@@ -1,0 +1,150 @@
+# ==============================================================================
+# Trace — .gitignore
+#
+# Canonical ignore set for an Unreal Engine 5 C++ project.
+#
+# GOLDEN RULE: Config/ and Source/ are ALWAYS tracked. If you ever find yourself
+# adding a pattern that swallows either of them, you have made a mistake — the
+# project is unbuildable for everyone else without those two directories.
+#
+# Content/ is also tracked (binary assets go through Git LFS — see .gitattributes).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Unreal Engine generated directories
+# These are recreated by UnrealBuildTool / the editor on demand. Never commit them.
+# The patterns are unanchored on purpose so they also catch Plugins/*/Binaries etc.
+# ------------------------------------------------------------------------------
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Platforms/*/Binaries/
+Platforms/*/Intermediate/
+
+# UBT / UAT build artifacts.
+# NOTE: Git cannot re-include a file whose parent directory is excluded. If you
+# later add packaging resources that MUST be versioned (Build/Mac/Resources,
+# Build/Windows/Application.ico, entitlements, ...), do not add a "!" line here —
+# change this to `Build/*` and add `!Build/Mac/` style negations instead.
+Build/
+
+# Cooked/staged output and packaged builds
+Packaged/
+Cooked/
+Archive/
+*.pak
+*.utoc
+*.ucas
+
+# ------------------------------------------------------------------------------
+# Generated IDE project files
+# `GenerateProjectFiles` (or Scripts/build.sh --projectfiles) recreates these.
+# ------------------------------------------------------------------------------
+*.xcodeproj/
+*.xcworkspace/
+*.sln
+*.suo
+*.sdf
+*.opensdf
+*.opendb
+*.VC.db
+*.VC.opendb
+*.code-workspace
+Makefile
+CMakeLists.txt
+.vs/
+.vscode/
+.idea/
+*.iml
+compile_commands.json
+.cache/
+.clangd/
+.ccls-cache/
+
+# ------------------------------------------------------------------------------
+# Compiler / linker intermediates that can escape Binaries/ and Intermediate/
+# (e.g. a ThirdParty build dropped in place). Deliberately NOT listing *.dll /
+# *.dylib / *.so / *.pdb here — real shipped ThirdParty libraries under
+# Source/ThirdParty are legitimately versioned and are LFS-tracked instead.
+# ------------------------------------------------------------------------------
+*.o
+*.obj
+*.slo
+*.lo
+*.gch
+*.ilk
+*.exp
+*.idb
+*.ipdb
+*.iobj
+*.tlog
+*.d
+*.dSYM/
+
+# ------------------------------------------------------------------------------
+# Logs, crash dumps, local scratch
+# ------------------------------------------------------------------------------
+*.log
+*.stackdump
+crash-*.dmp
+CrashReportClient/
+
+# Local engine-path override consumed by Scripts/_trace_common.sh.
+# Each developer may point this at their own UE install without touching the repo.
+.ue-root
+
+# Python bytecode — the editor's Python (Scripts/generate_map.py) drops these
+# next to the source when a module is imported.
+__pycache__/
+*.py[cod]
+
+# ------------------------------------------------------------------------------
+# macOS noise
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+.AppleDouble
+.AppleDB
+.AppleDesktop
+.LSOverride
+._*
+.Spotlight-V100
+.DocumentRevisions-V100
+.TemporaryItems
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Network Trash Folder
+Temporary Items
+Icon
+
+# ------------------------------------------------------------------------------
+# Windows noise
+# ------------------------------------------------------------------------------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ------------------------------------------------------------------------------
+# Linux noise
+# ------------------------------------------------------------------------------
+*~
+.directory
+.Trash-*
+
+# ------------------------------------------------------------------------------
+# Explicitly kept (belt-and-braces, and documentation for the next person).
+# These are anchored to the repo root and re-include nothing that is ignored
+# above — they exist so a careless future edit is obvious in review.
+# ------------------------------------------------------------------------------
+!/Config/
+!/Source/
+!/Scripts/
+!/.gitattributes
+!/.gitignore

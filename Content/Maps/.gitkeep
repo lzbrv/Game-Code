@@ -1,0 +1,17 @@
+This file exists only to keep Content/Maps/ in Git — Git tracks files, not
+directories, and an empty directory would vanish on clone.
+
+Arena.umap is NOT committed by default: it is generated on demand with
+
+    Scripts/generate-map.sh
+
+which creates a deliberately empty level. The whole arena (floor, walls,
+endzones, lights, player starts) is built in C++ by ATraceArenaBuilder at
+BeginPlay, so the map asset carries no content and nothing in the game depends
+on a .uasset we author.
+
+If the team ever does commit Arena.umap, it goes through Git LFS and is
+`lockable` (see .gitattributes) — .umap files cannot be merged, so lock before
+you edit:
+
+    git lfs lock Content/Maps/Arena.umap
