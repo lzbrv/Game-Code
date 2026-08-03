@@ -853,9 +853,9 @@ void UTraceTrailComponent::GatherTrackedCharacters(TArray<ATraceCharacter*>& Out
 	{
 		for (const TWeakObjectPtr<ATraceCharacter>& WeakCharacter : GameMode->GetTrackedCharacters())
 		{
-			if (ATraceCharacter* Character = WeakCharacter.Get())
+			if (ATraceCharacter* TraceChar = WeakCharacter.Get())
 			{
-				OutCharacters.Add(Character);
+				OutCharacters.Add(TraceChar);
 			}
 		}
 
@@ -869,9 +869,9 @@ void UTraceTrailComponent::GatherTrackedCharacters(TArray<ATraceCharacter*>& Out
 	// working if registration is incomplete (e.g. a character spawned outside the normal flow).
 	for (TActorIterator<ATraceCharacter> It(World); It; ++It)
 	{
-		if (ATraceCharacter* Character = *It)
+		if (ATraceCharacter* TraceChar = *It)
 		{
-			OutCharacters.Add(Character);
+			OutCharacters.Add(TraceChar);
 		}
 	}
 }
@@ -1224,9 +1224,9 @@ void UTraceTrailComponent::ApplyProximityGlowFade()
 		// Distance to the piece's SURFACE, not its centre: these are wide, flat slabs, and a centre
 		// distance would report a torso as far away at the exact moment its face is against the lens.
 		// The bounds are already computed for culling, so this costs nothing extra.
-		const FBoxSphereBounds& Bounds = Piece->Bounds;
+		const FBoxSphereBounds& LocalBounds = Piece->Bounds;
 		const double SurfaceDistance = FMath::Max(0.0,
-			FVector::Dist(CameraLocation, Bounds.Origin) - Bounds.SphereRadius);
+			FVector::Dist(CameraLocation, LocalBounds.Origin) - LocalBounds.SphereRadius);
 
 		float Scale = 1.f;
 		if (SurfaceDistance < ProximityFadeFarDistance)
@@ -1307,35 +1307,35 @@ UStaticMeshComponent* UTraceTrailComponent::CreatePooledMesh(UStaticMesh* Source
 		return nullptr;
 	}
 
-	UStaticMeshComponent* Mesh = NewObject<UStaticMeshComponent>(Owner, NAME_None, RF_Transient);
-	if (Mesh == nullptr)
+	UStaticMeshComponent* NewMesh = NewObject<UStaticMeshComponent>(Owner, NAME_None, RF_Transient);
+	if (NewMesh == nullptr)
 	{
 		return nullptr;
 	}
 
 	// Mobility must be set before registration.
-	Mesh->SetMobility(EComponentMobility::Movable);
-	Mesh->SetStaticMesh(SourceMesh);
-	Mesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	Mesh->SetCollisionProfileName(TEXT("NoCollision"));
-	Mesh->SetGenerateOverlapEvents(false);
-	Mesh->SetCanEverAffectNavigation(false);
-	Mesh->SetCastShadow(false);
-	Mesh->bReceivesDecals = false;
-	Mesh->SetIsReplicated(false);   // Purely local cosmetics, rebuilt from TrailPoints.
-	Mesh->SetVisibility(false);
+	NewMesh->SetMobility(EComponentMobility::Movable);
+	NewMesh->SetStaticMesh(SourceMesh);
+	NewMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	NewMesh->SetCollisionProfileName(TEXT("NoCollision"));
+	NewMesh->SetGenerateOverlapEvents(false);
+	NewMesh->SetCanEverAffectNavigation(false);
+	NewMesh->SetCastShadow(false);
+	NewMesh->bReceivesDecals = false;
+	NewMesh->SetIsReplicated(false);   // Purely local cosmetics, rebuilt from TrailPoints.
+	NewMesh->SetVisibility(false);
 
-	Mesh->RegisterComponent();
-	Mesh->AttachToComponent(this, FAttachmentTransformRules::KeepRelativeTransform);
+	NewMesh->RegisterComponent();
+	NewMesh->AttachToComponent(this, FAttachmentTransformRules::KeepRelativeTransform);
 
 	// Critical: the trace is laid in WORLD space and must not follow the holder around. Absolute
 	// transforms keep the components in the actor's hierarchy (so they are cleaned up with it)
 	// while making them ignore the parent transform entirely.
-	Mesh->SetAbsolute(true, true, true);
+	NewMesh->SetAbsolute(true, true, true);
 
 	if (TrailMaterial != nullptr)
 	{
-		OutMaterial = Mesh->CreateDynamicMaterialInstance(0, TrailMaterial);
+		OutMaterial = NewMesh->CreateDynamicMaterialInstance(0, TrailMaterial);
 	}
 
 	if (OutMaterial != nullptr)
@@ -1356,7 +1356,7 @@ UStaticMeshComponent* UTraceTrailComponent::CreatePooledMesh(UStaticMesh* Source
 		}
 	}
 
-	return Mesh;
+	return NewMesh;
 }
 
 void UTraceTrailComponent::HideGhostsFrom(int32 FirstGhostIndex)
@@ -1373,9 +1373,9 @@ void UTraceTrailComponent::HideGhostsFrom(int32 FirstGhostIndex)
 void UTraceTrailComponent::UpdateTeamColor()
 {
 	FLinearColor Desired = TraceTeamColor(ETraceTeam::None);
-	if (const ATraceCharacter* Character = GetOwnerCharacter())
+	if (const ATraceCharacter* TraceChar = GetOwnerCharacter())
 	{
-		Desired = TraceTeamColor(Character->GetTeam());
+		Desired = TraceTeamColor(TraceChar->GetTeam());
 	}
 	Desired.A = 1.f;
 
@@ -1412,16 +1412,16 @@ void UTraceTrailComponent::CacheMeshMetrics()
 
 	if (CylinderMesh != nullptr)
 	{
-		const FBoxSphereBounds Bounds = CylinderMesh->GetBounds();
-		CylinderHalfSize = Bounds.BoxExtent;
-		CylinderPivotOffset = Bounds.Origin;
+		const FBoxSphereBounds LocalBounds = CylinderMesh->GetBounds();
+		CylinderHalfSize = LocalBounds.BoxExtent;
+		CylinderPivotOffset = LocalBounds.Origin;
 	}
 
 	if (SphereMesh != nullptr)
 	{
-		const FBoxSphereBounds Bounds = SphereMesh->GetBounds();
-		SphereHalfSize = Bounds.BoxExtent;
-		SpherePivotOffset = Bounds.Origin;
+		const FBoxSphereBounds LocalBounds = SphereMesh->GetBounds();
+		SphereHalfSize = LocalBounds.BoxExtent;
+		SpherePivotOffset = LocalBounds.Origin;
 	}
 
 	// Never divide by zero, whatever the assets turn out to be.

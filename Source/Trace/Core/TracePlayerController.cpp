@@ -517,8 +517,8 @@ ATracePlayerState* ATracePlayerController::GetTracePlayerState() const
 
 ATraceCharacter* ATracePlayerController::GetLivingCharacter() const
 {
-	ATraceCharacter* Character = GetTraceCharacter();
-	return (Character != nullptr && Character->IsAlive()) ? Character : nullptr;
+	ATraceCharacter* TraceChar = GetTraceCharacter();
+	return (TraceChar != nullptr && TraceChar->IsAlive()) ? TraceChar : nullptr;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -548,11 +548,11 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 		// Release any held gameplay input before the handlers go quiet. Without this a player who
 		// opens the menu mid-burst comes back still firing, and one who opens it while walking keeps
 		// walking — the release edges are about to be swallowed.
-		if (ATraceCharacter* Character = GetTraceCharacter())
+		if (ATraceCharacter* TraceChar = GetTraceCharacter())
 		{
-			Character->DoFireReleased();
-			Character->StopJumping();
-			Character->DoMove(FVector2D::ZeroVector);
+			TraceChar->DoFireReleased();
+			TraceChar->StopJumping();
+			TraceChar->DoMove(FVector2D::ZeroVector);
 		}
 		bScoreboardOpen = false;
 
@@ -591,13 +591,13 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 
 bool ATracePlayerController::GetDashHudState(FTraceDashHudState& OutState) const
 {
-	const ATraceCharacter* Character = GetTraceCharacter();
-	if (Character == nullptr || !Character->IsAlive())
+	const ATraceCharacter* TraceChar = GetTraceCharacter();
+	if (TraceChar == nullptr || !TraceChar->IsAlive())
 	{
 		return false;
 	}
 
-	UTraceCharacterMovementComponent* Movement = Character->GetTraceMovement();
+	UTraceCharacterMovementComponent* Movement = TraceChar->GetTraceMovement();
 	if (Movement == nullptr)
 	{
 		return false;
@@ -634,13 +634,13 @@ bool ATracePlayerController::GetDashHudState(FTraceDashHudState& OutState) const
 
 bool ATracePlayerController::GetBoostHudState(float& OutRemaining, float& OutTotal) const
 {
-	const ATraceCharacter* Character = GetTraceCharacter();
-	if (Character == nullptr || !Character->IsAlive())
+	const ATraceCharacter* TraceChar = GetTraceCharacter();
+	if (TraceChar == nullptr || !TraceChar->IsAlive())
 	{
 		return false;
 	}
 
-	UTraceCharacterMovementComponent* Movement = Character->GetTraceMovement();
+	UTraceCharacterMovementComponent* Movement = TraceChar->GetTraceMovement();
 
 	const float Remaining = TraceCompat::BoostCooldownRemaining(Movement);
 	if (Remaining < 0.f)
@@ -658,13 +658,13 @@ bool ATracePlayerController::GetBoostHudState(float& OutRemaining, float& OutTot
 
 float ATracePlayerController::GetPassProgress() const
 {
-	ATraceCharacter* Character = GetTraceCharacter();
-	if (Character == nullptr || !Character->IsAlive())
+	ATraceCharacter* TraceChar = GetTraceCharacter();
+	if (TraceChar == nullptr || !TraceChar->IsAlive())
 	{
 		return -1.f;
 	}
 
-	return TraceCompat::PassProgress(Character);
+	return TraceCompat::PassProgress(TraceChar);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -687,19 +687,19 @@ void ATracePlayerController::OnMoveInput(const FInputActionValue& Value)
 	DebugLastMoveValue = MoveValue;
 	LogFirstEventOfAction(FirstEvent_Move, TEXT("Move"));
 
-	ATraceCharacter* Character = GetLivingCharacter();
+	ATraceCharacter* TraceChar = GetLivingCharacter();
 
 	if (InputLogLevel() >= 2)
 	{
 		UE_LOG(LogTraceGame, Display,
 			TEXT("INPUT Move  #%d value=(%.3f, %.3f) pawn=%s"),
 			DebugMoveEventCount, MoveValue.X, MoveValue.Y,
-			(Character != nullptr) ? *Character->GetName() : TEXT("<none/dead>"));
+			(TraceChar != nullptr) ? *TraceChar->GetName() : TEXT("<none/dead>"));
 	}
 
-	if (Character != nullptr)
+	if (TraceChar != nullptr)
 	{
-		Character->DoMove(MoveValue);
+		TraceChar->DoMove(MoveValue);
 	}
 }
 
@@ -755,9 +755,9 @@ void ATracePlayerController::OnLookInput(const FInputActionValue& Value)
 	}
 
 	// Looking stays available while dead so players can watch the fight that killed them.
-	if (ATraceCharacter* Character = GetTraceCharacter())
+	if (ATraceCharacter* TraceChar = GetTraceCharacter())
 	{
-		Character->DoLook(LookDelta);
+		TraceChar->DoLook(LookDelta);
 	}
 }
 
@@ -777,18 +777,18 @@ void ATracePlayerController::OnJumpStarted()
 
 	// ATraceCharacter deliberately exposes no DoJump — ACharacter::Jump is already
 	// prediction-safe and routes through the movement component's saved moves.
-	if (ATraceCharacter* Character = GetLivingCharacter())
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
 	{
-		Character->Jump();
+		TraceChar->Jump();
 	}
 }
 
 void ATracePlayerController::OnJumpCompleted()
 {
 	// Not gated on IsAlive: releasing must always clear bPressedJump, even on a dying pawn.
-	if (ATraceCharacter* Character = GetTraceCharacter())
+	if (ATraceCharacter* TraceChar = GetTraceCharacter())
 	{
-		Character->StopJumping();
+		TraceChar->StopJumping();
 	}
 }
 
@@ -803,20 +803,20 @@ void ATracePlayerController::OnFireStarted()
 	++DebugFireStartedCount;
 	LogFirstEventOfAction(FirstEvent_Fire, TEXT("Fire"));
 
-	ATraceCharacter* Character = GetTraceCharacter();
+	ATraceCharacter* TraceChar = GetTraceCharacter();
 
 	if (InputLogLevel() >= 1)
 	{
 		UE_LOG(LogTraceGame, Display,
 			TEXT("INPUT Fire pressed #%d pawn=%s alive=%d carrier=%d locallyControlled=%d"),
 			DebugFireStartedCount,
-			(Character != nullptr) ? *Character->GetName() : TEXT("<none>"),
-			(Character != nullptr) ? Character->IsAlive() : 0,
-			(Character != nullptr) ? Character->IsCarrier() : 0,
-			(Character != nullptr) ? Character->IsLocallyControlled() : 0);
+			(TraceChar != nullptr) ? *TraceChar->GetName() : TEXT("<none>"),
+			(TraceChar != nullptr) ? TraceChar->IsAlive() : 0,
+			(TraceChar != nullptr) ? TraceChar->IsCarrier() : 0,
+			(TraceChar != nullptr) ? TraceChar->IsLocallyControlled() : 0);
 	}
 
-	if (Character == nullptr || !Character->IsAlive())
+	if (TraceChar == nullptr || !TraceChar->IsAlive())
 	{
 		// Dead: fire doubles as "get me back in". The game mode still owns respawn timing.
 		ServerRequestRespawn();
@@ -825,7 +825,7 @@ void ATracePlayerController::OnFireStarted()
 
 	// The weapon component decides whether firing is actually legal (carrying the Core, cooldown,
 	// and so on) — the controller never second-guesses it.
-	Character->DoFirePressed();
+	TraceChar->DoFirePressed();
 }
 
 void ATracePlayerController::OnFireCompleted()
@@ -837,9 +837,9 @@ void ATracePlayerController::OnFireCompleted()
 	}
 
 	// Release always propagates, so a pawn that dies mid-burst does not come back still firing.
-	if (ATraceCharacter* Character = GetTraceCharacter())
+	if (ATraceCharacter* TraceChar = GetTraceCharacter())
 	{
-		Character->DoFireReleased();
+		TraceChar->DoFireReleased();
 	}
 }
 
@@ -857,9 +857,9 @@ void ATracePlayerController::OnPassStarted()
 		UE_LOG(LogTraceGame, Display, TEXT("INPUT Pass pressed #%d"), DebugPassCount);
 	}
 
-	if (ATraceCharacter* Character = GetLivingCharacter())
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
 	{
-		Character->DoPassPressed();
+		TraceChar->DoPassPressed();
 	}
 }
 
@@ -874,9 +874,9 @@ void ATracePlayerController::OnPassCompleted()
 		UE_LOG(LogTraceGame, Display, TEXT("INPUT Pass released #%d"), DebugPassCount);
 	}
 
-	if (ATraceCharacter* Character = GetPawn<ATraceCharacter>())
+	if (ATraceCharacter* TraceChar = GetPawn<ATraceCharacter>())
 	{
-		Character->DoPassReleased();
+		TraceChar->DoPassReleased();
 	}
 }
 
@@ -894,9 +894,9 @@ void ATracePlayerController::OnDashStarted()
 		UE_LOG(LogTraceGame, Display, TEXT("INPUT Dash pressed #%d"), DebugDashCount);
 	}
 
-	if (ATraceCharacter* Character = GetLivingCharacter())
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
 	{
-		Character->DoDash();
+		TraceChar->DoDash();
 	}
 }
 
@@ -917,9 +917,9 @@ void ATracePlayerController::OnBoostStarted()
 	// movement slice; TraceCompat::TryBoost calls ATraceCharacter::DoBoost() when that slice has
 	// landed it and is a no-op until then, so this binding is live from the moment it exists and
 	// needs no follow-up wiring. See Settings/TraceGameplayCompat.h.
-	if (ATraceCharacter* Character = GetLivingCharacter())
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
 	{
-		if (!TraceCompat::TryBoost(Character))
+		if (!TraceCompat::TryBoost(TraceChar))
 		{
 			// Once per session at Verbose: a boost key that does nothing is otherwise indistinguishable
 			// from a broken binding, and the hard-won lesson in this project is that the answer to
@@ -950,9 +950,9 @@ void ATracePlayerController::OnCrouchStarted()
 	// OnStartCrouch/OnEndCrouch to turn it into a ground slide or an air fast-fall; the controller
 	// deliberately does not encode which of those it is, because that decision needs the movement
 	// mode and belongs on the movement component.
-	if (ATraceCharacter* Character = GetLivingCharacter())
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
 	{
-		Character->Crouch();
+		TraceChar->Crouch();
 	}
 }
 
@@ -960,9 +960,9 @@ void ATracePlayerController::OnCrouchCompleted()
 {
 	// Not gated on IsAlive or on suppression: a release must ALWAYS propagate, or a pawn that dies
 	// (or opens the menu) mid-crouch comes back permanently crouched.
-	if (ATraceCharacter* Character = GetTraceCharacter())
+	if (ATraceCharacter* TraceChar = GetTraceCharacter())
 	{
-		Character->UnCrouch();
+		TraceChar->UnCrouch();
 	}
 }
 
@@ -1104,14 +1104,14 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 			GEngine->GameViewport->IgnoreInput() ? 1 : 0);
 	}
 
-	const ATraceCharacter* Character = GetTraceCharacter();
+	const ATraceCharacter* TraceChar = GetTraceCharacter();
 	UE_LOG(LogTraceGame, Display,
 		TEXT("INPUTDIAG [%s] pawn=%s alive=%d locallyControlled=%d location=%s"),
 		Context,
-		(Character != nullptr) ? *Character->GetName() : TEXT("<none>"),
-		(Character != nullptr) ? Character->IsAlive() : 0,
-		(Character != nullptr) ? Character->IsLocallyControlled() : 0,
-		(Character != nullptr) ? *Character->GetActorLocation().ToCompactString() : TEXT("-"));
+		(TraceChar != nullptr) ? *TraceChar->GetName() : TEXT("<none>"),
+		(TraceChar != nullptr) ? TraceChar->IsAlive() : 0,
+		(TraceChar != nullptr) ? TraceChar->IsLocallyControlled() : 0,
+		(TraceChar != nullptr) ? *TraceChar->GetActorLocation().ToCompactString() : TEXT("-"));
 
 	UE_LOG(LogTraceGame, Display,
 		TEXT("INPUTDIAG [%s] counters move=%d look=%d fireDown=%d fireUp=%d jump=%d pass=%d dash=%d boost=%d crouch=%d hitConfirm=%d lastMove=(%.2f, %.2f)"),

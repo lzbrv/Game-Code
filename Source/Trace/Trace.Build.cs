@@ -8,6 +8,20 @@ public class Trace : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
+		// Catch variable shadowing on macOS/clang too.
+		//
+		// MSVC enables C4458 (local hides class member) and C4459 (local hides global) as part of
+		// Unreal's warnings-as-errors set; clang does not by default. That asymmetry meant a clean
+		// Mac build shipped code that failed outright on Windows - locals named Character, Mesh,
+		// bHidden, Bounds and LogInput shadowing ACharacter::Mesh, AActor::bHidden,
+		// UPrimitiveComponent::Bounds and the engine's LogInput category.
+		//
+		// Module-scoped deliberately: setting this on the Target would modify the shared build
+		// environment, which an installed (launcher) engine refuses with "modifies the values of
+		// properties ... not allowed, as TraceEditor has build products in common with
+		// UnrealEditor".
+		CppCompileWarningSettings.ShadowVariableWarningLevel = WarningLevel.Error;
+
 		// This module uses a flat layout (no Public/Private split), so make the module root an
 		// explicit public include path. That guarantees both forms resolve from anywhere in the
 		// module, regardless of UBT's legacy-include-path defaults:

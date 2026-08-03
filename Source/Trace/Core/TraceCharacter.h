@@ -436,7 +436,7 @@ protected:
 	void PerformPass(const FVector& Direction);
 
 	/** Creates the MID on first use, then just pushes the colour. Fallback shapes only. */
-	void ApplyColorToMesh(UStaticMeshComponent* Mesh, TObjectPtr<UMaterialInstanceDynamic>& InOutMID, const FLinearColor& InColor);
+	void ApplyColorToMesh(UStaticMeshComponent* InMesh, TObjectPtr<UMaterialInstanceDynamic>& InOutMID, const FLinearColor& InColor);
 
 	/**
 	 * Team colour on the Mannequin. One MID per material slot (Manny has two), created once, then
@@ -483,7 +483,7 @@ protected:
 	 * Local, per-machine and owner-only: it changes nothing about what other players see, and it is
 	 * only ever called on the locally controlled pawn.
 	 */
-	void SetOwnBodyHiddenFromOwner(bool bHidden);
+	void SetOwnBodyHiddenFromOwner(bool bInHidden);
 
 	// --- First-person viewmodel (see the file header) ---------------------------------------------
 
@@ -499,7 +499,7 @@ protected:
 	void EnsureViewModelBuilt();
 
 	/** One primitive of the viewmodel: owner-only, shadowless, uncollidable, first-person-tagged. */
-	UStaticMeshComponent* AddViewModelPart(UStaticMesh* Mesh, const TCHAR* DebugName,
+	UStaticMeshComponent* AddViewModelPart(UStaticMesh* InMesh, const TCHAR* DebugName,
 		const FVector& Location, const FRotator& Rotation, const FVector& Size,
 		UMaterialInstanceDynamic* MID);
 

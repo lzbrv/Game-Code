@@ -342,14 +342,14 @@ namespace
 	 * the replicated actor rotation — nothing gameplay-critical ever asks a simulated proxy where it
 	 * is aiming.
 	 */
-	FRotator ResolveAimRotation(const ATraceCharacter& Character)
+	FRotator ResolveAimRotation(const ATraceCharacter& TraceChar)
 	{
-		if (const AController* OwningController = Character.GetController())
+		if (const AController* OwningController = TraceChar.GetController())
 		{
 			return OwningController->GetControlRotation();
 		}
 
-		FRotator Rotation = Character.GetActorRotation();
+		FRotator Rotation = TraceChar.GetActorRotation();
 		Rotation.Pitch = 0.f;
 		Rotation.Roll = 0.f;
 		return Rotation;
@@ -364,9 +364,9 @@ namespace
 	 * harmless right up until something makes that bot a view target, and paying for a camera blend
 	 * on nine pawns that have no camera is pure waste.
 	 */
-	bool IsLocalPlayerPawn(const ATraceCharacter& Character)
+	bool IsLocalPlayerPawn(const ATraceCharacter& TraceChar)
 	{
-		const APlayerController* PC = Cast<APlayerController>(Character.GetController());
+		const APlayerController* PC = Cast<APlayerController>(TraceChar.GetController());
 		return PC != nullptr && PC->IsLocalController();
 	}
 
@@ -380,23 +380,23 @@ namespace
 	}
 
 	/** Shared setup for the fallback shapes: drawable, and incapable of colliding. */
-	void ConfigureVisualMesh(UStaticMeshComponent* Mesh)
+	void ConfigureVisualMesh(UStaticMeshComponent* InMesh)
 	{
-		if (Mesh == nullptr)
+		if (InMesh == nullptr)
 		{
 			return;
 		}
 
 		// Contract §7: the capsule is the ONLY collider. A colliding mesh here would let a bullet
 		// stop on "the shoulder" while the lag-compensated capsule test says it missed.
-		Mesh->SetCollisionProfileName(TEXT("NoCollision"));
-		Mesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-		Mesh->SetGenerateOverlapEvents(false);
-		Mesh->SetCanEverAffectNavigation(false);
-		Mesh->bReceivesDecals = false;
+		InMesh->SetCollisionProfileName(TEXT("NoCollision"));
+		InMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		InMesh->SetGenerateOverlapEvents(false);
+		InMesh->SetCanEverAffectNavigation(false);
+		InMesh->bReceivesDecals = false;
 
 		// Same reason as the skeletal mesh: hidden from its owner in first person, still casting.
-		Mesh->bCastHiddenShadow = true;
+		InMesh->bCastHiddenShadow = true;
 	}
 }
 
@@ -1297,9 +1297,9 @@ void ATraceCharacter::ApplyColorToSkeletalMesh(const FLinearColor& InColor, floa
 	}
 }
 
-void ATraceCharacter::ApplyColorToMesh(UStaticMeshComponent* Mesh, TObjectPtr<UMaterialInstanceDynamic>& InOutMID, const FLinearColor& InColor)
+void ATraceCharacter::ApplyColorToMesh(UStaticMeshComponent* InMesh, TObjectPtr<UMaterialInstanceDynamic>& InOutMID, const FLinearColor& InColor)
 {
-	if (Mesh == nullptr || BasicShapeMaterial == nullptr)
+	if (InMesh == nullptr || BasicShapeMaterial == nullptr)
 	{
 		return;
 	}
@@ -1309,7 +1309,7 @@ void ATraceCharacter::ApplyColorToMesh(UStaticMeshComponent* Mesh, TObjectPtr<UM
 	// trail of them for the GC.
 	if (InOutMID == nullptr)
 	{
-		InOutMID = Mesh->CreateDynamicMaterialInstance(0, BasicShapeMaterial);
+		InOutMID = InMesh->CreateDynamicMaterialInstance(0, BasicShapeMaterial);
 	}
 
 	if (InOutMID == nullptr)
@@ -1449,10 +1449,10 @@ void ATraceCharacter::UpdateViewBlend(float DeltaSeconds, bool bSnap)
 // First-person viewmodel — see the file header for the framing and depth arithmetic.
 // =================================================================================================
 
-UStaticMeshComponent* ATraceCharacter::AddViewModelPart(UStaticMesh* Mesh, const TCHAR* DebugName,
+UStaticMeshComponent* ATraceCharacter::AddViewModelPart(UStaticMesh* InMesh, const TCHAR* DebugName,
 	const FVector& Location, const FRotator& Rotation, const FVector& Size, UMaterialInstanceDynamic* MID)
 {
-	if (Mesh == nullptr || ViewModelRoot == nullptr)
+	if (InMesh == nullptr || ViewModelRoot == nullptr)
 	{
 		return nullptr;
 	}
@@ -1466,7 +1466,7 @@ UStaticMeshComponent* ATraceCharacter::AddViewModelPart(UStaticMesh* Mesh, const
 
 	Part->SetMobility(EComponentMobility::Movable);
 	Part->SetupAttachment(ViewModelRoot);
-	Part->SetStaticMesh(Mesh);
+	Part->SetStaticMesh(InMesh);
 	Part->SetRelativeLocationAndRotation(Location, Rotation);
 	Part->SetRelativeScale3D(Size / TraceCharacterLayout::ViewModelShapeUnit);
 
@@ -1965,21 +1965,21 @@ void ATraceCharacter::ApplyRotationMode()
 	}
 }
 
-void ATraceCharacter::SetOwnBodyHiddenFromOwner(bool bHidden)
+void ATraceCharacter::SetOwnBodyHiddenFromOwner(bool bInHidden)
 {
 	// Guarded because SetOwnerNoSee marks the render state dirty; the blend calls this every frame.
-	if (bOwnBodyHiddenFromOwner == bHidden)
+	if (bOwnBodyHiddenFromOwner == bInHidden)
 	{
 		return;
 	}
-	bOwnBodyHiddenFromOwner = bHidden;
+	bOwnBodyHiddenFromOwner = bInHidden;
 
 	// All three visual components, because which of them is showing depends on whether the mannequin
 	// import has been run — a fresh clone in first person must not be staring at the inside of a
 	// fallback cylinder.
 	if (USkeletalMeshComponent* MeshComp = GetMesh())
 	{
-		MeshComp->SetOwnerNoSee(bHidden);
+		MeshComp->SetOwnerNoSee(bInHidden);
 
 		// Every other pawn keeps OnlyTickPoseWhenRendered, which is the big animation saving in a
 		// 5v5. This one pawn cannot: in first person it is deliberately not drawn for the only
@@ -1987,17 +1987,17 @@ void ATraceCharacter::SetOwnBodyHiddenFromOwner(bool bHidden)
 		// set in the constructor) would freeze mid-stride, and the pose would still be stale on the
 		// frame the Core is picked up and the body swings back into view. One always-ticked
 		// skeleton out of ten is a price worth paying for both of those.
-		MeshComp->VisibilityBasedAnimTickOption = bHidden
+		MeshComp->VisibilityBasedAnimTickOption = bInHidden
 			? EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones
 			: EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
 	}
 	if (FallbackBodyMesh != nullptr)
 	{
-		FallbackBodyMesh->SetOwnerNoSee(bHidden);
+		FallbackBodyMesh->SetOwnerNoSee(bInHidden);
 	}
 	if (FallbackHeadMesh != nullptr)
 	{
-		FallbackHeadMesh->SetOwnerNoSee(bHidden);
+		FallbackHeadMesh->SetOwnerNoSee(bInHidden);
 	}
 }
 
@@ -2265,9 +2265,9 @@ namespace
 			APlayerController* PC = It->Get();
 			if (PC != nullptr && PC->IsLocalController())
 			{
-				if (ATraceCharacter* Character = Cast<ATraceCharacter>(PC->GetPawn()))
+				if (ATraceCharacter* TraceChar = Cast<ATraceCharacter>(PC->GetPawn()))
 				{
-					return Character;
+					return TraceChar;
 				}
 			}
 		}
@@ -2310,16 +2310,16 @@ namespace
 					}
 					SinceLast = 0.0;
 
-					ATraceCharacter* Character = FindDebugLocalCharacter(FindDebugGameWorld());
-					if (Character == nullptr || Character->Camera == nullptr)
+					ATraceCharacter* TraceChar = FindDebugLocalCharacter(FindDebugGameWorld());
+					if (TraceChar == nullptr || TraceChar->Camera == nullptr)
 					{
 						return (++Emitted < Samples);
 					}
 
-					const FVector CameraLoc = Character->Camera->GetComponentLocation();
-					const FVector CameraFwd = Character->Camera->GetForwardVector();
-					const FVector EyeLoc = Character->GetPawnViewLocation();
-					const FVector AimDir = Character->GetAimDirection();
+					const FVector CameraLoc = TraceChar->Camera->GetComponentLocation();
+					const FVector CameraFwd = TraceChar->Camera->GetForwardVector();
+					const FVector EyeLoc = TraceChar->GetPawnViewLocation();
+					const FVector AimDir = TraceChar->GetAimDirection();
 
 					const double EyeError = FVector::Dist(CameraLoc, EyeLoc);
 					const double AimErrorDegrees = FMath::RadiansToDegrees(
@@ -2334,21 +2334,21 @@ namespace
 						TEXT("[ViewProbe] mode=%s carrier=%d blend=%.2f arm=%.1f eyeErr=%.2fuu aimErr=%.4fdeg ")
 						TEXT("bodyHiddenFromOwner=%d ctrlYaw=%d orientToMove=%d ")
 						TEXT("crouched=%d sliding=%d halfHeight=%.1f baseEye=%.1f vmParts=%d vmVisible=%d"),
-						Character->GetViewBlendAlpha() < 0.5f ? TEXT("FIRST") : TEXT("THIRD"),
-						Character->IsCarrier() ? 1 : 0,
-						Character->GetViewBlendAlpha(),
-						Character->SpringArm != nullptr ? Character->SpringArm->TargetArmLength : -1.f,
+						TraceChar->GetViewBlendAlpha() < 0.5f ? TEXT("FIRST") : TEXT("THIRD"),
+						TraceChar->IsCarrier() ? 1 : 0,
+						TraceChar->GetViewBlendAlpha(),
+						TraceChar->SpringArm != nullptr ? TraceChar->SpringArm->TargetArmLength : -1.f,
 						EyeError,
 						AimErrorDegrees,
-						(Character->GetMesh() != nullptr && Character->GetMesh()->bOwnerNoSee) ? 1 : 0,
-						Character->bUseControllerRotationYaw ? 1 : 0,
-						(Character->GetCharacterMovement() != nullptr && Character->GetCharacterMovement()->bOrientRotationToMovement) ? 1 : 0,
-						Character->bIsCrouched ? 1 : 0,
-						(Character->GetTraceMovement() != nullptr && Character->GetTraceMovement()->IsSliding()) ? 1 : 0,
-						Character->GetCapsuleComponent() != nullptr ? Character->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : -1.f,
-						Character->BaseEyeHeight,
-						Character->GetViewModelPartCount(),
-						Character->IsViewModelVisible() ? 1 : 0);
+						(TraceChar->GetMesh() != nullptr && TraceChar->GetMesh()->bOwnerNoSee) ? 1 : 0,
+						TraceChar->bUseControllerRotationYaw ? 1 : 0,
+						(TraceChar->GetCharacterMovement() != nullptr && TraceChar->GetCharacterMovement()->bOrientRotationToMovement) ? 1 : 0,
+						TraceChar->bIsCrouched ? 1 : 0,
+						(TraceChar->GetTraceMovement() != nullptr && TraceChar->GetTraceMovement()->IsSliding()) ? 1 : 0,
+						TraceChar->GetCapsuleComponent() != nullptr ? TraceChar->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : -1.f,
+						TraceChar->BaseEyeHeight,
+						TraceChar->GetViewModelPartCount(),
+						TraceChar->IsViewModelVisible() ? 1 : 0);
 
 					return (++Emitted < Samples);
 				}),
@@ -2400,21 +2400,21 @@ namespace
 						return true;
 					}
 
-					ATraceCharacter* Character = FindDebugLocalCharacter(FindDebugGameWorld());
-					if (Character == nullptr)
+					ATraceCharacter* TraceChar = FindDebugLocalCharacter(FindDebugGameWorld());
+					if (TraceChar == nullptr)
 					{
 						// Keep waiting for a pawn until well past the hold window, then give up.
 						return Elapsed < (Delay + Hold + 30.0);
 					}
 
-					UTraceCharacterMovementComponent* Movement = Character->GetTraceMovement();
+					UTraceCharacterMovementComponent* Movement = TraceChar->GetTraceMovement();
 
 					// BOTH entry points: the movement component ORs its own intent flag with the
 					// engine's bWantsToCrouch, and which of the two a real bind ends up using is the
 					// input layer's business, not this command's.
-					auto SetHeld = [Character, Movement](bool bDown)
+					auto SetHeld = [TraceChar, Movement](bool bDown)
 					{
-						if (bDown) { Character->Crouch(); } else { Character->UnCrouch(); }
+						if (bDown) { TraceChar->Crouch(); } else { TraceChar->UnCrouch(); }
 						if (Movement != nullptr) { Movement->SetWantsToSlide(bDown); }
 					};
 
@@ -2423,9 +2423,9 @@ namespace
 						SetHeld(false);
 						UE_LOG(LogTraceGame, Display,
 							TEXT("[DebugCrouch] %s finished (sliding=%d baseEye=%.1f)."),
-							*Character->GetName(),
+							*TraceChar->GetName(),
 							(Movement != nullptr && Movement->IsSliding()) ? 1 : 0,
-							Character->BaseEyeHeight);
+							TraceChar->BaseEyeHeight);
 						return false;
 					}
 
@@ -2434,10 +2434,10 @@ namespace
 						bLogged = true;
 						UE_LOG(LogTraceGame, Display,
 							TEXT("[DebugCrouch] %s pulsing crouch/slide for %.1fs (capsule halfHeight=%.1f baseEye=%.1f)."),
-							*Character->GetName(),
+							*TraceChar->GetName(),
 							Hold,
-							Character->GetCapsuleComponent() != nullptr ? Character->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : -1.f,
-							Character->BaseEyeHeight);
+							TraceChar->GetCapsuleComponent() != nullptr ? TraceChar->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : -1.f,
+							TraceChar->BaseEyeHeight);
 					}
 
 					// Square wave on the key, re-asserted every tick so a prediction correction that
@@ -2594,32 +2594,32 @@ namespace
 						return true;
 					}
 
-					ATraceCharacter* Character = FindDebugLocalCharacter(World);
-					if (Character == nullptr || !Character->IsAlive())
+					ATraceCharacter* TraceChar = FindDebugLocalCharacter(World);
+					if (TraceChar == nullptr || !TraceChar->IsAlive())
 					{
 						return true;
 					}
 
-					if (Character->IsCarrier())
+					if (TraceChar->IsCarrier())
 					{
-						UE_LOG(LogTraceGame, Display, TEXT("[DebugTakeCore] %s is already the carrier."), *Character->GetName());
+						UE_LOG(LogTraceGame, Display, TEXT("[DebugTakeCore] %s is already the carrier."), *TraceChar->GetName());
 						CarriedSinceSeconds = ElapsedSeconds;
 						return (Hold > 0.f);
 					}
 
-					TheCore->TryPickup(Character);
+					TheCore->TryPickup(TraceChar);
 
 					// TryPickup can legitimately refuse (someone else is carrying it, pickup lockout).
 					// Report what actually happened rather than what was asked for, and keep retrying
 					// if it did not take.
-					if (!Character->IsCarrier())
+					if (!TraceChar->IsCarrier())
 					{
 						return true;
 					}
 
 					UE_LOG(LogTraceGame, Display,
 						TEXT("[DebugTakeCore] %s is now carrying the Core (view blend -> third person)."),
-						*Character->GetName());
+						*TraceChar->GetName());
 
 					CarriedSinceSeconds = ElapsedSeconds;
 					return (Hold > 0.f);

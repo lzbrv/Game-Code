@@ -541,8 +541,8 @@ namespace TraceInputHarness
 
 		bool TickWaitForPawn(ATracePlayerController* PC)
 		{
-			const ATraceCharacter* Character = PC->GetTraceCharacter();
-			if (Character == nullptr || !Character->IsAlive())
+			const ATraceCharacter* TraceChar = PC->GetTraceCharacter();
+			if (TraceChar == nullptr || !TraceChar->IsAlive())
 			{
 				if (Elapsed > MaxWaitSeconds)
 				{
@@ -553,14 +553,14 @@ namespace TraceInputHarness
 			}
 
 			UE_LOG(LogTraceGame, Display, TEXT("SELFTEST: ==== BEGIN ==== pawn=%s at t=%.1fs"),
-				*Character->GetName(), Elapsed);
+				*TraceChar->GetName(), Elapsed);
 			PC->LogInputDiagnostics(TEXT("selftest-start"));
 
 			// Static checks first: if any of these fail, every later failure is a consequence of it
 			// rather than an independent finding.
 			Check(PC->IsLocalController(), TEXT("controller is local"));
 			Check(PC->GetLocalPlayer() != nullptr, TEXT("controller has a ULocalPlayer"));
-			Check(Character->IsLocallyControlled(), TEXT("pawn is locally controlled"));
+			Check(TraceChar->IsLocallyControlled(), TEXT("pawn is locally controlled"));
 			Check(GEngine != nullptr && GEngine->GameViewport != nullptr && !GEngine->GameViewport->IgnoreInput(),
 				TEXT("game viewport exists and is not ignoring input"));
 			Check(GEngine != nullptr && GEngine->GameViewport != nullptr &&
@@ -581,14 +581,14 @@ namespace TraceInputHarness
 				return true;
 			}
 
-			const ATraceCharacter* Character = PC->GetTraceCharacter();
-			if (Character == nullptr)
+			const ATraceCharacter* TraceChar = PC->GetTraceCharacter();
+			if (TraceChar == nullptr)
 			{
 				Advance(EPhase::WaitForPawn);
 				return true;
 			}
 
-			MoveStartLocation = Character->GetActorLocation();
+			MoveStartLocation = TraceChar->GetActorLocation();
 			MoveStartEventCount = PC->DebugMoveEventCount;
 
 			UE_LOG(LogTraceGame, Display, TEXT("SELFTEST: pressing W. Location before = %s"),
@@ -619,8 +619,8 @@ namespace TraceInputHarness
 				return true;
 			}
 
-			const ATraceCharacter* Character = PC->GetTraceCharacter();
-			const FVector EndLocation = (Character != nullptr) ? Character->GetActorLocation() : MoveStartLocation;
+			const ATraceCharacter* TraceChar = PC->GetTraceCharacter();
+			const FVector EndLocation = (TraceChar != nullptr) ? TraceChar->GetActorLocation() : MoveStartLocation;
 			const float Moved = FVector::Dist2D(EndLocation, MoveStartLocation);
 			const int32 MoveEvents = PC->DebugMoveEventCount - MoveStartEventCount;
 
@@ -680,8 +680,8 @@ namespace TraceInputHarness
 
 		bool TickAim(ATracePlayerController* PC)
 		{
-			ATraceCharacter* Character = PC->GetTraceCharacter();
-			if (Character == nullptr || !Character->IsAlive())
+			ATraceCharacter* TraceChar = PC->GetTraceCharacter();
+			if (TraceChar == nullptr || !TraceChar->IsAlive())
 			{
 				UE_LOG(LogTraceGame, Warning, TEXT("SELFTEST: pawn died before the fire test; waiting for a respawn."));
 				Advance(EPhase::WaitForPawn);
@@ -708,19 +708,19 @@ namespace TraceInputHarness
 			//
 			// So: leave our pawn exactly where the game put it, and bring a target to a spot the
 			// engine has just told us is reachable by a straight line from our own muzzle.
-			if (ATraceCharacter* Target = FindNearestEnemy(Character))
+			if (ATraceCharacter* Target = FindNearestEnemy(TraceChar))
 			{
-				const FVector Muzzle = Character->GetMuzzleLocation();
-				const FVector AimDir = Character->GetAimDirection().GetSafeNormal();
+				const FVector Muzzle = TraceChar->GetMuzzleLocation();
+				const FVector AimDir = TraceChar->GetAimDirection().GetSafeNormal();
 
 				// Trace on Visibility for the same reason the weapon does not: the Pawn profile
 				// ignores that channel, so this finds walls and pillars and nothing else. Whatever
 				// distance comes back is guaranteed clear of geometry.
 				float ClearDistance = FireTestRangeUU;
-				if (UWorld* World = Character->GetWorld())
+				if (UWorld* World = TraceChar->GetWorld())
 				{
 					FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceInputHarnessLOS), /*bTraceComplex=*/false);
-					Params.AddIgnoredActor(Character);
+					Params.AddIgnoredActor(TraceChar);
 
 					FHitResult Hit;
 					if (World->LineTraceSingleByChannel(
@@ -734,7 +734,7 @@ namespace TraceInputHarness
 				const bool bMoved = Target->SetActorLocation(
 					Spot, /*bSweep=*/false, /*OutSweepHitResult=*/nullptr, ETeleportType::TeleportPhysics);
 
-				const FVector Eye = Character->GetPawnViewLocation();
+				const FVector Eye = TraceChar->GetPawnViewLocation();
 				PC->SetControlRotation((Target->GetActorLocation() - Eye).Rotation());
 
 				UE_LOG(LogTraceGame, Display,
@@ -755,11 +755,11 @@ namespace TraceInputHarness
 			// the fire test would report zero tracers and read exactly like a broken weapon — the
 			// false conclusion this harness exists to prevent. So take the Core off ourselves first.
 			// Authority-only, single player; the Core is never destroyed, only handed to a teammate.
-			if (Character->IsCarrier() && Character->HasAuthority())
+			if (TraceChar->IsCarrier() && TraceChar->HasAuthority())
 			{
-				if (ATraceCore* TheCore = ATraceCore::Get(Character->GetWorld()))
+				if (ATraceCore* TheCore = ATraceCore::Get(TraceChar->GetWorld()))
 				{
-					ATraceCharacter* Receiver = FindTeammateOtherThan(Character);
+					ATraceCharacter* Receiver = FindTeammateOtherThan(TraceChar);
 					UE_LOG(LogTraceGame, Display,
 						TEXT("SELFTEST: we are the Core holder, so mouse1 would PASS, not fire. Handing the Core to %s first."),
 						*GetNameSafe(Receiver));
@@ -781,7 +781,7 @@ namespace TraceInputHarness
 			HitStartCount = PC->DebugHitConfirmCount;
 			TracerIds.Reset();
 
-			UE_LOG(LogTraceGame, Display, TEXT("SELFTEST: pressing LMB (carrier=%d)."), Character->IsCarrier() ? 1 : 0);
+			UE_LOG(LogTraceGame, Display, TEXT("SELFTEST: pressing LMB (carrier=%d)."), TraceChar->IsCarrier() ? 1 : 0);
 			InjectKey(EKeys::LeftMouseButton, /*bPressed=*/true, Path);
 
 			Advance(EPhase::FireHold);
@@ -800,11 +800,11 @@ namespace TraceInputHarness
 				// re-running FindNearestEnemy keeps a TActorIterator over the whole (now large)
 				// arena out of the per-frame path, and stops the aim snapping to a different bot
 				// halfway through the burst.
-				ATraceCharacter* Character = PC->GetTraceCharacter();
+				ATraceCharacter* TraceChar = PC->GetTraceCharacter();
 				ATraceCharacter* Target = FireTarget.Get();
-				if (Character != nullptr && Target != nullptr && Target->IsAlive())
+				if (TraceChar != nullptr && Target != nullptr && Target->IsAlive())
 				{
-					const FVector Eye = Character->GetPawnViewLocation();
+					const FVector Eye = TraceChar->GetPawnViewLocation();
 					PC->SetControlRotation((Target->GetActorLocation() - Eye).Rotation());
 				}
 				return true;
@@ -875,8 +875,8 @@ namespace TraceInputHarness
 		 */
 		bool TickKillSelf(ATracePlayerController* PC)
 		{
-			ATraceCharacter* Character = PC->GetTraceCharacter();
-			if (Character == nullptr)
+			ATraceCharacter* TraceChar = PC->GetTraceCharacter();
+			if (TraceChar == nullptr)
 			{
 				// Already gone — the bots got there first, which serves just as well.
 				PreDeathPawn = nullptr;
@@ -884,13 +884,13 @@ namespace TraceInputHarness
 				return true;
 			}
 
-			PreDeathPawn = Character;
+			PreDeathPawn = TraceChar;
 
-			if (UTraceHealthComponent* Health = Character->FindComponentByClass<UTraceHealthComponent>())
+			if (UTraceHealthComponent* Health = TraceChar->FindComponentByClass<UTraceHealthComponent>())
 			{
 				UE_LOG(LogTraceGame, Display,
 					TEXT("SELFTEST: killing %s on purpose to test that input survives re-possession."),
-					*Character->GetName());
+					*TraceChar->GetName());
 
 				// Kill(), not ApplyDamage(): it ignores invulnerability, so this works even if we
 				// happen to be holding the Core when the test reaches this point.
@@ -909,9 +909,9 @@ namespace TraceInputHarness
 
 		bool TickAwaitRespawn(ATracePlayerController* PC)
 		{
-			ATraceCharacter* Character = PC->GetTraceCharacter();
+			ATraceCharacter* TraceChar = PC->GetTraceCharacter();
 			const bool bFreshPawn =
-				Character != nullptr && Character->IsAlive() && Character != PreDeathPawn.Get();
+				TraceChar != nullptr && TraceChar->IsAlive() && TraceChar != PreDeathPawn.Get();
 
 			if (!bFreshPawn)
 			{
@@ -929,7 +929,7 @@ namespace TraceInputHarness
 
 			UE_LOG(LogTraceGame, Display,
 				TEXT("SELFTEST: respawned as %s after %.1fs. Re-running the whole sequence on the new pawn."),
-				*Character->GetName(), PhaseElapsed);
+				*TraceChar->GetName(), PhaseElapsed);
 
 			bSecondPass = true;
 			LookSamplesSent = 0;
@@ -1077,9 +1077,9 @@ namespace TraceInputHarness
 
 			// The proof is worthless if the per-event logging is off, so turn it on here rather
 			// than relying on whoever launched the run to have remembered.
-			if (IConsoleVariable* LogInput = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.LogInput")))
+			if (IConsoleVariable* LogInputCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.LogInput")))
 			{
-				LogInput->Set(1, ECVF_SetByConsole);
+				LogInputCVar->Set(1, ECVF_SetByConsole);
 			}
 
 			FSelfTest::Start(Settle, Path);
