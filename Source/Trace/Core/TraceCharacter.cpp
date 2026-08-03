@@ -1069,6 +1069,13 @@ void ATraceCharacter::SetCarrying(bool bNewCarrying)
 
 	// Carrier state gates invulnerability and the HUD banner — worth a packet immediately.
 	ForceNetUpdate();
+
+	// Display, not Verbose, and one line per possession change is cheap at ten players. bIsCarrier is
+	// the ONLY input to the view mode (WantsFirstPersonView), so "the camera is stuck in third
+	// person" is always a question about this exact line: either it never ran, or it ran on the
+	// server and the owning client never heard about it. Without it, both look identical.
+	UE_LOG(LogTraceGame, Display, TEXT("[Carry] %s bIsCarrier -> %d (authority, netmode=%d)"),
+		*GetName(), bNewCarrying ? 1 : 0, static_cast<int32>(GetNetMode()));
 }
 
 void ATraceCharacter::HandleDeath(AController* Killer, FName Cause)
@@ -1407,6 +1414,15 @@ void ATraceCharacter::PollTeamColors()
 void ATraceCharacter::OnRep_IsCarrier()
 {
 	ApplyTeamColors();
+
+	// The remote half of the [Carry] line in SetCarrying(). On a client this is the only proof the
+	// new value actually arrived — and a replicated bool re-set to the value it already holds fires
+	// no OnRep at all, so a missing line here next to a present one there IS the bug report.
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[Carry] %s bIsCarrier -> %d (replicated to client)"),
+			*GetName(), bIsCarrier ? 1 : 0);
+	}
 
 	// The camera is NOT moved from here. UpdateViewBlend() reads the carrier state every frame and
 	// walks toward it, which means the transition is identical whether the state arrived by
@@ -2115,13 +2131,16 @@ void ATraceCharacter::DoFirePressed()
 
 void ATraceCharacter::DoFireReleased()
 {
-	// The release ALWAYS propagates to both consumers. A player who picks up the Core mid-burst, or
-	// loses it mid-pass, must not be left with a stuck trigger or a stuck pass hold — and exactly
-	// one of these two is in a state where the release matters.
-	if (bIsCarrier)
-	{
-		DoPassReleased();
-	}
+	// UNCONDITIONAL, both halves. The comment here used to say "the release ALWAYS propagates" and
+	// then gate the pass half on bIsCarrier, which is the one state guaranteed to be wrong by the
+	// time it is read: a completed pass clears bIsCarrier on this pawn BEFORE the player's finger
+	// leaves the button, so the gate swallowed exactly the release it existed to deliver. See
+	// DoPassReleased(), whose own comment has always said this.
+	//
+	// Safe to send unconditionally now that ATraceCore::RequestPassInput takes the requester and
+	// decides for itself whose button it is - a non-holder's mouse1 release can no longer cancel
+	// the holder's pass, which is what made the gate look necessary in the first place.
+	DoPassReleased();
 
 	if (Weapon != nullptr)
 	{
@@ -2131,16 +2150,13 @@ void ATraceCharacter::DoFireReleased()
 
 void ATraceCharacter::DoPassPressed()
 {
-	// Local early-out only. ATraceCore re-checks possession, range, line of sight and the aim cone
-	// on the server every tick of the hold; this call is predicted locally purely for the HUD ring.
-	if (!bIsCarrier)
-	{
-		return;
-	}
-
+	// No local bIsCarrier gate. ATraceCore owns "may this pawn arm the pass", it checks the Core's
+	// own idea of who is holding rather than a replicated mirror of it, and it re-checks possession,
+	// range, line of sight and the aim cone on the server every tick of the hold. A second copy of
+	// the rule here could only ever disagree with the first.
 	if (ATraceCore* TheCore = ATraceCore::Get(GetWorld()))
 	{
-		TheCore->RequestPassInput(true);
+		TheCore->RequestPassInput(true, this);
 	}
 }
 
@@ -2148,10 +2164,12 @@ void ATraceCharacter::DoPassReleased()
 {
 	// NOT gated on bIsCarrier: a completed pass clears bIsCarrier on this pawn before the player's
 	// finger leaves the button, and the Core still needs to hear the release so bPassInputHeld does
-	// not stay latched into the next possession. RequestPassInput is a safe no-op for a non-holder.
+	// not stay latched into the next possession. Passing `this` is what makes that safe — the Core
+	// matches the release against whoever armed the latch, so this pawn can still deliver its own
+	// release after losing the Core, while a non-holder's release cannot touch anybody else's pass.
 	if (ATraceCore* TheCore = ATraceCore::Get(GetWorld()))
 	{
-		TheCore->RequestPassInput(false);
+		TheCore->RequestPassInput(false, this);
 	}
 }
 
@@ -2252,7 +2270,7 @@ void ATraceCharacter::PerformPass(const FVector& Direction)
 		return;
 	}
 
-	TheCore->RequestPassInput(true);
+	TheCore->RequestPassInput(true, this);
 }
 
 void ATraceCharacter::DoDash()
@@ -2388,17 +2406,32 @@ namespace
 					const double AimErrorDegrees = FMath::RadiansToDegrees(
 						FMath::Acos(FMath::Clamp(FVector::DotProduct(CameraFwd, AimDir), -1.0, 1.0)));
 
+					// The Core's own answer, printed next to the pawn's mirror of it. THE TWO MUST
+					// AGREE. carrier=1 with coreHolder pointing at somebody else is precisely the
+					// "stuck in third person" bug: the camera is a pure function of the mirror, so a
+					// mirror that outlives the possession strands the view behind the player forever.
+					// passHeld is here for the same reason — a latched mouse1 with nobody's finger on
+					// it can start a pass on its own, and nothing else in the game shows it.
+					const ATraceCore* ProbeCore = ATraceCore::Get(TraceChar->GetWorld());
+					const ATraceCharacter* ProbeHolder = (ProbeCore != nullptr) ? ProbeCore->GetCarrier() : nullptr;
+
 					// crouch / eye / viewmodel are logged alongside because they are the three things
 					// that can silently break the aim guarantee or the new viewmodel and that a
 					// screenshot cannot distinguish: a crouch that never engaged looks exactly like
 					// one that did if the eye height is not printed, and a viewmodel hidden by a
 					// visibility bug looks exactly like one that was never built.
 					UE_LOG(LogTraceGame, Display,
-						TEXT("[ViewProbe] mode=%s carrier=%d blend=%.2f arm=%.1f eyeErr=%.2fuu aimErr=%.4fdeg ")
+						TEXT("[ViewProbe] mode=%s carrier=%d coreHolder=%s holderIsMe=%d passActive=%d passHeld=%d predicted=%d ")
+						TEXT("blend=%.2f arm=%.1f eyeErr=%.2fuu aimErr=%.4fdeg ")
 						TEXT("bodyHiddenFromOwner=%d ctrlYaw=%d orientToMove=%d ")
 						TEXT("crouched=%d sliding=%d halfHeight=%.1f baseEye=%.1f vmParts=%d vmVisible=%d"),
 						TraceChar->GetViewBlendAlpha() < 0.5f ? TEXT("FIRST") : TEXT("THIRD"),
 						TraceChar->IsCarrier() ? 1 : 0,
+						*GetNameSafe(ProbeHolder),
+						(ProbeHolder == TraceChar) ? 1 : 0,
+						(ProbeCore != nullptr && ProbeCore->IsPassActive()) ? 1 : 0,
+						(ProbeCore != nullptr && ProbeCore->IsPassInputHeld()) ? 1 : 0,
+						(ProbeCore != nullptr && ProbeCore->IsPassLocallyPredicted()) ? 1 : 0,
 						TraceChar->GetViewBlendAlpha(),
 						TraceChar->SpringArm != nullptr ? TraceChar->SpringArm->TargetArmLength : -1.f,
 						EyeError,
@@ -2608,11 +2641,14 @@ namespace
 							return true;
 						}
 
-						// Give the hover 6s to find a teammate — well clear of the 0.5s the rule needs.
-						// The surplus is for a receiver walking into the crosshair, which is not
-						// something a screenshot harness can aim.
+						// Give the hover 20s to find a teammate — far more than the 0.5s the rule needs,
+						// and the surplus is not slack. A pass that acquires and then CANCELS (a
+						// receiver stepping behind cover, the crosshair drifting for a frame) spends
+						// PassCooldownSeconds before the still-held button may acquire again, so a
+						// window of a few seconds could only ever observe the first attempt. Watching
+						// a held button recover from a cancel is the whole behaviour under test.
 						const bool bStillCarrying = Carrier->IsCarrier();
-						if (bStillCarrying && (ElapsedSeconds - PassPressedSeconds) < 6.0)
+						if (bStillCarrying && (ElapsedSeconds - PassPressedSeconds) < 20.0)
 						{
 							return true;
 						}
@@ -2817,6 +2853,122 @@ namespace
 					const FVector Chest = Nearest->GetActorLocation() + FVector(0.0, 0.0, 40.0);
 					MyController->SetControlRotation((Chest - MyView).Rotation());
 					return true;
+				}),
+				0.f);
+		}));
+
+	/**
+	 * Trace.DebugPassTargets [IntervalSeconds] [Samples]
+	 *
+	 * For the local player, asks ATraceCore::IsLegalPassTarget about EVERY other character and prints
+	 * which test each one failed.
+	 *
+	 * This exists because of a bug whose only symptom was a camera. The view mode is
+	 * `!bIsCarrier` and nothing else, so a carrier who cannot get rid of the Core is a player stuck in
+	 * third person — and "the camera is stuck" and "the pass never acquires anybody" produce exactly
+	 * the same log line ("no receiver found") and exactly the same screenshot. The reasons come out of
+	 * the real rule through an out-param rather than from a copy of it here, so this cannot drift away
+	 * from what the game actually enforces.
+	 *
+	 * When the answer is "no line of sight" it re-runs the same ECC_Visibility trace and NAMES THE
+	 * BLOCKER, because "something is in the way" across a 24000 uu arena is not a diagnosis.
+	 */
+	FAutoConsoleCommand CmdDebugPassTargets(
+		TEXT("Trace.DebugPassTargets"),
+		TEXT("Trace.DebugPassTargets [IntervalSeconds] [Samples] — log why each teammate is or is not a legal pass receiver."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Interval = (Args.Num() > 0) ? FMath::Max(0.1f, FCString::Atof(*Args[0])) : 1.f;
+			const int32 Samples = (Args.Num() > 1) ? FMath::Max(1, FCString::Atoi(*Args[1])) : 30;
+
+			int32 Emitted = 0;
+			double SinceLast = 0.0;
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([Emitted, SinceLast, Interval, Samples](float DeltaTime) mutable -> bool
+				{
+					SinceLast += DeltaTime;
+					if (SinceLast < Interval)
+					{
+						return true;
+					}
+					SinceLast = 0.0;
+
+					UWorld* World = FindDebugGameWorld();
+					ATraceCharacter* Me = FindDebugLocalCharacter(World);
+					ATraceCore* TheCore = (World != nullptr) ? ATraceCore::Get(World) : nullptr;
+					if (Me == nullptr || TheCore == nullptr)
+					{
+						return (++Emitted < Samples);
+					}
+
+					TArray<ATraceCharacter*> Candidates;
+					TheCore->GatherCharacters(Candidates);
+
+					const FVector MyView = Me->GetPawnViewLocation();
+					const FVector MyAim = Me->GetAimDirection();
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[PassTargets] %s carrier=%d holder=%s candidates=%d best=%s"),
+						*Me->GetName(), Me->IsCarrier() ? 1 : 0, *GetNameSafe(TheCore->GetCarrier()),
+						Candidates.Num(), *GetNameSafe(TheCore->FindPassTargetFor(Me)));
+
+					for (const ATraceCharacter* Candidate : Candidates)
+					{
+						if (Candidate == nullptr || Candidate == Me)
+						{
+							continue;
+						}
+
+						const TCHAR* Reason = TEXT("?");
+						const bool bLegal = TheCore->IsLegalPassTarget(Me, Candidate, /*bRequireAim=*/true, &Reason);
+
+						const FVector Chest = Candidate->GetActorLocation() + FVector(0.0, 0.0, 20.0);
+						FVector ToTarget = Chest - MyView;
+						const double Distance = ToTarget.Size();
+						const double AngleDegrees = (Distance > 1.0)
+							? FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(
+								FVector::DotProduct(ToTarget / Distance, MyAim), -1.0, 1.0)))
+							: 0.0;
+
+						// Only the interesting ones: an enemy on the far side of the map failing "not
+						// an ally" is noise, and ten players times thirty samples of it is a log nobody
+						// reads.
+						const bool bAlly = (Candidate->GetTeam() != ETraceTeam::None)
+							&& (Candidate->GetTeam() == Me->GetTeam());
+						if (!bAlly)
+						{
+							continue;
+						}
+
+						FString Blocker;
+						if (FCString::Strcmp(Reason, TEXT("no line of sight")) == 0)
+						{
+							FCollisionQueryParams QueryParams(FName(TEXT("TraceDebugPassLOS")), /*bTraceComplex=*/false);
+							QueryParams.AddIgnoredActor(TheCore);
+							QueryParams.AddIgnoredActor(Me);
+							QueryParams.AddIgnoredActor(Candidate);
+
+							FHitResult Hit;
+							if (World->LineTraceSingleByChannel(Hit, MyView, Chest, ECC_Visibility, QueryParams))
+							{
+								Blocker = FString::Printf(TEXT(" blockedBy=%s/%s profile=%s at %.0fuu"),
+									*GetNameSafe(Hit.GetActor()),
+									*GetNameSafe(Hit.GetComponent()),
+									Hit.GetComponent() != nullptr
+										? *Hit.GetComponent()->GetCollisionProfileName().ToString()
+										: TEXT("?"),
+									Hit.Distance);
+							}
+						}
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[PassTargets]   ally %-18s legal=%d reason=%-24s dist=%.0fuu angle=%.1fdeg alive=%d%s"),
+							*Candidate->GetName(), bLegal ? 1 : 0, Reason, Distance, AngleDegrees,
+							Candidate->IsAlive() ? 1 : 0, *Blocker);
+					}
+
+					return (++Emitted < Samples);
 				}),
 				0.f);
 		}));

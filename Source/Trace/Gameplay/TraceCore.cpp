@@ -573,22 +573,40 @@ void ATraceCore::GatherCharacters(TArray<ATraceCharacter*>& OutCharacters) const
 	}
 }
 
-bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCharacter* Candidate, bool bRequireAim) const
+bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCharacter* Candidate, bool bRequireAim,
+	const TCHAR** OutRejectReason) const
 {
+	// Every `return false` below names itself. Costs nothing when the caller does not ask (the
+	// gameplay path passes null), and turns "no receiver found" — which is what a carrier who cannot
+	// get rid of the Core actually experiences — into a specific broken test.
+	const auto Reject = [OutRejectReason](const TCHAR* Reason) -> bool
+	{
+		if (OutRejectReason != nullptr)
+		{
+			*OutRejectReason = Reason;
+		}
+		return false;
+	};
+
+	if (OutRejectReason != nullptr)
+	{
+		*OutRejectReason = TEXT("legal");
+	}
+
 	if (!IsValid(Holder) || !IsValid(Candidate) || Holder == Candidate)
 	{
-		return false;
+		return Reject(TEXT("invalid or self"));
 	}
 
 	// §9.3 [ASSUMPTION]: you cannot pass to a dead or respawning teammate.
 	if (!Candidate->IsAlive())
 	{
-		return false;
+		return Reject(TEXT("dead"));
 	}
 
 	if (!AreAllies(Holder->GetTeam(), Candidate->GetTeam()))
 	{
-		return false;
+		return Reject(TEXT("not an ally"));
 	}
 
 	const FVector ViewLocation = Holder->GetPawnViewLocation();
@@ -596,7 +614,7 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 
 	if (FVector::DistSquared(ViewLocation, TargetChest) > FMath::Square(TraceCoreTuning::PassMaxRange))
 	{
-		return false;
+		return Reject(TEXT("out of range"));
 	}
 
 	// Line of sight, against WORLD GEOMETRY ONLY - and "world geometry" means ECC_Visibility, not an
@@ -625,7 +643,7 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 
 		if (World->LineTraceTestByChannel(ViewLocation, TargetChest, ECC_Visibility, QueryParams))
 		{
-			return false;
+			return Reject(TEXT("no line of sight"));
 		}
 	}
 
@@ -648,7 +666,7 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 	const double Cosine = FVector::DotProduct(ToTarget, AimDirection);
 	if (Cosine <= 0.0)
 	{
-		return false;   // Behind us.
+		return Reject(TEXT("behind us"));
 	}
 
 	// (a) angular cone - what makes a distant receiver acquirable at all.
@@ -676,7 +694,12 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 	FMath::SegmentDistToSegmentSafe(ViewLocation, RayEnd, CapsuleBottom, CapsuleTop, ClosestOnRay, ClosestOnCapsule);
 
 	const double Threshold = CapsuleRadius + TraceCoreTuning::PassAimSlack;
-	return FVector::DistSquared(ClosestOnRay, ClosestOnCapsule) <= (Threshold * Threshold);
+	if (FVector::DistSquared(ClosestOnRay, ClosestOnCapsule) > (Threshold * Threshold))
+	{
+		return Reject(TEXT("not under the crosshair"));
+	}
+
+	return true;
 }
 
 ATraceCharacter* ATraceCore::FindPassTargetFor(const ATraceCharacter* Holder) const
@@ -723,13 +746,42 @@ ATraceCharacter* ATraceCore::FindPassTargetFor(const ATraceCharacter* Holder) co
 // Pass: input and state machine
 // =================================================================================================
 
-void ATraceCore::RequestPassInput(bool bPressed)
+void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 {
-	// Only the holder can pass, and only a living one.
-	if (!IsValid(Carrier) || !Carrier->IsAlive())
+	if (!IsValid(Requester))
 	{
 		return;
 	}
+
+	// bPassInputHeld is ONE latch shared by the whole match, so "safe to call on a non-holder" —
+	// which this function used to claim — was wrong in both directions. Who is asking decides
+	// whether the latch may move.
+	if (bPressed)
+	{
+		// Only the living holder may arm it.
+		if (Requester != Carrier || !Carrier->IsAlive())
+		{
+			return;
+		}
+		PassInputInstigator = Requester;
+	}
+	else
+	{
+		// A RELEASE is honoured from the holder OR from whoever armed it, and the second case is the
+		// one that matters: a completed pass moves the Core to the receiver BEFORE the player's
+		// finger leaves the button, so the passer is no longer the holder when their release lands.
+		// (Tracked per machine; nothing here is replicated.)
+		if (Requester != Carrier && Requester != PassInputInstigator.Get())
+		{
+			return;
+		}
+		PassInputInstigator = nullptr;
+	}
+
+	// No "is anyone holding the Core" check here any more. A PRESS already implies one — it is only
+	// reached when Requester is the living Carrier. A RELEASE must go through even when nobody is
+	// holding the Core (one arriving during a kickoff window), because a release that is dropped is
+	// exactly what leaves the latch set.
 
 	if (HasAuthority())
 	{
@@ -747,7 +799,9 @@ void ATraceCore::RequestPassInput(bool bPressed)
 	// does NOT predict the shield drop or the trace hardening: those are damage rules, they are
 	// resolved on the server, and a client that mispredicted them would be showing itself a
 	// safety it does not have.
-	if (Carrier->IsLocallyControlled())
+	// Requester, not Carrier: the release half of this runs after a completed pass has already moved
+	// Carrier to the receiver, and it is OUR prediction that has to be unwound, not theirs.
+	if (Requester->IsLocallyControlled())
 	{
 		if (bPressed)
 		{
@@ -768,21 +822,17 @@ void ATraceCore::RequestPassInput(bool bPressed)
 		}
 	}
 
-	ServerSetPassInput(bPressed);
+	ServerSetPassInput(bPressed, Requester);
 }
 
-void ATraceCore::ServerSetPassInput_Implementation(bool bPressed)
+void ATraceCore::ServerSetPassInput_Implementation(bool bPressed, ATraceCharacter* Requester)
 {
 	// Network input: this RPC is routed by ownership (SetOwner(Carrier) in GrantTo), so only the
-	// holding connection can reach it at all. Re-check anyway - ownership replication and the
-	// client's own idea of who holds the Core can disagree for a frame.
-	if (!IsValid(Carrier))
-	{
-		return;
-	}
-
-	bPassInputHeld = bPressed;
-	ServerTickPass(0.f);
+	// holding connection can reach it at all. It is re-validated anyway, by running the SAME
+	// function the client ran - on the server HasAuthority() is true, so this lands in the branch
+	// above and applies the identical press/release ownership rules. One copy of the rules, and a
+	// client that lies about Requester is refused by them exactly as a local call would be.
+	RequestPassInput(bPressed, Requester);
 }
 
 void ATraceCore::ServerTickPass(float /*DeltaSeconds*/)
@@ -797,6 +847,7 @@ void ATraceCore::ServerTickPass(float /*DeltaSeconds*/)
 	if (!IsValid(Carrier) || !Carrier->IsAlive())
 	{
 		CancelPass(TEXT("holder gone"));
+		ClearPassInput();
 		return;
 	}
 
@@ -892,7 +943,23 @@ void ATraceCore::CancelPass(const TCHAR* Reason)
 		return;
 	}
 
-	bPassInputHeld = false;
+	// THIS USED TO START WITH `bPassInputHeld = false;` AND THAT WAS THE BUG.
+	//
+	// bPassInputHeld is not pass state. It is a mirror of a PHYSICAL BUTTON, and only the player who
+	// is holding that button (or losing the pawn that owns it) may change it. Clearing it here meant
+	// that any cancel - a receiver stepping behind a lane rail for one frame, the crosshair drifting
+	// off for one frame - silently disarmed a mouse button the player was still holding down. From
+	// then on ServerTickPass hit `if (!bPassInputHeld) return;` and refused to acquire ANYBODY, no
+	// matter how perfectly the crosshair sat on a teammate, until the player physically let go and
+	// pressed again. Measured: a pass cancelled 24ms before it would have completed, then six
+	// further seconds of holding the button with a legal receiver on the crosshair and nothing
+	// happening. The player is left holding the Core - and the camera is `!bIsCarrier` and nothing
+	// else, so "the Core will not leave" and "I am stuck in third person" are the same event.
+	//
+	// Churn is already prevented, and by the right mechanism: a cancel with a Reason spends
+	// PassCooldownSeconds below, so a held button re-acquires on a cooldown rather than every frame.
+	// The latch is cleared where it actually belongs - on a release, and on a possession change
+	// (ClearPassInput, called from ReleaseHolder and GrantTo).
 
 	if (!bPassActive)
 	{
@@ -901,7 +968,11 @@ void ATraceCore::CancelPass(const TCHAR* Reason)
 
 	if (Reason != nullptr)
 	{
-		UE_LOG(LogTraceGame, Verbose, TEXT("Core: pass cancelled (%s) - shield restored, trace vulnerable"), Reason);
+		// Display, unlike its "pass started" counterpart. A cancel that the player did not ask for is
+		// the failure signature of this whole area — it is what leaves them holding the Core, and
+		// therefore stuck in third person — and it names its own reason. At most a few lines a
+		// minute, since only one player can be passing at a time.
+		UE_LOG(LogTraceGame, Display, TEXT("Core: pass cancelled (%s) - shield restored, trace vulnerable"), Reason);
 
 		// A cancelled attempt still spends the cooldown. Without this, tapping the button is a free
 		// way to churn the shield state (and the packets that carry it) every frame.
@@ -915,6 +986,15 @@ void ATraceCore::CancelPass(const TCHAR* Reason)
 	ApplyTraceInvulnerability();
 	UpdateVisuals();
 	ForceNetUpdate();
+}
+
+void ATraceCore::ClearPassInput()
+{
+	// The one legitimate reason to forget a held button without hearing a release: the pawn that was
+	// holding it is not the holder any more. Whoever has the Core now has not pressed anything, and
+	// a latch inherited from the previous holder would start a pass they never asked for.
+	bPassInputHeld = false;
+	PassInputInstigator = nullptr;
 }
 
 void ATraceCore::DriveBotAimAtPassTarget()
@@ -987,6 +1067,9 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 
 	CancelPass(nullptr);
 	ReleaseHolder();
+
+	// Explicit, and no longer a side effect of CancelPass: the incoming holder inherits no button.
+	ClearPassInput();
 
 	Carrier = NewHolder;
 	State = ECoreState::Carried;
@@ -1084,6 +1167,11 @@ void ATraceCore::ReleaseHolder()
 	Carrier = nullptr;
 	State = ECoreState::Loose;
 	SetOwner(nullptr);
+
+	// Possession is gone, so the held-button state that belonged to it is gone too. Every path that
+	// takes the Core off somebody funnels through here - a completed pass, a kill, a disconnect, a
+	// score, half time - which is why this is the one place it needs saying.
+	ClearPassInput();
 
 	DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
 
@@ -1314,6 +1402,7 @@ void ATraceCore::Throw(const FVector& /*Direction*/, float /*Speed*/)
 	// receiver immediately before calling this, so they acquire on the first frame; the state
 	// machine then holds their crosshair there for them (DriveBotAimAtPassTarget).
 	bPassInputHeld = true;
+	PassInputInstigator = Carrier;
 	ServerTickPass(0.f);
 
 	// Single shot. This entry point is a PRESS with no matching release (ATraceCharacter::DoPass is
@@ -1323,7 +1412,7 @@ void ATraceCore::Throw(const FVector& /*Direction*/, float /*Speed*/)
 	// stays set and the state machine owns it until the hold completes or the holder looks away.
 	if (!bPassActive)
 	{
-		bPassInputHeld = false;
+		ClearPassInput();
 	}
 }
 

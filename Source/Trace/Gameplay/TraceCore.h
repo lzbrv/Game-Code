@@ -160,13 +160,30 @@ public:
 
 	/**
 	 * The holder's mouse1 state. Call on the machine that owns the input; it predicts locally and
-	 * forwards to the server. Safe to call from anywhere, including on a non-holder (no-op).
+	 * forwards to the server.
+	 *
+	 * @p Requester is the pawn whose button this is, and it is NOT optional bookkeeping.
+	 * bPassInputHeld is a single latch shared by the whole match, so "safe to call on a non-holder"
+	 * — which this used to claim — was false in both directions: a non-holder's press could arm the
+	 * holder's pass, and a non-holder's mouse1 RELEASE could cancel it. The rules are now:
+	 *
+	 *   PRESS   accepted only from the living current holder.
+	 *   RELEASE accepted from the current holder OR from whoever latched it. The second half is
+	 *           load-bearing: a completed pass moves the Core to the receiver BEFORE the player's
+	 *           finger leaves the button, so the passer is no longer the holder when their release
+	 *           arrives, and dropping it there is what leaves the latch set into the next possession.
 	 */
-	void RequestPassInput(bool bPressed);
+	void RequestPassInput(bool bPressed, ATraceCharacter* Requester);
 
-	/** Server RPC half of RequestPassInput. Routed via this actor's Owner (= the holder). */
+	/**
+	 * Server RPC half of RequestPassInput. Routed via this actor's Owner (= the holder).
+	 *
+	 * Requester travels with the call rather than being inferred from the Owner: ownership moves the
+	 * instant the Core does, so a release sent a frame before a transfer would otherwise be applied
+	 * to the pawn that just RECEIVED the Core.
+	 */
 	UFUNCTION(Server, Reliable)
-	void ServerSetPassInput(bool bPressed);
+	void ServerSetPassInput(bool bPressed, ATraceCharacter* Requester);
 
 	/** 0..1 progress of the pass hold, from replicated state, or from local prediction if newer. */
 	float GetPassProgress() const;
@@ -181,11 +198,49 @@ public:
 	float GetPassCooldownRemaining() const;
 
 	/**
+	 * Diagnostics: the raw latched mouse1 state the server is holding for the current holder.
+	 *
+	 * Meaningful on the authority only (a client never writes it). Exposed because a latched pass
+	 * input with nobody's finger on the button is invisible in every other reading of the game —
+	 * see Trace.DebugViewProbe, which prints it next to the carrier flag it can silently corrupt.
+	 */
+	bool IsPassInputHeld() const { return bPassInputHeld; }
+
+	/** Diagnostics: true once the local machine has predicted a pass that the server has not confirmed. */
+	bool IsPassLocallyPredicted() const { return bLocalPassPredicted; }
+
+	/**
 	 * Whoever the given character would pass to right now, evaluated from THEIR aim. Server-side
 	 * truth when called on the server; a local prediction when called on the owning client.
 	 * Public so the HUD can highlight the receiver before the button is pressed.
 	 */
 	ATraceCharacter* FindPassTargetFor(const ATraceCharacter* Holder) const;
+
+	// PUBLIC, not private, for one reason: the console diagnostic Trace.DebugPassTargets asks the
+	// REAL rule below why each teammate was refused. A debug command that re-implemented the rule
+	// would be a second copy of it, and a second copy is how a pass-acquisition bug gets diagnosed
+	// against logic the game does not actually run. Both are const queries; neither moves the Core.
+
+	/**
+	 * True if @p Candidate is a legal receiver for @p Holder right now: alive, on their team, in
+	 * range, in line of sight, and (when @p bRequireAim) under their crosshair.
+	 *
+	 * bRequireAim is false for AI holders during an active pass only. A bot's crosshair is driven
+	 * BY this class (DriveBotAimAtPassTarget), and the bot controller's own aim slew runs in an
+	 * unspecified order relative to this actor's tick, so re-testing the hover against a rotation we
+	 * just wrote is a coin flip that would make bot passes cancel at random. Range, line of sight
+	 * and "still alive and on my team" are enforced for bots exactly as for humans.
+	 *
+	 * @param OutRejectReason optional; on a false return, set to a literal naming the test that
+	 *        failed. Diagnostics only (Trace.DebugPassTargets), and the reason this is an out-param
+	 *        rather than a second copy of the rules in the debug command: a copy would drift, and a
+	 *        pass-acquisition bug diagnosed against a drifted copy is worse than no diagnosis.
+	 */
+	bool IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCharacter* Candidate, bool bRequireAim = true,
+		const TCHAR** OutRejectReason = nullptr) const;
+
+	/** Every character the match knows about. GameMode list, with an actor-iterator fallback. */
+	void GatherCharacters(TArray<ATraceCharacter*>& OutCharacters) const;
 
 	// --- Cross-system queries --------------------------------------------------------------------
 
@@ -285,6 +340,15 @@ private:
 	/** Server. Ticks the pass state machine: acquire, validate, complete, cancel. */
 	void ServerTickPass(float DeltaSeconds);
 
+	/**
+	 * Server. Forgets the held mouse1 latch WITHOUT a release having been heard.
+	 *
+	 * Legitimate in exactly one situation: possession changed, so the button that armed the latch
+	 * belongs to a pawn that is no longer the holder. Deliberately NOT called from CancelPass - see
+	 * the note there.
+	 */
+	void ClearPassInput();
+
 	/** Server. Starts the hold on @p Target. */
 	void BeginPass(ATraceCharacter* Target);
 
@@ -318,25 +382,20 @@ private:
 	/** Shared clock, matching UTraceTrailComponent::GetServerTimeSeconds(). */
 	float GetServerTimeSeconds() const;
 
-	/**
-	 * True if @p Candidate is a legal receiver for @p Holder right now: alive, on their team, in
-	 * range, in line of sight, and (when @p bRequireAim) under their crosshair.
-	 *
-	 * bRequireAim is false for AI holders during an active pass only. A bot's crosshair is driven
-	 * BY this class (DriveBotAimAtPassTarget), and the bot controller's own aim slew runs in an
-	 * unspecified order relative to this actor's tick, so re-testing the hover against a rotation we
-	 * just wrote is a coin flip that would make bot passes cancel at random. Range, line of sight
-	 * and "still alive and on my team" are enforced for bots exactly as for humans.
-	 */
-	bool IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCharacter* Candidate, bool bRequireAim = true) const;
-
-	/** Every character the match knows about. GameMode list, with an actor-iterator fallback. */
-	void GatherCharacters(TArray<ATraceCharacter*>& OutCharacters) const;
 
 	// --- Server state ----------------------------------------------------------------------------
 
 	/** Mouse1 as last reported by the holder. The server never trusts anything else from them. */
 	bool bPassInputHeld = false;
+
+	/**
+	 * The pawn that latched bPassInputHeld, i.e. whose finger is on the button.
+	 *
+	 * Tracked on every machine (each keeps its own copy; nothing about it is replicated) so that the
+	 * release can be matched to the press even after the Core has changed hands in between — see
+	 * RequestPassInput. Cleared with the latch itself in CancelPass.
+	 */
+	TWeakObjectPtr<ATraceCharacter> PassInputInstigator;
 
 	/** The holder whose OnDeath we are currently bound to. */
 	TWeakObjectPtr<ATraceCharacter> BoundDeathHolder;

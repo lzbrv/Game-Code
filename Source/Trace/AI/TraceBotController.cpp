@@ -344,7 +344,10 @@ static bool ApplyPassInput(ATraceCharacter* Character, bool bPressed)
 
 	if (ATraceCore* TheCore = ATraceCore::Get(Character->GetWorld()))
 	{
-		TheCore->RequestPassInput(bPressed);
+		// Character, not nullptr: the Core matches a release against whoever armed the latch, so a bot
+		// that has just completed a pass can still deliver its own release, and one bot's release can
+		// never cancel another's pass.
+		TheCore->RequestPassInput(bPressed, Character);
 		return true;
 	}
 
