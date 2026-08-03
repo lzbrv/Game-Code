@@ -4,18 +4,28 @@
 
 #include "Net/UnrealNetwork.h"
 
+#include "Animation/AnimInstance.h"
 #include "Camera/CameraComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Containers/Ticker.h"                 // FTSTicker (debug console command below)
+#include "Engine/Engine.h"                     // GEngine (debug console command below)
+#include "HAL/IConsoleManager.h"               // FAutoConsoleCommand (debug console command below)
+#include "Components/PrimitiveComponent.h"      // EFirstPersonPrimitiveType (the viewmodel)
+#include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Controller.h"
+#include "GameFramework/PlayerController.h"    // ApplyRotationMode: human vs bot
 #include "GameFramework/SpringArmComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "Math/RotationMatrix.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -49,27 +59,276 @@ namespace TraceCharacterLayout
 	/** Head centre, chosen so the top of the sphere lands level with the top of the capsule. */
 	constexpr float HeadCentreZ = CapsuleHalfHeight - (HeadDiameter * 0.5f);
 
-	constexpr float NoseSize = 38.f;
-	constexpr float NoseForward = 24.f;
-
-	constexpr float SpringArmLength = 450.f;
-	constexpr float SpringArmPivotZ = 60.f;
-	constexpr float CameraFOV = 95.f;
-
-	/** Muzzle: chest height, pushed out along the aim yaw so tracers do not start inside the body. */
-	constexpr float MuzzleHeight = 40.f;
-	constexpr float MuzzleForward = 45.f;
+	/**
+	 * Skeletal mesh placement on the capsule. SKM_Manny_Simple is authored feet-at-origin, facing
+	 * +Y: its bounds run Z 0..180 about an origin at Z 90 (measured, not assumed — see
+	 * Scripts/import-mannequin.sh). So dropping it by the capsule half-height stands it exactly on
+	 * the bottom of the capsule, and yaw -90 turns its +Y forward onto the actor's +X, which is the
+	 * direction the movement component orients to and the direction GetAimDirection() shoots along.
+	 * Get either of these wrong and the character floats, sinks, or strafes everywhere.
+	 */
+	constexpr float MeshOffsetZ = -CapsuleHalfHeight;
+	constexpr float MeshYaw = -90.f;
 
 	/**
-	 * Distance at which the muzzle ray is made to meet the camera ray. Anything past this converges
-	 * to within a fraction of a degree; anything much closer than this is at point-blank range where
-	 * the parallax is invisible anyway.
+	 * Pushed into M_Mannequin's "EmissivePower" scalar.
+	 *
+	 * MEASURED, NOT ASSUMED, AND THE ANSWER IS DISAPPOINTING: rendering the same frame with this at
+	 * 0 and at 8 produces a visually identical character. M_Mannequin does expose the parameter, but
+	 * MI_Manny_01_New / MI_Manny_02_New — the two instances SKM_Manny_Simple actually ships with —
+	 * mask the emissive contribution to nothing, so on the stock materials this scalar is a no-op.
+	 *
+	 * It is still set, for two reasons: setting a parameter is free, and it means the moment anyone
+	 * swaps in a material whose emissive is live (an authored Tron suit, say) the glow arrives with
+	 * no code change. What ACTUALLY carries team identity today is the "Paint Tint" vector below,
+	 * which is verified to recolour the whole suit — cyan and orange players are unmistakable at
+	 * across-the-arena distance in a captured frame. Do not "rely" on these numbers for readability.
+	 */
+	constexpr float EmissiveNormal = 8.f;
+	constexpr float EmissiveCarrier = 30.f;
+	constexpr float EmissiveDead = 0.f;
+
+	// --- View rig (see the file header) ---------------------------------------------------------
+
+	/**
+	 * Eye height above the capsule centre, and the single number the whole first-person view is
+	 * pinned to. It is pushed into APawn::BaseEyeHeight in the constructor, so GetPawnViewLocation()
+	 * — which the aim ray, the bots and the harness all use — and the first-person camera are the
+	 * same point BY CONSTRUCTION rather than by two constants that agree today.
+	 *
+	 * 64 above centre is 152 above the feet on an 88-half-height capsule, which lands in Manny's
+	 * head (the mesh is 180 tall). It is also APawn's own default, so nothing is being fought.
+	 */
+	constexpr float EyeHeight = 64.f;
+
+	/** Collapsed onto the eye. Not "small": exactly 0, or the camera stops being the gun. */
+	constexpr float FirstPersonArmLength = 0.f;
+
+	constexpr float ThirdPersonArmLength = 450.f;
+
+	/**
+	 * Where the third-person arm pivots, as a WORLD-space offset from the capsule centre
+	 * (USpringArmComponent::TargetOffset, not SocketOffset — SocketOffset is rotated by the arm, so
+	 * using it would swing the camera height around as the player pitches, and in first person that
+	 * would drag the eye off GetPawnViewLocation() and break the aim guarantee above).
+	 *
+	 * Centred, not over-the-shoulder: a lateral offset makes the muzzle ray and the crosshair
+	 * disagree at close range, and this prototype has one crosshair dead centre.
+	 */
+	constexpr float ThirdPersonPivotZ = 60.f;
+
+	/**
+	 * How far the third-person camera must clear the TOP of the carrier's own light trail.
+	 *
+	 * This is not a taste number, it is a correctness one. Third person happens EXACTLY when you are
+	 * carrying the Core, and carrying the Core is exactly when you are laying a trail — a 190 uu tall
+	 * UNLIT EMISSIVE wall, with no collision, extruded along the precise path you just walked. The
+	 * camera hangs ThirdPersonArmLength straight back down that same path. So at the old pivot of 60
+	 * (camera 150 above the feet, trail top 196) the camera spent every moving carry INSIDE its own
+	 * trail, and because the trail material has no lighting term the result was a flat pale slab
+	 * filling the whole frame. Measured over one match: every third-person frame taken while the
+	 * carrier was moving was >50% blown out (one was 96%), while the third-person frames taken while
+	 * the carrier stood still — no trail being laid — were correctly dark.
+	 *
+	 * Raising the pivot fixes it structurally rather than by tuning a glow value down: the camera
+	 * flies above the wall and looks along it, which is the light-cycle shot this game wants anyway.
+	 * The clearance is measured from the top of the trail's cap strip, not from the trail centre.
+	 */
+	constexpr float TrailCameraClearance = 66.f;
+
+	/** Long enough to read as a deliberate pull-back, short enough not to fight for control. */
+	constexpr float ViewBlendSeconds = 0.35f;
+
+	/**
+	 * Below this blend alpha the local player's own body is hidden from their own camera. Slightly
+	 * above 0 on purpose: the last few centimetres of the pull-in put the camera inside the head,
+	 * and a frame of the inside of your own skull is the one artefact this transition can produce.
+	 */
+	constexpr float OwnBodyHideAlpha = 0.2f;
+
+	constexpr float CameraFOV = 95.f;
+
+	/**
+	 * Muzzle: on the aim ray, one short step in front of the eye.
+	 *
+	 * It used to be chest height and 45 uu forward, which put the shot origin 24 uu below and
+	 * outside the crosshair ray and left AimConvergenceDistance below to paper over the parallax.
+	 * In first person that is not acceptable — the camera IS the gun — so the muzzle now sits on the
+	 * ray itself and the convergence correction resolves to the view direction exactly.
+	 *
+	 * 22 uu is deliberately INSIDE the 34 uu capsule radius: the origin can never end up on the far
+	 * side of a wall the player is pressed against, which the old 45 could.
+	 */
+	constexpr float MuzzleForward = 22.f;
+
+	/**
+	 * Distance at which the muzzle ray is made to meet the camera ray. With the muzzle on the ray
+	 * this correction is a no-op (it returns the view direction to float precision); it is kept
+	 * because it is what makes the muzzle offset above a free parameter rather than a load-bearing
+	 * one — move the muzzle off-axis and shots still converge on the crosshair.
 	 */
 	constexpr float AimConvergenceDistance = 6000.f;
 
 	/** Team-colour polling: PlayerState and Team arrive in an order nothing can rely on. */
 	constexpr float TeamColorPollInterval = 0.25f;
 	constexpr int32 MaxTeamColorAttempts = 24;   // ~6 s, then give up and stay grey
+
+	// --- Crouch / slide ---------------------------------------------------------------------------
+
+	/**
+	 * Where the eye sits above the FEET while crouched, in uu.
+	 *
+	 * Expressed against the feet rather than as a BaseEyeHeight because BaseEyeHeight is measured
+	 * from the capsule CENTRE, and the crouched capsule height belongs to
+	 * UTraceCharacterMovementComponent, not to this class. OnStartCrouch() reads the resized capsule
+	 * and subtracts, so this number stays correct whatever the movement component decides a crouch
+	 * is. 92 against a standing 152 is a 60 uu drop: unmistakable in first person, and low enough to
+	 * genuinely change what a slide can see over.
+	 */
+	constexpr float CrouchedEyeAboveFeet = 92.f;
+
+	/**
+	 * BaseEyeHeight while SLIDING, i.e. 30 above the capsule centre and 118 above the feet, against
+	 * 64 / 152 standing.
+	 *
+	 * Not derived from the capsule, because in this game a slide does not shrink the capsule (see
+	 * UpdateCrouchPresentation): the movement component keeps it fixed so hitscan, the rewind
+	 * history and the trail trip test cannot disagree with it. Only the view drops. It stays well
+	 * inside the 88 uu half height so the eye can never leave the collider, and a 34 uu dip is
+	 * plainly readable at a glance without putting the camera in the floor.
+	 */
+	constexpr float SlideEyeHeight = 30.f;
+
+	/** Fast enough that the dip lands with the slide, slow enough that it is a move, not a cut. */
+	constexpr float SlideEyeInterpSpeed = 11.f;
+
+	/** Keeps the crouched eye inside the capsule, so a slide can never poke the camera up through it. */
+	constexpr float CrouchedEyeCapsuleMargin = 6.f;
+
+	/**
+	 * How far the body leans forward at full crouch, in degrees, about the mesh's own foot pivot.
+	 *
+	 * An approximation and knowingly so: there is no crouch or slide animation in the Mannequin set
+	 * (see UpdateCrouchPresentation), so the alternatives were a standing figure inside a
+	 * half-height capsule - which reads as a bug - or squashing the mesh, which reads as a different
+	 * bug. 20 degrees is enough to say "low and moving" from across the arena while keeping the mass
+	 * of the body over the capsule; past ~30 the head starts visibly outrunning the collision.
+	 */
+	constexpr float CrouchLeanPitch = 20.f;
+
+	/** Rate constants for the crouch lean and the skid streak. Fast enough not to feel laggy. */
+	constexpr float CrouchLeanInterpSpeed = 9.f;
+
+	/** Ground speed at which the skid streak reaches full length. */
+	constexpr float SkidFullSpeed = 900.f;
+
+	/** Streak size at full strength: long, narrow, and hugging the deck. */
+	constexpr float SkidLength = 260.f;
+	constexpr float SkidWidth = 46.f;
+	constexpr float SkidThickness = 5.f;
+	constexpr float SkidGlow = 3.4f;
+
+	// --- First-person viewmodel (see the file header) ---------------------------------------------
+	//
+	// EVERYTHING BELOW IS ARITHMETIC, NOT TASTE, and the arithmetic is written down because it is
+	// what let this land without a launch-look-tweak loop.
+	//
+	// The rig is authored in CAMERA SPACE: +X out through the lens, +Y right, +Z up, origin at the
+	// eye. The renderer then draws it through FirstPersonFieldOfView and squashes its depth by
+	// FirstPersonScale, so two independent checks have to pass:
+	//
+	//   FRAMING. Half-width of the frame at distance d is d * tan(FirstPersonFieldOfView / 2), and
+	//   half-height is that times 9/16. The muzzle sits at (75.5, 12.9, -12.3), i.e. 20% right of
+	//   centre and 35% below it; the highest point of the gun - the top of the slide's light channel
+	//   - is 27% below centre. THE CROSSHAIR IS AT 0,0, so the gun clears it by more than a quarter
+	//   of the frame at every point along its length. That was the requirement.
+	//
+	//   DEPTH. The deepest part of the rig is the muzzle at 76 uu. At FirstPersonScale 0.40 the
+	//   renderer draws it at 30 uu, and the pawn capsule radius is 34, so nothing in the viewmodel
+	//   can reach a surface the body cannot already stand against - it can never intersect the
+	//   world. The shallowest part is the far end of a forearm at ~43 uu, drawn at ~17 uu, which
+	//   clears the 10 uu near plane. Those two bounds are why the forearms are 16-17 uu long rather
+	//   than anatomically correct: they run off the bottom of the frame, which is exactly where a
+	//   real viewmodel's arms go.
+	//
+	// MEASURED AND RETUNED. The first pass put the rig at 40 uu through a 70 degree first-person
+	// lens, and a captured frame showed the reason to write the arithmetic down and then go and look
+	// anyway: the gun and hands filled 27% of the frame's width and 43% of its height, which reads
+	// as a prop shoved against the lens rather than as a weapon being carried. Apparent size is
+	// (size / depth) * FOVCorrection, and FOVCorrection is tan(SceneFOV/2) / tan(FirstPersonFOV/2) -
+	// so BOTH dials shrink it. Moving out 40 -> 56 and opening the first-person lens 70 -> 80 (a
+	// correction of 1.30 rather than 1.56) multiplies the on-screen size by 0.60 between them, and
+	// the scale came down 0.5 -> 0.40 to keep the now-more-distant muzzle inside the capsule radius.
+	// Same gun, same aim, three fifths the frame.
+	constexpr float FirstPersonViewModelFOV = 80.f;
+	constexpr float FirstPersonViewModelScale = 0.40f;
+
+	/** Rest pose of the rig in camera space. */
+	const FVector ViewModelRestLocation(56.f, 14.5f, -14.f);
+
+	/** Slight muzzle-up, slight inward yaw, slight cant. A gun held dead square looks like a prop. */
+	const FRotator ViewModelRestRotation(2.f, -4.f, 5.f);
+
+	/** Engine basic shapes are 100 uu; every Size below is a world size and divides by this. */
+	constexpr float ViewModelShapeUnit = 100.f;
+
+	// Sway / bob / recoil. All small: this is texture, not animation, and anything big enough to
+	// notice as movement is big enough to read as the crosshair drifting.
+	constexpr float SwayPerDegree = 0.55f;      // rig degrees per degree of view change this frame
+	constexpr float SwayMaxDegrees = 4.f;
+	constexpr float SwayRecoverSpeed = 9.f;
+	constexpr float BobInterpSpeed = 6.f;
+	constexpr float BobBaseRate = 7.2f;         // radians/s at a standstill-to-walk blend
+	constexpr float BobVerticalUU = 0.6f;
+	constexpr float BobLateralUU = 0.8f;
+	constexpr float KickRecoverSpeed = 11.f;
+	constexpr float KickBackUU = 2.4f;
+	constexpr float KickPitchDegrees = 5.f;
+	constexpr float CrouchDipUU = 2.2f;
+
+	/** One kick per shot however many code paths report the same shot. */
+	constexpr double FireKickRefractorySeconds = 0.02;
+}
+
+namespace TraceCharacterAssets
+{
+	/**
+	 * Imported by Scripts/import-mannequin.sh out of the developer's own engine install; NOT in the
+	 * repository. These paths are not a preference — the .uasset files carry their own absolute
+	 * /Game references internally (SKM_Manny_Simple names /Game/Characters/Mannequins/Meshes/
+	 * SK_Mannequin as its skeleton), so the import script reads the expected root back out of the
+	 * mesh and refuses to copy anywhere else. If you move these, move them in both places.
+	 */
+	const TCHAR* const MannequinMesh = TEXT("/Game/Characters/Mannequins/Meshes/SKM_Manny_Simple.SKM_Manny_Simple");
+
+	/**
+	 * ABP_Unarmed is the ONLY anim blueprint Epic ships in that folder. The Rifle set
+	 * (MM_Rifle_Fire, MF_Rifle_Idle_ADS, the Jog/Walk directional sets) is raw AnimSequences with no
+	 * blueprint and no weapon mesh to hold, so choosing it would mean hand-authoring a state machine
+	 * in C++ and would still leave every character miming a rifle they visibly are not holding.
+	 * ABP_Unarmed reads its own Speed/Direction/IsFalling from the pawn's velocity and drives
+	 * BS_Idle_Walk_Run, so it animates correctly for a C++ ACharacter with no glue at all.
+	 */
+	const TCHAR* const UnarmedAnimClass = TEXT("/Game/Characters/Mannequins/Anims/Unarmed/ABP_Unarmed.ABP_Unarmed_C");
+
+	/** M_Mannequin's parameters, measured from the asset rather than guessed. */
+	const FName PaintTintParam(TEXT("Paint Tint"));
+	const FName EmissivePowerParam(TEXT("EmissivePower"));
+
+	/**
+	 * The two generated Tron materials, shared with ATraceArenaBuilder. NOT in the repository:
+	 * Scripts/generate_content.py writes them into the gitignored Content/Generated, exactly like
+	 * the arena's copies, and exactly like the arena this degrades to BasicShapeMaterial rather than
+	 * failing - a flat-shaded gun beats no gun.
+	 */
+	const TCHAR* const SurfaceMaterialPath = TEXT("/Game/Generated/Materials/M_TraceSurface.M_TraceSurface");
+	const TCHAR* const NeonMaterialPath = TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon");
+
+	/** Printed at most once per process, so a missing import is loud but not spam. */
+	const TCHAR* const MissingImportHint =
+		TEXT("Character art is not imported. Run Scripts/import-mannequin.sh to copy Epic's Mannequin ")
+		TEXT("out of your own UE 5.8 install into Content/Characters/Mannequins. ")
+		TEXT("Falling back to plain team-coloured shapes.");
 }
 
 namespace
@@ -97,6 +356,20 @@ namespace
 	}
 
 	/** Clamps a tint back into a sane range and forces opaque alpha (colours get scaled about). */
+	/**
+	 * "Is a human sitting behind this pawn's eyes on THIS machine."
+	 *
+	 * Not APawn::IsLocallyControlled(), which is true for every bot on the server as well — an
+	 * AIController is by definition a local controller. Hiding a bot's body from "its owner" is
+	 * harmless right up until something makes that bot a view target, and paying for a camera blend
+	 * on nine pawns that have no camera is pure waste.
+	 */
+	bool IsLocalPlayerPawn(const ATraceCharacter& Character)
+	{
+		const APlayerController* PC = Cast<APlayerController>(Character.GetController());
+		return PC != nullptr && PC->IsLocalController();
+	}
+
 	FLinearColor SanitizeTint(const FLinearColor& InColor)
 	{
 		return FLinearColor(
@@ -106,7 +379,7 @@ namespace
 			1.f);
 	}
 
-	/** Shared setup for the three decorative meshes: visible, and incapable of colliding. */
+	/** Shared setup for the fallback shapes: drawable, and incapable of colliding. */
 	void ConfigureVisualMesh(UStaticMeshComponent* Mesh)
 	{
 		if (Mesh == nullptr)
@@ -121,6 +394,9 @@ namespace
 		Mesh->SetGenerateOverlapEvents(false);
 		Mesh->SetCanEverAffectNavigation(false);
 		Mesh->bReceivesDecals = false;
+
+		// Same reason as the skeletal mesh: hidden from its owner in first person, still casting.
+		Mesh->bCastHiddenShadow = true;
 	}
 }
 
@@ -134,18 +410,31 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 	// way to get UTraceCharacterMovementComponent (and with it the predicted dash) in its place.
 	: Super(OI.SetDefaultSubobjectClass<UTraceCharacterMovementComponent>(ACharacter::CharacterMovementComponentName))
 {
-	// ACharacter's own tick settings are left exactly as the engine configured them. Nothing here
-	// needs an actor tick of its own — the movement component ticks itself, the lag-compensation
-	// component records its own frames and the trail ticks server-side — but ACharacter::Tick is
-	// part of the root-motion/simulated-proxy path and is not ours to switch off.
+	// The actor tick exists for exactly one thing: the first/third person camera blend, which needs
+	// a per-frame delta and nothing else. AActor defaults it off and ACharacter does not override
+	// ::Tick at all in 5.8, so this is a new tick function rather than a re-enabled one; everything
+	// else here still ticks itself (the movement component, lag compensation, the trail).
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = true;
 
 	bReplicates = true;
 	SetReplicateMovement(true);
 
-	// Aim and facing are deliberately independent. The capsule turns toward its movement
-	// (bOrientRotationToMovement, set on the movement component) while the camera and the shot
-	// direction follow the control rotation — so a player can strafe around a target while
-	// shooting at it, and other players can read their momentum from their body.
+	// Set here so the class default is right for a pawn that is spawned and never possessed, and
+	// re-derived from that default every time ACharacter::UnCrouch calls RecalculateBaseEyeHeight().
+	// The first-person camera is placed at exactly this height — see EyeHeight.
+	BaseEyeHeight = TraceCharacterLayout::EyeHeight;
+
+	// A starting value only. Crouching now exists (it is how sliding works — spec section 5), and the
+	// real crouched eye height depends on the crouched capsule height, which belongs to
+	// UTraceCharacterMovementComponent. OnStartCrouch() computes it from the resized capsule; see the
+	// note on the override.
+	CrouchedEyeHeight = TraceCharacterLayout::EyeHeight;
+
+	// Facing is mode-dependent and is configured by ApplyRotationMode() once a controller exists —
+	// first person turns the body with the aim, carrying turns it with the movement. These class
+	// defaults are the carrying/bot case (capsule follows its movement, camera and shot direction
+	// follow the control rotation), which is also the only correct answer for an unpossessed pawn.
 	bUseControllerRotationYaw = false;
 	bUseControllerRotationPitch = false;
 	bUseControllerRotationRoll = false;
@@ -155,30 +444,79 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 		Capsule->InitCapsuleSize(TraceCharacterLayout::CapsuleRadius, TraceCharacterLayout::CapsuleHalfHeight);
 		Capsule->SetCollisionProfileName(TEXT("Pawn"));
 
+		// The spring arm below probes on ECC_Camera, and the engine's Pawn profile overrides only
+		// Visibility to Ignore - Camera stays Block. In a 5v5 that means any teammate standing behind
+		// you yanks your camera into your own head. Pawn-vs-Pawn *movement* blocking is on the
+		// WorldDynamic/Pawn channels and is unaffected by this.
+		Capsule->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+
 		// Both sides of an overlap pair must generate events. The endzone trigger and the Core's
 		// pickup sphere are the other half; without this the game has no way to score or to pick
 		// the Core up.
 		Capsule->SetGenerateOverlapEvents(true);
 	}
 
-	// No skeletal mesh is used (contract §2 forbids authored assets) — the static shapes below are
-	// the character. Make sure the inherited component cannot collide or draw anything.
+	// --- The character you actually see ----------------------------------------------------------
+	//
+	// ACharacter already owns a USkeletalMeshComponent; this places it and makes it harmless. The
+	// asset and the anim blueprint are attached later, in SetupCharacterVisuals(), because they are
+	// imported per developer and may not exist (see the header).
+	//
+	// The relative transform is set HERE and nowhere else: ACharacter::PostInitializeComponents()
+	// snapshots it into BaseTranslationOffset/BaseRotationOffset, which root motion and crouch then
+	// work against. Moving the mesh after that point desynchronises those.
 	if (USkeletalMeshComponent* SkeletalMesh = GetMesh())
 	{
+		SkeletalMesh->SetRelativeLocation(FVector(0.f, 0.f, TraceCharacterLayout::MeshOffsetZ));
+		SkeletalMesh->SetRelativeRotation(FRotator(0.f, TraceCharacterLayout::MeshYaw, 0.f));
+
+		// Contract §7 again: the capsule is the only collider. The mannequin ships with a physics
+		// asset (PA_Mannequin) and would otherwise start blocking bullets per-bone, which is exactly
+		// the "hit the shoulder, miss the capsule" desync the rest of this file is built to avoid.
 		SkeletalMesh->SetCollisionProfileName(TEXT("NoCollision"));
 		SkeletalMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		SkeletalMesh->SetGenerateOverlapEvents(false);
+		SkeletalMesh->SetCanEverAffectNavigation(false);
+		SkeletalMesh->bReceivesDecals = false;
+
+		// In first person this mesh is hidden from its own owner (SetOwnerNoSee). Without this the
+		// player would also lose their own shadow, and on a black floor with hard neon key lights the
+		// shadow is most of what tells you where your feet are. Costs one extra shadow-only draw for
+		// the one pawn that is hidden, and nothing at all for the other nine.
+		SkeletalMesh->bCastHiddenShadow = true;
+
+		// Ten characters in a 5v5, most of them off-screen most of the time. Skipping the pose for
+		// anything not rendered is the single biggest animation saving available and costs nothing
+		// visible — the pose is rebuilt the moment the character comes back on screen.
+		SkeletalMesh->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+
+		// Hidden until SetupCharacterVisuals() confirms there is a mesh to show, so a missing import
+		// can never leave a T-posing null-mesh component drawing nothing over the fallback shapes.
 		SkeletalMesh->SetVisibility(false);
 	}
 
+	// Soft references, resolved once per pawn in PostInitializeComponents(). Assigning them here
+	// (rather than in a config or a Blueprint) keeps them on the CDO, which is what makes the cooker
+	// follow them into a packaged build.
+	CharacterMeshAsset = TSoftObjectPtr<USkeletalMesh>(FSoftObjectPath(TraceCharacterAssets::MannequinMesh));
+	CharacterAnimClass = TSoftClassPtr<UAnimInstance>(FSoftClassPath(TraceCharacterAssets::UnarmedAnimClass));
+
 	// --- Camera rig ------------------------------------------------------------------------------
 
+	// ONE arm, ONE camera, for both view modes — UpdateViewBlend() lerps the arm between them. Two
+	// camera actors and a SetViewTarget would put a player camera manager blend on top of ours and
+	// would cut, not travel; the travel is the whole point.
 	SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SpringArm"));
 	SpringArm->SetupAttachment(RootComponent);
-	SpringArm->TargetArmLength = TraceCharacterLayout::SpringArmLength;
-	// Centred, not over-the-shoulder: a lateral offset makes the muzzle ray and the crosshair
-	// disagree at close range, and this prototype has one crosshair dead centre.
-	SpringArm->SocketOffset = FVector(0.f, 0.f, TraceCharacterLayout::SpringArmPivotZ);
+
+	// First person is the default state of the game, so the rig is built collapsed onto the eye and
+	// only opens out when the Core is picked up.
+	SpringArm->TargetArmLength = TraceCharacterLayout::FirstPersonArmLength;
+	SpringArm->TargetOffset = FVector(0.f, 0.f, TraceCharacterLayout::EyeHeight);
+	// SocketOffset stays zero in both modes — see ThirdPersonPivotZ for why the height lives in
+	// TargetOffset instead.
+	SpringArm->SocketOffset = FVector::ZeroVector;
+
 	SpringArm->bUsePawnControlRotation = true;
 	SpringArm->bDoCollisionTest = true;
 	// Camera lag would smear the crosshair away from the aim direction the weapon actually uses.
@@ -190,40 +528,69 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 	Camera->bUsePawnControlRotation = false;   // the arm already applied it
 	Camera->SetFieldOfView(TraceCharacterLayout::CameraFOV);
 
-	// --- Visual meshes ---------------------------------------------------------------------------
+	// First-person rendering parameters. These affect ONLY primitives tagged
+	// EFirstPersonPrimitiveType::FirstPerson — i.e. the viewmodel and nothing else in the world — so
+	// they are harmless while the camera is in third person, where the viewmodel is hidden anyway.
+	//
+	// FirstPersonFieldOfView 70 against a scene FOV of 95: the renderer cancels the scene projection
+	// and re-applies this one, so the gun is drawn through a normal lens instead of the wide one the
+	// arena needs, which is what stops a viewmodel at arm's length looking stretched and enormous.
+	// FirstPersonScale 0.5 then squashes the rig's DEPTH range toward the camera by half while
+	// preserving the solid angle it covers, so it looks identical and can no longer reach into the
+	// scene. See the depth arithmetic in the file header.
+	Camera->bEnableFirstPersonFieldOfView = true;
+	Camera->bEnableFirstPersonScale = true;
+	Camera->FirstPersonFieldOfView = TraceCharacterLayout::FirstPersonViewModelFOV;
+	Camera->FirstPersonScale = TraceCharacterLayout::FirstPersonViewModelScale;
 
-	BodyMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("BodyMesh"));
-	BodyMesh->SetupAttachment(RootComponent);
-	ConfigureVisualMesh(BodyMesh);
+	// The viewmodel rig hangs off the CAMERA, not off the capsule or the mesh: it has to inherit the
+	// aim exactly, and the camera is the one thing in the hierarchy that already has it. Nothing in
+	// the shot path reads this component, so animating it cannot move a bullet.
+	ViewModelRoot = CreateDefaultSubobject<USceneComponent>(TEXT("ViewModelRoot"));
+	ViewModelRoot->SetupAttachment(Camera);
+	ViewModelRoot->SetRelativeLocationAndRotation(
+		TraceCharacterLayout::ViewModelRestLocation, TraceCharacterLayout::ViewModelRestRotation);
 
-	HeadMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("HeadMesh"));
-	HeadMesh->SetupAttachment(RootComponent);
-	ConfigureVisualMesh(HeadMesh);
+	// --- Fallback shapes -------------------------------------------------------------------------
+	//
+	// A clone that has not run Scripts/import-mannequin.sh has no character art at all. Rather than
+	// render nothing — an invisible player is far worse than an ugly one — the pawn keeps the old
+	// primitive body/head, built from /Engine/BasicShapes which ship with every install, hidden
+	// unless the mannequin fails to load.
 
-	NoseMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("NoseMesh"));
-	NoseMesh->SetupAttachment(RootComponent);
-	ConfigureVisualMesh(NoseMesh);
+	FallbackBodyMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("FallbackBodyMesh"));
+	FallbackBodyMesh->SetupAttachment(RootComponent);
+	ConfigureVisualMesh(FallbackBodyMesh);
+	FallbackBodyMesh->SetVisibility(false);
+
+	FallbackHeadMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("FallbackHeadMesh"));
+	FallbackHeadMesh->SetupAttachment(RootComponent);
+	ConfigureVisualMesh(FallbackHeadMesh);
+	FallbackHeadMesh->SetVisibility(false);
 
 	// Constructor-time FObjectFinders (not runtime LoadObject) on purpose: the reference lands on
 	// the CDO, which is what makes the cooker pull these engine assets into a packaged build. A
 	// bare runtime load of the same path would resolve in the editor and return null in a package.
+	// These are /Engine/ assets, so unlike the mannequin they are always present and a hard
+	// reference is safe.
 	{
+		static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
 		static ConstructorHelpers::FObjectFinder<UStaticMesh> CylinderFinder(TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
 		static ConstructorHelpers::FObjectFinder<UStaticMesh> SphereFinder(TEXT("/Engine/BasicShapes/Sphere.Sphere"));
-		static ConstructorHelpers::FObjectFinder<UStaticMesh> ConeFinder(TEXT("/Engine/BasicShapes/Cone.Cone"));
 		static ConstructorHelpers::FObjectFinder<UMaterialInterface> MaterialFinder(TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
 
+		if (CubeFinder.Succeeded())
+		{
+			CubeMesh = CubeFinder.Object;
+		}
 		if (CylinderFinder.Succeeded())
 		{
-			BodyMesh->SetStaticMesh(CylinderFinder.Object);
+			CylinderMesh = CylinderFinder.Object;
+			FallbackBodyMesh->SetStaticMesh(CylinderFinder.Object);
 		}
 		if (SphereFinder.Succeeded())
 		{
-			HeadMesh->SetStaticMesh(SphereFinder.Object);
-		}
-		if (ConeFinder.Succeeded())
-		{
-			NoseMesh->SetStaticMesh(ConeFinder.Object);
+			FallbackHeadMesh->SetStaticMesh(SphereFinder.Object);
 		}
 		if (MaterialFinder.Succeeded())
 		{
@@ -231,32 +598,69 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 		}
 	}
 
+	// The generated Tron materials, resolved the same way ATraceArenaBuilder resolves them: a
+	// constructor-time finder so the reference lands on the CDO and the cooker follows it, and a
+	// tolerated miss (the folder is gitignored and produced by Scripts/generate_content.py) that
+	// MakeViewModelMaterials() turns into a BasicShapeMaterial fallback.
+	{
+		static ConstructorHelpers::FObjectFinder<UMaterialInterface> SurfaceFinder(TraceCharacterAssets::SurfaceMaterialPath);
+		static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TraceCharacterAssets::NeonMaterialPath);
+
+		if (SurfaceFinder.Succeeded())
+		{
+			SurfaceMaterial = SurfaceFinder.Object;
+		}
+		if (NeonFinder.Succeeded())
+		{
+			NeonMaterial = NeonFinder.Object;
+		}
+	}
+
 	// Body: a cylinder standing on the bottom of the capsule, as wide as the capsule is.
 	{
 		const float BodyScaleXY = (TraceCharacterLayout::CapsuleRadius * 2.f) / TraceCharacterLayout::BasicShapeSize;
 		const float BodyScaleZ = TraceCharacterLayout::BodyHeight / TraceCharacterLayout::BasicShapeSize;
-		BodyMesh->SetRelativeScale3D(FVector(BodyScaleXY, BodyScaleXY, BodyScaleZ));
-		BodyMesh->SetRelativeLocation(FVector(
+		FallbackBodyMesh->SetRelativeScale3D(FVector(BodyScaleXY, BodyScaleXY, BodyScaleZ));
+		FallbackBodyMesh->SetRelativeLocation(FVector(
 			0.f, 0.f, (TraceCharacterLayout::BodyHeight * 0.5f) - TraceCharacterLayout::CapsuleHalfHeight));
 	}
 
 	// Head: a sphere capping the body, overlapping it slightly so the silhouette reads as one piece.
 	{
 		const float HeadScale = TraceCharacterLayout::HeadDiameter / TraceCharacterLayout::BasicShapeSize;
-		HeadMesh->SetRelativeScale3D(FVector(HeadScale));
-		HeadMesh->SetRelativeLocation(FVector(0.f, 0.f, TraceCharacterLayout::HeadCentreZ));
+		FallbackHeadMesh->SetRelativeScale3D(FVector(HeadScale));
+		FallbackHeadMesh->SetRelativeLocation(FVector(0.f, 0.f, TraceCharacterLayout::HeadCentreZ));
 	}
 
-	// Nose: a cone laid on its side so you can read someone's facing across the arena.
-	// NOTE: the exact pivot of /Engine/BasicShapes/Cone (base centre vs bounds centre) is not
-	// something we can verify without the editor. A pitch of -90 maps the cone's local +Z onto the
-	// actor's +X either way, so it always points forward; only its offset along X may want a nudge.
+	// --- Slide skid streak -------------------------------------------------------------------------
+	//
+	// Flat on the deck under the feet, unlit, team-coloured, and hidden until the pawn is actually
+	// sliding. See UpdateCrouchPresentation for why this exists at all.
+	SlideSkidMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("SlideSkidMesh"));
+	SlideSkidMesh->SetupAttachment(RootComponent);
+	// After the FObjectFinder block above, which is where CubeMesh is resolved. A null mesh here
+	// would leave the streak invisible AND leave CreateDynamicMaterialInstance with no slot to wrap,
+	// so ApplyTeamColors would silently never build SlideSkidMID either.
+	if (CubeMesh != nullptr)
 	{
-		const float NoseScale = TraceCharacterLayout::NoseSize / TraceCharacterLayout::BasicShapeSize;
-		NoseMesh->SetRelativeScale3D(FVector(NoseScale));
-		NoseMesh->SetRelativeRotation(FRotator(-90.f, 0.f, 0.f));
-		NoseMesh->SetRelativeLocation(FVector(
-			TraceCharacterLayout::NoseForward, 0.f, TraceCharacterLayout::HeadCentreZ));
+		SlideSkidMesh->SetStaticMesh(CubeMesh);
+	}
+	ConfigureVisualMesh(SlideSkidMesh);
+	SlideSkidMesh->SetVisibility(false);
+	// The one visual on this pawn that must NOT be hidden from its owner in first person and must
+	// NOT cast a shadow: it is a light on the floor, not part of the body.
+	SlideSkidMesh->bCastHiddenShadow = false;
+	SlideSkidMesh->SetCastShadow(false);
+	SlideSkidMesh->SetRelativeLocation(FVector(0.f, 0.f, -TraceCharacterLayout::CapsuleHalfHeight + 3.f));
+
+	// --- Movement capabilities ---------------------------------------------------------------------
+	//
+	// Crouch has to be ALLOWED on the nav agent or UCharacterMovementComponent::Crouch() silently
+	// refuses, and crouch is how spec section 5's slide is implemented. Set here rather than in the
+	// movement component because it is a property of the pawn, and setting it twice is free.
+	if (UCharacterMovementComponent* Movement = GetCharacterMovement())
+	{
+		Movement->GetNavAgentPropertiesRef().bCanCrouch = true;
 	}
 
 	// --- Gameplay components ---------------------------------------------------------------------
@@ -274,6 +678,102 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 // =================================================================================================
 // Lifecycle
 // =================================================================================================
+
+void ATraceCharacter::PostInitializeComponents()
+{
+	Super::PostInitializeComponents();
+
+	// After Super, deliberately: ACharacter::PostInitializeComponents() is what snapshots the mesh's
+	// relative transform and initialises the anim instance machinery. Dressing the mesh before that
+	// would have the base class re-derive its offsets from a component we were halfway through
+	// changing.
+	SetupCharacterVisuals();
+}
+
+void ATraceCharacter::SetupCharacterVisuals()
+{
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	if (MeshComp == nullptr)
+	{
+		return;
+	}
+
+	// A dedicated server renders nothing and never builds a pose. Loading 126 MB of character art
+	// there would be pure cost — and the capsule, which is what the server actually simulates and
+	// tests against, is unaffected either way.
+	if (IsRunningDedicatedServer())
+	{
+		MeshComp->SetVisibility(false);
+		return;
+	}
+
+	// -TraceNoCharacterArt exists so the not-imported path can actually be TESTED, on a machine where
+	// the import has been run, without deleting anyone's Content folder out from under a parallel
+	// session. The fallback is the branch every fresh clone takes; leaving it unexercised until a
+	// new hire hits it is how "optional asset" handling quietly rots.
+	const bool bForceNoArt = FParse::Param(FCommandLine::Get(), TEXT("TraceNoCharacterArt"));
+
+	// LoadSynchronous on a soft pointer: the first pawn pays for the load, every pawn after it gets
+	// the already-resident object back. Ten characters spawn at match start, so this happens once.
+	USkeletalMesh* LoadedMesh = (bForceNoArt || CharacterMeshAsset.IsNull())
+		? nullptr
+		: CharacterMeshAsset.LoadSynchronous();
+
+	if (LoadedMesh == nullptr)
+	{
+		// The whole point of the soft reference. No crash, no invisible player: show the primitives
+		// and say exactly what to run. Warned once per process rather than once per pawn, because
+		// ten identical screenfuls of this would bury everything else in the log.
+		static bool bWarnedMissingMesh = false;
+		if (!bWarnedMissingMesh)
+		{
+			bWarnedMissingMesh = true;
+			UE_LOG(LogTraceGame, Warning, TEXT("%s (looked for %s)"),
+				TraceCharacterAssets::MissingImportHint, TraceCharacterAssets::MannequinMesh);
+		}
+
+		bUsingSkeletalMesh = false;
+		MeshComp->SetVisibility(false);
+		if (FallbackBodyMesh != nullptr) { FallbackBodyMesh->SetVisibility(true); }
+		if (FallbackHeadMesh != nullptr) { FallbackHeadMesh->SetVisibility(true); }
+		ApplyTeamColors();
+		return;
+	}
+
+	MeshComp->SetSkeletalMeshAsset(LoadedMesh);
+	MeshComp->SetVisibility(true);
+
+	bUsingSkeletalMesh = true;
+	if (FallbackBodyMesh != nullptr) { FallbackBodyMesh->SetVisibility(false); }
+	if (FallbackHeadMesh != nullptr) { FallbackHeadMesh->SetVisibility(false); }
+
+	// The anim blueprint is loaded separately and is separately optional: a character with a mesh
+	// but no anim instance is a T-pose, which is ugly but still playable and still correctly
+	// team-coloured. That is a better failure than refusing to draw the player.
+	UClass* LoadedAnimClass = (bForceNoArt || CharacterAnimClass.IsNull())
+		? nullptr
+		: CharacterAnimClass.LoadSynchronous();
+	if (LoadedAnimClass != nullptr)
+	{
+		MeshComp->SetAnimationMode(EAnimationMode::AnimationBlueprint);
+		MeshComp->SetAnimInstanceClass(LoadedAnimClass);
+	}
+	else
+	{
+		static bool bWarnedMissingAnim = false;
+		if (!bWarnedMissingAnim)
+		{
+			bWarnedMissingAnim = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("Character mesh loaded but its anim blueprint did not (%s). Characters will be ")
+				TEXT("posed but not animated; re-run Scripts/import-mannequin.sh --force."),
+				TraceCharacterAssets::UnarmedAnimClass);
+		}
+	}
+
+	// Slot count is only knowable once the mesh is attached, so the MIDs are built from here.
+	ApplyTeamColors();
+}
 
 void ATraceCharacter::BeginPlay()
 {
@@ -300,6 +800,11 @@ void ATraceCharacter::BeginPlay()
 	}
 
 	ApplyTeamColors();
+
+	// Snapped, never blended: a pawn spawns without the Core, so the first frame must already be
+	// first person. Blending into it would fly every camera in the match forward from 450 uu back.
+	ApplyRotationMode();
+	UpdateViewBlend(0.f, /*bSnap=*/true);
 
 	// Team colours are cosmetic, so the poll costs a dedicated server nothing (it never runs there).
 	if (World != nullptr && GetNetMode() != NM_DedicatedServer && GetTeam() == ETraceTeam::None)
@@ -335,6 +840,37 @@ void ATraceCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
+void ATraceCharacter::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+	// The only reason this pawn ticks. See UpdateViewBlend().
+	//
+	// The rotation model is re-asserted here rather than only on possession because on a client the
+	// controller arrives by replication, after the pawn: there is no PossessedBy() on that machine.
+	// Both calls early-out on "nothing changed", so the steady-state cost is two branches.
+	const bool bLocalPlayer = IsLocalPlayerPawn(*this);
+	const bool bJustBecameLocal = bLocalPlayer && !bWasLocallyControlled;
+	bWasLocallyControlled = bLocalPlayer;
+
+	ApplyRotationMode();
+
+	// BEFORE UpdateViewBlend, and the order is load-bearing: this is what moves BaseEyeHeight for a
+	// slide, and UpdateViewBlend pins the spring arm to BaseEyeHeight. Running it after would leave
+	// the camera one frame behind the point the shot is built from for the whole descent, i.e. a
+	// non-zero eyeErr exactly while the player is sliding. Runs for every pawn on every machine.
+	UpdateCrouchPresentation(DeltaSeconds);
+
+	UpdateViewBlend(DeltaSeconds, /*bSnap=*/bJustBecameLocal);
+
+	// Local player only — UpdateViewBlend has already hidden the rig on everyone else, and this
+	// early-outs on a hidden one.
+	if (bLocalPlayer)
+	{
+		UpdateViewModel(DeltaSeconds);
+	}
+}
+
 void ATraceCharacter::PossessedBy(AController* NewController)
 {
 	Super::PossessedBy(NewController);
@@ -342,6 +878,11 @@ void ATraceCharacter::PossessedBy(AController* NewController)
 	// Server side, this is the first moment GetPlayerState() can answer — and therefore the first
 	// moment the team is knowable.
 	ApplyTeamColors();
+
+	// ...and the first moment the pawn knows whether it is a bot or a human, which is what decides
+	// the rotation model. Snapped for the same reason as BeginPlay: a fresh pawn has no Core.
+	ApplyRotationMode();
+	UpdateViewBlend(0.f, /*bSnap=*/true);
 }
 
 void ATraceCharacter::OnRep_PlayerState()
@@ -379,6 +920,11 @@ void ATraceCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	// COND_None: every client needs this, not just the owner — it drives the carrier tint, the HUD
 	// banner and the trail's "who is the carrier" question.
 	DOREPLIFETIME(ATraceCharacter, bIsCarrier);
+
+	// COND_SkipOwner: the owning client predicts its own slide from the saved move and already has a
+	// better answer than any packet could carry. Everyone ELSE has no way to know at all — see the
+	// property's comment; without this a sliding player's hit zones desync from what a shooter sees.
+	DOREPLIFETIME_CONDITION(ATraceCharacter, bReplicatedSliding, COND_SkipOwner);
 }
 
 // =================================================================================================
@@ -420,16 +966,45 @@ UTraceCharacterMovementComponent* ATraceCharacter::GetTraceMovement() const
 	return Cast<UTraceCharacterMovementComponent>(GetCharacterMovement());
 }
 
+bool ATraceCharacter::WantsFirstPersonView() const
+{
+	// The entire rule. Carrying the Core is the one state that needs the space behind you visible,
+	// because the trail you are laying there is the only thing that can kill you.
+	return !bIsCarrier;
+}
+
+float ATraceCharacter::GetViewBlendAlpha() const
+{
+	return ViewBlendAlpha;
+}
+
+int32 ATraceCharacter::GetViewModelPartCount() const
+{
+	return ViewModelParts.Num();
+}
+
+bool ATraceCharacter::IsViewModelVisible() const
+{
+	return bViewModelVisible;
+}
+
 FVector ATraceCharacter::GetMuzzleLocation() const
 {
-	// Yaw only: pitching the camera up should not swing the muzzle up out of the character's chest,
-	// it should just change where the shot goes.
-	const FRotator AimRotation = ResolveAimRotation(*this);
-	const FVector Forward = FRotator(0.f, AimRotation.Yaw, 0.f).Vector();
+	// ON THE AIM RAY. The eye, stepped forward along the full aim rotation — pitch included, unlike
+	// the old chest muzzle which used yaw only and therefore sat off the ray whenever the player
+	// looked anywhere but the horizon.
+	//
+	// GetPawnViewLocation() (actor + BaseEyeHeight) rather than the camera component's world
+	// location, deliberately and for the same reason as in GetAimDirection(): it is pure arithmetic
+	// on the actor transform, so the server computes the same origin as the client. The camera's
+	// real position depends on the spring arm's collision probe and on where the view blend happens
+	// to be this frame, neither of which the server knows or should know.
+	//
+	// Every shot in the game is fired from first person (a carrier cannot fire), so this is the
+	// first-person muzzle and there is no second case to keep in step.
+	const FVector ViewForward = ResolveAimRotation(*this).Vector();
 
-	return GetActorLocation()
-		+ FVector(0.f, 0.f, TraceCharacterLayout::MuzzleHeight)
-		+ Forward * TraceCharacterLayout::MuzzleForward;
+	return GetPawnViewLocation() + ViewForward * TraceCharacterLayout::MuzzleForward;
 }
 
 FVector ATraceCharacter::GetAimDirection() const
@@ -437,10 +1012,13 @@ FVector ATraceCharacter::GetAimDirection() const
 	const FRotator AimRotation = ResolveAimRotation(*this);
 	const FVector ViewForward = AimRotation.Vector();
 
-	// The muzzle sits below and in front of the eye, so firing straight along the view forward would
-	// put every shot slightly under the crosshair. Aim at a point far along the *view* ray instead
-	// and shoot from the muzzle toward it — the two rays converge, and by any range that matters the
-	// error is a fraction of a degree.
+	// Aim at a point far along the *view* ray and shoot from the muzzle toward it, so the shot
+	// converges on whatever the crosshair covers wherever the muzzle happens to be.
+	//
+	// Since the muzzle was moved onto the ray itself this is arithmetically the identity — the
+	// focus point, the muzzle and the eye are collinear, so Converged == ViewForward to float
+	// precision. That is the point: the crosshair is exact in first person, and it stays exact if
+	// anyone later moves the muzzle to a weapon socket off the axis.
 	//
 	// GetPawnViewLocation() is used rather than the camera component's world location on purpose: it
 	// is pure arithmetic on the actor transform, so the server computes the same answer as the
@@ -608,20 +1186,115 @@ void ATraceCharacter::ApplyTeamColors()
 			1.f);
 	}
 	FLinearColor HeadColor = bIsCarrier ? FLinearColor::White : (TeamColor * 1.4f);
-	FLinearColor NoseColor = bIsCarrier ? FLinearColor::White : FLinearColor(0.85f, 0.85f, 0.85f, 1.f);
+
+	// See EmissiveNormal: a no-op on the stock Mannequin materials, kept so a material with a live
+	// emissive would light up for free. The carrier is made distinct by the near-white tint above,
+	// which is the part that has been confirmed to work.
+	float EmissivePower = bIsCarrier
+		? TraceCharacterLayout::EmissiveCarrier
+		: TraceCharacterLayout::EmissiveNormal;
 
 	if (bDeadPresentation)
 	{
 		// Dim rather than hide: seeing where someone died is useful information, and it makes the
-		// respawn delay legible without any UI.
+		// respawn delay legible without any UI. The glow goes out entirely, which reads instantly as
+		// "that one is not a threat".
 		BodyColor *= 0.2f;
 		HeadColor *= 0.2f;
-		NoseColor *= 0.2f;
+		EmissivePower = TraceCharacterLayout::EmissiveDead;
 	}
 
-	ApplyColorToMesh(BodyMesh, BodyMID, SanitizeTint(BodyColor));
-	ApplyColorToMesh(HeadMesh, HeadMID, SanitizeTint(HeadColor));
-	ApplyColorToMesh(NoseMesh, NoseMID, SanitizeTint(NoseColor));
+	if (bUsingSkeletalMesh)
+	{
+		ApplyColorToSkeletalMesh(SanitizeTint(BodyColor), EmissivePower);
+	}
+	else
+	{
+		ApplyColorToMesh(FallbackBodyMesh, FallbackBodyMID, SanitizeTint(BodyColor));
+		ApplyColorToMesh(FallbackHeadMesh, FallbackHeadMID, SanitizeTint(HeadColor));
+	}
+
+	// The gun's light channels wear the team colour too. It is the only part of your own kit you can
+	// see in first person, so it is the only thing that answers "which side am I on" without opening
+	// the scoreboard — and it means a spectator switching between players sees the change instantly.
+	// Team::None replicates as grey-cyan, which is also the correct read: the team is not known yet.
+	if (ViewModelNeonMID != nullptr)
+	{
+		const FLinearColor NeonColor = (GetTeam() == ETraceTeam::None)
+			? FLinearColor(0.55f, 0.88f, 1.f)
+			: TeamColor;
+		ViewModelNeonMID->SetVectorParameterValue(TEXT("Color"), NeonColor);
+		ViewModelNeonMID->SetScalarParameterValue(TEXT("Glow"), 2.4f);
+		// Fallback path (BasicShapeMaterial, no Glow input): the best available approximation of an
+		// unlit strip is a bright matte albedo. Same trade ATraceArenaBuilder::MakeNeonMID makes.
+		ViewModelNeonMID->SetVectorParameterValue(TEXT("Color"), NeonColor);
+		ViewModelNeonMID->SetVectorParameterValue(TEXT("BaseColor"), NeonColor);
+	}
+
+	// The skid streak is deliberately BRIGHTER than the suit and not whitened for the carrier: it is
+	// a movement tell, and it has to be readable across the arena on a near-black floor.
+	if (SlideSkidMesh != nullptr)
+	{
+		if (SlideSkidMID == nullptr)
+		{
+			UMaterialInterface* Parent = (NeonMaterial != nullptr) ? NeonMaterial.Get() : BasicShapeMaterial.Get();
+			if (Parent != nullptr)
+			{
+				SlideSkidMID = SlideSkidMesh->CreateDynamicMaterialInstance(0, Parent);
+			}
+		}
+		if (SlideSkidMID != nullptr)
+		{
+			SlideSkidMID->SetVectorParameterValue(TEXT("Color"), TeamColor);
+			SlideSkidMID->SetVectorParameterValue(TEXT("BaseColor"), TeamColor);
+			SlideSkidMID->SetScalarParameterValue(TEXT("Glow"), TraceCharacterLayout::SkidGlow);
+		}
+	}
+}
+
+void ATraceCharacter::ApplyColorToSkeletalMesh(const FLinearColor& InColor, float InEmissivePower)
+{
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	if (MeshComp == nullptr || MeshComp->GetSkeletalMeshAsset() == nullptr)
+	{
+		return;
+	}
+
+	const int32 NumSlots = MeshComp->GetNumMaterials();
+
+	// Built once and then reused, for the same reason as the static-mesh MIDs below: this runs on
+	// every team change, carrier change, death and poll tick, and a fresh MID per call would leave a
+	// trail of garbage. CreateDynamicMaterialInstance(Index) with no parent wraps whatever material
+	// is already in the slot, so Manny keeps his own textures and normal maps — this tints the
+	// existing material, it does not replace it with flat colour.
+	if (CharacterMIDs.Num() != NumSlots)
+	{
+		CharacterMIDs.Reset(NumSlots);
+		for (int32 SlotIndex = 0; SlotIndex < NumSlots; ++SlotIndex)
+		{
+			CharacterMIDs.Add(MeshComp->CreateDynamicMaterialInstance(SlotIndex));
+		}
+	}
+
+	for (UMaterialInstanceDynamic* MID : CharacterMIDs)
+	{
+		if (MID == nullptr)
+		{
+			continue;
+		}
+
+		// "Paint Tint" and "EmissivePower" are M_Mannequin's own parameters, read out of the asset
+		// rather than guessed at. Setting a parameter a material does not have is a silent no-op, so
+		// the extra generic names below cost nothing and keep this working if the mesh is ever
+		// swapped for one built on a different material.
+		MID->SetVectorParameterValue(TraceCharacterAssets::PaintTintParam, InColor);
+		MID->SetScalarParameterValue(TraceCharacterAssets::EmissivePowerParam, InEmissivePower);
+
+		MID->SetVectorParameterValue(TEXT("Color"), InColor);
+		MID->SetVectorParameterValue(TEXT("BaseColor"), InColor);
+		MID->SetVectorParameterValue(TEXT("Tint"), InColor);
+		MID->SetVectorParameterValue(TEXT("EmissiveColor"), InColor);
+	}
 }
 
 void ATraceCharacter::ApplyColorToMesh(UStaticMeshComponent* Mesh, TObjectPtr<UMaterialInstanceDynamic>& InOutMID, const FLinearColor& InColor)
@@ -671,6 +1344,661 @@ void ATraceCharacter::PollTeamColors()
 void ATraceCharacter::OnRep_IsCarrier()
 {
 	ApplyTeamColors();
+
+	// The camera is NOT moved from here. UpdateViewBlend() reads the carrier state every frame and
+	// walks toward it, which means the transition is identical whether the state arrived by
+	// replication, by SetCarrying() on a listen host, or by the Core being passed away — and there
+	// is no path that can leave the camera stranded in the wrong mode because a callback did not
+	// fire on some machine.
+}
+
+// =================================================================================================
+// View mode — first person, third person while carrying. See the file header.
+// =================================================================================================
+
+float ATraceCharacter::GetThirdPersonPivotZ() const
+{
+	// Read from the settings rather than from a second copy of "190" so that retuning TrailHeight
+	// moves the camera with it. UTraceTrailComponent builds its wall as TrailHeight tall, centred on
+	// the carrier's actor location, and rides a cap strip of clamp(Height * 0.12, 14, 42) on top of
+	// it — so the highest lit surface sits half the height plus half the cap above the actor centre,
+	// and TargetOffset.Z is measured from that same actor centre.
+	const float TrailHeight = FMath::Max(0.f, UTraceSettings::Get().TrailHeight);
+	const float TrailTopAboveCentre = TrailHeight * 0.5f + FMath::Clamp(TrailHeight * 0.12f, 14.f, 42.f) * 0.5f;
+
+	// Max, not a plain sum: if the trail is ever made short enough to duck under, the camera goes
+	// back to the framing that was chosen on its own merits instead of drifting down with it.
+	return FMath::Max(
+		TraceCharacterLayout::ThirdPersonPivotZ,
+		TrailTopAboveCentre + TraceCharacterLayout::TrailCameraClearance);
+}
+
+void ATraceCharacter::UpdateViewBlend(float DeltaSeconds, bool bSnap)
+{
+	// Pure presentation: a dedicated server has no camera, renders nothing, and must not spend a
+	// frame of anyone's time on this.
+	if (SpringArm == nullptr || GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+
+	// This pawn's camera is only ever looked through by the machine that controls it. On every other
+	// machine the arm is inert scenery — but the owner-visibility flag is NOT inert, so if this pawn
+	// ever was ours (a listen host respawning, a controller changing hands) the body has to be put
+	// back before we stop maintaining it.
+	if (!IsLocalPlayerPawn(*this))
+	{
+		SetOwnBodyHiddenFromOwner(false);
+		SetViewModelVisible(false);
+		return;
+	}
+
+	// The first frame this pawn turns out to be the one a human is inside is the first frame it is
+	// worth building a gun for. See EnsureViewModelBuilt() for why this is lazy.
+	EnsureViewModelBuilt();
+
+	const float Target = WantsFirstPersonView() ? 0.f : 1.f;
+
+	if (bSnap || TraceCharacterLayout::ViewBlendSeconds <= 0.f)
+	{
+		ViewBlendAlpha = Target;
+	}
+	else
+	{
+		// Constant rate, so the pull-back always takes exactly ViewBlendSeconds however far through a
+		// previous blend it was interrupted — a player who grabs the Core, passes it and catches it
+		// again inside 0.7 s gets a continuous camera, not a stutter.
+		ViewBlendAlpha = FMath::FInterpConstantTo(
+			ViewBlendAlpha, Target, DeltaSeconds, 1.f / TraceCharacterLayout::ViewBlendSeconds);
+	}
+
+	// Smoothstep. The easing is the difference between "the camera was yanked" and "the camera
+	// pulled back": it leaves and arrives at zero velocity, so neither end of the move reads as a cut.
+	const float Eased = ViewBlendAlpha * ViewBlendAlpha * (3.f - 2.f * ViewBlendAlpha);
+
+	// TargetArmLength 0 puts the camera exactly on the arm origin, and the arm origin is
+	// TargetOffset above the capsule centre — which at Eased 0 is precisely GetPawnViewLocation(),
+	// the point the aim ray is built from. That equality is the first-person aim guarantee; do not
+	// introduce a lateral SocketOffset here without re-reading GetMuzzleLocation().
+	SpringArm->TargetArmLength = FMath::Lerp(
+		TraceCharacterLayout::FirstPersonArmLength, TraceCharacterLayout::ThirdPersonArmLength, Eased);
+
+	// BaseEyeHeight, not the EyeHeight constant, and this is load-bearing now that sliding exists.
+	// GetPawnViewLocation() is actor + BaseEyeHeight and is what GetAimDirection() and
+	// GetMuzzleLocation() build the shot from; ACharacter drops BaseEyeHeight to CrouchedEyeHeight
+	// the moment a slide starts. Pinning the arm to the standing constant instead would leave the
+	// camera 60 uu above the point the bullet leaves from for the whole slide — the crosshair would
+	// lie exactly when the player is moving fastest. Reading the live value keeps eyeErr at 0.00 uu
+	// in first person standing AND crouched, which is what Trace.DebugViewProbe measures.
+	SpringArm->TargetOffset = FVector(0.f, 0.f, FMath::Lerp(
+		BaseEyeHeight, GetThirdPersonPivotZ(), Eased));
+
+	// Our own body follows the camera out of the way. Other players' pawns are untouched by this —
+	// SetOwnerNoSee hides a mesh from ONE viewer, the one whose view target owns it.
+	const bool bFirstPersonNow = (Eased < TraceCharacterLayout::OwnBodyHideAlpha);
+	SetOwnBodyHiddenFromOwner(bFirstPersonNow);
+
+	// The gun follows the same switch as the body, so the two can never disagree: the moment the
+	// camera pulls back to show the carrier, the viewmodel goes away with it. A corpse holds no gun
+	// either — the third condition is what stops a dead player staring at a floating pistol while
+	// the respawn timer runs.
+	SetViewModelVisible(bFirstPersonNow && !bDeadPresentation && IsAlive());
+}
+
+// =================================================================================================
+// First-person viewmodel — see the file header for the framing and depth arithmetic.
+// =================================================================================================
+
+UStaticMeshComponent* ATraceCharacter::AddViewModelPart(UStaticMesh* Mesh, const TCHAR* DebugName,
+	const FVector& Location, const FRotator& Rotation, const FVector& Size, UMaterialInstanceDynamic* MID)
+{
+	if (Mesh == nullptr || ViewModelRoot == nullptr)
+	{
+		return nullptr;
+	}
+
+	UStaticMeshComponent* Part = NewObject<UStaticMeshComponent>(
+		this, MakeUniqueObjectName(this, UStaticMeshComponent::StaticClass(), FName(DebugName)));
+	if (Part == nullptr)
+	{
+		return nullptr;
+	}
+
+	Part->SetMobility(EComponentMobility::Movable);
+	Part->SetupAttachment(ViewModelRoot);
+	Part->SetStaticMesh(Mesh);
+	Part->SetRelativeLocationAndRotation(Location, Rotation);
+	Part->SetRelativeScale3D(Size / TraceCharacterLayout::ViewModelShapeUnit);
+
+	// Contract section 7 again, and it matters more here than anywhere: the capsule is the ONLY
+	// collider on this actor. A viewmodel is 40 uu from the eye — a colliding one would be a
+	// permanent obstacle welded to the player's face.
+	Part->SetCollisionProfileName(TEXT("NoCollision"));
+	Part->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Part->SetGenerateOverlapEvents(false);
+	Part->SetCanEverAffectNavigation(false);
+	Part->bReceivesDecals = false;
+
+	// NOBODY ELSE MAY EVER SEE THIS. bOnlyOwnerSee restricts it to the machine whose view target
+	// owns it, and no shadow of any kind is cast, so there is no path by which a floating gun
+	// appears in anyone else's frame — not even as a silhouette on the floor.
+	Part->SetOnlyOwnerSee(true);
+	Part->SetCastShadow(false);
+	Part->bCastHiddenShadow = false;
+
+	// The whole point of the rig. Set before RegisterComponent so the scene proxy is created with it
+	// rather than having to be rebuilt; see the depth arithmetic in the file header.
+	Part->FirstPersonPrimitiveType = EFirstPersonPrimitiveType::FirstPerson;
+
+	if (MID != nullptr)
+	{
+		Part->SetMaterial(0, MID);
+	}
+
+	Part->RegisterComponent();
+	ViewModelParts.Add(Part);
+	return Part;
+}
+
+void ATraceCharacter::EnsureViewModelBuilt()
+{
+	if (bViewModelBuilt || ViewModelRoot == nullptr || GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+	bViewModelBuilt = true;
+
+	if (CubeMesh == nullptr || CylinderMesh == nullptr)
+	{
+		// /Engine/BasicShapes ships with every install, so this is close to impossible — but an
+		// invisible gun is a far better failure than a crash, and it is the same contract every
+		// other optional asset in this file honours.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("First-person viewmodel skipped: /Engine/BasicShapes did not resolve."));
+		return;
+	}
+
+	// --- Materials -------------------------------------------------------------------------------
+	//
+	// The gun is made of the same two materials as the arena, which is what makes it look like it
+	// belongs in the world rather than like a prop dropped into it.
+	//
+	// The body albedo (0.06) is four times the arena's structure albedo, and deliberately: the three
+	// directional lights in this arena total under 6 lux and none of them is aimed at the inside of a
+	// player's face, so a gun at the arena's own 0.015 would be a black hole in the middle of the
+	// frame. The emissive term does the rest — it is the only lighting term that does not depend on
+	// an angle of incidence, which is exactly the argument the arena's own cover blocks make.
+	{
+		UMaterialInterface* BodyParent = (SurfaceMaterial != nullptr) ? SurfaceMaterial.Get() : BasicShapeMaterial.Get();
+		if (BodyParent != nullptr)
+		{
+			ViewModelBodyMID = UMaterialInstanceDynamic::Create(BodyParent, this);
+			if (ViewModelBodyMID != nullptr)
+			{
+				// MEASURED. The first pass ran albedo 0.055 at metallic 0.35, and against a black
+				// arena that produced two flat mid-blue slabs where the hands should be: bright
+				// enough to be the largest object in the frame, dark enough to have no detail in it,
+				// and glossy enough to pick the floor's cyan up over the whole surface. Dropping the
+				// albedo and most of the metallic hands the shape reading back to the light channels,
+				// which is the same argument the arena's own cover blocks make - the silhouette is
+				// drawn in neon, and the body is what the neon is drawn ON.
+				const FLinearColor BodyColor(0.028f, 0.032f, 0.042f);
+				ViewModelBodyMID->SetVectorParameterValue(TEXT("BaseColor"), BodyColor);
+				ViewModelBodyMID->SetVectorParameterValue(TEXT("Color"), BodyColor);
+				ViewModelBodyMID->SetScalarParameterValue(TEXT("Roughness"), 0.52f);
+				ViewModelBodyMID->SetScalarParameterValue(TEXT("Metallic"), 0.12f);
+				ViewModelBodyMID->SetVectorParameterValue(TEXT("Emissive"), FLinearColor(0.30f, 0.55f, 0.80f));
+				ViewModelBodyMID->SetScalarParameterValue(TEXT("EmissiveStrength"), 0.030f);
+			}
+		}
+
+		UMaterialInterface* NeonParent = (NeonMaterial != nullptr) ? NeonMaterial.Get() : BasicShapeMaterial.Get();
+		if (NeonParent != nullptr)
+		{
+			ViewModelNeonMID = UMaterialInstanceDynamic::Create(NeonParent, this);
+		}
+	}
+
+	// --- Geometry --------------------------------------------------------------------------------
+	//
+	// Rig space: +X out of the lens, +Y right, +Z up, origin at the top-rear of the grip. Every
+	// number here was placed against the framing arithmetic in the file header, so the gun sits in
+	// the lower right with its highest point a quarter of a frame below the crosshair.
+	struct FViewModelPart
+	{
+		const TCHAR* Name;
+		bool bCylinder;
+		FVector Location;
+		FRotator Rotation;
+		FVector Size;
+		bool bNeon;
+	};
+
+	const FViewModelPart Parts[] =
+	{
+		// The gun. A slide over a frame over a raked grip: three masses, which is what makes a
+		// blocky shape read as a handgun rather than as a brick.
+		{ TEXT("VMSlide"),      false, FVector(9.0f, 0.f, 2.4f),    FRotator::ZeroRotator,        FVector(21.0f, 4.6f, 5.2f),  false },
+		{ TEXT("VMFrame"),      false, FVector(7.0f, 0.f, -1.6f),   FRotator::ZeroRotator,        FVector(16.5f, 4.2f, 4.4f),  false },
+		{ TEXT("VMGrip"),       false, FVector(-1.6f, 0.f, -8.2f),  FRotator(14.f, 0.f, 0.f),     FVector(5.6f, 4.0f, 13.5f),  false },
+		{ TEXT("VMGuard"),      false, FVector(3.2f, 0.f, -4.6f),   FRotator::ZeroRotator,        FVector(5.6f, 3.0f, 1.4f),   false },
+
+		// Light channels. The muzzle ring is a cylinder turned to point down the barrel (pitch 90
+		// swings the shape's own +Z axis onto +X), and it is the piece that makes the gun read as a
+		// weapon at a glance: a lit circle where the shot comes out.
+		{ TEXT("VMMuzzle"),     true,  FVector(19.6f, 0.f, 2.4f),   FRotator(90.f, 0.f, 0.f),     FVector(5.8f, 5.8f, 2.2f),   true  },
+		{ TEXT("VMSlideNeon"),  false, FVector(8.4f, 0.f, 5.3f),    FRotator::ZeroRotator,        FVector(16.5f, 1.8f, 1.5f),  true  },
+		{ TEXT("VMSight"),      false, FVector(17.6f, 0.f, 5.6f),   FRotator::ZeroRotator,        FVector(1.4f, 1.4f, 2.0f),   true  },
+		{ TEXT("VMSideNeonL"),  false, FVector(7.6f, -2.4f, 0.4f),  FRotator::ZeroRotator,        FVector(12.5f, 0.9f, 1.6f),  true  },
+		{ TEXT("VMSideNeonR"),  false, FVector(7.6f, 2.4f, 0.4f),   FRotator::ZeroRotator,        FVector(12.5f, 0.9f, 1.6f),  true  },
+		{ TEXT("VMGripNeon"),   false, FVector(-3.9f, 0.f, -8.0f),  FRotator(14.f, 0.f, 0.f),     FVector(1.2f, 3.0f, 9.5f),   true  },
+		{ TEXT("VMRearSight"),  false, FVector(1.4f, 0.f, 5.6f),    FRotator::ZeroRotator,        FVector(1.6f, 3.6f, 2.0f),   true  },
+		{ TEXT("VMRailNeon"),   false, FVector(6.5f, 0.f, -3.9f),   FRotator::ZeroRotator,        FVector(13.0f, 1.6f, 1.0f),  true  },
+
+		// Hands. Blocks, not fingers: at this scale and this framing a gloved fist is a shape, and
+		// trying to model knuckles on a 6 uu cube only produces noise. What DOES read is a lit bar
+		// across each one — a knuckle line, in the same language as everything else in this world.
+		{ TEXT("VMHandR"),      false, FVector(-0.8f, 0.f, -4.6f),  FRotator(14.f, 0.f, 0.f),     FVector(5.6f, 5.4f, 7.0f),   false },
+		{ TEXT("VMKnuckleR"),   false, FVector(1.4f, 0.f, -3.2f),   FRotator(14.f, 0.f, 0.f),     FVector(1.2f, 5.0f, 4.6f),   true  },
+		{ TEXT("VMHandL"),      false, FVector(2.8f, -3.4f, -4.0f), FRotator::ZeroRotator,        FVector(5.0f, 4.8f, 5.6f),   false },
+		{ TEXT("VMKnuckleL"),   false, FVector(4.9f, -3.4f, -3.0f), FRotator::ZeroRotator,        FVector(1.1f, 4.4f, 3.8f),   true  }
+	};
+
+	for (const FViewModelPart& Part : Parts)
+	{
+		AddViewModelPart(Part.bCylinder ? CylinderMesh : CubeMesh, Part.Name,
+			Part.Location, Part.Rotation, Part.Size,
+			Part.bNeon ? ViewModelNeonMID : ViewModelBodyMID);
+	}
+
+	// --- Forearms --------------------------------------------------------------------------------
+	//
+	// Two cylinders running from the hands down and back out of frame, each with a neon cuff. They
+	// are short (17-18 uu) for the depth reason in the file header: the far end must stay in front of
+	// the near plane once FirstPersonScale has halved its depth. That is not a compromise — a real
+	// viewmodel's arms leave the bottom of the frame within a few centimetres of the hands too.
+	struct FForearmSpec
+	{
+		const TCHAR* Name;
+		const TCHAR* CuffName;
+		FVector Hand;
+		FVector Direction;   // normalised in place; points away from the gun, down and outward
+		float Length;
+		float Diameter;
+	};
+
+	const FForearmSpec Forearms[] =
+	{
+		{ TEXT("VMForearmR"), TEXT("VMCuffR"), FVector(-0.8f, 0.f, -4.6f),  FVector(-0.42f, 0.36f, -0.86f),  17.f, 7.0f },
+		{ TEXT("VMForearmL"), TEXT("VMCuffL"), FVector(2.8f, -3.4f, -4.0f), FVector(-0.40f, -0.38f, -0.86f), 16.f, 6.7f }
+	};
+
+	for (const FForearmSpec& Arm : Forearms)
+	{
+		const FVector Dir = Arm.Direction.GetSafeNormal();
+		if (Dir.IsNearlyZero())
+		{
+			continue;
+		}
+
+		// MakeFromZ because the basic cylinder's axis is its own +Z; this turns that axis onto the
+		// arm direction without having to hand-derive a rotator.
+		const FRotator ArmRotation = FRotationMatrix::MakeFromZ(Dir).Rotator();
+		const FVector ArmCentre = Arm.Hand + Dir * (2.f + Arm.Length * 0.5f);
+
+		AddViewModelPart(CylinderMesh, Arm.Name, ArmCentre, ArmRotation,
+			FVector(Arm.Diameter, Arm.Diameter, Arm.Length), ViewModelBodyMID);
+
+		AddViewModelPart(CylinderMesh, Arm.CuffName, Arm.Hand + Dir * 5.f, ArmRotation,
+			FVector(Arm.Diameter + 0.8f, Arm.Diameter + 0.8f, 1.8f), ViewModelNeonMID);
+	}
+
+	// Hidden until UpdateViewBlend says first person; ApplyTeamColors paints the light channels.
+	for (UStaticMeshComponent* Part : ViewModelParts)
+	{
+		if (Part != nullptr)
+		{
+			Part->SetVisibility(false);
+		}
+	}
+	bViewModelVisible = false;
+
+	ApplyTeamColors();
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("%s built a first-person viewmodel (%d parts)."),
+		*GetName(), ViewModelParts.Num());
+}
+
+void ATraceCharacter::SetViewModelVisible(bool bVisible)
+{
+	if (bViewModelVisible == bVisible)
+	{
+		return;
+	}
+	bViewModelVisible = bVisible;
+
+	for (UStaticMeshComponent* Part : ViewModelParts)
+	{
+		if (Part != nullptr)
+		{
+			Part->SetVisibility(bVisible);
+		}
+	}
+}
+
+void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
+{
+	if (ViewModelRoot == nullptr)
+	{
+		return;
+	}
+
+	// A hidden rig still gets its state DECAYED rather than frozen, so a player who takes the Core
+	// mid-burst and hands it back does not come out of third person with a stale recoil kick and a
+	// bob phase from four seconds ago. It just does not get a transform written.
+	const bool bAnimate = bViewModelVisible && DeltaSeconds > 0.f;
+
+	// --- Sway ------------------------------------------------------------------------------------
+	//
+	// The rig lags a fast turn by a fraction of a degree and springs back. This is the single
+	// cheapest thing that makes a viewmodel feel like an object being carried rather than a decal
+	// stuck to the lens — and it is free of consequence, because nothing in the shot path reads the
+	// rig transform. GetAimDirection() is still built from the control rotation alone.
+	const FRotator ControlRotation = GetControlRotation();
+	if (bViewModelHasLastRotation && DeltaSeconds > 0.f)
+	{
+		const FRotator Delta = (ControlRotation - ViewModelLastControlRotation).GetNormalized();
+
+		ViewModelSwayYaw = FMath::Clamp(
+			ViewModelSwayYaw - static_cast<float>(Delta.Yaw) * TraceCharacterLayout::SwayPerDegree,
+			-TraceCharacterLayout::SwayMaxDegrees, TraceCharacterLayout::SwayMaxDegrees);
+		ViewModelSwayPitch = FMath::Clamp(
+			ViewModelSwayPitch - static_cast<float>(Delta.Pitch) * TraceCharacterLayout::SwayPerDegree,
+			-TraceCharacterLayout::SwayMaxDegrees, TraceCharacterLayout::SwayMaxDegrees);
+	}
+	ViewModelLastControlRotation = ControlRotation;
+	bViewModelHasLastRotation = true;
+
+	ViewModelSwayYaw = FMath::FInterpTo(ViewModelSwayYaw, 0.f, DeltaSeconds, TraceCharacterLayout::SwayRecoverSpeed);
+	ViewModelSwayPitch = FMath::FInterpTo(ViewModelSwayPitch, 0.f, DeltaSeconds, TraceCharacterLayout::SwayRecoverSpeed);
+
+	// --- Walk bob --------------------------------------------------------------------------------
+
+	const UCharacterMovementComponent* Movement = GetCharacterMovement();
+	const bool bGrounded = (Movement != nullptr) && Movement->IsMovingOnGround();
+	const float PlanarSpeed = GetVelocity().Size2D();
+	const float MaxSpeed = (Movement != nullptr && Movement->MaxWalkSpeed > 1.f) ? Movement->MaxWalkSpeed : 720.f;
+	const float BobTarget = bGrounded ? FMath::Clamp(PlanarSpeed / MaxSpeed, 0.f, 1.f) : 0.f;
+
+	ViewModelBobStrength = FMath::FInterpTo(ViewModelBobStrength, BobTarget, DeltaSeconds, TraceCharacterLayout::BobInterpSpeed);
+	ViewModelBobPhase = FMath::Fmod(
+		ViewModelBobPhase + DeltaSeconds * TraceCharacterLayout::BobBaseRate * (0.6f + ViewModelBobStrength),
+		2.f * PI);
+
+	// --- Recoil and crouch dip -------------------------------------------------------------------
+
+	ViewModelKick = FMath::FInterpTo(ViewModelKick, 0.f, DeltaSeconds, TraceCharacterLayout::KickRecoverSpeed);
+
+	// The gun drops a little further than the eye does during a slide — the hands come down into the
+	// lap. CrouchLeanAlpha is the already-eased slide state UpdateCrouchPresentation computed this
+	// frame, so the two cannot disagree about when a slide started.
+	ViewModelCrouchDip = FMath::FInterpTo(ViewModelCrouchDip, CrouchLeanAlpha, DeltaSeconds,
+		TraceCharacterLayout::CrouchLeanInterpSpeed);
+
+	if (!bAnimate)
+	{
+		return;
+	}
+
+	// Vertical bob runs at twice the lateral rate — one dip per footfall, one sway per stride, which
+	// is what a gait actually does.
+	FVector Offset(
+		-ViewModelKick * TraceCharacterLayout::KickBackUU,
+		FMath::Sin(ViewModelBobPhase) * TraceCharacterLayout::BobLateralUU * ViewModelBobStrength,
+		FMath::Sin(ViewModelBobPhase * 2.f) * TraceCharacterLayout::BobVerticalUU * ViewModelBobStrength
+			- ViewModelCrouchDip * TraceCharacterLayout::CrouchDipUU);
+
+	const FRotator Rotation = TraceCharacterLayout::ViewModelRestRotation
+		+ FRotator(ViewModelSwayPitch + ViewModelKick * TraceCharacterLayout::KickPitchDegrees,
+			ViewModelSwayYaw, 0.f);
+
+	ViewModelRoot->SetRelativeLocationAndRotation(TraceCharacterLayout::ViewModelRestLocation + Offset, Rotation);
+}
+
+void ATraceCharacter::NotifyWeaponFired()
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	const double Now = World->GetTimeSeconds();
+	if ((Now - LastFireKickTime) < TraceCharacterLayout::FireKickRefractorySeconds)
+	{
+		return;
+	}
+	LastFireKickTime = Now;
+
+	ViewModelKick = 1.f;
+}
+
+// =================================================================================================
+// Crouch / slide
+// =================================================================================================
+
+void ATraceCharacter::OnStartCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust)
+{
+	// BEFORE Super — see the note on the declaration. ACharacter::OnStartCrouch is what calls
+	// RecalculateBaseEyeHeight(), and that is what copies CrouchedEyeHeight into BaseEyeHeight.
+	if (const UCapsuleComponent* Capsule = GetCapsuleComponent())
+	{
+		const float NewHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+
+		// Clamped INSIDE the capsule (minus a margin) rather than left free: BaseEyeHeight is where
+		// the first-person camera and the aim ray both live, and an eye above the top of a crouched
+		// capsule would let a slide see over cover the body is genuinely behind.
+		const float MaxEye = FMath::Max(4.f, NewHalfHeight - TraceCharacterLayout::CrouchedEyeCapsuleMargin);
+		CrouchedEyeHeight = FMath::Clamp(TraceCharacterLayout::CrouchedEyeAboveFeet - NewHalfHeight, 4.f, MaxEye);
+	}
+
+	Super::OnStartCrouch(HalfHeightAdjust, ScaledHalfHeightAdjust);
+}
+
+void ATraceCharacter::OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust)
+{
+	Super::OnEndCrouch(HalfHeightAdjust, ScaledHalfHeightAdjust);
+}
+
+void ATraceCharacter::UpdateCrouchPresentation(float DeltaSeconds)
+{
+	// WHAT "CROUCHED" MEANS IN THIS GAME, and why this does not read bIsCrouched.
+	//
+	// UTraceCharacterMovementComponent overrides CanCrouchInCurrentState() to ALWAYS RETURN FALSE,
+	// on purpose and with a good reason: the capsule is this project's single source of truth for
+	// hitscan, for the pose history the server rewinds and for the trail trip test, and a slide that
+	// silently halved a pawn's hit height would change all three on the server only, in the middle
+	// of the one mechanic the game is about. The crouch key therefore never resizes anything and
+	// ACharacter::bIsCrouched is never set — it is consumed as an INPUT and turned into a slide.
+	//
+	// So the state to present is IsSliding(), not bIsCrouched. Both are checked anyway, so this
+	// keeps working if the capsule ever does start shrinking.
+	const UTraceCharacterMovementComponent* TraceMovement = GetTraceMovement();
+	const bool bLocallySliding = (TraceMovement != nullptr && TraceMovement->IsSliding());
+
+	// The authority is the one machine that knows the truth for every pawn — its own, its bots' and
+	// every remote client's, all of which it simulates from the same saved moves. Publishing it here
+	// (rather than from the movement component) keeps the write next to the single reader.
+	if (HasAuthority())
+	{
+		bReplicatedSliding = bLocallySliding;
+	}
+
+	// bReplicatedSliding is what carries the slide to a THIRD machine: a simulated proxy runs no
+	// saved moves, so without it a bystander's copy of a sliding player stands bolt upright and, far
+	// worse, lays its hit zones out at standing height (see the property's comment). ORed, never
+	// substituted, so the owner's own prediction always wins on the frame it starts.
+	const bool bSliding = bLocallySliding || bReplicatedSliding || bIsCrouched;
+
+	// --- The eye ---------------------------------------------------------------------------------
+	//
+	// The capsule stays put; the EYE does not have to, and it is the half of the crouch the player
+	// actually experiences. Driving BaseEyeHeight (rather than dropping the camera on its own) is
+	// what keeps the aim honest: GetPawnViewLocation() is actor + BaseEyeHeight, UpdateViewBlend
+	// pins the spring arm to the same value, so the camera, the muzzle and the bullet all descend
+	// together and Trace.DebugViewProbe still reads eyeErr 0.00 mid-slide. Dropping only the camera
+	// would have put the crosshair 34 uu above the shot for the whole slide.
+	//
+	// This half runs on EVERY machine including a dedicated server, because the server evaluates
+	// GetPawnViewLocation() when it resolves a shot; the visual half below does not.
+	const float StandingEye = bIsCrouched ? CrouchedEyeHeight : TraceCharacterLayout::EyeHeight;
+	const float TargetEye = bSliding
+		? FMath::Min(StandingEye, TraceCharacterLayout::SlideEyeHeight)
+		: StandingEye;
+	BaseEyeHeight = FMath::FInterpTo(BaseEyeHeight, TargetEye, DeltaSeconds,
+		TraceCharacterLayout::SlideEyeInterpSpeed);
+
+	if (GetNetMode() == NM_DedicatedServer)
+	{
+		return;   // nothing is drawn there
+	}
+
+	// The slide is client-predicted and server-simulated from the same saved moves, so a bystander's
+	// copy of a sliding player reaches this state on its own: no RPC, no replicated presentation
+	// flag, and the lean cannot disagree with the movement that caused it.
+	const float LeanTarget = bSliding ? 1.f : 0.f;
+	const float PreviousLean = CrouchLeanAlpha;
+	CrouchLeanAlpha = FMath::FInterpTo(CrouchLeanAlpha, LeanTarget, DeltaSeconds,
+		TraceCharacterLayout::CrouchLeanInterpSpeed);
+
+	// --- The lean --------------------------------------------------------------------------------
+	//
+	// Composed as Lean * Yaw, not as a rotator sum: the mesh already carries MeshYaw (-90) to point
+	// its +Y forward down the actor's +X, and adding a pitch to a rotator that is already yawed 90
+	// degrees rolls the character sideways instead of tipping it forward. Quaternion order in Unreal
+	// is "apply the right one first", so this yaws the mesh into place and then pitches it about the
+	// ACTOR's own Y axis, which is the axis a body leans about.
+	//
+	// The pivot is the mesh origin, which sits at the bottom of the capsule (MeshOffsetZ), i.e. at
+	// the feet — so the body tips over its feet rather than swinging about its waist.
+	if (FMath::Abs(CrouchLeanAlpha - PreviousLean) > 0.001f)
+	{
+		if (USkeletalMeshComponent* MeshComp = GetMesh())
+		{
+			const FQuat YawQuat(FRotator(0.f, TraceCharacterLayout::MeshYaw, 0.f));
+			const FQuat LeanQuat(FRotator(CrouchLeanAlpha * TraceCharacterLayout::CrouchLeanPitch, 0.f, 0.f));
+			MeshComp->SetRelativeRotation(LeanQuat * YawQuat);
+		}
+	}
+
+	// --- The skid streak -------------------------------------------------------------------------
+	//
+	// Only while crouched, on the ground AND actually moving: a stationary crouch is a crouch, and a
+	// streak under a player who is standing still would be nonsense. Scaled by speed so the streak
+	// grows out of nothing as a slide starts and dies as it runs out, which is the whole read.
+	if (SlideSkidMesh == nullptr)
+	{
+		return;
+	}
+
+	const UCharacterMovementComponent* Movement = GetCharacterMovement();
+	const bool bGrounded = (Movement != nullptr) && Movement->IsMovingOnGround();
+	const float PlanarSpeed = GetVelocity().Size2D();
+	const float SkidTarget = (bSliding && bGrounded && IsAlive())
+		? FMath::Clamp(PlanarSpeed / TraceCharacterLayout::SkidFullSpeed, 0.f, 1.f)
+		: 0.f;
+
+	SkidGlowAlpha = FMath::FInterpTo(SkidGlowAlpha, SkidTarget, DeltaSeconds, 8.f);
+
+	const bool bShowSkid = SkidGlowAlpha > 0.05f;
+	if (SlideSkidMesh->IsVisible() != bShowSkid)
+	{
+		SlideSkidMesh->SetVisibility(bShowSkid);
+	}
+	if (!bShowSkid)
+	{
+		return;
+	}
+
+	// Sits under the crouched capsule, not the standing one: the capsule really did shrink, so the
+	// streak has to come up with it or it would be drawn inside the floor.
+	const float FeetZ = (GetCapsuleComponent() != nullptr)
+		? -GetCapsuleComponent()->GetScaledCapsuleHalfHeight() + 3.f
+		: -TraceCharacterLayout::CapsuleHalfHeight + 3.f;
+
+	// Trailing BEHIND the pawn, which is where a skid mark belongs. Local +X is the actor's forward
+	// and the actor faces its movement while sliding.
+	SlideSkidMesh->SetRelativeLocation(
+		FVector(-TraceCharacterLayout::SkidLength * 0.5f * SkidGlowAlpha, 0.f, FeetZ));
+	SlideSkidMesh->SetRelativeScale3D(FVector(
+		TraceCharacterLayout::SkidLength * SkidGlowAlpha / TraceCharacterLayout::ViewModelShapeUnit,
+		TraceCharacterLayout::SkidWidth / TraceCharacterLayout::ViewModelShapeUnit,
+		TraceCharacterLayout::SkidThickness / TraceCharacterLayout::ViewModelShapeUnit));
+}
+
+void ATraceCharacter::ApplyRotationMode()
+{
+	// Only a human in first person turns their body with their aim.
+	//
+	// A bot is never looked out of, and ABP_Unarmed drives a SPEED-only blend space: a pawn whose
+	// body faces its aim while it strafes plays a forward run sideways. Nobody sees that on their own
+	// character (it is hidden in first person, and a carrier faces its movement), but everyone sees
+	// it on all nine other characters — so bots stay on orient-to-movement in both modes. This is a
+	// deliberate asymmetry, not an oversight.
+	const bool bHumanControlled = (Cast<APlayerController>(GetController()) != nullptr);
+	const bool bFirstPersonRotation = bHumanControlled && WantsFirstPersonView();
+
+	if (bRotationModeApplied && bRotationModeIsFirstPerson == bFirstPersonRotation)
+	{
+		return;
+	}
+	bRotationModeApplied = true;
+	bRotationModeIsFirstPerson = bFirstPersonRotation;
+
+	// These two are exclusive by construction: leaving both on makes the movement component and the
+	// controller fight over the same yaw every frame.
+	bUseControllerRotationYaw = bFirstPersonRotation;
+
+	if (UCharacterMovementComponent* Movement = GetCharacterMovement())
+	{
+		Movement->bOrientRotationToMovement = !bFirstPersonRotation;
+	}
+}
+
+void ATraceCharacter::SetOwnBodyHiddenFromOwner(bool bHidden)
+{
+	// Guarded because SetOwnerNoSee marks the render state dirty; the blend calls this every frame.
+	if (bOwnBodyHiddenFromOwner == bHidden)
+	{
+		return;
+	}
+	bOwnBodyHiddenFromOwner = bHidden;
+
+	// All three visual components, because which of them is showing depends on whether the mannequin
+	// import has been run — a fresh clone in first person must not be staring at the inside of a
+	// fallback cylinder.
+	if (USkeletalMeshComponent* MeshComp = GetMesh())
+	{
+		MeshComp->SetOwnerNoSee(bHidden);
+
+		// Every other pawn keeps OnlyTickPoseWhenRendered, which is the big animation saving in a
+		// 5v5. This one pawn cannot: in first person it is deliberately not drawn for the only
+		// viewer there is, so "when rendered" would mean "never" — its shadow (bCastHiddenShadow,
+		// set in the constructor) would freeze mid-stride, and the pose would still be stale on the
+		// frame the Core is picked up and the body swings back into view. One always-ticked
+		// skeleton out of ten is a price worth paying for both of those.
+		MeshComp->VisibilityBasedAnimTickOption = bHidden
+			? EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones
+			: EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+	}
+	if (FallbackBodyMesh != nullptr)
+	{
+		FallbackBodyMesh->SetOwnerNoSee(bHidden);
+	}
+	if (FallbackHeadMesh != nullptr)
+	{
+		FallbackHeadMesh->SetOwnerNoSee(bHidden);
+	}
 }
 
 // =================================================================================================
@@ -695,16 +2023,27 @@ void ATraceCharacter::DoMove(const FVector2D& Value)
 
 void ATraceCharacter::DoLook(const FVector2D& Value)
 {
-	// Both signs are already correct on arrival: the mapping context negates raw MouseY, which is
-	// positive when the mouse moves up while AddControllerPitchInput treats positive as down.
+	// Both signs are already correct on arrival: the Look mapping's Y scalar carries BOTH the
+	// vertical sensitivity and the invert-Y sign (Settings/TraceUserSettings). Nothing else in the
+	// chain flips a sign — with bEnableLegacyInputScales=False, AddControllerPitchInput's multiplier
+	// is +1 and raw MouseY is already positive when the mouse moves up. Do not add a negate here.
 	AddControllerYawInput(Value.X);
 	AddControllerPitchInput(Value.Y);
 }
 
 void ATraceCharacter::DoFirePressed()
 {
-	// The weapon owns every rule about whether the shot is legal (carrying the Core, dead, fire
-	// rate). The pawn just forwards the trigger.
+	// SPEC §4. Carrying the Core overloads mouse1: it passes instead of shooting, and the gun stays
+	// silent. Returning here (rather than also calling StartFire) is what guarantees the "cannot
+	// shoot while carrying" rule holds even if the weapon's own gate is ever relaxed.
+	if (bIsCarrier)
+	{
+		DoPassPressed();
+		return;
+	}
+
+	// The weapon owns every remaining rule about whether the shot is legal (dead, fire rate). The
+	// pawn just forwards the trigger.
 	if (Weapon != nullptr)
 	{
 		Weapon->StartFire();
@@ -713,33 +2052,92 @@ void ATraceCharacter::DoFirePressed()
 
 void ATraceCharacter::DoFireReleased()
 {
+	// The release ALWAYS propagates to both consumers. A player who picks up the Core mid-burst, or
+	// loses it mid-pass, must not be left with a stuck trigger or a stuck pass hold — and exactly
+	// one of these two is in a state where the release matters.
+	if (bIsCarrier)
+	{
+		DoPassReleased();
+	}
+
 	if (Weapon != nullptr)
 	{
 		Weapon->StopFire();
 	}
 }
 
-void ATraceCharacter::DoPass()
+void ATraceCharacter::DoPassPressed()
 {
-	// Local early-out only; PerformPass re-checks everything on the server, where bIsCarrier is
-	// authoritative and the Core can confirm it is actually being held by this character.
+	// Local early-out only. ATraceCore re-checks possession, range, line of sight and the aim cone
+	// on the server every tick of the hold; this call is predicted locally purely for the HUD ring.
 	if (!bIsCarrier)
 	{
 		return;
 	}
 
-	// No upward bias applied here — ATraceCore::Throw adds UTraceSettings::PassUpwardBias itself, and
-	// adding it twice would lob every pass into the ceiling.
-	const FVector Direction = GetAimDirection();
+	if (ATraceCore* TheCore = ATraceCore::Get(GetWorld()))
+	{
+		TheCore->RequestPassInput(true);
+	}
+}
 
-	if (HasAuthority())
+void ATraceCharacter::DoPassReleased()
+{
+	// NOT gated on bIsCarrier: a completed pass clears bIsCarrier on this pawn before the player's
+	// finger leaves the button, and the Core still needs to hear the release so bPassInputHeld does
+	// not stay latched into the next possession. RequestPassInput is a safe no-op for a non-holder.
+	if (ATraceCore* TheCore = ATraceCore::Get(GetWorld()))
 	{
-		PerformPass(Direction);
+		TheCore->RequestPassInput(false);
 	}
-	else
+}
+
+void ATraceCharacter::DoPass()
+{
+	DoPassPressed();
+}
+
+float ATraceCharacter::GetPassProgress() const
+{
+	// Negative means "no pass in progress" — the HUD's contract, see the header. Only the holder
+	// ever reports progress, so a spectator or a teammate draws nothing.
+	if (!bIsCarrier)
 	{
-		ServerPass(Direction);
+		return -1.f;
 	}
+
+	const ATraceCore* TheCore = ATraceCore::Get(GetWorld());
+	if (TheCore == nullptr || TheCore->GetCarrier() != this || !TheCore->IsPassActive())
+	{
+		return -1.f;
+	}
+
+	return FMath::Clamp(TheCore->GetPassProgress(), 0.f, 1.f);
+}
+
+float ATraceCharacter::GetHitZonePostureScale() const
+{
+	const UCapsuleComponent* Capsule = GetCapsuleComponent();
+	if (Capsule == nullptr)
+	{
+		return 1.f;
+	}
+
+	// Both heights are measured from the FEET, which is where the zone model lays its bands out
+	// from. Standing is the constant rather than the live capsule's own default so that a pawn whose
+	// capsule is ever resized still reports 1.0 when it is upright.
+	const float HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+	const float StandingAboveFeet = HalfHeight + TraceCharacterLayout::EyeHeight;
+	if (StandingAboveFeet <= KINDA_SMALL_NUMBER)
+	{
+		return 1.f;
+	}
+
+	const float CurrentAboveFeet = HalfHeight + BaseEyeHeight;
+
+	// Floored well above zero: a degenerate posture would collapse the head sphere onto the feet and
+	// turn a leg shot into a one-shot kill. 0.5 is far below anything the slide can produce (0.776).
+	return FMath::Clamp(CurrentAboveFeet / StandingAboveFeet, 0.5f, 1.f);
 }
 
 void ATraceCharacter::ServerPass_Implementation(FVector_NetQuantizeNormal Direction)
@@ -772,37 +2170,26 @@ void ATraceCharacter::ServerPass_Implementation(FVector_NetQuantizeNormal Direct
 
 void ATraceCharacter::PerformPass(const FVector& Direction)
 {
+	// LEGACY. Nothing routes here any more: the pass is a held hover evaluated entirely on the
+	// server from the holder's own aim (ATraceCore::ServerTickPass), and the direction a client
+	// sends is exactly the thing the server is not allowed to trust. Kept because ServerPass is a
+	// declared RPC and an old client build could still call it; re-expressed as "the holder input a
+	// pass", which the Core will then validate against the aim it can see for itself.
 	if (!HasAuthority() || !bIsCarrier)
 	{
 		return;
 	}
 
-	UWorld* World = GetWorld();
-	if (World == nullptr)
-	{
-		return;
-	}
-
-	ATraceCore* TheCore = nullptr;
-	if (const ATraceGameState* TraceGameState = World->GetGameState<ATraceGameState>())
-	{
-		TheCore = TraceGameState->Core;
-	}
+	ATraceCore* TheCore = ATraceCore::Get(GetWorld());
 
 	// The Core is the authority on who is holding it. bIsCarrier is a mirror, and a stale mirror
-	// must not be able to launch a Core somebody else is carrying.
+	// must not be able to move a Core somebody else is carrying.
 	if (TheCore == nullptr || TheCore->GetCarrier() != this)
 	{
 		return;
 	}
 
-	FVector Dir = Direction.GetSafeNormal();
-	if (Dir.IsNearlyZero())
-	{
-		Dir = GetAimDirection();
-	}
-
-	TheCore->Throw(Dir, UTraceSettings::Get().PassSpeed);
+	TheCore->RequestPassInput(true);
 }
 
 void ATraceCharacter::DoDash()
@@ -820,3 +2207,425 @@ void ATraceCharacter::DoDash()
 		Movement->StartDash();
 	}
 }
+
+void ATraceCharacter::DoBoost()
+{
+	if (!IsAlive())
+	{
+		return;
+	}
+
+	if (UTraceCharacterMovementComponent* Movement = GetTraceMovement())
+	{
+		// Same prediction story as the dash: StartBoost() raises a flag that the next saved move packs
+		// into FLAG_Custom_1, so there is no RPC and the server reproduces it from the ServerMove.
+		// The "ground only" and 12s cooldown rules live in the movement component, where the
+		// authoritative movement mode is, not here.
+		Movement->StartBoost();
+	}
+}
+
+// =================================================================================================
+// Debug console command
+// =================================================================================================
+
+#if !UE_BUILD_SHIPPING
+
+namespace
+{
+	/** Shared by both debug commands below: whichever world is actually playing. */
+	UWorld* FindDebugGameWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if ((Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+				&& Context.World() != nullptr)
+			{
+				return Context.World();
+			}
+		}
+		return nullptr;
+	}
+
+	/** The local player's pawn, or null. */
+	ATraceCharacter* FindDebugLocalCharacter(UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			if (PC != nullptr && PC->IsLocalController())
+			{
+				if (ATraceCharacter* Character = Cast<ATraceCharacter>(PC->GetPawn()))
+				{
+					return Character;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Trace.DebugViewProbe [IntervalSeconds] [Samples]
+	 *
+	 * Prints, at Display so it survives an automated run's default verbosity, the two numbers that
+	 * decide whether this feature works and that a screenshot cannot show:
+	 *
+	 *   eyeErr — distance from the CAMERA to GetPawnViewLocation(), the point the shot is built
+	 *            from. In first person this must be 0: the camera IS the gun. In third person it is
+	 *            the arm length, which is the whole point of third person and is fine, because a
+	 *            carrier cannot fire.
+	 *   aimErr — angle between the camera's forward vector and GetAimDirection(). This must be ~0
+	 *            in BOTH modes, or the crosshair is lying about where the bullet goes.
+	 *
+	 * A screenshot proves the view changed; this proves the view did not take the aim with it.
+	 */
+	FAutoConsoleCommand CmdDebugViewProbe(
+		TEXT("Trace.DebugViewProbe"),
+		TEXT("Trace.DebugViewProbe [IntervalSeconds] [Samples] — log camera vs aim agreement in whichever view mode is active."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Interval = (Args.Num() > 0) ? FMath::Max(0.05f, FCString::Atof(*Args[0])) : 1.f;
+			const int32 Samples = (Args.Num() > 1) ? FMath::Max(1, FCString::Atoi(*Args[1])) : 30;
+
+			int32 Emitted = 0;
+			double SinceLast = 0.0;
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([Emitted, SinceLast, Interval, Samples](float DeltaTime) mutable -> bool
+				{
+					SinceLast += DeltaTime;
+					if (SinceLast < Interval)
+					{
+						return true;
+					}
+					SinceLast = 0.0;
+
+					ATraceCharacter* Character = FindDebugLocalCharacter(FindDebugGameWorld());
+					if (Character == nullptr || Character->Camera == nullptr)
+					{
+						return (++Emitted < Samples);
+					}
+
+					const FVector CameraLoc = Character->Camera->GetComponentLocation();
+					const FVector CameraFwd = Character->Camera->GetForwardVector();
+					const FVector EyeLoc = Character->GetPawnViewLocation();
+					const FVector AimDir = Character->GetAimDirection();
+
+					const double EyeError = FVector::Dist(CameraLoc, EyeLoc);
+					const double AimErrorDegrees = FMath::RadiansToDegrees(
+						FMath::Acos(FMath::Clamp(FVector::DotProduct(CameraFwd, AimDir), -1.0, 1.0)));
+
+					// crouch / eye / viewmodel are logged alongside because they are the three things
+					// that can silently break the aim guarantee or the new viewmodel and that a
+					// screenshot cannot distinguish: a crouch that never engaged looks exactly like
+					// one that did if the eye height is not printed, and a viewmodel hidden by a
+					// visibility bug looks exactly like one that was never built.
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ViewProbe] mode=%s carrier=%d blend=%.2f arm=%.1f eyeErr=%.2fuu aimErr=%.4fdeg ")
+						TEXT("bodyHiddenFromOwner=%d ctrlYaw=%d orientToMove=%d ")
+						TEXT("crouched=%d sliding=%d halfHeight=%.1f baseEye=%.1f vmParts=%d vmVisible=%d"),
+						Character->GetViewBlendAlpha() < 0.5f ? TEXT("FIRST") : TEXT("THIRD"),
+						Character->IsCarrier() ? 1 : 0,
+						Character->GetViewBlendAlpha(),
+						Character->SpringArm != nullptr ? Character->SpringArm->TargetArmLength : -1.f,
+						EyeError,
+						AimErrorDegrees,
+						(Character->GetMesh() != nullptr && Character->GetMesh()->bOwnerNoSee) ? 1 : 0,
+						Character->bUseControllerRotationYaw ? 1 : 0,
+						(Character->GetCharacterMovement() != nullptr && Character->GetCharacterMovement()->bOrientRotationToMovement) ? 1 : 0,
+						Character->bIsCrouched ? 1 : 0,
+						(Character->GetTraceMovement() != nullptr && Character->GetTraceMovement()->IsSliding()) ? 1 : 0,
+						Character->GetCapsuleComponent() != nullptr ? Character->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : -1.f,
+						Character->BaseEyeHeight,
+						Character->GetViewModelPartCount(),
+						Character->IsViewModelVisible() ? 1 : 0);
+
+					return (++Emitted < Samples);
+				}),
+				0.f);
+		}));
+
+	/**
+	 * Trace.DebugCrouch [HoldSeconds] [DelaySeconds]
+	 *
+	 * Pulses the crouch/slide input on the local player, so the slide presentation can be
+	 * photographed by an automated -TraceAutoShot run.
+	 *
+	 * It exists for the same reason Trace.DebugTakeCore does: the thing being verified is a VISUAL
+	 * state, a screenshot harness has no hands, and the crouch bind belongs to the input layer,
+	 * which is a different file and a different pass. It drives the two real entry points —
+	 * ACharacter::Crouch() and UTraceCharacterMovementComponent::SetWantsToSlide() — so the slide
+	 * begins through the same predicted path a key press uses, and the lean, the eye dip and the
+	 * skid streak are driven by exactly the state the real thing produces. Only the key is skipped.
+	 *
+	 * IT PULSES RATHER THAN HOLDING, and that is not a detail. A ground slide needs a fresh PRESS
+	 * (see UTraceCharacterMovementComponent's SlideBufferRemaining note), so holding the key gives
+	 * you ONE slide of SlideDuration and then a walk. A harness taking a frame every second or two
+	 * would then photograph a slide that had already ended and conclude the feature was dead —
+	 * which is exactly the failure mode this project has already hit twice with suppressed logging.
+	 * Pressing and releasing on a cycle guarantees a slide window overlaps a capture.
+	 */
+	FAutoConsoleCommand CmdDebugCrouch(
+		TEXT("Trace.DebugCrouch"),
+		TEXT("Trace.DebugCrouch [HoldSeconds] [DelaySeconds] — pulse crouch/slide on the local player so the slide pose can be captured."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Hold = (Args.Num() > 0) ? FMath::Max(0.1f, FCString::Atof(*Args[0])) : 4.f;
+			const float Delay = (Args.Num() > 1) ? FMath::Max(0.f, FCString::Atof(*Args[1])) : 0.f;
+
+			// Long enough to cover a whole slide window, short enough to fit several presses inside
+			// a capture window.
+			constexpr double PressSeconds = 1.1;
+			constexpr double ReleaseSeconds = 0.5;
+
+			double Elapsed = 0.0;
+			bool bLogged = false;
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([Elapsed, bLogged, Hold, Delay](float DeltaTime) mutable -> bool
+				{
+					Elapsed += DeltaTime;
+					if (Elapsed < Delay)
+					{
+						return true;
+					}
+
+					ATraceCharacter* Character = FindDebugLocalCharacter(FindDebugGameWorld());
+					if (Character == nullptr)
+					{
+						// Keep waiting for a pawn until well past the hold window, then give up.
+						return Elapsed < (Delay + Hold + 30.0);
+					}
+
+					UTraceCharacterMovementComponent* Movement = Character->GetTraceMovement();
+
+					// BOTH entry points: the movement component ORs its own intent flag with the
+					// engine's bWantsToCrouch, and which of the two a real bind ends up using is the
+					// input layer's business, not this command's.
+					auto SetHeld = [Character, Movement](bool bDown)
+					{
+						if (bDown) { Character->Crouch(); } else { Character->UnCrouch(); }
+						if (Movement != nullptr) { Movement->SetWantsToSlide(bDown); }
+					};
+
+					if (Elapsed >= (Delay + Hold))
+					{
+						SetHeld(false);
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[DebugCrouch] %s finished (sliding=%d baseEye=%.1f)."),
+							*Character->GetName(),
+							(Movement != nullptr && Movement->IsSliding()) ? 1 : 0,
+							Character->BaseEyeHeight);
+						return false;
+					}
+
+					if (!bLogged)
+					{
+						bLogged = true;
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[DebugCrouch] %s pulsing crouch/slide for %.1fs (capsule halfHeight=%.1f baseEye=%.1f)."),
+							*Character->GetName(),
+							Hold,
+							Character->GetCapsuleComponent() != nullptr ? Character->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : -1.f,
+							Character->BaseEyeHeight);
+					}
+
+					// Square wave on the key, re-asserted every tick so a prediction correction that
+					// clears the intent cannot silently end the test.
+					const double Phase = FMath::Fmod(Elapsed - Delay, PressSeconds + ReleaseSeconds);
+					SetHeld(Phase < PressSeconds);
+					return true;
+				}),
+				0.f);
+		}));
+
+	/**
+	 * Trace.DebugTakeCore [DelaySeconds] [TimeoutSeconds]
+	 *
+	 * Hands the Core to the local player, so the third-person carry view can be captured by an
+	 * automated -TraceAutoShot run. Without this the only way to see it is for a human to walk to the
+	 * centre of a 24000 uu arena and beat nine bots to the pickup, which is not a thing a screenshot
+	 * harness can do — and "I could not photograph it" is how an unverified feature ships broken.
+	 *
+	 * It is not a cheat that bypasses the rules: it calls ATraceCore::TryPickup(), the same entry
+	 * point the pickup sphere calls, so the Core really attaches, the trail really starts, the
+	 * PlayerState really updates and bIsCarrier really replicates. Only the walking is skipped.
+	 *
+	 * HoldSeconds then passes the Core straight back out through ATraceCharacter::DoPass() — again
+	 * the real path, the one RMB uses — so a single automated run covers the whole round trip:
+	 * first person, pull back to third on pickup, push back in to first on release. Testing only
+	 * the way in would leave the return blend unmeasured, and that is half the feature.
+	 *
+	 * It self-schedules: -ExecCmds fires long before the match map has a possessed pawn, so this
+	 * retries on the core ticker until a living local pawn and a loose Core both exist, then stops.
+	 */
+	FAutoConsoleCommand CmdDebugTakeCore(
+		TEXT("Trace.DebugTakeCore"),
+		TEXT("Trace.DebugTakeCore [DelaySeconds] [HoldSeconds] [TimeoutSeconds] — give the local player the Core, then pass it away again."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Delay = (Args.Num() > 0) ? FMath::Max(0.f, FCString::Atof(*Args[0])) : 0.f;
+			const float Hold = (Args.Num() > 1) ? FMath::Max(0.f, FCString::Atof(*Args[1])) : 0.f;
+			const float Timeout = (Args.Num() > 2) ? FMath::Max(1.f, FCString::Atof(*Args[2])) : 60.f;
+
+			// Captured by value into the ticker; the lambda outlives this scope by design.
+			double ElapsedSeconds = 0.0;
+			double CarriedSinceSeconds = -1.0;
+			double PassPressedSeconds = -1.0;
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda(
+					[ElapsedSeconds, CarriedSinceSeconds, PassPressedSeconds, Delay, Hold, Timeout](float DeltaTime) mutable -> bool
+				{
+					ElapsedSeconds += DeltaTime;
+					if (ElapsedSeconds < Delay)
+					{
+						return true;   // keep waiting
+					}
+
+					// ---- second leg: hand it back, so the return blend is exercised too ----------
+					//
+					// INTEGRATION FIX (spec §4). This used to be a single Carrier->DoPass() call, and
+					// under the old model that was complete: DoPass() threw the Core along the aim and
+					// it detached on the spot. The pass is now a HELD hover — DoPass() is only
+					// DoPassPressed(), and the transfer needs the button to stay down for 0.5s with a
+					// teammate under the crosshair. Pressing once and immediately dropping the ticker
+					// left mouse1 LATCHED DOWN on the Core with nothing left alive to release it, so
+					// the pawn sat with its shield suppressed and its trace invulnerable indefinitely
+					// while this command logged that it had passed the Core away. It had not.
+					//
+					// So: press, then keep ticking until the Core actually leaves, and always send the
+					// matching release. Whether it completes or times out, both halves of the risk beat
+					// are restored, which is the state the camera blend is supposed to be measured in.
+					if (CarriedSinceSeconds >= 0.0)
+					{
+						if ((ElapsedSeconds - CarriedSinceSeconds) < Hold)
+						{
+							return true;
+						}
+
+						ATraceCharacter* Carrier = FindDebugLocalCharacter(FindDebugGameWorld());
+						if (Carrier == nullptr)
+						{
+							return false;
+						}
+
+						if (PassPressedSeconds < 0.0)
+						{
+							// Whether we still HAVE the Core decides how to read everything below. The
+							// local pawn is re-resolved every tick, so by now it may be a different
+							// actor entirely: getting trail-dashed while carrying kills you, hands the
+							// Core to the dasher and respawns you as a fresh pawn. Without this the
+							// "no longer carrying" that follows would be reported as a successful
+							// transfer, which is how a harness talks itself into a false pass.
+							if (!Carrier->IsCarrier())
+							{
+								UE_LOG(LogTraceGame, Display,
+									TEXT("[DebugTakeCore] %s no longer has the Core after %.1fs (lost it while carrying); nothing to pass."),
+									*Carrier->GetName(), Hold);
+								return false;
+							}
+
+							// The same entry point mouse1 uses, so the server evaluates our real aim.
+							Carrier->DoPassPressed();
+							PassPressedSeconds = ElapsedSeconds;
+							UE_LOG(LogTraceGame, Display,
+								TEXT("[DebugTakeCore] %s began a pass after %.1fs carrying (shield down, trace invulnerable)."),
+								*Carrier->GetName(), Hold);
+							return true;
+						}
+
+						// Give the hover 6s to find a teammate — well clear of the 0.5s the rule needs.
+						// The surplus is for a receiver walking into the crosshair, which is not
+						// something a screenshot harness can aim.
+						const bool bStillCarrying = Carrier->IsCarrier();
+						if (bStillCarrying && (ElapsedSeconds - PassPressedSeconds) < 6.0)
+						{
+							return true;
+						}
+
+						Carrier->DoPassReleased();
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[DebugTakeCore] %s released the pass after %.1fs (carrier=%d, %s, view blend -> first person)."),
+							*Carrier->GetName(), ElapsedSeconds - PassPressedSeconds, bStillCarrying ? 1 : 0,
+							bStillCarrying ? TEXT("no receiver found - cancelled, shield restored") : TEXT("transfer completed"));
+						return false;
+					}
+
+					if (ElapsedSeconds > (Delay + Timeout))
+					{
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[DebugTakeCore] Gave up after %.1fs: no living local pawn and loose Core."), Timeout);
+						return false;
+					}
+
+					UWorld* World = FindDebugGameWorld();
+					if (World == nullptr)
+					{
+						return true;
+					}
+
+					// Authority only. On a client the Core is server-owned and TryPickup would be a
+					// no-op; say so rather than spinning silently for a minute.
+					if (World->GetNetMode() == NM_Client)
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[DebugTakeCore] Client build: the server owns the Core."));
+						return false;
+					}
+
+					ATraceCore* TheCore = nullptr;
+					if (const ATraceGameState* State = World->GetGameState<ATraceGameState>())
+					{
+						TheCore = State->Core;
+					}
+					if (TheCore == nullptr)
+					{
+						return true;
+					}
+
+					ATraceCharacter* Character = FindDebugLocalCharacter(World);
+					if (Character == nullptr || !Character->IsAlive())
+					{
+						return true;
+					}
+
+					if (Character->IsCarrier())
+					{
+						UE_LOG(LogTraceGame, Display, TEXT("[DebugTakeCore] %s is already the carrier."), *Character->GetName());
+						CarriedSinceSeconds = ElapsedSeconds;
+						return (Hold > 0.f);
+					}
+
+					TheCore->TryPickup(Character);
+
+					// TryPickup can legitimately refuse (someone else is carrying it, pickup lockout).
+					// Report what actually happened rather than what was asked for, and keep retrying
+					// if it did not take.
+					if (!Character->IsCarrier())
+					{
+						return true;
+					}
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[DebugTakeCore] %s is now carrying the Core (view blend -> third person)."),
+						*Character->GetName());
+
+					CarriedSinceSeconds = ElapsedSeconds;
+					return (Hold > 0.f);
+				}),
+				0.f);
+		}));
+}
+
+#endif // !UE_BUILD_SHIPPING

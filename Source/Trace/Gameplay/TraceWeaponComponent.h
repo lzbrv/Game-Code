@@ -3,12 +3,19 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "Engine/NetSerialization.h"
+#include "Gameplay/TraceHitZones.h"   // ETraceHitZone
 #include "TraceWeaponComponent.generated.h"
 
 class ATraceCharacter;
 
 /**
- * The hitscan gun carried by everyone who is not holding the Core.
+ * The hitscan handgun carried by everyone who is not holding the Core.
+ *
+ * DAMAGE IS POSITIONAL (spec section 6): head 100 / body 40 / legs 25 against 100 health, so a
+ * head shot kills outright, three body shots kill, four leg shots kill. There is no headshot
+ * multiplier any more and there is NO SPREAD AT ALL - the spec removes movement inaccuracy, so the
+ * shot goes exactly where the crosshair points, every time, moving or still. See
+ * Gameplay/TraceHitZones.h for where the zones are and what the approximation costs.
  *
  * Network model (see docs/NETWORKING.md):
  *  1. The owning client gates on fire rate locally, rolls its own spread, draws its own tracer
@@ -43,15 +50,21 @@ public:
 
 	/**
 	 * @param Origin               Muzzle position the client fired from.
-	 * @param Direction            Unit aim direction, spread already applied by the client.
+	 * @param Direction            Unit aim direction. No spread is applied any more (spec section 6).
 	 * @param ClientFireServerTime Shared-clock timestamp of the shot, from the client's GameState.
 	 */
 	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerFire(FVector_NetQuantize Origin, FVector_NetQuantizeNormal Direction, float ClientFireServerTime);
 
-	/** Cosmetic tracer for everyone except the shooter, who already predicted it. */
+	/**
+	 * Cosmetic railgun effect for everyone except the shooter, who already predicted it.
+	 *
+	 * @param bImpacted True when the beam actually stopped on something (a body or world geometry)
+	 *                  rather than dying at maximum range, so the impact flash is only drawn where
+	 *                  there is a surface to flash against.
+	 */
 	UFUNCTION(NetMulticast, Unreliable)
-	void MulticastFireEffects(FVector_NetQuantize Origin, FVector_NetQuantize Impact);
+	void MulticastFireEffects(FVector_NetQuantize Origin, FVector_NetQuantize Impact, bool bImpacted);
 
 private:
 	ATraceCharacter* GetTraceCharacter() const;
@@ -65,7 +78,19 @@ private:
 	/** Runs the whole predicted client-side shot and sends ServerFire. */
 	void FireOnce();
 
-	void PlayLocalTracer(const FVector& From, const FVector& To) const;
+	void PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted) const;
+
+	/**
+	 * Last zone the LOCAL predicted trace produced, and the victim it produced it against.
+	 *
+	 * Only read by the Trace.DebugHitZones instrumentation, which compares them against what the
+	 * server independently resolved. On a listen host both traces run in this same process, so the
+	 * comparison is a direct answer to "does what the shooter saw match what the server scored" -
+	 * the failure mode spec section 6 warns about. Never used for gameplay.
+	 */
+	ETraceHitZone LastPredictedZone = ETraceHitZone::None;
+	TWeakObjectPtr<ATraceCharacter> LastPredictedVictim;
+	double LastPredictedFireServerTime = -1000.0;
 
 	/** Trigger state. Only meaningful on the machine that owns the input (client, or listen host). */
 	bool bTriggerHeld = false;

@@ -5,6 +5,7 @@
 #include "Net/UnrealNetwork.h"
 
 #include "Core/TraceCharacter.h"
+#include "Gameplay/TraceCore.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Controller.h"
 #include "Math/UnrealMathUtility.h"
@@ -64,7 +65,10 @@ bool UTraceHealthComponent::IsInvulnerable() const
 	// rather than stored — there is no way for the two to fall out of sync.
 	if (const ATraceCharacter* OwningCharacter = Cast<ATraceCharacter>(GetOwner()))
 	{
-		return OwningCharacter->IsCarrier();
+		// Spec §4, THE RISK BEAT: the shield drops for the whole pass window. Both halves of the
+		// beat (this, and the trace hardening) read the SAME replicated bool on ATraceCore, so they
+		// cannot drift apart, and a cancel restores both in one statement.
+		return OwningCharacter->IsCarrier() && !ATraceCore::IsShieldSuppressedFor(OwningCharacter);
 	}
 	return false;
 }

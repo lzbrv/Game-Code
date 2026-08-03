@@ -8,6 +8,7 @@
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Trace.h"
+#include "World/TraceArenaBuilder.h"   // repaint the endzones when the sides switch
 
 ATraceGameState::ATraceGameState()
 {
@@ -29,6 +30,15 @@ void ATraceGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	DOREPLIFETIME(ATraceGameState, TraceMatchState);
 	DOREPLIFETIME(ATraceGameState, MatchEndServerTime);
 	DOREPLIFETIME(ATraceGameState, Core);
+
+	// The half/side block is small, changes a handful of times per match and decides what every
+	// client draws and which way every bot runs, so it is unconditional and pushed eagerly.
+	DOREPLIFETIME(ATraceGameState, CurrentHalf);
+	DOREPLIFETIME(ATraceGameState, NumHalves);
+	DOREPLIFETIME(ATraceGameState, bHalfTimeBreak);
+	DOREPLIFETIME(ATraceGameState, TeamOnNegativeSide);
+	DOREPLIFETIME(ATraceGameState, LastWipeBonusTeam);
+	DOREPLIFETIME(ATraceGameState, LastWipeBonusServerTime);
 }
 
 int32 ATraceGameState::GetScore(ETraceTeam Team) const
@@ -102,9 +112,150 @@ int32 ATraceGameState::CountTeamMembers(ETraceTeam Team) const
 	return Count;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Halves and sides
+// ---------------------------------------------------------------------------------------------
+
+float ATraceGameState::GetDefendedEndSign(ETraceTeam Team) const
+{
+	if (Team == ETraceTeam::None)
+	{
+		return 0.f;
+	}
+
+	// TeamOnNegativeSide is the whole side assignment. Everything else is this one comparison, which
+	// is exactly why it is worth a function: a `Team == Blue ? -1 : +1` written anywhere else in the
+	// codebase is a bug that only shows up in the second half, when it is hardest to notice.
+	const ETraceTeam NegativeSideTeam = (TeamOnNegativeSide == ETraceTeam::None) ? ETraceTeam::Blue : TeamOnNegativeSide;
+	return (Team == NegativeSideTeam) ? -1.f : 1.f;
+}
+
+float ATraceGameState::GetAttackEndSign(ETraceTeam Team) const
+{
+	return -GetDefendedEndSign(Team);
+}
+
+ETraceTeam ATraceGameState::GetTeamDefendingEnd(float XSign) const
+{
+	const ETraceTeam NegativeSideTeam = (TeamOnNegativeSide == ETraceTeam::None) ? ETraceTeam::Blue : TeamOnNegativeSide;
+	return (XSign < 0.f) ? NegativeSideTeam : TraceOpposingTeam(NegativeSideTeam);
+}
+
+ETraceTeam ATraceGameState::GetTeamAttackingEnd(float XSign) const
+{
+	return TraceOpposingTeam(GetTeamDefendingEnd(XSign));
+}
+
+bool ATraceGameState::AreSidesSwapped() const
+{
+	return TeamOnNegativeSide != ETraceTeam::Blue;
+}
+
+bool ATraceGameState::IsHalfTimeBreak() const
+{
+	return bHalfTimeBreak;
+}
+
+int32 ATraceGameState::GetCurrentHalf() const
+{
+	return CurrentHalf;
+}
+
+FString ATraceGameState::GetHalfLabel() const
+{
+	if (bHalfTimeBreak)
+	{
+		return TEXT("HALF TIME");
+	}
+
+	// Ordinals only go as far as the number of halves anyone will ever configure; beyond that fall
+	// back to a plain count rather than inventing English.
+	switch (CurrentHalf)
+	{
+	case 1:  return (NumHalves <= 1) ? FString(TEXT("MATCH")) : FString(TEXT("1ST HALF"));
+	case 2:  return TEXT("2ND HALF");
+	case 3:  return TEXT("3RD HALF");
+	default: return FString::Printf(TEXT("PERIOD %d"), CurrentHalf);
+	}
+}
+
+void ATraceGameState::SetTeamSides(ETraceTeam InTeamOnNegativeSide)
+{
+	if (!HasAuthority() || InTeamOnNegativeSide == ETraceTeam::None)
+	{
+		return;
+	}
+
+	TeamOnNegativeSide = InTeamOnNegativeSide;
+	OnRep_SidesChanged();
+	ForceNetUpdate();
+}
+
+void ATraceGameState::SetHalfState(int32 InCurrentHalf, int32 InNumHalves, bool bInHalfTimeBreak)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	CurrentHalf = FMath::Max(1, InCurrentHalf);
+	NumHalves = FMath::Max(1, InNumHalves);
+	bHalfTimeBreak = bInHalfTimeBreak;
+
+	OnRep_HalfChanged();
+	ForceNetUpdate();
+}
+
+void ATraceGameState::NotifyWipeBonus(ETraceTeam BonusTeam)
+{
+	if (!HasAuthority() || BonusTeam == ETraceTeam::None)
+	{
+		return;
+	}
+
+	LastWipeBonusTeam = BonusTeam;
+	LastWipeBonusServerTime = static_cast<float>(GetServerWorldTimeSeconds());
+
+	OnRep_WipeBonus();
+	ForceNetUpdate();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Replication callbacks
+// ---------------------------------------------------------------------------------------------
+
 void ATraceGameState::OnRep_Scores()
 {
 	// Nothing to push: the HUD polls GetScore() every frame. The log is the cheapest way to watch
 	// score replication actually land on a client during a two-instance net test.
 	UE_LOG(LogTraceGame, Verbose, TEXT("Scores replicated: Blue %d - Orange %d"), BlueScore, OrangeScore);
+}
+
+void ATraceGameState::OnRep_HalfChanged()
+{
+	// Log at Display, not Verbose: half time is a once-a-match event and the single most useful line
+	// in the log when something about the second half looks wrong. (See the project's hard-won
+	// lesson about mechanics being declared dead because their log line was suppressed.)
+	UE_LOG(LogTraceGame, Display, TEXT("[Half] %s  (half %d of %d)"), *GetHalfLabel(), CurrentHalf, NumHalves);
+}
+
+void ATraceGameState::OnRep_SidesChanged()
+{
+	UE_LOG(LogTraceGame, Display, TEXT("[Sides] %s now defends the -X end (%s defends +X)."),
+		*TraceTeamName(TeamOnNegativeSide).ToString(),
+		*TraceTeamName(TraceOpposingTeam(TeamOnNegativeSide)).ToString());
+
+	// Repaint the arena on THIS machine. The builder is not a replicated actor — every client
+	// constructs its own copy of the arena from the same parameters — so the server calling
+	// ApplyTeamSides on its own builder does nothing for anybody else. This OnRep is the only place
+	// a client learns the sides changed, so it is the only place a client can act on it.
+	//
+	// Runs on the listen host too, harmlessly: ApplyTeamSides is idempotent and early-outs when the
+	// paint already matches.
+	ATraceArenaBuilder::ApplyTeamSidesInWorld(GetWorld(), TeamOnNegativeSide);
+}
+
+void ATraceGameState::OnRep_WipeBonus()
+{
+	UE_LOG(LogTraceGame, Display, TEXT("[Wipe] %s wiped the enemy team."), *TraceTeamName(LastWipeBonusTeam).ToString());
 }

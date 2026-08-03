@@ -45,6 +45,22 @@ public:
 	UPROPERTY(Replicated)
 	bool bIsCarrier = false;
 
+	/**
+	 * Absolute server time (AGameStateBase::GetServerWorldTimeSeconds) at which this player's
+	 * pending respawn fires. Zero means "not waiting to respawn".
+	 *
+	 * Exists because the respawn delay is no longer a constant a client can assume: it lives on the
+	 * game mode (which only exists on the server), and the death panel used to count down from
+	 * UTraceSettings::RespawnDelay — a number nothing enforces. Replicating the deadline instead of
+	 * the duration also makes a late-arriving client immediately correct, exactly like
+	 * MatchEndServerTime.
+	 */
+	UPROPERTY(Replicated)
+	float RespawnEndServerTime = 0.f;
+
+	/** Seconds until RespawnEndServerTime, clamped at zero. Zero when no respawn is pending. */
+	float GetRespawnTimeRemaining() const;
+
 	/** Server only. Assigns the team and runs the OnRep locally so a listen server updates too. */
 	void SetTeam(ETraceTeam NewTeam);
 

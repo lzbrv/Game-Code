@@ -2,14 +2,17 @@
 
 #include "Net/UnrealNetwork.h"
 
+#include "Camera/PlayerCameraManager.h"        // local camera location (proximity glow fade)
 #include "Components/CapsuleComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/Engine.h"                     // GEngine->GetFirstLocalPlayerController()
 #include "Engine/EngineBaseTypes.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"                       // TActorIterator (fallback character gather)
 #include "GameFramework/Controller.h"
 #include "GameFramework/GameStateBase.h"       // GetServerWorldTimeSeconds()
+#include "GameFramework/PlayerController.h"    // IsLocalPlayerController() (own-trace near hide)
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "Math/NumericLimits.h"                // TNumericLimits (trip-test broad phase)
@@ -18,6 +21,7 @@
 
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
+#include "Gameplay/TraceCore.h"                // IsTraceInvulnerableFor (spec §4)
 #include "Gameplay/TraceHealthComponent.h"
 #include "Movement/TraceCharacterMovementComponent.h"   // GetLastDashActiveWorldTime()
 #include "Trace.h"
@@ -25,13 +29,51 @@
 
 namespace
 {
-	/** Upper bound on pooled visual components, so a pathological MaxTrailPoints cannot explode. */
-	constexpr int32 MaxPooledSegments = 512;
+	/**
+	 * Spec §3: the trace lasts FOUR seconds (it was six).
+	 *
+	 * Taken as a CEILING over UTraceSettings::TrailLifetime rather than replacing it, because that
+	 * property still ships at 6.0 and TraceSettings.h belongs to another ownership slice this pass.
+	 * A designer lowering the setting still wins; a stale 6 cannot silently reinstate the old rule.
+	 * Once the setting is updated to 4 this min() becomes an identity and can be deleted.
+	 */
+	constexpr float SpecTraceLifetimeSeconds = 4.0f;
+
+	/** Upper bound on pooled after-images. At 4s and 60uu spacing a run produces roughly 52. */
+	constexpr int32 MaxPooledGhosts = 96;
+
+	/** Meshes per after-image: legs, torso, head. */
+	constexpr int32 PartsPerGhost = 3;
+	constexpr int32 PartLegs = 0;
+	constexpr int32 PartTorso = 1;
+	constexpr int32 PartHead = 2;
+
+	/**
+	 * How much of the freshest trace is hidden from the holder's own camera, measured along the path.
+	 *
+	 * Must stay comfortably longer than ATraceCharacter's third-person arm (450 uu), because the whole
+	 * point is that the camera and its near field sit in the gap. 850 leaves 400 uu of clearance in
+	 * front of the lens. Nobody else's view is affected — see the SetOwnerNoSee block in
+	 * RebuildVisuals() for why this is presentation-only and cannot touch the lethal volume.
+	 */
+	constexpr double OwnerNearHideDistance = 850.0;
+
+	/**
+	 * Camera-proximity emissive fade — the anti-whiteout guard. See ApplyProximityGlowFade().
+	 *
+	 * Far: beyond this the trace is exactly as bright as it was measured to need. 320uu is a little
+	 * over three capsule widths, so nothing at a normal fighting distance is affected at all.
+	 * Near: at and below this the eye is effectively inside the volume.
+	 * MinScale: NOT zero. The trace must stay visible from inside it — it is lethal from inside it.
+	 */
+	constexpr double ProximityFadeFarDistance = 320.0;
+	constexpr double ProximityFadeNearDistance = 30.0;
+	constexpr float ProximityFadeMinScale = 0.10f;
 
 	/**
 	 * How long client visuals stay hidden after MulticastClearTrail. The reliable multicast can
 	 * arrive a frame before the property delta that actually empties Items; without this the
-	 * trail of a just-killed carrier flickers back for a few frames.
+	 * trace of a just-killed holder flickers back for a few frames.
 	 */
 	constexpr float TrailClearSuppressSeconds = 0.35f;
 
@@ -43,10 +85,9 @@ namespace
 	constexpr double MinTeleportSweepDistance = 600.0;
 
 	/**
-	 * The same idea applied to the carrier: a gap this large between two consecutive trail points
-	 * cannot have been walked, so the trail restarts rather than joining them into one lethal
-	 * segment spanning the arena. ATraceGameMode clears the trail explicitly on every teleport it
-	 * knows about (death, respawn, post-score reset); this is the backstop for the rest.
+	 * The same idea applied to the holder: a gap this large between two consecutive trace points
+	 * cannot have been walked, so the trace restarts rather than joining them into one lethal
+	 * segment spanning the arena.
 	 */
 	constexpr double MaxTrailSegmentLength = 1000.0;
 
@@ -61,6 +102,53 @@ namespace
 	 * the rule that walking does nothing.
 	 */
 	constexpr double RecentDashGraceSeconds = 0.15;
+
+	// ---------------------------------------------------------------------------------------------
+	// After-image silhouette (spec §3: "a blur created where your character model has passed
+	// through"). Every number is a FRACTION of the lethal volume, never an absolute — the shape has
+	// to be re-derived if TrailRadius/TrailHeight are retuned, or the player is being shown a
+	// boundary that is not the boundary.
+	//
+	// Measured from the bottom of the volume upward, the three parts tile it: legs occupy the lowest
+	// 45%, torso the next 34%, head the top 23%. Widths taper the way a body does, with the TORSO at
+	// the full lethal width so the widest part of the smear is the part you actually judge.
+	// ---------------------------------------------------------------------------------------------
+
+	constexpr double GhostLegCentreFrac = 0.225;
+	constexpr double GhostLegHeightFrac = 0.450;
+	constexpr double GhostLegWidthFrac = 0.80;
+
+	constexpr double GhostTorsoCentreFrac = 0.615;
+	constexpr double GhostTorsoHeightFrac = 0.340;
+	constexpr double GhostTorsoWidthFrac = 1.00;
+
+	constexpr double GhostHeadCentreFrac = 0.885;
+	constexpr double GhostHeadHeightFrac = 0.230;
+	constexpr double GhostHeadWidthFrac = 0.50;
+
+	/**
+	 * Glow per part, on M_TraceNeon.
+	 *
+	 * MEASURED, and the reason the split exists at all: a previous pass ran the whole trace at 3.4
+	 * and every channel clipped, so it rendered as a shapeless white slab — extremely visible and
+	 * useless, because you could no longer tell WHOSE it was, and a trace whose team you cannot read
+	 * is a trace you cannot decide whether to dash through.
+	 *
+	 * So the body stays under 2 and keeps its team colour through the tonemapper, and the HEAD —
+	 * a small element, exactly the case where clipping to white is the desired look — carries the
+	 * brightness. That is not decoration either: the head sits at ~160uu above the floor, which is
+	 * first-person eye height, so a chain of hot heads is the one feature of the smear that survives
+	 * being seen edge-on from a player's own eyeline at any range. Do not dim it.
+	 */
+	constexpr float GhostLegGlow = 1.25f;
+	constexpr float GhostTorsoGlow = 1.70f;
+	constexpr float GhostHeadGlow = 4.20f;
+
+	/** Oldest after-images dim to this fraction of full glow. Never to zero: they are still lethal. */
+	constexpr float GhostOldestGlowScale = 0.55f;
+
+	/** Spec §4: while the pass window is open the trace hardens. This is what that looks like. */
+	constexpr float GhostInvulnerableGlowScale = 1.90f;
 
 	/** Where along [A,B] the point P projects, clamped to [0,1]. Zero-length segments give 0. */
 	double SegmentAlpha(const FVector& A, const FVector& B, const FVector& P)
@@ -90,19 +178,48 @@ UTraceTrailComponent::UTraceTrailComponent()
 	// The component itself is a bare USceneComponent: a logical anchor with no primitive and
 	// therefore no collision of its own. Everything it draws is a pooled child mesh.
 
-	// Contract §2: engine basic shapes only, resolved with a constructor-time FObjectFinder so
-	// the cooker follows the CDO reference and the asset survives into a packaged build. A bare
-	// runtime LoadObject would return nullptr there.
+	// Engine basic shapes only, resolved with a constructor-time FObjectFinder so the cooker
+	// follows the CDO reference and the asset survives into a packaged build. A bare runtime
+	// LoadObject would return nullptr there.
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CylinderFinder(TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
 	if (CylinderFinder.Succeeded())
 	{
 		CylinderMesh = CylinderFinder.Object;
 	}
 
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> MaterialFinder(TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
-	if (MaterialFinder.Succeeded())
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> SphereFinder(TEXT("/Engine/BasicShapes/Sphere.Sphere"));
+	if (SphereFinder.Succeeded())
 	{
-		TrailMaterial = MaterialFinder.Object;
+		SphereMesh = SphereFinder.Object;
+	}
+
+	// The trace is drawn on the arena's own unlit neon material, NOT on BasicShapeMaterial.
+	//
+	// This mattered more than anything else about the visuals. BasicShapeMaterial is LIT, and this
+	// world is a black room with three deliberately weak directional lights in it - so a tinted lit
+	// mesh standing on the floor came out as a dark grey-blue smudge that you could genuinely walk
+	// past without noticing. M_TraceNeon emits Color * Glow with no lighting term at all, which is
+	// what makes the after-image the same kind of object as every glowing edge in the arena, and
+	// pushes it past the post-process bloom threshold so it reads as light rather than as geometry.
+	//
+	// The trace is the ONLY counterplay to a shielded holder (§3), so a player who cannot see it
+	// cannot play the game.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon"));
+	if (NeonFinder.Succeeded())
+	{
+		TrailMaterial = NeonFinder.Object;
+		bTrailMaterialIsNeon = true;
+	}
+
+	// Fallback exactly as the arena builder does it: /Game/Generated is gitignored and produced by
+	// Scripts/generate_content.py, so a developer who has not run that script must still get a
+	// visible - if flat and lit - trace rather than an invisible one. No .uasset is ever a hard
+	// requirement.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> BasicFinder(TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+	if (TrailMaterial == nullptr && BasicFinder.Succeeded())
+	{
+		TrailMaterial = BasicFinder.Object;
+		bTrailMaterialIsNeon = false;
 	}
 }
 
@@ -110,7 +227,7 @@ void UTraceTrailComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
-	// COND_None on both: the carrier's own client needs to see the trail it is laying just as
+	// COND_None on both: the holder's own client needs to see the trace it is laying just as
 	// much as everyone else does.
 	DOREPLIFETIME(UTraceTrailComponent, TrailPoints);
 	DOREPLIFETIME(UTraceTrailComponent, bEmitting);
@@ -155,13 +272,13 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 
 	if (Owner->HasAuthority())
 	{
-		// Contract §3: the trail dies with its carrier, instantly. ATraceCore drives this in the
-		// normal flow; this is the safety net so a trail can never outlive the body that owns it
-		// and go on killing a corpse.
+		// §3: the trace dies with its holder, instantly. ATraceCore drives this in the normal flow;
+		// this is the safety net so a trace can never outlive the body that owns it and go on
+		// killing a corpse.
 		if (bEmitting)
 		{
-			const ATraceCharacter* Carrier = GetOwnerCharacter();
-			if (Carrier == nullptr || !Carrier->IsAlive())
+			const ATraceCharacter* Holder = GetOwnerCharacter();
+			if (Holder == nullptr || !Holder->IsAlive())
 			{
 				SetEmitting(false);
 				ClearTrail();
@@ -172,10 +289,14 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 		ServerRunTripTest(DeltaTime);
 	}
 
-	// Listen servers draw the trail too; only a headless server skips it.
+	// Listen servers draw the trace too; only a headless server skips it.
 	if (GetNetMode() != NM_DedicatedServer)
 	{
 		UpdateVisuals();
+
+		// EVERY frame, not just on a rebuild: this depends on where the local camera is, and the
+		// camera moves continuously while the geometry does not. See the function's comment.
+		ApplyProximityGlowFade();
 	}
 }
 
@@ -183,6 +304,11 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 // =================================================================================================
 // Public API
 // =================================================================================================
+
+float UTraceTrailComponent::GetTraceLifetimeSeconds()
+{
+	return FMath::Max(0.1f, FMath::Min(UTraceSettings::Get().TrailLifetime, SpecTraceLifetimeSeconds));
+}
 
 void UTraceTrailComponent::SetEmitting(bool bEmit)
 {
@@ -204,24 +330,62 @@ void UTraceTrailComponent::SetEmitting(bool bEmit)
 
 	if (bEmit)
 	{
-		// A new carrier never inherits the previous trail.
+		// A new holder never inherits the previous trace.
 		ClearTrail();
 
-		// Lay the first point at the pickup itself rather than one spacing later.
+		// Lay the first point at the transfer itself rather than one spacing later — unless the
+		// §2 grace is running, in which case ServerUpdateTrail lays nothing and the trace simply
+		// starts a second later, from wherever the holder has got to by then.
 		ServerUpdateTrail();
 	}
+	else
+	{
+		// Not emitting means not in a grace window either. Leaving a stale deadline behind would
+		// eat the first second of the NEXT emission window this component ever opens.
+		EmitGraceEndServerTime = 0.f;
+	}
 
-	// Note: stopping does NOT clear. A trail left behind by a pass is harmless (the trip test
-	// requires bEmitting) and fading out over TrailLifetime reads much better than popping.
+	// Note: stopping does NOT clear. A trace left behind by a completed pass is harmless (the trip
+	// test requires bEmitting) and fading out over its lifetime reads much better than popping.
 	// Death is the case that must clear instantly, and it does so explicitly.
 
-	UE_LOG(LogTraceGame, Verbose, TEXT("Trail: %s emitting for %s"),
+	UE_LOG(LogTraceGame, Verbose, TEXT("Trace: %s emitting for %s"),
 		bEmit ? TEXT("started") : TEXT("stopped"), *GetNameSafe(GetOwner()));
+}
+
+void UTraceTrailComponent::SetEmitGrace(float Seconds)
+{
+	const AActor* Owner = GetOwner();
+	if (Owner == nullptr || !Owner->HasAuthority())
+	{
+		return;
+	}
+
+	EmitGraceEndServerTime = (Seconds > 0.f) ? (GetServerTimeSeconds() + Seconds) : 0.f;
+
+	if (Seconds > 0.f)
+	{
+		UE_LOG(LogTraceGame, Verbose, TEXT("Trace: %.2fs grace before %s begins leaving a trace"),
+			Seconds, *GetNameSafe(GetOwner()));
+	}
 }
 
 bool UTraceTrailComponent::IsEmitting() const
 {
 	return bEmitting;
+}
+
+bool UTraceTrailComponent::IsTraceInvulnerable() const
+{
+	// Read straight out of the Core rather than mirrored here. §4 says the trace hardening and the
+	// holder's shield loss happen "simultaneously"; the only way to guarantee that is for both to be
+	// the same replicated bool, read twice.
+	return ATraceCore::IsTraceInvulnerableFor(GetOwner());
+}
+
+void UTraceTrailComponent::NotifyInvulnerabilityChanged()
+{
+	bVisualsDirty = true;
 }
 
 void UTraceTrailComponent::ClearTrail()
@@ -240,7 +404,7 @@ void UTraceTrailComponent::ClearTrail()
 		TrailPoints.MarkArrayDirty();
 
 		// The delta alone would get there, but "instantly" is a game rule here — the reliable
-		// multicast lets every client drop the visuals on the same frame the carrier dies.
+		// multicast lets every client drop the visuals on the same frame the holder dies.
 		//
 		// Guarded on there having actually been something to clear: ClearTrail() is called on every
 		// death (twice - HandleDeath and NotifyCharacterDied), on Logout, on SetEmitting(true), and
@@ -256,7 +420,7 @@ void UTraceTrailComponent::ClearTrail()
 
 void UTraceTrailComponent::MulticastClearTrail_Implementation()
 {
-	HideSegmentsFrom(0);
+	HideGhostsFrom(0);
 
 	LastVisualPointCount = -1;
 	LastVisualHead = FVector::ZeroVector;
@@ -264,7 +428,7 @@ void UTraceTrailComponent::MulticastClearTrail_Implementation()
 	bVisualsDirty = true;
 
 	// Hold the visuals down briefly: this reliable RPC can beat the property delta that empties
-	// Items, and re-showing a dead carrier's trail for a few frames looks like a bug. Any
+	// Items, and re-showing a dead holder's trace for a few frames looks like a bug. Any
 	// subsequent replication callback (or an empty Items) lifts the hold early.
 	if (const UWorld* World = GetWorld())
 	{
@@ -285,7 +449,7 @@ void UTraceTrailComponent::OnTrailPointsChanged()
 
 
 // =================================================================================================
-// Server: laying the trail
+// Server: laying the trace
 // =================================================================================================
 
 void UTraceTrailComponent::ServerUpdateTrail()
@@ -295,7 +459,7 @@ void UTraceTrailComponent::ServerUpdateTrail()
 	bool bChanged = false;
 
 	// 1. Expire. Items are strictly ordered oldest-first, so the first survivor ends the scan.
-	const float Lifetime = FMath::Max(0.1f, Settings.TrailLifetime);
+	const float Lifetime = GetTraceLifetimeSeconds();
 	int32 ExpiredCount = 0;
 	while (ExpiredCount < TrailPoints.Items.Num()
 		&& (Now - TrailPoints.Items[ExpiredCount].BirthServerTime) > Lifetime)
@@ -318,16 +482,23 @@ void UTraceTrailComponent::ServerUpdateTrail()
 		bChanged = true;
 	}
 
-	// 3. Append, distance-gated so a stationary carrier does not spam identical points.
-	if (bEmitting)
+	// 3. Append, distance-gated so a stationary holder does not spam identical points.
+	//
+	//    §2's transfer grace lives right here: for one second after the Core changes team, the new
+	//    holder is running around laying nothing. Everything else about the emission window is
+	//    already true — bEmitting is set, the trip test is live — there simply are no points yet,
+	//    which is exactly what "the trace has not begun to form" means.
+	const bool bGraceActive = (EmitGraceEndServerTime > 0.f) && (Now < EmitGraceEndServerTime);
+
+	if (bEmitting && !bGraceActive)
 	{
 		// Anchor on the capsule centre (the owner's actor location), NOT on this component's own
 		// world location. The trip test measures every candidate by its actor location, so both
 		// halves of the geometry have to live in the same reference frame; if the pawn ever
 		// attaches this component with an offset, GetComponentLocation() would quietly slide the
-		// trail away from the volume the test evaluates. Falls back for a non-character owner.
-		const ATraceCharacter* Carrier = GetOwnerCharacter();
-		const FVector Location = Carrier != nullptr ? Carrier->GetActorLocation() : GetComponentLocation();
+		// trace away from the volume the test evaluates. Falls back for a non-character owner.
+		const ATraceCharacter* Holder = GetOwnerCharacter();
+		const FVector Location = Holder != nullptr ? Holder->GetActorLocation() : GetComponentLocation();
 
 		const double Spacing = FMath::Max(1.0, static_cast<double>(Settings.TrailPointSpacing));
 
@@ -339,7 +510,7 @@ void UTraceTrailComponent::ServerUpdateTrail()
 		// Teleport, not movement — restart rather than laying a segment across the map.
 		if (bHasHead && DistanceFromHead > MaxTrailSegmentLength)
 		{
-			UE_LOG(LogTraceGame, Verbose, TEXT("Trail: discontinuity of %.0fuu on %s, restarting trail"),
+			UE_LOG(LogTraceGame, Verbose, TEXT("Trace: discontinuity of %.0fuu on %s, restarting"),
 				DistanceFromHead, *GetNameSafe(GetOwner()));
 
 			ClearTrail();
@@ -364,8 +535,7 @@ void UTraceTrailComponent::ServerUpdateTrail()
 
 		// Authority cannot race itself: TrailPoints is settled by the time we get here. A listen
 		// server runs MulticastClearTrail on itself too, so without this the host would hold its
-		// own visuals down for the suppression window every time a carrier picks the Core up
-		// (SetEmitting -> ClearTrail -> multicast -> immediately lay the first point again).
+		// own visuals down for the suppression window every time the Core changes hands.
 		VisualSuppressUntilTime = 0.f;
 	}
 }
@@ -377,10 +547,28 @@ void UTraceTrailComponent::ServerUpdateTrail()
 
 void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 {
-	ATraceCharacter* Carrier = GetOwnerCharacter();
-	if (Carrier == nullptr || !bEmitting || !Carrier->IsAlive())
+	ATraceCharacter* Holder = GetOwnerCharacter();
+	if (Holder == nullptr || !bEmitting || !Holder->IsAlive())
 	{
-		// Not laying trail: nothing is lethal, and any remembered positions are now stale.
+		// Not laying a trace: nothing is lethal, and any remembered positions are now stale.
+		PreviousLocations.Reset();
+		return;
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// SPEC §4, THE RISK BEAT. From the instant the holder inputs a pass until it completes or
+	// cancels, the trace CANNOT BE BROKEN. This is the whole reason the passer is willing to give
+	// up their shield: for those 0.5s the dash counterplay is off the table and the only way to
+	// stop the pass is to shoot them.
+	//
+	// Positions are still refreshed below on the frames this returns early? No — they are not, and
+	// that is deliberate: PreviousLocations is reset here so that the first tick AFTER the window
+	// closes rebuilds its sweeps from fresh positions rather than from wherever everyone was half a
+	// second ago. A stale sweep would be discarded by the teleport guard anyway, i.e. it would
+	// silently swallow the first dash after every pass.
+	// -------------------------------------------------------------------------------------------
+	if (IsTraceInvulnerable())
+	{
 		PreviousLocations.Reset();
 		return;
 	}
@@ -388,7 +576,7 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	const UTraceSettings& Settings = UTraceSettings::Get();
 
 	// The newest TrailHeadGracePoints points are exempt so a defender cannot simply stand on the
-	// emitter and dash on the spot — they have to actually cross the laid trail.
+	// emitter and dash on the spot — they have to actually cross the laid trace.
 	const int32 GraceCount = FMath::Max(0, Settings.TrailHeadGracePoints);
 	const int32 LastTestableIndex = TrailPoints.Items.Num() - 1 - GraceCount;
 
@@ -403,7 +591,7 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 
 	// Broad phase. The narrow phase below is O(candidates x segments) - with MaxTrailPoints=256 and
 	// ten players that is ~2500 segment-to-segment tests every server frame, for a test that is
-	// almost always a miss. One XY AABB over the whole trail turns the common case into four
+	// almost always a miss. One XY AABB over the whole trace turns the common case into four
 	// comparisons per candidate. It is only ever used to reject, so it cannot change the outcome.
 	// Written as four scalars rather than an FBox2D so nothing depends on that type's float/double
 	// spelling on any given 5.x engine.
@@ -463,9 +651,9 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 
 		// --- eligibility, in the exact order the game rules state it -------------------------
 
-		// The carrier can never trip their own trail (grace points are not enough on their own
+		// The holder can never trip their own trace (grace points are not enough on their own
 		// when bOnlyEnemiesTripTrail is turned off for tuning).
-		if (Candidate == Carrier)
+		if (Candidate == Holder)
 		{
 			continue;
 		}
@@ -476,29 +664,29 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 			continue;
 		}
 
-		// (b) an enemy of the carrier. Unknown teams never count as enemies.
+		// (b) an enemy of the holder. Unknown teams never count as enemies; teammates never trip it.
 		if (Settings.bOnlyEnemiesTripTrail)
 		{
-			const ETraceTeam CarrierTeam = Carrier->GetTeam();
+			const ETraceTeam HolderTeam = Holder->GetTeam();
 			const ETraceTeam CandidateTeam = Candidate->GetTeam();
-			const bool bIsEnemy = CarrierTeam != ETraceTeam::None
+			const bool bIsEnemy = HolderTeam != ETraceTeam::None
 				&& CandidateTeam != ETraceTeam::None
-				&& CandidateTeam != CarrierTeam;
+				&& CandidateTeam != HolderTeam;
 			if (!bIsEnemy)
 			{
 				continue;
 			}
 		}
 
-		// (c) dashing. This is the rule: walking or running through a trail does nothing at all,
-		// and the dash is the only counterplay to an invulnerable carrier.
+		// (c) dashing. This is the rule: walking or running through a trace does nothing at all,
+		// and the dash is the only counterplay to a shielded holder.
 		//
 		// Sampled with a short trailing window rather than as an instant. This test ticks once per
 		// server frame, but the server advances a remote client's dash clock inside MoveAutonomous
 		// and can consume several client moves in one frame - so the tail of a dash (or, after a
 		// hitch, all 0.18s of it) can be simulated *between* two ticks here. The displacement is
 		// still credited to this frame's sweep, but DashTimeRemaining has already hit zero, and the
-		// player watches themselves dash through the trail with nothing happening. The movement
+		// player watches themselves dash through the trace with nothing happening. The movement
 		// component latches the last instant it was authoritatively dashing; accept that too.
 		if (Settings.bRequireDashToTripTrail && !Candidate->IsDashing())
 		{
@@ -539,11 +727,11 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 			CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
 		}
 
-		// The trail is a vertical wall of radius TrailRadius and height TrailHeight swept along
-		// the carrier's path, and the tripper is a capsule swept along its path this tick. Test
+		// The trace is a vertical volume of radius TrailRadius and height TrailHeight swept along
+		// the holder's path, and the tripper is a capsule swept along its path this tick. Test
 		// those two sweeps as: horizontal segment-to-segment distance (which catches tunnelling
 		// at dash speed, unlike a point test), plus a separate vertical overlap check so that
-		// clearing the wall in the air is not a hit.
+		// clearing the trace in the air is not a hit.
 		const double HorizontalThreshold = TrailRadius + CapsuleRadius;
 		const double HorizontalThresholdSquared = HorizontalThreshold * HorizontalThreshold;
 		const double VerticalThreshold = TrailHalfHeight + CapsuleHalfHeight;
@@ -552,7 +740,7 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		const FVector SweepEnd(CurrentLocation.X, CurrentLocation.Y, 0.0);
 
 		// Broad phase: if this candidate's swept XY box, inflated by the same horizontal threshold
-		// the narrow phase uses, does not touch the trail's XY box, no segment can be within range.
+		// the narrow phase uses, does not touch the trace's XY box, no segment can be within range.
 		{
 			const double SweepMinX = FMath::Min(PreviousLocation.X, CurrentLocation.X) - HorizontalThreshold;
 			const double SweepMaxX = FMath::Max(PreviousLocation.X, CurrentLocation.X) + HorizontalThreshold;
@@ -604,13 +792,13 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	// TrailPoints.Items and PreviousLocations.
 	if (Tripper != nullptr)
 	{
-		ApplyTrailTrip(Carrier, Tripper);
+		ApplyTrailTrip(Holder, Tripper);
 	}
 }
 
-void UTraceTrailComponent::ApplyTrailTrip(ATraceCharacter* Carrier, ATraceCharacter* Tripper)
+void UTraceTrailComponent::ApplyTrailTrip(ATraceCharacter* Holder, ATraceCharacter* Tripper)
 {
-	if (Carrier == nullptr || Tripper == nullptr)
+	if (Holder == nullptr || Tripper == nullptr)
 	{
 		return;
 	}
@@ -618,23 +806,27 @@ void UTraceTrailComponent::ApplyTrailTrip(ATraceCharacter* Carrier, ATraceCharac
 	// Resolve both controllers first: the first Kill() may unpossess the pawn we would otherwise
 	// ask for a controller afterwards.
 	AController* TripperController = Tripper->GetController();
-	AController* CarrierController = Carrier->GetController();
+	AController* HolderController = Holder->GetController();
 
-	/** Cause tag reported to the GameMode / kill feed for a trail death (build contract §7). */
+	/** Cause tag reported to the GameMode / kill feed for a trace death. */
 	static const FName TrailDeathCause(TEXT("Trail"));
 
 	const ETrailLethality Lethality = UTraceSettings::Get().TrailLethality;
 
-	UE_LOG(LogTraceGame, Log, TEXT("Trail tripped: %s dashed through %s's trail (lethality %d)"),
-		*GetNameSafe(Tripper), *GetNameSafe(Carrier), static_cast<int32>(Lethality));
+	UE_LOG(LogTraceGame, Log, TEXT("Trace broken: %s dashed through %s's trace (lethality %d)"),
+		*GetNameSafe(Tripper), *GetNameSafe(Holder), static_cast<int32>(Lethality));
 
 	if (Lethality == ETrailLethality::KillsCarrier || Lethality == ETrailLethality::KillsBoth)
 	{
-		// Kill(), never ApplyDamage(): the carrier is invulnerable to damage by design, and the
-		// trail is the one thing that gets through. This is the whole point of the mechanic.
-		if (UTraceHealthComponent* CarrierHealth = Carrier->Health)
+		// Kill(), never ApplyDamage(): the holder is shielded against damage by design, and the
+		// trace is the one thing that gets through. This is the whole point of the mechanic.
+		//
+		// TripperController is what carries the §2 transfer: ATraceCore listens to this health
+		// component's OnDeath and hands the Core to whoever is credited here. "The core transfers
+		// to the enemy who breaks your trace" is implemented by this argument.
+		if (UTraceHealthComponent* HolderHealth = Holder->Health)
 		{
-			CarrierHealth->Kill(TripperController, TrailDeathCause);
+			HolderHealth->Kill(TripperController, TrailDeathCause);
 		}
 	}
 
@@ -642,7 +834,7 @@ void UTraceTrailComponent::ApplyTrailTrip(ATraceCharacter* Carrier, ATraceCharac
 	{
 		if (UTraceHealthComponent* TripperHealth = Tripper->Health)
 		{
-			TripperHealth->Kill(CarrierController, TrailDeathCause);
+			TripperHealth->Kill(HolderController, TrailDeathCause);
 		}
 	}
 }
@@ -707,6 +899,28 @@ ATraceCharacter* UTraceTrailComponent::GetOwnerCharacter() const
 
 // =================================================================================================
 // Visuals (client + listen server)
+//
+// SPEC §3: "a blur created where your character model has passed through".
+//
+// The previous implementation extruded one continuous wall between consecutive points, with a hot
+// strip along its top edge. It was readable, but it read as a fence — a solid barrier the carrier
+// had built — which is the wrong mental model for a thing you are supposed to run at and dash
+// through, and it is not what the design doc asks for.
+//
+// What is drawn now is a chain of CHARACTER-SHAPED after-images: at every trail point, a coarse
+// three-part silhouette (legs / torso / head) oriented along the direction of travel, fading with
+// age. Consecutive points are 60uu apart and each silhouette is deeper than that along its own axis,
+// so they overlap into a continuous smear rather than a dotted line of statues — which is what makes
+// it read as motion blur instead of as a crowd.
+//
+// Two properties were preserved deliberately, because both were measured and both are load-bearing:
+//
+//   1. The silhouette spans EXACTLY the lethal volume (TrailRadius wide, TrailHeight tall, centred
+//      on the point). What you dash at is what kills you.
+//   2. The HEAD is the hottest part, and it sits at first-person eye height. A previous pass
+//      established that a trace has to be readable from a player's own eyeline at range; a bright
+//      element at that height is the feature that survives the projection when everything else
+//      collapses edge-on.
 // =================================================================================================
 
 void UTraceTrailComponent::UpdateVisuals()
@@ -735,9 +949,11 @@ void UTraceTrailComponent::UpdateVisuals()
 	const int32 PointCount = TrailPoints.Items.Num();
 	const FVector Head = PointCount > 0 ? FVector(TrailPoints.Items.Last().Location) : FVector::ZeroVector;
 	const FVector Tail = PointCount > 0 ? FVector(TrailPoints.Items[0].Location) : FVector::ZeroVector;
+	const bool bInvulnerable = IsTraceInvulnerable();
 
 	if (!bVisualsDirty
 		&& PointCount == LastVisualPointCount
+		&& bInvulnerable == bLastVisualInvulnerable
 		&& Head.Equals(LastVisualHead, 0.01)
 		&& Tail.Equals(LastVisualTail, 0.01))
 	{
@@ -748,139 +964,408 @@ void UTraceTrailComponent::UpdateVisuals()
 	LastVisualPointCount = PointCount;
 	LastVisualHead = Head;
 	LastVisualTail = Tail;
+	bLastVisualInvulnerable = bInvulnerable;
 
 	RebuildVisuals();
 }
 
 void UTraceTrailComponent::RebuildVisuals()
 {
-	const int32 SegmentCount = FMath::Max(0, TrailPoints.Items.Num() - 1);
-	if (SegmentCount == 0 || CylinderMesh == nullptr)
+	const int32 PointCount = TrailPoints.Items.Num();
+	if (PointCount == 0 || CylinderMesh == nullptr)
 	{
-		HideSegmentsFrom(0);
+		HideGhostsFrom(0);
 		return;
 	}
 
 	CacheMeshMetrics();
 
 	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// The silhouette is derived from the lethal volume, never chosen. If TrailRadius/TrailHeight are
+	// retuned the after-image moves with them.
 	const double Width = FMath::Max(1.0, 2.0 * static_cast<double>(Settings.TrailRadius));
 	const double Height = FMath::Max(1.0, static_cast<double>(Settings.TrailHeight));
+	const double HalfHeight = Height * 0.5;
+	const double Spacing = FMath::Max(1.0, static_cast<double>(Settings.TrailPointSpacing));
 
-	int32 PlacedCount = 0;
-	for (int32 SegmentIndex = 0; SegmentIndex < SegmentCount; ++SegmentIndex)
+	// Depth along the direction of travel. Kept above the point spacing so consecutive after-images
+	// interpenetrate and the chain reads as one smear rather than as separate figures.
+	const double Depth = FMath::Max(Width * 0.62, Spacing * 1.35);
+
+	const float Lifetime = GetTraceLifetimeSeconds();
+	const float Now = GetServerTimeSeconds();
+	const float InvulnerableScale = IsTraceInvulnerable() ? GhostInvulnerableGlowScale : 1.f;
+
+	// --- Hide the newest stretch of the trace from the holder's OWN eyes -------------------------
+	//
+	// Holding the Core is what puts the camera into third person, and third person parks it
+	// ThirdPersonArmLength straight back down the path the holder just walked — which is exactly
+	// where this component is placing unlit emissive geometry. Raising the camera above the trace
+	// (see ATraceCharacter::GetThirdPersonPivotZ) stops it being INSIDE it, but the freshest
+	// after-images are still hot surfaces a few tens of uu below the lens: they blew out the bottom
+	// third of the frame and, worse, drowned the player's own character in glare.
+	//
+	// SetOwnerNoSee hides a primitive from ONE viewer — the one whose view target owns it — so this
+	// costs every other player nothing. They still see the whole trace, including the part its own
+	// holder cannot, and the LETHAL VOLUME IS UNTOUCHED: trip resolution runs off TrailPoints, never
+	// off what happens to be rendered. A holder cannot trip their own trace anyway, so nothing is
+	// being hidden that its owner could act on.
+	int32 FirstOwnerHiddenPoint = PointCount;   // == PointCount means "hide nothing"
+	if (const ATraceCharacter* OwnerCharacter = GetOwnerCharacter())
 	{
-		UStaticMeshComponent* Segment = GetOrCreateSegment(SegmentIndex);
-		if (Segment == nullptr)
+		const APlayerController* OwnerPC = Cast<APlayerController>(OwnerCharacter->GetController());
+		if (OwnerPC != nullptr && OwnerPC->IsLocalPlayerController())
 		{
-			break;   // Pool cap hit, or no mesh — draw what we have.
+			double DistanceFromHead = 0.0;
+			FirstOwnerHiddenPoint = 0;
+			for (int32 Index = PointCount - 1; Index >= 0; --Index)
+			{
+				if (DistanceFromHead >= OwnerNearHideDistance)
+				{
+					FirstOwnerHiddenPoint = Index + 1;
+					break;
+				}
+				if (Index > 0)
+				{
+					DistanceFromHead += FVector::Dist(TrailPoints.Items[Index - 1].Location, TrailPoints.Items[Index].Location);
+				}
+			}
+		}
+	}
+
+	// If there are more points than the pool can draw, drop the OLDEST. UTraceSettings::MaxTrailPoints
+	// is 256 and the pool caps at 96, so this is reachable if the point spacing is ever lowered — and
+	// truncating from the wrong end would hide the freshest stretch of the trace, which is the part
+	// an approaching enemy is judging and the part nearest the holder. The tail simply fades early.
+	const int32 FirstDrawnPoint = FMath::Max(0, PointCount - MaxPooledGhosts);
+
+	int32 PlacedGhosts = 0;
+
+	for (int32 PointIndex = FirstDrawnPoint; PointIndex < PointCount; ++PointIndex)
+	{
+		if (!EnsureGhost(PlacedGhosts))
+		{
+			break;   // Pool cap hit — draw what we have.
 		}
 
-		const FVector Start = TrailPoints.Items[SegmentIndex].Location;
-		const FVector End = TrailPoints.Items[SegmentIndex + 1].Location;
+		const FVector Centre = TrailPoints.Items[PointIndex].Location;
 
-		FVector Along = End - Start;
+		// Facing: the direction the holder was travelling when this after-image was left. Taken from
+		// the segment that ENDS here where one exists, so the first point borrows the second's.
+		FVector Along = FVector::ZeroVector;
+		if (PointIndex > 0)
+		{
+			Along = Centre - FVector(TrailPoints.Items[PointIndex - 1].Location);
+		}
+		else if (PointCount > 1)
+		{
+			Along = FVector(TrailPoints.Items[1].Location) - Centre;
+		}
 		Along.Z = 0.0;
-		const double AlongLength = Along.Size();
+		const FRotator Facing = (Along.SizeSquared() > 1.0) ? Along.GetSafeNormal().Rotation() : FRotator::ZeroRotator;
 
-		// Yaw-only: Along is horizontal, so the cylinder's local Z stays world-up and the mesh
-		// remains a vertical wall segment.
-		const FRotator SegmentRotation = AlongLength > 1.0 ? (Along / AlongLength).Rotation() : FRotator::ZeroRotator;
+		// Age fade. Never to zero: an old after-image is exactly as lethal as a new one, so it has
+		// to stay clearly visible — this is a "cooling" cue, not a disappearance.
+		const float Age = FMath::Max(0.f, Now - TrailPoints.Items[PointIndex].BirthServerTime);
+		const float Remaining = FMath::Clamp(1.f - (Age / FMath::Max(0.01f, Lifetime)), 0.f, 1.f);
+		const float FadeScale = FMath::Lerp(GhostOldestGlowScale, 1.f, Remaining);
 
-		// Stretched along the path and padded by one radius at each end so consecutive segments
-		// overlap into one continuous wall instead of a dotted line of pillars. The resulting
-		// elliptical prism is a close match for the swept capsule the trip test actually uses.
-		const FVector DesiredSize(AlongLength + Width, Width, Height);
-		const FVector Scale(
-			DesiredSize.X / (2.0 * MeshHalfSize.X),
-			DesiredSize.Y / (2.0 * MeshHalfSize.Y),
-			DesiredSize.Z / (2.0 * MeshHalfSize.Z));
+		const bool bHideFromOwner = (PointIndex >= FirstOwnerHiddenPoint);
 
-		// Corrects for a source mesh whose pivot is not at its bounds centre, so we never have to
-		// assume anything about the engine cylinder's authoring.
-		const FVector PivotCorrection = SegmentRotation.RotateVector(MeshPivotOffset * Scale);
-		const FVector Midpoint = (Start + End) * 0.5;
+		for (int32 Part = 0; Part < PartsPerGhost; ++Part)
+		{
+			UStaticMeshComponent* Piece = GhostMeshes[PlacedGhosts * PartsPerGhost + Part];
+			if (Piece == nullptr)
+			{
+				continue;
+			}
 
-		Segment->SetWorldLocationAndRotation(Midpoint - PivotCorrection, SegmentRotation);
-		Segment->SetWorldScale3D(Scale);
-		Segment->SetVisibility(true);
-		++PlacedCount;
+			double CentreFrac = GhostTorsoCentreFrac;
+			double HeightFrac = GhostTorsoHeightFrac;
+			double WidthFrac = GhostTorsoWidthFrac;
+			float BaseGlow = GhostTorsoGlow;
+
+			if (Part == PartLegs)
+			{
+				CentreFrac = GhostLegCentreFrac;
+				HeightFrac = GhostLegHeightFrac;
+				WidthFrac = GhostLegWidthFrac;
+				BaseGlow = GhostLegGlow;
+			}
+			else if (Part == PartHead)
+			{
+				CentreFrac = GhostHeadCentreFrac;
+				HeightFrac = GhostHeadHeightFrac;
+				WidthFrac = GhostHeadWidthFrac;
+				BaseGlow = GhostHeadGlow;
+			}
+
+			const bool bIsHead = (Part == PartHead);
+			const FVector& MeshHalfSize = bIsHead ? SphereHalfSize : CylinderHalfSize;
+			const FVector& MeshPivot = bIsHead ? SpherePivotOffset : CylinderPivotOffset;
+
+			const FVector DesiredSize(
+				Depth * WidthFrac,
+				Width * WidthFrac,
+				Height * HeightFrac);
+
+			const FVector Scale(
+				DesiredSize.X / (2.0 * MeshHalfSize.X),
+				DesiredSize.Y / (2.0 * MeshHalfSize.Y),
+				DesiredSize.Z / (2.0 * MeshHalfSize.Z));
+
+			// Measured from the BOTTOM of the lethal volume, so the three parts tile it exactly.
+			const FVector PartCentre = Centre + FVector(0.0, 0.0, -HalfHeight + Height * CentreFrac);
+
+			// Corrects for a source mesh whose pivot is not at its bounds centre, so we never have
+			// to assume anything about the engine primitives' authoring.
+			const FVector PivotCorrection = Facing.RotateVector(MeshPivot * Scale);
+
+			Piece->SetWorldLocationAndRotation(PartCentre - PivotCorrection, Facing);
+			Piece->SetWorldScale3D(Scale);
+			Piece->SetVisibility(true);
+
+			// Guarded: SetOwnerNoSee dirties the render state, and this runs as the trace grows.
+			if (Piece->bOwnerNoSee != bHideFromOwner)
+			{
+				Piece->SetOwnerNoSee(bHideFromOwner);
+			}
+
+			// The intended brightness of this piece, BEFORE the camera-proximity fade. Recorded rather
+			// than pushed directly, because ApplyProximityGlowFade() runs every frame and needs to
+			// know what full brightness means for this piece without re-deriving the whole rebuild.
+			const int32 SlotIndex = PlacedGhosts * PartsPerGhost + Part;
+			if (GhostBaseGlow.Num() <= SlotIndex)
+			{
+				GhostBaseGlow.SetNumZeroed(SlotIndex + 1);
+				GhostAppliedGlowScale.SetNumZeroed(SlotIndex + 1);
+			}
+			GhostBaseGlow[SlotIndex] = BaseGlow * FadeScale * InvulnerableScale;
+
+			if (bTrailMaterialIsNeon)
+			{
+				if (UMaterialInstanceDynamic* Material = GhostMaterials[SlotIndex])
+				{
+					// Push full brightness and let the proximity pass pull it down. Resetting the
+					// remembered scale forces that pass to re-evaluate this piece, which it must:
+					// the piece has just been moved somewhere else entirely.
+					Material->SetScalarParameterValue(TEXT("Glow"), GhostBaseGlow[SlotIndex]);
+					GhostAppliedGlowScale[SlotIndex] = 1.f;
+				}
+			}
+		}
+
+		++PlacedGhosts;
 	}
 
-	HideSegmentsFrom(PlacedCount);
+	HideGhostsFrom(PlacedGhosts);
 }
 
-UStaticMeshComponent* UTraceTrailComponent::GetOrCreateSegment(int32 Index)
+void UTraceTrailComponent::ApplyProximityGlowFade()
 {
-	if (SegmentPool.IsValidIndex(Index))
+	// ------------------------------------------------------------------------------------------
+	// WHY THIS EXISTS
+	//
+	// This project has a measured, named defect: point-blank whiteout from unlit emissive surfaces.
+	// The arena's version of it was fixed by STANDOFF — geometry gained a pawn-blocking shell so an
+	// eye can never get close enough (see ATraceArenaBuilder::AddPawnStandoff). That fix is not
+	// available here and must not be: walking through a trace has to stay free, because only a DASH
+	// may trip it (spec §3). So a player can and will stand with their eye INSIDE an after-image.
+	//
+	// M_TraceNeon is unlit: it emits Color * Glow with no distance term whatsoever, so a head piece
+	// at Glow 4.2 arrives at the lens at full intensity and fills the frame. A full-field walk
+	// measured two frames out of 108 blown past 40% (52.7% and 43.0%), and BOTH were a player
+	// standing inside somebody else's trace — after the arena fix, the only remaining source.
+	//
+	// So bound the SOLID ANGLE instead of the standoff: attenuate a piece's emissive by how close
+	// the local camera is to it. Far away nothing changes at all, which is the whole point — the
+	// trace's readability across the arena is a measured win and is untouched.
+	//
+	// STRICTLY LOCAL AND STRICTLY COSMETIC. It reads this machine's camera, writes only this
+	// machine's material instances, and the lethal volume is TrailPoints — which this function does
+	// not touch and the trip test never renders. Two players standing in the same trace see their
+	// own fade and die to exactly the same geometry.
+	// ------------------------------------------------------------------------------------------
+	if (!bTrailMaterialIsNeon || GhostMeshes.Num() == 0)
 	{
-		return SegmentPool[Index];
+		return;
 	}
 
-	// The pool only ever grows one slot at a time, in order.
-	if (Index != SegmentPool.Num() || Index >= MaxPooledSegments)
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
 	{
-		return nullptr;
+		return;
 	}
+
+	// The local viewpoint. On a listen host with nine bots there is exactly one, and a dedicated
+	// server never reaches here.
+	const APlayerController* LocalPC = GEngine != nullptr ? GEngine->GetFirstLocalPlayerController(World) : nullptr;
+	if (LocalPC == nullptr || LocalPC->PlayerCameraManager == nullptr)
+	{
+		return;
+	}
+	const FVector CameraLocation = LocalPC->PlayerCameraManager->GetCameraLocation();
+
+	const int32 SlotCount = FMath::Min(GhostMeshes.Num(), GhostMaterials.Num());
+	for (int32 Slot = 0; Slot < SlotCount; ++Slot)
+	{
+		UStaticMeshComponent* Piece = GhostMeshes[Slot];
+		UMaterialInstanceDynamic* Material = GhostMaterials[Slot];
+		if (Piece == nullptr || Material == nullptr || !Piece->IsVisible())
+		{
+			continue;
+		}
+		if (!GhostBaseGlow.IsValidIndex(Slot))
+		{
+			continue;
+		}
+
+		// Distance to the piece's SURFACE, not its centre: these are wide, flat slabs, and a centre
+		// distance would report a torso as far away at the exact moment its face is against the lens.
+		// The bounds are already computed for culling, so this costs nothing extra.
+		const FBoxSphereBounds& Bounds = Piece->Bounds;
+		const double SurfaceDistance = FMath::Max(0.0,
+			FVector::Dist(CameraLocation, Bounds.Origin) - Bounds.SphereRadius);
+
+		float Scale = 1.f;
+		if (SurfaceDistance < ProximityFadeFarDistance)
+		{
+			// Smooth, so a piece does not pop as the player walks past it. The floor is not zero:
+			// an after-image you are standing inside is exactly as lethal as one across the field,
+			// and a player must still be able to see that they are in it.
+			const float T = FMath::Clamp(
+				static_cast<float>((SurfaceDistance - ProximityFadeNearDistance)
+					/ FMath::Max(1.0, ProximityFadeFarDistance - ProximityFadeNearDistance)),
+				0.f, 1.f);
+			Scale = FMath::Lerp(ProximityFadeMinScale, 1.f, FMath::InterpEaseIn(0.f, 1.f, T, 2.f));
+		}
+
+		// Only touch the material when the change is visible. Without this every pooled piece would
+		// dirty its render state every frame for the entire life of the trace.
+		if (!GhostAppliedGlowScale.IsValidIndex(Slot))
+		{
+			GhostAppliedGlowScale.SetNumZeroed(Slot + 1);
+		}
+		if (FMath::IsNearlyEqual(GhostAppliedGlowScale[Slot], Scale, 0.02f))
+		{
+			continue;
+		}
+
+		GhostAppliedGlowScale[Slot] = Scale;
+		Material->SetScalarParameterValue(TEXT("Glow"), GhostBaseGlow[Slot] * Scale);
+	}
+}
+
+bool UTraceTrailComponent::EnsureGhost(int32 GhostIndex)
+{
+	if (GhostIndex < 0 || GhostIndex >= MaxPooledGhosts)
+	{
+		return false;
+	}
+
+	const int32 RequiredNum = (GhostIndex + 1) * PartsPerGhost;
+	if (GhostMeshes.Num() >= RequiredNum)
+	{
+		return true;
+	}
+
+	// The pool only ever grows one whole after-image at a time, in order, so the interleaving
+	// (legs / torso / head) can never slip.
+	if (GhostMeshes.Num() != GhostIndex * PartsPerGhost)
+	{
+		return false;
+	}
+
+	for (int32 Part = 0; Part < PartsPerGhost; ++Part)
+	{
+		UStaticMesh* SourceMesh = (Part == PartHead) ? SphereMesh.Get() : CylinderMesh.Get();
+		if (SourceMesh == nullptr)
+		{
+			SourceMesh = CylinderMesh.Get();   // A missing sphere just means a blockier head.
+		}
+
+		UMaterialInstanceDynamic* Material = nullptr;
+		UStaticMeshComponent* Piece = CreatePooledMesh(SourceMesh, Material);
+
+		// A null entry is skipped harmlessly in RebuildVisuals, whereas a SHORT array would
+		// silently pair one after-image's head with the next one's legs.
+		GhostMeshes.Add(Piece);
+		GhostMaterials.Add(Material);
+	}
+
+	return true;
+}
+
+UStaticMeshComponent* UTraceTrailComponent::CreatePooledMesh(UStaticMesh* SourceMesh, UMaterialInstanceDynamic*& OutMaterial)
+{
+	OutMaterial = nullptr;
 
 	AActor* Owner = GetOwner();
-	if (Owner == nullptr || CylinderMesh == nullptr)
+	if (Owner == nullptr || SourceMesh == nullptr)
 	{
 		return nullptr;
 	}
 
-	UStaticMeshComponent* Segment = NewObject<UStaticMeshComponent>(Owner, NAME_None, RF_Transient);
-	if (Segment == nullptr)
+	UStaticMeshComponent* Mesh = NewObject<UStaticMeshComponent>(Owner, NAME_None, RF_Transient);
+	if (Mesh == nullptr)
 	{
 		return nullptr;
 	}
 
 	// Mobility must be set before registration.
-	Segment->SetMobility(EComponentMobility::Movable);
-	Segment->SetStaticMesh(CylinderMesh);
-	Segment->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	Segment->SetCollisionProfileName(TEXT("NoCollision"));
-	Segment->SetGenerateOverlapEvents(false);
-	Segment->SetCanEverAffectNavigation(false);
-	Segment->SetCastShadow(false);
-	Segment->bReceivesDecals = false;
-	Segment->SetIsReplicated(false);   // Purely local cosmetics, rebuilt from TrailPoints.
-	Segment->SetVisibility(false);
+	Mesh->SetMobility(EComponentMobility::Movable);
+	Mesh->SetStaticMesh(SourceMesh);
+	Mesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Mesh->SetCollisionProfileName(TEXT("NoCollision"));
+	Mesh->SetGenerateOverlapEvents(false);
+	Mesh->SetCanEverAffectNavigation(false);
+	Mesh->SetCastShadow(false);
+	Mesh->bReceivesDecals = false;
+	Mesh->SetIsReplicated(false);   // Purely local cosmetics, rebuilt from TrailPoints.
+	Mesh->SetVisibility(false);
 
-	Segment->RegisterComponent();
-	Segment->AttachToComponent(this, FAttachmentTransformRules::KeepRelativeTransform);
+	Mesh->RegisterComponent();
+	Mesh->AttachToComponent(this, FAttachmentTransformRules::KeepRelativeTransform);
 
-	// Critical: the trail is laid in WORLD space and must not follow the carrier around. Absolute
+	// Critical: the trace is laid in WORLD space and must not follow the holder around. Absolute
 	// transforms keep the components in the actor's hierarchy (so they are cleaned up with it)
 	// while making them ignore the parent transform entirely.
-	Segment->SetAbsolute(true, true, true);
+	Mesh->SetAbsolute(true, true, true);
 
-	UMaterialInstanceDynamic* SegmentMaterial = nullptr;
 	if (TrailMaterial != nullptr)
 	{
-		SegmentMaterial = Segment->CreateDynamicMaterialInstance(0, TrailMaterial);
+		OutMaterial = Mesh->CreateDynamicMaterialInstance(0, TrailMaterial);
 	}
 
-	SegmentPool.Add(Segment);
-	SegmentMaterials.Add(SegmentMaterial);
-
-	// Newly created components need the colour that the pool already agreed on.
-	if (SegmentMaterial != nullptr && bColorApplied)
+	if (OutMaterial != nullptr)
 	{
-		SegmentMaterial->SetVectorParameterValue(TEXT("Color"), AppliedColor);
-		SegmentMaterial->SetVectorParameterValue(TEXT("BaseColor"), AppliedColor);
+		if (!bTrailMaterialIsNeon)
+		{
+			// BasicShapeMaterial fallback: lit, no Glow, so the best available approximation is a
+			// bright matte albedo. It will not bloom and it will not read as light — that is the
+			// cost of not having run Scripts/generate_content.py.
+			OutMaterial->SetScalarParameterValue(TEXT("Roughness"), 0.9f);
+		}
+
+		// Newly created components need the colour that the pool already agreed on.
+		if (bColorApplied)
+		{
+			OutMaterial->SetVectorParameterValue(TEXT("Color"), AppliedColor);
+			OutMaterial->SetVectorParameterValue(TEXT("BaseColor"), AppliedColor);
+		}
 	}
 
-	return Segment;
+	return Mesh;
 }
 
-void UTraceTrailComponent::HideSegmentsFrom(int32 FirstIndex)
+void UTraceTrailComponent::HideGhostsFrom(int32 FirstGhostIndex)
 {
-	for (int32 Index = FMath::Max(0, FirstIndex); Index < SegmentPool.Num(); ++Index)
+	for (int32 Index = FMath::Max(0, FirstGhostIndex) * PartsPerGhost; Index < GhostMeshes.Num(); ++Index)
 	{
-		if (UStaticMeshComponent* Segment = SegmentPool[Index])
+		if (UStaticMeshComponent* Piece = GhostMeshes[Index])
 		{
-			Segment->SetVisibility(false);
+			Piece->SetVisibility(false);
 		}
 	}
 }
@@ -902,14 +1387,18 @@ void UTraceTrailComponent::UpdateTeamColor()
 	AppliedColor = Desired;
 	bColorApplied = true;
 
-	for (UMaterialInstanceDynamic* SegmentMaterial : SegmentMaterials)
+	// "Color" is the real vector parameter on both M_TraceNeon and BasicShapeMaterial; "BaseColor" is
+	// a defensive second guess and is a silent no-op if the parameter does not exist.
+	//
+	// The head keeps the team colour rather than going white. A white element would read as "generic
+	// hazard"; the whole point is that a glance tells you WHOSE trace it is, and therefore whether
+	// dashing through it kills their holder or does nothing at all.
+	for (UMaterialInstanceDynamic* Material : GhostMaterials)
 	{
-		if (SegmentMaterial != nullptr)
+		if (Material != nullptr)
 		{
-			// "Color" is BasicShapeMaterial's real vector parameter; "BaseColor" is a defensive
-			// second guess and is a silent no-op if the parameter does not exist.
-			SegmentMaterial->SetVectorParameterValue(TEXT("Color"), AppliedColor);
-			SegmentMaterial->SetVectorParameterValue(TEXT("BaseColor"), AppliedColor);
+			Material->SetVectorParameterValue(TEXT("Color"), AppliedColor);
+			Material->SetVectorParameterValue(TEXT("BaseColor"), AppliedColor);
 		}
 	}
 }
@@ -924,30 +1413,40 @@ void UTraceTrailComponent::CacheMeshMetrics()
 	if (CylinderMesh != nullptr)
 	{
 		const FBoxSphereBounds Bounds = CylinderMesh->GetBounds();
-		MeshHalfSize = Bounds.BoxExtent;
-		MeshPivotOffset = Bounds.Origin;
+		CylinderHalfSize = Bounds.BoxExtent;
+		CylinderPivotOffset = Bounds.Origin;
 	}
 
-	// Never divide by zero, whatever the asset turns out to be.
-	MeshHalfSize.X = FMath::Max(MeshHalfSize.X, 1.0);
-	MeshHalfSize.Y = FMath::Max(MeshHalfSize.Y, 1.0);
-	MeshHalfSize.Z = FMath::Max(MeshHalfSize.Z, 1.0);
+	if (SphereMesh != nullptr)
+	{
+		const FBoxSphereBounds Bounds = SphereMesh->GetBounds();
+		SphereHalfSize = Bounds.BoxExtent;
+		SpherePivotOffset = Bounds.Origin;
+	}
+
+	// Never divide by zero, whatever the assets turn out to be.
+	CylinderHalfSize.X = FMath::Max(CylinderHalfSize.X, 1.0);
+	CylinderHalfSize.Y = FMath::Max(CylinderHalfSize.Y, 1.0);
+	CylinderHalfSize.Z = FMath::Max(CylinderHalfSize.Z, 1.0);
+	SphereHalfSize.X = FMath::Max(SphereHalfSize.X, 1.0);
+	SphereHalfSize.Y = FMath::Max(SphereHalfSize.Y, 1.0);
+	SphereHalfSize.Z = FMath::Max(SphereHalfSize.Z, 1.0);
 
 	bMeshMetricsCached = true;
 }
 
 void UTraceTrailComponent::DestroyVisualPool()
 {
-	for (UStaticMeshComponent* Segment : SegmentPool)
+	for (UStaticMeshComponent* Piece : GhostMeshes)
 	{
-		if (Segment != nullptr)
+		if (Piece != nullptr)
 		{
-			Segment->DestroyComponent();
+			Piece->DestroyComponent();
 		}
 	}
 
-	SegmentPool.Reset();
-	SegmentMaterials.Reset();
+	GhostMeshes.Reset();
+	GhostMaterials.Reset();
 
 	LastVisualPointCount = -1;
 	bColorApplied = false;

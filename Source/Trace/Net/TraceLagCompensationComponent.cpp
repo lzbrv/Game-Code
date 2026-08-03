@@ -15,6 +15,8 @@
 
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
+#include "Gameplay/TraceCore.h"                // IsShieldSuppressedFor (the pass risk beat)
+#include "Gameplay/TraceHitZones.h"
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"
@@ -103,6 +105,13 @@ void UTraceLagCompensationComponent::RecordFrame(float ServerTime)
 	Frame.CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
 	Frame.CapsuleRadius = Capsule->GetScaledCapsuleRadius();
 
+	// Posture rewinds with the pose, so a shot fired at a sliding player is classified against the
+	// crouched zone layout the shooter actually saw, not against where that player is standing now.
+	if (const ATraceCharacter* TraceCharacter = Cast<ATraceCharacter>(OwnerActor))
+	{
+		Frame.PostureScale = TraceCharacter->GetHitZonePostureScale();
+	}
+
 	TrimHistory(ServerTime);
 }
 
@@ -171,6 +180,7 @@ bool UTraceLagCompensationComponent::GetPoseAtTime(float ServerTime, FTraceLagCo
 			Out.CapsuleCenter = FMath::Lerp(A.CapsuleCenter, B.CapsuleCenter, Alpha);
 			Out.CapsuleHalfHeight = FMath::Lerp(A.CapsuleHalfHeight, B.CapsuleHalfHeight, Alpha);
 			Out.CapsuleRadius = FMath::Lerp(A.CapsuleRadius, B.CapsuleRadius, Alpha);
+			Out.PostureScale = FMath::Lerp(A.PostureScale, B.PostureScale, Alpha);
 			return true;
 		}
 	}
@@ -188,9 +198,9 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	float Range,
 	float RewindToServerTime,
 	FVector& OutImpactPoint,
-	bool& bOutHeadshot)
+	ETraceHitZone& OutZone)
 {
-	bOutHeadshot = false;
+	OutZone = ETraceHitZone::None;
 	OutImpactPoint = Origin;
 
 	if (World == nullptr)
@@ -270,7 +280,12 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	}
 
 	// ---------------------------------------------------------------------------------------
-	// 3. Analytic segment-vs-capsule against each candidate's rewound pose. Nearest hit wins.
+	// 3. Analytic segment-vs-body against each candidate's rewound pose. Nearest hit wins.
+	//
+	//    The body is the three-zone model in Gameplay/TraceHitZones.h, reconstructed from the
+	//    rewound capsule. Hit *detection* is still the segment-vs-capsule test that shipped, so
+	//    exactly the same shots connect as before positional damage existed; the zone only decides
+	//    what a connecting shot is worth.
 	// ---------------------------------------------------------------------------------------
 	const FVector RayEnd = Origin + Dir * MaxDistance;
 	const ETraceTeam ShooterTeam = (Shooter != nullptr) ? Shooter->GetTeam() : ETraceTeam::None;
@@ -278,7 +293,7 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	ATraceCharacter* BestTarget = nullptr;
 	double BestDistanceAlongRay = TNumericLimits<double>::Max();
 	FVector BestImpact = OutImpactPoint;
-	bool bBestHeadshot = false;
+	ETraceHitZone BestZone = ETraceHitZone::None;
 
 	for (ATraceCharacter* Target : Candidates)
 	{
@@ -290,9 +305,19 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 		{
 			continue;
 		}
-		if (Target->IsCarrier())
+		if (Target->IsCarrier() && !ATraceCore::IsShieldSuppressedFor(Target))
 		{
 			// The Core carrier is invulnerable to bullets by design - do not even resolve them.
+			//
+			// INTEGRATION FIX (spec section 4, THE RISK BEAT). This used to be an unconditional
+			// `if (Target->IsCarrier()) continue;`, which silently cancelled the entire pass
+			// mechanic: UTraceHealthComponent::IsInvulnerable() correctly reports the carrier as
+			// damageable while a pass is held, but a shot never reached ApplyDamage() because the
+			// carrier was skipped as a hitscan CANDIDATE one step earlier. The passer risked
+			// nothing, and the bots' PunishPasser state was firing into a target that could not be
+			// hit. The condition is deliberately the SAME expression the health component reads, so
+			// "can this be shot" has exactly one definition in the build and cancel restores both
+			// halves of the beat in one statement.
 			continue;
 		}
 		if (!Settings.bFriendlyFire && Shooter != nullptr && ShooterTeam != ETraceTeam::None && Target->GetTeam() == ShooterTeam)
@@ -323,15 +348,14 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 			Frame.CapsuleCenter = Capsule->GetComponentLocation();
 			Frame.CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
 			Frame.CapsuleRadius = Capsule->GetScaledCapsuleRadius();
+			// Live posture too, so the client's predicted trace (which always lands here, because a
+			// client has no lag-comp history) lays its zones out exactly as the server's rewind does.
+			Frame.PostureScale = Target->GetHitZonePostureScale();
 		}
 
-		const double CapsuleRadius = FMath::Max(1.0, static_cast<double>(Frame.CapsuleRadius));
-		const double HalfSegment = FMath::Max(0.0, static_cast<double>(Frame.CapsuleHalfHeight) - CapsuleRadius);
-
-		// Character capsules are always upright, so the capsule's core segment is a vertical line
-		// through its centre, inset by the radius at each end.
-		const FVector CapsuleBottom = Frame.CapsuleCenter - FVector(0.0, 0.0, HalfSegment);
-		const FVector CapsuleTop = Frame.CapsuleCenter + FVector(0.0, 0.0, HalfSegment);
+		// Zones are derived from the rewound capsule, so they rewind with it for free - including
+		// the crouched/sliding half height, which is the whole reason the model is proportional.
+		const FTraceHitZoneModel ZoneModel = FTraceHitZoneModel::FromFrame(Frame);
 
 #if ENABLE_DRAW_DEBUG
 		if (Settings.bDrawServerRewindDebug)
@@ -347,26 +371,27 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 					LiveCapsule->GetScaledCapsuleRadius(), FQuat::Identity, FColor(60, 60, 60),
 					/*bPersistentLines=*/false, /*LifeTime=*/1.5f, /*DepthPriority=*/0, /*Thickness=*/0.5f);
 			}
+
+			// The head sphere the one-shot kill is actually tested against, so "why was that not a
+			// headshot" is answerable by looking rather than by reading code.
+			DrawDebugSphere(World, ZoneModel.HeadCenter, static_cast<float>(ZoneModel.HeadRadius), 12, FColor::Yellow,
+				/*bPersistentLines=*/false, /*LifeTime=*/1.5f, /*DepthPriority=*/0, /*Thickness=*/1.f);
+
+			// The hip line dividing body from legs.
+			const FVector HipCentre(ZoneModel.CapsuleCenter.X, ZoneModel.CapsuleCenter.Y, ZoneModel.HipZ);
+			DrawDebugCircle(World, HipCentre, static_cast<float>(ZoneModel.Radius), 16, FColor::Green,
+				/*bPersistentLines=*/false, /*LifeTime=*/1.5f, /*DepthPriority=*/0, /*Thickness=*/1.f,
+				FVector(1, 0, 0), FVector(0, 1, 0), /*bDrawAxis=*/false);
 		}
 #endif
 
-		// Closest approach between the (bounded) shot segment and the capsule's core segment.
-		FVector ClosestOnRay = FVector::ZeroVector;
-		FVector ClosestOnCapsule = FVector::ZeroVector;
-		FMath::SegmentDistToSegmentSafe(Origin, RayEnd, CapsuleBottom, CapsuleTop, ClosestOnRay, ClosestOnCapsule);
-
-		const double SeparationSq = FVector::DistSquared(ClosestOnRay, ClosestOnCapsule);
-		if (SeparationSq > CapsuleRadius * CapsuleRadius)
+		double AlongEntry = 0.0;
+		FVector ZoneImpact = FVector::ZeroVector;
+		ETraceHitZone ZoneHit = ETraceHitZone::None;
+		if (!ZoneModel.ResolveSegment(Origin, RayEnd, AlongEntry, ZoneImpact, ZoneHit))
 		{
 			continue;
 		}
-
-		// Step back from the closest-approach point to the point where the ray actually enters the
-		// capsule surface, so overlapping targets order correctly and the impact marker sits on the
-		// near side of the body rather than in the middle of it.
-		const double BackOff = FMath::Sqrt(FMath::Max(0.0, CapsuleRadius * CapsuleRadius - SeparationSq));
-		const double AlongClosest = FVector::DotProduct(ClosestOnRay - Origin, Dir);
-		const double AlongEntry = FMath::Clamp(AlongClosest - BackOff, 0.0, MaxDistance);
 
 		if (AlongEntry >= BestDistanceAlongRay)
 		{
@@ -375,8 +400,8 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 
 		BestDistanceAlongRay = AlongEntry;
 		BestTarget = Target;
-		BestImpact = Origin + Dir * AlongEntry;
-		bBestHeadshot = BestImpact.Z > (Frame.CapsuleCenter.Z + Frame.CapsuleHalfHeight * HeadshotHeightFraction);
+		BestImpact = ZoneImpact;
+		BestZone = ZoneHit;
 	}
 
 	// NOTE: the ray is bounded by static geometry, but a capsule straddling a thin wall can still be
@@ -386,7 +411,7 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	if (BestTarget != nullptr)
 	{
 		OutImpactPoint = BestImpact;
-		bOutHeadshot = bBestHeadshot;
+		OutZone = BestZone;
 	}
 
 #if ENABLE_DRAW_DEBUG
@@ -401,8 +426,9 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 
 	if (BestTarget != nullptr)
 	{
-		UE_LOG(LogTraceGame, Verbose, TEXT("ResolveHitscan: %s hit %s at t=%.3f (%.0fuu, headshot=%d)"),
-			*GetNameSafe(Shooter), *GetNameSafe(BestTarget), RewindToServerTime, BestDistanceAlongRay, bBestHeadshot ? 1 : 0);
+		UE_LOG(LogTraceGame, Verbose, TEXT("ResolveHitscan: %s hit %s at t=%.3f (%.0fuu, zone=%s)"),
+			*GetNameSafe(Shooter), *GetNameSafe(BestTarget), RewindToServerTime, BestDistanceAlongRay,
+			TraceHitZoneToString(BestZone));
 	}
 
 	return BestTarget;

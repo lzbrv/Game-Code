@@ -23,7 +23,12 @@ public class Trace : ModuleRules
 			"InputCore",          // FKey / EKeys used when building the mapping context in C++
 			"EnhancedInput",      // UInputAction, UInputMappingContext, UEnhancedInputComponent
 			"DeveloperSettings",  // UDeveloperSettings base for UTraceSettings
-			"NetCore"             // FFastArraySerializer (Net/Serialization/FastArraySerializer.h)
+			"NetCore",            // FFastArraySerializer (Net/Serialization/FastArraySerializer.h)
+			"AIModule"            // AAIController base for ATraceBotController
+			// AIModule is an engine RUNTIME module, not a plugin, so this adds no plugin dependency
+			// and no asset dependency. Nothing here uses BehaviorTree, Blackboard or the navigation
+			// system: those would need .uassets (contract 2) or a runtime-built navmesh. The bots
+			// steer directly with AddMovementInput against ATraceArenaBuilder::GetFieldBounds().
 			// Deliberately NOT listed: Slate / SlateCore / PhysicsCore. Nothing in this module
 			// includes a header from any of them - the HUD is pure AHUD::DrawText/DrawRect, UFont
 			// comes from Engine/Font.h and the collision channels from Engine/EngineTypes.h, all of

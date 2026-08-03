@@ -6,22 +6,50 @@
 #include "Core/TracePlayerState.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
+#include "EnhancedPlayerInput.h"           // the concrete UPlayerInput Enhanced Input requires
+#include "Engine/Engine.h"                 // GEngine->GameViewport, for the capture-mode diagnostic
+#include "Engine/GameViewportClient.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"       // ACharacter::Jump / StopJumping on ATraceCharacter
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerInput.h"    // APlayerController::PlayerInput, for the setup diagnostic
+#include "HAL/IConsoleManager.h"           // Trace.LogInput
 #include "InputAction.h"
 #include "InputActionValue.h"
 #include "InputCoreTypes.h"                // EKeys
 #include "InputMappingContext.h"
 #include "InputModifiers.h"
 #include "InputTriggers.h"                 // ETriggerEvent
+#include "Movement/TraceCharacterMovementComponent.h"   // dash/boost state for the HUD accessors
+#include "Settings/TraceGameplayCompat.h"  // compile-time detection of not-yet-landed gameplay APIs
+#include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
 #include "Trace.h"                         // LogTraceGame
+#include "TraceSettings.h"                 // gameplay tuning (dash cooldown, and so on)
+
+/**
+ * Per-event Display logging for the input path. Off by default — on at 60 Hz the Move handler alone
+ * would write a line a frame — but every automated verification run turns it on, and it is the only
+ * way to see from a log that a key actually reached a bound delegate.
+ *
+ *     Trace.LogInput 1        (console, -ExecCmds, or the harness in Source/Trace/Debug)
+ */
+static TAutoConsoleVariable<int32> CVarTraceLogInput(
+	TEXT("Trace.LogInput"),
+	0,
+	TEXT("Log every Enhanced Input event that reaches ATracePlayerController, at Display level.\n")
+	TEXT("0: off (default)  1: buttons only  2: buttons + per-frame Move/Look axes"),
+	ECVF_Default);
 
 namespace
 {
+	/** 1 = buttons, 2 = buttons and axes. */
+	FORCEINLINE int32 InputLogLevel()
+	{
+		return CVarTraceLogInput.GetValueOnGameThread();
+	}
+
 	/**
 	 * A 1D key (W/S/A/D, MouseX, MouseY) always delivers its value on the X component. Swizzling
 	 * with YXZ moves it onto Y, which is how a single key becomes the "forward" axis of an
@@ -35,17 +63,23 @@ namespace
 	}
 
 	/**
-	 * NOTE (unverified API detail): UInputModifierNegate exposes per-axis bX/bY/bZ flags, but we
-	 * cannot verify their exact names or defaults without compiling. So we rely only on the
-	 * documented default behaviour — negate every component — which is exactly right here because
-	 * every mapping we attach this to carries a single non-zero component (each key is 1D, and the
-	 * swizzle happens first). If you ever need to invert one axis of a genuinely 2D key such as
-	 * EKeys::Mouse2D, split it into two 1D mappings the way the Look binding below does rather
-	 * than reaching for the per-axis flags.
+	 * UInputModifierNegate does expose per-axis bX/bY/bZ flags (all defaulting to true), but we never
+	 * need them: every mapping this is attached to carries a single non-zero component, because each
+	 * key is 1D and any swizzle has already run. If you ever need to invert one axis of a genuinely
+	 * 2D key such as EKeys::Mouse2D, split it into two 1D mappings the way the Look binding below
+	 * does — that stays readable, whereas the flags do not.
 	 */
 	UInputModifierNegate* MakeNegate(UObject* Outer)
 	{
 		return NewObject<UInputModifierNegate>(Outer);
+	}
+
+	/** Uniform XY multiplier. Used to give mouse-look a sensitivity that is actually configurable. */
+	UInputModifierScalar* MakeScalar(UObject* Outer, float Scale)
+	{
+		UInputModifierScalar* Scalar = NewObject<UInputModifierScalar>(Outer);
+		Scalar->Scalar = FVector(Scale, Scale, 1.f);
+		return Scalar;
 	}
 }
 
@@ -67,13 +101,17 @@ void ATracePlayerController::BeginPlay()
 
 	if (IsLocalController())
 	{
-		// Mouse-look shooter: the viewport swallows the cursor and nothing else wants input.
-		SetInputMode(FInputModeGameOnly());
-		bShowMouseCursor = false;
+		ApplyGameInputMode();
 
 		// SetupInputComponent has normally already run, but possession/init order differs between
 		// standalone, listen server and client, so make sure the context really is live.
 		AddInputMappings();
+
+		// The options screen is reachable from an in-game pause menu, so a sensitivity change has to
+		// land on the very next mouse event. Weak-lambda: the delegate lives in a static and outlives
+		// every controller that ever subscribes to it.
+		SettingsChangedHandle = UTraceUserSettings::OnChanged().AddWeakLambda(this,
+			[this]() { ApplyControlSettings(); });
 	}
 }
 
@@ -83,7 +121,51 @@ void ATracePlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	// registered would keep a dead controller's actions in the mapping stack across travel.
 	RemoveInputMappings();
 
+	// AddWeakLambda already makes the callback safe after destruction, but the delegate itself is a
+	// process-lifetime static: without this, every controller ever created leaves an entry behind and
+	// the list grows for the life of the session.
+	if (SettingsChangedHandle.IsValid())
+	{
+		UTraceUserSettings::OnChanged().Remove(SettingsChangedHandle);
+		SettingsChangedHandle.Reset();
+	}
+
 	Super::EndPlay(EndPlayReason);
+}
+
+void ATracePlayerController::ApplyGameInputMode()
+{
+	if (!IsLocalController())
+	{
+		return;
+	}
+
+	// Mouse-look shooter: the viewport swallows the cursor and nothing else wants input.
+	//
+	// SetConsumeCaptureMouseDown(false) is load-bearing. FInputModeGameOnly defaults it to true,
+	// and FInputModeGameOnly::ApplyInputMode then downgrades the viewport from
+	// CapturePermanently_IncludingInitialMouseDown to plain CapturePermanently — silently undoing
+	// DefaultViewportMouseCaptureMode in Config/DefaultInput.ini one frame after BeginPlay
+	// (measured: "Viewport MouseCaptureMode Changed, CapturePermanently_IncludingInitialMouseDown ->
+	// CapturePermanently"). The consequence is that the click which RE-captures the viewport is
+	// eaten and never reaches Enhanced Input. On macOS in a window, capture is lost on every
+	// Cmd-Tab or click-away, so a large share of shots silently do nothing.
+	FInputModeGameOnly InputMode;
+	InputMode.SetConsumeCaptureMouseDown(false);
+	SetInputMode(InputMode);
+
+	bShowMouseCursor = false;
+
+	// Swallow look input briefly. When the viewport takes the mouse it warps the OS cursor to the
+	// centre of the window, and the delta between the cursor's old position and that warp arrives as
+	// a single enormous mouse move. Measured on this build at spawn: one frame carrying +83.8 deg of
+	// yaw and +17.9 deg of pitch at LookSensitivity 1.0 — reproducible to eight decimal places
+	// across separate processes, and multiplied to +209.5 / +44.6 at the shipped sensitivity of 2.5.
+	// The player spawns facing down the field and is instantly spun around and pointed at the sky.
+	if (const UWorld* World = GetWorld())
+	{
+		IgnoreLookUntilTime = World->GetTimeSeconds() + LookSuppressAfterCapture;
+	}
 }
 
 // -------------------------------------------------------------------------------------------
@@ -92,88 +174,160 @@ void ATracePlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void ATracePlayerController::BuildInputData()
 {
-	if (InputMapping != nullptr)
+	if (InputMapping == nullptr)
 	{
+		// Everything below is outered to `this` (or to the mapping context) AND referenced by a
+		// UPROPERTY, so the whole object graph survives GC for as long as the controller does.
+		InputMapping = NewObject<UInputMappingContext>(this, TEXT("IMC_Trace"));
+
+		auto MakeAction = [this](const TCHAR* Name, EInputActionValueType ValueType) -> UInputAction*
+		{
+			UInputAction* Action = NewObject<UInputAction>(this, Name);
+			// Must be set before anything binds to the action: a mismatched ValueType silently yields
+			// zeroes in the handler instead of failing loudly.
+			Action->ValueType = ValueType;
+			return Action;
+		};
+
+		IA_Move       = MakeAction(TEXT("IA_Move"),       EInputActionValueType::Axis2D);
+		IA_Look       = MakeAction(TEXT("IA_Look"),       EInputActionValueType::Axis2D);
+		IA_Jump       = MakeAction(TEXT("IA_Jump"),       EInputActionValueType::Boolean);
+		IA_Fire       = MakeAction(TEXT("IA_Fire"),       EInputActionValueType::Boolean);
+		IA_Pass       = MakeAction(TEXT("IA_Pass"),       EInputActionValueType::Boolean);
+		IA_Dash       = MakeAction(TEXT("IA_Dash"),       EInputActionValueType::Boolean);
+		IA_Scoreboard = MakeAction(TEXT("IA_Scoreboard"), EInputActionValueType::Boolean);
+		IA_Crouch     = MakeAction(TEXT("IA_Crouch"),     EInputActionValueType::Boolean);
+		IA_Boost      = MakeAction(TEXT("IA_Boost"),      EInputActionValueType::Boolean);
+
+		// Cumulative accumulation is REQUIRED for opposing keys to cancel. UInputAction defaults to
+		// TakeHighestAbsoluteValue, and UEnhancedPlayerInput::ProcessActionMappingEvent merges with
+		// `if (Abs(Modified[C]) >= Abs(Merged[C])) Merged[C] = Modified[C];` — note the `>=`, so on a
+		// tie the LAST mapping added to the context wins. With the mapping order below that made W+S
+		// walk backwards and A+D strafe right, and counter-strafing impossible. The engine's own docs
+		// name WASD as the motivating case for Cumulative.
+		IA_Move->AccumulationBehavior = EInputActionAccumulationBehavior::Cumulative;
+	}
+
+	ApplyControlSettings();
+}
+
+void ATracePlayerController::ApplyControlSettings()
+{
+	if (InputMapping == nullptr)
+	{
+		// Called from the settings delegate before this controller ever built its input (a controller
+		// on a client that has not finished initialising). BuildInputData will call us back.
 		return;
 	}
 
-	// Everything below is outered to `this` (or to the mapping context) AND referenced by a
-	// UPROPERTY, so the whole object graph survives GC for as long as the controller does.
-	InputMapping = NewObject<UInputMappingContext>(this, TEXT("IMC_Trace"));
+	const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
 
-	auto MakeAction = [this](const TCHAR* Name, EInputActionValueType ValueType) -> UInputAction*
+	// Torn down and rebuilt wholesale rather than edited in place. Editing means finding the right
+	// FEnhancedActionKeyMapping by (action, old key) and mutating it, which is fiddly, and the
+	// modifier objects would have to be reused or leaked; a context with a dozen mappings costs
+	// nothing to rebuild and the result cannot be half-applied.
+	InputMapping->UnmapAll();
+
+	auto KeyFor = [&UserSettings](ETraceInputAction Action) { return UserSettings.GetKey(Action); };
+
+	/** Maps @p Key to @p Action, skipping the mapping entirely when the player has unbound it. */
+	auto MapButton = [this](UInputAction* Action, const FKey& Key)
 	{
-		UInputAction* Action = NewObject<UInputAction>(this, Name);
-		// Must be set before anything binds to the action: a mismatched ValueType silently yields
-		// zeroes in the handler instead of failing loudly.
-		Action->ValueType = ValueType;
-		return Action;
+		// No explicit triggers: an action with no trigger uses the implicit "down" trigger, which
+		// gives us Started on press, Triggered while held and Completed on release. That is exactly
+		// the shape the handlers below expect.
+		if (Action != nullptr && Key.IsValid())
+		{
+			InputMapping->MapKey(Action, Key);
+		}
 	};
 
-	IA_Move       = MakeAction(TEXT("IA_Move"),       EInputActionValueType::Axis2D);
-	IA_Look       = MakeAction(TEXT("IA_Look"),       EInputActionValueType::Axis2D);
-	IA_Jump       = MakeAction(TEXT("IA_Jump"),       EInputActionValueType::Boolean);
-	IA_Fire       = MakeAction(TEXT("IA_Fire"),       EInputActionValueType::Boolean);
-	IA_Pass       = MakeAction(TEXT("IA_Pass"),       EInputActionValueType::Boolean);
-	IA_Dash       = MakeAction(TEXT("IA_Dash"),       EInputActionValueType::Boolean);
-	IA_Scoreboard = MakeAction(TEXT("IA_Scoreboard"), EInputActionValueType::Boolean);
-
-	// --- Move: WASD -> (X = strafe, +right), (Y = forward, +forward) ---------------------------
-	//
-	// Opposing keys sum to zero because Enhanced Input combines every mapping of an action.
+	// --- Move: four 1D keys -> (X = strafe, +right), (Y = forward, +forward) --------------------
 	//
 	// MapKey returns a reference *into* the context's mapping array, so it is invalidated by the
 	// next MapKey call. Each binding therefore gets its own scope and uses the reference
 	// immediately — never cache one.
+	if (const FKey Key = KeyFor(ETraceInputAction::MoveForward); Key.IsValid())
 	{
-		// W: forward. 1D X -> Y.
-		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, EKeys::W);
+		// Forward. 1D X -> Y.
+		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
 		Mapping.Modifiers.Add(MakeSwizzleXToY(InputMapping));
 	}
+	if (const FKey Key = KeyFor(ETraceInputAction::MoveBack); Key.IsValid())
 	{
-		// S: backward. 1D X -> Y, then inverted.
-		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, EKeys::S);
+		// Backward. 1D X -> Y, then inverted.
+		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
 		Mapping.Modifiers.Add(MakeSwizzleXToY(InputMapping));
 		Mapping.Modifiers.Add(MakeNegate(InputMapping));
 	}
+	if (const FKey Key = KeyFor(ETraceInputAction::MoveLeft); Key.IsValid())
 	{
-		// A: strafe left — X, inverted.
-		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, EKeys::A);
+		// Strafe left — X, inverted.
+		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
 		Mapping.Modifiers.Add(MakeNegate(InputMapping));
 	}
+	if (const FKey Key = KeyFor(ETraceInputAction::MoveRight); Key.IsValid())
 	{
-		// D: strafe right — raw X, no modifiers at all.
-		InputMapping->MapKey(IA_Move, EKeys::D);
+		// Strafe right — raw X, no modifiers at all.
+		InputMapping->MapKey(IA_Move, Key);
 	}
 
 	// --- Look: mouse -> (X = yaw delta, Y = pitch delta) ---------------------------------------
 	//
-	// Deliberately two 1D mappings rather than one EKeys::Mouse2D mapping: raw MouseY is positive
-	// when the mouse moves *up*, but AddControllerPitchInput treats positive as *down*, so Y needs
-	// inverting. Splitting the axes lets us use a whole-vector Negate — the only Negate behaviour
-	// we are confident about — instead of the per-axis flags.
+	// THE INVERT-Y BUG, AND WHY THE DEFAULT HAD TO CHANGE RATHER THAN JUST GAIN A TOGGLE.
+	//
+	// Raw EKeys::MouseY is positive when the mouse moves UP: FSceneViewport::OnMouseMove accumulates
+	// `MouseDelta.Y -= CursorDelta.Y`, negating the screen-space (down-positive) delta. And with
+	// Config/DefaultInput.ini setting bEnableLegacyInputScales=False, APlayerController::
+	// AddPitchInput adds `Val * 1.0` straight onto RotationInput.Pitch, where positive pitch is UP.
+	// So mouse-up arrives positive and should be consumed as-is.
+	//
+	// This context used to put a Negate modifier on MouseY. That is correct ONLY under the legacy
+	// input scales, where InputPitchScale_DEPRECATED is -2.5 and supplies an inversion of its own for
+	// the Negate to cancel. With legacy scales off the Negate was the only sign flip left in the
+	// chain, so pushing the mouse forward looked DOWN — which is exactly what the player reported.
+	//
+	// The Negate is therefore gone, and inversion now lives in the SIGN of the Y scalar. That keeps
+	// the modifier list a fixed shape, so a live rebuild only ever changes numbers, and it means the
+	// invert toggle and the sensitivity slider share one code path instead of two.
+	//
+	// The Scalars are not optional: with legacy scales off, nothing else in the chain scales the
+	// mouse at all, and raw delta would be consumed directly as degrees.
 	{
-		InputMapping->MapKey(IA_Look, EKeys::MouseX);
+		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Look, EKeys::MouseX);
+		Mapping.Modifiers.Add(MakeScalar(InputMapping, UserSettings.GetLookScaleX()));
 	}
 	{
 		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Look, EKeys::MouseY);
 		Mapping.Modifiers.Add(MakeSwizzleXToY(InputMapping));
-		Mapping.Modifiers.Add(MakeNegate(InputMapping));
+		Mapping.Modifiers.Add(MakeScalar(InputMapping, UserSettings.GetLookScaleY()));
 	}
 
 	// --- Buttons -------------------------------------------------------------------------------
-	//
-	// No explicit triggers: an action with no trigger uses the implicit "down" trigger, which
-	// gives us Started on press, Triggered while held and Completed on release. That is exactly
-	// the shape the handlers below expect.
-	InputMapping->MapKey(IA_Jump,       EKeys::SpaceBar);
-	InputMapping->MapKey(IA_Fire,       EKeys::LeftMouseButton);
-	InputMapping->MapKey(IA_Pass,       EKeys::RightMouseButton);
-	InputMapping->MapKey(IA_Dash,       EKeys::LeftShift);
-	InputMapping->MapKey(IA_Scoreboard, EKeys::Tab);
+	MapButton(IA_Jump,       KeyFor(ETraceInputAction::Jump));
+	MapButton(IA_Crouch,     KeyFor(ETraceInputAction::Crouch));
+	MapButton(IA_Fire,       KeyFor(ETraceInputAction::Fire));
+	MapButton(IA_Pass,       KeyFor(ETraceInputAction::Pass));
+	MapButton(IA_Dash,       KeyFor(ETraceInputAction::Dash));
+	MapButton(IA_Boost,      KeyFor(ETraceInputAction::Boost));
+	MapButton(IA_Scoreboard, KeyFor(ETraceInputAction::Scoreboard));
 
-	UE_LOG(LogTraceGame, Verbose, TEXT("[%s] Built C++ Enhanced Input data (%d key mappings)"),
-		*GetName(), InputMapping->GetMappings().Num());
+	// The context is already registered by the time a settings change arrives, and Enhanced Input
+	// caches the resolved key->action table. Without this the new bindings sit in the context and
+	// are never consulted, which looks exactly like "rebinding does nothing".
+	if (const ULocalPlayer* LocalPlayer = GetLocalPlayer())
+	{
+		if (UEnhancedInputLocalPlayerSubsystem* Subsystem = LocalPlayer->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>())
+		{
+			Subsystem->RequestRebuildControlMappings();
+		}
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[%s] Input mappings applied: %d key mappings, sensitivity %.2f (yaw) / %.2f (pitch, %s)."),
+		*GetName(), InputMapping->GetMappings().Num(),
+		UserSettings.GetLookScaleX(), FMath::Abs(UserSettings.GetLookScaleY()),
+		UserSettings.bInvertMouseY ? TEXT("INVERTED") : TEXT("standard"));
 }
 
 void ATracePlayerController::AddInputMappings()
@@ -213,19 +367,21 @@ void ATracePlayerController::AddInputMappings()
 	// UEnhancedPlayerInput — and a project that overrides DefaultPlayerInputClass in config hits
 	// exactly that, with no error anywhere and no input in game. The subsystem records the context
 	// on the player input synchronously, so reading it straight back is a real check rather than a
-	// guess. Latched: without the flag this would fire again on every respawn.
-	if (!bInputContextChecked)
+	// guess.
+	//
+	// The check itself runs EVERY time, because registration can start failing later than the first
+	// call (seamless travel, a second local player). Only the *reporting* is latched, so a
+	// persistent failure logs once instead of once per respawn — and a failure that appears after a
+	// success is still reported.
+	if (!Subsystem->HasMappingContext(InputMapping) && !bInputFailureReported)
 	{
-		bInputContextChecked = true;
+		bInputFailureReported = true;
 
-		if (!Subsystem->HasMappingContext(InputMapping))
-		{
-			UE_LOG(LogTraceGame, Error,
-				TEXT("[%s] Enhanced Input refused the mapping context — no gameplay input will reach the pawn. ")
-				TEXT("Check [/Script/Engine.InputSettings] DefaultPlayerInputClass; PlayerInput is currently '%s'."),
-				*GetName(),
-				PlayerInput ? *PlayerInput->GetClass()->GetName() : TEXT("<none>"));
-		}
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[%s] Enhanced Input refused the mapping context — no gameplay input will reach the pawn. ")
+			TEXT("Check [/Script/Engine.InputSettings] DefaultPlayerInputClass; PlayerInput is currently '%s'."),
+			*GetName(),
+			PlayerInput ? *PlayerInput->GetClass()->GetName() : TEXT("<none>"));
 	}
 }
 
@@ -281,9 +437,26 @@ void ATracePlayerController::SetupInputComponent()
 
 	EIC->BindAction(IA_Fire, ETriggerEvent::Started,   this, &ATracePlayerController::OnFireStarted);
 	EIC->BindAction(IA_Fire, ETriggerEvent::Completed, this, &ATracePlayerController::OnFireCompleted);
+	// Mouse1 is a held button now for the carrier (§4 pass), so an interrupted trigger has to reach
+	// the release path too, or a focus loss mid-pass strands the shield down.
+	EIC->BindAction(IA_Fire, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnFireCompleted);
 
+	// Pass is a HELD action now (spec §4: hover a teammate and hold for 0.5s), so it needs the
+	// release edge — and Canceled too, because losing window focus mid-hold must not leave the
+	// carrier's shield welded down.
 	EIC->BindAction(IA_Pass, ETriggerEvent::Started,   this, &ATracePlayerController::OnPassStarted);
+	EIC->BindAction(IA_Pass, ETriggerEvent::Completed, this, &ATracePlayerController::OnPassCompleted);
+	EIC->BindAction(IA_Pass, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnPassCompleted);
+
 	EIC->BindAction(IA_Dash, ETriggerEvent::Started,   this, &ATracePlayerController::OnDashStarted);
+	EIC->BindAction(IA_Boost, ETriggerEvent::Started,  this, &ATracePlayerController::OnBoostStarted);
+
+	// Crouch is a HELD action — ground slide while down, stand on release — so it needs the release
+	// edge as well, and Canceled for the same reason the scoreboard does: losing window focus with
+	// the key down must not weld the player into a crouch.
+	EIC->BindAction(IA_Crouch, ETriggerEvent::Started,   this, &ATracePlayerController::OnCrouchStarted);
+	EIC->BindAction(IA_Crouch, ETriggerEvent::Completed, this, &ATracePlayerController::OnCrouchCompleted);
+	EIC->BindAction(IA_Crouch, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnCrouchCompleted);
 
 	EIC->BindAction(IA_Scoreboard, ETriggerEvent::Started,   this, &ATracePlayerController::OnScoreboardStarted);
 	EIC->BindAction(IA_Scoreboard, ETriggerEvent::Completed, this, &ATracePlayerController::OnScoreboardCompleted);
@@ -306,6 +479,11 @@ void ATracePlayerController::OnPossess(APawn* InPawn)
 
 	// Server path. Only meaningful on a listen-server host, where this controller is also local.
 	AddInputMappings();
+
+	// Re-assert the capture mode on every possession, not just once at BeginPlay: anything that
+	// pushes a different input mode (a menu, a travel, the engine's own focus handling) would
+	// otherwise leave the viewport swallowing the first click of every burst.
+	ApplyGameInputMode();
 }
 
 void ATracePlayerController::AcknowledgePossession(APawn* P)
@@ -315,6 +493,7 @@ void ATracePlayerController::AcknowledgePossession(APawn* P)
 	// Client path: the local player definitely exists by now, even if SetupInputComponent ran
 	// before it did.
 	AddInputMappings();
+	ApplyGameInputMode();
 
 	// Deliberately does NOT reset bScoreboardOpen. Enhanced Input state lives on the local player,
 	// not the pawn, so a player holding Tab through their own death and respawn is still holding it
@@ -343,6 +522,152 @@ ATraceCharacter* ATracePlayerController::GetLivingCharacter() const
 }
 
 // -------------------------------------------------------------------------------------------
+// Menu suppression
+// -------------------------------------------------------------------------------------------
+
+void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
+{
+	if (!IsLocalController() || bGameInputSuppressed == bSuppressed)
+	{
+		return;
+	}
+
+	bGameInputSuppressed = bSuppressed;
+
+	if (bSuppressed)
+	{
+		// GameAndUI rather than UIOnly, and for the same reason the title screen uses it: this menu
+		// is drawn on a Canvas and owns no Slate widget to focus, so UIOnly would route key presses
+		// at a widget that does not exist and the overlay would see nothing.
+		FInputModeGameAndUI InputMode;
+		InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+		InputMode.SetHideCursorDuringCapture(false);
+		SetInputMode(InputMode);
+		bShowMouseCursor = true;
+
+		// Release any held gameplay input before the handlers go quiet. Without this a player who
+		// opens the menu mid-burst comes back still firing, and one who opens it while walking keeps
+		// walking — the release edges are about to be swallowed.
+		if (ATraceCharacter* Character = GetTraceCharacter())
+		{
+			Character->DoFireReleased();
+			Character->StopJumping();
+			Character->DoMove(FVector2D::ZeroVector);
+		}
+		bScoreboardOpen = false;
+
+		// Standalone only. SetPause routes through the game mode and is meaningless on a client, and
+		// pausing a listen server would stop the world for everybody else because one player opened
+		// their settings. Solo-with-bots — which is every session today — gets a real pause.
+		if (GetNetMode() == NM_Standalone)
+		{
+			SetPause(true);
+		}
+	}
+	else
+	{
+		if (GetNetMode() == NM_Standalone)
+		{
+			SetPause(false);
+		}
+
+		// Re-takes mouse capture, hides the cursor, and — the part that matters — re-arms the
+		// look-suppression window. Reacquiring capture warps the OS cursor to the centre of the
+		// viewport, and that warp arrives as one enormous mouse delta; without this the player closes
+		// the settings screen and is instantly spun around. Exactly the spawn-time bug, same fix.
+		ApplyGameInputMode();
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[%s] Gameplay input %s."),
+		*GetName(), bSuppressed ? TEXT("suppressed (menu open)") : TEXT("restored"));
+}
+
+// -------------------------------------------------------------------------------------------
+// HUD data sources
+//
+// See Settings/TraceGameplayCompat.h. Each of these reads the real gameplay accessor when the
+// movement/character slice has landed it, and a stated fallback when it has not.
+// -------------------------------------------------------------------------------------------
+
+bool ATracePlayerController::GetDashHudState(FTraceDashHudState& OutState) const
+{
+	const ATraceCharacter* Character = GetTraceCharacter();
+	if (Character == nullptr || !Character->IsAlive())
+	{
+		return false;
+	}
+
+	UTraceCharacterMovementComponent* Movement = Character->GetTraceMovement();
+	if (Movement == nullptr)
+	{
+		return false;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// GetDashCooldownRemaining() covers the whole lockout — the active dash window PLUS the cooldown
+	// that follows it, because the movement component starts the timer at DashDuration + DashCooldown.
+	// Dividing by DashCooldown alone would pin the meter at empty for the first DashDuration seconds.
+	const float FullWindow = FMath::Max(1.e-4f, Settings.DashDuration + Settings.DashCooldown);
+	const float Remaining = FMath::Max(0.f, Movement->GetDashCooldownRemaining());
+
+	OutState.Remaining = Remaining;
+	OutState.RechargeFraction = FMath::Clamp(1.f - (Remaining / FullWindow), 0.f, 1.f);
+
+	// Fallbacks describe today's single-dash build exactly: one charge, spent while the cooldown
+	// runs. Spec §5 replaces this with a two-charge system for the Core carrier.
+	OutState.MaxCharges = TraceCompat::MaxDashCharges(Movement, 1);
+	OutState.Charges = TraceCompat::DashCharges(Movement, (Remaining <= 1.e-4f) ? 1 : 0);
+
+	OutState.MaxCharges = FMath::Max(1, OutState.MaxCharges);
+	OutState.Charges = FMath::Clamp(OutState.Charges, 0, OutState.MaxCharges);
+
+	// A full bank has nothing regenerating, whatever the underlying timer happens to say.
+	if (OutState.Charges >= OutState.MaxCharges)
+	{
+		OutState.RechargeFraction = 1.f;
+		OutState.Remaining = 0.f;
+	}
+
+	return true;
+}
+
+bool ATracePlayerController::GetBoostHudState(float& OutRemaining, float& OutTotal) const
+{
+	const ATraceCharacter* Character = GetTraceCharacter();
+	if (Character == nullptr || !Character->IsAlive())
+	{
+		return false;
+	}
+
+	UTraceCharacterMovementComponent* Movement = Character->GetTraceMovement();
+
+	const float Remaining = TraceCompat::BoostCooldownRemaining(Movement);
+	if (Remaining < 0.f)
+	{
+		// The mechanic does not exist in this build. The HUD omits the row rather than drawing a
+		// meter that can never move.
+		return false;
+	}
+
+	OutRemaining = Remaining;
+	// 12s is the spec §5 figure, used only until the movement component exposes its own.
+	OutTotal = FMath::Max(1.e-4f, TraceCompat::BoostCooldown(Movement, 12.f));
+	return true;
+}
+
+float ATracePlayerController::GetPassProgress() const
+{
+	ATraceCharacter* Character = GetTraceCharacter();
+	if (Character == nullptr || !Character->IsAlive())
+	{
+		return -1.f;
+	}
+
+	return TraceCompat::PassProgress(Character);
+}
+
+// -------------------------------------------------------------------------------------------
 // Input handlers
 //
 // Every one of these must tolerate a null pawn: input keeps flowing during the respawn window,
@@ -351,23 +676,105 @@ ATraceCharacter* ATracePlayerController::GetLivingCharacter() const
 
 void ATracePlayerController::OnMoveInput(const FInputActionValue& Value)
 {
-	if (ATraceCharacter* Character = GetLivingCharacter())
+	if (bGameInputSuppressed)
 	{
-		Character->DoMove(Value.Get<FVector2D>());
+		return;
+	}
+
+	const FVector2D MoveValue = Value.Get<FVector2D>();
+
+	++DebugMoveEventCount;
+	DebugLastMoveValue = MoveValue;
+	LogFirstEventOfAction(FirstEvent_Move, TEXT("Move"));
+
+	ATraceCharacter* Character = GetLivingCharacter();
+
+	if (InputLogLevel() >= 2)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("INPUT Move  #%d value=(%.3f, %.3f) pawn=%s"),
+			DebugMoveEventCount, MoveValue.X, MoveValue.Y,
+			(Character != nullptr) ? *Character->GetName() : TEXT("<none/dead>"));
+	}
+
+	if (Character != nullptr)
+	{
+		Character->DoMove(MoveValue);
 	}
 }
 
 void ATracePlayerController::OnLookInput(const FInputActionValue& Value)
 {
+	if (bGameInputSuppressed)
+	{
+		// The overlay has the mouse. Nothing about the view may move while the player is dragging a
+		// sensitivity slider with the very device that drives it.
+		return;
+	}
+
+	const UWorld* World = GetWorld();
+	if (World != nullptr && World->GetTimeSeconds() < IgnoreLookUntilTime)
+	{
+		// Inside the post-capture window; see ApplyGameInputMode.
+		return;
+	}
+
+	const FVector2D LookDelta = Value.Get<FVector2D>();
+
+	// Spike guard for every capture we are NOT told about. On macOS the viewport loses the mouse on
+	// any Cmd-Tab or click-away and re-warps the cursor when the player clicks back in, producing
+	// the same one-frame teleport that the suppression window above handles at spawn. Measured
+	// without this guard: single frames carrying 210 deg and 59 deg of yaw, in otherwise identical
+	// runs — the arrival time of the warp varies, so a time window alone cannot catch it.
+	//
+	// This is a RATE limit, not a clamp, and an offending event is dropped whole rather than
+	// clipped: a clamped spike still snaps the view by the clamp value, which is exactly the bug.
+	// The budget is deliberately far above a human hand — a hard 180 flick runs at roughly
+	// 1800 deg/s — and the floor keeps the threshold sane at very high frame rates.
+	const UWorld* TickWorld = World;
+	const float FrameSeconds = (TickWorld != nullptr) ? TickWorld->GetDeltaSeconds() : 0.f;
+	const float Threshold = FMath::Max(MinLookSpikeDegrees, MaxLookDegreesPerSecond * FrameSeconds);
+
+	if (FMath::Abs(LookDelta.X) > Threshold || FMath::Abs(LookDelta.Y) > Threshold)
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[%s] Dropped an implausible look delta (%.1f, %.1f) over %.4fs; threshold %.1f deg. ")
+			TEXT("This is almost always the viewport's cursor warp on mouse capture."),
+			*GetName(), LookDelta.X, LookDelta.Y, FrameSeconds, Threshold);
+		return;
+	}
+
+	++DebugLookEventCount;
+	DebugLastLookValue = LookDelta;
+	LogFirstEventOfAction(FirstEvent_Look, TEXT("Look"));
+
+	if (InputLogLevel() >= 2)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Look  #%d delta=(%.3f, %.3f)"),
+			DebugLookEventCount, LookDelta.X, LookDelta.Y);
+	}
+
 	// Looking stays available while dead so players can watch the fight that killed them.
 	if (ATraceCharacter* Character = GetTraceCharacter())
 	{
-		Character->DoLook(Value.Get<FVector2D>());
+		Character->DoLook(LookDelta);
 	}
 }
 
 void ATracePlayerController::OnJumpStarted()
 {
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	++DebugJumpCount;
+	LogFirstEventOfAction(FirstEvent_Jump, TEXT("Jump"));
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Jump pressed #%d"), DebugJumpCount);
+	}
+
 	// ATraceCharacter deliberately exposes no DoJump — ACharacter::Jump is already
 	// prediction-safe and routes through the movement component's saved moves.
 	if (ATraceCharacter* Character = GetLivingCharacter())
@@ -387,7 +794,28 @@ void ATracePlayerController::OnJumpCompleted()
 
 void ATracePlayerController::OnFireStarted()
 {
+	if (bGameInputSuppressed)
+	{
+		// Also covers the respawn request below: clicking RESUME must not double as "put me back in".
+		return;
+	}
+
+	++DebugFireStartedCount;
+	LogFirstEventOfAction(FirstEvent_Fire, TEXT("Fire"));
+
 	ATraceCharacter* Character = GetTraceCharacter();
+
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("INPUT Fire pressed #%d pawn=%s alive=%d carrier=%d locallyControlled=%d"),
+			DebugFireStartedCount,
+			(Character != nullptr) ? *Character->GetName() : TEXT("<none>"),
+			(Character != nullptr) ? Character->IsAlive() : 0,
+			(Character != nullptr) ? Character->IsCarrier() : 0,
+			(Character != nullptr) ? Character->IsLocallyControlled() : 0);
+	}
+
 	if (Character == nullptr || !Character->IsAlive())
 	{
 		// Dead: fire doubles as "get me back in". The game mode still owns respawn timing.
@@ -402,6 +830,12 @@ void ATracePlayerController::OnFireStarted()
 
 void ATracePlayerController::OnFireCompleted()
 {
+	++DebugFireCompletedCount;
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Fire released #%d"), DebugFireCompletedCount);
+	}
+
 	// Release always propagates, so a pawn that dies mid-burst does not come back still firing.
 	if (ATraceCharacter* Character = GetTraceCharacter())
 	{
@@ -411,41 +845,304 @@ void ATracePlayerController::OnFireCompleted()
 
 void ATracePlayerController::OnPassStarted()
 {
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	++DebugPassCount;
+	LogFirstEventOfAction(FirstEvent_Pass, TEXT("Pass"));
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Pass pressed #%d"), DebugPassCount);
+	}
+
 	if (ATraceCharacter* Character = GetLivingCharacter())
 	{
-		Character->DoPass();
+		Character->DoPassPressed();
+	}
+}
+
+void ATracePlayerController::OnPassCompleted()
+{
+	// Deliberately NOT gated on bGameInputSuppressed or on GetLivingCharacter(). A release that is
+	// dropped leaves ATraceCore::bPassInputHeld latched, which means a shield that never comes back
+	// up. Opening the pause menu mid-hold suppresses input; dying mid-hold makes the pawn non-living.
+	// Both are exactly the cases where the release must still be delivered.
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Pass released #%d"), DebugPassCount);
+	}
+
+	if (ATraceCharacter* Character = GetPawn<ATraceCharacter>())
+	{
+		Character->DoPassReleased();
 	}
 }
 
 void ATracePlayerController::OnDashStarted()
 {
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	++DebugDashCount;
+	LogFirstEventOfAction(FirstEvent_Dash, TEXT("Dash"));
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Dash pressed #%d"), DebugDashCount);
+	}
+
 	if (ATraceCharacter* Character = GetLivingCharacter())
 	{
 		Character->DoDash();
 	}
 }
 
+void ATracePlayerController::OnBoostStarted()
+{
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	++DebugBoostCount;
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Boost pressed #%d"), DebugBoostCount);
+	}
+
+	// Spec §5: a ground-only super-jump on a 12s cooldown. The mechanic itself belongs to the
+	// movement slice; TraceCompat::TryBoost calls ATraceCharacter::DoBoost() when that slice has
+	// landed it and is a no-op until then, so this binding is live from the moment it exists and
+	// needs no follow-up wiring. See Settings/TraceGameplayCompat.h.
+	if (ATraceCharacter* Character = GetLivingCharacter())
+	{
+		if (!TraceCompat::TryBoost(Character))
+		{
+			// Once per session at Verbose: a boost key that does nothing is otherwise indistinguishable
+			// from a broken binding, and the hard-won lesson in this project is that the answer to
+			// "is it dead or is it just quiet?" has to already be in the log.
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[%s] Boost pressed, but ATraceCharacter has no DoBoost() in this build."), *GetName());
+		}
+	}
+}
+
+void ATracePlayerController::OnCrouchStarted()
+{
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	++DebugCrouchCount;
+	LogFirstEventOfAction(FirstEvent_Crouch, TEXT("Crouch"));
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Crouch pressed #%d"), DebugCrouchCount);
+	}
+
+	// ACharacter::Crouch(), not a bespoke DoCrouch. It sets bWantsToCrouch, which is already part of
+	// FSavedMove_Character's compressed flags and therefore already client-predicted and already
+	// replicated — exactly the round-trip spec §5 demands. The movement slice hooks the resulting
+	// OnStartCrouch/OnEndCrouch to turn it into a ground slide or an air fast-fall; the controller
+	// deliberately does not encode which of those it is, because that decision needs the movement
+	// mode and belongs on the movement component.
+	if (ATraceCharacter* Character = GetLivingCharacter())
+	{
+		Character->Crouch();
+	}
+}
+
+void ATracePlayerController::OnCrouchCompleted()
+{
+	// Not gated on IsAlive or on suppression: a release must ALWAYS propagate, or a pawn that dies
+	// (or opens the menu) mid-crouch comes back permanently crouched.
+	if (ATraceCharacter* Character = GetTraceCharacter())
+	{
+		Character->UnCrouch();
+	}
+}
+
 void ATracePlayerController::OnScoreboardStarted()
 {
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	++DebugScoreboardCount;
+	LogFirstEventOfAction(FirstEvent_Scoreboard, TEXT("Scoreboard"));
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Scoreboard down #%d"), DebugScoreboardCount);
+	}
+
 	bScoreboardOpen = true;
 }
 
 void ATracePlayerController::OnScoreboardCompleted()
 {
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Scoreboard up"));
+	}
+
 	bScoreboardOpen = false;
+}
+
+// -------------------------------------------------------------------------------------------
+// Diagnostics
+// -------------------------------------------------------------------------------------------
+
+void ATracePlayerController::LogFirstEventOfAction(uint8 Bit, const TCHAR* ActionName)
+{
+	if ((FirstEventLoggedMask & Bit) != 0)
+	{
+		return;
+	}
+	FirstEventLoggedMask |= Bit;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[%s] Input OK: the '%s' action reached the controller for the first time."),
+		*GetName(), ActionName);
+}
+
+void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
+{
+	const ULocalPlayer* LocalPlayer = GetLocalPlayer();
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("INPUTDIAG [%s] controller=%s netmode=%d isLocal=%d localPlayer=%s"),
+		Context, *GetName(), static_cast<int32>(GetNetMode()), IsLocalController() ? 1 : 0,
+		(LocalPlayer != nullptr) ? *LocalPlayer->GetName() : TEXT("<none>"));
+
+	// UEnhancedPlayerInput is the hard requirement nothing else checks: AddMappingContext is a
+	// silent no-op against a plain UPlayerInput, and DefaultPlayerInputClass lives in an ini.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("INPUTDIAG [%s] PlayerInput=%s isEnhanced=%d"),
+		Context,
+		(PlayerInput != nullptr) ? *PlayerInput->GetClass()->GetName() : TEXT("<null>"),
+		(Cast<UEnhancedPlayerInput>(PlayerInput) != nullptr) ? 1 : 0);
+
+	const UEnhancedInputComponent* EIC = Cast<UEnhancedInputComponent>(InputComponent);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("INPUTDIAG [%s] InputComponent=%s isEnhanced=%d actionBindings=%d"),
+		Context,
+		(InputComponent != nullptr) ? *InputComponent->GetClass()->GetName() : TEXT("<null>"),
+		(EIC != nullptr) ? 1 : 0,
+		(EIC != nullptr) ? EIC->GetActionEventBindings().Num() : -1);
+
+	int32 MappingCount = -1;
+	int32 bContextRegistered = -1;
+	if (InputMapping != nullptr)
+	{
+		MappingCount = InputMapping->GetMappings().Num();
+
+		if (LocalPlayer != nullptr)
+		{
+			if (const UEnhancedInputLocalPlayerSubsystem* Subsystem =
+					LocalPlayer->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>())
+			{
+				bContextRegistered = Subsystem->HasMappingContext(InputMapping) ? 1 : 0;
+			}
+		}
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("INPUTDIAG [%s] MappingContext=%s keyMappings=%d registeredWithSubsystem=%d"),
+		Context,
+		(InputMapping != nullptr) ? *InputMapping->GetName() : TEXT("<null>"),
+		MappingCount, bContextRegistered);
+
+	// A wrong ValueType is the classic silent failure: Axis2D read as a bool, or a bool action
+	// asked for a FVector2D, both yield zero with no warning anywhere.
+	auto LogAction = [Context, this](const TCHAR* Label, const UInputAction* Action)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUTDIAG [%s]   %s valid=%d valueType=%d"),
+			Context, Label, (Action != nullptr) ? 1 : 0,
+			(Action != nullptr) ? static_cast<int32>(Action->ValueType) : -1);
+	};
+	LogAction(TEXT("IA_Move      "), IA_Move);
+	LogAction(TEXT("IA_Look      "), IA_Look);
+	LogAction(TEXT("IA_Jump      "), IA_Jump);
+	LogAction(TEXT("IA_Fire      "), IA_Fire);
+	LogAction(TEXT("IA_Pass      "), IA_Pass);
+	LogAction(TEXT("IA_Dash      "), IA_Dash);
+	LogAction(TEXT("IA_Boost     "), IA_Boost);
+	LogAction(TEXT("IA_Crouch    "), IA_Crouch);
+	LogAction(TEXT("IA_Scoreboard"), IA_Scoreboard);
+
+	// The player's own settings are now part of "why does input feel wrong", so they belong in the
+	// same dump. A hand-edited or half-migrated TraceUserSettings.ini is otherwise invisible.
+	const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+	UE_LOG(LogTraceGame, Display,
+		TEXT("INPUTDIAG [%s] settings sensitivity=%.2f yScale=%.2f invertY=%d lookScale=(%.3f, %.3f) menuSuppressed=%d"),
+		Context, UserSettings.MouseSensitivity, UserSettings.MouseSensitivityYScale,
+		UserSettings.bInvertMouseY ? 1 : 0,
+		UserSettings.GetLookScaleX(), UserSettings.GetLookScaleY(), bGameInputSuppressed ? 1 : 0);
+
+	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUTDIAG [%s]   bind %-16s -> %s"),
+			Context, Info.ConfigId, *UTraceUserSettings::DescribeKey(UserSettings.GetKey(Info.Action)));
+	}
+
+	// The mouse-capture mode is the one part of this that is not ours and can change behind our
+	// back a frame after we set it — see ApplyGameInputMode. Anything other than
+	// CapturePermanently_IncludingInitialMouseDown (2) means the click that re-captures the window
+	// is being eaten, which on macOS is felt as "some of my shots just do nothing".
+	if (GEngine != nullptr && GEngine->GameViewport != nullptr)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("INPUTDIAG [%s] viewport captureMode=%d (2 = CapturePermanently_IncludingInitialMouseDown) lockMode=%d ignoreInput=%d"),
+			Context,
+			static_cast<int32>(GEngine->GameViewport->GetMouseCaptureMode()),
+			static_cast<int32>(GEngine->GameViewport->GetMouseLockMode()),
+			GEngine->GameViewport->IgnoreInput() ? 1 : 0);
+	}
+
+	const ATraceCharacter* Character = GetTraceCharacter();
+	UE_LOG(LogTraceGame, Display,
+		TEXT("INPUTDIAG [%s] pawn=%s alive=%d locallyControlled=%d location=%s"),
+		Context,
+		(Character != nullptr) ? *Character->GetName() : TEXT("<none>"),
+		(Character != nullptr) ? Character->IsAlive() : 0,
+		(Character != nullptr) ? Character->IsLocallyControlled() : 0,
+		(Character != nullptr) ? *Character->GetActorLocation().ToCompactString() : TEXT("-"));
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("INPUTDIAG [%s] counters move=%d look=%d fireDown=%d fireUp=%d jump=%d pass=%d dash=%d boost=%d crouch=%d hitConfirm=%d lastMove=(%.2f, %.2f)"),
+		Context, DebugMoveEventCount, DebugLookEventCount, DebugFireStartedCount,
+		DebugFireCompletedCount, DebugJumpCount, DebugPassCount, DebugDashCount,
+		DebugBoostCount, DebugCrouchCount,
+		DebugHitConfirmCount, DebugLastMoveValue.X, DebugLastMoveValue.Y);
 }
 
 // -------------------------------------------------------------------------------------------
 // RPCs
 // -------------------------------------------------------------------------------------------
 
-void ATracePlayerController::ClientNotifyHit_Implementation(bool bKilled)
+void ATracePlayerController::ClientNotifyHit_Implementation(bool bKilled, ETraceHitZone Zone)
 {
 	if (const UWorld* World = GetWorld())
 	{
 		LastHitMarkerTime = World->GetTimeSeconds();
 	}
 	bLastHitMarkerWasKill = bKilled;
+	LastHitMarkerZone = Zone;
+
+	// End-to-end proof for the harness: the server only ever sends this after ServerFire ran the
+	// lag-compensated resolver and found one of our bullets on somebody. It cannot be produced by
+	// any local, client-side part of the fire path.
+	++DebugHitConfirmCount;
+	if (InputLogLevel() >= 1)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT HitConfirm #%d killed=%d zone=%s"),
+			DebugHitConfirmCount, bKilled ? 1 : 0, TraceHitZoneToString(Zone));
+	}
 }
 
 void ATracePlayerController::ClientNotifyKilledBy_Implementation(const FString& KillerName, FName Cause)

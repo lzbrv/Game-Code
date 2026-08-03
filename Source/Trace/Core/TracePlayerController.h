@@ -16,8 +16,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Delegates/IDelegateInstance.h"  // FDelegateHandle
 #include "Engine/EngineTypes.h"          // EEndPlayReason
 #include "GameFramework/PlayerController.h"
+#include "Gameplay/TraceHitZones.h"      // ETraceHitZone (ClientNotifyHit's payload)
 #include "UObject/ObjectMacros.h"
 #include "UObject/ObjectPtr.h"
 
@@ -31,15 +33,43 @@ class UInputMappingContext;
 struct FInputActionValue;
 
 /**
+ * Everything the HUD needs to draw the dash indicator, resolved in one call.
+ *
+ * A struct rather than four out-parameters because the HUD needs all of it at once and the pieces
+ * are only meaningful together — a charge count without its recharge fraction cannot be drawn.
+ *
+ * Plain C++, declared outside the UCLASS: it is never reflected, never replicated and never touched
+ * by Blueprint, so putting it through UHT would buy nothing.
+ */
+struct FTraceDashHudState
+{
+	/** Charges ready to spend right now. */
+	int32 Charges = 0;
+
+	/** Total charges the pawn has. 2 for the Core carrier once spec §5 lands, 1 otherwise. */
+	int32 MaxCharges = 1;
+
+	/** 0..1 progress of the charge currently regenerating. 1 when nothing is recharging. */
+	float RechargeFraction = 1.f;
+
+	/** Seconds until the next charge lands. 0 when nothing is recharging. */
+	float Remaining = 0.f;
+};
+
+/**
  * Trace's player controller.
  *
- * Input model (contract §7):
+ * Input model (contract §7). Every key below is the DEFAULT — all of them are rebindable through
+ * the options screen, and the authority at runtime is UTraceUserSettings, not this comment:
  *   Move        Axis2D   WASD          -> X = strafe (+right), Y = forward (+forward)
- *   Look        Axis2D   Mouse X / Y   -> X = yaw delta, Y = pitch delta (already un-inverted)
+ *   Look        Axis2D   Mouse X / Y   -> X = yaw delta, Y = pitch delta, scaled and signed by
+ *                                         the player's sensitivity and invert-Y settings
  *   Jump        bool     Space
+ *   Crouch      bool     Left Ctrl     (slide on the ground, fast-fall in the air)
  *   Fire        bool     LMB           (doubles as "put me back in" while dead)
  *   Pass        bool     RMB
  *   Dash        bool     Left Shift
+ *   Boost       bool     E
  *   Scoreboard  bool     Tab           (held)
  */
 UCLASS()
@@ -65,7 +95,10 @@ public:
 	 * Reliable: a dropped hit marker reads as a missed shot, which is worse than a late one.
 	 */
 	UFUNCTION(Client, Reliable)
-	void ClientNotifyHit(bool bKilled);
+	void ClientNotifyHit(bool bKilled, ETraceHitZone Zone);
+
+	/** Which zone the last confirmed hit landed on. Drives the hitmarker's colour and shape. */
+	ETraceHitZone GetLastHitMarkerZone() const { return LastHitMarkerZone; }
 
 	/** Victim-side death notification. Drives the killer line on the death panel. */
 	UFUNCTION(Client, Reliable)
@@ -105,6 +138,123 @@ public:
 	/** Cause of our last death: "Bullet", "Trail" or "Fell". NAME_None until set. */
 	FName GetLastDeathCause() const { return LastDeathCause; }
 
+	// -----------------------------------------------------------------------------------------
+	// Settings
+	// -----------------------------------------------------------------------------------------
+
+	/**
+	 * Rebuilds every key mapping and both look modifiers from UTraceUserSettings.
+	 *
+	 * Called on construction of the input data, and again on every settings change — the options
+	 * screen is reachable from an in-game pause menu, so a player has to be able to fix their
+	 * sensitivity and feel it on the next mouse movement, not on the next respawn.
+	 *
+	 * Cheap: it clears and repopulates a dozen mappings on one transient context and asks the
+	 * subsystem to rebuild. Safe to call before the local player exists.
+	 */
+	void ApplyControlSettings();
+
+	/**
+	 * Silences every gameplay input handler and hands the mouse to the UI.
+	 *
+	 * Driven by ATraceHUD when the pause/settings overlay opens. Look input in particular MUST be
+	 * suppressed: the overlay releases the mouse from the viewport, and the warp back to centre when
+	 * capture is retaken is the same one-frame view teleport ApplyGameInputMode already defends
+	 * against at spawn.
+	 */
+	void SetGameInputSuppressed(bool bSuppressed);
+
+	bool IsGameInputSuppressed() const { return bGameInputSuppressed; }
+
+	// -----------------------------------------------------------------------------------------
+	// HUD data sources for mechanics owned by other slices.
+	//
+	// These exist so ATraceHUD never has to know whether dash charges, boost or the pass hold have
+	// landed yet. See Settings/TraceGameplayCompat.h: each one resolves to the real accessor when
+	// the gameplay slice provides it and to a documented fallback when it does not, so the HUD can
+	// ship its affordances now and light them up automatically.
+	// -----------------------------------------------------------------------------------------
+
+	/** False when there is no living pawn to describe. */
+	bool GetDashHudState(FTraceDashHudState& OutState) const;
+
+	/**
+	 * Boost cooldown, in seconds. Returns false while the boost mechanic does not exist, which is
+	 * how the HUD knows to omit the row entirely rather than draw a meter that never moves.
+	 */
+	bool GetBoostHudState(float& OutRemaining, float& OutTotal) const;
+
+	/** 0..1 through the 0.5s pass hold; negative when no pass is in progress. */
+	float GetPassProgress() const;
+
+	// -----------------------------------------------------------------------------------------
+	// Input verification instrumentation.
+	//
+	// The bots call ATraceCharacter::Do* directly and never touch Enhanced Input, so before this
+	// existed NOTHING in the project exercised the human input path — a broken binding would have
+	// produced a completely silent, completely green run. These counters are the ground truth that
+	// the synthetic-input harness in Source/Trace/Debug asserts against: they are incremented
+	// inside the Enhanced Input delegates themselves, so a non-zero count is proof that the event
+	// travelled OS/Slate -> viewport -> UEnhancedPlayerInput -> trigger -> our bound delegate.
+	//
+	// Plain ints, not UPROPERTYs: they are never replicated, never serialised and never read by
+	// gameplay. Cost is a handful of bytes and one increment per event.
+	// -----------------------------------------------------------------------------------------
+
+	int32 DebugMoveEventCount = 0;
+	int32 DebugLookEventCount = 0;
+	int32 DebugFireStartedCount = 0;
+	int32 DebugFireCompletedCount = 0;
+	int32 DebugJumpCount = 0;
+	int32 DebugPassCount = 0;
+	int32 DebugDashCount = 0;
+	int32 DebugScoreboardCount = 0;
+	int32 DebugCrouchCount = 0;
+	int32 DebugBoostCount = 0;
+	/** Bumped by ClientNotifyHit — a server-confirmed hitscan resolution credited to us. */
+	int32 DebugHitConfirmCount = 0;
+
+	FVector2D DebugLastMoveValue = FVector2D::ZeroVector;
+	FVector2D DebugLastLookValue = FVector2D::ZeroVector;
+
+	/**
+	 * Dumps every part of the Enhanced Input setup that can silently be wrong — the input
+	 * component's real class, how many action bindings it carries, whether the subsystem actually
+	 * accepted our mapping context, each action's ValueType, and the possession state.
+	 *
+	 * Lives here rather than in the harness because most of what it reports is protected state of
+	 * this class. Logs at Display so it survives the default verbosity of an automated run.
+	 */
+	void LogInputDiagnostics(const TCHAR* Context) const;
+
+private:
+	/**
+	 * Emits ONE Display line the first time each action ever fires, then never again.
+	 *
+	 * This is not covered by Trace.LogInput, and deliberately so. The next time somebody reports
+	 * "I couldn't shoot", the answer to "did the key even reach the game?" has to be in the log
+	 * they already have — not behind a cvar nobody thought to set before playing. Seven lines per
+	 * session is nothing; the absence of the "Fire" line is a diagnosis.
+	 */
+	void LogFirstEventOfAction(uint8 Bit, const TCHAR* ActionName);
+
+	/** One bit per action, so the line above is emitted exactly once each. */
+	uint8 FirstEventLoggedMask = 0;
+
+	static constexpr uint8 FirstEvent_Move       = 1 << 0;
+	static constexpr uint8 FirstEvent_Look       = 1 << 1;
+	static constexpr uint8 FirstEvent_Jump       = 1 << 2;
+	static constexpr uint8 FirstEvent_Fire       = 1 << 3;
+	static constexpr uint8 FirstEvent_Pass       = 1 << 4;
+	static constexpr uint8 FirstEvent_Dash       = 1 << 5;
+	static constexpr uint8 FirstEvent_Scoreboard = 1 << 6;
+	static constexpr uint8 FirstEvent_Crouch     = 1 << 7;
+	// Boost deliberately has no bit: the mask is a uint8 and is full. Boost is the newest action and
+	// the least likely to be the one somebody is debugging; widening the mask for it would be the
+	// wrong trade against the "seven lines a session" budget the mechanism is built around.
+
+public:
+
 protected:
 	// ---- Enhanced Input data, all built in C++ ------------------------------------------------
 	//
@@ -135,7 +285,20 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UInputAction> IA_Scoreboard;
 
-	/** Builds InputMapping and every IA_* exactly once. Cheap and safe to call repeatedly. */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_Crouch;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_Boost;
+
+	/**
+	 * Builds InputMapping and every IA_* exactly once, then lays down the key mappings.
+	 *
+	 * The two halves are separate on purpose. The ACTIONS must be created exactly once and never
+	 * replaced, because SetupInputComponent binds delegates to those specific objects and a fresh
+	 * UInputAction would leave every binding pointing at an action nothing maps to. The KEY MAPPINGS
+	 * are torn down and rebuilt on every settings change. Cheap and safe to call repeatedly.
+	 */
 	void BuildInputData();
 
 	/** Registers InputMapping with the local player's Enhanced Input subsystem. Idempotent. */
@@ -143,6 +306,13 @@ protected:
 
 	/** Unregisters it again. Called from EndPlay so travel does not leak stale contexts. */
 	void RemoveInputMappings();
+
+	/**
+	 * Puts the viewport into game-only input with the initial mouse-down NOT consumed, so the click
+	 * that recaptures a window also registers as a shot. Re-applied on every possession; see the
+	 * implementation for why the default FInputModeGameOnly is wrong for a shooter.
+	 */
+	void ApplyGameInputMode();
 
 	// ---- Input handlers -----------------------------------------------------------------------
 	void OnMoveInput(const FInputActionValue& Value);
@@ -152,7 +322,12 @@ protected:
 	void OnFireStarted();
 	void OnFireCompleted();
 	void OnPassStarted();
+	/** Release edge of the held hover pass (spec §4). Must fire even when input is suppressed. */
+	void OnPassCompleted();
 	void OnDashStarted();
+	void OnBoostStarted();
+	void OnCrouchStarted();
+	void OnCrouchCompleted();
 	void OnScoreboardStarted();
 	void OnScoreboardCompleted();
 
@@ -166,22 +341,42 @@ private:
 	/** Minimum seconds between honoured ServerRequestRespawn calls (anti-spam). */
 	static constexpr float RespawnRequestCooldown = 0.5f;
 
+	/** How long look input is dropped after the viewport takes the mouse. See ApplyGameInputMode. */
+	static constexpr float LookSuppressAfterCapture = 0.5f;
+
+	/** Look rate budget. A look event above this rate is discarded as a capture artefact. */
+	static constexpr float MaxLookDegreesPerSecond = 2500.f;
+
+	/** Floor for the rate budget, so a very high frame rate cannot make the threshold absurdly tight. */
+	static constexpr float MinLookSpikeDegrees = 20.f;
+
+	/** World time before which look input is discarded. */
+	float IgnoreLookUntilTime = 0.f;
+
 	/** Far enough in the past that the HUD's "age" test fails on the first frame. */
 	static constexpr float NeverHitSentinel = -1000.f;
 
 	float LastHitMarkerTime = NeverHitSentinel;
 	bool bLastHitMarkerWasKill = false;
+	ETraceHitZone LastHitMarkerZone = ETraceHitZone::None;
 
 	bool bScoreboardOpen = false;
 
 	/**
-	 * Latches after the first post-add verification of the mapping context, so the diagnostic in
-	 * AddInputMappings() reports a misconfiguration once rather than on every respawn.
+	 * Latches once AddInputMappings() has REPORTED a mapping-context failure, so a persistent
+	 * misconfiguration logs once instead of once per respawn. The check itself is not latched — a
+	 * failure that only appears later (seamless travel, a second local player) still gets reported.
 	 */
-	bool bInputContextChecked = false;
+	bool bInputFailureReported = false;
 
 	FString LastKillerName;
 	FName LastDeathCause = NAME_None;
+
+	/** True while the pause/settings overlay owns the screen. See SetGameInputSuppressed. */
+	bool bGameInputSuppressed = false;
+
+	/** Registration with UTraceUserSettings::OnChanged, released in EndPlay. */
+	FDelegateHandle SettingsChangedHandle;
 
 	/** Server-side: world time of the last respawn request we acted on. */
 	float LastRespawnRequestTime = NeverHitSentinel;

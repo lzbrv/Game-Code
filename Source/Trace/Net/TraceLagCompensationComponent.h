@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "Gameplay/TraceHitZones.h"   // ETraceHitZone, FTraceHitZoneModel
 #include "TraceTypes.h"
 #include "TraceLagCompensationComponent.generated.h"
 
@@ -20,6 +21,48 @@ class UWorld;
  * else ticking that frame. Here the rewind is pure math - the historical pose is a plain struct and
  * the ray/character test is an analytic segment-vs-capsule check. The world itself is traced once,
  * live, purely to find out how far the ray gets before static geometry stops it.
+ *
+ * --- REWINDING THREE ZONES, NOT ONE CAPSULE (spec section 6) --------------------------------
+ *
+ * Positional damage means the rewind has to reconstruct head / body / legs at the rewound time,
+ * not just "a body". It does so WITHOUT storing any extra history: FTraceHitZoneModel derives all
+ * three zones arithmetically from the capsule centre, half height and radius that this buffer has
+ * always recorded, so a rewound pose reconstructs its zones exactly as a live pose does.
+ *
+ * That is a deliberate memory/fidelity trade. The honest accounting:
+ *
+ *   what it costs       nothing. History stays at 28 bytes per frame per player - 10 players at
+ *                       60 Hz for 1 s is ~17 KB total. Storing per-bone transforms instead would
+ *                       be on the order of 2 MB/s of history plus a skeletal evaluation per
+ *                       rewind, for a prototype that does not need it.
+ *   what it buys        the zones structurally cannot desync from the capsule, because they ARE the
+ *                       capsule expressed differently. Any future change to capsule size, at any
+ *                       point in the recorded window, is tracked for free.
+ *   where it lies       the zones are an upright column at the capsule's dimensions. They do not
+ *                       track a leaning, strafing or mid-stride mesh, and arms are folded into the
+ *                       body zone wherever the arm actually is.
+ *
+ *                       IMPORTANT and easy to get wrong: this build's crouch does NOT shrink the
+ *                       capsule. Crouch is a SLIDE, and the movement component keeps the capsule at
+ *                       full size on purpose (see UTraceCharacterMovementComponent::
+ *                       CanCrouchInCurrentState).
+ *
+ *                       FIXED AT INTEGRATION, and this is the one thing NOT to regress: the frame
+ *                       now also records FTraceLagCompFrame::PostureScale (from
+ *                       ATraceCharacter::GetHitZonePostureScale), so the head/hip bands compress
+ *                       toward the feet with the slide and rewind with it. Before that term
+ *                       existed, a slider's head sphere floated ~48uu above the head the shooter
+ *                       could see: aiming at the visible head scored BODY and aiming at empty air
+ *                       above it scored a one-shot kill. Posture is 33 bytes/frame -> 32, and it
+ *                       moves only zone CLASSIFICATION; hit DETECTION is still the full capsule, so
+ *                       exactly the same shots connect. Full accounting in Gameplay/TraceHitZones.h.
+ *
+ *                       Still unmodelled: the 20-degree forward mesh lean during a slide, and arms.
+ *
+ * Both the client's predicted trace and this server-authoritative one call ResolveHitscan(), which
+ * calls FTraceHitZoneModel::ResolveSegment(). There is exactly one copy of the zone geometry in
+ * the build, so the two paths cannot disagree about what a zone is - only about the pose, which is
+ * what the rewind exists to reconcile.
  */
 UCLASS(ClassGroup = (Trace), meta = (BlueprintSpawnableComponent))
 class TRACE_API UTraceLagCompensationComponent : public UActorComponent
@@ -60,7 +103,8 @@ public:
 	 * @param OutImpactPoint       Set to the character impact when one is hit, otherwise to the
 	 *                             static-geometry impact, otherwise to the far end of the ray. Always
 	 *                             written, so it can be fed straight to a tracer.
-	 * @param bOutHeadshot         True when the impact landed in the upper part of the capsule.
+	 * @param OutZone              Head / Body / Legs on a character hit, None otherwise. Drives
+	 *                             positional damage (spec section 6) - see Gameplay/TraceHitZones.h.
 	 * @return                     The nearest character hit, or nullptr.
 	 *
 	 * Skips the shooter, dead characters, the Core carrier (invulnerable to bullets by design) and,
@@ -74,7 +118,7 @@ public:
 		float Range,
 		float RewindToServerTime,
 		FVector& OutImpactPoint,
-		bool& bOutHeadshot);
+		ETraceHitZone& OutZone);
 
 private:
 	/**
@@ -88,7 +132,4 @@ private:
 
 	/** Hard ceiling so a hitch or a pathological tick rate cannot grow the buffer without bound. */
 	static constexpr int32 MaxHistoryFrames = 512;
-
-	/** Fraction of the capsule half height above the centre that counts as a head. */
-	static constexpr float HeadshotHeightFraction = 0.55f;
 };

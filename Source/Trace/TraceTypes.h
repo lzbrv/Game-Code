@@ -215,4 +215,23 @@ struct FTraceLagCompFrame
 
 	/** Radius of the capsule at capture time. */
 	float CapsuleRadius = 34.f;
+
+	/**
+	 * Posture: the fraction of the capsule's full height that the BODY actually occupies at capture
+	 * time. 1.0 standing; ~0.78 at the bottom of a slide.
+	 *
+	 * This exists because of a cross-system conflict that is easy to miss. This build's crouch is a
+	 * SLIDE, and UTraceCharacterMovementComponent::CanCrouchInCurrentState() returns false on
+	 * purpose so the capsule is NEVER resized - the capsule is the single source of truth for
+	 * hitscan, for this rewind buffer and for the trail trip test. But ATraceCharacter drops
+	 * BaseEyeHeight and leans the mesh while sliding. Without this term the zone model would keep a
+	 * slider's head sphere at standing height, i.e. floating ~48uu above the head the shooter can
+	 * actually see: aiming at a slider's visible head would score BODY, and aiming at the empty air
+	 * above them would score a one-shot HEAD kill.
+	 *
+	 * Recording posture rather than shrinking the capsule keeps hit DETECTION byte-for-byte
+	 * unchanged (which shots connect) and moves only zone CLASSIFICATION (what a connecting shot is
+	 * worth). It costs 4 bytes per frame, and it rewinds with the pose for free.
+	 */
+	float PostureScale = 1.f;
 };

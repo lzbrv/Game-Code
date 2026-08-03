@@ -4,7 +4,9 @@
 
 #include "Net/UnrealNetwork.h"
 
+#include "Engine/World.h"
 #include "GameFramework/Controller.h"
+#include "GameFramework/GameStateBase.h"
 #include "GameFramework/Pawn.h"
 #include "Core/TraceCharacter.h"
 #include "Trace.h"
@@ -27,6 +29,25 @@ void ATracePlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Ou
 	DOREPLIFETIME(ATracePlayerState, Kills);
 	DOREPLIFETIME(ATracePlayerState, Deaths);
 	DOREPLIFETIME(ATracePlayerState, bIsCarrier);
+	DOREPLIFETIME(ATracePlayerState, RespawnEndServerTime);
+}
+
+float ATracePlayerState::GetRespawnTimeRemaining() const
+{
+	if (RespawnEndServerTime <= 0.f)
+	{
+		return 0.f;
+	}
+
+	const AGameStateBase* BaseGameState = (GetWorld() != nullptr) ? GetWorld()->GetGameState() : nullptr;
+	if (BaseGameState == nullptr)
+	{
+		return 0.f;
+	}
+
+	// Kept in double until the end: GetServerWorldTimeSeconds() is double on 5.3+.
+	const double Remaining = static_cast<double>(RespawnEndServerTime) - BaseGameState->GetServerWorldTimeSeconds();
+	return FMath::Max(0.f, static_cast<float>(Remaining));
 }
 
 void ATracePlayerState::SetTeam(ETraceTeam NewTeam)
@@ -86,5 +107,9 @@ void ATracePlayerState::CopyProperties(APlayerState* PlayerState)
 
 		// bIsCarrier is deliberately NOT carried: the Core does not survive travel, and a stale
 		// "carrier" flag would make the HUD claim someone is holding an object that no longer exists.
+		//
+		// RespawnEndServerTime is not carried either, and for a sharper reason: it is an absolute
+		// timestamp on the OLD world's clock. Copying it across travel would hand the new match a
+		// deadline in its own distant past or future and pin a death panel open.
 	}
 }

@@ -9,20 +9,26 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
+#include "Kismet/GameplayStatics.h"                      // ParseOption / GetIntOption ("?bots=")
 #include "Math/NumericLimits.h"
+#include "Misc/CommandLine.h"                            // -TraceBotDebug
+#include "Misc/Parse.h"
 #include "TimerManager.h"
 
+#include "AI/TraceBotController.h"
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"
+#include "Gameplay/TraceEndzone.h"
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceTrailComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"
 #include "UI/TraceHUD.h"
+#include "UI/TraceMatchOptions.h"
 #include "World/TraceArenaBuilder.h"
 #include "World/TraceTeamPlayerStart.h"
 
@@ -40,6 +46,28 @@ namespace TraceGameModeConstants
 	 * 5.4 through 5.8.
 	 */
 	static constexpr float ZeroDurationEpsilon = 0.001f;
+
+	/** Seconds between -TraceBotDebug roster dumps. */
+	static constexpr float BotDebugInterval = 3.f;
+
+	/** Tag on the respawn pads this class builds inside the endzones. */
+	static const FName EndzoneStartTag(TEXT("TraceEndzoneStart"));
+
+	/**
+	 * Capsule used to test a candidate endzone respawn pad for solid geometry.
+	 *
+	 * These are the shipped ATraceCharacter capsule dimensions. They are duplicated rather than read
+	 * off the pawn CDO because the test runs during PreInitializeComponents, before any pawn exists,
+	 * and being 2uu wrong here only costs a slightly conservative pad placement.
+	 */
+	static constexpr float SpawnProbeRadius = 34.f;
+	static constexpr float SpawnProbeHalfHeight = 88.f;
+
+	/** How many times a blocked endzone pad steps back towards the goal line before giving up. */
+	static constexpr int32 SpawnProbeSteps = 4;
+
+	/** Fraction of the endzone depth each of those steps covers. */
+	static constexpr float SpawnProbeStepFraction = 0.18f;
 }
 
 ATraceGameMode::ATraceGameMode()
@@ -54,6 +82,7 @@ ATraceGameMode::ATraceGameMode()
 
 	ArenaBuilderClass = ATraceArenaBuilder::StaticClass();
 	CoreClass = ATraceCore::StaticClass();
+	BotControllerClass = ATraceBotController::StaticClass();
 
 	// Players run around during warm-up rather than sitting in spectator.
 	bStartPlayersAsSpectators = false;
@@ -63,22 +92,144 @@ ATraceGameMode::ATraceGameMode()
 	bUseSeamlessTravel = true;
 }
 
+void ATraceGameMode::InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage)
+{
+	Super::InitGame(MapName, Options, ErrorMessage);
+
+	// Read once, here, rather than off OptionsString later: this is the only place the raw URL is
+	// guaranteed to be exactly what the session was opened with.
+	//   ?bots=0  -> no bots at all this session, whatever the config says
+	//   ?bots=N  -> at most N bots in total
+	//   (absent) -> UTraceSettings::bFillTeamsWithBots decides
+	BotCountFromURL = UGameplayStatics::HasOption(Options, TEXT("bots"))
+		? FMath::Max(0, UGameplayStatics::GetIntOption(Options, TEXT("bots"), 0))
+		: -1;
+
+	if (BotCountFromURL >= 0)
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("URL option '?bots=%d' overrides the configured bot fill."), BotCountFromURL);
+	}
+
+	// "?difficulty=easy|normal|hard" arrives from the title screen's Play button. The option is
+	// absent when the map is opened directly (a headless test run, a level-editor Play), and
+	// UTraceSettings then falls back to "-difficulty=" on the command line and finally to the
+	// configured default rather than leaving whoever launched it against the hardest bots.
+	//
+	// This is THE resolution point for bot difficulty, and it is forced. InitGame runs exactly once
+	// per map load, before any bot's BeginPlay, so forcing here is what lets a player return to the
+	// title screen, pick a different difficulty and actually get it — UTraceSettings otherwise
+	// latches the first answer for the whole process, which silently pinned every match after the
+	// first to the first match's bots.
+	//
+	// The bot controllers still call the same function unforced (see ATraceBotController::BeginPlay)
+	// so a bot spawned into a map that somehow bypassed InitGame is not left unresolved. Those calls
+	// are no-ops once this one has run.
+	UTraceSettings::ResolveBotDifficultyFromOptions(Options, /*bForceReresolve=*/true);
+
+	// Test hooks for the match format. A full match is now 2 x HalfDuration, which at the shipped
+	// ten minutes a half is twenty minutes of wall clock — far too long for an automated run to ever
+	// reach half time, let alone full time. These make the whole structure reachable in seconds:
+	//
+	//     /Game/Maps/Arena?half=20?breaklen=4            (from a travel URL)
+	//     -TraceHalfSeconds=20 -TraceHalfTimeSeconds=4   (from the command line, for headless runs)
+	//
+	// Note the separator: UE URL options are chained with '?', NOT with '&'. Writing "?half=20&
+	// breaklen=4" parses as ONE option called "half" whose value is "20&breaklen=4" — which
+	// FCString::Atoi happily reads as 20, so the first option appears to work and the second is
+	// silently ignored. That is exactly what happened the first time this was tested.
+	//
+	// Deliberately not gated on !UE_BUILD_SHIPPING: they are URL/CLI options nobody can reach by
+	// accident, and a live server operator shortening a half is a legitimate thing to want.
+	float OverrideSeconds = 0.f;
+	if (UGameplayStatics::HasOption(Options, TEXT("half")))
+	{
+		OverrideSeconds = static_cast<float>(UGameplayStatics::GetIntOption(Options, TEXT("half"), 0));
+	}
+	else
+	{
+		FParse::Value(FCommandLine::Get(), TEXT("TraceHalfSeconds="), OverrideSeconds);
+	}
+
+	if (OverrideSeconds > 0.f)
+	{
+		HalfDuration = OverrideSeconds;
+		UE_LOG(LogTraceGame, Log, TEXT("Half duration overridden to %.1fs."), HalfDuration);
+	}
+
+	float BreakOverrideSeconds = 0.f;
+	if (UGameplayStatics::HasOption(Options, TEXT("breaklen")))
+	{
+		BreakOverrideSeconds = static_cast<float>(UGameplayStatics::GetIntOption(Options, TEXT("breaklen"), 0));
+	}
+	else
+	{
+		FParse::Value(FCommandLine::Get(), TEXT("TraceHalfTimeSeconds="), BreakOverrideSeconds);
+	}
+
+	if (BreakOverrideSeconds > 0.f)
+	{
+		HalfTimeBreakDuration = BreakOverrideSeconds;
+		UE_LOG(LogTraceGame, Log, TEXT("Half-time interval overridden to %.1fs."), HalfTimeBreakDuration);
+	}
+}
+
+void ATraceGameMode::PreInitializeComponents()
+{
+	// Super creates the GameState (AGameModeBase::PreInitializeComponents). SpawnCoreIfNeeded
+	// publishes the Core on it, so Super has to run first.
+	Super::PreInitializeComponents();
+
+	// See the header for the LoadMap ordering this exists to get ahead of. Short version: every
+	// ATraceTeamPlayerStart must exist before AGameModeBase::Login calls FindPlayerStart, and Login
+	// happens before any BeginPlay in the world.
+	//
+	// Re-entrancy is safe. ULevel::RouteActorInitialize already loops until the actor count
+	// stabilises specifically because pre-initialisation may spawn actors, and every pass skips
+	// actors that are already initialised. UWorld::bActorsInitialized is set before InitGame, so the
+	// actors we spawn here get PreInitializeComponents/PostInitializeComponents inline.
+	EnsureArenaBuilt();
+	SpawnCoreIfNeeded();
+
+	// Both of these must land before AGameModeBase::Login runs FindPlayerStart, for the same reason
+	// the arena itself does: the very first spawn already has to happen on the right side, in the
+	// right endzone. ApplyTeamSides is what makes "the right side" a runtime answer.
+	ApplyTeamSides(GetNegativeSideTeamForHalf(1));
+	BuildEndzoneSpawnPads();
+}
+
 void ATraceGameMode::BeginPlay()
 {
 	Super::BeginPlay();
 
-	SpawnArenaAndCore();
+	// Belt and braces for paths that skip PreInitializeComponents' happy case — seamless travel, a
+	// Blueprint subclass that forgets to call Super, PIE quirks. Both are idempotent.
+	EnsureArenaBuilt();
+	SpawnCoreIfNeeded();
+	ApplyTeamSides(GetNegativeSideTeamForHalf(1));
+	BuildEndzoneSpawnPads();
 
-	// The listen-server host logs in during UEngine::LoadMap, i.e. *before* the world begins play,
-	// so at their PostLogin the arena — and with it every ATraceTeamPlayerStart — did not exist yet
-	// and AGameModeBase::RestartPlayer will have bailed out with "player start not found". Now that
-	// the field is built, hand a pawn to anyone still without one. On a dedicated server this is a
-	// no-op (remote clients only ever log in after BeginPlay).
-	EnsurePlayersHavePawns();
+	// Anyone who logged in before the arena existed is dragged onto a real pad here. This must be
+	// ResetPlayersToSpawns() rather than a "does this controller have a pawn?" test: the engine's
+	// WorldSettings fallback hands a MISPLACED player a perfectly valid pawn, so a pawn-existence
+	// test never fires for the case that matters. With PreInitializeComponents doing its job this is
+	// a cheap no-op teleport onto the pad the player is already standing on.
+	ResetPlayersToSpawns();
 
-	// Same reason: the host is already logged in, so this is the first point at which the phase
-	// machine is allowed to run.
+	// Bots are filled in BEFORE the phase machine runs, on purpose: they carry real PlayerStates, so
+	// they count towards MinPlayersToStart. A solo human plus nine bots therefore leaves
+	// WaitingForPlayers exactly like a full lobby would, which is the whole point of the mode.
+	UpdateBotFill();
+
+	// The host is already logged in, so this is the first point at which the phase machine may run.
 	CheckMatchStartConditions();
+
+#if !UE_BUILD_SHIPPING
+	if (FParse::Param(FCommandLine::Get(), TEXT("TraceBotDebug")))
+	{
+		GetWorldTimerManager().SetTimer(BotDebugTimerHandle, this, &ATraceGameMode::LogBotRoster,
+			TraceGameModeConstants::BotDebugInterval, /*bLoop=*/true, /*FirstDelay=*/1.f);
+	}
+#endif
 }
 
 bool ATraceGameMode::ShouldSpawnAtStartSpot(AController* Player)
@@ -88,7 +239,7 @@ bool ATraceGameMode::ShouldSpawnAtStartSpot(AController* Player)
 	return false;
 }
 
-void ATraceGameMode::SpawnArenaAndCore()
+void ATraceGameMode::EnsureArenaBuilt()
 {
 	UWorld* World = GetWorld();
 	if (World == nullptr || !HasAuthority())
@@ -96,7 +247,10 @@ void ATraceGameMode::SpawnArenaAndCore()
 		return;
 	}
 
-	ArenaBuilder = ATraceArenaBuilder::Get(World);
+	if (ArenaBuilder == nullptr)
+	{
+		ArenaBuilder = ATraceArenaBuilder::Get(World);
+	}
 
 	if (ArenaBuilder == nullptr)
 	{
@@ -109,22 +263,30 @@ void ATraceGameMode::SpawnArenaAndCore()
 		UE_LOG(LogTraceGame, Log, TEXT("No ATraceArenaBuilder in the level; spawned one at the origin."));
 	}
 
-	// The builder must have run before we can trust GetCoreSpawnLocation() or expect its player
-	// starts to exist, and neither path above guarantees that:
-	//  - a level-placed builder may simply not have reached BeginPlay yet (actor order is undefined);
-	//  - an actor spawned *during* the world's begin-play sweep does not begin play at spawn time,
-	//    because UWorld::HasBegunPlay() is still false while that sweep is running.
-	// AActor::DispatchBeginPlay self-guards and is a no-op once an actor has begun play, so forcing
-	// it here is both safe and idempotent.
-	if (ArenaBuilder != nullptr && !ArenaBuilder->HasActorBegunPlay())
+	// The builder must have run before anyone can trust GetCoreSpawnLocation() or expect its player
+	// starts to exist, and spawning it does NOT guarantee that. We are called from
+	// PreInitializeComponents, where the world has not begun play and AActor::BeginPlayCallDepth is
+	// zero, so AActor::PostActorConstruction will not dispatch BeginPlay for a freshly spawned actor
+	// — and a level-placed builder has not reached BeginPlay either. EnsureBuilt() is the explicit,
+	// idempotent way to make it build regardless of lifecycle stage.
+	if (ArenaBuilder != nullptr)
 	{
-		ArenaBuilder->DispatchBeginPlay();
+		ArenaBuilder->EnsureBuilt();
+	}
+}
+
+void ATraceGameMode::SpawnCoreIfNeeded()
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority())
+	{
+		return;
 	}
 
 	ATraceGameState* TraceGameState = GetTraceGameState();
 	if (TraceGameState == nullptr)
 	{
-		UE_LOG(LogTraceGame, Error, TEXT("ATraceGameMode::SpawnArenaAndCore: no ATraceGameState, cannot publish the Core."));
+		UE_LOG(LogTraceGame, Error, TEXT("ATraceGameMode::SpawnCoreIfNeeded: no ATraceGameState, cannot publish the Core."));
 		return;
 	}
 
@@ -146,7 +308,7 @@ void ATraceGameMode::SpawnArenaAndCore()
 	ATraceCore* SpawnedCore = World->SpawnActor<ATraceCore>(CoreClassToSpawn, CoreLocation, FRotator::ZeroRotator, CoreSpawnParams);
 	if (SpawnedCore == nullptr)
 	{
-		UE_LOG(LogTraceGame, Error, TEXT("ATraceGameMode::SpawnArenaAndCore: failed to spawn the Core."));
+		UE_LOG(LogTraceGame, Error, TEXT("ATraceGameMode::SpawnCoreIfNeeded: failed to spawn the Core."));
 		return;
 	}
 
@@ -182,6 +344,10 @@ void ATraceGameMode::PostLogin(APlayerController* NewPlayer)
 		}
 	}
 
+	// A human arriving on a listen server takes a slot back off the AI. Deferred by a tick because
+	// PlayerArray is only truthful once Login/PostLogin have finished.
+	ScheduleBotFill();
+
 	CheckMatchStartConditions();
 }
 
@@ -197,6 +363,11 @@ void ATraceGameMode::AssignTeamIfNeeded(APlayerController* NewPlayer)
 	{
 		return;
 	}
+
+	// Before PickTeamForNewPlayer is consulted: bots occupy real team slots, so with a full AI fill
+	// in place PickTeamForNewPlayer would correctly report "both teams full" and the human would
+	// spawn teamless — no scoring, no friendly-fire protection, no spawn side.
+	FreeSlotForHuman();
 
 	const ETraceTeam PickedTeam = PickTeamForNewPlayer();
 	if (PickedTeam == ETraceTeam::None)
@@ -286,6 +457,13 @@ ETraceTeam ATraceGameMode::PickTeamForNewPlayer() const
 
 AActor* ATraceGameMode::ChoosePlayerStart_Implementation(AController* Player)
 {
+	// Last moment before AGameModeBase::FindPlayerStart silently falls back to
+	// World->GetWorldSettings() (the origin, inside the floor and the pedestal). If anything ever
+	// asks for a start before the arena exists, build it right here. Deliberately ahead of the
+	// Player null-check: AGameModeBase::Login calls us with Player == nullptr, and that call is the
+	// FIRST one, so guarding after the early-return would leave the important path unprotected.
+	EnsureArenaBuilt();
+
 	UWorld* World = GetWorld();
 	if (World == nullptr || Player == nullptr)
 	{
@@ -294,6 +472,15 @@ AActor* ATraceGameMode::ChoosePlayerStart_Implementation(AController* Player)
 
 	const ETraceTeam Team = GetTeamForController(Player);
 
+	// Three pools, most specific first:
+	//   EndzoneStarts - the pads this class builds INSIDE each endzone. Spec §1 puts respawns here.
+	//   TeamStarts    - the arena builder's pads in front of the endzone. The fallback if a pad
+	//                   could not be placed (blocked by geometry) or the feature is switched off.
+	//   AnyStarts     - anything at all, for a teamless player or a hand-built level.
+	//
+	// Membership in all three is keyed off Start->Team, which ApplyTeamSides() rewrites at half
+	// time. That is the whole side switch as far as spawning is concerned.
+	TArray<ATraceTeamPlayerStart*> EndzoneTeamStarts;
 	TArray<ATraceTeamPlayerStart*> TeamStarts;
 	TArray<ATraceTeamPlayerStart*> AnyStarts;
 	for (TActorIterator<ATraceTeamPlayerStart> It(World); It; ++It)
@@ -304,16 +491,32 @@ AActor* ATraceGameMode::ChoosePlayerStart_Implementation(AController* Player)
 			continue;
 		}
 
-		AnyStarts.Add(Start);
+		const bool bIsEndzonePad = Start->ActorHasTag(TraceGameModeConstants::EndzoneStartTag);
+
+		// An endzone pad is never a generic fallback: it is deep in a scoring volume, which is the
+		// last place a teamless spectator-ish pawn should materialise.
+		if (!bIsEndzonePad)
+		{
+			AnyStarts.Add(Start);
+		}
+
 		if (Team != ETraceTeam::None && Start->Team == Team)
 		{
-			TeamStarts.Add(Start);
+			if (bIsEndzonePad)
+			{
+				EndzoneTeamStarts.Add(Start);
+			}
+			else
+			{
+				TeamStarts.Add(Start);
+			}
 		}
 	}
 
-	// Teamless players (or a level with no team starts) fall back to any Trace start, then to the
-	// engine's default APlayerStart selection.
-	const TArray<ATraceTeamPlayerStart*>& Pool = (TeamStarts.Num() > 0) ? TeamStarts : AnyStarts;
+	const TArray<ATraceTeamPlayerStart*>& Pool =
+		(bRespawnInOwnEndzone && EndzoneTeamStarts.Num() > 0) ? EndzoneTeamStarts :
+		(TeamStarts.Num() > 0) ? TeamStarts : AnyStarts;
+
 	if (Pool.Num() == 0)
 	{
 		return Super::ChoosePlayerStart_Implementation(Player);
@@ -556,8 +759,20 @@ void ATraceGameMode::NotifyCharacterDied(ATraceCharacter* Victim, AController* K
 	//    replace the first death's timer, never race it.
 	if (VictimController != nullptr)
 	{
-		const float RespawnDelay = FMath::Max(TraceGameModeConstants::MinRespawnDelay, UTraceSettings::Get().RespawnDelay);
+		const float EffectiveRespawnDelay = FMath::Max(TraceGameModeConstants::MinRespawnDelay, RespawnDelay);
 		const TWeakObjectPtr<AController> WeakController(VictimController);
+
+		// Publish the deadline, not the duration: the death panel counts down against the same
+		// replicated server clock the match timer uses, so it can never disagree with the timer that
+		// actually fires. Guarded on the GameState because a death can outrace seamless travel.
+		if (VictimState != nullptr)
+		{
+			if (const ATraceGameState* ClockState = GetTraceGameState())
+			{
+				VictimState->RespawnEndServerTime =
+					static_cast<float>(ClockState->GetServerWorldTimeSeconds()) + EffectiveRespawnDelay;
+			}
+		}
 
 		// Drop entries whose controller has been destroyed, so the map cannot grow across a long
 		// match of joins and leaves.
@@ -575,8 +790,16 @@ void ATraceGameMode::NotifyCharacterDied(ATraceCharacter* Victim, AController* K
 		GetWorldTimerManager().SetTimer(
 			RespawnHandle,
 			FTimerDelegate::CreateUObject(this, &ATraceGameMode::RespawnController, WeakController),
-			RespawnDelay,
+			EffectiveRespawnDelay,
 			false);
+	}
+
+	// 6. The wipe bonus (spec §1). Evaluated LAST, after the respawn above is on the clock, so the
+	//    "are they all down?" count is taken at the true instant of the fifth death — with four
+	//    teammates already waiting on timers and this one just added to them.
+	if (VictimState != nullptr)
+	{
+		EvaluateWipeBonus(VictimState->Team);
 	}
 }
 
@@ -643,32 +866,159 @@ void ATraceGameMode::RestartPlayerFresh(AController* Controller)
 	}
 
 	RestartPlayer(Controller);
+
+	// The player is breathing again, so retire their respawn countdown and re-arm the wipe bonus
+	// against their team. Both are done here rather than in RespawnController() because every path
+	// that hands out a fresh pawn — a timed respawn, a kickoff reset, the half-time reset — funnels
+	// through this function, and a latch that only cleared on the timed path would let one team be
+	// wiped "twice" without ever standing up in between.
+	if (ATracePlayerState* RestartedState = Controller->GetPlayerState<ATracePlayerState>())
+	{
+		RestartedState->RespawnEndServerTime = 0.f;
+
+		const ATraceCharacter* FreshCharacter = Cast<ATraceCharacter>(Controller->GetPawn());
+		if (FreshCharacter != nullptr && FreshCharacter->IsAlive())
+		{
+			ClearWipeLatchIfAlive(RestartedState->Team);
+		}
+	}
 }
 
-void ATraceGameMode::EnsurePlayersHavePawns()
+// ---------------------------------------------------------------------------------------------
+// Wipe bonus (spec §1)
+//
+// "Simultaneously" is interpreted as: the moment the fifth living enemy dies while the other four
+// are still on respawn timers. That is a state test, not an event window — at the instant the last
+// one falls, nobody on that team possesses a living pawn — which is both simpler and exactly right,
+// because a team can only be "all dead at once" by being all dead at once.
+// ---------------------------------------------------------------------------------------------
+
+int32 ATraceGameMode::CountLivingOnTeam(ETraceTeam Team) const
 {
-	UWorld* World = GetWorld();
-	if (World == nullptr || !HasAuthority())
+	if (Team == ETraceTeam::None)
+	{
+		return 0;
+	}
+
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return 0;
+	}
+
+	// Walked over controllers rather than TrackedCharacters because a player waiting on a respawn
+	// has NO pawn at all (RestartPlayerFresh destroys the corpse), and a roster of characters cannot
+	// tell "dead" apart from "never existed".
+	int32 Living = 0;
+	for (FConstControllerIterator It = World->GetControllerIterator(); It; ++It)
+	{
+		const AController* Controller = It->Get();
+		if (!IsValid(Controller))
+		{
+			continue;
+		}
+
+		const ATracePlayerState* State = Controller->GetPlayerState<ATracePlayerState>();
+		if (State == nullptr || State->IsOnlyASpectator() || State->Team != Team)
+		{
+			continue;
+		}
+
+		const ATraceCharacter* Character = Cast<ATraceCharacter>(Controller->GetPawn());
+		if (Character != nullptr && Character->IsAlive())
+		{
+			++Living;
+		}
+	}
+
+	return Living;
+}
+
+bool ATraceGameMode::IsWipeLatched(ETraceTeam Team) const
+{
+	switch (Team)
+	{
+	case ETraceTeam::Blue:   return bBlueWipeLatched;
+	case ETraceTeam::Orange: return bOrangeWipeLatched;
+	default:                 return true;   // No team can never be wiped; treat as already handled.
+	}
+}
+
+void ATraceGameMode::SetWipeLatched(ETraceTeam Team, bool bLatched)
+{
+	switch (Team)
+	{
+	case ETraceTeam::Blue:   bBlueWipeLatched = bLatched; break;
+	case ETraceTeam::Orange: bOrangeWipeLatched = bLatched; break;
+	default: break;
+	}
+}
+
+void ATraceGameMode::ClearWipeLatchIfAlive(ETraceTeam Team)
+{
+	if (Team == ETraceTeam::None || !IsWipeLatched(Team))
 	{
 		return;
 	}
 
-	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	if (CountLivingOnTeam(Team) > 0)
 	{
-		APlayerController* PlayerController = It->Get();
-		if (!IsValid(PlayerController) || PlayerController->GetPawn() != nullptr)
-		{
-			continue;
-		}
+		SetWipeLatched(Team, false);
+		UE_LOG(LogTraceGame, Verbose, TEXT("Wipe latch on %s cleared; the bonus is armed again."),
+			*TraceTeamName(Team).ToString());
+	}
+}
 
-		// Genuine spectators must stay pawnless.
-		const APlayerState* ControllerPlayerState = PlayerController->GetPlayerState<APlayerState>();
-		if (ControllerPlayerState == nullptr || ControllerPlayerState->IsOnlyASpectator())
-		{
-			continue;
-		}
+void ATraceGameMode::EvaluateWipeBonus(ETraceTeam DeadTeam)
+{
+	if (!HasAuthority() || DeadTeam == ETraceTeam::None || WipeBonusPoints == 0)
+	{
+		return;
+	}
 
-		RestartPlayerFresh(PlayerController);
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	// Only live play pays. A warm-up scrum or a post-whistle tidy-up must not move the scoreboard,
+	// and the interval has no play in it at all.
+	if (TraceGameState->TraceMatchState != ETraceMatchState::InProgress || TraceGameState->IsHalfTimeBreak())
+	{
+		return;
+	}
+
+	if (IsWipeLatched(DeadTeam))
+	{
+		return;
+	}
+
+	// A team that has no members cannot be "wiped" — otherwise an empty side would pay a bonus every
+	// time anybody at all died.
+	if (TraceGameState->CountTeamMembers(DeadTeam) <= 0 || CountLivingOnTeam(DeadTeam) > 0)
+	{
+		return;
+	}
+
+	const ETraceTeam BonusTeam = TraceOpposingTeam(DeadTeam);
+	SetWipeLatched(DeadTeam, true);
+
+	TraceGameState->AddScore(BonusTeam, WipeBonusPoints);
+	TraceGameState->NotifyWipeBonus(BonusTeam);
+
+	UE_LOG(LogTraceGame, Display, TEXT("TEAM WIPE: %s is down to zero; %s +%d. Blue %d - Orange %d"),
+		*TraceTeamName(DeadTeam).ToString(), *TraceTeamName(BonusTeam).ToString(), WipeBonusPoints,
+		TraceGameState->BlueScore, TraceGameState->OrangeScore);
+
+	// A wipe can be the point that wins the match, but only if the mercy rule is switched on.
+	if (bEndMatchAtScoreToWin)
+	{
+		const int32 ScoreToWin = FMath::Max(1, UTraceSettings::Get().ScoreToWin);
+		if (TraceGameState->GetScore(BonusTeam) >= ScoreToWin)
+		{
+			FinishMatch(BonusTeam);
+		}
 	}
 }
 
@@ -689,32 +1039,66 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 		return;
 	}
 
-	// Warm-up and post-match carries still reset the field, but they never count.
-	const bool bCounts = (TraceGameState->TraceMatchState == ETraceMatchState::InProgress);
+	// Warm-up, the interval and post-match carries still reset the field, but they never count.
+	const bool bCounts = (TraceGameState->TraceMatchState == ETraceMatchState::InProgress)
+		&& !TraceGameState->IsHalfTimeBreak();
+
 	if (bCounts)
 	{
 		TraceGameState->AddScore(ScoringTeam, 1);
-		UE_LOG(LogTraceGame, Log, TEXT("%s scored. Blue %d - Orange %d"),
-			*TraceTeamName(ScoringTeam).ToString(), TraceGameState->BlueScore, TraceGameState->OrangeScore);
+		UE_LOG(LogTraceGame, Log, TEXT("%s scored (%s). Blue %d - Orange %d"),
+			*TraceTeamName(ScoringTeam).ToString(), *TraceGameState->GetHalfLabel(),
+			TraceGameState->BlueScore, TraceGameState->OrangeScore);
 	}
 
-	// Reset the Core first: it detaches from the carrier and clears their carrying state (and with
-	// it the trail) before we start moving pawns around.
-	if (ATraceCore* TheCore = TraceGameState->Core)
-	{
-		TheCore->ResetToCenter();
-	}
-
-	ResetPlayersToSpawns();
-
-	if (bCounts)
+	// The mercy rule, if it is switched on at all, is decided before anything is restarted: there is
+	// no point kicking off into a match that has just ended.
+	if (bCounts && bEndMatchAtScoreToWin)
 	{
 		const int32 ScoreToWin = FMath::Max(1, UTraceSettings::Get().ScoreToWin);
 		if (TraceGameState->GetScore(ScoringTeam) >= ScoreToWin)
 		{
+			// Still put everyone back on their pads: the results screen looks past the players, and
+			// leaving ten pawns piled in one endzone behind it reads as the game having frozen.
+			ResetPlayersToSpawns();
 			FinishMatch(ScoringTeam);
+			return;
 		}
 	}
+
+	// Kickoff, then the reset. Both orders release the outgoing holder (and with them the trace);
+	// this one also gets the grant delay lined up with the teleport — see GrantCoreToTeam.
+	//
+	// The Core only goes back into play while there IS play: after the whistle, and during the
+	// interval, it stays out so nothing can be carried into a results screen or a side switch.
+	if (TraceGameState->TraceMatchState == ETraceMatchState::PostMatch || TraceGameState->IsHalfTimeBreak())
+	{
+		ReleaseCore();
+	}
+	else
+	{
+		switch (KickoffMode)
+		{
+		case ECoreKickoffMode::ScoredOnTeam:
+			// American-football logic, and the spec's stated assumption: the team that conceded
+			// restarts with the Core in their own endzone.
+			GrantCoreToTeam(TraceOpposingTeam(ScoringTeam));
+			break;
+
+		case ECoreKickoffMode::AlternateTeams:
+			GrantCoreToTeam((LastKickoffTeam == ETraceTeam::Blue) ? ETraceTeam::Orange : ETraceTeam::Blue);
+			break;
+
+		case ECoreKickoffMode::Neutral:
+		default:
+			// Nobody is granted it. With a status Core that means "out of play until the next
+			// event" rather than "loose on the ground", which no longer exists.
+			ReleaseCore();
+			break;
+		}
+	}
+
+	ResetPlayersToSpawns();
 }
 
 void ATraceGameMode::ResetPlayersToSpawns()
@@ -725,25 +1109,43 @@ void ATraceGameMode::ResetPlayersToSpawns()
 		return;
 	}
 
-	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	// Controllers, not player controllers: bots are AAIControllers and are never in the player
+	// controller list. Iterating only humans here would leave nine pawns standing where they were
+	// after every capture reset and at the start of the match.
+	//
+	// The list is a snapshot of AController pointers; RestartPlayerFresh below destroys and respawns
+	// *pawns*, never controllers, so it cannot invalidate the iteration.
+	TArray<AController*> Controllers;
+	Controllers.Reserve(16);
+	for (FConstControllerIterator It = World->GetControllerIterator(); It; ++It)
 	{
-		APlayerController* PlayerController = It->Get();
-		if (!IsValid(PlayerController))
+		if (AController* Controller = It->Get())
+		{
+			Controllers.Add(Controller);
+		}
+	}
+
+	for (AController* Controller : Controllers)
+	{
+		if (!IsValid(Controller))
 		{
 			continue;
 		}
 
-		ATraceCharacter* TraceCharacter = Cast<ATraceCharacter>(PlayerController->GetPawn());
+		// Null for a bot. Only the human half of the reset (the rotation RPC) needs it.
+		APlayerController* PlayerController = Cast<APlayerController>(Controller);
+
+		ATraceCharacter* TraceCharacter = Cast<ATraceCharacter>(Controller->GetPawn());
 
 		if (TraceCharacter == nullptr || !TraceCharacter->IsAlive())
 		{
 			// Dead or pawnless: hand them a brand new pawn at a freshly chosen start, and drop the
 			// pending respawn timer that would otherwise fire into an already-live player.
-			ClearPendingRespawn(PlayerController);
-			RestartPlayerFresh(PlayerController);
-			TraceCharacter = Cast<ATraceCharacter>(PlayerController->GetPawn());
+			ClearPendingRespawn(Controller);
+			RestartPlayerFresh(Controller);
+			TraceCharacter = Cast<ATraceCharacter>(Controller->GetPawn());
 		}
-		else if (AActor* StartSpot = FindPlayerStart(PlayerController))
+		else if (AActor* StartSpot = FindPlayerStart(Controller))
 		{
 			// AGameModeBase::RestartPlayerAtPlayerStart only re-possesses a pawn that already
 			// exists — it never moves it — so a living player has to be teleported by hand.
@@ -753,10 +1155,14 @@ void ATraceGameMode::ResetPlayersToSpawns()
 			StartRotation.Roll = 0.f;
 
 			TraceCharacter->TeleportTo(StartLocation, StartRotation);
-			PlayerController->SetControlRotation(StartRotation);
+			Controller->SetControlRotation(StartRotation);
 
-			// Control rotation is client-authoritative, so the client has to be told to turn.
-			PlayerController->ClientSetRotation(StartRotation, /*bResetCamera=*/true);
+			// Control rotation is client-authoritative, so the client has to be told to turn. Bots
+			// have no client and their controller writes its own aim every tick anyway.
+			if (PlayerController != nullptr)
+			{
+				PlayerController->ClientSetRotation(StartRotation, /*bResetCamera=*/true);
+			}
 		}
 
 		if (TraceCharacter == nullptr)
@@ -784,6 +1190,334 @@ void ATraceGameMode::ResetPlayersToSpawns()
 		TraceCharacter->ApplyTeamColors();
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// Bots
+//
+// The whole singleplayer mode is this section plus ATraceBotController. Bots are ordinary
+// AControllers with ordinary ATracePlayerStates possessing the ordinary DefaultPawnClass, so they
+// need no special cases anywhere else: ChoosePlayerStart already keys off the PlayerState team,
+// NotifyCharacterDied already schedules a respawn per AController (not per APlayerController), and
+// the HUD scoreboard already walks GameState->PlayerArray. That is deliberate — the moment a bot
+// needs its own code path in a rules file, the rules stop being verifiable against the bots.
+// ---------------------------------------------------------------------------------------------
+
+bool ATraceGameMode::AreBotsEnabled() const
+{
+	if (BotCountFromURL == 0)
+	{
+		return false;
+	}
+	if (BotCountFromURL > 0)
+	{
+		return true;
+	}
+	return UTraceSettings::Get().bFillTeamsWithBots;
+}
+
+void ATraceGameMode::ScheduleBotFill()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimerForNextTick(this, &ATraceGameMode::UpdateBotFill);
+	}
+}
+
+int32 ATraceGameMode::CountBotsOnTeam(ETraceTeam Team) const
+{
+	int32 Count = 0;
+	for (const TWeakObjectPtr<ATraceBotController>& WeakBot : Bots)
+	{
+		const ATraceBotController* Bot = WeakBot.Get();
+		if (Bot == nullptr)
+		{
+			continue;
+		}
+		if (const ATracePlayerState* BotState = Bot->GetPlayerState<ATracePlayerState>())
+		{
+			if (BotState->Team == Team)
+			{
+				++Count;
+			}
+		}
+	}
+	return Count;
+}
+
+void ATraceGameMode::CompactBots()
+{
+	Bots.RemoveAll([](const TWeakObjectPtr<ATraceBotController>& WeakBot)
+	{
+		return !WeakBot.IsValid();
+	});
+}
+
+void ATraceGameMode::UpdateBotFill()
+{
+	if (!HasAuthority() || GetWorld() == nullptr)
+	{
+		return;
+	}
+
+	CompactBots();
+
+	const ATraceGameState* TraceGameState = GetGameState<ATraceGameState>();
+	if (TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	if (!AreBotsEnabled())
+	{
+		// Config or "?bots=0" turned the fill off after bots already existed (a live config change,
+		// or a travel). Clear them out rather than leaving a half-populated match.
+		for (const ETraceTeam Team : { ETraceTeam::Blue, ETraceTeam::Orange })
+		{
+			while (CountBotsOnTeam(Team) > 0)
+			{
+				RemoveOneBotFromTeam(Team);
+			}
+		}
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const int32 TeamCap = FMath::Max(1, Settings.PlayersPerTeam);
+
+	// A hard cap on total bots, from whichever of the three sources is tightest. The URL value is a
+	// total, the setting is a per-team target, and MaxBots is the safety net.
+	int32 TotalBotBudget = FMath::Max(0, Settings.MaxBots);
+	if (BotCountFromURL > 0)
+	{
+		TotalBotBudget = FMath::Min(TotalBotBudget, BotCountFromURL);
+	}
+
+	int32 SpawnedThisPass = 0;
+	int32 RemovedThisPass = 0;
+
+	for (const ETraceTeam Team : { ETraceTeam::Blue, ETraceTeam::Orange })
+	{
+		// BotsPerTeam < 0 means "fill to PlayersPerTeam", which is the self-correcting default: it
+		// is expressed as a *target roster size*, so humans joining and leaving are absorbed for
+		// free. A positive value is a literal bot count on top of whoever is there.
+		const int32 CurrentTotal = TraceGameState->CountTeamMembers(Team);
+		const int32 CurrentBots = CountBotsOnTeam(Team);
+		const int32 Humans = FMath::Max(0, CurrentTotal - CurrentBots);
+
+		const int32 DesiredBots = (Settings.BotsPerTeam < 0)
+			? FMath::Max(0, TeamCap - Humans)
+			: FMath::Clamp(Settings.BotsPerTeam, 0, FMath::Max(0, TeamCap - Humans));
+
+		for (int32 Removal = CurrentBots; Removal > DesiredBots; --Removal)
+		{
+			RemoveOneBotFromTeam(Team);
+			++RemovedThisPass;
+		}
+
+		for (int32 Addition = CurrentBots; Addition < DesiredBots; ++Addition)
+		{
+			if (Bots.Num() >= TotalBotBudget)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("Bot fill stopped at the MaxBots budget (%d); %s is short of PlayersPerTeam."),
+					TotalBotBudget, *TraceTeamName(Team).ToString());
+				break;
+			}
+
+			if (SpawnBotForTeam(Team) == nullptr)
+			{
+				break;
+			}
+			++SpawnedThisPass;
+		}
+	}
+
+	if (SpawnedThisPass > 0 || RemovedThisPass > 0)
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("Bot fill: +%d / -%d. Roster now Blue %d (%d bots) vs Orange %d (%d bots), %d players total."),
+			SpawnedThisPass, RemovedThisPass,
+			TraceGameState->CountTeamMembers(ETraceTeam::Blue), CountBotsOnTeam(ETraceTeam::Blue),
+			TraceGameState->CountTeamMembers(ETraceTeam::Orange), CountBotsOnTeam(ETraceTeam::Orange),
+			GetActivePlayerCount());
+
+		// Bots carry PlayerStates and therefore count towards MinPlayersToStart.
+		CheckMatchStartConditions();
+	}
+}
+
+ATraceBotController* ATraceGameMode::SpawnBotForTeam(ETraceTeam Team)
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority() || Team == ETraceTeam::None)
+	{
+		return nullptr;
+	}
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParams.ObjectFlags |= RF_Transient;   // Runtime scaffolding; never saved into a level.
+
+	UClass* ClassToSpawn = (BotControllerClass != nullptr) ? BotControllerClass.Get() : ATraceBotController::StaticClass();
+	ATraceBotController* Bot = World->SpawnActor<ATraceBotController>(ClassToSpawn, FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+	if (Bot == nullptr)
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("Failed to spawn a %s bot controller."), *TraceTeamName(Team).ToString());
+		return nullptr;
+	}
+
+	// ATraceBotController sets bWantsPlayerState, so AController::PostInitializeComponents has
+	// already created and registered the PlayerState by the time SpawnActor returns. If it has not,
+	// the bot is useless (no team, invisible to the scoreboard and to the team balancer), so bail
+	// loudly rather than leaving a mute actor wandering the field.
+	ATracePlayerState* BotState = Bot->GetPlayerState<ATracePlayerState>();
+	if (BotState == nullptr)
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("Bot controller spawned without an ATracePlayerState; destroying it."));
+		Bot->Destroy();
+		return nullptr;
+	}
+
+	BotState->SetTeam(Team);
+	Bot->SetBotDisplayName(FString::Printf(TEXT("BOT %s %d"), *TraceTeamName(Team).ToString(), NextBotNumber++));
+
+	Bots.Add(Bot);
+
+	// Same entry point humans go through, so the bot lands on a real team pad chosen by the same
+	// "furthest from a live enemy" rule.
+	RestartPlayer(Bot);
+
+	if (ATraceCharacter* BotCharacter = Cast<ATraceCharacter>(Bot->GetPawn()))
+	{
+		BotCharacter->ApplyTeamColors();
+
+		// A fresh body on a wiped team re-arms that team's wipe bonus, exactly as a respawn does.
+		// RestartPlayer() is called directly here rather than through RestartPlayerFresh(), so the
+		// latch clearing has to be repeated — a bot filling in for an evicted one would otherwise
+		// leave the latch stuck and cost the opposing team the next wipe they earn.
+		ClearWipeLatchIfAlive(Team);
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("Bot '%s' did not receive a pawn."), *BotState->GetPlayerName());
+	}
+
+	return Bot;
+}
+
+void ATraceGameMode::RemoveOneBotFromTeam(ETraceTeam Team)
+{
+	for (int32 Index = Bots.Num() - 1; Index >= 0; --Index)
+	{
+		ATraceBotController* Bot = Bots[Index].Get();
+		if (Bot == nullptr)
+		{
+			Bots.RemoveAt(Index);
+			continue;
+		}
+
+		const ATracePlayerState* BotState = Bot->GetPlayerState<ATracePlayerState>();
+		if (BotState == nullptr || BotState->Team != Team)
+		{
+			continue;
+		}
+
+		Bots.RemoveAt(Index);
+
+		// Reuse the human departure path so the Core cannot leave the match in a bot's hands and the
+		// trail cannot outlive its emitter.
+		Logout(Bot);
+
+		if (APawn* BotPawn = Bot->GetPawn())
+		{
+			Bot->UnPossess();
+			BotPawn->Destroy();
+		}
+
+		Bot->Destroy();
+		return;
+	}
+}
+
+void ATraceGameMode::FreeSlotForHuman()
+{
+	const ATraceGameState* TraceGameState = GetGameState<ATraceGameState>();
+	if (TraceGameState == nullptr || Bots.Num() == 0)
+	{
+		return;
+	}
+
+	const int32 TeamCap = FMath::Max(1, UTraceSettings::Get().PlayersPerTeam);
+	const int32 NumBlue = TraceGameState->CountTeamMembers(ETraceTeam::Blue);
+	const int32 NumOrange = TraceGameState->CountTeamMembers(ETraceTeam::Orange);
+
+	if (NumBlue < TeamCap || NumOrange < TeamCap)
+	{
+		return;   // There is already room somewhere; PickTeamForNewPlayer will find it.
+	}
+
+	// Both full. Take the slot from whichever side still has a bot to give, preferring the larger
+	// side so the eviction cannot itself unbalance the teams.
+	const ETraceTeam First = (NumOrange >= NumBlue) ? ETraceTeam::Orange : ETraceTeam::Blue;
+	const ETraceTeam Second = TraceOpposingTeam(First);
+
+	if (CountBotsOnTeam(First) > 0)
+	{
+		RemoveOneBotFromTeam(First);
+	}
+	else if (CountBotsOnTeam(Second) > 0)
+	{
+		RemoveOneBotFromTeam(Second);
+	}
+	else
+	{
+		return;   // Ten humans. Nothing to evict; the newcomer legitimately has no slot.
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("Evicted a bot to make room for a human."));
+}
+
+#if !UE_BUILD_SHIPPING
+void ATraceGameMode::LogBotRoster()
+{
+	const ATraceGameState* TraceGameState = GetGameState<ATraceGameState>();
+	if (TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	const ATraceCore* TheCore = GetCore();
+	const ATraceCharacter* TheCarrier = (TheCore != nullptr) ? TheCore->GetCarrier() : nullptr;
+
+	UE_LOG(LogTraceGame, Display, TEXT("[BotDebug] %d players | Blue %d Orange %d | core=%s carrier=%s"),
+		GetActivePlayerCount(),
+		TraceGameState->CountTeamMembers(ETraceTeam::Blue),
+		TraceGameState->CountTeamMembers(ETraceTeam::Orange),
+		(TheCore != nullptr) ? *TheCore->GetActorLocation().ToCompactString() : TEXT("<none>"),
+		(TheCarrier != nullptr) ? *GetNameSafe(TheCarrier->GetPlayerState<ATracePlayerState>()) : TEXT("<loose>"));
+
+	for (const TWeakObjectPtr<ATraceCharacter>& WeakCharacter : TrackedCharacters)
+	{
+		const ATraceCharacter* Character = WeakCharacter.Get();
+		if (Character == nullptr)
+		{
+			continue;
+		}
+
+		const ATracePlayerState* State = Character->GetPlayerState<ATracePlayerState>();
+		const ATraceBotController* Bot = Cast<ATraceBotController>(Character->GetController());
+
+		UE_LOG(LogTraceGame, Display, TEXT("[BotDebug]   %-16s %-6s %-14s pos=%s speed=%.0f %s%s"),
+			(State != nullptr) ? *State->GetPlayerName() : TEXT("<no state>"),
+			(State != nullptr) ? *TraceTeamName(State->Team).ToString() : TEXT("?"),
+			(Bot != nullptr) ? ATraceBotController::StateToString(Bot->GetBotState()) : TEXT("HUMAN"),
+			*Character->GetActorLocation().ToCompactString(),
+			Character->GetVelocity().Size2D(),
+			Character->IsAlive() ? TEXT("") : TEXT("[DEAD] "),
+			Character->IsCarrier() ? TEXT("[CARRIER]") : TEXT(""));
+	}
+}
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Match phase machine
@@ -892,36 +1626,300 @@ void ATraceGameMode::BeginMatch()
 
 	GetWorldTimerManager().ClearTimer(WarmupTimerHandle);
 
-	const float MatchDuration = FMath::Max(1.f, UTraceSettings::Get().MatchDuration);
-
 	// Warm-up goals do not count, but nothing stops the scores being non-zero if the settings were
-	// changed live, so start from a known state.
+	// changed live, so start from a known state. Scores carry ACROSS halves (spec §9 q5) — they are
+	// only cleared here, once, at the opening whistle.
 	TraceGameState->BlueScore = 0;
 	TraceGameState->OrangeScore = 0;
 	TraceGameState->OnRep_Scores();
 
 	TraceGameState->TraceMatchState = ETraceMatchState::InProgress;
-	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + MatchDuration);
 	TraceGameState->ForceNetUpdate();
 
-	if (ATraceCore* TheCore = TraceGameState->Core)
+	bBlueWipeLatched = false;
+	bOrangeWipeLatched = false;
+	LastKickoffTeam = ETraceTeam::None;
+
+	BeginHalf(1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Halves and sides (spec §1)
+// ---------------------------------------------------------------------------------------------
+
+ETraceTeam ATraceGameMode::GetNegativeSideTeamForHalf(int32 HalfIndex) const
+{
+	// The arena is PAINTED with Blue at -X, so odd halves are played the way the field looks and
+	// even halves are the swap. Expressed as parity rather than "if half == 2" so raising
+	// HalvesPerMatch keeps alternating instead of silently sticking.
+	const bool bSwapped = (FMath::Max(1, HalfIndex) % 2) == 0;
+	const ETraceTeam PaintedNegativeSideTeam = ETraceTeam::Blue;
+
+	return bSwapped ? TraceOpposingTeam(PaintedNegativeSideTeam) : PaintedNegativeSideTeam;
+}
+
+ETraceTeam ATraceGameMode::GetKickoffTeamForHalf(int32 HalfIndex) const
+{
+	// "The core starts with Team A in the first half, Team B in the second."
+	const ETraceTeam TeamA = (FirstHalfCoreTeam == ETraceTeam::None) ? ETraceTeam::Blue : FirstHalfCoreTeam;
+	const bool bTeamB = (FMath::Max(1, HalfIndex) % 2) == 0;
+
+	return bTeamB ? TraceOpposingTeam(TeamA) : TeamA;
+}
+
+void ATraceGameMode::ApplyTeamSides(ETraceTeam TeamOnNegativeSide)
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority() || TeamOnNegativeSide == ETraceTeam::None)
 	{
-		TheCore->ResetToCenter();
+		return;
 	}
+
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	// Publish first. Everything that asks "which way do I attack?" — bots, the HUD, anything added
+	// later — reads the GameState, so it must be correct before the actors below start moving.
+	TraceGameState->SetTeamSides(TeamOnNegativeSide);
+
+	// The field runs goal to goal along X and GetFieldBounds() is an axis-aligned world box, so an
+	// actor's side is the sign of its X relative to the field centre. Deriving it geometrically
+	// rather than from the actor's previous Team is what makes this idempotent: calling it twice
+	// with the same argument is a no-op, and calling it with the other argument is an exact swap,
+	// however many times the sides have already been switched.
+	float CentreX = 0.f;
+	if (ArenaBuilder != nullptr)
+	{
+		CentreX = static_cast<float>(ArenaBuilder->GetFieldBounds().GetCenter().X);
+	}
+
+	int32 ZonesRepointed = 0;
+	for (TActorIterator<ATraceEndzone> It(World); It; ++It)
+	{
+		ATraceEndzone* Zone = *It;
+		if (!IsValid(Zone))
+		{
+			continue;
+		}
+
+		// ATraceEndzone::OwningTeam is the team that DEFENDS the zone; its opponent scores in it.
+		Zone->OwningTeam = TraceGameState->GetTeamDefendingEnd(Zone->GetActorLocation().X - CentreX);
+		++ZonesRepointed;
+	}
+
+	int32 StartsRepointed = 0;
+	for (TActorIterator<ATraceTeamPlayerStart> It(World); It; ++It)
+	{
+		ATraceTeamPlayerStart* Start = *It;
+		if (!IsValid(Start))
+		{
+			continue;
+		}
+
+		// A spawn pad belongs to the team that DEFENDS the end it sits at — you spawn at home, both
+		// on the builder's pads and on the endzone pads this class adds.
+		Start->Team = TraceGameState->GetTeamDefendingEnd(Start->GetActorLocation().X - CentreX);
+		++StartsRepointed;
+	}
+
+	// Repaint the arena to match. On a listen host this is the server's own view; remote clients get
+	// there through ATraceGameState::OnRep_SidesChanged, because the builder is not replicated.
+	ATraceArenaBuilder::ApplyTeamSidesInWorld(World, TeamOnNegativeSide);
+
+	UE_LOG(LogTraceGame, Log, TEXT("Sides set: %s defends -X, %s defends +X (%d endzones, %d spawn pads re-pointed)."),
+		*TraceTeamName(TeamOnNegativeSide).ToString(),
+		*TraceTeamName(TraceOpposingTeam(TeamOnNegativeSide)).ToString(),
+		ZonesRepointed, StartsRepointed);
+}
+
+bool ATraceGameMode::IsSpawnLocationBlocked(const FVector& Location) const
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return false;
+	}
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceEndzoneSpawnProbe), /*bTraceComplex=*/false);
+	Params.bIgnoreTouches = true;
+
+	return World->OverlapBlockingTestByChannel(
+		Location, FQuat::Identity, ECC_Pawn,
+		FCollisionShape::MakeCapsule(TraceGameModeConstants::SpawnProbeRadius, TraceGameModeConstants::SpawnProbeHalfHeight),
+		Params);
+}
+
+void ATraceGameMode::BuildEndzoneSpawnPads()
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority() || !bRespawnInOwnEndzone)
+	{
+		return;
+	}
+
+	// Idempotent: called from both PreInitializeComponents and BeginPlay, and a second set of pads
+	// would double every team's spawn choices for no benefit.
+	EndzoneStarts.RemoveAll([](const TWeakObjectPtr<ATraceTeamPlayerStart>& Weak) { return !Weak.IsValid(); });
+	if (EndzoneStarts.Num() > 0)
+	{
+		return;
+	}
+
+	if (ArenaBuilder == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("No arena builder; respawns fall back to the generic team pads."));
+		return;
+	}
+
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	const FBox Bounds = ArenaBuilder->GetFieldBounds();
+	const FVector Centre = Bounds.GetCenter();
+	const float HalfX = FMath::Max(1.f, static_cast<float>(Bounds.Max.X - Bounds.Min.X) * 0.5f);
+	const float Depth = FMath::Clamp(ArenaBuilder->EndzoneDepth, 100.f, HalfX);
+
+	// Mid-endzone: half a depth in from the end wall, half a depth behind the goal line. The gate
+	// towers and the goal line itself stand ON the line, so the middle of the box is the one part of
+	// an endzone with nothing built in it.
+	const float PadInsetFromCentre = HalfX - Depth * 0.5f;
+
+	// The arena builder's own pads are the source of lateral spread, height and facing. Reusing them
+	// means a pad line that has already been checked against every cover block in the arena, and it
+	// costs nothing: only the X coordinate moves.
+	TArray<ATraceTeamPlayerStart*> Templates;
+	for (TActorIterator<ATraceTeamPlayerStart> It(World); It; ++It)
+	{
+		ATraceTeamPlayerStart* Start = *It;
+		if (IsValid(Start) && !Start->ActorHasTag(TraceGameModeConstants::EndzoneStartTag))
+		{
+			Templates.Add(Start);
+		}
+	}
+
+	if (Templates.Num() == 0)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("No arena spawn pads to derive endzone respawns from."));
+		return;
+	}
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParams.ObjectFlags |= RF_Transient;   // Runtime scaffolding; never saved into a level.
+
+	int32 Placed = 0;
+	int32 Skipped = 0;
+
+	for (const ATraceTeamPlayerStart* Template : Templates)
+	{
+		const FVector TemplateLocation = Template->GetActorLocation();
+		const float Sign = (TemplateLocation.X - Centre.X < 0.f) ? -1.f : 1.f;
+
+		// Walk from mid-endzone back towards the goal line until the capsule fits. In the shipped
+		// arena the first candidate is always clear; the walk exists so that changing EndzoneDepth
+		// or adding endzone furniture degrades into a slightly shallower pad instead of spawning a
+		// pawn inside a wall.
+		FVector Candidate(Centre.X + Sign * PadInsetFromCentre, TemplateLocation.Y, TemplateLocation.Z);
+		bool bPlaced = false;
+
+		for (int32 Step = 0; Step <= TraceGameModeConstants::SpawnProbeSteps; ++Step)
+		{
+			Candidate.X = Centre.X + Sign * (PadInsetFromCentre
+				- Depth * TraceGameModeConstants::SpawnProbeStepFraction * static_cast<float>(Step));
+
+			if (!IsSpawnLocationBlocked(Candidate))
+			{
+				bPlaced = true;
+				break;
+			}
+		}
+
+		if (!bPlaced)
+		{
+			++Skipped;
+			continue;
+		}
+
+		ATraceTeamPlayerStart* Pad = World->SpawnActor<ATraceTeamPlayerStart>(
+			ATraceTeamPlayerStart::StaticClass(), Candidate, Template->GetActorRotation(), SpawnParams);
+
+		if (Pad == nullptr)
+		{
+			++Skipped;
+			continue;
+		}
+
+		Pad->Tags.Add(TraceGameModeConstants::EndzoneStartTag);
+		Pad->Team = TraceGameState->GetTeamDefendingEnd(Sign);
+		EndzoneStarts.Add(Pad);
+		++Placed;
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("Endzone respawn pads: %d placed, %d skipped (blocked)."), Placed, Skipped);
+}
+
+void ATraceGameMode::BeginHalf(int32 HalfIndex)
+{
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr || TraceGameState->TraceMatchState != ETraceMatchState::InProgress)
+	{
+		return;
+	}
+
+	const int32 Halves = FMath::Max(1, HalvesPerMatch);
+	const int32 ClampedHalf = FMath::Clamp(HalfIndex, 1, Halves);
+	const float Duration = FMath::Max(1.f, HalfDuration);
+
+	GetWorldTimerManager().ClearTimer(HalfTimeTimerHandle);
+	GetWorldTimerManager().ClearTimer(MatchTimerHandle);
+
+	// A period of play opens with both wipe bonuses armed. The reset below stands everybody up, so a
+	// latch carried in from the previous half would describe a team that is no longer down.
+	bBlueWipeLatched = false;
+	bOrangeWipeLatched = false;
+
+	TraceGameState->SetHalfState(ClampedHalf, Halves, /*bInHalfTimeBreak=*/false);
+	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + Duration);
+	TraceGameState->ForceNetUpdate();
+
+	// Sides are already correct for half 1 (set in PreInitializeComponents) and for half 2 (set the
+	// moment the interval began), but assert them here anyway: this is the one function that starts
+	// a period of play, and it must not depend on who called it to be correct.
+	ApplyTeamSides(GetNegativeSideTeamForHalf(ClampedHalf));
+
+	// Kickoff first, pawns second: ATraceCore::KickoffTo holds the grant back for a moment exactly
+	// so the receiver is already standing on their new pad when it lands.
+	GrantCoreToTeam(GetKickoffTeamForHalf(ClampedHalf));
 	ResetPlayersToSpawns();
 
 	// The authoritative deadline is the replicated MatchEndServerTime; this timer is merely what
 	// fires on it server-side. Clients count down against the shared clock instead.
-	GetWorldTimerManager().SetTimer(MatchTimerHandle, this, &ATraceGameMode::HandleMatchTimeExpired, MatchDuration, false);
+	GetWorldTimerManager().SetTimer(MatchTimerHandle, this, &ATraceGameMode::HandleHalfExpired, Duration, false);
 
-	UE_LOG(LogTraceGame, Log, TEXT("Match started (%.0fs, first to %d)."), MatchDuration, UTraceSettings::Get().ScoreToWin);
+	UE_LOG(LogTraceGame, Log, TEXT("%s started: %.0fs, %s kicks off, %s defends -X. Blue %d - Orange %d"),
+		*TraceGameState->GetHalfLabel(), Duration,
+		*TraceTeamName(GetKickoffTeamForHalf(ClampedHalf)).ToString(),
+		*TraceTeamName(GetNegativeSideTeamForHalf(ClampedHalf)).ToString(),
+		TraceGameState->BlueScore, TraceGameState->OrangeScore);
 }
 
-void ATraceGameMode::HandleMatchTimeExpired()
+void ATraceGameMode::HandleHalfExpired()
 {
 	const ATraceGameState* TraceGameState = GetTraceGameState();
 	if (TraceGameState == nullptr || TraceGameState->TraceMatchState != ETraceMatchState::InProgress)
 	{
+		return;
+	}
+
+	if (TraceGameState->CurrentHalf < FMath::Max(1, HalvesPerMatch))
+	{
+		BeginHalfTimeBreak();
 		return;
 	}
 
@@ -938,6 +1936,107 @@ void ATraceGameMode::HandleMatchTimeExpired()
 	FinishMatch(Winner);
 }
 
+void ATraceGameMode::BeginHalfTimeBreak()
+{
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr || TraceGameState->TraceMatchState != ETraceMatchState::InProgress
+		|| TraceGameState->IsHalfTimeBreak())
+	{
+		return;
+	}
+
+	GetWorldTimerManager().ClearTimer(MatchTimerHandle);
+
+	const float BreakDuration = FMath::Max(1.f, HalfTimeBreakDuration);
+	const int32 NextHalf = TraceGameState->CurrentHalf + 1;
+
+	TraceGameState->SetHalfState(TraceGameState->CurrentHalf, FMath::Max(1, HalvesPerMatch), /*bInHalfTimeBreak=*/true);
+	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + BreakDuration);
+	TraceGameState->ForceNetUpdate();
+
+	// The switch happens NOW, at the top of the interval, not at the bottom of it. Spending the
+	// break stood in the end you are about to defend, looking at the goal you are about to attack,
+	// is the entire reason the interval is on screen — a swap that happened the instant play resumed
+	// would be a swap nobody saw.
+	ApplyTeamSides(GetNegativeSideTeamForHalf(NextHalf));
+
+	ReleaseCore();
+	ResetPlayersToSpawns();
+
+	// The scores deliberately survive: the second half continues the first (spec §9 q5).
+	UE_LOG(LogTraceGame, Display, TEXT("HALF TIME (%.0fs). Sides switch: %s now defends -X. Blue %d - Orange %d"),
+		BreakDuration, *TraceTeamName(GetNegativeSideTeamForHalf(NextHalf)).ToString(),
+		TraceGameState->BlueScore, TraceGameState->OrangeScore);
+
+	GetWorldTimerManager().SetTimer(HalfTimeTimerHandle, this, &ATraceGameMode::EndHalfTimeBreak, BreakDuration, false);
+}
+
+void ATraceGameMode::EndHalfTimeBreak()
+{
+	const ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr || !TraceGameState->IsHalfTimeBreak())
+	{
+		return;
+	}
+
+	BeginHalf(TraceGameState->CurrentHalf + 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Core possession
+//
+// The only two places this class touches ATraceCore. See the header: the Core is being rewritten
+// from a physical actor into a replicated possession status, and confining every call to these two
+// functions is what keeps that a local edit.
+// ---------------------------------------------------------------------------------------------
+
+void ATraceGameMode::ReleaseCore()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	if (ATraceCore* TheCore = GetCore())
+	{
+		// "Out of play": no holder, parked at the centre. ETraceTeam::None is the argument that says
+		// so, and it is the same call as a kickoff precisely so the Core has one entry point.
+		//
+		// INTEGRATION NOTE: ATraceCore::KickoffTo currently rewrites a None argument into its own
+		// TraceCoreTuning::DefaultKickoffTeam, so today this parks the Core and then grants it to
+		// Blue a second later. That is wrong during the interval and after the whistle. The fix is
+		// two lines in TraceCore.cpp and is written out in this pass's report; the call site here is
+		// already correct and needs no change when it lands.
+		TheCore->KickoffTo(ETraceTeam::None);
+	}
+}
+
+void ATraceGameMode::GrantCoreToTeam(ETraceTeam Team)
+{
+	if (!HasAuthority() || Team == ETraceTeam::None)
+	{
+		return;
+	}
+
+	ATraceCore* TheCore = GetCore();
+	if (TheCore == nullptr)
+	{
+		return;
+	}
+
+	// KickoffTo releases the outgoing holder, parks the Core and queues the grant behind a short
+	// delay. The delay is the reason this is called BEFORE the pawns are teleported rather than
+	// after: granting first and moving second would lay a trace across the teleport.
+	//
+	// Which player on the team receives it is ATraceCore's decision (nearest to the Core's home
+	// among the living). After a reset every candidate is stood on a pad in their own endzone, so
+	// any of them is a legitimate kickoff receiver.
+	TheCore->KickoffTo(Team);
+	LastKickoffTeam = Team;
+
+	UE_LOG(LogTraceGame, Log, TEXT("Kickoff: the Core goes to %s."), *TraceTeamName(Team).ToString());
+}
+
 void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam)
 {
 	ATraceGameState* TraceGameState = GetTraceGameState();
@@ -946,16 +2045,45 @@ void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam)
 		return;
 	}
 
+	// Every clock this class owns stops here, including the interval — a FinishMatch triggered early
+	// (a mercy-rule win, a forfeit) during half time must not have the second half start underneath
+	// the results screen. That would be the restart loop the contract forbids, wearing a new hat.
 	GetWorldTimerManager().ClearTimer(WarmupTimerHandle);
 	GetWorldTimerManager().ClearTimer(MatchTimerHandle);
+	GetWorldTimerManager().ClearTimer(HalfTimeTimerHandle);
 
 	TraceGameState->TraceMatchState = ETraceMatchState::PostMatch;
+	TraceGameState->SetHalfState(TraceGameState->CurrentHalf, FMath::Max(1, HalvesPerMatch), /*bInHalfTimeBreak=*/false);
 	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds());
 	TraceGameState->ForceNetUpdate();
+
+	// The objective leaves the field with the whistle: nobody should be able to "score" into the
+	// results screen, and the reset that follows a goal would fight the post-match state.
+	ReleaseCore();
 
 	// Players keep their pawns and keep respawning after the whistle — the HUD switches to the FINAL
 	// banner, and leaving everyone alive means nobody is staring at a corpse on the results screen.
 	UE_LOG(LogTraceGame, Log, TEXT("Match over. Winner: %s (Blue %d - Orange %d)"),
 		(WinningTeam == ETraceTeam::None) ? TEXT("draw") : *TraceTeamName(WinningTeam).ToString(),
 		TraceGameState->BlueScore, TraceGameState->OrangeScore);
+
+	// PostMatch is a phase with an exit, not a dead end. The HUD renders the same countdown from
+	// the same constant, so what the player is told is what actually happens.
+	GetWorldTimerManager().SetTimer(ReturnToMenuTimerHandle, this, &ATraceGameMode::ReturnToMainMenu,
+		TraceMatchFlow::PostMatchDuration, false);
+}
+
+void ATraceGameMode::ReturnToMainMenu()
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority())
+	{
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("Post-match window elapsed; returning to %s."), TraceMaps::MainMenu);
+
+	// Absolute travel: the menu runs a different game mode on a different map, and a relative
+	// travel would carry this match's URL options (?difficulty=, ?bots=) into it.
+	UGameplayStatics::OpenLevel(World, FName(TraceMaps::MainMenu), /*bAbsolute=*/true);
 }

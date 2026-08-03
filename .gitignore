@@ -139,6 +139,27 @@ $RECYCLE.BIN/
 .Trash-*
 
 # ------------------------------------------------------------------------------
+# Imported engine art — NOT ours, NOT committed.
+#
+# Scripts/import-mannequin.sh copies Epic's Mannequin (skeletal meshes, skeleton,
+# animations, ABP_Unarmed, materials, textures — ~126 MB) out of each developer's
+# own UE 5.8 install into Content/Characters/Mannequins, where the assets' own
+# embedded /Game references require them to be.
+#
+# Everyone is pinned to the same engine version, so everyone gets byte-identical
+# files. Importing them beats committing them: the repo stays text-only, there is
+# no LFS bill, and nothing here is content we authored or may redistribute.
+#
+# Run Scripts/import-mannequin.sh after cloning. Without it the game still runs —
+# ATraceCharacter falls back to a team-coloured capsule and logs a warning.
+#
+# Scoped to the imported folder only, and anchored to the repo root, so the rest
+# of Content/ (notably /Content/Maps/Arena.umap, which IS ours and IS tracked)
+# is untouched.
+# ------------------------------------------------------------------------------
+/Content/Characters/
+
+# ------------------------------------------------------------------------------
 # Explicitly kept (belt-and-braces, and documentation for the next person).
 # These are anchored to the repo root and re-include nothing that is ignored
 # above — they exist so a careless future edit is obvious in review.
@@ -148,3 +169,8 @@ $RECYCLE.BIN/
 !/Scripts/
 !/.gitattributes
 !/.gitignore
+
+# Generated art (Scripts/generate_content.py). Binary, regenerated per developer
+# from the pinned UE 5.8.1 install - never committed. See the asset policy in
+# Scripts/generate_content.py.
+/Content/Generated/
