@@ -118,6 +118,20 @@ public:
 	/** True while the trace is inside the holder's pass window and cannot be broken (§4). */
 	bool IsTraceInvulnerable() const;
 
+	/**
+	 * THE VISIBLE == LETHAL INVARIANT, in one function.
+	 *
+	 * Returns the highest index in TrailPoints that takes part in the lethal set. Everything from
+	 * 0 to this index inclusive both KILLS (ServerRunTripTest) and is DRAWN (RebuildVisuals);
+	 * everything newer than it does neither. -1 means the trace is too young to be either.
+	 *
+	 * It is deliberately a pure function of the replicated state (TrailPoints, bEmitting) plus
+	 * UTraceSettings, so the server's answer and every client's answer are the same answer. A
+	 * segment that cannot kill must never be on screen looking like it can - that mismatch is
+	 * precisely the "I dashed through the trace and nothing happened" bug.
+	 */
+	int32 ComputeLastLethalIndex() const;
+
 	/** Called by ATraceCore when the pass window opens or closes, so the visuals react at once. */
 	void NotifyInvulnerabilityChanged();
 
@@ -161,6 +175,13 @@ private:
 
 	/** Scratch copy of the testable point locations, so the trip test never touches Items mid-loop. */
 	TArray<FVector> TestPositions;
+
+	/**
+	 * Scratch copy of the newest, NON-lethal stub of the trace (the emitter's own footprint). Not
+	 * drawn and not lethal; kept only so the trip test can report a dash that crossed it, which is
+	 * the difference between "the fix works" and "I hope the fix works".
+	 */
+	TArray<FVector> ExemptPositions;
 
 	// ------------------------------------------------------------------------------------------
 	// Visuals (client + listen server; never created on a dedicated server)
@@ -223,6 +244,13 @@ private:
 	/** Last invulnerability state the visuals were built for; a change forces a rebuild. */
 	bool bLastVisualInvulnerable = false;
 
+	/**
+	 * Last emission state the visuals were built for. It is part of the change detection because
+	 * ComputeLastLethalIndex() depends on it: the moment a holder stops emitting, the stub under
+	 * their feet becomes lethal and must therefore become visible on the same frame.
+	 */
+	bool bLastVisualEmitting = false;
+
 	/** World time until which visuals stay hidden after a MulticastClearTrail (0 = not suppressed). */
 	float VisualSuppressUntilTime = 0.f;
 
@@ -251,6 +279,18 @@ private:
 
 	/** Server: swept enemy-dash trip test against the trace. */
 	void ServerRunTripTest(float DeltaTime);
+
+	/**
+	 * Server: does the capsule swept from @p PreviousLocation to @p CurrentLocation this tick touch
+	 * the polyline @p Positions? Horizontal segment-to-segment distance plus a vertical overlap
+	 * test, exactly as the trip test has always done it — factored out so the LETHAL set and the
+	 * exempt head stub can be asked the same question, which is what makes the instrumentation
+	 * ("a dash crossed the trace but did not kill, and here is why") possible at all.
+	 *
+	 * A single-point polyline is tested as a degenerate segment, so a two-point trace is lethal.
+	 */
+	bool SweepIntersectsTrace(const TArray<FVector>& Positions, const FVector& PreviousLocation,
+		const FVector& CurrentLocation, double HorizontalThreshold, double VerticalThreshold) const;
 
 	/** Server: applies UTraceSettings::TrailLethality. Called only after the trip loops finish. */
 	void ApplyTrailTrip(ATraceCharacter* Holder, ATraceCharacter* Tripper);

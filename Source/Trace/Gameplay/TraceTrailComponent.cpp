@@ -275,10 +275,15 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 		// §3: the trace dies with its holder, instantly. ATraceCore drives this in the normal flow;
 		// this is the safety net so a trace can never outlive the body that owns it and go on
 		// killing a corpse.
-		if (bEmitting)
+		//
+		// Checked whether or not this component is still emitting. A trace kills the player who
+		// LAID it, so once that player is dead it can never kill anyone again — and by the
+		// visible == lethal invariant a set of points that can never kill must not be on screen.
+		// (Before, this was inside an `if (bEmitting)`, so a holder who passed the Core away and
+		// then died left their trace hanging in the air, visible and completely inert.)
 		{
 			const ATraceCharacter* Holder = GetOwnerCharacter();
-			if (Holder == nullptr || !Holder->IsAlive())
+			if ((Holder == nullptr || !Holder->IsAlive()) && (bEmitting || TrailPoints.Items.Num() > 0))
 			{
 				SetEmitting(false);
 				ClearTrail();
@@ -386,6 +391,61 @@ bool UTraceTrailComponent::IsTraceInvulnerable() const
 void UTraceTrailComponent::NotifyInvulnerabilityChanged()
 {
 	bVisualsDirty = true;
+}
+
+int32 UTraceTrailComponent::ComputeLastLethalIndex() const
+{
+	const int32 PointCount = TrailPoints.Items.Num();
+	if (PointCount == 0)
+	{
+		return -1;
+	}
+
+	// Nobody is standing on the head of a trace that has stopped growing, so there is nothing to
+	// exempt: a residual trace left behind by a pass or a Core steal is lethal end to end. This is
+	// half of the reported bug — see ServerRunTripTest for the other half.
+	if (!bEmitting)
+	{
+		return PointCount - 1;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const int32 MaxExempt = FMath::Max(0, Settings.TrailHeadGracePoints);
+	if (MaxExempt == 0)
+	{
+		return PointCount - 1;   // Exemption switched off entirely.
+	}
+
+	// WHY THE HEAD EXEMPTION IS A DISTANCE, NOT A COUNT.
+	//
+	// It exists for exactly one reason: the newest point is under the holder's own feet, so without
+	// it a defender could stand on the emitter and dash on the spot instead of crossing anything.
+	// That is a claim about ONE BODY WIDTH of trace, and it is written here as one body width —
+	// TrailRadius, the lethal volume's own radius, measured back along the chain.
+	//
+	// Read as a point COUNT (the old code took the newest TrailHeadGracePoints=3 wholesale) it was
+	// 3 x TrailPointSpacing = 180uu of trace that was drawn but could not kill, permanently trailing
+	// every carrier, and 5 points' worth of travel after every turnover during which the trace was
+	// visible and completely harmless. TrailHeadGracePoints still caps the exemption, so 0 removes
+	// it and a larger value cannot make the invisible-but-drawn window come back: the distance
+	// binds first at any sane spacing.
+	const double GraceDistance = FMath::Max(0.0, static_cast<double>(Settings.TrailRadius));
+
+	// The head point itself always counts as exempt while emitting: it is the holder's own position
+	// this frame, not a place they have been.
+	int32 ExemptCount = 1;
+	double DistanceFromHead = 0.0;
+	for (int32 Index = PointCount - 1; Index > 0 && ExemptCount < MaxExempt; --Index)
+	{
+		DistanceFromHead += FVector::Dist(TrailPoints.Items[Index - 1].Location, TrailPoints.Items[Index].Location);
+		if (DistanceFromHead > GraceDistance)
+		{
+			break;
+		}
+		++ExemptCount;
+	}
+
+	return PointCount - 1 - ExemptCount;
 }
 
 void UTraceTrailComponent::ClearTrail()
@@ -548,26 +608,20 @@ void UTraceTrailComponent::ServerUpdateTrail()
 void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 {
 	ATraceCharacter* Holder = GetOwnerCharacter();
-	if (Holder == nullptr || !bEmitting || !Holder->IsAlive())
-	{
-		// Not laying a trace: nothing is lethal, and any remembered positions are now stale.
-		PreviousLocations.Reset();
-		return;
-	}
 
 	// -------------------------------------------------------------------------------------------
-	// SPEC §4, THE RISK BEAT. From the instant the holder inputs a pass until it completes or
-	// cancels, the trace CANNOT BE BROKEN. This is the whole reason the passer is willing to give
-	// up their shield: for those 0.5s the dash counterplay is off the table and the only way to
-	// stop the pass is to shoot them.
+	// THE INVARIANT: ONCE A TRACE SEGMENT EXISTS AND IS VISIBLE, IT IS LETHAL.
 	//
-	// Positions are still refreshed below on the frames this returns early? No — they are not, and
-	// that is deliberate: PreviousLocations is reset here so that the first tick AFTER the window
-	// closes rebuilds its sweeps from fresh positions rather than from wherever everyone was half a
-	// second ago. A stale sweep would be discarded by the teleport guard anyway, i.e. it would
-	// silently swallow the first dash after every pass.
+	// The gate is the POINTS, not bEmitting. This is the bug the user reported: a holder who lost
+	// the Core (a completed pass, or being killed and the Core changing hands) stops EMITTING, but
+	// the trace they already laid stays on screen for its full lifetime — and the old test bailed
+	// out on !bEmitting, so every one of those visible segments was completely inert. Dashing
+	// through a trace right after a turnover did nothing, which is exactly what was described.
+	//
+	// A trace kills the player who laid it, so the only hard requirement is that that player is
+	// still alive; if they are not, TickComponent has already wiped the points above.
 	// -------------------------------------------------------------------------------------------
-	if (IsTraceInvulnerable())
+	if (Holder == nullptr || !Holder->IsAlive() || TrailPoints.Items.Num() == 0)
 	{
 		PreviousLocations.Reset();
 		return;
@@ -575,10 +629,23 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 
 	const UTraceSettings& Settings = UTraceSettings::Get();
 
-	// The newest TrailHeadGracePoints points are exempt so a defender cannot simply stand on the
-	// emitter and dash on the spot — they have to actually cross the laid trace.
-	const int32 GraceCount = FMath::Max(0, Settings.TrailHeadGracePoints);
-	const int32 LastTestableIndex = TrailPoints.Items.Num() - 1 - GraceCount;
+	// -------------------------------------------------------------------------------------------
+	// SPEC §4, THE RISK BEAT. From the instant the holder inputs a pass until it completes or
+	// cancels, the trace CANNOT BE BROKEN. This is the whole reason the passer is willing to give
+	// up their shield: for those 0.5s the dash counterplay is off the table and the only way to
+	// stop the pass is to shoot them. It is the ONE intended exception to the invariant above, and
+	// it is signposted: the after-images brighten by GhostInvulnerableGlowScale while it holds.
+	//
+	// It suppresses the KILL only — the loop below still runs, so PreviousLocations keeps tracking
+	// every candidate. The old code returned early and reset them, which meant the first tick after
+	// the window closed had no valid previous position for anyone; that is a sweep the teleport
+	// guard throws away, i.e. the first dash after every single pass was silently swallowed.
+	// -------------------------------------------------------------------------------------------
+	const bool bInvulnerable = IsTraceInvulnerable();
+
+	// Everything up to and including this index is BOTH lethal and drawn; everything after it is
+	// neither. One function, one answer, used by the trip test and by RebuildVisuals.
+	const int32 LastTestableIndex = ComputeLastLethalIndex();
 
 	// Snapshot the testable positions. Nothing below may touch TrailPoints.Items: applying a kill
 	// re-enters this component (death -> SetCarrying(false) -> SetEmitting/ClearTrail) and would
@@ -587,6 +654,14 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	for (int32 PointIndex = 0; PointIndex <= LastTestableIndex; ++PointIndex)
 	{
 		TestPositions.Add(TrailPoints.Items[PointIndex].Location);
+	}
+
+	// The newest stub — the holder's own footprint — which is neither lethal nor drawn. Snapshotted
+	// only so a dash that crosses it can SAY SO in the log instead of looking like a lost kill.
+	ExemptPositions.Reset();
+	for (int32 PointIndex = FMath::Max(0, LastTestableIndex); PointIndex < TrailPoints.Items.Num(); ++PointIndex)
+	{
+		ExemptPositions.Add(TrailPoints.Items[PointIndex].Location);
 	}
 
 	// Broad phase. The narrow phase below is O(candidates x segments) - with MaxTrailPoints=256 and
@@ -708,11 +783,6 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 
 		// --- swept geometry -------------------------------------------------------------------
 
-		if (LastTestableIndex < 1)
-		{
-			continue;   // Fewer than two testable points means there is no segment yet.
-		}
-
 		const double SweepDistance = FVector::Dist(PreviousLocation, CurrentLocation);
 		if (SweepDistance > MaxSweepDistance)
 		{
@@ -733,58 +803,53 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		// at dash speed, unlike a point test), plus a separate vertical overlap check so that
 		// clearing the trace in the air is not a hit.
 		const double HorizontalThreshold = TrailRadius + CapsuleRadius;
-		const double HorizontalThresholdSquared = HorizontalThreshold * HorizontalThreshold;
 		const double VerticalThreshold = TrailHalfHeight + CapsuleHalfHeight;
-
-		const FVector SweepStart(PreviousLocation.X, PreviousLocation.Y, 0.0);
-		const FVector SweepEnd(CurrentLocation.X, CurrentLocation.Y, 0.0);
 
 		// Broad phase: if this candidate's swept XY box, inflated by the same horizontal threshold
 		// the narrow phase uses, does not touch the trace's XY box, no segment can be within range.
+		// Only ever used to REJECT the lethal test — the exempt stub below is two points and is
+		// checked unconditionally, so the instrumentation can never be broad-phased away.
+		bool bNearTrace = TestPositions.Num() > 0;
+		if (bNearTrace)
 		{
 			const double SweepMinX = FMath::Min(PreviousLocation.X, CurrentLocation.X) - HorizontalThreshold;
 			const double SweepMaxX = FMath::Max(PreviousLocation.X, CurrentLocation.X) + HorizontalThreshold;
 			const double SweepMinY = FMath::Min(PreviousLocation.Y, CurrentLocation.Y) - HorizontalThreshold;
 			const double SweepMaxY = FMath::Max(PreviousLocation.Y, CurrentLocation.Y) + HorizontalThreshold;
 
-			if (SweepMaxX < TrailMinX || SweepMinX > TrailMaxX || SweepMaxY < TrailMinY || SweepMinY > TrailMaxY)
-			{
-				continue;
-			}
+			bNearTrace = !(SweepMaxX < TrailMinX || SweepMinX > TrailMaxX || SweepMaxY < TrailMinY || SweepMinY > TrailMaxY);
 		}
 
-		for (int32 SegmentIndex = 0; SegmentIndex + 1 <= LastTestableIndex; ++SegmentIndex)
+		const bool bHitLethal = bNearTrace
+			&& SweepIntersectsTrace(TestPositions, PreviousLocation, CurrentLocation, HorizontalThreshold, VerticalThreshold);
+
+		if (bHitLethal)
 		{
-			const FVector& TrailStart = TestPositions[SegmentIndex];
-			const FVector& TrailEnd = TestPositions[SegmentIndex + 1];
-
-			const FVector FlatTrailStart(TrailStart.X, TrailStart.Y, 0.0);
-			const FVector FlatTrailEnd(TrailEnd.X, TrailEnd.Y, 0.0);
-
-			// Returns void — the closest point on each segment, not the distance.
-			FVector ClosestOnSweep = FVector::ZeroVector;
-			FVector ClosestOnTrail = FVector::ZeroVector;
-			FMath::SegmentDistToSegmentSafe(SweepStart, SweepEnd, FlatTrailStart, FlatTrailEnd, ClosestOnSweep, ClosestOnTrail);
-
-			if (FVector::DistSquared(ClosestOnSweep, ClosestOnTrail) > HorizontalThresholdSquared)
+			if (!bInvulnerable)
 			{
-				continue;
+				Tripper = Candidate;
+				continue;   // Resolved; keep looping only to refresh the remaining positions.
 			}
 
-			// Recover where along each segment the closest approach happened so we can compare
-			// heights there (the flattened test threw the Z away).
-			const double SweepAlpha = SegmentAlpha(SweepStart, SweepEnd, ClosestOnSweep);
-			const double TrailAlpha = SegmentAlpha(FlatTrailStart, FlatTrailEnd, ClosestOnTrail);
-			const double ToucherZ = FMath::Lerp(PreviousLocation.Z, CurrentLocation.Z, SweepAlpha);
-			const double TrailZ = FMath::Lerp(TrailStart.Z, TrailEnd.Z, TrailAlpha);
+			// The one intended exception. Logged, because "I dashed through it and nothing
+			// happened" must always have an answer in the log.
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[TRACEDASH] %s dashed through %s's trace: NO KILL (pass window invulnerable, spec 4). points=%d lethal=%d emitting=%d"),
+				*GetNameSafe(Candidate), *GetNameSafe(Holder),
+				TrailPoints.Items.Num(), TestPositions.Num(), bEmitting ? 1 : 0);
+			continue;
+		}
 
-			if (FMath::Abs(ToucherZ - TrailZ) > VerticalThreshold)
-			{
-				continue;
-			}
-
-			Tripper = Candidate;
-			break;
+		// Did they cross the stub that is neither drawn nor lethal? If this ever fires the visible
+		// state and the lethal state have drifted apart, which is the whole bug class this pass
+		// exists to close — so it is reported at Log, not at Verbose.
+		if (ExemptPositions.Num() > 1
+			&& SweepIntersectsTrace(ExemptPositions, PreviousLocation, CurrentLocation, HorizontalThreshold, VerticalThreshold))
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[TRACEDASH] %s dashed through the NON-DRAWN head stub of %s's trace: NO KILL (emitter footprint, %.0fuu). points=%d lethal=%d"),
+				*GetNameSafe(Candidate), *GetNameSafe(Holder),
+				static_cast<double>(Settings.TrailRadius), TrailPoints.Items.Num(), TestPositions.Num());
 		}
 	}
 
@@ -792,8 +857,69 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	// TrailPoints.Items and PreviousLocations.
 	if (Tripper != nullptr)
 	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[TRACEDASH] %s dashed through %s's trace: KILL. points=%d lethal=%d emitting=%d (residual trace: %s)"),
+			*GetNameSafe(Tripper), *GetNameSafe(Holder),
+			TrailPoints.Items.Num(), TestPositions.Num(), bEmitting ? 1 : 0,
+			bEmitting ? TEXT("no") : TEXT("yes - laid before a turnover"));
+
 		ApplyTrailTrip(Holder, Tripper);
 	}
+}
+
+bool UTraceTrailComponent::SweepIntersectsTrace(const TArray<FVector>& Positions, const FVector& PreviousLocation,
+	const FVector& CurrentLocation, double HorizontalThreshold, double VerticalThreshold) const
+{
+	if (Positions.Num() == 0)
+	{
+		return false;
+	}
+
+	const double HorizontalThresholdSquared = HorizontalThreshold * HorizontalThreshold;
+
+	const FVector SweepStart(PreviousLocation.X, PreviousLocation.Y, 0.0);
+	const FVector SweepEnd(CurrentLocation.X, CurrentLocation.Y, 0.0);
+
+	// A single point is tested as a zero-length segment rather than skipped. The old code needed
+	// two testable points before ANYTHING was lethal, which — stacked on the head exemption — meant
+	// a freshly formed trace was drawn but harmless for its first few points. SegmentDistToSegment
+	// handles a degenerate segment correctly, so there is no reason for that hole to exist.
+	const int32 LastSegment = FMath::Max(0, Positions.Num() - 2);
+
+	for (int32 SegmentIndex = 0; SegmentIndex <= LastSegment; ++SegmentIndex)
+	{
+		const FVector& TrailStart = Positions[SegmentIndex];
+		const FVector& TrailEnd = Positions[FMath::Min(SegmentIndex + 1, Positions.Num() - 1)];
+
+		const FVector FlatTrailStart(TrailStart.X, TrailStart.Y, 0.0);
+		const FVector FlatTrailEnd(TrailEnd.X, TrailEnd.Y, 0.0);
+
+		// Returns void — the closest point on each segment, not the distance.
+		FVector ClosestOnSweep = FVector::ZeroVector;
+		FVector ClosestOnTrail = FVector::ZeroVector;
+		FMath::SegmentDistToSegmentSafe(SweepStart, SweepEnd, FlatTrailStart, FlatTrailEnd, ClosestOnSweep, ClosestOnTrail);
+
+		if (FVector::DistSquared(ClosestOnSweep, ClosestOnTrail) > HorizontalThresholdSquared)
+		{
+			continue;
+		}
+
+		// Recover where along each segment the closest approach happened so we can compare
+		// heights there (the flattened test threw the Z away).
+		const double SweepAlpha = SegmentAlpha(SweepStart, SweepEnd, ClosestOnSweep);
+		const double TrailAlpha = SegmentAlpha(FlatTrailStart, FlatTrailEnd, ClosestOnTrail);
+		const double ToucherZ = FMath::Lerp(PreviousLocation.Z, CurrentLocation.Z, SweepAlpha);
+		const double TrailZ = FMath::Lerp(TrailStart.Z, TrailEnd.Z, TrailAlpha);
+
+		if (FMath::Abs(ToucherZ - TrailZ) > VerticalThreshold)
+		{
+			continue;
+		}
+
+		return true;
+	}
+
+	return false;
 }
 
 void UTraceTrailComponent::ApplyTrailTrip(ATraceCharacter* Holder, ATraceCharacter* Tripper)
@@ -954,6 +1080,7 @@ void UTraceTrailComponent::UpdateVisuals()
 	if (!bVisualsDirty
 		&& PointCount == LastVisualPointCount
 		&& bInvulnerable == bLastVisualInvulnerable
+		&& bEmitting == bLastVisualEmitting
 		&& Head.Equals(LastVisualHead, 0.01)
 		&& Tail.Equals(LastVisualTail, 0.01))
 	{
@@ -966,13 +1093,23 @@ void UTraceTrailComponent::UpdateVisuals()
 	LastVisualTail = Tail;
 	bLastVisualInvulnerable = bInvulnerable;
 
+	// bEmitting is in the comparison above because ComputeLastLethalIndex() reads it: the frame a
+	// holder stops emitting, the stub under their feet becomes lethal and must become visible with
+	// it. Nothing else about the point set changes on that frame, so without this the rebuild would
+	// wait for the next expiry and the trace would be lethal-but-invisible in between.
+	bLastVisualEmitting = bEmitting;
+
 	RebuildVisuals();
 }
 
 void UTraceTrailComponent::RebuildVisuals()
 {
-	const int32 PointCount = TrailPoints.Items.Num();
-	if (PointCount == 0 || CylinderMesh == nullptr)
+	// THE OTHER HALF OF THE INVARIANT. What is drawn is exactly the lethal set — not the whole
+	// point array — so a player can never be shown a segment that would not have killed them.
+	// ComputeLastLethalIndex() is the same function the server's trip test runs off, and it reads
+	// only replicated state, so this client's answer is the server's answer.
+	const int32 PointCount = ComputeLastLethalIndex() + 1;
+	if (PointCount <= 0 || CylinderMesh == nullptr)
 	{
 		HideGhostsFrom(0);
 		return;

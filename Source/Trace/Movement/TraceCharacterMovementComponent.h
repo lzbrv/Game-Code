@@ -32,9 +32,34 @@
 //          Runs on a CHARGE system: one charge for everybody, two while carrying the Core, each
 //          charge refilling on its own DashCooldown. See "charges" below.
 //   JUMP   Untouched — plain ACharacter::Jump.
-//   CROUCH On the ground: a slide (a directional, decaying burst you steer weakly).
+//   CROUCH On the ground: a slide (a directional momentum carry you steer weakly).
 //          In the air: a fast-fall that zeroes POSITIVE Z velocity only, on the press edge.
 //   BOOST  Ground-only vertical launch on a long cooldown. A separate bind from jump.
+//
+// --- THE SLIDE IS A MOMENTUM CARRY, NOT A BRAKE -----------------------------------------------
+//
+// The slide used to be a short burst that bled itself out: it entered at 1.45x walk, shed
+// SlideDeceleration every second and gave up once it dropped to SlideExitSpeedFraction of the walk
+// speed — which handed the player back BELOW walking pace and made every slide a net loss of
+// momentum. Three rules now keep the speed you brought to it:
+//
+//   ENTRY never costs speed. The boosted entry is capped by SlideMaxSpeed, but the cap can never
+//         pull the entry below the planar speed the pawn already had (BeginSlide).
+//   MIDDLE bleeds slowly. SlideDeceleration is the friction dial and is meant to be small enough
+//         that SlideDuration, not the decay, is what ends the slide.
+//   EXIT  hands the speed back. EndSlide() carries SlideExitSpeedRetention of the slide's current
+//         speed into normal movement, floored at SlideExitMinSpeedFraction of the walk speed and
+//         capped at SlideExitMaxSpeedMultiplier x GetMaxSpeed(), instead of the old unconditional
+//         clamp. Every exit — timer, decay, key release, ledge, boost — goes through that one path.
+//
+// SlideMinCommitSeconds makes the first moments of a slide uncancellable, so a slide reads as a
+// commitment rather than a tap, and so releasing the key a frame late cannot amputate it.
+//
+// THE FOUR NEW KNOBS (SlideMinCommitSeconds, SlideExitSpeedRetention, SlideExitMinSpeedFraction,
+// SlideExitMaxSpeedMultiplier) are read through a detection shim in the .cpp: if UTraceSettings
+// declares them they are used, otherwise the built-in defaults apply. That is what lets this slice
+// ship its behaviour without editing a file it does not own, and pick the settings up automatically
+// the moment they exist.
 //
 // --- WHY CHARGES AND NOT A SECOND TIMER -------------------------------------------------------
 //
@@ -203,10 +228,19 @@ protected:
 	/** Locks the direction, spends a charge, starts the dash window and launches the velocity. */
 	void BeginDash();
 
-	/** Locks the direction, sets the entry speed and starts the slide window. */
+	/** Locks the direction, sets the entry speed and starts the slide + commit windows. */
 	void BeginSlide();
 
-	/** Ends a slide and hands the player back at walking speed. */
+	/**
+	 * THE ONE EXIT. Ends a slide and hands the player back WITH their momentum.
+	 *
+	 * Every way out of a slide routes through here — the duration expiring, the decay reaching the
+	 * exit speed, the key coming up, walking off a ledge, and a dash or boost cancelling it — because
+	 * the exit speed rule has to be identical on all five paths or "slide cancel" becomes a
+	 * different (and better, and unintended) move than "let the slide finish".
+	 *
+	 * Idempotent: safe to call when no slide is running, in which case it does nothing at all.
+	 */
 	void EndSlide();
 
 	/** Spends the boost cooldown, sets +Z and drops the pawn into MOVE_Falling. */
@@ -235,6 +269,26 @@ protected:
 
 	/** DashDuration + DashCooldown: the cooldown is measured from dash START, as it always was. */
 	float GetDashRechargeWindow() const;
+
+	// Slide tuning, same rule: read live, every frame, never cached. The last four fall back to a
+	// built-in default when UTraceSettings does not (yet) declare the property — see the header note.
+	float GetSlideDuration() const;
+	float GetSlideDeceleration() const;
+	float GetSlideMinCommitSeconds() const;
+	float GetSlideExitSpeedRetention() const;
+	float GetSlideExitMinSpeedFraction() const;
+	float GetSlideExitMaxSpeedMultiplier() const;
+
+	/**
+	 * Pushes UTraceSettings::WalkSpeed into MaxWalkSpeed if a designer has changed it.
+	 *
+	 * BeginPlay copies the setting once, which is exactly the caching this file's own comments warn
+	 * against: with only that copy, retuning WalkSpeed in Project Settings during PIE did nothing
+	 * until the map was reloaded. Called once per simulated move so the editor's value is live, and
+	 * cheap enough to be unconditional (one float compare). Not a prediction hazard: both ends read
+	 * the same config, and a designer editing the number mid-PIE is a single-process situation.
+	 */
+	void RefreshWalkSpeedFromSettings();
 
 	// --- Dash state (all saved/restored by FSavedMove_Trace) --------------------------------------
 
@@ -269,6 +323,20 @@ protected:
 	FVector SlideDirection;
 
 	/**
+	 * Seconds left of the window in which releasing crouch will NOT cancel the slide.
+	 *
+	 * A slide is a commitment: it is worth its cooldown precisely because you cannot bail out of it
+	 * the instant it stops being convenient. It also fixes a mundane input problem — the slide is
+	 * driven by a HELD level, so a key that comes up one frame early (or a bot whose hold timer
+	 * expires early) used to amputate the slide, and the player never learns why theirs was short.
+	 *
+	 * SAVED-MOVE STATE, like every other clock here: a correction mid-slide must rewind this with
+	 * the rest, or the replay decides the slide was cancellable when the original decided it was not
+	 * and the two ends disagree about where the pawn went.
+	 */
+	float SlideCommitRemaining;
+
+	/**
 	 * Seconds of "I pressed crouch and meant it" left over from a press that could not start a slide
 	 * yet — because the pawn was mid-dash, or still in the air.
 	 *
@@ -293,6 +361,18 @@ protected:
 
 	/** See GetLastDashActiveWorldTime(). Server observation only; never saved or replicated. */
 	float LastDashActiveWorldTime = -1000.f;
+
+#if !UE_BUILD_SHIPPING
+	// --- Slide measurement ("-TraceSlideDebug", or `Trace.SlideDebug 1`) -------------------------
+	//
+	// Deliberately NOT saved-move state and never read by the simulation: these only observe. They
+	// are what let a headless match answer "are slides actually longer now" with numbers instead of
+	// an opinion. The running mean they feed is process-wide (a file-scope counter in the .cpp), not
+	// per-pawn, because the question is about the mechanic and ten bots is the sample.
+	float SlideDebugStartTime = 0.f;
+	FVector SlideDebugStartLocation = FVector::ZeroVector;
+	float SlideDebugEntrySpeed = 0.f;
+#endif
 
 #if !UE_BUILD_SHIPPING
 	/**
@@ -352,6 +432,7 @@ public:
 
 	float SavedSlideTimeRemaining;
 	float SavedSlideCooldownRemaining;
+	float SavedSlideCommitRemaining;
 	float SavedSlideSpeed;
 	float SavedSlideBufferRemaining;
 	FVector SavedSlideDirection;

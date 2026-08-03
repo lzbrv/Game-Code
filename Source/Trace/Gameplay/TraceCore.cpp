@@ -599,22 +599,31 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 		return false;
 	}
 
-	// Line of sight, against WORLD GEOMETRY ONLY. A hitscan-style ECC_Visibility trace would let a
-	// teammate standing between the two of them invalidate the pass, which is not what "can I see
-	// them" means for a receiver.
+	// Line of sight, against WORLD GEOMETRY ONLY - and "world geometry" means ECC_Visibility, not an
+	// object-type query.
+	//
+	// THIS USED TO BE LineTraceTestByObjectType({WorldStatic, WorldDynamic}), AND THAT SILENTLY KILLED
+	// EVERY PASS INVOLVING AN ENDZONE. An object-type query matches on the component's object type and
+	// ignores its response channels entirely, so the ATraceEndzone trigger - a QueryOnly box whose
+	// object type is ECC_WorldDynamic and which responds to nothing but ECC_Pawn - was a solid wall to
+	// this one query and nothing else in the game. A carrier standing in a zone hit it immediately
+	// (bFindInitialOverlaps defaults true), and a pass INTO a zone hit it on entry, so "complete a pass
+	// to a teammate standing in the enemy endzone" could never fire. Widening the endzones to the full
+	// field width made the dead area twice as large.
+	//
+	// ECC_Visibility is what the original comment actually wanted: arena geometry blocks it, the
+	// endzone trigger ignores it by construction (TraceEndzone.cpp sets every channel to Ignore, then
+	// opens ECC_Pawn alone), and the "Pawn" capsule profile ignores it too - so a teammate standing in
+	// between still cannot invalidate the pass, which was the whole reason the object query was chosen.
 	const UWorld* World = GetWorld();
 	if (World != nullptr)
 	{
-		FCollisionObjectQueryParams ObjectParams;
-		ObjectParams.AddObjectTypesToQuery(ECC_WorldStatic);
-		ObjectParams.AddObjectTypesToQuery(ECC_WorldDynamic);
-
 		FCollisionQueryParams QueryParams(FName(TEXT("TracePassLOS")), /*bTraceComplex=*/false);
 		QueryParams.AddIgnoredActor(this);
 		QueryParams.AddIgnoredActor(Holder);
 		QueryParams.AddIgnoredActor(Candidate);
 
-		if (World->LineTraceTestByObjectType(ViewLocation, TargetChest, ObjectParams, QueryParams))
+		if (World->LineTraceTestByChannel(ViewLocation, TargetChest, ECC_Visibility, QueryParams))
 		{
 			return false;
 		}
@@ -1026,6 +1035,32 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 
 	UE_LOG(LogTraceGame, Log, TEXT("Core granted to %s (reason %d, team change %s)"),
 		*GetNameSafe(NewHolder), static_cast<int32>(Reason), bTeamChanged ? TEXT("yes") : TEXT("no"));
+
+	// A pass completed to a teammate who is ALREADY STANDING IN THE ENEMY ENDZONE scores, and so
+	// does a Core taken from a carrier you killed while standing in it yourself. Neither generates
+	// a begin-overlap — the receiver never moved — so the endzone test has to be driven off the
+	// POSSESSION change, which is this function, rather than off the movement that usually causes
+	// it. The GameMode owns the test; it reads the endzone volume itself, so this stays correct
+	// however the zones are sized.
+	//
+	// LAST STATEMENT IN THE FUNCTION, deliberately: a score resets the field (kickoff, every pawn
+	// teleported, this Core released again), so nothing here may touch member state afterwards.
+	if (UWorld* World = GetWorld())
+	{
+		if (ATraceGameMode* GameMode = World->GetAuthGameMode<ATraceGameMode>())
+		{
+			// Ordered to match ETraceCoreGrantReason exactly; clamped so adding a reason without
+			// touching this cannot read off the end.
+			static const TCHAR* GrantReasonNames[] =
+			{
+				TEXT("kickoff"), TEXT("completed pass"), TEXT("kill steal"), TEXT("fallback"), TEXT("debug grant")
+			};
+			const int32 ReasonIndex = FMath::Clamp(static_cast<int32>(Reason), 0,
+				static_cast<int32>(UE_ARRAY_COUNT(GrantReasonNames)) - 1);
+
+			GameMode->CheckEndzoneScoreForCarrier(NewHolder, GrantReasonNames[ReasonIndex]);
+		}
+	}
 }
 
 void ATraceCore::ReleaseHolder()

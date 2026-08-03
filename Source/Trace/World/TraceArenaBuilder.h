@@ -28,13 +28,18 @@ class UStaticMeshComponent;
  * Builds the entire playfield from C++ at BeginPlay, so /Game/Maps/Arena can be a completely
  * empty level and the project never ships an authored level .uasset (build contract section 2).
  *
+ * THAT IS WHY THE MAP LOOKS EMPTY IN THE EDITOR. Drop one of these into the level and press
+ * "Build Preview In Editor" in its Details panel to see the arena without pressing Play - the full
+ * two-click workflow, and the reasons it cannot leak into a build, are documented on that function.
+ *
  * WHAT IT MAKES
  * -------------
  * A 24000 x 12000 uu Tron arena: a near-black glossy floor carrying a team-tinted neon grid, four
  * 2600 uu perimeter walls with lit trim and vertical ribs, a four-tier stepped centre dais with the
  * Core pedestal on top and four light pylons around it, four stepped wing platforms, two rows of
  * segmented lane rails that split the field into a central spine plus two lanes per side, a
- * scattering of diamond cover blocks, and a lit gate structure over each endzone. Along both
+ * scattering of diamond cover blocks, and a lit gate spanning the full width of each endzone (the
+ * endzones run sideline to sideline - see EndzoneHalfWidth). Along both
  * flanks: a row of wall buttresses carrying a continuous high rail, a light bridge per quadrant out
  * to the lane pylons, bright outer-lane floor stripes and a pylon in each corner. Plus the gameplay
  * furniture: two ATraceEndzone triggers, five ATraceTeamPlayerStarts per team, the lighting rig
@@ -112,6 +117,37 @@ public:
 	FBox GetFieldBounds() const;
 
 	/**
+	 * EndzoneDepth clamped to something that can actually be built: at least 100 uu, never more than
+	 * the half length (a deeper zone than that would swallow the centre of the field).
+	 *
+	 * THE ONE PLACE THIS CLAMP LIVES. It used to be repeated at three call sites - the trigger, the
+	 * builder's own spawn line and ATraceGameMode::BuildEndzoneSpawnPads - and the failure mode of a
+	 * clamp that disagrees with itself is not a compile error, it is a spawn pad on the wrong side of
+	 * a goal line. Call this instead of clamping EndzoneDepth yourself.
+	 */
+	float ClampedEndzoneDepth() const;
+
+	/**
+	 * Half extent of an endzone along Y.
+	 *
+	 * An endzone spans the FULL WIDTH of the field, sideline to sideline - the trigger volume, the
+	 * tinted floor patch, the goal line and the gate all use this one function, so what the player
+	 * sees and what actually scores cannot drift apart. Do not reintroduce a partial-width zone: a
+	 * carrier who crosses the goal line out by a sideline and does not score is indistinguishable
+	 * from a broken trigger.
+	 */
+	float EndzoneHalfWidth() const { return HalfWidth(); }
+
+	/**
+	 * World-space box of the endzone at @p EndSign (-1 for the -X end, +1 for the +X end).
+	 *
+	 * Exactly the volume the ATraceEndzone trigger occupies, exposed so that anything deriving
+	 * geometry from an endzone (respawn pads, bot targeting, debug draw) reads the real box rather
+	 * than reconstructing it from EndzoneDepth and getting the width wrong.
+	 */
+	FBox GetEndzoneBounds(float EndSign) const;
+
+	/**
 	 * Builds the arena now if it has not been built yet. Idempotent, and legal to call before
 	 * BeginPlay — which is the whole point: ATraceGameMode::PreInitializeComponents has to get the
 	 * player starts into the world before AGameModeBase::Login runs FindPlayerStart, and that is two
@@ -125,6 +161,48 @@ public:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	//~ End AActor
+
+#if WITH_EDITOR
+	// ---------------------------------------------------------------------------------------------
+	// EDITOR PREVIEW - see the arena without pressing Play
+	//
+	// THE PROBLEM. /Game/Maps/Arena is a deliberately EMPTY level (build contract section 2: the
+	// project ships no authored level .uasset) and everything you see in a match is built from C++ at
+	// BeginPlay. Open the map in the editor and you therefore get a blank grid, which reads as a
+	// broken project rather than as a design decision, and it means the layout cannot be inspected,
+	// measured or screenshotted without launching the game.
+	//
+	// THE WORKFLOW, two clicks:
+	//   1. Drag an ATraceArenaBuilder from the Place Actors panel into the level (put it at the
+	//      origin - the whole arena is built in this actor's local space, so the builder's transform
+	//      IS the arena's transform).
+	//   2. With it selected, press "Build Preview In Editor" in the Details panel under Trace|Preview.
+	//      The full arena - floor, walls, dais, wings, rails, cover, flanks, endzones, the lighting
+	//      rig, fog and post process - appears in the viewport immediately.
+	//   Press "Clear Preview In Editor" to take it all away again. Editing any property above (field
+	//   size, wall height, endzone depth, lighting) while a preview is up rebuilds it automatically.
+	//
+	// WHY IT CANNOT LEAK. Two independent guarantees, because "the preview got saved into the map"
+	// would double the arena at runtime - two floors, two sets of endzone triggers, two of everything:
+	//   1. Everything the preview creates is RF_Transient (BuiltObjectFlags() below stamps every
+	//      component, every MID and every spawned actor), and transient objects are never written to
+	//      a .umap. Saving the level with a preview up saves the builder actor and nothing else.
+	//   2. BuildArena() tears any surviving preview down before it builds for real, so even a preview
+	//      that somehow reached a play session cannot be there twice.
+	// Both buttons refuse to run outside an editor world, so neither can touch a live match.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Builds the whole arena into the editor viewport, transiently. Idempotent: rebuilds if shown. */
+	UFUNCTION(CallInEditor, Category = "Trace|Preview")
+	void BuildPreviewInEditor();
+
+	/** Removes the editor preview. Safe to press when there is nothing to remove. */
+	UFUNCTION(CallInEditor, Category = "Trace|Preview")
+	void ClearPreviewInEditor();
+
+	/** Keeps a live preview in step with the layout properties above. */
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
 
 	// ---------------------------------------------------------------------------------------------
 	// Layout. All values in unreal units, all local to this actor's transform, so the whole arena
@@ -160,7 +238,15 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FloorThickness = 120.f;
 
-	/** How far each endzone reaches in from its end wall. */
+	/**
+	 * How far each endzone reaches in from its end wall, i.e. its size along X.
+	 *
+	 * THERE IS NO WIDTH DIAL, and that is deliberate: an endzone spans the ENTIRE width of the field,
+	 * sideline to sideline, exactly like a real football endzone. See EndzoneHalfWidth().
+	 *
+	 * Read it through ClampedEndzoneDepth(), never raw - three separate places used to re-clamp this
+	 * by hand and one of them getting it wrong is what put both teams' spawn lines on the centre dais.
+	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float EndzoneDepth = 2400.f;
 
@@ -334,6 +420,24 @@ protected:
 	void BuildLighting();
 	void BuildFloorLamps();
 	void BuildPostProcess();
+
+	/**
+	 * Object flags for everything the builder creates - components, MIDs and spawned actors alike.
+	 *
+	 * RF_NoFlags at runtime (nothing is ever saved from a running game) and RF_Transient while an
+	 * editor preview is being built, which is what stops the preview from being serialised into
+	 * /Game/Maps/Arena and then doubling up against the arena the runtime builder makes for itself.
+	 */
+	EObjectFlags BuiltObjectFlags() const;
+
+	/**
+	 * Destroys everything BuildArena() made - every component attached under Root, every actor in
+	 * SpawnedActors, every MID - and resets the built flag so the next build starts from nothing.
+	 *
+	 * Editor-only, and it stays that way on purpose: at runtime the arena is built exactly once per
+	 * world and EndPlay is the only teardown path that exists.
+	 */
+	void DestroyBuiltArena();
 
 	// --- Primitive helpers -----------------------------------------------------------------------
 
@@ -558,4 +662,16 @@ private:
 
 	/** BeginPlay can be forced early by the GameMode (DispatchBeginPlay); never build twice. */
 	bool bArenaBuilt = false;
+
+	/**
+	 * True only while BuildArena() is running for the editor preview.
+	 *
+	 * Declared unconditionally rather than under #if WITH_EDITOR so that BuiltObjectFlags() - which
+	 * every primitive helper calls - is one function with one body in every configuration. It is a
+	 * bool; the alternative is a preprocessor fork through the hottest path in the file.
+	 */
+	bool bBuildingEditorPreview = false;
+
+	/** True while an editor preview is standing. See the preview block in the public section. */
+	bool bEditorPreviewBuilt = false;
 };

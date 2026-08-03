@@ -86,9 +86,15 @@ void ATraceEndzone::BeginPlay()
 	// in Tick() covers it, and doubles as a safety net if the overlap never fires at all.
 	SetActorTickEnabled(true);
 
-	UE_LOG(LogTraceGame, Verbose, TEXT("Endzone defended by %s is live at %s (scored in by %s)."),
+	// Log, not Verbose. The half extent is the whole contract of this actor - "the zone spans the
+	// full width of the field" is either true or the game silently refuses points out by the
+	// sidelines - and a fact nobody can see must at least be one nobody has to raise a verbosity
+	// level to read. This project has twice declared a working mechanic dead over exactly that.
+	const FVector Extent = (Trigger != nullptr) ? Trigger->GetUnscaledBoxExtent() : FVector::ZeroVector;
+	UE_LOG(LogTraceGame, Log, TEXT("Endzone defended by %s is live at %s, half extent %s (scored in by %s)."),
 		*TraceTeamName(OwningTeam).ToString(),
 		*GetActorLocation().ToCompactString(),
+		*Extent.ToCompactString(),
 		*TraceTeamName(TraceOpposingTeam(OwningTeam)).ToString());
 }
 
@@ -192,9 +198,18 @@ void ATraceEndzone::TryScore(ATraceCharacter* Character)
 
 	LastScoreTime = Now;
 
-	UE_LOG(LogTraceGame, Log, TEXT("%s carried the Core into the %s endzone - %s scores."),
+	// The lateral coordinate is in the line on purpose. An endzone spans the FULL width of the field
+	// (ATraceArenaBuilder::EndzoneHalfWidth), and the only cheap way to prove that from a match log -
+	// rather than by walking into a corner and hoping - is to see scores land at Y values out near
+	// the sidelines as well as down the middle. If every score in a log sits near Y=0, the trigger
+	// has quietly gone back to being a partial box.
+	const FVector ScoreLocation = Character->GetActorLocation();
+	const float ZoneHalfWidth = (Trigger != nullptr) ? Trigger->GetUnscaledBoxExtent().Y : 0.f;
+
+	UE_LOG(LogTraceGame, Log, TEXT("%s carried the Core into the %s endzone at X=%.0f Y=%.0f (zone half width %.0f) - %s scores."),
 		*GetNameSafe(Character),
 		*TraceTeamName(OwningTeam).ToString(),
+		ScoreLocation.X, ScoreLocation.Y, ZoneHalfWidth,
 		*TraceTeamName(CarrierTeam).ToString());
 
 	// The scoring team is the CARRIER's team, never OwningTeam.

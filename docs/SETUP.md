@@ -480,8 +480,16 @@ The level stays empty. The floor, walls, endzones, pedestal, player starts, dire
 sky light are all spawned by `ATraceArenaBuilder` at runtime. If you open the map and see nothing
 but a black void, that is correct.
 
-`Config/DefaultEngine.ini` already points both the editor startup map and the game default map at
-`/Game/Maps/Arena`, so once the file exists everything just works.
+`Config/DefaultEngine.ini` already points the two startup maps, and it deliberately points them at
+**different** levels:
+
+- `EditorStartupMap=/Game/Maps/Arena` — the editor opens on the arena, which is what you want to be
+  looking at while you work.
+- `GameDefaultMap=/Game/Maps/MainMenu` — a launched (non-PIE) game boots to the title screen, and the
+  menu is what starts a match.
+
+So pressing Play drops you straight into the arena, while running the packaged game or
+`-game` with no map override gives you the menu first. Both are correct; neither needs changing.
 
 ---
 

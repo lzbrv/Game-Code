@@ -237,9 +237,9 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	{
 		for (const TWeakObjectPtr<ATraceCharacter>& Weak : GameMode->GetTrackedCharacters())
 		{
-			if (ATraceCharacter* Character = Weak.Get())
+			if (ATraceCharacter* TraceChar = Weak.Get())
 			{
-				Candidates.Add(Character);
+				Candidates.Add(TraceChar);
 			}
 		}
 	}
@@ -264,9 +264,9 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	// ---------------------------------------------------------------------------------------
 	FCollisionQueryParams QueryParams(FName(TEXT("TraceHitscanWorld")), /*bTraceComplex=*/false, Shooter);
 	QueryParams.bReturnPhysicalMaterial = false;
-	for (ATraceCharacter* Character : Candidates)
+	for (ATraceCharacter* TraceChar : Candidates)
 	{
-		QueryParams.AddIgnoredActor(Character);
+		QueryParams.AddIgnoredActor(TraceChar);
 	}
 
 	double MaxDistance = ShotRange;

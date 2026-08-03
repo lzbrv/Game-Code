@@ -2,9 +2,11 @@
 
 #include "Core/TraceGameMode.h"
 
+#include "Components/BoxComponent.h"                     // endzone trigger extent (see CheckEndzoneScoreForCarrier)
 #include "EngineUtils.h"                                 // TActorIterator
 #include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"     // StopMovementImmediately on respawn
+#include "Movement/TraceCharacterMovementComponent.h"    // StartDash (the -TraceTripTest harness)
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
@@ -68,6 +70,14 @@ namespace TraceGameModeConstants
 
 	/** Fraction of the endzone depth each of those steps covers. */
 	static constexpr float SpawnProbeStepFraction = 0.18f;
+
+	/**
+	 * Minimum seconds between two accepted scores. See NotifyScored: the endzone volume and the
+	 * possession-change check are two detectors for one event, and the reset the first one starts
+	 * (kickoff + teleporting every pawn) does not finish inside a frame. Comfortably shorter than
+	 * any real gap between captures — the kickoff delay alone is longer.
+	 */
+	static constexpr float ScoreDebounceSeconds = 0.5f;
 }
 
 ATraceGameMode::ATraceGameMode()
@@ -228,6 +238,15 @@ void ATraceGameMode::BeginPlay()
 	{
 		GetWorldTimerManager().SetTimer(BotDebugTimerHandle, this, &ATraceGameMode::LogBotRoster,
 			TraceGameModeConstants::BotDebugInterval, /*bLoop=*/true, /*FirstDelay=*/1.f);
+	}
+
+	if (FParse::Param(FCommandLine::Get(), TEXT("TraceTripTest")))
+	{
+		// One step per fire, at roughly one frame each: the scripted dash needs its start and end
+		// positions on two CONSECUTIVE trip-test ticks, because what the test evaluates is the
+		// swept segment between them.
+		GetWorldTimerManager().SetTimer(VerifyTimerHandle, this, &ATraceGameMode::RunVerificationStep,
+			0.016f, /*bLoop=*/true, /*FirstDelay=*/2.f);
 	}
 #endif
 }
@@ -573,13 +592,13 @@ bool ATraceGameMode::IsStartOccupied(const AActor* Start, const AController* For
 
 	for (const TWeakObjectPtr<ATraceCharacter>& WeakCharacter : TrackedCharacters)
 	{
-		const ATraceCharacter* Character = WeakCharacter.Get();
-		if (Character == nullptr || Character == OwnPawn || !Character->IsAlive())
+		const ATraceCharacter* InCharacter = WeakCharacter.Get();
+		if (InCharacter == nullptr || InCharacter == OwnPawn || !InCharacter->IsAlive())
 		{
 			continue;
 		}
 
-		if (FVector::DistSquared(StartLocation, Character->GetActorLocation()) <= RadiusSquared)
+		if (FVector::DistSquared(StartLocation, InCharacter->GetActorLocation()) <= RadiusSquared)
 		{
 			return true;
 		}
@@ -594,19 +613,19 @@ float ATraceGameMode::DistSqToNearestEnemy(const FVector& Location, ETraceTeam T
 
 	for (const TWeakObjectPtr<ATraceCharacter>& WeakCharacter : TrackedCharacters)
 	{
-		const ATraceCharacter* Character = WeakCharacter.Get();
-		if (Character == nullptr || !Character->IsAlive())
+		const ATraceCharacter* InCharacter = WeakCharacter.Get();
+		if (InCharacter == nullptr || !InCharacter->IsAlive())
 		{
 			continue;
 		}
 
 		// A teamless spawner treats everyone as a threat; otherwise our own team is not one.
-		if (Team != ETraceTeam::None && Character->GetTeam() == Team)
+		if (Team != ETraceTeam::None && InCharacter->GetTeam() == Team)
 		{
 			continue;
 		}
 
-		const float DistanceSquared = static_cast<float>(FVector::DistSquared(Location, Character->GetActorLocation()));
+		const float DistanceSquared = static_cast<float>(FVector::DistSquared(Location, InCharacter->GetActorLocation()));
 		BestDistanceSquared = FMath::Min(BestDistanceSquared, DistanceSquared);
 	}
 
@@ -625,28 +644,28 @@ ETraceTeam ATraceGameMode::GetTeamForController(const AController* Controller)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Character tracking
+// InCharacter tracking
 // ---------------------------------------------------------------------------------------------
 
-void ATraceGameMode::RegisterCharacter(ATraceCharacter* Character)
+void ATraceGameMode::RegisterCharacter(ATraceCharacter* InCharacter)
 {
-	if (Character == nullptr)
+	if (InCharacter == nullptr)
 	{
 		return;
 	}
 
 	CompactTrackedCharacters();
-	TrackedCharacters.AddUnique(Character);
+	TrackedCharacters.AddUnique(InCharacter);
 }
 
-void ATraceGameMode::UnregisterCharacter(ATraceCharacter* Character)
+void ATraceGameMode::UnregisterCharacter(ATraceCharacter* InCharacter)
 {
-	if (Character == nullptr)
+	if (InCharacter == nullptr)
 	{
 		return;
 	}
 
-	TrackedCharacters.Remove(Character);
+	TrackedCharacters.Remove(InCharacter);
 	CompactTrackedCharacters();
 }
 
@@ -924,8 +943,8 @@ int32 ATraceGameMode::CountLivingOnTeam(ETraceTeam Team) const
 			continue;
 		}
 
-		const ATraceCharacter* Character = Cast<ATraceCharacter>(Controller->GetPawn());
-		if (Character != nullptr && Character->IsAlive())
+		const ATraceCharacter* InCharacter = Cast<ATraceCharacter>(Controller->GetPawn());
+		if (InCharacter != nullptr && InCharacter->IsAlive())
 		{
 			++Living;
 		}
@@ -1028,7 +1047,8 @@ void ATraceGameMode::EvaluateWipeBonus(ETraceTeam DeadTeam)
 
 void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 {
-	if (!HasAuthority() || ScoringTeam == ETraceTeam::None)
+	UWorld* World = GetWorld();
+	if (!HasAuthority() || World == nullptr || ScoringTeam == ETraceTeam::None)
 	{
 		return;
 	}
@@ -1038,6 +1058,22 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 	{
 		return;
 	}
+
+	// One capture, one point. Two independent detectors now feed this — the endzone's own trigger
+	// and poll, and CheckEndzoneScoreForCarrier on a possession change — and a pass completed
+	// inside the endzone trips both within a tenth of a second of each other. Everything below
+	// (kickoff, teleporting ten pawns) is a field reset that takes several frames to settle, so
+	// re-entering it before it has is never right, whichever detector got here first.
+	const float NowWorld = static_cast<float>(World->GetTimeSeconds());
+	if ((NowWorld - LastScoreProcessedWorldTime) < TraceGameModeConstants::ScoreDebounceSeconds)
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("Score by %s ignored: %.2fs since the last one (debounce %.2fs)."),
+			*TraceTeamName(ScoringTeam).ToString(), NowWorld - LastScoreProcessedWorldTime,
+			TraceGameModeConstants::ScoreDebounceSeconds);
+		return;
+	}
+	LastScoreProcessedWorldTime = NowWorld;
 
 	// Warm-up, the interval and post-match carries still reset the field, but they never count.
 	const bool bCounts = (TraceGameState->TraceMatchState == ETraceMatchState::InProgress)
@@ -1099,6 +1135,71 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 	}
 
 	ResetPlayersToSpawns();
+}
+
+bool ATraceGameMode::CheckEndzoneScoreForCarrier(ATraceCharacter* InCharacter, const TCHAR* Reason)
+{
+	UWorld* World = GetWorld();
+	if (!HasAuthority() || World == nullptr || !IsValid(InCharacter) || !InCharacter->IsAlive())
+	{
+		return false;
+	}
+
+	// The carrier is asked of the Core, not of the pawn's replicated flag: this runs on the frame
+	// possession changes, and the flag is a mirror that may not have been written yet.
+	const ATraceCore* TheCore = GetCore();
+	if (TheCore == nullptr || TheCore->GetCarrier() != InCharacter)
+	{
+		return false;
+	}
+
+	const ETraceTeam CarrierTeam = InCharacter->GetTeam();
+	if (CarrierTeam == ETraceTeam::None)
+	{
+		return false;
+	}
+
+	const FVector CarrierLocation = InCharacter->GetActorLocation();
+
+	for (TActorIterator<ATraceEndzone> It(World); It; ++It)
+	{
+		ATraceEndzone* Zone = *It;
+		if (!IsValid(Zone) || Zone->Trigger == nullptr)
+		{
+			continue;
+		}
+
+		// ATraceEndzone::ScoresHere() is the single authority on scoring direction (OwningTeam
+		// DEFENDS the zone; its opponent scores in it), and it is re-pointed at half time by
+		// ApplyTeamSides. Asking it means this can never be the copy that goes stale.
+		if (!Zone->ScoresHere(CarrierTeam))
+		{
+			continue;
+		}
+
+		// Point-in-box in the trigger's own space, against the UNSCALED extent (InverseTransform
+		// has already undone the scale). Identical to the test the zone itself polls with, and it
+		// takes the zone's live dimensions — widen the endzones and this widens with them.
+		const FVector Local = Zone->Trigger->GetComponentTransform().InverseTransformPosition(CarrierLocation);
+		const FVector Extent = Zone->Trigger->GetUnscaledBoxExtent();
+
+		if (FMath::Abs(Local.X) > Extent.X || FMath::Abs(Local.Y) > Extent.Y || FMath::Abs(Local.Z) > Extent.Z)
+		{
+			continue;
+		}
+
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[ENDZONE] %s (%s) took the Core inside the %s endzone (%s) - %s scores without moving."),
+			*GetNameSafe(InCharacter), *TraceTeamName(CarrierTeam).ToString(),
+			*TraceTeamName(Zone->OwningTeam).ToString(),
+			Reason != nullptr ? Reason : TEXT("possession change"),
+			*TraceTeamName(CarrierTeam).ToString());
+
+		NotifyScored(CarrierTeam);
+		return true;
+	}
+
+	return false;
 }
 
 void ATraceGameMode::ResetPlayersToSpawns()
@@ -1498,23 +1599,299 @@ void ATraceGameMode::LogBotRoster()
 
 	for (const TWeakObjectPtr<ATraceCharacter>& WeakCharacter : TrackedCharacters)
 	{
-		const ATraceCharacter* Character = WeakCharacter.Get();
-		if (Character == nullptr)
+		const ATraceCharacter* InCharacter = WeakCharacter.Get();
+		if (InCharacter == nullptr)
 		{
 			continue;
 		}
 
-		const ATracePlayerState* State = Character->GetPlayerState<ATracePlayerState>();
-		const ATraceBotController* Bot = Cast<ATraceBotController>(Character->GetController());
+		const ATracePlayerState* State = InCharacter->GetPlayerState<ATracePlayerState>();
+		const ATraceBotController* Bot = Cast<ATraceBotController>(InCharacter->GetController());
 
 		UE_LOG(LogTraceGame, Display, TEXT("[BotDebug]   %-16s %-6s %-14s pos=%s speed=%.0f %s%s"),
 			(State != nullptr) ? *State->GetPlayerName() : TEXT("<no state>"),
 			(State != nullptr) ? *TraceTeamName(State->Team).ToString() : TEXT("?"),
 			(Bot != nullptr) ? ATraceBotController::StateToString(Bot->GetBotState()) : TEXT("HUMAN"),
-			*Character->GetActorLocation().ToCompactString(),
-			Character->GetVelocity().Size2D(),
-			Character->IsAlive() ? TEXT("") : TEXT("[DEAD] "),
-			Character->IsCarrier() ? TEXT("[CARRIER]") : TEXT(""));
+			*InCharacter->GetActorLocation().ToCompactString(),
+			InCharacter->GetVelocity().Size2D(),
+			InCharacter->IsAlive() ? TEXT("") : TEXT("[DEAD] "),
+			InCharacter->IsCarrier() ? TEXT("[CARRIER]") : TEXT(""));
+	}
+}
+
+// -------------------------------------------------------------------------------------------
+// -TraceTripTest: scripted proof of the two rules this pass fixed.
+//
+// SCENARIO A, run VerifyTraceDashRuns times. Force a TURNOVER (the Core moves to the other team),
+// which leaves the ex-carrier's trace lying on the field exactly as a completed pass or a steal
+// does. Then take one of their enemies and sweep them across a segment of that residual trace
+// while dashing. The trace is drawn, so by the invariant it must kill. Before this pass it never
+// did: the trip test bailed out on !bEmitting and every visible segment of it was inert.
+//
+// SCENARIO B, once. Put a teammate of the carrier inside the endzone their team scores in, then
+// complete a pass to them. They never move, so no trigger volume can ever see them arrive: the
+// point has to come from the possession change itself.
+//
+// The dash is driven by two teleports on consecutive frames rather than by running at the trace,
+// because what the trip test evaluates IS the swept segment between two ticks - this reproduces it
+// exactly, deterministically, without depending on where a bot happens to be looking.
+// -------------------------------------------------------------------------------------------
+
+void ATraceGameMode::RunVerificationStep()
+{
+	UWorld* World = GetWorld();
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	ATraceCore* TheCore = GetCore();
+	if (World == nullptr || TraceGameState == nullptr || TheCore == nullptr)
+	{
+		return;
+	}
+
+	/**
+	 * How many times scenario A runs. More than one, because the claim is "reliably" — and
+	 * "-TraceTripRuns=<n>" raises it, because three samples is an anecdote and a hit RATE needs a
+	 * denominator. Read once into a static: the value cannot change inside a session, and parsing
+	 * the command line on a 60Hz timer would be silly.
+	 */
+	static const int32 VerifyTraceDashRuns = []()
+	{
+		int32 ParsedRuns = 3;
+		FParse::Value(FCommandLine::Get(), TEXT("TraceTripRuns="), ParsedRuns);
+		return FMath::Clamp(ParsedRuns, 1, 200);
+	}();
+
+	/** Steps between scenarios: long enough for the kill, the respawn and a fresh trace. */
+	static constexpr int32 VerifyStepsBetweenRuns = 90;
+
+	// Idle until there is a real match with a real carrier to take the Core off.
+	if (TraceGameState->TraceMatchState != ETraceMatchState::InProgress)
+	{
+		return;
+	}
+
+	++VerifyStep;
+
+	// --- SCENARIO A ---------------------------------------------------------------------------
+	if (VerifyIteration < VerifyTraceDashRuns)
+	{
+		const int32 Phase = VerifyStep % VerifyStepsBetweenRuns;
+
+		if (Phase == 1)
+		{
+			// Force the turnover. Any living player on the other team will do; the point is only
+			// that the Core changes team, which is what leaves a residual trace behind.
+			ATraceCharacter* Carrier = TheCore->GetCarrier();
+			if (Carrier == nullptr || !Carrier->IsAlive() || Carrier->Trail == nullptr
+				|| Carrier->Trail->TrailPoints.Items.Num() < 6)
+			{
+				--VerifyStep;   // Not ready - hold this phase rather than skipping the scenario.
+				return;
+			}
+
+			ATraceCharacter* NewHolder = nullptr;
+			for (const TWeakObjectPtr<ATraceCharacter>& Weak : TrackedCharacters)
+			{
+				ATraceCharacter* Candidate = Weak.Get();
+				if (Candidate != nullptr && Candidate->IsAlive() && Candidate->GetTeam() != ETraceTeam::None
+					&& Candidate->GetTeam() != Carrier->GetTeam())
+				{
+					NewHolder = Candidate;
+					break;
+				}
+			}
+			if (NewHolder == nullptr)
+			{
+				--VerifyStep;
+				return;
+			}
+
+			VerifyTraceOwner = Carrier;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TRIPTEST %d] Turnover: Core %s -> %s. %s keeps a residual trace of %d points (%d of them lethal AND drawn)."),
+				VerifyIteration + 1, *GetNameSafe(Carrier), *GetNameSafe(NewHolder), *GetNameSafe(Carrier),
+				Carrier->Trail->TrailPoints.Items.Num(), Carrier->Trail->ComputeLastLethalIndex() + 1);
+
+			// Debug harness only. Normal play routes Core changes through ReleaseCore /
+			// GrantCoreToTeam; this needs a specific receiver, which is a turnover, not a kickoff.
+			TheCore->GrantTo(NewHolder, ETraceCoreGrantReason::Debug);
+			return;
+		}
+
+		if (Phase == 3)
+		{
+			// Line the tripper up on one side of a segment of the residual trace.
+			ATraceCharacter* TraceOwner = VerifyTraceOwner.Get();
+			if (TraceOwner == nullptr || !TraceOwner->IsAlive() || TraceOwner->Trail == nullptr)
+			{
+				return;
+			}
+
+			const int32 LastLethal = TraceOwner->Trail->ComputeLastLethalIndex();
+			if (LastLethal < 1)
+			{
+				return;
+			}
+
+			const int32 SegmentIndex = LastLethal / 2;
+			const FVector SegmentStart = TraceOwner->Trail->TrailPoints.Items[SegmentIndex].Location;
+			const FVector SegmentEnd = TraceOwner->Trail->TrailPoints.Items[SegmentIndex + 1].Location;
+
+			FVector Along = SegmentEnd - SegmentStart;
+			Along.Z = 0.0;
+			if (!Along.Normalize())
+			{
+				return;
+			}
+			const FVector Across = FVector::CrossProduct(Along, FVector::UpVector).GetSafeNormal();
+			const FVector Midpoint = (SegmentStart + SegmentEnd) * 0.5;
+
+			ATraceCharacter* Tripper = nullptr;
+			for (const TWeakObjectPtr<ATraceCharacter>& Weak : TrackedCharacters)
+			{
+				ATraceCharacter* Candidate = Weak.Get();
+				if (Candidate != nullptr && Candidate != TraceOwner && Candidate->IsAlive()
+					&& Candidate->GetTeam() != ETraceTeam::None && Candidate->GetTeam() != TraceOwner->GetTeam())
+				{
+					Tripper = Candidate;
+					break;
+				}
+			}
+			if (Tripper == nullptr)
+			{
+				return;
+			}
+
+			const FVector DashStart = Midpoint + Across * 260.0;
+			VerifyDashEnd = Midpoint - Across * 240.0;
+			VerifyTripper = Tripper;
+
+			Tripper->SetActorLocation(DashStart, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+			Tripper->SetActorRotation((-Across).Rotation());
+			if (UTraceCharacterMovementComponent* Movement = Tripper->GetTraceMovement())
+			{
+				Movement->StartDash();
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TRIPTEST %d] %s (enemy of %s) starts a dash at %s, aimed across segment %d of the residual trace at %s. TraceOwner emitting=%d."),
+				VerifyIteration + 1, *GetNameSafe(Tripper), *GetNameSafe(TraceOwner), *DashStart.ToCompactString(),
+				SegmentIndex, *Midpoint.ToCompactString(), TraceOwner->Trail->IsEmitting() ? 1 : 0);
+			return;
+		}
+
+		if (Phase == 4)
+		{
+			// Second half of the sweep, one frame later: this is the segment the trip test sees.
+			if (ATraceCharacter* Tripper = VerifyTripper.Get())
+			{
+				Tripper->SetActorLocation(VerifyDashEnd, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+				UE_LOG(LogTraceGame, Display, TEXT("[TRIPTEST %d] %s swept through to %s (dashing=%d)."),
+					VerifyIteration + 1, *GetNameSafe(Tripper), *VerifyDashEnd.ToCompactString(),
+					Tripper->IsDashing() ? 1 : 0);
+			}
+			return;
+		}
+
+		if (Phase == 10)
+		{
+			const ATraceCharacter* TraceOwner = VerifyTraceOwner.Get();
+			const bool bKilled = (TraceOwner == nullptr) || !TraceOwner->IsAlive();
+
+			UE_LOG(LogTraceGame, Display, TEXT("[TRIPTEST %d] RESULT: dash through the post-turnover trace %s."),
+				VerifyIteration + 1, bKilled ? TEXT("KILLED the trace owner - PASS") : TEXT("did nothing - FAIL"));
+
+			++VerifyIteration;
+			VerifyStep = 0;
+			return;
+		}
+
+		return;
+	}
+
+	// --- SCENARIO B ---------------------------------------------------------------------------
+	{
+		const int32 Phase = VerifyStep;
+
+		if (Phase == 20)
+		{
+			ATraceCharacter* Carrier = TheCore->GetCarrier();
+			if (Carrier == nullptr || !Carrier->IsAlive())
+			{
+				--VerifyStep;
+				return;
+			}
+
+			// A teammate to receive the pass, and the endzone their team scores in.
+			ATraceCharacter* Receiver = nullptr;
+			for (const TWeakObjectPtr<ATraceCharacter>& Weak : TrackedCharacters)
+			{
+				ATraceCharacter* Candidate = Weak.Get();
+				if (Candidate != nullptr && Candidate != Carrier && Candidate->IsAlive()
+					&& Candidate->GetTeam() == Carrier->GetTeam())
+				{
+					Receiver = Candidate;
+					break;
+				}
+			}
+
+			ATraceEndzone* TargetZone = nullptr;
+			for (TActorIterator<ATraceEndzone> It(World); It; ++It)
+			{
+				ATraceEndzone* Zone = *It;
+				if (IsValid(Zone) && Zone->Trigger != nullptr && Zone->ScoresHere(Carrier->GetTeam()))
+				{
+					TargetZone = Zone;
+					break;
+				}
+			}
+
+			if (Receiver == nullptr || TargetZone == nullptr)
+			{
+				--VerifyStep;
+				return;
+			}
+
+			// Stand them in the middle of the zone, on the floor plane the pads use.
+			const FVector ZoneCentre = TargetZone->Trigger->GetComponentLocation();
+			const FVector Standing(ZoneCentre.X, ZoneCentre.Y, Receiver->GetActorLocation().Z);
+			Receiver->SetActorLocation(Standing, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+
+			VerifyTripper = Receiver;
+			VerifyScoreBefore = TraceGameState->GetScore(Carrier->GetTeam());
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ENDZONETEST] %s (%s) is standing still inside the %s endzone at %s. %s completes a pass to them. Score before: %d."),
+				*GetNameSafe(Receiver), *TraceTeamName(Receiver->GetTeam()).ToString(),
+				*TraceTeamName(TargetZone->OwningTeam).ToString(), *Standing.ToCompactString(),
+				*GetNameSafe(Carrier), VerifyScoreBefore);
+			return;
+		}
+
+		if (Phase == 22)
+		{
+			// The completed-pass path itself: ATraceCore::ServerTickPass ends in exactly this call.
+			if (ATraceCharacter* Receiver = VerifyTripper.Get())
+			{
+				TheCore->GrantTo(Receiver, ETraceCoreGrantReason::Pass);
+			}
+			return;
+		}
+
+		if (Phase == 26)
+		{
+			const ATraceCharacter* Receiver = VerifyTripper.Get();
+			const ETraceTeam Team = (Receiver != nullptr) ? Receiver->GetTeam() : ETraceTeam::None;
+			const int32 ScoreAfter = (Team != ETraceTeam::None) ? TraceGameState->GetScore(Team) : -1;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ENDZONETEST] RESULT: score %d -> %d. A pass completed into the enemy endzone %s."),
+				VerifyScoreBefore, ScoreAfter,
+				(ScoreAfter == VerifyScoreBefore + 1) ? TEXT("SCORED - PASS") : TEXT("did not score - FAIL"));
+
+			GetWorldTimerManager().ClearTimer(VerifyTimerHandle);
+			return;
+		}
 	}
 }
 #endif
@@ -1783,7 +2160,10 @@ void ATraceGameMode::BuildEndzoneSpawnPads()
 	const FBox Bounds = ArenaBuilder->GetFieldBounds();
 	const FVector Centre = Bounds.GetCenter();
 	const float HalfX = FMath::Max(1.f, static_cast<float>(Bounds.Max.X - Bounds.Min.X) * 0.5f);
-	const float Depth = FMath::Clamp(ArenaBuilder->EndzoneDepth, 100.f, HalfX);
+
+	// Ask the builder for the depth rather than re-clamping EndzoneDepth here. This was the third
+	// independent copy of that clamp, and when the copies disagreed the pads landed on the dais.
+	const float Depth = ArenaBuilder->ClampedEndzoneDepth();
 
 	// Mid-endzone: half a depth in from the end wall, half a depth behind the goal line. The gate
 	// towers and the goal line itself stand ON the line, so the middle of the box is the one part of

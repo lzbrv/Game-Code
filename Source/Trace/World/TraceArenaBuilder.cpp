@@ -29,6 +29,10 @@
 #include "UObject/ConstructorHelpers.h"
 #include "UObject/UObjectGlobals.h"            // NewObject, MakeUniqueObjectName
 
+#if WITH_EDITOR
+#include "UObject/UnrealType.h"                // FPropertyChangedEvent, EPropertyChangeType
+#endif
+
 namespace TraceArenaConstants
 {
 	/** The engine basic shapes are 100 uu across and centred on their pivot. */
@@ -527,8 +531,22 @@ namespace TraceArenaConstants
 	 */
 	static constexpr float LampZ = 900.f;
 
-	/** Endzone gate: two towers on the goal line plus a beam across the top. */
-	static constexpr float GateTowerYFrac = 0.5000f;   // 3000
+	/**
+	 * Endzone gate: two towers on the goal line plus a beam spanning the WHOLE width above them.
+	 *
+	 * The towers used to stand at |Y| = 3000, i.e. at half width, and that was the single worst piece
+	 * of misinformation in the arena. The scoring volume has always covered the full 12000 uu width,
+	 * but the gate is what the eye reads as "the endzone starts here", so the arena said the zone was
+	 * the middle half of the field while the trigger said sideline to sideline. Two towers on the
+	 * sidelines with a beam right across say the true thing, and they clear the scoring lane in the
+	 * middle of the goal line, which is where the carrier is actually running.
+	 *
+	 * GateTowerWallGap is measured from the side wall's inner face to the tower's OUTER face. 300
+	 * clears the buttress row (ButtressDepth 200) and the flank rail hanging off it (FlankRailSize 64
+	 * immediately inboard of that) with 36 uu to spare, so the gate never intersects the flank
+	 * dressing. Re-check it if you change either of those.
+	 */
+	static constexpr float GateTowerWallGap = 300.f;
 	static constexpr float GateTowerSide = 420.f;
 	static constexpr float GateTowerHeight = 2300.f;
 	static constexpr float GateBeamSize = 300.f;
@@ -645,6 +663,33 @@ FBox ATraceArenaBuilder::GetFieldBounds() const
 	return Local.TransformBy(GetActorTransform());
 }
 
+float ATraceArenaBuilder::ClampedEndzoneDepth() const
+{
+	// Upper bound is the HALF length, not the length: a zone deeper than that at each end would meet
+	// in the middle, and the derived spawn line would land on the centre dais - which is exactly the
+	// failure a previous pass shipped when this clamp existed in three copies and one of them used a
+	// Max(0, ...) instead. One function, one answer.
+	return FMath::Clamp(EndzoneDepth, 100.f, HalfLength());
+}
+
+FBox ATraceArenaBuilder::GetEndzoneBounds(float EndSign) const
+{
+	const float Sign = (EndSign < 0.f) ? -1.f : 1.f;
+	const float HalfX = HalfLength();
+	const float Depth = ClampedEndzoneDepth();
+
+	// Goal line to end wall along X; sideline to sideline along Y; floor to wall top in Z. The Y
+	// term is the full half width on purpose - see EndzoneHalfWidth().
+	const float NearX = Sign * (HalfX - Depth);
+	const float FarX = Sign * HalfX;
+
+	const FBox Local(
+		FVector(FMath::Min(NearX, FarX), -EndzoneHalfWidth(), 0.f),
+		FVector(FMath::Max(NearX, FarX), EndzoneHalfWidth(), WallHeight));
+
+	return Local.TransformBy(GetActorTransform());
+}
+
 // -------------------------------------------------------------------------------------------------
 // Lifecycle
 // -------------------------------------------------------------------------------------------------
@@ -694,6 +739,19 @@ void ATraceArenaBuilder::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void ATraceArenaBuilder::BuildArena()
 {
+#if WITH_EDITOR
+	// Belt and braces against the one way an editor preview could ever hurt a running game: if a
+	// preview is somehow still standing on this actor when the real build starts, tear it down first
+	// so the arena cannot exist twice. Nothing should be able to reach here with a preview up - the
+	// preview only builds in an editor world and everything it makes is transient - but "two floors,
+	// two sets of endzone triggers" is a bad enough failure to be worth one branch.
+	if (bEditorPreviewBuilt)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("ATraceArenaBuilder: an editor preview was still standing at build time; clearing it first."));
+		DestroyBuiltArena();
+	}
+#endif
+
 	bArenaBuilt = true;
 
 	// A dedicated server needs collision and triggers, nothing else: material shaders are not cooked
@@ -1368,8 +1426,9 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// --- Corner pylons ---------------------------------------------------------------------------
 	//
 	// The four corners behind the goal lines were the only part of the field with no structure of any
-	// kind: the gate towers stop at |Y| = 3000 and the endzone is otherwise flat. A tall column in
-	// each corner closes the room off and, incidentally, gives a defender something to fight around.
+	// kind, the endzone floor being otherwise flat. A tall column in each corner closes the room off
+	// and, incidentally, gives a defender something to fight around. They sit at (10600, 5100), i.e.
+	// inboard of and behind the gate towers at (9600, 5490) - checked, nothing intersects.
 	//
 	// Built BEFORE the visuals-only section on purpose: these block, and a dedicated server has to
 	// build the same collision the clients are predicting against.
@@ -1458,8 +1517,14 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 {
 	UWorld* World = GetWorld();
 	const float HalfX = HalfLength();
-	const float HalfY = HalfWidth();
-	const float Depth = FMath::Clamp(EndzoneDepth, 100.f, HalfX);
+
+	// FULL WIDTH, from one function, for every piece of this. The trigger, the floor patch, the goal
+	// line and the gate all measure themselves against EndzoneHalfWidth() so the volume that scores
+	// and the paint that advertises it are the same rectangle by construction rather than by
+	// coincidence. See the header note on EndzoneHalfWidth before narrowing anything here.
+	const float HalfY = EndzoneHalfWidth();
+	const float ZoneWidth = HalfY * 2.f;
+	const float Depth = ClampedEndzoneDepth();
 
 	const ETraceTeam Teams[] = { ETraceTeam::Blue, ETraceTeam::Orange };
 	for (const ETraceTeam Team : Teams)
@@ -1480,18 +1545,20 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 			RegisterSideMID(Sign, PatchMID, /*bNeon=*/false, /*Intensity=*/0.10f, /*BaseDim=*/0.020f);
 			AddMeshBlock(CubeMesh,
 				FVector(CenterX, 0.f, TraceArenaConstants::PatchZ),
-				FVector(Depth, FieldWidth, TraceArenaConstants::PatchThickness),
+				FVector(Depth, ZoneWidth, TraceArenaConstants::PatchThickness),
 				PatchMID, /*bCastShadow=*/false, TEXT("EndzonePatch"));
 
 			UMaterialInstanceDynamic* LineMID = MakeNeonMID(TeamColor, TraceArenaConstants::GlowGoalLine);
 			RegisterSideMID(Sign, LineMID, /*bNeon=*/true, TraceArenaConstants::GlowGoalLine);
 			AddMeshBlock(CubeMesh,
 				FVector(GoalX, 0.f, TraceArenaConstants::GoalLineZ),
-				FVector(TraceArenaConstants::GoalLineWidth, FieldWidth, TraceArenaConstants::GoalLineThickness),
+				FVector(TraceArenaConstants::GoalLineWidth, ZoneWidth, TraceArenaConstants::GoalLineThickness),
 				LineMID, /*bCastShadow=*/false, TEXT("GoalLine"));
 
-			// Two rails on the floor running from the goal line back to the end wall, closing the
-			// endzone off visually so it reads as a room you score into rather than as more floor.
+			// Two rails on the floor running from the goal line back to the end wall, one against
+			// each sideline, closing the endzone off visually so it reads as a room you score into
+			// rather than as more floor. They sit ON the sidelines because the zone reaches them:
+			// together with the goal line they draw the exact rectangle the trigger occupies.
 			for (const float YSign : { -1.f, 1.f })
 			{
 				AddMeshBlock(CubeMesh,
@@ -1502,16 +1569,21 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 
 			// --- Gate ----------------------------------------------------------------------------
 			//
-			// Two towers on the goal line with a beam across the top. This is the single biggest
-			// piece of "you are attacking THAT way" signage in the arena: it is 2600 uu tall, lit in
-			// the defending team's colour, and visible from the opposite endzone.
+			// Two towers ON THE SIDELINES with a beam across the entire width between them. This is
+			// the single biggest piece of "you are attacking THAT way" signage in the arena: 2600 uu
+			// tall, lit in the defending team's colour, visible from the opposite endzone - and now
+			// also the thing that tells you how WIDE the endzone is, which is the whole point of
+			// moving the towers out. A gate you can run round is a gate that lies about the zone.
 			UMaterialInstanceDynamic* GateBodyMID = MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f,
 				TeamColor, 0.026f);
 			UMaterialInstanceDynamic* GateNeonMID = MakeNeonMID(TeamColor, TraceArenaConstants::GlowPylon);
 			RegisterSideMID(Sign, GateBodyMID, /*bNeon=*/false, /*Intensity=*/0.026f, /*BaseDim=*/-1.f);
 			RegisterSideMID(Sign, GateNeonMID, /*bNeon=*/true, TraceArenaConstants::GlowPylon);
 
-			const float TowerY = HalfY * TraceArenaConstants::GateTowerYFrac;
+			// Outer face GateTowerWallGap off the side wall; Max() keeps a silly FieldWidth from
+			// pushing the two towers through each other at the centreline.
+			const float TowerY = FMath::Max(TraceArenaConstants::GateTowerSide,
+				HalfY - TraceArenaConstants::GateTowerWallGap - TraceArenaConstants::GateTowerSide * 0.5f);
 			for (const float YSign : { -1.f, 1.f })
 			{
 				AddPylon(FVector2D(GoalX, YSign * TowerY),
@@ -1519,11 +1591,15 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 					GateBodyMID, GateNeonMID, TEXT("GateTower"));
 			}
 
+			// The beam runs the FULL width, wall to wall, rather than only between the towers: its
+			// ends bury themselves a few uu into the side walls, which is what makes it read as a
+			// span carried by the arena instead of a bar balanced on two columns. It is 300 uu deep
+			// and its top sits at 2600, flush with the wall tops.
 			const float BeamZ = TraceArenaConstants::GateTowerHeight + TraceArenaConstants::GateBeamSize * 0.5f;
 			UMaterialInstanceDynamic* GateFaceMID = MakeNeonMID(TeamColor, TraceArenaConstants::GlowFace);
 			RegisterSideMID(Sign, GateFaceMID, /*bNeon=*/true, TraceArenaConstants::GlowFace);
 			AddNeonBlock(FVector(GoalX, 0.f, BeamZ),
-				FVector(TraceArenaConstants::GateBeamSize, TowerY * 2.f + TraceArenaConstants::GateTowerSide, TraceArenaConstants::GateBeamSize),
+				FVector(TraceArenaConstants::GateBeamSize, ZoneWidth, TraceArenaConstants::GateBeamSize),
 				0.f, GateBodyMID, GateNeonMID, /*bCollide=*/false, TEXT("GateBeam"),
 				GateFaceMID, /*bVerticalTrim=*/false);   // a horizontal beam has no vertical corners worth lighting
 		}
@@ -1539,9 +1615,16 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 			GetActorRotation(),
 			GetActorTransform().TransformPosition(FVector(CenterX, 0.f, WallHeight * 0.5f)));
 
-		ATraceEndzone* Zone = World->SpawnActorDeferred<ATraceEndzone>(
-			ATraceEndzone::StaticClass(), ZoneTransform, /*Owner=*/nullptr, /*Instigator=*/nullptr,
-			ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+		// Deferred so OwningTeam and the box extent are already correct when BeginPlay runs, and
+		// RF_Transient because this is runtime scaffolding exactly like the player start pads: it
+		// must never be serialised into a level, least of all by the editor preview below.
+		FActorSpawnParameters ZoneParams;
+		ZoneParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		ZoneParams.ObjectFlags |= RF_Transient;
+		ZoneParams.bDeferConstruction = true;
+
+		ATraceEndzone* Zone = World->SpawnActor<ATraceEndzone>(
+			ATraceEndzone::StaticClass(), ZoneTransform, ZoneParams);
 
 		if (Zone == nullptr)
 		{
@@ -1549,14 +1632,30 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 			continue;
 		}
 
+		// Half extents: half the depth along X, the FULL half width along Y (sideline to sideline),
+		// and floor to wall top in Z so a carrier scores whether they are running, jumping or
+		// standing on anything built inside the zone.
 		Zone->ConfigureZone(Team, FVector(Depth * 0.5f, HalfY, WallHeight * 0.5f));
 		Zone->FinishSpawning(ZoneTransform);
+
+		// Logged at Log, not Verbose, and with the numbers spelled out: "does the endzone really
+		// span the whole field?" is otherwise a question you can only answer by walking into a
+		// corner and hoping. X is the goal-line-to-end-wall span, Y is sideline to sideline.
+		UE_LOG(LogTraceGame, Log,
+			TEXT("Endzone (%s defends) spans X %.0f..%.0f, Y %.0f..%.0f (full field width %.0f), Z 0..%.0f."),
+			*TraceTeamName(Team).ToString(),
+			FMath::Min(GoalX, Sign * HalfX), FMath::Max(GoalX, Sign * HalfX),
+			-HalfY, HalfY, ZoneWidth, WallHeight);
 
 		// We are very often spawned from ATraceGameMode::BeginPlay, i.e. from inside the world's
 		// own begin-play sweep, and an actor created during that sweep is not guaranteed to be
 		// dispatched by it. The endzone does all of its wiring in BeginPlay, so force it here -
 		// DispatchBeginPlay self-guards, and the world's later pass will simply skip it.
-		if (!Zone->HasActorBegunPlay())
+		//
+		// NEVER during an editor preview: an editor world does not begin play at all, and starting a
+		// scoring trigger ticking in the level editor is a side effect a preview button has no
+		// business having. The box still draws its wireframe, which is all the preview needs it for.
+		if (!bBuildingEditorPreview && !Zone->HasActorBegunPlay())
 		{
 			Zone->DispatchBeginPlay();
 		}
@@ -1588,8 +1687,12 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 
 		// A team spawns in front of the endzone it defends and faces the centre of the field.
 		//
-		// Depth is clamped exactly as BuildEndzones clamps it, so the pads cannot end up inside (or
-		// on the far side of) the endzone they are supposed to sit in front of. The lower bound is
+		// Depth comes from the SAME function BuildEndzones uses (ClampedEndzoneDepth), not from a
+		// second hand-written clamp, so the pads cannot end up inside (or on the far side of) the
+		// endzone they are supposed to sit in front of. Widening the endzone to the full field width
+		// changed nothing here - the line is a function of depth alone - but the lateral spread is
+		// worth a thought: it is StartSpreadFraction (0.7) of the half width, i.e. +/-4200, which is
+		// comfortably inside the sidelines whether or not the zone reaches them. The lower bound is
 		// the dais rather than 0: with a large EndzoneDepth the old Max(0.f, ...) put BOTH teams'
 		// spawn lines at X = 0, i.e. on top of the centre dais — silently reproducing the exact
 		// "spawned inside geometry" failure this build was shipped with.
@@ -1598,7 +1701,7 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 		// and wing platform in TraceArenaConstants: nothing is built across it. If you move the
 		// interior layout, re-check it - a start pad inside a solid block is a pawn that spawns
 		// embedded in the world.
-		const float Depth = FMath::Clamp(EndzoneDepth, 100.f, HalfX);
+		const float Depth = ClampedEndzoneDepth();
 		const float MinLineX = TraceArenaConstants::DaisTopTierSide + TraceArenaConstants::DaisTierSideStep * TraceArenaConstants::DaisTiers;
 		const float LineX = Sign * FMath::Max(MinLineX, HalfX * (1.f - TraceArenaConstants::StartInsetFraction) - Depth);
 		const float FacingYaw = (Sign < 0.f) ? 0.f : 180.f;
@@ -1919,6 +2022,14 @@ void ATraceArenaBuilder::BuildPostProcess()
 // Primitive helpers
 // -------------------------------------------------------------------------------------------------
 
+EObjectFlags ATraceArenaBuilder::BuiltObjectFlags() const
+{
+	// RF_Transient during an editor preview and nothing at runtime. This is the flag that keeps the
+	// preview out of the .umap: a transient object is skipped when the level is saved, so a user who
+	// builds a preview and then saves the map saves the builder actor and none of its geometry.
+	return bBuildingEditorPreview ? RF_Transient : RF_NoFlags;
+}
+
 UStaticMeshComponent* ATraceArenaBuilder::AddMeshBlock(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
 	UMaterialInstanceDynamic* MID, bool bCastShadow, const TCHAR* DebugName, float YawDegrees)
 {
@@ -1930,7 +2041,8 @@ UStaticMeshComponent* ATraceArenaBuilder::AddMeshBlock(UStaticMesh* Mesh, const 
 	}
 
 	UStaticMeshComponent* Component = NewObject<UStaticMeshComponent>(
-		this, MakeUniqueObjectName(this, UStaticMeshComponent::StaticClass(), FName(DebugName)));
+		this, MakeUniqueObjectName(this, UStaticMeshComponent::StaticClass(), FName(DebugName)),
+		BuiltObjectFlags());
 	if (Component == nullptr)
 	{
 		return nullptr;
@@ -1968,7 +2080,8 @@ UBoxComponent* ATraceArenaBuilder::AddCollisionBlock(const FVector& LocalCenter,
 	}
 
 	UBoxComponent* Component = NewObject<UBoxComponent>(
-		this, MakeUniqueObjectName(this, UBoxComponent::StaticClass(), FName(DebugName)));
+		this, MakeUniqueObjectName(this, UBoxComponent::StaticClass(), FName(DebugName)),
+		BuiltObjectFlags());
 	if (Component == nullptr)
 	{
 		return nullptr;
@@ -2000,7 +2113,8 @@ UBoxComponent* ATraceArenaBuilder::AddPawnStandoff(const FVector& LocalCenter, c
 	}
 
 	UBoxComponent* Component = NewObject<UBoxComponent>(
-		this, MakeUniqueObjectName(this, UBoxComponent::StaticClass(), FName(DebugName)));
+		this, MakeUniqueObjectName(this, UBoxComponent::StaticClass(), FName(DebugName)),
+		BuiltObjectFlags());
 	if (Component == nullptr)
 	{
 		return nullptr;
@@ -2254,7 +2368,8 @@ UPointLightComponent* ATraceArenaBuilder::AddPointLight(const FVector& LocalCent
 	}
 
 	UPointLightComponent* Light = NewObject<UPointLightComponent>(
-		this, MakeUniqueObjectName(this, UPointLightComponent::StaticClass(), FName(DebugName)));
+		this, MakeUniqueObjectName(this, UPointLightComponent::StaticClass(), FName(DebugName)),
+		BuiltObjectFlags());
 	if (Light == nullptr)
 	{
 		return nullptr;
@@ -2487,6 +2602,9 @@ UMaterialInstanceDynamic* ATraceArenaBuilder::MakeSurfaceMID(const FLinearColor&
 	MID->SetVectorParameterValue(TEXT("Emissive"), Emissive);
 	MID->SetScalarParameterValue(TEXT("EmissiveStrength"), EmissiveStrength);
 
+	// Outered to this actor, so it follows the same transient rule as the components that use it.
+	MID->SetFlags(BuiltObjectFlags());
+
 	TintMIDs.Add(MID);
 	return MID;
 }
@@ -2516,6 +2634,8 @@ UMaterialInstanceDynamic* ATraceArenaBuilder::MakeNeonMID(const FLinearColor& Co
 		// that is the cost of not having run Scripts/generate_content.py.
 		MID->SetScalarParameterValue(TEXT("Roughness"), 0.9f);
 	}
+
+	MID->SetFlags(BuiltObjectFlags());
 
 	TintMIDs.Add(MID);
 	return MID;
@@ -2630,3 +2750,168 @@ void ATraceArenaBuilder::ApplyTeamSidesInWorld(const UWorld* World, ETraceTeam T
 		It->ApplyTeamSides(TeamOnNegativeSide);
 	}
 }
+
+// -------------------------------------------------------------------------------------------------
+// Editor preview
+//
+// See the two-click workflow documented on BuildPreviewInEditor in the header. Everything below is
+// #if WITH_EDITOR: none of it is compiled into a packaged game, so a preview cannot exist there and
+// the runtime path is byte-identical to what it was.
+// -------------------------------------------------------------------------------------------------
+
+#if WITH_EDITOR
+
+void ATraceArenaBuilder::DestroyBuiltArena()
+{
+	// Every piece of geometry is a component attached under Root (AddMeshBlock, AddCollisionBlock,
+	// AddPawnStandoff and AddPointLight all SetupAttachment(Root)), so walking the attachment tree
+	// is a complete list by construction — no parallel bookkeeping array to fall out of step with
+	// what was actually built. Root itself is a constructor subobject and stays.
+	//
+	// NOT named "Children": AActor has a member of that name and a local shadowing it fails the
+	// Windows build under /W4 (C4458), which this project has already been bitten by once.
+	int32 ComponentsDestroyed = 0;
+	if (Root != nullptr)
+	{
+		TArray<USceneComponent*> BuiltChildren;
+		Root->GetChildrenComponents(/*bIncludeAllDescendants=*/true, BuiltChildren);
+
+		for (USceneComponent* Child : BuiltChildren)
+		{
+			if (IsValid(Child))
+			{
+				Child->DestroyComponent();
+				++ComponentsDestroyed;
+			}
+		}
+	}
+
+	int32 ActorsDestroyed = 0;
+	for (const TObjectPtr<AActor>& Spawned : SpawnedActors)
+	{
+		AActor* Actor = Spawned.Get();
+		if (IsValid(Actor))
+		{
+			Actor->Destroy();
+			++ActorsDestroyed;
+		}
+	}
+	SpawnedActors.Reset();
+
+	// The MIDs are outered to this actor and referenced only from here and from the components that
+	// just died, so dropping the array is enough; GC takes them.
+	TintMIDs.Reset();
+	SideMIDs.Reset();
+	PaintedTeamOnNegativeSide = ETraceTeam::Blue;
+
+	bArenaBuilt = false;
+	bEditorPreviewBuilt = false;
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("ATraceArenaBuilder: torn down %d components and %d actors."),
+		ComponentsDestroyed, ActorsDestroyed);
+}
+
+void ATraceArenaBuilder::BuildPreviewInEditor()
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// EDITOR WORLDS ONLY. In a PIE or game world the arena is already built (or about to be) by the
+	// game mode, and a second copy from a button press would be two floors, two sets of endzone
+	// triggers and two lighting rigs on top of each other. Refuse loudly rather than half-work.
+	if (World->WorldType != EWorldType::Editor && World->WorldType != EWorldType::EditorPreview)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("BuildPreviewInEditor is an editor-only tool and does nothing in a play session — the arena ")
+			TEXT("builds itself at BeginPlay. Stop PIE, then press it in the level editor."));
+		return;
+	}
+
+	// Idempotent: pressing the button twice, or pressing it after changing FieldLength, replaces the
+	// preview rather than stacking a second arena on top of the first.
+	DestroyBuiltArena();
+
+	bBuildingEditorPreview = true;
+	BuildArena();
+	bBuildingEditorPreview = false;
+
+	bEditorPreviewBuilt = true;
+
+	// SELF-CHECK, and it earns its keep: "the preview cannot be saved into the map" is a claim about
+	// an object flag on ~1000 objects, made by code that a later edit could quietly break (one
+	// NewObject that forgets BuiltObjectFlags is all it takes), and the symptom would not appear
+	// until someone saved the level and then played it with two arenas in it. Counting is cheap;
+	// finding that bug from the symptom is not.
+	int32 NonTransient = 0;
+	for (const UActorComponent* Built : GetComponents())
+	{
+		if (Built != nullptr && Built != Root && !Built->HasAnyFlags(RF_Transient))
+		{
+			++NonTransient;
+		}
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Arena] Editor preview built: %d components, %d actors, %.0f x %.0f uu. ")
+		TEXT("Press Clear Preview In Editor to remove it; it is never saved into the map."),
+		GetComponents().Num(), SpawnedActors.Num(), FieldLength, FieldWidth);
+
+	if (NonTransient > 0)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] %d preview components are NOT transient and would be saved into the level, ")
+			TEXT("which would double the arena at runtime. Every component factory must pass BuiltObjectFlags()."),
+			NonTransient);
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("[Arena] Preview is fully transient: nothing here can be saved into the map."));
+	}
+}
+
+void ATraceArenaBuilder::ClearPreviewInEditor()
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// Same gate as the build button, and for a much sharper reason: without it, pressing Clear on a
+	// builder selected in the level while PIE is running would delete a LIVE arena out from under
+	// the players standing in it.
+	if (World->WorldType != EWorldType::Editor && World->WorldType != EWorldType::EditorPreview)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("ClearPreviewInEditor is an editor-only tool and does nothing in a play session."));
+		return;
+	}
+
+	if (!bEditorPreviewBuilt && !bArenaBuilt)
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("[Arena] No editor preview to clear."));
+		return;
+	}
+
+	DestroyBuiltArena();
+	UE_LOG(LogTraceGame, Log, TEXT("[Arena] Editor preview cleared."));
+}
+
+void ATraceArenaBuilder::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+	Super::PostEditChangeProperty(PropertyChangedEvent);
+
+	// A preview that does not follow the numbers next to it is a trap: you widen the field, the
+	// viewport does not move, and you conclude the property does nothing. Only rebuild when a
+	// preview is already standing (so this costs nothing for anyone not using the tool) and only on
+	// a committed edit — EPropertyChangeType::Interactive fires on every mouse-drag frame of a
+	// slider, and rebuilding ~830 components per frame would lock the editor up.
+	if (bEditorPreviewBuilt && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive)
+	{
+		BuildPreviewInEditor();
+	}
+}
+
+#endif // WITH_EDITOR

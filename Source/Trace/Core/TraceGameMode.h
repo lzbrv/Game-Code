@@ -135,8 +135,24 @@ public:
 	/** Called by ATraceEndzone when a carrier reaches the opposing endzone. */
 	void NotifyScored(ETraceTeam ScoringTeam);
 
-	void RegisterCharacter(ATraceCharacter* Character);
-	void UnregisterCharacter(ATraceCharacter* Character);
+	/**
+	 * Server: award a point if @p InCharacter is the Core carrier RIGHT NOW and is standing inside an
+	 * endzone their team scores in.
+	 *
+	 * Called by ATraceCore::GrantTo on every possession change, which is the case a trigger volume
+	 * cannot see: a completed pass to a teammate who is ALREADY standing in the enemy endzone (or a
+	 * kill steal taken in there). Nothing overlaps-begins for a player who is not moving, so the
+	 * test has to be re-run against the possession event rather than against the movement event.
+	 *
+	 * The geometry is read off the ATraceEndzone volume itself — never from field bounds or any
+	 * other second copy of where the endzone is — so it stays correct however the zones are sized.
+	 *
+	 * @return true when a point was awarded.
+	 */
+	bool CheckEndzoneScoreForCarrier(ATraceCharacter* InCharacter, const TCHAR* Reason);
+
+	void RegisterCharacter(ATraceCharacter* InCharacter);
+	void UnregisterCharacter(ATraceCharacter* InCharacter);
 
 	/**
 	 * The server's roster of live characters. Used by the weapon's lag-compensated resolver and by
@@ -431,6 +447,17 @@ private:
 	/** Team the Core was granted to at the last kickoff. Only read by ECoreKickoffMode::AlternateTeams. */
 	ETraceTeam LastKickoffTeam = ETraceTeam::None;
 
+	/**
+	 * World time of the last score this class actually processed, for the one-score-at-a-time guard
+	 * in NotifyScored.
+	 *
+	 * There are now two ways in: the ATraceEndzone trigger/poll, and CheckEndzoneScoreForCarrier on
+	 * a possession change. A pass completed inside the endzone satisfies both within the same tenth
+	 * of a second, and a capture must never pay twice. Seeded far in the past (world time starts at
+	 * 0) so the first score of a match is never swallowed.
+	 */
+	float LastScoreProcessedWorldTime = -10000.f;
+
 	FTimerHandle WarmupTimerHandle;
 	FTimerHandle MatchTimerHandle;
 	FTimerHandle HalfTimeTimerHandle;
@@ -439,5 +466,33 @@ private:
 
 #if !UE_BUILD_SHIPPING
 	FTimerHandle BotDebugTimerHandle;
+
+	// --- -TraceTripTest: scripted verification of the two rules this pass fixed ------------------
+	//
+	// Off unless the switch is on the command line, and compiled out of a shipping build entirely.
+	// It exists because both fixes are about cases that are rare in organic play but decide matches:
+	// dashing through the trace a turnover left behind, and a pass completed to a teammate who is
+	// already standing in the enemy endzone. Waiting for ten bots to stumble into them is not
+	// evidence. This drives each one on purpose and logs the outcome.
+	FTimerHandle VerifyTimerHandle;
+
+	/** Step counter within one scripted scenario; see RunVerificationStep(). */
+	int32 VerifyStep = 0;
+
+	/** How many trace-dash scenarios have been run, so "reliably" means more than once. */
+	int32 VerifyIteration = 0;
+
+	/** The player whose trace is being dashed through, and the enemy doing the dashing. */
+	TWeakObjectPtr<ATraceCharacter> VerifyTraceOwner;
+	TWeakObjectPtr<ATraceCharacter> VerifyTripper;
+
+	/** Far side of the scripted dash, applied one frame after the near side so the sweep crosses. */
+	FVector VerifyDashEnd = FVector::ZeroVector;
+
+	/** Score snapshot taken before the scripted endzone pass, so the point can be measured. */
+	int32 VerifyScoreBefore = 0;
+
+	/** Drives the scenarios. Fires every frame-ish; each call advances one step. */
+	void RunVerificationStep();
 #endif
 };

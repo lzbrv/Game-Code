@@ -18,6 +18,13 @@ class UPrimitiveComponent;
 /**
  * A scoring volume at one end of the field.
  *
+ * SHAPE. Goal line to end wall along X, floor to wall top in Z, and the ENTIRE WIDTH of the field
+ * along Y - sideline to sideline, like a real football endzone. ATraceArenaBuilder sizes it from
+ * EndzoneHalfWidth() and paints the floor patch, the goal line and the endzone gate from the same
+ * number, so the rectangle you can see is the rectangle that scores. If you ever narrow one of
+ * them, narrow all of them: a carrier who crosses the line by a sideline and does not score reads
+ * as a broken trigger, not as a design decision.
+ *
  * SCORING DIRECTION - read this before touching anything below.
  * OwningTeam is the team that *defends* this zone. You score in your OPPONENT's zone, so a zone
  * with OwningTeam == Blue is scored in by an ORANGE carrier, and vice versa. The whole rule is

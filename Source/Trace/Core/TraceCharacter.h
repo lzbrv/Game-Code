@@ -426,6 +426,25 @@ protected:
 	void SetDeadPresentation(bool bDead);
 
 	/**
+	 * The corpse VANISHES. Mesh, fallback shapes, skid streak, trail meshes, viewmodel — everything
+	 * this actor draws, gone on the frame the death is known, and back on the frame it is undone.
+	 *
+	 * Called only from SetDeadPresentation(), which is driven by the REPLICATED health value
+	 * (UTraceHealthComponent::OnRep_Health), so the server, every client and any client that joins
+	 * later all reach the same answer from the same fact. A multicast would leave a late joiner
+	 * looking at a body nobody else can see.
+	 *
+	 * Hiding at the ACTOR level rather than by clearing each component's own visibility flag is the
+	 * whole trick: which components are visible at any moment is decided elsewhere and by several
+	 * owners at once — SetupCharacterVisuals() picks mannequin OR fallback shapes depending on
+	 * whether the art import was run, UpdateViewBlend() owns the viewmodel, UpdateCrouchPresentation()
+	 * owns the skid. bHiddenInGame is an INDEPENDENT second gate on top of all of that, so setting it
+	 * hides everything and clearing it restores precisely the state the pawn had, with nothing to
+	 * guess back on respawn.
+	 */
+	void SetCorpseHidden(bool bInHidden);
+
+	/**
 	 * Passes the Core along the client's aim. Reliable because it is a state change, not an
 	 * effect; the direction is quantised per contract §9.5 and re-validated server-side.
 	 */

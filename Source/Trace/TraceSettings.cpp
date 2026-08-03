@@ -7,6 +7,18 @@
 #include "Trace.h"                      // LogTraceGame
 #include "TraceTypes.h"
 
+#if WITH_EDITOR || !UE_BUILD_SHIPPING
+// Live-tuning support, and the dev-only verification commands at the bottom of this file. See
+// ApplyLiveMovementTuning() for why a settings object is allowed to reach into character movement
+// components, and why it is limited to re-asserting exactly the two fields BeginPlay already writes.
+#include "Containers/Ticker.h"          // FTSTicker, for Trace.LiveEditTest's delay
+#include "Engine/World.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "HAL/IConsoleManager.h"        // FAutoConsoleCommandWithArgs
+#include "UObject/UnrealType.h"         // FProperty, for naming the edited property
+#include "UObject/UObjectIterator.h"
+#endif
+
 // Why the FTraceTrailPoint replication callbacks live in *this* translation unit:
 //
 // The callbacks have to reach UTraceTrailComponent::OnTrailPointsChanged(). TraceTrailComponent.h
@@ -89,6 +101,14 @@ UTraceSettings::UTraceSettings(const FObjectInitializer& ObjectInitializer)
 	// past its reaction delay, is
 	//
 	//     TTK  =  (3 / P) * FireInterval / DutyCycle,     DutyCycle = burst / (burst + rest)
+	//
+	// NOTE, FIRE RATE CHANGED THIS PASS: FireInterval went 0.12 -> 0.16 (a 25% slower gun, asked for
+	// explicitly). FireInterval is a LINEAR term in the TTK above, so every measured figure quoted
+	// per-profile below is now about 33% longer than it was when it was measured — for the bots AND
+	// for the player, since both fire the same weapon. The three difficulties keep their ratios to
+	// each other exactly, which is what these profiles exist to control; the whole ladder simply
+	// moved down one notch in absolute lethality. Deliberately NOT compensated for here: silently
+	// speeding the bots back up would undo half of the change that was requested.
 	//
 	// Each profile below states the TTK it is aiming for at its own PreferredCombatRange, and the
 	// numbers are solved for that. The model is a lower bound on real time-to-kill — it assumes
@@ -290,6 +310,98 @@ FName UTraceSettings::GetCategoryName() const
 	return FName(TEXT("Game"));
 }
 
+#if WITH_EDITOR
+
+// =================================================================================================
+// Live editing during PIE
+//
+// The Project Settings details panel edits this class's CDO in place, and Get() returns that same
+// CDO, so the ~55 call sites that read Get() at their point of use are already live: drag a slider,
+// see it on the next frame, PIE still running. Nothing in this section is needed for those.
+//
+// This section exists for the values that CANNOT be read at the point of use because they have been
+// copied into a field that engine code reads directly. There is exactly one such family today —
+// UCharacterMovementComponent::MaxWalkSpeed and MaxWalkSpeedCrouched, which
+// UTraceCharacterMovementComponent::BeginPlay initialises from WalkSpeed — and it happens to be the
+// single most feel-critical number a designer would want to tune live.
+// =================================================================================================
+
+FTraceSettingsChanged& UTraceSettings::OnSettingsChanged()
+{
+	// Function-local static rather than a class member: the delegate must outlive, and be
+	// independent of, the CDO. The config system reconstructs and re-populates the CDO on a hot
+	// reload, which would silently drop every subscriber if the list lived on the object.
+	static FTraceSettingsChanged Delegate;
+	return Delegate;
+}
+
+void UTraceSettings::ApplyLiveMovementTuning()
+{
+	const UTraceSettings& Settings = Get();
+
+	// Deliberately NOT named WalkSpeed: a local that shadows a class member compiles clean on clang
+	// and fails the Windows build with C4458, which Unreal promotes to an error. This project has
+	// already been broken that way once.
+	const float NewMaxWalkSpeed = FMath::Max(1.f, Settings.WalkSpeed);
+
+	// TObjectIterator rather than walking worlds and actors: it is one pass over the movement
+	// components that actually exist, it needs no knowledge of which worlds are live, and it cannot
+	// miss a pawn that is mid-spawn. This runs once per property edit, never per frame.
+	for (TObjectIterator<UCharacterMovementComponent> It; It; ++It)
+	{
+		UCharacterMovementComponent* Movement = *It;
+		if (Movement == nullptr || !IsValid(Movement) || Movement->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject))
+		{
+			continue;
+		}
+
+		// Only components in a running game world. Editor-world (preview / blueprint-editor)
+		// components are not playing the game and must keep whatever their archetype says.
+		const UWorld* World = Movement->GetWorld();
+		if (World == nullptr || !World->IsGameWorld())
+		{
+			continue;
+		}
+
+		// These are exactly the two assignments UTraceCharacterMovementComponent::BeginPlay makes,
+		// so re-running them can never put a pawn into a state that a freshly spawned pawn would not
+		// also be in. If that initialisation ever changes, change it here too — or, better, have the
+		// movement component subscribe to OnSettingsChanged() and delete this loop.
+		//
+		// AS OF THIS PASS THIS IS BELT AND BRACES, NOT THE ONLY MECHANISM, and that is on purpose.
+		// UTraceCharacterMovementComponent::OnMovementUpdated now calls its own
+		// RefreshWalkSpeedFromSettings() every frame, which writes these same two fields from the
+		// same source. Two writers of one value is normally a smell; here they are idempotent and
+		// agree by construction, and each covers a case the other does not — the per-frame refresh
+		// catches config changes from any source (a .ini reload, a console command), while this loop
+		// reaches pawns whose movement is not currently simulating, which is precisely the state a
+		// paused-PIE tuning session leaves them in.
+		Movement->MaxWalkSpeed = NewMaxWalkSpeed;
+		Movement->MaxWalkSpeedCrouched = NewMaxWalkSpeed * 0.5f;
+	}
+}
+
+void UTraceSettings::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+	Super::PostEditChangeProperty(PropertyChangedEvent);
+
+	const FName ChangedName = (PropertyChangedEvent.Property != nullptr)
+		? PropertyChangedEvent.Property->GetFName()
+		: NAME_None;
+
+	// Unconditional, not gated on ChangedName == "WalkSpeed". A struct-wide paste, an "import
+	// defaults", or an edit routed through a container reports NAME_None or the container's name
+	// rather than the leaf, and a gate would then silently skip the one case where re-pushing
+	// matters most. The loop is a few hundred iterations at worst and runs on a human keystroke.
+	ApplyLiveMovementTuning();
+
+	OnSettingsChanged().Broadcast(ChangedName);
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("[TraceSettings] live edit: %s"), *ChangedName.ToString());
+}
+
+#endif // WITH_EDITOR
+
 // ---------------------------------------------------------------------------------------------
 // Bot difficulty
 // ---------------------------------------------------------------------------------------------
@@ -402,3 +514,145 @@ void FTraceTrailPoint::PreReplicatedRemove(const FTraceTrailPointArray& Serializ
 		Component->OnTrailPointsChanged();
 	}
 }
+
+
+#if !UE_BUILD_SHIPPING
+
+// =================================================================================================
+// VERIFICATION INSTRUMENTATION — dev builds only, compiled out of Shipping entirely.
+//
+// Two questions kept being answered by reading a header, which is the one place that cannot answer
+// them: DefaultGame.ini is layered over the C++ initialiser at startup, so the value the game
+// actually runs on is whatever the CDO holds at runtime and nothing else.
+//
+//   Trace.DumpSettings
+//       Log the numbers UTraceSettings::Get() is returning RIGHT NOW, plus the derived values that
+//       are clamped somewhere else (the trail's effective lifetime), plus the engine-owned walk
+//       speed on every live movement component — which is the one family of values that is a COPY
+//       and could therefore disagree with the table.
+//
+//   Trace.LiveEditTest <DelaySeconds> <PropertyName> <Value>
+//       Drive the exact code path the Project Settings details panel drives — assign to the CDO,
+//       then call PostEditChangeProperty — after a delay, so it lands mid-match rather than at
+//       engine init, and dump the result. This is what "the panel retunes the game with PIE still
+//       running" means, expressed as something an unattended run can prove.
+//
+// Neither command is wired into gameplay in any way; nothing outside this block calls them.
+// =================================================================================================
+
+namespace
+{
+	void DumpTraceSettings(const TCHAR* Tag)
+	{
+		const UTraceSettings& Table = UTraceSettings::Get();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] WalkSpeed=%.1f DashSpeed=%.1f DashDuration=%.3f DashCooldown=%.2f "
+			     "FireInterval=%.3f BoostZVelocity=%.1f TrailLifetime=%.2f (trail component uses %.2fs)"),
+			Tag, Table.WalkSpeed, Table.DashSpeed, Table.DashDuration, Table.DashCooldown,
+			Table.FireInterval, Table.BoostZVelocity, Table.TrailLifetime,
+			UTraceTrailComponent::GetTraceLifetimeSeconds());
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] Slide dur=%.2f decel=%.0f maxSpeed=%.0f entryFrac=%.2f mult=%.2f "
+			     "exitFrac=%.2f cooldown=%.2f minCommit=%.2f exitRetention=%.2f exitFloor=%.2f exitCeil=%.2f"),
+			Tag, Table.SlideDuration, Table.SlideDeceleration, Table.SlideMaxSpeed,
+			Table.SlideEntrySpeedFraction, Table.SlideSpeedMultiplier, Table.SlideExitSpeedFraction,
+			Table.SlideCooldown, Table.SlideMinCommitSeconds, Table.SlideExitSpeedRetention,
+			Table.SlideExitMinSpeedFraction, Table.SlideExitMaxSpeedMultiplier);
+
+		// The engine-owned copies. Named MovementIt/LiveMovement rather than anything that reads
+		// like a base-class member: a local shadowing one fails the Windows build (C4458).
+		int32 LiveComponents = 0;
+		int32 Disagreeing = 0;
+		for (TObjectIterator<UCharacterMovementComponent> MovementIt; MovementIt; ++MovementIt)
+		{
+			UCharacterMovementComponent* LiveMovement = *MovementIt;
+			if (LiveMovement == nullptr || !IsValid(LiveMovement)
+				|| LiveMovement->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject))
+			{
+				continue;
+			}
+
+			const UWorld* LiveWorld = LiveMovement->GetWorld();
+			if (LiveWorld == nullptr || !LiveWorld->IsGameWorld())
+			{
+				continue;
+			}
+
+			++LiveComponents;
+			if (!FMath::IsNearlyEqual(LiveMovement->MaxWalkSpeed, Table.WalkSpeed, 0.5f))
+			{
+				++Disagreeing;
+				UE_LOG(LogTraceGame, Display, TEXT("[SettingsDump:%s]   %s MaxWalkSpeed=%.1f (table says %.1f)"),
+					Tag, *GetNameSafe(LiveMovement->GetOwner()), LiveMovement->MaxWalkSpeed, Table.WalkSpeed);
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] %d live movement components, %d disagree with WalkSpeed=%.1f"),
+			Tag, LiveComponents, Disagreeing, Table.WalkSpeed);
+	}
+
+	void ApplyLiveEdit(FString PropertyName, float NewValue)
+	{
+		UTraceSettings* MutableTable = GetMutableDefault<UTraceSettings>();
+		FProperty* Edited = UTraceSettings::StaticClass()->FindPropertyByName(FName(*PropertyName));
+		FFloatProperty* EditedFloat = CastField<FFloatProperty>(Edited);
+
+		if (MutableTable == nullptr || EditedFloat == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[LiveEdit] '%s' is not a float property of UTraceSettings."), *PropertyName);
+			return;
+		}
+
+		const float PreviousValue = EditedFloat->GetPropertyValue_InContainer(MutableTable);
+		EditedFloat->SetPropertyValue_InContainer(MutableTable, NewValue);
+
+#if WITH_EDITOR
+		// Byte for byte what the details panel does after it writes the value.
+		FPropertyChangedEvent EditEvent(Edited, EPropertyChangeType::ValueSet);
+		MutableTable->PostEditChangeProperty(EditEvent);
+#endif
+
+		UE_LOG(LogTraceGame, Display, TEXT("[LiveEdit] %s: %.3f -> %.3f (panel path%s)"),
+			*PropertyName, PreviousValue, NewValue,
+			WITH_EDITOR ? TEXT(", PostEditChangeProperty called") : TEXT(", no editor hook in this build"));
+
+		DumpTraceSettings(TEXT("after-live-edit"));
+	}
+
+	FAutoConsoleCommand CmdDumpTraceSettings(
+		TEXT("Trace.DumpSettings"),
+		TEXT("Dev only. Log the gameplay tuning values UTraceSettings::Get() returns right now, plus every live pawn's engine-owned MaxWalkSpeed."),
+		FConsoleCommandDelegate::CreateStatic(&DumpTraceSettings, TEXT("now")));
+
+	// FAutoConsoleCommand, not FAutoConsoleCommandWithArgs: in UE 5.8 the argument-taking form is an
+	// overload of FAutoConsoleCommand's constructor, and there is no ...WithArgs type.
+	FAutoConsoleCommand CmdLiveEditTest(
+		TEXT("Trace.LiveEditTest"),
+		TEXT("Dev only. Trace.LiveEditTest <DelaySeconds> <PropertyName> <Value> - after the delay, edit the settings CDO exactly as the Project Settings panel does and report what the live pawns end up with."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			if (Args.Num() < 3)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[LiveEdit] usage: Trace.LiveEditTest <DelaySeconds> <PropertyName> <Value>"));
+				return;
+			}
+
+			const float DelaySeconds = FMath::Max(0.f, FCString::Atof(*Args[0]));
+			const FString PropertyName = Args[1];
+			const float NewValue = FCString::Atof(*Args[2]);
+
+			UE_LOG(LogTraceGame, Display, TEXT("[LiveEdit] scheduled: %s = %.3f in %.1fs"), *PropertyName, NewValue, DelaySeconds);
+
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+				[PropertyName, NewValue](float /*Delta*/)
+				{
+					ApplyLiveEdit(PropertyName, NewValue);
+					return false;   // one shot
+				}), DelaySeconds);
+		}));
+}
+
+#endif // !UE_BUILD_SHIPPING

@@ -51,6 +51,47 @@ namespace TraceMovement
 	}
 }
 
+// The four slide-exit knobs (SlideMinCommitSeconds, SlideExitSpeedRetention,
+// SlideExitMinSpeedFraction, SlideExitMaxSpeedMultiplier) are now real UTraceSettings properties and
+// are read directly by the getters below.
+//
+// They were briefly reached through an SFINAE detection shim, because the slide work and the
+// settings work landed in parallel and this file could not add properties to UTraceSettings. That
+// shim is deliberately GONE: now that the properties exist it would only serve to swallow a rename
+// or a typo, silently substituting a hardcoded default for the designer's value instead of failing
+// the build. A direct read is the whole point of having the properties.
+
+#if !UE_BUILD_SHIPPING
+/**
+ * Slide instrumentation. Off by default; "-TraceSlideDebug" on the command line or
+ * `Trace.SlideDebug 1` in the console turns it on for a measurement run.
+ *
+ * At Display, not Verbose. A log line nobody can see has twice now been read as a dead mechanic.
+ */
+int32 GTraceSlideDebug = 0;
+static FAutoConsoleVariableRef CVarTraceSlideDebug(
+	TEXT("Trace.SlideDebug"),
+	GTraceSlideDebug,
+	TEXT("Dev only. Non-zero logs every slide's duration, distance and entry/exit speed at Display, "
+	     "with a running mean, so a headless match can measure the slide instead of describing it."),
+	ECVF_Cheat);
+
+static bool IsSlideDebugEnabled()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceSlideDebug"));
+	return bFromCommandLine || GTraceSlideDebug != 0;
+}
+
+/**
+ * Match-wide slide sample, not per-pawn: ten bots sliding two hundred times between them is one
+ * sample of the mechanic, and a mean per pawn would be ten small samples of nothing in particular.
+ * Game thread only, and dev-only, so plain file statics are the right amount of machinery.
+ */
+static int32 GTraceSlideDebugCount = 0;
+static float GTraceSlideDebugTotalDuration = 0.f;
+static float GTraceSlideDebugTotalDistance = 0.f;
+#endif
+
 // -------------------------------------------------------------------------------------------
 // UTraceCharacterMovementComponent
 // -------------------------------------------------------------------------------------------
@@ -69,6 +110,7 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 
 	SlideTimeRemaining = 0.f;
 	SlideCooldownRemaining = 0.f;
+	SlideCommitRemaining = 0.f;
 	SlideSpeed = 0.f;
 	SlideDirection = FVector::ZeroVector;
 	SlideBufferRemaining = 0.f;
@@ -83,9 +125,11 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	bUseControllerDesiredRotation = false;
 	RotationRate = FRotator(0.f, 900.f, 0.f);
 
-	// Arena-shooter tuning. MaxWalkSpeed is overwritten from UTraceSettings in BeginPlay; the
-	// literal here only covers the window before play starts (and the CDO in the editor).
-	MaxWalkSpeed = 720.f;
+	// Arena-shooter tuning. MaxWalkSpeed is overwritten from UTraceSettings in BeginPlay and re-pushed
+	// every movement update by RefreshWalkSpeedFromSettings(), so this literal only covers the window
+	// before play starts (and the CDO in the editor). Keep it equal to UTraceSettings::WalkSpeed
+	// anyway — a stale value here is what an editor viewport shows before anyone presses Play.
+	MaxWalkSpeed = 820.f;
 	MaxAcceleration = 4096.f;
 	BrakingDecelerationWalking = 2600.f;
 	GroundFriction = 8.f;
@@ -116,6 +160,29 @@ void UTraceCharacterMovementComponent::BeginPlay()
 	LastMaxDashCharges = GetMaxDashCharges();
 	DashCharges = LastMaxDashCharges;
 	DashRechargeRemaining = 0.f;
+
+#if !UE_BUILD_SHIPPING
+	// One line, once per process, naming every number the kit will actually run on. A measurement
+	// run that does not print the configuration it measured is an anecdote — and this is also the
+	// cheapest possible check that a "-ini:Game:..." override on the command line really landed.
+	if (IsSlideDebugEnabled())
+	{
+		static bool bLoggedKitConfig = false;
+		if (!bLoggedKitConfig)
+		{
+			bLoggedKitConfig = true;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SLIDECFG walk=%.0f | slide dur=%.2f decel=%.0f commit=%.2f entryFrac=%.2f mult=%.2f max=%.0f exitFrac=%.2f cd=%.2f "
+				     "| exit retention=%.2f minFrac=%.2f maxMul=%.2f | dash speed=%.0f dur=%.2f cd=%.2f | boostZ=%.0f cd=%.1f"),
+				MaxWalkSpeed, GetSlideDuration(), GetSlideDeceleration(), GetSlideMinCommitSeconds(),
+				Settings.SlideEntrySpeedFraction, Settings.SlideSpeedMultiplier, Settings.SlideMaxSpeed,
+				Settings.SlideExitSpeedFraction, Settings.SlideCooldown,
+				GetSlideExitSpeedRetention(), GetSlideExitMinSpeedFraction(), GetSlideExitMaxSpeedMultiplier(),
+				GetDashSpeed(), GetDashDuration(), GetDashCooldown(),
+				Settings.BoostZVelocity, GetBoostCooldown());
+		}
+	}
+#endif
 }
 
 bool UTraceCharacterMovementComponent::CanCrouchInCurrentState() const
@@ -151,6 +218,53 @@ float UTraceCharacterMovementComponent::GetDashRechargeWindow() const
 	// HUD's meter divides by exactly this quantity. Keeping every refill on the same window means a
 	// second charge refills on the same rhythm as the first.
 	return GetDashDuration() + GetDashCooldown();
+}
+
+float UTraceCharacterMovementComponent::GetSlideDuration() const
+{
+	// Floored rather than defaulted: a zero-length slide would still spend the slide cooldown.
+	return FMath::Max(0.05f, UTraceSettings::Get().SlideDuration);
+}
+
+float UTraceCharacterMovementComponent::GetSlideDeceleration() const
+{
+	// 0 is legal and means "a slide holds its entry speed for its whole duration".
+	return FMath::Max(0.f, UTraceSettings::Get().SlideDeceleration);
+}
+
+float UTraceCharacterMovementComponent::GetSlideMinCommitSeconds() const
+{
+	// Clamped to the slide's own length: a commit window longer than the slide is meaningless, and
+	// leaving it unclamped would let one bad number make the slide feel like it ignores the key.
+	return FMath::Clamp(UTraceSettings::Get().SlideMinCommitSeconds, 0.f, GetSlideDuration());
+}
+
+float UTraceCharacterMovementComponent::GetSlideExitSpeedRetention() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().SlideExitSpeedRetention);
+}
+
+float UTraceCharacterMovementComponent::GetSlideExitMinSpeedFraction() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().SlideExitMinSpeedFraction);
+}
+
+float UTraceCharacterMovementComponent::GetSlideExitMaxSpeedMultiplier() const
+{
+	// Never below 1: a multiplier under 1 would make a slide exit SLOWER than a walk, which is the
+	// exact behaviour this pass exists to remove. The property's ClampMin matches this floor, so the
+	// settings panel cannot offer a value that this line would silently discard.
+	return FMath::Max(1.f, UTraceSettings::Get().SlideExitMaxSpeedMultiplier);
+}
+
+void UTraceCharacterMovementComponent::RefreshWalkSpeedFromSettings()
+{
+	const float DesiredWalkSpeed = FMath::Max(1.f, UTraceSettings::Get().WalkSpeed);
+	if (!FMath::IsNearlyEqual(MaxWalkSpeed, DesiredWalkSpeed))
+	{
+		MaxWalkSpeed = DesiredWalkSpeed;
+		MaxWalkSpeedCrouched = DesiredWalkSpeed * 0.5f;
+	}
 }
 
 int32 UTraceCharacterMovementComponent::GetMaxDashCharges() const
@@ -337,12 +451,13 @@ void UTraceCharacterMovementComponent::BeginDash()
 	}
 
 	// A dash cancels a slide — they are both "planar velocity is on rails" states and letting them
-	// overlap would mean two writers fighting over Velocity every frame.
-	if (SlideTimeRemaining > 0.f)
-	{
-		SlideTimeRemaining = 0.f;
-		SlideSpeed = 0.f;
-	}
+	// overlap would mean two writers fighting over Velocity every frame. Through EndSlide() so the
+	// measurement and the exit rule stay on one path; the velocity it writes is overwritten by the
+	// dash launch below, which is correct — the dash's speed is strictly the larger of the two.
+	//
+	// A dash beats the commit window on purpose: the commit exists to stop a slide being fumbled
+	// away by the crouch key, not to take the dash away from a player who is about to be shot.
+	EndSlide();
 
 	// Launch on the same frame the intent arrived. The move for this frame has already been
 	// simulated by the time OnMovementUpdated runs, so this velocity lands on the next one — a
@@ -437,9 +552,21 @@ void UTraceCharacterMovementComponent::BeginSlide()
 	const float Entry = FMath::Max(PlanarSpeed, FMath::Max(1.f, Settings.WalkSpeed));
 
 	SlideDirection = Direction;
-	SlideSpeed = FMath::Min(Entry * FMath::Max(1.f, Settings.SlideSpeedMultiplier),
-	                        FMath::Max(1.f, Settings.SlideMaxSpeed));
-	SlideTimeRemaining = FMath::Max(0.05f, Settings.SlideDuration);
+
+	// ENTERING A SLIDE CAN NEVER COST YOU SPEED.
+	//
+	// SlideMaxSpeed still caps the BOOST — that is what stops a slide out of a fast state compounding
+	// into a rocket — but the cap is then floored back up to the speed the pawn actually arrived
+	// with. Without the floor, any pawn already moving faster than SlideMaxSpeed is *braked* by
+	// pressing crouch, which is the precise opposite of what a slide is for. (In practice the dash
+	// already clamps to the walk speed on the frame it ends, so this floor is a guarantee rather
+	// than a common case — but it is the guarantee the whole mechanic rests on.)
+	const float BoostedEntry = FMath::Min(Entry * FMath::Max(1.f, Settings.SlideSpeedMultiplier),
+	                                      FMath::Max(1.f, Settings.SlideMaxSpeed));
+	SlideSpeed = FMath::Max(BoostedEntry, PlanarSpeed);
+
+	SlideTimeRemaining = GetSlideDuration();
+	SlideCommitRemaining = GetSlideMinCommitSeconds();
 
 	// Measured from slide START, same convention as the dash, so the knob reads the same way.
 	SlideCooldownRemaining = SlideTimeRemaining + FMath::Max(0.f, Settings.SlideCooldown);
@@ -450,13 +577,106 @@ void UTraceCharacterMovementComponent::BeginSlide()
 	{
 		Velocity.Z = 0.f;
 	}
+
+#if !UE_BUILD_SHIPPING
+	if (IsSlideDebugEnabled())
+	{
+		SlideDebugEntrySpeed = SlideSpeed;
+		SlideDebugStartLocation = (UpdatedComponent != nullptr)
+			? UpdatedComponent->GetComponentLocation()
+			: FVector::ZeroVector;
+		SlideDebugStartTime = (GetWorld() != nullptr) ? static_cast<float>(GetWorld()->GetTimeSeconds()) : 0.f;
+	}
+#endif
 }
 
 void UTraceCharacterMovementComponent::EndSlide()
 {
+	if (SlideTimeRemaining <= 0.f && SlideSpeed <= 0.f)
+	{
+		// Idempotent: the cancel paths (dash, boost) and the two natural exits can all reach here,
+		// and a second call must not re-write Velocity with a stale direction.
+		SlideCommitRemaining = 0.f;
+		return;
+	}
+
+	// --- Hand the momentum back ------------------------------------------------------------------
+	//
+	// The old exit was ClampPlanarSpeedToMax(), which did nothing at all in the common case: the
+	// slide gave up once its speed had decayed to SlideExitSpeedFraction of the walk speed, i.e.
+	// BELOW the clamp, so the player was dropped out of a slide at 60% of a run and had to
+	// re-accelerate. That is the "slides scrub your momentum" complaint in one line of code.
+	//
+	// Now the exit speed is the slide's own live speed, scaled by SlideExitSpeedRetention, floored
+	// at SlideExitMinSpeedFraction of the walk speed and capped at SlideExitMaxSpeedMultiplier x the
+	// speed normal movement would allow. Both bounds derive from config and from GetMaxSpeed(),
+	// which the replay path reproduces exactly, so this stays prediction-safe.
+	const float Retained = FMath::Max(0.f, SlideSpeed) * GetSlideExitSpeedRetention();
+
+	// Clear FIRST: GetMaxSpeed() folds in SlideSpeed while IsSliding(), so the ceiling below has to
+	// be computed against the speed the pawn is about to live under, not the slide's.
 	SlideTimeRemaining = 0.f;
+	SlideCommitRemaining = 0.f;
+	const float ExitedSpeed = SlideSpeed;
 	SlideSpeed = 0.f;
-	ClampPlanarSpeedToMax();
+
+	// Named ExitCeiling/ExitFloor rather than the obvious Ceiling/Floor: "Floor" is dense with
+	// meaning inside a movement component (CurrentFloor, FindFloor, FFindFloorResult) and a local
+	// that reads like the walkable surface in a function about speed is a trap for the next reader.
+	const float ExitCeiling = FMath::Max(1.f, GetMaxSpeed()) * GetSlideExitMaxSpeedMultiplier();
+	const float ExitFloor = FMath::Min(
+		FMath::Max(1.f, UTraceSettings::Get().WalkSpeed) * GetSlideExitMinSpeedFraction(), ExitCeiling);
+	const float ExitSpeed = FMath::Clamp(Retained, ExitFloor, ExitCeiling);
+
+	// Direction of TRAVEL, not the steered slide direction: on a ledge or against a wall the two can
+	// differ, and the player's momentum is the one they can see.
+	FVector ExitDirection(Velocity.X, Velocity.Y, 0.f);
+	if (!ExitDirection.Normalize())
+	{
+		ExitDirection = SlideDirection;
+		ExitDirection.Z = 0.f;
+		if (!ExitDirection.Normalize())
+		{
+			ExitDirection = (UpdatedComponent != nullptr) ? UpdatedComponent->GetForwardVector() : FVector::ForwardVector;
+			ExitDirection.Z = 0.f;
+			if (!ExitDirection.Normalize())
+			{
+				ExitDirection = FVector::ForwardVector;
+			}
+		}
+	}
+
+	Velocity.X = ExitDirection.X * ExitSpeed;
+	Velocity.Y = ExitDirection.Y * ExitSpeed;
+
+#if !UE_BUILD_SHIPPING
+	// Observation only — never feeds the simulation, so it cannot desync anything. Logged on the
+	// authority alone: the server also advances a remote client's slide inside MoveAutonomous, and a
+	// client replaying corrections would otherwise count the same slide several times.
+	// SlideDebugStartTime > 0 rejects the one slide that could be in flight when the cvar is toggled
+	// on mid-match, whose start was never recorded and would otherwise report the whole match as its
+	// duration and poison the mean.
+	if (IsSlideDebugEnabled() && SlideDebugStartTime > 0.f
+		&& CharacterOwner != nullptr && CharacterOwner->HasAuthority() && GetWorld() != nullptr)
+	{
+		const float Now = static_cast<float>(GetWorld()->GetTimeSeconds());
+		const float Duration = FMath::Max(0.f, Now - SlideDebugStartTime);
+		const FVector Here = (UpdatedComponent != nullptr) ? UpdatedComponent->GetComponentLocation() : SlideDebugStartLocation;
+		const float Distance = FVector::Dist2D(Here, SlideDebugStartLocation);
+
+		++GTraceSlideDebugCount;
+		GTraceSlideDebugTotalDuration += Duration;
+		GTraceSlideDebugTotalDistance += Distance;
+		SlideDebugStartTime = 0.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SLIDE %-16s dur=%5.2fs dist=%6.0fuu entry=%6.0f exitSpeed=%6.0f (slideSpeed was %6.0f) | n=%3d avgDur=%5.2fs avgDist=%6.0fuu"),
+			*GetNameSafe(CharacterOwner), Duration, Distance, SlideDebugEntrySpeed, ExitSpeed, ExitedSpeed,
+			GTraceSlideDebugCount,
+			GTraceSlideDebugTotalDuration / FMath::Max(1, GTraceSlideDebugCount),
+			GTraceSlideDebugTotalDistance / FMath::Max(1, GTraceSlideDebugCount));
+	}
+#endif
 }
 
 void UTraceCharacterMovementComponent::ClampPlanarSpeedToMax()
@@ -528,6 +748,10 @@ void UTraceCharacterMovementComponent::BeginBoost()
 
 	BoostCooldownRemaining = GetBoostCooldown();
 
+	// Read LIVE from the settings CDO on every activation — never cached, not in the constructor and
+	// not in BeginPlay — so retuning BoostZVelocity in Project Settings changes the very next boost,
+	// including mid-PIE. Apex is v^2/2g against the world's gravity: halving the height means
+	// scaling this by sqrt(0.5) (1150 -> ~813, i.e. ~675uu -> ~337uu), not halving the number.
 	Velocity.Z = FMath::Max(1.f, Settings.BoostZVelocity);
 
 	// MOVE_Walking discards vertical velocity outright — PhysWalking projects movement onto the
@@ -551,6 +775,11 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 
 	const UTraceSettings& Settings = UTraceSettings::Get();
 
+	// 0. Pick up a WalkSpeed a designer has just changed in Project Settings. BeginPlay's copy is the
+	//    one piece of cached config in this file, and caching is exactly what this file's own rules
+	//    forbid — without this, retuning WalkSpeed during PIE did nothing until the map reloaded.
+	RefreshWalkSpeedFromSettings();
+
 	// 1. Advance every clock first, so an ability that expires this frame stops driving velocity
 	//    this frame and a cooldown that expires this frame permits an activation this frame.
 	const bool bWasDashing = (DashTimeRemaining > 0.f);
@@ -567,6 +796,10 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	if (SlideCooldownRemaining > 0.f)
 	{
 		SlideCooldownRemaining = FMath::Max(0.f, SlideCooldownRemaining - DeltaSeconds);
+	}
+	if (SlideCommitRemaining > 0.f)
+	{
+		SlideCommitRemaining = FMath::Max(0.f, SlideCommitRemaining - DeltaSeconds);
 	}
 	if (BoostCooldownRemaining > 0.f)
 	{
@@ -620,16 +853,20 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 	}
 
-	// 1d. The frame a dash or a slide ends, hand the player back at walking speed. See
-	//     ClampPlanarSpeedToMax() for why this is a discrete step rather than a velocity cap.
+	// 1d. The frame a dash ends, hand the player back at walking speed. See ClampPlanarSpeedToMax()
+	//     for why this is a discrete step rather than a velocity cap.
 	if (bWasDashing && DashTimeRemaining <= 0.f)
 	{
 		ClampPlanarSpeedToMax();
 	}
+
+	// 1e. A slide whose duration has just run out exits through EndSlide() like every other slide
+	//     exit, so it KEEPS its momentum instead of being clamped. Routing the timer expiry through
+	//     the same function as the key release is what makes "hold the slide out" and "cancel it
+	//     early" cost the same, which is what stops one of them becoming the only correct play.
 	if (bWasSliding && SlideTimeRemaining <= 0.f)
 	{
-		SlideSpeed = 0.f;
-		ClampPlanarSpeedToMax();
+		EndSlide();
 	}
 
 	// 2. Activations, in priority order. Dash first: it is the mechanic the whole game is built
@@ -665,12 +902,11 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	{
 		BeginBoost();
 
-		// Boost leaves the ground, and a slide is a ground state.
-		if (SlideTimeRemaining > 0.f)
-		{
-			SlideTimeRemaining = 0.f;
-			SlideSpeed = 0.f;
-		}
+		// Boost leaves the ground, and a slide is a ground state. EndSlide() carries the slide's
+		// horizontal speed into the launch rather than dropping it, so boosting out of a slide is a
+		// long flat arc — which is the one thing a player boosting mid-slide is obviously trying to
+		// do. It is capped like every other exit, so it cannot become free permanent overspeed.
+		EndSlide();
 	}
 
 	// 4. Crouch: slide on the ground, fast-fall in the air. One key, resolved by where the pawn is.
@@ -686,10 +922,16 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	if (SlideTimeRemaining > 0.f)
 	{
 		// --- Maintain an active slide -----------------------------------------------------------
-		if (!IsMovingOnGround() || !bCrouchHeld)
+		//
+		// Two ways out here, and only one of them is negotiable. Leaving the ground always ends the
+		// slide — it is a ground state and the floor is what it is sliding on. Releasing the key ends
+		// it too, but NOT during the commit window: for SlideMinCommitSeconds the slide is bought and
+		// paid for. That is what makes a slide a commitment worth its cooldown, and it is also what
+		// stops a key released a frame early (or an AI whose hold timer ran out mid-slide) from
+		// amputating it. Momentum survives either exit now, so neither one is a punishment.
+		const bool bCommitted = (SlideCommitRemaining > 0.f);
+		if (!IsMovingOnGround() || (!bCrouchHeld && !bCommitted))
 		{
-			// Released early, or slid off a ledge. Either way the slide is over and the speed
-			// bonus goes with it — otherwise "slide off every ledge" would be free travel.
 			EndSlide();
 		}
 		else
@@ -704,13 +946,17 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 					SlideDirection, Desired, FMath::Max(0.f, Settings.SlideTurnRateDegrees) * DeltaSeconds);
 			}
 
-			SlideSpeed = FMath::Max(0.f, SlideSpeed - FMath::Max(0.f, Settings.SlideDeceleration) * DeltaSeconds);
+			// The friction dial. Small on purpose: the slide is meant to be ended by SlideDuration,
+			// not by having bled itself back down to a walk two thirds of the way through.
+			SlideSpeed = FMath::Max(0.f, SlideSpeed - GetSlideDeceleration() * DeltaSeconds);
 
-			const float ExitSpeed = FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideExitSpeedFraction);
-			if (SlideSpeed <= ExitSpeed)
+			const float FloorSpeed = FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideExitSpeedFraction);
+			if (SlideSpeed <= FloorSpeed)
 			{
 				// Decayed back to walking pace: stop rather than drag the player along at a speed
-				// the normal movement code would have given them anyway.
+				// the normal movement code would have given them anyway. EndSlide() still hands back
+				// at least SlideExitMinSpeedFraction of the walk speed, so this is no longer the
+				// trapdoor that dumped a slide out below a run.
 				EndSlide();
 			}
 			else
@@ -924,6 +1170,7 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, SavedDashDirection(FVector::ZeroVector)
 	, SavedSlideTimeRemaining(0.f)
 	, SavedSlideCooldownRemaining(0.f)
+	, SavedSlideCommitRemaining(0.f)
 	, SavedSlideSpeed(0.f)
 	, SavedSlideBufferRemaining(0.f)
 	, SavedSlideDirection(FVector::ZeroVector)
@@ -950,6 +1197,7 @@ void FSavedMove_Trace::Clear()
 
 	SavedSlideTimeRemaining = 0.f;
 	SavedSlideCooldownRemaining = 0.f;
+	SavedSlideCommitRemaining = 0.f;
 	SavedSlideSpeed = 0.f;
 	SavedSlideBufferRemaining = 0.f;
 	SavedSlideDirection = FVector::ZeroVector;
@@ -1002,8 +1250,13 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// Never merge across an active dash or slide. Combining replays one longer move from the older
 	// move's start state; the clocks are linear in dt so the maths would survive, but the frame on
 	// which the ability *ends* would move, and with it the velocity profile.
+	//
+	// The commit window is included for the same reason: it decides whether a released key ends the
+	// slide, so a merged move that straddled its expiry would resolve the release differently from
+	// the two moves it replaced.
 	if (SavedDashTimeRemaining > 0.f || Other->SavedDashTimeRemaining > 0.f
-		|| SavedSlideTimeRemaining > 0.f || Other->SavedSlideTimeRemaining > 0.f)
+		|| SavedSlideTimeRemaining > 0.f || Other->SavedSlideTimeRemaining > 0.f
+		|| SavedSlideCommitRemaining > 0.f || Other->SavedSlideCommitRemaining > 0.f)
 	{
 		return false;
 	}
@@ -1033,6 +1286,7 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 
 			SavedSlideTimeRemaining     = Movement->SlideTimeRemaining;
 			SavedSlideCooldownRemaining = Movement->SlideCooldownRemaining;
+			SavedSlideCommitRemaining   = Movement->SlideCommitRemaining;
 			SavedSlideSpeed             = Movement->SlideSpeed;
 			SavedSlideBufferRemaining   = Movement->SlideBufferRemaining;
 			SavedSlideDirection         = Movement->SlideDirection;
@@ -1066,6 +1320,7 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 
 			Movement->SlideTimeRemaining     = SavedSlideTimeRemaining;
 			Movement->SlideCooldownRemaining = SavedSlideCooldownRemaining;
+			Movement->SlideCommitRemaining   = SavedSlideCommitRemaining;
 			Movement->SlideSpeed             = SavedSlideSpeed;
 			Movement->SlideBufferRemaining   = SavedSlideBufferRemaining;
 			Movement->SlideDirection         = SavedSlideDirection;

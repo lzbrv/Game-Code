@@ -62,6 +62,28 @@ namespace TraceHUDStyle
 	/** Match clock turns red inside this many seconds. */
 	static constexpr float ClockUrgentSeconds = 30.f;
 
+	/**
+	 * Where the third-person pass reticle is anchored along the pass ray when there is no receiver
+	 * under it, in world units. See DrawPassReticle(): the reticle marks a POINT on that ray, and a
+	 * ray drawn from an origin the camera is not sitting at has no single screen position — so one
+	 * has to be picked. ~16 m is a typical in-arena pass; the anchor slides to the real distance the
+	 * moment an actual receiver is acquired.
+	 */
+	static constexpr float PassAnchorDefaultDistance = 1600.f;
+
+	/** Ease rates for the pass reticle: anchor distance (uu/s-ish) and the lock-on close. */
+	static constexpr float PassAnchorInterpSpeed = 6.f;
+	static constexpr float PassLockInterpSpeed = 14.f;
+
+	/**
+	 * How often the "who would receive a pass" probe may run, in seconds.
+	 *
+	 * ATraceCore::FindPassTargetFor() line-traces once per candidate. That is cheap, but it is not
+	 * free and nothing about the answer changes meaningfully inside 50 ms — and it is only ever run
+	 * on the one machine whose local player is currently holding the Core.
+	 */
+	static constexpr float PassTargetPollInterval = 0.05f;
+
 	/** How long "BLUE SCORES" stays up after a capture, and "GO" after the whistle. */
 	static constexpr float ScoreFlashDuration = 2.4f;
 	/** How long the "TEAM WIPE +2" flash stays up, in seconds. */
@@ -252,6 +274,10 @@ void ATraceHUD::DrawHUD()
 	const bool bPostMatch = (TraceGS != nullptr) && (TraceGS->TraceMatchState == ETraceMatchState::PostMatch);
 	if (!bPostMatch)
 	{
+		// Before any pass draws: the crosshair and the pass ring have to sit on the same pixel, and
+		// the pass-target probe has to run exactly once per frame.
+		UpdateReticleAnchor();
+
 		DrawCrosshair();
 		DrawPassProgress();
 		DrawHitMarker();
@@ -356,38 +382,177 @@ void ATraceHUD::LogAffordanceAvailabilityOnce()
 // Reticle
 // -------------------------------------------------------------------------------------------
 
+void ATraceHUD::UpdateReticleAnchor()
+{
+	// First person: the viewport centre is not an approximation of the aim point, it IS the aim
+	// point. The spring arm collapses to length 0 at GetPawnViewLocation() and looks along the
+	// control rotation, which is the exact ray GetAimDirection() builds — Trace.DebugViewProbe
+	// measures aimErr 0.0000 deg off that identity. So the centre is the default and every
+	// first-person path below leaves it untouched.
+	const float CX = FMath::RoundToFloat(ViewW * 0.5f);
+	const float CY = FMath::RoundToFloat(ViewH * 0.5f);
+	ReticleX = CX;
+	ReticleY = CY;
+
+	// Keyed off the CAMERA's eased blend rather than off bLocalCarrying, so everything that follows
+	// the view mode moves over the same ~0.35s the camera takes rather than snapping a beat early.
+	ViewBlend = (LocalChar != nullptr)
+		? FMath::Clamp(LocalChar->GetViewBlendAlpha(), 0.f, 1.f)
+		: (bLocalCarrying ? 1.f : 0.f);
+
+	const float DeltaSeconds = (GetWorld() != nullptr) ? GetWorld()->GetDeltaSeconds() : 0.f;
+
+	if (!bLocalAlive || LocalChar == nullptr || Canvas == nullptr || ViewBlend <= 0.02f)
+	{
+		HoveredPassTarget = nullptr;
+		LastLoggedPassTarget = nullptr;   // so the next carry announces its first receiver again
+		PassLockAlpha = 0.f;
+		PassAnchorDistance = -1.f;
+		return;
+	}
+
+	// ---- Who would receive a pass right now ----------------------------------------------------
+	//
+	// ATraceCore::FindPassTargetFor() is public precisely so the HUD can answer this before the
+	// button is pressed (see its comment). Asking the Core rather than re-implementing the cone here
+	// is the whole point: the highlight can then never disagree with the pass that actually happens.
+	ATraceCore* Core = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
+	if (Core != nullptr && bLocalCarrying)
+	{
+		if ((Now - LastPassTargetPollTime) >= TraceHUDStyle::PassTargetPollInterval)
+		{
+			LastPassTargetPollTime = Now;
+			HoveredPassTarget = Core->FindPassTargetFor(LocalChar.Get());
+		}
+
+		// Once a pass is actually in flight the Core's own choice of receiver outranks our probe:
+		// that is the player the server will hand the Core to, whatever the aim has drifted onto.
+		if (ATraceCharacter* Locked = Core->GetEffectivePassTarget())
+		{
+			HoveredPassTarget = Locked;
+		}
+	}
+	else
+	{
+		HoveredPassTarget = nullptr;
+	}
+
+	ATraceCharacter* Target = HoveredPassTarget.Get();
+	if (Target != nullptr && !Target->IsAlive())
+	{
+		Target = nullptr;
+		HoveredPassTarget = nullptr;
+	}
+
+	PassLockAlpha = (DeltaSeconds > 0.f)
+		? FMath::FInterpTo(PassLockAlpha, (Target != nullptr) ? 1.f : 0.f, DeltaSeconds, TraceHUDStyle::PassLockInterpSpeed)
+		: ((Target != nullptr) ? 1.f : 0.f);
+
+	// ---- Where the pass ray lands on screen ----------------------------------------------------
+	//
+	// THIS IS THE PART THAT IS NOT OBVIOUS, so it is spelled out. A pass is aimed from
+	// GetPawnViewLocation() along the control rotation — the same ray a bullet uses. In first person
+	// the camera sits ON that origin, so the ray projects to a single point: screen centre. In third
+	// person the camera is 450 uu behind it and ~110 uu above it, and a ray seen from a point that is
+	// not on it does NOT project to one screen position: it projects to a line. Screen centre is that
+	// line's vanishing point, i.e. the pass ray at INFINITY, and every finite distance sits below it —
+	// by ~3 deg (about 35 px at 720p) at a typical 16 m pass, more the closer the receiver is. A
+	// centred reticle in third person would therefore be a lie of exactly the kind the first-person
+	// crosshair goes to such lengths to avoid.
+	//
+	// So the reticle marks the pass ray at a DISTANCE, and the distance is the receiver's when there
+	// is one — which lands the bracket squarely on the teammate the Core is about to go to.
+	const FVector ViewLocation = LocalChar->GetPawnViewLocation();
+	const FVector AimDirection = LocalChar->GetAimDirection();
+
+	const float DesiredDistance = (Target != nullptr)
+		? FMath::Max(200.f, static_cast<float>(FVector::Dist(ViewLocation, Target->GetActorLocation())))
+		: TraceHUDStyle::PassAnchorDefaultDistance;
+
+	PassAnchorDistance = (PassAnchorDistance <= 0.f || DeltaSeconds <= 0.f)
+		? DesiredDistance
+		: FMath::FInterpTo(PassAnchorDistance, DesiredDistance, DeltaSeconds, TraceHUDStyle::PassAnchorInterpSpeed);
+
+	const FVector AimPoint = ViewLocation + AimDirection * PassAnchorDistance;
+	const FVector Projected = Canvas->Project(AimPoint);
+
+	// Behind the camera is arithmetically impossible here (the anchor is >= 200 uu in front of an eye
+	// that is itself 450 uu in front of the camera), but a projected point that has been clamped to
+	// the near plane would put the reticle somewhere meaningless, so it is checked rather than
+	// assumed. Falling back to the centre is the honest failure: it is the ray's vanishing point.
+	if (Projected.Z <= 0.f)
+	{
+		return;
+	}
+
+	// Cross-faded with the camera blend, so the reticle TRAVELS from the centre to the pass point
+	// over the same 0.35s the camera takes to pull back, instead of jumping the moment the Core is
+	// picked up. At ViewBlend 0 this is exactly the centre, bit for bit.
+	ReticleX = FMath::RoundToFloat(FMath::Lerp(CX, static_cast<float>(Projected.X), ViewBlend));
+	ReticleY = FMath::RoundToFloat(FMath::Lerp(CY, static_cast<float>(Projected.Y), ViewBlend));
+
+	// A receiver at the very edge of the aim cone can put the anchor near the frame edge; keep the
+	// whole reticle on screen so it can never be half-drawn.
+	const float EdgePad = 48.f * UIScale;
+	ReticleX = FMath::Clamp(ReticleX, EdgePad, FMath::Max(EdgePad, ViewW - EdgePad));
+	ReticleY = FMath::Clamp(ReticleY, EdgePad, FMath::Max(EdgePad, ViewH - EdgePad));
+
+	// One Display line whenever the answer CHANGES, and Display deliberately: the reticle's whole
+	// claim is that the player it highlights is the player the Core will actually be given to, and
+	// when a pass visibly fails this line is the first thing worth reading. It is also the only way
+	// to tell "the HUD did not find a receiver" from "the HUD found one and drew it wrong" — a
+	// distinction no screenshot can make. Silent while nothing changes.
+	if (bLocalCarrying && Target != LastLoggedPassTarget.Get())
+	{
+		LastLoggedPassTarget = Target;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Reticle] pass target: %s (blend=%.2f anchor=%.0fuu reticle=%.0f,%.0f centre=%.0f,%.0f)"),
+			(Target != nullptr) ? *Target->GetName() : TEXT("<none>"),
+			ViewBlend, PassAnchorDistance, ReticleX, ReticleY, CX, CY);
+	}
+}
+
 void ATraceHUD::DrawCrosshair()
 {
-	// THIS IS A FIRST-PERSON GAME NOW, which changes what the crosshair is for.
+	// A CROSSHAIR IN BOTH CAMERA MODES, and they are two different instruments.
 	//
-	// In the old third-person view the reticle was decoration: the camera sat behind the shoulder,
-	// so screen centre was never exactly where the shot went and the player aimed off the character
-	// anyway. In first person it is the single most important pixel on the screen — the weapon fires
-	// from GetPawnViewLocation() along the control rotation, which projects to exactly the centre of
-	// the viewport, so this reticle is a literal promise about where the bullet goes.
+	// First person is the shooting view: the reticle is the single most important pixel on the
+	// screen, a literal promise about where the bullet goes, and it is unchanged from the version
+	// that measured aimErr 0.0000 deg.
 	//
-	// Two consequences, both handled below: it has to be PIXEL-CRISP, and it has to stay legible
-	// over the arena's bright neon as well as over its black floor.
+	// Third person is the CARRYING view, and the carrier has no gun (contract §3) — but mouse1 is
+	// not idle there either. Spec §4 makes it the PASS button, held for 0.5s while hovering a
+	// teammate, so the carrier is still aiming at a target with the mouse and still needs to know
+	// what is under the pointer. The reticle therefore does not disappear when the camera pulls
+	// back; it CHANGES JOB, from "where the bullet goes" to "who catches the Core", and changes
+	// shape to say so.
+	//
+	// Both fade with the camera blend rather than with the carrier bool, so a pick-up cross-fades
+	// one instrument into the other over the 0.35s the camera is travelling.
 	if (!bLocalAlive)
 	{
 		return;
 	}
 
-	// The carrier has no gun (contract §3), so an aiming reticle would be a lie — and carrying is
-	// also exactly when the camera pulls back to third person, where screen centre means nothing.
-	//
-	// Keyed off the CAMERA's eased blend rather than off bLocalCarrying, so the reticle fades out
-	// over the same ~0.7s the camera takes to pull back instead of vanishing a beat before the view
-	// has moved. GetViewBlendAlpha is 0 in first person and 1 in third.
-	const float ViewBlend = (LocalChar != nullptr)
-		? FMath::Clamp(LocalChar->GetViewBlendAlpha(), 0.f, 1.f)
-		: (bLocalCarrying ? 1.f : 0.f);
-
-	const float Visibility = 1.f - ViewBlend;
-	if (Visibility <= 0.02f)
+	const float FirstPersonVisibility = 1.f - ViewBlend;
+	if (FirstPersonVisibility > 0.02f)
 	{
-		return;
+		DrawAimReticle(ReticleX, ReticleY, FirstPersonVisibility);
 	}
+	if (ViewBlend > 0.02f)
+	{
+		DrawPassReticle(ViewBlend);
+	}
+}
+
+void ATraceHUD::DrawAimReticle(float CX, float CY, float Visibility)
+{
+	// In first person the weapon fires from GetPawnViewLocation() along the control rotation, which
+	// projects to exactly the centre of the viewport, so this reticle is a literal promise about
+	// where the bullet goes.
+	//
+	// Two consequences, both handled below: it has to be PIXEL-CRISP, and it has to stay legible
+	// over the arena's bright neon as well as over its black floor.
 
 	// --- Pixel snapping -------------------------------------------------------------------------
 	//
@@ -414,9 +579,6 @@ void ATraceHUD::DrawCrosshair()
 	// Half a bar, floored, so the bar's own pixels straddle the centre symmetrically for odd T and
 	// sit flush against it for even T. Both are exact; neither is a half-pixel.
 	const float Half = FMath::FloorToFloat(T * 0.5f);
-
-	const float CX = FMath::RoundToFloat(ViewW * 0.5f);
-	const float CY = FMath::RoundToFloat(ViewH * 0.5f);
 
 	const FLinearColor Ink    = FLinearColor(1.f, 1.f, 1.f, 0.92f * Visibility);
 	// A one-pixel dark surround. The arena is black floor plus saturated cyan and amber neon, and a
@@ -445,6 +607,126 @@ void ATraceHUD::DrawCrosshair()
 	}
 }
 
+void ATraceHUD::DrawPassReticle(float Visibility)
+{
+	// A DIFFERENT SHAPE, on purpose. The two reticles mean two different things and the player must
+	// never have to look twice to know which one is on screen: the aim reticle is a cross whose
+	// centre is a point, this is a frame whose centre is a TARGET. A cross would also read as "you
+	// can shoot", which is the one thing a carrier cannot do.
+	//
+	// Everything below is integer-snapped for the same reason the aim reticle is: at 720p a
+	// fractional rect is a grey smudge, and a smudged reticle is what "blurry" looks like.
+	const float T = FMath::Max(2.f, FMath::RoundToFloat(2.5f * UIScale));
+	const float Half = FMath::FloorToFloat(T * 0.5f);
+	const float Len = FMath::Max(5.f, FMath::RoundToFloat(9.f * UIScale));
+
+	// The brackets CLOSE when a receiver is acquired. Motion is what the eye catches; a colour swap
+	// alone can be missed in the middle of a chase, and one that could only be seen by its colour
+	// would be invisible to a colour-blind player.
+	const float Radius = FMath::RoundToFloat(FMath::Lerp(24.f, 15.f, PassLockAlpha) * UIScale);
+
+	const float X = ReticleX;
+	const float Y = ReticleY;
+
+	const bool bLocked = HoveredPassTarget.IsValid();
+
+	// Cooldown state is worth its own colour: a player hovering a teammate and wondering why nothing
+	// happens is exactly the confusion this reticle exists to remove.
+	//
+	// Gated on actually being the carrier: the cooldown is a property of the CORE, not of a player,
+	// so the teammate who just received a pass inherits the tail of it — and telling someone who is
+	// not holding anything that their pass is not ready would be noise.
+	ATraceCore* Core = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
+	const float CooldownRemaining = (Core != nullptr) ? Core->GetPassCooldownRemaining() : 0.f;
+	const bool bOnCooldown = bLocalCarrying && (CooldownRemaining > TraceHUDStyle::TimeEpsilon);
+
+	FLinearColor Base = TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.72f);
+	if (bOnCooldown)
+	{
+		Base = TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.75f);
+	}
+	else if (bLocked)
+	{
+		// Team coloured and lifted toward white: a pass is the one action whose whole point is the
+		// teammate on the other end of it, so the lock wears the team's colour.
+		Base = TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f);
+	}
+
+	const FLinearColor Ink = TraceHUDStyle::WithAlpha(Base, Base.A * Visibility);
+	const FLinearColor Shadow = FLinearColor(0.f, 0.f, 0.f, 0.80f * Visibility);
+
+	// Four L-shaped corner brackets, as eight axis-aligned integer rects: (left, top, width, height).
+	const float X0 = X - Radius;              // outer left edge
+	const float X1 = X + Radius - T;          // outer right edge (inset by its own thickness)
+	const float Y0 = Y - Radius;
+	const float Y1 = Y + Radius - T;
+	const float Tail = Len - T;               // where a right/bottom arm starts so it ENDS on the edge
+
+	const float Bars[9][4] =
+	{
+		{ X0,        Y0,        Len, T   },   // top-left, horizontal
+		{ X0,        Y0,        T,   Len },   // top-left, vertical
+		{ X1 - Tail, Y0,        Len, T   },   // top-right, horizontal
+		{ X1,        Y0,        T,   Len },   // top-right, vertical
+		{ X0,        Y1,        Len, T   },   // bottom-left, horizontal
+		{ X0,        Y1 - Tail, T,   Len },   // bottom-left, vertical
+		{ X1 - Tail, Y1,        Len, T   },   // bottom-right, horizontal
+		{ X1,        Y1 - Tail, T,   Len },   // bottom-right, vertical
+		{ X - Half,  Y - Half,  T,   T   },   // centre dot: the exact point the pass is aimed at
+	};
+
+	for (const float* B : Bars)
+	{
+		DrawRect(Shadow, B[0] - 1.f, B[1] - 1.f, B[2] + 2.f, B[3] + 2.f);
+	}
+	for (const float* B : Bars)
+	{
+		DrawRect(Ink, B[0], B[1], B[2], B[3]);
+	}
+
+	// ---- Caption ---------------------------------------------------------------------------------
+	//
+	// Suppressed once the hold has started: DrawPassProgress owns the ring and the word PASSING at
+	// that point, and two captions on the same pixel is how a HUD starts overlapping itself.
+	const bool bPassing = (TracePC != nullptr) && (TracePC->GetPassProgress() >= 0.f);
+	if (bPassing)
+	{
+		return;
+	}
+
+	FString Caption;
+	FLinearColor CaptionColor = TraceHUDStyle::InkDim;
+	if (bOnCooldown)
+	{
+		Caption = FString::Printf(TEXT("PASS READY IN %.1f"), CooldownRemaining);
+		CaptionColor = TraceHUDStyle::Danger;
+	}
+	else if (bLocked)
+	{
+		// The receiver by NAME. In a 5v5 with two teammates overlapping on screen, "which one" is a
+		// real question and the Core picks whoever is nearest the crosshair — so the HUD says so out
+		// loud rather than leaving the player to infer it from a bracket.
+		FString ReceiverName;
+		if (const ATraceCharacter* Target = HoveredPassTarget.Get())
+		{
+			if (const APlayerState* TargetState = Target->GetPlayerState())
+			{
+				ReceiverName = TargetState->GetPlayerName();
+			}
+		}
+		Caption = ReceiverName.IsEmpty()
+			? FString(TEXT("HOLD TO PASS"))
+			: FString::Printf(TEXT("HOLD TO PASS  -  %s"), *ReceiverName.ToUpper());
+		CaptionColor = TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f);
+	}
+
+	if (!Caption.IsEmpty())
+	{
+		DrawTextCentered(Caption, TraceHUDStyle::WithAlpha(CaptionColor, Visibility),
+			X, Y + Radius + (14.f * UIScale), FontSmall, UIScale);
+	}
+}
+
 void ATraceHUD::DrawPassProgress()
 {
 	if (TracePC == nullptr)
@@ -460,8 +742,12 @@ void ATraceHUD::DrawPassProgress()
 		return;
 	}
 
-	const float CX = FMath::RoundToFloat(ViewW * 0.5f);
-	const float CY = FMath::RoundToFloat(ViewH * 0.5f);
+	// The ring closes around the RETICLE, not around screen centre. In third person — which is the
+	// only view a pass is ever made from — those are not the same pixel (see UpdateReticleAnchor),
+	// and a progress ring that is not concentric with the thing it is the progress of reads as two
+	// unrelated pieces of UI.
+	const float CX = ReticleX;
+	const float CY = ReticleY;
 	const float Radius = 34.f * UIScale;
 	const float Thickness = FMath::Max(2.f, 3.f * UIScale);
 

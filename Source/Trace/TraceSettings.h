@@ -1,15 +1,49 @@
 // Trace — every runtime-tunable number in one place.
 //
-// UTraceSettings is a UDeveloperSettings, so it shows up under Project Settings and persists to
-// Config/DefaultGame.ini (defaultconfig). Read it from anywhere with UTraceSettings::Get().
+// UTraceSettings is a UDeveloperSettings, so it shows up under Project Settings > Game >
+// "Trace Gameplay" and persists to Config/DefaultGame.ini (defaultconfig). Read it from anywhere
+// with UTraceSettings::Get().
 //
 // Rule for the rest of the codebase: never hardcode a gameplay constant that lives in this
 // table. Read it through Get() at the point of use — designers change these live, and the CDO
 // is refreshed by the config system, so caching a copy in a constructor will go stale.
+//
+// =================================================================================================
+// LIVE EDITING DURING PIE — HOW IT WORKS, AND WHAT YOU MUST NOT DO
+// =================================================================================================
+//
+// The Project Settings details panel edits the CLASS DEFAULT OBJECT of this class in place. Get()
+// returns exactly that CDO. So any system that calls Get() at the point of use picks a changed
+// value up on the very next frame, with PIE still running and no restart. That is not an accident
+// of the implementation, it is the whole reason Get() returns a reference to the CDO instead of a
+// cached snapshot, and it is why the "read at point of use" rule above is a rule and not a style
+// preference.
+//
+// A value only fails to update live when somebody has COPIED it out of here into a member — at
+// BeginPlay, in a constructor, or into an engine field like UCharacterMovementComponent::
+// MaxWalkSpeed, which the movement system reads directly and which no amount of re-reading Get()
+// can refresh on its own.
+//
+// For those cases there are two hooks, both below:
+//
+//   1. UTraceSettings::OnSettingsChanged() — a multicast delegate broadcast from
+//      PostEditChangeProperty. Systems that genuinely must cache (because the value feeds an engine
+//      field, or because the read is on a hot path) subscribe once and re-copy on the broadcast.
+//
+//   2. UTraceSettings::ApplyLiveMovementTuning() — called by the same PostEditChangeProperty, and
+//      also safe to call by hand. It walks every live character movement component in every game
+//      world and re-asserts the engine-owned speed fields from this table. This exists so that
+//      WalkSpeed responds to a slider drag TODAY, without the movement component having to
+//      subscribe to anything. If the movement component later grows its own subscription, this
+//      stays correct: it writes the same values BeginPlay writes, so the two agree by construction.
+//
+// Both are editor-only (WITH_EDITOR). In a cooked build nothing edits the CDO, so there is nothing
+// to react to.
 
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Delegates/Delegate.h"
 #include "Engine/DeveloperSettings.h"   // module: DeveloperSettings
 #include "UObject/ObjectMacros.h"
 #include "UObject/UObjectGlobals.h"     // GetDefault<>
@@ -17,6 +51,16 @@
 #include "TraceTypes.h"                 // ETrailLethality
 
 #include "TraceSettings.generated.h"
+
+/**
+ * Broadcast after any UTraceSettings property is edited in the Project Settings panel.
+ *
+ * Declared at file scope rather than inside the UCLASS so UnrealHeaderTool never has to parse a
+ * delegate macro inside a generated-body class. The parameter is the edited property's name, or
+ * NAME_None when the panel could not name one (a struct-wide paste, an "import defaults").
+ * Listeners that only care about a couple of values should treat NAME_None as "re-read everything".
+ */
+DECLARE_MULTICAST_DELEGATE_OneParam(FTraceSettingsChanged, FName /*ChangedPropertyName*/);
 
 /**
  * How hard the bots play. Easy is the default everywhere: a newcomer's first match must be
@@ -47,6 +91,10 @@ enum class EBotDifficulty : uint8
  * Only EditAnywhere on the members: `config` belongs on the FTraceBotProfile *property* in
  * UTraceSettings, which is what makes the whole struct round-trip through DefaultGame.ini. Marking
  * the inner members config as well does nothing, because a USTRUCT is not a config container.
+ *
+ * LIVE: ATraceBotController calls UTraceSettings::GetBotProfile() at the point of use on every
+ * decision tick, so every number in here retunes with PIE running. The only thing latched for the
+ * duration of a match is WHICH of the three profiles is selected (see the difficulty latch).
  */
 USTRUCT()
 struct TRACE_API FTraceBotProfile
@@ -60,21 +108,30 @@ struct TRACE_API FTraceBotProfile
 	// fires in one frame is indistinguishable from an aimbot no matter how badly it aims.
 	// ----------------------------------------------------------------------------------------
 
-	/** Seconds a bot must hold ONE target continuously before it is allowed to pull the trigger. */
-	UPROPERTY(EditAnywhere, Category = "Reaction")
+	/**
+	 * Seconds a bot must hold ONE target continuously before it is allowed to pull the trigger.
+	 *
+	 * Sane range 0.2 (Hard, near-instant) to 1.2 (Easy, visibly slow). Above ~1.5 most engagements
+	 * end before the bot is ever allowed to fire and the bots read as broken rather than as easy.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Reaction", meta = (DisplayName = "Reaction Time (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.1", UIMax = "1.5"))
 	float ReactionTimeSeconds = 0.90f;
 
-	/** +/- fraction of ReactionTimeSeconds rolled per acquisition, so five bots never fire as one. */
-	UPROPERTY(EditAnywhere, Category = "Reaction")
+	/**
+	 * +/- fraction of ReactionTimeSeconds rolled per acquisition, so five bots never fire as one.
+	 *
+	 * Sane range 0.2 to 0.5. Zero makes a squad fire in perfect unison, which reads as scripted.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Reaction", meta = (DisplayName = "Reaction Jitter (fraction)", ClampMin = "0.0", ClampMax = "0.95", UIMin = "0.0", UIMax = "0.6"))
 	float ReactionJitterFraction = 0.40f;
 
 	/**
 	 * Seconds a bot is blind after its target dies or leaves its engagement envelope.
 	 *
 	 * Without this a bot kills you and is already on your teammate in the same frame, which is what
-	 * turned the opening seconds of a match into a simultaneous ten-way wipe.
+	 * turned the opening seconds of a match into a simultaneous ten-way wipe. Sane range 0.3 to 1.4.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Reaction")
+	UPROPERTY(EditAnywhere, Category = "Reaction", meta = (DisplayName = "Reacquire Delay (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "2.0"))
 	float ReacquireDelaySeconds = 1.20f;
 
 	// ----------------------------------------------------------------------------------------
@@ -86,28 +143,55 @@ struct TRACE_API FTraceBotProfile
 	// ever fired once it was pointed at you: raising the error made bots quieter, never worse.)
 	// ----------------------------------------------------------------------------------------
 
-	/** Base half-width of the aim error cone, in degrees, at point-blank range against a still target. */
-	UPROPERTY(EditAnywhere, Category = "Aim")
+	/**
+	 * Base half-width of the aim error cone, in degrees, at point-blank range against a still target.
+	 *
+	 * Sane range 1.5 (Hard) to 6 (Easy). This is the SMALLEST the error ever gets; the range and
+	 * cross-speed terms below are added on top and dominate at arena distances.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Aim", meta = (DisplayName = "Aim Error Base (deg)", ClampMin = "0.0", ClampMax = "45.0", UIMin = "0.0", UIMax = "12.0"))
 	float AimErrorDegrees = 5.0f;
 
-	/** Extra degrees of error per 1000uu of range. This is the "bots are lasers across the map" fix. */
-	UPROPERTY(EditAnywhere, Category = "Aim")
+	/**
+	 * Extra degrees of error per 1000uu of range. This is the "bots are lasers across the map" fix.
+	 *
+	 * Sane range 1.0 (Hard) to 2.5 (Easy). The dominant term at arena distances: at 4000uu it is
+	 * worth four times the base error.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Aim", meta = (DisplayName = "Aim Error per 1000uu Range (deg)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "5.0"))
 	float AimErrorPerThousandRange = 2.6f;
 
-	/** Extra degrees of error per 1000uu/s of the target's speed across the bot's line of sight. */
-	UPROPERTY(EditAnywhere, Category = "Aim")
+	/**
+	 * Extra degrees of error per 1000uu/s of the target's speed across the bot's line of sight.
+	 *
+	 * This is what pays a player for strafing. Sane range 1.0 (Hard) to 4.0 (Easy).
+	 */
+	UPROPERTY(EditAnywhere, Category = "Aim", meta = (DisplayName = "Aim Error per 1000uu/s Cross Speed (deg)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "6.0"))
 	float AimErrorPerThousandCrossSpeed = 3.0f;
 
-	/** Hard ceiling on total aim error, so a distant sprinter does not make a bot spin in circles. */
-	UPROPERTY(EditAnywhere, Category = "Aim")
+	/**
+	 * Hard ceiling on total aim error, so a distant sprinter does not make a bot spin in circles.
+	 *
+	 * Sane range 12 (Hard) to 22 (Easy). Must stay above AimErrorDegrees or the base is unreachable.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Aim", meta = (DisplayName = "Aim Error Ceiling (deg)", ClampMin = "0.5", ClampMax = "90.0", UIMin = "5.0", UIMax = "40.0"))
 	float AimErrorMaxDegrees = 22.f;
 
-	/** Degrees per second the bot's aim slews. A finite rate is what makes strafing counterplay. */
-	UPROPERTY(EditAnywhere, Category = "Aim")
+	/**
+	 * Degrees per second the bot's aim slews. A finite rate is what makes strafing counterplay.
+	 *
+	 * Sane range 150 (Easy) to 450 (Hard). Anything above ~700 is instant snap at arena distances.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Aim", meta = (DisplayName = "Aim Turn Rate (deg/s)", ClampMin = "10.0", ClampMax = "2000.0", UIMin = "80.0", UIMax = "600.0"))
 	float AimTurnRateDegrees = 190.f;
 
-	/** How close to its OWN (error-offset) aim point a bot must be before it fires. */
-	UPROPERTY(EditAnywhere, Category = "Aim")
+	/**
+	 * How close to its OWN (error-offset) aim point a bot must be before it fires.
+	 *
+	 * Sane range 2.5 to 4.5. This is a trigger gate, not an accuracy dial — widening it makes bots
+	 * fire sooner, not more accurately.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Aim", meta = (DisplayName = "Fire Cone (deg)", ClampMin = "0.1", ClampMax = "45.0", UIMin = "1.0", UIMax = "10.0"))
 	float FireConeDegrees = 3.5f;
 
 	/**
@@ -126,62 +210,88 @@ struct TRACE_API FTraceBotProfile
 	 *
 	 * Rolled once per acquisition, not per shot: a bot commits to the zone for the engagement rather
 	 * than flickering between head and chest and hitting the gap between them.
+	 *
+	 * Sane range: 0 on Easy, ~0.3 on Normal, ~0.6 on Hard. 1.0 is an execution machine.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Aim")
+	UPROPERTY(EditAnywhere, Category = "Aim", meta = (DisplayName = "Headshot Aim Chance (0-1)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float HeadshotAimFraction = 0.f;
 
 	// ----------------------------------------------------------------------------------------
 	// Engagement envelope
 	// ----------------------------------------------------------------------------------------
 
-	/** Bots are unaware of enemies beyond this, even with clear line of sight. */
-	UPROPERTY(EditAnywhere, Category = "Engagement")
+	/**
+	 * Bots are unaware of enemies beyond this, even with clear line of sight.
+	 *
+	 * Sane range 5000 to 8000 on a 24000 x 12000 field. Must stay above MaxEngagementRange or a bot
+	 * can never legally shoot at anything.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Engagement", meta = (DisplayName = "Sight Range (uu)", ClampMin = "100.0", ClampMax = "40000.0", UIMin = "2000.0", UIMax = "12000.0"))
 	float SightRange = 4500.f;
 
 	/**
 	 * Hard cap on the range a bot will SHOOT at. Deliberately far below SightRange: a bot that
 	 * knows you exist but will not open up across the arena is what gives a player room to move.
+	 *
+	 * Sane range 4000 (Easy) to 6000 (Hard). Below ~3000 on this field size the bots read as
+	 * ignoring the player entirely — that was measured.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Engagement")
+	UPROPERTY(EditAnywhere, Category = "Engagement", meta = (DisplayName = "Max Engagement Range (uu)", ClampMin = "100.0", ClampMax = "40000.0", UIMin = "1000.0", UIMax = "10000.0"))
 	float MaxEngagementRange = 2600.f;
 
-	/** Range a bot tries to hold while duelling. Longer = its aim error costs it more. */
-	UPROPERTY(EditAnywhere, Category = "Engagement")
+	/**
+	 * Range a bot tries to hold while duelling. Longer = its aim error costs it more.
+	 *
+	 * Sane range 1400 to 2000. Should sit well inside MaxEngagementRange.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Engagement", meta = (DisplayName = "Preferred Combat Range (uu)", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "600.0", UIMax = "5000.0"))
 	float PreferredCombatRange = 1900.f;
 
 	// ----------------------------------------------------------------------------------------
 	// Burst fire
 	//
-	// FireInterval is 0.12s and a body shot is 40 (spec §6), so a held trigger on target kills in
-	// 0.24s — and a single head shot kills instantly.
+	// FireInterval is 0.16s and a body shot is 40 (spec §6), so a held trigger on target kills in
+	// 0.32s — and a single head shot kills instantly.
 	// Nothing about reaction time or aim error survives that. Bursting is the DPS dial, and it is
 	// the one that makes a fight readable: you can hear the gap and move in it.
 	// ----------------------------------------------------------------------------------------
 
-	/** Seconds of continuous fire before the bot lets go of the trigger. */
-	UPROPERTY(EditAnywhere, Category = "Burst")
+	/** Seconds of continuous fire before the bot lets go of the trigger. Sane range 0.2 to 0.45. */
+	UPROPERTY(EditAnywhere, Category = "Burst", meta = (DisplayName = "Burst Duration Min (s)", ClampMin = "0.02", ClampMax = "5.0", UIMin = "0.1", UIMax = "1.0"))
 	float BurstDurationMin = 0.20f;
 
-	UPROPERTY(EditAnywhere, Category = "Burst")
+	/** Upper end of the rolled burst length. Keep at or above BurstDurationMin. */
+	UPROPERTY(EditAnywhere, Category = "Burst", meta = (DisplayName = "Burst Duration Max (s)", ClampMin = "0.02", ClampMax = "5.0", UIMin = "0.1", UIMax = "1.0"))
 	float BurstDurationMax = 0.38f;
 
-	/** Seconds the trigger stays released after a burst, whatever the bot can see. */
-	UPROPERTY(EditAnywhere, Category = "Burst")
+	/**
+	 * Seconds the trigger stays released after a burst, whatever the bot can see.
+	 *
+	 * Burst / (burst + rest) is the duty cycle, and the duty cycle is the real DPS dial: ~28% on
+	 * Easy, ~38% on Normal, ~58% on Hard. Sane range 0.3 to 1.0.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Burst", meta = (DisplayName = "Burst Rest Min (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.1", UIMax = "2.0"))
 	float BurstRestMin = 0.70f;
 
-	UPROPERTY(EditAnywhere, Category = "Burst")
+	/** Upper end of the rolled rest. Keep at or above BurstRestMin. */
+	UPROPERTY(EditAnywhere, Category = "Burst", meta = (DisplayName = "Burst Rest Max (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.1", UIMax = "2.0"))
 	float BurstRestMax = 1.30f;
 
 	// ----------------------------------------------------------------------------------------
 	// Tempo and objective play
 	// ----------------------------------------------------------------------------------------
 
-	/** Seconds between bot state re-evaluations. Steering and aim still run every frame. */
-	UPROPERTY(EditAnywhere, Category = "Tempo")
+	/**
+	 * Seconds between bot state re-evaluations. Steering and aim still run every frame.
+	 *
+	 * Sane range 0.15 (Hard) to 0.32 (Easy). This is a cost dial as much as a skill one — ten bots
+	 * at 0.05 is a measurable frame cost for no visible gain.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Tempo", meta = (DisplayName = "Decision Interval (s)", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.1", UIMax = "0.6"))
 	float DecisionInterval = 0.26f;
 
 	/** 0..1. How eagerly a bot spends its dash — to escape while carrying, or to commit at a trail. */
-	UPROPERTY(EditAnywhere, Category = "Tempo")
+	UPROPERTY(EditAnywhere, Category = "Tempo", meta = (DisplayName = "Aggression (0-1)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float Aggression = 0.55f;
 
 	/**
@@ -190,16 +300,20 @@ struct TRACE_API FTraceBotProfile
 	 * NOT scaled down on Easy. The trail-dash kill is the identity of the game; if it only shows up
 	 * on Hard then most players never see the mechanic the whole design is built around. Easy is
 	 * made easy by the shooting model above, not by hiding the signature play.
+	 *
+	 * InterceptorCount + PunisherCount must fit inside a five-man side, or the punisher slots never
+	 * get filled — that was measured on Hard at 4 + 2, which logged zero punisher ticks in a 260s
+	 * match.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Tempo")
+	UPROPERTY(EditAnywhere, Category = "Tempo", meta = (DisplayName = "Interceptors (trace hunters)", ClampMin = "0", ClampMax = "5", UIMin = "0", UIMax = "5"))
 	int32 InterceptorCount = 3;
 
 	/** Per-decision probability that an interceptor in range actually commits its dash at the trail. */
-	UPROPERTY(EditAnywhere, Category = "Tempo")
+	UPROPERTY(EditAnywhere, Category = "Tempo", meta = (DisplayName = "Trail Dash Commit Chance (0-1)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float TrailDashCommitChance = 0.92f;
 
 	/** Probability a carrying bot passes on an evaluation tick that found a legal receiver. */
-	UPROPERTY(EditAnywhere, Category = "Tempo")
+	UPROPERTY(EditAnywhere, Category = "Tempo", meta = (DisplayName = "Pass Chance (0-1)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float PassChance = 0.55f;
 
 	/**
@@ -214,7 +328,7 @@ struct TRACE_API FTraceBotProfile
 	 * Separate from InterceptorCount because the two jobs want different bots: an interceptor has to
 	 * get physically across the trace, a punisher only has to keep line of sight.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Tempo")
+	UPROPERTY(EditAnywhere, Category = "Tempo", meta = (DisplayName = "Punishers (pass hunters)", ClampMin = "0", ClampMax = "5", UIMin = "0", UIMax = "5"))
 	int32 PunisherCount = 1;
 
 	/**
@@ -227,7 +341,7 @@ struct TRACE_API FTraceBotProfile
 	 * Low on Easy on purpose. A reckless pass is a turnover and a free kill for the player, which is
 	 * one of the few ways to make Easy easier that does not involve making the bots look stupid.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Tempo")
+	UPROPERTY(EditAnywhere, Category = "Tempo", meta = (DisplayName = "Pass Caution (0-1)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float PassCaution = 0.30f;
 
 	/**
@@ -237,15 +351,20 @@ struct TRACE_API FTraceBotProfile
 	 * point of the kit is that it reads as intent. Kept well above zero even on Easy, because a
 	 * mechanic no bot performs is a mechanic that has never been tested.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Tempo")
+	UPROPERTY(EditAnywhere, Category = "Tempo", meta = (DisplayName = "Movement Tech Chance (0-1)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float MovementTechChance = 0.55f;
 };
 
 /**
- * Gameplay tuning for Trace.
+ * Gameplay tuning for Trace.  (Project Settings > Game > Trace Gameplay)
  *
  * Every member is a `config` property: values ship in DefaultGame.ini under
  * [/Script/Trace.TraceSettings] and can be overridden per-platform or per-user without a rebuild.
+ *
+ * Every member is also EditAnywhere with clamps and a tooltip, and — because Get() reads the CDO
+ * the details panel writes to — every member that is read at its point of use retunes with PIE
+ * running. See the LIVE EDITING block at the top of this file for the handful of values that need
+ * the PostEditChangeProperty hook instead, and why.
  */
 UCLASS(config = Game, defaultconfig, meta = (DisplayName = "Trace Gameplay"))
 class TRACE_API UTraceSettings : public UDeveloperSettings
@@ -259,11 +378,46 @@ public:
 	 * The one accessor. Returns the class default object, which the config system has already
 	 * populated — cheap enough to call per-frame, but do not hold the reference across a
 	 * hot reload.
+	 *
+	 * This is also what makes live editing work: the Project Settings panel edits this exact
+	 * object, so a value read through here is never more than a frame behind the slider.
 	 */
 	static const UTraceSettings& Get();
 
 	/** Groups the page under "Game" in Project Settings rather than the default bucket. */
 	virtual FName GetCategoryName() const override;
+
+#if WITH_EDITOR
+	/**
+	 * Fires after any property on this page is edited.
+	 *
+	 * Subscribe from any system that CANNOT read Get() at its point of use — typically because the
+	 * value has to be copied into an engine-owned field. Do not subscribe merely to cache: reading
+	 * Get() is a pointer dereference and is cheaper than the bookkeeping.
+	 *
+	 * Editor-only. Nothing edits the CDO in a cooked build, so a shipped listener would be dead
+	 * code that still cost a delegate slot.
+	 */
+	static FTraceSettingsChanged& OnSettingsChanged();
+
+	/**
+	 * Re-asserts the engine-owned movement fields (UCharacterMovementComponent::MaxWalkSpeed and
+	 * MaxWalkSpeedCrouched) from this table, on every live pawn in every game world.
+	 *
+	 * WHY THIS EXISTS. The movement component copies WalkSpeed into MaxWalkSpeed once, in BeginPlay,
+	 * because MaxWalkSpeed is what CalcVelocity clamps against — it is read by engine code that has
+	 * never heard of UTraceSettings, so "read at point of use" is not available for this one value.
+	 * Without this function, WalkSpeed is the single most feel-critical number on the page and also
+	 * the only one that needed a PIE restart.
+	 *
+	 * Idempotent, and deliberately writes exactly what BeginPlay writes, so it cannot disagree with
+	 * the movement component's own initialisation. Safe to call at any time; a no-op outside PIE.
+	 */
+	static void ApplyLiveMovementTuning();
+
+	/** Broadcasts OnSettingsChanged and pushes the engine-owned copies. See the file header. */
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
 
 	// ------------------------------------------------------------------------------------------
 	// Bot difficulty resolution
@@ -278,6 +432,10 @@ public:
 	// screen can be returned to and a different difficulty chosen, so ATraceGameMode::InitGame
 	// forces a fresh resolution on every map load. Without that force, the second match of a session
 	// silently kept the first match's bots.
+	//
+	// NOTE FOR LIVE TUNING: the latch covers WHICH PROFILE is in force, not the numbers inside it.
+	// Editing BotEasy while an Easy match is running retunes the bots immediately; editing
+	// BotDifficulty mid-match does nothing until the next map load, by design.
 	// ------------------------------------------------------------------------------------------
 
 	/** The difficulty currently in force. Never returns anything but a valid enumerator. */
@@ -305,13 +463,42 @@ public:
 	/** The full knob set for the difficulty currently in force. */
 	static const FTraceBotProfile& GetBotProfile();
 
-	// ------------------------------------------------------------------------------------------
-	// Match
-	// ------------------------------------------------------------------------------------------
+	// ==========================================================================================
+	// MATCH
+	// ==========================================================================================
 
-	/** Captures needed to win outright. */
-	UPROPERTY(config, EditAnywhere, Category = "Match")
+	/**
+	 * Captures needed to win outright.
+	 *
+	 * NOT usually match-ending: ATraceGameMode::bEndMatchAtScoreToWin is off by default, because
+	 * "first to 5" would cut the second half — and the side switch that justifies it — out of most
+	 * matches. Sane range 3 to 10.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Score To Win", ClampMin = "1", ClampMax = "50", UIMin = "1", UIMax = "15"))
 	int32 ScoreToWin = 5;
+
+	/** Target roster size per team; used to balance teams on login. 5 is the designed game. */
+	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Players Per Team", ClampMin = "1", ClampMax = "16", UIMin = "1", UIMax = "8"))
+	int32 PlayersPerTeam = 5;
+
+	/** Connected players required before the match leaves WaitingForPlayers. */
+	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Min Players To Start", ClampMin = "1", ClampMax = "32", UIMin = "1", UIMax = "10"))
+	int32 MinPlayersToStart = 2;
+
+	/**
+	 * Seconds between death and respawn. Spec §1 sets this to 3.
+	 *
+	 * NOT AUTHORITATIVE. ATraceGameMode::RespawnDelay is what actually schedules the respawn; this
+	 * is the client-side fallback the death panel counts down from during the frame or two before
+	 * ATracePlayerState::RespawnEndServerTime (the real, replicated deadline) has arrived. Keep the
+	 * two equal or the panel briefly disagrees with the game.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Respawn Delay (s, HUD fallback)", ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.0", UIMax = "10.0"))
+	float RespawnDelay = 3.f;
+
+	/** Countdown after MinPlayersToStart is met, before the match goes InProgress. */
+	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Warmup Duration (s)", ClampMin = "0.0", ClampMax = "120.0", UIMin = "0.0", UIMax = "30.0"))
+	float WarmupDuration = 5.f;
 
 	/**
 	 * LEGACY — read by nothing in the rules.
@@ -323,38 +510,15 @@ public:
 	 *
 	 * Kept so existing configs still load without warnings. Do not tune it and expect an effect.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match")
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Match", meta = (DisplayName = "Match Duration (s) [DEAD]", ClampMin = "0.0", ClampMax = "7200.0"))
 	float MatchDuration = 600.f;
 
-	/** Target roster size per team; used to balance teams on login. */
-	UPROPERTY(config, EditAnywhere, Category = "Match")
-	int32 PlayersPerTeam = 5;
+	// ==========================================================================================
+	// COMBAT
+	// ==========================================================================================
 
-	/** Connected players required before the match leaves WaitingForPlayers. */
-	UPROPERTY(config, EditAnywhere, Category = "Match")
-	int32 MinPlayersToStart = 2;
-
-	/**
-	 * Seconds between death and respawn. Spec §1 sets this to 3.
-	 *
-	 * NOT AUTHORITATIVE. ATraceGameMode::RespawnDelay is what actually schedules the respawn; this
-	 * is the client-side fallback the death panel counts down from during the frame or two before
-	 * ATracePlayerState::RespawnEndServerTime (the real, replicated deadline) has arrived. Keep the
-	 * two equal or the panel briefly disagrees with the game.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match")
-	float RespawnDelay = 3.f;
-
-	/** Countdown after MinPlayersToStart is met, before the match goes InProgress. */
-	UPROPERTY(config, EditAnywhere, Category = "Match")
-	float WarmupDuration = 5.f;
-
-	// ------------------------------------------------------------------------------------------
-	// Combat
-	// ------------------------------------------------------------------------------------------
-
-	/** Starting and maximum health. */
-	UPROPERTY(config, EditAnywhere, Category = "Combat")
+	/** Starting and maximum health. Three body shots (40 each) is the designed time-to-kill. */
+	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Max Health", ClampMin = "1.0", ClampMax = "1000.0", UIMin = "25.0", UIMax = "250.0"))
 	float MaxHealth = 100.f;
 
 	// DEAD PROPERTIES REMOVED: HitscanDamage and HeadshotMultiplier.
@@ -373,18 +537,25 @@ public:
 	 * — correct for the old 8000 x 4000 arena and barely half the field once it was scaled up.
 	 *
 	 * Raising it does NOT make the bots deadlier: they are limited by FTraceBotProfile::
-	 * MaxEngagementRange (3000 Easy / 3400 Normal / 5000 Hard), far below either value. This only
+	 * MaxEngagementRange (4200 Easy / 4800 Normal / 6000 Hard), far below either value. This only
 	 * restores the human's ability to shoot what they can see.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Combat")
+	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Hitscan Range (uu)", ClampMin = "100.0", ClampMax = "200000.0", UIMin = "5000.0", UIMax = "50000.0"))
 	float HitscanRange = 28000.f;
 
-	/** Seconds between shots. The server validates fire rate against this with a tolerance. */
-	UPROPERTY(config, EditAnywhere, Category = "Combat")
-	float FireInterval = 0.12f;
+	/**
+	 * SECONDS BETWEEN SHOTS — this is the inverse of the fire RATE, so a BIGGER number is a SLOWER
+	 * gun. The server validates a client's claimed fire rate against this with a tolerance.
+	 *
+	 * 0.16 is 6.25 shots/second: three body shots (40 damage each) kills a full-health target in
+	 * 0.32s of sustained fire. Sane range 0.08 (twice as fast, very lethal) to 0.30 (a marksman
+	 * rifle). Below ~0.05 the server's rate validation starts rejecting legitimate client shots.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Fire Interval (s between shots)", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.05", UIMax = "0.5"))
+	float FireInterval = 0.16f;
 
 	/** Off by design: teammates never damage each other. Flip only for tuning experiments. */
-	UPROPERTY(config, EditAnywhere, Category = "Combat")
+	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Friendly Fire"))
 	bool bFriendlyFire = false;
 
 	/**
@@ -395,38 +566,362 @@ public:
 	 * configured to zero so that a stale .ini cannot quietly reintroduce inaccuracy the design has
 	 * deleted — and so a modified client cannot roll itself a zero nobody else gets.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Combat")
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Combat", meta = (DisplayName = "Spread (deg) [DEAD]", ClampMin = "0.0", ClampMax = "0.0"))
 	float SpreadDegrees = 0.f;
 
-	// ------------------------------------------------------------------------------------------
-	// Bots (singleplayer)
+	// ==========================================================================================
+	// MOVEMENT
+	//
+	// The most feel-critical block on the page, and the one designers drag sliders on while PIE is
+	// running. Everything here IS live: the movement component reads DashSpeed / DashDuration /
+	// DashCooldown / the whole slide block / BoostZVelocity / BoostCooldown at the point of use, and
+	// WalkSpeed — the one value the engine copies into its own field — is pushed by
+	// ApplyLiveMovementTuning() from PostEditChangeProperty. See the file header.
+	// ==========================================================================================
+
+	/**
+	 * Base ground speed, in uu/s.
+	 *
+	 * Copied into UCharacterMovementComponent::MaxWalkSpeed, which is what the physics step actually
+	 * clamps against; ApplyLiveMovementTuning() re-pushes it on every edit so the slider is felt
+	 * immediately. Sane range 600 (heavy) to 1000 (frantic). The whole slide and dash block is
+	 * expressed as multiples of this, so moving it moves the kit with it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Walk", meta = (DisplayName = "Walk Speed (uu/s)", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "1500.0"))
+	float WalkSpeed = 820.f;
+
+	/**
+	 * WalkSpeed multiplier while carrying the Core — the carrier is slightly faster.
+	 *
+	 * The carrier cannot shoot and is hunted by five people, so the speed edge is what makes
+	 * carrying playable. Sane range 1.0 to 1.2; above ~1.3 nobody can catch a carrier at all.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Walk", meta = (DisplayName = "Carrier Speed Multiplier", ClampMin = "0.5", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
+	float CarrierSpeedMultiplier = 1.08f;
+
+	// --- Dash --------------------------------------------------------------------------------
+
+	/**
+	 * Speed clamp while dashing, in uu/s.
+	 *
+	 * DASH REACH = DashSpeed * DashDuration. At 3000 x 0.18 that is 540uu. Bots' BotTrailDashRange
+	 * must stay comfortably under that number or the signature trail-crossing kill stops landing —
+	 * if you change this, check that one. Sane range 2200 to 3600.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Dash Speed (uu/s)", ClampMin = "100.0", ClampMax = "10000.0", UIMin = "1000.0", UIMax = "5000.0"))
+	float DashSpeed = 3000.f;
+
+	/**
+	 * How long a dash lasts, in seconds. Multiplied by DashSpeed this is the dash's reach.
+	 *
+	 * Sane range 0.12 to 0.28. Below ~0.08 the dash becomes a one-or-two-frame teleport that the
+	 * trail trip test can step straight over, which silently breaks the game's core counterplay.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Dash Duration (s)", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.08", UIMax = "0.4"))
+	float DashDuration = 0.18f;
+
+	/**
+	 * Cooldown measured from dash start, per charge, in seconds.
+	 *
+	 * This is the only counterplay against a carrier, so it is a strong dial in both directions:
+	 * shorter means the defence can commit more often, longer means the carrier's run is safer.
+	 * Sane range 2.5 to 5. Keep UTraceSettings::BotDashCooldownSeconds equal to it, or the bots'
+	 * shadow charge model will think they have a dash they do not.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Dash Cooldown (s)", ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.5", UIMax = "10.0"))
+	float DashCooldown = 3.5f;
+
+	/**
+	 * Dash charges everybody has. The pool refills one charge at a time, each on DashCooldown.
+	 *
+	 * A pool rather than a timer because the carrier bonus below has to be able to appear and
+	 * disappear mid-cooldown without the answer being arbitrary — see the movement component header.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Base Dash Charges", ClampMin = "1", ClampMax = "5", UIMin = "1", UIMax = "3"))
+	int32 BaseDashCharges = 1;
+
+	/** Extra dash charges granted for as long as the pawn is carrying the Core (contract §5). */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Carrier Extra Dash Charges", ClampMin = "0", ClampMax = "5", UIMin = "0", UIMax = "3"))
+	int32 CarrierExtraDashCharges = 1;
+
+	// --- Slide (crouch on the ground) -------------------------------------------------------
+	//
+	// A slide SPENDS MOMENTUM YOU ALREADY HAVE: it starts from your current speed, boosts it once
+	// and then bleeds it off slowly. It never resizes the capsule — the capsule is the single source
+	// of truth for hit resolution, lag compensation and the trail trip test.
+	//
+	// The numbers below were retuned this pass for "longer, and it must preserve the player's
+	// momentum": the decay is now gentle enough that a slide carries most of its entry speed all the
+	// way to its natural end, and the duration is long enough for that to be a traversal tool rather
+	// than a flourish. SlideCooldown moved with SlideDuration on purpose — the cooldown is measured
+	// from slide START, so a cooldown shorter than the duration would let a player chain slides
+	// end-to-end and never walk again.
+
+	/**
+	 * Fraction of WalkSpeed you must already be moving at before crouch will start a slide.
+	 * Stops "tap crouch from a standstill" being free speed. Sane range 0.4 to 0.7.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Entry Speed (fraction of Walk Speed)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.2", UIMax = "1.0"))
+	float SlideEntrySpeedFraction = 0.55f;
+
+	/**
+	 * Entry speed multiplier applied to max(current planar speed, WalkSpeed).
+	 *
+	 * Because it multiplies your CURRENT speed, a slide out of a fast approach is faster than a
+	 * slide out of a walk — that is the momentum preservation. Sane range 1.1 to 1.5; 1.0 is a pure
+	 * "keep exactly what I had" slide.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Entry Speed Multiplier", ClampMin = "0.5", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float SlideSpeedMultiplier = 1.35f;
+
+	/**
+	 * Hard ceiling on slide entry speed, in uu/s.
+	 *
+	 * This is the one knob that can DESTROY momentum rather than preserve it: a slide entered out of
+	 * a dash is clamped to this, so setting it near WalkSpeed means a fast player is slowed by
+	 * sliding. Kept well above walking pace for that reason. Sane range 1.5x to 2.5x WalkSpeed.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Max Entry Speed (uu/s)", ClampMin = "100.0", ClampMax = "6000.0", UIMin = "800.0", UIMax = "3000.0"))
+	float SlideMaxSpeed = 1900.f;
+
+	/**
+	 * Longest a slide may last, in seconds, even if it has not decayed to the exit speed.
+	 *
+	 * With the gentle deceleration below, this is what actually ends most slides — so this is the
+	 * "make the slide longer" dial. Sane range 0.8 to 2.5. Keep SlideCooldown at or above it, or
+	 * slides chain end-to-end.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Duration (s)", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.3", UIMax = "3.0"))
+	float SlideDuration = 1.8f;
+
+	/**
+	 * uu/s bled off the slide every second. THIS IS THE MOMENTUM DIAL — lower preserves more.
+	 *
+	 * At 260 a 1.8s slide sheds ~470uu/s in total, so a slide entered at ~1100 still exits above
+	 * walking pace. The old 750 stripped 750uu/s and ended most slides early on the exit-speed
+	 * check, which is what made the slide feel like a brake. Sane range 150 to 500; 0 is a
+	 * frictionless rail.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Deceleration (uu/s per s)", ClampMin = "0.0", ClampMax = "4000.0", UIMin = "0.0", UIMax = "1500.0"))
+	float SlideDeceleration = 260.f;
+
+	/**
+	 * Fraction of WalkSpeed at which a decaying slide gives up and hands the player back.
+	 *
+	 * Raise it and slides end early; lower it and a slide runs until SlideDuration expires. Sane
+	 * range 0.4 to 0.8.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Exit Speed (fraction of Walk Speed)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.2", UIMax = "1.0"))
+	float SlideExitSpeedFraction = 0.5f;
+
+	/** Degrees per second a slide may be steered. 0 = a slide is a rail. Sane range 90 to 180. */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Turn Rate (deg/s)", ClampMin = "0.0", ClampMax = "720.0", UIMin = "0.0", UIMax = "360.0"))
+	float SlideTurnRateDegrees = 130.f;
+
+	/**
+	 * Cooldown measured from slide START, in seconds, so chained slides cannot sustain above walking
+	 * speed.
+	 *
+	 * MEASURED FROM START, NOT FROM END — so a value below SlideDuration means no cooldown at all in
+	 * practice. Keep it at or above SlideDuration plus the recovery you want between slides.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Cooldown (s, from slide start)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "6.0"))
+	float SlideCooldown = 2.4f;
+
+	/**
+	 * How long a crouch press that could not slide yet (mid-dash, or airborne) stays queued.
+	 *
+	 * This is what makes "dash, then slide out of it" and "press crouch just before you land" work.
+	 * Only a fresh PRESS charges it, so holding the key can never chain slides. Sane range 0.15 to
+	 * 0.35; much above that and the slide fires long after the player stopped asking for it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Input Buffer (s)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
+	float SlideInputBufferSeconds = 0.25f;
+
+	/**
+	 * Seconds at the start of a slide during which releasing crouch will NOT cancel it.
+	 *
+	 * Without this a slide is only as long as the player holds the key, so lengthening SlideDuration
+	 * changes nothing for anyone who taps crouch. A dash still overrides the commit window. Sane
+	 * range 0.3 to 0.8; at or above SlideDuration the slide becomes entirely uncancellable.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Min Commit (s, uncancellable)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.5"))
+	float SlideMinCommitSeconds = 0.55f;
+
+	/**
+	 * Fraction of the slide's LIVE speed carried into normal movement on exit. 1 = all of it.
+	 *
+	 * This is the "preserve momentum" contract: the old exit only ever clamped DOWN, so a slide
+	 * handed the player back below walking pace and made them re-accelerate. Sane range 0.8 to 1.0.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Exit Speed Retention (fraction of slide speed)", ClampMin = "0.0", ClampMax = "1.5", UIMin = "0.5", UIMax = "1.0"))
+	float SlideExitSpeedRetention = 1.0f;
+
+	/**
+	 * Floor on the exit speed as a fraction of WalkSpeed, so a slide can never end slower than a run.
+	 *
+	 * Below 1 a decayed slide still dumps the player out under walking pace. Sane range 0.9 to 1.0.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Exit Floor (fraction of Walk Speed)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.5", UIMax = "1.2"))
+	float SlideExitMinSpeedFraction = 1.0f;
+
+	/**
+	 * Ceiling on the exit speed as a multiple of max speed. KEEP THIS AT 1.0 unless you want overspeed.
+	 *
+	 * Above 1, CalcVelocity's input branch clamps to the CURRENT speed once it exceeds max, so any
+	 * overspeed handed back is kept for as long as a movement key is held — slide-cancel spam then
+	 * becomes the fastest way to cross the arena. The knob exists to make that a deliberate choice.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Exit Ceiling (multiple of Max Speed)", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float SlideExitMaxSpeedMultiplier = 1.0f;
+
+	// --- Boost (ground-only vertical launch, a separate bind from jump) ----------------------
+
+	/**
+	 * +Z velocity granted by a boost, in uu/s.
+	 *
+	 * APEX SCALES WITH THE SQUARE: height = v^2 / 2g. Against the default 980 gravity, 813 gives an
+	 * apex of ~337uu, against ~209uu for the 640 jump. Halving this value would QUARTER the height,
+	 * not halve it — to halve the height, scale the velocity by sqrt(0.5) (which is exactly how 1150
+	 * became 813). Sane range 700 to 1400.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Boost", meta = (DisplayName = "Boost Z Velocity (uu/s)", ClampMin = "100.0", ClampMax = "4000.0", UIMin = "400.0", UIMax = "2000.0"))
+	float BoostZVelocity = 813.f;
+
+	/**
+	 * Boost cooldown in seconds. Contract §5: twelve seconds.
+	 *
+	 * Long on purpose — boost is a commitment, not mobility. Keep BotBoostCooldownSeconds equal.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Boost", meta = (DisplayName = "Boost Cooldown (s)", ClampMin = "0.0", ClampMax = "60.0", UIMin = "1.0", UIMax = "20.0"))
+	float BoostCooldown = 12.f;
+
+	// ==========================================================================================
+	// CORE
+	// ==========================================================================================
+
+	/** Launch speed of a thrown/passed Core, in uu/s. Sane range 1800 to 3200. */
+	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Pass Speed (uu/s)", ClampMin = "100.0", ClampMax = "10000.0", UIMin = "800.0", UIMax = "5000.0"))
+	float PassSpeed = 2400.f;
+
+	/** Fraction of the throw direction added as +Z, so passes arc instead of skimming the floor. */
+	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Pass Upward Bias (fraction)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
+	float PassUpwardBias = 0.14f;
+
+	/**
+	 * Radius within which a character may pick the Core up, in uu.
+	 *
+	 * Roughly three capsule radii. Much larger and passes catch themselves off a near miss; much
+	 * smaller and a moving receiver has to be threaded through.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Pickup Radius (uu)", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "50.0", UIMax = "400.0"))
+	float PickupRadius = 110.f;
+
+	/** How long the thrower is blocked from re-catching their own pass, in seconds. */
+	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Self-Catch Lockout (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
+	float PickupLockoutAfterThrow = 0.35f;
+
+	/** A loose, untouched Core returns to centre after this many seconds. Sane range 8 to 25. */
+	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Loose Core Reset Time (s)", ClampMin = "1.0", ClampMax = "120.0", UIMin = "5.0", UIMax = "40.0"))
+	float CoreResetTime = 15.f;
+
+	// ==========================================================================================
+	// TRAIL  (the "trace")
+	// ==========================================================================================
+
+	/** Who dies when the trail is tripped. Default rule: the carrier does. */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Trail Lethality"))
+	ETrailLethality TrailLethality = ETrailLethality::KillsCarrier;
+
+	/** True: teammates of the carrier pass through the trail harmlessly. Flipping this changes the game. */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Only Enemies Trip Trail"))
+	bool bOnlyEnemiesTripTrail = true;
+
+	/** True: only a dashing player trips the trail. This is the core counterplay rule. */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Require Dash To Trip Trail"))
+	bool bRequireDashToTripTrail = true;
+
+	/**
+	 * Seconds a trail point survives after being laid — i.e. how much lethal trace is on the field
+	 * behind a carrier at any moment.
+	 *
+	 * CEILING OF 4 SECONDS, ENFORCED IN CODE. UTraceTrailComponent::GetTraceLifetimeSeconds() takes
+	 * min(this, 4.0), so a larger value here is silently ignored; the clamp below makes that visible
+	 * in the panel instead of hiding it. Sane range 2 to 4.
+	 *
+	 * Shortening it is a real nerf to the trail-hunting bots, whose BotTrailMinPointLifeRemaining
+	 * filter is a fraction of this window written as an absolute — move the two together.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Trail Lifetime (s)", ClampMin = "0.2", ClampMax = "4.0", UIMin = "0.5", UIMax = "4.0"))
+	float TrailLifetime = 2.8f;
+
+	/**
+	 * Distance the carrier must travel before a new point is appended, in uu.
+	 *
+	 * Smaller is a smoother, more expensive trace. Sane range 40 to 100; this multiplied by
+	 * MaxTrailPoints is the longest trace that can exist.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Point Spacing (uu)", ClampMin = "10.0", ClampMax = "500.0", UIMin = "30.0", UIMax = "200.0"))
+	float TrailPointSpacing = 60.f;
+
+	/** Collision/visual radius of a trail segment, in uu. The visual is derived from the lethal volume. */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Segment Radius (uu)", ClampMin = "5.0", ClampMax = "500.0", UIMin = "20.0", UIMax = "150.0"))
+	float TrailRadius = 45.f;
+
+	/**
+	 * Collision/visual height of a trail segment, in uu.
+	 *
+	 * Also drives the third-person camera pivot (ATraceCharacter::GetThirdPersonPivotZ reads this so
+	 * the camera clears the wall), so raising it lifts the carry camera with it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Segment Height (uu)", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "60.0", UIMax = "400.0"))
+	float TrailHeight = 190.f;
+
+	/** Hard cap on replicated trail points; oldest are dropped first. A bandwidth dial. */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Max Trail Points", ClampMin = "8", ClampMax = "1024", UIMin = "32", UIMax = "512"))
+	int32 MaxTrailPoints = 256;
+
+	/**
+	 * Newest N points are exempt from the trip test so the carrier never kills themselves.
+	 *
+	 * At the default spacing this is only ~180uu of exemption. Sane range 2 to 6; zero lets a
+	 * carrier die to the trace coming out of their own feet.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Head Grace Points", ClampMin = "0", ClampMax = "32", UIMin = "0", UIMax = "10"))
+	int32 TrailHeadGracePoints = 3;
+
+	// ==========================================================================================
+	// BOTS
 	//
 	// Everything here is read live by ATraceGameMode and ATraceBotController, so the whole bot
-	// difficulty curve is tunable from Config/DefaultGame.ini without a rebuild. The URL option
-	// "?bots=0" overrides bFillTeamsWithBots for one session (see ATraceGameMode::AreBotsEnabled).
-	// ------------------------------------------------------------------------------------------
+	// difficulty curve is tunable with PIE running. The URL option "?bots=0" overrides
+	// bFillTeamsWithBots for one session (see ATraceGameMode::AreBotsEnabled).
+	// ==========================================================================================
 
 	/** Master switch: top both teams up to PlayersPerTeam with AI so one human gets a full 5v5. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots")
+	UPROPERTY(config, EditAnywhere, Category = "Bots", meta = (DisplayName = "Fill Teams With Bots"))
 	bool bFillTeamsWithBots = true;
 
 	/**
 	 * Bots to add per team, or -1 for "however many it takes to reach PlayersPerTeam".
 	 * -1 is what makes the fill self-correcting when a second human joins a listen server.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots")
+	UPROPERTY(config, EditAnywhere, Category = "Bots", meta = (DisplayName = "Bots Per Team (-1 = auto fill)", ClampMin = "-1", ClampMax = "16", UIMin = "-1", UIMax = "8"))
 	int32 BotsPerTeam = -1;
 
 	/** Hard safety cap on total bots, so a silly PlayersPerTeam cannot spawn a hundred pawns. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots")
+	UPROPERTY(config, EditAnywhere, Category = "Bots", meta = (DisplayName = "Max Bots (safety cap)", ClampMin = "0", ClampMax = "64", UIMin = "0", UIMax = "32"))
 	int32 MaxBots = 16;
 
 	/**
 	 * Difficulty used when nothing else resolved one — i.e. a direct launch straight into the arena
 	 * with no travel URL. EASY on purpose: this is what an unattended run, an automated test and a
 	 * first-time player all get.
+	 *
+	 * LATCHED PER MATCH. Editing this mid-PIE does nothing until the next map load; edit the profile
+	 * that is already in force instead, which retunes immediately.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots")
+	UPROPERTY(config, EditAnywhere, Category = "Bots", meta = (DisplayName = "Default Bot Difficulty"))
 	EBotDifficulty BotDifficulty = EBotDifficulty::Easy;
 
 	/**
@@ -434,13 +929,15 @@ public:
 	 * constructor rather than braced here: twenty-one positional floats in a row is a data-entry
 	 * accident waiting to happen, and the constructor lets each number sit next to its reason.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Difficulty")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Difficulty", meta = (DisplayName = "Easy Profile"))
 	FTraceBotProfile BotEasy;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Difficulty")
+	/** The Normal skill curve. Roughly a competent human. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Difficulty", meta = (DisplayName = "Normal Profile"))
 	FTraceBotProfile BotNormal;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Difficulty")
+	/** The Hard skill curve. Punishing: you must use cover and you must keep moving. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Difficulty", meta = (DisplayName = "Hard Profile"))
 	FTraceBotProfile BotHard;
 
 	// ------------------------------------------------------------------------------------------
@@ -458,22 +955,22 @@ public:
 	// length or half-width, read from ATraceArenaBuilder::GetFieldBounds() at runtime.
 	//
 	// Distances that describe the CHARACTER rather than the pitch — dash reach, the trail dash
-	// commit band, wall clearance — stay absolute, because a dash is 468uu no matter how big the
+	// commit band, wall clearance — stay absolute, because a dash is 540uu no matter how big the
 	// arena is.
 	// ------------------------------------------------------------------------------------------
 
 	/**
-	 * Perpendicular distance to the trail line inside which a hunting bot commits its dash.
+	 * Perpendicular distance to the trail line inside which a hunting bot commits its dash, in uu.
 	 *
-	 * Must stay comfortably under the dash's own reach (DashSpeed * DashDuration, ~468uu by
+	 * Must stay comfortably under the dash's own reach (DashSpeed * DashDuration, ~540uu by
 	 * default) or the dash stops short of the trail and the signature kill never lands. ABSOLUTE,
-	 * not field-relative: it is a property of the dash.
+	 * not field-relative: it is a property of the dash. Sane range 0.6 to 0.85 of dash reach.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Trail Dash Commit Range (uu)", ClampMin = "10.0", ClampMax = "3000.0", UIMin = "100.0", UIMax = "1000.0"))
 	float BotTrailDashRange = 380.f;
 
-	/** How far past the trail an interceptor aims, so the dash sweeps THROUGH it and not up to it. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept")
+	/** How far past the trail an interceptor aims, in uu, so the dash sweeps THROUGH it and not up to it. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Trail Cross Overshoot (uu)", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "50.0", UIMax = "800.0"))
 	float BotTrailCrossOvershoot = 320.f;
 
 	/**
@@ -481,14 +978,16 @@ public:
 	 *
 	 * A bot that commits to a point which expires before it arrives is a bot that spends the whole
 	 * carry running at ghosts — one of the two reasons trail kills were 1.3% of deaths.
+	 *
+	 * A FRACTION OF TrailLifetime WRITTEN AS AN ABSOLUTE, so the two must move together. It is
+	 * calibrated to discard the oldest ~20% of the trace: at TrailLifetime 4 that was 0.8, and at
+	 * the current 2.8 it is 0.56. Leaving it at 0.8 against a 2.8s trace would discard the oldest
+	 * 29% instead — the same mistake, in the same direction, that cut the trail-kill share from a
+	 * measured 37.5% of kills to 25.9% when TrailLifetime went 6 -> 4. Interceptors were not worse
+	 * at crossing; there was simply less legal trace for them to aim at.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept")
-	// 1.2 -> 0.8: spec §3 cut TrailLifetime from 6 s to 4 s, and this filter is a FRACTION of that
-	// window even though it is written as an absolute. At 1.2 s it discarded the oldest 30% of a 4 s
-	// trace instead of the 20% it was tuned to discard, and the trail-kill share fell from a measured
-	// 37.5% of kills to 25.9% in the first run under the new rules. Interceptors were not worse at
-	// crossing; there was simply less legal trace for them to aim at.
-	float BotTrailMinPointLifeRemaining = 0.8f;
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Min Point Life Remaining (s)", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0"))
+	float BotTrailMinPointLifeRemaining = 0.56f;
 
 	/**
 	 * Fraction of the field HALF-LENGTH inside which a bot will accept the interceptor role.
@@ -499,11 +998,11 @@ public:
 	 * knowing about — measurably fatal: the carrier died 1-3 seconds after every pickup and the
 	 * match ran a full minute without a single capture.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Intercept Radius (fraction of field half-length)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.1", UIMax = "1.0"))
 	float BotInterceptRadiusFieldFraction = 0.70f;
 
 	/**
-	 * Trail points closer than this to the carrier are not intercept targets.
+	 * Trail points closer than this to the carrier are not intercept targets, in uu.
 	 *
 	 * The server exempts the newest TrailHeadGracePoints from the trip test, but at the default
 	 * spacing that is only ~180uu — close enough that a defender standing where the carrier just
@@ -511,19 +1010,24 @@ public:
 	 * mechanic is for. Requiring established trail turns the intercept back into a chase and gives
 	 * the carrier the separation a run needs to be worth attempting.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Min Trail Distance From Carrier (uu)", ClampMin = "0.0", ClampMax = "8000.0", UIMin = "0.0", UIMax = "3000.0"))
 	float BotTrailMinDistanceFromCarrier = 900.f;
 
-	/** Fraction of the field HALF-LENGTH a screening escort holds ahead of the carrier. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning")
+	/**
+	 * Fraction of the field HALF-LENGTH a screening escort holds ahead of the carrier.
+	 *
+	 * Must stay comfortably ABOVE BotPassMinGoalAdvantageFieldFraction, or no escort is ever a legal
+	 * receiver and bots silently never pass. That was measured: zero passes in fifty runs.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning", meta = (DisplayName = "Escort Lead (fraction of field half-length)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
 	float BotEscortLeadFieldFraction = 0.18f;
 
 	/** Fraction of the field HALF-LENGTH short of the goal a deep receiver parks at. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning", meta = (DisplayName = "Deep Runner Standoff (fraction of field half-length)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.6"))
 	float BotDeepRunnerStandoffFieldFraction = 0.22f;
 
 	/** Fraction of the field HALF-WIDTH used to spread bots sideways so they do not stack up. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning", meta = (DisplayName = "Formation Spread (fraction of field half-width)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float BotFormationSpreadFieldFraction = 0.35f;
 
 	/**
@@ -544,21 +1048,31 @@ public:
 	 * ~12000uu. Contesting the Core together is what generates fights; only the endzone approach has
 	 * width to give away.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning", meta = (DisplayName = "Attack Lane Spread (fraction of field half-width)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float BotAttackLaneFieldFraction = 0.30f;
 
-
-	/** How far inside the endzone the goal point sits. Must stay under the endzone depth (900uu). */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning")
+	/** How far inside the endzone the goal point sits, in uu. Must stay under the endzone depth (900uu). */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning", meta = (DisplayName = "Goal Inset From Wall (uu)", ClampMin = "0.0", ClampMax = "900.0", UIMin = "0.0", UIMax = "900.0"))
 	float BotGoalInsetFromWall = 300.f;
 
-	/** How close to a wall the steering repulsion field starts pushing back. Absolute: dash reach. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning")
+	/** How close to a wall the steering repulsion field starts pushing back, in uu. Absolute: dash reach. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning", meta = (DisplayName = "Wall Avoid Margin (uu)", ClampMin = "1.0", ClampMax = "4000.0", UIMin = "50.0", UIMax = "1500.0"))
 	float BotWallAvoidMargin = 500.f;
 
-	/** An enemy inside this radius makes a carrying bot spend its dash to break away. Absolute. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning")
+	/** An enemy inside this radius (uu) makes a carrying bot spend its dash to break away. Absolute. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning", meta = (DisplayName = "Carrier Panic Radius (uu)", ClampMin = "0.0", ClampMax = "8000.0", UIMin = "0.0", UIMax = "3000.0"))
 	float BotCarrierPanicRadius = 900.f;
+
+	/**
+	 * Seconds between re-asking the ATraceEndzone actors which end this team attacks.
+	 *
+	 * Bots MUST NOT cache "Blue attacks +X". Teams switch sides at half time, and a bot still
+	 * running at the first-half endzone in the second half is both the most likely bug in this pass
+	 * and one that looks exactly like bad pathing. Polling is a two-actor scan, so it is cheap
+	 * enough to simply keep doing forever rather than trying to detect the switch.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning", meta = (DisplayName = "Endzone Re-resolve Interval (s)", ClampMin = "0.05", ClampMax = "30.0", UIMin = "0.1", UIMax = "5.0"))
+	float BotEndzoneResolveInterval = 1.f;
 
 	// ------------------------------------------------------------------------------------------
 	// Bots — target selection
@@ -584,7 +1098,7 @@ public:
 	 * 12% of the time, because nine bots packed around the Core are always the closer option.
 	 * Deliberately not lower still: bots that visibly refuse to fight each other read as scripted.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Targeting")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Targeting", meta = (DisplayName = "Human Target Bias (squared-distance weight)", ClampMin = "0.01", ClampMax = "1.0", UIMin = "0.05", UIMax = "1.0"))
 	float BotHumanTargetBias = 0.25f;
 
 	/**
@@ -597,28 +1111,32 @@ public:
 	 * the ~17% duty cycle the burst profile alone implies. Sticking to a target is what converts
 	 * aim time into shots.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Targeting")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Targeting", meta = (DisplayName = "Target Switch Threshold (fraction)", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.1", UIMax = "1.0"))
 	float BotTargetSwitchFraction = 0.45f;
 
+	// ------------------------------------------------------------------------------------------
+	// Bots — passing
+	// ------------------------------------------------------------------------------------------
+
 	/** Seconds between pass evaluations by a carrying bot. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing", meta = (DisplayName = "Pass Eval Interval (s)", ClampMin = "0.05", ClampMax = "5.0", UIMin = "0.1", UIMax = "1.5"))
 	float BotPassEvalInterval = 0.35f;
 
 	/**
-	 * Shortest throw a bot will bother with.
+	 * Shortest throw a bot will bother with, in uu.
 	 *
 	 * Below this the "pass" is a handoff to somebody already inside PickupRadius — the Core is
 	 * caught in the same frame it is thrown, which gains nothing and reads in the log as a bug.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing", meta = (DisplayName = "Min Pass Distance (uu)", ClampMin = "0.0", ClampMax = "10000.0", UIMin = "100.0", UIMax = "3000.0"))
 	float BotPassMinDistance = 700.f;
 
 	/** Floor on pass range, in uu. The effective range is the larger of this and the fraction below. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing", meta = (DisplayName = "Pass Range Floor (uu)", ClampMin = "0.0", ClampMax = "30000.0", UIMin = "500.0", UIMax = "10000.0"))
 	float BotPassMinRange = 3200.f;
 
 	/** Fraction of the field HALF-LENGTH a bot will throw the Core across. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing", meta = (DisplayName = "Pass Range (fraction of field half-length)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.1", UIMax = "1.0"))
 	float BotPassRangeFieldFraction = 0.55f;
 
 	/**
@@ -629,14 +1147,14 @@ public:
 	 * passing silently never happens. That is exactly what was measured — zero passes in fifty
 	 * runs. Keep BotEscortLeadFieldFraction comfortably above this value.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing", meta = (DisplayName = "Min Receiver Goal Advantage (fraction of field half-length)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
 	float BotPassMinGoalAdvantageFieldFraction = 0.10f;
 
 	/**
-	 * An enemy this close to a carrying bot turns passing into a reflex rather than a plan: the
+	 * An enemy this close (uu) to a carrying bot turns passing into a reflex rather than a plan: the
 	 * advantage requirement drops to zero and any open teammate becomes a legal outlet.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing", meta = (DisplayName = "Pass Pressure Radius (uu)", ClampMin = "0.0", ClampMax = "10000.0", UIMin = "0.0", UIMax = "4000.0"))
 	float BotPassPressureRadius = 1400.f;
 
 	// ------------------------------------------------------------------------------------------
@@ -657,15 +1175,15 @@ public:
 	 * hold and the dwell being clocked on slightly different frames. Cheap: the surplus is spent
 	 * shielded-down, but only for a frame or two.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Hold Margin (s)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.75"))
 	float BotPassHoldMargin = 0.20f;
 
-	/** Bot-side mirror of the rule's pass dwell. Keep equal to the pawn's hold requirement. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass")
+	/** Bot-side MIRROR of the rule's pass dwell. Keep equal to the pawn's hold requirement. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Hold Duration (s) [mirror of the rule]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.1", UIMax = "2.0"))
 	float BotPassHoldSeconds = 0.50f;
 
-	/** Bot-side mirror of the rule's 2 s post-pass cooldown, plus a little so bots never spam it. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass")
+	/** Bot-side MIRROR of the rule's 2 s post-pass cooldown, plus a little so bots never spam it. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Pass Cooldown (s) [mirror of the rule]", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "6.0"))
 	float BotPassCooldownSeconds = 2.30f;
 
 	/**
@@ -675,7 +1193,7 @@ public:
 	 * and only presses once it is inside this cone. Pressing early would burn the vulnerable window
 	 * on slewing rather than on the dwell.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Aim Tolerance (deg)", ClampMin = "0.1", ClampMax = "45.0", UIMin = "1.0", UIMax = "15.0"))
 	float BotPassAimToleranceDegrees = 4.f;
 
 	/**
@@ -684,17 +1202,17 @@ public:
 	 * A carrier that spends four seconds slewing at a teammate who keeps moving behind cover is a
 	 * carrier not running at the goal.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Max Line-Up Time (s)", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.2", UIMax = "3.0"))
 	float BotPassMaxLineUpSeconds = 1.10f;
 
 	/**
-	 * Radius inside which an enemy with line of sight counts as "covering" the carrier, and so as a
-	 * reason not to start a pass. Scaled by FTraceBotProfile::PassCaution.
+	 * Radius (uu) inside which an enemy with line of sight counts as "covering" the carrier, and so
+	 * as a reason not to start a pass. Scaled by FTraceBotProfile::PassCaution.
 	 *
 	 * This is the risk half of the spec's central loop expressed as a number: it is the distance at
 	 * which a gun is close enough to convert half a second of dropped shield into a kill.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Safe Radius (uu)", ClampMin = "0.0", ClampMax = "20000.0", UIMin = "0.0", UIMax = "6000.0"))
 	float BotPassSafeRadius = 2200.f;
 
 	// ------------------------------------------------------------------------------------------
@@ -702,13 +1220,13 @@ public:
 	// ------------------------------------------------------------------------------------------
 
 	/**
-	 * Range at which a punisher will hold a bead on the enemy carrier.
+	 * Range (uu) at which a punisher will hold a bead on the enemy carrier.
 	 *
 	 * Also the radius used by CountEnemiesCoveringMe(), so the carrier's idea of "someone can shoot
 	 * me" and the defender's idea of "I can shoot the carrier" are the same number by construction.
 	 * If those two ever disagree, one side of the pass loop is playing a different game.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Punish")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Punish", meta = (DisplayName = "Punish Range (uu)", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
 	float BotPunishRange = 2600.f;
 
 	/**
@@ -717,7 +1235,7 @@ public:
 	 * Deliberately not zero: a punisher that walks onto the carrier is inside its own trace-hunting
 	 * teammates' crossing lanes, and is also the first thing a boosting carrier escapes past.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Punish")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Punish", meta = (DisplayName = "Punish Standoff (fraction of Punish Range)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float BotPunishStandoffFraction = 0.55f;
 
 	// ------------------------------------------------------------------------------------------
@@ -728,10 +1246,12 @@ public:
 	// a bot's aim converges on; FTraceBotProfile::HeadshotAimFraction chooses between them.
 	// ------------------------------------------------------------------------------------------
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Aim")
+	/** Head aim point, +Z from the capsule centre. The capsule half-height is 88, so ~62 is the skull. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Aim", meta = (DisplayName = "Head Aim Offset Z (uu)", ClampMin = "-200.0", ClampMax = "200.0", UIMin = "0.0", UIMax = "100.0"))
 	float BotAimHeadOffsetZ = 62.f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Aim")
+	/** Body (centre mass) aim point, +Z from the capsule centre. Also the point the LOS test uses. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Aim", meta = (DisplayName = "Body Aim Offset Z (uu)", ClampMin = "-200.0", ClampMax = "200.0", UIMin = "-50.0", UIMax = "80.0"))
 	float BotAimBodyOffsetZ = 20.f;
 
 	/**
@@ -741,7 +1261,7 @@ public:
 	 * around the body point already produces leg hits, and naming the zone makes that visible in the
 	 * damage numbers instead of looking like a miss that happened to land.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Aim")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Aim", meta = (DisplayName = "Leg Aim Offset Z (uu)", ClampMin = "-200.0", ClampMax = "200.0", UIMin = "-100.0", UIMax = "20.0"))
 	float BotAimLegOffsetZ = -50.f;
 
 	// ------------------------------------------------------------------------------------------
@@ -752,12 +1272,12 @@ public:
 	// durations are (see above) — the authoritative cooldown lives on the movement component.
 	// ------------------------------------------------------------------------------------------
 
-	/** Bot-side mirror of the dash cooldown used by the shadow charge model. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement")
-	float BotDashCooldownSeconds = 4.f;
+	/** Bot-side MIRROR of DashCooldown, used by the shadow charge model. Keep the two equal. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Dash Cooldown (s) [mirror of Movement|Dash]", ClampMin = "0.05", ClampMax = "30.0", UIMin = "0.5", UIMax = "10.0"))
+	float BotDashCooldownSeconds = 3.5f;
 
-	/** Bot-side mirror of the boost cooldown. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement")
+	/** Bot-side MIRROR of BoostCooldown. Keep the two equal. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Boost Cooldown (s) [mirror of Movement|Boost]", ClampMin = "0.05", ClampMax = "60.0", UIMin = "1.0", UIMax = "20.0"))
 	float BotBoostCooldownSeconds = 12.f;
 
 	/**
@@ -769,17 +1289,25 @@ public:
 	 * seconds at a time. Slightly longer than the strafe-evade trigger so the cheap fix is always
 	 * tried first.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Boost-When-Stuck Delay (s)", ClampMin = "0.1", ClampMax = "10.0", UIMin = "0.3", UIMax = "4.0"))
 	float BotBoostStuckSeconds = 1.30f;
 
-	/** Minimum planar speed before a slide is worth starting. Sliding from a standstill is a crouch. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement")
+	/** Minimum planar speed (uu/s) before a slide is worth starting. Sliding from a standstill is a crouch. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Slide Min Speed (uu/s)", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "100.0", UIMax = "1500.0"))
 	float BotSlideMinSpeed = 480.f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement")
-	float BotSlideHoldSeconds = 0.70f;
+	/**
+	 * How long a bot holds the crouch input once it decides to slide. Keep at or under SlideDuration.
+	 *
+	 * MUST TRACK SlideDuration. Bots release crouch after exactly this long, so at the old 0.70
+	 * against a 1.8s slide every bot slide ended in the commit window and the longer slide was
+	 * invisible in bot play. 1.60 lets a bot slide run essentially to its duration.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Slide Hold (s)", ClampMin = "0.05", ClampMax = "6.0", UIMin = "0.1", UIMax = "3.0"))
+	float BotSlideHoldSeconds = 1.60f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement")
+	/** Bot-side pacing on slides, so a bot does not spend the whole match on its side. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Slide Cooldown (s)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.5", UIMax = "8.0"))
 	float BotSlideCooldownSeconds = 3.20f;
 
 	/**
@@ -789,23 +1317,8 @@ public:
 	 * and cannot change direction, which is a bad place to be while being shot at. Below this height
 	 * the fall is over before the input would matter.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement")
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Fast-Fall Min Height (uu)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "0.0", UIMax = "600.0"))
 	float BotFastFallMinHeight = 140.f;
-
-	// ------------------------------------------------------------------------------------------
-	// Bots — endzone resolution  (mechanics spec §1: sides switch at half time)
-	// ------------------------------------------------------------------------------------------
-
-	/**
-	 * Seconds between re-asking the ATraceEndzone actors which end this team attacks.
-	 *
-	 * Bots MUST NOT cache "Blue attacks +X". Teams switch sides at half time, and a bot still
-	 * running at the first-half endzone in the second half is both the most likely bug in this pass
-	 * and one that looks exactly like bad pathing. Polling is a two-actor scan, so it is cheap
-	 * enough to simply keep doing forever rather than trying to detect the switch.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Positioning")
-	float BotEndzoneResolveInterval = 1.f;
 
 	// ------------------------------------------------------------------------------------------
 	// Bots — legacy scalars
@@ -814,240 +1327,88 @@ public:
 	// They survive because UI/TraceMatchOptions.cpp writes to them to express its own difficulty
 	// curve, and deleting them would not compile. Treat them as read-only history: changing them
 	// no longer changes how a bot plays.
+	//
+	// Marked AdvancedDisplay so the panel folds them out of the way rather than presenting seven
+	// dead knobs alongside the live ones.
 	// ------------------------------------------------------------------------------------------
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Legacy")
+	/** DEAD — superseded by FTraceBotProfile::ReactionTimeSeconds. */
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Reaction Time [DEAD]", ClampMin = "0.0", ClampMax = "5.0"))
 	float BotReactionTime = 0.32f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Legacy")
+	/** DEAD — superseded by FTraceBotProfile::AimErrorDegrees. */
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Aim Error [DEAD]", ClampMin = "0.0", ClampMax = "45.0"))
 	float BotAimErrorDegrees = 4.5f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Legacy")
+	/** DEAD — superseded by FTraceBotProfile::Aggression. */
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Aggression [DEAD]", ClampMin = "0.0", ClampMax = "1.0"))
 	float BotAggression = 0.75f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Legacy")
+	/** DEAD — superseded by FTraceBotProfile::DecisionInterval. */
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Decision Interval [DEAD]", ClampMin = "0.02", ClampMax = "2.0"))
 	float BotDecisionInterval = 0.2f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Legacy")
+	/** DEAD — superseded by FTraceBotProfile::SightRange. */
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Sight Range [DEAD]", ClampMin = "0.0", ClampMax = "40000.0"))
 	float BotSightRange = 6000.f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Legacy")
+	/** DEAD — superseded by FTraceBotProfile::PreferredCombatRange. */
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Preferred Combat Range [DEAD]", ClampMin = "0.0", ClampMax = "20000.0"))
 	float BotPreferredCombatRange = 1600.f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Legacy")
+	/** DEAD — superseded by FTraceBotProfile::PassChance. */
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Pass Chance [DEAD]", ClampMin = "0.0", ClampMax = "1.0"))
 	float BotPassChance = 0.35f;
 
-	// ------------------------------------------------------------------------------------------
-	// Controls
-	// ------------------------------------------------------------------------------------------
+	// ==========================================================================================
+	// NET
+	// ==========================================================================================
+
+	/** Master switch for server-side rewind on hitscan. Off = resolve against present-day poses. */
+	UPROPERTY(config, EditAnywhere, Category = "Net", meta = (DisplayName = "Enable Lag Compensation"))
+	bool bEnableLagCompensation = true;
 
 	/**
-	 * NO LONGER THE PLAYER'S SENSITIVITY. The human look scale is now a persisted per-player
-	 * setting: UTraceUserSettings::LookSensitivity (default 1.50), plus a separate vertical
-	 * multiplier and an invert-Y toggle, all rebuilt into the Look mapping's modifier scalars by
+	 * Upper bound on how far back the server will rewind, in seconds.
+	 *
+	 * 0.25 covers ~250ms RTT; beyond that a shooter's claim is rejected rather than honoured, which
+	 * is what stops high-ping players from shooting into the past. Must stay BELOW
+	 * LagCompHistoryDuration with headroom, or the rewind target falls off the end of the buffer.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Net", meta = (DisplayName = "Max Rewind Time (s)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
+	float MaxRewindTime = 0.25f;
+
+	/**
+	 * How much pose history each character keeps, in seconds. MUST EXCEED MaxRewindTime.
+	 *
+	 * This is a memory dial: ten characters at 60Hz for one second is 600 stored poses.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Net", meta = (DisplayName = "Lag Comp History (s)", ClampMin = "0.05", ClampMax = "5.0", UIMin = "0.25", UIMax = "2.0"))
+	float LagCompHistoryDuration = 1.f;
+
+	/** Draws the rewound capsules the server actually tested against. Noisy; dev only. */
+	UPROPERTY(config, EditAnywhere, Category = "Net", meta = (DisplayName = "Draw Server Rewind Debug"))
+	bool bDrawServerRewindDebug = false;
+
+	// ==========================================================================================
+	// CONTROLS  (legacy)
+	// ==========================================================================================
+
+	/**
+	 * DEAD. NO LONGER THE PLAYER'S SENSITIVITY.
+	 *
+	 * The human look scale is now a persisted per-player setting: UTraceUserSettings::
+	 * LookSensitivity (default 1.50), plus a separate vertical multiplier and an invert-Y toggle,
+	 * all rebuilt into the Look mapping's modifier scalars by
 	 * ATracePlayerController::ApplyControlSettings(). Editing this value does not move a human's
 	 * crosshair.
 	 *
-	 * DEAD. Nothing reads it any more. Its last caller was the -TraceWalkHuman debug harness in
+	 * Nothing reads it any more. Its last caller was the -TraceWalkHuman debug harness in
 	 * AI/TraceBotController.cpp, which divided by it to convert a desired yaw into synthetic mouse
 	 * delta; that was fixed at integration to read UTraceUserSettings::GetLookScaleX(), i.e. the
 	 * scalar actually installed in the Look mapping. Kept only so an existing DefaultGame.ini that
 	 * still carries the key does not warn. Do not wire anything new to it.
-	 *
-	 * The old warning about bEnableLegacyInputScales is obsolete and was wrong in the opposite
-	 * direction — see the header of Settings/TraceUserSettings.h for the corrected sign analysis
-	 * (the Negate modifier on MouseY was the bug, and it is gone).
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Controls")
+	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Controls", meta = (DisplayName = "Look Sensitivity [DEAD — see TraceUserSettings]", ClampMin = "0.01", ClampMax = "20.0"))
 	float LookSensitivity = 2.5f;
-
-	// ------------------------------------------------------------------------------------------
-	// Movement
-	// ------------------------------------------------------------------------------------------
-
-	/** Base ground speed. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float WalkSpeed = 720.f;
-
-	/** WalkSpeed multiplier while carrying the Core — the carrier is slightly faster. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float CarrierSpeedMultiplier = 1.08f;
-
-	/** Speed clamp while dashing. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float DashSpeed = 2600.f;
-
-	/** How long a dash lasts. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float DashDuration = 0.18f;
-
-	/**
-	 * Cooldown measured from dash start, per charge. Contract §5: four seconds.
-	 *
-	 * Was 3. Raising it is a real nerf to the only counterplay against a carrier, which is exactly
-	 * why the carrier is simultaneously given a second charge — the pressure moves from "the
-	 * defender can dash often" to "the carrier can dash twice".
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float DashCooldown = 4.f;
-
-	/**
-	 * Dash charges everybody has. The pool refills one charge at a time, each on DashCooldown.
-	 *
-	 * A pool rather than a timer because the carrier bonus below has to be able to appear and
-	 * disappear mid-cooldown without the answer being arbitrary — see the movement component header.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	int32 BaseDashCharges = 1;
-
-	/** Extra dash charges granted for as long as the pawn is carrying the Core (contract §5). */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	int32 CarrierExtraDashCharges = 1;
-
-	// --- Slide (crouch on the ground) -------------------------------------------------------
-	//
-	// A slide spends momentum you already have: it starts from your current speed, boosts it once
-	// and then bleeds it off. It never resizes the capsule — the capsule is the single source of
-	// truth for hit resolution, lag compensation and the trail trip test.
-
-	/**
-	 * Fraction of WalkSpeed you must already be moving at before crouch will start a slide.
-	 * Stops "tap crouch from a standstill" being free speed.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideEntrySpeedFraction = 0.55f;
-
-	/** Entry speed multiplier applied to max(current planar speed, WalkSpeed). */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideSpeedMultiplier = 1.45f;
-
-	/** Hard ceiling on slide entry speed, so a slide out of a dash cannot compound. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideMaxSpeed = 1500.f;
-
-	/** Longest a slide may last, even if it has not decayed to the exit speed. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideDuration = 1.f;
-
-	/** uu/s^2 bled off the slide every second. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideDeceleration = 750.f;
-
-	/** Fraction of WalkSpeed at which a decaying slide gives up and hands the player back. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideExitSpeedFraction = 0.6f;
-
-	/** Degrees per second a slide may be steered. 0 = a slide is a rail. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideTurnRateDegrees = 130.f;
-
-	/** Cooldown measured from slide start, so chained slides cannot sustain above walking speed. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideCooldown = 0.6f;
-
-	/**
-	 * How long a crouch press that could not slide yet (mid-dash, or airborne) stays queued.
-	 *
-	 * This is what makes "dash, then slide out of it" and "press crouch just before you land" work.
-	 * Only a fresh PRESS charges it, so holding the key can never chain slides.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float SlideInputBufferSeconds = 0.25f;
-
-	// --- Boost (ground-only vertical launch, a separate bind from jump) ----------------------
-
-	/**
-	 * +Z velocity granted by a boost. Apex is v^2/2g: at 1150 against the default 980 gravity that
-	 * is ~675uu, against ~209uu for the 640 jump.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float BoostZVelocity = 1150.f;
-
-	/** Contract §5: twelve seconds. Long on purpose — boost is a commitment, not mobility. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement")
-	float BoostCooldown = 12.f;
-
-	// ------------------------------------------------------------------------------------------
-	// Core
-	// ------------------------------------------------------------------------------------------
-
-	/** Launch speed of a thrown/passed Core. */
-	UPROPERTY(config, EditAnywhere, Category = "Core")
-	float PassSpeed = 2400.f;
-
-	/** Fraction of the throw direction added as +Z, so passes arc instead of skimming the floor. */
-	UPROPERTY(config, EditAnywhere, Category = "Core")
-	float PassUpwardBias = 0.14f;
-
-	/** Radius within which a character may pick the Core up. */
-	UPROPERTY(config, EditAnywhere, Category = "Core")
-	float PickupRadius = 110.f;
-
-	/** How long the thrower is blocked from re-catching their own pass. */
-	UPROPERTY(config, EditAnywhere, Category = "Core")
-	float PickupLockoutAfterThrow = 0.35f;
-
-	/** A loose, untouched Core returns to centre after this many seconds. */
-	UPROPERTY(config, EditAnywhere, Category = "Core")
-	float CoreResetTime = 15.f;
-
-	// ------------------------------------------------------------------------------------------
-	// Trail
-	// ------------------------------------------------------------------------------------------
-
-	/** Who dies when the trail is tripped. Default rule: the carrier does. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	ETrailLethality TrailLethality = ETrailLethality::KillsCarrier;
-
-	/** True: teammates of the carrier pass through the trail harmlessly. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	bool bOnlyEnemiesTripTrail = true;
-
-	/** True: only a dashing player trips the trail. This is the core counterplay rule. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	bool bRequireDashToTripTrail = true;
-
-	/** Seconds a trail point survives after being laid. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	float TrailLifetime = 4.f;
-
-	/** Distance the carrier must travel before a new point is appended. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	float TrailPointSpacing = 60.f;
-
-	/** Collision/visual radius of a trail segment. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	float TrailRadius = 45.f;
-
-	/** Collision/visual height of a trail segment. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	float TrailHeight = 190.f;
-
-	/** Hard cap on replicated trail points; oldest are dropped first. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	int32 MaxTrailPoints = 256;
-
-	/** Newest N points are exempt from the trip test so the carrier never kills themselves. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail")
-	int32 TrailHeadGracePoints = 3;
-
-	// ------------------------------------------------------------------------------------------
-	// Net
-	// ------------------------------------------------------------------------------------------
-
-	/** Master switch for server-side rewind on hitscan. Off = resolve against present-day poses. */
-	UPROPERTY(config, EditAnywhere, Category = "Net")
-	bool bEnableLagCompensation = true;
-
-	/** Upper bound on how far back the server will rewind, in seconds. */
-	UPROPERTY(config, EditAnywhere, Category = "Net")
-	float MaxRewindTime = 0.25f;
-
-	/** How much pose history each character keeps, in seconds. Must exceed MaxRewindTime. */
-	UPROPERTY(config, EditAnywhere, Category = "Net")
-	float LagCompHistoryDuration = 1.f;
-
-	/** Draws the rewound capsules the server actually tested against. Noisy; dev only. */
-	UPROPERTY(config, EditAnywhere, Category = "Net")
-	bool bDrawServerRewindDebug = false;
 };

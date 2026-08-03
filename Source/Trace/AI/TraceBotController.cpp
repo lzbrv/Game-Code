@@ -2641,8 +2641,11 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 	const float TechChance = FMath::Clamp(Profile.MovementTechChance, 0.f, 1.f);
 
 	const bool bOnGround = Movement->IsMovingOnGround();
-	const FVector Velocity = BotCharacter->GetVelocity();
-	const float PlanarSpeed = static_cast<float>(Velocity.Size2D());
+	// Not named "Velocity": UMovementComponent declares a public member of that name, and the project
+	// has already lost a Windows build to C4458/C4459 once. clang never warns, so the only defence is
+	// not writing the name.
+	const FVector BotVelocity = BotCharacter->GetVelocity();
+	const float PlanarSpeed = static_cast<float>(BotVelocity.Size2D());
 
 	// --- End an in-progress slide ----------------------------------------------------------------
 	if (bCrouchHeld && bOnGround && Now >= SlideEndTime)
@@ -2658,7 +2661,7 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 	// momentum is still upward — once the bot is already falling there is nothing left to cancel.
 	if (!bOnGround)
 	{
-		const bool bRising = Velocity.Z > 50.f;
+		const bool bRising = BotVelocity.Z > 50.f;
 
 		float HeightAboveFloor = TraceBotConstants::GroundProbeLength;
 		{
@@ -2732,7 +2735,7 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 	// reason to give a bot the verb.
 	if (!bCrouchHeld && Now >= SlideReadyTime && PlanarSpeed > FMath::Max(50.f, Settings.BotSlideMinSpeed))
 	{
-		const FVector Heading = Velocity.GetSafeNormal2D();
+		const FVector Heading = BotVelocity.GetSafeNormal2D();
 		const bool bCommitted = !DesiredMoveDirection.IsNearlyZero()
 			&& FVector::DotProduct(Heading, DesiredMoveDirection) > 0.9f;
 

@@ -1151,7 +1151,70 @@ void ATraceCharacter::SetDeadPresentation(bool bDead)
 	// The visual meshes are NoCollision in their own right and stay that way through this toggle.
 	SetActorEnableCollision(!bDead);
 
+	// And the body itself goes, on the same frame, on every machine. There is no dying animation to
+	// wait for and no ragdoll to settle: the pawn is already frozen and already non-colliding, so a
+	// lingering mesh is a prop that reads as a live player from any distance at which you cannot see
+	// that it is dimmed. Deliberately AFTER the collision toggle, so nothing can ever be invisible
+	// and still solid.
+	SetCorpseHidden(bDead);
+
 	ApplyTeamColors();
+}
+
+void ATraceCharacter::SetCorpseHidden(bool bInHidden)
+{
+	// Note the parameter name. A local or parameter called bHidden would shadow AActor's own member
+	// and fail the Windows build on C4458 — this file has already paid that toll once.
+
+	// One flag, every primitive this actor owns: the mannequin, both fallback shapes, the skid
+	// streak, the pooled trail meshes and every viewmodel part. See the header for why this is done
+	// at the actor level rather than component by component.
+	SetActorHiddenInGame(bInHidden);
+
+	if (USkeletalMeshComponent* MeshComp = GetMesh())
+	{
+		// bCastHiddenShadow is set in the constructor so that a first-person player, whose own mesh is
+		// hidden from their own camera, still casts a shadow they can find their feet by. On a corpse
+		// that same flag is a bug with a very obvious symptom: the body disappears and a body-shaped
+		// shadow stays standing on the floor. Cleared while dead, restored on revive.
+		MeshComp->SetCastHiddenShadow(!bInHidden);
+
+		// A hidden mesh under OnlyTickPoseWhenRendered stops evaluating anyway; saying so explicitly
+		// keeps a dead pawn from being the one skeleton still animating because it happened to be the
+		// local player's (SetOwnBodyHiddenFromOwner puts that one on AlwaysTickPoseAndRefreshBones).
+		if (bInHidden)
+		{
+			MeshComp->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+		}
+	}
+
+	if (bInHidden)
+	{
+		// The viewmodel hangs off the CAMERA, and the camera is still the local player's view target
+		// while the respawn timer runs — so its own visibility bool has to be brought in line, or
+		// UpdateViewBlend would go on believing the gun is shown and skip the restore.
+		SetViewModelVisible(false);
+	}
+
+	// Display, not Verbose. This project has twice declared a mechanic dead because the only line
+	// proving it ran was suppressed at the default verbosity of an automated run — and "did the body
+	// actually go away on every machine" is precisely the kind of claim a screenshot cannot settle
+	// for the nine pawns that were off camera. One line per death and one per respawn.
+	UE_LOG(LogTraceGame, Display, TEXT("[Corpse] %s %s (hiddenInGame=%d, alive=%d, authority=%d)"),
+		*GetName(),
+		bInHidden ? TEXT("hidden on death") : TEXT("shown on respawn"),
+		IsHidden() ? 1 : 0,
+		IsAlive() ? 1 : 0,
+		HasAuthority() ? 1 : 0);
+
+	// NOT touched here: the Core. It is a separate actor that merely attaches to its holder, it is
+	// still in play, and hiding it with the body would blank the one object the whole match is about.
+	// ATraceCore's own holder-sanity pass releases it from a dead carrier (see its Tick), which is
+	// what makes the orb leave the corpse.
+	//
+	// NOT touched either: lag compensation. UTraceLagCompensationComponent records the CAPSULE pose,
+	// which is a transform and is unaffected by visibility; it also skips targets that are not alive.
+	// Hit registration for everyone still breathing is untouched by any of this.
 }
 
 // =================================================================================================
@@ -2623,6 +2686,137 @@ namespace
 
 					CarriedSinceSeconds = ElapsedSeconds;
 					return (Hold > 0.f);
+				}),
+				0.f);
+		}));
+
+	/**
+	 * Trace.DebugAimAtTeammate [DelaySeconds] [DurationSeconds]
+	 *
+	 * Points the local player's view at their nearest living teammate and keeps it there.
+	 *
+	 * Same reason as Trace.DebugTakeCore, one step further along. The pass reticle only reaches its
+	 * interesting state — brackets closed, team coloured, receiver named, hold ring filling — when a
+	 * legal receiver is actually under the crosshair, and a headless harness cannot aim at a bot that
+	 * is wandering a 24000 uu arena. Without this, the acquired state is the one state of the HUD
+	 * that can never be photographed, which is exactly the sort of gap this project has shipped bugs
+	 * through before.
+	 *
+	 * It moves the CONTROL ROTATION only, which is the same thing a mouse moves: the aim, the camera
+	 * and the reticle all follow from it through the normal path, and ATraceCore evaluates the pass
+	 * against the same rotation it would have got from a human. No pass rule is bypassed — if the
+	 * teammate is behind a wall the pass is still refused and the reticle still shows no lock, which
+	 * is the correct answer.
+	 */
+	FAutoConsoleCommand CmdDebugAimAtTeammate(
+		TEXT("Trace.DebugAimAtTeammate"),
+		TEXT("Trace.DebugAimAtTeammate [DelaySeconds] [DurationSeconds] — hold the local player's aim on their nearest teammate."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Delay = (Args.Num() > 0) ? FMath::Max(0.f, FCString::Atof(*Args[0])) : 0.f;
+			const float Duration = (Args.Num() > 1) ? FMath::Max(0.5f, FCString::Atof(*Args[1])) : 20.f;
+
+			double ElapsedSeconds = 0.0;
+			// Weak, and re-logged whenever the choice changes: which teammate is reachable moves
+			// around constantly in a live match, and "the harness stopped finding anyone" is the
+			// single most useful thing this command can tell whoever is reading the log afterwards.
+			TWeakObjectPtr<ATraceCharacter> LastAimedAt;
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda(
+					[ElapsedSeconds, LastAimedAt, Delay, Duration](float DeltaTime) mutable -> bool
+				{
+					ElapsedSeconds += DeltaTime;
+					if (ElapsedSeconds < Delay)
+					{
+						return true;
+					}
+					if (ElapsedSeconds > (Delay + Duration))
+					{
+						return false;
+					}
+
+					UWorld* World = FindDebugGameWorld();
+					ATraceCharacter* Me = FindDebugLocalCharacter(World);
+					const ATraceGameState* State = (World != nullptr) ? World->GetGameState<ATraceGameState>() : nullptr;
+					if (Me == nullptr || State == nullptr || !Me->IsAlive())
+					{
+						return true;
+					}
+
+					// Nearest living ally, found through the PlayerArray rather than an actor iterator:
+					// every pawn in this match belongs to a player state, so this keeps the search to
+					// the ten actors that could possibly be receivers.
+					//
+					// LINE OF SIGHT IS PART OF THE SEARCH, and it has to be. The first version simply
+					// took the nearest ally, and the nearest ally in a real match is very often on a
+					// platform behind a railing — so the harness pointed the crosshair at a teammate
+					// the pass rules correctly refused, and photographed a reticle that was correctly
+					// showing no lock. The Core's own LOS test (ATraceCore::IsLegalPassTarget) is
+					// against world geometry only, so this mirrors it exactly.
+					const FVector MyView = Me->GetPawnViewLocation();
+
+					FCollisionObjectQueryParams ObjectParams;
+					ObjectParams.AddObjectTypesToQuery(ECC_WorldStatic);
+					ObjectParams.AddObjectTypesToQuery(ECC_WorldDynamic);
+
+					ATraceCharacter* Nearest = nullptr;
+					double NearestDistance = TNumericLimits<double>::Max();
+					for (const APlayerState* PlayerState : State->PlayerArray)
+					{
+						ATraceCharacter* Candidate = (PlayerState != nullptr)
+							? Cast<ATraceCharacter>(PlayerState->GetPawn())
+							: nullptr;
+						if (Candidate == nullptr || Candidate == Me || !Candidate->IsAlive())
+						{
+							continue;
+						}
+						// Same test ATraceCore::AreAllies makes, spelled out: that helper is file-local
+						// to TraceCore.cpp and a second copy of the team rules is not worth a header.
+						if (Me->GetTeam() == ETraceTeam::None || Candidate->GetTeam() != Me->GetTeam())
+						{
+							continue;
+						}
+
+						const double Distance = FVector::Dist(Me->GetActorLocation(), Candidate->GetActorLocation());
+						if (Distance >= NearestDistance)
+						{
+							continue;
+						}
+
+						const FVector CandidateChest = Candidate->GetActorLocation() + FVector(0.0, 0.0, 40.0);
+						FCollisionQueryParams QueryParams(FName(TEXT("TraceDebugAimLOS")), /*bTraceComplex=*/false);
+						QueryParams.AddIgnoredActor(Me);
+						QueryParams.AddIgnoredActor(Candidate);
+						if (World->LineTraceTestByObjectType(MyView, CandidateChest, ObjectParams, QueryParams))
+						{
+							continue;   // something solid in the way: not a legal receiver, do not aim at it
+						}
+
+						NearestDistance = Distance;
+						Nearest = Candidate;
+					}
+
+					AController* MyController = Me->GetController();
+					if (Nearest != LastAimedAt.Get())
+					{
+						LastAimedAt = Nearest;
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[DebugAimAtTeammate] %s is now looking at %s (%.0f uu, clear line of sight)."),
+							*Me->GetName(),
+							(Nearest != nullptr) ? *Nearest->GetName() : TEXT("<nobody reachable>"),
+							(Nearest != nullptr) ? NearestDistance : 0.0);
+					}
+
+					if (Nearest == nullptr || MyController == nullptr)
+					{
+						return true;
+					}
+
+					// Chest height, which is the point ATraceCore aims a pass at.
+					const FVector Chest = Nearest->GetActorLocation() + FVector(0.0, 0.0, 40.0);
+					MyController->SetControlRotation((Chest - MyView).Rotation());
+					return true;
 				}),
 				0.f);
 		}));

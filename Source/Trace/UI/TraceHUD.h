@@ -44,7 +44,28 @@ public:
 
 protected:
 	// ---- Draw passes, in back-to-front order --------------------------------------------------
+
+	/**
+	 * Resolves where the reticle goes THIS frame, and who a pass would go to, before anything is
+	 * drawn. Both are consumed by DrawCrosshair() and DrawPassProgress(), which must agree.
+	 *
+	 * Called once from DrawHUD() rather than from inside a pass, because two passes read it and
+	 * the pass-target probe (a handful of line traces) may only ever run once a frame.
+	 */
+	void UpdateReticleAnchor();
+
+	/** The crosshair. Present in BOTH camera modes; see the long note in the .cpp. */
 	void DrawCrosshair();
+
+	/** First-person aim reticle: cross plus centre dot, pixel-snapped, at @p CX,@p CY. */
+	void DrawAimReticle(float CX, float CY, float Visibility);
+
+	/**
+	 * Third-person PASS reticle: a bracket frame that closes and takes the team colour when it is
+	 * over a teammate you could actually pass to. Drawn at the projected pass ray, not at screen
+	 * centre — see DrawPassReticle() for why those are not the same point in third person.
+	 */
+	void DrawPassReticle(float Visibility);
 
 	/**
 	 * The 0.5s pass hold (spec §4), drawn as a ring closing around the reticle.
@@ -135,6 +156,36 @@ protected:
 	bool bLocalAlive = false;
 	bool bLocalCarrying = false;
 	bool bLocalDead = false;
+
+	// ---- Reticle anchor, resolved once per frame by UpdateReticleAnchor() ----------------------
+
+	/**
+	 * 0 = fully first person, 1 = fully third person, eased — the camera's own blend, not the
+	 * carrier bool, so everything keyed off it moves with the camera rather than a beat ahead of it.
+	 */
+	float ViewBlend = 0.f;
+
+	/** Screen-space centre of the reticle. Exactly the viewport centre in first person. */
+	float ReticleX = 0.f;
+	float ReticleY = 0.f;
+
+	/**
+	 * How far down the pass ray the third-person reticle is anchored, in world units, eased so that
+	 * acquiring or losing a receiver slides the reticle instead of teleporting it.
+	 */
+	float PassAnchorDistance = -1.f;
+
+	/** Whoever a pass would go to right now. Weak: it is a pawn, and pawns die mid-frame. */
+	TWeakObjectPtr<ATraceCharacter> HoveredPassTarget;
+
+	/** Last time FindPassTargetFor() was run, so the probe is throttled rather than per-frame. */
+	float LastPassTargetPollTime = -1000.f;
+
+	/** Last receiver announced to the log, so the line is printed on change and never per frame. */
+	TWeakObjectPtr<ATraceCharacter> LastLoggedPassTarget;
+
+	/** 0 = no receiver, 1 = locked on. Eased, so the bracket close reads as a movement. */
+	float PassLockAlpha = 0.f;
 
 private:
 	/**

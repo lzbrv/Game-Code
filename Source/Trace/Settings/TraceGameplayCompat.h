@@ -66,16 +66,16 @@ namespace TraceCompat
 
 	/** Fires the character's boost if the mechanic exists. Returns false when it does not. */
 	template <typename CharacterType>
-	bool TryBoost(CharacterType* Character)
+	bool TryBoost(CharacterType* InCharacter)
 	{
-		if (Character == nullptr)
+		if (InCharacter == nullptr)
 		{
 			return false;
 		}
 
 		if constexpr (THasDoBoost<CharacterType>::value)
 		{
-			Character->DoBoost();
+			InCharacter->DoBoost();
 			return true;
 		}
 		else
@@ -151,11 +151,11 @@ namespace TraceCompat
 	 * what a build without the mechanic reports — so the HUD ring simply never appears.
 	 */
 	template <typename CharacterType>
-	float PassProgress(CharacterType* Character)
+	float PassProgress(CharacterType* InCharacter)
 	{
 		if constexpr (THasPassProgress<CharacterType>::value)
 		{
-			return (Character != nullptr) ? Character->GetPassProgress() : -1.f;
+			return (InCharacter != nullptr) ? InCharacter->GetPassProgress() : -1.f;
 		}
 		else
 		{
