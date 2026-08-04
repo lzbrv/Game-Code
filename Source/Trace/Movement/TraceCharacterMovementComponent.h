@@ -69,30 +69,74 @@
 //        dash→ground hands back DashExitSpeedMultiplier × the ground limit instead of the ground
 //        limit itself. Every one of those ceilings is a knob.
 //
-// --- THE SLIDE IS A MOMENTUM CARRY, NOT A BRAKE -----------------------------------------------
+// --- THE SLIDE IS A MOMENTUM CARRY, NOT A BRAKE, AND NOT A BOOST EITHER -----------------------
 //
-// ENTRY is ENTRY SPEED (spec §2.3: "entry speed determines slide velocity"):
+// SPEC v4 §1 CLOSED THE [CONFLICT] SPEC v3 LEFT OPEN, and it closed it against the boost. Verbatim:
+// "You can remove the slideexitminspeedfraction value, as well as any other part of the slide code
+// contradicting the movement list. The flat momentum boost should be ruled out, going with the
+// source-style movement system instead."
+//
+// So the rule is one sentence: YOU KEEP WHAT YOU BROUGHT IN, FRICTION BLEEDS IT, NOTHING TOPS IT UP.
+//
+// ENTRY is ENTRY SPEED:
 //
 //       SlideSpeed = max(planar speed at entry,
-//                        min(planar speed × SlideEntrySpeedMultiplier + SlideImpulse, SlideMaxSpeed))
+//                        min(planar speed × SlideEntrySpeedMultiplier, SlideMaxSpeed))
 //
-//       SlideEntrySpeedMultiplier defaults to 1.0 and SlideImpulse to 0, which is the pure "no flat
-//       momentum boost" reading. The spec contains a second, contradictory line asking for the
-//       slide to INCREASE momentum; rather than guess, both readings are knobs and the shipped
-//       defaults implement the first one. Raise SlideImpulse to get the second.
+//       SlideEntrySpeedMultiplier is 1.0, so this reduces to "the speed you arrived with". The outer
+//       max() is not a boost and cannot manufacture speed — it only stops SlideMaxSpeed BRAKING
+//       somebody who arrived above the cap, which would make pressing crouch a punishment for
+//       arriving fast. SlideImpulse, the flat additive that used to sit inside this expression, has
+//       been DELETED.
 //
 // MIDDLE bleeds slowly. SlideDeceleration is the friction dial and is meant to be small enough
 //       that SlideDuration, not the decay, is what ends the slide.
-// EXIT  hands the speed back. EndSlide() carries SlideExitSpeedRetention of the slide's current
-//       speed into normal movement, floored at SlideExitMinSpeedFraction of the walk speed, and
-//       capped at max(SlideExitMaxSpeedMultiplier × GetMaxSpeed(), the slide's own speed) — that
-//       max() is what makes "slide → jump" preserve the vector instead of resetting it.
-// AFTER SlideCooldownSeconds (0.8s, spec §2.3) must elapse from the slide's END before another can
-//       start. The old SlideCooldown was measured from slide START, which made "the buffer between
-//       slides" a number you had to compute rather than read.
+// EXIT  hands the speed back and NEVER TOPS IT UP. EndSlide() carries SlideExitSpeedRetention of the
+//       slide's current speed into normal movement, capped at max(SlideExitMaxSpeedMultiplier ×
+//       GetMaxSpeed(), the slide's own speed) — that max() is what makes "slide → jump" preserve the
+//       vector instead of resetting it. There is NO FLOOR any more: SlideExitMinSpeedFraction, which
+//       handed a decayed slide back at exactly WalkSpeed (measured: a 73% speed GAIN), is DELETED.
+// AFTER SlideCooldownSeconds (0.8s) must elapse from the slide's END before another can start. The
+//       old SlideCooldown was measured from slide START, which made "the buffer between slides" a
+//       number you had to compute rather than read.
 //
 // SlideMinCommitSeconds makes the first moments of a slide uncancellable, so a slide reads as a
 // commitment rather than a tap, and so releasing the key a frame late cannot amputate it.
+//
+// --- THE SLIDE-JUMP (spec v4 §1) --------------------------------------------------------------
+//
+// "Sliding, however, doesn't feel like it does much; is it possible to add a slide-jump mechanic,
+// also attempting to feel like apex legends."
+//
+// With the flat boost gone this is the whole reason to slide. The slide holds a fast vector low to
+// the ground while friction bleeds it slowly; the slide-jump is how you cash that vector in before
+// the bleed finishes, and it is the ONE transition in the kit where the design intends a reward for
+// execution. It lives in DoJump() — the engine's own predicted jump entry point — rather than in
+// OnMovementUpdated, because the jump has to consume the slide on the SAME frame it launches:
+//
+//   1. jumping while sliding (or within the coyote window after a slide ends) is a slide-jump;
+//   2. it routes the slide out through EndSlide(), like every other slide exit, so the 0.8s
+//      between-slides buffer is charged exactly once and on exactly one code path;
+//   3. planar speed becomes (the slide's live speed) × SlideJumpHorizontalRetention, which at the
+//      shipped 1.0 is pure preservation — what it actually buys the player is escaping the ground
+//      friction that would otherwise have eaten the carry;
+//   4. Velocity.Z, which Super::DoJump has just set to JumpZVelocity, is scaled by
+//      SlideJumpZMultiplier;
+//   5. a jump taken in the last SlideJumpWindowSeconds of the slide (or in the equally long coyote
+//      window straight after it ends) is WELL TIMED and additionally multiplies the retention by
+//      SlideJumpWindowSpeedBonus. Missing the window never costs anything — it only declines to pay
+//      the bonus. A mechanic that punished a mistimed hop would simply stop being used.
+//
+// bSlideJumpEnabled turns the whole thing off, so "does sliding do anything now" can be A/B'd from
+// one binary.
+//
+// CanAttemptJump() IS OVERRIDDEN FOR THIS, and it is not optional. The engine's version refuses to
+// jump whenever bWantsToCrouch is set — a sane rule in a game where crouch shrinks the capsule and
+// you might not have headroom to stand up. Here crouch NEVER resizes anything (see
+// CanCrouchInCurrentState) and is the slide key, so that rule silently made the slide-jump
+// impossible for any human player: ATracePlayerController drives crouch through ACharacter::Crouch(),
+// which sets bWantsToCrouch, so CanJump() was false for the entire slide. The dev measurement
+// harness did not catch it because it drives SetWantsToSlide() instead.
 //
 // --- WHY CHARGES AND NOT A SECOND TIMER -------------------------------------------------------
 //
@@ -202,6 +246,29 @@ public:
 	 */
 	virtual bool CanCrouchInCurrentState() const override;
 
+	/**
+	 * THE SLIDE-JUMP LIVES HERE. See the header note.
+	 *
+	 * DoJump is the engine's predicted jump entry point: ACharacter::CheckJumpInput calls it from
+	 * inside PerformMovement, on the client, on the server and on every replayed move, driven by
+	 * bPressedJump — which is already saved-move state (FLAG_JumpPressed). Putting the slide-jump here
+	 * rather than in OnMovementUpdated is what lets the jump consume the slide on the same frame it
+	 * launches, and gets the whole thing predicted for free.
+	 */
+	virtual bool DoJump(bool bReplayingMoves, float DeltaTime) override;
+
+	/**
+	 * DROPS THE ENGINE'S "!bWantsToCrouch" CLAUSE, and that is the entire point of the override.
+	 *
+	 * UCharacterMovementComponent::CanAttemptJump() refuses to jump while bWantsToCrouch is set. That
+	 * is correct for a game where crouch shrinks the capsule — you may not have the headroom to stand
+	 * back up. It is wrong here: CanCrouchInCurrentState() is hardwired to false, the capsule never
+	 * resizes, and the crouch key is the SLIDE key. Left alone it made the slide-jump unreachable for
+	 * every human player, because ATracePlayerController slides through ACharacter::Crouch() and that
+	 * sets bWantsToCrouch for the whole slide.
+	 */
+	virtual bool CanAttemptJump() const override;
+
 	// --- Dash API ------------------------------------------------------------------------------
 
 	/**
@@ -270,6 +337,23 @@ public:
 
 	/** Seconds before another slide is allowed (0 when ready). Measured from the last slide's END. */
 	float GetSlideCooldownRemaining() const { return FMath::Max(0.f, SlideCooldownRemaining); }
+
+	// --- Slide-jump readouts (HUD, bots, debug) --------------------------------------------------
+
+	/**
+	 * True when jumping RIGHT NOW would be a slide-jump: mid-slide, or inside the coyote window that
+	 * follows a slide. Pure query — reads saved-move state only, so it is safe for a bot to poll.
+	 */
+	bool IsSlideJumpAvailable() const;
+
+	/**
+	 * True when a slide-jump taken RIGHT NOW would collect SlideJumpWindowSpeedBonus, i.e. the slide
+	 * has less than SlideJumpWindowSeconds left (or just ended having been in that state).
+	 *
+	 * This is the number a HUD tell should be driven from: the timing window is unlearnable without
+	 * feedback, and the whole point of the mechanic is that it rewards a read.
+	 */
+	bool IsSlideJumpWellTimed() const;
 
 	// --- Momentum readouts (HUD, debug, measurement) --------------------------------------------
 
@@ -363,17 +447,47 @@ protected:
 	float GetSlideDeceleration() const;
 	float GetSlideMinCommitSeconds() const;
 	float GetSlideExitSpeedRetention() const;
-	float GetSlideExitMinSpeedFraction() const;
 	float GetSlideExitMaxSpeedMultiplier() const;
 
-	/** Spec §2.3. Seconds between slides, measured from the END of the previous one. */
+	/** Seconds between slides, measured from the END of the previous one. */
 	float GetSlideCooldownSeconds() const;
 
-	/** Spec §2.3 / the [CONFLICT]: entry speed × this, plus GetSlideImpulse(), is the slide speed. */
+	/** Entry speed × this IS the slide speed. 1.0, and that is now a decision (spec v4 §1). */
 	float GetSlideEntrySpeedMultiplier() const;
 
-	/** Spec §2.3 / the [CONFLICT]: a FLAT additive boost on slide entry. 0 by default. */
-	float GetSlideImpulse() const;
+	// Slide-jump tuning. Read live, like everything else.
+	bool  IsSlideJumpEnabled() const;
+	float GetSlideJumpHorizontalRetention() const;
+	float GetSlideJumpZMultiplier() const;
+
+	/**
+	 * Length of the well-timed window, measured backwards from the slide's END — and, deliberately,
+	 * ALSO the length of the coyote window after the slide has ended. One knob for both because they
+	 * are one continuous window in the player's hands: the moment the slide runs out is the moment
+	 * they are aiming at, and half of the presses that mean to hit it land a frame or two late.
+	 */
+	float GetSlideJumpWindowSeconds() const;
+
+	/** Multiplier applied to the retention when the hop lands inside the window. */
+	float GetSlideJumpWindowSpeedBonus() const;
+
+	/**
+	 * Seconds until the running slide will end, BY EITHER ROUTE. 0 when no slide is running.
+	 *
+	 * A slide has two exits, and the timing window has to respect both or it is unhittable half the
+	 * time. SlideTimeRemaining counts down SlideDuration; but the slide ALSO ends the moment
+	 * SlideSpeed decays past SlideExitSpeedFraction x WalkSpeed, and at the shipped numbers that is
+	 * the exit a slide entered at walking pace actually takes.
+	 *
+	 * MEASURED, and this is why the function exists: entering at 800 uu/s, SlideDeceleration 260
+	 * reaches the 400 uu/s exit threshold after 1.54 s, while SlideDuration is 1.8 s — so
+	 * SlideTimeRemaining was still 0.26 s when the slide ended and never once dipped under the 0.20 s
+	 * window. Every slide-jump out of a normal-speed slide scored "mistimed" no matter when it was
+	 * pressed, which would have read to a player as the reward being broken.
+	 *
+	 * Pure function of saved-move state and config, so it replays exactly.
+	 */
+	float GetSlideTimeLeft() const;
 
 	// Air / momentum tuning.
 	bool  IsSourceAirAccelerationEnabled() const;
@@ -464,6 +578,34 @@ protected:
 	float SlideBufferRemaining;
 
 	/**
+	 * COYOTE TIME FOR THE SLIDE-JUMP: seconds after a slide ended during which a jump still counts as
+	 * a slide-jump. Charged in EndSlide() to GetSlideJumpWindowSeconds(), consumed by DoJump().
+	 *
+	 * A slide ends on its own after SlideDuration, and a player who jumps two frames later did mean
+	 * to slide-jump. Without this, the payoff move would fail at random for reasons the player cannot
+	 * see, which is worse than not having it: they would land in ground friction, watch the carry
+	 * evaporate, and conclude the mechanic is broken.
+	 *
+	 * SAVED-MOVE STATE, like every other clock here. A correction that landed mid-window and lost it
+	 * would replay a slide-jump as an ordinary jump, and the two ends would disagree about a velocity
+	 * difference of several hundred uu/s — the single most visible rubber-band the kit could produce.
+	 */
+	float SlideJumpGraceRemaining;
+
+	/**
+	 * Whether the slide that just ended was inside its well-timed window when it ended, so that a hop
+	 * taken during the coyote grace above is scored the same as one taken a frame earlier.
+	 *
+	 * Stored rather than recomputed because once the slide is over SlideTimeRemaining is 0 and the
+	 * information is gone. It also keeps the grace honest: a slide CANCELLED early (crouch released
+	 * after the commit window, or a dash) ends nowhere near its window, so its grace is worth the
+	 * ordinary retention and not the bonus.
+	 *
+	 * Saved-move state for the same reason as the clock beside it.
+	 */
+	uint8 bSlideJumpGraceWellTimed : 1;
+
+	/**
 	 * bWantsToSlide as it stood at the END of the previous move, so the air fast-fall can fire on the
 	 * press EDGE rather than continuously. Saved state: without it a replayed move would see a stale
 	 * edge and fast-fall a second time, cancelling a jump the player did make.
@@ -536,6 +678,19 @@ protected:
 	 * where the pawn happened to spawn is not a measurement.
 	 */
 	FVector MeasureRunDirection = FVector::ForwardVector;
+
+	/**
+	 * Where the harness started, so the slide-jump phases can be run back on ground the earlier
+	 * phases already proved is clear.
+	 *
+	 * Needed because the CHAIN phases teleport to the middle of the arena, and the first slide-jump
+	 * measured there reported 70% of the slide's speed on the first airborne frame while the movement
+	 * component's own log reported 110% at the instant of launch. The difference was a ~50 degree
+	 * ROTATION of the velocity vector, not a loss of magnitude — i.e. SlideAlongSurface deflecting the
+	 * pawn off midfield cover, which is a measurement of the arena and not of the mechanic. Exactly
+	 * the same trap MeasureRunDirection exists to avoid.
+	 */
+	FVector MeasureHomeLocation = FVector::ZeroVector;
 #endif
 };
 
@@ -595,6 +750,10 @@ public:
 	FVector SavedSlideDirection;
 	uint8 bSavedSlideHeldLastMove : 1;
 	uint8 bSavedWasAirborneLastMove : 1;
+
+	/** The slide-jump's coyote window and its "this hop is worth the bonus" bit. */
+	float SavedSlideJumpGraceRemaining;
+	uint8 bSavedSlideJumpGraceWellTimed : 1;
 };
 
 /** Client prediction data whose only job is to hand out FSavedMove_Trace instances. */

@@ -123,11 +123,12 @@ UTraceSettings::UTraceSettings(const FObjectInitializer& ObjectInitializer)
 	// ENGAGEMENT RANGE AND THE ARENA THAT TRIPLED IN SIZE
 	//
 	// Every MaxEngagementRange below is also raised. These were tuned against an 8000 x 4000 field,
-	// where 3000uu is most of the pitch; on 24000 x 9600 it is close quarters. Measured with the
+	// where 3000uu is most of the pitch; on 33600 x 9600 it is close quarters. Measured with the
 	// player walked up the field, bots had them inside SightRange for 69.7% of bot-ticks but inside
 	// MaxEngagementRange with line of sight for 16.0% — they could see the player fine and simply
-	// were not allowed to shoot. Meanwhile HitscanRange is 28000, so the player could shoot back
-	// from anywhere. That asymmetry is indistinguishable from "the bots ignore me".
+	// were not allowed to shoot. Meanwhile HitscanRange is 36000 (it has to span the field's 34944uu
+	// diagonal), so the player could shoot back from anywhere. That asymmetry is indistinguishable
+	// from "the bots ignore me".
 	//
 	// Widening the envelope does NOT make bots snipe: the per-range aim error term means a shot at
 	// 4200uu on Easy carries ~15 degrees of error and essentially never lands. What it buys is
@@ -554,13 +555,18 @@ namespace
 			UTraceTrailComponent::GetTraceLifetimeSeconds());
 
 		UE_LOG(LogTraceGame, Display,
+			// SlideImpulse and SlideExitMinSpeedFraction are gone (spec v4 §1) and so are their columns.
+			// The slide-jump replaces them as the reason to slide, so it dumps on the same line.
 			TEXT("[SettingsDump:%s] Slide dur=%.2f decel=%.0f maxSpeed=%.0f entryFrac=%.2f mult=%.2f "
-			     "impulse=%.0f exitFrac=%.2f cooldown=%.2f minCommit=%.2f exitRetention=%.2f exitFloor=%.2f exitCeil=%.2f"),
+			     "exitFrac=%.2f cooldown=%.2f minCommit=%.2f exitRetention=%.2f exitCeil=%.2f | "
+			     "SlideJump on=%d retain=%.2f zMul=%.2f window=%.2f windowBonus=%.2f"),
 			Tag, Table.SlideDuration, Table.SlideDeceleration, Table.SlideMaxSpeed,
-			Table.SlideEntrySpeedFraction, Table.SlideEntrySpeedMultiplier, Table.SlideImpulse,
+			Table.SlideEntrySpeedFraction, Table.SlideEntrySpeedMultiplier,
 			Table.SlideExitSpeedFraction,
 			Table.SlideCooldownSeconds, Table.SlideMinCommitSeconds, Table.SlideExitSpeedRetention,
-			Table.SlideExitMinSpeedFraction, Table.SlideExitMaxSpeedMultiplier);
+			Table.SlideExitMaxSpeedMultiplier,
+			Table.bSlideJumpEnabled ? 1 : 0, Table.SlideJumpHorizontalRetention, Table.SlideJumpZMultiplier,
+			Table.SlideJumpWindowSeconds, Table.SlideJumpWindowSpeedBonus);
 
 		// Spec v3 §2: the air/landing block is the new movement model, so it dumps next to the
 		// slide rather than being something you have to open Project Settings to read back.
@@ -585,6 +591,45 @@ namespace
 			Table.bPassMultiPointLos ? 1 : 0, Table.PassTargetChestOffsetZ,
 			Table.CoreTurnoverGraceSeconds,
 			Table.ParryDuration, Table.ParryCooldown, Table.ParryGlowScale);
+
+		// Spec v4 §5 moved three numbers that are ALSO set in DefaultGame.ini, and the ini wins. The
+		// only honest way to check one of those is to read it back out of the live CDO, which is what
+		// this line is for — do not answer "did the respawn time change" from a header again.
+		// Note RespawnDelay here is the HUD fallback; the ENFORCED one is ATraceGameMode::RespawnDelay
+		// and is pinned in DefaultGame.ini under [/Script/Trace.TraceGameMode].
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] SPECv4 respawn=%.2f turnoverGrace=%.2f walkSpeed=%.1f | "
+			     "mercyLead=%d scoringMode=%s goalWidthFrac=%.3f goalHeight=%.0f"),
+			Tag, Table.RespawnDelay, Table.CoreTurnoverGraceSeconds, Table.WalkSpeed,
+			Table.MercyRuleLead,
+			(Table.ScoringMode == ETraceScoringMode::ThrownCoreAndGoals) ? TEXT("B-ThrownCoreAndGoals") : TEXT("A-EndzoneStatusCore"),
+			Table.GoalWidthFieldFraction, Table.GoalHeightUU);
+
+		// The slide-jump dumps on the Slide line above, not here — one number, one column.
+		//
+		// EVERY mode-B knob is here now, not four of eight. These are bound to ATraceCore BY NAME at
+		// runtime, so a misspelled property is a silent no-op rather than a build error; this line is
+		// how "is the value I typed the value being played" gets answered without a debugger. It is
+		// also what caught CoreThrowUpBias, which shipped for a while as "CoreThrowUpwardBias" and
+		// was dead the entire time.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] Ghosts spacing=%.0fuu max=%d glow=%.2f smearGlow=%.2f lod=%d | "
+			     "ModeB throw=%.0f lift=%.2f grav=%.2f pickupR=%.0f lockout=%.2f cooldown=%.2f "
+			     "bounce=%.2f looseReset=%.1f"),
+			Tag, Table.TraceGhostSpacingUU, Table.MaxTraceGhosts, Table.TraceGhostGlow,
+			Table.TraceSmearGlowScale, Table.TraceGhostForcedLOD,
+			Table.CoreThrowSpeed, Table.CoreThrowUpBias, Table.CoreThrowGravityScale,
+			Table.CorePickupRadius, Table.CoreThrowerPickupLockoutSeconds,
+			Table.CoreThrowCooldownSeconds, Table.CoreThrowBounce,
+			Table.CoreLooseResetSeconds);
+
+		// Spec v4 §4. The impact sphere is deleted from ATraceTracer, so there is nothing to report
+		// for it — the radii are the whole of what is left to get wrong.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] Tracer radiusPerLen=%.5f min=%.2f max=%.2f haloRatio=%.2f "
+			     "muzzle=%d muzzleR=%.2f (impact sphere: DELETED)"),
+			Tag, Table.TracerRadiusPerLength, Table.TracerRadiusMinUU, Table.TracerRadiusMaxUU,
+			Table.TracerSheathRadiusRatio, Table.bTracerMuzzleFlash ? 1 : 0, Table.TracerMuzzleRadiusUU);
 
 		// The engine-owned copies. Named MovementIt/LiveMovement rather than anything that reads
 		// like a base-class member: a local shadowing one fails the Windows build (C4458).

@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Engine/EngineTypes.h"      // FHitResult (overlap delegate signature)
 #include "GameFramework/Actor.h"
+#include "Math/Box.h"                // FBox
 #include "UObject/ObjectPtr.h"
 
 #include "TraceTypes.h"              // ETraceTeam, TraceOpposingTeam
@@ -16,14 +17,33 @@ class UBoxComponent;
 class UPrimitiveComponent;
 
 /**
- * A scoring volume at one end of the field.
+ * A scoring volume at one end of the field. ONE class, TWO shapes - see the mode note below.
  *
- * SHAPE. Goal line to end wall along X, floor to wall top in Z, and the ENTIRE WIDTH of the field
- * along Y - sideline to sideline, like a real football endzone. ATraceArenaBuilder sizes it from
- * EndzoneHalfWidth() and paints the floor patch, the goal line and the endzone gate from the same
- * number, so the rectangle you can see is the rectangle that scores. If you ever narrow one of
- * them, narrow all of them: a carrier who crosses the line by a sideline and does not score reads
- * as a broken trigger, not as a design decision.
+ * SHAPE IN MODE A (ETraceScoringMode::EndzoneStatusCore, the shipped game). Goal line to end wall along X,
+ * floor to wall top in Z, and the ENTIRE WIDTH of the field along Y - sideline to sideline, like a
+ * real football endzone. ATraceArenaBuilder sizes it from EndzoneHalfWidth() and paints the floor
+ * patch, the goal line and the endzone gate from the same number, so the rectangle you can see is
+ * the rectangle that scores. If you ever narrow one of them, narrow all of them: a carrier who
+ * crosses the line by a sideline and does not score reads as a broken trigger, not as a design
+ * decision.
+ *
+ * SHAPE IN MODE B (ETraceScoringMode::ThrownCoreAndGoals, spec v4 §7). A GOAL: the same depth along X, but only
+ * ATraceArenaBuilder::GoalHalfWidth() either side of the centre line (a third of the field width by
+ * default) and only ClampedGoalHeight() tall, so it reads as a goal rather than as a wall. Same
+ * rule: the builder draws the posts, the crossbar and the mouth patch from the same two functions
+ * that size this box.
+ *
+ * WHY ONE CLASS AND NOT TWO. Everything below - the team check, the carrier check, the debounce, the
+ * geometric poll - is identical for both shapes, because "the carrier got inside the volume" is the
+ * same question in both modes. Only the box extent and the trim differ, and both arrive through
+ * ConfigureZone. bGoalVolume exists so that a caller can TELL the two apart (and so the log says
+ * which it is); it is never used to decide which game is being played. That question has exactly one
+ * legal answer, ATraceGameState::GetScoringMode() - see the note at the top of TraceMatchTypes.h.
+ *
+ * BOTH SETS EXIST AT ONCE. The builder spawns the endzone pair AND the goal pair and then activates
+ * one of them (SetZoneActive), so the A/B toggle is a flag flip rather than a rebuild and no restart
+ * is needed. An inactive zone has no collision and does not tick: it cannot score, and it cannot be
+ * found by an overlap query either.
  *
  * SCORING DIRECTION - read this before touching anything below.
  * OwningTeam is the team that *defends* this zone. You score in your OPPONENT's zone, so a zone
@@ -63,13 +83,55 @@ public:
 	//~ End AActor
 
 	/**
-	 * Sets the owning team and the box half-extent in one call. Used by ATraceArenaBuilder, which
-	 * spawns these deferred so OwningTeam is already correct by the time BeginPlay runs.
+	 * Sets the owning team, the box half-extent and the shape in one call. Used by
+	 * ATraceArenaBuilder, which spawns these deferred so OwningTeam is already correct by the time
+	 * BeginPlay runs.
+	 *
+	 * @param bInGoalVolume true for the mode-B goal, false for the mode-A endzone. Shape only - see
+	 *                      the class comment on why this must never be read as "which mode is live".
 	 */
-	void ConfigureZone(ETraceTeam InOwningTeam, const FVector& BoxHalfExtent);
+	void ConfigureZone(ETraceTeam InOwningTeam, const FVector& BoxHalfExtent, bool bInGoalVolume = false);
 
 	/** True when a carrier on @p Team scores by entering this zone. See the class comment. */
 	bool ScoresHere(ETraceTeam Team) const;
+
+	//~ Mode A / mode B surface (spec v4 §7) - the contract the scoring slice reads.
+
+	/** True if this is the narrow mode-B GOAL rather than the full-width mode-A endzone. */
+	bool IsGoalVolume() const { return bGoalVolume; }
+
+	/**
+	 * Arms or disarms the volume. An inactive zone drops its collision, stops ticking and refuses to
+	 * score, so the pair belonging to the other mode is inert rather than merely quiet.
+	 *
+	 * Idempotent, and safe to call at any time on the server. On a client it only bookkeeps the flag
+	 * (the collision is already off there - see BeginPlay).
+	 */
+	void SetZoneActive(bool bInActive);
+
+	/** True while this volume can score. See SetZoneActive. */
+	bool IsZoneActive() const { return bZoneActive; }
+
+	/**
+	 * Point-in-box against the trigger volume, in the trigger's own space.
+	 *
+	 * PUBLIC ON PURPOSE. Mode B scores a THROWN Core as well as a carried one, and the code that owns
+	 * the throw must be able to ask "is the Core inside the goal" without rebuilding the box from
+	 * width and depth constants and getting it subtly wrong - which is precisely how the visible goal
+	 * and the scoring goal drift apart. This is the same test the tick poll uses, so the answer
+	 * cannot disagree with the answer that awards points.
+	 *
+	 * Deliberately geometric rather than overlap-based, so it never depends on the other actor's
+	 * collision settings or on overlap events being enabled on both primitives - the two classic ways
+	 * a trigger silently stops firing. Returns false on an INACTIVE zone: the volume belonging to the
+	 * mode that is not being played contains nothing.
+	 */
+	bool IsInsideZone(const FVector& WorldLocation) const;
+
+	/** World-space box of this volume, for debug draw, bot targeting and throw aiming. */
+	FBox GetZoneBounds() const;
+
+	//~ End mode surface
 
 protected:
 	UFUNCTION()
@@ -84,15 +146,6 @@ protected:
 
 	/** Authoritative "is this the carrier": asks the GameMode's Core, not just the replicated flag. */
 	bool IsCoreCarrier(const ATraceCharacter* Character) const;
-
-	/**
-	 * Pure point-in-box test against the trigger volume, in the trigger's own space.
-	 *
-	 * Used by the tick poll instead of GetOverlappingActors so that scoring never depends on the
-	 * pawn's collision settings or on overlap events being enabled on both primitives - the two
-	 * classic ways a trigger silently stops firing.
-	 */
-	bool IsInsideZone(const FVector& WorldLocation) const;
 
 	/**
 	 * Seconds of deafness after a score. NotifyScored resets the Core and teleports every pawn, but
@@ -110,4 +163,16 @@ private:
 	 * during the 5.x line and the old spellings warn on newer engines.
 	 */
 	float LastScoreTime = -10000.f;
+
+	/** Shape flag: the narrow mode-B goal rather than the full-width mode-A endzone. */
+	bool bGoalVolume = false;
+
+	/**
+	 * Whether this volume can score right now. Both pairs are built; one pair is armed.
+	 *
+	 * Defaults TRUE so that a zone nobody ever calls SetZoneActive on behaves exactly as it did
+	 * before mode B existed - a level-placed endzone, or any future caller that spawns one directly,
+	 * must not be silently dead.
+	 */
+	bool bZoneActive = true;
 };

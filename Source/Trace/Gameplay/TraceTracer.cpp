@@ -16,6 +16,7 @@
 #include "UObject/ConstructorHelpers.h"
 
 #include "Trace.h"
+#include "TraceSettings.h"
 
 namespace
 {
@@ -115,7 +116,9 @@ ATraceTracer::ATraceTracer()
 	BeamCore    = MakePiece(TEXT("BeamCore"), Cylinder);
 	BeamSheath  = MakePiece(TEXT("BeamSheath"), Cylinder);
 	MuzzleFlash = MakePiece(TEXT("MuzzleFlash"), Sphere);
-	ImpactFlash = MakePiece(TEXT("ImpactFlash"), Sphere);
+
+	// No ImpactFlash: spec v4 §4 deleted the sphere at the far end of the beam. The Sphere mesh is
+	// still loaded above because the muzzle flash uses it.
 }
 
 ATraceTracer* ATraceTracer::Spawn(UWorld* World, const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted)
@@ -199,18 +202,15 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	const FVector Dir = Delta / Length;
 
 	// --- first person treatment (see the class comment) -----------------------------------------
+	//
+	// The point-blank impact-pop dimming that used to live here is gone with the impact sphere it
+	// protected against. Nothing else in this effect is large, unlit and drawn at the far end of the
+	// ray, so there is no longer a whiteout to defend against there.
 	FVector BeamStart = From;
 	FVector ViewLocation = FVector::ZeroVector;
 	FRotator ViewRotation = FRotator::ZeroRotator;
 	if (GetLocalView(GetWorld(), ViewLocation, ViewRotation))
 	{
-		// A 60 uu unlit-emissive sphere going off a few tens of uu from the eye is the same failure
-		// as the arena's point-blank neon whiteout: unlit emissive does not attenuate with distance,
-		// so it arrives at full intensity however close it is. Shrink and dim the impact pop when it
-		// lands in the viewer's face. This never applies to a shot across the arena.
-		const double ToImpact = FVector::Dist(ViewLocation, To);
-		ImpactProximityScale = FMath::Clamp(static_cast<float>(ToImpact / 400.0), 0.3f, 1.f);
-
 		const double ToEye = FVector::Dist(ViewLocation, From);
 		if (ToEye < FirstPersonProximityUU)
 		{
@@ -241,9 +241,25 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	}
 	const FVector BeamDir = Delta / Length;
 
-	// Thickness is a function of the shot's length; see CoreDiameterPerLengthUU.
-	CoreDiameter = FMath::Clamp(static_cast<float>(Length) * CoreDiameterPerLengthUU, CoreDiameterMinUU, CoreDiameterMaxUU);
-	SheathDiameter = CoreDiameter * SheathWidthRatio;
+	// --- width (spec v4 §4) ---------------------------------------------------------------------
+	//
+	// Read fresh per shot, so dragging the Tracer sliders in Project Settings retunes the beam with
+	// PIE running - that is the point of moving these out of this file's constants.
+	//
+	// Radius in, diameter out: /Engine/BasicShapes primitives are 100 uu ACROSS, so a diameter is
+	// what divides cleanly into a mesh scale. The doubling happens exactly here so nothing further
+	// down has to remember which unit it is holding.
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	const float CoreRadiusMin = FMath::Clamp(Settings.TracerRadiusMinUU, MinSafeRadiusUU, MaxSafeRadiusUU);
+	const float CoreRadiusMax = FMath::Clamp(Settings.TracerRadiusMaxUU, CoreRadiusMin, MaxSafeRadiusUU);
+	const float CoreRadius = FMath::Clamp(
+		static_cast<float>(Length) * FMath::Max(0.f, Settings.TracerRadiusPerLength),
+		CoreRadiusMin, CoreRadiusMax);
+
+	CoreDiameter = 2.f * CoreRadius;
+	SheathDiameter = CoreDiameter * FMath::Max(1.f, Settings.TracerSheathRadiusRatio);
+	MuzzleDiameter = 2.f * FMath::Clamp(Settings.TracerMuzzleRadiusUU, MinSafeRadiusUU, MaxSafeRadiusUU);
 
 	// Local +Z runs down the shot, so every piece can be placed by its distance along the beam.
 	SetActorLocationAndRotation(BeamStart, FRotationMatrix::MakeFromZ(BeamDir).ToQuat());
@@ -283,7 +299,10 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	}
 
 	// --- muzzle flash ---------------------------------------------------------------------------
-	bMuzzleVisible = (Length >= MinLengthForMuzzleFlashUU);
+	// Not the sphere spec v4 §4 removed - that one was at the far end. This is the one on the
+	// viewmodel, and it is what makes a first-person shot visible at all, so it is switchable rather
+	// than deleted.
+	bMuzzleVisible = Settings.bTracerMuzzleFlash && (Length >= MinLengthForMuzzleFlashUU);
 	if (MuzzleFlash != nullptr)
 	{
 		if (bMuzzleVisible)
@@ -297,20 +316,11 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 		}
 	}
 
-	// --- impact pop -----------------------------------------------------------------------------
-	bImpactVisible = bImpacted;
-	if (ImpactFlash != nullptr)
-	{
-		if (bImpactVisible)
-		{
-			ImpactFlash->SetRelativeLocation(FVector(0.0, 0.0, Length));
-			ImpactMID = MakeMID(ImpactFlash, (NeonMaterial != nullptr) ? NeonMaterial.Get() : FallbackMaterial.Get());
-		}
-		else
-		{
-			ImpactFlash->SetVisibility(false);
-		}
-	}
+	// NO IMPACT POP. Spec v4 §4: "Remove the sphere from the end of the bullet tracer hitscan
+	// animation, so it's just a bullet trace." The beam still terminates exactly on the impact
+	// point, which is the information the sphere was covering up. bImpacted is now unused; see the
+	// note on Spawn() in the header for why the parameter survives.
+	(void)bImpacted;
 
 	// Cache the length-driven scale on the components that need it, then let ApplyFade own the rest.
 	if (BeamCore != nullptr)
@@ -325,9 +335,12 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	// Frame one must already look right: this is hitscan, so there is no state before "fully drawn".
 	ApplyFade(0.f);
 
+	// VERBOSE ON PURPOSE - this fires up to ~80 times a second in a full match. Enable it with
+	// "log LogTraceGame Verbose" when the beam needs inspecting; do not conclude from its silence
+	// that the tracer is not spawning. (Trace.TestBeam logs at Display and is the better probe.)
 	UE_LOG(LogTraceGame, Verbose,
-		TEXT("TRACER: start=%s len=%.0f coreD=%.1f coreMat=%s coreParent=%s bounds=%s r=%.0f vis=%d sheathMat=%s"),
-		*BeamStart.ToCompactString(), Length, CoreDiameter,
+		TEXT("TRACER: start=%s len=%.0f coreD=%.2f sheathD=%.2f muzzleD=%.2f coreMat=%s coreParent=%s bounds=%s r=%.0f vis=%d sheathMat=%s"),
+		*BeamStart.ToCompactString(), Length, CoreDiameter, SheathDiameter, MuzzleDiameter,
 		(BeamCore != nullptr) ? *GetNameSafe(BeamCore->GetMaterial(0)) : TEXT("-"),
 		(CoreMID != nullptr) ? *GetNameSafe(CoreMID->Parent) : TEXT("-"),
 		(BeamCore != nullptr) ? *BeamCore->Bounds.Origin.ToCompactString() : TEXT("-"),
@@ -372,7 +385,7 @@ void ATraceTracer::ApplyFade(float Alpha)
 	{
 		const float MuzzleAlpha = FMath::Clamp(Alpha / MuzzleFlashLifeFraction, 0.f, 1.f);
 		const float MuzzleFade = 1.f - MuzzleAlpha;
-		const double Size = MuzzleDiameterUU * (0.4 + 0.6 * MuzzleFade) * DiameterScale;
+		const double Size = MuzzleDiameter * (0.4 + 0.6 * MuzzleFade) * DiameterScale;
 		MuzzleFlash->SetRelativeScale3D(FVector(Size));
 		SetMIDColor(MuzzleMID, HotColor, MuzzleIntensity * MuzzleFade * MuzzleFade, /*bGlowScalar=*/true);
 
@@ -383,18 +396,7 @@ void ATraceTracer::ApplyFade(float Alpha)
 		}
 	}
 
-	// --- impact: EXPANDS while dimming. The shot's exclamation mark ------------------------------
-	if (bImpactVisible && ImpactFlash != nullptr)
-	{
-		// Ease-out expansion: most of the growth happens in the first third, so the pop lands with
-		// the shot instead of blooming lazily afterwards.
-		const float Expand = 1.f - FMath::Pow(1.f - Alpha, 3.f);
-		const double SizeScale = FMath::Lerp(0.55, 1.0, static_cast<double>(ImpactProximityScale));
-		const double Diameter = FMath::Lerp(static_cast<double>(ImpactStartDiameterUU),
-			static_cast<double>(ImpactEndDiameterUU), static_cast<double>(Expand)) * SizeScale;
-		ImpactFlash->SetRelativeScale3D(FVector(Diameter * DiameterScale));
-		SetMIDColor(ImpactMID, FMath::Lerp(HotColor, ShotColor, Alpha), ImpactIntensity * Fade * ImpactProximityScale, /*bGlowScalar=*/true);
-	}
+	// The impact beat used to be here: an expanding sphere at the hit point. Deleted, spec v4 §4.
 }
 
 void ATraceTracer::Tick(float DeltaSeconds)

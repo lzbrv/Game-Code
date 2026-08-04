@@ -196,6 +196,14 @@ def build_neon():
     # does and it makes every glowing block transparent.
     material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
     material.set_editor_property("two_sided", False)
+    # REQUIRED, and its absence is silent in the editor and fatal in a packaged build.
+    # Spec v4 section 2 draws the trace as posed Mannequins (UPoseableMeshComponent), so this
+    # material is applied to a SKINNED mesh. Without MATUSAGE_SkeletalMesh the skeletal
+    # vertex-factory shader permutation is never compiled and the renderer substitutes the default
+    # grey checkerboard - the after-images stop being team-coloured silhouettes and become grey
+    # blocks. The editor auto-repairs this flag on first use ONLY when it is not running as a game,
+    # and every run of this project is -game, so the repair never happens here.
+    material.set_editor_property("used_with_skeletal_mesh", True)
 
     colour = vector_param(material, "Color", unreal.LinearColor(0.0, 0.8, 1.0, 1.0), -560, -80)
     glow = scalar_param(material, "Glow", 6.0, -560, 140)

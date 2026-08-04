@@ -151,7 +151,14 @@ void ATraceMenuHUD::BeginPlay()
 	// (and the arena's game mode applies whatever arrives in the URL), so this is belt and braces.
 	TraceDifficulty::ApplyToSettings(Difficulty);
 
-	UE_LOG(LogTraceGame, Log, TEXT("Title screen up. Difficulty %s."), *TraceDifficulty::ToDisplayName(Difficulty));
+	// The mode goes the other way: it is READ from the settings rather than pushed to them, so a
+	// player who has run three mode-B matches comes back to the title screen still on mode B. The
+	// settings CDO is the single storage for the toggle (see TraceScoring::ApplyToSettings), so
+	// there is nothing to reconcile — this is a load, not a second copy.
+	ScoringMode = TraceScoring::GetCurrentSetting();
+
+	UE_LOG(LogTraceGame, Log, TEXT("Title screen up. Difficulty %s, %s."),
+		*TraceDifficulty::ToDisplayName(Difficulty), *TraceScoringModeLabel(ScoringMode));
 
 	// See AcceptUnlockTime in the header. Long enough to outlast window creation and focus
 	// acquisition, short enough that a player reaching straight for Enter never notices it.
@@ -252,9 +259,19 @@ void ATraceMenuHUD::ArmAutoPlay()
 		Difficulty = TraceDifficulty::FromUrlValue(DifficultyArg);
 	}
 
+	// And an explicit scoring mode, for the same reason: an A/B toggle whose second half can only be
+	// reached by a human pressing an arrow key is an A/B toggle that never gets tested headlessly.
+	// "-TraceMenuScoringMode=b" drives the whole menu -> mode B match -> results -> menu loop.
+	FString ScoringModeArg;
+	if (FParse::Value(FCommandLine::Get(), TEXT("TraceMenuScoringMode="), ScoringModeArg))
+	{
+		ScoringMode = TraceScoringModeFromUrlValue(ScoringModeArg);
+		TraceScoring::ApplyToSettings(ScoringMode);
+	}
+
 	DelaySeconds = FMath::Max(0.01f, DelaySeconds);
-	UE_LOG(LogTraceGame, Display, TEXT("[AutoPlay] Pressing PLAY in %.2fs at difficulty %s."),
-		DelaySeconds, *TraceDifficulty::ToDisplayName(Difficulty));
+	UE_LOG(LogTraceGame, Display, TEXT("[AutoPlay] Pressing PLAY in %.2fs at difficulty %s, %s."),
+		DelaySeconds, *TraceDifficulty::ToDisplayName(Difficulty), *TraceScoringModeLabel(ScoringMode));
 
 	World->GetTimerManager().SetTimer(AutoPlayTimer,
 		FTimerDelegate::CreateWeakLambda(this, [this]() { StartMatch(); }), DelaySeconds, false);
@@ -353,13 +370,25 @@ void ATraceMenuHUD::MoveSelection(int32 Delta)
 
 void ATraceMenuHUD::AdjustSelection(int32 Delta)
 {
-	if (OptionsMenu.IsOpen() || bTravelling || Selected != ETraceMenuRow::Difficulty || Delta == 0)
+	if (OptionsMenu.IsOpen() || bTravelling || Delta == 0)
 	{
 		return;
 	}
 
-	Difficulty = TraceDifficulty::Step(Difficulty, Delta);
-	TraceDifficulty::ApplyToSettings(Difficulty);
+	if (Selected == ETraceMenuRow::Difficulty)
+	{
+		Difficulty = TraceDifficulty::Step(Difficulty, Delta);
+		TraceDifficulty::ApplyToSettings(Difficulty);
+		return;
+	}
+
+	if (Selected == ETraceMenuRow::Mode)
+	{
+		// Applied on every change rather than only on PLAY, so the value on screen is never a
+		// promise the match fails to keep — the same reason the difficulty does it.
+		ScoringMode = TraceScoringModeStep(ScoringMode, Delta);
+		TraceScoring::ApplyToSettings(ScoringMode);
+	}
 }
 
 bool ATraceMenuHUD::AcceptsActivation() const
@@ -396,6 +425,15 @@ void ATraceMenuHUD::ActivateSelection()
 		// direction" to offer, so stopping dead at HARD would just look broken.
 		Difficulty = static_cast<ETraceBotDifficulty>((static_cast<int32>(Difficulty) + 1) % TraceDifficulty::Count);
 		TraceDifficulty::ApplyToSettings(Difficulty);
+		break;
+
+	case ETraceMenuRow::Mode:
+		// Same rule as DIFFICULTY: a click has no "other direction" to offer, so activating the row
+		// wraps instead of stopping dead at the far end. With two modes this is simply a toggle,
+		// which is exactly what an A/B switch should feel like to click.
+		ScoringMode = static_cast<ETraceScoringMode>(
+			(static_cast<int32>(ScoringMode) + 1) % TraceScoringModeCount);
+		TraceScoring::ApplyToSettings(ScoringMode);
 		break;
 
 	case ETraceMenuRow::Settings:
@@ -579,11 +617,19 @@ void ATraceMenuHUD::StartMatch()
 	// the option and applies it itself, but in standalone this call is what makes the very first
 	// match honour the setting even if the URL is ever dropped on the floor.
 	TraceDifficulty::ApplyToSettings(Difficulty);
+	TraceScoring::ApplyToSettings(ScoringMode);
 
-	const FString Options = FString::Printf(TEXT("%s=%s"),
-		TraceDifficulty::UrlOption, *TraceDifficulty::ToUrlValue(Difficulty));
+	// NOTE THE SEPARATOR. UE URL options are chained with '?', NOT with '&' — writing "a=1&b=2"
+	// parses as ONE option called "a" whose value is "1&b=2", so the first appears to work and the
+	// second is silently ignored. That has already happened once in this project (see
+	// ATraceGameMode::InitGame), and it is exactly the kind of bug that makes an A/B toggle look
+	// like it does nothing.
+	const FString Options = FString::Printf(TEXT("%s=%s?%s=%s"),
+		TraceDifficulty::UrlOption, *TraceDifficulty::ToUrlValue(Difficulty),
+		TraceScoringModeUrlOption, *TraceScoringModeToUrlValue(ScoringMode));
 
-	UE_LOG(LogTraceGame, Log, TEXT("Title screen: PLAY -> %s?%s"), TraceMaps::Arena, *Options);
+	UE_LOG(LogTraceGame, Log, TEXT("Title screen: PLAY -> %s?%s  (%s)"),
+		TraceMaps::Arena, *Options, *TraceScoringModeLabel(ScoringMode));
 
 	UGameplayStatics::OpenLevel(this, FName(TraceMaps::Arena), /*bAbsolute=*/true, Options);
 }
@@ -865,8 +911,15 @@ void ATraceMenuHUD::DrawMenuRows()
 	}
 	bRowRectsValid = true;
 
-	// One line of plain English under the rows, so "EASY" means something before you commit to it.
-	DrawTextCentered(TraceMenuStyle::DifficultyBlurb(Difficulty), TraceMenuStyle::InkDim,
+	// One line of plain English under the rows, so "EASY" and "MODE B" mean something before you
+	// commit to them. It describes whichever value row is SELECTED, because with two value rows a
+	// blurb that only ever explained the difficulty would leave the more consequential of the two
+	// undocumented — and the scoring mode is a whole different game, not a slider.
+	const FString Blurb = (Selected == ETraceMenuRow::Mode)
+		? FString(TraceScoringModeBlurb(ScoringMode))
+		: TraceMenuStyle::DifficultyBlurb(Difficulty);
+
+	DrawTextCentered(Blurb, TraceMenuStyle::InkDim,
 		CX, PanelY + PanelH - (36.f * UIScale), FontSmall, 1.1f * UIScale);
 }
 
@@ -905,20 +958,37 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 	FString Label;
 	switch (Row)
 	{
-	case ETraceMenuRow::Play:       Label = TEXT("PLAY");       break;
-	case ETraceMenuRow::Difficulty: Label = TEXT("DIFFICULTY"); break;
-	case ETraceMenuRow::Settings:   Label = TEXT("SETTINGS");   break;
-	case ETraceMenuRow::Quit:       Label = TEXT("QUIT");       break;
-	default:                        Label = TEXT("");           break;
+	case ETraceMenuRow::Play:       Label = TEXT("PLAY");         break;
+	case ETraceMenuRow::Difficulty: Label = TEXT("DIFFICULTY");   break;
+	case ETraceMenuRow::Mode:       Label = TEXT("SCORING MODE"); break;
+	case ETraceMenuRow::Settings:   Label = TEXT("SETTINGS");     break;
+	case ETraceMenuRow::Quit:       Label = TEXT("QUIT");         break;
+	default:                        Label = TEXT("");             break;
 	}
 
 	const float LabelY = Y + (RowH - MeasureHeight(Label, FontMedium, LabelScale)) * 0.5f;
 	DrawText(Label, LabelColor, X + PadX, LabelY, FontMedium, LabelScale);
 
-	if (Row == ETraceMenuRow::Difficulty)
+	// The two VALUE rows share one renderer: right-aligned value, arrows either side, dimmed at the
+	// ends of the range. Written once because two copies of this maths is two copies to keep in
+	// alignment, and a title screen where one row's arrows sit two pixels off the other's is the
+	// kind of thing that reads as sloppy without anyone being able to say why.
+	if (Row == ETraceMenuRow::Difficulty || Row == ETraceMenuRow::Mode)
 	{
-		const FString Value = TraceDifficulty::ToDisplayName(Difficulty);
-		const FLinearColor ValueColor = TraceMenuStyle::DifficultyColor(Difficulty);
+		const bool bIsModeRow = (Row == ETraceMenuRow::Mode);
+
+		// "A - ENDZONES" rather than the full "MODE A - ENDZONES": the row already says SCORING MODE
+		// on its left, and repeating the word inside the value pushes it into the label at 720p.
+		const FString Value = bIsModeRow
+			? FString::Printf(TEXT("%s - %s"), TraceScoringModeLetter(ScoringMode), TraceScoringModeName(ScoringMode))
+			: TraceDifficulty::ToDisplayName(Difficulty);
+
+		// Mode B wears the amber that this screen reserves for "this is not the default" — the same
+		// colour HARD gets, for the same reason. Mode A is the shipped game and takes the plain cyan.
+		const FLinearColor ValueColor = bIsModeRow
+			? (TraceIsGoalMode(ScoringMode) ? TraceMenuStyle::Amber : TraceMenuStyle::Cyan)
+			: TraceMenuStyle::DifficultyColor(Difficulty);
+
 		const float ValueW = MeasureWidth(Value, FontMedium, LabelScale);
 		const float ValueRight = X + Width - PadX;
 		const float ValueY = Y + (RowH - MeasureHeight(Value, FontMedium, LabelScale)) * 0.5f;
@@ -930,8 +1000,12 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 		const float ArrowY = Y + RowH * 0.5f;
 		const float ArrowS = 8.f * UIScale;
 		const float ArrowT = FMath::Max(1.f, 2.f * UIScale);
-		const bool bCanLeft  = Difficulty != ETraceBotDifficulty::Easy;
-		const bool bCanRight = Difficulty != ETraceBotDifficulty::Hard;
+		const bool bCanLeft  = bIsModeRow
+			? (ScoringMode != ETraceScoringMode::EndzoneStatusCore)
+			: (Difficulty != ETraceBotDifficulty::Easy);
+		const bool bCanRight = bIsModeRow
+			? (ScoringMode != ETraceScoringMode::ThrownCoreAndGoals)
+			: (Difficulty != ETraceBotDifficulty::Hard);
 
 		const float LeftX = ValueRight - ValueW - (22.f * UIScale);
 		DrawLine(LeftX, ArrowY, LeftX + ArrowS, ArrowY - ArrowS,

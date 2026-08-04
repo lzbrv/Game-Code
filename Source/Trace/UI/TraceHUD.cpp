@@ -62,6 +62,16 @@ namespace TraceHUDStyle
 	static constexpr float ClockUrgentSeconds = 30.f;
 
 	/**
+	 * How many points short of UTraceSettings::MercyRuleLead the mercy warning appears.
+	 *
+	 * Two. The rule can end a match in the middle of the first half (spec v4 §6), and a match that
+	 * simply stops with no warning is indistinguishable from the "keeps stopping and restarting"
+	 * complaint this HUD has spent two passes answering. Any earlier than two points and the warning
+	 * is on screen for most of a lopsided match, at which point it stops being a warning.
+	 */
+	static constexpr int32 MercyWarningPoints = 2;
+
+	/**
 	 * Where the third-person pass reticle is anchored along the pass ray when there is no receiver
 	 * under it, in world units. See DrawPassReticle(): the reticle marks a POINT on that ray, and a
 	 * ray drawn from an origin the camera is not sitting at has no single screen position — so one
@@ -212,6 +222,15 @@ void ATraceHUD::DrawHUD()
 
 	bLocalAlive    = (LocalChar != nullptr) && LocalChar->IsAlive();
 	bLocalCarrying = bLocalAlive && LocalChar->IsCarrier();
+
+	// WHICH OF THE TWO GAMES THIS IS (spec v4 §7), resolved once a frame from the replicated
+	// GameState rather than per pass. Every prompt below has to follow it — mode B changes what LMB
+	// does while carrying, and a HUD that keeps saying "HOLD TO PASS" in a mode where the button
+	// throws is actively teaching the wrong control.
+	//
+	// The GameState, not ATraceCore::IsModeB: the Core is null before it has replicated, and the
+	// mode chip has to be right on the first drawn frame of the warm-up.
+	bGoalMode = (TraceGS != nullptr) && TraceGS->IsGoalMode();
 
 	// Death edge detection, purely local — see the note on LocalDeathTime in the header.
 	if (bLocalAlive)
@@ -541,8 +560,13 @@ void ATraceHUD::UpdateReticleAnchor()
 	// ATraceCore::FindPassTargetFor() is public precisely so the HUD can answer this before the
 	// button is pressed (see its comment). Asking the Core rather than re-implementing the cone here
 	// is the whole point: the highlight can then never disagree with the pass that actually happens.
+	//
+	// SKIPPED ENTIRELY IN MODE B. A throw has no receiver to acquire — it goes where the crosshair
+	// points and the first player to touch it takes it, teammate or not (spec v4 §7). Running the
+	// probe anyway would light a teammate up as "the person this is going to", which is not a thing
+	// mode B does, and would spend a handful of line traces a frame proving it.
 	ATraceCore* Core = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
-	if (Core != nullptr && bLocalCarrying)
+	if (Core != nullptr && bLocalCarrying && !bGoalMode)
 	{
 		if ((Now - LastPassTargetPollTime) >= TraceHUDStyle::PassTargetPollInterval)
 		{
@@ -905,6 +929,35 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 
 	FString Caption;
 	FLinearColor CaptionColor = TraceHUDStyle::InkDim;
+
+	// ---- MODE B: the caption is the control scheme, and it is a different one ---------------------
+	//
+	// Spec v4 §7: "The carrier should be able to throw the core forward by left clicking." There is
+	// no receiver to acquire, no hold, and no teammate to name — the throw goes where the crosshair
+	// points and the first player to reach it, either team, takes it. So mode B gets its own short
+	// caption rather than mode A's, and it takes this branch before any of the receiver logic below
+	// can put a teammate's name under a reticle that does not aim at teammates.
+	if (bGoalMode)
+	{
+		if (bOnCooldown)
+		{
+			Caption = FString::Printf(TEXT("THROW READY IN %.1f"), CooldownRemaining);
+			CaptionColor = TraceHUDStyle::Danger;
+		}
+		else if (bLocalCarrying)
+		{
+			Caption = TEXT("LMB  -  THROW");
+			CaptionColor = TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f);
+		}
+
+		if (!Caption.IsEmpty())
+		{
+			DrawTextCentered(Caption, TraceHUDStyle::WithAlpha(CaptionColor, Visibility),
+				X, Y + Radius + (14.f * UIScale), FontSmall, UIScale);
+		}
+		return;
+	}
+
 	if (bOnCooldown)
 	{
 		Caption = FString::Printf(TEXT("PASS READY IN %.1f"), CooldownRemaining);
@@ -1176,6 +1229,50 @@ void ATraceHUD::DrawHealthAndDash()
 					Margin + BarW + (10.f * UIScale),
 					VCenterTextY(CountdownText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 			}
+
+			// This used to be the last row and so never advanced the cursor. The slide-jump row
+			// below is drawn from the same RowY, so without this the two land on top of each other.
+			RowY -= (RowH + RowGap);
+		}
+	}
+
+	// ---- Slide-jump window --------------------------------------------------------------------
+	//
+	// Spec v4 §1 makes the slide-jump the payoff move and gives it a TIMING WINDOW. A timing window
+	// with no feedback is unlearnable: the player presses jump, sometimes gets 110% of their speed
+	// back and sometimes gets 100%, and has no way to tell which happened or why. That does not read
+	// as a skill they have not learned yet, it reads as an inconsistent game.
+	//
+	// So the row only exists while a slide-jump is actually available, and it says which of the two
+	// states the player is in — armed, or armed AND inside the bonus window. Deliberately a separate
+	// row rather than a flash on the dash pips: dash and slide are different resources spent on
+	// different keys, and overloading one meter to mean both is how a player learns the wrong thing.
+	if (const UTraceCharacterMovementComponent* TraceMove =
+			Cast<UTraceCharacterMovementComponent>(LocalChar->GetCharacterMovement()))
+	{
+		if (TraceMove->IsSlideJumpAvailable())
+		{
+			const bool bWellTimed = TraceMove->IsSlideJumpWellTimed();
+
+			const FString SlideLabel(TEXT("SLIDE"));
+			DrawTextLeft(SlideLabel, bWellTimed ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+				Margin, VCenterTextY(SlideLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+			// Pulsed while the bonus is live so it reads as a moment to act on, steady-dim while the
+			// slide is merely running. The pulse is the same 12 rad/s the SHIELD DOWN callout uses,
+			// so "something is happening right now" looks the same everywhere on this HUD.
+			const FLinearColor WindowColor = bWellTimed
+				? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * FMath::Sin(Now * 12.f))
+				: TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
+
+			DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bWellTimed ? 1.f : 0.35f, WindowColor);
+
+			const FString WindowText = bWellTimed ? TEXT("JUMP NOW") : TEXT("SLIDING");
+			DrawTextLeft(WindowText, TraceHUDStyle::InkDim,
+				Margin + BarW + (10.f * UIScale),
+				VCenterTextY(WindowText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+			RowY -= (RowH + RowGap);
 		}
 	}
 
@@ -1308,11 +1405,11 @@ void ATraceHUD::DrawScoresAndClock()
 
 	DrawTextCentered(ClockText, ClockColor, CX, ScoreY + (6.f * UIScale), FontLarge, 1.15f * UIScale);
 
-	// Bottom line of the panel: the target score, prefixed by the phase when the phase is anything
-	// other than "the match you are playing right now".
-	// "FIRST TO N" is no longer the rule: spec §1 runs a fixed two halves and the mercy rule is off
-	// by default (see ATraceGameMode::bEndMatchAtScoreToWin), so the phase is the useful thing to
-	// show. ATraceGameState::GetHalfLabel() already reads "1ST HALF" / "HALF TIME" / "2ND HALF".
+	// Bottom line of the panel: WHICH PHASE, and — since spec v4 §7 — WHICH OF THE TWO GAMES.
+	//
+	// "FIRST TO N" was never the rule and the score cap is now deleted outright (spec v4 §6): the
+	// clock decides the match, so the phase is the useful thing to show.
+	// ATraceGameState::GetHalfLabel() already reads "1ST HALF" / "HALF TIME" / "2ND HALF".
 	FString FooterText = (TraceGS != nullptr) ? TraceGS->GetHalfLabel() : FString(TEXT("MATCH"));
 	if (TraceGS != nullptr && TraceGS->TraceMatchState == ETraceMatchState::WaitingForPlayers)
 	{
@@ -1323,7 +1420,65 @@ void ATraceHUD::DrawScoresAndClock()
 		FooterText = TEXT("FULL TIME");
 	}
 
-	DrawTextCentered(FooterText, TraceHUDStyle::InkDim, CX, PanelY + PanelH - (22.f * UIScale), FontSmall, UIScale);
+	// The mode is appended rather than given a panel of its own. It has to be visible in EVERY
+	// screenshot — the whole point of the A/B toggle is comparing two builds' worth of footage, and
+	// a capture that does not say which mode it is from is a capture nobody can file — but it is
+	// also a constant, and a constant does not deserve to compete with the clock for attention.
+	if (TraceGS != nullptr)
+	{
+		FooterText = FString::Printf(TEXT("%s   -   %s"), *FooterText,
+			*TraceScoringModeLabel(TraceGS->GetScoringMode()));
+	}
+
+	const float FooterY = PanelY + PanelH - (22.f * UIScale);
+	DrawTextCentered(FooterText, TraceHUDStyle::InkDim, CX, FooterY, FontSmall, UIScale);
+
+	// ---- Mercy-rule warning ---------------------------------------------------------------------
+	//
+	// The mercy rule (spec v4 §6) ends the match the moment a lead reaches MercyRuleLead, and a
+	// match that stops in the middle of the first half with no warning reads exactly like the
+	// "keeps stopping and restarting" complaint this HUD has spent two passes answering. So the last
+	// couple of points are announced: the losing side knows what is at stake and the winning side
+	// knows it is one capture from the whistle.
+	//
+	// Read at the point of use, like everything else on the settings page — turn the rule off
+	// mid-match and this disappears with it.
+	const int32 MercyLead = UTraceSettings::Get().MercyRuleLead;
+	const bool bMatchLive = (TraceGS != nullptr)
+		&& TraceGS->TraceMatchState == ETraceMatchState::InProgress
+		&& !TraceGS->IsHalfTimeBreak();
+
+	if (bMatchLive && MercyLead > 0)
+	{
+		const int32 Lead = FMath::Abs(BlueScore - OrangeScore);
+		const int32 Remaining = MercyLead - Lead;
+
+		// Two points out, AND somebody actually ahead. The Lead > 0 test is not redundant: at a
+		// mercy threshold of 1 a 0-0 scoreline is "one point from the win" for both teams at once,
+		// and the warning was measured naming Orange as the leader of a drawn game.
+		if (Lead > 0 && Remaining > 0 && Remaining <= TraceHUDStyle::MercyWarningPoints)
+		{
+			const ETraceTeam LeadingTeam = (BlueScore > OrangeScore) ? ETraceTeam::Blue : ETraceTeam::Orange;
+			const FString MercyText = (Remaining == 1)
+				? FString::Printf(TEXT("MERCY RULE: %s WINS ON THE NEXT POINT"), *TraceTeamName(LeadingTeam).ToString().ToUpper())
+				: FString::Printf(TEXT("MERCY RULE: %s IS %d POINTS FROM THE WIN"), *TraceTeamName(LeadingTeam).ToString().ToUpper(), Remaining);
+
+			// Pulsed and team coloured, one line UNDER the Core banner.
+			//
+			// It was above the panel, which is where there is visibly empty screen — and it was
+			// clipped off the top edge in the first capture, because TopPanelY is only 14 reference
+			// pixels and there is no room up there at all. Below the possession banner is the next
+			// free strip and it is the right neighbourhood anyway: these are the two lines that say
+			// what is at stake right now.
+			const float MercyY = (TraceHUDStyle::TopPanelY + TraceHUDStyle::TopPanelH
+				+ TraceHUDStyle::BannerGap + 34.f) * UIScale;
+
+			const FLinearColor MercyColor = TraceHUDStyle::WithAlpha(
+				TraceTeamColor(LeadingTeam), 0.65f + 0.35f * FMath::Sin(Now * 5.f));
+
+			DrawTextCentered(MercyText, MercyColor, CX, MercyY, FontSmall, UIScale);
+		}
+	}
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1351,21 +1506,39 @@ void ATraceHUD::DrawCoreBanner()
 	ATraceCharacter* Carrier = Core->GetCarrier();
 	if (Carrier == nullptr)
 	{
-		// SPEC §2: the Core is a STATUS. It is never loose on the ground and never in flight, so
-		// there is nothing here for the player to run over and grab — telling them "CORE LOOSE"
-		// sent them chasing a pickup that no longer exists. The only two holderless states left are
-		// both transient and both mean "wait":
+		// MODE A (spec §2): the Core is a STATUS. It is never loose on the ground and never in
+		// flight, so there is nothing here for the player to run over and grab — telling them "CORE
+		// LOOSE" sent them chasing a pickup that no longer exists. The only two holderless states
+		// are both transient and both mean "wait":
 		//
 		//   out of play  — the half-time interval and the post-match window, where the Core is
 		//                  deliberately parked and granted to nobody (ATraceCore::KickoffTo(None));
 		//   kickoff      — the ~1s grant delay after a whistle or a score, which exists so the Core
 		//                  is not handed over mid-teleport.
-		BannerText = Core->IsOutOfPlay() ? TEXT("CORE OUT OF PLAY") : TEXT("CORE KICKOFF");
-		BannerColor = TraceHUDStyle::InkDim;
+		//
+		// MODE B REINSTATES THE THIRD STATE, and reinstates it as a real instruction: a thrown Core
+		// IS on the field and the first player to touch it takes it, either team. Saying "CORE
+		// LOOSE" in mode A was a lie; refusing to say it in mode B would be the opposite lie, and
+		// the resulting scramble is the single most important thing on screen when it happens.
+		if (bGoalMode && Core->IsLoose())
+		{
+			BannerText = TEXT("CORE LOOSE - FIRST TOUCH TAKES IT");
+			BannerColor = TraceHUDStyle::Danger;
+		}
+		else
+		{
+			BannerText = Core->IsOutOfPlay() ? TEXT("CORE OUT OF PLAY") : TEXT("CORE KICKOFF");
+			BannerColor = TraceHUDStyle::InkDim;
+		}
 	}
 	else if (Carrier == LocalChar.Get())
 	{
-		BannerText = TEXT("YOU HAVE THE CORE");
+		// The verb follows the mode. Spec v4 §7 makes LMB mean two different things while carrying —
+		// the 0.5 s hover-hold pass in mode A, an outright throw in mode B — and the banner is the
+		// one piece of HUD a carrier is guaranteed to be looking at.
+		BannerText = bGoalMode
+			? FString(TEXT("YOU HAVE THE CORE - LMB THROWS"))
+			: FString(TEXT("YOU HAVE THE CORE - HOLD LMB TO PASS"));
 		BannerColor = TraceTeamColor(LocalTeam);
 	}
 	else
@@ -1375,8 +1548,11 @@ void ATraceHUD::DrawCoreBanner()
 		BannerColor = TraceTeamColor(CarrierTeam);
 	}
 
-	// Pulse anything that demands a reaction: you are carrying it, or an enemy is.
-	const bool bUrgent = (Carrier != nullptr) && (Carrier == LocalChar.Get() || Carrier->GetTeam() != LocalTeam);
+	// Pulse anything that demands a reaction: you are carrying it, an enemy is, or (mode B) it is
+	// lying on the field and the next person to touch it owns the possession.
+	const bool bUrgent = (Carrier != nullptr)
+		? (Carrier == LocalChar.Get() || Carrier->GetTeam() != LocalTeam)
+		: (bGoalMode && Core->IsLoose());
 	if (bUrgent)
 	{
 		BannerColor = TraceHUDStyle::WithAlpha(BannerColor, 0.7f + 0.3f * FMath::Sin(Now * 6.f));
@@ -1602,22 +1778,59 @@ void ATraceHUD::DrawMatchResult()
 
 	const float CX = ViewW * 0.5f;
 
+	// ---- Who won, and WHY the match stopped (spec v4 §6) ----------------------------------------
+	//
+	// Both are read from the GameState rather than re-derived from the two scores. That mattered
+	// less when the clock was the only way to finish; now that the mercy rule can stop a match in
+	// the middle of the first half, "9-1" alone does not say whether the whistle went because time
+	// ran out or because the rule fired — and the spec asks for that distinction in as many words,
+	// because it is the whole difference to somebody reading a result they did not watch.
+	//
+	// The score fallback below is for the frame or two before MatchWinner has replicated to a client
+	// that joined mid-whistle, not for normal play.
+	const ETraceMatchEndReason EndReason = TraceGS->GetMatchEndReason();
+
+	ETraceTeam Winner = TraceGS->GetMatchWinner();
+	if (Winner == ETraceTeam::None && Blue != Orange)
+	{
+		Winner = (Blue > Orange) ? ETraceTeam::Blue : ETraceTeam::Orange;
+	}
+
 	FString ResultText;
 	FLinearColor ResultColor;
-	if (Blue == Orange)
+	if (Winner == ETraceTeam::None)
 	{
 		ResultText = TEXT("DRAW");
 		ResultColor = TraceHUDStyle::Ink;
 	}
 	else
 	{
-		const ETraceTeam Winner = (Blue > Orange) ? ETraceTeam::Blue : ETraceTeam::Orange;
 		ResultText = FString::Printf(TEXT("%s WINS"), *TraceTeamName(Winner).ToString().ToUpper());
 		ResultColor = TraceTeamColor(Winner);
 	}
 
-	DrawTextCentered(TEXT("FULL TIME"), TraceHUDStyle::InkDim, CX, ViewH * 0.095f, FontSmall, 1.3f * UIScale);
+	// The headline is the REASON, not a fixed "FULL TIME": a mercy win says MERCY RULE. Coloured
+	// with it too, so the two outcomes are told apart at a glance from a screenshot.
+	const bool bMercy = (EndReason == ETraceMatchEndReason::Mercy);
+	DrawTextCentered(TraceMatchEndReasonHeadline(EndReason),
+		bMercy ? TraceHUDStyle::Danger : TraceHUDStyle::InkDim,
+		CX, ViewH * 0.095f, FontSmall, 1.3f * UIScale);
+
 	DrawTextCentered(ResultText, ResultColor, CX, ViewH * 0.135f, FontLarge, 2.6f * UIScale);
+
+	// One line of plain English under the result. A results screen that says "MERCY RULE" and
+	// nothing else leaves the reader to guess the threshold; this states the rule that fired, and in
+	// the clock case it states which mode the match was played in — which is the fact an A/B
+	// playtest's notes need and the one a screenshot otherwise loses.
+	const FString SubText = bMercy
+		? FString::Printf(TEXT("%s LED BY %d - THE MATCH ENDED EARLY (%s)"),
+			*TraceTeamName(Winner).ToString().ToUpper(), FMath::Abs(Blue - Orange),
+			*TraceScoringModeLabel(TraceGS->GetScoringMode()))
+		: FString::Printf(TEXT("%s HALVES ON THE CLOCK  -  %s"),
+			(TraceGS->NumHalves == 2) ? TEXT("TWO") : TEXT("ALL"),
+			*TraceScoringModeLabel(TraceGS->GetScoringMode()));
+
+	DrawTextCentered(SubText, TraceHUDStyle::InkDim, CX, ViewH * 0.205f, FontSmall, 1.05f * UIScale);
 
 	// Final score, spelled out as two team-coloured numbers rather than one string, so the winner
 	// is legible from across the room.

@@ -9,6 +9,8 @@
 #include "UObject/ObjectPtr.h"
 
 #include "TraceTypes.h"              // ETraceTeam
+#include "Core/TraceMatchTypes.h"    // TraceIsGoalMode / TraceScoringModeLabel, and ETraceScoringMode
+                                     // itself via TraceSettings.h - the A/B toggle (spec v4 §7)
 
 #include "TraceArenaBuilder.generated.h"
 
@@ -32,10 +34,10 @@ class UStaticMeshComponent;
  * "Build Preview In Editor" in its Details panel to see the arena without pressing Play - the full
  * two-click workflow, and the reasons it cannot leak into a build, are documented on that function.
  *
- * WHAT IT MAKES  (spec v3 section 7 - rebuilt from the collaborator's overhead sketch)
+ * WHAT IT MAKES  (spec v3 section 7 - rebuilt from the collaborator's overhead sketch,
+ *                 lengthened to 3.5 : 1 for spec v4 section 3)
  * -------------
- * A 24000 x 9600 uu Tron arena - LENGTH : WIDTH = 2.5 : 1, which is the proportion the sketch asks
- * for. Inside it:
+ * A 33600 x 9600 uu Tron arena - LENGTH : WIDTH = 3.5 : 1. Inside it:
  *
  *  - a near-black glossy floor carrying a team-tinted neon grid, and four 2600 uu perimeter walls
  *    with lit trim, a kick rail and vertical ribs;
@@ -49,13 +51,35 @@ class UStaticMeshComponent;
  *  - a scatter of cover boxes and long low bars at exactly 1x / 2x / 3.5x player height (176 / 352
  *    / 616 uu), keyed to the character capsule via PlayerHeightUU();
  *  - a lit gate spanning the full width of each endzone; the endzones themselves run sideline to
- *    sideline - see EndzoneHalfWidth.
+ *    sideline - see EndzoneHalfWidth;
+ *  - and, for MODE B, a GOAL at each end: two posts a third of the field width apart carrying a
+ *    crossbar at ClampedGoalHeight(), with the goal mouth lit on the floor between them. See the
+ *    two-modes note below.
+ *
+ * TWO SCORING SHAPES, BOTH BUILT (spec v4 section 7)
+ * -------------------------------------------------
+ * Mode A scores in full-width endzones; mode B scores in narrow, finite-height goals. The arena
+ * builds BOTH sets of furniture - both pairs of ATraceEndzone volumes and both pieces of paint - and
+ * then ARMS one of them (ApplyScoringMode). That is what makes the A/B toggle a flag flip a match
+ * can survive rather than a rebuild that needs a restart, which is the whole point of an A/B test.
+ *
+ * The cost is about 80 extra components and two extra server-only trigger actors, all of which are
+ * hidden and collisionless in the mode that is not being played. The alternative - rebuilding the
+ * endzone furniture on the toggle - was rejected because the toggle can be flipped while ten pawns
+ * are standing on the geometry being destroyed.
+ *
+ * NOTHING HERE DECIDES WHICH MODE IS RUNNING. The builder is told, through ApplyScoringMode /
+ * ApplyScoringModeInWorld, by the one authority there is: ATraceGameState::GetScoringMode(). See the
+ * note at the top of TraceMatchTypes.h.
  *
  * Along both flanks: a row of wall buttresses carrying a continuous high rail, a light bridge per
- * quadrant out to the lane pylons, bright lane floor stripes and a pylon in each endzone corner.
- * Plus the gameplay furniture: two ATraceEndzone triggers, five ATraceTeamPlayerStarts per team,
- * the lighting rig (three directional lights plus a 24-lamp floor lattice), height fog and an
- * unbound post-process volume.
+ * lane pylon out to the side wall, bright lane floor stripes and a pylon in each endzone corner.
+ * Plus the gameplay furniture: FOUR ATraceEndzone triggers (two endzones and two goals - see the
+ * two-modes note above), five ATraceTeamPlayerStarts per team, the lighting rig (three directional
+ * lights plus a 32-lamp floor lattice), height fog and an unbound post-process volume.
+ *
+ * That comes to ~1190 components on the shipped field, up from ~830 at 24000 x 9600: the field grew
+ * 40% and the structure count with it, plus the mode-B goal furniture.
  *
  * MIRRORED HALVES, DELIBERATELY
  * -----------------------------
@@ -70,10 +94,16 @@ class UStaticMeshComponent;
  * WHY IT IS THIS BIG
  * ------------------
  * The field was 8000 x 4000. At WalkSpeed 720 that is 11 seconds end to end and a point was over
- * before it started. 24000 long is 3x that: a full-field carry is ~33 seconds, so the carrier
- * actually has to survive a journey and the dash-through-the-trail counterplay gets time to happen.
- * Every derived number below is expressed as a fraction of the field, so changing
- * FieldLength/FieldWidth moves the whole layout coherently.
+ * before it started. 24000 long was 3x that; 33600 is 4.2x, and at the current WalkSpeed of 800 a
+ * full-field run is ~42 SECONDS. That is a long time, and the report on this pass says so plainly:
+ * if it plays badly, the alternative reading of "lengthen to 3.5:1" is to NARROW instead, which is
+ * two numbers on FieldLength/FieldWidth below (24000 / 6857) and nothing else - every structure,
+ * volume, spawn and bound in this file is derived from those two, and the corner banks, the goal and
+ * the endzone all re-derive themselves. It is genuinely a one-edit change; it is not a rewrite.
+ *
+ * Every derived number below is expressed as a fraction of the field (or, for the pieces that must
+ * not drift away from the goal line when the field grows, as an offset back FROM the goal line - see
+ * ApproachCover in the .cpp), so changing FieldLength/FieldWidth moves the whole layout coherently.
  *
  * ART DIRECTION - READ THIS BEFORE TOUCHING THE LIGHTING
  * -----------------------------------------------------
@@ -168,6 +198,70 @@ public:
 	 */
 	FBox GetEndzoneBounds(float EndSign) const;
 
+	// --- MODE B: goals (spec v4 section 7) --------------------------------------------------------
+
+	/**
+	 * Half extent of a GOAL along Y, i.e. half the goal mouth.
+	 *
+	 * UTraceSettings::GoalWidthFieldFraction of the FULL field width, halved - a third of the width
+	 * by default, so 1600 uu either side of the centre line on the 9600 uu field. Read through this
+	 * function everywhere, exactly as EndzoneHalfWidth() is: the trigger box, the posts, the crossbar
+	 * and the mouth patch all measure themselves against it, so what scores and what is painted are
+	 * the same rectangle by construction.
+	 *
+	 * Clamped so a silly fraction can neither produce a zero-width goal nor a full-width one (which
+	 * would silently turn mode B back into mode A with a shorter ceiling).
+	 */
+	float GoalHalfWidth() const;
+
+	/**
+	 * Height of a goal volume, floor upward, from UTraceSettings::GoalHeightUU.
+	 *
+	 * FINITE ON PURPOSE - "height finite so it reads as a goal rather than a wall". Clamped to the
+	 * wall height at the top so the crossbar can never be built above the sky.
+	 */
+	float ClampedGoalHeight() const;
+
+	/**
+	 * World-space box of the GOAL at @p EndSign (-1 for the -X end, +1 for the +X end).
+	 *
+	 * Goal line to end wall along X (the same depth as the endzone, so a Core thrown to the back of
+	 * the net still counts), +/- GoalHalfWidth() along Y, and floor to ClampedGoalHeight() in Z.
+	 */
+	FBox GetGoalBounds(float EndSign) const;
+
+	/**
+	 * The box that actually scores at @p EndSign in the mode currently armed - the goal in mode B,
+	 * the endzone in mode A.
+	 *
+	 * This is the one anything mode-agnostic should call: bot goal-seeking, throw aiming, debug
+	 * draw. Asking for GetEndzoneBounds() in mode B is how a bot ends up running at a target that
+	 * cannot score.
+	 */
+	FBox GetScoringBounds(float EndSign) const;
+
+	/** The scoring shape the arena is currently presenting. Told to it; never inferred here. */
+	ETraceScoringMode GetScoringMode() const { return ScoringMode; }
+
+	/**
+	 * Presents @p NewMode: arms that mode's scoring volumes, shows its furniture, and hides and
+	 * disarms the other mode's.
+	 *
+	 * Idempotent, cheap (a visibility and collision push over ~80 components and 4 actors), and legal
+	 * at any point in a match on any machine - no rebuild, no restart. Safe to call before the arena
+	 * is built: the mode is remembered and applied at the end of the build.
+	 */
+	void ApplyScoringMode(ETraceScoringMode NewMode);
+
+	/**
+	 * Finds this world's builder and switches it. Called from BOTH sides of the network for the same
+	 * reason ApplyTeamSidesInWorld is: the builder is not replicated, so the server and every client
+	 * has to be driven independently (the game mode on publish, ATraceGameState::OnRep on clients).
+	 */
+	static void ApplyScoringModeInWorld(const UWorld* World, ETraceScoringMode NewMode);
+
+	//~ End mode B surface
+
 	/**
 	 * Builds the arena now if it has not been built yet. Idempotent, and legal to call before
 	 * BeginPlay — which is the whole point: ATraceGameMode::PreInitializeComponents has to get the
@@ -235,16 +329,23 @@ public:
 	/**
 	 * Length of the field along X (goal to goal).
 	 *
+	 * 24000 -> 33600 for spec v4 section 3, verbatim: "Lengthen the map to a 3.5:1 ratio, adjusting
+	 * the structures to match." 33600 : 9600 is exactly 3.5 : 1, and [ASSUMPTION] "lengthen" grows
+	 * the long axis rather than narrowing the short one.
+	 *
 	 * The layout scales with this: the cover scatter, the corner banks, the pylons and the endzone
-	 * gates are all placed at fractions of the half length, so 24000 is a tuning value rather than a
+	 * gates are all placed at fractions of the half length, so 33600 is a tuning value rather than a
 	 * load-bearing constant. Do not drop it below ~12000 or the centre diamond and the two spawn
 	 * lines start to overlap.
 	 *
-	 * It is also HALF of the 2.5 : 1 proportion spec v3 section 7 asks for. Change this without
-	 * changing FieldWidth and the sketch's shape goes with it.
+	 * THE COST, STATED PLAINLY: at WalkSpeed 800 a full-field run is 42 seconds. If that plays badly
+	 * the alternative reading of the same note is to NARROW instead - set this to 24000 and FieldWidth
+	 * to 6857 and the arena rebuilds itself at 3.5 : 1 with a 30-second field. Nothing else needs
+	 * touching; that is what the "everything is a fraction" rule is for. (Check HitscanRange either
+	 * way - see FieldWidth.)
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
-	float FieldLength = 24000.f;
+	float FieldLength = 33600.f;
 
 	/**
 	 * Width of the field along Y (sideline to sideline). Layout scales with this too.
@@ -254,18 +355,22 @@ public:
 	 * The narrower field also pulls the flanks back into play - at 12000 the outer thirds were two
 	 * black voids that needed a whole subsystem of dressing to fill.
 	 *
-	 * EVERYTHING derived from this follows automatically: the endzone volumes and their triggers,
-	 * the spawn fan, GetFieldBounds() (which is what the bots steer inside and what the half-time
-	 * side switch measures against), the grid, the flanks and the corner banks. The one number that
-	 * does NOT live here and must be re-checked by hand is UTraceSettings::HitscanRange, which has
-	 * to clear the field diagonal: 24000 x 9600 is a 25849 uu diagonal against a 28000 uu range, so
-	 * it still clears with 2151 uu to spare.
+	 * EVERYTHING derived from this follows automatically: the endzone volumes and their triggers, the
+	 * mode-B goal mouths, the spawn fan, GetFieldBounds() (which is what the bots steer inside and
+	 * what the half-time side switch measures against), the grid, the flanks and the corner banks.
+	 *
+	 * THE ONE NUMBER THAT DOES NOT LIVE HERE and must be re-checked by hand is
+	 * UTraceSettings::HitscanRange, which has to clear the field diagonal. 33600 x 9600 is a 34944 uu
+	 * diagonal, so the 28000 that covered the old 24000 x 9600 field NO LONGER REACHES: a shot down
+	 * the long diagonal now dies 6944 uu short of a target the player can plainly see. That property
+	 * lives in UTraceSettings (and, because the ini wins, in Config/DefaultGame.ini as well) and it
+	 * needs to go to 36000. It is called out in this pass's report.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FieldWidth = 9600.f;
 
 	/**
-	 * Wall height. Tall on purpose: on a 24000 uu field a 700 uu wall is a kerb, and the walls are
+	 * Wall height. Tall on purpose: on a 33600 uu field a 700 uu wall is a kerb, and the walls are
 	 * the main thing standing between the camera and an empty black sky.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
@@ -464,7 +569,7 @@ public:
 	float BloomThreshold = -0.35f;
 
 	/**
-	 * Height fog density. Low: enough to give the 24000 uu field depth, not enough to hide it.
+	 * Height fog density. Low: enough to give the 33600 uu field depth, not enough to hide it.
 	 *
 	 * 0.012 -> 0.015. MEASURED over 52 walking frames: 3.8% of them were more than 85% DEAD BLACK -
 	 * literal (0,0,0) - which is the other half of the point-blank defect and the one nobody
@@ -501,6 +606,14 @@ protected:
 	void BuildCoverField(bool bBuildVisuals);
 	void BuildFlanks(bool bBuildVisuals);
 	void BuildEndzones(bool bBuildVisuals);
+
+	/**
+	 * The MODE B goals: two posts, a crossbar, a lit mouth on the floor and the scoring volume, at
+	 * each end. Built unconditionally and then hidden if mode A is the one armed - see the two-modes
+	 * note in the class comment.
+	 */
+	void BuildGoals(bool bBuildVisuals);
+
 	void BuildPlayerStarts();
 	void BuildLighting();
 	void BuildFloorLamps();
@@ -678,6 +791,48 @@ protected:
 	float DaisTopZ() const;
 
 	/**
+	 * |X| of a goal line, i.e. HalfLength() minus the endzone depth. Both ends are symmetric.
+	 *
+	 * The anchor for everything at the business end of the field: the endzone gate, the goal posts,
+	 * the mode-B mouth, and the goal-approach cover cluster (see ApproachCover in the .cpp), which is
+	 * measured back from HERE rather than as a fraction of the half length. That distinction is what
+	 * stopped the 3.5:1 lengthening from sliding the goal-approach tower into the spawn fan - the
+	 * pads are goal-relative, so cover that is length-relative drifts THROUGH them as the field grows.
+	 */
+	float GoalLineX() const;
+
+	// --- Mode-tagged geometry ---------------------------------------------------------------------
+	//
+	// Both scoring shapes are built; one is presented. These three are the whole mechanism.
+
+	/**
+	 * One piece of geometry that belongs to a single scoring mode, plus the collision state it was
+	 * built with, so hiding and re-showing it restores exactly what it had rather than a guess.
+	 */
+	struct FTraceModePiece
+	{
+		TWeakObjectPtr<USceneComponent> Component;
+
+		/** Collision the component was built with. Restored verbatim when its mode is armed. */
+		TEnumAsByte<ECollisionEnabled::Type> Collision = ECollisionEnabled::NoCollision;
+	};
+
+	/**
+	 * Number of components attached under Root right now.
+	 *
+	 * Paired with CollectPiecesSince() this is how a build step tags everything it made without any
+	 * of the primitive helpers knowing modes exist: mark, build, collect the difference. Every helper
+	 * in this file attaches to Root and appends in order, so the difference IS what the step built.
+	 */
+	int32 MarkBuiltComponents() const;
+
+	/** Appends everything attached under Root since @p Mark to @p Out, with its collision state. */
+	void CollectPiecesSince(int32 Mark, TArray<FTraceModePiece>& Out) const;
+
+	/** Shows or hides one tagged set, restoring its built collision when shown. */
+	static void SetPiecesPresented(const TArray<FTraceModePiece>& Pieces, bool bPresented);
+
+	/**
 	 * +1 for the team defending the +X end, -1 for the other, AS THE ARENA IS PAINTED AT BUILD TIME.
 	 *
 	 * NOT the runtime authority any more. Spec §1 switches sides at half time, so "which end does
@@ -748,6 +903,32 @@ private:
 
 	/** The side assignment currently painted, so ApplyTeamSides can skip redundant work. */
 	ETraceTeam PaintedTeamOnNegativeSide = ETraceTeam::Blue;
+
+	/**
+	 * The scoring shape currently presented. Defaults to mode A, which is the shipped game.
+	 *
+	 * Set before the build (from ATraceGameState, or from UTraceSettings if no game state exists yet)
+	 * and re-applied by ApplyScoringMode whenever the authority says it changed.
+	 */
+	// ENUMERATOR NAMES: EndzoneStatusCore / ThrownCoreAndGoals, as declared in TraceSettings.h and as
+	// serialised by Config/DefaultGame.ini. This line said ETraceScoringMode::Endzones, which does
+	// not exist and failed the whole module; TraceIsGoalMode() is the readable way to test it.
+	ETraceScoringMode ScoringMode = ETraceScoringMode::EndzoneStatusCore;
+
+	/** Furniture that only exists in mode A: the full-width patch, goal line and endzone edge rails. */
+	TArray<FTraceModePiece> EndzoneModePieces;
+
+	/** Furniture that only exists in mode B: the goal posts, crossbar and lit mouth. */
+	TArray<FTraceModePiece> GoalModePieces;
+
+	/**
+	 * Every ATraceEndzone this builder spawned, both shapes, server only.
+	 *
+	 * Weak, and separate from SpawnedActors (which owns them): ApplyScoringMode has to arm one pair
+	 * and disarm the other, and walking a typed list beats filtering the actor list by cast on every
+	 * toggle. Also empty on clients, where no scoring volume is ever spawned.
+	 */
+	TArray<TWeakObjectPtr<ATraceEndzone>> ScoringVolumes;
 
 
 	/** Engine basic shapes, resolved in the constructor so the cooker keeps them (contract §2). */

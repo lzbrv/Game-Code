@@ -193,9 +193,11 @@ public:
 	/**
 	 * A glowing skid streak under the feet while sliding.
 	 *
-	 * The Mannequin set Scripts/import-mannequin.sh imports has no crouch or slide animation, so a
-	 * sliding player is a running pose in a shortened capsule and reads as a bug. This is what
-	 * actually communicates the state to everyone else: an unlit team-coloured streak on the deck,
+	 * The Mannequin set Scripts/import-mannequin.sh imports has NO crouch and NO slide animation —
+	 * spec v4 §1 asked for Unreal's stock one and it does not exist — so the body itself is posed
+	 * procedurally (UpdateCrouchPresentation: recline, drop, roll, and the locomotion blend space
+	 * slowed almost to a stop). This streak is the other half of the read, and the half that carries
+	 * across the arena: an unlit team-coloured streak on the deck,
 	 * scaled by speed, which the near-mirror floor doubles. It is the light-cycle read the rest of
 	 * the arena is built around, and it costs one static mesh component per pawn.
 	 */

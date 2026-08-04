@@ -4,14 +4,18 @@
 
 #include "Camera/PlayerCameraManager.h"        // local camera location (proximity glow fade)
 #include "Components/CapsuleComponent.h"
+#include "Components/PoseableMeshComponent.h"  // spec v4 §2 — the character-shaped after-images
+#include "Components/SkeletalMeshComponent.h"  // the live Mannequin the ghosts copy their pose from
 #include "Components/StaticMeshComponent.h"
 #include "Engine/Engine.h"                     // GEngine->GetFirstLocalPlayerController()
 #include "Engine/EngineBaseTypes.h"
+#include "Engine/SkinnedAsset.h"               // ghost pool identity (which Mannequin is skinned in)
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"                       // TActorIterator (fallback character gather)
 #include "GameFramework/Controller.h"
 #include "GameFramework/GameStateBase.h"       // GetServerWorldTimeSeconds()
+#include "GameFramework/Pawn.h"                 // Trace.Trail.DebugLookBack
 #include "GameFramework/PlayerController.h"    // IsLocalPlayerController() (own-trace near hide)
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
@@ -19,6 +23,7 @@
 #include "Math/UnrealMathUtility.h"            // FMath::SegmentDistToSegmentSafe
 #include "UObject/ConstructorHelpers.h"
 
+#include "Containers/Ticker.h"                 // FTSTicker (Trace.Trail.DebugLookBack)
 #include "HAL/IConsoleManager.h"               // FAutoConsoleVariableRef (trace timing knobs)
 
 #include "Core/TraceCharacter.h"
@@ -69,14 +74,71 @@ namespace
 		     "Delays formation only; already-laid segments stay lethal."),
 		ECVF_Default);
 
-	/** Upper bound on pooled after-images. At 4s and 60uu spacing a run produces roughly 52. */
-	constexpr int32 MaxPooledGhosts = 96;
+	/** Upper bound on pooled SMEAR elements (one per lethal segment). 2.0s at 60uu spacing is ~27. */
+	constexpr int32 MaxPooledSmearElements = 96;
 
-	/** Meshes per after-image: legs, torso, head. */
-	constexpr int32 PartsPerGhost = 3;
-	constexpr int32 PartLegs = 0;
-	constexpr int32 PartTorso = 1;
-	constexpr int32 PartHead = 2;
+	/** Meshes per smear element, interleaved: [0] body (legs+torso), [1] the hot head band. */
+	constexpr int32 PartsPerSmear = 2;
+	constexpr int32 PartHead = 1;
+
+	/**
+	 * Upper bound on pooled POSED MANNEQUIN GHOSTS. This is the number that decides whether spec v4 §2
+	 * is affordable, so it is worth being explicit about the arithmetic:
+	 *
+	 *   trace length  = TrailLifetime x speed, capped by MaxTrailPoints x TrailPointSpacing
+	 *                 = 2.0s x 800uu/s = 1600uu at a walk, ~3200uu through a sustained dash
+	 *   ghosts        = length / GhostSpacing = 1600/220 = 8 at a walk, ~15 dashing
+	 *
+	 * 20 covers the dashing case with headroom. Beyond it the OLDEST ghosts are released — never the
+	 * newest, which are the ones an approaching enemy is judging — and the smear still covers the tail,
+	 * so the cap degrades the look and never the continuity.
+	 *
+	 * ONLY THE CORE HOLDER EMITS. In the worst realistic case (a turnover leaving a residual trace
+	 * while the new holder lays a fresh one) two traces coexist, so the ceiling on posed mannequins in
+	 * the world is ~40, not 20-per-player. Ten simultaneous traces is not a state this game has.
+	 */
+	int32 GMaxPoseGhosts = 20;
+
+	FAutoConsoleVariableRef CVarMaxPoseGhosts(
+		TEXT("Trace.Trail.GhostMaxCount"),
+		GMaxPoseGhosts,
+		TEXT("Cap on posed-Mannequin after-images per trace (spec v4 2). 0 disables them and leaves "
+		     "the trace as the continuous smear alone. Cosmetic - never changes the lethal volume."),
+		ECVF_Default);
+
+	/**
+	 * uu along the path between consecutive posed after-images.
+	 *
+	 * The tension it resolves: a ghost per trail point (60uu) is the most beautiful version and costs
+	 * ~27 skinned draws per trace; a ghost every 400uu is nearly free and reads as a row of statues
+	 * with holes between them. 220uu is a little over one body-depth of gap, so consecutive
+	 * mannequins nearly touch and the eye joins them up — and the smear covers the gap regardless.
+	 */
+	float GGhostSpacing = 220.f;
+
+	FAutoConsoleVariableRef CVarGhostSpacing(
+		TEXT("Trace.Trail.GhostSpacing"),
+		GGhostSpacing,
+		TEXT("uu between posed-Mannequin after-images along the trace (spec v4 2). Lower = denser and "
+		     "prettier and more skinned draws. Cosmetic only."),
+		ECVF_Default);
+
+	/**
+	 * Forced LOD for the ghosts. 0 = automatic (screen-size driven), 1 = LOD0, 2 = LOD1, ...
+	 *
+	 * Left on automatic because the ghosts are exactly the case the LOD system is good at: they are
+	 * static, they are frequently far away, and they have no animation whose popping could give the
+	 * transition away. Exposed because forcing LOD2 is the single biggest lever available if a
+	 * ten-player capture ever measures these as expensive.
+	 */
+	int32 GGhostForcedLOD = 0;
+
+	FAutoConsoleVariableRef CVarGhostForcedLOD(
+		TEXT("Trace.Trail.GhostForcedLOD"),
+		GGhostForcedLOD,
+		TEXT("Forced LOD on posed-Mannequin after-images. 0 = automatic (default), 1 = LOD0, 2 = LOD1. "
+		     "Perf lever only."),
+		ECVF_Default);
 
 	/**
 	 * How much of the freshest trace is hidden from the holder's own camera, measured along the path.
@@ -149,27 +211,50 @@ namespace
 	constexpr double RecentDashGraceSeconds = 0.15;
 
 	// ---------------------------------------------------------------------------------------------
-	// After-image silhouette (spec §3: "a blur created where your character model has passed
-	// through"). Every number is a FRACTION of the lethal volume, never an absolute — the shape has
-	// to be re-derived if TrailRadius/TrailHeight are retuned, or the player is being shown a
-	// boundary that is not the boundary.
+	// THE SMEAR's cross-section. Every number is a FRACTION of the lethal volume, never an absolute —
+	// the shape has to be re-derived if TrailRadius/TrailHeight are retuned, or the player is being
+	// shown a boundary that is not the boundary.
 	//
-	// Measured from the bottom of the volume upward, the three parts tile it: legs occupy the lowest
-	// 45%, torso the next 34%, head the top 23%. Widths taper the way a body does, with the TORSO at
-	// the full lethal width so the widest part of the smear is the part you actually judge.
+	// WHY THE MIDDLE OF THE VOLUME IS LEFT EMPTY, which is the single most important decision in this
+	// file and was arrived at by looking at a screenshot of the first attempt:
+	//
+	//   M_TraceNeon IS OPAQUE AND WRITES DEPTH. The first version of this pass drew the smear as one
+	//   band spanning the full lethal height at the full lethal width — geometrically perfect, and it
+	//   completely swallowed the mannequins. Every ghost was rendered, correctly posed, in the right
+	//   place, and every one of them was INSIDE an opaque cylinder. The capture came back as a flat
+	//   featureless slab of cyan: exactly the "old cylinder models" look the user asked us to leave.
+	//
+	// So the smear now draws the two bands the eye needs and vacates the band the mannequins live in:
+	//
+	//   FLOOR BAND   bottom 38% (0-72uu of 190), at EXACTLY the lethal width. This is the continuous
+	//                one. It is the drawn statement of where the kill volume's edge is, it runs
+	//                unbroken along every lethal segment, and it is the surface a DASHING player
+	//                actually meets — the trip test is a horizontal sweep, so the decision a player is
+	//                making when they judge a gap is a decision about this band.
+	//   EYE LINE     a thin hot ribbon at ~170uu, 30% of the width. First-person eye height is 152uu;
+	//                a previous pass measured that a bright continuous element at that height is the
+	//                one feature of a trace that survives being seen edge-on across the arena, and the
+	//                mannequins cannot replace it because they are discrete and, at 6000uu, two pixels.
+	//   THE GAP      72-162uu is left open, and that is where a Mannequin's torso, arms and shoulders
+	//                are. The after-images show through it.
+	//
+	// The honest cost is written up in the block comment above RebuildVisuals(): the smear no longer
+	// paints the full HEIGHT of the kill volume. It paints the full WIDTH, continuously, at the height
+	// a dasher crosses. The vertical extent was never what the trip test turns on anyway — its
+	// vertical threshold is TrailHeight/2 + the tripper's own capsule half-height (95 + 88 = 183uu),
+	// which any grounded or jumping player passes trivially.
 	// ---------------------------------------------------------------------------------------------
 
-	constexpr double GhostLegCentreFrac = 0.225;
-	constexpr double GhostLegHeightFrac = 0.450;
-	constexpr double GhostLegWidthFrac = 0.80;
+	constexpr double SmearBodyCentreFrac = 0.190;
+	constexpr double SmearBodyHeightFrac = 0.380;
+	// EXACTLY the lethal width, not a flattering 0.9 of it. A boundary drawn narrower than it really
+	// is turns the trace into a trap rather than a warning. (The trip test is wider still — it
+	// inflates by the tripper's own capsule radius — so the error that remains favours the player.)
+	constexpr double SmearBodyWidthFrac = 1.00;
 
-	constexpr double GhostTorsoCentreFrac = 0.615;
-	constexpr double GhostTorsoHeightFrac = 0.340;
-	constexpr double GhostTorsoWidthFrac = 1.00;
-
-	constexpr double GhostHeadCentreFrac = 0.885;
-	constexpr double GhostHeadHeightFrac = 0.230;
-	constexpr double GhostHeadWidthFrac = 0.50;
+	constexpr double SmearHeadCentreFrac = 0.900;
+	constexpr double SmearHeadHeightFrac = 0.100;
+	constexpr double SmearHeadWidthFrac = 0.30;
 
 	/**
 	 * Glow per part, on M_TraceNeon.
@@ -185,9 +270,40 @@ namespace
 	 * first-person eye height, so a chain of hot heads is the one feature of the smear that survives
 	 * being seen edge-on from a player's own eyeline at any range. Do not dim it.
 	 */
-	constexpr float GhostLegGlow = 1.25f;
-	constexpr float GhostTorsoGlow = 1.70f;
-	constexpr float GhostHeadGlow = 4.20f;
+	constexpr float SmearBodyGlow = 1.50f;
+	constexpr float SmearHeadGlow = 4.20f;
+
+	/**
+	 * What the smear's brightness is multiplied by ONCE THE POSED GHOSTS ARE DRAWING.
+	 *
+	 * This is the whole art direction of v4 §2 in one number. At 1.0 the smear is as bright as the
+	 * mannequins and the trace goes back to reading as a solid extruded fence with figures buried in
+	 * it. Near 0 the mannequins float in a row of statues and the gaps between them look passable,
+	 * which is the one thing the trip mechanic cannot afford. It wants to sit where the smear is
+	 * plainly, continuously THERE and the mannequins are plainly the brighter thing.
+	 *
+	 * When the ghosts are unavailable this is not applied at all and the smear runs at full strength,
+	 * i.e. the pre-v4 look, so a build with no character art still has a perfectly readable trace.
+	 */
+	float GSmearGlowScale = 0.50f;
+
+	FAutoConsoleVariableRef CVarSmearGlowScale(
+		TEXT("Trace.Trail.SmearGlowScale"),
+		GSmearGlowScale,
+		TEXT("Brightness of the continuous smear relative to the posed-Mannequin after-images (spec v4 2). "
+		     "1 = the old solid-fence look; the smear must stay clearly visible or the gaps between "
+		     "ghosts read as passable. Cosmetic only - the kill volume is unchanged either way."),
+		ECVF_Default);
+
+	/** Brightness of a posed after-image on M_TraceNeon. Above the smear, below the clipping point. */
+	float GGhostGlow = 2.60f;
+
+	FAutoConsoleVariableRef CVarGhostGlow(
+		TEXT("Trace.Trail.GhostGlow"),
+		GGhostGlow,
+		TEXT("Emissive strength of the posed-Mannequin after-images (spec v4 2). Above ~3.5 the team "
+		     "colour clips to white and you can no longer tell whose trace it is."),
+		ECVF_Default);
 
 	/** Oldest after-images dim to this fraction of full glow. Never to zero: they are still lethal. */
 	constexpr float GhostOldestGlowScale = 0.55f;
@@ -209,6 +325,74 @@ namespace
 			return 0.0;
 		}
 		return FMath::Clamp(FVector::DotProduct(P - A, Segment) / LengthSquared, 0.0, 1.0);
+	}
+
+	// =============================================================================================
+	// GHOST KNOBS: UTraceSettings is the authority, the CVars are overrides
+	//
+	// Every value above shipped as a console variable only, which meant the five after-image dials
+	// were invisible to the settings panel the user actually tunes from — a dead knob on the page
+	// and a live one on the console is worse than either alone, because the page lies.
+	//
+	// So each dial is resolved at the point of use: the UTraceSettings property wins, UNLESS the
+	// CVar has been explicitly set at runtime or from an ini (SetBy above Constructor), in which
+	// case a measurement run's pin wins. Same pattern as ATraceCore's mode-B tuning and as
+	// GTraceLifetimeOverride, and it is read fresh every time so PIE edits land immediately.
+	//
+	// Property names are matched here at COMPILE time, not by reflection, so a rename that misses
+	// one half fails the build instead of silently falling back to the CVar default.
+	// =============================================================================================
+
+	/** True once something other than the C++ default has written this CVar. */
+	bool IsCVarOverridden(const TCHAR* Name)
+	{
+		const IConsoleVariable* Console = IConsoleManager::Get().FindConsoleVariable(Name);
+		if (Console == nullptr)
+		{
+			return false;
+		}
+		const uint32 SetBy = static_cast<uint32>(Console->GetFlags()) & static_cast<uint32>(ECVF_SetByMask);
+		return SetBy > static_cast<uint32>(ECVF_SetByConstructor);
+	}
+
+	float ResolvedGhostSpacing()
+	{
+		const float Value = IsCVarOverridden(TEXT("Trace.Trail.GhostSpacing"))
+			? GGhostSpacing
+			: UTraceSettings::Get().TraceGhostSpacingUU;
+		return FMath::Max(20.f, Value);
+	}
+
+	int32 ResolvedMaxGhosts()
+	{
+		const int32 Value = IsCVarOverridden(TEXT("Trace.Trail.GhostMaxCount"))
+			? GMaxPoseGhosts
+			: UTraceSettings::Get().MaxTraceGhosts;
+		return FMath::Clamp(Value, 0, 64);
+	}
+
+	float ResolvedGhostGlow()
+	{
+		const float Value = IsCVarOverridden(TEXT("Trace.Trail.GhostGlow"))
+			? GGhostGlow
+			: UTraceSettings::Get().TraceGhostGlow;
+		return FMath::Max(0.f, Value);
+	}
+
+	float ResolvedSmearGlowScale()
+	{
+		const float Value = IsCVarOverridden(TEXT("Trace.Trail.SmearGlowScale"))
+			? GSmearGlowScale
+			: UTraceSettings::Get().TraceSmearGlowScale;
+		return FMath::Clamp(Value, 0.02f, 4.f);
+	}
+
+	int32 ResolvedGhostForcedLOD()
+	{
+		const int32 Value = IsCVarOverridden(TEXT("Trace.Trail.GhostForcedLOD"))
+			? GGhostForcedLOD
+			: UTraceSettings::Get().TraceGhostForcedLOD;
+		return FMath::Clamp(Value, 0, 4);
 	}
 }
 
@@ -236,11 +420,10 @@ UTraceTrailComponent::UTraceTrailComponent()
 		CylinderMesh = CylinderFinder.Object;
 	}
 
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> SphereFinder(TEXT("/Engine/BasicShapes/Sphere.Sphere"));
-	if (SphereFinder.Succeeded())
-	{
-		SphereMesh = SphereFinder.Object;
-	}
+	// (The sphere that used to be the after-image's head is gone with the per-point silhouette. The
+	// smear's head band runs ALONG a segment, so it wants a tube, not a ball: a stretched sphere's
+	// rounded ends would leave a visible pinch at every joint in exactly the element whose job is to
+	// be an unbroken line at eye height.)
 
 	// The trace is drawn on the arena's own unlit neon material, NOT on BasicShapeMaterial.
 	//
@@ -768,7 +951,8 @@ void UTraceTrailComponent::ClearTrail()
 
 void UTraceTrailComponent::MulticastClearTrail_Implementation()
 {
-	HideGhostsFrom(0);
+	HideSmearFrom(0);
+	ClearGhostRecords();
 
 	LastVisualPointCount = -1;
 	LastVisualHead = FVector::ZeroVector;
@@ -1341,26 +1525,74 @@ ATraceCharacter* UTraceTrailComponent::GetOwnerCharacter() const
 // Visuals (client + listen server)
 //
 // SPEC §3: "a blur created where your character model has passed through".
+// SPEC v4 §2: "change the look of the trace to match the new mannequin models, rather than the old
+// cylinder models."
 //
-// The previous implementation extruded one continuous wall between consecutive points, with a hot
-// strip along its top edge. It was readable, but it read as a fence — a solid barrier the carrier
-// had built — which is the wrong mental model for a thing you are supposed to run at and dash
-// through, and it is not what the design doc asks for.
+// TWO LAYERS, BOTH DERIVED FROM THE SAME LETHAL POINT SET.
 //
-// What is drawn now is a chain of CHARACTER-SHAPED after-images: at every trail point, a coarse
-// three-part silhouette (legs / torso / head) oriented along the direction of travel, fading with
-// age. Consecutive points are 60uu apart and each silhouette is deeper than that along its own axis,
-// so they overlap into a continuous smear rather than a dotted line of statues — which is what makes
-// it read as motion blur instead of as a crowd.
+// LAYER 1 — THE GHOSTS. Every GhostSpacing uu along the path, a UPoseableMeshComponent wearing the
+// holder's own Mannequin is frozen at the pose the holder was actually in and left standing there,
+// rendered on the unlit neon material in the team colour. This is the literal reading of the design
+// language and it is what the player actually looks at: it is unmistakably a person, so "somebody
+// ran through here" is legible at a glance instead of inferred from a shape.
+//
+// LAYER 2 — THE SMEAR. Along every lethal SEGMENT, a two-part body-shaped extrusion (body + a hot
+// head band) at roughly half the ghosts' brightness. Two jobs, in this order of importance:
+//
+//   (a) IT KEEPS THE DRAWING CONTINUOUS WHERE THE GHOSTS ARE DISCRETE. This is not decoration. The
+//       kill volume is a continuous swept polyline; the ghosts are ~220uu apart. If the gaps between
+//       them were empty a player would look at one, reasonably conclude they could run it, and die —
+//       and the trip test is the mechanic the whole game turns on. The smear is drawn from the same
+//       ComputeLastLethalIndex() polyline the server kills with, at the same TrailRadius/TrailHeight,
+//       one element per segment with a TrailRadius overlap at interior joints so the outside of a
+//       corner is covered. There is no gap anywhere along the lethal set. See RebuildSmear().
+//   (b) It is what makes the thing a BLUR rather than a row of statues.
+//
+// WHY POSEABLE, AND WHY NOT ONE PER POINT. A trail point every 60uu for 2s is ~27 points; a skeletal
+// mesh component per point would be 27 anim-graph evaluations per trace per frame for a set of poses
+// that are frozen by definition. UPoseableMeshComponent has no anim instance at all: the bones are
+// written once by CopyPoseFromSkeletalComponent, RefreshBoneTransforms is called once by hand, tick
+// is then disabled, and the component is a plain static skinned draw for the rest of its life.
+// Sampling every 220uu instead of every 60uu takes the count from 27 to ~8 at a walk. Measured
+// component counts are in EnsurePoseGhost / MaxPooledSmearElements.
 //
 // Two properties were preserved deliberately, because both were measured and both are load-bearing:
 //
-//   1. The silhouette spans EXACTLY the lethal volume (TrailRadius wide, TrailHeight tall, centred
-//      on the point). What you dash at is what kills you.
-//   2. The HEAD is the hottest part, and it sits at first-person eye height. A previous pass
-//      established that a trace has to be readable from a player's own eyeline at range; a bright
-//      element at that height is the feature that survives the projection when everything else
-//      collapses edge-on.
+//   1. The smear spans EXACTLY the lethal volume (TrailRadius wide, TrailHeight tall, along the
+//      lethal polyline). What you dash at is what kills you.
+//   2. The HEAD band is the hottest part of the smear, and it sits at first-person eye height. A
+//      previous pass established that a trace has to be readable from a player's own eyeline at
+//      range; a bright element at that height is the feature that survives the projection when
+//      everything else collapses edge-on. The mannequins do not replace it — a mannequin seen
+//      edge-on at 6000uu is two pixels — so it stays.
+//
+// WHERE VISUAL AND COLLISION DO NOT AGREE EXACTLY, stated plainly rather than buried:
+//   * THE SMEAR NO LONGER SPANS THE FULL HEIGHT OF THE KILL VOLUME, WHILE GHOSTS ARE ON. It draws
+//     the bottom 38% at the exact lethal width, plus a thin ribbon at eye height, and leaves
+//     72-162uu open so the opaque mannequins are not buried inside it (see the cross-section
+//     constants for the screenshot that forced this). Horizontally and along the path it is still
+//     exactly the lethal set, which is what a dash is judged against; vertically, 72-162uu is
+//     covered by the after-images alone and between two of them there is a body-shaped hole in the
+//     middle of the column. A player cannot use it — the trip test's vertical threshold is 95 plus
+//     their own 88uu capsule half-height, so anything short of leaving the ground entirely is still
+//     inside it — but it IS a place where the drawing is thinner than the rule.
+//
+//     WITH GHOSTS OFF THE HOLE CLOSES. RebuildSmear() spans the body band over the full lethal
+//     height whenever AreCharacterGhostsEnabled() is false, because the hole is only ever safe when
+//     there are mannequins standing in it. That covers both reachable cases — missing character art
+//     or a material without MATUSAGE_SkeletalMesh, and MaxTraceGhosts set to 0, which the settings
+//     panel advertises as "0 = smear only". Dimming alone would have left that setting drawing a
+//     trace with a body-shaped gap through the middle of it.
+//   * The GHOSTS are a person-shaped mesh standing inside a cylinder-shaped kill volume, so the
+//     lethal volume is strictly WIDER than a mannequin's arms and legs. That is the safe direction
+//     (you die slightly before you touch the silhouette, never after), and the floor band draws the
+//     true width continuously underneath, so the boundary is never invisible.
+//   * A ghost's POSE is snapshotted when it is placed, which is up to one TrailRadius of travel
+//     (~0.06s at 800uu/s) after the point it stands on was laid. Its position is the point's; only
+//     the limb positions are that fraction of a second late.
+//   * On a segment where the holder changed height (a jump), the smear covers the union of both
+//     ends' vertical bands rather than the exact lerp, so it over-draws by at most half the height
+//     change at the segment ends. Over-drawing a lethal boundary is the safe direction.
 // =================================================================================================
 
 void UTraceTrailComponent::UpdateVisuals()
@@ -1429,36 +1661,25 @@ void UTraceTrailComponent::RebuildVisuals()
 	// point array — so a player can never be shown a segment that would not have killed them.
 	// ComputeLastLethalIndex() is the same function the server's trip test runs off, and it reads
 	// only replicated state, so this client's answer is the server's answer.
-	const int32 PointCount = ComputeLastLethalIndex() + 1;
-	if (PointCount <= 0 || CylinderMesh == nullptr)
+	const int32 LethalPointCount = ComputeLastLethalIndex() + 1;
+	if (LethalPointCount <= 0)
 	{
-		HideGhostsFrom(0);
+		HideSmearFrom(0);
+		ClearGhostRecords();
 		return;
 	}
 
 	CacheMeshMetrics();
-
-	const UTraceSettings& Settings = UTraceSettings::Get();
-
-	// The silhouette is derived from the lethal volume, never chosen. If TrailRadius/TrailHeight are
-	// retuned the after-image moves with them.
-	const double Width = FMath::Max(1.0, 2.0 * static_cast<double>(Settings.TrailRadius));
-	const double Height = FMath::Max(1.0, static_cast<double>(Settings.TrailHeight));
-	const double HalfHeight = Height * 0.5;
-	const double Spacing = FMath::Max(1.0, static_cast<double>(Settings.TrailPointSpacing));
-
-	// Depth along the direction of travel. Kept above the point spacing so consecutive after-images
-	// interpenetrate and the chain reads as one smear rather than as separate figures.
-	const double Depth = FMath::Max(Width * 0.62, Spacing * 1.35);
-
-	const float Lifetime = GetTraceLifetimeSeconds();
-	const float Now = GetServerTimeSeconds();
 
 	// v3 §3: the parry's brightness step, ABOVE the pass window's, and checked first so that a parry
 	// raised during a pass window still reads as a parry. The colour half of the same state is
 	// applied in UpdateTeamColor(); the two are driven by the same predicate so they cannot
 	// disagree — a red trace at pass-window brightness (or a cyan one at parry brightness) would be
 	// a state the player has no name for.
+	//
+	// It is passed to BOTH layers. The parry reddens and brightens the ENTIRE trace (v3 §3), and
+	// "entire" now includes the mannequins — a red smear under white-hot ghosts would be a third
+	// state nobody has a name for.
 	float InvulnerableScale = 1.f;
 	if (IsParryVisuallyActive())
 	{
@@ -1483,7 +1704,11 @@ void UTraceTrailComponent::RebuildVisuals()
 	// holder cannot, and the LETHAL VOLUME IS UNTOUCHED: trip resolution runs off TrailPoints, never
 	// off what happens to be rendered. A holder cannot trip their own trace anyway, so nothing is
 	// being hidden that its owner could act on.
-	int32 FirstOwnerHiddenPoint = PointCount;   // == PointCount means "hide nothing"
+	//
+	// It applies to the mannequin ghosts for the same reason and by the same rule: a posed copy of
+	// YOURSELF, hot, 100uu from your own third-person lens is the single worst version of the
+	// whiteout this exists to prevent.
+	int32 FirstOwnerHiddenPoint = LethalPointCount;   // == LethalPointCount means "hide nothing"
 	if (const ATraceCharacter* OwnerCharacter = GetOwnerCharacter())
 	{
 		const APlayerController* OwnerPC = Cast<APlayerController>(OwnerCharacter->GetController());
@@ -1491,7 +1716,7 @@ void UTraceTrailComponent::RebuildVisuals()
 		{
 			double DistanceFromHead = 0.0;
 			FirstOwnerHiddenPoint = 0;
-			for (int32 Index = PointCount - 1; Index >= 0; --Index)
+			for (int32 Index = LethalPointCount - 1; Index >= 0; --Index)
 			{
 				if (DistanceFromHead >= static_cast<double>(FMath::Max(0.f, GOwnerNearHideDistance)))
 				{
@@ -1506,93 +1731,144 @@ void UTraceTrailComponent::RebuildVisuals()
 		}
 	}
 
-	// If there are more points than the pool can draw, drop the OLDEST. UTraceSettings::MaxTrailPoints
-	// is 256 and the pool caps at 96, so this is reachable if the point spacing is ever lowered — and
-	// truncating from the wrong end would hide the freshest stretch of the trace, which is the part
-	// an approaching enemy is judging and the part nearest the holder. The tail simply fades early.
-	const int32 FirstDrawnPoint = FMath::Max(0, PointCount - MaxPooledGhosts);
+	RebuildSmear(LethalPointCount, FirstOwnerHiddenPoint, InvulnerableScale);
+	RebuildPoseGhosts(LethalPointCount, FirstOwnerHiddenPoint, InvulnerableScale);
+}
 
-	int32 PlacedGhosts = 0;
+// -------------------------------------------------------------------------------------------------
+// LAYER 2 (drawn first, read second): THE CONTINUOUS SMEAR.
+//
+// ONE ELEMENT PER LETHAL SEGMENT, spanning that segment exactly. This is the part of the visual that
+// is allowed to make a promise about where the kill volume is, so it is built the same way the trip
+// test evaluates it: along the polyline TrailPoints[0..LastLethal], TrailRadius to either side,
+// TrailHeight tall. Interior joints get one TrailRadius of overlap at each end, which fills the wedge
+// on the outside of a corner; the two OUTER ends get none, so the smear never extends past the first
+// or last lethal point into trace that would not kill.
+// -------------------------------------------------------------------------------------------------
 
-	for (int32 PointIndex = FirstDrawnPoint; PointIndex < PointCount; ++PointIndex)
+void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, int32 FirstOwnerHiddenPoint, float InvulnerableScale)
+{
+	if (CylinderMesh == nullptr || LethalPointCount <= 0)
 	{
-		if (!EnsureGhost(PlacedGhosts))
+		HideSmearFrom(0);
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// Derived from the lethal volume, never chosen. If TrailRadius/TrailHeight are retuned the smear
+	// moves with them, because it is the drawn statement of where they are.
+	const double Width = FMath::Max(1.0, 2.0 * static_cast<double>(Settings.TrailRadius));
+	const double Height = FMath::Max(1.0, static_cast<double>(Settings.TrailHeight));
+	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
+
+	// THE SMEAR STEPS OUT OF THE MANNEQUINS' WAY ONLY WHEN THERE ARE MANNEQUINS — and that has to
+	// govern the GEOMETRY, not just the brightness.
+	//
+	// The body band normally covers the bottom 38% of the lethal height and the head ribbon sits at
+	// eye level, leaving 72-162uu open so the opaque mannequins are not buried inside an opaque
+	// slab. That hole is only safe because the after-images fill it. With ghosts off there is
+	// nothing to fill it, and dimming alone would leave a trace with a body-shaped gap through the
+	// middle of the column — on the one mechanic the whole game turns on.
+	//
+	// Ghosts are off in two reachable cases, neither of them exotic: no character art / no
+	// skeletal-capable material (a packaged build that missed MATUSAGE_SkeletalMesh), and
+	// UTraceSettings::MaxTraceGhosts set to 0, which the settings panel offers as "0 = smear only".
+	// "Smear only" has to mean a solid trace, so in that case the body band spans the FULL lethal
+	// height at full strength: the pre-v4 look, and perfectly playable.
+	const bool bGhostsOn = AreCharacterGhostsEnabled();
+	const float LayerScale = bGhostsOn ? ResolvedSmearGlowScale() : 1.f;
+
+	const double BodyCentreFrac = bGhostsOn ? SmearBodyCentreFrac : 0.5;
+	const double BodyHeightFrac = bGhostsOn ? SmearBodyHeightFrac : 1.0;
+
+	const float Lifetime = GetTraceLifetimeSeconds();
+	const float Now = GetServerTimeSeconds();
+
+	// A one-point trace is a real, lethal, degenerate segment (SweepIntersectsTrace tests it as one),
+	// so it gets one stub element rather than nothing at all.
+	const int32 SegmentCount = FMath::Max(1, LethalPointCount - 1);
+
+	// If there are more segments than the pool can draw, drop the OLDEST. Truncating from the wrong
+	// end would hide the freshest stretch — the part an approaching enemy is judging.
+	const int32 FirstSegment = FMath::Max(0, SegmentCount - MaxPooledSmearElements);
+
+	int32 Placed = 0;
+
+	for (int32 SegmentIndex = FirstSegment; SegmentIndex < SegmentCount; ++SegmentIndex)
+	{
+		if (!EnsureSmearElement(Placed))
 		{
 			break;   // Pool cap hit — draw what we have.
 		}
 
-		const FVector Centre = TrailPoints.Items[PointIndex].Location;
+		const FVector SegStart = TrailPoints.Items[SegmentIndex].Location;
+		const FVector SegEnd = (LethalPointCount > 1)
+			? FVector(TrailPoints.Items[SegmentIndex + 1].Location)
+			: SegStart;
 
-		// Facing: the direction the holder was travelling when this after-image was left. Taken from
-		// the segment that ENDS here where one exists, so the first point borrows the second's.
-		FVector Along = FVector::ZeroVector;
-		if (PointIndex > 0)
-		{
-			Along = Centre - FVector(TrailPoints.Items[PointIndex - 1].Location);
-		}
-		else if (PointCount > 1)
-		{
-			Along = FVector(TrailPoints.Items[1].Location) - Centre;
-		}
+		FVector Along = SegEnd - SegStart;
 		Along.Z = 0.0;
-		const FRotator Facing = (Along.SizeSquared() > 1.0) ? Along.GetSafeNormal().Rotation() : FRotator::ZeroRotator;
+		const double PlanarLength = Along.Size();
+		const FVector Direction = (PlanarLength > 1.0) ? (Along / PlanarLength) : FVector::ZeroVector;
+		const FRotator Facing = (PlanarLength > 1.0) ? Direction.Rotation() : FRotator::ZeroRotator;
 
-		// Age fade. Never to zero: an old after-image is exactly as lethal as a new one, so it has
-		// to stay clearly visible — this is a "cooling" cue, not a disappearance.
-		const float Age = FMath::Max(0.f, Now - TrailPoints.Items[PointIndex].BirthServerTime);
+		// Overlap at INTERIOR joints only. The two ends of the whole trace stay flush with the first
+		// and last lethal point, so nothing is drawn beyond the polyline the server kills along.
+		const double BackOverlap = (SegmentIndex > FirstSegment) ? JointOverlap : 0.0;
+		const double ForwardOverlap = (SegmentIndex + 1 < LethalPointCount - 1) ? JointOverlap : 0.0;
+
+		// The floor is one full body width, so a one-point (degenerate but lethal) trace draws a
+		// blob you can see rather than a sliver you cannot.
+		const double ElementLength = FMath::Max(Width, PlanarLength + BackOverlap + ForwardOverlap);
+		const FVector ElementCentre = (SegStart + SegEnd) * 0.5
+			+ Direction * ((ForwardOverlap - BackOverlap) * 0.5);
+
+		// A segment the holder JUMPED along is lethal over a band that slides from one end's height to
+		// the other's. Covering the union of the two bands over-draws by at most half the height change
+		// at the segment's ends, which is the safe direction: the boundary is never drawn smaller than
+		// it is.
+		const double SpanHeight = Height + FMath::Abs(SegEnd.Z - SegStart.Z);
+
+		// Age from the NEWER endpoint: a segment is as young as its leading edge.
+		const float Age = FMath::Max(0.f, Now - TrailPoints.Items[FMath::Min(SegmentIndex + 1, LethalPointCount - 1)].BirthServerTime);
 		const float Remaining = FMath::Clamp(1.f - (Age / FMath::Max(0.01f, Lifetime)), 0.f, 1.f);
 		const float FadeScale = FMath::Lerp(GhostOldestGlowScale, 1.f, Remaining);
 
-		const bool bHideFromOwner = (PointIndex >= FirstOwnerHiddenPoint);
+		const bool bHideFromOwner = ((SegmentIndex + 1) >= FirstOwnerHiddenPoint);
 
-		for (int32 Part = 0; Part < PartsPerGhost; ++Part)
+		for (int32 Part = 0; Part < PartsPerSmear; ++Part)
 		{
-			UStaticMeshComponent* Piece = GhostMeshes[PlacedGhosts * PartsPerGhost + Part];
+			const int32 SlotIndex = Placed * PartsPerSmear + Part;
+			UStaticMeshComponent* Piece = SmearMeshes[SlotIndex];
 			if (Piece == nullptr)
 			{
 				continue;
 			}
 
-			double CentreFrac = GhostTorsoCentreFrac;
-			double HeightFrac = GhostTorsoHeightFrac;
-			double WidthFrac = GhostTorsoWidthFrac;
-			float BaseGlow = GhostTorsoGlow;
-
-			if (Part == PartLegs)
-			{
-				CentreFrac = GhostLegCentreFrac;
-				HeightFrac = GhostLegHeightFrac;
-				WidthFrac = GhostLegWidthFrac;
-				BaseGlow = GhostLegGlow;
-			}
-			else if (Part == PartHead)
-			{
-				CentreFrac = GhostHeadCentreFrac;
-				HeightFrac = GhostHeadHeightFrac;
-				WidthFrac = GhostHeadWidthFrac;
-				BaseGlow = GhostHeadGlow;
-			}
-
 			const bool bIsHead = (Part == PartHead);
-			const FVector& MeshHalfSize = bIsHead ? SphereHalfSize : CylinderHalfSize;
-			const FVector& MeshPivot = bIsHead ? SpherePivotOffset : CylinderPivotOffset;
+			const double CentreFrac = bIsHead ? SmearHeadCentreFrac : BodyCentreFrac;
+			const double HeightFrac = bIsHead ? SmearHeadHeightFrac : BodyHeightFrac;
+			const double WidthFrac = bIsHead ? SmearHeadWidthFrac : SmearBodyWidthFrac;
+			const float BaseGlow = (bIsHead ? SmearHeadGlow : SmearBodyGlow) * LayerScale;
 
 			const FVector DesiredSize(
-				Depth * WidthFrac,
+				ElementLength,
 				Width * WidthFrac,
-				Height * HeightFrac);
+				SpanHeight * HeightFrac);
 
 			const FVector Scale(
-				DesiredSize.X / (2.0 * MeshHalfSize.X),
-				DesiredSize.Y / (2.0 * MeshHalfSize.Y),
-				DesiredSize.Z / (2.0 * MeshHalfSize.Z));
+				DesiredSize.X / (2.0 * CylinderHalfSize.X),
+				DesiredSize.Y / (2.0 * CylinderHalfSize.Y),
+				DesiredSize.Z / (2.0 * CylinderHalfSize.Z));
 
-			// Measured from the BOTTOM of the lethal volume, so the three parts tile it exactly.
-			const FVector PartCentre = Centre + FVector(0.0, 0.0, -HalfHeight + Height * CentreFrac);
+			// Measured from the BOTTOM of the lethal band, so the two parts tile it exactly.
+			const FVector PartCentre = ElementCentre
+				+ FVector(0.0, 0.0, -SpanHeight * 0.5 + SpanHeight * CentreFrac);
 
 			// Corrects for a source mesh whose pivot is not at its bounds centre, so we never have
 			// to assume anything about the engine primitives' authoring.
-			const FVector PivotCorrection = Facing.RotateVector(MeshPivot * Scale);
+			const FVector PivotCorrection = Facing.RotateVector(CylinderPivotOffset * Scale);
 
 			Piece->SetWorldLocationAndRotation(PartCentre - PivotCorrection, Facing);
 			Piece->SetWorldScale3D(Scale);
@@ -1607,31 +1883,311 @@ void UTraceTrailComponent::RebuildVisuals()
 			// The intended brightness of this piece, BEFORE the camera-proximity fade. Recorded rather
 			// than pushed directly, because ApplyProximityGlowFade() runs every frame and needs to
 			// know what full brightness means for this piece without re-deriving the whole rebuild.
-			const int32 SlotIndex = PlacedGhosts * PartsPerGhost + Part;
-			if (GhostBaseGlow.Num() <= SlotIndex)
+			if (SmearBaseGlow.Num() <= SlotIndex)
 			{
-				GhostBaseGlow.SetNumZeroed(SlotIndex + 1);
-				GhostAppliedGlowScale.SetNumZeroed(SlotIndex + 1);
+				SmearBaseGlow.SetNumZeroed(SlotIndex + 1);
+				SmearAppliedGlowScale.SetNumZeroed(SlotIndex + 1);
 			}
-			GhostBaseGlow[SlotIndex] = BaseGlow * FadeScale * InvulnerableScale;
+			SmearBaseGlow[SlotIndex] = BaseGlow * FadeScale * InvulnerableScale;
 
 			if (bTrailMaterialIsNeon)
 			{
-				if (UMaterialInstanceDynamic* Material = GhostMaterials[SlotIndex])
+				if (UMaterialInstanceDynamic* Material = SmearMaterials[SlotIndex])
 				{
 					// Push full brightness and let the proximity pass pull it down. Resetting the
 					// remembered scale forces that pass to re-evaluate this piece, which it must:
 					// the piece has just been moved somewhere else entirely.
-					Material->SetScalarParameterValue(TEXT("Glow"), GhostBaseGlow[SlotIndex]);
-					GhostAppliedGlowScale[SlotIndex] = 1.f;
+					Material->SetScalarParameterValue(TEXT("Glow"), SmearBaseGlow[SlotIndex]);
+					SmearAppliedGlowScale[SlotIndex] = 1.f;
 				}
 			}
 		}
 
-		++PlacedGhosts;
+		++Placed;
 	}
 
-	HideGhostsFrom(PlacedGhosts);
+	HideSmearFrom(Placed);
+}
+
+// -------------------------------------------------------------------------------------------------
+// LAYER 1: THE POSED MANNEQUIN AFTER-IMAGES (spec v4 §2).
+//
+// The pool is a DEQUE aligned index-for-index with GhostRecords: PoseGhosts[i] holds the pose of
+// GhostRecords[i], and anything past GhostRecords.Num() is a free, hidden component waiting to be
+// re-posed. Retiring the oldest ghost therefore rotates its component to the BACK of the pool rather
+// than shifting every record onto a different component — which matters, because the pose lives in
+// the component and a shift would silently re-pair every surviving record with somebody else's pose.
+//
+// A ghost is created only when the head of the LETHAL polyline has moved GhostSpacing uu clear of the
+// last one, and retired the instant its BirthServerTime falls off the back of TrailPoints. Both
+// endpoints of the ghost chain are therefore pinned to the point array, so the after-images can never
+// extend past the trace, outlive it, or survive a turnover.
+// -------------------------------------------------------------------------------------------------
+
+void UTraceTrailComponent::RebuildPoseGhosts(int32 LethalPointCount, int32 FirstOwnerHiddenPoint, float InvulnerableScale)
+{
+	if (!AreCharacterGhostsEnabled() || LethalPointCount <= 0)
+	{
+		ClearGhostRecords();
+		return;
+	}
+
+	// --- 0. The pool is skinned to ONE asset -----------------------------------------------------
+	//
+	// ATraceCharacter resolves its Mannequin lazily and falls back to a primitive stand-in when the
+	// import is missing, so "which mesh am I" can change after this component has already built
+	// ghosts. A pool skinned to the previous asset would keep drawing the wrong body, so it is torn
+	// down and rebuilt rather than reused.
+	if (USkeletalMeshComponent* CurrentSource = GetGhostSourceMesh())
+	{
+		if (PoseGhosts.Num() > 0 && GhostSkinnedAsset.Get() != CurrentSource->GetSkinnedAsset())
+		{
+			for (UPoseableMeshComponent* Stale : PoseGhosts)
+			{
+				if (Stale != nullptr)
+				{
+					Stale->DestroyComponent();
+				}
+			}
+			PoseGhosts.Reset();
+			PoseGhostMaterials.Reset();
+			PoseGhostBaseGlow.Reset();
+			PoseGhostAppliedGlowScale.Reset();
+			GhostRecords.Reset();
+		}
+	}
+
+	const float Now = GetServerTimeSeconds();
+	const float Lifetime = GetTraceLifetimeSeconds();
+
+	// --- 1. Retire ------------------------------------------------------------------------------
+	//
+	// A ghost dies exactly when the stretch of trace it stands on does. Comparing birth times against
+	// the OLDEST SURVIVING POINT (rather than running an independent lifetime here) means the ghost
+	// chain and the lethal polyline are trimmed by one decision made in one place — the server's
+	// expiry loop in ServerUpdateTrail — so they cannot end up ending in different places.
+	const float OldestPointBirth = TrailPoints.Items[0].BirthServerTime;
+
+	int32 RetireCount = 0;
+	while (RetireCount < GhostRecords.Num()
+		&& GhostRecords[RetireCount].BirthServerTime < OldestPointBirth - 0.001f)
+	{
+		++RetireCount;
+	}
+
+	// --- 2. Make room for a new one -------------------------------------------------------------
+	const int32 MaxGhosts = ResolvedMaxGhosts();
+
+	const int32 LastLethalIndex = LethalPointCount - 1;
+	const FVector HeadLocation = TrailPoints.Items[LastLethalIndex].Location;
+
+	const double Spacing = static_cast<double>(ResolvedGhostSpacing());
+	const bool bWantNew = (GhostRecords.Num() - RetireCount) <= 0
+		|| FVector::Dist(GhostRecords.Last().PathLocation, HeadLocation) >= Spacing;
+
+	if (bWantNew && (GhostRecords.Num() - RetireCount) >= MaxGhosts)
+	{
+		// At the cap the OLDEST goes, never the newest: the fresh end of the trace is the end an
+		// approaching enemy is judging, and the smear still covers the tail either way.
+		RetireCount = FMath::Min(GhostRecords.Num(), RetireCount + 1);
+	}
+
+	if (RetireCount > 0)
+	{
+		// Rotate the retired components to the back of the pool, keeping record <-> component pairing
+		// intact for every survivor. Bounded by MaxGhosts (<= 64) so the shifting is trivial.
+		for (int32 Rotation = 0; Rotation < RetireCount; ++Rotation)
+		{
+			if (PoseGhosts.Num() > 0)
+			{
+				UPoseableMeshComponent* Recycled = PoseGhosts[0];
+				if (Recycled != nullptr)
+				{
+					Recycled->SetVisibility(false);
+				}
+				PoseGhosts.RemoveAt(0);
+				PoseGhosts.Add(Recycled);
+			}
+			if (PoseGhostMaterials.Num() > 0)
+			{
+				UMaterialInstanceDynamic* RecycledMaterial = PoseGhostMaterials[0];
+				PoseGhostMaterials.RemoveAt(0);
+				PoseGhostMaterials.Add(RecycledMaterial);
+			}
+			if (PoseGhostBaseGlow.Num() > 0)
+			{
+				PoseGhostBaseGlow.RemoveAt(0);
+				PoseGhostBaseGlow.Add(0.f);
+			}
+			if (PoseGhostAppliedGlowScale.Num() > 0)
+			{
+				PoseGhostAppliedGlowScale.RemoveAt(0);
+				PoseGhostAppliedGlowScale.Add(1.f);
+			}
+		}
+
+		GhostRecords.RemoveAt(0, RetireCount);
+	}
+
+	// --- 3. Drop a new after-image ---------------------------------------------------------------
+	if (bWantNew && GhostRecords.Num() < MaxGhosts)
+	{
+		USkeletalMeshComponent* SourceMesh = GetGhostSourceMesh();
+		const ATraceCharacter* OwnerCharacter = GetOwnerCharacter();
+		const int32 NewIndex = GhostRecords.Num();
+
+		if (SourceMesh != nullptr && OwnerCharacter != nullptr && EnsurePoseGhost(NewIndex))
+		{
+			FTraceGhostRecord Record;
+			Record.BirthServerTime = TrailPoints.Items[LastLethalIndex].BirthServerTime;
+			Record.PathLocation = HeadLocation;
+
+			// The ghost stands on the TRAIL POINT, wearing the mesh's offset from its actor. The
+			// point is an actor location and so is GetActorLocation(), so the difference is exactly
+			// the mesh's placement on the capsule (feet on the capsule bottom, yaw -90) with no
+			// assumption about either constant baked in here.
+			const FTransform SourceTransform = SourceMesh->GetComponentTransform();
+			const FVector MeshOffset = SourceTransform.GetLocation() - OwnerCharacter->GetActorLocation();
+
+			Record.MeshTransform = FTransform(
+				SourceTransform.GetRotation(),
+				HeadLocation + MeshOffset,
+				SourceTransform.GetScale3D());
+
+			if (UPoseableMeshComponent* Ghost = PoseGhosts[NewIndex])
+			{
+				Ghost->SetWorldTransform(Record.MeshTransform);
+
+				// The whole cost of a ghost, paid once: copy the bones, evaluate them once by hand,
+				// and never touch it again. RefreshBoneTransforms is normally driven from the
+				// component's own tick; calling it here is what lets that tick stay switched off.
+				Ghost->CopyPoseFromSkeletalComponent(SourceMesh);
+				Ghost->RefreshBoneTransforms(nullptr);
+
+				Record.bPosed = true;
+			}
+
+			GhostRecords.Add(Record);
+		}
+	}
+
+	// --- 4. Colour, brightness, visibility --------------------------------------------------------
+	for (int32 GhostIndex = 0; GhostIndex < GhostRecords.Num(); ++GhostIndex)
+	{
+		if (!PoseGhosts.IsValidIndex(GhostIndex))
+		{
+			break;
+		}
+
+		UPoseableMeshComponent* Ghost = PoseGhosts[GhostIndex];
+		if (Ghost == nullptr)
+		{
+			continue;
+		}
+
+		const FTraceGhostRecord& Record = GhostRecords[GhostIndex];
+
+		// Age fade. Never to zero: an old after-image is exactly as lethal as a new one, so it has
+		// to stay clearly visible — this is a "cooling" cue, not a disappearance.
+		const float Age = FMath::Max(0.f, Now - Record.BirthServerTime);
+		const float Remaining = FMath::Clamp(1.f - (Age / FMath::Max(0.01f, Lifetime)), 0.f, 1.f);
+		const float FadeScale = FMath::Lerp(GhostOldestGlowScale, 1.f, Remaining);
+
+		// Same rule as the smear, expressed against the same point array: a ghost is hidden from its
+		// own holder when the point it stands on is inside the near-hide window.
+		const bool bHideFromOwner = FirstOwnerHiddenPoint < LethalPointCount
+			&& Record.BirthServerTime >= TrailPoints.Items[FirstOwnerHiddenPoint].BirthServerTime;
+
+		Ghost->SetVisibility(true);
+		if (Ghost->bOwnerNoSee != bHideFromOwner)
+		{
+			Ghost->SetOwnerNoSee(bHideFromOwner);
+		}
+
+		if (PoseGhostBaseGlow.Num() <= GhostIndex)
+		{
+			PoseGhostBaseGlow.SetNumZeroed(GhostIndex + 1);
+			PoseGhostAppliedGlowScale.SetNumZeroed(GhostIndex + 1);
+		}
+		PoseGhostBaseGlow[GhostIndex] = ResolvedGhostGlow() * FadeScale * InvulnerableScale;
+
+		if (bTrailMaterialIsNeon && PoseGhostMaterials.IsValidIndex(GhostIndex))
+		{
+			if (UMaterialInstanceDynamic* Material = PoseGhostMaterials[GhostIndex])
+			{
+				Material->SetScalarParameterValue(TEXT("Glow"), PoseGhostBaseGlow[GhostIndex]);
+				PoseGhostAppliedGlowScale[GhostIndex] = 1.f;
+			}
+		}
+	}
+
+	ReleasePoseGhostsFrom(GhostRecords.Num());
+}
+
+USkeletalMeshComponent* UTraceTrailComponent::GetGhostSourceMesh() const
+{
+	const ATraceCharacter* OwnerCharacter = GetOwnerCharacter();
+	if (OwnerCharacter == nullptr)
+	{
+		return nullptr;
+	}
+
+	USkeletalMeshComponent* SourceMesh = OwnerCharacter->GetMesh();
+	if (SourceMesh == nullptr || SourceMesh->GetSkinnedAsset() == nullptr)
+	{
+		// No Mannequin on this machine (Scripts/import-mannequin.sh has not run, or the character
+		// fell back to its primitive stand-in). The smear covers for it at full brightness.
+		return nullptr;
+	}
+
+	return SourceMesh;
+}
+
+bool UTraceTrailComponent::AreCharacterGhostsEnabled() const
+{
+	if (ResolvedMaxGhosts() <= 0)
+	{
+		return false;
+	}
+
+	if (GetGhostSourceMesh() == nullptr)
+	{
+		return false;
+	}
+
+	// ------------------------------------------------------------------------------------------
+	// THE MATERIAL GATE, and why it is a hard one.
+	//
+	// A material without MATUSAGE_SkeletalMesh is not "a bit wrong" on a skinned draw: the renderer
+	// silently substitutes the engine's default grey checkerboard, because the skeletal vertex
+	// factory permutation of its shader was never compiled. That would put a herd of untinted grey
+	// mannequins on the pitch in place of a trace — strictly worse than having no ghosts at all, and
+	// worse still because it would look like a bug in the trace rather than a missing flag.
+	//
+	// The editor normally repairs this on first use, but ONLY when it is not running as a game
+	// (UMaterial::SetMaterialUsage checks FApp::IsGame), and every run of this project is -game. So
+	// the flag has to be saved into M_TraceNeon by Scripts/generate_content.py, and this asks rather
+	// than assumes. Logged once, at Log, because a silently-disabled feature is exactly how the last
+	// two "that mechanic is dead" false alarms happened here.
+	// ------------------------------------------------------------------------------------------
+	if (GhostMaterialState == EGhostMaterialState::Unknown)
+	{
+		UTraceTrailComponent* Mutable = const_cast<UTraceTrailComponent*>(this);
+
+		const bool bUsable = TrailMaterial != nullptr
+			&& TrailMaterial->CheckMaterialUsage_Concurrent(MATUSAGE_SkeletalMesh);
+
+		Mutable->GhostMaterialState = bUsable ? EGhostMaterialState::Usable : EGhostMaterialState::Unusable;
+
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[TRACEGHOST] Character after-images %s. material=%s skeletalUsage=%d neon=%d "
+			     "(spec v4 2: the trace is drawn as posed Mannequins; without skeletal usage on the "
+			     "trace material they are switched off and the continuous smear carries the trace alone)."),
+			bUsable ? TEXT("ENABLED") : TEXT("DISABLED"),
+			*GetNameSafe(TrailMaterial), bUsable ? 1 : 0, bTrailMaterialIsNeon ? 1 : 0);
+	}
+
+	return GhostMaterialState == EGhostMaterialState::Usable;
 }
 
 void UTraceTrailComponent::ApplyProximityGlowFade()
@@ -1659,7 +2215,7 @@ void UTraceTrailComponent::ApplyProximityGlowFade()
 	// not touch and the trip test never renders. Two players standing in the same trace see their
 	// own fade and die to exactly the same geometry.
 	// ------------------------------------------------------------------------------------------
-	if (!bTrailMaterialIsNeon || GhostMeshes.Num() == 0)
+	if (!bTrailMaterialIsNeon || (SmearMeshes.Num() == 0 && PoseGhosts.Num() == 0))
 	{
 		return;
 	}
@@ -1679,92 +2235,209 @@ void UTraceTrailComponent::ApplyProximityGlowFade()
 	}
 	const FVector CameraLocation = LocalPC->PlayerCameraManager->GetCameraLocation();
 
-	const int32 SlotCount = FMath::Min(GhostMeshes.Num(), GhostMaterials.Num());
-	for (int32 Slot = 0; Slot < SlotCount; ++Slot)
+	// Both pools take the same treatment: a posed mannequin is exactly as unlit, exactly as emissive
+	// and exactly as standable-inside as a smear slab, so exempting it would reinstate the whiteout
+	// this function exists to prevent — from the one piece of geometry now closest to the lens.
+	auto FadePool = [&CameraLocation](
+		const auto& Pieces,
+		const TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
+		const TArray<float>& BaseGlow,
+		TArray<float>& AppliedScale)
 	{
-		UStaticMeshComponent* Piece = GhostMeshes[Slot];
-		UMaterialInstanceDynamic* Material = GhostMaterials[Slot];
-		if (Piece == nullptr || Material == nullptr || !Piece->IsVisible())
+		const int32 SlotCount = FMath::Min(Pieces.Num(), Materials.Num());
+		for (int32 Slot = 0; Slot < SlotCount; ++Slot)
 		{
-			continue;
-		}
-		if (!GhostBaseGlow.IsValidIndex(Slot))
-		{
-			continue;
-		}
+			UMeshComponent* Piece = Pieces[Slot];
+			UMaterialInstanceDynamic* Material = Materials[Slot];
+			if (Piece == nullptr || Material == nullptr || !Piece->IsVisible())
+			{
+				continue;
+			}
+			if (!BaseGlow.IsValidIndex(Slot))
+			{
+				continue;
+			}
 
-		// Distance to the piece's SURFACE, not its centre: these are wide, flat slabs, and a centre
-		// distance would report a torso as far away at the exact moment its face is against the lens.
-		// The bounds are already computed for culling, so this costs nothing extra.
-		const FBoxSphereBounds& LocalBounds = Piece->Bounds;
-		const double SurfaceDistance = FMath::Max(0.0,
-			FVector::Dist(CameraLocation, LocalBounds.Origin) - LocalBounds.SphereRadius);
+			// Distance to the piece's SURFACE, not its centre: these are wide, flat slabs, and a
+			// centre distance would report a torso as far away at the exact moment its face is
+			// against the lens. The bounds are already computed for culling, so this is free.
+			const FBoxSphereBounds& LocalBounds = Piece->Bounds;
+			const double SurfaceDistance = FMath::Max(0.0,
+				FVector::Dist(CameraLocation, LocalBounds.Origin) - LocalBounds.SphereRadius);
 
-		float Scale = 1.f;
-		if (SurfaceDistance < ProximityFadeFarDistance)
-		{
-			// Smooth, so a piece does not pop as the player walks past it. The floor is not zero:
-			// an after-image you are standing inside is exactly as lethal as one across the field,
-			// and a player must still be able to see that they are in it.
-			const float T = FMath::Clamp(
-				static_cast<float>((SurfaceDistance - ProximityFadeNearDistance)
-					/ FMath::Max(1.0, ProximityFadeFarDistance - ProximityFadeNearDistance)),
-				0.f, 1.f);
-			Scale = FMath::Lerp(ProximityFadeMinScale, 1.f, FMath::InterpEaseIn(0.f, 1.f, T, 2.f));
-		}
+			float Scale = 1.f;
+			if (SurfaceDistance < ProximityFadeFarDistance)
+			{
+				// Smooth, so a piece does not pop as the player walks past it. The floor is not zero:
+				// an after-image you are standing inside is exactly as lethal as one across the
+				// field, and a player must still be able to see that they are in it.
+				const float T = FMath::Clamp(
+					static_cast<float>((SurfaceDistance - ProximityFadeNearDistance)
+						/ FMath::Max(1.0, ProximityFadeFarDistance - ProximityFadeNearDistance)),
+					0.f, 1.f);
+				Scale = FMath::Lerp(ProximityFadeMinScale, 1.f, FMath::InterpEaseIn(0.f, 1.f, T, 2.f));
+			}
 
-		// Only touch the material when the change is visible. Without this every pooled piece would
-		// dirty its render state every frame for the entire life of the trace.
-		if (!GhostAppliedGlowScale.IsValidIndex(Slot))
-		{
-			GhostAppliedGlowScale.SetNumZeroed(Slot + 1);
-		}
-		if (FMath::IsNearlyEqual(GhostAppliedGlowScale[Slot], Scale, 0.02f))
-		{
-			continue;
-		}
+			// Only touch the material when the change is visible. Without this every pooled piece
+			// would dirty its render state every frame for the entire life of the trace.
+			if (!AppliedScale.IsValidIndex(Slot))
+			{
+				AppliedScale.SetNumZeroed(Slot + 1);
+			}
+			if (FMath::IsNearlyEqual(AppliedScale[Slot], Scale, 0.02f))
+			{
+				continue;
+			}
 
-		GhostAppliedGlowScale[Slot] = Scale;
-		Material->SetScalarParameterValue(TEXT("Glow"), GhostBaseGlow[Slot] * Scale);
-	}
+			AppliedScale[Slot] = Scale;
+			Material->SetScalarParameterValue(TEXT("Glow"), BaseGlow[Slot] * Scale);
+		}
+	};
+
+	// Generic over the array's element type: TArray<TObjectPtr<UStaticMeshComponent>> and
+	// TArray<TObjectPtr<UPoseableMeshComponent>> are unrelated types, and copying either into a
+	// widened scratch array every frame to share one signature would be a real per-frame cost paid
+	// for a compile-time problem.
+	FadePool(SmearMeshes, SmearMaterials, SmearBaseGlow, SmearAppliedGlowScale);
+	FadePool(PoseGhosts, PoseGhostMaterials, PoseGhostBaseGlow, PoseGhostAppliedGlowScale);
 }
 
-bool UTraceTrailComponent::EnsureGhost(int32 GhostIndex)
+bool UTraceTrailComponent::EnsureSmearElement(int32 ElementIndex)
 {
-	if (GhostIndex < 0 || GhostIndex >= MaxPooledGhosts)
+	if (ElementIndex < 0 || ElementIndex >= MaxPooledSmearElements)
 	{
 		return false;
 	}
 
-	const int32 RequiredNum = (GhostIndex + 1) * PartsPerGhost;
-	if (GhostMeshes.Num() >= RequiredNum)
+	const int32 RequiredNum = (ElementIndex + 1) * PartsPerSmear;
+	if (SmearMeshes.Num() >= RequiredNum)
 	{
 		return true;
 	}
 
-	// The pool only ever grows one whole after-image at a time, in order, so the interleaving
-	// (legs / torso / head) can never slip.
-	if (GhostMeshes.Num() != GhostIndex * PartsPerGhost)
+	// The pool only ever grows one whole element at a time, in order, so the interleaving
+	// (body / head) can never slip.
+	if (SmearMeshes.Num() != ElementIndex * PartsPerSmear)
 	{
 		return false;
 	}
 
-	for (int32 Part = 0; Part < PartsPerGhost; ++Part)
+	for (int32 Part = 0; Part < PartsPerSmear; ++Part)
 	{
-		UStaticMesh* SourceMesh = (Part == PartHead) ? SphereMesh.Get() : CylinderMesh.Get();
-		if (SourceMesh == nullptr)
-		{
-			SourceMesh = CylinderMesh.Get();   // A missing sphere just means a blockier head.
-		}
-
 		UMaterialInstanceDynamic* Material = nullptr;
-		UStaticMeshComponent* Piece = CreatePooledMesh(SourceMesh, Material);
+		UStaticMeshComponent* Piece = CreatePooledMesh(CylinderMesh.Get(), Material);
 
-		// A null entry is skipped harmlessly in RebuildVisuals, whereas a SHORT array would
-		// silently pair one after-image's head with the next one's legs.
-		GhostMeshes.Add(Piece);
-		GhostMaterials.Add(Material);
+		// A null entry is skipped harmlessly in RebuildSmear, whereas a SHORT array would silently
+		// pair one element's head band with the next one's body.
+		SmearMeshes.Add(Piece);
+		SmearMaterials.Add(Material);
 	}
+
+	return true;
+}
+
+bool UTraceTrailComponent::EnsurePoseGhost(int32 GhostIndex)
+{
+	const int32 MaxGhosts = ResolvedMaxGhosts();
+	if (GhostIndex < 0 || GhostIndex >= MaxGhosts)
+	{
+		return false;
+	}
+
+	// Free components live past GhostRecords.Num(), so the pool is usually already big enough and
+	// this is a no-op — creating a UPoseableMeshComponent is the expensive part of a ghost and it is
+	// paid at most MaxGhosts times per trace, ever.
+	if (PoseGhosts.Num() > GhostIndex)
+	{
+		return true;
+	}
+	if (PoseGhosts.Num() != GhostIndex)
+	{
+		return false;
+	}
+
+	AActor* OwnerActor = GetOwner();
+	USkeletalMeshComponent* SourceMesh = GetGhostSourceMesh();
+	if (OwnerActor == nullptr || SourceMesh == nullptr)
+	{
+		return false;
+	}
+
+	UPoseableMeshComponent* Ghost = NewObject<UPoseableMeshComponent>(OwnerActor, NAME_None, RF_Transient);
+	if (Ghost == nullptr)
+	{
+		return false;
+	}
+
+	// Mobility must be set before registration.
+	Ghost->SetMobility(EComponentMobility::Movable);
+	Ghost->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Ghost->SetCollisionProfileName(TEXT("NoCollision"));
+	Ghost->SetGenerateOverlapEvents(false);
+	Ghost->SetCanEverAffectNavigation(false);
+	Ghost->SetCastShadow(false);
+	Ghost->bReceivesDecals = false;
+	Ghost->SetIsReplicated(false);   // Purely local cosmetics, rebuilt from TrailPoints.
+	Ghost->SetVisibility(false);
+
+	// THE PERFORMANCE CLAIM, in two lines. A frozen pose has nothing to advance, so the component
+	// never ticks; RebuildPoseGhosts calls RefreshBoneTransforms() by hand exactly once, when the
+	// pose is written. Everything after that is a static skinned draw.
+	Ghost->PrimaryComponentTick.bCanEverTick = false;
+	Ghost->SetComponentTickEnabled(false);
+
+	Ghost->RegisterComponent();
+	Ghost->AttachToComponent(this, FAttachmentTransformRules::KeepRelativeTransform);
+
+	// Critical: the trace is laid in WORLD space and must not follow the holder around. Absolute
+	// transforms keep the components in the actor's hierarchy (so they are cleaned up with it) while
+	// making them ignore the parent transform entirely.
+	Ghost->SetAbsolute(true, true, true);
+
+	// Allocates the bone arrays and RequiredBones, which CopyPoseFromSkeletalComponent needs.
+	Ghost->SetSkinnedAssetAndUpdate(SourceMesh->GetSkinnedAsset(), /*bReinitPose=*/true);
+	GhostSkinnedAsset = SourceMesh->GetSkinnedAsset();
+
+	const int32 ForcedLOD = ResolvedGhostForcedLOD();
+	if (ForcedLOD > 0)
+	{
+		Ghost->SetForcedLOD(ForcedLOD);
+	}
+
+	// ONE MID ON EVERY SLOT. The Mannequin ships two materials (body and a logo decal sheet); an
+	// after-image is not a character, it is a light, so every slot gets the same unlit neon instance
+	// and the ghost renders as a flat team-coloured silhouette rather than as a second player.
+	UMaterialInstanceDynamic* Material = nullptr;
+	if (TrailMaterial != nullptr)
+	{
+		Material = UMaterialInstanceDynamic::Create(TrailMaterial, this);
+		if (Material != nullptr)
+		{
+			const int32 SlotCount = Ghost->GetNumMaterials();
+			for (int32 Slot = 0; Slot < SlotCount; ++Slot)
+			{
+				Ghost->SetMaterial(Slot, Material);
+			}
+
+			if (!bTrailMaterialIsNeon)
+			{
+				Material->SetScalarParameterValue(TEXT("Roughness"), 0.9f);
+			}
+			if (bColorApplied)
+			{
+				Material->SetVectorParameterValue(TEXT("Color"), AppliedColor);
+				Material->SetVectorParameterValue(TEXT("BaseColor"), AppliedColor);
+			}
+		}
+	}
+
+	PoseGhosts.Add(Ghost);
+	PoseGhostMaterials.Add(Material);
+	PoseGhostBaseGlow.Add(0.f);
+	PoseGhostAppliedGlowScale.Add(1.f);
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("[TRACEGHOST] %s grew the after-image pool to %d posed mannequins."),
+		*GetNameSafe(OwnerActor), PoseGhosts.Num());
 
 	return true;
 }
@@ -1831,15 +2504,36 @@ UStaticMeshComponent* UTraceTrailComponent::CreatePooledMesh(UStaticMesh* Source
 	return NewMesh;
 }
 
-void UTraceTrailComponent::HideGhostsFrom(int32 FirstGhostIndex)
+void UTraceTrailComponent::HideSmearFrom(int32 FirstElementIndex)
 {
-	for (int32 Index = FMath::Max(0, FirstGhostIndex) * PartsPerGhost; Index < GhostMeshes.Num(); ++Index)
+	for (int32 Index = FMath::Max(0, FirstElementIndex) * PartsPerSmear; Index < SmearMeshes.Num(); ++Index)
 	{
-		if (UStaticMeshComponent* Piece = GhostMeshes[Index])
+		if (UStaticMeshComponent* Piece = SmearMeshes[Index])
 		{
 			Piece->SetVisibility(false);
 		}
 	}
+}
+
+void UTraceTrailComponent::ReleasePoseGhostsFrom(int32 FirstGhostIndex)
+{
+	for (int32 Index = FMath::Max(0, FirstGhostIndex); Index < PoseGhosts.Num(); ++Index)
+	{
+		if (UPoseableMeshComponent* Ghost = PoseGhosts[Index])
+		{
+			Ghost->SetVisibility(false);
+		}
+	}
+}
+
+void UTraceTrailComponent::ClearGhostRecords()
+{
+	// The components are NOT destroyed: they keep their skinned asset and their material instance and
+	// go back to being free slots at the back of the pool. A turnover happens several times a minute
+	// and rebuilding twenty poseable mesh components each time would be the one genuinely expensive
+	// thing in this file.
+	GhostRecords.Reset();
+	ReleasePoseGhostsFrom(0);
 }
 
 void UTraceTrailComponent::UpdateTeamColor()
@@ -1889,7 +2583,20 @@ void UTraceTrailComponent::UpdateTeamColor()
 	// The head keeps the team colour rather than going white. A white element would read as "generic
 	// hazard"; the whole point is that a glance tells you WHOSE trace it is, and therefore whether
 	// dashing through it kills their holder or does nothing at all.
-	for (UMaterialInstanceDynamic* Material : GhostMaterials)
+	//
+	// BOTH POOLS. "The ENTIRE trace turns red" (v3 §3) has to include the mannequins, or the parry
+	// produces a red smear full of team-coloured ghosts and the tell stops being a single readable
+	// state. The ghosts share this one loop precisely so they cannot be forgotten.
+	for (UMaterialInstanceDynamic* Material : SmearMaterials)
+	{
+		if (Material != nullptr)
+		{
+			Material->SetVectorParameterValue(TEXT("Color"), AppliedColor);
+			Material->SetVectorParameterValue(TEXT("BaseColor"), AppliedColor);
+		}
+	}
+
+	for (UMaterialInstanceDynamic* Material : PoseGhostMaterials)
 	{
 		if (Material != nullptr)
 		{
@@ -1913,27 +2620,126 @@ void UTraceTrailComponent::CacheMeshMetrics()
 		CylinderPivotOffset = LocalBounds.Origin;
 	}
 
-	if (SphereMesh != nullptr)
-	{
-		const FBoxSphereBounds LocalBounds = SphereMesh->GetBounds();
-		SphereHalfSize = LocalBounds.BoxExtent;
-		SpherePivotOffset = LocalBounds.Origin;
-	}
-
 	// Never divide by zero, whatever the assets turn out to be.
 	CylinderHalfSize.X = FMath::Max(CylinderHalfSize.X, 1.0);
 	CylinderHalfSize.Y = FMath::Max(CylinderHalfSize.Y, 1.0);
 	CylinderHalfSize.Z = FMath::Max(CylinderHalfSize.Z, 1.0);
-	SphereHalfSize.X = FMath::Max(SphereHalfSize.X, 1.0);
-	SphereHalfSize.Y = FMath::Max(SphereHalfSize.Y, 1.0);
-	SphereHalfSize.Z = FMath::Max(SphereHalfSize.Z, 1.0);
 
 	bMeshMetricsCached = true;
 }
 
+#if !UE_BUILD_SHIPPING
+namespace
+{
+	/**
+	 * Trace.Trail.DebugLookBack [Seconds] [OnSeconds] [OffSeconds]
+	 *
+	 * Periodically spins the local player 180 degrees so an automated capture can photograph THEIR OWN
+	 * TRACE from in front of it.
+	 *
+	 * It exists for exactly the reason Trace.DebugTakeCore does, and the reason is worth writing down
+	 * because it cost this pass real time: the trace forms BEHIND the holder, and holding the Core is
+	 * what puts the camera 450uu behind them looking FORWARD. So the one player guaranteed to have a
+	 * trace is the one player who structurally cannot see it, and an unattended screenshot harness has
+	 * no hands with which to turn round. Every capture of a carrier comes back as a picture of the
+	 * arena in front of them. Pair this with Trace.DebugTakeCore and Trace.Trail.OwnerNearHideDistance
+	 * and a headless run can photograph the after-images head-on.
+	 *
+	 * IT PULSES rather than holding, for the same reason Trace.DebugCrouch does: the control rotation
+	 * is also the movement basis, so a permanent 180 makes the player walk backwards down their own
+	 * trace and stop laying new one. On/off means the trace keeps being drawn AND gets photographed.
+	 *
+	 * Purely a camera aid. It writes the control rotation and nothing else — no gameplay state, no
+	 * trail state, and it is compiled out of Shipping.
+	 */
+	FAutoConsoleCommand CmdTrailDebugLookBack(
+		TEXT("Trace.Trail.DebugLookBack"),
+		TEXT("Trace.Trail.DebugLookBack [Seconds] [OnSeconds] [OffSeconds] — pulse the local player's view "
+		     "180 degrees so an automated capture can photograph their own trace. Camera only."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Seconds = (Args.Num() > 0) ? FMath::Max(1.f, FCString::Atof(*Args[0])) : 120.f;
+			const float OnSeconds = (Args.Num() > 1) ? FMath::Max(0.2f, FCString::Atof(*Args[1])) : 2.5f;
+			const float OffSeconds = (Args.Num() > 2) ? FMath::Max(0.2f, FCString::Atof(*Args[2])) : 4.0f;
+
+			double Elapsed = 0.0;
+			double PhaseStart = 0.0;
+			bool bLookingBack = false;
+			bool bLogged = false;
+
+			// Registered at period 0 and self-timed: a non-zero ticker period was measured NOT to fire
+			// at all through this project's -ExecCmds path. See TraceCharacter.cpp's anim probe.
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+				[Elapsed, PhaseStart, bLookingBack, bLogged, Seconds, OnSeconds, OffSeconds](float DeltaTime) mutable -> bool
+			{
+				Elapsed += DeltaTime;
+
+				UWorld* World = nullptr;
+				if (GEngine != nullptr)
+				{
+					for (const FWorldContext& Context : GEngine->GetWorldContexts())
+					{
+						if ((Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+							&& Context.World() != nullptr)
+						{
+							World = Context.World();
+							break;
+						}
+					}
+				}
+
+				APlayerController* PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+				APawn* ViewPawn = (PC != nullptr) ? PC->GetPawn() : nullptr;
+				if (ViewPawn == nullptr)
+				{
+					return (Elapsed < Seconds);   // Wait for a pawn; the map may still be loading.
+				}
+
+				if (!bLogged)
+				{
+					bLogged = true;
+					UE_LOG(LogTraceGame, Log,
+						TEXT("[TRACELOOKBACK] Armed for %.0fs: %.1fs looking back, %.1fs looking forward."),
+						Seconds, OnSeconds, OffSeconds);
+				}
+
+				const double PhaseLength = bLookingBack ? OnSeconds : OffSeconds;
+				if ((Elapsed - PhaseStart) >= PhaseLength)
+				{
+					PhaseStart = Elapsed;
+					bLookingBack = !bLookingBack;
+
+					if (bLookingBack)
+					{
+						FRotator Look = ViewPawn->GetActorRotation();
+						Look.Yaw += 180.f;
+						Look.Pitch = -8.f;   // Slightly down: the trace stands on the floor.
+						Look.Roll = 0.f;
+						PC->SetControlRotation(Look);
+
+						UE_LOG(LogTraceGame, Log, TEXT("[TRACELOOKBACK] Looking back down the trace (t=%.1fs)."),
+							Elapsed);
+					}
+				}
+				else if (bLookingBack)
+				{
+					// Hold the heading against the walk harness's steering, which would otherwise turn
+					// the player round again inside the very window we are trying to photograph.
+					FRotator Look = PC->GetControlRotation();
+					Look.Pitch = -8.f;
+					Look.Roll = 0.f;
+					PC->SetControlRotation(Look);
+				}
+
+				return (Elapsed < Seconds);
+			}), 0.f);
+		}));
+}
+#endif // !UE_BUILD_SHIPPING
+
 void UTraceTrailComponent::DestroyVisualPool()
 {
-	for (UStaticMeshComponent* Piece : GhostMeshes)
+	for (UStaticMeshComponent* Piece : SmearMeshes)
 	{
 		if (Piece != nullptr)
 		{
@@ -1941,8 +2747,24 @@ void UTraceTrailComponent::DestroyVisualPool()
 		}
 	}
 
-	GhostMeshes.Reset();
-	GhostMaterials.Reset();
+	for (UPoseableMeshComponent* Ghost : PoseGhosts)
+	{
+		if (Ghost != nullptr)
+		{
+			Ghost->DestroyComponent();
+		}
+	}
+
+	SmearMeshes.Reset();
+	SmearMaterials.Reset();
+	SmearBaseGlow.Reset();
+	SmearAppliedGlowScale.Reset();
+
+	PoseGhosts.Reset();
+	PoseGhostMaterials.Reset();
+	PoseGhostBaseGlow.Reset();
+	PoseGhostAppliedGlowScale.Reset();
+	GhostRecords.Reset();
 
 	LastVisualPointCount = -1;
 	bColorApplied = false;

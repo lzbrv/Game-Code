@@ -20,7 +20,7 @@ class UWorld;
  * stick, no muzzle, no impact, no falloff. It read as debug geometry because it WAS debug
  * geometry.
  *
- * A railgun shot has four beats, and this actor draws all four out of engine primitives, because
+ * A railgun shot has three beats, and this actor draws all three out of engine primitives, because
  * Niagara would need .uasset VFX this project cannot author (build contract 2):
  *
  *   1. CORE      a thin, almost white cylinder from muzzle to impact. Near-white rather than team
@@ -31,14 +31,36 @@ class UWorld;
  *   2. SHEATH    a fatter, dimmer, fully team-coloured cylinder around the core, drawn additively
  *                so it cannot occlude the core. Optional: if the additive engine material is
  *                unavailable the effect degrades to core-plus-bloom and still looks deliberate.
- *   3. MUZZLE    a short, bright sphere at the near end of the beam.
- *   4. IMPACT    a sphere at the hit point that EXPANDS as it dims - the pop that gives the shot
- *                its weight, and the thing that tells a player at a glance that they connected.
- *                Suppressed when the shot died at maximum range with nothing to hit.
+ *   3. MUZZLE    a short, bright sphere at the near end of the beam. Suppressible from settings
+ *                (UTraceSettings::bTracerMuzzleFlash).
+ *
+ * --- THE FOURTH BEAT, AND WHY IT IS GONE ------------------------------------------------------
+ *
+ * There used to be an IMPACT beat: a sphere at the hit point that expanded from 10 to 52 uu as it
+ * dimmed - "the pop that gives the shot its weight". Spec v4 §4 deletes it, verbatim: "Remove the
+ * sphere from the end of the bullet tracer hitscan animation, so it's just a bullet trace, which
+ * makes it easier to see where your shots are going."
+ *
+ * That is the right call and the old comment above contained the reason without noticing it. The
+ * sphere's whole job was to sit ON the point the shooter is trying to read, and at 52 uu of unlit
+ * emissive under this arena's bloom it did not merely mark that point, it covered it. A player
+ * checking where their shots are landing was being shown a ball of light exactly where the answer
+ * was. The beam already terminates at the impact, so the information was never lost with it.
+ *
+ * DELETED, NOT DISABLED. There is no bImpactFlash setting, because a knob to restore it would be a
+ * knob to restore the reported problem.
  *
  * The whole thing snaps to full length on frame one (it is hitscan - there is no travel time to
  * animate) and then decays over TracerLifeSeconds with an ease-out: bright and instant, then a
  * short weighty fade. Nothing translates; only intensity and thickness animate.
+ *
+ * --- WIDTH ------------------------------------------------------------------------------------
+ *
+ * Spec v4 §4 also asks for a thinner beam, with the radius tunable. The radius, its two clamps, the
+ * halo ratio and the muzzle flash are all UTraceSettings properties (Category "Tracer") read fresh
+ * on every shot, so the look retunes with PIE running. The proportional-to-length model is kept and
+ * scaled down rather than replaced with a constant - see the comment on that block in
+ * TraceSettings.h for why a constant radius cannot work across a 24000+ uu arena.
  *
  * --- THE FIRST PERSON OFFSET, AND WHY THE OLD TRACER WAS INVISIBLE ----------------------------
  *
@@ -87,9 +109,12 @@ public:
 	 * @param From      Muzzle position.
 	 * @param To        Impact position (or the far end of the ray if nothing was hit).
 	 * @param Color     Shooter's team colour.
-	 * @param bImpacted True when the beam actually terminated on a surface, which is what gates the
-	 *                  impact pop. Passing false for a shot that died at max range keeps a flash
-	 *                  from appearing in mid-air 28000 uu away.
+	 * @param bImpacted RETAINED AND NOW UNUSED. It used to gate the impact pop, which spec v4 §4
+	 *                  deleted. The parameter is kept, with its default, so that every existing call
+	 *                  site (UTraceWeaponComponent's predicted and multicast paths, the input
+	 *                  harness) keeps compiling untouched — removing it would be a change to files
+	 *                  this slice does not own, for no behavioural gain. If a future beat ever needs
+	 *                  to know whether the shot connected, it is already plumbed.
 	 *
 	 * Returns nullptr on a dedicated server (no visuals), for a degenerate/non-finite segment, or
 	 * when the world is invalid. Callers may ignore the return value.
@@ -109,13 +134,14 @@ protected:
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
 	TObjectPtr<UStaticMeshComponent> BeamSheath;
 
-	/** Beat 3: muzzle flash. */
+	/** Beat 3: muzzle flash. Gated on UTraceSettings::bTracerMuzzleFlash. */
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
 	TObjectPtr<UStaticMeshComponent> MuzzleFlash;
 
-	/** Beat 4: expanding impact pop. */
-	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
-	TObjectPtr<UStaticMeshComponent> ImpactFlash;
+	// ImpactFlash DELETED (spec v4 §4). See "THE FOURTH BEAT, AND WHY IT IS GONE" in the class
+	// comment. The component, its MID, its two diameter constants, its intensity, its visibility flag
+	// and the camera-proximity dimming that existed solely to stop it whiting out the screen at
+	// point-blank range are all gone with it.
 
 	/**
 	 * /Game/Generated/Materials/M_TraceNeon — unlit, opaque, EmissiveColor = Color * Glow. Made by
@@ -168,9 +194,6 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> MuzzleMID;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> ImpactMID;
-
 	/** Team colour of the shot, cached for the per-frame fade. */
 	FLinearColor ShotColor = FLinearColor::White;
 
@@ -180,24 +203,34 @@ private:
 	float Age = 0.f;
 
 	/**
-	 * 0.3..1, from how close the impact point is to the local camera. Scales the impact pop's size
-	 * and brightness down when it goes off in the viewer's face. See InitTracer().
+	 * Beam DIAMETERS for this particular shot. All three are overwritten by InitTracer from the
+	 * Tracer block in UTraceSettings before anything is drawn; the initialisers here only keep a
+	 * tracer that returned early from InitTracer (a degenerate segment) from holding garbage.
+	 *
+	 * DIAMETERS rather than radii because /Engine/BasicShapes/Cylinder and Sphere are 100 uu ACROSS,
+	 * so a diameter is what divides cleanly into a mesh scale. The settings are expressed as RADII
+	 * because that is the word spec v4 §4 uses ("the radius of the cross section"); InitTracer
+	 * doubles them exactly once, at the boundary, so the rest of this file stays in one unit.
 	 */
-	float ImpactProximityScale = 1.f;
-
-	/** Beam widths for this particular shot, derived from its length. See CoreDiameterPerLengthUU. */
-	float CoreDiameter = CoreDiameterMinUU;
-	float SheathDiameter = CoreDiameterMinUU * SheathWidthRatio;
+	float CoreDiameter = 4.f;
+	float SheathDiameter = 12.f;
+	float MuzzleDiameter = 5.f;
 
 	/** Set false once the muzzle flash has been retired, so it is only hidden once. */
 	bool bMuzzleVisible = false;
-	bool bImpactVisible = false;
 
 	// --- Tuning ---------------------------------------------------------------------------------
 	//
-	// These are deliberately compile-time constants rather than config: they are the *look* of one
-	// effect, they are meaningless outside this file, and every one of them was chosen against the
-	// arena's bloom settings. A settings page for them would be twelve knobs nobody turns.
+	// What is left here is compile-time on purpose: these are the *look* of one effect, they are
+	// meaningless outside this file, and every one of them was chosen against the arena's bloom
+	// settings.
+	//
+	// THE WIDTHS ARE NO LONGER AMONG THEM. Spec v4 §4 asks for the beam radius to be tunable, and
+	// this project's standing rule is that a new tunable is a UTraceSettings property - categorised,
+	// clamped, tooltipped and live in PIE - because that panel is where the user tunes now. So
+	// CoreDiameterPerLengthUU / Min / Max, SheathWidthRatio and MuzzleDiameterUU have MOVED to
+	// UTraceSettings (Category "Tracer") as radii, and ImpactStartDiameterUU / ImpactEndDiameterUU /
+	// ImpactIntensity are simply gone with the sphere they described.
 
 	/** Total life. Long enough to read as a beam, short enough that 10 bots firing never smears. */
 	static constexpr float TracerLifeSeconds = 0.17f;
@@ -206,52 +239,30 @@ private:
 	static constexpr float MuzzleFlashLifeFraction = 0.42f;
 
 	/**
-	 * Beam thickness scales with the length of the shot.
-	 *
-	 * A fixed-width cylinder is the wrong model for something meant to read at every range in a
-	 * 24000 uu arena: 4 uu is a fat rod across a corridor and a sub-pixel thread across the field.
-	 * Making the diameter proportional to the shot's own length holds the beam at roughly constant
-	 * angular width from the shooter's eye, which is what a real beam material would do with a
-	 * camera-facing ribbon. Clamped at both ends so a knife-fight shot is not a needle and a
-	 * cross-map shot is not a wall.
-	 */
-	static constexpr float CoreDiameterPerLengthUU = 0.0062f;
-	static constexpr float CoreDiameterMinUU = 5.0f;
-	static constexpr float CoreDiameterMaxUU = 26.0f;
-
-	/** The soft glow is this many times the core's diameter. */
-	static constexpr float SheathWidthRatio = 3.2f;
-
-	/**
-	 * Muzzle flash diameter at t=0. Kept small on purpose: with the standoff below it sits 120 uu
-	 * from the shooter's own eye, where 10 uu subtends under 5 degrees. Measured larger and hotter
-	 * first, and it bloomed into a blob that ate the middle of the screen on every shot - a
-	 * flashbang, not a muzzle flash.
-	 */
-	static constexpr float MuzzleDiameterUU = 10.0f;
-
-	/** Impact pop diameter, start and end of its expansion. */
-	static constexpr float ImpactStartDiameterUU = 10.0f;
-	static constexpr float ImpactEndDiameterUU = 52.0f;
-
-	/**
 	 * M_TraceNeon "Glow" multipliers at t=0 - how far past white the emissive sits, and therefore
 	 * how hard the shot blooms.
 	 *
 	 * Calibrated against the rest of the arena rather than picked in the abstract: the neon grid
 	 * runs at 1.5, structural trim at 3.2-4.5, the goal line at 6.0, and the carrier's trail ghost
 	 * peaks at 4.2. A railgun should be the hottest thing on the field, so the core sits just above
-	 * the goal line and the impact just above that - and no higher. An earlier draft ran these at 26
-	 * to 34 and every shot was an undifferentiated white blob that erased the arena behind it.
+	 * the goal line - and no higher. An earlier draft ran these at 26 to 34 and every shot was an
+	 * undifferentiated white blob that erased the arena behind it.
+	 *
+	 * CoreIntensity 5.5 -> 6.6 WITH THE THINNING (spec v4 §4). Halving a beam's radius quarters its
+	 * cross-sectional area and therefore roughly quarters the light it contributes to the bloom pass,
+	 * so a beam made thinner at unchanged brightness reads as *dimmer* as well as thinner - and at
+	 * arena distances "dimmer and thinner" is how a tracer becomes one the player cannot follow. A
+	 * 20% lift on the emissive is the compensation, and it is deliberately not the full 4x: a thin
+	 * bright line is the goal, and pushing an unlit emissive far past the tonemapper's shoulder just
+	 * turns it white and takes the team colour with it.
 	 *
 	 * NOTE, hard won: brightness MUST ride on this scalar. Encoding it in the "Color" vector
 	 * parameter instead does not work - a material instance clamps vector parameters to [0,1], so
 	 * Color * 34 silently became flat white at intensity 1 and the beam rendered as a dull matte
 	 * tube with no bloom at all. That failure looks exactly like "the effect is not rendering".
 	 */
-	static constexpr float CoreIntensity = 5.5f;
+	static constexpr float CoreIntensity = 6.6f;
 	static constexpr float MuzzleIntensity = 3.0f;
-	static constexpr float ImpactIntensity = 6.5f;
 
 	/**
 	 * The additive sheath's engine material has no Glow scalar, so its intensity has to ride in the
@@ -293,4 +304,16 @@ private:
 
 	/** Below this beam length the muzzle flash is skipped: it would sit on top of the impact. */
 	static constexpr float MinLengthForMuzzleFlashUU = 60.0f;
+
+	/**
+	 * Hard bounds applied to the settings-driven radii after they are read, in uu.
+	 *
+	 * The UPROPERTY clamps already stop a slider producing these, but Get() reads a CDO that
+	 * DefaultGame.ini is layered over, and an ini is not clamp-checked. A zero or negative radius
+	 * scales the beam mesh to nothing and looks exactly like "the tracer stopped rendering"; an
+	 * enormous one is a wall across the arena on every shot. Both are one typo away, and this effect
+	 * spawns up to ~80 times a second, so it is worth two lines of defence.
+	 */
+	static constexpr float MinSafeRadiusUU = 0.05f;
+	static constexpr float MaxSafeRadiusUU = 400.0f;
 };

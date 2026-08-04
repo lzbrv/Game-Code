@@ -78,6 +78,16 @@ namespace TraceGameModeConstants
 	 * any real gap between captures — the kickoff delay alone is longer.
 	 */
 	static constexpr float ScoreDebounceSeconds = 0.5f;
+
+	/**
+	 * Seconds between checks of UTraceSettings::ScoringMode for a live edit (spec v4 §7).
+	 *
+	 * Half a second is imperceptible to somebody dragging a toggle in the details panel and is two
+	 * ticks per second of one enum comparison, which does not register on any profile. It is not a
+	 * hook because PostEditChangeProperty is editor-only and the toggle has to keep working in a
+	 * packaged A/B build.
+	 */
+	static constexpr float ScoringModePollInterval = 0.5f;
 }
 
 ATraceGameMode::ATraceGameMode()
@@ -136,6 +146,44 @@ void ATraceGameMode::InitGame(const FString& MapName, const FString& Options, FS
 	// are no-ops once this one has run.
 	UTraceSettings::ResolveBotDifficultyFromOptions(Options, /*bForceReresolve=*/true);
 
+	// Which of the two games (spec v4 §7). Same three-way resolution as the difficulty above and for
+	// the same reason: the title screen sends it on the travel URL, a headless run sends it on the
+	// command line, and everything else falls back to the Project Settings page. Must happen HERE —
+	// InitGame is the last point before PreInitializeComponents builds the arena, and the arena is
+	// one of the things the mode decides the shape of.
+	ResolveScoringMode(Options);
+
+	// Test hook for the MERCY RULE, and it earns its place for the same reason the half-length hooks
+	// above do: at the shipped threshold of 8 the rule fires perhaps once in a long lopsided match,
+	// which is not something an automated run can wait for. Lower it and the rule becomes reachable
+	// in seconds; set it to 0 and a scripted run is guaranteed to reach full time instead.
+	//
+	//     /Game/Maps/Arena?mercy=2        (from a travel URL)
+	//     -TraceMercyLead=2               (from the command line, for headless runs)
+	//
+	// Written into the CDO rather than into a member for the same reason the mode is: UTraceSettings
+	// is the storage the rule is read from at its point of use, so there is one value, not two.
+	// Note the '?' separator rule spelled out above — '&' silently swallows the next option.
+	int32 MercyOverride = -1;
+	if (UGameplayStatics::HasOption(Options, TEXT("mercy")))
+	{
+		MercyOverride = UGameplayStatics::GetIntOption(Options, TEXT("mercy"), -1);
+	}
+	else
+	{
+		FParse::Value(FCommandLine::Get(), TEXT("TraceMercyLead="), MercyOverride);
+	}
+
+	if (MercyOverride >= 0)
+	{
+		if (UTraceSettings* MutableSettings = GetMutableDefault<UTraceSettings>())
+		{
+			MutableSettings->MercyRuleLead = MercyOverride;
+			UE_LOG(LogTraceGame, Log, TEXT("Mercy-rule lead overridden to %d (%s)."),
+				MercyOverride, (MercyOverride == 0) ? TEXT("disabled; the clock is the only end") : TEXT("enabled"));
+		}
+	}
+
 	// Test hooks for the match format. A full match is now 2 x HalfDuration, which at the shipped
 	// ten minutes a half is twenty minutes of wall clock — far too long for an automated run to ever
 	// reach half time, let alone full time. These make the whole structure reachable in seconds:
@@ -189,6 +237,12 @@ void ATraceGameMode::PreInitializeComponents()
 	// publishes the Core on it, so Super has to run first.
 	Super::PreInitializeComponents();
 
+	// BEFORE the arena is built and before anybody logs in: the mode decides what the ends of the
+	// field are (endzones or goals) and what the Core is, so every system that reads it during its
+	// own construction has to find the right answer already published. Super created the GameState
+	// immediately above, which is the earliest this can possibly run.
+	PublishScoringMode();
+
 	// See the header for the LoadMap ordering this exists to get ahead of. Short version: every
 	// ATraceTeamPlayerStart must exist before AGameModeBase::Login calls FindPlayerStart, and Login
 	// happens before any BeginPlay in the world.
@@ -213,6 +267,7 @@ void ATraceGameMode::BeginPlay()
 
 	// Belt and braces for paths that skip PreInitializeComponents' happy case — seamless travel, a
 	// Blueprint subclass that forgets to call Super, PIE quirks. Both are idempotent.
+	PublishScoringMode();
 	EnsureArenaBuilt();
 	SpawnCoreIfNeeded();
 	ApplyTeamSides(GetNegativeSideTeamForHalf(1));
@@ -232,6 +287,11 @@ void ATraceGameMode::BeginPlay()
 
 	// The host is already logged in, so this is the first point at which the phase machine may run.
 	CheckMatchStartConditions();
+
+	// Makes the A/B toggle live for the rest of the session. See PollScoringModeSetting().
+	GetWorldTimerManager().SetTimer(ScoringModePollHandle, this, &ATraceGameMode::PollScoringModeSetting,
+		TraceGameModeConstants::ScoringModePollInterval, /*bLoop=*/true,
+		TraceGameModeConstants::ScoringModePollInterval);
 
 #if !UE_BUILD_SHIPPING
 	if (FParse::Param(FCommandLine::Get(), TEXT("TraceBotDebug")))
@@ -1034,15 +1094,172 @@ void ATraceGameMode::EvaluateWipeBonus(ETraceTeam DeadTeam)
 		*TraceTeamName(DeadTeam).ToString(), *TraceTeamName(BonusTeam).ToString(), WipeBonusPoints,
 		TraceGameState->BlueScore, TraceGameState->OrangeScore);
 
-	// A wipe can be the point that wins the match, but only if the mercy rule is switched on.
-	if (bEndMatchAtScoreToWin)
+	// A wipe moves the scoreboard by WipeBonusPoints at once, so it is the single most likely way to
+	// CROSS the mercy threshold rather than land on it — which is exactly why the rule is written as
+	// "lead >= N" rather than "lead == N", and why this check is here at all.
+	CheckMercyRule(TEXT("wipe bonus"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Win conditions (spec v4 §6)
+// ---------------------------------------------------------------------------------------------
+
+bool ATraceGameMode::CheckMercyRule(const TCHAR* Cause)
+{
+	if (!HasAuthority())
 	{
-		const int32 ScoreToWin = FMath::Max(1, UTraceSettings::Get().ScoreToWin);
-		if (TraceGameState->GetScore(BonusTeam) >= ScoreToWin)
+		return false;
+	}
+
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr)
+	{
+		return false;
+	}
+
+	// Read at the point of use, so dragging the slider in the Project Settings panel retunes the
+	// rule with PIE running. Zero (or anything negative from a bad .ini) disables it outright and
+	// leaves the clock as the only way a match can end.
+	const int32 RequiredLead = UTraceSettings::Get().MercyRuleLead;
+	if (RequiredLead <= 0)
+	{
+		return false;
+	}
+
+	// Only live play can trigger it. Warm-up scrums do not score, the interval has no play in it,
+	// and a match already in PostMatch cannot end a second time — but each of those is reachable
+	// through some path (a debug grant, a live settings edit), and a mercy "win" awarded on the
+	// results screen would restart a match that has finished. That is the loop the contract forbids.
+	if (TraceGameState->TraceMatchState != ETraceMatchState::InProgress || TraceGameState->IsHalfTimeBreak())
+	{
+		return false;
+	}
+
+	const int32 Lead = TraceGameState->BlueScore - TraceGameState->OrangeScore;
+	if (FMath::Abs(Lead) < RequiredLead)
+	{
+		return false;
+	}
+
+	const ETraceTeam WinningTeam = (Lead > 0) ? ETraceTeam::Blue : ETraceTeam::Orange;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("MERCY RULE: %s leads by %d (threshold %d) after a %s in the %s. Match ends immediately. Blue %d - Orange %d"),
+		*TraceTeamName(WinningTeam).ToString(), FMath::Abs(Lead), RequiredLead,
+		(Cause != nullptr) ? Cause : TEXT("score"), *TraceGameState->GetHalfLabel(),
+		TraceGameState->BlueScore, TraceGameState->OrangeScore);
+
+	// Same courtesy the old score cap paid: put everybody back on their pads before the results
+	// screen takes the frame, so it is not drawn over ten pawns piled in one endzone. FinishMatch
+	// stops every clock this class owns, including the half-time interval, so a mercy win taken in
+	// the first half cannot have the second half start underneath the results screen.
+	ResetPlayersToSpawns();
+	FinishMatch(WinningTeam, ETraceMatchEndReason::Mercy);
+	return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scoring mode (spec v4 §7)
+// ---------------------------------------------------------------------------------------------
+
+ETraceScoringMode ATraceGameMode::GetScoringMode() const
+{
+	const ATraceGameState* TraceGameState = GetGameState<ATraceGameState>();
+	return (TraceGameState != nullptr) ? TraceGameState->GetScoringMode() : ETraceScoringMode::EndzoneStatusCore;
+}
+
+void ATraceGameMode::ResolveScoringMode(const FString& Options)
+{
+	// The default is whatever the settings page already says, so the two overrides below are genuine
+	// overrides rather than a reset to the shipped mode.
+	UTraceSettings* MutableSettings = GetMutableDefault<UTraceSettings>();
+	if (MutableSettings == nullptr)
+	{
+		return;
+	}
+
+	ETraceScoringMode ResolvedMode = MutableSettings->ScoringMode;
+	const TCHAR* Source = TEXT("Project Settings");
+
+	if (UGameplayStatics::HasOption(Options, TraceScoringModeUrlOption))
+	{
+		ResolvedMode = TraceScoringModeFromUrlValue(
+			UGameplayStatics::ParseOption(Options, TraceScoringModeUrlOption));
+		Source = TEXT("travel URL");
+	}
+	else
+	{
+		FString CommandLineValue;
+		if (FParse::Value(FCommandLine::Get(), TEXT("TraceScoringMode="), CommandLineValue))
 		{
-			FinishMatch(BonusTeam);
+			ResolvedMode = TraceScoringModeFromUrlValue(CommandLineValue);
+			Source = TEXT("command line");
 		}
 	}
+
+	// Written BACK into the CDO, which is the whole trick that makes this both authoritative and
+	// live. After this line the Project Settings panel shows the mode actually being played, the
+	// poll below has nothing to fight, and dragging the toggle there is a real change rather than a
+	// value silently losing to a URL the player cannot see.
+	MutableSettings->ScoringMode = ResolvedMode;
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Mode] %s selected (from the %s)."),
+		*TraceScoringModeLabel(ResolvedMode), Source);
+}
+
+void ATraceGameMode::PublishScoringMode()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	const ETraceScoringMode DesiredMode = UTraceSettings::Get().ScoringMode;
+
+	// SetScoringMode early-outs when nothing changed, so this is free on the second and third call
+	// and no OnRep storms out of the belt-and-braces re-runs in BeginPlay.
+	TraceGameState->SetScoringMode(DesiredMode);
+
+	// THE CORE HOLDS NO MODE OF ITS OWN. It used to, and the latch was deleted: a second copy of the
+	// fact that decides what that actor IS meant the two could disagree for a frame, and the Core's
+	// own log caught exactly that — mode A latched, then flipped to B a frame later. ATraceCore::
+	// IsModeB() now asks ATraceGameState every time, so the GameState line above is the whole of the
+	// publish.
+	//
+	// This call is therefore a RECONCILE-NOW hook, not a setter: it tells the Core to pick up the
+	// new mode on the frame the mode is published rather than on its next tick, and it logs a
+	// warning if what it is handed disagrees with the GameState instead of obeying it.
+	if (ATraceCore* TheCore = GetCore())
+	{
+		TheCore->SetScoringMode(DesiredMode);
+	}
+}
+
+void ATraceGameMode::PollScoringModeSetting()
+{
+	const ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	const ETraceScoringMode DesiredMode = UTraceSettings::Get().ScoringMode;
+	if (DesiredMode == TraceGameState->GetScoringMode())
+	{
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Mode] Live change: %s -> %s. Subscribers to OnScoringModeChanged rebuild from here."),
+		*TraceScoringModeLabel(TraceGameState->GetScoringMode()), *TraceScoringModeLabel(DesiredMode));
+
+	PublishScoringMode();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1091,19 +1308,15 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 			TraceGameState->BlueScore, TraceGameState->OrangeScore);
 	}
 
-	// The mercy rule, if it is switched on at all, is decided before anything is restarted: there is
-	// no point kicking off into a match that has just ended.
-	if (bCounts && bEndMatchAtScoreToWin)
+	// THE MERCY RULE IS DECIDED BEFORE ANYTHING IS RESTARTED (spec v4 §6). There is no point kicking
+	// off into a match that has just ended, and CheckMercyRule does its own field reset before the
+	// results screen takes the frame.
+	//
+	// This is the only remaining early exit from a match. The score cap that used to sit here is
+	// deleted: the clock decides the match now.
+	if (bCounts && CheckMercyRule(TEXT("capture")))
 	{
-		const int32 ScoreToWin = FMath::Max(1, UTraceSettings::Get().ScoreToWin);
-		if (TraceGameState->GetScore(ScoringTeam) >= ScoreToWin)
-		{
-			// Still put everyone back on their pads: the results screen looks past the players, and
-			// leaving ten pawns piled in one endzone behind it reads as the game having frozen.
-			ResetPlayersToSpawns();
-			FinishMatch(ScoringTeam);
-			return;
-		}
+		return;
 	}
 
 	// Kickoff, then the reset. Both orders release the outgoing holder (and with them the trace);
@@ -1169,6 +1382,16 @@ bool ATraceGameMode::CheckEndzoneScoreForCarrier(ATraceCharacter* InCharacter, c
 	{
 		ATraceEndzone* Zone = *It;
 		if (!IsValid(Zone) || Zone->Trigger == nullptr)
+		{
+			continue;
+		}
+
+		// DISARMED ZONES DO NOT SCORE. The arena builds both shapes — full-width endzones for mode A
+		// and narrow goals for mode B — and arms one pair, so two of the four ATraceEndzone actors
+		// in the world are always inactive. Without this test a mode-B match could award a point off
+		// the disarmed FULL-WIDTH endzone, i.e. score by walking over the goal line anywhere along a
+		// 9600 uu sideline, which is precisely the thing mode B exists to stop.
+		if (!Zone->IsZoneActive())
 		{
 			continue;
 		}
@@ -1763,16 +1986,42 @@ void ATraceGameMode::RunVerificationStep()
 			const FVector Across = FVector::CrossProduct(Along, FVector::UpVector).GetSafeNormal();
 			const FVector Midpoint = (SegmentStart + SegmentEnd) * 0.5;
 
+			// NEVER THE CARRIER. This loop used to take the first living enemy, which is the same
+			// test phase 1 used to pick the new holder — so the pawn teleported onto the trace was
+			// the pawn now carrying the Core. On the v4 field that is fatal to the test: the
+			// residual trace of a turnover early in a half lies near a spawn, the endzone is 2400uu
+			// deep (X -16800..-14400), and the dash positions land INSIDE it. Teleporting the
+			// carrier there scores, which resets the field and clears the very trace the sweep was
+			// about to cross — so every run reported "did nothing - FAIL" while the mechanic was
+			// working perfectly (Trace.TestParry kills 4/4 unparried on the same build).
+			//
+			// A non-carrier crossing the same ground is inert, so the sweep resolves against the
+			// trace instead of against the scoreboard. Falling back to the carrier keeps the test
+			// running on a roster too small to offer anyone else rather than silently stalling.
 			ATraceCharacter* Tripper = nullptr;
+			ATraceCharacter* CarrierFallback = nullptr;
+			const ATraceCharacter* CoreCarrier = TheCore->GetCarrier();
 			for (const TWeakObjectPtr<ATraceCharacter>& Weak : TrackedCharacters)
 			{
 				ATraceCharacter* Candidate = Weak.Get();
-				if (Candidate != nullptr && Candidate != TraceOwner && Candidate->IsAlive()
-					&& Candidate->GetTeam() != ETraceTeam::None && Candidate->GetTeam() != TraceOwner->GetTeam())
+				if (Candidate == nullptr || Candidate == TraceOwner || !Candidate->IsAlive()
+					|| Candidate->GetTeam() == ETraceTeam::None || Candidate->GetTeam() == TraceOwner->GetTeam())
 				{
-					Tripper = Candidate;
-					break;
+					continue;
 				}
+
+				if (Candidate == CoreCarrier)
+				{
+					CarrierFallback = Candidate;
+					continue;
+				}
+
+				Tripper = Candidate;
+				break;
+			}
+			if (Tripper == nullptr)
+			{
+				Tripper = CarrierFallback;
 			}
 			if (Tripper == nullptr)
 			{
@@ -1790,9 +2039,13 @@ void ATraceGameMode::RunVerificationStep()
 				Movement->StartDash();
 			}
 
+			// isCarrier is printed because it is the one condition that invalidates the whole run:
+			// a carrier teleported onto a trace that happens to lie in an endzone scores instead of
+			// dashing, and the FAIL that follows is the harness's, not the game's.
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[TRIPTEST %d] %s (enemy of %s) starts a dash at %s, aimed across segment %d of the residual trace at %s. TraceOwner emitting=%d."),
-				VerifyIteration + 1, *GetNameSafe(Tripper), *GetNameSafe(TraceOwner), *DashStart.ToCompactString(),
+				TEXT("[TRIPTEST %d] %s (enemy of %s, isCarrier=%d) starts a dash at %s, aimed across segment %d of the residual trace at %s. TraceOwner emitting=%d."),
+				VerifyIteration + 1, *GetNameSafe(Tripper), *GetNameSafe(TraceOwner),
+				(Tripper == CoreCarrier) ? 1 : 0, *DashStart.ToCompactString(),
 				SegmentIndex, *Midpoint.ToCompactString(), TraceOwner->Trail->IsEmitting() ? 1 : 0);
 			return;
 		}
@@ -2026,6 +2279,16 @@ void ATraceGameMode::BeginMatch()
 	TraceGameState->BlueScore = 0;
 	TraceGameState->OrangeScore = 0;
 	TraceGameState->OnRep_Scores();
+
+	// A match that is starting has not ended. Cleared for the same reason the scores are: nothing
+	// guarantees this GameState is fresh, and a stale "MERCY RULE" on the results screen of the next
+	// match would be a lie nobody would think to look for.
+	TraceGameState->SetMatchResult(ETraceTeam::None, ETraceMatchEndReason::NotEnded);
+
+	// The mode is latched for the match at the opening whistle in the sense that this is the last
+	// unconditional publish; a live edit after this point still takes effect through the poll, which
+	// is exactly what A/B playtesting needs.
+	PublishScoringMode();
 
 	TraceGameState->TraceMatchState = ETraceMatchState::InProgress;
 	TraceGameState->ForceNetUpdate();
@@ -2320,6 +2583,8 @@ void ATraceGameMode::HandleHalfExpired()
 		return;
 	}
 
+	// The clock is now the ONLY way a match reaches full time, and the highest score at that moment
+	// wins. Equal scores are a genuine draw — there is no cap to break the tie against any more.
 	ETraceTeam Winner = ETraceTeam::None;
 	if (TraceGameState->BlueScore > TraceGameState->OrangeScore)
 	{
@@ -2330,7 +2595,7 @@ void ATraceGameMode::HandleHalfExpired()
 		Winner = ETraceTeam::Orange;
 	}
 
-	FinishMatch(Winner);
+	FinishMatch(Winner, ETraceMatchEndReason::Clock);
 }
 
 void ATraceGameMode::BeginHalfTimeBreak()
@@ -2434,13 +2699,18 @@ void ATraceGameMode::GrantCoreToTeam(ETraceTeam Team)
 	UE_LOG(LogTraceGame, Log, TEXT("Kickoff: the Core goes to %s."), *TraceTeamName(Team).ToString());
 }
 
-void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam)
+void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Reason)
 {
 	ATraceGameState* TraceGameState = GetTraceGameState();
 	if (TraceGameState == nullptr || TraceGameState->TraceMatchState == ETraceMatchState::PostMatch)
 	{
 		return;
 	}
+
+	// Published BEFORE the phase flips to PostMatch, so no client can ever draw one frame of the
+	// results screen with a stale "NotEnded" reason on it. Both properties are on the same actor and
+	// the same net update, but the ordering costs nothing and removes the question.
+	TraceGameState->SetMatchResult(WinningTeam, Reason);
 
 	// Every clock this class owns stops here, including the interval — a FinishMatch triggered early
 	// (a mercy-rule win, a forfeit) during half time must not have the second half start underneath
@@ -2460,9 +2730,11 @@ void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam)
 
 	// Players keep their pawns and keep respawning after the whistle — the HUD switches to the FINAL
 	// banner, and leaving everyone alive means nobody is staring at a corpse on the results screen.
-	UE_LOG(LogTraceGame, Log, TEXT("Match over. Winner: %s (Blue %d - Orange %d)"),
+	UE_LOG(LogTraceGame, Display, TEXT("Match over by %s. Winner: %s (Blue %d - Orange %d, %s)"),
+		TraceMatchEndReasonHeadline(Reason),
 		(WinningTeam == ETraceTeam::None) ? TEXT("draw") : *TraceTeamName(WinningTeam).ToString(),
-		TraceGameState->BlueScore, TraceGameState->OrangeScore);
+		TraceGameState->BlueScore, TraceGameState->OrangeScore,
+		*TraceScoringModeLabel(TraceGameState->GetScoringMode()));
 
 	// PostMatch is a phase with an exit, not a dead end. The HUD renders the same countdown from
 	// the same constant, so what the player is told is what actually happens.

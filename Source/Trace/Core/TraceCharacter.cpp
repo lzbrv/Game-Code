@@ -209,18 +209,18 @@ namespace TraceCharacterLayout
 	/** Keeps the crouched eye inside the capsule, so a slide can never poke the camera up through it. */
 	constexpr float CrouchedEyeCapsuleMargin = 6.f;
 
-	/**
-	 * How far the body leans forward at full crouch, in degrees, about the mesh's own foot pivot.
-	 *
-	 * An approximation and knowingly so: there is no crouch or slide animation in the Mannequin set
-	 * (see UpdateCrouchPresentation), so the alternatives were a standing figure inside a
-	 * half-height capsule - which reads as a bug - or squashing the mesh, which reads as a different
-	 * bug. 20 degrees is enough to say "low and moving" from across the arena while keeping the mass
-	 * of the body over the capsule; past ~30 the head starts visibly outrunning the collision.
-	 */
-	constexpr float CrouchLeanPitch = 20.f;
+	// CrouchLeanPitch (20 degrees) WAS HERE. It is now UTraceSettings::SlidePoseLeanDegrees, promoted
+	// along with the rest of the slide pose (drop, roll, anim rate, blend speed) because spec v4 §1
+	// asks for a slide pose the user can actually look at and retune, and a pose whose only dial is a
+	// recompile is not one. See UpdateCrouchPresentation().
 
-	/** Rate constants for the crouch lean and the skid streak. Fast enough not to feel laggy. */
+	/**
+	 * How fast the first-person viewmodel's own crouch dip follows the slide.
+	 *
+	 * Deliberately still a constant, and deliberately NOT UTraceSettings::SlidePoseBlendSpeed: this is
+	 * the gun in front of the camera, not the third-person body, and they are tuned by different
+	 * people looking at different things. Fast enough not to feel laggy.
+	 */
 	constexpr float CrouchLeanInterpSpeed = 9.f;
 
 	/** Ground speed at which the skid streak reaches full length. */
@@ -1176,8 +1176,34 @@ UTraceCharacterMovementComponent* ATraceCharacter::GetTraceMovement() const
 	return Cast<UTraceCharacterMovementComponent>(GetCharacterMovement());
 }
 
+#if !UE_BUILD_SHIPPING
+/**
+ * Dev only. Forces the third-person camera regardless of the Core, so the procedural slide pose can
+ * actually be LOOKED AT.
+ *
+ * It exists because the pose is the one part of spec v4 §1 that cannot be verified from a log line,
+ * and the pawn a headless run drives is in first person — where its own body is deliberately hidden.
+ * Bots are the only other sliding bodies and they are specks at arena scale. Cheat-flagged, compiled
+ * out of shipping, and it changes nothing but which camera the local player looks through.
+ */
+int32 GTraceForceThirdPerson = 0;
+static FAutoConsoleVariableRef CVarTraceForceThirdPerson(
+	TEXT("Trace.ForceThirdPerson"),
+	GTraceForceThirdPerson,
+	TEXT("Dev only. Non-zero forces the third-person camera on the local player, so the slide pose and "
+	     "the carry blend can be inspected without holding the Core."),
+	ECVF_Cheat);
+#endif
+
 bool ATraceCharacter::WantsFirstPersonView() const
 {
+#if !UE_BUILD_SHIPPING
+	if (GTraceForceThirdPerson != 0)
+	{
+		return false;
+	}
+#endif
+
 	// The entire rule. Carrying the Core is the one state that needs the space behind you visible,
 	// because the trail you are laying there is the only thing that can kill you.
 	return !bIsCarrier;
@@ -2165,31 +2191,76 @@ void ATraceCharacter::UpdateCrouchPresentation(float DeltaSeconds)
 		return;   // nothing is drawn there
 	}
 
-	// The slide is client-predicted and server-simulated from the same saved moves, so a bystander's
-	// copy of a sliding player reaches this state on its own: no RPC, no replicated presentation
-	// flag, and the lean cannot disagree with the movement that caused it.
+	// --- THE SLIDE POSE (spec v4 §1) — PROCEDURAL, BECAUSE THERE IS NO STOCK SLIDE ANIMATION ------
+	//
+	// The Demo 4 notes ask: "If unreal has a default slide animation for the mannequins, please add
+	// that in." IT DOES NOT. The Mannequin set Scripts/import-mannequin.sh brings in is Death, Jump,
+	// Pistol, Rifle and Unarmed locomotion — BS_Idle_Walk_Run and MM_Idle — and there is no slide and
+	// no crouch anywhere in Templates/TemplateResources or Engine/Content. Nothing below is a shipped
+	// Epic animation; it is an approximation assembled from the skeleton the project already has, and
+	// a real slide would still have to be authored or bought.
+	//
+	// Four things together sell it, and the fourth matters most:
+	//   RECLINE   the body tips BACK over its own feet (SlidePoseLeanDegrees), feet leading, which is
+	//             the Apex/Titanfall silhouette.
+	//   DROP      the whole mesh sinks toward the deck (SlidePoseDropUU). The capsule deliberately
+	//             does NOT shrink — it is the single source of truth for hitscan, for the pose history
+	//             the server rewinds and for the trail trip test — so this is the only thing that
+	//             makes a sliding player look low from the outside.
+	//   ROLL      a few degrees of lead shoulder (SlidePoseRollDegrees) so the pose is a body
+	//             committed to a direction rather than a mannequin tipped back on a hinge.
+	//   ANIM RATE the locomotion blend space is slowed almost to a stop (SlidePoseAnimRateScale).
+	//             Without this the legs sprint at full cadence underneath the reclined torso, which is
+	//             the one thing that unambiguously reads as a bug rather than as a move; near zero
+	//             they freeze mid-stride, which is close enough to "extended into a slide" to sell.
+	//
+	// All of it is driven off the same eased CrouchLeanAlpha, which is derived from the slide state —
+	// client-predicted and server-simulated from the same saved moves — so a bystander's copy reaches
+	// this pose on its own, with no RPC and no presentation flag, and it cannot disagree with the
+	// movement that caused it. And all of it is visual: nothing here feeds the simulation or moves a
+	// hit zone.
+	const UTraceSettings& PoseSettings = UTraceSettings::Get();
+
 	const float LeanTarget = bSliding ? 1.f : 0.f;
 	const float PreviousLean = CrouchLeanAlpha;
 	CrouchLeanAlpha = FMath::FInterpTo(CrouchLeanAlpha, LeanTarget, DeltaSeconds,
-		TraceCharacterLayout::CrouchLeanInterpSpeed);
+		FMath::Max(1.f, PoseSettings.SlidePoseBlendSpeed));
 
-	// --- The lean --------------------------------------------------------------------------------
-	//
-	// Composed as Lean * Yaw, not as a rotator sum: the mesh already carries MeshYaw (-90) to point
+	// Composed as Pose * Yaw, not as a rotator sum: the mesh already carries MeshYaw (-90) to point
 	// its +Y forward down the actor's +X, and adding a pitch to a rotator that is already yawed 90
-	// degrees rolls the character sideways instead of tipping it forward. Quaternion order in Unreal
-	// is "apply the right one first", so this yaws the mesh into place and then pitches it about the
-	// ACTOR's own Y axis, which is the axis a body leans about.
+	// degrees rolls the character sideways instead of tipping it back. Quaternion order in Unreal is
+	// "apply the right one first", so this yaws the mesh into place and THEN pitches and rolls it
+	// about the ACTOR's own Y and X axes, which are the axes a body leans and lists about.
 	//
-	// The pivot is the mesh origin, which sits at the bottom of the capsule (MeshOffsetZ), i.e. at
-	// the feet — so the body tips over its feet rather than swinging about its waist.
+	// The pivot is the mesh origin, which sits at the bottom of the capsule (MeshOffsetZ), i.e. at the
+	// feet — so the body tips over its feet rather than swinging about its waist, and the head travels
+	// while the feet stay planted on the skid streak.
 	if (FMath::Abs(CrouchLeanAlpha - PreviousLean) > 0.001f)
 	{
 		if (USkeletalMeshComponent* MeshComp = GetMesh())
 		{
+			const float LeanDegrees = FMath::Clamp(PoseSettings.SlidePoseLeanDegrees, 0.f, 70.f);
+			const float RollDegrees = FMath::Clamp(PoseSettings.SlidePoseRollDegrees, -40.f, 40.f);
+			const float DropUU      = FMath::Clamp(PoseSettings.SlidePoseDropUU, 0.f, 80.f);
+
 			const FQuat YawQuat(FRotator(0.f, TraceCharacterLayout::MeshYaw, 0.f));
-			const FQuat LeanQuat(FRotator(CrouchLeanAlpha * TraceCharacterLayout::CrouchLeanPitch, 0.f, 0.f));
-			MeshComp->SetRelativeRotation(LeanQuat * YawQuat);
+			const FQuat PoseQuat(FRotator(
+				CrouchLeanAlpha * LeanDegrees,   // pitch: positive tips the body BACK, feet leading
+				0.f,
+				CrouchLeanAlpha * RollDegrees)); // roll: the lead shoulder
+			MeshComp->SetRelativeRotation(PoseQuat * YawQuat);
+
+			// Straight down from the standing offset. Kept modest and clamped because the feet sit at
+			// the mesh origin: drop far enough and they go through the deck. The recline is already
+			// bringing the head down by roughly (1 - cos(lean)) of the body height, so this only has to
+			// finish the job.
+			MeshComp->SetRelativeLocation(FVector(
+				0.f, 0.f, TraceCharacterLayout::MeshOffsetZ - CrouchLeanAlpha * DropUU));
+
+			// THE ONE THAT STOPS IT LOOKING LIKE A BUG. Lerped rather than switched so the legs wind
+			// down into the slide and spin back up out of it, instead of snapping.
+			MeshComp->GlobalAnimRateScale = FMath::Lerp(
+				1.f, FMath::Clamp(PoseSettings.SlidePoseAnimRateScale, 0.f, 1.f), CrouchLeanAlpha);
 		}
 	}
 

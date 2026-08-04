@@ -39,8 +39,21 @@
 //                       invulnerability sources compose without clobbering each other. Read it
 //                       before changing either.
 //
-// VISUALLY (§3) the trace is "a blur created where your character model has passed through": a
-// chain of character-shaped after-images, not a wall and not a tube. See RebuildVisuals().
+// VISUALLY (§3, and spec v4 §2 "change the look of the trace to match the new mannequin models")
+// the trace is "a blur created where your character model has passed through". It is drawn as TWO
+// layers, both derived from the same lethal point set:
+//
+//   THE GHOSTS   Pooled UPoseableMeshComponents wearing the holder's own Mannequin, frozen at the
+//                pose the holder was actually in, dropped every GhostSpacing uu along the path.
+//                These are the thing the player reads: they are unmistakably a person.
+//
+//   THE SMEAR    A continuous body-shaped extrusion along every lethal segment, dimmer, which is
+//                what makes the trace a BLUR rather than a row of statues — and, far more
+//                importantly, what keeps the drawn thing continuous where the ghosts are discrete.
+//                The kill volume is continuous, so the drawing has to be too, or a player will
+//                look at the gap between two ghosts and reasonably conclude they can run it.
+//
+// See RebuildVisuals() and the block comment above it for the numbers and the justification.
 //
 // Clients only ever *read* TrailPoints: they rebuild a pooled set of meshes from it.
 
@@ -62,8 +75,37 @@ class AController;
 class ATraceCharacter;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
+class UPoseableMeshComponent;
+class USkeletalMeshComponent;
 class UStaticMesh;
 class UStaticMeshComponent;
+
+/**
+ * One character-shaped after-image that has been dropped on the path (spec v4 §2).
+ *
+ * Deliberately NOT one-per-trail-point. A trail point every 60uu for 2 seconds is ~27 points, and a
+ * posed skeletal mesh per point does not survive ten players. A record is created only when the
+ * newest LETHAL point is GhostSpacing uu clear of the last one, which is what makes the ghost count
+ * a function of distance travelled rather than of point density.
+ *
+ * BirthServerTime is copied from the trail point the ghost was placed at, and is the only thing that
+ * retires it: a ghost dies exactly when the piece of trace it stands on does, so the after-images and
+ * the lethal polyline can never end in different places.
+ */
+struct FTraceGhostRecord
+{
+	/** Shared-clock birth time of the trail point this ghost was placed at. */
+	float BirthServerTime = 0.f;
+
+	/** The trail point itself, kept so the GhostSpacing test measures along the path, not the mesh. */
+	FVector PathLocation = FVector::ZeroVector;
+
+	/** World transform for the posed mesh: the trail point, plus the character's mesh offset. */
+	FTransform MeshTransform = FTransform::Identity;
+
+	/** True once a pose was successfully copied into the pooled component holding this record. */
+	bool bPosed = false;
+};
 
 /**
  * Lays, replicates, evaluates and draws the Core holder's trace.
@@ -325,9 +367,6 @@ private:
 	TObjectPtr<UStaticMesh> CylinderMesh = nullptr;
 
 	UPROPERTY()
-	TObjectPtr<UStaticMesh> SphereMesh = nullptr;
-
-	UPROPERTY()
 	TObjectPtr<UMaterialInterface> TrailMaterial = nullptr;
 
 	/**
@@ -338,29 +377,80 @@ private:
 	bool bTrailMaterialIsNeon = false;
 
 	/**
-	 * Pooled after-image meshes, THREE per trail point, interleaved: [i*3+0] legs, [i*3+1] torso,
-	 * [i*3+2] head. See ETraceGhostPart and RebuildVisuals().
+	 * THE SMEAR. Pooled static meshes, TWO per lethal SEGMENT, interleaved: [i*2+0] body, [i*2+1] head.
 	 *
-	 * The silhouette is sized from the same UTraceSettings TrailRadius/TrailHeight the server's trip
-	 * test uses, so what you dash at is what kills you — an after-image narrower than its own lethal
-	 * volume would be a trap, not a warning.
+	 * One element per SEGMENT, not per point, and that is the whole reason this layer is trustworthy:
+	 * an element spans exactly from its segment's start to its segment's end (plus one TrailRadius of
+	 * overlap at interior joints, which covers the wedge on the outside of a corner), so the drawn
+	 * smear is the lethal polyline and not an approximation of it.
+	 *
+	 * Sized from the same UTraceSettings TrailRadius/TrailHeight the server's trip test uses, so what
+	 * you dash at is what kills you — a smear narrower than its own lethal volume would be a trap.
 	 */
 	UPROPERTY(Transient)
-	TArray<TObjectPtr<UStaticMeshComponent>> GhostMeshes;
+	TArray<TObjectPtr<UStaticMeshComponent>> SmearMeshes;
 
-	/** Parallel to GhostMeshes — one MID per pooled component, created once with it. */
+	/** Parallel to SmearMeshes — one MID per pooled component, created once with it. */
 	UPROPERTY(Transient)
-	TArray<TObjectPtr<UMaterialInstanceDynamic>> GhostMaterials;
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> SmearMaterials;
 
 	/**
-	 * Parallel to GhostMeshes. The brightness each piece WOULD have with the camera far away, i.e.
+	 * Parallel to SmearMeshes. The brightness each piece WOULD have with the camera far away, i.e.
 	 * before ApplyProximityGlowFade() attenuates it. Split out because the rebuild is guarded by a
 	 * dirty check while the proximity fade has to run every frame, so the two cannot share a pass.
 	 */
-	TArray<float> GhostBaseGlow;
+	TArray<float> SmearBaseGlow;
 
 	/** Parallel again: the proximity scale last actually written, so the pass can skip no-op writes. */
-	TArray<float> GhostAppliedGlowScale;
+	TArray<float> SmearAppliedGlowScale;
+
+	// ------------------------------------------------------------------------------------------
+	// THE GHOSTS (spec v4 §2). Pooled posed Mannequins.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Pooled UPoseableMeshComponents, one per FTraceGhostRecord, index-aligned with GhostRecords.
+	 *
+	 * UPoseableMeshComponent and not USkeletalMeshComponent, deliberately: a skeletal mesh component
+	 * would carry an AnimInstance, evaluate a graph and tick a pose EVERY FRAME for something that is
+	 * frozen by definition. A poseable mesh has no anim graph at all — CopyPoseFromSkeletalComponent
+	 * writes the bones once, RefreshBoneTransforms is called once, and after that the component is a
+	 * static skinned draw with its tick disabled.
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UPoseableMeshComponent>> PoseGhosts;
+
+	/** Parallel to PoseGhosts. One MID per ghost, bound to EVERY material slot of the Mannequin. */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> PoseGhostMaterials;
+
+	/** Parallel to PoseGhosts — same split as SmearBaseGlow / SmearAppliedGlowScale, same reason. */
+	TArray<float> PoseGhostBaseGlow;
+	TArray<float> PoseGhostAppliedGlowScale;
+
+	/**
+	 * The after-images currently standing on the path, oldest first. Purely local: the trace is
+	 * replicated as points and every machine derives its own ghosts from them.
+	 */
+	TArray<FTraceGhostRecord> GhostRecords;
+
+	/**
+	 * The Mannequin the ghosts are wearing, cached so a change of character art rebuilds the pool.
+	 * Weak: nothing here should keep a skinned asset alive.
+	 */
+	TWeakObjectPtr<UObject> GhostSkinnedAsset;
+
+	/**
+	 * Whether M_TraceNeon is usable on a skinned mesh at all.
+	 *
+	 * Resolved ONCE, lazily, because it is a hard gate: a material without MATUSAGE_SkeletalMesh is
+	 * silently swapped for the engine's default grey checkerboard on a skeletal draw, which would put
+	 * a herd of untinted grey mannequins on the pitch instead of a trace. If the answer is no, the
+	 * ghosts are switched off and the smear carries the whole trace on its own at full brightness —
+	 * i.e. exactly the pre-v4 look, which is worse but is not broken.
+	 */
+	enum class EGhostMaterialState : uint8 { Unknown, Usable, Unusable };
+	EGhostMaterialState GhostMaterialState = EGhostMaterialState::Unknown;
 
 	/** Set by OnTrailPointsChanged() and by every server-side mutation. */
 	bool bVisualsDirty = true;
@@ -397,11 +487,9 @@ private:
 	FLinearColor AppliedColor = FLinearColor::White;
 	bool bColorApplied = false;
 
-	/** Source-mesh metrics, read once from each asset so we never hardcode "the cylinder is 100uu". */
+	/** Source-mesh metrics, read once from the asset so we never hardcode "the cylinder is 100uu". */
 	FVector CylinderHalfSize = FVector(50.0);
 	FVector CylinderPivotOffset = FVector::ZeroVector;
-	FVector SphereHalfSize = FVector(50.0);
-	FVector SpherePivotOffset = FVector::ZeroVector;
 	bool bMeshMetricsCached = false;
 
 	// ------------------------------------------------------------------------------------------
@@ -440,7 +528,25 @@ private:
 	/** Client/listen server: rebuild only when something actually changed. */
 	void UpdateVisuals();
 	void RebuildVisuals();
-	void HideGhostsFrom(int32 FirstGhostIndex);
+
+	/** Layer 1: the continuous body-shaped extrusion along every lethal segment. */
+	void RebuildSmear(int32 LethalPointCount, int32 FirstOwnerHiddenPoint, float InvulnerableScale);
+
+	/**
+	 * Layer 2: retire the after-images whose stretch of trace has expired, drop a new one when the
+	 * path has moved on far enough, and push colour/brightness at all of them.
+	 */
+	void RebuildPoseGhosts(int32 LethalPointCount, int32 FirstOwnerHiddenPoint, float InvulnerableScale);
+
+	/** True when a posed Mannequin ghost can actually be drawn (art present AND material usable). */
+	bool AreCharacterGhostsEnabled() const;
+
+	/** The live skeletal mesh the ghosts copy their pose from, or null if this build has no art. */
+	USkeletalMeshComponent* GetGhostSourceMesh() const;
+
+	void HideSmearFrom(int32 FirstElementIndex);
+	void ReleasePoseGhostsFrom(int32 FirstGhostIndex);
+	void ClearGhostRecords();
 
 	/**
 	 * Local, cosmetic anti-whiteout guard: dims an after-image's emissive as the LOCAL camera gets
@@ -449,10 +555,13 @@ private:
 	 */
 	void ApplyProximityGlowFade();
 
-	/** Grows the pool to cover ghost @p GhostIndex. False once the pool cap is hit. */
-	bool EnsureGhost(int32 GhostIndex);
+	/** Grows the smear pool to cover element @p ElementIndex. False once the pool cap is hit. */
+	bool EnsureSmearElement(int32 ElementIndex);
 
-	/** Shared setup for one pooled after-image piece. */
+	/** Grows the ghost pool to cover ghost @p GhostIndex. False once the pool cap is hit. */
+	bool EnsurePoseGhost(int32 GhostIndex);
+
+	/** Shared setup for one pooled smear piece. */
 	UStaticMeshComponent* CreatePooledMesh(UStaticMesh* SourceMesh, UMaterialInstanceDynamic*& OutMaterial);
 
 	void UpdateTeamColor();

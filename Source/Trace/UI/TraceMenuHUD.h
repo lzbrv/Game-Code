@@ -23,7 +23,8 @@
 #include "UObject/ObjectMacros.h"
 #include "UObject/ObjectPtr.h"
 
-#include "UI/TraceMatchOptions.h"   // ETraceBotDifficulty
+#include "TraceSettings.h"           // ETraceScoringMode (the A/B toggle's own enum)
+#include "UI/TraceMatchOptions.h"   // ETraceBotDifficulty, TraceScoring
 #include "UI/TraceOptionsMenu.h"     // FTraceOptionsMenu
 
 #include "TraceMenuHUD.generated.h"
@@ -36,14 +37,21 @@ enum class ETraceMenuRow : uint8
 	Play       = 0,
 	Difficulty = 1,
 	/**
-	 * Sensitivity, invert-Y and the key bindings. Sits above QUIT rather than below DIFFICULTY's
-	 * blurb so that the two things a player might change before their first match are adjacent, and
-	 * the one destructive row stays last.
+	 * SCORING MODE — the A/B toggle (spec v4 §7). Directly under DIFFICULTY, and above SETTINGS,
+	 * because it is the second thing a playtester picks and the entire point of this build: the
+	 * notes ask for the two rulesets to be compared back to back, which means switching between them
+	 * has to be one keypress on the way into a match rather than a trip through a settings panel.
 	 */
-	Settings   = 2,
-	Quit       = 3,
+	Mode       = 2,
+	/**
+	 * Sensitivity, invert-Y and the key bindings. Sits above QUIT rather than below the blurb so
+	 * that the things a player might change before their first match are adjacent, and the one
+	 * destructive row stays last.
+	 */
+	Settings   = 3,
+	Quit       = 4,
 
-	Count      = 4
+	Count      = 5
 };
 
 UCLASS()
@@ -62,7 +70,7 @@ public:
 	/** Up / down. Clamped rather than wrapped: three rows wrap badly and clamping reads as solid. */
 	void MoveSelection(int32 Delta);
 
-	/** Left / right. Only the difficulty row responds. */
+	/** Left / right. Only the DIFFICULTY and SCORING MODE rows respond. */
 	void AdjustSelection(int32 Delta);
 
 	/** Enter / Space / left click on the selected row. */
@@ -81,6 +89,9 @@ public:
 	void MouseReleased();
 
 	ETraceBotDifficulty GetDifficulty() const { return Difficulty; }
+
+	/** The ruleset PLAY will launch. See ETraceScoringMode. */
+	ETraceScoringMode GetScoringMode() const { return ScoringMode; }
 
 	/**
 	 * True while the settings overlay owns the screen.
@@ -133,6 +144,16 @@ protected:
 private:
 	ETraceMenuRow Selected = ETraceMenuRow::Play;
 	ETraceBotDifficulty Difficulty = TraceDifficulty::Default;
+
+	/**
+	 * The scoring mode PLAY will launch (spec v4 §7).
+	 *
+	 * Seeded from UTraceSettings in BeginPlay rather than hardcoded to mode A, so returning to the
+	 * title screen after a mode-B match comes back on mode B. Somebody A/B testing plays several
+	 * matches of one mode in a row; making them re-pick it every single time is how a toggle stops
+	 * being used.
+	 */
+	ETraceScoringMode ScoringMode = ETraceScoringMode::EndzoneStatusCore;
 
 	/** Screen rects of the rows as of the last draw, used for mouse hover and click hit testing. */
 	FBox2D RowRects[static_cast<int32>(ETraceMenuRow::Count)];

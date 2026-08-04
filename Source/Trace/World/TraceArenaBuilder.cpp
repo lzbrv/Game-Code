@@ -4,7 +4,9 @@
 
 #include "Trace.h"
 #include "TraceTypes.h"
+#include "TraceSettings.h"              // GoalWidthFieldFraction / GoalHeightUU (spec v4 section 7)
 #include "Core/TraceCharacter.h"        // PlayerHeightUU() reads the capsule off the CDO
+#include "Core/TraceGameState.h"        // GetScoringModeFor - the one authority on which mode runs
 #include "Gameplay/TraceEndzone.h"
 #include "World/TraceTeamPlayerStart.h"
 
@@ -436,9 +438,33 @@ namespace TraceArenaConstants
 
 	// --- Interior layout -------------------------------------------------------------------------
 	//
-	// Everything below is a FRACTION of HalfLength() / HalfWidth(), so the whole arena rescales
-	// coherently when FieldLength / FieldWidth change. The absolute numbers in the comments are for
-	// the 24000 x 9600 field of spec v3 section 7.
+	// TWO ANCHORS, AND THE 3.5:1 LENGTHENING IS WHY.
+	//
+	// Everything used to be a FRACTION of HalfLength() / HalfWidth(). That rescales coherently, and
+	// for the corner banks, the flanks and the lighting it is still exactly right. It is WRONG for
+	// the cover at the business end of the field, and the 24000 -> 33600 pass is what exposed it:
+	// the spawn pads sit a fraction of the half length IN FRONT OF THE GOAL LINE (see
+	// StartInsetFraction), so as the field grows the pad line and a length-fraction cover block move
+	// at different rates and slide through each other. Checked on the new field: the old block D at
+	// 0.6083 would have landed at X = 10215 against a pad at X = 12720... and the old block E at
+	// 0.75 would have landed at (12600, 2100) with a pad at (12720, 1440) INSIDE its 45-degree
+	// footprint. A pawn spawned inside solid geometry, silently, from a change of field length.
+	//
+	// So the scatter is now two lists with two anchors:
+	//
+	//   ApproachCover  measured in uu BACK FROM THE GOAL LINE. These are the pieces whose job is
+	//                  defined relative to the goal - the tower a defender fights around, the block
+	//                  a carrier has to beat - and their distances to the goal line, to the gate and
+	//                  to the spawn fan are the tuned numbers worth preserving. They do not move
+	//                  when the field is lengthened; the field grows BEHIND them.
+	//   MidfieldCover  a fraction of the span from the centre line to the innermost approach block.
+	//                  These are the pieces that fill the middle, and they are exactly what has to
+	//                  stretch when the field does - otherwise "lengthen the map" produces two
+	//                  crowded ends with an empty middle, which is the failure this section of the
+	//                  spec explicitly warns about.
+	//
+	// The absolute numbers in the comments are for the 33600 x 9600 field: HalfLength 16800,
+	// HalfWidth 4800, goal line at X = 14400, spawn fan at X = 12720 (Y = 0 / +/-1440 / +/-2880).
 	//
 	// The design, laid out for ONE half and mirrored through the centre line (see the header note on
 	// why the sketch's asymmetry is deliberately not reproduced):
@@ -448,10 +474,32 @@ namespace TraceArenaConstants
 	// or from the centre to either goal, is clear for its whole length, and so that the two 3.5x
 	// landmarks (the top-centre tower and the goal-approach tower) are visible from most of the
 	// field. Every block below is one of the sketch's three height classes and nothing in between.
+	//
+	// EVERY POSITION HERE WAS RE-CHECKED on the 33600 field, in the (+X, +Y) quadrant, against every
+	// other entry, against the centre diamond and its pylons, both lane pylons, the corner banks'
+	// inner edge (|Y| = 3300), the goal line, the mode-B goal posts at (14400, +/-1600) and the five
+	// spawn pads - and checked against the PAWN STANDOFF SHELLS, not the visible boxes. The shells
+	// are 26 uu proud on every side, so two blocks that look 120 uu apart leave a 68 uu channel,
+	// which is exactly one capsule diameter: a gap measured off the meshes is a gap that does not
+	// exist.
+	//
+	// The tightest shell-to-shell clearances after that check, so you know what you are working with
+	// if you move one:
+	//
+	//   C vs the bank toe .... 124 uu   (and the toe is a 39 uu step, so it is walkable, not a wall)
+	//   F vs AxisCover 1  .... 391 uu
+	//   G vs AxisCover 2  .... 549 uu
+	//   E vs a goal post  .... 453 uu
+	//   D vs the pad line .... 890 uu
+	//
+	// A block overlapping a spawn pad is a pawn spawned inside solid geometry; a block overlapping
+	// the bank is a block with its bottom step swallowed; a channel under 68 uu is a pocket a
+	// navmesh-less bot grinds in until stuck-evade fires. All three are silent.
 
 	struct FCoverSpec
 	{
-		float XFrac;        // of HalfLength
+		/** ApproachCover: uu back from the goal line. MidfieldCover: fraction of the midfield span. */
+		float XAnchor;
 		float YFrac;        // of HalfWidth
 		float SizeX;        // uu, before any rotation
 		float SizeY;        // uu
@@ -460,45 +508,55 @@ namespace TraceArenaConstants
 	};
 
 	/**
-	 * Mirrored into all four quadrants: +/-X (the half-time-fair mirror) and +/-Y.
+	 * The goal approach, measured BACK FROM THE GOAL LINE. Mirrored into all four quadrants.
 	 *
-	 * EVERY POSITION HERE WAS CHECKED, in the (+X, +Y) quadrant, against every other entry, against
-	 * the centre diamond and its pylons, the lane pylons, the corner banks' inner edge (|Y| = 3300),
-	 * the goal line (X = 9600) and the five player-start pads at X = 8400, Y = 0 / +/-1440 /
-	 * +/-2880 - and checked against the PAWN STANDOFF SHELLS, not the visible boxes. The shells are
-	 * 26 uu proud on every side, so two blocks that look 120 uu apart leave a 68 uu channel, which
-	 * is exactly one capsule diameter: a gap measured off the meshes is a gap that does not exist.
-	 *
-	 * The tightest shell-to-shell clearances after that check, so you know what you are working with
-	 * if you move one:
-	 *
-	 *   A vs LanePylon    .... 288 uu
-	 *   B vs C            .... 291 uu
-	 *   C vs D            .... 270 uu
-	 *   C vs the bank toe .... 124 uu   (and the toe is a 39 uu step, so it is walkable, not a wall)
-	 *
-	 * A block overlapping a spawn pad is a pawn spawned inside solid geometry; a block overlapping
-	 * the bank is a block with its bottom step swallowed; a channel under 68 uu is a pocket a
-	 * navmesh-less bot grinds in until stuck-evade fires. All three are silent.
+	 * Ordered outermost-first, and that matters: MidfieldSpan is taken from the LAST entry, which is
+	 * therefore the innermost approach block and the boundary between the two lists.
 	 */
-	static const FCoverSpec CoverBlocks[] =
+	static const FCoverSpec ApproachCover[] =
 	{
-		// A - long low bar, near the centre. The sketch's "long low bar", and the piece that stops
-		//     the run from a spawn to the centre diamond being a straight line.
-		{ 0.2000f, 0.4792f, 2600.f,  400.f, StructureHeight1x,   0.f },   // (2400, 2300)
-		// B - mid-half diamond in the spine. 2x, so it hides a standing body.
-		{ 0.3958f, 0.2500f, 1000.f, 1000.f, StructureHeight2x,  45.f },   // (4750, 1200)
-		// C - upright bar across the lane, 2x. Reads as a gate between the spine and the flank.
-		{ 0.5000f, 0.5208f,  400.f, 1300.f, StructureHeight2x,   0.f },   // (6000, 2500)
-		// D - low diamond on the endzone approach, 1x: shootable over, not hideable behind.
-		{ 0.6083f, 0.2708f, 1100.f, 1100.f, StructureHeight1x,  45.f },   // (7300, 1300)
 		// E - the 3.5x landmark tower of the goal approach. Visible from the far half; the piece a
-		//     defender fights around. Its Y span deliberately falls BETWEEN two spawn-pad rows.
-		{ 0.7500f, 0.4375f,  700.f,  700.f, StructureHeight35x, 45.f }    // (9000, 2100)
+		//     defender fights around. Its Y span deliberately falls BETWEEN two spawn-pad rows, and
+		//     1000 uu back leaves its 45-degree footprint 505 uu clear of the goal line, which is
+		//     what keeps it out of the mode-B goal posts.
+		{ 1000.f, 0.4375f,  700.f,  700.f, StructureHeight35x, 45.f },   // (13800, 2100)
+		// D - low diamond on the endzone approach, 1x: shootable over, not hideable behind.
+		{ 3400.f, 0.2708f, 1100.f, 1100.f, StructureHeight1x,  45.f },   // (11000, 1300)
+		// C - upright bar across the lane, 2x. Reads as a gate between the spine and the flank, and
+		//     it is the innermost approach block, so it also defines where the midfield ends.
+		{ 4800.f, 0.5208f,  400.f, 1300.f, StructureHeight2x,   0.f }    // (9600, 2500)
 	};
 
-	/** Mirrored in X only: one long 2x bar straddling the centreline of each half. */
-	static constexpr float AxisCoverXFrac = 0.4917f;   // 5900
+	/**
+	 * The midfield, as a fraction of the span from the centre line to the innermost ApproachCover
+	 * block. Mirrored into all four quadrants.
+	 *
+	 * THIS IS THE LIST THAT ANSWERS "adjusting the structures to match". The span it divides went
+	 * from 6000 uu to 9600 uu with the lengthening, so it gained a third entry: two blocks stretched
+	 * over the longer midfield would have left a 3900 uu hole where the old field had 2350, and a
+	 * hole that size at eye height is not "open space", it is a corridor with nothing in it.
+	 */
+	static const FCoverSpec MidfieldCover[] =
+	{
+		// A - long low bar. The sketch's "long low bar", and the piece that stops the run from the
+		//     centre diamond out into the half being a straight line.
+		{ 0.27f, 0.4792f, 2600.f,  400.f, StructureHeight1x,  0.f },   // (2592, 2300)
+		// F - mid-half diamond in the spine. 2x, so it hides a standing body.
+		{ 0.55f, 0.2917f, 1000.f, 1000.f, StructureHeight2x, 45.f },   // (5280, 1400)
+		// G - the new one. A larger 2x diamond on the outer lane, halfway between F and C, which is
+		//     the piece that keeps the second half of the midfield from being empty floor.
+		{ 0.80f, 0.3542f, 1200.f, 1200.f, StructureHeight2x, 45.f }    // (7680, 1700)
+	};
+
+	/**
+	 * Mirrored in X only: long 2x bars straddling the centreline of each half, so the shortest route
+	 * from the centre diamond to a goal is never a clear straight line.
+	 *
+	 * ONE -> TWO with the lengthening. The spine is the route every carrier takes and it is now
+	 * 16800 uu from the diamond to the goal line; a single bar in the middle of that leaves two
+	 * clear 6000 uu runs either side of it.
+	 */
+	static constexpr float AxisCoverXFracs[] = { 0.2400f, 0.5600f };   // 4032, 9408
 	static constexpr float AxisCoverSizeX = 2000.f;
 	static constexpr float AxisCoverSizeY = 500.f;
 
@@ -517,13 +575,19 @@ namespace TraceArenaConstants
 	static constexpr float TopCentreTowerSide = 800.f;
 
 	/**
-	 * The mid-lane pylons, one per quadrant: tall thin light columns marking the flank route.
+	 * The mid-lane pylons: tall thin light columns marking the flank route, each carrying a light
+	 * bridge out to the side wall.
 	 *
-	 * Moved in from (4200, 3400) to (4200, 2900) with the narrower field, which keeps them 400 uu
-	 * clear of the corner banks. They still carry the light bridges out to the side walls, which is
-	 * most of what stops a flank frame being empty sky.
+	 * ONE PER QUADRANT -> TWO. They are the only vertical structure in the outer lane, and the outer
+	 * lane is now 16800 uu long per half; a single column at 0.35 would have left 10000 uu of lane
+	 * with nothing standing in it, which is the "empty flank" failure the whole flank section exists
+	 * to answer. Two at 0.25 and 0.6667 put a column roughly every 5600 uu and give the light-bridge
+	 * span a rhythm.
+	 *
+	 * Y stays at 0.6042 (2900) - the field width did not change - which keeps them 290 uu clear of
+	 * the corner banks' toe.
 	 */
-	static constexpr float LanePylonXFrac = 0.3500f;   // 4200
+	static constexpr float LanePylonXFracs[] = { 0.2500f, 0.6667f };   // 4200, 11200
 	static constexpr float LanePylonYFrac = 0.6042f;   // 2900
 	static constexpr float LanePylonSide = 220.f;
 	static constexpr float LanePylonHeight = 1300.f;
@@ -537,7 +601,10 @@ namespace TraceArenaConstants
 	 * diamond is a 1900 uu square yawed 45, i.e. |x| + |y| <= 1344, and a pylon at (2200, 1100)
 	 * sums to 3300.
 	 */
-	static constexpr float DaisPylonXFrac = 0.1833f;   // 2200
+	// 0.1833 -> 0.1310, i.e. the SAME 2200 uu on the longer field. These ring the centre diamond, and
+	// the diamond did not get bigger when the field did; left as a fraction of the half length they
+	// would have marched out to 3080 and stopped reading as its ring.
+	static constexpr float DaisPylonXFrac = 0.1310f;   // 2200
 	static constexpr float DaisPylonYFrac = 0.2292f;   // 1100
 	static constexpr float DaisPylonSide = 240.f;
 	static constexpr float DaisPylonHeight = 1400.f;
@@ -588,14 +655,25 @@ namespace TraceArenaConstants
 		float Height;
 	};
 
-	/** Side walls (constant Y). Mirrored into +/-X and +/-Y, so 0.f is built once per wall. */
+	/**
+	 * Side walls (constant Y). Mirrored into +/-X and +/-Y, so 0.f is built once per wall.
+	 *
+	 * FIVE -> SEVEN for the 3.5:1 field. The row's job is to give 33600 uu of wall a beat you can
+	 * judge your own speed against, and a beat is a function of SPACING, not of count: at the old
+	 * five fractions the gap between the centre buttress and its neighbour would have gone from 2400
+	 * uu to 3360 and the next from 3600 to 5040. Seven lands them 2520 uu apart, which is the old
+	 * spacing to within a hundred uu. Tall (1600) and short (1050) alternate so the high rail they
+	 * carry has something to sit on every other bay.
+	 */
 	static const FButtressSpec SideButtresses[] =
 	{
 		{ 0.0000f, 1700.f },   // 0      - midfield marker, the tallest of the row
-		{ 0.2000f, 1050.f },   // 2400
-		{ 0.5000f, 1600.f },   // 6000
-		{ 0.6500f, 1050.f },   // 7800
-		{ 0.8500f, 1600.f }    // 10200  - behind the goal line, inside the endzone
+		{ 0.1500f, 1050.f },   // 2520
+		{ 0.3000f, 1600.f },   // 5040
+		{ 0.4500f, 1050.f },   // 7560
+		{ 0.6000f, 1600.f },   // 10080
+		{ 0.7300f, 1050.f },   // 12264
+		{ 0.8600f, 1600.f }    // 14448  - just behind the goal line, inside the endzone
 	};
 
 	/** End walls (constant X). Mirrored into +/-Y and +/-X. Y = 0 is left clear for the scoring lane. */
@@ -637,9 +715,18 @@ namespace TraceArenaConstants
 	static constexpr float LaneStripeYFracs[] = { 0.4200f, 0.6600f };   // 2016, 3168
 	static constexpr float LaneStripeWidth = 72.f;
 
-	/** Corner pylons, in the dead space behind each goal line. */
-	static constexpr float CornerPylonXFrac = 0.8833f;   // 10600
-	static constexpr float CornerPylonYFrac = 0.8500f;   // 5100
+	/**
+	 * Corner pylons, in the dead space behind each goal line.
+	 *
+	 * NO LONGER A FRACTION OF THE HALF LENGTH. They belong to the ENDZONE, whose depth is an absolute
+	 * 2400 uu, so a length fraction slides them relative to the thing they are dressing: 0.8833 of
+	 * the new half length is X = 14840, which is 440 uu behind the goal line and 80 uu from the face
+	 * of a gate tower - two structures visibly fouling each other, from a change of field length.
+	 * They now stand at the MIDDLE OF THE ENDZONE (goal line + half the depth, X = 15600), which is
+	 * where they were in spirit on the old field and where they stay whatever the field does. Y is
+	 * still a width fraction, because the width is what it is dressing.
+	 */
+	static constexpr float CornerPylonYFrac = 0.8500f;   // 4080
 	static constexpr float CornerPylonSide = 300.f;
 	static constexpr float CornerPylonHeight = 1900.f;
 
@@ -653,8 +740,17 @@ namespace TraceArenaConstants
 	// tops and useless for the vertical face of a cover block. A lamp sitting on the deck 2000 uu
 	// away rakes across those faces and is what finally makes a slab read as a solid object rather
 	// than as a hole in the world.
-	static constexpr float LampXFracs[] = { 0.2000f, 0.5500f, 0.8800f };   // 2400, 6600, 10560
-	static constexpr float LampYFracs[] = { 0.3600f, 0.8000f };            // 2160, 4800
+	//
+	// THREE COLUMNS -> FOUR for the 3.5:1 field, and this one is not decoration. The lattice spacing
+	// has to stay near FloorLampRadius (4200) or neighbouring pools stop touching and the field goes
+	// back to being lit only by the three high directional lights - which is the exact condition that
+	// made a 900 uu cover block render as a featureless black shape. At the old three fractions the
+	// columns would have landed 5880 uu apart on the longer field, i.e. 1680 uu of gap between the
+	// edges of adjacent pools, in the two places (X ~ 4900 and ~ 12600) the new cover scatter lives.
+	// Four fractions land them 4032 uu apart, just inside the radius. Cost: 24 -> 32 unshadowed
+	// point lights.
+	static constexpr float LampXFracs[] = { 0.1400f, 0.3800f, 0.6200f, 0.8600f };   // 2352, 6384, 10416, 14448
+	static constexpr float LampYFracs[] = { 0.3600f, 0.8000f };                     // 1728, 3840
 
 	/**
 	 * Lamp height. MEASURED: this started at 500 and the floor directly beneath a lamp came back as a
@@ -685,6 +781,48 @@ namespace TraceArenaConstants
 	static constexpr float GateTowerSide = 420.f;
 	static constexpr float GateTowerHeight = 2300.f;
 	static constexpr float GateBeamSize = 300.f;
+
+	// --- MODE B: the goal (spec v4 section 7) ------------------------------------------------------
+	//
+	// Verbatim: "scoring should happen when the core is thrown into the goal or a player carries the
+	// core into the goal. The goal should not be the entire width of the map, like the endzone."
+	//
+	// THE SHAPE. A goal is the middle GoalWidthFieldFraction of the field width (a third, so 3200 uu
+	// on the 9600 uu field), from the goal line back to the end wall, and GoalHeightUU (700) tall. It
+	// is drawn as an actual goal: two posts standing ON the goal line at the edges of the mouth, a
+	// crossbar between them at the top of the volume, a lit sill across the mouth on the floor and a
+	// lit patch of floor inside it. That set of five lines is what makes the volume READ - a player
+	// has to be able to see, from midfield, both where the mouth is and how high it goes, because in
+	// mode B the throw is aimed at it.
+	//
+	// WHY THE POSTS BLOCK. They are the only piece of mode-B furniture with collision, and it is
+	// deliberate: a goal you can throw THROUGH the frame of is not a goal, and a post you can bounce
+	// a thrown Core off is the counterplay that makes aiming matter. They are thin (140 uu) and stand
+	// 1600 uu off the centre line, so they are nowhere near the running lanes a bot uses to reach the
+	// endzone - and they are pawn-blocking only in the sense every other pylon in the arena is.
+	//
+	// The DEPTH is the endzone depth, deliberately not its own dial: the goal occupies the middle
+	// third of the endzone footprint, so a Core thrown to the back of the net still counts and the
+	// two shapes cannot end up describing different rooms.
+	static constexpr float GoalPostSide = 140.f;
+	static constexpr float GoalPostOvershoot = 90.f;    // posts stand this far above the crossbar
+	static constexpr float GoalCrossbarSize = 120.f;
+
+	/** Floor sill across the goal mouth, and the lit patch behind it. */
+	static constexpr float GoalSillWidth = 90.f;
+	static constexpr float GoalPatchZ = 5.f;            // above PatchZ (4) so it wins the z-fight
+
+	/** Glow for the goal frame. Brighter than a gate tower: it is the thing being aimed at. */
+	static constexpr float GlowGoalFrame = 5.2f;
+
+	/**
+	 * Clamps on the two mode-B settings, so a live edit in PIE can never build a degenerate goal.
+	 * The upper width bound is 0.9 rather than 1.0 because a full-width "goal" is an endzone, and
+	 * silently rebuilding mode A inside mode B is worse than refusing.
+	 */
+	static constexpr float MinGoalWidthFraction = 0.05f;
+	static constexpr float MaxGoalWidthFraction = 0.90f;
+	static constexpr float MinGoalHeight = 120.f;
 }
 
 ATraceArenaBuilder::ATraceArenaBuilder()
@@ -854,15 +992,20 @@ float ATraceArenaBuilder::ClampedEndzoneDepth() const
 	return FMath::Clamp(EndzoneDepth, 100.f, HalfLength());
 }
 
+float ATraceArenaBuilder::GoalLineX() const
+{
+	// |X| of a goal line. ClampedEndzoneDepth(), never the raw property - see that function.
+	return HalfLength() - ClampedEndzoneDepth();
+}
+
 FBox ATraceArenaBuilder::GetEndzoneBounds(float EndSign) const
 {
 	const float Sign = (EndSign < 0.f) ? -1.f : 1.f;
 	const float HalfX = HalfLength();
-	const float Depth = ClampedEndzoneDepth();
 
 	// Goal line to end wall along X; sideline to sideline along Y; floor to wall top in Z. The Y
 	// term is the full half width on purpose - see EndzoneHalfWidth().
-	const float NearX = Sign * (HalfX - Depth);
+	const float NearX = Sign * GoalLineX();
 	const float FarX = Sign * HalfX;
 
 	const FBox Local(
@@ -870,6 +1013,46 @@ FBox ATraceArenaBuilder::GetEndzoneBounds(float EndSign) const
 		FVector(FMath::Max(NearX, FarX), EndzoneHalfWidth(), WallHeight));
 
 	return Local.TransformBy(GetActorTransform());
+}
+
+float ATraceArenaBuilder::GoalHalfWidth() const
+{
+	// The FRACTION IS OF THE FULL WIDTH, so halving it twice is correct and is the mistake to watch
+	// for: a third of the width is 3200 uu of mouth, i.e. 1600 either side of the centre line.
+	const float Fraction = FMath::Clamp(UTraceSettings::Get().GoalWidthFieldFraction,
+		TraceArenaConstants::MinGoalWidthFraction, TraceArenaConstants::MaxGoalWidthFraction);
+
+	// Never wider than the field itself, whatever the settings say.
+	return FMath::Min(HalfWidth(), FieldWidth * Fraction * 0.5f);
+}
+
+float ATraceArenaBuilder::ClampedGoalHeight() const
+{
+	return FMath::Clamp(UTraceSettings::Get().GoalHeightUU, TraceArenaConstants::MinGoalHeight, WallHeight);
+}
+
+FBox ATraceArenaBuilder::GetGoalBounds(float EndSign) const
+{
+	const float Sign = (EndSign < 0.f) ? -1.f : 1.f;
+	const float HalfX = HalfLength();
+	const float HalfY = GoalHalfWidth();
+
+	// Same depth as the endzone (goal line to end wall) - see the goal note in TraceArenaConstants -
+	// but only the goal mouth wide and only ClampedGoalHeight() tall. Those last two are the entire
+	// difference between mode B and mode A, and both of them are what the spec asked for.
+	const float NearX = Sign * GoalLineX();
+	const float FarX = Sign * HalfX;
+
+	const FBox Local(
+		FVector(FMath::Min(NearX, FarX), -HalfY, 0.f),
+		FVector(FMath::Max(NearX, FarX), HalfY, ClampedGoalHeight()));
+
+	return Local.TransformBy(GetActorTransform());
+}
+
+FBox ATraceArenaBuilder::GetScoringBounds(float EndSign) const
+{
+	return TraceIsGoalMode(ScoringMode) ? GetGoalBounds(EndSign) : GetEndzoneBounds(EndSign);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -936,6 +1119,19 @@ void ATraceArenaBuilder::BuildArena()
 
 	bArenaBuilt = true;
 
+	// WHICH SCORING SHAPE TO PRESENT, decided once here and re-applied whenever the authority says it
+	// changed (ApplyScoringModeInWorld). ATraceGameState is the authority and it is asked first; on a
+	// machine that has no game state yet - the editor preview, or a build that runs before the game
+	// mode has published - the settings page is the best available guess, and it is only a guess, so
+	// the later ApplyScoringMode call is what makes it right. Both shapes are built either way, so a
+	// wrong guess here costs a flag flip and nothing else.
+	{
+		const ETraceScoringMode PublishedMode = ATraceGameState::GetScoringModeFor(this);
+		ScoringMode = (GetWorld() != nullptr && GetWorld()->GetGameState() != nullptr)
+			? PublishedMode
+			: UTraceSettings::Get().ScoringMode;
+	}
+
 	// A dedicated server needs collision and triggers, nothing else: material shaders are not cooked
 	// for server targets and nothing there ever renders.
 	const bool bBuildVisuals = (GetNetMode() != NM_DedicatedServer);
@@ -973,7 +1169,11 @@ void ATraceArenaBuilder::BuildArena()
 		BuildFlanks(bBuildVisuals);
 	}
 
+	// BOTH scoring shapes, always. See the two-modes note in the header: the A/B toggle has to be
+	// survivable mid-match, and the only way to do that safely is to have already built what the
+	// other mode needs.
 	BuildEndzones(bBuildVisuals);
+	BuildGoals(bBuildVisuals);
 
 	if (HasAuthority())
 	{
@@ -990,14 +1190,23 @@ void ATraceArenaBuilder::BuildArena()
 
 	BuildPostProcess();
 
-	// Spelled out at Log because the proportion and the flat playfield width are the two things a
-	// playtester asks about first, and neither is readable from a screenshot.
+	// Present one of the two scoring shapes and disarm the other. Forced rather than early-returned
+	// on "the mode did not change", because at this point NOTHING has been presented yet: the goal
+	// furniture is built visible and the endzone triggers are built armed, so mode A needs this call
+	// exactly as much as mode B does.
+	ApplyScoringMode(ScoringMode);
+
+	// Spelled out at Log because the proportion, the flat playfield width and which game is being
+	// played are the things a playtester asks about first, and none of them is readable from a
+	// screenshot.
 	UE_LOG(LogTraceGame, Log,
-		TEXT("Arena built (%.0f x %.0f x %.0f uu, %.2f:1, flat playfield %.0f wide, banks %s at %.0f uu, visuals=%s, authority=%s): %d components."),
+		TEXT("Arena built (%.0f x %.0f x %.0f uu, %.2f:1, flat playfield %.0f wide, banks %s at %.0f uu, ")
+		TEXT("mode %s, visuals=%s, authority=%s): %d components."),
 		FieldLength, FieldWidth, WallHeight,
 		(FieldWidth > 0.f) ? (FieldLength / FieldWidth) : 0.f,
 		BankInnerHalfWidth() * 2.f,
 		bBuildCornerBanks ? TEXT("on") : TEXT("off"), BankHeight,
+		*TraceScoringModeLabel(ScoringMode),
 		bBuildVisuals ? TEXT("yes") : TEXT("no"),
 		HasAuthority() ? TEXT("yes") : TEXT("no"),
 		GetComponents().Num());
@@ -1130,7 +1339,10 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 			FVector(FieldLength, TraceArenaConstants::WallBandSize, TraceArenaConstants::WallBandSize),
 			NeutralRibMID, false, TEXT("WallKickY"));
 
-		const int32 RibsPerHalf = FMath::Clamp(FMath::FloorToInt(HalfX / TraceArenaConstants::WallRibSpacing), 0, 8);
+		// Cap raised 8 -> 12 with the 3.5:1 field: the ribs are spaced in ABSOLUTE uu (2200), so the
+		// count is what grows when the field does. At HalfX 16800 this wants 7, and the old cap of 8
+		// was one rib away from silently truncating the row at 17600 uu.
+		const int32 RibsPerHalf = FMath::Clamp(FMath::FloorToInt(HalfX / TraceArenaConstants::WallRibSpacing), 0, 12);
 		for (int32 Index = -RibsPerHalf; Index <= RibsPerHalf; ++Index)
 		{
 			AddMeshBlock(CubeMesh,
@@ -1376,7 +1588,7 @@ void ATraceArenaBuilder::BuildCentreDais(bool bBuildVisuals)
 		PedestalRingMID, /*bCastShadow=*/false, TEXT("PedestalBase"));
 
 	// Four light pylons standing around the objective. They are the tallest interior structures and
-	// they are what makes the centre findable from the far end of a 24000 uu field.
+	// they are what makes the centre findable from the far end of a 33600 uu field.
 	UMaterialInstanceDynamic* PylonBodyMID = MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f,
 		TraceArenaConstants::NeonNeutral, 0.026f);
 	UMaterialInstanceDynamic* PylonNeonMID = MakeNeonMID(TraceArenaConstants::NeonNeutral, TraceArenaConstants::GlowPylon);
@@ -1436,10 +1648,10 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	const int32 TerraceCount = FMath::Clamp(FMath::CeilToInt(Height / TraceArenaConstants::StepRise), 1, 24);
 	const float Riser = Height / static_cast<float>(TerraceCount);
 
-	// The goal line is where the bank has to stop. ClampedEndzoneDepth() rather than EndzoneDepth,
-	// for the reason spelled out on that function: three hand-written copies of this clamp is how a
-	// spawn pad ended up on the wrong side of a goal line.
-	const float GoalX = HalfX - ClampedEndzoneDepth();
+	// The goal line is where the bank has to stop. GoalLineX() rather than a hand-rolled
+	// HalfX - EndzoneDepth, for the reason spelled out on ClampedEndzoneDepth(): three hand-written
+	// copies of this clamp is how a spawn pad ended up on the wrong side of a goal line.
+	const float GoalX = GoalLineX();
 	const float Inboard = FMath::Max(0.f, GoalX * TraceArenaConstants::BankInboardTaperFrac);
 	const float Setback = FMath::Min(TraceArenaConstants::BankGoalSetback, FMath::Max(0.f, GoalX * 0.5f));
 
@@ -1560,13 +1772,16 @@ void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)
 		// component's own wall sliding, instead of standing still pushing into a flat face until
 		// stuck-detection fires. The long bars are left axis-aligned - they are meant to be run
 		// ALONG, and a yawed bar would just be a diagonal wall across a lane.
-		for (const TraceArenaConstants::FCoverSpec& Spec : TraceArenaConstants::CoverBlocks)
+		//
+		// One lambda for both lists, because the ONLY difference between them is how the X anchor
+		// resolves - see the two-anchors note in TraceArenaConstants.
+		auto PlaceCover = [&](const TraceArenaConstants::FCoverSpec& Spec, float LocalX)
 		{
 			const float BlockHeight = PlayerHeight * Spec.HeightMult;
 
 			for (const float YSign : { -1.f, 1.f })
 			{
-				const FVector Centre(XSign * HalfX * Spec.XFrac, YSign * HalfY * Spec.YFrac, BlockHeight * 0.5f);
+				const FVector Centre(XSign * LocalX, YSign * HalfY * Spec.YFrac, BlockHeight * 0.5f);
 
 				// A yawed bar has to be mirrored by NEGATING the yaw, not by reusing it: reflecting a
 				// shape through an axis reverses its handedness. Every entry is currently 0 or 45 on
@@ -1578,15 +1793,39 @@ void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)
 				AddNeonBlock(Centre, FVector(Spec.SizeX, Spec.SizeY, BlockHeight), Yaw,
 					BodyMID, NeonMID, /*bCollide=*/true, TEXT("Cover"), FaceMID);
 			}
+		};
+
+		// The goal approach: measured back from the goal line, so it keeps its tuned relationship to
+		// the goal, the gate and the spawn fan however long the field is.
+		const float GoalX = GoalLineX();
+		for (const TraceArenaConstants::FCoverSpec& Spec : TraceArenaConstants::ApproachCover)
+		{
+			// Never let a deep endzone or a short field push an approach block through the centre
+			// line into the other team's half - that would break the mirror, not just the spacing.
+			PlaceCover(Spec, FMath::Max(0.f, GoalX - Spec.XAnchor));
 		}
 
-		// One long 2x bar straddling the centreline of each half, so the shortest route from the
-		// centre diamond to a goal is never a clear straight line.
+		// The midfield: a fraction of the span from the centre line out to the innermost approach
+		// block, so THIS is the part of the layout that stretches when the field is lengthened.
+		const TraceArenaConstants::FCoverSpec& Innermost =
+			TraceArenaConstants::ApproachCover[UE_ARRAY_COUNT(TraceArenaConstants::ApproachCover) - 1];
+		const float MidfieldSpan = FMath::Max(0.f, GoalX - Innermost.XAnchor);
+
+		for (const TraceArenaConstants::FCoverSpec& Spec : TraceArenaConstants::MidfieldCover)
+		{
+			PlaceCover(Spec, MidfieldSpan * Spec.XAnchor);
+		}
+
+		// Long 2x bars straddling the centreline of each half, so the shortest route from the centre
+		// diamond to a goal is never a clear straight line. Two of them on the 3.5:1 field - see
+		// AxisCoverXFracs.
 		const float AxisHeight = PlayerHeight * TraceArenaConstants::StructureHeight2x;
-		const FVector AxisCentre(XSign * HalfX * TraceArenaConstants::AxisCoverXFrac, 0.f, AxisHeight * 0.5f);
-		AddNeonBlock(AxisCentre,
-			FVector(TraceArenaConstants::AxisCoverSizeX, TraceArenaConstants::AxisCoverSizeY, AxisHeight),
-			0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("AxisCover"), FaceMID);
+		for (const float AxisXFrac : TraceArenaConstants::AxisCoverXFracs)
+		{
+			AddNeonBlock(FVector(XSign * HalfX * AxisXFrac, 0.f, AxisHeight * 0.5f),
+				FVector(TraceArenaConstants::AxisCoverSizeX, TraceArenaConstants::AxisCoverSizeY, AxisHeight),
+				0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("AxisCover"), FaceMID);
+		}
 	}
 
 	// --- The 3.5x tower at top centre ------------------------------------------------------------
@@ -1694,18 +1933,22 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// The four corners behind the goal lines were the only part of the field with no structure of any
 	// kind, the endzone floor being otherwise flat - and it is still flat, because the corner banks
 	// deliberately stop at the goal line. A tall column in each corner closes the room off and,
-	// incidentally, gives a defender something to fight around. On the 9600 uu field they sit at
-	// (10600, 4080), inboard of and behind the gate towers at (9600, 4290) - checked, nothing
-	// intersects, and both are clear of the banks.
+	// incidentally, gives a defender something to fight around. They stand at the MIDDLE of the
+	// endzone (X = 15600 on the shipped field) rather than at a fraction of the half length - see
+	// CornerPylonYFrac for why that distinction cost a gate tower 80 uu of clearance.
+	//
+	// Checked on the 33600 field: (15600, 4080) with a 300 uu side leaves 840 uu to the gate tower
+	// face at X = 14610, 1050 uu to the end wall, and 1200 uu in Y to the outermost endzone respawn
+	// pad at (15600, 2880).
 	//
 	// Built BEFORE the visuals-only section on purpose: these block, and a dedicated server has to
 	// build the same collision the clients are predicting against.
+	const float CornerPylonX = HalfX - ClampedEndzoneDepth() * 0.5f;
 	for (const float XSign : { -1.f, 1.f })
 	{
 		for (const float YSign : { -1.f, 1.f })
 		{
-			AddPylon(FVector2D(XSign * HalfX * TraceArenaConstants::CornerPylonXFrac,
-					YSign * HalfY * TraceArenaConstants::CornerPylonYFrac),
+			AddPylon(FVector2D(XSign * CornerPylonX, YSign * HalfY * TraceArenaConstants::CornerPylonYFrac),
 				TraceArenaConstants::CornerPylonSide, TraceArenaConstants::CornerPylonHeight,
 				BodyMID, HalfNeon[HalfIndex(XSign)], TEXT("CornerPylon"));
 		}
@@ -1713,18 +1956,20 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 
 	// --- Lane pylons -----------------------------------------------------------------------------
 	//
-	// One per quadrant, marking the flank route and carrying the light bridge out to the wall. They
-	// used to be built alongside the wing platforms; the wings are gone (the banks replaced them) so
-	// they live here now, with the rest of the flank dressing they belong to. Collision, so they are
-	// outside the bBuildVisuals gate with everything else that blocks.
+	// Two per quadrant on the 3.5:1 field, marking the flank route and each carrying a light bridge
+	// out to the wall. They used to be built alongside the wing platforms; the wings are gone (the
+	// banks replaced them) so they live here now, with the rest of the flank dressing they belong to.
+	// Collision, so they are outside the bBuildVisuals gate with everything else that blocks.
 	for (const float XSign : { -1.f, 1.f })
 	{
-		for (const float YSign : { -1.f, 1.f })
+		for (const float XFrac : TraceArenaConstants::LanePylonXFracs)
 		{
-			AddPylon(FVector2D(XSign * HalfX * TraceArenaConstants::LanePylonXFrac,
-					YSign * HalfY * TraceArenaConstants::LanePylonYFrac),
-				TraceArenaConstants::LanePylonSide, TraceArenaConstants::LanePylonHeight,
-				BodyMID, HalfNeon[HalfIndex(XSign)], TEXT("LanePylon"));
+			for (const float YSign : { -1.f, 1.f })
+			{
+				AddPylon(FVector2D(XSign * HalfX * XFrac, YSign * HalfY * TraceArenaConstants::LanePylonYFrac),
+					TraceArenaConstants::LanePylonSide, TraceArenaConstants::LanePylonHeight,
+					BodyMID, HalfNeon[HalfIndex(XSign)], TEXT("LanePylon"));
+			}
 		}
 	}
 
@@ -1763,16 +2008,19 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	const float BridgeZ = TraceArenaConstants::LanePylonHeight - TraceArenaConstants::BridgeDrop;
 	for (const float XSign : { -1.f, 1.f })
 	{
-		for (const float YSign : { -1.f, 1.f })
+		for (const float XFrac : TraceArenaConstants::LanePylonXFracs)
 		{
-			const float PylonY = YSign * HalfY * TraceArenaConstants::LanePylonYFrac;
-			const float WallY = YSign * (HalfY - TraceArenaConstants::ButtressDepth);
-			const float Span = FMath::Abs(WallY - PylonY);
+			for (const float YSign : { -1.f, 1.f })
+			{
+				const float PylonY = YSign * HalfY * TraceArenaConstants::LanePylonYFrac;
+				const float WallY = YSign * (HalfY - TraceArenaConstants::ButtressDepth);
+				const float Span = FMath::Abs(WallY - PylonY);
 
-			AddMeshBlock(CubeMesh,
-				FVector(XSign * HalfX * TraceArenaConstants::LanePylonXFrac, (PylonY + WallY) * 0.5f, BridgeZ),
-				FVector(TraceArenaConstants::BridgeSize, Span, TraceArenaConstants::BridgeSize),
-				HalfBridge[HalfIndex(XSign)], /*bCastShadow=*/false, TEXT("LightBridge"));
+				AddMeshBlock(CubeMesh,
+					FVector(XSign * HalfX * XFrac, (PylonY + WallY) * 0.5f, BridgeZ),
+					FVector(TraceArenaConstants::BridgeSize, Span, TraceArenaConstants::BridgeSize),
+					HalfBridge[HalfIndex(XSign)], /*bCastShadow=*/false, TEXT("LightBridge"));
+			}
 		}
 	}
 
@@ -1816,11 +2064,22 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 	{
 		const float Sign = TeamEndSign(Team);
 		const float CenterX = Sign * (HalfX - Depth * 0.5f);
-		const float GoalX = Sign * (HalfX - Depth);
+		const float GoalX = Sign * GoalLineX();
 		const FLinearColor TeamColor = TraceTeamColor(Team);
 
 		if (bBuildVisuals)
 		{
+			// --- Mode-A-only paint ---------------------------------------------------------------
+			//
+			// The full-width patch and the two sideline rails are the pieces that CLAIM the whole
+			// width scores, and in mode B that claim is false, so they are tagged and hidden there.
+			// The goal LINE and the gate above are deliberately NOT tagged: the line is where the
+			// endzone begins in both modes (the mode-B goal stands on it), and the gate is the
+			// "you are attacking that way" landmark that a 33600 uu field needs whichever game is
+			// being played. Hiding those two as well left mode B's end of the field unlit and
+			// unreadable, which is a bigger lie than an over-generous floor patch.
+			const int32 EndzonePaintMark = MarkBuiltComponents();
+
 			// The patch is tinted with the colour of the team that DEFENDS this end. Their opponent
 			// is the one who scores on it - see ATraceEndzone's class comment. It is a lit surface
 			// with a faint emissive term rather than a neon block, so it reads as a floor that glows
@@ -1835,10 +2094,6 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 
 			UMaterialInstanceDynamic* LineMID = MakeNeonMID(TeamColor, TraceArenaConstants::GlowGoalLine);
 			RegisterSideMID(Sign, LineMID, /*bNeon=*/true, TraceArenaConstants::GlowGoalLine);
-			AddMeshBlock(CubeMesh,
-				FVector(GoalX, 0.f, TraceArenaConstants::GoalLineZ),
-				FVector(TraceArenaConstants::GoalLineWidth, ZoneWidth, TraceArenaConstants::GoalLineThickness),
-				LineMID, /*bCastShadow=*/false, TEXT("GoalLine"));
 
 			// Two rails on the floor running from the goal line back to the end wall, one against
 			// each sideline, closing the endzone off visually so it reads as a room you score into
@@ -1851,6 +2106,14 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 					FVector(Depth, TraceArenaConstants::GoalLineWidth, TraceArenaConstants::GoalLineThickness),
 					LineMID, /*bCastShadow=*/false, TEXT("EndzoneEdge"));
 			}
+
+			CollectPiecesSince(EndzonePaintMark, EndzoneModePieces);
+
+			// Shared from here down.
+			AddMeshBlock(CubeMesh,
+				FVector(GoalX, 0.f, TraceArenaConstants::GoalLineZ),
+				FVector(TraceArenaConstants::GoalLineWidth, ZoneWidth, TraceArenaConstants::GoalLineThickness),
+				LineMID, /*bCastShadow=*/false, TEXT("GoalLine"));
 
 			// --- Gate ----------------------------------------------------------------------------
 			//
@@ -1920,8 +2183,18 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 		// Half extents: half the depth along X, the FULL half width along Y (sideline to sideline),
 		// and floor to wall top in Z so a carrier scores whether they are running, jumping or
 		// standing on anything built inside the zone.
-		Zone->ConfigureZone(Team, FVector(Depth * 0.5f, HalfY, WallHeight * 0.5f));
+		Zone->ConfigureZone(Team, FVector(Depth * 0.5f, HalfY, WallHeight * 0.5f), /*bInGoalVolume=*/false);
+
+		// Armed state BEFORE BeginPlay, not after. ApplyScoringMode at the end of BuildArena would
+		// reach the same answer, but the zone logs what it is on BeginPlay and a mode-B run would
+		// otherwise print "Endzone ... is LIVE" a few lines before quietly disarming it. This project
+		// has twice lost a day to a log line that said the wrong thing.
+		Zone->SetZoneActive(!TraceIsGoalMode(ScoringMode));
 		Zone->FinishSpawning(ZoneTransform);
+
+		// Remembered so ApplyScoringMode can arm this pair and disarm the goals (or the reverse)
+		// without a cast-and-filter walk of every actor in the world on every toggle.
+		ScoringVolumes.Add(Zone);
 
 		// Logged at Log, not Verbose, and with the numbers spelled out: "does the endzone really
 		// span the whole field?" is otherwise a question you can only answer by walking into a
@@ -1946,6 +2219,184 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 		}
 
 		SpawnedActors.Add(Zone);
+	}
+}
+
+void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
+{
+	// ---------------------------------------------------------------------------------------------
+	// MODE B - the goals. Spec v4 section 7, verbatim: "The goal should not be the entire width of
+	// the map, like the endzone."
+	//
+	// A goal is the middle third of the field width, the full endzone depth, and 700 uu tall: a real
+	// goal shape rather than a repainted endzone. Two posts stand on the goal line at the edges of
+	// the mouth carrying a crossbar at the top of the scoring volume, a bright sill crosses the mouth
+	// on the floor and the floor inside the mouth is tinted, so that from midfield you can see both
+	// where to throw and how high the ceiling is. Everything here is tagged into GoalModePieces and
+	// hidden (and de-collided) while mode A is being played.
+	// ---------------------------------------------------------------------------------------------
+
+	UWorld* World = GetWorld();
+	const float HalfX = HalfLength();
+	const float MouthHalfY = GoalHalfWidth();
+	const float Height = ClampedGoalHeight();
+	const float Depth = ClampedEndzoneDepth();
+
+	// Mark BEFORE anything is built, collision included: the posts block, and on a dedicated server
+	// (which builds collision and no visuals at all) an untagged post would still be a wall standing
+	// in the endzone through the whole of mode A.
+	const int32 GoalMark = MarkBuiltComponents();
+
+	const ETraceTeam Teams[] = { ETraceTeam::Blue, ETraceTeam::Orange };
+	for (const ETraceTeam Team : Teams)
+	{
+		const float Sign = TeamEndSign(Team);
+		const float GoalX = Sign * GoalLineX();
+		const float CenterX = Sign * (HalfX - Depth * 0.5f);
+		const FLinearColor TeamColor = TraceTeamColor(Team);
+
+		// A goal is tinted for the team that DEFENDS it, exactly like the endzone patch and for the
+		// same reason: you attack the colour that is not yours. Registered for the half-time repaint.
+		UMaterialInstanceDynamic* PostBodyMID = bBuildVisuals
+			? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f, TeamColor, 0.030f)
+			: nullptr;
+		UMaterialInstanceDynamic* FrameMID = bBuildVisuals
+			? MakeNeonMID(TeamColor, TraceArenaConstants::GlowGoalFrame)
+			: nullptr;
+		UMaterialInstanceDynamic* FaceMID = bBuildVisuals
+			? MakeNeonMID(TeamColor, TraceArenaConstants::GlowFace)
+			: nullptr;
+
+		RegisterSideMID(Sign, PostBodyMID, /*bNeon=*/false, /*Intensity=*/0.030f, /*BaseDim=*/-1.f);
+		RegisterSideMID(Sign, FrameMID, /*bNeon=*/true, TraceArenaConstants::GlowGoalFrame);
+		RegisterSideMID(Sign, FaceMID, /*bNeon=*/true, TraceArenaConstants::GlowFace);
+
+		// --- Posts -------------------------------------------------------------------------------
+		//
+		// The only mode-B furniture with collision. They stand a little PROUD of the crossbar
+		// (GoalPostOvershoot) because a frame whose uprights stop exactly at the bar reads as a
+		// doorway; overshooting them reads as a goal. Built through AddNeonBlock so they get the same
+		// face trim and the same pawn-only standoff shell every other structure in the arena has -
+		// which is what keeps a first-person eye off the emissive at point-blank range.
+		const float PostHeight = Height + TraceArenaConstants::GoalPostOvershoot;
+		for (const float YSign : { -1.f, 1.f })
+		{
+			AddNeonBlock(
+				FVector(GoalX, YSign * MouthHalfY, PostHeight * 0.5f),
+				FVector(TraceArenaConstants::GoalPostSide, TraceArenaConstants::GoalPostSide, PostHeight),
+				/*YawDegrees=*/0.f, PostBodyMID, FrameMID, /*bCollide=*/true, TEXT("GoalPost"), FaceMID);
+		}
+
+		if (!bBuildVisuals)
+		{
+			continue;
+		}
+
+		// --- Crossbar ----------------------------------------------------------------------------
+		//
+		// Sits ON the top of the scoring volume, so what you see is exactly the ceiling that scores.
+		// bVerticalTrim / bFaceBands off: a horizontal bar has no vertical corners worth lighting and
+		// a skirt on it would be a second line 20 uu under the lip.
+		AddNeonBlock(
+			FVector(GoalX, 0.f, Height - TraceArenaConstants::GoalCrossbarSize * 0.5f),
+			FVector(TraceArenaConstants::GoalCrossbarSize, MouthHalfY * 2.f, TraceArenaConstants::GoalCrossbarSize),
+			0.f, PostBodyMID, FrameMID, /*bCollide=*/false, TEXT("GoalCrossbar"),
+			FaceMID, /*bVerticalTrim=*/false, /*bFaceBands=*/false);
+
+		// --- Sill ---------------------------------------------------------------------------------
+		//
+		// A bright bar across the mouth on the floor, laid a hair above the full-width goal line so
+		// it wins the z-fight and so the mouth reads as a segment OF that line rather than as a
+		// second line near it. This is the piece that says "the goal is this wide" from ground level,
+		// which is the eyeline a throw is actually aimed from.
+		AddMeshBlock(CubeMesh,
+			FVector(GoalX, 0.f, TraceArenaConstants::GoalLineZ + 4.f),
+			FVector(TraceArenaConstants::GoalSillWidth, MouthHalfY * 2.f, TraceArenaConstants::GoalLineThickness),
+			FrameMID, /*bCastShadow=*/false, TEXT("GoalSill"));
+
+		// --- Mouth patch --------------------------------------------------------------------------
+		//
+		// The floor inside the goal, tinted like the endzone patch but only the mouth wide. In mode B
+		// this is the only floor paint at this end (the full-width patch is hidden), so it is what
+		// tells a carrier running in whether they are inside the scoring rectangle or beside it.
+		UMaterialInstanceDynamic* MouthMID = MakeSurfaceMID(
+			TraceArenaConstants::Dim(TeamColor, 0.030f), 0.20f, 0.f, TeamColor, 0.16f);
+		RegisterSideMID(Sign, MouthMID, /*bNeon=*/false, /*Intensity=*/0.16f, /*BaseDim=*/0.030f);
+		AddMeshBlock(CubeMesh,
+			FVector(CenterX, 0.f, TraceArenaConstants::GoalPatchZ),
+			FVector(Depth, MouthHalfY * 2.f, TraceArenaConstants::PatchThickness),
+			MouthMID, /*bCastShadow=*/false, TEXT("GoalMouthPatch"));
+
+		// Two rails running back from the posts to the end wall, marking the sides of the volume on
+		// the floor. Together with the sill they draw the exact rectangle the trigger occupies - the
+		// same contract the endzone edge rails have in mode A.
+		for (const float YSign : { -1.f, 1.f })
+		{
+			AddMeshBlock(CubeMesh,
+				FVector(CenterX, YSign * MouthHalfY, TraceArenaConstants::GoalLineZ + 4.f),
+				FVector(Depth, TraceArenaConstants::GoalSillWidth * 0.6f, TraceArenaConstants::GoalLineThickness),
+				FrameMID, /*bCastShadow=*/false, TEXT("GoalSideRail"));
+		}
+	}
+
+	// Everything above belongs to mode B. Collected once, outside the team loop, because the tag is
+	// about the MODE and not about the end.
+	CollectPiecesSince(GoalMark, GoalModePieces);
+
+	// --- Triggers ---------------------------------------------------------------------------------
+	//
+	// Server only, exactly like the endzone triggers, and spawned deferred for the same reason.
+	if (!HasAuthority() || World == nullptr)
+	{
+		return;
+	}
+
+	for (const ETraceTeam Team : Teams)
+	{
+		const float Sign = TeamEndSign(Team);
+		const float CenterX = Sign * (HalfX - Depth * 0.5f);
+
+		// Centred at half the GOAL height, not half the wall height: the volume stops at the
+		// crossbar. That is the whole "finite height so it reads as a goal rather than a wall".
+		const FTransform ZoneTransform(
+			GetActorRotation(),
+			GetActorTransform().TransformPosition(FVector(CenterX, 0.f, Height * 0.5f)));
+
+		FActorSpawnParameters ZoneParams;
+		ZoneParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		ZoneParams.ObjectFlags |= RF_Transient;
+		ZoneParams.bDeferConstruction = true;
+
+		ATraceEndzone* Goal = World->SpawnActor<ATraceEndzone>(
+			ATraceEndzone::StaticClass(), ZoneTransform, ZoneParams);
+
+		if (Goal == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("ATraceArenaBuilder: failed to spawn the %s goal."), *TraceTeamName(Team).ToString());
+			continue;
+		}
+
+		Goal->ConfigureZone(Team, FVector(Depth * 0.5f, MouthHalfY, Height * 0.5f), /*bInGoalVolume=*/true);
+		Goal->SetZoneActive(TraceIsGoalMode(ScoringMode));   // see the matching note in BuildEndzones
+		Goal->FinishSpawning(ZoneTransform);
+		ScoringVolumes.Add(Goal);
+
+		// Log, not Verbose, and with the width spelled out as a fraction as well as in uu: "the goal
+		// is not the whole width" is the single claim this whole feature makes, and it is not
+		// something anybody can measure from a screenshot.
+		UE_LOG(LogTraceGame, Log,
+			TEXT("Goal (%s defends) spans X %.0f..%.0f, Y %.0f..%.0f (%.0f uu mouth = %.0f%% of the %.0f uu field width), Z 0..%.0f."),
+			*TraceTeamName(Team).ToString(),
+			FMath::Min(Sign * GoalLineX(), Sign * HalfX), FMath::Max(Sign * GoalLineX(), Sign * HalfX),
+			-MouthHalfY, MouthHalfY, MouthHalfY * 2.f,
+			(FieldWidth > 0.f) ? (MouthHalfY * 200.f / FieldWidth) : 0.f, FieldWidth, Height);
+
+		if (!bBuildingEditorPreview && !Goal->HasActorBegunPlay())
+		{
+			Goal->DispatchBeginPlay();
+		}
+
+		SpawnedActors.Add(Goal);
 	}
 }
 
@@ -1982,13 +2433,19 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 		// spawn lines at X = 0, i.e. on top of it — silently reproducing the exact "spawned inside
 		// geometry" failure this build was shipped with.
 		//
-		// THE RESULTING FAN, on the shipped field: X = +/-8400, Y = 0 / +/-1440 / +/-2880. Every one
-		// of those five points was checked against every entry in TraceArenaConstants::CoverBlocks
-		// and against the corner banks. The tightest is cover block E, the 3.5x goal-approach tower,
-		// whose diamond reaches X = 8505 at Y = 2100..2595 — 105 uu clear of the pad at (8400, 2880)
-		// in X, and its Y span deliberately falls BETWEEN two pad rows. If you move the interior
-		// layout, re-check it: a start pad inside a solid block is a pawn that spawns embedded in
-		// the world, and nothing logs it.
+		// THE RESULTING FAN, on the 33600 x 9600 field: X = +/-12720 (i.e. 1680 uu in front of the
+		// goal line at 14400), Y = 0 / +/-1440 / +/-2880. Every one of those five points was
+		// re-checked against every entry in ApproachCover and MidfieldCover and against the corner
+		// banks. The tightest is the 3.5x goal-approach tower E at (13800, 2100), whose 45-degree
+		// footprint reaches X = 13305 — 585 uu clear in X — and whose Y span deliberately falls
+		// BETWEEN two pad rows; then block D at (11000, 1300), 890 uu clear.
+		//
+		// THIS IS THE PAIRING THAT BROKE WHEN THE FIELD WAS LENGTHENED, and it is worth knowing why:
+		// the pad line is GOAL-RELATIVE (goal line minus 0.1 * half length) while the cover used to
+		// be LENGTH-RELATIVE, so growing the field slid them through each other and put a pad inside
+		// block E's footprint. ApproachCover is now measured back from the goal line for exactly
+		// that reason. If you move the interior layout, re-check it: a start pad inside a solid block
+		// is a pawn that spawns embedded in the world, and nothing logs it.
 		const float Depth = ClampedEndzoneDepth();
 		const float MinLineX = TraceArenaConstants::DaisTopTierSide + TraceArenaConstants::DaisTierSideStep * TraceArenaConstants::DaisTiers;
 		const float LineX = Sign * FMath::Max(MinLineX, HalfX * (1.f - TraceArenaConstants::StartInsetFraction) - Depth);
@@ -3029,6 +3486,129 @@ void ATraceArenaBuilder::ApplyTeamSides(ETraceTeam TeamOnNegativeSide)
 		*TraceTeamName(TeamOnNegativeSide).ToString(), Repainted, SideMIDs.Num());
 }
 
+// -------------------------------------------------------------------------------------------------
+// Scoring mode (spec v4 section 7) - both shapes built, one presented
+// -------------------------------------------------------------------------------------------------
+
+int32 ATraceArenaBuilder::MarkBuiltComponents() const
+{
+	return (Root != nullptr) ? Root->GetAttachChildren().Num() : 0;
+}
+
+void ATraceArenaBuilder::CollectPiecesSince(int32 Mark, TArray<FTraceModePiece>& Out) const
+{
+	if (Root == nullptr)
+	{
+		return;
+	}
+
+	// MARK, BUILD, DIFF - and no primitive helper had to learn that modes exist. Every factory in
+	// this file does SetupAttachment(Root) and AttachChildren appends in construction order, so the
+	// components added since the mark ARE what the step built. The alternative was threading a
+	// "which mode is this for" argument through AddMeshBlock / AddCollisionBlock / AddPawnStandoff /
+	// AddNeonBlock / AddPylon, which is five signatures and a default argument nobody would notice
+	// getting wrong.
+	const auto& BuiltChildren = Root->GetAttachChildren();
+	for (int32 Index = FMath::Max(0, Mark); Index < BuiltChildren.Num(); ++Index)
+	{
+		USceneComponent* Built = BuiltChildren[Index];
+		if (!IsValid(Built))
+		{
+			continue;
+		}
+
+		FTraceModePiece& Piece = Out.AddDefaulted_GetRef();
+		Piece.Component = Built;
+
+		// Remembered rather than assumed, so re-arming restores what the piece was BUILT with. The
+		// goal posts are BlockAll boxes, their standoff shells are QueryOnly pawn-blockers and the
+		// paint is NoCollision: three different answers in one tagged set.
+		if (const UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(Built))
+		{
+			Piece.Collision = Primitive->GetCollisionEnabled();
+		}
+	}
+}
+
+void ATraceArenaBuilder::SetPiecesPresented(const TArray<FTraceModePiece>& Pieces, bool bPresented)
+{
+	for (const FTraceModePiece& Piece : Pieces)
+	{
+		USceneComponent* Component = Piece.Component.Get();
+		if (!IsValid(Component))
+		{
+			continue;
+		}
+
+		Component->SetVisibility(bPresented, /*bPropagateToChildren=*/true);
+
+		// Visibility alone is not enough and this is the important half: an invisible goal post that
+		// still blocks is an invisible wall standing in the endzone for the whole of mode A, which is
+		// the worst kind of bug - it has no visual symptom at all.
+		if (UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(Component))
+		{
+			Primitive->SetCollisionEnabled(bPresented ? Piece.Collision.GetValue() : ECollisionEnabled::NoCollision);
+		}
+	}
+}
+
+void ATraceArenaBuilder::ApplyScoringMode(ETraceScoringMode NewMode)
+{
+	ScoringMode = NewMode;
+
+	// Legal before the build: the mode is remembered above and BuildArena calls this again at the
+	// end, so an early call (the game mode publishing before the arena exists) is not a lost edit.
+	if (!bArenaBuilt)
+	{
+		return;
+	}
+
+	const bool bGoalMode = TraceIsGoalMode(ScoringMode);
+
+	SetPiecesPresented(EndzoneModePieces, !bGoalMode);
+	SetPiecesPresented(GoalModePieces, bGoalMode);
+
+	// Arm one pair of volumes, disarm the other. Empty on clients (no scoring volume is ever spawned
+	// there), which is correct: a client has nothing to arm.
+	int32 Armed = 0;
+	for (const TWeakObjectPtr<ATraceEndzone>& Weak : ScoringVolumes)
+	{
+		ATraceEndzone* Zone = Weak.Get();
+		if (!IsValid(Zone))
+		{
+			continue;
+		}
+
+		const bool bWanted = (Zone->IsGoalVolume() == bGoalMode);
+		Zone->SetZoneActive(bWanted);
+		Armed += bWanted ? 1 : 0;
+	}
+
+	// Display, not Log: this is the answer to "which game am I looking at", and on an A/B toggle
+	// that is the first thing anybody reading a log wants to see.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Arena] Presenting %s: %d endzone pieces %s, %d goal pieces %s, %d of %d volumes armed."),
+		*TraceScoringModeLabel(ScoringMode),
+		EndzoneModePieces.Num(), bGoalMode ? TEXT("hidden") : TEXT("shown"),
+		GoalModePieces.Num(), bGoalMode ? TEXT("shown") : TEXT("hidden"),
+		Armed, ScoringVolumes.Num());
+}
+
+void ATraceArenaBuilder::ApplyScoringModeInWorld(const UWorld* World, ETraceScoringMode NewMode)
+{
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// One per world, and not replicated, so the server and every client has to be driven separately -
+	// the same reason ApplyTeamSidesInWorld exists in this shape.
+	for (TActorIterator<ATraceArenaBuilder> It(const_cast<UWorld*>(World)); It; ++It)
+	{
+		It->ApplyScoringMode(NewMode);
+	}
+}
+
 void ATraceArenaBuilder::ApplyTeamSidesInWorld(const UWorld* World, ETraceTeam TeamOnNegativeSide)
 {
 	if (World == nullptr)
@@ -3097,6 +3677,13 @@ void ATraceArenaBuilder::DestroyBuiltArena()
 	TintMIDs.Reset();
 	SideMIDs.Reset();
 	PaintedTeamOnNegativeSide = ETraceTeam::Blue;
+
+	// The mode tags point at components that have just been destroyed. Weak pointers make that safe
+	// rather than fatal, but a stale entry would still make the next ApplyScoringMode walk a list of
+	// nulls and report a component count that no longer means anything.
+	EndzoneModePieces.Reset();
+	GoalModePieces.Reset();
+	ScoringVolumes.Reset();
 
 	bArenaBuilt = false;
 	bEditorPreviewBuilt = false;

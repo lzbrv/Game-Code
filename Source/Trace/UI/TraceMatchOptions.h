@@ -16,6 +16,8 @@
 
 #include "CoreMinimal.h"
 
+#include "Core/TraceMatchTypes.h"   // ETraceScoringMode (forward declaration) + its string helpers
+
 /** The only two levels in the project. */
 namespace TraceMaps
 {
@@ -69,6 +71,33 @@ namespace TraceDifficulty
 	 * on top of Easy until the bots stood still.
 	 */
 	TRACE_API void ApplyToSettings(ETraceBotDifficulty Difficulty);
+}
+
+/**
+ * The A/B scoring-mode toggle's half of the menu/match contract (spec v4 §7).
+ *
+ * Deliberately thin, and deliberately shaped exactly like TraceDifficulty above: the two things the
+ * title screen chooses travel the same way, so they should be selected, applied and carried the
+ * same way. Everything about NAMING the modes lives in Core/TraceMatchTypes.h, which this header
+ * includes; the URL option is TraceScoringModeUrlOption ("mode") from the same place.
+ */
+namespace TraceScoring
+{
+	/**
+	 * Writes @p Mode onto the UTraceSettings CDO, which is what ATraceGameMode publishes from and
+	 * what the Project Settings page displays.
+	 *
+	 * Called by the title screen when the row changes AND again on PLAY, for the same reason
+	 * TraceDifficulty::ApplyToSettings is: the travel URL is the authority for the destination map,
+	 * but a standalone launch where the URL is ever dropped must still honour what the player picked.
+	 *
+	 * It is also what keeps the settings page honest while sitting on the title screen — the panel
+	 * shows the mode the next match will actually play, rather than the last one written to ini.
+	 */
+	TRACE_API void ApplyToSettings(ETraceScoringMode Mode);
+
+	/** The mode currently on the UTraceSettings CDO. The title screen's starting value. */
+	TRACE_API ETraceScoringMode GetCurrentSetting();
 }
 
 namespace TraceMatchFlow

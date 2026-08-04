@@ -13,16 +13,23 @@
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
 #include "Core/TraceGameState.h"
+#include "Core/TraceMatchTypes.h"      // TraceIsGoalMode (mode B)
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceTrailComponent.h"
 #include "World/TraceArenaBuilder.h"
 
+#include "Gameplay/TraceEndzone.h"
+
+#include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "CollisionQueryParams.h"
+#include "CollisionShape.h"
 #include "Engine/EngineTypes.h"
+#include "Engine/HitResult.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"                        // TActorIterator (character gather fallback)
@@ -34,6 +41,7 @@
 #include "Math/NumericLimits.h"
 #include "Math/UnrealMathUtility.h"             // FMath::SegmentDistToSegmentSafe
 #include "UObject/ConstructorHelpers.h"
+#include "UObject/UnrealType.h"                 // FindFProperty / FFloatProperty (mode B settings bridge)
 
 namespace TraceCoreTuning
 {
@@ -351,6 +359,258 @@ static FAutoConsoleCommand GTracePassStatsResetCmd(
 
 
 // =================================================================================================
+// MODE B: TUNABLES  (spec v4 §7)
+//
+// THE KNOB CONTRACT, AND HOW THIS BLOCK HONOURS IT.
+// This project's rule is that every new constant is a UTraceSettings property — categorised,
+// clamped, tooltipped and live-editable in PIE — because the user tunes from that panel and "a dead
+// knob is worse than no knob". Three of mode B's numbers already live there (ScoringMode,
+// GoalWidthFieldFraction, GoalHeightUU). The rest — CoreThrowSpeed, CorePickupRadius,
+// CoreLooseResetSeconds and their neighbours — are NAMED in UTraceSettings' own documentation but
+// are not declared on it yet, and TraceSettings.h is not this slice's to edit.
+//
+// So each one is resolved in two steps, at the point of use, every time:
+//
+//   1. if UTraceSettings has a float property of that exact name, its live value is used. That is a
+//      reflected lookup (FindFProperty), cached per name after the first call, and it means the
+//      moment the property is declared on the settings page the knob becomes a real panel slider
+//      with no further edit here — including live retuning in PIE, since it reads the same CDO the
+//      panel edits.
+//   2. otherwise the console variable below is used, which is itself live-editable and settable
+//      from Config/*.ini ([SystemSettings]) and the command line.
+//
+// A CVar explicitly set at runtime (`Trace.ModeB.ThrowSpeed 3000`) wins over the settings property,
+// so a measurement run can pin a value without touching the user's page. Nothing here is a
+// compile-time constant that a designer cannot reach.
+// =================================================================================================
+
+namespace TraceModeBTuning
+{
+	/**
+	 * Reads a float property off UTraceSettings by name, if one exists.
+	 *
+	 * The name lookup is done ONCE per name and cached — including the negative result — so the
+	 * steady-state cost is a TMap probe and a pointer dereference, i.e. the same order as reading
+	 * the property directly. The cache holds an FProperty, not a value, so live edits still land.
+	 */
+	static bool TrySettingsFloat(const TCHAR* PropertyName, float& OutValue)
+	{
+		static TMap<FName, const FFloatProperty*> Cache;
+
+		const FName Key(PropertyName);
+		const FFloatProperty* const* Found = Cache.Find(Key);
+		if (Found == nullptr)
+		{
+			Found = &Cache.Add(Key, FindFProperty<FFloatProperty>(UTraceSettings::StaticClass(), Key));
+		}
+
+		if (*Found == nullptr)
+		{
+			return false;
+		}
+
+		OutValue = (*Found)->GetPropertyValue_InContainer(&UTraceSettings::Get());
+		return true;
+	}
+
+	/** Settings property if it exists and the CVar has not been overridden; otherwise the CVar. */
+	static float Resolve(const TCHAR* SettingsName, const TAutoConsoleVariable<float>& CVar, float MinValue, float MaxValue)
+	{
+		const IConsoleVariable* Console = CVar.AsVariable();
+		const uint32 SetBy = (Console != nullptr)
+			? (static_cast<uint32>(Console->GetFlags()) & static_cast<uint32>(ECVF_SetByMask))
+			: 0u;
+		const bool bCVarOverridden = SetBy > static_cast<uint32>(ECVF_SetByConstructor);
+
+		float Value = CVar.GetValueOnAnyThread();
+		if (!bCVarOverridden)
+		{
+			float FromSettings = 0.f;
+			if (TrySettingsFloat(SettingsName, FromSettings))
+			{
+				Value = FromSettings;
+			}
+		}
+
+		return FMath::Clamp(Value, MinValue, MaxValue);
+	}
+}
+
+// NO "Trace.ScoringMode" CONSOLE VARIABLE. There was one, and it was wrong: ATraceGameState
+// publishes the mode (resolved by ATraceGameMode from "?mode=a|b" on the travel URL) and that is the
+// one legal answer. A console override here would have been a second source of truth for the fact
+// that decides what this actor IS, and the two would have disagreed on exactly the frame it
+// mattered — this file's own log showed the pair fighting, mode A being set and then flipped to B a
+// frame later. A run selects its mode with "?mode=b" on the URL, like the menu does.
+
+static TAutoConsoleVariable<float> CVarModeBThrowSpeed(
+	TEXT("Trace.ModeB.ThrowSpeed"),
+	3000.f,
+	TEXT("MODE B. Launch speed of a thrown Core, uu/s. Maps to UTraceSettings::CoreThrowSpeed when that exists."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBThrowUpBias(
+	TEXT("Trace.ModeB.ThrowUpBias"),
+	0.12f,
+	TEXT("MODE B. Upward component added to a throw, as a fraction of throw speed. Gives a flat aim a ")
+	TEXT("shallow arc so a throw carries instead of ploughing into the floor. UTraceSettings::CoreThrowUpBias."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBThrowGravityScale(
+	TEXT("Trace.ModeB.GravityScale"),
+	0.55f,
+	TEXT("MODE B. World gravity multiplier applied to a loose Core. Below 1 so a throw crosses useful ")
+	TEXT("ground on a 24000uu field. UTraceSettings::CoreThrowGravityScale."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBPickupRadius(
+	TEXT("Trace.ModeB.PickupRadius"),
+	120.f,
+	TEXT("MODE B. 'First contact' radius, uu, measured from the Core to the surface of a player's ")
+	TEXT("capsule. UTraceSettings::CorePickupRadius."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBSelfPickupLockout(
+	TEXT("Trace.ModeB.SelfPickupLockout"),
+	0.35f,
+	TEXT("MODE B. Seconds the THROWER alone cannot re-take their own throw. Everyone else may take it ")
+	TEXT("on frame one. Without this a throw is a no-op: the Core leaves from inside the thrower's own ")
+	TEXT("pickup radius. UTraceSettings::CoreThrowerPickupLockoutSeconds."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBLooseReset(
+	TEXT("Trace.ModeB.LooseResetSeconds"),
+	12.f,
+	TEXT("MODE B. Seconds a loose Core may lie untouched before it is put back into play. The Core may ")
+	TEXT("never be lost permanently. UTraceSettings::CoreLooseResetSeconds."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBThrowCooldown(
+	TEXT("Trace.ModeB.ThrowCooldown"),
+	0.35f,
+	TEXT("MODE B. Seconds after taking the Core before it may be thrown again. Stops a pickup and a ")
+	TEXT("throw landing on the same frame. UTraceSettings::CoreThrowCooldownSeconds."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBBounce(
+	TEXT("Trace.ModeB.Bounce"),
+	0.35f,
+	TEXT("MODE B. Restitution of a loose Core against world geometry. 0 = dead stop, 1 = perfect bounce."),
+	ECVF_Default);
+
+namespace TraceModeBTuning
+{
+	float ThrowSpeed()        { return Resolve(TEXT("CoreThrowSpeed"),                    CVarModeBThrowSpeed,       200.f, 20000.f); }
+	float ThrowUpBias()       { return Resolve(TEXT("CoreThrowUpBias"),                   CVarModeBThrowUpBias,      0.f,   1.5f); }
+	float GravityScale()      { return Resolve(TEXT("CoreThrowGravityScale"),             CVarModeBThrowGravityScale, 0.f,  4.f); }
+	float PickupRadius()      { return Resolve(TEXT("CorePickupRadius"),                  CVarModeBPickupRadius,     20.f,  1500.f); }
+	float SelfPickupLockout() { return Resolve(TEXT("CoreThrowerPickupLockoutSeconds"),   CVarModeBSelfPickupLockout, 0.f,  5.f); }
+	// Lower bound 0, NOT 1: UTraceSettings::CoreLooseResetSeconds documents 0 as "never reset", and a
+	// floor of 1 turned that into the FASTEST reset available. The caller treats <= 0 as "never".
+	float LooseResetSeconds() { return Resolve(TEXT("CoreLooseResetSeconds"),             CVarModeBLooseReset,       0.f,   120.f); }
+	float ThrowCooldown()     { return Resolve(TEXT("CoreThrowCooldownSeconds"),          CVarModeBThrowCooldown,    0.f,   10.f); }
+	float Bounce()            { return Resolve(TEXT("CoreThrowBounce"),                   CVarModeBBounce,           0.f,   1.f); }
+
+	/** Radius of the sphere swept for the loose Core's collision. Matches the orb the player sees. */
+	constexpr float CollisionRadius = 22.f;
+
+	/** Below this speed the Core is declared at rest, so it stops jittering along the floor. */
+	constexpr float RestSpeed = 60.f;
+
+	/** How often the goal boxes are re-derived. Cheap, and only has to beat the half-time switch. */
+	constexpr float GoalRefreshInterval = 0.5f;
+
+	/** Height above the thrower's eye-line the Core leaves from, so it does not clip their own head. */
+	constexpr double ThrowMuzzleForward = 70.0;
+
+	/**
+	 * Reports, once per mode-B entry, whether each knob found its UTraceSettings property or fell
+	 * back to its console variable.
+	 *
+	 * This exists because the binding is by NAME at runtime: a misspelled property is not a build
+	 * error and not a warning, it is a slider on the settings page that silently does nothing. The
+	 * project's rule is that a dead knob is worse than no knob, so the build states its own answer
+	 * rather than leaving it to be discovered by a designer wondering why nothing changed.
+	 */
+	void LogKnobBindings()
+	{
+		// Paired with the accessors above; every name here must be the one Resolve() is called with.
+		static const TCHAR* const KnobNames[] =
+		{
+			TEXT("CoreThrowSpeed"),
+			TEXT("CoreThrowUpBias"),
+			TEXT("CoreThrowGravityScale"),
+			TEXT("CorePickupRadius"),
+			TEXT("CoreThrowerPickupLockoutSeconds"),
+			TEXT("CoreLooseResetSeconds"),
+			TEXT("CoreThrowCooldownSeconds"),
+			TEXT("CoreThrowBounce"),
+		};
+
+		int32 BoundCount = 0;
+		FString DeadNames;
+
+		for (const TCHAR* Name : KnobNames)
+		{
+			if (FindFProperty<FFloatProperty>(UTraceSettings::StaticClass(), FName(Name)) != nullptr)
+			{
+				++BoundCount;
+			}
+			else
+			{
+				if (!DeadNames.IsEmpty())
+				{
+					DeadNames += TEXT(", ");
+				}
+				DeadNames += Name;
+			}
+		}
+
+		const int32 TotalCount = static_cast<int32>(UE_ARRAY_COUNT(KnobNames));
+
+		if (DeadNames.IsEmpty())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ModeB] tuning: all %d knobs are bound to UTraceSettings properties and are live on the settings panel."),
+				TotalCount);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeB] tuning: %d of %d knobs bound; NO UTraceSettings PROPERTY FOUND FOR: %s. ")
+				TEXT("Those fall back to their Trace.ModeB.* console variables, so the settings panel ")
+				TEXT("shows nothing for them - declare a float of that exact name on UTraceSettings."),
+				BoundCount, TotalCount, *DeadNames);
+		}
+	}
+}
+
+/**
+ * Registered goal volumes.
+ *
+ * Static and world-filtered rather than a member, because the goal actor's BeginPlay can run before
+ * the GameMode has spawned the Core — a registration that had to find the Core first would be
+ * dropped exactly once per map load, at the only moment it matters. Entries are weak; dead ones are
+ * pruned on every refresh, so an actor that forgets to unregister leaks nothing.
+ */
+namespace TraceGoalRegistry
+{
+	struct FEntry
+	{
+		TWeakObjectPtr<AActor> GoalOwner;
+		TWeakObjectPtr<UPrimitiveComponent> Volume;
+		ETraceTeam DefendingTeam = ETraceTeam::None;
+	};
+
+	static TArray<FEntry>& Entries()
+	{
+		static TArray<FEntry> Registry;
+		return Registry;
+	}
+}
+
+
+// =================================================================================================
 // Construction
 // =================================================================================================
 
@@ -451,6 +711,13 @@ void ATraceCore::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifeti
 	DOREPLIFETIME(ATraceCore, PassTarget);
 	DOREPLIFETIME(ATraceCore, PassStartServerTime);
 	DOREPLIFETIME(ATraceCore, PassCooldownEndServerTime);
+
+	// Mode B. Three properties that never change value at all in mode A, so mode A pays one bitfield
+	// comparison per net update for them and nothing else. (The MODE itself is not replicated here:
+	// ATraceGameState owns and replicates it.)
+	DOREPLIFETIME(ATraceCore, bLoose);
+	DOREPLIFETIME(ATraceCore, LooseLocation);
+	DOREPLIFETIME(ATraceCore, LooseVelocity);
 }
 
 void ATraceCore::BeginPlay()
@@ -478,6 +745,15 @@ void ATraceCore::BeginPlay()
 		// Nobody has it yet and nobody is owed it. The Tick backstop grants it to the default team
 		// if the GameMode has not called KickoffTo() within a few seconds.
 		PendingGrantTime = GetServerTimeSeconds() + TraceCoreTuning::MaxHolderlessSeconds;
+
+		// Nothing to latch: the mode is read from ATraceGameState at the point of use. This only
+		// records what it currently is, so OnScoringModeChanged fires on the first real change.
+		bAppliedModeB = IsModeB();
+		bModeEverApplied = true;
+
+		UE_LOG(LogTraceGame, Display, TEXT("[Core] starting in scoring mode %s"),
+			bAppliedModeB ? TEXT("B - goals, Core is thrown and intercepted")
+						  : TEXT("A - endzones, Core is a status"));
 	}
 
 	ApplyAttachment();
@@ -509,7 +785,8 @@ void ATraceCore::Tick(float DeltaSeconds)
 
 	// Carrier / State / bPassActive are independent properties and can land in any order, so every
 	// machine reconciles from Tick as well as from the OnReps.
-	if (!bAppliedEver || AppliedHolder.Get() != Carrier || bAppliedPassActive != bPassActive)
+	if (!bAppliedEver || AppliedHolder.Get() != Carrier || bAppliedPassActive != bPassActive
+		|| bAppliedLoose != bLoose)
 	{
 		ApplyAttachment();
 		UpdateVisuals();
@@ -517,10 +794,48 @@ void ATraceCore::Tick(float DeltaSeconds)
 
 	if (!HasAuthority())
 	{
+		// MODE B, CLIENTS. Dead-reckon the loose Core between net updates so it flies along its arc
+		// instead of stepping along it at the net update rate. Purely presentational: LooseLocation
+		// is overwritten by the next replicated value, and no client ever decides a pickup or a goal.
+		if (bLoose)
+		{
+			LooseLocation = LooseLocation + LooseVelocity * DeltaSeconds;
+			SetActorLocation(LooseLocation, false, nullptr, ETeleportType::TeleportPhysics);
+		}
 		return;
 	}
 
 	const float Now = GetServerTimeSeconds();
+
+	// ---- 0. Mode B: a Core that is out in the world is its own state, and it OWNS this tick. ----
+	//
+	// Placed ahead of everything below deliberately. Steps 1-3 all assume that "Carrier == nullptr"
+	// means the Core is waiting to be granted, and a loose Core is the one case where that is false:
+	// without this early-out, step 3 would grant a thrown Core to the nearest player of whichever
+	// team was owed it and park the actor back at the centre circle, mid-flight.
+	//
+	// Also notices a mode change, which is why it runs before the loose test rather than inside it:
+	// switching to mode A while the Core is in the air has to normalise that state, not be skipped
+	// by it. One bool compare per tick in the steady state.
+	{
+		const bool bNowModeB = IsModeB();
+		if (!bModeEverApplied || bAppliedModeB != bNowModeB)
+		{
+			bAppliedModeB = bNowModeB;
+			bModeEverApplied = true;
+			OnScoringModeChanged();
+		}
+	}
+
+	// Diagnostics, and deliberately ahead of the loose branch's early return so the scenario can
+	// observe a Core that is currently in the air. Costs one int compare when it is not armed.
+	TickModeBVerification();
+
+	if (bLoose)
+	{
+		ServerTickLooseCore(DeltaSeconds);
+		return;
+	}
 
 	// ---- 1. A queued fallback from DropAt(). --------------------------------------------------
 	//
@@ -607,6 +922,29 @@ void ATraceCore::Tick(float DeltaSeconds)
 	ServerTickPass(DeltaSeconds);
 	EnforceHolderTrailState();
 	SamplePassAvailabilityStats();
+
+	// ---- 5. Mode B only: "a player carries the core into the goal". -----------------------------
+	//
+	// Swept from where the holder was last frame, for the same reason the thrown test is swept: a
+	// carrier at 800 uu/s with a dash on top can cross a goal mouth inside one long frame.
+	//
+	// The goal volume polls for a stationary carrier itself, at 10 Hz. This is not a duplicate of
+	// that: the poll samples POSITIONS and this samples the PATH BETWEEN THEM, so a carrier who
+	// crosses the mouth and comes out the far side between two polls scores here and nowhere else.
+	// ATraceGameMode::NotifyScored debounces the overlap, so a carry-in slow enough for both to see
+	// still counts once.
+	if (IsModeB() && IsValid(Carrier))
+	{
+		const FVector CarrierNow = Carrier->GetActorLocation();
+		const FVector CarrierFrom = LastCarrierGoalTestLocation.IsZero() ? CarrierNow : LastCarrierGoalTestLocation;
+		LastCarrierGoalTestLocation = CarrierNow;
+
+		CheckGoalScore(CarrierFrom, CarrierNow, Carrier->GetTeam(), TEXT("carried in"));
+	}
+	else
+	{
+		LastCarrierGoalTestLocation = FVector::ZeroVector;
+	}
 }
 
 void ATraceCore::SamplePassAvailabilityStats()
@@ -1179,6 +1517,27 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 
 	if (HasAuthority())
 	{
+		// ---- THE BINDING'S MEANING IS MODE-DEPENDENT (spec v4 §7). -------------------------------
+		//
+		// Verbatim: "The carrier should be able to throw the core forward by left clicking." In mode
+		// A the same button starts the 0.5 s hover-pass. The branch lives HERE, at the one door every
+		// pass input comes through, rather than in the pawn or the bots: ATraceCharacter::
+		// DoPassPressed, ATracePlayerController and the bots' ApplyPassInput all call this function
+		// and none of them has to learn that a second mode exists.
+		//
+		// A throw is instantaneous, so there is nothing to hold and nothing to release: the press
+		// throws, the release is swallowed, and bPassInputHeld is never armed in mode B - which
+		// matters, because an armed latch would make ServerTickPass open a pass window (shield down)
+		// on a Core that is no longer held.
+		if (IsModeB())
+		{
+			if (bPressed)
+			{
+				ThrowFromHolder(Requester);
+			}
+			return;
+		}
+
 		bPassInputHeld = bPressed;
 		// Resolve on the same frame the button was pressed rather than waiting a tick: the pass
 		// window is the moment the shield drops, and a frame of latency on that is a frame of free
@@ -1195,7 +1554,10 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 	// safety it does not have.
 	// Requester, not Carrier: the release half of this runs after a completed pass has already moved
 	// Carrier to the receiver, and it is OUR prediction that has to be unwound, not theirs.
-	if (Requester->IsLocallyControlled())
+	// Mode B predicts nothing. A throw is a single server-resolved event with no hold to visualise,
+	// and a client that predicted the Core leaving its own hands would show itself a throw the server
+	// may refuse (cooldown, a possession change in flight).
+	if (Requester->IsLocallyControlled() && !IsModeB())
 	{
 		if (bPressed)
 		{
@@ -1547,12 +1909,28 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 	}
 
 	ATraceCharacter* Previous = Carrier;
-	const ETraceTeam PreviousTeam = IsValid(Previous) ? Previous->GetTeam() : ETraceTeam::None;
+
+	// MODE B: a loose Core has no previous holder to ask, so TakeLooseCore hands us the team the
+	// Core came FROM through this single-use override. Consumed here, unconditionally, so it can
+	// never leak into the next possession. In mode A it is always None and this line is the old one.
+	const ETraceTeam OverrideTeam = GraceOverrideTeam;
+	GraceOverrideTeam = ETraceTeam::None;
+
+	const ETraceTeam PreviousTeam = IsValid(Previous)
+		? Previous->GetTeam()
+		: OverrideTeam;
+
 	const ETraceTeam NewTeam = NewHolder->GetTeam();
 
 	// §2 [ASSUMPTION]: the 1s grace is a TEAM change rule. A completed teammate pass reads as
 	// continuous possession, so the trace keeps forming without a gap; anything that takes the Core
 	// across to the other side buys that side a second before their trace exists.
+	//
+	// Spec v4 §7 makes this rule serve mode B unchanged: "Turnovers in game state b should retain
+	// the grace period from game state a. However, teammates picking up the core should not have a
+	// grace period, the same as when they are passed to in game state a." An interception is a team
+	// change and gets the grace; a teammate recovering a throw is not and gets none. One line, two
+	// modes - which is why mode B did not get a grace rule of its own to drift from this one.
 	const bool bTeamChanged = !AreAllies(PreviousTeam, NewTeam);
 
 	CancelPass(nullptr);
@@ -1565,6 +1943,18 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 	PendingGrantTeam = ETraceTeam::None;
 	bFallbackQueued = false;
 	bOutOfPlay = false;
+
+	// Mode B: whatever route brought the Core here, it is on a player now and is not loose. Held
+	// alongside the assignment above rather than left to the caller, because GrantTo is the funnel
+	// EVERY path ends at - including the ones mode B did not write (a kill steal off a carrier, the
+	// nearest-enemy fallback, a kickoff), any of which can fire while a throw is still in the air.
+	if (bLoose)
+	{
+		ClearLooseState();
+	}
+	LooseFromTeam = NewTeam;
+	ThrowCooldownEndServerTime = GetServerTimeSeconds() + TraceModeBTuning::ThrowCooldown();
+	LastCarrierGoalTestLocation = NewHolder->GetActorLocation();
 
 	// Ownership is what lets the holding CLIENT send ServerSetPassInput() to this actor. Without it
 	// the RPC is silently dropped by the net driver as "not owned by that connection".
@@ -1580,12 +1970,19 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 
 	// Grace BEFORE SetCarrying: SetCarrying(true) starts the trail emitting, and the trail must
 	// already know it is not allowed to lay a point yet.
+	const float GraceSeconds = bTeamChanged
+		? FMath::Max(0.f, UTraceSettings::Get().CoreTurnoverGraceSeconds) : 0.f;
+
 	if (NewHolder->Trail != nullptr)
 	{
 		// Spec v3 section 1: 1.0 -> 0.4 s, and now a UTraceSettings knob rather than a constant.
-		NewHolder->Trail->SetEmitGrace(bTeamChanged
-			? FMath::Max(0.f, UTraceSettings::Get().CoreTurnoverGraceSeconds) : 0.f);
+		NewHolder->Trail->SetEmitGrace(GraceSeconds);
 	}
+
+	// Recorded for Trace.ModeB.Verify. This is the rule's OWN answer, taken at the moment it is made;
+	// anything read back afterwards would be measuring the trail rather than the decision.
+	bLastGrantTeamChanged = bTeamChanged;
+	LastGrantGraceSeconds = GraceSeconds;
 
 	// SetCarrying() is the SOLE writer of ATracePlayerState::bIsCarrier — it sets the flag and
 	// force-updates it. This used to write the mirror a second time right here, which is the
@@ -1629,17 +2026,30 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 	// teleported, this Core released again), so nothing here may touch member state afterwards.
 	if (UWorld* World = GetWorld())
 	{
-		if (ATraceGameMode* GameMode = World->GetAuthGameMode<ATraceGameMode>())
+		// Ordered to match ETraceCoreGrantReason exactly; clamped so adding a reason without
+		// touching this cannot read off the end.
+		static const TCHAR* GrantReasonNames[] =
 		{
-			// Ordered to match ETraceCoreGrantReason exactly; clamped so adding a reason without
-			// touching this cannot read off the end.
-			static const TCHAR* GrantReasonNames[] =
-			{
-				TEXT("kickoff"), TEXT("completed pass"), TEXT("kill steal"), TEXT("fallback"), TEXT("debug grant")
-			};
-			const int32 ReasonIndex = FMath::Clamp(static_cast<int32>(Reason), 0,
-				static_cast<int32>(UE_ARRAY_COUNT(GrantReasonNames)) - 1);
+			TEXT("kickoff"), TEXT("completed pass"), TEXT("kill steal"), TEXT("fallback"), TEXT("debug grant"),
+			TEXT("interception"), TEXT("recovery")
+		};
+		const int32 ReasonIndex = FMath::Clamp(static_cast<int32>(Reason), 0,
+			static_cast<int32>(UE_ARRAY_COUNT(GrantReasonNames)) - 1);
 
+		if (IsModeB())
+		{
+			// MODE B: the scoring volume is the narrow goal, not the full-width endzone, so the
+			// possession-change test runs against the goal boxes instead. Same reasoning as mode A's
+			// version: nobody overlaps-begins for a player who did not move, so taking the Core while
+			// already standing in the goal has to be caught off the POSSESSION event.
+			//
+			// From == To: this is a possession change, not a movement, and CheckGoalScore's IsInside
+			// branch is what covers the degenerate segment.
+			const FVector Where = NewHolder->GetActorLocation();
+			CheckGoalScore(Where, Where, NewTeam, GrantReasonNames[ReasonIndex]);
+		}
+		else if (ATraceGameMode* GameMode = World->GetAuthGameMode<ATraceGameMode>())
+		{
 			GameMode->CheckEndzoneScoreForCarrier(NewHolder, GrantReasonNames[ReasonIndex]);
 		}
 	}
@@ -1721,6 +2131,16 @@ void ATraceCore::KickoffTo(ETraceTeam ReceivingTeam)
 
 	CancelPass(nullptr);
 	ReleaseHolder();
+
+	// Mode B: a kickoff supersedes anything in flight. Every caller of this function (a score, match
+	// start, half time) is about to teleport ten pawns, and a Core still integrating its own arc
+	// through that would be picked up mid-reset by whoever the teleport happened to land next to.
+	if (bLoose)
+	{
+		ClearLooseState();
+	}
+	LooseFromTeam = ETraceTeam::None;
+	LastCarrierGoalTestLocation = FVector::ZeroVector;
 
 	// None means OUT OF PLAY, and it must NOT be quietly rewritten into a real team: the half-time
 	// interval and the post-match screen both need the Core parked with nobody holding it, and
@@ -1874,6 +2294,1037 @@ void ATraceCore::OnHolderDeath(AActor* Victim, AController* Killer, FName Cause)
 
 
 // =================================================================================================
+// MODE B  —  the throwable, interceptable Core  (spec v4 §7)
+// =================================================================================================
+
+bool ATraceCore::IsModeB() const
+{
+	// ONE SOURCE OF TRUTH, asked every time. ATraceGameState publishes the mode (ATraceGameMode
+	// resolves it from "?mode=a|b" once, at match start) and replicates it, so this answer is
+	// identical on the server and on every client, in every phase. Nothing is cached on this actor:
+	// a cached copy of the fact that decides what this actor IS is the classic way two systems end
+	// up playing different games for a frame.
+	const ATraceGameState* GameState = GetWorld() ? GetWorld()->GetGameState<ATraceGameState>() : nullptr;
+	return GameState != nullptr && GameState->IsGoalMode();
+}
+
+bool ATraceCore::IsModeB(const UWorld* World)
+{
+	const ATraceGameState* GameState = (World != nullptr) ? World->GetGameState<ATraceGameState>() : nullptr;
+	return GameState != nullptr && GameState->IsGoalMode();
+}
+
+void ATraceCore::SetScoringMode(ETraceScoringMode PublishedMode)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	const bool bPublishedIsModeB = TraceIsGoalMode(PublishedMode);
+	const bool bStateSaysModeB = IsModeB();
+
+	if (bPublishedIsModeB != bStateSaysModeB)
+	{
+		// Deliberately a warning and NOT an override. The Core holds no mode of its own to correct,
+		// so the only thing this disagreement can mean is that the GameState has not been written
+		// yet (or was written after this call) — an ordering fact worth one log line, and one that a
+		// silent local latch would have hidden by papering over it.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Core] SetScoringMode(%s) disagrees with the published ATraceGameState mode (%s). ")
+			TEXT("The GameState is authoritative; publish it before telling the Core."),
+			bPublishedIsModeB ? TEXT("B") : TEXT("A"), bStateSaysModeB ? TEXT("B") : TEXT("A"));
+	}
+
+	if (!bModeEverApplied || bAppliedModeB != bStateSaysModeB)
+	{
+		bAppliedModeB = bStateSaysModeB;
+		bModeEverApplied = true;
+		OnScoringModeChanged();
+	}
+}
+
+void ATraceCore::OnScoringModeChanged()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// GUARDED: switching to mode A with the Core in the air has to end the flight AND put the Core
+	// somewhere legal, and the kickoff that does so re-enters this actor.
+	if (bCoreStateLocked)
+	{
+		return;
+	}
+	FCoreStateLock Lock(this);
+
+	// NOT arming or disarming any scoring volume. ATraceArenaBuilder builds both pairs and arms the
+	// one belonging to the selected mode (ATraceEndzone::SetZoneActive); a second arming pass here
+	// would be two systems fighting over one flag, and the loser would be whichever ran last.
+
+	// Mode A cannot represent a loose Core at all - there is no pickup in mode A, so one would lie
+	// there for the rest of the match. Normalise it into the model mode A does have: a kickoff for
+	// the side that did not last hold it.
+	if (!IsModeB() && bLoose)
+	{
+		const ETraceTeam Owed = (LooseFromTeam != ETraceTeam::None)
+			? TraceOpposingTeam(LooseFromTeam) : TraceCoreTuning::DefaultKickoffTeam;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] scoring mode switched to A with the Core loose - recovering it as a kickoff for %s."),
+			*TraceTeamName(Owed).ToString());
+
+		ClearLooseState();
+		KickoffTo(Owed);
+	}
+
+	GoalBoxRefreshTime = 0.f;
+	RefreshGoalVolumes(/*bForce=*/true);
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Core] scoring mode is now %s (%d goal volume(s) visible to the Core)."),
+		IsModeB() ? TEXT("B - goals, Core is thrown") : TEXT("A - endzones, Core is a status"),
+		GoalBoxes.Num());
+
+	// THE ONE FAILURE THIS FILE CANNOT DETECT ANY OTHER WAY.
+	//
+	// Every mode-B knob is matched to UTraceSettings BY NAME, at runtime, through FindFProperty. A
+	// misspelling therefore does not fail the build and does not warn: the lookup simply misses, the
+	// CVar default is played, and the settings panel shows a slider that moves nothing. That is
+	// exactly what happened to CoreThrowUpBias, which was declared for a while as
+	// "CoreThrowUpwardBias" and was silently dead the whole time.
+	//
+	// So on the frame mode B is entered, say out loud which knobs are wired to the panel and which
+	// fell back. In a healthy build every line reads "settings"; a "CVAR FALLBACK" line names the
+	// property that needs declaring, and a dead knob can never again be invisible.
+	if (IsModeB())
+	{
+		TraceModeBTuning::LogKnobBindings();
+	}
+}
+
+
+// --- Goals ---------------------------------------------------------------------------------------
+
+void ATraceCore::RegisterGoalVolume(AActor* GoalOwner, ETraceTeam DefendingTeam, UPrimitiveComponent* Volume)
+{
+	if (!IsValid(GoalOwner) || !IsValid(Volume) || DefendingTeam == ETraceTeam::None)
+	{
+		return;
+	}
+
+	TArray<TraceGoalRegistry::FEntry>& Registry = TraceGoalRegistry::Entries();
+
+	for (TraceGoalRegistry::FEntry& Entry : Registry)
+	{
+		if (Entry.GoalOwner.Get() == GoalOwner)
+		{
+			Entry.Volume = Volume;
+			Entry.DefendingTeam = DefendingTeam;
+			return;
+		}
+	}
+
+	TraceGoalRegistry::FEntry NewEntry;
+	NewEntry.GoalOwner = GoalOwner;
+	NewEntry.Volume = Volume;
+	NewEntry.DefendingTeam = DefendingTeam;
+	Registry.Add(NewEntry);
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Core] goal volume registered: %s defends %s, bounds %s"),
+		*GetNameSafe(GoalOwner), *TraceTeamName(DefendingTeam).ToString(),
+		*Volume->Bounds.GetBox().ToString());
+}
+
+void ATraceCore::UnregisterGoalVolume(AActor* GoalOwner)
+{
+	TraceGoalRegistry::Entries().RemoveAll([GoalOwner](const TraceGoalRegistry::FEntry& Entry)
+	{
+		return !Entry.GoalOwner.IsValid() || Entry.GoalOwner.Get() == GoalOwner;
+	});
+}
+
+void ATraceCore::RefreshGoalVolumes(bool bForce)
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	if (!IsModeB())
+	{
+		// Mode A has no goals at all - the endzone is the scoring volume and it is not this class's
+		// business. Emptied rather than merely skipped so nothing can score off a stale box if the
+		// mode is switched back and forth.
+		GoalBoxes.Reset();
+		return;
+	}
+
+	const float Now = GetServerTimeSeconds();
+	if (!bForce && Now < GoalBoxRefreshTime)
+	{
+		return;
+	}
+	GoalBoxRefreshTime = Now + TraceModeBTuning::GoalRefreshInterval;
+
+	GoalBoxes.Reset();
+
+	// --- 1. Externally registered volumes win outright. -------------------------------------------
+	for (int32 Index = TraceGoalRegistry::Entries().Num() - 1; Index >= 0; --Index)
+	{
+		const TraceGoalRegistry::FEntry& Entry = TraceGoalRegistry::Entries()[Index];
+		const UPrimitiveComponent* Volume = Entry.Volume.Get();
+
+		if (!Entry.GoalOwner.IsValid() || Volume == nullptr)
+		{
+			TraceGoalRegistry::Entries().RemoveAt(Index);
+			continue;
+		}
+		if (Volume->GetWorld() != World)
+		{
+			continue;   // Another PIE world's goal. Not ours.
+		}
+
+		FTraceGoalBox Goal;
+		Goal.Box = Volume->Bounds.GetBox();
+		Goal.DefendingTeam = Entry.DefendingTeam;
+		GoalBoxes.Add(Goal);
+	}
+
+	if (GoalBoxes.Num() > 0)
+	{
+		return;
+	}
+
+	// --- 2. The arena's own goal volumes. ---------------------------------------------------------
+	//
+	// ATraceArenaBuilder builds a mode-A endzone AND a mode-B goal at each end and arms the pair
+	// belonging to the selected mode, so the goals are already in the world with the right shape.
+	// This asks them for it — IsGoalVolume() to skip the full-width endzones, IsZoneActive() to skip
+	// the pair the mode is not playing, GetZoneBounds() for the box — rather than reconstructing a
+	// goal from GoalWidthFieldFraction and GoalHeightUU.
+	//
+	// It used to reconstruct it, and the reconstruction was CORRECT to the millimetre against the
+	// volume that shipped a few hours later. That is exactly why it had to go: a second copy of a
+	// shape agrees with the first right up until somebody changes one of them, and then the goal you
+	// can see and the goal that scores are different boxes.
+	for (TActorIterator<ATraceEndzone> It(World); It; ++It)
+	{
+		const ATraceEndzone* Zone = *It;
+		if (!IsValid(Zone) || !Zone->IsGoalVolume() || !Zone->IsZoneActive()
+			|| Zone->OwningTeam == ETraceTeam::None)
+		{
+			continue;
+		}
+
+		FTraceGoalBox Goal;
+		Goal.DefendingTeam = Zone->OwningTeam;
+		Goal.Box = Zone->GetZoneBounds();
+		GoalBoxes.Add(Goal);
+	}
+}
+
+bool ATraceCore::GetAttackGoalCentre(const UWorld* World, ETraceTeam AttackingTeam, FVector& OutCentre)
+{
+	ATraceCore* TheCore = ATraceCore::Get(World);
+	if (TheCore == nullptr || !TheCore->IsModeB() || AttackingTeam == ETraceTeam::None)
+	{
+		return false;
+	}
+
+	TheCore->RefreshGoalVolumes(/*bForce=*/false);
+
+	for (const FTraceGoalBox& Goal : TheCore->GoalBoxes)
+	{
+		// Same rule as ATraceEndzone::ScoresHere: you score in the goal your OPPONENT defends.
+		if (Goal.DefendingTeam != ETraceTeam::None && AttackingTeam == TraceOpposingTeam(Goal.DefendingTeam))
+		{
+			OutCentre = Goal.Box.GetCenter();
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool ATraceCore::CheckGoalScore(const FVector& From, const FVector& To, ETraceTeam ScoringTeam, const TCHAR* How)
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority() || !IsModeB() || ScoringTeam == ETraceTeam::None)
+	{
+		return false;
+	}
+
+	RefreshGoalVolumes(/*bForce=*/false);
+
+	for (const FTraceGoalBox& Goal : GoalBoxes)
+	{
+		if (Goal.DefendingTeam == ETraceTeam::None || ScoringTeam != TraceOpposingTeam(Goal.DefendingTeam))
+		{
+			continue;
+		}
+
+		// FMath::LineBoxIntersection is the swept test; the explicit IsInside covers the degenerate
+		// case where From == To (a stationary carrier standing in the mouth), which the segment test
+		// is not required to report.
+		if (!Goal.Box.IsInside(To) && !FMath::LineBoxIntersection(Goal.Box, From, To, To - From))
+		{
+			continue;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] GOAL by %s (%s) into the goal %s defends. Box %s"),
+			*TraceTeamName(ScoringTeam).ToString(), How,
+			*TraceTeamName(Goal.DefendingTeam).ToString(), *Goal.Box.ToString());
+
+		if (ATraceGameMode* GameMode = World->GetAuthGameMode<ATraceGameMode>())
+		{
+			// NotifyScored resets the field: it kicks off, teleports ten pawns and releases this Core.
+			// Nothing may touch member state after it, which is why every caller of this function
+			// returns immediately on true.
+			GameMode->NotifyScored(ScoringTeam);
+		}
+		return true;
+	}
+
+	return false;
+}
+
+
+// --- The throw -----------------------------------------------------------------------------------
+
+bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
+{
+	if (!HasAuthority() || !IsModeB())
+	{
+		return false;
+	}
+
+	// One guarded, indivisible sequence from here to the end of the function.
+	if (bCoreStateLocked)
+	{
+		return false;
+	}
+
+	if (bLoose || !IsValid(Thrower) || Thrower != Carrier || !Thrower->IsAlive())
+	{
+		return false;
+	}
+
+	const float Now = GetServerTimeSeconds();
+	if (Now < ThrowCooldownEndServerTime)
+	{
+		return false;
+	}
+
+	FCoreStateLock Lock(this);
+
+	// SERVER'S copy of the aim, never a client-supplied direction. See the ThrowFromHolder doc.
+	FVector ThrowDirection = Thrower->GetAimDirection();
+	if (ThrowDirection.IsNearlyZero())
+	{
+		ThrowDirection = Thrower->GetActorForwardVector();
+	}
+	ThrowDirection = ThrowDirection.GetSafeNormal();
+
+	const float Speed = TraceModeBTuning::ThrowSpeed();
+	const FVector LaunchVelocity = ThrowDirection * Speed
+		+ FVector::UpVector * (Speed * TraceModeBTuning::ThrowUpBias());
+
+	const FVector LaunchLocation = Thrower->GetPawnViewLocation()
+		+ ThrowDirection * TraceModeBTuning::ThrowMuzzleForward;
+
+	const ETraceTeam ThrowerTeam = Thrower->GetTeam();
+
+	// ORDER MATTERS AND IS THE POINT OF THE LOCK.
+	//   1. end any pass window (mode B never opens one, but a mode switch mid-hold could leave one);
+	//   2. hand the Core off its holder through the SAME exit mode A uses, so the trail stops
+	//      emitting, the carrier mirror is cleared, the death binding is dropped and ownership goes;
+	//   3. only then flip to loose and place the actor.
+	// Doing 3 before 2 would leave ReleaseHolder's DetachFromActor snapping the Core back onto the
+	// thrower's transform - which is the "stored its home position as a relative offset" family of
+	// bug the file header warns about.
+	CancelPass(nullptr);
+	ReleaseHolder();
+
+	bLoose = true;
+	bLooseAtRest = false;
+	LooseFromTeam = ThrowerTeam;
+	LooseThrower = Thrower;
+	LooseStartServerTime = Now;
+	LooseLocation = LaunchLocation;
+	LooseVelocity = LaunchVelocity;
+
+	// A loose Core belongs to nobody, so it must be visible to everybody - including the thrower,
+	// whose own camera had it hidden while they carried it (bOwnerNoSee, resolved through the actor
+	// owner chain that ReleaseHolder just cleared).
+	SetActorLocation(LaunchLocation, false, nullptr, ETeleportType::TeleportPhysics);
+	ApplyAttachment();
+	UpdateVisuals();
+	ForceNetUpdate();
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] THROW by %s (%s) at %.0f uu/s from %s"),
+		*GetNameSafe(Thrower), *TraceTeamName(ThrowerTeam).ToString(),
+		LaunchVelocity.Size(), *LaunchLocation.ToCompactString());
+
+	return true;
+}
+
+
+// --- The loose Core ------------------------------------------------------------------------------
+
+void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority() || !bLoose)
+	{
+		return;
+	}
+
+	// A mode switch, a half-time interval or a score can all land while the Core is in the air.
+	if (!IsModeB())
+	{
+		return;   // OnScoringModeChanged() normalises it; nothing to integrate in the meantime.
+	}
+
+	const float Now = GetServerTimeSeconds();
+	const float Step = FMath::Clamp(DeltaSeconds, 0.f, 0.1f);   // A hitch must not teleport the Core.
+
+	const FVector StartLocation = LooseLocation;
+
+	// --- 1. Integrate. No UProjectileMovementComponent: see the header. --------------------------
+	if (!bLooseAtRest)
+	{
+		const double GravityZ = static_cast<double>(World->GetGravityZ())
+			* static_cast<double>(TraceModeBTuning::GravityScale());
+
+		LooseVelocity = FVector(LooseVelocity) + FVector(0.0, 0.0, GravityZ * Step);
+
+		const FVector Desired = StartLocation + FVector(LooseVelocity) * Step;
+
+		// ONE sphere sweep against static world geometry. Pawns are deliberately not swept against:
+		// "first contact takes it" is resolved by the proximity poll below, so a player standing in
+		// the flight path must not also bounce the Core off themselves.
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreLoose), /*bTraceComplex=*/false, this);
+		Params.AddIgnoredActor(this);
+
+		FHitResult Hit;
+		const bool bBlocked = World->SweepSingleByChannel(
+			Hit, StartLocation, Desired, FQuat::Identity, ECC_WorldStatic,
+			FCollisionShape::MakeSphere(TraceModeBTuning::CollisionRadius), Params);
+
+		if (bBlocked)
+		{
+			// Land just off the surface so the next sweep does not start inside it.
+			LooseLocation = Hit.Location + Hit.ImpactNormal * 2.0;
+
+			const FVector Reflected = FVector(LooseVelocity).MirrorByVector(Hit.ImpactNormal)
+				* TraceModeBTuning::Bounce();
+			LooseVelocity = Reflected;
+
+			if (Reflected.Size() < TraceModeBTuning::RestSpeed)
+			{
+				LooseVelocity = FVector::ZeroVector;
+				bLooseAtRest = true;
+				UE_LOG(LogTraceGame, Verbose, TEXT("[ModeB] loose Core came to rest at %s"),
+					*FVector(LooseLocation).ToCompactString());
+			}
+		}
+		else
+		{
+			LooseLocation = Desired;
+		}
+	}
+
+	SetActorLocation(LooseLocation, false, nullptr, ETeleportType::TeleportPhysics);
+
+	// --- 2. Did the flight cross a goal? ----------------------------------------------------------
+	//
+	// Before the pickup poll, and swept across this frame's motion. The throwing team is the only one
+	// that can score from it, exactly as with an endzone: a Core that flies into the goal its own
+	// team defends is not an own goal, it is a bad throw.
+	if (CheckGoalScore(StartLocation, LooseLocation, LooseFromTeam, TEXT("thrown in")))
+	{
+		return;   // The field has been reset under us. Touch nothing.
+	}
+
+	// --- 3. First contact takes it. ---------------------------------------------------------------
+	if (ServerTryLoosePickup())
+	{
+		return;
+	}
+
+	// --- 4. It may never be lost permanently. -----------------------------------------------------
+	const FBox FieldBox = [World]() -> FBox
+	{
+		if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World))
+		{
+			return Arena->GetFieldBounds();
+		}
+		return FBox(ForceInit);
+	}();
+
+	// Generous vertical slack: a lobbed Core is legitimately far above the field box, and a Core
+	// under the floor has fallen out of the world and is gone for good.
+	const bool bOutOfWorld = (FieldBox.IsValid != 0)
+		&& (FVector(LooseLocation).X < FieldBox.Min.X - 2000.0
+			|| FVector(LooseLocation).X > FieldBox.Max.X + 2000.0
+			|| FVector(LooseLocation).Y < FieldBox.Min.Y - 2000.0
+			|| FVector(LooseLocation).Y > FieldBox.Max.Y + 2000.0
+			|| FVector(LooseLocation).Z < FieldBox.Min.Z - 1500.0);
+
+	if (bOutOfWorld)
+	{
+		ResetLooseCore(TEXT("left the field"));
+		return;
+	}
+
+	// 0 disables the timer outright (UTraceSettings::CoreLooseResetSeconds, "0 = never"). The
+	// out-of-world rescue above still runs, so even with the timer off the Core cannot be lost
+	// permanently — it can only be left lying somewhere a player can still reach it.
+	const float ResetAfter = TraceModeBTuning::LooseResetSeconds();
+	if (ResetAfter > 0.f && (Now - LooseStartServerTime) >= ResetAfter)
+	{
+		ResetLooseCore(TEXT("untouched past the reset timer"));
+	}
+}
+
+bool ATraceCore::ServerTryLoosePickup()
+{
+	if (!HasAuthority() || !bLoose || bCoreStateLocked)
+	{
+		return false;
+	}
+
+	const float Now = GetServerTimeSeconds();
+	const float Radius = TraceModeBTuning::PickupRadius();
+	const float SelfLockoutEnd = LooseStartServerTime + TraceModeBTuning::SelfPickupLockout();
+	const ATraceCharacter* Thrower = LooseThrower.Get();
+
+	TArray<ATraceCharacter*> Candidates;
+	GatherCharacters(Candidates);
+
+	ATraceCharacter* Best = nullptr;
+	double BestOverlapSq = TNumericLimits<double>::Max();
+
+	const FVector CoreLocation = LooseLocation;
+
+	for (ATraceCharacter* Candidate : Candidates)
+	{
+		if (!IsValid(Candidate) || !Candidate->IsAlive())
+		{
+			continue;
+		}
+
+		// The ONE exception to "first contact, anyone". The Core leaves from inside the thrower's own
+		// pickup radius, so without a brief lockout on them alone, every throw would be caught by the
+		// player who threw it on the very next tick and the mechanic would not exist. Everybody else -
+		// teammate or enemy - is eligible from frame one, which is what makes interception the point.
+		if (Candidate == Thrower && Now < SelfLockoutEnd)
+		{
+			continue;
+		}
+
+		// Distance to the CAPSULE, not to the actor origin: the origin is at the pawn's midpoint, so
+		// an origin test would refuse a Core rolling past a player's feet.
+		double DistanceSq = FVector::DistSquared(CoreLocation, Candidate->GetActorLocation());
+		if (const UCapsuleComponent* Capsule = Candidate->GetCapsuleComponent())
+		{
+			const FVector CapsuleCentre = Capsule->GetComponentLocation();
+			const double HalfHeight = static_cast<double>(Capsule->GetScaledCapsuleHalfHeight());
+			const double CapsuleRadius = static_cast<double>(Capsule->GetScaledCapsuleRadius());
+
+			// Closest point on the capsule's axis, then subtract the radius off the distance.
+			FVector Closest = CoreLocation;
+			Closest.Z = FMath::Clamp(CoreLocation.Z, CapsuleCentre.Z - HalfHeight, CapsuleCentre.Z + HalfHeight);
+			Closest.X = CapsuleCentre.X;
+			Closest.Y = CapsuleCentre.Y;
+
+			const double Surface = FMath::Max(0.0, FVector::Dist(CoreLocation, Closest) - CapsuleRadius);
+			DistanceSq = Surface * Surface;
+		}
+
+		if (DistanceSq > static_cast<double>(Radius) * static_cast<double>(Radius))
+		{
+			continue;
+		}
+
+		if (DistanceSq < BestOverlapSq)
+		{
+			BestOverlapSq = DistanceSq;
+			Best = Candidate;
+		}
+	}
+
+	if (Best == nullptr)
+	{
+		return false;
+	}
+
+	TakeLooseCore(Best);
+	return true;
+}
+
+void ATraceCore::TakeLooseCore(ATraceCharacter* Taker)
+{
+	if (!HasAuthority() || !IsValid(Taker) || bCoreStateLocked)
+	{
+		return;
+	}
+
+	FCoreStateLock Lock(this);
+
+	const ETraceTeam FromTeam = LooseFromTeam;
+	const ETraceTeam TakerTeam = Taker->GetTeam();
+
+	// THE GRACE RULE, and the reason ETraceCoreGrantReason grew two enumerators rather than one.
+	// Spec v4 §7 verbatim: turnovers keep mode A's grace, teammates picking it up get none. Both
+	// halves are decided by the same AreAllies() line inside GrantTo - all this does is tell GrantTo
+	// which team the Core came FROM, since there is no previous holder left to ask.
+	const bool bTeamChanged = !(FromTeam != ETraceTeam::None && FromTeam == TakerTeam);
+	const ETraceCoreGrantReason Reason = bTeamChanged
+		? ETraceCoreGrantReason::Interception
+		: ETraceCoreGrantReason::Recovery;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] %s by %s (%s) - Core was thrown by %s, %s"),
+		bTeamChanged ? TEXT("INTERCEPTION") : TEXT("RECOVERY"),
+		*GetNameSafe(Taker), *TraceTeamName(TakerTeam).ToString(),
+		*TraceTeamName(FromTeam).ToString(),
+		bTeamChanged ? TEXT("turnover grace applies") : TEXT("no grace, same team"));
+
+	// Clear the loose state BEFORE granting, and set the single-use grace override in the same
+	// breath. GrantTo attaches the Core to the taker; leaving bLoose true across that call would let
+	// any re-entrant tick integrate a Core that is now parented to a pawn.
+	// Captured for Trace.ModeB.Verify BEFORE the grant, because GrantTo can score, reset the field
+	// and hand the Core straight back out again — by the time it returns, the take this scenario
+	// caused is no longer the possession anybody can observe.
+	if (bVerifyAwaitingTake)
+	{
+		bVerifyAwaitingTake = false;
+		bVerifyTakeSeen = true;
+		VerifyTookTeam = TakerTeam;
+		VerifyFromTeam = FromTeam;
+		bVerifyTookGrace = bTeamChanged;
+		VerifyTakerName = GetNameSafe(Taker);
+	}
+
+	ClearLooseState();
+	GraceOverrideTeam = FromTeam;
+
+	GrantTo(Taker, Reason);
+
+	// GrantTo consumes it, but clear again unconditionally: if GrantTo refused the grant (a dead
+	// taker between the poll and here) a stale override must not survive into the next possession.
+	GraceOverrideTeam = ETraceTeam::None;
+}
+
+void ATraceCore::ClearLooseState()
+{
+	bLoose = false;
+	bLooseAtRest = false;
+	LooseVelocity = FVector::ZeroVector;
+	LooseThrower = nullptr;
+	LooseStartServerTime = 0.f;
+	// LooseFromTeam is deliberately NOT cleared here: TakeLooseCore reads it immediately afterwards
+	// to decide the grace, and KickoffTo/GrantTo overwrite it on the next possession.
+}
+
+void ATraceCore::ResetLooseCore(const TCHAR* Reason)
+{
+	if (!HasAuthority() || bCoreStateLocked)
+	{
+		return;
+	}
+
+	FCoreStateLock Lock(this);
+
+	// The team that did NOT throw it away gets the restart. A throw nobody collected is a wasted
+	// possession, and handing it back to the side that wasted it would make stalling free.
+	const ETraceTeam Owed = (LooseFromTeam != ETraceTeam::None)
+		? TraceOpposingTeam(LooseFromTeam)
+		: TraceCoreTuning::DefaultKickoffTeam;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] loose Core reset (%s) after %.1fs - kickoff to %s"),
+		Reason, GetServerTimeSeconds() - LooseStartServerTime, *TraceTeamName(Owed).ToString());
+
+	ClearLooseState();
+	LooseFromTeam = ETraceTeam::None;
+
+	KickoffTo(Owed);
+}
+
+// --- Trace.ModeB.Verify: a scripted proof that each mode-B rule fires ------------------------------
+//
+// WHY THIS EXISTS. Mode B has four rules and a live match exercises them on its own schedule: a
+// throw when a bot decides to throw, an interception when somebody happens to be in the way, a goal
+// when a throw happens to go in, a reset when a Core happens to be abandoned. Waiting for all four
+// to coincide inside one run is not a test, it is a hope — and "we never saw it fail" is not
+// evidence a rule works. This drives each of them deliberately, in order, and prints PASS or FAIL
+// with the fact it checked.
+//
+// It drives the REAL functions: ThrowFromHolder for the throws (so the aim, the launch, the release
+// of the holder and the trail are all the shipping path) and the ordinary pickup poll for the takes.
+// The only thing it fakes is WHERE the Core starts for the goal and reset cases, which is exactly the
+// part a match cannot be asked to arrange on cue.
+
+static TAutoConsoleVariable<int32> CVarModeBVerifyRequested(
+	TEXT("Trace.ModeB.Verify"),
+	0,
+	TEXT("1: run the mode B verification scenario once (throw -> teammate recovery with NO grace, ")
+	TEXT("throw -> enemy interception WITH grace, a Core thrown into the goal, and the loose reset timer)."),
+	ECVF_Default);
+
+bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelocity, ETraceTeam FromTeam)
+{
+	if (!HasAuthority() || !IsModeB() || bCoreStateLocked)
+	{
+		return false;
+	}
+
+	FCoreStateLock Lock(this);
+
+	CancelPass(nullptr);
+	ReleaseHolder();
+
+	bLoose = true;
+	bLooseAtRest = false;
+	LooseFromTeam = FromTeam;
+	LooseThrower = nullptr;
+	LooseStartServerTime = GetServerTimeSeconds();
+	LooseLocation = From;
+	LooseVelocity = LaunchVelocity;
+
+	SetActorLocation(From, false, nullptr, ETeleportType::TeleportPhysics);
+	ApplyAttachment();
+	UpdateVisuals();
+	ForceNetUpdate();
+	return true;
+}
+
+void ATraceCore::TickModeBVerification()
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority())
+	{
+		return;
+	}
+
+	const float Now = GetServerTimeSeconds();
+
+	// --- Arm --------------------------------------------------------------------------------------
+	if (VerifyStep < 0)
+	{
+		if (CVarModeBVerifyRequested.GetValueOnAnyThread() == 0)
+		{
+			return;
+		}
+		if (!IsModeB())
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] refused: the match is playing mode A."));
+			CVarModeBVerifyRequested->Set(0, ECVF_SetByConsole);
+			return;
+		}
+		// Wait for a settled, running half. Arming during the pre-match window put the very first
+		// throw on the same frame as the 1st-half kickoff, which cancelled it and made the scenario
+		// report a failure of a rule that had never run.
+		const ATraceGameState* GameState = World->GetGameState<ATraceGameState>();
+		if (GameState == nullptr
+			|| GameState->TraceMatchState != ETraceMatchState::InProgress
+			|| GameState->IsHalfTimeBreak()
+			|| !IsValid(Carrier))
+		{
+			return;
+		}
+
+		VerifyStep = 0;
+		VerifyPassCount = 0;
+		VerifyFailCount = 0;
+		VerifyStepDeadline = 0.f;
+		UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] ===== mode B verification starting ====="));
+	}
+
+	// --- A step that is waiting on an outcome -----------------------------------------------------
+	if (VerifyStepDeadline > 0.f)
+	{
+		const bool bTimedOut = (Now >= VerifyStepDeadline);
+
+		// Steps 0 and 1 are waiting for a taker; steps 2 and 3 are waiting for the Core to stop being
+		// loose (a goal or a reset both end with a kickoff).
+		if (VerifyStep <= 1)
+		{
+			if (bVerifyTakeSeen)
+			{
+				bVerifyTakeSeen = false;
+
+				// THE RULE, judged on the take that actually happened rather than on who was predicted
+				// to win the race. Spec v4 §7 is a statement about TEAMS, not about players: grace iff
+				// the Core crossed sides. "First contact takes it" means the thrower can legitimately
+				// beat the intended receiver to their own throw, and that is not a failure - the rule
+				// still has to hold for whoever got there.
+				const bool bShouldGrace = (VerifyTookTeam != VerifyFromTeam);
+				const bool bOk = (bVerifyTookGrace == bShouldGrace)
+					&& (bVerifyTookGrace == (bLastGrantTeamChanged && LastGrantGraceSeconds > 0.f));
+
+				(bOk ? VerifyPassCount : VerifyFailCount)++;
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ModeBVerify] step %d %s: %s (%s) took the thrown Core | grace %s, rule says %s"),
+					VerifyStep, bOk ? TEXT("PASS") : TEXT("FAIL"),
+					*VerifyTakerName, *TraceTeamName(VerifyTookTeam).ToString(),
+					bVerifyTookGrace ? *FString::Printf(TEXT("APPLIED %.2fs"), LastGrantGraceSeconds) : TEXT("none"),
+					bShouldGrace ? TEXT("APPLIED (crossed teams)") : TEXT("none (same team)"));
+
+				VerifyStepDeadline = 0.f;
+				++VerifyStep;
+				return;
+			}
+		}
+		else if (!bLoose)
+		{
+			// Step 2 is the goal, and "the Core stopped being loose" is not enough on its own — a
+			// pickup or a reset would look the same from here. The point on the scoreboard is the
+			// fact under test, so that is what is checked.
+			bool bOk = true;
+			FString Detail = TEXT("the loose Core left play as expected");
+
+			if (VerifyStep == 2)
+			{
+				int32 ScoreNow = 0;
+				if (const ATraceGameState* GameState = World->GetGameState<ATraceGameState>())
+				{
+					ScoreNow = GameState->GetScore(VerifyExpectTeam);
+				}
+				bOk = (ScoreNow > VerifyGoalsAtStart);
+				Detail = FString::Printf(TEXT("%s score %d -> %d"),
+					*TraceTeamName(VerifyExpectTeam).ToString(), VerifyGoalsAtStart, ScoreNow);
+			}
+
+			(bOk ? VerifyPassCount : VerifyFailCount)++;
+			UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] step %d %s: %s."),
+				VerifyStep, bOk ? TEXT("PASS") : TEXT("FAIL"), *Detail);
+
+			VerifyStepDeadline = 0.f;
+			++VerifyStep;
+			return;
+		}
+
+		if (bTimedOut)
+		{
+			++VerifyFailCount;
+			bVerifyAwaitingTake = false;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step %d FAIL: timed out (loose=%d, carrier=%s)."),
+				VerifyStep, bLoose ? 1 : 0, *GetNameSafe(Carrier));
+			VerifyStepDeadline = 0.f;
+			++VerifyStep;
+		}
+		return;
+	}
+
+	// --- Start the next step ----------------------------------------------------------------------
+	TArray<ATraceCharacter*> Everyone;
+	GatherCharacters(Everyone);
+
+	switch (VerifyStep)
+	{
+	case 0:
+	case 1:
+	{
+		// A real throw, aimed at a real target, through ThrowFromHolder.
+		if (!IsValid(Carrier) || !Carrier->IsAlive())
+		{
+			return;
+		}
+
+		const bool bWantTeammate = (VerifyStep == 0);
+		const ETraceTeam HolderTeam = Carrier->GetTeam();
+
+		ATraceCharacter* Target = nullptr;
+		double BestDistSq = TNumericLimits<double>::Max();
+		for (ATraceCharacter* Candidate : Everyone)
+		{
+			if (!IsValid(Candidate) || Candidate == Carrier || !Candidate->IsAlive())
+			{
+				continue;
+			}
+			const bool bIsMate = AreAllies(HolderTeam, Candidate->GetTeam());
+			if (bIsMate != bWantTeammate)
+			{
+				continue;
+			}
+			const double DistSq = FVector::DistSquared(Carrier->GetActorLocation(), Candidate->GetActorLocation());
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				Target = Candidate;
+			}
+		}
+
+		if (Target == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step %d SKIPPED: no living %s to throw at."),
+				VerifyStep, bWantTeammate ? TEXT("teammate") : TEXT("enemy"));
+			++VerifyStep;
+			return;
+		}
+
+		// Put the target within arm's reach of the throw so the outcome is about the RULE (who may
+		// take it, and what grace they get) rather than about a bot's ability to run somewhere.
+		const FVector Behind = Carrier->GetActorLocation()
+			+ (Carrier->GetActorForwardVector().GetSafeNormal2D() * 420.0);
+		Target->SetActorLocation(FVector(Behind.X, Behind.Y, Target->GetActorLocation().Z),
+			false, nullptr, ETeleportType::TeleportPhysics);
+
+		if (AController* HolderController = Carrier->GetController())
+		{
+			const FVector ToTarget = Target->GetActorLocation() - Carrier->GetPawnViewLocation();
+			if (!ToTarget.IsNearlyZero())
+			{
+				HolderController->SetControlRotation(ToTarget.Rotation());
+			}
+		}
+
+		VerifyThrower = Carrier;
+		VerifyExpectTeam = Target->GetTeam();
+		VerifyExpectGrace = !AreAllies(HolderTeam, Target->GetTeam());
+
+		ThrowCooldownEndServerTime = 0.f;   // The scenario is not testing the cooldown.
+		bVerifyAwaitingTake = true;
+		bVerifyTakeSeen = false;
+
+		if (!ThrowFromHolder(Carrier))
+		{
+			++VerifyFailCount;
+			bVerifyAwaitingTake = false;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step %d FAIL: ThrowFromHolder refused."), VerifyStep);
+			++VerifyStep;
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] step %d: thrown at %s (%s) - expecting %s with %s grace."),
+			VerifyStep, *GetNameSafe(Target), bWantTeammate ? TEXT("teammate") : TEXT("enemy"),
+			*TraceTeamName(VerifyExpectTeam).ToString(), VerifyExpectGrace ? TEXT("a") : TEXT("no"));
+
+		VerifyStepDeadline = Now + 4.f;
+		return;
+	}
+
+	case 2:
+	{
+		// A Core thrown INTO the goal. Launched from just outside the mouth, moving into it, so the
+		// swept goal test in ServerTickLooseCore is what has to catch it.
+		const ETraceTeam Attacker = IsValid(Carrier) ? Carrier->GetTeam() : ETraceTeam::Blue;
+
+		FVector GoalCentre = FVector::ZeroVector;
+		if (!GetAttackGoalCentre(World, Attacker, GoalCentre))
+		{
+			++VerifyFailCount;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 2 FAIL: no goal box resolved for %s."),
+				*TraceTeamName(Attacker).ToString());
+			++VerifyStep;
+			return;
+		}
+
+		// Approach along X from the field side, so "into the goal" is unambiguous whichever end it is.
+		const double FieldCentreX = [World]() -> double
+		{
+			if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World))
+			{
+				return Arena->GetFieldBounds().GetCenter().X;
+			}
+			return 0.0;
+		}();
+
+		const double Sign = (GoalCentre.X >= FieldCentreX) ? 1.0 : -1.0;
+		const FVector Start = GoalCentre - FVector(Sign * 1200.0, 0.0, 0.0);
+		const FVector LaunchVelocity = FVector(Sign * 2400.0, 0.0, 200.0);
+
+		VerifyGoalsAtStart = 0;
+		VerifyExpectTeam = Attacker;
+		if (const ATraceGameState* GameState = World->GetGameState<ATraceGameState>())
+		{
+			VerifyGoalsAtStart = GameState->GetScore(Attacker);
+		}
+
+		if (!DebugLaunchLoose(Start, LaunchVelocity, Attacker))
+		{
+			++VerifyFailCount;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 2 FAIL: could not launch."));
+			++VerifyStep;
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] step 2: %s Core launched at the goal mouth %s from %s - expecting a GOAL."),
+			*TraceTeamName(Attacker).ToString(), *GoalCentre.ToCompactString(), *Start.ToCompactString());
+
+		VerifyStepDeadline = Now + 4.f;
+		return;
+	}
+
+	case 3:
+	{
+		// The reset timer. Launched straight down into the floor in a corner with a back-dated start
+		// time, so it comes to rest untouched and the timer is the only thing that can end it.
+		const ETraceTeam FromTeam = IsValid(Carrier) ? Carrier->GetTeam() : ETraceTeam::Blue;
+
+		FVector Corner = GetHomeLocation() + FVector(0.0, 0.0, 400.0);
+		if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World))
+		{
+			const FBox FieldBox = Arena->GetFieldBounds();
+			if (FieldBox.IsValid != 0)
+			{
+				Corner = FVector(FieldBox.GetCenter().X, FieldBox.Max.Y - 600.0, FieldBox.Min.Z + 400.0);
+			}
+		}
+
+		if (!DebugLaunchLoose(Corner, FVector(0.0, 0.0, -50.0), FromTeam))
+		{
+			++VerifyFailCount;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 3 FAIL: could not launch."));
+			++VerifyStep;
+			return;
+		}
+
+		// Back-date the clock rather than waiting out the real timer: the rule under test is "a loose
+		// Core is put back into play once it has been ignored for long enough", not the wall clock.
+		LooseStartServerTime = Now - (TraceModeBTuning::LooseResetSeconds() - 2.f);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] step 3: Core parked at %s with its reset timer 2s from expiry - expecting a reset."),
+			*Corner.ToCompactString());
+
+		VerifyStepDeadline = Now + 8.f;
+		return;
+	}
+
+	default:
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] ===== finished: %d PASS, %d FAIL ====="), VerifyPassCount, VerifyFailCount);
+		CVarModeBVerifyRequested->Set(0, ECVF_SetByConsole);
+		VerifyStep = -1;
+		return;
+	}
+	}
+}
+
+bool ATraceCore::GetLooseCoreInterceptPoint(float LeadSeconds, FVector& OutPoint) const
+{
+	if (!bLoose)
+	{
+		return false;
+	}
+
+	OutPoint = FVector(LooseLocation) + FVector(LooseVelocity) * FMath::Clamp(LeadSeconds, 0.f, 2.f);
+	return true;
+}
+
+
+// =================================================================================================
 // Legacy shims (see the file header)
 // =================================================================================================
 
@@ -1935,6 +3386,7 @@ void ATraceCore::ApplyAttachment()
 {
 	AppliedHolder = Carrier;
 	bAppliedPassActive = bPassActive;
+	bAppliedLoose = bLoose;
 	bAppliedEver = true;
 
 	if (IsValid(Carrier))
@@ -1974,8 +3426,10 @@ void ATraceCore::ApplyAttachment()
 			TraceCoreTuning::BeaconWidth / MeshWidth,
 			Height / MeshHeight));
 
-		// Only shown while somebody is holding it: a holderless Core is a kickoff, not a target.
-		Beacon->SetVisibility(IsValid(Carrier));
+		// Shown while somebody is holding it - a holderless Core is a kickoff, not a target - and, in
+		// mode B, while it is LOOSE, which is the one moment in that mode when every player on the
+		// field needs to find it from wherever they happen to be standing.
+		Beacon->SetVisibility(IsValid(Carrier) || bLoose);
 	}
 
 	// FPrimitiveSceneProxy caches the actor owner chain when it is BUILT, and that chain is what
@@ -2068,6 +3522,22 @@ void ATraceCore::OnRep_Owner()
 	{
 		Beacon->MarkRenderStateDirty();
 	}
+}
+
+void ATraceCore::OnRep_Loose()
+{
+	// bLoose flips the Core between "attached to a pawn" and "an object at LooseLocation", and both
+	// halves of that are done by ApplyAttachment, which reads Carrier and bLoose together. Carrier
+	// and bLoose are separate properties and can land in either order, so Tick's reconciliation
+	// (bAppliedEver / AppliedHolder) is what actually guarantees they converge - this is the fast
+	// path, not the only path.
+	if (bLoose)
+	{
+		SetActorLocation(LooseLocation, false, nullptr, ETeleportType::TeleportPhysics);
+	}
+
+	ApplyAttachment();
+	UpdateVisuals();
 }
 
 void ATraceCore::OnRep_PassState()

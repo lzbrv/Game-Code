@@ -80,6 +80,40 @@ enum class EBotDifficulty : uint8
 };
 
 /**
+ * Which of the two scoring rulesets the match plays. Spec v4 §7, verbatim: "Create a toggle which
+ * can switch between the current game state(a) ... to a game state (b) where the core can be thrown
+ * and intercepted, so that we can test which feels better."
+ *
+ * This is an A/B TESTING TOGGLE, not a game type ladder — the whole point is that one build can play
+ * both so the two can be compared back to back. It lives here (and is mirrored on the main menu,
+ * which writes "?mode=a|b" onto the travel URL) rather than being a second game mode class, because
+ * a second class would double every rule that the two modes share.
+ *
+ * EndzoneStatusCore is mode A and is the DEFAULT: it is the shipped game and must not regress.
+ *
+ *   EndzoneStatusCore     Endzones spanning the full field width. The Core is a STATUS, not an
+ *                         object: it cannot exist on the ground, LMB starts the 0.5 s hover-pass,
+ *                         and possession moves on kill / trace break / completed pass.
+ *   ThrownCoreAndGoals    Discrete goal volumes (GoalWidthFieldFraction of the field width,
+ *                         GoalHeightUU tall) instead of endzones. The Core is a physical entity:
+ *                         LMB THROWS it at CoreThrowSpeed, and the first player of either team to
+ *                         come within CorePickupRadius takes it. A Core left on the ground for
+ *                         CoreLooseResetSeconds returns to play so it cannot be lost forever.
+ *
+ * Grace rules are shared: possession crossing TEAMS costs CoreTurnoverGraceSeconds of trace grace in
+ * both modes, possession moving WITHIN a team costs none in both modes.
+ */
+UENUM()
+enum class ETraceScoringMode : uint8
+{
+	/** Mode A — endzones, Core is a status, LMB is the hover-pass. The shipped game. */
+	EndzoneStatusCore = 0 UMETA(DisplayName = "A - Endzones, Core is a status"),
+
+	/** Mode B — goals, Core is a physical thrown/intercepted object, LMB throws. */
+	ThrownCoreAndGoals = 1 UMETA(DisplayName = "B - Goals, Core is thrown")
+};
+
+/**
  * The whole bot skill curve, one struct per difficulty.
  *
  * WHY A STRUCT AND NOT A PILE OF Bot*_Easy SCALARS
@@ -223,7 +257,7 @@ struct TRACE_API FTraceBotProfile
 	/**
 	 * Bots are unaware of enemies beyond this, even with clear line of sight.
 	 *
-	 * Sane range 5000 to 8000 on a 24000 x 9600 field. Must stay above MaxEngagementRange or a bot
+	 * Sane range 5000 to 8000 on the 33600 x 9600 field. Must stay above MaxEngagementRange or a bot
 	 * can never legally shoot at anything.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Engagement", meta = (DisplayName = "Sight Range (uu)", ClampMin = "100.0", ClampMax = "40000.0", UIMin = "2000.0", UIMax = "12000.0"))
@@ -468,15 +502,15 @@ public:
 	// MATCH
 	// ==========================================================================================
 
-	/**
-	 * Captures needed to win outright.
-	 *
-	 * NOT usually match-ending: ATraceGameMode::bEndMatchAtScoreToWin is off by default, because
-	 * "first to 5" would cut the second half — and the side switch that justifies it — out of most
-	 * matches. Sane range 3 to 10.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Score To Win", ClampMin = "1", ClampMax = "50", UIMin = "1", UIMax = "15"))
-	int32 ScoreToWin = 5;
+	// DEAD PROPERTY REMOVED: ScoreToWin, with ATraceGameMode::bEndMatchAtScoreToWin.
+	//
+	// Spec v4 §6, verbatim: "Remove score to win 5 — Keep the match timer as the win condition, but
+	// add a mercy rule". The clock decides the match; MercyRuleLead below is the only early exit.
+	//
+	// Deleted rather than left defaulted-off, and the game mode's switch went with it. A property
+	// that can reintroduce a deleted win condition is exactly the thing an old DefaultGame.ini
+	// switches back on, and the symptom — matches ending at 5-4 with half the format unplayed —
+	// looks like a bug in the clock rather than a stale config key.
 
 	/** Target roster size per team; used to balance teams on login. 5 is the designed game. */
 	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Players Per Team", ClampMin = "1", ClampMax = "16", UIMin = "1", UIMax = "8"))
@@ -487,28 +521,102 @@ public:
 	int32 MinPlayersToStart = 2;
 
 	/**
-	 * Seconds between death and respawn. Spec §1 sets this to 3.
+	 * Seconds between death and respawn. 3 -> 2 THIS PASS (spec v4 §5).
 	 *
 	 * NOT AUTHORITATIVE. ATraceGameMode::RespawnDelay is what actually schedules the respawn; this
 	 * is the client-side fallback the death panel counts down from during the frame or two before
 	 * ATracePlayerState::RespawnEndServerTime (the real, replicated deadline) has arrived. Keep the
 	 * two equal or the panel briefly disagrees with the game.
+	 *
+	 * BOTH COPIES MOVED. The enforcing one is now pinned from DefaultGame.ini under
+	 * [/Script/Trace.TraceGameMode] (RespawnDelay=2.0) as well as in the game mode header, because
+	 * this project has twice shipped a "changed" value that the ini quietly overrode.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Respawn Delay (s, HUD fallback)", ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.0", UIMax = "10.0"))
-	float RespawnDelay = 3.f;
+	float RespawnDelay = 2.f;
 
 	/** Countdown after MinPlayersToStart is met, before the match goes InProgress. */
 	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Warmup Duration (s)", ClampMin = "0.0", ClampMax = "120.0", UIMin = "0.0", UIMax = "30.0"))
 	float WarmupDuration = 5.f;
 
+	/**
+	 * MERCY RULE (spec v4 §6, new). The moment one team's lead reaches this many points the match
+	 * ends immediately and that team wins. ZERO DISABLES IT.
+	 *
+	 * Verbatim: "Keep the match timer as the win condition, but add a mercy rule, where the game will
+	 * end if one team leads by 8 points (granting an immediate win to the team leading)."
+	 *
+	 * It is a LEAD, not a score: 9-1 ends the match, 12-6 does not. [ASSUMPTION] it is checked across
+	 * the whole match including mid-first-half, and it ends the MATCH outright rather than ending the
+	 * half — so a blowout does not get dragged through a side switch and a second ten minutes.
+	 *
+	 * THIS IS WHAT REPLACES ScoreToWin. That property and the game mode's bEndMatchAtScoreToWin
+	 * switch were the old "first to N wins outright" condition, and spec v4 §6 removes it; both are
+	 * deleted rather than left inert. The clock and this rule are now the only two ways a match can
+	 * end, and the post-match screen must be able to say which one did it.
+	 *
+	 * Sane range 6 to 12 against a two-half format. Below ~5 a single good possession run ends the
+	 * match; at 0 only the clock ever does.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Mercy Rule Lead (points, 0 = off)", ClampMin = "0", ClampMax = "50", UIMin = "0", UIMax = "15"))
+	int32 MercyRuleLead = 8;
+
+	// ==========================================================================================
+	// SCORING MODE  —  the A/B toggle (spec v4 §7)
+	//
+	// Two complete rulesets in one binary so they can be played back to back and compared. See
+	// ETraceScoringMode above for what each mode actually changes; the three knobs here are the
+	// mode selector and the geometry mode B needs and mode A does not.
+	//
+	// LATCHING: the mode must be read ONCE at match start and held for the match. It changes what
+	// the Core IS (a status versus an actor) and what the scoring volumes ARE, so flipping it with a
+	// carrier mid-run is not a live retune, it is a mid-air rules change. The menu writes
+	// "?mode=a|b" onto the travel URL; this property is what a direct launch into the arena uses.
+	// ==========================================================================================
+
+	/**
+	 * Which ruleset the next match plays. A is the shipped game and the default.
+	 *
+	 * NOT a live knob in the way the rest of this page is: read it at match start, not at the point
+	 * of use. See the latching note above.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Scoring Mode (A/B test)"))
+	ETraceScoringMode ScoringMode = ETraceScoringMode::EndzoneStatusCore;
+
+	/**
+	 * MODE B ONLY. Width of each goal as a fraction of the FULL field width.
+	 *
+	 * Verbatim: "The goal should not be the entire width of the map, like the endzone."
+	 * [ASSUMPTION] one third. At a 9600 uu wide field that is a 3200 uu goal mouth centred on the
+	 * end line, which is wide enough to throw at from an angle and narrow enough that a defender can
+	 * meaningfully cover it — the two properties that make it a goal rather than a repainted endzone.
+	 *
+	 * Ignored entirely in mode A, where the endzone spans the full width by design. Keep it under
+	 * ~0.6 or the distinction the spec is asking for stops existing.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Goal Width (fraction of field width) [mode B]", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.1", UIMax = "0.6"))
+	float GoalWidthFieldFraction = 0.3333f;
+
+	/**
+	 * MODE B ONLY. Height of the goal volume, uu, measured from the floor.
+	 *
+	 * FINITE ON PURPOSE — "height finite so it reads as a goal rather than a wall". A goal you can
+	 * throw over is a goal you can defend by standing in front of. 700 is about four character
+	 * heights (the capsule is 176 uu), so a lobbed Core clears it and a flat throw does not.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Goal Height (uu) [mode B]", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "200.0", UIMax = "2000.0"))
+	float GoalHeightUU = 700.f;
+
 	// DEAD PROPERTY REMOVED: MatchDuration.
 	//
 	// Spec §1 replaced the single timed match with TWO HALVES. The enforced length of each half is
-	// ATraceGameMode::HalfDuration (config=Game on the game mode, [/Script/Trace.TraceGameMode]),
-	// and the game mode also owns whether the score cap ends the match early
-	// (bEndMatchAtScoreToWin, off by default — "first to 5" would cut the second half, and the side
-	// switch with it, out of most matches). Nothing read MatchDuration; a slider that silently does
-	// nothing is worse than no slider, so it is gone rather than folded away under AdvancedDisplay.
+	// ATraceGameMode::HalfDuration (config=Game on the game mode, [/Script/Trace.TraceGameMode]).
+	// Nothing read MatchDuration; a slider that silently does nothing is worse than no slider, so it
+	// is gone rather than folded away under AdvancedDisplay.
+	//
+	// The score cap that used to sit beside it (ScoreToWin here, bEndMatchAtScoreToWin on the game
+	// mode) has since gone the same way — spec v4 §6 removes "first to N" as a win condition. What
+	// ends a match now is the clock, or MercyRuleLead above.
 
 	// ==========================================================================================
 	// COMBAT
@@ -530,16 +638,18 @@ public:
 	 * Maximum hitscan distance in unreal units.
 	 *
 	 * Must span the arena diagonal or shots silently die in mid-air short of a visible target. The
-	 * field is 24000 x 9600 (spec v3 §7 narrowed it from 12000 for the 2.5:1 proportion), so the
-	 * diagonal is ~25849; 28000 still covers it with 2151 uu of margin. This was 15000 — correct for
-	 * the old 8000 x 4000 arena and barely half the field once it was scaled up.
+	 * field is 33600 x 9600 (spec v4 §3 lengthened it from 24000 for the 3.5:1 proportion), so the
+	 * diagonal is 34944 uu; 36000 covers it with 1056 uu of margin. The 28000 that preceded this
+	 * covered the OLD 24000-long field and fell 6944 uu short of the new one — a shot down the spine
+	 * expired in mid-air short of a target the player could plainly see. If ATraceArenaBuilder::
+	 * FieldLength or FieldWidth changes again, recompute sqrt(L^2 + W^2) and raise this with it.
 	 *
 	 * Raising it does NOT make the bots deadlier: they are limited by FTraceBotProfile::
 	 * MaxEngagementRange (4200 Easy / 4800 Normal / 6000 Hard), far below either value. This only
 	 * restores the human's ability to shoot what they can see.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Hitscan Range (uu)", ClampMin = "100.0", ClampMax = "200000.0", UIMin = "5000.0", UIMax = "50000.0"))
-	float HitscanRange = 28000.f;
+	float HitscanRange = 36000.f;
 
 	/**
 	 * SECONDS BETWEEN SHOTS — this is the inverse of the fire RATE, so a BIGGER number is a SLOWER
@@ -593,9 +703,14 @@ public:
 	 * clamps against; ApplyLiveMovementTuning() re-pushes it on every edit so the slider is felt
 	 * immediately. Sane range 600 (heavy) to 1000 (frantic). The whole slide and dash block is
 	 * expressed as multiples of this, so moving it moves the kit with it.
+	 *
+	 * 820 -> 800 THIS PASS (spec v4 §5). Note there is a THIRD copy of this number:
+	 * UTraceCharacterMovementComponent's constructor seeds MaxWalkSpeed so a pawn is sane for the
+	 * frames before BeginPlay overwrites it from here. It is not authoritative, but it should be
+	 * moved with this one so a breakpoint in the constructor does not read a stale figure.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Walk", meta = (DisplayName = "Walk Speed (uu/s)", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "1500.0"))
-	float WalkSpeed = 820.f;
+	float WalkSpeed = 800.f;
 
 	/**
 	 * WalkSpeed multiplier while carrying the Core — the carrier is slightly faster.
@@ -834,12 +949,18 @@ public:
 	// decay is gentle enough that a slide carries most of its entry speed all the way to its natural
 	// end, and the duration is long enough for that to be a traversal tool rather than a flourish.
 	//
-	// SPEC v3 §2.3 CHANGED THREE THINGS HERE:
-	//   * entry speed decides slide velocity, so SlideEntrySpeedMultiplier drops to 1.0;
-	//   * SlideImpulse is new, and is the other (contradictory) reading of the same note — see the
-	//     [CONFLICT] discussion on the multiplier below;
-	//   * the cooldown is 0.8 s and is now measured from the slide's END rather than its START,
-	//     which is why it is a differently named property (SlideCooldownSeconds).
+	// SPEC v4 §1 CLOSED THE [CONFLICT] SPEC v3 LEFT OPEN. The design owner ruled the flat momentum
+	// boost OUT: "entry speed determines slide velocity", Source-style, and nothing tops it up.
+	//   * SlideImpulse (a flat uu/s additive on entry) is DELETED. Not defaulted to zero — removed.
+	//   * SlideExitMinSpeedFraction (a floor on the exit speed, measured granting a slow slide a 73%
+	//     speed GAIN) is DELETED. It was the exit-side spelling of the same flat boost.
+	//   * SlideEntrySpeedMultiplier stays at 1.0 and is now the ONLY knob that can scale entry speed.
+	//   * The payoff for sliding is the SLIDE-JUMP block at the end of this section, which preserves
+	//     momentum through the jump instead of manufacturing it.
+	//   * The cooldown is 0.8 s and is measured from the slide's END rather than its START, which is
+	//     why it is a differently named property (SlideCooldownSeconds).
+	//
+	// If a merge ever reintroduces SlideImpulse or SlideExitMinSpeedFraction, delete them again.
 
 	/**
 	 * Fraction of WalkSpeed you must already be moving at before crouch will start a slide.
@@ -849,42 +970,24 @@ public:
 	float SlideEntrySpeedFraction = 0.55f;
 
 	/**
-	 * Entry speed multiplier applied to the ACTUAL entry speed. Slide velocity = entry speed x this,
-	 * plus SlideImpulse.
+	 * Entry speed multiplier applied to the ACTUAL entry speed. Slide velocity = entry speed x this.
 	 *
 	 * Not max(entry speed, WalkSpeed) — that was the old implementation and the old wording, and the
-	 * floor is exactly the flat boost §2.3 rules out: it made a slide entered at walking pace come
-	 * out 35% faster than the walk. It multiplies what you actually arrived with, nothing else.
+	 * floor is exactly the flat boost spec v4 §1 rules out: it made a slide entered at walking pace
+	 * come out 35% faster than the walk. It multiplies what you actually arrived with, nothing else.
 	 *
-	 * ONE HALF OF A CONFLICT THE SPEC LEFT OPEN, AND THE HALF THAT IS SHIPPED ACTIVE.
-	 * Spec v3 §2.3 says "entry speed determines slide velocity (NO FLAT MOMENTUM BOOST)", and a
-	 * later line in the same notes says "have the slide INCREASE MOMENTUM". Those disagree, so both
-	 * readings are knobs rather than a decision made on the designer's behalf:
-	 *   * this multiplier at 1.0 is the §2.3 reading — the slide is exactly the speed you brought;
-	 *   * SlideImpulse below, at any non-zero value, is the "increase momentum" reading.
-	 * Shipped at 1.0 / 0.0, i.e. the §2.3 reading. Raise one or the other to pick the other one.
+	 * SHIPPED AT 1.0, WHICH IS NOW THE DECISION AND NOT A DEFAULT. Spec v4 §1: "the flat momentum
+	 * boost should be ruled out, going with the source-style movement system instead". At 1.0 the
+	 * slide is exactly the speed you brought into it, friction bleeds it, and nothing tops it up.
+	 * Above 1.0 this is the ONE remaining way to make a slide grant speed, and it is at least a
+	 * proportional grant rather than a flat one — but the design owner has ruled that out, so raising
+	 * it is a deliberate reversal of their call, not a tuning nudge.
 	 *
 	 * Because it multiplies your CURRENT speed, a slide out of a fast approach is faster than a
-	 * slide out of a walk — that is the momentum preservation, and it holds at 1.0. Sane range 1.0
-	 * to 1.5. Was 1.35 before spec v3.
+	 * slide out of a walk — that is the momentum preservation, and it holds at 1.0.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Entry Speed Multiplier", ClampMin = "0.5", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
 	float SlideEntrySpeedMultiplier = 1.0f;
-
-	/**
-	 * Flat uu/s added to slide entry speed, on top of the multiplier. ZERO BY DEFAULT.
-	 *
-	 * The other half of the §2.3-versus-"increase momentum" conflict above. Unlike the multiplier
-	 * this is a FLAT boost — it is worth the same whether you entered at a walk or out of a dash,
-	 * which is precisely what "no flat momentum boost" rules out and what "increase momentum"
-	 * asks for. Deliberately applied AFTER the SlideMaxSpeed clamp, so it is never silently eaten
-	 * by the entry cap; if it were clamped, dialling it in from zero would appear to do nothing for
-	 * anyone entering a slide fast.
-	 *
-	 * Try 150-300 for a noticeable kick without making crouch-spam the fastest way to travel.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Entry Impulse (flat uu/s)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "0.0", UIMax = "600.0"))
-	float SlideImpulse = 0.f;
 
 	/**
 	 * Hard ceiling on slide entry speed, in uu/s.
@@ -974,13 +1077,11 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Exit Speed Retention (fraction of slide speed)", ClampMin = "0.0", ClampMax = "1.5", UIMin = "0.5", UIMax = "1.0"))
 	float SlideExitSpeedRetention = 1.0f;
 
-	/**
-	 * Floor on the exit speed as a fraction of WalkSpeed, so a slide can never end slower than a run.
-	 *
-	 * Below 1 a decayed slide still dumps the player out under walking pace. Sane range 0.9 to 1.0.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Exit Floor (fraction of Walk Speed)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.5", UIMax = "1.2"))
-	float SlideExitMinSpeedFraction = 1.0f;
+	// SlideExitMinSpeedFraction ("Exit Floor") WAS HERE AND IS DELETED (spec v4 §1, verbatim: "you
+	// can remove the slideexitminspeedfraction value"). At 1.0 it handed every slide back at exactly
+	// WalkSpeed no matter how slowly it was going — measured at a 73% speed GAIN for a slide that had
+	// decayed. That is the flat momentum boost the design owner ruled out, wearing an exit-side hat.
+	// A slide now ends at whatever the friction left it with, and the SLIDE-JUMP is the payoff.
 
 	/**
 	 * Ceiling on the exit speed as a multiple of max speed.
@@ -997,6 +1098,150 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Exit Ceiling (multiple of Max Speed)", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
 	float SlideExitMaxSpeedMultiplier = 1.0f;
+
+	// --- Slide-jump (spec v4 §1, new) ---------------------------------------------------------
+	//
+	// Verbatim: "Sliding, however, doesn't feel like it does much; is it possible to add a slide-jump
+	// mechanic, also attempting to feel like apex legends."
+	//
+	// This is the payoff move, and after spec v4 §1 deleted the flat slide boost it is the ONLY thing
+	// that makes sliding worth doing: the slide itself now returns exactly the momentum you brought
+	// to it, so the reason to slide has to be what you can do at the end of one.
+	//
+	// The Apex slide-hop is three properties, and each is a knob below:
+	//   1. jumping out of a slide keeps your horizontal speed instead of clamping it to walk pace
+	//      (SlideJumpHorizontalRetention),
+	//   2. it launches you properly rather than at a standing jump's height (SlideJumpZMultiplier),
+	//   3. hitting it near the END of the slide is worth more than mashing it at the start, which is
+	//      what makes it a skill rather than a second jump button (SlideJumpWindowSeconds /
+	//      SlideJumpWindowSpeedBonus).
+	//
+	// All four are read at the point of use by the movement component, so the whole feel of the move
+	// retunes with PIE running. Note the retention is applied to the SLIDE's live speed, which is
+	// already the momentum you carried in — this is not a place a flat boost can hide.
+
+	/**
+	 * Master switch for the slide-jump. OFF makes a jump out of a slide behave like any other jump.
+	 *
+	 * Exists so the move can be A/B'd against its absence from one binary, which matters here: the
+	 * slide has just lost its flat boost, and whether sliding "does something" now is exactly the
+	 * question this mechanic is answering.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Slide Jump Enabled"))
+	bool bSlideJumpEnabled = true;
+
+	/**
+	 * Fraction of the slide's live horizontal speed carried into the jump. 1.0 = all of it.
+	 *
+	 * THE HEADLINE KNOB. At 1.0 a slide-jump is a pure momentum-preserving launch and the slide
+	 * becomes a way to convert a fast approach into distance; below ~0.85 the move stops being worth
+	 * the setup and players will simply jump. Above 1.0 it is a boost — which is exactly what spec v4
+	 * §1 ruled out for the slide itself, so raise it only deliberately and only as an experiment.
+	 *
+	 * Sane range 0.9 to 1.1.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Horizontal Retention (fraction of slide speed)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.5", UIMax = "1.3"))
+	float SlideJumpHorizontalRetention = 1.0f;
+
+	/**
+	 * Multiplier on the pawn's normal jump velocity when the jump comes out of a slide.
+	 *
+	 * Kept at 1.0 by default and deliberately so: in Apex the slide-hop's value is DISTANCE, not
+	 * height, and a taller jump mostly buys hang time during which you cannot dash, cannot turn hard
+	 * and are an easy target. Lower it toward 0.85 for a flatter, faster-feeling launch; raise it if
+	 * playtesting wants the move to clear the arena's cover.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Vertical Multiplier (x normal jump)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.5", UIMax = "1.6"))
+	float SlideJumpZMultiplier = 1.0f;
+
+	/**
+	 * Seconds before a slide would END during which the jump counts as well timed. 0 = no window,
+	 * every slide-jump is worth the same.
+	 *
+	 * This is the "reward good timing" half of the request. A window measured from the slide's END
+	 * rather than its start is what makes it readable: the player can see and feel the slide running
+	 * out, so the input has something to be timed AGAINST. Timing it against the start would just
+	 * mean "press both keys at once", which is not a skill.
+	 *
+	 * Sane range 0.15 to 0.30. Below ~0.1 it is unhittable at real latency; above ~0.5 against a 1.8s
+	 * slide it covers so much of the slide that it stops being a window at all.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Timing Window (s before slide end)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.6"))
+	float SlideJumpWindowSeconds = 0.20f;
+
+	/**
+	 * Extra horizontal speed multiplier for a slide-jump taken inside the timing window above.
+	 *
+	 * Small on purpose. 1.10 on a ~1100 uu/s slide is about 110 uu/s — plainly felt over a long jump,
+	 * but not enough that a player who never learns the timing is playing a different game. This is
+	 * the one place in the movement kit where a flat-ish gain is intended, and it is gated behind a
+	 * read rather than being free, which is the distinction spec v4 §1 is actually drawing.
+	 *
+	 * 1.0 turns the window into a no-op without disabling the move. Do not go far past ~1.2 or
+	 * chained slide-jumps become the fastest way to cross the arena.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Speed Bonus (x)", ClampMin = "1.0", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.3"))
+	float SlideJumpWindowSpeedBonus = 1.10f;
+
+	// --- Slide pose (spec v4 §1) — PROCEDURAL. THERE IS NO STOCK MANNEQUIN SLIDE ANIMATION. -----
+	//
+	// The notes ask for "unreal's default slide animation for the mannequins". IT DOES NOT EXIST, and
+	// this block is not it. The Mannequin set Scripts/import-mannequin.sh brings in ships Death, Jump,
+	// Pistol, Rifle and Unarmed locomotion (BS_Idle_Walk_Run, MM_Idle) — no slide and no crouch,
+	// anywhere in Templates/TemplateResources or Engine/Content. So the pose is APPROXIMATED from what
+	// the skeleton already has: the whole mesh reclines and drops over its own feet, and the
+	// locomotion blend space is slowed almost to a stop so the legs stop sprinting. A real slide
+	// animation would have to be authored or bought.
+	//
+	// Visual only. The capsule never resizes — it is the single source of truth for hitscan, for the
+	// pose history the server rewinds and for the trail trip test — and nothing here feeds the
+	// simulation, so none of it can desync prediction or move a hit zone.
+
+	/**
+	 * Degrees the body reclines into a slide. Positive = leaning BACK, feet leading, which is the
+	 * Apex/Titanfall read and the thing that makes a slide legible at a distance.
+	 *
+	 * Sane range 20 to 40. Past ~50 the Mannequin's heels lift off the deck, because the mesh pivots
+	 * about its own origin (the bottom of the capsule) rather than about a hip joint.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Pose", meta = (DisplayName = "Recline (deg)", ClampMin = "0.0", ClampMax = "70.0", UIMin = "0.0", UIMax = "45.0"))
+	float SlidePoseLeanDegrees = 30.f;
+
+	/**
+	 * How far, in uu, the whole mesh drops toward the deck while sliding.
+	 *
+	 * The capsule deliberately does NOT shrink, so this is the only thing that makes a sliding player
+	 * look low from the outside. Modest on purpose: the feet sit at the mesh origin, so a large drop
+	 * buries them in the floor. Sane range 15 to 35.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Pose", meta = (DisplayName = "Body Drop (uu)", ClampMin = "0.0", ClampMax = "80.0", UIMin = "0.0", UIMax = "45.0"))
+	float SlidePoseDropUU = 20.f;
+
+	/**
+	 * Degrees of roll — one shoulder led into the slide. Breaks the symmetry so the pose reads as a
+	 * body committed to a direction rather than a mannequin tipped back on a hinge. 0 is a clean
+	 * recline; sane range 6 to 15.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Pose", meta = (DisplayName = "Roll (deg)", ClampMin = "-40.0", ClampMax = "40.0", UIMin = "-20.0", UIMax = "20.0"))
+	float SlidePoseRollDegrees = 9.f;
+
+	/**
+	 * Animation play rate while sliding, as a fraction of normal.
+	 *
+	 * THE MOST IMPORTANT ONE. Without it the pawn keeps playing BS_Idle_Walk_Run at slide speed, so a
+	 * sliding player's legs churn at a full sprint cadence while the torso lies back — which is the
+	 * one thing that unambiguously reads as a bug rather than a move. Near zero freezes the legs
+	 * mid-stride, close enough to "extended into a slide" to sell it. 1.0 disables the effect.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Pose", meta = (DisplayName = "Anim Rate While Sliding", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float SlidePoseAnimRateScale = 0.12f;
+
+	/**
+	 * How fast the pose blends in and out (FInterpTo speed). Fast enough to land with the slide, slow
+	 * enough to be a move rather than a cut. Sane range 7 to 14.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Pose", meta = (DisplayName = "Blend Speed", ClampMin = "1.0", ClampMax = "30.0", UIMin = "4.0", UIMax = "16.0"))
+	float SlidePoseBlendSpeed = 9.f;
 
 	// BOOST DELETED (spec v3 §1: "remove boost from the game entirely"). BoostZVelocity and
 	// BoostCooldown lived here; the bot-side mirrors BotBoostCooldownSeconds and BotBoostStuckSeconds
@@ -1160,16 +1405,131 @@ public:
 	/**
 	 * Seconds after the Core changes TEAM before the new carrier's trace starts forming.
 	 *
-	 * 1.0 -> 0.4 THIS PASS (spec v3 §1). The grace exists so a turnover does not instantly wrap the
-	 * new carrier in lethal trace laid on top of the scrum they just won it in; at a full second it
-	 * also meant the counter-attack got a free run with no trace behind it at all. 0.4 s is about
-	 * 330uu of travel at carrier speed — enough to clear the pile, short enough that the trace is a
-	 * threat again before anyone has crossed open ground.
+	 * 1.0 -> 0.4 (spec v3 §1) -> 0.5 THIS PASS (spec v4 §5, which asks for exactly 0.4 x 1.25). The
+	 * grace exists so a turnover does not instantly wrap the new carrier in lethal trace laid on top
+	 * of the scrum they just won it in; at a full second it also meant the counter-attack got a free
+	 * run with no trace behind it at all. 0.5 s is about 430uu of travel at carrier speed — enough to
+	 * clear the pile, short enough that the trace is a threat again before anyone has crossed open
+	 * ground.
 	 *
-	 * Applies only when the Core changes SIDE. A pass between teammates has no grace, by design.
+	 * Applies only when the Core changes SIDE. A pass between teammates has no grace, by design —
+	 * and in mode B (ScoringMode = ThrownCoreAndGoals) the same rule holds for a thrown Core:
+	 * intercepted by an enemy = this grace, recovered by a teammate = none. Spec v4 §7.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Turnover Trace Grace (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "2.0"))
-	float CoreTurnoverGraceSeconds = 0.4f;
+	float CoreTurnoverGraceSeconds = 0.5f;
+
+	// ==========================================================================================
+	// CORE — MODE B ONLY  (the thrown, interceptable Core; spec v4 §7)
+	//
+	// INERT IN MODE A. Nothing below is read unless ScoringMode is ThrownCoreAndGoals, because in
+	// mode A the Core is a status and cannot be thrown, dropped or stood on. They are grouped in
+	// their own category and named "[mode B]" so that is obvious from the panel — a knob that does
+	// nothing in the mode you are playing is the same trap as a knob that does nothing at all,
+	// unless the panel says so.
+	//
+	// This is NOT the physical Core the project deleted in spec v2 being reverted. It is a second
+	// possession model behind the mode enum, sharing the trace, parry and grace logic with mode A.
+	// ==========================================================================================
+
+	/**
+	 * Launch speed, uu/s, of a Core thrown with LMB in mode B.
+	 *
+	 * Verbatim: "The carrier should be able to throw the core forward by left clicking."
+	 * Fast enough to be a pass across a lane, slow enough that the "first player to contact the core
+	 * picks it up" rule has something to work with — a Core that crosses the field in half a second
+	 * cannot be intercepted by anyone, which deletes the whole point of mode B. 3000 covers ~3000uu
+	 * in the first second before drag and gravity, roughly a dash's worth of reach per second.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Speed (uu/s) [mode B]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
+	float CoreThrowSpeed = 3000.f;
+
+	/**
+	 * Fraction of the throw speed added as upward velocity, so a throw arcs instead of running flat
+	 * along the floor and catching on the first piece of cover.
+	 *
+	 * Small: at 0.12 a 3000 uu/s throw leaves with 360 uu/s of lift, which is a shallow arc a player
+	 * can lead. Raising it makes throws lobbed and easy to read; zero makes them hitscan-flat and
+	 * makes the goal's finite height (GoalHeightUU) meaningless.
+	 *
+	 * NAME IS LOAD-BEARING: ATraceCore resolves this by reflection under exactly this spelling
+	 * (TraceModeBTuning::ThrowUpBias). It was briefly declared as "CoreThrowUpwardBias", which the
+	 * lookup could not find, so the panel slider moved nothing and the CVar default was played
+	 * instead. Do not rename either half alone.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Upward Bias (fraction of speed) [mode B]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
+	float CoreThrowUpBias = 0.12f;
+
+	/**
+	 * World gravity multiplier applied to a Core in flight and rolling loose.
+	 *
+	 * Below 1 because the field is 33600 uu long: at full gravity a throw that a player can aim
+	 * ploughs into the floor inside a couple of thousand uu, which turns every throw into a short
+	 * dribble and makes interception trivial. 0.55 lets a throw cross useful ground while still
+	 * arcing enough to be read and cut off.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Gravity Scale [mode B]", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "1.5"))
+	float CoreThrowGravityScale = 0.55f;
+
+	/**
+	 * Seconds the THROWER alone may not re-take their own throw. Everybody else may take it on the
+	 * first frame — "the first player to contact the core should pick it up" is unconditional for
+	 * all nine other players.
+	 *
+	 * Without this a throw is a no-op: the Core leaves from inside the thrower's own pickup radius,
+	 * so the thrower's proximity poll re-takes it on the very next tick and the throw looks like it
+	 * never happened.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Thrower Re-Pickup Lockout (s) [mode B]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
+	float CoreThrowerPickupLockoutSeconds = 0.35f;
+
+	/**
+	 * Seconds after TAKING the Core before it may be thrown again. Stops a pickup and a throw
+	 * landing on the same frame, which reads as the Core bouncing off a player rather than being
+	 * caught, and lets an interception be seen before it is undone.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Cooldown After Pickup (s) [mode B]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "2.0"))
+	float CoreThrowCooldownSeconds = 0.35f;
+
+	/**
+	 * Restitution of a loose Core against world geometry: 0 = dead stop on contact, 1 = perfect
+	 * bounce. Low by default so a missed throw settles somewhere a player can contest rather than
+	 * pinballing off the banks into a corner.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Loose Core Bounce [mode B]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float CoreThrowBounce = 0.35f;
+
+	/**
+	 * Radius, uu, inside which a player takes possession of a loose Core. "The first player to
+	 * contact the core should pick it up" — enemy or teammate, whoever gets there first.
+	 *
+	 * Comfortably wider than the character capsule (34 uu) because this is a contact test against a
+	 * moving object sampled once a frame: at 3000 uu/s a Core travels 50 uu between frames at 60Hz,
+	 * so a radius near the capsule's would let a thrown Core tunnel straight through the player who
+	 * was standing in its path. That failure reads as "interception is broken", not as "I was too
+	 * slow". Sane range 90 to 200.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pickup Radius (uu) [mode B]", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "50.0", UIMax = "400.0"))
+	float CorePickupRadius = 120.f;
+
+	/**
+	 * Seconds a Core may lie untouched on the ground before it resets to a neutral position.
+	 * 0 disables the reset and lets it lie there forever.
+	 *
+	 * [ASSUMPTION] from spec v4 §7: "a thrown Core that lands untouched stays live on the ground and
+	 * is picked up by first contact; add a reset timer so it cannot be lost forever." The failure it
+	 * exists to prevent is a Core thrown out of bounds, into a gap in the arena geometry, or simply
+	 * ignored by ten players who all went to fight — any of which stalls the match until the half
+	 * ends. Long enough that a genuine scramble for a loose ball is never cut short; short enough
+	 * that a lost Core costs one possession rather than a half.
+	 *
+	 * 0 GENUINELY MEANS NEVER, and that took a fix: ATraceCore used to clamp this to a floor of 1
+	 * second, so entering 0 to disable the reset produced the FASTEST possible reset instead of no
+	 * reset at all — the exact opposite of what this tooltip promises. The floor is gone and the
+	 * use site now treats <= 0 as "leave it lying there".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Loose Core Reset (s, 0 = never) [mode B]", ClampMin = "0.0", ClampMax = "120.0", UIMin = "0.0", UIMax = "30.0"))
+	float CoreLooseResetSeconds = 12.f;
 
 	// ==========================================================================================
 	// PARRY  (spec v3 §3 — new mechanic)
@@ -1259,6 +1619,102 @@ public:
 	float ThirdPersonCrosshairScale = 1.60f;
 
 	// ==========================================================================================
+	// TRACER  —  the railgun shot effect  (spec v4 §4)
+	//
+	// Verbatim: "Remove the sphere from the end of the bullet tracer hitscan animation, so it's just
+	// a bullet trace, which makes it easier to see where your shots are going. Reduce the radius of
+	// the cross section of the bullet tracers in order to make them thinner."
+	//
+	// THE IMPACT SPHERE IS GONE — deleted, not disabled. ATraceTracer no longer has an ImpactFlash
+	// component at all, so there is no knob here to bring it back. It was a 10 -> 52 uu expanding
+	// emissive ball sitting exactly on the point the player is trying to look at, which is precisely
+	// the complaint: it announced the hit at the cost of hiding where the shot landed.
+	//
+	// WHY THE WIDTH IS PROPORTIONAL TO THE SHOT'S LENGTH, AND WHY THAT SURVIVED THE THINNING.
+	// A fixed-radius cylinder is the wrong model for a beam that has to read at every range in a
+	// 24000+ uu arena: any radius that is sane across a corridor is a sub-pixel thread across the
+	// field, and any radius that is visible across the field is a rod at knife range. Radius
+	// proportional to the shot's own length holds the beam at roughly constant ANGULAR width from the
+	// shooter's eye, which is what a real camera-facing beam material would do. So "thinner" is
+	// implemented by halving the proportion and both clamps, NOT by replacing the model with a
+	// constant — that would have made it thinner in a corridor and invisible across the map.
+	//
+	// Read fresh by every shot (ATraceTracer::InitTracer calls Get()), so all six retune with PIE
+	// running and Trace.TestBeam will show the change immediately.
+	// ==========================================================================================
+
+	/**
+	 * Core beam RADIUS per uu of shot length. Halved this pass: 0.0031 -> 0.00155.
+	 *
+	 * A 4000 uu shot is now 6.2 uu in radius where it was 12.4. Clamped at both ends by the two
+	 * values below, and this is the middle of the three — most in-arena shots land between the
+	 * clamps, so this is the number to move if the beam is broadly too fat or too thin.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Tracer", meta = (DisplayName = "Beam Radius per uu of Shot Length", ClampMin = "0.0", ClampMax = "0.05", UIMin = "0.0002", UIMax = "0.01"))
+	float TracerRadiusPerLength = 0.00155f;
+
+	/**
+	 * Floor on the core beam radius, uu. Halved this pass: 2.5 -> 1.75.
+	 *
+	 * NOT halved quite as far as the rest, and deliberately. This governs SHORT shots, which are the
+	 * ones already fired at point-blank range in a scrum, and it is the value that decides whether a
+	 * beam is a line or a sub-pixel shimmer. Below ~1.2 uu a short shot stops resolving on a 1280-wide
+	 * back buffer at all, and "thinner" turns into "gone" — which is the failure this task is
+	 * explicitly told to avoid.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Tracer", meta = (DisplayName = "Beam Radius Min (uu)", ClampMin = "0.1", ClampMax = "100.0", UIMin = "0.5", UIMax = "10.0"))
+	float TracerRadiusMinUU = 1.75f;
+
+	/**
+	 * Ceiling on the core beam radius, uu. Halved this pass: 13.0 -> 6.5.
+	 *
+	 * Governs LONG shots — anything past ~4200 uu is on this clamp — so this is what a cross-map shot
+	 * actually looks like, and it is the single biggest contributor to "the tracers are too thick".
+	 * The angular size it produces is what matters: 6.5 uu at 8000 uu away is about 0.09 degrees,
+	 * roughly 2.5 px at 1280 wide and a 95 degree field of view, plus the sheath's halo around it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Tracer", meta = (DisplayName = "Beam Radius Max (uu)", ClampMin = "0.5", ClampMax = "200.0", UIMin = "2.0", UIMax = "30.0"))
+	float TracerRadiusMaxUU = 6.5f;
+
+	/**
+	 * The soft additive team-coloured halo is this many times the core's radius.
+	 *
+	 * DELIBERATELY LEFT AT ITS OLD VALUE WHILE THE CORE WAS HALVED, which is what keeps a thin beam
+	 * legible at distance. The halo is additive, writes no depth and is heavily bloomed, so it costs
+	 * the player nothing in occlusion — it is what your eye finds across the arena, and the hard thin
+	 * core inside it is what tells you exactly where the shot went. Thinning both together is how a
+	 * "thinner tracer" change ends up as an invisible one.
+	 *
+	 * 1.0 removes the halo entirely and leaves the bare core.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Tracer", meta = (DisplayName = "Halo Radius (multiple of beam radius)", ClampMin = "1.0", ClampMax = "12.0", UIMin = "1.0", UIMax = "6.0"))
+	float TracerSheathRadiusRatio = 3.2f;
+
+	/**
+	 * Draw the small bright sphere at the MUZZLE end of the beam. ON by default.
+	 *
+	 * This is not the sphere spec v4 §4 asks to remove — that one was at the impact end and is
+	 * deleted outright. This one sits on the viewmodel, 120 uu from the shooter's own eye, and it is
+	 * a large part of why a first-person shot is visible at all: the beam runs almost straight away
+	 * from the camera and projects to nearly a point, so the flash at the near end is what says "you
+	 * fired". It is a knob rather than an assumption because "the sphere" is ambiguous in the note,
+	 * and this is the one that can be answered without a rebuild.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Tracer", meta = (DisplayName = "Muzzle Flash"))
+	bool bTracerMuzzleFlash = true;
+
+	/**
+	 * Muzzle flash RADIUS at the instant of firing, uu. Halved with the beam: 5.0 -> 2.5.
+	 *
+	 * Kept small on purpose, and the reason is not subtlety. Unlit emissive does not attenuate with
+	 * distance, so a flash this close to the eye arrives at full intensity: measured larger and
+	 * hotter first, it bloomed into a blob that ate the middle of the screen on every shot — a
+	 * flashbang, not a muzzle flash. Do not push it far past ~6.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Tracer", meta = (DisplayName = "Muzzle Flash Radius (uu)", ClampMin = "0.1", ClampMax = "60.0", UIMin = "0.5", UIMax = "15.0"))
+	float TracerMuzzleRadiusUU = 2.5f;
+
+	// ==========================================================================================
 	// TRAIL  (the "trace")
 	// ==========================================================================================
 
@@ -1327,6 +1783,95 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Head Grace Points", ClampMin = "0", ClampMax = "32", UIMin = "0", UIMax = "10"))
 	int32 TrailHeadGracePoints = 3;
 
+	// ------------------------------------------------------------------------------------------
+	// Trace GHOSTS (spec v4 §2, new look)
+	//
+	// Verbatim: "Change the look of the trace to match the new mannequin models, rather than the old
+	// cylinder models." The trace goes back to its original description — "a blur created where your
+	// character model has passed through" — so the visual is a run of character-shaped after-images
+	// rather than a tube.
+	//
+	// THE ONE RULE THESE KNOBS MUST NOT BREAK: the kill volume is what the player sees. Ghosts are
+	// SPARSER than trail points for performance (a skeletal snapshot per point does not scale to ten
+	// carriers), and the ribbon between them is what keeps the trip geometry continuous. So
+	// TraceGhostSpacingPoints is a VISUAL density dial only — it must never be allowed to thin the
+	// collision, or the trip test and the picture disagree and the whole game feels broken.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * uu ALONG THE PATH between consecutive posed after-images. Mirrors the
+	 * Trace.Trail.GhostSpacing CVar; keep the two equal.
+	 *
+	 * A DISTANCE, not a count of trail points, and that is the right unit: point spacing changes with
+	 * TrailPointSpacing and the ghosts want to be a fixed distance apart however finely the path
+	 * happens to be sampled.
+	 *
+	 * The tension it resolves: a ghost at every trail point (60 uu) is the most beautiful version and
+	 * costs ~27 skinned draws per trace; a ghost every 400 uu is nearly free and reads as a row of
+	 * statues with holes between them. 220 uu is a little over one body-depth of gap, so consecutive
+	 * mannequins nearly touch and the eye joins them into one blur — and the smear ribbon covers the
+	 * gap regardless, which is what keeps the picture continuous where the collision is.
+	 *
+	 * COSMETIC ONLY. Nothing here may thin the lethal volume; the trip test runs on the trail points,
+	 * not on the ghosts. Sane range 120 to 300.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Ghost Spacing (uu along path)", ClampMin = "20.0", ClampMax = "2000.0", UIMin = "60.0", UIMax = "500.0"))
+	float TraceGhostSpacingUU = 220.f;
+
+	/**
+	 * Cap on pooled posed-Mannequin after-images PER TRACE. 0 disables ghosts and leaves the trace as
+	 * the continuous smear alone. Mirrors the Trace.Trail.GhostMaxCount CVar; keep the two equal.
+	 *
+	 * This is the number that decides whether spec v4 §2 is affordable, so the arithmetic is worth
+	 * stating: a trace is TrailLifetime x speed long, capped by MaxTrailPoints x TrailPointSpacing —
+	 * 2.0 s x 800 uu/s = 1600 uu at a walk, ~3200 uu through a sustained dash — so at 220 uu spacing
+	 * that is ~8 ghosts walking and ~15 dashing. 20 covers the dashing case with headroom.
+	 *
+	 * Past the cap the OLDEST ghosts are released, never the newest: the newest are the ones an
+	 * approaching enemy is judging their dash against. The smear still covers the tail, so the cap
+	 * degrades the look and never the continuity — which is the rule the whole feature turns on.
+	 *
+	 * Only the Core holder emits, so the worst realistic case (a residual trace during a turnover
+	 * while the new holder lays a fresh one) is ~2x this in the world, not 10x.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Max Ghosts Per Trace (0 = smear only)", ClampMin = "0", ClampMax = "64", UIMin = "0", UIMax = "40"))
+	int32 MaxTraceGhosts = 20;
+
+	/**
+	 * Emissive strength of a posed after-image on M_TraceNeon. Mirrors Trace.Trail.GhostGlow.
+	 *
+	 * Above roughly 3.5 the team colour clips toward white and you can no longer tell WHOSE trace you
+	 * are looking at, which matters more than prettiness — the trace is only lethal to the other team,
+	 * so misreading its colour is misreading whether you may run through it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Ghost Glow", ClampMin = "0.0", ClampMax = "8.0", UIMin = "0.5", UIMax = "4.0"))
+	float TraceGhostGlow = 2.6f;
+
+	/**
+	 * Brightness of the continuous smear as a FRACTION of the ghost glow. Mirrors
+	 * Trace.Trail.SmearGlowScale.
+	 *
+	 * The smear is the part of the drawing that is continuous, and the trip volume is continuous, so
+	 * this is the knob that decides whether the picture still agrees with the rule. Turned down, the
+	 * mannequins read as the bright thing and the smear as the blur joining them; turned to 1 it is
+	 * the old solid-fence look. DO NOT take it low enough that the gaps between ghosts read as
+	 * passable — they are not passable, and a player who learns otherwise learns a lie.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Smear Glow (fraction of ghost glow)", ClampMin = "0.02", ClampMax = "4.0", UIMin = "0.1", UIMax = "1.5"))
+	float TraceSmearGlowScale = 0.5f;
+
+	/**
+	 * Forced LOD on the after-images: 0 = automatic (screen-size driven), 1 = LOD0, 2 = LOD1, ...
+	 * Mirrors Trace.Trail.GhostForcedLOD.
+	 *
+	 * Automatic by default because ghosts are exactly what the LOD system is good at — static, often
+	 * distant, and with no animation whose popping would give a transition away. Exposed because
+	 * forcing a low LOD is the single biggest perf lever here if a ten-player capture ever measures
+	 * the skinned draws as expensive.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Ghost Forced LOD (0 = auto)", ClampMin = "0", ClampMax = "4"))
+	int32 TraceGhostForcedLOD = 0;
+
 	// ==========================================================================================
 	// BOTS
 	//
@@ -1387,7 +1932,7 @@ public:
 	// The field is not a fixed size. Distances that describe *positioning on the pitch* (how far
 	// ahead of the carrier a screen sits, how deep a receiver runs, how long a pass may be, how far
 	// a defender will travel to reach a trail) were originally constants tuned against an
-	// 8000 x 4000 field; on a 24000 x 9600 field the same numbers put every escort on top of the
+	// 8000 x 4000 field; on the 33600 x 9600 field the same numbers put every escort on top of the
 	// carrier and made every pass illegal. Those are expressed as a fraction of the field half-
 	// length or half-width, read from ATraceArenaBuilder::GetFieldBounds() at runtime.
 	//

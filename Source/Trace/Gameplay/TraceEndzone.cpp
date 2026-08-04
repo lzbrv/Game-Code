@@ -40,14 +40,61 @@ ATraceEndzone::ATraceEndzone()
 	Trigger->SetHiddenInGame(true);
 }
 
-void ATraceEndzone::ConfigureZone(ETraceTeam InOwningTeam, const FVector& BoxHalfExtent)
+void ATraceEndzone::ConfigureZone(ETraceTeam InOwningTeam, const FVector& BoxHalfExtent, bool bInGoalVolume)
 {
 	OwningTeam = InOwningTeam;
+	bGoalVolume = bInGoalVolume;
 
 	if (Trigger)
 	{
 		Trigger->SetBoxExtent(BoxHalfExtent, /*bUpdateOverlaps=*/false);
 	}
+}
+
+void ATraceEndzone::SetZoneActive(bool bInActive)
+{
+	if (bZoneActive == bInActive)
+	{
+		return;
+	}
+
+	bZoneActive = bInActive;
+
+	// A client copy is already fully inert (BeginPlay strips its collision and tick), so the flag is
+	// all it needs; re-enabling collision here would arm a scoring trigger on a machine that has no
+	// authority to score.
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	if (Trigger)
+	{
+		Trigger->SetCollisionEnabled(bZoneActive ? ECollisionEnabled::QueryOnly : ECollisionEnabled::NoCollision);
+		Trigger->SetGenerateOverlapEvents(bZoneActive);
+	}
+	SetActorTickEnabled(bZoneActive);
+
+	// Log, not Verbose. A volume that stops scoring is indistinguishable from a broken trigger from
+	// inside the game, and the A/B toggle is exactly the moment somebody will be looking for that.
+	UE_LOG(LogTraceGame, Log, TEXT("%s %s (defended by %s) is now %s."),
+		bGoalVolume ? TEXT("Goal") : TEXT("Endzone"),
+		*GetNameSafe(this),
+		*TraceTeamName(OwningTeam).ToString(),
+		bZoneActive ? TEXT("ARMED") : TEXT("inert"));
+}
+
+FBox ATraceEndzone::GetZoneBounds() const
+{
+	if (Trigger == nullptr)
+	{
+		return FBox(ForceInit);
+	}
+
+	// Built from the component transform rather than from the actor's, so a scaled or rotated
+	// trigger still reports the box it actually occupies.
+	const FBox Local(-Trigger->GetUnscaledBoxExtent(), Trigger->GetUnscaledBoxExtent());
+	return Local.TransformBy(Trigger->GetComponentTransform());
 }
 
 bool ATraceEndzone::ScoresHere(ETraceTeam Team) const
@@ -84,15 +131,26 @@ void ATraceEndzone::BeginPlay()
 	// The overlap event only fires on entry, which misses the case that decides matches: a player
 	// standing inside the enemy endzone who picks up (or intercepts) the Core there. The 10 Hz poll
 	// in Tick() covers it, and doubles as a safety net if the overlap never fires at all.
-	SetActorTickEnabled(true);
+	//
+	// Gated on bZoneActive: in mode B the endzone pair is built but inert, and vice versa, so the
+	// volume belonging to the other mode must not tick, overlap or score.
+	if (Trigger)
+	{
+		Trigger->SetCollisionEnabled(bZoneActive ? ECollisionEnabled::QueryOnly : ECollisionEnabled::NoCollision);
+		Trigger->SetGenerateOverlapEvents(bZoneActive);
+	}
+	SetActorTickEnabled(bZoneActive);
 
 	// Log, not Verbose. The half extent is the whole contract of this actor - "the zone spans the
-	// full width of the field" is either true or the game silently refuses points out by the
-	// sidelines - and a fact nobody can see must at least be one nobody has to raise a verbosity
-	// level to read. This project has twice declared a working mechanic dead over exactly that.
+	// full width of the field", or in mode B "the goal is a third of it and 700 uu tall" - is either
+	// true or the game silently refuses points somewhere, and a fact nobody can see must at least be
+	// one nobody has to raise a verbosity level to read. This project has twice declared a working
+	// mechanic dead over exactly that.
 	const FVector Extent = (Trigger != nullptr) ? Trigger->GetUnscaledBoxExtent() : FVector::ZeroVector;
-	UE_LOG(LogTraceGame, Log, TEXT("Endzone defended by %s is live at %s, half extent %s (scored in by %s)."),
+	UE_LOG(LogTraceGame, Log, TEXT("%s defended by %s is %s at %s, half extent %s (scored in by %s)."),
+		bGoalVolume ? TEXT("Goal (mode B)") : TEXT("Endzone (mode A)"),
 		*TraceTeamName(OwningTeam).ToString(),
+		bZoneActive ? TEXT("LIVE") : TEXT("built but inert"),
 		*GetActorLocation().ToCompactString(),
 		*Extent.ToCompactString(),
 		*TraceTeamName(TraceOpposingTeam(OwningTeam)).ToString());
@@ -103,7 +161,7 @@ void ATraceEndzone::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 
 	const UWorld* World = GetWorld();
-	if (!HasAuthority() || World == nullptr || Trigger == nullptr)
+	if (!HasAuthority() || !bZoneActive || World == nullptr || Trigger == nullptr)
 	{
 		return;
 	}
@@ -134,7 +192,10 @@ void ATraceEndzone::Tick(float DeltaSeconds)
 
 bool ATraceEndzone::IsInsideZone(const FVector& WorldLocation) const
 {
-	if (Trigger == nullptr)
+	// An inactive volume contains nothing. Without this, mode B's throw code could ask the mode-A
+	// endzone (which is still built, just disarmed) whether the Core is inside it and get a yes for
+	// a point that must not be awarded.
+	if (Trigger == nullptr || !bZoneActive)
 	{
 		return false;
 	}
@@ -166,7 +227,7 @@ void ATraceEndzone::OnTriggerBeginOverlap(UPrimitiveComponent* /*OverlappedCompo
 void ATraceEndzone::TryScore(ATraceCharacter* Character)
 {
 	UWorld* World = GetWorld();
-	if (!HasAuthority() || World == nullptr || !IsValid(Character))
+	if (!HasAuthority() || !bZoneActive || World == nullptr || !IsValid(Character))
 	{
 		return;
 	}
@@ -198,17 +259,19 @@ void ATraceEndzone::TryScore(ATraceCharacter* Character)
 
 	LastScoreTime = Now;
 
-	// The lateral coordinate is in the line on purpose. An endzone spans the FULL width of the field
-	// (ATraceArenaBuilder::EndzoneHalfWidth), and the only cheap way to prove that from a match log -
-	// rather than by walking into a corner and hoping - is to see scores land at Y values out near
-	// the sidelines as well as down the middle. If every score in a log sits near Y=0, the trigger
-	// has quietly gone back to being a partial box.
+	// The lateral coordinate is in the line on purpose. A mode-A endzone spans the FULL width of the
+	// field (ATraceArenaBuilder::EndzoneHalfWidth), and the only cheap way to prove that from a match
+	// log - rather than by walking into a corner and hoping - is to see scores land at Y values out
+	// near the sidelines as well as down the middle. If every mode-A score in a log sits near Y=0,
+	// the trigger has quietly gone back to being a partial box. In mode B the opposite reading
+	// applies: every score MUST sit inside the printed half width, or the goal is not a goal.
 	const FVector ScoreLocation = Character->GetActorLocation();
 	const float ZoneHalfWidth = (Trigger != nullptr) ? Trigger->GetUnscaledBoxExtent().Y : 0.f;
 
-	UE_LOG(LogTraceGame, Log, TEXT("%s carried the Core into the %s endzone at X=%.0f Y=%.0f (zone half width %.0f) - %s scores."),
+	UE_LOG(LogTraceGame, Log, TEXT("%s carried the Core into the %s %s at X=%.0f Y=%.0f (zone half width %.0f) - %s scores."),
 		*GetNameSafe(Character),
 		*TraceTeamName(OwningTeam).ToString(),
+		bGoalVolume ? TEXT("goal") : TEXT("endzone"),
 		ScoreLocation.X, ScoreLocation.Y, ZoneHalfWidth,
 		*TraceTeamName(CarrierTeam).ToString());
 

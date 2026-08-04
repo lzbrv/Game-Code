@@ -119,7 +119,31 @@ enum class ETraceBotState : uint8
 	Regroup,
 
 	/** Nothing objective-shaped is available to me. Fight the nearest enemy I can see. */
-	Fight
+	Fight,
+
+	// --- MODE B ONLY (spec v4 §7). Unreachable while the match is playing mode A. -----------------
+
+	/**
+	 * The Core is LOOSE — thrown, in flight, or lying on the ground — and I am one of the players
+	 * going for it. "The first player to contact the core should pick it up", enemy or teammate, so
+	 * this is the state in which mode B's central act, the interception, actually happens.
+	 *
+	 * Deliberately ranked above the carrier states in this enum: while the Core is loose there IS no
+	 * carrier, so nothing below can fire anyway, and a loose Core is the most urgent thing on the
+	 * field for both sides at once.
+	 */
+	ChaseLooseCore,
+
+	/**
+	 * MODE B. Somebody else is going to reach the Core first, or an enemy already has it and I am not
+	 * one of the players pressuring them. Sit between the threat and my own goal.
+	 *
+	 * This role does not exist in mode A and would be wrong there: a mode-A endzone spans the full
+	 * width of the field, so there is no mouth to stand in front of and "defending" it means
+	 * intercepting the carrier, which is what HuntCarrier already does. A mode-B goal is a third of
+	 * the width, which makes standing in front of it a real and coverable job.
+	 */
+	DefendGoal
 };
 
 /**
@@ -229,6 +253,53 @@ protected:
 	void BehaviourEscortCarrier(float DeltaSeconds);
 	void BehaviourRegroup(float DeltaSeconds);
 	void BehaviourFight(float DeltaSeconds);
+
+	/** MODE B. Run at the loose Core, led by its own velocity so the bot meets it rather than trails it. */
+	void BehaviourChaseLooseCore(float DeltaSeconds);
+
+	/** MODE B. Hold a station between the current threat and the goal this bot's team defends. */
+	void BehaviourDefendGoal(float DeltaSeconds);
+
+	/**
+	 * MODE B. True when this bot is one of the players whose job is the goal mouth right now.
+	 *
+	 * Ranked by distance to OUR OWN goal among living teammates, capped at
+	 * TraceBotConstants::GoalDefenders. Always false in mode A, where there is no mouth to guard.
+	 */
+	bool ShouldHoldGoalDefence() const;
+
+	// ------------------------------------------------------------------------------------------
+	// MODE B: throwing  (spec v4 §7)
+	//
+	// The mode-B counterpart of UpdatePass, and deliberately a SEPARATE state machine rather than a
+	// branch inside it. A hover pass is a half-second commitment with a shield cost and an abort
+	// path; a throw is instantaneous, costs nothing, and cannot be aborted once released. Folding
+	// the two together would mean every line of the pass machine growing a mode test, and the risk
+	// beat that machine exists to implement does not apply to a throw at all.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Carrier only, mode B. Decides whether to throw, at what, lines the aim up and releases.
+	 *
+	 * Two targets are considered, in this order: the GOAL when the bot is close enough and has a
+	 * clear line to it (that is how mode B scores at range), and an OPEN TEAMMATE further up the
+	 * field otherwise. A carrier under pressure with neither available throws the Core forward
+	 * anyway rather than dying with it — a loose Core its own team can contest is worth more than a
+	 * turnover.
+	 */
+	void UpdateThrow(float DeltaSeconds);
+
+	/**
+	 * Ballistic aim point for a throw at @p WorldTarget: the target raised by the amount the Core
+	 * will drop over its flight, so the bot lobs rather than firing flat into the floor.
+	 *
+	 * Uses the Core's own throw speed and gravity scale, so a designer retuning either does not
+	 * silently make every bot throw short.
+	 */
+	FVector ComputeThrowAimPoint(const FVector& WorldTarget) const;
+
+	/** Ends a throw attempt and starts the same cooldown a pass attempt would. */
+	void AbortThrow(const TCHAR* Reason);
 
 	// ------------------------------------------------------------------------------------------
 	// Hover passing  (spec §4)
@@ -401,6 +472,26 @@ private:
 	bool bBoundsValid = false;
 
 	// ------------------------------------------------------------------------------------------
+	// MODE B world state. All false / zero for the whole match in mode A.
+	// ------------------------------------------------------------------------------------------
+
+	/** True when the match is playing spec v4 §7 mode B: goals, and a Core that is thrown. */
+	bool bModeB = false;
+
+	/** True while the Core is out in the world with no holder — thrown, flying, or lying still. */
+	bool bCoreLoose = false;
+
+	/** Where to run to intercept the loose Core: its position, led by its own velocity. */
+	FVector LooseCorePoint = FVector::ZeroVector;
+
+	/** 2D distance from this bot to LooseCorePoint, for the chase ranking. */
+	float LooseCoreDistSq = 0.f;
+
+	/** Centre of the goal this team DEFENDS, in mode B. Only meaningful while bDefendGoalValid. */
+	FVector DefendGoalCentre = FVector::ZeroVector;
+	bool bDefendGoalValid = false;
+
+	// ------------------------------------------------------------------------------------------
 	// Attacking endzone  (survives the half-time side switch)
 	// ------------------------------------------------------------------------------------------
 
@@ -552,6 +643,18 @@ private:
 
 	/** Set while the pass input is down, so it is always released exactly once. */
 	bool bPassInputHeld = false;
+
+	// --- MODE B throwing ------------------------------------------------------------------------
+	//
+	// Deliberately reuses PassPhase, PassCooldownUntilTime and NextPassEvalTime. Only one of the two
+	// machines can ever run — the scoring mode is latched for the whole match — so a second copy of
+	// the phase bookkeeping would be state that is always half dead, and the two would drift.
+
+	/** MODE B. True when the current attempt is a shot at the goal rather than a throw to a teammate. */
+	bool bThrowAtGoal = false;
+
+	/** MODE B. What the current attempt is aimed at, BEFORE the ballistic elevation is added. */
+	FVector ThrowTargetPoint = FVector::ZeroVector;
 
 	// --- Steering -----------------------------------------------------------------------------
 

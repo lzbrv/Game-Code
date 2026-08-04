@@ -5,6 +5,12 @@
 // BOOST HAS BEEN DELETED (spec v3 §1). Not disabled, not defaulted to zero — removed. If you are
 // reading this because a merge resurrected `bWantsToBoost`, `BoostCooldownRemaining`, `BeginBoost`
 // or FLAG_Custom_1, delete it again.
+//
+// THE SLIDE'S FLAT MOMENTUM BOOST HAS BEEN DELETED TOO (spec v4 §1). Same rule: `SlideImpulse`,
+// `GetSlideImpulse()`, `SlideExitMinSpeedFraction` and `GetSlideExitMinSpeedFraction()` are gone,
+// along with the ExitFloor term in EndSlide(). The design owner ruled the boost out explicitly. If a
+// merge brings any of them back, delete them again — and read the slide-jump section of the header,
+// which is what the slide is supposed to be worth now.
 
 #include "Movement/TraceCharacterMovementComponent.h"
 
@@ -120,6 +126,8 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	SlideSpeed = 0.f;
 	SlideDirection = FVector::ZeroVector;
 	SlideBufferRemaining = 0.f;
+	SlideJumpGraceRemaining = 0.f;
+	bSlideJumpGraceWellTimed = 0;
 	bSlideHeldLastMove = 0;
 	bWasAirborneLastMove = 0;
 
@@ -134,7 +142,7 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	// every movement update by RefreshEngineTunablesFromSettings(), so this literal only covers the
 	// window before play starts (and the CDO in the editor). Keep it equal to UTraceSettings::WalkSpeed
 	// anyway — a stale value here is what an editor viewport shows before anyone presses Play.
-	MaxWalkSpeed = 820.f;
+	MaxWalkSpeed = 800.f;   // spec v4 §5: 820 -> 800. Equal to UTraceSettings::WalkSpeed by rule.
 	MaxAcceleration = 4096.f;
 	BrakingDecelerationWalking = 2600.f;
 	GroundFriction = 8.f;
@@ -200,16 +208,19 @@ void UTraceCharacterMovementComponent::BeginPlay()
 			UE_LOG(LogTraceGame, Display,
 				TEXT("MOVECFG walk=%.0f | AIR srcAccel=%d accel=%.0f wishCap=%.0f maxAir=%.0f "
 				     "| LAND preserve=%d overspeedFric=%.2f overspeedBrake=%.0f turn=%.1f dashExit=%.2fx "
-				     "| SLIDE dur=%.2f entryMul=%.2f impulse=%.0f cooldownFromEnd=%.2f max=%.0f decel=%.0f "
-				     "commit=%.2f exitRet=%.2f exitFloor=%.2f exitCeil=%.2f "
+				     "| SLIDE dur=%.2f entryMul=%.2f cooldownFromEnd=%.2f max=%.0f decel=%.0f "
+				     "commit=%.2f exitRet=%.2f exitCeil=%.2f (NO impulse, NO exit floor - spec v4 s1) "
+				     "| SLIDEJUMP on=%d retain=%.2f zMul=%.2f window=%.2f windowBonus=%.2f "
 				     "| DASH speed=%.0f dur=%.2f cd=%.2f"),
 				MaxWalkSpeed,
 				IsSourceAirAccelerationEnabled() ? 1 : 0, GetAirAcceleration(), GetAirMaxWishSpeed(), GetMaxAirSpeed(),
 				IsLandingMomentumPreserved() ? 1 : 0, GetGroundOverspeedFriction(), GetGroundOverspeedBraking(),
 				GetGroundOverspeedTurnRate(), GetDashExitSpeedMultiplier(),
-				GetSlideDuration(), GetSlideEntrySpeedMultiplier(), GetSlideImpulse(), GetSlideCooldownSeconds(),
+				GetSlideDuration(), GetSlideEntrySpeedMultiplier(), GetSlideCooldownSeconds(),
 				Settings.SlideMaxSpeed, GetSlideDeceleration(), GetSlideMinCommitSeconds(),
-				GetSlideExitSpeedRetention(), GetSlideExitMinSpeedFraction(), GetSlideExitMaxSpeedMultiplier(),
+				GetSlideExitSpeedRetention(), GetSlideExitMaxSpeedMultiplier(),
+				IsSlideJumpEnabled() ? 1 : 0, GetSlideJumpHorizontalRetention(), GetSlideJumpZMultiplier(),
+				GetSlideJumpWindowSeconds(), GetSlideJumpWindowSpeedBonus(),
 				GetDashSpeed(), GetDashDuration(), GetDashCooldown());
 		}
 	}
@@ -281,10 +292,9 @@ float UTraceCharacterMovementComponent::GetSlideExitSpeedRetention() const
 	return FMath::Max(0.f, UTraceSettings::Get().SlideExitSpeedRetention);
 }
 
-float UTraceCharacterMovementComponent::GetSlideExitMinSpeedFraction() const
-{
-	return FMath::Max(0.f, UTraceSettings::Get().SlideExitMinSpeedFraction);
-}
+// GetSlideExitMinSpeedFraction() WAS HERE AND IS DELETED (spec v4 §1). It read the exit FLOOR, which
+// handed a decayed slide back at exactly WalkSpeed however slowly it was actually going — measured as
+// a 73% speed gain for a slow slide, i.e. the flat momentum boost the design owner ruled out.
 
 float UTraceCharacterMovementComponent::GetSlideExitMaxSpeedMultiplier() const
 {
@@ -305,9 +315,41 @@ float UTraceCharacterMovementComponent::GetSlideEntrySpeedMultiplier() const
 	return FMath::Max(0.f, UTraceSettings::Get().SlideEntrySpeedMultiplier);
 }
 
-float UTraceCharacterMovementComponent::GetSlideImpulse() const
+// GetSlideImpulse() WAS HERE AND IS DELETED (spec v4 §1). It read the FLAT additive on slide entry —
+// worth the same whether you entered at a walk or out of a dash, which is exactly what "the flat
+// momentum boost should be ruled out" means. SlideEntrySpeedMultiplier (1.0) is now the only thing
+// between entry speed and slide speed.
+
+bool UTraceCharacterMovementComponent::IsSlideJumpEnabled() const
 {
-	return FMath::Max(0.f, UTraceSettings::Get().SlideImpulse);
+	return UTraceSettings::Get().bSlideJumpEnabled;
+}
+
+float UTraceCharacterMovementComponent::GetSlideJumpHorizontalRetention() const
+{
+	// Not floored at 1: the user is allowed to make a slide-jump cost speed if that is what plays
+	// well. Floored at 0 only so a negative value cannot reverse the pawn's direction of travel.
+	return FMath::Max(0.f, UTraceSettings::Get().SlideJumpHorizontalRetention);
+}
+
+float UTraceCharacterMovementComponent::GetSlideJumpZMultiplier() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().SlideJumpZMultiplier);
+}
+
+float UTraceCharacterMovementComponent::GetSlideJumpWindowSeconds() const
+{
+	// Clamped to the slide's own length, like SlideMinCommitSeconds: a window longer than the slide
+	// means every slide-jump is well timed, which is not a window, and leaving it unclamped lets one
+	// bad number quietly turn the bonus into a permanent multiplier.
+	return FMath::Clamp(UTraceSettings::Get().SlideJumpWindowSeconds, 0.f, GetSlideDuration());
+}
+
+float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
+{
+	// Never below 1: the window must never be able to PUNISH a well-timed hop. Missing the timing is
+	// allowed to be worth less; hitting it must never be worth less than missing it.
+	return FMath::Max(1.f, UTraceSettings::Get().SlideJumpWindowSpeedBonus);
 }
 
 bool UTraceCharacterMovementComponent::IsSourceAirAccelerationEnabled() const
@@ -849,37 +891,39 @@ void UTraceCharacterMovementComponent::BeginSlide()
 
 	SlideDirection = Direction;
 
-	// --- ENTRY SPEED DETERMINES SLIDE VELOCITY (spec §2.3) ---------------------------------------
+	// --- ENTRY SPEED DETERMINES SLIDE VELOCITY (spec v4 §1) --------------------------------------
 	//
-	// The old formula was max(planar speed, WalkSpeed) × SlideSpeedMultiplier(1.35), which is a flat
-	// momentum boost by any reading — a slide entered at walking pace came out 35% faster than a run
-	// for free. Spec §2.3 says explicitly "no flat momentum boost", so entry is now the speed the
-	// pawn actually arrived with, and the two knobs that could reintroduce a boost both default to
-	// neutral:
+	// The original formula was max(planar speed, WalkSpeed) × SlideSpeedMultiplier(1.35), which is a
+	// flat momentum boost by any reading — a slide entered at walking pace came out 35% faster than a
+	// run, for free. Spec v3 flagged that; spec v4 §1 settled it: "The flat momentum boost should be
+	// ruled out, going with the source-style movement system instead."
 	//
-	//   SlideEntrySpeedMultiplier = 1.0   → slide speed IS entry speed
-	//   SlideImpulse              = 0.0   → no flat addition
+	// So entry is the speed the pawn actually arrived with, and there is exactly one term left:
 	//
-	// The spec also contains a contradictory line asking for the slide to increase momentum; raising
-	// SlideImpulse is how to get that reading without another code change. See the header.
+	//   SlideSpeed = max(EntrySpeed, min(EntrySpeed × SlideEntrySpeedMultiplier, SlideMaxSpeed))
 	//
-	// SlideMaxSpeed caps the MULTIPLIED entry speed. SlideImpulse is added AFTERWARDS, on purpose and
-	// as its tooltip promises: if the impulse were inside the cap, dialling it up from zero would
-	// appear to do nothing at all for anybody already entering a slide fast, which is exactly the
-	// player the "increase momentum" reading is about.
+	//   SlideEntrySpeedMultiplier = 1.0  → slide speed IS entry speed.
+	//   SlideImpulse                     → DELETED. It was the flat addition, and it is gone.
 	//
-	// The whole thing is then floored at the speed the pawn actually arrived with: ENTERING A SLIDE
-	// CAN NEVER COST YOU SPEED. Without that floor, anyone arriving faster than SlideMaxSpeed (an
-	// air-strafe landing, a slide-jump chain, a dash exit) would be BRAKED by pressing crouch, which
-	// is the precise opposite of what a slide is for.
+	// THE OUTER max() IS NOT A BOOST, and it is the one thing here that could be misread as one. It
+	// cannot manufacture speed: at multiplier 1.0 it is a no-op, and its only job is to stop
+	// SlideMaxSpeed BRAKING somebody who arrived above the cap. Without it, a player landing an
+	// air-strafe at 1900+ uu/s, or sliding out of a dash, would be SLOWED by pressing crouch — the
+	// precise opposite of "you keep what you brought in", and a floor on losses is not a boost.
 	const float EntrySpeed = FVector(Velocity.X, Velocity.Y, 0.f).Size();
 	const float ScaledEntrySpeed = FMath::Min(EntrySpeed * GetSlideEntrySpeedMultiplier(),
 	                                          FMath::Max(1.f, Settings.SlideMaxSpeed));
 
-	SlideSpeed = FMath::Max(ScaledEntrySpeed + GetSlideImpulse(), EntrySpeed);
+	SlideSpeed = FMath::Max(ScaledEntrySpeed, EntrySpeed);
 
 	SlideTimeRemaining = GetSlideDuration();
 	SlideCommitRemaining = GetSlideMinCommitSeconds();
+
+	// A fresh slide owns the slide-jump window outright: any coyote grace left over from the previous
+	// slide is void, or a slide started 0.1s after one ended would inherit the last one's "well
+	// timed" bit and pay the bonus for a hop nobody earned.
+	SlideJumpGraceRemaining = 0.f;
+	bSlideJumpGraceWellTimed = 0;
 
 	// Cleared, not set: the between-slides buffer is charged in EndSlide() because spec §2.3 asks
 	// for a gap BETWEEN slides. An active slide is already blocked by SlideTimeRemaining.
@@ -914,23 +958,40 @@ void UTraceCharacterMovementComponent::EndSlide()
 		return;
 	}
 
-	// --- Hand the momentum back ------------------------------------------------------------------
+	// --- Hand the momentum back, AND NEVER TOP IT UP ---------------------------------------------
 	//
-	// The exit speed is the slide's own live speed scaled by SlideExitSpeedRetention, floored at
-	// SlideExitMinSpeedFraction of the walk speed, and capped at
+	// The exit speed is the slide's own live speed scaled by SlideExitSpeedRetention and capped at
 	//
 	//     max(SlideExitMaxSpeedMultiplier × GetMaxSpeed(), the slide's own speed)
 	//
-	// That max() is spec §2.4, "state transitions should preserve velocity vectors rather than
-	// resetting them", in one term. Without it, slide→jump was a hard brake: the ceiling evaluated
-	// to the walk speed (820) and a 1900uu/s slide handed the player into the air at 820. With it,
-	// a slide can never end below the speed it was running at, and the excess then bleeds off
-	// through ApplyGroundOverspeedBleed like any other carried momentum — or survives into the air
-	// intact if the exit was a jump, which is the entire Apex slide-jump.
+	// That max() is "state transitions should preserve velocity vectors rather than resetting them",
+	// in one term. Without it, slide→jump was a hard brake: the ceiling evaluated to the walk speed
+	// (800) and a 1900uu/s slide handed the player into the air at 800. With it, a slide can never end
+	// below the speed it was running at, and the excess then bleeds off through
+	// ApplyGroundOverspeedBleed like any other carried momentum — or survives into the air intact if
+	// the exit was a jump, which is the entire Apex slide-jump.
+	//
+	// THERE IS NO FLOOR ANY MORE (spec v4 §1). The old code clamped this into
+	// [SlideExitMinSpeedFraction × WalkSpeed, ExitCeiling], and at the shipped fraction of 1.0 that
+	// lower bound was WalkSpeed itself — so a slide that had decayed to 470 uu/s was handed back at
+	// 820, a measured 73% speed GAIN, for the crime of ending. That is the flat momentum boost the
+	// design owner ruled out, spelled on the exit instead of the entry. A slide now ends at exactly
+	// what friction left it with, and ordinary ground acceleration takes it from there.
 	const float Retained = FMath::Max(0.f, SlideSpeed) * GetSlideExitSpeedRetention();
 
 	// Clear FIRST: GetMaxSpeed() folds in SlideSpeed while IsSliding(), so the ceiling below has to
 	// be computed against the speed the pawn is about to live under, not the slide's.
+	//
+	// The well-timed bit is read off SlideTimeRemaining before it is zeroed, because once the slide is
+	// over the information is gone — see SlideJumpGraceRemaining.
+	//
+	// GetSlideTimeLeft(), not SlideTimeRemaining: a slide that ends by DECAY is just as much at its
+	// end as one that runs its duration out, and measuring only the duration clock made every
+	// walking-pace slide score as mistimed however well the hop was pressed.
+	const float WellTimedWindow = GetSlideJumpWindowSeconds();
+	bSlideJumpGraceWellTimed = (WellTimedWindow > 0.f && GetSlideTimeLeft() <= WellTimedWindow) ? 1 : 0;
+	SlideJumpGraceRemaining = WellTimedWindow;
+
 	SlideTimeRemaining = 0.f;
 	SlideCommitRemaining = 0.f;
 	const float ExitedSpeed = SlideSpeed;
@@ -941,18 +1002,18 @@ void UTraceCharacterMovementComponent::EndSlide()
 	// SlideCooldown minus SlideDuration.
 	SlideCooldownRemaining = GetSlideCooldownSeconds();
 
-	// Named ExitCeiling/ExitFloor rather than the obvious Ceiling/Floor: "Floor" is dense with
-	// meaning inside a movement component (CurrentFloor, FindFloor, FFindFloorResult) and a local
-	// that reads like the walkable surface in a function about speed is a trap for the next reader.
+	// Named ExitCeiling rather than the obvious Ceiling: "Floor" is dense with meaning inside a
+	// movement component (CurrentFloor, FindFloor, FFindFloorResult) and a local that reads like the
+	// walkable surface in a function about speed is a trap for the next reader. The matching ExitFloor
+	// local is gone with the setting that fed it.
 	float ExitCeiling = FMath::Max(1.f, GetMaxSpeed()) * GetSlideExitMaxSpeedMultiplier();
 	if (IsLandingMomentumPreserved())
 	{
 		ExitCeiling = FMath::Max(ExitCeiling, ExitedSpeed);
 	}
 
-	const float ExitFloor = FMath::Min(
-		FMath::Max(1.f, UTraceSettings::Get().WalkSpeed) * GetSlideExitMinSpeedFraction(), ExitCeiling);
-	const float ExitSpeed = FMath::Clamp(Retained, ExitFloor, ExitCeiling);
+	// Min, not Clamp. The only bound left is the ceiling; nothing lifts a slow exit.
+	const float ExitSpeed = FMath::Min(Retained, ExitCeiling);
 
 	// Direction of TRAVEL, not the steered slide direction: on a ledge or against a wall the two can
 	// differ, and the player's momentum is the one they can see.
@@ -1003,6 +1064,171 @@ void UTraceCharacterMovementComponent::EndSlide()
 			GTraceSlideDebugTotalDistance / FMath::Max(1, GTraceSlideDebugCount));
 	}
 #endif
+}
+
+// --- Slide-jump ---------------------------------------------------------------------------------
+
+bool UTraceCharacterMovementComponent::IsSlideJumpAvailable() const
+{
+	return IsSlideJumpEnabled() && MovementMode != MOVE_None
+		&& (IsSliding() || SlideJumpGraceRemaining > 0.f);
+}
+
+float UTraceCharacterMovementComponent::GetSlideTimeLeft() const
+{
+	if (SlideTimeRemaining <= 0.f)
+	{
+		return 0.f;
+	}
+
+	// Route 1: the duration clock.
+	float TimeLeft = SlideTimeRemaining;
+
+	// Route 2: the decay. OnMovementUpdated ends the slide as soon as SlideSpeed falls to
+	// WalkSpeed x SlideExitSpeedFraction, and with the shipped numbers that happens FIRST for anybody
+	// who entered at walking pace. Deceleration is constant, so the crossing time is exact rather than
+	// estimated — no iteration, no drift between client and server.
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const float Deceleration = GetSlideDeceleration();
+	if (Deceleration > 0.f)
+	{
+		const float DecayFloor = FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideExitSpeedFraction);
+		const float SpeedAboveFloor = SlideSpeed - DecayFloor;
+		TimeLeft = FMath::Min(TimeLeft, FMath::Max(0.f, SpeedAboveFloor) / Deceleration);
+	}
+
+	return TimeLeft;
+}
+
+bool UTraceCharacterMovementComponent::IsSlideJumpWellTimed() const
+{
+	if (!IsSlideJumpAvailable())
+	{
+		return false;
+	}
+
+	const float Window = GetSlideJumpWindowSeconds();
+	if (Window <= 0.f)
+	{
+		return false;
+	}
+
+	// Mid-slide the window is live — the last Window seconds of the slide, by WHICHEVER exit the slide
+	// is actually heading for (see GetSlideTimeLeft). During the coyote grace it is whatever the slide
+	// was worth at the moment it ended.
+	return IsSliding() ? (GetSlideTimeLeft() <= Window) : (bSlideJumpGraceWellTimed != 0);
+}
+
+bool UTraceCharacterMovementComponent::CanAttemptJump() const
+{
+	// Super, MINUS the "!bWantsToCrouch" clause. See the header: crouch is the slide key here and
+	// never resizes the capsule, so the engine's "you might not have headroom to stand up" rule has
+	// nothing to protect and was silently making the slide-jump unreachable for human players.
+	//
+	// Everything else Super checks is kept verbatim, including the IsMovingOnGround() || IsFalling()
+	// test, which ACharacter::JumpIsAllowedInternal still validates against JumpMaxCount on top.
+	return IsJumpAllowed() && (IsMovingOnGround() || IsFalling());
+}
+
+bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaTime)
+{
+	// Capture BEFORE anything is touched: EndSlide() below rewrites every one of these.
+	const bool bSlideJump = IsSlideJumpAvailable();
+	const bool bWellTimed = IsSlideJumpWellTimed();
+
+	// The speed the jump is entitled to carry. Mid-slide that is the slide's own live speed — which is
+	// also what Velocity is, because OnMovementUpdated re-asserts it every frame — and during the
+	// coyote grace it is simply whatever the pawn has now, which is the honest Source answer: you keep
+	// what you brought, and if you dawdled after the slide ended, friction has already taken its cut.
+	const float CarrySpeed = IsSliding()
+		? FMath::Max(SlideSpeed, GetPlanarSpeed())
+		: GetPlanarSpeed();
+
+	// The slide direction, kept as a fallback for the degenerate case where Velocity has been zeroed
+	// by a collision on the exact frame of the jump.
+	const FVector CarryDirectionFallback = SlideDirection;
+
+	if (bSlideJump)
+	{
+		// THE ONE EXIT, still. A jump out of a slide ends it through EndSlide() like the duration
+		// expiring or the key coming up, so the 0.8s between-slides buffer is charged exactly once and
+		// on exactly one code path — spec v4 §1 keeps that cooldown, and a slide-jump that skipped it
+		// would turn the payoff move into a hop loop. The velocity EndSlide() writes is overwritten
+		// below; that is intended, and it is why the retention is applied to CarrySpeed (captured
+		// above) rather than to whatever the exit rule happened to leave behind.
+		EndSlide();
+	}
+
+	// Super sets Velocity.Z = max(Velocity.Z, JumpZVelocity) and switches to MOVE_Falling, or returns
+	// false if the jump was not legal. If it refuses, the slide has already ended — which is correct
+	// and not a leak: the only way to reach here with bSlideJump true and be refused is to be dead or
+	// movement-disabled, and in both cases the slide has to end anyway.
+	if (!Super::DoJump(bReplayingMoves, DeltaTime))
+	{
+		return false;
+	}
+
+	if (!bSlideJump)
+	{
+		return true;
+	}
+
+	// --- The payoff -------------------------------------------------------------------------------
+	//
+	// Retention 1.0 is PURE PRESERVATION, not a boost. What it buys the player is escaping the ground
+	// friction that would otherwise have eaten the carry over the next second — which is exactly the
+	// Apex slide-hop, and exactly why the flat entry boost is no longer needed to make sliding worth
+	// doing.
+	const float Retention = GetSlideJumpHorizontalRetention()
+		* (bWellTimed ? GetSlideJumpWindowSpeedBonus() : 1.f);
+	const float LaunchSpeed = CarrySpeed * Retention;
+
+	FVector LaunchDirection(Velocity.X, Velocity.Y, 0.f);
+	if (!LaunchDirection.Normalize())
+	{
+		LaunchDirection = CarryDirectionFallback;
+		LaunchDirection.Z = 0.f;
+		if (!LaunchDirection.Normalize())
+		{
+			LaunchDirection = (UpdatedComponent != nullptr)
+				? UpdatedComponent->GetForwardVector()
+				: FVector::ForwardVector;
+			LaunchDirection.Z = 0.f;
+			if (!LaunchDirection.Normalize())
+			{
+				LaunchDirection = FVector::ForwardVector;
+			}
+		}
+	}
+
+	Velocity.X = LaunchDirection.X * LaunchSpeed;
+	Velocity.Y = LaunchDirection.Y * LaunchSpeed;
+
+	// Z has just been set to JumpZVelocity by Super. Scaling rather than assigning keeps this honest
+	// on the multi-frame path: with a non-zero JumpMaxHoldTime the engine calls DoJump on several
+	// consecutive frames, and the slide is only alive for the first of them, so only the first can be
+	// a slide-jump. A second scaling cannot happen because bSlideJump is false by then.
+	Velocity.Z *= GetSlideJumpZMultiplier();
+
+	// Consumed. One slide, one slide-jump.
+	SlideJumpGraceRemaining = 0.f;
+	bSlideJumpGraceWellTimed = 0;
+
+#if !UE_BUILD_SHIPPING
+	// Observation only, and on the authority alone so a client replaying corrections cannot count the
+	// same hop several times. At Display, behind the same switch as the slide measurement.
+	if (IsSlideDebugEnabled() && CharacterOwner != nullptr && CharacterOwner->HasAuthority())
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SLIDEJUMP %-16s carried=%6.0f -> launched=%6.0f uu/s (%.1f%%, retain=%.2f%s) velZ=%6.0f (jumpZ=%.0f x %.2f)"),
+			*GetNameSafe(CharacterOwner), CarrySpeed, GetPlanarSpeed(),
+			100.f * GetPlanarSpeed() / FMath::Max(1.f, CarrySpeed), Retention,
+			bWellTimed ? TEXT(", WELL TIMED") : TEXT(""),
+			Velocity.Z, JumpZVelocity, GetSlideJumpZMultiplier());
+	}
+#endif
+
+	return true;
 }
 
 void UTraceCharacterMovementComponent::ApplyDashExitSpeed()
@@ -1059,6 +1285,16 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	if (SlideBufferRemaining > 0.f)
 	{
 		SlideBufferRemaining = FMath::Max(0.f, SlideBufferRemaining - DeltaSeconds);
+	}
+	if (SlideJumpGraceRemaining > 0.f)
+	{
+		// The slide-jump's coyote window. Ticked here with every other clock so a replayed move
+		// advances it by exactly the same amount the original did.
+		SlideJumpGraceRemaining = FMath::Max(0.f, SlideJumpGraceRemaining - DeltaSeconds);
+		if (SlideJumpGraceRemaining <= 0.f)
+		{
+			bSlideJumpGraceWellTimed = 0;
+		}
 	}
 
 	// 1b. Resize the charge pool from the TRANSITION in GetMaxDashCharges(), never from its value.
@@ -1206,9 +1442,16 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 			const float FloorSpeed = FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideExitSpeedFraction);
 			if (SlideSpeed <= FloorSpeed)
 			{
-				// Decayed back to walking pace: stop rather than drag the player along at a speed
-				// the normal movement code would have given them anyway. EndSlide() still hands back
-				// at least SlideExitMinSpeedFraction of the walk speed.
+				// Decayed back to walking pace: stop rather than drag the player along at a speed the
+				// normal movement code would have given them anyway.
+				//
+				// This is an EXIT CONDITION, not a floor on speed, and the distinction is the whole of
+				// spec v4 §1. It ends the slide when the slide has stopped being worth anything; it
+				// does not hand the player a single unit they did not already have. EndSlide() used to
+				// then lift them back to WalkSpeed on the way out (SlideExitMinSpeedFraction), which
+				// DID contradict "entry speed determines slide velocity" — that is deleted, so a slide
+				// that decays out now leaves the player at ~SlideExitSpeedFraction of the walk speed
+				// and they re-accelerate normally, exactly as if they had never pressed crouch.
 				EndSlide();
 			}
 			else
@@ -1369,12 +1612,19 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		UE_LOG(LogTraceGame, Display,
 			TEXT("MEASURE ---- begin. walk=%.0f | air: srcModel=%d accel=%.0f wishCap=%.0f maxAir=%.0f airFric=%.2f airControl=%.2f "
 			     "| land: preserve=%d fric=%.2f brake=%.0f turn=%.0fdeg/s | dashExit=%.2fx "
-			     "| slide: entryMul=%.2f impulse=%.0f cooldown=%.2fs"),
+			     "| slide: entryMul=%.2f cooldown=%.2fs (NO impulse, NO exit floor) "
+			     "| slideJump: on=%d retain=%.2f zMul=%.2f window=%.2fs windowBonus=%.2f"),
 			MaxWalkSpeed, IsSourceAirAccelerationEnabled() ? 1 : 0, GetAirAcceleration(), GetAirMaxWishSpeed(),
 			GetMaxAirSpeed(), FallingLateralFriction, AirControl,
 			IsLandingMomentumPreserved() ? 1 : 0, GetGroundOverspeedFriction(), GetGroundOverspeedBraking(),
 			GetGroundOverspeedTurnRate(), GetDashExitSpeedMultiplier(),
-			GetSlideEntrySpeedMultiplier(), GetSlideImpulse(), GetSlideCooldownSeconds());
+			GetSlideEntrySpeedMultiplier(), GetSlideCooldownSeconds(),
+			IsSlideJumpEnabled() ? 1 : 0, GetSlideJumpHorizontalRetention(), GetSlideJumpZMultiplier(),
+			GetSlideJumpWindowSeconds(), GetSlideJumpWindowSpeedBonus());
+		MeasureHomeLocation = (UpdatedComponent != nullptr)
+			? UpdatedComponent->GetComponentLocation()
+			: FVector::ZeroVector;
+
 		UE_LOG(LogTraceGame, Display, TEXT("MEASURE run direction %s from %s"),
 			*MeasureRunDirection.ToCompactString(),
 			*(UpdatedComponent != nullptr ? UpdatedComponent->GetComponentLocation() : FVector::ZeroVector).ToCompactString());
@@ -1559,9 +1809,10 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		if (IsSliding())
 		{
 			UE_LOG(LogTraceGame, Display,
-				TEXT("MEASURE SLIDE-1 entry: %.0f uu/s in -> slideSpeed=%.0f uu/s (ratio %.2f, entryMul=%.2f impulse=%.0f)"),
+				TEXT("MEASURE SLIDE-1 entry: %.0f uu/s in -> slideSpeed=%.0f uu/s (ratio %.2f, entryMul=%.2f). "
+				     "Ratio must be 1.00: entry speed determines slide velocity, nothing tops it up."),
 				MeasureMarkA, SlideSpeed, SlideSpeed / FMath::Max(1.f, MeasureMarkA),
-				GetSlideEntrySpeedMultiplier(), GetSlideImpulse());
+				GetSlideEntrySpeedMultiplier());
 			Advance(10);
 		}
 		else if (MeasurePhaseTime > 1.f)
@@ -1580,9 +1831,11 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		{
 			MeasureMarkB = static_cast<float>(GetWorld() != nullptr ? GetWorld()->GetTimeSeconds() : 0.0);
 			UE_LOG(LogTraceGame, Display,
-				TEXT("MEASURE SLIDE-1 exit: after %.2fs, planar=%.0f uu/s (entry was %.0f, %.1f%% kept), buffer now %.2fs"),
+				TEXT("MEASURE SLIDE-1 exit: after %.2fs, planar=%.0f uu/s (entry was %.0f, %.1f%% kept), buffer now %.2fs. "
+				     "THE EXIT FLOOR IS GONE: the deleted SlideExitMinSpeedFraction would have forced this to %.0f."),
 				MeasurePhaseTime, PlanarSpeed, MeasureMarkA,
-				100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA), GetSlideCooldownRemaining());
+				100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA), GetSlideCooldownRemaining(),
+				MaxWalkSpeed);
 			SetWantsToSlide(false);
 			Advance(11);
 		}
@@ -1675,11 +1928,18 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		break;
 
 	case 16:
-		// Ride the slide past its commit window, then jump straight out of it.
+		// Ride the slide down INTO its well-timed window and hop out of it, which is the Apex
+		// slide-hop the spec is asking for. Waiting for IsSlideJumpWellTimed() rather than for a flat
+		// 0.60s is what makes the number below a measurement of the mechanic rather than of a
+		// stopwatch: with the shipped 0.20s window against a 1.8s slide, this fires at ~1.6s in.
 		SetWantsToSlide(true);
-		if (MeasurePhaseTime > 0.60f)
+		if (IsSlideJumpWellTimed() || MeasurePhaseTime > 3.0f)
 		{
 			MeasureMarkA = SlideSpeed;
+			MeasureMarkB = IsSlideJumpWellTimed() ? 1.f : 0.f;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE SLIDEJUMP arming at slideSpeed=%.0f uu/s, %.2fs of slide left, wellTimed=%d"),
+				SlideSpeed, SlideTimeRemaining, IsSlideJumpWellTimed() ? 1 : 0);
 			CharacterOwner->Jump();
 			Advance(17);
 		}
@@ -1691,9 +1951,10 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 			CharacterOwner->StopJumping();
 			SetWantsToSlide(false);
 			UE_LOG(LogTraceGame, Display,
-				TEXT("MEASURE CHAIN slide->jump: slideSpeed was %.0f uu/s -> airborne at %.0f uu/s (%.1f%%). "
-				     "The old exit ceiling would have handed back %.0f."),
-				MeasureMarkA, PlanarSpeed, 100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA), MaxWalkSpeed);
+				TEXT("MEASURE CHAIN slide->jump: slideSpeed was %.0f uu/s -> airborne at %.0f uu/s (%.1f%%), "
+				     "wellTimed=%.0f, velZ=%.0f (jumpZ %.0f x %.2f). The old exit ceiling would have handed back %.0f."),
+				MeasureMarkA, PlanarSpeed, 100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA),
+				MeasureMarkB, Velocity.Z, JumpZVelocity, GetSlideJumpZMultiplier(), MaxWalkSpeed);
 			Advance(18);
 		}
 		else
@@ -1750,8 +2011,116 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		if (MeasurePhaseTime > 0.30f)
 		{
 			UE_LOG(LogTraceGame, Display, TEXT("MEASURE DASH exit +0.30s: planar=%.0f uu/s"), PlanarSpeed);
-			UE_LOG(LogTraceGame, Display, TEXT("MEASURE ---- end"));
 			Advance(22);
+		}
+		break;
+
+	// =============================================================================================
+	// 22-26. THE SLIDE-JUMP, ON CLEAN GROUND.
+	//
+	// The CHAIN phases above already jump out of a slide, but they do it at the middle of the arena
+	// (they teleport to the world origin to isolate the drop) and the first run of this harness
+	// measured a slide-jump there at 110% of the slide speed AT LAUNCH and 70% one physics step later.
+	// The magnitude did not fall by 30% — the VECTOR turned about 50 degrees, which is
+	// SlideAlongSurface deflecting the pawn off midfield cover. That is a measurement of the arena.
+	//
+	// So this repeats the move back at MeasureHomeLocation, on the strip phases 7-11 already crossed
+	// without a single collision (RUN->JUMP measured exactly 100.0% there). Same reason
+	// MeasureRunDirection exists.
+	// =============================================================================================
+	case 22:
+		if (UpdatedComponent != nullptr && CharacterOwner != nullptr)
+		{
+			SetWantsToSlide(false);
+			CharacterOwner->SetActorLocation(MeasureHomeLocation + FVector(0.f, 0.f, 40.f),
+				false, nullptr, ETeleportType::TeleportPhysics);
+			Velocity = FVector::ZeroVector;
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE SLIDEJUMP-CLEAN: returned to %s"),
+				*MeasureHomeLocation.ToCompactString());
+			Advance(23);
+		}
+		break;
+
+	case 23:
+		// Run up to speed on known-clear ground, then ask for the slide.
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		if (MeasurePhaseTime > 1.5f && IsMovingOnGround() && GetSlideCooldownRemaining() <= 0.f)
+		{
+			MeasureMarkA = PlanarSpeed;
+			SetWantsToSlide(true);
+			Advance(24);
+		}
+		break;
+
+	case 24:
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		SetWantsToSlide(true);
+		if (IsSliding())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE SLIDEJUMP-CLEAN entry: %.0f uu/s in -> slideSpeed=%.0f uu/s (ratio %.2f)"),
+				MeasureMarkA, SlideSpeed, SlideSpeed / FMath::Max(1.f, MeasureMarkA));
+			Advance(25);
+		}
+		else if (MeasurePhaseTime > 2.f)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("MEASURE SLIDEJUMP-CLEAN slide never latched (planar=%.0f)"), PlanarSpeed);
+			Advance(27);
+		}
+		break;
+
+	case 25:
+		// Ride down into the well-timed window and hop. Input is HELD the whole way: without it the
+		// first run of this phase let ground friction stop the pawn dead after the slide decayed out,
+		// and then measured a slide-jump from a standstill (0 uu/s -> 0 uu/s), which is a measurement
+		// of the harness. The bail-out fires the moment the slide-jump stops being available at all,
+		// so a slide that ends without ever entering the window still produces a number.
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		SetWantsToSlide(true);
+		if (IsSlideJumpWellTimed() || !IsSlideJumpAvailable() || MeasurePhaseTime > 3.f)
+		{
+			MeasureMarkA = FMath::Max(SlideSpeed, PlanarSpeed);
+			MeasureMarkB = IsSlideJumpWellTimed() ? 1.f : 0.f;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE SLIDEJUMP-CLEAN arming at slideSpeed=%.0f planar=%.0f, timeLeft=%.2fs "
+				     "(durationClock=%.2fs), wellTimed=%d, available=%d"),
+				SlideSpeed, PlanarSpeed, GetSlideTimeLeft(), SlideTimeRemaining,
+				IsSlideJumpWellTimed() ? 1 : 0, IsSlideJumpAvailable() ? 1 : 0);
+			CharacterOwner->Jump();
+			Advance(26);
+		}
+		break;
+
+	case 26:
+		if (!IsMovingOnGround())
+		{
+			CharacterOwner->StopJumping();
+			SetWantsToSlide(false);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE SLIDEJUMP-CLEAN: slideSpeed was %.0f uu/s -> first airborne frame %.0f uu/s "
+				     "(%.1f%%), wellTimed=%.0f, velZ=%.0f. Retention %.2f x windowBonus %.2f."),
+				MeasureMarkA, PlanarSpeed, 100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA),
+				MeasureMarkB, Velocity.Z, GetSlideJumpHorizontalRetention(),
+				MeasureMarkB > 0.f ? GetSlideJumpWindowSpeedBonus() : 1.f);
+			Advance(27);
+		}
+		else
+		{
+			SetWantsToSlide(true);
+			if (MeasurePhaseTime > 1.f)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("MEASURE SLIDEJUMP-CLEAN never left the ground"));
+				Advance(27);
+			}
+		}
+		break;
+
+	case 27:
+		if (MeasurePhaseTime > 0.30f)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE SLIDEJUMP-CLEAN +0.30s airborne: planar=%.0f uu/s"), PlanarSpeed);
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE ---- end"));
+			Advance(28);
 		}
 		break;
 
@@ -1783,6 +2152,8 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, SavedSlideDirection(FVector::ZeroVector)
 	, bSavedSlideHeldLastMove(0)
 	, bSavedWasAirborneLastMove(0)
+	, SavedSlideJumpGraceRemaining(0.f)
+	, bSavedSlideJumpGraceWellTimed(0)
 {
 }
 
@@ -1810,6 +2181,8 @@ void FSavedMove_Trace::Clear()
 	SavedSlideDirection = FVector::ZeroVector;
 	bSavedSlideHeldLastMove = 0;
 	bSavedWasAirborneLastMove = 0;
+	SavedSlideJumpGraceRemaining = 0.f;
+	bSavedSlideJumpGraceWellTimed = 0;
 }
 
 uint8 FSavedMove_Trace::GetCompressedFlags() const
@@ -1856,9 +2229,13 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// The commit window is included for the same reason: it decides whether a released key ends the
 	// slide, so a merged move that straddled its expiry would resolve the release differently from
 	// the two moves it replaced.
+	// The slide-jump's coyote window is in the same list and for the same reason: it decides whether
+	// a jump is a slide-jump at all, so a merged move straddling its expiry would resolve the jump
+	// differently from the two moves it replaced — and the difference is the whole carry.
 	if (SavedDashTimeRemaining > 0.f || Other->SavedDashTimeRemaining > 0.f
 		|| SavedSlideTimeRemaining > 0.f || Other->SavedSlideTimeRemaining > 0.f
-		|| SavedSlideCommitRemaining > 0.f || Other->SavedSlideCommitRemaining > 0.f)
+		|| SavedSlideCommitRemaining > 0.f || Other->SavedSlideCommitRemaining > 0.f
+		|| SavedSlideJumpGraceRemaining > 0.f || Other->SavedSlideJumpGraceRemaining > 0.f)
 	{
 		return false;
 	}
@@ -1907,6 +2284,9 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedSlideDirection         = Movement->SlideDirection;
 			bSavedSlideHeldLastMove     = Movement->bSlideHeldLastMove;
 			bSavedWasAirborneLastMove   = Movement->bWasAirborneLastMove;
+
+			SavedSlideJumpGraceRemaining  = Movement->SlideJumpGraceRemaining;
+			bSavedSlideJumpGraceWellTimed = Movement->bSlideJumpGraceWellTimed;
 		}
 	}
 }
@@ -1942,6 +2322,12 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			Movement->SlideDirection         = SavedSlideDirection;
 			Movement->bSlideHeldLastMove     = bSavedSlideHeldLastMove;
 			Movement->bWasAirborneLastMove   = bSavedWasAirborneLastMove;
+
+			// The slide-jump window. Without this a correction that landed mid-window would replay a
+			// slide-jump as an ordinary jump, and client and server would disagree about several
+			// hundred uu/s of horizontal velocity on the most visible frame in the kit.
+			Movement->SlideJumpGraceRemaining  = SavedSlideJumpGraceRemaining;
+			Movement->bSlideJumpGraceWellTimed = bSavedSlideJumpGraceWellTimed;
 		}
 	}
 }

@@ -10,6 +10,7 @@
 #include "UObject/ObjectPtr.h"
 #include "UObject/WeakObjectPtrTemplates.h"
 
+#include "Core/TraceMatchTypes.h"                // ETraceScoringMode, ETraceMatchEndReason
 #include "TraceTypes.h"                          // ETraceTeam
 
 #include "TraceGameMode.generated.h"
@@ -57,7 +58,19 @@ enum class ECoreKickoffMode : uint8
  *
  *     WaitingForPlayers --(MinPlayersToStart reached)--> [WarmupDuration countdown]
  *                       --(warm-up expires)------------> InProgress
- *                       --(ScoreToWin or MatchDuration)-> PostMatch
+ *                       --(final half's clock expires)-> PostMatch   [ETraceMatchEndReason::Clock]
+ *                       --(a lead of MercyRuleLead)----> PostMatch   [ETraceMatchEndReason::Mercy]
+ *
+ * WIN CONDITIONS (spec v4 §6), because this changed and the old rule is gone:
+ * THE CLOCK DECIDES THE MATCH. There is no score cap — UTraceSettings::ScoreToWin and the
+ * bEndMatchAtScoreToWin switch that consumed it have both been deleted, not merely defaulted off.
+ * The one early exit is the MERCY RULE: the instant either team's lead reaches
+ * UTraceSettings::MercyRuleLead (8, or 0 to disable) the whole match ends and that team wins,
+ * whichever half it happens in. See CheckMercyRule().
+ *
+ * SCORING MODE (spec v4 §7): this class resolves which of the two games is being played and
+ * publishes it on ATraceGameState::ScoringMode, which is the authority everything else reads. See
+ * ResolveScoringMode() / PublishScoringMode().
  *
  * There is deliberately no separate "Warmup" state: the countdown is expressed through the shared
  * MatchEndServerTime deadline while the state stays WaitingForPlayers, which keeps ETraceMatchState
@@ -162,6 +175,15 @@ public:
 
 	ATraceCore* GetCore() const;
 
+	/**
+	 * The scoring mode this match is being played in (spec v4 §7).
+	 *
+	 * Server-side convenience only, and it simply forwards to ATraceGameState::GetScoringMode() so
+	 * the two can never disagree. Anything that also runs on a client — a HUD pass, a component, a
+	 * pawn — must ask the GameState instead: AGameModeBase does not exist outside the server.
+	 */
+	ETraceScoringMode GetScoringMode() const;
+
 	/** Smaller team wins, ties go to Blue. Returns None when both teams are at PlayersPerTeam. */
 	ETraceTeam PickTeamForNewPlayer() const;
 
@@ -185,14 +207,17 @@ public:
 	float HalfTimeBreakDuration = 12.f;
 
 	/**
-	 * Seconds between death and respawn. Spec §1 sets this to 3.
+	 * Seconds between death and respawn. Spec v4 §5 sets this to 2 (it was 3).
+	 *
+	 * Config/DefaultGame.ini pins this under [/Script/Trace.TraceGameMode] as well, and the ini
+	 * wins — so this literal is what a reader sees, not what a match uses. Keep the two equal.
 	 *
 	 * Deliberately here and not in UTraceSettings: the respawn delay is a RULE, this class is the
 	 * rules, and UTraceSettings::RespawnDelay has no enforcement behind it. Clients no longer need
 	 * to know it either — the deadline replicates on ATracePlayerState::RespawnEndServerTime.
 	 */
 	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Match")
-	float RespawnDelay = 3.f;
+	float RespawnDelay = 2.f;
 
 	/**
 	 * "Team A" in the doc's phrase "the core starts with Team A in the first half". Team B (its
@@ -209,13 +234,13 @@ public:
 	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Match")
 	int32 WipeBonusPoints = 2;
 
-	/**
-	 * Mercy rule. OFF by design: the format is now a fixed two halves of ten minutes, and ending at
-	 * UTraceSettings::ScoreToWin would cut the second half — and the side switch that justifies it —
-	 * out of most matches. Flip it on to restore "first to N wins outright".
-	 */
-	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Match")
-	bool bEndMatchAtScoreToWin = false;
+	// bEndMatchAtScoreToWin AND ITS SCORE CAP ARE GONE (spec v4 §6, verbatim: "Remove score to win 5
+	// — Keep the match timer as the win condition, but add a mercy rule").
+	//
+	// Deleted rather than defaulted off, along with UTraceSettings::ScoreToWin: a switch that can
+	// reintroduce a deleted win condition is exactly the kind of thing that gets flipped on by an
+	// old .ini and quietly ends matches at 5-4. The mercy rule replaces it, lives in
+	// UTraceSettings::MercyRuleLead so it retunes live, and is enforced by CheckMercyRule().
 
 	/**
 	 * Spec §1: players respawn in their OWN team's endzone rather than on the generic pads in front
@@ -249,7 +274,71 @@ protected:
 	void StartWarmup();
 	void CancelWarmup();
 	void BeginMatch();
-	void FinishMatch(ETraceTeam WinningTeam);
+
+	/**
+	 * Ends the match, records WHY, and starts the results-screen countdown.
+	 *
+	 * @param WinningTeam ETraceTeam::None is a genuine draw (only reachable on a clock finish).
+	 * @param Reason      Clock or Mercy. Replicated to the results screen — spec §6 asks for the
+	 *                    distinction explicitly, because a mercy win and a clock win produce the
+	 *                    same scoreboard and are not the same result.
+	 */
+	void FinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Reason);
+
+	// --- Win conditions (spec v4 §6) -----------------------------------------------------------
+
+	/**
+	 * The MERCY RULE. Verbatim: "add a mercy rule, where the game will end if one team leads by 8
+	 * points (granting an immediate win to the team leading)."
+	 *
+	 * Call this after ANY change to the scoreboard — a capture, a wipe bonus, anything added later.
+	 * It is a state test on the current lead, not an event handler, so it cannot be desynchronised
+	 * from the score by whoever forgot to pass it the right argument.
+	 *
+	 * SCOPE, per the spec's stated assumption: the whole match, including mid-first-half, and it
+	 * ends the MATCH outright rather than ending only the half. A mercy win in the first half means
+	 * the second half and its side switch never happen — that is the point of a mercy rule.
+	 *
+	 * The threshold is UTraceSettings::MercyRuleLead, read here at the point of use so it retunes
+	 * with PIE running. Zero disables the rule entirely and the clock becomes the only end.
+	 *
+	 * @return true when the match was ended. Callers must not continue their own work (a kickoff, a
+	 *         field reset) once this returns true — the match is over.
+	 */
+	bool CheckMercyRule(const TCHAR* Cause);
+
+	// --- Scoring mode (spec v4 §7) -------------------------------------------------------------
+
+	/**
+	 * Resolves which game this map load is playing and writes the answer into the UTraceSettings
+	 * CDO, which is where PublishScoringMode() and the live poll both read it from.
+	 *
+	 * Three ways in, in priority order — exactly the shape bot difficulty already uses, because the
+	 * title screen carries both across the same travel:
+	 *   1. "?mode=a|b" on the travel URL (what the main menu's SCORING MODE row sends);
+	 *   2. "-TraceScoringMode=a|b" on the command line, for headless A/B runs;
+	 *   3. UTraceSettings::ScoringMode, i.e. whatever the Project Settings page says.
+	 *
+	 * Writing the resolved answer BACK into the CDO is what makes the settings page honest: after
+	 * this runs, the panel shows the mode that is actually being played, and dragging it there is a
+	 * live change rather than a value fighting a URL nobody can see.
+	 */
+	void ResolveScoringMode(const FString& Options);
+
+	/** Copies UTraceSettings::ScoringMode onto the GameState. Idempotent; safe to call repeatedly. */
+	void PublishScoringMode();
+
+	/**
+	 * Watches UTraceSettings::ScoringMode for an edit made while the game is running, and republishes
+	 * when it moves.
+	 *
+	 * This is what makes the toggle genuinely live rather than a value latched at map load. The
+	 * whole point of spec §7 is A/B playtesting, and "switching must be easy and obvious" is not
+	 * satisfied by a knob that needs a restart. A half-second poll is far cheaper than any hook, and
+	 * PostEditChangeProperty is editor-only, so a poll is also the only mechanism that survives into
+	 * a packaged build where the setting can still be changed by a console command.
+	 */
+	void PollScoringModeSetting();
 
 	// --- Halves ------------------------------------------------------------------------------
 
@@ -463,6 +552,9 @@ private:
 	FTimerHandle HalfTimeTimerHandle;
 	FTimerHandle BotFillTimerHandle;
 	FTimerHandle ReturnToMenuTimerHandle;
+
+	/** Drives PollScoringModeSetting(). Looping, half a second, for the whole session. */
+	FTimerHandle ScoringModePollHandle;
 
 #if !UE_BUILD_SHIPPING
 	FTimerHandle BotDebugTimerHandle;

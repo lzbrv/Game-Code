@@ -76,6 +76,40 @@ namespace TraceBotConstants
 	/** Inside this radius of its station, an escort stops shuffling and holds. */
 	static constexpr float StationHoldRadius = 260.f;
 
+	// --- MODE B (spec v4 §7) ----------------------------------------------------------------------
+
+	/**
+	 * How many bots per team contest a loose Core; the rest fall back and cover their own goal.
+	 *
+	 * Two is the smallest number that still makes the chase a contest rather than a foot race, and it
+	 * leaves three of a five-man side goal-side of the ball. Sending everybody was the first version
+	 * and it produced exactly what you would expect: both teams stacked on one point and an
+	 * unguarded goal mouth for whoever came out of the pile with it.
+	 */
+	static constexpr int32 LooseCoreChasers = 2;
+
+	/**
+	 * How many bots per team hold a station in front of their own goal. The rest play normally.
+	 *
+	 * MEASURED: without a cap, "an enemy has the Core and I cannot reach them" caught nearly the
+	 * whole side — 12358 goal-defence bot-ticks against 877 spent chasing over a 60 s sample on a
+	 * 33600 uu field, because on a pitch that long most players are out of carrier range most of the
+	 * time. A team standing in its own goal is not defending, it is absent.
+	 */
+	static constexpr int32 GoalDefenders = 2;
+
+	/**
+	 * Fraction of the way from our own goal toward the threat that a defender stands.
+	 *
+	 * Not ON the goal line: a defender standing in the mouth can be walked around, and the goal is
+	 * finite in height, so the useful position is a little in front of it where the throwing lane is
+	 * narrowest.
+	 */
+	static constexpr float GoalDefenceStandoffFraction = 0.22f;
+
+	/** Inside this angle of the goal centre, a carrying bot will take the shot rather than pass. */
+	static constexpr float ThrowAtGoalConeDegrees = 35.f;
+
 	/**
 	 * Perpendicular distance under which "which side of the trace am I on" stops being answerable.
 	 *
@@ -408,12 +442,22 @@ namespace TraceBotTelemetry
 		int32 StuckJumps        = 0;   // wedged on geometry, tried a jump to clear it
 		int32 Slides            = 0;
 		int32 FastFalls         = 0;
+		int32 SlideJumps        = 0;   // slides cashed in as a slide-jump inside the timing window
 
 		int32 PunisherTicks     = 0;   // bot-ticks spent holding a bead on an enemy carrier
 		int32 PunisherShots     = 0;   // trigger pulls in that role
 
 		int32 EndzoneFlips      = 0;   // times a bot's attacking end changed (i.e. half time)
 		int32 EndzoneUnresolved = 0;   // bots that had to fall back to the "Blue attacks +X" guess
+
+		// --- MODE B (spec v4 §7). Zero for the whole match in mode A, which is itself the check
+		//     that mode A has not quietly started running mode B's code.
+		int32 ThrowAttempts     = 0;   // throw input actually pressed
+		int32 ThrowsAtGoal      = 0;   // ...aimed at the goal mouth
+		int32 ThrowsToTeammate  = 0;   // ...aimed at an open teammate
+		int32 ThrowGiveUps      = 0;   // lined up on a throw and abandoned it
+		int32 LooseChaseTicks   = 0;   // bot-ticks spent running at a loose Core
+		int32 GoalDefenceTicks  = 0;   // bot-ticks spent holding a station in front of our own goal
 	};
 
 	struct FState
@@ -805,14 +849,27 @@ namespace TraceBotTelemetry
 		// match", and a rolling window makes that harder to read rather than easier.
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[BotKit] t=%.0fs | pass: attempt=%d done=%d abort-threat=%d abort-other=%d giveup=%d ")
-			TEXT("| dash: trace=%d escape=%d duel=%d | stuckjump=%d slide=%d fastfall=%d ")
+			TEXT("| dash: trace=%d escape=%d duel=%d | stuckjump=%d slide=%d slidejump=%d fastfall=%d ")
 			TEXT("| punish: ticks=%d shots=%d | endzone: flips=%d unresolved=%d"),
 			Elapsed,
 			K.PassAttempts, K.PassCompletions, K.PassAbortsThreat, K.PassAbortsOther, K.PassLineUpGiveUps,
 			K.TraceDashes, K.EscapeDashes, K.DuelDashes,
-			K.StuckJumps, K.Slides, K.FastFalls,
+			K.StuckJumps, K.Slides, K.SlideJumps, K.FastFalls,
 			K.PunisherTicks, K.PunisherShots,
 			K.EndzoneFlips, K.EndzoneUnresolved);
+
+		// Mode B, on its own line and only when it has anything to say. In mode A every one of these
+		// is zero and the line is suppressed, so its mere presence in a log is the evidence that the
+		// mode-B bot code ran — and its absence is the evidence that mode A did not touch it.
+		if (K.ThrowAttempts + K.LooseChaseTicks + K.GoalDefenceTicks > 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BotKitB] t=%.0fs | throw: attempt=%d at-goal=%d to-mate=%d giveup=%d ")
+				TEXT("| loose: chaseticks=%d | defend: ticks=%d"),
+				Elapsed,
+				K.ThrowAttempts, K.ThrowsAtGoal, K.ThrowsToTeammate, K.ThrowGiveUps,
+				K.LooseChaseTicks, K.GoalDefenceTicks);
+		}
 
 		S.Window = FWindow();
 	}
@@ -1066,6 +1123,8 @@ const TCHAR* ATraceBotController::StateToString(ETraceBotState InState)
 	case ETraceBotState::EscortCarrier: return TEXT("EscortCarrier");
 	case ETraceBotState::Regroup:       return TEXT("Regroup");
 	case ETraceBotState::Fight:         return TEXT("Fight");
+	case ETraceBotState::ChaseLooseCore: return TEXT("ChaseLooseCore");
+	case ETraceBotState::DefendGoal:    return TEXT("DefendGoal");
 	default:                            return TEXT("Idle");
 	}
 }
@@ -1168,7 +1227,32 @@ void ATraceBotController::Tick(float DeltaSeconds)
 	// where the carrier can be shot, and it is the one thing the spec asks to get exactly right.
 	if (bIAmCarrier)
 	{
-		UpdatePass(DeltaSeconds);
+		// The mode decides which verb mouse1 has, so it decides which machine runs. Only ever one of
+		// them: ScoringMode is latched for the match.
+		if (bModeB)
+		{
+			UpdateThrow(DeltaSeconds);
+		}
+		else
+		{
+			UpdatePass(DeltaSeconds);
+		}
+	}
+	else if (bModeB)
+	{
+		// MODE B. No dwell, so there is no "we were holding and it landed" case to detect: a throw
+		// that leaves is a throw that happened, and its counter is incremented at the point of
+		// release. All that is left is closing out an attempt that was still lining up when the Core
+		// went somewhere else — killed mid-line-up, or intercepted after an earlier throw.
+		//
+		// (What became of a loose Core is deliberately NOT counted here. Ten bots would each count
+		// the same pickup, and the Core already logs every one of them exactly once, with the team
+		// and the grace decision attached: see the [ModeB] INTERCEPTION / RECOVERY lines.)
+		if (PassPhase == ETraceBotPassPhase::Lining)
+		{
+			TRACE_BOT_KIT(ThrowGiveUps);
+			AbortThrow(TEXT("lost the Core while lining up a throw"));
+		}
 	}
 	else if (PassPhase != ETraceBotPassPhase::None && PassPhase != ETraceBotPassPhase::Cooldown)
 	{
@@ -1339,6 +1423,34 @@ void ATraceBotController::GatherWorldState()
 		}
 	}
 
+	// --- MODE B: is there a Core lying out in the world right now? -------------------------------
+	//
+	// This is the ONE place this class asks the Core actor anything about possession, and it is
+	// unavoidable: "the Core is loose" is a fact about an object, and the roster scan above - which
+	// deliberately asks the PLAYERS who is carrying, so that the bots do not depend on ATraceCore -
+	// cannot see it, because while the Core is loose nobody is carrying. In mode A the answer is
+	// always false and the bots' dependency on the Core is exactly what it was.
+	bModeB = false;
+	bCoreLoose = false;
+	LooseCorePoint = FVector::ZeroVector;
+	LooseCoreDistSq = 0.f;
+
+	if (const ATraceCore* TheCore = ATraceCore::Get(GetWorld()))
+	{
+		bModeB = TheCore->IsModeB();
+		if (bModeB)
+		{
+			// Lead by a fraction of a second: a Core doing 2600 uu/s is 40 uu further on by the time
+			// this bot's movement input is applied, and chasing the position it WAS at is how a bot
+			// trails a loose Core across the field without ever reaching it.
+			bCoreLoose = TheCore->GetLooseCoreInterceptPoint(0.25f, LooseCorePoint);
+			if (bCoreLoose)
+			{
+				LooseCoreDistSq = static_cast<float>(FVector::DistSquared2D(MyLocation, LooseCorePoint));
+			}
+		}
+	}
+
 	// Sides switch at half time. Polling is a two-actor scan once a second, which is cheaper than
 	// any scheme for detecting the switch would be, and it cannot miss one.
 	const float Now = GetWorld() ? static_cast<float>(GetWorld()->GetTimeSeconds()) : 0.f;
@@ -1362,11 +1474,17 @@ void ATraceBotController::ResolveAttackEndzone()
 	// no matter HOW the game mode implements the switch: swapping the zones' OwningTeam, moving the
 	// zones, or re-assigning the spawns all produce the right answer here, because all three have to
 	// end up changing what ScoresHere() returns or the human's own scoring would be wrong too.
+	// IsZoneActive() is not optional now that BOTH shapes exist at once. ATraceArenaBuilder builds
+	// the endzones AND the mode-B goals up front and arms whichever pair the scoring mode calls for,
+	// so there are FOUR ATraceEndzone actors in the world and two of them are disarmed. Without this
+	// test the loop takes whichever the actor iterator reaches first. It happens to come out right
+	// today — the endzone and the goal at the same end share an OwningTeam and an X/Y centre — but
+	// that is luck, not a rule, and it would break the moment the two shapes stop being concentric.
 	const ATraceEndzone* Target = nullptr;
 	for (TActorIterator<ATraceEndzone> It(World); It; ++It)
 	{
 		ATraceEndzone* Zone = *It;
-		if (IsValid(Zone) && Zone->ScoresHere(MyTeam))
+		if (IsValid(Zone) && Zone->IsZoneActive() && Zone->ScoresHere(MyTeam))
 		{
 			Target = Zone;
 			break;
@@ -1392,9 +1510,37 @@ void ATraceBotController::ResolveAttackEndzone()
 		return;
 	}
 
-	const FVector Centre = (Target->Trigger != nullptr)
+	FVector Centre = (Target->Trigger != nullptr)
 		? Target->Trigger->GetComponentLocation()
 		: Target->GetActorLocation();
+
+	// --- MODE B: the scoring volume is the GOAL, not the endzone. ---------------------------------
+	//
+	// Steering at the endzone centre in mode B would be wrong in a way that is easy to miss: the two
+	// share a centre line, so a bot would still look like it was attacking correctly while running
+	// at a box the rule no longer scores. Ask the Core for the goal mouth, which is answered from
+	// the very same boxes ATraceCore::CheckGoalScore awards points off - the same equivalence
+	// argument as asking ATraceEndzone::ScoresHere above, one layer along.
+	//
+	// Also resolve the goal this team DEFENDS, which is the goal our OPPONENT scores in. Mode A has
+	// no such thing (the endzone is the full width of the field, so there is no mouth to stand in
+	// front of) and leaves bDefendGoalValid false.
+	bDefendGoalValid = false;
+	if (bModeB)
+	{
+		FVector GoalCentre = FVector::ZeroVector;
+		if (ATraceCore::GetAttackGoalCentre(World, MyTeam, GoalCentre))
+		{
+			Centre = GoalCentre;
+		}
+
+		FVector OwnGoalCentre = FVector::ZeroVector;
+		if (ATraceCore::GetAttackGoalCentre(World, TraceOpposingTeam(MyTeam), OwnGoalCentre))
+		{
+			DefendGoalCentre = OwnGoalCentre;
+			bDefendGoalValid = true;
+		}
+	}
 
 	AttackGoalCentre = Centre;
 	bAttackGoalValid = true;
@@ -1433,6 +1579,37 @@ void ATraceBotController::DecideState()
 	{
 		State = ETraceBotState::CarryToGoal;
 	}
+	else if (bCoreLoose)
+	{
+		// MODE B ONLY (bCoreLoose is false for the whole match in mode A).
+		//
+		// A loose Core outranks everything except carrying one, for both teams at once: "the first
+		// player to contact the core should pick it up", so whoever gets there decides the next
+		// possession. That makes it the most valuable thing on the field and the one moment where
+		// standing off is strictly wrong.
+		//
+		// But not EVERYBODY sprints at it. Five bots converging on one point is a scrum that leaves
+		// the goal wide open behind them, and the ranking below is the same distance ordering the
+		// interceptor/punisher split uses: consistent across bots with no shared table, because every
+		// bot computes it from the same replicated positions. The closest few contest; the rest fall
+		// back and cover the mouth.
+		int32 CloserTeammates = 0;
+		for (const ATraceCharacter* Mate : LiveTeammates)
+		{
+			if (Mate == nullptr)
+			{
+				continue;
+			}
+			if (FVector::DistSquared2D(Mate->GetActorLocation(), LooseCorePoint) < LooseCoreDistSq)
+			{
+				++CloserTeammates;
+			}
+		}
+
+		State = (CloserTeammates < TraceBotConstants::LooseCoreChasers)
+			? ETraceBotState::ChaseLooseCore
+			: (ShouldHoldGoalDefence() ? ETraceBotState::DefendGoal : ETraceBotState::Fight);
+	}
 	else if (bEnemyIsCarrier)
 	{
 		// Two jobs, not one, and both are needed for the spec's central loop to close.
@@ -1454,7 +1631,15 @@ void ATraceBotController::DecideState()
 
 		if (Rank == INDEX_NONE)
 		{
-			State = ETraceBotState::Fight;
+			// Too far from the carrier, or unable to see them. In mode A there is nothing to guard —
+			// the endzone is the whole width of the field — so the honest answer is to keep fighting.
+			// In mode B there IS a mouth to stand in front of, and the players who cannot reach the
+			// carrier are exactly the ones who should be standing in it — but only the nearest couple
+			// of them. MEASURED: without the ShouldHoldGoalDefence cap this branch caught almost the
+			// whole team (12358 goal-defence bot-ticks against 877 spent chasing in a 60 s sample, on
+			// a 33600 uu field where most players are out of carrier range most of the time), which
+			// reads as a side that has stopped playing.
+			State = ShouldHoldGoalDefence() ? ETraceBotState::DefendGoal : ETraceBotState::Fight;
 		}
 		else if (Rank < Interceptors)
 		{
@@ -1491,6 +1676,41 @@ void ATraceBotController::DecideState()
 		UE_LOG(LogTraceGame, Verbose, TEXT("[Bot] %s -> %s"),
 			*GetNameSafe(GetPlayerState<APlayerState>()), StateToString(State));
 	}
+}
+
+bool ATraceBotController::ShouldHoldGoalDefence() const
+{
+	// Mode A has no goal mouth to stand in front of, so nobody ever holds this station there.
+	if (!bModeB || !bDefendGoalValid)
+	{
+		return false;
+	}
+
+	const ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (BotCharacter == nullptr)
+	{
+		return false;
+	}
+
+	// The same distance-ranking scheme as the interceptor/punisher split and the loose-Core chase:
+	// every bot computes the same ordering from the same positions, so the defence assigns itself
+	// with no shared table and no arbitration pass. Ranked on distance to OUR OWN goal, which is the
+	// thing being guarded — ranking on distance to the threat would send whoever happened to be
+	// nearest the ball back to defend, which is the opposite of the intent.
+	const float MyDistSq =
+		static_cast<float>(FVector::DistSquared2D(BotCharacter->GetActorLocation(), DefendGoalCentre));
+
+	int32 CloserTeammates = 0;
+	for (const ATraceCharacter* Mate : LiveTeammates)
+	{
+		if (Mate != nullptr
+			&& FVector::DistSquared2D(Mate->GetActorLocation(), DefendGoalCentre) < MyDistSq)
+		{
+			++CloserTeammates;
+		}
+	}
+
+	return CloserTeammates < TraceBotConstants::GoalDefenders;
 }
 
 int32 ATraceBotController::GetCarrierPressureRank() const
@@ -1653,6 +1873,8 @@ void ATraceBotController::UpdateMovementIntent(float DeltaSeconds)
 	case ETraceBotState::EscortCarrier: BehaviourEscortCarrier(DeltaSeconds); break;
 	case ETraceBotState::Regroup:       BehaviourRegroup(DeltaSeconds);       break;
 	case ETraceBotState::Fight:         BehaviourFight(DeltaSeconds);         break;
+	case ETraceBotState::ChaseLooseCore: BehaviourChaseLooseCore(DeltaSeconds); break;
+	case ETraceBotState::DefendGoal:    BehaviourDefendGoal(DeltaSeconds);    break;
 	default:                            DesiredMoveDirection = FVector::ZeroVector; break;
 	}
 }
@@ -2128,6 +2350,135 @@ void ATraceBotController::BehaviourFight(float DeltaSeconds)
 }
 
 // =================================================================================================
+// MODE B behaviours  (spec v4 §7)
+// =================================================================================================
+
+void ATraceBotController::BehaviourChaseLooseCore(float DeltaSeconds)
+{
+	ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (BotCharacter == nullptr || !bCoreLoose)
+	{
+		DesiredMoveDirection = FVector::ZeroVector;
+		return;
+	}
+
+	TRACE_BOT_KIT(LooseChaseTicks);
+
+	const FVector MyLocation = BotCharacter->GetActorLocation();
+
+	FVector ToCore = LooseCorePoint - MyLocation;
+	ToCore.Z = 0.f;
+	DesiredMoveDirection = ToCore.GetSafeNormal();
+
+	// The chase is a race and it is the one moment in mode B where losing by half a metre loses the
+	// possession, so a dash is well spent here — and unlike the carrier's dash there is no second
+	// charge to hold in reserve, because there is nothing to escape from yet.
+	const float Distance = static_cast<float>(ToCore.Size());
+	const float DashBand = FMath::Max(600.f, HalfFieldLength() * 0.12f);
+
+	if (Distance > 250.f && Distance < DashBand)
+	{
+		// Only worth it when somebody is actually contesting: an uncontested walk-up does not need a
+		// charge, and spending one leaves the bot flat if an enemy arrives a second later.
+		bool bContested = false;
+		for (const ATraceCharacter* Enemy : LiveEnemies)
+		{
+			if (Enemy != nullptr
+				&& FVector::DistSquared2D(Enemy->GetActorLocation(), LooseCorePoint) < FMath::Square(DashBand))
+			{
+				bContested = true;
+				break;
+			}
+		}
+
+		if (bContested && FMath::FRand() < UTraceSettings::GetBotProfile().Aggression * DeltaSeconds * 2.5f)
+		{
+			if (RequestDash(/*bReserveLast=*/false))
+			{
+				TRACE_BOT_KIT(EscapeDashes);
+			}
+		}
+	}
+
+	// Keep shooting while chasing. Unlike carrying — where mouse1 IS the throw and the weapon refuses
+	// anyway — a bot running at a loose Core is an ordinary armed player, and the enemy running at
+	// the same point is a legitimate target. UpdateCombat picks it; all this does is not suppress it.
+	bWantsToAim = true;
+	if (ATraceCharacter* Target = FindBestShootTarget())
+	{
+		ShootTarget = Target;
+		DesiredAimPoint = GetAimPointOn(Target);
+	}
+	else
+	{
+		bWantsToAim = false;
+	}
+}
+
+void ATraceBotController::BehaviourDefendGoal(float DeltaSeconds)
+{
+	ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (BotCharacter == nullptr)
+	{
+		return;
+	}
+
+	if (!bDefendGoalValid)
+	{
+		// No goal resolved (mode A, or the boxes have not been derived yet). Fall through to the
+		// behaviour that is always safe rather than standing still.
+		BehaviourRegroup(DeltaSeconds);
+		return;
+	}
+
+	TRACE_BOT_KIT(GoalDefenceTicks);
+
+	const FVector MyLocation = BotCharacter->GetActorLocation();
+
+	// The thing we are defending against, in priority order: an enemy who already has the Core, the
+	// loose Core itself, then the nearest enemy. Standing between THAT and the mouth is the whole job.
+	FVector Threat = MyLocation;
+	if (bEnemyIsCarrier && Carrier.IsValid())
+	{
+		Threat = Carrier->GetActorLocation();
+	}
+	else if (bCoreLoose)
+	{
+		Threat = LooseCorePoint;
+	}
+	else if (NearestEnemy.IsValid())
+	{
+		Threat = NearestEnemy->GetActorLocation();
+	}
+
+	FVector Station = FMath::Lerp(DefendGoalCentre, Threat, TraceBotConstants::GoalDefenceStandoffFraction);
+
+	// Spread along the mouth rather than stacking on its centre, using the same per-bot bias the
+	// attacking lane offset uses, so two defenders cover two thirds of the goal instead of one third
+	// of it twice.
+	Station.Y += HalfFieldWidth()
+		* FMath::Max(0.f, UTraceSettings::Get().BotAttackLaneFieldFraction) * 0.5f
+		* FMath::Clamp(FormationBias, -1.f, 1.f);
+	Station.Z = MyLocation.Z;
+
+	FVector ToStation = Station - MyLocation;
+	ToStation.Z = 0.f;
+
+	DesiredMoveDirection = (ToStation.SizeSquared() > FMath::Square(TraceBotConstants::StationHoldRadius))
+		? ToStation.GetSafeNormal()
+		: FVector::ZeroVector;
+
+	// A defender that does not shoot is a cone. Aim while holding the station.
+	if (ATraceCharacter* Target = FindBestShootTarget())
+	{
+		ShootTarget = Target;
+		bWantsToAim = true;
+		DesiredAimPoint = GetAimPointOn(Target);
+	}
+}
+
+
+// =================================================================================================
 // Hover passing  (spec §4)
 //
 // THE BEAT THIS IMPLEMENTS
@@ -2373,6 +2724,288 @@ void ATraceBotController::UpdatePass(float DeltaSeconds)
 	}
 }
 
+// =================================================================================================
+// MODE B throwing  (spec v4 §7)
+//
+// THE BEAT THIS IMPLEMENTS
+//   * mouse1 while carrying THROWS the Core forward, instantly and irrevocably;
+//   * anybody's first contact with it takes it, enemy or teammate;
+//   * so a throw is a bet, not a commitment: there is no dwell, no shield cost and no abort, and
+//     the entire decision is "is the thing I am throwing at better than the ground under my feet".
+//
+// A bot that never threw would make mode B untestable, and a bot that threw constantly would turn
+// every possession into a coin flip. What follows is the middle: shoot at the goal when the goal is
+// in range and in front of me, throw to a teammate who is meaningfully further up the field
+// otherwise, and clear it forward rather than die with it when the position is collapsing.
+// =================================================================================================
+
+FVector ATraceBotController::ComputeThrowAimPoint(const FVector& WorldTarget) const
+{
+	const ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (BotCharacter == nullptr)
+	{
+		return WorldTarget;
+	}
+
+	const UWorld* World = GetWorld();
+	const FVector From = BotCharacter->GetPawnViewLocation();
+	const float Distance = static_cast<float>(FVector::Dist(From, WorldTarget));
+
+	// The Core's OWN launch speed and gravity, read through the console variables that back them, so
+	// a designer who halves the throw speed does not silently leave every bot aiming as if it were
+	// still fast. Defaults here match the Core's defaults and are only used if the variables are gone.
+	const IConsoleVariable* SpeedVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ModeB.ThrowSpeed"));
+	const IConsoleVariable* GravityVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ModeB.GravityScale"));
+	const IConsoleVariable* UpBiasVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ModeB.ThrowUpBias"));
+
+	const float Speed = FMath::Max(100.f, (SpeedVar != nullptr) ? SpeedVar->GetFloat() : 2600.f);
+	const float GravityScale = (GravityVar != nullptr) ? GravityVar->GetFloat() : 0.55f;
+	const float UpBias = (UpBiasVar != nullptr) ? UpBiasVar->GetFloat() : 0.18f;
+
+	const float GravityZ = FMath::Abs((World != nullptr) ? World->GetGravityZ() : -980.f) * GravityScale;
+
+	// First-order lob: time of flight at launch speed, the drop over that time, minus whatever the
+	// Core's own built-in upward bias already contributes. Deliberately not a full ballistic solve —
+	// the bots aim through a slew with error on top, so a second decimal place of elevation would be
+	// noise, and the failure this fixes (every throw ploughing into the floor at range) is first
+	// order.
+	const float FlightTime = Distance / Speed;
+	const float Drop = 0.5f * GravityZ * FlightTime * FlightTime;
+	const float BiasLift = Speed * UpBias * FlightTime;
+
+	FVector AimPoint = WorldTarget;
+	AimPoint.Z += FMath::Max(0.f, Drop - BiasLift);
+	return AimPoint;
+}
+
+void ATraceBotController::UpdateThrow(float DeltaSeconds)
+{
+	UWorld* World = GetWorld();
+	ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (World == nullptr || BotCharacter == nullptr)
+	{
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const FTraceBotProfile& Profile = UTraceSettings::GetBotProfile();
+	const float Now = static_cast<float>(World->GetTimeSeconds());
+
+	// --- Cooldown --------------------------------------------------------------------------------
+	if (PassPhase == ETraceBotPassPhase::Cooldown)
+	{
+		if (Now >= PassCooldownUntilTime)
+		{
+			PassPhase = ETraceBotPassPhase::None;
+		}
+		return;
+	}
+
+	const FVector MyLocation = BotCharacter->GetActorLocation();
+
+	// --- Idle: is there anything worth throwing at? -----------------------------------------------
+	if (PassPhase == ETraceBotPassPhase::None)
+	{
+		if (Now < NextPassEvalTime)
+		{
+			return;
+		}
+		NextPassEvalTime = Now + FMath::Max(0.05f, Settings.BotPassEvalInterval);
+
+		const bool bUnderPressure = NearestEnemy.IsValid()
+			&& NearestEnemyDistSq < FMath::Square(FMath::Max(0.f, Settings.BotPassPressureRadius));
+
+		// --- 1. THE SHOT AT GOAL. --------------------------------------------------------------
+		//
+		// The reason mode B exists: "scoring should happen when the core is thrown into the goal".
+		// Taken when the goal is close enough to reach on a throw and roughly in front of the bot,
+		// because a throw across the bot's own shoulder is a throw its aim slew will spend a second
+		// lining up while a defender arrives.
+		bool bWantGoalShot = false;
+		FVector GoalCentre = FVector::ZeroVector;
+
+		if (ATraceCore::GetAttackGoalCentre(World, MyTeam, GoalCentre))
+		{
+			const float GoalDistance = static_cast<float>(FVector::Dist2D(MyLocation, GoalCentre));
+
+			// Range is a fraction of the pitch, not a constant, so this survives the map growing.
+			const float ShotRange = HalfFieldLength() * 0.55f;
+
+			FVector ToGoal = GoalCentre - MyLocation;
+			ToGoal.Z = 0.f;
+			const FVector Facing = BotCharacter->GetActorForwardVector().GetSafeNormal2D();
+			const float ConeCos = FMath::Cos(FMath::DegreesToRadians(TraceBotConstants::ThrowAtGoalConeDegrees));
+
+			const bool bInFront = !ToGoal.IsNearlyZero()
+				&& FVector::DotProduct(ToGoal.GetSafeNormal(), Facing) >= ConeCos;
+
+			if (GoalDistance <= ShotRange && (bInFront || bUnderPressure))
+			{
+				bWantGoalShot = true;
+				ThrowTargetPoint = GoalCentre;
+			}
+		}
+
+		if (bWantGoalShot)
+		{
+			bThrowAtGoal = true;
+			PassPhase = ETraceBotPassPhase::Lining;
+			PassReceiver = nullptr;
+			PassPhaseStartTime = Now;
+			return;
+		}
+
+		// --- 2. THE THROW TO A TEAMMATE. -------------------------------------------------------
+		//
+		// ChooseReceiver is the mode-A pass rule and it is reused verbatim: "an open teammate, in
+		// range, with line of sight, meaningfully further up the field". What differs is what happens
+		// next — the Core is thrown at them and ANYBODY may intercept it, which is the risk mode B
+		// substitutes for mode A's dropped shield.
+		float Advantage = 0.f;
+		ATraceCharacter* Receiver = ChooseReceiver(Advantage);
+
+		if (Receiver == nullptr)
+		{
+			// --- 3. THE CLEARANCE. -------------------------------------------------------------
+			//
+			// Nothing to throw at and enemies closing. Throwing it forward at nothing is still better
+			// than being killed holding it: a loose Core is contestable by our side too, whereas a
+			// kill hands it to the killer outright. This is also what stops a cornered mode-B carrier
+			// standing still until it dies, which was the first version's most visible failure.
+			if (bUnderPressure && FMath::FRand() < FMath::Clamp(Profile.PassChance, 0.f, 1.f))
+			{
+				const FVector Goal = GetAttackGoalLocation();
+				ThrowTargetPoint = FMath::Lerp(MyLocation, Goal, 0.5f);
+				bThrowAtGoal = false;
+				PassPhase = ETraceBotPassPhase::Lining;
+				PassReceiver = nullptr;
+				PassPhaseStartTime = Now;
+			}
+			return;
+		}
+
+		if (FMath::FRand() > FMath::Clamp(Profile.PassChance, 0.f, 1.f))
+		{
+			return;
+		}
+
+		bThrowAtGoal = false;
+		PassReceiver = Receiver;
+		ThrowTargetPoint = Receiver->GetActorLocation() + FVector(0.f, 0.f, Settings.BotAimBodyOffsetZ);
+		PassPhase = ETraceBotPassPhase::Lining;
+		PassPhaseStartTime = Now;
+		return;
+	}
+
+	// --- Lining up. There is no Holding phase in mode B: the throw fires and it is gone. ----------
+	if (PassPhase != ETraceBotPassPhase::Lining)
+	{
+		// A leftover Holding phase from a mid-match mode switch. Close it out cleanly.
+		AbortThrow(TEXT("stale phase after a mode change"));
+		return;
+	}
+
+	// A teammate throw tracks its receiver; a shot at goal and a clearance are aimed at fixed points.
+	if (!bThrowAtGoal && PassReceiver.IsValid())
+	{
+		ATraceCharacter* Receiver = PassReceiver.Get();
+		if (!Receiver->IsAlive())
+		{
+			AbortThrow(TEXT("receiver died"));
+			return;
+		}
+		ThrowTargetPoint = Receiver->GetActorLocation() + FVector(0.f, 0.f, Settings.BotAimBodyOffsetZ);
+	}
+
+	PassAimPoint = ComputeThrowAimPoint(ThrowTargetPoint);
+	bPassOwnsAim = true;
+
+	const FVector ViewLocation = BotCharacter->GetPawnViewLocation();
+	const FRotator DesiredRotation = (PassAimPoint - ViewLocation).Rotation();
+	const FRotator CurrentRotation = GetControlRotation();
+
+	const float AimErrorDegrees =
+		FMath::Abs(FRotator::NormalizeAxis(CurrentRotation.Yaw - DesiredRotation.Yaw)) +
+		FMath::Abs(FRotator::NormalizeAxis(CurrentRotation.Pitch - DesiredRotation.Pitch));
+
+	if (Now - PassPhaseStartTime > FMath::Max(0.1f, Settings.BotPassMaxLineUpSeconds))
+	{
+		TRACE_BOT_KIT(ThrowGiveUps);
+		AbortThrow(TEXT("throw line-up timed out"));
+		return;
+	}
+
+	// Deliberately the ANGULAR test, not ATraceCore::FindPassTargetFor. That function answers "who
+	// would a HOVER PASS go to", which is a question mode B does not ask: a throw goes wherever the
+	// bot is pointing and hits whatever it hits. Asking it here would refuse every shot at goal,
+	// because a goal mouth is not a legal pass target and never will be.
+	if (AimErrorDegrees > FMath::Max(0.5f, Settings.BotPassAimToleranceDegrees))
+	{
+		return;   // Still slewing. UpdateCombat honours bPassOwnsAim and drives the rotation.
+	}
+
+	// On the mouse1 binding the throw input IS the fire input; release the trigger first so the two
+	// do not fight, exactly as the hover pass does.
+	if (bTriggerHeld)
+	{
+		BotCharacter->DoFireReleased();
+		bTriggerHeld = false;
+	}
+
+	// THROW. ATraceCore::RequestPassInput routes a press to ThrowFromHolder in mode B, so this is
+	// the same entry point a human's mouse1 reaches — the bots do not have a private door.
+	ApplyPassInput(BotCharacter, true);
+	ApplyPassInput(BotCharacter, false);   // Instantaneous: nothing to hold.
+
+	TRACE_BOT_KIT(ThrowAttempts);
+	if (bThrowAtGoal)
+	{
+		TRACE_BOT_KIT(ThrowsAtGoal);
+	}
+	else if (PassReceiver.IsValid())
+	{
+		TRACE_BOT_KIT(ThrowsToTeammate);
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[BotThrow] %s threw at %s (%s), aim error %.1fdeg"),
+		*GetNameSafe(GetPlayerState<APlayerState>()),
+		bThrowAtGoal ? TEXT("the GOAL") : (PassReceiver.IsValid()
+			? *GetNameSafe(PassReceiver->GetPlayerState<APlayerState>()) : TEXT("open ground (clearance)")),
+		bThrowAtGoal ? TEXT("shot") : (PassReceiver.IsValid() ? TEXT("pass") : TEXT("clearance")),
+		AimErrorDegrees);
+
+	AbortThrow(nullptr);   // Not a failure: this is how the attempt is closed out and cooled down.
+}
+
+void ATraceBotController::AbortThrow(const TCHAR* Reason)
+{
+	const UWorld* World = GetWorld();
+	const float Now = (World != nullptr) ? static_cast<float>(World->GetTimeSeconds()) : 0.f;
+
+	// A throw never leaves the input latched — it is pressed and released in the same call — but a
+	// mode switch mid-hover-pass can, so release defensively rather than assuming.
+	if (bPassInputHeld)
+	{
+		if (ATraceCharacter* BotCharacter = GetBotCharacter())
+		{
+			ApplyPassInput(BotCharacter, false);
+		}
+		bPassInputHeld = false;
+	}
+
+	bPassOwnsAim = false;
+	bThrowAtGoal = false;
+	PassReceiver = nullptr;
+	PassPhase = ETraceBotPassPhase::Cooldown;
+	PassCooldownUntilTime = Now + FMath::Max(0.f, UTraceSettings::Get().BotPassCooldownSeconds);
+
+	if (Reason != nullptr)
+	{
+		UE_LOG(LogTraceGame, Verbose, TEXT("[BotThrow] %s aborted (%s)"),
+			*GetNameSafe(GetPlayerState<APlayerState>()), Reason);
+	}
+}
+
 void ATraceBotController::AbortPass(const TCHAR* Reason)
 {
 	UWorld* World = GetWorld();
@@ -2572,6 +3205,39 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 	// not writing the name.
 	const FVector BotVelocity = BotCharacter->GetVelocity();
 	const float PlanarSpeed = static_cast<float>(BotVelocity.Size2D());
+
+	// --- Cash a slide in as a SLIDE-JUMP ---------------------------------------------------------
+	//
+	// Spec v4 §1 makes the slide-jump the payoff move: with the flat momentum boost deleted, jumping
+	// out of a slide inside the timing window is the ONLY thing that makes sliding worth doing. A
+	// bot that slides but never slide-jumps therefore demonstrates the half of the mechanic that no
+	// longer pays, and the half that does pay is invisible in every 5v5 the user watches — which is
+	// the same as it being untestable.
+	//
+	// UTraceCharacterMovementComponent::IsSlideJumpWellTimed() is the movement code's own answer to
+	// "would a jump RIGHT NOW collect the bonus", read rather than re-derived here so the bot can
+	// never drift from the rule a human is being taught. It is a pure query over saved-move state.
+	//
+	// Ordered BEFORE the slide-end branch below on purpose: once that branch releases crouch the
+	// slide is over and the window is spent, so a bot checking afterwards would only ever jump out
+	// of slides it had already thrown away.
+	if (bCrouchHeld && bOnGround)
+	{
+		const UTraceCharacterMovementComponent* TraceMovement = Cast<UTraceCharacterMovementComponent>(Movement);
+		if (TraceMovement != nullptr && TraceMovement->IsSlideJumpWellTimed())
+		{
+			bWantsJumpThisTick = true;
+
+			// Release crouch on the same tick. ACharacter::Crouch() sets bWantsToCrouch, and the
+			// slide is driven through it, so leaving it held would have the bot re-enter a slide on
+			// the frame it lands instead of carrying the speed it just bought.
+			ApplyCrouchInput(BotCharacter, false);
+			bCrouchHeld = false;
+			SlideReadyTime = Now + FMath::Max(0.f, Settings.BotSlideCooldownSeconds);
+
+			TRACE_BOT_KIT(SlideJumps);
+		}
+	}
 
 	// --- End an in-progress slide ----------------------------------------------------------------
 	if (bCrouchHeld && bOnGround && Now >= SlideEndTime)
