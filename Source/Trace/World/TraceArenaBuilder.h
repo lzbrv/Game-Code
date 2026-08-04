@@ -32,26 +32,47 @@ class UStaticMeshComponent;
  * "Build Preview In Editor" in its Details panel to see the arena without pressing Play - the full
  * two-click workflow, and the reasons it cannot leak into a build, are documented on that function.
  *
- * WHAT IT MAKES
+ * WHAT IT MAKES  (spec v3 section 7 - rebuilt from the collaborator's overhead sketch)
  * -------------
- * A 24000 x 12000 uu Tron arena: a near-black glossy floor carrying a team-tinted neon grid, four
- * 2600 uu perimeter walls with lit trim and vertical ribs, a four-tier stepped centre dais with the
- * Core pedestal on top and four light pylons around it, four stepped wing platforms, two rows of
- * segmented lane rails that split the field into a central spine plus two lanes per side, a
- * scattering of diamond cover blocks, and a lit gate spanning the full width of each endzone (the
- * endzones run sideline to sideline - see EndzoneHalfWidth). Along both
- * flanks: a row of wall buttresses carrying a continuous high rail, a light bridge per quadrant out
- * to the lane pylons, bright outer-lane floor stripes and a pylon in each corner. Plus the gameplay
- * furniture: two ATraceEndzone triggers, five ATraceTeamPlayerStarts per team, the lighting rig
- * (three directional lights plus a 24-lamp floor lattice), height fog and an unbound post-process
- * volume.
+ * A 24000 x 9600 uu Tron arena - LENGTH : WIDTH = 2.5 : 1, which is the proportion the sketch asks
+ * for. Inside it:
+ *
+ *  - a near-black glossy floor carrying a team-tinted neon grid, and four 2600 uu perimeter walls
+ *    with lit trim, a kick rail and vertical ribs;
+ *  - a SHALLOW STADIUM BOWL: four terraced corner banks, one per quadrant, raised along the long
+ *    edges and stepping DOWN toward the flat central playfield. These are the sketch's green
+ *    arrows. Every riser is under MaxStepHeight so they are walkable from any direction and cannot
+ *    trap a bot that steers straight at its target (see BuildCornerBanks);
+ *  - a SMALL DIAMOND at the exact centre - a three-tier stepped platform carrying the Core
+ *    pedestal - ringed by four light pylons;
+ *  - a TALL 3.5x-player-height tower at top centre, standing on the dividing line;
+ *  - a scatter of cover boxes and long low bars at exactly 1x / 2x / 3.5x player height (176 / 352
+ *    / 616 uu), keyed to the character capsule via PlayerHeightUU();
+ *  - a lit gate spanning the full width of each endzone; the endzones themselves run sideline to
+ *    sideline - see EndzoneHalfWidth.
+ *
+ * Along both flanks: a row of wall buttresses carrying a continuous high rail, a light bridge per
+ * quadrant out to the lane pylons, bright lane floor stripes and a pylon in each endzone corner.
+ * Plus the gameplay furniture: two ATraceEndzone triggers, five ATraceTeamPlayerStarts per team,
+ * the lighting rig (three directional lights plus a 24-lamp floor lattice), height fog and an
+ * unbound post-process volume.
+ *
+ * MIRRORED HALVES, DELIBERATELY
+ * -----------------------------
+ * The hand sketch is not symmetric - the left half has a long horizontal bar and a diagonal, the
+ * right a vertical bar and a different scatter. This builder mirrors ONE half through the centre
+ * line instead, because the match plays two halves with a side switch (spec section 8) and an
+ * asymmetric field would hand one team the better half for ten minutes. Everything except the
+ * top-centre tower is mirrored in X; the tower sits ON the dividing line, so it belongs to neither
+ * half and mirroring leaves it where it is. If the asymmetry is ever wanted back, it is a per-spec
+ * XSign filter in BuildCoverField and nothing else.
  *
  * WHY IT IS THIS BIG
  * ------------------
  * The field was 8000 x 4000. At WalkSpeed 720 that is 11 seconds end to end and a point was over
- * before it started. 24000 x 12000 is 3x linear / 9x area: a full-field carry is ~33 seconds, so
- * the carrier actually has to survive a journey and the dash-through-the-trail counterplay gets
- * time to happen. Every derived number below is expressed as a fraction of the field, so changing
+ * before it started. 24000 long is 3x that: a full-field carry is ~33 seconds, so the carrier
+ * actually has to survive a journey and the dash-through-the-trail counterplay gets time to happen.
+ * Every derived number below is expressed as a fraction of the field, so changing
  * FieldLength/FieldWidth moves the whole layout coherently.
  *
  * ART DIRECTION - READ THIS BEFORE TOUCHING THE LIGHTING
@@ -214,16 +235,34 @@ public:
 	/**
 	 * Length of the field along X (goal to goal).
 	 *
-	 * The layout scales with this: rails, cover, wings and endzone gates are all placed at
-	 * fractions of the half length, so 24000 is a tuning value rather than a load-bearing constant.
-	 * Do not drop it below ~12000 or the centre dais and the two spawn lines start to overlap.
+	 * The layout scales with this: the cover scatter, the corner banks, the pylons and the endzone
+	 * gates are all placed at fractions of the half length, so 24000 is a tuning value rather than a
+	 * load-bearing constant. Do not drop it below ~12000 or the centre diamond and the two spawn
+	 * lines start to overlap.
+	 *
+	 * It is also HALF of the 2.5 : 1 proportion spec v3 section 7 asks for. Change this without
+	 * changing FieldWidth and the sketch's shape goes with it.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FieldLength = 24000.f;
 
-	/** Width of the field along Y (sideline to sideline). Layout scales with this too. */
+	/**
+	 * Width of the field along Y (sideline to sideline). Layout scales with this too.
+	 *
+	 * 12000 -> 9600 for spec v3 section 7: the collaborator's sketch is drawn at LENGTH : WIDTH =
+	 * 2.5 : 1, and the length is the dimension worth keeping (it is what makes a carry a journey).
+	 * The narrower field also pulls the flanks back into play - at 12000 the outer thirds were two
+	 * black voids that needed a whole subsystem of dressing to fill.
+	 *
+	 * EVERYTHING derived from this follows automatically: the endzone volumes and their triggers,
+	 * the spawn fan, GetFieldBounds() (which is what the bots steer inside and what the half-time
+	 * side switch measures against), the grid, the flanks and the corner banks. The one number that
+	 * does NOT live here and must be re-checked by hand is UTraceSettings::HitscanRange, which has
+	 * to clear the field diagonal: 24000 x 9600 is a 25849 uu diagonal against a 28000 uu range, so
+	 * it still clears with 2151 uu to spare.
+	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
-	float FieldWidth = 12000.f;
+	float FieldWidth = 9600.f;
 
 	/**
 	 * Wall height. Tall on purpose: on a 24000 uu field a 700 uu wall is a kerb, and the walls are
@@ -262,20 +301,58 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Trace|Grid")
 	int32 MaxGridLinesPerAxis = 51;
 
-	/** Master switch for the interior layout (dais, wings, rails, cover, gates). */
+	/** Master switch for the interior layout (centre diamond, cover scatter, gates). */
 	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
 	bool bBuildInteriorLayout = true;
+
+	// --- Corner banks (the sketch's green arrows) ------------------------------------------------
+	//
+	// Four terraced banks, one per quadrant, raised along the long edges and stepping DOWN toward
+	// the middle of the field. Read the sketch as a shallow stadium bowl: high at the corners,
+	// flat in the centre. See BuildCornerBanks for the shape and for why it is terraced rather
+	// than ramped.
+
+	/** Master switch for the four terraced corner banks. */
+	UPROPERTY(EditAnywhere, Category = "Trace|Banks")
+	bool bBuildCornerBanks = true;
+
+	/**
+	 * How far a bank reaches in from its sideline, i.e. the width of the sloped strip along Y.
+	 *
+	 * This is the number that decides how much FLAT playfield is left: the flat centre is
+	 * FieldWidth - 2 * BankDepth wide, so 1500 on a 9600 field leaves 6600 uu of flat ground -
+	 * still wider than the whole original 8000 x 4000 arena. Push it much past 2000 and the two
+	 * banks start eating the routes the cover scatter is built around.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Banks", meta = (ClampMin = "0.0"))
+	float BankDepth = 1500.f;
+
+	/**
+	 * Height of a bank at its highest terrace, i.e. how deep the bowl is.
+	 *
+	 * Defaults to 2x player height (352 uu) so it matches the sketch's mid-height structures: high
+	 * enough that standing on the bank is genuinely high ground and that a body behind it is
+	 * hidden, low enough that it never reads as a wall. The terrace count is derived from this so
+	 * that every riser stays under UCharacterMovementComponent::MaxStepHeight whatever it is set
+	 * to - see BuildCornerBanks.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Banks", meta = (ClampMin = "0.0"))
+	float BankHeight = 352.f;
 
 	/**
 	 * Master switch for the flank dressing: wall buttresses, the high rails they carry, the light
 	 * bridges out to the lane pylons, the outer-lane floor stripes and the corner pylons.
 	 *
-	 * WHY IT EXISTS. The field is 12000 uu wide and every route worth taking used to run down the
-	 * middle, so the outer thirds rendered as two black voids - one measured screenshot had an
-	 * entirely black left half. Empty space at this scale does not read as "arena", it reads as
-	 * "unfinished". Everything this builds is either flush against a side wall or above head height,
-	 * so it fills the void without narrowing the lanes or giving the navmesh-less bots a pocket to
-	 * grind in (see ATraceBotController).
+	 * WHY IT EXISTS. The field was 12000 uu wide and every route worth taking ran down the middle,
+	 * so the outer thirds rendered as two black voids - one measured screenshot had an entirely
+	 * black left half. Empty space at this scale does not read as "arena", it reads as "unfinished".
+	 * Everything this builds is either flush against a side wall or above head height, so it fills
+	 * the void without narrowing the lanes or giving the navmesh-less bots a pocket to grind in
+	 * (see ATraceBotController).
+	 *
+	 * Still worth keeping at 9600 wide, and still cheap: the corner banks now occupy the outer 1500
+	 * uu of each side, but they are ground, so they fill the BOTTOM of a flank frame and leave the
+	 * middle band - the part the high rail and the light bridges answer - exactly as empty as it was.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
 	bool bBuildFlankStructures = true;
@@ -411,8 +488,16 @@ protected:
 	void BuildFloorAndWalls(bool bBuildVisuals);
 	void BuildGrid();
 	void BuildCentreDais(bool bBuildVisuals);
-	void BuildWingPlatforms(bool bBuildVisuals);
-	void BuildLaneRails(bool bBuildVisuals);
+
+	/**
+	 * The four terraced corner banks - the sketch's green arrows, i.e. the shallow stadium bowl.
+	 *
+	 * REPLACED the four stepped wing platforms and the two rows of segmented lane rails. Those
+	 * existed to break up a 12000 uu wide field; at 9600 the banks do that job and do it as
+	 * TERRAIN, which is what the sketch actually draws.
+	 */
+	void BuildCornerBanks(bool bBuildVisuals);
+
 	void BuildCoverField(bool bBuildVisuals);
 	void BuildFlanks(bool bBuildVisuals);
 	void BuildEndzones(bool bBuildVisuals);
@@ -505,11 +590,18 @@ protected:
 	 *                      instance so the top lip stays the brightest line on the shape.
 	 * @param bVerticalTrim false suppresses the corner ribs for pieces where they read as clutter -
 	 *                      the nested tiers of a stepped platform and the horizontal gate beam.
+	 * @param bFaceBands    false ALSO suppresses the skirt and the mid band, leaving the top lip as
+	 *                      the only trim. That is what a terrace of the corner banks wants: the
+	 *                      terraces are nested, so a skirt on an inner terrace would be buried
+	 *                      inside the solid body of the one outside it, and a mid band would be a
+	 *                      second line 20 uu under the lip. One glowing contour per terrace reads as
+	 *                      a bank; three read as a pile of crates.
 	 */
 	void AddNeonBlock(const FVector& LocalCenter, const FVector& Size, float YawDegrees,
 		UMaterialInstanceDynamic* BodyMID, UMaterialInstanceDynamic* NeonMID,
 		bool bCollide, const TCHAR* DebugName,
-		UMaterialInstanceDynamic* FaceNeonMID = nullptr, bool bVerticalTrim = true);
+		UMaterialInstanceDynamic* FaceNeonMID = nullptr, bool bVerticalTrim = true,
+		bool bFaceBands = true);
 
 	/**
 	 * A pilaster standing flush against a perimeter wall: a dark body, a blocking box and one
@@ -557,7 +649,32 @@ protected:
 	float HalfLength() const { return FieldLength * 0.5f; }
 	float HalfWidth() const { return FieldWidth * 0.5f; }
 
-	/** Top of the centre dais, i.e. the surface the Core pedestal stands on. */
+	/**
+	 * ONE PLAYER HEIGHT, in uu, and the single source of every structure height in the arena.
+	 *
+	 * Spec v3 section 7 keys the sketch's three structure classes to the player: a green outline is
+	 * 1x, orange 2x and red 3.5x. Those are 176 / 352 / 616 uu today, but they are only correct
+	 * while the capsule is 88 uu half height - so this READS THE CAPSULE rather than hard-coding
+	 * 176. ATraceCharacter's class default object is asked for its capsule half height and doubled;
+	 * if the CDO cannot be reached (it always can, but the arena must never crash over art) it
+	 * falls back to the documented 176 and says so in the log.
+	 *
+	 * Consequence worth knowing: shrink the capsule and every cover block in the arena shrinks with
+	 * it, which is what "1x player height" is supposed to mean.
+	 */
+	float PlayerHeightUU() const;
+
+	/**
+	 * |Y| at which the corner banks start, i.e. the half width of the FLAT central playfield.
+	 *
+	 * Everything laid on the floor (the grid, the lane stripes) and every piece of cover has to
+	 * stay inside this or it would be built partly inside a bank - a floor decal buried under a
+	 * terrace, or a 176 uu block with its bottom step swallowed. Returns HalfWidth() outright when
+	 * the banks are switched off, so the same call site is correct either way.
+	 */
+	float BankInnerHalfWidth() const;
+
+	/** Top of the centre diamond, i.e. the surface the Core pedestal stands on. */
 	float DaisTopZ() const;
 
 	/**

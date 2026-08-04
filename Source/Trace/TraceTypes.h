@@ -36,17 +36,11 @@ enum class ETraceTeam : uint8
 	Orange = 2
 };
 
-/** Lifecycle of the single shared Core object. */
-UENUM(BlueprintType)
-enum class ECoreState : uint8
-{
-	/** On the ground (or resting), pickable by anyone. */
-	Loose    = 0,
-	/** Attached to a carrier. */
-	Carried  = 1,
-	/** Thrown/passed, travelling under projectile movement. */
-	InFlight = 2
-};
+// ECoreState IS DELETED. It described a physical Core that no longer exists: InFlight ("travelling
+// under projectile movement") was unreachable because nothing flies, and Loose was documented as "on
+// the ground, pickable by anyone" when there is no pickup at all. Its one holder, the replicated
+// ATraceCore::State, was written twice and read by nothing. "Holderless" is ATraceCore::Carrier
+// == nullptr, which is the fact every caller actually wanted.
 
 /** Who dies when an eligible player trips the carrier's trail. */
 UENUM(BlueprintType)

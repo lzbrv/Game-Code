@@ -15,7 +15,6 @@
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceHealthComponent.h"
 #include "Movement/TraceCharacterMovementComponent.h"
-#include "Settings/TraceGameplayCompat.h" // which of the new mechanics this build actually has
 #include "InputCoreTypes.h"               // EKeys::Escape, for the pause poll
 #include "Misc/CommandLine.h"
 #include "Misc/DateTime.h"
@@ -70,6 +69,21 @@ namespace TraceHUDStyle
 	 * moment an actual receiver is acquired.
 	 */
 	static constexpr float PassAnchorDefaultDistance = 1600.f;
+
+	/**
+	 * How much bigger the centre crosshair is drawn in third person than in first.
+	 *
+	 * Not a style flourish and not an arbitrary number. In third person the crosshair stops being the
+	 * gun's aim point and becomes the pointer a pass is aimed with, over a frame that now contains
+	 * the player's own body, their trail and a Core — and the previous build's crosshair was reported
+	 * MISSING there. At 1280x720 (UIScale 0.667) 1.0 gives a 22 px cross; 1.6 gives 37 px with 3 px
+	 * bars, which is unmistakable in a screenshot and still nowhere near obscuring a receiver.
+	 *
+	 * PROMOTED TO UTraceSettings::ThirdPersonCrosshairScale (Category "HUD") — this is the fallback
+	 * used only if the settings object is somehow unavailable, and it must stay equal to the shipped
+	 * default there. Read it through ThirdPersonCrosshairScaleSetting() below, never directly.
+	 */
+	static constexpr float ThirdPersonCrosshairScale = 1.6f;
 
 	/** Ease rates for the pass reticle: anchor distance (uu/s-ish) and the lock-on close. */
 	static constexpr float PassAnchorInterpSpeed = 6.f;
@@ -127,11 +141,30 @@ namespace TraceHUDStyle
 	{
 		return FLinearColor(C.R, C.G, C.B, Alpha);
 	}
+
+	/**
+	 * The live third-person crosshair scale, from Project Settings, clamped to the panel's own range.
+	 *
+	 * The ONE reader of UTraceSettings::ThirdPersonCrosshairScale. Going through here rather than
+	 * touching the setting at each use site is what makes it live-editable in PIE with no caching
+	 * seam, and the clamp keeps a hand-edited ini from producing a crosshair that covers the receiver
+	 * the player is trying to aim at.
+	 */
+	static float ThirdPersonCrosshairScaleSetting()
+	{
+		return FMath::Clamp(UTraceSettings::Get().ThirdPersonCrosshairScale, 1.f, 3.f);
+	}
 }
 
 void ATraceHUD::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// FIRST-RUN ART CHECK, before a single character has spawned. Cheap (a package-store lookup, no
+	// load) and idempotent, and it is what puts DrawArtWarning() on screen during warm-up rather than
+	// after the first pawn happens to be dressed. See ETraceCharacterArtStatus: a silent degrade to
+	// capsules is what produced the "the character models were not replaced" bug report.
+	ATraceCharacter::VerifyCharacterArtInstalled();
 
 #if !UE_BUILD_SHIPPING
 	TraceAutoShot::Arm(this, TEXT("Match"));
@@ -292,6 +325,10 @@ void ATraceHUD::DrawHUD()
 
 	DrawMatchResult();
 
+	// Outside the bPostMatch gate on purpose: a broken install is broken on the result screen too,
+	// and this is the one message that must not be possible to wait out.
+	DrawArtWarning();
+
 	// Last, over everything including the full-time takeover. A no-op while closed.
 	PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
 }
@@ -364,18 +401,97 @@ void ATraceHUD::LogAffordanceAvailabilityOnce()
 	}
 	bLoggedAffordances = true;
 
-	// Reports whether the ACCESSOR exists, not whether the mechanic is active right now — a pass is
-	// never in progress on the first frame, so asking GetPassProgress() would report 0 forever.
+	// These used to be compile-time SFINAE probes, back when the mechanics lived in slices that had
+	// not landed. They have landed and the shim is deleted, so these are now RUNTIME answers: what
+	// the HUD actually got when it asked, on this pawn, on this frame.
 	//
 	// Display, not Verbose, and deliberately so. Twice now this project has lost time to a mechanic
-	// declared dead when its only log line was suppressed. "boost=0" in the log the player already
-	// has is the whole diagnosis. Once the movement and character slices land, all three read 1.
+	// declared dead when its only log line was suppressed. "parry=0" in the log the player already
+	// has is the whole diagnosis. Boost is no longer listed: spec §1 deleted the feature.
+	float ParryRemaining = 0.f;
+	float ParryTotal = 0.f;
+	bool bParryActive = false;
+	const bool bHasParry = LocalChar->GetParryHudState(ParryRemaining, ParryTotal, bParryActive);
+
+	FTraceDashHudState DashState;
+	const bool bHasDash = TracePC->GetDashHudState(DashState);
+
+	// GetPassProgress() is negative when no pass is in progress, which is always true on the first
+	// frame — so this reports "the accessor answered", not "a pass is happening".
+	const bool bHasPass = (TracePC->GetPassProgress() >= -1.f);
+
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[HUD] Affordances: dashCharges=%d boost=%d passProgress=%d ")
-		TEXT("(0 = that gameplay slice has not landed its accessor yet; see Settings/TraceGameplayCompat.h)"),
-		TraceCompat::THasDashCharges<UTraceCharacterMovementComponent>::value ? 1 : 0,
-		TraceCompat::THasBoostCooldownRemaining<UTraceCharacterMovementComponent>::value ? 1 : 0,
-		TraceCompat::THasPassProgress<ATraceCharacter>::value ? 1 : 0);
+		TEXT("[HUD] Affordances: dashCharges=%d (%d/%d) passProgress=%d parry=%d ")
+		TEXT("(0 = the HUD asked and got nothing back; see Gameplay/TraceParry.h and ")
+		TEXT("ATracePlayerController's HUD data sources)"),
+		bHasDash ? 1 : 0, DashState.Charges, DashState.MaxCharges,
+		bHasPass ? 1 : 0,
+		bHasParry ? 1 : 0);
+}
+
+// -------------------------------------------------------------------------------------------
+// Missing character art
+// -------------------------------------------------------------------------------------------
+
+void ATraceHUD::DrawArtWarning()
+{
+	// THE FIX FOR A BUG REPORT, not decoration. The user asked for "default unreal engine human
+	// character models that have running animations, heads, and limbs" — which were already
+	// implemented and already working on the machine they were implemented on. What they were looking
+	// at was the FALLBACK: character art is gitignored by design (126 MB of binaries), so a clone that
+	// has not run Scripts/import-mannequin.sh silently draws capsules. The only evidence was one
+	// Warning line in a log nobody reads during a playtest.
+	//
+	// So the degrade stops being silent. This panel is up for the entire session, in every phase
+	// including the post-match screen, it names the exact command, and it cannot be dismissed —
+	// because the correct response to it is to run one command and relaunch, not to close it.
+	//
+	// It draws NOTHING in the normal case, and nothing under -TraceNoCharacterArt either: somebody
+	// deliberately exercising the fallback does not need to be nagged, and a warning that appears
+	// when nothing is wrong is a warning people learn to ignore.
+	FString Headline;
+	FString Detail;
+	if (!ATraceCharacter::GetCharacterArtWarning(Headline, Detail))
+	{
+		return;
+	}
+
+	const float PanelX = 40.f * UIScale;
+	const float PanelY = 18.f * UIScale;
+	const float PadX = 16.f * UIScale;
+	const float PadY = 10.f * UIScale;
+	const float LineGap = 4.f * UIScale;
+
+	// Headline in the MEDIUM font, not the small one. Measured at 1280x720 (UIScale 0.667) the
+	// small-font headline was a 6px-tall strip in the corner — technically present, which is exactly
+	// the failure mode this whole panel exists to correct. It has to be readable at a glance from
+	// across a desk.
+	// The headline is drawn at 1.35x the medium font. Measured at 1280x720 (UIScale 0.667) the
+	// original small-font headline was a 6px-tall strip in the corner — technically present, which is
+	// exactly the failure mode this panel exists to correct. The scale is capped by the space to the
+	// LEFT of the top score panel (which starts at reference x=700), so the two can never overlap.
+	const float HeadScale = UIScale * 1.35f;
+	const float HeadlineW = MeasureWidth(Headline, FontMedium, HeadScale);
+	const float DetailW = MeasureWidth(Detail, FontSmall, UIScale);
+	const float HeadlineH = MeasureHeight(Headline, FontMedium, HeadScale);
+	const float DetailH = MeasureHeight(Detail, FontSmall, UIScale);
+
+	const float PanelW = FMath::Max(HeadlineW, DetailW) + (PadX * 2.f);
+	const float PanelH = HeadlineH + DetailH + LineGap + (PadY * 2.f);
+
+	// Pulsed rather than static. A steady red box at the edge of the screen becomes furniture inside
+	// a minute; a slow 1 Hz pulse keeps catching the eye without ever obscuring anything, and it is
+	// also the difference between "this build has a red box in the corner" and "something is wrong".
+	const float Pulse = 0.5f + 0.5f * FMath::Sin(Now * UE_TWO_PI * 0.9f);
+
+	const FLinearColor Fill = FLinearColor(0.22f, 0.02f, 0.02f, 0.86f);
+	const FLinearColor Border = TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.55f + 0.45f * Pulse);
+	DrawPanel(PanelX, PanelY, PanelW, PanelH, Fill, Border);
+
+	DrawTextLeft(Headline, TraceHUDStyle::LerpColor(TraceHUDStyle::Danger, TraceHUDStyle::Ink, 0.35f + 0.35f * Pulse),
+		PanelX + PadX, PanelY + PadY, FontMedium, HeadScale);
+	DrawTextLeft(Detail, TraceHUDStyle::Ink,
+		PanelX + PadX, PanelY + PadY + HeadlineH + LineGap, FontSmall, UIScale);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -402,7 +518,16 @@ void ATraceHUD::UpdateReticleAnchor()
 
 	const float DeltaSeconds = (GetWorld() != nullptr) ? GetWorld()->GetDeltaSeconds() : 0.f;
 
-	if (!bLocalAlive || LocalChar == nullptr || Canvas == nullptr || ViewBlend <= 0.02f)
+	// GATED ON CARRYING, NOT ON THE CAMERA BLEND. This used to early-out on `ViewBlend <= 0.02f`,
+	// which is a bug with a measurable cost: ViewBlend starts at 0 the instant you receive the Core
+	// and takes ~0.35 s to ease in, so NO pass affordance was computed at all for the first ~20
+	// frames of every single carry — precisely the frames in which a player who caught a pass is
+	// looking for who to send it to next. That is one of the mechanisms behind "sometimes the pass
+	// option doesn't show up" (spec §4.1).
+	//
+	// ViewBlend still gates the VISUALS below, which is what it is for: the third-person reticle
+	// should fade in with the camera. It must never gate the query.
+	if (!bLocalAlive || LocalChar == nullptr || Canvas == nullptr || (!bLocalCarrying && ViewBlend <= 0.02f))
 	{
 		HoveredPassTarget = nullptr;
 		LastLoggedPassTarget = nullptr;   // so the next carry announces its first receiver again
@@ -514,38 +639,69 @@ void ATraceHUD::UpdateReticleAnchor()
 
 void ATraceHUD::DrawCrosshair()
 {
-	// A CROSSHAIR IN BOTH CAMERA MODES, and they are two different instruments.
+	// ============================================================================================
+	// "THERE'S STILL NO CROSSHAIR IN THIRD PERSON." — reported twice. Read this before changing it.
+	// ============================================================================================
 	//
-	// First person is the shooting view: the reticle is the single most important pixel on the
-	// screen, a literal promise about where the bullet goes, and it is unchanged from the version
-	// that measured aimErr 0.0000 deg.
+	// The previous version CROSS-FADED the first-person cross out and the third-person pass brackets
+	// in, and anchored those brackets on the projected pass ray, which in third person sits about
+	// 30 px BELOW screen centre. Every individual decision there was defensible and the net result
+	// was still a bug report: the player looks at the middle of the screen, finds nothing there, and
+	// concludes there is no crosshair. They were right — there was nothing at the centre.
 	//
-	// Third person is the CARRYING view, and the carrier has no gun (contract §3) — but mouse1 is
-	// not idle there either. Spec §4 makes it the PASS button, held for 0.5s while hovering a
-	// teammate, so the carrier is still aiming at a target with the mouse and still needs to know
-	// what is under the pointer. The reticle therefore does not disappear when the camera pulls
-	// back; it CHANGES JOB, from "where the bullet goes" to "who catches the Core", and changes
-	// shape to say so.
+	// The rule now, and it is not negotiable without another bug report:
 	//
-	// Both fade with the camera blend rather than with the carrier bool, so a pick-up cross-fades
-	// one instrument into the other over the 0.35s the camera is travelling.
+	//   THERE IS ALWAYS A CROSSHAIR AT THE EXACT CENTRE OF THE SCREEN, IN BOTH CAMERA MODES.
+	//
+	// The pass state is LAYERED ON TOP of it — brackets that close around it, a colour change, a
+	// caption — instead of replacing it. Three layers, back to front:
+	//
+	//   1. the centre crosshair          — always, both modes, never fades below full strength;
+	//   2. the pass brackets             — third person only, CONCENTRIC with the centre crosshair,
+	//                                      so the closing bracket reads as the same instrument
+	//                                      changing state rather than as a second one appearing;
+	//   3. the pass-point marker         — a small diamond at the actual projected pass ray, which
+	//                                      is what keeps the reticle honest: the Core leaves along
+	//                                      that ray, not along the screen centre, and in third
+	//                                      person those are genuinely different pixels. It is a
+	//                                      SUBORDINATE mark on a receiver, not the crosshair.
+	//
+	// What changes with the camera blend is now only the crosshair's SIZE and COLOUR, never its
+	// presence and never its position.
 	if (!bLocalAlive)
 	{
 		return;
 	}
 
-	const float FirstPersonVisibility = 1.f - ViewBlend;
-	if (FirstPersonVisibility > 0.02f)
+	// Screen centre, integer-snapped. Not ReticleX/ReticleY — that is the pass anchor, and using it
+	// here is exactly what moved the crosshair off centre and produced the bug report.
+	const float CX = FMath::RoundToFloat(ViewW * 0.5f);
+	const float CY = FMath::RoundToFloat(ViewH * 0.5f);
+
+	// Third person is the CARRYING view: no gun (contract §3), so the crosshair stops being a promise
+	// about a bullet and becomes the pointer the pass is aimed with. It grows, because it is now the
+	// only thing on screen doing that job and it has to survive a busy third-person frame, and it
+	// takes the team colour once a receiver is under it.
+	const float Scale = FMath::Lerp(1.f, TraceHUDStyle::ThirdPersonCrosshairScaleSetting(), ViewBlend);
+
+	FLinearColor CrosshairInk = FLinearColor(1.f, 1.f, 1.f, 0.94f);
+	if (ViewBlend > 0.02f && PassLockAlpha > 0.f)
 	{
-		DrawAimReticle(ReticleX, ReticleY, FirstPersonVisibility);
+		// Only ever a LIFT toward the team colour, never a fade to it: a colour-blind player, or one
+		// looking at a cyan wall, still has the white core and the shape.
+		CrosshairInk = TraceHUDStyle::LerpColor(CrosshairInk,
+			TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.45f), PassLockAlpha * ViewBlend);
 	}
+
+	DrawAimReticle(CX, CY, /*Visibility=*/1.f, Scale, CrosshairInk);
+
 	if (ViewBlend > 0.02f)
 	{
 		DrawPassReticle(ViewBlend);
 	}
 }
 
-void ATraceHUD::DrawAimReticle(float CX, float CY, float Visibility)
+void ATraceHUD::DrawAimReticle(float CX, float CY, float Visibility, float Scale, const FLinearColor& InkColor)
 {
 	// In first person the weapon fires from GetPawnViewLocation() along the control rotation, which
 	// projects to exactly the centre of the viewport, so this reticle is a literal promise about
@@ -572,15 +728,20 @@ void ATraceHUD::DrawAimReticle(float CX, float CY, float Visibility)
 	// crosshair had been drawn at all, because against a lit cyan surface (193, 252, 253) a single
 	// white pixel with a single 55%-black neighbour is nothing. In first person this reticle is the
 	// aim point, so the minimums below are what it may never shrink past, whatever the resolution.
-	const float T   = FMath::Max(2.f, FMath::RoundToFloat(2.5f * UIScale));
-	const float Arm = FMath::Max(6.f, FMath::RoundToFloat(11.f * UIScale));
-	const float Gap = FMath::Max(3.f, FMath::RoundToFloat(5.f  * UIScale));
+	//
+	// @param Scale     1.0 in first person; larger in third person, where this is the pass pointer
+	//                  rather than the gun's aim point and has to hold its own in a busier frame.
+	// @param InkColor  the fill; alpha is multiplied by Visibility, so callers pass an opaque colour.
+	const float S   = FMath::Max(0.5f, Scale);
+	const float T   = FMath::Max(2.f, FMath::RoundToFloat(2.5f * UIScale * S));
+	const float Arm = FMath::Max(6.f, FMath::RoundToFloat(11.f * UIScale * S));
+	const float Gap = FMath::Max(3.f, FMath::RoundToFloat(5.f  * UIScale * S));
 
 	// Half a bar, floored, so the bar's own pixels straddle the centre symmetrically for odd T and
 	// sit flush against it for even T. Both are exact; neither is a half-pixel.
 	const float Half = FMath::FloorToFloat(T * 0.5f);
 
-	const FLinearColor Ink    = FLinearColor(1.f, 1.f, 1.f, 0.92f * Visibility);
+	const FLinearColor Ink    = TraceHUDStyle::WithAlpha(InkColor, InkColor.A * Visibility);
 	// A one-pixel dark surround. The arena is black floor plus saturated cyan and amber neon, and a
 	// plain white reticle disappears the moment it crosses a lit edge or a bright trail. The
 	// outline costs nothing and makes the aim point unconditionally readable — but only if it is
@@ -609,24 +770,35 @@ void ATraceHUD::DrawAimReticle(float CX, float CY, float Visibility)
 
 void ATraceHUD::DrawPassReticle(float Visibility)
 {
-	// A DIFFERENT SHAPE, on purpose. The two reticles mean two different things and the player must
-	// never have to look twice to know which one is on screen: the aim reticle is a cross whose
-	// centre is a point, this is a frame whose centre is a TARGET. A cross would also read as "you
-	// can shoot", which is the one thing a carrier cannot do.
+	// A LAYER ON THE CROSSHAIR, not a replacement for it (see DrawCrosshair). The brackets are drawn
+	// CONCENTRIC with the centre crosshair so the two read as one instrument in two states, and the
+	// only thing that ever sits away from the centre is the small pass-point marker at the end of
+	// this function.
 	//
 	// Everything below is integer-snapped for the same reason the aim reticle is: at 720p a
 	// fractional rect is a grey smudge, and a smudged reticle is what "blurry" looks like.
 	const float T = FMath::Max(2.f, FMath::RoundToFloat(2.5f * UIScale));
-	const float Half = FMath::FloorToFloat(T * 0.5f);
-	const float Len = FMath::Max(5.f, FMath::RoundToFloat(9.f * UIScale));
+	const float Len = FMath::Max(6.f, FMath::RoundToFloat(11.f * UIScale));
 
 	// The brackets CLOSE when a receiver is acquired. Motion is what the eye catches; a colour swap
 	// alone can be missed in the middle of a chase, and one that could only be seen by its colour
 	// would be invisible to a colour-blind player.
-	const float Radius = FMath::RoundToFloat(FMath::Lerp(24.f, 15.f, PassLockAlpha) * UIScale);
+	//
+	// The OPEN radius must CLEAR the enlarged third-person crosshair so the brackets frame the cross
+	// instead of colliding with it, and the closed radius must stop just outside it.
+	//
+	// DERIVED from the crosshair's own arm reach, not a matching pair of literals. The scale is a
+	// live setting now (UTraceSettings::ThirdPersonCrosshairScale, 1.0-3.0), and hardcoded 40/30
+	// against a 1.6 crosshair would have the brackets drawn straight through the cross the moment
+	// anyone raised it — a knob that visibly breaks the UI at the top of its own clamp is not a knob.
+	// The cross's arms reach (5 + 11) * UIScale * Scale; the constants below are the clearances.
+	const float ArmReach = (5.f + 11.f) * UIScale * TraceHUDStyle::ThirdPersonCrosshairScaleSetting();
+	const float OpenRadius = ArmReach + (14.f * UIScale);
+	const float ClosedRadius = ArmReach + (4.f * UIScale);
+	const float Radius = FMath::RoundToFloat(FMath::Lerp(OpenRadius, ClosedRadius, PassLockAlpha));
 
-	const float X = ReticleX;
-	const float Y = ReticleY;
+	const float X = FMath::RoundToFloat(ViewW * 0.5f);
+	const float Y = FMath::RoundToFloat(ViewH * 0.5f);
 
 	const bool bLocked = HoveredPassTarget.IsValid();
 
@@ -662,7 +834,10 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 	const float Y1 = Y + Radius - T;
 	const float Tail = Len - T;               // where a right/bottom arm starts so it ENDS on the edge
 
-	const float Bars[9][4] =
+	// NO CENTRE DOT HERE. The centre belongs to the crosshair this is layered over — drawing a second
+	// dot on the same pixel is how two elements that are meant to read as one instrument end up
+	// looking like two.
+	const float Bars[8][4] =
 	{
 		{ X0,        Y0,        Len, T   },   // top-left, horizontal
 		{ X0,        Y0,        T,   Len },   // top-left, vertical
@@ -672,7 +847,6 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 		{ X0,        Y1 - Tail, T,   Len },   // bottom-left, vertical
 		{ X1 - Tail, Y1,        Len, T   },   // bottom-right, horizontal
 		{ X1,        Y1 - Tail, T,   Len },   // bottom-right, vertical
-		{ X - Half,  Y - Half,  T,   T   },   // centre dot: the exact point the pass is aimed at
 	};
 
 	for (const float* B : Bars)
@@ -682,6 +856,41 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 	for (const float* B : Bars)
 	{
 		DrawRect(Ink, B[0], B[1], B[2], B[3]);
+	}
+
+	// ---- The pass-point marker -------------------------------------------------------------------
+	//
+	// THE HONESTY LAYER, and the reason the old code put the whole reticle down here. A pass is aimed
+	// from GetPawnViewLocation() along the control rotation. In first person the camera sits ON that
+	// ray so it projects to screen centre; in third person the camera is 450 uu behind it, the ray
+	// projects to a LINE, and screen centre is only that line's vanishing point — every finite pass
+	// distance lands below it (~30 px at 720p for a typical 16 m pass).
+	//
+	// So the centre crosshair is where you POINT and this diamond is where the Core actually goes.
+	// It is deliberately small and subordinate: it marks a receiver, it is not the crosshair, and
+	// making it the crosshair is precisely the mistake that got reported as "there is no crosshair".
+	// Suppressed when it would sit on top of the centre anyway (first-person-ish blends, a receiver
+	// near the vanishing point), where two marks on one spot would just look like a smudge.
+	const float MarkerDX = ReticleX - X;
+	const float MarkerDY = ReticleY - Y;
+	if ((MarkerDX * MarkerDX + MarkerDY * MarkerDY) > FMath::Square(10.f * UIScale))
+	{
+		const float D = FMath::Max(3.f, FMath::RoundToFloat(5.f * UIScale));   // half-diagonal, in px
+		const float MX = ReticleX;
+		const float MY = ReticleY;
+
+		// A diamond as a stack of horizontal integer rows: axis-aligned rects again, so it stays
+		// unblurred at any resolution, and a shape no other HUD element uses.
+		for (float Row = -D; Row <= D; Row += 1.f)
+		{
+			const float HalfWidth = D - FMath::Abs(Row);
+			DrawRect(Shadow, MX - HalfWidth - 1.f, MY + Row, (HalfWidth * 2.f) + 3.f, 1.f);
+		}
+		for (float Row = -D; Row <= D; Row += 1.f)
+		{
+			const float HalfWidth = D - FMath::Abs(Row);
+			DrawRect(Ink, MX - HalfWidth, MY + Row, (HalfWidth * 2.f) + 1.f, 1.f);
+		}
 	}
 
 	// ---- Caption ---------------------------------------------------------------------------------
@@ -742,13 +951,20 @@ void ATraceHUD::DrawPassProgress()
 		return;
 	}
 
-	// The ring closes around the RETICLE, not around screen centre. In third person — which is the
-	// only view a pass is ever made from — those are not the same pixel (see UpdateReticleAnchor),
-	// and a progress ring that is not concentric with the thing it is the progress of reads as two
-	// unrelated pieces of UI.
-	const float CX = ReticleX;
-	const float CY = ReticleY;
-	const float Radius = 34.f * UIScale;
+	// The ring closes around the CENTRE CROSSHAIR, because that is now where the crosshair always is
+	// (see DrawCrosshair) and a progress ring that is not concentric with the thing it is the
+	// progress of reads as two unrelated pieces of UI. It used to close around the pass anchor, back
+	// when the anchor was the reticle; that whole arrangement is what produced "there is no
+	// crosshair in third person".
+	const float CX = FMath::RoundToFloat(ViewW * 0.5f);
+	const float CY = FMath::RoundToFloat(ViewH * 0.5f);
+
+	// Outside the open bracket radius, so the ring frames the brackets rather than cutting through
+	// them. Derived from the same crosshair arm reach DrawPassReticle() uses, for the same reason:
+	// ThirdPersonCrosshairScale is a live setting, and a ring pinned to a literal would be sliced by
+	// the brackets as soon as anyone raised it. Clearance is 8 px beyond the open bracket radius.
+	const float ArmReach = (5.f + 11.f) * UIScale * TraceHUDStyle::ThirdPersonCrosshairScaleSetting();
+	const float Radius = ArmReach + (22.f * UIScale);
 	const float Thickness = FMath::Max(2.f, 3.f * UIScale);
 
 	// Canvas has no arc primitive, so the ring is a fan of short chords. 48 segments is smooth at any
@@ -876,39 +1092,48 @@ void ATraceHUD::DrawHealthAndDash()
 
 	const float HealthY = ViewH - Margin - HealthH;
 
-	// The ability stack grows UPWARDS from the health bar, so adding boost does not move health — the
+	// The ability stack grows UPWARDS from the health bar, so adding a row does not move health — the
 	// one element a player finds by muscle memory rather than by reading.
 	float RowY = HealthY - (14.f * UIScale) - RowH;
 
 	const FLinearColor TeamTint = TraceTeamColor(LocalTeam);
 
-	// ---- Boost (spec §5: ground-only super-jump, 12s) ---------------------------------------
+	// ---- Parry (spec §3), where BOOST used to be ------------------------------------------------
 	//
-	// Drawn only when the movement component actually has a boost cooldown to report. A meter that
-	// is permanently full is worse than no meter: it teaches the player that the row means nothing.
+	// BOOST IS DELETED (spec §1: "remove boost from the game entirely"), and its row is gone with it,
+	// including the GetBoostHudState() call that fed it — leaving that call here would have broken
+	// the build the moment the movement slice removed the accessor.
+	//
+	// The ability stack keeps its shape because parry inherits the slot: a carrier-only, cooldown-
+	// gated key on the same stack as dash. Drawn only when the mechanic actually reports state (see
+	// ATraceCharacter::GetParryHudState) and only for the CARRIER, since a non-carrier pressing parry
+	// does nothing at all and a meter for a key that does nothing is worse than no meter.
+	if (bLocalCarrying)
 	{
-		float BoostRemaining = 0.f;
-		float BoostTotal = 0.f;
-		if (TracePC->GetBoostHudState(BoostRemaining, BoostTotal))
+		float ParryRemaining = 0.f;
+		float ParryTotal = 0.f;
+		bool bParryActive = false;
+		if (LocalChar->GetParryHudState(ParryRemaining, ParryTotal, bParryActive))
 		{
-			const float Charge = FMath::Clamp(1.f - (BoostRemaining / FMath::Max(TraceHUDStyle::TimeEpsilon, BoostTotal)), 0.f, 1.f);
-			const bool bReady = (BoostRemaining <= TraceHUDStyle::TimeEpsilon);
+			const float Charge = FMath::Clamp(1.f - (ParryRemaining / FMath::Max(TraceHUDStyle::TimeEpsilon, ParryTotal)), 0.f, 1.f);
+			const bool bReady = (ParryRemaining <= TraceHUDStyle::TimeEpsilon);
 
-			const FString Label(TEXT("BOOST"));
+			const FString Label(TEXT("PARRY"));
 			DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 				Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
-			// Amber rather than the team tint: boost is a movement cost the player spends, and giving
-			// it its own hue stops the two meters reading as one two-line bar.
-			const FLinearColor BoostColor = bReady
-				? FLinearColor(1.00f, 0.72f, 0.28f, 1.f)
-				: FLinearColor(0.42f, 0.30f, 0.12f, 1.f);
+			// RED while the 0.1s window is open, matching the red the whole trace turns (spec §3), so
+			// the meter and the world are saying the same thing at the same moment. Otherwise its own
+			// hue, so the stack does not read as one three-line bar.
+			const FLinearColor ParryColor = bParryActive
+				? TraceHUDStyle::Danger
+				: (bReady ? FLinearColor(0.95f, 0.35f, 0.30f, 1.f) : FLinearColor(0.38f, 0.16f, 0.14f, 1.f));
 
-			DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, Charge, BoostColor);
+			DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bParryActive ? 1.f : Charge, ParryColor);
 
-			if (!bReady)
+			if (!bReady && !bParryActive)
 			{
-				const FString CountdownText = FString::Printf(TEXT("%.1f"), BoostRemaining);
+				const FString CountdownText = FString::Printf(TEXT("%.1f"), ParryRemaining);
 				DrawTextLeft(CountdownText, TraceHUDStyle::InkDim,
 					Margin + BarW + (10.f * UIScale),
 					VCenterTextY(CountdownText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);

@@ -248,6 +248,41 @@ text file, so a tuning change reviews as a one-line diff.
 
 The full annotated list of what each value does is in [DESIGN.md §2](DESIGN.md#2-tunables--utracesettings).
 
+The **Trace Gameplay** page is organised into these categories: **Match**, **Combat**,
+**Movement | Walk / Air / Landing / Dash / Slide**, **Core** and **Core | Pass**, **Parry**,
+**HUD**, **Trail**, **Bots** (with `Difficulty`, `Intercept`, `Positioning`, `Targeting`, `Passing`,
+`HoverPass`, `Punish`, `Aim` and `Movement` sub-groups) and **Net**.
+
+Three knobs landed at integration, each replacing a hardcoded constant that this project's rules
+forbid: **Parry** now owns `ParryDuration`, `ParryCooldown`, `ParryTintColor` and `ParryGlowScale`
+(`Gameplay/TraceParry.cpp` reads them and nothing else may); **HUD** owns
+`ThirdPersonCrosshairScale`; and **Bots | Movement** owns `BotStuckJumpSeconds`, the stuck-recovery
+timer that inherited the deleted boost's one useful job.
+
+**Everything on this page is read by something.** That is a rule, not a description, and it is
+enforced by grep at integration in both directions — every `config` property has a reader, and every
+reader names a property that exists. Eighteen knobs were deleted this pass precisely because they
+were not:
+
+- the whole `Movement | Boost` category, plus its two bot mirrors — boost no longer exists;
+- five `Core` values describing a thrown, catchable Core that the hover pass replaced
+  (`PassSpeed`, `PassUpwardBias`, `PickupRadius`, `PickupLockoutAfterThrow`, `CoreResetTime`);
+- the seven-scalar `Bots | Legacy` block, superseded by the difficulty profiles;
+- `BotPassSafeRadius`, which duplicated `BotPunishRange`;
+- `MatchDuration`, `SpreadDegrees` and `LookSensitivity`.
+
+A slider that silently does nothing is worse than no slider. If you find one, delete it or wire it —
+do not fold it under `AdvancedDisplay` and hope. The check is one grep: every `config` property in
+`TraceSettings.h` should appear as a `Settings.<Name>` or `Get().<Name>` read somewhere in
+`Source/`.
+
+If you would rather read the values back than trust the panel, `Trace.DumpSettings` in the console
+logs what `UTraceSettings::Get()` is returning **right now** — movement, air and landing, slide,
+pass, parry, trail — plus every live pawn's engine-owned `MaxWalkSpeed`, which is the one family of
+values that is a copy and could therefore disagree with the table. `Trace.LiveEditTest <delay>
+<PropertyName> <value>` drives the exact code path the details panel drives, after a delay, so an
+unattended run can prove that live editing works mid-match.
+
 ### Changes apply live during Play-In-Editor
 
 You do not have to stop PIE, change a number and start again. **Start a PIE session, leave it
@@ -256,10 +291,13 @@ running, open Project Settings, and drag a value — the running game picks it u
 That works because of a rule the codebase follows deliberately: nothing caches a gameplay constant.
 Every use site calls `UTraceSettings::Get()` (which returns the class default object the settings UI
 is editing) at the moment it needs the value, rather than copying it into a member in a constructor.
-The one unavoidable exception is `MaxWalkSpeed`, which the engine's movement component owns and
-reads internally — so `UTraceCharacterMovementComponent` re-pushes it from the settings at the top
-of every movement update (`RefreshWalkSpeedFromSettings()`). Without that, retuning `WalkSpeed`
-during PIE did nothing until the map reloaded.
+The unavoidable exceptions are the handful of values the **engine** owns a copy of and reads
+internally — `MaxWalkSpeed`, `MaxWalkSpeedCrouched` and `AirControl` — so
+`UTraceCharacterMovementComponent` re-pushes them from the settings on every simulated move
+(`RefreshEngineTunablesFromSettings()`). Without that, retuning `WalkSpeed` during PIE did nothing
+until the map reloaded. `UTraceSettings::ApplyLiveMovementTuning()` does the same job from the other
+end, on every property edit, which additionally reaches pawns whose movement is not currently
+simulating — precisely the state a paused-PIE tuning session leaves them in.
 
 Two caveats:
 

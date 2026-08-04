@@ -69,7 +69,7 @@ struct FTraceDashHudState
  *   Fire        bool     LMB           (doubles as "put me back in" while dead)
  *   Pass        bool     RMB
  *   Dash        bool     Left Shift
- *   Boost       bool     E
+ *   Parry       bool     Q             (carrier only — 0.1s of trace invulnerability, spec v3 §3)
  *   Scoreboard  bool     Tab           (held)
  */
 UCLASS()
@@ -169,20 +169,15 @@ public:
 	// -----------------------------------------------------------------------------------------
 	// HUD data sources for mechanics owned by other slices.
 	//
-	// These exist so ATraceHUD never has to know whether dash charges, boost or the pass hold have
-	// landed yet. See Settings/TraceGameplayCompat.h: each one resolves to the real accessor when
-	// the gameplay slice provides it and to a documented fallback when it does not, so the HUD can
-	// ship its affordances now and light them up automatically.
+	// These exist so ATraceHUD never has to poll the movement component itself. They used to route
+	// through a SFINAE compat header while the movement/character slices were still landing; those
+	// slices have landed, so these now call the real accessors directly. A missing accessor is a
+	// compile error again, which is the point — the shim's silent `false` was how a dead mechanic
+	// could look exactly like a working one.
 	// -----------------------------------------------------------------------------------------
 
 	/** False when there is no living pawn to describe. */
 	bool GetDashHudState(FTraceDashHudState& OutState) const;
-
-	/**
-	 * Boost cooldown, in seconds. Returns false while the boost mechanic does not exist, which is
-	 * how the HUD knows to omit the row entirely rather than draw a meter that never moves.
-	 */
-	bool GetBoostHudState(float& OutRemaining, float& OutTotal) const;
 
 	/** 0..1 through the 0.5s pass hold; negative when no pass is in progress. */
 	float GetPassProgress() const;
@@ -210,7 +205,7 @@ public:
 	int32 DebugDashCount = 0;
 	int32 DebugScoreboardCount = 0;
 	int32 DebugCrouchCount = 0;
-	int32 DebugBoostCount = 0;
+	int32 DebugParryCount = 0;
 	/** Bumped by ClientNotifyHit — a server-confirmed hitscan resolution credited to us. */
 	int32 DebugHitConfirmCount = 0;
 
@@ -249,9 +244,10 @@ private:
 	static constexpr uint8 FirstEvent_Dash       = 1 << 5;
 	static constexpr uint8 FirstEvent_Scoreboard = 1 << 6;
 	static constexpr uint8 FirstEvent_Crouch     = 1 << 7;
-	// Boost deliberately has no bit: the mask is a uint8 and is full. Boost is the newest action and
-	// the least likely to be the one somebody is debugging; widening the mask for it would be the
-	// wrong trade against the "seven lines a session" budget the mechanism is built around.
+	// Parry deliberately has no bit: the mask is a uint8 and is full. Parry is the newest action, and
+	// unlike the others it has a loud diagnosis of its own — Trace.DebugParry reports the refusal
+	// reason for every attempt — so it is the one action whose "did my key do anything?" question is
+	// already answerable without widening the mask.
 
 public:
 
@@ -289,7 +285,7 @@ protected:
 	TObjectPtr<UInputAction> IA_Crouch;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UInputAction> IA_Boost;
+	TObjectPtr<UInputAction> IA_Parry;
 
 	/**
 	 * Builds InputMapping and every IA_* exactly once, then lays down the key mappings.
@@ -325,7 +321,15 @@ protected:
 	/** Release edge of the held hover pass (spec §4). Must fire even when input is suppressed. */
 	void OnPassCompleted();
 	void OnDashStarted();
-	void OnBoostStarted();
+	/** Press edge of the parry (spec v3 §3). Carrier-only; the refusal lives in TraceParry. */
+	void OnParryStarted();
+	/**
+	 * Release edge. Parry is a tap, not a hold, so this does nothing — but it is bound anyway, and
+	 * Canceled with it, so every button in this class has the same Started/Completed/Canceled shape.
+	 * That symmetry is what fixed the pass-input latch; an action bound on Started alone is how a
+	 * held-key bug gets reintroduced the day somebody makes the window hold-to-extend.
+	 */
+	void OnParryCompleted();
 	void OnCrouchStarted();
 	void OnCrouchCompleted();
 	void OnScoreboardStarted();

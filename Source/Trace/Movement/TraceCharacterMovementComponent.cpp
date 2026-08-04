@@ -1,5 +1,10 @@
-// Trace — the client-predicted movement kit: dash (charged), slide, air fast-fall, boost.
+// Trace — the client-predicted movement kit: dash (charged), slide, air fast-fall, and the
+// Source/Apex momentum model (air acceleration, landing carry, momentum-preserving transitions).
 // See the header for the full prediction model and the design rationale.
+//
+// BOOST HAS BEEN DELETED (spec v3 §1). Not disabled, not defaulted to zero — removed. If you are
+// reading this because a merge resurrected `bWantsToBoost`, `BoostCooldownRemaining`, `BeginBoost`
+// or FLAG_Custom_1, delete it again.
 
 #include "Movement/TraceCharacterMovementComponent.h"
 
@@ -12,11 +17,23 @@
 #include "TraceSettings.h"
 
 #if !UE_BUILD_SHIPPING
-#include "GameFramework/PlayerController.h"    // self-test: player-controlled check
+#include "GameFramework/PlayerController.h"    // measurement harness: player-controlled check
 #include "HAL/IConsoleManager.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #endif
+
+// Every number this file runs on is a live UTraceSettings property, read at the point of use. There
+// is deliberately NO detection shim: the spec v3 §2 knobs (Movement|Air, Movement|Landing, the slide
+// entry/impulse/cooldown block, DashExitSpeedMultiplier) are real properties now, and a shim would
+// only serve to swallow a rename and silently substitute a hardcoded default for the designer's
+// value instead of failing the build.
+
+namespace TraceMoveCfg
+{
+	/** Below this the pawn is treated as having no horizontal motion at all. */
+	constexpr float SpeedEpsilon = 1.f;
+}
 
 namespace TraceMovement
 {
@@ -50,16 +67,6 @@ namespace TraceMovement
 		return Result.GetSafeNormal(UE_SMALL_NUMBER, Current);
 	}
 }
-
-// The four slide-exit knobs (SlideMinCommitSeconds, SlideExitSpeedRetention,
-// SlideExitMinSpeedFraction, SlideExitMaxSpeedMultiplier) are now real UTraceSettings properties and
-// are read directly by the getters below.
-//
-// They were briefly reached through an SFINAE detection shim, because the slide work and the
-// settings work landed in parallel and this file could not add properties to UTraceSettings. That
-// shim is deliberately GONE: now that the properties exist it would only serve to swallow a rename
-// or a typo, silently substituting a hardcoded default for the designer's value instead of failing
-// the build. A direct read is the whole point of having the properties.
 
 #if !UE_BUILD_SHIPPING
 /**
@@ -99,7 +106,6 @@ static float GTraceSlideDebugTotalDistance = 0.f;
 UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 {
 	bWantsToDash = 0;
-	bWantsToBoost = 0;
 	bWantsToSlide = 0;
 
 	DashTimeRemaining = 0.f;
@@ -115,8 +121,7 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	SlideDirection = FVector::ZeroVector;
 	SlideBufferRemaining = 0.f;
 	bSlideHeldLastMove = 0;
-
-	BoostCooldownRemaining = 0.f;
+	bWasAirborneLastMove = 0;
 
 	// Third-person feel: the capsule turns toward where it is moving. Aim is separate and comes
 	// from the control rotation (ATraceCharacter::GetAimDirection), which is why the character
@@ -126,16 +131,38 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	RotationRate = FRotator(0.f, 900.f, 0.f);
 
 	// Arena-shooter tuning. MaxWalkSpeed is overwritten from UTraceSettings in BeginPlay and re-pushed
-	// every movement update by RefreshWalkSpeedFromSettings(), so this literal only covers the window
-	// before play starts (and the CDO in the editor). Keep it equal to UTraceSettings::WalkSpeed
+	// every movement update by RefreshEngineTunablesFromSettings(), so this literal only covers the
+	// window before play starts (and the CDO in the editor). Keep it equal to UTraceSettings::WalkSpeed
 	// anyway — a stale value here is what an editor viewport shows before anyone presses Play.
 	MaxWalkSpeed = 820.f;
 	MaxAcceleration = 4096.f;
 	BrakingDecelerationWalking = 2600.f;
 	GroundFriction = 8.f;
 	JumpZVelocity = 640.f;
-	AirControl = 0.45f;
 	bCanWalkOffLedges = true;
+
+	// --- The air, spec §2.1 ---------------------------------------------------------------------
+	//
+	// AirControl 1.0 is not "more air control", it is "get out of the way". GetFallingLateralAcceleration
+	// scales Acceleration by AirControl before CalcVelocity sees it, and our Source model has to
+	// receive the raw wish vector so it can cap in SPEED (AirMaxWishSpeed) rather than in
+	// ACCELERATION. Capping the acceleration is exactly what makes perpendicular input brake.
+	//
+	// Zero lateral friction and zero falling braking: Source has no air friction, and neither do we.
+	// Letting go of the stick mid-flight must coast, not decay.
+	//
+	// These two are re-pushed from UTraceSettings every move by RefreshEngineTunablesFromSettings();
+	// the literals only cover the CDO and the window before play starts. Keep them equal to
+	// UTraceSettings::AirControl / AirFriction.
+	AirControl = 1.f;
+	FallingLateralFriction = 0.f;
+	BrakingDecelerationFalling = 0.f;
+
+	// Neutralise the engine's low-speed air-control boost. It exists to make the stock lerp usable
+	// when you are barely moving; under the projection model it would double the wish vector at low
+	// speed, i.e. change the model based on how fast you happen to be going.
+	AirControlBoostMultiplier = 1.f;
+	AirControlBoostVelocityThreshold = 0.f;
 
 	// Lets ACharacter::Crouch() raise bWantsToCrouch at all — CanEverCrouch() gates it. The capsule is
 	// still never resized, because CanCrouchInCurrentState() is overridden to false; this only opens
@@ -165,21 +192,25 @@ void UTraceCharacterMovementComponent::BeginPlay()
 	// One line, once per process, naming every number the kit will actually run on. A measurement
 	// run that does not print the configuration it measured is an anecdote — and this is also the
 	// cheapest possible check that a "-ini:Game:..." override on the command line really landed.
-	if (IsSlideDebugEnabled())
 	{
 		static bool bLoggedKitConfig = false;
 		if (!bLoggedKitConfig)
 		{
 			bLoggedKitConfig = true;
 			UE_LOG(LogTraceGame, Display,
-				TEXT("SLIDECFG walk=%.0f | slide dur=%.2f decel=%.0f commit=%.2f entryFrac=%.2f mult=%.2f max=%.0f exitFrac=%.2f cd=%.2f "
-				     "| exit retention=%.2f minFrac=%.2f maxMul=%.2f | dash speed=%.0f dur=%.2f cd=%.2f | boostZ=%.0f cd=%.1f"),
-				MaxWalkSpeed, GetSlideDuration(), GetSlideDeceleration(), GetSlideMinCommitSeconds(),
-				Settings.SlideEntrySpeedFraction, Settings.SlideSpeedMultiplier, Settings.SlideMaxSpeed,
-				Settings.SlideExitSpeedFraction, Settings.SlideCooldown,
+				TEXT("MOVECFG walk=%.0f | AIR srcAccel=%d accel=%.0f wishCap=%.0f maxAir=%.0f "
+				     "| LAND preserve=%d overspeedFric=%.2f overspeedBrake=%.0f turn=%.1f dashExit=%.2fx "
+				     "| SLIDE dur=%.2f entryMul=%.2f impulse=%.0f cooldownFromEnd=%.2f max=%.0f decel=%.0f "
+				     "commit=%.2f exitRet=%.2f exitFloor=%.2f exitCeil=%.2f "
+				     "| DASH speed=%.0f dur=%.2f cd=%.2f"),
+				MaxWalkSpeed,
+				IsSourceAirAccelerationEnabled() ? 1 : 0, GetAirAcceleration(), GetAirMaxWishSpeed(), GetMaxAirSpeed(),
+				IsLandingMomentumPreserved() ? 1 : 0, GetGroundOverspeedFriction(), GetGroundOverspeedBraking(),
+				GetGroundOverspeedTurnRate(), GetDashExitSpeedMultiplier(),
+				GetSlideDuration(), GetSlideEntrySpeedMultiplier(), GetSlideImpulse(), GetSlideCooldownSeconds(),
+				Settings.SlideMaxSpeed, GetSlideDeceleration(), GetSlideMinCommitSeconds(),
 				GetSlideExitSpeedRetention(), GetSlideExitMinSpeedFraction(), GetSlideExitMaxSpeedMultiplier(),
-				GetDashSpeed(), GetDashDuration(), GetDashCooldown(),
-				Settings.BoostZVelocity, GetBoostCooldown());
+				GetDashSpeed(), GetDashDuration(), GetDashCooldown());
 		}
 	}
 #endif
@@ -220,6 +251,12 @@ float UTraceCharacterMovementComponent::GetDashRechargeWindow() const
 	return GetDashDuration() + GetDashCooldown();
 }
 
+float UTraceCharacterMovementComponent::GetDashExitSpeedMultiplier() const
+{
+	// Never below 1: a dash that handed back LESS than a run would be a punishment for dashing.
+	return FMath::Max(1.f, UTraceSettings::Get().DashExitSpeedMultiplier);
+}
+
 float UTraceCharacterMovementComponent::GetSlideDuration() const
 {
 	// Floored rather than defaulted: a zero-length slide would still spend the slide cooldown.
@@ -252,18 +289,97 @@ float UTraceCharacterMovementComponent::GetSlideExitMinSpeedFraction() const
 float UTraceCharacterMovementComponent::GetSlideExitMaxSpeedMultiplier() const
 {
 	// Never below 1: a multiplier under 1 would make a slide exit SLOWER than a walk, which is the
-	// exact behaviour this pass exists to remove. The property's ClampMin matches this floor, so the
-	// settings panel cannot offer a value that this line would silently discard.
+	// exact behaviour this pass exists to remove. Note that EndSlide() additionally floors the
+	// resulting ceiling at the slide's own speed when momentum preservation is on, so this knob only
+	// ever decides how much of a *fast* slide is handed back, never whether one is braked.
 	return FMath::Max(1.f, UTraceSettings::Get().SlideExitMaxSpeedMultiplier);
 }
 
-void UTraceCharacterMovementComponent::RefreshWalkSpeedFromSettings()
+float UTraceCharacterMovementComponent::GetSlideCooldownSeconds() const
 {
-	const float DesiredWalkSpeed = FMath::Max(1.f, UTraceSettings::Get().WalkSpeed);
+	return FMath::Max(0.f, UTraceSettings::Get().SlideCooldownSeconds);
+}
+
+float UTraceCharacterMovementComponent::GetSlideEntrySpeedMultiplier() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().SlideEntrySpeedMultiplier);
+}
+
+float UTraceCharacterMovementComponent::GetSlideImpulse() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().SlideImpulse);
+}
+
+bool UTraceCharacterMovementComponent::IsSourceAirAccelerationEnabled() const
+{
+	return UTraceSettings::Get().bSourceAirAcceleration;
+}
+
+float UTraceCharacterMovementComponent::GetAirAcceleration() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().AirAcceleration);
+}
+
+float UTraceCharacterMovementComponent::GetAirMaxWishSpeed() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().AirMaxWishSpeed);
+}
+
+float UTraceCharacterMovementComponent::GetMaxAirSpeed() const
+{
+	return FMath::Max(1.f, UTraceSettings::Get().MaxAirSpeed);
+}
+
+bool UTraceCharacterMovementComponent::IsLandingMomentumPreserved() const
+{
+	return UTraceSettings::Get().bPreserveLandingMomentum;
+}
+
+float UTraceCharacterMovementComponent::GetGroundOverspeedFriction() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().GroundOverspeedFriction);
+}
+
+float UTraceCharacterMovementComponent::GetGroundOverspeedBraking() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().GroundOverspeedBraking);
+}
+
+float UTraceCharacterMovementComponent::GetGroundOverspeedTurnRate() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().GroundOverspeedTurnRate);
+}
+
+void UTraceCharacterMovementComponent::RefreshEngineTunablesFromSettings()
+{
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	const float DesiredWalkSpeed = FMath::Max(1.f, Settings.WalkSpeed);
 	if (!FMath::IsNearlyEqual(MaxWalkSpeed, DesiredWalkSpeed))
 	{
 		MaxWalkSpeed = DesiredWalkSpeed;
 		MaxWalkSpeedCrouched = DesiredWalkSpeed * 0.5f;
+	}
+
+	// AirControl and the lateral air friction are engine-owned fields consumed deep inside
+	// PhysFalling, not at any point this file can intercept, so they are the two air values that
+	// have to be COPIED rather than read at the point of use. Copying them once a move is what keeps
+	// them live in PIE like everything else.
+	//
+	// AirControl matters more than it looks. GetFallingLateralAcceleration multiplies Acceleration
+	// by it BEFORE CalcVelocity — and therefore before ApplySourceAirAcceleration — ever sees it, so
+	// anything below 1 silently scales the wish vector and the documented air model stops being what
+	// actually runs. UTraceSettings ships it at 1 and says so.
+	const float DesiredAirControl = FMath::Clamp(Settings.AirControl, 0.f, 1.f);
+	if (!FMath::IsNearlyEqual(AirControl, DesiredAirControl))
+	{
+		AirControl = DesiredAirControl;
+	}
+
+	const float DesiredAirFriction = FMath::Max(0.f, Settings.AirFriction);
+	if (!FMath::IsNearlyEqual(FallingLateralFriction, DesiredAirFriction))
+	{
+		FallingLateralFriction = DesiredAirFriction;
 	}
 }
 
@@ -282,7 +398,7 @@ int32 UTraceCharacterMovementComponent::GetMaxDashCharges() const
 	}
 
 #if !UE_BUILD_SHIPPING
-	// Dev override so the charge pool can be exercised without a Core. See TickSelfTest().
+	// Dev override so the charge pool can be exercised without a Core.
 	extern int32 GTraceMoveKitFakeCarrier;
 	if (GTraceMoveKitFakeCarrier != 0 && CharacterOwner != nullptr && CharacterOwner->IsLocallyControlled())
 	{
@@ -296,6 +412,18 @@ int32 UTraceCharacterMovementComponent::GetMaxDashCharges() const
 	}
 
 	return Max;
+}
+
+// --- Momentum readouts --------------------------------------------------------------------------
+
+float UTraceCharacterMovementComponent::GetPlanarSpeed() const
+{
+	return FVector(Velocity.X, Velocity.Y, 0.f).Size();
+}
+
+bool UTraceCharacterMovementComponent::IsCarryingExcessSpeed() const
+{
+	return IsMovingOnGround() && GetPlanarSpeed() > (GetMaxSpeed() + TraceMoveCfg::SpeedEpsilon);
 }
 
 // --- Prediction pipeline ---------------------------------------------------------------------
@@ -323,9 +451,179 @@ void UTraceCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 
 	// Pure state restore. The actual activations happen in OnMovementUpdated, on every machine,
 	// from these flags — so server, client and replay all go through one code path.
+	//
+	// FLAG_Custom_1 is unused: it was boost, and boost is gone (spec v3 §1).
 	bWantsToDash  = ((Flags & FSavedMove_Character::FLAG_Custom_0) != 0) ? 1 : 0;
-	bWantsToBoost = ((Flags & FSavedMove_Character::FLAG_Custom_1) != 0) ? 1 : 0;
 	bWantsToSlide = ((Flags & FSavedMove_Character::FLAG_Custom_2) != 0) ? 1 : 0;
+}
+
+// =================================================================================================
+// THE MOMENTUM MODEL
+// =================================================================================================
+
+void UTraceCharacterMovementComponent::CalcVelocity(float DeltaTime, float Friction, bool bFluid, float BrakingDeceleration)
+{
+	// Mirror the base class's own bail-outs before deciding anything. A simulated proxy is fed its
+	// velocity by replication and must not run either branch, or it would fight the interpolation.
+	const bool bBaseWouldBailOut =
+		!HasValidData()
+		|| HasAnimRootMotion()
+		|| DeltaTime < 1.e-6f
+		|| (CharacterOwner != nullptr && CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy && !bWasSimulatingRootMotion)
+		|| CurrentRootMotion.HasOverrideVelocity();
+
+	if (!bBaseWouldBailOut)
+	{
+		// --- AIR (spec §2.1) ---------------------------------------------------------------------
+		//
+		// Not while dashing: the dash owns the velocity vector outright for its whole window and
+		// re-asserts it in OnMovementUpdated, so letting air input add to it first would just be
+		// arithmetic nobody can observe.
+		if (IsFalling() && IsSourceAirAccelerationEnabled() && DashTimeRemaining <= 0.f)
+		{
+			ApplySourceAirAcceleration(DeltaTime);
+			return;
+		}
+
+		// --- CARRIED GROUND MOMENTUM (spec §2.2, §2.4) --------------------------------------------
+		//
+		// This is the branch that "removes the clamp of horizontal velocity to ground max speed on
+		// landing". Super::CalcVelocity, the instant IsExceedingMaxSpeed() is true, runs
+		// ApplyVelocityBraking with GroundFriction × BrakingFrictionFactor (8 × 2) plus
+		// BrakingDecelerationWalking (2600) — which at 1900uu/s is about -33000uu/s², i.e. the whole
+		// carry is gone inside four frames. Taking the branch ourselves is the only way to defeat it
+		// without lowering GroundFriction, which would also make ordinary walking feel like ice.
+		//
+		// Not while sliding or dashing: those states set GetMaxSpeed() to their own speed, so they
+		// are never "overspeed" by this definition and never reach here anyway — but the explicit
+		// test documents that they own Velocity and this does not.
+		if (IsMovingOnGround() && IsLandingMomentumPreserved()
+			&& DashTimeRemaining <= 0.f && SlideTimeRemaining <= 0.f
+			&& GetPlanarSpeed() > (FMath::Max(1.f, GetMaxSpeed()) + TraceMoveCfg::SpeedEpsilon))
+		{
+			ApplyGroundOverspeedBleed(DeltaTime);
+			return;
+		}
+	}
+
+	Super::CalcVelocity(DeltaTime, Friction, bFluid, BrakingDeceleration);
+}
+
+void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTime)
+{
+	// PhysFalling has already stripped Velocity.Z for the duration of this call and restores it
+	// afterwards, so everything here is honestly planar. Never write Z.
+	const FVector PlanarVelocity(Velocity.X, Velocity.Y, 0.f);
+	const float SpeedBefore = PlanarVelocity.Size();
+
+	// Acceleration here is FallAcceleration: planar, scaled by AirControl (which
+	// RefreshEngineTunablesFromSettings pins at 1.0 for exactly this reason) and clamped to
+	// GetMaxAcceleration(). Its LENGTH is the analog input magnitude; its direction is the wish
+	// direction. Using Acceleration rather than GetLastInputVector() is what makes this replay-safe:
+	// MoveAutonomous restores Acceleration from the saved move on every corrected frame.
+	FVector WishDirection(Acceleration.X, Acceleration.Y, 0.f);
+	const float WishMagnitude = WishDirection.Size();
+
+	// NO INPUT MEANS NO CHANGE. Not "decay toward zero" — Source has no air friction and neither do
+	// we, and a decay here would make every jump cost speed, which is precisely the complaint.
+	if (WishMagnitude <= UE_KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+	WishDirection /= WishMagnitude;
+
+	const float InputScale = FMath::Clamp(WishMagnitude / FMath::Max(1.f, GetMaxAcceleration()), 0.f, 1.f);
+
+	// THE FORMULA (Quake's PM_AirAccelerate, Source's CAirAccelerate, same maths):
+	//
+	//   1. WishSpeed is what the player is asking for, clamped to AirMaxWishSpeed. That clamp is the
+	//      entire mechanic. In Quake it is 30 units/s; making it a knob is what "expose the accel cap
+	//      and max air speed" means.
+	//   2. Project the CURRENT velocity onto the wish direction. If the player is already travelling
+	//      that fast in that direction, there is nothing to add.
+	//   3. Add at most AirAcceleration·dt along the wish direction — and only ever ADD.
+	//
+	// Step 3 is why perpendicular input turns you for free: with the input at 90° to travel, the
+	// projection is 0, so the full allowance is available, and it is applied SIDEWAYS. The resulting
+	// vector is sqrt(v² + a²) long — very slightly FASTER, and rotated. Nothing anywhere subtracts a
+	// component of velocity, so strafing can never cost speed. A lerp toward the input direction,
+	// which is the usual mistake, subtracts on every frame and is why "air control" feels like a
+	// brake.
+	//
+	// InputScale is the one addition to the formula as UTraceSettings documents it, and it is a
+	// no-op for a keyboard: it only scales the target for a partially deflected analog stick, where
+	// asking for half speed and getting the full turn allowance would be wrong.
+	const float WishSpeed = FMath::Min(GetMaxAirSpeed(), GetAirMaxWishSpeed()) * InputScale;
+	const float SpeedAlongWish = FVector::DotProduct(PlanarVelocity, WishDirection);
+	const float AddSpeed = WishSpeed - SpeedAlongWish;
+
+	if (AddSpeed <= 0.f)
+	{
+		return;
+	}
+
+	const float AccelSpeed = FMath::Min(GetAirAcceleration() * DeltaTime, AddSpeed);
+	FVector NewPlanar = PlanarVelocity + WishDirection * AccelSpeed;
+
+	// MaxAirSpeed is a ceiling on what air input may BUILD, never a brake on what the pawn arrived
+	// with: a slide-jump that leaves the ground above the cap keeps every unit of it. Floor the
+	// ceiling at the entry speed and the clamp can only ever remove speed this call just added.
+	const float SpeedCeiling = FMath::Max(GetMaxAirSpeed(), SpeedBefore);
+	const float NewSpeed = NewPlanar.Size();
+	if (NewSpeed > SpeedCeiling && NewSpeed > UE_KINDA_SMALL_NUMBER)
+	{
+		NewPlanar *= (SpeedCeiling / NewSpeed);
+	}
+
+	Velocity.X = NewPlanar.X;
+	Velocity.Y = NewPlanar.Y;
+}
+
+void UTraceCharacterMovementComponent::ApplyGroundOverspeedBleed(float DeltaTime)
+{
+	const FVector PlanarVelocity(Velocity.X, Velocity.Y, 0.f);
+	const float CurrentSpeed = PlanarVelocity.Size();
+	if (CurrentSpeed <= TraceMoveCfg::SpeedEpsilon)
+	{
+		return;
+	}
+
+	const float GroundSpeedLimit = FMath::Max(1.f, GetMaxSpeed());
+	FVector TravelDirection = PlanarVelocity / CurrentSpeed;
+
+	// STEERING. Carried momentum you cannot aim is a punishment, not a reward, so the player may
+	// rotate it — at GroundOverspeedTurnRate, and WITHOUT the rotation costing any speed, which is
+	// the same rule the air model follows. Falls back to the AI's requested velocity so that a bot
+	// coming out of a dash still corners instead of ballistically overshooting: path following sets
+	// RequestedVelocity but leaves Acceleration at zero.
+	FVector WishDirection(Acceleration.X, Acceleration.Y, 0.f);
+	if (WishDirection.SizeSquared() <= UE_KINDA_SMALL_NUMBER && bHasRequestedVelocity)
+	{
+		WishDirection = FVector(RequestedVelocity.X, RequestedVelocity.Y, 0.f);
+	}
+	if (WishDirection.Normalize())
+	{
+		// A fixed ANGULAR rate (degrees/second), like the slide's steering and for the same reason:
+		// the result depends only on (TravelDirection, WishDirection, rate x dt), all of which the
+		// replay path reproduces exactly, and rotating by a fixed angle cannot change the magnitude.
+		TravelDirection = TraceMovement::SteerTowards(
+			TravelDirection, WishDirection, GetGroundOverspeedTurnRate() * DeltaTime);
+	}
+
+	// BLEED THE EXCESS, NOT THE SPEED. Friction proportional to the excess makes the carry taper
+	// (fast at first, gentle as it approaches a run) and the flat braking term guarantees it
+	// actually terminates rather than approaching the limit asymptotically forever.
+	//
+	// Floored at the ground limit, never below: once the excess is gone this branch stops being
+	// taken and Super::CalcVelocity resumes on exactly the speed normal movement would allow, so
+	// there is no discontinuity at the handover.
+	const float ExcessSpeed = CurrentSpeed - GroundSpeedLimit;
+	const float Bleed = (GetGroundOverspeedFriction() * ExcessSpeed + GetGroundOverspeedBraking()) * DeltaTime;
+	const float NewSpeed = FMath::Max(GroundSpeedLimit, CurrentSpeed - Bleed);
+
+	Velocity.X = TravelDirection.X * NewSpeed;
+	Velocity.Y = TravelDirection.Y * NewSpeed;
+	// Z is already zero here: PhysWalking calls MaintainHorizontalGroundVelocity() before this.
 }
 
 // --- Dash ------------------------------------------------------------------------------------
@@ -518,12 +816,13 @@ bool UTraceCharacterMovementComponent::CanStartSlide() const
 	}
 
 	// A slide is a way of spending momentum you already have. Crouching from a standstill must not
-	// hand out free speed, or "tap crouch" becomes the fastest way to cross the field.
+	// hand out free speed, or "tap crouch" becomes the fastest way to cross the field. This matters
+	// more now than it did: with SlideEntrySpeedMultiplier at 1.0 the slide has nothing of its own
+	// to give, so entering one slowly would be strictly worse than running.
 	const UTraceSettings& Settings = UTraceSettings::Get();
 	const float EntrySpeed = FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideEntrySpeedFraction);
-	const FVector PlanarVelocity(Velocity.X, Velocity.Y, 0.f);
 
-	return PlanarVelocity.SizeSquared() >= FMath::Square(EntrySpeed);
+	return FVector(Velocity.X, Velocity.Y, 0.f).SizeSquared() >= FMath::Square(EntrySpeed);
 }
 
 void UTraceCharacterMovementComponent::BeginSlide()
@@ -548,28 +847,43 @@ void UTraceCharacterMovementComponent::BeginSlide()
 		}
 	}
 
-	const float PlanarSpeed = FVector(Velocity.X, Velocity.Y, 0.f).Size();
-	const float Entry = FMath::Max(PlanarSpeed, FMath::Max(1.f, Settings.WalkSpeed));
-
 	SlideDirection = Direction;
 
-	// ENTERING A SLIDE CAN NEVER COST YOU SPEED.
+	// --- ENTRY SPEED DETERMINES SLIDE VELOCITY (spec §2.3) ---------------------------------------
 	//
-	// SlideMaxSpeed still caps the BOOST — that is what stops a slide out of a fast state compounding
-	// into a rocket — but the cap is then floored back up to the speed the pawn actually arrived
-	// with. Without the floor, any pawn already moving faster than SlideMaxSpeed is *braked* by
-	// pressing crouch, which is the precise opposite of what a slide is for. (In practice the dash
-	// already clamps to the walk speed on the frame it ends, so this floor is a guarantee rather
-	// than a common case — but it is the guarantee the whole mechanic rests on.)
-	const float BoostedEntry = FMath::Min(Entry * FMath::Max(1.f, Settings.SlideSpeedMultiplier),
-	                                      FMath::Max(1.f, Settings.SlideMaxSpeed));
-	SlideSpeed = FMath::Max(BoostedEntry, PlanarSpeed);
+	// The old formula was max(planar speed, WalkSpeed) × SlideSpeedMultiplier(1.35), which is a flat
+	// momentum boost by any reading — a slide entered at walking pace came out 35% faster than a run
+	// for free. Spec §2.3 says explicitly "no flat momentum boost", so entry is now the speed the
+	// pawn actually arrived with, and the two knobs that could reintroduce a boost both default to
+	// neutral:
+	//
+	//   SlideEntrySpeedMultiplier = 1.0   → slide speed IS entry speed
+	//   SlideImpulse              = 0.0   → no flat addition
+	//
+	// The spec also contains a contradictory line asking for the slide to increase momentum; raising
+	// SlideImpulse is how to get that reading without another code change. See the header.
+	//
+	// SlideMaxSpeed caps the MULTIPLIED entry speed. SlideImpulse is added AFTERWARDS, on purpose and
+	// as its tooltip promises: if the impulse were inside the cap, dialling it up from zero would
+	// appear to do nothing at all for anybody already entering a slide fast, which is exactly the
+	// player the "increase momentum" reading is about.
+	//
+	// The whole thing is then floored at the speed the pawn actually arrived with: ENTERING A SLIDE
+	// CAN NEVER COST YOU SPEED. Without that floor, anyone arriving faster than SlideMaxSpeed (an
+	// air-strafe landing, a slide-jump chain, a dash exit) would be BRAKED by pressing crouch, which
+	// is the precise opposite of what a slide is for.
+	const float EntrySpeed = FVector(Velocity.X, Velocity.Y, 0.f).Size();
+	const float ScaledEntrySpeed = FMath::Min(EntrySpeed * GetSlideEntrySpeedMultiplier(),
+	                                          FMath::Max(1.f, Settings.SlideMaxSpeed));
+
+	SlideSpeed = FMath::Max(ScaledEntrySpeed + GetSlideImpulse(), EntrySpeed);
 
 	SlideTimeRemaining = GetSlideDuration();
 	SlideCommitRemaining = GetSlideMinCommitSeconds();
 
-	// Measured from slide START, same convention as the dash, so the knob reads the same way.
-	SlideCooldownRemaining = SlideTimeRemaining + FMath::Max(0.f, Settings.SlideCooldown);
+	// Cleared, not set: the between-slides buffer is charged in EndSlide() because spec §2.3 asks
+	// for a gap BETWEEN slides. An active slide is already blocked by SlideTimeRemaining.
+	SlideCooldownRemaining = 0.f;
 
 	Velocity.X = SlideDirection.X * SlideSpeed;
 	Velocity.Y = SlideDirection.Y * SlideSpeed;
@@ -594,23 +908,25 @@ void UTraceCharacterMovementComponent::EndSlide()
 {
 	if (SlideTimeRemaining <= 0.f && SlideSpeed <= 0.f)
 	{
-		// Idempotent: the cancel paths (dash, boost) and the two natural exits can all reach here,
-		// and a second call must not re-write Velocity with a stale direction.
+		// Idempotent: the cancel paths and the natural exits can all reach here, and a second call
+		// must not re-write Velocity with a stale direction or re-charge the cooldown.
 		SlideCommitRemaining = 0.f;
 		return;
 	}
 
 	// --- Hand the momentum back ------------------------------------------------------------------
 	//
-	// The old exit was ClampPlanarSpeedToMax(), which did nothing at all in the common case: the
-	// slide gave up once its speed had decayed to SlideExitSpeedFraction of the walk speed, i.e.
-	// BELOW the clamp, so the player was dropped out of a slide at 60% of a run and had to
-	// re-accelerate. That is the "slides scrub your momentum" complaint in one line of code.
+	// The exit speed is the slide's own live speed scaled by SlideExitSpeedRetention, floored at
+	// SlideExitMinSpeedFraction of the walk speed, and capped at
 	//
-	// Now the exit speed is the slide's own live speed, scaled by SlideExitSpeedRetention, floored
-	// at SlideExitMinSpeedFraction of the walk speed and capped at SlideExitMaxSpeedMultiplier x the
-	// speed normal movement would allow. Both bounds derive from config and from GetMaxSpeed(),
-	// which the replay path reproduces exactly, so this stays prediction-safe.
+	//     max(SlideExitMaxSpeedMultiplier × GetMaxSpeed(), the slide's own speed)
+	//
+	// That max() is spec §2.4, "state transitions should preserve velocity vectors rather than
+	// resetting them", in one term. Without it, slide→jump was a hard brake: the ceiling evaluated
+	// to the walk speed (820) and a 1900uu/s slide handed the player into the air at 820. With it,
+	// a slide can never end below the speed it was running at, and the excess then bleeds off
+	// through ApplyGroundOverspeedBleed like any other carried momentum — or survives into the air
+	// intact if the exit was a jump, which is the entire Apex slide-jump.
 	const float Retained = FMath::Max(0.f, SlideSpeed) * GetSlideExitSpeedRetention();
 
 	// Clear FIRST: GetMaxSpeed() folds in SlideSpeed while IsSliding(), so the ceiling below has to
@@ -620,10 +936,20 @@ void UTraceCharacterMovementComponent::EndSlide()
 	const float ExitedSpeed = SlideSpeed;
 	SlideSpeed = 0.f;
 
+	// Spec §2.3: "add a .8 second buffer between slides". Charged HERE, at the end, so the knob says
+	// what it means — the old cooldown was measured from slide start, which made the actual buffer
+	// SlideCooldown minus SlideDuration.
+	SlideCooldownRemaining = GetSlideCooldownSeconds();
+
 	// Named ExitCeiling/ExitFloor rather than the obvious Ceiling/Floor: "Floor" is dense with
 	// meaning inside a movement component (CurrentFloor, FindFloor, FFindFloorResult) and a local
 	// that reads like the walkable surface in a function about speed is a trap for the next reader.
-	const float ExitCeiling = FMath::Max(1.f, GetMaxSpeed()) * GetSlideExitMaxSpeedMultiplier();
+	float ExitCeiling = FMath::Max(1.f, GetMaxSpeed()) * GetSlideExitMaxSpeedMultiplier();
+	if (IsLandingMomentumPreserved())
+	{
+		ExitCeiling = FMath::Max(ExitCeiling, ExitedSpeed);
+	}
+
 	const float ExitFloor = FMath::Min(
 		FMath::Max(1.f, UTraceSettings::Get().WalkSpeed) * GetSlideExitMinSpeedFraction(), ExitCeiling);
 	const float ExitSpeed = FMath::Clamp(Retained, ExitFloor, ExitCeiling);
@@ -679,87 +1005,16 @@ void UTraceCharacterMovementComponent::EndSlide()
 #endif
 }
 
-void UTraceCharacterMovementComponent::ClampPlanarSpeedToMax()
+void UTraceCharacterMovementComponent::ApplyDashExitSpeed()
 {
 	const FVector PlanarVelocity(Velocity.X, Velocity.Y, 0.f);
-	const float PlanarLimit = GetMaxSpeed();
+	const float PlanarLimit = FMath::Max(1.f, GetMaxSpeed()) * GetDashExitSpeedMultiplier();
 	if (PlanarVelocity.SizeSquared() > FMath::Square(PlanarLimit))
 	{
 		const FVector Clamped = PlanarVelocity.GetSafeNormal() * PlanarLimit;
 		Velocity.X = Clamped.X;
 		Velocity.Y = Clamped.Y;
 	}
-}
-
-// --- Boost -----------------------------------------------------------------------------------
-
-void UTraceCharacterMovementComponent::StartBoost()
-{
-	if (!CanBoost())
-	{
-		return;
-	}
-
-	bWantsToBoost = 1;
-}
-
-bool UTraceCharacterMovementComponent::CanBoost() const
-{
-	if (CharacterOwner == nullptr || UpdatedComponent == nullptr)
-	{
-		return false;
-	}
-
-	if (BoostCooldownRemaining > 0.f)
-	{
-		return false;
-	}
-
-	// Contract §5: ground only. This is the whole reason boost is not a second jump.
-	if (MovementMode == MOVE_None || !IsMovingOnGround())
-	{
-		return false;
-	}
-
-	if (const ATraceCharacter* TraceCharacter = Cast<ATraceCharacter>(CharacterOwner))
-	{
-		if (!TraceCharacter->IsAlive())
-		{
-			return false;
-		}
-	}
-
-	return true;
-}
-
-float UTraceCharacterMovementComponent::GetBoostCooldownRemaining() const
-{
-	return FMath::Max(0.f, BoostCooldownRemaining);
-}
-
-float UTraceCharacterMovementComponent::GetBoostCooldown() const
-{
-	return FMath::Max(0.f, UTraceSettings::Get().BoostCooldown);
-}
-
-void UTraceCharacterMovementComponent::BeginBoost()
-{
-	const UTraceSettings& Settings = UTraceSettings::Get();
-
-	BoostCooldownRemaining = GetBoostCooldown();
-
-	// Read LIVE from the settings CDO on every activation — never cached, not in the constructor and
-	// not in BeginPlay — so retuning BoostZVelocity in Project Settings changes the very next boost,
-	// including mid-PIE. Apex is v^2/2g against the world's gravity: halving the height means
-	// scaling this by sqrt(0.5) (1150 -> ~813, i.e. ~675uu -> ~337uu), not halving the number.
-	Velocity.Z = FMath::Max(1.f, Settings.BoostZVelocity);
-
-	// MOVE_Walking discards vertical velocity outright — PhysWalking projects movement onto the
-	// floor — so the mode change is not decoration, it is the only thing that makes the launch
-	// happen at all. This mirrors ACharacter::DoJump, which does exactly the same two lines.
-	// Called from OnMovementUpdated (inside the scoped move, after the physics step), so the launch
-	// lands on the NEXT frame — one frame, identically on both ends of the wire, like the dash.
-	SetMovementMode(MOVE_Falling);
 }
 
 // --- Simulation --------------------------------------------------------------------------------
@@ -775,10 +1030,10 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 
 	const UTraceSettings& Settings = UTraceSettings::Get();
 
-	// 0. Pick up a WalkSpeed a designer has just changed in Project Settings. BeginPlay's copy is the
-	//    one piece of cached config in this file, and caching is exactly what this file's own rules
+	// 0. Pick up config a designer has just changed in Project Settings. BeginPlay's copy is the one
+	//    piece of cached config in this file, and caching is exactly what this file's own rules
 	//    forbid — without this, retuning WalkSpeed during PIE did nothing until the map reloaded.
-	RefreshWalkSpeedFromSettings();
+	RefreshEngineTunablesFromSettings();
 
 	// 1. Advance every clock first, so an ability that expires this frame stops driving velocity
 	//    this frame and a cooldown that expires this frame permits an activation this frame.
@@ -800,10 +1055,6 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	if (SlideCommitRemaining > 0.f)
 	{
 		SlideCommitRemaining = FMath::Max(0.f, SlideCommitRemaining - DeltaSeconds);
-	}
-	if (BoostCooldownRemaining > 0.f)
-	{
-		BoostCooldownRemaining = FMath::Max(0.f, BoostCooldownRemaining - DeltaSeconds);
 	}
 	if (SlideBufferRemaining > 0.f)
 	{
@@ -853,11 +1104,11 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 	}
 
-	// 1d. The frame a dash ends, hand the player back at walking speed. See ClampPlanarSpeedToMax()
-	//     for why this is a discrete step rather than a velocity cap.
+	// 1d. The frame a dash ends, hand the player back at DashExitSpeedMultiplier x the ground limit
+	//     rather than AT the ground limit. See ApplyDashExitSpeed().
 	if (bWasDashing && DashTimeRemaining <= 0.f)
 	{
-		ClampPlanarSpeedToMax();
+		ApplyDashExitSpeed();
 	}
 
 	// 1e. A slide whose duration has just run out exits through EndSlide() like every other slide
@@ -894,29 +1145,33 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 	}
 
-	// 3. Boost. Ground-only, so it cannot be chained in the air, and it deliberately runs after the
-	//    dash: a dash+boost in one frame is a diagonal launch, which is fine, but the dash's planar
-	//    velocity must be established first or the boost's mode change would be applied to stale
-	//    horizontal speed.
-	if (bWantsToBoost && CanBoost())
-	{
-		BeginBoost();
-
-		// Boost leaves the ground, and a slide is a ground state. EndSlide() carries the slide's
-		// horizontal speed into the launch rather than dropping it, so boosting out of a slide is a
-		// long flat arc — which is the one thing a player boosting mid-slide is obviously trying to
-		// do. It is capped like every other exit, so it cannot become free permanent overspeed.
-		EndSlide();
-	}
-
-	// 4. Crouch: slide on the ground, fast-fall in the air. One key, resolved by where the pawn is.
+	// 3. Crouch: slide on the ground, fast-fall in the air. One key, resolved by where the pawn is.
 	//
 	//    A press that cannot be honoured yet (mid-dash, or airborne) is buffered rather than thrown
 	//    away — see SlideBufferRemaining. The buffer is charged from the press EDGE only, so holding
-	//    the key can never chain slides.
+	//    the key can never chain slides. It is also what makes "air-strafe, then slide the instant
+	//    you touch down" a single input instead of a frame-perfect one.
+	const bool bOnGroundNow = IsMovingOnGround();
+	const bool bJustLanded = bOnGroundNow && (bWasAirborneLastMove != 0);
+
 	if (bSlidePressedThisMove)
 	{
 		SlideBufferRemaining = FMath::Max(0.f, Settings.SlideInputBufferSeconds);
+	}
+	else if (bJustLanded && bCrouchHeld)
+	{
+		// LANDING WITH CROUCH HELD IS A SLIDE (spec v3 §2.4, jump->slide).
+		//
+		// The press edge alone cannot express this. A crouch pressed in the air is consumed by the
+		// fast-fall, which zeroes the buffer on purpose so that one press does not silently mean two
+		// things; and the buffer is a quarter of a second while a jump is over a second. So a player
+		// who holds crouch from the apex all the way down used to land, keep nothing, and have to
+		// re-press — measured: a 1293 uu/s landing produced no slide at all.
+		//
+		// Charging the buffer on the landing TRANSITION fixes that without reopening the "one press,
+		// two meanings" problem: the key is still held, the player is still asking, and it can fire
+		// only once per landing because the next move is no longer a transition.
+		SlideBufferRemaining = FMath::Max(SlideBufferRemaining, FMath::Max(0.f, Settings.SlideInputBufferSeconds));
 	}
 
 	if (SlideTimeRemaining > 0.f)
@@ -926,9 +1181,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		// Two ways out here, and only one of them is negotiable. Leaving the ground always ends the
 		// slide — it is a ground state and the floor is what it is sliding on. Releasing the key ends
 		// it too, but NOT during the commit window: for SlideMinCommitSeconds the slide is bought and
-		// paid for. That is what makes a slide a commitment worth its cooldown, and it is also what
-		// stops a key released a frame early (or an AI whose hold timer ran out mid-slide) from
-		// amputating it. Momentum survives either exit now, so neither one is a punishment.
+		// paid for. Momentum survives either exit now, so neither one is a punishment.
 		const bool bCommitted = (SlideCommitRemaining > 0.f);
 		if (!IsMovingOnGround() || (!bCrouchHeld && !bCommitted))
 		{
@@ -955,8 +1208,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 			{
 				// Decayed back to walking pace: stop rather than drag the player along at a speed
 				// the normal movement code would have given them anyway. EndSlide() still hands back
-				// at least SlideExitMinSpeedFraction of the walk speed, so this is no longer the
-				// trapdoor that dumped a slide out below a run.
+				// at least SlideExitMinSpeedFraction of the walk speed.
 				EndSlide();
 			}
 			else
@@ -975,8 +1227,8 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		// --- FAST-FALL (contract §5) -------------------------------------------------------------
 		// Zero POSITIVE Z only, leave horizontal speed alone. This is a fall you chose, not a stop:
 		// cutting a jump short to drop behind cover or to beat a shot is the whole point, so the
-		// horizontal carry must survive. Runs on the press edge, not continuously, so holding crouch
-		// does not pin the pawn under every subsequent jump or boost.
+		// horizontal carry must survive — and with the Source air model that carry can now be well
+		// above walking pace, which is exactly the state a fast-fall wants to bring to the floor.
 		if (Velocity.Z > 0.f)
 		{
 			Velocity.Z = 0.f;
@@ -994,7 +1246,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		SlideBufferRemaining = 0.f;
 	}
 
-	// 5. Latch the last instant this pawn was inside its dash window, on the authority only.
+	// 4. Latch the last instant this pawn was inside its dash window, on the authority only.
 	//    The trail's trip test ticks once per SERVER frame, but the server advances a remote
 	//    client's dash clock here inside MoveAutonomous - possibly several client moves deep in a
 	//    single server frame. Without this latch, a dash that starts and finishes between two trail
@@ -1008,16 +1260,16 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 	}
 
-	// 6. Consume the one-shot intents and remember the held one for the next move's edge test. On
+	// 5. Consume the one-shot intent and remember the held one for the next move's edge test. On
 	//    the server the intents are re-supplied by the next ServerMove's flags, on the client by the
-	//    next StartDash()/StartBoost(), and during replay by UpdateFromCompressedFlags — so one key
-	//    press can only ever produce one dash and one boost.
+	//    next StartDash(), and during replay by UpdateFromCompressedFlags — so one key press can
+	//    only ever produce one dash.
 	bWantsToDash = 0;
-	bWantsToBoost = 0;
 	bSlideHeldLastMove = bCrouchHeld ? 1 : 0;
+	bWasAirborneLastMove = (MovementMode != MOVE_None && !IsMovingOnGround()) ? 1 : 0;
 
 #if !UE_BUILD_SHIPPING
-	TickSelfTest(DeltaSeconds);
+	TickMomentumMeasure(DeltaSeconds);
 #endif
 }
 
@@ -1053,9 +1305,16 @@ float UTraceCharacterMovementComponent::GetMaxSpeed() const
 	return Speed;
 }
 
-// -------------------------------------------------------------------------------------------
-// Dev-only scripted self-test — see the header. "-TraceMoveKitTest".
-// -------------------------------------------------------------------------------------------
+// =================================================================================================
+// Dev-only measurement harness — "-TraceMoveMeasure". See the header.
+//
+// This exists because the four things spec §2 asks for are all NUMBERS, and none of them can be
+// verified from a screenshot or from "it feels better". It prints, at Display:
+//
+//   AIRTURN   planar speed before / after a 90-degree strafe turn, and the angle actually turned
+//   LAND      planar speed the frame before touchdown and 0.1s / 0.3s / 0.6s after it
+//   SLIDE     entry speed vs exit speed, and the measured gap before the next slide is allowed
+// =================================================================================================
 
 #if !UE_BUILD_SHIPPING
 
@@ -1067,9 +1326,9 @@ static FAutoConsoleVariableRef CVarTraceMoveKitFakeCarrier(
 	     "charge pool, so the carrier's extra charge can be exercised without a Core."),
 	ECVF_Cheat);
 
-void UTraceCharacterMovementComponent::TickSelfTest(float DeltaSeconds)
+void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 {
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("TraceMoveKitTest"));
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("TraceMoveMeasure"));
 	if (!bEnabled || CharacterOwner == nullptr)
 	{
 		return;
@@ -1083,74 +1342,422 @@ void UTraceCharacterMovementComponent::TickSelfTest(float DeltaSeconds)
 		return;
 	}
 
-	if (SelfTestTime < 0.f)
+	if (MeasureTime < 0.f)
 	{
 		// Let the pawn spawn, settle onto the floor and finish its first replication.
-		if (GetWorld() == nullptr || GetWorld()->GetTimeSeconds() < 3.f)
+		if (GetWorld() == nullptr || GetWorld()->GetTimeSeconds() < 3.f || !IsMovingOnGround())
 		{
 			return;
 		}
-		SelfTestTime = 0.f;
-		UE_LOG(LogTraceGame, Display, TEXT("MOVEKIT ---- self-test begin, WalkSpeed=%.0f DashCooldown=%.1f MaxCharges=%d"),
-			MaxWalkSpeed, GetDashCooldown(), GetMaxDashCharges());
-	}
+		MeasureTime = 0.f;
+		MeasurePhase = 0;
+		MeasurePhaseTime = 0.f;
 
-	const float T = SelfTestTime;
-	SelfTestTime += DeltaSeconds;
-
-	// Hold "forward" for the whole test so there is momentum to dash and slide with.
-	if (T < 12.f)
-	{
-		CharacterOwner->AddMovementInput(CharacterOwner->GetActorForwardVector(), 1.f);
-	}
-
-	auto Report = [this, T](const TCHAR* Tag)
-	{
-		const FVector Planar(Velocity.X, Velocity.Y, 0.f);
-		UE_LOG(LogTraceGame, Display,
-			TEXT("MOVEKIT t=%5.2f %-14s mode=%d planar=%7.1f velZ=%8.1f z=%8.1f charges=%d/%d recharge=%4.2f dash=%4.2f slide=%4.2f(%6.1f) boostCd=%5.2f"),
-			T, Tag, static_cast<int32>(MovementMode.GetValue()), Planar.Size(), Velocity.Z,
-			UpdatedComponent != nullptr ? UpdatedComponent->GetComponentLocation().Z : 0.f,
-			DashCharges, GetMaxDashCharges(), DashRechargeRemaining,
-			DashTimeRemaining, SlideTimeRemaining, SlideSpeed, BoostCooldownRemaining);
-	};
-
-	// A step fires once, the first move at or after its scheduled time.
-	auto Step = [this, T](int32 Index, float At) -> bool
-	{
-		if (SelfTestStep == Index && T >= At)
+		// Run toward the middle of the field, not along a world axis: spawns are in the endzones and
+		// a fixed +X run walks straight into the back wall, which turns every number after it into a
+		// measurement of a collision.
+		MeasureRunDirection = FVector::ForwardVector;
+		if (UpdatedComponent != nullptr)
 		{
-			SelfTestStep = Index + 1;
-			return true;
+			FVector TowardCentre = -UpdatedComponent->GetComponentLocation();
+			TowardCentre.Z = 0.f;
+			if (TowardCentre.Normalize())
+			{
+				MeasureRunDirection = TowardCentre;
+			}
 		}
-		return false;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("MEASURE ---- begin. walk=%.0f | air: srcModel=%d accel=%.0f wishCap=%.0f maxAir=%.0f airFric=%.2f airControl=%.2f "
+			     "| land: preserve=%d fric=%.2f brake=%.0f turn=%.0fdeg/s | dashExit=%.2fx "
+			     "| slide: entryMul=%.2f impulse=%.0f cooldown=%.2fs"),
+			MaxWalkSpeed, IsSourceAirAccelerationEnabled() ? 1 : 0, GetAirAcceleration(), GetAirMaxWishSpeed(),
+			GetMaxAirSpeed(), FallingLateralFriction, AirControl,
+			IsLandingMomentumPreserved() ? 1 : 0, GetGroundOverspeedFriction(), GetGroundOverspeedBraking(),
+			GetGroundOverspeedTurnRate(), GetDashExitSpeedMultiplier(),
+			GetSlideEntrySpeedMultiplier(), GetSlideImpulse(), GetSlideCooldownSeconds());
+		UE_LOG(LogTraceGame, Display, TEXT("MEASURE run direction %s from %s"),
+			*MeasureRunDirection.ToCompactString(),
+			*(UpdatedComponent != nullptr ? UpdatedComponent->GetComponentLocation() : FVector::ZeroVector).ToCompactString());
+	}
+
+	MeasureTime += DeltaSeconds;
+	MeasurePhaseTime += DeltaSeconds;
+
+	const FVector PlanarVelocity(Velocity.X, Velocity.Y, 0.f);
+	const float PlanarSpeed = PlanarVelocity.Size();
+	const FVector TravelDirection = PlanarVelocity.GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
+
+	auto Advance = [this](int32 NextPhase)
+	{
+		MeasurePhase = NextPhase;
+		MeasurePhaseTime = 0.f;
 	};
 
-	// --- the schedule ---------------------------------------------------------------------------
-	if (Step(0, 1.5f))  { Report(TEXT("RUN"));            }
-	if (Step(1, 2.0f))  { StartDash();          Report(TEXT("DASH-req")); }
-	if (Step(2, 2.1f))  { Report(TEXT("DASH-mid"));       }
-	if (Step(3, 2.4f))  { Report(TEXT("DASH-end"));       }
-	if (Step(4, 3.5f))  { SetWantsToSlide(true);  Report(TEXT("SLIDE-req")); }
-	if (Step(5, 3.7f))  { Report(TEXT("SLIDE-mid"));      }
-	if (Step(6, 4.2f))  { Report(TEXT("SLIDE-late"));     }
-	if (Step(7, 4.8f))  { SetWantsToSlide(false); Report(TEXT("SLIDE-rel")); }
-	if (Step(8, 5.2f))  { StartBoost();           Report(TEXT("BOOST-req")); }
-	if (Step(9, 5.4f))  { Report(TEXT("BOOST-rise"));     }
-	if (Step(10, 5.6f)) { SetWantsToSlide(true);  Report(TEXT("FASTFALL-req")); }
-	if (Step(11, 5.7f)) { SetWantsToSlide(false); Report(TEXT("FASTFALL-after")); }
-	if (Step(12, 7.0f)) { Report(TEXT("LANDED"));         }
-	// The carrier's second charge: grant on the transition, two dashes inside one cooldown, then
-	// take it back and prove the pool clamps.
-	if (Step(13, 7.5f)) { GTraceMoveKitFakeCarrier = 1;  Report(TEXT("CARRIER-on")); }
-	if (Step(14, 7.7f)) { Report(TEXT("CARRIER-granted")); }
-	if (Step(15, 8.0f)) { StartDash();            Report(TEXT("CDASH-1")); }
-	if (Step(16, 8.6f)) { StartDash();            Report(TEXT("CDASH-2")); }
-	if (Step(17, 8.9f)) { StartDash();            Report(TEXT("CDASH-3-should-fail")); }
-	if (Step(18, 9.5f)) { GTraceMoveKitFakeCarrier = 0;  Report(TEXT("CARRIER-off")); }
-	if (Step(19, 9.7f)) { Report(TEXT("CARRIER-clamped")); }
-	if (Step(20, 13.0f)) { Report(TEXT("REFILLED"));      }
-	if (Step(21, 13.2f)) { UE_LOG(LogTraceGame, Display, TEXT("MOVEKIT ---- self-test end")); }
+	// Angle between the velocity vector now and where it pointed when the phase started.
+	auto TurnedDegrees = [this, &TravelDirection]() -> float
+	{
+		return FMath::RadiansToDegrees(FMath::Acos(
+			FMath::Clamp(FVector::DotProduct(MeasureMarkDirection, TravelDirection), -1.f, 1.f)));
+	};
+
+	switch (MeasurePhase)
+	{
+	// --- 0. A CONTROLLED DROP -----------------------------------------------------------------
+	//
+	// The air numbers are taken from a scripted drop rather than from a run-and-jump, because a
+	// run-and-jump measures the arena as much as it measures the movement model: the first two
+	// attempts at this harness sprinted into an endzone wall and a bank, and reported a jump that
+	// "lost" 750 uu/s, which was a collision. Placing the pawn high over the middle of the field
+	// with a known velocity isolates the model. The run-and-jump is still exercised below, on the
+	// ground, where the slide numbers are taken.
+	case 0:
+		if (UpdatedComponent != nullptr && CharacterOwner != nullptr)
+		{
+			const FVector Here = UpdatedComponent->GetComponentLocation();
+			CharacterOwner->SetActorLocation(FVector(0.f, 0.f, Here.Z + 1500.f), false, nullptr, ETeleportType::TeleportPhysics);
+			Velocity = FVector(MaxWalkSpeed, 0.f, 0.f);
+			SetMovementMode(MOVE_Falling);
+			MeasureMarkA = MaxWalkSpeed;
+			MeasureMarkDirection = FVector::ForwardVector;
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE DROP: placed at (0,0,%.0f) with planar=%.0f uu/s along +X"),
+				Here.Z + 1500.f, MaxWalkSpeed);
+			Advance(1);
+		}
+		break;
+
+	// --- 1. FIXED perpendicular input -------------------------------------------------------------
+	//
+	// The strongest possible refutation of a lerp-style air control: hold a direction exactly 90
+	// degrees from travel and do nothing else. A lerp subtracts the forward component every frame
+	// and the speed FALLS. The projection formula can only add sideways, so the speed must not fall.
+	case 1:
+	{
+		const FVector Perpendicular = FVector::CrossProduct(FVector::UpVector, MeasureMarkDirection).GetSafeNormal();
+		CharacterOwner->AddMovementInput(Perpendicular, 1.f);
+		UE_LOG(LogTraceGame, Display, TEXT("MEASURE   air t=%.3f planar=%7.1f velZ=%8.1f mode=%d accel=%6.0f turned=%5.1f"),
+			MeasurePhaseTime, PlanarSpeed, Velocity.Z, static_cast<int32>(MovementMode.GetValue()),
+			Acceleration.Size2D(), TurnedDegrees());
+		if (MeasurePhaseTime > 0.30f)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE AIRTURN-FIXED: %.0f -> %.0f uu/s over %.2fs of fixed perpendicular input "
+				     "(%.1f%% of entry, vector turned %.1f deg)"),
+				MeasureMarkA, PlanarSpeed, MeasurePhaseTime,
+				100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA), TurnedDegrees());
+			MeasureMarkA = PlanarSpeed;
+			MeasureMarkDirection = TravelDirection;
+			Advance(2);
+		}
+		break;
+	}
+
+	// --- 2. CONTINUOUSLY perpendicular input (a real strafe turn) ---------------------------------
+	//
+	// The wish direction is recomputed every frame to stay at 90 degrees to the CURRENT velocity —
+	// which is exactly what a player doing a strafe turn produces with mouse + strafe key. This is
+	// the number "slightly increase efficacy of strafing in mid air" is about.
+	case 2:
+	{
+		const FVector Perpendicular = FVector::CrossProduct(FVector::UpVector, TravelDirection).GetSafeNormal();
+		CharacterOwner->AddMovementInput(Perpendicular, 1.f);
+		UE_LOG(LogTraceGame, Display, TEXT("MEASURE   air t=%.3f planar=%7.1f velZ=%8.1f mode=%d accel=%6.0f turned=%5.1f"),
+			MeasurePhaseTime, PlanarSpeed, Velocity.Z, static_cast<int32>(MovementMode.GetValue()),
+			Acceleration.Size2D(), TurnedDegrees());
+		if (MeasurePhaseTime > 0.40f)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE AIRTURN-STRAFE: %.0f -> %.0f uu/s over %.2fs of continuously perpendicular input "
+				     "(%.1f%% of entry, vector turned %.1f deg)"),
+				MeasureMarkA, PlanarSpeed, MeasurePhaseTime,
+				100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA), TurnedDegrees());
+			Advance(3);
+		}
+		break;
+	}
+
+	// --- 3. COAST, then LANDING CARRY ---------------------------------------------------------------
+	//
+	// No input at all from here: Source has no air friction, so the speed must not move a unit
+	// between the last input frame and touchdown, and the touchdown must not clamp it.
+	case 3:
+		if (!IsMovingOnGround())
+		{
+			// Refreshed every airborne frame; the last value written is the frame before touchdown.
+			MeasureMarkA = PlanarSpeed;
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE LAND: last airborne planar=%.0f uu/s -> first grounded planar=%.0f uu/s "
+				     "(%.1f%% carried; ground limit is %.0f)"),
+				MeasureMarkA, PlanarSpeed, 100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA), GetMaxSpeed());
+			Advance(4);
+		}
+		break;
+
+	// --- 4-6. Watch the bleed. No input at all, so this is purely the decay curve. ------------------
+	case 4:
+		if (MeasurePhaseTime > 0.10f)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE LAND +0.10s: planar=%.0f uu/s"), PlanarSpeed);
+			Advance(5);
+		}
+		break;
+
+	case 5:
+		if (MeasurePhaseTime > 0.20f)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE LAND +0.30s: planar=%.0f uu/s"), PlanarSpeed);
+			Advance(6);
+		}
+		break;
+
+	case 6:
+		if (MeasurePhaseTime > 0.30f)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE LAND +0.60s: planar=%.0f uu/s (ground limit %.0f)"),
+				PlanarSpeed, GetMaxSpeed());
+			Advance(7);
+		}
+		break;
+
+	// --- 7. A REAL run-and-jump, for the run->jump transition ---------------------------------------
+	case 7:
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		if (MeasurePhaseTime > 1.2f)
+		{
+			if (IsMovingOnGround())
+			{
+				MeasureMarkA = PlanarSpeed;
+				CharacterOwner->Jump();
+			}
+			else
+			{
+				CharacterOwner->StopJumping();
+				UE_LOG(LogTraceGame, Display,
+					TEXT("MEASURE RUN->JUMP: %.0f uu/s on the ground -> %.0f uu/s on the first airborne frame (%.1f%%)"),
+					MeasureMarkA, PlanarSpeed, 100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA));
+				Advance(8);
+			}
+		}
+		break;
+
+	// --- 8. SLIDE 1: entry speed determines slide velocity -------------------------------------------
+	case 8:
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		if (MeasurePhaseTime > 1.5f)
+		{
+			MeasureMarkA = PlanarSpeed;
+			SetWantsToSlide(true);
+			Advance(9);
+		}
+		break;
+
+	case 9:
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		SetWantsToSlide(true);
+		if (IsSliding())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE SLIDE-1 entry: %.0f uu/s in -> slideSpeed=%.0f uu/s (ratio %.2f, entryMul=%.2f impulse=%.0f)"),
+				MeasureMarkA, SlideSpeed, SlideSpeed / FMath::Max(1.f, MeasureMarkA),
+				GetSlideEntrySpeedMultiplier(), GetSlideImpulse());
+			Advance(10);
+		}
+		else if (MeasurePhaseTime > 1.f)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("MEASURE SLIDE-1 never latched (planar=%.0f, cooldown=%.2f)"),
+				PlanarSpeed, GetSlideCooldownRemaining());
+			Advance(12);
+		}
+		break;
+
+	case 10:
+		// Hold it out to its natural end so the exit measured is the one the duration produces.
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		SetWantsToSlide(true);
+		if (!IsSliding())
+		{
+			MeasureMarkB = static_cast<float>(GetWorld() != nullptr ? GetWorld()->GetTimeSeconds() : 0.0);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE SLIDE-1 exit: after %.2fs, planar=%.0f uu/s (entry was %.0f, %.1f%% kept), buffer now %.2fs"),
+				MeasurePhaseTime, PlanarSpeed, MeasureMarkA,
+				100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA), GetSlideCooldownRemaining());
+			SetWantsToSlide(false);
+			Advance(11);
+		}
+		break;
+
+	// --- 11. SLIDE 2: prove the between-slides buffer ------------------------------------------------
+	//
+	// Crouch is PULSED rather than held: the slide needs a fresh press edge, and the input buffer is
+	// only 0.25s, so one press at the start would expire long before the 0.8s buffer does.
+	case 11:
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		SetWantsToSlide(FMath::Fmod(MeasurePhaseTime, 0.2f) < 0.1f);
+		if (IsSliding())
+		{
+			const float Now = static_cast<float>(GetWorld() != nullptr ? GetWorld()->GetTimeSeconds() : 0.0);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE SLIDE-2 started %.2fs after slide 1 ended (configured buffer %.2fs), slideSpeed=%.0f uu/s"),
+				Now - MeasureMarkB, GetSlideCooldownSeconds(), SlideSpeed);
+			SetWantsToSlide(false);
+			Advance(12);
+		}
+		else if (MeasurePhaseTime > 4.f)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("MEASURE SLIDE-2 never started within 4s (planar=%.0f, buffer left %.2fs)"),
+				PlanarSpeed, GetSlideCooldownRemaining());
+			SetWantsToSlide(false);
+			Advance(12);
+		}
+		break;
+
+	case 12:
+		if (MeasurePhaseTime > 2.f)
+		{
+			Advance(13);
+		}
+		break;
+
+	// =============================================================================================
+	// THE CHAIN: land fast -> slide -> jump. This is the sequence spec v3 §2.4 is really about, and
+	// the one the old code broke in two places: the landing clamped to walk speed, and EndSlide()
+	// clamped the exit to walk speed so jumping out of a fast slide threw the momentum away.
+	// Everything above measures one transition at a time; this measures them composed.
+	// =============================================================================================
+	case 13:
+		if (UpdatedComponent != nullptr && CharacterOwner != nullptr)
+		{
+			const FVector Here = UpdatedComponent->GetComponentLocation();
+			CharacterOwner->SetActorLocation(FVector(0.f, 0.f, Here.Z + 1500.f), false, nullptr, ETeleportType::TeleportPhysics);
+			Velocity = FVector(1200.f, 0.f, 0.f);
+			SetMovementMode(MOVE_Falling);
+			MeasureMarkA = 1200.f;
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE CHAIN: dropped at planar=1200 uu/s (ground limit %.0f)"), GetMaxSpeed());
+			Advance(14);
+		}
+		break;
+
+	case 14:
+	{
+		// Strafe up to something comfortably over the ground limit, then hold crouch so the input
+		// buffer converts the landing into a slide on the touchdown frame.
+		const FVector Perpendicular = FVector::CrossProduct(FVector::UpVector, TravelDirection).GetSafeNormal();
+		CharacterOwner->AddMovementInput(Perpendicular, 1.f);
+		if (MeasurePhaseTime > 0.35f)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE CHAIN air speed before landing: %.0f uu/s"), PlanarSpeed);
+			SetWantsToSlide(true);
+			Advance(15);
+		}
+		break;
+	}
+
+	case 15:
+		SetWantsToSlide(true);
+		if (!IsMovingOnGround())
+		{
+			MeasureMarkA = PlanarSpeed;
+		}
+		else if (IsSliding())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE CHAIN jump->slide: landed at %.0f uu/s -> slideSpeed=%.0f uu/s (%.1f%%; ground limit %.0f)"),
+				MeasureMarkA, SlideSpeed, 100.f * SlideSpeed / FMath::Max(1.f, MeasureMarkA), MaxWalkSpeed);
+			Advance(16);
+		}
+		else if (MeasurePhaseTime > 3.f)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("MEASURE CHAIN slide never latched (planar=%.0f)"), PlanarSpeed);
+			Advance(18);
+		}
+		break;
+
+	case 16:
+		// Ride the slide past its commit window, then jump straight out of it.
+		SetWantsToSlide(true);
+		if (MeasurePhaseTime > 0.60f)
+		{
+			MeasureMarkA = SlideSpeed;
+			CharacterOwner->Jump();
+			Advance(17);
+		}
+		break;
+
+	case 17:
+		if (!IsMovingOnGround())
+		{
+			CharacterOwner->StopJumping();
+			SetWantsToSlide(false);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE CHAIN slide->jump: slideSpeed was %.0f uu/s -> airborne at %.0f uu/s (%.1f%%). "
+				     "The old exit ceiling would have handed back %.0f."),
+				MeasureMarkA, PlanarSpeed, 100.f * PlanarSpeed / FMath::Max(1.f, MeasureMarkA), MaxWalkSpeed);
+			Advance(18);
+		}
+		else
+		{
+			SetWantsToSlide(true);
+			if (MeasurePhaseTime > 1.f)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("MEASURE CHAIN never left the ground"));
+				Advance(18);
+			}
+		}
+		break;
+
+	case 18:
+		SetWantsToSlide(false);
+		if (IsMovingOnGround() && MeasurePhaseTime > 1.2f)
+		{
+			Advance(19);
+		}
+		break;
+
+	// --- 19-21. DASH EXIT ---------------------------------------------------------------------------
+	case 19:
+		CharacterOwner->AddMovementInput(MeasureRunDirection, 1.f);
+		if (MeasurePhaseTime > 1.2f && IsMovingOnGround())
+		{
+			StartDash();
+			Advance(20);
+		}
+		break;
+
+	case 20:
+		if (IsDashing())
+		{
+			MeasureMarkA = PlanarSpeed;
+		}
+		else if (MeasureMarkA > 0.f)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE DASH exit: %.0f uu/s while dashing -> %.0f uu/s on the frame it ended "
+				     "(ground limit %.0f x DashExitSpeedMultiplier %.2f = %.0f)"),
+				MeasureMarkA, PlanarSpeed, GetMaxSpeed(), GetDashExitSpeedMultiplier(),
+				GetMaxSpeed() * GetDashExitSpeedMultiplier());
+			Advance(21);
+		}
+		else if (MeasurePhaseTime > 2.f)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("MEASURE DASH never started"));
+			Advance(22);
+		}
+		break;
+
+	case 21:
+		if (MeasurePhaseTime > 0.30f)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE DASH exit +0.30s: planar=%.0f uu/s"), PlanarSpeed);
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE ---- end"));
+			Advance(22);
+		}
+		break;
+
+	default:
+		break;
+	}
 }
 
 #endif // !UE_BUILD_SHIPPING
@@ -1161,8 +1768,8 @@ void UTraceCharacterMovementComponent::TickSelfTest(float DeltaSeconds)
 
 FSavedMove_Trace::FSavedMove_Trace()
 	: bSavedWantsToDash(0)
-	, bSavedWantsToBoost(0)
 	, bSavedWantsToSlide(0)
+	, bSavedMomentumActive(0)
 	, SavedDashTimeRemaining(0.f)
 	, SavedDashRechargeRemaining(0.f)
 	, SavedDashCharges(0)
@@ -1175,7 +1782,7 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, SavedSlideBufferRemaining(0.f)
 	, SavedSlideDirection(FVector::ZeroVector)
 	, bSavedSlideHeldLastMove(0)
-	, SavedBoostCooldownRemaining(0.f)
+	, bSavedWasAirborneLastMove(0)
 {
 }
 
@@ -1186,8 +1793,8 @@ void FSavedMove_Trace::Clear()
 	// Saved moves are pooled and recycled — every added field must be reset or a stale ability will
 	// resurrect itself several moves later.
 	bSavedWantsToDash = 0;
-	bSavedWantsToBoost = 0;
 	bSavedWantsToSlide = 0;
+	bSavedMomentumActive = 0;
 
 	SavedDashTimeRemaining = 0.f;
 	SavedDashRechargeRemaining = 0.f;
@@ -1202,8 +1809,7 @@ void FSavedMove_Trace::Clear()
 	SavedSlideBufferRemaining = 0.f;
 	SavedSlideDirection = FVector::ZeroVector;
 	bSavedSlideHeldLastMove = 0;
-
-	SavedBoostCooldownRemaining = 0.f;
+	bSavedWasAirborneLastMove = 0;
 }
 
 uint8 FSavedMove_Trace::GetCompressedFlags() const
@@ -1214,10 +1820,7 @@ uint8 FSavedMove_Trace::GetCompressedFlags() const
 	{
 		Result |= FLAG_Custom_0;
 	}
-	if (bSavedWantsToBoost)
-	{
-		Result |= FLAG_Custom_1;
-	}
+	// FLAG_Custom_1 is FREE. It was boost; spec v3 §1 deleted the ability.
 	if (bSavedWantsToSlide)
 	{
 		Result |= FLAG_Custom_2;
@@ -1241,7 +1844,6 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// edge, because the edge is DERIVED from it: merging a held frame with a released one would
 	// erase a press the fast-fall depends on.
 	if (bSavedWantsToDash != Other->bSavedWantsToDash
-		|| bSavedWantsToBoost != Other->bSavedWantsToBoost
 		|| bSavedWantsToSlide != Other->bSavedWantsToSlide)
 	{
 		return false;
@@ -1261,6 +1863,16 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 		return false;
 	}
 
+	// ...and never merge across the momentum model. Both of its branches clamp PER SUB-STEP —
+	// min(AirAcceleration x dt, AddSpeed) in the air, max(GroundLimit, Speed - Bleed x dt) on the
+	// ground — so f(2dt) != f(dt) twice whenever a clamp binds. A merged move would hand the server
+	// a trajectory the client never simulated, and the correction would arrive as a rubber-band in
+	// the exact situation (mid-strafe, mid-landing) where it is most visible.
+	if (bSavedMomentumActive || Other->bSavedMomentumActive)
+	{
+		return false;
+	}
+
 	return Super::CanCombineWith(NewMove, InCharacter, MaxDelta);
 }
 
@@ -1275,8 +1887,11 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 		if (const UTraceCharacterMovementComponent* Movement = Cast<UTraceCharacterMovementComponent>(C->GetCharacterMovement()))
 		{
 			bSavedWantsToDash  = Movement->bWantsToDash;
-			bSavedWantsToBoost = Movement->bWantsToBoost;
 			bSavedWantsToSlide = Movement->bWantsToSlide;
+
+			// Not CMC state and deliberately not restored by PrepMoveFor: this is a property OF the
+			// move, read only by CanCombineWith. See the field's comment.
+			bSavedMomentumActive = (Movement->IsFalling() || Movement->IsCarryingExcessSpeed()) ? 1 : 0;
 
 			SavedDashTimeRemaining     = Movement->DashTimeRemaining;
 			SavedDashRechargeRemaining = Movement->DashRechargeRemaining;
@@ -1291,8 +1906,7 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedSlideBufferRemaining   = Movement->SlideBufferRemaining;
 			SavedSlideDirection         = Movement->SlideDirection;
 			bSavedSlideHeldLastMove     = Movement->bSlideHeldLastMove;
-
-			SavedBoostCooldownRemaining = Movement->BoostCooldownRemaining;
+			bSavedWasAirborneLastMove   = Movement->bWasAirborneLastMove;
 		}
 	}
 }
@@ -1306,10 +1920,12 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 		if (UTraceCharacterMovementComponent* Movement = Cast<UTraceCharacterMovementComponent>(C->GetCharacterMovement()))
 		{
 			// Rewind every ability to exactly where it stood before this move ran. MoveAutonomous
-			// will overwrite the three intent flags from the compressed flags immediately after this
+			// will overwrite the two intent flags from the compressed flags immediately after this
 			// returns; restoring them too costs nothing and keeps the snapshot complete.
+			//
+			// The momentum model needs nothing here: it is a pure function of Velocity and
+			// Acceleration, both of which Super::PrepMoveFor and MoveAutonomous already restore.
 			Movement->bWantsToDash  = bSavedWantsToDash;
-			Movement->bWantsToBoost = bSavedWantsToBoost;
 			Movement->bWantsToSlide = bSavedWantsToSlide;
 
 			Movement->DashTimeRemaining     = SavedDashTimeRemaining;
@@ -1325,8 +1941,7 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			Movement->SlideBufferRemaining   = SavedSlideBufferRemaining;
 			Movement->SlideDirection         = SavedSlideDirection;
 			Movement->bSlideHeldLastMove     = bSavedSlideHeldLastMove;
-
-			Movement->BoostCooldownRemaining = SavedBoostCooldownRemaining;
+			Movement->bWasAirborneLastMove   = bSavedWasAirborneLastMove;
 		}
 	}
 }

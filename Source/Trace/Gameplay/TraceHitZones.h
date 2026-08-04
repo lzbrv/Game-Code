@@ -133,9 +133,28 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Damage")
 	float BodyDamage = 40.f;
 
-	/** Below the hips. Four leg shots to kill (25 x 4 = 100). */
+	/**
+	 * Below the hips. Still four leg shots to kill (30 x 4 = 120 >= 100).
+	 *
+	 * 25 -> 30 THIS PASS, and it is the fix for a reported bug, not a balance whim. The user said
+	 * "shooting feels WAY more inconsistent on this latest version". It was measured over 313
+	 * server-accepted shots and the hit registration was found to be exactly right — 313/313 client
+	 * and server agreed on the zone, zero rejects, zero shots lost at the muzzle. What actually
+	 * changed was the VARIANCE OF THE PAYOUT: the old flat 34/x2-head model killed in 2 or 3 shots
+	 * (a 1.5x spread); 100/40/25 kills in 1, 3 or 4 (a 4x spread). That is what "inconsistent" feels
+	 * like from inside, and it is arithmetic rather than a defect.
+	 *
+	 * 30 keeps the 4-shot leg kill intact while cutting the body-versus-leg swing from 38% to 25%.
+	 * That matters because 15.9% of measured hits landed within 0.25-0.50 of body height, straddling
+	 * the HipHeightFraction line at 0.46 — so roughly one shot in six is close enough to the boundary
+	 * that a few uu of aim wobble changes the damage. Narrowing the gap narrows the surprise.
+	 *
+	 * The other two levers, if this is not enough: lower HipHeightFraction to ~0.40 (moves the
+	 * boundary out from under where shots actually land, at the cost of anatomical accuracy), or
+	 * accept the 4x spread as the design. Both are live knobs; try them in that order.
+	 */
 	UPROPERTY(config, EditAnywhere, Category = "Damage")
-	float LegDamage = 25.f;
+	float LegDamage = 30.f;
 
 	// --- Zone geometry -----------------------------------------------------------------------
 	//

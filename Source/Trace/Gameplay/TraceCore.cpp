@@ -38,51 +38,41 @@
 namespace TraceCoreTuning
 {
 	// ---------------------------------------------------------------------------------------------
-	// Spec §2/§4 numbers.
-	//
-	// These are compile-time constants rather than UTraceSettings entries only because
-	// TraceSettings.h is owned by another slice this pass. Every one of them is a designer knob and
-	// they should be promoted to UTraceSettings (Category = "Core") verbatim - the report names them.
+	// PROMOTED. Pass hold, cooldown, range, aim cone, aim slack, chest offset and the turnover trace
+	// grace all used to live here as compile-time constants, with a comment asking for exactly this:
+	// "Every one of them is a designer knob and they should be promoted to UTraceSettings". They now
+	// are - UTraceSettings, Category "Core|Pass" - and this file reads them at the point of use, so
+	// they retune with PIE running. Nothing is left behind here except the two PRE-FIX values the
+	// Trace.Pass.Fixes A/B switch replays, and the constants that are genuinely not designer-facing.
 	// ---------------------------------------------------------------------------------------------
 
-	/** §4: hold the crosshair on the receiver this long to complete the transfer. */
-	constexpr float PassHoldSeconds = 0.5f;
-
-	/** §4: before another pass may be STARTED. Applied on completion and on cancellation alike. */
-	constexpr float PassCooldownSeconds = 2.0f;
-
-	/** §2: after the Core changes TEAM, the trace does not begin forming for this long. */
-	constexpr float TransferGraceSeconds = 1.0f;
-
 	/**
-	 * §4 [ASSUMPTION]: maximum pass range.
-	 *
-	 * The field is 24000 x 12000, and the bots' own pass range works out at ~6600uu
-	 * (BotPassRangeFieldFraction 0.55 of a 12000uu half-length). 8000 covers a third of the pitch
-	 * and comfortably contains every pass a bot will attempt, without making a cross-map hail mary
-	 * free.
-	 */
-	constexpr double PassMaxRange = 8000.0;
-
-	/**
-	 * §4 [ASSUMPTION]: "hover the crosshair over a teammate", generously.
-	 *
-	 * Two tests, either of which is enough: a flat angular cone (so a distant teammate is still
-	 * acquirable when their capsule subtends almost nothing), and the aim ray passing within
-	 * CapsuleRadius + PassAimSlack of the receiver's capsule axis (so a near teammate is acquirable
-	 * anywhere on their body). The angular test is what stops it feeling frustrating at range; the
-	 * capsule test is what stops it feeling sloppy up close.
+	 * PRE-FIX aim cone and slack. Read ONLY when Trace.Pass.Fixes is 0, which replays the exact
+	 * behaviour the user reported as broken so the before/after numbers come from one binary.
+	 * The live values are UTraceSettings::PassAimConeDegrees / PassAimSlack (9 deg / 70 uu).
 	 */
 	constexpr double PassAimConeDegrees = 6.0;
 	constexpr double PassAimSlack = 40.0;
 
-	/** Chest, not feet: the LOS probe and the aim point both use it. */
-	constexpr double TargetChestOffsetZ = 20.0;
+	/**
+	 * Line-of-sight probe heights, as offsets from the receiver's capsule CENTRE. Chest, head,
+	 * knees.
+	 *
+	 * A single chest-height ray against 176 uu / 352 uu / 616 uu cover boxes is a coin flip: a
+	 * receiver whose head and shoulders are plainly visible over a 1x block fails the test because
+	 * the one point being probed is behind it. ANY clear probe means line of sight, which is both
+	 * more generous and much closer to what the player can actually see.
+	 *
+	 * Entry 0 is a placeholder: the chest probe is overridden at the call site with
+	 * UTraceSettings::PassTargetChestOffsetZ, so the probed chest and the AIMED-AT chest are
+	 * guaranteed to be the same point. Toggled by UTraceSettings::bPassMultiPointLos.
+	 */
+	constexpr double LosProbeOffsetsZ[] = { 20.0, 70.0, -45.0 };
 
 	/**
 	 * How long a kickoff waits before it is granted.
 	 *
-	 * Every caller of ResetToCenter()/KickoffTo() teleports ten pawns immediately afterwards
+	 * Every caller of KickoffTo() teleports ten pawns immediately afterwards
 	 * (ATraceGameMode::ResetPlayersToSpawns, which also clears every trail). Granting inside that
 	 * window would lay a trail across the teleport and then have it wiped from under us.
 	 */
@@ -161,6 +151,203 @@ namespace
 		return A != ETraceTeam::None && A == B;
 	}
 }
+
+// =================================================================================================
+// §4.1 PASS TUNABLES
+//
+// Every number the pass runs on is now a UTraceSettings property, read AT THE POINT OF USE so it
+// retunes with PIE running - which is what the user asked for: "implement these as tunable
+// variables so I can playtest and adjust numbers rather than you guessing at feel." See
+// UTraceSettings, Category "Core|Pass". The TraceCoreTuning constants below survive only as the
+// PRE-FIX values, which is what the A/B switch replays.
+//
+// Trace.Pass.Fixes is that switch. Setting it to 0 restores the exact pre-fix behaviour (no grace,
+// 6-degree cone, 40 uu slack, single chest LOS ray, a full 2 s cooldown on a cancel, no sticky
+// acquisition) so the before/after numbers in the report come from ONE binary rather than two -
+// nothing else changed between the two runs, including the map, the bots and the RNG seed.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarTracePassFixes(
+	TEXT("Trace.Pass.Fixes"),
+	1,
+	TEXT("1 (default): apply the section 4.1 pass-reliability fixes and read UTraceSettings for their values. 0: exact pre-fix behaviour, for A/B measurement."),
+	ECVF_Default);
+
+namespace TraceCoreTuning
+{
+	/** Grace window, or 0 when the A/B switch is replaying pre-fix behaviour. */
+	float ResolvedValidationGrace(const UTraceSettings& Settings)
+	{
+		return (CVarTracePassFixes.GetValueOnAnyThread() != 0)
+			? FMath::Clamp(Settings.PassValidationGraceSeconds, 0.f, 2.f)
+			: 0.f;
+	}
+
+	/** Sticky acquisition window, or 0 when replaying pre-fix behaviour. */
+	float ResolvedAcquireSticky(const UTraceSettings& Settings)
+	{
+		return (CVarTracePassFixes.GetValueOnAnyThread() != 0)
+			? FMath::Clamp(Settings.PassAcquireStickySeconds, 0.f, 2.f)
+			: 0.f;
+	}
+
+	/** Cancel cooldown. Pre-fix this was the same two seconds a COMPLETED pass spends. */
+	float ResolvedCancelCooldown(const UTraceSettings& Settings)
+	{
+		return (CVarTracePassFixes.GetValueOnAnyThread() != 0)
+			? FMath::Max(0.f, Settings.PassCancelCooldownSeconds)
+			: FMath::Max(0.f, Settings.PassCooldownSeconds);
+	}
+
+	double ResolvedAimConeDegrees(const UTraceSettings& Settings)
+	{
+		return (CVarTracePassFixes.GetValueOnAnyThread() != 0)
+			? FMath::Clamp(static_cast<double>(Settings.PassAimConeDegrees), 0.5, 60.0)
+			: PassAimConeDegrees;
+	}
+
+	double ResolvedAimSlack(const UTraceSettings& Settings)
+	{
+		return (CVarTracePassFixes.GetValueOnAnyThread() != 0)
+			? FMath::Clamp(static_cast<double>(Settings.PassAimSlack), 0.0, 500.0)
+			: PassAimSlack;
+	}
+
+	bool ResolvedMultiPointLos(const UTraceSettings& Settings)
+	{
+		return (CVarTracePassFixes.GetValueOnAnyThread() != 0) && Settings.bPassMultiPointLos;
+	}
+}
+
+static TAutoConsoleVariable<int32> CVarTracePassStats(
+	TEXT("Trace.PassStats"),
+	0,
+	TEXT("1: accumulate pass acquisition / cancellation statistics. Trace.PassStats.Dump prints them."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarTracePassStatsInterval(
+	TEXT("Trace.PassStats.Interval"),
+	20.f,
+	TEXT("Seconds between automatic Trace.PassStats dumps. 0 disables the automatic dump."),
+	ECVF_Default);
+
+namespace TracePassStats
+{
+	/**
+	 * "Sometimes the pass option doesn't show up" is a claim about how OFTEN, so this counts how
+	 * often. Sampled server-side at 10 Hz for whoever is holding the Core: does FindPassTargetFor()
+	 * return anybody, and when it does not, which test refused each teammate?
+	 *
+	 * That last column is the whole diagnosis. "No receiver" caused by everyone being genuinely
+	 * behind cover is a map problem; "no receiver" caused by the 6-degree cone is a tuning problem;
+	 * and they are indistinguishable from inside the game.
+	 */
+	struct FStats
+	{
+		// --- availability, sampled while somebody is holding the Core ---
+		//
+		// TWO numbers, because they answer two different questions and only the second one is the
+		// bug report. RawSamplesWithTarget asks the instantaneous rule "is any teammate legal RIGHT
+		// NOW"; SamplesWithTarget asks FindPassTargetFor(), which is what ATraceHUD polls to decide
+		// whether to draw the pass affordance at all and therefore what the player means by "the
+		// pass option". The gap between them is exactly what the sticky window closes.
+		int32 CarrySamples = 0;
+		int32 RawSamplesWithTarget = 0;
+		int32 SamplesWithTarget = 0;
+		int32 SamplesWithoutTarget = 0;
+
+		/** Per-teammate refusal tally over those samples. Indexed by ETracePassRejectReason. */
+		int32 RefusalCount[8] = {};
+		int32 TeammatesConsidered = 0;
+		int32 TeammatesLegal = 0;
+
+		// --- the state machine ---
+		int32 PassesBegun = 0;
+		int32 PassesCompleted = 0;
+		int32 CancelReleased = 0;
+		int32 CancelLostTarget = 0;
+		int32 CancelHolderGone = 0;
+
+		/** Times the grace window absorbed a blink of illegality that would previously have cancelled. */
+		int32 GraceSaves = 0;
+		/** Times the grace window expired and the pass cancelled anyway. */
+		int32 GraceExpired = 0;
+		/** Total seconds of in-flight pass time spent inside the grace window. */
+		double GraceSecondsAccrued = 0.0;
+
+		/** Times the sticky window kept a receiver the instantaneous test had dropped. */
+		int32 StickySaves = 0;
+
+		double LastSampleTime = 0.0;
+		double LastDumpTime = 0.0;
+	};
+
+	static FStats GStats;
+
+	static const TCHAR* RefusalName(int32 Index);
+
+	static float Percent(int32 Part, int32 Whole)
+	{
+		return (Whole > 0) ? (100.f * static_cast<float>(Part) / static_cast<float>(Whole)) : 0.f;
+	}
+
+	static void Reset()
+	{
+		const double Keep = GStats.LastDumpTime;
+		GStats = FStats();
+		GStats.LastDumpTime = Keep;
+	}
+
+	static void Dump()
+	{
+		const FStats& S = GStats;
+		UE_LOG(LogTraceGame, Display, TEXT("========== TRACE PASS STATS =========="));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("PASSSTAT availability: %d samples while carrying | a receiver was offered on %d (%.1f%%), none on %d (%.1f%%)"),
+			S.CarrySamples,
+			S.SamplesWithTarget, Percent(S.SamplesWithTarget, S.CarrySamples),
+			S.SamplesWithoutTarget, Percent(S.SamplesWithoutTarget, S.CarrySamples));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("PASSSTAT rawrule     : the instantaneous rule alone offered a receiver on %d (%.1f%%) - the gap to the line above is what the sticky window recovers"),
+			S.RawSamplesWithTarget, Percent(S.RawSamplesWithTarget, S.CarrySamples));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("PASSSTAT teammates   : %d evaluated, %d legal (%.1f%%)"),
+			S.TeammatesConsidered, S.TeammatesLegal, Percent(S.TeammatesLegal, S.TeammatesConsidered));
+
+		FString Refusals;
+		for (int32 Index = 1; Index < 8; ++Index)
+		{
+			if (S.RefusalCount[Index] > 0)
+			{
+				Refusals += FString::Printf(TEXT("  %-20s %6d (%.1f%%)\n"),
+					RefusalName(Index), S.RefusalCount[Index],
+					Percent(S.RefusalCount[Index], S.TeammatesConsidered));
+			}
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("PASSSTAT refusals by test:\n%s"), *Refusals);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("PASSSTAT state       : begun %d, completed %d (%.1f%%) | cancels: released %d, lost target %d, holder gone %d"),
+			S.PassesBegun, S.PassesCompleted, Percent(S.PassesCompleted, S.PassesBegun),
+			S.CancelReleased, S.CancelLostTarget, S.CancelHolderGone);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("PASSSTAT grace       : saves %d, expired %d | %.2fs total spent inside the grace window"),
+			S.GraceSaves, S.GraceExpired, S.GraceSecondsAccrued);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("PASSSTAT sticky      : %d acquisitions kept alive by the sticky window"), S.StickySaves);
+		UE_LOG(LogTraceGame, Display, TEXT("======================================"));
+	}
+} // namespace TracePassStats
+
+static FAutoConsoleCommand GTracePassStatsDumpCmd(
+	TEXT("Trace.PassStats.Dump"),
+	TEXT("Prints the accumulated pass acquisition / cancellation statistics gathered while Trace.PassStats is 1."),
+	FConsoleCommandDelegate::CreateStatic([]() { TracePassStats::Dump(); }));
+
+static FAutoConsoleCommand GTracePassStatsResetCmd(
+	TEXT("Trace.PassStats.Reset"),
+	TEXT("Clears the accumulated pass statistics."),
+	FConsoleCommandDelegate::CreateStatic([]() { TracePassStats::Reset(); }));
 
 
 // =================================================================================================
@@ -260,7 +447,6 @@ void ATraceCore::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifeti
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME(ATraceCore, Carrier);
-	DOREPLIFETIME(ATraceCore, State);
 	DOREPLIFETIME(ATraceCore, bPassActive);
 	DOREPLIFETIME(ATraceCore, PassTarget);
 	DOREPLIFETIME(ATraceCore, PassStartServerTime);
@@ -290,7 +476,7 @@ void ATraceCore::BeginPlay()
 	if (HasAuthority())
 	{
 		// Nobody has it yet and nobody is owed it. The Tick backstop grants it to the default team
-		// if the GameMode has not called ResetToCenter()/KickoffTo() within a few seconds.
+		// if the GameMode has not called KickoffTo() within a few seconds.
 		PendingGrantTime = GetServerTimeSeconds() + TraceCoreTuning::MaxHolderlessSeconds;
 	}
 
@@ -369,10 +555,21 @@ void ATraceCore::Tick(float DeltaSeconds)
 		// be a dead match, and this class's one hard promise is that the Core never goes missing.
 		if (bOutOfPlay)
 		{
+			// "LIVE" MUST EXCLUDE HALF TIME, and the obvious test does not.
+			// ATraceGameState.h states it outright: TraceMatchState stays InProgress THROUGH the
+			// interval on purpose. So `== InProgress` alone is true during half time, and this
+			// recovery would fire 15 s into a 12 s break — granting the Core to Blue, starting a
+			// trace and teleporting pawns in the middle of the side switch. Four seconds of margin,
+			// on a break length that is `config` AND settable per-run via ?breaklen= and
+			// -TraceHalfTimeSeconds=. Any longer break trips it.
+			//
+			// IsHalfTimeBreak() is the question this code was always asking; the constant's own doc
+			// comment says "while a half is actually RUNNING", which is not what the enum means.
 			bool bMatchLive = false;
 			if (const ATraceGameState* GameState = GetWorld() ? GetWorld()->GetGameState<ATraceGameState>() : nullptr)
 			{
-				bMatchLive = (GameState->TraceMatchState == ETraceMatchState::InProgress);
+				bMatchLive = (GameState->TraceMatchState == ETraceMatchState::InProgress)
+					&& !GameState->IsHalfTimeBreak();
 			}
 
 			if (bMatchLive && (Now - PendingGrantTime) >= TraceCoreTuning::OutOfPlayRecoverySeconds)
@@ -409,6 +606,88 @@ void ATraceCore::Tick(float DeltaSeconds)
 	// ---- 4. Held: run the pass state machine and keep the trace alive. -------------------------
 	ServerTickPass(DeltaSeconds);
 	EnforceHolderTrailState();
+	SamplePassAvailabilityStats();
+}
+
+void ATraceCore::SamplePassAvailabilityStats()
+{
+	if (!HasAuthority() || CVarTracePassStats.GetValueOnAnyThread() == 0 || !IsValid(Carrier) || !Carrier->IsAlive())
+	{
+		return;
+	}
+
+	// 10 Hz. The point is a distribution over a match, not a per-frame trace storm - and each sample
+	// runs a handful of line traces per teammate.
+	const float Now = GetServerTimeSeconds();
+	if ((Now - TracePassStats::GStats.LastSampleTime) < 0.1f)
+	{
+		return;
+	}
+	TracePassStats::GStats.LastSampleTime = Now;
+
+	TArray<ATraceCharacter*> Candidates;
+	GatherCharacters(Candidates);
+
+	bool bAnyLegal = false;
+	for (const ATraceCharacter* Candidate : Candidates)
+	{
+		if (Candidate == Carrier || !IsValid(Candidate))
+		{
+			continue;
+		}
+		// Only count TEAMMATES: an enemy failing "not an ally" says nothing about whether the pass
+		// option should have shown up, and there are five of them per sample drowning the histogram.
+		if (!AreAllies(Carrier->GetTeam(), Candidate->GetTeam()))
+		{
+			continue;
+		}
+
+		++TracePassStats::GStats.TeammatesConsidered;
+
+		ETracePassRejectReason Code = ETracePassRejectReason::None;
+		if (IsLegalPassTarget(Carrier, Candidate, /*bRequireAim=*/true, /*OutRejectReason=*/nullptr, &Code))
+		{
+			++TracePassStats::GStats.TeammatesLegal;
+			bAnyLegal = true;
+		}
+		else
+		{
+			const int32 Index = FMath::Clamp(static_cast<int32>(Code), 0, 7);
+			++TracePassStats::GStats.RefusalCount[Index];
+		}
+	}
+
+	++TracePassStats::GStats.CarrySamples;
+	if (bAnyLegal)
+	{
+		++TracePassStats::GStats.RawSamplesWithTarget;
+	}
+
+	// THE NUMBER THE BUG REPORT IS ABOUT. FindPassTargetFor() is what ATraceHUD polls to decide
+	// whether to show the pass affordance and what the bots ask before committing a pass, so this -
+	// not the raw rule above - is "did the pass option show up".
+	if (FindPassTargetFor(Carrier) != nullptr)
+	{
+		++TracePassStats::GStats.SamplesWithTarget;
+	}
+	else
+	{
+		++TracePassStats::GStats.SamplesWithoutTarget;
+	}
+
+	const float Interval = CVarTracePassStatsInterval.GetValueOnAnyThread();
+	if (Interval > 0.f)
+	{
+		if (TracePassStats::GStats.LastDumpTime <= 0.0)
+		{
+			TracePassStats::GStats.LastDumpTime = Now;
+		}
+		else if ((Now - TracePassStats::GStats.LastDumpTime) >= Interval)
+		{
+			TracePassStats::GStats.LastDumpTime = Now;
+			TracePassStats::Dump();
+		}
+	}
 }
 
 
@@ -441,11 +720,8 @@ FVector ATraceCore::GetHomeLocation() const
 	return SpawnHomeLocation;
 }
 
-bool ATraceCore::IsPickupLockedOutFor(const ATraceCharacter* /*Character*/) const
-{
-	// Nothing is picked up any more, so nothing can be locked out of it.
-	return false;
-}
+// IsPickupLockedOutFor() IS DELETED. Zero callers, and it returned false unconditionally: there is
+// no loose Core and nothing is ever picked up, so there was nothing to be locked out of.
 
 float ATraceCore::GetServerTimeSeconds() const
 {
@@ -488,6 +764,17 @@ bool ATraceCore::IsShieldSuppressedFor(const AActor* Character)
 	return Core != nullptr && Core->bPassActive && Core->Carrier == Character;
 }
 
+bool ATraceCore::IsCoreHolder(const AActor* Character)
+{
+	if (Character == nullptr)
+	{
+		return false;
+	}
+
+	const ATraceCore* Core = ATraceCore::Get(Character->GetWorld());
+	return Core != nullptr && Core->Carrier == Character;
+}
+
 bool ATraceCore::IsTraceInvulnerableFor(const AActor* Character)
 {
 	// Identical condition to IsShieldSuppressedFor by design: §4 says the two flip "simultaneously",
@@ -511,7 +798,7 @@ ATraceCharacter* ATraceCore::GetEffectivePassTarget() const
 
 float ATraceCore::GetPassProgress() const
 {
-	const float Hold = FMath::Max(0.01f, TraceCoreTuning::PassHoldSeconds);
+	const float Hold = FMath::Max(0.01f, UTraceSettings::Get().PassHoldSeconds);
 	const float Now = GetServerTimeSeconds();
 
 	// Server state wins the moment it exists; prediction only covers the round trip before it does.
@@ -573,17 +860,40 @@ void ATraceCore::GatherCharacters(TArray<ATraceCharacter*>& OutCharacters) const
 	}
 }
 
+const TCHAR* TracePassStats::RefusalName(int32 Index)
+{
+	switch (static_cast<ETracePassRejectReason>(Index))
+	{
+	case ETracePassRejectReason::InvalidOrSelf:     return TEXT("invalid or self");
+	case ETracePassRejectReason::Dead:              return TEXT("dead");
+	case ETracePassRejectReason::NotAnAlly:         return TEXT("not an ally");
+	case ETracePassRejectReason::OutOfRange:        return TEXT("out of range");
+	case ETracePassRejectReason::NoLineOfSight:     return TEXT("no line of sight");
+	case ETracePassRejectReason::Behind:            return TEXT("behind us");
+	case ETracePassRejectReason::NotUnderCrosshair: return TEXT("not under crosshair");
+	default:                                        return TEXT("legal");
+	}
+}
+
 bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCharacter* Candidate, bool bRequireAim,
-	const TCHAR** OutRejectReason) const
+	const TCHAR** OutRejectReason, ETracePassRejectReason* OutRejectCode) const
 {
 	// Every `return false` below names itself. Costs nothing when the caller does not ask (the
 	// gameplay path passes null), and turns "no receiver found" — which is what a carrier who cannot
 	// get rid of the Core actually experiences — into a specific broken test.
-	const auto Reject = [OutRejectReason](const TCHAR* Reason) -> bool
+	//
+	// The CODE is what the grace window reads: the state machine has to know whether the refusal was
+	// a transient geometric blink (ride it out) or a fact about the receiver (cancel now). The string
+	// stays for Trace.DebugPassTargets, derived from the code so the two can never disagree.
+	const auto Reject = [OutRejectReason, OutRejectCode](ETracePassRejectReason Code) -> bool
 	{
+		if (OutRejectCode != nullptr)
+		{
+			*OutRejectCode = Code;
+		}
 		if (OutRejectReason != nullptr)
 		{
-			*OutRejectReason = Reason;
+			*OutRejectReason = TracePassStats::RefusalName(static_cast<int32>(Code));
 		}
 		return false;
 	};
@@ -592,29 +902,36 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 	{
 		*OutRejectReason = TEXT("legal");
 	}
+	if (OutRejectCode != nullptr)
+	{
+		*OutRejectCode = ETracePassRejectReason::None;
+	}
 
 	if (!IsValid(Holder) || !IsValid(Candidate) || Holder == Candidate)
 	{
-		return Reject(TEXT("invalid or self"));
+		return Reject(ETracePassRejectReason::InvalidOrSelf);
 	}
 
 	// §9.3 [ASSUMPTION]: you cannot pass to a dead or respawning teammate.
 	if (!Candidate->IsAlive())
 	{
-		return Reject(TEXT("dead"));
+		return Reject(ETracePassRejectReason::Dead);
 	}
 
 	if (!AreAllies(Holder->GetTeam(), Candidate->GetTeam()))
 	{
-		return Reject(TEXT("not an ally"));
+		return Reject(ETracePassRejectReason::NotAnAlly);
 	}
 
-	const FVector ViewLocation = Holder->GetPawnViewLocation();
-	const FVector TargetChest = Candidate->GetActorLocation() + FVector(0.0, 0.0, TraceCoreTuning::TargetChestOffsetZ);
+	const UTraceSettings& Settings = UTraceSettings::Get();
 
-	if (FVector::DistSquared(ViewLocation, TargetChest) > FMath::Square(TraceCoreTuning::PassMaxRange))
+	const FVector ViewLocation = Holder->GetPawnViewLocation();
+	const FVector TargetChest = Candidate->GetActorLocation()
+		+ FVector(0.0, 0.0, static_cast<double>(Settings.PassTargetChestOffsetZ));
+
+	if (FVector::DistSquared(ViewLocation, TargetChest) > FMath::Square(static_cast<double>(Settings.PassMaxRange)))
 	{
-		return Reject(TEXT("out of range"));
+		return Reject(ETracePassRejectReason::OutOfRange);
 	}
 
 	// Line of sight, against WORLD GEOMETRY ONLY - and "world geometry" means ECC_Visibility, not an
@@ -633,6 +950,12 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 	// endzone trigger ignores it by construction (TraceEndzone.cpp sets every channel to Ignore, then
 	// opens ECC_Pawn alone), and the "Pawn" capsule profile ignores it too - so a teammate standing in
 	// between still cannot invalidate the pass, which was the whole reason the object query was chosen.
+	//
+	// §4.1 FIX - PROBE MORE THAN ONE POINT. A single chest ray is a coin flip against the new cover
+	// density: a receiver whose head and shoulders are plainly visible over a 1x (176 uu) block still
+	// fails, because the one point being probed is the one point behind it. Any clear probe now means
+	// line of sight, which is both more generous and much closer to what the passer can actually see.
+	// The chest is probed first so the common case is still exactly one trace.
 	const UWorld* World = GetWorld();
 	if (World != nullptr)
 	{
@@ -641,9 +964,26 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 		QueryParams.AddIgnoredActor(Holder);
 		QueryParams.AddIgnoredActor(Candidate);
 
-		if (World->LineTraceTestByChannel(ViewLocation, TargetChest, ECC_Visibility, QueryParams))
+		const FVector CandidateLocation = Candidate->GetActorLocation();
+		const int32 ProbeCount = TraceCoreTuning::ResolvedMultiPointLos(Settings)
+			? static_cast<int32>(UE_ARRAY_COUNT(TraceCoreTuning::LosProbeOffsetsZ))
+			: 1;
+
+		bool bHaveLineOfSight = false;
+		for (int32 ProbeIndex = 0; ProbeIndex < ProbeCount && !bHaveLineOfSight; ++ProbeIndex)
 		{
-			return Reject(TEXT("no line of sight"));
+			// Probe 0 is the chest and must be the SAME point the aim test and the range test used,
+			// or the pass can be aimed at a spot line of sight was never checked against.
+			const double ProbeZ = (ProbeIndex == 0)
+				? static_cast<double>(Settings.PassTargetChestOffsetZ)
+				: TraceCoreTuning::LosProbeOffsetsZ[ProbeIndex];
+			const FVector ProbePoint = CandidateLocation + FVector(0.0, 0.0, ProbeZ);
+			bHaveLineOfSight = !World->LineTraceTestByChannel(ViewLocation, ProbePoint, ECC_Visibility, QueryParams);
+		}
+
+		if (!bHaveLineOfSight)
+		{
+			return Reject(ETracePassRejectReason::NoLineOfSight);
 		}
 	}
 
@@ -666,11 +1006,12 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 	const double Cosine = FVector::DotProduct(ToTarget, AimDirection);
 	if (Cosine <= 0.0)
 	{
-		return Reject(TEXT("behind us"));
+		return Reject(ETracePassRejectReason::Behind);
 	}
 
 	// (a) angular cone - what makes a distant receiver acquirable at all.
-	if (Cosine >= FMath::Cos(FMath::DegreesToRadians(TraceCoreTuning::PassAimConeDegrees)))
+	const double ConeDegrees = TraceCoreTuning::ResolvedAimConeDegrees(Settings);
+	if (Cosine >= FMath::Cos(FMath::DegreesToRadians(ConeDegrees)))
 	{
 		return true;
 	}
@@ -693,10 +1034,10 @@ bool ATraceCore::IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCh
 	FVector ClosestOnCapsule = FVector::ZeroVector;
 	FMath::SegmentDistToSegmentSafe(ViewLocation, RayEnd, CapsuleBottom, CapsuleTop, ClosestOnRay, ClosestOnCapsule);
 
-	const double Threshold = CapsuleRadius + TraceCoreTuning::PassAimSlack;
+	const double Threshold = CapsuleRadius + TraceCoreTuning::ResolvedAimSlack(Settings);
 	if (FVector::DistSquared(ClosestOnRay, ClosestOnCapsule) > (Threshold * Threshold))
 	{
-		return Reject(TEXT("not under the crosshair"));
+		return Reject(ETracePassRejectReason::NotUnderCrosshair);
 	}
 
 	return true;
@@ -708,6 +1049,8 @@ ATraceCharacter* ATraceCore::FindPassTargetFor(const ATraceCharacter* Holder) co
 	{
 		return nullptr;
 	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
 
 	TArray<ATraceCharacter*> Candidates;
 	GatherCharacters(Candidates);
@@ -727,7 +1070,8 @@ ATraceCharacter* ATraceCore::FindPassTargetFor(const ATraceCharacter* Holder) co
 
 		// Among everyone who qualifies, take whoever is nearest the crosshair. With two teammates
 		// overlapping on screen this is the one the player is obviously pointing at.
-		const FVector TargetChest = Candidate->GetActorLocation() + FVector(0.0, 0.0, TraceCoreTuning::TargetChestOffsetZ);
+		const FVector TargetChest = Candidate->GetActorLocation()
+			+ FVector(0.0, 0.0, static_cast<double>(Settings.PassTargetChestOffsetZ));
 		const FVector ToTarget = (TargetChest - ViewLocation).GetSafeNormal();
 		const double Cosine = FVector::DotProduct(ToTarget, AimDirection);
 
@@ -738,7 +1082,52 @@ ATraceCharacter* ATraceCore::FindPassTargetFor(const ATraceCharacter* Holder) co
 		}
 	}
 
-	return Best;
+	// --- §4.1 FIX: sticky acquisition ------------------------------------------------------------
+	//
+	// Without this the answer above flickers, and the flicker IS the reported bug. ATraceHUD polls
+	// this at 20 Hz purely to decide whether to draw the receiver highlight, so a teammate who is
+	// jogging past a lane rail makes the pass option itself blink in and out - "sometimes the pass
+	// option doesn't show up". It also costs real passes: the button is only sampled when it is
+	// pressed, so a press that lands on a flickered-out frame acquires nobody at all.
+	//
+	// Identity, team, life and range are re-tested every single time (bRequireAim false skips only
+	// the aim cone, and the LOS probe inside is what the window is forgiving). So a receiver who dies
+	// or is genuinely miles away is dropped immediately; only the two flickery geometric tests get
+	// held over, and only for Trace.Pass.StickySeconds.
+	const float StickyWindow = TraceCoreTuning::ResolvedAcquireSticky(Settings);
+	const float Now = GetServerTimeSeconds();
+
+	if (Best != nullptr)
+	{
+		StickyAcquireHolder = const_cast<ATraceCharacter*>(Holder);
+		StickyAcquireTarget = Best;
+		StickyAcquireServerTime = Now;
+		return Best;
+	}
+
+	if (StickyWindow > 0.f
+		&& StickyAcquireHolder.Get() == Holder
+		&& (Now - StickyAcquireServerTime) <= StickyWindow)
+	{
+		if (ATraceCharacter* Held = StickyAcquireTarget.Get())
+		{
+			// Everything except the aim cone and line of sight, re-checked for real.
+			if (IsValid(Held) && Held != Holder && Held->IsAlive()
+				&& AreAllies(Holder->GetTeam(), Held->GetTeam())
+				&& FVector::DistSquared(Holder->GetPawnViewLocation(),
+					Held->GetActorLocation() + FVector(0.0, 0.0, static_cast<double>(Settings.PassTargetChestOffsetZ)))
+					<= FMath::Square(static_cast<double>(Settings.PassMaxRange)))
+			{
+				if (HasAuthority() && CVarTracePassStats.GetValueOnAnyThread() != 0)
+				{
+					++TracePassStats::GStats.StickySaves;
+				}
+				return Held;
+			}
+		}
+	}
+
+	return nullptr;
 }
 
 
@@ -759,7 +1148,12 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 	if (bPressed)
 	{
 		// Only the living holder may arm it.
-		if (Requester != Carrier || !Carrier->IsAlive())
+		//
+		// IsValid(Carrier) FIRST, explicitly. The old form (`Requester != Carrier || !Carrier->...`)
+		// was correct only because || short-circuits when Carrier is null and Requester is validated
+		// non-null above — i.e. it was one clause reorder away from being a client crash. Stating the
+		// null check is free and removes the trap.
+		if (!IsValid(Carrier) || Requester != Carrier || !Carrier->IsAlive())
 		{
 			return;
 		}
@@ -844,8 +1238,14 @@ void ATraceCore::ServerTickPass(float /*DeltaSeconds*/)
 
 	const float Now = GetServerTimeSeconds();
 
+	const bool bCollectPassStats = (CVarTracePassStats.GetValueOnAnyThread() != 0);
+
 	if (!IsValid(Carrier) || !Carrier->IsAlive())
 	{
+		if (bPassActive && bCollectPassStats)
+		{
+			++TracePassStats::GStats.CancelHolderGone;
+		}
 		CancelPass(TEXT("holder gone"));
 		ClearPassInput();
 		return;
@@ -857,6 +1257,10 @@ void ATraceCore::ServerTickPass(float /*DeltaSeconds*/)
 		if (!bPassInputHeld)
 		{
 			// §4 [ASSUMPTION]: releasing early cancels, with the same instant restoration.
+			if (bCollectPassStats)
+			{
+				++TracePassStats::GStats.CancelReleased;
+			}
 			CancelPass(TEXT("released"));
 			return;
 		}
@@ -871,13 +1275,77 @@ void ATraceCore::ServerTickPass(float /*DeltaSeconds*/)
 		const AController* HolderController = Carrier->GetController();
 		const bool bHolderIsAI = (HolderController != nullptr) && !HolderController->IsPlayerController();
 
-		if (!IsLegalPassTarget(Carrier, PassTarget, /*bRequireAim=*/!bHolderIsAI))
+		ETracePassRejectReason RejectCode = ETracePassRejectReason::None;
+		const bool bStillLegal = IsLegalPassTarget(Carrier, PassTarget, /*bRequireAim=*/!bHolderIsAI,
+			/*OutRejectReason=*/nullptr, &RejectCode);
+
+		// --- §4.1 FIX: LINE-OF-SIGHT / AIM GRACE ------------------------------------------------
+		//
+		// The measured failure this exists for: a pass cancelled 24 ms before it would have completed
+		// because the receiver crossed behind a lane rail. Both remaining tests here are sampled once
+		// per frame against geometry, and a receiver who is RUNNING - which is every receiver worth
+		// passing to - blinks through them repeatedly over a 0.5 s hold. One frame of occlusion must
+		// not be the end of the pass.
+		//
+		// Only the transient geometric refusals are graced. A receiver who dies, who is no longer an
+		// ally or who has been destroyed cancels on the very frame it happens, exactly as before,
+		// because granting the Core to a corpse is a real bug and a rail is not.
+		const float GraceSeconds = TraceCoreTuning::ResolvedValidationGrace(UTraceSettings::Get());
+
+		if (bStillLegal)
 		{
-			CancelPass(TEXT("looked away or target invalid"));
-			return;
+			if (PassGraceStartServerTime > 0.f)
+			{
+				// Rode it out. This is the counter that says how often the fix earns its keep.
+				if (bCollectPassStats)
+				{
+					++TracePassStats::GStats.GraceSaves;
+					TracePassStats::GStats.GraceSecondsAccrued += FMath::Max(0.f, Now - PassGraceStartServerTime);
+				}
+				PassGraceStartServerTime = 0.f;
+			}
+		}
+		else
+		{
+			const bool bTransient = IsTransientPassRejection(RejectCode);
+			if (!bTransient || GraceSeconds <= 0.f)
+			{
+				if (bCollectPassStats)
+				{
+					++TracePassStats::GStats.CancelLostTarget;
+					if (bTransient && PassGraceStartServerTime > 0.f)
+					{
+						++TracePassStats::GStats.GraceExpired;
+					}
+				}
+				PassGraceStartServerTime = 0.f;
+				CancelPass(TEXT("looked away or target invalid"));
+				return;
+			}
+
+			if (PassGraceStartServerTime <= 0.f)
+			{
+				PassGraceStartServerTime = Now;
+			}
+			else if ((Now - PassGraceStartServerTime) > GraceSeconds)
+			{
+				if (bCollectPassStats)
+				{
+					++TracePassStats::GStats.CancelLostTarget;
+					++TracePassStats::GStats.GraceExpired;
+					TracePassStats::GStats.GraceSecondsAccrued += GraceSeconds;
+				}
+				PassGraceStartServerTime = 0.f;
+				CancelPass(TEXT("receiver stayed out of sight past the grace window"));
+				return;
+			}
+			// Inside the grace window: fall through and keep the pass alive, including completing it
+			// if the timer runs out here. Completing during a blink of occlusion is correct - the
+			// player held a legal receiver for the full 0.5 s and a rail passing across them at the
+			// last moment is not a decision they made.
 		}
 
-		if ((Now - PassStartServerTime) >= TraceCoreTuning::PassHoldSeconds)
+		if ((Now - PassStartServerTime) >= FMath::Max(0.05f, UTraceSettings::Get().PassHoldSeconds))
 		{
 			ATraceCharacter* Receiver = PassTarget;
 
@@ -886,7 +1354,12 @@ void ATraceCore::ServerTickPass(float /*DeltaSeconds*/)
 
 			// Cooldown lands on the passer's side of the transfer, but the Core is about to change
 			// hands so it is really only meaningful if the pass is somehow refused below.
-			PassCooldownEndServerTime = Now + TraceCoreTuning::PassCooldownSeconds;
+			PassCooldownEndServerTime = Now + FMath::Max(0.f, UTraceSettings::Get().PassCooldownSeconds);
+
+			if (bCollectPassStats)
+			{
+				++TracePassStats::GStats.PassesCompleted;
+			}
 
 			CancelPass(nullptr);          // Silent: this is a completion, not an abort.
 			GrantTo(Receiver, ETraceCoreGrantReason::Pass);
@@ -921,6 +1394,12 @@ void ATraceCore::BeginPass(ATraceCharacter* Target)
 	bPassActive = true;
 	PassTarget = Target;
 	PassStartServerTime = GetServerTimeSeconds();
+	PassGraceStartServerTime = 0.f;
+
+	if (CVarTracePassStats.GetValueOnAnyThread() != 0)
+	{
+		++TracePassStats::GStats.PassesBegun;
+	}
 
 	// THE RISK BEAT. Both halves of §4 happen right here, on one frame, from one bool:
 	//   - the trace hardens (ApplyTraceInvulnerability, read back by UTraceTrailComponent), and
@@ -974,13 +1453,23 @@ void ATraceCore::CancelPass(const TCHAR* Reason)
 		// minute, since only one player can be passing at a time.
 		UE_LOG(LogTraceGame, Display, TEXT("Core: pass cancelled (%s) - shield restored, trace vulnerable"), Reason);
 
-		// A cancelled attempt still spends the cooldown. Without this, tapping the button is a free
-		// way to churn the shield state (and the packets that carry it) every frame.
-		PassCooldownEndServerTime = GetServerTimeSeconds() + TraceCoreTuning::PassCooldownSeconds;
+		// A cancelled attempt still spends A cooldown. Without one, tapping the button is a free way
+		// to churn the shield state (and the packets that carry it) every frame.
+		//
+		// §4.1 FIX: it is no longer the SAME cooldown a completed pass spends. Two full seconds of
+		// lockout after an unwanted cancel is a large part of "passing is inconsistent": the player
+		// holds mouse1 on a teammate, watches the ring fill, watches it die because the receiver
+		// clipped a rail, and then gets nothing for two more seconds while still holding the button
+		// on a perfectly legal target. 0.25 s still bounds the churn to one cycle per
+		// (grace + cooldown) = 0.4 s, which is far below anything a player experiences as a lockout,
+		// and it is what "make re-acquisition generous after a cancel" means in practice.
+		PassCooldownEndServerTime = GetServerTimeSeconds()
+			+ TraceCoreTuning::ResolvedCancelCooldown(UTraceSettings::Get());
 	}
 
 	bPassActive = false;
 	PassTarget = nullptr;
+	PassGraceStartServerTime = 0.f;
 
 	// Instant restoration, both halves together (§9.2: the implemented answer is "instant").
 	ApplyTraceInvulnerability();
@@ -1011,7 +1500,8 @@ void ATraceCore::DriveBotAimAtPassTarget()
 	}
 
 	const FVector ViewLocation = Carrier->GetPawnViewLocation();
-	const FVector TargetChest = PassTarget->GetActorLocation() + FVector(0.0, 0.0, TraceCoreTuning::TargetChestOffsetZ);
+	const FVector TargetChest = PassTarget->GetActorLocation()
+		+ FVector(0.0, 0.0, static_cast<double>(UTraceSettings::Get().PassTargetChestOffsetZ));
 
 	const FVector ToTarget = TargetChest - ViewLocation;
 	if (!ToTarget.IsNearlyZero())
@@ -1072,7 +1562,6 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 	ClearPassInput();
 
 	Carrier = NewHolder;
-	State = ECoreState::Carried;
 	PendingGrantTeam = ETraceTeam::None;
 	bFallbackQueued = false;
 	bOutOfPlay = false;
@@ -1083,7 +1572,9 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 
 	// The receiver may not pass back instantly; the cooldown belongs to whoever holds the Core.
 	PassCooldownEndServerTime = GetServerTimeSeconds()
-		+ ((Reason == ETraceCoreGrantReason::Pass) ? TraceCoreTuning::PassCooldownSeconds : 0.f);
+		+ ((Reason == ETraceCoreGrantReason::Pass)
+			? FMath::Max(0.f, UTraceSettings::Get().PassCooldownSeconds)
+			: 0.f);
 
 	ApplyAttachment();
 
@@ -1091,14 +1582,22 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 	// already know it is not allowed to lay a point yet.
 	if (NewHolder->Trail != nullptr)
 	{
-		NewHolder->Trail->SetEmitGrace(bTeamChanged ? TraceCoreTuning::TransferGraceSeconds : 0.f);
+		// Spec v3 section 1: 1.0 -> 0.4 s, and now a UTraceSettings knob rather than a constant.
+		NewHolder->Trail->SetEmitGrace(bTeamChanged
+			? FMath::Max(0.f, UTraceSettings::Get().CoreTurnoverGraceSeconds) : 0.f);
 	}
 
+	// SetCarrying() is the SOLE writer of ATracePlayerState::bIsCarrier — it sets the flag and
+	// force-updates it. This used to write the mirror a second time right here, which is the
+	// duplicated-state shape the audit flagged.
 	NewHolder->SetCarrying(true);
-	if (ATracePlayerState* HolderState = NewHolder->GetPlayerState<ATracePlayerState>())
-	{
-		HolderState->bIsCarrier = true;
-	}
+
+	// Cache the holder's PlayerState. Not an optimisation: the PlayerState OUTLIVES the pawn, and
+	// ReleaseHolder() has a path where the pawn is already invalid by the time it runs. Without a
+	// handle taken while the pawn was alive there is nothing left to clear the mirror through, and a
+	// phantom carrier sticks on the scoreboard for the rest of the match. See ReleaseHolder().
+	HolderPlayerState = NewHolder->GetPlayerState<ATracePlayerState>();
+
 	if (NewHolder->Trail != nullptr)
 	{
 		NewHolder->Trail->SetEmitting(true);
@@ -1165,7 +1664,6 @@ void ATraceCore::ReleaseHolder()
 	BoundDeathHolder = nullptr;
 
 	Carrier = nullptr;
-	State = ECoreState::Loose;
 	SetOwner(nullptr);
 
 	// Possession is gone, so the held-button state that belonged to it is gone too. Every path that
@@ -1174,6 +1672,23 @@ void ATraceCore::ReleaseHolder()
 	ClearPassInput();
 
 	DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+
+	// CLEAR THE MIRROR BEFORE THE EARLY-OUT, through the handle cached in GrantTo.
+	//
+	// The bug this fixes: ATracePlayerState OUTLIVES the pawn. If the holder's pawn became invalid
+	// before release — which Tick() step 2 exists specifically to handle, and which a GC'd pawn or a
+	// level teardown also produces — the `!IsValid(Previous)` return below fired first and the mirror
+	// was never cleared. Nothing else could clear it either: ATracePlayerState::CopyProperties
+	// deliberately does not carry bIsCarrier across, and SetCarrying() early-outs when the pawn's own
+	// flag already matches, so a fresh pawn (default false) never writes it. The result was a
+	// permanent phantom carrier on the scoreboard (ATraceHUD reads Member->bIsCarrier) for the rest
+	// of the match.
+	if (ATracePlayerState* CachedState = HolderPlayerState.Get())
+	{
+		CachedState->bIsCarrier = false;
+		CachedState->ForceNetUpdate();
+	}
+	HolderPlayerState = nullptr;
 
 	if (!IsValid(Previous))
 	{
@@ -1184,11 +1699,9 @@ void ATraceCore::ReleaseHolder()
 	// currently unwinding, after the GameMode's own death path has already released the holder.
 	RecentlyReleasedHolder = Previous;
 
+	// Sole writer of the mirror for the live-pawn case (see ATraceCharacter::SetCarrying). The
+	// explicit PlayerState write that used to sit here is gone with the other duplicates.
 	Previous->SetCarrying(false);
-	if (ATracePlayerState* PreviousState = Previous->GetPlayerState<ATracePlayerState>())
-	{
-		PreviousState->bIsCarrier = false;
-	}
 
 	// Stop laying, but do NOT wipe what is already there: an expiring trace is counterplay the enemy
 	// team has already earned, and popping it out of existence reads worse than letting it fade.
@@ -1385,36 +1898,11 @@ void ATraceCore::TryPickup(ATraceCharacter* Character)
 	GrantTo(Character, ETraceCoreGrantReason::Debug);
 }
 
-void ATraceCore::Throw(const FVector& /*Direction*/, float /*Speed*/)
-{
-	if (!HasAuthority())
-	{
-		return;
-	}
-
-	// Nothing is thrown any more. This is the legacy "pass" entry point
-	// (ATraceCharacter::PerformPass, and through it every bot's ConsiderPass()), so it is
-	// re-expressed as a pass INPUT: press, and let the state machine hold it.
-	//
-	// The supplied direction is deliberately ignored. The server evaluates the holder's own aim
-	// (ATraceCharacter::GetAimDirection, which on the server reads the replicated control rotation),
-	// which is the only aim it is entitled to trust. Bots set their control rotation onto the
-	// receiver immediately before calling this, so they acquire on the first frame; the state
-	// machine then holds their crosshair there for them (DriveBotAimAtPassTarget).
-	bPassInputHeld = true;
-	PassInputInstigator = Carrier;
-	ServerTickPass(0.f);
-
-	// Single shot. This entry point is a PRESS with no matching release (ATraceCharacter::DoPass is
-	// bound to a pressed-only action, and a bot never lets go of anything), so if nothing was
-	// acquired the button must not stay latched - otherwise the holder would silently pass to the
-	// first teammate who later wandered across their crosshair. Once a pass IS running the flag
-	// stays set and the state machine owns it until the hold completes or the holder looks away.
-	if (!bPassActive)
-	{
-		ClearPassInput();
-	}
-}
+// Throw() IS DELETED. It was the legacy pass entry point, documented as being reached from
+// ATraceCharacter::PerformPass "and therefore the bots' DoPass()" — a map to a road that no longer
+// existed: PerformPass called RequestPassInput directly and never went through here, and the bots go
+// through ApplyPassInput -> DoPassPressed -> RequestPassInput. Zero callers, and all three of the
+// functions it named are deleted too. The one door is RequestPassInput().
 
 void ATraceCore::DropAt(const FVector& /*Location*/, const FVector& /*Impulse*/)
 {
@@ -1436,25 +1924,8 @@ void ATraceCore::DropAt(const FVector& /*Location*/, const FVector& /*Impulse*/)
 	ForceNetUpdate();
 }
 
-void ATraceCore::ResetToCenter()
-{
-	if (!HasAuthority())
-	{
-		return;
-	}
-
-	// §1 [ASSUMPTION] - American-football kickoff. Every caller of this is a score, a match start or
-	// a half-time reset, and in the scoring case the outgoing holder IS the team that just scored,
-	// so the team that was scored on is simply their opponent. That means the kickoff rule needs no
-	// change at the call site.
-	const ETraceTeam ScoringTeam = GetHolderTeam();
-	const ETraceTeam ReceivingTeam = (ScoringTeam != ETraceTeam::None)
-		? TraceOpposingTeam(ScoringTeam)
-		: TraceCoreTuning::DefaultKickoffTeam;
-
-	KickoffTo(ReceivingTeam);
-}
-
+// ResetToCenter() IS DELETED. Zero callers — every score, match start and half-time reset calls
+// KickoffTo() directly, which is the entry point this merely wrapped.
 
 // =================================================================================================
 // Presentation

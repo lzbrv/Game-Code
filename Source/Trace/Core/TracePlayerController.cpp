@@ -22,8 +22,7 @@
 #include "InputMappingContext.h"
 #include "InputModifiers.h"
 #include "InputTriggers.h"                 // ETriggerEvent
-#include "Movement/TraceCharacterMovementComponent.h"   // dash/boost state for the HUD accessors
-#include "Settings/TraceGameplayCompat.h"  // compile-time detection of not-yet-landed gameplay APIs
+#include "Movement/TraceCharacterMovementComponent.h"   // dash charges, for the HUD accessors
 #include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
 #include "Trace.h"                         // LogTraceGame
 #include "TraceSettings.h"                 // gameplay tuning (dash cooldown, and so on)
@@ -197,7 +196,7 @@ void ATracePlayerController::BuildInputData()
 		IA_Dash       = MakeAction(TEXT("IA_Dash"),       EInputActionValueType::Boolean);
 		IA_Scoreboard = MakeAction(TEXT("IA_Scoreboard"), EInputActionValueType::Boolean);
 		IA_Crouch     = MakeAction(TEXT("IA_Crouch"),     EInputActionValueType::Boolean);
-		IA_Boost      = MakeAction(TEXT("IA_Boost"),      EInputActionValueType::Boolean);
+		IA_Parry      = MakeAction(TEXT("IA_Parry"),      EInputActionValueType::Boolean);
 
 		// Cumulative accumulation is REQUIRED for opposing keys to cancel. UInputAction defaults to
 		// TakeHighestAbsoluteValue, and UEnhancedPlayerInput::ProcessActionMappingEvent merges with
@@ -309,7 +308,7 @@ void ATracePlayerController::ApplyControlSettings()
 	MapButton(IA_Fire,       KeyFor(ETraceInputAction::Fire));
 	MapButton(IA_Pass,       KeyFor(ETraceInputAction::Pass));
 	MapButton(IA_Dash,       KeyFor(ETraceInputAction::Dash));
-	MapButton(IA_Boost,      KeyFor(ETraceInputAction::Boost));
+	MapButton(IA_Parry,      KeyFor(ETraceInputAction::Parry));
 	MapButton(IA_Scoreboard, KeyFor(ETraceInputAction::Scoreboard));
 
 	// The context is already registered by the time a settings change arrives, and Enhanced Input
@@ -449,7 +448,12 @@ void ATracePlayerController::SetupInputComponent()
 	EIC->BindAction(IA_Pass, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnPassCompleted);
 
 	EIC->BindAction(IA_Dash, ETriggerEvent::Started,   this, &ATracePlayerController::OnDashStarted);
-	EIC->BindAction(IA_Boost, ETriggerEvent::Started,  this, &ATracePlayerController::OnBoostStarted);
+
+	// Parry (spec v3 §3). Bound on all three edges for the symmetry argument in the header, even
+	// though the release path is deliberately empty today.
+	EIC->BindAction(IA_Parry, ETriggerEvent::Started,   this, &ATracePlayerController::OnParryStarted);
+	EIC->BindAction(IA_Parry, ETriggerEvent::Completed, this, &ATracePlayerController::OnParryCompleted);
+	EIC->BindAction(IA_Parry, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnParryCompleted);
 
 	// Crouch is a HELD action — ground slide while down, stand on release — so it needs the release
 	// edge as well, and Canceled for the same reason the scoreboard does: losing window focus with
@@ -585,8 +589,10 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 // -------------------------------------------------------------------------------------------
 // HUD data sources
 //
-// See Settings/TraceGameplayCompat.h. Each of these reads the real gameplay accessor when the
-// movement/character slice has landed it, and a stated fallback when it has not.
+// These call the real gameplay accessors directly. They used to go through a SFINAE compat header
+// (Settings/TraceGameplayCompat.h) while the movement and character slices were still landing;
+// those slices have landed and that header is deleted, so a renamed or removed accessor is a
+// compile error again rather than a meter that silently reverts to a fallback value.
 // -------------------------------------------------------------------------------------------
 
 bool ATracePlayerController::GetDashHudState(FTraceDashHudState& OutState) const
@@ -614,10 +620,10 @@ bool ATracePlayerController::GetDashHudState(FTraceDashHudState& OutState) const
 	OutState.Remaining = Remaining;
 	OutState.RechargeFraction = FMath::Clamp(1.f - (Remaining / FullWindow), 0.f, 1.f);
 
-	// Fallbacks describe today's single-dash build exactly: one charge, spent while the cooldown
-	// runs. Spec §5 replaces this with a two-charge system for the Core carrier.
-	OutState.MaxCharges = TraceCompat::MaxDashCharges(Movement, 1);
-	OutState.Charges = TraceCompat::DashCharges(Movement, (Remaining <= 1.e-4f) ? 1 : 0);
+	// Direct calls, not the old SFINAE shim: the charge system has landed, so a rename in the
+	// movement component must break this build rather than quietly reverting the meter to a fallback.
+	OutState.MaxCharges = Movement->GetMaxDashCharges();
+	OutState.Charges = Movement->GetDashCharges();
 
 	OutState.MaxCharges = FMath::Max(1, OutState.MaxCharges);
 	OutState.Charges = FMath::Clamp(OutState.Charges, 0, OutState.MaxCharges);
@@ -632,39 +638,21 @@ bool ATracePlayerController::GetDashHudState(FTraceDashHudState& OutState) const
 	return true;
 }
 
-bool ATracePlayerController::GetBoostHudState(float& OutRemaining, float& OutTotal) const
-{
-	const ATraceCharacter* TraceChar = GetTraceCharacter();
-	if (TraceChar == nullptr || !TraceChar->IsAlive())
-	{
-		return false;
-	}
-
-	UTraceCharacterMovementComponent* Movement = TraceChar->GetTraceMovement();
-
-	const float Remaining = TraceCompat::BoostCooldownRemaining(Movement);
-	if (Remaining < 0.f)
-	{
-		// The mechanic does not exist in this build. The HUD omits the row rather than drawing a
-		// meter that can never move.
-		return false;
-	}
-
-	OutRemaining = Remaining;
-	// 12s is the spec §5 figure, used only until the movement component exposes its own.
-	OutTotal = FMath::Max(1.e-4f, TraceCompat::BoostCooldown(Movement, 12.f));
-	return true;
-}
+// BOOST IS GONE (spec v3 §1: "remove boost from the game entirely"). GetBoostHudState() lived here
+// and fed the HUD's BOOST row; both were deleted with the feature, along with IA_Boost, its binding,
+// its keybind and the whole Settings/TraceGameplayCompat.h shim that let this file call a boost that
+// might not exist. The parry took its slot in the ability stack — see ATraceCharacter::
+// GetParryHudState(), which the HUD calls directly.
 
 float ATracePlayerController::GetPassProgress() const
 {
-	ATraceCharacter* TraceChar = GetTraceCharacter();
+	const ATraceCharacter* TraceChar = GetTraceCharacter();
 	if (TraceChar == nullptr || !TraceChar->IsAlive())
 	{
 		return -1.f;
 	}
 
-	return TraceCompat::PassProgress(TraceChar);
+	return TraceChar->GetPassProgress();
 }
 
 // -------------------------------------------------------------------------------------------
@@ -900,33 +888,36 @@ void ATracePlayerController::OnDashStarted()
 	}
 }
 
-void ATracePlayerController::OnBoostStarted()
+void ATracePlayerController::OnParryStarted()
 {
 	if (bGameInputSuppressed)
 	{
 		return;
 	}
 
-	++DebugBoostCount;
+	++DebugParryCount;
 	if (InputLogLevel() >= 1)
 	{
-		UE_LOG(LogTraceGame, Display, TEXT("INPUT Boost pressed #%d"), DebugBoostCount);
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT Parry pressed #%d"), DebugParryCount);
 	}
 
-	// Spec §5: a ground-only super-jump on a 12s cooldown. The mechanic itself belongs to the
-	// movement slice; TraceCompat::TryBoost calls ATraceCharacter::DoBoost() when that slice has
-	// landed it and is a no-op until then, so this binding is live from the moment it exists and
-	// needs no follow-up wiring. See Settings/TraceGameplayCompat.h.
+	// Spec v3 §3. Everything that can refuse a parry — not carrying, cooldown, dead — lives behind
+	// ATraceCharacter::DoParryPressed -> TraceParry::RequestParry, which also owns the local tint
+	// prediction and the server RPC. This handler deliberately makes no decision of its own; a
+	// second opinion about whether a parry is legal is exactly how prediction and authority diverge.
 	if (ATraceCharacter* TraceChar = GetLivingCharacter())
 	{
-		if (!TraceCompat::TryBoost(TraceChar))
-		{
-			// Once per session at Verbose: a boost key that does nothing is otherwise indistinguishable
-			// from a broken binding, and the hard-won lesson in this project is that the answer to
-			// "is it dead or is it just quiet?" has to already be in the log.
-			UE_LOG(LogTraceGame, Verbose,
-				TEXT("[%s] Boost pressed, but ATraceCharacter has no DoBoost() in this build."), *GetName());
-		}
+		TraceChar->DoParryPressed();
+	}
+}
+
+void ATracePlayerController::OnParryCompleted()
+{
+	// Intentionally not gated on bGameInputSuppressed, and intentionally empty. See the header: the
+	// window is a fixed duration owned by the trail component, so there is no held state to release.
+	if (ATraceCharacter* TraceChar = GetPawn<ATraceCharacter>())
+	{
+		TraceChar->DoParryReleased();
 	}
 }
 
@@ -1071,7 +1062,7 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 	LogAction(TEXT("IA_Fire      "), IA_Fire);
 	LogAction(TEXT("IA_Pass      "), IA_Pass);
 	LogAction(TEXT("IA_Dash      "), IA_Dash);
-	LogAction(TEXT("IA_Boost     "), IA_Boost);
+	LogAction(TEXT("IA_Parry     "), IA_Parry);
 	LogAction(TEXT("IA_Crouch    "), IA_Crouch);
 	LogAction(TEXT("IA_Scoreboard"), IA_Scoreboard);
 
@@ -1114,10 +1105,10 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 		(TraceChar != nullptr) ? *TraceChar->GetActorLocation().ToCompactString() : TEXT("-"));
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("INPUTDIAG [%s] counters move=%d look=%d fireDown=%d fireUp=%d jump=%d pass=%d dash=%d boost=%d crouch=%d hitConfirm=%d lastMove=(%.2f, %.2f)"),
+		TEXT("INPUTDIAG [%s] counters move=%d look=%d fireDown=%d fireUp=%d jump=%d pass=%d dash=%d parry=%d crouch=%d hitConfirm=%d lastMove=(%.2f, %.2f)"),
 		Context, DebugMoveEventCount, DebugLookEventCount, DebugFireStartedCount,
 		DebugFireCompletedCount, DebugJumpCount, DebugPassCount, DebugDashCount,
-		DebugBoostCount, DebugCrouchCount,
+		DebugParryCount, DebugCrouchCount,
 		DebugHitConfirmCount, DebugLastMoveValue.X, DebugLastMoveValue.Y);
 }
 

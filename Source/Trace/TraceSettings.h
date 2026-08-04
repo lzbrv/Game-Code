@@ -223,7 +223,7 @@ struct TRACE_API FTraceBotProfile
 	/**
 	 * Bots are unaware of enemies beyond this, even with clear line of sight.
 	 *
-	 * Sane range 5000 to 8000 on a 24000 x 12000 field. Must stay above MaxEngagementRange or a bot
+	 * Sane range 5000 to 8000 on a 24000 x 9600 field. Must stay above MaxEngagementRange or a bot
 	 * can never legally shoot at anything.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Engagement", meta = (DisplayName = "Sight Range (uu)", ClampMin = "100.0", ClampMax = "40000.0", UIMin = "2000.0", UIMax = "12000.0"))
@@ -334,9 +334,10 @@ struct TRACE_API FTraceBotProfile
 	/**
 	 * 0..1. How careful a carrying bot is about WHEN it starts a pass.
 	 *
-	 * Scales UTraceSettings::BotPassSafeRadius and the number of covering enemies tolerated. At 0 a
-	 * bot passes whenever it has a receiver, drops its shield in front of a firing line and dies for
-	 * it; at 1 it waits for a genuinely clean window.
+	 * Scales the number of covering enemies tolerated inside UTraceSettings::BotPunishRange (which
+	 * ATraceBotController::CountEnemiesCoveringMe uses as its radius). At 0 a bot passes whenever it
+	 * has a receiver, drops its shield in front of a firing line and dies for it; at 1 it waits for
+	 * a genuinely clean window.
 	 *
 	 * Low on Easy on purpose. A reckless pass is a turnover and a free kill for the player, which is
 	 * one of the few ways to make Easy easier that does not involve making the bots look stupid.
@@ -345,7 +346,7 @@ struct TRACE_API FTraceBotProfile
 	float PassCaution = 0.30f;
 
 	/**
-	 * 0..1. How much of the movement kit (slide, boost, crouch fast-fall) this bot uses.
+	 * 0..1. How much of the movement kit (slide, crouch fast-fall) this bot uses.
 	 *
 	 * Not a skill dial so much as a legibility one: nine bots all sliding at once is noise, and the
 	 * point of the kit is that it reads as intent. Kept well above zero even on Easy, because a
@@ -500,18 +501,14 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Warmup Duration (s)", ClampMin = "0.0", ClampMax = "120.0", UIMin = "0.0", UIMax = "30.0"))
 	float WarmupDuration = 5.f;
 
-	/**
-	 * LEGACY — read by nothing in the rules.
-	 *
-	 * Spec §1 replaced the single timed match with TWO HALVES. The enforced length of each half is
-	 * ATraceGameMode::HalfDuration (config=Game on the game mode), and the game mode also owns
-	 * whether the score cap ends the match early (bEndMatchAtScoreToWin, off by default — "first to
-	 * 5" would cut the second half, and the side switch with it, out of most matches).
-	 *
-	 * Kept so existing configs still load without warnings. Do not tune it and expect an effect.
-	 */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Match", meta = (DisplayName = "Match Duration (s) [DEAD]", ClampMin = "0.0", ClampMax = "7200.0"))
-	float MatchDuration = 600.f;
+	// DEAD PROPERTY REMOVED: MatchDuration.
+	//
+	// Spec §1 replaced the single timed match with TWO HALVES. The enforced length of each half is
+	// ATraceGameMode::HalfDuration (config=Game on the game mode, [/Script/Trace.TraceGameMode]),
+	// and the game mode also owns whether the score cap ends the match early
+	// (bEndMatchAtScoreToWin, off by default — "first to 5" would cut the second half, and the side
+	// switch with it, out of most matches). Nothing read MatchDuration; a slider that silently does
+	// nothing is worse than no slider, so it is gone rather than folded away under AdvancedDisplay.
 
 	// ==========================================================================================
 	// COMBAT
@@ -533,8 +530,9 @@ public:
 	 * Maximum hitscan distance in unreal units.
 	 *
 	 * Must span the arena diagonal or shots silently die in mid-air short of a visible target. The
-	 * field is 24000 x 12000, so the diagonal is ~26833; 28000 covers it with margin. This was 15000
-	 * — correct for the old 8000 x 4000 arena and barely half the field once it was scaled up.
+	 * field is 24000 x 9600 (spec v3 §7 narrowed it from 12000 for the 2.5:1 proportion), so the
+	 * diagonal is ~25849; 28000 still covers it with 2151 uu of margin. This was 15000 — correct for
+	 * the old 8000 x 4000 arena and barely half the field once it was scaled up.
 	 *
 	 * Raising it does NOT make the bots deadlier: they are limited by FTraceBotProfile::
 	 * MaxEngagementRange (4200 Easy / 4800 Normal / 6000 Hard), far below either value. This only
@@ -558,25 +556,34 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Friendly Fire"))
 	bool bFriendlyFire = false;
 
-	/**
-	 * LEGACY — read by nothing.
-	 *
-	 * Spec §6: "There is no movement inaccuracy. Set spread to 0." UTraceWeaponComponent::FireOnce
-	 * no longer rolls a cone at all; the shot IS the aim ray. The roll was removed rather than
-	 * configured to zero so that a stale .ini cannot quietly reintroduce inaccuracy the design has
-	 * deleted — and so a modified client cannot roll itself a zero nobody else gets.
-	 */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Combat", meta = (DisplayName = "Spread (deg) [DEAD]", ClampMin = "0.0", ClampMax = "0.0"))
-	float SpreadDegrees = 0.f;
+	// DEAD PROPERTY REMOVED: SpreadDegrees.
+	//
+	// Spec §6: "There is no movement inaccuracy. Set spread to 0." UTraceWeaponComponent::FireOnce
+	// does not roll a cone at all; the shot IS the aim ray. The roll was removed rather than
+	// configured to zero so that a stale .ini cannot quietly reintroduce inaccuracy the design has
+	// deleted — and so a modified client cannot roll itself a zero nobody else gets. The knob has
+	// now followed the code out of the file.
 
 	// ==========================================================================================
 	// MOVEMENT
 	//
 	// The most feel-critical block on the page, and the one designers drag sliders on while PIE is
 	// running. Everything here IS live: the movement component reads DashSpeed / DashDuration /
-	// DashCooldown / the whole slide block / BoostZVelocity / BoostCooldown at the point of use, and
+	// DashCooldown / the whole slide block / the whole air block at the point of use, and
 	// WalkSpeed — the one value the engine copies into its own field — is pushed by
 	// ApplyLiveMovementTuning() from PostEditChangeProperty. See the file header.
+	//
+	// BOOST IS GONE (spec v3 §1: "remove boost from the game entirely"). BoostZVelocity,
+	// BoostCooldown and the two bot-side boost knobs were deleted with the feature rather than left
+	// behind as sliders that move nothing.
+	//
+	// THE MOVEMENT MODEL CHANGED THIS PASS (spec v3 §2, "mimicking apex legends movement and source
+	// engine"). Three things follow from that, and all three are knobs in this block:
+	//   * air control is a Source-style ACCELERATION PROJECTION (Movement|Air), not a lerp toward
+	//     the input direction, so input perpendicular to travel turns you without costing speed;
+	//   * landing no longer clamps horizontal speed to the ground maximum (Movement|Landing) —
+	//     ground friction bleeds the excess instead;
+	//   * a slide's velocity comes from the speed you entered it with (Movement|Slide).
 	// ==========================================================================================
 
 	/**
@@ -598,6 +605,166 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Walk", meta = (DisplayName = "Carrier Speed Multiplier", ClampMin = "0.5", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
 	float CarrierSpeedMultiplier = 1.08f;
+
+	// --- Air control (Source/Quake air-accel) -------------------------------------------------
+	//
+	// THE MODEL, because these four knobs are meaningless without it.
+	//
+	// Every frame in the air the movement component takes the player's wish direction W (normalised
+	// input, planar), and the speed the pawn ALREADY has along that direction:
+	//
+	//     CurrentAlongWish = Velocity . W
+	//     AddSpeed         = min(MaxAirSpeed, AirMaxWishSpeed) - CurrentAlongWish
+	//     if (AddSpeed <= 0)  -> no change at all this frame
+	//     Accel            = min(AirAcceleration * dt, AddSpeed)
+	//     Velocity        += Accel * W
+	//
+	// That projection — and specifically the fact that the cap applies to the component ALONG the
+	// wish direction rather than to total speed — is the whole trick. Point the stick sideways to
+	// where you are already travelling and CurrentAlongWish is ~0, so you get the full add, applied
+	// at ninety degrees: the velocity VECTOR ROTATES and its magnitude barely changes. Point it
+	// straight ahead and CurrentAlongWish is already your full speed, so AddSpeed is negative and
+	// you get nothing. This is why the spec asks for the real formula and explicitly not a lerp
+	// toward the input direction: a lerp bleeds speed on every turn, which is the opposite result.
+	//
+	// AirMaxWishSpeed is therefore the "how sharply can I turn in the air" dial, and it is what
+	// the note "slightly increase efficacy of strafing in mid air" is asking for.
+	//
+	// Read by UTraceCharacterMovementComponent::ApplySourceAirAcceleration, which runs inside
+	// CalcVelocity — i.e. inside the physics sub-step, on the client, on the server and on every
+	// replayed move — and is a pure function of (Velocity, Acceleration, dt, these values), so it
+	// adds no saved-move state and every one of these knobs is safe to drag mid-PIE.
+
+	/**
+	 * Master switch for the Source/Quake air model. OFF restores Unreal's stock AirControl lerp.
+	 *
+	 * Exists so the new movement can be A/B'd against the old feel from one binary rather than two.
+	 * Turning it off does NOT restore the landing clamp — that is bPreserveLandingMomentum below.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Source-Style Air Acceleration"))
+	bool bSourceAirAcceleration = true;
+
+	/**
+	 * Ceiling, in uu/s, on the velocity component ALONG the wish direction that air input will
+	 * build. THIS IS THE AIR-STRAFE DIAL.
+	 *
+	 * Source ships the equivalent of ~57 uu/s here, which is deliberately tiny — it is what makes
+	 * strafe-jumping a skill rather than a control scheme. The default here is a good deal higher
+	 * because spec v3 asks for "full control authority to redirect velocity in air" and for
+	 * strafing to be MORE effective, not less.
+	 *
+	 * Raising it turns the air into a plane you can steer freely on; lowering it toward ~60 gives
+	 * the classic sharp Quake/Source feel where only perpendicular input does anything. It does NOT
+	 * raise your top speed — MaxAirSpeed does that — it raises how much of a turn one frame of
+	 * input can buy. Sane range 60 to 400.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Max Wish Speed (uu/s along wish dir)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "40.0", UIMax = "600.0"))
+	float AirMaxWishSpeed = 160.f;
+
+	/**
+	 * How hard the air-accel step pushes, in uu/s^2.
+	 *
+	 * Together with the cap above this decides whether a turn takes one frame or several: at 8000
+	 * and a 60Hz frame the step can add 133 uu/s, so the 160 cap is very nearly reached in a single
+	 * frame and the model behaves as "cap per frame". Lower it and air control becomes gradual and
+	 * floaty. Sane range 3000 to 12000.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Acceleration (uu/s^2)", ClampMin = "0.0", ClampMax = "50000.0", UIMin = "1000.0", UIMax = "20000.0"))
+	float AirAcceleration = 8000.f;
+
+	/**
+	 * Ceiling on planar speed that AIR INPUT may build toward, in uu/s.
+	 *
+	 * NOT a hard clamp on the pawn's velocity, and deliberately so: speed carried into the air by a
+	 * dash or a slide is left alone, because clamping it is exactly the "velocity gets reset by a
+	 * state transition" complaint spec v3 §2.4 raises. This only bounds what holding a direction
+	 * key in mid-air can ACCELERATE you to. Keep it at or above WalkSpeed; well above it lets a
+	 * skilled player convert air time into speed, which is the Apex/Source reading.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Max Air Speed (uu/s)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "3000.0"))
+	float MaxAirSpeed = 1600.f;
+
+	/**
+	 * Lateral drag in the air, per second (the engine's FallingLateralFriction). ZERO BY DESIGN.
+	 *
+	 * Source and Quake have no air drag at all, which is what makes a jump preserve the speed you
+	 * took into it — the single most-requested property of this movement model. Any non-zero value
+	 * here quietly undoes momentum preservation for every airborne frame, so it is a knob for
+	 * experiments rather than a dial to season with. Sane range 0 to 0.5.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Friction (lateral, per s)", ClampMin = "0.0", ClampMax = "8.0", UIMin = "0.0", UIMax = "1.0"))
+	float AirFriction = 0.f;
+
+	/**
+	 * Engine-owned: the fraction of input acceleration that survives into the falling state
+	 * (UCharacterMovementComponent::AirControl). Pushed into the component by
+	 * RefreshEngineTunablesFromSettings(), so it is live but is a COPY — the one air value that
+	 * cannot be read at the point of use.
+	 *
+	 * 1.0, NOT the 0.45 the constructor used to set. Under the stock model AirControl WAS the air
+	 * model, and 0.45 was how you stopped it being too strong. Under the Source model it sits in
+	 * front of the real model: anything below 1 quietly scales the acceleration before
+	 * ApplySourceAirAcceleration ever sees it, so the air block above would no longer mean what it
+	 * says. Tune AirMaxWishSpeed instead; leave this at 1.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Control (engine acceleration scale)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float AirControl = 1.f;
+
+	// --- Landing and carried momentum ----------------------------------------------------------
+	//
+	// Spec v3 §2.2, verbatim: "do not clamp horizontal velocity to ground max speed on landing.
+	// Velocity carries over from air to ground."
+	//
+	// Unreal does not have a landing clamp you can switch off — it has CalcVelocity, which brakes
+	// hard the moment IsExceedingMaxSpeed(MaxWalkSpeed) is true. GroundFriction 8 x
+	// BrakingFrictionFactor 2, plus BrakingDecelerationWalking 2600, kills 1000 uu/s of carried
+	// speed in about 60 ms, and 60 ms is indistinguishable from a clamp. So the movement component
+	// takes over CalcVelocity for exactly the frames where planar speed exceeds the ground limit
+	// and bleeds the EXCESS at the three much gentler numbers below.
+
+	/**
+	 * ON BY DEFAULT — this is spec v3 §2.2. Off restores the engine's hard brake on landing.
+	 *
+	 * It exists so the old feel can be A/B'd from one binary. Turning it off makes the three
+	 * overspeed knobs below inert.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Landing", meta = (DisplayName = "Preserve Landing Momentum"))
+	bool bPreserveLandingMomentum = true;
+
+	/**
+	 * Friction applied to the EXCESS above walk speed while on the ground, replacing the engine's
+	 * GroundFriction (8) for those frames only. THE MAIN "how long does carried speed last" DIAL.
+	 *
+	 * Overspeed has to leave somehow, or a player who lands fast keeps that speed forever and walk
+	 * speed stops meaning anything. The Source-style answer is that friction bleeds it over a short
+	 * run-out rather than the game snapping it away in one frame. Lower = momentum is worth more;
+	 * at 8 the excess is gone almost immediately and preserving it buys nothing. Sane range 1.5 to 4.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Landing", meta = (DisplayName = "Overspeed Ground Friction", ClampMin = "0.0", ClampMax = "16.0", UIMin = "0.5", UIMax = "8.0"))
+	float GroundOverspeedFriction = 2.f;
+
+	/**
+	 * Flat deceleration, uu/s^2, applied to the excess above walk speed when there is NO input —
+	 * the counterpart of BrakingDecelerationWalking (2600) for overspeed frames.
+	 *
+	 * Separate from the friction term because friction is proportional and a proportional bleed
+	 * alone has a long tail: it takes the same time to go 2000 -> 1000 as 1000 -> 500, so a fast
+	 * landing leaves the pawn hovering just above walk speed for an implausibly long time. This is
+	 * what actually lands them. Sane range 200 to 800; at 2600 you have the engine's brake back.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Landing", meta = (DisplayName = "Overspeed Braking (uu/s^2)", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "100.0", UIMax = "2000.0"))
+	float GroundOverspeedBraking = 400.f;
+
+	/**
+	 * Degrees per second an overspeed pawn may steer while it bleeds down, on the ground.
+	 *
+	 * Unlimited steering while overspeed would let a player carry a landing's momentum around a
+	 * corner at full value, which turns the whole model into free speed; zero would make a fast
+	 * landing a rail you cannot correct on. This is the middle ground and it is the knob to reach
+	 * for if landings feel either "on ice" (raise it) or "too free" (lower it). Sane range 90 to 360.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Landing", meta = (DisplayName = "Overspeed Turn Rate (deg/s)", ClampMin = "0.0", ClampMax = "720.0", UIMin = "0.0", UIMax = "360.0"))
+	float GroundOverspeedTurnRate = 180.f;
 
 	// --- Dash --------------------------------------------------------------------------------
 
@@ -644,18 +811,35 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Carrier Extra Dash Charges", ClampMin = "0", ClampMax = "5", UIMin = "0", UIMax = "3"))
 	int32 CarrierExtraDashCharges = 1;
 
+	/**
+	 * Multiple of the ground speed limit a dash hands back when it ends. 1.0 = the old behaviour.
+	 *
+	 * Spec v3 §2.4: "state transitions should preserve velocity vectors rather than resetting
+	 * them". A dash ending by dumping the pawn at exactly walking pace is the most visible reset in
+	 * the kit — you spend a cooldown, cross 540 uu, and arrive slower than a slide would have left
+	 * you. Above 1 the surplus is handed back as real overspeed and then bleeds off through
+	 * GroundOverspeedFriction like any other carried momentum, so this cannot become permanent
+	 * free speed. Sane range 1.0 to 1.5.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Dash Exit Speed (multiple of max speed)", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float DashExitSpeedMultiplier = 1.25f;
+
 	// --- Slide (crouch on the ground) -------------------------------------------------------
 	//
 	// A slide SPENDS MOMENTUM YOU ALREADY HAVE: it starts from your current speed, boosts it once
 	// and then bleeds it off slowly. It never resizes the capsule — the capsule is the single source
 	// of truth for hit resolution, lag compensation and the trail trip test.
 	//
-	// The numbers below were retuned this pass for "longer, and it must preserve the player's
-	// momentum": the decay is now gentle enough that a slide carries most of its entry speed all the
-	// way to its natural end, and the duration is long enough for that to be a traversal tool rather
-	// than a flourish. SlideCooldown moved with SlideDuration on purpose — the cooldown is measured
-	// from slide START, so a cooldown shorter than the duration would let a player chain slides
-	// end-to-end and never walk again.
+	// The numbers below were retuned for "longer, and it must preserve the player's momentum": the
+	// decay is gentle enough that a slide carries most of its entry speed all the way to its natural
+	// end, and the duration is long enough for that to be a traversal tool rather than a flourish.
+	//
+	// SPEC v3 §2.3 CHANGED THREE THINGS HERE:
+	//   * entry speed decides slide velocity, so SlideEntrySpeedMultiplier drops to 1.0;
+	//   * SlideImpulse is new, and is the other (contradictory) reading of the same note — see the
+	//     [CONFLICT] discussion on the multiplier below;
+	//   * the cooldown is 0.8 s and is now measured from the slide's END rather than its START,
+	//     which is why it is a differently named property (SlideCooldownSeconds).
 
 	/**
 	 * Fraction of WalkSpeed you must already be moving at before crouch will start a slide.
@@ -665,14 +849,42 @@ public:
 	float SlideEntrySpeedFraction = 0.55f;
 
 	/**
-	 * Entry speed multiplier applied to max(current planar speed, WalkSpeed).
+	 * Entry speed multiplier applied to the ACTUAL entry speed. Slide velocity = entry speed x this,
+	 * plus SlideImpulse.
+	 *
+	 * Not max(entry speed, WalkSpeed) — that was the old implementation and the old wording, and the
+	 * floor is exactly the flat boost §2.3 rules out: it made a slide entered at walking pace come
+	 * out 35% faster than the walk. It multiplies what you actually arrived with, nothing else.
+	 *
+	 * ONE HALF OF A CONFLICT THE SPEC LEFT OPEN, AND THE HALF THAT IS SHIPPED ACTIVE.
+	 * Spec v3 §2.3 says "entry speed determines slide velocity (NO FLAT MOMENTUM BOOST)", and a
+	 * later line in the same notes says "have the slide INCREASE MOMENTUM". Those disagree, so both
+	 * readings are knobs rather than a decision made on the designer's behalf:
+	 *   * this multiplier at 1.0 is the §2.3 reading — the slide is exactly the speed you brought;
+	 *   * SlideImpulse below, at any non-zero value, is the "increase momentum" reading.
+	 * Shipped at 1.0 / 0.0, i.e. the §2.3 reading. Raise one or the other to pick the other one.
 	 *
 	 * Because it multiplies your CURRENT speed, a slide out of a fast approach is faster than a
-	 * slide out of a walk — that is the momentum preservation. Sane range 1.1 to 1.5; 1.0 is a pure
-	 * "keep exactly what I had" slide.
+	 * slide out of a walk — that is the momentum preservation, and it holds at 1.0. Sane range 1.0
+	 * to 1.5. Was 1.35 before spec v3.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Entry Speed Multiplier", ClampMin = "0.5", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
-	float SlideSpeedMultiplier = 1.35f;
+	float SlideEntrySpeedMultiplier = 1.0f;
+
+	/**
+	 * Flat uu/s added to slide entry speed, on top of the multiplier. ZERO BY DEFAULT.
+	 *
+	 * The other half of the §2.3-versus-"increase momentum" conflict above. Unlike the multiplier
+	 * this is a FLAT boost — it is worth the same whether you entered at a walk or out of a dash,
+	 * which is precisely what "no flat momentum boost" rules out and what "increase momentum"
+	 * asks for. Deliberately applied AFTER the SlideMaxSpeed clamp, so it is never silently eaten
+	 * by the entry cap; if it were clamped, dialling it in from zero would appear to do nothing for
+	 * anyone entering a slide fast.
+	 *
+	 * Try 150-300 for a noticeable kick without making crouch-spam the fastest way to travel.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Entry Impulse (flat uu/s)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "0.0", UIMax = "600.0"))
+	float SlideImpulse = 0.f;
 
 	/**
 	 * Hard ceiling on slide entry speed, in uu/s.
@@ -688,8 +900,8 @@ public:
 	 * Longest a slide may last, in seconds, even if it has not decayed to the exit speed.
 	 *
 	 * With the gentle deceleration below, this is what actually ends most slides — so this is the
-	 * "make the slide longer" dial. Sane range 0.8 to 2.5. Keep SlideCooldown at or above it, or
-	 * slides chain end-to-end.
+	 * "make the slide longer" dial. Sane range 0.8 to 2.5. Independent of SlideCooldownSeconds now
+	 * that the cooldown is measured from the slide's end.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Duration (s)", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.3", UIMax = "3.0"))
 	float SlideDuration = 1.8f;
@@ -719,14 +931,19 @@ public:
 	float SlideTurnRateDegrees = 130.f;
 
 	/**
-	 * Cooldown measured from slide START, in seconds, so chained slides cannot sustain above walking
-	 * speed.
+	 * The gap BETWEEN slides, in seconds. Spec v3 §2.3: "add a .8second buffer between slides".
 	 *
-	 * MEASURED FROM START, NOT FROM END — so a value below SlideDuration means no cooldown at all in
-	 * practice. Keep it at or above SlideDuration plus the recovery you want between slides.
+	 * MEASURED FROM THE SLIDE'S END, and that is a change. The old SlideCooldown was measured from
+	 * the slide's START, so "the buffer between slides" was a number you had to compute (cooldown
+	 * minus duration) rather than one you could read — and a value below SlideDuration meant no
+	 * cooldown at all, which is a trap. This is the number the spec asks for, directly.
+	 *
+	 * RENAMED (SlideCooldown -> SlideCooldownSeconds) ALONG WITH THE SEMANTIC CHANGE, deliberately:
+	 * a stale .ini or a saved config still carrying the old START-measured 2.40 must not land on
+	 * the new END-measured knob and silently produce a four-second gap between slides.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Cooldown (s, from slide start)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "6.0"))
-	float SlideCooldown = 2.4f;
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Cooldown (s, gap after a slide ends)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "6.0"))
+	float SlideCooldownSeconds = 0.8f;
 
 	/**
 	 * How long a crouch press that could not slide yet (mid-dash, or airborne) stays queued.
@@ -766,64 +983,280 @@ public:
 	float SlideExitMinSpeedFraction = 1.0f;
 
 	/**
-	 * Ceiling on the exit speed as a multiple of max speed. KEEP THIS AT 1.0 unless you want overspeed.
+	 * Ceiling on the exit speed as a multiple of max speed.
 	 *
-	 * Above 1, CalcVelocity's input branch clamps to the CURRENT speed once it exceeds max, so any
-	 * overspeed handed back is kept for as long as a movement key is held — slide-cancel spam then
-	 * becomes the fastest way to cross the arena. The knob exists to make that a deliberate choice.
+	 * The old warning here — "above 1, overspeed is kept for as long as a movement key is held, and
+	 * slide-cancel spam becomes the fastest way to cross the arena" — described the pre-spec-v3
+	 * CalcVelocity, whose input branch clamped to the current speed and so could HOLD overspeed
+	 * indefinitely. That branch is gone. The ground overspeed bleed replaces it and always bleeds the
+	 * excess (GroundOverspeedFriction / GroundOverspeedBraking), so exit overspeed now decays no
+	 * matter what is held. Raising this is a real knob again rather than an exploit.
+	 *
+	 * Note this is a ceiling, not the whole story: SlideExitMaxSpeed is taken as max(this x max
+	 * speed, the slide's own speed), which is what stops slide->jump being a hard brake to walk pace.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Exit Ceiling (multiple of Max Speed)", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
 	float SlideExitMaxSpeedMultiplier = 1.0f;
 
-	// --- Boost (ground-only vertical launch, a separate bind from jump) ----------------------
-
-	/**
-	 * +Z velocity granted by a boost, in uu/s.
-	 *
-	 * APEX SCALES WITH THE SQUARE: height = v^2 / 2g. Against the default 980 gravity, 813 gives an
-	 * apex of ~337uu, against ~209uu for the 640 jump. Halving this value would QUARTER the height,
-	 * not halve it — to halve the height, scale the velocity by sqrt(0.5) (which is exactly how 1150
-	 * became 813). Sane range 700 to 1400.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Boost", meta = (DisplayName = "Boost Z Velocity (uu/s)", ClampMin = "100.0", ClampMax = "4000.0", UIMin = "400.0", UIMax = "2000.0"))
-	float BoostZVelocity = 813.f;
-
-	/**
-	 * Boost cooldown in seconds. Contract §5: twelve seconds.
-	 *
-	 * Long on purpose — boost is a commitment, not mobility. Keep BotBoostCooldownSeconds equal.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Boost", meta = (DisplayName = "Boost Cooldown (s)", ClampMin = "0.0", ClampMax = "60.0", UIMin = "1.0", UIMax = "20.0"))
-	float BoostCooldown = 12.f;
+	// BOOST DELETED (spec v3 §1: "remove boost from the game entirely"). BoostZVelocity and
+	// BoostCooldown lived here; the bot-side mirrors BotBoostCooldownSeconds and BotBoostStuckSeconds
+	// went with them. Nothing on this page describes a boost any more.
 
 	// ==========================================================================================
-	// CORE
+	// CORE  —  the hover pass
+	//
+	// FIVE DEAD KNOBS WERE REMOVED FROM THIS CATEGORY AND REPLACED BY THE SEVEN BELOW.
+	//
+	// The Core stopped being a thrown, catchable object: it is a STATUS that transfers by holding
+	// the crosshair on a teammate (see the ATraceCore file header). So PassSpeed, PassUpwardBias,
+	// PickupRadius, PickupLockoutAfterThrow and CoreResetTime described a projectile and a pickup
+	// that no longer exist and were read by nothing. (ATraceCore::Throw and IsPickupLockedOutFor,
+	// the two functions that used to make that argument concrete, have since been deleted as well —
+	// they had zero callers between them.) There is no loose Core to reset. They are deleted rather than folded away: the user is tuning from this panel, and a
+	// slider that silently does nothing is worse than no slider.
+	//
+	// What replaces them is the set of numbers the hover pass ACTUALLY runs on. Those were
+	// compile-time constants in TraceCoreTuning (Gameplay/TraceCore.cpp), whose own comment asked
+	// for exactly this promotion: "Every one of them is a designer knob and they should be promoted
+	// to UTraceSettings (Category = "Core") verbatim". Read at the point of use, so all of them
+	// retune with PIE running.
 	// ==========================================================================================
 
-	/** Launch speed of a thrown/passed Core, in uu/s. Sane range 1800 to 3200. */
-	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Pass Speed (uu/s)", ClampMin = "100.0", ClampMax = "10000.0", UIMin = "800.0", UIMax = "5000.0"))
-	float PassSpeed = 2400.f;
-
-	/** Fraction of the throw direction added as +Z, so passes arc instead of skimming the floor. */
-	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Pass Upward Bias (fraction)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
-	float PassUpwardBias = 0.14f;
+	/**
+	 * Seconds the carrier must hold the pass input with the crosshair on a legal receiver before
+	 * the Core transfers. Spec §4.
+	 *
+	 * This is the risk beat: the carrier's shield drops the instant the input goes down and the
+	 * trace goes invulnerable, and both are restored if the pass is cancelled. Longer means a
+	 * bigger window for a punisher to convert; shorter means passing is close to free. Keep
+	 * BotPassHoldSeconds equal to it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Pass Hold (s)", ClampMin = "0.05", ClampMax = "5.0", UIMin = "0.1", UIMax = "2.0"))
+	float PassHoldSeconds = 0.50f;
 
 	/**
-	 * Radius within which a character may pick the Core up, in uu.
+	 * Seconds before another pass may be STARTED after one COMPLETES. A cancelled attempt spends
+	 * PassCancelCooldownSeconds instead, which is much shorter — see below.
 	 *
-	 * Roughly three capsule radii. Much larger and passes catch themselves off a near miss; much
-	 * smaller and a moving receiver has to be threaded through.
+	 * Keep BotPassCooldownSeconds at or just above it.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Pickup Radius (uu)", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "50.0", UIMax = "400.0"))
-	float PickupRadius = 110.f;
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Pass Cooldown (s, on completion)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "6.0"))
+	float PassCooldownSeconds = 2.0f;
 
-	/** How long the thrower is blocked from re-catching their own pass, in seconds. */
-	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Self-Catch Lockout (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
-	float PickupLockoutAfterThrow = 0.35f;
+	/**
+	 * Seconds before another pass may be started after one was CANCELLED. A large part of the
+	 * reported bug, and the reason it is now a separate number.
+	 *
+	 * This used to be PassCooldownSeconds — two full seconds — for a pass the player never chose to
+	 * abandon. The sequence they experience: hold the input on a teammate, watch the ring fill,
+	 * watch it vanish because the receiver clipped a rail, and then get NOTHING for two more
+	 * seconds while still holding the button on a perfectly legal target. Twice in a row and the
+	 * mechanic reads as broken, which is precisely the report.
+	 *
+	 * It cannot go to zero: the cancel path flips the shield and the trace invulnerability and
+	 * forces a net update, so a permanently-illegal target would churn that every frame. 0.25
+	 * bounds the churn to (grace + this) = 0.4 s per cycle while sitting well below the threshold
+	 * at which a player perceives a lockout at all.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Pass Cooldown (s, on cancel)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "3.0"))
+	float PassCancelCooldownSeconds = 0.25f;
 
-	/** A loose, untouched Core returns to centre after this many seconds. Sane range 8 to 25. */
-	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Loose Core Reset Time (s)", ClampMin = "1.0", ClampMax = "120.0", UIMin = "5.0", UIMax = "40.0"))
-	float CoreResetTime = 15.f;
+	/**
+	 * Longest pass the rules allow, in uu.
+	 *
+	 * The bots' own pass range works out at ~6600uu (BotPassRangeFieldFraction 0.55 of a 12000uu
+	 * field HALF-LENGTH — that is half of 24000, not the width), so this comfortably contains every
+	 * pass a bot attempts while still making a
+	 * cross-map hail mary illegal. Keep it above the bots' figure or bots will start passes the
+	 * rules then refuse.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Max Pass Range (uu)", ClampMin = "100.0", ClampMax = "40000.0", UIMin = "1000.0", UIMax = "20000.0"))
+	float PassMaxRange = 8000.f;
+
+	/**
+	 * Half-angle of the pass acquisition cone, in degrees. "Hover the crosshair over a teammate",
+	 * expressed as an angle.
+	 *
+	 * 6 -> 9 THIS PASS, and it was a prime suspect in the pass-inconsistency report. At 6 degrees a
+	 * teammate 4000uu away had to be held inside a circle about 420uu across while both of you were
+	 * running, which is a lot to ask on a field whose cover just got denser. There is a second,
+	 * independent test (PassAimSlack) that covers the close-range case, so this only affects distant
+	 * receivers — and it is still the first number to raise if passing feels like it is refusing you.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Aim Cone (deg)", ClampMin = "0.5", ClampMax = "45.0", UIMin = "2.0", UIMax = "20.0"))
+	float PassAimConeDegrees = 9.f;
+
+	/**
+	 * Extra uu added to the receiver's capsule radius for the second, distance-based acquisition
+	 * test: the aim ray counts as on-target if it passes within (CapsuleRadius + this) of the
+	 * receiver's capsule axis.
+	 *
+	 * Either test acquiring is enough. The angular cone is what makes a distant teammate reachable;
+	 * this is what stops a near one feeling sloppy — at point-blank range a 9 degree cone is
+	 * narrower than the teammate's own body. 40 -> 70 this pass, so a near receiver is acquirable
+	 * well off their silhouette rather than only dead centre.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Aim Slack (uu beyond capsule radius)", ClampMin = "0.0", ClampMax = "500.0", UIMin = "0.0", UIMax = "200.0"))
+	float PassAimSlack = 70.f;
+
+	/**
+	 * Seconds an IN-FLIGHT pass survives a receiver who has momentarily stopped being legal. THE
+	 * FIX FOR THE REPORTED PASS REGRESSION.
+	 *
+	 * A pass was measured dying 24 ms before it would have completed because the receiver crossed
+	 * behind a lane rail for a handful of frames. Line of sight, "under the crosshair" and range
+	 * are all instantaneous tests sampled once per frame against a field whose cover just got much
+	 * denser, so a receiver who is RUNNING is guaranteed to blink out of legality repeatedly during
+	 * any 0.5 s hold. Without a grace, every one of those blinks is a cancelled pass — which is
+	 * exactly what "passing is inconsistent on this version" feels like from the inside.
+	 *
+	 * COVERS ONLY THE TRANSIENT GEOMETRIC TESTS. A receiver who dies, respawns onto the other team
+	 * or stops existing cancels the pass instantly, with no grace at all.
+	 *
+	 * Not free: it also lets a pass complete through a thin sliver of cover. 0.15 is about one rail
+	 * at a run. Above ~0.4 a receiver can duck fully behind a block and still catch.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Validation Grace (s)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.6"))
+	float PassValidationGraceSeconds = 0.15f;
+
+	/**
+	 * Seconds ACQUISITION keeps returning the last receiver found after they stop passing the
+	 * aim/LOS tests. The acquisition-side twin of the grace above.
+	 *
+	 * THIS IS THE HALF OF THE REPORT THAT IS A DISPLAY PROBLEM. The HUD polls for a legal receiver
+	 * about twenty times a second to decide whether to show the pass highlight at all, so a target
+	 * flickering in and out of legality makes the pass OPTION itself flicker — "sometimes the pass
+	 * option doesn't show up" is at least partly that, rather than a failure to acquire. Identity,
+	 * team, life and range are still re-checked every poll; only the two flickery geometric tests
+	 * are held over.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Acquire Sticky (s)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
+	float PassAcquireStickySeconds = 0.20f;
+
+	/**
+	 * True: probe chest, head AND knees for line of sight and accept any clear one. False: chest
+	 * only, which is the pre-fix behaviour.
+	 *
+	 * A single chest-height ray against the new 176 / 352 / 616 uu cover boxes is close to a coin
+	 * flip — a receiver whose head and shoulders are plainly visible over a 1x block fails the test
+	 * because the one point being probed is behind it. Any clear probe meaning "line of sight" is
+	 * both more generous and much closer to what the player can actually see. The chest is probed
+	 * first, so the common case still resolves in one trace.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Multi-Point Line Of Sight"))
+	bool bPassMultiPointLos = true;
+
+	/**
+	 * Height above a candidate's actor origin that the aim point and the first LOS probe both
+	 * target, uu.
+	 *
+	 * Chest, not feet. Both must use the same offset or the pass can be aimed at a point the LOS
+	 * test is not checking, which produces exactly the "it says I can pass and then nothing
+	 * happens" class of bug.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Pass", meta = (DisplayName = "Target Chest Offset Z (uu)", ClampMin = "-100.0", ClampMax = "200.0", UIMin = "0.0", UIMax = "100.0"))
+	float PassTargetChestOffsetZ = 20.f;
+
+	/**
+	 * Seconds after the Core changes TEAM before the new carrier's trace starts forming.
+	 *
+	 * 1.0 -> 0.4 THIS PASS (spec v3 §1). The grace exists so a turnover does not instantly wrap the
+	 * new carrier in lethal trace laid on top of the scrum they just won it in; at a full second it
+	 * also meant the counter-attack got a free run with no trace behind it at all. 0.4 s is about
+	 * 330uu of travel at carrier speed — enough to clear the pile, short enough that the trace is a
+	 * threat again before anyone has crossed open ground.
+	 *
+	 * Applies only when the Core changes SIDE. A pass between teammates has no grace, by design.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Turnover Trace Grace (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "2.0"))
+	float CoreTurnoverGraceSeconds = 0.4f;
+
+	// ==========================================================================================
+	// PARRY  (spec v3 §3 — new mechanic)
+	//
+	// Verbatim: "Create a parry mechanic for the core carrier. Parrying gives your trace
+	// invulnerability for .1seconds. It also makes the entire trace turn red for the duration of
+	// the parry. If an enemy would break your trace with a dash, parrying as they dash protects the
+	// trace."
+	//
+	// So it is a reaction check on the one thing that can kill a carrier. A 0.1 s window means the
+	// carrier has to read the dash, not hold a button; the red tint is what makes that readable to
+	// BOTH players, which is why it covers the entire trace rather than the nearest segments.
+	//
+	// Composes with, and does not replace, the pass-window trace invulnerability: a parry during a
+	// pass is a no-op because the trace is already invulnerable, and the parry ending must not
+	// clear an invulnerability the pass still owns.
+	// ==========================================================================================
+
+	/**
+	 * Seconds of trace invulnerability granted by a parry. Spec §3: 0.1.
+	 *
+	 * THE ENTIRE MECHANIC IS THIS NUMBER. At 0.1 s a parry has to be a read of the incoming dash;
+	 * at 0.4 s it is a panic button, and the dash — the only counterplay the defence has against a
+	 * carrier — stops being reliable. Raise it only if playtesting says the window is unhittable at
+	 * real latency, and raise the cooldown with it. Sane range 0.08 to 0.25.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Parry", meta = (DisplayName = "Parry Duration (s)", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.05", UIMax = "0.5"))
+	float ParryDuration = 0.10f;
+
+	/**
+	 * Seconds before the carrier may parry again, measured from the parry's START.
+	 *
+	 * [ASSUMPTION] — the spec does not give one. 1.5 s against a 0.1 s window is a ~7% uptime, which
+	 * keeps it a reaction check: spamming it covers almost nothing, so a defender's dash timing
+	 * still beats a carrier's button mashing. Drop it toward 0.5 and the carrier can simply hold
+	 * the lane covered; the mechanic then reads as "the carrier is immune", which is not the game.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Parry", meta = (DisplayName = "Parry Cooldown (s)", ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.2", UIMax = "6.0"))
+	float ParryCooldown = 1.5f;
+
+	/**
+	 * Colour the ENTIRE trace turns for the duration of a parry. Spec §3 says red.
+	 *
+	 * A gameplay tell, not decoration: it is how the dashing enemy learns their dash is about to be
+	 * wasted and how the carrier confirms the parry registered.
+	 *
+	 * GREEN AND BLUE ARE NEAR ZERO ON PURPOSE AND MUST STAY THAT WAY. The trace is drawn on an
+	 * unlit emissive material at glow values well above 1, so every channel with any weight in it
+	 * clips to white at the tonemapper — the exact failure measured when the whole trace ran at
+	 * glow 3.4 and became "a shapeless white slab". (1, 0.03, 0.06) stays unambiguously RED however
+	 * hard the glow is pushed, which is the entire point.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Parry", meta = (DisplayName = "Parry Trace Tint"))
+	FLinearColor ParryTintColor = FLinearColor(1.f, 0.03f, 0.06f, 1.f);
+
+	/**
+	 * Emissive multiplier on the red trace while parrying, on M_TraceNeon.
+	 *
+	 * Above the pass window's 1.90 on purpose: the two states must not be confusable at a glance,
+	 * and the parry is the shorter and more decisive of the two. Red at 2.6 is a step-change in
+	 * brightness as well as in hue, so the tell survives being seen edge-on, at range, or in the
+	 * corner of the eye — which is the only way an enemy already committed to a dash will see it.
+	 * Do not push it far past 3: that is where the whole trace clips to white.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Parry", meta = (DisplayName = "Parry Glow Scale", ClampMin = "0.0", ClampMax = "8.0", UIMin = "1.0", UIMax = "4.0"))
+	float ParryGlowScale = 2.60f;
+
+	// ==========================================================================================
+	// HUD
+	// ==========================================================================================
+
+	/**
+	 * How much larger the CENTRE crosshair is drawn while the third-person carry blend is fully in.
+	 *
+	 * There is always a crosshair at the exact centre of the screen, in both view modes — that rule
+	 * is stated in ATraceHUD::DrawCrosshair and must not be undone. This only scales it. The reason
+	 * it grows at all is that the third-person camera sits behind and above the pawn, so the same
+	 * pixel size reads as a smaller fraction of the visible scene and gets lost against the neon.
+	 *
+	 * The bug this exists to prevent is real and was reported twice: a previous pass cross-FADED the
+	 * centre cross out and drew the reticle on the projected pass ray, ~30 px low. The player looked
+	 * at the middle of the screen, found nothing, and reported "there's still no crosshair in third
+	 * person". They were right. 1.0 here is legal and simply means "same size in both modes" — it
+	 * does NOT mean "no crosshair".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "HUD", meta = (DisplayName = "Third-Person Crosshair Scale", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.5"))
+	float ThirdPersonCrosshairScale = 1.60f;
 
 	// ==========================================================================================
 	// TRAIL  (the "trace")
@@ -845,15 +1278,19 @@ public:
 	 * Seconds a trail point survives after being laid — i.e. how much lethal trace is on the field
 	 * behind a carrier at any moment.
 	 *
-	 * CEILING OF 4 SECONDS, ENFORCED IN CODE. UTraceTrailComponent::GetTraceLifetimeSeconds() takes
-	 * min(this, 4.0), so a larger value here is silently ignored; the clamp below makes that visible
-	 * in the panel instead of hiding it. Sane range 2 to 4.
+	 * THIS IS THE ONLY VALUE. UTraceTrailComponent::GetTraceLifetimeSeconds() used to take a min()
+	 * against a hardcoded ceiling while the two slices were landing separately; that ceiling is gone,
+	 * so what you set here is what the game plays. The ClampMax below is the real bound. Sane range
+	 * 2 to 4.
 	 *
 	 * Shortening it is a real nerf to the trail-hunting bots, whose BotTrailMinPointLifeRemaining
 	 * filter is a fraction of this window written as an absolute — move the two together.
+	 *
+	 * 2.8 -> 2.00 this pass (spec v3 §1). BotTrailMinPointLifeRemaining moved 0.56 -> 0.40 with it,
+	 * holding the "discard the oldest ~20% of the trace" ratio the two are supposed to keep.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Trail Lifetime (s)", ClampMin = "0.2", ClampMax = "4.0", UIMin = "0.5", UIMax = "4.0"))
-	float TrailLifetime = 2.8f;
+	float TrailLifetime = 2.0f;
 
 	/**
 	 * Distance the carrier must travel before a new point is appended, in uu.
@@ -950,7 +1387,7 @@ public:
 	// The field is not a fixed size. Distances that describe *positioning on the pitch* (how far
 	// ahead of the carrier a screen sits, how deep a receiver runs, how long a pass may be, how far
 	// a defender will travel to reach a trail) were originally constants tuned against an
-	// 8000 x 4000 field; on a 24000 x 12000 field the same numbers put every escort on top of the
+	// 8000 x 4000 field; on a 24000 x 9600 field the same numbers put every escort on top of the
 	// carrier and made every pass illegal. Those are expressed as a fraction of the field half-
 	// length or half-width, read from ATraceArenaBuilder::GetFieldBounds() at runtime.
 	//
@@ -980,14 +1417,14 @@ public:
 	 * carry running at ghosts — one of the two reasons trail kills were 1.3% of deaths.
 	 *
 	 * A FRACTION OF TrailLifetime WRITTEN AS AN ABSOLUTE, so the two must move together. It is
-	 * calibrated to discard the oldest ~20% of the trace: at TrailLifetime 4 that was 0.8, and at
-	 * the current 2.8 it is 0.56. Leaving it at 0.8 against a 2.8s trace would discard the oldest
-	 * 29% instead — the same mistake, in the same direction, that cut the trail-kill share from a
-	 * measured 37.5% of kills to 25.9% when TrailLifetime went 6 -> 4. Interceptors were not worse
-	 * at crossing; there was simply less legal trace for them to aim at.
+	 * calibrated to discard the oldest ~20% of the trace: at TrailLifetime 4 that was 0.8, at 2.8 it
+	 * was 0.56, and at the current 2.00 it is 0.40. Leaving it behind when TrailLifetime shrinks
+	 * discards a larger share of the trace instead — the same mistake, in the same direction, that
+	 * cut the trail-kill share from a measured 37.5% of kills to 25.9% when TrailLifetime went
+	 * 6 -> 4. Interceptors were not worse at crossing; there was simply less legal trace to aim at.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Min Point Life Remaining (s)", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0"))
-	float BotTrailMinPointLifeRemaining = 0.56f;
+	float BotTrailMinPointLifeRemaining = 0.40f;
 
 	/**
 	 * Fraction of the field HALF-LENGTH inside which a bot will accept the interceptor role.
@@ -1035,7 +1472,7 @@ public:
 	 *
 	 * An endzone spans the whole width of the field, so which part of the line a carrier crosses is
 	 * free choice — and aiming every bot at its exact centre threw that away, funnelling every carry
-	 * and every escort station down one corridor on a 12000uu-wide pitch. This gives each bot its own
+	 * and every escort station down one corridor. This gives each bot its own
 	 * crossing point for the life of its pawn (FormationBias is uniform in [-1, 1] and fixed per
 	 * life), which spreads carry routes, the trails they lay, and the escort screens that hang off
 	 * them across the field instead of stacking them.
@@ -1123,10 +1560,12 @@ public:
 	float BotPassEvalInterval = 0.35f;
 
 	/**
-	 * Shortest throw a bot will bother with, in uu.
+	 * Shortest pass a bot will bother with, in uu.
 	 *
-	 * Below this the "pass" is a handoff to somebody already inside PickupRadius — the Core is
-	 * caught in the same frame it is thrown, which gains nothing and reads in the log as a bug.
+	 * Below this the "pass" is a handoff to somebody standing on top of the carrier: it moves the
+	 * Core almost nowhere, spends PassCooldownSeconds, and costs the carrier PassHoldSeconds of
+	 * dropped shield for no positional gain at all. That is a bad trade for the bot and reads in the
+	 * log as a bug.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Passing", meta = (DisplayName = "Min Pass Distance (uu)", ClampMin = "0.0", ClampMax = "10000.0", UIMin = "100.0", UIMax = "3000.0"))
 	float BotPassMinDistance = 700.f;
@@ -1164,10 +1603,12 @@ public:
 	// teammate, and the instant it starts the carrier's shield drops. So the bot side of it is a
 	// commitment with an abort path, and these are the numbers that describe the commitment.
 	//
-	// The three durations below deliberately MIRROR the rule values rather than reading them: the
-	// rule lives on the pawn's own settings, which are owned elsewhere, and a bot that guessed at
-	// them would fail silently rather than loudly. If the rule moves, these move with it, and
-	// [BotPass] telemetry (attempts vs completions) is what says whether they still agree.
+	// The two durations below MIRROR the rule values rather than reading them. That was originally
+	// because the rule lived as compile-time constants in TraceCore.cpp; as of this pass the rule IS
+	// on this page (Core|Pass: PassHoldSeconds / PassCooldownSeconds), so the mirrors are now
+	// redundant and are candidates for deletion once ATraceBotController reads the Core|Pass values
+	// directly. Until then: keep each equal to the Core|Pass value it names, and watch [BotPass]
+	// telemetry (attempts vs completions) for the two drifting apart.
 	// ------------------------------------------------------------------------------------------
 
 	/**
@@ -1178,12 +1619,12 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Hold Margin (s)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.75"))
 	float BotPassHoldMargin = 0.20f;
 
-	/** Bot-side MIRROR of the rule's pass dwell. Keep equal to the pawn's hold requirement. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Hold Duration (s) [mirror of the rule]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.1", UIMax = "2.0"))
+	/** Bot-side MIRROR of Core|Pass "Pass Hold (s)". Keep equal to PassHoldSeconds. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Hold Duration (s) [mirror of Core|Pass]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.1", UIMax = "2.0"))
 	float BotPassHoldSeconds = 0.50f;
 
-	/** Bot-side MIRROR of the rule's 2 s post-pass cooldown, plus a little so bots never spam it. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Pass Cooldown (s) [mirror of the rule]", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "6.0"))
+	/** Bot-side MIRROR of Core|Pass "Pass Cooldown (s)", plus a little so bots never spam it. */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Pass Cooldown (s) [mirror of Core|Pass]", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.0", UIMax = "6.0"))
 	float BotPassCooldownSeconds = 2.30f;
 
 	/**
@@ -1205,15 +1646,15 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Max Line-Up Time (s)", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.2", UIMax = "3.0"))
 	float BotPassMaxLineUpSeconds = 1.10f;
 
-	/**
-	 * Radius (uu) inside which an enemy with line of sight counts as "covering" the carrier, and so
-	 * as a reason not to start a pass. Scaled by FTraceBotProfile::PassCaution.
-	 *
-	 * This is the risk half of the spec's central loop expressed as a number: it is the distance at
-	 * which a gun is close enough to convert half a second of dropped shield into a kill.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|HoverPass", meta = (DisplayName = "Safe Radius (uu)", ClampMin = "0.0", ClampMax = "20000.0", UIMin = "0.0", UIMax = "6000.0"))
-	float BotPassSafeRadius = 2200.f;
+	// DEAD PROPERTY REMOVED: BotPassSafeRadius (an EIGHTH dead knob, missed by the audit that found
+	// the other seven).
+	//
+	// It claimed to be the radius inside which an enemy with line of sight counts as "covering" the
+	// carrier — the risk half of the spec's central loop expressed as a number. Nothing read it.
+	// ATraceBotController::CountEnemiesCoveringMe uses BotPunishRange (Bots|Punish) instead, and
+	// that is the better answer anyway: it makes the carrier's idea of "someone can shoot me" and
+	// the defender's idea of "I can shoot the carrier" the same number by construction. Two knobs
+	// for one distance is how those two ever come to disagree.
 
 	// ------------------------------------------------------------------------------------------
 	// Bots — punishing the passer
@@ -1233,7 +1674,7 @@ public:
 	 * Standoff a punisher tries to hold from the carrier, as a fraction of BotPunishRange.
 	 *
 	 * Deliberately not zero: a punisher that walks onto the carrier is inside its own trace-hunting
-	 * teammates' crossing lanes, and is also the first thing a boosting carrier escapes past.
+	 * teammates' crossing lanes, and is also the first thing a dashing carrier escapes past.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Punish", meta = (DisplayName = "Punish Standoff (fraction of Punish Range)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float BotPunishStandoffFraction = 0.55f;
@@ -1267,30 +1708,33 @@ public:
 	// ------------------------------------------------------------------------------------------
 	// Bots — movement kit  (mechanics spec §5)
 	//
-	// Dash, slide, crouch fast-fall and boost. Each has ONE job below; none of them fire randomly.
-	// The cooldowns here are bot-side mirrors of the rule values for the same reason the pass
+	// Dash, slide and crouch fast-fall. Each has ONE job below; none of them fire randomly.
+	// The dash cooldown here is a bot-side mirror of the rule value for the same reason the pass
 	// durations are (see above) — the authoritative cooldown lives on the movement component.
+	//
+	// BOOST DELETED (spec v3 §1). BotBoostCooldownSeconds went with it. The stuck-recovery job the
+	// boost was doing for a navmesh-less AI is now BotStuckJumpSeconds below — a plain jump, which
+	// clears the low neon trim responsible for most wedges and costs no new ability.
 	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Seconds a bot may push into geometry without moving before it tries a jump to clear it.
+	 *
+	 * The bots have no navmesh, so their one failure mode is wedging against the arena's waist-high
+	 * furniture and sidestepping along it. Strafe-evade handles most of it; this is the escalation
+	 * when it does not, and it is deliberately NOT gated on MovementTechChance — a recovery that only
+	 * sometimes fires is a bot that sometimes stands in a wall for the rest of the match.
+	 *
+	 * MATTERS MORE ON THE NEW MAP. The corner banks (spec §7) are terraced at a ~39 uu riser against
+	 * a 45 MaxStepHeight, so they are walkable — but a bot steering straight at a riser corner has
+	 * exactly the stall shape this catches. Raise it if bots look twitchy; lower it if they grind.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Stuck Jump After (s)", ClampMin = "0.1", ClampMax = "10.0", UIMin = "0.5", UIMax = "4.0"))
+	float BotStuckJumpSeconds = 1.30f;
 
 	/** Bot-side MIRROR of DashCooldown, used by the shadow charge model. Keep the two equal. */
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Dash Cooldown (s) [mirror of Movement|Dash]", ClampMin = "0.05", ClampMax = "30.0", UIMin = "0.5", UIMax = "10.0"))
 	float BotDashCooldownSeconds = 3.5f;
-
-	/** Bot-side MIRROR of BoostCooldown. Keep the two equal. */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Boost Cooldown (s) [mirror of Movement|Boost]", ClampMin = "0.05", ClampMax = "60.0", UIMin = "1.0", UIMax = "20.0"))
-	float BotBoostCooldownSeconds = 12.f;
-
-	/**
-	 * Seconds of being unable to make progress before a bot tries to BOOST over whatever is in the
-	 * way, rather than only strafing around it.
-	 *
-	 * This is the single most useful job the boost has for an AI with no navmesh: the arena is full
-	 * of waist-high neon furniture, and a bot wedged against a block used to sidestep along it for
-	 * seconds at a time. Slightly longer than the strafe-evade trigger so the cheap fix is always
-	 * tried first.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Boost-When-Stuck Delay (s)", ClampMin = "0.1", ClampMax = "10.0", UIMin = "0.3", UIMax = "4.0"))
-	float BotBoostStuckSeconds = 1.30f;
 
 	/** Minimum planar speed (uu/s) before a slide is worth starting. Sliding from a standstill is a crouch. */
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Slide Min Speed (uu/s)", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "100.0", UIMax = "1500.0"))
@@ -1321,44 +1765,20 @@ public:
 	float BotFastFallMinHeight = 140.f;
 
 	// ------------------------------------------------------------------------------------------
-	// Bots — legacy scalars
+	// DELETED THIS PASS: the "Bots|Legacy" scalar block.
 	//
-	// Superseded by the FTraceBotProfile above, which is what ATraceBotController actually reads.
-	// They survive because UI/TraceMatchOptions.cpp writes to them to express its own difficulty
-	// curve, and deleting them would not compile. Treat them as read-only history: changing them
-	// no longer changes how a bot plays.
+	// BotReactionTime, BotAimErrorDegrees, BotAggression, BotDecisionInterval, BotSightRange,
+	// BotPreferredCombatRange and BotPassChance were all superseded by FTraceBotProfile above,
+	// which is what ATraceBotController actually reads. They had survived because
+	// UI/TraceMatchOptions.cpp once multiplied them by a difficulty curve; it no longer touches
+	// them (see the comment at TraceMatchOptions.cpp:63), so nothing in the project read any of the
+	// seven. AdvancedDisplay hid them but did not make them harmless — the last two in that list
+	// were on the standing "dead knobs" defect, because "Preferred Combat Range" and "Pass Chance"
+	// are exactly the names a designer reaches for when bots hold the wrong range or never pass.
 	//
-	// Marked AdvancedDisplay so the panel folds them out of the way rather than presenting seven
-	// dead knobs alongside the live ones.
+	// Tune FTraceBotProfile (Bots|Difficulty > Easy/Normal/Hard Profile) instead. Every knob those
+	// seven pretended to be is in there, and those ones are live.
 	// ------------------------------------------------------------------------------------------
-
-	/** DEAD — superseded by FTraceBotProfile::ReactionTimeSeconds. */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Reaction Time [DEAD]", ClampMin = "0.0", ClampMax = "5.0"))
-	float BotReactionTime = 0.32f;
-
-	/** DEAD — superseded by FTraceBotProfile::AimErrorDegrees. */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Aim Error [DEAD]", ClampMin = "0.0", ClampMax = "45.0"))
-	float BotAimErrorDegrees = 4.5f;
-
-	/** DEAD — superseded by FTraceBotProfile::Aggression. */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Aggression [DEAD]", ClampMin = "0.0", ClampMax = "1.0"))
-	float BotAggression = 0.75f;
-
-	/** DEAD — superseded by FTraceBotProfile::DecisionInterval. */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Decision Interval [DEAD]", ClampMin = "0.02", ClampMax = "2.0"))
-	float BotDecisionInterval = 0.2f;
-
-	/** DEAD — superseded by FTraceBotProfile::SightRange. */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Sight Range [DEAD]", ClampMin = "0.0", ClampMax = "40000.0"))
-	float BotSightRange = 6000.f;
-
-	/** DEAD — superseded by FTraceBotProfile::PreferredCombatRange. */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Preferred Combat Range [DEAD]", ClampMin = "0.0", ClampMax = "20000.0"))
-	float BotPreferredCombatRange = 1600.f;
-
-	/** DEAD — superseded by FTraceBotProfile::PassChance. */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Bots|Legacy", meta = (DisplayName = "Pass Chance [DEAD]", ClampMin = "0.0", ClampMax = "1.0"))
-	float BotPassChance = 0.35f;
 
 	// ==========================================================================================
 	// NET
@@ -1391,24 +1811,15 @@ public:
 	bool bDrawServerRewindDebug = false;
 
 	// ==========================================================================================
-	// CONTROLS  (legacy)
+	// DELETED THIS PASS: the "Controls" category and its single LookSensitivity property.
+	//
+	// The human look scale is a persisted per-player setting: UTraceUserSettings::LookSensitivity
+	// (default 1.50), plus a separate vertical multiplier and an invert-Y toggle, all rebuilt into
+	// the Look mapping's modifier scalars by ATracePlayerController::ApplyControlSettings(). The
+	// property here had not moved a crosshair since its last caller (the -TraceWalkHuman harness in
+	// AI/TraceBotController.cpp) was repointed at UTraceUserSettings::GetLookScaleX().
+	//
+	// Look sensitivity belongs in the in-game options menu, not in Project Settings, and having it
+	// in both is how somebody ends up tuning the copy that does nothing.
 	// ==========================================================================================
-
-	/**
-	 * DEAD. NO LONGER THE PLAYER'S SENSITIVITY.
-	 *
-	 * The human look scale is now a persisted per-player setting: UTraceUserSettings::
-	 * LookSensitivity (default 1.50), plus a separate vertical multiplier and an invert-Y toggle,
-	 * all rebuilt into the Look mapping's modifier scalars by
-	 * ATracePlayerController::ApplyControlSettings(). Editing this value does not move a human's
-	 * crosshair.
-	 *
-	 * Nothing reads it any more. Its last caller was the -TraceWalkHuman debug harness in
-	 * AI/TraceBotController.cpp, which divided by it to convert a desired yaw into synthetic mouse
-	 * delta; that was fixed at integration to read UTraceUserSettings::GetLookScaleX(), i.e. the
-	 * scalar actually installed in the Look mapping. Kept only so an existing DefaultGame.ini that
-	 * still carries the key does not warn. Do not wire anything new to it.
-	 */
-	UPROPERTY(config, EditAnywhere, AdvancedDisplay, Category = "Controls", meta = (DisplayName = "Look Sensitivity [DEAD — see TraceUserSettings]", ClampMin = "0.01", ClampMax = "20.0"))
-	float LookSensitivity = 2.5f;
 };

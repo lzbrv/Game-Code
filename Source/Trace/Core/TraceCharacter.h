@@ -94,7 +94,6 @@
 
 #include "CoreMinimal.h"
 #include "Engine/EngineTypes.h"        // FTimerHandle, EEndPlayReason
-#include "Engine/NetSerialization.h"   // FVector_NetQuantizeNormal (ServerPass payload)
 #include "GameFramework/Character.h"
 #include "UObject/ObjectPtr.h"
 
@@ -118,6 +117,37 @@ class UTraceHealthComponent;
 class UTraceLagCompensationComponent;
 class UTraceTrailComponent;
 class UTraceWeaponComponent;
+
+/**
+ * What happened when this build went looking for Epic's Mannequin.
+ *
+ * THIS ENUM IS THE FIX FOR A REAL BUG REPORT. The user asked for "default unreal engine human
+ * character models that have running animations, heads, and limbs" — which were already implemented
+ * and already loading on the machine they were implemented on. What they saw was the FALLBACK: art
+ * is gitignored by design (see the file header), so a clone that has not run
+ * Scripts/import-mannequin.sh silently degrades to team-coloured capsules. The degrade was silent
+ * because the only evidence was one Warning line in a log nobody reads during a playtest.
+ *
+ * So the status is now a first-class, queryable fact: decided before any pawn spawns
+ * (VerifyCharacterArtInstalled), logged as a banner at Error verbosity, and drawn on screen by
+ * ATraceHUD for as long as it is wrong. A missing import must be impossible to mistake for a
+ * design decision.
+ */
+enum class ETraceCharacterArtStatus : uint8
+{
+	/** Nothing has looked yet. */
+	Unknown,
+	/** Mannequin mesh AND ABP_Unarmed both resolved: heads, limbs and a real run cycle. */
+	Ok,
+	/** The mesh is there but the anim blueprint is not: a posed, non-animating character. */
+	AnimMissing,
+	/** Neither is there. Players are drawn as fallback primitives. THIS is the reported bug. */
+	MeshMissing,
+	/** -TraceNoCharacterArt: the fallback was asked for on purpose, so it is not a defect. */
+	DisabledByCommandLine,
+	/** Dedicated server: renders nothing, so there is nothing to warn about. */
+	NotRequired
+};
 
 UCLASS()
 class TRACE_API ATraceCharacter : public ACharacter
@@ -299,6 +329,32 @@ public:
 	 */
 	void SetupCharacterVisuals();
 
+	// --- Character art availability (see ETraceCharacterArtStatus) --------------------------------
+
+	/**
+	 * FIRST-RUN CHECK. Answers "is the Mannequin actually on this machine" WITHOUT spawning a pawn
+	 * and without loading 126 MB, by asking the package store whether the two packages exist.
+	 *
+	 * Safe and cheap to call from anywhere on any machine; idempotent; decides the status exactly
+	 * once per process and logs a boxed banner at Error verbosity when the answer is bad. ATraceHUD
+	 * calls it from BeginPlay so the warning is already on screen during warm-up, before the first
+	 * character has been dressed.
+	 */
+	static void VerifyCharacterArtInstalled();
+
+	/** The decided status, running VerifyCharacterArtInstalled() first if nothing has looked yet. */
+	static ETraceCharacterArtStatus GetCharacterArtStatus();
+
+	/**
+	 * True when this machine is drawing placeholder shapes (or unanimated poses) because the import
+	 * was not run — i.e. when the on-screen warning must be up. False for -TraceNoCharacterArt, which
+	 * is a deliberate test of the fallback, and false on a dedicated server.
+	 *
+	 * @param OutHeadline  short, shouty, one line.
+	 * @param OutDetail    the exact command to run.
+	 */
+	static bool GetCharacterArtWarning(FString& OutHeadline, FString& OutDetail);
+
 	/**
 	 * (Re)builds the team-coloured MIDs. Idempotent and safe to call from BeginPlay,
 	 * OnRep_PlayerState, OnRep_Team (ATracePlayerState calls it) and OnRep_IsCarrier — team data
@@ -359,29 +415,54 @@ public:
 	void DoPassPressed();
 	void DoPassReleased();
 
-	/**
-	 * Legacy single-shot shim (old bots, console). Equivalent to a press — AND NOTHING ELSE.
-	 *
-	 * DANGER, this has already caused one bug. Under the pre-spec model this was a complete action:
-	 * it threw the Core along the aim and the Core detached on the spot. Under spec §4 a pass is a
-	 * HELD hover, so this only latches mouse1 down. A caller that treats it as fire-and-forget leaves
-	 * the holder's shield suppressed and their trace invulnerable until something else cancels it —
-	 * which is exactly what Trace.DebugTakeCore used to do.
-	 *
-	 * If you call this, you own sending the matching DoPassReleased(). Prefer the explicit pair.
-	 */
-	void DoPass();
+	// DoPass() IS DELETED. It was a one-line alias for DoPassPressed() that read as a complete
+	// fire-and-forget action but only latched the button down — leaving the holder's shield
+	// suppressed and their trace invulnerable until something else cancelled it. That cost one real
+	// bug (Trace.DebugTakeCore). Call the explicit DoPassPressed/DoPassReleased pair.
 
 	void DoDash();
 
-	/** Spec §5: ground-only super-jump on a 12s cooldown. Predicted inside the movement component. */
-	void DoBoost();
+	/**
+	 * PARRY (spec §3) — the carrier's counter to a dash through their trace.
+	 *
+	 * ROUTING ONLY. The rule ("0.1 s of trace invulnerability, the whole trace turns red, an enemy
+	 * dash inside the window neither breaks the trace nor kills the carrier") belongs to
+	 * Gameplay/TraceParry.h and UTraceTrailComponent, which own the window, its replication, the red
+	 * tint and the refusal reasons. This forwards to TraceParry::RequestParry(), which is documented
+	 * as the mechanic's one entry point and which handles carrier-only, the cooldown, the local tint
+	 * prediction and the server RPC itself.
+	 *
+	 * There is deliberately no ServerParry RPC on this class: a second path to the same window is how
+	 * a prediction and an authoritative window end up disagreeing.
+	 */
+	void DoParryPressed();
+
+	/**
+	 * Release half of the parry bind. A NO-OP by design and declared anyway.
+	 *
+	 * Parry is a tap, not a hold — the window is a fixed 0.1 s owned by the trail component, so
+	 * holding the key must not extend it. This exists so the controller can bind Started/Completed/
+	 * Canceled symmetrically like every other button in ATracePlayerController, which is what stopped
+	 * the pass bind from latching a button down across a cancel (spec §8). Do not make it do work.
+	 */
+	void DoParryReleased();
+
+	/** True while this pawn's trace is inside a parry window. False in a build without the mechanic. */
+	bool IsParryActive() const;
+
+	/**
+	 * HUD feed for the parry cooldown, mirroring ATracePlayerController::GetDashHudState's contract.
+	 * Returns false when the mechanic does not exist in this build, and the HUD then draws no row at
+	 * all — a meter that is permanently full teaches the player that the row means nothing.
+	 */
+	bool GetParryHudState(float& OutRemaining, float& OutTotal, bool& bOutActive) const;
 
 	/**
 	 * 0..1 progress through the 0.5s pass hold; NEGATIVE when no pass is in progress.
 	 *
-	 * The sign convention is the HUD's contract (Settings/TraceGameplayCompat.h probes for this
-	 * name): a negative return means "draw nothing", not "a pass that has made no progress".
+	 * The sign convention is the HUD's contract: a negative return means "draw nothing", not "a pass
+	 * that has made no progress". ATracePlayerController::GetPassProgress() forwards this straight
+	 * through, so do not change the convention without changing the ring in ATraceHUD.
 	 */
 	float GetPassProgress() const;
 
@@ -444,15 +525,11 @@ protected:
 	 */
 	void SetCorpseHidden(bool bInHidden);
 
-	/**
-	 * Passes the Core along the client's aim. Reliable because it is a state change, not an
-	 * effect; the direction is quantised per contract §9.5 and re-validated server-side.
-	 */
-	UFUNCTION(Server, Reliable)
-	void ServerPass(FVector_NetQuantizeNormal Direction);
-
-	/** Server-side half of DoPass(), shared by the RPC and the listen-host path. */
-	void PerformPass(const FVector& Direction);
+	// ServerPass / PerformPass ARE DELETED — see the tombstone in the .cpp. Both had zero callers.
+	// The pass is decided on the server from the holder's own aim, so a client-supplied direction was
+	// unusable by definition, and a reliable server RPC nothing calls is only an attack surface.
+	// The live path is DoPassPressed/DoPassReleased -> ATraceCore::RequestPassInput, whose own RPC
+	// (ATraceCore::ServerSetPassInput) re-enters the same validation.
 
 	/** Creates the MID on first use, then just pushes the colour. Fallback shapes only. */
 	void ApplyColorToMesh(UStaticMeshComponent* InMesh, TObjectPtr<UMaterialInstanceDynamic>& InOutMID, const FLinearColor& InColor);
@@ -642,7 +719,4 @@ private:
 	bool bRotationModeIsFirstPerson = false;
 	bool bRotationModeApplied = false;
 
-	/** Server-side throttle for ServerPass, which is reliable and otherwise unbounded. */
-	static constexpr float MinPassRequestInterval = 0.1f;
-	float LastPassRequestTime = -1000.f;
 };

@@ -98,12 +98,12 @@ namespace TraceBotConstants
 // WHERE THE VERBS ACTUALLY LIVE
 //   hover pass  ATraceCore::RequestPassInput / IsShieldSuppressedFor / FindPassTargetFor
 //               (bound directly — see ApplyPassInput and IsCarrierShielded below)
-//   boost/slide UTraceCharacterMovementComponent::StartBoost / SetWantsToSlide
+//   slide       UTraceCharacterMovementComponent::SetWantsToSlide
 //   dash        ATraceCharacter::DoDash + UTraceCharacterMovementComponent::GetDashCharges
 //
 // WHY THE PROBES BELOW EXIST ANYWAY, AND WHY IT IS NOT PARANOIA
 //
-// Spec v2 gives the pawn four new input verbs — begin/end a hover pass, boost, crouch, and a dash
+// Spec v2 gives the pawn several new input verbs — begin/end a hover pass, crouch, and a dash
 // that now has charges. This file does not own ATraceCharacter, and under this project's strict file
 // ownership rule it must not add them. Written the obvious way, the bot brain would therefore fail
 // to COMPILE until somebody else's half of the pass had landed, and a bot layer that cannot be built
@@ -116,7 +116,7 @@ namespace TraceBotConstants
 // binds and the bot degrades to the nearest thing that DOES exist (mouse1, ACharacter::Crouch, a
 // plain jump) instead of breaking the build. Each adapter also returns whether it bound the real
 // verb, and LogCapabilities() prints the whole table once per match at Display — so "the bots do not
-// boost" can never again be diagnosed from silence. It is a compile-time question with a run-time
+// slide" can never again be diagnosed from silence. It is a compile-time question with a run-time
 // answer printed in the log.
 //
 // REQUIREMENTS ON THE PAWN, for whoever lands the other half:
@@ -141,30 +141,22 @@ namespace TraceBotPawnAPI
 		/** DoFirePressed. mouse1 IS the pass while carrying (spec §4), so this is the honest default. */
 		FireFallback = 0,
 
-		/** DoPass(): the pre-spec instant throw. Completes on the press; there is nothing to hold. */
-		LegacyInstant = 1,
-
 		/** DoPassPressed()/DoPassReleased(): the real held, cancellable hover pass. */
 		HoverHold = 2
 	};
 
-	// Three-level probe, most-preferred first. The overload ranking does the choosing: called with
-	// the literal 0, `int` is an exact match, `long` needs a conversion, and `...` is worse than
-	// both — so the first candidate that COMPILES for this pawn is the one that binds.
+	// Two-level probe, most-preferred first. The overload ranking does the choosing: called with the
+	// literal 0, `int` is an exact match and `...` is worse — so the first candidate that COMPILES
+	// for this pawn is the one that binds.
 	//
-	// The LegacyInstant rung is not just politeness toward old code: it is what keeps the pass
-	// mechanic measurable while the pawn half of spec §4 is still being written. A bot layer that
-	// reported "0 passes" for the whole of that window would be indistinguishable from a bot layer
-	// that could not pass at all.
+	// There WAS a middle LegacyInstant rung probing ATraceCharacter::DoPass(). That function has been
+	// deleted, and the rung went with it rather than being left to probe a name that no longer exists
+	// anywhere — a detector that can never fire is the silent-fallback hazard this whole block warns
+	// about, pointed at itself.
 	template <typename T> auto PassPressed(T* C, int) -> decltype(C->DoPassPressed(), EPassBinding())
 	{
 		C->DoPassPressed();
 		return EPassBinding::HoverHold;
-	}
-	template <typename T> auto PassPressed(T* C, long) -> decltype(C->DoPass(), EPassBinding())
-	{
-		C->DoPass();
-		return EPassBinding::LegacyInstant;
 	}
 	template <typename T> EPassBinding PassPressed(T* C, ...)
 	{
@@ -183,41 +175,11 @@ namespace TraceBotPawnAPI
 		return false;
 	}
 
-	// --- Boost: a ground-only super jump, 12 s cooldown ------------------------------------------
-	//
-	// Lives on UTraceCharacterMovementComponent (StartBoost/CanBoost), because it has to ride the
-	// saved-move pipeline like the dash does. Fallback is an ordinary jump on the character, which
-	// keeps the *behaviour* (get over the obstacle, break the duel) alive and visible while
-	// reporting bound=false — a far better failure than a bot that stands still where it should
-	// have launched.
-
-	template <typename M> auto Boost(M* Movement, int) -> decltype(Movement->StartBoost(), bool())
-	{
-		Movement->StartBoost();
-		return true;
-	}
-	template <typename M> bool Boost(M*, long)
-	{
-		return false;
-	}
-
-	template <typename M> auto CanBoost(const M* Movement, int) -> decltype(Movement->CanBoost())
-	{
-		return Movement->CanBoost();
-	}
-	template <typename M> bool CanBoost(const M*, long)
-	{
-		return true;   // No query: fall back to this controller's own cooldown mirror.
-	}
-
-	template <typename M> auto HasBoost(const M* Movement, int) -> decltype(Movement->CanBoost(), true)
-	{
-		return true;
-	}
-	template <typename M> bool HasBoost(const M*, long)
-	{
-		return false;
-	}
+	// BOOST IS GONE (spec v3 §1: "remove boost from the game entirely"). The Boost/CanBoost/HasBoost
+	// adapters lived here and drove UTraceCharacterMovementComponent::StartBoost. The one job the
+	// boost was doing for a navmesh-less AI — getting a wedged bot over the low neon furniture it had
+	// walked into — is now a plain jump, gated on UTraceSettings::BotStuckJumpSeconds. See the unstick
+	// branch in UpdateMovementTech().
 
 	// --- Crouch: slide on the ground, cancel upward momentum in the air ---------------------------
 	//
@@ -263,10 +225,6 @@ namespace TraceBotPawnAPI
 	{
 		return EPassBinding::HoverHold;
 	}
-	template <typename T> auto PassBindingOf(T* C, long) -> decltype(C->DoPass(), EPassBinding())
-	{
-		return EPassBinding::LegacyInstant;
-	}
 	template <typename T> EPassBinding PassBindingOf(T*, ...)
 	{
 		return EPassBinding::FireFallback;
@@ -277,7 +235,6 @@ namespace TraceBotPawnAPI
 		switch (Binding)
 		{
 		case EPassBinding::HoverHold:     return TEXT("DoPassPressed/DoPassReleased (real hover pass)");
-		case EPassBinding::LegacyInstant: return TEXT("DoPass (legacy instant throw)");
 		default:                          return TEXT("DoFirePressed (mouse1 fallback)");
 		}
 	}
@@ -362,26 +319,6 @@ static bool ApplyPassInput(ATraceCharacter* Character, bool bPressed)
 	return false;
 }
 
-/** Boost, falling back to a plain jump. Returns true if the real boost verb was driven. */
-static bool ApplyBoostInput(ATraceCharacter* Character)
-{
-	if (Character == nullptr)
-	{
-		return false;
-	}
-
-	if (UTraceCharacterMovementComponent* Movement = Character->GetTraceMovement())
-	{
-		if (TraceBotPawnAPI::Boost(Movement, 0))
-		{
-			return true;
-		}
-	}
-
-	Character->Jump();
-	return false;
-}
-
 // =================================================================================================
 // Measurement harness  (Trace.BotMetrics 1)
 //
@@ -405,8 +342,8 @@ static bool ApplyBoostInput(ATraceCharacter* Character)
 //
 // SPEC v2 ADDED A SECOND QUESTION: is every new mechanic actually being PLAYED? Nine of the ten
 // players are bots, so a rule no bot exercises is a rule that has never run. The [BotKit] line
-// counts pass attempts, completions and aborts, punisher engagements, dashes at a trace, boosts,
-// slides and fast-falls, so "the bots cannot hover-pass" is answerable from one line of log instead
+// counts pass attempts, completions and aborts, punisher engagements, dashes at a trace, unstick
+// jumps, slides and fast-falls, so "the bots cannot hover-pass" is answerable from one line of log instead
 // of from watching.
 //
 // It is behind a cvar because the acquisition chain costs one extra line trace per bot per tick.
@@ -468,7 +405,7 @@ namespace TraceBotTelemetry
 		int32 EscapeDashes      = 0;   // carrier dashes spent breaking away from a threat
 		int32 DuelDashes        = 0;   // dashes spent closing or disengaging in a fight
 
-		int32 Boosts            = 0;
+		int32 StuckJumps        = 0;   // wedged on geometry, tried a jump to clear it
 		int32 Slides            = 0;
 		int32 FastFalls         = 0;
 
@@ -626,7 +563,7 @@ namespace TraceBotTelemetry
 		// anything.
 		//
 		// A synthetic player who walks at wherever the objective currently is spends most of a run
-		// crossing 12000uu of empty pitch behind the play, and across four runs the mean distance to
+		// crossing half the pitch behind the play, and across four runs the mean distance to
 		// the nearest bot varied by a factor of three purely by luck. The "difficulty" those runs
 		// reported tracked that distance and not the profile: NORMAL measured *less* lethal than EASY
 		// on exactly the runs where the human had wandered into their own back corner.
@@ -868,12 +805,12 @@ namespace TraceBotTelemetry
 		// match", and a rolling window makes that harder to read rather than easier.
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[BotKit] t=%.0fs | pass: attempt=%d done=%d abort-threat=%d abort-other=%d giveup=%d ")
-			TEXT("| dash: trace=%d escape=%d duel=%d | boost=%d slide=%d fastfall=%d ")
+			TEXT("| dash: trace=%d escape=%d duel=%d | stuckjump=%d slide=%d fastfall=%d ")
 			TEXT("| punish: ticks=%d shots=%d | endzone: flips=%d unresolved=%d"),
 			Elapsed,
 			K.PassAttempts, K.PassCompletions, K.PassAbortsThreat, K.PassAbortsOther, K.PassLineUpGiveUps,
 			K.TraceDashes, K.EscapeDashes, K.DuelDashes,
-			K.Boosts, K.Slides, K.FastFalls,
+			K.StuckJumps, K.Slides, K.FastFalls,
 			K.PunisherTicks, K.PunisherShots,
 			K.EndzoneFlips, K.EndzoneUnresolved);
 
@@ -1005,7 +942,6 @@ void ATraceBotController::OnPossess(APawn* InPawn)
 	bCrouchHeld = false;
 	SlideEndTime = 0.f;
 	SlideReadyTime = 0.f;
-	BoostReadyTime = 0.f;
 	SpentDashCharges = 0;
 	NextDashRefillTime = 0.f;
 
@@ -1040,7 +976,6 @@ void ATraceBotController::OnPossess(APawn* InPawn)
 
 		const UTraceCharacterMovementComponent* Movement = PossessedCharacter->GetTraceMovement();
 		const int32 Charges = (Movement != nullptr) ? TraceBotPawnAPI::DashCharges(Movement, 0) : -1;
-		const bool bBoost = (Movement != nullptr) && TraceBotPawnAPI::HasBoost(Movement, 0);
 		const bool bSlide = (Movement != nullptr) && TraceBotPawnAPI::SetSlide(
 			const_cast<UTraceCharacterMovementComponent*>(Movement), false, 0);
 
@@ -1049,11 +984,10 @@ void ATraceBotController::OnPossess(APawn* InPawn)
 		const bool bCorePass = (ATraceCore::Get(GetWorld()) != nullptr);
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[BotCaps] pass=%s | boost=%s | slide=%s | shield-query=%s | dash-charges=%s"),
+			TEXT("[BotCaps] pass=%s | slide=%s | shield-query=%s | dash-charges=%s"),
 			bCorePass
 				? TEXT("ATraceCore::RequestPassInput (held, cancellable hover pass)")
 				: TraceBotPawnAPI::PassBindingName(TraceBotPawnAPI::PassBindingOf(PossessedCharacter, 0)),
-			bBoost ? TEXT("StartBoost") : TEXT("NOT BOUND — falling back to a plain jump"),
 			bSlide ? TEXT("SetWantsToSlide") : TEXT("ACharacter::Crouch fallback"),
 			TEXT("ATraceCore::IsShieldSuppressedFor"),
 			(Charges >= 0) ? TEXT("GetDashCharges") : TEXT("NOT BOUND — using the shadow model"));
@@ -1197,7 +1131,6 @@ void ATraceBotController::Tick(float DeltaSeconds)
 	bWantsToAim = false;
 	bPassOwnsAim = false;
 	bWantsDashThisTick = false;
-	bWantsBoostThisTick = false;
 	bWantsJumpThisTick = false;
 	ShootTarget = nullptr;
 
@@ -1956,7 +1889,7 @@ void ATraceBotController::BehaviourPunishPasser(float DeltaSeconds)
 	const FVector Forward = ToCarrier.GetSafeNormal();
 
 	// Hold a standoff rather than closing all the way in. A punisher that walks onto the carrier is
-	// standing in its own interceptors' crossing lanes, and is the first thing a boosting carrier
+	// standing in its own interceptors' crossing lanes, and is the first thing a dashing carrier
 	// gets away from.
 	const float Range = FMath::Max(200.f, Settings.BotPunishRange);
 	const float Standoff = Range * FMath::Clamp(Settings.BotPunishStandoffFraction, 0.1f, 1.f);
@@ -2379,23 +2312,9 @@ void ATraceBotController::UpdatePass(float DeltaSeconds)
 		const TraceBotPawnAPI::EPassBinding Binding = TraceBotPawnAPI::PassBindingOf(BotCharacter, 0);
 		TRACE_BOT_KIT(PassAttempts);
 
-		if (!bCoreDriven && Binding == TraceBotPawnAPI::EPassBinding::LegacyInstant)
-		{
-			// The pre-spec pawn throws on the press and there is nothing to hold: the Core is already
-			// gone. Close the attempt out here rather than sitting in Holding waiting for a dwell
-			// that this pawn does not implement.
-			TRACE_BOT_KIT(PassCompletions);
-
-			UE_LOG(LogTraceGame, Display, TEXT("[BotPass] %s -> %s COMPLETED (legacy instant binding)"),
-				*GetNameSafe(GetPlayerState<APlayerState>()),
-				*GetNameSafe(Receiver->GetPlayerState<APlayerState>()));
-
-			bPassOwnsAim = false;
-			PassReceiver = nullptr;
-			PassPhase = ETraceBotPassPhase::Cooldown;
-			PassCooldownUntilTime = Now + FMath::Max(0.f, Settings.BotPassCooldownSeconds);
-			return;
-		}
+		// The LegacyInstant early-completion branch used to live here, for a pre-spec pawn that threw
+		// on the press with nothing to hold. That binding is gone (ATraceCharacter::DoPass is
+		// deleted), so every pass now genuinely holds and completes through the dwell below.
 
 		bPassInputHeld = true;
 		PassPhase = ETraceBotPassPhase::Holding;
@@ -2607,20 +2526,24 @@ int32 ATraceBotController::CountEnemiesCoveringMe() const
 // Four verbs, four jobs. None of them fire at random, and each is here because of something a bot
 // with only "walk and dash" measurably did badly:
 //
-//   BOOST (12 s)  — get over the thing that is in the way. With no navmesh the bots' one failure
+//   UNSTICK JUMP  — get over the thing that is in the way. With no navmesh the bots' one failure
 //                   mode is wedging against the arena's waist-high neon furniture and sidestepping
-//                   along it for seconds; the boost is a vertical answer to a problem the horizontal
-//                   evade cannot solve. Also spent by a threatened carrier to break a duel.
+//                   along it for seconds; a jump is a vertical answer to a problem the horizontal
+//                   evade cannot solve, and clears the low trim that causes most of these. This used
+//                   to be a BOOST; spec v3 §1 deleted that feature, and the carrier's vertical
+//                   escape is the dash charge pool's job now.
 //   SLIDE         — a committed burst while already running in a straight line, and a lower profile
 //                   while doing it. Started only above BotSlideMinSpeed, because sliding from a
 //                   standstill is just crouching in the open.
 //   FAST-FALL     — get back to the ground. A bot in the air cannot dash usefully, cannot change
 //                   direction and is a clean silhouette; killing the upward momentum is how it stops
 //                   being all three of those at once.
-//   JUMP          — the cheap version of boost, for when boost is on cooldown.
 //
-// All four are gated on FTraceBotProfile::MovementTechChance so a difficulty can dial how busy the
-// bots look, and every use is counted in [BotKit] so "the bots never boost" is answerable.
+// The discretionary ones are gated on FTraceBotProfile::MovementTechChance so a difficulty can dial
+// how busy the bots look, and every use is counted in [BotKit] so "the bots never slide" is
+// answerable. The unstick jump is deliberately NOT gated on that chance: it is a recovery, not a
+// flourish, and a bot that only sometimes escapes a wall is a bot that sometimes stands in one for
+// the rest of the match.
 // =================================================================================================
 
 void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
@@ -2691,44 +2614,20 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 		return;   // Nothing else in this kit is usable in the air.
 	}
 
-	// --- Boost -----------------------------------------------------------------------------------
+	// --- Unstick jump ------------------------------------------------------------------------------
 	//
-	// Two triggers, both specific:
-	//   1. genuinely stuck — the horizontal evade has already been tried and is not working;
-	//   2. a carrier with something on top of it — a vertical exit a chasing defender cannot mirror,
-	//      and one that does not cost a dash charge that the trace defence will need.
-	// Ask the movement component when it can answer — its cooldown is the authoritative one and it
-	// also knows about "ground only". BoostReadyTime is only the mirror for a pawn that has no boost
-	// at all, where the fallback is a jump and nothing would otherwise rate-limit it.
-	const UTraceCharacterMovementComponent* TraceMovement = BotCharacter->GetTraceMovement();
-	const bool bBoostReady = (Now >= BoostReadyTime)
-		&& (TraceMovement == nullptr || TraceBotPawnAPI::CanBoost(TraceMovement, 0));
-
-	if (bBoostReady)
+	// The surviving half of the deleted boost: a bot that has been pushing into geometry without
+	// moving for this long tries a jump, which clears the low neon trim responsible for most wedges.
+	// StuckSeconds is reset on the way out so the bot re-earns the next attempt rather than
+	// hammering jump every frame while it stays stuck.
+	//
+	// The new corner banks (spec §7) make this matter more than it did on the flat map: a bot that
+	// steers straight at a terrace riser and stalls has exactly this shape.
+	if (StuckSeconds > FMath::Max(0.1f, Settings.BotStuckJumpSeconds))
 	{
-		const bool bStuck = StuckSeconds > FMath::Max(0.1f, Settings.BotBoostStuckSeconds);
-
-		const float PanicRadius = FMath::Max(0.f, Settings.BotCarrierPanicRadius);
-		const bool bCarrierCornered = bIAmCarrier
-			&& !IsPassing()
-			&& NearestEnemy.IsValid()
-			&& NearestEnemyDistSq < FMath::Square(PanicRadius * 0.7f)
-			&& GetDashCharges() == 0;
-
-		if (bStuck || (bCarrierCornered && FMath::FRand() < TechChance))
-		{
-			bWantsBoostThisTick = true;
-			BoostReadyTime = Now + FMath::Max(0.5f, Settings.BotBoostCooldownSeconds);
-			StuckSeconds = 0.f;
-			TRACE_BOT_KIT(Boosts);
-		}
-	}
-	else if (StuckSeconds > FMath::Max(0.1f, Settings.BotBoostStuckSeconds) * 1.5f)
-	{
-		// Boost is on cooldown but we are still wedged. A plain jump is worth trying; it clears the
-		// low trim that causes most of these.
 		bWantsJumpThisTick = true;
 		StuckSeconds = 0.f;
+		TRACE_BOT_KIT(StuckJumps);
 	}
 
 	// --- Slide -----------------------------------------------------------------------------------
@@ -3209,10 +3108,12 @@ bool ATraceBotController::FindTrailInterceptPoint(FVector& OutPoint, FVector& Ou
 		return false;
 	}
 
-	// Points expire TrailLifetime seconds after they are laid — FOUR seconds now, down from six
-	// (spec §3), which makes this filter matter considerably more than it did: a third of the
-	// window is gone, so committing to a point with less than BotTrailMinPointLifeRemaining left is
-	// a correspondingly larger share of a defender's time spent running at floor.
+	// Points expire UTraceSettings::TrailLifetime seconds after they are laid. NO NUMBER IN THIS
+	// COMMENT ON PURPOSE — it has been wrong twice already (it said six, then four; the setting is
+	// 2.0 today). The shorter that window gets, the more this filter matters: committing to a point
+	// with less than BotTrailMinPointLifeRemaining left is a correspondingly larger share of a
+	// defender's time spent running at floor. Those two settings are calibrated against each other;
+	// move them together.
 	float ServerNow = 0.f;
 	if (const AGameStateBase* GameStateBase = GetWorld() ? GetWorld()->GetGameState() : nullptr)
 	{
@@ -3302,7 +3203,7 @@ void ATraceBotController::ApplySteering(float DeltaSeconds)
 	// --- Stuck detection ------------------------------------------------------------------------
 	// There is no navmesh, so arena obstacles are handled the cheap way: notice that we are pushing
 	// into something and are not moving, then kick sideways — and if that does not work either,
-	// UpdateMovementTech() escalates to a boost over the top.
+	// UpdateMovementTech() escalates to a jump over the top.
 	if (bWantedToMove && BotCharacter->GetVelocity().Size2D() < TraceBotConstants::StuckSpeedThreshold)
 	{
 		StuckSeconds += DeltaSeconds;
@@ -3358,19 +3259,13 @@ void ATraceBotController::ApplySteering(float DeltaSeconds)
 
 	// Every impulse below MUST be raised after AddMovementInput and before the movement component
 	// ticks: UTraceCharacterMovementComponent::BeginDash locks the direction from Acceleration,
-	// which is derived from the input vector we have only just contributed, and the boost wants the
+	// which is derived from the input vector we have only just contributed, and the jump wants the
 	// same frame's heading. The tick prerequisite installed in OnPossess guarantees that ordering.
 	if (bWantsDashThisTick)
 	{
 		BotCharacter->DoDash();
 	}
 	bWantsDashThisTick = false;
-
-	if (bWantsBoostThisTick)
-	{
-		ApplyBoostInput(BotCharacter);
-	}
-	bWantsBoostThisTick = false;
 
 	if (bWantsJumpThisTick)
 	{
@@ -3420,7 +3315,7 @@ FVector ATraceBotController::GetAttackGoalLocation() const
 
 	// The goal is a LINE, not a point: an endzone spans the whole width, and which part of it a
 	// carrier crosses is free choice. Aiming every bot at the exact centre of it throws that away and
-	// funnels the entire match down the middle of a 12000uu-wide field. See
+	// funnels the entire match down the middle of the field. See
 	// UTraceSettings::BotAttackLaneFieldFraction for the measurement that says so.
 	const float LaneOffset = HalfFieldWidth()
 		* FMath::Max(0.f, Settings.BotAttackLaneFieldFraction)

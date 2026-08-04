@@ -68,7 +68,14 @@ bool UTraceHealthComponent::IsInvulnerable() const
 		// Spec §4, THE RISK BEAT: the shield drops for the whole pass window. Both halves of the
 		// beat (this, and the trace hardening) read the SAME replicated bool on ATraceCore, so they
 		// cannot drift apart, and a cancel restores both in one statement.
-		return OwningCharacter->IsCarrier() && !ATraceCore::IsShieldSuppressedFor(OwningCharacter);
+		//
+		// BOTH TERMS NOW ASK THE CORE. This used to be `OwningCharacter->IsCarrier() && ...`, mixing
+		// the pawn's replicated presentation mirror with the Core's authoritative pointer inside one
+		// expression — two independently replicated facts deciding one damage rule. IsCoreHolder()
+		// reads Core->Carrier, the same object the second term reads, so a frame in which the mirror
+		// and the Core disagree can no longer make a player briefly invulnerable or briefly shootable.
+		return ATraceCore::IsCoreHolder(OwningCharacter)
+			&& !ATraceCore::IsShieldSuppressedFor(OwningCharacter);
 	}
 	return false;
 }

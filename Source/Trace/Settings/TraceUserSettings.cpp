@@ -25,11 +25,12 @@ namespace
 	FKey Default_Crouch()      { return EKeys::LeftControl; }
 	FKey Default_Dash()        { return EKeys::LeftShift; }
 	/**
-	 * Boost is new this pass (spec §5: a ground-only super-jump on a 12s cooldown) and so has no
-	 * historical bind to honour. E is the only unclaimed key left under the movement hand — Q reads
-	 * as "lean" to anyone who has played a milsim, and F/R read as "use" and "reload".
+	 * Parry (spec v3 §3). The spec suggested "right mouse or Q"; RIGHT MOUSE IS ALREADY PASS, and
+	 * parry is a carrier-only ability, so overloading it onto the carrier's own pass button would
+	 * make the two mechanics unusable together — exactly the pair a carrier needs most. Q it is:
+	 * unclaimed, under the movement hand, reachable without leaving WASD.
 	 */
-	FKey Default_Boost()       { return EKeys::E; }
+	FKey Default_Parry()       { return EKeys::Q; }
 	FKey Default_Fire()        { return EKeys::LeftMouseButton; }
 	FKey Default_Pass()        { return EKeys::RightMouseButton; }
 	FKey Default_Scoreboard()  { return EKeys::Tab; }
@@ -47,7 +48,7 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		{ ETraceInputAction::Jump,        TEXT("Jump"),        TEXT("JUMP"),         &Default_Jump        },
 		{ ETraceInputAction::Crouch,      TEXT("Crouch"),      TEXT("CROUCH / SLIDE"), &Default_Crouch    },
 		{ ETraceInputAction::Dash,        TEXT("Dash"),        TEXT("DASH"),         &Default_Dash        },
-		{ ETraceInputAction::Boost,       TEXT("Boost"),       TEXT("BOOST"),        &Default_Boost       },
+		{ ETraceInputAction::Parry,       TEXT("Parry"),       TEXT("PARRY"),        &Default_Parry       },
 		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire        },
 		{ ETraceInputAction::Pass,        TEXT("Pass"),        TEXT("PASS CORE"),    &Default_Pass        },
 		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard  },

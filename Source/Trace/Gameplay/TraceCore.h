@@ -35,10 +35,16 @@
 //  - Movement replication is off permanently: the Core is either attached to a holder (attachment
 //    replicates on its own) or parked at its home location, which every machine computes.
 //
-// LEGACY SHIMS. TryPickup / Throw / DropAt / ResetToCenter are kept, with their old signatures,
-// because the GameMode, the endzone, the bots and the debug console still call them. They are
+// LEGACY SHIMS. TryPickup and DropAt are kept, with their old signatures, because they still have
+// live callers - the debug console (Trace.DebugTakeCore) and the uncredited-loss path
+// (ATraceGameMode::Logout, and the death path before the killer is known) respectively. They are
 // re-expressed on top of the status model - see each one's comment. New code should call
 // GrantTo / RequestPassInput / KickoffTo instead.
+//
+// Throw, ResetToCenter and IsPickupLockedOutFor were also kept "so foreign call sites compile", and
+// were then found to have ZERO call sites between them. All three are deleted; so is the replicated
+// ECoreState, which nothing read. A shim that shims nothing is just a second, wronger description of
+// the mechanic - Throw's own doc comment pointed at three functions that no longer exist.
 
 #pragma once
 
@@ -50,6 +56,7 @@
 
 class AController;
 class ATraceCharacter;
+class ATracePlayerState;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
 class USceneComponent;
@@ -71,6 +78,38 @@ enum class ETraceCoreGrantReason : uint8
 	/** Console / debug / harness grant. */
 	Debug = 4
 };
+
+/**
+ * Which test in IsLegalPassTarget() refused a candidate receiver.
+ *
+ * The distinction that MATTERS is IsTransientPassRejection(): the last three are geometry sampled
+ * once per frame against a field full of cover, so a running receiver blinks through them
+ * constantly and an in-flight pass must be allowed to ride those blinks out (spec §4.1, the pass
+ * measured dying 24 ms before completion). The first three are facts about the receiver - dead, an
+ * enemy, gone - and must cancel a pass immediately, with no grace at all.
+ *
+ * Values are stable because Trace.PassStats indexes its refusal histogram by them.
+ */
+enum class ETracePassRejectReason : uint8
+{
+	None = 0,
+	InvalidOrSelf = 1,
+	Dead = 2,
+	NotAnAlly = 3,
+	OutOfRange = 4,
+	NoLineOfSight = 5,
+	Behind = 6,
+	NotUnderCrosshair = 7
+};
+
+/** True for the geometric tests a momentary blink of which must not cancel an in-flight pass. */
+inline bool IsTransientPassRejection(ETracePassRejectReason Reason)
+{
+	return Reason == ETracePassRejectReason::OutOfRange
+		|| Reason == ETracePassRejectReason::NoLineOfSight
+		|| Reason == ETracePassRejectReason::Behind
+		|| Reason == ETracePassRejectReason::NotUnderCrosshair;
+}
 
 /**
  * The single contested objective, modelled as replicated status.
@@ -98,9 +137,12 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_Carrier)
 	TObjectPtr<ATraceCharacter> Carrier = nullptr;
 
-	/** Only Loose (== holderless) and Carried occur now. InFlight is dead: nothing flies. */
-	UPROPERTY(Replicated)
-	ECoreState State = ECoreState::Loose;
+	// ATraceCore::State IS DELETED, and ECoreState with it. It was a REPLICATED property written in
+	// two places and read by nobody in the entire module — a replicated property and a DOREPLIFETIME
+	// entry spent on a fact no code consulted. Its enum was worse than useless: InFlight
+	// ("travelling under projectile movement") was unreachable because nothing flies, and Loose was
+	// documented "on the ground, pickable by anyone", which flatly contradicts the model — there is
+	// no pickup. Carrier == nullptr is the only "holderless" test anything needs.
 
 	// --- Pass window (§4). These three are ONE fact; they replicate together. --------------------
 
@@ -237,7 +279,7 @@ public:
 	 *        pass-acquisition bug diagnosed against a drifted copy is worse than no diagnosis.
 	 */
 	bool IsLegalPassTarget(const ATraceCharacter* Holder, const ATraceCharacter* Candidate, bool bRequireAim = true,
-		const TCHAR** OutRejectReason = nullptr) const;
+		const TCHAR** OutRejectReason = nullptr, ETracePassRejectReason* OutRejectCode = nullptr) const;
 
 	/** Every character the match knows about. GameMode list, with an actor-iterator fallback. */
 	void GatherCharacters(TArray<ATraceCharacter*>& OutCharacters) const;
@@ -256,6 +298,21 @@ public:
 	 */
 	static bool IsShieldSuppressedFor(const AActor* Character);
 
+	/**
+	 * True if @p Character is the CURRENT holder, answered from the Core's own Carrier pointer.
+	 * Never from the pawn mirror.
+	 *
+	 * Use this — not ATraceCharacter::IsCarrier() — anywhere a GAMEPLAY RULE turns on who is
+	 * holding the Core. The pawn's bIsCarrier and the PlayerState's are presentation mirrors: they
+	 * drive the camera mode, the tint and the scoreboard, and they are replicated separately from
+	 * the Core, so there are frames in which they disagree with it. Damage and hit resolution used
+	 * to mix the two in a single expression (`Target->IsCarrier() && !IsShieldSuppressedFor(Target)`
+	 * — a mirror AND the truth), which is correct today only by luck of ordering.
+	 *
+	 * Safe on any actor, on any machine, including null.
+	 */
+	static bool IsCoreHolder(const AActor* Character);
+
 	/** §4: while a pass is in flight the holder's trace cannot be broken. */
 	static bool IsTraceInvulnerableFor(const AActor* Character);
 
@@ -267,26 +324,15 @@ public:
 	void TryPickup(ATraceCharacter* Character);
 
 	/**
-	 * Legacy pass entry point (ATraceCharacter::PerformPass, and therefore the bots' DoPass()).
-	 *
-	 * There is no throwing any more, so this is re-expressed as "the holder inputs a pass". The
-	 * direction and speed arguments are ignored: the server evaluates the holder's OWN aim, which
-	 * is the only thing it is allowed to trust.
-	 */
-	void Throw(const FVector& Direction, float Speed);
-
-	/**
 	 * Legacy. The holder lost the Core with nobody credited (Logout, and the GameMode's
 	 * death path before the killer is known). Queues the §2 fallback: nearest living enemy, else
 	 * hold for that team's next spawn. Location and impulse are ignored.
 	 */
 	void DropAt(const FVector& Location, const FVector& Impulse);
 
-	/** Legacy. Kickoff. The team that was scored on receives it (see KickoffTo). */
-	void ResetToCenter();
-
-	/** Legacy. Nothing is ever locked out of anything now; always false. */
-	bool IsPickupLockedOutFor(const ATraceCharacter* Character) const;
+	// Throw / ResetToCenter / IsPickupLockedOutFor ARE DELETED — all three had zero callers. See the
+	// tombstones in the .cpp. TryPickup and DropAt below are kept because they DO have live callers
+	// (Trace.DebugTakeCore, and the Logout / uncredited-death path respectively).
 
 	/** Arena centre, resolved from the arena builder and falling back to the spawn point. */
 	FVector GetHomeLocation() const;
@@ -339,6 +385,15 @@ private:
 
 	/** Server. Ticks the pass state machine: acquire, validate, complete, cancel. */
 	void ServerTickPass(float DeltaSeconds);
+
+	/**
+	 * Server, diagnostics only, throttled to 10 Hz and gated on Trace.PassStats.
+	 *
+	 * Answers "how often does the pass option fail to show up, and which test refused each teammate"
+	 * with a number instead of an impression. Runs the REAL rule (IsLegalPassTarget) so the answer
+	 * cannot drift from the game.
+	 */
+	void SamplePassAvailabilityStats();
 
 	/**
 	 * Server. Forgets the held mouse1 latch WITHOUT a release having been heard.
@@ -397,8 +452,34 @@ private:
 	 */
 	TWeakObjectPtr<ATraceCharacter> PassInputInstigator;
 
+	/**
+	 * Shared-clock time the ACTIVE pass's receiver last passed IsLegalPassTarget(), or <= 0 when
+	 * they are legal right now.
+	 *
+	 * §4.1: line of sight and "under the crosshair" are instantaneous tests sampled once per frame,
+	 * and the new arena's cover density means a running receiver blinks out of legality repeatedly
+	 * during any 0.5 s hold. Cancelling on the first blink is what killed a pass 24 ms before it
+	 * completed. The pass now cancels only when the receiver has been continuously illegal for
+	 * Trace.Pass.GraceSeconds, and only for the geometric tests - death or a team change still
+	 * cancels on the frame it happens (see IsTransientPassRejection).
+	 */
+	float PassGraceStartServerTime = 0.f;
+
 	/** The holder whose OnDeath we are currently bound to. */
 	TWeakObjectPtr<ATraceCharacter> BoundDeathHolder;
+
+	/**
+	 * The holder's PlayerState, cached in GrantTo().
+	 *
+	 * Exists for one reason: ATracePlayerState OUTLIVES the pawn, so the bIsCarrier mirror has to
+	 * stay clearable after the pawn is gone. ReleaseHolder() has a real path where the pawn is
+	 * already invalid (Tick step 2, a GC'd pawn, level teardown), and without a handle taken while
+	 * the pawn was alive there is no way to reach the PlayerState — which left a phantom carrier on
+	 * the scoreboard permanently. Cleared in ReleaseHolder BEFORE its `!IsValid(Previous)` return.
+	 *
+	 * Weak, not raw: a disconnect destroys the PlayerState too, and this must not keep it alive.
+	 */
+	TWeakObjectPtr<ATracePlayerState> HolderPlayerState;
 
 	/**
 	 * The holder we most recently let go of.
@@ -433,6 +514,18 @@ private:
 	ETraceTeam FallbackTeam = ETraceTeam::None;
 
 	FVector SpawnHomeLocation = FVector::ZeroVector;
+
+	// --- Sticky acquisition (per machine; nothing here is replicated) -------------------------------
+	//
+	// FindPassTargetFor() is a const query called from three places with different holders - the
+	// gameplay path (the carrier), ATraceHUD's 20 Hz highlight poll (the local player) and the bot
+	// controller. So the cache is keyed by holder and mutable: it must not change the meaning of a
+	// const query, only stop the answer flickering on and off between frames. See
+	// TraceCoreTuning::PassAcquireStickyDefault for why the flicker is the reported bug.
+
+	mutable TWeakObjectPtr<ATraceCharacter> StickyAcquireHolder;
+	mutable TWeakObjectPtr<ATraceCharacter> StickyAcquireTarget;
+	mutable float StickyAcquireServerTime = 0.f;
 
 	// --- Local prediction (owning client, and the listen host) -------------------------------------
 

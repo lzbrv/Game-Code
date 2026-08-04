@@ -4,10 +4,12 @@
 
 #include "Trace.h"
 #include "TraceTypes.h"
+#include "Core/TraceCharacter.h"        // PlayerHeightUU() reads the capsule off the CDO
 #include "Gameplay/TraceEndzone.h"
 #include "World/TraceTeamPlayerStart.h"
 
 #include "Components/BoxComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
 #include "Components/PointLightComponent.h"
@@ -50,15 +52,33 @@ namespace TraceArenaConstants
 	 */
 	static constexpr float StepRise = 40.f;
 
-	/** Tiers in the centre dais. Its top surface is therefore at StepRise * DaisTiers. */
-	static constexpr int32 DaisTiers = 4;
-	static constexpr float DaisTopTierSide = 1500.f;
-	static constexpr float DaisTierSideStep = 700.f;
+	/**
+	 * Fallback player height, used only if ATraceCharacter's CDO cannot be reached.
+	 *
+	 * The capsule is 88 uu half height, so one player height is 176 uu and the sketch's three
+	 * structure classes (spec v3 section 7) are 176 / 352 / 616. The live value comes from
+	 * ATraceArenaBuilder::PlayerHeightUU(), which reads the capsule; this constant exists so that a
+	 * missing CDO degrades to the documented arena instead of to a field of zero-height blocks.
+	 */
+	static constexpr float FallbackPlayerHeight = 176.f;
 
-	/** Tiers in each of the four wing platforms. */
-	static constexpr int32 WingTiers = 2;
-	static constexpr float WingTopTierSide = 1700.f;
-	static constexpr float WingTierSideStep = 700.f;
+	/** Structure heights from the sketch key, as multiples of one player height. */
+	static constexpr float StructureHeight1x = 1.0f;    // green outline
+	static constexpr float StructureHeight2x = 2.0f;    // orange outline
+	static constexpr float StructureHeight35x = 3.5f;   // red outline
+
+	/**
+	 * Tiers in the centre diamond. Its top surface is therefore at StepRise * DaisTiers.
+	 *
+	 * FOUR TIERS AT 1500/700 -> THREE AT 900/500. The sketch draws a SMALL diamond at the exact
+	 * centre; the old dais was a 3600 uu wide four-tier ziggurat, which on a 9600 uu wide field
+	 * would have been more than a third of the width and would have made the centre a fortress
+	 * rather than a landmark. 1900 uu across the base, 120 uu tall: high enough to be the visible
+	 * pedestal for the Core, small enough to run round.
+	 */
+	static constexpr int32 DaisTiers = 3;
+	static constexpr float DaisTopTierSide = 900.f;
+	static constexpr float DaisTierSideStep = 500.f;
 
 	/** The Core pedestal, measured from the dais top. */
 	static constexpr float PedestalHeight = 60.f;
@@ -211,11 +231,19 @@ namespace TraceArenaConstants
 	 *
 	 * The 40 uu risers of a stepped platform and the low floor decals do not have a vertical face
 	 * worth lighting, and trimming them would triple the component count of the dais for nothing.
-	 * 240 sits comfortably above StepRise * 4 (the tallest dais tier's own slab is the full 160) and
-	 * comfortably below the 420 uu lane rails, which are the shortest thing that genuinely blocks a
-	 * sightline and therefore genuinely has to be visible head-on.
+	 * 240 -> 160, because the SHORTEST COVER IN THE ARENA IS NOW 176 uu.
+	 *
+	 * Spec v3 section 7 keys structure heights to the player, and its lowest class - a green
+	 * outline - is exactly one player height. At 240 those blocks would have fallen through this
+	 * test and got the top lip alone, which is the precise failure the face trim was added to fix
+	 * (a black slab seen head-on), and they would also have missed the pawn-only standoff shell
+	 * AddNeonBlock hangs off the same test - so a first-person eye could have pressed to 34 uu of a
+	 * lip protruding 12 uu into the field, which is the point-blank whiteout coming back.
+	 *
+	 * 160 still sits above the 120 uu centre diamond and above any terrace of a corner bank (those
+	 * pass bFaceBands=false anyway), so nothing walkable gains trim it should not have.
 	 */
-	static constexpr float FaceTrimMinHeight = 240.f;
+	static constexpr float FaceTrimMinHeight = 160.f;
 
 	/** Glowing skirt where a block meets the floor. Its reflection in the floor doubles the read. */
 	static constexpr float SkirtOut = 10.f;
@@ -274,8 +302,16 @@ namespace TraceArenaConstants
 	/** How far the spawn line sits in front of a team's own goal line, as a fraction of half length. */
 	static constexpr float StartInsetFraction = 0.10f;
 
-	/** Fraction of the half width the spawn fan covers. */
-	static constexpr float StartSpreadFraction = 0.7f;
+	/**
+	 * Fraction of the half width the spawn fan covers.
+	 *
+	 * 0.7 -> 0.6. On a 9600 uu field 0.7 puts the outermost pad at Y = 3360, which is 60 uu inside
+	 * the corner banks (they start at HalfWidth - BankDepth = 3300): a pawn would spawn standing on
+	 * the first terrace with its capsule half in the riser. 0.6 lands the fan at +/-2880, i.e. 420
+	 * uu clear of the bank, and the five pads 1440 uu apart. Re-check this against BankDepth if you
+	 * change either.
+	 */
+	static constexpr float StartSpreadFraction = 0.6f;
 
 	// --- Palette ---------------------------------------------------------------------------------
 	//
@@ -349,83 +385,172 @@ namespace TraceArenaConstants
 		return FLinearColor(Color.R * Scale, Color.G * Scale, Color.B * Scale, 1.f);
 	}
 
+	// --- Corner banks ------------------------------------------------------------------------------
+	//
+	// THE SKETCH'S GREEN ARROWS. Four terraced banks, one per quadrant, raised along the long edges
+	// and stepping DOWN toward the middle of the field: a shallow stadium bowl with a flat central
+	// playfield. The geometry is built in BuildCornerBanks; these are the shape parameters.
+	//
+	// Each bank is a nest of solid boxes rising from Z = 0, exactly like AddSteppedPlatform, so
+	// there are no seams for a capsule to catch on and every riser is identical. Terrace k is
+	// strictly inside terrace k-1 in BOTH axes, which is what makes the top surface a staircase
+	// descending toward the centre and toward the goal line rather than a cliff at either end.
+	//
+	// WHY TERRACED AND NOT A RAMP. Trace's bots have no navmesh: they steer straight at their
+	// target with AddMovementInput (see ATraceBotController). A pitched ramp needs a rotated
+	// collision box, which is a different primitive from everything else here, and a bot that meets
+	// its downhill EDGE side-on gets a wall. Terraces are the same axis-aligned boxes the rest of
+	// the arena is made of, and UCharacterMovementComponent steps up anything under MaxStepHeight
+	// without the mover ever knowing there was a step - so a bot walking flat out at a target on the
+	// far side of a bank simply walks up and over it.
+
+	/**
+	 * Fraction of the half length the bank reaches IN from the goal line, toward midfield, at its
+	 * top terrace. The lowest terrace always runs the full half length.
+	 *
+	 * This is what makes the bowl a bowl instead of a trough: the terraces get shorter as they get
+	 * higher, so the bank is highest at the corner and tapers away to a single 39 uu lip by the
+	 * halfway line. 0.62 of 12000 puts the top terrace's inboard end at X = 5952, i.e. the bank
+	 * climbs over 5952 uu of run - about 3.4 degrees - which is a landscape, not an obstacle.
+	 */
+	static constexpr float BankInboardTaperFrac = 0.62f;
+
+	/**
+	 * How far the top terrace stops SHORT of the goal line, in uu, so the bank steps back down into
+	 * a flat endzone instead of ending in a wall.
+	 *
+	 * The endzones stay flat and full width on purpose: the goal line, the endzone floor patch, the
+	 * gate towers, the spawn pads and the endzone respawn pads all live in there, and every one of
+	 * them assumes a flat floor at Z = 0. 1400 uu of run over the bank's full height is a ~14 degree
+	 * descent, comfortably walkable, and it puts the high ground where a defender wants it - looking
+	 * back over their own goal line.
+	 */
+	static constexpr float BankGoalSetback = 1400.f;
+
+	/**
+	 * The lowest terrace stops this far short of the goal line too, so it cannot bury the goal line
+	 * decal. GoalLineWidth is 44 uu centred on the line, so anything over 22 clears it; 60 leaves a
+	 * visible dark gutter between the bank's toe and the lit line.
+	 */
+	static constexpr float BankGoalClearance = 60.f;
+
 	// --- Interior layout -------------------------------------------------------------------------
 	//
 	// Everything below is a FRACTION of HalfLength() / HalfWidth(), so the whole arena rescales
 	// coherently when FieldLength / FieldWidth change. The absolute numbers in the comments are for
-	// the shipped 24000 x 12000 field.
+	// the 24000 x 9600 field of spec v3 section 7.
 	//
-	// The design, from the centreline out:
-	//   |Y| < 2300     central spine - the direct route, dominated by the raised dais
-	//   |Y| ~ 2300     lane rail row A, segmented, splits spine from the mid lane
-	//   |Y| ~ 4400     lane rail row B, segmented, splits mid lane from the outer lane
-	//   |Y| ~ 4200     the four wing platforms, high ground overlooking the outer lanes
-	// with diamond cover blocks scattered so that no straight line from a spawn to the dais, or from
-	// the dais to either goal, is clear for its whole length. That is the point of the whole layout:
-	// the previous arena was a flat empty rectangle and every duel was decided the instant it began.
+	// The design, laid out for ONE half and mirrored through the centre line (see the header note on
+	// why the sketch's asymmetry is deliberately not reproduced):
+	//   |Y| < 3300     the flat central playfield, where all the cover lives
+	//   |Y| > 3300     the corner banks - terrain, not cover
+	// The cover scatter is placed so that no straight line from a spawn pad to the centre diamond,
+	// or from the centre to either goal, is clear for its whole length, and so that the two 3.5x
+	// landmarks (the top-centre tower and the goal-approach tower) are visible from most of the
+	// field. Every block below is one of the sketch's three height classes and nothing in between.
 
 	struct FCoverSpec
 	{
-		float XFrac;    // of HalfLength
-		float YFrac;    // of HalfWidth
-		float Side;     // uu, before the 45 degree rotation
-		float Height;   // uu
+		float XFrac;        // of HalfLength
+		float YFrac;        // of HalfWidth
+		float SizeX;        // uu, before any rotation
+		float SizeY;        // uu
+		float HeightMult;   // multiple of one player height - 1x, 2x or 3.5x, per the sketch key
+		float Yaw;          // 45 for a diamond, 0 for an axis-aligned bar
 	};
 
 	/**
-	 * Mirrored into all four quadrants. Every position here was checked against the rails, the wing
-	 * platforms, the endzone gates and the player-start line so nothing is built inside anything
-	 * else and nobody spawns inside a block - re-check if you move one.
+	 * Mirrored into all four quadrants: +/-X (the half-time-fair mirror) and +/-Y.
+	 *
+	 * EVERY POSITION HERE WAS CHECKED, in the (+X, +Y) quadrant, against every other entry, against
+	 * the centre diamond and its pylons, the lane pylons, the corner banks' inner edge (|Y| = 3300),
+	 * the goal line (X = 9600) and the five player-start pads at X = 8400, Y = 0 / +/-1440 /
+	 * +/-2880 - and checked against the PAWN STANDOFF SHELLS, not the visible boxes. The shells are
+	 * 26 uu proud on every side, so two blocks that look 120 uu apart leave a 68 uu channel, which
+	 * is exactly one capsule diameter: a gap measured off the meshes is a gap that does not exist.
+	 *
+	 * The tightest shell-to-shell clearances after that check, so you know what you are working with
+	 * if you move one:
+	 *
+	 *   A vs LanePylon    .... 288 uu
+	 *   B vs C            .... 291 uu
+	 *   C vs D            .... 270 uu
+	 *   C vs the bank toe .... 124 uu   (and the toe is a 39 uu step, so it is walkable, not a wall)
+	 *
+	 * A block overlapping a spawn pad is a pawn spawned inside solid geometry; a block overlapping
+	 * the bank is a block with its bottom step swallowed; a channel under 68 uu is a pocket a
+	 * navmesh-less bot grinds in until stuck-evade fires. All three are silent.
 	 */
 	static const FCoverSpec CoverBlocks[] =
 	{
-		{ 0.2917f, 0.2167f,  950.f, 800.f },   // (3500, 1300) - spine, first sightline break
-		{ 0.5750f, 0.2500f,  800.f, 680.f },   // (6900, 1500) - spine, mid field
-		{ 0.3917f, 0.8750f,  900.f, 860.f },   // (4700, 5250) - outer lane
-		{ 0.7250f, 0.5667f,  800.f, 760.f }    // (8700, 3400) - approach to the endzone
+		// A - long low bar, near the centre. The sketch's "long low bar", and the piece that stops
+		//     the run from a spawn to the centre diamond being a straight line.
+		{ 0.2000f, 0.4792f, 2600.f,  400.f, StructureHeight1x,   0.f },   // (2400, 2300)
+		// B - mid-half diamond in the spine. 2x, so it hides a standing body.
+		{ 0.3958f, 0.2500f, 1000.f, 1000.f, StructureHeight2x,  45.f },   // (4750, 1200)
+		// C - upright bar across the lane, 2x. Reads as a gate between the spine and the flank.
+		{ 0.5000f, 0.5208f,  400.f, 1300.f, StructureHeight2x,   0.f },   // (6000, 2500)
+		// D - low diamond on the endzone approach, 1x: shootable over, not hideable behind.
+		{ 0.6083f, 0.2708f, 1100.f, 1100.f, StructureHeight1x,  45.f },   // (7300, 1300)
+		// E - the 3.5x landmark tower of the goal approach. Visible from the far half; the piece a
+		//     defender fights around. Its Y span deliberately falls BETWEEN two spawn-pad rows.
+		{ 0.7500f, 0.4375f,  700.f,  700.f, StructureHeight35x, 45.f }    // (9000, 2100)
 	};
 
-	/** Mirrored in X only: two slabs straddling the centreline of each half. */
+	/** Mirrored in X only: one long 2x bar straddling the centreline of each half. */
 	static constexpr float AxisCoverXFrac = 0.4917f;   // 5900
-	static const FVector AxisCoverSize(1600.f, 600.f, 900.f);
+	static constexpr float AxisCoverSizeX = 2000.f;
+	static constexpr float AxisCoverSizeY = 500.f;
 
-	/** Lane rails: Y position as a fraction of HalfWidth, and the segment centres along X. */
-	static constexpr float RailRowAYFrac = 0.3833f;    // 2300
-	static constexpr float RailRowBYFrac = 0.7333f;    // 4400
-	static constexpr float RailRowAXFracs[] = { 0.2167f, 0.5500f };   // 2600, 6600
-	static constexpr float RailRowBXFracs[] = { 0.1167f, 0.3000f };   // 1400, 3600
-	static constexpr float RailLength = 2200.f;
-	static constexpr float RailThickness = 260.f;
-	static constexpr float RailHeight = 420.f;
-
-	/** Wing platforms and their light pylons. */
-	static constexpr float WingXFrac = 0.5333f;        // 6400
-	static constexpr float WingYFrac = 0.7000f;        // 4200
 	/**
-	 * The mid-lane pylons, one per quadrant.
+	 * The 3.5x tower at TOP CENTRE, standing on the dividing line. Straight from the sketch.
 	 *
-	 * These deliberately do NOT stand on the wing platforms. They did in the first pass, at the wing
-	 * centre, and a screenshot from the platform top showed the result immediately: a 220 uu column
-	 * planted in the middle of the one piece of high ground on that side of the field, so the reward
-	 * for taking the high ground was a pillar in your face. Out here they still mark the lane and
-	 * still break a sightline, and the platform top is clear to fight on.
+	 * It is the one structure that is NOT mirrored, and it does not need to be: it sits on X = 0, so
+	 * it belongs to neither half and the side switch cannot make it unfair. It is the tallest thing
+	 * on the field outside the endzone gates, which makes it the landmark that tells you where the
+	 * centre is from anywhere - the job the old 1800 uu dais pylons used to do badly.
 	 *
-	 * Position checked against tier 0 of the wing (2200 uu clear), both rail rows, cover blocks 2, 3
-	 * and 4 and the player-start line.
+	 * Checked: its Y span (2034..3166) clears the centre diamond's corner by 690 uu and the corner
+	 * banks by 134 uu.
+	 */
+	static constexpr float TopCentreTowerYFrac = 0.5417f;   // 2600
+	static constexpr float TopCentreTowerSide = 800.f;
+
+	/**
+	 * The mid-lane pylons, one per quadrant: tall thin light columns marking the flank route.
+	 *
+	 * Moved in from (4200, 3400) to (4200, 2900) with the narrower field, which keeps them 400 uu
+	 * clear of the corner banks. They still carry the light bridges out to the side walls, which is
+	 * most of what stops a flank frame being empty sky.
 	 */
 	static constexpr float LanePylonXFrac = 0.3500f;   // 4200
-	static constexpr float LanePylonYFrac = 0.5667f;   // 3400
-	static constexpr float WingPylonSide = 220.f;
-	static constexpr float WingPylonHeight = 1300.f;
+	static constexpr float LanePylonYFrac = 0.6042f;   // 2900
+	static constexpr float LanePylonSide = 220.f;
+	static constexpr float LanePylonHeight = 1300.f;
 
-	/** The four pylons standing around the centre dais. */
-	static constexpr float DaisPylonXFrac = 0.2167f;   // 2600
-	static constexpr float DaisPylonYFrac = 0.2667f;   // 1600
+	/**
+	 * The four pylons standing around the centre diamond.
+	 *
+	 * Pulled in and shortened (2600/1600/1800 -> 2200/1100/1400) to match the smaller diamond: at
+	 * the old radius they ringed a landmark that is no longer there, and at 1800 uu they competed
+	 * with the top-centre tower for the eye. Checked against the diamond's base corner - the
+	 * diamond is a 1900 uu square yawed 45, i.e. |x| + |y| <= 1344, and a pylon at (2200, 1100)
+	 * sums to 3300.
+	 */
+	static constexpr float DaisPylonXFrac = 0.1833f;   // 2200
+	static constexpr float DaisPylonYFrac = 0.2292f;   // 1100
 	static constexpr float DaisPylonSide = 240.f;
-	static constexpr float DaisPylonHeight = 1800.f;
+	static constexpr float DaisPylonHeight = 1400.f;
 
-	/** Glowing ring on the floor marking the contested zone. Diameter as a fraction of HalfWidth. */
-	static constexpr float CentrePadDiameterFrac = 0.8667f;   // 5200
+	/**
+	 * Glowing ring on the floor marking the contested zone. Diameter as a fraction of HalfWidth.
+	 *
+	 * 0.8667 -> 0.62. It is a fraction of the half width, so it survived the narrowing arithmetically
+	 * - and would have landed a 4160 uu radius ring straight through the toe of both corner banks,
+	 * where the terraces would have eaten most of it. 0.62 gives a 2976 uu radius, which sits
+	 * entirely on the flat playfield with 324 uu to spare.
+	 */
+	static constexpr float CentrePadDiameterFrac = 0.62f;
 	static constexpr float CentreRingWidth = 70.f;
 
 	// --- Flanks ----------------------------------------------------------------------------------
@@ -450,11 +575,12 @@ namespace TraceArenaConstants
 	//   corner pylons  four tall columns in the corners behind the goal lines, the one part of the
 	//                  field with no interior structure at all
 	//
-	// EVERY X POSITION BELOW WAS CHECKED against the wing platform diamonds, the outer cover blocks,
-	// the gate towers and the endzone. The tight one is the wing: its tier 0 is a 2400 uu square
-	// rotated 45 degrees about (6400, 4200), so it reaches Y = 5897 at exactly X = 6400 and shrinks
-	// by 1 uu of Y per uu of X either side. Buttresses at 6000 and 7800 clear it by 300 and 1300 uu
-	// respectively; one at 6400 would have been inside it.
+	// AFTER THE SECTION 7 REBUILD the void this was written for is much smaller - the field is 9600
+	// wide rather than 12000, and the outer 1500 uu of each side is now a corner bank, which is
+	// terrain the player can stand on rather than empty floor. All of it is kept because all of it
+	// is either flush with a wall or above head height, so none of it fights the banks: the
+	// buttresses and corner pylons are built from Z = 0 and simply emerge from the bank they stand
+	// on, and the rail and bridges are at 1640 and 1240 uu, far above the 352 uu bank crest.
 
 	struct FButtressSpec
 	{
@@ -498,8 +624,17 @@ namespace TraceArenaConstants
 	static constexpr float BridgeSize = 78.f;
 	static constexpr float BridgeDrop = 60.f;
 
-	/** Outer-lane floor stripes, as fractions of HalfWidth. */
-	static constexpr float LaneStripeYFracs[] = { 0.5500f, 0.8833f };   // 3300, 5300
+	/**
+	 * Lane floor stripes, as fractions of HalfWidth.
+	 *
+	 * { 0.55, 0.8833 } -> { 0.42, 0.66 }, i.e. 2016 and 3168 rather than 3300 and 5300. These are
+	 * floor decals 7 uu off the deck: at the old fractions the outer one would have been at Y = 4240
+	 * and the inner one exactly ON the bank toe, so one stripe would have been entirely buried
+	 * inside a terrace and the other half-eaten. Both now run on the flat playfield, and they mark
+	 * the two routes that actually exist there - the spine and the lane between the spine and the
+	 * bank.
+	 */
+	static constexpr float LaneStripeYFracs[] = { 0.4200f, 0.6600f };   // 2016, 3168
 	static constexpr float LaneStripeWidth = 72.f;
 
 	/** Corner pylons, in the dead space behind each goal line. */
@@ -535,7 +670,7 @@ namespace TraceArenaConstants
 	 * Endzone gate: two towers on the goal line plus a beam spanning the WHOLE width above them.
 	 *
 	 * The towers used to stand at |Y| = 3000, i.e. at half width, and that was the single worst piece
-	 * of misinformation in the arena. The scoring volume has always covered the full 12000 uu width,
+	 * of misinformation in the arena. The scoring volume has always covered the full field width,
 	 * but the gate is what the eye reads as "the endzone starts here", so the arena said the zone was
 	 * the middle half of the field while the trigger said sideline to sideline. Two towers on the
 	 * sidelines with a beam right across say the true thing, and they clear the scoring lane in the
@@ -642,6 +777,53 @@ ATraceArenaBuilder* ATraceArenaBuilder::Get(UWorld* World)
 float ATraceArenaBuilder::DaisTopZ() const
 {
 	return bBuildInteriorLayout ? (TraceArenaConstants::StepRise * TraceArenaConstants::DaisTiers) : 0.f;
+}
+
+float ATraceArenaBuilder::PlayerHeightUU() const
+{
+	// Read the capsule, do not assume it. Spec v3 section 7 sizes every structure in the arena as a
+	// multiple of ONE PLAYER HEIGHT, and the only durable definition of that is the pawn the player
+	// actually drives: ATraceCharacter sets its capsule to 88 uu half height in its constructor, so
+	// the class default object already knows the answer before any pawn exists. Cached statically
+	// because the CDO cannot change within a process and this is called once per structure.
+	static const float Cached = []() -> float
+	{
+		const ATraceCharacter* CDO = ATraceCharacter::StaticClass()->GetDefaultObject<ATraceCharacter>();
+		const UCapsuleComponent* Capsule = (CDO != nullptr) ? CDO->GetCapsuleComponent() : nullptr;
+		if (Capsule == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("ATraceArenaBuilder: could not read the character capsule; structure heights fall back to %.0f uu per player height."),
+				TraceArenaConstants::FallbackPlayerHeight);
+			return TraceArenaConstants::FallbackPlayerHeight;
+		}
+
+		const float Height = Capsule->GetUnscaledCapsuleHalfHeight() * 2.f;
+
+		// Logged at Log, not Verbose. "Why is that block the wrong height" is otherwise a question
+		// you can only answer by reading two files, and a previous pass twice declared a working
+		// mechanic dead because its log line was suppressed by default.
+		UE_LOG(LogTraceGame, Log,
+			TEXT("Arena structure heights keyed to the capsule: 1 player height = %.0f uu, so 1x/2x/3.5x = %.0f/%.0f/%.0f."),
+			Height, Height, Height * 2.f, Height * 3.5f);
+
+		return FMath::Max(1.f, Height);
+	}();
+
+	return Cached;
+}
+
+float ATraceArenaBuilder::BankInnerHalfWidth() const
+{
+	if (!bBuildCornerBanks)
+	{
+		return HalfWidth();
+	}
+
+	// Never let a silly BankDepth swallow the whole field: at minimum a quarter of the half width
+	// stays flat, which is what everything laid on the floor is placed against.
+	const float Depth = FMath::Clamp(BankDepth, 0.f, HalfWidth() * 0.75f);
+	return HalfWidth() - Depth;
 }
 
 FVector ATraceArenaBuilder::GetCoreSpawnLocation() const
@@ -772,11 +954,17 @@ void ATraceArenaBuilder::BuildArena()
 		BuildGrid();
 	}
 
+	// The banks are the ground, so they go down before anything that stands on them. Gated on their
+	// own switch rather than on bBuildInteriorLayout: a flat field with cover and a bowl with no
+	// cover are both useful things to be able to look at while tuning.
+	if (bBuildCornerBanks)
+	{
+		BuildCornerBanks(bBuildVisuals);
+	}
+
 	if (bBuildInteriorLayout)
 	{
 		BuildCentreDais(bBuildVisuals);
-		BuildWingPlatforms(bBuildVisuals);
-		BuildLaneRails(bBuildVisuals);
 		BuildCoverField(bBuildVisuals);
 	}
 
@@ -802,8 +990,14 @@ void ATraceArenaBuilder::BuildArena()
 
 	BuildPostProcess();
 
-	UE_LOG(LogTraceGame, Log, TEXT("Arena built (%.0f x %.0f x %.0f uu, visuals=%s, authority=%s): %d components."),
+	// Spelled out at Log because the proportion and the flat playfield width are the two things a
+	// playtester asks about first, and neither is readable from a screenshot.
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Arena built (%.0f x %.0f x %.0f uu, %.2f:1, flat playfield %.0f wide, banks %s at %.0f uu, visuals=%s, authority=%s): %d components."),
 		FieldLength, FieldWidth, WallHeight,
+		(FieldWidth > 0.f) ? (FieldLength / FieldWidth) : 0.f,
+		BankInnerHalfWidth() * 2.f,
+		bBuildCornerBanks ? TEXT("on") : TEXT("off"), BankHeight,
 		bBuildVisuals ? TEXT("yes") : TEXT("no"),
 		HasAuthority() ? TEXT("yes") : TEXT("no"),
 		GetComponents().Num());
@@ -1006,10 +1200,18 @@ void ATraceArenaBuilder::BuildGrid()
 
 	const int32 MaxHalfLines = FMath::Max(1, MaxGridLinesPerAxis / 2);
 	const int32 HalfLinesX = FMath::Min(FMath::FloorToInt(HalfX / GridSpacing), MaxHalfLines);
-	const int32 HalfLinesY = FMath::Min(FMath::FloorToInt(HalfY / GridSpacing), MaxHalfLines);
 
-	// Lines of constant X, running the full width. Each lies entirely in one half, so it takes that
-	// half's colour outright.
+	// THE GRID STOPS AT THE BANK TOE. Every strip here is a 5 uu slab lying on the floor at Z = 2,
+	// and the corner banks are solid boxes rising from Z = 0 - so any part of the grid out past
+	// BankInnerHalfWidth() is not "a line on a slope", it is a line INSIDE a terrace, invisible and
+	// paid for. Clipping the constant-X strips to the flat playfield and dropping the constant-Y
+	// strips that fall outside it also makes the grid say something true: the lit rectangle is
+	// exactly the flat ground, and the banks read as the frame around it.
+	const float GridHalfY = BankInnerHalfWidth();
+	const int32 HalfLinesY = FMath::Min(FMath::FloorToInt(GridHalfY / GridSpacing), MaxHalfLines);
+
+	// Lines of constant X, running the width of the flat playfield. Each lies entirely in one half,
+	// so it takes that half's colour outright.
 	for (int32 Index = -HalfLinesX; Index <= HalfLinesX; ++Index)
 	{
 		const float X = Index * GridSpacing;
@@ -1021,7 +1223,7 @@ void ATraceArenaBuilder::BuildGrid()
 		const bool bCenter = (Index == 0);
 		AddMeshBlock(CubeMesh,
 			FVector(X, 0.f, TraceArenaConstants::GridZ),
-			FVector(bCenter ? GridStripWidth * 3.f : GridStripWidth, FieldWidth, TraceArenaConstants::GridThickness),
+			FVector(bCenter ? GridStripWidth * 3.f : GridStripWidth, GridHalfY * 2.f, TraceArenaConstants::GridThickness),
 			bCenter ? CenterMID : HalfColorMID(X),
 			/*bCastShadow=*/false,
 			TEXT("GridX"));
@@ -1032,7 +1234,7 @@ void ATraceArenaBuilder::BuildGrid()
 	for (int32 Index = -HalfLinesY; Index <= HalfLinesY; ++Index)
 	{
 		const float Y = Index * GridSpacing;
-		if (FMath::IsNearlyEqual(FMath::Abs(Y), HalfY, 1.f))
+		if (FMath::IsNearlyEqual(FMath::Abs(Y), HalfY, 1.f) || FMath::Abs(Y) > GridHalfY)
 		{
 			continue;
 		}
@@ -1099,9 +1301,10 @@ void ATraceArenaBuilder::BuildCentreDais(bool bBuildVisuals)
 			MaskMID, /*bCastShadow=*/false, TEXT("CentreRingMask"));
 	}
 
-	// The dais itself: four 40 uu steps, rotated 45 degrees so it reads as a diamond and so a player
-	// running at it from any of the eight compass directions meets a flat face square-on rather than
-	// a corner. It is walkable from every side (see AddSteppedPlatform), which is what keeps the
+	// THE SMALL DIAMOND AT THE EXACT CENTRE, straight off the sketch: three 40 uu steps, rotated 45
+	// degrees so it reads as a diamond and so a player running at it from any of the eight compass
+	// directions meets a flat face square-on rather than a corner. 1900 uu across the base, 120 uu
+	// tall. It is walkable from every side (see AddSteppedPlatform), which is what keeps the
 	// objective reachable without a ramp for the navmesh-less bots to find.
 	AddSteppedPlatform(FVector2D::ZeroVector,
 		TraceArenaConstants::DaisTopTierSide, TraceArenaConstants::DaisTierSideStep,
@@ -1121,23 +1324,27 @@ void ATraceArenaBuilder::BuildCentreDais(bool bBuildVisuals)
 	// collision, and the Core is the only thing that ever touches it.
 	if (UBoxComponent* PedestalCollision = AddCollisionBlock(PedestalCenter, PedestalSize * FVector(0.94f, 0.94f, 1.f), TEXT("PedestalCollision")))
 	{
-		// THE PEDESTAL MUST NOT BLOCK PAWNS. It sits exactly where the Core lives, so blocking pawns
-		// makes the objective unreachable by ANYONE:
+		// THE PEDESTAL MUST NOT BLOCK PAWNS. It sits exactly where the Core lives, and a pawn-blocking
+		// pedestal is how the centre of the map becomes a place players bounce off.
 		//
 		//     pedestal collision half-extent  = 300 * 0.94 / 2 = 141 uu
 		//   + character capsule radius        =                   34 uu
 		//   = closest a player can stand      =                  175 uu from the centre
-		//     UTraceSettings::PickupRadius    =                  110 uu
 		//
-		// 175 > 110, so the Core's pickup sphere could never overlap a capsule while the Core is at
-		// home. That was measured, not reasoned about: ten bots walked to the centre and orbited at
-		// exactly X = +/-175.03 with zero "Core picked up" events in the log. The pedestal is also
-		// 60 uu tall against a 45 uu MaxStepHeight, so players cannot climb it either.
+		// HISTORICAL NOTE, because the measurement is still the reason this line exists. Back when the
+		// Core was a physical object with a pickup sphere (UTraceSettings::PickupRadius, 110 uu — both
+		// the setting and the mechanic are now deleted), 175 > 110 meant the sphere could never
+		// overlap a capsule while the Core was at home, and the objective was literally untakeable.
+		// That was measured, not reasoned about: ten bots walked to the centre, orbited at exactly
+		// X = +/-175.03, and logged zero pickups. The Core is a status now and is granted rather than
+		// touched, so that specific failure cannot recur — but the pedestal is still 60 uu tall
+		// against a 45 uu MaxStepHeight, so a blocking pedestal would still be an obstacle parked on
+		// the objective.
 		//
-		// Ignoring ECC_Pawn keeps everything the block was actually for — the Core's projectile sweep
-		// still rests on it, ECC_Visibility still blocks hitscan and bot line-of-sight, ECC_Camera
-		// still blocks the spring arm — and only removes the one response that made the objective
-		// impossible to take. Waist-high scenery you can walk through beats an unwinnable match.
+		// Ignoring ECC_Pawn keeps everything the block was actually for — ECC_Visibility still blocks
+		// hitscan and bot line-of-sight, ECC_Camera still blocks the spring arm — and only removes
+		// the one response that made the centre hostile. Waist-high scenery you can walk through
+		// beats an unwinnable match.
 		PedestalCollision->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
 	}
 
@@ -1186,105 +1393,121 @@ void ATraceArenaBuilder::BuildCentreDais(bool bBuildVisuals)
 	}
 }
 
-void ATraceArenaBuilder::BuildWingPlatforms(bool bBuildVisuals)
+void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 {
+	// ---------------------------------------------------------------------------------------------
+	// THE SHALLOW STADIUM BOWL - spec v3 section 7, the sketch's green arrows.
+	//
+	// Four banks, one per quadrant. Each is a nest of solid boxes rising from Z = 0, terrace 0
+	// widest/longest/lowest and terrace N-1 smallest/highest, so the top surface is a staircase that
+	// descends toward the centre of the field in BOTH axes:
+	//
+	//        goal line                      halfway
+	//    |Y| = 4800  ###############################____        <- terrace N-1 crest, 352 uu
+	//                  ###########################______
+	//                    #######################__________
+	//    |Y| = 3300        ###################______________    <- terrace 0 toe, 39 uu
+	//                          flat central playfield
+	//
+	// EVERY RISER IS UNDER MaxStepHeight, and that is the load-bearing property. The terrace count
+	// is DERIVED from BankHeight rather than fixed, so raising the bank adds terraces instead of
+	// making the risers taller - a bank that "just" needed a taller step would silently become a
+	// wall, and a wall along both sidelines is a bot trap and a carrier's dead end at once.
+	//
+	// WHY THE BANKS STOP AT THE GOAL LINE. The endzones stay flat and full width. The goal line
+	// decal, the endzone floor patch, the gate towers, the spawn fan and the endzone respawn pads
+	// all assume a floor at Z = 0 out there, and a scoring volume you have to climb into is a rule
+	// nobody asked for. The bank's crest sits just inboard of the goal line and steps back down over
+	// BankGoalSetback uu, so the high ground overlooks the endzone rather than being part of it.
+	// ---------------------------------------------------------------------------------------------
+
 	const float HalfX = HalfLength();
 	const float HalfY = HalfWidth();
+	const float Depth = HalfY - BankInnerHalfWidth();
+	const float Height = FMath::Max(0.f, BankHeight);
 
+	if (Depth <= 1.f || Height <= 1.f)
+	{
+		return;
+	}
+
+	// Terrace count from the riser ceiling, not the other way round. Ceil, so the riser is always
+	// STRICTLY under StepRise (which is itself 5 uu under the engine's MaxStepHeight of 45).
+	const int32 TerraceCount = FMath::Clamp(FMath::CeilToInt(Height / TraceArenaConstants::StepRise), 1, 24);
+	const float Riser = Height / static_cast<float>(TerraceCount);
+
+	// The goal line is where the bank has to stop. ClampedEndzoneDepth() rather than EndzoneDepth,
+	// for the reason spelled out on that function: three hand-written copies of this clamp is how a
+	// spawn pad ended up on the wrong side of a goal line.
+	const float GoalX = HalfX - ClampedEndzoneDepth();
+	const float Inboard = FMath::Max(0.f, GoalX * TraceArenaConstants::BankInboardTaperFrac);
+	const float Setback = FMath::Min(TraceArenaConstants::BankGoalSetback, FMath::Max(0.f, GoalX * 0.5f));
+
+	// Emissive 0.012, the DAIS number, not the 0.026-0.030 the cover blocks carry - and for exactly
+	// the reason recorded on the dais: a terrace is a large UP-FACING surface, up-facing surfaces
+	// also catch the most key light, and the two terms stack. The palette comment one screen up
+	// records what that costs (platform tops blowing out to a flat pale sheet at ~200/255, judged
+	// from a screenshot of a platform top rather than of a wall), and the banks are by area the
+	// largest up-facing structure in the arena - four of them, 1500 uu deep, the full half length.
+	// The per-terrace lips do all the shape reading here anyway: nine concentric glowing contours
+	// per bank is more edge per square metre than anything except the dais itself.
 	UMaterialInstanceDynamic* BodyMID = bBuildVisuals
 		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f,
-			TraceArenaConstants::NeonNeutral, 0.026f)
+			TraceArenaConstants::NeonNeutral, 0.012f)
 		: nullptr;
-	UMaterialInstanceDynamic* PylonBodyMID = BodyMID;
 
-	// One platform per quadrant, each wearing the colour of the team whose half it stands in.
 	for (const float XSign : { -1.f, 1.f })
 	{
+		// The bank wears the colour of the half it lies in, exactly like the floor grid and the
+		// flank dressing: a player who has lost their bearings on a bank can still read which way
+		// they are attacking off the contour lines under their feet.
 		const ETraceTeam HalfTeam = (XSign < 0.f) ? ETraceTeam::Blue : ETraceTeam::Orange;
 		UMaterialInstanceDynamic* NeonMID = bBuildVisuals
 			? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowLip)
 			: nullptr;
-		UMaterialInstanceDynamic* PylonNeonMID = bBuildVisuals
-			? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowPylon)
-			: nullptr;
 
 		for (const float YSign : { -1.f, 1.f })
 		{
-			const FVector2D Centre(XSign * HalfX * TraceArenaConstants::WingXFrac,
-				YSign * HalfY * TraceArenaConstants::WingYFrac);
-
-			AddSteppedPlatform(Centre,
-				TraceArenaConstants::WingTopTierSide, TraceArenaConstants::WingTierSideStep,
-				TraceArenaConstants::WingTiers, 45.f, BodyMID, NeonMID, TEXT("Wing"));
-
-			if (bBuildVisuals)
+			for (int32 Terrace = 0; Terrace < TerraceCount; ++Terrace)
 			{
-				// Stands beside the platform, not on it - see LanePylonXFrac.
-				AddPylon(FVector2D(XSign * HalfX * TraceArenaConstants::LanePylonXFrac,
-						YSign * HalfY * TraceArenaConstants::LanePylonYFrac),
-					TraceArenaConstants::WingPylonSide, TraceArenaConstants::WingPylonHeight,
-					PylonBodyMID, PylonNeonMID, TEXT("LanePylon"));
-			}
-		}
-	}
-}
+				const float Alpha = static_cast<float>(Terrace) / static_cast<float>(TerraceCount);
+				const float TopZ = Riser * static_cast<float>(Terrace + 1);
 
-void ATraceArenaBuilder::BuildLaneRails(bool bBuildVisuals)
-{
-	const float HalfX = HalfLength();
-	const float HalfY = HalfWidth();
+				// Y: terrace 0 reaches BankDepth in from the sideline, each one after it a step less,
+				// so the sloped strip is Depth wide with TerraceCount treads across it.
+				const float InnerY = HalfY - Depth * (1.f - Alpha);
 
-	UMaterialInstanceDynamic* BodyMID = bBuildVisuals
-		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f,
-			TraceArenaConstants::NeonNeutral, 0.026f)
-		: nullptr;
+				// X: terrace 0 runs from the halfway line to just short of the goal line; higher
+				// terraces start further out and stop further back, which is what turns a trough
+				// along the sideline into a bank that is highest at the CORNER.
+				const float NearX = Inboard * Alpha;
+				const float FarX = GoalX - TraceArenaConstants::BankGoalClearance - Setback * Alpha;
 
-	// Waist-high segmented rails. They are what turns an open rectangle into a central spine plus two
-	// lanes per side: long enough to break a sightline and to make a carrier commit to a route, with
-	// wide gaps between segments so nothing is ever a corridor. The gaps matter for more than feel -
-	// Trace's bots have no navmesh and steer straight at their target (ATraceBotController), so a
-	// continuous rail would be something they grind along until the stuck-evade kicks in.
-	struct FRailRow
-	{
-		float YFrac;
-		const float* XFracs;
-		int32 XCount;
-	};
-
-	const FRailRow Rows[] =
-	{
-		{ TraceArenaConstants::RailRowAYFrac, TraceArenaConstants::RailRowAXFracs, UE_ARRAY_COUNT(TraceArenaConstants::RailRowAXFracs) },
-		{ TraceArenaConstants::RailRowBYFrac, TraceArenaConstants::RailRowBXFracs, UE_ARRAY_COUNT(TraceArenaConstants::RailRowBXFracs) }
-	};
-
-	for (const FRailRow& Row : Rows)
-	{
-		for (const float YSign : { -1.f, 1.f })
-		{
-			for (const float XSign : { -1.f, 1.f })
-			{
-				const ETraceTeam HalfTeam = (XSign < 0.f) ? ETraceTeam::Blue : ETraceTeam::Orange;
-				UMaterialInstanceDynamic* NeonMID = bBuildVisuals
-					? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowLip)
-					: nullptr;
-				UMaterialInstanceDynamic* FaceMID = bBuildVisuals
-					? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowFace)
-					: nullptr;
-
-				for (int32 Index = 0; Index < Row.XCount; ++Index)
+				const float SpanX = FarX - NearX;
+				const float SpanY = HalfY - InnerY;
+				if (SpanX <= 1.f || SpanY <= 1.f)
 				{
-					const FVector Centre(
-						XSign * HalfX * Row.XFracs[Index],
-						YSign * HalfY * Row.YFrac,
-						TraceArenaConstants::RailHeight * 0.5f);
-
-					AddNeonBlock(Centre,
-						FVector(TraceArenaConstants::RailLength, TraceArenaConstants::RailThickness, TraceArenaConstants::RailHeight),
-						0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("LaneRail"), FaceMID);
+					continue;
 				}
+
+				// bVerticalTrim = false: a 39 uu riser would carry four 39 uu corner-rib stubs.
+				// bFaceBands = false: the terraces are NESTED, so a skirt on this one would be
+				// buried inside the solid body of the one outside it. The top lip alone gives each
+				// terrace one glowing contour line, which is the whole read - and its 12 uu
+				// protrusion hangs 13 uu above the tread below, so it never blocks a foot.
+				AddNeonBlock(
+					FVector(XSign * (NearX + SpanX * 0.5f), YSign * (InnerY + SpanY * 0.5f), TopZ * 0.5f),
+					FVector(SpanX, SpanY, TopZ),
+					/*YawDegrees=*/0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("Bank"),
+					/*FaceNeonMID=*/nullptr, /*bVerticalTrim=*/false, /*bFaceBands=*/false);
 			}
 		}
 	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Corner banks: %d terraces per bank, %.1f uu riser (ceiling %.0f), crest %.0f uu, %.0f uu deep, X %.0f..%.0f."),
+		TerraceCount, Riser, TraceArenaConstants::StepRise, Height, Depth,
+		0.f, GoalX - TraceArenaConstants::BankGoalClearance);
 }
 
 void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)
@@ -1311,6 +1534,12 @@ void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)
 			TraceArenaConstants::NeonNeutral, 0.030f)
 		: nullptr;
 
+	// ONE PLAYER HEIGHT, read off the capsule. Every block below is exactly 1x, 2x or 3.5x of it -
+	// the sketch's green, orange and red outlines - and nothing in between. That is what makes the
+	// arena readable: a block is either something you can shoot over, something you can hide behind,
+	// or a landmark, and the three are told apart at a glance by height alone.
+	const float PlayerHeight = PlayerHeightUU();
+
 	for (const float XSign : { -1.f, 1.f })
 	{
 		const ETraceTeam HalfTeam = (XSign < 0.f) ? ETraceTeam::Blue : ETraceTeam::Orange;
@@ -1321,26 +1550,63 @@ void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)
 			? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowFace)
 			: nullptr;
 
-		// Diamonds, not squares. A pawn (or a bot steering straight at a target behind it) that meets
-		// a 45-degree face gets deflected around the block by the movement component's own wall
-		// sliding, instead of standing still pushing into a flat face until stuck-detection fires.
+		// MIRRORED IN X. The sketch's two halves are different; this builds the same half twice,
+		// because the match switches sides at half time and an asymmetric field would hand one team
+		// the better ground for a full half. See the header. Also mirrored in Y, which the sketch's
+		// own scatter is roughly but not exactly - same argument, smaller stakes.
+		//
+		// Diamonds where the spec says diamond: a pawn (or a bot steering straight at a target
+		// behind it) that meets a 45-degree face gets deflected around the block by the movement
+		// component's own wall sliding, instead of standing still pushing into a flat face until
+		// stuck-detection fires. The long bars are left axis-aligned - they are meant to be run
+		// ALONG, and a yawed bar would just be a diagonal wall across a lane.
 		for (const TraceArenaConstants::FCoverSpec& Spec : TraceArenaConstants::CoverBlocks)
 		{
+			const float BlockHeight = PlayerHeight * Spec.HeightMult;
+
 			for (const float YSign : { -1.f, 1.f })
 			{
-				const FVector Centre(XSign * HalfX * Spec.XFrac, YSign * HalfY * Spec.YFrac, Spec.Height * 0.5f);
-				AddNeonBlock(Centre, FVector(Spec.Side, Spec.Side, Spec.Height), 45.f,
+				const FVector Centre(XSign * HalfX * Spec.XFrac, YSign * HalfY * Spec.YFrac, BlockHeight * 0.5f);
+
+				// A yawed bar has to be mirrored by NEGATING the yaw, not by reusing it: reflecting a
+				// shape through an axis reverses its handedness. Every entry is currently 0 or 45 on
+				// a square footprint, where it makes no difference - but the day someone adds the
+				// sketch's diagonal, a shared yaw would quietly build two blocks that are rotations
+				// of each other rather than mirror images, and the two halves would stop matching.
+				const float Yaw = Spec.Yaw * XSign * YSign;
+
+				AddNeonBlock(Centre, FVector(Spec.SizeX, Spec.SizeY, BlockHeight), Yaw,
 					BodyMID, NeonMID, /*bCollide=*/true, TEXT("Cover"), FaceMID);
 			}
 		}
 
-		// One long slab straddling the centreline of each half, so the shortest route from the dais
-		// to a goal is never a clear straight line.
-		const FVector AxisCentre(XSign * HalfX * TraceArenaConstants::AxisCoverXFrac, 0.f,
-			TraceArenaConstants::AxisCoverSize.Z * 0.5f);
-		AddNeonBlock(AxisCentre, TraceArenaConstants::AxisCoverSize, 0.f,
-			BodyMID, NeonMID, /*bCollide=*/true, TEXT("AxisCover"), FaceMID);
+		// One long 2x bar straddling the centreline of each half, so the shortest route from the
+		// centre diamond to a goal is never a clear straight line.
+		const float AxisHeight = PlayerHeight * TraceArenaConstants::StructureHeight2x;
+		const FVector AxisCentre(XSign * HalfX * TraceArenaConstants::AxisCoverXFrac, 0.f, AxisHeight * 0.5f);
+		AddNeonBlock(AxisCentre,
+			FVector(TraceArenaConstants::AxisCoverSizeX, TraceArenaConstants::AxisCoverSizeY, AxisHeight),
+			0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("AxisCover"), FaceMID);
 	}
+
+	// --- The 3.5x tower at top centre ------------------------------------------------------------
+	//
+	// On the dividing line, off to the +Y side, exactly as drawn. Neutral cyan rather than a team
+	// colour because it belongs to neither half - the same call the floor grid's centre strip and
+	// the midfield buttress already make.
+	UMaterialInstanceDynamic* TowerNeonMID = bBuildVisuals
+		? MakeNeonMID(TraceArenaConstants::NeonNeutralPale, TraceArenaConstants::GlowLip)
+		: nullptr;
+	UMaterialInstanceDynamic* TowerFaceMID = bBuildVisuals
+		? MakeNeonMID(TraceArenaConstants::NeonNeutral, TraceArenaConstants::GlowFace)
+		: nullptr;
+
+	const float TowerHeight = PlayerHeight * TraceArenaConstants::StructureHeight35x;
+	const float TowerSide = TraceArenaConstants::TopCentreTowerSide;
+	AddNeonBlock(
+		FVector(0.f, HalfY * TraceArenaConstants::TopCentreTowerYFrac, TowerHeight * 0.5f),
+		FVector(TowerSide, TowerSide, TowerHeight), 45.f,
+		BodyMID, TowerNeonMID, /*bCollide=*/true, TEXT("TopCentreTower"), TowerFaceMID);
 }
 
 void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
@@ -1426,9 +1692,11 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// --- Corner pylons ---------------------------------------------------------------------------
 	//
 	// The four corners behind the goal lines were the only part of the field with no structure of any
-	// kind, the endzone floor being otherwise flat. A tall column in each corner closes the room off
-	// and, incidentally, gives a defender something to fight around. They sit at (10600, 5100), i.e.
-	// inboard of and behind the gate towers at (9600, 5490) - checked, nothing intersects.
+	// kind, the endzone floor being otherwise flat - and it is still flat, because the corner banks
+	// deliberately stop at the goal line. A tall column in each corner closes the room off and,
+	// incidentally, gives a defender something to fight around. On the 9600 uu field they sit at
+	// (10600, 4080), inboard of and behind the gate towers at (9600, 4290) - checked, nothing
+	// intersects, and both are clear of the banks.
 	//
 	// Built BEFORE the visuals-only section on purpose: these block, and a dedicated server has to
 	// build the same collision the clients are predicting against.
@@ -1440,6 +1708,23 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 					YSign * HalfY * TraceArenaConstants::CornerPylonYFrac),
 				TraceArenaConstants::CornerPylonSide, TraceArenaConstants::CornerPylonHeight,
 				BodyMID, HalfNeon[HalfIndex(XSign)], TEXT("CornerPylon"));
+		}
+	}
+
+	// --- Lane pylons -----------------------------------------------------------------------------
+	//
+	// One per quadrant, marking the flank route and carrying the light bridge out to the wall. They
+	// used to be built alongside the wing platforms; the wings are gone (the banks replaced them) so
+	// they live here now, with the rest of the flank dressing they belong to. Collision, so they are
+	// outside the bBuildVisuals gate with everything else that blocks.
+	for (const float XSign : { -1.f, 1.f })
+	{
+		for (const float YSign : { -1.f, 1.f })
+		{
+			AddPylon(FVector2D(XSign * HalfX * TraceArenaConstants::LanePylonXFrac,
+					YSign * HalfY * TraceArenaConstants::LanePylonYFrac),
+				TraceArenaConstants::LanePylonSide, TraceArenaConstants::LanePylonHeight,
+				BodyMID, HalfNeon[HalfIndex(XSign)], TEXT("LanePylon"));
 		}
 	}
 
@@ -1475,7 +1760,7 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// the tallest thing in the outer lane and they read as loose columns standing in nothing; tying
 	// them to the wall turns the flank into a structure with a span over it, and the beam crosses the
 	// outer lane at 1240 uu so it frames anyone running underneath.
-	const float BridgeZ = TraceArenaConstants::WingPylonHeight - TraceArenaConstants::BridgeDrop;
+	const float BridgeZ = TraceArenaConstants::LanePylonHeight - TraceArenaConstants::BridgeDrop;
 	for (const float XSign : { -1.f, 1.f })
 	{
 		for (const float YSign : { -1.f, 1.f })
@@ -1691,16 +1976,19 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 		// second hand-written clamp, so the pads cannot end up inside (or on the far side of) the
 		// endzone they are supposed to sit in front of. Widening the endzone to the full field width
 		// changed nothing here - the line is a function of depth alone - but the lateral spread is
-		// worth a thought: it is StartSpreadFraction (0.7) of the half width, i.e. +/-4200, which is
-		// comfortably inside the sidelines whether or not the zone reaches them. The lower bound is
-		// the dais rather than 0: with a large EndzoneDepth the old Max(0.f, ...) put BOTH teams'
-		// spawn lines at X = 0, i.e. on top of the centre dais — silently reproducing the exact
-		// "spawned inside geometry" failure this build was shipped with.
+		// worth a thought: it is StartSpreadFraction (0.6) of the half width, i.e. +/-2880 on the
+		// 9600 uu field, which clears the corner banks by 420 uu. The lower bound is the centre
+		// diamond rather than 0: with a large EndzoneDepth the old Max(0.f, ...) put BOTH teams'
+		// spawn lines at X = 0, i.e. on top of it — silently reproducing the exact "spawned inside
+		// geometry" failure this build was shipped with.
 		//
-		// The resulting line (x = +/-8400 on the shipped field) was checked against every cover block
-		// and wing platform in TraceArenaConstants: nothing is built across it. If you move the
-		// interior layout, re-check it - a start pad inside a solid block is a pawn that spawns
-		// embedded in the world.
+		// THE RESULTING FAN, on the shipped field: X = +/-8400, Y = 0 / +/-1440 / +/-2880. Every one
+		// of those five points was checked against every entry in TraceArenaConstants::CoverBlocks
+		// and against the corner banks. The tightest is cover block E, the 3.5x goal-approach tower,
+		// whose diamond reaches X = 8505 at Y = 2100..2595 — 105 uu clear of the pad at (8400, 2880)
+		// in X, and its Y span deliberately falls BETWEEN two pad rows. If you move the interior
+		// layout, re-check it: a start pad inside a solid block is a pawn that spawns embedded in
+		// the world, and nothing logs it.
 		const float Depth = ClampedEndzoneDepth();
 		const float MinLineX = TraceArenaConstants::DaisTopTierSide + TraceArenaConstants::DaisTierSideStep * TraceArenaConstants::DaisTiers;
 		const float LineX = Sign * FMath::Max(MinLineX, HalfX * (1.f - TraceArenaConstants::StartInsetFraction) - Depth);
@@ -2147,12 +2435,18 @@ UBoxComponent* ATraceArenaBuilder::AddPawnStandoff(const FVector& LocalCenter, c
 
 void ATraceArenaBuilder::AddNeonBlock(const FVector& LocalCenter, const FVector& Size, float YawDegrees,
 	UMaterialInstanceDynamic* BodyMID, UMaterialInstanceDynamic* NeonMID, bool bCollide, const TCHAR* DebugName,
-	UMaterialInstanceDynamic* FaceNeonMID, bool bVerticalTrim)
+	UMaterialInstanceDynamic* FaceNeonMID, bool bVerticalTrim, bool bFaceBands)
 {
 	// Whether this block gets face trim is decided from GEOMETRY, not from whether the materials
 	// resolved, because a dedicated server passes null MIDs and still has to build byte-identical
 	// collision to the clients predicting against it.
-	const bool bHasFaceTrim = bVerticalTrim && (Size.Z >= TraceArenaConstants::FaceTrimMinHeight);
+	//
+	// It also decides whether the block gets a PAWN STANDOFF SHELL, which is why bFaceBands is in
+	// the test as well as bVerticalTrim: a piece with no face trim has no emissive lying outside its
+	// collision box except the top lip, and the pieces that pass bFaceBands=false - the corner bank
+	// terraces - are WALKABLE. A shell on a terrace would leave players standing on 26 uu of thin
+	// air out past its visible edge, which is a worse defect than the one the shell prevents.
+	const bool bHasFaceTrim = bVerticalTrim && bFaceBands && (Size.Z >= TraceArenaConstants::FaceTrimMinHeight);
 
 	if (bCollide)
 	{
@@ -2197,7 +2491,7 @@ void ATraceArenaBuilder::AddNeonBlock(const FVector& LocalCenter, const FVector&
 	//
 	// Everything from here down exists so the block reads HEAD ON. See the header comment.
 
-	if (NeonMID == nullptr || Size.Z < TraceArenaConstants::FaceTrimMinHeight)
+	if (NeonMID == nullptr || !bFaceBands || Size.Z < TraceArenaConstants::FaceTrimMinHeight)
 	{
 		return;
 	}

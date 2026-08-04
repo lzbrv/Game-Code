@@ -171,8 +171,24 @@ bool FTraceHitZoneModel::ResolveSegment(const FVector& Start, const FVector& End
 		}
 	}
 
-	// ---- 3. Everything else: a height band on the capsule entry point -----------------------
-	OutZone = (OutImpactPoint.Z < HipZ) ? ETraceHitZone::Legs : ETraceHitZone::Body;
+	// ---- 3. Everything else: a height band at CLOSEST APPROACH, not at the entry point -------
+	//
+	// ClosestOnRay, not OutImpactPoint, and the difference is a real classification error.
+	//
+	// OutImpactPoint is the point where the ray crosses the capsule SURFACE — it sits up to one
+	// capsule radius (34 uu, about a fifth of a body) earlier along the ray than the point of
+	// closest approach, displaced in Z by Radius * sin(pitch). So on any angled shot the band is
+	// sampled at the wrong height: firing UP at someone on a bank biases torso hits into LEGS, and
+	// firing DOWN biases leg hits into BODY. Measured at 2.9% of hits on a flat map; the new corner
+	// banks (spec §7) make angled shots the common case, not the exception.
+	//
+	// ClosestOnRay is the ray point nearest the capsule's own axis, which is the honest answer to
+	// "how high up the body did this shot pass". It is already computed by the
+	// SegmentDistToSegmentSafe call in step 1, so this costs nothing.
+	//
+	// OutImpactPoint MUST stay the entry point: impact FX belong on the surface, and OutEnterDist
+	// derived from it is what orders overlapping targets along the ray.
+	OutZone = (ClosestOnRay.Z < HipZ) ? ETraceHitZone::Legs : ETraceHitZone::Body;
 	return true;
 }
 

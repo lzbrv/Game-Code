@@ -1,17 +1,17 @@
 // Trace — character movement with a genuinely client-predicted movement kit.
 //
-// Nothing in here is an RPC that plays a montage. Dash, boost, slide and the air fast-fall are all
+// Nothing in here is an RPC that plays a montage. Dash, slide and the air fast-fall are all
 // first-class movement states that ride the engine's saved-move pipeline, exactly like crouch or
 // jump:
 //
-//   1. Input calls StartDash() / StartBoost() / SetWantsToSlide() on the owning client, which
-//      raises an intent flag.
+//   1. Input calls StartDash() / SetWantsToSlide() on the owning client, which raises an intent
+//      flag.
 //   2. FSavedMove_Trace::SetMoveFor() snapshots that intent (plus every timer, charge counter and
 //      locked direction) into the move about to be simulated.
 //   3. The client simulates the move immediately — the ability starts on the same frame the key is
 //      pressed, at any ping.
-//   4. GetCompressedFlags() packs the intents into FLAG_Custom_0..2, which travel to the server
-//      inside the ordinary ServerMove RPC. No extra RPC, no extra bandwidth.
+//   4. GetCompressedFlags() packs the intents into FLAG_Custom_0/FLAG_Custom_2, which travel to the
+//      server inside the ordinary ServerMove RPC. No extra RPC, no extra bandwidth.
 //   5. The server runs UpdateFromCompressedFlags() → the identical simulation → authoritative
 //      result. If it disagrees it sends a correction, and the client replays its unacknowledged
 //      moves through PrepMoveFor()/MoveAutonomous().
@@ -22,44 +22,77 @@
 // time and the client would rubber-band.
 //
 // Everything these abilities touch is derived from data the replay path restores (Acceleration, the
-// updated component's rotation, the saved timers), so client and server always compute the same
-// answer from the same inputs. Nothing here reads wall-clock time or per-frame input state that
-// the replay cannot reproduce.
+// updated component's rotation, Velocity, the saved timers), so client and server always compute
+// the same answer from the same inputs. Nothing here reads wall-clock time or per-frame input state
+// that the replay cannot reproduce.
 //
-// --- THE KIT (contract §5) -------------------------------------------------------------------
+// --- THE KIT (contract §5, as amended by spec v3 §1–2) ----------------------------------------
 //
 //   DASH   Horizontal-plane burst along the current input direction. NEVER adds vertical velocity.
 //          Runs on a CHARGE system: one charge for everybody, two while carrying the Core, each
 //          charge refilling on its own DashCooldown. See "charges" below.
-//   JUMP   Untouched — plain ACharacter::Jump.
-//   CROUCH On the ground: a slide (a directional momentum carry you steer weakly).
+//   JUMP   Plain ACharacter::Jump. Horizontal velocity is never touched, in either direction.
+//   CROUCH On the ground: a slide (an entry-speed momentum carry you steer weakly).
 //          In the air: a fast-fall that zeroes POSITIVE Z velocity only, on the press edge.
-//   BOOST  Ground-only vertical launch on a long cooldown. A separate bind from jump.
+//   AIR    Source/Quake air acceleration — see below. Not an engine feature; ours.
+//
+//   BOOST IS GONE (spec v3 §1). The ability, its intent flag, its saved-move field, its
+//   compressed-flag bit (FLAG_Custom_1, now free) and its settings have all been deleted. Nothing
+//   in this file should ever grow a "boost" again; if a vertical launch is wanted later it is a new
+//   design, not a resurrection.
+//
+// --- SOURCE / APEX MOMENTUM MODEL (spec v3 §2) -------------------------------------------------
+//
+// Three rules, and they are the whole point of the movement pass:
+//
+//   AIR ACCELERATION is the real Quake/Source projection formula, in CalcVelocity() while falling.
+//        Project the current planar velocity onto the wish direction; the input may only raise that
+//        PROJECTION up to AirMaxWishSpeed, at AirAcceleration uu/s². Input can therefore only ever
+//        ADD velocity along the wish direction and can never subtract any, so input perpendicular
+//        to travel ROTATES the velocity vector at (slightly more than) constant magnitude instead
+//        of braking it. There is no lerp toward the input direction anywhere in this file, because
+//        a lerp is exactly the thing that makes strafing cost speed.
+//        There is also NO air friction: releasing the stick in mid-air coasts at full speed.
+//
+//   LANDING DOES NOT CLAMP. UCharacterMovementComponent::CalcVelocity brakes hard the moment
+//        `IsExceedingMaxSpeed(MaxWalkSpeed)` is true — GroundFriction 8 × BrakingFrictionFactor 2
+//        plus BrakingDecelerationWalking 2600 kills 1000uu/s of carried speed in about 60ms, which
+//        is the "velocity is clamped to ground max speed on landing" the spec is complaining about.
+//        We defeat it by taking over CalcVelocity() whenever planar speed exceeds the ground limit
+//        and bleeding the EXCESS ourselves at GroundOverspeedFriction / GroundOverspeedBraking,
+//        which are deliberately an order of magnitude gentler.
+//
+//   TRANSITIONS PRESERVE VELOCITY. run→jump never touched horizontal velocity and still does not.
+//        jump→slide enters the slide at exactly the speed the pawn landed with. slide→jump used to
+//        be a hard brake — EndSlide() clamped to GetMaxSpeed() × SlideExitMaxSpeedMultiplier, i.e.
+//        to the walk speed — and now cannot end a slide below the speed the slide was running at.
+//        dash→ground hands back DashExitSpeedMultiplier × the ground limit instead of the ground
+//        limit itself. Every one of those ceilings is a knob.
 //
 // --- THE SLIDE IS A MOMENTUM CARRY, NOT A BRAKE -----------------------------------------------
 //
-// The slide used to be a short burst that bled itself out: it entered at 1.45x walk, shed
-// SlideDeceleration every second and gave up once it dropped to SlideExitSpeedFraction of the walk
-// speed — which handed the player back BELOW walking pace and made every slide a net loss of
-// momentum. Three rules now keep the speed you brought to it:
+// ENTRY is ENTRY SPEED (spec §2.3: "entry speed determines slide velocity"):
 //
-//   ENTRY never costs speed. The boosted entry is capped by SlideMaxSpeed, but the cap can never
-//         pull the entry below the planar speed the pawn already had (BeginSlide).
-//   MIDDLE bleeds slowly. SlideDeceleration is the friction dial and is meant to be small enough
-//         that SlideDuration, not the decay, is what ends the slide.
-//   EXIT  hands the speed back. EndSlide() carries SlideExitSpeedRetention of the slide's current
-//         speed into normal movement, floored at SlideExitMinSpeedFraction of the walk speed and
-//         capped at SlideExitMaxSpeedMultiplier x GetMaxSpeed(), instead of the old unconditional
-//         clamp. Every exit — timer, decay, key release, ledge, boost — goes through that one path.
+//       SlideSpeed = max(planar speed at entry,
+//                        min(planar speed × SlideEntrySpeedMultiplier + SlideImpulse, SlideMaxSpeed))
+//
+//       SlideEntrySpeedMultiplier defaults to 1.0 and SlideImpulse to 0, which is the pure "no flat
+//       momentum boost" reading. The spec contains a second, contradictory line asking for the
+//       slide to INCREASE momentum; rather than guess, both readings are knobs and the shipped
+//       defaults implement the first one. Raise SlideImpulse to get the second.
+//
+// MIDDLE bleeds slowly. SlideDeceleration is the friction dial and is meant to be small enough
+//       that SlideDuration, not the decay, is what ends the slide.
+// EXIT  hands the speed back. EndSlide() carries SlideExitSpeedRetention of the slide's current
+//       speed into normal movement, floored at SlideExitMinSpeedFraction of the walk speed, and
+//       capped at max(SlideExitMaxSpeedMultiplier × GetMaxSpeed(), the slide's own speed) — that
+//       max() is what makes "slide → jump" preserve the vector instead of resetting it.
+// AFTER SlideCooldownSeconds (0.8s, spec §2.3) must elapse from the slide's END before another can
+//       start. The old SlideCooldown was measured from slide START, which made "the buffer between
+//       slides" a number you had to compute rather than read.
 //
 // SlideMinCommitSeconds makes the first moments of a slide uncancellable, so a slide reads as a
 // commitment rather than a tap, and so releasing the key a frame late cannot amputate it.
-//
-// THE FOUR NEW KNOBS (SlideMinCommitSeconds, SlideExitSpeedRetention, SlideExitMinSpeedFraction,
-// SlideExitMaxSpeedMultiplier) are read through a detection shim in the .cpp: if UTraceSettings
-// declares them they are used, otherwise the built-in defaults apply. That is what lets this slice
-// ship its behaviour without editing a file it does not own, and pick the settings up automatically
-// the moment they exist.
 //
 // --- WHY CHARGES AND NOT A SECOND TIMER -------------------------------------------------------
 //
@@ -76,9 +109,27 @@
 // exactly as they already disagree about GetMaxSpeed()'s carrier multiplier. The consequence is
 // bounded: a client that spends a second charge the server does not yet believe in gets one
 // correction, and the counts reconverge, because the pool is resized from a *transition* in the
-// carrier bit rather than recomputed from scratch. It cannot drift permanently. Fixing it properly
-// would mean putting the carrier bit in the compressed flags, i.e. letting the client assert its
-// own carrier state to the server, which is not a trade worth making.
+// carrier bit rather than recomputed from scratch. It cannot drift permanently.
+//
+// --- WHY THE MOMENTUM MODEL ADDS NO SAVED-MOVE STATE ------------------------------------------
+//
+// Air acceleration and the ground overspeed bleed are both PURE FUNCTIONS of (Velocity,
+// Acceleration, DeltaTime, config). Velocity and Acceleration are already restored by
+// FSavedMove_Character::PrepMoveFor / MoveAutonomous on every replayed frame, so a correction
+// replays them exactly. That is deliberate: "retained velocity" is not a new variable to keep in
+// sync, it is just Velocity, which the prediction system has always round-tripped. The only new
+// saved field is one bit, bSavedMomentumActive, and it exists purely to stop the client MERGING two
+// moves across an air-accel or overspeed frame, where the per-move clamps make the simulation
+// non-linear in dt and one long move would not equal the two short ones it replaced.
+//
+// --- READING SETTINGS THIS SLICE DOES NOT OWN --------------------------------------------------
+//
+// The new knobs (air, momentum, slide entry/impulse/cooldown) are now plain UTraceSettings
+// properties, read directly by the small accessors at the top of the .cpp (GetAirAcceleration,
+// GetAirMaxWishSpeed, GetMaxAirSpeed, and so on). They were briefly behind a compile-time detection
+// shim while TraceSettings.h belonged to another slice mid-pass; the properties landed and the shim
+// collapsed, as intended. Every one of those accessors clamps on read, so nothing in this file
+// touches UTraceSettings::Get() directly — go through them, and a bad ini cannot break the model.
 
 #pragma once
 
@@ -112,7 +163,24 @@ public:
 	 */
 	virtual void UpdateFromCompressedFlags(uint8 Flags) override;
 
-	/** Where the whole kit is simulated. Called once per move, on every machine. */
+	/**
+	 * THE MOMENTUM MODEL LIVES HERE, not in OnMovementUpdated.
+	 *
+	 * CalcVelocity is called by PhysFalling and PhysWalking from *inside* the physics step, once per
+	 * sub-step, with that sub-step's delta and with Velocity.Z already stripped. That is the only
+	 * place where a velocity change actually moves the pawn on the same frame it is computed;
+	 * anything written in OnMovementUpdated lands a frame late. It is also called identically on the
+	 * client, on the server and on every replayed move, so overriding it is prediction-safe.
+	 *
+	 * Two branches take over from the engine, both of them stateless:
+	 *   FALLING  → Source/Quake air acceleration, no air friction.
+	 *   WALKING while planar speed exceeds the ground limit → our own gentle overspeed bleed, so
+	 *              landing carries momentum instead of being clamped.
+	 * Everything else falls through to Super.
+	 */
+	virtual void CalcVelocity(float DeltaTime, float Friction, bool bFluid, float BrakingDeceleration) override;
+
+	/** Where the ability kit is simulated. Called once per move, on every machine. */
 	virtual void OnMovementUpdated(float DeltaSeconds, const FVector& OldLocation, const FVector& OldVelocity) override;
 
 	virtual float GetMaxSpeed() const override;
@@ -200,28 +268,27 @@ public:
 	/** True for the duration of a slide. */
 	bool IsSliding() const;
 
-	// --- Boost API -------------------------------------------------------------------------------
+	/** Seconds before another slide is allowed (0 when ready). Measured from the last slide's END. */
+	float GetSlideCooldownRemaining() const { return FMath::Max(0.f, SlideCooldownRemaining); }
 
-	/** Requests a boost. Same contract as StartDash(): raises intent, CanBoost() gates activation. */
-	void StartBoost();
+	// --- Momentum readouts (HUD, debug, measurement) --------------------------------------------
 
-	/** Off cooldown, alive, and standing on the ground. */
-	bool CanBoost() const;
+	/** Horizontal speed, in uu/s. The number every part of this pass is actually about. */
+	float GetPlanarSpeed() const;
 
-	/** Seconds until the next boost is allowed (0 when ready). */
-	float GetBoostCooldownRemaining() const;
-
-	/** The full boost cooldown from UTraceSettings — the denominator for a HUD meter. */
-	float GetBoostCooldown() const;
+	/**
+	 * True when the pawn is carrying more horizontal speed than normal ground movement would grant.
+	 * This is the state that used to be erased on landing and is now bled off instead.
+	 */
+	bool IsCarryingExcessSpeed() const;
 
 	// --- Per-move intents ------------------------------------------------------------------------
 	//
 	// Public because the saved move and the compressed-flag unpack both drive them. Not UPROPERTYs:
-	// they are per-move scratch state. bWantsToDash and bWantsToBoost are one-shot (consumed at the
-	// end of the move); bWantsToSlide is a level, held for as long as the key is down.
+	// they are per-move scratch state. bWantsToDash is one-shot (consumed at the end of the move);
+	// bWantsToSlide is a level, held for as long as the key is down.
 
 	uint8 bWantsToDash : 1;
-	uint8 bWantsToBoost : 1;
 	uint8 bWantsToSlide : 1;
 
 protected:
@@ -235,31 +302,49 @@ protected:
 	 * THE ONE EXIT. Ends a slide and hands the player back WITH their momentum.
 	 *
 	 * Every way out of a slide routes through here — the duration expiring, the decay reaching the
-	 * exit speed, the key coming up, walking off a ledge, and a dash or boost cancelling it — because
-	 * the exit speed rule has to be identical on all five paths or "slide cancel" becomes a
-	 * different (and better, and unintended) move than "let the slide finish".
+	 * exit speed, the key coming up, walking off a ledge, and a dash cancelling it — because the
+	 * exit speed rule has to be identical on all of them or "slide cancel" becomes a different (and
+	 * better, and unintended) move than "let the slide finish".
+	 *
+	 * Also where the 0.8s between-slides buffer is charged, because the buffer is measured from the
+	 * END of a slide and this is the only place a slide ends.
 	 *
 	 * Idempotent: safe to call when no slide is running, in which case it does nothing at all.
 	 */
 	void EndSlide();
 
-	/** Spends the boost cooldown, sets +Z and drops the pawn into MOVE_Falling. */
-	void BeginBoost();
-
 	/** True if a slide could start on this exact frame (ground, off cooldown, moving fast enough). */
 	bool CanStartSlide() const;
 
 	/**
-	 * Bleeds planar speed back down to GetMaxSpeed() in one step.
+	 * Bleeds planar speed down to DashExitSpeedMultiplier × GetMaxSpeed() in one step.
 	 *
-	 * Used the frame a dash or a slide ends. Without it CalcVelocity only sheds the excess through
-	 * braking friction, which at DashSpeed takes the better part of a second — so the ability would
-	 * keep moving the player long after IsDashing()/IsSliding() (and therefore the trail rule) said
-	 * it was over. Doing it here rather than through a velocity cap is what keeps it predictable: it
-	 * happens on exactly the frame the saved timer crosses zero, and that frame replays identically
-	 * on the client and the server.
+	 * Used the frame a dash ends. Without it CalcVelocity only sheds the excess through the
+	 * (now deliberately gentle) overspeed bleed, which at DashSpeed would keep the player moving
+	 * long after IsDashing() — and therefore the trail rule — said the dash was over. Doing it here
+	 * rather than through a velocity cap is what keeps it predictable: it happens on exactly the
+	 * frame the saved timer crosses zero, and that frame replays identically on client and server.
+	 *
+	 * DashExitSpeedMultiplier > 1 is what stops this being a "state transition that resets the
+	 * velocity vector" (spec §2.4): the dash hands back a fast player, not a walking one, and the
+	 * remainder then bleeds off through the overspeed friction like any other carried momentum.
 	 */
-	void ClampPlanarSpeedToMax();
+	void ApplyDashExitSpeed();
+
+	// --- The momentum model (both stateless; see the header note on prediction) -------------------
+
+	/**
+	 * Quake/Source air acceleration for one sub-step. Assumes Velocity.Z has already been stripped
+	 * by PhysFalling and never writes it.
+	 */
+	void ApplySourceAirAcceleration(float DeltaTime);
+
+	/**
+	 * One sub-step of the carried-momentum bleed, used instead of the engine's braking whenever
+	 * planar speed exceeds the ground limit. Steers, then sheds only the EXCESS, and can never drop
+	 * the pawn below the speed normal ground movement would have given it anyway.
+	 */
+	void ApplyGroundOverspeedBleed(float DeltaTime);
 
 	// Settings are read live (never cached in the constructor) so both ends of the wire always
 	// agree with the config, and so designers can retune without a rebuild.
@@ -270,8 +355,10 @@ protected:
 	/** DashDuration + DashCooldown: the cooldown is measured from dash START, as it always was. */
 	float GetDashRechargeWindow() const;
 
-	// Slide tuning, same rule: read live, every frame, never cached. The last four fall back to a
-	// built-in default when UTraceSettings does not (yet) declare the property — see the header note.
+	/** Multiple of the ground speed limit a dash is allowed to hand back on exit. >= 1. */
+	float GetDashExitSpeedMultiplier() const;
+
+	// Slide tuning, same rule: read live, every frame, never cached.
 	float GetSlideDuration() const;
 	float GetSlideDeceleration() const;
 	float GetSlideMinCommitSeconds() const;
@@ -279,16 +366,37 @@ protected:
 	float GetSlideExitMinSpeedFraction() const;
 	float GetSlideExitMaxSpeedMultiplier() const;
 
+	/** Spec §2.3. Seconds between slides, measured from the END of the previous one. */
+	float GetSlideCooldownSeconds() const;
+
+	/** Spec §2.3 / the [CONFLICT]: entry speed × this, plus GetSlideImpulse(), is the slide speed. */
+	float GetSlideEntrySpeedMultiplier() const;
+
+	/** Spec §2.3 / the [CONFLICT]: a FLAT additive boost on slide entry. 0 by default. */
+	float GetSlideImpulse() const;
+
+	// Air / momentum tuning.
+	bool  IsSourceAirAccelerationEnabled() const;
+	float GetAirAcceleration() const;
+	float GetAirMaxWishSpeed() const;
+	float GetMaxAirSpeed() const;
+	bool  IsLandingMomentumPreserved() const;
+	float GetGroundOverspeedFriction() const;
+	float GetGroundOverspeedBraking() const;
+	float GetGroundOverspeedTurnRate() const;
+
 	/**
-	 * Pushes UTraceSettings::WalkSpeed into MaxWalkSpeed if a designer has changed it.
+	 * Pushes UTraceSettings values into the engine-owned fields the physics step reads directly
+	 * (MaxWalkSpeed, and AirControl, which decides how much of Acceleration survives
+	 * GetFallingLateralAcceleration before our air model ever sees it).
 	 *
-	 * BeginPlay copies the setting once, which is exactly the caching this file's own comments warn
+	 * BeginPlay copies them once, which is exactly the caching this file's own comments warn
 	 * against: with only that copy, retuning WalkSpeed in Project Settings during PIE did nothing
-	 * until the map was reloaded. Called once per simulated move so the editor's value is live, and
-	 * cheap enough to be unconditional (one float compare). Not a prediction hazard: both ends read
-	 * the same config, and a designer editing the number mid-PIE is a single-process situation.
+	 * until the map was reloaded. Called once per simulated move so the editor's values are live,
+	 * and cheap enough to be unconditional (two float compares). Not a prediction hazard: both ends
+	 * read the same config, and a designer editing the number mid-PIE is a single-process situation.
 	 */
-	void RefreshWalkSpeedFromSettings();
+	void RefreshEngineTunablesFromSettings();
 
 	// --- Dash state (all saved/restored by FSavedMove_Trace) --------------------------------------
 
@@ -318,7 +426,15 @@ protected:
 	// --- Slide state (all saved/restored) ---------------------------------------------------------
 
 	float SlideTimeRemaining;
+
+	/**
+	 * Seconds left of the between-slides buffer. Charged in EndSlide() — spec §2.3 asks for a
+	 * buffer "between slides", which is a from-END measurement; charging it at slide start (as the
+	 * old SlideCooldown did) made the actual gap SlideCooldown minus SlideDuration, a number the
+	 * designer had to compute instead of read.
+	 */
 	float SlideCooldownRemaining;
+
 	float SlideSpeed;
 	FVector SlideDirection;
 
@@ -342,9 +458,8 @@ protected:
 	 *
 	 * Without this, "dash and then slide out of it" is impossible unless the player releases and
 	 * re-presses crouch inside the 180ms the dash lasts, and "press crouch just before landing"
-	 * silently does nothing. Both are things players do constantly. The buffer is short enough that
-	 * it cannot turn a held key into a slide loop: the ground slide still needs a fresh PRESS, and
-	 * SlideCooldown still gates the repeat.
+	 * silently does nothing. Both are things players do constantly — and the second one is now the
+	 * primary way to convert an air-strafe into a slide, which is the whole Apex loop.
 	 */
 	float SlideBufferRemaining;
 
@@ -355,9 +470,24 @@ protected:
 	 */
 	uint8 bSlideHeldLastMove : 1;
 
-	// --- Boost state (saved/restored) --------------------------------------------------------------
-
-	float BoostCooldownRemaining;
+	/**
+	 * Whether the pawn was airborne at the END of the previous move — i.e. this move can detect a
+	 * LANDING as a transition rather than as a state.
+	 *
+	 * This is what makes "hold crouch through a landing" start a slide, which is the whole Apex loop
+	 * and is spec v3 §2.4's jump->slide transition. It cannot be done from the press edge alone,
+	 * because a crouch press made in the air is CONSUMED by the fast-fall (deliberately: one press,
+	 * one meaning) and the input buffer is far shorter than a jump. Without this bit, measured
+	 * behaviour was that landing fast and holding crouch produced no slide at all, and 1293 uu/s of
+	 * carried momentum simply bled away.
+	 *
+	 * Charges the buffer exactly once per landing, so holding the key still cannot chain slides —
+	 * the next move sees the pawn already grounded and does nothing.
+	 *
+	 * SAVED-MOVE STATE for the same reason as bSlideHeldLastMove: a replay that lost it would decide
+	 * a mid-air move was a landing and start a slide the original never started.
+	 */
+	uint8 bWasAirborneLastMove : 1;
 
 	/** See GetLastDashActiveWorldTime(). Server observation only; never saved or replicated. */
 	float LastDashActiveWorldTime = -1000.f;
@@ -376,21 +506,36 @@ protected:
 
 #if !UE_BUILD_SHIPPING
 	/**
-	 * "-TraceMoveKitTest": a scripted, headless exercise of the whole kit on the local player pawn.
+	 * "-TraceMoveMeasure": a scripted, headless exercise of the momentum model on the local player
+	 * pawn that prints MEASURED numbers for the four things spec §2 is about — speed retained
+	 * through an air strafe turn, speed carried through a landing, slide entry vs exit speed, and
+	 * the between-slides buffer.
 	 *
-	 * It exists because crouch and boost have no key bound to them yet — the mapping context lives in
-	 * ATracePlayerController, which this slice does not own — so without it there is no way to prove
-	 * slide, fast-fall or boost actually run in a real world with real collision and real gravity.
-	 * It drives the same public entry points the input layer will (StartDash / SetWantsToSlide /
-	 * StartBoost), and logs the measured result at Display.
+	 * It exists because none of those can be verified from a screenshot and because crouch has no
+	 * key bound in a headless run. It drives the same public entry points the input layer does
+	 * (Jump / SetWantsToSlide / StartDash) and logs at Display, never Verbose.
 	 *
 	 * Standalone + locally controlled + player controlled only, off unless the switch is on the
 	 * command line, and compiled out of shipping.
 	 */
-	void TickSelfTest(float DeltaSeconds);
+	void TickMomentumMeasure(float DeltaSeconds);
 
-	float SelfTestTime = -1.f;
-	int32 SelfTestStep = 0;
+	float MeasureTime = -1.f;
+	int32 MeasurePhase = 0;
+	float MeasurePhaseTime = 0.f;
+	float MeasureMarkA = 0.f;
+	float MeasureMarkB = 0.f;
+	FVector MeasureMarkDirection = FVector::ZeroVector;
+
+	/**
+	 * The direction the harness runs in, chosen once at start as "toward the middle of the field".
+	 *
+	 * Not a constant world axis. The first run of this harness sprinted along +X from a spawn pad,
+	 * hit the endzone wall two frames after reaching full speed, and reported a jump that "lost" 760
+	 * uu/s — which was a collision, not the movement model. A measurement that can be invalidated by
+	 * where the pawn happened to spawn is not a measurement.
+	 */
+	FVector MeasureRunDirection = FVector::ForwardVector;
 #endif
 };
 
@@ -402,7 +547,7 @@ protected:
  *   SetMoveFor()         capture CMC state *before* the move is simulated
  *   PrepMoveFor()        push that captured state back into the CMC before a replay
  *   GetCompressedFlags() pack the intents for the wire
- *   CanCombineWith()     refuse to merge moves whose ability state differs
+ *   CanCombineWith()     refuse to merge moves whose ability or momentum state differs
  */
 class TRACE_API FSavedMove_Trace : public FSavedMove_Character
 {
@@ -418,10 +563,22 @@ public:
 	virtual void SetMoveFor(ACharacter* C, float InDeltaTime, FVector const& NewAccel, class FNetworkPredictionData_Client_Character& ClientData) override;
 	virtual void PrepMoveFor(class ACharacter* C) override;
 
-	/** Intents. FLAG_Custom_0 = dash, FLAG_Custom_1 = boost, FLAG_Custom_2 = crouch/slide held. */
+	/**
+	 * Intents. FLAG_Custom_0 = dash, FLAG_Custom_2 = crouch/slide held.
+	 * FLAG_Custom_1 used to be boost and is now FREE — spec v3 §1 deleted the ability.
+	 */
 	uint8 bSavedWantsToDash : 1;
-	uint8 bSavedWantsToBoost : 1;
 	uint8 bSavedWantsToSlide : 1;
+
+	/**
+	 * "This move was simulated under the momentum model" — airborne, or carrying excess ground
+	 * speed. Not CMC state and therefore not restored by PrepMoveFor; it exists only so
+	 * CanCombineWith can refuse to merge such moves. Both branches of the model clamp per sub-step
+	 * (min(AirAcceleration·dt, AddSpeed); max(GroundLimit, Speed − Bleed·dt)), so one combined move
+	 * of length 2dt is NOT equal to two moves of length dt, and merging would hand the server a
+	 * simulation the client never ran.
+	 */
+	uint8 bSavedMomentumActive : 1;
 
 	/** Every clock, charge counter and locked direction as it stood *before* this move was simulated. */
 	float SavedDashTimeRemaining;
@@ -437,8 +594,7 @@ public:
 	float SavedSlideBufferRemaining;
 	FVector SavedSlideDirection;
 	uint8 bSavedSlideHeldLastMove : 1;
-
-	float SavedBoostCooldownRemaining;
+	uint8 bSavedWasAirborneLastMove : 1;
 };
 
 /** Client prediction data whose only job is to hand out FSavedMove_Trace instances. */

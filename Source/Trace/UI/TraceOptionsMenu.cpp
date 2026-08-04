@@ -375,7 +375,7 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 	}
 
 	// Explicit unbind. Every options screen that lets you bind should let you UNbind, and without it
-	// there is no way to express "I do not want a boost key" short of hiding it under some other one.
+	// there is no way to express "I do not want a parry key" short of hiding it under some other one.
 	if (PC->WasInputKeyJustPressed(EKeys::BackSpace) || PC->WasInputKeyJustPressed(EKeys::Delete))
 	{
 		if (Rows.IsValidIndex(Selected) && Rows[Selected].Kind == ERowKind::Binding)

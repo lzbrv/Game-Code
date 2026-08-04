@@ -19,10 +19,13 @@
 #include "Math/UnrealMathUtility.h"            // FMath::SegmentDistToSegmentSafe
 #include "UObject/ConstructorHelpers.h"
 
+#include "HAL/IConsoleManager.h"               // FAutoConsoleVariableRef (trace timing knobs)
+
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
 #include "Gameplay/TraceCore.h"                // IsTraceInvulnerableFor (spec §4)
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceParry.h"               // v3 §3 — the second invulnerability source
 #include "Movement/TraceCharacterMovementComponent.h"   // GetLastDashActiveWorldTime()
 #include "Trace.h"
 #include "TraceSettings.h"
@@ -30,14 +33,41 @@
 namespace
 {
 	/**
-	 * Spec §3: the trace lasts FOUR seconds (it was six).
+	 * SPEC v3 §1: the trace lasts TWO seconds, and the turnover grace is 0.4s.
 	 *
-	 * Taken as a CEILING over UTraceSettings::TrailLifetime rather than replacing it, because that
-	 * property still ships at 6.0 and TraceSettings.h belongs to another ownership slice this pass.
-	 * A designer lowering the setting still wins; a stale 6 cannot silently reinstate the old rule.
-	 * Once the setting is updated to 4 this min() becomes an identity and can be deleted.
+	 * BOTH VALUES NOW LIVE IN UTraceSettings (TrailLifetime, CoreTurnoverGraceSeconds). These used to
+	 * be ceilings applied over the settings, because TraceSettings.h belonged to another ownership
+	 * slice mid-pass and a stale 2.8 could otherwise have reinstated the old rule. The settings have
+	 * landed at 2.0 / 0.4, so the min() was an identity and is gone: there is exactly one number for
+	 * each, it is in Project Settings, and it is live-editable in PIE.
+	 *
+	 * What survives is an OVERRIDE apiece, negative by default, for console experiments during a
+	 * headless run where there is no settings panel to open. Same pattern, and same reasoning, as the
+	 * parry cvars in Gameplay/TraceParry.cpp.
+	 *
+	 * KNOCK-ON, still true and still load-bearing: UTraceSettings::BotTrailMinPointLifeRemaining is
+	 * "the oldest ~20% of the trace, written as an absolute" and is calibrated against the lifetime.
+	 * At 2.8 it was 0.56; at 2.0 it is 0.40. Move one without the other and the interceptor bots
+	 * discard 28% of the trace instead of 20% — the exact mistake, in the exact direction, that cut
+	 * trail kills from 37.5% to 25.9% the last time the lifetime moved on its own.
 	 */
-	constexpr float SpecTraceLifetimeSeconds = 4.0f;
+	float GTraceLifetimeOverride = -1.f;
+	float GTurnoverGraceOverride = -1.f;
+
+	FAutoConsoleVariableRef CVarTraceLifetimeCeiling(
+		TEXT("Trace.Trail.LifetimeCeiling"),
+		GTraceLifetimeOverride,
+		TEXT("OVERRIDE for seconds a trace point survives (spec v3 1: 2.00). "
+		     "Negative (default) = use UTraceSettings::TrailLifetime."),
+		ECVF_Default);
+
+	FAutoConsoleVariableRef CVarTurnoverGrace(
+		TEXT("Trace.Trail.TurnoverGrace"),
+		GTurnoverGraceOverride,
+		TEXT("OVERRIDE for seconds after the Core changes team before the new holder's trace BEGINS "
+		     "FORMING (spec v3 1: 0.40). Negative (default) = use UTraceSettings::CoreTurnoverGraceSeconds. "
+		     "Delays formation only; already-laid segments stay lethal."),
+		ECVF_Default);
 
 	/** Upper bound on pooled after-images. At 4s and 60uu spacing a run produces roughly 52. */
 	constexpr int32 MaxPooledGhosts = 96;
@@ -55,8 +85,23 @@ namespace
 	 * point is that the camera and its near field sit in the gap. 850 leaves 400 uu of clearance in
 	 * front of the lens. Nobody else's view is affected — see the SetOwnerNoSee block in
 	 * RebuildVisuals() for why this is presentation-only and cannot touch the lethal volume.
+	 *
+	 * IT IS ALSO THE CEILING ON HOW MUCH OF THEIR OWN RED TRACE A PARRYING CARRIER CAN SEE (v3 §3).
+	 * At a 2.0s lifetime and ~600uu/s that leaves the carrier roughly the oldest third of their own
+	 * trace to read the parry off, which is enough on a curving path and thin on a straight one — so
+	 * the carrier's PRIMARY parry tell has to be a HUD element, not this. Lowering it back toward the
+	 * 450uu camera arm re-enters the near field that produced the measured point-blank whiteout, so
+	 * it is exposed as a live knob to be playtested rather than quietly retuned here.
 	 */
-	constexpr double OwnerNearHideDistance = 850.0;
+	float GOwnerNearHideDistance = 850.f;
+
+	FAutoConsoleVariableRef CVarOwnerNearHideDistance(
+		TEXT("Trace.Trail.OwnerNearHideDistance"),
+		GOwnerNearHideDistance,
+		TEXT("uu of the freshest trace hidden from its OWN holder's camera (anti-whiteout). Presentation "
+		     "only - never changes the lethal volume. Lower to let a parrying carrier see more of their "
+		     "own red trace; below ~600 it re-enters the third-person near field."),
+		ECVF_Default);
 
 	/**
 	 * Camera-proximity emissive fade — the anti-whiteout guard. See ApplyProximityGlowFade().
@@ -147,8 +192,12 @@ namespace
 	/** Oldest after-images dim to this fraction of full glow. Never to zero: they are still lethal. */
 	constexpr float GhostOldestGlowScale = 0.55f;
 
-	/** Spec §4: while the pass window is open the trace hardens. This is what that looks like. */
+	/** Spec §4: while the PASS window is open the trace hardens. This is what that looks like. */
 	constexpr float GhostInvulnerableGlowScale = 1.90f;
+
+	// The PARRY's own tell (v3 §3) is not here: it is the whole trace going RED, and both the colour
+	// and its glow multiplier are TraceParry tunables so the two halves of one visual state cannot
+	// drift apart. See TraceParry::GetTintColor() / GetGlowScale().
 
 	/** Where along [A,B] the point P projects, clamped to [0,1]. Zero-length segments give 0. */
 	double SegmentAlpha(const FVector& A, const FVector& B, const FVector& P)
@@ -231,6 +280,12 @@ void UTraceTrailComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 	// much as everyone else does.
 	DOREPLIFETIME(UTraceTrailComponent, TrailPoints);
 	DOREPLIFETIME(UTraceTrailComponent, bEmitting);
+
+	// COND_None on both, deliberately. The parry's entire job is to be SEEN — by the carrier and by
+	// the enemy already committed to a dash — so every machine has to know the window is open, not
+	// just the owner. Two floats, written once per parry.
+	DOREPLIFETIME(UTraceTrailComponent, ParryEndServerTime);
+	DOREPLIFETIME(UTraceTrailComponent, ParryCooldownEndServerTime);
 }
 
 void UTraceTrailComponent::OnRegister()
@@ -292,6 +347,7 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 
 		ServerUpdateTrail();
 		ServerRunTripTest(DeltaTime);
+		ServerTickBotAutoParry();
 	}
 
 	// Listen servers draw the trace too; only a headless server skips it.
@@ -312,7 +368,16 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 
 float UTraceTrailComponent::GetTraceLifetimeSeconds()
 {
-	return FMath::Max(0.1f, FMath::Min(UTraceSettings::Get().TrailLifetime, SpecTraceLifetimeSeconds));
+	const float Value = (GTraceLifetimeOverride >= 0.f)
+		? GTraceLifetimeOverride : UTraceSettings::Get().TrailLifetime;
+	return FMath::Max(0.1f, Value);
+}
+
+float UTraceTrailComponent::GetTurnoverGraceSeconds()
+{
+	const float Value = (GTurnoverGraceOverride >= 0.f)
+		? GTurnoverGraceOverride : UTraceSettings::Get().CoreTurnoverGraceSeconds;
+	return FMath::Clamp(Value, 0.f, 5.f);
 }
 
 void UTraceTrailComponent::SetEmitting(bool bEmit)
@@ -366,12 +431,20 @@ void UTraceTrailComponent::SetEmitGrace(float Seconds)
 		return;
 	}
 
-	EmitGraceEndServerTime = (Seconds > 0.f) ? (GetServerTimeSeconds() + Seconds) : 0.f;
+	// v3 §1: 1.0s -> 0.4s. Capped rather than replaced, so a caller asking for less still wins and a
+	// stale 1.0 in TraceCoreTuning cannot reinstate the old rule. See the header for the full reason.
+	const float Granted = (Seconds > 0.f) ? FMath::Min(Seconds, GetTurnoverGraceSeconds()) : 0.f;
+
+	EmitGraceEndServerTime = (Granted > 0.f) ? (GetServerTimeSeconds() + Granted) : 0.f;
 
 	if (Seconds > 0.f)
 	{
-		UE_LOG(LogTraceGame, Verbose, TEXT("Trace: %.2fs grace before %s begins leaving a trace"),
-			Seconds, *GetNameSafe(GetOwner()));
+		// Log level, not Verbose: this is one line per turnover (not per tick), and the last two
+		// times a mechanic here was declared dead it was because its only evidence sat at Verbose.
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[TRACEGRACE] %s: %.2fs requested, %.2fs granted before the trace BEGINS FORMING. "
+			     "Already-laid segments stay lethal throughout."),
+			*GetNameSafe(GetOwner()), Seconds, Granted);
 	}
 }
 
@@ -380,7 +453,28 @@ bool UTraceTrailComponent::IsEmitting() const
 	return bEmitting;
 }
 
-bool UTraceTrailComponent::IsTraceInvulnerable() const
+// =================================================================================================
+// TRACE INVULNERABILITY — TWO SOURCES, COMPOSED HERE AND NOWHERE ELSE
+//
+// If you read one comment in this file, read this one and TraceParry.h's file header.
+//
+//   Source 1, THE PASS WINDOW (§4). ~0.5s. Owned by ATraceCore. It is the SAME replicated bool that
+//   drops the holder's shield, so the risk beat cannot half-apply.
+//
+//   Source 2, THE PARRY (v3 §3). 0.1s on a 1.5s cooldown. Owned by this component. It does NOT
+//   touch the shield: the carrier stays bulletproof throughout.
+//
+// They are ORed, and each stays separately readable. The failure mode this structure exists to
+// prevent is a future reader assuming there is only one source and "simplifying" — e.g. routing the
+// parry through ATraceCore::IsTraceInvulnerableFor(), which would silently make the carrier
+// shootable for 0.1s every 1.5s, or letting one source's end time clear the other's.
+//
+// Neither source can end the other: they are different pieces of state on different objects, and
+// nothing below writes across the boundary. A parry raised during a pass window simply reddens a
+// trace that was already unbreakable, and expires without shortening the pass.
+// =================================================================================================
+
+bool UTraceTrailComponent::IsPassWindowInvulnerable() const
 {
 	// Read straight out of the Core rather than mirrored here. §4 says the trace hardening and the
 	// holder's shield loss happen "simultaneously"; the only way to guarantee that is for both to be
@@ -388,9 +482,203 @@ bool UTraceTrailComponent::IsTraceInvulnerable() const
 	return ATraceCore::IsTraceInvulnerableFor(GetOwner());
 }
 
+bool UTraceTrailComponent::IsTraceInvulnerable() const
+{
+	return IsPassWindowInvulnerable() || IsParryActive();
+}
+
 void UTraceTrailComponent::NotifyInvulnerabilityChanged()
 {
 	bVisualsDirty = true;
+}
+
+
+// =================================================================================================
+// The parry (spec v3 §3)
+// =================================================================================================
+
+bool UTraceTrailComponent::IsParryActive() const
+{
+	// DEBUG ONLY, and it is checked first so a verification run cannot be defeated by a cooldown.
+	// Off in every normal session; see TraceParry.h.
+	if (TraceParry::IsWindowForced())
+	{
+		const ATraceCharacter* Holder = GetOwnerCharacter();
+		return Holder != nullptr && Holder->IsCarrier();
+	}
+
+	// AUTHORITATIVE, and only the authoritative value: the replicated deadline on the replicated
+	// clock. The local prediction is deliberately absent — see IsParryVisuallyActive().
+	return ParryEndServerTime > 0.f && GetServerTimeSeconds() < ParryEndServerTime;
+}
+
+bool UTraceTrailComponent::IsParryVisuallyActive() const
+{
+	if (IsParryActive())
+	{
+		return true;
+	}
+
+	// Cosmetic prediction. Never reached on the server, because the server sets the authoritative
+	// value directly and never sets this.
+	return LocalParryPredictEndTime > 0.f && GetServerTimeSeconds() < LocalParryPredictEndTime;
+}
+
+float UTraceTrailComponent::GetParryWindowRemaining() const
+{
+	if (ParryEndServerTime <= 0.f)
+	{
+		return 0.f;
+	}
+	return FMath::Max(0.f, ParryEndServerTime - GetServerTimeSeconds());
+}
+
+float UTraceTrailComponent::GetParryCooldownRemaining() const
+{
+	if (ParryCooldownEndServerTime <= 0.f)
+	{
+		return 0.f;
+	}
+	return FMath::Max(0.f, ParryCooldownEndServerTime - GetServerTimeSeconds());
+}
+
+void UTraceTrailComponent::RequestParry(ETraceParryRefusal& OutRefusal)
+{
+	OutRefusal = ETraceParryRefusal::None;
+
+	const AActor* OwnerActor = GetOwner();
+	if (OwnerActor == nullptr)
+	{
+		OutRefusal = ETraceParryRefusal::NoPawn;
+		return;
+	}
+
+	if (OwnerActor->HasAuthority())
+	{
+		ServerTryBeginParry(OutRefusal);
+		return;
+	}
+
+	// ---- owning client -----------------------------------------------------------------------
+	//
+	// Predict the TINT and nothing else. The window that decides whether anybody lives is the
+	// server's, and the trip test never reads the prediction.
+	const ATraceCharacter* Holder = GetOwnerCharacter();
+	if (Holder == nullptr || !Holder->IsAlive())
+	{
+		OutRefusal = ETraceParryRefusal::Dead;
+		return;
+	}
+	if (!Holder->IsCarrier())
+	{
+		OutRefusal = ETraceParryRefusal::NotCarrying;
+		return;
+	}
+
+	// Respect the replicated cooldown locally too, so mashing the key does not strobe the trace red
+	// on requests the server is certain to refuse.
+	if (GetParryCooldownRemaining() > 0.f)
+	{
+		OutRefusal = ETraceParryRefusal::OnCooldown;
+		return;
+	}
+
+	LocalParryPredictEndTime = GetServerTimeSeconds() + TraceParry::GetDurationSeconds();
+	bVisualsDirty = true;
+
+	ServerRequestParry();
+}
+
+void UTraceTrailComponent::ServerRequestParry_Implementation()
+{
+	ETraceParryRefusal Refusal = ETraceParryRefusal::None;
+	ServerTryBeginParry(Refusal);
+}
+
+bool UTraceTrailComponent::ServerTryBeginParry(ETraceParryRefusal& OutRefusal)
+{
+	OutRefusal = ETraceParryRefusal::None;
+
+	const AActor* OwnerActor = GetOwner();
+	if (OwnerActor == nullptr || !OwnerActor->HasAuthority())
+	{
+		OutRefusal = ETraceParryRefusal::NoPawn;
+		return false;
+	}
+
+	const ATraceCharacter* Holder = GetOwnerCharacter();
+	if (Holder == nullptr)
+	{
+		OutRefusal = ETraceParryRefusal::NoPawn;
+		return false;
+	}
+	if (!Holder->IsAlive())
+	{
+		OutRefusal = ETraceParryRefusal::Dead;
+		return false;
+	}
+
+	// v3 §3, first line: "a parry mechanic for THE CORE CARRIER". A non-carrier pressing parry does
+	// nothing at all — no window, and no cooldown burnt either, so the key is dead rather than
+	// punishing while you are not holding the Core.
+	if (!Holder->IsCarrier())
+	{
+		OutRefusal = ETraceParryRefusal::NotCarrying;
+		return false;
+	}
+
+	const float Now = GetServerTimeSeconds();
+	if (ParryCooldownEndServerTime > 0.f && Now < ParryCooldownEndServerTime)
+	{
+		OutRefusal = ETraceParryRefusal::OnCooldown;
+		return false;
+	}
+
+	ParryEndServerTime = Now + TraceParry::GetDurationSeconds();
+	ParryCooldownEndServerTime = Now + TraceParry::GetCooldownSeconds();
+
+	// A listen server is also a viewer: it will not get OnRep, so dirty the visuals here.
+	bVisualsDirty = true;
+
+	UE_LOG(LogTraceGame, Log, TEXT("[PARRY] %s parried: trace invulnerable for %.2fs, next parry in %.2fs."),
+		*GetNameSafe(GetOwner()), TraceParry::GetDurationSeconds(), TraceParry::GetCooldownSeconds());
+
+	return true;
+}
+
+void UTraceTrailComponent::OnRep_ParryEndServerTime()
+{
+	// The authority has spoken; the prediction has nothing left to cover.
+	LocalParryPredictEndTime = 0.f;
+	bVisualsDirty = true;
+}
+
+void UTraceTrailComponent::ServerTickBotAutoParry()
+{
+	if (!TraceParry::IsBotAutoParryEnabled())
+	{
+		return;
+	}
+
+	const ATraceCharacter* Holder = GetOwnerCharacter();
+	if (Holder == nullptr || !Holder->IsAlive() || !Holder->IsCarrier())
+	{
+		return;
+	}
+
+	// Only AI. A human's parry stays a human's decision even with this on.
+	if (Cast<APlayerController>(Holder->GetController()) != nullptr)
+	{
+		return;
+	}
+
+	if (GetParryCooldownRemaining() > 0.f || IsParryActive())
+	{
+		return;
+	}
+
+	ETraceParryRefusal Refusal = ETraceParryRefusal::None;
+	ServerTryBeginParry(Refusal);
 }
 
 int32 UTraceTrailComponent::ComputeLastLethalIndex() const
@@ -544,10 +832,16 @@ void UTraceTrailComponent::ServerUpdateTrail()
 
 	// 3. Append, distance-gated so a stationary holder does not spam identical points.
 	//
-	//    §2's transfer grace lives right here: for one second after the Core changes team, the new
-	//    holder is running around laying nothing. Everything else about the emission window is
-	//    already true — bEmitting is set, the trip test is live — there simply are no points yet,
+	//    THE TRANSFER GRACE LIVES RIGHT HERE, AND ONLY HERE (§2; 0.4s since v3 §1). For its duration
+	//    the new holder runs around laying nothing. Everything else about the emission window is
+	//    already true — bEmitting is set, THE TRIP TEST IS LIVE — there simply are no points yet,
 	//    which is exactly what "the trace has not begun to form" means.
+	//
+	//    THIS IS THE ONLY CORRECT PLACE FOR IT. Shortening the grace must not, and here cannot, make
+	//    a visible trace non-lethal: the invariant is "once a segment is visible it is lethal, except
+	//    during an explicit parry or pass window", and the grace is upstream of any segment existing
+	//    at all. A previous pass shipped the grace as an early-out in the TRIP TEST instead; that is
+	//    the reported "I dashed through it and nothing happened" bug, and it must not come back.
 	const bool bGraceActive = (EmitGraceEndServerTime > 0.f) && (Now < EmitGraceEndServerTime);
 
 	if (bEmitting && !bGraceActive)
@@ -630,18 +924,28 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	const UTraceSettings& Settings = UTraceSettings::Get();
 
 	// -------------------------------------------------------------------------------------------
-	// SPEC §4, THE RISK BEAT. From the instant the holder inputs a pass until it completes or
-	// cancels, the trace CANNOT BE BROKEN. This is the whole reason the passer is willing to give
-	// up their shield: for those 0.5s the dash counterplay is off the table and the only way to
-	// stop the pass is to shoot them. It is the ONE intended exception to the invariant above, and
-	// it is signposted: the after-images brighten by GhostInvulnerableGlowScale while it holds.
+	// THE TWO INTENDED EXCEPTIONS TO THE INVARIANT ABOVE. Both suppress the KILL and nothing else.
 	//
-	// It suppresses the KILL only — the loop below still runs, so PreviousLocations keeps tracking
-	// every candidate. The old code returned early and reset them, which meant the first tick after
-	// the window closed had no valid previous position for anyone; that is a sweep the teleport
-	// guard throws away, i.e. the first dash after every single pass was silently swallowed.
+	// §4, THE PASS WINDOW / RISK BEAT. From the instant the holder inputs a pass until it completes
+	// or cancels, the trace CANNOT BE BROKEN. This is the whole reason the passer is willing to give
+	// up their shield: for those 0.5s the dash counterplay is off the table and the only way to stop
+	// the pass is to shoot them. Signposted by GhostInvulnerableGlowScale.
+	//
+	// v3 §3, THE PARRY. 0.1s, carrier-only, on a cooldown, shield untouched. Signposted by the
+	// entire trace turning RED. Read from IsParryActive(), which is the REPLICATED window and never
+	// the client's local prediction — this line is where "server-authoritative on whether a dash
+	// landed inside the window" actually happens.
+	//
+	// The two are read separately so the log can name which one saved the carrier; a merged bool
+	// would turn every one of these lines into a guess. They suppress the KILL only — the loop below
+	// still runs, so PreviousLocations keeps tracking every candidate. The old code returned early
+	// and reset them, which meant the first tick after the window closed had no valid previous
+	// position for anyone; that is a sweep the teleport guard throws away, i.e. the first dash after
+	// every single pass was silently swallowed.
 	// -------------------------------------------------------------------------------------------
-	const bool bInvulnerable = IsTraceInvulnerable();
+	const bool bPassWindow = IsPassWindowInvulnerable();
+	const bool bParry = IsParryActive();
+	const bool bInvulnerable = bPassWindow || bParry;
 
 	// Everything up to and including this index is BOTH lethal and drawn; everything after it is
 	// neither. One function, one answer, used by the trip test and by RebuildVisuals.
@@ -831,11 +1135,18 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 				continue;   // Resolved; keep looping only to refresh the remaining positions.
 			}
 
-			// The one intended exception. Logged, because "I dashed through it and nothing
-			// happened" must always have an answer in the log.
+			// An intended exception. ALWAYS logged, and always naming WHICH source saved the
+			// carrier, because "I dashed through it and nothing happened" must have an answer in
+			// the log — and with two sources, "it was invulnerable" is not an answer.
+			const TCHAR* NoKillReason =
+				(bParry && bPassWindow) ? TEXT("PARRIED (v3 3), and also inside a pass window (spec 4)")
+				: bParry                ? TEXT("PARRIED - trace protected, carrier lives (v3 3)")
+				:                         TEXT("pass window invulnerable (spec 4)");
+
 			UE_LOG(LogTraceGame, Log,
-				TEXT("[TRACEDASH] %s dashed through %s's trace: NO KILL (pass window invulnerable, spec 4). points=%d lethal=%d emitting=%d"),
-				*GetNameSafe(Candidate), *GetNameSafe(Holder),
+				TEXT("[TRACEDASH] %s dashed through %s's trace: NO KILL - %s. parry=%d (%.3fs left) passWindow=%d points=%d lethal=%d emitting=%d"),
+				*GetNameSafe(Candidate), *GetNameSafe(Holder), NoKillReason,
+				bParry ? 1 : 0, GetParryWindowRemaining(), bPassWindow ? 1 : 0,
 				TrailPoints.Items.Num(), TestPositions.Num(), bEmitting ? 1 : 0);
 			continue;
 		}
@@ -857,8 +1168,11 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	// TrailPoints.Items and PreviousLocations.
 	if (Tripper != nullptr)
 	{
+		// parry=0 passWindow=0 is printed on the KILL line too, and it is not noise: the claim under
+		// test is a conditional, so the log has to carry the negative case as explicitly as the
+		// positive one. "Every dash through a trace, and whether a parry was active" is one grep.
 		UE_LOG(LogTraceGame, Log,
-			TEXT("[TRACEDASH] %s dashed through %s's trace: KILL. points=%d lethal=%d emitting=%d (residual trace: %s)"),
+			TEXT("[TRACEDASH] %s dashed through %s's trace: KILL. parry=0 passWindow=0 points=%d lethal=%d emitting=%d (residual trace: %s)"),
 			*GetNameSafe(Tripper), *GetNameSafe(Holder),
 			TrailPoints.Items.Num(), TestPositions.Num(), bEmitting ? 1 : 0,
 			bEmitting ? TEXT("no") : TEXT("yes - laid before a turnover"));
@@ -1077,9 +1391,15 @@ void UTraceTrailComponent::UpdateVisuals()
 	const FVector Tail = PointCount > 0 ? FVector(TrailPoints.Items[0].Location) : FVector::ZeroVector;
 	const bool bInvulnerable = IsTraceInvulnerable();
 
+	// The PARRY is its own change detector — see bLastVisualParry's declaration. Without it, a parry
+	// raised during an open pass window would leave every other term unchanged and the trace would
+	// never go red.
+	const bool bParryVisual = IsParryVisuallyActive();
+
 	if (!bVisualsDirty
 		&& PointCount == LastVisualPointCount
 		&& bInvulnerable == bLastVisualInvulnerable
+		&& bParryVisual == bLastVisualParry
 		&& bEmitting == bLastVisualEmitting
 		&& Head.Equals(LastVisualHead, 0.01)
 		&& Tail.Equals(LastVisualTail, 0.01))
@@ -1092,6 +1412,7 @@ void UTraceTrailComponent::UpdateVisuals()
 	LastVisualHead = Head;
 	LastVisualTail = Tail;
 	bLastVisualInvulnerable = bInvulnerable;
+	bLastVisualParry = bParryVisual;
 
 	// bEmitting is in the comparison above because ComputeLastLethalIndex() reads it: the frame a
 	// holder stops emitting, the stub under their feet becomes lethal and must become visible with
@@ -1132,7 +1453,21 @@ void UTraceTrailComponent::RebuildVisuals()
 
 	const float Lifetime = GetTraceLifetimeSeconds();
 	const float Now = GetServerTimeSeconds();
-	const float InvulnerableScale = IsTraceInvulnerable() ? GhostInvulnerableGlowScale : 1.f;
+
+	// v3 §3: the parry's brightness step, ABOVE the pass window's, and checked first so that a parry
+	// raised during a pass window still reads as a parry. The colour half of the same state is
+	// applied in UpdateTeamColor(); the two are driven by the same predicate so they cannot
+	// disagree — a red trace at pass-window brightness (or a cyan one at parry brightness) would be
+	// a state the player has no name for.
+	float InvulnerableScale = 1.f;
+	if (IsParryVisuallyActive())
+	{
+		InvulnerableScale = TraceParry::GetGlowScale();
+	}
+	else if (IsPassWindowInvulnerable())
+	{
+		InvulnerableScale = GhostInvulnerableGlowScale;
+	}
 
 	// --- Hide the newest stretch of the trace from the holder's OWN eyes -------------------------
 	//
@@ -1158,7 +1493,7 @@ void UTraceTrailComponent::RebuildVisuals()
 			FirstOwnerHiddenPoint = 0;
 			for (int32 Index = PointCount - 1; Index >= 0; --Index)
 			{
-				if (DistanceFromHead >= OwnerNearHideDistance)
+				if (DistanceFromHead >= static_cast<double>(FMath::Max(0.f, GOwnerNearHideDistance)))
 				{
 					FirstOwnerHiddenPoint = Index + 1;
 					break;
@@ -1514,6 +1849,30 @@ void UTraceTrailComponent::UpdateTeamColor()
 	{
 		Desired = TraceTeamColor(TraceChar->GetTeam());
 	}
+
+	// -------------------------------------------------------------------------------------------
+	// v3 §3: "It also makes the ENTIRE trace turn red for the duration of the parry."
+	//
+	// Every after-image, not the ones near the dasher — the tell has to be legible from anywhere on
+	// the field, to the carrier (who is looking forward, away from their own trace) and to the enemy
+	// (who is already mid-dash and has one frame to abort). One colour on every MID does that.
+	//
+	// AND IT REVERTS BY CONSTRUCTION, which is the point of doing it here rather than on an event.
+	// This function is POLLED from UpdateVisuals() every single tick and simply asks "what colour
+	// should the trace be right now"; when the window lapses the answer goes back to the team colour
+	// on the very next tick with nothing having to remember to undo anything. A stuck red trace is
+	// the obvious failure mode of this mechanic, and an event-driven tint is how you get one — a
+	// dropped RPC, a holder who dies mid-parry, a Core that changes hands inside the window, and the
+	// "turn it off" edge never arrives. There is no such edge here.
+	//
+	// The early-out below still means the MIDs are touched only on an actual change, so polling
+	// costs one FLinearColor comparison per tick.
+	// -------------------------------------------------------------------------------------------
+	if (IsParryVisuallyActive())
+	{
+		Desired = TraceParry::GetTintColor();
+	}
+
 	Desired.A = 1.f;
 
 	if (bColorApplied && Desired.Equals(AppliedColor, 0.001f))

@@ -198,10 +198,16 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	float Range,
 	float RewindToServerTime,
 	FVector& OutImpactPoint,
-	ETraceHitZone& OutZone)
+	ETraceHitZone& OutZone,
+	FTraceHitscanDiagnostics* OutDiagnostics)
 {
 	OutZone = ETraceHitZone::None;
 	OutImpactPoint = Origin;
+
+	if (OutDiagnostics != nullptr)
+	{
+		*OutDiagnostics = FTraceHitscanDiagnostics();
+	}
 
 	if (World == nullptr)
 	{
@@ -277,6 +283,13 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 		// a wall degrades to "very short shot" instead of "every shot silently dies".
 		MaxDistance = FMath::Max(static_cast<double>(WorldHit.Distance), 1.0);
 		OutImpactPoint = WorldHit.ImpactPoint;
+
+		if (OutDiagnostics != nullptr)
+		{
+			OutDiagnostics->bWorldTraceHit = true;
+			OutDiagnostics->bWorldStartPenetrating = WorldHit.bStartPenetrating;
+			OutDiagnostics->WorldHitDistance = WorldHit.Distance;
+		}
 	}
 
 	// ---------------------------------------------------------------------------------------
@@ -294,6 +307,8 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	double BestDistanceAlongRay = TNumericLimits<double>::Max();
 	FVector BestImpact = OutImpactPoint;
 	ETraceHitZone BestZone = ETraceHitZone::None;
+	FTraceLagCompFrame BestFrame;
+	bool bBestFrameRewound = false;
 
 	for (ATraceCharacter* Target : Candidates)
 	{
@@ -305,7 +320,7 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 		{
 			continue;
 		}
-		if (Target->IsCarrier() && !ATraceCore::IsShieldSuppressedFor(Target))
+		if (ATraceCore::IsCoreHolder(Target) && !ATraceCore::IsShieldSuppressedFor(Target))
 		{
 			// The Core carrier is invulnerable to bullets by design - do not even resolve them.
 			//
@@ -318,6 +333,10 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 			// hit. The condition is deliberately the SAME expression the health component reads, so
 			// "can this be shot" has exactly one definition in the build and cancel restores both
 			// halves of the beat in one statement.
+			//
+			// Both terms ask ATraceCore, not the pawn's replicated bIsCarrier mirror — see
+			// ATraceCore::IsCoreHolder. Mixing the mirror with the Core inside one expression made a
+			// damage rule depend on two separately replicated facts agreeing.
 			continue;
 		}
 		if (!Settings.bFriendlyFire && Shooter != nullptr && ShooterTeam != ETraceTeam::None && Target->GetTeam() == ShooterTeam)
@@ -402,6 +421,8 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 		BestTarget = Target;
 		BestImpact = ZoneImpact;
 		BestZone = ZoneHit;
+		BestFrame = Frame;
+		bBestFrameRewound = bHavePose;
 	}
 
 	// NOTE: the ray is bounded by static geometry, but a capsule straddling a thin wall can still be
@@ -412,6 +433,44 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 	{
 		OutImpactPoint = BestImpact;
 		OutZone = BestZone;
+	}
+
+	// ---------------------------------------------------------------------------------------
+	// 4. Diagnostics. Never touches the answer above; it only re-describes it.
+	// ---------------------------------------------------------------------------------------
+	if (OutDiagnostics != nullptr && BestTarget != nullptr)
+	{
+		OutDiagnostics->bHaveVictim = true;
+		OutDiagnostics->VictimFrame = BestFrame;
+		OutDiagnostics->bVictimPoseRewound = bBestFrameRewound;
+		OutDiagnostics->Zone = BestZone;
+
+		const FTraceHitZoneModel BestModel = FTraceHitZoneModel::FromFrame(BestFrame);
+		const double FootZ = BestModel.CapsuleCenter.Z - BestModel.HalfHeight;
+		const double FullHeight = FMath::Max(1.0, BestModel.HalfHeight * 2.0);
+
+		OutDiagnostics->EntryHeightFraction = (BestImpact.Z - FootZ) / FullHeight;
+
+		// The ray's closest approach to the capsule AXIS - i.e. where the shot actually passes
+		// through the body, rather than where it first touches the capsule's outer surface. The
+		// game classifies at the entry point, which on a non-horizontal shot sits up to one capsule
+		// RADIUS (34 uu, a fifth of a body) away in Z from where the round really goes.
+		const double AxisHalf = FMath::Max(0.0, BestModel.HalfHeight - BestModel.Radius);
+		const FVector AxisBottom = BestModel.CapsuleCenter - FVector(0.0, 0.0, AxisHalf);
+		const FVector AxisTop = BestModel.CapsuleCenter + FVector(0.0, 0.0, AxisHalf);
+
+		FVector NearestOnRay = FVector::ZeroVector;
+		FVector NearestOnAxis = FVector::ZeroVector;
+		FMath::SegmentDistToSegmentSafe(Origin, RayEnd, AxisBottom, AxisTop, NearestOnRay, NearestOnAxis);
+
+		OutDiagnostics->ClosestHeightFraction = (NearestOnRay.Z - FootZ) / FullHeight;
+
+		// Head stays whatever the real ray/sphere test decided - only the body/legs BAND is being
+		// re-asked here, because that is the boundary that changes what a shot is worth by 15 damage
+		// and by a whole extra round in the time to kill.
+		OutDiagnostics->ZoneAtClosestApproach = (BestZone == ETraceHitZone::Head)
+			? ETraceHitZone::Head
+			: ((NearestOnRay.Z < BestModel.HipZ) ? ETraceHitZone::Legs : ETraceHitZone::Body);
 	}
 
 #if ENABLE_DRAW_DEBUG

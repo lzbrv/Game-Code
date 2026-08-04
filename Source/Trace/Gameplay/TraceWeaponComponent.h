@@ -81,6 +81,16 @@ private:
 	void PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted) const;
 
 	/**
+	 * Folds one server-resolved shot into the Trace.ShotStats distribution.
+	 *
+	 * Authority only, and only while the cvar is on. Reads LastPredicted* so it can also count the
+	 * predicted-vs-authoritative agreement rate for shots whose prediction ran in this same process
+	 * (a bot, single player, or the listen host's own pawn).
+	 */
+	void AccumulateShotStats(ETraceHitZone ServerZone, const class ATraceCharacter* Victim,
+		const struct FTraceHitscanDiagnostics& Diagnostics);
+
+	/**
 	 * Last zone the LOCAL predicted trace produced, and the victim it produced it against.
 	 *
 	 * Only read by the Trace.DebugHitZones instrumentation, which compares them against what the

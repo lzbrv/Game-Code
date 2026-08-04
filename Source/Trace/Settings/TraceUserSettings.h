@@ -48,7 +48,15 @@ enum class ETraceInputAction : uint8
 	Jump,
 	Crouch,
 	Dash,
-	Boost,
+	/**
+	 * Spec v3 §3. Took the slot Boost vacated, which is why Count is unchanged.
+	 *
+	 * The ConfigId is new ("Parry", never "Boost"), so a TraceUserSettings.ini written by an older
+	 * build carries a `Boost=E` line that RefreshFromConfig simply does not recognise and drops. That
+	 * is the whole migration: no player inherits a parry bound to the old boost key by accident, and
+	 * nobody has to write an upgrade path.
+	 */
+	Parry,
 	Fire,
 	Pass,
 	Scoreboard,

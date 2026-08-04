@@ -14,16 +14,30 @@
 //     takes the Core. Walking or running through it does nothing at all. Teammates never trip it.
 //     Dashing through the trace is the only counterplay to an otherwise shielded holder.
 //
-// Two rules from spec v2 sit on top of that and are implemented here:
+// Three rules sit on top of that and are implemented here:
 //
-//   GRACE (§2)          After the Core changes TEAM, the trace does not begin to form for 1
-//                       second. ATraceCore calls SetEmitGrace() immediately before it starts the
-//                       new holder emitting; points laid inside the window are simply not laid.
+//   GRACE (§2)          After the Core changes TEAM, the trace does not begin to form for
+//                       0.4 seconds (spec v3 §1 shortened it from 1.0). ATraceCore calls
+//                       SetEmitGrace() immediately before it starts the new holder emitting;
+//                       points laid inside the window are simply not laid.
 //
-//   INVULNERABILITY (§4) From the instant the holder INPUTS a pass until it completes or cancels,
+//                       IT DELAYS FORMATION AND NOTHING ELSE. A segment that has already been laid
+//                       is lethal, grace or no grace. Making the grace suppress the TRIP TEST
+//                       instead of the point laying is a bug this project has already shipped once
+//                       and fixed once — see ServerRunTripTest.
+//
+//   PASS WINDOW (§4)    From the instant the holder INPUTS a pass until it completes or cancels,
 //                       the trace cannot be broken. That fact is not stored here — it is read back
 //                       out of ATraceCore::IsTraceInvulnerableFor(), which is the same replicated
 //                       bool that drops the holder's shield, so the two can never disagree.
+//
+//   PARRY (v3 §3)       A carrier-only, 0.1s window of trace invulnerability on a 1.5s cooldown,
+//                       during which the ENTIRE trace turns red. Unlike the pass window it does NOT
+//                       drop the shield. The window lives here (see ParryEndServerTime); the
+//                       tunables, the entry point and the debug commands live in Gameplay/TraceParry.h,
+//                       whose file header explains the split and — importantly — exactly how the two
+//                       invulnerability sources compose without clobbering each other. Read it
+//                       before changing either.
 //
 // VISUALLY (§3) the trace is "a blur created where your character model has passed through": a
 // chain of character-shaped after-images, not a wall and not a tube. See RebuildVisuals().
@@ -39,7 +53,8 @@
 #include "UObject/ObjectPtr.h"
 #include "UObject/WeakObjectPtr.h"
 
-#include "TraceTypes.h"   // FTraceTrailPointArray
+#include "TraceTypes.h"          // FTraceTrailPointArray
+#include "Gameplay/TraceParry.h" // ETraceParryRefusal (plain header, no reflection)
 
 #include "TraceTrailComponent.generated.h"
 
@@ -101,13 +116,24 @@ public:
 	void SetEmitting(bool bEmit);
 
 	/**
-	 * Server: spec §2 — suppress point laying for @p Seconds from now.
+	 * Server: spec §2 — suppress POINT LAYING for @p Seconds from now.
 	 *
 	 * Must be called BEFORE SetEmitting(true), because that is what starts the emission and lays
 	 * the first point. Stored as an absolute deadline rather than a countdown, so re-asserting
 	 * emission (see SetEmitting) can neither extend nor lose the window.
+	 *
+	 * v3 §1 SHORTENED THE TURNOVER GRACE FROM 1.0s TO 0.4s. The request is capped here rather than
+	 * at the single call site (ATraceCore's TraceCoreTuning::TransferGraceSeconds, still 1.0) for
+	 * exactly the reason GetTraceLifetimeSeconds() caps the lifetime: that constant lives in a file
+	 * this slice does not own, and a stale value there must not be able to reinstate the old rule.
+	 * A caller asking for LESS still wins. Tune with Trace.Trail.TurnoverGrace.
+	 *
+	 * IT DELAYS FORMATION, NOT LETHALITY. Nothing in the grace path touches the trip test.
 	 */
 	void SetEmitGrace(float Seconds);
+
+	/** The turnover grace actually in force, in seconds. v3 §1: 0.4. */
+	static float GetTurnoverGraceSeconds();
 
 	/** Server: drop every point and tell clients to wipe their visuals immediately. */
 	void ClearTrail();
@@ -115,8 +141,68 @@ public:
 	/** True while this component is laying the trace. Replicated, so it is meaningful on clients. */
 	bool IsEmitting() const;
 
-	/** True while the trace is inside the holder's pass window and cannot be broken (§4). */
+	// ------------------------------------------------------------------------------------------
+	// TRACE INVULNERABILITY — TWO INDEPENDENT SOURCES. See Gameplay/TraceParry.h's file header.
+	//
+	// IsTraceInvulnerable() is the OR of the two and is what the trip test and the visuals ask.
+	// The two component questions stay separately answerable on purpose: the HUD, the logs and any
+	// future reader need to be able to say WHICH one is protecting a trace, and a single merged
+	// bool would make "the parry ate my pass window" impossible to diagnose.
+	// ------------------------------------------------------------------------------------------
+
+	/** True while the trace cannot be broken FOR ANY REASON: pass window, parry, or a debug force. */
 	bool IsTraceInvulnerable() const;
+
+	/**
+	 * Source 1 (§4). True while the holder's PASS window is open.
+	 *
+	 * Read straight back out of ATraceCore, which is also what drops the holder's shield — the two
+	 * are one fact read twice. The parry must never write it; see TraceParry.h.
+	 */
+	bool IsPassWindowInvulnerable() const;
+
+	// ------------------------------------------------------------------------------------------
+	// Source 2 (v3 §3): THE PARRY.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Ask for a parry. Call TraceParry::RequestParry() instead of this from gameplay code — that is
+	 * the documented entry point and it copes with a null pawn.
+	 *
+	 * Server: applies the rules and opens the window. Owning client: predicts the RED TINT locally
+	 * (nothing else) and sends ServerRequestParry. Anyone else: refused.
+	 */
+	void RequestParry(ETraceParryRefusal& OutRefusal);
+
+	/** Owning client -> server. Reliable: a dropped parry is a death, which is not a droppable event. */
+	UFUNCTION(Server, Reliable)
+	void ServerRequestParry();
+
+	/**
+	 * AUTHORITATIVE. True while a parry window is open, per the REPLICATED window end time only.
+	 *
+	 * The trip test reads this and nothing else, which is what makes the server the sole judge of
+	 * whether a dash landed inside the window. It deliberately ignores the local prediction — a
+	 * client that predicts a parry the server refused still dies, and correctly so.
+	 */
+	bool IsParryActive() const;
+
+	/**
+	 * COSMETIC ONLY: authoritative window OR this machine's local prediction.
+	 *
+	 * Used exclusively by the visuals. 0.1s is shorter than a round trip, so a tint that waited for
+	 * the server would arrive after the window it is meant to advertise had already closed.
+	 */
+	bool IsParryVisuallyActive() const;
+
+	/** Seconds of parry window remaining (authoritative), 0 when closed. */
+	float GetParryWindowRemaining() const;
+
+	/** Seconds until this holder may parry again; 0 means ready. For the HUD pip. */
+	float GetParryCooldownRemaining() const;
+
+	/** The colour last pushed to the after-image materials. Debug readout for Trace.DebugParry. */
+	FLinearColor GetAppliedTraceColor() const { return AppliedColor; }
 
 	/**
 	 * THE VISIBLE == LETHAL INVARIANT, in one function.
@@ -158,6 +244,49 @@ private:
 	/** Replicated so IsEmitting() is truthful on clients (one bit on the wire). */
 	UPROPERTY(Replicated)
 	bool bEmitting = false;
+
+	/**
+	 * v3 §3: shared-clock instant the current PARRY window closes. 0 = never parried.
+	 *
+	 * Replicated to EVERYONE, not just the owner, and that is the mechanic rather than a detail: the
+	 * enemy who is mid-dash is the person who most needs the red trace, and they can only be shown it
+	 * if their machine knows the window is open. One float, written once per parry.
+	 *
+	 * Stored as an absolute deadline rather than a countdown so it cannot be extended or lost by a
+	 * re-assertion, and so the server's answer and every client's answer are the same arithmetic on
+	 * the same replicated clock (AGameStateBase::GetServerWorldTimeSeconds).
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_ParryEndServerTime)
+	float ParryEndServerTime = 0.f;
+
+	/** Shared-clock instant this holder may parry again. Replicated so the HUD pip is truthful. */
+	UPROPERTY(Replicated)
+	float ParryCooldownEndServerTime = 0.f;
+
+	/**
+	 * CLIENT-ONLY, COSMETIC-ONLY: when this machine's locally predicted red tint expires.
+	 *
+	 * Never consulted by the trip test, never replicated, and cleared the moment the authoritative
+	 * window replicates in. If the server refuses the parry this simply lapses and the trace goes
+	 * back to team colour — the player sees a 0.1s flash and dies anyway, which is the honest
+	 * outcome of predicting something the server said no to.
+	 */
+	float LocalParryPredictEndTime = 0.f;
+
+	UFUNCTION()
+	void OnRep_ParryEndServerTime();
+
+	/** Server: the actual rules. Returns true and opens the window, or false with a reason. */
+	bool ServerTryBeginParry(ETraceParryRefusal& OutRefusal);
+
+	/**
+	 * Server, DEBUG ONLY: Trace.Parry.BotAuto — AI carriers parry the instant their cooldown allows.
+	 *
+	 * It exists so an unattended bot match produces a large, mixed sample of parried and unparried
+	 * dashes through the *real* code path, which is the only way to measure the mechanic without a
+	 * human sitting there reacting. Compiled out of shipping and off by default.
+	 */
+	void ServerTickBotAutoParry();
 
 	/**
 	 * Shared-clock deadline before which no point may be laid (spec §2's 1s transfer grace).
@@ -243,6 +372,16 @@ private:
 
 	/** Last invulnerability state the visuals were built for; a change forces a rebuild. */
 	bool bLastVisualInvulnerable = false;
+
+	/**
+	 * Last PARRY visual state the visuals were built for.
+	 *
+	 * Tracked separately from bLastVisualInvulnerable, and it has to be: a parry raised during an
+	 * open pass window leaves IsTraceInvulnerable() true on both sides of the transition, so that
+	 * flag alone would not notice — and the trace would stay pass-window-cyan instead of going red.
+	 * This is the change detector for the RED, which is the whole readability of the mechanic.
+	 */
+	bool bLastVisualParry = false;
 
 	/**
 	 * Last emission state the visuals were built for. It is part of the change detection because

@@ -747,7 +747,11 @@ void ATraceGameMode::NotifyCharacterDied(ATraceCharacter* Victim, AController* K
 	if (VictimState != nullptr)
 	{
 		++VictimState->Deaths;
-		VictimState->bIsCarrier = false;
+		// bIsCarrier is deliberately NOT written here any more. ATraceCharacter::SetCarrying() is the
+		// sole writer of that mirror, and the Core's release path (ATraceCore::ReleaseHolder, which a
+		// death always reaches) clears it — including through its cached PlayerState handle when the
+		// pawn is already gone. A fourth writer in the death path is how the mirror ended up with
+		// four of them and no owner.
 		VictimState->ForceNetUpdate();
 	}
 
@@ -1526,7 +1530,20 @@ void ATraceGameMode::RemoveOneBotFromTeam(ETraceTeam Team)
 		Bots.RemoveAt(Index);
 
 		// Reuse the human departure path so the Core cannot leave the match in a bot's hands and the
-		// trail cannot outlive its emitter.
+		// trail cannot outlive its emitter. Called MANUALLY and BEFORE the pawn is torn down, because
+		// the release path needs a live pawn to hand the Core off from.
+		//
+		// THE ENGINE WILL CALL Logout(Bot) AGAIN. AController::Destroyed() calls
+		// GameMode->Logout(this) for any controller carrying a PlayerState, and a bot controller
+		// does. So Bot->Destroy() below re-enters this same function a second time for the same
+		// controller. That is harmless today only because every step happens to be idempotent — the
+		// pawn is already null, Super::Logout casts to APlayerController and no-ops on a bot, and
+		// ClearPendingRespawn tolerates a second call — and because the only visible cost is
+		// CheckMatchStartConditions being scheduled twice.
+		//
+		// LOGOUT MUST THEREFORE STAY IDEMPOTENT. If you add state to it that cannot be applied twice
+		// (a counter, a score adjustment, a queue push), this is the call site that will double it,
+		// and the symptom will show up as a bot-count drift nowhere near this line.
 		Logout(Bot);
 
 		if (APawn* BotPawn = Bot->GetPawn())
@@ -2382,11 +2399,11 @@ void ATraceGameMode::ReleaseCore()
 		// "Out of play": no holder, parked at the centre. ETraceTeam::None is the argument that says
 		// so, and it is the same call as a kickoff precisely so the Core has one entry point.
 		//
-		// INTEGRATION NOTE: ATraceCore::KickoffTo currently rewrites a None argument into its own
-		// TraceCoreTuning::DefaultKickoffTeam, so today this parks the Core and then grants it to
-		// Blue a second later. That is wrong during the interval and after the whistle. The fix is
-		// two lines in TraceCore.cpp and is written out in this pass's report; the call site here is
-		// already correct and needs no change when it lands.
+		// KickoffTo honours None: it sets bOutOfPlay, grants the Core to nobody and parks it at the
+		// centre. (There WAS a period where it rewrote None into DefaultKickoffTeam and handed the
+		// Core to Blue a second into the interval; that is fixed at the source, and the Core's
+		// out-of-play recovery is now also gated on ATraceGameState::IsHalfTimeBreak() so it cannot
+		// force a kickoff mid-break either.)
 		TheCore->KickoffTo(ETraceTeam::None);
 	}
 }

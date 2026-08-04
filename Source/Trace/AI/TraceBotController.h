@@ -34,7 +34,7 @@
 //    risk/reward loop in (2) — without someone waiting for it, passing would be free.
 //
 // 4. THE MOVEMENT KIT IS USED ON PURPOSE. Dash charges (two while carrying, and the second is held
-//    in reserve), slide, crouch fast-fall and boost each have a specific job, listed on
+//    in reserve), slide, crouch fast-fall and the unstick jump each have a specific job, listed on
 //    UpdateMovementTech(). None of them fire randomly.
 //
 // 5. SIDES SWITCH AT HALF TIME. GetAttackGoalLocation() no longer derives the attacking end from
@@ -210,7 +210,7 @@ protected:
 	/** Produces DesiredMoveDirection (and may raise a dash) for the current State. */
 	void UpdateMovementIntent(float DeltaSeconds);
 
-	/** Slide, crouch fast-fall, boost and jump. Runs every tick, after the behaviours. */
+	/** Slide, crouch fast-fall and the unstick jump. Runs every tick, after the behaviours. */
 	void UpdateMovementTech(float DeltaSeconds);
 
 	/** Aim, reaction delay, aim error, burst discipline and the trigger. Suppressed while carrying. */
@@ -455,8 +455,7 @@ private:
 	 */
 	bool bWantsDashThisTick = false;
 
-	/** Same ordering argument as the dash: a boost is a launch and wants this tick's heading. */
-	bool bWantsBoostThisTick = false;
+	/** Same ordering argument as the dash: a jump is a launch and wants this tick's heading. */
 	bool bWantsJumpThisTick = false;
 
 	// ------------------------------------------------------------------------------------------
@@ -533,9 +532,6 @@ private:
 	float SlideEndTime = 0.f;
 	float SlideReadyTime = 0.f;
 
-	/** World time the boost comes off cooldown. Bot-side mirror of the 12 s rule. */
-	float BoostReadyTime = 0.f;
-
 	/** Strafe handedness while duelling; flips on a timer so bots do not orbit predictably. */
 	float StrafeSign = 1.f;
 	float StrafeFlipTime = 0.f;
@@ -559,7 +555,7 @@ private:
 
 	// --- Steering -----------------------------------------------------------------------------
 
-	/** Seconds spent wanting to move but not moving. Drives the evade kick and the boost hop. */
+	/** Seconds spent wanting to move but not moving. Drives the evade kick and the unstick jump. */
 	float StuckSeconds = 0.f;
 
 	/** While world time < EvadeUntilTime, steering is overridden by EvadeDirection. */

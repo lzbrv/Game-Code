@@ -38,6 +38,179 @@ static TAutoConsoleVariable<int32> CVarTraceDebugHitZones(
 	TEXT("1: log the predicted vs server-resolved damage zone for every shot fired by a local player."),
 	ECVF_Default);
 
+// =================================================================================================
+// SHOT STATISTICS - the answer to "shooting feels WAY more inconsistent"
+//
+// The complaint is about FEEL, and feel is a distribution. Damage is head 100 / body 40 / legs 25
+// against 100 health, so the time to kill is 1, 3 or 4 rounds depending purely on which band a shot
+// lands in. If the bands sit where the player thinks they do, that reads as positional damage; if
+// they do not, it reads as the gun randomly deciding how much it feels like doing today - every
+// shot registering, none of them worth the same.
+//
+// So this accumulates, on the authority, for every shot the server accepts:
+//   * the zone histogram, which is the headline number,
+//   * WHERE on the body each shot landed as a fraction of the target's height, so the bands can be
+//     checked against where people actually aim rather than against an assumption,
+//   * the same shot re-classified at the ray's closest approach to the body axis instead of at the
+//     capsule entry point, which isolates one specific suspected defect,
+//   * predicted (client/shooter) vs authoritative (server) zone agreement - the 567/0 baseline,
+//   * how often the world trace truncated the shot, and how short.
+//
+// Off by default and one integer increment per shot when on. Bots fire constantly, so a 90 s match
+// is a few thousand samples, which is more than enough to see a skew.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarTraceShotStats(
+	TEXT("Trace.ShotStats"),
+	0,
+	TEXT("1: accumulate the hit-zone / impact-height distribution for every server-accepted shot. Trace.ShotStats.Dump prints it."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarTraceShotStatsInterval(
+	TEXT("Trace.ShotStats.Interval"),
+	20.f,
+	TEXT("Seconds between automatic Trace.ShotStats dumps. 0 disables the automatic dump."),
+	ECVF_Default);
+
+namespace TraceShotStats
+{
+	/** Height buckets, as twentieths of the target's full capsule height (0.05 = ~8.8 uu). */
+	constexpr int32 NumHeightBuckets = 20;
+
+	struct FStats
+	{
+		// --- what the local input path did ---
+		int32 LocalShotsFired = 0;
+		int32 RefusedCarrier = 0;
+		int32 RefusedDead = 0;
+
+		// --- what the server did with them ---
+		int32 ServerShotsAccepted = 0;
+		int32 ServerRejectedRate = 0;
+		int32 ServerRejectedState = 0;
+		int32 ServerRejectedPayload = 0;
+
+		// --- outcomes ---
+		int32 ZoneCount[4] = { 0, 0, 0, 0 };          // None / Head / Body / Legs
+		int32 AltZoneCount[4] = { 0, 0, 0, 0 };       // same, classified at closest approach
+		int32 ZoneReclassified = 0;                   // entry-point verdict != closest-approach verdict
+		int32 ReclassLegsToBody = 0;
+		int32 ReclassBodyToLegs = 0;
+
+		int32 HeightHistogram[NumHeightBuckets] = {};
+		double HeightFractionSum = 0.0;
+		int32 HeightSamples = 0;
+
+		// --- pose provenance ---
+		int32 VictimPoseRewound = 0;
+		int32 VictimPoseLive = 0;
+		int32 VictimNonStandingPosture = 0;           // PostureScale < 0.99, i.e. mid-slide
+		double PostureSum = 0.0;
+
+		// --- world geometry interaction ---
+		int32 WorldTruncated = 0;
+		int32 WorldStartPenetrating = 0;
+		int32 WorldTruncatedUnder200 = 0;
+
+		// --- predicted vs authoritative ---
+		int32 PredictionComparisons = 0;
+		int32 PredictionAgree = 0;
+		int32 PredictionZoneMismatch = 0;
+		int32 PredictionVictimMismatch = 0;
+
+		double LastDumpTime = 0.0;
+	};
+
+	static FStats GStats;
+
+	static void Reset()
+	{
+		const double Keep = GStats.LastDumpTime;
+		GStats = FStats();
+		GStats.LastDumpTime = Keep;
+	}
+
+	static float Percent(int32 Part, int32 Whole)
+	{
+		return (Whole > 0) ? (100.f * static_cast<float>(Part) / static_cast<float>(Whole)) : 0.f;
+	}
+
+	static void Dump()
+	{
+		const FStats& S = GStats;
+		const int32 Hits = S.ZoneCount[1] + S.ZoneCount[2] + S.ZoneCount[3];
+
+		UE_LOG(LogTraceGame, Display, TEXT("========== TRACE SHOT STATS =========="));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT input     : local fired %d | refused carrier %d, dead %d"),
+			S.LocalShotsFired, S.RefusedCarrier, S.RefusedDead);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT server    : accepted %d | rejected rate %d, state %d, payload %d"),
+			S.ServerShotsAccepted, S.ServerRejectedRate, S.ServerRejectedState, S.ServerRejectedPayload);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT outcome   : hits %d (%.1f%% of accepted) | misses %d"),
+			Hits, Percent(Hits, S.ServerShotsAccepted), S.ZoneCount[0]);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT ZONES     : HEAD %d (%.1f%%)  BODY %d (%.1f%%)  LEGS %d (%.1f%%)   [of %d hits]"),
+			S.ZoneCount[1], Percent(S.ZoneCount[1], Hits),
+			S.ZoneCount[2], Percent(S.ZoneCount[2], Hits),
+			S.ZoneCount[3], Percent(S.ZoneCount[3], Hits),
+			Hits);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT ZONES-alt : HEAD %d (%.1f%%)  BODY %d (%.1f%%)  LEGS %d (%.1f%%)   [classified at closest approach]"),
+			S.AltZoneCount[1], Percent(S.AltZoneCount[1], Hits),
+			S.AltZoneCount[2], Percent(S.AltZoneCount[2], Hits),
+			S.AltZoneCount[3], Percent(S.AltZoneCount[3], Hits));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT reclassify: %d of %d hits (%.1f%%) change tier | legs->body %d, body->legs %d"),
+			S.ZoneReclassified, Hits, Percent(S.ZoneReclassified, Hits),
+			S.ReclassLegsToBody, S.ReclassBodyToLegs);
+
+		if (S.HeightSamples > 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SHOTSTAT height    : mean impact at %.3f of body height (feet 0.00, crown 1.00). Hip band is at 0.46, head sphere centre 0.905."),
+				S.HeightFractionSum / static_cast<double>(S.HeightSamples));
+
+			FString Histogram;
+			for (int32 Bucket = 0; Bucket < NumHeightBuckets; ++Bucket)
+			{
+				Histogram += FString::Printf(TEXT("  %.2f-%.2f %5d (%4.1f%%)%s"),
+					Bucket / static_cast<float>(NumHeightBuckets),
+					(Bucket + 1) / static_cast<float>(NumHeightBuckets),
+					S.HeightHistogram[Bucket], Percent(S.HeightHistogram[Bucket], S.HeightSamples),
+					((Bucket % 4) == 3) ? TEXT("\n") : TEXT(""));
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("SHOTSTAT histogram (closest-approach height):\n%s"), *Histogram);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT pose      : rewound %d, live %d | mid-slide victims %d (%.1f%%), mean posture %.4f"),
+			S.VictimPoseRewound, S.VictimPoseLive, S.VictimNonStandingPosture,
+			Percent(S.VictimNonStandingPosture, Hits),
+			(Hits > 0) ? (S.PostureSum / Hits) : 1.0);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT world     : truncated %d (%.1f%%) | start-penetrating %d | truncated under 200uu %d"),
+			S.WorldTruncated, Percent(S.WorldTruncated, S.ServerShotsAccepted),
+			S.WorldStartPenetrating, S.WorldTruncatedUnder200);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SHOTSTAT predict   : %d compared | AGREE %d (%.2f%%) | zone mismatch %d | victim mismatch %d"),
+			S.PredictionComparisons, S.PredictionAgree, Percent(S.PredictionAgree, S.PredictionComparisons),
+			S.PredictionZoneMismatch, S.PredictionVictimMismatch);
+		UE_LOG(LogTraceGame, Display, TEXT("======================================"));
+	}
+} // namespace TraceShotStats
+
+static FAutoConsoleCommand GTraceShotStatsDumpCmd(
+	TEXT("Trace.ShotStats.Dump"),
+	TEXT("Prints the accumulated hit-zone / impact-height distribution gathered while Trace.ShotStats is 1."),
+	FConsoleCommandDelegate::CreateStatic([]() { TraceShotStats::Dump(); }));
+
+static FAutoConsoleCommand GTraceShotStatsResetCmd(
+	TEXT("Trace.ShotStats.Reset"),
+	TEXT("Clears the accumulated shot statistics."),
+	FConsoleCommandDelegate::CreateStatic([]() { TraceShotStats::Reset(); }));
+
 UTraceWeaponComponent::UTraceWeaponComponent()
 {
 	// Ticks only while the trigger is held on the machine that owns the input.
@@ -125,6 +298,15 @@ void UTraceWeaponComponent::StartFire()
 		UE_LOG(LogTraceGame, Verbose,
 			TEXT("[%s] Fire refused: carrying the Core (carriers trade the gun for bullet immunity)."),
 			*GetNameSafe(Character));
+
+		if (CVarTraceShotStats.GetValueOnGameThread() != 0)
+		{
+			++TraceShotStats::GStats.RefusedCarrier;
+		}
+	}
+	else if (!Character->IsAlive() && CVarTraceShotStats.GetValueOnGameThread() != 0)
+	{
+		++TraceShotStats::GStats.RefusedDead;
 	}
 
 	if (CanFire())
@@ -188,6 +370,11 @@ void UTraceWeaponComponent::FireOnce()
 	// rewinds to. Taking it before any of the work below keeps it honest.
 	const double FireServerTime = GetServerTimeSeconds();
 	LastLocalFireTime = GetLocalTimeSeconds();
+
+	if (CVarTraceShotStats.GetValueOnGameThread() != 0)
+	{
+		++TraceShotStats::GStats.LocalShotsFired;
+	}
 
 	const FVector Origin = Character->GetMuzzleLocation();
 	FVector Dir = Character->GetAimDirection().GetSafeNormal();
@@ -261,6 +448,107 @@ void UTraceWeaponComponent::PlayLocalTracer(const FVector& From, const FVector& 
 	ATraceTracer::Spawn(World, From, To, TraceTeamColor(Character->GetTeam()), bImpacted);
 }
 
+void UTraceWeaponComponent::AccumulateShotStats(ETraceHitZone ServerZone, const ATraceCharacter* Victim,
+	const FTraceHitscanDiagnostics& Diagnostics)
+{
+	TraceShotStats::FStats& S = TraceShotStats::GStats;
+
+	const int32 ZoneIndex = FMath::Clamp(static_cast<int32>(ServerZone), 0, 3);
+	++S.ZoneCount[ZoneIndex];
+
+	if (Diagnostics.bWorldTraceHit)
+	{
+		++S.WorldTruncated;
+		if (Diagnostics.bWorldStartPenetrating)
+		{
+			++S.WorldStartPenetrating;
+		}
+		if (Diagnostics.WorldHitDistance >= 0.0 && Diagnostics.WorldHitDistance < 200.0)
+		{
+			++S.WorldTruncatedUnder200;
+		}
+	}
+
+	if (Diagnostics.bHaveVictim)
+	{
+		const int32 AltIndex = FMath::Clamp(static_cast<int32>(Diagnostics.ZoneAtClosestApproach), 0, 3);
+		++S.AltZoneCount[AltIndex];
+
+		if (Diagnostics.ZoneAtClosestApproach != ServerZone)
+		{
+			++S.ZoneReclassified;
+			if (ServerZone == ETraceHitZone::Legs && Diagnostics.ZoneAtClosestApproach == ETraceHitZone::Body)
+			{
+				++S.ReclassLegsToBody;
+			}
+			else if (ServerZone == ETraceHitZone::Body && Diagnostics.ZoneAtClosestApproach == ETraceHitZone::Legs)
+			{
+				++S.ReclassBodyToLegs;
+			}
+		}
+
+		if (Diagnostics.ClosestHeightFraction >= 0.0)
+		{
+			const int32 Bucket = FMath::Clamp(
+				static_cast<int32>(Diagnostics.ClosestHeightFraction * TraceShotStats::NumHeightBuckets),
+				0, TraceShotStats::NumHeightBuckets - 1);
+			++S.HeightHistogram[Bucket];
+			S.HeightFractionSum += Diagnostics.ClosestHeightFraction;
+			++S.HeightSamples;
+		}
+
+		if (Diagnostics.bVictimPoseRewound)
+		{
+			++S.VictimPoseRewound;
+		}
+		else
+		{
+			++S.VictimPoseLive;
+		}
+
+		S.PostureSum += Diagnostics.VictimFrame.PostureScale;
+		if (Diagnostics.VictimFrame.PostureScale < 0.99)
+		{
+			++S.VictimNonStandingPosture;
+		}
+	}
+
+	// Predicted vs authoritative. Only meaningful when both halves ran here; a remote client's
+	// prediction lives in another process and cannot be compared from inside this one.
+	const ATraceCharacter* Shooter = GetTraceCharacter();
+	if (Shooter != nullptr && Shooter->IsLocallyControlled() && LastPredictedFireServerTime > 0.0)
+	{
+		++S.PredictionComparisons;
+		const bool bSameVictim = (LastPredictedVictim.Get() == Victim);
+		const bool bSameZone = (LastPredictedZone == ServerZone);
+		if (bSameVictim && bSameZone)
+		{
+			++S.PredictionAgree;
+		}
+		else
+		{
+			if (!bSameZone) { ++S.PredictionZoneMismatch; }
+			if (!bSameVictim) { ++S.PredictionVictimMismatch; }
+		}
+	}
+
+	// Automatic dump so a headless run needs no console at the end of it.
+	const float Interval = CVarTraceShotStatsInterval.GetValueOnGameThread();
+	if (Interval > 0.f)
+	{
+		const double Now = GetLocalTimeSeconds();
+		if (S.LastDumpTime <= 0.0)
+		{
+			S.LastDumpTime = Now;
+		}
+		else if ((Now - S.LastDumpTime) >= Interval)
+		{
+			S.LastDumpTime = Now;
+			TraceShotStats::Dump();
+		}
+	}
+}
+
 bool UTraceWeaponComponent::ServerFire_Validate(FVector_NetQuantize Origin, FVector_NetQuantizeNormal Direction, float ClientFireServerTime)
 {
 	// Validation failure disconnects the client, so only reject payloads that are outright
@@ -287,27 +575,33 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	}
 
 	// ---- payload sanity (never check() on network input) ---------------------------------
+	const bool bCollectStats = (CVarTraceShotStats.GetValueOnGameThread() != 0);
+
 	FVector Dir(Direction);
 	const double DirLengthSq = Dir.SizeSquared();
 	if (DirLengthSq < 0.25 || DirLengthSq > 4.0)
 	{
 		UE_LOG(LogTraceGame, Verbose, TEXT("ServerFire: rejecting non-unit direction from %s"), *GetNameSafe(OwnerActor));
+		if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedPayload; }
 		return;
 	}
 	Dir = Dir.GetSafeNormal();
 	if (Dir.IsNearlyZero())
 	{
+		if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedPayload; }
 		return;
 	}
 	if (FMath::Abs(Origin.X) > MaxReasonableCoordinateUU || FMath::Abs(Origin.Y) > MaxReasonableCoordinateUU || FMath::Abs(Origin.Z) > MaxReasonableCoordinateUU)
 	{
 		UE_LOG(LogTraceGame, Verbose, TEXT("ServerFire: rejecting out-of-world origin from %s"), *GetNameSafe(OwnerActor));
+		if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedPayload; }
 		return;
 	}
 
 	// ---- state gate ----------------------------------------------------------------------
 	if (!Character->IsAlive() || Character->IsCarrier())
 	{
+		if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedState; }
 		return;
 	}
 
@@ -320,9 +614,11 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	{
 		UE_LOG(LogTraceGame, Verbose, TEXT("ServerFire: rate-limited %s (%.3fs since last accepted)"),
 			*GetNameSafe(OwnerActor), LocalNow - LastAcceptedFireTime);
+		if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedRate; }
 		return;
 	}
 	LastAcceptedFireTime = LocalNow;
+	if (bCollectStats) { ++TraceShotStats::GStats.ServerShotsAccepted; }
 
 	// ---- rewind window -------------------------------------------------------------------
 	const double ServerNow = GetServerTimeSeconds();
@@ -359,6 +655,7 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	const float ShotRange = FMath::Max(1.f, Settings.HitscanRange);
 	FVector ImpactPoint = ShotOrigin + Dir * ShotRange;
 	ETraceHitZone Zone = ETraceHitZone::None;
+	FTraceHitscanDiagnostics Diagnostics;
 	ATraceCharacter* Victim = UTraceLagCompensationComponent::ResolveHitscan(
 		World,
 		Character,
@@ -367,7 +664,13 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 		ShotRange,
 		static_cast<float>(RewindTime),
 		ImpactPoint,
-		Zone);
+		Zone,
+		bCollectStats ? &Diagnostics : nullptr);
+
+	if (bCollectStats)
+	{
+		AccumulateShotStats(Zone, Victim, Diagnostics);
+	}
 
 	bool bKilled = false;
 	if (Victim != nullptr)

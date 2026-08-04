@@ -64,6 +64,58 @@ class UWorld;
  * the build, so the two paths cannot disagree about what a zone is - only about the pose, which is
  * what the rewind exists to reconcile.
  */
+/**
+ * Optional per-shot diagnostics filled in by ResolveHitscan().
+ *
+ * NOT gameplay. It exists because "shooting feels inconsistent" is an impression, and the only way
+ * to answer an impression is with a distribution. Every field here is something that was previously
+ * only knowable by reading the code and guessing:
+ *
+ *  - whether the world trace truncated the shot, and how short (a muzzle clipping cover would make
+ *    shots evaporate at point-blank range, which is exactly what "inconsistent near cover" means),
+ *  - the pose the shot was actually resolved against, and whether it came from rewound history or
+ *    from the live capsule,
+ *  - WHERE on the body the shot landed, as a fraction of the target's height, which is the only
+ *    honest way to sanity-check the zone bands against where players really aim, and
+ *  - what the zone WOULD have been had classification used the ray's closest approach to the body
+ *    axis instead of the capsule ENTRY point. The two differ on any shot that is not horizontal,
+ *    and the difference is a whole damage tier.
+ *
+ * Passing null (the default) costs one branch per shot.
+ */
+struct FTraceHitscanDiagnostics
+{
+	/** The live world trace stopped the ray on static geometry before it reached full range. */
+	bool bWorldTraceHit = false;
+
+	/** The muzzle started inside geometry. Chaos reports this with Distance 0. */
+	bool bWorldStartPenetrating = false;
+
+	/** Distance the world trace allowed, or -1 when the ray ran to full range. */
+	double WorldHitDistance = -1.0;
+
+	/** True when a character was hit and the fields below are meaningful. */
+	bool bHaveVictim = false;
+
+	/** The pose the winning target was resolved against. */
+	FTraceLagCompFrame VictimFrame;
+
+	/** True when VictimFrame came from recorded history rather than the live capsule. */
+	bool bVictimPoseRewound = false;
+
+	/** Height of the CAPSULE ENTRY point above the target's feet, over their full capsule height. */
+	double EntryHeightFraction = -1.0;
+
+	/** Same, for the ray's closest approach to the capsule axis. */
+	double ClosestHeightFraction = -1.0;
+
+	/** The zone the shot scored (entry-point classification - what the game actually used). */
+	ETraceHitZone Zone = ETraceHitZone::None;
+
+	/** The zone the same shot would have scored classified at closest approach. */
+	ETraceHitZone ZoneAtClosestApproach = ETraceHitZone::None;
+};
+
 UCLASS(ClassGroup = (Trace), meta = (BlueprintSpawnableComponent))
 class TRACE_API UTraceLagCompensationComponent : public UActorComponent
 {
@@ -118,7 +170,8 @@ public:
 		float Range,
 		float RewindToServerTime,
 		FVector& OutImpactPoint,
-		ETraceHitZone& OutZone);
+		ETraceHitZone& OutZone,
+		FTraceHitscanDiagnostics* OutDiagnostics = nullptr);
 
 private:
 	/**

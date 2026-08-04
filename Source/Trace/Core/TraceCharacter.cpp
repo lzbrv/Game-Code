@@ -9,6 +9,7 @@
 #include "Components/CapsuleComponent.h"
 #include "Containers/Ticker.h"                 // FTSTicker (debug console command below)
 #include "Engine/Engine.h"                     // GEngine (debug console command below)
+#include "EngineUtils.h"                       // TActorIterator (Trace.DebugAnimProbe)
 #include "HAL/IConsoleManager.h"               // FAutoConsoleCommand (debug console command below)
 #include "Components/PrimitiveComponent.h"      // EFirstPersonPrimitiveType (the viewmodel)
 #include "Components/SceneComponent.h"
@@ -25,15 +26,18 @@
 #include "Materials/MaterialInterface.h"
 #include "Math/RotationMatrix.h"
 #include "Misc/CommandLine.h"
+#include "Misc/PackageName.h"                  // DoesPackageExist (the character-art first-run check)
 #include "Misc/Parse.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
+
 
 #include "Core/TraceGameMode.h"
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceParry.h"                // the parry entry point and its queries (spec §3)
 #include "Gameplay/TraceTrailComponent.h"
 #include "Gameplay/TraceWeaponComponent.h"
 #include "Movement/TraceCharacterMovementComponent.h"
@@ -329,6 +333,197 @@ namespace TraceCharacterAssets
 		TEXT("Character art is not imported. Run Scripts/import-mannequin.sh to copy Epic's Mannequin ")
 		TEXT("out of your own UE 5.8 install into Content/Characters/Mannequins. ")
 		TEXT("Falling back to plain team-coloured shapes.");
+
+	/** The one command that fixes it. Quoted verbatim on screen and in the log, so nobody has to guess. */
+	const TCHAR* const ImportCommand = TEXT("./Scripts/import-mannequin.sh");
+}
+
+// =================================================================================================
+// Character art availability — the "why am I looking at capsules" answer
+// =================================================================================================
+//
+// A bug report arrived asking for the human character models that were already implemented. The
+// models were fine; the REPORTER'S MACHINE had never run Scripts/import-mannequin.sh, and the only
+// evidence of that was a single Warning line, emitted after the pawn had already spawned, in a log
+// that nobody reads while playtesting. The models are not the defect. The SILENT DEGRADE is.
+//
+// Three things therefore happen now, and all three are needed:
+//   1. the check runs BEFORE any pawn exists (VerifyCharacterArtInstalled, from ATraceHUD::BeginPlay),
+//      by asking the package store rather than by loading anything;
+//   2. it logs a boxed banner at Error verbosity — Warning has been suppressed in this project's
+//      logs before, and this is the one message that must survive that;
+//   3. the status is queryable, so ATraceHUD can keep a warning on screen for the whole session.
+namespace
+{
+	/** Process-wide, because the answer is a property of the INSTALL, not of any one pawn. */
+	ETraceCharacterArtStatus GCharacterArtStatus = ETraceCharacterArtStatus::Unknown;
+
+	/** So the banner is printed once per distinct status rather than once per pawn (ten per match). */
+	ETraceCharacterArtStatus GLoggedCharacterArtStatus = ETraceCharacterArtStatus::Unknown;
+
+	/** "/Game/.../SKM_Manny_Simple.SKM_Manny_Simple" -> "/Game/.../SKM_Manny_Simple". */
+	FString PackageNameOf(const TCHAR* ObjectPath)
+	{
+		return FPackageName::ObjectPathToPackageName(FString(ObjectPath));
+	}
+
+	/**
+	 * Records the status and, on a CHANGE, says so at a verbosity that cannot be missed.
+	 *
+	 * Error rather than Warning for the two broken states. That is not shouting for its own sake:
+	 * this project has twice concluded a working mechanic was dead because its log line was filtered,
+	 * and the whole purpose of this message is to be the thing that is still visible when everything
+	 * else has been turned down.
+	 */
+	void ReportCharacterArtStatus(ETraceCharacterArtStatus NewStatus)
+	{
+		GCharacterArtStatus = NewStatus;
+		if (GLoggedCharacterArtStatus == NewStatus)
+		{
+			return;
+		}
+		GLoggedCharacterArtStatus = NewStatus;
+
+		switch (NewStatus)
+		{
+		case ETraceCharacterArtStatus::Ok:
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CharacterArt] OK — %s and %s both resolved. Characters are Epic's Mannequin with ")
+				TEXT("head, limbs and the ABP_Unarmed run cycle."),
+				TraceCharacterAssets::MannequinMesh, TraceCharacterAssets::UnarmedAnimClass);
+			break;
+
+		case ETraceCharacterArtStatus::MeshMissing:
+			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
+			UE_LOG(LogTraceGame, Error, TEXT("  CHARACTER ART IS NOT INSTALLED ON THIS MACHINE."));
+			UE_LOG(LogTraceGame, Error, TEXT("  Every player will be drawn as a coloured capsule with a ball"));
+			UE_LOG(LogTraceGame, Error, TEXT("  for a head, with NO running animation. This is a missing"));
+			UE_LOG(LogTraceGame, Error, TEXT("  import, NOT the intended look of the game."));
+			UE_LOG(LogTraceGame, Error, TEXT(""));
+			UE_LOG(LogTraceGame, Error, TEXT("  FIX IT WITH ONE COMMAND, from the project root:"));
+			UE_LOG(LogTraceGame, Error, TEXT("      %s"), TraceCharacterAssets::ImportCommand);
+			UE_LOG(LogTraceGame, Error, TEXT(""));
+			UE_LOG(LogTraceGame, Error, TEXT("  It copies Epic's Mannequin out of YOUR OWN UE 5.8 install into"));
+			UE_LOG(LogTraceGame, Error, TEXT("  Content/Characters/Mannequins. The art is gitignored on"));
+			UE_LOG(LogTraceGame, Error, TEXT("  purpose (126 MB of binaries), so a fresh clone always needs"));
+			UE_LOG(LogTraceGame, Error, TEXT("  this once. Missing package: %s"), *PackageNameOf(TraceCharacterAssets::MannequinMesh));
+			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
+			break;
+
+		case ETraceCharacterArtStatus::AnimMissing:
+			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
+			UE_LOG(LogTraceGame, Error, TEXT("  CHARACTER ART IS ONLY HALF INSTALLED."));
+			UE_LOG(LogTraceGame, Error, TEXT("  The Mannequin mesh loaded but %s did not, so characters will"), TraceCharacterAssets::UnarmedAnimClass);
+			UE_LOG(LogTraceGame, Error, TEXT("  stand in a fixed pose and never run."));
+			UE_LOG(LogTraceGame, Error, TEXT("  FIX:  %s --force"), TraceCharacterAssets::ImportCommand);
+			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
+			break;
+
+		case ETraceCharacterArtStatus::DisabledByCommandLine:
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CharacterArt] -TraceNoCharacterArt: the fallback primitives are being shown ON PURPOSE. ")
+				TEXT("Relaunch without the switch for the Mannequin."));
+			break;
+
+		case ETraceCharacterArtStatus::NotRequired:
+			UE_LOG(LogTraceGame, Display, TEXT("[CharacterArt] Dedicated server: no character art is loaded or needed."));
+			break;
+
+		default:
+			break;
+		}
+	}
+}
+
+void ATraceCharacter::VerifyCharacterArtInstalled()
+{
+	// Idempotent: the first caller decides, everybody after it is free. SetupCharacterVisuals() may
+	// have got here first with a definitive answer (it actually tried to LOAD the assets, which beats
+	// a package-store lookup), and must not be second-guessed by a cheaper test.
+	if (GCharacterArtStatus != ETraceCharacterArtStatus::Unknown)
+	{
+		return;
+	}
+
+	if (IsRunningDedicatedServer())
+	{
+		ReportCharacterArtStatus(ETraceCharacterArtStatus::NotRequired);
+		return;
+	}
+
+	if (FParse::Param(FCommandLine::Get(), TEXT("TraceNoCharacterArt")))
+	{
+		ReportCharacterArtStatus(ETraceCharacterArtStatus::DisabledByCommandLine);
+		return;
+	}
+
+	// DoesPackageExist, not LoadObject: this runs during BeginPlay on the HUD, before the match has
+	// drawn a frame, and the whole point is to answer the question without paying 126 MB for it.
+	// Works in a cooked build too — the package store knows what was cooked in.
+	const bool bMeshPresent = FPackageName::DoesPackageExist(PackageNameOf(TraceCharacterAssets::MannequinMesh));
+	const bool bAnimPresent = FPackageName::DoesPackageExist(PackageNameOf(TraceCharacterAssets::UnarmedAnimClass));
+
+	if (!bMeshPresent)
+	{
+		ReportCharacterArtStatus(ETraceCharacterArtStatus::MeshMissing);
+	}
+	else if (!bAnimPresent)
+	{
+		ReportCharacterArtStatus(ETraceCharacterArtStatus::AnimMissing);
+	}
+	else
+	{
+		// Deliberately NOT reported as Ok here. Both packages exist, but "exists" is not "loads and
+		// has a skeleton": SetupCharacterVisuals() is the only thing that knows that, and it will set
+		// the real status the moment the first pawn is dressed. Leaving it Unknown keeps the on-screen
+		// warning off (Unknown is not a warned state) without claiming a success nobody has verified.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CharacterArt] Pre-flight OK: both Mannequin packages are present on disk. ")
+			TEXT("Confirming on the first spawned character."));
+	}
+}
+
+ETraceCharacterArtStatus ATraceCharacter::GetCharacterArtStatus()
+{
+	if (GCharacterArtStatus == ETraceCharacterArtStatus::Unknown)
+	{
+		VerifyCharacterArtInstalled();
+	}
+	return GCharacterArtStatus;
+}
+
+bool ATraceCharacter::GetCharacterArtWarning(FString& OutHeadline, FString& OutDetail)
+{
+	switch (GetCharacterArtStatus())
+	{
+	case ETraceCharacterArtStatus::MeshMissing:
+		OutHeadline = TEXT("CHARACTER ART NOT INSTALLED");
+		OutDetail = FString::Printf(TEXT("Players are placeholder shapes. Run  %s  from the project root, then relaunch."),
+			TraceCharacterAssets::ImportCommand);
+		return true;
+
+	case ETraceCharacterArtStatus::AnimMissing:
+		OutHeadline = TEXT("CHARACTER ANIMATIONS NOT INSTALLED");
+		OutDetail = FString::Printf(TEXT("Players are posed but never move. Run  %s --force, then relaunch."),
+			TraceCharacterAssets::ImportCommand);
+		return true;
+
+	case ETraceCharacterArtStatus::DisabledByCommandLine:
+		// WARNED TOO, and that is the whole reason -TraceNoCharacterArt exists. The switch is there so
+		// the fallback branch can be exercised on a machine where the import HAS been run; if it
+		// exercised everything about the fallback EXCEPT the warning, the warning would be the one
+		// part of this fix that no automated run could ever photograph. Different wording, so nobody
+		// mistakes a deliberate test for a broken install.
+		OutHeadline = TEXT("CHARACTER ART DISABLED (-TraceNoCharacterArt)");
+		OutDetail = TEXT("This is the simulated missing-import state. Relaunch without the switch for the Mannequin.");
+		return true;
+
+	default:
+		// Ok, Unknown and NotRequired draw nothing.
+		OutHeadline.Reset();
+		OutDetail.Reset();
+		return false;
+	}
 }
 
 namespace
@@ -703,6 +898,7 @@ void ATraceCharacter::SetupCharacterVisuals()
 	// tests against, is unaffected either way.
 	if (IsRunningDedicatedServer())
 	{
+		ReportCharacterArtStatus(ETraceCharacterArtStatus::NotRequired);
 		MeshComp->SetVisibility(false);
 		return;
 	}
@@ -722,8 +918,14 @@ void ATraceCharacter::SetupCharacterVisuals()
 	if (LoadedMesh == nullptr)
 	{
 		// The whole point of the soft reference. No crash, no invisible player: show the primitives
-		// and say exactly what to run. Warned once per process rather than once per pawn, because
-		// ten identical screenfuls of this would bury everything else in the log.
+		// and say exactly what to run. Banner-logged once per process rather than once per pawn,
+		// because ten identical screenfuls of this would bury everything else in the log — and
+		// mirrored onto the HUD by ATraceHUD::DrawArtWarning(), because a log line demonstrably was
+		// not enough (this is the bug that got reported as "the character models were not replaced").
+		ReportCharacterArtStatus(bForceNoArt
+			? ETraceCharacterArtStatus::DisabledByCommandLine
+			: ETraceCharacterArtStatus::MeshMissing);
+
 		static bool bWarnedMissingMesh = false;
 		if (!bWarnedMissingMesh)
 		{
@@ -757,9 +959,17 @@ void ATraceCharacter::SetupCharacterVisuals()
 	{
 		MeshComp->SetAnimationMode(EAnimationMode::AnimationBlueprint);
 		MeshComp->SetAnimInstanceClass(LoadedAnimClass);
+
+		// The ONLY place in the codebase that can honestly say the art is fine: both objects loaded,
+		// the mesh is attached and the anim blueprint is instanced. Everything else is a prediction.
+		ReportCharacterArtStatus(ETraceCharacterArtStatus::Ok);
 	}
 	else
 	{
+		ReportCharacterArtStatus(bForceNoArt
+			? ETraceCharacterArtStatus::DisabledByCommandLine
+			: ETraceCharacterArtStatus::AnimMissing);
+
 		static bool bWarnedMissingAnim = false;
 		if (!bWarnedMissingAnim)
 		{
@@ -1043,12 +1253,25 @@ void ATraceCharacter::SetCarrying(bool bNewCarrying)
 
 	bIsCarrier = bNewCarrying;
 
-	// ATraceCore drives the PlayerState mirror and the trail as well. Doing it here too keeps the
-	// pawn internally consistent for any other caller, and both writes are idempotent — the trail
-	// component early-outs when the emitting state is unchanged.
+	// THIS IS THE SOLE WRITER of ATracePlayerState::bIsCarrier for a pawn that still exists.
+	//
+	// It used to be one of FOUR: ATraceCore::GrantTo, ATraceCore::ReleaseHolder and
+	// ATraceGameMode::NotifyCharacterDied all wrote the mirror too, and every one of them also called
+	// SetCarrying — so three of the four writes were pure duplication, and duplicated state with
+	// scattered writers is what the whole-project audit named as the most likely source of the next
+	// bug. Those three are gone. If you find yourself adding a fourth, the answer is to call
+	// SetCarrying() instead.
+	//
+	// The ONE case this cannot cover is a holder whose pawn has already been destroyed: the
+	// PlayerState outlives the pawn, so there is no pawn left to call. ATraceCore caches the holder's
+	// PlayerState at grant time and clears it in ReleaseHolder() for exactly that case — see the
+	// comment there. Do not re-add a write here to "fix" it; a destroyed pawn cannot reach this line.
 	if (ATracePlayerState* State = GetPlayerState<ATracePlayerState>())
 	{
 		State->bIsCarrier = bNewCarrying;
+		// The scoreboard reads this on every client; without a nudge it waits for the PlayerState's
+		// ordinary replication interval, which is long enough to be seen as a wrong scoreboard.
+		State->ForceNetUpdate();
 	}
 
 	if (Trail != nullptr)
@@ -2173,11 +2396,6 @@ void ATraceCharacter::DoPassReleased()
 	}
 }
 
-void ATraceCharacter::DoPass()
-{
-	DoPassPressed();
-}
-
 float ATraceCharacter::GetPassProgress() const
 {
 	// Negative means "no pass in progress" — the HUD's contract, see the header. Only the holder
@@ -2221,57 +2439,20 @@ float ATraceCharacter::GetHitZonePostureScale() const
 	return FMath::Clamp(CurrentAboveFeet / StandingAboveFeet, 0.5f, 1.f);
 }
 
-void ATraceCharacter::ServerPass_Implementation(FVector_NetQuantizeNormal Direction)
-{
-	// Rate limit before anything else. This is a reliable server RPC with no cooldown of its own, so
-	// a modified or looping client could otherwise burn a reliable slot every frame. PerformPass is
-	// what actually gates the pass; this only bounds the cost of the rejected calls.
-	const UWorld* World = GetWorld();
-	if (World == nullptr)
-	{
-		return;
-	}
-	const float Now = World->GetTimeSeconds();
-	if ((Now - LastPassRequestTime) < MinPassRequestInterval)
-	{
-		return;
-	}
-	LastPassRequestTime = Now;
-
-	// Network input: validate, never check() (contract §10). A quantised normal can arrive as zero
-	// or non-finite from a malformed or malicious client.
-	const FVector Requested(Direction);
-	if (Requested.ContainsNaN() || Requested.IsNearlyZero())
-	{
-		return;
-	}
-
-	PerformPass(Requested);
-}
-
-void ATraceCharacter::PerformPass(const FVector& Direction)
-{
-	// LEGACY. Nothing routes here any more: the pass is a held hover evaluated entirely on the
-	// server from the holder's own aim (ATraceCore::ServerTickPass), and the direction a client
-	// sends is exactly the thing the server is not allowed to trust. Kept because ServerPass is a
-	// declared RPC and an old client build could still call it; re-expressed as "the holder input a
-	// pass", which the Core will then validate against the aim it can see for itself.
-	if (!HasAuthority() || !bIsCarrier)
-	{
-		return;
-	}
-
-	ATraceCore* TheCore = ATraceCore::Get(GetWorld());
-
-	// The Core is the authority on who is holding it. bIsCarrier is a mirror, and a stale mirror
-	// must not be able to move a Core somebody else is carrying.
-	if (TheCore == nullptr || TheCore->GetCarrier() != this)
-	{
-		return;
-	}
-
-	TheCore->RequestPassInput(true, this);
-}
+// DELETED THIS PASS: ServerPass / PerformPass / DoPass.
+//
+// All three were legacy and all three had ZERO callers. The pass has been a held hover evaluated
+// entirely on the server from the holder's own aim (ATraceCore::ServerTickPass) for two passes now;
+// the direction a client sends is precisely the thing the server must not trust, so PerformPass's
+// whole payload was unusable. DoPass() was a one-line alias for DoPassPressed().
+//
+// ServerPass was kept "in case an old client build calls it". There are no shipped clients, and a
+// declared reliable server RPC with no callers is a surface a modified client can burn a reliable
+// slot on every frame — rate-limited, so not a hole, but cost for nothing. The rate limiter
+// (LastPassRequestTime / MinPassRequestInterval) went with it.
+//
+// The live path is DoPassPressed / DoPassReleased -> ATraceCore::RequestPassInput, which has its own
+// server RPC (ATraceCore::ServerSetPassInput) that re-enters the same validation. One door.
 
 void ATraceCharacter::DoDash()
 {
@@ -2289,21 +2470,59 @@ void ATraceCharacter::DoDash()
 	}
 }
 
-void ATraceCharacter::DoBoost()
-{
-	if (!IsAlive())
-	{
-		return;
-	}
+// BOOST IS GONE (spec §1: "remove boost from the game entirely"). ATraceCharacter::DoBoost() used to
+// live here and forwarded to UTraceCharacterMovementComponent::StartBoost(). It was deleted with the
+// rest of the feature; see the report for the two callers outside this file that must go with it
+// (ATracePlayerController::OnBoostStarted and the IA_Boost binding).
 
-	if (UTraceCharacterMovementComponent* Movement = GetTraceMovement())
-	{
-		// Same prediction story as the dash: StartBoost() raises a flag that the next saved move packs
-		// into FLAG_Custom_1, so there is no RPC and the server reproduces it from the ServerMove.
-		// The "ground only" and 12s cooldown rules live in the movement component, where the
-		// authoritative movement mode is, not here.
-		Movement->StartBoost();
-	}
+// =================================================================================================
+// Parry (spec §3) — input routing only
+// =================================================================================================
+//
+// THE MECHANIC IS NOT HERE AND MUST NOT MOVE HERE. Gameplay/TraceParry.h is the policy and entry
+// point (duration, cooldown, refusal reasons, the red tint) and UTraceTrailComponent owns the
+// window itself, because trace invulnerability and trace colour are already its two jobs and the
+// pass window's invulnerability already lives beside it — the two compose there by OR instead of
+// fighting over a flag on the pawn. This function is the pawn-side doorway and nothing more.
+//
+// TraceParry::RequestParry() is documented as "THE ONE ENTRY POINT. Wire the parry bind, the bots
+// and any debug command to this", and it is safe from any machine: it refuses non-carriers, refuses
+// a cooldown, predicts the red tint on the owning client and sends the server RPC itself. So there
+// is deliberately NO ServerParry RPC on this class — a second path to the same window is how the
+// prediction and the authoritative window end up disagreeing.
+
+void ATraceCharacter::DoParryPressed()
+{
+	// Every rule (carrier-only, cooldown, death) belongs to TraceParry::RequestParry, which reports
+	// them through ETraceParryRefusal. Duplicating any of them here would give the mechanic two
+	// policies to keep in step; the ONE thing checked locally is that there is a pawn to parry with,
+	// and RequestParry treats even a null pawn as a refusal rather than a crash.
+	ETraceParryRefusal Refusal = ETraceParryRefusal::None;
+	TraceParry::RequestParry(this, &Refusal);
+
+	// Verbose and refusal-only: a non-carrier holding the key is the normal case, not an error, and
+	// with ten pawns in a match a Display line per press would be per-frame noise. Trace.DebugParry
+	// (Gameplay/TraceParry.cpp) is the loud diagnostic when one is actually wanted.
+	UE_LOG(LogTraceGame, Verbose, TEXT("[%s] parry input: %s"), *GetName(), LexToString(Refusal));
+}
+
+void ATraceCharacter::DoParryReleased()
+{
+	// Intentionally empty — see the header. Parry is a tap; the window length is TraceParry's and
+	// holding the key must not extend it.
+}
+
+bool ATraceCharacter::IsParryActive() const
+{
+	return TraceParry::IsParryActiveFor(this);
+}
+
+bool ATraceCharacter::GetParryHudState(float& OutRemaining, float& OutTotal, bool& bOutActive) const
+{
+	OutRemaining = FMath::Max(0.f, TraceParry::GetCooldownRemainingFor(this));
+	OutTotal = FMath::Max(KINDA_SMALL_NUMBER, TraceParry::GetCooldownTotal());
+	bOutActive = TraceParry::IsParryActiveFor(this);
+	return true;
 }
 
 // =================================================================================================
@@ -2447,6 +2666,164 @@ namespace
 						TraceChar->IsViewModelVisible() ? 1 : 0);
 
 					return (++Emitted < Samples);
+				}),
+				0.f);
+		}));
+
+	/**
+	 * Trace.DebugAnimProbe [Seconds] [SampleInterval]
+	 *
+	 * "ARE THE CHARACTERS ACTUALLY ANIMATING?" — answered with a measurement instead of an opinion.
+	 *
+	 * A screenshot cannot tell a T-pose from a run cycle caught at its neutral frame, and it
+	 * certainly cannot tell an idle loop from a run loop. Both of those failures have a specific,
+	 * plausible cause in this project: the art is imported per developer (see the file header), so
+	 * a machine can have SKM_Manny_Simple present and ABP_Unarmed absent, which renders a perfectly
+	 * good-looking, perfectly motionless human.
+	 *
+	 * So this samples the actual POSE. It watches foot_l and hand_r in COMPONENT space — component,
+	 * not world, so walking the actor across the pitch contributes nothing and only the animation
+	 * can move them — and reports the travel of each. The pass/fail is unambiguous:
+	 *
+	 *     range ~0 uu  -> no anim instance, or a single static frame (T-pose / bind pose)
+	 *     range >10 uu -> limbs are being posed; a Manny run cycle swings a foot ~60-90 uu
+	 *
+	 * It prefers whichever character is actually MOVING, because an idle pose legitimately barely
+	 * moves the feet and would read as a failure. Display verbosity throughout: this is a diagnostic
+	 * whose whole job is to be readable in a log somebody is already looking at.
+	 */
+	FAutoConsoleCommand CmdDebugAnimProbe(
+		TEXT("Trace.DebugAnimProbe"),
+		TEXT("Trace.DebugAnimProbe [Seconds] [SampleInterval] — measure whether the character anim blueprint is really posing limbs."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Seconds = (Args.Num() > 0) ? FMath::Max(0.5f, FCString::Atof(*Args[0])) : 6.f;
+			const float Interval = (Args.Num() > 1) ? FMath::Max(0.02f, FCString::Atof(*Args[1])) : 0.1f;
+
+			// Armed-line at Display, for the same reason every other diagnostic in this file has one:
+			// a probe that prints nothing is indistinguishable from a probe that never ran, and this
+			// one is deliberately silent until it has an answer.
+			UE_LOG(LogTraceGame, Display, TEXT("[AnimProbe] armed: sampling for %.1fs every %.2fs."), Seconds, Interval);
+
+			// Captured by value into the ticker; the lambda outlives this scope by design.
+			double Elapsed = 0.0;
+			double FirstSampleTime = -1.0;
+			double LastSampleTime = -1.0e9;
+			FBox FootBounds(ForceInit);
+			FBox HandBounds(ForceInit);
+			int32 Samples = 0;
+			float FastestSpeed = 0.f;
+			FString SubjectName;
+			FString AnimClassName(TEXT("<none>"));
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda(
+					[Elapsed, FirstSampleTime, LastSampleTime, FootBounds, HandBounds, Samples, FastestSpeed, SubjectName, AnimClassName, Seconds, Interval](float DeltaTime) mutable -> bool
+				{
+					Elapsed += DeltaTime;
+
+					// EVERY-FRAME TICKER, sampled on our own clock. Registering with a non-zero ticker
+					// period was measured NOT to fire in this project's -ExecCmds path at all (the probe
+					// armed and then never ran once), while every other debug command here registers at
+					// 0 and works. So: tick every frame, and decide here whether this frame is a sample.
+					const bool bSampleThisFrame = (Elapsed - LastSampleTime) >= Interval;
+					if (!bSampleThisFrame)
+					{
+						return true;
+					}
+					LastSampleTime = Elapsed;
+
+					UWorld* World = FindDebugGameWorld();
+					if (World == nullptr)
+					{
+						return (Elapsed < Seconds);
+					}
+
+					// Whoever is moving fastest right now. An idle Manny's feet are planted, so probing
+					// a standing player would measure "no animation" on a perfectly healthy build.
+					ATraceCharacter* Subject = nullptr;
+					float BestSpeed = -1.f;
+					for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+					{
+						ATraceCharacter* Candidate = *It;
+						if (Candidate == nullptr || !Candidate->IsAlive() || Candidate->GetMesh() == nullptr)
+						{
+							continue;
+						}
+						const float Speed = Candidate->GetVelocity().Size2D();
+						if (Speed > BestSpeed)
+						{
+							BestSpeed = Speed;
+							Subject = Candidate;
+						}
+					}
+
+					if (Subject != nullptr)
+					{
+						USkeletalMeshComponent* MeshComp = Subject->GetMesh();
+						FastestSpeed = FMath::Max(FastestSpeed, BestSpeed);
+						SubjectName = Subject->GetName();
+
+						const UAnimInstance* AnimInstance = MeshComp->GetAnimInstance();
+						AnimClassName = (AnimInstance != nullptr) ? AnimInstance->GetClass()->GetName() : FString(TEXT("<none>"));
+
+						// Component space: the actor's own travel across the pitch cannot contribute, so
+						// anything this measures came from the animation and nothing else.
+						if (MeshComp->GetSkinnedAsset() != nullptr)
+						{
+							FootBounds += MeshComp->GetSocketTransform(TEXT("foot_l"), RTS_Component).GetLocation();
+							HandBounds += MeshComp->GetSocketTransform(TEXT("hand_r"), RTS_Component).GetLocation();
+							if (Samples == 0)
+							{
+								FirstSampleTime = Elapsed;
+							}
+							++Samples;
+						}
+					}
+
+					// THE SAMPLING WINDOW STARTS AT THE FIRST CHARACTER, NOT AT THE COMMAND.
+					//
+					// Measured the hard way: -ExecCmds fires at engine init, the menu map and the level
+					// travel then take 15-30s on a loaded machine, and a 14s window had closed before a
+					// single pawn existed — the probe honestly reported "NOT ANIMATING" about an empty
+					// world. A diagnostic that can produce a false failure is worse than none, so the
+					// clock does not start until there is somebody to watch.
+					if (Samples == 0)
+					{
+						if (Elapsed < (Seconds + 30.0))
+						{
+							return true;
+						}
+
+						// Absolute stop, and it SAYS SO. A probe that quietly gives up is how a run
+						// gets read as "the feature is fine, nothing was reported".
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[AnimProbe] gave up after %.0fs: no living character with a skeletal mesh ever ")
+							TEXT("appeared. On a machine without the art import that is EXPECTED — the pawns are ")
+							TEXT("fallback primitives; see the [CharacterArt] line above."), Elapsed);
+						return false;
+					}
+
+					if (Elapsed < (FirstSampleTime + Seconds))
+					{
+						return true;
+					}
+
+					const FVector FootTravel = (Samples > 0) ? FootBounds.GetSize() : FVector::ZeroVector;
+					const FVector HandTravel = (Samples > 0) ? HandBounds.GetSize() : FVector::ZeroVector;
+					const float FootRange = static_cast<float>(FootTravel.GetMax());
+					const float HandRange = static_cast<float>(HandTravel.GetMax());
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[AnimProbe] subject=%s animClass=%s samples=%d peakSpeed=%.0fuu/s ")
+						TEXT("foot_l travel=%.1fuu hand_r travel=%.1fuu -> %s"),
+						SubjectName.IsEmpty() ? TEXT("<none>") : *SubjectName, *AnimClassName, Samples, FastestSpeed,
+						FootRange, HandRange,
+						(FootRange > 10.f || HandRange > 10.f)
+							? TEXT("ANIMATING (limbs are being posed)")
+							: TEXT("NOT ANIMATING (static pose — check the anim blueprint / the art import)"));
+
+					return false;
 				}),
 				0.f);
 		}));

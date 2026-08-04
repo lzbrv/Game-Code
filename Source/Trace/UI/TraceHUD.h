@@ -54,18 +54,34 @@ protected:
 	 */
 	void UpdateReticleAnchor();
 
-	/** The crosshair. Present in BOTH camera modes; see the long note in the .cpp. */
+	/**
+	 * The crosshair. ALWAYS AT SCREEN CENTRE, in both camera modes — read the long note in the .cpp
+	 * before changing that, it is a twice-reported bug ("there's still no crosshair in third person")
+	 * and the previous fix failed because the reticle was drawn on the pass ray, ~30px below centre.
+	 */
 	void DrawCrosshair();
 
-	/** First-person aim reticle: cross plus centre dot, pixel-snapped, at @p CX,@p CY. */
-	void DrawAimReticle(float CX, float CY, float Visibility);
+	/**
+	 * The centre crosshair itself: four arms plus a centre dot, pixel-snapped, at @p CX,@p CY.
+	 *
+	 * @param Scale     1.0 in first person, ThirdPersonCrosshairScale in third.
+	 * @param InkColor  fill colour; its alpha is multiplied by @p Visibility.
+	 */
+	void DrawAimReticle(float CX, float CY, float Visibility, float Scale, const FLinearColor& InkColor);
 
 	/**
-	 * Third-person PASS reticle: a bracket frame that closes and takes the team colour when it is
-	 * over a teammate you could actually pass to. Drawn at the projected pass ray, not at screen
-	 * centre — see DrawPassReticle() for why those are not the same point in third person.
+	 * The third-person PASS state, LAYERED ON the centre crosshair rather than replacing it: corner
+	 * brackets concentric with it that close and take the team colour over a legal receiver, plus a
+	 * small subordinate diamond at the projected pass ray (which is genuinely not screen centre in
+	 * third person — see the note in the .cpp).
 	 */
 	void DrawPassReticle(float Visibility);
+
+	/**
+	 * The persistent "character art was never imported" warning, and the reason it exists at all —
+	 * see the note in the .cpp. Draws nothing when the Mannequin is present.
+	 */
+	void DrawArtWarning();
 
 	/**
 	 * The 0.5s pass hold (spec §4), drawn as a ring closing around the reticle.
@@ -79,7 +95,7 @@ protected:
 
 	void DrawHitMarker();
 
-	/** Health, dash CHARGES and the boost cooldown: the bottom-left ability stack. */
+	/** Health, dash CHARGES and the parry cooldown: the bottom-left ability stack. (Boost is gone.) */
 	void DrawHealthAndDash();
 
 	void DrawScoresAndClock();
@@ -251,7 +267,7 @@ private:
 
 	/**
 	 * One Display line on the first draw naming which of the not-yet-landed mechanics this build
-	 * actually has. Without it, a missing boost meter is indistinguishable from a broken one — and
+	 * actually has. Without it, a missing parry meter is indistinguishable from a broken one — and
 	 * this project has twice lost time to a mechanic that was merely quiet rather than dead.
 	 */
 	void LogAffordanceAvailabilityOnce();

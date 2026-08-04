@@ -123,7 +123,7 @@ UTraceSettings::UTraceSettings(const FObjectInitializer& ObjectInitializer)
 	// ENGAGEMENT RANGE AND THE ARENA THAT TRIPLED IN SIZE
 	//
 	// Every MaxEngagementRange below is also raised. These were tuned against an 8000 x 4000 field,
-	// where 3000uu is most of the pitch; on 24000 x 12000 it is close quarters. Measured with the
+	// where 3000uu is most of the pitch; on 24000 x 9600 it is close quarters. Measured with the
 	// player walked up the field, bots had them inside SightRange for 69.7% of bot-ticks but inside
 	// MaxEngagementRange with line of sight for 16.0% — they could see the player fine and simply
 	// were not allowed to shoot. Meanwhile HitscanRange is 28000, so the player could shoot back
@@ -548,18 +548,43 @@ namespace
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[SettingsDump:%s] WalkSpeed=%.1f DashSpeed=%.1f DashDuration=%.3f DashCooldown=%.2f "
-			     "FireInterval=%.3f BoostZVelocity=%.1f TrailLifetime=%.2f (trail component uses %.2fs)"),
+			     "FireInterval=%.3f TrailLifetime=%.2f (trail component uses %.2fs)"),
 			Tag, Table.WalkSpeed, Table.DashSpeed, Table.DashDuration, Table.DashCooldown,
-			Table.FireInterval, Table.BoostZVelocity, Table.TrailLifetime,
+			Table.FireInterval, Table.TrailLifetime,
 			UTraceTrailComponent::GetTraceLifetimeSeconds());
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[SettingsDump:%s] Slide dur=%.2f decel=%.0f maxSpeed=%.0f entryFrac=%.2f mult=%.2f "
-			     "exitFrac=%.2f cooldown=%.2f minCommit=%.2f exitRetention=%.2f exitFloor=%.2f exitCeil=%.2f"),
+			     "impulse=%.0f exitFrac=%.2f cooldown=%.2f minCommit=%.2f exitRetention=%.2f exitFloor=%.2f exitCeil=%.2f"),
 			Tag, Table.SlideDuration, Table.SlideDeceleration, Table.SlideMaxSpeed,
-			Table.SlideEntrySpeedFraction, Table.SlideSpeedMultiplier, Table.SlideExitSpeedFraction,
-			Table.SlideCooldown, Table.SlideMinCommitSeconds, Table.SlideExitSpeedRetention,
+			Table.SlideEntrySpeedFraction, Table.SlideEntrySpeedMultiplier, Table.SlideImpulse,
+			Table.SlideExitSpeedFraction,
+			Table.SlideCooldownSeconds, Table.SlideMinCommitSeconds, Table.SlideExitSpeedRetention,
 			Table.SlideExitMinSpeedFraction, Table.SlideExitMaxSpeedMultiplier);
+
+		// Spec v3 §2: the air/landing block is the new movement model, so it dumps next to the
+		// slide rather than being something you have to open Project Settings to read back.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] Air src=%d wishCap=%.0f accel=%.0f maxAirSpeed=%.0f friction=%.2f control=%.2f | "
+			     "Landing preserve=%d overspeed friction=%.2f braking=%.0f turn=%.0f | dashExit=%.2f"),
+			Tag, Table.bSourceAirAcceleration ? 1 : 0, Table.AirMaxWishSpeed, Table.AirAcceleration,
+			Table.MaxAirSpeed, Table.AirFriction, Table.AirControl,
+			Table.bPreserveLandingMomentum ? 1 : 0, Table.GroundOverspeedFriction,
+			Table.GroundOverspeedBraking, Table.GroundOverspeedTurnRate, Table.DashExitSpeedMultiplier);
+
+		// Spec v3 §3 and §4. The pass numbers were compile-time constants in TraceCore.cpp until
+		// this pass, which is precisely why "passing is inconsistent" could not be answered by
+		// reading a value back at runtime.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] Pass hold=%.2f cooldown=%.2f cancelCooldown=%.2f range=%.0f "
+			     "cone=%.1fdeg slack=%.0f grace=%.2f sticky=%.2f multiLOS=%d chestZ=%.0f | "
+			     "turnoverGrace=%.2f | Parry dur=%.2f cooldown=%.2f glow=%.2f"),
+			Tag, Table.PassHoldSeconds, Table.PassCooldownSeconds, Table.PassCancelCooldownSeconds,
+			Table.PassMaxRange, Table.PassAimConeDegrees, Table.PassAimSlack,
+			Table.PassValidationGraceSeconds, Table.PassAcquireStickySeconds,
+			Table.bPassMultiPointLos ? 1 : 0, Table.PassTargetChestOffsetZ,
+			Table.CoreTurnoverGraceSeconds,
+			Table.ParryDuration, Table.ParryCooldown, Table.ParryGlowScale);
 
 		// The engine-owned copies. Named MovementIt/LiveMovement rather than anything that reads
 		// like a base-class member: a local shadowing one fails the Windows build (C4458).

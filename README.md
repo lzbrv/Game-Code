@@ -6,11 +6,17 @@ Trace is a networking prototype first and a game second. It exists to prove out 
 multiplayer stack — client-side prediction, server-authoritative hitscan with server-side rewind,
 delta-replicated state — on top of a game idea that is small enough to actually finish.
 
-**There are no binary assets in this repository.** No `.uasset` we authored, no imported art,
-no Blueprints. The arena, the characters, the Core, the trail and the entire HUD are built in C++
-from engine primitives (`/Engine/BasicShapes/*` and Canvas drawing). The only content file in the
-repo is one empty level. This is a deliberate constraint: it keeps the repo diffable, keeps merges
-sane for a four-person team, and means a fresh clone builds and runs with zero asset pipeline.
+**There are no binary assets in this repository.** No `.uasset` we authored, no Blueprints. The
+arena, the Core, the trail and the entire HUD are built in C++ from engine primitives
+(`/Engine/BasicShapes/*` and Canvas drawing). The only content file in the repo is one empty level.
+This is a deliberate constraint: it keeps the repo diffable, keeps merges sane for a four-person
+team, and means a fresh clone builds and runs with zero asset pipeline.
+
+**One exception, and it bites new clones:** the characters use Epic's default Mannequin
+(`SKM_Manny_Simple` + `ABP_Unarmed`) for heads, limbs and run cycles. That is ~126 MB of imported
+engine content and it is **gitignored**, so it is not in a fresh clone. Run
+`Scripts/import-mannequin.sh` once per machine. Without it `ATraceCharacter` falls back to
+primitives and everyone on the field is a capsule — if that is what you are looking at, this is why.
 
 ---
 
@@ -22,9 +28,10 @@ Two teams of five, one shared Core, one arena.
 
 - There is **one Core**, and **both teams contest the same object**. It is not a flag-per-team
   setup — there is a single ball in play.
-- You score by carrying the Core into the **opposing team's endzone**.
-- First team to **5** points wins, or the highest score when the **10-minute** match clock expires.
-  (Both numbers are configurable — see [docs/DESIGN.md](docs/DESIGN.md).)
+- You score by carrying the Core into the **opposing team's endzone** — or by **passing** it to a
+  teammate who is already standing in it. The alley-oop is intended.
+- A match is **two 10-minute halves with a side switch**; the highest score at the end wins.
+  (Everything here is configurable — see [docs/DESIGN.md](docs/DESIGN.md).)
 
 ### The carrier
 
@@ -44,6 +51,9 @@ This is the part that makes Trace different from every other capture-the-thing g
 - **Teammates never trip the trail.** The carrier's own team can run through it freely.
 - Dash is therefore the *only* way to stop a carrier. Not damage. Not focus fire. A committed,
   cooldown-gated dash through the line they just drew.
+- **The carrier can parry it.** A 0.1-second window that makes the trace invulnerable and turns the
+  **entire trace red** for the duration. Dash into a red trace and you have wasted it. It is a
+  reaction check, not a shield — 0.1 s of cover on a 1.5 s cooldown.
 
 The design consequence: chasing a carrier is a positioning puzzle, not an aim duel. The carrier is
 trying to draw a path that no one can safely cut; the defenders are trying to spend a dash at the
@@ -55,11 +65,17 @@ needs to dash is a real wall.
 - Everyone **not** carrying the Core has a **hitscan** gun — instant, no projectile travel time.
 - **No friendly fire.**
 - Bullets never damage the Core carrier (see above).
-- **Everyone**, carrier included, has a **dash** on a short cooldown.
-- The Core can be **thrown/passed**, and **anyone may catch or pick it up** — teammate *or* enemy.
-  Interception is a feature, not a bug. A sloppy pass across midfield is a turnover.
-- When the carrier dies, the Core **drops at the death location** and the trail is **cleared
-  instantly**.
+- **Everyone**, carrier included, has a **dash** on a short cooldown and a **slide**. There is no
+  boost — it was removed.
+- **Movement is Source/Apex-flavoured.** Real Quake-style air acceleration, so strafing in mid-air
+  turns your velocity vector instead of braking it; landing does **not** clamp your speed to the
+  ground maximum, it bleeds the excess off over a short run-out; and run→jump→slide→jump preserve
+  the velocity vector rather than resetting it.
+- The Core is **passed by holding the crosshair on a teammate for half a second** — it is not a
+  thrown, catchable ball. The moment you start a pass **your shield drops and your trace goes
+  invulnerable**, and both come back if you cancel. That half second is the risk beat the whole
+  design turns on.
+- When the carrier dies the trail is **cleared instantly**.
 
 ---
 
@@ -77,6 +93,9 @@ Scripts/
   build.sh                  Wraps UnrealBuildTool. Also --projectfiles and --clean.
   generate-map.sh           Creates the empty /Game/Maps/Arena level headlessly.
   generate_map.py           The editor-Python it drives. Not a standalone python3 script.
+  generate_content.py       Produces M_TraceSurface / M_TraceNeon into /Game/Generated/Materials.
+  import-mannequin.sh       Imports Epic's Mannequin (~126 MB). Run once per machine or every
+                            character on the field is a capsule.
   run-listen-server.sh      Host a listen server on :7777. The default way to play right now.
   run-client.sh             Connect a client to <ip>:7777.
   run-dedicated-server.sh   Headless server. Needs --editor on a launcher engine — see NETWORKING.
@@ -93,12 +112,14 @@ Source/
     TraceTypes.h            Shared enums, team colours, the replicated trail structs.
     TraceSettings.{h,cpp}   UTraceSettings — every gameplay number, ini-configurable.
     Core/                   GameMode, GameState, PlayerState, PlayerController, Character.
-    Movement/               TraceCharacterMovementComponent — predicted dash.
-    Gameplay/               Health, Weapon, Trail, Core, Endzone, Tracer.
+    Movement/               TraceCharacterMovementComponent — predicted dash and slide,
+                            Source-style air acceleration, carried-momentum landing.
+    Gameplay/               Health, Weapon, HitZones, Trail, Core, Parry, Endzone, Tracer.
+    Settings/               TraceUserSettings — persisted per-player controls and video.
     Net/                    TraceLagCompensationComponent — pose history + server rewind.
     UI/                     TraceHUD — Canvas-only HUD and scoreboard.
     World/                  TraceArenaBuilder, TraceTeamPlayerStart.
-docs/                       SETUP, NETWORKING, GITHUB, DESIGN. You are here.
+docs/                       SETUP, EDITOR, NETWORKING, GITHUB, DESIGN. You are here.
 .gitattributes              Git LFS + file-locking rules. Read docs/GITHUB.md.
 .gitignore                  Everything generated. Read docs/GITHUB.md.
 ```
@@ -146,7 +167,11 @@ Scripts/build.sh
 # 3. Create the one required level (see below).
 Scripts/generate-map.sh
 
-# 4. Open it.
+# 4. Import the character art (~126 MB, gitignored, once per machine).
+#    Skip this and every player on the field is an untextured capsule.
+Scripts/import-mannequin.sh
+
+# 5. Open it.
 open Trace.uproject
 ```
 
@@ -186,12 +211,15 @@ See [docs/NETWORKING.md](docs/NETWORKING.md#3-dedicated-server--requires-a-sourc
 | Mouse | Look |
 | `Space` | Jump |
 | **Left Mouse** | Fire (disabled while carrying the Core) |
-| **Right Mouse** | Pass / throw the Core |
+| **Right Mouse** | Pass — hold on a teammate for half a second |
 | **Left Shift** | Dash |
+| **Left Ctrl** | Slide (on the ground) / fast-fall (in the air) |
+| **`Q`** | Parry — carrier only. 0.1s of trace invulnerability; the whole trace flashes red |
 | `Tab` | Scoreboard |
 
 Input is Enhanced Input, constructed entirely in C++ at runtime — there are no input `.uasset`s to
-open, and remapping is a code change in `TracePlayerController`.
+open. **Every action above is rebindable in-game** (Options → Controls); the bindings persist
+through `UTraceUserSettings`, and the defaults live in `Source/Trace/Settings/TraceUserSettings.cpp`.
 
 ---
 
@@ -202,11 +230,18 @@ open, and remapping is a code change in `TracePlayerController`.
 | **[docs/SETUP.md](docs/SETUP.md)** | Setting up a Mac from zero. Start here on a new machine. |
 | **[docs/NETWORKING.md](docs/NETWORKING.md)** | You want to playtest — locally, or with the four of us across the internet. |
 | **[docs/GITHUB.md](docs/GITHUB.md)** | **Before your first commit.** Unreal + Git has rules that are not optional. |
-| **[docs/DESIGN.md](docs/DESIGN.md)** | Tuning the game, or adding a feature. Full knob table and class map. |
+| **[docs/EDITOR.md](docs/EDITOR.md)** | New to the Unreal Editor, or wondering why the viewport is empty. Panels, PIE, and the arena preview button. |
+| **[docs/DESIGN.md](docs/DESIGN.md)** | Tuning the game, or adding a feature. Full knob table, the arena layout and the class map. |
 
 ---
 
 ## Status
 
-Prototype. It plays, it replicates, it is not balanced and it is not pretty. The netcode is the
-part that is meant to be production-shaped; everything visual is a placeholder made of cylinders.
+Prototype. It plays, it replicates, and it is not balanced. The netcode is the part that is meant to
+be production-shaped; the arena is Tron-styled but is still made of engine primitives.
+
+It currently has: a title menu with difficulty selection, a post-match result screen, two-half match
+flow with a side switch, first-person with a third-person blend while carrying, animated Epic
+Mannequin characters, a 24000 × 9600 neon arena built in C++, bots that play the full ruleset, an
+editor arena-preview button, and every gameplay number live-editable in Project Settings while
+Play-In-Editor is running.
