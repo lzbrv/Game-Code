@@ -12,11 +12,19 @@ arena, the Core, the trail and the entire HUD are built in C++ from engine primi
 This is a deliberate constraint: it keeps the repo diffable, keeps merges sane for a four-person
 team, and means a fresh clone builds and runs with zero asset pipeline.
 
-**One exception, and it bites new clones:** the characters use Epic's default Mannequin
-(`SKM_Manny_Simple` + `ABP_Unarmed`) for heads, limbs and run cycles. That is ~126 MB of imported
-engine content and it is **gitignored**, so it is not in a fresh clone. Run
-`Scripts/import-mannequin.sh` once per machine. Without it `ATraceCharacter` falls back to
-primitives and everyone on the field is a capsule — if that is what you are looking at, this is why.
+**One exception worth understanding:** the characters use Epic's default Mannequin
+(`SKM_Manny_Simple` + `ABP_Unarmed`) for heads, limbs and run cycles. That is ~126 MB of engine
+content and it is **gitignored**, so it is not in a fresh clone — it is copied out of the Unreal
+install you already have, which is why the repo is ~1.3 MB instead of hundreds.
+
+`Scripts/build.sh` (and `build.bat`) now **imports it automatically** when it is missing, so a
+fresh clone just works. Pass `--no-art`, or set `TRACE_SKIP_ART_IMPORT=1`, to skip that. To run it
+by hand: `Scripts/import-mannequin.sh` on macOS/Linux, `Scripts\import-mannequin.bat` on Windows.
+
+If every player on the field is a plain capsule, the import has not run: the game says so on screen
+and names the script. The usual cause is an engine installed without **Templates and Feature Packs**
+ticked, since that is where the source art lives — the import script detects that and tells you how
+to fix it in the Epic Games Launcher.
 
 ---
 
@@ -94,8 +102,9 @@ Scripts/
   generate-map.sh           Creates the empty /Game/Maps/Arena level headlessly.
   generate_map.py           The editor-Python it drives. Not a standalone python3 script.
   generate_content.py       Produces M_TraceSurface / M_TraceNeon into /Game/Generated/Materials.
-  import-mannequin.sh       Imports Epic's Mannequin (~126 MB). Run once per machine or every
-                            character on the field is a capsule.
+  import-mannequin.sh       Imports Epic's Mannequin (~126 MB) from your own engine install.
+                            build.sh runs this for you when the art is missing.
+  import-mannequin.bat      Windows twin of the above.
   run-listen-server.sh      Host a listen server on :7777. The default way to play right now.
   run-client.sh             Connect a client to <ip>:7777.
   run-dedicated-server.sh   Headless server. Needs --editor on a launcher engine — see NETWORKING.
@@ -167,11 +176,8 @@ Scripts/build.sh
 # 3. Create the one required level (see below).
 Scripts/generate-map.sh
 
-# 4. Import the character art (~126 MB, gitignored, once per machine).
-#    Skip this and every player on the field is an untextured capsule.
-Scripts/import-mannequin.sh
-
-# 5. Open it.
+# 4. Open it. (build.sh already imported the character art in step 3 —
+#    ~126 MB copied from your own engine install, not from GitHub.)
 open Trace.uproject
 ```
 

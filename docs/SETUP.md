@@ -411,6 +411,46 @@ means it starts over.
 
 ---
 
+## Character art — automatic, but worth knowing about
+
+If every player on the field is a plain coloured capsule, this section is why.
+
+The characters use Epic's default Mannequin (`SKM_Manny_Simple` + `ABP_Unarmed`) for heads, limbs
+and run cycles. That art is **not in the repository** — `.gitignore` excludes `/Content/Characters/`
+deliberately. It is ~126 MB of binary content, and committing it would consume GitHub's Git-LFS free
+tier (roughly 1 GiB of storage *and* 1 GiB/month of bandwidth) that a four-person team cloning would
+burn through quickly. Keeping it out is what makes this repo ~1.3 MB.
+
+Instead it is copied out of **the Unreal install you already have** — every UE 5.8 install ships it
+under `Templates/TemplateResources`. No network access is involved.
+
+**`Scripts/build.sh` and `Scripts/build.bat` do this for you automatically** whenever the art is
+missing, so a fresh clone just works. You will see it once:
+
+```
+[trace] Character art missing or incomplete — importing Epic's Mannequin
+[trace] Importing 128 .uasset files (126M)...
+[trace] Character art imported.
+```
+
+Subsequent builds say nothing. To run it by hand, skip it, or force a re-copy:
+
+```bash
+Scripts/import-mannequin.sh              # macOS / Linux
+Scripts\import-mannequin.bat             # Windows
+Scripts/import-mannequin.sh --verify     # report what is present, copy nothing
+Scripts/import-mannequin.sh --force      # recopy everything
+Scripts/build.sh --no-art                # build without the art check
+```
+
+**If the import fails**, it is almost always because the engine was installed without **Templates
+and Feature Packs** — that is where the source art lives. Open the Epic Games Launcher → Unreal
+Engine 5.8 → Options, tick it, and Apply. The script detects this case and tells you the same thing.
+
+The build never fails over missing art: the game runs with fallback shapes and says so on screen.
+
+---
+
 ## The one manual step: `/Game/Maps/Arena`
 
 Trace builds its entire arena in C++ at `BeginPlay`. But Unreal still needs a **level asset** to

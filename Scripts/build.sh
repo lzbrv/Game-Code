@@ -20,6 +20,9 @@ CONFIG="Development"
 PLATFORM=""
 DO_CLEAN=0
 DO_PROJECTFILES=0
+# Import Epic's Mannequin automatically if it is missing. See the art block below.
+DO_IMPORT_ART="${TRACE_SKIP_ART_IMPORT:+0}"
+DO_IMPORT_ART="${DO_IMPORT_ART:-1}"
 EXTRA_ARGS=()
 
 usage() {
@@ -38,6 +41,8 @@ OPTIONS
       --clean             Clean the target instead of building it (-clean)
       --projectfiles      Regenerate IDE project files (Xcode workspace / Makefile)
                           instead of building
+      --no-art            Skip the automatic Mannequin import. Characters will
+                          render as fallback shapes unless already imported.
   -n, --dry-run           Print the command that would run; run nothing
   -h, --help              This text
 
@@ -77,6 +82,7 @@ while [ $# -gt 0 ]; do
         -p|--platform)  [ $# -ge 2 ] || trace_die "--platform needs a value"; PLATFORM="$2"; shift 2 ;;
         --clean)        DO_CLEAN=1; shift ;;
         --projectfiles) DO_PROJECTFILES=1; shift ;;
+        --no-art)       DO_IMPORT_ART=0; shift ;;
         -n|--dry-run)   TRACE_DRY_RUN=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         --)             shift; while [ $# -gt 0 ]; do EXTRA_ARGS+=("$1"); shift; done ;;
@@ -102,6 +108,44 @@ trace_resolve_engine
 trace_check_toolchain
 
 BUILD_SH="$(trace_build_script)"
+
+# ------------------------------------------------------------------------------
+# Character art — imported, not committed
+#
+# Epic's Mannequin is deliberately NOT in the repo: .gitignore excludes
+# /Content/Characters/, and Scripts/import-mannequin.sh copies it out of each
+# developer's own UE install instead. That keeps the repo ~1.3 MB and off
+# GitHub's LFS quota (~1 GiB storage AND ~1 GiB/month bandwidth, which a team of
+# four cloning would burn through fast).
+#
+# The cost of that choice is that a fresh clone builds with fallback primitives
+# until somebody remembers the extra command — which is exactly how a
+# collaborator came to report "there don't seem to be any models in the project".
+# So do it for them. The engine ships the source art, so this needs no network.
+#
+# DELIBERATELY NON-FATAL. The game runs fine with fallback shapes and now warns
+# loudly on screen about it, so a partial engine install (no "Templates and
+# Feature Packs") must degrade the visuals, never block the build.
+#
+# Skip with --no-art, or TRACE_SKIP_ART_IMPORT=1 for CI.
+# ------------------------------------------------------------------------------
+if [ "$DO_IMPORT_ART" = "1" ] && [ "$TRACE_DRY_RUN" != "1" ]; then
+    IMPORT_SH="${TRACE_SCRIPT_DIR}/import-mannequin.sh"
+    if [ ! -x "$IMPORT_SH" ]; then
+        trace_warn "Missing ${IMPORT_SH}; skipping the character-art check."
+    elif "$IMPORT_SH" --verify >/dev/null 2>&1; then
+        : # Already imported and complete — say nothing, this is the common case.
+    else
+        trace_msg "Character art missing or incomplete — importing Epic's Mannequin"
+        if "$IMPORT_SH"; then
+            trace_msg "Character art imported."
+        else
+            trace_warn "Mannequin import failed. Building anyway — characters will render as"
+            trace_warn "fallback shapes and the game will say so on screen."
+            trace_warn "Run ${IMPORT_SH} on its own to see why."
+        fi
+    fi
+fi
 
 if [ "$DO_PROJECTFILES" = "1" ]; then
     # Installed (launcher) engines ship Build.sh but not always GenerateProjectFiles.sh,

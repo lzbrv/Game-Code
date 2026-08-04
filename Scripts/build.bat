@@ -24,6 +24,9 @@ set "CONFIG=Development"
 set "PLATFORM="
 set "DO_CLEAN=0"
 set "DO_PROJECTFILES=0"
+rem Import Epic's Mannequin automatically when it is missing. See the art block below.
+set "DO_IMPORT_ART=1"
+if defined TRACE_SKIP_ART_IMPORT set "DO_IMPORT_ART=0"
 set "EXTRA_ARGS="
 
 rem -----------------------------------------------------------------------------
@@ -40,6 +43,7 @@ if /i "!_a!"=="-p"             goto :o_platform
 if /i "!_a!"=="--platform"     goto :o_platform
 if /i "!_a!"=="--clean"        goto :o_clean
 if /i "!_a!"=="--projectfiles" goto :o_projectfiles
+if /i "!_a!"=="--no-art"       goto :o_noart
 if /i "!_a!"=="-n"             goto :o_dryrun
 if /i "!_a!"=="--dry-run"      goto :o_dryrun
 if /i "!_a!"=="-h"             goto :o_help
@@ -86,6 +90,11 @@ goto :parse
 
 :o_projectfiles
 set "DO_PROJECTFILES=1"
+shift
+goto :parse
+
+:o_noart
+set "DO_IMPORT_ART=0"
 shift
 goto :parse
 
@@ -144,6 +153,38 @@ call "%~dp0_trace_common.bat" check_toolchain
 
 call "%~dp0_trace_common.bat" build_script
 if errorlevel 1 exit /b 1
+
+rem -----------------------------------------------------------------------------
+rem  Character art - imported, not committed
+rem
+rem  Epic's Mannequin is deliberately NOT in the repo: .gitignore excludes
+rem  /Content/Characters/, and import-mannequin copies it out of each developer's
+rem  own UE install instead. That keeps the repo ~1.3 MB and off GitHub's LFS
+rem  quota. The cost is that a fresh clone builds with fallback primitives until
+rem  somebody runs the extra command - which is how a collaborator came to report
+rem  that no character models were in the project. So do it for them.
+rem
+rem  DELIBERATELY NON-FATAL: the game runs with fallback shapes and warns on
+rem  screen, so a partial engine install must degrade visuals, never block a build.
+rem
+rem  Skip with --no-art, or set TRACE_SKIP_ART_IMPORT=1 for CI.
+rem -----------------------------------------------------------------------------
+if "%DO_IMPORT_ART%"=="1" if not "%TRACE_DRY_RUN%"=="1" (
+    if not exist "%~dp0import-mannequin.bat" (
+        call "%~dp0_trace_common.bat" warn "Missing %~dp0import-mannequin.bat; skipping the character-art check."
+    ) else (
+        call "%~dp0import-mannequin.bat" --verify >nul 2>&1
+        if errorlevel 1 (
+            call "%~dp0_trace_common.bat" msg "Character art missing or incomplete - importing Epic's Mannequin"
+            call "%~dp0import-mannequin.bat"
+            if errorlevel 1 (
+                call "%~dp0_trace_common.bat" warn "Mannequin import failed. Building anyway - characters will render as fallback shapes and the game will say so on screen."
+            ) else (
+                call "%~dp0_trace_common.bat" msg "Character art imported."
+            )
+        )
+    )
+)
 
 if "%DO_PROJECTFILES%"=="1" goto :projectfiles
 
@@ -243,6 +284,7 @@ echo   -p, --platform ^<name^>   Target platform. Default: this host (%TRACE_HOS
 echo       --clean             Clean the target instead of building it (-clean)
 echo       --projectfiles      Regenerate IDE project files (Trace.sln)
 echo                           instead of building
+echo       --no-art            Skip the automatic Mannequin import
 echo   -n, --dry-run           Print the command that would run; run nothing
 echo   -h, --help              This text
 echo(
