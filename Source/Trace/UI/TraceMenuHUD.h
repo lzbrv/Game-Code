@@ -25,6 +25,7 @@
 
 #include "TraceSettings.h"           // ETraceScoringMode (the A/B toggle's own enum)
 #include "UI/TraceMatchOptions.h"   // ETraceBotDifficulty, TraceScoring
+#include "UI/TraceNetworking.h"      // FTraceTextEntry, TraceNet
 #include "UI/TraceOptionsMenu.h"     // FTraceOptionsMenu
 
 #include "TraceMenuHUD.generated.h"
@@ -34,24 +35,42 @@ class UFont;
 /** Rows of the title menu, top to bottom. */
 enum class ETraceMenuRow : uint8
 {
+	/**
+	 * Starts a match AND a listen server, always (spec v5 §0).
+	 *
+	 * There is deliberately no separate "host" row. A listen server with zero clients is
+	 * indistinguishable from standalone for the player sitting at it — same frame rate, same bots,
+	 * same everything — so making every PLAY joinable costs the single-player experience nothing and
+	 * removes the entire class of failure where two people each started a private match and then
+	 * wondered why they could not see each other. That is exactly what happened in the Demo 5
+	 * playtest.
+	 */
 	Play       = 0,
-	Difficulty = 1,
+	/**
+	 * Connect to somebody else's PLAY. Opens the address prompt (see ATraceMenuHUD::OpenJoinPrompt).
+	 *
+	 * Second, directly under PLAY, because those two rows are the whole question a player is here to
+	 * answer — "am I hosting or joining?" — and burying JOIN under the tuning rows would keep the
+	 * feature as invisible as its absence was.
+	 */
+	Join       = 1,
+	Difficulty = 2,
 	/**
 	 * SCORING MODE — the A/B toggle (spec v4 §7). Directly under DIFFICULTY, and above SETTINGS,
 	 * because it is the second thing a playtester picks and the entire point of this build: the
 	 * notes ask for the two rulesets to be compared back to back, which means switching between them
 	 * has to be one keypress on the way into a match rather than a trip through a settings panel.
 	 */
-	Mode       = 2,
+	Mode       = 3,
 	/**
 	 * Sensitivity, invert-Y and the key bindings. Sits above QUIT rather than below the blurb so
 	 * that the things a player might change before their first match are adjacent, and the one
 	 * destructive row stays last.
 	 */
-	Settings   = 3,
-	Quit       = 4,
+	Settings   = 4,
+	Quit       = 5,
 
-	Count      = 5
+	Count      = 6
 };
 
 UCLASS()
@@ -102,6 +121,16 @@ public:
 	 */
 	bool IsOptionsOpen() const { return OptionsMenu.IsOpen(); }
 
+	/**
+	 * True while the JOIN address prompt owns the screen.
+	 *
+	 * Same contract as IsOptionsOpen(), and for a sharper reason: the title screen binds A, S, D and
+	 * W as navigation keys, and those are letters somebody typing "aya.tail1234.ts.net" needs. Every
+	 * entry point above returns early while this is true, and FTraceTextEntry polls the keyboard
+	 * itself.
+	 */
+	bool IsJoinPromptOpen() const { return JoinEntry.IsActive(); }
+
 protected:
 	// ---- Draw passes, back to front --------------------------------------------------------------
 	void DrawBackdrop();
@@ -111,16 +140,53 @@ protected:
 	void DrawBezel();
 
 	void DrawWordmark();
+
+	/**
+	 * "YOUR ADDRESS — 100.101.102.103:7777", directly under the tagline.
+	 *
+	 * Treated as a headline element rather than a footnote, because it removes the single most
+	 * common multiplayer failure this project has actually seen: not knowing what to type. The host
+	 * reads it off their own title screen and says it out loud; nobody has to run `tailscale ip -4`
+	 * in a terminal, and nobody has to find the networking doc first.
+	 */
+	void DrawAddressChip();
+
+	/** Red strip across the top when a connection or travel attempt failed. See TraceNet. */
+	void DrawFailureBanner();
+
 	void DrawMenuRows();
 	void DrawFooter();
 	void DrawCursor();
 	void DrawTravelOverlay();
 
+	/** The modal address field raised by the JOIN row. Draws nothing while the field is inactive. */
+	void DrawJoinPrompt();
+
 	/** One menu row. Returns the row's screen rect so the caller can store it for hit testing. */
 	FBox2D DrawRow(ETraceMenuRow Row, float CenterX, float Y, float Width, bool bSelected);
 
 	// ---- Actions ---------------------------------------------------------------------------------
+
+	/**
+	 * Travels to the arena as a LISTEN SERVER — the fix for spec v5 §0.
+	 *
+	 * The URL gains a bare `listen` option alongside the difficulty and mode. That one word is the
+	 * entire difference between the shipped build and a joinable one: without it
+	 * UEngine::LoadMap never calls UWorld::Listen, no net driver is created, nothing binds UDP 7777,
+	 * and the match is unreachable no matter how correct the other machine's setup is.
+	 */
 	void StartMatch();
+
+	/** Raises the address prompt, pre-filled with the last address that was joined. */
+	void OpenJoinPrompt();
+
+	/**
+	 * Validates whatever is in the field, remembers it, and calls ClientTravel.
+	 *
+	 * TRAVEL_Absolute, because a join is not relative to the map we are on — the menu map's package
+	 * name must not be prepended to an IP address.
+	 */
+	void ConfirmJoin();
 
 	/** Raises the settings overlay on its settings page, with BACK closing it outright. */
 	void OpenOptions();
@@ -161,6 +227,34 @@ private:
 
 	/** Set once Play has been taken, so a second Enter during the level load cannot travel twice. */
 	bool bTravelling = false;
+
+	/** What the travel overlay should say: "ENTERING THE ARENA" or "CONNECTING TO <addr>". */
+	FString TravelCaption;
+
+	// ---- JOIN ------------------------------------------------------------------------------------
+
+	/**
+	 * The address field. Active state IS the "prompt is open" state — see IsJoinPromptOpen().
+	 *
+	 * Not a UPROPERTY and does not need to be: FTraceTextEntry is plain C++ holding an FString and
+	 * an int, exactly like FTraceOptionsMenu above it.
+	 */
+	FTraceTextEntry JoinEntry;
+
+	/**
+	 * The address shown on the JOIN row and pre-filled into the field.
+	 *
+	 * Loaded from disk in BeginPlay (TraceNet::LoadLastJoinAddress) and written back on every
+	 * successful join. The spec is explicit about why: nobody should retype a Tailscale address
+	 * every test, and a prototype that makes them do it is a prototype that stops being tested.
+	 */
+	FString LastJoinAddress;
+
+	/** Set when the typed address is unusable. Drawn under the field. */
+	FString JoinError;
+
+	/** The field contents JoinError was raised about; any edit away from it clears the message. */
+	FString JoinErrorText;
 
 	/**
 	 * World time at which the title screen started accepting Enter/Space.
@@ -256,6 +350,13 @@ private:
 	 */
 	bool bCursorHasMoved = false;
 
+	/**
+	 * Bottom of the tagline as of the last DrawWordmark(), so DrawAddressChip() can sit under it
+	 * without re-deriving the wordmark's cap height, rule offset and font metrics. Two copies of
+	 * that arithmetic is two things to keep in step.
+	 */
+	float TaglineBottomY = 0.f;
+
 	/** Viewport size and the layout scale every constant in the .cpp is authored against. */
 	float ViewW = 0.f;
 	float ViewH = 0.f;
@@ -305,5 +406,20 @@ private:
 	FTimerHandle AutoSettingsStepTimer;
 	int32 AutoSettingsIndex = 0;
 	bool bAutoSettingsAwaitingRelease = false;
+
+	/**
+	 * -TraceAutoJoin=<seconds> -TraceJoinAddress=<ip:port> drives the JOIN row for you.
+	 *
+	 * The counterpart of -TraceAutoPlay, and it exists for the same reason: the acceptance test for
+	 * this whole pass is TWO processes sharing one match, and a test that reached the second process
+	 * by passing the address on the command line would prove the engine works while proving nothing
+	 * at all about the menu — which is where the bug was. This drives the real row: it opens the real
+	 * prompt, fills the real field and submits it through the real ConfirmJoin().
+	 */
+	void ArmAutoJoin();
+	FTimerHandle AutoJoinTimer;
+
+	/** Submits 2.5s after the prompt opens, so -TraceAutoShot has a window to photograph it. */
+	FTimerHandle AutoJoinSubmitTimer;
 #endif
 };

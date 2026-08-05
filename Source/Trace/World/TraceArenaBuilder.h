@@ -52,7 +52,7 @@ class UStaticMeshComponent;
  *    / 616 uu), keyed to the character capsule via PlayerHeightUU();
  *  - a lit gate spanning the full width of each endzone; the endzones themselves run sideline to
  *    sideline - see EndzoneHalfWidth;
- *  - and, for MODE B, a GOAL at each end: two posts a third of the field width apart carrying a
+ *  - and, for MODE B, a GOAL at each end: two posts 2000 uu apart (GoalHalfWidth) carrying a
  *    crossbar at ClampedGoalHeight(), with the goal mouth lit on the floor between them. See the
  *    two-modes note below.
  *
@@ -203,8 +203,9 @@ public:
 	/**
 	 * Half extent of a GOAL along Y, i.e. half the goal mouth.
 	 *
-	 * UTraceSettings::GoalWidthFieldFraction of the FULL field width, halved - a third of the width
-	 * by default, so 1600 uu either side of the centre line on the 9600 uu field. Read through this
+	 * UTraceSettings::GoalWidthFieldFraction of the FULL field width, halved - 0.2083 by default
+	 * since spec v5 section 4 shrank it, so 1000 uu either side of the centre line on the 9600 uu
+	 * field (a 2000 uu mouth, down from 3200). Read through this
 	 * function everywhere, exactly as EndzoneHalfWidth() is: the trigger box, the posts, the crossbar
 	 * and the mouth patch all measure themselves against it, so what scores and what is painted are
 	 * the same rectangle by construction.
@@ -216,6 +217,9 @@ public:
 
 	/**
 	 * Height of a goal volume, floor upward, from UTraceSettings::GoalHeightUU.
+	 *
+	 * 440 uu by default: spec v5 section 4 scaled it by the same 2000/3200 the width was scaled by,
+	 * so "reduce height and width" kept the mouth's proportions instead of making it a letterbox.
 	 *
 	 * FINITE ON PURPOSE - "height finite so it reads as a goal rather than a wall". Clamped to the
 	 * wall height at the top so the crossbar can never be built above the sky.

@@ -298,6 +298,57 @@ protected:
 	 */
 	FVector ComputeThrowAimPoint(const FVector& WorldTarget) const;
 
+	/**
+	 * Solves the launch DIRECTION that puts a thrown Core through @p WorldTarget, or fails if the
+	 * target is out of ballistic range.
+	 *
+	 * Replaces a first-order "raise the aim point by the drop" approximation that was fine for a fast
+	 * flat Core and is not fine for a heavy one: with the v5 weight model the Core leaves 25% slower
+	 * under twice the gravity, so the drop over a long throw is larger than the throw is long and the
+	 * approximation has no fixed point at all. This is the real thing — the Core's own launch
+	 * (direction x speed, plus a world-up bias term) integrated under the Core's own gravity, solved
+	 * for pitch by bisection because the up-bias term makes the closed form a quartic.
+	 *
+	 * Returns the LOW arc when both exist: a flat throw spends less time in the air, which is less
+	 * time for a defender to walk into it.
+	 *
+	 * @param OutLaunchDirection unit vector to aim along, valid only on true.
+	 * @param OutFlightSeconds   time of flight, for the caller's lane sweep. Optional.
+	 */
+	bool SolveThrowLaunch(const FVector& From, const FVector& WorldTarget,
+		FVector& OutLaunchDirection, float* OutFlightSeconds = nullptr) const;
+
+	/**
+	 * MODE B. Furthest horizontal distance a throw from @p From can reach a point @p HeightDelta
+	 * above it, in uu.
+	 *
+	 * THE NUMBER THE OLD SHOT TEST GOT WRONG. It used HalfFieldLength() * 0.55 — 9240 uu on this
+	 * pitch — as "close enough to shoot", which was never a fact about the Core: the light Core
+	 * carried ~5000 uu on a flat throw and the heavy one carries ~3400. A bot inside the old range
+	 * but outside the real one throws the Core into the floor in front of a defender. Answered from
+	 * the Core's published flight model so it retunes with it.
+	 */
+	float MaxThrowRange(const FVector& From, float HeightDelta) const;
+
+	/**
+	 * MODE B. Is the arc from @p From to @p WorldTarget clear of arena geometry?
+	 *
+	 * "Teach them to shoot at the goal when they have a lane" is a claim about the whole trajectory,
+	 * not about a straight line: a lobbed Core clears cover a ray would call blocking, and drops into
+	 * a crossbar a ray would call clear. So the parabola is sampled and the segments between samples
+	 * are traced, against ECC_Visibility for the same reason HasLineOfSight uses it — arena geometry
+	 * blocks, pawns do not (a defender standing in the lane is a contest, not a reason not to shoot).
+	 */
+	bool HasThrowLane(const FVector& From, const FVector& WorldTarget, const FVector& LaunchDirection,
+		float FlightSeconds) const;
+
+	/**
+	 * MODE B. Should this carrier stop throwing and run the Core into the goal itself?
+	 *
+	 * Sets/clears bCommitCarryIn. See that member for why it is a latch.
+	 */
+	void UpdateCarryInCommit();
+
 	/** Ends a throw attempt and starts the same cooldown a pass attempt would. */
 	void AbortThrow(const TCHAR* Reason);
 
@@ -655,6 +706,31 @@ private:
 
 	/** MODE B. What the current attempt is aimed at, BEFORE the ballistic elevation is added. */
 	FVector ThrowTargetPoint = FVector::ZeroVector;
+
+	/**
+	 * MODE B, spec v5 §4. True while this carrier has committed to running the Core INTO the goal
+	 * rather than throwing it.
+	 *
+	 * A latch, not a per-frame test, and that is the point. Scoring by carrying it in never fired
+	 * once in ~7 minutes of measured play even though the rule works, because a carrier close to the
+	 * goal kept re-deciding: one evaluation tick it was in range for a shot, the next an escort came
+	 * open and it threw the Core away 1500 uu from an open mouth. Inside the commit radius the throw
+	 * machine is switched off entirely and the bot drives at the mouth until it scores, dies, or
+	 * leaves the radius.
+	 */
+	bool bCommitCarryIn = false;
+
+	/** World time the carry-in commit began, so a bot that is being held out of the mouth gives up. */
+	float CarryInCommitTime = 0.f;
+
+	/**
+	 * Throttle for the [BotThrowLane] diagnostic. Mutable because HasThrowLane is a const query.
+	 *
+	 * A carrier pressed against cover re-evaluates the shot several times a second and is refused
+	 * every time, which turned a one-line diagnosis into six lines a second per bot the first time it
+	 * fired. The information is in the FIRST one.
+	 */
+	mutable float NextThrowLaneLogTime = 0.f;
 
 	// --- Steering -----------------------------------------------------------------------------
 

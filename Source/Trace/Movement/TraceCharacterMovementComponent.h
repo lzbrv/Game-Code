@@ -130,6 +130,131 @@
 // bSlideJumpEnabled turns the whole thing off, so "does sliding do anything now" can be A/B'd from
 // one binary.
 //
+// --- SPEC v5 §3: THE SLIDE IS A ONE-SHOT ABILITY NOW ------------------------------------------
+//
+// "Sliding still feels pretty bad. Rather than making it a slide you can hold down, have it trigger
+// once, like an ability, with a hidden cooldown to prevent spamming it. Increase the multiplier
+// gained by perfectly timing a jump at the end of a slide."
+//
+// Three consequences, all of them here:
+//
+//   ONE PRESS, ONE SLIDE, FIXED LENGTH. Releasing the crouch key no longer ends a slide — the only
+//        exits left are the duration expiring, the decay reaching the exit speed, leaving the ground
+//        (for longer than the ledge grace, see below), a dash, and a slide-jump. Holding the key
+//        cannot lengthen a slide and cannot chain one either, because activation is still driven by
+//        the press EDGE (bSlideHeldLastMove) and by the landing transition.
+//        SlideMinCommitSeconds AND SlideCommitRemaining ARE DELETED. A partial commit window is
+//        meaningless once the whole slide is committed; leaving the knob in place would have left a
+//        setting in the ini that silently did nothing, which is the exact failure mode this project
+//        has been bitten by.
+//
+//   THE COOLDOWN IS HIDDEN. SlideCooldownSeconds (0.8s, from the slide's END) is unchanged and still
+//        enforced in CanStartSlide(). GetSlideCooldownRemaining() exists for bots and debug only —
+//        NOTHING MAY DRAW IT. The design intent is that the player feels the rhythm rather than
+//        reading a meter, so a HUD element for it is a regression, not a missing feature.
+//
+//   THE WELL-TIMED HOP IS WHERE THE SKILL LIVES. The window bonus was 1.10, i.e. a 10% edge that no
+//        player could feel. Spec v5 raises it (1.25 shipped) and adds a SECOND, independent reward:
+//        SlideJumpWindowZBonus scales the launch's vertical velocity too, so a well-timed slide-jump
+//        goes measurably further AND higher than a sloppy one. Missing the window still costs
+//        nothing at all — it simply declines to pay either bonus.
+//
+// --- SPEC v5 §1: THE AIR-STRAFE ACCUMULATION CEILING -------------------------------------------
+//
+// "The air strafing feels incredible, but its too powerful with how much momentum can be gained.
+// I think we need a hard cap on it or an exponential scale."
+//
+// THE TURN IS NOT TOUCHED. Read that sentence again before editing ApplySourceAirAcceleration: the
+// projection formula, the absence of air friction, and the fact that perpendicular input rotates the
+// velocity vector without costing a single uu/s are all exactly as they were. What is capped is the
+// MAGNITUDE GAIN — the sqrt(v² + a²) − v that each strafe frame adds — and nothing else.
+//
+// The implementation is one extra step at the end of the formula:
+//
+//   1. Compute the new planar vector exactly as before (rotated, very slightly longer).
+//   2. Gain = |new| − |old|, which the projection formula guarantees is >= 0.
+//   3. Scale that gain by ((HardCap − |old|) / (HardCap − SoftCap))^Exponent, clamped to [0,1] and
+//      equal to 1 below the soft cap. At the soft cap the strafe is worth 100%; at the hard cap it
+//      is worth 0%; in between it decays as an exponential falloff, which is what "harder and harder
+//      to gain momentum past a certain point" means.
+//   4. Rescale the new vector to |old| + ScaledGain, KEEPING ITS DIRECTION. This is the load-bearing
+//      line: the rotation from step 1 survives in full, so at the hard cap a player can still carve
+//      the vector round at constant speed forever — the Source feel — but cannot add to it.
+//   5. Clamp to the hard cap as a backstop, floored at the entry speed so the cap can only ever
+//      remove what THIS call just added and can never brake momentum that was carried into the air
+//      (a slide-jump above the cap keeps every unit of it, exactly as MaxAirSpeed always did).
+//
+// bAirStrafeGainFalloff and bAirStrafeHardCap are independent: either can be turned off alone, so
+// "falloff only", "cap only", "both" and "neither, i.e. Demo 5 behaviour" are all one ini edit away.
+// Every term is a pure function of (planar speed, config), so the whole thing replays exactly and
+// adds no saved-move state.
+//
+// --- SPEC v5 §7: THE LEDGE RUBBER-BAND, AND THE MANTLE -----------------------------------------
+//
+// "When jumping on the edge of a raised section, it's glitchy and feels like rubber banding. Add a
+// mantle, to solve this."
+//
+// DIAGNOSIS FIRST, because "rubber banding" in a predicted game is a claim about the network and not
+// about feel. The mechanism, in this kit specifically:
+//
+//   A capsule landing on the lip of a raised section is supported by the outer few uu of its bottom
+//   hemisphere. UCharacterMovementComponent ships PerchRadiusThreshold at 0, which means NO reduced-
+//   radius perch test is done at all: the pawn is "walking" while a hair of the capsule overlaps the
+//   ledge, and one sub-uu difference in where the sweep landed flips the answer. Client and server
+//   slice the same second into different sub-steps, so they take that coin flip on different frames.
+//
+//   That is ordinarily worth a few uu. HERE IT IS WORTH HUNDREDS OF uu/s, because this component
+//   attaches a completely different velocity model to each side of the flip:
+//
+//       IsFalling()       -> ApplySourceAirAcceleration: no friction, input adds speed
+//       IsMovingOnGround()-> ApplyGroundOverspeedBleed / Super: friction, braking, speed removed
+//
+//   plus EndSlide() on leaving the ground (which rewrites Velocity and charges the 0.8s buffer), the
+//   fast-fall (which zeroes Velocity.Z on a press edge only while airborne), and the landing
+//   transition that charges the slide buffer. A one-frame disagreement about ground contact makes
+//   client and server run different code, and the position error compounds until the server
+//   corrects. THAT is the rubber-band, and a mantle bolted on top would not have removed it.
+//
+// So there are three fixes, and only the third is the one that was asked for:
+//
+//   1. PerchRadiusThreshold, set in the constructor. Gives the perch test a real band to decide in
+//      instead of a knife edge, so the walking/falling answer at a lip is stable and both ends reach
+//      it from the same geometry.
+//   2. LEDGE GRACE (GroundGraceRemaining), saved-move state. The ability layer treats "on the ground
+//      within the last LedgeGroundGraceSeconds" as grounded, so a one-frame contact blip can no
+//      longer end a slide, fire a fast-fall or fake a landing. It deliberately does NOT touch the
+//      engine's own physics mode — only which of this file's branches run — so it cannot change
+//      where the pawn is, only stop the kit from disagreeing about it.
+//   3. THE MANTLE. See below.
+//
+// --- THE MANTLE ---------------------------------------------------------------------------------
+//
+// Fully client-predicted, and it needs no new input and no new compressed flag: it triggers itself
+// from state the replay path already restores (Velocity, Acceleration, the updated component's
+// transform) plus the static arena geometry, which is identical on every machine. Detection runs in
+// OnMovementUpdated, once per move, on client, server and every replayed move.
+//
+//   REACH   a forward trace at chest height, along the direction of travel, out to MantleReachUU.
+//           Requires a near-vertical face (|Normal.Z| small) and requires the player to be PUSHING
+//           INTO it (Acceleration·forward > 0), so falling past a wall never grabs it.
+//   HEIGHT  a downward trace from above that face finds the ledge top. It must be between
+//           MantleMinHeightUU and MantleMaxHeightUU above the pawn's feet — below the minimum the
+//           engine's own step-up already handles it, above the maximum it is a wall and not a ledge.
+//   CLEAR   a capsule sweep at the destination proves there is room to stand before anything moves.
+//
+//   The pull-up is TWO PHASES and never passes through solid geometry: straight up the face for
+//   MantleUpPhaseFraction of MantleDurationSeconds, then forward over the lip for the rest, both as
+//   ordinary swept movement in MOVE_Flying. Velocity is written in CalcVelocity (inside the physics
+//   step, where it moves the pawn on the same frame) as (target − here) / time-left, which is
+//   self-correcting: both ends independently recompute the same target from the same geometry and
+//   converge on it, so even a small difference in where the mantle started cannot accumulate.
+//
+// MantleTimeRemaining, MantleTargetLocation, MantleUpTargetZ, MantleEntrySpeed and
+// MantleCooldownRemaining are ALL saved-move state, round-tripped through Clear / SetMoveFor /
+// PrepMoveFor and blocked from move-merging by CanCombineWith — a correction landing mid-mantle that
+// lost them would replay the pull-up as a fall, which is the biggest rubber-band the kit could
+// produce and the exact bug this section exists to remove.
+//
 // CanAttemptJump() IS OVERRIDDEN FOR THIS, and it is not optional. The engine's version refuses to
 // jump whenever bWantsToCrouch is set — a sane rule in a game where crouch shrinks the capsule and
 // you might not have headroom to stand up. Here crouch NEVER resizes anything (see
@@ -269,6 +394,27 @@ public:
 	 */
 	virtual bool CanAttemptJump() const override;
 
+#if !UE_BUILD_SHIPPING
+	/**
+	 * DIAGNOSTIC ONLY — "Trace.MoveCorrections 1" (or -TraceMoveCorrections).
+	 *
+	 * Every server correction that reaches this client passes through here, and logging it with the
+	 * error magnitude and the pawn's state at the time is what turns "it feels like rubber banding"
+	 * into a number. It is the evidence for spec v5 §7's diagnosis and the measurement that the
+	 * ledge fixes are checked against.
+	 *
+	 * Note the overload: UE 5.8 dispatches the FMovementBaseInterfaceData* form directly from
+	 * ClientHandleMoveResponse, so overriding the older UPrimitiveComponent* form would never fire.
+	 *
+	 * Observation only — it calls Super immediately and changes nothing.
+	 */
+	virtual void OnClientCorrectionReceived(class FNetworkPredictionData_Client_Character& ClientData,
+		float TimeStamp, FVector NewLocation, FVector NewVelocity,
+		struct FMovementBaseInterfaceData* NewMovementBaseInterfaceData, FName NewBaseBoneName,
+		bool bHasBase, bool bBaseRelativePosition, uint8 ServerMovementMode,
+		FVector ServerGravityDirection) override;
+#endif
+
 	// --- Dash API ------------------------------------------------------------------------------
 
 	/**
@@ -318,8 +464,16 @@ public:
 	 * The crouch key, as a HELD state — call with true on press and false on release.
 	 *
 	 * One key, two meanings, resolved by where the pawn is when it goes down:
-	 *   on the ground → start a slide (and hold it; releasing ends the slide early)
+	 *   on the ground → FIRE the slide ability (spec v5 §3). One press buys one slide of
+	 *                   SlideDuration seconds; the release is ignored, and holding the key neither
+	 *                   lengthens the slide nor starts a second one.
 	 *   in the air    → fast-fall, i.e. zero out POSITIVE Z velocity once, on the press edge
+	 *
+	 * STILL A LEVEL AND NOT AN EDGE, deliberately: the edge is derived inside the simulation from
+	 * bSlideHeldLastMove, which is saved-move state, so a replayed move reproduces the press exactly.
+	 * A caller that pulsed an edge would have to guarantee the pulse survived a correction, and it
+	 * cannot. Callers (ATracePlayerController, ATraceBotController) need no change for spec v5 —
+	 * they may keep holding the key; it simply stops meaning anything after the first frame.
 	 *
 	 * EITHER THIS OR ACharacter::Crouch() WORKS. The two are ORed together every move (see
 	 * IsCrouchHeld()): ATracePlayerController drives the human through Crouch()/UnCrouch(), which
@@ -335,8 +489,31 @@ public:
 	/** True for the duration of a slide. */
 	bool IsSliding() const;
 
-	/** Seconds before another slide is allowed (0 when ready). Measured from the last slide's END. */
+	/**
+	 * Seconds before another slide is allowed (0 when ready). Measured from the last slide's END.
+	 *
+	 * THE HIDDEN COOLDOWN (spec v5 §3). Enforced, but deliberately never surfaced: this exists for
+	 * bots (which need to know whether asking for a slide is worth anything) and for the measurement
+	 * harness. DO NOT DRAW IT ON THE HUD — the design intent is that the player learns the rhythm by
+	 * feel, and a meter would turn a hidden cost into a resource to be optimised.
+	 */
 	float GetSlideCooldownRemaining() const { return FMath::Max(0.f, SlideCooldownRemaining); }
+
+	// --- Mantle API (spec v5 §7) -----------------------------------------------------------------
+
+	/** True while the ledge pull-up owns the pawn. Movement input, dash, slide and jump are all off. */
+	bool IsMantling() const;
+
+	/** Seconds of pull-up left, 0 when not mantling. For anim/HUD tells; never feeds the simulation. */
+	float GetMantleTimeRemaining() const { return FMath::Max(0.f, MantleTimeRemaining); }
+
+	/**
+	 * "Grounded" as the ABILITY LAYER sees it: actually on the ground, or within LedgeGroundGrace-
+	 * Seconds of having been. See the ledge section of the header — this is the hysteresis that stops
+	 * a one-frame contact blip on a ledge lip from ending a slide or faking a landing on one machine
+	 * and not the other. It never contradicts the engine about where the pawn IS.
+	 */
+	bool IsGroundedForAbilities() const;
 
 	// --- Slide-jump readouts (HUD, bots, debug) --------------------------------------------------
 
@@ -379,8 +556,35 @@ protected:
 	/** Locks the direction, spends a charge, starts the dash window and launches the velocity. */
 	void BeginDash();
 
-	/** Locks the direction, sets the entry speed and starts the slide + commit windows. */
+	/** Locks the direction, sets the entry speed and starts the slide's fixed-length window. */
 	void BeginSlide();
+
+	// --- Mantle (spec v5 §7) ---------------------------------------------------------------------
+
+	/**
+	 * Looks for a climbable ledge ahead and, if it finds one with room to stand, starts the pull-up.
+	 * Returns true if a mantle began. Pure function of restored state + static geometry, so it makes
+	 * the same decision on the client, on the server and on every replayed move.
+	 *
+	 * ApproachVelocity is OnMovementUpdated's OldVelocity — the velocity at the START of the move,
+	 * before any collision response. It has to be, and that is not a nicety: the frame a jump's
+	 * capsule meets a ledge face is the frame the sweep zeroes the planar velocity against it, so the
+	 * current Velocity says the pawn was standing still and the speed gate refuses. This parameter is
+	 * why the mantle fires at all.
+	 */
+	bool TryBeginMantle(const FVector& ApproachVelocity);
+
+	/** Cheap pre-test: alive, enabled, off cooldown, airborne, not already busy with another ability. */
+	bool CanAttemptMantle() const;
+
+	/**
+	 * One sub-step of the pull-up, written from inside CalcVelocity so it moves the pawn on the same
+	 * frame. Phase 1 climbs to MantleUpTargetZ, phase 2 crosses to MantleTargetLocation.
+	 */
+	void ApplyMantleVelocity(float DeltaTime);
+
+	/** Hands the pawn back to MOVE_Falling with its entry speed (capped at the ground limit). */
+	void EndMantle();
 
 	/**
 	 * THE ONE EXIT. Ends a slide and hands the player back WITH their momentum.
@@ -443,9 +647,9 @@ protected:
 	float GetDashExitSpeedMultiplier() const;
 
 	// Slide tuning, same rule: read live, every frame, never cached.
+	/** ONE PRESS BUYS EXACTLY THIS MANY SECONDS (spec v5 §3). Release does not shorten it. */
 	float GetSlideDuration() const;
 	float GetSlideDeceleration() const;
-	float GetSlideMinCommitSeconds() const;
 	float GetSlideExitSpeedRetention() const;
 	float GetSlideExitMaxSpeedMultiplier() const;
 
@@ -468,8 +672,20 @@ protected:
 	 */
 	float GetSlideJumpWindowSeconds() const;
 
-	/** Multiplier applied to the retention when the hop lands inside the window. */
+	/** Multiplier applied to the retention when the hop lands inside the window. 1.10 -> 1.25 (v5 §3). */
 	float GetSlideJumpWindowSpeedBonus() const;
+
+	/**
+	 * Multiplier applied to the launch's VERTICAL velocity when the hop lands inside the window —
+	 * spec v5 §3's "make the well-timed case feel distinctly better".
+	 *
+	 * A speed bonus alone is nearly invisible at a glance: 25% more planar speed on a 0.9s arc reads
+	 * as "I think that went further". Height is the readable channel — the camera rises, the arc
+	 * lengthens for free, and the two bonuses multiply into a jump that goes somewhere a mistimed one
+	 * cannot reach. Floored at 1 for the same reason as the speed bonus: hitting the window must
+	 * never be worth less than missing it.
+	 */
+	float GetSlideJumpWindowZBonus() const;
 
 	/**
 	 * Seconds until the running slide will end, BY EITHER ROUTE. 0 when no slide is running.
@@ -494,10 +710,73 @@ protected:
 	float GetAirAcceleration() const;
 	float GetAirMaxWishSpeed() const;
 	float GetMaxAirSpeed() const;
+
+	// --- The air-strafe accumulation ceiling (spec v5 §1) ----------------------------------------
+	//
+	// Two INDEPENDENT limiters, either of which can be turned off on its own so the user can A/B
+	// "falloff only" against "cap only" against "neither".
+
+	/** Diminishing returns on the strafe's speed GAIN. Never affects the turn. */
+	bool  IsAirStrafeFalloffEnabled() const;
+
+	/** Speed at which the falloff starts. Below it a strafe is worth exactly what it was in Demo 5. */
+	float GetAirStrafeSoftCapSpeed() const;
+
+	/** Absolute ceiling on speed BUILT in the air. Also the point the falloff decays to zero at. */
+	float GetAirStrafeHardCapSpeed() const;
+
+	/** Falloff shape. 1 = linear taper, 2 = the shipped quadratic, higher = a longer flat top. */
+	float GetAirStrafeFalloffExponent() const;
+
+	/** The hard cap as a backstop in its own right, usable with the falloff switched off. */
+	bool  IsAirStrafeHardCapEnabled() const;
+
+	/**
+	 * Fraction of a strafe's speed gain that is actually granted at this planar speed: 1 below the
+	 * soft cap, 0 at the hard cap, ((Hard-Speed)/(Hard-Soft))^Exponent in between.
+	 *
+	 * Pure function of (Speed, config) — no state, so it replays exactly, and it is the one place the
+	 * curve is defined. The measurement harness prints it at a range of speeds.
+	 */
+	float GetAirStrafeGainScale(float PlanarSpeed) const;
+
 	bool  IsLandingMomentumPreserved() const;
 	float GetGroundOverspeedFriction() const;
 	float GetGroundOverspeedBraking() const;
 	float GetGroundOverspeedTurnRate() const;
+
+	// --- Mantle / ledge tuning (spec v5 §7) -------------------------------------------------------
+
+	bool  IsMantleEnabled() const;
+
+	/** How far ahead of the capsule's surface a ledge face may be and still be grabbed. */
+	float GetMantleReachUU() const;
+
+	/** Below this the engine's own step-up handles it and a mantle would look like a stutter. */
+	float GetMantleMinHeightUU() const;
+
+	/** Above this it is a wall, not a ledge. Hip-to-shoulder plus the jump's own rise. */
+	float GetMantleMaxHeightUU() const;
+
+	/** Total length of the pull-up. */
+	float GetMantleDurationSeconds() const;
+
+	/** Fraction of that spent climbing before the pawn moves forward over the lip. */
+	float GetMantleUpPhaseFraction() const;
+
+	/** Blocks an immediate re-grab of the same lip after a mantle ends. */
+	float GetMantleCooldownSeconds() const;
+
+	/** Minimum planar speed toward the wall. Stops a standing pawn vacuuming itself up every wall. */
+	float GetMantleMinForwardSpeed() const;
+
+	/**
+	 * How long the ability layer keeps believing the pawn is grounded after contact is lost.
+	 *
+	 * The ledge hysteresis. 0 restores exactly the Demo 5 behaviour, which is what the desync was
+	 * measured against.
+	 */
+	float GetLedgeGroundGraceSeconds() const;
 
 	/**
 	 * Pushes UTraceSettings values into the engine-owned fields the physics step reads directly
@@ -552,19 +831,11 @@ protected:
 	float SlideSpeed;
 	FVector SlideDirection;
 
-	/**
-	 * Seconds left of the window in which releasing crouch will NOT cancel the slide.
-	 *
-	 * A slide is a commitment: it is worth its cooldown precisely because you cannot bail out of it
-	 * the instant it stops being convenient. It also fixes a mundane input problem — the slide is
-	 * driven by a HELD level, so a key that comes up one frame early (or a bot whose hold timer
-	 * expires early) used to amputate the slide, and the player never learns why theirs was short.
-	 *
-	 * SAVED-MOVE STATE, like every other clock here: a correction mid-slide must rewind this with
-	 * the rest, or the replay decides the slide was cancellable when the original decided it was not
-	 * and the two ends disagree about where the pawn went.
-	 */
-	float SlideCommitRemaining;
+	// SlideCommitRemaining WAS HERE AND IS DELETED (spec v5 §3). It held the window in which
+	// releasing crouch would not cancel the slide. A one-shot ability cannot be cancelled by the key
+	// at all, so the whole idea of a PARTIAL commit is gone: every slide is committed for its whole
+	// duration. GetSlideMinCommitSeconds() went with it, and UTraceSettings::SlideMinCommitSeconds
+	// should be deleted too rather than left in the ini doing nothing.
 
 	/**
 	 * Seconds of "I pressed crouch and meant it" left over from a press that could not start a slide
@@ -631,6 +902,36 @@ protected:
 	 */
 	uint8 bWasAirborneLastMove : 1;
 
+	// --- Ledge / mantle state (all saved/restored by FSavedMove_Trace) ----------------------------
+
+	/**
+	 * Seconds of "the ability layer still counts this pawn as grounded" left after ground contact is
+	 * lost. Refilled to LedgeGroundGraceSeconds on every grounded move.
+	 *
+	 * SAVED-MOVE STATE. It gates EndSlide(), the fast-fall and the landing transition, so a replay
+	 * that lost it would resolve a ledge blip differently from the original — which is precisely the
+	 * class of divergence it was added to remove.
+	 */
+	float GroundGraceRemaining;
+
+	/** Seconds of pull-up left. Non-zero IS "mantling"; the mantle owns Velocity for its whole run. */
+	float MantleTimeRemaining;
+
+	/** Length the current mantle started with, so the two phases can be timed against a fixed total. */
+	float MantleTotalTime;
+
+	/** Where the pawn is being pulled to: standing on the ledge, capsule centre. */
+	FVector MantleTargetLocation;
+
+	/** Z the climb phase rises to before the pawn moves forward. Always >= the target's Z. */
+	float MantleUpTargetZ;
+
+	/** Planar speed at the instant the mantle began, handed back (capped) on exit. */
+	float MantleEntrySpeed;
+
+	/** Blocks re-grabbing the same lip the frame after a mantle ends. Charged in EndMantle(). */
+	float MantleCooldownRemaining;
+
 	/** See GetLastDashActiveWorldTime(). Server observation only; never saved or replicated. */
 	float LastDashActiveWorldTime = -1000.f;
 
@@ -691,6 +992,37 @@ protected:
 	 * the same trap MeasureRunDirection exists to avoid.
 	 */
 	FVector MeasureHomeLocation = FVector::ZeroVector;
+
+	/**
+	 * "-TraceLedgeTest": spawns a block of a known height in front of the pawn and runs at it, over
+	 * and over, counting ground-state flips, mantles and (on a client) server corrections.
+	 *
+	 * It builds its own geometry on purpose. The arena's raised sections are real ledges, but their
+	 * positions depend on the arena builder's tuning, and a diagnosis of a prediction bug has to be
+	 * repeatable against the same lip every time or the numbers measure the level.
+	 *
+	 * Runs on the LOCALLY CONTROLLED pawn in any net mode — unlike TickMomentumMeasure, which is
+	 * standalone-only — because the whole point is to measure what a networked client experiences.
+	 */
+	void TickLedgeTest(float DeltaSeconds);
+
+	float LedgeTestTime = -1.f;
+	int32 LedgeTestPhase = 0;
+	float LedgeTestPhaseTime = 0.f;
+	int32 LedgeTestRun = 0;
+	int32 LedgeTestGroundFlips = 0;
+	int32 LedgeTestMantles = 0;
+	uint8 bLedgeTestWasGrounded : 1;
+	FVector LedgeTestStart = FVector::ZeroVector;
+	FVector LedgeTestRunDirection = FVector::ForwardVector;
+	TWeakObjectPtr<AActor> LedgeTestBlock;
+#endif
+
+#if !UE_BUILD_SHIPPING
+	/** Corrections observed on this pawn since it spawned. Diagnostic only; never feeds movement. */
+	int32 CorrectionCount = 0;
+	float CorrectionErrorTotal = 0.f;
+	float CorrectionErrorWorst = 0.f;
 #endif
 };
 
@@ -744,7 +1076,6 @@ public:
 
 	float SavedSlideTimeRemaining;
 	float SavedSlideCooldownRemaining;
-	float SavedSlideCommitRemaining;
 	float SavedSlideSpeed;
 	float SavedSlideBufferRemaining;
 	FVector SavedSlideDirection;
@@ -754,6 +1085,22 @@ public:
 	/** The slide-jump's coyote window and its "this hop is worth the bonus" bit. */
 	float SavedSlideJumpGraceRemaining;
 	uint8 bSavedSlideJumpGraceWellTimed : 1;
+
+	/**
+	 * The ledge grace and the whole mantle (spec v5 §7).
+	 *
+	 * Every one of these is restored by PrepMoveFor. A correction that landed mid-pull-up and lost
+	 * them would replay the mantle as a fall — the pawn would be on top of the ledge on one machine
+	 * and at the bottom of it on the other, which is the largest possible version of the exact bug
+	 * this feature was added to fix.
+	 */
+	float SavedGroundGraceRemaining;
+	float SavedMantleTimeRemaining;
+	float SavedMantleTotalTime;
+	FVector SavedMantleTargetLocation;
+	float SavedMantleUpTargetZ;
+	float SavedMantleEntrySpeed;
+	float SavedMantleCooldownRemaining;
 };
 
 /** Client prediction data whose only job is to hand out FSavedMove_Trace instances. */

@@ -4,7 +4,7 @@
 
 #include "Trace.h"
 #include "TraceTypes.h"
-#include "TraceSettings.h"              // GoalWidthFieldFraction / GoalHeightUU (spec v4 section 7)
+#include "TraceSettings.h"              // GoalWidthFieldFraction / GoalHeightUU (spec v4 section 7, resized v5 section 4)
 #include "Core/TraceCharacter.h"        // PlayerHeightUU() reads the capsule off the CDO
 #include "Core/TraceGameState.h"        // GetScoringModeFor - the one authority on which mode runs
 #include "Gameplay/TraceEndzone.h"
@@ -787,8 +787,11 @@ namespace TraceArenaConstants
 	// Verbatim: "scoring should happen when the core is thrown into the goal or a player carries the
 	// core into the goal. The goal should not be the entire width of the map, like the endzone."
 	//
-	// THE SHAPE. A goal is the middle GoalWidthFieldFraction of the field width (a third, so 3200 uu
-	// on the 9600 uu field), from the goal line back to the end wall, and GoalHeightUU (700) tall. It
+	// THE SHAPE. A goal is the middle GoalWidthFieldFraction of the field width (0.2083 of a 9600 uu
+	// field, so a 2000 uu mouth) from the goal line back to the end wall, and GoalHeightUU (440) tall.
+	// Both shrank in spec v5 section 4 - "for game mode b ONLY ... decrease the size of the goal
+	// (reduce height and width)" - and both shrank by the SAME factor, so the mouth keeps its
+	// proportions. Mode A never reads either number: its endzones span the full width and wall height. It
 	// is drawn as an actual goal: two posts standing ON the goal line at the edges of the mouth, a
 	// crossbar between them at the top of the volume, a lit sill across the mouth on the floor and a
 	// lit patch of floor inside it. That set of five lines is what makes the volume READ - a player
@@ -837,12 +840,20 @@ ATraceArenaBuilder::ATraceArenaBuilder()
 	SetReplicateMovement(false);
 	SetCanBeDamaged(false);
 
-	// The builder sits at the arena centre and the arena is now 24000 uu long, which is well past
-	// the default net cull distance - but this actor has nothing to replicate beyond its own
-	// existence, and AActor's relevancy fields changed accessor form during the 5.x line, so it is
-	// left alone deliberately (build contract section 1). Clients build their own copy of the
-	// geometry from BeginPlay; if the actor ever went irrelevant mid-match nothing would change,
-	// because the geometry is local and already built.
+	// MEASURED BUG, FIXED (spec v5 section 0). The comment that used to live here argued that
+	// relevancy did not matter "because the geometry is local and already built". That is true for
+	// going irrelevant MID-MATCH and false for the only case that counts: the FIRST replication.
+	//
+	// The builder is spawned at the origin, server-only, by ATraceGameMode. A client never runs
+	// BeginPlay - and so never calls EnsureBuilt() - until the actor arrives over the wire. With
+	// the default NetCullDistanceSquared of 225000000 (15000 uu) and player starts at X = +-15600,
+	// the actor is out of range from the very first frame and NEVER arrives. The client log
+	// contained no "Arena built" line at all and the joining pawn fell to Z = -19636.
+	//
+	// bAlwaysRelevant is still a plain public uint8:1 on AActor in 5.8 - ATraceCore sets it the
+	// same way a few files over, so the accessor-form worry in the old comment is settled. It costs
+	// one relevancy result per connection for an actor with zero replicated properties.
+	bAlwaysRelevant = true;
 
 	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 	SetRootComponent(Root);
@@ -1018,7 +1029,7 @@ FBox ATraceArenaBuilder::GetEndzoneBounds(float EndSign) const
 float ATraceArenaBuilder::GoalHalfWidth() const
 {
 	// The FRACTION IS OF THE FULL WIDTH, so halving it twice is correct and is the mistake to watch
-	// for: a third of the width is 3200 uu of mouth, i.e. 1600 either side of the centre line.
+	// for: at the v5 default this is 2000 uu of mouth, i.e. 1000 either side of the centre line.
 	const float Fraction = FMath::Clamp(UTraceSettings::Get().GoalWidthFieldFraction,
 		TraceArenaConstants::MinGoalWidthFraction, TraceArenaConstants::MaxGoalWidthFraction);
 
@@ -2228,7 +2239,7 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 	// MODE B - the goals. Spec v4 section 7, verbatim: "The goal should not be the entire width of
 	// the map, like the endzone."
 	//
-	// A goal is the middle third of the field width, the full endzone depth, and 700 uu tall: a real
+	// A goal is 2000 uu of the field width, the full endzone depth, and 440 uu tall: a real
 	// goal shape rather than a repainted endzone. Two posts stand on the goal line at the edges of
 	// the mouth carrying a crossbar at the top of the scoring volume, a bright sill crosses the mouth
 	// on the floor and the floor inside the mouth is tinted, so that from midfield you can see both
@@ -2246,6 +2257,15 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 	// (which builds collision and no visuals at all) an untagged post would still be a wall standing
 	// in the endzone through the whole of mode A.
 	const int32 GoalMark = MarkBuiltComponents();
+
+	// Say the finished size out loud, in uu. GoalWidthFieldFraction is a fraction of a field width
+	// that is itself a setting, so "0.2083" tells nobody whether the goal is still throwable at; this
+	// is the line a tuning pass is actually judged against, and it is the proof that the v5 shrink
+	// landed on the volume that SCORES and not only on the frame that is drawn.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Arena] MODE B goal: %.0f uu wide x %.0f uu tall x %.0f deep (%.1f%% of the %.0f uu field width)"),
+		MouthHalfY * 2.f, Height, Depth,
+		(FieldWidth > 0.f) ? (MouthHalfY * 200.f / FieldWidth) : 0.f, FieldWidth);
 
 	const ETraceTeam Teams[] = { ETraceTeam::Blue, ETraceTeam::Orange };
 	for (const ETraceTeam Team : Teams)

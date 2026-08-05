@@ -14,15 +14,22 @@
 
 #include "Movement/TraceCharacterMovementComponent.h"
 
+#include "Components/CapsuleComponent.h"        // mantle: capsule dimensions and the clearance sweep
 #include "Components/SceneComponent.h"
+#include "CollisionQueryParams.h"
 #include "Core/TraceCharacter.h"
-#include "Engine/World.h"                      // UWorld::GetTimeSeconds (dash-active latch)
+#include "Engine/World.h"                      // UWorld::GetTimeSeconds (dash-active latch), traces
 #include "GameFramework/Character.h"
 #include "Math/UnrealMathUtility.h"
 #include "Trace.h"                             // LogTraceGame
 #include "TraceSettings.h"
+#include "UObject/UnrealType.h"                // FProperty, for the name-bound spec v5 knobs
 
 #if !UE_BUILD_SHIPPING
+#include "Components/StaticMeshComponent.h"    // ledge test: the block it builds for itself
+#include "Engine/Engine.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshActor.h"
 #include "GameFramework/PlayerController.h"    // measurement harness: player-controlled check
 #include "HAL/IConsoleManager.h"
 #include "Misc/CommandLine.h"
@@ -39,6 +46,92 @@ namespace TraceMoveCfg
 {
 	/** Below this the pawn is treated as having no horizontal motion at all. */
 	constexpr float SpeedEpsilon = 1.f;
+}
+
+// =================================================================================================
+// THE SPEC v5 KNOBS, AND WHY THEY ARE BOUND BY NAME
+// =================================================================================================
+//
+// Spec v5 §1, §3 and §7 need eighteen new tunables. UTraceSettings belongs to another ownership
+// slice this pass, so the UPROPERTYs cannot be declared from here — and shipping the numbers as
+// hardcoded literals would mean shipping a movement pass with nothing to tune, which is worse.
+//
+// So each knob is resolved ONCE, by name, against UTraceSettings' UClass, and falls back to the
+// default written at the call site if the property does not exist yet. The instant the integrator
+// adds `float AirStrafeSoftCapSpeed = 950.f;` (and its ini line) the binding takes over, with no
+// change here and no rebuild of this file's behaviour.
+//
+// THIS PROJECT HAS BEEN BITTEN BY EXACTLY THE OPPOSITE ARRANGEMENT: five of eight mode-B knobs were
+// dead last pass because a name-bound lookup silently missed and nobody could tell. That is why
+// TraceMoveKnob::LogBindReport() prints, once per process at Display, every knob's name, the value
+// actually in force and whether it came from UTraceSettings or from the fallback. "BOUND" means the
+// ini can drive it; "default" means it cannot, and the report says so in as many words.
+//
+// Game thread only (movement is), and the cache is keyed on the property name, so the cost after the
+// first move is one TMap lookup per knob per read — the same order as the UTraceSettings::Get()
+// reads every other accessor in this file already does.
+
+namespace TraceMoveKnob
+{
+	struct FBinding
+	{
+		const FProperty* Property = nullptr;
+		bool bResolved = false;
+	};
+
+	/** Name -> resolved property (or a resolved miss). Never invalidated: UClass layout is static. */
+	static TMap<FName, FBinding>& Bindings()
+	{
+		static TMap<FName, FBinding> Map;
+		return Map;
+	}
+
+	/** Recorded purely so the bind report can name the knobs that fell back. */
+	static TMap<FName, bool>& BindReport()
+	{
+		static TMap<FName, bool> Map;
+		return Map;
+	}
+
+	static const FProperty* Resolve(const FName Name)
+	{
+		FBinding& Binding = Bindings().FindOrAdd(Name);
+		if (!Binding.bResolved)
+		{
+			Binding.bResolved = true;
+			Binding.Property = UTraceSettings::StaticClass()->FindPropertyByName(Name);
+			BindReport().Add(Name, Binding.Property != nullptr);
+		}
+		return Binding.Property;
+	}
+
+	static float Float(const FName Name, const float Default)
+	{
+		if (const FProperty* Property = Resolve(Name))
+		{
+			if (const FFloatProperty* AsFloat = CastField<FFloatProperty>(Property))
+			{
+				return AsFloat->GetPropertyValue_InContainer(&UTraceSettings::Get());
+			}
+			if (const FDoubleProperty* AsDouble = CastField<FDoubleProperty>(Property))
+			{
+				return static_cast<float>(AsDouble->GetPropertyValue_InContainer(&UTraceSettings::Get()));
+			}
+		}
+		return Default;
+	}
+
+	static bool Bool(const FName Name, const bool bDefault)
+	{
+		if (const FProperty* Property = Resolve(Name))
+		{
+			if (const FBoolProperty* AsBool = CastField<FBoolProperty>(Property))
+			{
+				return AsBool->GetPropertyValue_InContainer(&UTraceSettings::Get());
+			}
+		}
+		return bDefault;
+	}
 }
 
 namespace TraceMovement
@@ -103,6 +196,27 @@ static bool IsSlideDebugEnabled()
 static int32 GTraceSlideDebugCount = 0;
 static float GTraceSlideDebugTotalDuration = 0.f;
 static float GTraceSlideDebugTotalDistance = 0.f;
+
+/**
+ * Mantle instrumentation (spec v5 §7). Same rules as the slide's: off by default, Display when on.
+ * Declared up here rather than beside the other dev code at the bottom because TryBeginMantle() and
+ * EndMantle() sit in the middle of the file and are the two places worth watching.
+ */
+int32 GTraceMantleDebug = 0;
+static FAutoConsoleVariableRef CVarTraceMantleDebug(
+	TEXT("Trace.MantleDebug"),
+	GTraceMantleDebug,
+	TEXT("Dev only. Non-zero logs every mantle: ledge height, reach, duration and the exit speed."),
+	ECVF_Cheat);
+
+static bool IsMantleDebugEnabled()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceMantleDebug"));
+	return bFromCommandLine || GTraceMantleDebug != 0;
+}
+
+/** Mantles observed process-wide, so a headless run can answer "did it ever fire" with a count. */
+static int32 GTraceMantleCount = 0;
 #endif
 
 // -------------------------------------------------------------------------------------------
@@ -122,7 +236,6 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 
 	SlideTimeRemaining = 0.f;
 	SlideCooldownRemaining = 0.f;
-	SlideCommitRemaining = 0.f;
 	SlideSpeed = 0.f;
 	SlideDirection = FVector::ZeroVector;
 	SlideBufferRemaining = 0.f;
@@ -130,6 +243,18 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	bSlideJumpGraceWellTimed = 0;
 	bSlideHeldLastMove = 0;
 	bWasAirborneLastMove = 0;
+
+	GroundGraceRemaining = 0.f;
+	MantleTimeRemaining = 0.f;
+	MantleTotalTime = 0.f;
+	MantleTargetLocation = FVector::ZeroVector;
+	MantleUpTargetZ = 0.f;
+	MantleEntrySpeed = 0.f;
+	MantleCooldownRemaining = 0.f;
+
+#if !UE_BUILD_SHIPPING
+	bLedgeTestWasGrounded = 0;
+#endif
 
 	// Third-person feel: the capsule turns toward where it is moving. Aim is separate and comes
 	// from the control rotation (ATraceCharacter::GetAimDirection), which is why the character
@@ -148,6 +273,28 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	GroundFriction = 8.f;
 	JumpZVelocity = 640.f;
 	bCanWalkOffLedges = true;
+
+	// --- LEDGE STABILITY, spec v5 §7 --------------------------------------------------------------
+	//
+	// FIX 1 OF 3 FOR THE "RUBBER BANDING ON THE EDGE OF A RAISED SECTION" REPORT, and the only one
+	// that is a straight engine setting. See the header for the full diagnosis.
+	//
+	// PerchRadiusThreshold ships at 0, which disables the reduced-radius perch test entirely: a pawn
+	// counts as WALKING while any part of its capsule's bottom hemisphere touches the lip, i.e. while
+	// it is balanced on a fraction of a uu. Whether that sweep catches or misses is decided by
+	// sub-uu geometry, and the client and the server evaluate it on DIFFERENT sub-steps of the same
+	// second, so they take the coin flip independently. Each disagreement puts them on opposite sides
+	// of this component's air-model / ground-model split (see CalcVelocity), which is worth hundreds
+	// of uu/s rather than the fraction of a uu the geometry actually differed by.
+	//
+	// 15 uu gives the decision a band instead of an edge. The capsule radius is 42, so a pawn is now
+	// "perched" (and falls) once it has less than 15 uu of support, and solidly walking above that —
+	// a state both machines reach from the same geometry several frames before it matters.
+	//
+	// Deliberately NOT bUseFlatBaseForFloorChecks: that changes floor detection everywhere, including
+	// on the arena's 40 uu step risers, and this fix has to be surgical.
+	PerchRadiusThreshold = 15.f;
+	PerchAdditionalHeight = 40.f;
 
 	// --- The air, spec §2.1 ---------------------------------------------------------------------
 	//
@@ -209,7 +356,7 @@ void UTraceCharacterMovementComponent::BeginPlay()
 				TEXT("MOVECFG walk=%.0f | AIR srcAccel=%d accel=%.0f wishCap=%.0f maxAir=%.0f "
 				     "| LAND preserve=%d overspeedFric=%.2f overspeedBrake=%.0f turn=%.1f dashExit=%.2fx "
 				     "| SLIDE dur=%.2f entryMul=%.2f cooldownFromEnd=%.2f max=%.0f decel=%.0f "
-				     "commit=%.2f exitRet=%.2f exitCeil=%.2f (NO impulse, NO exit floor - spec v4 s1) "
+				     "exitRet=%.2f exitCeil=%.2f (ONE-SHOT - spec v5 s3; NO impulse, NO exit floor, NO commit) "
 				     "| SLIDEJUMP on=%d retain=%.2f zMul=%.2f window=%.2f windowBonus=%.2f "
 				     "| DASH speed=%.0f dur=%.2f cd=%.2f"),
 				MaxWalkSpeed,
@@ -217,11 +364,46 @@ void UTraceCharacterMovementComponent::BeginPlay()
 				IsLandingMomentumPreserved() ? 1 : 0, GetGroundOverspeedFriction(), GetGroundOverspeedBraking(),
 				GetGroundOverspeedTurnRate(), GetDashExitSpeedMultiplier(),
 				GetSlideDuration(), GetSlideEntrySpeedMultiplier(), GetSlideCooldownSeconds(),
-				Settings.SlideMaxSpeed, GetSlideDeceleration(), GetSlideMinCommitSeconds(),
+				Settings.SlideMaxSpeed, GetSlideDeceleration(),
 				GetSlideExitSpeedRetention(), GetSlideExitMaxSpeedMultiplier(),
 				IsSlideJumpEnabled() ? 1 : 0, GetSlideJumpHorizontalRetention(), GetSlideJumpZMultiplier(),
 				GetSlideJumpWindowSeconds(), GetSlideJumpWindowSpeedBonus(),
 				GetDashSpeed(), GetDashDuration(), GetDashCooldown());
+
+			// --- SPEC v5, and the bind report ----------------------------------------------------
+			//
+			// Reading every new knob here is what POPULATES TraceMoveKnob::BindReport(), so the
+			// listing below is complete by construction: a knob that is never read cannot be missing
+			// from the report, because it is not a knob this file uses.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MOVECFG-V5 AIRSTRAFE falloff=%d soft=%.0f hard=%.0f exp=%.2f hardCapOn=%d "
+				     "| SLIDE oneShot=1 dur=%.2f hiddenCooldown=%.2f windowBonus=%.2f zBonus=%.2f "
+				     "| MANTLE on=%d reach=%.0f minH=%.0f maxH=%.0f dur=%.2f upFrac=%.2f cd=%.2f minSpd=%.0f "
+				     "| LEDGE grace=%.3f perchThreshold=%.1f"),
+				IsAirStrafeFalloffEnabled() ? 1 : 0, GetAirStrafeSoftCapSpeed(), GetAirStrafeHardCapSpeed(),
+				GetAirStrafeFalloffExponent(), IsAirStrafeHardCapEnabled() ? 1 : 0,
+				GetSlideDuration(), GetSlideCooldownSeconds(), GetSlideJumpWindowSpeedBonus(),
+				GetSlideJumpWindowZBonus(),
+				IsMantleEnabled() ? 1 : 0, GetMantleReachUU(), GetMantleMinHeightUU(), GetMantleMaxHeightUU(),
+				GetMantleDurationSeconds(), GetMantleUpPhaseFraction(), GetMantleCooldownSeconds(),
+				GetMantleMinForwardSpeed(), GetLedgeGroundGraceSeconds(), PerchRadiusThreshold);
+
+			// The knob hygiene check the project's own history demands. A name-bound knob that does
+			// not resolve is not a build error and not a runtime error — it is a setting that
+			// silently does nothing, which is how five of eight knobs died last pass. Every one of
+			// them is named here, every pass, with the word BOUND or the word FALLBACK next to it.
+			int32 BoundCount = 0;
+			int32 FallbackCount = 0;
+			for (const TPair<FName, bool>& Entry : TraceMoveKnob::BindReport())
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("MOVEKNOB %-28s %s"),
+					*Entry.Key.ToString(),
+					Entry.Value ? TEXT("BOUND to UTraceSettings (ini-tunable)")
+					            : TEXT("FALLBACK to the built-in default (property missing -> ini CANNOT tune it)"));
+				(Entry.Value ? BoundCount : FallbackCount)++;
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("MOVEKNOB summary: %d bound, %d on built-in defaults"),
+				BoundCount, FallbackCount);
 		}
 	}
 #endif
@@ -280,12 +462,11 @@ float UTraceCharacterMovementComponent::GetSlideDeceleration() const
 	return FMath::Max(0.f, UTraceSettings::Get().SlideDeceleration);
 }
 
-float UTraceCharacterMovementComponent::GetSlideMinCommitSeconds() const
-{
-	// Clamped to the slide's own length: a commit window longer than the slide is meaningless, and
-	// leaving it unclamped would let one bad number make the slide feel like it ignores the key.
-	return FMath::Clamp(UTraceSettings::Get().SlideMinCommitSeconds, 0.f, GetSlideDuration());
-}
+// GetSlideMinCommitSeconds() WAS HERE AND IS DELETED (spec v5 §3). It read the window in which
+// releasing crouch could not cancel a slide. A one-shot ability has no partial commit — the whole
+// slide is committed the moment it starts — so the knob has nothing left to mean. Delete
+// UTraceSettings::SlideMinCommitSeconds and its DefaultGame.ini line with it; a setting that is read
+// nowhere is exactly the "silently dead knob" this project keeps getting caught by.
 
 float UTraceCharacterMovementComponent::GetSlideExitSpeedRetention() const
 {
@@ -349,7 +530,82 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
 {
 	// Never below 1: the window must never be able to PUNISH a well-timed hop. Missing the timing is
 	// allowed to be worth less; hitting it must never be worth less than missing it.
+	//
+	// SPEC v5 §3 RAISES THIS FROM 1.10 TO 1.25. The property is UTraceSettings::
+	// SlideJumpWindowSpeedBonus and the shipped value lives in DefaultGame.ini, which wins over the
+	// header default — both have to move or the retune does nothing. 1.10 was a 10% edge on a 0.9s
+	// arc, which is roughly the frame-to-frame noise a player sees anyway; with the hold-to-extend
+	// gone this is the only skill expression sliding has left, so it has to be legible.
 	return FMath::Max(1.f, UTraceSettings::Get().SlideJumpWindowSpeedBonus);
+}
+
+float UTraceCharacterMovementComponent::GetSlideJumpWindowZBonus() const
+{
+	// New in spec v5 §3. Height is the channel a player can actually SEE — 25% more planar speed is
+	// deniable, clearing a box you could not clear a second ago is not.
+	return FMath::Max(1.f, TraceMoveKnob::Float(TEXT("SlideJumpWindowZBonus"), 1.12f));
+}
+
+// --- The air-strafe accumulation ceiling (spec v5 §1) -------------------------------------------
+
+bool UTraceCharacterMovementComponent::IsAirStrafeFalloffEnabled() const
+{
+	return TraceMoveKnob::Bool(TEXT("bAirStrafeGainFalloff"), true);
+}
+
+float UTraceCharacterMovementComponent::GetAirStrafeSoftCapSpeed() const
+{
+	// 950 = 1.19 x the 800 walk speed. Below it a strafe is worth EXACTLY what it was in Demo 5,
+	// which is the part the user called incredible and asked not to be touched.
+	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("AirStrafeSoftCapSpeed"), 950.f));
+}
+
+float UTraceCharacterMovementComponent::GetAirStrafeHardCapSpeed() const
+{
+	// Always strictly above the soft cap: the falloff divides by (Hard - Soft), and a designer who
+	// set them equal would otherwise get a divide-by-zero rather than the "cap everything at the soft
+	// cap" they obviously meant.
+	return FMath::Max(GetAirStrafeSoftCapSpeed() + 1.f,
+		TraceMoveKnob::Float(TEXT("AirStrafeHardCapSpeed"), 1250.f));
+}
+
+float UTraceCharacterMovementComponent::GetAirStrafeFalloffExponent() const
+{
+	// 1 is a linear taper. 2 (shipped) keeps most of the strafe's value until well past the soft cap
+	// and then collapses it, which is what "harder and harder past a certain point" describes.
+	// Floored at a small positive number rather than 0, because Pow(x, 0) == 1 would silently turn
+	// the falloff into a no-op that still reported itself as enabled.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("AirStrafeFalloffExponent"), 2.f), 0.05f, 16.f);
+}
+
+bool UTraceCharacterMovementComponent::IsAirStrafeHardCapEnabled() const
+{
+	return TraceMoveKnob::Bool(TEXT("bAirStrafeHardCap"), true);
+}
+
+float UTraceCharacterMovementComponent::GetAirStrafeGainScale(const float PlanarSpeed) const
+{
+	if (!IsAirStrafeFalloffEnabled())
+	{
+		return 1.f;
+	}
+
+	const float Soft = GetAirStrafeSoftCapSpeed();
+	if (PlanarSpeed <= Soft)
+	{
+		return 1.f;
+	}
+
+	const float Hard = GetAirStrafeHardCapSpeed();
+	if (PlanarSpeed >= Hard)
+	{
+		return 0.f;
+	}
+
+	// Headroom left, as a fraction of the whole falloff band, raised to the exponent. Pure function
+	// of (PlanarSpeed, config) — no state, no time, so a replayed frame lands on the identical value.
+	const float Headroom = (Hard - PlanarSpeed) / (Hard - Soft);
+	return FMath::Pow(FMath::Clamp(Headroom, 0.f, 1.f), GetAirStrafeFalloffExponent());
 }
 
 bool UTraceCharacterMovementComponent::IsSourceAirAccelerationEnabled() const
@@ -390,6 +646,68 @@ float UTraceCharacterMovementComponent::GetGroundOverspeedBraking() const
 float UTraceCharacterMovementComponent::GetGroundOverspeedTurnRate() const
 {
 	return FMath::Max(0.f, UTraceSettings::Get().GroundOverspeedTurnRate);
+}
+
+// --- Mantle / ledge tuning (spec v5 §7) ---------------------------------------------------------
+
+bool UTraceCharacterMovementComponent::IsMantleEnabled() const
+{
+	return TraceMoveKnob::Bool(TEXT("bMantleEnabled"), true);
+}
+
+float UTraceCharacterMovementComponent::GetMantleReachUU() const
+{
+	// Measured from the capsule's SURFACE, not its centre — a reach expressed from the centre would
+	// silently change meaning if the capsule radius ever moved.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("MantleReachUU"), 70.f), 10.f, 400.f);
+}
+
+float UTraceCharacterMovementComponent::GetMantleMinHeightUU() const
+{
+	// Under this the engine's own step-up already carries the pawn over, and a mantle would read as a
+	// stutter on a kerb. MaxStepHeight is 45 and the arena's risers are 40, so 55 leaves both alone.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("MantleMinHeightUU"), 55.f), 0.f, 400.f);
+}
+
+float UTraceCharacterMovementComponent::GetMantleMaxHeightUU() const
+{
+	// Hip-to-shoulder, plus what a jump adds. The capsule is 88 uu half height (176 full), and the
+	// arena's smallest raised sections are exactly one player height — the ones the report is about.
+	// A plain jump reaches 640^2/(2*980) = 209 uu, so 230 covers "I jumped at it and just clipped the
+	// edge" without turning the 352 uu structures into free climbing.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("MantleMaxHeightUU"), 230.f),
+		GetMantleMinHeightUU() + 1.f, 1000.f);
+}
+
+float UTraceCharacterMovementComponent::GetMantleDurationSeconds() const
+{
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("MantleDurationSeconds"), 0.35f), 0.05f, 2.f);
+}
+
+float UTraceCharacterMovementComponent::GetMantleUpPhaseFraction() const
+{
+	// Never 0 and never 1: the climb has to finish before the pawn crosses the lip (or it walks into
+	// the wall face) and the crossing has to have time left (or it ends hanging in the air over it).
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("MantleUpPhaseFraction"), 0.6f), 0.1f, 0.9f);
+}
+
+float UTraceCharacterMovementComponent::GetMantleCooldownSeconds() const
+{
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("MantleCooldownSeconds"), 0.35f), 0.f, 10.f);
+}
+
+float UTraceCharacterMovementComponent::GetMantleMinForwardSpeed() const
+{
+	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("MantleMinForwardSpeed"), 120.f));
+}
+
+float UTraceCharacterMovementComponent::GetLedgeGroundGraceSeconds() const
+{
+	// 0.08s is about five frames at 60Hz — long enough to swallow the one- or two-frame contact blip
+	// a capsule takes crossing a lip, far too short to let a pawn slide off a roof and keep sliding.
+	// Setting it to 0 restores the Demo 5 behaviour exactly, which is what the desync was measured
+	// against.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("LedgeGroundGraceSeconds"), 0.08f), 0.f, 0.5f);
 }
 
 void UTraceCharacterMovementComponent::RefreshEngineTunablesFromSettings()
@@ -516,6 +834,19 @@ void UTraceCharacterMovementComponent::CalcVelocity(float DeltaTime, float Frict
 
 	if (!bBaseWouldBailOut)
 	{
+		// --- MANTLE (spec v5 §7) -----------------------------------------------------------------
+		//
+		// First, and unconditional: the pull-up owns the velocity vector outright for its whole
+		// window, exactly as the dash owns it for the dash's. Written HERE rather than in
+		// OnMovementUpdated for the reason at the top of this function — PhysFlying reads Velocity
+		// immediately after CalcVelocity returns, so this is the only place a mantle can move the
+		// pawn on the frame it was computed.
+		if (MantleTimeRemaining > 0.f)
+		{
+			ApplyMantleVelocity(DeltaTime);
+			return;
+		}
+
 		// --- AIR (spec §2.1) ---------------------------------------------------------------------
 		//
 		// Not while dashing: the dash owns the velocity vector outright for its whole window and
@@ -607,15 +938,50 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 	const float AccelSpeed = FMath::Min(GetAirAcceleration() * DeltaTime, AddSpeed);
 	FVector NewPlanar = PlanarVelocity + WishDirection * AccelSpeed;
 
-	// MaxAirSpeed is a ceiling on what air input may BUILD, never a brake on what the pawn arrived
-	// with: a slide-jump that leaves the ground above the cap keeps every unit of it. Floor the
-	// ceiling at the entry speed and the clamp can only ever remove speed this call just added.
-	const float SpeedCeiling = FMath::Max(GetMaxAirSpeed(), SpeedBefore);
 	const float NewSpeed = NewPlanar.Size();
-	if (NewSpeed > SpeedCeiling && NewSpeed > UE_KINDA_SMALL_NUMBER)
+	if (NewSpeed <= UE_KINDA_SMALL_NUMBER)
 	{
-		NewPlanar *= (SpeedCeiling / NewSpeed);
+		Velocity.X = NewPlanar.X;
+		Velocity.Y = NewPlanar.Y;
+		return;
 	}
+
+	// =============================================================================================
+	// SPEC v5 §1 — THE ACCUMULATION CEILING. EVERYTHING ABOVE THIS LINE IS UNCHANGED.
+	//
+	// "The air strafing feels incredible, but its too powerful with how much momentum can be gained."
+	//
+	// NewPlanar is already the fully turned vector. The only thing left to decide is HOW LONG it is,
+	// and the two limiters below touch nothing else — which is the whole reason the turn survives:
+	// the direction computed by the projection formula is preserved exactly, and a player at the hard
+	// cap can still carve their velocity round at constant speed indefinitely, for free, forever.
+	// What they cannot do is make it any longer.
+	// =============================================================================================
+
+	// The projection formula can only ever ADD along the wish direction, so this is >= 0 by
+	// construction; the Max is belt and braces against float noise at very low speeds.
+	const float RawGain = FMath::Max(0.f, NewSpeed - SpeedBefore);
+
+	// DIMINISHING RETURNS. Sampled at the speed the frame STARTED at, not at NewSpeed: sampling the
+	// output would make the scale depend on the frame length, and two 8ms frames would then not equal
+	// one 16ms frame — which is precisely the non-linearity CanCombineWith exists to protect the
+	// prediction from, and there is no reason to add another one.
+	const float GainScale = GetAirStrafeGainScale(SpeedBefore);
+	float TargetSpeed = SpeedBefore + RawGain * GainScale;
+
+	// THE BACKSTOPS. Both are floored at SpeedBefore so that a ceiling can only ever remove speed
+	// THIS CALL just added, and can never brake momentum carried into the air — a slide-jump that
+	// leaves the ground above the cap keeps every unit of it, exactly as MaxAirSpeed always did.
+	float SpeedCeiling = FMath::Max(GetMaxAirSpeed(), SpeedBefore);
+	if (IsAirStrafeHardCapEnabled())
+	{
+		SpeedCeiling = FMath::Min(SpeedCeiling, FMath::Max(GetAirStrafeHardCapSpeed(), SpeedBefore));
+	}
+	TargetSpeed = FMath::Min(TargetSpeed, SpeedCeiling);
+
+	// Rescale, KEEPING THE DIRECTION. This one line is the difference between "limit how much speed
+	// can accumulate" and "undo the Source feel".
+	NewPlanar *= (TargetSpeed / NewSpeed);
 
 	Velocity.X = NewPlanar.X;
 	Velocity.Y = NewPlanar.Y;
@@ -700,6 +1066,14 @@ bool UTraceCharacterMovementComponent::CanDash() const
 	// One dash at a time, whatever the pool says — chaining two dashes into one 5200uu/s smear is
 	// not the mechanic, and the trail trip test reasons about a single dash window.
 	if (DashTimeRemaining > 0.f)
+	{
+		return false;
+	}
+
+	// The mantle owns the pawn for its whole window (spec v5 §7). A dash fired mid-pull-up would
+	// fight ApplyMantleVelocity for Velocity every sub-step, and the loser would be whichever machine
+	// resolved the frame differently.
+	if (MantleTimeRemaining > 0.f)
 	{
 		return false;
 	}
@@ -837,13 +1211,20 @@ bool UTraceCharacterMovementComponent::CanStartSlide() const
 		return false;
 	}
 
-	if (SlideTimeRemaining > 0.f || SlideCooldownRemaining > 0.f || DashTimeRemaining > 0.f)
+	// SlideCooldownRemaining IS THE HIDDEN COOLDOWN (spec v5 §3). It is enforced here and nowhere
+	// else, it is charged in EndSlide(), and nothing draws it. Take this test out and "trigger once,
+	// like an ability, with a hidden cooldown to prevent spamming it" becomes a slide you can hold by
+	// mashing.
+	if (SlideTimeRemaining > 0.f || SlideCooldownRemaining > 0.f || DashTimeRemaining > 0.f
+		|| MantleTimeRemaining > 0.f)
 	{
 		return false;
 	}
 
-	// The key must still be down when the buffered press finally lands, or a tap would start a
-	// slide that the very next frame's "released early" test immediately cancels.
+	// NOTE (spec v5 §3): this is NOT "the key is still held" as a requirement to keep sliding — that
+	// rule is gone with the hold. It only stops a buffered press from firing after the player has
+	// already let go, which would start a slide nobody is asking for any more. Once BeginSlide() has
+	// run the key is irrelevant for the rest of the slide.
 	if (!IsCrouchHeld())
 	{
 		return false;
@@ -916,8 +1297,9 @@ void UTraceCharacterMovementComponent::BeginSlide()
 
 	SlideSpeed = FMath::Max(ScaledEntrySpeed, EntrySpeed);
 
+	// ONE PRESS BUYS THE WHOLE DURATION (spec v5 §3). There is no commit window any more because
+	// there is nothing left to commit against: the key cannot end this slide.
 	SlideTimeRemaining = GetSlideDuration();
-	SlideCommitRemaining = GetSlideMinCommitSeconds();
 
 	// A fresh slide owns the slide-jump window outright: any coyote grace left over from the previous
 	// slide is void, or a slide started 0.1s after one ended would inherit the last one's "well
@@ -954,7 +1336,6 @@ void UTraceCharacterMovementComponent::EndSlide()
 	{
 		// Idempotent: the cancel paths and the natural exits can all reach here, and a second call
 		// must not re-write Velocity with a stale direction or re-charge the cooldown.
-		SlideCommitRemaining = 0.f;
 		return;
 	}
 
@@ -993,7 +1374,6 @@ void UTraceCharacterMovementComponent::EndSlide()
 	SlideJumpGraceRemaining = WellTimedWindow;
 
 	SlideTimeRemaining = 0.f;
-	SlideCommitRemaining = 0.f;
 	const float ExitedSpeed = SlideSpeed;
 	SlideSpeed = 0.f;
 
@@ -1127,7 +1507,12 @@ bool UTraceCharacterMovementComponent::CanAttemptJump() const
 	//
 	// Everything else Super checks is kept verbatim, including the IsMovingOnGround() || IsFalling()
 	// test, which ACharacter::JumpIsAllowedInternal still validates against JumpMaxCount on top.
-	return IsJumpAllowed() && (IsMovingOnGround() || IsFalling());
+	//
+	// ...plus one clause of our own: no jumping out of a mantle. The pull-up is in MOVE_Flying, so
+	// Super's mode test would already refuse, but stating it here means the rule survives if the
+	// mantle ever moves to a custom mode — and a jump that fired mid-pull-up would leave the mantle
+	// clock running with the pawn no longer on its rail.
+	return IsJumpAllowed() && !IsMantling() && (IsMovingOnGround() || IsFalling());
 }
 
 bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaTime)
@@ -1208,7 +1593,13 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 	// on the multi-frame path: with a non-zero JumpMaxHoldTime the engine calls DoJump on several
 	// consecutive frames, and the slide is only alive for the first of them, so only the first can be
 	// a slide-jump. A second scaling cannot happen because bSlideJump is false by then.
-	Velocity.Z *= GetSlideJumpZMultiplier();
+	//
+	// SPEC v5 §3 adds the well-timed VERTICAL bonus on top. Two independent multipliers rather than
+	// one bigger speed number, because they buy different things: the speed bonus makes the hop go
+	// further, the Z bonus makes it go higher — and it is the height a player actually perceives, so
+	// this is what makes a well-timed slide-jump read as a different move rather than a slightly
+	// better one. Both are collected or neither is; missing the window still costs nothing.
+	Velocity.Z *= GetSlideJumpZMultiplier() * (bWellTimed ? GetSlideJumpWindowZBonus() : 1.f);
 
 	// Consumed. One slide, one slide-jump.
 	SlideJumpGraceRemaining = 0.f;
@@ -1220,11 +1611,13 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 	if (IsSlideDebugEnabled() && CharacterOwner != nullptr && CharacterOwner->HasAuthority())
 	{
 		UE_LOG(LogTraceGame, Display,
-			TEXT("SLIDEJUMP %-16s carried=%6.0f -> launched=%6.0f uu/s (%.1f%%, retain=%.2f%s) velZ=%6.0f (jumpZ=%.0f x %.2f)"),
+			TEXT("SLIDEJUMP %-16s carried=%6.0f -> launched=%6.0f uu/s (%.1f%%, retain=%.2f%s) "
+			     "velZ=%6.0f (jumpZ=%.0f x zMul=%.2f x zBonus=%.2f)"),
 			*GetNameSafe(CharacterOwner), CarrySpeed, GetPlanarSpeed(),
 			100.f * GetPlanarSpeed() / FMath::Max(1.f, CarrySpeed), Retention,
 			bWellTimed ? TEXT(", WELL TIMED") : TEXT(""),
-			Velocity.Z, JumpZVelocity, GetSlideJumpZMultiplier());
+			Velocity.Z, JumpZVelocity, GetSlideJumpZMultiplier(),
+			bWellTimed ? GetSlideJumpWindowZBonus() : 1.f);
 	}
 #endif
 
@@ -1241,6 +1634,491 @@ void UTraceCharacterMovementComponent::ApplyDashExitSpeed()
 		Velocity.X = Clamped.X;
 		Velocity.Y = Clamped.Y;
 	}
+}
+
+// =================================================================================================
+// THE MANTLE (spec v5 §7)
+//
+// Client-predicted with NO new input and NO new compressed flag. Everything the detection reads is
+// either restored by the replay path (Velocity, Acceleration, the updated component's transform) or
+// is static arena geometry, which is byte-identical on every machine. So the client, the server and
+// every replayed move independently reach the same answer from the same inputs — which is the same
+// contract the dash and the slide already keep, just without an intent bit to carry.
+// =================================================================================================
+
+bool UTraceCharacterMovementComponent::IsMantling() const
+{
+	// MOVE_None means the pawn was switched off (death, teleport) and OnMovementUpdated has stopped
+	// running, so the clock is frozen wherever it was — the same guard IsDashing() carries, and for
+	// the same reason.
+	return MantleTimeRemaining > 0.f && MovementMode != MOVE_None;
+}
+
+bool UTraceCharacterMovementComponent::IsGroundedForAbilities() const
+{
+	return IsMovingOnGround() || GroundGraceRemaining > 0.f;
+}
+
+bool UTraceCharacterMovementComponent::CanAttemptMantle() const
+{
+	if (!IsMantleEnabled() || CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return false;
+	}
+
+	if (MovementMode == MOVE_None || MantleTimeRemaining > 0.f || MantleCooldownRemaining > 0.f)
+	{
+		return false;
+	}
+
+	// AIRBORNE ONLY. A mantle is what a jump at a ledge should have been; a pawn standing on the
+	// ground in front of a waist-high box is already handled by step-up, and letting it vacuum itself
+	// up every wall it walks into would be a movement system nobody asked for.
+	//
+	// IsFalling(), not !IsMovingOnGround(): the grace window (which deliberately keeps reporting
+	// "grounded" across a ledge blip) must not gate this, because a jump taken off a lip is exactly
+	// when a mantle is wanted.
+	if (!IsFalling())
+	{
+		return false;
+	}
+
+	// The dash owns the velocity vector for its window and the slide is a ground state; neither may
+	// be interrupted by a mantle, and both end on their own within a fraction of a second.
+	if (DashTimeRemaining > 0.f || SlideTimeRemaining > 0.f)
+	{
+		return false;
+	}
+
+	if (const ATraceCharacter* TraceCharacter = Cast<ATraceCharacter>(CharacterOwner))
+	{
+		if (!TraceCharacter->IsAlive())
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool UTraceCharacterMovementComponent::TryBeginMantle(const FVector& ApproachVelocity)
+{
+	if (!CanAttemptMantle())
+	{
+		return false;
+	}
+
+	const UCapsuleComponent* Capsule = CharacterOwner->GetCapsuleComponent();
+	UWorld* MantleWorld = GetWorld();
+	if (Capsule == nullptr || MantleWorld == nullptr)
+	{
+		return false;
+	}
+
+	// Why a refusal is worth logging at all: this function has nine independent ways to say no, all
+	// of them geometric, and a silent "no mantle happened" is indistinguishable between them. Two
+	// separate real bugs (a chest-only probe and a travel-direction probe) survived a full test run
+	// each because the failure had no voice. Locally controlled pawns only, so ten bots refusing
+	// sixty times a second cannot drown the log.
+#if !UE_BUILD_SHIPPING
+	const bool bLogRefusals = IsMantleDebugEnabled() && CharacterOwner->IsLocallyControlled();
+	#define TRACE_MANTLE_NO(Reason, ...) \
+		do { if (bLogRefusals) { UE_LOG(LogTraceGame, Display, TEXT("MANTLE-NO %s: " Reason), *GetNameSafe(CharacterOwner), ##__VA_ARGS__); } return false; } while (0)
+#else
+	#define TRACE_MANTLE_NO(Reason, ...) return false
+#endif
+
+	const float CapsuleRadius = Capsule->GetScaledCapsuleRadius();
+	const float CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+	const FVector Here = UpdatedComponent->GetComponentLocation();
+	const float FeetZ = Here.Z - CapsuleHalfHeight;
+
+	// --- Direction and approach speed ------------------------------------------------------------
+	//
+	// Velocity, not the control rotation: a mantle is a consequence of where the pawn is going, and
+	// Velocity is restored by the replay path while the camera is not saved-move state at all.
+	//
+	// APPROACH VELOCITY, THOUGH, NOT THE CURRENT ONE, and this is not a detail — the first build of
+	// this function never fired a single mantle because of it. The frame a jump's capsule meets a
+	// ledge face head-on is the frame SafeMoveUpdatedComponent zeroes the planar velocity against it,
+	// so by the time OnMovementUpdated runs, "how fast am I going toward that wall" reads as roughly
+	// nothing and the speed gate refused every time. OnMovementUpdated's OldVelocity is the velocity
+	// at the START of the move — before the collision — and it is reproduced exactly on a replay
+	// (PrepMoveFor restores Velocity, then PerformMovement runs), so it is both the honest number and
+	// a prediction-safe one.
+	const float PlanarSpeed = FVector(Velocity.X, Velocity.Y, 0.f).Size();
+	const float ApproachSpeed = FMath::Max(PlanarSpeed, FVector(ApproachVelocity.X, ApproachVelocity.Y, 0.f).Size());
+	if (ApproachSpeed < GetMantleMinForwardSpeed())
+	{
+		TRACE_MANTLE_NO("too slow (approach %.0f < min %.0f)", ApproachSpeed, GetMantleMinForwardSpeed());
+	}
+
+	// THE PROBE FOLLOWS THE INPUT, NOT THE TRAVEL, and this is the second thing that stopped the
+	// first build ever firing. Measured, from a scripted jump straight at a 260 uu block: on contact
+	// the capsule's planar velocity had been deflected almost entirely ALONG the face by
+	// SlideAlongSurface (dist to the face pinned at ~40 uu while the velocity swung round to run
+	// parallel to it), so a probe cast along the direction of travel traced sideways down the wall
+	// and found nothing — for thirty consecutive frames of being pressed flat against the ledge.
+	//
+	// The direction that still means "get me up there" in that moment is the one the player is
+	// holding. It is also the intent test: a pawn falling past a wall with no input, or being carried
+	// along one, has no wish direction into it and cannot mantle, so the game never takes the
+	// controls away from somebody who did not ask.
+	//
+	// RequestedVelocity is the fallback for the same reason ApplyGroundOverspeedBleed carries it: AI
+	// path following sets that and leaves Acceleration at zero, so without it no bot could ever
+	// mantle and the raised sections would be human-only ground.
+	FVector Forward(Acceleration.X, Acceleration.Y, 0.f);
+	if (Forward.SizeSquared() <= UE_KINDA_SMALL_NUMBER && bHasRequestedVelocity)
+	{
+		Forward = FVector(RequestedVelocity.X, RequestedVelocity.Y, 0.f);
+	}
+	if (!Forward.Normalize())
+	{
+		TRACE_MANTLE_NO("no wish direction (accel %.0f, requestedVel=%d)", Acceleration.Size2D(), bHasRequestedVelocity ? 1 : 0);
+	}
+
+	const float ForwardSpeed = ApproachSpeed;
+
+	FCollisionQueryParams QueryParams;
+	FCollisionResponseParams ResponseParams;
+	InitCollisionParams(QueryParams, ResponseParams);
+	QueryParams.bTraceComplex = false;
+
+	// A trace that STARTS inside a collider must not report that collider. Without this a pawn whose
+	// capsule is even slightly embedded in geometry gets back a hit at distance 0 whose ImpactNormal
+	// is simply the reverse of the trace direction — which is horizontal, so it passes for a wall —
+	// and whose ImpactPoint is the pawn's own position. See the bStartPenetrating rejections below
+	// for what that cost when it was missing.
+	QueryParams.bFindInitialOverlaps = false;
+
+	// AND THE PAWN MUST NOT FIND ITSELF. This one line is why the mantle almost never fired.
+	//
+	// InitCollisionParams() forwards to UPrimitiveComponent::InitSweepCollisionParams, which adds
+	// MoveIgnoreActors and nothing else — it does NOT ignore the moving actor, because the sweep path
+	// it was written for excludes self inside MoveComponent instead. These probes are raw line traces,
+	// so nothing excluded the pawn. Every probe starts on the capsule's own axis at
+	// (Here.X, Here.Y, FeetZ + ProbeHeight), and the highest of the three starts at ProbeHeight ==
+	// CapsuleHalfHeight, i.e. exactly the capsule's centre — so it opened inside the pawn's own
+	// collider and came back penetrating at distance 0.
+	//
+	// MEASURED, on a clean approach to a 260 uu block on open floor: the two frames where the mantle
+	// should obviously have fired — planar 800 uu/s, face 35-42 uu ahead, ledge 99 uu above the feet,
+	// dead centre of the [55, 230] window — were BOTH refused with
+	// "degenerate (penetrating=1 dist=0.00 actor=TraceCharacter_0)", where TraceCharacter_0 is the
+	// probing pawn. The frame after that the capsule met the face, SafeMoveUpdatedComponent zeroed the
+	// planar velocity, and every later frame refused with "too slow (approach 0 < min 120)" while the
+	// pawn slid up the wall and fell back down. Eight runs, eight failures, and the same shape in the
+	// previous pass's logs (6825 "degenerate" refusals).
+	QueryParams.AddIgnoredActor(CharacterOwner);
+
+	const ECollisionChannel Channel = UpdatedComponent->GetCollisionObjectType();
+
+	// --- 1. REACH: is there a near-vertical face ahead? -------------------------------------------
+	//
+	// THREE HEIGHTS, AND THE LOW ONE IS THE IMPORTANT ONE. The first build probed at chest height
+	// only, on the reasoning that a ledge is chest-high — and it never fired on the case the report
+	// is actually about. "Jumping on the edge of a raised section" is a jump that ALMOST cleared it:
+	// the pawn's feet are a few uu below the top, so its chest is a metre ABOVE the ledge and a chest
+	// probe sails straight over the thing it is meant to find.
+	//
+	// A ledge face runs from its base all the way up to its lip, so a probe just above the feet finds
+	// it from any approach height — high (nearly cleared) or low (jumped short). The two higher
+	// probes are there for the case where the feet are below the face's own base (standing in a
+	// gutter, landing on a lower step). Nothing here decides whether it is CLIMBABLE, which is
+	// entirely the height test's job below.
+	//
+	// EVERY HEIGHT IS TRIED, AND AN UNUSABLE HIT DOES NOT END THE SEARCH. This loop used to keep the
+	// FIRST probe that hit anything, break, and validate that one hit below — so if the first probe to
+	// hit was unusable, the whole mantle was refused even when a higher probe was staring straight at a
+	// clean ledge face. MEASURED across the previous pass's logs: 6825 refusals reading
+	// "penetrating=1 dist=0.00" against 39 real mantles. The low probe sits 2 uu above the feet, which
+	// on a real approach is inside the floor slab the pawn is pressed against, so it degenerates on
+	// almost every frame of contact and masked the two probes above it for the entire approach. That
+	// single `break` is why the mantle fired once in eight runs while the gate logged canMantle=1.
+	//
+	// The guards themselves are UNCHANGED and still absolute — a degenerate hit, a ramp or a pawn can
+	// never START a mantle, so the ladder-to-the-sky loop stays closed. They now disqualify only the
+	// PROBE that produced them instead of the whole attempt.
+	const float ProbeHeights[] = { 2.f, CapsuleHalfHeight * 0.5f, CapsuleHalfHeight };
+	const float ProbeReach = CapsuleRadius + GetMantleReachUU();
+
+	FHitResult WallHit;
+	bool bFoundWall = false;
+
+	// The refusal reason is remembered rather than logged in place: with three probe heights a refusal
+	// is only real once all three have failed, and logging inside the loop would print two misleading
+	// rejections for every genuine one. Seeded with the "nothing ahead at all" case.
+	FString WallRejectReason = FString::Printf(TEXT("no face within %.0fuu ahead along %s (feet z=%.1f)"),
+		ProbeReach, *Forward.ToCompactString(), FeetZ);
+
+	for (const float ProbeHeight : ProbeHeights)
+	{
+		const FVector ProbeStart(Here.X, Here.Y, FeetZ + ProbeHeight);
+		FHitResult ProbeHit;
+		if (!MantleWorld->LineTraceSingleByChannel(ProbeHit, ProbeStart, ProbeStart + Forward * ProbeReach,
+			Channel, QueryParams, ResponseParams))
+		{
+			continue;
+		}
+
+		// THE LADDER-TO-THE-SKY GUARD. MEASURED, and it is the reason this test exists rather than a
+		// precaution: without it a headless match produced 289 mantles in 25 seconds and carried the
+		// bot team from Z=313 to Z=4097, one 230 uu step at a time. Every single one of those mantles
+		// logged reach=0.0uu, because the forward trace was starting inside a collider the pawn was
+		// slightly embedded in. A penetrating hit reports ImpactPoint = the trace's own start (i.e. the
+		// pawn) and ImpactNormal = -TraceDirection (horizontal, so it passes for a wall), and the
+		// height probe then finds whatever happens to be overhead — so the pawn mantles onto itself,
+		// ends up embedded a little higher, and does it again forever.
+		//
+		// bFindInitialOverlaps=false above already suppresses most of this; the explicit tests are the
+		// backstop, because a distance-zero "ledge" is meaningless whatever produced it.
+		if (ProbeHit.bStartPenetrating || ProbeHit.Distance < 1.f)
+		{
+			// The actor is named because "degenerate" alone cost this project a whole pass: it reads as
+			// a mantle bug, and the 6825 that were logged were the pawn pressed into the ENDZONE by a
+			// broken test harness. Knowing what was penetrated separates the two instantly.
+			WallRejectReason = FString::Printf(
+				TEXT("face at +%.0fuu is degenerate (penetrating=%d dist=%.2f actor=%s) - the ladder-to-the-sky guard"),
+				ProbeHeight, ProbeHit.bStartPenetrating ? 1 : 0, ProbeHit.Distance, *GetNameSafe(ProbeHit.GetActor()));
+			continue;
+		}
+
+		// Near-vertical. A 0.3 Z component is about a 17 degree overhang/lean either way; anything
+		// flatter is a ramp the pawn should be running up, not climbing.
+		if (FMath::Abs(ProbeHit.ImpactNormal.Z) > 0.3f)
+		{
+			WallRejectReason = FString::Printf(TEXT("face at +%.0fuu is not vertical (normal.Z=%.2f, actor %s)"),
+				ProbeHeight, ProbeHit.ImpactNormal.Z, *GetNameSafe(ProbeHit.GetActor()));
+			continue;
+		}
+
+		// YOU MAY NOT CLIMB PEOPLE. MEASURED: a bot mantled with wall=TraceCharacter_2, i.e. it used a
+		// team-mate's capsule as the ledge face and pulled itself up over them.
+		//
+		// That is a gameplay exploit — a stack of pawns becomes a ladder onto any roof in the arena —
+		// but the reason it is rejected HERE rather than tuned away is prediction. This whole feature
+		// is safe to predict because it is derived from STATIC arena geometry, which is byte-identical
+		// on every machine; another pawn's position is replicated, so the client and the server hold
+		// different versions of it, and a mantle keyed off one would put the two ends on different
+		// ledges. Every argument in the header about why the mantle cannot desync stops being true the
+		// moment the thing being climbed can move on its own.
+		if (Cast<APawn>(ProbeHit.GetActor()) != nullptr)
+		{
+			WallRejectReason = FString::Printf(TEXT("face at +%.0fuu belongs to a pawn (%s) - people are not ledges"),
+				ProbeHeight, *GetNameSafe(ProbeHit.GetActor()));
+			continue;
+		}
+
+		WallHit = ProbeHit;
+		bFoundWall = true;
+		break;
+	}
+
+	if (!bFoundWall)
+	{
+		TRACE_MANTLE_NO("%s", *WallRejectReason);
+	}
+
+	// --- 2. HEIGHT: where is the top of it? ------------------------------------------------------
+	//
+	// Drop a trace from above, just BEYOND the face, so it lands on the ledge's top surface rather
+	// than on the face itself. The overshoot is half a capsule radius: far enough in to clear the
+	// lip's own bevel, near enough to the edge that a narrow ledge still registers.
+	const float MaxHeight = GetMantleMaxHeightUU();
+	const FVector TopProbeXY = WallHit.ImpactPoint + Forward * (CapsuleRadius * 0.5f);
+	const FVector TopProbeStart(TopProbeXY.X, TopProbeXY.Y, FeetZ + MaxHeight + CapsuleHalfHeight);
+	const FVector TopProbeEnd(TopProbeXY.X, TopProbeXY.Y, FeetZ - 1.f);
+
+	FHitResult TopHit;
+	if (!MantleWorld->LineTraceSingleByChannel(TopHit, TopProbeStart, TopProbeEnd, Channel, QueryParams, ResponseParams))
+	{
+		TRACE_MANTLE_NO("no top found above the face (probed z %.1f down to %.1f at %s)",
+			TopProbeStart.Z, TopProbeEnd.Z, *TopProbeXY.ToCompactString());
+	}
+
+	// Same rejection as the wall probe, for the same reason: a down-trace that begins inside geometry
+	// reports its own start point as the "ledge top", which is a surface that does not exist.
+	if (TopHit.bStartPenetrating)
+	{
+		TRACE_MANTLE_NO("top probe started inside geometry");
+	}
+
+	// Walkable, or it is not a ledge — it is the underside of something, or a slope the pawn would
+	// slide straight back off.
+	if (!IsWalkable(TopHit))
+	{
+		TRACE_MANTLE_NO("top is not walkable (normal.Z=%.2f)", TopHit.ImpactNormal.Z);
+	}
+
+	// Same rule as the face, same reason: standing on someone's head is not a ledge, and a
+	// destination derived from a replicated actor is not a destination both machines agree on.
+	if (Cast<APawn>(TopHit.GetActor()) != nullptr)
+	{
+		TRACE_MANTLE_NO("top belongs to a pawn (%s)", *GetNameSafe(TopHit.GetActor()));
+	}
+
+	const float LedgeHeight = TopHit.ImpactPoint.Z - FeetZ;
+	if (LedgeHeight < GetMantleMinHeightUU() || LedgeHeight > MaxHeight)
+	{
+		TRACE_MANTLE_NO("ledge height %.1f outside [%.0f, %.0f]", LedgeHeight, GetMantleMinHeightUU(), MaxHeight);
+	}
+
+	// --- 3. CLEAR: is there room to stand up there? ----------------------------------------------
+	//
+	// Proved BEFORE anything moves. A mantle that starts and then finds the destination occupied has
+	// to either stop dead in mid-air or push the pawn into geometry, and both of those are corrections
+	// waiting to happen — which is the whole class of bug this feature exists to remove.
+	const FVector Destination(TopHit.ImpactPoint.X, TopHit.ImpactPoint.Y,
+		TopHit.ImpactPoint.Z + CapsuleHalfHeight + 2.f);
+
+	// AND IT HAS TO BE SOMEWHERE ELSE. A "ledge" directly overhead is the pawn mantling onto its own
+	// column — the third and last guard against the climbing loop above, and the one that still holds
+	// if some future geometry finds a way past the two penetration tests.
+	if (FVector::DistSquared2D(Destination, Here) < FMath::Square(CapsuleRadius * 0.5f))
+	{
+		TRACE_MANTLE_NO("destination is directly overhead (%.1fuu ahead)", static_cast<float>(FVector::Dist2D(Destination, Here)));
+	}
+
+	// Shrunk very slightly so a destination flush against a wall is not rejected by its own floor.
+	const FCollisionShape StandShape = FCollisionShape::MakeCapsule(CapsuleRadius - 1.f, CapsuleHalfHeight - 1.f);
+	if (MantleWorld->OverlapBlockingTestByChannel(Destination, FQuat::Identity, Channel, StandShape, QueryParams, ResponseParams))
+	{
+		TRACE_MANTLE_NO("no room to stand at %s", *Destination.ToCompactString());
+	}
+
+	// The climb has to clear the lip before the pawn moves forward, so it rises to the destination's
+	// own height plus a little; the forward phase then crosses level.
+	MantleUpTargetZ = Destination.Z;
+	MantleTargetLocation = Destination;
+	MantleTotalTime = GetMantleDurationSeconds();
+	MantleTimeRemaining = MantleTotalTime;
+	MantleEntrySpeed = ForwardSpeed;
+
+	// MOVE_Flying, not a custom mode: PhysFlying already does swept movement with no gravity, which
+	// is exactly a pull-up, and MovementMode is replicated in every correction (ServerMovementMode)
+	// so both ends agree about which physics the pawn is under without a single new byte on the wire.
+	SetMovementMode(MOVE_Flying);
+	Velocity = FVector::ZeroVector;
+
+	// A slide-jump grace that survived into a mantle would pay the bonus for a hop taken off the top
+	// of the ledge, several tenths of a second and an entire ability later.
+	SlideJumpGraceRemaining = 0.f;
+	bSlideJumpGraceWellTimed = 0;
+
+#if !UE_BUILD_SHIPPING
+	if (IsMantleDebugEnabled())
+	{
+		++GTraceMantleCount;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("MANTLE %-16s ledgeH=%5.1fuu (min %.0f max %.0f) reach=%5.1fuu ahead=%5.1fuu "
+			     "entrySpeed=%6.0f dur=%.2fs -> target %s | wall=%s | n=%d role=%d"),
+			*GetNameSafe(CharacterOwner), LedgeHeight, GetMantleMinHeightUU(), GetMantleMaxHeightUU(),
+			WallHit.Distance, static_cast<float>(FVector::Dist2D(Destination, Here)),
+			ForwardSpeed, MantleTotalTime, *Destination.ToCompactString(),
+			*GetNameSafe(WallHit.GetActor()),
+			GTraceMantleCount, static_cast<int32>(CharacterOwner->GetLocalRole()));
+	}
+#endif
+
+	#undef TRACE_MANTLE_NO
+	return true;
+}
+
+void UTraceCharacterMovementComponent::ApplyMantleVelocity(const float DeltaTime)
+{
+	if (UpdatedComponent == nullptr || MantleTotalTime <= 0.f)
+	{
+		Velocity = FVector::ZeroVector;
+		return;
+	}
+
+	const FVector Here = UpdatedComponent->GetComponentLocation();
+
+	// Where in the pull-up are we? Elapsed rather than remaining, because the two phases are defined
+	// forwards ("climb for the first 60%") and the arithmetic should read the same way.
+	const float Elapsed = FMath::Max(0.f, MantleTotalTime - MantleTimeRemaining);
+	const float UpPhaseEnd = MantleTotalTime * GetMantleUpPhaseFraction();
+
+	FVector Target;
+	float TimeLeftInPhase;
+	if (Elapsed < UpPhaseEnd)
+	{
+		// PHASE 1 — straight up the face. XY is held so the capsule stays in contact with the wall
+		// rather than swinging out into the air, which is what makes the move read as a climb.
+		Target = FVector(Here.X, Here.Y, MantleUpTargetZ);
+		TimeLeftInPhase = UpPhaseEnd - Elapsed;
+	}
+	else
+	{
+		// PHASE 2 — across the lip. Full 3D target so any Z the climb failed to reach is finished off
+		// here rather than leaving the pawn standing in the wall.
+		Target = MantleTargetLocation;
+		TimeLeftInPhase = FMath::Max(MantleTimeRemaining, DeltaTime);
+	}
+
+	// SELF-CORRECTING BY CONSTRUCTION, and this is the property that makes the mantle safe to
+	// predict. The velocity is recomputed every sub-step from (target - where I actually am), so two
+	// machines that started the pull-up from positions a uu apart converge on the same destination
+	// instead of accumulating the difference — and a replayed move, which restarts from a restored
+	// position, lands in exactly the same place as the original did.
+	const FVector ToTarget = Target - Here;
+	const float Distance = ToTarget.Size();
+	if (Distance <= UE_KINDA_SMALL_NUMBER)
+	{
+		Velocity = FVector::ZeroVector;
+		return;
+	}
+
+	Velocity = ToTarget * (1.f / FMath::Max(TimeLeftInPhase, UE_KINDA_SMALL_NUMBER));
+}
+
+void UTraceCharacterMovementComponent::EndMantle()
+{
+	if (MantleTimeRemaining <= 0.f && MantleTotalTime <= 0.f)
+	{
+		return;
+	}
+
+	MantleTimeRemaining = 0.f;
+	MantleTotalTime = 0.f;
+	MantleCooldownRemaining = GetMantleCooldownSeconds();
+
+	// Hand the pawn back MOVING, not standing. Contract §2.4 — transitions preserve velocity vectors
+	// rather than resetting them — and a mantle that dumped the player on the lip at 0 uu/s would be
+	// a full stop in the middle of a firefight, i.e. the thing the whole momentum pass exists to
+	// avoid. Capped at the ground limit, though: a mantle must not become a faster way to travel than
+	// running, or the arena's raised sections turn into a speed route.
+	FVector ExitDirection(Velocity.X, Velocity.Y, 0.f);
+	if (!ExitDirection.Normalize())
+	{
+		ExitDirection = (UpdatedComponent != nullptr) ? UpdatedComponent->GetForwardVector() : FVector::ForwardVector;
+		ExitDirection.Z = 0.f;
+		if (!ExitDirection.Normalize())
+		{
+			ExitDirection = FVector::ForwardVector;
+		}
+	}
+
+	// MOVE_Falling, not MOVE_Walking: the pawn is a couple of uu above the ledge and the engine's own
+	// floor check on the next frame is the only thing entitled to decide it has landed. Asserting
+	// Walking here would be this file guessing at a floor result, which is exactly the kind of
+	// client/server guess the ledge diagnosis is about.
+	//
+	// Done BEFORE the exit speed is computed, and that ordering is load-bearing: GetMaxSpeed() reads
+	// MaxFlySpeed (600) while the mode is still MOVE_Flying and MaxWalkSpeed (800) once it is not, so
+	// capping first would have quietly clipped every mantle exit to three quarters of a run.
+	if (MovementMode == MOVE_Flying)
+	{
+		SetMovementMode(MOVE_Falling);
+	}
+
+	const float ExitSpeed = FMath::Min(MantleEntrySpeed, FMath::Max(1.f, GetMaxSpeed()));
+	MantleEntrySpeed = 0.f;
+
+	Velocity.X = ExitDirection.X * ExitSpeed;
+	Velocity.Y = ExitDirection.Y * ExitSpeed;
+	Velocity.Z = 0.f;
 }
 
 // --- Simulation --------------------------------------------------------------------------------
@@ -1278,10 +2156,6 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	{
 		SlideCooldownRemaining = FMath::Max(0.f, SlideCooldownRemaining - DeltaSeconds);
 	}
-	if (SlideCommitRemaining > 0.f)
-	{
-		SlideCommitRemaining = FMath::Max(0.f, SlideCommitRemaining - DeltaSeconds);
-	}
 	if (SlideBufferRemaining > 0.f)
 	{
 		SlideBufferRemaining = FMath::Max(0.f, SlideBufferRemaining - DeltaSeconds);
@@ -1294,6 +2168,42 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		if (SlideJumpGraceRemaining <= 0.f)
 		{
 			bSlideJumpGraceWellTimed = 0;
+		}
+	}
+
+	// 1a-i. THE LEDGE GRACE (spec v5 §7). Refilled while grounded, bled while not, so
+	//       IsGroundedForAbilities() lags the engine's own answer by LedgeGroundGraceSeconds on the
+	//       way DOWN only — it can never claim the pawn is airborne when the engine says it is not.
+	//       Ticked with every other clock so a replayed move advances it by the same amount.
+	if (IsMovingOnGround())
+	{
+		GroundGraceRemaining = GetLedgeGroundGraceSeconds();
+	}
+	else if (GroundGraceRemaining > 0.f)
+	{
+		GroundGraceRemaining = FMath::Max(0.f, GroundGraceRemaining - DeltaSeconds);
+	}
+
+	// 1a-ii. THE MANTLE CLOCK. Advanced before the activations below, like every other ability, so a
+	//        pull-up that finishes this frame stops driving velocity this frame.
+	if (MantleCooldownRemaining > 0.f)
+	{
+		MantleCooldownRemaining = FMath::Max(0.f, MantleCooldownRemaining - DeltaSeconds);
+	}
+	if (MantleTimeRemaining > 0.f)
+	{
+		MantleTimeRemaining = FMath::Max(0.f, MantleTimeRemaining - DeltaSeconds);
+
+		// Early out when the destination is reached: the timer is a budget, not a schedule, and
+		// holding a pawn in MOVE_Flying for another 100ms after it is already standing on the ledge
+		// is exactly the "glitchy" the report is about. Distance-based, so it fires on the same frame
+		// on both machines.
+		const bool bArrived = (UpdatedComponent != nullptr)
+			&& FVector::DistSquared(UpdatedComponent->GetComponentLocation(), MantleTargetLocation) <= FMath::Square(6.f);
+
+		if (MantleTimeRemaining <= 0.f || bArrived || MovementMode == MOVE_None)
+		{
+			EndMantle();
 		}
 	}
 
@@ -1387,7 +2297,14 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	//    away — see SlideBufferRemaining. The buffer is charged from the press EDGE only, so holding
 	//    the key can never chain slides. It is also what makes "air-strafe, then slide the instant
 	//    you touch down" a single input instead of a frame-perfect one.
-	const bool bOnGroundNow = IsMovingOnGround();
+	//
+	//    LEDGE GRACE (spec v5 §7): every ground test in this section goes through
+	//    IsGroundedForAbilities() rather than IsMovingOnGround(). A capsule crossing the lip of a
+	//    raised section loses and regains contact for a frame or two, and the client and the server
+	//    do it on different frames — so the raw test made one machine fire a landing (or a fast-fall,
+	//    or an EndSlide) that the other never did. The grace is saved-move state, so a replay
+	//    resolves the blip exactly as the original did.
+	const bool bOnGroundNow = IsGroundedForAbilities();
 	const bool bJustLanded = bOnGroundNow && (bWasAirborneLastMove != 0);
 
 	if (bSlidePressedThisMove)
@@ -1414,12 +2331,18 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	{
 		// --- Maintain an active slide -----------------------------------------------------------
 		//
-		// Two ways out here, and only one of them is negotiable. Leaving the ground always ends the
-		// slide — it is a ground state and the floor is what it is sliding on. Releasing the key ends
-		// it too, but NOT during the commit window: for SlideMinCommitSeconds the slide is bought and
-		// paid for. Momentum survives either exit now, so neither one is a punishment.
-		const bool bCommitted = (SlideCommitRemaining > 0.f);
-		if (!IsMovingOnGround() || (!bCrouchHeld && !bCommitted))
+		// SPEC v5 §3: THE KEY NO LONGER ENDS A SLIDE. One press bought SlideDuration seconds and the
+		// player gets all of them — releasing crouch, or a bot's hold timer expiring, is now simply
+		// ignored, which is what "trigger once, like an ability" means. The old
+		// `(!bCrouchHeld && !bCommitted)` clause and the partial commit window it needed are both
+		// gone; every slide is committed for its whole length.
+		//
+		// ONE EXIT LEFT HERE: leaving the ground, because a slide is a ground state and the floor is
+		// what it is sliding on. Through IsGroundedForAbilities(), not IsMovingOnGround(), so a
+		// one-frame contact blip on a ledge lip cannot amputate a slide on one machine and not the
+		// other — see the ledge diagnosis in the header. (The other exits live elsewhere and are
+		// unchanged: the duration expiring, the decay below, a dash, and a slide-jump.)
+		if (!IsGroundedForAbilities())
 		{
 			EndSlide();
 		}
@@ -1465,7 +2388,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 			}
 		}
 	}
-	else if (bSlidePressedThisMove && !IsMovingOnGround() && MovementMode != MOVE_None)
+	else if (bSlidePressedThisMove && !bOnGroundNow && MantleTimeRemaining <= 0.f && MovementMode != MOVE_None)
 	{
 		// --- FAST-FALL (contract §5) -------------------------------------------------------------
 		// Zero POSITIVE Z only, leave horizontal speed alone. This is a fall you chose, not a stop:
@@ -1489,6 +2412,22 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		SlideBufferRemaining = 0.f;
 	}
 
+	// 3b. THE MANTLE (spec v5 §7). Last of the activations, and deliberately so: it is the fallback
+	//     for "this jump did not clear the ledge", so anything the player explicitly asked for on
+	//     this frame — a dash, a slide, a fast-fall — gets first refusal.
+	//
+	//     Attempted every airborne move rather than on an input edge, because the player's input for
+	//     "get on top of that" is the jump they already made plus the stick they are already holding
+	//     into the wall. TryBeginMantle() is cheap to refuse (two int compares before any trace) and
+	//     runs three traces only once it is genuinely airborne, moving, and pushing forward.
+	if (MantleTimeRemaining <= 0.f && CanAttemptMantle())
+	{
+		// OldVelocity, not Velocity: see the note at the top of TryBeginMantle. The frame the capsule
+		// meets the ledge is the frame the collision has already zeroed the planar velocity, and the
+		// approach speed is the only honest measure of "was I moving at that thing".
+		TryBeginMantle(OldVelocity);
+	}
+
 	// 4. Latch the last instant this pawn was inside its dash window, on the authority only.
 	//    The trail's trip test ticks once per SERVER frame, but the server advances a remote
 	//    client's dash clock here inside MoveAutonomous - possibly several client moves deep in a
@@ -1509,10 +2448,15 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	//    only ever produce one dash.
 	bWantsToDash = 0;
 	bSlideHeldLastMove = bCrouchHeld ? 1 : 0;
-	bWasAirborneLastMove = (MovementMode != MOVE_None && !IsMovingOnGround()) ? 1 : 0;
+
+	// Through the grace, like every other ground test in this function: the landing transition is
+	// derived from this bit, and a ledge blip that flipped it would fake a landing (and with a held
+	// crouch key, a whole slide) on one machine and not the other.
+	bWasAirborneLastMove = (MovementMode != MOVE_None && !IsGroundedForAbilities()) ? 1 : 0;
 
 #if !UE_BUILD_SHIPPING
 	TickMomentumMeasure(DeltaSeconds);
+	TickLedgeTest(DeltaSeconds);
 #endif
 }
 
@@ -1521,6 +2465,15 @@ float UTraceCharacterMovementComponent::GetMaxSpeed() const
 	if (IsDashing())
 	{
 		return GetDashSpeed();
+	}
+
+	// The mantle drives Velocity directly from CalcVelocity and never asks for an acceleration, so
+	// this exists only so that anything else sampling the pawn's speed limit mid-pull-up (the HUD,
+	// the anim layer, a bot) is not told the pawn is limited to MaxFlySpeed, which is a number this
+	// project never tuned and which the mantle happily exceeds on a tall ledge.
+	if (IsMantling() && MantleTotalTime > 0.f)
+	{
+		return FMath::Max(Super::GetMaxSpeed(), GetMantleMaxHeightUU() / MantleTotalTime);
 	}
 
 	float Speed = Super::GetMaxSpeed();
@@ -1561,6 +2514,27 @@ float UTraceCharacterMovementComponent::GetMaxSpeed() const
 
 #if !UE_BUILD_SHIPPING
 
+// --- The rubber-band instrument (spec v5 §7) ----------------------------------------------------
+//
+// "Feels like rubber banding" is a claim about the network. This is what turns it into a number:
+// every server correction the owning client receives, with the position error that triggered it and
+// the pawn's state at the time. At Display, because a diagnostic nobody can see has twice been read
+// as a dead mechanic in this project.
+
+int32 GTraceMoveCorrections = 0;
+static FAutoConsoleVariableRef CVarTraceMoveCorrections(
+	TEXT("Trace.MoveCorrections"),
+	GTraceMoveCorrections,
+	TEXT("Dev only. Non-zero logs every server movement correction this client receives, with the "
+	     "position error and the movement state, so ledge desyncs can be counted instead of described."),
+	ECVF_Cheat);
+
+static bool AreMoveCorrectionsLogged()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceMoveCorrections"));
+	return bFromCommandLine || GTraceMoveCorrections != 0;
+}
+
 int32 GTraceMoveKitFakeCarrier = 0;
 static FAutoConsoleVariableRef CVarTraceMoveKitFakeCarrier(
 	TEXT("Trace.MoveKitFakeCarrier"),
@@ -1577,9 +2551,15 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		return;
 	}
 
-	// Standalone only: the schedule below advances on the simulation's own delta, and a replayed
-	// move would advance it twice.
-	if (GetNetMode() != NM_Standalone || !CharacterOwner->IsLocallyControlled()
+	// THE AUTHORITY'S OWN PAWN ONLY. The schedule below advances on the simulation's own delta, and a
+	// replayed move would advance it twice — so this must never run on an autonomous proxy.
+	//
+	// It used to say `GetNetMode() != NM_Standalone`, and spec v5 §0 silently switched it off: PLAY
+	// now appends `listen` to the travel URL, so a solo session is an NM_ListenServer and every
+	// measurement in this harness stopped being taken. HasAuthority() && IsLocallyControlled() is the
+	// condition that was actually meant — it is true for a standalone player and for a listen host,
+	// and false for exactly the case (a client replaying corrections) the restriction exists for.
+	if (!CharacterOwner->HasAuthority() || !CharacterOwner->IsLocallyControlled()
 		|| Cast<APlayerController>(CharacterOwner->GetController()) == nullptr)
 	{
 		return;
@@ -1628,6 +2608,32 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		UE_LOG(LogTraceGame, Display, TEXT("MEASURE run direction %s from %s"),
 			*MeasureRunDirection.ToCompactString(),
 			*(UpdatedComponent != nullptr ? UpdatedComponent->GetComponentLocation() : FVector::ZeroVector).ToCompactString());
+
+		// --- THE AIR-STRAFE CURVE, AS A TABLE (spec v5 §1) ---------------------------------------
+		//
+		// The curve is a pure function, so it can be printed rather than inferred from a trajectory.
+		// This is "the new curve with measured numbers at several input speeds" in one line per
+		// speed: what fraction of a strafe's gain survives, and what one 60Hz frame of perpendicular
+		// input is actually worth at that speed. The trajectory phases below then confirm the table.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("MEASURE AIRCAP curve: falloff=%d soft=%.0f hard=%.0f exp=%.2f hardCapOn=%d"),
+			IsAirStrafeFalloffEnabled() ? 1 : 0, GetAirStrafeSoftCapSpeed(), GetAirStrafeHardCapSpeed(),
+			GetAirStrafeFalloffExponent(), IsAirStrafeHardCapEnabled() ? 1 : 0);
+		for (const float SampleSpeed : { 600.f, 700.f, 800.f, 835.f, 900.f, 950.f, 1000.f, 1036.f,
+		                                 1100.f, 1150.f, 1200.f, 1250.f, 1300.f, 1400.f })
+		{
+			// One 1/60s frame of perfectly perpendicular input: the projection is 0, so the whole
+			// AirAcceleration allowance is available and lands sideways, giving sqrt(v^2 + a^2).
+			const float Allowance = FMath::Min(GetAirAcceleration() / 60.f,
+				FMath::Min(GetMaxAirSpeed(), GetAirMaxWishSpeed()));
+			const float RawFrameGain = FMath::Sqrt(SampleSpeed * SampleSpeed + Allowance * Allowance) - SampleSpeed;
+			const float Scale = GetAirStrafeGainScale(SampleSpeed);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE AIRCAP   v=%6.0f uu/s  gainScale=%.4f  frameGain %5.2f -> %5.2f uu/s "
+				     "(%6.1f -> %6.1f uu/s per second of strafing)"),
+				SampleSpeed, Scale, RawFrameGain, RawFrameGain * Scale,
+				RawFrameGain * 60.f, RawFrameGain * Scale * 60.f);
+		}
 	}
 
 	MeasureTime += DeltaSeconds;
@@ -2119,8 +3125,468 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		if (MeasurePhaseTime > 0.30f)
 		{
 			UE_LOG(LogTraceGame, Display, TEXT("MEASURE SLIDEJUMP-CLEAN +0.30s airborne: planar=%.0f uu/s"), PlanarSpeed);
-			UE_LOG(LogTraceGame, Display, TEXT("MEASURE ---- end"));
 			Advance(28);
+		}
+		break;
+
+	// =============================================================================================
+	// 28-29. THE LONG STRAFE — spec v5 §1's actual question.
+	//
+	// Phase 2 above measures 0.40 s of strafing, which is what the Demo 5 baseline (835 -> 1036) was
+	// taken over. But "how much momentum can be gained" is not a question about 0.4 s: it is about
+	// what happens when a player strafes for the whole of a long jump, and then does it again off the
+	// next one. So this drops the pawn from far enough up to strafe for three full seconds and prints
+	// the speed every quarter of a second. Uncapped, that curve keeps climbing to MaxAirSpeed and the
+	// pawn lands well over the ground limit every time; capped, it flattens onto the hard cap.
+	// =============================================================================================
+	case 28:
+		if (UpdatedComponent != nullptr && CharacterOwner != nullptr)
+		{
+			const FVector Here = UpdatedComponent->GetComponentLocation();
+			CharacterOwner->SetActorLocation(FVector(0.f, 0.f, Here.Z + 6000.f), false, nullptr, ETeleportType::TeleportPhysics);
+			// 835 uu/s: the exact entry speed the Demo 5 baseline was measured from.
+			Velocity = FVector(835.f, 0.f, 0.f);
+			SetMovementMode(MOVE_Falling);
+			MeasureMarkA = 835.f;
+			MeasureMarkB = 0.f;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE AIRCAP-LONG: dropped at planar=835 uu/s (the Demo 5 baseline entry); "
+				     "strafing continuously for 3s. Demo 5 reached 1036 after 0.40s and kept climbing."));
+			Advance(29);
+		}
+		break;
+
+	case 29:
+	{
+		const FVector Perpendicular = FVector::CrossProduct(FVector::UpVector, TravelDirection).GetSafeNormal();
+		CharacterOwner->AddMovementInput(Perpendicular, 1.f);
+
+		// A sample every 0.25s, so the curve is readable as a table rather than as 180 log lines.
+		if (MeasurePhaseTime >= MeasureMarkB + 0.25f)
+		{
+			MeasureMarkB = MeasurePhaseTime;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE AIRCAP-LONG t=%.2fs planar=%7.1f uu/s (turned %5.1f deg, gainScale here %.4f)"),
+				MeasurePhaseTime, PlanarSpeed, TurnedDegrees(), GetAirStrafeGainScale(PlanarSpeed));
+		}
+
+		if (MeasurePhaseTime > 3.0f || IsMovingOnGround())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MEASURE AIRCAP-LONG RESULT: 835 -> %.0f uu/s over %.2fs of continuous strafing "
+				     "(%.1f%% of entry; soft cap %.0f, hard cap %.0f, falloff=%d hardCap=%d). "
+				     "Vector turned %.0f deg, so the TURN still costs nothing."),
+				PlanarSpeed, MeasurePhaseTime, 100.f * PlanarSpeed / 835.f,
+				GetAirStrafeSoftCapSpeed(), GetAirStrafeHardCapSpeed(),
+				IsAirStrafeFalloffEnabled() ? 1 : 0, IsAirStrafeHardCapEnabled() ? 1 : 0,
+				TurnedDegrees());
+			UE_LOG(LogTraceGame, Display, TEXT("MEASURE ---- end"));
+			Advance(30);
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+}
+
+// =================================================================================================
+// THE RUBBER-BAND INSTRUMENT AND THE LEDGE TEST (spec v5 §7)
+// =================================================================================================
+
+void UTraceCharacterMovementComponent::OnClientCorrectionReceived(
+	FNetworkPredictionData_Client_Character& ClientData, float TimeStamp, FVector NewLocation,
+	FVector NewVelocity, FMovementBaseInterfaceData* NewMovementBaseInterfaceData, FName NewBaseBoneName,
+	bool bHasBase, bool bBaseRelativePosition, uint8 ServerMovementMode, FVector ServerGravityDirection)
+{
+	// The error the server is about to correct, measured BEFORE Super applies it — afterwards the
+	// pawn is already at the corrected position and the number is zero.
+	const FVector Before = (UpdatedComponent != nullptr) ? UpdatedComponent->GetComponentLocation() : NewLocation;
+	const float PositionError = static_cast<float>(FVector::Dist(Before, NewLocation));
+	const float VelocityError = static_cast<float>(FVector::Dist(Velocity, NewVelocity));
+	const uint8 LocalMode = static_cast<uint8>(MovementMode.GetValue());
+
+	++CorrectionCount;
+	CorrectionErrorTotal += PositionError;
+	CorrectionErrorWorst = FMath::Max(CorrectionErrorWorst, PositionError);
+
+	if (AreMoveCorrectionsLogged())
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("CORRECTION %-16s #%d t=%.3f posErr=%7.2fuu velErr=%7.1fuu/s mode(local=%d server=%d) "
+			     "z=%.1f grounded=%d grace=%.3f mantle=%.3f slide=%.3f | mean=%.2f worst=%.2f"),
+			*GetNameSafe(CharacterOwner), CorrectionCount, TimeStamp, PositionError, VelocityError,
+			static_cast<int32>(LocalMode), static_cast<int32>(ServerMovementMode), Before.Z,
+			IsMovingOnGround() ? 1 : 0, GroundGraceRemaining, MantleTimeRemaining, SlideTimeRemaining,
+			CorrectionErrorTotal / FMath::Max(1, CorrectionCount), CorrectionErrorWorst);
+	}
+
+	Super::OnClientCorrectionReceived(ClientData, TimeStamp, NewLocation, NewVelocity,
+		NewMovementBaseInterfaceData, NewBaseBoneName, bHasBase, bBaseRelativePosition,
+		ServerMovementMode, ServerGravityDirection);
+}
+
+void UTraceCharacterMovementComponent::TickLedgeTest(float DeltaSeconds)
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("TraceLedgeTest"));
+	if (!bEnabled || CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	// Locally controlled only — but in ANY net mode, unlike TickMomentumMeasure. The whole point is
+	// to measure what a networked CLIENT experiences at a ledge, so restricting this to standalone
+	// would measure everything except the bug.
+	if (!CharacterOwner->IsLocallyControlled()
+		|| Cast<APlayerController>(CharacterOwner->GetController()) == nullptr)
+	{
+		return;
+	}
+
+	UWorld* TestWorld = GetWorld();
+	if (TestWorld == nullptr)
+	{
+		return;
+	}
+
+	// --- Ground-state flip counter, running the whole time -------------------------------------
+	//
+	// THE PRIMARY MEASUREMENT. A pawn that runs onto a raised section should change ground state
+	// twice: airborne on the jump, grounded on the landing. Every flip beyond that is the capsule
+	// oscillating on the lip, and every oscillation is a chance for the client and the server to
+	// disagree about which velocity model to run.
+	const bool bGroundedNow = IsMovingOnGround();
+	if (LedgeTestTime >= 0.f && bGroundedNow != (bLedgeTestWasGrounded != 0))
+	{
+		++LedgeTestGroundFlips;
+	}
+	bLedgeTestWasGrounded = bGroundedNow ? 1 : 0;
+
+	if (LedgeTestTime < 0.f)
+	{
+		if (TestWorld->GetTimeSeconds() < 3.f || !IsMovingOnGround())
+		{
+			return;
+		}
+		LedgeTestTime = 0.f;
+		LedgeTestPhase = 0;
+		LedgeTestPhaseTime = 0.f;
+		LedgeTestGroundFlips = 0;
+		LedgeTestMantles = 0;
+		LedgeTestRun = 0;
+		CorrectionCount = 0;
+		CorrectionErrorTotal = 0.f;
+		CorrectionErrorWorst = 0.f;
+
+		// Run toward the middle of the field, same rule as the momentum harness: a fixed world axis
+		// walks straight into an endzone wall from a spawn pad.
+		LedgeTestRunDirection = FVector::ForwardVector;
+		FVector TowardCentre = -UpdatedComponent->GetComponentLocation();
+		TowardCentre.Z = 0.f;
+		if (TowardCentre.Normalize())
+		{
+			LedgeTestRunDirection = TowardCentre;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("LEDGE ---- begin. netMode=%d role=%d mantle=%d grace=%.3f perch=%.1f jumpZ=%.0f"),
+			static_cast<int32>(GetNetMode()), static_cast<int32>(CharacterOwner->GetLocalRole()),
+			IsMantleEnabled() ? 1 : 0, GetLedgeGroundGraceSeconds(), PerchRadiusThreshold, JumpZVelocity);
+	}
+
+	LedgeTestTime += DeltaSeconds;
+	LedgeTestPhaseTime += DeltaSeconds;
+
+	auto Advance = [this](int32 NextPhase)
+	{
+		LedgeTestPhase = NextPhase;
+		LedgeTestPhaseTime = 0.f;
+	};
+
+	switch (LedgeTestPhase)
+	{
+	// --- 0. BUILD A LEDGE -----------------------------------------------------------------------
+	//
+	// The harness makes its own geometry on purpose. The arena's raised sections are real ledges,
+	// but where they are depends on the arena builder's tuning, and a repeatable measurement of a
+	// prediction bug has to hit the SAME lip every run. 176 uu is one player height — exactly the
+	// class of structure the report is about, and exactly the height a 640 uu/s jump (apex 209 uu)
+	// only just clears, which is why landing on its edge is so common.
+	//
+	// NOT REPLICATED, AND QUANTISED. Each machine spawns its OWN copy, at a position rounded to a
+	// 50 uu grid: replicating an AStaticMeshActor spawned at runtime would not carry its mesh or its
+	// scale to the client, and a block placed from an un-rounded pawn position would sit a couple of
+	// uu apart on the two machines — which would MANUFACTURE the desync this run exists to measure.
+	// Rounding makes both ends agree exactly as long as they agree to within 25 uu, which they must,
+	// or the correction had nothing to do with the ledge.
+	case 0:
+	{
+		if (LedgeTestBlock.IsValid())
+		{
+			Advance(1);
+			break;
+		}
+
+		UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		if (Cube == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("LEDGE could not load /Engine/BasicShapes/Cube"));
+			Advance(9);
+			break;
+		}
+
+		const FVector Here = UpdatedComponent->GetComponentLocation();
+		const float FeetZ = Here.Z - 88.f;
+
+		// "-TraceLedgeHeight=N", default 260.
+		//
+		// 260 AND NOT 176, AND THE FIRST RUN OF THIS HARNESS IS WHY. A 176 uu block is one player
+		// height, which is the arena's smallest raised section — but a 640 uu/s jump apexes at
+		// 640^2/(2*980) = 209 uu, so the pawn sails clean over it and never touches the face at all.
+		// Eight consecutive runs measured exactly that: canMantle=1 the whole way, feet passing 207 uu
+		// with the block's 176 uu top already below them, no wall in reach, no mantle, and no bug
+		// either. To exercise a LEDGE CLIMB the block has to be taller than the jump, and 260 is the
+		// first round number that is. The 176 case is a different test (landing on the lip) and is
+		// what PerchRadiusThreshold and the ledge grace are for.
+		float BlockHeight = 260.f;
+		FParse::Value(FCommandLine::Get(), TEXT("TraceLedgeHeight="), BlockHeight);
+		BlockHeight = FMath::Clamp(BlockHeight, 60.f, 800.f);
+
+		auto Quantise = [](double Value) { return FMath::GridSnap(Value, 50.0); };
+
+		// --- PICK AN OPEN STRETCH OF FLOOR, AND PROVE IT IS OPEN --------------------------------
+		//
+		// THIS HARNESS PREVIOUSLY MEASURED A COLLISION WITH THE ARENA, NOT THE MANTLE, and every
+		// mantle number reported off it — "1 mantle in 8 runs", "2 in 8" — is void. It ran from
+		// wherever the pawn happened to spawn and put its block 900 uu along the line to the field
+		// centre, without ever checking anything was there. Spawn pads are inside the endzone, so on
+		// a 33600-long field the block landed at X=-14700, i.e. inside the mode A endzone structure
+		// (half-extent 1200 about the end line, so X <= -14400 is solid). MEASURED: the pawn jammed
+		// against the endzone 300 uu short of its own test block and stayed there — z pinned at 90.1,
+		// feet 2.1, planar 800 uu/s going nowhere, dist to the face stuck around 300 while the mantle
+		// probe (reach 104 uu) reported "degenerate, penetrating=1 dist=0.00" against the endzone it
+		// was pressed into. Eight runs, eight collisions, zero arrivals at the ledge.
+		//
+		// This is precisely the failure TickMomentumMeasure documents for itself ("the first two
+		// attempts sprinted into an endzone wall and reported a jump that lost 750 uu/s, which was a
+		// collision") — the momentum harness teleports to the middle of the field to escape it, and
+		// this one never got the same treatment.
+		//
+		// So: run down the long axis from a candidate on the centre line, and accept a candidate only
+		// once three sweeps say it is genuinely clear — standing room at the mark, an unobstructed
+		// run-up to where the block will stand, and room for the block itself. Fixed round
+		// coordinates rather than pawn-relative ones also make the block land on the SAME world
+		// position on the host and on a client regardless of which pad each spawned at, which is what
+		// the quantisation was reaching for and could not deliver from a spawn-relative origin.
+		const UCapsuleComponent* TestCapsule = CharacterOwner->GetCapsuleComponent();
+		const float TestRadius = (TestCapsule != nullptr) ? TestCapsule->GetScaledCapsuleRadius() : 34.f;
+		const float TestHalfHeight = (TestCapsule != nullptr) ? TestCapsule->GetScaledCapsuleHalfHeight() : 88.f;
+		const FCollisionShape RunShape = FCollisionShape::MakeCapsule(TestRadius, TestHalfHeight);
+
+		FCollisionQueryParams ClearParams;
+		FCollisionResponseParams ClearResponse;
+		InitCollisionParams(ClearParams, ClearResponse);
+		ClearParams.bTraceComplex = false;
+		const ECollisionChannel ClearChannel = UpdatedComponent->GetCollisionObjectType();
+
+		// Down the long axis, on the centre line: the flat playfield is 6600 wide about Y=0, so Y=0 is
+		// the one line guaranteed clear of the banks that start at Y=+/-3300.
+		const FVector RunDirection = FVector::ForwardVector;
+		const double StandZ = Quantise(Here.Z);
+		const double BlockBottomZ = StandZ - TestHalfHeight;
+
+		bool bFoundSpot = false;
+		FVector ChosenStart = FVector(Quantise(Here.X), Quantise(Here.Y), Here.Z);
+		for (const double CandidateX : { -6000.0, -4000.0, -2000.0, 0.0, 2000.0, 4000.0, 6000.0, -8000.0, 8000.0 })
+		{
+			const FVector Candidate(CandidateX, 0.0, StandZ);
+			const FVector BlockSpot = Candidate + RunDirection * 900.f;
+
+			// 1. Room to stand at the mark.
+			if (TestWorld->OverlapBlockingTestByChannel(Candidate, FQuat::Identity, ClearChannel,
+				RunShape, ClearParams, ClearResponse))
+			{
+				continue;
+			}
+
+			// 2. An unobstructed run-up. Without this the pawn can start in the open and still meet a
+			//    pillar on the way, which is the same void measurement in a different place.
+			FHitResult PathHit;
+			if (TestWorld->SweepSingleByChannel(PathHit, Candidate, BlockSpot, FQuat::Identity,
+				ClearChannel, RunShape, ClearParams, ClearResponse))
+			{
+				continue;
+			}
+
+			// 3. Room for the block. Lifted 2 uu so the floor it stands on is not read as an overlap.
+			const FCollisionShape BlockVolume = FCollisionShape::MakeBox(
+				FVector(300.f, 300.f, static_cast<float>(BlockHeight * 0.5)));
+			const FVector BlockVolumeCentre(BlockSpot.X, BlockSpot.Y, BlockBottomZ + BlockHeight * 0.5 + 2.0);
+			if (TestWorld->OverlapBlockingTestByChannel(BlockVolumeCentre, FQuat::Identity, ClearChannel,
+				BlockVolume, ClearParams, ClearResponse))
+			{
+				continue;
+			}
+
+			ChosenStart = Candidate;
+			bFoundSpot = true;
+			break;
+		}
+
+		if (!bFoundSpot)
+		{
+			// Loud, because the alternative is another pass reporting mantle counts taken from a pawn
+			// wedged against a wall.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("LEDGE found no clear stretch on the centre line - the numbers below measure the "
+				     "arena, not the mantle. Falling back to %s."), *ChosenStart.ToCompactString());
+		}
+
+		LedgeTestRunDirection = RunDirection;
+		CharacterOwner->SetActorLocation(ChosenStart, false, nullptr, ETeleportType::TeleportPhysics);
+		Velocity = FVector::ZeroVector;
+
+		const FVector BlockCentre(Quantise(ChosenStart.X + RunDirection.X * 900.f),
+			Quantise(ChosenStart.Y + RunDirection.Y * 900.f),
+			BlockBottomZ + BlockHeight * 0.5);
+
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		AStaticMeshActor* Block = TestWorld->SpawnActor<AStaticMeshActor>(
+			AStaticMeshActor::StaticClass(), BlockCentre, FRotator::ZeroRotator, SpawnParams);
+		if (Block == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("LEDGE could not spawn the test block"));
+			Advance(9);
+			break;
+		}
+
+		if (UStaticMeshComponent* BlockMesh = Block->GetStaticMeshComponent())
+		{
+			BlockMesh->SetMobility(EComponentMobility::Movable);
+			BlockMesh->SetStaticMesh(Cube);
+			// The engine cube is 100 uu. 600 uu across so a slightly off run still meets the same face.
+			BlockMesh->SetWorldScale3D(FVector(6.f, 6.f, BlockHeight / 100.f));
+			BlockMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+		}
+
+		LedgeTestBlock = Block;
+		LedgeTestStart = ChosenStart;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("LEDGE built a %.0fuu block at %s (top z=%.1f, feet z=%.1f, jump apex is %.0fuu), running from %s "
+			     "(clear stretch found=%d)"),
+			BlockHeight, *BlockCentre.ToCompactString(), BlockCentre.Z + BlockHeight * 0.5f, FeetZ,
+			(JumpZVelocity * JumpZVelocity) / (2.f * FMath::Max(1.f, GetGravityZ() * -1.f)),
+			*LedgeTestStart.ToCompactString(), bFoundSpot ? 1 : 0);
+		Advance(1);
+		break;
+	}
+
+	// --- 1. RESET to the run-up mark ------------------------------------------------------------
+	case 1:
+		CharacterOwner->SetActorLocation(LedgeTestStart + FVector(0.f, 0.f, 20.f), false, nullptr, ETeleportType::TeleportPhysics);
+		Velocity = FVector::ZeroVector;
+		UE_LOG(LogTraceGame, Display, TEXT("LEDGE run %d: reset to %s"), LedgeTestRun + 1, *LedgeTestStart.ToCompactString());
+		Advance(2);
+		break;
+
+	// --- 2. RUN AT IT, AND JUMP AT THE EDGE -----------------------------------------------------
+	//
+	// The jump is triggered on DISTANCE TO THE FACE, not on a stopwatch. "Jumping on the edge of a
+	// raised section" is a specific input — a jump made close enough that the capsule arrives at the
+	// lip rather than sailing over it — and a fixed 0.85s produced a different jump every time the
+	// frame rate moved, which is how the first version of this harness measured nothing at all.
+	case 2:
+	{
+		CharacterOwner->AddMovementInput(LedgeTestRunDirection, 1.f);
+
+		const AActor* Block = LedgeTestBlock.Get();
+		const float DistanceToBlock = (Block != nullptr)
+			? static_cast<float>(FVector::Dist2D(UpdatedComponent->GetComponentLocation(), Block->GetActorLocation())) - 300.f
+			: 0.f;
+
+		if (Block != nullptr && DistanceToBlock < 340.f && IsMovingOnGround())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("LEDGE run %d: JUMP at %.0fuu from the face, planar=%.0f uu/s"),
+				LedgeTestRun + 1, DistanceToBlock, GetPlanarSpeed());
+			CharacterOwner->Jump();
+			Advance(3);
+		}
+		else if (LedgeTestPhaseTime > 4.f)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("LEDGE run %d: never reached the block (dist=%.0f, planar=%.0f, grounded=%d)"),
+				LedgeTestRun + 1, DistanceToBlock, GetPlanarSpeed(), IsMovingOnGround() ? 1 : 0);
+			Advance(4);
+		}
+		break;
+	}
+
+	// --- 3. HOLD FORWARD THROUGH THE CONTACT ----------------------------------------------------
+	//
+	// One log line per frame here, and only here: about thirty lines per run, which is the whole
+	// contact event at full resolution. Without it "the mantle did not fire" is a dead end — this is
+	// what says whether the pawn was even airborne and pushing when it met the lip.
+	case 3:
+	{
+		CharacterOwner->AddMovementInput(LedgeTestRunDirection, 1.f);
+		CharacterOwner->StopJumping();
+
+		const AActor* Block = LedgeTestBlock.Get();
+		const FVector Here = UpdatedComponent->GetComponentLocation();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("LEDGE   contact t=%.3f z=%7.1f feet=%7.1f planar=%6.0f velZ=%7.0f falling=%d "
+			     "canMantle=%d mantling=%d dist=%6.0f"),
+			LedgeTestPhaseTime, Here.Z, Here.Z - 88.f, GetPlanarSpeed(), Velocity.Z,
+			IsFalling() ? 1 : 0, CanAttemptMantle() ? 1 : 0, IsMantling() ? 1 : 0,
+			Block != nullptr ? static_cast<float>(FVector::Dist2D(Here, Block->GetActorLocation())) - 300.f : 0.f);
+
+		if (IsMantling())
+		{
+			++LedgeTestMantles;
+			Advance(4);
+			break;
+		}
+
+		if (LedgeTestPhaseTime > 1.6f)
+		{
+			Advance(4);
+		}
+		break;
+	}
+
+	// --- 4. SETTLE, then report this run and go again -------------------------------------------
+	case 4:
+		CharacterOwner->AddMovementInput(LedgeTestRunDirection, 1.f);
+		if (LedgeTestPhaseTime > 1.0f)
+		{
+			++LedgeTestRun;
+			const FVector Here = UpdatedComponent->GetComponentLocation();
+			UE_LOG(LogTraceGame, Display,
+				TEXT("LEDGE run %2d: z=%7.1f (start %7.1f, +%6.1f) grounded=%d | cumulative: flips=%d "
+				     "mantles=%d corrections=%d meanErr=%.2fuu worstErr=%.2fuu"),
+				LedgeTestRun, Here.Z, LedgeTestStart.Z, Here.Z - LedgeTestStart.Z,
+				IsMovingOnGround() ? 1 : 0, LedgeTestGroundFlips, LedgeTestMantles,
+				CorrectionCount, CorrectionErrorTotal / FMath::Max(1, CorrectionCount),
+				CorrectionErrorWorst);
+
+			if (LedgeTestRun >= 8)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("LEDGE ---- end. %d runs | groundFlips=%d (2/run is the floor: one jump, one "
+					     "landing) | mantles=%d | corrections=%d meanErr=%.2fuu worstErr=%.2fuu | "
+					     "mantleOn=%d grace=%.3f perch=%.1f"),
+					LedgeTestRun, LedgeTestGroundFlips, LedgeTestMantles, CorrectionCount,
+					CorrectionErrorTotal / FMath::Max(1, CorrectionCount), CorrectionErrorWorst,
+					IsMantleEnabled() ? 1 : 0, GetLedgeGroundGraceSeconds(), PerchRadiusThreshold);
+				Advance(9);
+			}
+			else
+			{
+				Advance(1);
+			}
 		}
 		break;
 
@@ -2146,7 +3612,6 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, SavedDashDirection(FVector::ZeroVector)
 	, SavedSlideTimeRemaining(0.f)
 	, SavedSlideCooldownRemaining(0.f)
-	, SavedSlideCommitRemaining(0.f)
 	, SavedSlideSpeed(0.f)
 	, SavedSlideBufferRemaining(0.f)
 	, SavedSlideDirection(FVector::ZeroVector)
@@ -2154,6 +3619,13 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, bSavedWasAirborneLastMove(0)
 	, SavedSlideJumpGraceRemaining(0.f)
 	, bSavedSlideJumpGraceWellTimed(0)
+	, SavedGroundGraceRemaining(0.f)
+	, SavedMantleTimeRemaining(0.f)
+	, SavedMantleTotalTime(0.f)
+	, SavedMantleTargetLocation(FVector::ZeroVector)
+	, SavedMantleUpTargetZ(0.f)
+	, SavedMantleEntrySpeed(0.f)
+	, SavedMantleCooldownRemaining(0.f)
 {
 }
 
@@ -2175,7 +3647,6 @@ void FSavedMove_Trace::Clear()
 
 	SavedSlideTimeRemaining = 0.f;
 	SavedSlideCooldownRemaining = 0.f;
-	SavedSlideCommitRemaining = 0.f;
 	SavedSlideSpeed = 0.f;
 	SavedSlideBufferRemaining = 0.f;
 	SavedSlideDirection = FVector::ZeroVector;
@@ -2183,6 +3654,16 @@ void FSavedMove_Trace::Clear()
 	bSavedWasAirborneLastMove = 0;
 	SavedSlideJumpGraceRemaining = 0.f;
 	bSavedSlideJumpGraceWellTimed = 0;
+
+	// Spec v5 §7. Moves are pooled: a stale MantleTimeRemaining left in a recycled move would
+	// resurrect a pull-up several moves later, in mid-air, with a target from a different ledge.
+	SavedGroundGraceRemaining = 0.f;
+	SavedMantleTimeRemaining = 0.f;
+	SavedMantleTotalTime = 0.f;
+	SavedMantleTargetLocation = FVector::ZeroVector;
+	SavedMantleUpTargetZ = 0.f;
+	SavedMantleEntrySpeed = 0.f;
+	SavedMantleCooldownRemaining = 0.f;
 }
 
 uint8 FSavedMove_Trace::GetCompressedFlags() const
@@ -2226,16 +3707,27 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// move's start state; the clocks are linear in dt so the maths would survive, but the frame on
 	// which the ability *ends* would move, and with it the velocity profile.
 	//
-	// The commit window is included for the same reason: it decides whether a released key ends the
-	// slide, so a merged move that straddled its expiry would resolve the release differently from
-	// the two moves it replaced.
 	// The slide-jump's coyote window is in the same list and for the same reason: it decides whether
 	// a jump is a slide-jump at all, so a merged move straddling its expiry would resolve the jump
 	// differently from the two moves it replaced — and the difference is the whole carry.
+	//
+	// SPEC v5 §7 adds the mantle. It is the strictest case in the whole kit: its velocity is
+	// (target - here)/time-left, which is non-linear in dt by construction, and the pull-up ends on a
+	// DISTANCE test, so merging two moves across it would move the frame the pawn arrives on.
+	//
+	// THE LEDGE GRACE IS DELIBERATELY NOT IN THIS LIST, and it would be a bandwidth bug if it were.
+	// GroundGraceRemaining is refilled on every grounded move, so testing it here would refuse to
+	// merge ANY ground movement at all — every walking move would go to the server separately. It
+	// needs no test: the grace only ever changes a decision while the pawn is airborne, and an
+	// airborne move already sets bSavedMomentumActive below, which refuses the merge.
+	//
+	// (SavedSlideCommitRemaining was in this list and is deleted with the commit window — spec v5 §3.
+	// Nothing is lost: SavedSlideTimeRemaining already refuses every move the commit window could
+	// have been open on.)
 	if (SavedDashTimeRemaining > 0.f || Other->SavedDashTimeRemaining > 0.f
 		|| SavedSlideTimeRemaining > 0.f || Other->SavedSlideTimeRemaining > 0.f
-		|| SavedSlideCommitRemaining > 0.f || Other->SavedSlideCommitRemaining > 0.f
-		|| SavedSlideJumpGraceRemaining > 0.f || Other->SavedSlideJumpGraceRemaining > 0.f)
+		|| SavedSlideJumpGraceRemaining > 0.f || Other->SavedSlideJumpGraceRemaining > 0.f
+		|| SavedMantleTimeRemaining > 0.f || Other->SavedMantleTimeRemaining > 0.f)
 	{
 		return false;
 	}
@@ -2278,7 +3770,6 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 
 			SavedSlideTimeRemaining     = Movement->SlideTimeRemaining;
 			SavedSlideCooldownRemaining = Movement->SlideCooldownRemaining;
-			SavedSlideCommitRemaining   = Movement->SlideCommitRemaining;
 			SavedSlideSpeed             = Movement->SlideSpeed;
 			SavedSlideBufferRemaining   = Movement->SlideBufferRemaining;
 			SavedSlideDirection         = Movement->SlideDirection;
@@ -2287,6 +3778,18 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 
 			SavedSlideJumpGraceRemaining  = Movement->SlideJumpGraceRemaining;
 			bSavedSlideJumpGraceWellTimed = Movement->bSlideJumpGraceWellTimed;
+
+			// Spec v5 §7. The mantle's target and its up-phase Z are snapshotted with the clocks:
+			// they are recomputed identically on the server from the same geometry, but the CLIENT's
+			// replay must restart from the target the original move actually used, or a correction
+			// mid-pull-up would re-derive it from a rewound position and aim somewhere else.
+			SavedGroundGraceRemaining    = Movement->GroundGraceRemaining;
+			SavedMantleTimeRemaining     = Movement->MantleTimeRemaining;
+			SavedMantleTotalTime         = Movement->MantleTotalTime;
+			SavedMantleTargetLocation    = Movement->MantleTargetLocation;
+			SavedMantleUpTargetZ         = Movement->MantleUpTargetZ;
+			SavedMantleEntrySpeed        = Movement->MantleEntrySpeed;
+			SavedMantleCooldownRemaining = Movement->MantleCooldownRemaining;
 		}
 	}
 }
@@ -2316,7 +3819,6 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 
 			Movement->SlideTimeRemaining     = SavedSlideTimeRemaining;
 			Movement->SlideCooldownRemaining = SavedSlideCooldownRemaining;
-			Movement->SlideCommitRemaining   = SavedSlideCommitRemaining;
 			Movement->SlideSpeed             = SavedSlideSpeed;
 			Movement->SlideBufferRemaining   = SavedSlideBufferRemaining;
 			Movement->SlideDirection         = SavedSlideDirection;
@@ -2328,6 +3830,18 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			// hundred uu/s of horizontal velocity on the most visible frame in the kit.
 			Movement->SlideJumpGraceRemaining  = SavedSlideJumpGraceRemaining;
 			Movement->bSlideJumpGraceWellTimed = bSavedSlideJumpGraceWellTimed;
+
+			// The mantle and the ledge grace (spec v5 §7). Without these a correction landing
+			// mid-pull-up replays it as a plain fall: the pawn ends up on top of the ledge on one
+			// machine and at the bottom of it on the other — the largest rubber-band the kit could
+			// produce, and the exact bug the mantle was added to remove.
+			Movement->GroundGraceRemaining    = SavedGroundGraceRemaining;
+			Movement->MantleTimeRemaining     = SavedMantleTimeRemaining;
+			Movement->MantleTotalTime         = SavedMantleTotalTime;
+			Movement->MantleTargetLocation    = SavedMantleTargetLocation;
+			Movement->MantleUpTargetZ         = SavedMantleUpTargetZ;
+			Movement->MantleEntrySpeed        = SavedMantleEntrySpeed;
+			Movement->MantleCooldownRemaining = SavedMantleCooldownRemaining;
 		}
 	}
 }

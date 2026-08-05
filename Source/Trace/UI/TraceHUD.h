@@ -102,6 +102,22 @@ protected:
 	void DrawCoreBanner();
 
 	/**
+	 * Top-right: what this process is on the network, and the address other people dial to reach it.
+	 *
+	 * "HOSTING — 100.101.102.103:7777" is a headline feature of spec v5 §0, not chrome. The reported
+	 * bug was two machines each running a private match and nobody able to tell whether their setup
+	 * worked; a host who can read their own address off their own screen, mid-match, while somebody
+	 * asks them for it over voice, is the affordance that makes the rest of this usable.
+	 *
+	 * It reads the world's ACTUAL net mode, never what the menu intended — so a listen server whose
+	 * bind failed says OFFLINE rather than repeating a promise the process did not keep.
+	 */
+	void DrawNetworkStatus();
+
+	/** The last connection or travel failure, if recent. Same store the title screen draws from. */
+	void DrawNetworkFailureBanner();
+
+	/**
 	 * The centre-screen phase callout: the warm-up countdown, and "GO" as the match starts.
 	 *
 	 * This exists because of a specific complaint: the match "keeps stopping and restarting
@@ -290,6 +306,12 @@ private:
 	int32 LastSeenBlueScore = 0;
 	int32 LastSeenOrangeScore = 0;
 	bool bScoreCacheValid = false;
+
+	/**
+	 * Humans in the match as of the last line DrawNetworkStatus() logged, so the roster is written
+	 * once per change instead of once per frame. -1 forces the first draw to report.
+	 */
+	int32 LastLoggedHumanCount = -1;
 
 	/** Client-local time the last capture was observed, and who scored it. */
 	float ScoreFlashTime = -1000.f;

@@ -357,10 +357,10 @@ public:
 	 * Registers a goal volume. Call from the goal actor's BeginPlay (server or not; non-authority
 	 * entries are simply never consulted for scoring).
 	 *
-	 * THIS IS THE HOOK FOR THE REAL GOAL ACTOR. While nothing is registered, the Core derives its
-	 * goals from the live ATraceEndzone boxes instead — narrowed to UTraceSettings::
-	 * GoalWidthFieldFraction and capped at GoalHeightUU — so mode B is playable and testable before
-	 * the goal geometry lands, and stops deriving the moment one real volume registers.
+	 * THIS IS THE HOOK FOR THE REAL GOAL ACTOR. While nothing is registered, the Core reads the live
+	 * ATraceEndzone goal volumes instead (RefreshGoalVolumes step 2) — the same boxes the arena
+	 * builder sized and drew, so mode B is playable and testable before any external goal actor
+	 * lands, and it stops reading them the moment one real volume registers.
 	 *
 	 * @param GoalOwner       the goal actor; also the key for UnregisterGoalVolume.
 	 * @param DefendingTeam   the team that DEFENDS this goal. Their OPPONENT scores in it, exactly
@@ -374,6 +374,25 @@ public:
 	static void UnregisterGoalVolume(AActor* GoalOwner);
 
 	/**
+	 * How a goal was put in.
+	 *
+	 * Counted apart because "bots never carry it in" and "bots never throw it in" are DIFFERENT
+	 * failures with different fixes, and both were live at once last pass — a single goal total
+	 * showed neither, and every goal that did land came from the scripted verifier or a deflection.
+	 */
+	enum class EGoalMethod : uint8
+	{
+		Thrown = 0,
+		Carried = 1,
+		/** Possession changed hands while the new holder was already standing inside the mouth. */
+		Granted = 2,
+		Count = 3
+	};
+
+	/** Running tally per EGoalMethod. Printed by the [ModeB] tally line and by Trace.ModeB.Tally. */
+	static int32 GoalsByMethod[static_cast<int32>(EGoalMethod::Count)];
+
+	/**
 	 * The centre of the goal @p AttackingTeam scores in, for bot steering and HUD markers.
 	 *
 	 * In mode B this is the narrow goal mouth; in mode A there are no goals and this returns false,
@@ -381,6 +400,38 @@ public:
 	 * so a bot cannot run at a goal the rule does not recognise.
 	 */
 	static bool GetAttackGoalCentre(const UWorld* World, ETraceTeam AttackingTeam, FVector& OutCentre);
+
+	/**
+	 * The whole goal box @p AttackingTeam scores in, not just its centre.
+	 *
+	 * Exists because the mouth is now NARROW (spec v5 §4) and a caller that only knows the centre
+	 * cannot tell whether it is lined up with it. ATraceBotController needs exactly that: its attack
+	 * lane spreads bots across ±BotAttackLaneFieldFraction of the field HALF-WIDTH, which is ±1440 uu
+	 * on this pitch — wider than the 2000 uu goal — so a carrier steering at "the goal, on my lane"
+	 * was steering at a point beside the mouth. Same boxes CheckGoalScore awards points off.
+	 */
+	static bool GetAttackGoalBox(const UWorld* World, ETraceTeam AttackingTeam, FBox& OutBox);
+
+	// --- MODE B: the Core's own flight model, published --------------------------------------------
+	//
+	// PUBLISHED, rather than left for each caller to reconstruct, because it already went wrong once:
+	// ATraceBotController::ComputeThrowAimPoint read the Trace.ModeB.* CONSOLE VARIABLES directly and
+	// so silently ignored the UTraceSettings properties that override them, and would have ignored
+	// the v5 weight model entirely — every bot aiming as if the Core were still the old light one,
+	// i.e. throwing long over a goal it is trying to hit. One model, one owner, asked at the point of
+	// use so a live retune reaches the bots on the same frame it reaches the Core.
+
+	/** MODE B. Launch speed of a thrown Core, uu/s, after the weight model. */
+	static float GetThrowSpeed();
+
+	/** MODE B. Upward component added to a throw, as a fraction of the launch speed, after weight. */
+	static float GetThrowUpBias();
+
+	/** MODE B. SIGNED gravity acting on a loose Core in @p World, uu/s^2 (negative), after weight. */
+	static float GetThrowGravityZ(const UWorld* World);
+
+	/** MODE B. Forward offset of the launch point from the thrower's eye. */
+	static float GetThrowMuzzleForward();
 
 	// --- Pass input ------------------------------------------------------------------------------
 
@@ -670,7 +721,8 @@ private:
 	 * more on a hitching server, so a point test at each frame boundary can miss a 700 uu goal mouth
 	 * outright. Awards the point (ATraceGameMode::NotifyScored) and returns true.
 	 */
-	bool CheckGoalScore(const FVector& From, const FVector& To, ETraceTeam ScoringTeam, const TCHAR* How);
+	bool CheckGoalScore(const FVector& From, const FVector& To, ETraceTeam ScoringTeam, EGoalMethod Method,
+		const TCHAR* How);
 
 	/** Rebuilds GoalBoxes from the registrations, or from the endzone volumes when there are none. */
 	void RefreshGoalVolumes(bool bForce);
@@ -863,6 +915,21 @@ private:
 	ETraceTeam VerifyFromTeam = ETraceTeam::None;
 	bool bVerifyTookGrace = false;
 	FString VerifyTakerName;
+
+	/**
+	 * GoalsByMethod, sampled when a bot-behaviour step starts (steps 4 and 5).
+	 *
+	 * Those two steps do not test the Core at all - they test that ATraceBotController actually
+	 * REACHES the two scoring paths, which is the gap this pass was asked to close ("bots NEVER throw
+	 * at the goal"; "scoring by CARRYING into a goal never fired"). Both are unreachable in a live
+	 * match on a 33600 uu pitch inside any window a test run gets, because a carrier is measured
+	 *16000-27000 uu from the mouth for the whole of it. Putting a carrier where the decision is
+	 * actually taken is the only way to prove the branch fires rather than merely that it compiles.
+	 */
+	int32 VerifyGoalTallyAtStart = 0;
+
+	/** Set on step 5 when a throw is seen to leave, so a shot that misses is still distinguishable. */
+	bool bVerifyThrowSeen = false;
 	int32 VerifyPassCount = 0;
 	int32 VerifyFailCount = 0;
 	int32 VerifyGoalsAtStart = 0;

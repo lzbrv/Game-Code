@@ -16,6 +16,7 @@
 #include "TimerManager.h"
 #include "Trace.h"                        // LogTraceGame
 #include "UnrealClient.h"                 // FScreenshotRequest
+#include "Engine/Engine.h"                // GEngine->Exec fallback for the deferred exec harness
 
 namespace
 {
@@ -161,6 +162,90 @@ void TraceAutoShot::Arm(AHUD* OwnerHUD, const TCHAR* Tag)
 	World->GetTimerManager().SetTimer(State.CaptureTimer,
 		FTimerDelegate::CreateWeakLambda(OwnerHUD, [OwnerHUD, TagCopy]() { TakeCapture(OwnerHUD, TagCopy); }),
 		bRepeat ? RepeatSeconds : DelaySeconds, bRepeat, DelaySeconds);
+}
+
+void TraceAutoShot::ArmDeferredExec(AHUD* OwnerHUD, const TCHAR* Tag)
+{
+	if (OwnerHUD == nullptr)
+	{
+		return;
+	}
+
+	UWorld* World = OwnerHUD->GetWorld();
+	APlayerController* PC = OwnerHUD->GetOwningPlayerController();
+	if (World == nullptr || PC == nullptr || !PC->IsLocalController())
+	{
+		return;
+	}
+
+	FString CommandList;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("TraceExec="), CommandList) || CommandList.IsEmpty())
+	{
+		// Switch absent: one FParse and out, same as the screenshot harness.
+		return;
+	}
+
+	// Which HUD this run is aimed at. Defaulting to "Match" is the safe half of the choice: almost
+	// every command worth deferring needs a live match, and firing one at the title screen produces
+	// a confusing "no world" refusal that reads like the command is broken.
+	FString WantTag;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("TraceExecOn="), WantTag) || WantTag.IsEmpty())
+	{
+		WantTag = TEXT("Match");
+	}
+	const FString TagCopy(Tag != nullptr ? Tag : TEXT(""));
+	if (!TagCopy.Equals(WantTag, ESearchCase::IgnoreCase))
+	{
+		return;
+	}
+
+	static TWeakObjectPtr<UWorld> ArmedExecWorld;
+	if (ArmedExecWorld.Get() == World)
+	{
+		return;
+	}
+	ArmedExecWorld = World;
+
+	float DelaySeconds = 8.f;
+	FParse::Value(FCommandLine::Get(), TEXT("TraceExecAt="), DelaySeconds);
+	DelaySeconds = FMath::Max(0.01f, DelaySeconds);
+
+	TArray<FString> Commands;
+	CommandList.ParseIntoArray(Commands, TEXT("|"), /*InCullEmpty=*/true);
+
+	UE_LOG(LogTraceGame, Display, TEXT("[AutoExec] Armed (%s): %d command(s) in %.2fs."),
+		*TagCopy, Commands.Num(), DelaySeconds);
+
+	// One timer, not one per command: the commands are run in the order given, and several of them
+	// (Trace.ModeB.Verify, Trace.Trail.TestHeadGap) schedule multi-second work of their own that
+	// would interleave badly if they were started at staggered times.
+	static FTimerHandle ExecTimer;
+	World->GetTimerManager().SetTimer(ExecTimer,
+		FTimerDelegate::CreateWeakLambda(OwnerHUD, [OwnerHUD, Commands]()
+	{
+		UWorld* ExecWorld = OwnerHUD->GetWorld();
+		APlayerController* ExecPC = OwnerHUD->GetOwningPlayerController();
+		for (const FString& Command : Commands)
+		{
+			const FString Trimmed = Command.TrimStartAndEnd();
+			if (Trimmed.IsEmpty())
+			{
+				continue;
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[AutoExec] > %s"), *Trimmed);
+			// Through the player controller when there is one: several Trace.* commands resolve
+			// "the local pawn" from the executing controller, and GEngine->Exec with a null player
+			// hands them nothing to work with.
+			if (ExecPC != nullptr)
+			{
+				ExecPC->ConsoleCommand(Trimmed, /*bWriteToLog=*/true);
+			}
+			else if (GEngine != nullptr)
+			{
+				GEngine->Exec(ExecWorld, *Trimmed);
+			}
+		}
+	}), DelaySeconds, false);
 }
 
 #endif // !UE_BUILD_SHIPPING

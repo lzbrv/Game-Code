@@ -556,14 +556,16 @@ namespace
 
 		UE_LOG(LogTraceGame, Display,
 			// SlideImpulse and SlideExitMinSpeedFraction are gone (spec v4 §1) and so are their columns.
-			// The slide-jump replaces them as the reason to slide, so it dumps on the same line.
+			// SlideMinCommitSeconds went the same way in spec v5 §3 — the slide is a one-shot ability
+			// now, so there is no partial commit to report. The slide-jump is the reason to slide, so
+			// it dumps on the same line.
 			TEXT("[SettingsDump:%s] Slide dur=%.2f decel=%.0f maxSpeed=%.0f entryFrac=%.2f mult=%.2f "
-			     "exitFrac=%.2f cooldown=%.2f minCommit=%.2f exitRetention=%.2f exitCeil=%.2f | "
+			     "exitFrac=%.2f cooldown=%.2f exitRetention=%.2f exitCeil=%.2f | "
 			     "SlideJump on=%d retain=%.2f zMul=%.2f window=%.2f windowBonus=%.2f"),
 			Tag, Table.SlideDuration, Table.SlideDeceleration, Table.SlideMaxSpeed,
 			Table.SlideEntrySpeedFraction, Table.SlideEntrySpeedMultiplier,
 			Table.SlideExitSpeedFraction,
-			Table.SlideCooldownSeconds, Table.SlideMinCommitSeconds, Table.SlideExitSpeedRetention,
+			Table.SlideCooldownSeconds, Table.SlideExitSpeedRetention,
 			Table.SlideExitMaxSpeedMultiplier,
 			Table.bSlideJumpEnabled ? 1 : 0, Table.SlideJumpHorizontalRetention, Table.SlideJumpZMultiplier,
 			Table.SlideJumpWindowSeconds, Table.SlideJumpWindowSpeedBonus);
@@ -622,6 +624,46 @@ namespace
 			Table.CorePickupRadius, Table.CoreThrowerPickupLockoutSeconds,
 			Table.CoreThrowCooldownSeconds, Table.CoreThrowBounce,
 			Table.CoreLooseResetSeconds);
+
+		// -----------------------------------------------------------------------------------------
+		// SPEC v5. Every number this pass moved or introduced, on three lines, because every one of
+		// them is ALSO written in Config/DefaultGame.ini and the ini wins — so the header cannot
+		// answer "what is the game actually running on" and nobody should try to read it from there
+		// again. Trace.VerifyKnobs below answers the other half: whether the properties exist at all
+		// for the systems that bind to them by name.
+		// -----------------------------------------------------------------------------------------
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] SPECv5 fire: FireInterval=%.3fs (= %.0f RPM) | Recoil on=%d perShot=%.2fdeg "
+			     "growth=%.2f max=%.2fdeg delay=%.2fs speed=%.1f/s floor=%.1fdeg/s burstReset=%.2fs compensate=%d"),
+			Tag, Table.FireInterval, (Table.FireInterval > 0.f) ? (60.f / Table.FireInterval) : 0.f,
+			Table.bRecoilEnabled ? 1 : 0, Table.RecoilPitchPerShot, Table.RecoilPitchGrowthPerShot,
+			Table.RecoilMaxPitchDegrees, Table.RecoilRecoveryDelaySeconds, Table.RecoilRecoverySpeed,
+			Table.RecoilRecoveryMinRateDegrees, Table.RecoilBurstResetSeconds,
+			Table.bRecoilPlayerCompensationCancels ? 1 : 0);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] SPECv5 move: AirStrafe falloff=%d soft=%.0f exp=%.2f hardCap=%d hard=%.0f (modelMax=%.0f) | "
+			     "Slide(ability) dur=%.2f hiddenCooldown=%.2f | SlideJump window=%.2f speed=%.2f height=%.2f | "
+			     "Mantle on=%d reach=%.0f minH=%.0f maxH=%.0f dur=%.2f upPhase=%.2f cooldown=%.2f minFwd=%.0f ledgeGrace=%.3f"),
+			Tag, Table.bAirStrafeGainFalloff ? 1 : 0, Table.AirStrafeSoftCapSpeed,
+			Table.AirStrafeFalloffExponent, Table.bAirStrafeHardCap ? 1 : 0,
+			Table.AirStrafeHardCapSpeed, Table.MaxAirSpeed,
+			Table.SlideDuration, Table.SlideCooldownSeconds,
+			Table.SlideJumpWindowSeconds, Table.SlideJumpWindowSpeedBonus, Table.SlideJumpWindowZBonus,
+			Table.bMantleEnabled ? 1 : 0, Table.MantleReachUU, Table.MantleMinHeightUU,
+			Table.MantleMaxHeightUU, Table.MantleDurationSeconds, Table.MantleUpPhaseFraction,
+			Table.MantleCooldownSeconds, Table.MantleMinForwardSpeed, Table.LedgeGroundGraceSeconds);
+
+		// Mode B geometry and weight. The BASE throw values are printed next to the mass scale that
+		// multiplies them, because the number a designer types is not the number the Core flies at —
+		// ATraceCore derives gravity x M, speed / sqrt(M), bias x M^1.5, bounce / M from these.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] SPECv5 modeB: goalWidthFrac=%.4f (=%.0fuu on a 9600uu field) goalHeight=%.0f | "
+			     "weight M=%.2f applied to base throw=%.0f grav=%.2f bias=%.2f -> effective throw=%.0f grav=%.2f"),
+			Tag, Table.GoalWidthFieldFraction, Table.GoalWidthFieldFraction * 9600.f, Table.GoalHeightUU,
+			Table.CoreMassScale, Table.CoreThrowSpeed, Table.CoreThrowGravityScale, Table.CoreThrowUpBias,
+			Table.CoreThrowSpeed / FMath::Sqrt(FMath::Max(0.01f, Table.CoreMassScale)),
+			Table.CoreThrowGravityScale * Table.CoreMassScale);
 
 		// Spec v4 §4. The impact sphere is deleted from ATraceTracer, so there is nothing to report
 		// for it — the radii are the whole of what is left to get wrong.
@@ -691,6 +733,173 @@ namespace
 
 		DumpTraceSettings(TEXT("after-live-edit"));
 	}
+
+	// =============================================================================================
+	// Trace.VerifyKnobs — "does this slider exist, and is it the type its reader expects".
+	//
+	// WHY THIS COMMAND EXISTS AT ALL. Several systems bind to this page BY NAME at runtime through
+	// FindFProperty (ATraceCore's whole mode-B block does, and the live-edit path does), and a
+	// misspelled or retyped property is NOT a build error. It is a slider on the settings panel that
+	// silently moves nothing. Five of the eight mode-B knobs shipped dead exactly that way, and one
+	// of them (CoreThrowUpBias, briefly declared as CoreThrowUpwardBias) was dead for a whole pass.
+	//
+	// So the build states its own answer. The table below is every knob this pass introduced or
+	// moved, plus the by-name mode-B set, each with the FProperty type its reader will cast to. If a
+	// name here is wrong the command says so by name; if a reader's name is wrong, the reader's own
+	// binding log (ATraceCore's LogKnobBindings) says so. Between them there is nowhere for a dead
+	// knob to hide.
+	// =============================================================================================
+
+	enum class EKnobType : uint8 { Float, Bool, Int };
+
+	struct FKnobSpec
+	{
+		const TCHAR* Name;
+		EKnobType Type;
+		const TCHAR* Note;
+	};
+
+	void VerifyTraceKnobs()
+	{
+		static const FKnobSpec Knobs[] =
+		{
+			// --- spec v5 §5, fire rate ---------------------------------------------------------
+			{ TEXT("FireInterval"),                    EKnobType::Float, TEXT("150 RPM = 0.40s") },
+
+			// --- spec v5 §6, upwards recoil ----------------------------------------------------
+			{ TEXT("bRecoilEnabled"),                  EKnobType::Bool,  TEXT("recoil master switch") },
+			{ TEXT("RecoilPitchPerShot"),              EKnobType::Float, TEXT("per-shot kick") },
+			{ TEXT("RecoilPitchGrowthPerShot"),        EKnobType::Float, TEXT("sustained-fire growth") },
+			{ TEXT("RecoilMaxPitchDegrees"),           EKnobType::Float, TEXT("climb ceiling") },
+			{ TEXT("RecoilRecoveryDelaySeconds"),      EKnobType::Float, TEXT("recovery delay") },
+			{ TEXT("RecoilRecoverySpeed"),             EKnobType::Float, TEXT("recovery rate") },
+			{ TEXT("RecoilRecoveryMinRateDegrees"),    EKnobType::Float, TEXT("recovery floor") },
+			{ TEXT("RecoilBurstResetSeconds"),         EKnobType::Float, TEXT("burst reset gap") },
+			{ TEXT("bRecoilPlayerCompensationCancels"),EKnobType::Bool,  TEXT("compensation cancels recovery") },
+
+			// --- spec v5 §1, air-strafe cap and falloff  [ALL FOUR BOUND BY NAME by the CMC] ----
+			{ TEXT("bAirStrafeGainFalloff"),           EKnobType::Bool,  TEXT("diminishing returns on/off [by-name bind]") },
+			{ TEXT("AirStrafeSoftCapSpeed"),           EKnobType::Float, TEXT("where falloff begins [by-name bind]") },
+			{ TEXT("AirStrafeFalloffExponent"),        EKnobType::Float, TEXT("falloff shape [by-name bind]") },
+			{ TEXT("bAirStrafeHardCap"),               EKnobType::Bool,  TEXT("hard cap on/off [by-name bind]") },
+			{ TEXT("AirStrafeHardCapSpeed"),           EKnobType::Float, TEXT("the hard cap [by-name bind]") },
+			{ TEXT("MaxAirSpeed"),                     EKnobType::Float, TEXT("model ceiling, NOT the v5 cap") },
+
+			// --- spec v5 §3, slide as an ability -----------------------------------------------
+			{ TEXT("SlideDuration"),                   EKnobType::Float, TEXT("ability duration") },
+			{ TEXT("SlideCooldownSeconds"),            EKnobType::Float, TEXT("HIDDEN cooldown - do not draw it") },
+			{ TEXT("SlideJumpWindowSeconds"),          EKnobType::Float, TEXT("well-timed window") },
+			{ TEXT("SlideJumpWindowSpeedBonus"),       EKnobType::Float, TEXT("well-timed speed multiplier") },
+			{ TEXT("SlideJumpWindowZBonus"),           EKnobType::Float, TEXT("well-timed height multiplier [by-name bind]") },
+
+			// --- spec v5 §7, mantle  [ALL BOUND BY NAME by the CMC] -----------------------------
+			{ TEXT("bMantleEnabled"),                  EKnobType::Bool,  TEXT("mantle master switch [by-name bind]") },
+			{ TEXT("MantleReachUU"),                   EKnobType::Float, TEXT("forward probe [by-name bind]") },
+			{ TEXT("MantleMinHeightUU"),               EKnobType::Float, TEXT("below this the step-up handles it [by-name bind]") },
+			{ TEXT("MantleMaxHeightUU"),               EKnobType::Float, TEXT("tallest climbable ledge [by-name bind]") },
+			{ TEXT("MantleDurationSeconds"),           EKnobType::Float, TEXT("climb duration [by-name bind]") },
+			{ TEXT("MantleUpPhaseFraction"),           EKnobType::Float, TEXT("rise before the step [by-name bind]") },
+			{ TEXT("MantleCooldownSeconds"),           EKnobType::Float, TEXT("gap between mantles [by-name bind]") },
+			{ TEXT("MantleMinForwardSpeed"),           EKnobType::Float, TEXT("a move, not a proximity effect [by-name bind]") },
+			{ TEXT("LedgeGroundGraceSeconds"),         EKnobType::Float, TEXT("the ledge desync half of §7 [by-name bind]") },
+
+			// --- spec v5 §4, mode B geometry and weight ----------------------------------------
+			{ TEXT("GoalWidthFieldFraction"),          EKnobType::Float, TEXT("2000uu goal mouth") },
+			{ TEXT("GoalHeightUU"),                    EKnobType::Float, TEXT("440uu goal height") },
+			{ TEXT("CoreMassScale"),                   EKnobType::Float, TEXT("THE weight knob [by-name bind]") },
+			{ TEXT("CoreThrowSpeed"),                  EKnobType::Float, TEXT("base, before weight [by-name bind]") },
+			{ TEXT("CoreThrowGravityScale"),           EKnobType::Float, TEXT("base, before weight [by-name bind]") },
+
+			// --- the rest of the mode-B set, all bound BY NAME by ATraceCore --------------------
+			{ TEXT("CoreThrowUpBias"),                 EKnobType::Float, TEXT("[by-name bind]") },
+			{ TEXT("CorePickupRadius"),                EKnobType::Float, TEXT("[by-name bind]") },
+			{ TEXT("CoreThrowerPickupLockoutSeconds"), EKnobType::Float, TEXT("[by-name bind]") },
+			{ TEXT("CoreLooseResetSeconds"),           EKnobType::Float, TEXT("[by-name bind]") },
+			{ TEXT("CoreThrowCooldownSeconds"),        EKnobType::Float, TEXT("[by-name bind]") },
+			{ TEXT("CoreThrowBounce"),                 EKnobType::Float, TEXT("[by-name bind]") },
+		};
+
+		const UTraceSettings& Table = UTraceSettings::Get();
+		int32 BoundCount = 0;
+		int32 DeadCount = 0;
+
+		for (const FKnobSpec& Knob : Knobs)
+		{
+			const FName KnobName(Knob.Name);
+			const FProperty* Found = UTraceSettings::StaticClass()->FindPropertyByName(KnobName);
+
+			FString Value = TEXT("<unbound>");
+			bool bTypeOk = false;
+
+			if (Found != nullptr)
+			{
+				switch (Knob.Type)
+				{
+				case EKnobType::Float:
+					if (const FFloatProperty* AsFloat = CastField<FFloatProperty>(Found))
+					{
+						bTypeOk = true;
+						Value = FString::Printf(TEXT("%.4f"), AsFloat->GetPropertyValue_InContainer(&Table));
+					}
+					break;
+				case EKnobType::Bool:
+					if (const FBoolProperty* AsBool = CastField<FBoolProperty>(Found))
+					{
+						bTypeOk = true;
+						Value = AsBool->GetPropertyValue_InContainer(&Table) ? TEXT("true") : TEXT("false");
+					}
+					break;
+				case EKnobType::Int:
+					if (const FIntProperty* AsInt = CastField<FIntProperty>(Found))
+					{
+						bTypeOk = true;
+						Value = FString::Printf(TEXT("%d"), AsInt->GetPropertyValue_InContainer(&Table));
+					}
+					break;
+				}
+			}
+
+			// A property that exists but is `config`-less would round-trip from the header and ignore
+			// DefaultGame.ini, which is the same silent failure wearing a different hat.
+			const bool bConfig = (Found != nullptr) && Found->HasAnyPropertyFlags(CPF_Config);
+			const bool bEditable = (Found != nullptr) && Found->HasAnyPropertyFlags(CPF_Edit);
+
+			if (bTypeOk && bConfig && bEditable)
+			{
+				++BoundCount;
+				UE_LOG(LogTraceGame, Display, TEXT("[VerifyKnobs]   OK   %-34s = %-10s  (%s)"),
+					Knob.Name, *Value, Knob.Note);
+			}
+			else
+			{
+				++DeadCount;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[VerifyKnobs]   DEAD %-34s  exists=%d rightType=%d config=%d editable=%d  (%s)"),
+					Knob.Name, (Found != nullptr) ? 1 : 0, bTypeOk ? 1 : 0, bConfig ? 1 : 0,
+					bEditable ? 1 : 0, Knob.Note);
+			}
+		}
+
+		const int32 TotalCount = static_cast<int32>(UE_ARRAY_COUNT(Knobs));
+		if (DeadCount == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[VerifyKnobs] %d of %d knobs bound: every one exists, has the type its reader casts to, "
+				     "is `config` (so DefaultGame.ini reaches it) and is EditAnywhere (so the panel does)."),
+				BoundCount, TotalCount);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[VerifyKnobs] %d of %d knobs bound, %d DEAD. A dead knob is a slider that moves nothing — fix the name before shipping."),
+				BoundCount, TotalCount, DeadCount);
+		}
+	}
+
+	FAutoConsoleCommand CmdVerifyTraceKnobs(
+		TEXT("Trace.VerifyKnobs"),
+		TEXT("Dev only. Check that every tunable this pass added exists on UTraceSettings with the right type, is config-backed and is panel-editable."),
+		FConsoleCommandDelegate::CreateStatic(&VerifyTraceKnobs));
 
 	FAutoConsoleCommand CmdDumpTraceSettings(
 		TEXT("Trace.DumpSettings"),

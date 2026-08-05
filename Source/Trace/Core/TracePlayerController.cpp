@@ -10,10 +10,13 @@
 #include "Engine/Engine.h"                 // GEngine->GameViewport, for the capture-mode diagnostic
 #include "Engine/GameViewportClient.h"
 #include "Engine/LocalPlayer.h"
+#include "Engine/NetDriver.h"           // UNetDriver::ClientConnections, for the solo-pause test
 #include "Engine/World.h"
 #include "GameFramework/Character.h"       // ACharacter::Jump / StopJumping on ATraceCharacter
 #include "GameFramework/GameModeBase.h"
+#include "GameFramework/GameStateBase.h"   // PlayerArray, for the TraceNetInfo roster dump
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerState.h"     // APlayerState::IsABot / GetPlayerName
 #include "GameFramework/PlayerInput.h"    // APlayerController::PlayerInput, for the setup diagnostic
 #include "HAL/IConsoleManager.h"           // Trace.LogInput
 #include "InputAction.h"
@@ -26,6 +29,7 @@
 #include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
 #include "Trace.h"                         // LogTraceGame
 #include "TraceSettings.h"                 // gameplay tuning (dash cooldown, and so on)
+#include "UI/TraceNetworking.h"            // TraceNet — failure handlers and the address helpers
 
 /**
  * Per-event Display logging for the input path. Off by default — on at 60 Hz the Move handler alone
@@ -111,7 +115,18 @@ void ATracePlayerController::BeginPlay()
 		// every controller that ever subscribes to it.
 		SettingsChangedHandle = UTraceUserSettings::OnChanged().AddWeakLambda(this,
 			[this]() { ApplyControlSettings(); });
+
+		// A failure that arrives while a match is running must still be reported, and a client can
+		// reach this map without ever having seen the title screen (Scripts/run-client.sh, or `open
+		// <ip>` from the console). Idempotent.
+		TraceNet::BindFailureHandlers();
 	}
+
+	// Every controller, not just the local one, and at Display: on a listen server this is the line
+	// that proves a remote player's controller actually reached the server. During the Demo 5
+	// playtest nobody could establish even that much, which is why the multiplayer question was
+	// unanswerable rather than merely unanswered.
+	LogNetworkRole(TEXT("PlayerController BeginPlay"));
 }
 
 void ATracePlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -506,6 +521,66 @@ void ATracePlayerController::AcknowledgePossession(APawn* P)
 }
 
 // -------------------------------------------------------------------------------------------
+// Networking
+//
+// Two small things, and both exist because the Demo 5 multiplayer report contained no evidence at
+// all — not a failure message, not a role, not an address. Neither of these changes behaviour; they
+// change what a log and a console can tell you.
+// -------------------------------------------------------------------------------------------
+
+void ATracePlayerController::LogNetworkRole(const TCHAR* Context) const
+{
+	const UWorld* ControllerWorld = GetWorld();
+	const ENetMode NetMode = (ControllerWorld != nullptr) ? ControllerWorld->GetNetMode() : NM_Standalone;
+
+	const TCHAR* NetModeName =
+		(NetMode == NM_Standalone)      ? TEXT("Standalone")    :
+		(NetMode == NM_ListenServer)    ? TEXT("ListenServer")  :
+		(NetMode == NM_DedicatedServer) ? TEXT("DedicatedServer") : TEXT("Client");
+
+	// "local" distinguishes the host's own controller from the proxies the server holds for remote
+	// players — the single most useful bit when reading a listen server's log, because a match with
+	// two humans in it has three controllers on the server and only one of them is local.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Net] %s: netMode=%s local=%d authority=%d name='%s' playerState=%s"),
+		Context, NetModeName, IsLocalController() ? 1 : 0, HasAuthority() ? 1 : 0,
+		*GetName(),
+		PlayerState != nullptr ? *PlayerState->GetPlayerName() : TEXT("<none>"));
+}
+
+void ATracePlayerController::TraceNetInfo()
+{
+	TraceNet::LogNetworkDiagnostics(GetWorld(), TEXT("TraceNetInfo"));
+	LogNetworkRole(TEXT("TraceNetInfo"));
+
+	// Every player state on this machine, which on a server is the direct answer to "are we actually
+	// in the same match?" — the acceptance test for spec v5 §0 is exactly this list containing two
+	// non-bot entries.
+	if (const UWorld* ControllerWorld = GetWorld())
+	{
+		if (const AGameStateBase* GameStateBase = ControllerWorld->GetGameState())
+		{
+			int32 Humans = 0;
+			for (const APlayerState* Player : GameStateBase->PlayerArray)
+			{
+				if (Player == nullptr)
+				{
+					continue;
+				}
+				if (!Player->IsABot())
+				{
+					++Humans;
+				}
+				UE_LOG(LogTraceGame, Display, TEXT("[Net]   playerState '%s' bot=%d"),
+					*Player->GetPlayerName(), Player->IsABot() ? 1 : 0);
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[Net] %d player state(s), %d human(s)."),
+				GameStateBase->PlayerArray.Num(), Humans);
+		}
+	}
+}
+
+// -------------------------------------------------------------------------------------------
 // Accessors
 // -------------------------------------------------------------------------------------------
 
@@ -528,6 +603,50 @@ ATraceCharacter* ATracePlayerController::GetLivingCharacter() const
 // -------------------------------------------------------------------------------------------
 // Menu suppression
 // -------------------------------------------------------------------------------------------
+
+namespace
+{
+	/**
+	 * True when pausing this world would stop the game for nobody but the person who asked.
+	 *
+	 * REGRESSION THIS FIXES, and it is a pure consequence of spec v5 §0. The two tests below used to
+	 * be a single `GetNetMode() == NM_Standalone`, written when PLAY produced a standalone session,
+	 * with the comment "Solo-with-bots — which is every session today — gets a real pause". Adding
+	 * `?listen` to the PLAY URL made every session a LISTEN SERVER instead, including a solo one, so
+	 * that test stopped being true on the very first frame of the fix and the settings screen quietly
+	 * stopped pausing anything for everybody.
+	 *
+	 * The rule the old code meant is not "standalone", it is "no other human is depending on this
+	 * world advancing". A listen server with zero client connections satisfies that exactly, and is
+	 * now the normal solo case. The moment one person joins, pausing is refused again - the original
+	 * reasoning ("pausing a listen server would stop the world for everybody else because one player
+	 * opened their settings") is untouched.
+	 */
+	bool CanPauseWithoutAffectingAnybodyElse(const UWorld* PauseWorld)
+	{
+		if (PauseWorld == nullptr)
+		{
+			return false;
+		}
+
+		const ENetMode Mode = PauseWorld->GetNetMode();
+		if (Mode == NM_Standalone)
+		{
+			return true;
+		}
+		if (Mode != NM_ListenServer)
+		{
+			// A pure client cannot pause anything: SetPause routes through the game mode, which is
+			// server-only. Unchanged behaviour, just stated.
+			return false;
+		}
+
+		// ClientConnections holds the REMOTE players only - the listen host itself is not in it - so
+		// an empty list is precisely "I am hosting and nobody has turned up".
+		const UNetDriver* Driver = PauseWorld->GetNetDriver();
+		return Driver == nullptr || Driver->ClientConnections.Num() == 0;
+	}
+}
 
 void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 {
@@ -560,17 +679,21 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 		}
 		bScoreboardOpen = false;
 
-		// Standalone only. SetPause routes through the game mode and is meaningless on a client, and
-		// pausing a listen server would stop the world for everybody else because one player opened
-		// their settings. Solo-with-bots — which is every session today — gets a real pause.
-		if (GetNetMode() == NM_Standalone)
+		// SetPause routes through the game mode and is meaningless on a client, and pausing a
+		// populated listen server would stop the world for everybody else because one player opened
+		// their settings. Solo-with-bots still gets a real pause — see the helper above for why this
+		// can no longer be a plain NM_Standalone test.
+		if (CanPauseWithoutAffectingAnybodyElse(GetWorld()))
 		{
 			SetPause(true);
 		}
 	}
 	else
 	{
-		if (GetNetMode() == NM_Standalone)
+		// NOT symmetric with the pause test on purpose: if somebody joined while the settings screen
+		// was open, this must still UNpause. SetPause(false) on an unpaused world is a no-op, so the
+		// unconditional-on-the-server form is the safe one.
+		if (HasAuthority())
 		{
 			SetPause(false);
 		}
@@ -582,8 +705,14 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 		ApplyGameInputMode();
 	}
 
-	UE_LOG(LogTraceGame, Display, TEXT("[%s] Gameplay input %s."),
-		*GetName(), bSuppressed ? TEXT("suppressed (menu open)") : TEXT("restored"));
+	// The world's pause state is printed alongside, because "does opening the settings screen still
+	// stop the game?" became a question the moment PLAY started opening a listen server, and the
+	// answer used to be silently no. See CanPauseWithoutAffectingAnybodyElse().
+	const UWorld* LogWorld = GetWorld();
+	UE_LOG(LogTraceGame, Display, TEXT("[%s] Gameplay input %s. netMode=%d paused=%d"),
+		*GetName(), bSuppressed ? TEXT("suppressed (menu open)") : TEXT("restored"),
+		LogWorld != nullptr ? static_cast<int32>(LogWorld->GetNetMode()) : -1,
+		(LogWorld != nullptr && LogWorld->IsPaused()) ? 1 : 0);
 }
 
 // -------------------------------------------------------------------------------------------

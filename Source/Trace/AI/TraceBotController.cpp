@@ -107,8 +107,48 @@ namespace TraceBotConstants
 	 */
 	static constexpr float GoalDefenceStandoffFraction = 0.22f;
 
-	/** Inside this angle of the goal centre, a carrying bot will take the shot rather than pass. */
-	static constexpr float ThrowAtGoalConeDegrees = 35.f;
+	/**
+	 * Inside this angle of the goal centre, a carrying bot will consider the shot at all.
+	 *
+	 * WIDENED from 35 degrees, and measured against the CONTROL rotation rather than the pawn's
+	 * forward vector, which is what the old test used. Those two are different things while carrying:
+	 * mouse1 is the throw, the bot is not aiming at anybody, and its capsule yaw follows where it is
+	 * running - i.e. a weaving carrier's actor-forward swings ±25 degrees off the goal line by
+	 * design (see the weave in BehaviourCarryToGoal). The control rotation is the thing that has to
+	 * slew onto the target, it slews at AimTurnRateDegrees, and BotPassMaxLineUpSeconds gives it over
+	 * a second to do it - so 75 degrees is comfortably inside what the line-up can actually deliver.
+	 */
+	static constexpr float ThrowAtGoalConeDegrees = 75.f;
+
+	// --- MODE B, spec v5 §4: the ballistic shot and the carry-in ------------------------------------
+
+	/**
+	 * Safety margin on the Core's maximum ballistic range. A bot will not attempt a shot beyond this
+	 * fraction of what the throw can physically carry.
+	 *
+	 * Not 1.0 because the launch pitch at maximum range is the single pitch that just barely reaches,
+	 * and the bots throw through an aim slew with error on top; a throw solved at 99% of maximum
+	 * range lands short of the mouth on any error at all. At 0.85 there is a real margin either side.
+	 */
+	static constexpr float ThrowRangeSafetyFraction = 0.85f;
+
+	/** Samples along the arc for the lane sweep. Ten segments resolves this arena's cover comfortably. */
+	static constexpr int32 ThrowLaneSamples = 10;
+
+	/**
+	 * How far from the goal MOUTH a carrier commits to running it in rather than throwing it.
+	 *
+	 * Deliberately shorter than the shot range: inside this the bot is close enough that the run is
+	 * the higher-percentage play, and the throw machine is switched off so it cannot change its mind
+	 * (see ATraceBotController::bCommitCarryIn for the failure that motivates the latch).
+	 */
+	static constexpr float CarryInCommitDistance = 4200.f;
+
+	/** Hysteresis: the commit is only released once the bot is this much further out again. */
+	static constexpr float CarryInReleaseDistance = 5400.f;
+
+	/** A carry-in that has not scored in this long is being held out of the mouth. Go back to throwing. */
+	static constexpr float CarryInPatienceSeconds = 9.f;
 
 	/**
 	 * Perpendicular distance under which "which side of the trace am I on" stops being answerable.
@@ -458,6 +498,35 @@ namespace TraceBotTelemetry
 		int32 ThrowGiveUps      = 0;   // lined up on a throw and abandoned it
 		int32 LooseChaseTicks   = 0;   // bot-ticks spent running at a loose Core
 		int32 GoalDefenceTicks  = 0;   // bot-ticks spent holding a station in front of our own goal
+
+		// --- MODE B, spec v5 §4. Why a shot at goal did or did not happen.
+		//
+		// at-goal=0 across 70 s of measured play was the headline failure, and the old counters could
+		// not say which of the three gates refused it. These can: the shot is offered only when the
+		// goal is inside the Core's REAL ballistic range and the arc is clear, and it is then weighed
+		// against the pass rather than short-circuiting it.
+		int32 ShotEvals         = 0;   // carrier evaluation ticks that considered a shot at goal
+		int32 ShotOutOfRange    = 0;   // ...refused: the goal is further than a throw can carry
+		int32 ShotNoSolution    = 0;   // ...refused: in range on paper, no launch pitch solves it
+		int32 ShotBlocked       = 0;   // ...refused: the arc hits arena geometry
+		int32 ShotLostToPass    = 0;   // ...available, but a pass to a teammate scored higher
+		int32 CarryInCommits    = 0;   // times a carrier committed to running it in instead
+		int32 CarryInTicks      = 0;   // bot-ticks spent driving at the mouth under that commit
+		int32 CarryInAbandoned  = 0;   // commits that ran out of patience against a packed mouth
+
+		/**
+		 * Closest a carrier has come to the goal mouth, uu, over the whole run.
+		 *
+		 * THE NUMBER THAT DECIDES WHETHER ANY OF THE ABOVE CAN EVER FIRE. "out-of-range=140 of 140"
+		 * says a shot was refused; it does not say whether it was refused by 200 uu or by 10000, and
+		 * those call for opposite fixes - one is a throw that needs more reach, the other is a team
+		 * that never gets up the pitch at all. On a 33600 uu field that distinction is the whole
+		 * diagnosis.
+		 */
+		float CarrierClosestToGoal = -1.f;
+
+		/** Teammate throws refused for being beyond what the Core can physically carry. */
+		int32 PassOutOfThrowRange = 0;
 	};
 
 	struct FState
@@ -861,7 +930,7 @@ namespace TraceBotTelemetry
 		// Mode B, on its own line and only when it has anything to say. In mode A every one of these
 		// is zero and the line is suppressed, so its mere presence in a log is the evidence that the
 		// mode-B bot code ran — and its absence is the evidence that mode A did not touch it.
-		if (K.ThrowAttempts + K.LooseChaseTicks + K.GoalDefenceTicks > 0)
+		if (K.ThrowAttempts + K.LooseChaseTicks + K.GoalDefenceTicks + K.ShotEvals > 0)
 		{
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[BotKitB] t=%.0fs | throw: attempt=%d at-goal=%d to-mate=%d giveup=%d ")
@@ -869,6 +938,18 @@ namespace TraceBotTelemetry
 				Elapsed,
 				K.ThrowAttempts, K.ThrowsAtGoal, K.ThrowsToTeammate, K.ThrowGiveUps,
 				K.LooseChaseTicks, K.GoalDefenceTicks);
+
+			// Spec v5 §4. The line that says WHY a shot at goal did or did not happen, because
+			// "at-goal=0" on its own is a symptom with four possible causes and no way to tell them
+			// apart from outside.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BotKitB] t=%.0fs | shot: evals=%d out-of-range=%d no-solution=%d blocked=%d lost-to-pass=%d ")
+				TEXT("| carry-in: commits=%d ticks=%d abandoned=%d | closest a carrier got to the mouth: %.0f uu ")
+				TEXT("| mate-throws refused as unreachable: %d"),
+				Elapsed,
+				K.ShotEvals, K.ShotOutOfRange, K.ShotNoSolution, K.ShotBlocked, K.ShotLostToPass,
+				K.CarryInCommits, K.CarryInTicks, K.CarryInAbandoned,
+				K.CarrierClosestToGoal, K.PassOutOfThrowRange);
 		}
 
 		S.Window = FWindow();
@@ -993,6 +1074,7 @@ void ATraceBotController::OnPossess(APawn* InPawn)
 	PassPhase = ETraceBotPassPhase::None;
 	PassReceiver = nullptr;
 	bPassInputHeld = false;
+	bCommitCarryIn = false;
 	bPassOwnsAim = false;
 	PassCooldownUntilTime = 0.f;
 	NextPassEvalTime = 0.f;
@@ -1182,6 +1264,7 @@ void ATraceBotController::Tick(float DeltaSeconds)
 		bCrouchHeld = false;
 		PassPhase = ETraceBotPassPhase::None;
 		PassReceiver = nullptr;
+		bCommitCarryIn = false;
 		State = ETraceBotState::Idle;
 		return;
 	}
@@ -1248,6 +1331,8 @@ void ATraceBotController::Tick(float DeltaSeconds)
 		// (What became of a loose Core is deliberately NOT counted here. Ten bots would each count
 		// the same pickup, and the Core already logs every one of them exactly once, with the team
 		// and the grace decision attached: see the [ModeB] INTERCEPTION / RECOVERY lines.)
+		bCommitCarryIn = false;
+
 		if (PassPhase == ETraceBotPassPhase::Lining)
 		{
 			TRACE_BOT_KIT(ThrowGiveUps);
@@ -1888,15 +1973,36 @@ void ATraceBotController::BehaviourCarryToGoal(float DeltaSeconds)
 	}
 
 	const FVector MyLocation = BotCharacter->GetActorLocation();
-	const FVector Goal = GetAttackGoalLocation();
+
+	// SPEC v5 §4. Once committed to carrying it in, run at the CENTRE of the mouth rather than at
+	// this bot's own attack lane, and stop weaving.
+	//
+	// Both of those are corrections to behaviour that is right in mode A and wrong at a 2000 uu goal.
+	// GetAttackGoalLocation() spreads bots across ±BotAttackLaneFieldFraction of the field half-width
+	// so they do not funnel down the middle of a FULL-WIDTH endzone, and the weave adds ±0.45 of
+	// lateral steering on top so the trace a carrier lays is not a straight line. Against a mouth
+	// only ±1000 uu wide, both of those aim the carrier at the goal POST.
+	const bool bDriveAtMouth = bCommitCarryIn;
+	FVector Goal = GetAttackGoalLocation();
+
+	if (bDriveAtMouth)
+	{
+		FVector GoalCentre = FVector::ZeroVector;
+		if (ATraceCore::GetAttackGoalCentre(GetWorld(), MyTeam, GoalCentre))
+		{
+			Goal = GoalCentre;
+		}
+		TRACE_BOT_KIT(CarryInTicks);
+	}
 
 	FVector ToGoal = Goal - MyLocation;
 	ToGoal.Z = 0.f;
 	DesiredMoveDirection = ToGoal.GetSafeNormal();
 
 	// Weave: a carrier running dead straight is trivially intercepted, and the trace it lays is a
-	// straight line that a defender only has to touch once.
-	if (!DesiredMoveDirection.IsNearlyZero())
+	// straight line that a defender only has to touch once. Suppressed on the final approach - see
+	// above; a weave that costs 400 uu of lateral drift is the difference between the net and a post.
+	if (!bDriveAtMouth && !DesiredMoveDirection.IsNearlyZero())
 	{
 		const FVector Right = FVector::CrossProduct(FVector::UpVector, DesiredMoveDirection);
 		const float Weave = FMath::Sin(static_cast<float>(GetWorld()->GetTimeSeconds()) * 1.4f + FormationBias * 3.f) * 0.45f;
@@ -1936,9 +2042,14 @@ void ATraceBotController::BehaviourCarryToGoal(float DeltaSeconds)
 		const float GoalDistance = static_cast<float>(FVector::Dist2D(MyLocation, Goal));
 		const float SprintBand = HalfFieldLength() * 0.55f;
 
-		if (GoalDistance < SprintBand && FMath::FRand() < Aggression * DeltaSeconds * 1.5f)
+		// On a committed carry-in the run at the mouth IS the play, so it is worth spending charges
+		// on much more freely - and worth spending the last one, because a carrier that reaches the
+		// mouth and scores does not need an escape charge afterwards.
+		const float DashUrgency = bDriveAtMouth ? 5.f : 1.5f;
+
+		if (GoalDistance < SprintBand && FMath::FRand() < Aggression * DeltaSeconds * DashUrgency)
 		{
-			if (RequestDash(/*bReserveLast=*/true))
+			if (RequestDash(/*bReserveLast=*/!bDriveAtMouth))
 			{
 				TRACE_BOT_KIT(EscapeDashes);
 			}
@@ -2739,6 +2850,282 @@ void ATraceBotController::UpdatePass(float DeltaSeconds)
 // otherwise, and clear it forward rather than die with it when the position is collapsing.
 // =================================================================================================
 
+namespace TraceThrowBallistics
+{
+	/**
+	 * The Core's launch, expressed once.
+	 *
+	 * ATraceCore builds its launch velocity as `AimDirection * Speed + Up * (Speed * UpBias)`, so the
+	 * up-bias term is added in WORLD space and does not rotate with the aim. That single detail is
+	 * what stops this being the textbook ballistic solve: the launch speed is not constant with pitch
+	 * (it is Speed * sqrt(1 + bias^2 + 2*bias*sin(pitch))), so the closed form is a quartic and is not
+	 * worth writing. Bisection on a monotone residual is.
+	 */
+	struct FModel
+	{
+		float Speed = 2236.f;      // uu/s along the aim direction
+		float UpBias = 0.29f;      // extra world-up, as a fraction of Speed
+		float GravityZ = -970.f;   // signed, uu/s^2
+	};
+
+	/**
+	 * Height, relative to the launch point, at which a throw at pitch @p SinPitch/@p CosPitch crosses
+	 * horizontal distance @p Range. Returns false when it never gets there at all.
+	 */
+	static bool HeightAtRange(const FModel& Model, float SinPitch, float CosPitch, float Range, float& OutHeight,
+		float* OutFlightSeconds = nullptr)
+	{
+		const float Vx = Model.Speed * CosPitch;
+		if (Vx <= 1.f || Range <= 0.f)
+		{
+			return false;
+		}
+
+		const float Vz = Model.Speed * SinPitch + Model.Speed * Model.UpBias;
+		const float T = Range / Vx;
+
+		OutHeight = Vz * T + 0.5f * Model.GravityZ * T * T;
+		if (OutFlightSeconds != nullptr)
+		{
+			*OutFlightSeconds = T;
+		}
+		return true;
+	}
+
+	/** Pitch limits, in radians. Below -60 the Core is thrown at the floor; above 80 it is thrown at the sky. */
+	static constexpr float MinPitchRadians = -1.047f;   // -60 deg
+	static constexpr float MaxPitchRadians = 1.396f;    //  80 deg
+
+	/**
+	 * Lowest pitch whose arc passes through (@p Range, @p HeightDelta), or false if none does.
+	 *
+	 * The residual (height at range, minus the target height) is sampled across the pitch band and
+	 * the FIRST sign change from below is bisected. Sampling rather than starting from an analytic
+	 * guess because the residual has two roots — the low arc and the lob — and the low one is wanted.
+	 */
+	static bool SolvePitch(const FModel& Model, float Range, float HeightDelta, float& OutPitch,
+		float& OutFlightSeconds)
+	{
+		constexpr int32 SampleCount = 36;
+
+		float PreviousPitch = MinPitchRadians;
+		float PreviousResidual = 0.f;
+		bool bHavePrevious = false;
+
+		for (int32 Index = 0; Index <= SampleCount; ++Index)
+		{
+			const float Pitch = FMath::Lerp(MinPitchRadians, MaxPitchRadians,
+				static_cast<float>(Index) / static_cast<float>(SampleCount));
+
+			float Height = 0.f;
+			if (!HeightAtRange(Model, FMath::Sin(Pitch), FMath::Cos(Pitch), Range, Height))
+			{
+				continue;
+			}
+
+			const float Residual = Height - HeightDelta;
+
+			if (bHavePrevious && ((PreviousResidual <= 0.f && Residual >= 0.f) || (PreviousResidual >= 0.f && Residual <= 0.f)))
+			{
+				// Bisect. 20 halvings of a 140-degree band is well under a thousandth of a degree,
+				// which is far finer than the aim slew that has to deliver it.
+				float Low = PreviousPitch;
+				float High = Pitch;
+				float LowResidual = PreviousResidual;
+
+				for (int32 Step = 0; Step < 20; ++Step)
+				{
+					const float Mid = 0.5f * (Low + High);
+					float MidHeight = 0.f;
+					if (!HeightAtRange(Model, FMath::Sin(Mid), FMath::Cos(Mid), Range, MidHeight))
+					{
+						break;
+					}
+					const float MidResidual = MidHeight - HeightDelta;
+
+					if ((LowResidual <= 0.f) == (MidResidual <= 0.f))
+					{
+						Low = Mid;
+						LowResidual = MidResidual;
+					}
+					else
+					{
+						High = Mid;
+					}
+				}
+
+				OutPitch = 0.5f * (Low + High);
+
+				float Unused = 0.f;
+				HeightAtRange(Model, FMath::Sin(OutPitch), FMath::Cos(OutPitch), Range, Unused, &OutFlightSeconds);
+				return true;
+			}
+
+			PreviousPitch = Pitch;
+			PreviousResidual = Residual;
+			bHavePrevious = true;
+		}
+
+		return false;
+	}
+}
+
+/**
+ * The Core's live flight model, asked of the Core rather than reconstructed.
+ *
+ * The previous version of this read Trace.ModeB.ThrowSpeed / GravityScale / ThrowUpBias off the
+ * console directly, which silently ignored the UTraceSettings properties that OVERRIDE those console
+ * variables — so it was already reading numbers the Core was not using, and it would have missed the
+ * v5 weight model completely.
+ */
+static TraceThrowBallistics::FModel MakeThrowModel(const UWorld* World)
+{
+	TraceThrowBallistics::FModel Model;
+	Model.Speed = FMath::Max(100.f, ATraceCore::GetThrowSpeed());
+	Model.UpBias = ATraceCore::GetThrowUpBias();
+	Model.GravityZ = FMath::Min(-1.f, ATraceCore::GetThrowGravityZ(World));
+	return Model;
+}
+
+bool ATraceBotController::SolveThrowLaunch(const FVector& From, const FVector& WorldTarget,
+	FVector& OutLaunchDirection, float* OutFlightSeconds) const
+{
+	const FVector Delta = WorldTarget - From;
+	FVector Horizontal = FVector(Delta.X, Delta.Y, 0.0);
+	const float Range = static_cast<float>(Horizontal.Size());
+
+	if (Range < 1.f)
+	{
+		OutLaunchDirection = FVector::UpVector;
+		if (OutFlightSeconds != nullptr)
+		{
+			*OutFlightSeconds = 0.f;
+		}
+		return true;
+	}
+
+	Horizontal /= Range;
+
+	const TraceThrowBallistics::FModel Model = MakeThrowModel(GetWorld());
+
+	float Pitch = 0.f;
+	float Flight = 0.f;
+	if (!TraceThrowBallistics::SolvePitch(Model, Range, static_cast<float>(Delta.Z), Pitch, Flight))
+	{
+		return false;
+	}
+
+	OutLaunchDirection = (Horizontal * FMath::Cos(Pitch) + FVector::UpVector * FMath::Sin(Pitch)).GetSafeNormal();
+	if (OutFlightSeconds != nullptr)
+	{
+		*OutFlightSeconds = Flight;
+	}
+	return true;
+}
+
+float ATraceBotController::MaxThrowRange(const FVector& /*From*/, float HeightDelta) const
+{
+	const TraceThrowBallistics::FModel Model = MakeThrowModel(GetWorld());
+
+	// Walk the pitch band and keep the furthest range that still arrives at the wanted height. The
+	// bisection in SolvePitch answers "can I reach THIS range"; this answers "how far can I reach at
+	// all", and the two must agree, so both are computed from the same HeightAtRange.
+	float Best = 0.f;
+	constexpr int32 SampleCount = 36;
+
+	for (int32 Index = 0; Index <= SampleCount; ++Index)
+	{
+		const float Pitch = FMath::Lerp(TraceThrowBallistics::MinPitchRadians, TraceThrowBallistics::MaxPitchRadians,
+			static_cast<float>(Index) / static_cast<float>(SampleCount));
+
+		const float SinPitch = FMath::Sin(Pitch);
+		const float CosPitch = FMath::Cos(Pitch);
+		const float Vx = Model.Speed * CosPitch;
+		if (Vx <= 1.f)
+		{
+			continue;
+		}
+
+		// Time at which the arc passes DOWN through the target height: the positive root of
+		// 0.5*g*t^2 + Vz*t - HeightDelta = 0.
+		const float Vz = Model.Speed * SinPitch + Model.Speed * Model.UpBias;
+		const float A = 0.5f * Model.GravityZ;
+		const float Discriminant = Vz * Vz + 4.f * A * HeightDelta;
+		if (Discriminant < 0.f)
+		{
+			continue;   // Never gets that high at this pitch.
+		}
+
+		const float Root = FMath::Sqrt(Discriminant);
+		const float T = (-Vz - Root) / (2.f * A);   // A is negative, so this is the LATER root.
+		if (T <= 0.f)
+		{
+			continue;
+		}
+
+		Best = FMath::Max(Best, Vx * T);
+	}
+
+	return Best;
+}
+
+bool ATraceBotController::HasThrowLane(const FVector& From, const FVector& WorldTarget,
+	const FVector& LaunchDirection, float FlightSeconds) const
+{
+	const UWorld* World = GetWorld();
+	const ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (World == nullptr || BotCharacter == nullptr || FlightSeconds <= 0.f)
+	{
+		return true;   // Nothing to sweep. Refusing here would refuse every point-blank shot.
+	}
+
+	const TraceThrowBallistics::FModel Model = MakeThrowModel(World);
+	const FVector LaunchVelocity = LaunchDirection * Model.Speed + FVector::UpVector * (Model.Speed * Model.UpBias);
+
+	FCollisionQueryParams Params(TEXT("TraceBotThrowLane"), /*bTraceComplex=*/false, BotCharacter);
+
+	// The last 10% is deliberately not swept. The mouth of the goal has a crossbar, a sill and two
+	// posts around it, and a Core arriving at the back of the net legitimately ends inside geometry;
+	// sweeping into it would report every good shot as blocked.
+	const float SweepSeconds = FlightSeconds * 0.9f;
+
+	// FROM THE MUZZLE, NOT THE EYE. ATraceCore::ThrowFromHolder launches at
+	// GetPawnViewLocation() + direction * ThrowMuzzleForward, so starting the sweep at the eye tests
+	// 70 uu of trajectory the Core never occupies - which is inside the capsule, and against a bot
+	// pressed up against cover is enough to report a lane that is actually clear as blocked.
+	const FVector MuzzleOffset = LaunchDirection * ATraceCore::GetThrowMuzzleForward();
+
+	FVector Previous = From + MuzzleOffset;
+	for (int32 Index = 1; Index <= TraceBotConstants::ThrowLaneSamples; ++Index)
+	{
+		const float T = SweepSeconds * (static_cast<float>(Index) / static_cast<float>(TraceBotConstants::ThrowLaneSamples));
+		const FVector Point = From + MuzzleOffset + LaunchVelocity * T
+			+ FVector(0.f, 0.f, 0.5f * Model.GravityZ * T * T);
+
+		FHitResult Hit;
+		if (World->LineTraceSingleByChannel(Hit, Previous, Point, ECC_Visibility, Params))
+		{
+			// NAMED, at Display, and only while the metrics harness is on. "blocked=18 of 18" is a
+			// symptom that looks identical whether the arc is clipping a cover box, the goal frame or
+			// the floor under the bot's own feet, and those want completely different fixes.
+			const float NowSeconds = static_cast<float>(World->GetTimeSeconds());
+			if (TraceBotTelemetry::Enabled() && NowSeconds >= NextThrowLaneLogTime)
+			{
+				NextThrowLaneLogTime = NowSeconds + 5.f;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BotThrowLane] %s: arc blocked at sample %d/%d by %s (%s) at %s"),
+					*GetNameSafe(GetPlayerState<APlayerState>()), Index, TraceBotConstants::ThrowLaneSamples,
+					*GetNameSafe(Hit.GetActor()), *GetNameSafe(Hit.GetComponent()),
+					*Hit.ImpactPoint.ToCompactString());
+			}
+			return false;
+		}
+		Previous = Point;
+	}
+
+	return true;
+}
+
 FVector ATraceBotController::ComputeThrowAimPoint(const FVector& WorldTarget) const
 {
 	const ATraceCharacter* BotCharacter = GetBotCharacter();
@@ -2747,35 +3134,28 @@ FVector ATraceBotController::ComputeThrowAimPoint(const FVector& WorldTarget) co
 		return WorldTarget;
 	}
 
-	const UWorld* World = GetWorld();
 	const FVector From = BotCharacter->GetPawnViewLocation();
-	const float Distance = static_cast<float>(FVector::Dist(From, WorldTarget));
 
-	// The Core's OWN launch speed and gravity, read through the console variables that back them, so
-	// a designer who halves the throw speed does not silently leave every bot aiming as if it were
-	// still fast. Defaults here match the Core's defaults and are only used if the variables are gone.
-	const IConsoleVariable* SpeedVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ModeB.ThrowSpeed"));
-	const IConsoleVariable* GravityVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ModeB.GravityScale"));
-	const IConsoleVariable* UpBiasVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ModeB.ThrowUpBias"));
+	FVector LaunchDirection = FVector::ZeroVector;
+	if (SolveThrowLaunch(From, WorldTarget, LaunchDirection))
+	{
+		// A point along the solved launch ray. The caller turns this back into a rotation, so the
+		// distance is arbitrary as long as it is far enough not to lose precision.
+		return From + LaunchDirection * FMath::Max(1000.f, static_cast<float>(FVector::Dist(From, WorldTarget)));
+	}
 
-	const float Speed = FMath::Max(100.f, (SpeedVar != nullptr) ? SpeedVar->GetFloat() : 2600.f);
-	const float GravityScale = (GravityVar != nullptr) ? GravityVar->GetFloat() : 0.55f;
-	const float UpBias = (UpBiasVar != nullptr) ? UpBiasVar->GetFloat() : 0.18f;
+	// Out of range: aim at the ceiling of what the throw CAN do, in the target's direction, rather
+	// than flat at a target that cannot be reached. Callers gate on range before getting here, so
+	// this is the clearance throw and the "throw it forward at nothing" case.
+	FVector Horizontal = FVector(WorldTarget.X - From.X, WorldTarget.Y - From.Y, 0.0).GetSafeNormal();
+	if (Horizontal.IsNearlyZero())
+	{
+		Horizontal = BotCharacter->GetActorForwardVector().GetSafeNormal2D();
+	}
 
-	const float GravityZ = FMath::Abs((World != nullptr) ? World->GetGravityZ() : -980.f) * GravityScale;
-
-	// First-order lob: time of flight at launch speed, the drop over that time, minus whatever the
-	// Core's own built-in upward bias already contributes. Deliberately not a full ballistic solve —
-	// the bots aim through a slew with error on top, so a second decimal place of elevation would be
-	// noise, and the failure this fixes (every throw ploughing into the floor at range) is first
-	// order.
-	const float FlightTime = Distance / Speed;
-	const float Drop = 0.5f * GravityZ * FlightTime * FlightTime;
-	const float BiasLift = Speed * UpBias * FlightTime;
-
-	FVector AimPoint = WorldTarget;
-	AimPoint.Z += FMath::Max(0.f, Drop - BiasLift);
-	return AimPoint;
+	constexpr float ClearanceElevationDegrees = 25.f;
+	const float Pitch = FMath::DegreesToRadians(ClearanceElevationDegrees);
+	return From + (Horizontal * FMath::Cos(Pitch) + FVector::UpVector * FMath::Sin(Pitch)) * 3000.f;
 }
 
 void ATraceBotController::UpdateThrow(float DeltaSeconds)
@@ -2790,6 +3170,28 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 	const UTraceSettings& Settings = UTraceSettings::Get();
 	const FTraceBotProfile& Profile = UTraceSettings::GetBotProfile();
 	const float Now = static_cast<float>(World->GetTimeSeconds());
+
+	// --- Committed to running it in? Then there is nothing to decide. -----------------------------
+	//
+	// SPEC v5 §4, and the fix for "scoring by carrying into a goal never fired in ~7 minutes". The
+	// code path was always live; what never happened was a bot getting close to an open mouth and
+	// CHOOSING to keep hold of the Core. Inside the commit radius the throw machine is off. See
+	// UpdateCarryInCommit and ATraceBotController::bCommitCarryIn.
+	//
+	// AHEAD OF THE COOLDOWN, deliberately. The throw cooldown is 2.3 s and a carrier crosses 1800 uu
+	// in that time; evaluating the commit only when the throw machine happens to be idle would let a
+	// bot sprint through the whole commit band and out the other side without ever noticing it, and
+	// BehaviourCarryToGoal - which reads the latch every frame to decide whether to weave - would be
+	// steering off the mouth the entire way in.
+	UpdateCarryInCommit();
+	if (bCommitCarryIn)
+	{
+		if (PassPhase == ETraceBotPassPhase::Lining)
+		{
+			AbortThrow(TEXT("committed to carrying it in"));
+		}
+		return;
+	}
 
 	// --- Cooldown --------------------------------------------------------------------------------
 	if (PassPhase == ETraceBotPassPhase::Cooldown)
@@ -2818,41 +3220,113 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 		// --- 1. THE SHOT AT GOAL. --------------------------------------------------------------
 		//
 		// The reason mode B exists: "scoring should happen when the core is thrown into the goal".
-		// Taken when the goal is close enough to reach on a throw and roughly in front of the bot,
-		// because a throw across the bot's own shoulder is a throw its aim slew will spend a second
-		// lining up while a defender arrives.
-		bool bWantGoalShot = false;
+		//
+		// MEASURED FAILURE THIS REPLACES: at-goal = 0 shots across 70 s of play while 5 of 14 throws
+		// went to a teammate — every goal that landed came from the scripted verifier or a deflection.
+		// Three things were wrong and all three are fixed here.
+		//
+		//  (a) THE RANGE WAS NOT A RANGE. "HalfFieldLength() * 0.55" is 9240 uu on this pitch, and it
+		//      is a fact about the map rather than about the Core: the light Core carried ~5000 uu on
+		//      a flat throw, the heavy one carries ~3400. So the gate simultaneously let through
+		//      shots that could not physically arrive AND, because the carrier is usually much
+		//      further out than 9240 on a 33600 uu field, refused every shot that could. It is now
+		//      MaxThrowRange() — the Core's own ballistics, at the goal's own height.
+		//  (b) THE AIM WAS FLAT. The elevation was a first-order drop correction with no solution for
+		//      the loft that actually extends a throw. Aiming UP roughly doubles the reachable
+		//      distance, which is the difference between "the goal is never in range" and "the goal
+		//      is in range from a third of our own half". SolveThrowLaunch does the real solve.
+		//  (c) THERE WAS NO LANE TEST AT ALL, only a 35-degree cone against the pawn's forward
+		//      vector — which is not the thing that has to slew, and which a weaving carrier swings
+		//      off the goal line by design. Now: the cone is measured on the control rotation and
+		//      widened to what the slew can deliver, and the ARC is swept against arena geometry.
+		bool bShotAvailable = false;
+		float ShotScore = 0.f;
 		FVector GoalCentre = FVector::ZeroVector;
+		FVector ShotLaunchDirection = FVector::ZeroVector;
 
 		if (ATraceCore::GetAttackGoalCentre(World, MyTeam, GoalCentre))
 		{
-			const float GoalDistance = static_cast<float>(FVector::Dist2D(MyLocation, GoalCentre));
+			TRACE_BOT_KIT(ShotEvals);
 
-			// Range is a fraction of the pitch, not a constant, so this survives the map growing.
-			const float ShotRange = HalfFieldLength() * 0.55f;
+			const FVector ViewLocation = BotCharacter->GetPawnViewLocation();
 
-			FVector ToGoal = GoalCentre - MyLocation;
+			// AIM AT THE MOUTH, NOT AT THE BACK OF THE NET.
+			//
+			// GetAttackGoalCentre returns the centre of the goal BOX, and the box runs from the goal
+			// line back to the end wall - 2400 uu deep on this arena, so its centre is 1200 uu past
+			// the plane a Core has to cross to score. Aiming there threw away 1200 uu of a range that
+			// is only ~6300 uu to begin with, and it is measurable: a bot placed 5200 uu from the
+			// mouth measured 6400 uu to the box centre, failed the range test by 150 uu, and threw a
+			// clearance into open ground instead of the shot it had. Aim a little way INSIDE the
+			// mouth (so a solution that lands exactly on target is already over the line) and at the
+			// middle of the mouth's height rather than the box's.
+			FVector AimTarget = GoalCentre;
+			FBox GoalBox(ForceInit);
+			if (ATraceCore::GetAttackGoalBox(World, MyTeam, GoalBox))
+			{
+				constexpr double InsideTheMouth = 250.0;
+
+				const double FieldCentreX = bBoundsValid ? FieldBounds.GetCenter().X : 0.0;
+				const bool bGoalIsPositiveX = (GoalBox.GetCenter().X >= FieldCentreX);
+
+				AimTarget.X = bGoalIsPositiveX ? (GoalBox.Min.X + InsideTheMouth) : (GoalBox.Max.X - InsideTheMouth);
+				AimTarget.Y = GoalBox.GetCenter().Y;
+				AimTarget.Z = GoalBox.Min.Z + (GoalBox.Max.Z - GoalBox.Min.Z) * 0.5;
+			}
+
+			const float GoalDistance = static_cast<float>(FVector::Dist2D(MyLocation, AimTarget));
+			const float Reach = MaxThrowRange(ViewLocation, static_cast<float>(AimTarget.Z - ViewLocation.Z))
+				* TraceBotConstants::ThrowRangeSafetyFraction;
+
+			// The cone is a PRE-FILTER against committing the aim to a 180-degree turn, and it is
+			// measured on the control rotation because that is what slews. Pressure waives it: a
+			// carrier about to die should throw at the goal even over its own shoulder.
+			FVector ToGoal = AimTarget - MyLocation;
 			ToGoal.Z = 0.f;
-			const FVector Facing = BotCharacter->GetActorForwardVector().GetSafeNormal2D();
+			const FVector Facing = GetControlRotation().Vector().GetSafeNormal2D();
 			const float ConeCos = FMath::Cos(FMath::DegreesToRadians(TraceBotConstants::ThrowAtGoalConeDegrees));
-
 			const bool bInFront = !ToGoal.IsNearlyZero()
 				&& FVector::DotProduct(ToGoal.GetSafeNormal(), Facing) >= ConeCos;
 
-			if (GoalDistance <= ShotRange && (bInFront || bUnderPressure))
+#if !UE_BUILD_SHIPPING
+			if (TraceBotTelemetry::Enabled())
 			{
-				bWantGoalShot = true;
-				ThrowTargetPoint = GoalCentre;
+				float& Closest = TraceBotTelemetry::Kit().CarrierClosestToGoal;
+				Closest = (Closest < 0.f) ? GoalDistance : FMath::Min(Closest, GoalDistance);
 			}
-		}
+#endif
 
-		if (bWantGoalShot)
-		{
-			bThrowAtGoal = true;
-			PassPhase = ETraceBotPassPhase::Lining;
-			PassReceiver = nullptr;
-			PassPhaseStartTime = Now;
-			return;
+			if (GoalDistance > Reach)
+			{
+				TRACE_BOT_KIT(ShotOutOfRange);
+			}
+			else if (!bInFront && !bUnderPressure)
+			{
+				// Not counted as a refusal: the bot is simply facing the wrong way this instant and
+				// will be facing the right way within a second of running at the goal.
+			}
+			else
+			{
+				float FlightSeconds = 0.f;
+				if (!SolveThrowLaunch(ViewLocation, AimTarget, ShotLaunchDirection, &FlightSeconds))
+				{
+					TRACE_BOT_KIT(ShotNoSolution);
+				}
+				else if (!HasThrowLane(ViewLocation, AimTarget, ShotLaunchDirection, FlightSeconds))
+				{
+					TRACE_BOT_KIT(ShotBlocked);
+				}
+				else
+				{
+					bShotAvailable = true;
+					ThrowTargetPoint = AimTarget;
+
+					// 1 at the mouth, 0 at the edge of what the throw can carry. Pressure is worth a
+					// lot: a shot released a moment before dying is the whole point of having one.
+					ShotScore = 1.f - FMath::Clamp(GoalDistance / FMath::Max(1.f, Reach), 0.f, 1.f);
+					ShotScore += bUnderPressure ? 0.35f : 0.f;
+				}
+			}
 		}
 
 		// --- 2. THE THROW TO A TEAMMATE. -------------------------------------------------------
@@ -2861,8 +3335,34 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 		// range, with line of sight, meaningfully further up the field". What differs is what happens
 		// next — the Core is thrown at them and ANYBODY may intercept it, which is the risk mode B
 		// substitutes for mode A's dropped shield.
+		//
+		// WEIGHED against the shot rather than losing to it outright. The old code took the shot the
+		// instant its (broken) range test passed and never looked at the pass; inverting that would
+		// be the same mistake the other way round. Both options are scored on the same 0..1 scale —
+		// how much closer to a goal does this throw get the Core — so the comparison means something:
+		// a pass that gains half the remaining distance beats a shot from the edge of throwing range,
+		// and a shot from the edge of the box beats any pass.
 		float Advantage = 0.f;
 		ATraceCharacter* Receiver = ChooseReceiver(Advantage);
+
+		if (Receiver != nullptr && bShotAvailable)
+		{
+			const float PassScore = FMath::Clamp(Advantage / FMath::Max(1.f, HalfFieldLength()), 0.f, 1.f);
+			if (PassScore > ShotScore)
+			{
+				bShotAvailable = false;
+				TRACE_BOT_KIT(ShotLostToPass);
+			}
+		}
+
+		if (bShotAvailable)
+		{
+			bThrowAtGoal = true;
+			PassPhase = ETraceBotPassPhase::Lining;
+			PassReceiver = nullptr;
+			PassPhaseStartTime = Now;
+			return;
+		}
 
 		if (Receiver == nullptr)
 		{
@@ -2977,6 +3477,79 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 	AbortThrow(nullptr);   // Not a failure: this is how the attempt is closed out and cooled down.
 }
 
+void ATraceBotController::UpdateCarryInCommit()
+{
+	const UWorld* World = GetWorld();
+	const ATraceCharacter* BotCharacter = GetBotCharacter();
+
+	if (World == nullptr || BotCharacter == nullptr || !bModeB || !bIAmCarrier)
+	{
+		bCommitCarryIn = false;
+		return;
+	}
+
+	FVector GoalCentre = FVector::ZeroVector;
+	if (!ATraceCore::GetAttackGoalCentre(World, MyTeam, GoalCentre))
+	{
+		bCommitCarryIn = false;
+		return;
+	}
+
+	const float Now = static_cast<float>(World->GetTimeSeconds());
+
+	// Distance to the MOUTH, not to the box centre: the box runs from the goal line back to the end
+	// wall, so its centre is 1200 uu inside the net and measuring to it would make every carrier
+	// think it was further away than it is.
+	FVector MouthPoint = GoalCentre;
+	FBox GoalBox(ForceInit);
+	if (ATraceCore::GetAttackGoalBox(World, MyTeam, GoalBox))
+	{
+		const double FieldCentreX = bBoundsValid ? FieldBounds.GetCenter().X : 0.0;
+		MouthPoint.X = (GoalBox.GetCenter().X >= FieldCentreX) ? GoalBox.Min.X : GoalBox.Max.X;
+	}
+
+	const float Distance = static_cast<float>(FVector::Dist2D(BotCharacter->GetActorLocation(), MouthPoint));
+
+	if (!bCommitCarryIn)
+	{
+		if (Distance <= TraceBotConstants::CarryInCommitDistance)
+		{
+			bCommitCarryIn = true;
+			CarryInCommitTime = Now;
+			TRACE_BOT_KIT(CarryInCommits);
+
+			// Display, not Verbose. This project has twice declared a working mechanic dead because
+			// its only log line was below the default verbosity, and "bots never carry it in" was
+			// exactly that kind of claim. It fires a handful of times a match, which is not spam.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BotCarryIn] %s COMMITTED to running it in, %.0f uu from the mouth"),
+				*GetNameSafe(GetPlayerState<APlayerState>()), Distance);
+		}
+		return;
+	}
+
+	// --- Releasing the commit. Two ways out, and both are needed. ---------------------------------
+	//
+	// Pushed back out (a turnover it survived, a dash away from a defender) - hysteresis so a bot on
+	// the boundary does not flicker between running and throwing every evaluation tick.
+	if (Distance > TraceBotConstants::CarryInReleaseDistance)
+	{
+		bCommitCarryIn = false;
+		return;
+	}
+
+	// Or held out of the mouth. Without this a carrier walled off by two defenders would stand there
+	// refusing to throw for the rest of its life, which is a worse bug than the one being fixed.
+	if ((Now - CarryInCommitTime) > TraceBotConstants::CarryInPatienceSeconds)
+	{
+		bCommitCarryIn = false;
+		TRACE_BOT_KIT(CarryInAbandoned);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotCarryIn] %s gave up after %.1fs, still %.0f uu out"),
+			*GetNameSafe(GetPlayerState<APlayerState>()), Now - CarryInCommitTime, Distance);
+	}
+}
+
 void ATraceBotController::AbortThrow(const TCHAR* Reason)
 {
 	const UWorld* World = GetWorld();
@@ -3052,9 +3625,35 @@ ATraceCharacter* ATraceBotController::ChooseReceiver(float& OutAdvantage) const
 	// Both of these were fixed constants tuned against a 4000uu half-length. On a 12000uu one a
 	// 3200uu pass cannot cross a third of the pitch and no receiver is ever in range, so the whole
 	// mechanic quietly switches itself off the moment the arena grows.
-	const float PassRange = FMath::Max(
+	float PassRange = FMath::Max(
 		FMath::Max(0.f, Settings.BotPassMinRange),
 		HalfLength * FMath::Max(0.f, Settings.BotPassRangeFieldFraction));
+
+	// --- MODE B: A PASS IS A THROW, AND A THROW HAS A RANGE. -------------------------------------
+	//
+	// The number above is 9240 uu on this pitch, and in mode A that is exactly right: the hover pass
+	// transfers possession outright and does not have to travel. In mode B the SAME number selects a
+	// receiver the Core cannot physically reach - it carries ~7300 uu on the best arc and ~3400 flat
+	// under the v5 weight model - so the bot solved an impossible shot, fell through to the fixed
+	// 25-degree clearance elevation, and lobbed the Core into open ground two thousand uu short of a
+	// teammate. That is the "they will throw short and the change will look like a regression" this
+	// pass was warned about, and it is not visible in any counter that only records that a throw
+	// happened.
+	//
+	// So in mode B the receiver search is clamped to what the throw can actually deliver, with the
+	// same safety margin the shot at goal uses.
+	if (bModeB)
+	{
+		const ATraceCharacter* Me = GetBotCharacter();
+		const FVector ViewLocation = (Me != nullptr) ? Me->GetPawnViewLocation() : MyLocation;
+		const float Reach = MaxThrowRange(ViewLocation, Settings.BotAimBodyOffsetZ)
+			* TraceBotConstants::ThrowRangeSafetyFraction;
+
+		if (Reach > 1.f)
+		{
+			PassRange = FMath::Min(PassRange, Reach);
+		}
+	}
 
 	// A pass to somebody standing on top of the carrier gains nothing and reads in the log as a bug.
 	const float MinPassDistance = FMath::Max(0.f, Settings.BotPassMinDistance);
@@ -3081,8 +3680,18 @@ ATraceCharacter* ATraceBotController::ChooseReceiver(float& OutAdvantage) const
 		}
 
 		const float PassDistance = static_cast<float>(FVector::Dist(MyLocation, Mate->GetActorLocation()));
-		if (PassDistance > PassRange || PassDistance < MinPassDistance)
+		if (PassDistance < MinPassDistance)
 		{
+			continue;
+		}
+		if (PassDistance > PassRange)
+		{
+			// Counted only in mode B, where the refusal is a ballistic fact worth measuring rather
+			// than the ordinary "too far away" the mode-A rule has always had.
+			if (bModeB)
+			{
+				TRACE_BOT_KIT(PassOutOfThrowRange);
+			}
 			continue;
 		}
 
@@ -4003,6 +4612,34 @@ FVector ATraceBotController::GetAttackGoalLocation() const
 			GoalY = FMath::Clamp(GoalY,
 				static_cast<float>(FieldBounds.Min.Y) + Margin,
 				static_cast<float>(FieldBounds.Max.Y) - Margin);
+		}
+
+		// --- MODE B: THE LANE MUST FIT INSIDE THE MOUTH. -----------------------------------------
+		//
+		// THIS IS WHY NOBODY EVER CARRIED THE CORE IN. The attack lane above is correct for mode A
+		// and actively harmful in mode B, and the numbers are not close: BotAttackLaneFieldFraction
+		// is 0.30 of the field HALF-WIDTH, i.e. ±1440 uu on a 9600 uu pitch, against a goal mouth
+		// that was ±1600 uu and is now ±1000 uu (spec v5 §4). So a bot with a high |FormationBias|
+		// spent the whole match running at a point OUTSIDE the goal it was trying to score in,
+		// arrived beside the post, and the swept carry-in test in ATraceCore correctly never fired.
+		// Seven minutes of "the code path exists but never runs" was one clamp.
+		//
+		// The lane is kept, not deleted: spreading five attackers is still right, and inside the
+		// mouth there is still 1400 uu of usable spread. It is simply clamped to the box that scores,
+		// with an inset so a carrier aiming at the very edge is still inside after the capsule
+		// radius and a frame of overshoot.
+		if (bModeB)
+		{
+			FBox GoalBox(ForceInit);
+			if (ATraceCore::GetAttackGoalBox(GetWorld(), MyTeam, GoalBox))
+			{
+				const double MouthHalfY = (GoalBox.Max.Y - GoalBox.Min.Y) * 0.5;
+				const double Inset = FMath::Min(300.0, MouthHalfY * 0.35);
+
+				GoalY = FMath::Clamp(GoalY,
+					static_cast<float>(GoalBox.Min.Y + Inset),
+					static_cast<float>(GoalBox.Max.Y - Inset));
+			}
 		}
 
 		return FVector(AttackGoalCentre.X, GoalY, AttackGoalCentre.Z);

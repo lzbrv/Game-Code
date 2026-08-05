@@ -6,6 +6,7 @@
 #include "TraceTypes.h"
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
+#include "Core/TraceGameState.h"
 #include "Gameplay/TraceCore.h"
 
 #include "Components/BoxComponent.h"
@@ -142,7 +143,8 @@ void ATraceEndzone::BeginPlay()
 	SetActorTickEnabled(bZoneActive);
 
 	// Log, not Verbose. The half extent is the whole contract of this actor - "the zone spans the
-	// full width of the field", or in mode B "the goal is a third of it and 700 uu tall" - is either
+	// full width of the field", or in mode B "the goal is 2000 uu of it and 440 uu tall" (spec v5
+	// section 4 shrank both; ATraceArenaBuilder::GoalHalfWidth is where that is decided) - is either
 	// true or the game silently refuses points somewhere, and a fact nobody can see must at least be
 	// one nobody has to raise a verbosity level to read. This project has twice declared a working
 	// mechanic dead over exactly that.
@@ -275,8 +277,38 @@ void ATraceEndzone::TryScore(ATraceCharacter* Character)
 		ScoreLocation.X, ScoreLocation.Y, ZoneHalfWidth,
 		*TraceTeamName(CarrierTeam).ToString());
 
-	// The scoring team is the CARRIER's team, never OwningTeam.
+	// The scoring team is the CARRIER's team, never OwningTeam. Read the score across the call so the
+	// mode-B tally below counts an AWARD and not merely an attempt - NotifyScored debounces, and this
+	// goal may already have been credited by ATraceCore's swept carry test a few milliseconds ago.
+	const AGameStateBase* GameStateBase = World->GetGameState();
+	const ATraceGameState* TraceGameState = Cast<ATraceGameState>(GameStateBase);
+	const int32 ScoreBefore = (TraceGameState != nullptr) ? TraceGameState->GetScore(CarrierTeam) : 0;
+
 	GameMode->NotifyScored(CarrierTeam);
+
+	const bool bAwarded = (TraceGameState == nullptr) || (TraceGameState->GetScore(CarrierTeam) > ScoreBefore);
+
+	// --- MODE B: count it as a goal by CARRYING. ---------------------------------------------------
+	//
+	// THIS IS THE OTHER HALF OF A TALLY THAT WAS LYING BY OMISSION. ATraceCore keeps a per-method
+	// goal count (thrown / carried / granted) so that "bots never carry it in" can be answered with a
+	// number, and its carried branch is the SWEPT test in ATraceCore::Tick - which only catches a
+	// carrier that crosses the mouth between two frames. The ordinary case, a carrier who simply runs
+	// in and is still inside on the next 10 Hz poll, is scored HERE and was counted nowhere.
+	//
+	// MEASURED: a bot placed 700 uu out ran in and scored 0.29 s later - "TraceCharacter_7 carried
+	// the Core into the Blue goal at X=-14375" - while the tally still read "carried 0", which read
+	// as the carry path being dead when it had just fired. A counter that misses the common case is
+	// worse than no counter, because it is the one somebody quotes.
+	if (bGoalVolume && bAwarded)
+	{
+		++ATraceCore::GoalsByMethod[static_cast<int32>(ATraceCore::EGoalMethod::Carried)];
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] GOAL by %s (carried in, endzone trigger) | tally: thrown %d, carried %d, granted %d"),
+			*TraceTeamName(CarrierTeam).ToString(),
+			ATraceCore::GoalsByMethod[0], ATraceCore::GoalsByMethod[1], ATraceCore::GoalsByMethod[2]);
+	}
 }
 
 bool ATraceEndzone::IsCoreCarrier(const ATraceCharacter* Character) const

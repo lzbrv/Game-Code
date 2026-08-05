@@ -10,6 +10,7 @@
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"                  // TActorIterator, for the replicated-character count
 #include "GameFramework/GameStateBase.h"   // AGameStateBase::PlayerArray
 #include "GameFramework/PlayerState.h"
 #include "Gameplay/TraceCore.h"
@@ -28,6 +29,7 @@
 #include "TraceTypes.h"
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"         // TraceMatchFlow::PostMatchDuration, TraceMaps
+#include "UI/TraceNetworking.h"           // TraceNet — host address, connection state, failures
 
 namespace TraceHUDStyle
 {
@@ -176,8 +178,21 @@ void ATraceHUD::BeginPlay()
 	// capsules is what produced the "the character models were not replaced" bug report.
 	ATraceCharacter::VerifyCharacterArtInstalled();
 
+	// Idempotent; the title screen usually got there first. Bound again here because a client can
+	// arrive in this map without ever having seen the menu (Scripts/run-client.sh, or `open <ip>`
+	// from the console), and a mid-match disconnect has to be reported on those paths too.
+	TraceNet::BindFailureHandlers();
+
+	// One Display line naming the net mode, the endpoint and every local adapter. This is the line
+	// anyone debugging a failed playtest will be asked for first, so it is emitted unconditionally
+	// rather than behind a cvar nobody sets before playing.
+	TraceNet::LogNetworkDiagnostics(GetWorld(), TEXT("Match HUD ready"));
+
 #if !UE_BUILD_SHIPPING
 	TraceAutoShot::Arm(this, TEXT("Match"));
+	// -TraceExec="a|b" -TraceExecAt=<sec>: run the in-match verification commands headlessly. See
+	// TraceAutoShot.h - the engine's own -ExecCmds fires on the title screen, where they are no-ops.
+	TraceAutoShot::ArmDeferredExec(this, TEXT("Match"));
 
 	if (!FParse::Value(FCommandLine::Get(), TEXT("TraceAutoPause="), AutoPauseAtSeconds))
 	{
@@ -347,6 +362,11 @@ void ATraceHUD::DrawHUD()
 	// Outside the bPostMatch gate on purpose: a broken install is broken on the result screen too,
 	// and this is the one message that must not be possible to wait out.
 	DrawArtWarning();
+
+	// Same reasoning: who is hosting, and whether the connection just broke, are true in every phase
+	// of the match including the full-time screen.
+	DrawNetworkStatus();
+	DrawNetworkFailureBanner();
 
 	// Last, over everything including the full-time takeover. A no-op while closed.
 	PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
@@ -1574,6 +1594,163 @@ void ATraceHUD::DrawCoreBanner()
 // -------------------------------------------------------------------------------------------
 // Phase callouts
 // -------------------------------------------------------------------------------------------
+
+void ATraceHUD::DrawNetworkStatus()
+{
+	FString Endpoint;
+	FString Detail;
+	const TraceNet::ERole Role = TraceNet::DescribeConnection(GetWorld(), Endpoint, Detail);
+
+	// A standalone match with a free port is an ordinary offline game and needs no chrome. A
+	// standalone match whose port was TAKEN is a listen server that silently failed to bind, and that
+	// one has to be shouted about — it is precisely the state that looks identical to a working host
+	// from the inside, which is the bug this pass exists to close.
+	if (Role == TraceNet::ERole::Offline && Detail.IsEmpty())
+	{
+		return;
+	}
+
+	FString Headline;
+	FLinearColor Accent = TraceHUDStyle::Good;
+	switch (Role)
+	{
+	case TraceNet::ERole::Hosting:
+		Headline = FString::Printf(TEXT("HOSTING  %s"), *Endpoint);
+		Accent = TraceHUDStyle::Good;
+		break;
+
+	case TraceNet::ERole::Client:
+		Headline = FString::Printf(TEXT("CONNECTED  %s"), *Endpoint);
+		Accent = TraceHUDStyle::Good;
+		// Bots fill the empty slots and yield them as humans arrive, so the useful second line for a
+		// client is simply how many humans are in the match with them.
+		Detail.Reset();
+		break;
+
+	default:
+		Headline = TEXT("OFFLINE - NOBODY CAN JOIN");
+		Accent = TraceHUDStyle::Warning;
+		break;
+	}
+
+	// Human count, on both host and client. Bots carry real PlayerStates (see the bot section of
+	// ATraceGameMode), so PlayerArray alone would always read 10 and tell nobody anything.
+	if (const AGameStateBase* GameStateBase = GetWorld() != nullptr ? GetWorld()->GetGameState() : nullptr)
+	{
+		int32 Humans = 0;
+		for (const APlayerState* Player : GameStateBase->PlayerArray)
+		{
+			if (Player != nullptr && !Player->IsABot())
+			{
+				++Humans;
+			}
+		}
+
+		const FString HumanText = (Humans == 1)
+			? FString(TEXT("1 HUMAN PLAYER"))
+			: FString::Printf(TEXT("%d HUMAN PLAYERS"), Humans);
+
+		Detail = Detail.IsEmpty() ? HumanText : FString::Printf(TEXT("%s  -  %s"), *Detail, *HumanText);
+
+		// Logged on CHANGE, never per frame. "A second human arrived" is the single fact the Demo 5
+		// report needed and could not get, and putting it in the log at Display means the next person
+		// who says "I don't think we were connected" can be answered from the file they already have,
+		// on either machine, without anyone having to reproduce anything.
+		if (Humans != LastLoggedHumanCount)
+		{
+			LastLoggedHumanCount = Humans;
+
+			// Character count as well as player-state count, because they answer different
+			// questions. Player states prove the ROSTER replicated; characters prove the PAWNS did —
+			// "the client can see the host's pawn" is a separate claim from "the client knows the
+			// host exists", and only the second one is free.
+			int32 Characters = 0;
+			for (TActorIterator<ATraceCharacter> It(GetWorld()); It; ++It)
+			{
+				++Characters;
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[Net] %s - %d human player(s) of %d player states, %d characters in the world."),
+				*Headline, Humans, GameStateBase->PlayerArray.Num(), Characters);
+
+			for (const APlayerState* Player : GameStateBase->PlayerArray)
+			{
+				if (Player != nullptr && !Player->IsABot())
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[Net]   human player state: '%s'"), *Player->GetPlayerName());
+				}
+			}
+		}
+	}
+
+	const float HeadScale = 1.05f * UIScale;
+	const float DetailScale = 0.95f * UIScale;
+	const float PadX = 12.f * UIScale;
+	const float PadY = 7.f * UIScale;
+
+	const float HeadW = MeasureWidth(Headline, FontMedium, HeadScale);
+	const float DetailW = MeasureWidth(Detail, FontSmall, DetailScale);
+	const float HeadH = MeasureHeight(Headline, FontMedium, HeadScale);
+	const float DetailH = Detail.IsEmpty() ? 0.f : MeasureHeight(Detail, FontSmall, DetailScale);
+
+	const float PanelW = FMath::Max(HeadW, DetailW) + PadX * 2.f;
+	const float PanelH = HeadH + DetailH + PadY * 2.f;
+
+	// Top-RIGHT. The top-left belongs to the art warning and the top-centre to the score panel; this
+	// is the only free corner, and it is a corner the eye visits between fights rather than during
+	// one.
+	const float PanelX = ViewW - PanelW - (18.f * UIScale);
+	const float PanelY = TraceHUDStyle::TopPanelY * UIScale;
+
+	DrawPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::PanelFill,
+		TraceHUDStyle::WithAlpha(Accent, 0.45f));
+
+	DrawTextLeft(Headline, Accent, PanelX + PadX, PanelY + PadY, FontMedium, HeadScale);
+	if (!Detail.IsEmpty())
+	{
+		DrawTextLeft(Detail, TraceHUDStyle::InkDim, PanelX + PadX, PanelY + PadY + HeadH, FontSmall, DetailScale);
+	}
+}
+
+void ATraceHUD::DrawNetworkFailureBanner()
+{
+	FString Headline;
+	FString Detail;
+	double AgeSeconds = 0.0;
+	if (!TraceNet::GetLastFailure(Headline, Detail, AgeSeconds))
+	{
+		return;
+	}
+
+	// Short in-match, unlike the title screen's minute: here the player is looking at the screen when
+	// it happens, and a banner that outstays its welcome would sit over a live fight.
+	constexpr double VisibleSeconds = 12.0;
+	if (AgeSeconds > VisibleSeconds)
+	{
+		return;
+	}
+	const float Fade = static_cast<float>(FMath::Clamp((VisibleSeconds - AgeSeconds) / 2.0, 0.0, 1.0));
+
+	const float CX = ViewW * 0.5f;
+	const float Y = ViewH * 0.16f;
+	const float HeadScale = 1.2f * UIScale;
+
+	const float HeadW = MeasureWidth(Headline, FontMedium, HeadScale);
+	const float HeadH = MeasureHeight(Headline, FontMedium, HeadScale);
+	const float DetailH = MeasureHeight(Detail, FontSmall, UIScale);
+	const float PadX = 20.f * UIScale;
+	const float PadY = 10.f * UIScale;
+
+	const float PanelW = FMath::Max(HeadW, MeasureWidth(Detail, FontSmall, UIScale)) + PadX * 2.f;
+	const float PanelH = HeadH + DetailH + PadY * 2.f;
+
+	DrawPanel(CX - PanelW * 0.5f, Y, PanelW, PanelH,
+		FLinearColor(0.20f, 0.03f, 0.02f, 0.88f * Fade),
+		TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.75f * Fade));
+
+	DrawTextCentered(Headline, TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, Fade), CX, Y + PadY, FontMedium, HeadScale);
+	DrawTextCentered(Detail, TraceHUDStyle::WithAlpha(TraceHUDStyle::InkDim, Fade), CX, Y + PadY + HeadH, FontSmall, UIScale);
+}
 
 void ATraceHUD::DrawPhaseBanner()
 {

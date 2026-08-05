@@ -284,10 +284,19 @@ struct TRACE_API FTraceBotProfile
 	// ----------------------------------------------------------------------------------------
 	// Burst fire
 	//
-	// FireInterval is 0.16s and a body shot is 40 (spec §6), so a held trigger on target kills in
-	// 0.32s — and a single head shot kills instantly.
+	// FireInterval is 0.40s AS OF SPEC v5 §5 (150 RPM, up from 0.16s) and a body shot is 40, so a
+	// held trigger on target kills in 0.80s — and a single head shot still kills instantly.
 	// Nothing about reaction time or aim error survives that. Bursting is the DPS dial, and it is
 	// the one that makes a fight readable: you can hear the gap and move in it.
+	//
+	// READ THIS BEFORE TUNING A BURST NUMBER. At 0.40s between rounds a burst of 0.20-0.38s contains
+	// exactly ONE shot, where at 0.16s it contained two or three. The duty cycle no longer describes
+	// bot DPS — the ROUND COUNT does — so on Easy a bot now lands at most one round per
+	// (burst + rest) ~= 1.29s, which is roughly half the damage per engaged second it used to do.
+	// These profiles are deliberately left alone in the fire-rate pass: the Easy baseline (~0.72
+	// human deaths per minute while engaged) was MEASURED, and moving the rate and the profiles in
+	// the same pass would make the next measurement uninterpretable. If bots read as harmless after
+	// this change, raise BurstDurationMin/Max to hold more than one round, or cut the rests.
 	// ----------------------------------------------------------------------------------------
 
 	/** Seconds of continuous fire before the bot lets go of the trigger. Sane range 0.2 to 0.45. */
@@ -586,26 +595,35 @@ public:
 	/**
 	 * MODE B ONLY. Width of each goal as a fraction of the FULL field width.
 	 *
-	 * Verbatim: "The goal should not be the entire width of the map, like the endzone."
-	 * [ASSUMPTION] one third. At a 9600 uu wide field that is a 3200 uu goal mouth centred on the
-	 * end line, which is wide enough to throw at from an angle and narrow enough that a defender can
-	 * meaningfully cover it — the two properties that make it a goal rather than a repainted endzone.
+	 * Verbatim (v4): "The goal should not be the entire width of the map, like the endzone."
+	 * Verbatim (v5 §4): "For game mode b ONLY ... decrease the size of the goal (reduce height and
+	 * width)."
+	 *
+	 * 0.3333 -> 0.2083 THIS PASS: a 3200 uu goal mouth on the 9600 uu wide field becomes 2000 uu
+	 * ([ASSUMPTION], spec v5 §4). Still wide enough to throw at from an angle — 2000 uu is about six
+	 * character-widths of margin either side of a defender — and now narrow enough that ONE defender
+	 * standing in front of it is a real obstacle, which is the point of shrinking it.
 	 *
 	 * Ignored entirely in mode A, where the endzone spans the full width by design. Keep it under
-	 * ~0.6 or the distinction the spec is asking for stops existing.
+	 * ~0.6 or the distinction the spec is asking for stops existing; below ~0.12 (1150 uu) a thrown
+	 * Core has to be threaded and mode B stops scoring at all.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Goal Width (fraction of field width) [mode B]", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.1", UIMax = "0.6"))
-	float GoalWidthFieldFraction = 0.3333f;
+	float GoalWidthFieldFraction = 0.2083f;
 
 	/**
 	 * MODE B ONLY. Height of the goal volume, uu, measured from the floor.
 	 *
 	 * FINITE ON PURPOSE — "height finite so it reads as a goal rather than a wall". A goal you can
-	 * throw over is a goal you can defend by standing in front of. 700 is about four character
-	 * heights (the capsule is 176 uu), so a lobbed Core clears it and a flat throw does not.
+	 * throw over is a goal you can defend by standing in front of.
+	 *
+	 * 700 -> 440 THIS PASS (spec v5 §4, "reduce height and width"). Scaled by the same factor the
+	 * width was, 2000/3200, so the goal mouth keeps its proportions instead of turning into a
+	 * letterbox. 440 is two and a half character heights (the capsule is 176 uu): a defender's head
+	 * covers a real fraction of it, a lobbed Core still clears it, and a flat throw still does not.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Goal Height (uu) [mode B]", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "200.0", UIMax = "2000.0"))
-	float GoalHeightUU = 700.f;
+	float GoalHeightUU = 440.f;
 
 	// DEAD PROPERTY REMOVED: MatchDuration.
 	//
@@ -655,12 +673,166 @@ public:
 	 * SECONDS BETWEEN SHOTS — this is the inverse of the fire RATE, so a BIGGER number is a SLOWER
 	 * gun. The server validates a client's claimed fire rate against this with a tolerance.
 	 *
-	 * 0.16 is 6.25 shots/second: three body shots (40 damage each) kills a full-health target in
-	 * 0.32s of sustained fire. Sane range 0.08 (twice as fast, very lethal) to 0.30 (a marksman
-	 * rifle). Below ~0.05 the server's rate validation starts rejecting legitimate client shots.
+	 * 0.16 -> 0.40 THIS PASS. Spec v5 §5, verbatim: "Change the gun's firerate to be 150 rounds per
+	 * minute, or whatever the equivalent is for this framework". 60/150 = 0.40 s between shots, i.e.
+	 * 2.5 shots/second, down from 6.25 (375 RPM).
+	 *
+	 * WHAT IT COSTS, STATED HERE BECAUSE IT IS THE BIGGEST SINGLE COMBAT CHANGE IN THE PASS:
+	 *   * three body shots (40 each) now take 0.80 s of sustained fire on target, up from 0.32 s;
+	 *   * a head shot (100) still kills in one, so the head/body gap widens from 3:1 in rounds to
+	 *     3:1 in rounds AND 0.80 s in wall-clock — aiming high is now most of the gun;
+	 *   * bot bursts (BurstDurationMin/Max, 0.20-0.38 s) now contain exactly ONE round each, where
+	 *     they used to contain two or three. Bot DPS falls with the burst, not just with the rate.
+	 *     Those profiles are deliberately NOT retuned here; see the note in the Burst block above.
+	 *
+	 * Sane range 0.08 (twice as fast as the old gun, very lethal) to 0.60 (a bolt-action feel).
+	 * Below ~0.05 the server's rate validation starts rejecting legitimate client shots.
+	 *
+	 * ALSO SET IN Config/DefaultGame.ini, AND THE INI WINS. Both were moved; verify from a running
+	 * game with Trace.DumpSettings rather than from this line.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Fire Interval (s between shots)", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.05", UIMax = "0.5"))
-	float FireInterval = 0.16f;
+	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Fire Interval (s between shots)", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.05", UIMax = "0.8"))
+	float FireInterval = 0.40f;
+
+	// ==========================================================================================
+	// COMBAT — UPWARDS RECOIL  (spec v5 §6, new)
+	//
+	// Verbatim: "Add upwards recoil, mimicking 100 upwards recoil from destiny 2".
+	//
+	// [ASSUMPTION] A recoil-DIRECTION stat of 100 in Destiny 2 means the muzzle climbs on a perfectly
+	// vertical line: no horizontal drift, no left/right bias, no randomness in the direction. So this
+	// block has a pitch term and NOTHING ELSE. There is deliberately no yaw knob, not even one
+	// defaulted to zero — same reasoning that deleted SpreadDegrees: a horizontal term that exists
+	// can be reintroduced by a stale .ini or by a modified client, and "purely vertical" is a rule
+	// rather than a default.
+	//
+	// WHERE IT IS APPLIED, AND WHY THAT CANNOT DESYNC THE SHOT
+	// UTraceWeaponComponent applies the kick to the LOCAL player controller's control rotation,
+	// AFTER the shot's direction has been sampled and sent. Three consequences, all of them the
+	// point:
+	//   * the round that produced the kick goes exactly where the crosshair was when the trigger
+	//     broke — recoil never bends the bullet that caused it;
+	//   * the SERVER is told the direction, not the rotation (UTraceWeaponComponent::ServerFire
+	//     carries Origin + Direction), so the authority resolves the same ray the shooter saw. There
+	//     is no recoil state to replicate and therefore nothing to disagree about;
+	//   * the camera and the aim ray are both pure functions of the control rotation
+	//     (ATraceCharacter::ResolveAimRotation), so moving it moves them together and
+	//     Trace.DebugViewProbe still measures aimErr = 0.0000 deg.
+	//
+	// BOTS DO NOT GET RECOIL, and that is a decision rather than an oversight. A bot's control
+	// rotation is overwritten every frame by ATraceBotController's RInterpConstantTo slew toward its
+	// own aim point, so a kick would be erased within a frame or two and would tune nothing while
+	// adding jitter to a system whose difficulty ladder was measured. The bots' DPS dial is the
+	// burst duty cycle; this is the human's.
+	// ==========================================================================================
+
+	/**
+	 * Master switch for view recoil. OFF restores the perfectly static muzzle the gun shipped with.
+	 *
+	 * Exists so the new gun feel can be A/B'd against its absence from one binary, which matters
+	 * this pass: the fire rate moved at the same time, and "the gun feels worse" needs to be
+	 * attributable to one of the two changes and not to their sum.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Upwards Recoil Enabled"))
+	bool bRecoilEnabled = true;
+
+	/**
+	 * Degrees of UPWARD pitch added to the local player's view by the FIRST shot of a burst.
+	 *
+	 * THE HEADLINE KNOB. At arena distances one degree is about 70 uu of vertical travel per 4000 uu
+	 * of range, and the character capsule is 176 uu tall — so 0.8 deg moves the point of aim by
+	 * roughly a third of a body per shot at a long engagement, and by almost nothing across a room.
+	 * That distance dependence is what makes recoil a range-dependent skill test rather than a flat
+	 * accuracy tax.
+	 *
+	 * Sane range 0.4 (barely felt) to 1.5 (a hand cannon). Above ~2 the second round of a burst is
+	 * over the target's head at any range and the gun becomes single-shot in practice.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Pitch Kick Per Shot (deg)", ClampMin = "0.0", ClampMax = "15.0", UIMin = "0.0", UIMax = "3.0"))
+	float RecoilPitchPerShot = 0.80f;
+
+	/**
+	 * Fraction of the base kick ADDED for each further consecutive shot, so sustained fire climbs.
+	 *
+	 * Shot n of a burst kicks PitchKickPerShot * (1 + this * n), n counting from 0. At 0.18 a burst
+	 * goes 0.80, 0.94, 1.09, 1.23 ... which is the Destiny read: the first round is nearly free and
+	 * the pattern opens up on you if you hold the trigger. 0 makes every shot in a burst identical.
+	 *
+	 * Sane range 0 to 0.35. The total is bounded by Max Accumulated Pitch below whatever this is.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Growth Per Consecutive Shot (fraction)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.5"))
+	float RecoilPitchGrowthPerShot = 0.18f;
+
+	/**
+	 * Ceiling, in degrees, on how far above the original aim the un-recovered climb may take the
+	 * view. The kick is truncated at the ceiling rather than the ceiling being enforced afterwards,
+	 * so the view never overshoots and snaps back.
+	 *
+	 * This is what stops a held trigger from walking the crosshair into the sky, and it is the knob
+	 * to lower if long bursts stop being aimable at all. Sane range 3 to 8.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Max Accumulated Pitch (deg)", ClampMin = "0.0", ClampMax = "45.0", UIMin = "1.0", UIMax = "12.0"))
+	float RecoilMaxPitchDegrees = 6.0f;
+
+	/**
+	 * Seconds after the LAST shot before recovery starts pulling the view back down.
+	 *
+	 * KEEP THIS AT OR JUST ABOVE FireInterval (0.40) OR THE GUN NEVER CLIMBS. Recovery that starts
+	 * between two shots of a held burst undoes each kick before the next one lands, which produces a
+	 * muzzle that twitches and returns instead of a pattern the player can learn and pre-aim
+	 * against. 0.45 s is one fire interval plus a beat, so a burst accumulates and the recovery is
+	 * something that happens when you stop shooting — which is exactly what the spec asks for.
+	 *
+	 * If FireInterval is retuned, retune this with it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Recovery Delay (s after last shot)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
+	float RecoilRecoveryDelaySeconds = 0.45f;
+
+	/**
+	 * Proportional recovery rate, per second (an FInterpTo speed): the view gives back this fraction
+	 * of the REMAINING climb every second, so the return decelerates as it lands.
+	 *
+	 * Proportional rather than linear because a constant-rate return reads as the camera being
+	 * driven by something rather than settling. At 6 the first half of the climb is gone in about
+	 * 0.12 s and the tail takes ~0.5 s. Sane range 3 (languid) to 12 (snappy).
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Recovery Speed (proportional, per s)", ClampMin = "0.0", ClampMax = "40.0", UIMin = "1.0", UIMax = "16.0"))
+	float RecoilRecoverySpeed = 6.0f;
+
+	/**
+	 * Floor, in degrees per second, under the proportional recovery above.
+	 *
+	 * A purely proportional return has an infinite tail: it takes as long to go 0.2 deg -> 0.1 deg
+	 * as 2 deg -> 1 deg, so the view hangs a fraction of a degree high for a second or more and the
+	 * player's next burst starts from somewhere they did not choose. This term is what actually
+	 * lands it. Sane range 2 to 8; 0 restores the infinite tail.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Recovery Floor (deg/s)", ClampMin = "0.0", ClampMax = "90.0", UIMin = "0.0", UIMax = "20.0"))
+	float RecoilRecoveryMinRateDegrees = 4.0f;
+
+	/**
+	 * A gap of this many seconds between shots resets the per-shot GROWTH back to the first-shot
+	 * kick. It does not touch the climb already accumulated, which recovers on its own schedule.
+	 *
+	 * Without it, ten single aimed shots spread over a minute would each kick harder than the last.
+	 * Keep it above FireInterval (0.40) or a held burst resets its own growth every shot and the
+	 * growth term does nothing. Sane range 1.5x to 3x FireInterval.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Burst Reset Gap (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.1", UIMax = "2.0"))
+	float RecoilBurstResetSeconds = 0.75f;
+
+	/**
+	 * True: pulling the mouse DOWN during recovery cancels an equal amount of the pending return,
+	 * so the player's own compensation is not paid back to them as a second, downward kick when the
+	 * gun settles.
+	 *
+	 * This is the difference between recoil a player can fight and recoil that fights back. With it
+	 * off, a player who drags down 3 degrees to hold the crosshair on a chest gets those 3 degrees
+	 * subtracted AGAIN by the recovery and ends up aiming at the floor. Every shooter with learnable
+	 * recoil does this; it is off only as a diagnostic.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Player Compensation Cancels Recovery"))
+	bool bRecoilPlayerCompensationCancels = true;
 
 	/** Off by design: teammates never damage each other. Flip only for tuning experiments. */
 	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Friendly Fire"))
@@ -795,9 +967,99 @@ public:
 	 * state transition" complaint spec v3 §2.4 raises. This only bounds what holding a direction
 	 * key in mid-air can ACCELERATE you to. Keep it at or above WalkSpeed; well above it lets a
 	 * skilled player convert air time into speed, which is the Apex/Source reading.
+	 *
+	 * LEFT AT 1600 THIS PASS, ON PURPOSE. Spec v5 §1's hard cap is AirStrafeHardCapSpeed below, and
+	 * the movement component takes the TIGHTER of the two, so lowering this as well would quietly
+	 * make it the operative ceiling and leave the v5 knob doing nothing. This is the model-wide
+	 * ceiling; that one is the strafe-accumulation ceiling. Keep this at or above it.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Max Air Speed (uu/s)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "3000.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Max Air Speed (uu/s, model ceiling)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "3000.0"))
 	float MaxAirSpeed = 1600.f;
+
+	// --- Air-strafe diminishing returns (spec v5 §1, new) --------------------------------------
+	//
+	// Verbatim: "The air strafing feels incredible, but its too powerful with how much momentum can
+	// be gained. I think we need a hard cap on it or an exponential scale in order to make it harder
+	// and harder to gain momentum past a certain point."
+	//
+	// THIS IS PRAISE WITH A CEILING ON IT, not a request to undo the movement model. What is capped
+	// is ACCUMULATION — how much speed a strafe may ADD — and nothing else. Turning without losing
+	// speed is untouched, because the falloff scales the ADD (which is zero for input along the
+	// direction you are already travelling) and never scales the velocity the pawn already has.
+	//
+	// THE CURVE. With planar speed S, soft cap C and hard cap H:
+	//     t     = clamp((S - C) / max(1, H - C), 0, 1)      -- 0 at the soft cap, 1 at the hard cap
+	//     Scale = (1 - t) ^ AirStrafeFalloffExponent
+	//     the air-accel step's computed add is multiplied by Scale
+	// Below the soft cap Scale is 1 and the air model is bit-for-bit what it was. Between the caps
+	// each further uu/s costs more input than the last; at the hard cap the add is zero.
+	//
+	// Read at the point of use inside ApplySourceAirAcceleration — i.e. inside the physics sub-step,
+	// on the client, on the server and on every replayed move — so it is a pure function of
+	// (Velocity, these values) and adds no saved-move state. Every knob here is safe to drag in PIE.
+	//
+	// NAMES ARE LOAD-BEARING. UTraceCharacterMovementComponent resolves all four BY NAME through
+	// FindPropertyByName (TraceMoveKnob::Float / ::Bool) because it was written in the same pass as
+	// this page and could not declare the UPROPERTYs itself. A rename on either side does not fail
+	// the build — it silently falls back to the literal at the call site and the panel slider stops
+	// doing anything. Trace.VerifyKnobs and the movement component's own bind report both print the
+	// answer at startup; keep the spellings identical.
+
+	/**
+	 * Master switch for the diminishing-returns curve. OFF leaves only the hard cap, which is the
+	 * "or" in the spec's "a hard cap OR an exponential scale" — both are implemented so the design
+	 * owner can play them separately and keep the one that feels right.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Gain Falloff"))
+	bool bAirStrafeGainFalloff = true;
+
+	/**
+	 * Planar speed, uu/s, at which strafing STOPS being free and starts paying diminishing returns.
+	 * Below this the air model is exactly what it was.
+	 *
+	 * 950 sits just under the measured baseline (a continuous strafe turn reaches ~1036 uu/s from
+	 * 835), so today's strafe is left almost entirely intact and it is the accumulation PAST it that
+	 * gets expensive — which is what "harder and harder to gain momentum past a certain point" asks
+	 * for. Lower it toward WalkSpeed (800) to make air speed mostly a function of what you jumped in
+	 * with. Must stay below the hard cap or the curve has no room to act.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Soft Cap (uu/s, falloff begins)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "2000.0"))
+	float AirStrafeSoftCapSpeed = 950.f;
+
+	/**
+	 * Shape of the falloff between the soft cap and the hard cap: Scale = (1 - t) ^ this.
+	 *
+	 * 1 is a straight line — every uu/s of headroom costs the same. 2 (the default) is the
+	 * "exponential scale" reading: it keeps most of the strafe's value until well past the soft cap
+	 * and then collapses it, so the speed asymptotes visibly short of the hard cap and a player
+	 * feels the ceiling arrive rather than hitting it. Above ~4 the gain dies almost at the soft cap
+	 * and the soft cap IS the cap. Sane range 1.5 to 3; never 0, which would be a silent no-op that
+	 * still reported itself as enabled.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Falloff Exponent", ClampMin = "0.1", ClampMax = "8.0", UIMin = "1.0", UIMax = "4.0"))
+	float AirStrafeFalloffExponent = 2.0f;
+
+	/**
+	 * Master switch for the absolute strafe ceiling — the "hard cap on it" half of the spec's
+	 * request. OFF leaves only the falloff curve (and MaxAirSpeed, which is the model-wide ceiling
+	 * and is not a v5 knob).
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Hard Cap Enabled"))
+	bool bAirStrafeHardCap = true;
+
+	/**
+	 * The hard ceiling, uu/s, on planar speed that air input may reach. THE BACKSTOP.
+	 *
+	 * 1250 is ~20% above the measured 1036 baseline: with the falloff on, the curve asymptotes well
+	 * short of it and this is only ever reached by input patterns the curve did not anticipate,
+	 * which is what a backstop is for. Speed CARRIED into the air (a dash, a slide-jump) is not
+	 * clamped by it — the movement component takes max(this, the speed you left the ground with), so
+	 * a cap can never confiscate momentum a player already had, which is the spec v3 §2.4 rule.
+	 *
+	 * Must stay above AirStrafeSoftCapSpeed and at or below MaxAirSpeed.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Hard Cap (uu/s)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "600.0", UIMax = "2500.0"))
+	float AirStrafeHardCapSpeed = 1250.f;
 
 	/**
 	 * Lateral drag in the air, per second (the engine's FallingLateralFriction). ZERO BY DESIGN.
@@ -962,6 +1224,30 @@ public:
 	//
 	// If a merge ever reintroduces SlideImpulse or SlideExitMinSpeedFraction, delete them again.
 
+	// --- Slide is an ABILITY as of spec v5 §3 ---------------------------------------------------
+	//
+	// Verbatim: "Rather than making it a slide you can hold down, have it trigger once, like an
+	// ability, with a hidden cooldown to prevent spamming it."
+	//
+	// THERE IS NO SWITCH FOR THIS AND THERE IS NO NEW KNOB. The movement component implements the
+	// ability model unconditionally — a slide is committed the instant it starts and runs for
+	// exactly SlideDuration — so a "one-shot ability" toggle on this page would be a slider that
+	// moves nothing, which is the failure this file keeps deleting. What makes it an ability is the
+	// two properties already here:
+	//   * SlideDuration        — the fixed length of the ability (1.8 s). One press buys all of it.
+	//   * SlideCooldownSeconds — THE HIDDEN COOLDOWN (0.8 s, the spec's starting value, measured
+	//                            from the slide's END). Enforced, and deliberately NOT drawn on the
+	//                            HUD: the spec asks for it to be felt, not read. Do not add a UI.
+	// SlideInputBufferSeconds still applies, and still only charges on a fresh PRESS, so a held key
+	// cannot chain slides.
+	//
+	// SlideMinCommitSeconds ("Min Commit (s, uncancellable)") WAS HERE AND IS DELETED. It described
+	// the window in which releasing crouch could not cancel a slide, and a one-shot ability has no
+	// partial commit — the whole slide is committed the moment it starts. Deleted at the movement
+	// component's request (see the note where GetSlideMinCommitSeconds() used to be) rather than
+	// left defaulted, because a property nothing reads is exactly the silently-dead knob this
+	// project keeps getting caught by. Its DefaultGame.ini line went with it.
+
 	/**
 	 * Fraction of WalkSpeed you must already be moving at before crouch will start a slide.
 	 * Stops "tap crouch from a standstill" being free speed. Sane range 0.4 to 0.7.
@@ -1057,16 +1343,6 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Input Buffer (s)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
 	float SlideInputBufferSeconds = 0.25f;
-
-	/**
-	 * Seconds at the start of a slide during which releasing crouch will NOT cancel it.
-	 *
-	 * Without this a slide is only as long as the player holds the key, so lengthening SlideDuration
-	 * changes nothing for anyone who taps crouch. A dash still overrides the commit window. Sane
-	 * range 0.3 to 0.8; at or above SlideDuration the slide becomes entirely uncancellable.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Min Commit (s, uncancellable)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.5"))
-	float SlideMinCommitSeconds = 0.55f;
 
 	/**
 	 * Fraction of the slide's LIVE speed carried into normal movement on exit. 1 = all of it.
@@ -1172,16 +1448,159 @@ public:
 	/**
 	 * Extra horizontal speed multiplier for a slide-jump taken inside the timing window above.
 	 *
-	 * Small on purpose. 1.10 on a ~1100 uu/s slide is about 110 uu/s — plainly felt over a long jump,
-	 * but not enough that a player who never learns the timing is playing a different game. This is
-	 * the one place in the movement kit where a flat-ish gain is intended, and it is gated behind a
-	 * read rather than being free, which is the distinction spec v4 §1 is actually drawing.
+	 * 1.10 -> 1.25 THIS PASS. Spec v5 §3, verbatim: "Increase the multiplier gained by perfectly
+	 * timing a jump at the end of a slide." [ASSUMPTION] 1.25 as the starting value. Now that the
+	 * slide is a fixed-length ability on a cooldown (bSlideIsOneShotAbility above), the timed exit
+	 * is the ONLY skill expression sliding has left, so it has to be worth reaching for: 1.25 on a
+	 * ~1100 uu/s slide is ~275 uu/s, which is a third of a walk speed and is plainly a different
+	 * jump rather than a nicer one.
 	 *
-	 * 1.0 turns the window into a no-op without disabling the move. Do not go far past ~1.2 or
-	 * chained slide-jumps become the fastest way to cross the arena.
+	 * The air-strafe falloff (Movement|Air) is what stops this compounding into free arena-crossing
+	 * speed: the launch speed is granted once, and everything past AirStrafeSoftCapSpeed is bought
+	 * against the curve. Check the two together if chained slide-jumps start looking like a
+	 * traversal exploit.
+	 *
+	 * 1.0 turns the window into a no-op without disabling the move. Do not go far past ~1.35.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Speed Bonus (x)", ClampMin = "1.0", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.3"))
-	float SlideJumpWindowSpeedBonus = 1.10f;
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Speed Bonus (x)", ClampMin = "1.0", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
+	float SlideJumpWindowSpeedBonus = 1.25f;
+
+	/**
+	 * Extra JUMP HEIGHT multiplier for a slide-jump taken inside the timing window. New in spec v5
+	 * §3, and the other half of "increase the multiplier gained by perfectly timing a jump".
+	 *
+	 * Height is the channel a player can actually SEE. 25% more planar speed is deniable — it looks
+	 * like a good jump — whereas clearing a box you could not clear a second ago is unambiguous
+	 * feedback that the timing landed. That legibility is the whole reason the window exists, so the
+	 * bonus is paid in both currencies.
+	 *
+	 * Small on purpose: 1.12 is about a fifth of a character height on a standard jump, enough to
+	 * change what geometry is reachable without turning the move into a jetpack. 1.0 makes the
+	 * window purely a speed bonus again.
+	 *
+	 * NAME IS LOAD-BEARING: the movement component resolves it BY NAME as "SlideJumpWindowZBonus".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Height Bonus (x normal jump)", ClampMin = "1.0", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
+	float SlideJumpWindowZBonus = 1.12f;
+
+	// ==========================================================================================
+	// MOVEMENT — MANTLE  (spec v5 §7, new)
+	//
+	// Verbatim: "When jumping on the edge of a raised section, it's glitchy and feels like rubber
+	// banding. Add a mantle, to solve this."
+	//
+	// A mantle is a LEDGE CLIMB: a forward probe finds a surface between the two heights below with
+	// clear space above it, and the pawn is pulled up onto it over MantleDurationSeconds instead of
+	// grinding its capsule against the lip. It must run through the saved-move system like the dash
+	// and the slide, or it becomes a new source of exactly the correction the report describes.
+	//
+	// NOTE FOR WHOEVER TUNES THIS: a mantle does not fix a prediction desync, it hides one. If the
+	// rubber-banding is the client and server disagreeing about the ledge collision, the disagreement
+	// is still there on every ledge the mantle does not trigger on. LedgeGroundGraceSeconds below is
+	// the movement pass's answer to that half; the rest of this block is the climb itself.
+	//
+	// NAMES ARE LOAD-BEARING. Every property here is resolved BY NAME by
+	// UTraceCharacterMovementComponent (TraceMoveKnob::Float / ::Bool), which was written in the same
+	// pass and could not declare them itself. A rename on either side silently falls back to the
+	// literal at the call site — no build error, no warning, just a slider that does nothing. The
+	// defaults below are exactly the movement component's fallbacks, so the two agree even before
+	// DefaultGame.ini is read. Trace.VerifyKnobs prints the verdict.
+	// ==========================================================================================
+
+	/** Master switch. OFF restores the pre-v5 behaviour of jumping and scraping at the lip. */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Mantle Enabled"))
+	bool bMantleEnabled = true;
+
+	/**
+	 * How far ahead of the capsule, in uu, the ledge probe reaches.
+	 *
+	 * Short on purpose: this is "I am at the wall", not "there is a wall over there". The capsule
+	 * radius is 34 uu, so 70 puts the probe about a body-width in front of the chest. Too long and
+	 * the pawn snaps forward onto ledges it was running past; too short and you have to be pressed
+	 * against the lip before it triggers, which is the feel the mantle exists to remove.
+	 * Sane range 50 to 110.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Reach (uu ahead of capsule)", ClampMin = "10.0", ClampMax = "500.0", UIMin = "40.0", UIMax = "200.0"))
+	float MantleReachUU = 70.f;
+
+	/**
+	 * Ledges lower than this, in uu above the pawn's feet, are NOT mantled — the engine's step-up
+	 * already walks the pawn over them, and mantling a kerb reads as the game taking the controls
+	 * away. Keep it at or above UCharacterMovementComponent::MaxStepHeight. Sane range 45 to 70.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Min Ledge Height (uu)", ClampMin = "0.0", ClampMax = "300.0", UIMin = "20.0", UIMax = "120.0"))
+	float MantleMinHeightUU = 55.f;
+
+	/**
+	 * Tallest ledge that may be mantled, in uu above the pawn's feet.
+	 *
+	 * The spec says "hip-to-shoulder height", and 230 is above that on a 176 uu capsule — that is
+	 * deliberate and it is the movement pass's call: the arena's cover boxes are 176 / 352 / 616 uu,
+	 * so a shoulder-height limit would mantle nothing the player could not already step onto and the
+	 * feature would never fire on the geometry that produced the complaint. A jump ADDS to what is
+	 * reachable, so 230 from standing plus a jump covers the 352 tier from a running start.
+	 * Must stay above Min Ledge Height. Sane range 150 to 260.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Max Ledge Height (uu)", ClampMin = "10.0", ClampMax = "600.0", UIMin = "60.0", UIMax = "400.0"))
+	float MantleMaxHeightUU = 230.f;
+
+	/**
+	 * How long the climb takes, in seconds, from trigger to standing on the ledge.
+	 *
+	 * This is a control lockout, so it is the number that decides whether the mantle feels like a
+	 * move or like a cutscene. 0.35 s is roughly a step-and-pull; past ~0.6 s a player being shot at
+	 * mid-climb has time to resent it, and below ~0.2 s it reads as a teleport and stops solving the
+	 * legibility half of the complaint. Sane range 0.25 to 0.5.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Climb Duration (s)", ClampMin = "0.05", ClampMax = "2.0", UIMin = "0.15", UIMax = "0.8"))
+	float MantleDurationSeconds = 0.35f;
+
+	/**
+	 * Fraction of the climb spent going UP before the pawn starts moving forward over the lip.
+	 *
+	 * Never 0 and never 1: the rise has to finish before the pawn crosses the lip or it walks into
+	 * the wall face, and the crossing has to have time left or the climb ends hanging in the air
+	 * over the edge. 0.6 is a rise-then-step. Sane range 0.5 to 0.75.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Up Phase (fraction of duration)", ClampMin = "0.1", ClampMax = "0.9", UIMin = "0.3", UIMax = "0.8"))
+	float MantleUpPhaseFraction = 0.6f;
+
+	/**
+	 * Seconds after a mantle ends before another may start.
+	 *
+	 * Stops a player mantling repeatedly against a wall corner where two ledges are in reach, which
+	 * looks like a stutter rather than a move. Short, because a mantle is traversal and not a
+	 * cooldown ability. Sane range 0.2 to 0.6.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Cooldown (s)", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "2.0"))
+	float MantleCooldownSeconds = 0.35f;
+
+	/**
+	 * Minimum forward speed, uu/s, before a mantle will trigger. This makes the mantle a MOVE rather
+	 * than a proximity effect: you have to be going at the ledge, not standing near it.
+	 *
+	 * 120 is about a seventh of walk speed, so it excludes a pawn drifting into a wall while looking
+	 * around and includes anyone actually running at it. 0 lets a stationary player climb, which
+	 * plays but reads as sticky. Sane range 80 to 250.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Min Forward Speed (uu/s)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "0.0", UIMax = "600.0"))
+	float MantleMinForwardSpeed = 120.f;
+
+	/**
+	 * Seconds of grace during which a pawn that has just lost ground contact is still treated as
+	 * grounded. THE OTHER HALF OF THE LEDGE BUG (spec v5 §7).
+	 *
+	 * "Feels like rubber banding" at a ledge is a one- or two-frame contact blip as the capsule
+	 * crosses a lip: the client and the server disagree about whether the pawn is walking or falling
+	 * for those frames, and the correction that follows is the rubber band. This swallows the blip
+	 * without swallowing anything a player would notice. 0.08 s is about five frames at 60 Hz — far
+	 * too short to let a pawn run off a roof and keep its footing.
+	 *
+	 * 0 restores the exact Demo 5 behaviour, which is what the desync was measured against, so keep
+	 * it as an A/B rather than deleting it. Sane range 0.05 to 0.12.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Ledge Ground Grace (s)", ClampMin = "0.0", ClampMax = "0.5", UIMin = "0.0", UIMax = "0.2"))
+	float LedgeGroundGraceSeconds = 0.08f;
 
 	// --- Slide pose (spec v4 §1) — PROCEDURAL. THERE IS NO STOCK MANNEQUIN SLIDE ANIMATION. -----
 	//
@@ -1439,9 +1858,14 @@ public:
 	 * Fast enough to be a pass across a lane, slow enough that the "first player to contact the core
 	 * picks it up" rule has something to work with — a Core that crosses the field in half a second
 	 * cannot be intercepted by anyone, which deletes the whole point of mode B. 3000 covers ~3000uu
-	 * in the first second before drag and gravity, roughly a dash's worth of reach per second.
+	 * in the first second before gravity, roughly a dash's worth of reach per second.
+	 *
+	 * THIS IS THE BASE, BEFORE WEIGHT, AND IT DELIBERATELY DID NOT MOVE THIS PASS. Spec v5 §4's
+	 * "increase the weight of the core" is CoreMassScale below, which divides this by sqrt(M) at the
+	 * point of use. Lowering this as well would apply the weight twice and the panel would no longer
+	 * describe the throw anybody is playing.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Speed (uu/s) [mode B]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Speed (uu/s, before weight) [mode B]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
 	float CoreThrowSpeed = 3000.f;
 
 	/**
@@ -1461,15 +1885,48 @@ public:
 	float CoreThrowUpBias = 0.12f;
 
 	/**
-	 * World gravity multiplier applied to a Core in flight and rolling loose.
+	 * World gravity multiplier applied to a Core in flight and rolling loose, BEFORE weight.
 	 *
 	 * Below 1 because the field is 33600 uu long: at full gravity a throw that a player can aim
 	 * ploughs into the floor inside a couple of thousand uu, which turns every throw into a short
 	 * dribble and makes interception trivial. 0.55 lets a throw cross useful ground while still
 	 * arcing enough to be read and cut off.
+	 *
+	 * UNCHANGED THIS PASS, like CoreThrowSpeed and for the same reason: CoreMassScale multiplies it
+	 * at the point of use, so moving both would apply spec v5 §4's weight twice.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Gravity Scale [mode B]", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "1.5"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Gravity Scale (before weight) [mode B]", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "1.5"))
 	float CoreThrowGravityScale = 0.55f;
+
+	/**
+	 * MODE B ONLY. HOW HEAVY THE CORE IS IN FLIGHT, relative to the light Core that shipped before
+	 * spec v5. 1.0 is exactly the old flight. THIS IS THE "WEIGHT" KNOB (spec v5 §4).
+	 *
+	 * Verbatim: "For game mode b ONLY, increase the weight of the core".
+	 *
+	 * WHY A SCALE AND NOT A MASS IN KILOGRAMS. The Core has no rigid body and no projectile movement
+	 * component — ATraceCore integrates it by hand — so there is no engine mass field for a kg value
+	 * to feed. "Weight" is therefore a derived model, and it has to be derived rather than faked by
+	 * slowing the throw down, because the note is explicit: "Tune mass/gravity scale, not just
+	 * speed." A Core that is merely slower reads as a bad throw; a Core that is HEAVY falls faster,
+	 * arcs more, carries less far and stops dead when it lands.
+	 *
+	 * So this one number drives five, all inside ATraceCore's mode-B tuning block:
+	 *     gravity scale  x M          the dominant "this thing is dense" cue
+	 *     throw speed    / sqrt(M)    you cannot hurl a heavy object as fast
+	 *     up bias        x M^1.5      the thrower lofts it, so shorter becomes shorter AND arced
+	 *     bounce         / M          heavy things thud instead of skittering to midfield
+	 *     rest speed     x M          and they settle sooner
+	 *
+	 * At 1.8 against the base knobs above, a flat throw measures: launch 3000 -> 2236 uu/s, gravity
+	 * 539 -> 970 uu/s^2, flat range ~5000 -> ~3400 uu, apex ~120 -> ~215 uu.
+	 *
+	 * INERT IN MODE A, which has no thrown Core at all. NAME IS LOAD-BEARING: ATraceCore resolves it
+	 * BY NAME as "CoreMassScale". Sane range 1.2 to 2.5; 1.0 restores the pre-v5 flight exactly,
+	 * which is the A/B the design owner needs to judge the feel.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Core Weight (mass scale, 1 = pre-v5) [mode B]", ClampMin = "0.25", ClampMax = "6.0", UIMin = "1.0", UIMax = "3.0"))
+	float CoreMassScale = 1.8f;
 
 	/**
 	 * Seconds the THROWER alone may not re-take their own throw. Everybody else may take it on the

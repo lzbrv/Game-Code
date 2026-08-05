@@ -1,13 +1,20 @@
 #include "Gameplay/TraceWeaponComponent.h"
 
+#include "Camera/CameraComponent.h"
+#include "Camera/PlayerCameraManager.h"
 #include "CollisionQueryParams.h"
+#include "Containers/Ticker.h"
 #include "HAL/IConsoleManager.h"
+#include "Engine/Engine.h"
+#include "EngineUtils.h"                       // TActorIterator, for the recoil test harness
 #include "Engine/EngineBaseTypes.h"
 #include "Engine/EngineTypes.h"
 #include "Engine/HitResult.h"
 #include "Engine/World.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/GameStateBase.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/SpringArmComponent.h"   // recoil: the camera boom's tick order
 #include "Math/UnrealMathUtility.h"
 
 #include "Core/TraceCharacter.h"
@@ -59,6 +66,19 @@ static TAutoConsoleVariable<int32> CVarTraceDebugHitZones(
 // Off by default and one integer increment per shot when on. Bots fire constantly, so a 90 s match
 // is a few thousand samples, which is more than enough to see a skew.
 // =================================================================================================
+
+/**
+ * Per-shot recoil trace: what the kick was, what it accumulated to, and where the view ended up.
+ *
+ * Spec v5 section 6 asks for recoil that is felt but does not move the bullet, and the only way to
+ * tell those two apart from outside is to print the view state around the moment of fire. Off by
+ * default - one line per shot, and at 150 RPM a firing bot squad is still a lot of lines.
+ */
+static TAutoConsoleVariable<int32> CVarTraceDebugRecoil(
+	TEXT("Trace.DebugRecoil"),
+	0,
+	TEXT("1: log the upward recoil kick, the accumulated climb and the resulting control pitch for every locally fired shot."),
+	ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarTraceShotStats(
 	TEXT("Trace.ShotStats"),
@@ -221,6 +241,44 @@ UTraceWeaponComponent::UTraceWeaponComponent()
 	SetIsReplicatedByDefault(true);
 }
 
+void UTraceWeaponComponent::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// -------------------------------------------------------------------------------------------
+	// TICK ORDER, AND THE ONE-FRAME CAMERA LAG IT FIXES.
+	//
+	// The recoil kick is written to the control rotation from this component's tick. The camera boom
+	// reads the control rotation from ITS tick (USpringArmComponent::UpdateDesiredArmLocation via
+	// GetTargetRotation) and moves the camera to match. Both live in TG_PrePhysics, and component
+	// tick order inside a group is registration order - the boom is created in the character's
+	// constructor, so it ticks FIRST and the camera renders one frame behind every kick.
+	//
+	// MEASURED, before this call existed: Trace.TestRecoil reported aimErr = 0.8000 deg on the frame
+	// after the first shot - exactly one kick - against a project guarantee of 0.0000. The bullet was
+	// never wrong (the shot is sampled and sent BEFORE the kick, so it goes where the crosshair was),
+	// but the probe that guards the guarantee could not tell those two things apart, and neither
+	// could the next person to read its output.
+	//
+	// One prerequisite edge fixes it: the boom updates after this component, so the kick and the
+	// camera that renders it land in the same frame. This is an engine API called on their component
+	// rather than an edit to their file, and it is a no-op for every pawn that is not a local human -
+	// bots have no camera boom worth ordering and no recoil to order it against.
+	// -------------------------------------------------------------------------------------------
+	if (GetRecoilController() == nullptr)
+	{
+		return;
+	}
+
+	if (const AActor* OwnerActor = GetOwner())
+	{
+		if (USpringArmComponent* CameraBoom = OwnerActor->FindComponentByClass<USpringArmComponent>())
+		{
+			CameraBoom->AddTickPrerequisiteComponent(this);
+		}
+	}
+}
+
 ATraceCharacter* UTraceWeaponComponent::GetTraceCharacter() const
 {
 	return Cast<ATraceCharacter>(GetOwner());
@@ -318,41 +376,259 @@ void UTraceWeaponComponent::StartFire()
 void UTraceWeaponComponent::StopFire()
 {
 	bTriggerHeld = false;
-	SetComponentTickEnabled(false);
+
+	// The tick is NOT switched off here any more. Recoil recovery is the whole point of releasing
+	// the trigger, so the component has to keep ticking until the view has been handed back; the
+	// tick disables itself below once there is nothing left to recover.
+	if (RecoilAppliedPitch <= UE_KINDA_SMALL_NUMBER)
+	{
+		SetComponentTickEnabled(false);
+	}
 }
 
 void UTraceWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-	if (!bTriggerHeld)
+	ATraceCharacter* Character = GetTraceCharacter();
+	if (Character == nullptr || !Character->IsLocallyControlled())
 	{
+		// The pawn is gone or is no longer ours: genuine teardown, drop everything. The climb goes
+		// with it — there is no view left to hand back to.
+		bTriggerHeld = false;
+		ResetRecoil();
 		SetComponentTickEnabled(false);
 		return;
 	}
 
-	ATraceCharacter* Character = GetTraceCharacter();
-	if (Character == nullptr || !Character->IsLocallyControlled())
+	if (!Character->IsAlive())
 	{
-		// The pawn is gone or is no longer ours: genuine teardown, drop everything.
-		StopFire();
-		return;
+		// Dead. Forget the climb rather than recovering it: the death camera owns the view now, and
+		// a recovery that keeps writing control rotation would fight it for the whole respawn.
+		ResetRecoil();
+	}
+	else
+	{
+		TickRecoil(DeltaTime);
 	}
 
-	if (!Character->IsAlive() || Character->IsCarrier())
-	{
-		// Temporarily ineligible. Deliberately does NOT clear bTriggerHeld: this component only
-		// hears about the trigger on press and release, so clearing it here means a player who is
-		// still physically holding the button gets nothing after passing the Core away or after
-		// respawning — they have to release and press again for no reason they can see. Keep
-		// ticking, skip firing, and resume the instant the gate reopens.
-		return;
-	}
-
-	if (CanFire())
+	// Firing is gated separately from recoil, and deliberately does NOT clear bTriggerHeld while
+	// ineligible: this component only hears about the trigger on press and release, so clearing it
+	// means a player who is still physically holding the button gets nothing after passing the Core
+	// away or after respawning — they would have to release and press again for no reason they can
+	// see. Keep ticking, skip firing, and resume the instant the gate reopens.
+	if (bTriggerHeld && Character->IsAlive() && !Character->IsCarrier() && CanFire())
 	{
 		FireOnce();
 	}
+
+	if (!bTriggerHeld && RecoilAppliedPitch <= UE_KINDA_SMALL_NUMBER)
+	{
+		SetComponentTickEnabled(false);
+	}
+}
+
+// =================================================================================================
+// UPWARDS RECOIL  (spec v5 section 6)
+// =================================================================================================
+
+APlayerController* UTraceWeaponComponent::GetRecoilController() const
+{
+	const ATraceCharacter* Character = GetTraceCharacter();
+	if (Character == nullptr)
+	{
+		return nullptr;
+	}
+
+	// APlayerController and LOCAL, both load-bearing. A bot's AAIController fails the cast, which is
+	// how bots are kept out of the recoil model; a remote client's proxy pawn on the server fails
+	// IsLocalController, which is how the server is kept from kicking a view it does not own.
+	APlayerController* RecoilController = Cast<APlayerController>(Character->GetController());
+	return (RecoilController != nullptr && RecoilController->IsLocalController()) ? RecoilController : nullptr;
+}
+
+namespace TraceRecoilMath
+{
+	/**
+	 * Folds any DOWNWARD view movement the player made since our last write into the accumulator,
+	 * so their own compensation is not paid back to them as a second kick when the gun settles.
+	 *
+	 * This is the difference between recoil you can fight and recoil that fights back: without it, a
+	 * player who drags 3 degrees down to hold the crosshair on a chest has those 3 degrees taken off
+	 * AGAIN by the recovery and ends the burst aiming at the floor.
+	 *
+	 * Upward player movement is deliberately NOT credited: looking up is not paying off a climb, and
+	 * crediting it would let a player bank recovery by flicking upward between shots.
+	 */
+	void ConsumePlayerCompensation(double CurrentPitch, bool bEnabled, double& InOutAppliedPitch,
+		double& InOutTrackedPitch, bool& bInOutTrackingValid)
+	{
+		if (bInOutTrackingValid && bEnabled)
+		{
+			const double PlayerDelta = CurrentPitch - InOutTrackedPitch;
+			if (PlayerDelta < 0.0)
+			{
+				InOutAppliedPitch = FMath::Max(0.0, InOutAppliedPitch + PlayerDelta);
+			}
+		}
+
+		InOutTrackedPitch = CurrentPitch;
+		bInOutTrackingValid = true;
+	}
+}
+
+void UTraceWeaponComponent::AddRecoilPitch(APlayerController* RecoilController, double DeltaPitchDegrees)
+{
+	if (RecoilController == nullptr || FMath::IsNearlyZero(DeltaPitchDegrees))
+	{
+		return;
+	}
+
+	FRotator ControlRotation = RecoilController->GetControlRotation();
+	const double OldPitch = FRotator::NormalizeAxis(ControlRotation.Pitch);
+
+	// The camera manager's own stops, so the climb cannot push the view past the point the player's
+	// mouse could reach and then owe them a recovery from somewhere that was never applied.
+	double MinPitch = -89.9;
+	double MaxPitch = 89.9;
+	if (const APlayerCameraManager* CameraLimits = RecoilController->PlayerCameraManager)
+	{
+		const double LimitLow = FRotator::NormalizeAxis(CameraLimits->ViewPitchMin);
+		const double LimitHigh = FRotator::NormalizeAxis(CameraLimits->ViewPitchMax);
+		if (LimitLow < LimitHigh)
+		{
+			MinPitch = LimitLow;
+			MaxPitch = LimitHigh;
+		}
+	}
+
+	const double NewPitch = FMath::Clamp(OldPitch + DeltaPitchDegrees, MinPitch, MaxPitch);
+	const double Applied = NewPitch - OldPitch;
+
+	// Read back what LANDED, not what was asked for. Against the pitch stop those differ, and an
+	// accumulator that believes the unclamped figure would owe the player a recovery it never
+	// applied — the view would sink below where they were aiming when the burst ended.
+	if (!FMath::IsNearlyZero(Applied))
+	{
+		ControlRotation.Pitch = NewPitch;
+		RecoilController->SetControlRotation(ControlRotation);
+		RecoilAppliedPitch = FMath::Max(0.0, RecoilAppliedPitch + Applied);
+	}
+
+	RecoilTrackedPitch = NewPitch;
+	bRecoilTrackingValid = true;
+}
+
+void UTraceWeaponComponent::ApplyRecoilKick()
+{
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	if (!Settings.bRecoilEnabled)
+	{
+		return;
+	}
+
+	APlayerController* RecoilController = GetRecoilController();
+	if (RecoilController == nullptr)
+	{
+		return;
+	}
+
+	const double Now = GetLocalTimeSeconds();
+	if ((Now - LastRecoilShotTime) > FMath::Max(0.f, Settings.RecoilBurstResetSeconds))
+	{
+		// A gap long enough to count as a new burst resets the GROWTH only. Whatever climb is still
+		// on the view keeps recovering on its own schedule; the two are independent by design.
+		RecoilBurstShotIndex = 0;
+	}
+	LastRecoilShotTime = Now;
+
+	// Settle up with the player's own movement before adding to the accumulator, or their pull-down
+	// since the last tick would be counted against the kick we are about to apply.
+	TraceRecoilMath::ConsumePlayerCompensation(
+		FRotator::NormalizeAxis(RecoilController->GetControlRotation().Pitch),
+		Settings.bRecoilPlayerCompensationCancels,
+		RecoilAppliedPitch, RecoilTrackedPitch, bRecoilTrackingValid);
+
+	const double Growth = 1.0 + FMath::Max(0.f, Settings.RecoilPitchGrowthPerShot) * static_cast<double>(RecoilBurstShotIndex);
+	const double Headroom = FMath::Max(0.0, static_cast<double>(FMath::Max(0.f, Settings.RecoilMaxPitchDegrees)) - RecoilAppliedPitch);
+
+	// Truncated at the ceiling rather than clamped after the fact, so the view never overshoots and
+	// visibly snaps back down.
+	const double Kick = FMath::Min(FMath::Max(0.f, Settings.RecoilPitchPerShot) * Growth, Headroom);
+	++RecoilBurstShotIndex;
+
+	const double PitchBefore = RecoilTrackedPitch;
+	if (Kick > 0.0)
+	{
+		AddRecoilPitch(RecoilController, Kick);
+	}
+
+	if (CVarTraceDebugRecoil.GetValueOnGameThread() != 0)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Recoil] shot %d of burst: kick %+.3fdeg (growth x%.2f, headroom %.3f) | pitch %+.3f -> %+.3f | climb %.3fdeg | yaw untouched"),
+			RecoilBurstShotIndex, Kick, Growth, Headroom, PitchBefore, RecoilTrackedPitch, RecoilAppliedPitch);
+	}
+}
+
+void UTraceWeaponComponent::TickRecoil(float DeltaTime)
+{
+	if (RecoilAppliedPitch <= UE_KINDA_SMALL_NUMBER)
+	{
+		RecoilAppliedPitch = 0.0;
+		return;
+	}
+
+	APlayerController* RecoilController = GetRecoilController();
+	if (RecoilController == nullptr)
+	{
+		ResetRecoil();
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// NOTE the recovery deliberately runs even when bRecoilEnabled has just been switched OFF: the
+	// climb already on the view has to be handed back, or turning the feature off mid-burst strands
+	// the player looking at the sky.
+	TraceRecoilMath::ConsumePlayerCompensation(
+		FRotator::NormalizeAxis(RecoilController->GetControlRotation().Pitch),
+		Settings.bRecoilPlayerCompensationCancels,
+		RecoilAppliedPitch, RecoilTrackedPitch, bRecoilTrackingValid);
+
+	if (RecoilAppliedPitch <= UE_KINDA_SMALL_NUMBER)
+	{
+		RecoilAppliedPitch = 0.0;
+		return;
+	}
+
+	if ((GetLocalTimeSeconds() - LastRecoilShotTime) < FMath::Max(0.f, Settings.RecoilRecoveryDelaySeconds))
+	{
+		return;
+	}
+
+	// Exponential rather than FMath::FInterpTo's linearisation, so the curve is identical at 30 and
+	// 240 fps — a recovery whose shape depends on frame rate is a feel bug nobody can reproduce.
+	const double Proportional = RecoilAppliedPitch
+		* (1.0 - FMath::Exp(-static_cast<double>(FMath::Max(0.f, Settings.RecoilRecoverySpeed)) * DeltaTime));
+
+	// ...plus a linear floor, because a purely proportional return has an infinite tail and would
+	// leave a fraction of a degree on the view for the whole of the next engagement.
+	const double Floor = static_cast<double>(FMath::Max(0.f, Settings.RecoilRecoveryMinRateDegrees)) * DeltaTime;
+
+	const double Step = FMath::Min(RecoilAppliedPitch, FMath::Max(Proportional, Floor));
+	if (Step > 0.0)
+	{
+		AddRecoilPitch(RecoilController, -Step);
+	}
+}
+
+void UTraceWeaponComponent::ResetRecoil()
+{
+	RecoilAppliedPitch = 0.0;
+	RecoilBurstShotIndex = 0;
+	bRecoilTrackingValid = false;
+	RecoilTrackedPitch = 0.0;
 }
 
 void UTraceWeaponComponent::FireOnce()
@@ -434,6 +710,19 @@ void UTraceWeaponComponent::FireOnce()
 	Character->NotifyWeaponFired();
 
 	ServerFire(FVector_NetQuantize(Origin), FVector_NetQuantizeNormal(Dir), static_cast<float>(FireServerTime));
+
+	// UPWARDS RECOIL, LAST — AND THE ORDER IS THE WHOLE DESIGN (spec v5 section 6).
+	//
+	// Origin and Dir were sampled at the top of this function and have already gone to the server,
+	// so the round that causes this kick flies exactly where the crosshair was when the trigger
+	// broke. The kick moves the control rotation, which is what the NEXT shot will be built from —
+	// that is recoil — and it moves the camera with it, because ATraceCharacter::ResolveAimRotation
+	// and the camera are both pure functions of that same rotation. Hence aimErr stays 0.0000 deg.
+	//
+	// Nothing about this replicates. The server is told a DIRECTION, not a rotation, so there is no
+	// recoil state for the two machines to disagree about and the authoritative trace resolves the
+	// same ray the shooter saw. Client-predicted for feel, invisible to the hit resolution.
+	ApplyRecoilKick();
 }
 
 void UTraceWeaponComponent::PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted) const
@@ -743,3 +1032,268 @@ void UTraceWeaponComponent::MulticastFireEffects_Implementation(FVector_NetQuant
 
 	PlayLocalTracer(Origin, Impact, bImpacted);
 }
+
+#if !UE_BUILD_SHIPPING
+
+// =================================================================================================
+// Trace.TestRecoil — the unattended proof for spec v5 section 6.
+//
+// A screenshot cannot show a recoil pattern and a log line per shot cannot show whether the view
+// came back. So this holds the trigger on the local player for a few seconds, samples the control
+// rotation and the aim agreement throughout, and prints the four numbers that decide whether the
+// feature is right:
+//
+//   PEAK CLIMB      how far above the original aim sustained fire took the view.
+//   RESIDUAL PITCH  where the view sat once recovery had finished. Must land back on ~0.000 or the
+//                   gun is stealing aim from the player one burst at a time.
+//   YAW DRIFT       must be EXACTLY 0.000. This is the "recoil direction 100" claim, measured: a
+//                   purely vertical kick cannot move the yaw, and the model has no yaw term at all.
+//   MAX aimErr      angle between the camera's forward vector and GetAimDirection(), sampled while
+//                   the view is being driven by recoil. The project's standing guarantee is
+//                   0.0000 deg and recoil must not be the thing that breaks it.
+//
+// It drives the same StartFire/StopFire the input layer calls, so it exercises the shipping path
+// rather than a test-only one, and it dumps Trace.ShotStats at the end so the client/server hit
+// agreement for the same burst is printed beside the recoil numbers.
+// =================================================================================================
+
+namespace TraceRecoilTest
+{
+	ATraceCharacter* FindLocalTraceCharacter()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* TestWorld = Context.World();
+			if (TestWorld == nullptr || !TestWorld->IsGameWorld())
+			{
+				continue;
+			}
+
+			if (APlayerController* LocalController = TestWorld->GetFirstPlayerController())
+			{
+				if (ATraceCharacter* LocalCharacter = Cast<ATraceCharacter>(LocalController->GetPawn()))
+				{
+					return LocalCharacter;
+				}
+			}
+		}
+
+		return nullptr;
+	}
+
+	struct FState
+	{
+		double Elapsed = 0.0;
+		double FireSeconds = 1.6;
+		double TotalSeconds = 4.0;
+		double NextSampleAt = 0.0;
+
+		bool bStarted = false;
+		bool bStopped = false;
+
+		double StartPitch = 0.0;
+		double StartYaw = 0.0;
+		double PeakClimb = 0.0;
+		double MaxAimError = 0.0;
+		int32 Samples = 0;
+	};
+
+	void Run(float FireSeconds, float SettleSeconds, float DelaySeconds)
+	{
+		TSharedRef<FState> State = MakeShared<FState>();
+		State->FireSeconds = FMath::Max(0.1f, FireSeconds);
+		State->TotalSeconds = State->FireSeconds + FMath::Max(0.5f, SettleSeconds);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[RecoilTest] in %.1fs: hold the trigger for %.2fs, then measure %.2fs of recovery."),
+			DelaySeconds, State->FireSeconds, State->TotalSeconds - State->FireSeconds);
+
+		// TWO TICKERS, AND THE SECOND ONE IS THE BUG FIX. FTSTicker::AddTicker's delay applies to
+		// EVERY invocation, not just the first, so arming the sampler directly with a delay of 8
+		// makes it run once every eight seconds — the first measured run held the trigger for thirty
+		// seconds and never reached its own StopFire. So the delay arms a one-shot that then arms the
+		// real per-frame sampler with no delay at all.
+		//
+		// The delay itself is what lets one unattended run take several samples at different points
+		// in a match — one while the field is still empty, a later one mid-fight — instead of betting
+		// the whole measurement on whichever two seconds the harness happened to pick.
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State](float /*Delta*/) -> bool
+			{
+				FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State](float DeltaTime) -> bool
+			{
+				ATraceCharacter* LocalCharacter = FindLocalTraceCharacter();
+				UTraceWeaponComponent* Weapon = (LocalCharacter != nullptr)
+					? LocalCharacter->FindComponentByClass<UTraceWeaponComponent>() : nullptr;
+				APlayerController* LocalController = (LocalCharacter != nullptr)
+					? Cast<APlayerController>(LocalCharacter->GetController()) : nullptr;
+
+				if (Weapon == nullptr || LocalController == nullptr)
+				{
+					// No pawn yet (still in warmup, or on the menu map). Wait rather than reporting
+					// a zero, which would read as "recoil does nothing".
+					return true;
+				}
+
+				const FRotator ControlRotation = LocalController->GetControlRotation();
+				const double Pitch = FRotator::NormalizeAxis(ControlRotation.Pitch);
+				const double Yaw = FRotator::NormalizeAxis(ControlRotation.Yaw);
+
+				if (!State->bStarted)
+				{
+					// POINT AT SOMEBODY FIRST. A burst fired at empty air proves the recoil model but
+					// says nothing about the thing that actually has to survive it — the client and the
+					// server resolving the same shot against the same body. Aimed once, at the start,
+					// and deliberately never re-aimed: the whole point is that the climb then walks the
+					// muzzle off the target, which is what recoil IS.
+					//
+					// The candidate is not merely the NEAREST enemy, it is the nearest one the shot
+					// would actually reach. The first version took the nearest and measured ten
+					// consecutive misses at 100% world truncation: on a field this dense the closest
+					// body is usually behind a cover box, and "the client and the server agree that
+					// nobody was hit" is a much weaker statement than the guarantee this is here to
+					// re-measure. Candidates are therefore tested with the SAME resolver the shot
+					// uses, so a target is only chosen if a round sent at it lands on it.
+					const ATraceCharacter* AimTarget = nullptr;
+					double BestDistanceSq = TNumericLimits<double>::Max();
+					if (UWorld* TestWorld = LocalCharacter->GetWorld())
+					{
+						const FVector EyeLocation = LocalCharacter->GetPawnViewLocation();
+						const float ProbeRange = FMath::Max(1.f, UTraceSettings::Get().HitscanRange);
+
+						for (TActorIterator<ATraceCharacter> It(TestWorld); It; ++It)
+						{
+							ATraceCharacter* Candidate = *It;
+							if (Candidate == nullptr || Candidate == LocalCharacter || !Candidate->IsAlive())
+							{
+								continue;
+							}
+
+							const double DistanceSq = FVector::DistSquared(
+								Candidate->GetActorLocation(), LocalCharacter->GetActorLocation());
+							if (DistanceSq >= BestDistanceSq)
+							{
+								continue;
+							}
+
+							const FVector CandidateChest = Candidate->GetActorLocation() + FVector(0.0, 0.0, 40.0);
+							const FVector ProbeDirection = (CandidateChest - EyeLocation).GetSafeNormal();
+							if (ProbeDirection.IsNearlyZero())
+							{
+								continue;
+							}
+
+							FVector ProbeImpact = FVector::ZeroVector;
+							ETraceHitZone ProbeZone = ETraceHitZone::None;
+							const ATraceCharacter* WouldHit = UTraceLagCompensationComponent::ResolveHitscan(
+								TestWorld, LocalCharacter, EyeLocation, ProbeDirection, ProbeRange,
+								0.f, ProbeImpact, ProbeZone);
+
+							if (WouldHit == Candidate)
+							{
+								BestDistanceSq = DistanceSq;
+								AimTarget = Candidate;
+							}
+						}
+					}
+
+					if (AimTarget != nullptr)
+					{
+						const FVector Chest = AimTarget->GetActorLocation() + FVector(0.0, 0.0, 40.0);
+						LocalController->SetControlRotation((Chest - LocalCharacter->GetPawnViewLocation()).Rotation());
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[RecoilTest] aiming at %s, %.0fuu away"),
+							*GetNameSafe(AimTarget), FMath::Sqrt(BestDistanceSq));
+					}
+					else
+					{
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[RecoilTest] no living target in the world; firing at open air (hit agreement will have nothing to compare)."));
+					}
+
+					State->StartPitch = FRotator::NormalizeAxis(LocalController->GetControlRotation().Pitch);
+					State->StartYaw = FRotator::NormalizeAxis(LocalController->GetControlRotation().Yaw);
+					State->bStarted = true;
+					Weapon->StartFire();
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[RecoilTest] start: pitch %+.3f yaw %+.3f"), State->StartPitch, State->StartYaw);
+					return true;   // sample from the next frame, once the aim has settled
+				}
+
+				State->Elapsed += DeltaTime;
+
+				const double Climb = Pitch - State->StartPitch;
+				State->PeakClimb = FMath::Max(State->PeakClimb, Climb);
+
+				double AimError = 0.0;
+				if (LocalCharacter->Camera != nullptr)
+				{
+					const FVector CameraForward = LocalCharacter->Camera->GetForwardVector();
+					const FVector AimDirection = LocalCharacter->GetAimDirection();
+					AimError = FMath::RadiansToDegrees(FMath::Acos(
+						FMath::Clamp(FVector::DotProduct(CameraForward, AimDirection), -1.0, 1.0)));
+					State->MaxAimError = FMath::Max(State->MaxAimError, AimError);
+					++State->Samples;
+				}
+
+				if (State->Elapsed >= State->NextSampleAt)
+				{
+					State->NextSampleAt = State->Elapsed + 0.1;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[RecoilTest] t=%.2f %s pitch=%+.3f climb=%+.3f yawDrift=%+.4f aimErr=%.4fdeg"),
+						State->Elapsed, State->bStopped ? TEXT("RECOVER") : TEXT("FIRING "),
+						Pitch, Climb, Yaw - State->StartYaw, AimError);
+				}
+
+				if (!State->bStopped && State->Elapsed >= State->FireSeconds)
+				{
+					State->bStopped = true;
+					Weapon->StopFire();
+				}
+
+				if (State->Elapsed < State->TotalSeconds)
+				{
+					return true;
+				}
+
+				UE_LOG(LogTraceGame, Display, TEXT("========== TRACE RECOIL TEST =========="));
+				UE_LOG(LogTraceGame, Display,
+					TEXT("RECOIL peak climb   : %+.3f deg above the original aim"), State->PeakClimb);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("RECOIL residual     : %+.4f deg (must settle to ~0.000 — the gun must not keep the aim)"),
+					Pitch - State->StartPitch);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("RECOIL yaw drift    : %+.4f deg (MUST be 0.0000 — 'recoil direction 100' is purely vertical)"),
+					Yaw - State->StartYaw);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("RECOIL max aimErr   : %.4f deg over %d samples (crosshair vs bullet; the standing guarantee is 0.0000)"),
+					State->MaxAimError, State->Samples);
+				UE_LOG(LogTraceGame, Display, TEXT("======================================="));
+
+				TraceShotStats::Dump();
+				return false;   // the sampler is done
+			}));
+
+				return false;   // the delay shot is done; the sampler above is now armed
+			}), DelaySeconds);
+	}
+
+	FAutoConsoleCommand CmdTestRecoil(
+		TEXT("Trace.TestRecoil"),
+		TEXT("Dev only. Trace.TestRecoil [FireSeconds] [SettleSeconds] [DelaySeconds] — hold the local player's trigger, then report peak climb, residual pitch, yaw drift and aimErr."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float FireSeconds = (Args.Num() > 0) ? FCString::Atof(*Args[0]) : 1.6f;
+			const float SettleSeconds = (Args.Num() > 1) ? FCString::Atof(*Args[1]) : 2.4f;
+			const float DelaySeconds = (Args.Num() > 2) ? FMath::Max(0.f, FCString::Atof(*Args[2])) : 0.f;
+			Run(FireSeconds, SettleSeconds, DelaySeconds);
+		}));
+}
+
+#endif // !UE_BUILD_SHIPPING

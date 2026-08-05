@@ -498,24 +498,82 @@ static TAutoConsoleVariable<float> CVarModeBBounce(
 	TEXT("MODE B. Restitution of a loose Core against world geometry. 0 = dead stop, 1 = perfect bounce."),
 	ECVF_Default);
 
+// =================================================================================================
+// MODE B ONLY — THE CORE'S WEIGHT  (spec v5 §4: "increase the weight of the core")
+//
+// The Core has no rigid body and no UProjectileMovementComponent, so there is no `Mass` field to
+// turn up. "Weight" here is therefore a DERIVED model rather than a single physics number, and it is
+// derived because the note is explicit that this must not be done by slowing the throw down alone:
+// "Tune mass/gravity scale, not just speed." A Core that is merely slower reads as a bad throw; a
+// Core that is HEAVY has to fall faster, arc more, carry less far and stop dead when it lands.
+//
+// So one knob, CoreMassScale (M), drives four:
+//
+//   gravity scale  x M          it accelerates downward faster — the dominant "this thing is dense"
+//                               cue, and the one the note names first;
+//   throw speed    / sqrt(M)    you cannot hurl a heavy object as fast. Square-root rather than
+//                               linear so that doubling the weight does not halve the game;
+//   up bias        x M^1.5      the thrower compensates by LOFTING it, which is what turns "shorter"
+//                               into "shorter and more arced" instead of "shorter and flatter";
+//   bounce         / M          heavy things do not skitter. At the default this is ~0.19, i.e. a
+//                               thud, which also makes a missed shot recoverable in front of the
+//                               goal rather than rebounding to midfield;
+//   rest speed     x M          and it settles sooner, for the same reason.
+//
+// MEASURED at the default M = 1.8 against the four base knobs as shipped (3000 uu/s, bias 0.12,
+// gravity 0.55, bounce 0.35), for a flat throw from eye height:
+//
+//                      before        after
+//   launch speed       3000          2236 uu/s
+//   gravity            539           970  uu/s^2
+//   flat range         ~5000         ~3400 uu
+//   apex above launch  ~120          ~215 uu
+//
+// EVERY ONE OF THESE IS MODE B ONLY, and not by a mode test bolted on here: TraceModeBTuning is read
+// from exactly two places, ThrowFromHolder() and ServerTickLooseCore(), and both refuse to run
+// unless IsModeB(). In mode A the Core is a status that never moves under its own power, so there is
+// nothing for a weight to apply to. Mode A cannot observe this block at all.
+//
+// M = 1 restores the pre-v5 flight exactly, which is the A/B the user needs to judge the feel.
+// =================================================================================================
+
+static TAutoConsoleVariable<float> CVarModeBCoreMassScale(
+	TEXT("Trace.ModeB.CoreMassScale"),
+	1.8f,
+	TEXT("MODE B. How heavy the Core is in flight, relative to the light Core that shipped before ")
+	TEXT("spec v5 (1.0 = exactly the old flight). Scales gravity up, throw speed down, loft up and ")
+	TEXT("bounce down together, so the Core reads as heavy rather than merely slow. ")
+	TEXT("UTraceSettings::CoreMassScale."),
+	ECVF_Default);
+
 namespace TraceModeBTuning
 {
-	float ThrowSpeed()        { return Resolve(TEXT("CoreThrowSpeed"),                    CVarModeBThrowSpeed,       200.f, 20000.f); }
-	float ThrowUpBias()       { return Resolve(TEXT("CoreThrowUpBias"),                   CVarModeBThrowUpBias,      0.f,   1.5f); }
-	float GravityScale()      { return Resolve(TEXT("CoreThrowGravityScale"),             CVarModeBThrowGravityScale, 0.f,  4.f); }
+	/** Mode B only. The weight multiplier the five accessors below are derived from. See the block above. */
+	float MassScale()         { return Resolve(TEXT("CoreMassScale"),                     CVarModeBCoreMassScale,    0.25f, 6.f); }
+
+	/** The four BASE values, before weight. Exposed separately so the settings panel still means what it says. */
+	float BaseThrowSpeed()    { return Resolve(TEXT("CoreThrowSpeed"),                    CVarModeBThrowSpeed,       200.f, 20000.f); }
+	float BaseThrowUpBias()   { return Resolve(TEXT("CoreThrowUpBias"),                   CVarModeBThrowUpBias,      0.f,   1.5f); }
+	float BaseGravityScale()  { return Resolve(TEXT("CoreThrowGravityScale"),             CVarModeBThrowGravityScale, 0.f,  4.f); }
+	float BaseBounce()        { return Resolve(TEXT("CoreThrowBounce"),                   CVarModeBBounce,           0.f,   1.f); }
+
+	float ThrowSpeed()        { return FMath::Max(100.f, BaseThrowSpeed() / FMath::Sqrt(MassScale())); }
+	float ThrowUpBias()       { return FMath::Clamp(BaseThrowUpBias() * FMath::Pow(MassScale(), 1.5f), 0.f, 2.f); }
+	float GravityScale()      { return FMath::Clamp(BaseGravityScale() * MassScale(), 0.f, 8.f); }
+	float Bounce()            { return FMath::Clamp(BaseBounce() / MassScale(), 0.f, 1.f); }
+
 	float PickupRadius()      { return Resolve(TEXT("CorePickupRadius"),                  CVarModeBPickupRadius,     20.f,  1500.f); }
 	float SelfPickupLockout() { return Resolve(TEXT("CoreThrowerPickupLockoutSeconds"),   CVarModeBSelfPickupLockout, 0.f,  5.f); }
 	// Lower bound 0, NOT 1: UTraceSettings::CoreLooseResetSeconds documents 0 as "never reset", and a
 	// floor of 1 turned that into the FASTEST reset available. The caller treats <= 0 as "never".
 	float LooseResetSeconds() { return Resolve(TEXT("CoreLooseResetSeconds"),             CVarModeBLooseReset,       0.f,   120.f); }
 	float ThrowCooldown()     { return Resolve(TEXT("CoreThrowCooldownSeconds"),          CVarModeBThrowCooldown,    0.f,   10.f); }
-	float Bounce()            { return Resolve(TEXT("CoreThrowBounce"),                   CVarModeBBounce,           0.f,   1.f); }
 
 	/** Radius of the sphere swept for the loose Core's collision. Matches the orb the player sees. */
 	constexpr float CollisionRadius = 22.f;
 
 	/** Below this speed the Core is declared at rest, so it stops jittering along the floor. */
-	constexpr float RestSpeed = 60.f;
+	float RestSpeed()         { return 60.f * FMath::Clamp(MassScale(), 0.5f, 4.f); }
 
 	/** How often the goal boxes are re-derived. Cheap, and only has to beat the half-time switch. */
 	constexpr float GoalRefreshInterval = 0.5f;
@@ -537,6 +595,7 @@ namespace TraceModeBTuning
 		// Paired with the accessors above; every name here must be the one Resolve() is called with.
 		static const TCHAR* const KnobNames[] =
 		{
+			TEXT("CoreMassScale"),
 			TEXT("CoreThrowSpeed"),
 			TEXT("CoreThrowUpBias"),
 			TEXT("CoreThrowGravityScale"),
@@ -582,6 +641,33 @@ namespace TraceModeBTuning
 				TEXT("shows nothing for them - declare a float of that exact name on UTraceSettings."),
 				BoundCount, TotalCount, *DeadNames);
 		}
+	}
+
+	/**
+	 * Says out loud what the weight model actually resolved to, in the units a designer thinks in.
+	 *
+	 * The point is the last column: a mass scale is an abstraction, and "1.8" tells nobody whether a
+	 * throw still crosses useful ground. The flat range and apex are computed from the same numbers
+	 * the Core integrates with, for a throw from eye height at a flat aim, so a tuning pass can be
+	 * judged against the pitch (33600 uu long) without a stopwatch.
+	 */
+	void LogFlightModel(const UWorld* World)
+	{
+		const float M = MassScale();
+		const float Speed = ThrowSpeed();
+		const float Bias = ThrowUpBias();
+		const float G = FMath::Abs((World != nullptr) ? World->GetGravityZ() : -980.f) * GravityScale();
+
+		// Flat aim from ~150 uu of eye height: up-phase, apex, then the fall back to the floor.
+		const float Vz = Speed * Bias;
+		const float LaunchZ = 150.f;
+		const float Apex = (G > 1.f) ? (Vz * Vz) / (2.f * G) : 0.f;
+		const float Flight = (G > 1.f) ? (Vz / G) + FMath::Sqrt(2.f * (LaunchZ + Apex) / G) : 0.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] core weight: mass x%.2f -> speed %.0f uu/s (base %.0f), gravity %.0f uu/s2 ")
+			TEXT("(scale %.2f), loft %.3f, bounce %.2f | flat throw: apex +%.0f uu, range ~%.0f uu"),
+			M, Speed, BaseThrowSpeed(), G, GravityScale(), Bias, Bounce(), Apex, Speed * Flight);
 	}
 }
 
@@ -939,7 +1025,7 @@ void ATraceCore::Tick(float DeltaSeconds)
 		const FVector CarrierFrom = LastCarrierGoalTestLocation.IsZero() ? CarrierNow : LastCarrierGoalTestLocation;
 		LastCarrierGoalTestLocation = CarrierNow;
 
-		CheckGoalScore(CarrierFrom, CarrierNow, Carrier->GetTeam(), TEXT("carried in"));
+		CheckGoalScore(CarrierFrom, CarrierNow, Carrier->GetTeam(), EGoalMethod::Carried, TEXT("carried in"));
 	}
 	else
 	{
@@ -2046,7 +2132,7 @@ void ATraceCore::GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reaso
 			// From == To: this is a possession change, not a movement, and CheckGoalScore's IsInside
 			// branch is what covers the degenerate segment.
 			const FVector Where = NewHolder->GetActorLocation();
-			CheckGoalScore(Where, Where, NewTeam, GrantReasonNames[ReasonIndex]);
+			CheckGoalScore(Where, Where, NewTeam, EGoalMethod::Granted, GrantReasonNames[ReasonIndex]);
 		}
 		else if (ATraceGameMode* GameMode = World->GetAuthGameMode<ATraceGameMode>())
 		{
@@ -2400,6 +2486,7 @@ void ATraceCore::OnScoringModeChanged()
 	if (IsModeB())
 	{
 		TraceModeBTuning::LogKnobBindings();
+		TraceModeBTuning::LogFlightModel(GetWorld());
 	}
 }
 
@@ -2548,7 +2635,64 @@ bool ATraceCore::GetAttackGoalCentre(const UWorld* World, ETraceTeam AttackingTe
 	return false;
 }
 
-bool ATraceCore::CheckGoalScore(const FVector& From, const FVector& To, ETraceTeam ScoringTeam, const TCHAR* How)
+bool ATraceCore::GetAttackGoalBox(const UWorld* World, ETraceTeam AttackingTeam, FBox& OutBox)
+{
+	ATraceCore* TheCore = ATraceCore::Get(World);
+	if (TheCore == nullptr || !TheCore->IsModeB() || AttackingTeam == ETraceTeam::None)
+	{
+		return false;
+	}
+
+	TheCore->RefreshGoalVolumes(/*bForce=*/false);
+
+	for (const FTraceGoalBox& Goal : TheCore->GoalBoxes)
+	{
+		if (Goal.DefendingTeam != ETraceTeam::None && AttackingTeam == TraceOpposingTeam(Goal.DefendingTeam))
+		{
+			OutBox = Goal.Box;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+float ATraceCore::GetThrowSpeed()
+{
+	return TraceModeBTuning::ThrowSpeed();
+}
+
+float ATraceCore::GetThrowUpBias()
+{
+	return TraceModeBTuning::ThrowUpBias();
+}
+
+float ATraceCore::GetThrowGravityZ(const UWorld* World)
+{
+	const float WorldGravityZ = (World != nullptr) ? World->GetGravityZ() : -980.f;
+	return WorldGravityZ * TraceModeBTuning::GravityScale();
+}
+
+float ATraceCore::GetThrowMuzzleForward()
+{
+	return static_cast<float>(TraceModeBTuning::ThrowMuzzleForward);
+}
+
+int32 ATraceCore::GoalsByMethod[static_cast<int32>(ATraceCore::EGoalMethod::Count)] = {};
+
+static FAutoConsoleCommand GTraceModeBTallyCmd(
+	TEXT("Trace.ModeB.Tally"),
+	TEXT("MODE B. Prints how many goals have been scored by throwing, by carrying in, and by taking possession inside the mouth."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] GOAL TALLY: thrown in %d | carried in %d | possession inside the mouth %d | total %d"),
+			ATraceCore::GoalsByMethod[0], ATraceCore::GoalsByMethod[1], ATraceCore::GoalsByMethod[2],
+			ATraceCore::GoalsByMethod[0] + ATraceCore::GoalsByMethod[1] + ATraceCore::GoalsByMethod[2]);
+	}));
+
+bool ATraceCore::CheckGoalScore(const FVector& From, const FVector& To, ETraceTeam ScoringTeam, EGoalMethod Method,
+	const TCHAR* How)
 {
 	UWorld* World = GetWorld();
 	if (World == nullptr || !HasAuthority() || !IsModeB() || ScoringTeam == ETraceTeam::None)
@@ -2578,12 +2722,33 @@ bool ATraceCore::CheckGoalScore(const FVector& From, const FVector& To, ETraceTe
 			*TraceTeamName(ScoringTeam).ToString(), How,
 			*TraceTeamName(Goal.DefendingTeam).ToString(), *Goal.Box.ToString());
 
+		// THE TALLY IS TAKEN OFF THE SCOREBOARD, NOT OFF THIS TEST.
+		//
+		// ATraceGameMode::NotifyScored DEBOUNCES, and it has to: the same goal can be seen by this
+		// swept test and by ATraceEndzone's 10 Hz poll within a few milliseconds of each other. If the
+		// tally counted attempts rather than awards, a carrier standing inside the mouth after a
+		// debounced award would still be inside it on the next frame and would count again, every
+		// frame, until something moved it. Comparing the score across the call is exact and costs two
+		// reads.
+		const ATraceGameState* GameState = World->GetGameState<ATraceGameState>();
+		const int32 ScoreBefore = (GameState != nullptr) ? GameState->GetScore(ScoringTeam) : 0;
+
 		if (ATraceGameMode* GameMode = World->GetAuthGameMode<ATraceGameMode>())
 		{
 			// NotifyScored resets the field: it kicks off, teleports ten pawns and releases this Core.
 			// Nothing may touch member state after it, which is why every caller of this function
 			// returns immediately on true.
 			GameMode->NotifyScored(ScoringTeam);
+		}
+
+		if (GameState != nullptr && GameState->GetScore(ScoringTeam) > ScoreBefore)
+		{
+			const int32 MethodIndex = FMath::Clamp(static_cast<int32>(Method), 0,
+				static_cast<int32>(EGoalMethod::Count) - 1);
+			++GoalsByMethod[MethodIndex];
+
+			UE_LOG(LogTraceGame, Display, TEXT("[ModeB] goal tally: thrown %d, carried %d, granted %d"),
+				GoalsByMethod[0], GoalsByMethod[1], GoalsByMethod[2]);
 		}
 		return true;
 	}
@@ -2724,7 +2889,7 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 				* TraceModeBTuning::Bounce();
 			LooseVelocity = Reflected;
 
-			if (Reflected.Size() < TraceModeBTuning::RestSpeed)
+			if (Reflected.Size() < TraceModeBTuning::RestSpeed())
 			{
 				LooseVelocity = FVector::ZeroVector;
 				bLooseAtRest = true;
@@ -2745,7 +2910,7 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	// Before the pickup poll, and swept across this frame's motion. The throwing team is the only one
 	// that can score from it, exactly as with an endzone: a Core that flies into the goal its own
 	// team defends is not an own goal, it is a bad throw.
-	if (CheckGoalScore(StartLocation, LooseLocation, LooseFromTeam, TEXT("thrown in")))
+	if (CheckGoalScore(StartLocation, LooseLocation, LooseFromTeam, EGoalMethod::Thrown, TEXT("thrown in")))
 	{
 		return;   // The field has been reset under us. Touch nothing.
 	}
@@ -3083,6 +3248,51 @@ void ATraceCore::TickModeBVerification()
 				return;
 			}
 		}
+		else if (VerifyStep >= 4)
+		{
+			// --- Steps 4 and 5: the BOT paths. -----------------------------------------------------
+			//
+			// Judged on ATraceCore::GoalsByMethod rather than on the scoreboard, because the whole
+			// point of these two steps is WHICH path scored. A carrier that wanders in and a Core that
+			// is thrown in both add one to the same score.
+			const int32 MethodIndex = (VerifyStep == 4)
+				? static_cast<int32>(EGoalMethod::Carried) : static_cast<int32>(EGoalMethod::Thrown);
+
+			if (VerifyStep == 5 && bLoose)
+			{
+				bVerifyThrowSeen = true;   // A throw left the bot's hands. Whether it goes in is next.
+			}
+
+			const int32 TallyNow = GoalsByMethod[MethodIndex];
+			if (TallyNow > VerifyGoalTallyAtStart)
+			{
+				++VerifyPassCount;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ModeBVerify] step %d PASS: a bot scored by %s (%s goals %d -> %d)."),
+					VerifyStep, (VerifyStep == 4) ? TEXT("CARRYING THE CORE IN") : TEXT("THROWING AT THE GOAL"),
+					(VerifyStep == 4) ? TEXT("carried") : TEXT("thrown"), VerifyGoalTallyAtStart, TallyNow);
+
+				VerifyStepDeadline = 0.f;
+				bVerifyThrowSeen = false;
+				++VerifyStep;
+				return;
+			}
+
+			if (bTimedOut)
+			{
+				++VerifyFailCount;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[ModeBVerify] step %d FAIL: no goal by %s inside the window (carrier=%s, loose=%d, ")
+					TEXT("a throw did%s leave)."),
+					VerifyStep, (VerifyStep == 4) ? TEXT("carrying in") : TEXT("throwing at the goal"),
+					*GetNameSafe(Carrier), bLoose ? 1 : 0, bVerifyThrowSeen ? TEXT("") : TEXT(" NOT"));
+
+				VerifyStepDeadline = 0.f;
+				bVerifyThrowSeen = false;
+				++VerifyStep;
+			}
+			return;
+		}
 		else if (!bLoose)
 		{
 			// Step 2 is the goal, and "the Core stopped being loose" is not enough on its own — a
@@ -3301,6 +3511,126 @@ void ATraceCore::TickModeBVerification()
 		return;
 	}
 
+	case 4:
+	case 5:
+	{
+		// =========================================================================================
+		// THE TWO BOT PATHS (spec v5 §4 follow-up).
+		//
+		// Step 4: a bot with the Core, 2800 uu from its own attacking mouth, must RUN IT IN.
+		// Step 5: a bot with the Core, 5200 uu out, must SHOOT AT THE GOAL.
+		//
+		// WHY THIS IS SCRIPTED AND NOT OBSERVED. Both branches are gated on the carrier being within
+		// ballistic range of the mouth, and a measured run says a carrier never is: over three runs
+		// the closest any carrier came to the goal was 16676 uu, against a Core that carries ~7300 uu
+		// on its best arc. So "we watched for ten minutes and never saw it" is evidence about the
+		// pitch, not about the branch — which is exactly the trap the previous pass fell into when it
+		// reported the carry-in path dead. This puts a carrier where the decision is taken, and then
+		// changes NOTHING else: the bot's own UpdateThrow / UpdateCarryInCommit / BehaviourCarryToGoal
+		// make every choice from there, through the same inputs a human's mouse reaches.
+		// =========================================================================================
+		if (!IsValid(Carrier) || !Carrier->IsAlive() || bLoose)
+		{
+			return;   // Between possessions. Try again next tick; the scenario is not on a clock yet.
+		}
+
+		if (Carrier->GetController() == nullptr || Carrier->GetController()->IsPlayerController())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBVerify] step %d SKIPPED: the carrier is not a bot, so there is no bot decision to test."),
+				VerifyStep);
+			++VerifyStep;
+			return;
+		}
+
+		const ETraceTeam Attacker = Carrier->GetTeam();
+
+		FBox GoalBox(ForceInit);
+		if (!GetAttackGoalBox(World, Attacker, GoalBox))
+		{
+			++VerifyFailCount;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step %d FAIL: no goal box resolved for %s."),
+				VerifyStep, *TraceTeamName(Attacker).ToString());
+			++VerifyStep;
+			return;
+		}
+
+		// The MOUTH, not the box centre: the box runs from the goal line back to the end wall.
+		const double FieldCentreX = [World]() -> double
+		{
+			if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World))
+			{
+				return Arena->GetFieldBounds().GetCenter().X;
+			}
+			return 0.0;
+		}();
+
+		const double Sign = (GoalBox.GetCenter().X >= FieldCentreX) ? 1.0 : -1.0;
+		const double MouthX = (Sign > 0.0) ? GoalBox.Min.X : GoalBox.Max.X;
+
+		// 700 uu is inside the carry-in commit band and about a second of running - long enough that
+		// the bot has to CHOOSE to run rather than being dropped on the line, short enough that the
+		// step measures that decision and not the carrier's odds of surviving a defended mouth.
+		// MEASURED: at 2800 and again at 1500 the bot committed (the [BotCarryIn] line proves it) and
+		// was then shot off the Core inside 1.2 s by the two defenders holding the mouth, so those
+		// distances tested the defence, not the branch.
+		// 5200 is outside the commit band and inside throwing range.
+		const double Standoff = (VerifyStep == 4) ? 700.0 : 5200.0;
+		// PICK A SPOT WITH A CLEAR VIEW OF THE MOUTH. The arena is full of cover, and the first
+		// attempt at this step dropped the carrier 58 uu in front of a 3x-height cover box: the bot
+		// correctly refused every shot ("blocked=18 of 18") and the step looked like a broken
+		// decision when it was a broken placement. Try the centre line first, then a few lanes
+		// either side, and take the first one that can actually see what it is being asked to
+		// attack. ECC_Visibility is the channel the bot's own lane test uses.
+		const double GoalZ = GoalBox.Min.Z + (GoalBox.Max.Z - GoalBox.Min.Z) * 0.5;
+		const double CarrierZ = Carrier->GetActorLocation().Z;
+
+		FVector Where(MouthX - Sign * Standoff, GoalBox.GetCenter().Y, CarrierZ);
+		{
+			const FVector MouthPoint(MouthX, GoalBox.GetCenter().Y, GoalZ);
+			FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreVerifyPlacement), false, Carrier);
+
+			static const double LaneOffsets[] = { 0.0, 600.0, -600.0, 1200.0, -1200.0 };
+			for (const double Offset : LaneOffsets)
+			{
+				const FVector Candidate(MouthX - Sign * Standoff, GoalBox.GetCenter().Y + Offset, CarrierZ);
+				const FVector Eye = Candidate + FVector(0.0, 0.0, 64.0);
+				if (!World->LineTraceTestByChannel(Eye, MouthPoint, ECC_Visibility, Params))
+				{
+					Where = Candidate;
+					break;
+				}
+			}
+		}
+
+		Carrier->SetActorLocation(Where, false, nullptr, ETeleportType::TeleportPhysics);
+		LastCarrierGoalTestLocation = Where;   // Do not sweep the teleport itself through the goal.
+
+		if (AController* BotController = Carrier->GetController())
+		{
+			const FVector ToGoal = FVector(MouthX, GoalBox.GetCenter().Y, GoalZ) - Carrier->GetPawnViewLocation();
+			if (!ToGoal.IsNearlyZero())
+			{
+				BotController->SetControlRotation(ToGoal.Rotation());
+			}
+		}
+
+		VerifyGoalTallyAtStart = GoalsByMethod[(VerifyStep == 4)
+			? static_cast<int32>(EGoalMethod::Carried) : static_cast<int32>(EGoalMethod::Thrown)];
+		bVerifyThrowSeen = false;
+		ThrowCooldownEndServerTime = 0.f;   // The scenario is not testing the cooldown.
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] step %d: %s (%s) placed %.0f uu from its goal mouth at %s, facing it - expecting a goal by %s."),
+			VerifyStep, *GetNameSafe(Carrier), *TraceTeamName(Attacker).ToString(), Standoff,
+			*Where.ToCompactString(), (VerifyStep == 4) ? TEXT("CARRYING IN") : TEXT("THROWING"));
+
+		// Generous: the bot has to run 2800 uu (step 4) or wait out a throw cooldown, slew onto a
+		// lofted solution and watch a 2-3 second arc land (step 5).
+		VerifyStepDeadline = Now + ((VerifyStep == 4) ? 16.f : 14.f);
+		return;
+	}
+
 	default:
 	{
 		UE_LOG(LogTraceGame, Display,
@@ -3319,7 +3649,17 @@ bool ATraceCore::GetLooseCoreInterceptPoint(float LeadSeconds, FVector& OutPoint
 		return false;
 	}
 
-	OutPoint = FVector(LooseLocation) + FVector(LooseVelocity) * FMath::Clamp(LeadSeconds, 0.f, 2.f);
+	const float Lead = FMath::Clamp(LeadSeconds, 0.f, 2.f);
+
+	// BALLISTIC, not linear. A straight extrapolation of the velocity was close enough while the Core
+	// flew flat under 55% gravity; under the v5 weight model it falls at roughly twice that rate and
+	// leaves the arc within a quarter of a second, so a chaser led by velocity alone runs at a point
+	// well above where the Core will actually be. Same integration the loose tick performs, one step.
+	const float GravityZ = (bLooseAtRest || GetWorld() == nullptr) ? 0.f : GetThrowGravityZ(GetWorld());
+
+	OutPoint = FVector(LooseLocation)
+		+ FVector(LooseVelocity) * Lead
+		+ FVector(0.0, 0.0, 0.5 * static_cast<double>(GravityZ) * static_cast<double>(Lead) * static_cast<double>(Lead));
 	return true;
 }
 

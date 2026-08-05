@@ -56,6 +56,14 @@
 // See RebuildVisuals() and the block comment above it for the numbers and the justification.
 //
 // Clients only ever *read* TrailPoints: they rebuild a pooled set of meshes from it.
+//
+// THE THIRD, OWNER-ONLY LAYER (spec v5 §2): THE PREDICTED HEAD. See UpdatePredictedHead().
+// The replicated point set always ends BEHIND the carrier — by the head-grace stub on every machine,
+// and by a further round trip of travel on a remote client — so the carrier's own trace visibly
+// stopped short of their feet. The gap is closed by drawing one extra stub from the last drawn point
+// to where the carrier actually is, on the carrier's own machine, visible to the carrier ALONE. It is
+// never lethal and it is never shown to anybody who could be killed by it; the reasoning that keeps
+// the visible == lethal invariant intact is written out in full above UpdatePredictedHead().
 
 #pragma once
 
@@ -105,6 +113,30 @@ struct FTraceGhostRecord
 
 	/** True once a pose was successfully copied into the pooled component holding this record. */
 	bool bPosed = false;
+};
+
+/**
+ * The smear's cross-section and brightness, resolved once per rebuild and handed to every element.
+ *
+ * It exists so the REPLICATED smear and the OWNER-ONLY predicted head stub are built by one function
+ * from one set of numbers. They draw the same shape at the same width for the same reason (the drawn
+ * width is the statement of where the kill volume's edge is), and two copies of that arithmetic would
+ * be two chances for the predicted stub to advertise a boundary the real trace does not have.
+ */
+struct FTraceSmearStyle
+{
+	/** Full lethal width — 2 x TrailRadius. Never a flattering fraction of it. */
+	double Width = 90.0;
+
+	/** Full lethal height — TrailHeight. */
+	double Height = 190.0;
+
+	/** Body band placement within the lethal height. Spans the whole column when ghosts are off. */
+	double BodyCentreFrac = 0.19;
+	double BodyHeightFrac = 0.38;
+
+	/** Multiplies both parts' glow: the ghosts-on dimming, so the mannequins stay the brighter thing. */
+	float LayerScale = 1.f;
 };
 
 /**
@@ -278,6 +310,42 @@ public:
 	/** Spec §3: 4 seconds. Exposed so the bots' intercept planning can agree with the truth. */
 	static float GetTraceLifetimeSeconds();
 
+	// ------------------------------------------------------------------------------------------
+	// THE PREDICTED HEAD (spec v5 §2). Owner-only, cosmetic, never lethal. Read-only accessors so
+	// Trace.Trail.TestHeadGap can measure the thing it claims to have fixed instead of asserting it.
+	// ------------------------------------------------------------------------------------------
+
+	/** True when THIS machine is drawing the owner-only predicted head stub for this trace. */
+	bool IsPredictingLocalHead() const;
+
+	/**
+	 * uu of trace the predicted stub is currently covering: from the newest DRAWN (== lethal) point
+	 * to the carrier's own feet. This is exactly the gap the user reported, so it is exactly what the
+	 * verification harness prints. 0 when nothing is being predicted.
+	 */
+	float GetPredictedHeadLength() const;
+
+	/**
+	 * uu between the newest LETHAL point and the carrier's current position — the gap that would be
+	 * on screen with no prediction. Independent of whether the prediction is running, so a run can
+	 * print the before and the after on one line.
+	 */
+	float MeasureHeadGap() const;
+
+	/**
+	 * THE NUMBER THE USER ACTUALLY REPORTED: how far it is from the carrier to the nearest piece of
+	 * their own trace THAT THEIR OWN CAMERA IS ALLOWED TO SEE, in uu, surface to centre.
+	 *
+	 * MeasureHeadGap() above only knows about the point set, so it cannot see the far bigger half of
+	 * this bug — the owner-only hide, which drew nothing for the newest 850uu without removing a
+	 * single point. This walks the drawn geometry instead and skips anything flagged bOwnerNoSee, so
+	 * it measures the hole in the picture rather than the hole in the data.
+	 *
+	 * @param bIncludePredictedHead  false answers "what would it be with the prediction switched
+	 *                               off", so one line can carry both halves of the fix.
+	 */
+	float MeasureOwnerVisibleGap(bool bIncludePredictedHead) const;
+
 private:
 	// ------------------------------------------------------------------------------------------
 	// Server state
@@ -405,6 +473,28 @@ private:
 	TArray<float> SmearAppliedGlowScale;
 
 	// ------------------------------------------------------------------------------------------
+	// THE PREDICTED HEAD (spec v5 §2) — a SECOND, TINY SMEAR POOL, owner-only.
+	//
+	// Deliberately not slots at the end of the main pool. The main pool is rebuilt only when the
+	// replicated point set changes; the predicted stub has to be re-placed EVERY FRAME because it
+	// tracks a moving pawn, and putting it in the same array would mean either a full 96-element
+	// rebuild every frame or index bookkeeping that the "grow one whole element at a time" invariant
+	// in EnsureSmearElement was written to make impossible. Four elements is the whole cost.
+	// ------------------------------------------------------------------------------------------
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> PredictedSmearMeshes;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> PredictedSmearMaterials;
+
+	TArray<float> PredictedSmearBaseGlow;
+	TArray<float> PredictedSmearAppliedGlowScale;
+
+	/** uu the predicted stub covered on the last frame it ran. 0 when it is not drawing. */
+	float PredictedHeadLength = 0.f;
+
+	// ------------------------------------------------------------------------------------------
 	// THE GHOSTS (spec v4 §2). Pooled posed Mannequins.
 	// ------------------------------------------------------------------------------------------
 
@@ -529,14 +619,55 @@ private:
 	void UpdateVisuals();
 	void RebuildVisuals();
 
+	/** The cross-section every smear element is built from. One resolution per rebuild. */
+	FTraceSmearStyle MakeSmearStyle() const;
+
+	/**
+	 * Places one two-part smear element (body + head band) across [SegStart, SegEnd] into @p Pieces.
+	 *
+	 * Shared by the replicated smear and by the owner-only predicted head, so the predicted stub is
+	 * the same shape, at the same width, from the same numbers as the trace it continues.
+	 *
+	 * @param GlowScale         age fade x invulnerability step, applied on top of the style's LayerScale.
+	 * @param bOnlyOwnerSees    true ONLY for the predicted head: hides the piece from every viewer
+	 *                          except the carrier it belongs to. See UpdatePredictedHead().
+	 */
+	void PlaceSmearSegment(
+		TArray<TObjectPtr<UStaticMeshComponent>>& Pieces,
+		TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
+		TArray<float>& BaseGlowOut,
+		TArray<float>& AppliedScaleOut,
+		int32 ElementIndex,
+		const FVector& SegStart,
+		const FVector& SegEnd,
+		double BackOverlap,
+		double ForwardOverlap,
+		const FTraceSmearStyle& Style,
+		float GlowScale,
+		bool bOnlyOwnerSees);
+
 	/** Layer 1: the continuous body-shaped extrusion along every lethal segment. */
-	void RebuildSmear(int32 LethalPointCount, int32 FirstOwnerHiddenPoint, float InvulnerableScale);
+	void RebuildSmear(int32 LethalPointCount, float InvulnerableScale);
 
 	/**
 	 * Layer 2: retire the after-images whose stretch of trace has expired, drop a new one when the
 	 * path has moved on far enough, and push colour/brightness at all of them.
 	 */
-	void RebuildPoseGhosts(int32 LethalPointCount, int32 FirstOwnerHiddenPoint, float InvulnerableScale);
+	void RebuildPoseGhosts(int32 LethalPointCount, float InvulnerableScale);
+
+	/**
+	 * Spec v5 §2. Every frame, on the carrier's OWN machine only: continue the drawn trace from the
+	 * newest drawn point to where the carrier actually is now, so their trace reaches their feet.
+	 * Read the block comment above the implementation before touching it — it is the argument that
+	 * this cannot make anything visible-but-not-lethal for a player who could be killed by it.
+	 */
+	void UpdatePredictedHead();
+
+	/** Hides the predicted stub and zeroes its measurement. Cheap and safe to call every frame. */
+	void HidePredictedHead();
+
+	/** Grows the predicted-head pool to cover element @p ElementIndex. False once its cap is hit. */
+	bool EnsurePredictedElement(int32 ElementIndex);
 
 	/** True when a posed Mannequin ghost can actually be drawn (art present AND material usable). */
 	bool AreCharacterGhostsEnabled() const;
@@ -552,6 +683,10 @@ private:
 	 * Local, cosmetic anti-whiteout guard: dims an after-image's emissive as the LOCAL camera gets
 	 * close to it, so an eye inside the trace does not take an unattenuated unlit emissive slab at
 	 * full frame width. Never changes the lethal volume. Runs every frame — see the implementation.
+	 *
+	 * It ALSO owns the owner-only near cull (the last resort behind the fade), for the same reason it
+	 * owns the fade: both are functions of where the local camera is this frame, and the camera moves
+	 * continuously while the geometry does not.
 	 */
 	void ApplyProximityGlowFade();
 

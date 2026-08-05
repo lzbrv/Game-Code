@@ -22,6 +22,7 @@
 #include "Trace.h"                    // LogTraceGame
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"
+#include "UI/TraceNetworking.h"
 
 // =================================================================================================
 // Palette and layout
@@ -43,9 +44,15 @@ namespace TraceMenuStyle
 	static const FLinearColor Ink       (0.90f,  0.97f,  1.00f,  1.00f);
 	static const FLinearColor InkDim    (0.42f,  0.58f,  0.66f,  1.00f);
 
-	/** Row geometry, in reference pixels. */
-	static constexpr float RowHeight  = 62.f;
-	static constexpr float RowSpacing = 78.f;
+	/**
+	 * Row geometry, in reference pixels.
+	 *
+	 * Spacing came down from 78 to 71 when JOIN was added: six rows at the old pitch put the bottom
+	 * of the console panel under the footer's dark strip at 1080p, which is the kind of collision
+	 * that only shows up on somebody else's monitor.
+	 */
+	static constexpr float RowHeight  = 60.f;
+	static constexpr float RowSpacing = 71.f;
 	static constexpr float RowPadX    = 30.f;
 
 	/**
@@ -157,8 +164,30 @@ void ATraceMenuHUD::BeginPlay()
 	// there is nothing to reconcile — this is a load, not a second copy.
 	ScoringMode = TraceScoring::GetCurrentSetting();
 
+	// Bound here rather than in a module startup because both HUDs need it and neither owns the
+	// other; the call is idempotent and the handlers outlive every world. Without it a failed join
+	// is completely silent, which is the single thing that made the reported bug undiagnosable from
+	// the player's chair.
+	TraceNet::BindFailureHandlers();
+
+	// The address the player typed last time, straight off disk. Empty on a fresh install, which is
+	// exactly when the prompt falls back to showing an example instead.
+	LastJoinAddress = TraceNet::LoadLastJoinAddress();
+
 	UE_LOG(LogTraceGame, Log, TEXT("Title screen up. Difficulty %s, %s."),
 		*TraceDifficulty::ToDisplayName(Difficulty), *TraceScoringModeLabel(ScoringMode));
+
+	// The address other machines dial to reach this one, and whether we can actually bind it. Logged
+	// at Display on every title screen: when a playtest fails to connect this is the first line
+	// anyone will be asked for, and it must already be in the log they have.
+	{
+		TArray<FString> LocalAddresses;
+		TraceNet::GetLocalAddresses(LocalAddresses);
+		UE_LOG(LogTraceGame, Display, TEXT("[Net] This machine hosts on %s (UDP %d %s). All addresses: %s"),
+			*TraceNet::GetHostEndpoint(), TraceNet::DefaultPort,
+			TraceNet::IsListenPortAvailable() ? TEXT("free") : TEXT("IN USE"),
+			*FString::Join(LocalAddresses, TEXT(", ")));
+	}
 
 	// See AcceptUnlockTime in the header. Long enough to outlast window creation and focus
 	// acquisition, short enough that a player reaching straight for Enter never notices it.
@@ -170,7 +199,9 @@ void ATraceMenuHUD::BeginPlay()
 
 #if !UE_BUILD_SHIPPING
 	TraceAutoShot::Arm(this, TEXT("Menu"));
+	TraceAutoShot::ArmDeferredExec(this, TEXT("Menu"));
 	ArmAutoPlay();
+	ArmAutoJoin();
 	ArmAutoSettings();
 #endif
 }
@@ -277,6 +308,60 @@ void ATraceMenuHUD::ArmAutoPlay()
 		FTimerDelegate::CreateWeakLambda(this, [this]() { StartMatch(); }), DelaySeconds, false);
 }
 
+void ATraceMenuHUD::ArmAutoJoin()
+{
+	float DelaySeconds = 0.f;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("TraceAutoJoin="), DelaySeconds))
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	FString AddressArg;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("TraceJoinAddress="), AddressArg))
+	{
+		// No address given: fall back to the remembered one, so a repeat run of the acceptance test
+		// needs one flag rather than two.
+		AddressArg = LastJoinAddress;
+	}
+	if (AddressArg.IsEmpty())
+	{
+		AddressArg = FString::Printf(TEXT("127.0.0.1:%d"), TraceNet::DefaultPort);
+	}
+
+	DelaySeconds = FMath::Max(0.01f, DelaySeconds);
+	UE_LOG(LogTraceGame, Display, TEXT("[AutoJoin] Will JOIN '%s' in %.2fs."), *AddressArg, DelaySeconds);
+
+	World->GetTimerManager().SetTimer(AutoJoinTimer,
+		FTimerDelegate::CreateWeakLambda(this, [this, AddressArg]()
+	{
+		// Through the real rows, not around them. Selecting JOIN, opening the real prompt and
+		// filling the real field is what makes this a test of the menu rather than a test of
+		// ClientTravel.
+		Selected = ETraceMenuRow::Join;
+		OpenJoinPrompt();
+		JoinEntry.SetText(AddressArg);
+
+		// Submitted on a SECOND timer rather than in this callback, so the filled prompt is on
+		// screen for a couple of seconds. That is the only window in which -TraceAutoShot can
+		// photograph it, and a screen with no automated capture is a screen that silently rots.
+		if (UWorld* PromptWorld = GetWorld())
+		{
+			PromptWorld->GetTimerManager().SetTimer(AutoJoinSubmitTimer,
+				FTimerDelegate::CreateWeakLambda(this, [this]() { ConfirmJoin(); }), 2.5f, false);
+		}
+		else
+		{
+			ConfirmJoin();
+		}
+	}), DelaySeconds, false);
+}
+
 void ATraceMenuHUD::ArmAutoSettings()
 {
 	float DelaySeconds = 0.f;
@@ -359,7 +444,7 @@ void ATraceMenuHUD::MoveSelection(int32 Delta)
 {
 	// The overlay polls its own input (see FTraceOptionsMenu). These handlers are still wired to the
 	// controller's key bindings and would otherwise move the selection UNDERNEATH the settings panel.
-	if (OptionsMenu.IsOpen() || bTravelling || Delta == 0)
+	if (OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling || Delta == 0)
 	{
 		return;
 	}
@@ -370,7 +455,7 @@ void ATraceMenuHUD::MoveSelection(int32 Delta)
 
 void ATraceMenuHUD::AdjustSelection(int32 Delta)
 {
-	if (OptionsMenu.IsOpen() || bTravelling || Delta == 0)
+	if (OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling || Delta == 0)
 	{
 		return;
 	}
@@ -399,7 +484,7 @@ bool ATraceMenuHUD::AcceptsActivation() const
 
 void ATraceMenuHUD::ActivateSelection()
 {
-	if (OptionsMenu.IsOpen() || bTravelling)
+	if (OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling)
 	{
 		return;
 	}
@@ -418,6 +503,10 @@ void ATraceMenuHUD::ActivateSelection()
 	{
 	case ETraceMenuRow::Play:
 		StartMatch();
+		break;
+
+	case ETraceMenuRow::Join:
+		OpenJoinPrompt();
 		break;
 
 	case ETraceMenuRow::Difficulty:
@@ -451,9 +540,10 @@ void ATraceMenuHUD::ActivateSelection()
 
 void ATraceMenuHUD::CancelPressed()
 {
-	if (OptionsMenu.IsOpen())
+	if (OptionsMenu.IsOpen() || IsJoinPromptOpen())
 	{
-		// The overlay owns Escape while it is up, and closes itself on it.
+		// Both overlays own Escape while they are up and close themselves on it. Letting this
+		// through as well would close the prompt AND move the selection to QUIT underneath it.
 		return;
 	}
 
@@ -528,7 +618,7 @@ void ATraceMenuHUD::MousePressed()
 {
 	PressedRow = INDEX_NONE;
 
-	if (OptionsMenu.IsOpen() || bTravelling || !bRowRectsValid)
+	if (OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling || !bRowRectsValid)
 	{
 		return;
 	}
@@ -579,7 +669,7 @@ void ATraceMenuHUD::MouseReleased()
 	const int32 Armed = PressedRow;
 	PressedRow = INDEX_NONE;
 
-	if (OptionsMenu.IsOpen() || bTravelling || Armed == INDEX_NONE)
+	if (OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling || Armed == INDEX_NONE)
 	{
 		return;
 	}
@@ -619,19 +709,122 @@ void ATraceMenuHUD::StartMatch()
 	TraceDifficulty::ApplyToSettings(Difficulty);
 	TraceScoring::ApplyToSettings(ScoringMode);
 
+	// A new attempt: whatever went wrong last time is no longer what is happening now.
+	TraceNet::ClearFailure();
+
+	// THE FIX (spec v5 §0). `listen` is a bare, valueless URL option, and its presence is the ONLY
+	// thing that makes UEngine::LoadMap call UWorld::Listen and stand up a net driver on UDP 7777.
+	// Without it the shipped build produced a standalone match with nothing bound, which is why two
+	// machines that both pressed PLAY could never see each other however good their VPN was.
+	//
+	// It is unconditional on purpose. A listen server with no clients ticks identically to
+	// standalone for the player sitting at it, so there is no single-player cost to pay and
+	// therefore no reason to make hosting a mode somebody has to remember to choose.
+	//
 	// NOTE THE SEPARATOR. UE URL options are chained with '?', NOT with '&' — writing "a=1&b=2"
 	// parses as ONE option called "a" whose value is "1&b=2", so the first appears to work and the
 	// second is silently ignored. That has already happened once in this project (see
 	// ATraceGameMode::InitGame), and it is exactly the kind of bug that makes an A/B toggle look
 	// like it does nothing.
-	const FString Options = FString::Printf(TEXT("%s=%s?%s=%s"),
+	const FString Options = FString::Printf(TEXT("%s=%s?%s=%s?listen"),
 		TraceDifficulty::UrlOption, *TraceDifficulty::ToUrlValue(Difficulty),
 		TraceScoringModeUrlOption, *TraceScoringModeToUrlValue(ScoringMode));
 
-	UE_LOG(LogTraceGame, Log, TEXT("Title screen: PLAY -> %s?%s  (%s)"),
-		TraceMaps::Arena, *Options, *TraceScoringModeLabel(ScoringMode));
+	// Checked BEFORE travelling, and the reason is subtle enough to be worth spelling out.
+	//
+	// MEASURED, not assumed: with another copy of the game already on 7777, UIpNetDriver does NOT
+	// fail — it walks up and binds the next free port, and the run logged "IpNetDriver listening on
+	// port 7778". The match is perfectly joinable; it is just joinable at an address that is not the
+	// one the title screen printed. A host reading ":7777" off their own screen and reciting it down
+	// a voice call would send everybody to a port nothing is listening on, and the join would time
+	// out for reasons neither end could see. So the warning is about the PORT MOVING, not about
+	// hosting failing.
+	//
+	// The in-match HUD is the authority and is already correct: TraceNet::DescribeConnection reads
+	// UNetDriver::LocalAddr, so the top-right chip shows the port that was actually bound.
+	const bool bPortFree = TraceNet::IsListenPortAvailable();
+	if (!bPortFree)
+	{
+		TraceNet::ReportFailure(
+			FString::Printf(TEXT("UDP %d IS BUSY - HOSTING ON A DIFFERENT PORT"), TraceNet::DefaultPort),
+			// ASCII only. These strings are drawn with the engine's built-in BITMAP fonts, whose
+			// glyph pages do not cover an em dash — it comes out as a box or as nothing at all.
+			TEXT("ANOTHER COPY OF TRACE ALREADY HOLDS 7777. THE MATCH IS STILL JOINABLE, BUT THE "
+			     "ADDRESS TO SHARE IS THE ONE SHOWN TOP-RIGHT ON THE HUD - IT WILL NOT END IN 7777."));
+	}
+
+	TravelCaption = bPortFree
+		? FString::Printf(TEXT("HOSTING ON %s"), *TraceNet::GetHostEndpoint())
+		: FString(TEXT("PORT 7777 IS BUSY - CHECK THE HUD FOR THE REAL ADDRESS"));
+
+	UE_LOG(LogTraceGame, Display, TEXT("Title screen: PLAY -> %s?%s  (%s)  hosting on %s, port %s"),
+		TraceMaps::Arena, *Options, *TraceScoringModeLabel(ScoringMode),
+		*TraceNet::GetHostEndpoint(), bPortFree ? TEXT("free") : TEXT("IN USE"));
 
 	UGameplayStatics::OpenLevel(this, FName(TraceMaps::Arena), /*bAbsolute=*/true, Options);
+}
+
+// -------------------------------------------------------------------------------------------
+// JOIN
+// -------------------------------------------------------------------------------------------
+
+void ATraceMenuHUD::OpenJoinPrompt()
+{
+	if (bTravelling || OptionsMenu.IsOpen())
+	{
+		return;
+	}
+
+	JoinError.Reset();
+	JoinErrorText.Reset();
+
+	// Pre-filled with the last address that worked, so the common case — the same four people
+	// playing again tomorrow — is Enter, Enter. A fresh install gets an empty field and the example
+	// text under it instead of a plausible-looking wrong address.
+	JoinEntry.Begin(LastJoinAddress);
+
+	UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] JOIN prompt opened (prefill '%s')."), *LastJoinAddress);
+}
+
+void ATraceMenuHUD::ConfirmJoin()
+{
+	const FString Typed = JoinEntry.GetText();
+	const FString Address = TraceNet::NormalizeJoinAddress(Typed);
+
+	if (Address.IsEmpty())
+	{
+		// Kept in the field rather than bounced back to the menu: an empty error that closes the
+		// prompt is how a player concludes the button does nothing.
+		JoinError = TEXT("ENTER AN ADDRESS, e.g.  100.101.102.103:7777");
+		JoinErrorText = Typed;
+		return;
+	}
+
+	APlayerController* PC = GetOwningPlayerController();
+	if (PC == nullptr)
+	{
+		JoinError = TEXT("NO LOCAL PLAYER - CANNOT CONNECT");
+		JoinErrorText = Typed;
+		return;
+	}
+
+	// Remembered on the ATTEMPT, not on success. A join that times out is overwhelmingly likely to
+	// be retried against the same address once the host's firewall is fixed, and making the player
+	// retype it in exactly that situation is the opposite of helpful.
+	LastJoinAddress = Address;
+	TraceNet::SaveLastJoinAddress(Address);
+
+	TraceNet::ClearFailure();
+	JoinEntry.End();
+
+	bTravelling = true;
+	TravelCaption = FString::Printf(TEXT("CONNECTING TO %s"), *Address);
+
+	UE_LOG(LogTraceGame, Display, TEXT("Title screen: JOIN -> ClientTravel('%s', TRAVEL_Absolute)."), *Address);
+
+	// TRAVEL_Absolute: a join is not relative to the map we are standing on. With TRAVEL_Relative the
+	// engine would resolve the address against the menu map's package path and produce nonsense.
+	PC->ClientTravel(Address, TRAVEL_Absolute);
 }
 
 void ATraceMenuHUD::OpenOptions()
@@ -695,7 +888,7 @@ void ATraceMenuHUD::DrawHUD()
 	// Skipped entirely while the overlay is up: the pointer is over the SETTINGS panel then, and
 	// tracking it here would quietly re-select whichever title row happened to be underneath, so
 	// closing the overlay would drop the player on a different row than the one they left.
-	if (APlayerController* PC = OptionsMenu.IsOpen() ? nullptr : GetOwningPlayerController())
+	if (APlayerController* PC = (OptionsMenu.IsOpen() || IsJoinPromptOpen()) ? nullptr : GetOwningPlayerController())
 	{
 		float MouseX = 0.f;
 		float MouseY = 0.f;
@@ -739,9 +932,37 @@ void ATraceMenuHUD::DrawHUD()
 		}
 	}
 
+	// The address field polls the keyboard itself, for the reasons in FTraceTextEntry's header, and
+	// has to be serviced before anything is drawn so that the caret and the text on screen are this
+	// frame's, not last frame's.
+	if (JoinEntry.IsActive())
+	{
+		JoinEntry.Poll(GetOwningPlayerController(), Now);
+
+		if (JoinEntry.ConsumeSubmit())
+		{
+			ConfirmJoin();
+		}
+		else if (JoinEntry.ConsumeCancel())
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] JOIN prompt cancelled."));
+			JoinEntry.End();
+			JoinError.Reset();
+			JoinErrorText.Reset();
+		}
+		else if (!JoinError.IsEmpty() && JoinEntry.GetText() != JoinErrorText)
+		{
+			// Any edit clears the complaint. An error that outlives the text it was about is worse
+			// than no error at all — the player fixes the address and the screen still calls it wrong.
+			JoinError.Reset();
+			JoinErrorText.Reset();
+		}
+	}
+
 	DrawBackdrop();
 	DrawGridFloor();
 	DrawWordmark();
+	DrawAddressChip();
 	DrawMenuRows();
 	DrawFooter();
 
@@ -750,6 +971,16 @@ void ATraceMenuHUD::DrawHUD()
 	DrawBezel();
 	DrawCursor();
 	DrawTravelOverlay();
+
+	// Over everything except the settings overlay, which cannot be open at the same time. A no-op
+	// while the field is inactive.
+	DrawJoinPrompt();
+
+	// AFTER the join prompt, not before. Measured from a screenshot: drawn earlier, the prompt's
+	// 78%-black scrim sat on top of the banner and turned the one message the player most needs to
+	// read into a dim brown smudge. The failure has to outrank every modal on this screen — the
+	// commonest moment to see it is the moment you are about to retype the address that just failed.
+	DrawFailureBanner();
 
 	// Last of all, over everything, including the travel overlay. Tick() is a no-op while closed.
 	OptionsMenu.Tick(this, GetOwningPlayerController(), ViewW, ViewH, UIScale, Now);
@@ -874,6 +1105,215 @@ void ATraceMenuHUD::DrawWordmark()
 
 	DrawTextCentered(TEXT("5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
 		TraceMenuStyle::InkDim, CX, RuleY + (18.f * UIScale), FontSmall, 1.15f * UIScale);
+
+	// Remembered for DrawAddressChip, which has to sit exactly under the tagline and must not
+	// re-derive the wordmark's geometry to find out where that is.
+	TaglineBottomY = RuleY + (18.f * UIScale) + MeasureHeight(TEXT("X"), FontSmall, 1.15f * UIScale);
+}
+
+void ATraceMenuHUD::DrawAddressChip()
+{
+	// THE SINGLE AFFORDANCE THAT REMOVES THE MOST COMMON FAILURE.
+	//
+	// The Demo 5 report was "we couldn't load into the same instance ... I'm unsure if we were
+	// actually on a working network-client setup". Half of that uncertainty was not knowing what to
+	// type at each other. So the address is on the title screen, before anything is pressed, at a
+	// size somebody can read it off a screen and say it out loud — not buried in a doc, not behind
+	// `tailscale ip -4`, not in a log.
+	const FString Endpoint = TraceNet::GetHostEndpoint();
+	const FString Caption = TEXT("YOUR ADDRESS");
+
+	const float CX = ViewW * 0.5f;
+	const float CaptionScale = 1.0f * UIScale;
+	const float ValueScale = 1.45f * UIScale;
+
+	const float CaptionW = MeasureWidth(Caption, FontSmall, CaptionScale);
+	const float ValueW = MeasureWidth(Endpoint, FontMedium, ValueScale);
+	const float ValueH = MeasureHeight(Endpoint, FontMedium, ValueScale);
+
+	const float Gap = 14.f * UIScale;
+	const float PadX = 18.f * UIScale;
+	const float PadY = 7.f * UIScale;
+
+	const float ChipW = CaptionW + Gap + ValueW + PadX * 2.f;
+	const float ChipH = ValueH + PadY * 2.f;
+	const float ChipX = CX - ChipW * 0.5f;
+	const float ChipY = TaglineBottomY + (14.f * UIScale);
+
+	DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 0.90f), ChipX, ChipY, ChipW, ChipH);
+
+	const float Edge = FMath::Max(1.f, 1.2f * UIScale);
+	const FLinearColor EdgeColor = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.45f);
+	DrawRect(EdgeColor, ChipX, ChipY, ChipW, Edge);
+	DrawRect(EdgeColor, ChipX, ChipY + ChipH - Edge, ChipW, Edge);
+	DrawRect(EdgeColor, ChipX, ChipY, Edge, ChipH);
+	DrawRect(EdgeColor, ChipX + ChipW - Edge, ChipY, Edge, ChipH);
+
+	const float CaptionY = ChipY + (ChipH - MeasureHeight(Caption, FontSmall, CaptionScale)) * 0.5f;
+	DrawText(Caption, TraceMenuStyle::InkDim, ChipX + PadX, CaptionY, FontSmall, CaptionScale);
+
+	// Bright cyan, and it is the only place on this screen a raw number is allowed to be the loudest
+	// thing in its own box.
+	DrawText(Endpoint, TraceMenuStyle::Cyan, ChipX + PadX + CaptionW + Gap, ChipY + PadY, FontMedium, ValueScale);
+
+	// MEASURED CAVEAT. If something else already holds UDP 7777, UIpNetDriver does not fail — it
+	// binds the next free port instead (observed: "IpNetDriver listening on port 7778"). The match is
+	// still joinable, but the number in the chip above is then a lie, and a host reciting it would
+	// send everybody to a port nothing is listening on. Saying so here, before PLAY, is cheaper than
+	// the ten minutes of confusion on the other end.
+	if (!TraceNet::IsDefaultPortFreeCached())
+	{
+		DrawTextCentered(TEXT("PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"),
+			TraceMenuStyle::Amber, CX, ChipY + ChipH + (4.f * UIScale), FontSmall, 0.95f * UIScale);
+	}
+}
+
+void ATraceMenuHUD::DrawFailureBanner()
+{
+	FString Headline;
+	FString Detail;
+	double AgeSeconds = 0.0;
+	if (!TraceNet::GetLastFailure(Headline, Detail, AgeSeconds))
+	{
+		return;
+	}
+
+	// A minute is a long time for a banner, and it is deliberate. The failure that matters here
+	// happens while the player is looking at a DIFFERENT screen — the join is in flight, the world is
+	// being torn down — and they arrive back at the title screen some seconds later. A message that
+	// had already expired by then would be exactly as useless as the silence it replaces.
+	constexpr double VisibleSeconds = 60.0;
+	if (AgeSeconds > VisibleSeconds)
+	{
+		return;
+	}
+
+	const float Fade = static_cast<float>(FMath::Clamp((VisibleSeconds - AgeSeconds) / 6.0, 0.0, 1.0));
+
+	// Amber, not a new red. This screen has exactly two hues and amber is already the one that means
+	// danger (see the palette note at the top of this file); introducing a third would cost more than
+	// the extra half-step of urgency is worth.
+	// Scales raised from 1.15 / 0.95 after reading a capture at 1280x720: the headline was a 9px
+	// strip and the engine failure code under it was genuinely unreadable. This is the one message
+	// on the screen that has to survive being photographed and pasted into a chat window.
+	const float HeadScale = 1.45f * UIScale;
+	const float DetailScale = 1.1f * UIScale;
+
+	const float BannerY = ViewH * 0.05f;
+	const float PadY = 11.f * UIScale;
+	const float HeadH = MeasureHeight(Headline, FontMedium, HeadScale);
+	const float DetailH = MeasureHeight(Detail, FontSmall, DetailScale);
+	const float BannerH = HeadH + DetailH + PadY * 2.f + (4.f * UIScale);
+
+	DrawRect(FLinearColor(0.18f, 0.05f, 0.00f, 0.90f * Fade), 0.f, BannerY, ViewW, BannerH);
+	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Amber, 0.85f * Fade), 0.f, BannerY, ViewW, FMath::Max(1.f, 2.f * UIScale));
+	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Amber, 0.85f * Fade), 0.f, BannerY + BannerH - FMath::Max(1.f, 2.f * UIScale), ViewW, FMath::Max(1.f, 2.f * UIScale));
+
+	DrawTextCentered(Headline, TraceMenuStyle::WithAlpha(TraceMenuStyle::Amber, Fade),
+		ViewW * 0.5f, BannerY + PadY, FontMedium, HeadScale);
+
+	// The engine's own code and message, kept verbatim under the readable sentence. The player does
+	// not need it; the person they paste their log to does.
+	DrawTextCentered(Detail, TraceMenuStyle::WithAlpha(TraceMenuStyle::Ink, 0.8f * Fade),
+		ViewW * 0.5f, BannerY + PadY + HeadH + (4.f * UIScale), FontSmall, DetailScale);
+}
+
+void ATraceMenuHUD::DrawJoinPrompt()
+{
+	if (!JoinEntry.IsActive())
+	{
+		return;
+	}
+
+	// Dim everything behind it. The prompt has swallowed the keyboard — including the W/A/S/D that
+	// normally move the selection — so the screen has to say plainly that the menu is not listening.
+	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.78f), 0.f, 0.f, ViewW, ViewH);
+
+	const float CX = ViewW * 0.5f;
+	const float PanelW = FMath::Min(ViewW * 0.72f, 900.f * UIScale);
+	const float PanelH = 300.f * UIScale;
+	const float PanelX = CX - PanelW * 0.5f;
+	const float PanelY = ViewH * 0.30f;
+
+	DrawRect(FLinearColor(0.004f, 0.016f, 0.030f, 0.97f), PanelX, PanelY, PanelW, PanelH);
+
+	const float Edge = FMath::Max(1.f, 1.6f * UIScale);
+	const FLinearColor EdgeColor = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.65f);
+	DrawRect(EdgeColor, PanelX, PanelY, PanelW, Edge);
+	DrawRect(EdgeColor, PanelX, PanelY + PanelH - Edge, PanelW, Edge);
+	DrawRect(EdgeColor, PanelX, PanelY, Edge, PanelH);
+	DrawRect(EdgeColor, PanelX + PanelW - Edge, PanelY, Edge, PanelH);
+
+	DrawTextCentered(TEXT("JOIN A GAME"), TraceMenuStyle::Cyan, CX, PanelY + (22.f * UIScale), FontMedium, 1.5f * UIScale);
+	DrawTextCentered(TEXT("TYPE THE HOST'S ADDRESS"), TraceMenuStyle::InkDim,
+		CX, PanelY + (58.f * UIScale), FontSmall, 1.f * UIScale);
+
+	// ---- The field -----------------------------------------------------------------------------
+	const float FieldW = PanelW - (72.f * UIScale);
+	const float FieldH = 56.f * UIScale;
+	const float FieldX = CX - FieldW * 0.5f;
+	const float FieldY = PanelY + (92.f * UIScale);
+
+	DrawRect(FLinearColor(0.00f, 0.03f, 0.05f, 0.95f), FieldX, FieldY, FieldW, FieldH);
+	const FLinearColor FieldEdge = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.55f);
+	DrawRect(FieldEdge, FieldX, FieldY, FieldW, Edge);
+	DrawRect(FieldEdge, FieldX, FieldY + FieldH - Edge, FieldW, Edge);
+	DrawRect(FieldEdge, FieldX, FieldY, Edge, FieldH);
+	DrawRect(FieldEdge, FieldX + FieldW - Edge, FieldY, Edge, FieldH);
+
+	const FString Typed = JoinEntry.GetText();
+	const float TextScale = 1.5f * UIScale;
+	const float TextX = FieldX + (18.f * UIScale);
+	const float TextY = FieldY + (FieldH - MeasureHeight(TEXT("0"), FontMedium, TextScale)) * 0.5f;
+
+	if (Typed.IsEmpty())
+	{
+		// Ghost text, dim enough that nobody mistakes it for a value they can press Enter on.
+		DrawText(FString::Printf(TEXT("100.101.102.103:%d"), TraceNet::DefaultPort),
+			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.35f), TextX, TextY, FontMedium, TextScale);
+	}
+	else
+	{
+		DrawText(Typed, TraceMenuStyle::Ink, TextX, TextY, FontMedium, TextScale);
+	}
+
+	// Caret. Measured off the substring LEFT of the caret rather than assuming a fixed advance —
+	// the engine fonts are proportional, and a caret that drifts off the character it is editing is
+	// worse than no caret at all.
+	if (JoinEntry.IsCaretVisible(Now))
+	{
+		const FString LeftOfCaret = Typed.Left(JoinEntry.GetCaret());
+		const float CaretX = TextX + MeasureWidth(LeftOfCaret, FontMedium, TextScale);
+		DrawRect(TraceMenuStyle::Cyan, CaretX, FieldY + (10.f * UIScale),
+			FMath::Max(2.f, 2.f * UIScale), FieldH - (20.f * UIScale));
+	}
+
+	// ---- Error, or the reassurance that replaces it ----------------------------------------------
+	const float NoteY = FieldY + FieldH + (12.f * UIScale);
+	if (!JoinError.IsEmpty())
+	{
+		DrawTextCentered(JoinError, TraceMenuStyle::Amber, CX, NoteY, FontSmall, 1.05f * UIScale);
+	}
+	else if (JoinEntry.WasRecentlyPasted(Now))
+	{
+		DrawTextCentered(TEXT("PASTED FROM CLIPBOARD"), TraceMenuStyle::Cyan, CX, NoteY, FontSmall, 1.05f * UIScale);
+	}
+	else
+	{
+		DrawTextCentered(FString::Printf(TEXT("PORT %d IS ADDED FOR YOU IF YOU LEAVE IT OFF"), TraceNet::DefaultPort),
+			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.75f), CX, NoteY, FontSmall, 1.05f * UIScale);
+	}
+
+	// ---- Keys, and this machine's own address ----------------------------------------------------
+	DrawTextCentered(TEXT("ENTER   CONNECT          ESC   CANCEL          CTRL / CMD + V   PASTE          BACKSPACE   DELETE"),
+		TraceMenuStyle::InkDim, CX, PanelY + PanelH - (66.f * UIScale), FontSmall, 1.f * UIScale);
+
+	// Deliberately repeated here as well as on the title screen behind it. Somebody in this prompt is
+	// mid-conversation with the person they are trying to reach, and "what's yours?" is the very next
+	// question — having it on screen saves a round trip through Escape.
+	DrawTextCentered(FString::Printf(TEXT("THIS MACHINE IS %s"), *TraceNet::GetHostEndpoint()),
+		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.7f),
+		CX, PanelY + PanelH - (40.f * UIScale), FontSmall, 1.f * UIScale);
 }
 
 void ATraceMenuHUD::DrawMenuRows()
@@ -891,7 +1331,9 @@ void ATraceMenuHUD::DrawMenuRows()
 	const float PadTop = 22.f * UIScale;
 	const float PanelW = RowW + PadX * 2.f;
 	const float PanelX = CX - PanelW * 0.5f;
-	const float PanelY = ViewH * 0.415f;
+	// 0.395 rather than 0.415: JOIN made this a six-row panel, and at 1080p the old anchor pushed its
+	// bottom edge 7px under the footer's dark strip.
+	const float PanelY = ViewH * 0.395f;
 	const float PanelH = PadTop + (RowCount - 1) * Spacing + (TraceMenuStyle::RowHeight * UIScale) + (58.f * UIScale);
 
 	DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 0.94f), PanelX, PanelY, PanelW, PanelH);
@@ -912,12 +1354,39 @@ void ATraceMenuHUD::DrawMenuRows()
 	bRowRectsValid = true;
 
 	// One line of plain English under the rows, so "EASY" and "MODE B" mean something before you
-	// commit to them. It describes whichever value row is SELECTED, because with two value rows a
-	// blurb that only ever explained the difficulty would leave the more consequential of the two
-	// undocumented — and the scoring mode is a whole different game, not a slider.
-	const FString Blurb = (Selected == ETraceMenuRow::Mode)
-		? FString(TraceScoringModeBlurb(ScoringMode))
-		: TraceMenuStyle::DifficultyBlurb(Difficulty);
+	// commit to them. It describes whichever row is SELECTED — every row now has something worth
+	// saying, and the two multiplayer rows have the most: PLAY silently became "host a server", and
+	// a player who is not told that will keep asking somebody else to host.
+	FString Blurb;
+	switch (Selected)
+	{
+	case ETraceMenuRow::Play:
+		Blurb = FString::Printf(TEXT("HOSTS A GAME ON %s.  OTHERS PICK JOIN AND TYPE THAT."),
+			*TraceNet::GetHostEndpoint());
+		break;
+
+	case ETraceMenuRow::Join:
+		Blurb = LastJoinAddress.IsEmpty()
+			? FString(TEXT("CONNECT TO SOMEBODY ELSE'S GAME.  YOU WILL NEED THEIR ADDRESS."))
+			: FString::Printf(TEXT("CONNECT TO SOMEBODY ELSE'S GAME.  ENTER RECONNECTS TO %s."), *LastJoinAddress);
+		break;
+
+	case ETraceMenuRow::Mode:
+		Blurb = FString(TraceScoringModeBlurb(ScoringMode));
+		break;
+
+	case ETraceMenuRow::Settings:
+		Blurb = TEXT("MOUSE SENSITIVITY, INVERT Y AND EVERY KEY BINDING.");
+		break;
+
+	case ETraceMenuRow::Quit:
+		Blurb = TEXT("CLOSE TRACE.");
+		break;
+
+	default:
+		Blurb = TraceMenuStyle::DifficultyBlurb(Difficulty);
+		break;
+	}
 
 	DrawTextCentered(Blurb, TraceMenuStyle::InkDim,
 		CX, PanelY + PanelH - (36.f * UIScale), FontSmall, 1.1f * UIScale);
@@ -959,6 +1428,7 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 	switch (Row)
 	{
 	case ETraceMenuRow::Play:       Label = TEXT("PLAY");         break;
+	case ETraceMenuRow::Join:       Label = TEXT("JOIN");         break;
 	case ETraceMenuRow::Difficulty: Label = TEXT("DIFFICULTY");   break;
 	case ETraceMenuRow::Mode:       Label = TEXT("SCORING MODE"); break;
 	case ETraceMenuRow::Settings:   Label = TEXT("SETTINGS");     break;
@@ -968,6 +1438,27 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 
 	const float LabelY = Y + (RowH - MeasureHeight(Label, FontMedium, LabelScale)) * 0.5f;
 	DrawText(Label, LabelColor, X + PadX, LabelY, FontMedium, LabelScale);
+
+	// The two NETWORK rows carry a right-aligned status word instead of a stepper. Small font, not
+	// the row font: an IPv4 address plus a port is twenty characters, and at the label's size it
+	// would collide with "JOIN" on a 1280-wide window. It is a readout, not a value to change.
+	if (Row == ETraceMenuRow::Play || Row == ETraceMenuRow::Join)
+	{
+		const bool bIsPlayRow = (Row == ETraceMenuRow::Play);
+
+		const FString Value = bIsPlayRow
+			? FString::Printf(TEXT("HOST  %s"), *TraceNet::GetHostEndpoint())
+			: (LastJoinAddress.IsEmpty() ? FString(TEXT("ENTER AN ADDRESS")) : LastJoinAddress);
+
+		const float ValueScale = 1.05f * UIScale;
+		const FLinearColor ValueColor = bSelected
+			? TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.95f)
+			: TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.85f);
+
+		const float ValueW = MeasureWidth(Value, FontSmall, ValueScale);
+		const float ValueY = Y + (RowH - MeasureHeight(Value, FontSmall, ValueScale)) * 0.5f;
+		DrawText(Value, ValueColor, X + Width - PadX - ValueW, ValueY, FontSmall, ValueScale);
+	}
 
 	// The two VALUE rows share one renderer: right-aligned value, arrows either side, dimmed at the
 	// ends of the range. Written once because two copies of this maths is two copies to keep in
@@ -1039,7 +1530,7 @@ void ATraceMenuHUD::DrawFooter()
 	DrawTextCentered(TEXT("W / S  OR  ARROWS   MOVE          A / D   CHANGE          ENTER   SELECT          ESC   QUIT"),
 		TraceMenuStyle::InkDim, CX, Y, FontSmall, 1.05f * UIScale);
 
-	DrawTextCentered(TEXT("MOUSE WORKS TOO   -   SENSITIVITY, INVERT Y AND KEY BINDINGS LIVE UNDER SETTINGS"),
+	DrawTextCentered(TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE   -   OTHERS PICK JOIN AND TYPE YOUR ADDRESS ABOVE"),
 		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.6f),
 		CX, Y + (24.f * UIScale), FontSmall, 1.f * UIScale);
 }
@@ -1074,8 +1565,20 @@ void ATraceMenuHUD::DrawTravelOverlay()
 	DrawStrokeTextCentered(TEXT("TRACE"), TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.55f),
 		ViewW * 0.5f, ViewH * 0.36f, ViewH * 0.10f, FMath::Max(2.f, ViewH * 0.10f * 0.055f));
 
-	DrawTextCentered(TEXT("ENTERING THE ARENA"), TraceMenuStyle::Ink, ViewW * 0.5f, ViewH * 0.55f,
+	// The caption names what is actually happening — "HOSTING ON 100.x.y.z:7777" or "CONNECTING TO
+	// <addr>" — rather than one generic line for two very different operations. A join that hangs
+	// for fifteen seconds and then fails needs the player to have seen the address it was dialling.
+	const FString Caption = TravelCaption.IsEmpty() ? FString(TEXT("ENTERING THE ARENA")) : TravelCaption;
+	DrawTextCentered(Caption, TraceMenuStyle::Ink, ViewW * 0.5f, ViewH * 0.55f,
 		FontMedium, 1.4f * UIScale);
+
+	// Only a join can sit here for a noticeable time; a local map load is instant. Say so, so that
+	// three seconds of nothing does not read as a hang.
+	if (TravelCaption.StartsWith(TEXT("CONNECTING")))
+	{
+		DrawTextCentered(TEXT("THIS CAN TAKE A FEW SECONDS.  A FAILURE WILL BE REPORTED, NOT SWALLOWED."),
+			TraceMenuStyle::InkDim, ViewW * 0.5f, ViewH * 0.55f + (34.f * UIScale), FontSmall, 1.05f * UIScale);
+	}
 }
 
 // =================================================================================================

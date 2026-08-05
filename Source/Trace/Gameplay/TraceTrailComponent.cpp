@@ -141,29 +141,120 @@ namespace
 		ECVF_Default);
 
 	/**
-	 * How much of the freshest trace is hidden from the holder's own camera, measured along the path.
+	 * THE OWNER-ONLY NEAR CULL — and the single most important number in the v5 §2 bug report.
 	 *
-	 * Must stay comfortably longer than ATraceCharacter's third-person arm (450 uu), because the whole
-	 * point is that the camera and its near field sit in the gap. 850 leaves 400 uu of clearance in
-	 * front of the lens. Nobody else's view is affected — see the SetOwnerNoSee block in
-	 * RebuildVisuals() for why this is presentation-only and cannot touch the lethal volume.
+	 * WHAT IT USED TO BE, AND WHY THAT WAS THE REPORTED BUG. This was
+	 * Trace.Trail.OwnerNearHideDistance, 850uu, measured ALONG THE PATH back from the carrier's feet:
+	 * the freshest 850uu of a carrier's own trace was hidden from that carrier by SetOwnerNoSee. It is
+	 * an owner-only effect, which is exactly the asymmetry the user reported — a bot's trace belongs
+	 * to no local viewer, so nothing of it is ever hidden, while the human carrying the Core lost the
+	 * newest ~1.4 seconds of their own trace. That is "my trace has a gap between me and the end of
+	 * it, the most recent section is missing", verbatim, and it happens in a solo match with no
+	 * networking involved at all.
 	 *
-	 * IT IS ALSO THE CEILING ON HOW MUCH OF THEIR OWN RED TRACE A PARRYING CARRIER CAN SEE (v3 §3).
-	 * At a 2.0s lifetime and ~600uu/s that leaves the carrier roughly the oldest third of their own
-	 * trace to read the parry off, which is enough on a curving path and thin on a straight one — so
-	 * the carrier's PRIMARY parry tell has to be a HUD element, not this. Lowering it back toward the
-	 * 450uu camera arm re-enters the near field that produced the measured point-blank whiteout, so
-	 * it is exposed as a live knob to be playtested rather than quietly retuned here.
+	 * WHY IT WAS WRONG-SHAPED, not just too big. The thing it defends against is POINT-BLANK WHITEOUT:
+	 * an unlit emissive slab arriving at the lens at full intensity. That is a function of how close a
+	 * piece is to the CAMERA, not of how far back along the path it lies. Path distance is only a
+	 * proxy for it, and a bad one: the third-person camera sits 450uu back down the path, so hiding by
+	 * path distance necessarily hides the trace on BOTH sides of the lens — including the stretch at
+	 * the carrier's feet, 450uu in FRONT of the camera, which cannot whiteout anything and is the
+	 * exact stretch the player wanted to see.
+	 *
+	 * SO IT IS NOW A RADIUS AROUND THE LENS. A piece is hidden from its own carrier when its SURFACE
+	 * comes within this many uu of the local camera. Measured from the current layout (camera 172uu
+	 * above the carrier's actor centre and 450uu behind, TrailHeight 190):
+	 *
+	 *   piece under the lens : head band ~20uu from the camera surface, body band ~136uu   -> HIDDEN
+	 *   piece at the feet    : head band ~384uu, body band ~411uu                          -> DRAWN
+	 *
+	 * 200 sits in the middle of a 250uu-wide separation, so the two cases cannot swap places under
+	 * any reasonable retune, and the hysteresis below removes any chance of a piece flickering at the
+	 * boundary. It also stays well inside ProximityFadeFarDistance (320), which means everything this
+	 * culls had ALREADY been faded to ~0.1-0.3 of its brightness by ApplyProximityGlowFade: the cull
+	 * removes geometry that was, by construction, nearly invisible anyway.
+	 *
+	 * When the carrier LOOKS BACK down their own trace — the moment they actually read it, and the
+	 * moment this bug was reported from — the arm swings the camera to the far side of the pawn, so
+	 * nothing on the trace is near the lens and the whole thing is drawn, feet included.
+	 *
+	 * Presentation only, on one machine, for one viewer. The lethal volume is TrailPoints and no line
+	 * of the cull touches it.
 	 */
-	float GOwnerNearHideDistance = 850.f;
+	float GOwnerHideCameraRadius = 200.f;
 
-	FAutoConsoleVariableRef CVarOwnerNearHideDistance(
-		TEXT("Trace.Trail.OwnerNearHideDistance"),
-		GOwnerNearHideDistance,
-		TEXT("uu of the freshest trace hidden from its OWN holder's camera (anti-whiteout). Presentation "
-		     "only - never changes the lethal volume. Lower to let a parrying carrier see more of their "
-		     "own red trace; below ~600 it re-enters the third-person near field."),
+	FAutoConsoleVariableRef CVarOwnerHideCameraRadius(
+		TEXT("Trace.Trail.OwnerHideCameraRadius"),
+		GOwnerHideCameraRadius,
+		TEXT("uu from the LOCAL CAMERA within which a carrier's own trace is hidden from that carrier "
+		     "(anti-whiteout). 0 disables the cull and leaves the proximity glow fade alone. Presentation "
+		     "only - never changes the lethal volume, and never affects any other player's view. "
+		     "Replaces Trace.Trail.OwnerNearHideDistance, which hid by distance along the path and was "
+		     "the cause of the reported gap between the carrier and the end of their own trace."),
 		ECVF_Default);
+
+	/** Re-show hysteresis on the cull above, so a piece at the boundary cannot flicker. */
+	constexpr double OwnerHideCameraHysteresis = 40.0;
+
+	/**
+	 * A SECOND, MUCH SMALLER owner-only hide, for the POSED MANNEQUINS ONLY, measured from the
+	 * carrier's own body rather than from the camera.
+	 *
+	 * The trace forms exactly where the carrier has just been, and the third-person camera looks
+	 * along that same line — so once the trace is allowed to reach the carrier's feet (which is the
+	 * whole point of v5 §2), the newest after-images stand BETWEEN the lens and the carrier's own
+	 * character, 100uu closer to the camera than the body they are copies of. An opaque, person-shaped,
+	 * emissive duplicate of yourself drawn slightly larger than and directly on top of your own
+	 * character is not a trace, it is a rendering bug with an explanation.
+	 *
+	 * The smear is deliberately NOT subject to this: it is the layer that carries continuity, it is
+	 * built at the exact lethal width, and it is a knee-high band plus a thin eye-line ribbon rather
+	 * than a body. It runs all the way to the carrier's feet, so the trace the player sees still
+	 * reaches them — which is the reported bug — while the mannequins start one body-length back.
+	 *
+	 * 300 is a little over one ghost spacing (220), so the carrier loses at most the newest one or
+	 * two after-images and every other player still sees all of them. 0 disables it entirely.
+	 */
+	float GOwnerGhostHideDistance = 300.f;
+
+	FAutoConsoleVariableRef CVarOwnerGhostHideDistance(
+		TEXT("Trace.Trail.OwnerGhostHideDistance"),
+		GOwnerGhostHideDistance,
+		TEXT("uu from the carrier's own body within which the posed-Mannequin after-images are hidden "
+		     "from that carrier alone (spec v5 2). The continuous smear is unaffected and still reaches "
+		     "their feet. 0 draws the ghosts right up to the body. Presentation only - never changes the "
+		     "lethal volume, and never affects another player's view."),
+		ECVF_Default);
+
+	/**
+	 * SPEC v5 §2: how far the OWNER-ONLY predicted head stub may reach ahead of the newest drawn point.
+	 *
+	 * It has to cover two things at once:
+	 *   - the head-grace stub, which exists on every machine including a listen host: the newest
+	 *     TrailRadius (45uu) of trace, plus the ungated head point itself, is deliberately neither
+	 *     lethal nor drawn, so even the authority's own view of its own trace stops ~one body width
+	 *     short of the carrier's feet;
+	 *   - on a remote client, one further round trip of travel — the points the server has already
+	 *     laid but this machine has not received. At 800uu/s and 120ms that is ~100uu; at dash speed
+	 *     it is more.
+	 *
+	 * 400 covers both with room to spare. Beyond it the stub is NOT clamped, it is ABANDONED: a
+	 * distance that large means a teleport, a respawn or a desync severe enough that a straight line
+	 * from the last known point to the pawn would be an invention rather than an interpolation, and
+	 * the honest thing to draw is the trace the machine actually knows about. Same reasoning, and the
+	 * same order of magnitude, as MaxTrailSegmentLength below.
+	 */
+	float GPredictedHeadMaxLength = 400.f;
+
+	FAutoConsoleVariableRef CVarPredictedHeadMaxLength(
+		TEXT("Trace.Trail.PredictMaxLength"),
+		GPredictedHeadMaxLength,
+		TEXT("uu the owner-only predicted head stub may span (spec v5 2). 0 disables the prediction and "
+		     "restores the gap between a carrier and the end of their own trace. Beyond this length the "
+		     "stub is dropped entirely rather than clamped - see the comment."),
+		ECVF_Default);
+
+	/** Elements in the predicted-head pool: up to TrailHeadGracePoints real segments plus the stub. */
+	constexpr int32 MaxPredictedSmearElements = 6;
 
 	/**
 	 * Camera-proximity emissive fade — the anti-whiteout guard. See ApplyProximityGlowFade().
@@ -537,6 +628,11 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 	if (GetNetMode() != NM_DedicatedServer)
 	{
 		UpdateVisuals();
+
+		// EVERY frame, and BEFORE the fade below, for two reasons that are really one: it tracks a
+		// moving pawn rather than a settled point array, and the piece it places has to be handed to
+		// the proximity pass on the same frame it appears (spec v5 §2).
+		UpdatePredictedHead();
 
 		// EVERY frame, not just on a rebuild: this depends on where the local camera is, and the
 		// camera moves continuously while the geometry does not. See the function's comment.
@@ -953,6 +1049,10 @@ void UTraceTrailComponent::MulticastClearTrail_Implementation()
 {
 	HideSmearFrom(0);
 	ClearGhostRecords();
+
+	// The predicted stub is the newest thing on screen, so it is the one piece a dying holder would
+	// most obviously leave hanging in the air. It goes on the same frame as everything else.
+	HidePredictedHead();
 
 	LastVisualPointCount = -1;
 	LastVisualHead = FVector::ZeroVector;
@@ -1690,77 +1790,41 @@ void UTraceTrailComponent::RebuildVisuals()
 		InvulnerableScale = GhostInvulnerableGlowScale;
 	}
 
-	// --- Hide the newest stretch of the trace from the holder's OWN eyes -------------------------
+	// --- Hiding the trace from the holder's OWN eyes is NOT decided here any more -----------------
 	//
 	// Holding the Core is what puts the camera into third person, and third person parks it
 	// ThirdPersonArmLength straight back down the path the holder just walked — which is exactly
 	// where this component is placing unlit emissive geometry. Raising the camera above the trace
-	// (see ATraceCharacter::GetThirdPersonPivotZ) stops it being INSIDE it, but the freshest
-	// after-images are still hot surfaces a few tens of uu below the lens: they blew out the bottom
-	// third of the frame and, worse, drowned the player's own character in glare.
+	// (see ATraceCharacter::GetThirdPersonPivotZ) stops it being INSIDE it, but the after-images
+	// immediately under the lens are still hot surfaces a few tens of uu away: they blew out the
+	// bottom third of the frame and, worse, drowned the player's own character in glare.
 	//
-	// SetOwnerNoSee hides a primitive from ONE viewer — the one whose view target owns it — so this
-	// costs every other player nothing. They still see the whole trace, including the part its own
-	// holder cannot, and the LETHAL VOLUME IS UNTOUCHED: trip resolution runs off TrailPoints, never
-	// off what happens to be rendered. A holder cannot trip their own trace anyway, so nothing is
-	// being hidden that its owner could act on.
+	// That guard used to live right here as a PATH-DISTANCE window — the newest 850uu of the trace,
+	// measured back along the polyline, hidden from its own carrier. That is the v5 §2 bug: the
+	// camera is 450uu back down that same polyline, so a path-distance window necessarily eats the
+	// trace at the carrier's FEET, which is 450uu in front of the lens and cannot blow anything out.
+	// It is owner-only, which is precisely why bots never showed it.
 	//
-	// It applies to the mannequin ghosts for the same reason and by the same rule: a posed copy of
-	// YOURSELF, hot, 100uu from your own third-person lens is the single worst version of the
-	// whiteout this exists to prevent.
-	int32 FirstOwnerHiddenPoint = LethalPointCount;   // == LethalPointCount means "hide nothing"
-	if (const ATraceCharacter* OwnerCharacter = GetOwnerCharacter())
-	{
-		const APlayerController* OwnerPC = Cast<APlayerController>(OwnerCharacter->GetController());
-		if (OwnerPC != nullptr && OwnerPC->IsLocalPlayerController())
-		{
-			double DistanceFromHead = 0.0;
-			FirstOwnerHiddenPoint = 0;
-			for (int32 Index = LethalPointCount - 1; Index >= 0; --Index)
-			{
-				if (DistanceFromHead >= static_cast<double>(FMath::Max(0.f, GOwnerNearHideDistance)))
-				{
-					FirstOwnerHiddenPoint = Index + 1;
-					break;
-				}
-				if (Index > 0)
-				{
-					DistanceFromHead += FVector::Dist(TrailPoints.Items[Index - 1].Location, TrailPoints.Items[Index].Location);
-				}
-			}
-		}
-	}
-
-	RebuildSmear(LethalPointCount, FirstOwnerHiddenPoint, InvulnerableScale);
-	RebuildPoseGhosts(LethalPointCount, FirstOwnerHiddenPoint, InvulnerableScale);
+	// The guard is now a RADIUS AROUND THE LENS, applied per piece, every frame, in
+	// ApplyProximityGlowFade() — where the camera position is already known and already used. See
+	// GOwnerHideCameraRadius for the measured numbers. Nothing about it is visible to any other
+	// player, and the LETHAL VOLUME IS UNTOUCHED either way: trip resolution runs off TrailPoints,
+	// never off what happens to be rendered. A holder cannot trip their own trace anyway, so nothing
+	// is being hidden or shown here that its owner could act on.
+	RebuildSmear(LethalPointCount, InvulnerableScale);
+	RebuildPoseGhosts(LethalPointCount, InvulnerableScale);
 }
 
-// -------------------------------------------------------------------------------------------------
-// LAYER 2 (drawn first, read second): THE CONTINUOUS SMEAR.
-//
-// ONE ELEMENT PER LETHAL SEGMENT, spanning that segment exactly. This is the part of the visual that
-// is allowed to make a promise about where the kill volume is, so it is built the same way the trip
-// test evaluates it: along the polyline TrailPoints[0..LastLethal], TrailRadius to either side,
-// TrailHeight tall. Interior joints get one TrailRadius of overlap at each end, which fills the wedge
-// on the outside of a corner; the two OUTER ends get none, so the smear never extends past the first
-// or last lethal point into trace that would not kill.
-// -------------------------------------------------------------------------------------------------
-
-void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, int32 FirstOwnerHiddenPoint, float InvulnerableScale)
+FTraceSmearStyle UTraceTrailComponent::MakeSmearStyle() const
 {
-	if (CylinderMesh == nullptr || LethalPointCount <= 0)
-	{
-		HideSmearFrom(0);
-		return;
-	}
-
 	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	FTraceSmearStyle Style;
 
 	// Derived from the lethal volume, never chosen. If TrailRadius/TrailHeight are retuned the smear
 	// moves with them, because it is the drawn statement of where they are.
-	const double Width = FMath::Max(1.0, 2.0 * static_cast<double>(Settings.TrailRadius));
-	const double Height = FMath::Max(1.0, static_cast<double>(Settings.TrailHeight));
-	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
+	Style.Width = FMath::Max(1.0, 2.0 * static_cast<double>(Settings.TrailRadius));
+	Style.Height = FMath::Max(1.0, static_cast<double>(Settings.TrailHeight));
 
 	// THE SMEAR STEPS OUT OF THE MANNEQUINS' WAY ONLY WHEN THERE ARE MANNEQUINS — and that has to
 	// govern the GEOMETRY, not just the brightness.
@@ -1777,10 +1841,144 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, int32 FirstOwner
 	// "Smear only" has to mean a solid trace, so in that case the body band spans the FULL lethal
 	// height at full strength: the pre-v4 look, and perfectly playable.
 	const bool bGhostsOn = AreCharacterGhostsEnabled();
-	const float LayerScale = bGhostsOn ? ResolvedSmearGlowScale() : 1.f;
 
-	const double BodyCentreFrac = bGhostsOn ? SmearBodyCentreFrac : 0.5;
-	const double BodyHeightFrac = bGhostsOn ? SmearBodyHeightFrac : 1.0;
+	Style.LayerScale = bGhostsOn ? ResolvedSmearGlowScale() : 1.f;
+	Style.BodyCentreFrac = bGhostsOn ? SmearBodyCentreFrac : 0.5;
+	Style.BodyHeightFrac = bGhostsOn ? SmearBodyHeightFrac : 1.0;
+
+	return Style;
+}
+
+void UTraceTrailComponent::PlaceSmearSegment(
+	TArray<TObjectPtr<UStaticMeshComponent>>& Pieces,
+	TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
+	TArray<float>& BaseGlowOut,
+	TArray<float>& AppliedScaleOut,
+	int32 ElementIndex,
+	const FVector& SegStart,
+	const FVector& SegEnd,
+	double BackOverlap,
+	double ForwardOverlap,
+	const FTraceSmearStyle& Style,
+	float GlowScale,
+	bool bOnlyOwnerSees)
+{
+	FVector Along = SegEnd - SegStart;
+	Along.Z = 0.0;
+	const double PlanarLength = Along.Size();
+	const FVector Direction = (PlanarLength > 1.0) ? (Along / PlanarLength) : FVector::ZeroVector;
+	const FRotator Facing = (PlanarLength > 1.0) ? Direction.Rotation() : FRotator::ZeroRotator;
+
+	// The floor is one full body width, so a one-point (degenerate but lethal) trace draws a
+	// blob you can see rather than a sliver you cannot.
+	const double ElementLength = FMath::Max(Style.Width, PlanarLength + BackOverlap + ForwardOverlap);
+	const FVector ElementCentre = (SegStart + SegEnd) * 0.5
+		+ Direction * ((ForwardOverlap - BackOverlap) * 0.5);
+
+	// A segment the holder JUMPED along is lethal over a band that slides from one end's height to
+	// the other's. Covering the union of the two bands over-draws by at most half the height change
+	// at the segment's ends, which is the safe direction: the boundary is never drawn smaller than
+	// it is.
+	const double SpanHeight = Style.Height + FMath::Abs(SegEnd.Z - SegStart.Z);
+
+	for (int32 Part = 0; Part < PartsPerSmear; ++Part)
+	{
+		const int32 SlotIndex = ElementIndex * PartsPerSmear + Part;
+		if (!Pieces.IsValidIndex(SlotIndex))
+		{
+			continue;
+		}
+
+		UStaticMeshComponent* Piece = Pieces[SlotIndex];
+		if (Piece == nullptr)
+		{
+			continue;
+		}
+
+		const bool bIsHead = (Part == PartHead);
+		const double CentreFrac = bIsHead ? SmearHeadCentreFrac : Style.BodyCentreFrac;
+		const double HeightFrac = bIsHead ? SmearHeadHeightFrac : Style.BodyHeightFrac;
+		const double WidthFrac = bIsHead ? SmearHeadWidthFrac : SmearBodyWidthFrac;
+		const float BaseGlow = (bIsHead ? SmearHeadGlow : SmearBodyGlow) * Style.LayerScale;
+
+		const FVector DesiredSize(
+			ElementLength,
+			Style.Width * WidthFrac,
+			SpanHeight * HeightFrac);
+
+		const FVector Scale(
+			DesiredSize.X / (2.0 * CylinderHalfSize.X),
+			DesiredSize.Y / (2.0 * CylinderHalfSize.Y),
+			DesiredSize.Z / (2.0 * CylinderHalfSize.Z));
+
+		// Measured from the BOTTOM of the lethal band, so the two parts tile it exactly.
+		const FVector PartCentre = ElementCentre
+			+ FVector(0.0, 0.0, -SpanHeight * 0.5 + SpanHeight * CentreFrac);
+
+		// Corrects for a source mesh whose pivot is not at its bounds centre, so we never have
+		// to assume anything about the engine primitives' authoring.
+		const FVector PivotCorrection = Facing.RotateVector(CylinderPivotOffset * Scale);
+
+		Piece->SetWorldLocationAndRotation(PartCentre - PivotCorrection, Facing);
+		Piece->SetWorldScale3D(Scale);
+		Piece->SetVisibility(true);
+
+		// THE ONE LINE THAT KEEPS THE PREDICTED HEAD OFF EVERY OTHER PLAYER'S SCREEN. Guarded because
+		// SetOnlyOwnerSee dirties the render state and this runs as the trace grows.
+		if (Piece->bOnlyOwnerSee != bOnlyOwnerSees)
+		{
+			Piece->SetOnlyOwnerSee(bOnlyOwnerSees);
+		}
+
+		// The intended brightness of this piece, BEFORE the camera-proximity fade. Recorded rather
+		// than pushed directly, because ApplyProximityGlowFade() runs every frame and needs to
+		// know what full brightness means for this piece without re-deriving the whole rebuild.
+		if (BaseGlowOut.Num() <= SlotIndex)
+		{
+			BaseGlowOut.SetNumZeroed(SlotIndex + 1);
+		}
+		if (AppliedScaleOut.Num() <= SlotIndex)
+		{
+			AppliedScaleOut.SetNumZeroed(SlotIndex + 1);
+		}
+		BaseGlowOut[SlotIndex] = BaseGlow * GlowScale;
+
+		if (bTrailMaterialIsNeon && Materials.IsValidIndex(SlotIndex))
+		{
+			if (UMaterialInstanceDynamic* Material = Materials[SlotIndex])
+			{
+				// Push full brightness and let the proximity pass pull it down. Resetting the
+				// remembered scale forces that pass to re-evaluate this piece, which it must:
+				// the piece has just been moved somewhere else entirely.
+				Material->SetScalarParameterValue(TEXT("Glow"), BaseGlowOut[SlotIndex]);
+				AppliedScaleOut[SlotIndex] = 1.f;
+			}
+		}
+	}
+}
+
+// -------------------------------------------------------------------------------------------------
+// LAYER 2 (drawn first, read second): THE CONTINUOUS SMEAR.
+//
+// ONE ELEMENT PER LETHAL SEGMENT, spanning that segment exactly. This is the part of the visual that
+// is allowed to make a promise about where the kill volume is, so it is built the same way the trip
+// test evaluates it: along the polyline TrailPoints[0..LastLethal], TrailRadius to either side,
+// TrailHeight tall. Interior joints get one TrailRadius of overlap at each end, which fills the wedge
+// on the outside of a corner; the two OUTER ends get none, so the smear never extends past the first
+// or last lethal point into trace that would not kill.
+// -------------------------------------------------------------------------------------------------
+
+void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float InvulnerableScale)
+{
+	if (CylinderMesh == nullptr || LethalPointCount <= 0)
+	{
+		HideSmearFrom(0);
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const FTraceSmearStyle Style = MakeSmearStyle();
+	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
 
 	const float Lifetime = GetTraceLifetimeSeconds();
 	const float Now = GetServerTimeSeconds();
@@ -1807,106 +2005,339 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, int32 FirstOwner
 			? FVector(TrailPoints.Items[SegmentIndex + 1].Location)
 			: SegStart;
 
-		FVector Along = SegEnd - SegStart;
-		Along.Z = 0.0;
-		const double PlanarLength = Along.Size();
-		const FVector Direction = (PlanarLength > 1.0) ? (Along / PlanarLength) : FVector::ZeroVector;
-		const FRotator Facing = (PlanarLength > 1.0) ? Direction.Rotation() : FRotator::ZeroRotator;
-
 		// Overlap at INTERIOR joints only. The two ends of the whole trace stay flush with the first
 		// and last lethal point, so nothing is drawn beyond the polyline the server kills along.
+		//
+		// THE FORWARD END IS THE ONE THAT MATTERS FOR v5 §2 AND IT IS STILL FLUSH. The predicted head
+		// stub continues the trace from exactly this point, in a separate pool, seen only by the
+		// carrier — it does not extend this element, and it does not move where the lethal set ends.
 		const double BackOverlap = (SegmentIndex > FirstSegment) ? JointOverlap : 0.0;
 		const double ForwardOverlap = (SegmentIndex + 1 < LethalPointCount - 1) ? JointOverlap : 0.0;
-
-		// The floor is one full body width, so a one-point (degenerate but lethal) trace draws a
-		// blob you can see rather than a sliver you cannot.
-		const double ElementLength = FMath::Max(Width, PlanarLength + BackOverlap + ForwardOverlap);
-		const FVector ElementCentre = (SegStart + SegEnd) * 0.5
-			+ Direction * ((ForwardOverlap - BackOverlap) * 0.5);
-
-		// A segment the holder JUMPED along is lethal over a band that slides from one end's height to
-		// the other's. Covering the union of the two bands over-draws by at most half the height change
-		// at the segment's ends, which is the safe direction: the boundary is never drawn smaller than
-		// it is.
-		const double SpanHeight = Height + FMath::Abs(SegEnd.Z - SegStart.Z);
 
 		// Age from the NEWER endpoint: a segment is as young as its leading edge.
 		const float Age = FMath::Max(0.f, Now - TrailPoints.Items[FMath::Min(SegmentIndex + 1, LethalPointCount - 1)].BirthServerTime);
 		const float Remaining = FMath::Clamp(1.f - (Age / FMath::Max(0.01f, Lifetime)), 0.f, 1.f);
 		const float FadeScale = FMath::Lerp(GhostOldestGlowScale, 1.f, Remaining);
 
-		const bool bHideFromOwner = ((SegmentIndex + 1) >= FirstOwnerHiddenPoint);
-
-		for (int32 Part = 0; Part < PartsPerSmear; ++Part)
-		{
-			const int32 SlotIndex = Placed * PartsPerSmear + Part;
-			UStaticMeshComponent* Piece = SmearMeshes[SlotIndex];
-			if (Piece == nullptr)
-			{
-				continue;
-			}
-
-			const bool bIsHead = (Part == PartHead);
-			const double CentreFrac = bIsHead ? SmearHeadCentreFrac : BodyCentreFrac;
-			const double HeightFrac = bIsHead ? SmearHeadHeightFrac : BodyHeightFrac;
-			const double WidthFrac = bIsHead ? SmearHeadWidthFrac : SmearBodyWidthFrac;
-			const float BaseGlow = (bIsHead ? SmearHeadGlow : SmearBodyGlow) * LayerScale;
-
-			const FVector DesiredSize(
-				ElementLength,
-				Width * WidthFrac,
-				SpanHeight * HeightFrac);
-
-			const FVector Scale(
-				DesiredSize.X / (2.0 * CylinderHalfSize.X),
-				DesiredSize.Y / (2.0 * CylinderHalfSize.Y),
-				DesiredSize.Z / (2.0 * CylinderHalfSize.Z));
-
-			// Measured from the BOTTOM of the lethal band, so the two parts tile it exactly.
-			const FVector PartCentre = ElementCentre
-				+ FVector(0.0, 0.0, -SpanHeight * 0.5 + SpanHeight * CentreFrac);
-
-			// Corrects for a source mesh whose pivot is not at its bounds centre, so we never have
-			// to assume anything about the engine primitives' authoring.
-			const FVector PivotCorrection = Facing.RotateVector(CylinderPivotOffset * Scale);
-
-			Piece->SetWorldLocationAndRotation(PartCentre - PivotCorrection, Facing);
-			Piece->SetWorldScale3D(Scale);
-			Piece->SetVisibility(true);
-
-			// Guarded: SetOwnerNoSee dirties the render state, and this runs as the trace grows.
-			if (Piece->bOwnerNoSee != bHideFromOwner)
-			{
-				Piece->SetOwnerNoSee(bHideFromOwner);
-			}
-
-			// The intended brightness of this piece, BEFORE the camera-proximity fade. Recorded rather
-			// than pushed directly, because ApplyProximityGlowFade() runs every frame and needs to
-			// know what full brightness means for this piece without re-deriving the whole rebuild.
-			if (SmearBaseGlow.Num() <= SlotIndex)
-			{
-				SmearBaseGlow.SetNumZeroed(SlotIndex + 1);
-				SmearAppliedGlowScale.SetNumZeroed(SlotIndex + 1);
-			}
-			SmearBaseGlow[SlotIndex] = BaseGlow * FadeScale * InvulnerableScale;
-
-			if (bTrailMaterialIsNeon)
-			{
-				if (UMaterialInstanceDynamic* Material = SmearMaterials[SlotIndex])
-				{
-					// Push full brightness and let the proximity pass pull it down. Resetting the
-					// remembered scale forces that pass to re-evaluate this piece, which it must:
-					// the piece has just been moved somewhere else entirely.
-					Material->SetScalarParameterValue(TEXT("Glow"), SmearBaseGlow[SlotIndex]);
-					SmearAppliedGlowScale[SlotIndex] = 1.f;
-				}
-			}
-		}
+		PlaceSmearSegment(SmearMeshes, SmearMaterials, SmearBaseGlow, SmearAppliedGlowScale,
+			Placed, SegStart, SegEnd, BackOverlap, ForwardOverlap, Style,
+			FadeScale * InvulnerableScale, /*bOnlyOwnerSees=*/false);
 
 		++Placed;
 	}
 
 	HideSmearFrom(Placed);
+}
+
+// -------------------------------------------------------------------------------------------------
+// SPEC v5 §2 — THE PREDICTED HEAD, and why it cannot break "visible implies lethal".
+//
+// THE BUG. "When I as a player pick up the core, my trace has a gap between me and the end of it (the
+// most recent section is missing). This bug is not present for bots carrying the trace."
+//
+// THERE ARE TWO CAUSES, and they stack. Both are owner-only, which is the whole reason bots never
+// showed the symptom — a bot's trace is drawn from the same replicated array by the same code, but no
+// local viewer owns it.
+//
+//   1. THE OWNER NEAR HIDE, and this is the big one, worth ~850uu. It was a path-distance window and
+//      it is now a radius around the lens: see GOwnerHideCameraRadius, which carries the numbers.
+//      It is present in a solo match with no networking at all, which is how this got reported at
+//      all given that PLAY has never opened a listen server (spec v5 §0).
+//
+//   2. THE DRAWN SET ENDS AT ComputeLastLethalIndex(), which deliberately stops one TrailRadius short
+//      of the carrier's feet (the head-grace stub: the newest ~45uu, plus the ungated head point,
+//      is neither lethal nor drawn so a defender cannot stand on the emitter and dash on the spot).
+//      On a REMOTE CLIENT there is a third term on top of that: the points the server has already
+//      laid but this machine has not received yet — one round trip of trace, exactly as the spec's
+//      diagnosis says.
+//
+// THE FIX. On the machine where the carrier is locally controlled, continue the drawn polyline from
+// the newest drawn point, through any real-but-not-yet-lethal points, to where the pawn actually is
+// this frame. Stateless: it is recomputed from scratch every frame, so "reconciling when the
+// authoritative point lands" is not a code path at all — the moment a new point arrives it becomes
+// part of the lethal set, the base of the stub advances, and the stub shortens by the same amount.
+// There is no accumulated prediction that could ever be wrong about the past.
+//
+// HOW THE VISIBLE == LETHAL INVARIANT SURVIVES. The invariant exists to protect ONE decision: an
+// enemy looking at a piece of trace and deciding whether to dash through it. The stub is unreachable
+// by that decision, twice over:
+//
+//   (a) IT IS ONLY BUILT ON THE CARRIER'S OWN MACHINE. These are locally created, non-replicated
+//       transient components. No other machine has them, so no other machine can draw them.
+//   (b) IT IS bOnlyOwnerSee. Even on a listen host, where the carrier's components and the enemy's
+//       viewer share a process, the renderer shows the stub only to the viewer whose view target
+//       owns it — the carrier.
+//
+// So the set of viewers who can see the stub is exactly "whoever is currently looking THROUGH the
+// carrier" — the carrier, plus any future spectator bound to them as a view target. The carrier is
+// the one player who can NEVER be killed by their own trace: ServerRunTripTest skips
+// Candidate == Holder unconditionally, before any of the eligibility rules; a spectator has no pawn
+// to dash with at all. Not one pixel changes on the screen of anybody who could dash through it. The
+// inverse hazard the spec warns about — "an enemy dashes through something that looks lethal and
+// survives" — requires an enemy who can SEE it, and there is none.
+//
+// WHAT THE CARRIER IS BEING TOLD, stated honestly rather than glossed: their own trace now reaches
+// their feet, and the newest ~45-105uu of what they see (plus, on a client, one round trip more) is
+// not yet lethal to anyone. That over-states their own coverage by about one body width, in the one
+// place — under their own feet — where an enemy trying to use it would be standing on top of them.
+// The alternative was under-stating it by 850uu, which is the bug being fixed. Nothing else in the
+// game reads this geometry: the bots plan against TrailPoints, and the trip test evaluates
+// TrailPoints, and neither has any notion that the stub exists.
+//
+// It is also DROPPED ENTIRELY rather than clamped when it would have to span more than
+// GPredictedHeadMaxLength, because past that distance a straight line from the last known point to
+// the pawn is an invention (a teleport, a respawn, a severe desync) rather than an interpolation.
+// -------------------------------------------------------------------------------------------------
+
+bool UTraceTrailComponent::IsPredictingLocalHead() const
+{
+	return PredictedHeadLength > 0.f;
+}
+
+float UTraceTrailComponent::GetPredictedHeadLength() const
+{
+	return PredictedHeadLength;
+}
+
+float UTraceTrailComponent::MeasureHeadGap() const
+{
+	const ATraceCharacter* Holder = GetOwnerCharacter();
+	const int32 LastLethal = ComputeLastLethalIndex();
+	if (Holder == nullptr || LastLethal < 0)
+	{
+		return 0.f;
+	}
+
+	// Measured along the chain of real points and then out to the pawn, not as a straight line from
+	// the last lethal point: on a curving path those differ, and the gap the player sees is the one
+	// that follows the path.
+	double Gap = 0.0;
+	FVector Cursor = FVector(TrailPoints.Items[LastLethal].Location);
+	for (int32 Index = LastLethal + 1; Index < TrailPoints.Items.Num(); ++Index)
+	{
+		const FVector Next = FVector(TrailPoints.Items[Index].Location);
+		Gap += FVector::Dist(Cursor, Next);
+		Cursor = Next;
+	}
+	Gap += FVector::Dist(Cursor, Holder->GetActorLocation());
+
+	return static_cast<float>(Gap);
+}
+
+float UTraceTrailComponent::MeasureOwnerVisibleGap(bool bIncludePredictedHead) const
+{
+	const ATraceCharacter* Holder = GetOwnerCharacter();
+	if (Holder == nullptr)
+	{
+		return -1.f;
+	}
+
+	const FVector PawnLocation = Holder->GetActorLocation();
+	double Nearest = TNumericLimits<double>::Max();
+
+	// Surface distance, so a piece the carrier is standing in reports 0 rather than half its length.
+	auto Consider = [&PawnLocation, &Nearest](const auto& Pieces)
+	{
+		for (int32 Slot = 0; Slot < Pieces.Num(); ++Slot)
+		{
+			const UMeshComponent* Piece = Pieces[Slot];
+			if (Piece == nullptr || !Piece->IsVisible() || Piece->bOwnerNoSee)
+			{
+				continue;   // Not drawn, or drawn for everyone EXCEPT the person we are measuring for.
+			}
+
+			const FBoxSphereBounds& LocalBounds = Piece->Bounds;
+			Nearest = FMath::Min(Nearest,
+				FMath::Max(0.0, FVector::Dist(PawnLocation, LocalBounds.Origin) - LocalBounds.SphereRadius));
+		}
+	};
+
+	Consider(SmearMeshes);
+	Consider(PoseGhosts);
+	if (bIncludePredictedHead)
+	{
+		Consider(PredictedSmearMeshes);
+	}
+
+	return (Nearest == TNumericLimits<double>::Max()) ? -1.f : static_cast<float>(Nearest);
+}
+
+void UTraceTrailComponent::UpdatePredictedHead()
+{
+	// ---- every reason not to draw it, cheapest first ------------------------------------------
+	if (CylinderMesh == nullptr || GPredictedHeadMaxLength <= 0.f)
+	{
+		HidePredictedHead();
+		return;
+	}
+
+	// Suppressed visuals mean a holder just died: the trace is about to vanish and the stub must not
+	// outlive it by even the suppression window.
+	if (VisualSuppressUntilTime > 0.f)
+	{
+		HidePredictedHead();
+		return;
+	}
+
+	// ONLY THE LOCALLY CONTROLLED CARRIER. Not "the owner": a listen host owns every bot's component
+	// too, and predicting a head for a bot would put geometry on the host's screen that no client has.
+	ATraceCharacter* Holder = GetOwnerCharacter();
+	if (Holder == nullptr || !Holder->IsAlive() || !bEmitting)
+	{
+		HidePredictedHead();
+		return;
+	}
+
+	const APlayerController* HolderPC = Cast<APlayerController>(Holder->GetController());
+	if (HolderPC == nullptr || !HolderPC->IsLocalPlayerController())
+	{
+		HidePredictedHead();
+		return;
+	}
+
+	// THE STUB ONLY EVER CONTINUES SOMETHING THAT IS ALREADY LETHAL AND ALREADY DRAWN. If there is no
+	// lethal point yet — an empty trace, or the whole of it still inside the turnover grace (§2) or
+	// the head exemption — there is nothing to continue and nothing is drawn. That is what keeps the
+	// grace window looking like a grace window instead of a trace the server does not have.
+	const int32 LastLethal = ComputeLastLethalIndex();
+	if (LastLethal < 0)
+	{
+		HidePredictedHead();
+		return;
+	}
+
+	// ---- build the polyline: last drawn point -> real ungated points -> the pawn ----------------
+	TArray<FVector, TInlineAllocator<8>> Path;
+	Path.Add(FVector(TrailPoints.Items[LastLethal].Location));
+	for (int32 Index = LastLethal + 1; Index < TrailPoints.Items.Num(); ++Index)
+	{
+		Path.Add(FVector(TrailPoints.Items[Index].Location));
+	}
+
+	const FVector PawnLocation = Holder->GetActorLocation();
+	if (FVector::Dist(Path.Last(), PawnLocation) > 1.0)
+	{
+		Path.Add(PawnLocation);
+	}
+
+	double TotalLength = 0.0;
+	for (int32 Index = 1; Index < Path.Num(); ++Index)
+	{
+		TotalLength += FVector::Dist(Path[Index - 1], Path[Index]);
+	}
+
+	if (TotalLength <= 1.0 || TotalLength > static_cast<double>(GPredictedHeadMaxLength))
+	{
+		// Nothing to cover, or so much that a straight line would be a fabrication. See the header
+		// comment: abandoned, never clamped.
+		HidePredictedHead();
+		return;
+	}
+
+	CacheMeshMetrics();
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const FTraceSmearStyle Style = MakeSmearStyle();
+	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
+
+	// The stub is the newest trace there is, so it takes the newest trace's brightness: no age fade,
+	// and the same parry / pass-window step the rest of the trace is wearing this frame. A stub that
+	// stayed team-cyan while the trace behind it went red would be a state nobody has a name for.
+	float InvulnerableScale = 1.f;
+	if (IsParryVisuallyActive())
+	{
+		InvulnerableScale = TraceParry::GetGlowScale();
+	}
+	else if (IsPassWindowInvulnerable())
+	{
+		InvulnerableScale = GhostInvulnerableGlowScale;
+	}
+
+	int32 Placed = 0;
+	for (int32 SegmentIndex = 0; SegmentIndex + 1 < Path.Num(); ++SegmentIndex)
+	{
+		if (!EnsurePredictedElement(Placed))
+		{
+			break;
+		}
+
+		// The BACK end overlaps into the last lethal element, which is what makes the join seamless —
+		// this is the joint the user is looking at. The FORWARD end of the last segment gets no
+		// overlap, so the drawn thing stops at the pawn and never reaches past it.
+		const double BackOverlap = JointOverlap;
+		const double ForwardOverlap = (SegmentIndex + 2 < Path.Num()) ? JointOverlap : 0.0;
+
+		PlaceSmearSegment(PredictedSmearMeshes, PredictedSmearMaterials,
+			PredictedSmearBaseGlow, PredictedSmearAppliedGlowScale,
+			Placed, Path[SegmentIndex], Path[SegmentIndex + 1], BackOverlap, ForwardOverlap,
+			Style, InvulnerableScale, /*bOnlyOwnerSees=*/true);
+
+		++Placed;
+	}
+
+	for (int32 Index = Placed * PartsPerSmear; Index < PredictedSmearMeshes.Num(); ++Index)
+	{
+		if (UStaticMeshComponent* Piece = PredictedSmearMeshes[Index])
+		{
+			Piece->SetVisibility(false);
+		}
+	}
+
+	PredictedHeadLength = (Placed > 0) ? static_cast<float>(TotalLength) : 0.f;
+}
+
+void UTraceTrailComponent::HidePredictedHead()
+{
+	PredictedHeadLength = 0.f;
+
+	for (UStaticMeshComponent* Piece : PredictedSmearMeshes)
+	{
+		if (Piece != nullptr && Piece->IsVisible())
+		{
+			Piece->SetVisibility(false);
+		}
+	}
+}
+
+bool UTraceTrailComponent::EnsurePredictedElement(int32 ElementIndex)
+{
+	if (ElementIndex < 0 || ElementIndex >= MaxPredictedSmearElements)
+	{
+		return false;
+	}
+
+	const int32 RequiredNum = (ElementIndex + 1) * PartsPerSmear;
+	if (PredictedSmearMeshes.Num() >= RequiredNum)
+	{
+		return true;
+	}
+
+	// Same one-whole-element-at-a-time rule as EnsureSmearElement, for the same reason: a short array
+	// would pair one element's head band with the next one's body.
+	if (PredictedSmearMeshes.Num() != ElementIndex * PartsPerSmear)
+	{
+		return false;
+	}
+
+	for (int32 Part = 0; Part < PartsPerSmear; ++Part)
+	{
+		UMaterialInstanceDynamic* Material = nullptr;
+		UStaticMeshComponent* Piece = CreatePooledMesh(CylinderMesh.Get(), Material);
+
+		// Set on creation as well as on every placement. A piece of this pool must NEVER be visible
+		// to anyone but the carrier, so it starts that way rather than becoming that way.
+		if (Piece != nullptr)
+		{
+			Piece->SetOnlyOwnerSee(true);
+		}
+
+		PredictedSmearMeshes.Add(Piece);
+		PredictedSmearMaterials.Add(Material);
+		PredictedSmearBaseGlow.Add(0.f);
+		PredictedSmearAppliedGlowScale.Add(1.f);
+	}
+
+	return true;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1924,7 +2355,7 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, int32 FirstOwner
 // extend past the trace, outlive it, or survive a turnover.
 // -------------------------------------------------------------------------------------------------
 
-void UTraceTrailComponent::RebuildPoseGhosts(int32 LethalPointCount, int32 FirstOwnerHiddenPoint, float InvulnerableScale)
+void UTraceTrailComponent::RebuildPoseGhosts(int32 LethalPointCount, float InvulnerableScale)
 {
 	if (!AreCharacterGhostsEnabled() || LethalPointCount <= 0)
 	{
@@ -2093,16 +2524,10 @@ void UTraceTrailComponent::RebuildPoseGhosts(int32 LethalPointCount, int32 First
 		const float Remaining = FMath::Clamp(1.f - (Age / FMath::Max(0.01f, Lifetime)), 0.f, 1.f);
 		const float FadeScale = FMath::Lerp(GhostOldestGlowScale, 1.f, Remaining);
 
-		// Same rule as the smear, expressed against the same point array: a ghost is hidden from its
-		// own holder when the point it stands on is inside the near-hide window.
-		const bool bHideFromOwner = FirstOwnerHiddenPoint < LethalPointCount
-			&& Record.BirthServerTime >= TrailPoints.Items[FirstOwnerHiddenPoint].BirthServerTime;
-
+		// Whether this after-image is hidden from its own holder is NOT decided here any more: it is a
+		// question about where the local camera is this frame, and it is answered per frame, per
+		// piece, in ApplyProximityGlowFade(). See the note in RebuildVisuals().
 		Ghost->SetVisibility(true);
-		if (Ghost->bOwnerNoSee != bHideFromOwner)
-		{
-			Ghost->SetOwnerNoSee(bHideFromOwner);
-		}
 
 		if (PoseGhostBaseGlow.Num() <= GhostIndex)
 		{
@@ -2214,8 +2639,18 @@ void UTraceTrailComponent::ApplyProximityGlowFade()
 	// machine's material instances, and the lethal volume is TrailPoints — which this function does
 	// not touch and the trip test never renders. Two players standing in the same trace see their
 	// own fade and die to exactly the same geometry.
+	//
+	// IT ALSO OWNS THE OWNER-ONLY NEAR CULL (spec v5 §2), the last resort behind the fade, for a piece
+	// close enough that even ProximityFadeMinScale would be too bright in the corner of the carrier's
+	// own third-person frame. It lives here and not in the rebuild because it is a question about the
+	// CAMERA, which moves every frame while the geometry does not — and answering it in the rebuild,
+	// as a distance along the path, is what produced the reported gap. See GOwnerHideCameraRadius.
+	//
+	// The cull is why the neon check below is per-write rather than an early-out: a build that fell
+	// back to BasicShapeMaterial has no Glow parameter to fade, but it still has a carrier with a
+	// camera and still needs the cull.
 	// ------------------------------------------------------------------------------------------
-	if (!bTrailMaterialIsNeon || (SmearMeshes.Num() == 0 && PoseGhosts.Num() == 0))
+	if (SmearMeshes.Num() == 0 && PoseGhosts.Num() == 0 && PredictedSmearMeshes.Num() == 0)
 	{
 		return;
 	}
@@ -2235,25 +2670,36 @@ void UTraceTrailComponent::ApplyProximityGlowFade()
 	}
 	const FVector CameraLocation = LocalPC->PlayerCameraManager->GetCameraLocation();
 
-	// Both pools take the same treatment: a posed mannequin is exactly as unlit, exactly as emissive
-	// and exactly as standable-inside as a smear slab, so exempting it would reinstate the whiteout
-	// this function exists to prevent — from the one piece of geometry now closest to the lens.
-	auto FadePool = [&CameraLocation](
+	// IS THE LOCAL VIEWER THE CARRIER OF *THIS* TRACE? bOwnerNoSee is resolved by the renderer against
+	// the view target's owner chain, so this is the same question the flag itself asks — and it has to
+	// be asked, because writing the flag from OUR camera's distance when the owner is somebody else's
+	// pawn (or a bot) would hide a trace from a player on another machine for a reason that has
+	// nothing to do with their view.
+	const bool bLocalViewerOwnsThisTrace = (LocalPC->GetViewTarget() == GetOwner());
+	const double OwnerHideRadius = FMath::Max(0.0, static_cast<double>(GOwnerHideCameraRadius));
+	const bool bNeon = bTrailMaterialIsNeon;
+
+	// For the ghost-only body hide. Zero-length when there is no owner pawn, which switches it off.
+	const AActor* OwnerActor = GetOwner();
+	const FVector OwnerLocation = (OwnerActor != nullptr) ? OwnerActor->GetActorLocation() : FVector::ZeroVector;
+
+	// Both pools take the same treatment for the FADE: a posed mannequin is exactly as unlit, exactly
+	// as emissive and exactly as standable-inside as a smear slab, so exempting it would reinstate the
+	// whiteout this function exists to prevent — from the one piece of geometry now closest to the lens.
+	//
+	// They differ in ONE thing: @p BodyHideRadius, which is non-zero only for the ghosts. See
+	// GOwnerGhostHideDistance.
+	auto FadePool = [&CameraLocation, &OwnerLocation, bLocalViewerOwnsThisTrace, OwnerHideRadius, bNeon](
 		const auto& Pieces,
 		const TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
 		const TArray<float>& BaseGlow,
-		TArray<float>& AppliedScale)
+		TArray<float>& AppliedScale,
+		double BodyHideRadius)
 	{
-		const int32 SlotCount = FMath::Min(Pieces.Num(), Materials.Num());
-		for (int32 Slot = 0; Slot < SlotCount; ++Slot)
+		for (int32 Slot = 0; Slot < Pieces.Num(); ++Slot)
 		{
 			UMeshComponent* Piece = Pieces[Slot];
-			UMaterialInstanceDynamic* Material = Materials[Slot];
-			if (Piece == nullptr || Material == nullptr || !Piece->IsVisible())
-			{
-				continue;
-			}
-			if (!BaseGlow.IsValidIndex(Slot))
+			if (Piece == nullptr || !Piece->IsVisible())
 			{
 				continue;
 			}
@@ -2264,6 +2710,46 @@ void UTraceTrailComponent::ApplyProximityGlowFade()
 			const FBoxSphereBounds& LocalBounds = Piece->Bounds;
 			const double SurfaceDistance = FMath::Max(0.0,
 				FVector::Dist(CameraLocation, LocalBounds.Origin) - LocalBounds.SphereRadius);
+
+			// --- the owner-only near cull (spec v5 §2) --------------------------------------------
+			//
+			// Hysteresis in one direction only: a piece already hidden stays hidden until it is
+			// clear of the radius by a margin, so a piece hovering on the boundary cannot flicker
+			// on and off as the camera breathes. SetOwnerNoSee dirties the render state, so the
+			// write is guarded on an actual change either way.
+			{
+				bool bHideFromOwner = false;
+				if (bLocalViewerOwnsThisTrace && OwnerHideRadius > 0.0)
+				{
+					const double Threshold = Piece->bOwnerNoSee
+						? (OwnerHideRadius + OwnerHideCameraHysteresis)
+						: OwnerHideRadius;
+					bHideFromOwner = (SurfaceDistance < Threshold);
+				}
+
+				// The ghost-only body hide: measured from the carrier's own pawn, not from the lens,
+				// because what it prevents is a person-shaped after-image being drawn on top of the
+				// person it is a copy of. Same hysteresis, same one-viewer scope.
+				if (bLocalViewerOwnsThisTrace && BodyHideRadius > 0.0)
+				{
+					const double BodyThreshold = Piece->bOwnerNoSee
+						? (BodyHideRadius + OwnerHideCameraHysteresis)
+						: BodyHideRadius;
+					bHideFromOwner = bHideFromOwner
+						|| (FVector::Dist(OwnerLocation, LocalBounds.Origin) < BodyThreshold);
+				}
+
+				if (Piece->bOwnerNoSee != bHideFromOwner)
+				{
+					Piece->SetOwnerNoSee(bHideFromOwner);
+				}
+			}
+
+			UMaterialInstanceDynamic* Material = Materials.IsValidIndex(Slot) ? Materials[Slot].Get() : nullptr;
+			if (!bNeon || Material == nullptr || !BaseGlow.IsValidIndex(Slot))
+			{
+				continue;   // Nothing to fade — the cull above has already run, which is the point.
+			}
 
 			float Scale = 1.f;
 			if (SurfaceDistance < ProximityFadeFarDistance)
@@ -2298,8 +2784,18 @@ void UTraceTrailComponent::ApplyProximityGlowFade()
 	// TArray<TObjectPtr<UPoseableMeshComponent>> are unrelated types, and copying either into a
 	// widened scratch array every frame to share one signature would be a real per-frame cost paid
 	// for a compile-time problem.
-	FadePool(SmearMeshes, SmearMaterials, SmearBaseGlow, SmearAppliedGlowScale);
-	FadePool(PoseGhosts, PoseGhostMaterials, PoseGhostBaseGlow, PoseGhostAppliedGlowScale);
+	FadePool(SmearMeshes, SmearMaterials, SmearBaseGlow, SmearAppliedGlowScale, /*BodyHideRadius=*/0.0);
+
+	// The ghosts, and ONLY the ghosts, also step away from the carrier's own body.
+	FadePool(PoseGhosts, PoseGhostMaterials, PoseGhostBaseGlow, PoseGhostAppliedGlowScale,
+		static_cast<double>(FMath::Max(0.f, GOwnerGhostHideDistance)));
+
+	// The predicted head takes exactly the same fade and the same camera cull as everything else. It
+	// is the piece closest to the carrier, so if any part of the trace is ever going to be too bright
+	// in their own frame it is this one — exempting it would be exempting the worst case. It is NOT
+	// subject to the body hide: reaching the carrier's feet is its entire job.
+	FadePool(PredictedSmearMeshes, PredictedSmearMaterials, PredictedSmearBaseGlow,
+		PredictedSmearAppliedGlowScale, /*BodyHideRadius=*/0.0);
 }
 
 bool UTraceTrailComponent::EnsureSmearElement(int32 ElementIndex)
@@ -2642,8 +3138,9 @@ namespace
 	 * what puts the camera 450uu behind them looking FORWARD. So the one player guaranteed to have a
 	 * trace is the one player who structurally cannot see it, and an unattended screenshot harness has
 	 * no hands with which to turn round. Every capture of a carrier comes back as a picture of the
-	 * arena in front of them. Pair this with Trace.DebugTakeCore and Trace.Trail.OwnerNearHideDistance
-	 * and a headless run can photograph the after-images head-on.
+	 * arena in front of them. Pair this with Trace.DebugTakeCore (and, if the near cull is in the way,
+	 * Trace.Trail.OwnerHideCameraRadius 0) and a headless run can photograph the after-images head-on
+	 * — including the predicted head stub, which only this viewer can see.
 	 *
 	 * IT PULSES rather than holding, for the same reason Trace.DebugCrouch does: the control rotation
 	 * is also the movement basis, so a permanent 180 makes the player walk backwards down their own
@@ -2734,12 +3231,449 @@ namespace
 				return (Elapsed < Seconds);
 			}), 0.f);
 		}));
+
+	// =============================================================================================
+	// SPEC v5 §2 VERIFICATION. Two commands, because the fix makes two claims and they are different
+	// kinds of claim:
+	//
+	//   Trace.Trail.DebugHeadGap  — MEASURES the gap the user reported, in uu, on the live carrier.
+	//                               "The trace reaches their feet" is a number, so it is printed as
+	//                               one rather than argued from a screenshot.
+	//   Trace.Trail.TestHeadGap   — DASHES an enemy through the NEWEST DRAWN segment and reports
+	//                               whether the carrier died. This is the half that matters for the
+	//                               inverse hazard: the newest thing an enemy can see must still
+	//                               kill, and the prediction must not have moved where that is.
+	// =============================================================================================
+
+	UWorld* FindTrailDebugWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if ((Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+				&& Context.World() != nullptr)
+			{
+				return Context.World();
+			}
+		}
+		return nullptr;
+	}
+
+	void GatherTrailDebugCharacters(UWorld* World, TArray<ATraceCharacter*>& OutCharacters)
+	{
+		OutCharacters.Reset();
+		if (World == nullptr)
+		{
+			return;
+		}
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			if (ATraceCharacter* TraceChar = *It)
+			{
+				OutCharacters.Add(TraceChar);
+			}
+		}
+	}
+
+	/** True when this pawn is the one a human is playing on THIS machine — the case in the report. */
+	bool IsLocallyControlledHuman(const ATraceCharacter* TraceChar)
+	{
+		if (TraceChar == nullptr)
+		{
+			return false;
+		}
+		const APlayerController* PC = Cast<APlayerController>(TraceChar->GetController());
+		return PC != nullptr && PC->IsLocalPlayerController();
+	}
+
+	/** One line per trace that exists: the reported gap, and what the prediction is covering of it. */
+	void DumpHeadGap()
+	{
+		UWorld* World = FindTrailDebugWorld();
+		TArray<ATraceCharacter*> Characters;
+		GatherTrailDebugCharacters(World, Characters);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[HEADGAP] ownerHideCameraRadius=%.0f ownerGhostHideDistance=%.0f predictMaxLength=%.0f (spec v5 2). "
+			     "gapToFeet = uu from the newest LETHAL point to the carrier's feet, along the path. "
+			     "predicted = uu of that the owner-only stub draws. "
+			     "SEEN = uu to the nearest piece of their own trace the carrier's camera may actually see "
+			     "(-1 = nothing drawn); SEEN-nopredict = the same with the prediction ignored. "
+			     "SEEN is the number the bug report is about."),
+			GOwnerHideCameraRadius, GOwnerGhostHideDistance, GPredictedHeadMaxLength);
+
+		for (const ATraceCharacter* TraceChar : Characters)
+		{
+			const UTraceTrailComponent* Trail = (TraceChar != nullptr) ? TraceChar->Trail : nullptr;
+			if (Trail == nullptr || Trail->TrailPoints.Items.Num() == 0)
+			{
+				continue;
+			}
+
+			const float Gap = Trail->MeasureHeadGap();
+			const float Predicted = Trail->GetPredictedHeadLength();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HEADGAP]   %-26s localHuman=%d carrier=%d points=%3d lethal=%3d | "
+				     "gapToFeet=%6.1fuu predicted=%6.1fuu | SEEN=%7.1fuu SEEN-nopredict=%7.1fuu"),
+				*GetNameSafe(TraceChar), IsLocallyControlledHuman(TraceChar) ? 1 : 0,
+				TraceChar->IsCarrier() ? 1 : 0,
+				Trail->TrailPoints.Items.Num(), Trail->ComputeLastLethalIndex() + 1,
+				Gap, Predicted,
+				Trail->MeasureOwnerVisibleGap(/*bIncludePredictedHead=*/true),
+				Trail->MeasureOwnerVisibleGap(/*bIncludePredictedHead=*/false));
+		}
+	}
+
+	FAutoConsoleCommand CmdDebugHeadGap(
+		TEXT("Trace.Trail.DebugHeadGap"),
+		TEXT("Trace.Trail.DebugHeadGap [IntervalSeconds] [Samples] - measure the gap between a carrier and "
+		     "the end of their own drawn trace, and how much of it the owner-only predicted head is covering "
+		     "(spec v5 2). With arguments it repeats."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Interval = (Args.Num() > 0) ? FMath::Max(0.05f, FCString::Atof(*Args[0])) : 0.f;
+			const int32 Samples = (Args.Num() > 1) ? FMath::Clamp(FCString::Atoi(*Args[1]), 1, 500) : 1;
+
+			if (Interval <= 0.f || Samples <= 1)
+			{
+				DumpHeadGap();
+				return;
+			}
+
+			int32 Remaining = Samples;
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([Remaining](float /*DeltaTime*/) mutable -> bool
+				{
+					DumpHeadGap();
+					return --Remaining > 0;
+				}), Interval);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.TestHeadGap — DOES THE NEWEST VISIBLE SEGMENT STILL KILL?
+	//
+	// Same two-teleport dash as Trace.TestParry (see the long comment there for why a synthesised
+	// sweep is the right shape of test), aimed at a deliberately different segment: the LAST one in
+	// the lethal set, i.e. the newest thing that is drawn on an enemy's screen. That is the segment
+	// the prediction sits immediately in front of, so it is the one where a mistake in this pass
+	// would show up as "I dashed through the freshest part of the trace and lived".
+	//
+	// It also prints the gap measurement for the carrier at the moment of the dash, so one run
+	// answers both halves of the request: the trace reaches the carrier's feet, AND the newest
+	// segment an enemy can see is still lethal.
+	// ---------------------------------------------------------------------------------------------
+
+	struct FHeadGapTestState
+	{
+		int32 TotalRuns = 4;
+		int32 RunIndex = 0;
+		int32 Phase = 0;
+
+		int32 WaitFrames = 0;
+		int32 IdleFrames = 0;
+		int32 ScratchCount = 0;
+
+		TWeakObjectPtr<ATraceCharacter> Carrier;
+		TWeakObjectPtr<ATraceCharacter> Tripper;
+		FVector DashEnd = FVector::ZeroVector;
+		FVector TripperHome = FVector::ZeroVector;
+
+		/** Snapshotted before the sweep, because an unparried dash deletes the carrier we measured. */
+		float GapAtSweep = 0.f;
+		float PredictedAtSweep = 0.f;
+		int32 LethalAtSweep = 0;
+		bool bCarrierWasLocalHuman = false;
+
+		int32 KilledCount = 0;
+		int32 SurvivedCount = 0;
+		int32 AbortedCount = 0;
+	};
+
+	bool TickHeadGapTest(FHeadGapTestState& State)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		if (State.RunIndex >= State.TotalRuns)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HEADGAPTEST] DONE. %d/%d dashes through the NEWEST DRAWN segment killed the carrier, "
+				     "%d did not, %d aborted. The newest visible segment is lethal iff killed == runs."),
+				State.KilledCount, State.TotalRuns, State.SurvivedCount, State.AbortedCount);
+			return false;
+		}
+
+		// ---- phase 0: find a living carrier with enough trace to aim at -------------------------
+		if (State.Phase == 0)
+		{
+			TArray<ATraceCharacter*> Characters;
+			GatherTrailDebugCharacters(World, Characters);
+
+			ATraceCharacter* Carrier = nullptr;
+			int32 LethalPoints = 0;
+			for (ATraceCharacter* TraceChar : Characters)
+			{
+				if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive()
+					&& TraceChar->Trail != nullptr)
+				{
+					// PREFER THE LOCAL HUMAN. The bug is about the local player's trace, so if the
+					// local player is carrying, that is the trace to test — but a bot carrier is
+					// still a valid subject for the lethality half and keeps an unattended run
+					// producing samples.
+					const int32 Lethal = TraceChar->Trail->ComputeLastLethalIndex() + 1;
+					if (Lethal > LethalPoints || (Carrier != nullptr && IsLocallyControlledHuman(TraceChar)
+						&& !IsLocallyControlledHuman(Carrier)))
+					{
+						Carrier = TraceChar;
+						LethalPoints = Lethal;
+					}
+				}
+			}
+
+			if (Carrier == nullptr || LethalPoints < 4)
+			{
+				if (Carrier == nullptr)
+				{
+					if (++State.IdleFrames > 36000)
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[HEADGAPTEST] gave up: no living Core carrier ever appeared."));
+						return false;
+					}
+					return true;
+				}
+
+				if (++State.WaitFrames > 1800)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[HEADGAPTEST] gave up waiting for a carrier with 4+ lethal trace points (had %d)."),
+						LethalPoints);
+					return false;
+				}
+				return true;
+			}
+
+			State.IdleFrames = 0;
+			State.WaitFrames = 0;
+			State.Carrier = Carrier;
+			State.Phase = 1;
+			return true;
+		}
+
+		ATraceCharacter* Carrier = State.Carrier.Get();
+
+		if (State.Phase <= 2 && (Carrier == nullptr || !Carrier->IsAlive() || Carrier->Trail == nullptr))
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[HEADGAPTEST %d] aborted: carrier gone before the sweep resolved."),
+				State.RunIndex + 1);
+			++State.AbortedCount;
+			++State.RunIndex;
+			State.Phase = 0;
+			State.Carrier = nullptr;
+			State.Tripper = nullptr;
+			return true;
+		}
+
+		// ---- phase 1: line the tripper up across the NEWEST lethal segment ----------------------
+		if (State.Phase == 1)
+		{
+			const int32 LastLethal = Carrier->Trail->ComputeLastLethalIndex();
+			if (LastLethal < 1)
+			{
+				State.Phase = 0;
+				return true;
+			}
+
+			// THE NEWEST DRAWN SEGMENT, not a comfortable one in the middle. This is the segment the
+			// predicted stub joins onto, and the one an enemy chasing a carrier actually meets.
+			const int32 SegmentIndex = LastLethal - 1;
+			const FVector SegmentStart = Carrier->Trail->TrailPoints.Items[SegmentIndex].Location;
+			const FVector SegmentEnd = Carrier->Trail->TrailPoints.Items[SegmentIndex + 1].Location;
+
+			FVector Along = SegmentEnd - SegmentStart;
+			Along.Z = 0.0;
+			if (!Along.Normalize())
+			{
+				State.Phase = 0;
+				return true;
+			}
+			const FVector Across = FVector::CrossProduct(Along, FVector::UpVector).GetSafeNormal();
+			const FVector Midpoint = (SegmentStart + SegmentEnd) * 0.5;
+
+			TArray<ATraceCharacter*> Candidates;
+			GatherTrailDebugCharacters(World, Candidates);
+
+			TArray<ATraceCharacter*> Enemies;
+			for (ATraceCharacter* Candidate : Candidates)
+			{
+				if (Candidate != nullptr && Candidate != Carrier && Candidate->IsAlive()
+					&& Candidate->GetTeam() != ETraceTeam::None
+					&& Candidate->GetTeam() != Carrier->GetTeam())
+				{
+					Enemies.Add(Candidate);
+				}
+			}
+			if (Enemies.Num() == 0)
+			{
+				State.Phase = 0;
+				return true;
+			}
+
+			// Rotate through the roster on retries — one pawn's dash cooldown must not delete a run.
+			ATraceCharacter* Tripper = Enemies[State.ScratchCount % Enemies.Num()];
+
+			State.GapAtSweep = Carrier->Trail->MeasureHeadGap();
+			State.PredictedAtSweep = Carrier->Trail->GetPredictedHeadLength();
+			State.LethalAtSweep = LastLethal + 1;
+			State.bCarrierWasLocalHuman = IsLocallyControlledHuman(Carrier);
+
+			const FVector DashStart = Midpoint + Across * 260.0;
+			State.DashEnd = Midpoint - Across * 240.0;
+			State.Tripper = Tripper;
+			State.TripperHome = Tripper->GetActorLocation();
+
+			Tripper->SetActorLocation(DashStart, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+			Tripper->SetActorRotation((-Across).Rotation());
+			if (UTraceCharacterMovementComponent* TripperMovement = Tripper->GetTraceMovement())
+			{
+				TripperMovement->StartDash();
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HEADGAPTEST %d/%d] carrier=%s localHuman=%d lethal=%d | gapToFeet=%.1fuu predicted=%.1fuu "
+				     "residual=%.1fuu | %s will dash across the NEWEST segment %d/%d at %s"),
+				State.RunIndex + 1, State.TotalRuns, *GetNameSafe(Carrier),
+				State.bCarrierWasLocalHuman ? 1 : 0, State.LethalAtSweep,
+				State.GapAtSweep, State.PredictedAtSweep, FMath::Max(0.f, State.GapAtSweep - State.PredictedAtSweep),
+				*GetNameSafe(Tripper), SegmentIndex, LastLethal, *Midpoint.ToCompactString());
+
+			State.Phase = 2;
+			return true;
+		}
+
+		// ---- phase 2: the frame the trip test resolves ------------------------------------------
+		if (State.Phase == 2)
+		{
+			ATraceCharacter* Tripper = State.Tripper.Get();
+			if (Tripper == nullptr)
+			{
+				State.Phase = 0;
+				return true;
+			}
+
+			// A run where the dash was refused measures nothing at all, and a negative produced by an
+			// absent dash is worse than no result. Scratch and retry on another pawn.
+			if (!Tripper->IsDashing())
+			{
+				if (++State.ScratchCount > 20)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[HEADGAPTEST %d] aborted: %s would not dash after %d attempts (cooldown?)."),
+						State.RunIndex + 1, *GetNameSafe(Tripper), State.ScratchCount);
+					++State.AbortedCount;
+					++State.RunIndex;
+					State.ScratchCount = 0;
+				}
+
+				Tripper->SetActorLocation(State.TripperHome, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+				State.Phase = 0;
+				State.Carrier = nullptr;
+				State.Tripper = nullptr;
+				return true;
+			}
+
+			Tripper->SetActorLocation(State.DashEnd, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+			State.Phase = 3;
+			return true;
+		}
+
+		// ---- phase 3: off the trace, so the run measures ONE sweep ------------------------------
+		if (State.Phase == 3)
+		{
+			if (ATraceCharacter* Tripper = State.Tripper.Get())
+			{
+				Tripper->SetActorLocation(State.TripperHome, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+			}
+			State.Phase = 4;
+			return true;
+		}
+
+		// ---- phase 4+: let the kill land, then score --------------------------------------------
+		if (State.Phase < 7)
+		{
+			++State.Phase;
+			return true;
+		}
+
+		{
+			const bool bCarrierAlive = (Carrier != nullptr) && Carrier->IsAlive();
+			if (bCarrierAlive)
+			{
+				++State.SurvivedCount;
+			}
+			else
+			{
+				++State.KilledCount;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HEADGAPTEST %d/%d] RESULT: dash through the NEWEST DRAWN segment -> carrier %s. %s "
+				     "(gapToFeet was %.1fuu, predicted %.1fuu)"),
+				State.RunIndex + 1, State.TotalRuns,
+				bCarrierAlive ? TEXT("SURVIVED") : TEXT("DIED (trace broken)"),
+				bCarrierAlive ? TEXT("*** FAIL - the newest visible segment did not kill ***") : TEXT("PASS"),
+				State.GapAtSweep, State.PredictedAtSweep);
+
+			++State.RunIndex;
+			State.ScratchCount = 0;
+			State.Phase = 0;
+			State.Carrier = nullptr;
+			State.Tripper = nullptr;
+		}
+
+		return true;
+	}
+
+	FAutoConsoleCommand CmdTestHeadGap(
+		TEXT("Trace.Trail.TestHeadGap"),
+		TEXT("Trace.Trail.TestHeadGap [Runs] - dash an enemy through the NEWEST DRAWN segment of a live "
+		     "carrier's trace and report whether it still kills, alongside the measured gap between the "
+		     "carrier and the end of their own trace (spec v5 2)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FHeadGapTestState State;
+			State.TotalRuns = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 50) : 4;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HEADGAPTEST] starting %d dashes through the NEWEST DRAWN segment of a live carrier's trace."),
+				State.TotalRuns);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float /*DeltaTime*/) mutable -> bool
+				{
+					return TickHeadGapTest(State);
+				}));
+		}));
 }
 #endif // !UE_BUILD_SHIPPING
 
 void UTraceTrailComponent::DestroyVisualPool()
 {
 	for (UStaticMeshComponent* Piece : SmearMeshes)
+	{
+		if (Piece != nullptr)
+		{
+			Piece->DestroyComponent();
+		}
+	}
+
+	for (UStaticMeshComponent* Piece : PredictedSmearMeshes)
 	{
 		if (Piece != nullptr)
 		{
@@ -2759,6 +3693,12 @@ void UTraceTrailComponent::DestroyVisualPool()
 	SmearMaterials.Reset();
 	SmearBaseGlow.Reset();
 	SmearAppliedGlowScale.Reset();
+
+	PredictedSmearMeshes.Reset();
+	PredictedSmearMaterials.Reset();
+	PredictedSmearBaseGlow.Reset();
+	PredictedSmearAppliedGlowScale.Reset();
+	PredictedHeadLength = 0.f;
 
 	PoseGhosts.Reset();
 	PoseGhostMaterials.Reset();

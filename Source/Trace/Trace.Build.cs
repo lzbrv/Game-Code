@@ -38,7 +38,16 @@ public class Trace : ModuleRules
 			"EnhancedInput",      // UInputAction, UInputMappingContext, UEnhancedInputComponent
 			"DeveloperSettings",  // UDeveloperSettings base for UTraceSettings
 			"NetCore",            // FFastArraySerializer (Net/Serialization/FastArraySerializer.h)
-			"AIModule"            // AAIController base for ATraceBotController
+			"AIModule",           // AAIController base for ATraceBotController
+			// Both of the following are LINK-time requirements of UI/TraceNetworking.cpp. Their
+			// headers resolve transitively through Engine, so omitting them still COMPILES cleanly
+			// and then fails at the very end with "Undefined symbols for architecture arm64" - do
+			// not remove either because the includes appear to be satisfied.
+			"Sockets",            // ISocketSubsystem::Get/CreateUniqueSocket - adapter enumeration
+			                      // and the UDP 7777 port probe behind TraceNet::.
+			"ApplicationCore"     // FPlatformApplicationMisc::ClipboardPaste - paste into the JOIN
+			                      // address field. Optional: set TRACE_HAS_CLIPBOARD 0 at the top of
+			                      // TraceNetworking.cpp and this entry can go, at the cost of paste.
 			// AIModule is an engine RUNTIME module, not a plugin, so this adds no plugin dependency
 			// and no asset dependency. Nothing here uses BehaviorTree, Blackboard or the navigation
 			// system: those would need .uassets (contract 2) or a runtime-built navmesh. The bots

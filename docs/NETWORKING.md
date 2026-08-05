@@ -1,7 +1,136 @@
 # Networking — how to playtest, and what the prototype actually does
 
-Two halves. The first is operational: how to get people into the same match, locally and remotely.
-The second is explanatory: what Trace's netcode does and why, in plain English.
+Three parts now. **§0 is the one you want**: playing together from inside the game, with no scripts
+and no terminal. After that, the operational detail (scripts, dedicated servers, Tailscale), and
+then the explanatory half — what Trace's netcode does and why, in plain English.
+
+---
+
+## 0. Playing together — from the title screen
+
+**This is the normal path. Nobody needs a script or a terminal.**
+
+### Host
+
+1. Launch Trace. You land on the title screen.
+2. Under the tagline there is a chip that reads **`YOUR ADDRESS   100.101.102.103:7777`**. That is
+   the address other people type. It is also printed on the **PLAY** row and repeated inside the
+   JOIN prompt, so you never have to go looking for it.
+3. Press **PLAY**.
+
+That is the whole host flow. **PLAY always starts a listen server** — every match is joinable, and
+there is no separate "host" button to forget. A listen server with nobody connected ticks exactly
+like a standalone game, so this costs a solo player nothing at all.
+
+While the match runs, the top-right of the HUD reads **`HOSTING  100.101.102.103:7777`** with a
+count of the humans in the match underneath. You can read your own address off your own screen
+mid-game when somebody asks for it.
+
+### Everyone else
+
+1. Launch Trace.
+2. Select **JOIN** and press Enter. A prompt opens with a text field.
+3. Type the host's address. **Ctrl+V / Cmd+V pastes.** Backspace, Delete and the arrow keys work;
+   there is a visible caret. If you leave the port off, `:7777` is added for you.
+4. Press **Enter**.
+
+The address is **remembered between sessions** (in `Saved/Config/<Platform>/GameUserSettings.ini`,
+which is not in source control), so the next test is JOIN → Enter → Enter. It is remembered on the
+*attempt*, not on success — a join that times out because a firewall was shut is exactly the one you
+will want to retry unchanged.
+
+### When it does not work, it says so
+
+A failed connection used to be completely silent, which is why the Demo 5 report could not tell a
+broken VPN from a broken game. Now:
+
+- The travel screen names what it is doing — `CONNECTING TO 100.101.102.103:7777`.
+- On failure the game returns to the title screen with an amber banner across the top giving the
+  reason in plain English (`CONNECTION TIMED OUT. CHECK THE ADDRESS, THE VPN, AND UDP 7777 ON THE
+  HOST.`) plus the engine's own failure code underneath for the bug report.
+- Mid-match disconnects raise the same banner over the HUD.
+- If UDP 7777 is already held by another process, you are warned on the title screen *and* before
+  travelling. **The port moves — hosting does not fail.** Measured: with a second copy of the game
+  already on 7777, `UIpNetDriver` binds the next free port instead and logs
+  `IpNetDriver listening on port 7778`. The match is perfectly joinable, just not at `:7777`, so the
+  in-game chip reads the port the driver *actually* bound (`UNetDriver::LocalAddr`) rather than the
+  one that was asked for. **Read the address off the HUD, not off the title screen, if you saw that
+  warning.**
+- If a net driver never comes up at all, the HUD reads `OFFLINE - NOBODY CAN JOIN` rather than
+  pretending to host. (The engine does not fail loudly on its own here: `UEngine::LoadMap` logs one
+  `LogNet` error and loads the map anyway, standalone. That silent degrade is the trap this replaces.)
+
+### Firewall — the one thing outside the game
+
+**The host must allow inbound UDP 7777.**
+
+- **macOS**: System Settings → Network → Firewall → Options → allow incoming connections for
+  `UnrealEditor` (and `UnrealEditor-Cmd`, and `Trace` if you run a packaged build). macOS normally
+  prompts the first time; **if anyone ever clicked "Deny" it stays denied, silently, forever.** This
+  has cost people whole evenings.
+- **Windows**: allow the same binaries on Private networks in Windows Defender Firewall.
+- **Over Tailscale** this is usually all you need — no port forwarding, no router config. See §4.
+- Symptom of a blocked port: the client sits on `CONNECTING TO …` and then reports
+  `CONNECTION TIMED OUT`. The host's log shows nothing at all, because nothing ever arrived.
+
+### Checking it worked
+
+In the console (**`~`**) on either machine:
+
+```
+TraceNetInfo
+```
+
+prints the net mode, this machine's endpoint, every local adapter address, and the full PlayerState
+roster with bots marked. Two non-bot entries means two humans are in one match. The title screen
+also logs the host endpoint and whether UDP 7777 is free on every launch, at `Display`, so the answer
+is already in any log somebody sends you.
+
+### What the bug actually was
+
+For the record, because it will save the next person the same week: `ATraceMenuHUD::StartMatch()`
+travelled to the arena with `?difficulty=…?mode=…` and **no `listen` option**. Without that one word
+`UEngine::LoadMap` never calls `UWorld::Listen`, no net driver is created and nothing binds UDP 7777.
+Both machines pressed PLAY, both got a private standalone match, and no connection was ever possible
+— the VPN was almost certainly fine. There was also no Host or Join UI anywhere in the project.
+`Scripts/run-listen-server.sh` *did* append `?listen`, which is exactly why the documented path
+looked correct while the in-game path silently was not.
+
+### Three more bugs that were hiding behind it
+
+The missing `listen` meant no client had ever actually reached a match, so nothing downstream of the
+join had ever run. All three of these turned up in the first two-process test and are fixed:
+
+1. **The client had no arena and fell through the world.** `ATraceArenaBuilder` is spawned server-side
+   and clients build their geometry from its `BeginPlay` — so the actor has to *replicate* first. Its
+   `NetCullDistanceSquared` was the 15000 uu default and the player starts are at X = ±15600, so it
+   was irrelevant from frame one and never arrived. The client's log had no `Arena built` line at all
+   and its pawn logged `Z=-19636`, falling. Fixed with `bAlwaysRelevant = true` in the constructor.
+2. **The client saw only 5 of the 10 players.** Same root cause on `ATraceCharacter`: a 15000 uu cull
+   radius on a 33600 × 9600 field means half the roster is never relevant. Now
+   `SetNetCullDistanceSquared(40000² )`, which covers the diagonal. Reading an enemy's trail from
+   across the arena is the whole game, so there is no distance at which a player stops mattering.
+3. **Every ground correction was being thrown away.** A real client logged this **2948 times in 30
+   seconds**:
+
+   ```
+   LogNetPlayerMovement: Warning: ClientAdjustPosition_Implementation could not resolve the new
+   relative movement base actor, ignoring server correction! ... on base None
+   ```
+
+   `MovementBaseUtility::IsDynamicBase()` is *exactly* `Mobility == Movable`, and the arena builder
+   creates all 1187 pieces of geometry Movable — so the engine classified the **floor** as a moving
+   platform, sent corrections as base-relative, and named a primitive component that is built locally
+   on each machine, is not a replicated subobject, has no NetGUID and can never resolve on a client.
+   A client that cannot be corrected while standing on the floor drifts from the server without
+   limit, which is the network half of *"jumping on the edge of a raised section feels like rubber
+   banding"*. `ATraceCharacter::SetBase` now refuses the arena as a movement base — the arena does
+   not move, so it must not be one. **Measured after: 0 of these warnings, and 1 correction total
+   (at spawn) where there had been 24.**
+
+If you are chasing a movement desync, `-TraceLedgeTest -TraceMoveCorrections` on a **client** against
+a listen server is the run that shows it; on a listen host corrections are structurally zero and
+every number reads clean.
 
 ---
 
@@ -73,6 +202,10 @@ Which is why the next two sections exist.
 **This is the default path for this team.** A dedicated server needs a source-built engine, which
 nobody has yet (§3) — so two real processes with one of them hosting is how you catch replication
 bugs today.
+
+> **You do not need any of this to play together — see §0.** The scripts below exist for automation
+> and for launching straight into the arena without passing through the menu. They and the in-game
+> flow produce the same thing: a listen server on UDP 7777.
 
 Host, from the repo root:
 
@@ -242,7 +375,14 @@ network.)
    (`login.tailscale.com` → **Users → Invite**). They accept and sign in to the *same* tailnet.
 3. Everyone runs `tailscale status` and sees four machines with `100.x` addresses.
 
-**Then play:**
+**Then play — the normal way (no terminal):**
+
+Host launches Trace and presses **PLAY**. The title screen already shows their tailnet address in the
+`YOUR ADDRESS` chip — `tailscale ip -4` and the chip will agree, because the address ranking prefers
+the `100.64.0.0/10` CGNAT block Tailscale hands out over anything else. Everyone else picks **JOIN**,
+pastes that address, presses Enter. See §0.
+
+**Or from the terminal, if you are scripting it:**
 
 ```bash
 # Host — find your tailnet address, then start a server exactly as in §2:
@@ -255,7 +395,12 @@ Scripts/run-client.sh 100.101.102.103
 #   open 100.101.102.103:7777
 ```
 
-That is genuinely all of it. No firewall rule, no router login.
+That is genuinely all of it. No router login.
+
+**Firewall, even on Tailscale.** Tailscale removes the *router* problem, not the *host machine*
+problem: the host's own OS firewall still has to allow the game binary to accept inbound
+connections on UDP 7777. On macOS that is System Settings → Network → Firewall → Options. If it was
+ever denied it stays denied silently — see §0.
 
 Two caveats worth knowing:
 - Tailscale prefers a **direct** peer-to-peer path but will fall back to a relay (DERP) if both
@@ -448,6 +593,7 @@ Press **`~`** in-game.
 
 | Command | What it does |
 |---|---|
+| `TraceNetInfo` | **Trace's own.** Net mode, this machine's endpoint, every local adapter, and the full PlayerState roster with bots marked. The direct answer to "are we in the same match?" |
 | `open <ip>:7777` | Connect to a server |
 | `open <map>?listen` | Become a listen server on the given map |
 | `disconnect` | Drop back to the main menu / local game |
@@ -483,6 +629,27 @@ Legacy equivalents if the above are unavailable on your build: `Net.PktLag`, `Ne
 
 Run emulation **on the client** to simulate that client's bad connection; run it **on the server**
 to make everyone's life hard at once.
+
+### Running these headlessly — `-TraceExec`
+
+Most of Trace's verification commands (`Trace.VerifyKnobs`, `Trace.ModeB.Verify 1`,
+`Trace.Trail.TestHeadGap`, `Trace.TestRecoil`) only mean anything once there is a live match, and the
+engine's own `-ExecCmds` fires during engine init — on the **title screen**, where every one of them
+is a no-op. So there was no way to run them without a human typing into a console, which is how a
+check quietly stops being run.
+
+```bash
+-TraceExec="Trace.VerifyKnobs|Trace.ModeB.Verify 1"  -TraceExecAt=12  [-TraceExecOn=Match|Menu]
+```
+
+Commands are separated by `|` (not `,` — several of them take numeric arguments). `-TraceExecAt` is
+seconds after the HUD comes up and defaults to 8; `-TraceExecOn` defaults to `Match`. They are run in
+order, through the local player controller, so commands that resolve "the local pawn" work.
+
+**Do not batch two commands that both drive pawns.** Running `Trace.TestRecoil` alongside
+`Trace.Trail.TestHeadGap` in one pass reported `max aimErr 116.78 deg`; run in isolation the same
+build reports `0.0000 deg over 347 samples`. The head-gap test dashes characters around, and the
+recoil harness measured the yank. One driving test per run.
 
 ### Trace-specific debugging
 
@@ -521,3 +688,48 @@ PIE; see §1 for what PIE hides.
 - [ ] **Late joiner** sees correct scores, correct carrier, correct trail. (Join a match already
       in progress — this catches replication that only works via RPC and not via property state.)
 - [ ] **Client disconnect mid-carry** drops the Core rather than deleting it.
+
+### Two processes on one machine, headlessly
+
+The entry points in §0 can be driven from the command line, which is how this flow is regression
+tested. `-TraceAutoPlay=<sec>` presses PLAY (and therefore hosts). `-TraceAutoJoin=<sec>` drives the
+real JOIN row — it selects the row, opens the real prompt, fills the real field and, **2.5 s later**,
+submits through the real `ConfirmJoin()`. That delay is deliberate: it is the window in which
+`-TraceAutoShot` can photograph the filled prompt. The address comes from `-TraceJoinAddress=`, or
+from the remembered one if that is absent.
+
+```bash
+UE="/Users/Shared/Epic Games/UE_5.8/Engine/Binaries/Mac/UnrealEditor.app/Contents/MacOS/UnrealEditor"
+
+# Host
+"$UE" Trace.uproject -game -RenderOffScreen -windowed -resx=1280 -resy=720 \
+    -abslog=/tmp/host.log -TraceAutoPlay=3 &
+
+# Client, a few seconds later
+"$UE" Trace.uproject -game -RenderOffScreen -windowed -resx=1280 -resy=720 \
+    -abslog=/tmp/client.log -TraceAutoJoin=3 -TraceJoinAddress=127.0.0.1:7777 &
+```
+
+What to grep for, and what each line proves:
+
+What to grep for, and what each line proves. Note that `Join succeeded` is a **server**-side line and
+`Welcomed by server` is the **client**-side one — they are the two ends of the same handshake, so
+check for each in the right log:
+
+| Log | Line | Proves |
+|---|---|---|
+| host | `Title screen: PLAY -> /Game/Maps/Arena?difficulty=…?mode=…?listen` | the URL carries `listen` at all — this is the bug that was fixed |
+| host | `IpNetDriver listening on port 7777` | `?listen` reached `UWorld::Listen` and the socket bound |
+| host | `NotifyAcceptedConnection … RemoteAddr:` then `Join succeeded:` | a real remote connection completed |
+| host | `[Net] PlayerController BeginPlay: netMode=ListenServer local=0 authority=1` | a **remote** player's controller exists on the server (`local=0` is the tell) |
+| host | `Evicted a bot to make room for a human.` | bots yield their slot as humans arrive |
+| host + client | `[Net] … - 2 human player(s) of 10 player states, N characters in the world.` | both ends agree on the roster |
+| client | `Title screen: JOIN -> ClientTravel('…', TRAVEL_Absolute)` | the JOIN row, not a command-line shortcut, started the connection |
+| client | `Welcomed by server (Level: /Game/Maps/Arena, Game: /Script/Trace.TraceGameMode)` | the client is in the server's match |
+| client | `[Net] Match HUD ready: CLIENT endpoint=…` | the client HUD resolved its role from the real net driver |
+
+`-TraceAutoShot=<sec>` on either process writes a screenshot to `Saved/Screenshots/`, which is how
+the client's view of the match is confirmed. Always pass `-RenderOffScreen` so no window appears.
+
+**On a shared machine, kill only your own PIDs.** `pkill -f UnrealEditor` will also take out anybody
+else's run, including a headless test somebody is halfway through.

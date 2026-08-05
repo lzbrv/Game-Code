@@ -34,6 +34,29 @@ namespace TraceAutoShot
 	 *            told apart at a glance in Saved/Screenshots/.
 	 */
 	void Arm(AHUD* OwnerHUD, const TCHAR* Tag);
+
+	/**
+	 * Runs console commands a fixed number of seconds after a HUD comes up.
+	 *
+	 *     -TraceExec="Trace.VerifyKnobs|Trace.ModeB.Verify"  -TraceExecAt=8
+	 *
+	 * WHY THIS EXISTS. The project's verification commands (Trace.VerifyKnobs, Trace.ModeB.Verify,
+	 * Trace.Trail.TestHeadGap, Trace.TestRecoil, ...) only mean anything once there is a match, a
+	 * pawn and a Core. The engine's own -ExecCmds fires once during engine init, on the TITLE
+	 * screen, where every one of them is a no-op - so headlessly there was no way to invoke them at
+	 * all and they could only ever be run by a human typing into a console. That is exactly the kind
+	 * of check that silently stops being run.
+	 *
+	 * Commands are separated by '|' rather than ',' because several of them take numeric arguments
+	 * and a comma would have to be escaped past both the shell and FParse.
+	 *
+	 * Same arm-once-per-world rule as Arm(): a HUD is rebuilt on travel, so the menu HUD and the
+	 * match HUD each get one chance, and @p Tag decides which. Dev-only; compiles out of Shipping.
+	 *
+	 * @param Tag Must match -TraceExecOn= (default "Match") or nothing is scheduled. This is what
+	 *            stops a match-only command from firing against the title screen.
+	 */
+	void ArmDeferredExec(AHUD* OwnerHUD, const TCHAR* Tag);
 }
 
 #endif // !UE_BUILD_SHIPPING

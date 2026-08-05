@@ -44,6 +44,7 @@
 #include "Net/TraceLagCompensationComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "World/TraceArenaBuilder.h"          // SetBase(): the arena is not a moving platform
 
 namespace TraceCharacterLayout
 {
@@ -614,6 +615,22 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 
 	bReplicates = true;
 	SetReplicateMovement(true);
+
+	// MEASURED (spec v5 section 0 acceptance run): a joining client saw only 5 of the 10 characters.
+	// APawn's default NetCullDistanceSquared is 225000000 = 15000 uu, and this field is 33600 x 9600
+	// - a corner-to-corner distance of ~34900 uu - so on a full-length field half the roster is
+	// never relevant and simply is not in the client's world. Trace's whole premise is reading an
+	// enemy's trail from across the arena, so there is no distance at which a player stops mattering.
+	//
+	// 40000 uu covers the diagonal with headroom. Squared it is 1.6e9, which is exact in a float
+	// (it is 1.6e9 < 2^31 and the value has few significant digits), so no precision game is being
+	// played here. Ten pawns on one field is a trivial relevancy set; this is not a bandwidth risk.
+	//
+	// Written through the SETTER, not the field. Direct access to NetCullDistanceSquared is
+	// UE_DEPRECATED(5.5) and clang here reports it; Unreal builds this module warnings-as-errors on
+	// MSVC, so the field form is a Windows build break waiting to happen (and the deprecation note
+	// says it stops compiling outright next release).
+	SetNetCullDistanceSquared(40000.f * 40000.f);
 
 	// Set here so the class default is right for a pawn that is spawned and never possessed, and
 	// re-derived from that default every time ACharacter::UnCrouch calls RecalculateBaseEyeHeight().
@@ -2136,6 +2153,48 @@ void ATraceCharacter::OnStartCrouch(float HalfHeightAdjust, float ScaledHalfHeig
 void ATraceCharacter::OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust)
 {
 	Super::OnEndCrouch(HalfHeightAdjust, ScaledHalfHeightAdjust);
+}
+
+// -----------------------------------------------------------------------------------------------
+// Movement base — the arena is not a moving platform. Full reasoning on the declarations.
+// -----------------------------------------------------------------------------------------------
+
+bool ATraceCharacter::ShouldIgnoreAsMovementBase(const UPrimitiveComponent* BaseComponent)
+{
+	if (BaseComponent == nullptr)
+	{
+		return false;
+	}
+
+	// Cheap out first: anything that is not Movable is already a static base as far as the engine is
+	// concerned (MovementBaseUtility::IsDynamicBase is exactly a Movable test), so it never produces
+	// a base-relative correction and there is nothing to suppress.
+	if (BaseComponent->Mobility != EComponentMobility::Movable)
+	{
+		return false;
+	}
+
+	// The arena and only the arena. Characters and the Core are real dynamic bases.
+	return BaseComponent->GetOwner() != nullptr
+		&& BaseComponent->GetOwner()->IsA<ATraceArenaBuilder>();
+}
+
+void ATraceCharacter::SetBase(FMovementBaseInterfaceData* MovementBaseInterfaceData, const FName BoneName, bool bNotifyActor)
+{
+	const UPrimitiveComponent* AsPrimitive = (MovementBaseInterfaceData != nullptr)
+		? Cast<UPrimitiveComponent>(MovementBaseInterfaceData->GetMovementBaseObject())
+		: nullptr;
+
+	if (ShouldIgnoreAsMovementBase(AsPrimitive))
+	{
+		// Not "skip the call" — the pawn may currently be based on something and has to be told it
+		// no longer is, or it keeps a stale base forever.
+		FMovementBaseInterfaceData* NoBase = nullptr;
+		Super::SetBase(NoBase, NAME_None, bNotifyActor);
+		return;
+	}
+
+	Super::SetBase(MovementBaseInterfaceData, BoneName, bNotifyActor);
 }
 
 void ATraceCharacter::UpdateCrouchPresentation(float DeltaSeconds)

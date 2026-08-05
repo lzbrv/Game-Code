@@ -222,6 +222,35 @@ public:
 	 */
 	void LogInputDiagnostics(const TCHAR* Context) const;
 
+	// -----------------------------------------------------------------------------------------
+	// Networking diagnostics (spec v5 §0).
+	//
+	// Neither of these changes behaviour. They exist because the Demo 5 multiplayer report — "I'm
+	// unsure if we were actually on a working network-client setup" — could not be answered from the
+	// evidence that existed, and the cheapest permanent fix for that is for the answer to already be
+	// in every log.
+	// -----------------------------------------------------------------------------------------
+
+	/**
+	 * One Display line: net mode, whether this controller is local, whether it has authority, and
+	 * the player it belongs to.
+	 *
+	 * Emitted for EVERY controller in BeginPlay, including the server-side proxies of remote
+	 * players. On a listen server hosting one other human that is three lines, and the fact that
+	 * there are three is itself the proof the connection worked.
+	 */
+	void LogNetworkRole(const TCHAR* Context) const;
+
+	/**
+	 * `TraceNetInfo` in the console: role, endpoint, every local adapter address, and the full
+	 * PlayerState roster with bots marked.
+	 *
+	 * Exec rather than a cvar because the question it answers ("who is actually in this match?") is
+	 * asked once, by hand, when something looks wrong — and because a cvar cannot print a list.
+	 */
+	UFUNCTION(Exec)
+	void TraceNetInfo();
+
 private:
 	/**
 	 * Emits ONE Display line the first time each action ever fires, then never again.

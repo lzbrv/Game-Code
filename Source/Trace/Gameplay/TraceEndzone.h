@@ -27,11 +27,13 @@ class UPrimitiveComponent;
  * crosses the line by a sideline and does not score reads as a broken trigger, not as a design
  * decision.
  *
- * SHAPE IN MODE B (ETraceScoringMode::ThrownCoreAndGoals, spec v4 §7). A GOAL: the same depth along X, but only
- * ATraceArenaBuilder::GoalHalfWidth() either side of the centre line (a third of the field width by
- * default) and only ClampedGoalHeight() tall, so it reads as a goal rather than as a wall. Same
- * rule: the builder draws the posts, the crossbar and the mouth patch from the same two functions
- * that size this box.
+ * SHAPE IN MODE B (ETraceScoringMode::ThrownCoreAndGoals, spec v4 §7, resized by spec v5 §4). A GOAL: the same
+ * depth along X, but only ATraceArenaBuilder::GoalHalfWidth() either side of the centre line (1000 uu
+ * by default, i.e. a 2000 uu mouth in a 9600 uu field) and only ClampedGoalHeight() tall (440 uu), so
+ * it reads as a goal rather than as a wall. Both numbers shrank in v5 - "for game mode b ONLY ...
+ * decrease the size of the goal (reduce height and width)" - by the same factor, so the mouth kept
+ * its proportions. Same rule as mode A: the builder draws the posts, the crossbar and the mouth
+ * patch from the same two functions that size this box.
  *
  * WHY ONE CLASS AND NOT TWO. Everything below - the team check, the carrier check, the debounce, the
  * geometric poll - is identical for both shapes, because "the carrier got inside the volume" is the

@@ -290,6 +290,48 @@ public:
 	virtual void OnStartCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust) override;
 	virtual void OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust) override;
 
+	/**
+	 * MEASURED MULTIPLAYER BUG (spec v5 §0 + §7). Refuses the arena as a movement base.
+	 *
+	 * THE SYMPTOM. A real client connected to a listen server logged 2948 of these in 30 seconds:
+	 *
+	 *   LogNetPlayerMovement: Warning: ClientAdjustPosition_Implementation could not resolve the
+	 *   new relative movement base actor, IGNORING SERVER CORRECTION! ... on base None
+	 *
+	 * Every one of those is a position correction the server sent and the client threw away. A
+	 * client that cannot be corrected while it is standing on the floor is a client whose position
+	 * is free to drift from the server's without limit - which is the network half of "jumping on
+	 * the edge of a raised section feels like rubber banding", and no amount of mantle fixes it.
+	 *
+	 * THE MECHANISM, from the engine source rather than from guesswork.
+	 * MovementBaseUtility::IsDynamicBase() is `Mobility == EComponentMobility::Movable` and nothing
+	 * else, and UseRelativeLocation() is a straight alias for it. ATraceArenaBuilder creates all
+	 * 1187 pieces of its geometry Movable (runtime-spawned components with no baked lighting to gain
+	 * from Static), so the engine classifies the FLOOR as a moving platform. The server therefore
+	 * sends corrections as base-RELATIVE, naming the primitive component the pawn stands on - and
+	 * that component is built locally in BeginPlay on each machine, is not a replicated subobject,
+	 * has no NetGUID, and can never resolve on the client. ClientAdjustPosition_Implementation hits
+	 * `bUnresolvedBase && bBaseRelativePosition` and returns without applying anything.
+	 *
+	 * THE FIX. The arena does not move, so it must not be a base. Nulling it here puts the pawn in
+	 * exactly the state the engine's own templates are in when standing on Static level geometry:
+	 * no base, absolute corrections, which resolve on any machine.
+	 *
+	 * ONLY the FMovementBaseInterfaceData overload is overridden, and that is deliberate. 5.8
+	 * deprecated the UPrimitiveComponent form; its body is now two lines that wrap the argument and
+	 * make a VIRTUAL call to this one (Character.cpp:1146), so every path still lands here.
+	 * Overriding the deprecated form as well compiles on clang with a -Wdeprecated-declarations
+	 * warning and FAILS the Windows build, which treats it as an error.
+	 *
+	 * Deliberately scoped to the arena rather than to "anything unreplicated": characters and the
+	 * Core ARE legitimate dynamic bases and must keep working. If another never-moving actor is ever
+	 * added to the world with pawn-blocking collision, add it to ShouldIgnoreAsMovementBase().
+	 */
+	virtual void SetBase(struct FMovementBaseInterfaceData* MovementBaseInterfaceData, const FName BoneName = NAME_None, bool bNotifyActor = true) override;
+
+	/** True when @p BaseComponent belongs to world geometry that never moves. See SetBase(). */
+	static bool ShouldIgnoreAsMovementBase(const UPrimitiveComponent* BaseComponent);
+
 	// --- Queries ---------------------------------------------------------------------------------
 
 	/** Team from the PlayerState, or None while it has not replicated yet. */

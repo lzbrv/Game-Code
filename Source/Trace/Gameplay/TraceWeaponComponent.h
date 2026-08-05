@@ -37,6 +37,15 @@ class TRACE_API UTraceWeaponComponent : public UActorComponent
 public:
 	UTraceWeaponComponent();
 
+	/**
+	 * Registers the ONE tick dependency this component needs: the owner's camera boom must update
+	 * AFTER us, so a recoil kick and the camera that renders it land in the same frame.
+	 *
+	 * See the implementation for the measurement that made this necessary - without it the probe
+	 * reads aimErr = 0.8 deg (exactly one kick) for one frame after every shot.
+	 */
+	virtual void BeginPlay() override;
+
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 	/** Trigger pressed. Local input path only; fires one shot right away, then repeats while held. */
@@ -79,6 +88,53 @@ private:
 	void FireOnce();
 
 	void PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted) const;
+
+	// --- Upwards recoil (spec v5 section 6) ------------------------------------------------------
+	//
+	// PURELY VERTICAL, and purely local. The kick is added to the owning PLAYER controller's control
+	// rotation after the shot's direction has already been sampled and sent, so:
+	//   * the round that caused the kick still goes exactly where the crosshair was;
+	//   * there is no recoil state on the wire - ServerFire carries a direction, so the authority
+	//     resolves the same ray the shooter saw, and aimErr stays 0.0000 deg because the camera and
+	//     the aim ray are both pure functions of the control rotation;
+	//   * bots are excluded: ATraceBotController overwrites its control rotation every frame with an
+	//     RInterpConstantTo slew, so a kick would be erased before it did anything.
+
+	/** The local human's controller, or null for a bot, a proxy, or a pawn with no controller. */
+	class APlayerController* GetRecoilController() const;
+
+	/** One shot's worth of upward kick, with the growth term and the accumulation ceiling applied. */
+	void ApplyRecoilKick();
+
+	/** Runs the recovery, and the player-compensation cancellation, once per tick. */
+	void TickRecoil(float DeltaTime);
+
+	/**
+	 * Adds DeltaPitchDegrees to the control rotation (positive = up), clamped into the camera
+	 * manager's own pitch limits, and folds however much ACTUALLY landed into RecoilAppliedPitch.
+	 * Reading the applied amount back is what keeps the accumulator honest when the view is already
+	 * against the 89.9 degree stop.
+	 */
+	void AddRecoilPitch(class APlayerController* RecoilController, double DeltaPitchDegrees);
+
+	/** Forgets the climb and the burst without touching the view. Death, respawn, teardown. */
+	void ResetRecoil();
+
+	/** Degrees of un-recovered climb currently sitting on top of the player's own aim. Never < 0. */
+	double RecoilAppliedPitch = 0.0;
+
+	/** How many shots into the current burst we are; drives the per-shot growth term. */
+	int32 RecoilBurstShotIndex = 0;
+
+	/** Local-clock time of the last shot that produced a kick. */
+	double LastRecoilShotTime = -1000.0;
+
+	/**
+	 * Control pitch as it stood after our own last write, so the next tick can tell the player's
+	 * mouse movement apart from our own. Only meaningful while bRecoilTrackingValid.
+	 */
+	double RecoilTrackedPitch = 0.0;
+	bool bRecoilTrackingValid = false;
 
 	/**
 	 * Folds one server-resolved shot into the Trace.ShotStats distribution.

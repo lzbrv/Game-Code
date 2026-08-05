@@ -2752,6 +2752,35 @@ void ATraceGameMode::ReturnToMainMenu()
 
 	UE_LOG(LogTraceGame, Log, TEXT("Post-match window elapsed; returning to %s."), TraceMaps::MainMenu);
 
+	// Send every REMOTE client home first, explicitly, before this machine leaves.
+	//
+	// The OpenLevel below is a purely local absolute travel. On a listen server that tears the net
+	// driver down under any connected client with no notice at all: they lose the host mid-frame
+	// and (before this) sat looking at a frozen post-match screen until something timed out. Now
+	// they are told to go to the same place, by name, one frame earlier.
+	//
+	// ClientTravel with TRAVEL_Absolute and a local map path is a client RPC: the client loads the
+	// menu map on its OWN machine and drops the connection as part of doing so. That is what we
+	// want - the menu is a single-player screen, so ServerTravel (which would drag everybody into
+	// a NETWORKED menu map still owned by this host) would be wrong.
+	int32 RemotesSentHome = 0;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		// IsLocalController() is false for exactly the remote humans. Bots are AAIControllers and
+		// never appear in this iterator at all.
+		if (PC != nullptr && !PC->IsLocalController())
+		{
+			PC->ClientTravel(TraceMaps::MainMenu, ETravelType::TRAVEL_Absolute);
+			++RemotesSentHome;
+		}
+	}
+	if (RemotesSentHome > 0)
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("[Net] Sent %d remote client(s) back to the menu before the host travels."),
+			RemotesSentHome);
+	}
+
 	// Absolute travel: the menu runs a different game mode on a different map, and a relative
 	// travel would carry this match's URL options (?difficulty=, ?bots=) into it.
 	UGameplayStatics::OpenLevel(World, FName(TraceMaps::MainMenu), /*bAbsolute=*/true);
