@@ -52,6 +52,30 @@ void ATraceEndzone::ConfigureZone(ETraceTeam InOwningTeam, const FVector& BoxHal
 	}
 }
 
+void ATraceEndzone::ConfigureRing(float Radius)
+{
+	bRingGoal = (Radius > 0.f);
+	RingRadius = FMath::Max(0.f, Radius);
+}
+
+FVector ATraceEndzone::GetRingCentre() const
+{
+	// The trigger's own origin, not the actor's: ConfigureZone sizes the BOX and the arena spawns the
+	// actor at the box centre, so those are the same point today - but reading the component is what
+	// keeps them the same point if anybody ever offsets the trigger.
+	return (Trigger != nullptr) ? Trigger->GetComponentLocation() : GetActorLocation();
+}
+
+FVector ATraceEndzone::GetRingAxis() const
+{
+	// Local +X. The arena builds the end walls perpendicular to X and spawns the goal with the
+	// builder's own rotation, so this is "straight down the field" for an unrotated arena and stays
+	// correct for a rotated one.
+	return (Trigger != nullptr)
+		? Trigger->GetComponentTransform().GetUnitAxis(EAxis::X)
+		: GetActorForwardVector();
+}
+
 void ATraceEndzone::SetZoneActive(bool bInActive)
 {
 	if (bZoneActive == bInActive)
@@ -156,6 +180,27 @@ void ATraceEndzone::BeginPlay()
 		*GetActorLocation().ToCompactString(),
 		*Extent.ToCompactString(),
 		*TraceTeamName(TraceOpposingTeam(OwningTeam)).ToString());
+
+	// Display, not Log. Spec v6 §4.3 moved the goal from a box on the floor to a RING in the back
+	// wall, and "is the hoop where I think it is, and how big is it" is the single question a
+	// playtest of that change asks. It is not readable from a screenshot and it is not derivable
+	// from the half extent alone, so it gets its own line at default verbosity.
+	//
+	// GATED ON bZoneActive as well as on the shape, and that is not tidiness. The ring volumes are
+	// BUILT in mode A too (built and immediately made inert, three lines up), so an ungated line
+	// printed "[ModeB] RING GOAL ... " twice into every mode A run — a "[ModeB]" tag in a mode A log
+	// is exactly the evidence somebody greps for to answer "did the mode B work leak into mode A",
+	// and answering that question wrongly costs a whole investigation. The inert case is already
+	// reported by the "built but inert" line above, which is where it belongs.
+	if (IsRingGoal() && bZoneActive)
+	{
+		const FVector Centre = GetRingCentre();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] RING GOAL (%s defends): centre %s, radius %.0f uu (%.0f uu across), ")
+			TEXT("bottom of the hoop %.0f uu off the floor, slab depth %.0f uu, axis %s."),
+			*TraceTeamName(OwningTeam).ToString(), *Centre.ToCompactString(), RingRadius, RingRadius * 2.f,
+			Centre.Z - RingRadius, Extent.X * 2.f, *GetRingAxis().ToCompactString());
+	}
 }
 
 void ATraceEndzone::Tick(float DeltaSeconds)
@@ -208,9 +253,22 @@ bool ATraceEndzone::IsInsideZone(const FVector& WorldLocation) const
 	const FVector Local = Trigger->GetComponentTransform().InverseTransformPosition(WorldLocation);
 	const FVector Extent = Trigger->GetUnscaledBoxExtent();
 
-	return FMath::Abs(Local.X) <= Extent.X
-		&& FMath::Abs(Local.Y) <= Extent.Y
-		&& FMath::Abs(Local.Z) <= Extent.Z;
+	if (FMath::Abs(Local.X) > Extent.X
+		|| FMath::Abs(Local.Y) > Extent.Y
+		|| FMath::Abs(Local.Z) > Extent.Z)
+	{
+		return false;
+	}
+
+	// SPEC v6 §4.3. A ring goal scores on the DISC inscribed in that slab, not on its corners. The
+	// box test above stays as the broad phase (and is what a non-ring endzone stops at), so mode A
+	// reaches exactly the code it always did.
+	if (IsRingGoal())
+	{
+		return (Local.Y * Local.Y + Local.Z * Local.Z) <= (RingRadius * RingRadius);
+	}
+
+	return true;
 }
 
 void ATraceEndzone::OnTriggerBeginOverlap(UPrimitiveComponent* /*OverlappedComponent*/, AActor* OtherActor,
@@ -243,6 +301,16 @@ void ATraceEndzone::TryScore(ATraceCharacter* Character)
 	}
 
 	if (!Character->IsAlive() || !IsCoreCarrier(Character))
+	{
+		return;
+	}
+
+	// SPEC v6 §4.3, RING GOALS ONLY. OnTriggerBeginOverlap fires off the CAPSULE touching the box,
+	// and the box is the ring's bounding slab - its corners are wall, not goal. Re-test the carrier
+	// against the disc so the overlap path awards exactly what the poll and ATraceCore's swept test
+	// award. Deliberately gated on IsRingGoal(): mode A's endzone must reach this function on the
+	// same terms it always has, overlap semantics included.
+	if (IsRingGoal() && !IsInsideZone(Character->GetActorLocation()))
 	{
 		return;
 	}

@@ -130,6 +130,20 @@ protected:
 	/** Two seconds of "BLUE SCORES" after a capture, so the field reset has a visible cause. */
 	void DrawScoreFlash();
 
+	/**
+	 * Spec v6 §3, the carrier's half of the parry punish: "PARRIED — <name> DASHED YOUR TRACE".
+	 *
+	 * The dasher already gets an unmistakable answer (their own death panel names the carrier and
+	 * the cause "Parried"). Without this the carrier gets NOTHING: they press Q, the trace flashes
+	 * red for a tenth of a second, and an enemy they may never have seen dies somewhere behind them.
+	 * A 0.1 s reaction check that cannot be confirmed is a mechanic players stop believing in.
+	 *
+	 * Two sources, in order, and both are needed: TraceParry's authoritative server-side record
+	 * (which is what a listen-server HOST reads, and the host is the only human in a bot playtest),
+	 * then ATracePlayerController::GetLastParryKillTime as the remote-client fallback.
+	 */
+	void DrawParryKillBanner();
+
 	void DrawDeathPanel();
 	void DrawMatchResult();
 	void DrawScoreboard();

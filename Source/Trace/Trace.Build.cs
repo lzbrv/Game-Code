@@ -45,9 +45,19 @@ public class Trace : ModuleRules
 			// not remove either because the includes appear to be satisfied.
 			"Sockets",            // ISocketSubsystem::Get/CreateUniqueSocket - adapter enumeration
 			                      // and the UDP 7777 port probe behind TraceNet::.
-			"ApplicationCore"     // FPlatformApplicationMisc::ClipboardPaste - paste into the JOIN
+			"ApplicationCore",    // FPlatformApplicationMisc::ClipboardPaste - paste into the JOIN
 			                      // address field. Optional: set TRACE_HAS_CLIPBOARD 0 at the top of
 			                      // TraceNetworking.cpp and this entry can go, at the cost of paste.
+			// The SAME TRAP AS THE TWO ABOVE, and it caught this project once already: RenderCore and
+			// RHI headers resolve transitively through Engine, so UTraceTrailComponent's perf probe
+			// compiled and then failed at link with "Undefined symbols" for GGameThreadTime /
+			// GRenderThreadTime / RHIGetGPUFrameCycles. The probe currently routes around it via
+			// FStatUnitData from the viewport client, which works but reads the engine's smoothed
+			// numbers rather than the raw counters. These are here so Trace.Trail.PerfAB - the A/B
+			// that produced this pass's before/after frame times, and the only way to reproduce
+			// them - can read the counters directly instead.
+			"RenderCore",         // GGameThreadTime, GRenderThreadTime
+			"RHI"                 // RHIGetGPUFrameCycles
 			// AIModule is an engine RUNTIME module, not a plugin, so this adds no plugin dependency
 			// and no asset dependency. Nothing here uses BehaviorTree, Blackboard or the navigation
 			// system: those would need .uassets (contract 2) or a runtime-built navmesh. The bots

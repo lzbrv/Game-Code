@@ -39,19 +39,21 @@
 //                       invulnerability sources compose without clobbering each other. Read it
 //                       before changing either.
 //
-// VISUALLY (§3, and spec v4 §2 "change the look of the trace to match the new mannequin models")
-// the trace is "a blur created where your character model has passed through". It is drawn as TWO
-// layers, both derived from the same lethal point set:
+// VISUALLY (spec v6 §2) the trace is ONE CURVED RIBBON: "a rectangle which curves to follow the
+// player ... one fluid shape ... a Tron path but from the model's back, curving through the air."
 //
-//   THE GHOSTS   Pooled UPoseableMeshComponents wearing the holder's own Mannequin, frozen at the
-//                pose the holder was actually in, dropped every GhostSpacing uu along the path.
-//                These are the thing the player reads: they are unmistakably a person.
+//   THE RIBBON   A single continuous swept rectangle, built along a Catmull-Rom smoothing of the
+//                lethal point set, at EXACTLY the lethal cross-section (2 x TrailRadius wide,
+//                TrailHeight tall) and centred on the trail points — which are the carrier's actor
+//                location, i.e. the middle of their model. See RebuildRibbon().
 //
-//   THE SMEAR    A continuous body-shaped extrusion along every lethal segment, dimmer, which is
-//                what makes the trace a BLUR rather than a row of statues — and, far more
-//                importantly, what keeps the drawn thing continuous where the ghosts are discrete.
-//                The kill volume is continuous, so the drawing has to be too, or a player will
-//                look at the gap between two ghosts and reasonably conclude they can run it.
+// THIS REPLACED, AND DID NOT LAYER OVER, THE SPEC v4 §2 CHARACTER-SHAPED GHOSTS. Twenty
+// UPoseableMeshComponents per carrier, each a full skinned Mannequin, were the prime suspect for the
+// Demo 6 "1/6 the fps" report, and the user judged the look worse besides. The old two-layer renderer
+// (posed mannequins + a two-band cylinder smear) is still compiled in behind Trace.Trail.Renderer 0
+// for ONE reason and one only: it is the BEFORE arm of the A/B measurement, so the cost of this
+// change can be quoted as a number on an identical scene rather than asserted. It is never the
+// default and nothing but a console command can select it. Trace.Trail.PerfAB runs the comparison.
 //
 // See RebuildVisuals() and the block comment above it for the numbers and the justification.
 //
@@ -346,6 +348,17 @@ public:
 	 */
 	float MeasureOwnerVisibleGap(bool bIncludePredictedHead) const;
 
+	// ------------------------------------------------------------------------------------------
+	// MEASUREMENT (spec v6 §1). Read-only counters so Trace.Trail.PerfAB can report what the trace
+	// actually put in the scene alongside the frame times, rather than inferring it.
+	// ------------------------------------------------------------------------------------------
+
+	/** Pooled mesh components this trace currently has VISIBLE, split by kind. */
+	void CountDrawnPieces(int32& OutStaticVisible, int32& OutSkinnedVisible) const;
+
+	/** Pooled mesh components this trace has ALLOCATED, visible or not, split by kind. */
+	void CountPooledPieces(int32& OutStaticTotal, int32& OutSkinnedTotal) const;
+
 private:
 	// ------------------------------------------------------------------------------------------
 	// Server state
@@ -434,6 +447,14 @@ private:
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> CylinderMesh = nullptr;
 
+	/**
+	 * THE RIBBON'S SOURCE MESH (spec v6 §2): a box, because the request is literally "a rectangle
+	 * which curves to follow the player". Falls back to the cylinder if /Engine/BasicShapes/Cube is
+	 * somehow absent — a rounded ribbon is still a ribbon, and no .uasset is ever a hard requirement.
+	 */
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> CubeMesh = nullptr;
+
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> TrailMaterial = nullptr;
 
@@ -445,6 +466,18 @@ private:
 	bool bTrailMaterialIsNeon = false;
 
 	/**
+	 * THE DRAWN TRACE. One pool, shared by both renderers, because they are mutually exclusive and a
+	 * second set of arrays would be a second set of things to forget to hide.
+	 *
+	 *   RIBBON (spec v6 §2, the default): ONE element per resampled ribbon segment.
+	 *   LEGACY (spec v4 §2, measurement only): TWO per lethal segment, interleaved [i*2+0] body,
+	 *          [i*2+1] head.
+	 *
+	 * PartsPerElement() is the multiplier, and every loop over this array goes through it. Switching
+	 * renderer at runtime tears the pool down (see ActiveRendererArm) rather than reinterpreting it.
+	 *
+	 * The legacy comment, still true of the legacy arm:
+	 *
 	 * THE SMEAR. Pooled static meshes, TWO per lethal SEGMENT, interleaved: [i*2+0] body, [i*2+1] head.
 	 *
 	 * One element per SEGMENT, not per point, and that is the whole reason this layer is trustworthy:
@@ -580,7 +613,35 @@ private:
 	/** Source-mesh metrics, read once from the asset so we never hardcode "the cylinder is 100uu". */
 	FVector CylinderHalfSize = FVector(50.0);
 	FVector CylinderPivotOffset = FVector::ZeroVector;
+	FVector CubeHalfSize = FVector(50.0);
+	FVector CubePivotOffset = FVector::ZeroVector;
 	bool bMeshMetricsCached = false;
+
+	// ------------------------------------------------------------------------------------------
+	// THE RIBBON (spec v6 §2)
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Which renderer arm the pooled components were built for (see Trace.Trail.Renderer).
+	 *
+	 * The two arms disagree about how many meshes an element is and what mesh each one wears, so a
+	 * switch destroys the pool instead of reinterpreting it. -1 = nothing built yet.
+	 */
+	int32 ActiveRendererArm = -1;
+
+	/**
+	 * Scratch for one ribbon rebuild: the Catmull-Rom centreline resampled at a near-uniform arc
+	 * length, and the shared-clock birth time interpolated to each sample (which is what makes the
+	 * age fade a smooth gradient along the ribbon instead of a step per element).
+	 *
+	 * Members rather than locals purely so a rebuild allocates nothing after the first one.
+	 */
+	TArray<FVector> RibbonSamples;
+	TArray<float> RibbonSampleBirth;
+
+	/** The unsmoothed input to the above: the lethal polyline, or the predicted stub's polyline. */
+	TArray<FVector> RibbonSourcePoints;
+	TArray<float> RibbonSourceBirths;
 
 	// ------------------------------------------------------------------------------------------
 	// Internals
@@ -648,6 +709,54 @@ private:
 
 	/** Layer 1: the continuous body-shaped extrusion along every lethal segment. */
 	void RebuildSmear(int32 LethalPointCount, float InvulnerableScale);
+
+	// ------------------------------------------------------------------------------------------
+	// THE RIBBON (spec v6 §2). Read the block comment above RebuildRibbon().
+	// ------------------------------------------------------------------------------------------
+
+	/** True when the ribbon is the active renderer (Trace.Trail.Renderer 1, the default). */
+	static bool IsRibbonRenderer();
+
+	/** Pooled meshes per drawn element: 1 for the ribbon, 2 for the legacy smear. */
+	static int32 PartsPerElement();
+
+	/**
+	 * Fills RibbonSamples / RibbonSampleBirth with a Catmull-Rom smoothing of @p Points, resampled at
+	 * a near-uniform arc length. @p Births may be empty, in which case the birth array is zeroed.
+	 *
+	 * The step coarsens automatically rather than truncating when the path is long: a dashing carrier
+	 * must get a slightly chunkier ribbon, never a ribbon that stops short of trace that can kill.
+	 */
+	void BuildRibbonSamples(const TArray<FVector>& Points, const TArray<float>& Births, double Step, int32 MaxElements);
+
+	/** Spec v6 §2: the whole lethal set as ONE swept, curved rectangle. */
+	void RebuildRibbon(int32 LethalPointCount, float InvulnerableScale);
+
+	/**
+	 * Places the elements of RibbonSamples into @p Pieces. Shared by the replicated ribbon and by the
+	 * owner-only predicted head, so the stub is the same shape at the same width from the same
+	 * numbers as the ribbon it continues.
+	 */
+	void PlaceRibbon(
+		TArray<TObjectPtr<UStaticMeshComponent>>& Pieces,
+		TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
+		TArray<float>& BaseGlowOut,
+		TArray<float>& AppliedScaleOut,
+		int32 MaxElements,
+		float InvulnerableScale,
+		bool bAgeFade,
+		bool bOnlyOwnerSees,
+		bool bOverlapAtStart);
+
+	/** Grows @p Pieces to cover element @p ElementIndex with the ribbon's source mesh. */
+	bool EnsureRibbonElement(
+		TArray<TObjectPtr<UStaticMeshComponent>>& Pieces,
+		TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
+		TArray<float>& BaseGlowOut,
+		TArray<float>& AppliedScaleOut,
+		int32 ElementIndex,
+		int32 MaxElements,
+		bool bOnlyOwnerSees);
 
 	/**
 	 * Layer 2: retire the after-images whose stretch of trace has expired, drop a new one when the

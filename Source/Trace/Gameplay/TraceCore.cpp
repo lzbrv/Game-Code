@@ -499,6 +499,94 @@ static TAutoConsoleVariable<float> CVarModeBBounce(
 	ECVF_Default);
 
 // =================================================================================================
+// MODE B ONLY — SPEC v6 §4.1, THE CATCH ZONE
+//
+// "create a small invisible radius around players that acts as a 'catch zone,' so that when the core
+// enters that area, it curves towards the player like a magnet. This is intended to make catching
+// feel fluid and clean."
+//
+// Three knobs, and the split between them is the design:
+//
+//   RADIUS   how far out the magnet reaches. Deliberately LARGER than the pickup radius (120 uu) and
+//            not by a little: the pickup radius is "you touched it", the catch radius is "it is
+//            coming to you". At 500 uu it is about three player widths - close enough that it reads
+//            as a catch and not as the Core being stolen out of the air from across a lane.
+//   CURVE    how hard it curves, in "fractions of the remaining error per second". 6 means the
+//            velocity is turned most of the way onto the catcher within a fifth of a second at point
+//            blank, and barely at all at the edge of the zone (the pull falls off with distance).
+//   LOCKOUT  how long the THROWER alone is excluded. A throw leaves from inside its own thrower's
+//            catch zone, so with no lockout every throw would snap straight back into their hands
+//            and the mechanic would not exist. Kept separate from CoreThrowerPickupLockoutSeconds
+//            because they answer different questions - one is "may I take it", the other is "does it
+//            come to me" - and the second wants to be a little longer so the throw is clear of the
+//            thrower's body before anything bends it.
+//
+// EVERY PLAYER, FRIEND OR ENEMY. Spec v6's [ASSUMPTION], and it is the right one: interception is
+// the whole risk of throwing in mode B, and a magnet that only helped the receiving team would
+// quietly delete it.
+//
+// SPEED IS NEVER CHANGED, only direction. A magnet that also accelerated the Core would make a caught
+// throw arrive faster than a thrown one, and would interact with the ground-turnover rule below in a
+// way nobody asked for. Curving alone is what "curves towards the player" says.
+// =================================================================================================
+
+static TAutoConsoleVariable<float> CVarModeBCatchRadius(
+	TEXT("Trace.ModeB.CatchRadius"),
+	500.f,
+	TEXT("MODE B. Radius of the invisible catch zone around every player, uu, measured from the Core ")
+	TEXT("to the surface of their capsule. A loose Core inside it curves toward them. ")
+	TEXT("UTraceSettings::CoreCatchRadius."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBCatchCurve(
+	TEXT("Trace.ModeB.CatchCurve"),
+	6.f,
+	TEXT("MODE B. How hard the catch zone curves the Core, in fractions of the remaining aim error per ")
+	TEXT("second at point-blank range. 0 disables the magnet outright. UTraceSettings::CoreCatchCurveStrength."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBCatchThrowerLockout(
+	TEXT("Trace.ModeB.CatchThrowerLockout"),
+	0.5f,
+	TEXT("MODE B. Seconds the THROWER alone is excluded from their own catch zone, so a throw does not ")
+	TEXT("curve straight back into the hands it left. UTraceSettings::CoreCatchThrowerLockoutSeconds."),
+	ECVF_Default);
+
+// =================================================================================================
+// MODE B ONLY — SPEC v6 §4.2, GROUND CONTACT IS A TURNOVER
+//
+// "When a team has possession of the core, throws it, and it hits the ground, it should
+// automatically turnover to the closest player on the enemy team."
+//
+// This REPLACES the v4 rule that a thrown Core stayed live on the ground for first contact. A wild
+// throw is now punished rather than merely wasted, which is the whole point: it makes the decision
+// to throw a real one.
+//
+// A CVar rather than a settings float because it is a RULE, not a tuning value - and it is here so
+// that an A/B of the change itself (the old "stays live" behaviour is one console command away) does
+// not need a rebuild. Deliberately NOT in the settings-panel knob list for the same reason: the
+// panel is for numbers a designer tunes, not for switching a spec'd rule off.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarModeBGroundTurnover(
+	TEXT("Trace.ModeB.GroundTurnover"),
+	1,
+	TEXT("MODE B, spec v6 §4.2. 1 (default): a THROWN Core that touches the ground turns over to the ")
+	TEXT("nearest enemy of the throwing team. 0: the pre-v6 behaviour, where it stays live on the ")
+	TEXT("ground for first contact."),
+	ECVF_Default);
+
+/**
+ * How upward-facing a surface has to be to count as "the ground".
+ *
+ * 0.7 is about 45 degrees, which is the engine's own default walkable floor angle - so "the ground"
+ * means the same thing to this rule as it does to the pawn standing on it. A Core that clips a wall,
+ * a goal spoke or the underside of a bank is NOT on the ground and stays live, which is what keeps
+ * the rule readable: it fires when the Core lands, not when it touches something.
+ */
+static constexpr float TraceModeBGroundNormalZ = 0.7f;
+
+// =================================================================================================
 // MODE B ONLY — THE CORE'S WEIGHT  (spec v5 §4: "increase the weight of the core")
 //
 // The Core has no rigid body and no UProjectileMovementComponent, so there is no `Mass` field to
@@ -569,6 +657,13 @@ namespace TraceModeBTuning
 	float LooseResetSeconds() { return Resolve(TEXT("CoreLooseResetSeconds"),             CVarModeBLooseReset,       0.f,   120.f); }
 	float ThrowCooldown()     { return Resolve(TEXT("CoreThrowCooldownSeconds"),          CVarModeBThrowCooldown,    0.f,   10.f); }
 
+	// --- Spec v6 §4.1, the catch zone. Upper bounds chosen so a live retune cannot break the game:
+	// a 3000 uu magnet would make the Core uncatchable-by-anybody-else and a curve above ~30 snaps
+	// rather than curves, which is the thing the note explicitly did not ask for.
+	float CatchRadius()          { return Resolve(TEXT("CoreCatchRadius"),                 CVarModeBCatchRadius,      0.f,   3000.f); }
+	float CatchCurveStrength()   { return Resolve(TEXT("CoreCatchCurveStrength"),          CVarModeBCatchCurve,       0.f,   30.f); }
+	float CatchThrowerLockout()  { return Resolve(TEXT("CoreCatchThrowerLockoutSeconds"),  CVarModeBCatchThrowerLockout, 0.f, 5.f); }
+
 	/** Radius of the sphere swept for the loose Core's collision. Matches the orb the player sees. */
 	constexpr float CollisionRadius = 22.f;
 
@@ -604,6 +699,12 @@ namespace TraceModeBTuning
 			TEXT("CoreLooseResetSeconds"),
 			TEXT("CoreThrowCooldownSeconds"),
 			TEXT("CoreThrowBounce"),
+			// Spec v6 §4.1. New this pass; they need declaring on UTraceSettings, and until they are
+			// this list is what says so out loud instead of leaving three dead sliders to be found by
+			// a designer wondering why nothing changed.
+			TEXT("CoreCatchRadius"),
+			TEXT("CoreCatchCurveStrength"),
+			TEXT("CoreCatchThrowerLockoutSeconds"),
 		};
 
 		int32 BoundCount = 0;
@@ -2608,8 +2709,70 @@ void ATraceCore::RefreshGoalVolumes(bool bForce)
 		FTraceGoalBox Goal;
 		Goal.DefendingTeam = Zone->OwningTeam;
 		Goal.Box = Zone->GetZoneBounds();
+
+		// SPEC v6 §4.3. The circle, asked of the volume that scores rather than rebuilt from the
+		// arena's constants — the same discipline that deleted the reconstructed goal box above, and
+		// for the same reason: a second copy of a shape agrees with the first until somebody changes
+		// one of them, and then the hoop you can see and the hoop that scores are different circles.
+		if (Zone->IsRingGoal())
+		{
+			Goal.bRing = true;
+			Goal.RingCentre = Zone->GetRingCentre();
+			Goal.RingRadius = Zone->GetRingRadius();
+			Goal.RingAxis = Zone->GetRingAxis().GetSafeNormal();
+		}
+
 		GoalBoxes.Add(Goal);
 	}
+}
+
+bool ATraceCore::GetAttackGoalRing(const UWorld* World, ETraceTeam AttackingTeam, FVector& OutCentre,
+	float& OutRadius, FVector& OutAxis)
+{
+	ATraceCore* TheCore = ATraceCore::Get(World);
+	if (TheCore == nullptr || !TheCore->IsModeB() || AttackingTeam == ETraceTeam::None)
+	{
+		return false;
+	}
+
+	TheCore->RefreshGoalVolumes(/*bForce=*/false);
+
+	for (const FTraceGoalBox& Goal : TheCore->GoalBoxes)
+	{
+		if (!Goal.bRing || Goal.RingRadius <= 0.f || Goal.DefendingTeam == ETraceTeam::None)
+		{
+			continue;
+		}
+		if (AttackingTeam != TraceOpposingTeam(Goal.DefendingTeam))
+		{
+			continue;
+		}
+
+		OutCentre = Goal.RingCentre;
+		OutRadius = Goal.RingRadius;
+
+		// Point the axis BACK INTO THE FIELD, i.e. up the attacker's approach, so a caller can read it
+		// as "stand off this way from the hoop" and negate it for "the direction a scoring throw
+		// travels". The trigger's own local +X is signed by however the arena happened to spawn it, so
+		// the sign is decided against the pitch rather than trusted.
+		FVector Axis = Goal.RingAxis.GetSafeNormal();
+		if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(const_cast<UWorld*>(World)))
+		{
+			const FBox Field = Arena->GetFieldBounds();
+			if (Field.IsValid != 0)
+			{
+				const FVector ToPitch = Field.GetCenter() - OutCentre;
+				if (!ToPitch.IsNearlyZero() && FVector::DotProduct(Axis, ToPitch) < 0.0)
+				{
+					Axis = -Axis;
+				}
+			}
+		}
+		OutAxis = Axis;
+		return true;
+	}
+
+	return false;
 }
 
 bool ATraceCore::GetAttackGoalCentre(const UWorld* World, ETraceTeam AttackingTeam, FVector& OutCentre)
@@ -2717,6 +2880,52 @@ bool ATraceCore::CheckGoalScore(const FVector& From, const FVector& To, ETraceTe
 			continue;
 		}
 
+		// --- SPEC v6 §4.3: the goal is a CIRCLE, so the box above was only the broad phase. --------
+		//
+		// The box is the hoop's bounding slab and its corners are WALL. Two ways in, both of which
+		// have to be caught or the rule reads as a broken trigger:
+		//
+		//   CROSSING  the segment passes through the ring's plane. Solved for the exact crossing
+		//             point rather than sampled, because that is the whole reason the thrown test is
+		//             swept at all: a Core at 2200 uu/s covers 37 uu a frame at 60 Hz and a great
+		//             deal more on a hitching server, and a point test at the frame boundary can be
+		//             on both sides of a 2000 uu hoop without ever having been measured inside it.
+		//   INSIDE    the end point is within the slab AND within the disc. This is the carrier
+		//             standing in the mouth at the top of the ramp, where From == To and there is no
+		//             crossing to solve.
+		if (Goal.bRing && Goal.RingRadius > 0.f)
+		{
+			const FVector Axis = Goal.RingAxis;
+			const double FromSide = FVector::DotProduct(From - Goal.RingCentre, Axis);
+			const double ToSide = FVector::DotProduct(To - Goal.RingCentre, Axis);
+
+			bool bThroughTheHoop = false;
+
+			if ((FromSide <= 0.0) != (ToSide <= 0.0))
+			{
+				const double Denominator = FromSide - ToSide;
+				const double Alpha = FMath::IsNearlyZero(Denominator) ? 0.0 : (FromSide / Denominator);
+				const FVector Crossing = From + (To - From) * FMath::Clamp(Alpha, 0.0, 1.0);
+
+				const FVector Offset = Crossing - Goal.RingCentre;
+				const FVector InPlane = Offset - Axis * FVector::DotProduct(Offset, Axis);
+				bThroughTheHoop = InPlane.SizeSquared() <= static_cast<double>(Goal.RingRadius) * Goal.RingRadius;
+			}
+
+			if (!bThroughTheHoop)
+			{
+				const FVector Offset = To - Goal.RingCentre;
+				const FVector InPlane = Offset - Axis * FVector::DotProduct(Offset, Axis);
+				bThroughTheHoop = Goal.Box.IsInside(To)
+					&& InPlane.SizeSquared() <= static_cast<double>(Goal.RingRadius) * Goal.RingRadius;
+			}
+
+			if (!bThroughTheHoop)
+			{
+				continue;   // Inside the slab but outside the hoop: that is wall, not goal.
+			}
+		}
+
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[ModeB] GOAL by %s (%s) into the goal %s defends. Box %s"),
 			*TraceTeamName(ScoringTeam).ToString(), How,
@@ -2815,6 +3024,8 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
 
 	bLoose = true;
 	bLooseAtRest = false;
+	bLooseFromThrow = true;   // Spec v6 §4.2: this Core, and only this kind, turns over on landing.
+	CatchZoneTarget = nullptr;
 	LooseFromTeam = ThrowerTeam;
 	LooseThrower = Thrower;
 	LooseStartServerTime = Now;
@@ -2858,6 +3069,14 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	const float Step = FMath::Clamp(DeltaSeconds, 0.f, 0.1f);   // A hitch must not teleport the Core.
 
 	const FVector StartLocation = LooseLocation;
+	bool bHitTheGround = false;
+
+	// --- 0. SPEC v6 §4.1: the catch zone. ---------------------------------------------------------
+	//
+	// Ahead of the integration, so this frame's motion is already the curved one: applying it
+	// afterwards would move the Core straight and then bend the velocity for next frame, which is a
+	// frame of lag on the one mechanic whose whole purpose is to feel immediate.
+	ServerApplyCatchZone(Step);
 
 	// --- 1. Integrate. No UProjectileMovementComponent: see the header. --------------------------
 	if (!bLooseAtRest)
@@ -2884,6 +3103,14 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 		{
 			// Land just off the surface so the next sweep does not start inside it.
 			LooseLocation = Hit.Location + Hit.ImpactNormal * 2.0;
+
+			// SPEC v6 §4.2. "It hits the ground" = it landed on something you could stand on, which is
+			// the floor, the corner banks, the top of a cover block or the approach ramp. A graze off a
+			// wall or a goal spoke is not a landing and leaves the Core live, which is what keeps the
+			// rule legible from inside the game: it fires when the throw comes down, not when it
+			// touches anything at all. Recorded here and acted on after the goal test, because a Core
+			// that scores and a Core that lands are resolved in that order.
+			bHitTheGround = (Hit.ImpactNormal.Z >= TraceModeBGroundNormalZ);
 
 			const FVector Reflected = FVector(LooseVelocity).MirrorByVector(Hit.ImpactNormal)
 				* TraceModeBTuning::Bounce();
@@ -2913,6 +3140,20 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	if (CheckGoalScore(StartLocation, LooseLocation, LooseFromTeam, EGoalMethod::Thrown, TEXT("thrown in")))
 	{
 		return;   // The field has been reset under us. Touch nothing.
+	}
+
+	// --- 2b. SPEC v6 §4.2: it hit the ground, so it is the other team's. --------------------------
+	//
+	// AHEAD OF THE PICKUP POLL, and that ordering IS the rule. The v4 model was "a Core on the ground
+	// stays live for first contact", and leaving the poll first would keep exactly that behaviour
+	// whenever anybody happened to be standing near where it landed - i.e. it would fire the new rule
+	// only when it did not matter. A throw that comes down is a turnover, full stop.
+	if (bHitTheGround && bLooseFromThrow && CVarModeBGroundTurnover.GetValueOnAnyThread() != 0)
+	{
+		if (ServerGroundTurnover())
+		{
+			return;   // Possession changed (or the Core was reset). Touch nothing.
+		}
 	}
 
 	// --- 3. First contact takes it. ---------------------------------------------------------------
@@ -2954,6 +3195,206 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	{
 		ResetLooseCore(TEXT("untouched past the reset timer"));
 	}
+}
+
+void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
+{
+	// SPEC v6 §4.1. See the tuning block at the top of this file for what the three knobs mean.
+	if (!HasAuthority() || !bLoose || bLooseAtRest || bCoreStateLocked || DeltaSeconds <= 0.f)
+	{
+		return;
+	}
+
+	const float Radius = TraceModeBTuning::CatchRadius();
+	const float Curve = TraceModeBTuning::CatchCurveStrength();
+	if (Radius <= 0.f || Curve <= 0.f)
+	{
+		CatchZoneTarget = nullptr;
+		return;   // Magnet switched off. The Core flies exactly as it did before v6.
+	}
+
+	const FVector Speed3D = LooseVelocity;
+	const double Speed = Speed3D.Size();
+	if (Speed < 1.0)
+	{
+		CatchZoneTarget = nullptr;
+		return;   // Nothing to steer.
+	}
+
+	const float Now = GetServerTimeSeconds();
+	const float ThrowerLockoutEnd = LooseStartServerTime + TraceModeBTuning::CatchThrowerLockout();
+	const ATraceCharacter* Thrower = LooseThrower.Get();
+	const FVector CoreLocation = LooseLocation;
+
+	TArray<ATraceCharacter*> Candidates;
+	GatherCharacters(Candidates);
+
+	ATraceCharacter* Best = nullptr;
+	FVector BestPoint = FVector::ZeroVector;
+	double BestSurfaceDistance = TNumericLimits<double>::Max();
+
+	for (ATraceCharacter* Candidate : Candidates)
+	{
+		if (!IsValid(Candidate) || !Candidate->IsAlive())
+		{
+			continue;
+		}
+
+		// THE ONE EXCLUSION. Everybody else - teammate or enemy - is a catcher from frame one, which
+		// is what makes interception a feature rather than an accident (spec v6 §4.1's [ASSUMPTION]).
+		if (Candidate == Thrower && Now < ThrowerLockoutEnd)
+		{
+			continue;
+		}
+
+		// Aim at the capsule's CENTRE LINE at the Core's own height, not at the actor origin: a Core
+		// arriving at head height should curve to the head, not dive at the navel and then climb.
+		FVector CatchPoint = Candidate->GetActorLocation();
+		double SurfaceDistance = FVector::Dist(CoreLocation, CatchPoint);
+
+		if (const UCapsuleComponent* Capsule = Candidate->GetCapsuleComponent())
+		{
+			const FVector CapsuleCentre = Capsule->GetComponentLocation();
+			const double HalfHeight = static_cast<double>(Capsule->GetScaledCapsuleHalfHeight());
+
+			CatchPoint = FVector(CapsuleCentre.X, CapsuleCentre.Y,
+				FMath::Clamp(CoreLocation.Z, CapsuleCentre.Z - HalfHeight, CapsuleCentre.Z + HalfHeight));
+
+			SurfaceDistance = FMath::Max(0.0,
+				FVector::Dist(CoreLocation, CatchPoint) - static_cast<double>(Capsule->GetScaledCapsuleRadius()));
+		}
+
+		if (SurfaceDistance > static_cast<double>(Radius))
+		{
+			continue;
+		}
+
+		// ONLY WHAT THE CORE IS FLYING TOWARD. Without this the magnet would drag the Core backwards
+		// into somebody it had already passed, which is not a catch - it is the Core changing its mind.
+		// Half a hemisphere of tolerance, so a player slightly off to the side still catches.
+		const FVector ToCatcher = CatchPoint - CoreLocation;
+		if (!ToCatcher.IsNearlyZero()
+			&& FVector::DotProduct(ToCatcher.GetSafeNormal(), Speed3D / Speed) < 0.0)
+		{
+			continue;
+		}
+
+		if (SurfaceDistance < BestSurfaceDistance)
+		{
+			BestSurfaceDistance = SurfaceDistance;
+			Best = Candidate;
+			BestPoint = CatchPoint;
+		}
+	}
+
+	if (Best == nullptr)
+	{
+		CatchZoneTarget = nullptr;
+		return;
+	}
+
+	const FVector ToTarget = BestPoint - CoreLocation;
+	if (ToTarget.IsNearlyZero())
+	{
+		return;   // Already there; the pickup poll has it this frame.
+	}
+
+	// Falloff: full strength on the capsule, nothing at the edge of the zone. This is what makes the
+	// zone read as a catch rather than as a wall of magnetism you can feel the boundary of.
+	const double Falloff = 1.0 - FMath::Clamp(BestSurfaceDistance / static_cast<double>(Radius), 0.0, 1.0);
+
+	// Exponential approach, so the curve is identical at 30 fps and at 240. Alpha is the fraction of
+	// the remaining aim error removed this frame.
+	const double Alpha = 1.0 - FMath::Exp(-static_cast<double>(Curve) * Falloff * static_cast<double>(DeltaSeconds));
+
+	// DIRECTION ONLY. Renormalised to the speed it already had - see the tuning block for why a
+	// magnet that also accelerated the Core is a different (and unasked-for) mechanic.
+	const FVector Steered = FMath::Lerp(Speed3D / Speed, ToTarget.GetSafeNormal(), Alpha).GetSafeNormal();
+	LooseVelocity = Steered * Speed;
+
+	// Announced ONCE per catch, at Display, and only when the target changes. The catch zone is
+	// invisible by design, and an invisible mechanic with no log line is one nobody can tell is
+	// working - which is precisely how two working mechanics have been declared dead on this project.
+	if (CatchZoneTarget.Get() != Best)
+	{
+		CatchZoneTarget = Best;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] CATCH ZONE: the Core is curving toward %s (%s) - %.0f uu from their capsule, ")
+			TEXT("radius %.0f, curve %.1f%s"),
+			*GetNameSafe(Best), *TraceTeamName(Best->GetTeam()).ToString(),
+			BestSurfaceDistance, Radius, Curve,
+			(Best == Thrower) ? TEXT(" (the thrower, past their lockout)") : TEXT(""));
+	}
+}
+
+bool ATraceCore::ServerGroundTurnover()
+{
+	// SPEC v6 §4.2. "When a team has possession of the core, throws it, and it hits the ground, it
+	// should automatically turnover to the closest player on the enemy team."
+	if (!HasAuthority() || !bLoose || bCoreStateLocked)
+	{
+		return false;
+	}
+
+	const ETraceTeam ThrowingTeam = LooseFromTeam;
+	const ETraceTeam ReceivingTeam = (ThrowingTeam != ETraceTeam::None)
+		? TraceOpposingTeam(ThrowingTeam) : ETraceTeam::None;
+
+	if (ReceivingTeam == ETraceTeam::None)
+	{
+		// Nobody threw it - a debug launch, or a Core loose from before a mode switch. The rule has no
+		// opinion, so leave it live and let the pickup poll and the reset timer do their jobs.
+		return false;
+	}
+
+	TArray<ATraceCharacter*> Candidates;
+	GatherCharacters(Candidates);
+
+	ATraceCharacter* Nearest = nullptr;
+	double NearestDistSq = TNumericLimits<double>::Max();
+	const FVector Landed = LooseLocation;
+
+	for (ATraceCharacter* Candidate : Candidates)
+	{
+		if (!IsValid(Candidate) || !Candidate->IsAlive() || Candidate->GetTeam() != ReceivingTeam)
+		{
+			continue;
+		}
+
+		const double DistSq = FVector::DistSquared(Landed, Candidate->GetActorLocation());
+		if (DistSq < NearestDistSq)
+		{
+			NearestDistSq = DistSq;
+			Nearest = Candidate;
+		}
+	}
+
+	if (Nearest == nullptr)
+	{
+		// The whole receiving team is dead. The Core may never be lost, and handing it back to the
+		// side that threw it away would make a wild throw free - so it becomes a kickoff for the side
+		// that is owed it, which is what ResetLooseCore already computes from LooseFromTeam.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] GROUND TURNOVER: the throw by %s landed at %s but %s has nobody alive - kicking off instead."),
+			*TraceTeamName(ThrowingTeam).ToString(), *Landed.ToCompactString(),
+			*TraceTeamName(ReceivingTeam).ToString());
+
+		ResetLooseCore(TEXT("thrown into the ground with no living enemy to award it to"));
+		return true;
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] GROUND TURNOVER (spec v6 §4.2): the %s throw hit the ground at %s - to %s (%s), ")
+		TEXT("the nearest enemy, %.0f uu away."),
+		*TraceTeamName(ThrowingTeam).ToString(), *Landed.ToCompactString(),
+		*GetNameSafe(Nearest), *TraceTeamName(ReceivingTeam).ToString(), FMath::Sqrt(NearestDistSq));
+
+	// THROUGH TakeLooseCore, not through a private grant. It is the one guarded loose -> held
+	// transition, and it is what sets GraceOverrideTeam so that GrantTo's own AreAllies() line decides
+	// the 0.5 s trace grace. This is a cross-team change of possession, so that line will grant it -
+	// spec v5 §0's rule, applied rather than re-implemented. It also feeds Trace.ModeB.Verify.
+	TakeLooseCore(Nearest);
+	return true;
 }
 
 bool ATraceCore::ServerTryLoosePickup()
@@ -3090,6 +3531,8 @@ void ATraceCore::ClearLooseState()
 {
 	bLoose = false;
 	bLooseAtRest = false;
+	bLooseFromThrow = false;
+	CatchZoneTarget = nullptr;
 	LooseVelocity = FVector::ZeroVector;
 	LooseThrower = nullptr;
 	LooseStartServerTime = 0.f;
@@ -3140,10 +3583,12 @@ static TAutoConsoleVariable<int32> CVarModeBVerifyRequested(
 	TEXT("Trace.ModeB.Verify"),
 	0,
 	TEXT("1: run the mode B verification scenario once (throw -> teammate recovery with NO grace, ")
-	TEXT("throw -> enemy interception WITH grace, a Core thrown into the goal, and the loose reset timer)."),
+	TEXT("throw -> enemy interception WITH grace, a Core thrown into the ring goal, the loose reset ")
+	TEXT("timer, a bot carrying it in, a bot throwing it in, and spec v6's ground turnover)."),
 	ECVF_Default);
 
-bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelocity, ETraceTeam FromTeam)
+bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelocity, ETraceTeam FromTeam,
+	bool bAsThrow)
 {
 	if (!HasAuthority() || !IsModeB() || bCoreStateLocked)
 	{
@@ -3157,6 +3602,11 @@ bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelo
 
 	bLoose = true;
 	bLooseAtRest = false;
+	// Spec v6 §4.2 is a rule about a THROW. The scenario's reset-timer step deliberately parks a Core
+	// on the floor, and a Core that was never thrown must not turn over on contact with it - otherwise
+	// that step would silently stop testing the timer and start testing the turnover.
+	bLooseFromThrow = bAsThrow;
+	CatchZoneTarget = nullptr;
 	LooseFromTeam = FromTeam;
 	LooseThrower = nullptr;
 	LooseStartServerTime = GetServerTimeSeconds();
@@ -3217,13 +3667,54 @@ void ATraceCore::TickModeBVerification()
 	{
 		const bool bTimedOut = (Now >= VerifyStepDeadline);
 
-		// Steps 0 and 1 are waiting for a taker; steps 2 and 3 are waiting for the Core to stop being
-		// loose (a goal or a reset both end with a kickoff).
-		if (VerifyStep <= 1)
+		// Steps 0, 1 and 6 are waiting for a taker; steps 2 and 3 are waiting for the Core to stop
+		// being loose (a goal or a reset both end with a kickoff).
+		if (VerifyStep <= 1 || VerifyStep == 6)
 		{
 			if (bVerifyTakeSeen)
 			{
 				bVerifyTakeSeen = false;
+
+				// --- Step 6: spec v6 §4.2, the ground turnover. --------------------------------------
+				//
+				// Judged apart because it makes a STRONGER claim than steps 0 and 1 do. Those two are
+				// happy with whoever won the race to the Core; this one asserts the specific outcome the
+				// rule promises - the enemy of the throwing team has it, and (because that crosses
+				// sides) with the turnover grace applied. Anything else is a failure even if the grace
+				// bookkeeping was internally consistent.
+				if (VerifyStep == 6)
+				{
+					const bool bWentToTheEnemy = (VerifyFromTeam != ETraceTeam::None)
+						&& (VerifyTookTeam == TraceOpposingTeam(VerifyFromTeam));
+					const bool bGraceOk = bVerifyTookGrace
+						&& bLastGrantTeamChanged && LastGrantGraceSeconds > 0.f;
+					const bool bStepOk = bWentToTheEnemy && bGraceOk;
+
+					(bStepOk ? VerifyPassCount : VerifyFailCount)++;
+
+					// Two calls rather than a ternary verbosity: UE_LOG pastes its second argument
+					// into ELogVerbosity::<token>, so the level has to be a literal.
+					const FString StepDetail = FString::Printf(
+						TEXT("a %s throw hit the ground and went to %s (%s) | expected the nearest %s player, ")
+						TEXT("with grace | grace %s"),
+						*TraceTeamName(VerifyFromTeam).ToString(),
+						*VerifyTakerName, *TraceTeamName(VerifyTookTeam).ToString(),
+						*TraceTeamName(TraceOpposingTeam(VerifyFromTeam)).ToString(),
+						bGraceOk ? *FString::Printf(TEXT("APPLIED %.2fs"), LastGrantGraceSeconds) : TEXT("MISSING"));
+
+					if (bStepOk)
+					{
+						UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] step 6 PASS: %s"), *StepDetail);
+					}
+					else
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 6 FAIL: %s"), *StepDetail);
+					}
+
+					VerifyStepDeadline = 0.f;
+					++VerifyStep;
+					return;
+				}
 
 				// THE RULE, judged on the take that actually happened rather than on who was predicted
 				// to win the race. Spec v4 §7 is a statement about TEAMS, not about players: grace iff
@@ -3248,7 +3739,7 @@ void ATraceCore::TickModeBVerification()
 				return;
 			}
 		}
-		else if (VerifyStep >= 4)
+		else if (VerifyStep == 4 || VerifyStep == 5)
 		{
 			// --- Steps 4 and 5: the BOT paths. -----------------------------------------------------
 			//
@@ -3491,7 +3982,11 @@ void ATraceCore::TickModeBVerification()
 			}
 		}
 
-		if (!DebugLaunchLoose(Corner, FVector(0.0, 0.0, -50.0), FromTeam))
+		// bAsThrow = FALSE. Spec v6 §4.2 turns a thrown Core over the instant it touches the floor, and
+		// this step's entire premise is a Core that LIES on the floor untouched until the timer fires.
+		// Launching it as a throw would hand it to the nearest enemy on the first frame and this step
+		// would silently become a second (worse) test of the turnover rule.
+		if (!DebugLaunchLoose(Corner, FVector(0.0, 0.0, -50.0), FromTeam, /*bAsThrow=*/false))
 		{
 			++VerifyFailCount;
 			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 3 FAIL: could not launch."));
@@ -3575,7 +4070,22 @@ void ATraceCore::TickModeBVerification()
 		// was then shot off the Core inside 1.2 s by the two defenders holding the mouth, so those
 		// distances tested the defence, not the branch.
 		// 5200 is outside the commit band and inside throwing range.
-		const double Standoff = (VerifyStep == 4) ? 700.0 : 5200.0;
+		//
+		// STEP 5 IS 4800, AND THE FLOOR UNDER IT IS NOT THE BALLISTICS - IT IS THE CARRY-IN BAND.
+		// MEASURED, twice, and worth writing down because the obvious reasoning is wrong twice over.
+		// Spec v6 moved the goal 2400 uu further away and 1100 uu up, so the first instinct was that
+		// the shot must now be taken from closer and this step was set to 2600. It failed three runs
+		// running with "a throw did NOT leave" - and the reason is that UpdateThrow returns early
+		// while bCommitCarryIn is set, and TraceBotConstants::CarryInCommitDistance is 4200 uu. At
+		// 2600 the bot was not refusing the shot, it was correctly RUNNING IT IN, and the step was
+		// asking a carrier inside the commit band to do the one thing the commit exists to stop.
+		//
+		// The range worry was unfounded in the bargain: the same run measured a live bot taking (and
+		// scoring) a shot at the hoop from 4835 uu, because MaxThrowRange solves over launch ANGLE and
+		// a lofted arc carries far further than the flat-throw figure the tuning log prints.
+		//
+		// So: outside the commit band, inside the measured reach.
+		const double Standoff = (VerifyStep == 4) ? 700.0 : 4800.0;
 		// PICK A SPOT WITH A CLEAR VIEW OF THE MOUTH. The arena is full of cover, and the first
 		// attempt at this step dropped the carrier 58 uu in front of a 3x-height cover box: the bot
 		// correctly refused every shot ("blocked=18 of 18") and the step looked like a broken
@@ -3628,6 +4138,94 @@ void ATraceCore::TickModeBVerification()
 		// Generous: the bot has to run 2800 uu (step 4) or wait out a throw cooldown, slew onto a
 		// lofted solution and watch a 2-3 second arc land (step 5).
 		VerifyStepDeadline = Now + ((VerifyStep == 4) ? 16.f : 14.f);
+		return;
+	}
+
+	case 6:
+	{
+		// =========================================================================================
+		// SPEC v6 §4.2: A THROWN CORE THAT HITS THE GROUND IS THE ENEMY'S.
+		//
+		// Scripted for the same reason steps 2 and 3 are: waiting for a bot to happen to throw one
+		// into the dirt in front of an enemy is a hope, not a test. This throws it at the floor
+		// deliberately - from the real holder, through the same DebugLaunchLoose the goal step uses,
+		// flagged as a throw so the rule is armed - and then asserts the outcome the rule promises.
+		// =========================================================================================
+		if (!IsValid(Carrier) || !Carrier->IsAlive() || bLoose)
+		{
+			return;   // Between possessions. Not on a clock yet.
+		}
+
+		const ETraceTeam FromTeam = Carrier->GetTeam();
+		const ETraceTeam ToTeam = TraceOpposingTeam(FromTeam);
+
+		// Put an enemy where the throw will land, so "the CLOSEST player on the enemy team" is a fact
+		// the step controls rather than an accident of where ten bots happen to be standing. A second
+		// enemy is deliberately left wherever they are: if the rule picked the wrong one, the taker
+		// name in the PASS line is what says so.
+		ATraceCharacter* Nearest = nullptr;
+		for (ATraceCharacter* Candidate : Everyone)
+		{
+			if (IsValid(Candidate) && Candidate->IsAlive() && Candidate->GetTeam() == ToTeam)
+			{
+				Nearest = Candidate;
+				break;
+			}
+		}
+
+		if (Nearest == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBVerify] step 6 SKIPPED: no living %s player to award the turnover to."),
+				*TraceTeamName(ToTeam).ToString());
+			++VerifyStep;
+			return;
+		}
+
+		// 2200 uu AHEAD OF THE THROWER, not 900. MEASURED: at 900 the ex-carrier - who becomes a loose
+		// Core chaser the instant they are released - was inside their own 500 uu catch zone of the
+		// falling Core within 140 ms and caught it in the air, and the step reported the turnover rule
+		// broken when what it had actually observed was §4.1 working. The drop has to land somewhere
+		// nobody can reach first, or this measures the magnet.
+		const FVector CarrierLocation = Carrier->GetActorLocation();
+		const FVector Forward = Carrier->GetActorForwardVector().GetSafeNormal2D();
+		const FVector LandingSpot = CarrierLocation + Forward * 2200.0;
+
+		// 700 uu, NOT arm's length. The catch zone (§4.1) reaches 500 uu from a capsule's surface, so
+		// an enemy any closer would magnet the falling Core into their hands BEFORE it landed and the
+		// step would quietly become a second test of the magnet instead of a test of the turnover.
+		Nearest->SetActorLocation(
+			FVector(LandingSpot.X + 700.0, LandingSpot.Y, Nearest->GetActorLocation().Z),
+			false, nullptr, ETeleportType::TeleportPhysics);
+
+		// Aimed DOWN, HARD and from LOW: a throw that is going to hit the ground and nothing else,
+		// inside two or three frames, so there is no flight for anybody to intercept and the step
+		// measures the landing. Low enough that it cannot cross a goal or clip a cover block on the
+		// way, which would end the step for the wrong reason.
+		const FVector Start = LandingSpot + FVector(0.0, 0.0, 220.0);
+
+		VerifyThrower = Carrier;
+		VerifyExpectTeam = ToTeam;
+		VerifyExpectGrace = true;
+		bVerifyAwaitingTake = true;
+		bVerifyTakeSeen = false;
+
+		if (!DebugLaunchLoose(Start, FVector(0.0, 0.0, -2000.0), FromTeam, /*bAsThrow=*/true))
+		{
+			++VerifyFailCount;
+			bVerifyAwaitingTake = false;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 6 FAIL: could not launch."));
+			++VerifyStep;
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] step 6: a %s throw dropped at %s with %s (%s) standing 700 uu away - ")
+			TEXT("expecting a GROUND TURNOVER to them, with grace."),
+			*TraceTeamName(FromTeam).ToString(), *LandingSpot.ToCompactString(),
+			*GetNameSafe(Nearest), *TraceTeamName(ToTeam).ToString());
+
+		VerifyStepDeadline = Now + 4.f;
 		return;
 	}
 

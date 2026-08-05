@@ -94,8 +94,10 @@ enum class EBotDifficulty : uint8
  *   EndzoneStatusCore     Endzones spanning the full field width. The Core is a STATUS, not an
  *                         object: it cannot exist on the ground, LMB starts the 0.5 s hover-pass,
  *                         and possession moves on kill / trace break / completed pass.
- *   ThrownCoreAndGoals    Discrete goal volumes (GoalWidthFieldFraction of the field width,
- *                         GoalHeightUU tall) instead of endzones. The Core is a physical entity:
+ *   ThrownCoreAndGoals    CIRCULAR goals set into the back walls (spec v6 §4.3) instead of
+ *                         endzones — a hoop of diameter GoalWidthFieldFraction of the field width,
+ *                         its bottom raised 1.5 player heights off the floor. The Core is a
+ *                         physical entity:
  *                         LMB THROWS it at CoreThrowSpeed, and the first player of either team to
  *                         come within CorePickupRadius takes it. A Core left on the ground for
  *                         CoreLooseResetSeconds returns to play so it cannot be lost forever.
@@ -614,15 +616,20 @@ public:
 	/**
 	 * MODE B ONLY. Height of the goal volume, uu, measured from the floor.
 	 *
-	 * FINITE ON PURPOSE — "height finite so it reads as a goal rather than a wall". A goal you can
-	 * throw over is a goal you can defend by standing in front of.
+	 * REPOINTED BY SPEC v6 §4.3 — READ THIS BEFORE TUNING IT. Until v6 this was the height of a
+	 * free-standing goal between the goal line and the end wall. There is no such goal any more: the
+	 * goal is a CIRCLE set into the back wall, its diameter given by GoalWidthFieldFraction and its
+	 * height off the floor by the arena builder's GoalRingRaisePlayerHeights. Rather than leave a
+	 * slider that moves nothing — this project's rule is that a dead knob is worse than no knob —
+	 * this is now the dial on the GOAL APPROACH RAMP, the run-up that makes carrying the Core
+	 * through a raised hoop possible at all (ATraceArenaBuilder::GoalRampTopZ, which clamps it to
+	 * one step below the hoop).
 	 *
-	 * 700 -> 440 THIS PASS (spec v5 §4, "reduce height and width"). Scaled by the same factor the
-	 * width was, 2000/3200, so the goal mouth keeps its proportions instead of turning into a
-	 * letterbox. 440 is two and a half character heights (the capsule is 176 uu): a defender's head
-	 * covers a real fraction of it, a lobbed Core still clears it, and a flat throw still does not.
+	 * At its shipped 440 the clamp wins and the ramp sits exactly where the ring puts it. Lower it
+	 * and the run-up gets lower, which makes carrying one in harder; 0 removes the ramp entirely and
+	 * leaves throwing as the only way to score.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Goal Height (uu) [mode B]", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "200.0", UIMax = "2000.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Goal Approach Ramp Height (uu) [mode B]", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "200.0", UIMax = "2000.0"))
 	float GoalHeightUU = 440.f;
 
 	// DEAD PROPERTY REMOVED: MatchDuration.
@@ -1873,8 +1880,8 @@ public:
 	 * along the floor and catching on the first piece of cover.
 	 *
 	 * Small: at 0.12 a 3000 uu/s throw leaves with 360 uu/s of lift, which is a shallow arc a player
-	 * can lead. Raising it makes throws lobbed and easy to read; zero makes them hitscan-flat and
-	 * makes the goal's finite height (GoalHeightUU) meaningless.
+	 * can lead. Raising it makes throws lobbed and easy to read; zero makes them hitscan-flat — and
+	 * since spec v6 §4.3 raised the hoop off the floor, a flat throw cannot reach the goal at all.
 	 *
 	 * NAME IS LOAD-BEARING: ATraceCore resolves this by reflection under exactly this spelling
 	 * (TraceModeBTuning::ThrowUpBias). It was briefly declared as "CoreThrowUpwardBias", which the
@@ -1988,6 +1995,53 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Loose Core Reset (s, 0 = never) [mode B]", ClampMin = "0.0", ClampMax = "120.0", UIMin = "0.0", UIMax = "30.0"))
 	float CoreLooseResetSeconds = 12.f;
 
+	// ------------------------------------------------------------------------------------------
+	// CATCH ZONE  (spec v6 §4.1, mode B only)
+	//
+	// Verbatim: "create a small invisible radius around players that acts as a 'catch zone,' so that
+	// when the core enters that area, it curves towards the player like a magnet. This is intended
+	// to make catching feel fluid and clean."
+	//
+	// All three are read BY NAME by TraceModeBTuning in Gameplay/TraceCore.cpp (Resolve()), which is
+	// why the spelling below is load-bearing and why Trace.VerifyKnobs lists them: a typo here is a
+	// slider that moves nothing, not a build error.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Radius, uu, of the invisible catch zone around EVERY player. A loose Core entering it is
+	 * steered toward that player. 0 disables the magnet.
+	 *
+	 * Steers DIRECTION ONLY — speed is preserved, so this makes a near-miss into a catch without
+	 * making the Core faster or slower than the throw that produced it. Sized well above
+	 * CorePickupRadius (120): the pickup radius is where possession changes, this is the funnel
+	 * that feeds it. Sane range 300 to 800; past ~1000 the Core visibly homes and interceptions
+	 * stop feeling earned.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Zone Radius (uu) [mode B]", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "0.0", UIMax = "1200.0"))
+	float CoreCatchRadius = 500.f;
+
+	/**
+	 * How hard the catch zone bends the Core, as an exponential approach rate (frame-rate
+	 * independent). 0 disables the magnet outright; the pull already falls off to zero at the edge
+	 * of the zone, so this scales the curve at point-blank range rather than at the boundary.
+	 *
+	 * Too high and a throw at open ground snaps sideways into whoever is nearest, which reads as
+	 * aim assist rather than a catch. Sane range 3 to 10.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Zone Curve Strength [mode B]", ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.0", UIMax = "12.0"))
+	float CoreCatchCurveStrength = 6.f;
+
+	/**
+	 * Seconds the THROWER alone is excluded from their own catch zone. Without it a throw curves
+	 * straight back into the hands it left and the throw looks like it never happened — the same
+	 * failure CoreThrowerPickupLockoutSeconds exists to prevent, one step earlier in the chain.
+	 *
+	 * Every other player, friend or enemy, is magnetised from the first frame: interception is a
+	 * feature (spec v6 §4.1 [ASSUMPTION]).
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Zone Thrower Lockout (s) [mode B]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
+	float CoreCatchThrowerLockoutSeconds = 0.5f;
+
 	// ==========================================================================================
 	// PARRY  (spec v3 §3 — new mechanic)
 	//
@@ -2026,6 +2080,19 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Parry", meta = (DisplayName = "Parry Cooldown (s)", ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.2", UIMax = "6.0"))
 	float ParryCooldown = 1.5f;
+
+	/**
+	 * Spec v6 §3: "Perfectly timed parries should kill the enemy dashing." A parry that actually
+	 * intercepts a dash which WOULD have killed the carrier now kills the dasher instead of merely
+	 * saving the carrier. False restores the pre-v6 behaviour (the parry is purely protective).
+	 *
+	 * Only a dash that would genuinely have been lethal is punished — a parry thrown at empty air
+	 * kills nobody, and under a TrailLethality tuning where the trace does not kill the carrier
+	 * there is nothing to punish. Read by Gameplay/TraceParry.cpp; the console override is
+	 * Trace.Parry.KillsDasher, which is a cheat cvar and loses to nothing but itself.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Parry", meta = (DisplayName = "Parry Kills the Dasher"))
+	bool bParryKillsDasher = true;
 
 	/**
 	 * Colour the ENTIRE trace turns for the duration of a parry. Spec §3 says red.
@@ -2253,6 +2320,22 @@ public:
 	// carriers), and the ribbon between them is what keeps the trip geometry continuous. So
 	// TraceGhostSpacingPoints is a VISUAL density dial only — it must never be allowed to thin the
 	// collision, or the trip test and the picture disagree and the whole game feels broken.
+	//
+	// ------------------------------------------------------------------------------------------
+	// READ THIS BEFORE TOUCHING THE FOUR "[legacy]" KNOBS. Spec v6 §2 replaced the character-shaped
+	// after-images with one continuous curved RIBBON, which is what ships and what the renderer
+	// draws at Trace.Trail.Renderer 1 (the default). Four of the five knobs below —
+	// TraceGhostSpacingUU, MaxTraceGhosts, TraceSmearGlowScale, TraceGhostForcedLOD — now affect
+	// ONLY the legacy arm, i.e. only if somebody sets Trace.Trail.Renderer 0 to A/B the old look.
+	//
+	// They are kept rather than deleted because that A/B is how the performance claim in this pass
+	// was measured and is the only way to reproduce it, and they are RELABELLED rather than left
+	// alone because a settings panel that offers a live-looking slider for a renderer nobody is
+	// running is the same silent lie as a knob bound to a misspelled name. The fifth,
+	// TraceGhostGlow, is genuinely live: it drives the ribbon's brightness.
+	//
+	// Do not "fix" a look problem with these. If the ribbon is wrong, the ribbon's own knobs are
+	// Trace.Trail.RibbonStep, Trace.Trail.RibbonWidthScale and Trace.Trail.OwnerHideCameraRadius.
 	// ------------------------------------------------------------------------------------------
 
 	/**
@@ -2272,7 +2355,7 @@ public:
 	 * COSMETIC ONLY. Nothing here may thin the lethal volume; the trip test runs on the trail points,
 	 * not on the ghosts. Sane range 120 to 300.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Ghost Spacing (uu along path)", ClampMin = "20.0", ClampMax = "2000.0", UIMin = "60.0", UIMax = "500.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Legacy Renderer", meta = (DisplayName = "[legacy] Ghost Spacing (uu along path)", ClampMin = "20.0", ClampMax = "2000.0", UIMin = "60.0", UIMax = "500.0"))
 	float TraceGhostSpacingUU = 220.f;
 
 	/**
@@ -2291,17 +2374,24 @@ public:
 	 * Only the Core holder emits, so the worst realistic case (a residual trace during a turnover
 	 * while the new holder lays a fresh one) is ~2x this in the world, not 10x.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Max Ghosts Per Trace (0 = smear only)", ClampMin = "0", ClampMax = "64", UIMin = "0", UIMax = "40"))
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Legacy Renderer", meta = (DisplayName = "[legacy] Max Ghosts Per Trace (0 = smear only)", ClampMin = "0", ClampMax = "64", UIMin = "0", UIMax = "40"))
 	int32 MaxTraceGhosts = 20;
 
 	/**
-	 * Emissive strength of a posed after-image on M_TraceNeon. Mirrors Trace.Trail.GhostGlow.
+	 * THE LIVE ONE. Emissive strength of the brightest layer of the trace on M_TraceNeon — which
+	 * since spec v6 §2 is the RIBBON, not a posed after-image. Mirrors Trace.Trail.GhostGlow.
+	 *
+	 * The name is legacy and the meaning is not: "emissive strength of the brightest layer" is
+	 * exactly what it always was, so the number a designer already tuned still means what they tuned
+	 * it to. It is deliberately NOT renamed to TraceRibbonGlow, because the four knobs below it ARE
+	 * dead weight on the shipping renderer and renaming this one would blur the line between the two
+	 * groups at the exact moment that line is the useful information.
 	 *
 	 * Above roughly 3.5 the team colour clips toward white and you can no longer tell WHOSE trace you
 	 * are looking at, which matters more than prettiness — the trace is only lethal to the other team,
 	 * so misreading its colour is misreading whether you may run through it.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Ghost Glow", ClampMin = "0.0", ClampMax = "8.0", UIMin = "0.5", UIMax = "4.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Trace Ribbon Glow", ClampMin = "0.0", ClampMax = "8.0", UIMin = "0.5", UIMax = "4.0"))
 	float TraceGhostGlow = 2.6f;
 
 	/**
@@ -2314,7 +2404,7 @@ public:
 	 * the old solid-fence look. DO NOT take it low enough that the gaps between ghosts read as
 	 * passable — they are not passable, and a player who learns otherwise learns a lie.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Smear Glow (fraction of ghost glow)", ClampMin = "0.02", ClampMax = "4.0", UIMin = "0.1", UIMax = "1.5"))
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Legacy Renderer", meta = (DisplayName = "[legacy] Smear Glow (fraction of ribbon glow)", ClampMin = "0.02", ClampMax = "4.0", UIMin = "0.1", UIMax = "1.5"))
 	float TraceSmearGlowScale = 0.5f;
 
 	/**
@@ -2326,7 +2416,7 @@ public:
 	 * forcing a low LOD is the single biggest perf lever here if a ten-player capture ever measures
 	 * the skinned draws as expensive.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Trail|Ghosts", meta = (DisplayName = "Ghost Forced LOD (0 = auto)", ClampMin = "0", ClampMax = "4"))
+	UPROPERTY(config, EditAnywhere, Category = "Trail|Legacy Renderer", meta = (DisplayName = "[legacy] Ghost Forced LOD (0 = auto)", ClampMin = "0", ClampMax = "4"))
 	int32 TraceGhostForcedLOD = 0;
 
 	// ==========================================================================================

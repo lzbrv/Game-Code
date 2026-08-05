@@ -52,9 +52,11 @@ class UStaticMeshComponent;
  *    / 616 uu), keyed to the character capsule via PlayerHeightUU();
  *  - a lit gate spanning the full width of each endzone; the endzones themselves run sideline to
  *    sideline - see EndzoneHalfWidth;
- *  - and, for MODE B, a GOAL at each end: two posts 2000 uu apart (GoalHalfWidth) carrying a
- *    crossbar at ClampedGoalHeight(), with the goal mouth lit on the floor between them. See the
- *    two-modes note below.
+ *  - and, for MODE B, a GOAL at each end: since spec v6 section 4.3 that is a 2000 uu CIRCULAR hoop
+ *    (GoalHalfWidth is its radius) set INTO the back wall, its bottom raised 1.5 player heights off
+ *    the floor, with a lit alcove behind it and a run-up ramp in front of it. The end wall itself is
+ *    mode-tagged because of it: mode A gets the solid slab, mode B gets a perforated replacement.
+ *    See BuildGoalWall and the two-modes note below.
  *
  * TWO SCORING SHAPES, BOTH BUILT (spec v4 section 7)
  * -------------------------------------------------
@@ -216,13 +218,16 @@ public:
 	float GoalHalfWidth() const;
 
 	/**
-	 * Height of a goal volume, floor upward, from UTraceSettings::GoalHeightUU.
+	 * UTraceSettings::GoalHeightUU, clamped to the wall height.
 	 *
-	 * 440 uu by default: spec v5 section 4 scaled it by the same 2000/3200 the width was scaled by,
-	 * so "reduce height and width" kept the mouth's proportions instead of making it a letterbox.
-	 *
-	 * FINITE ON PURPOSE - "height finite so it reads as a goal rather than a wall". Clamped to the
-	 * wall height at the top so the crossbar can never be built above the sky.
+	 * WHAT IT USED TO MEAN, AND WHAT IT MEANS NOW. Until spec v6 section 4.3 this was the height of a
+	 * goal that stood on the floor between the goal line and the end wall, with a crossbar on top of
+	 * it. There is no such goal any more - the goal is a ring in the wall, sized by GoalRingRadius()
+	 * and placed by GoalRingClearanceZ(). Rather than leave a settings slider that moves nothing (a
+	 * dead knob is worse than no knob), it is now the dial on the GOAL APPROACH RAMP: see
+	 * GoalRampTopZ(), which clamps it to one step below the hoop. At its shipped 440 the clamp wins
+	 * and the ramp sits exactly where the ring puts it; lower it and the run-up gets lower, which
+	 * makes carrying the Core through the hoop harder; 0 removes the ramp.
 	 */
 	float ClampedGoalHeight() const;
 
@@ -233,6 +238,74 @@ public:
 	 * the net still counts), +/- GoalHalfWidth() along Y, and floor to ClampedGoalHeight() in Z.
 	 */
 	FBox GetGoalBounds(float EndSign) const;
+
+	// --- MODE B, SPEC v6 §4.3: the goal is a RING SET INTO THE BACK WALL ---------------------------
+	//
+	// Verbatim: "Raise the goals 1.5x player height from the ground, place them into the back walls,
+	// and make them circular."
+	//
+	// WHAT REPLACED WHAT. The v4/v5 goal was a box standing on the floor between the goal line and
+	// the end wall, framed by two posts and a crossbar. All of that is gone. In its place each end
+	// wall is REBUILT WITH A HOLE IN IT - four panels around a square opening plus a thick neon
+	// annulus that closes the opening down to a circle - and the scoring volume is a shallow slab
+	// across the mouth of that hole, tested against the disc rather than against its corners
+	// (ATraceEndzone::ConfigureRing).
+	//
+	// THE ONE PLACE THE SPEC CONTRADICTS ITSELF, and how it is resolved. Spec v6 §4.3 asks for the
+	// goal CENTRE at 1.5 player heights (264 uu) AND for a 2000 uu diameter. A 1000 uu radius about a
+	// 264 uu centre puts 736 uu of the hoop underneath the floor: the ring would not be "raised off
+	// the ground" at all, it would be buried in it, which defeats the verbatim instruction the
+	// numbers were derived from. The diameter is the number that decides whether the goal is
+	// throwable at, so the diameter is kept and the 1.5 player heights are applied to the BOTTOM of
+	// the hoop - the hoop clears the floor by exactly 1.5 player heights and its centre sits at
+	// 264 + 1000 = 1264 uu. Both halves are dials (GoalRingRaisePlayerHeights, and the diameter via
+	// UTraceSettings::GoalWidthFieldFraction), and the resolved numbers are logged at Display so the
+	// reading is visible rather than buried here.
+
+	/**
+	 * How far the BOTTOM of the ring clears the floor, in player heights. Spec v6 §4.3's
+	 * "1.5x player height from the ground" - 264 uu against the 176 uu capsule.
+	 *
+	 * Clamped at use so the hoop can never be pushed through the floor or through the wall top.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
+	float GoalRingRaisePlayerHeights = 1.5f;
+
+	/**
+	 * Depth of the scoring slab in front of the wall plane, uu. The volume a carrier has to be
+	 * INSIDE to have "carried it through the ring".
+	 *
+	 * Not zero, because a plane cannot contain a pawn: at 320 uu a carrier standing at the top of
+	 * the approach ramp with their capsule against the wall is inside it, and a Core crossing the
+	 * plane is caught by the swept test in ATraceCore whatever the frame rate.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
+	float GoalRingDepth = 320.f;
+
+	/**
+	 * Run-up ramp in front of each ring, as a fraction of the ring's floor clearance -> how long the
+	 * slope is. The ramp is what makes "carrying the core through the goal" reachable at all now that
+	 * the mouth is 264 uu off the ground: a pawn's own jump apex leaves its origin ~50 uu short of
+	 * the bottom of the hoop, so without a ramp the carry-in path would be dead and only throwing
+	 * would score. Set to 0 to remove the ramp (and with it, in practice, the carry-in goal).
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
+	float GoalRampRunPerRise = 4.2f;
+
+	/** Radius of the ring mouth, uu. Half of GoalHalfWidth()'s mouth, i.e. 1000 by default. */
+	float GoalRingRadius() const;
+
+	/** Height of the BOTTOM of the hoop above the floor, uu. GoalRingRaisePlayerHeights x a player. */
+	float GoalRingClearanceZ() const;
+
+	/** Height of the CENTRE of the hoop above the floor, uu. Clearance + radius, clamped to the wall. */
+	float GoalRingCentreZ() const;
+
+	/** Top of the approach ramp in front of the ring, uu. One step below the hoop, or 0 with no ramp. */
+	float GoalRampTopZ() const;
+
+	/** World-space centre of the ring mouth at @p EndSign. */
+	FVector GetGoalRingCentre(float EndSign) const;
 
 	/**
 	 * The box that actually scores at @p EndSign in the mode currently armed - the goal in mode B,
@@ -612,11 +685,23 @@ protected:
 	void BuildEndzones(bool bBuildVisuals);
 
 	/**
-	 * The MODE B goals: two posts, a crossbar, a lit mouth on the floor and the scoring volume, at
-	 * each end. Built unconditionally and then hidden if mode A is the one armed - see the two-modes
-	 * note in the class comment.
+	 * The MODE B goals (spec v6 §4.3): a circular neon ring set into each back wall, the perforated
+	 * end wall that carries it, the alcove behind it, the approach ramp in front of it and the
+	 * scoring volume across its mouth. Built unconditionally and then hidden if mode A is the one
+	 * armed - see the two-modes note in the class comment.
 	 */
 	void BuildGoals(bool bBuildVisuals);
+
+	/**
+	 * One end's worth of mode-B wall: the four panels that leave a square opening, the annulus that
+	 * closes that opening down to a circle, the neon hoop on its inner rim, the alcove behind and the
+	 * pawn standoffs that used to run across the whole wall face.
+	 *
+	 * Split out of BuildGoals because it is the piece that has to agree with BuildFloorAndWalls: the
+	 * solid end wall it replaces is tagged into EndzoneModePieces there, and these are tagged into
+	 * GoalModePieces, so exactly one of the two exists at a time.
+	 */
+	void BuildGoalWall(float Sign, bool bBuildVisuals);
 
 	void BuildPlayerStarts();
 	void BuildLighting();
@@ -659,6 +744,22 @@ protected:
 	 */
 	UBoxComponent* AddCollisionBlock(const FVector& LocalCenter, const FVector& Size, const TCHAR* DebugName,
 		float YawDegrees = 0.f);
+
+	// --- Freely rotated variants (spec v6 §4.3) ---------------------------------------------------
+	//
+	// The three helpers above take a YAW only, which was enough while every piece of the arena was an
+	// axis-aligned box standing on the floor. A ring set into a VERTICAL wall is not: its segments
+	// are spokes around an axis that points down the field, so each one needs a ROLL. Rather than
+	// widening five signatures (and their forty-odd call sites) these are separate entry points, and
+	// the yaw-only versions forward to them, so there is still exactly one implementation of each.
+
+	/** As AddMeshBlock, with a full rotation rather than a yaw. */
+	UStaticMeshComponent* AddMeshBlockRotated(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
+		UMaterialInstanceDynamic* MID, bool bCastShadow, const TCHAR* DebugName, const FRotator& Rotation);
+
+	/** As AddCollisionBlock, with a full rotation rather than a yaw. */
+	UBoxComponent* AddCollisionBlockRotated(const FVector& LocalCenter, const FVector& Size, const TCHAR* DebugName,
+		const FRotator& Rotation);
 
 	/**
 	 * An invisible box that blocks ECC_Pawn AND NOTHING ELSE, wrapped around a piece of structure so

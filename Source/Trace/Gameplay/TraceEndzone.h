@@ -94,6 +94,47 @@ public:
 	 */
 	void ConfigureZone(ETraceTeam InOwningTeam, const FVector& BoxHalfExtent, bool bInGoalVolume = false);
 
+	// =============================================================================================
+	// SPEC v6 §4.3 — THE CIRCULAR GOAL. MODE B ONLY.
+	//
+	// "Raise the goals 1.5x player height from the ground, place them into the back walls, and make
+	// them circular."
+	//
+	// The volume stays a BOX component, because a box is what UBoxComponent can be and because the
+	// box is still the right broad phase — it is the ring's bounding slab: half a ring diameter in Y
+	// and Z, and the slab's depth in X. What the ring adds is one extra test inside it, applied by
+	// IsInsideZone() and by ATraceCore's swept goal test alike, so the shape that scores and the
+	// shape the arena draws are still the same shape.
+	//
+	// WHY THE RING TEST LIVES HERE AND NOT IN ATraceCore. The class comment above makes the promise
+	// that "the volume that scores is the volume you can see", and the way that promise is kept is
+	// that nobody reconstructs the shape: the arena sizes it, this actor stores it, and every reader
+	// asks. A radius kept privately by the Core would be a second copy of the goal, which is exactly
+	// how the drawn goal and the scoring goal drifted apart the last time somebody tried it.
+	// =============================================================================================
+
+	/**
+	 * Makes this goal CIRCULAR: the mouth is the disc of radius @p Radius about the trigger's own
+	 * origin, in the trigger's local Y/Z plane, and the box's X extent becomes the slab depth.
+	 *
+	 * @p Radius <= 0 restores the plain box, which is what mode A's endzones stay as forever.
+	 * Call after ConfigureZone (it does not resize the box - the caller owns that, because the box
+	 * has to be the ring's bounding slab and only the caller knows the depth it wants).
+	 */
+	void ConfigureRing(float Radius);
+
+	/** True when this volume scores on a DISC rather than on the whole box. Mode B goals only. */
+	bool IsRingGoal() const { return bRingGoal && RingRadius > 0.f; }
+
+	/** Radius of the ring mouth, uu. 0 when this is not a ring. */
+	float GetRingRadius() const { return RingRadius; }
+
+	/** World-space centre of the ring mouth: the trigger's own origin. */
+	FVector GetRingCentre() const;
+
+	/** World-space unit normal of the ring plane (the trigger's local +X, i.e. down the field). */
+	FVector GetRingAxis() const;
+
 	/** True when a carrier on @p Team scores by entering this zone. See the class comment. */
 	bool ScoresHere(ETraceTeam Team) const;
 
@@ -168,6 +209,17 @@ private:
 
 	/** Shape flag: the narrow mode-B goal rather than the full-width mode-A endzone. */
 	bool bGoalVolume = false;
+
+	/**
+	 * Spec v6 §4.3. Circular mouth, mode B only.
+	 *
+	 * Two fields rather than "radius > 0 means circular" alone, so that a zero radius arriving from a
+	 * degenerate settings value reads as a BROKEN ring in the log rather than silently reverting the
+	 * goal to a full box - which would be a goal the size of its own bounding slab, i.e. an invisible
+	 * one that scores off the corners.
+	 */
+	bool bRingGoal = false;
+	float RingRadius = 0.f;
 
 	/**
 	 * Whether this volume can score right now. Both pairs are built; one pair is armed.

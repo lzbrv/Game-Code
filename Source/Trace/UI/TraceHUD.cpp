@@ -15,6 +15,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceParry.h"          // v6 §3 — the parry-kill banner and the death-panel line
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "InputCoreTypes.h"               // EKeys::Escape, for the pause poll
 #include "Misc/CommandLine.h"
@@ -353,6 +354,7 @@ void ATraceHUD::DrawHUD()
 		DrawCoreBanner();
 		DrawPhaseBanner();
 		DrawScoreFlash();
+		DrawParryKillBanner();
 		DrawDeathPanel();
 		DrawScoreboard();
 	}
@@ -1879,6 +1881,59 @@ void ATraceHUD::DrawScoreFlash()
 // Death / respawn
 // -------------------------------------------------------------------------------------------
 
+void ATraceHUD::DrawParryKillBanner()
+{
+	const float FadeSeconds = FMath::Max(0.01f, TraceParry::GetParryKillFeedbackSeconds());
+
+	// SOURCE 1: the authoritative server-side record. On a listen server this is the whole of it —
+	// the host's pawn IS the carrier the record names, no replication involved and nothing to drop.
+	float SecondsAgo = -1.f;
+	FString VictimName;
+	bool bHave = TraceParry::GetParryKillFeedback(LocalChar.Get(), SecondsAgo, VictimName);
+
+	// SOURCE 2: the remote-client fallback. A client has no access to that record, so the server
+	// sends ClientNotifyParryKill and we age it against OUR clock (which is why the RPC stamps the
+	// client's own world time and not the server's).
+	if (!bHave && TracePC != nullptr && !TracePC->GetLastParryKillVictim().IsEmpty())
+	{
+		const float Age = Now - TracePC->GetLastParryKillTime();
+		if (Age >= 0.f && Age <= FadeSeconds)
+		{
+			bHave = true;
+			SecondsAgo = Age;
+			VictimName = TracePC->GetLastParryKillVictim();
+		}
+	}
+
+	if (!bHave)
+	{
+		return;
+	}
+
+	// Drawn in the PARRY's own red, from TraceParry::GetTintColor(), and that is not decoration: it
+	// is the same colour the whole trace flashed at the instant this happened, so the banner and the
+	// world are visibly the same event rather than two things that coincided.
+	const float Alpha = FMath::Clamp(1.f - (SecondsAgo / FadeSeconds), 0.f, 1.f);
+	const FLinearColor Tint = TraceHUDStyle::WithAlpha(TraceParry::GetTintColor(), Alpha);
+
+	const FString Line = FString::Printf(TEXT("PARRIED - %s DASHED YOUR TRACE"), *VictimName.ToUpper());
+
+	// Below the Core banner, above the crosshair: the carrier is looking at one or the other, and
+	// this must never sit on top of either.
+	const float CX = ViewW * 0.5f;
+	const float BannerY = ViewH * 0.30f;
+	const float BannerScale = 1.1f * UIScale;
+
+	const float TextW = MeasureWidth(Line, FontMedium, BannerScale);
+	const float TextH = MeasureHeight(Line, FontMedium, BannerScale);
+	const float PadX = 16.f * UIScale;
+	const float PadY = 5.f * UIScale;
+
+	DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Shadow, Alpha),
+		CX - TextW * 0.5f - PadX, BannerY - PadY, TextW + PadX * 2.f, TextH + PadY * 2.f);
+	DrawTextCentered(Line, Tint, CX, BannerY, FontMedium, BannerScale);
+}
+
 void ATraceHUD::DrawDeathPanel()
 {
 	if (!bLocalDead)
@@ -1904,6 +1959,17 @@ void ATraceHUD::DrawDeathPanel()
 		const FString CauseText = Cause.IsNone() ? FString() : FString::Printf(TEXT("  (%s)"), *Cause.ToString());
 		const FString KillerLine = FString::Printf(TEXT("by %s%s"), *TracePC->GetLastKillerName(), *CauseText);
 		DrawTextCentered(KillerLine, TraceHUDStyle::InkDim, CX, PanelY + (62.f * UIScale), FontMedium, 0.95f * UIScale);
+
+		// SPEC v6 §3 asks for feedback that leaves the dasher in no doubt. "by <carrier> (Parried)"
+		// names the fact; this names the RULE, because "Parried" is a brand new cause of death and a
+		// player who has never met it will read it as a bug — they dashed a trace, which they know
+		// kills the carrier, and instead they died. One extra line is the cheapest possible fix, and
+		// it says RED because red is the tell they had 0.1 s to notice and did not.
+		if (Cause == TraceParry::GetParryKillCause())
+		{
+			DrawTextCentered(TEXT("YOU DASHED A PARRIED (RED) TRACE"), TraceParry::GetTintColor(),
+				CX, PanelY + (82.f * UIScale), FontSmall, 0.85f * UIScale);
+		}
 	}
 
 	// Countdown, from the AUTHORITATIVE respawn deadline the player state replicates. It used to be

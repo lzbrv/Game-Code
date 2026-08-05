@@ -1273,6 +1273,20 @@ void ATracePlayerController::ClientNotifyKilledBy_Implementation(const FString& 
 	UE_LOG(LogTraceGame, Verbose, TEXT("[%s] Killed by '%s' (%s)"), *GetName(), *KillerName, *Cause.ToString());
 }
 
+void ATracePlayerController::ClientNotifyParryKill_Implementation(const FString& VictimName)
+{
+	// CLIENT-LOCAL time on purpose, exactly like LastHitMarkerTime: the HUD fades this banner out
+	// against UWorld::GetTimeSeconds() on this machine, and a server timestamp would be offset by
+	// the client's own clock delta and could fade the banner before it was ever drawn.
+	if (const UWorld* World = GetWorld())
+	{
+		LastParryKillTime = World->GetTimeSeconds();
+	}
+	LastParryKillVictim = VictimName;
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("[%s] Parry kill on '%s'"), *GetName(), *VictimName);
+}
+
 void ATracePlayerController::ServerRequestRespawn_Implementation()
 {
 	// Contract §8: never check() on network input — validate and return.

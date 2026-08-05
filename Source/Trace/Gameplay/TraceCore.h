@@ -412,6 +412,22 @@ public:
 	 */
 	static bool GetAttackGoalBox(const UWorld* World, ETraceTeam AttackingTeam, FBox& OutBox);
 
+	/**
+	 * SPEC v6 §4.3. The CIRCLE @p AttackingTeam scores in: centre, radius and plane normal.
+	 *
+	 * The goal is now a hoop set into a back wall, and the box a bot used to aim at is only its
+	 * bounding slab - so aiming at the box centre is aiming at the middle of a square whose corners
+	 * are wall. This is the shape that actually scores, published for the same reason the flight
+	 * model is: ATraceBotController would otherwise have to rebuild it from the arena's constants and
+	 * would silently disagree with the rule the moment either changed.
+	 *
+	 * @return false in mode A, and false in mode B if the armed goal is not a ring (an externally
+	 *         registered box goal, for instance) - in which case the caller should fall back to
+	 *         GetAttackGoalBox.
+	 */
+	static bool GetAttackGoalRing(const UWorld* World, ETraceTeam AttackingTeam, FVector& OutCentre,
+		float& OutRadius, FVector& OutAxis);
+
 	// --- MODE B: the Core's own flight model, published --------------------------------------------
 	//
 	// PUBLISHED, rather than left for each caller to reconstruct, because it already went wrong once:
@@ -705,6 +721,42 @@ private:
 	/** Server, mode B. Nearest living player within the pickup radius takes it. True if one did. */
 	bool ServerTryLoosePickup();
 
+	/**
+	 * Server, mode B, SPEC v6 §4.1 — THE CATCH ZONE.
+	 *
+	 * Verbatim: "create a small invisible radius around players that acts as a 'catch zone,' so that
+	 * when the core enters that area, it curves towards the player like a magnet."
+	 *
+	 * Bends LooseVelocity toward the nearest eligible catcher inside CatchRadius. SPEED IS PRESERVED
+	 * and only the DIRECTION is steered, which is what makes it read as a catch rather than as a
+	 * tractor beam: a Core that arrives faster still arrives faster, it just arrives at the player.
+	 * The pull falls off with distance so the edge of the zone is a nudge and the middle of it is a
+	 * catch, and it is scaled by DeltaSeconds so the curve is frame-rate independent.
+	 *
+	 * EVERY player, friend or enemy (spec: interception is a feature), except the thrower for
+	 * CatchThrowerLockout seconds — without that a throw would curve straight back into the hands it
+	 * left, since it leaves from inside its own thrower's catch zone.
+	 */
+	void ServerApplyCatchZone(float DeltaSeconds);
+
+	/**
+	 * Server, mode B, SPEC v6 §4.2 — GROUND CONTACT IS A TURNOVER.
+	 *
+	 * Verbatim: "When a team has possession of the core, throws it, and it hits the ground, it should
+	 * automatically turnover to the closest player on the enemy team."
+	 *
+	 * Grants the Core to the nearest living member of the team OPPOSING @p LooseFromTeam. That is a
+	 * cross-team change of possession, so it goes through TakeLooseCore like an interception and
+	 * picks up the 0.5 s trace grace by the same AreAllies() line — spec v5 §0's rule, unmodified.
+	 *
+	 * Falls back to ResetLooseCore when that team has nobody alive, because the Core may never be
+	 * lost and a kickoff to the same side is the closest thing to the intended outcome.
+	 *
+	 * @return true when the Core left the ground state (granted or reset). The caller must touch no
+	 *         member state afterwards: a grant can score, which resets the field.
+	 */
+	bool ServerGroundTurnover();
+
 	/** Server, mode B. The guarded loose -> held transition. Sets the grace override, then grants. */
 	void TakeLooseCore(ATraceCharacter* Taker);
 
@@ -736,7 +788,8 @@ private:
 	 * live match only by waiting for a bot to happen to produce them, and "we never saw it fail" is
 	 * not evidence that a rule works.
 	 */
-	bool DebugLaunchLoose(const FVector& From, const FVector& LaunchVelocity, ETraceTeam FromTeam);
+	bool DebugLaunchLoose(const FVector& From, const FVector& LaunchVelocity, ETraceTeam FromTeam,
+		bool bAsThrow = true);
 
 	/** Server. Runs the Trace.ModeB.Verify scenario, one step at a time. See the .cpp. */
 	void TickModeBVerification();
@@ -867,14 +920,54 @@ private:
 	/** True once the loose Core has come to rest, so the log says "thrown" or "loose" correctly. */
 	bool bLooseAtRest = false;
 
+	/**
+	 * SPEC v6 §4.2. True while the loose Core is one a team actually THREW.
+	 *
+	 * The turnover rule is a statement about a throw — "when a team has possession of the core,
+	 * throws it, and it hits the ground" — and not about every way a Core can end up in the air. The
+	 * only other way it can is Trace.ModeB.Verify's DebugLaunchLoose, whose reset-timer step parks a
+	 * Core on the floor on purpose; without this flag that step would hand the Core to the nearest
+	 * enemy on its first frame and would be testing the new rule instead of the timer.
+	 */
+	bool bLooseFromThrow = false;
+
+	/**
+	 * SPEC v6 §4.1. The catcher the magnet is currently pulling toward, for the log line only.
+	 *
+	 * Held so that "the Core curved toward X" is announced ONCE per catch rather than every frame of
+	 * the curve. An invisible mechanic with no log line is one nobody can tell is broken, and this
+	 * project has twice declared a working mechanic dead for exactly that reason.
+	 */
+	TWeakObjectPtr<ATraceCharacter> CatchZoneTarget;
+
 	/** Previous frame's holder position, so the mode-B carry-in test is swept rather than sampled. */
 	FVector LastCarrierGoalTestLocation = FVector::ZeroVector;
 
-	/** One goal mouth, in world space, with the team that DEFENDS it. */
+	/**
+	 * One goal mouth, in world space, with the team that DEFENDS it.
+	 *
+	 * SPEC v6 §4.3 added the ring. The BOX is still here and is still the broad phase — it is the
+	 * ring's bounding slab, it is what a swept segment is cheaply rejected against, and it is what
+	 * GetAttackGoalBox publishes — but when bRing is set, a segment that crosses the box only scores
+	 * if it crosses the DISC. Keeping both means the cheap test stays cheap and the corners of the
+	 * slab, which are wall, stop awarding points.
+	 */
 	struct FTraceGoalBox
 	{
 		FBox Box = FBox(ForceInit);
 		ETraceTeam DefendingTeam = ETraceTeam::None;
+
+		/** Spec v6: this goal is a circle in a wall, not a box on the floor. */
+		bool bRing = false;
+
+		/** Centre of the ring mouth. Meaningless unless bRing. */
+		FVector RingCentre = FVector::ZeroVector;
+
+		/** Radius of the ring mouth, uu. */
+		float RingRadius = 0.f;
+
+		/** Unit normal of the ring plane, i.e. the direction a scoring throw travels through it. */
+		FVector RingAxis = FVector::ForwardVector;
 	};
 
 	/** Refreshed on a slow cadence so the half-time side switch is picked up without polling cost. */

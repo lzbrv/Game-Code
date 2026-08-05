@@ -49,11 +49,25 @@
 // which deliberately ignores the local prediction. The client predicts only the red tint (see
 // IsParryVisuallyActive), because 0.1s is shorter than a round trip and a tell that arrives after
 // the window has closed is not a tell.
+//
+// SPEC v6 §3 — A PERFECT PARRY NOW KILLS THE DASHER.
+//
+//     "Perfectly timed parries should kill the enemy dashing. E.g. if an enemy's dash would kill the
+//      carrier, but the carrier stops it with a parry, that enemy dies instead. Retain all other
+//      rules regarding dashing a trace and parrying."
+//
+// The parry stopped being purely defensive. It is now a punish, and the one function that implements
+// it is ServerPunishParriedDash() below. Read its comment before changing anything here: the whole
+// mechanic is one conditional and every clause of that conditional is a rule the user stated.
+//
+// Nothing else about the parry moved. 0.1s window, 1.5s cooldown, carrier-only, whole trace flashes
+// red, and an UNPARRIED dash still kills the carrier exactly as before — that branch is untouched.
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Math/Color.h"
+#include "UObject/NameTypes.h"
 
 class AActor;
 class ATraceCharacter;
@@ -109,6 +123,12 @@ namespace TraceParry
 	//     Trace.Parry.GlowScale    -1   override for the emissive multiplier on the red trace
 	//     Trace.Parry.ForceWindow   0   debug: every carrier is permanently parrying
 	//     Trace.Parry.BotAuto       0   debug: AI carriers parry whenever the cooldown is ready
+	//
+	// And two added by v6 §3, which are NOT overrides — there is no setting behind them yet, because
+	// UTraceSettings is another ownership slice this pass. Promoting them is specified in the report:
+	//
+	//     Trace.Parry.KillsDasher          1     the v6 §3 rule itself; 0 restores the pre-v6 parry
+	//     Trace.Parry.KillFeedbackSeconds  2.5   how long the carrier's parry-kill banner lasts
 	// ---------------------------------------------------------------------------------------------
 
 	/** Spec §3: 0.1 seconds of trace invulnerability. */
@@ -149,6 +169,61 @@ namespace TraceParry
 	bool RequestParry(ATraceCharacter* Parrier, ETraceParryRefusal* OutRefusal = nullptr);
 
 	// ---------------------------------------------------------------------------------------------
+	// SPEC v6 §3 — THE PUNISH
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * A parried dash kills the DASHER. Server only. This is the entire v6 §3 mechanic.
+	 *
+	 * CALL SITE. Exactly one: UTraceTrailComponent::ServerRunTripTest, at the point where it has
+	 * already established that @p Dasher's swept capsule intersected @p Carrier's LETHAL trace this
+	 * tick and that a parry window was open, i.e. the branch that today only logs
+	 * "NO KILL - PARRIED". Do not call it from anywhere else and do not re-derive the geometry here:
+	 * the trip test is the single implementation of "did a dash hit the trace", and a second one
+	 * would be exactly the two-objects-agreeing-about-one-fact bug this file's header warns about.
+	 *
+	 * WHY THE GEOMETRY GATE MATTERS. Spec v6 §3 [ASSUMPTION]: *"only a dash that WOULD have killed
+	 * the carrier is punished. A parry thrown at nothing kills nobody."* Because the only caller is
+	 * the branch inside `if (bHitLethal)`, a parry pressed at empty air can never reach this
+	 * function — there is no "did anyone dash?" test to get wrong, the call simply does not happen.
+	 * That is the whole reason the punish lives at the call site instead of on a timer.
+	 *
+	 * THE REMAINING CLAUSES, all re-checked here so the rule survives a future caller:
+	 *
+	 *   * authority — the server decides. A client calling this does nothing.
+	 *   * IsParryActiveFor(Carrier) — the REPLICATED window, never the local prediction, so the
+	 *     punish and the protection are decided by the same fact on the same machine.
+	 *   * both pawns alive.
+	 *   * UTraceSettings::TrailLethality must actually kill the carrier (KillsCarrier / KillsBoth).
+	 *     Under the KillsToucher tuning rule the dash would NOT have killed the carrier, so by the
+	 *     [ASSUMPTION] above there is nothing to punish.
+	 *
+	 * DELIBERATELY *NOT* A CLAUSE: whether the §4 pass window happened to be open too. If both were
+	 * up the dasher still dies. The trace they dashed into was RED — IsParryActive() wins the tint
+	 * (UTraceTrailComponent::GetAppliedTraceColor) — and "red trace kills me" has to be true every
+	 * single time or it is not a tell. Consistency of the signal beats the pedantic reading that the
+	 * pass window would have saved the carrier anyway.
+	 *
+	 * FEEDBACK. The dasher is killed with GetParryKillCause() as the death cause and the CARRIER'S
+	 * controller as the killer, so the existing victim-side path (ATraceGameMode::NotifyCharacterDied
+	 * -> ClientNotifyKilledBy -> ATraceHUD::DrawDeathPanel) puts "by <carrier> (Parried)" on the
+	 * dasher's own death panel, and the carrier is credited with the kill on the scoreboard. The
+	 * carrier-side banner is fed by RecordParryKill/GetParryKillFeedback below.
+	 *
+	 * @return true if the dasher was killed.
+	 */
+	bool ServerPunishParriedDash(ATraceCharacter* Carrier, ATraceCharacter* Dasher);
+
+	/**
+	 * The death cause reported for a dasher killed by a parry: "Parried".
+	 *
+	 * Its own tag, not "Trail". The two deaths are opposite outcomes of the same collision and the
+	 * kill feed, the death panel and every log line have to be able to tell them apart — "Trail" on
+	 * the dasher's screen would read as the game having killed the wrong player.
+	 */
+	FName GetParryKillCause();
+
+	// ---------------------------------------------------------------------------------------------
 	// Queries
 	// ---------------------------------------------------------------------------------------------
 
@@ -170,6 +245,41 @@ namespace TraceParry
 
 	/** Total cooldown, so the HUD can draw a fraction without knowing the tunable. */
 	float GetCooldownTotal();
+
+	// ---------------------------------------------------------------------------------------------
+	// Parry-kill feedback (v6 §3: "the dasher needs to understand why they died")
+	//
+	// TWO SIDES, TWO CHANNELS, because the two players need different sentences:
+	//
+	//   THE DASHER already has a complete, replicated answer with no new plumbing at all — they are
+	//   killed with cause "Parried" and the carrier as the killer, so ATraceHUD's death panel reads
+	//   "by <carrier>  (Parried)". That path is server -> victim and is reliable.
+	//
+	//   THE CARRIER gets the record below. It is written on the server the instant the punish lands
+	//   and is what a HUD banner reads ("PARRIED — <victim>"). On a listen server — the host, which
+	//   is how this game is played — the carrier's HUD is on the writing machine and reads it
+	//   directly. A REMOTE carrier needs the one-line client RPC described in this pass's report;
+	//   ATracePlayerController is not in this ownership slice, so it is specified there rather than
+	//   written here. The mechanic itself does not depend on it.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Server-side. Files a parry kill by @p Carrier against @p Victim for the feedback readers. */
+	void RecordParryKill(const AActor* Carrier, const AActor* Victim);
+
+	/**
+	 * Most recent parry kill by @p Parrier, if it is recent enough to still be worth drawing.
+	 *
+	 * @param OutSecondsAgo   age of the event, 0 on the frame it happened.
+	 * @param OutVictimName   display name of the dasher who died.
+	 * @return false if @p Parrier has no parry kill inside GetParryKillFeedbackSeconds().
+	 */
+	bool GetParryKillFeedback(const AActor* Parrier, float& OutSecondsAgo, FString& OutVictimName);
+
+	/** How long a parry kill stays worth showing. */
+	float GetParryKillFeedbackSeconds();
+
+	/** Total parry kills this process has awarded. Verification counter; never a game rule. */
+	int32 GetParryKillCount();
 
 	// ---------------------------------------------------------------------------------------------
 	// Debug switches, read by UTraceTrailComponent. Never true in normal play.

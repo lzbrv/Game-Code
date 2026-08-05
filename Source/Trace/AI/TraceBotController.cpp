@@ -85,8 +85,15 @@ namespace TraceBotConstants
 	 * leaves three of a five-man side goal-side of the ball. Sending everybody was the first version
 	 * and it produced exactly what you would expect: both teams stacked on one point and an
 	 * unguarded goal mouth for whoever came out of the pile with it.
+	 *
+	 * 2 -> 3 FOR SPEC v6. Two things changed at once and both push the same way. The catch zone
+	 * (section 4.1) means a contesting bot no longer has to reach the Core, only the flight path, so a
+	 * third chaser is now a real chance of an interception rather than a third body arriving late.
+	 * And the ground turnover (section 4.2) means a throw that nobody contests is not a 50/50 scramble
+	 * any more - it is decided by where it lands - so the moment to influence it is while it is still
+	 * in the air. Three of five still leaves two goal-side.
 	 */
-	static constexpr int32 LooseCoreChasers = 2;
+	static constexpr int32 LooseCoreChasers = 3;
 
 	/**
 	 * How many bots per team hold a station in front of their own goal. The rest play normally.
@@ -131,6 +138,40 @@ namespace TraceBotConstants
 	 * range lands short of the mouth on any error at all. At 0.85 there is a real margin either side.
 	 */
 	static constexpr float ThrowRangeSafetyFraction = 0.85f;
+
+	/**
+	 * SPEC v6 section 4.2. Minimum shot quality a bot will take at goal when it is NOT about to die.
+	 *
+	 * 0.08 on the 0..1 ShotScore scale, i.e. "no further out than about 92% of what the Core can
+	 * physically carry to the hoop". The gate exists because the cost of missing changed: a thrown
+	 * Core that hits the ground now turns over to the nearest enemy, and a shot released at the edge
+	 * of range lands in front of the goal it was aimed at, which is the single worst place to hand a
+	 * defender the Core. Under pressure it is waived - a shot thrown a moment before dying is still
+	 * better than being killed holding it, because a kill hands the Core over just as surely.
+	 *
+	 * MEASURED, AND WHY IT IS 0.08 AND NOT MORE. The first value tried was 0.22, and it was wrong for
+	 * a reason worth recording: spec v6 §4.3 moved the goal 2400 uu further away (into the back wall
+	 * instead of on the goal line) AND 1100 uu up, and throwing at a target that high costs range -
+	 * the Core's ballistic maximum falls from ~5150 uu flat to ~3300 uu at the hoop's height after
+	 * the safety fraction. A verified shot from 2600 uu therefore scores only 0.15, and 0.22 refused
+	 * it: the scenario's step 5 measured "a throw did NOT leave" against a bot that had a good shot.
+	 * At 0.08 only the last 8% of a range that is already short is refused, which is the ragged edge
+	 * this is meant to trim and not the shot itself.
+	 */
+	static constexpr float ThrowAtGoalMinScore = 0.08f;
+
+	/**
+	 * SPEC v6 section 4.2. A clearance is thrown at the most advanced TEAMMATE, at this fraction of
+	 * the way to them, rather than at open ground.
+	 *
+	 * The clearance used to be aimed halfway to the goal at nothing at all, on the reasoning that a
+	 * loose Core is contestable by both sides. That reasoning is dead: a loose Core that lands is not
+	 * contestable, it is the enemy's. So a clearance now has to be aimed at somebody who could
+	 * plausibly catch it - and with the §4.1 catch zone reaching 500 uu, "plausibly" is a much wider
+	 * target than a pass rule would accept. Short of the receiver rather than at them, so the Core
+	 * arrives in front of a runner instead of behind one.
+	 */
+	static constexpr float ClearanceLeadFraction = 0.85f;
 
 	/** Samples along the arc for the lane sweep. Ten segments resolves this arena's cover comfortably. */
 	static constexpr int32 ThrowLaneSamples = 10;
@@ -1525,10 +1566,29 @@ void ATraceBotController::GatherWorldState()
 		bModeB = TheCore->IsModeB();
 		if (bModeB)
 		{
-			// Lead by a fraction of a second: a Core doing 2600 uu/s is 40 uu further on by the time
-			// this bot's movement input is applied, and chasing the position it WAS at is how a bot
-			// trails a loose Core across the field without ever reaching it.
-			bCoreLoose = TheCore->GetLooseCoreInterceptPoint(0.25f, LooseCorePoint);
+			// LEAD BY HOW LONG IT WILL ACTUALLY TAKE ME TO GET THERE, not by a fixed 0.25 s.
+			//
+			// The fixed lead was sized for "the Core is 40 uu further on by the time my movement input
+			// lands", which is a correction for input latency and not for a chase. Spec v6 §4.1 makes
+			// the difference matter: with a 500 uu catch zone, a bot only has to reach the FLIGHT PATH
+			// rather than the Core itself, so a bot that runs at where the Core is now - and is
+			// therefore always behind it - never contests a throw it could have. Leading by its own
+			// time-to-arrive puts it on the arc.
+			//
+			// Two calls because the lead depends on the distance and the distance depends on the lead:
+			// the first is the un-led position, which is close enough to size the second.
+			FVector Instant = FVector::ZeroVector;
+			if (TheCore->GetLooseCoreInterceptPoint(0.f, Instant))
+			{
+				const float RunSpeed = FMath::Max(200.f, UTraceSettings::Get().WalkSpeed);
+				const float TimeToArrive = static_cast<float>(FVector::Dist2D(MyLocation, Instant)) / RunSpeed;
+
+				// Capped: past about a second and a half the ballistic extrapolation is guessing at an
+				// arc that a catch zone or a bounce will have changed anyway.
+				bCoreLoose = TheCore->GetLooseCoreInterceptPoint(
+					FMath::Clamp(TimeToArrive, 0.25f, 1.5f), LooseCorePoint);
+			}
+
 			if (bCoreLoose)
 			{
 				LooseCoreDistSq = static_cast<float>(FVector::DistSquared2D(MyLocation, LooseCorePoint));
@@ -3243,6 +3303,7 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 		float ShotScore = 0.f;
 		FVector GoalCentre = FVector::ZeroVector;
 		FVector ShotLaunchDirection = FVector::ZeroVector;
+		FBox GoalBoxFallback(ForceInit);
 
 		if (ATraceCore::GetAttackGoalCentre(World, MyTeam, GoalCentre))
 		{
@@ -3250,28 +3311,39 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 
 			const FVector ViewLocation = BotCharacter->GetPawnViewLocation();
 
-			// AIM AT THE MOUTH, NOT AT THE BACK OF THE NET.
+			// AIM AT THE HOOP, NOT AT THE BOX (spec v6 §4.3).
 			//
-			// GetAttackGoalCentre returns the centre of the goal BOX, and the box runs from the goal
-			// line back to the end wall - 2400 uu deep on this arena, so its centre is 1200 uu past
-			// the plane a Core has to cross to score. Aiming there threw away 1200 uu of a range that
-			// is only ~6300 uu to begin with, and it is measurable: a bot placed 5200 uu from the
-			// mouth measured 6400 uu to the box centre, failed the range test by 150 uu, and threw a
-			// clearance into open ground instead of the shot it had. Aim a little way INSIDE the
-			// mouth (so a solution that lands exactly on target is already over the line) and at the
-			// middle of the mouth's height rather than the box's.
+			// GetAttackGoalCentre still returns the centre of the goal BOX, and since v6 that box is
+			// the ring's bounding SLAB - a square whose corners are back wall. Aiming at its centre is
+			// aiming at the middle of the hoop only by coincidence of it being centred; what actually
+			// matters, and what the old "aim 250 uu inside the mouth" fudge was for, is that the aim
+			// point sits just past the plane a Core has to cross, in the middle of the circle. Ask the
+			// Core for the ring and there is nothing left to reconstruct.
+			//
+			// The fallback is the pre-v6 path verbatim, for an externally registered box goal.
 			FVector AimTarget = GoalCentre;
-			FBox GoalBox(ForceInit);
-			if (ATraceCore::GetAttackGoalBox(World, MyTeam, GoalBox))
+			FVector RingCentre = FVector::ZeroVector;
+			FVector RingAxis = FVector::ZeroVector;
+			float RingRadius = 0.f;
+
+			if (ATraceCore::GetAttackGoalRing(World, MyTeam, RingCentre, RingRadius, RingAxis))
+			{
+				// A little way THROUGH the hoop, along its own axis, so a solution that lands exactly
+				// on target is already over the line rather than kissing the plane.
+				constexpr double ThroughTheHoop = 200.0;
+				AimTarget = RingCentre - RingAxis.GetSafeNormal() * ThroughTheHoop;
+			}
+			else if (ATraceCore::GetAttackGoalBox(World, MyTeam, GoalBoxFallback))
 			{
 				constexpr double InsideTheMouth = 250.0;
 
 				const double FieldCentreX = bBoundsValid ? FieldBounds.GetCenter().X : 0.0;
-				const bool bGoalIsPositiveX = (GoalBox.GetCenter().X >= FieldCentreX);
+				const bool bGoalIsPositiveX = (GoalBoxFallback.GetCenter().X >= FieldCentreX);
 
-				AimTarget.X = bGoalIsPositiveX ? (GoalBox.Min.X + InsideTheMouth) : (GoalBox.Max.X - InsideTheMouth);
-				AimTarget.Y = GoalBox.GetCenter().Y;
-				AimTarget.Z = GoalBox.Min.Z + (GoalBox.Max.Z - GoalBox.Min.Z) * 0.5;
+				AimTarget.X = bGoalIsPositiveX
+					? (GoalBoxFallback.Min.X + InsideTheMouth) : (GoalBoxFallback.Max.X - InsideTheMouth);
+				AimTarget.Y = GoalBoxFallback.GetCenter().Y;
+				AimTarget.Z = GoalBoxFallback.Min.Z + (GoalBoxFallback.Max.Z - GoalBoxFallback.Min.Z) * 0.5;
 			}
 
 			const float GoalDistance = static_cast<float>(FVector::Dist2D(MyLocation, AimTarget));
@@ -3318,13 +3390,30 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 				}
 				else
 				{
-					bShotAvailable = true;
-					ThrowTargetPoint = AimTarget;
-
 					// 1 at the mouth, 0 at the edge of what the throw can carry. Pressure is worth a
 					// lot: a shot released a moment before dying is the whole point of having one.
 					ShotScore = 1.f - FMath::Clamp(GoalDistance / FMath::Max(1.f, Reach), 0.f, 1.f);
 					ShotScore += bUnderPressure ? 0.35f : 0.f;
+
+					// SPEC v6 §4.2 CHANGED WHAT A MISS COSTS, so it has to change when a bot shoots.
+					// Before v6 a shot that fell short left the Core lying in front of the goal for
+					// either side to recover - i.e. a miss was free, and taking the shot at maximum
+					// range was strictly correct. Now a throw that touches the ground is handed
+					// straight to the nearest defender, and in front of their own goal that is the
+					// worst place on the field to give it away. A shot from the ragged edge of range
+					// is therefore no longer a free option and is refused unless the alternative is
+					// dying with it.
+					bShotAvailable = bUnderPressure
+						|| ShotScore >= TraceBotConstants::ThrowAtGoalMinScore;
+
+					if (bShotAvailable)
+					{
+						ThrowTargetPoint = AimTarget;
+					}
+					else
+					{
+						TRACE_BOT_KIT(ShotOutOfRange);
+					}
 				}
 			}
 		}
@@ -3368,14 +3457,65 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 		{
 			// --- 3. THE CLEARANCE. -------------------------------------------------------------
 			//
-			// Nothing to throw at and enemies closing. Throwing it forward at nothing is still better
-			// than being killed holding it: a loose Core is contestable by our side too, whereas a
-			// kill hands it to the killer outright. This is also what stops a cornered mode-B carrier
-			// standing still until it dies, which was the first version's most visible failure.
+			// Nothing that passes the pass rule, and enemies closing. Throwing is still better than
+			// being killed holding it - a kill hands the Core to the killer outright - so a cornered
+			// carrier must not stand still until it dies, which was the first version's most visible
+			// failure.
+			//
+			// WHAT SPEC v6 §4.2 CHANGED. The old clearance was thrown at a point halfway to the goal,
+			// at nobody, on the reasoning that a loose Core is contestable by our side too. It no
+			// longer is: a throw that lands is the enemy's by rule. So the clearance is now aimed at
+			// the most ADVANCED LIVING TEAMMATE even though they failed ChooseReceiver's stricter
+			// test, because with the §4.1 catch zone reaching 500 uu off a capsule the bar for "could
+			// they catch this" is much lower than the bar for "is this a good pass". A clearance at a
+			// teammate is a throw that might be caught; a clearance at open ground is a gift.
 			if (bUnderPressure && FMath::FRand() < FMath::Clamp(Profile.PassChance, 0.f, 1.f))
 			{
 				const FVector Goal = GetAttackGoalLocation();
-				ThrowTargetPoint = FMath::Lerp(MyLocation, Goal, 0.5f);
+
+				const ATraceCharacter* Outlet = nullptr;
+				double BestAdvance = -TNumericLimits<double>::Max();
+				for (const ATraceCharacter* Mate : LiveTeammates)
+				{
+					if (Mate == nullptr || !Mate->IsAlive())
+					{
+						continue;
+					}
+
+					// "Most advanced" = closest to the goal we are attacking, and no further from us
+					// than the Core can actually be thrown, so the clearance is not a shot into space
+					// dressed up as a pass.
+					const double ToGoal = FVector::Dist2D(Mate->GetActorLocation(), Goal);
+					const double FromMe = FVector::Dist2D(Mate->GetActorLocation(), MyLocation);
+					const float Carry = MaxThrowRange(BotCharacter->GetPawnViewLocation(), Settings.BotAimBodyOffsetZ)
+						* TraceBotConstants::ThrowRangeSafetyFraction;
+
+					if (FromMe > static_cast<double>(Carry))
+					{
+						continue;
+					}
+
+					const double Advance = -ToGoal;
+					if (Advance > BestAdvance)
+					{
+						BestAdvance = Advance;
+						Outlet = Mate;
+					}
+				}
+
+				if (Outlet != nullptr)
+				{
+					const FVector OutletPoint = Outlet->GetActorLocation() + FVector(0.f, 0.f, Settings.BotAimBodyOffsetZ);
+					ThrowTargetPoint = FMath::Lerp(MyLocation, OutletPoint, TraceBotConstants::ClearanceLeadFraction);
+				}
+				else
+				{
+					// Genuinely nobody. Throw it forward anyway - being killed holding it is not better
+					// - but keep it short so it lands in our own half rather than presenting it to a
+					// defender in front of their goal.
+					ThrowTargetPoint = FMath::Lerp(MyLocation, Goal, 0.3f);
+				}
+
 				bThrowAtGoal = false;
 				PassPhase = ETraceBotPassPhase::Lining;
 				PassReceiver = nullptr;
@@ -3497,15 +3637,29 @@ void ATraceBotController::UpdateCarryInCommit()
 
 	const float Now = static_cast<float>(World->GetTimeSeconds());
 
-	// Distance to the MOUTH, not to the box centre: the box runs from the goal line back to the end
-	// wall, so its centre is 1200 uu inside the net and measuring to it would make every carrier
-	// think it was further away than it is.
+	// Distance to the MOUTH, not to the box centre.
+	//
+	// Since spec v6 §4.3 the mouth is the ring, so ask for the ring: the box is its bounding slab and
+	// its near face is 160 uu short of the hoop's plane. (Pre-v6 the box ran from the goal line back
+	// to the end wall and its centre was 1200 uu inside the net, which is the error this originally
+	// corrected - the correction is smaller now but the reason for it is identical.)
 	FVector MouthPoint = GoalCentre;
-	FBox GoalBox(ForceInit);
-	if (ATraceCore::GetAttackGoalBox(World, MyTeam, GoalBox))
+	FVector RingCentre = FVector::ZeroVector;
+	FVector RingAxis = FVector::ZeroVector;
+	float RingRadius = 0.f;
+
+	if (ATraceCore::GetAttackGoalRing(World, MyTeam, RingCentre, RingRadius, RingAxis))
 	{
-		const double FieldCentreX = bBoundsValid ? FieldBounds.GetCenter().X : 0.0;
-		MouthPoint.X = (GoalBox.GetCenter().X >= FieldCentreX) ? GoalBox.Min.X : GoalBox.Max.X;
+		MouthPoint = RingCentre;
+	}
+	else
+	{
+		FBox GoalBox(ForceInit);
+		if (ATraceCore::GetAttackGoalBox(World, MyTeam, GoalBox))
+		{
+			const double FieldCentreX = bBoundsValid ? FieldBounds.GetCenter().X : 0.0;
+			MouthPoint.X = (GoalBox.GetCenter().X >= FieldCentreX) ? GoalBox.Min.X : GoalBox.Max.X;
+		}
 	}
 
 	const float Distance = static_cast<float>(FVector::Dist2D(BotCharacter->GetActorLocation(), MouthPoint));

@@ -26,6 +26,22 @@
 #include "Containers/Ticker.h"                 // FTSTicker (Trace.Trail.DebugLookBack)
 #include "HAL/IConsoleManager.h"               // FAutoConsoleVariableRef (trace timing knobs)
 
+// Spec v6 §1: Trace.Trail.PerfAB reads the SAME numbers `stat unit` displays, out of the same
+// FStatUnitData the overlay is drawn from, so a headless run can quote game vs render vs GPU without
+// anybody having to read them off a screenshot.
+//
+// Via the viewport client and NOT via RenderCore's GGameThreadTime / RHIGetGPUFrameCycles(), which
+// would be the direct route: those live in the RenderCore and RHI modules, which are include-path
+// dependencies of Engine but not LINK dependencies of this one, so using them fails at the very end
+// with "Undefined symbols for architecture arm64" — exactly the trap Trace.Build.cs already warns
+// about for Sockets and ApplicationCore. FStatUnitData is Engine, and Engine is already linked.
+//
+// The cost of that choice, stated so nobody is surprised by a table of zeroes: these fields are only
+// filled while `stat unit` is actually enabled. PerfAB turns it on itself and says so if it is off.
+#include "Engine/GameViewportClient.h"         // GetStatUnitData()
+#include "UnrealClient.h"                      // FStatUnitData
+#include "UObject/UObjectIterator.h"           // TObjectIterator (scene primitive census)
+
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
 #include "Gameplay/TraceCore.h"                // IsTraceInvulnerableFor (spec §4)
@@ -80,6 +96,126 @@ namespace
 	/** Meshes per smear element, interleaved: [0] body (legs+torso), [1] the hot head band. */
 	constexpr int32 PartsPerSmear = 2;
 	constexpr int32 PartHead = 1;
+
+	// =============================================================================================
+	// SPEC v6 §1 + §2 — WHICH RENDERER, AND THE A/B LEVER THAT MEASURES THE DIFFERENCE
+	//
+	// 1 = THE RIBBON. One continuous swept rectangle along a Catmull-Rom smoothing of the lethal
+	//     point set. This is the shipping look and the default (§2).
+	// 0 = THE LEGACY spec v4 §2 renderer: up to MaxTraceGhosts posed Mannequins
+	//     (UPoseableMeshComponent, one CopyPoseFromSkeletalComponent each) plus a two-part cylinder
+	//     smear. It exists ONLY as the BEFORE arm of Trace.Trail.PerfAB. The user's report was
+	//     "1/6 the fps", which is a number, so the answer has to be a number measured on the same
+	//     scene in the same process — not "the new one feels lighter".
+	// 2 = NOTHING DRAWN. The third arm, and the one that makes the measurement honest: it bounds the
+	//     ENTIRE cost of this component's visuals. If arm 2 does not recover the frame rate then the
+	//     trace was never the problem, and saying so plainly is worth more than a fix.
+	//
+	// The lethal volume is TrailPoints and is identical on all three arms. Arm 2 breaks the
+	// visible == lethal invariant by drawing nothing at all, which is why it is a measurement arm and
+	// not a quality setting.
+	// =============================================================================================
+	int32 GTrailRenderer = 1;
+
+	FAutoConsoleVariableRef CVarTrailRenderer(
+		TEXT("Trace.Trail.Renderer"),
+		GTrailRenderer,
+		TEXT("1 = the curved ribbon (spec v6 2, default). 0 = the legacy posed-Mannequin + smear "
+		     "renderer, kept ONLY as the before arm of Trace.Trail.PerfAB. 2 = draw nothing, which "
+		     "bounds the whole cost of the trace's visuals. Cosmetic - the kill volume is TrailPoints "
+		     "on every arm."),
+		ECVF_Default);
+
+	/**
+	 * uu of arc length per ribbon element (spec v6 §2).
+	 *
+	 * This is the ONLY perf dial the ribbon has, and it is a straight trade of components for
+	 * smoothness. At the default TrailPointSpacing of 60 and a 2.0s lifetime, a walking carrier's
+	 * trace is ~1600uu, so 60 gives ~27 elements — HALF the component count of the legacy smear
+	 * (two meshes per segment) and with none of the twenty skinned Mannequins beside it.
+	 *
+	 * Note the ribbon is resampled along a Catmull-Rom curve THROUGH the points, so a step equal to
+	 * the point spacing is not the same thing as drawing the chords: the samples land on the smoothed
+	 * curve, and the elements between them are oriented by it in full 3D (yaw AND pitch), which is
+	 * what "curving through the air" means for a trace laid over a jump.
+	 */
+	float GRibbonStep = 60.f;
+
+	FAutoConsoleVariableRef CVarRibbonStep(
+		TEXT("Trace.Trail.RibbonStep"),
+		GRibbonStep,
+		TEXT("uu of arc length per element of the curved ribbon (spec v6 2). Lower = smoother and more "
+		     "draw calls. Purely cosmetic - the kill volume is unchanged."),
+		ECVF_Default);
+
+	/**
+	 * Upper bound on pooled RIBBON elements. Past it the STEP COARSENS instead of the ribbon being
+	 * truncated, which is the whole difference between "a long trace looks chunkier" and "a long
+	 * trace has a lethal stretch nobody can see". The invariant does not get a budget.
+	 *
+	 * 96 at the 60uu default is 5760uu of trace, which is longer than MaxTrailPoints x
+	 * TrailPointSpacing at any dash speed this game has.
+	 */
+	constexpr int32 MaxRibbonElements = 96;
+
+	/** Elements in the owner-only predicted-head ribbon. The stub is at most GPredictedHeadMaxLength. */
+	constexpr int32 MaxPredictedRibbonElements = 12;
+
+	/**
+	 * ALTERNATING CROSS-SECTION INSET, and it is not a cosmetic nicety — it is the fix for the
+	 * "noticeable sections" half of the user's report.
+	 *
+	 * Consecutive elements overlap by half a body width so the outside of a corner is never open (the
+	 * same joint overlap the smear has always used). On a STRAIGHT stretch that puts two identically
+	 * sized boxes' top and side faces exactly coplanar over the whole overlap — which is textbook
+	 * Z-FIGHTING, and Z-fighting on an unlit emissive surface reads precisely as a flickering band at
+	 * every single joint, i.e. as sections.
+	 *
+	 * Insetting every other element's cross-section by 0.6% (0.54uu of the 90uu width, 1.1uu of the
+	 * 190uu height) makes the overlapping faces non-coplanar, so the depth test resolves them
+	 * consistently and the ribbon reads as one surface. It is far below the width of a pixel at any
+	 * range the trace is judged from, and it only ever makes the drawn thing SMALLER than the lethal
+	 * volume by half a uu on alternate elements — inside the 34uu of tripper-capsule inflation the
+	 * trip test already adds, so it cannot manufacture a graze.
+	 */
+	constexpr double RibbonAlternateInset = 0.994;
+
+	/**
+	 * Fraction of the LETHAL width the ribbon is drawn at. 1.0, and it should stay 1.0.
+	 *
+	 * It exists because "a rectangle which curves" and "a Tron path" pull in opposite directions on
+	 * exactly one number: a Tron light wall is a thin sheet, and the volume that kills here is 90uu
+	 * wide — a body width. Drawn at 1.0 the ribbon is a slab, which is honest; drawn thinner it looks
+	 * more like a light wall and starts lying.
+	 *
+	 * SO THE DEFAULT IS THE HONEST ONE AND THE DIAL IS EXPOSED WITH THE COST WRITTEN ON IT. At scale
+	 * S the drawn half-width is 45*S, while a dash is caught at 45 + the tripper's own capsule radius
+	 * (~34) = ~79uu from the centreline. So S = 0.5 puts up to 56uu of lethal ground on each side of
+	 * the ribbon that a player can graze without ever touching the thing they were shown. That is the
+	 * "I dashed past it and died anyway" bug, bought back one uu at a time.
+	 */
+	float GRibbonWidthScale = 1.f;
+
+	FAutoConsoleVariableRef CVarRibbonWidthScale(
+		TEXT("Trace.Trail.RibbonWidthScale"),
+		GRibbonWidthScale,
+		TEXT("Fraction of the LETHAL width the ribbon is drawn at (spec v6 2). 1 (default) draws the "
+		     "kill volume exactly. Below 1 makes it look more like a thin Tron light wall AND makes it "
+		     "narrower than the thing that kills - see the comment for how much lethal ground that "
+		     "hides. Never changes the kill volume itself, only what the player is shown of it."),
+		ECVF_Default);
+
+	/**
+	 * Spec v6 §1: game-thread milliseconds every UTraceTrailComponent in the world spent on VISUALS
+	 * this frame — the rebuild, the predicted head and the per-frame proximity pass.
+	 *
+	 * Accumulated unconditionally (one FPlatformTime::Seconds pair per component per frame, which is
+	 * a few nanoseconds) and drained by Trace.Trail.PerfAB. It exists because the frame-time column
+	 * alone cannot tell "the trace is expensive on the game thread" from "the trace is expensive on
+	 * the GPU" from "the trace was never the problem", and those are three different conclusions with
+	 * three different owners.
+	 */
+	double GTrailVisualMillisecondsThisFrame = 0.0;
 
 	/**
 	 * Upper bound on pooled POSED MANNEQUIN GHOSTS. This is the number that decides whether spec v4 §2
@@ -406,6 +542,25 @@ namespace
 	// and its glow multiplier are TraceParry tunables so the two halves of one visual state cannot
 	// drift apart. See TraceParry::GetTintColor() / GetGlowScale().
 
+	/**
+	 * Uniform Catmull-Rom through P1 and P2, with P0/P3 as the neighbouring control points.
+	 *
+	 * Catmull-Rom rather than a Bezier fit because it INTERPOLATES its control points: every trail
+	 * point the server laid is still exactly on the drawn centreline, so the ribbon cannot drift off
+	 * the lethal polyline at the samples. Between them the curve can bulge outside the chord by up to
+	 * ~1/8 of the chord length (~7uu at the 60uu default), which is bounded in the report and is an
+	 * order of magnitude inside the 45uu lethal radius.
+	 */
+	FVector CatmullRom(const FVector& P0, const FVector& P1, const FVector& P2, const FVector& P3, double T)
+	{
+		const double T2 = T * T;
+		const double T3 = T2 * T;
+		return 0.5 * ((2.0 * P1)
+			+ (-P0 + P2) * T
+			+ (2.0 * P0 - 5.0 * P1 + 4.0 * P2 - P3) * T2
+			+ (-P0 + 3.0 * P1 - 3.0 * P2 + P3) * T3);
+	}
+
 	/** Where along [A,B] the point P projects, clamped to [0,1]. Zero-length segments give 0. */
 	double SegmentAlpha(const FVector& A, const FVector& B, const FVector& P)
 	{
@@ -485,6 +640,30 @@ namespace
 			: UTraceSettings::Get().TraceGhostForcedLOD;
 		return FMath::Clamp(Value, 0, 4);
 	}
+
+	/**
+	 * THE RIBBON'S BRIGHTNESS (spec v6 §2).
+	 *
+	 * Deliberately bound to UTraceSettings::TraceGhostGlow rather than to a new property. That knob
+	 * was "the emissive strength of the brightest layer of the trace", the settings panel already
+	 * shows it, it is already live-editable in PIE, and the ribbon IS the brightest (and only) layer
+	 * now — so the number keeps its meaning even though the geometry under it changed. Adding a
+	 * property would have meant editing TraceSettings.h, which this slice does not own, and a knob
+	 * that silently does nothing is the failure mode this project has already been bitten by.
+	 * Trace.Trail.GhostGlow still overrides it for a measurement run. The rename is in the report.
+	 *
+	 * 2.6 was measured as "above the smear, below the point where the team colour clips to white and
+	 * you can no longer tell whose trace it is". The ribbon spans first-person eye height along its
+	 * whole length, which is what the legacy renderer needed a separate 4.2-glow head band to
+	 * achieve, so the single value now does both jobs.
+	 */
+	float ResolvedRibbonGlow()
+	{
+		const float Value = IsCVarOverridden(TEXT("Trace.Trail.GhostGlow"))
+			? GGhostGlow
+			: UTraceSettings::Get().TraceGhostGlow;
+		return FMath::Max(0.f, Value);
+	}
 }
 
 
@@ -509,6 +688,15 @@ UTraceTrailComponent::UTraceTrailComponent()
 	if (CylinderFinder.Succeeded())
 	{
 		CylinderMesh = CylinderFinder.Object;
+	}
+
+	// Spec v6 §2: "a rectangle which curves to follow the player". The ribbon's cross-section is a
+	// rectangle, so its source primitive is a box — 12 triangles, the plain static-mesh vertex
+	// factory, and no material usage flag beyond the one the smear has always needed.
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (CubeFinder.Succeeded())
+	{
+		CubeMesh = CubeFinder.Object;
 	}
 
 	// (The sphere that used to be the after-image's head is gone with the per-point silhouette. The
@@ -627,6 +815,10 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 	// Listen servers draw the trace too; only a headless server skips it.
 	if (GetNetMode() != NM_DedicatedServer)
 	{
+		// Spec v6 §1. One timer pair around every line of visual work this component does, so
+		// Trace.Trail.PerfAB can quote the trace's own game-thread cost rather than infer it.
+		const double VisualStartSeconds = FPlatformTime::Seconds();
+
 		UpdateVisuals();
 
 		// EVERY frame, and BEFORE the fade below, for two reasons that are really one: it tracks a
@@ -637,6 +829,8 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 		// EVERY frame, not just on a rebuild: this depends on where the local camera is, and the
 		// camera moves continuously while the geometry does not. See the function's comment.
 		ApplyProximityGlowFade();
+
+		GTrailVisualMillisecondsThisFrame += (FPlatformTime::Seconds() - VisualStartSeconds) * 1000.0;
 	}
 }
 
@@ -1282,6 +1476,17 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 
 	ATraceCharacter* Tripper = nullptr;
 
+	// SPEC v6 §3. The enemy whose LETHAL dash was stopped by a parry this tick — they die instead of
+	// the carrier. Resolved after the loop, exactly like Tripper and for the same reason: killing
+	// re-enters this component. Owned by Gameplay/TraceParry.cpp; this is its only call site.
+	//
+	// Tripper and ParriedDasher can never both be set on one tick, and that is structural rather
+	// than lucky: bInvulnerable is computed once above the loop, Tripper is only assigned in the
+	// !bInvulnerable arm and ParriedDasher only in the bInvulnerable arm. So "the dasher dies" and
+	// "the carrier dies" are two exclusive outcomes of one evaluation of one fact — they cannot
+	// double-kill, and neither can cancel the other.
+	ATraceCharacter* ParriedDasher = nullptr;
+
 	for (ATraceCharacter* Candidate : Candidates)
 	{
 		if (Candidate == nullptr)
@@ -1432,6 +1637,15 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 				*GetNameSafe(Candidate), *GetNameSafe(Holder), NoKillReason,
 				bParry ? 1 : 0, GetParryWindowRemaining(), bPassWindow ? 1 : 0,
 				TrailPoints.Items.Num(), TestPositions.Num(), bEmitting ? 1 : 0);
+
+			// v6 §3. A PARRY specifically — not the pass window — turns this into a punish. Note the
+			// deliberate non-clause: if the pass window happens to be open too, the dasher still
+			// dies. The trace they hit was red (parry wins the tint), and "red trace kills me" has
+			// to hold every time or it is not a tell.
+			if (bParry && ParriedDasher == nullptr)
+			{
+				ParriedDasher = Candidate;
+			}
 			continue;
 		}
 
@@ -1462,6 +1676,13 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 			bEmitting ? TEXT("no") : TEXT("yes - laid before a turnover"));
 
 		ApplyTrailTrip(Holder, Tripper);
+	}
+
+	// v6 §3, deferred for the same re-entrancy reason as ApplyTrailTrip above: this kills, and the
+	// death path re-enters this component.
+	if (ParriedDasher != nullptr)
+	{
+		TraceParry::ServerPunishParriedDash(Holder, ParriedDasher);
 	}
 }
 
@@ -1715,6 +1936,15 @@ void UTraceTrailComponent::UpdateVisuals()
 	// UpdateTeamColor() early-outs unless the colour actually changed.
 	UpdateTeamColor();
 
+	// A renderer switch has to force a rebuild, because none of the terms below would notice it: the
+	// point set, the invulnerability and the emission state are all identical either side of the
+	// lever. Without this, a stationary carrier would keep the old renderer's geometry on screen and
+	// Trace.Trail.PerfAB would measure the previous arm.
+	if (ActiveRendererArm != GTrailRenderer)
+	{
+		bVisualsDirty = true;
+	}
+
 	// Change detection. bVisualsDirty is the primary signal (set by the replication callbacks and
 	// by every server-side mutation); the head/tail/count comparison is a cheap backstop so the
 	// visuals keep tracking even if a fast-array callback is ever missed.
@@ -1755,8 +1985,38 @@ void UTraceTrailComponent::UpdateVisuals()
 	RebuildVisuals();
 }
 
+bool UTraceTrailComponent::IsRibbonRenderer()
+{
+	return GTrailRenderer != 0;
+}
+
+int32 UTraceTrailComponent::PartsPerElement()
+{
+	return IsRibbonRenderer() ? 1 : PartsPerSmear;
+}
+
 void UTraceTrailComponent::RebuildVisuals()
 {
+	// THE RENDERER ARM IS PART OF THE POOL'S IDENTITY. Arm 0 puts two cylinders in every element and
+	// keeps a herd of posed Mannequins beside them; arm 1 puts one box in every element and no
+	// skinned meshes at all. Reinterpreting one pool as the other would pair a ribbon element with a
+	// head band's material and leave orphaned mannequins standing in the arena, so a switch tears the
+	// pool down. It happens only when a console command moves the lever.
+	if (ActiveRendererArm != GTrailRenderer)
+	{
+		DestroyVisualPool();
+		ActiveRendererArm = GTrailRenderer;
+	}
+
+	// Arm 2: the measurement arm that draws nothing at all. See CVarTrailRenderer.
+	if (GTrailRenderer == 2)
+	{
+		HideSmearFrom(0);
+		ClearGhostRecords();
+		HidePredictedHead();
+		return;
+	}
+
 	// THE OTHER HALF OF THE INVARIANT. What is drawn is exactly the lethal set — not the whole
 	// point array — so a player can never be shown a segment that would not have killed them.
 	// ComputeLastLethalIndex() is the same function the server's trip test runs off, and it reads
@@ -1811,8 +2071,18 @@ void UTraceTrailComponent::RebuildVisuals()
 	// player, and the LETHAL VOLUME IS UNTOUCHED either way: trip resolution runs off TrailPoints,
 	// never off what happens to be rendered. A holder cannot trip their own trace anyway, so nothing
 	// is being hidden or shown here that its owner could act on.
-	RebuildSmear(LethalPointCount, InvulnerableScale);
-	RebuildPoseGhosts(LethalPointCount, InvulnerableScale);
+	if (IsRibbonRenderer())
+	{
+		// Spec v6 §2. ONE layer, one shape, no ghosts. ClearGhostRecords() is a no-op unless the
+		// lever was just moved off the legacy arm, and costs one Num() test otherwise.
+		ClearGhostRecords();
+		RebuildRibbon(LethalPointCount, InvulnerableScale);
+	}
+	else
+	{
+		RebuildSmear(LethalPointCount, InvulnerableScale);
+		RebuildPoseGhosts(LethalPointCount, InvulnerableScale);
+	}
 }
 
 FTraceSmearStyle UTraceTrailComponent::MakeSmearStyle() const
@@ -2029,6 +2299,407 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float Invulnerab
 	HideSmearFrom(Placed);
 }
 
+// =================================================================================================
+// SPEC v6 §2 — THE CURVED RIBBON. THIS IS THE TRACE.
+//
+// Verbatim: "Change the trace from a player shaped trace to a rectangle which curves to follow the
+// player. Rather than having noticeable sections, make it one fluid shape. It should emanate from
+// the middle of the player's model, and follow all the exact same rules as the old trace, but look
+// cleaner. Think a Tron path but from the model's back, curving through the air."
+//
+// Four requirements, and what each one is in the code:
+//
+//   A RECTANGLE, NOT A PERSON.   The element mesh is a box at EXACTLY the lethal cross-section:
+//                                2 x TrailRadius wide (90uu) and TrailHeight tall (190uu), both read
+//                                from UTraceSettings so a retune moves the drawing with the rule.
+//                                Nothing about the drawn silhouette is a flattering fraction of the
+//                                volume that kills. The posed Mannequins are gone entirely.
+//
+//   IT CURVES TO FOLLOW.         The centreline is a Catmull-Rom curve THROUGH the trail points,
+//                                resampled at a near-uniform arc length, and every element is
+//                                oriented by the curve in full 3D — yaw AND pitch. The legacy smear
+//                                flattened every segment (Along.Z = 0), so a trace laid over a jump
+//                                was a staircase of level slabs; this one banks through the arc,
+//                                which is the "curving through the air" half of the request.
+//
+//   ONE FLUID SHAPE.             Three separate things were producing "noticeable sections", and all
+//                                three are addressed rather than one of them:
+//                                  1. the twenty discrete Mannequins — deleted;
+//                                  2. the two-band cross-section with an empty 72-162uu gap between
+//                                     the floor band and the eye ribbon — replaced by one solid
+//                                     rectangle spanning the whole lethal height;
+//                                  3. Z-FIGHTING between the coplanar faces of overlapping elements,
+//                                     which strobes as a bright band at every joint — see
+//                                     RibbonAlternateInset.
+//                                Elements still overlap by half a body width at interior joints, so
+//                                the outside of a corner is never open; on a flat unlit emissive
+//                                material an overlap is not visible as anything at all.
+//
+//   FROM THE MIDDLE OF THE MODEL. The trail points ARE the carrier's actor location, i.e. the centre
+//                                of the capsule, i.e. the middle of the model — and the ribbon's
+//                                cross-section is centred on the point rather than hung below it.
+//                                The legacy smear put its solid band in the bottom 38% of the column
+//                                (to leave room for the mannequins), so it read as emanating from
+//                                the feet. The owner-only predicted head (spec v5 §2) still carries
+//                                the ribbon forward to the carrier so there is no gap at the source.
+//
+// GAMEPLAY IS UNTOUCHED (spec v6 §3). The ribbon is built from ComputeLastLethalIndex(), the same
+// function the server's trip test runs off, so the drawn set is still exactly the lethal set: the
+// trip test, lethality, lifetime, turnover grace and the parry all read TrailPoints and have no
+// notion that the renderer changed. WHERE THE SILHOUETTE AND THE TRIP VOLUME DIFFER, stated plainly:
+//
+//   * THE CENTRELINE IS SMOOTHED, so between two trail points it can bow outside the chord by up to
+//     ~1/8 of the chord (~7uu at the 60uu default spacing), and the elements chord that curve back
+//     by a sagitta of at most a few uu. Net: the drawn centreline is within ~10uu of the lethal
+//     polyline, against a lethal radius of 45uu — and the trip test inflates that by the tripper's
+//     own capsule radius (~34uu) before it decides. The ribbon is inside the volume that kills
+//     everywhere; it never advertises lethal ground that is not.
+//   * ALTERNATE ELEMENTS ARE INSET BY 0.6% of the cross-section (0.54uu of 90) to break Z-fighting.
+//     Same direction, three orders of magnitude smaller than the margin above.
+//   * A PITCHED ELEMENT tilts its cross-section with the curve, so its vertical band is the union of
+//     its two ends' bands (Height + |dZ|) rather than the exact lerp — an over-draw of at most half
+//     the height change, which is the safe direction and is what the smear always did.
+//   * VERTICALLY THE RIBBON NOW COVERS THE FULL LETHAL HEIGHT, where the legacy renderer left
+//     72-162uu open for the mannequins to stand in. This is strictly MORE honest than before.
+// =================================================================================================
+
+void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, const TArray<float>& Births,
+	double Step, int32 MaxElements)
+{
+	RibbonSamples.Reset();
+	RibbonSampleBirth.Reset();
+
+	const int32 PointCount = Points.Num();
+	if (PointCount == 0)
+	{
+		return;
+	}
+
+	const bool bHaveBirths = (Births.Num() == PointCount);
+
+	if (PointCount == 1)
+	{
+		// A one-point trace is a real, lethal, degenerate segment (SweepIntersectsTrace tests it as
+		// one), so it gets one stub element rather than nothing at all.
+		RibbonSamples.Add(Points[0]);
+		RibbonSamples.Add(Points[0]);
+		RibbonSampleBirth.Add(bHaveBirths ? Births[0] : 0.f);
+		RibbonSampleBirth.Add(bHaveBirths ? Births[0] : 0.f);
+		return;
+	}
+
+	// Chord lengths on the ORIGINAL polyline. Used as the arc-length parameter: the Catmull-Rom curve
+	// is a little longer than its control polygon, so the resample is slightly non-uniform. That is
+	// immaterial to a ribbon — it changes element lengths by a percent or two, not their coverage.
+	double TotalLength = 0.0;
+	TArray<double, TInlineAllocator<64>> Cumulative;
+	Cumulative.Reserve(PointCount);
+	Cumulative.Add(0.0);
+	for (int32 Index = 1; Index < PointCount; ++Index)
+	{
+		TotalLength += FVector::Dist(Points[Index - 1], Points[Index]);
+		Cumulative.Add(TotalLength);
+	}
+
+	if (TotalLength <= GeometryEpsilon)
+	{
+		RibbonSamples.Add(Points[0]);
+		RibbonSamples.Add(Points.Last());
+		RibbonSampleBirth.Add(bHaveBirths ? Births[0] : 0.f);
+		RibbonSampleBirth.Add(bHaveBirths ? Births.Last() : 0.f);
+		return;
+	}
+
+	// COARSEN, NEVER TRUNCATE. A trace longer than the pool can draw at the requested step gets
+	// longer elements, not a missing tail: every uu of the lethal set stays covered. (The legacy
+	// smear dropped the oldest segments at its cap, which was a hole in the drawing of a thing that
+	// still kills.)
+	const double SafeStep = FMath::Max(1.0, Step);
+	int32 ElementCount = FMath::CeilToInt(TotalLength / SafeStep);
+	ElementCount = FMath::Clamp(ElementCount, 1, FMath::Max(1, MaxElements));
+
+	RibbonSamples.Reserve(ElementCount + 1);
+	RibbonSampleBirth.Reserve(ElementCount + 1);
+
+	int32 Segment = 0;
+	for (int32 SampleIndex = 0; SampleIndex <= ElementCount; ++SampleIndex)
+	{
+		const double Distance = (TotalLength * SampleIndex) / static_cast<double>(ElementCount);
+
+		while (Segment + 2 < PointCount && Cumulative[Segment + 1] < Distance)
+		{
+			++Segment;
+		}
+
+		const double SegmentLength = Cumulative[Segment + 1] - Cumulative[Segment];
+		const double T = (SegmentLength > GeometryEpsilon)
+			? FMath::Clamp((Distance - Cumulative[Segment]) / SegmentLength, 0.0, 1.0)
+			: 0.0;
+
+		// End control points are duplicated rather than extrapolated: an extrapolated phantom point
+		// would let the curve overshoot PAST the first or last lethal point, i.e. draw trace beyond
+		// where the server kills. Duplication makes the curve stop exactly on the endpoint.
+		const FVector& P0 = Points[FMath::Max(0, Segment - 1)];
+		const FVector& P1 = Points[Segment];
+		const FVector& P2 = Points[FMath::Min(PointCount - 1, Segment + 1)];
+		const FVector& P3 = Points[FMath::Min(PointCount - 1, Segment + 2)];
+
+		RibbonSamples.Add(CatmullRom(P0, P1, P2, P3, T));
+
+		if (bHaveBirths)
+		{
+			const float BirthA = Births[Segment];
+			const float BirthB = Births[FMath::Min(PointCount - 1, Segment + 1)];
+			RibbonSampleBirth.Add(FMath::Lerp(BirthA, BirthB, static_cast<float>(T)));
+		}
+		else
+		{
+			RibbonSampleBirth.Add(0.f);
+		}
+	}
+}
+
+void UTraceTrailComponent::RebuildRibbon(int32 LethalPointCount, float InvulnerableScale)
+{
+	if (LethalPointCount <= 0 || (CubeMesh == nullptr && CylinderMesh == nullptr))
+	{
+		HideSmearFrom(0);
+		return;
+	}
+
+	// Snapshot the lethal polyline and its birth times into the reusable scratch arrays, rather than
+	// reading TrailPoints inside the resample loop: nothing here can then be surprised by a
+	// replication callback landing mid-rebuild, and a steady-state rebuild allocates nothing.
+	RibbonSourcePoints.Reset();
+	RibbonSourceBirths.Reset();
+	for (int32 Index = 0; Index < LethalPointCount; ++Index)
+	{
+		RibbonSourcePoints.Add(FVector(TrailPoints.Items[Index].Location));
+		RibbonSourceBirths.Add(TrailPoints.Items[Index].BirthServerTime);
+	}
+
+	BuildRibbonSamples(RibbonSourcePoints, RibbonSourceBirths,
+		static_cast<double>(FMath::Max(5.f, GRibbonStep)), MaxRibbonElements);
+
+	CacheMeshMetrics();
+
+	PlaceRibbon(SmearMeshes, SmearMaterials, SmearBaseGlow, SmearAppliedGlowScale,
+		MaxRibbonElements, InvulnerableScale, /*bAgeFade=*/true, /*bOnlyOwnerSees=*/false,
+		/*bOverlapAtStart=*/false);
+}
+
+void UTraceTrailComponent::PlaceRibbon(
+	TArray<TObjectPtr<UStaticMeshComponent>>& Pieces,
+	TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
+	TArray<float>& BaseGlowOut,
+	TArray<float>& AppliedScaleOut,
+	int32 MaxElements,
+	float InvulnerableScale,
+	bool bAgeFade,
+	bool bOnlyOwnerSees,
+	bool bOverlapAtStart)
+{
+	const int32 ElementCount = FMath::Max(0, RibbonSamples.Num() - 1);
+	if (ElementCount <= 0)
+	{
+		for (int32 Index = 0; Index < Pieces.Num(); ++Index)
+		{
+			if (UStaticMeshComponent* Piece = Pieces[Index])
+			{
+				Piece->SetVisibility(false);
+			}
+		}
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// EXACTLY the lethal cross-section, both axes, unless somebody has explicitly dialled the width
+	// down with Trace.Trail.RibbonWidthScale (default 1.0 — see the comment there for what a
+	// narrower ribbon costs the player). A boundary drawn narrower than it really is turns the trace
+	// into a trap rather than a warning.
+	const double LethalWidth = FMath::Max(1.0, 2.0 * static_cast<double>(Settings.TrailRadius));
+	const double Width = LethalWidth * FMath::Clamp(static_cast<double>(GRibbonWidthScale), 0.05, 2.0);
+	const double Height = FMath::Max(1.0, static_cast<double>(Settings.TrailHeight));
+
+	// Half a body width of overlap at interior joints — enough to close the wedge on the outside of a
+	// corner up to a 90-degree turn between two consecutive elements.
+	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
+
+	const float Lifetime = GetTraceLifetimeSeconds();
+	const float Now = GetServerTimeSeconds();
+	const float RibbonGlow = ResolvedRibbonGlow();
+
+	const FVector HalfSize = (CubeMesh != nullptr) ? CubeHalfSize : CylinderHalfSize;
+	const FVector PivotOffset = (CubeMesh != nullptr) ? CubePivotOffset : CylinderPivotOffset;
+
+	int32 Placed = 0;
+	for (int32 ElementIndex = 0; ElementIndex < ElementCount; ++ElementIndex)
+	{
+		if (!EnsureRibbonElement(Pieces, Materials, BaseGlowOut, AppliedScaleOut,
+			Placed, MaxElements, bOnlyOwnerSees))
+		{
+			break;
+		}
+
+		UStaticMeshComponent* Piece = Pieces.IsValidIndex(Placed) ? Pieces[Placed].Get() : nullptr;
+		if (Piece == nullptr)
+		{
+			++Placed;
+			continue;
+		}
+
+		const FVector SegStart = RibbonSamples[ElementIndex];
+		const FVector SegEnd = RibbonSamples[ElementIndex + 1];
+
+		FVector Along = SegEnd - SegStart;
+		const double Length = Along.Size();
+		// FULL 3D, pitch included — this is what makes the ribbon curve through the air rather than
+		// step through it. Roll is left at zero so the ribbon always stands upright: the lethal volume
+		// is a vertical column, and a banked cross-section would advertise a boundary that is not
+		// there. Rotation() yields yaw+pitch with roll 0 by construction.
+		const FVector Direction = (Length > GeometryEpsilon) ? (Along / Length) : FVector::ForwardVector;
+		const FRotator Facing = Direction.Rotation();
+
+		// Interior joints overlap; the two OUTER ends stay flush with the first and last lethal point,
+		// so the ribbon never extends past the polyline the server kills along.
+		//
+		// bOverlapAtStart is the one exception, and it is the seam the user is looking straight at: the
+		// owner-only predicted stub begins exactly where the drawn lethal set ends, so ITS first
+		// element overlaps BACKWARD into the last real one. Without that, the one joint a carrier sees
+		// from a metre away is the only butt joint in the whole trace.
+		const double BackOverlap = (ElementIndex > 0 || bOverlapAtStart) ? JointOverlap : 0.0;
+		const double ForwardOverlap = (ElementIndex + 1 < ElementCount) ? JointOverlap : 0.0;
+
+		// Never shorter than one body width, so a degenerate (but lethal) one-point trace draws a
+		// block you can see rather than a sliver you cannot.
+		const double ElementLength = FMath::Max(LethalWidth, Length + BackOverlap + ForwardOverlap);
+		const FVector ElementCentre = (SegStart + SegEnd) * 0.5
+			+ Direction * ((ForwardOverlap - BackOverlap) * 0.5);
+
+		// Union of the two ends' vertical bands, exactly as the smear did it: over-drawing a lethal
+		// boundary is the safe direction, under-drawing it is a trap.
+		const double SpanHeight = Height + FMath::Abs(SegEnd.Z - SegStart.Z);
+
+		// See RibbonAlternateInset: this is the anti-Z-fight, not a taper.
+		const double Inset = ((ElementIndex & 1) != 0) ? RibbonAlternateInset : 1.0;
+
+		const FVector Scale(
+			ElementLength / (2.0 * HalfSize.X),
+			(Width * Inset) / (2.0 * HalfSize.Y),
+			(SpanHeight * Inset) / (2.0 * HalfSize.Z));
+
+		// Corrects for a source mesh whose pivot is not at its bounds centre, so we never assume
+		// anything about the engine primitives' authoring.
+		const FVector PivotCorrection = Facing.RotateVector(PivotOffset * Scale);
+
+		Piece->SetWorldLocationAndRotation(ElementCentre - PivotCorrection, Facing);
+		Piece->SetWorldScale3D(Scale);
+		if (!Piece->IsVisible())
+		{
+			Piece->SetVisibility(true);
+		}
+
+		// THE ONE LINE THAT KEEPS THE PREDICTED HEAD OFF EVERY OTHER PLAYER'S SCREEN. Guarded because
+		// SetOnlyOwnerSee dirties the render state and this runs as the trace grows.
+		if (Piece->bOnlyOwnerSee != bOnlyOwnerSees)
+		{
+			Piece->SetOnlyOwnerSee(bOnlyOwnerSees);
+		}
+
+		// The age fade is a GRADIENT ALONG THE RIBBON, not a step per element: the birth time was
+		// interpolated to each sample when the curve was resampled, so consecutive elements differ by
+		// a percent or two and the eye reads a cooling ramp instead of a row of tiles. It never falls
+		// to zero — an old stretch of trace is exactly as lethal as a new one.
+		float FadeScale = 1.f;
+		if (bAgeFade && RibbonSampleBirth.IsValidIndex(ElementIndex + 1))
+		{
+			const float Age = FMath::Max(0.f, Now - RibbonSampleBirth[ElementIndex + 1]);
+			const float Remaining = FMath::Clamp(1.f - (Age / FMath::Max(0.01f, Lifetime)), 0.f, 1.f);
+			FadeScale = FMath::Lerp(GhostOldestGlowScale, 1.f, Remaining);
+		}
+
+		if (BaseGlowOut.Num() <= Placed)
+		{
+			BaseGlowOut.SetNumZeroed(Placed + 1);
+		}
+		if (AppliedScaleOut.Num() <= Placed)
+		{
+			AppliedScaleOut.SetNumZeroed(Placed + 1);
+		}
+		BaseGlowOut[Placed] = RibbonGlow * FadeScale * InvulnerableScale;
+
+		if (bTrailMaterialIsNeon && Materials.IsValidIndex(Placed))
+		{
+			if (UMaterialInstanceDynamic* Material = Materials[Placed])
+			{
+				// Push full brightness and let the proximity pass pull it down. Resetting the
+				// remembered scale forces that pass to re-evaluate this piece, which it must: the
+				// piece has just been moved somewhere else entirely.
+				Material->SetScalarParameterValue(TEXT("Glow"), BaseGlowOut[Placed]);
+				AppliedScaleOut[Placed] = 1.f;
+			}
+		}
+
+		++Placed;
+	}
+
+	for (int32 Index = Placed; Index < Pieces.Num(); ++Index)
+	{
+		if (UStaticMeshComponent* Piece = Pieces[Index])
+		{
+			if (Piece->IsVisible())
+			{
+				Piece->SetVisibility(false);
+			}
+		}
+	}
+}
+
+bool UTraceTrailComponent::EnsureRibbonElement(
+	TArray<TObjectPtr<UStaticMeshComponent>>& Pieces,
+	TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
+	TArray<float>& BaseGlowOut,
+	TArray<float>& AppliedScaleOut,
+	int32 ElementIndex,
+	int32 MaxElements,
+	bool bOnlyOwnerSees)
+{
+	if (ElementIndex < 0 || ElementIndex >= MaxElements)
+	{
+		return false;
+	}
+
+	if (Pieces.Num() > ElementIndex)
+	{
+		return true;
+	}
+
+	// One element at a time, in order, so an index can never mean two different things.
+	if (Pieces.Num() != ElementIndex)
+	{
+		return false;
+	}
+
+	UMaterialInstanceDynamic* Material = nullptr;
+	UStaticMeshComponent* Piece = CreatePooledMesh(
+		(CubeMesh != nullptr) ? CubeMesh.Get() : CylinderMesh.Get(), Material);
+
+	// Set on creation as well as on every placement: a predicted-head piece must NEVER be visible to
+	// anyone but the carrier, so it starts that way rather than becoming that way.
+	if (Piece != nullptr && bOnlyOwnerSees)
+	{
+		Piece->SetOnlyOwnerSee(true);
+	}
+
+	Pieces.Add(Piece);
+	Materials.Add(Material);
+	BaseGlowOut.Add(0.f);
+	AppliedScaleOut.Add(1.f);
+
+	return true;
+}
+
 // -------------------------------------------------------------------------------------------------
 // SPEC v5 §2 — THE PREDICTED HEAD, and why it cannot break "visible implies lethal".
 //
@@ -2165,7 +2836,11 @@ float UTraceTrailComponent::MeasureOwnerVisibleGap(bool bIncludePredictedHead) c
 void UTraceTrailComponent::UpdatePredictedHead()
 {
 	// ---- every reason not to draw it, cheapest first ------------------------------------------
-	if (CylinderMesh == nullptr || GPredictedHeadMaxLength <= 0.f)
+	//
+	// Arm 2 of Trace.Trail.Renderer draws NOTHING, and that has to include the owner-only stub: the
+	// arm exists to bound the total cost of this component's visuals, and six elements it forgot to
+	// hide would be six elements silently subtracted from the answer.
+	if (CylinderMesh == nullptr || GPredictedHeadMaxLength <= 0.f || GTrailRenderer == 2)
 	{
 		HidePredictedHead();
 		return;
@@ -2237,7 +2912,6 @@ void UTraceTrailComponent::UpdatePredictedHead()
 	CacheMeshMetrics();
 
 	const UTraceSettings& Settings = UTraceSettings::Get();
-	const FTraceSmearStyle Style = MakeSmearStyle();
 	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
 
 	// The stub is the newest trace there is, so it takes the newest trace's brightness: no age fade,
@@ -2252,6 +2926,39 @@ void UTraceTrailComponent::UpdatePredictedHead()
 	{
 		InvulnerableScale = GhostInvulnerableGlowScale;
 	}
+
+	// ---- the ribbon arm (spec v6 §2): the stub is the same shape as the trace it continues --------
+	//
+	// It has to be built from the SAME resample-and-place code, not from a lookalike: the stub's whole
+	// job is to be indistinguishable from the ribbon it joins onto, and two implementations of "a
+	// curved rectangle at the lethal cross-section" would be two chances for the join to show. The
+	// FIRST sample is the last drawn point, so the stub's back end overlaps into the last real element
+	// exactly as an interior joint does.
+	if (IsRibbonRenderer())
+	{
+		RibbonSourcePoints.Reset();
+		RibbonSourceBirths.Reset();
+		for (const FVector& PathPoint : Path)
+		{
+			RibbonSourcePoints.Add(PathPoint);
+		}
+
+		BuildRibbonSamples(RibbonSourcePoints, RibbonSourceBirths,
+			static_cast<double>(FMath::Max(5.f, GRibbonStep)), MaxPredictedRibbonElements);
+
+		// No age fade: the stub is the newest trace there is, so it wears the newest trace's
+		// brightness and cannot read as older than the element behind it.
+		PlaceRibbon(PredictedSmearMeshes, PredictedSmearMaterials,
+			PredictedSmearBaseGlow, PredictedSmearAppliedGlowScale,
+			MaxPredictedRibbonElements, InvulnerableScale, /*bAgeFade=*/false, /*bOnlyOwnerSees=*/true,
+			/*bOverlapAtStart=*/true);
+
+		PredictedHeadLength = (PredictedSmearMeshes.Num() > 0) ? static_cast<float>(TotalLength) : 0.f;
+		return;
+	}
+
+	// ---- the legacy arm (spec v4 §2), reached only from Trace.Trail.Renderer 0 ---------------------
+	const FTraceSmearStyle Style = MakeSmearStyle();
 
 	int32 Placed = 0;
 	for (int32 SegmentIndex = 0; SegmentIndex + 1 < Path.Num(); ++SegmentIndex)
@@ -3002,7 +3709,9 @@ UStaticMeshComponent* UTraceTrailComponent::CreatePooledMesh(UStaticMesh* Source
 
 void UTraceTrailComponent::HideSmearFrom(int32 FirstElementIndex)
 {
-	for (int32 Index = FMath::Max(0, FirstElementIndex) * PartsPerSmear; Index < SmearMeshes.Num(); ++Index)
+	// PartsPerElement(), not PartsPerSmear: the ribbon is one mesh per element and the legacy smear is
+	// two, and this is called from both.
+	for (int32 Index = FMath::Max(0, FirstElementIndex) * PartsPerElement(); Index < SmearMeshes.Num(); ++Index)
 	{
 		if (UStaticMeshComponent* Piece = SmearMeshes[Index])
 		{
@@ -3100,6 +3809,19 @@ void UTraceTrailComponent::UpdateTeamColor()
 			Material->SetVectorParameterValue(TEXT("BaseColor"), AppliedColor);
 		}
 	}
+
+	// AND THE OWNER-ONLY PREDICTED HEAD. It was missing from this loop, which is a real bug and not a
+	// tidy-up: the stub took its colour once, at creation, from bColorApplied — so a carrier who
+	// parried saw their entire trace go red EXCEPT the 45-400uu of it nearest their own feet, which
+	// stayed team-cyan. The carrier is the person the parry tell exists for.
+	for (UMaterialInstanceDynamic* Material : PredictedSmearMaterials)
+	{
+		if (Material != nullptr)
+		{
+			Material->SetVectorParameterValue(TEXT("Color"), AppliedColor);
+			Material->SetVectorParameterValue(TEXT("BaseColor"), AppliedColor);
+		}
+	}
 }
 
 void UTraceTrailComponent::CacheMeshMetrics()
@@ -3116,10 +3838,26 @@ void UTraceTrailComponent::CacheMeshMetrics()
 		CylinderPivotOffset = LocalBounds.Origin;
 	}
 
+	if (CubeMesh != nullptr)
+	{
+		const FBoxSphereBounds LocalBounds = CubeMesh->GetBounds();
+		CubeHalfSize = LocalBounds.BoxExtent;
+		CubePivotOffset = LocalBounds.Origin;
+	}
+	else
+	{
+		// No cube: the ribbon is drawn on the cylinder instead, so it must measure the cylinder.
+		CubeHalfSize = CylinderHalfSize;
+		CubePivotOffset = CylinderPivotOffset;
+	}
+
 	// Never divide by zero, whatever the assets turn out to be.
 	CylinderHalfSize.X = FMath::Max(CylinderHalfSize.X, 1.0);
 	CylinderHalfSize.Y = FMath::Max(CylinderHalfSize.Y, 1.0);
 	CylinderHalfSize.Z = FMath::Max(CylinderHalfSize.Z, 1.0);
+	CubeHalfSize.X = FMath::Max(CubeHalfSize.X, 1.0);
+	CubeHalfSize.Y = FMath::Max(CubeHalfSize.Y, 1.0);
+	CubeHalfSize.Z = FMath::Max(CubeHalfSize.Z, 1.0);
 
 	bMeshMetricsCached = true;
 }
@@ -3640,6 +4378,457 @@ namespace
 		return true;
 	}
 
+	// =============================================================================================
+	// SPEC v6 §1 — THE MEASUREMENT. "WAY laggier, with 1/6 the fps and its unplayable."
+	//
+	// That report is a number, so the answer has to be a number, taken on the SAME SCENE in the SAME
+	// PROCESS. Rebuilding the old binary and eyeballing two separate runs would compare two different
+	// bot matches as much as two renderers, so instead Trace.Trail.Renderer switches the renderer at
+	// runtime and this command cycles it:
+	//
+	//   arm "legacy"  Trace.Trail.Renderer 0 — spec v4 §2: up to 20 posed Mannequins per carrier plus
+	//                                          a two-part cylinder smear. THE BEFORE.
+	//   arm "ribbon"  Trace.Trail.Renderer 1 — spec v6 §2: one swept rectangle. THE AFTER.
+	//   arm "off"     Trace.Trail.Renderer 2 — nothing drawn. THE BOUND: whatever this arm does not
+	//                                          recover was never the trace's fault, and that is the
+	//                                          more valuable finding of the two.
+	//
+	// WHAT IS SAMPLED, and it is deliberately the same four numbers `stat unit` shows, from the same
+	// globals `stat unit` reads:
+	//   Frame  — real wall-clock frame time from the ticker's own delta, which is the one number the
+	//            user's "1/6 the fps" is about.
+	//   Game   — GGameThreadTime.     Render — GRenderThreadTime.     GPU — RHIGetGPUFrameCycles().
+	// Reporting the split is the point: 20 skinned meshes would show up as GPU and render-thread
+	// cost, whereas an arena with 1187 components or a per-frame line trace shows up as game thread,
+	// and those are different bugs with different owners.
+	//
+	// Each arm gets a warm-up before it is sampled, because the first frames after a renderer switch
+	// pay for pool destruction and component creation and are not the steady state anybody plays in.
+	// =============================================================================================
+
+	struct FTrailPerfArm
+	{
+		int32 Renderer = 1;
+		FString Name;
+
+		TArray<float> FrameMs;
+		double GameMsSum = 0.0;
+		double RenderMsSum = 0.0;
+		double GpuMsSum = 0.0;
+		double TrailMsSum = 0.0;
+		double StaticPieces = 0.0;
+		double SkinnedPieces = 0.0;
+		double Carriers = 0.0;
+		int32 Frames = 0;
+	};
+
+	float TrailPerfPercentile(TArray<float>& Values, float Fraction)
+	{
+		if (Values.Num() == 0)
+		{
+			return 0.f;
+		}
+		Values.Sort();
+		const int32 Index = FMath::Clamp(FMath::RoundToInt(Fraction * (Values.Num() - 1)), 0, Values.Num() - 1);
+		return Values[Index];
+	}
+
+	float TrailPerfMean(const TArray<float>& Values)
+	{
+		if (Values.Num() == 0)
+		{
+			return 0.f;
+		}
+		double Total = 0.0;
+		for (const float Value : Values)
+		{
+			Total += Value;
+		}
+		return static_cast<float>(Total / Values.Num());
+	}
+
+	struct FTrailPerfState
+	{
+		TArray<FTrailPerfArm> Arms;
+		int32 ArmIndex = 0;
+		float WarmupSeconds = 3.f;
+		float SampleSeconds = 15.f;
+		float PhaseElapsed = 0.f;
+		bool bWarming = true;
+		bool bStarted = false;
+		int32 RestoreRenderer = 1;
+
+		/**
+		 * HOW MANY TIMES THE THREE ARMS ARE CYCLED, and this is not a nicety either.
+		 *
+		 * Run once, the arms are three CONSECUTIVE time windows, so anything that drifts over a match
+		 * lands entirely on whichever arm was running. Measured: at 16x resolution a single pass gave
+		 * legacy 39.7 ms, ribbon 42.7, off 45.6 — a perfectly monotonic ramp that says the LAST arm
+		 * is slowest whatever it is drawing, which is a statement about the match and not about the
+		 * renderer. (Drawing nothing "cost" 5.9 ms more than twenty skinned Mannequins.)
+		 *
+		 * Interleaving legacy/ribbon/off/legacy/ribbon/off/... spreads that drift evenly across all
+		 * three buckets, which is the whole difference between a comparison and a coincidence.
+		 */
+		int32 CyclesTotal = 3;
+		int32 CycleIndex = 0;
+
+		/** Characterises the scene once, so the numbers can be read months from now. */
+		int32 PrimitiveCount = 0;
+		int32 CharacterCount = 0;
+	};
+
+	/**
+	 * DID THE FRAME RATE ACTUALLY GET UNCAPPED? Returns the refresh rate it is pinned to, or 0.
+	 *
+	 * TickTrailPerf asks for an uncapped frame four different ways (t.MaxFPS, r.VSync,
+	 * rhi.SyncInterval, bSmoothFrameRate). ON MACOS NONE OF THEM WORK: Metal paces the present to the
+	 * display whatever the RHI is told, and -RenderOffScreen still presents. Measured on this machine
+	 * at 1280x720: legacy 8.34 ms, ribbon 8.35 ms, off 8.34 ms — three arms, one of which DRAWS
+	 * NOTHING AT ALL, agreeing to a hundredth of a millisecond at exactly 1000/120.
+	 *
+	 * THAT IS NOT A RESULT, IT IS THE ABSENCE OF ONE, and the two are indistinguishable in the table:
+	 * both look like "the renderer does not matter". A whole verification pass has already concluded
+	 * "the trace was never the cause" from precisely those numbers. The conclusion happened to be
+	 * right — re-measured GPU-bound, the entire trace is under 1% of the frame — but it was not
+	 * SUPPORTED, because a capped run cannot tell a free renderer from an expensive one.
+	 *
+	 * So the harness now says so itself. The test needs both halves:
+	 *   * every arm's mean within CapAgreementTolerance of every other. A genuine tie is possible, so
+	 *     this alone must never be enough to cry cap;
+	 *   * and that shared mean sitting on a plausible refresh period. THIS is the specific half. At
+	 *     3x screen percentage the same three arms came back 23.17 / 23.34 / 23.13 — a 0.9% spread
+	 *     that passes the first test and is nowhere near any refresh rate, so it is correctly reported
+	 *     as the real measurement it is.
+	 */
+	float TrailPerfDetectFrameRateCap(const FTrailPerfState& State)
+	{
+		// Fraction by which the arms' mean frame times may differ and still count as "identical".
+		constexpr float CapAgreementTolerance = 0.02f;
+		// Fraction by which the shared mean may differ from a refresh period and still count as it.
+		constexpr float CapRefreshTolerance = 0.03f;
+
+		float MinMean = TNumericLimits<float>::Max();
+		float MaxMean = 0.f;
+		for (const FTrailPerfArm& Arm : State.Arms)
+		{
+			const float Mean = TrailPerfMean(Arm.FrameMs);
+			if (Mean <= 0.f)
+			{
+				return 0.f;   // An arm with no frames: nothing to conclude either way.
+			}
+			MinMean = FMath::Min(MinMean, Mean);
+			MaxMean = FMath::Max(MaxMean, Mean);
+		}
+
+		if (MinMean <= 0.f || ((MaxMean - MinMean) / MinMean) > CapAgreementTolerance)
+		{
+			return 0.f;   // The arms genuinely differ, so nothing is holding them together.
+		}
+
+		static const float CommonRefreshRates[] = { 30.f, 50.f, 60.f, 72.f, 75.f, 90.f, 100.f, 120.f, 144.f, 165.f, 240.f };
+		for (const float Hz : CommonRefreshRates)
+		{
+			const float Period = 1000.f / Hz;
+			if (FMath::Abs(MinMean - Period) / Period <= CapRefreshTolerance)
+			{
+				return Hz;
+			}
+		}
+
+		return 0.f;
+	}
+
+	void TrailPerfBeginArm(FTrailPerfState& State)
+	{
+		GTrailRenderer = State.Arms[State.ArmIndex].Renderer;
+		State.bWarming = true;
+		State.PhaseElapsed = 0.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TRAILPERF] arm '%s' (Trace.Trail.Renderer %d): warming %.1fs, then sampling %.1fs."),
+			*State.Arms[State.ArmIndex].Name, State.Arms[State.ArmIndex].Renderer,
+			State.WarmupSeconds, State.SampleSeconds);
+	}
+
+	void TrailPerfReport(FTrailPerfState& State)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TRAILPERF] ===== RESULTS. scene: %d primitive components, %d characters. "
+			     "ms lower is better; fps from the MEAN frame time. ====="),
+			State.PrimitiveCount, State.CharacterCount);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TRAILPERF] %-8s %6s | %8s %8s %8s | %8s %8s %8s %8s | %7s %8s"),
+			TEXT("arm"), TEXT("frames"), TEXT("frameMs"), TEXT("medMs"), TEXT("p95Ms"),
+			TEXT("gameMs"), TEXT("rendMs"), TEXT("gpuMs"), TEXT("traceMs"), TEXT("fps"), TEXT("pieces"));
+
+		float BaselineFrame = 0.f;
+		for (FTrailPerfArm& Arm : State.Arms)
+		{
+			const float MeanFrame = TrailPerfMean(Arm.FrameMs);
+			const float MedianFrame = TrailPerfPercentile(Arm.FrameMs, 0.50f);
+			const float P95Frame = TrailPerfPercentile(Arm.FrameMs, 0.95f);
+			const int32 SafeFrames = FMath::Max(1, Arm.Frames);
+
+			if (Arm.Renderer == 0)
+			{
+				BaselineFrame = MeanFrame;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TRAILPERF] %-8s %6d | %8.2f %8.2f %8.2f | %8.2f %8.2f %8.2f %8.3f | %7.1f %5.1f static + %.1f skinned"),
+				*Arm.Name, Arm.Frames, MeanFrame, MedianFrame, P95Frame,
+				Arm.GameMsSum / SafeFrames, Arm.RenderMsSum / SafeFrames, Arm.GpuMsSum / SafeFrames,
+				Arm.TrailMsSum / SafeFrames,
+				(MeanFrame > 0.f) ? (1000.f / MeanFrame) : 0.f,
+				Arm.StaticPieces / SafeFrames, Arm.SkinnedPieces / SafeFrames);
+		}
+
+		if (BaselineFrame > 0.f)
+		{
+			for (FTrailPerfArm& Arm : State.Arms)
+			{
+				if (Arm.Renderer == 0)
+				{
+					continue;
+				}
+				const float MeanFrame = TrailPerfMean(Arm.FrameMs);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[TRAILPERF] '%s' vs 'legacy': %+.2f ms/frame (%+.1f%%), %.2fx the frame rate."),
+					*Arm.Name, MeanFrame - BaselineFrame,
+					100.f * (MeanFrame - BaselineFrame) / BaselineFrame,
+					(MeanFrame > 0.f) ? (BaselineFrame / MeanFrame) : 0.f);
+			}
+		}
+
+		// THE VALIDITY VERDICT, PRINTED LAST SO IT IS THE LINE UNDER THE TABLE. See
+		// TrailPerfDetectFrameRateCap for why a table of near-identical arms is the one result that
+		// must never be read at face value.
+		if (const float CapHz = TrailPerfDetectFrameRateCap(State); CapHz > 0.f)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[TRAILPERF] *** THIS MEASUREMENT IS INVALID: every arm landed within 2%% of %.2f ms, "
+				     "which is %.0f Hz. The frame is PACED TO THE DISPLAY, not to the renderer, so an arm "
+				     "that draws NOTHING measures the same as one that draws twenty skinned meshes and the "
+				     "comparison cannot detect a difference of any size. t.MaxFPS / r.VSync / "
+				     "rhi.SyncInterval do NOT defeat this on macOS Metal, and -RenderOffScreen still "
+				     "presents. ***"),
+				1000.f / CapHz, CapHz);
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[TRAILPERF] *** TO GET A REAL NUMBER, make the GPU the bottleneck so the cap stops "
+				     "binding - e.g. run `r.ScreenPercentage 300` before Trace.Trail.PerfAB - and re-read "
+				     "the table. Do NOT quote the numbers above. ***"));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TRAILPERF] Validity: the arms differ by more than the cap-detection tolerance and the "
+				     "shared mean is not a display refresh period, so the frame was NOT paced and this "
+				     "comparison could have detected a difference."));
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[TRAILPERF] ===== END. Trace.Trail.Renderer restored to %d. ====="),
+			State.RestoreRenderer);
+	}
+
+	bool TickTrailPerf(FTrailPerfState& State, float DeltaTime)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return true;   // The map may still be loading.
+		}
+
+		if (!State.bStarted)
+		{
+			State.bStarted = true;
+
+			// FStatUnitData is only filled while the overlay is enabled, so enable it HERE rather than
+			// asking the caller to remember: a run that forgets produces a table of zeroes in three of
+			// the columns, which looks like a measurement and is not one. `stat unit` is a toggle, so
+			// this is done exactly once per PerfAB and the frame-time column never depends on it.
+			if (GEngine != nullptr)
+			{
+				GEngine->Exec(World, TEXT("stat unit"));
+
+				// AND UNCAP THE FRAME RATE, which two runs of this harness proved is not optional:
+				// every arm came back at exactly 8.33 ms, because this machine's display runs at
+				// 120 Hz and the swap chain was pacing to it. All three renderers then measure
+				// identical and the comparison says nothing at all — a capped frame time measures
+				// the cap. -RenderOffScreen does NOT bypass this; it still presents.
+				//
+				// All four levers, because they are four different caps: the engine's own limiter
+				// (t.MaxFPS), the engine's frame smoothing, the fixed-timestep mode, and the RHI's
+				// present interval (r.VSync / rhi.SyncInterval), and any one of them left on holds
+				// the whole measurement at the refresh rate.
+				GEngine->Exec(World, TEXT("t.MaxFPS 0"));
+				GEngine->Exec(World, TEXT("r.VSync 0"));
+				GEngine->Exec(World, TEXT("rhi.SyncInterval 0"));
+				GEngine->bSmoothFrameRate = false;
+				GEngine->bUseFixedFrameRate = false;
+			}
+
+			TrailPerfBeginArm(State);
+			return true;
+		}
+
+		State.PhaseElapsed += DeltaTime;
+
+		if (State.bWarming)
+		{
+			if (State.PhaseElapsed >= State.WarmupSeconds)
+			{
+				State.bWarming = false;
+				State.PhaseElapsed = 0.f;
+			}
+			return true;
+		}
+
+		// ---- sample this frame -------------------------------------------------------------------
+		FTrailPerfArm& Arm = State.Arms[State.ArmIndex];
+
+		Arm.FrameMs.Add(DeltaTime * 1000.f);
+
+		if (GEngine != nullptr && GEngine->GameViewport != nullptr)
+		{
+			if (const FStatUnitData* Unit = GEngine->GameViewport->GetStatUnitData())
+			{
+				Arm.GameMsSum += Unit->RawGameThreadTime;
+				Arm.RenderMsSum += Unit->RawRenderThreadTime;
+				Arm.GpuMsSum += Unit->RawGPUFrameTime[0];
+			}
+		}
+
+		// This component's own game-thread cost, independent of whether `stat unit` is on. It is the
+		// one slice of the frame this file is responsible for, so it is the one the report can be held
+		// to; everything else in the table is context.
+		Arm.TrailMsSum += GTrailVisualMillisecondsThisFrame;
+		GTrailVisualMillisecondsThisFrame = 0.0;
+
+		int32 StaticVisible = 0;
+		int32 SkinnedVisible = 0;
+		int32 Carriers = 0;
+		int32 CharacterTotal = 0;
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			const ATraceCharacter* TraceChar = *It;
+			if (TraceChar == nullptr)
+			{
+				continue;
+			}
+			++CharacterTotal;
+
+			const UTraceTrailComponent* Trail = TraceChar->Trail;
+			if (Trail == nullptr)
+			{
+				continue;
+			}
+			if (Trail->TrailPoints.Items.Num() > 0)
+			{
+				++Carriers;
+			}
+
+			int32 PieceStatic = 0;
+			int32 PieceSkinned = 0;
+			Trail->CountDrawnPieces(PieceStatic, PieceSkinned);
+			StaticVisible += PieceStatic;
+			SkinnedVisible += PieceSkinned;
+		}
+
+		Arm.StaticPieces += StaticVisible;
+		Arm.SkinnedPieces += SkinnedVisible;
+		Arm.Carriers += Carriers;
+		++Arm.Frames;
+
+		State.CharacterCount = CharacterTotal;
+		if (State.PrimitiveCount == 0)
+		{
+			int32 Primitives = 0;
+			for (TObjectIterator<UPrimitiveComponent> It; It; ++It)
+			{
+				if (It->GetWorld() == World && It->IsRegistered())
+				{
+					++Primitives;
+				}
+			}
+			State.PrimitiveCount = Primitives;
+		}
+
+		if (State.PhaseElapsed < State.SampleSeconds)
+		{
+			return true;
+		}
+
+		// ---- arm complete -------------------------------------------------------------------------
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TRAILPERF] arm '%s' done: %d frames, mean %.2f ms (%.1f fps), mean drawn pieces %.1f static "
+			     "+ %.1f skinned across %.1f live traces."),
+			*Arm.Name, Arm.Frames, TrailPerfMean(Arm.FrameMs),
+			(TrailPerfMean(Arm.FrameMs) > 0.f) ? (1000.f / TrailPerfMean(Arm.FrameMs)) : 0.f,
+			Arm.StaticPieces / FMath::Max(1, Arm.Frames), Arm.SkinnedPieces / FMath::Max(1, Arm.Frames),
+			Arm.Carriers / FMath::Max(1, Arm.Frames));
+
+		++State.ArmIndex;
+		if (State.ArmIndex >= State.Arms.Num())
+		{
+			State.ArmIndex = 0;
+			++State.CycleIndex;
+
+			if (State.CycleIndex >= State.CyclesTotal)
+			{
+				GTrailRenderer = State.RestoreRenderer;
+				TrailPerfReport(State);
+				return false;
+			}
+		}
+
+		TrailPerfBeginArm(State);
+		return true;
+	}
+
+	FAutoConsoleCommand CmdTrailPerfAB(
+		TEXT("Trace.Trail.PerfAB"),
+		TEXT("Trace.Trail.PerfAB [SampleSeconds] [WarmupSeconds] [Cycles] - interleave the trace "
+		     "renderer through legacy (posed Mannequins + smear), ribbon and off, Cycles times each, "
+		     "sampling frame / game / render / GPU milliseconds, and print the comparison (spec v6 1)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FTrailPerfState State;
+			State.SampleSeconds = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 2.f, 120.f) : 15.f;
+			State.WarmupSeconds = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 0.5f, 30.f) : 3.f;
+			State.CyclesTotal = (Args.Num() > 2) ? FMath::Clamp(FCString::Atoi(*Args[2]), 1, 20) : 3;
+			State.RestoreRenderer = GTrailRenderer;
+
+			// LEGACY FIRST, deliberately. It is the arm that allocates twenty poseable mesh components
+			// per carrier, and running it first means the later arms are not measured against a heap
+			// that is still warming up.
+			FTrailPerfArm Legacy;
+			Legacy.Renderer = 0;
+			Legacy.Name = TEXT("legacy");
+			FTrailPerfArm Ribbon;
+			Ribbon.Renderer = 1;
+			Ribbon.Name = TEXT("ribbon");
+			FTrailPerfArm Off;
+			Off.Renderer = 2;
+			Off.Name = TEXT("off");
+
+			State.Arms.Add(MoveTemp(Legacy));
+			State.Arms.Add(MoveTemp(Ribbon));
+			State.Arms.Add(MoveTemp(Off));
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TRAILPERF] starting: %d interleaved cycles x 3 arms x (%.1fs warmup + %.1fs sample) "
+				     "= %.0fs total."),
+				State.CyclesTotal, State.WarmupSeconds, State.SampleSeconds,
+				State.CyclesTotal * 3.f * (State.WarmupSeconds + State.SampleSeconds));
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickTrailPerf(State, DeltaTime);
+				}), 0.f);
+		}));
+
 	FAutoConsoleCommand CmdTestHeadGap(
 		TEXT("Trace.Trail.TestHeadGap"),
 		TEXT("Trace.Trail.TestHeadGap [Runs] - dash an enemy through the NEWEST DRAWN segment of a live "
@@ -3706,6 +4895,49 @@ void UTraceTrailComponent::DestroyVisualPool()
 	PoseGhostAppliedGlowScale.Reset();
 	GhostRecords.Reset();
 
+	RibbonSamples.Reset();
+	RibbonSampleBirth.Reset();
+	RibbonSourcePoints.Reset();
+	RibbonSourceBirths.Reset();
+
 	LastVisualPointCount = -1;
 	bColorApplied = false;
+}
+
+// =================================================================================================
+// MEASUREMENT (spec v6 §1)
+// =================================================================================================
+
+void UTraceTrailComponent::CountDrawnPieces(int32& OutStaticVisible, int32& OutSkinnedVisible) const
+{
+	OutStaticVisible = 0;
+	OutSkinnedVisible = 0;
+
+	for (const UStaticMeshComponent* Piece : SmearMeshes)
+	{
+		if (Piece != nullptr && Piece->IsVisible())
+		{
+			++OutStaticVisible;
+		}
+	}
+	for (const UStaticMeshComponent* Piece : PredictedSmearMeshes)
+	{
+		if (Piece != nullptr && Piece->IsVisible())
+		{
+			++OutStaticVisible;
+		}
+	}
+	for (const UPoseableMeshComponent* Ghost : PoseGhosts)
+	{
+		if (Ghost != nullptr && Ghost->IsVisible())
+		{
+			++OutSkinnedVisible;
+		}
+	}
+}
+
+void UTraceTrailComponent::CountPooledPieces(int32& OutStaticTotal, int32& OutSkinnedTotal) const
+{
+	OutStaticTotal = SmearMeshes.Num() + PredictedSmearMeshes.Num();
+	OutSkinnedTotal = PoseGhosts.Num();
 }

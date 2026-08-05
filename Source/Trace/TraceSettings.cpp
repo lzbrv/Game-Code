@@ -601,7 +601,7 @@ namespace
 		// and is pinned in DefaultGame.ini under [/Script/Trace.TraceGameMode].
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[SettingsDump:%s] SPECv4 respawn=%.2f turnoverGrace=%.2f walkSpeed=%.1f | "
-			     "mercyLead=%d scoringMode=%s goalWidthFrac=%.3f goalHeight=%.0f"),
+			     "mercyLead=%d scoringMode=%s goalWidthFrac=%.3f goalRampH=%.0f"),
 			Tag, Table.RespawnDelay, Table.CoreTurnoverGraceSeconds, Table.WalkSpeed,
 			Table.MercyRuleLead,
 			(Table.ScoringMode == ETraceScoringMode::ThrownCoreAndGoals) ? TEXT("B-ThrownCoreAndGoals") : TEXT("A-EndzoneStatusCore"),
@@ -658,7 +658,7 @@ namespace
 		// multiplies them, because the number a designer types is not the number the Core flies at —
 		// ATraceCore derives gravity x M, speed / sqrt(M), bias x M^1.5, bounce / M from these.
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[SettingsDump:%s] SPECv5 modeB: goalWidthFrac=%.4f (=%.0fuu on a 9600uu field) goalHeight=%.0f | "
+			TEXT("[SettingsDump:%s] SPECv5 modeB: goalWidthFrac=%.4f (=%.0fuu ring diameter on a 9600uu field) goalRampH=%.0f | "
 			     "weight M=%.2f applied to base throw=%.0f grav=%.2f bias=%.2f -> effective throw=%.0f grav=%.2f"),
 			Tag, Table.GoalWidthFieldFraction, Table.GoalWidthFieldFraction * 9600.f, Table.GoalHeightUU,
 			Table.CoreMassScale, Table.CoreThrowSpeed, Table.CoreThrowGravityScale, Table.CoreThrowUpBias,
@@ -805,7 +805,15 @@ namespace
 
 			// --- spec v5 §4, mode B geometry and weight ----------------------------------------
 			{ TEXT("GoalWidthFieldFraction"),          EKnobType::Float, TEXT("2000uu goal mouth") },
-			{ TEXT("GoalHeightUU"),                    EKnobType::Float, TEXT("440uu goal height") },
+			{ TEXT("GoalHeightUU"),                    EKnobType::Float, TEXT("goal APPROACH RAMP height since v6 4.3") },
+
+			// --- spec v6 §4.1, the mode-B catch zone  [ALL THREE BOUND BY NAME by ATraceCore] ---
+			{ TEXT("CoreCatchRadius"),                 EKnobType::Float, TEXT("catch magnet radius [by-name bind]") },
+			{ TEXT("CoreCatchCurveStrength"),          EKnobType::Float, TEXT("catch magnet strength [by-name bind]") },
+			{ TEXT("CoreCatchThrowerLockoutSeconds"),  EKnobType::Float, TEXT("thrower excluded from own zone [by-name bind]") },
+
+			// --- spec v6 §3, the parry punish --------------------------------------------------
+			{ TEXT("bParryKillsDasher"),               EKnobType::Bool,  TEXT("parry kills the dasher") },
 			{ TEXT("CoreMassScale"),                   EKnobType::Float, TEXT("THE weight knob [by-name bind]") },
 			{ TEXT("CoreThrowSpeed"),                  EKnobType::Float, TEXT("base, before weight [by-name bind]") },
 			{ TEXT("CoreThrowGravityScale"),           EKnobType::Float, TEXT("base, before weight [by-name bind]") },

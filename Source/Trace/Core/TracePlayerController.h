@@ -104,6 +104,30 @@ public:
 	UFUNCTION(Client, Reliable)
 	void ClientNotifyKilledBy(const FString& KillerName, FName Cause);
 
+	/**
+	 * KILLER-side notification for spec v6 §3: your parry killed the enemy who dashed your trace.
+	 *
+	 * The dasher already learns why they died through ClientNotifyKilledBy above — the kill carries
+	 * cause "Parried" and the carrier as the killer. This is the other half, and it needs its own
+	 * message because the carrier's screen shows them nothing at all otherwise: the enemy simply
+	 * stops existing somewhere behind them, which is the one outcome a 0.1 s reaction check must
+	 * never produce silently.
+	 *
+	 * Reliable for the same reason ClientNotifyHit is: a dropped confirmation of a hit reads as a
+	 * miss, and a parry the carrier cannot confirm reads as a parry that did not register.
+	 *
+	 * A listen-server host needs none of this — TraceParry keeps the authoritative record and
+	 * ATraceHUD reads it directly — but a remote client has no access to that record at all.
+	 */
+	UFUNCTION(Client, Reliable)
+	void ClientNotifyParryKill(const FString& VictimName);
+
+	/** Client-local time of our last parry kill, or a large negative sentinel. See the RPC above. */
+	float GetLastParryKillTime() const { return LastParryKillTime; }
+
+	/** Who our last parry killed; empty until the server tells us. */
+	const FString& GetLastParryKillVictim() const { return LastParryKillVictim; }
+
 	/** Asks the server to put us back in the game. See the implementation for the exact rules. */
 	UFUNCTION(Server, Reliable)
 	void ServerRequestRespawn();
@@ -404,6 +428,10 @@ private:
 
 	FString LastKillerName;
 	FName LastDeathCause = NAME_None;
+
+	/** Spec v6 §3, remote-carrier feedback. Written only by ClientNotifyParryKill. */
+	float LastParryKillTime = NeverHitSentinel;
+	FString LastParryKillVictim;
 
 	/** True while the pause/settings overlay owns the screen. See SetGameInputSuppressed. */
 	bool bGameInputSuppressed = false;

@@ -7,9 +7,15 @@
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"           // FAutoConsoleVariableRef, FAutoConsoleCommand
 
+#include "GameFramework/Controller.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerState.h"
+
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
+#include "Core/TracePlayerController.h"                // ClientNotifyParryKill (v6 3, carrier side)
 #include "Gameplay/TraceCore.h"
+#include "Gameplay/TraceHealthComponent.h"             // v6 3 — the punish kills the dasher
 #include "Gameplay/TraceTrailComponent.h"
 #include "Movement/TraceCharacterMovementComponent.h"   // StartDash() (verification harness only)
 #include "Trace.h"
@@ -41,6 +47,87 @@ namespace
 	/** Debug only. See the header. */
 	int32 GParryForceWindow = 0;
 	int32 GParryBotAuto = 0;
+
+	// ---------------------------------------------------------------------------------------------
+	// v6 3 — the punish, and the carrier-side feedback record.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * 1 = a parry that intercepts a lethal dash kills the dasher (spec v6 3, the shipping rule).
+	 * 0 = the pre-v6 behaviour, parry protects and nothing else.
+	 *
+	 * A live switch and not a constant because it is the single biggest change to how the parry
+	 * feels, and the user's standing instruction is that anything they might want to feel out in a
+	 * playtest is a knob rather than a number an agent chose.
+	 *
+	 * INTEGRATED: the shipping value now lives in UTraceSettings::bParryKillsDasher next to
+	 * ParryDuration, so it is on the settings panel and in DefaultGame.ini like every other tunable.
+	 * This is the OVERRIDE, and it follows the same sentinel convention as GParryDurationOverride
+	 * above: -1 (default) = "use UTraceSettings", 0/1 = force. Cheat-flagged so it cannot be flipped
+	 * in a real match.
+	 */
+	int32 GParryKillsDasherOverride = -1;
+
+	/** The one answer, resolved the way every other parry tunable in this file is resolved. */
+	bool ParryKillsDasherEnabled()
+	{
+		if (GParryKillsDasherOverride >= 0)
+		{
+			return GParryKillsDasherOverride != 0;
+		}
+		return UTraceSettings::Get().bParryKillsDasher;
+	}
+
+	/** Seconds a parry kill stays on the carrier's HUD. See GetParryKillFeedbackSeconds(). */
+	float GParryKillFeedbackSeconds = 2.5f;
+
+	FAutoConsoleVariableRef CVarParryKillsDasher(
+		TEXT("Trace.Parry.KillsDasher"),
+		GParryKillsDasherOverride,
+		TEXT("OVERRIDE for whether a parry that intercepts a LETHAL dash kills the dasher (spec v6 3). "
+		     "Negative (default) = use UTraceSettings::bParryKillsDasher. 1 = force on, "
+		     "0 = force off (pre-v6, the parry only protects the trace)."),
+		ECVF_Cheat);
+
+	FAutoConsoleVariableRef CVarParryKillFeedbackSeconds(
+		TEXT("Trace.Parry.KillFeedbackSeconds"),
+		GParryKillFeedbackSeconds,
+		TEXT("How long a parry kill stays worth drawing on the parrying carrier's HUD."),
+		ECVF_Default);
+
+	/** One parry kill, kept only long enough for the HUD to draw it. */
+	struct FParryKillRecord
+	{
+		TWeakObjectPtr<const AActor> Parrier;
+		FString VictimName;
+		double WorldTime = 0.0;
+	};
+
+	/**
+	 * The recent parry kills, newest last. Bounded by the ten pawns in a match and swept on every
+	 * write, so it cannot grow: a record older than the feedback window is dead weight by definition.
+	 */
+	TArray<FParryKillRecord> GParryKills;
+
+	/** Every parry kill this process has awarded. Verification only — never read by a game rule. */
+	int32 GParryKillCount = 0;
+
+	/** PlayerState name if there is one, else the actor name. Bots have both; a fresh pawn may not. */
+	FString ParryDisplayName(const AActor* Actor)
+	{
+		if (const APawn* AsPawn = Cast<const APawn>(Actor))
+		{
+			if (const APlayerState* State = AsPawn->GetPlayerState())
+			{
+				const FString PlayerName = State->GetPlayerName();
+				if (!PlayerName.IsEmpty())
+				{
+					return PlayerName;
+				}
+			}
+		}
+		return GetNameSafe(Actor);
+	}
 
 	FAutoConsoleVariableRef CVarParryDuration(
 		TEXT("Trace.Parry.Duration"),
@@ -176,6 +263,195 @@ namespace TraceParry
 		return Trail != nullptr && Trail->IsParryActive();
 	}
 
+	// ---------------------------------------------------------------------------------------------
+	// v6 3 — THE PUNISH. See the long comment on the declaration; this is deliberately one
+	// straight-line function with no branches other than the rules themselves.
+	// ---------------------------------------------------------------------------------------------
+
+	FName GetParryKillCause()
+	{
+		// Constructed once. Matches the existing cause vocabulary ("Bullet" / "Trail" / "Fell"), which
+		// ATraceHUD::DrawDeathPanel prints verbatim as "by <killer>  (<cause>)".
+		static const FName ParryKillCause(TEXT("Parried"));
+		return ParryKillCause;
+	}
+
+	float GetParryKillFeedbackSeconds()
+	{
+		return FMath::Clamp(GParryKillFeedbackSeconds, 0.f, 10.f);
+	}
+
+	int32 GetParryKillCount()
+	{
+		return GParryKillCount;
+	}
+
+	void RecordParryKill(const AActor* Carrier, const AActor* Victim)
+	{
+		if (Carrier == nullptr)
+		{
+			return;
+		}
+
+		const UWorld* World = Carrier->GetWorld();
+		const double Now = (World != nullptr) ? World->GetTimeSeconds() : 0.0;
+
+		// Sweep first: anything stale or whose parrier has been destroyed is gone. This is what keeps
+		// the array at "kills in the last couple of seconds" rather than "kills this match".
+		const double Window = static_cast<double>(GetParryKillFeedbackSeconds());
+		GParryKills.RemoveAll([Now, Window](const FParryKillRecord& Record)
+		{
+			return !Record.Parrier.IsValid() || (Now - Record.WorldTime) > Window;
+		});
+
+		// One record per parrier: the newest kill is the one worth drawing, and two banners fighting
+		// over the same slot is worse feedback than one.
+		GParryKills.RemoveAll([Carrier](const FParryKillRecord& Record)
+		{
+			return Record.Parrier.Get() == Carrier;
+		});
+
+		FParryKillRecord& Record = GParryKills.AddDefaulted_GetRef();
+		Record.Parrier = Carrier;
+		Record.VictimName = ParryDisplayName(Victim);
+		Record.WorldTime = Now;
+	}
+
+	bool GetParryKillFeedback(const AActor* Parrier, float& OutSecondsAgo, FString& OutVictimName)
+	{
+		OutSecondsAgo = 0.f;
+		OutVictimName.Reset();
+
+		if (Parrier == nullptr)
+		{
+			return false;
+		}
+
+		const UWorld* World = Parrier->GetWorld();
+		const double Now = (World != nullptr) ? World->GetTimeSeconds() : 0.0;
+
+		for (const FParryKillRecord& Record : GParryKills)
+		{
+			if (Record.Parrier.Get() != Parrier)
+			{
+				continue;
+			}
+
+			const double Age = Now - Record.WorldTime;
+			if (Age < 0.0 || Age > static_cast<double>(GetParryKillFeedbackSeconds()))
+			{
+				return false;
+			}
+
+			OutSecondsAgo = static_cast<float>(Age);
+			OutVictimName = Record.VictimName;
+			return true;
+		}
+
+		return false;
+	}
+
+	bool ServerPunishParriedDash(ATraceCharacter* Carrier, ATraceCharacter* Dasher)
+	{
+		// --- the rule is off ----------------------------------------------------------------------
+		if (!ParryKillsDasherEnabled())
+		{
+			return false;
+		}
+
+		// --- the two pawns ------------------------------------------------------------------------
+		if (Carrier == nullptr || Dasher == nullptr || Carrier == Dasher)
+		{
+			return false;
+		}
+
+		// --- SERVER-AUTHORITATIVE (spec v6 3). A client reaching here decides nothing. --------------
+		//
+		// Asked of the CARRIER because the carrier owns the trace and the window; the dasher may be a
+		// remote pawn whose authority answer is about a different connection.
+		if (!Carrier->HasAuthority())
+		{
+			return false;
+		}
+
+		if (!Carrier->IsAlive() || !Dasher->IsAlive())
+		{
+			return false;
+		}
+
+		// --- the window, from the REPLICATED fact, never a local prediction ------------------------
+		//
+		// Re-checked rather than trusted from the caller. The caller has it right today, but "the
+		// dasher dies" and "the carrier lives" must be two consequences of ONE evaluation of one
+		// fact — the failure mode where they disagree is a dead dasher AND a dead carrier, which
+		// would read as the mechanic being broken in both directions at once.
+		if (!IsParryActiveFor(Carrier))
+		{
+			return false;
+		}
+
+		// --- "only a dash that WOULD have killed the carrier is punished" (v6 3 [ASSUMPTION]) -------
+		//
+		// The geometry half of that sentence is guaranteed by the call site (see the header). This is
+		// the other half: under the KillsToucher tuning rule a dash does not kill the carrier at all,
+		// so there is no lethal dash to punish and the parry goes back to being purely protective.
+		const ETrailLethality Lethality = UTraceSettings::Get().TrailLethality;
+		if (Lethality != ETrailLethality::KillsCarrier && Lethality != ETrailLethality::KillsBoth)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[PARRYKILL] %s parried %s's dash, but TrailLethality=%d means the dash was never "
+				     "lethal to the carrier - nothing to punish (v6 3 [ASSUMPTION])."),
+				*GetNameSafe(Carrier), *GetNameSafe(Dasher), static_cast<int32>(Lethality));
+			return false;
+		}
+
+		UTraceHealthComponent* DasherHealth = Dasher->Health;
+		if (DasherHealth == nullptr)
+		{
+			return false;
+		}
+
+		// Resolved BEFORE the kill: UTraceHealthComponent::Kill() broadcasts synchronously and the
+		// death path can unpossess, after which GetController() is null and the carrier silently
+		// loses the credit. This is the same ordering ApplyTrailTrip() uses, for the same reason.
+		AController* CarrierController = Carrier->GetController();
+
+		// ATTRIBUTION. Killer = the carrier's controller, so ATraceGameMode::NotifyCharacterDied
+		// credits the carrier with the kill on the scoreboard and sends the dasher
+		// ClientNotifyKilledBy(<carrier>, "Parried") — which is the sentence the dasher reads on
+		// their own death panel. Cause is its own tag and NOT "Trail": the two are opposite outcomes
+		// of the same collision and must never be confused in a log or a feed.
+		//
+		// Kill() and not ApplyDamage() because the dasher may be shielded for reasons of their own
+		// (they could be a carrier too, in a two-Core future) and because a parry is not chip damage:
+		// spec v6 3 says "that enemy dies instead".
+		// Display, not Log: this is the one line that explains a death to two different players, and
+		// a mechanic has twice been declared dead in this project because its evidence sat at a
+		// verbosity nobody was capturing. It fires once per parry kill, so it cannot spam.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[PARRYKILL] %s PARRIED %s's dash and killed them (v6 3). window=%.3fs left, cause=%s, "
+			     "killer=%s. The dash WOULD have killed the carrier; it killed the dasher instead."),
+			*GetNameSafe(Carrier), *GetNameSafe(Dasher),
+			GetWindowRemainingFor(Carrier), *GetParryKillCause().ToString(),
+			*GetNameSafe(CarrierController));
+
+		++GParryKillCount;
+		RecordParryKill(Carrier, Dasher);
+
+		// v6 §3 FEEDBACK, CARRIER SIDE. The RECORD above already drives the banner on a listen
+		// server, which is where the host — the only human in a bot playtest — actually plays. This
+		// RPC is what carries it to a REMOTE client's screen, which has no access to that record.
+		// Sent before the kill for the same reason CarrierController was resolved before it: the
+		// death path below can unpossess, and an RPC through a null controller goes nowhere.
+		if (ATracePlayerController* CarrierPC = Cast<ATracePlayerController>(CarrierController))
+		{
+			CarrierPC->ClientNotifyParryKill(ParryDisplayName(Dasher));
+		}
+
+		DasherHealth->Kill(CarrierController, GetParryKillCause());
+		return true;
+	}
+
 	float GetWindowRemainingFor(const AActor* Actor)
 	{
 		const UTraceTrailComponent* Trail = FindTrail(Actor);
@@ -289,9 +565,19 @@ namespace
 	// Trace.TestParry — THE DETERMINISTIC PROOF.
 	//
 	// The claim under test is a conditional ("parrying as they dash protects the trace"), so a single
-	// outcome proves nothing: the harness has to show BOTH branches, from the same code path, with
-	// nothing else changed between them. So it alternates — odd runs parry, even runs do not — and
-	// reports the carrier's fate for each.
+	// outcome proves nothing: the harness has to show every branch, from the same code path, with
+	// nothing else changed between them. Spec v6 §3 added a third branch and a second victim, so the
+	// harness now CYCLES THROUGH THREE CASES and reports the fate of BOTH pawns in each:
+	//
+	//   case A  parry + dash    -> the dasher dies, the carrier lives      (the v6 §3 punish)
+	//   case B  dash, no parry  -> the carrier dies, the dasher lives      (the unchanged old rule)
+	//   case C  parry, no dash  -> nobody dies                             (v6 §3 [ASSUMPTION])
+	//
+	// Case C is not padding. The [ASSUMPTION] the punish is built on is *"a parry thrown at nothing
+	// kills nobody"*, and a harness that only ever parries into an incoming dash cannot tell a
+	// correctly-gated punish apart from one that kills the nearest enemy on every parry press. So C
+	// presses the parry, moves nobody, and asserts that both pawns are alive AND that the global
+	// parry-kill counter did not move.
 	//
 	// The dash is two teleports on consecutive frames rather than a bot running at the trace, for the
 	// same reason ATraceGameMode's -TraceTripTest does it that way: what the trip test actually
@@ -303,6 +589,31 @@ namespace
 	// then dashes through the ex-carrier's residual trace. This one leaves the carrier CARRYING,
 	// because the parry is carrier-only — a residual trace has nobody left who is allowed to parry it.
 	// ---------------------------------------------------------------------------------------------
+
+	/** Which of the three cases above a run is exercising. RunIndex % 3, so a session cycles. */
+	enum class EParryTestCase : uint8
+	{
+		ParriedDash = 0,     // A
+		UnparriedDash = 1,   // B
+		ParryNoDash = 2,     // C
+	};
+
+	/**
+	 * Deliberately NOT another LexToString overload. This one would live in the anonymous namespace
+	 * and would therefore HIDE the global LexToString(ETraceParryRefusal) for every call in this
+	 * block — which today still compiles only because argument-dependent lookup rescues it. A
+	 * distinct name costs nothing and removes the trap.
+	 */
+	const TCHAR* ParryTestCaseName(EParryTestCase Case)
+	{
+		switch (Case)
+		{
+		case EParryTestCase::ParriedDash:   return TEXT("A parry+dash");
+		case EParryTestCase::UnparriedDash: return TEXT("B dash,no parry");
+		case EParryTestCase::ParryNoDash:   return TEXT("C parry,no dash");
+		default:                            return TEXT("?");
+		}
+	}
 
 	/** One in-flight Trace.TestParry session. Captured by value into the ticker, mutated in place. */
 	struct FParryTestState
@@ -338,14 +649,32 @@ namespace
 		 */
 		FVector TripperHome = FVector::ZeroVector;
 
+		EParryTestCase Case = EParryTestCase::ParriedDash;
 		bool bParryThisRun = false;
+		bool bDashThisRun = true;
 		bool bParryWasActiveAtSweep = false;
+
+		/** GetParryKillCount() sampled at the start of the run, so case C can assert "+0". */
+		int32 ParryKillsAtRunStart = 0;
 
 		/** Attempts scratched for this run index (dash refused, no tripper). Bounded, then aborted. */
 		int32 ScratchCount = 0;
 
-		int32 ProtectedCount = 0;
-		int32 KilledCount = 0;
+		// --- tallies, reported at the end -----------------------------------------------------
+		int32 CaseARuns = 0;   // parry + dash
+		int32 CaseBRuns = 0;   // dash, no parry
+		int32 CaseCRuns = 0;   // parry, no dash
+
+		/** Outcomes, counted across all cases. These three are mutually exclusive per run. */
+		int32 DasherDiedCount = 0;
+		int32 CarrierDiedCount = 0;
+		int32 NobodyDiedCount = 0;
+
+		/** Both dying at once would mean the punish and the protection disagreed. Must stay 0. */
+		int32 BothDiedCount = 0;
+
+		int32 PassCount = 0;
+		int32 FailCount = 0;
 		int32 AbortedCount = 0;
 	};
 
@@ -361,8 +690,14 @@ namespace
 		if (State.RunIndex >= State.TotalRuns)
 		{
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[PARRYTEST] DONE. %d runs: %d protected by a parry, %d killed with no parry, %d aborted."),
-				State.TotalRuns, State.ProtectedCount, State.KilledCount, State.AbortedCount);
+				TEXT("[PARRYTEST] DONE. %d runs (A parry+dash=%d, B dash-no-parry=%d, C parry-no-dash=%d, aborted=%d)"),
+				State.TotalRuns, State.CaseARuns, State.CaseBRuns, State.CaseCRuns, State.AbortedCount);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[PARRYTEST] OUTCOMES: dasher died=%d, carrier died=%d, nobody died=%d, BOTH died=%d (must be 0)."),
+				State.DasherDiedCount, State.CarrierDiedCount, State.NobodyDiedCount, State.BothDiedCount);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[PARRYTEST] VERDICT: %d PASS, %d FAIL. Total parry kills awarded this process: %d."),
+				State.PassCount, State.FailCount, TraceParry::GetParryKillCount());
 			return false;
 		}
 
@@ -425,7 +760,13 @@ namespace
 
 			State.WaitFrames = 0;
 			State.Carrier = Carrier;
-			State.bParryThisRun = ((State.RunIndex % 2) == 0);
+
+			// THE THREE-CASE CYCLE. Derived from RunIndex so a session of 6 runs is two full cycles
+			// and every case is exercised the same number of times.
+			State.Case = static_cast<EParryTestCase>(State.RunIndex % 3);
+			State.bParryThisRun = (State.Case != EParryTestCase::UnparriedDash);
+			State.bDashThisRun = (State.Case != EParryTestCase::ParryNoDash);
+			State.ParryKillsAtRunStart = TraceParry::GetParryKillCount();
 			State.Phase = 1;
 			return true;
 		}
@@ -518,19 +859,47 @@ namespace
 			State.Tripper = Tripper;
 			State.TripperHome = Tripper->GetActorLocation();
 
-			Tripper->SetActorLocation(DashStart, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
-			Tripper->SetActorRotation((-Across).Rotation());
-			if (UTraceCharacterMovementComponent* TripperMovement = Tripper->GetTraceMovement())
+			// CASE C moves nobody and starts no dash. The enemy is recorded anyway — as the WITNESS,
+			// not the dasher — because "nobody dies" has to be asserted about a specific, named,
+			// still-standing enemy for the result to mean anything.
+			if (State.bDashThisRun)
 			{
-				TripperMovement->StartDash();
+				Tripper->SetActorLocation(DashStart, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+				Tripper->SetActorRotation((-Across).Rotation());
+				if (UTraceCharacterMovementComponent* TripperMovement = Tripper->GetTraceMovement())
+				{
+					TripperMovement->StartDash();
+				}
 			}
 
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[PARRYTEST %d/%d] carrier=%s parryRequested=%d granted=%d (%s) window=%.3fs cooldown=%.2fs | %s will dash across segment %d/%d at %s"),
-				State.RunIndex + 1, State.TotalRuns, *GetNameSafe(Carrier),
+				TEXT("[PARRYTEST %d/%d] case=%s carrier=%s parryRequested=%d granted=%d (%s) window=%.3fs cooldown=%.2fs "
+				     "| %s %s segment %d/%d at %s"),
+				State.RunIndex + 1, State.TotalRuns, ParryTestCaseName(State.Case), *GetNameSafe(Carrier),
 				State.bParryThisRun ? 1 : 0, bParryGranted ? 1 : 0, LexToString(Refusal),
 				TraceParry::GetWindowRemainingFor(Carrier), TraceParry::GetCooldownRemainingFor(Carrier),
-				*GetNameSafe(Tripper), SegmentIndex, LastLethal, *Midpoint.ToCompactString());
+				*GetNameSafe(Tripper),
+				State.bDashThisRun ? TEXT("will dash across") : TEXT("stays home, witness to"),
+				SegmentIndex, LastLethal, *Midpoint.ToCompactString());
+
+			// A case-C run whose parry was REFUSED tests nothing at all — the assertion "a parry that
+			// hits nothing kills nobody" needs a parry. Scratch and retry at the same run index.
+			if (State.Case == EParryTestCase::ParryNoDash && !bParryGranted)
+			{
+				if (++State.ScratchCount > 20)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[PARRYTEST %d] aborted: parry never granted for the no-dash case (%s)."),
+						State.RunIndex + 1, LexToString(Refusal));
+					++State.AbortedCount;
+					++State.RunIndex;
+					State.ScratchCount = 0;
+				}
+				State.Phase = 0;
+				State.Carrier = nullptr;
+				State.Tripper = nullptr;
+				return true;
+			}
 
 			State.Phase = 2;
 			return true;
@@ -543,6 +912,24 @@ namespace
 			if (Tripper == nullptr)
 			{
 				State.Phase = 0;
+				return true;
+			}
+
+			// CASE C: no sweep to resolve. Record that the window really was open with nothing dashing
+			// into it — which is the exact situation the [ASSUMPTION] is about — and fall through to
+			// the same settle-and-score tail as the other two cases.
+			if (!State.bDashThisRun)
+			{
+				State.bParryWasActiveAtSweep = TraceParry::IsParryActiveFor(Carrier);
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[PARRYTEST %d/%d] no dash this run: parryActive=%d (%.3fs left) traceInvuln=%d, %s untouched at %s"),
+					State.RunIndex + 1, State.TotalRuns,
+					State.bParryWasActiveAtSweep ? 1 : 0, TraceParry::GetWindowRemainingFor(Carrier),
+					Carrier->Trail->IsTraceInvulnerable() ? 1 : 0,
+					*GetNameSafe(Tripper), *Tripper->GetActorLocation().ToCompactString());
+
+				State.Phase = 3;
 				return true;
 			}
 
@@ -606,9 +993,17 @@ namespace
 		// trace") instead of the different question "does a parry survive a camper".
 		if (State.Phase == 3)
 		{
-			if (ATraceCharacter* Tripper = State.Tripper.Get())
+			// Nothing to undo in case C, and a parry-killed dasher is a corpse the death path is
+			// already hiding — moving either one would only add noise.
+			if (State.bDashThisRun)
 			{
-				Tripper->SetActorLocation(State.TripperHome, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+				if (ATraceCharacter* Tripper = State.Tripper.Get())
+				{
+					if (Tripper->IsAlive())
+					{
+						Tripper->SetActorLocation(State.TripperHome, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+					}
+				}
 			}
 			State.Phase = 4;
 			return true;
@@ -622,25 +1017,70 @@ namespace
 		}
 
 		{
-			// Carrier may legitimately be NULL here: an unparried dash kills them and the pawn is
-			// gone by the time we score. That is the expected negative result, not a crash.
+			// EITHER pawn may legitimately be NULL here: an unparried dash kills the carrier and a
+			// parried dash now kills the dasher, and the loser's pawn can be gone by the time we
+			// score. Both are expected results, not crashes.
+			ATraceCharacter* Dasher = State.Tripper.Get();
 			const bool bCarrierAlive = (Carrier != nullptr) && Carrier->IsAlive();
-			const bool bExpectedProtection = State.bParryWasActiveAtSweep;
-			const bool bPass = (bCarrierAlive == bExpectedProtection);
+			const bool bDasherAlive = (Dasher != nullptr) && Dasher->IsAlive();
+			const int32 KillsAwarded = TraceParry::GetParryKillCount() - State.ParryKillsAtRunStart;
 
-			if (bCarrierAlive)
+			// THE EXPECTATION IS DERIVED FROM WHAT WAS OBSERVED, NOT FROM WHAT WAS REQUESTED.
+			//
+			// bParryWasActiveAtSweep is the REPLICATED window read on the very frame the sweep
+			// resolved — the same fact ServerRunTripTest read. Scoring against the *request* instead
+			// would turn "the parry lapsed a frame early" into a spurious FAIL and, worse, would let a
+			// genuinely broken window pass whenever the request happened to be refused.
+			bool bExpectCarrierAlive = true;
+			bool bExpectDasherAlive = true;
+			if (State.bDashThisRun)
 			{
-				++State.ProtectedCount;
+				// A dash landed. Exactly one of the two dies, and which one is the whole of v6 §3.
+				bExpectCarrierAlive = State.bParryWasActiveAtSweep;
+				bExpectDasherAlive = !State.bParryWasActiveAtSweep;
+			}
+
+			const int32 ExpectedKills = (State.bDashThisRun && State.bParryWasActiveAtSweep) ? 1 : 0;
+			const bool bPass = (bCarrierAlive == bExpectCarrierAlive)
+				&& (bDasherAlive == bExpectDasherAlive)
+				&& (KillsAwarded == ExpectedKills);
+
+			switch (State.Case)
+			{
+			case EParryTestCase::ParriedDash:   ++State.CaseARuns; break;
+			case EParryTestCase::UnparriedDash: ++State.CaseBRuns; break;
+			case EParryTestCase::ParryNoDash:   ++State.CaseCRuns; break;
+			}
+
+			if (!bCarrierAlive && !bDasherAlive)
+			{
+				// The punish and the protection disagreed about one window. Called out separately
+				// because it is the one failure that would look "half correct" in the other tallies.
+				++State.BothDiedCount;
+			}
+			else if (!bDasherAlive)
+			{
+				++State.DasherDiedCount;
+			}
+			else if (!bCarrierAlive)
+			{
+				++State.CarrierDiedCount;
 			}
 			else
 			{
-				++State.KilledCount;
+				++State.NobodyDiedCount;
 			}
 
+			(bPass ? State.PassCount : State.FailCount)++;
+
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[PARRYTEST %d/%d] RESULT: parryActive=%d -> carrier %s. %s"),
-				State.RunIndex + 1, State.TotalRuns, State.bParryWasActiveAtSweep ? 1 : 0,
-				bCarrierAlive ? TEXT("SURVIVED (trace not broken)") : TEXT("DIED (trace broken)"),
+				TEXT("[PARRYTEST %d/%d] RESULT case=%s: parryActive=%d dashed=%d -> carrier %s (%s), dasher %s (%s), "
+				     "parryKills+%d (expected +%d). %s"),
+				State.RunIndex + 1, State.TotalRuns, ParryTestCaseName(State.Case),
+				State.bParryWasActiveAtSweep ? 1 : 0, State.bDashThisRun ? 1 : 0,
+				*GetNameSafe(Carrier), bCarrierAlive ? TEXT("ALIVE") : TEXT("DIED"),
+				*GetNameSafe(Dasher), bDasherAlive ? TEXT("ALIVE") : TEXT("DIED"),
+				KillsAwarded, ExpectedKills,
 				bPass ? TEXT("PASS") : TEXT("*** FAIL ***"));
 
 			++State.RunIndex;
@@ -660,9 +1100,10 @@ namespace
 		State.TotalRuns = FMath::Clamp(Runs, 1, 100);
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[PARRYTEST] starting %d runs, alternating parried / unparried dashes through a live carrier's trace. "
-			     "duration=%.2fs cooldown=%.2fs"),
-			State.TotalRuns, TraceParry::GetDurationSeconds(), TraceParry::GetCooldownSeconds());
+			TEXT("[PARRYTEST] starting %d runs, cycling A(parry+dash) / B(dash,no parry) / C(parry,no dash) "
+			     "through a live carrier's trace. duration=%.2fs cooldown=%.2fs killsDasher=%d"),
+			State.TotalRuns, TraceParry::GetDurationSeconds(), TraceParry::GetCooldownSeconds(),
+			ParryKillsDasherEnabled() ? 1 : 0);
 
 		FTSTicker::GetCoreTicker().AddTicker(
 			FTickerDelegate::CreateLambda([State](float /*DeltaTime*/) mutable -> bool
@@ -693,9 +1134,11 @@ namespace
 		GatherParryDebugCharacters(World, Characters);
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[DebugParry] duration=%.2fs cooldown=%.2fs glow=%.2f forceWindow=%d botAuto=%d"),
+			TEXT("[DebugParry] duration=%.2fs cooldown=%.2fs glow=%.2f forceWindow=%d botAuto=%d | v6 3: "
+			     "killsDasher=%d cause='%s' parryKillsAwarded=%d"),
 			TraceParry::GetDurationSeconds(), TraceParry::GetCooldownSeconds(), TraceParry::GetGlowScale(),
-			TraceParry::IsWindowForced() ? 1 : 0, TraceParry::IsBotAutoParryEnabled() ? 1 : 0);
+			TraceParry::IsWindowForced() ? 1 : 0, TraceParry::IsBotAutoParryEnabled() ? 1 : 0,
+			ParryKillsDasherEnabled() ? 1 : 0, *TraceParry::GetParryKillCause().ToString(), TraceParry::GetParryKillCount());
 
 		for (const ATraceCharacter* TraceChar : Characters)
 		{
@@ -705,18 +1148,27 @@ namespace
 				continue;
 			}
 
+			// v6 §3 feedback record: what this player's HUD banner would be showing right now. It is
+			// here because "the dasher must understand why they died" has a mirror obligation on the
+			// other side, and a claim about on-screen feedback needs something objective behind it.
+			float KillAge = 0.f;
+			FString KillVictim;
+			const FString ParryKillText = TraceParry::GetParryKillFeedback(TraceChar, KillAge, KillVictim)
+				? FString::Printf(TEXT(" | PARRY KILL: %s, %.2fs ago"), *KillVictim, KillAge)
+				: FString();
+
 			// tint= is the colour actually pushed to the after-image material instances, so this line
 			// is the objective answer to both "did it go red" and "did it come back".
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[DebugParry]   %-24s carrier=%d points=%d lethal=%d | parry=%d visual=%d (%.3fs left, cd %.2fs) "
-				     "passWindow=%d | traceInvulnerable=%d | tint=%s"),
+				     "passWindow=%d | traceInvulnerable=%d | tint=%s%s"),
 				*GetNameSafe(TraceChar), TraceChar->IsCarrier() ? 1 : 0,
 				Trail->TrailPoints.Items.Num(), Trail->ComputeLastLethalIndex() + 1,
 				Trail->IsParryActive() ? 1 : 0, Trail->IsParryVisuallyActive() ? 1 : 0,
 				Trail->GetParryWindowRemaining(), Trail->GetParryCooldownRemaining(),
 				Trail->IsPassWindowInvulnerable() ? 1 : 0,
 				Trail->IsTraceInvulnerable() ? 1 : 0,
-				*Trail->GetAppliedTraceColor().ToString());
+				*Trail->GetAppliedTraceColor().ToString(), *ParryKillText);
 		}
 	}
 
@@ -747,7 +1199,9 @@ namespace
 
 	FAutoConsoleCommand CmdTestParry(
 		TEXT("Trace.TestParry"),
-		TEXT("Trace.TestParry [Runs] - alternating parried/unparried dashes through a live carrier's trace."),
+		TEXT("Trace.TestParry [Runs] - cycles three cases through a live carrier's trace: A parry+dash "
+		     "(dasher dies, v6 3), B dash with no parry (carrier dies), C parry with nothing dashing "
+		     "(nobody dies). Runs defaults to 6 = two full cycles."),
 		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
 		{
 			const int32 Runs = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 6;
