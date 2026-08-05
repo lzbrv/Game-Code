@@ -204,6 +204,14 @@ def build_neon():
     # blocks. The editor auto-repairs this flag on first use ONLY when it is not running as a game,
     # and every run of this project is -game, so the repair never happens here.
     material.set_editor_property("used_with_skeletal_mesh", True)
+    # REQUIRED FOR THE SAME REASON, ONE VERTEX FACTORY OVER. Spec v7 section 8 rebuilt the arena on
+    # UInstancedStaticMeshComponent, and an ISM is its own vertex factory: without
+    # MATUSAGE_InstancedStaticMeshes the permutation is never compiled, the log says
+    # "Material ... missing usage flag InstancedStaticMeshes! Default Material will be used in game",
+    # and THE ENTIRE ARENA RENDERS AS GREY DEFAULT MATERIAL. Same silent-in-editor, fatal-in-game
+    # trap as the line above, and for the same reason the editor's auto-repair never fires: it is
+    # gated on not running as a game, and every run of this project is -game.
+    material.set_editor_property("used_with_instanced_static_meshes", True)
 
     colour = vector_param(material, "Color", unreal.LinearColor(0.0, 0.8, 1.0, 1.0), -560, -80)
     glow = scalar_param(material, "Glow", 6.0, -560, 140)
@@ -225,6 +233,13 @@ def build_surface():
     material.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_DEFAULT_LIT)
     material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
     material.set_editor_property("two_sided", False)
+    # REQUIRED. This is the material almost every arena block wears, and since spec v7 section 8 the
+    # arena is built from UInstancedStaticMeshComponents. An ISM is its own vertex factory, so
+    # without MATUSAGE_InstancedStaticMeshes the permutation is never compiled and the renderer
+    # substitutes the grey default for THE WHOLE ARENA - the log line to search for is
+    # "missing usage flag InstancedStaticMeshes". The editor's auto-repair is gated on not running
+    # as a game, and every run of this project is -game, so it never happens here.
+    material.set_editor_property("used_with_instanced_static_meshes", True)
 
     base_colour = vector_param(material, "BaseColor", unreal.LinearColor(0.01, 0.012, 0.016, 1.0), -560, -320)
     link_property(base_colour, "", unreal.MaterialProperty.MP_BASE_COLOR)

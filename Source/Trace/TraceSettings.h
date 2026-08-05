@@ -1208,6 +1208,21 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Dash Exit Speed (multiple of max speed)", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
 	float DashExitSpeedMultiplier = 1.25f;
 
+	/**
+	 * Ceiling on the UPWARD velocity a dash hands back when it ends, as a multiple of JumpZVelocity.
+	 *
+	 * SPEC v7 §5 made the dash a true 3D ray, so a straight-up dash now exists — and the air-strafe
+	 * cap does NOT bound it, being planar by construction. Unclamped, a vertical dash was 540uu on
+	 * rails PLUS 3000uu/s of exit velocity, about 4592uu of coast, straight through the arena's
+	 * 1640uu ceiling. At 1.0 a dash may hand back at most one jump's worth of climb, making the
+	 * straight-up total ~749uu once, then a fall, with the next dash a full cooldown away.
+	 *
+	 * DOWNWARD exit velocity is deliberately untouched by this: a dive is not a climb.
+	 * Zero forbids a dash from adding any upward exit speed at all.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Dash Exit Vertical Speed (multiple of jump)", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0"))
+	float DashExitVerticalSpeedMultiplier = 1.0f;
+
 	// --- Slide (crouch on the ground) -------------------------------------------------------
 	//
 	// A slide SPENDS MOMENTUM YOU ALREADY HAVE: it starts from your current speed, boosts it once
@@ -2042,6 +2057,26 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Zone Thrower Lockout (s) [mode B]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
 	float CoreCatchThrowerLockoutSeconds = 0.5f;
 
+	/**
+	 * SPEC v7 §4. The angle from straight up, in degrees, at which a surface stops being something the
+	 * Core can come to rest ON and starts being a wall it must bounce OFF.
+	 *
+	 * Verbatim: "Sometimes the core gets stuck up top of an object in gamemode b. This should also
+	 * count as a turnover. Walls should not, the core should bounce off those."
+	 *
+	 * The arena is generic static meshes, so "is this a wall?" has to come from geometry, never from
+	 * actor type: a Core at rest is probed downward and the surface holding it up is classified by its
+	 * normal. Within this many degrees of straight up = a floor OR the top of any structure, and the
+	 * Core turns over to the nearest enemy exactly as the v6 ground rule did. Steeper = a wall: the
+	 * Core keeps its downward component, stays live, falls, and turns over wherever it finally lands.
+	 *
+	 * 45 is the v7 [ASSUMPTION]. Raising it toward 89 makes near-vertical faces count as resting
+	 * places; lowering it toward 0 demands an almost perfectly flat surface to turn a Core over.
+	 * Trace.ModeB.SurfaceMaxSlopeDegrees overrides it live.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Surface Max Slope (deg) [mode B]", ClampMin = "0.0", ClampMax = "89.0", UIMin = "10.0", UIMax = "60.0"))
+	float CoreSurfaceMaxSlopeDegrees = 45.f;
+
 	// ==========================================================================================
 	// PARRY  (spec v3 §3 — new mechanic)
 	//
@@ -2255,22 +2290,40 @@ public:
 	bool bRequireDashToTripTrail = true;
 
 	/**
-	 * Seconds a trail point survives after being laid — i.e. how much lethal trace is on the field
-	 * behind a carrier at any moment.
+	 * NO LONGER THE EXPIRY RULE. SPEC v7 §1 deleted time-based trail expiry outright; a trail point
+	 * now leaves the tail ONLY when new trace at the head pushes the path past TrailMaxLengthUU.
 	 *
-	 * THIS IS THE ONLY VALUE. UTraceTrailComponent::GetTraceLifetimeSeconds() used to take a min()
-	 * against a hardcoded ceiling while the two slices were landing separately; that ceiling is gone,
-	 * so what you set here is what the game plays. The ClampMax below is the real bound. Sane range
-	 * 2 to 4.
+	 * A carrier who stands still therefore keeps their entire trace indefinitely — that is the whole
+	 * point of the change. The reported exploit was that a stationary carrier's trace timed out and
+	 * left them literally unkillable, the trace being the only way to kill a carrier.
 	 *
-	 * Shortening it is a real nerf to the trail-hunting bots, whose BotTrailMinPointLifeRemaining
-	 * filter is a fraction of this window written as an absolute — move the two together.
+	 * WHAT THIS VALUE STILL DOES, and the only two things it does:
+	 *   1. It is the DERIVATION INPUT for TrailMaxLengthUU when that knob is left at or below zero
+	 *      (TrailLifetime x WalkSpeed x 0.75). Set TrailMaxLengthUU directly and this stops mattering.
+	 *   2. It is the age-fade reference for the LEGACY renderer arm (Trace.Trail.Renderer 0), which
+	 *      is a measurement arm, not the shipping look.
 	 *
-	 * 2.8 -> 2.00 this pass (spec v3 §1). BotTrailMinPointLifeRemaining moved 0.56 -> 0.40 with it,
-	 * holding the "discard the oldest ~20% of the trace" ratio the two are supposed to keep.
+	 * Do not reintroduce an expiry read of this value. A surviving timer anywhere in the retirement
+	 * path restores the stand-still exploit, which is the one thing spec v7 §1 exists to kill.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Trail Lifetime (s)", ClampMin = "0.2", ClampMax = "4.0", UIMin = "0.5", UIMax = "4.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Trail Lifetime (s) [derivation/legacy fade only]", ClampMin = "0.2", ClampMax = "4.0", UIMin = "0.5", UIMax = "4.0"))
 	float TrailLifetime = 2.0f;
+
+	/**
+	 * SPEC v7 §§1-2. THE MAXIMUM LENGTH OF A TRACE, IN UU — and the rule that retires trail points.
+	 *
+	 * Points are appended at the head as the carrier moves and dropped from the tail only while the
+	 * total path length exceeds this. Nothing else retires a point. No clock is involved, so the
+	 * trace behind a stationary carrier is permanent until they move again.
+	 *
+	 * 1200 = the v7 §2 conversion of the old timer: TrailLifetime 2.0s x WalkSpeed 800 = 1600uu, of
+	 * which the request was "lower by 25%". This is now the number the whole mechanic hangs on.
+	 *
+	 * At or below zero re-derives it from TrailLifetime x WalkSpeed x 0.75 so the pair cannot silently
+	 * disagree; the console override Trace.Trail.MaxLength beats both for a headless measurement run.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Trail Max Length (uu)", ClampMin = "0.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "3000.0"))
+	float TrailMaxLengthUU = 1200.f;
 
 	/**
 	 * Distance the carrier must travel before a new point is appended, in uu.
@@ -2281,18 +2334,32 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Point Spacing (uu)", ClampMin = "10.0", ClampMax = "500.0", UIMin = "30.0", UIMax = "200.0"))
 	float TrailPointSpacing = 60.f;
 
-	/** Collision/visual radius of a trail segment, in uu. The visual is derived from the lethal volume. */
-	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Segment Radius (uu)", ClampMin = "5.0", ClampMax = "500.0", UIMin = "20.0", UIMax = "150.0"))
-	float TrailRadius = 45.f;
+	/**
+	 * HALF the trace's width in uu — the LETHAL radius and the DRAWN radius, which are one number.
+	 *
+	 * SPEC v7 §3: 45 (the full player-model width) -> 22.5, "it doesn't need to be the full width of
+	 * the player model". Both the trip test and every renderer arm resolve this through
+	 * UTraceTrailComponent::GetTraceTrailRadius(), so shrinking the drawing without shrinking the kill
+	 * volume ("I dashed past it and died anyway") is not expressible. Trace.Trail.Radius overrides it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Segment Radius (uu)", ClampMin = "5.0", ClampMax = "500.0", UIMin = "10.0", UIMax = "150.0"))
+	float TrailRadius = 22.5f;
 
 	/**
-	 * Collision/visual height of a trail segment, in uu.
+	 * The trace's height in uu, centred on the carrier's mid-model — LETHAL AND DRAWN TOGETHER.
 	 *
-	 * Also drives the third-person camera pivot (ATraceCharacter::GetThirdPersonPivotZ reads this so
-	 * the camera clears the wall), so raising it lifts the carry camera with it.
+	 * SPEC v7 §3: 190 -> 63, "get rid of the top and bottom third of the trace, so that it's just the
+	 * middle section, in order to make visibility around the trace better". Resolved through
+	 * UTraceTrailComponent::GetTraceTrailHeight(); Trace.Trail.Height overrides it.
+	 *
+	 * NOTE, and this changed in v7: this NO LONGER drives the third-person carry camera.
+	 * ATraceCharacter::GetThirdPersonPivotZ used to derive its height from this so the camera cleared
+	 * the trail wall, which at 63 would have dropped the approved carry framing by ~68uu as a side
+	 * effect of a visibility change. The camera now has its own floor — see
+	 * TraceCharacterLayout::CarryPivotZ.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Segment Height (uu)", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "60.0", UIMax = "400.0"))
-	float TrailHeight = 190.f;
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Segment Height (uu)", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "40.0", UIMax = "400.0"))
+	float TrailHeight = 63.f;
 
 	/** Hard cap on replicated trail points; oldest are dropped first. A bandwidth dial. */
 	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Max Trail Points", ClampMin = "8", ClampMax = "1024", UIMin = "32", UIMax = "512"))
@@ -2363,9 +2430,10 @@ public:
 	 * the continuous smear alone. Mirrors the Trace.Trail.GhostMaxCount CVar; keep the two equal.
 	 *
 	 * This is the number that decides whether spec v4 §2 is affordable, so the arithmetic is worth
-	 * stating: a trace is TrailLifetime x speed long, capped by MaxTrailPoints x TrailPointSpacing —
-	 * 2.0 s x 800 uu/s = 1600 uu at a walk, ~3200 uu through a sustained dash — so at 220 uu spacing
-	 * that is ~8 ghosts walking and ~15 dashing. 20 covers the dashing case with headroom.
+	 * restating now that spec v7 §§1-2 changed it: a trace is TrailMaxLengthUU long WHATEVER the
+	 * carrier is doing — 1200 uu — capped as ever by MaxTrailPoints x TrailPointSpacing. At 220 uu
+	 * spacing that is ~6 ghosts, and dashing no longer stretches the trace the way a time window did
+	 * (a dash covers the length faster, it does not make it longer). 20 is now generous headroom.
 	 *
 	 * Past the cap the OLDEST ghosts are released, never the newest: the newest are the ones an
 	 * approaching enemy is judging their dash against. The smear still covers the tail, so the cap
@@ -2503,19 +2571,25 @@ public:
 	float BotTrailCrossOvershoot = 320.f;
 
 	/**
-	 * Trail points with less than this many seconds of life left are not worth running at.
+	 * How much of the OLDEST end of the trace a hunting bot refuses to aim at, expressed as the
+	 * seconds of walking that stretch of trace represents (x WalkSpeed = the uu skipped from the tail).
 	 *
-	 * A bot that commits to a point which expires before it arrives is a bot that spends the whole
-	 * carry running at ghosts — one of the two reasons trail kills were 1.3% of deaths.
+	 * A bot that commits to a point which vanishes before it arrives is a bot that spends the whole
+	 * carry running at ghosts — one of the two reasons trail kills were once 1.3% of deaths.
 	 *
-	 * A FRACTION OF TrailLifetime WRITTEN AS AN ABSOLUTE, so the two must move together. It is
-	 * calibrated to discard the oldest ~20% of the trace: at TrailLifetime 4 that was 0.8, at 2.8 it
-	 * was 0.56, and at the current 2.00 it is 0.40. Leaving it behind when TrailLifetime shrinks
-	 * discards a larger share of the trace instead — the same mistake, in the same direction, that
-	 * cut the trail-kill share from a measured 37.5% of kills to 25.9% when TrailLifetime went
-	 * 6 -> 4. Interceptors were not worse at crossing; there was simply less legal trace to aim at.
+	 * SPEC v7 §1 CHANGED WHAT THIS MEANS, AND THE INTEGRATOR CHANGED THE FILTER TO MATCH. Points no
+	 * longer expire by age at all, so the old reading — "points with less than this many seconds of
+	 * LIFE LEFT" — became unsatisfiable: for a stationary carrier every point is older than any age
+	 * cutoff, so the bots discarded the whole trace and never planned an intercept. The filter in
+	 * ATraceBotController is now a DISTANCE margin measured from the tail:
+	 *
+	 *     skip = BotTrailMinPointLifeRemaining x WalkSpeed   (0.40 x 800 = 320uu)
+	 *
+	 * which against the 1200uu TrailMaxLengthUU preserves exactly the calibrated "discard the oldest
+	 * ~20-25% of the trace" this number has always meant. It stays a fraction of the trace written as
+	 * an absolute — so if TrailMaxLengthUU moves, move this with it, the same standing rule as before.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Min Point Life Remaining (s)", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Min Point Life Remaining (s, x WalkSpeed = uu skipped from tail)", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0"))
 	float BotTrailMinPointLifeRemaining = 0.40f;
 
 	/**

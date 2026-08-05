@@ -1,5 +1,7 @@
 #include "Gameplay/TraceParry.h"
 
+#include <type_traits>                     // v7 §6: the two cross-slice accessor detectors
+
 #include "Containers/Ticker.h"
 #include "Engine/Engine.h"                 // GEngine->GetWorldContexts()
 #include "Engine/World.h"
@@ -111,6 +113,55 @@ namespace
 
 	/** Every parry kill this process has awarded. Verification only — never read by a game rule. */
 	int32 GParryKillCount = 0;
+
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v7 §6 — the refunds. Counters and the two bridges to state this file does not own.
+	// ---------------------------------------------------------------------------------------------
+
+	int32 GParryCooldownRefundCount = 0;
+	int32 GDashRefundCount = 0;
+	int32 GDashRefundUnwiredCount = 0;
+
+	/**
+	 * 1 = a parry KILL refunds the carrier's parry cooldown and one dash charge (spec v7 §6).
+	 * 0 = the v6 behaviour, where a parry kill is its own reward and nothing is given back.
+	 *
+	 * A switch for the same reason Trace.Parry.KillsDasher is one: this changes how the parry FEELS
+	 * more than it changes what it does, and the user's standing instruction is that anything they
+	 * might want to feel out in a playtest is a knob rather than a number an agent chose. Cheat-
+	 * flagged so it cannot be flipped in a real match.
+	 */
+	int32 GParryKillRefunds = 1;
+
+	FAutoConsoleVariableRef CVarParryKillRefunds(
+		TEXT("Trace.Parry.KillRefunds"),
+		GParryKillRefunds,
+		TEXT("SPEC v7 §6. 1 (default): a parry KILL resets the carrier's parry cooldown to zero and hands "
+		     "back one dash charge. 0: the pre-v7 behaviour, no refunds."),
+		ECVF_Cheat);
+
+	// =============================================================================================
+	// THE TWO WRITES SPEC v7 §6 MAKES OUTSIDE THIS SLICE — NOW PLAIN CALLS
+	//
+	// Spec v7 §6 has to write two facts this file does not own:
+	//
+	//   THE PARRY COOLDOWN   lives on UTraceTrailComponent (ParryCooldownEndServerTime), deliberately
+	//                        — see this file's header, the window and the cooldown belong with the
+	//                        thing that replicates and draws the trace.
+	//   THE DASH POOL        lives on UTraceCharacterMovementComponent (DashCharges), deliberately —
+	//                        it is saved-move state and has to round-trip through prediction.
+	//
+	// Both were reached through SFINAE detectors while the accessors were being written in parallel,
+	// and the parry half additionally had a by-name reflection fallback so the mechanic could be
+	// tested before the accessor existed. INTEGRATED: UTraceTrailComponent::ServerResetParryCooldown()
+	// and UTraceCharacterMovementComponent::RefundDashCharge() both exist now, so the detectors and
+	// the reflection bridge are DELETED and these are ordinary calls that fail to compile if either
+	// accessor is ever removed — which is the whole reason they were only ever meant to be temporary.
+	//
+	// Each accessor also owns the part of the job only it can do: the trail forces a net update so the
+	// HUD pip moves immediately, and the movement component mirrors the refunded charge onto the
+	// owning client, DashCharges being predicted state that is never replicated as a property.
+	// =============================================================================================
 
 	/** PlayerState name if there is one, else the actor name. Bots have both; a fresh pawn may not. */
 	FString ParryDisplayName(const AActor* Actor)
@@ -351,6 +402,113 @@ namespace TraceParry
 		return false;
 	}
 
+	int32 GetParryCooldownRefundCount() { return GParryCooldownRefundCount; }
+	int32 GetDashRefundCount()          { return GDashRefundCount; }
+	int32 GetDashRefundUnwiredCount()   { return GDashRefundUnwiredCount; }
+
+	bool IsDashRefundWired()
+	{
+		// Was a SFINAE probe for UTraceCharacterMovementComponent::RefundDashCharge(). The accessor is
+		// integrated, so the call below is a hard compile-time dependency and this cannot be false.
+		// Kept because the verifier prints it, and a reader deserves to see the answer is now trivial.
+		return true;
+	}
+
+	bool ServerRefundOnParryKill(ATraceCharacter* Carrier)
+	{
+		if (GParryKillRefunds == 0)
+		{
+			return false;
+		}
+
+		// SERVER-AUTHORITATIVE (spec v7 §6). Same test, asked of the same pawn, as the punish that
+		// leads here — a client reaching this decides nothing.
+		if (Carrier == nullptr || !Carrier->HasAuthority())
+		{
+			return false;
+		}
+
+		bool bRefundedAnything = false;
+
+		// --- 1. "reset that players parry cooldown to zero" ----------------------------------------
+		//
+		// Unconditional, not "if it is on cooldown": it always IS on cooldown here. The kill can only
+		// have happened inside a live parry window, and the cooldown is charged when the window opens.
+		float CooldownBefore = 0.f;
+		if (UTraceTrailComponent* Trail = Carrier->Trail)
+		{
+			CooldownBefore = Trail->GetParryCooldownRemaining();
+
+			// The deadline is replicated, and ServerResetParryCooldown() forces the net update itself,
+			// so the carrier's own HUD pip and every other machine's idea of it move together on this
+			// frame rather than at the next scheduled update — a refund the player cannot see is a
+			// refund they will not use.
+			Trail->ServerResetParryCooldown();
+
+			++GParryCooldownRefundCount;
+			bRefundedAnything = true;
+		}
+
+		// --- 2. "and one of their dash cooldowns to zero" ------------------------------------------
+		//
+		// See the header for why "one of them, the one actually on cooldown" is exactly "hand back one
+		// charge" in the pool model the movement component uses.
+		int32 ChargesBefore = 0;
+		int32 ChargesAfter = 0;
+		int32 MaxCharges = 0;
+		bool bDashOwed = false;
+
+		if (UTraceCharacterMovementComponent* Movement = Carrier->GetTraceMovement())
+		{
+			ChargesBefore = Movement->GetDashCharges();
+			ChargesAfter = ChargesBefore;
+			MaxCharges = FMath::Max(1, Movement->GetMaxDashCharges());
+
+			// "If both are already available, nothing to do" — the spec's own third case.
+			bDashOwed = (ChargesBefore < MaxCharges);
+
+			if (bDashOwed)
+			{
+				// RefundDashCharge() also mirrors the charge onto the owning client, which is the only
+				// way a remote carrier's HUD meter can move: DashCharges is predicted saved-move state
+				// and is never replicated as a property.
+				Movement->RefundDashCharge();
+
+				ChargesAfter = Movement->GetDashCharges();
+				if (ChargesAfter > ChargesBefore)
+				{
+					++GDashRefundCount;
+					bRefundedAnything = true;
+				}
+				else
+				{
+					// OWED AND NOT PAID. Cannot happen now that the accessor is integrated — the pool
+					// was measured short one line above — so this is left as a loud tripwire rather
+					// than deleted. The only thing worse than a missing refund is a run that reports
+					// one it never made.
+					++GDashRefundUnwiredCount;
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[PARRYREFUND] %s was owed a dash charge (%d/%d in hand) and "
+						     "UTraceCharacterMovementComponent::RefundDashCharge() did not pay it. The "
+						     "pool was measured short, so this is a real bug. Parry cooldown was reset."),
+						*GetNameSafe(Carrier), ChargesBefore, MaxCharges);
+				}
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[PARRYREFUND] %s (spec v7 §6): parry cooldown %.2fs -> %.2fs | dash charges %d -> %d of %d "
+			     "(%s) | totals: parry resets %d, dash refunds %d, dash refunds owed but unwired %d"),
+			*GetNameSafe(Carrier),
+			CooldownBefore, (Carrier->Trail != nullptr) ? Carrier->Trail->GetParryCooldownRemaining() : 0.f,
+			ChargesBefore, ChargesAfter, MaxCharges,
+			!bDashOwed ? TEXT("both dashes were already available - nothing owed")
+				: (ChargesAfter > ChargesBefore ? TEXT("refunded") : TEXT("OWED, NOT PAID")),
+			GParryCooldownRefundCount, GDashRefundCount, GDashRefundUnwiredCount);
+
+		return bRefundedAnything;
+	}
+
 	bool ServerPunishParriedDash(ATraceCharacter* Carrier, ATraceCharacter* Dasher)
 	{
 		// --- the rule is off ----------------------------------------------------------------------
@@ -449,6 +607,13 @@ namespace TraceParry
 		}
 
 		DasherHealth->Kill(CarrierController, GetParryKillCause());
+
+		// SPEC v7 §6, AFTER THE KILL AND NOT BEFORE IT. The refund is the reward for a KILL, so it is
+		// applied on the far side of the one line that makes the kill true. Ordering matters for a
+		// second reason too: Kill() broadcasts synchronously and the death chain can move the Core,
+		// and the refund is a statement about the pawn that parried rather than about whoever is
+		// holding the Core a microsecond later - it is deliberately not re-derived from the Core here.
+		ServerRefundOnParryKill(Carrier);
 		return true;
 	}
 
@@ -657,6 +822,19 @@ namespace
 		/** GetParryKillCount() sampled at the start of the run, so case C can assert "+0". */
 		int32 ParryKillsAtRunStart = 0;
 
+		// --- SPEC v7 §6, the refunds. Sampled either side of the sweep. ------------------------
+		//
+		// The whole claim is a CHANGE across one event, so both ends have to be measured on the
+		// carrier the harness actually used. Sampling only the "after" state would pass trivially
+		// against a carrier who happened to have a full pool and a ready parry to begin with, which
+		// is the usual state of a bot that has not been made to spend anything.
+		float ParryCooldownBeforeSweep = 0.f;
+		float ParryCooldownAfterKill = 0.f;
+		int32 DashChargesBeforeSweep = 0;
+		int32 DashChargesAfterKill = 0;
+		int32 DashMaxChargesAtSweep = 0;
+		bool bRefundSampled = false;
+
 		/** Attempts scratched for this run index (dash refused, no tripper). Bounded, then aborted. */
 		int32 ScratchCount = 0;
 
@@ -676,6 +854,16 @@ namespace
 		int32 PassCount = 0;
 		int32 FailCount = 0;
 		int32 AbortedCount = 0;
+
+		// --- SPEC v7 §6 tallies, reported at the end -------------------------------------------
+		int32 RefundRunsMeasured = 0;
+		int32 ParryCooldownResetsConfirmed = 0;
+		int32 ParryCooldownResetsMissed = 0;
+		int32 DashRefundsConfirmed = 0;
+		int32 DashRefundsOwedButUnwired = 0;
+		int32 DashRefundsNotOwed = 0;
+		int32 RefundPassCount = 0;
+		int32 RefundFailCount = 0;
 	};
 
 	/** Advances one Trace.TestParry session by one frame. Returns false when the session is done. */
@@ -698,6 +886,19 @@ namespace
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[PARRYTEST] VERDICT: %d PASS, %d FAIL. Total parry kills awarded this process: %d."),
 				State.PassCount, State.FailCount, TraceParry::GetParryKillCount());
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[PARRYTEST] v7 §6 REFUND VERDICT: %d PASS, %d FAIL (scored apart from the v6 §3 verdict ")
+				TEXT("above, which is about who died)."),
+				State.RefundPassCount, State.RefundFailCount);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[PARRYTEST] v7 §6 REFUNDS: %d kills measured | parry cooldown reset %d, NOT reset %d | ")
+				TEXT("dash refunded %d, owed-but-unwired %d, nothing owed %d | process totals: parry resets %d, ")
+				TEXT("dash refunds %d, unwired %d (accessor wired=%d)"),
+				State.RefundRunsMeasured,
+				State.ParryCooldownResetsConfirmed, State.ParryCooldownResetsMissed,
+				State.DashRefundsConfirmed, State.DashRefundsOwedButUnwired, State.DashRefundsNotOwed,
+				TraceParry::GetParryCooldownRefundCount(), TraceParry::GetDashRefundCount(),
+				TraceParry::GetDashRefundUnwiredCount(), TraceParry::IsDashRefundWired() ? 1 : 0);
 			return false;
 		}
 
@@ -854,6 +1055,22 @@ namespace
 				bParryGranted = TraceParry::RequestParry(Carrier, &Refusal);
 			}
 
+			// SPEC v7 §6: MAKE THERE BE SOMETHING TO REFUND.
+			//
+			// The refund is "hand back the dash that is on cooldown", and a carrier who has not spent
+			// one has nothing owed to them — the spec's own third case ("if both are available,
+			// nothing to do"). A harness that never spent one would therefore assert nothing at all
+			// and would pass against a completely dead refund path. So the carrier spends a charge
+			// here, through the real StartDash() the player's key drives, and the assertion below is
+			// about a pool that is genuinely short.
+			if (State.Case == EParryTestCase::ParriedDash)
+			{
+				if (UTraceCharacterMovementComponent* CarrierMovement = Carrier->GetTraceMovement())
+				{
+					CarrierMovement->StartDash();
+				}
+			}
+
 			const FVector DashStart = Midpoint + Across * 260.0;
 			State.DashEnd = Midpoint - Across * 240.0;
 			State.Tripper = Tripper;
@@ -967,6 +1184,17 @@ namespace
 
 			State.bParryWasActiveAtSweep = TraceParry::IsParryActiveFor(Carrier);
 
+			// SPEC v7 §6 BASELINE, taken on the frame the sweep resolves and BEFORE it does: the core
+			// ticker runs ahead of the world tick that will run the trip test, so this is the last
+			// reading of the carrier's cooldowns that predates the kill.
+			if (UTraceCharacterMovementComponent* CarrierMovement = Carrier->GetTraceMovement())
+			{
+				State.DashChargesBeforeSweep = CarrierMovement->GetDashCharges();
+				State.DashMaxChargesAtSweep = FMath::Max(1, CarrierMovement->GetMaxDashCharges());
+				State.bRefundSampled = true;
+			}
+			State.ParryCooldownBeforeSweep = TraceParry::GetCooldownRemainingFor(Carrier);
+
 			Tripper->SetActorLocation(State.DashEnd, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
 
 			UE_LOG(LogTraceGame, Display,
@@ -993,6 +1221,19 @@ namespace
 		// trace") instead of the different question "does a parry survive a camper".
 		if (State.Phase == 3)
 		{
+			// SPEC v7 §6, THE OTHER END OF THE MEASUREMENT. One frame after the sweep, so the trip
+			// test, the punish, the kill and the refund have all run. Read from the carrier's own
+			// components, which is where the HUD reads them, rather than from the refund's counters:
+			// a counter proves the code ran, and this proves the state the player sees changed.
+			if (Carrier != nullptr && State.bRefundSampled)
+			{
+				State.ParryCooldownAfterKill = TraceParry::GetCooldownRemainingFor(Carrier);
+				if (const UTraceCharacterMovementComponent* CarrierMovement = Carrier->GetTraceMovement())
+				{
+					State.DashChargesAfterKill = CarrierMovement->GetDashCharges();
+				}
+			}
+
 			// Nothing to undo in case C, and a parry-killed dasher is a corpse the death path is
 			// already hiding — moving either one would only add noise.
 			if (State.bDashThisRun)
@@ -1041,6 +1282,68 @@ namespace
 			}
 
 			const int32 ExpectedKills = (State.bDashThisRun && State.bParryWasActiveAtSweep) ? 1 : 0;
+
+			// --- SPEC v7 §6: the refunds, scored only on a run that actually produced a KILL --------
+			//
+			// Gated on ExpectedKills rather than on the case, for the same reason the fates above are
+			// gated on the OBSERVED window: a case-A run whose parry lapsed a frame early produces no
+			// kill, and asserting a refund there would fail the refund for the timing's mistake.
+			bool bRefundOk = true;
+			if (ExpectedKills == 1 && KillsAwarded == 1 && State.bRefundSampled && bCarrierAlive)
+			{
+				++State.RefundRunsMeasured;
+
+				// "reset that players parry cooldown to zero" - and it is a RESET, so the number that
+				// matters is the one after, not the delta. A carrier whose cooldown happened to be
+				// zero already is still a pass; a carrier still counting down is not.
+				const bool bCooldownOk = (State.ParryCooldownAfterKill <= 0.001f);
+				(bCooldownOk ? State.ParryCooldownResetsConfirmed : State.ParryCooldownResetsMissed)++;
+
+				// "one of their dash cooldowns to zero. If the first dash is already off cooldown, the
+				// second one should be set to zero instead" = one charge back, unless the pool is full.
+				const bool bDashOwed = (State.DashChargesBeforeSweep < State.DashMaxChargesAtSweep);
+				bool bDashOk = true;
+				if (!bDashOwed)
+				{
+					++State.DashRefundsNotOwed;
+				}
+				else if (State.DashChargesAfterKill > State.DashChargesBeforeSweep)
+				{
+					++State.DashRefundsConfirmed;
+				}
+				else if (!TraceParry::IsDashRefundWired())
+				{
+					// The accessor this build needs is not there. Recorded as its own outcome and NOT
+					// as a pass: the mechanic is genuinely missing, and a harness that shrugged at that
+					// would be the reason nobody noticed.
+					++State.DashRefundsOwedButUnwired;
+					bDashOk = false;
+				}
+				else
+				{
+					bDashOk = false;
+				}
+
+				bRefundOk = bCooldownOk && bDashOk;
+				(bRefundOk ? State.RefundPassCount : State.RefundFailCount)++;
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[PARRYTEST %d/%d] v7 §6 REFUND: parry cooldown %.2fs -> %.2fs (%s) | dash charges "
+					     "%d -> %d of %d (%s) | accessor wired=%d"),
+					State.RunIndex + 1, State.TotalRuns,
+					State.ParryCooldownBeforeSweep, State.ParryCooldownAfterKill,
+					bCooldownOk ? TEXT("RESET") : TEXT("*** NOT RESET ***"),
+					State.DashChargesBeforeSweep, State.DashChargesAfterKill, State.DashMaxChargesAtSweep,
+					!bDashOwed ? TEXT("nothing owed - the pool was full")
+						: (bDashOk ? TEXT("REFUNDED") : TEXT("*** OWED, NOT REFUNDED ***")),
+					TraceParry::IsDashRefundWired() ? 1 : 0);
+			}
+
+			// TWO VERDICTS, KEPT APART ON PURPOSE. bPass is the v6 §3 claim - who died - and it must
+			// stay comparable with the 12/12 this harness has reported since that spec landed. Folding
+			// a missing v7 §6 refund into it would turn a working punish into a FAIL line and invite
+			// exactly the wrong diagnosis. The refund gets its own verdict, counted below and printed
+			// on its own line, so a gap in it is loud without being mistaken for a regression.
 			const bool bPass = (bCarrierAlive == bExpectCarrierAlive)
 				&& (bDasherAlive == bExpectDasherAlive)
 				&& (KillsAwarded == ExpectedKills);
@@ -1135,10 +1438,13 @@ namespace
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[DebugParry] duration=%.2fs cooldown=%.2fs glow=%.2f forceWindow=%d botAuto=%d | v6 3: "
-			     "killsDasher=%d cause='%s' parryKillsAwarded=%d"),
+			     "killsDasher=%d cause='%s' parryKillsAwarded=%d | v7 6: refundsEnabled=%d "
+			     "parryCooldownResets=%d dashRefunds=%d dashRefundsOwedButUnwired=%d accessorWired=%d"),
 			TraceParry::GetDurationSeconds(), TraceParry::GetCooldownSeconds(), TraceParry::GetGlowScale(),
 			TraceParry::IsWindowForced() ? 1 : 0, TraceParry::IsBotAutoParryEnabled() ? 1 : 0,
-			ParryKillsDasherEnabled() ? 1 : 0, *TraceParry::GetParryKillCause().ToString(), TraceParry::GetParryKillCount());
+			ParryKillsDasherEnabled() ? 1 : 0, *TraceParry::GetParryKillCause().ToString(), TraceParry::GetParryKillCount(),
+			GParryKillRefunds, TraceParry::GetParryCooldownRefundCount(), TraceParry::GetDashRefundCount(),
+			TraceParry::GetDashRefundUnwiredCount(), TraceParry::IsDashRefundWired() ? 1 : 0);
 
 		for (const ATraceCharacter* TraceChar : Characters)
 		{

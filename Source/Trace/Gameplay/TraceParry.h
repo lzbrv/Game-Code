@@ -214,6 +214,64 @@ namespace TraceParry
 	 */
 	bool ServerPunishParriedDash(ATraceCharacter* Carrier, ATraceCharacter* Dasher);
 
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v7 §6 — A PARRY KILL REFUNDS THE CARRIER'S COOLDOWNS
+	//
+	// Verbatim: *"When a player carrying the trace successfully kills an enemy with a parry, reset
+	// that players parry cooldown to zero and one of their dash cooldowns to zero. If the first dash
+	// is already off cooldown, the second one should be set to zero instead."*
+	//
+	// A KILL, NOT A PARRY. This is called from exactly one place — inside ServerPunishParriedDash,
+	// after the dasher is confirmed dead — and that is the whole of the gating. A parry that merely
+	// protects the trace refunds nothing, and a parry thrown at empty air cannot reach here at all,
+	// for the same structural reason the punish itself cannot: the only caller is inside the branch
+	// that has already established a lethal dash hit a live parry window.
+	//
+	// "ONE OF THEIR DASH COOLDOWNS", AND WHICH ONE. The carrier's two dashes are a CHARGE POOL with a
+	// single refill clock (see UTraceCharacterMovementComponent's "why charges and not a second
+	// timer"), not two independent timers, so "the first one, unless it is already off cooldown, in
+	// which case the second" has exactly one meaning in that model: HAND BACK ONE CHARGE. Spent one
+	// of two -> the spent one comes back. Spent both -> one comes back and the other keeps refilling
+	// on the clock it was already on. Spent neither -> nothing to refund, which the spec also says.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Server. Applies spec v7 §6's refunds to @p Carrier: parry cooldown to zero, one dash charge back.
+	 *
+	 * Server-authoritative and idempotent-safe: a second call with nothing left to refund is a no-op.
+	 * The parry cooldown is a REPLICATED deadline, so zeroing it reaches the carrier's HUD by the
+	 * ordinary replication path; the dash pool is saved-move state and needs the owning client told
+	 * directly, which is what the accessor described in this pass's report does.
+	 *
+	 * @return true if anything was actually refunded.
+	 */
+	bool ServerRefundOnParryKill(ATraceCharacter* Carrier);
+
+	/** Parry cooldowns zeroed by a parry kill this process. Verification counter; never a game rule. */
+	int32 GetParryCooldownRefundCount();
+
+	/** Dash charges handed back by a parry kill this process. Verification counter. */
+	int32 GetDashRefundCount();
+
+	/**
+	 * Parry kills where a dash charge was owed but could NOT be handed back, because the movement
+	 * component in this build exposes no way to do it.
+	 *
+	 * Exists so the gap is a NUMBER in the run's own log rather than a claim in a report. See
+	 * IsDashRefundWired().
+	 */
+	int32 GetDashRefundUnwiredCount();
+
+	/**
+	 * True when this build actually has a way to hand a dash charge back.
+	 *
+	 * The dash pool lives on UTraceCharacterMovementComponent, which is another ownership slice this
+	 * pass; the one-function accessor it needs is specified in this pass's report. This answers
+	 * whether that accessor has landed, so the verification harness reports "refunded" or "the
+	 * accessor is missing" instead of silently reporting a refund nobody performed.
+	 */
+	bool IsDashRefundWired();
+
 	/**
 	 * The death cause reported for a dasher killed by a parry: "Parried".
 	 *

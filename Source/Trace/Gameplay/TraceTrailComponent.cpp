@@ -90,6 +90,94 @@ namespace
 		     "Delays formation only; already-laid segments stay lethal."),
 		ECVF_Default);
 
+	// =============================================================================================
+	// SPEC v7 §§1-3 — THE TRACE IS A LENGTH, AND IT IS THINNER AND SHALLOWER
+	//
+	// §1 THE EXPLOIT THIS CLOSES, in the user's words: "When a player stands still, their trace is
+	//    gone and they can't be killed." The trace is the ONLY counterplay to a shielded carrier, so
+	//    a 2-second timer meant a carrier who simply stopped moving was, after two seconds,
+	//    unkillable. The timer is GONE — not layered under a length cap, gone — and points now leave
+	//    the tail for exactly one reason: a new point at the head pushed the path past its maximum
+	//    LENGTH. Stand still and nothing is spawned, so nothing is retired, so the whole trace stays.
+	//
+	// §2 THE VALUE. TrailLifetime (2.0s) x WalkSpeed (800uu/s) = 1600uu was the old walking trace;
+	//    the spec asks for that minus 25%, i.e. 1200uu.
+	//
+	//    DERIVED from those two settings rather than written as a bare 1200, and that is deliberate:
+	//    TraceSettings.h and Config/DefaultGame.ini are not this slice's files, so a new property
+	//    would have to be requested from the integrator, and until it landed the number would be a
+	//    console variable that the settings panel does not show — "a knob on the page that lies",
+	//    which this project has already been bitten by. Binding to two knobs the panel ALREADY shows
+	//    and already live-edits keeps it tunable in PIE today. Trace.Trail.MaxLength overrides it
+	//    outright for a headless run, and the report asks for a first-class TrailMaxLengthUU.
+	//
+	// §3 THE CROSS-SECTION. "Get rid of the top and bottom third of the trace ... also reduce the
+	//    width, it doesn't need to be the full width of the player model." Height 190 -> 63 (the
+	//    middle third, centred on the trail point, which IS mid-model), radius 45 -> 22.5.
+	//
+	//    THE LETHAL VOLUME AND THE DRAWN VOLUME COME OUT OF THE SAME TWO FUNCTIONS. Both the trip
+	//    test and every renderer arm read GetTraceTrailRadius()/GetTraceTrailHeight() and nothing in
+	//    this file reads UTraceSettings::TrailRadius/TrailHeight any more, so the standing invariant
+	//    ("once a trace segment is visible it is lethal", and its converse) cannot be broken by
+	//    editing one of them. Shrinking the drawing without shrinking the trip volume would be the
+	//    "I dashed past it and died anyway" bug; the reverse is trace you cannot see that kills you.
+	//
+	//    THESE TWO ARE REPLACEMENTS, NOT SCALES, so they cannot double-apply if and when the
+	//    integrator moves 22.5/63 into TraceSettings + DefaultGame.ini. At that point set both
+	//    defaults below to -1 and the settings take over unchanged. That handover is in the report.
+	// =============================================================================================
+
+	float GTrailMaxLength = -1.f;
+
+	FAutoConsoleVariableRef CVarTrailMaxLength(
+		TEXT("Trace.Trail.MaxLength"),
+		GTrailMaxLength,
+		TEXT("OVERRIDE for the maximum LENGTH of a trace in uu (spec v7 1-2: 1200). Points leave the "
+		     "tail only when new trace at the head pushes the path past this - never because time "
+		     "passed, so a stationary carrier keeps their whole trace. Negative (default) = use "
+		     "UTraceSettings::TrailMaxLengthUU, or derive it from TrailLifetime x WalkSpeed x 0.75 "
+		     "if that is left at or below zero."),
+		ECVF_Default);
+
+	// INTEGRATED: -1 now, because 22.5 and 63 live in UTraceSettings + DefaultGame.ini where the
+	// settings panel can reach them. These stay as CONSOLE overrides only. See GetTraceTrailRadius().
+	float GTrailRadiusOverride = -1.f;
+
+	FAutoConsoleVariableRef CVarTrailRadius(
+		TEXT("Trace.Trail.Radius"),
+		GTrailRadiusOverride,
+		TEXT("HALF the trace's width in uu, LETHAL AND DRAWN TOGETHER (spec v7 3: 22.5, down from the "
+		     "player model's 45). Negative = fall back to UTraceSettings::TrailRadius. Changing this "
+		     "moves the kill volume and the ribbon by the same amount, on purpose."),
+		ECVF_Default);
+
+	float GTrailHeightOverride = -1.f;
+
+	FAutoConsoleVariableRef CVarTrailHeight(
+		TEXT("Trace.Trail.Height"),
+		GTrailHeightOverride,
+		TEXT("The trace's height in uu, LETHAL AND DRAWN TOGETHER, centred on the carrier's mid-model "
+		     "(spec v7 3: 63, the middle third of the old 190). Negative = fall back to "
+		     "UTraceSettings::TrailHeight."),
+		ECVF_Default);
+
+	/**
+	 * v7 §7: whether a receiving machine repairs the order of the replicated point array.
+	 *
+	 * On by default — off is not a quality setting, it is the BEFORE arm. Setting it to 0 reproduces
+	 * the reported tether on demand, which is how the mechanism was confirmed rather than assumed.
+	 */
+	int32 GClientOrderFix = 1;
+
+	FAutoConsoleVariableRef CVarClientOrderFix(
+		TEXT("Trace.Trail.ClientOrderFix"),
+		GClientOrderFix,
+		TEXT("1 (default) = a receiving client puts the delta-replicated trail points back into path "
+		     "order after the fast array's RemoveAtSwap scrambles them (spec v7 7). 0 reproduces the "
+		     "bug: the far end of the trace snaps to the carrier. Clients only - authority never "
+		     "reorders."),
+		ECVF_Default);
+
 	/** Upper bound on pooled SMEAR elements (one per lethal segment). 2.0s at 60uu spacing is ~27. */
 	constexpr int32 MaxPooledSmearElements = 96;
 
@@ -812,6 +900,11 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 		ServerTickBotAutoParry();
 	}
 
+	// SPEC v7 §7. BEFORE anything reads the point set on this machine — the visuals, the predicted
+	// head, and on a listen client's screen every judgement a player makes about where the trace is.
+	// A no-op on authority and on any client whose array happens to have arrived in order.
+	RestoreReplicatedPointOrder();
+
 	// Listen servers draw the trace too; only a headless server skips it.
 	if (GetNetMode() != NM_DedicatedServer)
 	{
@@ -844,6 +937,48 @@ float UTraceTrailComponent::GetTraceLifetimeSeconds()
 	const float Value = (GTraceLifetimeOverride >= 0.f)
 		? GTraceLifetimeOverride : UTraceSettings::Get().TrailLifetime;
 	return FMath::Max(0.1f, Value);
+}
+
+float UTraceTrailComponent::GetTraceMaxLengthUU()
+{
+	if (GTrailMaxLength > 0.f)
+	{
+		return GTrailMaxLength;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// INTEGRATED: the first-class knob asked for in the v7 report now exists, so the settings panel
+	// and DefaultGame.ini own this number (1200) and the derivation below is the fallback for a
+	// config that leaves it at or below zero.
+	if (Settings.TrailMaxLengthUU > 0.f)
+	{
+		return FMath::Max(FMath::Max(1.f, Settings.TrailPointSpacing) * 2.f, Settings.TrailMaxLengthUU);
+	}
+
+	// Spec v7 §2's arithmetic, written as arithmetic so it stays true when the settings move:
+	// the old walking trace was TrailLifetime x WalkSpeed long, and the request is that minus 25%.
+	const float Derived = FMath::Max(0.1f, Settings.TrailLifetime)
+		* FMath::Max(1.f, Settings.WalkSpeed)
+		* 0.75f;
+
+	// Floored at one point spacing: below that the trace could not hold two points, and a one-point
+	// trace is a degenerate blob rather than a path.
+	return FMath::Max(FMath::Max(1.f, Settings.TrailPointSpacing) * 2.f, Derived);
+}
+
+float UTraceTrailComponent::GetTraceTrailRadius()
+{
+	const float Value = (GTrailRadiusOverride >= 0.f)
+		? GTrailRadiusOverride : UTraceSettings::Get().TrailRadius;
+	return FMath::Max(1.f, Value);
+}
+
+float UTraceTrailComponent::GetTraceTrailHeight()
+{
+	const float Value = (GTrailHeightOverride >= 0.f)
+		? GTrailHeightOverride : UTraceSettings::Get().TrailHeight;
+	return FMath::Max(1.f, Value);
 }
 
 float UTraceTrailComponent::GetTurnoverGraceSeconds()
@@ -1013,6 +1148,26 @@ float UTraceTrailComponent::GetParryCooldownRemaining() const
 		return 0.f;
 	}
 	return FMath::Max(0.f, ParryCooldownEndServerTime - GetServerTimeSeconds());
+}
+
+void UTraceTrailComponent::ServerResetParryCooldown()
+{
+	if (GetOwnerRole() != ROLE_Authority)
+	{
+		return;
+	}
+
+	// Zero, not "now minus something": GetParryCooldownRemaining() special-cases <= 0 as "never set",
+	// which is exactly the state a refund wants to restore.
+	ParryCooldownEndServerTime = 0.f;
+
+	// Plain DOREPLIFETIME with no push-model dirty flag, so the write itself is enough to replicate —
+	// this only stops the owning client's HUD pip waiting for the next scheduled net update to learn
+	// that its parry is back. Spec v7 §6 asks for the refund to show immediately.
+	if (AActor* OwnerActor = GetOwner())
+	{
+		OwnerActor->ForceNetUpdate();
+	}
 }
 
 void UTraceTrailComponent::RequestParry(ETraceParryRefusal& OutRefusal)
@@ -1190,7 +1345,11 @@ int32 UTraceTrailComponent::ComputeLastLethalIndex() const
 	// visible and completely harmless. TrailHeadGracePoints still caps the exemption, so 0 removes
 	// it and a larger value cannot make the invisible-but-drawn window come back: the distance
 	// binds first at any sane spacing.
-	const double GraceDistance = FMath::Max(0.0, static_cast<double>(Settings.TrailRadius));
+	//
+	// v7 §3 halved the radius (45 -> 22.5), so the exempt stub halves with it — which is right: the
+	// exemption is "one body width of trace under the emitter's own feet", and the trace is now half
+	// a body wide. It is read through GetTraceTrailRadius() so it can never disagree with the volume.
+	const double GraceDistance = FMath::Max(0.0, static_cast<double>(GetTraceTrailRadius()));
 
 	// The head point itself always counts as exempt while emitting: it is the holder's own position
 	// this frame, not a place they have been.
@@ -1262,6 +1421,148 @@ void UTraceTrailComponent::MulticastClearTrail_Implementation()
 	}
 }
 
+// =================================================================================================
+// SPEC v7 §7 — THE CLIENT TETHER BUG
+//
+// THE REPORT, verbatim, from a joining client at 40 ping: "The far end of the trace seems to be
+// pulled back towards their character model, so that both ends of the trace are tied to the
+// character instead of just the most recent part of the trace."
+//
+// THE SPEC'S LEAD WAS WRONG, AND CHECKING IT FIRST IS WHY THIS IS THE RIGHT FIX. The suspicion was
+// that the ribbon pieces attach with KeepRelativeTransform and never get SetAbsolute(true,true,true),
+// so they ride the character. They do get it: EnsureRibbonElement builds every piece through
+// CreatePooledMesh, and CreatePooledMesh calls SetAbsolute on the line after the attach — the same
+// call the ghost path makes. Both renderer arms share it. Nothing drawn by this component inherits
+// the carrier's transform, and no amount of stale frames could make it.
+//
+// THE ACTUAL MECHANISM IS IN THE ENGINE'S DELTA SERIALISER, AND IT IS THE DATA THAT MOVES, NOT THE
+// MESHES. FFastArraySerializer applies removals like this
+// (Engine/Source/Runtime/Net/Core/Classes/Net/Serialization/FastArraySerializer.h):
+//
+//     Items.RemoveAtSwap(DeleteIndex, EAllowShrinking::No);
+//
+// RemoveAtSwap, not RemoveAt. A receiving machine therefore has NO ordering guarantee at all, and
+// this component's entire model — "Items are strictly ordered oldest-first" — is an authority-only
+// truth. The server retires points from the FRONT, so index 0 is what gets deleted, and RemoveAtSwap
+// fills the hole with the LAST element: the newest point, the one under the carrier's own feet.
+// After one removal the client's array reads [newest, second-oldest, third-oldest, ...], so the
+// polyline everything is drawn from now starts AT THE CARRIER, runs out to the far end of the trace,
+// and comes back. Both ends tied to the character. That is the report, exactly, and it is not a
+// rendering artefact — the client's idea of where the trace IS has been corrupted.
+//
+// WHY THE HOST NEVER SEES IT: authority mutates Items directly with RemoveAt(0, N), which preserves
+// order. It has nothing to do with the host rebuilding more often.
+//
+// WHY IT GOT WORSE WITH PING rather than appearing at all: it needs a removal to have happened, and
+// it is repaired-looking on any frame where the swapped-in point is close to where the tail was. At
+// 40ms the client sits on the corrupted array across several frames of the carrier's movement, so
+// the segment from slot 0 to the carrier stretches and the tether is unmistakable.
+//
+// THE FIX IS TO REPAIR THE ARRAY, not to draw around it. Every other reader in the project indexes
+// TrailPoints.Items directly and assumes path order — ComputeLastLethalIndex, the bots' intercept
+// planning, TraceParry's verifier, the GameMode's trail-kill probe. A private sorted copy inside the
+// renderer would have fixed the picture and left all of them holding a scrambled path.
+// =================================================================================================
+
+bool UTraceTrailComponent::RestoreReplicatedPointOrder()
+{
+	if (GClientOrderFix == 0)
+	{
+		return false;   // The BEFORE arm. See Trace.Trail.ClientOrderFix.
+	}
+
+	const AActor* Owner = GetOwner();
+	if (Owner == nullptr || Owner->HasAuthority())
+	{
+		// Authority OWNS the order and is the only writer. Sorting here would be a no-op at best and,
+		// if a point set were ever legitimately non-monotonic, would silently rewrite the truth.
+		return false;
+	}
+
+	const int32 PointCount = TrailPoints.Items.Num();
+	if (PointCount < 2)
+	{
+		return false;
+	}
+
+	// The common case is a single O(n) scan that finds nothing: n is ~21 points at the v7 §2 length.
+	bool bOutOfOrder = false;
+	for (int32 Index = 1; Index < PointCount; ++Index)
+	{
+		if (TrailPoints.Items[Index].BirthServerTime < TrailPoints.Items[Index - 1].BirthServerTime)
+		{
+			bOutOfOrder = true;
+			break;
+		}
+	}
+
+	if (!bOutOfOrder)
+	{
+		return false;
+	}
+
+	// BirthServerTime is the authority's own shared-clock stamp, replicated with the point and never
+	// touched on a client, so it is the one field that still knows the true path order after the swap.
+	// Stable, so points stamped in the same tick (which the append gate makes impossible, but a
+	// pathological spacing could not rule out) keep whatever relative order they arrived in.
+	TrailPoints.Items.StableSort([](const FTraceTrailPoint& A, const FTraceTrailPoint& B)
+	{
+		return A.BirthServerTime < B.BirthServerTime;
+	});
+
+	// ItemMap maps ReplicationID -> index into Items, and we have just moved every index. Emptying it
+	// is what forces the engine's ConditionalRebuildItemMap to rebuild it against the new layout on
+	// the next delta (its guard is ItemMap.Num() != Items.Num()); without this, the next
+	// PostReplicatedChange would write the update for one point into a different point. This is
+	// exactly what the engine itself does on the line after its own RemoveAtSwap loop.
+	TrailPoints.ItemMap.Empty();
+
+	++PointOrderRepairs;
+	bVisualsDirty = true;
+
+	UE_LOG(LogTraceGame, Verbose,
+		TEXT("[TRACEORDER] %s: repaired a scrambled replicated trace (%d points, repair #%d). "
+		     "FFastArraySerializer removes with RemoveAtSwap - see RestoreReplicatedPointOrder()."),
+		*GetNameSafe(GetOwner()), PointCount, PointOrderRepairs);
+
+	return true;
+}
+
+int32 UTraceTrailComponent::CountPointOrderViolations() const
+{
+	int32 Violations = 0;
+	for (int32 Index = 1; Index < TrailPoints.Items.Num(); ++Index)
+	{
+		if (TrailPoints.Items[Index].BirthServerTime < TrailPoints.Items[Index - 1].BirthServerTime)
+		{
+			++Violations;
+		}
+	}
+	return Violations;
+}
+
+float UTraceTrailComponent::MeasureTailDistanceToCarrier() const
+{
+	const ATraceCharacter* Holder = GetOwnerCharacter();
+	if (Holder == nullptr || TrailPoints.Items.Num() == 0)
+	{
+		return -1.f;
+	}
+
+	return static_cast<float>(FVector::Dist(
+		FVector(TrailPoints.Items[0].Location), Holder->GetActorLocation()));
+}
+
+float UTraceTrailComponent::MeasureTraceLength() const
+{
+	double Length = 0.0;
+	for (int32 Index = 1; Index < TrailPoints.Items.Num(); ++Index)
+	{
+		Length += FVector::Dist(TrailPoints.Items[Index - 1].Location, TrailPoints.Items[Index].Location);
+	}
+	return static_cast<float>(Length);
+}
+
 void UTraceTrailComponent::OnTrailPointsChanged()
 {
 	// Called once per changed item from FTraceTrailPoint's replication callbacks, which means it
@@ -1284,31 +1585,7 @@ void UTraceTrailComponent::ServerUpdateTrail()
 	const float Now = GetServerTimeSeconds();
 	bool bChanged = false;
 
-	// 1. Expire. Items are strictly ordered oldest-first, so the first survivor ends the scan.
-	const float Lifetime = GetTraceLifetimeSeconds();
-	int32 ExpiredCount = 0;
-	while (ExpiredCount < TrailPoints.Items.Num()
-		&& (Now - TrailPoints.Items[ExpiredCount].BirthServerTime) > Lifetime)
-	{
-		++ExpiredCount;
-	}
-	if (ExpiredCount > 0)
-	{
-		TrailPoints.Items.RemoveAt(0, ExpiredCount);
-		TrailPoints.MarkArrayDirty();
-		bChanged = true;
-	}
-
-	// 2. Hard cap, oldest dropped first.
-	const int32 MaxPoints = FMath::Max(2, Settings.MaxTrailPoints);
-	if (TrailPoints.Items.Num() > MaxPoints)
-	{
-		TrailPoints.Items.RemoveAt(0, TrailPoints.Items.Num() - MaxPoints);
-		TrailPoints.MarkArrayDirty();
-		bChanged = true;
-	}
-
-	// 3. Append, distance-gated so a stationary holder does not spam identical points.
+	// 1. Append, distance-gated so a stationary holder does not spam identical points.
 	//
 	//    THE TRANSFER GRACE LIVES RIGHT HERE, AND ONLY HERE (§2; 0.4s since v3 §1). For its duration
 	//    the new holder runs around laying nothing. Everything else about the emission window is
@@ -1359,6 +1636,57 @@ void UTraceTrailComponent::ServerUpdateTrail()
 			TrailPoints.MarkItemDirty(NewPoint);
 			bChanged = true;
 		}
+	}
+
+	// 2. TRIM THE TAIL TO THE MAXIMUM LENGTH (spec v7 §1-2). THIS IS THE ONLY THING THAT RETIRES A
+	//    POINT, and it runs AFTER the append for the reason the whole change exists: a point can
+	//    only be pushed off the back by new trace arriving at the front. There is no clock in this
+	//    block, and there must never be one again — the user's exploit was "stand still, the timer
+	//    empties your trace, and you cannot be killed", and the trace is the only counterplay to a
+	//    shielded carrier. A stationary holder appends nothing, so nothing here fires, so they keep
+	//    every point they have laid for as long as they hold the Core.
+	//
+	//    Whole points are dropped rather than sliding the tail point along its first segment. The
+	//    length therefore lands in (Max - TrailPointSpacing, Max] instead of exactly on Max, which
+	//    is the same 60uu granularity the tail has always receded at — and sliding the point would
+	//    mean re-replicating item 0 on every server tick a carrier is moving, for a smoothness the
+	//    old timer never had either.
+	const double MaxLength = static_cast<double>(GetTraceMaxLengthUU());
+	if (TrailPoints.Items.Num() > 2)
+	{
+		double PathLength = 0.0;
+		for (int32 Index = 1; Index < TrailPoints.Items.Num(); ++Index)
+		{
+			PathLength += FVector::Dist(TrailPoints.Items[Index - 1].Location, TrailPoints.Items[Index].Location);
+		}
+
+		int32 DropCount = 0;
+		while ((TrailPoints.Items.Num() - DropCount) > 2 && PathLength > MaxLength)
+		{
+			PathLength -= FVector::Dist(
+				TrailPoints.Items[DropCount].Location,
+				TrailPoints.Items[DropCount + 1].Location);
+			++DropCount;
+		}
+
+		if (DropCount > 0)
+		{
+			TrailPoints.Items.RemoveAt(0, DropCount);
+			TrailPoints.MarkArrayDirty();
+			bChanged = true;
+		}
+	}
+
+	// 3. Hard cap on POINTS, oldest dropped first. Not an expiry rule — a memory and bandwidth
+	//    ceiling that the length cap already keeps two orders of magnitude clear of (1200uu at 60uu
+	//    spacing is ~21 points against MaxTrailPoints 256). It survives as the backstop for a
+	//    pathological spacing setting.
+	const int32 MaxPoints = FMath::Max(2, Settings.MaxTrailPoints);
+	if (TrailPoints.Items.Num() > MaxPoints)
+	{
+		TrailPoints.Items.RemoveAt(0, TrailPoints.Items.Num() - MaxPoints);
+		TrailPoints.MarkArrayDirty();
+		bChanged = true;
 	}
 
 	if (bChanged)
@@ -1471,8 +1799,11 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		MinTeleportSweepDistance,
 		static_cast<double>(Settings.DashSpeed) * static_cast<double>(DeltaTime) * 2.0);
 
-	const double TrailRadius = FMath::Max(0.0, static_cast<double>(Settings.TrailRadius));
-	const double TrailHalfHeight = FMath::Max(0.0, static_cast<double>(Settings.TrailHeight)) * 0.5;
+	// SPEC v7 §3. THE SAME TWO FUNCTIONS THE RIBBON IS DRAWN FROM — this is the line that makes
+	// "the lethal volume matches the drawn volume" structural. 22.5uu to either side, 63uu tall,
+	// centred on the trail point (which is the carrier's actor location, i.e. mid-model).
+	const double TrailRadius = FMath::Max(0.0, static_cast<double>(GetTraceTrailRadius()));
+	const double TrailHalfHeight = FMath::Max(0.0, static_cast<double>(GetTraceTrailHeight())) * 0.5;
 
 	ATraceCharacter* Tripper = nullptr;
 
@@ -1658,7 +1989,7 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 			UE_LOG(LogTraceGame, Log,
 				TEXT("[TRACEDASH] %s dashed through the NON-DRAWN head stub of %s's trace: NO KILL (emitter footprint, %.0fuu). points=%d lethal=%d"),
 				*GetNameSafe(Candidate), *GetNameSafe(Holder),
-				static_cast<double>(Settings.TrailRadius), TrailPoints.Items.Num(), TestPositions.Num());
+				static_cast<double>(GetTraceTrailRadius()), TrailPoints.Items.Num(), TestPositions.Num());
 		}
 	}
 
@@ -2087,14 +2418,13 @@ void UTraceTrailComponent::RebuildVisuals()
 
 FTraceSmearStyle UTraceTrailComponent::MakeSmearStyle() const
 {
-	const UTraceSettings& Settings = UTraceSettings::Get();
 
 	FTraceSmearStyle Style;
 
 	// Derived from the lethal volume, never chosen. If TrailRadius/TrailHeight are retuned the smear
 	// moves with them, because it is the drawn statement of where they are.
-	Style.Width = FMath::Max(1.0, 2.0 * static_cast<double>(Settings.TrailRadius));
-	Style.Height = FMath::Max(1.0, static_cast<double>(Settings.TrailHeight));
+	Style.Width = FMath::Max(1.0, 2.0 * static_cast<double>(GetTraceTrailRadius()));
+	Style.Height = FMath::Max(1.0, static_cast<double>(GetTraceTrailHeight()));
 
 	// THE SMEAR STEPS OUT OF THE MANNEQUINS' WAY ONLY WHEN THERE ARE MANNEQUINS — and that has to
 	// govern the GEOMETRY, not just the brightness.
@@ -2246,9 +2576,8 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float Invulnerab
 		return;
 	}
 
-	const UTraceSettings& Settings = UTraceSettings::Get();
 	const FTraceSmearStyle Style = MakeSmearStyle();
-	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
+	const double JointOverlap = FMath::Max(1.0, static_cast<double>(GetTraceTrailRadius()));
 
 	const float Lifetime = GetTraceLifetimeSeconds();
 	const float Now = GetServerTimeSeconds();
@@ -2484,7 +2813,7 @@ void UTraceTrailComponent::RebuildRibbon(int32 LethalPointCount, float Invulnera
 	CacheMeshMetrics();
 
 	PlaceRibbon(SmearMeshes, SmearMaterials, SmearBaseGlow, SmearAppliedGlowScale,
-		MaxRibbonElements, InvulnerableScale, /*bAgeFade=*/true, /*bOnlyOwnerSees=*/false,
+		MaxRibbonElements, InvulnerableScale, /*bTailFade=*/true, /*bOnlyOwnerSees=*/false,
 		/*bOverlapAtStart=*/false);
 }
 
@@ -2495,7 +2824,7 @@ void UTraceTrailComponent::PlaceRibbon(
 	TArray<float>& AppliedScaleOut,
 	int32 MaxElements,
 	float InvulnerableScale,
-	bool bAgeFade,
+	bool bTailFade,
 	bool bOnlyOwnerSees,
 	bool bOverlapAtStart)
 {
@@ -2512,23 +2841,47 @@ void UTraceTrailComponent::PlaceRibbon(
 		return;
 	}
 
-	const UTraceSettings& Settings = UTraceSettings::Get();
 
 	// EXACTLY the lethal cross-section, both axes, unless somebody has explicitly dialled the width
 	// down with Trace.Trail.RibbonWidthScale (default 1.0 — see the comment there for what a
 	// narrower ribbon costs the player). A boundary drawn narrower than it really is turns the trace
 	// into a trap rather than a warning.
-	const double LethalWidth = FMath::Max(1.0, 2.0 * static_cast<double>(Settings.TrailRadius));
+	const double LethalWidth = FMath::Max(1.0, 2.0 * static_cast<double>(GetTraceTrailRadius()));
 	const double Width = LethalWidth * FMath::Clamp(static_cast<double>(GRibbonWidthScale), 0.05, 2.0);
-	const double Height = FMath::Max(1.0, static_cast<double>(Settings.TrailHeight));
+	const double Height = FMath::Max(1.0, static_cast<double>(GetTraceTrailHeight()));
 
 	// Half a body width of overlap at interior joints — enough to close the wedge on the outside of a
 	// corner up to a 90-degree turn between two consecutive elements.
-	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
+	const double JointOverlap = FMath::Max(1.0, static_cast<double>(GetTraceTrailRadius()));
 
-	const float Lifetime = GetTraceLifetimeSeconds();
-	const float Now = GetServerTimeSeconds();
 	const float RibbonGlow = ResolvedRibbonGlow();
+
+	// THE FADE IS ALONG THE LENGTH NOW, NOT THROUGH TIME (spec v7 §1).
+	//
+	// It used to ramp on each sample's AGE against the lifetime, which was honest while age was what
+	// retired a point. It no longer is: a carrier who stands still keeps their trace forever, so an
+	// age ramp would quietly dim a perfectly lethal trace to its floor and tell the player it was
+	// about to expire when nothing of the kind was happening. Distance back from the head is now the
+	// thing that predicts what dies next, so distance back from the head is what the gradient shows.
+	//
+	// Computed as a cumulative arc length over the samples — the same samples the elements are placed
+	// between — so it stays a smooth ramp along the ribbon rather than a step per element.
+	double RibbonTotalLength = 0.0;
+	TArray<double, TInlineAllocator<128>> SampleDistance;
+	if (bTailFade)
+	{
+		SampleDistance.Reserve(RibbonSamples.Num());
+		SampleDistance.Add(0.0);
+		for (int32 Index = 1; Index < RibbonSamples.Num(); ++Index)
+		{
+			RibbonTotalLength += FVector::Dist(RibbonSamples[Index - 1], RibbonSamples[Index]);
+			SampleDistance.Add(RibbonTotalLength);
+		}
+	}
+
+	// The trace is trimmed to this, so distance-from-head divided by it is "how close this stretch is
+	// to being the next thing pushed off the tail" — which is exactly what the gradient means.
+	const double FadeLength = FMath::Max(1.0, static_cast<double>(GetTraceMaxLengthUU()));
 
 	const FVector HalfSize = (CubeMesh != nullptr) ? CubeHalfSize : CylinderHalfSize;
 	const FVector PivotOffset = (CubeMesh != nullptr) ? CubePivotOffset : CylinderPivotOffset;
@@ -2607,15 +2960,16 @@ void UTraceTrailComponent::PlaceRibbon(
 			Piece->SetOnlyOwnerSee(bOnlyOwnerSees);
 		}
 
-		// The age fade is a GRADIENT ALONG THE RIBBON, not a step per element: the birth time was
-		// interpolated to each sample when the curve was resampled, so consecutive elements differ by
-		// a percent or two and the eye reads a cooling ramp instead of a row of tiles. It never falls
-		// to zero — an old stretch of trace is exactly as lethal as a new one.
+		// The tail fade is a GRADIENT ALONG THE RIBBON, not a step per element: it is evaluated at
+		// each element's own arc length, so consecutive elements differ by a percent or two and the
+		// eye reads a cooling ramp instead of a row of tiles. It never falls to zero — a stretch of
+		// trace near the tail is exactly as lethal as one at the head, and the moment it stops being
+		// lethal it stops being drawn.
 		float FadeScale = 1.f;
-		if (bAgeFade && RibbonSampleBirth.IsValidIndex(ElementIndex + 1))
+		if (bTailFade && SampleDistance.IsValidIndex(ElementIndex + 1))
 		{
-			const float Age = FMath::Max(0.f, Now - RibbonSampleBirth[ElementIndex + 1]);
-			const float Remaining = FMath::Clamp(1.f - (Age / FMath::Max(0.01f, Lifetime)), 0.f, 1.f);
+			const double DistanceFromHead = FMath::Max(0.0, RibbonTotalLength - SampleDistance[ElementIndex + 1]);
+			const float Remaining = static_cast<float>(FMath::Clamp(1.0 - (DistanceFromHead / FadeLength), 0.0, 1.0));
 			FadeScale = FMath::Lerp(GhostOldestGlowScale, 1.f, Remaining);
 		}
 
@@ -2911,8 +3265,7 @@ void UTraceTrailComponent::UpdatePredictedHead()
 
 	CacheMeshMetrics();
 
-	const UTraceSettings& Settings = UTraceSettings::Get();
-	const double JointOverlap = FMath::Max(1.0, static_cast<double>(Settings.TrailRadius));
+	const double JointOverlap = FMath::Max(1.0, static_cast<double>(GetTraceTrailRadius()));
 
 	// The stub is the newest trace there is, so it takes the newest trace's brightness: no age fade,
 	// and the same parry / pass-window step the rest of the trace is wearing this frame. A stub that
@@ -2950,7 +3303,7 @@ void UTraceTrailComponent::UpdatePredictedHead()
 		// brightness and cannot read as older than the element behind it.
 		PlaceRibbon(PredictedSmearMeshes, PredictedSmearMaterials,
 			PredictedSmearBaseGlow, PredictedSmearAppliedGlowScale,
-			MaxPredictedRibbonElements, InvulnerableScale, /*bAgeFade=*/false, /*bOnlyOwnerSees=*/true,
+			MaxPredictedRibbonElements, InvulnerableScale, /*bTailFade=*/false, /*bOnlyOwnerSees=*/true,
 			/*bOverlapAtStart=*/true);
 
 		PredictedHeadLength = (PredictedSmearMeshes.Num() > 0) ? static_cast<float>(TotalLength) : 0.f;
@@ -4066,6 +4419,199 @@ namespace
 		}
 	}
 
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.TetherCheck — SPEC v7 §1 AND §7 IN ONE LINE PER TRACE, AND IT HAS TO BE RUN ON THE
+	// CLIENT.
+	//
+	// TAIL is the number the §7 bug report is about: the distance from the carrier to the OLDEST
+	// point in the array, i.e. to the far end of everything drawn off it. A healthy trace reads
+	// roughly its own length (~1200uu). With the tether, the fast array's RemoveAtSwap has put the
+	// NEWEST point — the one at the carrier's feet — into slot 0, so TAIL collapses towards zero
+	// while LEN stays long: the far end has been pulled back onto the character, which is exactly
+	// what was described. ORD counts adjacent pairs still out of chronological order, and FIX counts
+	// how many times this machine has had to put the array back together.
+	//
+	// Run it with Trace.Trail.ClientOrderFix 0 to see the failure, and with 1 to see it gone. LEN
+	// doubles as the §1/§2 readout: it must sit at or just under the max length and must NOT fall
+	// when a carrier stops moving.
+	// ---------------------------------------------------------------------------------------------
+	void DumpTetherCheck()
+	{
+		UWorld* World = FindTrailDebugWorld();
+		TArray<ATraceCharacter*> Characters;
+		GatherTrailDebugCharacters(World, Characters);
+
+		const TCHAR* NetRole = TEXT("unknown");
+		if (World != nullptr)
+		{
+			switch (World->GetNetMode())
+			{
+			case NM_Standalone:    NetRole = TEXT("standalone"); break;
+			case NM_ListenServer:  NetRole = TEXT("HOST");       break;
+			case NM_Client:        NetRole = TEXT("CLIENT");     break;
+			case NM_DedicatedServer: NetRole = TEXT("dedicated"); break;
+			default: break;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TETHER] netmode=%s orderFix=%d maxLen=%.0fuu radius=%.1fuu height=%.1fuu (spec v7 1-3,7). "
+			     "LEN = replicated path length. TAIL = uu from the carrier to the OLDEST point, i.e. to the "
+			     "far end of the drawn ribbon - it collapses towards 0 when the tether bug is present. "
+			     "ORD = adjacent pairs out of chronological order. FIX = order repairs this machine has made."),
+			NetRole, GClientOrderFix, UTraceTrailComponent::GetTraceMaxLengthUU(),
+			UTraceTrailComponent::GetTraceTrailRadius(), UTraceTrailComponent::GetTraceTrailHeight());
+
+		for (const ATraceCharacter* TraceChar : Characters)
+		{
+			const UTraceTrailComponent* Trail = (TraceChar != nullptr) ? TraceChar->Trail : nullptr;
+			if (Trail == nullptr || Trail->TrailPoints.Items.Num() == 0)
+			{
+				continue;
+			}
+
+			double MaxHalfWidth = 0.0;
+			double MaxHalfHeight = 0.0;
+			double WorstUncovered = 0.0;
+			int32 VisiblePieces = 0;
+			Trail->MeasureDrawnVolume(MaxHalfWidth, MaxHalfHeight, WorstUncovered, VisiblePieces);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TETHER]   %-26s localHuman=%d carrier=%d points=%3d lethal=%3d | LEN=%7.1fuu "
+				     "TAIL=%7.1fuu ORD=%d FIX=%d | drawn: pieces=%2d halfWidth=%5.1f halfHeight=%5.1f "
+				     "worstUncoveredLethal=%5.2fuu"),
+				*GetNameSafe(TraceChar), IsLocallyControlledHuman(TraceChar) ? 1 : 0,
+				TraceChar->IsCarrier() ? 1 : 0,
+				Trail->TrailPoints.Items.Num(), Trail->ComputeLastLethalIndex() + 1,
+				Trail->MeasureTraceLength(), Trail->MeasureTailDistanceToCarrier(),
+				Trail->CountPointOrderViolations(), Trail->GetPointOrderRepairCount(),
+				VisiblePieces, MaxHalfWidth, MaxHalfHeight, WorstUncovered);
+		}
+	}
+
+	FAutoConsoleCommand CmdTetherCheck(
+		TEXT("Trace.Trail.TetherCheck"),
+		TEXT("Trace.Trail.TetherCheck [IntervalSeconds] [Samples] - per trace: path length, distance from "
+		     "the carrier to the FAR end of it, replicated-order violations, and the drawn cross-section "
+		     "against the lethal one (spec v7 1-3, 7). Run it ON THE CLIENT."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Interval = (Args.Num() > 0) ? FMath::Max(0.05f, FCString::Atof(*Args[0])) : 0.f;
+			const int32 Samples = (Args.Num() > 1) ? FMath::Clamp(FCString::Atoi(*Args[1]), 1, 500) : 1;
+
+			if (Interval <= 0.f || Samples <= 1)
+			{
+				DumpTetherCheck();
+				return;
+			}
+
+			int32 Remaining = Samples;
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([Remaining](float /*DeltaTime*/) mutable -> bool
+				{
+					DumpTetherCheck();
+					return --Remaining > 0;
+				}), Interval);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.Geometry — spec v7 §3's invariant, stated as a PASS or a FAIL rather than as a
+	// screenshot. Both directions, because only one of them is the obvious one:
+	//
+	//   DRAWN <= LETHAL   no visible piece is wider or taller than the volume that kills. Failing
+	//                     this is visible ribbon that cannot kill.
+	//   LETHAL <= DRAWN   every lethal point is inside something on screen. Failing this is an
+	//                     invisible kill volume, which is the worse of the two.
+	//
+	// It also prints where each number came from, because v7 §3's values live in this file's CVars
+	// until the integrator moves them into UTraceSettings, and a shadowed settings knob that silently
+	// does nothing is a failure mode this project has already paid for once.
+	// ---------------------------------------------------------------------------------------------
+	FAutoConsoleCommand CmdTrailGeometry(
+		TEXT("Trace.Trail.Geometry"),
+		TEXT("Trace.Trail.Geometry - print the resolved lethal cross-section and max trace length, where "
+		     "each number came from, and whether the DRAWN volume matches the LETHAL one in both "
+		     "directions (spec v7 1-3)."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			const UTraceSettings& Settings = UTraceSettings::Get();
+
+			const float Radius = UTraceTrailComponent::GetTraceTrailRadius();
+			const float Height = UTraceTrailComponent::GetTraceTrailHeight();
+			const float MaxLength = UTraceTrailComponent::GetTraceMaxLengthUU();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TRAILGEOM] LETHAL == DRAWN cross-section: radius=%.2fuu (%s; UTraceSettings::TrailRadius=%.1f) "
+				     "height=%.2fuu (%s; UTraceSettings::TrailHeight=%.1f) | maxLength=%.0fuu (%s; "
+				     "TrailLifetime=%.2f x WalkSpeed=%.0f x 0.75 = %.0f) | spacing=%.0fuu -> ~%d points"),
+				Radius, (GTrailRadiusOverride >= 0.f) ? TEXT("Trace.Trail.Radius") : TEXT("settings"),
+				Settings.TrailRadius,
+				Height, (GTrailHeightOverride >= 0.f) ? TEXT("Trace.Trail.Height") : TEXT("settings"),
+				Settings.TrailHeight,
+				MaxLength, (GTrailMaxLength > 0.f) ? TEXT("Trace.Trail.MaxLength")
+					: ((Settings.TrailMaxLengthUU > 0.f) ? TEXT("settings::TrailMaxLengthUU") : TEXT("derived")),
+				Settings.TrailLifetime, Settings.WalkSpeed,
+				Settings.TrailLifetime * Settings.WalkSpeed * 0.75f,
+				Settings.TrailPointSpacing,
+				FMath::CeilToInt(MaxLength / FMath::Max(1.f, Settings.TrailPointSpacing)));
+
+			UWorld* World = FindTrailDebugWorld();
+			TArray<ATraceCharacter*> Characters;
+			GatherTrailDebugCharacters(World, Characters);
+
+			int32 Checked = 0;
+			int32 Failed = 0;
+
+			for (const ATraceCharacter* TraceChar : Characters)
+			{
+				const UTraceTrailComponent* Trail = (TraceChar != nullptr) ? TraceChar->Trail : nullptr;
+				if (Trail == nullptr || Trail->ComputeLastLethalIndex() < 0)
+				{
+					continue;
+				}
+
+				double MaxHalfWidth = 0.0;
+				double MaxHalfHeight = 0.0;
+				double WorstUncovered = 0.0;
+				int32 VisiblePieces = 0;
+				Trail->MeasureDrawnVolume(MaxHalfWidth, MaxHalfHeight, WorstUncovered, VisiblePieces);
+
+				if (VisiblePieces == 0)
+				{
+					continue;   // Nothing on screen to compare against (dedicated server, or renderer 2).
+				}
+
+				++Checked;
+
+				// One uu of slack: the alternating anti-Z-fight inset makes every other element 0.6%
+				// smaller, and a segment the carrier JUMPED along is deliberately drawn over the union
+				// of its two ends' vertical bands, so the height may legitimately exceed the flat
+				// cross-section by the segment's own rise. Width has no such allowance.
+				const double WidthLimit = static_cast<double>(Radius) + 1.0;
+				const bool bWidthOk = MaxHalfWidth <= WidthLimit;
+				const bool bCoverOk = WorstUncovered <= 1.0;
+
+				if (!bWidthOk || !bCoverOk)
+				{
+					++Failed;
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[TRAILGEOM]   %-26s lethalPoints=%3d visiblePieces=%2d | drawn halfWidth=%5.2f "
+					     "(lethal %5.2f) %s | drawn halfHeight=%5.2f (lethal flat %5.2f, +rise on jumps) | "
+					     "worstUncoveredLethalPoint=%5.2fuu %s"),
+					*GetNameSafe(TraceChar), Trail->ComputeLastLethalIndex() + 1, VisiblePieces,
+					MaxHalfWidth, static_cast<double>(Radius), bWidthOk ? TEXT("OK") : TEXT("** WIDER THAN LETHAL **"),
+					MaxHalfHeight, static_cast<double>(Height) * 0.5,
+					WorstUncovered, bCoverOk ? TEXT("OK") : TEXT("** LETHAL BUT NOT DRAWN **"));
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TRAILGEOM] %s - %d trace(s) checked, %d violation(s)."),
+				(Checked > 0 && Failed == 0) ? TEXT("PASS") : (Checked == 0 ? TEXT("NO DATA") : TEXT("FAIL")),
+				Checked, Failed);
+		}));
+
 	FAutoConsoleCommand CmdDebugHeadGap(
 		TEXT("Trace.Trail.DebugHeadGap"),
 		TEXT("Trace.Trail.DebugHeadGap [IntervalSeconds] [Samples] - measure the gap between a carrier and "
@@ -4126,10 +4672,46 @@ namespace
 		int32 LethalAtSweep = 0;
 		bool bCarrierWasLocalHuman = false;
 
+		/**
+		 * DID THE CARRIER SPEND ANY PART OF THIS RUN INSIDE A DESIGNED INVULNERABILITY WINDOW?
+		 *
+		 * THIS FIELD EXISTS BECAUSE THE HARNESS WAS CALLING CORRECT BEHAVIOUR A FAILURE. Scoring was
+		 * a bare `Carrier->IsAlive()`, which cannot tell "the newest visible segment is not lethal"
+		 * (a real bug, and the whole point of this test) apart from "the trip test deliberately
+		 * declined to kill" — and there are exactly two ways it declines, both of them shipped rules:
+		 *
+		 *   * spec v4 §4, THE PASS WINDOW. From the instant the holder inputs a pass until it
+		 *     completes or cancels, the trace CANNOT be broken. That is the risk beat the passer is
+		 *     paid for, and a bot carrier hovering a pass is a completely ordinary thing to catch.
+		 *   * spec v3 §3, THE PARRY. 0.1s, carrier-only. Trace.TestParry already models this one;
+		 *     this harness did not.
+		 *
+		 * Measured on the shipping build: 51 PASS / 2 FAIL over 53 runs, and BOTH "failures" have the
+		 * engine's own verdict logged one line above them — "[TRACEDASH] ... NO KILL - pass window
+		 * invulnerable (spec 4) ... passWindow=1", followed 21 ms later by "Core: pass completed".
+		 * The trace was fine; the scoreboard was wrong. An unattributed intermittent failure on the
+		 * project's headline lethality invariant is exactly the kind of noise that gets a real
+		 * regression waved through later, so the run is now EXEMPTED and says why.
+		 *
+		 * Sampled across phases 1-3 rather than once: the window can open or close between the frame
+		 * the dash is issued and the frame the sweep resolves, and either overlap is enough to make
+		 * the outcome unusable as evidence about geometry.
+		 */
+		bool bInvulnerableAtSweep = false;
+
 		int32 KilledCount = 0;
 		int32 SurvivedCount = 0;
 		int32 AbortedCount = 0;
+		int32 ExemptCount = 0;
 	};
+
+	/** True while the trip test is under standing orders NOT to kill this carrier (v4 §4 / v3 §3). */
+	bool IsCarrierInvulnerableByDesign(const ATraceCharacter* Carrier)
+	{
+		const UTraceTrailComponent* Trail = (Carrier != nullptr) ? Carrier->Trail : nullptr;
+		return (Trail != nullptr)
+			&& (Trail->IsPassWindowInvulnerable() || Trail->IsParryActive());
+	}
 
 	bool TickHeadGapTest(FHeadGapTestState& State)
 	{
@@ -4141,10 +4723,22 @@ namespace
 
 		if (State.RunIndex >= State.TotalRuns)
 		{
+			// The verdict is over SCORED runs only. Exempt and aborted runs are reported separately
+			// and excluded from the denominator, because neither one measured the thing.
+			const int32 Scored = State.KilledCount + State.SurvivedCount;
+
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[HEADGAPTEST] DONE. %d/%d dashes through the NEWEST DRAWN segment killed the carrier, "
-				     "%d did not, %d aborted. The newest visible segment is lethal iff killed == runs."),
-				State.KilledCount, State.TotalRuns, State.SurvivedCount, State.AbortedCount);
+				TEXT("[HEADGAPTEST] DONE. %d of %d SCORED dashes through the NEWEST DRAWN segment killed the "
+				     "carrier, %d did not. (%d exempt: carrier inside the pass window or a parry, spec v4 4 / "
+				     "v3 3; %d aborted; %d runs requested.) The newest visible segment is lethal iff "
+				     "killed == scored. %s"),
+				State.KilledCount, Scored, State.SurvivedCount,
+				State.ExemptCount, State.AbortedCount, State.TotalRuns,
+				(Scored > 0 && State.KilledCount == Scored)
+					? TEXT("VERDICT: PASS.")
+					: (Scored == 0
+						? TEXT("VERDICT: NO DATA - every run was exempt or aborted.")
+						: TEXT("VERDICT: *** FAIL ***.")));
 			return false;
 		}
 
@@ -4270,6 +4864,7 @@ namespace
 			State.PredictedAtSweep = Carrier->Trail->GetPredictedHeadLength();
 			State.LethalAtSweep = LastLethal + 1;
 			State.bCarrierWasLocalHuman = IsLocallyControlledHuman(Carrier);
+			State.bInvulnerableAtSweep = IsCarrierInvulnerableByDesign(Carrier);
 
 			const FVector DashStart = Midpoint + Across * 260.0;
 			State.DashEnd = Midpoint - Across * 240.0;
@@ -4298,6 +4893,10 @@ namespace
 		// ---- phase 2: the frame the trip test resolves ------------------------------------------
 		if (State.Phase == 2)
 		{
+			// Re-sampled here, not only when the dash was issued: this is the frame the sweep is
+			// actually evaluated, so this is the reading that decides whether the outcome is evidence.
+			State.bInvulnerableAtSweep |= IsCarrierInvulnerableByDesign(State.Carrier.Get());
+
 			ATraceCharacter* Tripper = State.Tripper.Get();
 			if (Tripper == nullptr)
 			{
@@ -4334,6 +4933,8 @@ namespace
 		// ---- phase 3: off the trace, so the run measures ONE sweep ------------------------------
 		if (State.Phase == 3)
 		{
+			State.bInvulnerableAtSweep |= IsCarrierInvulnerableByDesign(State.Carrier.Get());
+
 			if (ATraceCharacter* Tripper = State.Tripper.Get())
 			{
 				Tripper->SetActorLocation(State.TripperHome, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
@@ -4351,7 +4952,23 @@ namespace
 
 		{
 			const bool bCarrierAlive = (Carrier != nullptr) && Carrier->IsAlive();
-			if (bCarrierAlive)
+
+			// A survival inside the pass window or the parry is the trip test obeying spec v4 §4 /
+			// v3 §3, not the geometry failing — see FHeadGapTestState::bInvulnerableAtSweep. It is
+			// EXEMPTED rather than passed: the run produced no evidence either way about whether the
+			// newest visible segment is lethal, and counting it as a PASS would let a genuinely dead
+			// segment hide behind a carrier who happened to be passing.
+			//
+			// A survival is only ever exempted. A KILL is scored normally however invulnerable the
+			// carrier was supposed to be — a kill that lands inside a protection window is a real
+			// defect and this harness must not become the place it goes unnoticed.
+			const bool bExempt = bCarrierAlive && State.bInvulnerableAtSweep;
+
+			if (bExempt)
+			{
+				++State.ExemptCount;
+			}
+			else if (bCarrierAlive)
 			{
 				++State.SurvivedCount;
 			}
@@ -4365,10 +4982,17 @@ namespace
 				     "(gapToFeet was %.1fuu, predicted %.1fuu)"),
 				State.RunIndex + 1, State.TotalRuns,
 				bCarrierAlive ? TEXT("SURVIVED") : TEXT("DIED (trace broken)"),
-				bCarrierAlive ? TEXT("*** FAIL - the newest visible segment did not kill ***") : TEXT("PASS"),
+				bExempt
+					? TEXT("EXEMPT - the carrier was inside the pass window or a parry, so the trip test "
+					       "was under orders not to kill (spec v4 4 / v3 3). Not evidence either way; "
+					       "this run is not scored")
+					: (bCarrierAlive
+						? TEXT("*** FAIL - the newest visible segment did not kill ***")
+						: TEXT("PASS")),
 				State.GapAtSweep, State.PredictedAtSweep);
 
 			++State.RunIndex;
+			State.bInvulnerableAtSweep = false;
 			State.ScratchCount = 0;
 			State.Phase = 0;
 			State.Carrier = nullptr;
@@ -4907,6 +5531,74 @@ void UTraceTrailComponent::DestroyVisualPool()
 // =================================================================================================
 // MEASUREMENT (spec v6 §1)
 // =================================================================================================
+
+void UTraceTrailComponent::MeasureDrawnVolume(double& OutMaxHalfWidth, double& OutMaxHalfHeight,
+	double& OutWorstUncovered, int32& OutVisiblePieces) const
+{
+	OutMaxHalfWidth = 0.0;
+	OutMaxHalfHeight = 0.0;
+	OutWorstUncovered = 0.0;
+	OutVisiblePieces = 0;
+
+	// Only the REPLICATED pool. The owner-only predicted stub is deliberately drawn where nothing is
+	// lethal yet, so including it would report a violation that is documented, intended, and invisible
+	// to anybody who could be killed by it (see UpdatePredictedHead).
+	TArray<const UStaticMeshComponent*, TInlineAllocator<128>> Visible;
+	for (const UStaticMeshComponent* Piece : SmearMeshes)
+	{
+		if (Piece != nullptr && Piece->IsVisible() && Piece->GetStaticMesh() != nullptr)
+		{
+			Visible.Add(Piece);
+			++OutVisiblePieces;
+		}
+	}
+
+	// DIRECTION ONE: nothing drawn may be WIDER OR TALLER than the volume that kills. A visible
+	// ribbon that cannot kill is the "I dashed through it and nothing happened" bug wearing a
+	// different hat. The local Y axis is the ribbon's width and Z is its height; X is its length
+	// along the path and is not a cross-section.
+	for (const UStaticMeshComponent* Piece : Visible)
+	{
+		const FBox LocalBox = Piece->GetStaticMesh()->GetBoundingBox();
+		const FVector LocalExtent = LocalBox.GetExtent();
+		const FVector Scale = Piece->GetComponentScale();
+
+		OutMaxHalfWidth = FMath::Max(OutMaxHalfWidth, FMath::Abs(LocalExtent.Y * Scale.Y));
+		OutMaxHalfHeight = FMath::Max(OutMaxHalfHeight, FMath::Abs(LocalExtent.Z * Scale.Z));
+	}
+
+	// DIRECTION TWO: every LETHAL point must be inside something that is on screen. Measured as the
+	// distance from the point to the nearest visible piece's oriented box — clamping in the piece's
+	// own local space and transforming back is the exact closest point on an OBB, which an
+	// axis-aligned world bounds test would only approximate (and would approximate in the flattering
+	// direction).
+	const int32 LethalCount = ComputeLastLethalIndex() + 1;
+	for (int32 PointIndex = 0; PointIndex < LethalCount && Visible.Num() > 0; ++PointIndex)
+	{
+		const FVector Point(TrailPoints.Items[PointIndex].Location);
+
+		double Nearest = TNumericLimits<double>::Max();
+		for (const UStaticMeshComponent* Piece : Visible)
+		{
+			const FTransform& PieceTransform = Piece->GetComponentTransform();
+			const FBox LocalBox = Piece->GetStaticMesh()->GetBoundingBox();
+
+			const FVector Local = PieceTransform.InverseTransformPosition(Point);
+			const FVector Clamped(
+				FMath::Clamp(Local.X, LocalBox.Min.X, LocalBox.Max.X),
+				FMath::Clamp(Local.Y, LocalBox.Min.Y, LocalBox.Max.Y),
+				FMath::Clamp(Local.Z, LocalBox.Min.Z, LocalBox.Max.Z));
+
+			Nearest = FMath::Min(Nearest, FVector::Dist(Point, PieceTransform.TransformPosition(Clamped)));
+			if (Nearest <= 0.01)
+			{
+				break;
+			}
+		}
+
+		OutWorstUncovered = FMath::Max(OutWorstUncovered, Nearest);
+	}
+}
 
 void UTraceTrailComponent::CountDrawnPieces(int32& OutStaticVisible, int32& OutSkinnedVisible) const
 {

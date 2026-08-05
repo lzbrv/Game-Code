@@ -14,6 +14,14 @@
 //     takes the Core. Walking or running through it does nothing at all. Teammates never trip it.
 //     Dashing through the trace is the only counterplay to an otherwise shielded holder.
 //
+// THE TRACE EXPIRES BY LENGTH, NOT BY TIME (spec v7 §1, and this replaced the timer rather than
+// layering over it). A point leaves the TAIL only when the total path length exceeds
+// GetTraceMaxLengthUU() — i.e. only when NEW trace is spawned at the head. A carrier who stands
+// still therefore keeps their entire trace indefinitely, which is the whole point: the trace is the
+// only way to kill a carrier, so a timer made "stand still and become unkillable" a real exploit.
+// There is deliberately no surviving time-based expiry anywhere in this file; reintroducing one
+// reintroduces the exploit. The 0.4s TURNOVER GRACE is a separate mechanism and still applies.
+//
 // Three rules sit on top of that and are implemented here:
 //
 //   GRACE (§2)          After the Core changes TEAM, the trace does not begin to form for
@@ -127,11 +135,14 @@ struct FTraceGhostRecord
  */
 struct FTraceSmearStyle
 {
-	/** Full lethal width — 2 x TrailRadius. Never a flattering fraction of it. */
-	double Width = 90.0;
+	/**
+	 * Full lethal width — 2 x UTraceTrailComponent::GetTraceTrailRadius(). Never a flattering
+	 * fraction of it. v7 §3 halved the radius (45 -> 22.5), so this is 45 rather than 90.
+	 */
+	double Width = 45.0;
 
-	/** Full lethal height — TrailHeight. */
-	double Height = 190.0;
+	/** Full lethal height — GetTraceTrailHeight(). v7 §3: the middle third, 190 -> ~63. */
+	double Height = 63.0;
 
 	/** Body band placement within the lethal height. Spans the whole column when ghosts are off. */
 	double BodyCentreFrac = 0.19;
@@ -277,6 +288,19 @@ public:
 	/** Seconds until this holder may parry again; 0 means ready. For the HUD pip. */
 	float GetParryCooldownRemaining() const;
 
+	/**
+	 * SPEC v7 §6. SERVER. Clears the parry cooldown outright, so the carrier may parry again NOW.
+	 *
+	 * Verbatim: "when a player carrying the trace successfully kills an enemy with a parry, reset
+	 * that players parry cooldown to zero". Called from exactly one place, TraceParry's
+	 * ServerRefundOnParryKill, and only after the kill has actually landed.
+	 *
+	 * ForceNetUpdate because ParryCooldownEndServerTime is what the owning client's HUD pip reads:
+	 * a refund the player cannot see until the next scheduled update is a refund they will not use.
+	 * Silently ignored off the authority — the cooldown is server truth, and always has been.
+	 */
+	void ServerResetParryCooldown();
+
 	/** The colour last pushed to the after-image materials. Debug readout for Trace.DebugParry. */
 	FLinearColor GetAppliedTraceColor() const { return AppliedColor; }
 
@@ -309,8 +333,40 @@ public:
 	 */
 	void OnTrailPointsChanged();
 
-	/** Spec §3: 4 seconds. Exposed so the bots' intercept planning can agree with the truth. */
+	/**
+	 * NO LONGER THE EXPIRY RULE (v7 §1). Points are not retired by age any more — see
+	 * GetTraceMaxLengthUU(). This survives as the AGE-FADE reference for the legacy measurement
+	 * renderer (Trace.Trail.Renderer 0) and as the number Trace.DumpSettings prints, and it is still
+	 * the derivation input for the default max length. Anything that asks it "is this point still
+	 * alive?" is asking the wrong question and will be wrong for a stationary carrier.
+	 */
 	static float GetTraceLifetimeSeconds();
+
+	// ------------------------------------------------------------------------------------------
+	// THE THREE NUMBERS THE MECHANIC NOW HANGS ON (spec v7 §§1-3).
+	//
+	// Static and public because the trip test, the drawing, the bots' intercept planning and the
+	// third-person camera all have to agree about the same volume. Every one of them is resolved
+	// through these functions and nothing in this file reads UTraceSettings::TrailRadius /
+	// TrailHeight directly any more — one number, one place, so "the lethal volume matches the drawn
+	// volume" is structural rather than maintained by hand.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * v7 §§1-2: the maximum LENGTH of the trace in uu, measured along the path. Points leave the
+	 * tail only when a new one at the head pushes the total past this — never because time passed.
+	 *
+	 * Default 1200: TrailLifetime (2.0s) x WalkSpeed (800uu/s) = 1600uu, minus the 25% the spec
+	 * asks for. Derived from those two live-editable settings rather than hardcoded so it still
+	 * responds to the settings panel; Trace.Trail.MaxLength overrides it outright.
+	 */
+	static float GetTraceMaxLengthUU();
+
+	/** v7 §3: half the lethal (and drawn) WIDTH, in uu. 45 -> 22.5, narrower than the player model. */
+	static float GetTraceTrailRadius();
+
+	/** v7 §3: the lethal (and drawn) HEIGHT, in uu, centred on the carrier's mid-model. 190 -> ~63. */
+	static float GetTraceTrailHeight();
 
 	// ------------------------------------------------------------------------------------------
 	// THE PREDICTED HEAD (spec v5 §2). Owner-only, cosmetic, never lethal. Read-only accessors so
@@ -358,6 +414,45 @@ public:
 
 	/** Pooled mesh components this trace has ALLOCATED, visible or not, split by kind. */
 	void CountPooledPieces(int32& OutStaticTotal, int32& OutSkinnedTotal) const;
+
+	// ------------------------------------------------------------------------------------------
+	// THE CLIENT TETHER BUG (spec v7 §7). Read-only counters so Trace.Trail.TetherCheck can report
+	// the reordering as it happens instead of asserting that it was fixed. See
+	// RestoreReplicatedPointOrder().
+	// ------------------------------------------------------------------------------------------
+
+	/** How many times this machine has had to put a replicated point set back into path order. */
+	int32 GetPointOrderRepairCount() const { return PointOrderRepairs; }
+
+	/** Adjacent pairs currently out of chronological order in TrailPoints.Items. 0 = the path is sane. */
+	int32 CountPointOrderViolations() const;
+
+	/**
+	 * uu from the carrier to the OLDEST point in the array — i.e. to the far end of the drawn
+	 * ribbon. THE NUMBER THE BUG REPORT IS ABOUT: with the tether bug this collapses towards zero on
+	 * a client (the newest point, under the carrier's feet, gets swapped into slot 0), while a
+	 * healthy trace reads roughly the trace's full length. Negative when there is no trace.
+	 */
+	float MeasureTailDistanceToCarrier() const;
+
+	/** Total length of the replicated path, in uu — what v7 §1's max length is enforced against. */
+	float MeasureTraceLength() const;
+
+	/**
+	 * SPEC v7 §3 VERIFICATION, BOTH DIRECTIONS, off the geometry that is actually on screen.
+	 *
+	 * @param OutMaxHalfWidth   widest half-width any VISIBLE piece is drawn at. Must not exceed
+	 *                          GetTraceTrailRadius(), or there is ribbon that does not kill.
+	 * @param OutMaxHalfHeight  tallest half-height any visible piece is drawn at. Compared against
+	 *                          GetTraceTrailHeight()/2 plus whatever vertical span the carrier's
+	 *                          jump added to the segment.
+	 * @param OutWorstUncovered worst distance, in uu, from a LETHAL trail point to the nearest
+	 *                          visible piece's surface. Non-zero means there is a stretch that kills
+	 *                          and is not drawn — the other direction of the same invariant.
+	 * @param OutVisiblePieces  how many pooled pieces are currently visible.
+	 */
+	void MeasureDrawnVolume(double& OutMaxHalfWidth, double& OutMaxHalfHeight,
+		double& OutWorstUncovered, int32& OutVisiblePieces) const;
 
 private:
 	// ------------------------------------------------------------------------------------------
@@ -652,8 +747,34 @@ private:
 	/** Shared clock: GameState time where available, local world time as a fallback. */
 	float GetServerTimeSeconds() const;
 
-	/** Server: expire, cap, and append points. */
+	/** Server: append points, then trim the tail back to the max LENGTH (v7 §1). */
 	void ServerUpdateTrail();
+
+	/**
+	 * SPEC v7 §7, THE CLIENT TETHER BUG — and the fix is here rather than in the drawing because the
+	 * damage is done to the DATA, not to the geometry.
+	 *
+	 * FFastArraySerializer deletes with RemoveAtSwap (FastArraySerializer.h, "Items.RemoveAtSwap
+	 * (DeleteIndex, EAllowShrinking::No)"). Every machine that only RECEIVES the array therefore has
+	 * its order scrambled by every removal: dropping the oldest point swaps the NEWEST point — the
+	 * one under the carrier's feet — into slot 0, which is the tail of everything drawn off this
+	 * array. So the far end of the ribbon snaps to the character, exactly as reported, and both ends
+	 * of the trace end up tied to them. The server never sees it because authority mutates Items
+	 * itself with an order-preserving RemoveAt.
+	 *
+	 * Restores chronological order in place, on non-authority only, and empties the fast array's
+	 * ItemMap so the engine rebuilds the ReplicationID -> index map against the new layout (the
+	 * same thing the engine itself does immediately after its RemoveAtSwap loop). Returns true when
+	 * it had to move anything.
+	 *
+	 * It is the ARRAY that is fixed, not a private copy of it, because every other reader —
+	 * ComputeLastLethalIndex, the bots, TraceParry's verifier, the GameMode — indexes TrailPoints
+	 * .Items directly and would otherwise each need their own copy of this knowledge.
+	 */
+	bool RestoreReplicatedPointOrder();
+
+	/** Counter behind GetPointOrderRepairCount(). */
+	int32 PointOrderRepairs = 0;
 
 	/** Server: swept enemy-dash trip test against the trace. */
 	void ServerRunTripTest(float DeltaTime);
@@ -744,7 +865,7 @@ private:
 		TArray<float>& AppliedScaleOut,
 		int32 MaxElements,
 		float InvulnerableScale,
-		bool bAgeFade,
+		bool bTailFade,
 		bool bOnlyOwnerSees,
 		bool bOverlapAtStart);
 

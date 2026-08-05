@@ -393,6 +393,34 @@ public:
 	static int32 GoalsByMethod[static_cast<int32>(EGoalMethod::Count)];
 
 	/**
+	 * SPEC v7 §4 counters. Verification only — never a game rule.
+	 *
+	 * The rule does NOT distinguish a floor from the roof of a crate (that is the whole point of it),
+	 * so the only way to show that the generalised path is actually being exercised, rather than the
+	 * old floor-only one, is to count the two outcomes separately here and report both. Printed by
+	 * Trace.ModeB.SurfaceStats and by the Trace.ModeB.VerifySurfaces scenario.
+	 */
+	struct FSurfaceRuleStats
+	{
+		/** Turnovers where the supporting surface was at (or near) the arena floor. */
+		int32 GroundTurnovers = 0;
+
+		/** Turnovers where it was well above the floor: the top of a structure. */
+		int32 TopTurnovers = 0;
+
+		/** Blocking contacts whose normal said WALL, and which therefore bounced instead. */
+		int32 WallBounces = 0;
+
+		/** Wall bounces too slow to matter that were nonetheless refused a resting place on the wall. */
+		int32 WallRestRefusals = 0;
+
+		/** Landings the at-rest probe found that the contact test alone would have missed. */
+		int32 RestProbeRescues = 0;
+	};
+
+	static FSurfaceRuleStats SurfaceStats;
+
+	/**
 	 * The centre of the goal @p AttackingTeam scores in, for bot steering and HUD markers.
 	 *
 	 * In mode B this is the narrow goal mouth; in mode A there are no goals and this returns false,
@@ -740,10 +768,16 @@ private:
 	void ServerApplyCatchZone(float DeltaSeconds);
 
 	/**
-	 * Server, mode B, SPEC v6 §4.2 — GROUND CONTACT IS A TURNOVER.
+	 * Server, mode B, SPEC v6 §4.2 AS GENERALISED BY SPEC v7 §4 — SURFACE CONTACT IS A TURNOVER.
 	 *
-	 * Verbatim: "When a team has possession of the core, throws it, and it hits the ground, it should
-	 * automatically turnover to the closest player on the enemy team."
+	 * v6, verbatim: "When a team has possession of the core, throws it, and it hits the ground, it
+	 * should automatically turnover to the closest player on the enemy team."
+	 * v7, verbatim: "Sometimes the core gets stuck up top of an object in gamemode b. This should also
+	 * count as a turnover. Walls should not, the core should bounce off those."
+	 *
+	 * ONE function for both, deliberately. "The top of a crate" and "the floor" are the same event to
+	 * this rule and the caller has already decided that by asking @p SurfaceNormal — a second entry
+	 * point would be a second copy of a rule the spec states once.
 	 *
 	 * Grants the Core to the nearest living member of the team OPPOSING @p LooseFromTeam. That is a
 	 * cross-team change of possession, so it goes through TakeLooseCore like an interception and
@@ -752,10 +786,26 @@ private:
 	 * Falls back to ResetLooseCore when that team has nobody alive, because the Core may never be
 	 * lost and a kickoff to the same side is the closest thing to the intended outcome.
 	 *
-	 * @return true when the Core left the ground state (granted or reset). The caller must touch no
+	 * @param SurfacePoint  where the Core is being held up, for the log and the floor/top tally.
+	 * @param SurfaceNormal the normal that decided this was a landing. Reported, never re-tested here.
+	 * @return true when the Core left the loose state (granted or reset). The caller must touch no
 	 *         member state afterwards: a grant can score, which resets the field.
 	 */
-	bool ServerGroundTurnover();
+	bool ServerSurfaceTurnover(const FVector& SurfacePoint, const FVector& SurfaceNormal);
+
+	/**
+	 * Server, mode B, SPEC v7 §4. What is holding a Core at rest up, if anything?
+	 *
+	 * THE FIX FOR "the core gets stuck up top of an object". The contact test in the flight
+	 * integration only runs on a frame whose sweep was blocked, and a Core that reaches rest on an
+	 * edge hit (normal nowhere near vertical) switches that integration off for good — after which
+	 * nothing ever asks again. This asks, with the same sphere and the same channel the flight uses,
+	 * so the two cannot disagree about what the Core is touching.
+	 *
+	 * @return false when there is nothing underneath at all, which is a Core "at rest" in mid-air:
+	 *         the caller puts it back in flight rather than leaving it hanging.
+	 */
+	bool ServerProbeRestingSurface(FVector& OutPoint, FVector& OutNormal) const;
 
 	/** Server, mode B. The guarded loose -> held transition. Sets the grace override, then grants. */
 	void TakeLooseCore(ATraceCharacter* Taker);
@@ -1020,6 +1070,39 @@ private:
 	 * actually taken is the only way to prove the branch fires rather than merely that it compiles.
 	 */
 	int32 VerifyGoalTallyAtStart = 0;
+
+	/**
+	 * SPEC v7 §4 scenario state (steps 7 and 8).
+	 *
+	 * The scenario can be armed two ways: Trace.ModeB.Verify runs the whole thing from step 0, and
+	 * Trace.ModeB.VerifySurfaces starts it at step 7, because steps 4 and 5 wait on bots to score and
+	 * a surface-rule run should not have to sit through that.
+	 */
+	bool bVerifySurfacesOnly = false;
+	int32 VerifyWallBouncesAtStart = 0;
+	int32 VerifyTurnoversAtStart = 0;
+	int32 VerifyRescuesAtStart = 0;
+
+	/**
+	 * Step 8 only: the parked Core has settled and has been declared thrown.
+	 *
+	 * The step cannot arm on the frame it launches — a Core still in the air would be caught by the
+	 * ordinary contact test and the step would silently become a second copy of step 7.
+	 */
+	bool bVerifyRestArmed = false;
+
+	/**
+	 * Server, diagnostics. Finds a raised, horizontal-ish surface in the arena — the TOP of a piece of
+	 * cover — and, on its side, a vertical face to bounce off.
+	 *
+	 * Sampled from the world with the same sphere the Core flies with, rather than read off
+	 * ATraceArenaBuilder's construction constants: the rule under test is "what does the geometry
+	 * say", so a test that asked the builder where it MEANT to put a crate could pass against an arena
+	 * whose crates were somewhere else.
+	 *
+	 * @return false when the arena has no raised cover to land on, which is a SKIP and not a failure.
+	 */
+	bool FindVerificationSurfaces(FVector& OutTopPoint, FVector& OutWallPoint, FVector& OutWallNormal) const;
 
 	/** Set on step 5 when a throw is seen to leave, so a shot that misses is still distinguishable. */
 	bool bVerifyThrowSeen = false;

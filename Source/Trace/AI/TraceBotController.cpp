@@ -4537,20 +4537,46 @@ bool ATraceBotController::FindTrailInterceptPoint(FVector& OutPoint, FVector& Ou
 		return false;
 	}
 
-	// Points expire UTraceSettings::TrailLifetime seconds after they are laid. NO NUMBER IN THIS
-	// COMMENT ON PURPOSE — it has been wrong twice already (it said six, then four; the setting is
-	// 2.0 today). The shorter that window gets, the more this filter matters: committing to a point
-	// with less than BotTrailMinPointLifeRemaining left is a correspondingly larger share of a
-	// defender's time spent running at floor. Those two settings are calibrated against each other;
-	// move them together.
-	float ServerNow = 0.f;
-	if (const AGameStateBase* GameStateBase = GetWorld() ? GetWorld()->GetGameState() : nullptr)
+	// SPEC v7 §1 REWROTE THIS FILTER, AND NOT COSMETICALLY.
+	//
+	// This used to reject points with less than BotTrailMinPointLifeRemaining seconds of LIFE LEFT,
+	// computed as BirthServerTime < now - TrailLifetime + margin. Points no longer expire by age at
+	// all — the tail is trimmed only when new trace at the head pushes the path past
+	// UTraceTrailComponent::GetTraceMaxLengthUU(). Against a stationary carrier that age test rejects
+	// EVERY point (they are all older than any cutoff measured backwards from now), so the bots would
+	// have discarded the whole trace and never planned an intercept — a silent, total regression of
+	// the game's signature defensive play, on exactly the carrier the v7 change makes killable.
+	//
+	// Same intent, expressed in the units the trace now lives in: skip the OLDEST stretch of the path,
+	// measured as a DISTANCE walked back from the tail. BotTrailMinPointLifeRemaining is still the
+	// "fraction of the trace written as an absolute" it has always been — 0.40s x WalkSpeed 800 =
+	// 320uu of the 1200uu trace, the same calibrated oldest-quarter it used to discard. It stays
+	// paired with the trace's size; if TrailMaxLengthUU moves, move this with it.
+	const float TailSkipUU = FMath::Max(0.f, Settings.BotTrailMinPointLifeRemaining)
+		* FMath::Max(0.f, Settings.WalkSpeed);
+
+	// Walk the path from the oldest end and find the first index at least TailSkipUU along it. The
+	// path is measured, not assumed uniform: a carrier who dashed laid points far further apart than
+	// TrailPointSpacing, and index arithmetic would skip a wildly variable amount of real trace.
+	int32 FirstAcceptableIndex = 0;
+	if (TailSkipUU > 0.f)
 	{
-		ServerNow = static_cast<float>(GameStateBase->GetServerWorldTimeSeconds());
+		double Walked = 0.0;
+		for (int32 Index = 0; Index + 1 < Usable; ++Index)
+		{
+			Walked += FVector::Dist(Points[Index].Location, Points[Index + 1].Location);
+			if (Walked >= static_cast<double>(TailSkipUU))
+			{
+				FirstAcceptableIndex = Index + 1;
+				break;
+			}
+		}
+
+		// A trace shorter than the margin has no "oldest quarter" worth naming. Rejecting all of it
+		// would be the age filter's bug in new clothes, so clamp: a short trace stays huntable, and
+		// the head grace above is what protects the carrier's heels.
+		FirstAcceptableIndex = FMath::Clamp(FirstAcceptableIndex, 0, FMath::Max(0, Usable - 2));
 	}
-	const float OldestAcceptableBirth = ServerNow
-		- FMath::Max(0.f, Settings.TrailLifetime)
-		+ FMath::Max(0.f, Settings.BotTrailMinPointLifeRemaining);
 
 	const FVector MyLocation = BotCharacter->GetActorLocation();
 	const FVector CarrierLocation = EnemyCarrier->GetActorLocation();
@@ -4564,15 +4590,10 @@ bool ATraceBotController::FindTrailInterceptPoint(FVector& OutPoint, FVector& Ou
 	int32 BestIndex = INDEX_NONE;
 	float BestDistanceSq = TNumericLimits<float>::Max();
 
-	// Index 0 is the oldest point. Stop one short of the last usable entry so a tangent can always
-	// be built forward from BestIndex.
-	for (int32 Index = 0; Index < Usable - 1; ++Index)
+	// Index 0 is the oldest point. Start past the tail margin computed above, and stop one short of
+	// the last usable entry so a tangent can always be built forward from BestIndex.
+	for (int32 Index = FirstAcceptableIndex; Index < Usable - 1; ++Index)
 	{
-		if (Points[Index].BirthServerTime < OldestAcceptableBirth)
-		{
-			continue;
-		}
-
 		const FVector PointLocation = Points[Index].Location;
 
 		if (FVector::DistSquared2D(CarrierLocation, PointLocation) < MinCarrierGapSq)

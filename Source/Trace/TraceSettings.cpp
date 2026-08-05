@@ -825,6 +825,24 @@ namespace
 			{ TEXT("CoreLooseResetSeconds"),           EKnobType::Float, TEXT("[by-name bind]") },
 			{ TEXT("CoreThrowCooldownSeconds"),        EKnobType::Float, TEXT("[by-name bind]") },
 			{ TEXT("CoreThrowBounce"),                 EKnobType::Float, TEXT("[by-name bind]") },
+
+			// --- spec v7, every knob this pass introduced --------------------------------------
+			//
+			// §§1-2 the trace expires by LENGTH, not time. TrailMaxLengthUU is now the number the
+			// whole mechanic hangs on, and TrailLifetime survives only to derive it and to fade the
+			// legacy renderer arm — a dead TrailMaxLengthUU would silently fall back to the
+			// derivation and look like it worked, which is exactly the failure this table exists for.
+			{ TEXT("TrailMaxLengthUU"),                EKnobType::Float, TEXT("v7 §§1-2: 1200uu, THE expiry rule") },
+			{ TEXT("TrailLifetime"),                   EKnobType::Float, TEXT("v7 §1: derivation + legacy fade ONLY, no longer expiry") },
+			// §3 thinner and shallower. These two are the LETHAL volume and the DRAWN volume at once.
+			{ TEXT("TrailRadius"),                     EKnobType::Float, TEXT("v7 §3: 45 -> 22.5, lethal == drawn") },
+			{ TEXT("TrailHeight"),                     EKnobType::Float, TEXT("v7 §3: 190 -> 63, lethal == drawn") },
+			// §4 the mode-B surface rule, bound BY NAME by ATraceCore like the rest of that block.
+			{ TEXT("CoreSurfaceMaxSlopeDegrees"),      EKnobType::Float, TEXT("v7 §4: floor/top vs wall, deg from up [by-name bind]") },
+			// §5 the vertical ceiling a vectorized dash may hand back, as a multiple of the jump.
+			{ TEXT("DashExitVerticalSpeedMultiplier"), EKnobType::Float, TEXT("v7 §5: climb ceiling on a vertical dash") },
+			// §1 fallout: the bots' tail filter changed units from seconds-of-life to uu-from-tail.
+			{ TEXT("BotTrailMinPointLifeRemaining"),   EKnobType::Float, TEXT("v7 §1: now x WalkSpeed = uu skipped from the tail") },
 		};
 
 		const UTraceSettings& Table = UTraceSettings::Get();

@@ -19,6 +19,7 @@ class ASkyLight;
 class ATraceEndzone;
 class ATraceTeamPlayerStart;
 class UBoxComponent;
+class UInstancedStaticMeshComponent;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
 class UPointLightComponent;
@@ -80,8 +81,15 @@ class UStaticMeshComponent;
  * two-modes note above), five ATraceTeamPlayerStarts per team, the lighting rig (three directional
  * lights plus a 32-lamp floor lattice), height fog and an unbound post-process volume.
  *
- * That comes to ~1190 components on the shipped field, up from ~830 at 24000 x 9600: the field grew
- * 40% and the structure count with it, plus the mode-B goal furniture.
+ * HOW MUCH OF THAT REACHES THE RENDERER (spec v7 §8, and this replaces the old "~1190 components"
+ * line, which was true and misleading in equal measure). The build still describes ~1240 pieces of
+ * geometry, but they are no longer ~1240 primitives: every visible block is now an INSTANCE inside a
+ * pooled UInstancedStaticMeshComponent, batched by mesh + material + shadow flag, so the ~960 loose
+ * Movable static-mesh components the arena used to register collapse into a few dozen Static pools.
+ * The ~280 collision boxes and pawn shells are unchanged in number but are Static now too, which is
+ * what keeps them out of the physics scene's dynamic broadphase. Nothing about the LAYOUT changed:
+ * same shapes, same transforms, same materials. See the INSTANCING block above AddInstancedBlock,
+ * and measure any claim about it with Trace.Arena.PerfAB rather than by reading this comment.
  *
  * MIRRORED HALVES, DELIBERATELY
  * -----------------------------
@@ -160,8 +168,17 @@ public:
 
 	//~ Contract surface (spec section 7)
 
-	/** First arena builder in @p World, or null. Cheap enough for occasional use, not per-tick. */
-	static ATraceArenaBuilder* Get(UWorld* World);
+	/**
+	 * First arena builder in @p World, or null. Cheap enough for occasional use, not per-tick.
+	 *
+	 * Takes a CONST world and const_casts internally, exactly as ApplyScoringModeInWorld and
+	 * ApplyTeamSidesInWorld already did. Finding an actor does not modify the world; the const_cast is
+	 * paid for by TActorIterator, which has no const form. Widened here rather than at the call sites
+	 * because "I have a const UWorld* and want to ask the arena a question" is the normal case for
+	 * every const query in the codebase (ATraceCore's resting-surface test is the one that found it),
+	 * and the alternative is a const_cast repeated at each of them.
+	 */
+	static ATraceArenaBuilder* Get(const UWorld* World);
 
 	/** World-space point the Core spawns at and resets to: just above the centre pedestal. */
 	FVector GetCoreSpawnLocation() const;
@@ -346,6 +363,24 @@ public:
 	 * steps earlier than any BeginPlay.
 	 */
 	void EnsureBuilt();
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * Tears the arena down and builds it again in place. FOR MEASUREMENT ONLY - see spec v7 §8.
+	 *
+	 * It exists because comparing the instanced geometry path against the legacy one across two
+	 * SEPARATE PROCESSES is not a comparison on a machine that has anything else running on it: the
+	 * first attempt at this measurement was invalidated twice by another headless run starting up
+	 * inside the sample window. Rebuilding in one process lets Trace.Arena.PerfAB interleave the arms,
+	 * which spreads any outside interference evenly over both instead of dumping it on whichever arm
+	 * was unlucky.
+	 *
+	 * NOT A LIVE-TUNING FACILITY. It destroys and respawns the endzone triggers and the player starts
+	 * and resets the painted side assignment; the pawns standing on the floor survive only because the
+	 * collision is rebuilt in the same frame it is destroyed.
+	 */
+	void RebuildForMeasurement();
+#endif
 
 	//~ End contract surface
 
@@ -719,10 +754,13 @@ protected:
 
 	/**
 	 * Destroys everything BuildArena() made - every component attached under Root, every actor in
-	 * SpawnedActors, every MID - and resets the built flag so the next build starts from nothing.
+	 * SpawnedActors, every MID, every instance pool - and resets the built flag so the next build
+	 * starts from nothing.
 	 *
-	 * Editor-only, and it stays that way on purpose: at runtime the arena is built exactly once per
-	 * world and EndPlay is the only teardown path that exists.
+	 * It used to be editor-only. It is not any more, because spec v7 §8's A/B rebuilds the arena in
+	 * place between arms (RebuildForMeasurement) - but the RULE it encoded still holds: the GAME never
+	 * calls this. At runtime the arena is built exactly once per world and EndPlay is the only teardown
+	 * path the match itself ever takes.
 	 */
 	void DestroyBuiltArena();
 
@@ -731,9 +769,16 @@ protected:
 	/**
 	 * Adds a visual-only mesh block. @p Size is the desired world size in uu; the engine basic
 	 * shapes are 100 uu and centred on their pivot, so the scale is just Size/100.
-	 * Returns null (harmlessly) if the mesh asset failed to resolve.
+	 * Silently does nothing if the mesh asset failed to resolve.
+	 *
+	 * SINCE THE INSTANCING PASS THIS DOES NOT PRODUCE A COMPONENT (spec v7 §8). The block becomes one
+	 * INSTANCE inside a pooled UInstancedStaticMeshComponent shared by every other block with the same
+	 * mesh, the same material and the same shadow flag - see AddInstancedBlock. That is why it now
+	 * returns void: a caller that kept the old UStaticMeshComponent* would have been handed the whole
+	 * batch, and anything it set (visibility, collision, a material) would have applied to hundreds of
+	 * unrelated blocks. Nothing in this file ever used the return value.
 	 */
-	UStaticMeshComponent* AddMeshBlock(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
+	void AddMeshBlock(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
 		UMaterialInstanceDynamic* MID, bool bCastShadow, const TCHAR* DebugName, float YawDegrees = 0.f);
 
 	/**
@@ -754,12 +799,86 @@ protected:
 	// the yaw-only versions forward to them, so there is still exactly one implementation of each.
 
 	/** As AddMeshBlock, with a full rotation rather than a yaw. */
-	UStaticMeshComponent* AddMeshBlockRotated(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
+	void AddMeshBlockRotated(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
 		UMaterialInstanceDynamic* MID, bool bCastShadow, const TCHAR* DebugName, const FRotator& Rotation);
 
 	/** As AddCollisionBlock, with a full rotation rather than a yaw. */
 	UBoxComponent* AddCollisionBlockRotated(const FVector& LocalCenter, const FVector& Size, const TCHAR* DebugName,
 		const FRotator& Rotation);
+
+	// --- INSTANCING (spec v7 §8) ------------------------------------------------------------------
+	//
+	// THE PROBLEM THIS SOLVES, with the measured numbers. Every visible block used to be its own
+	// UStaticMeshComponent: 1454-1462 registered primitives, all Movable, submitted as ~1450 separate
+	// draws per pass and again per shadow cascade, on an arena that is a handful of engine cubes and
+	// one cylinder repeated hundreds of times. Game thread was 1.8-3.1 ms, so none of that was CPU
+	// simulation - it was draw submission and GPU.
+	//
+	// THE FIX. Blocks are pooled by (mesh, material, cast-shadow) and become instances of one
+	// UInstancedStaticMeshComponent per pool. The arena's look is UNCHANGED - the same cubes at the
+	// same transforms with the same materials - only how they reach the renderer changes.
+	//
+	// WHY THE KEY IS EXACTLY THOSE THREE. Mesh and material are what a draw call is; two blocks that
+	// differ in either cannot share one. bCastShadow is a per-COMPONENT flag on an ISM (there is no
+	// per-instance shadow bit), so a shadow-caster and a non-caster cannot share a pool either -
+	// merging them would silently start casting shadows off every neon strip in the arena.
+	//
+	// WHY THE MIDs DO NOT EXPLODE THE POOL COUNT: MakeSurfaceMID/MakeNeonMID are called once per build
+	// STEP and the result is handed to every block in it (one body MID and two neon MIDs for the whole
+	// cover field, one per half), so ~1450 blocks collapse into a few dozen pools. Half-time repainting
+	// still works untouched, because it pushes parameters into those same MIDs (ApplyTeamSides).
+
+	/**
+	 * The pooled ISM that carries every block sharing one (mesh, material, shadow) key.
+	 *
+	 * Registration is DEFERRED to FlushInstancePools(): instances are appended while the component is
+	 * still unregistered, so the whole batch costs one render-state creation instead of one per block,
+	 * and the mobility can be decided after the build knows whether anything in the pool has to move.
+	 */
+	struct FTraceInstancePool
+	{
+		TWeakObjectPtr<UStaticMesh> Mesh;
+		TWeakObjectPtr<UMaterialInstanceDynamic> MID;
+		bool bCastShadow = false;
+
+		TWeakObjectPtr<UInstancedStaticMeshComponent> Component;
+
+		/**
+		 * Set by CollectPiecesSince when a mode-tagged instance lands in this pool.
+		 *
+		 * Such a pool must stay Movable: arming a scoring mode rewrites those instances' transforms,
+		 * and rewriting a Static component's transform in a game world is exactly what Static means
+		 * you may not do. Every other pool is genuinely Static - see FlushInstancePools.
+		 */
+		bool bNeedsRuntimeInstanceUpdates = false;
+	};
+
+	/**
+	 * One block that was turned into an instance, remembered in construction order.
+	 *
+	 * This is the instanced half of the mark/collect diff: the pooled ISMs interleave blocks from
+	 * every build step, so "the instances added since the mark" cannot be read off any one component
+	 * and has to be recorded here as it happens.
+	 */
+	struct FTraceBuiltInstance
+	{
+		int32 PoolIndex = INDEX_NONE;
+		int32 InstanceIndex = INDEX_NONE;
+		FTransform Transform;
+	};
+
+	/** Appends one instance to the pool for (@p Mesh, @p MID, @p bCastShadow), creating it if needed. */
+	void AddInstancedBlock(UStaticMesh* Mesh, UMaterialInstanceDynamic* MID, bool bCastShadow,
+		const FTransform& LocalTransform, const TCHAR* DebugName);
+
+	/**
+	 * Registers every pool that has instances, at the mobility the build decided it needs.
+	 *
+	 * Called once at the end of BuildArena, AFTER every CollectPiecesSince, because that is when
+	 * bNeedsRuntimeInstanceUpdates is finally known - and a component's mobility can only be chosen
+	 * before it registers.
+	 */
+	void FlushInstancePools();
 
 	/**
 	 * An invisible box that blocks ECC_Pawn AND NOTHING ELSE, wrapped around a piece of structure so
@@ -911,8 +1030,14 @@ protected:
 	// Both scoring shapes are built; one is presented. These three are the whole mechanism.
 
 	/**
-	 * One piece of geometry that belongs to a single scoring mode, plus the collision state it was
-	 * built with, so hiding and re-showing it restores exactly what it had rather than a guess.
+	 * One piece of geometry that belongs to a single scoring mode, plus the state it was built with,
+	 * so hiding and re-showing it restores exactly what it had rather than a guess.
+	 *
+	 * TWO KINDS OF PIECE SINCE THE INSTANCING PASS. Collision boxes and pawn shells are still whole
+	 * components and are hidden by SetVisibility/SetCollisionEnabled. Visible geometry is no longer a
+	 * component at all - it is one instance inside a pooled ISM - so it is hidden by collapsing that
+	 * instance's transform to zero scale and restored by writing the built transform back. Exactly
+	 * one of the two halves is filled in; InstanceIndex == INDEX_NONE says which.
 	 */
 	struct FTraceModePiece
 	{
@@ -920,19 +1045,42 @@ protected:
 
 		/** Collision the component was built with. Restored verbatim when its mode is armed. */
 		TEnumAsByte<ECollisionEnabled::Type> Collision = ECollisionEnabled::NoCollision;
+
+		/** Instanced half: the pool the piece lives in, or null for a whole-component piece. */
+		TWeakObjectPtr<UInstancedStaticMeshComponent> InstancePool;
+
+		/** Index of this piece's instance inside InstancePool, or INDEX_NONE. */
+		int32 InstanceIndex = INDEX_NONE;
+
+		/** The transform the instance was built with. Written back when its mode is armed. */
+		FTransform InstanceTransform = FTransform::Identity;
 	};
 
 	/**
-	 * Number of components attached under Root right now.
+	 * A point in the build, against which "everything made since" can be diffed.
+	 *
+	 * Two counters because the build now emits two kinds of thing: whole components attached under
+	 * Root (collision boxes, pawn shells, lights) and INSTANCES appended to the pooled ISMs. Both
+	 * append in construction order, so a pair of counts is a complete cut of the build.
+	 */
+	struct FTraceBuildMark
+	{
+		int32 Components = 0;
+		int32 Instances = 0;
+	};
+
+	/**
+	 * Where the build has got to right now.
 	 *
 	 * Paired with CollectPiecesSince() this is how a build step tags everything it made without any
 	 * of the primitive helpers knowing modes exist: mark, build, collect the difference. Every helper
-	 * in this file attaches to Root and appends in order, so the difference IS what the step built.
+	 * in this file either attaches to Root or appends to BuiltInstances, and both append in order, so
+	 * the difference IS what the step built.
 	 */
-	int32 MarkBuiltComponents() const;
+	FTraceBuildMark MarkBuiltComponents() const;
 
-	/** Appends everything attached under Root since @p Mark to @p Out, with its collision state. */
-	void CollectPiecesSince(int32 Mark, TArray<FTraceModePiece>& Out) const;
+	/** Appends everything built since @p Mark to @p Out, with the state it was built with. */
+	void CollectPiecesSince(const FTraceBuildMark& Mark, TArray<FTraceModePiece>& Out);
 
 	/** Shows or hides one tagged set, restoring its built collision when shown. */
 	static void SetPiecesPresented(const TArray<FTraceModePiece>& Pieces, bool bPresented);
@@ -1036,6 +1184,19 @@ private:
 	TArray<TWeakObjectPtr<ATraceEndzone>> ScoringVolumes;
 
 
+	/**
+	 * One ISM per (mesh, material, shadow) key. Rebuilt from nothing on every build.
+	 *
+	 * Weak handles rather than a UPROPERTY array: an actor component whose Outer is this actor is
+	 * added to the actor's owned-component set the moment it is constructed, so it is already GC
+	 * reachable - exactly as every UStaticMeshComponent this file has ever made was, none of which
+	 * were held in a UPROPERTY either.
+	 */
+	TArray<FTraceInstancePool> InstancePools;
+
+	/** Every instance added, in construction order. The instanced half of the mark/collect diff. */
+	TArray<FTraceBuiltInstance> BuiltInstances;
+
 	/** Engine basic shapes, resolved in the constructor so the cooker keeps them (contract §2). */
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> CubeMesh;
@@ -1065,6 +1226,13 @@ private:
 
 	/** BeginPlay can be forced early by the GameMode (DispatchBeginPlay); never build twice. */
 	bool bArenaBuilt = false;
+
+	/**
+	 * Which geometry path this arena was built with (spec v7 §8). Latched at the top of BuildArena
+	 * from Trace.Arena.Instancing and -TraceArenaLegacyGeometry, and never read again after the
+	 * build, so the arena can never come out half instanced.
+	 */
+	bool bBuildingInstancedGeometry = true;
 
 	/**
 	 * True only while BuildArena() is running for the editor preview.

@@ -141,6 +141,27 @@ namespace TraceCharacterLayout
 	 */
 	constexpr float TrailCameraClearance = 66.f;
 
+	/**
+	 * THE SHIPPED THIRD-PERSON CARRY FRAMING, held explicitly since spec v7 §3 — 172 uu above the
+	 * carrier's actor centre.
+	 *
+	 * GetThirdPersonPivotZ() derives its height from the trail so the camera clears the wall, and for
+	 * the whole life of that rule the trail was 190 uu tall, which put the pivot at
+	 * 190*0.5 + clamp(190*0.12,14,42)*0.5 + 66 = 172.4. That is the framing the carry blend was tuned
+	 * with, playtested with and signed off on.
+	 *
+	 * v7 §3 then cut the trail to 63 uu "in order to make visibility around the trace better". The
+	 * derivation alone would have answered 38.5 + 66 = 104.5 and silently dropped the carry camera
+	 * ~68 uu — a large, unrequested change to a DO-NOT-REGRESS feature, arriving as a side effect of
+	 * a visibility change that never mentioned the camera. The clearance rule is still right and
+	 * still live (raise TrailHeight past ~212 and it takes over again); this is the floor it may not
+	 * fall below, replacing the generic ThirdPersonPivotZ 60 in that role while carrying.
+	 *
+	 * If the lower camera turns out to be wanted now that the trail no longer fills the frame, this
+	 * one constant is the whole change — drop it back to ThirdPersonPivotZ and the derivation wins.
+	 */
+	constexpr float CarryPivotZ = 172.4f;
+
 	/** Long enough to read as a deliberate pull-back, short enough not to fight for control. */
 	constexpr float ViewBlendSeconds = 0.35f;
 
@@ -1703,18 +1724,23 @@ void ATraceCharacter::OnRep_IsCarrier()
 
 float ATraceCharacter::GetThirdPersonPivotZ() const
 {
-	// Read from the settings rather than from a second copy of "190" so that retuning TrailHeight
-	// moves the camera with it. UTraceTrailComponent builds its wall as TrailHeight tall, centred on
-	// the carrier's actor location, and rides a cap strip of clamp(Height * 0.12, 14, 42) on top of
-	// it — so the highest lit surface sits half the height plus half the cap above the actor centre,
-	// and TargetOffset.Z is measured from that same actor centre.
-	const float TrailHeight = FMath::Max(0.f, UTraceSettings::Get().TrailHeight);
+	// Resolved through the trail component rather than off UTraceSettings::TrailHeight directly, so
+	// that the height the camera clears is the height the trail is ACTUALLY built at — the console
+	// override Trace.Trail.Height moves both together, and the two can never disagree.
+	//
+	// UTraceTrailComponent builds its wall centred on the carrier's actor location and rides a cap
+	// strip of clamp(Height * 0.12, 14, 42) on top of it, so the highest lit surface sits half the
+	// height plus half the cap above the actor centre — and TargetOffset.Z is measured from that
+	// same actor centre.
+	const float TrailHeight = FMath::Max(0.f, UTraceTrailComponent::GetTraceTrailHeight());
 	const float TrailTopAboveCentre = TrailHeight * 0.5f + FMath::Clamp(TrailHeight * 0.12f, 14.f, 42.f) * 0.5f;
 
-	// Max, not a plain sum: if the trail is ever made short enough to duck under, the camera goes
-	// back to the framing that was chosen on its own merits instead of drifting down with it.
+	// Max, not a plain sum, and the floor is CarryPivotZ rather than the generic ThirdPersonPivotZ.
+	// Spec v7 §3 cut the trail to a third of its height, and without this floor that visibility change
+	// would have dragged the approved carry framing down 68uu with it. See CarryPivotZ for the whole
+	// argument and for the one-line way to reverse this decision.
 	return FMath::Max(
-		TraceCharacterLayout::ThirdPersonPivotZ,
+		TraceCharacterLayout::CarryPivotZ,
 		TrailTopAboveCentre + TraceCharacterLayout::TrailCameraClearance);
 }
 

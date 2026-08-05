@@ -20,6 +20,8 @@
 #include "Core/TraceCharacter.h"
 #include "Engine/World.h"                      // UWorld::GetTimeSeconds (dash-active latch), traces
 #include "GameFramework/Character.h"
+#include "GameFramework/Controller.h"          // spec v7 §5: the aim rotation the dash is composed from
+#include "Math/RotationMatrix.h"               // spec v7 §5: the yaw basis the input is decomposed in
 #include "Math/UnrealMathUtility.h"
 #include "Trace.h"                             // LogTraceGame
 #include "TraceSettings.h"
@@ -209,6 +211,30 @@ static FAutoConsoleVariableRef CVarTraceMantleDebug(
 	TEXT("Dev only. Non-zero logs every mantle: ledge height, reach, duration and the exit speed."),
 	ECVF_Cheat);
 
+/**
+ * Dash instrumentation (spec v7 §5). Same rules as the slide's and the mantle's: off by default,
+ * Display when on.
+ *
+ * This exists because Trace.DashVectorTest measures the PURE function and nothing else. It cannot
+ * see whether a grounded upward dash actually reaches MOVE_Falling, whether the per-frame re-assert
+ * holds Z on rails, or whether the exit clamp fires — all three of which are runtime behaviour, and
+ * two of which are new. A headless match full of bots produces hundreds of real dashes; this turns
+ * them into the evidence.
+ */
+int32 GTraceDashDebug = 0;
+static FAutoConsoleVariableRef CVarTraceDashDebug(
+	TEXT("Trace.DashDebug"),
+	GTraceDashDebug,
+	TEXT("Dev only. Non-zero logs every dash's composed direction, launch velocity, movement mode "
+	     "and exit velocity at Display, so the vertical dash can be measured in a live match."),
+	ECVF_Cheat);
+
+static bool IsDashDebugEnabled()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceDashDebug"));
+	return bFromCommandLine || GTraceDashDebug != 0;
+}
+
 static bool IsMantleDebugEnabled()
 {
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceMantleDebug"));
@@ -233,6 +259,8 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	DashRechargeRemaining = 0.f;
 	LastMaxDashCharges = 1;
 	DashDirection = FVector::ZeroVector;
+	ReplayAimRotation = FRotator::ZeroRotator;
+	bReplayAimRotationValid = 0;
 
 	SlideTimeRemaining = 0.f;
 	SlideCooldownRemaining = 0.f;
@@ -254,6 +282,12 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 
 #if !UE_BUILD_SHIPPING
 	bLedgeTestWasGrounded = 0;
+
+	// Spec v7 §5's harness. Bitfields get no in-class initialiser here for the same reason the ledge
+	// test's does not: every other one in this component is set in the constructor, and a mixed
+	// convention is how one of them ends up uninitialised.
+	bDashPitchTestFired = 0;
+	bDashPitchTestLogged = 0;
 #endif
 
 	// Third-person feel: the capsule turns toward where it is moving. Aim is separate and comes
@@ -448,6 +482,45 @@ float UTraceCharacterMovementComponent::GetDashExitSpeedMultiplier() const
 {
 	// Never below 1: a dash that handed back LESS than a run would be a punishment for dashing.
 	return FMath::Max(1.f, UTraceSettings::Get().DashExitSpeedMultiplier);
+}
+
+float UTraceCharacterMovementComponent::GetDashExitVerticalSpeedLimit() const
+{
+	// SPEC v7 §5. See the header note "THE CLIMB". JumpZVelocity rather than a literal so that the
+	// one number the whole kit expresses vertical launches in still governs this one, and so that
+	// raising the jump raises the dash's ceiling with it instead of silently capping it lower.
+	// INTEGRATED: the designer knob asked for in the v7 report now exists, as a MULTIPLE of the jump
+	// rather than an absolute, so the tie to JumpZVelocity survives retuning.
+	return FMath::Max(0.f, JumpZVelocity * FMath::Max(0.f, UTraceSettings::Get().DashExitVerticalSpeedMultiplier));
+}
+
+FRotator UTraceCharacterMovementComponent::GetDashAimRotation() const
+{
+	// SPEC v7 §5, AND THE ONLY REASON A VERTICAL DASH DOES NOT DESYNC.
+	//
+	// bClientUpdating is set for exactly the span of ClientUpdatePositionAfterServerUpdate's replay
+	// loop, and inside that loop every move's PrepMoveFor has just written ReplayAimRotation. So the
+	// gate is both necessary (a live move must use the live mouse) and sufficient (a replayed move
+	// can never read a stale rotation, because one was written microseconds earlier).
+	if (bReplayAimRotationValid != 0 && CharacterOwner != nullptr && CharacterOwner->bClientUpdating)
+	{
+		return ReplayAimRotation;
+	}
+
+	// The authority's own path and the owning client's original simulation. On the server this is
+	// the rotation FCharacterNetworkMoveData delivered and ServerMove_PerformMovement applied to the
+	// controller immediately before MoveAutonomous, so it matches what the client had.
+	if (CharacterOwner != nullptr)
+	{
+		if (const AController* OwningController = CharacterOwner->GetController())
+		{
+			return OwningController->GetControlRotation();
+		}
+	}
+
+	// No controller at all (a detached or dying pawn). The capsule's own rotation is level under
+	// bOrientRotationToMovement, which degrades this to exactly the old horizontal dash.
+	return (UpdatedComponent != nullptr) ? UpdatedComponent->GetComponentRotation() : FRotator::ZeroRotator;
 }
 
 float UTraceCharacterMovementComponent::GetSlideDuration() const
@@ -772,6 +845,58 @@ int32 UTraceCharacterMovementComponent::GetMaxDashCharges() const
 	}
 
 	return Max;
+}
+
+bool UTraceCharacterMovementComponent::RefundDashCharge()
+{
+	// SPEC v7 §6. The header documents the three cases; this is them, in order.
+	if (CharacterOwner == nullptr || !CharacterOwner->HasAuthority())
+	{
+		return false;
+	}
+
+	const int32 MaxCharges = GetMaxDashCharges();
+	if (DashCharges >= MaxCharges)
+	{
+		// "If both are already available, nothing to do." Not an error, and not worth an RPC.
+		return false;
+	}
+
+	DashCharges = FMath::Min(DashCharges + 1, MaxCharges);
+
+	// Only a FULL pool clears the clock. A carrier who had spent BOTH charges keeps the timer that
+	// was already running for the second — the spec refunds one dash, not both. Leaving the clock
+	// alone is also what makes this composable with the refill in TickComponent, which restarts the
+	// window only when it finds the pool short with no clock running.
+	if (DashCharges >= MaxCharges)
+	{
+		DashRechargeRemaining = 0.f;
+	}
+
+	ClientRefundDashCharge();
+	return true;
+}
+
+void UTraceCharacterMovementComponent::ClientRefundDashCharge_Implementation()
+{
+	// The listen host already ran RefundDashCharge on this very component; applying it twice here
+	// would hand back two charges for one parry kill.
+	if (CharacterOwner == nullptr || CharacterOwner->HasAuthority())
+	{
+		return;
+	}
+
+	const int32 MaxCharges = GetMaxDashCharges();
+	if (DashCharges >= MaxCharges)
+	{
+		return;
+	}
+
+	DashCharges = FMath::Min(DashCharges + 1, MaxCharges);
+	if (DashCharges >= MaxCharges)
+	{
+		DashRechargeRemaining = 0.f;
+	}
 }
 
 // --- Momentum readouts --------------------------------------------------------------------------
@@ -1121,26 +1246,40 @@ float UTraceCharacterMovementComponent::GetDashCooldownRemaining() const
 	return FMath::Max(0.f, DashRechargeRemaining);
 }
 
-void UTraceCharacterMovementComponent::BeginDash()
+FVector UTraceCharacterMovementComponent::ComputeDashDirection(const FVector& InAcceleration, const FRotator& InAimRotation) const
 {
-	// Direction is locked here and never recomputed: a dash you can steer is not a dash, and a
-	// steerable dash would also have to re-derive its direction identically during replay.
-	//
-	// Acceleration (not GetLastInputVector()) is the input source on purpose. Acceleration is
-	// restored by MoveAutonomous() from the saved move on every replayed frame, so it reproduces
-	// exactly; LastControlInputVector is consumed from live per-frame input and is *not* part of
-	// the saved move, so using it would desync the client on every correction.
-	//
-	// Z is stripped here and never re-added anywhere in the dash: contract §5 is explicit that a
-	// dash is a horizontal-plane burst and must not add vertical velocity. A dash in the air keeps
-	// whatever Z the fall had.
-	FVector Direction = Acceleration;
-	Direction.Z = 0.f;
+	// SPEC v7 §5. THE ONLY PLACE THE DASH DIRECTION IS EVER DERIVED. Pure: it reads no clock, no
+	// per-frame input and no mutable member except the standing-still fallback's facing, so BeginDash
+	// on the server, BeginDash on the client, BeginDash on a replayed frame and Trace.DashVectorTest
+	// all get bit-identical answers from identical arguments.
+
+	// The input basis is the AIM YAW, not the capsule's — exactly as ATraceCharacter::DoMove builds
+	// it. Reconstructing the same basis here is what turns a single world-space Acceleration back
+	// into the two scalars the player actually pressed.
+	const FRotationMatrix YawBasis(FRotator(0.f, InAimRotation.Yaw, 0.f));
+	const FVector YawForward = YawBasis.GetUnitAxis(EAxis::X);
+	const FVector YawRight   = YawBasis.GetUnitAxis(EAxis::Y);
+
+	// Acceleration is level to begin with for a human (DoMove feeds it two level axes), but a bot
+	// steers with a world direction that can be tilted, so flatten before decomposing rather than
+	// letting a bot's climb angle leak in as a phantom forward amount.
+	const FVector PlanarInput(InAcceleration.X, InAcceleration.Y, 0.f);
+	const float ForwardAmount = FVector::DotProduct(PlanarInput, YawForward);   // W positive, S negative
+	const float StrafeAmount  = FVector::DotProduct(PlanarInput, YawRight);     // D positive, A negative
+
+	// THE WHOLE CHANGE IS THIS PAIR OF BASIS VECTORS.
+	//   strafe → YawRight, dead level, "parallel to the ground" whatever the pitch is;
+	//   forward → the full aim ray, so look up and W goes up, look 45° and W goes 45°.
+	// Summed and normalised, because the spec asks for "one dash length" on the diagonals: an
+	// unnormalised sum would make W+D reach ~1.4× as far as W alone.
+	FVector Direction = InAimRotation.Vector() * ForwardAmount + YawRight * StrafeAmount;
 
 	if (!Direction.Normalize())
 	{
-		// Standing still: dash straight ahead. bOrientRotationToMovement means the capsule is
-		// already facing the last movement direction, which is what a player expects.
+		// No directional input. Spec v7 §5 keeps the old fallback verbatim: dash straight ahead,
+		// level. bOrientRotationToMovement means the capsule is already facing the last movement
+		// direction, which is what a player expects — and with nothing held there is no forward axis
+		// asking for the aim's pitch, so this stays horizontal on purpose.
 		Direction = (UpdatedComponent != nullptr)
 			? UpdatedComponent->GetForwardVector()
 			: (CharacterOwner != nullptr ? CharacterOwner->GetActorForwardVector() : FVector::ForwardVector);
@@ -1150,6 +1289,34 @@ void UTraceCharacterMovementComponent::BeginDash()
 		{
 			Direction = FVector::ForwardVector;
 		}
+	}
+
+	return Direction;
+}
+
+void UTraceCharacterMovementComponent::BeginDash()
+{
+	// Direction is locked here and never recomputed: a dash you can steer is not a dash, and a
+	// steerable dash would also have to re-derive its direction identically during replay.
+	//
+	// Acceleration (not GetLastInputVector()) is the input source on purpose. Acceleration is
+	// restored by MoveAutonomous() from the saved move on every replayed frame, so it reproduces
+	// exactly; LastControlInputVector is consumed from live per-frame input and is *not* part of
+	// the saved move, so using it would desync the client on every correction. The aim rotation is
+	// the second input and does NOT come free like that — see GetDashAimRotation().
+	//
+	// SPEC v7 §5: the Z-stripping that used to live here is GONE, and so is the contract §5 rule it
+	// enforced. A dash may now be vertical. Do not reintroduce `Direction.Z = 0`.
+	FVector Direction = ComputeDashDirection(Acceleration, GetDashAimRotation());
+
+	// A GROUNDED DASH MAY NOT AIM INTO THE FLOOR. Look at your feet and press W and the composed
+	// direction is straight down; PhysWalking would discard all of it and the player would have spent
+	// a charge to stand still. Flatten instead, which is the same dash they would have got before
+	// they looked down. Airborne is left alone — a dive is a legitimate move.
+	if (IsMovingOnGround() && Direction.Z < 0.f)
+	{
+		FVector Flattened(Direction.X, Direction.Y, 0.f);
+		Direction = Flattened.Normalize() ? Flattened : ComputeDashDirection(FVector::ZeroVector, GetDashAimRotation());
 	}
 
 	DashDirection = Direction;
@@ -1176,10 +1343,46 @@ void UTraceCharacterMovementComponent::BeginDash()
 	// Launch on the same frame the intent arrived. The move for this frame has already been
 	// simulated by the time OnMovementUpdated runs, so this velocity lands on the next one — a
 	// single frame, identically on both ends of the wire.
-	const FVector Planar = DashDirection * GetDashSpeed();
-	Velocity.X = Planar.X;
-	Velocity.Y = Planar.Y;
-	if (IsMovingOnGround())
+	//
+	// SPEC v7 §5: the FULL vector, Z included. A grounded dash whose direction is level still ends up
+	// with Velocity.Z == 0, which is the old behaviour exactly; a grounded dash that aims up needs
+	// MOVE_Falling as well, because PhysWalking zeroes Z at the top of every walking step and would
+	// otherwise eat the launch whole.
+	ApplyDashVelocity();
+
+	if (IsMovingOnGround() && DashDirection.Z > UE_KINDA_SMALL_NUMBER)
+	{
+		SetMovementMode(MOVE_Falling);
+	}
+
+#if !UE_BUILD_SHIPPING
+	if (IsDashDebugEnabled())
+	{
+		const FRotator AimRotation = GetDashAimRotation();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("DASH %s start: aimPitch=%6.1f accel=(%7.1f,%7.1f,%7.1f) dir=(%6.3f,%6.3f,%6.3f) "
+			     "dashPitch=%6.1fdeg v=(%7.1f,%7.1f,%7.1f) mode=%d replayedAim=%d"),
+			*GetNameSafe(CharacterOwner), FRotator::NormalizeAxis(AimRotation.Pitch),
+			Acceleration.X, Acceleration.Y, Acceleration.Z,
+			DashDirection.X, DashDirection.Y, DashDirection.Z,
+			FMath::RadiansToDegrees(FMath::Asin(FMath::Clamp(DashDirection.Z, -1., 1.))),
+			Velocity.X, Velocity.Y, Velocity.Z, static_cast<int32>(MovementMode.GetValue()),
+			(CharacterOwner != nullptr && CharacterOwner->bClientUpdating) ? 1 : 0);
+	}
+#endif
+}
+
+void UTraceCharacterMovementComponent::ApplyDashVelocity()
+{
+	// SPEC v7 §5. One writer for the dash's velocity, used by both the launch and the per-frame
+	// re-assert, so the two can never drift apart — they did not before this change either, but they
+	// were two copies of the same three lines and now there are three axes to keep in step.
+	Velocity = DashDirection * GetDashSpeed();
+
+	// Still on the ground and not asking to leave it: keep Z at zero rather than handing PhysWalking
+	// a vertical component it would only discard. This is also what stops a level dash across a slope
+	// from being read as an attempt to launch.
+	if (IsMovingOnGround() && DashDirection.Z <= UE_KINDA_SMALL_NUMBER)
 	{
 		Velocity.Z = 0.f;
 	}
@@ -1633,6 +1836,21 @@ void UTraceCharacterMovementComponent::ApplyDashExitSpeed()
 		const FVector Clamped = PlanarVelocity.GetSafeNormal() * PlanarLimit;
 		Velocity.X = Clamped.X;
 		Velocity.Y = Clamped.Y;
+	}
+
+	// SPEC v7 §5, AND THE THING THAT KEEPS A VERTICAL DASH FROM BEING A ROCKET. The dash suspends
+	// gravity for its window, so a straight-up one would hand back the whole DashSpeed as upward
+	// velocity — 3000 uu/s, another 4592 uu of coast, past the arena's 1640 uu ceiling. THE AIR-STRAFE
+	// CEILING CANNOT HELP HERE: it is planar-only by construction (see ApplySourceAirAcceleration,
+	// which never touches Z) and so bounds nothing vertical at all.
+	//
+	// Same shape as the planar rule directly above: hand back a fast player, not a stationary one,
+	// but hand back a bounded one. Downward Z is deliberately untouched — a dive is not a climb, and
+	// clamping it would turn a downward dash into a float.
+	const float VerticalLimit = GetDashExitVerticalSpeedLimit();
+	if (Velocity.Z > VerticalLimit)
+	{
+		Velocity.Z = VerticalLimit;
 	}
 }
 
@@ -2254,7 +2472,26 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	//     rather than AT the ground limit. See ApplyDashExitSpeed().
 	if (bWasDashing && DashTimeRemaining <= 0.f)
 	{
+#if !UE_BUILD_SHIPPING
+		const FVector PreExitVelocity = Velocity;
+#endif
 		ApplyDashExitSpeed();
+
+#if !UE_BUILD_SHIPPING
+		if (IsDashDebugEnabled())
+		{
+			// The Z column is the spec v7 §5 exit clamp doing its job: a vertical dash arrives here
+			// carrying the whole DashSpeed upward and must leave carrying at most JumpZVelocity.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("DASH %s  exit: pre=(%7.1f,%7.1f,%7.1f) post=(%7.1f,%7.1f,%7.1f) "
+				     "planarLimit=%6.1f zLimit=%6.1f mode=%d"),
+				*GetNameSafe(CharacterOwner),
+				PreExitVelocity.X, PreExitVelocity.Y, PreExitVelocity.Z,
+				Velocity.X, Velocity.Y, Velocity.Z,
+				FMath::Max(1.f, GetMaxSpeed()) * GetDashExitSpeedMultiplier(),
+				GetDashExitVerticalSpeedLimit(), static_cast<int32>(MovementMode.GetValue()));
+		}
+#endif
 	}
 
 	// 1e. A slide whose duration has just run out exits through EndSlide() like every other slide
@@ -2281,14 +2518,11 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		// against whatever the player is (or is not) holding, and without this the dash would
 		// decay toward the walk speed and, worse, decay by a different amount on a replayed frame.
 		//
-		// Planar only, always: the dash never writes a positive Z (contract §5).
-		const FVector Planar = DashDirection * GetDashSpeed();
-		Velocity.X = Planar.X;
-		Velocity.Y = Planar.Y;
-		if (IsMovingOnGround())
-		{
-			Velocity.Z = 0.f;
-		}
+		// SPEC v7 §5: all three axes now, through the same writer the launch uses. Re-asserting Z is
+		// what makes a vertical dash a straight line for its window instead of a gravity arc — the
+		// same "on rails" property the horizontal dash has always had, extended to the axis the dash
+		// is now allowed to use. Gravity resumes the instant the window closes.
+		ApplyDashVelocity();
 	}
 
 	// 3. Crouch: slide on the ground, fast-fall in the air. One key, resolved by where the pawn is.
@@ -2457,6 +2691,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 #if !UE_BUILD_SHIPPING
 	TickMomentumMeasure(DeltaSeconds);
 	TickLedgeTest(DeltaSeconds);
+	TickDashPitchTest(DeltaSeconds);
 #endif
 }
 
@@ -3595,6 +3830,328 @@ void UTraceCharacterMovementComponent::TickLedgeTest(float DeltaSeconds)
 	}
 }
 
+// -------------------------------------------------------------------------------------------
+// Trace.DashVectorTest — the measured verification of spec v7 §5
+// -------------------------------------------------------------------------------------------
+//
+// Offline and deterministic: it calls the SHIPPING ComputeDashDirection() with synthetic
+// (acceleration, aim rotation) pairs, so what it prints is the function the game runs, not a
+// re-derivation of it. Yaw is pinned to 0 so every expected answer is a world axis and a wrong sign
+// is obvious by eye; MaxAcceleration is used as the input magnitude because that is what
+// ATraceCharacter::DoMove actually produces once UCharacterMovementComponent has scaled the stick.
+//
+// The row that matters most is the last pair: W-only and W+D must print the SAME |v| and the same
+// reach. "add the two vectors and normalize to one dash length" is a claim about distance, and this
+// is the only place it is checked.
+
+// -------------------------------------------------------------------------------------------
+// -TraceDashPitchTest — spec v7 §5 measured on a real pawn
+// -------------------------------------------------------------------------------------------
+
+void UTraceCharacterMovementComponent::TickDashPitchTest(float DeltaSeconds)
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("TraceDashPitchTest"));
+	if (!bEnabled || CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	APlayerController* TestController = Cast<APlayerController>(CharacterOwner->GetController());
+	if (TestController == nullptr || !CharacterOwner->IsLocallyControlled())
+	{
+		return;
+	}
+
+	// NEVER ON A REPLAYED MOVE. OnMovementUpdated runs again for every saved move a correction
+	// replays, and this harness has a clock and fires abilities — advancing it twice would schedule
+	// phantom dashes that the server never saw, which is the harness manufacturing the very desync
+	// it was written to look for. TickMomentumMeasure sidesteps this by refusing to run on an
+	// autonomous proxy at all; this one has to run there, because a networked CLIENT predicting a
+	// vertical dash is exactly the case worth measuring.
+	if (CharacterOwner->bClientUpdating)
+	{
+		return;
+	}
+
+	const UWorld* TestWorld = GetWorld();
+	if (TestWorld == nullptr)
+	{
+		return;
+	}
+
+	// One phase per row. Forward/Strafe are the W/S and A/D amounts; Pitch is where the mouse points,
+	// positive up. 85 rather than 90 because APlayerController::LimitViewRotation clamps to the
+	// camera manager's ViewPitchMax (89.9 by default) and a request at the clamp is a request whose
+	// answer depends on the clamp.
+	struct FDashPitchPhase
+	{
+		const TCHAR* Label;
+		float Forward;
+		float Strafe;
+		float Pitch;
+	};
+
+	static const FDashPitchPhase Phases[] =
+	{
+		{ TEXT("A only,  level    "),  0.f, -1.f,  0.f },
+		{ TEXT("D only,  level    "),  0.f,  1.f,  0.f },
+		{ TEXT("D only,  look up45"),  0.f,  1.f, 45.f },
+		{ TEXT("W only,  level    "),  1.f,  0.f,  0.f },
+		{ TEXT("W only,  look up45"),  1.f,  0.f, 45.f },
+		{ TEXT("W only,  look up85"),  1.f,  0.f, 85.f },
+		{ TEXT("W+D,     look up45"),  1.f,  1.f, 45.f },
+	};
+
+	static const int32 NumPhases = UE_ARRAY_COUNT(Phases);
+
+	// The dash is charged, and one charge refills over DashDuration + DashCooldown (3.68s shipped).
+	// A phase shorter than that would silently measure "no dash happened" from the second row on.
+	const float PhaseLength = FMath::Max(4.0f, GetDashRechargeWindow() + 0.5f);
+	const float FireAt = 0.5f;      // input has to be held for a frame or two before Acceleration exists
+	const float ReportAt = FireAt + 2.5f;
+
+	if (DashPitchTestTime < 0.f)
+	{
+		// Wait for the match to settle and the pawn to be standing on something.
+		if (TestWorld->GetTimeSeconds() < 4.f || !IsMovingOnGround())
+		{
+			return;
+		}
+
+		DashPitchTestTime = 0.f;
+		DashPitchTestPhase = 0;
+		DashPitchTestPhaseTime = 0.f;
+		bDashPitchTestFired = 0;
+		bDashPitchTestLogged = 0;
+
+		// Face the middle of the field, exactly as the other two harnesses do: a fixed world axis
+		// runs the pawn straight into an endzone wall from a spawn pad and measures the wall.
+		FVector TowardCentre = -UpdatedComponent->GetComponentLocation();
+		TowardCentre.Z = 0.f;
+		DashPitchTestYaw = TowardCentre.Normalize() ? TowardCentre.Rotation().Yaw : 0.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("DASHPITCH ---- begin. netMode=%d speed=%.0f duration=%.3f reach=%.1fuu "
+			     "exitZLimit=%.0f runYaw=%.1f"),
+			static_cast<int32>(GetNetMode()), GetDashSpeed(), GetDashDuration(),
+			GetDashSpeed() * GetDashDuration(), GetDashExitVerticalSpeedLimit(), DashPitchTestYaw);
+	}
+
+	if (DashPitchTestPhase >= NumPhases)
+	{
+		return;
+	}
+
+	DashPitchTestTime += DeltaSeconds;
+	DashPitchTestPhaseTime += DeltaSeconds;
+
+	const FDashPitchPhase& Phase = Phases[DashPitchTestPhase];
+
+	// Aim. Held every frame: the pawn is under a PlayerController whose UpdateRotation would
+	// otherwise leave the rotation wherever the last frame put it, and the whole measurement is
+	// about pitch.
+	TestController->SetControlRotation(FRotator(Phase.Pitch, DashPitchTestYaw, 0.f));
+
+	// Hold the movement keys. Same basis ATraceCharacter::DoMove uses, so Acceleration arrives at
+	// BeginDash shaped exactly as a human's would be.
+	const FRotationMatrix YawBasis(FRotator(0.f, DashPitchTestYaw, 0.f));
+	const FVector InputDirection =
+		(YawBasis.GetUnitAxis(EAxis::X) * Phase.Forward + YawBasis.GetUnitAxis(EAxis::Y) * Phase.Strafe)
+		.GetSafeNormal();
+	if (!InputDirection.IsNearlyZero() && DashPitchTestPhaseTime < ReportAt)
+	{
+		CharacterOwner->AddMovementInput(InputDirection, 1.f);
+	}
+
+	if (DashPitchTestPhaseTime >= FireAt && bDashPitchTestFired == 0)
+	{
+		DashPitchTestStart = UpdatedComponent->GetComponentLocation();
+		DashPitchTestPeakRise = 0.f;
+		DashPitchTestLaunchVelocity = FVector::ZeroVector;
+		StartDash();
+		bDashPitchTestFired = 1;
+	}
+
+	if (bDashPitchTestFired != 0)
+	{
+		// First frame the dash is actually running is the launch this phase is measuring.
+		if (IsDashing() && DashPitchTestLaunchVelocity.IsNearlyZero())
+		{
+			DashPitchTestLaunchVelocity = Velocity;
+		}
+
+		DashPitchTestPeakRise = FMath::Max<float>(
+			DashPitchTestPeakRise,
+			static_cast<float>(UpdatedComponent->GetComponentLocation().Z - DashPitchTestStart.Z));
+	}
+
+	if (DashPitchTestPhaseTime >= ReportAt && bDashPitchTestLogged == 0)
+	{
+		const FVector Here = UpdatedComponent->GetComponentLocation();
+		const FVector Travel = Here - DashPitchTestStart;
+		const FVector PlanarTravel(Travel.X, Travel.Y, 0.f);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("DASHPITCH %s dir=(%6.3f,%6.3f,%6.3f) launchV=(%7.1f,%7.1f,%7.1f) |v|=%7.1f "
+			     "peakRise=%7.1fuu planarTravel=%7.1fuu netZ=%7.1fuu grounded=%d"),
+			Phase.Label, DashDirection.X, DashDirection.Y, DashDirection.Z,
+			DashPitchTestLaunchVelocity.X, DashPitchTestLaunchVelocity.Y, DashPitchTestLaunchVelocity.Z,
+			DashPitchTestLaunchVelocity.Size(), DashPitchTestPeakRise, PlanarTravel.Size(), Travel.Z,
+			IsMovingOnGround() ? 1 : 0);
+
+		bDashPitchTestLogged = 1;
+	}
+
+	if (DashPitchTestPhaseTime >= PhaseLength)
+	{
+		++DashPitchTestPhase;
+		DashPitchTestPhaseTime = 0.f;
+		bDashPitchTestFired = 0;
+		bDashPitchTestLogged = 0;
+
+		if (DashPitchTestPhase >= NumPhases)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("DASHPITCH ---- end. %d phases."), NumPhases);
+		}
+	}
+}
+
+int32 UTraceCharacterMovementComponent::RunDashVectorTest() const
+{
+	const float DashSpeed = GetDashSpeed();
+	const float DashDuration = GetDashDuration();
+	const float ExitVerticalLimit = GetDashExitVerticalSpeedLimit();
+	const float GravityMagnitude = FMath::Max(1.f, -GetGravityZ());
+	const float InputMagnitude = FMath::Max(1.f, GetMaxAcceleration());
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("DASHVEC ---- spec v7 5, yaw pinned to 0 so +X is forward and +Y is right. "
+		     "speed=%.0f duration=%.3f reach=%.1fuu exitZLimit=%.0f gravity=%.0f"),
+		DashSpeed, DashDuration, DashSpeed * DashDuration, ExitVerticalLimit, GravityMagnitude);
+
+	struct FDashVectorCase
+	{
+		const TCHAR* Label;
+		float Forward;   // W = +1, S = -1
+		float Strafe;    // D = +1, A = -1
+		float Pitch;     // degrees, positive is looking UP
+	};
+
+	// Every case the task asks for, plus the degenerate ones that would silently break.
+	static const FDashVectorCase Cases[] =
+	{
+		{ TEXT("A only,      level     "),  0.f, -1.f,   0.f },
+		{ TEXT("D only,      level     "),  0.f,  1.f,   0.f },
+		{ TEXT("A only,      look up 60"),  0.f, -1.f,  60.f },
+		{ TEXT("D only,      look dn 60"),  0.f,  1.f, -60.f },
+		{ TEXT("W only,      level     "),  1.f,  0.f,   0.f },
+		{ TEXT("W only,      look up 90"),  1.f,  0.f,  90.f },
+		{ TEXT("W only,      look up 45"),  1.f,  0.f,  45.f },
+		{ TEXT("W only,      look dn 45"),  1.f,  0.f, -45.f },
+		{ TEXT("S only,      look up 45"), -1.f,  0.f,  45.f },
+		{ TEXT("W+D,         level     "),  1.f,  1.f,   0.f },
+		{ TEXT("W+D,         look up 45"),  1.f,  1.f,  45.f },
+		{ TEXT("W+A,         look up 45"),  1.f, -1.f,  45.f },
+		{ TEXT("no input,    look up 45"),  0.f,  0.f,  45.f },
+	};
+
+	int32 Failures = 0;
+
+	for (const FDashVectorCase& Case : Cases)
+	{
+		// Yaw 0: forward is +X, right is +Y. This is the same construction ATraceCharacter::DoMove
+		// uses, so the acceleration fed in is shaped exactly like a real frame's.
+		const FVector InAccel = FVector(Case.Forward, Case.Strafe, 0.f).GetSafeNormal() * InputMagnitude;
+		const FRotator AimRotation(Case.Pitch, 0.f, 0.f);
+
+		const FVector Direction = ComputeDashDirection(InAccel, AimRotation);
+		const FVector DashVelocity = Direction * DashSpeed;
+		const float Magnitude = DashVelocity.Size();
+
+		// The normalisation claim, checked rather than described: every case must be one dash length.
+		if (!FMath::IsNearlyEqual(Direction.Size(), 1.f, 1.e-4f))
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("DASHVEC FAIL  %s direction is not unit length (%.6f)"),
+				Case.Label, Direction.Size());
+			++Failures;
+		}
+
+		// "If only A or D is held, dash horizontally only: parallel to the ground" — stated as an
+		// assertion so a future edit that lets pitch leak into the strafe axis fails here loudly.
+		if (FMath::IsNearlyZero(Case.Forward) && !FMath::IsNearlyZero(Case.Strafe)
+			&& !FMath::IsNearlyZero(Direction.Z, 1.e-4f))
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("DASHVEC FAIL  %s is strafe-only but has Z=%.6f"),
+				Case.Label, Direction.Z);
+			++Failures;
+		}
+
+		// Climb accounting, so "how high does a vertical dash get me" is a printed number rather than
+		// an argument: the rails phase, then the clamped exit coast.
+		const float RailsRise = FMath::Max(0.f, DashVelocity.Z) * DashDuration;
+		const float ExitZ = FMath::Min(FMath::Max(0.f, DashVelocity.Z), ExitVerticalLimit);
+		const float CoastRise = (ExitZ * ExitZ) / (2.f * GravityMagnitude);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("DASHVEC %s dir=(%7.4f,%7.4f,%7.4f) v=(%8.1f,%8.1f,%8.1f) |v|=%7.1f "
+			     "reach=%6.1fuu pitchOut=%6.1fdeg climb=%6.1f+%6.1f=%6.1fuu"),
+			Case.Label, Direction.X, Direction.Y, Direction.Z,
+			DashVelocity.X, DashVelocity.Y, DashVelocity.Z, Magnitude,
+			Magnitude * DashDuration,
+			FMath::RadiansToDegrees(FMath::Asin(FMath::Clamp(Direction.Z, -1.f, 1.f))),
+			RailsRise, CoastRise, RailsRise + CoastRise);
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("DASHVEC ---- end. %d failure(s)."), Failures);
+	return Failures;
+}
+
+static void TraceRunDashVectorTest()
+{
+	// Prefer a live pawn's component so the numbers reported are the ones the running match would
+	// get; the CDO is a correct fallback because ComputeDashDirection touches no instance state
+	// except in its standing-still branch, and every setting it reads is global.
+	const UTraceCharacterMovementComponent* Movement = nullptr;
+	if (GEngine != nullptr)
+	{
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			const UWorld* ContextWorld = Context.World();
+			if (ContextWorld == nullptr)
+			{
+				continue;
+			}
+
+			if (const APlayerController* LocalPC = ContextWorld->GetFirstPlayerController())
+			{
+				if (const ACharacter* LocalCharacter = Cast<ACharacter>(LocalPC->GetPawn()))
+				{
+					if (const UTraceCharacterMovementComponent* Found =
+						Cast<UTraceCharacterMovementComponent>(LocalCharacter->GetCharacterMovement()))
+					{
+						Movement = Found;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	if (Movement == nullptr)
+	{
+		Movement = GetDefault<UTraceCharacterMovementComponent>();
+	}
+
+	Movement->RunDashVectorTest();
+}
+
+static FAutoConsoleCommand GTraceDashVectorTestCmd(
+	TEXT("Trace.DashVectorTest"),
+	TEXT("Dev only. Prints the composed dash vector for every input/aim combination in spec v7 sec 5 "
+	     "(A only, D only, W while looking up, W at 45 degrees, W+D) and asserts that each one is a "
+	     "single dash length and that the strafe axis stays level."),
+	FConsoleCommandDelegate::CreateStatic([]() { TraceRunDashVectorTest(); }));
+
 #endif // !UE_BUILD_SHIPPING
 
 // -------------------------------------------------------------------------------------------
@@ -3766,7 +4323,16 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedDashRechargeRemaining = Movement->DashRechargeRemaining;
 			SavedDashCharges           = Movement->DashCharges;
 			SavedLastMaxDashCharges    = Movement->LastMaxDashCharges;
+
+			// The WHOLE vector, Z included (spec v7 §5). Nothing here had to change — it was always
+			// an FVector — but the field is now load-bearing in three axes rather than two, so a
+			// future "optimisation" to a yaw or an FVector2D would silently flatten every vertical
+			// dash on the replay path only, which is the hardest class of bug this file can have.
 			SavedDashDirection         = Movement->DashDirection;
+
+			// NOTE: the aim rotation needs nothing here. Super::SetMoveFor has already captured it
+			// into the base class's SavedControlRotation, which is the same field the ServerMove
+			// packs; PrepMoveFor is where it is handed back to the component.
 
 			SavedSlideTimeRemaining     = Movement->SlideTimeRemaining;
 			SavedSlideCooldownRemaining = Movement->SlideCooldownRemaining;
@@ -3815,7 +4381,33 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			Movement->DashRechargeRemaining = SavedDashRechargeRemaining;
 			Movement->DashCharges           = SavedDashCharges;
 			Movement->LastMaxDashCharges    = SavedLastMaxDashCharges;
+
+			// SavedDashDirection IS THE FULL 3D VECTOR (spec v7 §5). It always was an FVector; what
+			// changed is that its Z is now non-zero, so a correction landing mid-dash restores the
+			// vertical component too and the replay re-launches along the same ray rather than a
+			// flattened one.
 			Movement->DashDirection         = SavedDashDirection;
+
+			// SPEC v7 §5 — THE AIM ROTATION, AND THE REASON A VERTICAL DASH DOES NOT RUBBER-BAND.
+			//
+			// Acceleration round-trips for free (MoveAutonomous restores it), but the dash direction
+			// now has a SECOND input, and FSavedMove_Character::PrepMoveFor does not restore the
+			// control rotation — so a replayed BeginDash would compose its direction from wherever
+			// the mouse is pointing at correction time, not where it pointed when the dash was
+			// pressed. With the old horizontal dash that was invisible because only the yaw mattered
+			// and the yaw arrived inside Acceleration; with a vertical dash it is a Z-velocity
+			// disagreement between client and server, i.e. exactly the rubber-band this project has
+			// already been reported for.
+			//
+			// SavedControlRotation is the base class's own field, filled by Super::SetMoveFor from
+			// the same GetControlRotation() that FCharacterNetworkMoveData packs into this move's
+			// ServerMove and that ServerMove_PerformMovement applies to the controller before running
+			// MoveAutonomous. So restoring it here makes the replay compose from the identical pair
+			// of inputs the server did — for free, with no new saved-move field and no bandwidth.
+			// GetDashAimRotation() gates the read on ACharacter::bClientUpdating, so this value can
+			// never escape the replay loop and colour a live move.
+			Movement->ReplayAimRotation        = SavedControlRotation;
+			Movement->bReplayAimRotationValid  = 1;
 
 			Movement->SlideTimeRemaining     = SavedSlideTimeRemaining;
 			Movement->SlideCooldownRemaining = SavedSlideCooldownRemaining;

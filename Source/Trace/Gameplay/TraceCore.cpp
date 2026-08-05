@@ -576,15 +576,69 @@ static TAutoConsoleVariable<int32> CVarModeBGroundTurnover(
 	TEXT("ground for first contact."),
 	ECVF_Default);
 
+// =================================================================================================
+// MODE B ONLY — SPEC v7 §4, THE SURFACE RULE: TOPS TURN OVER, WALLS BOUNCE
+//
+// "Sometimes the core gets stuck up top of an object in gamemode b. This should also count as a
+// turnover. Walls should not, the core should bounce off those."
+//
+// This GENERALISES v6 §4.2 rather than adding a second rule beside it. v6 already asked the hit
+// NORMAL whether the Core had landed, which is the right question — the arena is generic static
+// meshes and there is no actor type to ask — and it already turned the Core over on an upward-facing
+// hit. What v7 changes is that the answer must also be asked of a Core that has come to REST, and
+// what it adds is that a WALL may never be a resting place.
+//
+// THE BUG THE USER SAW, and why the v6 test alone could not catch it. bHitTheGround was evaluated
+// ONLY on the frame a sweep was blocked, and only against that one impact normal. A Core arriving on
+// the lip of a cover block hits the EDGE first, where a swept sphere's normal points out of the
+// corner and can be nowhere near vertical; the bounce off it is small, the next sweep's reflected
+// speed falls under RestSpeed, and bLooseAtRest goes up on a frame where the normal said "wall".
+// From that frame on the integration block is skipped entirely, so no further sweep ever runs and
+// the question is never asked again. The Core sits on top of the block until the reset timer —
+// exactly "the core gets stuck up top of an object".
+//
+// So the rule is now asked in TWO places, both of them geometry:
+//
+//   1. ON CONTACT   the v6 test, unchanged: an upward-facing impact normal is a landing.
+//   2. AT REST      a short downward probe under a Core that has stopped. Whatever is holding it up
+//                   is the surface the rule is about, whether that is the floor or the roof of a
+//                   cover block, and its normal decides. This is the one that fixes the report.
+//
+// And a wall is now genuinely a bounce and nothing else: a Core whose reflection off a vertical face
+// is too slow to matter is NOT declared at rest (it would hang in mid-air against the wall, which is
+// the same stuck-forever failure one surface over). It keeps falling, lands on something horizontal,
+// and turns over there — which is what "the core should bounce off those" means once you follow the
+// Core past the bounce.
+// =================================================================================================
+
+static TAutoConsoleVariable<float> CVarModeBSurfaceMaxSlope(
+	TEXT("Trace.ModeB.SurfaceMaxSlopeDegrees"),
+	45.f,
+	TEXT("MODE B, spec v7 §4. How far from straight up a surface normal may lean and still count as a ")
+	TEXT("FLOOR OR TOP (a turnover) rather than a WALL (a bounce). 45 degrees is the engine's own ")
+	TEXT("default walkable slope, so 'the ground' means the same thing to this rule as it does to the ")
+	TEXT("pawn standing on it. 0 = only a perfectly flat surface turns the Core over; 89 = everything ")
+	TEXT("but a true vertical does. UTraceSettings::CoreSurfaceMaxSlopeDegrees."),
+	ECVF_Default);
+
 /**
- * How upward-facing a surface has to be to count as "the ground".
+ * How far a Core at rest probes downward to find what is holding it up.
  *
- * 0.7 is about 45 degrees, which is the engine's own default walkable floor angle - so "the ground"
- * means the same thing to this rule as it does to the pawn standing on it. A Core that clips a wall,
- * a goal spoke or the underside of a bank is NOT on the ground and stays live, which is what keeps
- * the rule readable: it fires when the Core lands, not when it touches something.
+ * The Core is parked 2 uu off whatever it landed on (see the sweep), so this only has to clear that
+ * plus the sphere's own radius plus a little slack for a surface it settled into.
  */
-static constexpr float TraceModeBGroundNormalZ = 0.7f;
+static constexpr float TraceModeBRestProbeDepth = 24.f;
+
+/**
+ * How far above the arena floor a surface has to be before the log and the tallies call it "the top
+ * of an object" rather than "the ground".
+ *
+ * REPORTING ONLY. The rule itself does not know this number exists and must not: spec v7 §4 is
+ * explicit that landing on top of a structure and landing on the floor are the same event. This
+ * exists so a verification run can state how many of each it actually produced, which is the only
+ * way to show the generalised path was exercised and not just the old one.
+ */
+static constexpr double TraceModeBElevatedSurfaceZ = 60.0;
 
 // =================================================================================================
 // MODE B ONLY — THE CORE'S WEIGHT  (spec v5 §4: "increase the weight of the core")
@@ -657,6 +711,14 @@ namespace TraceModeBTuning
 	float LooseResetSeconds() { return Resolve(TEXT("CoreLooseResetSeconds"),             CVarModeBLooseReset,       0.f,   120.f); }
 	float ThrowCooldown()     { return Resolve(TEXT("CoreThrowCooldownSeconds"),          CVarModeBThrowCooldown,    0.f,   10.f); }
 
+	// --- Spec v7 §4, the surface rule. Kept in DEGREES because that is the unit the spec states it in
+	// ("a normal within ~45 degrees of straight up") and the unit a designer can picture; the cosine
+	// the test actually needs is derived once, here, so no caller has to remember which one it holds.
+	float SurfaceMaxSlopeDegrees() { return Resolve(TEXT("CoreSurfaceMaxSlopeDegrees"), CVarModeBSurfaceMaxSlope, 0.f, 89.f); }
+
+	/** cos(SurfaceMaxSlopeDegrees): the minimum normal Z of a surface the Core may come to rest on. */
+	float SurfaceUpNormalZ()  { return FMath::Cos(FMath::DegreesToRadians(SurfaceMaxSlopeDegrees())); }
+
 	// --- Spec v6 §4.1, the catch zone. Upper bounds chosen so a live retune cannot break the game:
 	// a 3000 uu magnet would make the Core uncatchable-by-anybody-else and a curve above ~30 snaps
 	// rather than curves, which is the thing the note explicitly did not ask for.
@@ -705,6 +767,10 @@ namespace TraceModeBTuning
 			TEXT("CoreCatchRadius"),
 			TEXT("CoreCatchCurveStrength"),
 			TEXT("CoreCatchThrowerLockoutSeconds"),
+			// Spec v7 §4. New this pass, same story: until UTraceSettings declares it, this list is
+			// what says out loud that the slider is not there, and Trace.ModeB.SurfaceMaxSlopeDegrees
+			// is where the threshold can be retuned in the meantime.
+			TEXT("CoreSurfaceMaxSlopeDegrees"),
 		};
 
 		int32 BoundCount = 0;
@@ -2854,6 +2920,25 @@ static FAutoConsoleCommand GTraceModeBTallyCmd(
 			ATraceCore::GoalsByMethod[0] + ATraceCore::GoalsByMethod[1] + ATraceCore::GoalsByMethod[2]);
 	}));
 
+ATraceCore::FSurfaceRuleStats ATraceCore::SurfaceStats;
+
+static FAutoConsoleCommand GTraceModeBSurfaceStatsCmd(
+	TEXT("Trace.ModeB.SurfaceStats"),
+	TEXT("MODE B, spec v7 §4. Prints how many turnovers came off the FLOOR, how many off the TOP of an ")
+	TEXT("object, how many wall bounces were resolved, and how many times a Core was refused a resting ")
+	TEXT("place on a wall."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		const ATraceCore::FSurfaceRuleStats& Stats = ATraceCore::SurfaceStats;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] SURFACE RULE TALLY (spec v7 §4): turnovers off the ground %d | turnovers off the ")
+			TEXT("TOP of an object %d | wall bounces %d (of which %d were refused a resting place) | ")
+			TEXT("rest-probe rescues %d | threshold %.0f deg from vertical (normal Z >= %.3f)"),
+			Stats.GroundTurnovers, Stats.TopTurnovers, Stats.WallBounces, Stats.WallRestRefusals,
+			Stats.RestProbeRescues,
+			TraceModeBTuning::SurfaceMaxSlopeDegrees(), TraceModeBTuning::SurfaceUpNormalZ());
+	}));
+
 bool ATraceCore::CheckGoalScore(const FVector& From, const FVector& To, ETraceTeam ScoringTeam, EGoalMethod Method,
 	const TCHAR* How)
 {
@@ -3069,7 +3154,14 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	const float Step = FMath::Clamp(DeltaSeconds, 0.f, 0.1f);   // A hitch must not teleport the Core.
 
 	const FVector StartLocation = LooseLocation;
-	bool bHitTheGround = false;
+
+	// SPEC v7 §4. "Did it land on something you could stand on" — set by a contact this frame, or by
+	// the at-rest probe below. One flag, two ways of establishing the same geometric fact, so there is
+	// still exactly one turnover call site.
+	bool bLandedOnSurface = false;
+	bool bLandedByRestProbe = false;
+	FVector SurfacePoint = FVector::ZeroVector;
+	FVector SurfaceNormal = FVector::UpVector;
 
 	// --- 0. SPEC v6 §4.1: the catch zone. ---------------------------------------------------------
 	//
@@ -3101,32 +3193,111 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 
 		if (bBlocked)
 		{
-			// Land just off the surface so the next sweep does not start inside it.
-			LooseLocation = Hit.Location + Hit.ImpactNormal * 2.0;
+			// THE NORMAL THE RULE IS ASKED ABOUT. A sweep that STARTS inside geometry reports no
+			// meaningful ImpactNormal - the usable one is Hit.Normal, the depenetration direction,
+			// which points back out of whatever the Core is buried in. Reading ImpactNormal there gave
+			// the surface test a zero vector to classify, and a zero vector is a wall by arithmetic:
+			// the Core would be refused a landing on the one geometry it could not escape.
+			const FVector ContactNormal = (Hit.bStartPenetrating && !Hit.Normal.IsNearlyZero())
+				? Hit.Normal.GetSafeNormal()
+				: Hit.ImpactNormal;
 
-			// SPEC v6 §4.2. "It hits the ground" = it landed on something you could stand on, which is
-			// the floor, the corner banks, the top of a cover block or the approach ramp. A graze off a
-			// wall or a goal spoke is not a landing and leaves the Core live, which is what keeps the
-			// rule legible from inside the game: it fires when the throw comes down, not when it
-			// touches anything at all. Recorded here and acted on after the goal test, because a Core
-			// that scores and a Core that lands are resolved in that order.
-			bHitTheGround = (Hit.ImpactNormal.Z >= TraceModeBGroundNormalZ);
+			// Land just off the surface so the next sweep does not start inside it. A penetrating hit
+			// needs pushing all the way back out, not 2 uu: leaving it embedded means every following
+			// sweep also starts penetrating, which is a Core that can never move again.
+			const double PushOut = Hit.bStartPenetrating
+				? (static_cast<double>(Hit.PenetrationDepth) + 2.0) : 2.0;
+			LooseLocation = Hit.Location + ContactNormal * PushOut;
 
-			const FVector Reflected = FVector(LooseVelocity).MirrorByVector(Hit.ImpactNormal)
+			// SPEC v6 §4.2, GENERALISED BY v7 §4. "It hits the ground" = it landed on something you
+			// could stand on — the floor, a corner bank, the approach ramp, or the TOP of a cover
+			// block, which is the case the user reported and which this test already covers because it
+			// asks the NORMAL and not the actor. A graze off a wall or a goal spoke is not a landing
+			// and leaves the Core live, which is what keeps the rule legible from inside the game: it
+			// fires when the throw comes down, not when it touches anything at all. Recorded here and
+			// acted on after the goal test, because a Core that scores and a Core that lands are
+			// resolved in that order.
+			const float UpNormalZ = TraceModeBTuning::SurfaceUpNormalZ();
+			const bool bUpwardFacing = (ContactNormal.Z >= UpNormalZ);
+
+			bLandedOnSurface = bUpwardFacing;
+			SurfacePoint = Hit.bStartPenetrating ? Hit.Location : Hit.ImpactPoint;
+			SurfaceNormal = ContactNormal;
+
+			const FVector Reflected = FVector(LooseVelocity).MirrorByVector(ContactNormal)
 				* TraceModeBTuning::Bounce();
 			LooseVelocity = Reflected;
 
+			if (!bUpwardFacing)
+			{
+				++SurfaceStats.WallBounces;
+				UE_LOG(LogTraceGame, Verbose,
+					TEXT("[ModeB] loose Core BOUNCED off a wall at %s (normal %s, %.0f deg from up) - no turnover."),
+					*SurfacePoint.ToCompactString(), *ContactNormal.ToCompactString(),
+					FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(ContactNormal.Z, -1.0, 1.0))));
+			}
+
 			if (Reflected.Size() < TraceModeBTuning::RestSpeed())
 			{
-				LooseVelocity = FVector::ZeroVector;
-				bLooseAtRest = true;
-				UE_LOG(LogTraceGame, Verbose, TEXT("[ModeB] loose Core came to rest at %s"),
-					*FVector(LooseLocation).ToCompactString());
+				// SPEC v7 §4: A WALL IS NOT A RESTING PLACE.
+				//
+				// "Walls should not [turn over], the core should bounce off those." Declaring the Core
+				// at rest here on a vertical face would leave it hanging in mid-air against the wall
+				// with the integration switched off - the same stuck-forever failure the user reported
+				// one surface over, and one that no probe can rescue because nothing is holding it up.
+				// So a slow bounce off a wall keeps only its DOWNWARD component and stays live: gravity
+				// takes it to something horizontal, and the rule fires there instead.
+				if (bUpwardFacing)
+				{
+					LooseVelocity = FVector::ZeroVector;
+					bLooseAtRest = true;
+					UE_LOG(LogTraceGame, Verbose, TEXT("[ModeB] loose Core came to rest at %s"),
+						*FVector(LooseLocation).ToCompactString());
+				}
+				else
+				{
+					++SurfaceStats.WallRestRefusals;
+					LooseVelocity = FVector(0.0, 0.0, FMath::Min(0.0, Reflected.Z));
+				}
 			}
 		}
 		else
 		{
 			LooseLocation = Desired;
+		}
+	}
+
+	// --- 1b. SPEC v7 §4: ASK THE SAME QUESTION OF A CORE THAT HAS STOPPED. -------------------------
+	//
+	// THIS IS THE FIX FOR "the core gets stuck up top of an object". The contact test above only ever
+	// runs on the frame a sweep is blocked, and a Core can reach rest on a frame whose impact normal
+	// was an edge or a corner - after which the integration block is skipped forever and the question
+	// is never asked again. Probing straight down under a Core at rest asks it of whatever is actually
+	// holding the Core up, which is the surface the rule is about: the floor, or the roof of a block.
+	//
+	// Cheap by construction: it runs only while the Core is at rest AND has not yet turned over, which
+	// in a real match is the handful of frames between landing and the turnover firing.
+	if (!bLandedOnSurface && bLooseAtRest)
+	{
+		FVector RestPoint = FVector::ZeroVector;
+		FVector RestNormal = FVector::UpVector;
+		const bool bSupported = ServerProbeRestingSurface(RestPoint, RestNormal);
+
+		if (bSupported)
+		{
+			bLandedOnSurface = (RestNormal.Z >= TraceModeBTuning::SurfaceUpNormalZ());
+			bLandedByRestProbe = bLandedOnSurface;
+			SurfacePoint = RestPoint;
+			SurfaceNormal = RestNormal;
+		}
+		else
+		{
+			// Nothing under it. A Core "at rest" in mid-air is a contradiction and the state that
+			// produced every stuck-Core report; put it back in flight and let gravity resolve it.
+			bLooseAtRest = false;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ModeB] loose Core was at rest at %s with nothing under it - resuming flight (spec v7 §4)."),
+				*FVector(LooseLocation).ToCompactString());
 		}
 	}
 
@@ -3142,16 +3313,29 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 		return;   // The field has been reset under us. Touch nothing.
 	}
 
-	// --- 2b. SPEC v6 §4.2: it hit the ground, so it is the other team's. --------------------------
+	// --- 2b. SPEC v6 §4.2 / v7 §4: it came down on a surface, so it is the other team's. -----------
 	//
 	// AHEAD OF THE PICKUP POLL, and that ordering IS the rule. The v4 model was "a Core on the ground
 	// stays live for first contact", and leaving the poll first would keep exactly that behaviour
 	// whenever anybody happened to be standing near where it landed - i.e. it would fire the new rule
 	// only when it did not matter. A throw that comes down is a turnover, full stop.
-	if (bHitTheGround && bLooseFromThrow && CVarModeBGroundTurnover.GetValueOnAnyThread() != 0)
+	//
+	// ONE call site for both ways of establishing the landing (contact this frame, or at rest on
+	// something horizontal), because they are the same rule about the same geometry - the spec's
+	// instruction was to generalise the ground path, not to grow a second one beside it.
+	if (bLandedOnSurface && bLooseFromThrow && CVarModeBGroundTurnover.GetValueOnAnyThread() != 0)
 	{
-		if (ServerGroundTurnover())
+		if (ServerSurfaceTurnover(SurfacePoint, SurfaceNormal))
 		{
+			if (bLandedByRestProbe)
+			{
+				// Counted only on a turnover that actually fired, and only when the AT-REST PROBE is
+				// what established it: this is the number that says the v7 probe caught a landing the
+				// v6 contact test had missed, i.e. how often the reported bug would have happened.
+				// Counting it where the probe runs instead would tick up every frame a Core sat
+				// somewhere no turnover was due, and the number would mean nothing.
+				++SurfaceStats.RestProbeRescues;
+			}
 			return;   // Possession changed (or the Core was reset). Touch nothing.
 		}
 	}
@@ -3327,14 +3511,69 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 	}
 }
 
-bool ATraceCore::ServerGroundTurnover()
+bool ATraceCore::ServerProbeRestingSurface(FVector& OutPoint, FVector& OutNormal) const
 {
-	// SPEC v6 §4.2. "When a team has possession of the core, throws it, and it hits the ground, it
-	// should automatically turnover to the closest player on the enemy team."
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return false;
+	}
+
+	const FVector From = LooseLocation;
+	const FVector To = From - FVector(0.0, 0.0, static_cast<double>(TraceModeBRestProbeDepth));
+
+	// The SAME sphere and the SAME channel the flight sweeps use. A probe with a different shape
+	// would be a second opinion about what the Core is touching, and the two would disagree exactly
+	// where it matters - on the lip of a block, which is the geometry the user's report is about.
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreRestProbe), /*bTraceComplex=*/false, this);
+	Params.AddIgnoredActor(this);
+
+	FHitResult Hit;
+	const bool bHit = World->SweepSingleByChannel(
+		Hit, From, To, FQuat::Identity, ECC_WorldStatic,
+		FCollisionShape::MakeSphere(TraceModeBTuning::CollisionRadius), Params);
+
+	if (!bHit)
+	{
+		return false;
+	}
+
+	// A start-penetrating probe reports no ImpactNormal worth having; Normal is the depenetration
+	// direction, which for a Core settled into a surface points back out of it and is the honest
+	// answer to "what is holding this up".
+	OutNormal = Hit.bStartPenetrating ? Hit.Normal : Hit.ImpactNormal;
+	OutPoint = Hit.bStartPenetrating ? Hit.Location : Hit.ImpactPoint;
+	return true;
+}
+
+bool ATraceCore::ServerSurfaceTurnover(const FVector& SurfacePoint, const FVector& SurfaceNormal)
+{
+	// SPEC v6 §4.2, GENERALISED BY v7 §4. "When a team has possession of the core, throws it, and it
+	// hits the ground, it should automatically turnover to the closest player on the enemy team" —
+	// where "the ground" is now any upward-facing surface, the top of a structure included.
 	if (!HasAuthority() || !bLoose || bCoreStateLocked)
 	{
 		return false;
 	}
+
+	// FLOOR OR TOP, for the log line and the tallies only — the RULE does not distinguish them, and
+	// must not: the spec's whole point is that landing on a crate is the same event as landing on the
+	// floor. Measured against the arena's own floor plane rather than against an actor type, for the
+	// same reason the rule itself is: the arena is generic static meshes.
+	double FloorZ = 0.0;
+	bool bHaveFloor = false;
+	if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(GetWorld()))
+	{
+		const FBox FieldBox = Arena->GetFieldBounds();
+		if (FieldBox.IsValid != 0)
+		{
+			FloorZ = FieldBox.Min.Z;
+			bHaveFloor = true;
+		}
+	}
+
+	const bool bElevated = bHaveFloor && (SurfacePoint.Z > FloorZ + TraceModeBElevatedSurfaceZ);
+	const TCHAR* const SurfaceKind = bElevated ? TEXT("the TOP OF AN OBJECT") : TEXT("the ground");
 
 	const ETraceTeam ThrowingTeam = LooseFromTeam;
 	const ETraceTeam ReceivingTeam = (ThrowingTeam != ETraceTeam::None)
@@ -3375,19 +3614,29 @@ bool ATraceCore::ServerGroundTurnover()
 		// side that threw it away would make a wild throw free - so it becomes a kickoff for the side
 		// that is owed it, which is what ResetLooseCore already computes from LooseFromTeam.
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[ModeB] GROUND TURNOVER: the throw by %s landed at %s but %s has nobody alive - kicking off instead."),
-			*TraceTeamName(ThrowingTeam).ToString(), *Landed.ToCompactString(),
+			TEXT("[ModeB] SURFACE TURNOVER: the throw by %s came to rest on %s at %s but %s has nobody ")
+			TEXT("alive - kicking off instead."),
+			*TraceTeamName(ThrowingTeam).ToString(), SurfaceKind, *Landed.ToCompactString(),
 			*TraceTeamName(ReceivingTeam).ToString());
 
-		ResetLooseCore(TEXT("thrown into the ground with no living enemy to award it to"));
+		(bElevated ? SurfaceStats.TopTurnovers : SurfaceStats.GroundTurnovers)++;
+		ResetLooseCore(TEXT("thrown onto a surface with no living enemy to award it to"));
 		return true;
 	}
 
+	// ONE LINE FOR BOTH SURFACES, naming which one it was. A turnover off the top of a block and a
+	// turnover off the floor are the same rule firing, and a log that called them different things
+	// would invite the next reader to go looking for two rules.
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[ModeB] GROUND TURNOVER (spec v6 §4.2): the %s throw hit the ground at %s - to %s (%s), ")
-		TEXT("the nearest enemy, %.0f uu away."),
-		*TraceTeamName(ThrowingTeam).ToString(), *Landed.ToCompactString(),
+		TEXT("[ModeB] SURFACE TURNOVER (spec v7 §4): the %s throw settled on %s at %s (normal %s, %.0f deg ")
+		TEXT("from up, threshold %.0f) - to %s (%s), the nearest enemy, %.0f uu away."),
+		*TraceTeamName(ThrowingTeam).ToString(), SurfaceKind, *Landed.ToCompactString(),
+		*SurfaceNormal.ToCompactString(),
+		FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(SurfaceNormal.Z, -1.0, 1.0))),
+		TraceModeBTuning::SurfaceMaxSlopeDegrees(),
 		*GetNameSafe(Nearest), *TraceTeamName(ReceivingTeam).ToString(), FMath::Sqrt(NearestDistSq));
+
+	(bElevated ? SurfaceStats.TopTurnovers : SurfaceStats.GroundTurnovers)++;
 
 	// THROUGH TakeLooseCore, not through a private grant. It is the one guarded loose -> held
 	// transition, and it is what sets GraceOverrideTeam so that GrantTo's own AreAllies() line decides
@@ -3587,6 +3836,21 @@ static TAutoConsoleVariable<int32> CVarModeBVerifyRequested(
 	TEXT("timer, a bot carrying it in, a bot throwing it in, and spec v6's ground turnover)."),
 	ECVF_Default);
 
+/**
+ * SPEC v7 §4. The surface steps on their own.
+ *
+ * A separate arming switch rather than a seventh and eighth step everybody has to sit through,
+ * because steps 4 and 5 of the full scenario wait on BOTS to score and legitimately take tens of
+ * seconds each. A rule about hit normals should be measurable in a few seconds, and a check that is
+ * slow to run is a check that stops being run.
+ */
+static TAutoConsoleVariable<int32> CVarModeBVerifySurfacesRequested(
+	TEXT("Trace.ModeB.VerifySurfaces"),
+	0,
+	TEXT("1: run spec v7 §4's surface steps only - drop the Core on the TOP of a piece of cover and ")
+	TEXT("assert a TURNOVER, then fire it at a WALL and assert a BOUNCE with no turnover."),
+	ECVF_Default);
+
 bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelocity, ETraceTeam FromTeam,
 	bool bAsThrow)
 {
@@ -3633,7 +3897,10 @@ void ATraceCore::TickModeBVerification()
 	// --- Arm --------------------------------------------------------------------------------------
 	if (VerifyStep < 0)
 	{
-		if (CVarModeBVerifyRequested.GetValueOnAnyThread() == 0)
+		const bool bFullRequested = (CVarModeBVerifyRequested.GetValueOnAnyThread() != 0);
+		const bool bSurfacesRequested = (CVarModeBVerifySurfacesRequested.GetValueOnAnyThread() != 0);
+
+		if (!bFullRequested && !bSurfacesRequested)
 		{
 			return;
 		}
@@ -3641,6 +3908,7 @@ void ATraceCore::TickModeBVerification()
 		{
 			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] refused: the match is playing mode A."));
 			CVarModeBVerifyRequested->Set(0, ECVF_SetByConsole);
+			CVarModeBVerifySurfacesRequested->Set(0, ECVF_SetByConsole);
 			return;
 		}
 		// Wait for a settled, running half. Arming during the pre-match window put the very first
@@ -3655,11 +3923,15 @@ void ATraceCore::TickModeBVerification()
 			return;
 		}
 
-		VerifyStep = 0;
+		// SURFACES-ONLY starts at step 7. The full scenario still runs 0..8, so the v7 steps are also
+		// exercised by whatever already runs Trace.ModeB.Verify — one set of steps, two ways in.
+		bVerifySurfacesOnly = (!bFullRequested && bSurfacesRequested);
+		VerifyStep = bVerifySurfacesOnly ? 7 : 0;
 		VerifyPassCount = 0;
 		VerifyFailCount = 0;
 		VerifyStepDeadline = 0.f;
-		UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] ===== mode B verification starting ====="));
+		UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] ===== mode B verification starting (%s) ====="),
+			bVerifySurfacesOnly ? TEXT("spec v7 §4 surface rules only") : TEXT("all rules"));
 	}
 
 	// --- A step that is waiting on an outcome -----------------------------------------------------
@@ -3667,48 +3939,97 @@ void ATraceCore::TickModeBVerification()
 	{
 		const bool bTimedOut = (Now >= VerifyStepDeadline);
 
-		// Steps 0, 1 and 6 are waiting for a taker; steps 2 and 3 are waiting for the Core to stop
-		// being loose (a goal or a reset both end with a kickoff).
-		if (VerifyStep <= 1 || VerifyStep == 6)
+		// STEP 8 ARMS ITSELF LATE, and that is the whole design of it. It parks a Core on top of an
+		// object as something that was NOT thrown, so no rule may touch it, and waits for it to come to
+		// rest. Only then does it declare the Core "thrown" - at which point the flight integration is
+		// already switched off for good and NO further sweep will ever run. The turnover that follows
+		// can therefore only have come from the at-rest probe, which is the exact code path the user's
+		// "stuck up top of an object" report is about. Anything else would be testing the contact test
+		// step 7 already covers.
+		if (VerifyStep == 8 && !bVerifyRestArmed && !bTimedOut)
+		{
+			if (!bLoose || !bLooseAtRest)
+			{
+				return;   // Still falling. Nothing to arm yet.
+			}
+
+			bVerifyRestArmed = true;
+			bVerifyAwaitingTake = true;
+			bVerifyTakeSeen = false;
+			bLooseFromThrow = true;
+			VerifyTurnoversAtStart = SurfaceStats.TopTurnovers;
+			VerifyRescuesAtStart = SurfaceStats.RestProbeRescues;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ModeBVerify] step 8: the Core is now AT REST at %s with the flight integration off - ")
+				TEXT("arming the throw flag. Only the at-rest probe can turn it over from here."),
+				*FVector(LooseLocation).ToCompactString());
+			return;
+		}
+
+		// Steps 0, 1, 6, 7 and 8 are waiting for a taker; steps 2 and 3 are waiting for the Core to
+		// stop being loose (a goal or a reset both end with a kickoff); step 9 is waiting for a bounce.
+		if (VerifyStep <= 1 || (VerifyStep >= 6 && VerifyStep <= 8))
 		{
 			if (bVerifyTakeSeen)
 			{
 				bVerifyTakeSeen = false;
 
-				// --- Step 6: spec v6 §4.2, the ground turnover. --------------------------------------
+				// --- Steps 6, 7 and 8: the turnover rule. --------------------------------------------
 				//
-				// Judged apart because it makes a STRONGER claim than steps 0 and 1 do. Those two are
-				// happy with whoever won the race to the Core; this one asserts the specific outcome the
+				// Judged apart because they make a STRONGER claim than steps 0 and 1 do. Those two are
+				// happy with whoever won the race to the Core; these assert the specific outcome the
 				// rule promises - the enemy of the throwing team has it, and (because that crosses
 				// sides) with the turnover grace applied. Anything else is a failure even if the grace
 				// bookkeeping was internally consistent.
-				if (VerifyStep == 6)
+				//
+				// Step 6 lands on the FLOOR (spec v6 §4.2), step 7 on the TOP OF AN OBJECT by contact,
+				// step 8 on the top of an object with the contact test unable to run at all (spec v7
+				// §4). One assertion for all three, because that is exactly the claim being made: they
+				// are the same event and they have to end the same way.
+				if (VerifyStep >= 6 && VerifyStep <= 8)
 				{
 					const bool bWentToTheEnemy = (VerifyFromTeam != ETraceTeam::None)
 						&& (VerifyTookTeam == TraceOpposingTeam(VerifyFromTeam));
 					const bool bGraceOk = bVerifyTookGrace
 						&& bLastGrantTeamChanged && LastGrantGraceSeconds > 0.f;
-					const bool bStepOk = bWentToTheEnemy && bGraceOk;
+
+					// STEPS 7 AND 8 ASSERT THE SURFACE TOO, and they have to: a turnover that fired
+					// because the Core rolled off the crate and landed on the FLOOR would satisfy every
+					// other clause here while testing precisely the rule that already worked. Step 8
+					// additionally asserts that the AT-REST PROBE is what caught it. Both read the tally
+					// the rule itself keeps, rather than re-deriving the geometry.
+					const bool bSurfaceOk = (VerifyStep == 6)
+						|| (SurfaceStats.TopTurnovers > VerifyTurnoversAtStart);
+					const bool bProbeOk = (VerifyStep != 8)
+						|| (SurfaceStats.RestProbeRescues > VerifyRescuesAtStart);
+					const bool bStepOk = bWentToTheEnemy && bGraceOk && bSurfaceOk && bProbeOk;
 
 					(bStepOk ? VerifyPassCount : VerifyFailCount)++;
 
 					// Two calls rather than a ternary verbosity: UE_LOG pastes its second argument
 					// into ELogVerbosity::<token>, so the level has to be a literal.
 					const FString StepDetail = FString::Printf(
-						TEXT("a %s throw hit the ground and went to %s (%s) | expected the nearest %s player, ")
-						TEXT("with grace | grace %s"),
+						TEXT("a %s throw settled on %s and turned over to %s (%s) | expected the nearest %s ")
+						TEXT("player, with grace | grace %s | top-of-object turnovers %d -> %d | at-rest ")
+						TEXT("probe catches %d -> %d%s%s"),
 						*TraceTeamName(VerifyFromTeam).ToString(),
+						(VerifyStep == 6) ? TEXT("the ground") : TEXT("THE TOP OF AN OBJECT"),
 						*VerifyTakerName, *TraceTeamName(VerifyTookTeam).ToString(),
 						*TraceTeamName(TraceOpposingTeam(VerifyFromTeam)).ToString(),
-						bGraceOk ? *FString::Printf(TEXT("APPLIED %.2fs"), LastGrantGraceSeconds) : TEXT("MISSING"));
+						bGraceOk ? *FString::Printf(TEXT("APPLIED %.2fs"), LastGrantGraceSeconds) : TEXT("MISSING"),
+						VerifyTurnoversAtStart, SurfaceStats.TopTurnovers,
+						VerifyRescuesAtStart, SurfaceStats.RestProbeRescues,
+						bSurfaceOk ? TEXT("") : TEXT(" *** it did not land on a raised surface ***"),
+						bProbeOk ? TEXT("") : TEXT(" *** the at-rest probe is not what caught it ***"));
 
 					if (bStepOk)
 					{
-						UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] step 6 PASS: %s"), *StepDetail);
+						UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] step %d PASS: %s"), VerifyStep, *StepDetail);
 					}
 					else
 					{
-						UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 6 FAIL: %s"), *StepDetail);
+						UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step %d FAIL: %s"), VerifyStep, *StepDetail);
 					}
 
 					VerifyStepDeadline = 0.f;
@@ -3738,6 +4059,63 @@ void ATraceCore::TickModeBVerification()
 				++VerifyStep;
 				return;
 			}
+		}
+		else if (VerifyStep == 9)
+		{
+			// --- Step 9: SPEC v7 §4, "walls should not [turn over], the core should bounce off those".
+			//
+			// TWO facts, and both are needed. That a bounce HAPPENED is the positive half - counted by
+			// the rule itself at the moment it classified the normal as a wall. That NO TURNOVER
+			// happened is the negative half, and it is the one the user actually asked for: a wall that
+			// handed the Core to the nearest enemy would be the bug, not the bounce.
+			//
+			// Judged the instant the bounce is seen rather than at the end of a fixed window, because
+			// the Core CORRECTLY falls to the floor afterwards and turns over there - waiting would
+			// measure the floor rule and report the wall rule broken.
+			const int32 BouncesNow = SurfaceStats.WallBounces;
+			const int32 TurnoversNow = SurfaceStats.GroundTurnovers + SurfaceStats.TopTurnovers;
+
+			if (BouncesNow > VerifyWallBouncesAtStart)
+			{
+				const bool bNoTurnover = (TurnoversNow == VerifyTurnoversAtStart);
+				const bool bStillLoose = bLoose;
+				const bool bStepOk = bNoTurnover && bStillLoose;
+
+				(bStepOk ? VerifyPassCount : VerifyFailCount)++;
+
+				const FString StepDetail = FString::Printf(
+					TEXT("the Core struck a WALL and bounced (wall bounces %d -> %d) | turnovers %d -> %d ")
+					TEXT("(must not move) | still loose=%d | velocity %s"),
+					VerifyWallBouncesAtStart, BouncesNow, VerifyTurnoversAtStart, TurnoversNow,
+					bStillLoose ? 1 : 0, *FVector(LooseVelocity).ToCompactString());
+
+				if (bStepOk)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] step 9 PASS: %s"), *StepDetail);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 9 FAIL: %s"), *StepDetail);
+				}
+
+				VerifyStepDeadline = 0.f;
+				++VerifyStep;
+				return;
+			}
+
+			if (bTimedOut)
+			{
+				++VerifyFailCount;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[ModeBVerify] step 9 FAIL: the Core never struck the wall (loose=%d, at rest=%d, ")
+					TEXT("at %s, turnovers %d -> %d)."),
+					bLoose ? 1 : 0, bLooseAtRest ? 1 : 0, *FVector(LooseLocation).ToCompactString(),
+					VerifyTurnoversAtStart, TurnoversNow);
+
+				VerifyStepDeadline = 0.f;
+				++VerifyStep;
+			}
+			return;
 		}
 		else if (VerifyStep == 4 || VerifyStep == 5)
 		{
@@ -4229,15 +4607,354 @@ void ATraceCore::TickModeBVerification()
 		return;
 	}
 
+	case 7:
+	{
+		// =========================================================================================
+		// SPEC v7 §4, HALF ONE: THE TOP OF AN OBJECT IS A TURNOVER.
+		//
+		// "Sometimes the core gets stuck up top of an object in gamemode b. This should also count as
+		// a turnover."
+		//
+		// Step 6 proves the FLOOR case. This proves the case the user actually reported, and it has to
+		// be driven rather than waited for: a bot throw that happens to come down on the roof of a
+		// crate, with an enemy near enough to receive it, is not something a test run can be promised.
+		// The Core is dropped from just above a real, world-sampled raised surface, and the step then
+		// asserts the same three things step 6 does PLUS that the tally recorded a TOP turnover.
+		// =========================================================================================
+		if (!IsValid(Carrier) || !Carrier->IsAlive() || bLoose)
+		{
+			return;   // Between possessions. Not on a clock yet.
+		}
+
+		FVector TopPoint = FVector::ZeroVector;
+		FVector WallPoint = FVector::ZeroVector;
+		FVector WallNormal = FVector::ZeroVector;
+		if (!FindVerificationSurfaces(TopPoint, WallPoint, WallNormal))
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBVerify] steps 7-9 SKIPPED: no raised cover found in the arena to land on."));
+			VerifyStep = 10;
+			return;
+		}
+
+		const ETraceTeam FromTeam = Carrier->GetTeam();
+		const ETraceTeam ToTeam = TraceOpposingTeam(FromTeam);
+
+		ATraceCharacter* Nearest = nullptr;
+		for (ATraceCharacter* Candidate : Everyone)
+		{
+			if (IsValid(Candidate) && Candidate->IsAlive() && Candidate->GetTeam() == ToTeam)
+			{
+				Nearest = Candidate;
+				break;
+			}
+		}
+
+		if (Nearest == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBVerify] step 7 SKIPPED: no living %s player to award the turnover to."),
+				*TraceTeamName(ToTeam).ToString());
+			++VerifyStep;
+			return;
+		}
+
+		// 900 uu away, for the reason step 6 documents at length: the catch zone reaches 500 uu from a
+		// capsule's surface, so an enemy any closer would magnet the Core out of the air and this step
+		// would quietly become a third test of §4.1.
+		Nearest->SetActorLocation(
+			FVector(TopPoint.X + 900.0, TopPoint.Y, Nearest->GetActorLocation().Z),
+			false, nullptr, ETeleportType::TeleportPhysics);
+
+		const FVector Start = TopPoint + FVector(0.0, 0.0, 160.0);
+
+		VerifyThrower = Carrier;
+		VerifyExpectTeam = ToTeam;
+		VerifyExpectGrace = true;
+		bVerifyAwaitingTake = true;
+		bVerifyTakeSeen = false;
+		VerifyTurnoversAtStart = SurfaceStats.TopTurnovers;
+
+		if (!DebugLaunchLoose(Start, FVector(0.0, 0.0, -1400.0), FromTeam, /*bAsThrow=*/true))
+		{
+			++VerifyFailCount;
+			bVerifyAwaitingTake = false;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 7 FAIL: could not launch."));
+			++VerifyStep;
+			return;
+		}
+
+		const ATraceArenaBuilder* VerifyArena = ATraceArenaBuilder::Get(World);
+		const double VerifyFloorZ = (VerifyArena != nullptr) ? VerifyArena->GetFieldBounds().Min.Z : 0.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] step 7: a %s throw dropped onto the TOP of an object at %s (%.0f uu above ")
+			TEXT("the floor) with %s (%s) standing 900 uu away - expecting a SURFACE TURNOVER to them, with grace."),
+			*TraceTeamName(FromTeam).ToString(), *TopPoint.ToCompactString(),
+			TopPoint.Z - VerifyFloorZ,
+			*GetNameSafe(Nearest), *TraceTeamName(ToTeam).ToString());
+
+		VerifyStepDeadline = Now + 5.f;
+		return;
+	}
+
+	case 8:
+	{
+		// =========================================================================================
+		// SPEC v7 §4: THE STUCK CORE ITSELF — a turnover with the flight integration switched OFF.
+		//
+		// THIS IS THE STEP THAT TESTS THE REPORTED BUG. Step 7 drops a Core onto a crate and the
+		// CONTACT test catches it, which is the path that already existed; a Core that reaches rest
+		// without a qualifying contact - an edge hit, a hitch, a state lock held on the landing frame -
+		// switches the integration off and is never asked again, and that is the Core the user watched
+		// sit on top of an object until the reset timer.
+		//
+		// Reproduced exactly: park a Core on the crate as something NOBODY threw (so no rule may touch
+		// it), let it settle, and only then declare it thrown. From that instant the contact test is
+		// unreachable by construction - there is no sweep - so a turnover can only come from the
+		// at-rest probe. If the probe is broken this step hangs and fails, and nothing else does.
+		// =========================================================================================
+		if (!IsValid(Carrier) || !Carrier->IsAlive() || bLoose)
+		{
+			return;
+		}
+
+		FVector RestTopPoint = FVector::ZeroVector;
+		FVector UnusedWallPoint = FVector::ZeroVector;
+		FVector UnusedWallNormal = FVector::ZeroVector;
+		if (!FindVerificationSurfaces(RestTopPoint, UnusedWallPoint, UnusedWallNormal))
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 8 SKIPPED: no raised cover to park a Core on."));
+			++VerifyStep;
+			return;
+		}
+
+		const ETraceTeam RestFromTeam = IsValid(Carrier) ? Carrier->GetTeam() : ETraceTeam::Blue;
+		const ETraceTeam RestToTeam = TraceOpposingTeam(RestFromTeam);
+
+		ATraceCharacter* RestNearest = nullptr;
+		for (ATraceCharacter* Candidate : Everyone)
+		{
+			if (IsValid(Candidate) && Candidate->IsAlive() && Candidate->GetTeam() == RestToTeam)
+			{
+				RestNearest = Candidate;
+				break;
+			}
+		}
+
+		if (RestNearest == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBVerify] step 8 SKIPPED: no living %s player to award the turnover to."),
+				*TraceTeamName(RestToTeam).ToString());
+			++VerifyStep;
+			return;
+		}
+
+		RestNearest->SetActorLocation(
+			FVector(RestTopPoint.X + 900.0, RestTopPoint.Y, RestNearest->GetActorLocation().Z),
+			false, nullptr, ETeleportType::TeleportPhysics);
+
+		// bAsThrow = FALSE. That is the whole trick: while it is falling and settling, NO rule is
+		// allowed to fire, so the Core reaches rest exactly as an abandoned one does.
+		if (!DebugLaunchLoose(RestTopPoint + FVector(0.0, 0.0, 60.0), FVector(0.0, 0.0, -200.0),
+			RestFromTeam, /*bAsThrow=*/false))
+		{
+			++VerifyFailCount;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 8 FAIL: could not park the Core."));
+			++VerifyStep;
+			return;
+		}
+
+		VerifyThrower = Carrier;
+		VerifyExpectTeam = RestToTeam;
+		VerifyExpectGrace = true;
+		bVerifyRestArmed = false;
+		bVerifyAwaitingTake = false;
+		bVerifyTakeSeen = false;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] step 8: parking an unthrown %s Core on the TOP of an object at %s with %s (%s) ")
+			TEXT("900 uu away - it must settle first, and the AT-REST PROBE alone must then turn it over."),
+			*TraceTeamName(RestFromTeam).ToString(), *RestTopPoint.ToCompactString(),
+			*GetNameSafe(RestNearest), *TraceTeamName(RestToTeam).ToString());
+
+		VerifyStepDeadline = Now + 6.f;
+		return;
+	}
+
+	case 9:
+	{
+		// =========================================================================================
+		// SPEC v7 §4, THE OTHER HALF: A WALL IS A BOUNCE, NOT A TURNOVER.
+		//
+		// "Walls should not, the core should bounce off those."
+		//
+		// Fired horizontally at the SIDE of the same piece of cover step 7 landed on, hard enough and
+		// from close enough that gravity cannot drop it onto anything horizontal on the way. What is
+		// asserted is the pair: a bounce was registered, and the turnover tally did not move.
+		// =========================================================================================
+		FVector TopPoint = FVector::ZeroVector;
+		FVector WallPoint = FVector::ZeroVector;
+		FVector WallNormal = FVector::ZeroVector;
+		if (!FindVerificationSurfaces(TopPoint, WallPoint, WallNormal))
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 9 SKIPPED: no wall found to bounce off."));
+			++VerifyStep;
+			return;
+		}
+
+		const ETraceTeam FromTeam = IsValid(Carrier) ? Carrier->GetTeam() : ETraceTeam::Blue;
+
+		// 420 uu out along the wall's own normal, moving straight back down it at 2400 uu/s: the flight
+		// lasts under 0.2 s, in which the Core falls ~20 uu under the mode-B gravity model, so it
+		// cannot clip the floor or the top of the block before it reaches the face under test.
+		const FVector Start = WallPoint + WallNormal * 420.0;
+		const FVector LaunchVelocity = -WallNormal * 2400.0;
+
+		VerifyWallBouncesAtStart = SurfaceStats.WallBounces;
+		VerifyTurnoversAtStart = SurfaceStats.GroundTurnovers + SurfaceStats.TopTurnovers;
+		bVerifyAwaitingTake = false;
+		bVerifyTakeSeen = false;
+
+		if (!DebugLaunchLoose(Start, LaunchVelocity, FromTeam, /*bAsThrow=*/true))
+		{
+			++VerifyFailCount;
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step 8 FAIL: could not launch."));
+			++VerifyStep;
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] step 9: a %s throw fired at a WALL at %s (normal %s, %.0f deg from up) from ")
+			TEXT("%s - expecting a BOUNCE and NO turnover."),
+			*TraceTeamName(FromTeam).ToString(), *WallPoint.ToCompactString(), *WallNormal.ToCompactString(),
+			FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(WallNormal.Z, -1.0, 1.0))),
+			*Start.ToCompactString());
+
+		VerifyStepDeadline = Now + 4.f;
+		return;
+	}
+
 	default:
 	{
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[ModeBVerify] ===== finished: %d PASS, %d FAIL ====="), VerifyPassCount, VerifyFailCount);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBVerify] spec v7 §4 tally: turnovers off the ground %d, off the TOP of an object %d ")
+			TEXT("| wall bounces %d (rest refused on a wall %d) | landings the at-rest probe caught %d"),
+			SurfaceStats.GroundTurnovers, SurfaceStats.TopTurnovers, SurfaceStats.WallBounces,
+			SurfaceStats.WallRestRefusals, SurfaceStats.RestProbeRescues);
+
 		CVarModeBVerifyRequested->Set(0, ECVF_SetByConsole);
+		CVarModeBVerifySurfacesRequested->Set(0, ECVF_SetByConsole);
+		bVerifySurfacesOnly = false;
 		VerifyStep = -1;
 		return;
 	}
 	}
+}
+
+bool ATraceCore::FindVerificationSurfaces(FVector& OutTopPoint, FVector& OutWallPoint, FVector& OutWallNormal) const
+{
+	const UWorld* World = GetWorld();
+	const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
+	if (World == nullptr || Arena == nullptr)
+	{
+		return false;
+	}
+
+	const FBox FieldBox = Arena->GetFieldBounds();
+	if (FieldBox.IsValid == 0)
+	{
+		return false;
+	}
+
+	const double FloorZ = FieldBox.Min.Z;
+	const FVector Centre = FieldBox.GetCenter();
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreSurfaceProbe), /*bTraceComplex=*/false, this);
+	Params.AddIgnoredActor(this);
+
+	const float UpNormalZ = TraceModeBTuning::SurfaceUpNormalZ();
+	const float Radius = TraceModeBTuning::CollisionRadius;
+
+	// SAMPLED, NOT CONSTRUCTED. The rule under test reads world geometry, so the test has to find its
+	// crate the same way - a probe grid over the MIDDLE of the pitch, deliberately away from both goal
+	// mouths so a dropped Core cannot score and end the step for the wrong reason.
+	const double SpanX = FieldBox.GetSize().X * 0.25;
+	const double SpanY = FieldBox.GetSize().Y * 0.40;
+
+	for (int32 IndexX = -6; IndexX <= 6; ++IndexX)
+	{
+		for (int32 IndexY = -6; IndexY <= 6; ++IndexY)
+		{
+			const FVector Column(
+				Centre.X + (SpanX * IndexX) / 6.0,
+				Centre.Y + (SpanY * IndexY) / 6.0,
+				0.0);
+
+			FHitResult TopHit;
+			const bool bHitTop = World->SweepSingleByChannel(
+				TopHit,
+				FVector(Column.X, Column.Y, FieldBox.Max.Z),
+				FVector(Column.X, Column.Y, FloorZ - 50.0),
+				FQuat::Identity, ECC_WorldStatic, FCollisionShape::MakeSphere(Radius), Params);
+
+			// Raised, horizontal-ish, and not so tall that it is a wall cap or the roof: the point is a
+			// piece of cover a thrown Core could plausibly settle on.
+			if (!bHitTop
+				|| TopHit.ImpactNormal.Z < UpNormalZ
+				|| TopHit.ImpactPoint.Z < FloorZ + 150.0
+				|| TopHit.ImpactPoint.Z > FloorZ + 1200.0)
+			{
+				continue;
+			}
+
+			// Its SIDE. Probed from four directions at a height comfortably below the top face, so the
+			// hit is the flank of the same block and not its lip.
+			const FVector SideSample = FVector(TopHit.ImpactPoint.X, TopHit.ImpactPoint.Y,
+				FMath::Max(FloorZ + 60.0, TopHit.ImpactPoint.Z - 90.0));
+
+			static const FVector Directions[] =
+			{
+				FVector(1.0, 0.0, 0.0), FVector(-1.0, 0.0, 0.0),
+				FVector(0.0, 1.0, 0.0), FVector(0.0, -1.0, 0.0)
+			};
+
+			for (const FVector& Direction : Directions)
+			{
+				FHitResult SideHit;
+				const bool bHitSide = World->SweepSingleByChannel(
+					SideHit, SideSample + Direction * 900.0, SideSample,
+					FQuat::Identity, ECC_WorldStatic, FCollisionShape::MakeSphere(Radius), Params);
+
+				// A WALL by the rule's own definition, not by ours: whatever the shipping threshold
+				// currently says is not a floor. Asking the same accessor is what keeps the test honest
+				// if the threshold is ever retuned.
+				if (!bHitSide || SideHit.ImpactNormal.Z >= UpNormalZ || SideHit.bStartPenetrating)
+				{
+					continue;
+				}
+
+				// The launch point has to be in open air, or the step tests whatever is between them.
+				FHitResult ClearHit;
+				const FVector LaunchPoint = SideHit.ImpactPoint + SideHit.ImpactNormal * 420.0;
+				if (World->SweepSingleByChannel(ClearHit, LaunchPoint, LaunchPoint,
+					FQuat::Identity, ECC_WorldStatic, FCollisionShape::MakeSphere(Radius * 2.f), Params))
+				{
+					continue;
+				}
+
+				OutTopPoint = TopHit.ImpactPoint;
+				OutWallPoint = SideHit.ImpactPoint;
+				OutWallNormal = SideHit.ImpactNormal.GetSafeNormal();
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 bool ATraceCore::GetLooseCoreInterceptPoint(float LeadSeconds, FVector& OutPoint) const

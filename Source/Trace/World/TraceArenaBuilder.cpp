@@ -14,14 +14,17 @@
 #include "Components/CapsuleComponent.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"   // spec v7 §8 - the pooled arena geometry
 #include "Components/PointLightComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkyAtmosphereComponent.h"   // USkyAtmosphereComponent AND ASkyAtmosphere
 #include "Components/SkyLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/DirectionalLight.h"
+#include "Engine/Engine.h"                      // GEngine (Trace.Arena.Perf)
 #include "Engine/EngineTypes.h"
 #include "Engine/ExponentialHeightFog.h"
+#include "Engine/GameViewportClient.h"          // GetStatUnitData() (Trace.Arena.Perf)
 #include "Engine/PostProcessVolume.h"
 #include "Engine/Scene.h"                       // FPostProcessSettings
 #include "Engine/SkyLight.h"
@@ -32,6 +35,20 @@
 #include "Materials/MaterialInterface.h"
 #include "UObject/ConstructorHelpers.h"
 #include "UObject/UObjectGlobals.h"            // NewObject, MakeUniqueObjectName
+
+// --- The measurement harness for spec v7 §8. See the Trace.Arena.Perf block at the end of the file.
+#include "Containers/Ticker.h"                 // FTSTicker
+#include "HAL/IConsoleManager.h"               // FAutoConsoleVariableRef / FAutoConsoleCommand
+#include "Misc/CommandLine.h"                  // -TraceArenaLegacyGeometry
+#include "Misc/Parse.h"                        // FParse::Param
+// DELIBERATELY NOT RHIStats.h. The obvious way to report draw calls is GNumDrawCallsRHI, and it was
+// tried: it reads a flat ZERO every frame on this Metal build, because the counter is only published
+// by the end-of-pipe GPU profiler's ProcessFrame and that does not run here. A column of zeroes in a
+// perf table is worse than no column - it looks like a result. The draw-call claim in the report is
+// therefore made from the primitive census (which IS directly observable, and which is what decides
+// the draw count for a scene of unique-material blocks), not from a counter that does not work.
+#include "UnrealClient.h"                      // FStatUnitData
+#include "UObject/UObjectIterator.h"           // TObjectIterator (scene primitive census)
 
 #if WITH_EDITOR
 #include "UObject/UnrealType.h"                // FPropertyChangedEvent, EPropertyChangeType
@@ -871,6 +888,36 @@ namespace TraceArenaConstants
 	static constexpr float GoalRingWallHeadroom = 120.f;
 }
 
+// -------------------------------------------------------------------------------------------------
+// SPEC v7 §8 - THE A/B ARM.
+//
+// The whole reason this knob exists is the lesson from the last performance pass: a measurement with
+// no BEFORE arm in the same binary is not a measurement. Demo 6's "the ribbon fixed it" was produced
+// by comparing two capped runs, and it was wrong. So the pre-instancing geometry path is kept, and
+// Trace.Arena.Perf can be run against either arm of the SAME build:
+//
+//   Trace.Arena.Instancing 1  (default) - one pooled ISM per (mesh, material, shadow) key.
+//   Trace.Arena.Instancing 0            - the old path: one Movable UStaticMeshComponent per block.
+//
+// Read ONCE at the top of BuildArena into bBuildingInstancedGeometry, because the arena is built in a
+// single pass and a knob that changed halfway through would produce a half-instanced arena that
+// matches neither arm. To take the BEFORE measurement, launch with -TraceArenaLegacyGeometry: the
+// arena is built long before any console command can run, so the command line is the only lever that
+// is in place in time.
+// -------------------------------------------------------------------------------------------------
+namespace
+{
+	int32 GArenaInstancing = 1;
+	FAutoConsoleVariableRef CVarArenaInstancing(
+		TEXT("Trace.Arena.Instancing"),
+		GArenaInstancing,
+		TEXT("1 (default) = arena geometry is pooled into instanced static meshes by mesh+material+shadow. ")
+		TEXT("0 = the pre-spec-v7 path, one Movable UStaticMeshComponent per block, kept only as the BEFORE ")
+		TEXT("arm of Trace.Arena.Perf. Read once when the arena is built, so it must be set before then - ")
+		TEXT("use the -TraceArenaLegacyGeometry command line switch."),
+		ECVF_Default);
+}
+
 ATraceArenaBuilder::ATraceArenaBuilder()
 {
 	PrimaryActorTick.bCanEverTick = false;
@@ -900,10 +947,22 @@ ATraceArenaBuilder::ATraceArenaBuilder()
 
 	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 	SetRootComponent(Root);
-	// Explicitly Movable: a scene component may never be less mobile than its children, and every
-	// piece of geometry we attach below is created Movable (runtime-spawned actors have no baked
-	// lighting to gain from Static, and this project disables static lighting outright).
-	Root->SetMobility(EComponentMobility::Movable);
+
+	// STATIC, and this line is load-bearing for spec v7 §8.
+	//
+	// It used to be Movable, with a comment arguing that Static bought nothing because this project
+	// disables static lighting. Lighting was never the point. A component may not be LESS mobile than
+	// its attach parent, so a Movable root forces every one of the ~1450 pieces below it to be Movable
+	// too - and Movable is what puts a primitive in the dynamic half of the renderer and the dynamic
+	// half of the physics scene: excluded from cached shadow depths, re-evaluated for GPU-scene
+	// transform upload, and held as a kinematic body in the physics broadphase rather than in the
+	// static tree. The arena never moves. Not one piece of it.
+	//
+	// The reverse is legal and is used deliberately: the floor-lamp lattice below is Movable, and a
+	// child MAY be more mobile than its parent. Nothing moves this actor - ATraceGameMode spawns it at
+	// the origin and it stays there - and the editor is free to drag a level-placed one, because the
+	// Static restriction is on moving a component in a GAME world, not on an editor transform.
+	Root->SetMobility(EComponentMobility::Static);
 
 	// Constructor-time FObjectFinders are what make these engine assets cook into a packaged build.
 	// A bare runtime LoadObject would resolve to null once cooked (build contract section 2).
@@ -947,14 +1006,14 @@ ATraceArenaBuilder::ATraceArenaBuilder()
 // Contract surface
 // -------------------------------------------------------------------------------------------------
 
-ATraceArenaBuilder* ATraceArenaBuilder::Get(UWorld* World)
+ATraceArenaBuilder* ATraceArenaBuilder::Get(const UWorld* World)
 {
 	if (World == nullptr)
 	{
 		return nullptr;
 	}
 
-	for (TActorIterator<ATraceArenaBuilder> It(World); It; ++It)
+	for (TActorIterator<ATraceArenaBuilder> It(const_cast<UWorld*>(World)); It; ++It)
 	{
 		ATraceArenaBuilder* Builder = *It;
 		if (IsValid(Builder))
@@ -1233,6 +1292,13 @@ void ATraceArenaBuilder::BuildArena()
 
 	bArenaBuilt = true;
 
+	// WHICH GEOMETRY PATH (spec v7 §8), read exactly once so the arena cannot come out half
+	// instanced. The command-line switch wins because the arena is built from
+	// ATraceGameMode::PreInitializeComponents, which is earlier than any console command can run -
+	// there is no other way to get the BEFORE arm.
+	bBuildingInstancedGeometry = (GArenaInstancing != 0)
+		&& !FParse::Param(FCommandLine::Get(), TEXT("TraceArenaLegacyGeometry"));
+
 	// WHICH SCORING SHAPE TO PRESENT, decided once here and re-applied whenever the authority says it
 	// changed (ApplyScoringModeInWorld). ATraceGameState is the authority and it is asked first; on a
 	// machine that has no game state yet - the editor preview, or a build that runs before the game
@@ -1304,6 +1370,12 @@ void ATraceArenaBuilder::BuildArena()
 
 	BuildPostProcess();
 
+	// EVERY POOL GOES LIVE HERE, and the position of this line in the function is a correctness
+	// constraint rather than a tidiness one. It has to be AFTER the last CollectPiecesSince (which is
+	// what decides a pool's mobility) and BEFORE ApplyScoringMode (which rewrites instance transforms
+	// through components that must already be registered at the right mobility).
+	FlushInstancePools();
+
 	// Present one of the two scoring shapes and disarm the other. Forced rather than early-returned
 	// on "the mode did not change", because at this point NOTHING has been presented yet: the goal
 	// furniture is built visible and the endzone triggers are built armed, so mode A needs this call
@@ -1313,9 +1385,24 @@ void ATraceArenaBuilder::BuildArena()
 	// Spelled out at Log because the proportion, the flat playfield width and which game is being
 	// played are the things a playtester asks about first, and none of them is readable from a
 	// screenshot.
+	// The primitive census, spelled out, because "how many things does this hand the renderer" is the
+	// question spec v7 §8 is about and GetComponents().Num() alone answers it wrongly now: one pooled
+	// ISM is one component and several hundred blocks.
+	int32 Primitives = 0;
+	int32 Movables = 0;
+	for (const UActorComponent* Built : GetComponents())
+	{
+		if (const UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(Built))
+		{
+			++Primitives;
+			Movables += (Primitive->Mobility == EComponentMobility::Movable) ? 1 : 0;
+		}
+	}
+
 	UE_LOG(LogTraceGame, Log,
 		TEXT("Arena built (%.0f x %.0f x %.0f uu, %.2f:1, flat playfield %.0f wide, banks %s at %.0f uu, ")
-		TEXT("mode %s, visuals=%s, authority=%s): %d components."),
+		TEXT("mode %s, visuals=%s, authority=%s, geometry=%s): %d components, %d of them primitives ")
+		TEXT("(%d Movable), carrying %d instanced blocks in %d pools."),
 		FieldLength, FieldWidth, WallHeight,
 		(FieldWidth > 0.f) ? (FieldLength / FieldWidth) : 0.f,
 		BankInnerHalfWidth() * 2.f,
@@ -1323,7 +1410,9 @@ void ATraceArenaBuilder::BuildArena()
 		*TraceScoringModeLabel(ScoringMode),
 		bBuildVisuals ? TEXT("yes") : TEXT("no"),
 		HasAuthority() ? TEXT("yes") : TEXT("no"),
-		GetComponents().Num());
+		bBuildingInstancedGeometry ? TEXT("instanced") : TEXT("legacy one-component-per-block"),
+		GetComponents().Num(), Primitives, Movables,
+		BuiltInstances.Num(), InstancePools.Num());
 }
 
 void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
@@ -1383,7 +1472,7 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		// Marked around the pair of components rather than around the loop, so the collision box and
 		// the mesh for one wall are tagged together and the SIDE walls stay untagged and permanent.
 		const bool bEndWall = (Wall.Size.X <= WallThickness * 1.01f);
-		const int32 WallMark = bEndWall ? MarkBuiltComponents() : 0;
+		const FTraceBuildMark WallMark = bEndWall ? MarkBuiltComponents() : FTraceBuildMark();
 
 		AddCollisionBlock(Wall.Center, Wall.Size, Wall.Name);
 
@@ -1427,7 +1516,7 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		// hold a mode-B carrier 74 uu OFF the goal they are trying to run through - an invisible wall
 		// standing in the mouth, which is exactly the failure SetPiecesPresented was written to stop.
 		// BuildGoalWall builds the four shells that go around the ring instead.
-		const int32 StandoffMark = MarkBuiltComponents();
+		const FTraceBuildMark StandoffMark = MarkBuiltComponents();
 
 		AddPawnStandoff(
 			FVector(XSign * (HalfX - TraceArenaConstants::WallNeonStandoff * 0.5f), 0.f, StandoffZ),
@@ -1510,7 +1599,7 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		// the height and the width the mode-B hoop occupies, so in mode B they would be three glowing
 		// bars drawn straight across the goal - the strongest lines on the wall, contradicting the
 		// thing the wall is now for. In mode B the ring and its alcove are the dressing at this end.
-		const int32 TrimMark = MarkBuiltComponents();
+		const FTraceBuildMark TrimMark = MarkBuiltComponents();
 
 		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TraceArenaConstants::WallBandSize * 0.5f), 0.f, BandZ),
 			FVector(TraceArenaConstants::WallBandSize, FieldWidth, TraceArenaConstants::WallBandSize),
@@ -2226,7 +2315,7 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 			// "you are attacking that way" landmark that a 33600 uu field needs whichever game is
 			// being played. Hiding those two as well left mode B's end of the field unlit and
 			// unreadable, which is a bigger lie than an over-generous floor patch.
-			const int32 EndzonePaintMark = MarkBuiltComponents();
+			const FTraceBuildMark EndzonePaintMark = MarkBuiltComponents();
 
 			// The patch is tinted with the colour of the team that DEFENDS this end. Their opponent
 			// is the one who scores on it - see ATraceEndzone's class comment. It is a lit surface
@@ -2497,7 +2586,12 @@ void ATraceArenaBuilder::BuildGoalWall(float Sign, bool bBuildVisuals)
 			continue;
 		}
 
-		AddMeshBlockRotated(CubeMesh, SpokeCentre, SpokeSize, RingBodyMID, /*bCastShadow=*/true,
+		// bCastShadow=false (spec v7 §8 shadow audit). A spoke is one sector of the annulus that closes
+		// the wall's square opening down to a circle: it is exactly WallThickness deep and it lies IN
+		// THE PLANE of the four wall panels around it, which do cast. Its shadow is therefore always
+		// inside the wall's own, and there are GoalRingSegments of them at each end. Nothing on screen
+		// changes; the shadow pass stops being handed the ring.
+		AddMeshBlockRotated(CubeMesh, SpokeCentre, SpokeSize, RingBodyMID, /*bCastShadow=*/false,
 			TEXT("GoalRingSpoke"), SpokeRotation);
 
 		// THE HOOP. A thin bright band on the spoke's inner face, standing proud of the wall on the
@@ -2675,7 +2769,7 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 	// Mark BEFORE anything is built, collision included: the perforated wall BLOCKS, and on a
 	// dedicated server (which builds collision and no visuals at all) an untagged panel would be a
 	// second wall standing inside the first one through the whole of mode A.
-	const int32 GoalMark = MarkBuiltComponents();
+	const FTraceBuildMark GoalMark = MarkBuiltComponents();
 
 	// Say the finished shape out loud, in uu, at Display. This is the line a playtest of spec v6 is
 	// judged against, and none of it - the height off the floor, the diameter, the fact that it is a
@@ -3173,13 +3267,13 @@ EObjectFlags ATraceArenaBuilder::BuiltObjectFlags() const
 	return bBuildingEditorPreview ? RF_Transient : RF_NoFlags;
 }
 
-UStaticMeshComponent* ATraceArenaBuilder::AddMeshBlock(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
+void ATraceArenaBuilder::AddMeshBlock(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
 	UMaterialInstanceDynamic* MID, bool bCastShadow, const TCHAR* DebugName, float YawDegrees)
 {
-	return AddMeshBlockRotated(Mesh, LocalCenter, Size, MID, bCastShadow, DebugName, FRotator(0.f, YawDegrees, 0.f));
+	AddMeshBlockRotated(Mesh, LocalCenter, Size, MID, bCastShadow, DebugName, FRotator(0.f, YawDegrees, 0.f));
 }
 
-UStaticMeshComponent* ATraceArenaBuilder::AddMeshBlockRotated(UStaticMesh* Mesh, const FVector& LocalCenter,
+void ATraceArenaBuilder::AddMeshBlockRotated(UStaticMesh* Mesh, const FVector& LocalCenter,
 	const FVector& Size, UMaterialInstanceDynamic* MID, bool bCastShadow, const TCHAR* DebugName,
 	const FRotator& Rotation)
 {
@@ -3187,26 +3281,41 @@ UStaticMeshComponent* ATraceArenaBuilder::AddMeshBlockRotated(UStaticMesh* Mesh,
 	// to a crash. Collision lives in separate box components, so the arena still plays.
 	if (Mesh == nullptr || Root == nullptr)
 	{
-		return nullptr;
+		return;
 	}
+
+	// One transform, computed once, used by both arms. FTransform's (rotation, translation, scale)
+	// constructor composes scale-then-rotate-then-translate, which is exactly what a scene component's
+	// relative transform does, so the instanced and legacy arms place a block IDENTICALLY. That is the
+	// whole safety property of this change: nothing about where anything is has moved.
+	const FTransform LocalTransform(Rotation, LocalCenter, Size / TraceArenaConstants::ShapeUnit);
+
+	if (bBuildingInstancedGeometry)
+	{
+		AddInstancedBlock(Mesh, MID, bCastShadow, LocalTransform, DebugName);
+		return;
+	}
+
+	// --- Legacy arm: one component per block. Kept only so Trace.Arena.Perf has a BEFORE. -----------
 
 	UStaticMeshComponent* Component = NewObject<UStaticMeshComponent>(
 		this, MakeUniqueObjectName(this, UStaticMeshComponent::StaticClass(), FName(DebugName)),
 		BuiltObjectFlags());
 	if (Component == nullptr)
 	{
-		return nullptr;
+		return;
 	}
 
 	// Everything is configured BEFORE RegisterComponent: a scene component may be freely posed
 	// while unregistered, and registering once with the final state avoids a redundant render and
 	// physics update per piece.
+	//
+	// Movable, unlike everything else the builder now makes, because this arm exists to reproduce the
+	// old behaviour exactly - including the mobility that was half the cost.
 	Component->SetMobility(EComponentMobility::Movable);
 	Component->SetupAttachment(Root);
 	Component->SetStaticMesh(Mesh);
-	Component->SetRelativeLocation(LocalCenter);
-	Component->SetRelativeRotation(Rotation);
-	Component->SetRelativeScale3D(Size / TraceArenaConstants::ShapeUnit);
+	Component->SetRelativeTransform(LocalTransform);
 	Component->SetCollisionProfileName(TEXT("NoCollision"));
 	Component->SetGenerateOverlapEvents(false);
 	Component->SetCanEverAffectNavigation(false);
@@ -3218,7 +3327,113 @@ UStaticMeshComponent* ATraceArenaBuilder::AddMeshBlockRotated(UStaticMesh* Mesh,
 	}
 
 	Component->RegisterComponent();
-	return Component;
+}
+
+void ATraceArenaBuilder::AddInstancedBlock(UStaticMesh* Mesh, UMaterialInstanceDynamic* MID, bool bCastShadow,
+	const FTransform& LocalTransform, const TCHAR* DebugName)
+{
+	// Linear search on purpose. The pool count settles in the low dozens, the build does ~1450
+	// lookups, and a TMap keyed on a three-field struct would need a hash and an equality operator to
+	// save an amount of time too small to measure once, at build, on a load screen.
+	int32 PoolIndex = INDEX_NONE;
+	for (int32 Index = 0; Index < InstancePools.Num(); ++Index)
+	{
+		const FTraceInstancePool& Candidate = InstancePools[Index];
+		if (Candidate.Mesh.Get() == Mesh && Candidate.MID.Get() == MID && Candidate.bCastShadow == bCastShadow)
+		{
+			PoolIndex = Index;
+			break;
+		}
+	}
+
+	if (PoolIndex == INDEX_NONE)
+	{
+		UInstancedStaticMeshComponent* Pooled = NewObject<UInstancedStaticMeshComponent>(
+			this, MakeUniqueObjectName(this, UInstancedStaticMeshComponent::StaticClass(), FName(DebugName)),
+			BuiltObjectFlags());
+		if (Pooled == nullptr)
+		{
+			return;
+		}
+
+		Pooled->SetupAttachment(Root);
+		Pooled->SetStaticMesh(Mesh);
+
+		// NO COLLISION, and it matters more here than it did on the single components. An ISM with a
+		// collision profile builds one physics body PER INSTANCE, so a careless profile here would
+		// create the ~1450 bodies this change is supposed to be removing. The arena's collision has
+		// always lived in separate box components (see AddCollisionBlock) precisely so the visible
+		// geometry can be free of it.
+		Pooled->SetCollisionProfileName(TEXT("NoCollision"));
+		Pooled->SetGenerateOverlapEvents(false);
+		Pooled->SetCanEverAffectNavigation(false);
+		Pooled->SetCastShadow(bCastShadow);
+
+		if (MID != nullptr)
+		{
+			Pooled->SetMaterial(0, MID);
+		}
+
+		// Deliberately NOT registered here - see FlushInstancePools. Instances are appended while the
+		// component is unregistered, which is both cheaper (no render state to recreate per block) and
+		// the only way to still be able to choose the mobility once the build knows whether anything
+		// in this pool is mode-tagged.
+
+		FTraceInstancePool& NewPool = InstancePools.AddDefaulted_GetRef();
+		NewPool.Mesh = Mesh;
+		NewPool.MID = MID;
+		NewPool.bCastShadow = bCastShadow;
+		NewPool.Component = Pooled;
+		PoolIndex = InstancePools.Num() - 1;
+	}
+
+	UInstancedStaticMeshComponent* Pool = InstancePools[PoolIndex].Component.Get();
+	if (Pool == nullptr)
+	{
+		return;
+	}
+
+	const int32 InstanceIndex = Pool->AddInstance(LocalTransform, /*bWorldSpace=*/false);
+
+	FTraceBuiltInstance& Record = BuiltInstances.AddDefaulted_GetRef();
+	Record.PoolIndex = PoolIndex;
+	Record.InstanceIndex = InstanceIndex;
+	Record.Transform = LocalTransform;
+}
+
+void ATraceArenaBuilder::FlushInstancePools()
+{
+	int32 Registered = 0;
+	int32 Instances = 0;
+	int32 MovablePools = 0;
+
+	for (FTraceInstancePool& Pool : InstancePools)
+	{
+		UInstancedStaticMeshComponent* Component = Pool.Component.Get();
+		if (!IsValid(Component) || Component->IsRegistered())
+		{
+			continue;
+		}
+
+		// STATIC unless the scoring-mode toggle has to rewrite an instance in this pool. See
+		// FTraceInstancePool::bNeedsRuntimeInstanceUpdates: moving a Static component in a game world
+		// is not allowed, and "moving" includes UpdateInstanceTransform.
+		Component->SetMobility(Pool.bNeedsRuntimeInstanceUpdates
+			? EComponentMobility::Movable
+			: EComponentMobility::Static);
+
+		MovablePools += Pool.bNeedsRuntimeInstanceUpdates ? 1 : 0;
+		Instances += Component->GetInstanceCount();
+
+		Component->RegisterComponent();
+		++Registered;
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Arena] Instanced geometry: %d instances across %d pooled meshes (%d of them Movable for the "
+		     "A/B scoring toggle, the rest Static). That is %d fewer registered primitives than one "
+		     "component per block."),
+		Instances, Registered, MovablePools, FMath::Max(0, Instances - Registered));
 }
 
 UBoxComponent* ATraceArenaBuilder::AddCollisionBlock(const FVector& LocalCenter, const FVector& Size, const TCHAR* DebugName,
@@ -3243,7 +3458,12 @@ UBoxComponent* ATraceArenaBuilder::AddCollisionBlockRotated(const FVector& Local
 		return nullptr;
 	}
 
-	Component->SetMobility(EComponentMobility::Movable);
+	// STATIC (spec v7 §8). These boxes are the arena's collision and not one of them ever moves, but
+	// a Movable primitive is held in the physics scene as a KINEMATIC body in the dynamic broadphase
+	// rather than in the static tree - ~500 of them, re-queried by every movement sweep, every bullet
+	// and every Core throw. Scoring-mode toggling only ever calls SetCollisionEnabled on these, which
+	// is a state change and not a move, so it stays legal on a Static component.
+	Component->SetMobility(EComponentMobility::Static);
 	Component->SetupAttachment(Root);
 	Component->SetRelativeLocation(LocalCenter);
 	Component->SetRelativeRotation(Rotation);
@@ -3276,7 +3496,9 @@ UBoxComponent* ATraceArenaBuilder::AddPawnStandoff(const FVector& LocalCenter, c
 		return nullptr;
 	}
 
-	Component->SetMobility(EComponentMobility::Movable);
+	// Static for the same reason AddCollisionBlock is: a shell that never moves has no business in the
+	// dynamic broadphase.
+	Component->SetMobility(EComponentMobility::Static);
 	Component->SetupAttachment(Root);
 	Component->SetRelativeLocation(LocalCenter);
 	Component->SetRelativeRotation(FRotator(0.f, YawDegrees, 0.f));
@@ -3672,10 +3894,15 @@ void ATraceArenaBuilder::AddPylon(const FVector2D& LocalCentre, float Side, floa
 	const float BaseSide = Side + 44.f;
 	const float CapSide = Side + 30.f;
 
+	// bCastShadow=false on both (spec v7 §8 shadow audit). These are collars around the shaft, 22 and
+	// 15 uu proud of a column that casts, and they sit at the very bottom and the very top of it - the
+	// plinth's shadow starts at the floor line where the shaft's already is, and the capital's is
+	// thrown from 616+ uu up onto whatever the shaft is already shadowing. Two extra shadow draws per
+	// cascade per pylon, for a couple of dozen pixels of extra penumbra nobody can find.
 	AddMeshBlock(CubeMesh, FVector(Centre.X, Centre.Y, BaseHeight * 0.5f),
-		FVector(BaseSide, BaseSide, BaseHeight), BodyMID, /*bCastShadow=*/true, DebugName);
+		FVector(BaseSide, BaseSide, BaseHeight), BodyMID, /*bCastShadow=*/false, DebugName);
 	AddMeshBlock(CubeMesh, FVector(Centre.X, Centre.Y, Height - CapHeight * 0.5f),
-		FVector(CapSide, CapSide, CapHeight), BodyMID, /*bCastShadow=*/true, DebugName);
+		FVector(CapSide, CapSide, CapHeight), BodyMID, /*bCastShadow=*/false, DebugName);
 
 	if (NeonMID == nullptr)
 	{
@@ -3901,12 +4128,15 @@ void ATraceArenaBuilder::ApplyTeamSides(ETraceTeam TeamOnNegativeSide)
 // Scoring mode (spec v4 section 7) - both shapes built, one presented
 // -------------------------------------------------------------------------------------------------
 
-int32 ATraceArenaBuilder::MarkBuiltComponents() const
+ATraceArenaBuilder::FTraceBuildMark ATraceArenaBuilder::MarkBuiltComponents() const
 {
-	return (Root != nullptr) ? Root->GetAttachChildren().Num() : 0;
+	FTraceBuildMark Mark;
+	Mark.Components = (Root != nullptr) ? Root->GetAttachChildren().Num() : 0;
+	Mark.Instances = BuiltInstances.Num();
+	return Mark;
 }
 
-void ATraceArenaBuilder::CollectPiecesSince(int32 Mark, TArray<FTraceModePiece>& Out) const
+void ATraceArenaBuilder::CollectPiecesSince(const FTraceBuildMark& Mark, TArray<FTraceModePiece>& Out)
 {
 	if (Root == nullptr)
 	{
@@ -3914,17 +4144,37 @@ void ATraceArenaBuilder::CollectPiecesSince(int32 Mark, TArray<FTraceModePiece>&
 	}
 
 	// MARK, BUILD, DIFF - and no primitive helper had to learn that modes exist. Every factory in
-	// this file does SetupAttachment(Root) and AttachChildren appends in construction order, so the
-	// components added since the mark ARE what the step built. The alternative was threading a
+	// this file either does SetupAttachment(Root) or appends to BuiltInstances, both in construction
+	// order, so what appeared since the mark IS what the step built. The alternative was threading a
 	// "which mode is this for" argument through AddMeshBlock / AddCollisionBlock / AddPawnStandoff /
 	// AddNeonBlock / AddPylon, which is five signatures and a default argument nobody would notice
 	// getting wrong.
+	//
+	// THE INSTANCED HALF IS WHY THIS RUNS IN TWO LOOPS. Pooling interleaves blocks from every build
+	// step into a handful of shared components, so "the geometry this step made" is no longer a
+	// contiguous run of components - it is a contiguous run of INSTANCES scattered across pools, which
+	// is exactly what BuiltInstances records.
 	const auto& BuiltChildren = Root->GetAttachChildren();
-	for (int32 Index = FMath::Max(0, Mark); Index < BuiltChildren.Num(); ++Index)
+	for (int32 Index = FMath::Max(0, Mark.Components); Index < BuiltChildren.Num(); ++Index)
 	{
 		USceneComponent* Built = BuiltChildren[Index];
 		if (!IsValid(Built))
 		{
+			continue;
+		}
+
+		// The pooled ISMs are shared by every build step, so one of them appearing in this range would
+		// mean hiding hundreds of untagged blocks along with the tagged ones. They cannot appear -
+		// registration, and therefore attachment, is deferred to FlushInstancePools long after the
+		// last collect - but this is the assumption that would fail silently and invisibly if that
+		// ordering were ever changed, so it is asserted rather than assumed.
+		if (Built->IsA<UInstancedStaticMeshComponent>())
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Arena] A pooled instanced mesh (%s) was attached before the mode tags were collected. ")
+				TEXT("Tagging it would hide every block in its pool. FlushInstancePools must run after every ")
+				TEXT("CollectPiecesSince."),
+				*Built->GetName());
 			continue;
 		}
 
@@ -3939,12 +4189,62 @@ void ATraceArenaBuilder::CollectPiecesSince(int32 Mark, TArray<FTraceModePiece>&
 			Piece.Collision = Primitive->GetCollisionEnabled();
 		}
 	}
+
+	for (int32 Index = FMath::Max(0, Mark.Instances); Index < BuiltInstances.Num(); ++Index)
+	{
+		const FTraceBuiltInstance& Built = BuiltInstances[Index];
+		if (!InstancePools.IsValidIndex(Built.PoolIndex))
+		{
+			continue;
+		}
+
+		FTraceInstancePool& Pool = InstancePools[Built.PoolIndex];
+		UInstancedStaticMeshComponent* Component = Pool.Component.Get();
+		if (!IsValid(Component))
+		{
+			continue;
+		}
+
+		// The pool now has to survive being re-transformed at runtime, so it cannot be Static. This is
+		// the only place that decides it, and FlushInstancePools reads it - which is why the flush has
+		// to come last.
+		Pool.bNeedsRuntimeInstanceUpdates = true;
+
+		FTraceModePiece& Piece = Out.AddDefaulted_GetRef();
+		Piece.InstancePool = Component;
+		Piece.InstanceIndex = Built.InstanceIndex;
+		Piece.InstanceTransform = Built.Transform;
+		// Instanced pieces are visual only - the pools are built NoCollision - so there is no
+		// collision state to remember or restore. The blocking half of a mode-tagged structure is its
+		// separate box component, tagged in the loop above.
+	}
 }
 
 void ATraceArenaBuilder::SetPiecesPresented(const TArray<FTraceModePiece>& Pieces, bool bPresented)
 {
+	// Pools touched by an instance rewrite, so the render state is recreated once per pool instead of
+	// once per instance. A mode toggle can move a couple of hundred instances.
+	TSet<UInstancedStaticMeshComponent*> TouchedPools;
+
 	for (const FTraceModePiece& Piece : Pieces)
 	{
+		if (UInstancedStaticMeshComponent* Pool = Piece.InstancePool.Get(); IsValid(Pool) && Piece.InstanceIndex != INDEX_NONE)
+		{
+			// HIDING AN INSTANCE IS COLLAPSING IT. There is no per-instance visibility bit on an ISM,
+			// so the piece is scaled to zero where it stands and its built transform is written back
+			// when its mode is armed. A zero-scaled instance produces degenerate triangles that cover
+			// no pixels; it is the standard idiom, and it is why FTraceModePiece remembers the
+			// transform rather than trying to recompute it.
+			const FTransform Wanted = bPresented
+				? Piece.InstanceTransform
+				: FTransform(Piece.InstanceTransform.GetRotation(), Piece.InstanceTransform.GetTranslation(), FVector::ZeroVector);
+
+			Pool->UpdateInstanceTransform(Piece.InstanceIndex, Wanted, /*bWorldSpace=*/false,
+				/*bMarkRenderStateDirty=*/false, /*bTeleport=*/true);
+			TouchedPools.Add(Pool);
+			continue;
+		}
+
 		USceneComponent* Component = Piece.Component.Get();
 		if (!IsValid(Component))
 		{
@@ -3960,6 +4260,11 @@ void ATraceArenaBuilder::SetPiecesPresented(const TArray<FTraceModePiece>& Piece
 		{
 			Primitive->SetCollisionEnabled(bPresented ? Piece.Collision.GetValue() : ECollisionEnabled::NoCollision);
 		}
+	}
+
+	for (UInstancedStaticMeshComponent* Pool : TouchedPools)
+	{
+		Pool->MarkRenderStateDirty();
 	}
 }
 
@@ -4037,14 +4342,15 @@ void ATraceArenaBuilder::ApplyTeamSidesInWorld(const UWorld* World, ETraceTeam T
 }
 
 // -------------------------------------------------------------------------------------------------
-// Editor preview
+// Teardown
 //
-// See the two-click workflow documented on BuildPreviewInEditor in the header. Everything below is
-// #if WITH_EDITOR: none of it is compiled into a packaged game, so a preview cannot exist there and
-// the runtime path is byte-identical to what it was.
+// DestroyBuiltArena used to live inside the #if WITH_EDITOR block below, because the editor preview
+// was the only thing that ever needed to take an arena apart. Spec v7 §8's A/B needs it too: the only
+// way to compare the instanced and legacy geometry paths WITHOUT comparing two different processes on
+// a machine that has other work on it is to rebuild the arena in place between arms. It is still
+// never called by the game itself - at runtime the arena is built exactly once per world and EndPlay
+// is the only other teardown path there is.
 // -------------------------------------------------------------------------------------------------
-
-#if WITH_EDITOR
 
 void ATraceArenaBuilder::DestroyBuiltArena()
 {
@@ -4096,12 +4402,51 @@ void ATraceArenaBuilder::DestroyBuiltArena()
 	GoalModePieces.Reset();
 	ScoringVolumes.Reset();
 
+	// The instance pools are the same story with a sharper edge: their INDICES are the identity of
+	// every mode-tagged piece, so a surviving pool entry would have the next build appending into a
+	// component that has just been destroyed and handing out indices that mean nothing. A pool that
+	// never got as far as FlushInstancePools is not in the attachment tree either, so destroy it here
+	// rather than leaking an unregistered component per aborted preview.
+	for (FTraceInstancePool& Pool : InstancePools)
+	{
+		if (UInstancedStaticMeshComponent* Pooled = Pool.Component.Get(); IsValid(Pooled) && !Pooled->IsRegistered())
+		{
+			Pooled->DestroyComponent();
+			++ComponentsDestroyed;
+		}
+	}
+	InstancePools.Reset();
+	BuiltInstances.Reset();
+
 	bArenaBuilt = false;
 	bEditorPreviewBuilt = false;
 
 	UE_LOG(LogTraceGame, Verbose, TEXT("ATraceArenaBuilder: torn down %d components and %d actors."),
 		ComponentsDestroyed, ActorsDestroyed);
 }
+
+#if !UE_BUILD_SHIPPING
+void ATraceArenaBuilder::RebuildForMeasurement()
+{
+	// MEASUREMENT ONLY, and the header says so in stronger terms. This is not a live-tuning facility:
+	// it destroys and respawns the endzone triggers and the player starts, and it resets the painted
+	// side assignment to the builder's default, so a match that survives it is a match whose endzones
+	// may be the wrong colour until the next half-time push. Trace.Arena.PerfAB accepts that because
+	// it is measuring frame time, not playing a game.
+	DestroyBuiltArena();
+	BuildArena();
+}
+#endif
+
+// -------------------------------------------------------------------------------------------------
+// Editor preview
+//
+// See the two-click workflow documented on BuildPreviewInEditor in the header. Everything below is
+// #if WITH_EDITOR: none of it is compiled into a packaged game, so a preview cannot exist there and
+// the runtime path is byte-identical to what it was.
+// -------------------------------------------------------------------------------------------------
+
+#if WITH_EDITOR
 
 void ATraceArenaBuilder::BuildPreviewInEditor()
 {
@@ -4207,3 +4552,506 @@ void ATraceArenaBuilder::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
 }
 
 #endif // WITH_EDITOR
+
+// =================================================================================================
+// SPEC v7 §8 - THE MEASUREMENT: Trace.Arena.Perf and Trace.Arena.PerfAB
+//
+// WHY THIS EXISTS AT ALL, given the project already has Trace.Trail.PerfAB. That harness compares
+// three TRAIL renderers; this one compares two ARENA GEOMETRY paths and characterises the scene,
+// which is a different question and the one spec v7 §8 actually asks: how many primitives is the
+// arena handing the renderer, and what does a frame cost. It samples the same four columns from the
+// same globals `stat unit` reads, so the two harnesses' numbers are directly comparable.
+//
+// TWO COMMANDS, AND THE SECOND ONE IS THE ONE TO TRUST:
+//
+//   Trace.Arena.Perf    - characterise whatever is built right now. One arm, no comparison.
+//   Trace.Arena.PerfAB  - REBUILD the arena as legacy, sample it, rebuild it as instanced, sample
+//                         that, N times over, then print both with the delta.
+//
+// WHY THE A/B IS IN ONE PROCESS. The obvious way to get a before and an after is two launches with
+// and without -TraceArenaLegacyGeometry. That was tried first and it produced two numbers that cannot
+// be compared: this machine is shared, and BOTH attempts had another headless UE run start up inside
+// the 12-second sample window (once mid-warmup, once at second 3), which on a GPU-bound measurement
+// is not noise, it is a second renderer. Interleaving the arms in one process spreads any such
+// interference - and any thermal or match-state drift - evenly across both arms instead of dumping
+// it on whichever one was unlucky. That is the same reasoning, and the same shape, as
+// Trace.Trail.PerfAB's cycle count.
+//
+// r.ScreenPercentage 300 IS NOT OPTIONAL AND IS NOT DECORATION. macOS Metal paces the present to the
+// display whatever t.MaxFPS, r.VSync, rhi.SyncInterval and -RenderOffScreen are set to. A run that
+// lands on the refresh period has measured the CAP, and a capped frame time is identical for an arena
+// that draws 1450 meshes and one that draws 40 - which is exactly how a previous pass concluded it
+// had fixed something it had not. Making the GPU the bottleneck is what lets the comparison detect
+// anything at all, and this harness refuses to let a capped table be read at face value: see the
+// validity verdict printed under it.
+//
+//   ... -TraceAutoPlay=2 -TraceExec="r.ScreenPercentage 300|Trace.Arena.PerfAB 10 2 3" -TraceExecAt=14
+// =================================================================================================
+
+namespace
+{
+	/** Everything the report needs about the scene, gathered per arm so it can be read months later. */
+	struct FArenaPerfCensus
+	{
+		int32 ScenePrimitives = 0;       // every registered primitive in the world, arena or not
+		int32 ArenaPrimitives = 0;       // primitives owned by the arena builder
+		int32 ArenaMovable = 0;          // ...of which Movable
+		int32 ArenaShadowCasters = 0;    // ...of which cast a shadow
+		int32 ArenaMeshComponents = 0;   // plain UStaticMeshComponents (the legacy arm's blocks)
+		int32 ArenaInstancePools = 0;    // pooled ISMs (the instanced arm's blocks)
+		int32 ArenaInstances = 0;        // total instances across those pools
+		int32 ArenaBoxes = 0;            // collision boxes and pawn standoff shells
+		int32 Characters = 0;
+	};
+
+	UWorld* FindArenaPerfWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if ((Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+				&& Context.World() != nullptr)
+			{
+				return Context.World();
+			}
+		}
+
+		return nullptr;
+	}
+
+	void GatherArenaPerfCensus(UWorld* World, FArenaPerfCensus& Out)
+	{
+		Out = FArenaPerfCensus();
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		for (TObjectIterator<UPrimitiveComponent> It; It; ++It)
+		{
+			UPrimitiveComponent* Primitive = *It;
+			if (Primitive == nullptr || Primitive->GetWorld() != World || !Primitive->IsRegistered())
+			{
+				continue;
+			}
+
+			++Out.ScenePrimitives;
+
+			if (Primitive->GetOwner() == nullptr || !Primitive->GetOwner()->IsA<ATraceArenaBuilder>())
+			{
+				continue;
+			}
+
+			++Out.ArenaPrimitives;
+			Out.ArenaMovable += (Primitive->Mobility == EComponentMobility::Movable) ? 1 : 0;
+			Out.ArenaShadowCasters += Primitive->CastShadow ? 1 : 0;
+
+			// ISM before StaticMesh: UInstancedStaticMeshComponent DERIVES from UStaticMeshComponent,
+			// so testing the base class first would count every pool as a loose block and report the
+			// instanced arm as though nothing had changed.
+			if (const UInstancedStaticMeshComponent* Pool = Cast<UInstancedStaticMeshComponent>(Primitive))
+			{
+				++Out.ArenaInstancePools;
+				Out.ArenaInstances += Pool->GetInstanceCount();
+			}
+			else if (Primitive->IsA<UStaticMeshComponent>())
+			{
+				++Out.ArenaMeshComponents;
+			}
+			else if (Primitive->IsA<UBoxComponent>())
+			{
+				++Out.ArenaBoxes;
+			}
+		}
+
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			++Out.Characters;
+		}
+	}
+
+	struct FArenaPerfArm
+	{
+		/** Trace.Arena.Instancing value this arm builds the arena with. */
+		int32 Instancing = 1;
+		FString Name;
+
+		TArray<float> FrameMs;
+		double GameMsSum = 0.0;
+		double RenderMsSum = 0.0;
+		double GpuMsSum = 0.0;
+		int32 Frames = 0;
+
+		FArenaPerfCensus Census;
+	};
+
+	struct FArenaPerfState
+	{
+		TArray<FArenaPerfArm> Arms;
+		int32 ArmIndex = 0;
+		int32 CyclesTotal = 3;
+		int32 CycleIndex = 0;
+
+		float WarmupSeconds = 2.f;
+		float SampleSeconds = 10.f;
+		float PhaseElapsed = 0.f;
+		bool bWarming = true;
+		bool bStarted = false;
+
+		/** false for Trace.Arena.Perf: sample what is already built, never rebuild anything. */
+		bool bRebuildBetweenArms = true;
+
+		int32 RestoreInstancing = 1;
+	};
+
+	float ArenaPerfMean(const TArray<float>& Values)
+	{
+		if (Values.Num() == 0)
+		{
+			return 0.f;
+		}
+		double Total = 0.0;
+		for (const float Value : Values)
+		{
+			Total += Value;
+		}
+		return static_cast<float>(Total / Values.Num());
+	}
+
+	float ArenaPerfPercentile(TArray<float>& Values, float Fraction)
+	{
+		if (Values.Num() == 0)
+		{
+			return 0.f;
+		}
+		Values.Sort();
+		const int32 Index = FMath::Clamp(FMath::RoundToInt(Fraction * (Values.Num() - 1)), 0, Values.Num() - 1);
+		return Values[Index];
+	}
+
+	/**
+	 * The refresh rate this run was pinned to, or 0 if it was free.
+	 *
+	 * Two halves, exactly as Trace.Trail.PerfAB's version has: the arms have to AGREE to within a
+	 * couple of percent (a genuine tie is possible, so agreement alone must never be enough to cry
+	 * cap) AND that shared mean has to sit on a plausible refresh period. A single-arm run degrades to
+	 * the second half, which is the half that carries the information anyway - a measurement sitting
+	 * within 3% of a refresh period is a measurement of the display.
+	 */
+	float ArenaPerfDetectFrameRateCap(const FArenaPerfState& State)
+	{
+		float MinMean = TNumericLimits<float>::Max();
+		float MaxMean = 0.f;
+		for (const FArenaPerfArm& Arm : State.Arms)
+		{
+			const float Mean = ArenaPerfMean(Arm.FrameMs);
+			if (Mean <= 0.f)
+			{
+				return 0.f;   // An arm with no frames: nothing to conclude either way.
+			}
+			MinMean = FMath::Min(MinMean, Mean);
+			MaxMean = FMath::Max(MaxMean, Mean);
+		}
+
+		if (MinMean <= 0.f || (State.Arms.Num() > 1 && ((MaxMean - MinMean) / MinMean) > 0.02f))
+		{
+			return 0.f;   // The arms genuinely differ, so nothing is holding them together.
+		}
+
+		static const float CommonRefreshRates[] = { 30.f, 50.f, 60.f, 72.f, 75.f, 90.f, 100.f, 120.f, 144.f, 165.f, 240.f };
+		for (const float Hz : CommonRefreshRates)
+		{
+			const float Period = 1000.f / Hz;
+			if (FMath::Abs(MinMean - Period) / Period <= 0.03f)
+			{
+				return Hz;
+			}
+		}
+
+		return 0.f;
+	}
+
+	void ArenaPerfReport(FArenaPerfState& State)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ARENAPERF] ===== RESULTS. %d interleaved cycle(s) x %d arm(s) x %.1fs sample. ")
+			TEXT("ms lower is better; fps from the MEAN frame time. ====="),
+			State.CyclesTotal, State.Arms.Num(), State.SampleSeconds);
+
+		for (const FArenaPerfArm& Arm : State.Arms)
+		{
+			const FArenaPerfCensus& C = Arm.Census;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ARENAPERF] arm '%s' scene: arena owns %d registered primitives (%d Movable, %d shadow ")
+				TEXT("casters) = %d loose static meshes + %d pooled ISMs carrying %d instances + %d ")
+				TEXT("collision/standoff boxes. Whole world: %d primitives, %d characters."),
+				*Arm.Name, C.ArenaPrimitives, C.ArenaMovable, C.ArenaShadowCasters,
+				C.ArenaMeshComponents, C.ArenaInstancePools, C.ArenaInstances, C.ArenaBoxes,
+				C.ScenePrimitives, C.Characters);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ARENAPERF] %-10s %6s | %8s %8s %8s | %8s %8s %8s | %7s"),
+			TEXT("arm"), TEXT("frames"), TEXT("frameMs"), TEXT("medMs"), TEXT("p95Ms"),
+			TEXT("gameMs"), TEXT("rendMs"), TEXT("gpuMs"), TEXT("fps"));
+
+		float BaselineFrame = 0.f;
+		for (FArenaPerfArm& Arm : State.Arms)
+		{
+			const int32 SafeFrames = FMath::Max(1, Arm.Frames);
+			const float MeanFrame = ArenaPerfMean(Arm.FrameMs);
+
+			if (Arm.Instancing == 0)
+			{
+				BaselineFrame = MeanFrame;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ARENAPERF] %-10s %6d | %8.2f %8.2f %8.2f | %8.2f %8.2f %8.2f | %7.1f"),
+				*Arm.Name, Arm.Frames, MeanFrame,
+				ArenaPerfPercentile(Arm.FrameMs, 0.50f), ArenaPerfPercentile(Arm.FrameMs, 0.95f),
+				Arm.GameMsSum / SafeFrames, Arm.RenderMsSum / SafeFrames, Arm.GpuMsSum / SafeFrames,
+				(MeanFrame > 0.f) ? (1000.f / MeanFrame) : 0.f);
+		}
+
+		if (BaselineFrame > 0.f)
+		{
+			for (FArenaPerfArm& Arm : State.Arms)
+			{
+				if (Arm.Instancing == 0)
+				{
+					continue;
+				}
+				const float MeanFrame = ArenaPerfMean(Arm.FrameMs);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ARENAPERF] '%s' vs 'legacy': %+.2f ms/frame (%+.1f%%), %.2fx the frame rate."),
+					*Arm.Name, MeanFrame - BaselineFrame,
+					100.f * (MeanFrame - BaselineFrame) / BaselineFrame,
+					(MeanFrame > 0.f) ? (BaselineFrame / MeanFrame) : 0.f);
+			}
+		}
+
+		// THE VALIDITY VERDICT, PRINTED LAST SO IT IS THE LINE UNDER THE TABLE.
+		if (const float CapHz = ArenaPerfDetectFrameRateCap(State); CapHz > 0.f)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ARENAPERF] *** THIS MEASUREMENT IS INVALID: every arm landed within 2%% of %.2f ms, ")
+				TEXT("which is %.0f Hz. The frame is PACED TO THE DISPLAY, not to the renderer, so it reads ")
+				TEXT("the same whether the arena submits 1450 draws or 40 and the comparison cannot detect a ")
+				TEXT("difference of any size. t.MaxFPS / r.VSync / rhi.SyncInterval do NOT defeat this on ")
+				TEXT("macOS Metal, and -RenderOffScreen still presents. Run `r.ScreenPercentage 300` first so ")
+				TEXT("the GPU is the bottleneck, and do NOT quote the numbers above. ***"),
+				1000.f / CapHz, CapHz);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ARENAPERF] Validity: the arms differ by more than the cap-detection tolerance and the ")
+				TEXT("shared mean is not a display refresh period, so the frame was NOT paced and this ")
+				TEXT("comparison could have detected a difference."));
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[ARENAPERF] ===== END. ====="));
+	}
+
+	void ArenaPerfBeginArm(FArenaPerfState& State, UWorld* World)
+	{
+		FArenaPerfArm& Arm = State.Arms[State.ArmIndex];
+
+		if (State.bRebuildBetweenArms)
+		{
+			// The arm's geometry path is latched by BuildArena, so the cvar has to be set BEFORE the
+			// rebuild and not after it.
+			GArenaInstancing = Arm.Instancing;
+
+			int32 Rebuilt = 0;
+			for (TActorIterator<ATraceArenaBuilder> It(World); It; ++It)
+			{
+				It->RebuildForMeasurement();
+				++Rebuilt;
+			}
+
+			if (Rebuilt == 0)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[ARENAPERF] no ATraceArenaBuilder in this world; the arms will all measure the same scene."));
+			}
+		}
+
+		GatherArenaPerfCensus(World, Arm.Census);
+
+		State.bWarming = true;
+		State.PhaseElapsed = 0.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ARENAPERF] arm '%s' (Trace.Arena.Instancing %d): %d arena primitives. Warming %.1fs, then sampling %.1fs."),
+			*Arm.Name, Arm.Instancing, Arm.Census.ArenaPrimitives, State.WarmupSeconds, State.SampleSeconds);
+	}
+
+	bool TickArenaPerf(FArenaPerfState& State, float DeltaTime)
+	{
+		UWorld* World = FindArenaPerfWorld();
+		if (World == nullptr)
+		{
+			return true;   // The map may still be loading.
+		}
+
+		if (!State.bStarted)
+		{
+			State.bStarted = true;
+
+			if (GEngine != nullptr)
+			{
+				// FStatUnitData is only filled while the overlay is enabled, so enable it here rather
+				// than asking the caller to remember: a run that forgets produces zeroes in three
+				// columns, which looks like a measurement and is not one.
+				GEngine->Exec(World, TEXT("stat unit"));
+
+				// Every cap the engine owns. None of them beats Metal's present pacing on macOS -
+				// that is what r.ScreenPercentage is for - but leaving any of them on guarantees a
+				// capped number even on hardware where they do work.
+				GEngine->Exec(World, TEXT("t.MaxFPS 0"));
+				GEngine->Exec(World, TEXT("r.VSync 0"));
+				GEngine->Exec(World, TEXT("rhi.SyncInterval 0"));
+				GEngine->bSmoothFrameRate = false;
+				GEngine->bUseFixedFrameRate = false;
+			}
+
+			ArenaPerfBeginArm(State, World);
+			return true;
+		}
+
+		State.PhaseElapsed += DeltaTime;
+
+		if (State.bWarming)
+		{
+			if (State.PhaseElapsed >= State.WarmupSeconds)
+			{
+				State.bWarming = false;
+				State.PhaseElapsed = 0.f;
+			}
+			return true;
+		}
+
+		FArenaPerfArm& Arm = State.Arms[State.ArmIndex];
+		Arm.FrameMs.Add(DeltaTime * 1000.f);
+
+		if (GEngine != nullptr && GEngine->GameViewport != nullptr)
+		{
+			if (const FStatUnitData* Unit = GEngine->GameViewport->GetStatUnitData())
+			{
+				Arm.GameMsSum += Unit->RawGameThreadTime;
+				Arm.RenderMsSum += Unit->RawRenderThreadTime;
+				Arm.GpuMsSum += Unit->RawGPUFrameTime[0];
+			}
+		}
+
+		++Arm.Frames;
+
+		if (State.PhaseElapsed < State.SampleSeconds)
+		{
+			return true;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ARENAPERF] arm '%s' done: %d frames, mean %.2f ms (%.1f fps)."),
+			*Arm.Name, Arm.Frames, ArenaPerfMean(Arm.FrameMs),
+			(ArenaPerfMean(Arm.FrameMs) > 0.f) ? (1000.f / ArenaPerfMean(Arm.FrameMs)) : 0.f);
+
+		++State.ArmIndex;
+		if (State.ArmIndex >= State.Arms.Num())
+		{
+			State.ArmIndex = 0;
+			++State.CycleIndex;
+
+			if (State.CycleIndex >= State.CyclesTotal)
+			{
+				// Leave the arena in the arm the project actually ships, whatever the last one
+				// sampled happened to be.
+				if (State.bRebuildBetweenArms)
+				{
+					GArenaInstancing = State.RestoreInstancing;
+					for (TActorIterator<ATraceArenaBuilder> It(World); It; ++It)
+					{
+						It->RebuildForMeasurement();
+					}
+				}
+
+				ArenaPerfReport(State);
+				return false;
+			}
+		}
+
+		ArenaPerfBeginArm(State, World);
+		return true;
+	}
+
+	void StartArenaPerf(FArenaPerfState& State)
+	{
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+			{
+				return TickArenaPerf(State, DeltaTime);
+			}), 0.f);
+	}
+
+	FAutoConsoleCommand CmdArenaPerf(
+		TEXT("Trace.Arena.Perf"),
+		TEXT("Trace.Arena.Perf [SampleSeconds] [WarmupSeconds] - census the arena's primitives and sample "
+		     "frame / game / render / GPU milliseconds for whatever is built RIGHT NOW, then print the table "
+		     "(spec v7 8). Nothing is rebuilt. Run `r.ScreenPercentage 300` first or the number you get is "
+		     "the display's refresh rate."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FArenaPerfState State;
+			State.SampleSeconds = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 2.f, 120.f) : 12.f;
+			State.WarmupSeconds = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 0.5f, 30.f) : 3.f;
+			State.CyclesTotal = 1;
+			State.bRebuildBetweenArms = false;
+
+			FArenaPerfArm Current;
+			Current.Instancing = GArenaInstancing;
+			Current.Name = TEXT("as-built");
+			State.Arms.Add(MoveTemp(Current));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[ARENAPERF] starting: %.1fs warmup + %.1fs sample, no rebuild."),
+				State.WarmupSeconds, State.SampleSeconds);
+			StartArenaPerf(State);
+		}));
+
+	FAutoConsoleCommand CmdArenaPerfAB(
+		TEXT("Trace.Arena.PerfAB"),
+		TEXT("Trace.Arena.PerfAB [SampleSeconds] [WarmupSeconds] [Cycles] - REBUILD the arena as legacy "
+		     "one-component-per-block, sample it, rebuild it instanced, sample that, Cycles times "
+		     "interleaved, then print the comparison (spec v7 8). Run `r.ScreenPercentage 300` first so the "
+		     "GPU is the bottleneck, or the harness will tell you the result is the display refresh rate."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FArenaPerfState State;
+			State.SampleSeconds = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 2.f, 120.f) : 10.f;
+			State.WarmupSeconds = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 0.5f, 30.f) : 2.f;
+			State.CyclesTotal = (Args.Num() > 2) ? FMath::Clamp(FCString::Atoi(*Args[2]), 1, 20) : 3;
+			State.RestoreInstancing = GArenaInstancing;
+
+			// LEGACY FIRST, deliberately, so the arm that allocates ~960 components is the one paying
+			// for a cold heap rather than the one that is supposed to look good.
+			FArenaPerfArm Legacy;
+			Legacy.Instancing = 0;
+			Legacy.Name = TEXT("legacy");
+			FArenaPerfArm Instanced;
+			Instanced.Instancing = 1;
+			Instanced.Name = TEXT("instanced");
+			State.Arms.Add(MoveTemp(Legacy));
+			State.Arms.Add(MoveTemp(Instanced));
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ARENAPERF] starting: %d interleaved cycles x 2 arms x (%.1fs warmup + %.1fs sample) = %.0fs total."),
+				State.CyclesTotal, State.WarmupSeconds, State.SampleSeconds,
+				State.CyclesTotal * 2.f * (State.WarmupSeconds + State.SampleSeconds));
+			StartArenaPerf(State);
+		}));
+}
