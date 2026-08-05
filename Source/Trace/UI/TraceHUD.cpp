@@ -1599,20 +1599,20 @@ void ATraceHUD::DrawNetworkStatus()
 {
 	FString Endpoint;
 	FString Detail;
-	const TraceNet::ERole Role = TraceNet::DescribeConnection(GetWorld(), Endpoint, Detail);
+	const TraceNet::ERole ConnectionRole = TraceNet::DescribeConnection(GetWorld(), Endpoint, Detail);
 
 	// A standalone match with a free port is an ordinary offline game and needs no chrome. A
 	// standalone match whose port was TAKEN is a listen server that silently failed to bind, and that
 	// one has to be shouted about — it is precisely the state that looks identical to a working host
 	// from the inside, which is the bug this pass exists to close.
-	if (Role == TraceNet::ERole::Offline && Detail.IsEmpty())
+	if (ConnectionRole == TraceNet::ERole::Offline && Detail.IsEmpty())
 	{
 		return;
 	}
 
 	FString Headline;
 	FLinearColor Accent = TraceHUDStyle::Good;
-	switch (Role)
+	switch (ConnectionRole)
 	{
 	case TraceNet::ERole::Hosting:
 		Headline = FString::Printf(TEXT("HOSTING  %s"), *Endpoint);

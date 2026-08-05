@@ -561,18 +561,18 @@ void ATracePlayerController::TraceNetInfo()
 		if (const AGameStateBase* GameStateBase = ControllerWorld->GetGameState())
 		{
 			int32 Humans = 0;
-			for (const APlayerState* Player : GameStateBase->PlayerArray)
+			for (const APlayerState* PlayerStateEntry : GameStateBase->PlayerArray)
 			{
-				if (Player == nullptr)
+				if (PlayerStateEntry == nullptr)
 				{
 					continue;
 				}
-				if (!Player->IsABot())
+				if (!PlayerStateEntry->IsABot())
 				{
 					++Humans;
 				}
 				UE_LOG(LogTraceGame, Display, TEXT("[Net]   playerState '%s' bot=%d"),
-					*Player->GetPlayerName(), Player->IsABot() ? 1 : 0);
+					*PlayerStateEntry->GetPlayerName(), PlayerStateEntry->IsABot() ? 1 : 0);
 			}
 			UE_LOG(LogTraceGame, Display, TEXT("[Net] %d player state(s), %d human(s)."),
 				GameStateBase->PlayerArray.Num(), Humans);
