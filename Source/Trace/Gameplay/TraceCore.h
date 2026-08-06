@@ -477,6 +477,93 @@ public:
 	/** MODE B. Forward offset of the launch point from the thrower's eye. */
 	static float GetThrowMuzzleForward();
 
+	// --- SPEC v8 §4: THE THROW CARRIES THE THROWER'S MOMENTUM --------------------------------------
+	//
+	// Verbatim: "When jumping and throwing the core, the core doesn't seem to keep momentum. Make sure
+	// that the core has the momentum from the throw and also carries momentum from the player."
+	//
+	// The throw used to be a pure impulse in the aim direction: a Core thrown by a player sprinting at
+	// 900 uu/s left at exactly the same velocity as one thrown standing still, and a Core thrown at the
+	// top of a jump left with the jump's +Z thrown away. THAT SECOND CASE IS THE ONE THE USER NOTICED,
+	// and it is the more visible of the two because a jump's vertical velocity is the one component a
+	// player is watching at the moment they release.
+	//
+	// The launch is now impulse + up bias + THROWER VELOCITY * inheritance, vertical included. The
+	// three accessors below are published for the same reason the flight model above them is: the bot
+	// throw solver reconstructs the launch to aim, and a solver that does not know about the inherited
+	// term aims at where the Core would have gone before this change.
+
+	/**
+	 * MODE B. Fraction of the thrower's own velocity added to the launch. 1.0 = full inheritance.
+	 *
+	 * Spec v8 §4's [ASSUMPTION] is full inheritance, and this exists so that "too strong" is a number
+	 * a designer can change rather than a fudge factor compiled into the launch. Bound by name to
+	 * UTraceSettings::CoreThrowVelocityInheritance, with Trace.ModeB.ThrowVelocityInheritance behind it.
+	 */
+	static float GetThrowVelocityInheritance();
+
+	/**
+	 * MODE B. The inherited term on its own: @p Thrower's current velocity times the fraction above.
+	 *
+	 * Zero for a null or non-pawn actor, and zero in mode A, so it is safe to add unconditionally.
+	 */
+	static FVector GetInheritedThrowVelocity(const AActor* Thrower);
+
+	/**
+	 * MODE B. THE COMPLETE LAUNCH VELOCITY a throw by @p Thrower along @p AimDirection leaves with.
+	 *
+	 * ThrowFromHolder() calls exactly this, so anything that needs to predict the flight — the bot
+	 * throw solver, the arc lane sweep, a HUD trajectory — gets the same answer the Core will actually
+	 * use, including the inherited term. Reconstructing it from GetThrowSpeed()/GetThrowUpBias() alone
+	 * is now WRONG by up to the thrower's full speed, which on a sprinting carrier is ~40% of the
+	 * launch speed.
+	 */
+	static FVector ComputeThrowLaunchVelocity(const AActor* Thrower, const FVector& AimDirection);
+
+	/**
+	 * The last throw, broken into its parts. Diagnostics only (Trace.ModeB.ThrowMomentum).
+	 *
+	 * Recorded because "the core doesn't seem to keep momentum" is a claim about a launch velocity, and
+	 * the only honest answer to it is the three numbers that make one up. A single "launch speed" in
+	 * the log cannot distinguish a throw that inherited nothing from one that inherited a velocity
+	 * pointing backwards.
+	 */
+	struct FThrowMomentumSample
+	{
+		bool bValid = false;
+		/** Speed of the impulse alone: throw speed plus the up bias, before inheritance. */
+		float ImpulseSpeed = 0.f;
+		/** Magnitude of the inherited term. */
+		float InheritedSpeed = 0.f;
+		/** Magnitude of the sum, i.e. what actually left the hand. */
+		float LaunchSpeed = 0.f;
+		/** The thrower's velocity at the instant of release, split so a jump is visible as a jump. */
+		float ThrowerSpeed2D = 0.f;
+		float ThrowerVelocityZ = 0.f;
+		bool bThrowerFalling = false;
+		/** Z of the launch velocity, which is the number the user is watching on a jumping throw. */
+		float LaunchVelocityZ = 0.f;
+		float Inheritance = 0.f;
+		FString ThrowerName;
+	};
+
+	static FThrowMomentumSample LastThrow;
+
+	/**
+	 * Server, diagnostics only (Trace.ModeB.MomentumTest). Three throws by the current holder — at a
+	 * dead stop, at a full run, and airborne with a jump's vertical velocity — printed with their
+	 * pre-v8 baselines beside them.
+	 *
+	 * Exists because the three numbers the note is about cannot be arranged on cue in a live match:
+	 * a bot happens to throw while running, essentially never throws at the top of a jump, and never
+	 * throws standing still at all. It WRITES THE THROWER'S VELOCITY and then calls the shipping
+	 * ThrowFromHolder, so what is measured is the real launch and not a re-derivation of it.
+	 *
+	 * It mutates a pawn's velocity, so it must not be run alongside a harness that is also driving
+	 * pawns (-TraceTripTest).
+	 */
+	void RunThrowMomentumTest();
+
 	// --- Pass input ------------------------------------------------------------------------------
 
 	/**
@@ -843,6 +930,37 @@ private:
 
 	/** Server. Runs the Trace.ModeB.Verify scenario, one step at a time. See the .cpp. */
 	void TickModeBVerification();
+
+	/**
+	 * EVERY MACHINE, diagnostics only (Trace.ModeB.FlightLog). Logs this machine's own view of the
+	 * loose Core at 10 Hz. Deliberately not authority-gated — see spec v8 §0.
+	 */
+	void TickFlightLog();
+
+	/**
+	 * Server. Is a JOINING CLIENT's pawn live in this match right now?
+	 *
+	 * The §0 gate for the momentum measurement. Asks for a possessed pawn rather than merely a
+	 * connection, because a connection exists well before the client has a character to throw with —
+	 * and a measurement taken in that window is a host-side measurement wearing a client's name.
+	 */
+	bool HasRemoteClientPawn() const;
+
+	/** Throttle for TickFlightLog. Local to each machine; nothing about it is replicated. */
+	float NextFlightLogTime = 0.f;
+	bool bFlightLogWasLoose = false;
+
+	/**
+	 * The momentum measurement has already run once.
+	 *
+	 * A LATCH, not a re-read of the CVar, and the difference was a measured bug: the arming CVar is
+	 * set from -ExecCmds, i.e. at ECVF_SetByConsole, and a later Set(0, ECVF_SetByCode) from inside
+	 * the game is SILENTLY IGNORED because console-priority beats code-priority. The disarm never
+	 * took, and the test re-fired every tick for the rest of the match — 48 runs instead of 1, with
+	 * the Core being thrown out of every possession. Anything that disarms itself has to do it with
+	 * state it owns.
+	 */
+	bool bMomentumTestRun = false;
 
 	/**
 	 * Called when the observed scoring mode changes. Normalises anything the new mode cannot

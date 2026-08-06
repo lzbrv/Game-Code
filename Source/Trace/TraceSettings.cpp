@@ -789,7 +789,7 @@ namespace
 			{ TEXT("SlideDuration"),                   EKnobType::Float, TEXT("ability duration") },
 			{ TEXT("SlideCooldownSeconds"),            EKnobType::Float, TEXT("HIDDEN cooldown - do not draw it") },
 			{ TEXT("SlideJumpWindowSeconds"),          EKnobType::Float, TEXT("well-timed window") },
-			{ TEXT("SlideJumpWindowSpeedBonus"),       EKnobType::Float, TEXT("well-timed speed multiplier") },
+			{ TEXT("SlideJumpWindowSpeedBonus"),       EKnobType::Float, TEXT("well-timed speed multiplier - v8 §8: 1.25 -> 1.3125") },
 			{ TEXT("SlideJumpWindowZBonus"),           EKnobType::Float, TEXT("well-timed height multiplier [by-name bind]") },
 
 			// --- spec v5 §7, mantle  [ALL BOUND BY NAME by the CMC] -----------------------------
@@ -843,6 +843,37 @@ namespace
 			{ TEXT("DashExitVerticalSpeedMultiplier"), EKnobType::Float, TEXT("v7 §5: climb ceiling on a vertical dash") },
 			// §1 fallout: the bots' tail filter changed units from seconds-of-life to uu-from-tail.
 			{ TEXT("BotTrailMinPointLifeRemaining"),   EKnobType::Float, TEXT("v7 §1: now x WalkSpeed = uu skipped from the tail") },
+
+			// --- spec v8, every knob this pass introduced or moved -----------------------------
+			//
+			// §7 the wall jump. ALL SEVEN are resolved by name by the CMC through TraceMoveKnob, so
+			// a rename in TraceSettings.h does not fail to compile — it silently reverts the whole
+			// mechanic to the built-in fallback and the ini stops driving it. That is precisely the
+			// failure this table exists to make loud, and it is why a brand-new mechanic's knobs are
+			// listed here on the pass that introduces them rather than the pass after.
+			{ TEXT("bWallJumpEnabled"),                EKnobType::Bool,  TEXT("v8 §7: wall jump master switch [by-name bind]") },
+			{ TEXT("WallJumpWindowSeconds"),           EKnobType::Float, TEXT("v8 §7: contact window, the reaction input [by-name bind]") },
+			{ TEXT("WallJumpSpeedRetention"),          EKnobType::Float, TEXT("v8 §7: THE request - carry, not reset [by-name bind]") },
+			{ TEXT("WallJumpOutwardImpulse"),          EKnobType::Float, TEXT("v8 §7: floor for a glancing wall jump [by-name bind]") },
+			{ TEXT("WallJumpVerticalMultiplier"),      EKnobType::Float, TEXT("v8 §7: vertical, x JumpZVelocity [by-name bind]") },
+			{ TEXT("WallJumpMaxConsecutive"),          EKnobType::Int,   TEXT("v8 §7: THE anti-ladder cap [by-name bind]") },
+			{ TEXT("WallJumpMaxNormalZ"),              EKnobType::Float, TEXT("v8 §7: wall vs ramp [by-name bind]") },
+
+			// §4 the thrown Core inherits the thrower's velocity. Bound BY NAME by ATraceCore like
+			// the rest of that block, and its own binding check names it out loud when it misses.
+			{ TEXT("CoreThrowVelocityInheritance"),    EKnobType::Float, TEXT("v8 §4: launch = impulse + thrower velocity x this [by-name bind]") },
+
+			// §3 the parry window. Not new, but it MOVED this pass (0.10 -> 0.20) and it is the one
+			// number the whole mechanic is, so it is worth a line that proves the ini still drives it.
+			{ TEXT("ParryDuration"),                   EKnobType::Float, TEXT("v8 §3: 0.10 -> 0.20, THE parry") },
+
+			// §8 the slide-jump bonus moved 1.25 -> 1.3125, but it is ALREADY in this table under the
+			// spec v5 §3 block above — a second row would double-count it in the bound/dead summary,
+			// so the change is recorded there in the note rather than repeated here.
+
+			// §5 the carrier's second dash charge. The spec's first suspect was "CarrierExtraDashCharges
+			// may be 0 in the ini, which WINS over the header default", so the value is worth printing.
+			{ TEXT("CarrierExtraDashCharges"),         EKnobType::Int,   TEXT("v8 §5: the carrier's 2nd charge - must read 1") },
 		};
 
 		const UTraceSettings& Table = UTraceSettings::Get();

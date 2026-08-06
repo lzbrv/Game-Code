@@ -30,6 +30,8 @@
 #if !UE_BUILD_SHIPPING
 #include "Components/StaticMeshComponent.h"    // ledge test: the block it builds for itself
 #include "Engine/Engine.h"
+#include "EngineUtils.h"                       // TActorIterator, for the spec v8 §5 carrier harness
+#include "Gameplay/TraceCore.h"                // spec v8 §5: the real pickup funnel, ATraceCore::TryPickup
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
 #include "GameFramework/PlayerController.h"    // measurement harness: player-controlled check
@@ -118,6 +120,18 @@ namespace TraceMoveKnob
 			if (const FDoubleProperty* AsDouble = CastField<FDoubleProperty>(Property))
 			{
 				return static_cast<float>(AsDouble->GetPropertyValue_InContainer(&UTraceSettings::Get()));
+			}
+		}
+		return Default;
+	}
+
+	static int32 Int(const FName Name, const int32 Default)
+	{
+		if (const FProperty* Property = Resolve(Name))
+		{
+			if (const FIntProperty* AsInt = CastField<FIntProperty>(Property))
+			{
+				return AsInt->GetPropertyValue_InContainer(&UTraceSettings::Get());
 			}
 		}
 		return Default;
@@ -243,6 +257,15 @@ static bool IsMantleDebugEnabled()
 
 /** Mantles observed process-wide, so a headless run can answer "did it ever fire" with a count. */
 static int32 GTraceMantleCount = 0;
+
+/**
+ * Forward declaration. IsDashPoolDebugEnabled() is defined further down, next to the dash-charge
+ * pool it reports on, but it is first CALLED from the movement-update path well above that point.
+ * C++ needs the declaration before the call; without it the translation unit fails outright with
+ * "use of undeclared identifier", which takes the whole module — and every agent's run rig — with it.
+ * Same shape as IsDashDebugEnabled() / IsMantleDebugEnabled() above.
+ */
+static bool IsDashPoolDebugEnabled();
 #endif
 
 // -------------------------------------------------------------------------------------------
@@ -279,6 +302,12 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	MantleUpTargetZ = 0.f;
 	MantleEntrySpeed = 0.f;
 	MantleCooldownRemaining = 0.f;
+
+	// Spec v8 §7. Saved-move state like everything above it.
+	WallJumpNormal = FVector::ZeroVector;
+	WallJumpWindowRemaining = 0.f;
+	WallJumpEntryVelocity = FVector::ZeroVector;
+	WallJumpsSinceGround = 0;
 
 #if !UE_BUILD_SHIPPING
 	bLedgeTestWasGrounded = 0;
@@ -376,6 +405,10 @@ void UTraceCharacterMovementComponent::BeginPlay()
 	LastMaxDashCharges = GetMaxDashCharges();
 	DashCharges = LastMaxDashCharges;
 	DashRechargeRemaining = 0.f;
+
+	// Spec v8 §7 needs ACharacter::JumpMaxCount raised before the first move, not after it — see the
+	// note in RefreshEngineTunablesFromSettings, which keeps it live from then on.
+	RefreshEngineTunablesFromSettings();
 
 #if !UE_BUILD_SHIPPING
 	// One line, once per process, naming every number the kit will actually run on. A measurement
@@ -814,6 +847,90 @@ void UTraceCharacterMovementComponent::RefreshEngineTunablesFromSettings()
 	{
 		FallingLateralFriction = DesiredAirFriction;
 	}
+
+	// --- SPEC v8 §7: BUY THE QUESTION, NOT THE JUMP ----------------------------------------------
+	//
+	// ACharacter::CheckJumpInput will not call DoJump() at all once JumpCurrentCount has reached
+	// JumpMaxCount, and stepping off a ledge or jumping once already spends the only count there is.
+	// With the stock JumpMaxCount of 1 the wall jump was unreachable no matter what DoJump did — the
+	// engine simply never asked.
+	//
+	// So the count is raised to 1 + WallJumpMaxConsecutive. That does NOT grant a double jump:
+	// DoJump() returns false for every mid-air press that is not a genuine wall jump, and a refused
+	// DoJump leaves JumpCurrentCount exactly where it was. What the extra counts buy is the engine
+	// asking us the question on each press; TryWallJump() answers it.
+	//
+	// Prediction-safe: JumpMaxCount is already saved-move state (FSavedMove_Character captures and
+	// restores it), both ends derive the same number from the same config, and this runs once per
+	// simulated move on every machine, exactly like the two engine fields above.
+	if (CharacterOwner != nullptr)
+	{
+		const int32 DesiredJumpMaxCount = IsWallJumpEnabled() ? (1 + GetWallJumpMaxConsecutive()) : 1;
+		if (CharacterOwner->JumpMaxCount != DesiredJumpMaxCount)
+		{
+			CharacterOwner->JumpMaxCount = DesiredJumpMaxCount;
+		}
+	}
+}
+
+// --- Wall-jump tuning (spec v8 §7) --------------------------------------------------------------
+//
+// Name-bound against UTraceSettings for the reason the spec v5 knobs are: the UPROPERTYs live in a
+// file this slice does not own. Every default below is the shipped value, and BeginPlay's MOVEKNOB
+// report says BOUND or FALLBACK for each one so a missing property can never be silent.
+
+bool UTraceCharacterMovementComponent::IsWallJumpEnabled() const
+{
+	return TraceMoveKnob::Bool(TEXT("bWallJumpEnabled"), true);
+}
+
+float UTraceCharacterMovementComponent::GetWallJumpWindowSeconds() const
+{
+	// "press jump right as they hit a wall". 0.25s is about four frames of slack at 60Hz plus the
+	// human reaction floor — long enough to be hittable, short enough that it is a reaction to the
+	// contact rather than a state you live in. Clamped so a bad ini cannot make it permanent.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpWindowSeconds"), 0.25f), 0.f, 1.f);
+}
+
+float UTraceCharacterMovementComponent::GetWallJumpSpeedRetention() const
+{
+	// The "carry momentum in a new direction" dial. 0.95 rather than 1.0 so a wall is very slightly
+	// lossy — otherwise a corridor is a frictionless pinball table — but nowhere near the reset the
+	// request is complaining about. Capped at 1: a wall must never MANUFACTURE speed, which is the
+	// same rule spec v4 §1 imposed on the slide.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpSpeedRetention"), 0.95f), 0.f, 1.f);
+}
+
+float UTraceCharacterMovementComponent::GetWallJumpOutwardImpulse() const
+{
+	// Flat push along the normal, on top of the reflection. Without it a player who slid down a wall
+	// with almost no planar speed would wall-jump straight back into the wall on the next frame and
+	// the mechanic would read as broken; with it, even a standing wall jump clears the face.
+	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("WallJumpOutwardImpulse"), 420.f));
+}
+
+float UTraceCharacterMovementComponent::GetWallJumpVerticalMultiplier() const
+{
+	// A multiple of JumpZVelocity, like every other vertical launch in the kit (see
+	// GetDashExitVerticalSpeedLimit). 1.05 makes a wall jump read as very slightly stronger than a
+	// standing jump, which is what sells it as a distinct move.
+	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("WallJumpVerticalMultiplier"), 1.05f));
+}
+
+int32 UTraceCharacterMovementComponent::GetWallJumpMaxConsecutive() const
+{
+	// THE ANTI-LADDER CAP. Two parallel walls three metres apart are an infinite staircase without it.
+	// Floored at 1 (a cap of zero would be "the feature is off", which is what bWallJumpEnabled is
+	// for) and ceilinged at 4 so that the JumpMaxCount this drives stays sane.
+	return FMath::Clamp(TraceMoveKnob::Int(TEXT("WallJumpMaxConsecutive"), 2), 1, 4);
+}
+
+float UTraceCharacterMovementComponent::GetWallJumpMaxNormalZ() const
+{
+	// |Normal.Z| below this is a wall. GetWalkableFloorZ() is 0.71 at the default 45 degrees, so 0.4
+	// leaves a clear band between "wall" and "slope you could have walked up" and stops a ramp from
+	// being a trampoline.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpMaxNormalZ"), 0.4f), 0.f, 0.9f);
 }
 
 int32 UTraceCharacterMovementComponent::GetMaxDashCharges() const
@@ -1322,6 +1439,29 @@ void UTraceCharacterMovementComponent::BeginDash()
 	DashDirection = Direction;
 	DashTimeRemaining = GetDashDuration();
 
+#if !UE_BUILD_SHIPPING
+	// SPEC v8 §1, THE MEASUREMENT. "Dash feels rubber bandy" is a claim about the correction rate
+	// DURING a dash, and the previous pass answered it with a whole-session count taken on the HOST,
+	// where corrections cannot happen by construction. Attributing each correction to the dash it
+	// landed inside turns that into a RATE that can only be read on a client.
+	//
+	// bClientUpdating gates it because a REPLAYED dash is the same dash, not a new one: without this
+	// every correction would inflate the denominator it is supposed to be measured against, and the
+	// rate would fall towards 1 no matter how bad the prediction was.
+	if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating && CharacterOwner->IsLocallyControlled())
+	{
+		++DashNetDashCount;
+
+		// The window runs past the dash itself: a correction for a dash frame arrives one round trip
+		// LATER, so closing the window at the dash's end would miss exactly the corrections this
+		// item is about. Duration + 0.5 s covers a 250 ms round trip with room to spare.
+		const UWorld* DashWorld = GetWorld();
+		DashNetAttributionUntil = (DashWorld != nullptr)
+			? static_cast<float>(DashWorld->GetTimeSeconds()) + GetDashDuration() + 0.5f
+			: -1000.f;
+	}
+#endif
+
 	// Spend a charge and make sure the refill clock is running. Only START it if it is idle: a
 	// carrier who spends both charges in quick succession must wait out two sequential windows, not
 	// have the first charge's progress thrown away by the second spend.
@@ -1702,6 +1842,206 @@ bool UTraceCharacterMovementComponent::IsSlideJumpWellTimed() const
 	return IsSliding() ? (GetSlideTimeLeft() <= Window) : (bSlideJumpGraceWellTimed != 0);
 }
 
+// --- The wall jump (spec v8 §7) -----------------------------------------------------------------
+
+void UTraceCharacterMovementComponent::HandleImpact(const FHitResult& Hit, float TimeSlice, const FVector& MoveDelta)
+{
+	Super::HandleImpact(Hit, TimeSlice, MoveDelta);
+
+	if (!IsWallJumpEnabled() || CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	// AIRBORNE ONLY. Running into a wall on the ground already has an answer — jump — and recording
+	// the contact there would let a player walk up to a wall, step off a ledge and wall-jump off a
+	// face they were never airborne against.
+	//
+	// The mantle owns the pawn outright while it runs, exactly as it does for the dash.
+	if (!IsFalling() || MantleTimeRemaining > 0.f || MovementMode == MOVE_None)
+	{
+		return;
+	}
+
+	if (!Hit.bBlockingHit)
+	{
+		return;
+	}
+
+	// A WALL, not a ramp. PhysFalling has already refused this hit as a landing spot, but "not a
+	// landing spot" includes ceilings and steep-but-walkable-adjacent geometry; the explicit test is
+	// what keeps the mechanic to vertical faces and off anything the player could have walked up.
+	const FVector Normal = Hit.ImpactNormal;
+	if (FMath::Abs(Normal.Z) > GetWallJumpMaxNormalZ())
+	{
+		return;
+	}
+
+	FVector PlanarNormal(Normal.X, Normal.Y, 0.f);
+	if (!PlanarNormal.Normalize())
+	{
+		return;
+	}
+
+	// Latch the face and open the window. Overwriting an older normal is deliberate: the wall you are
+	// touching NOW is the one a jump should launch off, and in a corner that is the last one hit.
+	WallJumpNormal = PlanarNormal;
+	WallJumpWindowRemaining = GetWallJumpWindowSeconds();
+
+	// AND THE MOMENTUM, WHICH ONLY EXISTS HERE. See the header on WallJumpEntryVelocity: measured on a
+	// client, a head-on approach reads entry=0 by the time the jump is pressed, because PhysFalling
+	// re-derives Velocity from the distance the capsule actually moved and a pawn stopped by a wall
+	// moved nothing. Without this capture the "preserve and redirect momentum" of spec v8 §7 is a
+	// 420 uu/s nudge and nothing else. Captured planar; the vertical component is the wall jump's own
+	// number.
+	//
+	// Take the FASTER of this frame's velocity and whatever the window already holds: the engine can
+	// deliver two HandleImpact calls for one collision (the sweep, then the slide's re-sweep), and the
+	// second arrives with the speed already scrubbed off.
+	const FVector PlanarEntry(Velocity.X, Velocity.Y, 0.f);
+	if (WallJumpEntryVelocity.IsNearlyZero() || PlanarEntry.SizeSquared() > WallJumpEntryVelocity.SizeSquared())
+	{
+		WallJumpEntryVelocity = PlanarEntry;
+	}
+}
+
+bool UTraceCharacterMovementComponent::IsWallJumpAvailable() const
+{
+	return IsWallJumpEnabled()
+		&& MovementMode != MOVE_None
+		&& IsFalling()
+		&& MantleTimeRemaining <= 0.f
+		&& WallJumpWindowRemaining > 0.f
+		&& !WallJumpNormal.IsNearlyZero()
+		&& WallJumpsSinceGround < GetWallJumpMaxConsecutive();
+}
+
+bool UTraceCharacterMovementComponent::TryWallJump()
+{
+	if (!IsWallJumpAvailable())
+	{
+		return false;
+	}
+
+	const FVector Normal = WallJumpNormal;
+
+	// --- REDIRECT, DO NOT RESET -------------------------------------------------------------------
+	//
+	// Reflect ONLY the component that was travelling into the wall. A head-on approach comes straight
+	// back, a glancing one glances off, and a pawn already moving away from the face (a corner, or a
+	// frame where the collision response has already pushed it out) keeps its vector untouched rather
+	// than being fired back into the geometry it just escaped.
+	// THE APPROACH VELOCITY, NOT THE POST-COLLISION ONE. WallJumpEntryVelocity is what the pawn was
+	// carrying on the frame it touched the wall; Velocity by now is what survived the collision, which
+	// for a head-on hit is nothing at all (measured: entry=0 uu/s on a client, every jump). Falling
+	// back to the live velocity keeps a window that somehow opened without a capture working.
+	FVector Planar = WallJumpEntryVelocity;
+	Planar.Z = 0.f;
+	if (Planar.IsNearlyZero())
+	{
+		Planar = FVector(Velocity.X, Velocity.Y, 0.f);
+	}
+	const float EntrySpeed = Planar.Size();
+
+	// Captured before the reflection mutates Planar. Measurement only (spec v8 §7's "in a new
+	// direction" is an angle), but it costs one normalise and keeps the maths honest.
+	const FVector EntryPlanarDirection = Planar.GetSafeNormal();
+	const float IntoWall = FVector::DotProduct(Planar, Normal);
+	if (IntoWall < 0.f)
+	{
+		Planar -= 2.f * IntoWall * Normal;
+	}
+
+	// The reflection is a rotation, so it preserves magnitude exactly; the retention is the only place
+	// speed is allowed to change, and it can only ever remove.
+	FVector LaunchDirection = Planar;
+	if (!LaunchDirection.Normalize())
+	{
+		// Pressed flat against the wall with no planar speed at all. The outward impulse below is the
+		// whole launch in that case, which is what makes a standing wall jump an escape rather than a
+		// wasted press.
+		LaunchDirection = Normal;
+	}
+
+	FVector Launch = LaunchDirection * (EntrySpeed * GetWallJumpSpeedRetention()) + Normal * GetWallJumpOutwardImpulse();
+
+	// --- AND IT MAY NOT BEAT THE AIR-STRAFE CEILING (spec v5 §1) ----------------------------------
+	//
+	// Same shape as the clamp at the end of ApplySourceAirAcceleration, and for the same reason: the
+	// ceiling exists to stop speed being BUILT in the air, not to brake speed that was carried into
+	// it. So the cap is floored at the speed the pawn arrived with — a wall jump keeps every unit it
+	// was already carrying, and can never add past the hard cap. Without this the outward impulse
+	// would be a free, repeatable +420 uu/s that the whole of spec v5 §1 was written to prevent.
+	if (IsAirStrafeHardCapEnabled())
+	{
+		const float Ceiling = FMath::Max(EntrySpeed, GetAirStrafeHardCapSpeed());
+		const float LaunchSpeed = Launch.Size();
+		if (LaunchSpeed > Ceiling && LaunchSpeed > UE_KINDA_SMALL_NUMBER)
+		{
+			Launch *= (Ceiling / LaunchSpeed);
+		}
+	}
+
+	Velocity.X = Launch.X;
+	Velocity.Y = Launch.Y;
+
+	// Super::DoJump has already set Z to at least JumpZVelocity and switched to MOVE_Falling. Assign
+	// rather than scale: the wall jump's vertical component is its own number (a multiple of the
+	// jump, like every other launch here), not a modifier on whatever the fall had left.
+	Velocity.Z = JumpZVelocity * GetWallJumpVerticalMultiplier();
+
+	// One jump per contact, and one step up the ladder. The window is closed rather than left to
+	// expire so that a second press inside the same window cannot double-dip off one wall.
+	WallJumpWindowRemaining = 0.f;
+	WallJumpNormal = FVector::ZeroVector;
+	WallJumpEntryVelocity = FVector::ZeroVector;
+	++WallJumpsSinceGround;
+
+#if !UE_BUILD_SHIPPING
+	// SPEC v8 §7, THE MEASUREMENT. Counted on the RECORD pass only, for BeginDash()'s reason: a
+	// replayed wall jump is the same wall jump, and counting it again would inflate the denominator
+	// that "corrections per wall jump" is measured against.
+	if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating && CharacterOwner->IsLocallyControlled())
+	{
+		const FVector LaunchPlanar(Velocity.X, Velocity.Y, 0.f);
+		const float LaunchSpeed = static_cast<float>(LaunchPlanar.Size());
+
+		++WallJumpCount;
+		WallJumpEntrySpeedSum += EntrySpeed;
+		WallJumpLaunchSpeedSum += LaunchSpeed;
+		WallJumpLaunchZSum += static_cast<float>(Velocity.Z);
+		WallJumpMaxConsecutiveSeen = FMath::Max(WallJumpMaxConsecutiveSeen, WallJumpsSinceGround);
+
+		// "In a NEW direction" is an angle, so measure the angle between the approach and the launch.
+		if (!EntryPlanarDirection.IsNearlyZero() && LaunchSpeed > 1.f)
+		{
+			const float Cosine = FMath::Clamp(
+				static_cast<float>(FVector::DotProduct(EntryPlanarDirection, LaunchPlanar.GetSafeNormal())),
+				-1.f, 1.f);
+			WallJumpTurnDegreesSum += FMath::RadiansToDegrees(FMath::Acos(Cosine));
+		}
+
+		const UWorld* WallJumpWorld = GetWorld();
+		WallJumpAttributionUntil = (WallJumpWorld != nullptr)
+			? static_cast<float>(WallJumpWorld->GetTimeSeconds()) + 0.75f
+			: -1000.f;
+	}
+
+	if (IsDashDebugEnabled() && CharacterOwner != nullptr)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("WALLJUMP %-16s normal=(%6.3f,%6.3f) entry=%6.0f -> launch=%6.0f uu/s (retain=%.2f "
+			     "outward=%.0f) velZ=%6.0f consecutive=%d/%d role=%d"),
+			*GetNameSafe(CharacterOwner), Normal.X, Normal.Y, EntrySpeed, GetPlanarSpeed(),
+			GetWallJumpSpeedRetention(), GetWallJumpOutwardImpulse(), Velocity.Z,
+			WallJumpsSinceGround, GetWallJumpMaxConsecutive(),
+			static_cast<int32>(CharacterOwner->GetLocalRole()));
+	}
+#endif
+
+	return true;
+}
+
 bool UTraceCharacterMovementComponent::CanAttemptJump() const
 {
 	// Super, MINUS the "!bWantsToCrouch" clause. See the header: crouch is the slide key here and
@@ -1723,6 +2063,13 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 	// Capture BEFORE anything is touched: EndSlide() below rewrites every one of these.
 	const bool bSlideJump = IsSlideJumpAvailable();
 	const bool bWellTimed = IsSlideJumpWellTimed();
+
+	// SPEC v8 §7. BOTH OF THESE MUST BE READ BEFORE Super::DoJump, and the first one is a trap worth
+	// naming: Super calls SetMovementMode(MOVE_Falling), so IsFalling() is TRUE after it even for an
+	// ordinary jump off the floor. Asking afterwards would route every ground jump into the wall-jump
+	// branch and refuse it — i.e. it would delete the jump key.
+	const bool bWasAirborneBeforeJump = IsFalling();
+	const FVector PreJumpVelocity = Velocity;
 
 	// The speed the jump is entitled to carry. Mid-slide that is the slide's own live speed — which is
 	// also what Velocity is, because OnMovementUpdated re-asserts it every frame — and during the
@@ -1758,6 +2105,48 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 
 	if (!bSlideJump)
 	{
+		// SPEC v8 §7. An airborne press that is not a slide-jump is the wall jump's only entry point.
+		//
+		// ORDER MATTERS AND THE SLIDE-JUMP WINS. A jump taken inside the slide-jump's coyote window is
+		// still a slide-jump even with a wall window open, so nothing about spec v4 §1 or v5 §3 changes
+		// behaviour — the wall jump only ever sees presses the slide had no claim on.
+		//
+		// TryWallJump() refuses (and leaves Velocity exactly as Super left it) whenever the pawn is
+		// grounded, past the consecutive cap, or outside the contact window. That refusal is what stops
+		// the raised JumpMaxCount from being a double jump: Super has already written
+		// Velocity.Z = max(Z, JumpZVelocity), which is a legitimate mid-air jump — so a refusal here
+		// has to un-ask the whole thing, which is exactly what returning false does. ACharacter::
+		// CheckJumpInput does not increment JumpCurrentCount for a DoJump that returned false.
+		if (bWasAirborneBeforeJump && IsWallJumpEnabled())
+		{
+#if !UE_BUILD_SHIPPING
+			// SPEC v8 §7, the anti-ladder cap, counted. A press that had a live wall under it and was
+			// refused ONLY by the consecutive cap is the thing that stops two walls being an infinite
+			// staircase, so it is worth its own number rather than being invisible inside "refused".
+			const bool bCapRefusal = WallJumpWindowRemaining > 0.f
+				&& !WallJumpNormal.IsNearlyZero()
+				&& WallJumpsSinceGround >= GetWallJumpMaxConsecutive()
+				&& CharacterOwner != nullptr && !CharacterOwner->bClientUpdating
+				&& CharacterOwner->IsLocallyControlled();
+			if (bCapRefusal)
+			{
+				++WallJumpCapRefusals;
+			}
+#endif
+
+			if (TryWallJump())
+			{
+				return true;
+			}
+
+			// Not a wall jump. Undo Super's vertical launch and refuse — otherwise every mid-air press
+			// would be a free jump, because the extra JumpMaxCount exists only to let the engine ask.
+			// The pawn was already airborne, so Super's SetMovementMode(MOVE_Falling) was a no-op and
+			// the velocity is the only thing to put back.
+			Velocity = PreJumpVelocity;
+			return false;
+		}
+
 		return true;
 	}
 
@@ -2402,6 +2791,27 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		GroundGraceRemaining = FMath::Max(0.f, GroundGraceRemaining - DeltaSeconds);
 	}
 
+	// 1a-iii. THE WALL-JUMP CONTACT WINDOW (spec v8 §7). Ticked here with every other clock so a
+	//         replayed move advances it by exactly the amount the original did, and cleared on the
+	//         frame it expires so IsWallJumpAvailable() never has to re-test the normal's age.
+	//
+	//         THE LADDER CAP IS RESET BY THE GROUND, and through IsGroundedForAbilities() like every
+	//         other ground test in this function — a one-frame contact blip on a ledge lip must not
+	//         refill a player's wall jumps on one machine and not the other.
+	if (WallJumpWindowRemaining > 0.f)
+	{
+		WallJumpWindowRemaining = FMath::Max(0.f, WallJumpWindowRemaining - DeltaSeconds);
+		if (WallJumpWindowRemaining <= 0.f)
+		{
+			WallJumpNormal = FVector::ZeroVector;
+			WallJumpEntryVelocity = FVector::ZeroVector;
+		}
+	}
+	if (IsGroundedForAbilities() && WallJumpsSinceGround != 0)
+	{
+		WallJumpsSinceGround = 0;
+	}
+
 	// 1a-ii. THE MANTLE CLOCK. Advanced before the activations below, like every other ability, so a
 	//        pull-up that finishes this frame stops driving velocity this frame.
 	if (MantleCooldownRemaining > 0.f)
@@ -2689,9 +3099,42 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	bWasAirborneLastMove = (MovementMode != MOVE_None && !IsGroundedForAbilities()) ? 1 : 0;
 
 #if !UE_BUILD_SHIPPING
+	// SPEC v8 §5 — THE LIVE CHARGE COUNTS, ON WHICHEVER MACHINE IS RUNNING THIS PAWN.
+	//
+	// Not on a replayed move: a correction replays several moves in one frame and would print the same
+	// second several times with rewound counts, which reads as the pool flickering when it is not.
+	if (IsDashPoolDebugEnabled() && CharacterOwner != nullptr && !CharacterOwner->bClientUpdating)
+	{
+		if (const UWorld* PoolWorld = GetWorld())
+		{
+			const float Now = static_cast<float>(PoolWorld->GetTimeSeconds());
+			if (Now >= DashPoolDebugNextLogTime)
+			{
+				DashPoolDebugNextLogTime = Now + 1.f;
+
+				const ATraceCharacter* PoolCharacter = Cast<ATraceCharacter>(CharacterOwner);
+				const UTraceSettings& PoolSettings = UTraceSettings::Get();
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("DASHPOOL %-16s netMode=%d role=%d local=%d carrier=%d | charges=%d/%d lastMax=%d "
+					     "refill=%5.2f dashLeft=%5.2f | cfg base=%d carrierExtra=%d window=%.2f"),
+					*GetNameSafe(CharacterOwner), static_cast<int32>(GetNetMode()),
+					static_cast<int32>(CharacterOwner->GetLocalRole()),
+					CharacterOwner->IsLocallyControlled() ? 1 : 0,
+					(PoolCharacter != nullptr && PoolCharacter->IsCarrier()) ? 1 : 0,
+					DashCharges, GetMaxDashCharges(), LastMaxDashCharges,
+					DashRechargeRemaining, DashTimeRemaining,
+					PoolSettings.BaseDashCharges, PoolSettings.CarrierExtraDashCharges,
+					GetDashRechargeWindow());
+			}
+		}
+	}
+
 	TickMomentumMeasure(DeltaSeconds);
 	TickLedgeTest(DeltaSeconds);
 	TickDashPitchTest(DeltaSeconds);
+	TickWallJumpTest(DeltaSeconds);
+	TickCarrierChargeTest(DeltaSeconds);
 #endif
 }
 
@@ -2777,6 +3220,59 @@ static FAutoConsoleVariableRef CVarTraceMoveKitFakeCarrier(
 	TEXT("Dev only. Non-zero pretends this pawn is carrying the Core for the purposes of the dash "
 	     "charge pool, so the carrier's extra charge can be exercised without a Core."),
 	ECVF_Cheat);
+
+/**
+ * SPEC v8 §1. The A/B switch for the dash-aim replay fix, so "before and after" is one build.
+ *
+ * 1 restores the spec v7 behaviour exactly: the replayed dash composes its direction from the base
+ * class's SavedControlRotation, which FSavedMove_Character::PostUpdate(PostUpdate_Replay) has already
+ * overwritten with the live mouse by the time a SECOND correction replays the same move. 0 (the
+ * default) uses FSavedMove_Trace::SavedDashAimRotation, which is recorded once and is immutable.
+ *
+ * A cvar rather than two builds because the measurement has to be corrections-per-dash on a CLIENT at
+ * 40ms, and two separately-built clients are two different populations of network jitter.
+ */
+/**
+ * How many times -TraceDashPitchTest walks its seven-phase list. See DashPitchTestCycle in the header:
+ * one lap is seven dashes, and seven dashes cannot separate a prediction change from an afternoon of
+ * machine load.
+ */
+int32 GTraceDashPitchTestCycles = 4;
+static FAutoConsoleVariableRef CVarTraceDashPitchTestCycles(
+	TEXT("Trace.DashPitchTestCycles"),
+	GTraceDashPitchTestCycles,
+	TEXT("Dev only. Laps of the -TraceDashPitchTest phase list. 7 dashes per lap; the default 4 gives 28."),
+	ECVF_Cheat);
+
+int32 GTraceDashLegacyAimReplay = 0;
+static FAutoConsoleVariableRef CVarTraceDashLegacyAimReplay(
+	TEXT("Trace.DashLegacyAimReplay"),
+	GTraceDashLegacyAimReplay,
+	TEXT("Dev only. 1 restores the spec v7 dash-replay aim source (the base class's SavedControlRotation, "
+	     "which the replay pass stomps) so the fix can be A/B'd against it in one build."),
+	ECVF_Cheat);
+
+/**
+ * Live charge-pool readout (spec v8 §5), once a second, per locally-controlled pawn.
+ *
+ * "The two dash charges aren't working anymore, for the carrier" is a claim about two integers, and
+ * the only place either of them is true or false is a running game — on a CLIENT, while carrying,
+ * where the carrier bit is replicated rather than authoritative. This prints both, plus the maximum
+ * the pool thinks it has and the settings that produced it.
+ */
+int32 GTraceDashPoolDebug = 0;
+static FAutoConsoleVariableRef CVarTraceDashPoolDebug(
+	TEXT("Trace.DashPoolDebug"),
+	GTraceDashPoolDebug,
+	TEXT("Dev only. Non-zero logs the live dash charge pool (charges / max / carrier bit / refill "
+	     "clock) once a second for every locally-controlled pawn."),
+	ECVF_Cheat);
+
+static bool IsDashPoolDebugEnabled()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceDashPoolDebug"));
+	return bFromCommandLine || GTraceDashPoolDebug != 0;
+}
 
 void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 {
@@ -3446,6 +3942,25 @@ void UTraceCharacterMovementComponent::OnClientCorrectionReceived(
 	CorrectionErrorTotal += PositionError;
 	CorrectionErrorWorst = FMath::Max(CorrectionErrorWorst, PositionError);
 
+	// SPEC v8 §1. Attribute this correction to a dash if one is live or recently ended. See
+	// BeginDash() for why the window outlives the dash and why replays do not count as new dashes.
+	const UWorld* CorrectionWorld = GetWorld();
+	const bool bInDashWindow = (CorrectionWorld != nullptr)
+		&& (static_cast<float>(CorrectionWorld->GetTimeSeconds()) <= DashNetAttributionUntil);
+	if (bInDashWindow)
+	{
+		++DashNetCorrectionsInDash;
+		DashNetCorrectionErrorInDash += PositionError;
+	}
+
+	// SPEC v8 §7. The same attribution for the wall jump: "fully client-predicted" is the claim, and a
+	// correction landing inside the launch window is what falsifies it.
+	if (CorrectionWorld != nullptr
+		&& static_cast<float>(CorrectionWorld->GetTimeSeconds()) <= WallJumpAttributionUntil)
+	{
+		++WallJumpCorrectionsInWindow;
+	}
+
 	if (AreMoveCorrectionsLogged())
 	{
 		UE_LOG(LogTraceGame, Display,
@@ -3455,6 +3970,15 @@ void UTraceCharacterMovementComponent::OnClientCorrectionReceived(
 			static_cast<int32>(LocalMode), static_cast<int32>(ServerMovementMode), Before.Z,
 			IsMovingOnGround() ? 1 : 0, GroundGraceRemaining, MantleTimeRemaining, SlideTimeRemaining,
 			CorrectionErrorTotal / FMath::Max(1, CorrectionCount), CorrectionErrorWorst);
+
+		// The v8 §1 line. Printed next to the correction it describes so "was this one a dash?" is
+		// answerable per correction rather than only in the summary.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("DASHNET   %-16s inDash=%d | dashes=%d corrInDash=%d rate=%.2f/dash meanDashErr=%.2fuu"),
+			*GetNameSafe(CharacterOwner), bInDashWindow ? 1 : 0, DashNetDashCount,
+			DashNetCorrectionsInDash,
+			DashNetCorrectionsInDash / static_cast<float>(FMath::Max(1, DashNetDashCount)),
+			DashNetCorrectionErrorInDash / static_cast<float>(FMath::Max(1, DashNetCorrectionsInDash)));
 	}
 
 	Super::OnClientCorrectionReceived(ClientData, TimeStamp, NewLocation, NewVelocity,
@@ -3950,7 +4474,30 @@ void UTraceCharacterMovementComponent::TickDashPitchTest(float DeltaSeconds)
 	// Aim. Held every frame: the pawn is under a PlayerController whose UpdateRotation would
 	// otherwise leave the rotation wherever the last frame put it, and the whole measurement is
 	// about pitch.
-	TestController->SetControlRotation(FRotator(Phase.Pitch, DashPitchTestYaw, 0.f));
+	//
+	// SPEC v8 §1 — AND WHY THE AIM MOVES AFTER THE DASH HAS LAUNCHED.
+	//
+	// The v7 version of this harness held the aim rigidly still for the whole phase, and that made the
+	// rubber-band it was supposed to catch INVISIBLE BY CONSTRUCTION. The legacy failure is that
+	// PostUpdate(PostUpdate_Replay) stomps the move's SavedControlRotation with the aim at CORRECTION
+	// time; if the aim has not moved since the dash was pressed, the stomped value equals the recorded
+	// one and the broken path and the fixed path produce identical numbers. A real player is still
+	// tracking a target while their dash is in the air, so the honest test is a moving aim.
+	//
+	// The sweep starts AFTER the launch frame (the dash direction is locked in BeginDash and must be
+	// composed from the phase's stated pitch, or the DASHPITCH rows below stop measuring spec v7 §5)
+	// and runs through the whole correction window, which is where the disagreement would land.
+	// Deterministic in phase time, so both A/B arms sweep identically.
+	const float AimSweepStart = FireAt + 0.08f;
+	float AimPitch = Phase.Pitch;
+	float AimYaw   = DashPitchTestYaw;
+	if (DashPitchTestPhaseTime > AimSweepStart)
+	{
+		const float SweepTime = DashPitchTestPhaseTime - AimSweepStart;
+		AimYaw   += 100.f * FMath::Sin(SweepTime * 6.0f);
+		AimPitch  = FMath::Clamp(Phase.Pitch - 55.f * FMath::Sin(SweepTime * 4.0f), -80.f, 85.f);
+	}
+	TestController->SetControlRotation(FRotator(AimPitch, AimYaw, 0.f));
 
 	// Hold the movement keys. Same basis ATraceCharacter::DoMove uses, so Acceleration arrives at
 	// BeginDash shaped exactly as a human's would be.
@@ -4011,7 +4558,28 @@ void UTraceCharacterMovementComponent::TickDashPitchTest(float DeltaSeconds)
 
 		if (DashPitchTestPhase >= NumPhases)
 		{
-			UE_LOG(LogTraceGame, Display, TEXT("DASHPITCH ---- end. %d phases."), NumPhases);
+			// Another lap, unless the requested number of laps is done. See DashPitchTestCycle: the
+			// corrections-per-dash figure this harness exists to produce is worthless at seven dashes.
+			++DashPitchTestCycle;
+			if (DashPitchTestCycle < FMath::Max(1, GTraceDashPitchTestCycles))
+			{
+				DashPitchTestPhase = 0;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("DASHPITCH ---- cycle %d of %d complete (%d dashes so far)."),
+					DashPitchTestCycle, FMath::Max(1, GTraceDashPitchTestCycles),
+					DashPitchTestCycle * NumPhases);
+				LogDashNetReport();
+				return;
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("DASHPITCH ---- end. %d phases x %d cycles."),
+				NumPhases, DashPitchTestCycle);
+
+			// SPEC v8 §1. The rubber-band number, printed by the harness that produced the dashes rather
+			// than left to a console command nobody can type into an offscreen -game process. On a
+			// listen host this reads 0.00 and means nothing (see TraceReportDashNet); on a JOINED CLIENT
+			// at 40 ms it is the answer to "does the dash rubber-band".
+			LogDashNetReport();
 		}
 	}
 }
@@ -4145,6 +4713,436 @@ static void TraceRunDashVectorTest()
 	Movement->RunDashVectorTest();
 }
 
+void UTraceCharacterMovementComponent::LogDashNetReport() const
+{
+	const UWorld* ReportWorld = GetWorld();
+
+	// netMode and role are printed because the whole point of this command is that the answer is only
+	// meaningful for ROLE_AutonomousProxy on a client. A reader who forgets that can see it in the
+	// line itself rather than having to remember which window they are in.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("DASHNET REPORT %-16s netMode=%d role=%d | dashes=%d corrections(all)=%d "
+		     "corrections(in dash)=%d => %.3f per dash | meanDashErr=%.2fuu "
+		     "meanAllErr=%.2fuu worstErr=%.2fuu%s"),
+		*GetNameSafe(CharacterOwner),
+		(ReportWorld != nullptr) ? static_cast<int32>(ReportWorld->GetNetMode()) : -1,
+		(CharacterOwner != nullptr) ? static_cast<int32>(CharacterOwner->GetLocalRole()) : -1,
+		DashNetDashCount, CorrectionCount, DashNetCorrectionsInDash,
+		DashNetCorrectionsInDash / static_cast<float>(FMath::Max(1, DashNetDashCount)),
+		DashNetCorrectionErrorInDash / static_cast<float>(FMath::Max(1, DashNetCorrectionsInDash)),
+		CorrectionErrorTotal / static_cast<float>(FMath::Max(1, CorrectionCount)),
+		CorrectionErrorWorst,
+		(CharacterOwner != nullptr && CharacterOwner->HasAuthority())
+			? TEXT("  [AUTHORITY - this number is meaningless here]") : TEXT(""));
+}
+
+void UTraceCharacterMovementComponent::LogWallJumpReport() const
+{
+	const UWorld* ReportWorld = GetWorld();
+	const float Denominator = static_cast<float>(FMath::Max(1, WallJumpCount));
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("WALLJUMP REPORT %-16s netMode=%d role=%d | jumps=%d entry=%6.0f -> launch=%6.0f uu/s "
+		     "(%.1f%% carried, turned %.1fdeg, launchZ=%6.0f) maxConsecutive=%d/%d capRefusals=%d "
+		     "corrections(in wall jump)=%d => %.3f per jump | hardCap=%.0f%s"),
+		*GetNameSafe(CharacterOwner),
+		(ReportWorld != nullptr) ? static_cast<int32>(ReportWorld->GetNetMode()) : -1,
+		(CharacterOwner != nullptr) ? static_cast<int32>(CharacterOwner->GetLocalRole()) : -1,
+		WallJumpCount,
+		WallJumpEntrySpeedSum / Denominator,
+		WallJumpLaunchSpeedSum / Denominator,
+		100.f * WallJumpLaunchSpeedSum / FMath::Max(1.f, WallJumpEntrySpeedSum),
+		WallJumpTurnDegreesSum / Denominator,
+		WallJumpLaunchZSum / Denominator,
+		WallJumpMaxConsecutiveSeen, GetWallJumpMaxConsecutive(), WallJumpCapRefusals,
+		WallJumpCorrectionsInWindow, WallJumpCorrectionsInWindow / Denominator,
+		GetAirStrafeHardCapSpeed(),
+		(CharacterOwner != nullptr && CharacterOwner->HasAuthority())
+			? TEXT("  [AUTHORITY - the correction column is meaningless here]") : TEXT(""));
+}
+
+/**
+ * SPEC v8 §7 — the wall jump driven from code, so it can be measured offscreen and ON A CLIENT.
+ *
+ * Runs the pawn at the nearest perimeter wall and presses jump through ACharacter::Jump() every frame
+ * IsWallJumpAvailable() is true. Jump() is the human entry point, so the press rides CheckJumpInput ->
+ * DoJump -> TryWallJump and the saved move exactly as a player's would; nothing here teleports, rotates
+ * or writes Velocity, so it cannot manufacture the desync it is measuring.
+ */
+void UTraceCharacterMovementComponent::TickWallJumpTest(float DeltaSeconds)
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("TraceWallJumpTest"));
+	if (!bEnabled || CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	APlayerController* TestController = Cast<APlayerController>(CharacterOwner->GetController());
+	if (TestController == nullptr || !CharacterOwner->IsLocallyControlled())
+	{
+		return;
+	}
+
+	// TickDashPitchTest's reason, verbatim: a replayed move must not advance a clock that fires input.
+	if (CharacterOwner->bClientUpdating)
+	{
+		return;
+	}
+
+	const UWorld* TestWorld = GetWorld();
+	if (TestWorld == nullptr)
+	{
+		return;
+	}
+
+	if (WallJumpTestTime < 0.f)
+	{
+		if (TestWorld->GetTimeSeconds() < 6.f || !IsMovingOnGround())
+		{
+			return;
+		}
+
+		// Straight at the nearer of the two long side walls. A perimeter wall is 4800uu from the
+		// centreline and its face is exactly vertical, which is the geometry the mechanic is for.
+		const FVector Here = UpdatedComponent->GetComponentLocation();
+		WallJumpTestYaw = (Here.Y >= 0.0) ? 90.f : -90.f;
+		WallJumpTestTime = 0.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("WALLJUMP ---- begin. netMode=%d role=%d at %s runYaw=%.0f window=%.2fs retain=%.2f "
+			     "outward=%.0f zMul=%.2f cap=%d"),
+			static_cast<int32>(GetNetMode()),
+			static_cast<int32>(CharacterOwner->GetLocalRole()), *Here.ToCompactString(), WallJumpTestYaw,
+			GetWallJumpWindowSeconds(), GetWallJumpSpeedRetention(), GetWallJumpOutwardImpulse(),
+			GetWallJumpVerticalMultiplier(), GetWallJumpMaxConsecutive());
+	}
+
+	WallJumpTestTime += DeltaSeconds;
+
+	// Hold the aim and the forward key at the wall for the whole run. Pressing INTO the wall is what
+	// makes the pawn re-contact it after a launch, which is the only way to reach the cap.
+	TestController->SetControlRotation(FRotator(0.f, WallJumpTestYaw, 0.f));
+	const FRotationMatrix YawBasis(FRotator(0.f, WallJumpTestYaw, 0.f));
+	CharacterOwner->AddMovementInput(YawBasis.GetUnitAxis(EAxis::X), 1.f);
+
+	// One press per open window. bPressedJump is consumed by CheckJumpInput on the same frame, and
+	// IsWallJumpAvailable() goes false the instant TryWallJump takes the window — so this cannot mash.
+	if (IsWallJumpAvailable())
+	{
+		CharacterOwner->Jump();
+	}
+	else if (IsMovingOnGround() && WallJumpTestTime > 1.f && GetPlanarSpeed() > 300.f)
+	{
+		// Grounded against the wall: the mechanic is airborne-only, so get airborne. An ordinary jump.
+		CharacterOwner->Jump();
+	}
+
+	if (WallJumpTestTime >= 40.f && bWallJumpTestReported == 0)
+	{
+		bWallJumpTestReported = 1;
+		UE_LOG(LogTraceGame, Display, TEXT("WALLJUMP ---- end."));
+		LogWallJumpReport();
+	}
+}
+
+/**
+ * SPEC v8 §5, THE MEASUREMENT. See the header for why it has a server half and a client half.
+ */
+void UTraceCharacterMovementComponent::TickCarrierChargeTest(float DeltaSeconds)
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("TraceCarrierChargeTest"));
+	if (!bEnabled || CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	// TickDashPitchTest's reason, verbatim: a replayed move must not advance a clock that fires input.
+	if (CharacterOwner->bClientUpdating)
+	{
+		return;
+	}
+
+	UWorld* TestWorld = GetWorld();
+	if (TestWorld == nullptr)
+	{
+		return;
+	}
+
+	ATraceCharacter* TraceOwner = Cast<ATraceCharacter>(CharacterOwner);
+	if (TraceOwner == nullptr)
+	{
+		return;
+	}
+
+	// --- THE SERVER HALF: hand the Core to the JOINED CLIENT's pawn --------------------------------
+	//
+	// Authority, over a pawn this process does NOT control, that is driven by a PlayerController — on a
+	// listen server that is precisely the pawn of the player who joined, which is the only pawn spec
+	// v8 §0 accepts a measurement from. Bots are excluded by the PlayerController test.
+	if (CharacterOwner->HasAuthority() && !CharacterOwner->IsLocallyControlled())
+	{
+		if (bCarrierTestCoreGiven != 0 || Cast<APlayerController>(CharacterOwner->GetController()) == nullptr)
+		{
+			return;
+		}
+
+		// After the client's control phase has had time to run and to spend its single charge, so the
+		// "before" number is measured on a pawn that genuinely was not carrying.
+		if (TestWorld->GetTimeSeconds() < 16.f)
+		{
+			return;
+		}
+
+		for (TActorIterator<ATraceCore> It(TestWorld); It; ++It)
+		{
+			ATraceCore* Core = *It;
+			if (Core == nullptr || Core->IsHeld())
+			{
+				continue;
+			}
+
+			// The real funnel, not a poke at bIsCarrier: the Core attaches, the PlayerState updates and
+			// bIsCarrier replicates, which is the whole thing being tested on the far end.
+			Core->TryPickup(TraceOwner);
+			bCarrierTestCoreGiven = 1;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("CARRIERTEST [server] gave the Core to the joined client's pawn %s at t=%.1f (carrier=%d)"),
+				*GetNameSafe(CharacterOwner), TestWorld->GetTimeSeconds(), TraceOwner->IsCarrier() ? 1 : 0);
+			break;
+		}
+
+		return;
+	}
+
+	// --- THE CLIENT HALF --------------------------------------------------------------------------
+	if (!CharacterOwner->IsLocallyControlled())
+	{
+		return;
+	}
+
+	// Count launches from the dash's own clock. A press that was refused for want of a charge produces
+	// no edge here, which is exactly the symptom being measured.
+	const bool bDashingNow = (DashTimeRemaining > 0.f);
+	if (bDashingNow && bCarrierTestWasDashing == 0)
+	{
+		++CarrierTestLaunches;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("CARRIERTEST [client] launch %d in phase %d (carrier=%d charges now %d/%d)"),
+			CarrierTestLaunches, CarrierTestPhase, TraceOwner->IsCarrier() ? 1 : 0,
+			DashCharges, GetMaxDashCharges());
+	}
+	bCarrierTestWasDashing = bDashingNow ? 1 : 0;
+
+	if (CarrierTestTime < 0.f)
+	{
+		if (TestWorld->GetTimeSeconds() < 8.f || !IsMovingOnGround())
+		{
+			return;
+		}
+
+		CarrierTestTime = 0.f;
+		CarrierTestPhaseTime = 0.f;
+		CarrierTestPhase = 0;
+		CarrierTestPresses = 0;
+		CarrierTestLaunches = 0;
+		CarrierTestChargesAtStart = DashCharges;
+		CarrierTestMaxAtStart = GetMaxDashCharges();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("CARRIERTEST ---- begin phase 0 (CONTROL, not carrying). netMode=%d role=%d carrier=%d "
+			     "charges=%d/%d cfg base=%d carrierExtra=%d"),
+			static_cast<int32>(GetNetMode()), static_cast<int32>(CharacterOwner->GetLocalRole()),
+			TraceOwner->IsCarrier() ? 1 : 0, DashCharges, GetMaxDashCharges(),
+			UTraceSettings::Get().BaseDashCharges, UTraceSettings::Get().CarrierExtraDashCharges);
+	}
+
+	CarrierTestTime += DeltaSeconds;
+	CarrierTestPhaseTime += DeltaSeconds;
+
+	if (CarrierTestPhase > 1)
+	{
+		return;
+	}
+
+	// Two presses, far enough apart that the first dash has ended (so the second is refused only by an
+	// empty pool, never by "a dash is already running") and close enough that no charge can refill.
+	const float FirstPressAt = 0.4f;
+	const float SecondPressAt = FirstPressAt + FMath::Max(0.35f, GetDashDuration() + 0.15f);
+	const float ReportAt = SecondPressAt + 1.2f;
+
+	if (CarrierTestPhaseTime >= FirstPressAt && CarrierTestPresses == 0)
+	{
+		++CarrierTestPresses;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("CARRIERTEST [client] press 1 phase %d: carrier=%d charges=%d/%d"),
+			CarrierTestPhase, TraceOwner->IsCarrier() ? 1 : 0, DashCharges, GetMaxDashCharges());
+		StartDash();
+	}
+	else if (CarrierTestPhaseTime >= SecondPressAt && CarrierTestPresses == 1)
+	{
+		++CarrierTestPresses;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("CARRIERTEST [client] press 2 phase %d: carrier=%d charges=%d/%d"),
+			CarrierTestPhase, TraceOwner->IsCarrier() ? 1 : 0, DashCharges, GetMaxDashCharges());
+		StartDash();
+	}
+
+	if (CarrierTestPhaseTime >= ReportAt && CarrierTestPresses >= 2)
+	{
+		const int32 Expected = (CarrierTestPhase == 0) ? 1 : 2;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("CARRIERTEST ==== phase %d (%s) presses=%d launches=%d expected=%d %s | carrier=%d "
+			     "chargesAtStart=%d/%d chargesNow=%d/%d lastMax=%d"),
+			CarrierTestPhase, (CarrierTestPhase == 0) ? TEXT("CONTROL, no Core") : TEXT("CARRYING"),
+			CarrierTestPresses, CarrierTestLaunches, Expected,
+			(CarrierTestLaunches == Expected) ? TEXT("PASS") : TEXT("FAIL"),
+			TraceOwner->IsCarrier() ? 1 : 0, CarrierTestChargesAtStart, CarrierTestMaxAtStart,
+			DashCharges, GetMaxDashCharges(), LastMaxDashCharges);
+
+		++CarrierTestPhase;
+		CarrierTestPhaseTime = 0.f;
+		CarrierTestPresses = 0;
+		CarrierTestLaunches = 0;
+
+		if (CarrierTestPhase == 1)
+		{
+			// Phase 1 starts only once the pawn IS the carrier AND the pool has refilled to the carrier's
+			// maximum. Both conditions are the claim: the Core arrived, and the extra charge came with it.
+			CarrierTestPhaseTime = -1000.f;
+		}
+	}
+
+	if (CarrierTestPhase == 1 && CarrierTestPhaseTime < -1.f)
+	{
+		if (TraceOwner->IsCarrier() && DashCharges >= GetMaxDashCharges() && GetMaxDashCharges() >= 2)
+		{
+			CarrierTestPhaseTime = 0.f;
+			CarrierTestChargesAtStart = DashCharges;
+			CarrierTestMaxAtStart = GetMaxDashCharges();
+			UE_LOG(LogTraceGame, Display,
+				TEXT("CARRIERTEST ---- begin phase 1 (CARRYING). carrier=%d charges=%d/%d lastMax=%d t=%.1f"),
+				TraceOwner->IsCarrier() ? 1 : 0, DashCharges, GetMaxDashCharges(), LastMaxDashCharges,
+				TestWorld->GetTimeSeconds());
+		}
+		else if (TestWorld->GetTimeSeconds() > 60.f)
+		{
+			CarrierTestPhase = 2;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("CARRIERTEST ==== phase 1 NEVER STARTED by t=60: carrier=%d charges=%d/%d lastMax=%d. "
+				     "Either the Core never reached this client or the pool never grew with it."),
+				TraceOwner->IsCarrier() ? 1 : 0, DashCharges, GetMaxDashCharges(), LastMaxDashCharges);
+		}
+	}
+}
+
+static void TraceReportWallJump()
+{
+	if (GEngine == nullptr)
+	{
+		return;
+	}
+
+	int32 Reported = 0;
+	for (const FWorldContext& Context : GEngine->GetWorldContexts())
+	{
+		const UWorld* ContextWorld = Context.World();
+		if (ContextWorld == nullptr)
+		{
+			continue;
+		}
+
+		for (FConstPlayerControllerIterator It = ContextWorld->GetPlayerControllerIterator(); It; ++It)
+		{
+			const APlayerController* PC = It->Get();
+			const ACharacter* PawnCharacter = (PC != nullptr) ? Cast<ACharacter>(PC->GetPawn()) : nullptr;
+			if (PawnCharacter == nullptr || !PawnCharacter->IsLocallyControlled())
+			{
+				continue;
+			}
+
+			const UTraceCharacterMovementComponent* Movement =
+				Cast<UTraceCharacterMovementComponent>(PawnCharacter->GetCharacterMovement());
+			if (Movement == nullptr)
+			{
+				continue;
+			}
+
+			++Reported;
+			Movement->LogWallJumpReport();
+		}
+	}
+
+	if (Reported == 0)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("WALLJUMP REPORT: no locally-controlled pawn in this process."));
+	}
+}
+
+static FAutoConsoleCommand GTraceWallJumpReportCmd(
+	TEXT("Trace.WallJumpReport"),
+	TEXT("Dev only. Spec v8 sec 7: entry vs launch speed, turn angle, the consecutive cap and "
+	     "corrections-per-wall-jump for each locally-controlled pawn. Read it on a JOINED CLIENT."),
+	FConsoleCommandDelegate::CreateStatic([]() { TraceReportWallJump(); }));
+
+/**
+ * SPEC v8 §1 — "dash feels rubber bandy", as a number, on the machine that can have the problem.
+ *
+ * Prints corrections-per-dash for every locally-controlled pawn in this process. ON A LISTEN HOST IT
+ * MUST READ 0.00 AND THAT PROVES NOTHING: an authoritative pawn cannot be corrected by definition,
+ * which is exactly how the previous pass reported "no corrections" for a dash the user could feel
+ * rubber-banding. Read it on a JOINED CLIENT with NetEmulation.PktLag 40 or it is not an answer.
+ */
+static void TraceReportDashNet()
+{
+	if (GEngine == nullptr)
+	{
+		return;
+	}
+
+	int32 Reported = 0;
+	for (const FWorldContext& Context : GEngine->GetWorldContexts())
+	{
+		const UWorld* ContextWorld = Context.World();
+		if (ContextWorld == nullptr)
+		{
+			continue;
+		}
+
+		for (FConstPlayerControllerIterator It = ContextWorld->GetPlayerControllerIterator(); It; ++It)
+		{
+			const APlayerController* PC = It->Get();
+			const ACharacter* PawnCharacter = (PC != nullptr) ? Cast<ACharacter>(PC->GetPawn()) : nullptr;
+			if (PawnCharacter == nullptr || !PawnCharacter->IsLocallyControlled())
+			{
+				continue;
+			}
+
+			const UTraceCharacterMovementComponent* Movement =
+				Cast<UTraceCharacterMovementComponent>(PawnCharacter->GetCharacterMovement());
+			if (Movement == nullptr)
+			{
+				continue;
+			}
+
+			++Reported;
+			Movement->LogDashNetReport();
+		}
+	}
+
+	if (Reported == 0)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("DASHNET REPORT: no locally-controlled pawn in this process."));
+	}
+}
+
+static FAutoConsoleCommand GTraceDashNetReportCmd(
+	TEXT("Trace.DashNetReport"),
+	TEXT("Dev only. Spec v8 sec 1: prints CORRECTIONS PER DASH for each locally-controlled pawn. Only "
+	     "meaningful on a JOINED CLIENT - a listen host cannot be corrected and always reads 0."),
+	FConsoleCommandDelegate::CreateStatic([]() { TraceReportDashNet(); }));
+
 static FAutoConsoleCommand GTraceDashVectorTestCmd(
 	TEXT("Trace.DashVectorTest"),
 	TEXT("Dev only. Prints the composed dash vector for every input/aim combination in spec v7 sec 5 "
@@ -4167,6 +5165,7 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, SavedDashCharges(0)
 	, SavedLastMaxDashCharges(0)
 	, SavedDashDirection(FVector::ZeroVector)
+	, bSavedDashAimRotationValid(0)
 	, SavedSlideTimeRemaining(0.f)
 	, SavedSlideCooldownRemaining(0.f)
 	, SavedSlideSpeed(0.f)
@@ -4221,6 +5220,18 @@ void FSavedMove_Trace::Clear()
 	SavedMantleUpTargetZ = 0.f;
 	SavedMantleEntrySpeed = 0.f;
 	SavedMantleCooldownRemaining = 0.f;
+
+	// Spec v8 §7. Same pooling argument as the mantle above: a stale wall-jump window left in a
+	// recycled move would let a replay take a wall jump off a wall that is no longer there, from a
+	// normal belonging to a different surface.
+	SavedWallJumpNormal = FVector::ZeroVector;
+	SavedWallJumpWindowRemaining = 0.f;
+	SavedWallJumpEntryVelocity = FVector::ZeroVector;
+	SavedWallJumpsSinceGround = 0;
+
+	// Spec v8 §1. Zeroed with everything else; SetMoveFor seeds it and PostUpdate_Record refines it.
+	SavedDashAimRotation = FRotator::ZeroRotator;
+	bSavedDashAimRotationValid = 0;
 }
 
 uint8 FSavedMove_Trace::GetCompressedFlags() const
@@ -4302,6 +5313,106 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	return Super::CanCombineWith(NewMove, InCharacter, MaxDelta);
 }
 
+void FSavedMove_Trace::PostUpdate(ACharacter* C, EPostUpdateMode PostUpdateMode)
+{
+	Super::PostUpdate(C, PostUpdateMode);
+
+	// RECORD PASS ONLY — this is the whole reason this override exists.
+	//
+	// The base class stores the move's aim in SavedControlRotation, and it would be the obvious place
+	// to read a dash's aim from on a replay. It is not safe: Super::PostUpdate WRITES that field, and
+	// ClientUpdatePositionAfterServerUpdate calls PostUpdate(PostUpdate_Replay) on every move it has
+	// just replayed. So the first correction after a dash overwrites that move's stored aim with
+	// wherever the mouse happens to be pointing at correction time, and a second correction covering
+	// the same move compounds it — the client replays the dash along a direction it never took, which
+	// is exactly the rubber-band being chased. See the header comment on this method.
+	//
+	// Capturing into our own field, and only on the record pass, means the aim a move was SENT with
+	// is written once and no number of replays can move it.
+	if (PostUpdateMode == FSavedMove_Character::PostUpdate_Record && C != nullptr)
+	{
+		// Super has just written SavedControlRotation with the record-time aim, owner fallback and
+		// .Clamp() included, and that is bit-for-bit the rotation FCharacterNetworkMoveData packs into
+		// this move's ServerMove. Copying it rather than recomputing it is deliberate: a hand-rolled
+		// copy of the engine's fallback logic is one engine change away from disagreeing with the wire.
+		SavedDashAimRotation = SavedControlRotation;
+		bSavedDashAimRotationValid = 1;
+	}
+	else if (bSavedDashAimRotationValid != 0)
+	{
+		// ================================================================================================
+		// THE REPLAY PASS — AND THE HALF OF SPEC v8 §1 THAT THE REPLAY-SIDE FIX ALONE MADE WORSE.
+		// ================================================================================================
+		//
+		// MEASURED, on a joined client at PktLag 40 both ways: restoring only the CLIENT's replay aim
+		// (Trace.DashLegacyAimReplay 0, PrepMoveFor reading SavedDashAimRotation) took corrections-per-dash
+		// from 0.43 to 2.29 — it made the rubber-band FIVE TIMES WORSE. The reason is the second consumer
+		// of this field, which the replay-side fix does not reach:
+		//
+		//   FCharacterNetworkMoveData::ClientFillNetworkMoveData does
+		//       ControlRotation = ClientMove.SavedControlRotation;
+		//
+		// and a correction does not just replay the unacknowledged moves, it RE-SENDS them. So the aim the
+		// server re-simulates each replayed move from is whatever is in SavedControlRotation AT RESEND
+		// TIME — which Super::PostUpdate(PostUpdate_Replay) has just overwritten with wherever the mouse is
+		// pointing NOW (engine CharacterMovementComponent.cpp: the SavedControlRotation write is in the
+		// block common to BOTH passes, not in the Record branch).
+		//
+		// That gives three possible worlds, and only one of them is right:
+		//
+		//   v7 (legacy):  replay reads the stomped aim, resend carries the stomped aim. Client and server
+		//                 agree — on an aim the player never held. The dash goes somewhere neither of them
+		//                 asked for, but they agree about it, so it corrects rarely.
+		//   replay-only:  replay reads the recorded aim, resend still carries the stomped one. Client and
+		//                 server now compose the dash from DIFFERENT rotations, every single time. This is
+		//                 the 2.29/dash measurement.
+		//   this:         the stomp is undone, so the replay AND the resend AND the server all use the aim
+		//                 the move was recorded with.
+		//
+		// The aim a move was made with is a historical fact about that move. Letting a replay rewrite it is
+		// the bug in both directions, and putting it back here is the only place that fixes both consumers
+		// at once — PrepMoveFor cannot, because it runs before the resend and does not own this field.
+		//
+		// This is not falsifying what the server was told: the ORIGINAL ServerMove for this timestamp
+		// already carried exactly this rotation. A resend that carried anything else would be handing the
+		// server different input for a timestamp it has already seen, which is the definition of a
+		// mispredicted move.
+#if !UE_BUILD_SHIPPING
+		// The A/B arm. Trace.DashLegacyAimReplay 1 leaves the engine's stomp in place, so the legacy
+		// number can be reproduced in this build rather than argued about.
+		extern int32 GTraceDashLegacyAimReplay;
+		if (GTraceDashLegacyAimReplay == 0)
+#endif
+		{
+			SavedControlRotation = SavedDashAimRotation;
+		}
+	}
+}
+
+void FSavedMove_Trace::CombineWith(const FSavedMove_Character* OldMove, ACharacter* InCharacter,
+	APlayerController* PC, const FVector& OldStartLocation)
+{
+	Super::CombineWith(OldMove, InCharacter, PC, OldStartLocation);
+
+	// When two moves merge, the combined move starts where the OLDER one did, so any state captured
+	// at the start of a move has to be re-based onto the older move's start or the replay begins from
+	// the wrong values.
+	//
+	// CanCombineWith already refuses to merge moves that differ in any ability or momentum state, so
+	// by the time we get here the two moves agree on all of it and there is nothing left to reconcile.
+	//
+	// THE AIM IS DELIBERATELY NOT RE-BASED ONTO THE OLDER MOVE, and an earlier revision of this file
+	// did exactly that. SavedDashAimRotation's invariant is "the rotation this move's ServerMove
+	// carries", i.e. it must equal SavedControlRotation as recorded — because PostUpdate's replay
+	// branch now writes it BACK into SavedControlRotation, which is what the resend reads. Combining
+	// runs in ReplicateMoveToServer BEFORE the combined move is simulated and before its
+	// PostUpdate(PostUpdate_Record), so the aim is re-recorded from the combined move immediately
+	// after this returns. Assigning the older move's rotation here would be overwritten in the happy
+	// path and would silently feed the server a rotation it was never sent in any other, so the
+	// honest thing is to leave the field alone and let the record pass own it.
+	(void)OldMove;
+}
+
 void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector const& NewAccel, FNetworkPredictionData_Client_Character& ClientData)
 {
 	Super::SetMoveFor(C, InDeltaTime, NewAccel, ClientData);
@@ -4356,6 +5467,16 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedMantleUpTargetZ         = Movement->MantleUpTargetZ;
 			SavedMantleEntrySpeed        = Movement->MantleEntrySpeed;
 			SavedMantleCooldownRemaining = Movement->MantleCooldownRemaining;
+
+			// SPEC v8 §7. The wall jump is only predicted if its state round-trips. HandleImpact does
+			// re-run on a replay (PhysFalling re-sweeps the same static geometry), so the NORMAL and the
+			// WINDOW are partly self-healing — but WallJumpsSinceGround is not: nothing in a replay can
+			// re-derive it, so without this capture a replay would keep incrementing the ladder counter
+			// and eventually refuse a wall jump the client had already taken.
+			SavedWallJumpNormal          = Movement->WallJumpNormal;
+			SavedWallJumpWindowRemaining = Movement->WallJumpWindowRemaining;
+			SavedWallJumpEntryVelocity   = Movement->WallJumpEntryVelocity;
+			SavedWallJumpsSinceGround    = Movement->WallJumpsSinceGround;
 		}
 	}
 }
@@ -4406,7 +5527,30 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			// of inputs the server did — for free, with no new saved-move field and no bandwidth.
 			// GetDashAimRotation() gates the read on ACharacter::bClientUpdating, so this value can
 			// never escape the replay loop and colour a live move.
-			Movement->ReplayAimRotation        = SavedControlRotation;
+			// SPEC v8 §1 — AND WHY IT IS *NOT* SavedControlRotation.
+			//
+			// SavedControlRotation is written by FSavedMove_Character::PostUpdate in the block that runs
+			// for BOTH passes (engine CharacterMovementComponent.cpp:12902), and
+			// ClientUpdatePositionAfterServerUpdate calls PostUpdate(PostUpdate_Replay) on every move it
+			// has just replayed. So the first correction after a dash stomps that move's stored aim with
+			// wherever the mouse is pointing at correction time; a second correction covering the same
+			// unacknowledged move then replays the dash from the stomped rotation while the server keeps
+			// composing from the rotation the ServerMove actually carried. On the spec v7 vectorized
+			// dash that disagreement is in Z — the rubber-band.
+			//
+			// SavedDashAimRotation is our own memo, written once on the record pass and immutable
+			// thereafter. Fall back to the base field only for a move that was never recorded, where it
+			// is the best (and only) value available.
+			// Trace.DashLegacyAimReplay 1 restores the v7 source in the SAME build, which is the only
+			// honest way to A/B this: two separately-built clients are two different populations of
+			// network jitter. The cvar was declared for exactly this and was reading nothing.
+#if !UE_BUILD_SHIPPING
+			extern int32 GTraceDashLegacyAimReplay;
+			const bool bUseRecordedAim = (GTraceDashLegacyAimReplay == 0) && (bSavedDashAimRotationValid != 0);
+#else
+			const bool bUseRecordedAim = (bSavedDashAimRotationValid != 0);
+#endif
+			Movement->ReplayAimRotation        = bUseRecordedAim ? SavedDashAimRotation : SavedControlRotation;
 			Movement->bReplayAimRotationValid  = 1;
 
 			Movement->SlideTimeRemaining     = SavedSlideTimeRemaining;
@@ -4434,6 +5578,15 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			Movement->MantleUpTargetZ         = SavedMantleUpTargetZ;
 			Movement->MantleEntrySpeed        = SavedMantleEntrySpeed;
 			Movement->MantleCooldownRemaining = SavedMantleCooldownRemaining;
+
+			// SPEC v8 §7. Rewind the wall to where it stood before this move ran. Without these a
+			// correction landing inside the contact window replays the wall jump as an ordinary refused
+			// mid-air jump — DoJump returns false, Velocity is put back, and client and server disagree
+			// about the entire redirected launch on the most visible frame of the move.
+			Movement->WallJumpNormal          = SavedWallJumpNormal;
+			Movement->WallJumpWindowRemaining = SavedWallJumpWindowRemaining;
+			Movement->WallJumpEntryVelocity   = SavedWallJumpEntryVelocity;
+			Movement->WallJumpsSinceGround    = SavedWallJumpsSinceGround;
 		}
 	}
 }

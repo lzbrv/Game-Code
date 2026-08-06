@@ -322,6 +322,51 @@
 // which sets bWantsToCrouch, so CanJump() was false for the entire slide. The dev measurement
 // harness did not catch it because it drives SetWantsToSlide() instead.
 //
+// --- SPEC v8 §7: THE WALL JUMP ------------------------------------------------------------------
+//
+// "Can you add a wall jump mechanic, where players can press jump right as they hit a wall to carry
+// momentum in a new direction?"
+//
+// CARRY, NOT RESET. The whole request is in the second half of that sentence, so the launch is a
+// REFLECTION of the incoming planar velocity about the wall normal — a player who arrives at 1400
+// uu/s leaves at 1400 × WallJumpSpeedRetention in a new direction, not at walking pace with a fresh
+// jump arc. Only the component that was travelling INTO the wall is mirrored; a glancing approach
+// glances off, a head-on approach comes straight back.
+//
+// DETECTION IS FREE, AND THAT IS DELIBERATE. There is no per-frame wall probe: the wall contact is
+// taken from UCharacterMovementComponent::HandleImpact, which PhysFalling already calls for every
+// blocking hit that is not a landing spot. So the mechanic costs one virtual call on a frame the
+// engine was already doing the sweep for, it fires on exactly the frame the capsule touched the
+// wall, and — the load-bearing part — it is reproduced identically by the server and by every
+// replayed move, because PhysFalling runs on all three and the arena's walls are static geometry.
+// A hand-rolled probe would have been a second, differently-timed source of truth for the same fact.
+//
+// PREDICTED LIKE THE MANTLE. WallJumpNormal, WallJumpWindowRemaining and WallJumpsSinceGround are
+// all saved-move state, round-tripped through Clear / SetMoveFor / PrepMoveFor / CombineWith and
+// refused by CanCombineWith while the window is open. A correction that landed mid-window and lost
+// them would replay a wall jump as an ordinary refused jump — a several-hundred-uu/s disagreement on
+// the most visible frame of the move, which is the exact failure this project keeps paying for.
+//
+// THE ENGINE HAD TO BE TOLD TO ASK. ACharacter::CheckJumpInput never calls DoJump() in mid-air once
+// JumpCurrentCount has reached JumpMaxCount, and JumpMaxCount is 1 — so with the stock value the
+// wall jump could not have been reached at all, whatever DoJump did. RefreshEngineTunablesFromSettings
+// raises JumpMaxCount to 1 + WallJumpMaxConsecutive so the engine ASKS on every mid-air press, and
+// DoJump() answers false unless a wall window is genuinely open. That is why this is not a double
+// jump: the extra counts buy the question, not the jump.
+//
+// THE LADDER IS CAPPED. Two close walls are an infinite staircase without a limit, so
+// WallJumpsSinceGround counts consecutive wall jumps and is reset only by touching the ground
+// (through IsGroundedForAbilities(), like every other ground test in this file, so a ledge blip
+// cannot silently refill it on one machine and not the other).
+//
+// IT CANNOT BEAT THE AIR-STRAFE CAP (spec v5 §1). The launch's planar speed is clamped to
+// max(entry planar speed, AirStrafeHardCapSpeed) — the same rule ApplySourceAirAcceleration uses, so
+// the wall jump can carry speed that was already above the cap but can never ADD past it.
+//
+// PRIORITY: the slide-jump wins. A jump taken inside the slide-jump coyote window is still a
+// slide-jump even if a wall window happens to be open, so nothing about spec v4 §1 or v5 §3 changes.
+// The wall jump is only reached by a jump that is airborne, not a slide-jump, and next to a wall.
+//
 // --- WHY CHARGES AND NOT A SECOND TIMER -------------------------------------------------------
 //
 // The Core carrier gets an extra dash. Modelling that as "a second cooldown that only carriers
@@ -453,7 +498,72 @@ public:
 	 */
 	virtual bool CanAttemptJump() const override;
 
+	/**
+	 * SPEC v8 §7. THE WALL JUMP'S ONLY SENSOR.
+	 *
+	 * PhysFalling calls this for every blocking hit that was not a landing spot, on the client, on the
+	 * server and on every replayed move, from inside the same sweep it was already doing. A hit on a
+	 * near-vertical face while airborne opens the wall-jump window; everything else falls through.
+	 *
+	 * Calls Super immediately (it drives the physics-interaction impulses) and never touches Velocity.
+	 */
+	virtual void HandleImpact(const FHitResult& Hit, float TimeSlice = 0.f, const FVector& MoveDelta = FVector::ZeroVector) override;
+
 #if !UE_BUILD_SHIPPING
+	/**
+	 * SPEC v8 §1 — "dash feels rubber bandy", answered as CORRECTIONS PER DASH.
+	 *
+	 * Logs this pawn's dash-attributed correction rate. Public and on the class because the counters
+	 * it reads are protected and the console command that drives it (Trace.DashNetReport) is a free
+	 * function; the alternative was exposing four raw counters that nothing else has any business
+	 * touching.
+	 *
+	 * ON AN AUTHORITATIVE PAWN THE ANSWER IS ALWAYS 0 AND MEANS NOTHING — a listen host cannot be
+	 * corrected. The line says so itself when HasAuthority(), because that exact confusion is how
+	 * the previous pass reported the dash as correction-free while the user was feeling it snap.
+	 */
+	void LogDashNetReport() const;
+
+	/**
+	 * SPEC v8 §7 — the wall jump, as numbers, on the machine that can disagree with the server.
+	 *
+	 * Prints how many wall jumps this pawn took, the entry -> launch planar speed (the "carry momentum"
+	 * claim), how far the launch was TURNED from the approach (the "in a new direction" claim), the
+	 * highest consecutive count reached, how many presses the anti-ladder cap refused, and how many
+	 * corrections landed inside a wall-jump window (the prediction claim — must be read on a CLIENT).
+	 */
+	void LogWallJumpReport() const;
+
+	/**
+	 * Drives the wall jump from code so it can be measured offscreen and on a client: runs the pawn at
+	 * the nearest perimeter wall and presses jump through ACharacter::Jump() — the real predicted path,
+	 * saved move and all — every time IsWallJumpAvailable() says a press would count. Enabled with
+	 * -TraceWallJumpTest. Never runs on a replayed move, for TickDashPitchTest's reason.
+	 */
+	void TickWallJumpTest(float DeltaSeconds);
+
+	/**
+	 * SPEC v8 §5 — "the two dash charges aren't working anymore, for the carrier", answered ON A CLIENT
+	 * WHILE ACTUALLY CARRYING. Enabled with -TraceCarrierChargeTest.
+	 *
+	 * It has two halves, one per process, because the claim spans both:
+	 *
+	 *   SERVER half. A joined client cannot walk to the middle of a 24000 uu arena in an offscreen
+	 *   test, and Trace.DebugTakeCore only ever targets the LOCAL pawn — on a listen host that is the
+	 *   host, which is the one machine spec v8 §0 says does not count. So the authority hands the Core
+	 *   to the JOINED CLIENT's pawn through ATraceCore::TryPickup(), the same funnel the pickup sphere
+	 *   uses, so bIsCarrier really replicates and the client learns it the way a player would.
+	 *
+	 *   CLIENT half. Fires two dashes in quick succession twice over: once BEFORE the Core arrives
+	 *   (the control — one charge, so the second press must be refused) and once after the pool has
+	 *   refilled WHILE CARRYING (two charges, so both presses must launch). Counting launches rather
+	 *   than reading the counter is the point: "it's acting as one dash charge" is a claim about how
+	 *   many dashes come out, and a charge that exists but cannot be spent would pass a counter check.
+	 *
+	 * Never runs on a replayed move, for TickDashPitchTest's reason.
+	 */
+	void TickCarrierChargeTest(float DeltaSeconds);
+
 	/**
 	 * DIAGNOSTIC ONLY — "Trace.MoveCorrections 1" (or -TraceMoveCorrections).
 	 *
@@ -657,6 +767,20 @@ public:
 	 */
 	bool IsSlideJumpWellTimed() const;
 
+	// --- Wall-jump readouts (HUD, bots, debug) — spec v8 §7 --------------------------------------
+
+	/**
+	 * True when pressing jump RIGHT NOW would be a wall jump: airborne, inside the contact window, and
+	 * still under the consecutive cap. Pure query over saved-move state, so a bot may poll it.
+	 */
+	bool IsWallJumpAvailable() const;
+
+	/** Outward normal of the wall the window is open on. Zero when no window is open. */
+	FVector GetWallJumpNormal() const { return WallJumpNormal; }
+
+	/** Wall jumps taken since the pawn last touched the ground. Capped at WallJumpMaxConsecutive. */
+	int32 GetWallJumpsSinceGround() const { return WallJumpsSinceGround; }
+
 	// --- Momentum readouts (HUD, debug, measurement) --------------------------------------------
 
 	/** Horizontal speed, in uu/s. The number every part of this pass is actually about. */
@@ -710,6 +834,17 @@ protected:
 
 	/** Hands the pawn back to MOVE_Falling with its entry speed (capped at the ground limit). */
 	void EndMantle();
+
+	// --- Wall jump (spec v8 §7) ------------------------------------------------------------------
+
+	/**
+	 * Consumes an open wall-jump window and writes the redirected launch velocity. Called from
+	 * DoJump(), i.e. from inside the engine's own predicted jump entry point, so it rides the saved
+	 * move exactly as the slide-jump does.
+	 *
+	 * @return true if a wall jump was actually taken. False leaves Velocity untouched.
+	 */
+	bool TryWallJump();
 
 	/**
 	 * THE ONE EXIT. Ends a slide and hands the player back WITH their momentum.
@@ -893,6 +1028,35 @@ protected:
 	 * curve is defined. The measurement harness prints it at a range of speeds.
 	 */
 	float GetAirStrafeGainScale(float PlanarSpeed) const;
+
+	// --- Wall-jump tuning (spec v8 §7) -----------------------------------------------------------
+	//
+	// Bound BY NAME against UTraceSettings (TraceMoveKnob), exactly like the spec v5 knobs: the
+	// properties do not exist in UTraceSettings yet, and the alternative — hardcoded literals — would
+	// ship a brand-new mechanic with nothing to tune. The moment the integrator adds the UPROPERTYs
+	// (the names are listed in the report) the ini takes over with no change here. BeginPlay's
+	// MOVEKNOB report prints BOUND or FALLBACK for every one of them, every run.
+
+	/** Master switch, so "is the wall jump making this worse" is one ini edit rather than a rebuild. */
+	bool  IsWallJumpEnabled() const;
+
+	/** Seconds after touching a wall in which a jump press is still a wall jump. */
+	float GetWallJumpWindowSeconds() const;
+
+	/** Fraction of the incoming planar SPEED the reflected launch keeps. 1.0 is pure preservation. */
+	float GetWallJumpSpeedRetention() const;
+
+	/** Flat uu/s pushed straight out along the wall normal, on top of the reflection. */
+	float GetWallJumpOutwardImpulse() const;
+
+	/** Vertical launch, as a multiple of JumpZVelocity — the unit every other launch here uses. */
+	float GetWallJumpVerticalMultiplier() const;
+
+	/** Consecutive wall jumps allowed without touching the ground. The anti-ladder cap. */
+	int32 GetWallJumpMaxConsecutive() const;
+
+	/** Largest |Normal.Z| still counted as a wall. Above it the surface is a ramp, not a face. */
+	float GetWallJumpMaxNormalZ() const;
 
 	bool  IsLandingMomentumPreserved() const;
 	float GetGroundOverspeedFriction() const;
@@ -1106,6 +1270,40 @@ protected:
 	/** Blocks re-grabbing the same lip the frame after a mantle ends. Charged in EndMantle(). */
 	float MantleCooldownRemaining;
 
+	// --- Wall-jump state (all saved/restored by FSavedMove_Trace) — spec v8 §7 -------------------
+
+	/**
+	 * Outward normal of the last wall touched while airborne, flattened to the horizontal plane and
+	 * normalised. Zero when no window is open.
+	 *
+	 * Written only from HandleImpact(), which runs identically on client, server and replay.
+	 */
+	FVector WallJumpNormal;
+
+	/** Seconds of "a jump press right now is a wall jump" left. Charged by HandleImpact(). */
+	float WallJumpWindowRemaining;
+
+	/**
+	 * THE VELOCITY THE PAWN HIT THE WALL WITH, planar, captured in HandleImpact() — and the difference
+	 * between "carry momentum in a new direction" and a 420 uu/s nudge.
+	 *
+	 * MEASURED on a client: reading Velocity at press time gives entry=0 for a head-on approach. By
+	 * then UCharacterMovementComponent::PhysFalling has re-derived Velocity from the distance the
+	 * capsule actually travelled that sub-step, and a pawn stopped dead by a wall travelled nothing.
+	 * The momentum the spec asks to redirect only exists on the frame of contact, so it is captured
+	 * there and held for the length of the window.
+	 *
+	 * Saved-move state like the rest of the window: a correction landing between the contact and the
+	 * press must not replay the launch from a different approach speed.
+	 */
+	FVector WallJumpEntryVelocity;
+
+	/**
+	 * Consecutive wall jumps since the pawn was last grounded. Reset through IsGroundedForAbilities(),
+	 * not IsMovingOnGround(), so a one-frame ledge blip cannot refill the ladder on one machine only.
+	 */
+	int32 WallJumpsSinceGround;
+
 	/** See GetLastDashActiveWorldTime(). Server observation only; never saved or replicated. */
 	float LastDashActiveWorldTime = -1000.f;
 
@@ -1139,6 +1337,14 @@ protected:
 
 	float DashPitchTestTime = -1.f;
 	int32 DashPitchTestPhase = 0;
+
+	/**
+	 * Which pass over the phase list this is. SEVEN DASHES IS NOT A SAMPLE: corrections arrive in
+	 * bursts of four or five from a single bad dash, so one seven-dash session put the SAME build and
+	 * the SAME cvar at 0.43/dash once and 2.29/dash an hour later. The list is walked several times so
+	 * the A/B compares tens of dashes per arm instead of seven. Trace.DashPitchTestCycles sets it.
+	 */
+	int32 DashPitchTestCycle = 0;
 	float DashPitchTestPhaseTime = 0.f;
 	float DashPitchTestYaw = 0.f;
 	float DashPitchTestPeakRise = 0.f;
@@ -1224,18 +1430,74 @@ protected:
 	int32 CorrectionCount = 0;
 	float CorrectionErrorTotal = 0.f;
 	float CorrectionErrorWorst = 0.f;
+
+	// --- SPEC v8 §1: CORRECTIONS PER DASH, MEASURED ON A CLIENT ---------------------------------
+	//
+	// "Dash feels rubber bandy" is a claim about the correction rate DURING a dash, and the previous
+	// pass answered it with a whole-session correction count taken on the host — where corrections
+	// are impossible by construction, so the number was zero for a reason that had nothing to do with
+	// the dash. These four fields attribute each correction to the dash it landed inside (or just
+	// after), so the answer is a RATE: corrections per dash, on the machine that can actually have
+	// them. Printed by Trace.DashNetReport and at the end of -TraceDashPitchTest.
+	int32 DashNetDashCount = 0;
+	int32 DashNetCorrectionsInDash = 0;
+	float DashNetCorrectionErrorInDash = 0.f;
+
+	/** World time the current dash's attribution window closes. Observation only; never saved. */
+	float DashNetAttributionUntil = -1000.f;
+
+	/** Next world time the once-a-second charge-pool readout (spec v8 §5) is due. */
+	float DashPoolDebugNextLogTime = 0.f;
+
+	// --- SPEC v8 §7: THE WALL JUMP, MEASURED ----------------------------------------------------
+	//
+	// Same argument as the dash block above. "Preserves and redirects momentum" and "is predicted"
+	// are two measurements, not an opinion, and the second one is only readable on a client.
+	int32 WallJumpCount = 0;
+	int32 WallJumpCapRefusals = 0;
+	int32 WallJumpMaxConsecutiveSeen = 0;
+	float WallJumpEntrySpeedSum = 0.f;
+	float WallJumpLaunchSpeedSum = 0.f;
+	float WallJumpTurnDegreesSum = 0.f;
+	float WallJumpLaunchZSum = 0.f;
+	int32 WallJumpCorrectionsInWindow = 0;
+
+	/** World time the current wall jump's correction-attribution window closes. Never saved. */
+	float WallJumpAttributionUntil = -1000.f;
+
+	/** -TraceWallJumpTest state. Phase clock, and the yaw that points at the chosen wall. */
+	float WallJumpTestTime = -1.f;
+	float WallJumpTestYaw = 0.f;
+	uint8 bWallJumpTestReported = 0;
+
+	// --- SPEC v8 §5: THE CARRIER'S TWO CHARGES, EXERCISED (-TraceCarrierChargeTest) ---------------
+	//
+	// Phase 0 = the control (not carrying), phase 1 = carrying. Launches are counted from the
+	// DashTimeRemaining edge rather than from the press, so a press that was silently refused for want
+	// of a charge is visible as a missing launch.
+	float CarrierTestTime = -1.f;
+	float CarrierTestPhaseTime = 0.f;
+	int32 CarrierTestPhase = 0;
+	int32 CarrierTestPresses = 0;
+	int32 CarrierTestLaunches = 0;
+	uint8 bCarrierTestWasDashing = 0;
+	uint8 bCarrierTestCoreGiven = 0;
+	int32 CarrierTestChargesAtStart = 0;
+	int32 CarrierTestMaxAtStart = 0;
 #endif
 };
 
 /**
  * One simulated movement frame, extended with the whole movement kit's state.
  *
- * Contract for the five overrides (all of them call Super first):
+ * Contract for the seven overrides (all of them call Super first):
  *   Clear()              wipe every added field — moves are pooled and reused
  *   SetMoveFor()         capture CMC state *before* the move is simulated
+ *   PostUpdate()         capture the AIM the move was actually sent with (record pass only)
  *   PrepMoveFor()        push that captured state back into the CMC before a replay
  *   GetCompressedFlags() pack the intents for the wire
  *   CanCombineWith()     refuse to merge moves whose ability or momentum state differs
+ *   CombineWith()        re-base the added state onto the OLDER move's start, when two moves merge
  */
 class TRACE_API FSavedMove_Trace : public FSavedMove_Character
 {
@@ -1250,6 +1512,59 @@ public:
 	virtual bool CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* InCharacter, float MaxDelta) const override;
 	virtual void SetMoveFor(ACharacter* C, float InDeltaTime, FVector const& NewAccel, class FNetworkPredictionData_Client_Character& ClientData) override;
 	virtual void PrepMoveFor(class ACharacter* C) override;
+
+	/**
+	 * SPEC v8 §1 — THE FIX FOR THE VECTORIZED DASH'S RUBBER-BAND, AND THE REASON THIS OVERRIDE EXISTS.
+	 *
+	 * The base class's SavedControlRotation looks like the right place to read the dash's aim from on
+	 * a replay, and spec v7 used it. IT IS NOT SAFE, because FSavedMove_Character::PostUpdate WRITES
+	 * it — and ClientUpdatePositionAfterServerUpdate calls PostUpdate(PostUpdate_Replay) on every move
+	 * it has just replayed. So the first correction after a dash OVERWRITES that move's stored aim
+	 * with wherever the mouse is pointing at correction time; a SECOND correction covering the same
+	 * unacknowledged move then replays the dash from that stomped rotation while the server keeps
+	 * composing from the rotation the move was actually sent with. On a horizontal dash the damage was
+	 * a yaw error; on the spec v7 vectorized dash it is a Z-velocity disagreement, i.e. the exact
+	 * rubber-band the user reported and the previous pass could not see from the host.
+	 *
+	 * Recording the aim into a field of OUR OWN, on the RECORD pass only, makes it immutable for the
+	 * life of the move: it is the rotation FCharacterNetworkMoveData packed into this move's
+	 * ServerMove, it is what the server applied to the controller before MoveAutonomous, and no number
+	 * of replays can move it.
+	 *
+	 * THAT ALONE MADE THE RUBBER-BAND FIVE TIMES WORSE, AND THIS IS THE PART TO READ.
+	 *
+	 * Measured on a joined client at PktLag 40 both ways: 0.43 corrections per dash with the v7 source,
+	 * 2.29 with the replay reading the recorded aim instead. SavedControlRotation has a SECOND consumer
+	 * that a replay-side fix never reaches — FCharacterNetworkMoveData::ClientFillNetworkMoveData does
+	 * `ControlRotation = ClientMove.SavedControlRotation`, and a correction RE-SENDS every unacknowledged
+	 * move. So the aim the server re-simulates from is whatever the replay pass last stomped into that
+	 * field. Fixing only the client's replay makes client and server compose the dash from two different
+	 * rotations on every corrected dash; v7 was "wrong but agreed".
+	 *
+	 * So this override does both halves: it records the aim on the record pass, and on the REPLAY pass it
+	 * puts SavedControlRotation back to it — undoing the engine's stomp before the resend reads it. The
+	 * aim a move was made with is a fact about that move, and the resend then carries what the original
+	 * ServerMove for that timestamp already carried.
+	 */
+	virtual void PostUpdate(ACharacter* C, EPostUpdateMode PostUpdateMode) override;
+
+	/**
+	 * When two moves merge, the combined move STARTS where the older one started — so its start-of-move
+	 * ability state has to be the older move's too.
+	 *
+	 * Super re-bases position, rotation, velocity and acceleration and stops there, which left every
+	 * added clock in this class one frame in the future relative to the move's own start. A replay of
+	 * a merged move therefore restored a dash recharge (or a ledge grace, or a wall window) that was
+	 * DeltaTime too short. CanCombineWith already refuses the loud cases — any live ability, and any
+	 * airborne or overspeed frame — so this was never a large error, but it was a divergence between
+	 * what the client simulated and what a replay of the same move would produce, which is precisely
+	 * the class of bug this pass exists to remove.
+	 *
+	 * The aim rotation is deliberately NOT re-based: the combined move is SENT with the newer move's
+	 * control rotation, so the replay has to use the newer one to match the server.
+	 */
+	virtual void CombineWith(const FSavedMove_Character* OldMove, ACharacter* InCharacter,
+		APlayerController* PC, const FVector& OldStartLocation) override;
 
 	/**
 	 * Intents. FLAG_Custom_0 = dash, FLAG_Custom_2 = crouch/slide held.
@@ -1274,6 +1589,24 @@ public:
 	int32 SavedDashCharges;
 	int32 SavedLastMaxDashCharges;
 	FVector SavedDashDirection;
+
+	/**
+	 * SPEC v8 §1. The aim rotation this move was SENT to the server with, recorded once on the
+	 * PostUpdate_Record pass and never touched again. See PostUpdate() for why the base class's
+	 * SavedControlRotation could not be used and what it cost.
+	 *
+	 * Costs no bandwidth: it is never serialised. It is a client-side memo of a value the server
+	 * already received inside the ordinary ServerMove.
+	 */
+	FRotator SavedDashAimRotation;
+
+	/**
+	 * True once PostUpdate_Record has written SavedDashAimRotation for THIS move. A move that has not
+	 * been recorded yet (or was recorded with no controller) must fall back to the base class's
+	 * SavedControlRotation rather than replaying the dash from a zero rotation, which would aim every
+	 * replayed dash due north and level.
+	 */
+	uint8 bSavedDashAimRotationValid : 1;
 
 	float SavedSlideTimeRemaining;
 	float SavedSlideCooldownRemaining;
@@ -1302,6 +1635,18 @@ public:
 	float SavedMantleUpTargetZ;
 	float SavedMantleEntrySpeed;
 	float SavedMantleCooldownRemaining;
+
+	/**
+	 * The wall jump (spec v8 §7). Same argument as the mantle's block above: a correction that landed
+	 * inside the contact window and lost these would replay the wall jump as a refused mid-air jump,
+	 * and client and server would disagree about the entire redirected launch.
+	 */
+	FVector SavedWallJumpNormal;
+	float SavedWallJumpWindowRemaining;
+	int32 SavedWallJumpsSinceGround;
+
+	/** The approach velocity the open window was charged with. See WallJumpEntryVelocity. */
+	FVector SavedWallJumpEntryVelocity;
 };
 
 /** Client prediction data whose only job is to hand out FSavedMove_Trace instances. */

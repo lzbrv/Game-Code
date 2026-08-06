@@ -367,8 +367,16 @@ void ATraceHUD::DrawHUD()
 
 	// Same reasoning: who is hosting, and whether the connection just broke, are true in every phase
 	// of the match including the full-time screen.
+	//
+	// KillFeedTopY is reset here and republished by DrawNetworkStatus below, so the feed hangs off
+	// whatever height that panel actually took this frame rather than off a guessed clearance.
+	KillFeedTopY = TraceHUDStyle::TopPanelY * UIScale;
 	DrawNetworkStatus();
 	DrawNetworkFailureBanner();
+
+	// After the network panel, and outside the bPostMatch gate: the last few kills are still worth
+	// reading on the full-time screen, and they are the only record of how a half ended.
+	DrawKillFeed();
 
 	// Last, over everything including the full-time takeover. A no-op while closed.
 	PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
@@ -1197,7 +1205,7 @@ void ATraceHUD::DrawHealthAndDash()
 			DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 				Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
-			// RED while the 0.1s window is open, matching the red the whole trace turns (spec §3), so
+			// RED while the 0.2s window is open, matching the red the whole trace turns (spec §3), so
 			// the meter and the world are saying the same thing at the same moment. Otherwise its own
 			// hue, so the stack does not read as one three-line bar.
 			const FLinearColor ParryColor = bParryActive
@@ -1712,6 +1720,9 @@ void ATraceHUD::DrawNetworkStatus()
 	{
 		DrawTextLeft(Detail, TraceHUDStyle::InkDim, PanelX + PadX, PanelY + PadY + HeadH, FontSmall, DetailScale);
 	}
+
+	// Publish the bottom edge so DrawKillFeed() can stack underneath this panel instead of over it.
+	KillFeedTopY = PanelY + PanelH;
 }
 
 void ATraceHUD::DrawNetworkFailureBanner()
@@ -1752,6 +1763,378 @@ void ATraceHUD::DrawNetworkFailureBanner()
 
 	DrawTextCentered(Headline, TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, Fade), CX, Y + PadY, FontMedium, HeadScale);
 	DrawTextCentered(Detail, TraceHUDStyle::WithAlpha(TraceHUDStyle::InkDim, Fade), CX, Y + PadY + HeadH, FontSmall, UIScale);
+}
+
+// -------------------------------------------------------------------------------------------
+// Kill feed (spec v8 §6)
+// -------------------------------------------------------------------------------------------
+
+namespace TraceKillFeedArt
+{
+	/**
+	 * THE ICONS, AS ASCII BITMAPS.
+	 *
+	 * Every glyph is a 13x13 grid, '#' lit and '.' clear, rendered as run-length integer DrawRects
+	 * with a one-cell-independent 1 px dark surround. No UMG, no texture, no imported art
+	 * (contract §2 / spec v8 §6) — and no vector maths either, because at the size a feed row can
+	 * afford (26 px) a hand-placed bitmap is the only thing that reliably reads. What you see here
+	 * is exactly what appears on screen, which is also why they are editable by anyone.
+	 *
+	 * The three the spec names, plus the two the cause taxonomy already implies:
+	 *
+	 *   Skull            HEADSHOT.  Silhouette + two eye sockets + a tooth row. Amber, matching the
+	 *                               headshot hit-marker this HUD already draws, so the two pieces of
+	 *                               head-shot feedback in the game agree with each other.
+	 *   Double chevron   DASH.      A trace kill. Reads as speed/direction at any size and is the
+	 *                               least confusable shape of the five.
+	 *   Shield           PARRY.     Drawn as an OUTLINE rather than filled: a solid shield at 26 px
+	 *                               degenerates into an anonymous downward blob, and the internal
+	 *                               void is what makes it a shield. Red, matching the parry flash.
+	 *   Round            BULLET.    The default for body and leg shots. Pointed right, with the
+	 *                               case/projectile groove that stops it reading as an arrow.
+	 *   Cross            WORLD.     Fell out of the arena, or an unattributable death.
+	 */
+	static constexpr int32 GlyphGrid = 13;
+
+	// A rifle round, pointed right: base flange, straight case walls, long ogive nose.
+	//
+	// THREE DRAFTS REJECTED. Each failure is a rule about drawing at 26 px, so they are kept.
+	//
+	//   Draft 1 had a ONE-CELL dark groove through a solid body. It disappeared: DrawKillIcon's
+	//   surround pass grows every lit run by 1 px on all sides, so at Cell = 2 px a one-cell (2 px)
+	//   gap is closed by 1 px of surround from each side. That is a hard floor — INTERIOR DETAIL
+	//   MUST BE AT LEAST TWO CELLS WIDE or it is not detail, it is nothing.
+	//
+	//   Draft 2 answered that by dropping the groove for a solid body with a flat back and a long
+	//   taper. Rendered at final size it plainly read as a MOUSE CURSOR — because a cursor is a flat
+	//   back and a taper, and crucially an ASYMMETRIC one. Symmetry about the horizontal axis is what
+	//   separates the two shapes, and this glyph is exactly symmetric for that reason.
+	//
+	//   Draft 3 restored the rim as a DETACHED bar two cells clear of the case, which is the smallest
+	//   gap the dilate leaves open. It survived, and it read as a BATTERY: at 26 px a floating bar is
+	//   not a rim, it is a second object. Rendered at 1x it degenerated further, into a dot and a
+	//   blob. THE RIM HAS TO BE ATTACHED — a cartridge base is a step in one silhouette, not two
+	//   shapes with a gap.
+	//
+	// So: one connected silhouette, a one-cell step top and bottom at the base for the flange,
+	// parallel case walls, and a four-column ogive. It reads as a round at 1x, which none of the
+	// three drafts above did.
+	static const TCHAR* const GlyphBullet[GlyphGrid] =
+	{
+		TEXT("............."),
+		TEXT("............."),
+		TEXT("..##........."),
+		TEXT("..#######...."),
+		TEXT("..#########.."),
+		TEXT("..##########."),
+		TEXT("..###########"),
+		TEXT("..##########."),
+		TEXT("..#########.."),
+		TEXT("..#######...."),
+		TEXT("..##........."),
+		TEXT("............."),
+		TEXT(".............")
+	};
+
+	static const TCHAR* const GlyphSkull[GlyphGrid] =
+	{
+		TEXT("....#####...."),
+		TEXT("..#########.."),
+		TEXT(".###########."),
+		TEXT("#############"),
+		TEXT("###.#####.###"),
+		TEXT("##...###...##"),
+		TEXT("##...###...##"),
+		TEXT("###.#####.###"),
+		TEXT("#####...#####"),
+		TEXT(".###########."),
+		TEXT("..#########.."),
+		TEXT("..#.#.#.#.#.."),
+		TEXT("...#######...")
+	};
+
+	static const TCHAR* const GlyphDash[GlyphGrid] =
+	{
+		TEXT("............."),
+		TEXT("............."),
+		TEXT("##.....##...."),
+		TEXT(".##.....##..."),
+		TEXT("..##.....##.."),
+		TEXT("...##.....##."),
+		TEXT("....##.....##"),
+		TEXT("...##.....##."),
+		TEXT("..##.....##.."),
+		TEXT(".##.....##..."),
+		TEXT("##.....##...."),
+		TEXT("............."),
+		TEXT(".............")
+	};
+
+	static const TCHAR* const GlyphParry[GlyphGrid] =
+	{
+		TEXT(".###########."),
+		TEXT("#############"),
+		TEXT("##.........##"),
+		TEXT("##.........##"),
+		TEXT("##.........##"),
+		TEXT(".##.......##."),
+		TEXT(".##.......##."),
+		TEXT("..##.....##.."),
+		TEXT("..##.....##.."),
+		TEXT("...##...##..."),
+		TEXT("....##.##...."),
+		TEXT(".....###....."),
+		TEXT("......#......")
+	};
+
+	static const TCHAR* const GlyphWorld[GlyphGrid] =
+	{
+		TEXT("............."),
+		TEXT(".##.......##."),
+		TEXT(".###.....###."),
+		TEXT("..###...###.."),
+		TEXT("...###.###..."),
+		TEXT("....#####...."),
+		TEXT(".....###....."),
+		TEXT("....#####...."),
+		TEXT("...###.###..."),
+		TEXT("..###...###.."),
+		TEXT(".###.....###."),
+		TEXT(".##.......##."),
+		TEXT(".............")
+	};
+
+	static const TCHAR* const* GlyphFor(ETraceKillIcon Icon)
+	{
+		switch (Icon)
+		{
+		case ETraceKillIcon::Headshot: return GlyphSkull;
+		case ETraceKillIcon::Dash:     return GlyphDash;
+		case ETraceKillIcon::Parry:    return GlyphParry;
+		case ETraceKillIcon::World:    return GlyphWorld;
+		default:                       return GlyphBullet;
+		}
+	}
+
+	/**
+	 * Icon tint. Each one is the colour the game ALREADY uses for that event elsewhere, rather than
+	 * a fresh palette: amber is the headshot hit-marker, red is the parry flash. A player who has
+	 * learned one has learned the other.
+	 */
+	static FLinearColor ColorFor(ETraceKillIcon Icon)
+	{
+		switch (Icon)
+		{
+		case ETraceKillIcon::Headshot: return TraceHUDStyle::Warning;
+		case ETraceKillIcon::Parry:    return TraceHUDStyle::Danger;
+		case ETraceKillIcon::World:    return TraceHUDStyle::InkDim;
+		default:                       return TraceHUDStyle::Ink;   // Bullet and Dash: neutral
+		}
+	}
+
+	/** Icon box in 1080p reference pixels, before the integer-cell floor below. */
+	static constexpr float IconBoxPx = 26.f;
+
+	static constexpr float MarginX = 18.f;   // must match DrawNetworkStatus's right margin
+	static constexpr float GapUnderPanel = 8.f;
+	static constexpr float RowGap = 4.f;
+	static constexpr float PadX = 10.f;
+	static constexpr float PadY = 5.f;
+	static constexpr float IconGap = 9.f;
+	static constexpr float NameScale = 0.95f;
+
+	/** Longest name drawn. Bot names are short; a pasted human name is not necessarily. */
+	static constexpr int32 MaxNameChars = 16;
+
+	/** How often a client with no relay yet may re-run the actor search, in seconds. */
+	static constexpr float RelayPollInterval = 0.5f;
+
+	static FString Shorten(const FString& Name)
+	{
+		return (Name.Len() <= MaxNameChars) ? Name : (Name.Left(MaxNameChars - 1) + TEXT("."));
+	}
+}
+
+void ATraceHUD::DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, const FLinearColor& Color)
+{
+	const TCHAR* const* Rows = TraceKillFeedArt::GlyphFor(Icon);
+
+	// Two passes: a dilated black surround, then the fill. Same reasoning as DrawAimReticle's
+	// outline — the arena is a black floor plus saturated cyan and amber neon, and an unoutlined
+	// white glyph disappears the moment it crosses a lit edge.
+	const FLinearColor Surround(0.f, 0.f, 0.f, 0.80f * Color.A);
+
+	for (int32 Pass = 0; Pass < 2; ++Pass)
+	{
+		const FLinearColor PassColor = (Pass == 0) ? Surround : Color;
+		const float Grow = (Pass == 0) ? 1.f : 0.f;
+
+		for (int32 RowIndex = 0; RowIndex < TraceKillFeedArt::GlyphGrid; ++RowIndex)
+		{
+			const TCHAR* const Row = Rows[RowIndex];
+
+			// Run-length: one DrawRect per horizontal run of lit cells rather than one per cell,
+			// which turns a worst-case 169 rects per icon into at most a handful.
+			int32 RunStart = -1;
+			for (int32 Col = 0; Col <= TraceKillFeedArt::GlyphGrid; ++Col)
+			{
+				const bool bLit = (Col < TraceKillFeedArt::GlyphGrid) && (Row[Col] == TEXT('#'));
+				if (bLit && RunStart < 0)
+				{
+					RunStart = Col;
+				}
+				else if (!bLit && RunStart >= 0)
+				{
+					DrawRect(PassColor,
+						X + RunStart * Cell - Grow,
+						Y + RowIndex * Cell - Grow,
+						(Col - RunStart) * Cell + Grow * 2.f,
+						Cell + Grow * 2.f);
+					RunStart = -1;
+				}
+			}
+		}
+	}
+}
+
+void ATraceHUD::DrawKillFeed()
+{
+	UWorld* const World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// Re-found on demand: on a client the relay arrives by replication some frames after this HUD
+	// exists, and a travel destroys it. Cheap once it is cached; an actor iteration until then.
+	if (!KillFeedRelay.IsValid())
+	{
+		if ((Now - LastKillFeedRelayPollTime) < TraceKillFeedArt::RelayPollInterval)
+		{
+			return;
+		}
+		LastKillFeedRelayPollTime = Now;
+
+		KillFeedRelay = ATraceKillFeedRelay::Find(World);
+		if (!KillFeedRelay.IsValid())
+		{
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[KillFeed] HUD found the relay; the feed will draw on this machine."));
+	}
+
+	const TArray<FTraceKillFeedEntry>& Rows = KillFeedRelay->GetEntries();
+	if (Rows.Num() == 0)
+	{
+		return;
+	}
+
+	// INTEGER CELLS, with a floor of 2. At 1080p this is 2 px per cell (a 26 px icon); at 720p the
+	// floor keeps it at 2 rather than collapsing to a 13 px smudge, so the glyph stays legible at
+	// the resolution this project is actually played and screenshotted at.
+	const float Cell = FMath::Max(2.f,
+		FMath::FloorToFloat(TraceKillFeedArt::IconBoxPx * UIScale / static_cast<float>(TraceKillFeedArt::GlyphGrid)));
+	const float IconPx = Cell * static_cast<float>(TraceKillFeedArt::GlyphGrid);
+
+	const float NameScale = TraceKillFeedArt::NameScale * UIScale;
+	const float PadX = TraceKillFeedArt::PadX * UIScale;
+	const float PadY = TraceKillFeedArt::PadY * UIScale;
+	const float IconGap = TraceKillFeedArt::IconGap * UIScale;
+	const float RightX = ViewW - TraceKillFeedArt::MarginX * UIScale;
+
+	// BY ID, NOT BY NAME. Names are not unique — a listen server and a client on one machine both
+	// default to that machine's name, and matching on the string drew "you died" on the host for a
+	// kill that happened to the joining player. PlayerId is server-assigned and replicated.
+	//
+	// ZERO IS NOT AN IDENTITY. Measured on a live match: every bot's APlayerState carries PlayerId 0
+	// (they are not registered through the login path that hands out ids; the two humans got 256 and
+	// 257). So an id of 0 means "some bot", not "this player", and a local id of 0 must match nothing
+	// — otherwise one unlucky assignment would colour every bot-on-bot row as the local player's own
+	// kill. Failing to zero costs a missing highlight, which is the harmless direction.
+	const int32 RawLocalId = (LocalPS != nullptr) ? LocalPS->GetPlayerId() : INDEX_NONE;
+	const int32 LocalPlayerId = (RawLocalId > 0) ? RawLocalId : INDEX_NONE;
+
+	float RowY = KillFeedTopY + TraceKillFeedArt::GapUnderPanel * UIScale;
+	int32 Drawn = 0;
+
+	for (const FTraceKillFeedEntry& Entry : Rows)
+	{
+		if (Drawn >= ATraceKillFeedRelay::MaxDrawnEntries)
+		{
+			break;
+		}
+
+		// AGAINST THE REPLICATED SERVER CLOCK, not against when this machine saw the row. That is
+		// what stops a client that joined mid-match from being shown five old kills as if they had
+		// just happened, and it is why a row is exactly as old on the client as it is on the host.
+		//
+		// Rows are newest-first, so the first one that has expired means every later one has too.
+		const float Age = ATraceKillFeedRelay::GetEntryAge(Entry, World);
+		if (Age >= ATraceKillFeedRelay::EntryLifetime)
+		{
+			break;
+		}
+
+		const float FadeStart = ATraceKillFeedRelay::EntryLifetime - ATraceKillFeedRelay::EntryFadeTime;
+		const float Alpha = (Age <= FadeStart)
+			? 1.f
+			: FMath::Clamp(1.f - (Age - FadeStart) / ATraceKillFeedRelay::EntryFadeTime, 0.f, 1.f);
+
+		const FString KillerText = TraceKillFeedArt::Shorten(Entry.KillerName);
+		const FString VictimText = TraceKillFeedArt::Shorten(Entry.VictimName);
+
+		const float KillerW = Entry.bHasKiller ? MeasureWidth(KillerText, FontSmall, NameScale) : 0.f;
+		const float VictimW = MeasureWidth(VictimText, FontSmall, NameScale);
+		const float TextH = MeasureHeight(VictimText, FontSmall, NameScale);
+
+		const float ContentW = (Entry.bHasKiller ? KillerW + IconGap : 0.f) + IconPx + IconGap + VictimW;
+		const float RowW = ContentW + PadX * 2.f;
+		const float RowH = FMath::Max(TextH, IconPx) + PadY * 2.f;
+		const float RowX = RightX - RowW;
+
+		// A row involving the local player gets a coloured edge — the one thing a player wants to
+		// find in a feed without reading it is whether it was about them.
+		FLinearColor Border = TraceHUDStyle::PanelBorder;
+		if (LocalPlayerId != INDEX_NONE)
+		{
+			if (Entry.bHasKiller && Entry.KillerPlayerId == LocalPlayerId)
+			{
+				Border = TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.85f);
+			}
+			else if (Entry.VictimPlayerId == LocalPlayerId)
+			{
+				Border = TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.85f);
+			}
+		}
+
+		DrawPanel(RowX, RowY, RowW, RowH,
+			TraceHUDStyle::WithAlpha(TraceHUDStyle::PanelFill, TraceHUDStyle::PanelFill.A * Alpha),
+			TraceHUDStyle::WithAlpha(Border, Border.A * Alpha));
+
+		const float TextY = RowY + (RowH - TextH) * 0.5f;
+		const float IconY = FMath::RoundToFloat(RowY + (RowH - IconPx) * 0.5f);
+
+		float CursorX = RowX + PadX;
+		if (Entry.bHasKiller)
+		{
+			DrawTextLeft(KillerText,
+				TraceHUDStyle::WithAlpha(TraceTeamColor(Entry.KillerTeam), Alpha),
+				CursorX, TextY, FontSmall, NameScale);
+			CursorX += KillerW + IconGap;
+		}
+
+		DrawKillIcon(Entry.Icon, FMath::RoundToFloat(CursorX), IconY, Cell,
+			TraceHUDStyle::WithAlpha(TraceKillFeedArt::ColorFor(Entry.Icon), Alpha));
+		CursorX += IconPx + IconGap;
+
+		DrawTextLeft(VictimText,
+			TraceHUDStyle::WithAlpha(TraceTeamColor(Entry.VictimTeam), Alpha),
+			CursorX, TextY, FontSmall, NameScale);
+
+		RowY += RowH + TraceKillFeedArt::RowGap * UIScale;
+		++Drawn;
+	}
 }
 
 void ATraceHUD::DrawPhaseBanner()
@@ -1964,7 +2347,7 @@ void ATraceHUD::DrawDeathPanel()
 		// names the fact; this names the RULE, because "Parried" is a brand new cause of death and a
 		// player who has never met it will read it as a bug — they dashed a trace, which they know
 		// kills the carrier, and instead they died. One extra line is the cheapest possible fix, and
-		// it says RED because red is the tell they had 0.1 s to notice and did not.
+		// it says RED because red is the tell they had 0.2 s to notice and did not.
 		if (Cause == TraceParry::GetParryKillCause())
 		{
 			DrawTextCentered(TEXT("YOU DASHED A PARRIED (RED) TRACE"), TraceParry::GetTintColor(),

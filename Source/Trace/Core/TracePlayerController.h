@@ -69,7 +69,7 @@ struct FTraceDashHudState
  *   Fire        bool     LMB           (doubles as "put me back in" while dead)
  *   Pass        bool     RMB
  *   Dash        bool     Left Shift
- *   Parry       bool     Q             (carrier only — 0.1s of trace invulnerability, spec v3 §3)
+ *   Parry       bool     Q             (carrier only — 0.2s of trace invulnerability, spec v3 §3 / v8 §3)
  *   Scoreboard  bool     Tab           (held)
  */
 UCLASS()

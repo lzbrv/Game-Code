@@ -39,7 +39,7 @@
 //                       out of ATraceCore::IsTraceInvulnerableFor(), which is the same replicated
 //                       bool that drops the holder's shield, so the two can never disagree.
 //
-//   PARRY (v3 §3)       A carrier-only, 0.1s window of trace invulnerability on a 1.5s cooldown,
+//   PARRY (v3 §3)       A carrier-only, 0.2s window of trace invulnerability on a 1.5s cooldown,
 //                       during which the ENTIRE trace turns red. Unlike the pass window it does NOT
 //                       drop the shield. The window lives here (see ParryEndServerTime); the
 //                       tunables, the entry point and the debug commands live in Gameplay/TraceParry.h,
@@ -123,6 +123,38 @@ struct FTraceGhostRecord
 
 	/** True once a pose was successfully copied into the pooled component holding this record. */
 	bool bPosed = false;
+};
+
+/**
+ * SPEC v8 §2. One frame of where the LOCALLY CONTROLLED carrier actually was, on their own machine.
+ *
+ * The predicted head (spec v5 §2) used to be a straight line from the newest replicated point to the
+ * pawn, and a straight line is only honest while it is short. On a JOINED CLIENT it is not short: the
+ * pawn is client-predicted a round trip AHEAD of the server, and the newest point the server laid is
+ * still a round trip BEHIND on the wire, so at dash speed the two ends are 400-600uu and one or two
+ * corners apart. That is why the stub's length cap kept firing on a client and never on the host —
+ * and a cap that fires deletes the whole stub, which is the "my trace detaches when I dash, but only
+ * when I have joined a server" report.
+ *
+ * The carrier's own machine does not have to guess: it KNOWS where the pawn has been every frame.
+ * These samples are that record. Nothing is replicated, nothing is lethal, and nothing is drawn for
+ * any other viewer — see UpdatePredictedHead().
+ */
+struct FTraceLocalPathSample
+{
+	/** Where the pawn's capsule centre was — the same anchor ServerUpdateTrail() lays points at. */
+	FVector Location = FVector::ZeroVector;
+
+	/**
+	 * Shared-clock stamp. Used for AGEING SAMPLES OUT and for nothing else.
+	 *
+	 * It is deliberately NOT how the stub decides which samples are still ahead of the replicated
+	 * trace. That decision is geometric (see UpdatePredictedHead), because a client's shared clock is
+	 * an estimate of the server's and a stamp comparison across the two would put the correctness of
+	 * the picture at the mercy of a few milliseconds of clock skew. A DIFFERENCE of two stamps taken
+	 * on this machine has no such problem, which is exactly what ageing out needs.
+	 */
+	float ServerTime = 0.f;
 };
 
 /**
@@ -261,9 +293,16 @@ public:
 	 */
 	void RequestParry(ETraceParryRefusal& OutRefusal);
 
-	/** Owning client -> server. Reliable: a dropped parry is a death, which is not a droppable event. */
+	/**
+	 * Owning client -> server. Reliable: a dropped parry is a death, which is not a droppable event.
+	 *
+	 * v8 §3: @p ClientPressServerTime is the client's own shared-clock reading AT THE PRESS. The
+	 * server clamps it exactly as a shot's timestamp is clamped and judges the parry against it, so
+	 * a joined player is not charged for their packet's flight time. 0 = "no stamp", which resolves
+	 * to arrival and reproduces the pre-v8 behaviour byte for byte.
+	 */
 	UFUNCTION(Server, Reliable)
-	void ServerRequestParry();
+	void ServerRequestParry(float ClientPressServerTime);
 
 	/**
 	 * AUTHORITATIVE. True while a parry window is open, per the REPLICATED window end time only.
@@ -390,6 +429,28 @@ public:
 	 */
 	float MeasureHeadGap() const;
 
+	// ------------------------------------------------------------------------------------------
+	// SPEC v8 §2 — WHY THE STUB WAS NOT DRAWN. The v5 §2 prediction can DECLINE (see
+	// UpdatePredictedHead), and a decline is invisible in every number above: the stub simply is not
+	// there, exactly as if the feature had never shipped. On a client that decline was the bug, so it
+	// is counted rather than inferred.
+	// ------------------------------------------------------------------------------------------
+
+	/** Times this machine has abandoned the stub because the gap was too long to draw honestly. */
+	int32 GetPredictedHeadDropCount() const { return PredictedHeadDrops; }
+
+	/**
+	 * uu the stub would have had to span on the last frame it was considered — drawn or dropped.
+	 *
+	 * This is the number the length cap is compared against, so it is the one that says whether a
+	 * client is living near the cliff edge. It keeps its value on a frame the stub was declined,
+	 * which GetPredictedHeadLength() (0 when nothing is drawn) deliberately cannot.
+	 */
+	float GetPredictedHeadSpan() const { return PredictedHeadSpan; }
+
+	/** Recorded local path samples the last stub was built through. 0 = it was a straight chord. */
+	int32 GetPredictedHeadSamplesUsed() const { return PredictedHeadSamplesUsed; }
+
 	/**
 	 * THE NUMBER THE USER ACTUALLY REPORTED: how far it is from the carrier to the nearest piece of
 	 * their own trace THAT THEIR OWN CAMERA IS ALLOWED TO SEE, in uu, surface to centre.
@@ -424,7 +485,14 @@ public:
 	/** How many times this machine has had to put a replicated point set back into path order. */
 	int32 GetPointOrderRepairCount() const { return PointOrderRepairs; }
 
-	/** Adjacent pairs currently out of chronological order in TrailPoints.Items. 0 = the path is sane. */
+	/**
+	 * Adjacent pairs currently out of PATH order in TrailPoints.Items. 0 = the identity order is sane.
+	 *
+	 * v8 §2: keyed on ReplicationID, the integer FFastArraySerializer hands out in append order and
+	 * keeps in sync across the wire — not on the replicated float BirthServerTime v7 §7 used. A float
+	 * key made both this counter and the repair blind to ties, so a scrambled array with two identical
+	 * stamps scored a clean zero here while still being drawn wrong. See RestoreReplicatedPointOrder().
+	 */
 	int32 CountPointOrderViolations() const;
 
 	/**
@@ -437,6 +505,31 @@ public:
 
 	/** Total length of the replicated path, in uu — what v7 §1's max length is enforced against. */
 	float MeasureTraceLength() const;
+
+	/**
+	 * THE SHARPEST SINGLE DETECTOR OF A CORRUPTED PATH, and the reason it exists is that ORD is not.
+	 *
+	 * The longest distance between two ADJACENT points in TrailPoints.Items. The server lays points at
+	 * TrailPointSpacing and restarts the trace on any discontinuity, so a healthy path's worst adjacent
+	 * gap is a small multiple of the spacing whatever the carrier is doing. A path whose order has been
+	 * scrambled contains one adjacent pair that jumps most of the trace's length — so this reads ~1200
+	 * instead of ~80 the instant the array is wrong, on the frame it is wrong.
+	 *
+	 * ORD (CountPointOrderViolations) can only see a violation of CHRONOLOGICAL order. This sees the
+	 * geometry the ribbon is actually built from, which is the thing the player is looking at.
+	 */
+	float MeasureMaxAdjacentSegment() const;
+
+	/**
+	 * Surface distances, in uu, from the carrier to the NEAREST and FARTHEST visible piece of the
+	 * REPLICATED ribbon (the owner-only stub is excluded — it is not drawn for anybody else).
+	 *
+	 * The far end of the drawn ribbon being pulled onto the character is the literal wording of the
+	 * bug report, so it is measured off the geometry rather than inferred from the point array:
+	 * OutFarthest collapsing towards zero while the trace is long IS the reported symptom.
+	 * Both are -1 when nothing is drawn.
+	 */
+	void MeasureDrawnSpan(float& OutNearest, float& OutFarthest, int32& OutVisiblePieces) const;
 
 	/**
 	 * SPEC v7 §3 VERIFICATION, BOTH DIRECTIONS, off the geometry that is actually on screen.
@@ -494,8 +587,52 @@ private:
 	UFUNCTION()
 	void OnRep_ParryEndServerTime();
 
-	/** Server: the actual rules. Returns true and opens the window, or false with a reason. */
-	bool ServerTryBeginParry(ETraceParryRefusal& OutRefusal);
+	/**
+	 * Server: the actual rules. Returns true and opens the window, or false with a reason.
+	 *
+	 * v8 §3: @p ClientPressServerTime is the client's stamped press, clamped and anchored by
+	 * TraceParry::ServerResolvePress. 0 (the host path and the bot auto-parry path) resolves to
+	 * "now", so those callers do not change by one frame.
+	 */
+	bool ServerTryBeginParry(ETraceParryRefusal& OutRefusal, float ClientPressServerTime = 0.f);
+
+	// --- v8 §3: a lethal trip waiting out a remote carrier's upstream lag ------------------------
+	//
+	// See Gameplay/TraceParry.h. GetTripHoldSeconds() is 0 for the host and for bots, so on a single
+	// machine these three fields are written, read once and cleared with no behaviour change at all.
+
+	/** The dasher whose lethal trip is currently being held. Null when nothing is pending. */
+	TWeakObjectPtr<ATraceCharacter> PendingTripDasher;
+
+	/** Shared-clock instant the held trip's sweep resolved. This, not "now", is what a parry must cover. */
+	float PendingTripServerTime = 0.f;
+
+	/** How long the trail has already held it. Compared against GetTripHoldSeconds(). */
+	float PendingTripHeldSeconds = 0.f;
+
+	/**
+	 * SERVER. Advance the one pending held trip by DeltaTime and act on the verdict.
+	 *
+	 * THE CONTRACT THIS EXISTS TO HONOUR (TraceParry.h, GetAbandonedHeldTripCount): once
+	 * ServerResolveHeldTrip has answered KeepHolding, the caller must keep asking EVERY FRAME until it
+	 * answers KillNow or Parried — *whether or not the dasher is still touching the trace*. A dash
+	 * crosses a ribbon in one or two frames and a hold lasts three or four, so the old
+	 * "else { PendingTripDasher = nullptr; }" dropped essentially every remote hold on the floor: the
+	 * kill never landed, the dead-man switch tripped, and held trips disarmed themselves for the
+	 * session. Measured: case B left the carrier ALIVE 3/3 instead of DEAD 4/4.
+	 *
+	 * @param Holder        the carrier the trip would kill.
+	 * @param DeltaTime     the frame's delta, accumulated into PendingTripHeldSeconds.
+	 * @param OutPunished   set to the dasher this call punished for a parry, if any. The caller must
+	 *                      not punish that same dasher again through the live-parry path in the same
+	 *                      frame — ServerPunishParriedDash carries the Demo 7 refunds (parry cooldown
+	 *                      to zero, one dash charge back), so a double call hands out two.
+	 * @return true if the trip is still pending (the caller must not start a different one).
+	 */
+	bool ServerAdvancePendingTrip(ATraceCharacter* Holder, float DeltaTime, ATraceCharacter** OutPunished = nullptr);
+
+	/** SERVER. Drop the pending hold cleanly — cancels the parry-side record so it is not "abandoned". */
+	void ServerCancelPendingTrip();
 
 	/**
 	 * Server, DEBUG ONLY: Trace.Parry.BotAuto — AI carriers parry the instant their cooldown allows.
@@ -621,6 +758,24 @@ private:
 
 	/** uu the predicted stub covered on the last frame it ran. 0 when it is not drawing. */
 	float PredictedHeadLength = 0.f;
+
+	/**
+	 * SPEC v8 §2. The locally controlled carrier's own recent path, newest last. Never replicated.
+	 *
+	 * Recorded on the machine that is PREDICTING the pawn, which is the only machine that knows where
+	 * it has been between two replicated trail points. Trimmed every frame to the samples newer than
+	 * the newest replicated point, so it holds one round trip of travel and nothing else — it is a
+	 * window onto the present, not a history that could ever redraw the past.
+	 */
+	TArray<FTraceLocalPathSample> LocalPathHistory;
+
+	/** Counters behind GetPredictedHeadDropCount / GetPredictedHeadSpan / GetPredictedHeadSamplesUsed. */
+	int32 PredictedHeadDrops = 0;
+	float PredictedHeadSpan = 0.f;
+	int32 PredictedHeadSamplesUsed = 0;
+
+	/** One line per episode of the stub being declined, re-armed when it draws again. */
+	bool bPredictedHeadDropReported = false;
 
 	// ------------------------------------------------------------------------------------------
 	// THE GHOSTS (spec v4 §2). Pooled posed Mannequins.
@@ -762,10 +917,19 @@ private:
 	 * of the trace end up tied to them. The server never sees it because authority mutates Items
 	 * itself with an order-preserving RemoveAt.
 	 *
-	 * Restores chronological order in place, on non-authority only, and empties the fast array's
-	 * ItemMap so the engine rebuilds the ReplicationID -> index map against the new layout (the
-	 * same thing the engine itself does immediately after its RemoveAtSwap loop). Returns true when
-	 * it had to move anything.
+	 * SPEC v8 §2 — THE KEY CHANGED, AND THAT IS THE FIX. v7 sorted on the replicated FLOAT
+	 * BirthServerTime with a strict `<` and a stable sort, so two points sharing a stamp kept whatever
+	 * order RemoveAtSwap left them in — and CountPointOrderViolations(), using the same comparison,
+	 * scored that array as perfect. It now sorts on ReplicationID, which IS the server's append order
+	 * (FFastArraySerializer::MarkItemDirty issues `++IDCounter`), is an integer, and is the one field
+	 * the engine guarantees is "replicated and in sync between client and server" while the indices
+	 * are not. A second, independent GEOMETRIC detector (an adjacent gap the server could never have
+	 * laid) also triggers the repair and is re-checked afterwards, so a path this cannot fix is
+	 * reported rather than silently drawn.
+	 *
+	 * Restores path order in place, on non-authority only, and empties the fast array's ItemMap so the
+	 * engine rebuilds the ReplicationID -> index map against the new layout (the same thing the engine
+	 * itself does immediately after its RemoveAtSwap loop). Returns true when it had to move anything.
 	 *
 	 * It is the ARRAY that is fixed, not a private copy of it, because every other reader —
 	 * ComputeLastLethalIndex, the bots, TraceParry's verifier, the GameMode — indexes TrailPoints
@@ -775,6 +939,15 @@ private:
 
 	/** Counter behind GetPointOrderRepairCount(). */
 	int32 PointOrderRepairs = 0;
+
+	/**
+	 * Throttle for the "this path is not a path" warning in RestoreReplicatedPointOrder().
+	 *
+	 * That check runs every tick, so an unthrottled warning would be a per-frame log flood on the one
+	 * machine that is already in trouble. One line per episode, re-armed the moment the path is sane
+	 * again, so a recurring fault still produces one line per occurrence rather than one ever.
+	 */
+	bool bPathBreakReported = false;
 
 	/** Server: swept enemy-dash trip test against the trace. */
 	void ServerRunTripTest(float DeltaTime);
@@ -895,6 +1068,16 @@ private:
 
 	/** Hides the predicted stub and zeroes its measurement. Cheap and safe to call every frame. */
 	void HidePredictedHead();
+
+	/**
+	 * SPEC v8 §2. Appends one FTraceLocalPathSample when this machine is the one predicting the
+	 * carrier, and drops everything the replicated point set has already caught up with.
+	 *
+	 * Called every frame from TickComponent, BEFORE UpdatePredictedHead and OUTSIDE its early-outs:
+	 * the frames that matter most are the ones where the stub is currently declining to draw, and a
+	 * recorder that only ran when the stub ran would have no path to offer on exactly those frames.
+	 */
+	void RecordLocalPathSample();
 
 	/** Grows the predicted-head pool to cover element @p ElementIndex. False once its cap is hit. */
 	bool EnsurePredictedElement(int32 ElementIndex);

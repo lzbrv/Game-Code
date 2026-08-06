@@ -970,7 +970,19 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			// IS the damage. UTraceSettings::HitscanDamage and HeadshotMultiplier are no longer read
 			// by the weapon (see the report); the numbers live in UTraceDamageSettings.
 			const float Damage = FTraceHitZoneModel::DamageForZone(Zone);
-			VictimHealth->ApplyDamage(Damage, Character->GetController(), FName(TEXT("Bullet")));
+
+			// SPEC v8 §6, the kill feed's headshot icon. The zone is known EXACTLY here and nowhere
+			// after: ApplyDamage takes a cause and the health component clamps at zero, so a head
+			// shot and a shin shot both arrived at the death handler as plain "Bullet". The feed was
+			// reduced to inferring it from the victim's previous health (PreviousHealth > BodyDamage
+			// ⇒ provably a head shot), which under-reports — a head shot on a victim already down to
+			// 20 was indistinguishable from a body shot and drew the plain round.
+			//
+			// Naming the zone at the one site that still knows it costs nothing and makes the icon
+			// exact in both directions. The feed already accepts this name; every other cause is
+			// unchanged, so nothing else in the taxonomy moves.
+			const FName DamageCause = (Zone == ETraceHitZone::Head) ? FName(TEXT("Headshot")) : FName(TEXT("Bullet"));
+			VictimHealth->ApplyDamage(Damage, Character->GetController(), DamageCause);
 
 			// ApplyDamage no-ops against an invulnerable target, so read the result rather than
 			// assuming the hit landed.

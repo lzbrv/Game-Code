@@ -469,7 +469,7 @@ public:
 	/**
 	 * PARRY (spec §3) — the carrier's counter to a dash through their trace.
 	 *
-	 * ROUTING ONLY. The rule ("0.1 s of trace invulnerability, the whole trace turns red, an enemy
+	 * ROUTING ONLY. The rule ("0.2 s of trace invulnerability, the whole trace turns red, an enemy
 	 * dash inside the window neither breaks the trace nor kills the carrier") belongs to
 	 * Gameplay/TraceParry.h and UTraceTrailComponent, which own the window, its replication, the red
 	 * tint and the refusal reasons. This forwards to TraceParry::RequestParry(), which is documented
@@ -484,7 +484,7 @@ public:
 	/**
 	 * Release half of the parry bind. A NO-OP by design and declared anyway.
 	 *
-	 * Parry is a tap, not a hold — the window is a fixed 0.1 s owned by the trail component, so
+	 * Parry is a tap, not a hold — the window is a fixed 0.2 s owned by the trail component, so
 	 * holding the key must not extend it. This exists so the controller can bind Started/Completed/
 	 * Canceled symmetrically like every other button in ATracePlayerController, which is what stopped
 	 * the pass bind from latching a button down across a cancel (spec §8). Do not make it do work.

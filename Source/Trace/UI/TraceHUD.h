@@ -21,6 +21,7 @@
 #include "UObject/ObjectPtr.h"
 
 #include "TraceTypes.h"          // ETraceTeam, TraceTeamColor
+#include "UI/TraceKillFeed.h"     // ETraceKillIcon, ATraceKillFeedRelay — spec v8 §6
 #include "UI/TraceOptionsMenu.h"  // FTraceOptionsMenu
 
 #include "TraceHUD.generated.h"
@@ -116,6 +117,36 @@ protected:
 
 	/** The last connection or travel failure, if recent. Same store the title screen draws from. */
 	void DrawNetworkFailureBanner();
+
+	/**
+	 * Spec v8 §6 — the kill feed. A right-hand stack of recent kills, newest at the top:
+	 *
+	 *     <killer>  [icon]  <victim>
+	 *
+	 * Names in their own team's colour, the glyph between them naming the CAUSE, rows ageing out
+	 * after ATraceKillFeedRelay::EntryLifetime and capped at MaxDrawnEntries.
+	 *
+	 * READS A REPLICATED STORE, NOT LOCAL EVENTS, and that distinction is the whole point of the
+	 * v8 pass. Every row this draws comes out of ATraceKillFeedRelay's replicated Entries array —
+	 * property state, deliberately not a multicast RPC, because a dropped RPC is a row that is gone
+	 * forever for one player while everyone else sees it (measured: 5 announced, 3 received). The
+	 * host reads that array through the same code path a joining client does, so there is no
+	 * arrangement of this HUD in which the host has a feed and a client does not. See TraceKillFeed.h.
+	 *
+	 * Drawn AFTER DrawNetworkStatus() so it can hang off the bottom of the "HOSTING — <address>"
+	 * panel that already owns the top-right corner (that panel publishes KillFeedTopY).
+	 */
+	void DrawKillFeed();
+
+	/**
+	 * One kill-feed glyph, drawn from a 13x13 bitmap at @p Cell pixels per cell, top-left at @p X,@p Y.
+	 *
+	 * NO IMPORTED ART AND NO UMG (contract §2 / spec v8 §6): every icon is an ASCII bitmap in the
+	 * .cpp, emitted as run-length integer DrawRects with a one-pixel dark surround. Integer cells
+	 * for the same reason the crosshair uses them — a fractional-width rect on a half-pixel boundary
+	 * is anti-aliased into a smudge, and these are 26 px tall shapes that have to read at a glance.
+	 */
+	void DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, const FLinearColor& Color);
 
 	/**
 	 * The centre-screen phase callout: the warm-up countdown, and "GO" as the match starts.
@@ -326,6 +357,32 @@ private:
 	 * once per change instead of once per frame. -1 forces the first draw to report.
 	 */
 	int32 LastLoggedHumanCount = -1;
+
+	// ---- Kill feed (spec v8 §6) ----------------------------------------------------------------
+
+	/**
+	 * The world's kill-feed relay. Weak and re-found on demand: on a client the actor arrives by
+	 * replication some frames after the HUD exists, and it can be destroyed by a travel.
+	 */
+	TWeakObjectPtr<ATraceKillFeedRelay> KillFeedRelay;
+
+	/**
+	 * Last time the relay was looked for, so the search is throttled rather than per-frame.
+	 *
+	 * Finding it is a TActorIterator over the whole arena. That is trivial once — but a client
+	 * connected to a build without the relay would otherwise pay it on every single frame forever,
+	 * and this HUD's one rule about probes (see PassTargetPollInterval) is that they get an interval.
+	 */
+	float LastKillFeedRelayPollTime = -1000.f;
+
+	/**
+	 * Y the kill feed may start at, published by DrawNetworkStatus() each frame.
+	 *
+	 * The network panel and the feed both want the top-right corner, and the panel's height depends
+	 * on its text (an address, a human count) — so the feed cannot hardcode a clearance. Set every
+	 * frame before the feed draws; defaults to the top margin when the panel drew nothing.
+	 */
+	float KillFeedTopY = 0.f;
 
 	/** Client-local time the last capture was observed, and who scored it. */
 	float ScoreFlashTime = -1000.f;

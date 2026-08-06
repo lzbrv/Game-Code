@@ -1470,12 +1470,19 @@ public:
 	/**
 	 * Extra horizontal speed multiplier for a slide-jump taken inside the timing window above.
 	 *
-	 * 1.10 -> 1.25 THIS PASS. Spec v5 §3, verbatim: "Increase the multiplier gained by perfectly
-	 * timing a jump at the end of a slide." [ASSUMPTION] 1.25 as the starting value. Now that the
-	 * slide is a fixed-length ability on a cooldown (bSlideIsOneShotAbility above), the timed exit
-	 * is the ONLY skill expression sliding has left, so it has to be worth reaching for: 1.25 on a
-	 * ~1100 uu/s slide is ~275 uu/s, which is a third of a walk speed and is plainly a different
-	 * jump rather than a nicer one.
+	 * 1.10 -> 1.25 (spec v5 §3) -> 1.3125 THIS PASS (spec v8 §8).
+	 *
+	 * v8 §8 verbatim: "Increase momentum from slide jump by 5%". [ASSUMPTION] read as 1.25 x 1.05 =
+	 * 1.3125 — a 5% increase OF the bonus, since "momentum from slide jump" names the thing the
+	 * multiplier produces. THE ALTERNATIVE READING IS 1.25 + 0.05 = 1.30, five percentage points
+	 * rather than five percent. The two differ by 0.0125, i.e. ~14 uu/s on a 1100 uu/s slide, which
+	 * is below what a player can feel — so this is a one-line correction in the ini if they meant
+	 * the other one, and nothing else in the kit has to move either way.
+	 *
+	 * Now that the slide is a fixed-length ability on a cooldown (bSlideIsOneShotAbility above), the
+	 * timed exit is the ONLY skill expression sliding has left, so it has to be worth reaching for:
+	 * 1.3125 on a ~1100 uu/s slide is ~344 uu/s, which is a third of a walk speed and is plainly a
+	 * different jump rather than a nicer one.
 	 *
 	 * The air-strafe falloff (Movement|Air) is what stops this compounding into free arena-crossing
 	 * speed: the launch speed is granted once, and everything past AirStrafeSoftCapSpeed is bought
@@ -1485,7 +1492,7 @@ public:
 	 * 1.0 turns the window into a no-op without disabling the move. Do not go far past ~1.35.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Speed Bonus (x)", ClampMin = "1.0", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
-	float SlideJumpWindowSpeedBonus = 1.25f;
+	float SlideJumpWindowSpeedBonus = 1.3125f;
 
 	/**
 	 * Extra JUMP HEIGHT multiplier for a slide-jump taken inside the timing window. New in spec v5
@@ -1623,6 +1630,93 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Ledge Ground Grace (s)", ClampMin = "0.0", ClampMax = "0.5", UIMin = "0.0", UIMax = "0.2"))
 	float LedgeGroundGraceSeconds = 0.08f;
+
+	// ==========================================================================================
+	// MOVEMENT — WALL JUMP  (spec v8 §7, new)
+	//
+	// "Can you add a wall jump mechanic, where players can press jump right as they hit a wall to
+	// carry momentum in a new direction?"
+	//
+	// ALL SEVEN ARE RESOLVED BY NAME by UTraceCharacterMovementComponent (TraceMoveKnob), so the
+	// spellings below are load-bearing — a rename here silently reverts the mechanic to the built-in
+	// fallback rather than failing to compile. BeginPlay's MOVEKNOB report prints BOUND or FALLBACK
+	// for each one every run, and Trace.VerifyKnobs lists them in the table.
+	// ==========================================================================================
+
+	/**
+	 * Master switch for the wall jump. Off restores the pre-v8 air game exactly: DoJump() refuses
+	 * every mid-air press and JumpMaxCount stays at 1.
+	 *
+	 * It exists because "is the wall jump making the arena feel worse" has to be answerable with one
+	 * ini edit rather than a rebuild — this is a brand-new traversal verb in a map that was tuned
+	 * without it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Wall Jump Enabled"))
+	bool bWallJumpEnabled = true;
+
+	/**
+	 * Seconds after touching a wall in which a jump press still counts as a wall jump.
+	 *
+	 * "Press jump RIGHT AS they hit a wall" is the request, so this is a reaction window and not a
+	 * wall-cling: 0.25 s is generous enough to survive a 40 ms client's own latency (the whole point
+	 * of spec v8 §0) while staying far too short to hang on a wall and think about it. Push it past
+	 * ~0.4 and the move stops reading as a timing input.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Contact Window (s)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.05", UIMax = "0.4"))
+	float WallJumpWindowSeconds = 0.25f;
+
+	/**
+	 * Fraction of the incoming planar SPEED the reflected launch keeps. 1.0 is pure preservation.
+	 *
+	 * THIS NUMBER IS THE REQUEST. "Carry momentum in a new direction" means the speed survives the
+	 * bounce and only the direction changes, so the default is deliberately near 1: 0.95 keeps the
+	 * move feeling lossless while charging a small toll that stops a corridor of walls from being a
+	 * free perpetual-motion machine. Below ~0.8 it stops reading as carrying momentum at all.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Speed Retention (x)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.7", UIMax = "1.0"))
+	float WallJumpSpeedRetention = 0.95f;
+
+	/**
+	 * Flat uu/s pushed straight out along the wall normal, on top of the reflection.
+	 *
+	 * Without it a player who slides ALONG a wall reflects almost nothing (their velocity is nearly
+	 * parallel to the face) and the wall jump does visibly nothing. This is the floor that makes a
+	 * glancing wall jump still a wall jump.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Outward Impulse (uu/s)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "150.0", UIMax = "800.0"))
+	float WallJumpOutwardImpulse = 420.f;
+
+	/**
+	 * Vertical launch, as a MULTIPLE OF JumpZVelocity — the unit every other launch in this kit uses,
+	 * so it tracks the jump automatically if the jump is ever retuned.
+	 *
+	 * Slightly over 1 so a wall jump clears a little more than a standing jump and is legible as its
+	 * own move. Combined with the consecutive cap below, 1.05 cannot climb a single flat wall.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Vertical (x jump)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.7", UIMax = "1.3"))
+	float WallJumpVerticalMultiplier = 1.05f;
+
+	/**
+	 * Consecutive wall jumps allowed without touching the ground. THE ANTI-LADDER CAP, and spec v8 §7
+	 * asks for it by name: "cap consecutive jumps without touching ground, or two close walls become
+	 * an infinite ladder".
+	 *
+	 * 2 buys the one thing the move is for — a wall, then a second wall, then you are somewhere new —
+	 * and refuses the third, which is where a corridor becomes a staircase to the skybox. Raising it
+	 * is the single most likely way to break the arena's sightlines, so raise it deliberately.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Max Consecutive (no ground)", ClampMin = "1", ClampMax = "4", UIMin = "1", UIMax = "3"))
+	int32 WallJumpMaxConsecutive = 2;
+
+	/**
+	 * Largest |Normal.Z| still counted as a wall. Above it the surface is a ramp, not a face.
+	 *
+	 * GetWalkableFloorZ() is 0.71 at the default 45-degree slope limit, so 0.4 leaves a clear band
+	 * between "wall" and "slope you could simply have walked up" — without it a shallow ramp becomes
+	 * a trampoline and the arena's approach geometry starts launching people.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Max Wall Normal Z", ClampMin = "0.0", ClampMax = "0.9", UIMin = "0.1", UIMax = "0.6"))
+	float WallJumpMaxNormalZ = 0.4f;
 
 	// --- Slide pose (spec v4 §1) — PROCEDURAL. THERE IS NO STOCK MANNEQUIN SLIDE ANIMATION. -----
 	//
@@ -1907,6 +2001,34 @@ public:
 	float CoreThrowUpBias = 0.12f;
 
 	/**
+	 * How much of the THROWER'S OWN velocity the Core keeps when it leaves their hands, as a fraction.
+	 * Spec v8 §4, and the whole of it.
+	 *
+	 * Verbatim: "When jumping and throwing the core, the core doesn't seem to keep momentum. Make
+	 * sure that the core has the momentum from the throw and also carries momentum from the player."
+	 * Before v8 the launch was impulse and nothing else, so a throw taken at a dead sprint and a
+	 * throw taken standing still left at exactly the same speed — and a throw taken at the top of a
+	 * jump threw away the jump, which is the case the note actually names.
+	 *
+	 * [ASSUMPTION] 1.0, full inheritance, per the spec's own instruction to expose a fraction rather
+	 * than hardcode a fudge. VERTICAL IS INCLUDED: that is the jumping throw.
+	 *
+	 * DELIBERATELY NOT SCALED BY CoreMassScale. Mass says how hard the Core is to THROW and already
+	 * divides the impulse; momentum is transferred by carrying it, so a heavier Core leaves the same
+	 * jump with the same velocity. Applying the weight to both would apply it twice.
+	 *
+	 * 0 replays the pre-v8 throw exactly, which is the A/B to reach for if this proves too strong.
+	 * 0.6 is the middle setting that keeps a jumping throw feeling like a jumping throw while cutting
+	 * the dash-throw tail case (dash 3000 + impulse ~= 5300 uu/s) by 40%.
+	 *
+	 * NAME IS LOAD-BEARING: ATraceCore resolves this by reflection under exactly this spelling, and
+	 * says so at runtime — the mode-B binding check prints "NO UTraceSettings PROPERTY FOUND FOR:"
+	 * with the name if it is renamed here alone.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Velocity Inheritance (fraction) [mode B]", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
+	float CoreThrowVelocityInheritance = 1.0f;
+
+	/**
 	 * World gravity multiplier applied to a Core in flight and rolling loose, BEFORE weight.
 	 *
 	 * Below 1 because the field is 33600 uu long: at full gravity a throw that a player can aim
@@ -2095,21 +2217,27 @@ public:
 	// ==========================================================================================
 
 	/**
-	 * Seconds of trace invulnerability granted by a parry. Spec §3: 0.1.
+	 * Seconds of trace invulnerability granted by a parry. Spec v8 §3: 0.2 (was 0.1 in v3 §3).
 	 *
-	 * THE ENTIRE MECHANIC IS THIS NUMBER. At 0.1 s a parry has to be a read of the incoming dash;
-	 * at 0.4 s it is a panic button, and the dash — the only counterplay the defence has against a
-	 * carrier — stops being reliable. Raise it only if playtesting says the window is unhittable at
-	 * real latency, and raise the cooldown with it. Sane range 0.08 to 0.25.
+	 * Verbatim: "Increase parry time to .2seconds".
+	 *
+	 * THE ENTIRE MECHANIC IS THIS NUMBER. At 0.2 s a parry is still a read of the incoming dash; at
+	 * 0.4 s it is a panic button, and the dash — the only counterplay the defence has against a
+	 * carrier — stops being reliable. Raise it further only if playtesting says the window is
+	 * unhittable at real latency, and raise the cooldown with it. Sane range 0.08 to 0.30.
+	 *
+	 * NOTE FOR TUNING AT LATENCY: a joined client does not lose window LENGTH to the network, they
+	 * lose its ALIGNMENT — see Gameplay/TraceParry.h's v8 §3 header. Widening this number is not the
+	 * fix for that and never was; it only makes the misalignment cheaper to survive.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Parry", meta = (DisplayName = "Parry Duration (s)", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.05", UIMax = "0.5"))
-	float ParryDuration = 0.10f;
+	float ParryDuration = 0.20f;
 
 	/**
 	 * Seconds before the carrier may parry again, measured from the parry's START.
 	 *
-	 * [ASSUMPTION] — the spec does not give one. 1.5 s against a 0.1 s window is a ~7% uptime, which
-	 * keeps it a reaction check: spamming it covers almost nothing, so a defender's dash timing
+	 * [ASSUMPTION] — the spec does not give one. 1.5 s against v8's 0.2 s window is a ~13% uptime,
+	 * which keeps it a reaction check: spamming it covers almost nothing, so a defender's dash timing
 	 * still beats a carrier's button mashing. Drop it toward 0.5 and the carrier can simply hold
 	 * the lane covered; the mechanic then reads as "the carrier is immune", which is not the game.
 	 */

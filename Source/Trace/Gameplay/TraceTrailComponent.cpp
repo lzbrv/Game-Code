@@ -246,8 +246,17 @@ namespace
 	 */
 	constexpr int32 MaxRibbonElements = 96;
 
-	/** Elements in the owner-only predicted-head ribbon. The stub is at most GPredictedHeadMaxLength. */
-	constexpr int32 MaxPredictedRibbonElements = 12;
+	/**
+	 * Elements in the owner-only predicted-head ribbon. The stub is at most GPredictedHeadMaxLength.
+	 *
+	 * v8 §2 took it from 12 to 24 with the cap's rise from 400 to 1200: BuildRibbonSamples COARSENS
+	 * rather than truncating, so 12 would still have covered the whole stub — as 100uu elements
+	 * chording a dash's curve. 24 keeps the stub's element length at the ribbon's own 60uu step, which
+	 * matters because the join between the stub and the replicated ribbon has to be invisible and a
+	 * chunkier element on one side of it is exactly how it becomes visible. Twelve extra boxes, on one
+	 * pawn per machine — the carrier's own.
+	 */
+	constexpr int32 MaxPredictedRibbonElements = 24;
 
 	/**
 	 * ALTERNATING CROSS-SECTION INSET, and it is not a cosmetic nicety — it is the fix for the
@@ -461,21 +470,79 @@ namespace
 	 *     laid but this machine has not received. At 800uu/s and 120ms that is ~100uu; at dash speed
 	 *     it is more.
 	 *
-	 * 400 covers both with room to spare. Beyond it the stub is NOT clamped, it is ABANDONED: a
-	 * distance that large means a teleport, a respawn or a desync severe enough that a straight line
-	 * from the last known point to the pawn would be an invention rather than an interpolation, and
-	 * the honest thing to draw is the trace the machine actually knows about. Same reasoning, and the
-	 * same order of magnitude, as MaxTrailSegmentLength below.
+	 * SPEC v8 §2 RAISED IT FROM 400 TO 1200, AND THE REASON IS THE WHOLE OF THIS PASS.
+	 *
+	 * 400 was sized for the HOST, where the only thing to cover is the head-grace stub (~80uu) — and
+	 * on the host it never came close to firing. On a JOINED CLIENT the same gap is the sum of three
+	 * terms, not one: the head grace, the round trip of trace the server has laid and the wire has not
+	 * yet delivered, AND the client's own movement prediction, which puts the pawn a further round
+	 * trip AHEAD of the position those points were laid at. Measured on a client at 40ms (see
+	 * Trace.Trail.OwnerHeadAB), a dash at 3000uu/s puts that sum at 400-600uu — i.e. straight through
+	 * the cap, on every dash, on a client only. And the cap does not shorten the stub, it DELETES it:
+	 * the carrier's trace detached from their body for the whole dash and snapped back afterwards.
+	 * That is "trace still has the same bug for the people connecting to the server".
+	 *
+	 * The cap could only be raised because the stub stopped being a straight line — see
+	 * GPredictedHeadUseHistory below. Every uu of it is now ground the pawn is recorded as having
+	 * actually covered, so length alone no longer implies fabrication, and the thing that DOES imply
+	 * fabrication (a single step no player could have walked) is tested per segment instead, against
+	 * MaxTrailSegmentLength — the same constant the server restarts its own trace on. 1200 is the
+	 * trace's own maximum length: past that the stub would be longer than the trace it continues.
 	 */
-	float GPredictedHeadMaxLength = 400.f;
+	float GPredictedHeadMaxLength = 1200.f;
 
 	FAutoConsoleVariableRef CVarPredictedHeadMaxLength(
 		TEXT("Trace.Trail.PredictMaxLength"),
 		GPredictedHeadMaxLength,
-		TEXT("uu the owner-only predicted head stub may span (spec v5 2). 0 disables the prediction and "
-		     "restores the gap between a carrier and the end of their own trace. Beyond this length the "
-		     "stub is dropped entirely rather than clamped - see the comment."),
+		TEXT("uu the owner-only predicted head stub may span (spec v5 2, raised 400 -> 1200 by v8 2). 0 "
+		     "disables the prediction and restores the gap between a carrier and the end of their own "
+		     "trace. Beyond this length the stub is dropped entirely rather than clamped - see the "
+		     "comment. Set it to 400 to reproduce the pre-v8 client behaviour."),
 		ECVF_Default);
+
+	/**
+	 * SPEC v8 §2 — THE FIX ITSELF, and the A/B lever for it. 1 = on, the default.
+	 *
+	 * With this off, the stub is what v5 §2 shipped: a straight chord from the newest drawn point to
+	 * wherever the pawn is now. That is exact on the host (the two are 80uu apart) and wrong on a
+	 * client in two different ways at once — it is too LONG to be trusted (so the cap deletes it) and,
+	 * where it does draw, it is a chord across whatever corner the carrier turned during the round
+	 * trip, so the trace visibly cuts the corner it is supposed to be following.
+	 *
+	 * With it on, the stub is built THROUGH LocalPathHistory: the carrier's own recorded per-frame
+	 * positions, on their own machine, from the newest replicated point up to the pawn. It is not a
+	 * prediction of the past at all — it is a record of it. The one thing it cannot know is what the
+	 * SERVER did with those frames, which is precisely why the stub stays owner-only, non-lethal and
+	 * stateless: the moment the authoritative point for that ground arrives, the sample it duplicates
+	 * is dropped and the ribbon behind the carrier is the replicated one again.
+	 */
+	int32 GPredictedHeadUseHistory = 1;
+
+	FAutoConsoleVariableRef CVarPredictedHeadUseHistory(
+		TEXT("Trace.Trail.PredictHistory"),
+		GPredictedHeadUseHistory,
+		TEXT("1 (default) builds the owner-only predicted head through the carrier's own recorded path, "
+		     "so it follows the corners they turned and can honestly span a client's round trip (spec "
+		     "v8 2). 0 restores the v5 straight chord, which is the pre-v8 client behaviour."),
+		ECVF_Default);
+
+	/**
+	 * Samples kept in LocalPathHistory. At 120fps this is 1.0s of travel, which is an order of
+	 * magnitude more than the round trip it has to cover; the per-frame trim by birth time is what
+	 * actually bounds it, and this is only the ceiling that keeps a stalled client's array finite.
+	 */
+	constexpr int32 MaxLocalPathSamples = 120;
+
+	/** How much of the carrier's own path is kept, in seconds. See RecordLocalPathSample(). */
+	constexpr float LocalPathHistorySeconds = 1.0f;
+
+	/**
+	 * Minimum spacing between two recorded samples, in uu. Anything finer is invisible in a ribbon
+	 * whose resample step is GRibbonStep (60uu) and would only cost curve control points. 25uu is
+	 * comfortably finer than the 60uu the server itself lays points at, so the stub is never a coarser
+	 * description of the path than the trace it continues.
+	 */
+	constexpr double LocalPathSampleSpacing = 25.0;
 
 	/** Elements in the predicted-head pool: up to TrailHeadGracePoints real segments plus the stub. */
 	constexpr int32 MaxPredictedSmearElements = 6;
@@ -914,6 +981,12 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 
 		UpdateVisuals();
 
+		// SPEC v8 §2. BEFORE UpdatePredictedHead and deliberately not inside it: the stub has a dozen
+		// early-outs, and the frames where it declines to draw are exactly the frames whose movement
+		// the next successful stub needs to know about. A recorder behind those early-outs would go
+		// blind precisely when the carrier was dashing.
+		RecordLocalPathSample();
+
 		// EVERY frame, and BEFORE the fade below, for two reasons that are really one: it tracks a
 		// moving pawn rather than a settled point array, and the piece it places has to be handed to
 		// the proximity pass on the same frame it appears (spec v5 §2).
@@ -1069,7 +1142,7 @@ bool UTraceTrailComponent::IsEmitting() const
 //   Source 1, THE PASS WINDOW (§4). ~0.5s. Owned by ATraceCore. It is the SAME replicated bool that
 //   drops the holder's shield, so the risk beat cannot half-apply.
 //
-//   Source 2, THE PARRY (v3 §3). 0.1s on a 1.5s cooldown. Owned by this component. It does NOT
+//   Source 2, THE PARRY (v3 §3, widened by v8 §3). 0.2s on a 1.5s cooldown. Owned by this component. It does NOT
 //   touch the shield: the carrier stays bulletproof throughout.
 //
 // They are ORed, and each stays separately readable. The failure mode this structure exists to
@@ -1214,16 +1287,18 @@ void UTraceTrailComponent::RequestParry(ETraceParryRefusal& OutRefusal)
 	LocalParryPredictEndTime = GetServerTimeSeconds() + TraceParry::GetDurationSeconds();
 	bVisualsDirty = true;
 
-	ServerRequestParry();
+	// v8 §3. The stamp is the whole fix: it is what lets the server judge this parry against when it
+	// was PRESSED instead of when the packet landed. Same clock as the window it will open.
+	ServerRequestParry(TraceParry::GetPressStampSeconds(OwnerActor));
 }
 
-void UTraceTrailComponent::ServerRequestParry_Implementation()
+void UTraceTrailComponent::ServerRequestParry_Implementation(float ClientPressServerTime)
 {
 	ETraceParryRefusal Refusal = ETraceParryRefusal::None;
-	ServerTryBeginParry(Refusal);
+	ServerTryBeginParry(Refusal, ClientPressServerTime);
 }
 
-bool UTraceTrailComponent::ServerTryBeginParry(ETraceParryRefusal& OutRefusal)
+bool UTraceTrailComponent::ServerTryBeginParry(ETraceParryRefusal& OutRefusal, float ClientPressServerTime)
 {
 	OutRefusal = ETraceParryRefusal::None;
 
@@ -1256,20 +1331,30 @@ bool UTraceTrailComponent::ServerTryBeginParry(ETraceParryRefusal& OutRefusal)
 	}
 
 	const float Now = GetServerTimeSeconds();
-	if (ParryCooldownEndServerTime > 0.f && Now < ParryCooldownEndServerTime)
+
+	// v8 §3. ONE call owns the clamp, the anchor and the cooldown test, so the rewind rule lives in
+	// one place — next to the shot rewind it copies. The cooldown is now asked AT THE PRESS: a
+	// client whose cooldown expired 5ms before they pressed is not refused for their own latency.
+	float PressServerTime = Now;
+	float WindowEnd = 0.f;
+	float CooldownEnd = 0.f;
+	if (!TraceParry::ServerResolvePress(GetOwnerCharacter(), ClientPressServerTime, Now,
+			ParryCooldownEndServerTime, PressServerTime, WindowEnd, CooldownEnd, OutRefusal))
 	{
-		OutRefusal = ETraceParryRefusal::OnCooldown;
-		return false;
+		return false;   // OutRefusal is set (OnCooldown / NoPawn)
 	}
 
-	ParryEndServerTime = Now + TraceParry::GetDurationSeconds();
-	ParryCooldownEndServerTime = Now + TraceParry::GetCooldownSeconds();
+	ParryEndServerTime = WindowEnd;
+	ParryCooldownEndServerTime = CooldownEnd;
 
 	// A listen server is also a viewer: it will not get OnRep, so dirty the visuals here.
 	bVisualsDirty = true;
 
-	UE_LOG(LogTraceGame, Log, TEXT("[PARRY] %s parried: trace invulnerable for %.2fs, next parry in %.2fs."),
-		*GetNameSafe(GetOwner()), TraceParry::GetDurationSeconds(), TraceParry::GetCooldownSeconds());
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[PARRY] %s parried: trace invulnerable for %.2fs, next parry in %.2fs. "
+		     "(press anchored %.0fms before arrival)"),
+		*GetNameSafe(GetOwner()), TraceParry::GetDurationSeconds(), TraceParry::GetCooldownSeconds(),
+		(Now - PressServerTime) * 1000.f);
 
 	return true;
 }
@@ -1407,6 +1492,11 @@ void UTraceTrailComponent::MulticastClearTrail_Implementation()
 	// most obviously leave hanging in the air. It goes on the same frame as everything else.
 	HidePredictedHead();
 
+	// And so does the record it would be rebuilt from (v8 §2). RecordLocalPathSample() would clear it
+	// on the next tick anyway — bEmitting is false by the time a trace is cleared — but "anyway" and
+	// "one frame later" are the same sentence, and this is the frame the trace is supposed to vanish.
+	LocalPathHistory.Reset();
+
 	LastVisualPointCount = -1;
 	LastVisualHead = FVector::ZeroVector;
 	LastVisualTail = FVector::ZeroVector;
@@ -1462,6 +1552,35 @@ void UTraceTrailComponent::MulticastClearTrail_Implementation()
 // TrailPoints.Items directly and assumes path order — ComputeLastLethalIndex, the bots' intercept
 // planning, TraceParry's verifier, the GameMode's trail-kill probe. A private sorted copy inside the
 // renderer would have fixed the picture and left all of them holding a scrambled path.
+//
+// -------------------------------------------------------------------------------------------------
+// SPEC v8 §2 — "Trace still has the same bug for the people connecting to the server."
+//
+// The mechanism above is right. The KEY IT SORTED ON WAS NOT, and the counter that was quoted as
+// evidence ("ORD 2 -> 0") measured the same wrong thing, so the two agreed with each other rather
+// than with the game.
+//
+//   v7 sorted on BirthServerTime — a replicated FLOAT, with `<`, using a STABLE sort. Two points
+//   carrying the same stamp are therefore left in exactly the order RemoveAtSwap put them, and the
+//   violation counter, which uses the same strict comparison, scores that array as perfect. The
+//   repair and its own proof share one blind spot, which is the worst possible arrangement: the
+//   measurement cannot fail where the fix does.
+//
+//   IT NOW SORTS ON ReplicationID, which is not a proxy for the append order — it is the append
+//   order. FFastArraySerializer::MarkItemDirty assigns `ReplicationID = ++IDCounter` the first time
+//   an item is marked, so the IDs are issued in exactly the sequence the server appended points; they
+//   are int32, so there are no ties and no precision to lose; and the engine's own header states the
+//   contract this stands on — "the ReplicationID is replicated and in sync between client and server.
+//   The indices are not." The wire preserves identity and discards position, so identity is what the
+//   order must be rebuilt from. BirthServerTime survives only as a tie-break for an item with no ID.
+//
+// AND THERE IS NOW A SECOND, INDEPENDENT DETECTOR, because a fix whose only detector is its own sort
+// key is how this shipped twice: a GEOMETRIC one. The server refuses to lay a segment longer than
+// MaxTrailSegmentLength (it restarts the trace instead, see ServerUpdateTrail), so an adjacent pair
+// further apart than that, on a receiving machine, means the array is not a path — whatever produced
+// it. That is the thing the player is actually looking at, and it is checked before AND after the
+// sort. If the path is still broken afterwards it is logged as a warning rather than quietly
+// tolerated, so the next "it is still not fixed" arrives with evidence attached.
 // =================================================================================================
 
 bool UTraceTrailComponent::RestoreReplicatedPointOrder()
@@ -1485,30 +1604,104 @@ bool UTraceTrailComponent::RestoreReplicatedPointOrder()
 		return false;
 	}
 
-	// The common case is a single O(n) scan that finds nothing: n is ~21 points at the v7 §2 length.
-	bool bOutOfOrder = false;
-	for (int32 Index = 1; Index < PointCount; ++Index)
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v8 §2 — THE KEY IS ReplicationID, NOT BirthServerTime.
+	//
+	// v7 §7 sorted on BirthServerTime, which is a REPLICATED FLOAT, and both the sort and the
+	// violation counter therefore had the same two blind spots:
+	//
+	//   TIES ARE INVISIBLE. `<` is strict and the sort is stable, so any two points that carry the
+	//   same stamp are left in exactly the order RemoveAtSwap left them — scrambled — while
+	//   CountPointOrderViolations() reports a clean zero over the top of it. A fix that measured
+	//   "ORD 2 -> 0" would look like a pass in precisely the case where it had done nothing.
+	//
+	//   IT IS A DERIVED QUANTITY. The stamp is gameplay data that happens to be monotone today. It is
+	//   float, it is quantised by nothing, and nothing structurally forbids two points sharing one.
+	//
+	// ReplicationID has neither problem, and it is not a proxy for the order — it IS the order.
+	// FFastArraySerializer::MarkItemDirty assigns `Item.ReplicationID = ++IDCounter` the first time an
+	// item is marked, so IDs are handed out in exactly the sequence the server appended points, they
+	// are int32 (no ties, no precision), and the engine's own documentation states the contract this
+	// relies on: "the ReplicationID is replicated and in sync between client and server. The indices
+	// are not." That sentence is the whole bug and the whole fix in one line — the wire preserves
+	// identity and discards position, so identity is what the order has to be rebuilt from.
+	//
+	// BirthServerTime survives as the tie-break, for the one case IDs cannot cover: a point that has
+	// somehow never been assigned one (INDEX_NONE), which cannot happen for an item that arrived over
+	// the wire but is cheap to be correct about.
+	// ---------------------------------------------------------------------------------------------
+	auto PathOrderLess = [](const FTraceTrailPoint& A, const FTraceTrailPoint& B)
 	{
-		if (TrailPoints.Items[Index].BirthServerTime < TrailPoints.Items[Index - 1].BirthServerTime)
+		if (A.ReplicationID != B.ReplicationID)
 		{
-			bOutOfOrder = true;
-			break;
+			return A.ReplicationID < B.ReplicationID;
 		}
+		return A.BirthServerTime < B.BirthServerTime;
+	};
+
+	// The common case is a single O(n) scan that finds nothing: n is ~21 points at the v7 §2 length.
+	//
+	// TWO DETECTORS WITH TWO DIFFERENT JOBS, because the report says the v7 §7 fix was not enough and
+	// a fix whose only evidence is its own sort key is how that happens twice:
+	//
+	//   IDENTITY  the array is not in ReplicationID order. This is the RemoveAtSwap scramble, and it
+	//             is what the sort REPAIRS — now decided on the integer the engine guarantees to keep
+	//             in sync rather than on a replicated float.
+	//   GEOMETRY  two adjacent points are further apart than a carrier could possibly have travelled
+	//             between them. The server refuses to lay such a segment at all (see
+	//             MaxTrailSegmentLength in ServerUpdateTrail — it restarts the trace instead), so on a
+	//             receiving machine this can only mean the array is not a path. It is the AUDIT, not a
+	//             second repair, and deliberately so: it is checked before and after the sort, and if
+	//             it fails while the identity order is already perfect then re-sorting cannot help and
+	//             the honest response is a warning naming the numbers, not a silently redrawn ribbon.
+	//             It measures the thing the player is looking at rather than the key being sorted on.
+	auto WorstAdjacentGap = [this]() -> double
+	{
+		double Worst = 0.0;
+		for (int32 Index = 1; Index < TrailPoints.Items.Num(); ++Index)
+		{
+			Worst = FMath::Max(Worst, FVector::Dist(
+				TrailPoints.Items[Index - 1].Location, TrailPoints.Items[Index].Location));
+		}
+		return Worst;
+	};
+
+	bool bIdentityOutOfOrder = false;
+	for (int32 Index = 1; Index < PointCount && !bIdentityOutOfOrder; ++Index)
+	{
+		bIdentityOutOfOrder = PathOrderLess(TrailPoints.Items[Index], TrailPoints.Items[Index - 1]);
 	}
 
-	if (!bOutOfOrder)
+	const double GapBefore = WorstAdjacentGap();
+	const bool bGeometryBroken = (GapBefore > MaxTrailSegmentLength);
+
+	if (!bIdentityOutOfOrder)
 	{
+		// THE SORT WOULD BE A NO-OP, so it is not run — and this branch is deliberately not silent.
+		//
+		// Sorting anyway would cost an ItemMap rebuild and a full ribbon rebuild EVERY FRAME for as
+		// long as the condition lasted, and would achieve nothing. But a path that is in perfect
+		// ReplicationID order and still geometrically impossible is a THIRD failure this file does not
+		// know about, so it is reported rather than tidied away. bPathBreakReported throttles it to
+		// one line per episode: this runs every tick.
+		if (bGeometryBroken && !bPathBreakReported)
+		{
+			bPathBreakReported = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[TRACEORDER] %s: replicated trace is in correct ReplicationID order but has a %.0fuu "
+				     "adjacent gap (%d points, limit %.0fuu). The order is NOT the cause here - the point "
+				     "set itself is wrong. See RestoreReplicatedPointOrder()."),
+				*GetNameSafe(GetOwner()), GapBefore, PointCount, MaxTrailSegmentLength);
+		}
+		else if (!bGeometryBroken)
+		{
+			bPathBreakReported = false;
+		}
+
 		return false;
 	}
 
-	// BirthServerTime is the authority's own shared-clock stamp, replicated with the point and never
-	// touched on a client, so it is the one field that still knows the true path order after the swap.
-	// Stable, so points stamped in the same tick (which the append gate makes impossible, but a
-	// pathological spacing could not rule out) keep whatever relative order they arrived in.
-	TrailPoints.Items.StableSort([](const FTraceTrailPoint& A, const FTraceTrailPoint& B)
-	{
-		return A.BirthServerTime < B.BirthServerTime;
-	});
+	TrailPoints.Items.StableSort(PathOrderLess);
 
 	// ItemMap maps ReplicationID -> index into Items, and we have just moved every index. Emptying it
 	// is what forces the engine's ConditionalRebuildItemMap to rebuild it against the new layout on
@@ -1520,20 +1713,50 @@ bool UTraceTrailComponent::RestoreReplicatedPointOrder()
 	++PointOrderRepairs;
 	bVisualsDirty = true;
 
+	// DID IT ACTUALLY WORK? The v7 §7 pass asserted the repair and measured a proxy for it; this
+	// checks the thing the player sees — whether the result is a walkable path — and says so out loud
+	// when it is not. A repair that leaves the array broken must never again look like a pass.
+	const double GapAfter = WorstAdjacentGap();
+	if (GapAfter > MaxTrailSegmentLength)
+	{
+		if (!bPathBreakReported)
+		{
+			bPathBreakReported = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[TRACEORDER] %s: sorted into ReplicationID order and the trace is STILL broken - "
+				     "worst adjacent gap %.0fuu -> %.0fuu over %d points (limit %.0fuu)."),
+				*GetNameSafe(GetOwner()), GapBefore, GapAfter, PointCount, MaxTrailSegmentLength);
+		}
+	}
+	else
+	{
+		bPathBreakReported = false;
+	}
+
 	UE_LOG(LogTraceGame, Verbose,
-		TEXT("[TRACEORDER] %s: repaired a scrambled replicated trace (%d points, repair #%d). "
-		     "FFastArraySerializer removes with RemoveAtSwap - see RestoreReplicatedPointOrder()."),
-		*GetNameSafe(GetOwner()), PointCount, PointOrderRepairs);
+		TEXT("[TRACEORDER] %s: repaired a scrambled replicated trace (%d points, repair #%d, "
+		     "worst adjacent gap %.0fuu -> %.0fuu). FFastArraySerializer removes with RemoveAtSwap - "
+		     "see RestoreReplicatedPointOrder()."),
+		*GetNameSafe(GetOwner()), PointCount, PointOrderRepairs, GapBefore, GapAfter);
 
 	return true;
 }
 
 int32 UTraceTrailComponent::CountPointOrderViolations() const
 {
+	// Same key as the repair, and that is the point: a counter that measures something the repair does
+	// not act on is how "ORD 2 -> 0" got quoted for a bug that was still there.
 	int32 Violations = 0;
 	for (int32 Index = 1; Index < TrailPoints.Items.Num(); ++Index)
 	{
-		if (TrailPoints.Items[Index].BirthServerTime < TrailPoints.Items[Index - 1].BirthServerTime)
+		const FTraceTrailPoint& Previous = TrailPoints.Items[Index - 1];
+		const FTraceTrailPoint& Current = TrailPoints.Items[Index];
+
+		const bool bOutOfOrder = (Current.ReplicationID != Previous.ReplicationID)
+			? (Current.ReplicationID < Previous.ReplicationID)
+			: (Current.BirthServerTime < Previous.BirthServerTime);
+
+		if (bOutOfOrder)
 		{
 			++Violations;
 		}
@@ -1561,6 +1784,55 @@ float UTraceTrailComponent::MeasureTraceLength() const
 		Length += FVector::Dist(TrailPoints.Items[Index - 1].Location, TrailPoints.Items[Index].Location);
 	}
 	return static_cast<float>(Length);
+}
+
+float UTraceTrailComponent::MeasureMaxAdjacentSegment() const
+{
+	double Worst = 0.0;
+	for (int32 Index = 1; Index < TrailPoints.Items.Num(); ++Index)
+	{
+		Worst = FMath::Max(Worst,
+			FVector::Dist(TrailPoints.Items[Index - 1].Location, TrailPoints.Items[Index].Location));
+	}
+	return static_cast<float>(Worst);
+}
+
+void UTraceTrailComponent::MeasureDrawnSpan(float& OutNearest, float& OutFarthest, int32& OutVisiblePieces) const
+{
+	OutNearest = -1.f;
+	OutFarthest = -1.f;
+	OutVisiblePieces = 0;
+
+	const ATraceCharacter* Holder = GetOwnerCharacter();
+	if (Holder == nullptr)
+	{
+		return;
+	}
+
+	const FVector PawnLocation = Holder->GetActorLocation();
+	double Nearest = TNumericLimits<double>::Max();
+	double Farthest = 0.0;
+
+	for (const UStaticMeshComponent* Piece : SmearMeshes)
+	{
+		if (Piece == nullptr || !Piece->IsVisible())
+		{
+			continue;
+		}
+
+		++OutVisiblePieces;
+
+		const FBoxSphereBounds& LocalBounds = Piece->Bounds;
+		const double CentreDistance = FVector::Dist(PawnLocation, LocalBounds.Origin);
+		Nearest = FMath::Min(Nearest, FMath::Max(0.0, CentreDistance - LocalBounds.SphereRadius));
+		Farthest = FMath::Max(Farthest, CentreDistance);
+	}
+
+	if (OutVisiblePieces > 0)
+	{
+		OutNearest = static_cast<float>(Nearest);
+		OutFarthest = static_cast<float>(Farthest);
+	}
 }
 
 void UTraceTrailComponent::OnTrailPointsChanged()
@@ -1723,6 +1995,26 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	// -------------------------------------------------------------------------------------------
 	if (Holder == nullptr || !Holder->IsAlive() || TrailPoints.Items.Num() == 0)
 	{
+		// v8 §3. A held trip must never leak out through an early return — that is precisely the
+		// "stopped asking" failure TraceParry's dead-man switch disarms the whole mechanic over.
+		//
+		// The two cases are genuinely different, so they are answered differently rather than both
+		// being swept under a null assignment:
+		//
+		//   carrier dead / gone  -> the kill is MOOT. Withdraw it; nobody dies twice.
+		//   trail merely EMPTY   -> the kill was EARNED, at PendingTripServerTime, against segments
+		//                           that were lethal and drawn then. A turnover or a pass clearing the
+		//                           ribbon a frame or two later must not refund the dasher's kill, so
+		//                           keep resolving it to its proper verdict.
+		if (Holder == nullptr || !Holder->IsAlive())
+		{
+			ServerCancelPendingTrip();
+		}
+		else if (PendingTripDasher.IsValid())
+		{
+			ServerAdvancePendingTrip(Holder, DeltaTime);
+		}
+
 		PreviousLocations.Reset();
 		return;
 	}
@@ -1737,7 +2029,7 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	// up their shield: for those 0.5s the dash counterplay is off the table and the only way to stop
 	// the pass is to shoot them. Signposted by GhostInvulnerableGlowScale.
 	//
-	// v3 §3, THE PARRY. 0.1s, carrier-only, on a cooldown, shield untouched. Signposted by the
+	// v3 §3, THE PARRY. 0.2s (v8 §3), carrier-only, on a cooldown, shield untouched. Signposted by the
 	// entire trace turning RED. Read from IsParryActive(), which is the REPLICATED window and never
 	// the client's local prediction — this line is where "server-authoritative on whether a dash
 	// landed inside the window" actually happens.
@@ -1750,7 +2042,13 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	// every single pass was silently swallowed.
 	// -------------------------------------------------------------------------------------------
 	const bool bPassWindow = IsPassWindowInvulnerable();
-	const bool bParry = IsParryActive();
+
+	// v8 §3: the sweep resolves at a known instant; that instant is what the window has to cover.
+	// ServerWasParryOpenAt falls back to IsParryActive() for any pawn with no stamped press on file
+	// (bots, the host), so those answers are unchanged.
+	TraceParry::NotifyHeldTripsWired();
+	const float TripServerTime = GetServerTimeSeconds();
+	const bool bParry = TraceParry::ServerWasParryOpenAt(GetOwner(), TripServerTime);
 	const bool bInvulnerable = bPassWindow || bParry;
 
 	// Everything up to and including this index is BOTH lethal and drawn; everything after it is
@@ -1993,6 +2291,11 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		}
 	}
 
+	// The dasher (if any) that the HELD path punished for a parry this frame. See the guard on the
+	// ParriedDasher block below: both paths call ServerPunishParriedDash, and that function carries
+	// the Demo 7 refunds, so the same dasher must not go through it twice in one frame.
+	ATraceCharacter* HeldPathPunished = nullptr;
+
 	// Applied outside every loop above: this kills, which re-enters the component and mutates
 	// TrailPoints.Items and PreviousLocations.
 	if (Tripper != nullptr)
@@ -2000,20 +2303,56 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		// parry=0 passWindow=0 is printed on the KILL line too, and it is not noise: the claim under
 		// test is a conditional, so the log has to carry the negative case as explicitly as the
 		// positive one. "Every dash through a trace, and whether a parry was active" is one grep.
-		UE_LOG(LogTraceGame, Log,
-			TEXT("[TRACEDASH] %s dashed through %s's trace: KILL. parry=0 passWindow=0 points=%d lethal=%d emitting=%d (residual trace: %s)"),
-			*GetNameSafe(Tripper), *GetNameSafe(Holder),
-			TrailPoints.Items.Num(), TestPositions.Num(), bEmitting ? 1 : 0,
-			bEmitting ? TEXT("no") : TEXT("yes - laid before a turnover"));
+		// v8 §3. A REMOTE carrier's parry may still be in the air; hold the kill for their own
+		// upstream lag and re-ask each frame. GetTripHoldSeconds() is 0 for the host and for bots,
+		// so single-machine play is untouched. The dasher pays a few tens of ms of feedback delay;
+		// they lose nothing else.
+		if (PendingTripDasher.Get() != Tripper)
+		{
+			PendingTripDasher = Tripper;
+			PendingTripServerTime = TripServerTime;
+			PendingTripHeldSeconds = 0.f;
 
-		ApplyTrailTrip(Holder, Tripper);
+			// Resolve the brand-new trip on its own contact frame with zero elapsed hold, exactly as
+			// before: a host or a bot carrier holds for 0s and dies on this very line.
+			ServerAdvancePendingTrip(Holder, 0.f, &HeldPathPunished);
+		}
+		else
+		{
+			ServerAdvancePendingTrip(Holder, DeltaTime, &HeldPathPunished);
+		}
+	}
+	else if (PendingTripDasher.IsValid())
+	{
+		// v8 §3, THE OTHER HALF OF THE HOLD — and the single line that decides whether any of this
+		// works. A dash crosses a ribbon in one or two frames; a remote carrier's hold lasts three or
+		// four. The previous code cleared PendingTripDasher here, on the first frame the dasher was no
+		// longer intersecting, so the hold was DROPPED rather than resolved: the earned kill never
+		// landed, TraceParry's dead-man switch counted it abandoned, and the first lethal dash against
+		// a joined carrier disarmed held trips (and with them the 58ms press anchoring) for the whole
+		// session. Measured before this change: case B left the carrier ALIVE 3/3 instead of DEAD 4/4
+		// — remote carriers were effectively unkillable by trace dashes, a worse client-only bug than
+		// the one v8 §3 set out to fix.
+		//
+		// Contact is NOT re-required. The trip already resolved, at PendingTripServerTime, against a
+		// segment that was lethal and drawn at that instant; the only open question is whether a press
+		// covering that instant shows up before the hold expires. Nothing here can invent a kill the
+		// sweep did not already earn.
+		ServerAdvancePendingTrip(Holder, DeltaTime, &HeldPathPunished);
 	}
 
 	// v6 §3, deferred for the same re-entrancy reason as ApplyTrailTrip above: this kills, and the
 	// death path re-enters this component.
-	if (ParriedDasher != nullptr)
+	//
+	// v8 integration: NOT if the held path already punished this same dasher this frame. Both routes
+	// end at ServerPunishParriedDash, which applies the Demo 7 refunds (parry cooldown to zero, one
+	// dash charge back) and kills the dasher — running it twice would refund twice and log a second
+	// kill against a corpse. The two routes overlap for exactly one frame whenever a held trip is
+	// resolved by a press that ALSO makes the live window open on the frame the dasher is still
+	// inside the ribbon, which is the common case rather than a rare one.
+	if (ParriedDasher != nullptr && ParriedDasher != HeldPathPunished)
 	{
-		TraceParry::ServerPunishParriedDash(Holder, ParriedDasher);
+		TraceParry::ServerPunishParriedDash(Holder, ParriedDasher, TripServerTime);
 	}
 }
 
@@ -2067,6 +2406,100 @@ bool UTraceTrailComponent::SweepIntersectsTrace(const TArray<FVector>& Positions
 		}
 
 		return true;
+	}
+
+	return false;
+}
+
+void UTraceTrailComponent::ServerCancelPendingTrip()
+{
+	if (!PendingTripDasher.IsValid() && PendingTripHeldSeconds <= 0.f)
+	{
+		return;
+	}
+
+	// Tell TraceParry the hold was WITHDRAWN, not forgotten. Without this the dead-man switch would
+	// read a legitimately moot kill (the carrier died of a bullet mid-hold) as the caller dropping a
+	// trip, and disarm held trips for the session over a non-bug.
+	if (ATraceCharacter* Holder = GetOwnerCharacter())
+	{
+		TraceParry::ServerCancelHeldTrip(Holder, PendingTripServerTime);
+	}
+
+	PendingTripDasher = nullptr;
+	PendingTripHeldSeconds = 0.f;
+}
+
+bool UTraceTrailComponent::ServerAdvancePendingTrip(ATraceCharacter* Holder, float DeltaTime, ATraceCharacter** OutPunished)
+{
+	if (OutPunished != nullptr)
+	{
+		*OutPunished = nullptr;
+	}
+
+	ATraceCharacter* Dasher = PendingTripDasher.Get();
+
+	// The dasher stopped existing (destroyed, or killed by something else) while we held their trip.
+	// Moot, and withdrawn rather than abandoned — see ServerCancelPendingTrip.
+	if (Holder == nullptr || Dasher == nullptr)
+	{
+		ServerCancelPendingTrip();
+		return false;
+	}
+
+	PendingTripHeldSeconds += DeltaTime;
+
+	switch (TraceParry::ServerResolveHeldTrip(Holder, PendingTripServerTime, PendingTripHeldSeconds))
+	{
+	case TraceParry::EHeldTrip::KeepHolding:
+		// Say nothing yet: the kill has not happened and may never happen. The contract is that we
+		// come back next frame, and the "else if (PendingTripDasher.IsValid())" branch in
+		// ServerRunTripTest is what guarantees we do even after contact ends.
+		return true;
+
+	case TraceParry::EHeldTrip::Parried:
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[TRACEDASH] %s dashed through %s's trace: PARRIED (held %.0fms for the carrier's press)."),
+			*GetNameSafe(Dasher), *GetNameSafe(Holder), PendingTripHeldSeconds * 1000.f);
+		PendingTripDasher = nullptr;
+		PendingTripHeldSeconds = 0.f;
+		TraceParry::ServerPunishParriedDash(Holder, Dasher, PendingTripServerTime);
+		if (OutPunished != nullptr)
+		{
+			*OutPunished = Dasher;
+		}
+		return false;
+
+	case TraceParry::EHeldTrip::KillNow:
+		// Both liveness checks are re-done HERE and not at the sweep: with a hold, arbitrary frames
+		// pass between "they dashed through it" and "they die for it", and either pawn may have died
+		// of something else in between. Killing a corpse would double-count in the kill feed.
+		if (!Holder->IsAlive() || !Dasher->IsAlive())
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[TRACEDASH] held trip %s -> %s dropped after %.0fms: %s died meanwhile."),
+				*GetNameSafe(Dasher), *GetNameSafe(Holder), PendingTripHeldSeconds * 1000.f,
+				Holder->IsAlive() ? TEXT("the dasher") : TEXT("the carrier"));
+			ServerCancelPendingTrip();
+			return false;
+		}
+
+		// parry=0 passWindow=0 is printed on the KILL line too, and it is not noise: the claim under
+		// test is a conditional, so the log has to carry the negative case as explicitly as the
+		// positive one. "Every dash through a trace, and whether a parry was active" is one grep.
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[TRACEDASH] %s dashed through %s's trace: KILL. parry=0 passWindow=0 points=%d lethal=%d emitting=%d held=%.0fms (residual trace: %s)"),
+			*GetNameSafe(Dasher), *GetNameSafe(Holder),
+			TrailPoints.Items.Num(), TestPositions.Num(), bEmitting ? 1 : 0,
+			PendingTripHeldSeconds * 1000.f,
+			bEmitting ? TEXT("no") : TEXT("yes - laid before a turnover"));
+
+		// Cleared BEFORE the kill: ApplyTrailTrip re-enters this component (death -> SetCarrying ->
+		// ClearTrail) and must not find a live hold pointing at a pawn it is in the middle of killing.
+		PendingTripDasher = nullptr;
+		PendingTripHeldSeconds = 0.f;
+		ApplyTrailTrip(Holder, Dasher);
+		return false;
 	}
 
 	return false;
@@ -3112,6 +3545,47 @@ bool UTraceTrailComponent::EnsureRibbonElement(
 // It is also DROPPED ENTIRELY rather than clamped when it would have to span more than
 // GPredictedHeadMaxLength, because past that distance a straight line from the last known point to
 // the pawn is an invention (a teleport, a respawn, a severe desync) rather than an interpolation.
+//
+// -------------------------------------------------------------------------------------------------
+// SPEC v8 §2 — "TRACE STILL HAS THE SAME BUG FOR THE PEOPLE CONNECTING TO THE SERVER."
+//
+// THE v7 §7 REORDERING WAS REAL AND IS FIXED (RestoreReplicatedPointOrder repairs a scrambled array
+// ~5 times a second on a live client, and the geometric detector reads a clean path afterwards —
+// measured, both arms, on a client at 40ms). THE PART THAT WAS NEVER MEASURED ON A CLIENT IS THIS
+// FUNCTION, because every probe in this file watches a BOT's trace, and a bot has no owner-only stub.
+// The one case the report is actually about — a human, on a client, carrying — was the one case with
+// no coverage at all. Trace.Trail.OwnerHeadAB is the harness that closes that hole.
+//
+// WHAT IT FOUND. The gap this stub has to cover is not one term on a client, it is three:
+//
+//     head grace (~80uu, every machine)
+//   + the trace the server has laid and the wire has not yet delivered  (one round trip)
+//   + the client's own movement prediction, which puts the pawn a FURTHER round trip ahead of the
+//     position those points were laid at
+//
+// At a walk that sum is ~180uu and the old 400uu cap never fired. At dash speed (3000uu/s) it is
+// 400-600uu, so the cap fired ON EVERY DASH — and the cap does not shorten the stub, it deletes it.
+// The carrier's own trace detached from their body for the length of every dash and snapped back
+// afterwards. On the host the same sum is ~80uu and the cap can never fire, which is exactly the
+// shape of "it feels really good for me as the host but not great for the players joining".
+//
+// THE FIX IS TO STOP GUESSING, NOT TO RAISE THE TOLERANCE FOR GUESSING. The stub is now built THROUGH
+// the carrier's own recorded per-frame positions (LocalPathHistory), so every uu of it is ground this
+// pawn is recorded as having covered on this machine. That makes the length cap a budget rather than
+// an honesty test, which is why it could go to 1200 (the trace's own maximum length); the honesty
+// test moved to where it belongs — a PER-SEGMENT check against MaxTrailSegmentLength, the same limit
+// the server restarts its own trace on, which is what still refuses to draw a line across a teleport.
+// It also fixes a second, quieter defect on the frames the old chord did draw: a chord across a round
+// trip cuts whatever corner the carrier turned during it, so their trace left their body at the wrong
+// angle. A recorded path turns the corner they turned.
+//
+// THE INVARIANT IS EXACTLY AS SAFE AS IT WAS, and for exactly the same two reasons — the stub is
+// still built only on the carrier's own machine and is still bOnlyOwnerSee, so the set of viewers who
+// can see it is still "whoever is looking through the carrier", and the carrier is the one player
+// their own trace can never kill. The stub got longer; the set of people it can mislead is still
+// empty. What the carrier is told is unchanged in kind and more accurate in degree: nearly all of the
+// stub is now ground the server HAS already laid lethal trace on and this machine has not been told
+// about yet, where the old chord's honest claim was only ever about the ~80uu under their own feet.
 // -------------------------------------------------------------------------------------------------
 
 bool UTraceTrailComponent::IsPredictingLocalHead() const
@@ -3235,12 +3709,71 @@ void UTraceTrailComponent::UpdatePredictedHead()
 		return;
 	}
 
-	// ---- build the polyline: last drawn point -> real ungated points -> the pawn ----------------
-	TArray<FVector, TInlineAllocator<8>> Path;
+	// ---- build the polyline: last drawn point -> real ungated points -> RECORDED PATH -> the pawn --
+	//
+	// SPEC v8 §2. The middle term is new and it is the fix. The v5 §2 version jumped straight from the
+	// newest replicated point to the pawn, which on the host is a step of about one body width and on
+	// a joined client is a step of half a dash — across which the carrier has usually turned. Two
+	// things went wrong there and only one of them was visible:
+	//
+	//   IT WAS DELETED. The length cap (GPredictedHeadMaxLength) is a fabrication guard, and a chord
+	//   that long IS a fabrication, so the guard fired and took the whole stub with it. On a client,
+	//   on every dash. That is the reported bug.
+	//   IT CUT THE CORNER. On the frames it did draw, the chord crossed whatever the carrier had run
+	//   round, so their own trace left their body at the wrong angle.
+	//
+	// LocalPathHistory removes the guesswork rather than widening the tolerance for it: these are the
+	// pawn's own recorded positions on the pawn's own machine, so the stub follows the path that was
+	// actually taken. Samples the replicated set has already caught up with were dropped by
+	// RecordLocalPathSample(); anything left is ground the server either has just laid trace on or is
+	// about to.
+	TArray<FVector, TInlineAllocator<32>> Path;
 	Path.Add(FVector(TrailPoints.Items[LastLethal].Location));
 	for (int32 Index = LastLethal + 1; Index < TrailPoints.Items.Num(); ++Index)
 	{
 		Path.Add(FVector(TrailPoints.Items[Index].Location));
+	}
+
+	PredictedHeadSamplesUsed = 0;
+	if (GPredictedHeadUseHistory != 0 && LocalPathHistory.Num() > 0)
+	{
+		// WHICH SAMPLES ARE STILL AHEAD OF THE REPLICATED TRACE — decided by GEOMETRY, not by clocks.
+		//
+		// The newest replicated point is not an abstract timestamp: it is a place this pawn STOOD, laid
+		// by the server at the pawn's own capsule centre. So the sample nearest to it is the moment
+		// this machine was there, and everything recorded after that sample is exactly the path since —
+		// which is the piece the stub exists to cover.
+		//
+		// The obvious alternative, "keep samples stamped later than the point's BirthServerTime", was
+		// rejected: those two numbers come from two different machines' readings of the shared clock,
+		// and a client's reading is an estimate. A few ms of skew in the wrong direction would discard
+		// every sample and silently drop the stub back to the v5 chord — the same failure this pass is
+		// fixing, hidden behind a clock instead of a cap. A distance measured on one machine cannot
+		// skew.
+		const FVector NewestReplicated(TrailPoints.Items.Last().Location);
+
+		int32 StartIndex = 0;
+		double NearestToHead = TNumericLimits<double>::Max();
+		for (int32 Index = 0; Index < LocalPathHistory.Num(); ++Index)
+		{
+			const double Distance = FVector::Dist(LocalPathHistory[Index].Location, NewestReplicated);
+			if (Distance < NearestToHead)
+			{
+				NearestToHead = Distance;
+				StartIndex = Index;
+			}
+		}
+
+		for (int32 Index = StartIndex + 1; Index < LocalPathHistory.Num(); ++Index)
+		{
+			const FVector& SampleLocation = LocalPathHistory[Index].Location;
+			if (FVector::Dist(Path.Last(), SampleLocation) < LocalPathSampleSpacing)
+			{
+				continue;   // Too close to the previous control point to change the curve.
+			}
+			Path.Add(SampleLocation);
+			++PredictedHeadSamplesUsed;
+		}
 	}
 
 	const FVector PawnLocation = Holder->GetActorLocation();
@@ -3249,19 +3782,63 @@ void UTraceTrailComponent::UpdatePredictedHead()
 		Path.Add(PawnLocation);
 	}
 
+	// TWO TESTS, AND THEY ARE ASKING DIFFERENT QUESTIONS. Splitting them is what let the cap rise.
+	//
+	//   PER SEGMENT (this one): could a player have travelled from one control point to the next?
+	//   MaxTrailSegmentLength is the server's own answer to that question — ServerUpdateTrail refuses
+	//   to join two points further apart than this and restarts the trace instead — so a step past it
+	//   is a teleport, a respawn or a desync, and joining it up would draw a line through the arena
+	//   that nobody ran. This is the fabrication guard, and it is exact.
+	//   TOTAL LENGTH (below): is the stub longer than the trace it is continuing? That is a budget
+	//   question, not an honesty one, now that every segment is a segment somebody ran.
 	double TotalLength = 0.0;
+	double WorstStep = 0.0;
 	for (int32 Index = 1; Index < Path.Num(); ++Index)
 	{
-		TotalLength += FVector::Dist(Path[Index - 1], Path[Index]);
+		const double Step = FVector::Dist(Path[Index - 1], Path[Index]);
+		TotalLength += Step;
+		WorstStep = FMath::Max(WorstStep, Step);
 	}
 
-	if (TotalLength <= 1.0 || TotalLength > static_cast<double>(GPredictedHeadMaxLength))
+	PredictedHeadSpan = static_cast<float>(TotalLength);
+
+	if (TotalLength <= 1.0)
 	{
-		// Nothing to cover, or so much that a straight line would be a fabrication. See the header
-		// comment: abandoned, never clamped.
 		HidePredictedHead();
 		return;
 	}
+
+	if (WorstStep > MaxTrailSegmentLength || TotalLength > static_cast<double>(GPredictedHeadMaxLength))
+	{
+		// Abandoned, never clamped — see the header comment. Counted, and said out loud once per
+		// episode, because THIS SILENCE WAS THE BUG: the pre-v8 stub declined on every dash a client
+		// took and the only evidence was the player's own eyes.
+		//
+		// WARNING RATHER THAN VERBOSE, and the measurement is the argument. Trace.Trail.OwnerHeadAB on
+		// a joined client at 40ms: the pre-v8 arm declined on 10 frames of a 15s carry — 23% of the
+		// frames the carrier was actually at dash speed — and the gap the carrier could see between
+		// themselves and their own trace reached 761uu. The v8 arm declined on none, on the client and
+		// on the host. So a line here means a carrier's trace is detached from their body RIGHT NOW,
+		// which is the whole of the report this pass exists to close, and it cannot be filed at a
+		// verbosity nobody enables. It stays one line per episode (bPredictedHeadDropReported) and a
+		// healthy machine, host or client, never prints it at all.
+		++PredictedHeadDrops;
+		if (!bPredictedHeadDropReported)
+		{
+			bPredictedHeadDropReported = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[HEADSTUB] %s: predicted head declined - span %.0fuu (cap %.0f), worst step %.0fuu "
+				     "(limit %.0f), %d recorded samples. The carrier's trace is detached from their body "
+				     "for as long as this lasts."),
+				*GetNameSafe(GetOwner()), TotalLength, GPredictedHeadMaxLength, WorstStep,
+				MaxTrailSegmentLength, PredictedHeadSamplesUsed);
+		}
+
+		HidePredictedHead();
+		return;
+	}
+
+	bPredictedHeadDropReported = false;
 
 	CacheMeshMetrics();
 
@@ -3356,6 +3933,58 @@ void UTraceTrailComponent::HidePredictedHead()
 		{
 			Piece->SetVisibility(false);
 		}
+	}
+}
+
+void UTraceTrailComponent::RecordLocalPathSample()
+{
+	// ONLY THE MACHINE THAT IS PREDICTING THIS PAWN, which is the same gate UpdatePredictedHead uses
+	// and for the same reason: a listen host owns every bot's component, and a record of a bot's path
+	// would be a record of a path the host already has authoritative points for.
+	//
+	// Anyone else drops the record entirely. That is not tidiness — it is what guarantees a stale
+	// sample from a previous life (a respawn, a turnover, a pawn that stopped carrying) can never
+	// reach the geometry, because there is nothing left to reach it with.
+	const ATraceCharacter* Holder = GetOwnerCharacter();
+	const APlayerController* HolderPC = (Holder != nullptr)
+		? Cast<APlayerController>(Holder->GetController()) : nullptr;
+
+	if (Holder == nullptr || !Holder->IsAlive() || !bEmitting
+		|| HolderPC == nullptr || !HolderPC->IsLocalPlayerController())
+	{
+		LocalPathHistory.Reset();
+		return;
+	}
+
+	const float Now = GetServerTimeSeconds();
+
+	// Age out. The window only has to cover a round trip; a second is an order of magnitude more than
+	// that, and the geometric selection in UpdatePredictedHead ignores whatever is older anyway. This
+	// is the ceiling that keeps the array finite on a client whose updates have stalled, not the
+	// mechanism that decides what gets drawn.
+	int32 FirstKept = 0;
+	while (FirstKept < LocalPathHistory.Num()
+		&& (Now - LocalPathHistory[FirstKept].ServerTime) > LocalPathHistorySeconds)
+	{
+		++FirstKept;
+	}
+	if (FirstKept > 0)
+	{
+		LocalPathHistory.RemoveAt(0, FirstKept, EAllowShrinking::No);
+	}
+
+	const FVector Location = Holder->GetActorLocation();
+	if (LocalPathHistory.Num() == 0
+		|| FVector::Dist(LocalPathHistory.Last().Location, Location) >= LocalPathSampleSpacing)
+	{
+		FTraceLocalPathSample& Sample = LocalPathHistory.AddDefaulted_GetRef();
+		Sample.Location = Location;
+		Sample.ServerTime = Now;
+	}
+
+	if (LocalPathHistory.Num() > MaxLocalPathSamples)
+	{
+		LocalPathHistory.RemoveAt(0, LocalPathHistory.Num() - MaxLocalPathSamples, EAllowShrinking::No);
 	}
 }
 
@@ -4514,6 +5143,687 @@ namespace
 				}), Interval);
 		}));
 
+	// =============================================================================================
+	// Trace.Trail.ClientTrace — SPEC v8 §2. THE PER-FRAME CLIENT RECORDER.
+	//
+	// WHY A SECOND HARNESS AT ALL. Trace.Trail.TetherCheck samples on a TIMER (2s by default), and it
+	// prints ORD — the number of adjacent pairs whose BirthServerTime is out of order. Both of those
+	// choices can miss the reported bug:
+	//
+	//   * A 2s SAMPLE CANNOT SEE A ONE-FRAME EVENT. A trace that is wrong on the frame a point retires
+	//     and right again a frame later is, to a player, a trace that flickers and snaps — and to a
+	//     timer-sampled probe it is a clean pass. Every sample here is one FRAME.
+	//   * ORD IS NOT THE SYMPTOM. The player never sees BirthServerTime; they see the polyline the
+	//     ribbon is swept along. SEG below is that polyline's worst adjacent gap. The server lays
+	//     points at TrailPointSpacing (60uu) and restarts on a discontinuity, so a healthy path's SEG
+	//     is a small multiple of 60 whatever the carrier is doing, and a path that has been reordered
+	//     — for any reason, whether or not the birth stamps happen to look monotone — reads several
+	//     hundred to over a thousand.
+	//
+	// FARTHEST is the report in the user's own words: uu from the carrier to the FARTHEST VISIBLE
+	// PIECE of ribbon. "The far end of the trace is pulled back towards their character model" is
+	// exactly FARTHEST collapsing while LEN stays long, measured off the geometry on screen rather
+	// than argued from the array behind it.
+	//
+	// RUN IT ON THE CLIENT. On the host every number here is a tautology.
+	// =============================================================================================
+	struct FTraceClientTraceStats
+	{
+		int32 Samples = 0;
+		int32 LocalHumanFrames = 0;
+
+		int32 MaxOrd = 0;
+		int32 OrdFrames = 0;
+		int32 Repairs = 0;
+
+		/**
+		 * Adjacent pairs sharing an identical BirthServerTime.
+		 *
+		 * The repair sorts on BirthServerTime with a STABLE sort and the violation counter uses a
+		 * STRICT less-than, so any pair of points stamped with the same time is invisible to both: the
+		 * sort leaves them in whatever order the fast array's RemoveAtSwap left them, and ORD reports a
+		 * clean zero over the top of it. If this column is ever non-zero the v7 §7 repair has a blind
+		 * spot, and it would be exactly the blind spot that lets the reported bug survive a fix that
+		 * measured ORD 2 -> 0.
+		 */
+		int32 MaxEqualBirths = 0;
+		int32 EqualBirthFrames = 0;
+
+		float MinLen = TNumericLimits<float>::Max();
+		float MaxLen = 0.f;
+
+		float MinTail = TNumericLimits<float>::Max();
+		float MaxTail = 0.f;
+
+		float MaxSeg = 0.f;
+		int32 BrokenPathFrames = 0;
+
+		float MaxHeadGap = 0.f;
+		double SumHeadGap = 0.0;
+
+		float MaxTailJump = 0.f;
+		float MaxHeadJump = 0.f;
+
+		float MinFarthest = TNumericLimits<float>::Max();
+		float MaxFarthest = 0.f;
+		float MaxNearest = 0.f;
+
+		float MaxSpeed = 0.f;
+		int32 MovingFrames = 0;
+
+		/**
+		 * uu the carrier's DRAWN MESH is displaced from the capsule root this frame.
+		 *
+		 * The spec's fourth candidate cause, made into a number. The trail points are laid at the
+		 * capsule root, so on a machine where the root and the mesh coincide (the server, and the
+		 * local player anywhere) the ribbon meets the body. A SIMULATED PROXY is different:
+		 * ACharacter's network smoothing leaves the capsule on the last replicated position and drags
+		 * the MESH along behind it, so the newest trace can be drawn a long way in front of the body
+		 * it is supposed to be coming out of — on a joining client, and only there.
+		 */
+		float MaxMeshOffset = 0.f;
+		double SumMeshOffset = 0.0;
+
+		FVector LastTail = FVector::ZeroVector;
+		FVector LastHead = FVector::ZeroVector;
+		bool bHasLast = false;
+
+		/** One full array dump per trace, on the first frame its path is geometrically impossible. */
+		bool bDumpedBrokenFrame = false;
+	};
+
+	/** Live recording state. Keyed by actor name so a pawn respawn starts a fresh row. */
+	TMap<FString, FTraceClientTraceStats> GClientTraceStats;
+	bool GClientTraceRecording = false;
+
+	/**
+	 * Adjacent gap above which the replicated path is certainly not a path any more.
+	 *
+	 * Calibrated to the ORDER REPAIR's own MaxTrailSegmentLength (1000uu), not to 4x TrailPointSpacing
+	 * (240uu, what this used to be). 240 was mis-calibrated and reported false BROKEN frames: a
+	 * legitimate path exceeds it whenever the server hitches or a carrier dashes at 3000uu/s, since
+	 * one point every ~0.02s of a 3000uu/s dash is already 60uu and a single dropped tick doubles or
+	 * triples that. Anything the repair itself is willing to call one segment must not be counted as
+	 * a break here, or the diagnostic accuses the code of a bug it does not have.
+	 */
+	constexpr float ClientTraceBrokenSegmentUU = 1000.f;
+
+	/**
+	 * One frame of sampling. Returns true if any live trace was seen.
+	 *
+	 * The return value is what makes this usable from -ExecCmds in a headless run: the caller starts
+	 * the clock on the FIRST frame a trace exists, so the recording window cannot quietly expire while
+	 * the process is still loading a map. A window that silently measured nothing is how a client-only
+	 * bug survives a test.
+	 */
+	bool ClientTraceSampleOneFrame()
+	{
+		UWorld* World = FindTrailDebugWorld();
+		TArray<ATraceCharacter*> Characters;
+		GatherTrailDebugCharacters(World, Characters);
+
+		bool bSawTrace = false;
+
+		for (const ATraceCharacter* TraceChar : Characters)
+		{
+			const UTraceTrailComponent* Trail = (TraceChar != nullptr) ? TraceChar->Trail : nullptr;
+			if (Trail == nullptr || Trail->TrailPoints.Items.Num() < 2)
+			{
+				continue;
+			}
+
+			bSawTrace = true;
+
+			FTraceClientTraceStats& S = GClientTraceStats.FindOrAdd(GetNameSafe(TraceChar));
+
+			++S.Samples;
+			S.LocalHumanFrames += IsLocallyControlledHuman(TraceChar) ? 1 : 0;
+
+			const int32 Ord = Trail->CountPointOrderViolations();
+			S.MaxOrd = FMath::Max(S.MaxOrd, Ord);
+			S.OrdFrames += (Ord > 0) ? 1 : 0;
+			S.Repairs = Trail->GetPointOrderRepairCount();
+
+			const float Len = Trail->MeasureTraceLength();
+			S.MinLen = FMath::Min(S.MinLen, Len);
+			S.MaxLen = FMath::Max(S.MaxLen, Len);
+
+			const float Tail = Trail->MeasureTailDistanceToCarrier();
+			S.MinTail = FMath::Min(S.MinTail, Tail);
+			S.MaxTail = FMath::Max(S.MaxTail, Tail);
+
+			int32 EqualBirths = 0;
+			for (int32 Index = 1; Index < Trail->TrailPoints.Items.Num(); ++Index)
+			{
+				if (Trail->TrailPoints.Items[Index].BirthServerTime
+					== Trail->TrailPoints.Items[Index - 1].BirthServerTime)
+				{
+					++EqualBirths;
+				}
+			}
+			S.MaxEqualBirths = FMath::Max(S.MaxEqualBirths, EqualBirths);
+			S.EqualBirthFrames += (EqualBirths > 0) ? 1 : 0;
+
+			const float Seg = Trail->MeasureMaxAdjacentSegment();
+			S.MaxSeg = FMath::Max(S.MaxSeg, Seg);
+			S.BrokenPathFrames += (Seg > ClientTraceBrokenSegmentUU) ? 1 : 0;
+
+			// THE EVIDENCE, not the summary. The first frame this trace is broken, print the whole
+			// array — index, ReplicationID, birth stamp, position, and the gap to the previous point.
+			// A maximum tells you something went wrong; this tells you WHAT went wrong, and it is the
+			// difference between diagnosing the next report and guessing at it again. Once per trace.
+			if (Seg > ClientTraceBrokenSegmentUU && !S.bDumpedBrokenFrame)
+			{
+				S.bDumpedBrokenFrame = true;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[CLIENTTRACE] BROKEN PATH on %s: %d points, worst adjacent gap %.0fuu. Dumping the array."),
+					*GetNameSafe(TraceChar), Trail->TrailPoints.Items.Num(), Seg);
+
+				for (int32 Index = 0; Index < Trail->TrailPoints.Items.Num(); ++Index)
+				{
+					const FTraceTrailPoint& Point = Trail->TrailPoints.Items[Index];
+					const double GapToPrevious = (Index > 0)
+						? FVector::Dist(Trail->TrailPoints.Items[Index - 1].Location, Point.Location)
+						: 0.0;
+
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[CLIENTTRACE]   [%2d] repID=%6d birth=%10.3f gapToPrev=%8.1fuu at %s"),
+						Index, Point.ReplicationID, Point.BirthServerTime, GapToPrevious,
+						*FVector(Point.Location).ToCompactString());
+				}
+			}
+
+			const float HeadGap = Trail->MeasureHeadGap();
+			S.MaxHeadGap = FMath::Max(S.MaxHeadGap, HeadGap);
+			S.SumHeadGap += HeadGap;
+
+			// FRAME-TO-FRAME MOVEMENT OF THE TWO ENDS OF THE PATH. The tail point is a fixed piece of
+			// world geometry until it retires, at which point it steps back by one spacing — so a tail
+			// jump of hundreds of uu is the far end teleporting, which is what "snaps to the character"
+			// looks like from inside the data.
+			const FVector TailPoint(Trail->TrailPoints.Items[0].Location);
+			const FVector HeadPoint(Trail->TrailPoints.Items.Last().Location);
+			if (S.bHasLast)
+			{
+				S.MaxTailJump = FMath::Max(S.MaxTailJump, static_cast<float>(FVector::Dist(S.LastTail, TailPoint)));
+				S.MaxHeadJump = FMath::Max(S.MaxHeadJump, static_cast<float>(FVector::Dist(S.LastHead, HeadPoint)));
+			}
+			S.LastTail = TailPoint;
+			S.LastHead = HeadPoint;
+			S.bHasLast = true;
+
+			float Nearest = -1.f;
+			float Farthest = -1.f;
+			int32 Visible = 0;
+			Trail->MeasureDrawnSpan(Nearest, Farthest, Visible);
+			if (Visible > 0)
+			{
+				S.MinFarthest = FMath::Min(S.MinFarthest, Farthest);
+				S.MaxFarthest = FMath::Max(S.MaxFarthest, Farthest);
+				S.MaxNearest = FMath::Max(S.MaxNearest, Nearest);
+			}
+
+			const float Speed = static_cast<float>(TraceChar->GetVelocity().Size());
+			S.MaxSpeed = FMath::Max(S.MaxSpeed, Speed);
+			S.MovingFrames += (Speed > 50.f) ? 1 : 0;
+
+			// Mesh vs capsule root: zero everywhere except on a machine that is SMOOTHING this pawn.
+			if (const USkeletalMeshComponent* Mesh = TraceChar->GetMesh())
+			{
+				const FVector Unsmoothed = TraceChar->GetActorLocation()
+					+ TraceChar->GetActorRotation().RotateVector(TraceChar->GetBaseTranslationOffset());
+				const float Offset = static_cast<float>(FVector::Dist(Mesh->GetComponentLocation(), Unsmoothed));
+				S.MaxMeshOffset = FMath::Max(S.MaxMeshOffset, Offset);
+				S.SumMeshOffset += Offset;
+			}
+		}
+
+		return bSawTrace;
+	}
+
+	void ClientTraceReport(const TCHAR* ArmName)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		const TCHAR* NetRole = TEXT("unknown");
+		if (World != nullptr)
+		{
+			switch (World->GetNetMode())
+			{
+			case NM_Standalone:      NetRole = TEXT("standalone"); break;
+			case NM_ListenServer:    NetRole = TEXT("HOST");       break;
+			case NM_Client:          NetRole = TEXT("CLIENT");     break;
+			case NM_DedicatedServer: NetRole = TEXT("dedicated");  break;
+			default: break;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CLIENTTRACE] ===== arm '%s' netmode=%s orderFix=%d maxLen=%.0fuu spacing=%.0fuu. Per-FRAME sampling. "
+			     "SEG = worst adjacent gap in the replicated path (healthy: a small multiple of the spacing; "
+			     "a reordered path reads hundreds). BROKEN = frames with SEG>%.0f. "
+			     "FAR = uu from the carrier to the FARTHEST VISIBLE ribbon piece - the reported symptom is "
+			     "FAR collapsing while LEN stays long. HEADGAP = uu from the newest lethal point to the "
+			     "carrier, along the path."),
+			ArmName, NetRole, GClientOrderFix, UTraceTrailComponent::GetTraceMaxLengthUU(),
+			UTraceSettings::Get().TrailPointSpacing, ClientTraceBrokenSegmentUU);
+
+		for (const TPair<FString, FTraceClientTraceStats>& Pair : GClientTraceStats)
+		{
+			const FTraceClientTraceStats& S = Pair.Value;
+			if (S.Samples == 0)
+			{
+				continue;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLIENTTRACE] %-8s %-24s frames=%4d localHuman=%d moving=%4d maxSpeed=%6.0f | "
+				     "LEN %6.1f..%6.1f | TAIL %6.1f..%6.1f | SEG max=%7.1f BROKEN=%4d | "
+				     "ORD max=%d frames=%4d FIX=%4d EQBIRTH max=%d frames=%4d | jump tail=%7.1f head=%7.1f | "
+				     "FAR %6.1f..%6.1f NEARmax=%6.1f | HEADGAP avg=%6.1f max=%6.1f | "
+				     "MESHOFF avg=%6.1f max=%6.1f"),
+				ArmName, *Pair.Key, S.Samples, (S.LocalHumanFrames > 0) ? 1 : 0, S.MovingFrames, S.MaxSpeed,
+				(S.MinLen == TNumericLimits<float>::Max()) ? -1.f : S.MinLen, S.MaxLen,
+				(S.MinTail == TNumericLimits<float>::Max()) ? -1.f : S.MinTail, S.MaxTail,
+				S.MaxSeg, S.BrokenPathFrames,
+				S.MaxOrd, S.OrdFrames, S.Repairs, S.MaxEqualBirths, S.EqualBirthFrames,
+				S.MaxTailJump, S.MaxHeadJump,
+				(S.MinFarthest == TNumericLimits<float>::Max()) ? -1.f : S.MinFarthest, S.MaxFarthest,
+				S.MaxNearest,
+				static_cast<float>(S.SumHeadGap / FMath::Max(1, S.Samples)), S.MaxHeadGap,
+				static_cast<float>(S.SumMeshOffset / FMath::Max(1, S.Samples)), S.MaxMeshOffset);
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[CLIENTTRACE] ===== END arm '%s' (%d traces)."),
+			ArmName, GClientTraceStats.Num());
+	}
+
+	/**
+	 * The A/B driver.
+	 *
+	 * TWO THINGS MAKE IT USABLE FROM -ExecCmds ON A HEADLESS CLIENT, and both were learned the hard way:
+	 *
+	 *   IT ARMS ITSELF. The window does not start when the command is typed (which is during engine
+	 *   init, minutes before the client has joined anything) but on the FIRST FRAME A LIVE TRACE
+	 *   EXISTS. A window that expired during map load would report a clean pass on zero samples, which
+	 *   is worse than no measurement at all.
+	 *
+	 *   IT RUNS BOTH ARMS ITSELF, in one process, against the same match: arm 'ordfix0' with
+	 *   Trace.Trail.ClientOrderFix forced to 0 (v7 §7's failure reproduced on demand — the reference
+	 *   signature of a genuinely corrupted path) and then arm 'ordfix1' with the shipping default.
+	 *   Any column on which the two arms agree is NOT explained by the v7 §7 reordering, and is
+	 *   therefore where a second cause has to live.
+	 */
+	struct FClientTraceArmState
+	{
+		int32 ArmIndex = 0;
+		double ArmEndTime = 0.0;
+		float SecondsPerArm = 30.f;
+		int32 RestoreOrderFix = 1;
+		bool bArmed = false;
+	};
+
+	FAutoConsoleCommand CmdClientTrace(
+		TEXT("Trace.Trail.ClientTrace"),
+		TEXT("Trace.Trail.ClientTrace [SecondsPerArm=30] - record the replicated trace EVERY FRAME and print "
+		     "the extremes: worst adjacent gap in the path, frames the path was broken, order violations, "
+		     "frame-to-frame movement of both ends, and the distance from the carrier to the farthest "
+		     "VISIBLE ribbon piece (spec v8 2). Runs TWO arms - ClientOrderFix 0 then 1 - against the same "
+		     "match, and starts the clock on the first frame a trace exists, so it is safe from -ExecCmds. "
+		     "Run it ON THE CLIENT."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			if (GClientTraceRecording)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[CLIENTTRACE] already recording."));
+				return;
+			}
+
+			TSharedRef<FClientTraceArmState> State = MakeShared<FClientTraceArmState>();
+			State->SecondsPerArm = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 1.f, 300.f) : 30.f;
+			State->RestoreOrderFix = GClientOrderFix;
+
+			GClientTraceStats.Reset();
+			GClientTraceRecording = true;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLIENTTRACE] armed: %.1fs per arm, two arms (ClientOrderFix 0 then 1). "
+				     "The clock starts on the first frame a live trace exists."),
+				State->SecondsPerArm);
+
+			// Interval 0 = once per frame on the game thread, which is the whole point: the failure
+			// this is looking for can be a single frame long.
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float /*DeltaTime*/) -> bool
+				{
+					const bool bSawTrace = ClientTraceSampleOneFrame();
+
+					if (!State->bArmed)
+					{
+						if (!bSawTrace)
+						{
+							return true;   // Still loading / no carrier yet. Do not burn the window.
+						}
+
+						State->bArmed = true;
+						GClientOrderFix = 0;
+						GClientTraceStats.Reset();
+						State->ArmEndTime = FPlatformTime::Seconds() + static_cast<double>(State->SecondsPerArm);
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[CLIENTTRACE] first live trace seen - arm 'ordfix0' recording for %.1fs."),
+							State->SecondsPerArm);
+						return true;
+					}
+
+					if (FPlatformTime::Seconds() < State->ArmEndTime)
+					{
+						return true;
+					}
+
+					if (State->ArmIndex == 0)
+					{
+						ClientTraceReport(TEXT("ordfix0"));
+						++State->ArmIndex;
+						GClientOrderFix = 1;
+						GClientTraceStats.Reset();
+						State->ArmEndTime = FPlatformTime::Seconds() + static_cast<double>(State->SecondsPerArm);
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[CLIENTTRACE] arm 'ordfix1' recording for %.1fs."), State->SecondsPerArm);
+						return true;
+					}
+
+					ClientTraceReport(TEXT("ordfix1"));
+					GClientOrderFix = State->RestoreOrderFix;
+					GClientTraceRecording = false;
+					UE_LOG(LogTraceGame, Display, TEXT("[CLIENTTRACE] ===== BOTH ARMS COMPLETE."));
+					return false;
+				}), 0.f);
+		}));
+
+	// =============================================================================================
+	// Trace.Trail.OwnerHeadAB — SPEC v8 §2, THE HALF OF THE TRACE THAT ONLY A JOINED CARRIER SEES.
+	//
+	// EVERY OTHER PROBE IN THIS FILE MEASURES SOMEBODY ELSE'S TRACE. Trace.Trail.ClientTrace watches
+	// the replicated point set of whoever happens to be carrying — in practice a bot, because an
+	// unattended client has no hands. That covers the array, the ribbon and the far end, and it is how
+	// the v7 §7 reordering was found. It is structurally blind to the one case the user is describing
+	// in the words "the people connecting to the server": A HUMAN, ON A CLIENT, CARRYING THE CORE AND
+	// LOOKING AT THEIR OWN TRACE. Nothing about that case is exercised by watching a bot, because the
+	// piece of geometry it turns on — the owner-only predicted head — is not drawn for bots at all.
+	//
+	// So this harness drives the local player itself: forward input, a gentle steer that keeps them on
+	// the pitch, and a dash on a timer, all through the same public entry points the input bindings
+	// use (ATraceCharacter::DoMove / DoDash). Pair it with Trace.Parry.GiveCoreToRemote on the HOST,
+	// which is what puts the Core in a joined client's hands.
+	//
+	// THE NUMBER IT EXISTS FOR IS 'DETACHED'. That is the count of frames on which the carrier was
+	// moving, their trace had a real gap to cover, and the predicted head DECLINED TO DRAW — so their
+	// own trace was visibly not attached to their body. On the host it is zero by construction. On a
+	// client, at 40ms, with the pre-v8 straight chord and its 400uu cap, it is most of every dash.
+	//
+	// TWO ARMS, ONE PROCESS, ONE MATCH:
+	//   'v5-chord400'  PredictHistory 0 + PredictMaxLength 400 — exactly what shipped before this pass.
+	//   'v8-history'   the new default: the stub follows the carrier's own recorded path, capped at
+	//                  the trace's own length.
+	// Any column the two arms agree on is not explained by this change, and is where the next cause
+	// would have to live.
+	//
+	// It STEERS AND DASHES A PAWN, so do not run it alongside -TraceTripTest or -TraceDashPitchTest —
+	// the same conflict Trace.TestParry and Trace.Trail.TestHeadGap have with those harnesses.
+	// =============================================================================================
+	struct FOwnerHeadStats
+	{
+		int32 Frames = 0;
+		int32 CarryingFrames = 0;
+		int32 MovingFrames = 0;
+		int32 DashingFrames = 0;
+
+		/** THE SYMPTOM: moving, a gap to cover, and nothing drawn to cover it. */
+		int32 DetachedFrames = 0;
+
+		int32 DropsAtStart = -1;
+		int32 DropsAtEnd = 0;
+
+		double SumSeen = 0.0;
+		float MaxSeen = 0.f;
+		double SumSpan = 0.0;
+		float MaxSpan = 0.f;
+		double SumStub = 0.0;
+		float MaxStub = 0.f;
+		int32 MaxSamples = 0;
+		float MaxSpeed = 0.f;
+
+		/** Worst visible gap while genuinely at dash speed — the frame the player actually complains about. */
+		float MaxSeenDashing = 0.f;
+	};
+
+	/** The one pawn a human is playing on this machine, carrier or not. */
+	ATraceCharacter* FindLocalHumanPawn(UWorld* World)
+	{
+		APlayerController* PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+		return (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+	}
+
+	/**
+	 * Hold forward, curve gently, and dash on a timer.
+	 *
+	 * THE CURVE IS NOT DECORATION. A straight run is the one shape in which the pre-v8 chord is
+	 * indistinguishable from the recorded path, so a straight-line harness would have measured the
+	 * length cap and missed the corner-cutting entirely. The steer is also what keeps an unattended
+	 * pawn off the endzone walls: past the box below it turns back toward the middle of the field,
+	 * which is the same trick every other unattended harness in this project uses.
+	 */
+	void DriveLocalCarrier(ATraceCharacter* Pawn, double Elapsed, double& LastDashTime)
+	{
+		APlayerController* PC = (Pawn != nullptr) ? Cast<APlayerController>(Pawn->GetController()) : nullptr;
+		if (PC == nullptr || !PC->IsLocalPlayerController())
+		{
+			return;
+		}
+
+		const FVector Location = Pawn->GetActorLocation();
+		float Yaw = PC->GetControlRotation().Yaw;
+
+		if (FMath::Abs(Location.X) > 12000.0 || FMath::Abs(Location.Y) > 3200.0)
+		{
+			FVector TowardCentre = -Location;
+			TowardCentre.Z = 0.0;
+			if (TowardCentre.Normalize())
+			{
+				Yaw = static_cast<float>(TowardCentre.Rotation().Yaw);
+			}
+		}
+		else
+		{
+			Yaw += 35.f * static_cast<float>(FMath::Sin(Elapsed * 0.9)) * 0.016f;
+		}
+
+		PC->SetControlRotation(FRotator(0.f, Yaw, 0.f));
+		Pawn->DoMove(FVector2D(0.f, 1.f));   // X = strafe, Y = forward
+
+		// Every 2.5s: comfortably longer than a dash plus its cooldown, so a refused dash is a real
+		// refusal rather than the harness pressing while the charge is still recharging.
+		if ((Elapsed - LastDashTime) > 2.5)
+		{
+			LastDashTime = Elapsed;
+			Pawn->DoDash();
+		}
+	}
+
+	void OwnerHeadSample(ATraceCharacter* Pawn, FOwnerHeadStats& S)
+	{
+		const UTraceTrailComponent* Trail = (Pawn != nullptr) ? Pawn->Trail : nullptr;
+		if (Trail == nullptr)
+		{
+			return;
+		}
+
+		++S.Frames;
+
+		const float Speed = static_cast<float>(Pawn->GetVelocity().Size());
+		S.MaxSpeed = FMath::Max(S.MaxSpeed, Speed);
+		S.MovingFrames += (Speed > 50.f) ? 1 : 0;
+		S.DashingFrames += (Speed > 1500.f) ? 1 : 0;
+
+		if (S.DropsAtStart < 0)
+		{
+			S.DropsAtStart = Trail->GetPredictedHeadDropCount();
+		}
+		S.DropsAtEnd = Trail->GetPredictedHeadDropCount();
+
+		if (!Pawn->IsCarrier() || Trail->ComputeLastLethalIndex() < 0)
+		{
+			return;   // Nothing to be attached to yet. Not a detachment.
+		}
+
+		++S.CarryingFrames;
+
+		const float Span = Trail->GetPredictedHeadSpan();
+		const float Stub = Trail->GetPredictedHeadLength();
+		const float Seen = Trail->MeasureOwnerVisibleGap(/*bIncludePredictedHead=*/true);
+
+		S.SumSpan += Span;
+		S.MaxSpan = FMath::Max(S.MaxSpan, Span);
+		S.SumStub += Stub;
+		S.MaxStub = FMath::Max(S.MaxStub, Stub);
+		S.MaxSamples = FMath::Max(S.MaxSamples, Trail->GetPredictedHeadSamplesUsed());
+
+		if (Seen >= 0.f)
+		{
+			S.SumSeen += Seen;
+			S.MaxSeen = FMath::Max(S.MaxSeen, Seen);
+			if (Speed > 1500.f)
+			{
+				S.MaxSeenDashing = FMath::Max(S.MaxSeenDashing, Seen);
+			}
+		}
+
+		// DETACHED: moving, more than one point spacing of trace to cover, and no stub covering it.
+		// One spacing rather than zero because the gap is never zero — the head point is laid at
+		// intervals — and a gap smaller than the interval is the trace being normal, not detached.
+		const double Threshold = FMath::Max(30.0, static_cast<double>(UTraceSettings::Get().TrailPointSpacing));
+		if (Speed > 50.f && Span > Threshold && Stub <= 0.f)
+		{
+			++S.DetachedFrames;
+		}
+	}
+
+	void OwnerHeadReport(const TCHAR* ArmName, const FOwnerHeadStats& S)
+	{
+		const int32 Carrying = FMath::Max(1, S.CarryingFrames);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[OWNERHEAD] %-12s frames=%4d carrying=%4d moving=%4d dashing=%4d maxSpeed=%6.0f | "
+			     "DETACHED=%4d (%5.1f%% of carrying) drops=%3d | SPAN avg=%6.1f max=%7.1f | "
+			     "STUB avg=%6.1f max=%7.1f samples<=%2d | SEEN avg=%6.1f max=%7.1f maxWhileDashing=%7.1f"),
+			ArmName, S.Frames, S.CarryingFrames, S.MovingFrames, S.DashingFrames, S.MaxSpeed,
+			S.DetachedFrames, 100.f * static_cast<float>(S.DetachedFrames) / static_cast<float>(Carrying),
+			FMath::Max(0, S.DropsAtEnd - FMath::Max(0, S.DropsAtStart)),
+			static_cast<float>(S.SumSpan / Carrying), S.MaxSpan,
+			static_cast<float>(S.SumStub / Carrying), S.MaxStub, S.MaxSamples,
+			static_cast<float>(S.SumSeen / Carrying), S.MaxSeen, S.MaxSeenDashing);
+	}
+
+	struct FOwnerHeadABState
+	{
+		int32 ArmIndex = 0;
+		bool bArmed = false;
+		double StartSeconds = 0.0;
+		double ArmEndTime = 0.0;
+		double LastDashTime = -10.0;
+		float SecondsPerArm = 20.f;
+
+		int32 RestoreUseHistory = 1;
+		float RestoreMaxLength = 1200.f;
+
+		FOwnerHeadStats Stats;
+	};
+
+	FAutoConsoleCommand CmdOwnerHeadAB(
+		TEXT("Trace.Trail.OwnerHeadAB"),
+		TEXT("Trace.Trail.OwnerHeadAB [SecondsPerArm=20] - drive the LOCAL player forward, curving, "
+		     "dashing on a timer, and record every frame whether their own trace stayed attached to "
+		     "their body (spec v8 2). Two arms in one match: 'v5-chord400' (the pre-v8 straight chord "
+		     "and its 400uu cap) then 'v8-history'. DETACHED is the symptom. RUN IT ON THE CLIENT, with "
+		     "Trace.Parry.GiveCoreToRemote on the host. Steers a pawn - do not combine with "
+		     "-TraceTripTest or -TraceDashPitchTest."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			TSharedRef<FOwnerHeadABState> State = MakeShared<FOwnerHeadABState>();
+			State->SecondsPerArm = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 2.f, 300.f) : 20.f;
+			State->RestoreUseHistory = GPredictedHeadUseHistory;
+			State->RestoreMaxLength = GPredictedHeadMaxLength;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[OWNERHEAD] armed: %.1fs per arm. The clock starts on the first frame the local "
+				     "player is CARRYING, so a slow join cannot burn the window. DETACHED = frames the "
+				     "carrier was moving with a real gap and no stub drawn to cover it."),
+				State->SecondsPerArm);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float /*DeltaTime*/) -> bool
+				{
+					UWorld* World = FindTrailDebugWorld();
+					ATraceCharacter* Pawn = FindLocalHumanPawn(World);
+					if (Pawn == nullptr || !Pawn->IsAlive())
+					{
+						return true;   // Still loading, or dead and waiting on a respawn.
+					}
+
+					const double Now = FPlatformTime::Seconds();
+					if (!State->bArmed)
+					{
+						// Drive from the moment there is a pawn: the local player has to be moving
+						// BEFORE they are handed the Core, or the first seconds of the first arm are a
+						// standing carrier, which has no gap to cover and nothing to measure.
+						DriveLocalCarrier(Pawn, Now, State->LastDashTime);
+
+						if (!Pawn->IsCarrier())
+						{
+							return true;
+						}
+
+						State->bArmed = true;
+						State->ArmEndTime = Now + static_cast<double>(State->SecondsPerArm);
+						State->Stats = FOwnerHeadStats();
+						GPredictedHeadUseHistory = 0;
+						GPredictedHeadMaxLength = 400.f;
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[OWNERHEAD] local player is carrying - arm 'v5-chord400' recording for %.1fs "
+							     "(netmode=%d)."),
+							State->SecondsPerArm, static_cast<int32>(World->GetNetMode()));
+						return true;
+					}
+
+					DriveLocalCarrier(Pawn, Now, State->LastDashTime);
+					OwnerHeadSample(Pawn, State->Stats);
+
+					if (Now < State->ArmEndTime)
+					{
+						return true;
+					}
+
+					if (State->ArmIndex == 0)
+					{
+						OwnerHeadReport(TEXT("v5-chord400"), State->Stats);
+						++State->ArmIndex;
+						State->Stats = FOwnerHeadStats();
+						State->ArmEndTime = Now + static_cast<double>(State->SecondsPerArm);
+						GPredictedHeadUseHistory = 1;
+						GPredictedHeadMaxLength = 1200.f;
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[OWNERHEAD] arm 'v8-history' recording for %.1fs."), State->SecondsPerArm);
+						return true;
+					}
+
+					OwnerHeadReport(TEXT("v8-history"), State->Stats);
+					GPredictedHeadUseHistory = State->RestoreUseHistory;
+					GPredictedHeadMaxLength = State->RestoreMaxLength;
+					UE_LOG(LogTraceGame, Display, TEXT("[OWNERHEAD] ===== BOTH ARMS COMPLETE."));
+					return false;
+				}), 0.f);
+		}));
+
 	// ---------------------------------------------------------------------------------------------
 	// Trace.Trail.Geometry — spec v7 §3's invariant, stated as a PASS or a FAIL rather than as a
 	// screenshot. Both directions, because only one of them is the obvious one:
@@ -4683,7 +5993,7 @@ namespace
 		 *   * spec v4 §4, THE PASS WINDOW. From the instant the holder inputs a pass until it
 		 *     completes or cancels, the trace CANNOT be broken. That is the risk beat the passer is
 		 *     paid for, and a bot carrier hovering a pass is a completely ordinary thing to catch.
-		 *   * spec v3 §3, THE PARRY. 0.1s, carrier-only. Trace.TestParry already models this one;
+		 *   * spec v3 §3, THE PARRY. 0.2s (v8 §3), carrier-only. Trace.TestParry already models this one;
 		 *     this harness did not.
 		 *
 		 * Measured on the shipping build: 51 PASS / 2 FAIL over 53 runs, and BOTH "failures" have the

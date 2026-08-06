@@ -30,7 +30,7 @@
 //      so the two consequences can never disagree. It lasts ~0.5s and it is a COMMITMENT: you gave
 //      up your shield for it.
 //
-//   2. THE PARRY (spec v3 §3, this file). 0.1s, on a 1.5s cooldown, and it does NOT touch the
+//   2. THE PARRY (spec v3 §3, this file; 0.2s since v8 §3). On a 1.5s cooldown, and it does NOT touch the
 //      shield — you are still bulletproof while it is up. It is a reaction check, not a commitment.
 //
 // They compose by OR and neither may clobber the other:
@@ -39,7 +39,7 @@
 // Concretely, the two mistakes a future reader is about to make:
 //   * DO NOT fold the parry into ATraceCore::IsTraceInvulnerableFor(). That function is also what
 //     drops the carrier's shield (UTraceHealthComponent::IsInvulnerable consults it), so a parry
-//     routed through it would make the carrier SHOOTABLE for 0.1s every 1.5s. The spec grants trace
+//     routed through it would make the carrier SHOOTABLE for 0.2s every 1.5s. The spec grants trace
 //     invulnerability, not a damage window.
 //   * DO NOT make the parry write the pass window's bool, or "parry, then pass" would end the parry
 //     early and "pass, then parry" would leave the shield down after the pass resolved.
@@ -47,8 +47,56 @@
 // AUTHORITY. The server alone decides whether a dash landed inside a window: the trip test reads
 // IsParryActive(), which on every machine is a pure function of the REPLICATED window end time, and
 // which deliberately ignores the local prediction. The client predicts only the red tint (see
-// IsParryVisuallyActive), because 0.1s is shorter than a round trip and a tell that arrives after
+// IsParryVisuallyActive), because 0.2s is shorter than a round trip and a tell that arrives after
 // the window has closed is not a tell.
+//
+// SPEC v8 §3 — 0.2s, AND THE CLIENT'S PRESS HAS TO COUNT.
+//
+//     "Increase parry time to .2seconds; is there a way to make it feel better across different
+//      clients? It feels really good for me as the host but not great for the players joining the
+//      server"
+//
+// THE ARITHMETIC OF THE COMPLAINT — measured, not assumed. Call L the one-way lag (40ms on the
+// rig; NetEmulation.PktLag applies it in each direction). Work in the server's clock:
+//
+//   * a dash trips the trace at server time X;
+//   * the carrier SEES the dash L late, so a host reacting in R presses at R, and a client
+//     reacting equally fast presses at L + R;
+//   * the window opens where the SERVER learns of it. Host: instantly. Client: one more L later,
+//     when UTraceTrailComponent::ServerRequestParry arrives.
+//
+//   host window   [R,        R + 0.2]        -> parries every trip in that band
+//   client window [R + 2L,   R + 2L + 0.2]   -> the SAME band, displaced 2L = 80ms LATE
+//
+// So the client's 200ms is not shortened, it is MISAIMED: to cover the trip they have to press 80ms
+// earlier than the host does, i.e. against a dash they are already seeing 40ms late. Press when it
+// looks right and the window opens just after the trip that killed you. That is the whole of "it
+// feels really good for me as the host but not great for the players joining".
+//
+// WHAT ACTUALLY FIXES IT, AND WHAT ONLY LOOKS LIKE IT DOES. Extending the window's END recovers
+// nothing: the client's press is LATE, so a longer tail catches later trips, never the earlier one
+// they missed. Only moving the window's START back before the packet arrived can help, and that is
+// the same trick this project already plays for hitscan (UTraceLagCompensationComponent):
+//
+//   1. PREDICT LOCALLY       — the red tint already opens on the press, client-side, no round trip.
+//   2. VALIDATE ON THE SERVER — the server still decides; a predicted parry the server refuses
+//                               protects nobody, exactly as before.
+//   3. LAG-COMPENSATE THE VALIDATION — judge the press against WHEN IT WAS PRESSED. The client
+//      stamps the press with the shared GetServerWorldTimeSeconds clock, the server CLAMPS that
+//      stamp into [Now - MaxRewindTime, Now] — the identical clamp UTraceWeaponComponent applies to
+//      a shot — and anchors the window there instead of at packet arrival.
+//
+// Anchoring alone gives back the upstream L. The other L is the trip the client could not have
+// answered yet, and answering it means the server must be willing to WAIT the length of that
+// client's own upstream lag before a lethal trip becomes a death (GetTripHoldSeconds /
+// ServerResolveHeldTrip below). Held trips are the second half; a host and a bot hold for 0s, so
+// nothing about single-machine play changes.
+//
+// EVERYTHING IN THIS FILE IS ONE PATH, NOT A SECOND ONE. The functions below are decision helpers
+// with no state of their own beyond a bounded ledger of granted windows: the trail still owns the
+// window, still replicates it, and still asks exactly one question ("was a parry open at time T").
+// The warning in this header about two objects agreeing about one fact stands unchanged, and
+// ServerRequestParry stays THE path — it gains a timestamp, it does not gain a sibling.
 //
 // SPEC v6 §3 — A PERFECT PARRY NOW KILLS THE DASHER.
 //
@@ -60,7 +108,7 @@
 // it is ServerPunishParriedDash() below. Read its comment before changing anything here: the whole
 // mechanic is one conditional and every clause of that conditional is a rule the user stated.
 //
-// Nothing else about the parry moved. 0.1s window, 1.5s cooldown, carrier-only, whole trace flashes
+// Nothing else about the parry moved. 0.2s window (v8 §3), 1.5s cooldown, carrier-only, trace flashes
 // red, and an UNPARRIED dash still kills the carrier exactly as before — that branch is untouched.
 
 #pragma once
@@ -131,10 +179,10 @@ namespace TraceParry
 	//     Trace.Parry.KillFeedbackSeconds  2.5   how long the carrier's parry-kill banner lasts
 	// ---------------------------------------------------------------------------------------------
 
-	/** Spec §3: 0.1 seconds of trace invulnerability. */
+	/** Spec v8 §3: 0.2 seconds of trace invulnerability (was 0.1 in v3 §3). */
 	float GetDurationSeconds();
 
-	/** [ASSUMPTION] spec §3: not specified by the user. 1.5s makes 0.1s a reaction check. */
+	/** [ASSUMPTION] spec §3: not specified by the user. 1.5s keeps v8's 0.2s a reaction check. */
 	float GetCooldownSeconds();
 
 	/**
@@ -167,6 +215,182 @@ namespace TraceParry
 	 * @param OutRefusal  optional; why it was refused.
 	 */
 	bool RequestParry(ATraceCharacter* Parrier, ETraceParryRefusal* OutRefusal = nullptr);
+
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v8 §3 — THE CLIENT'S PRESS, JUDGED AGAINST WHEN THEY PRESSED IT
+	//
+	// Six functions, no state a caller can corrupt, and every one safe on any machine and on null.
+	// UTraceTrailComponent is the only intended caller of the first three; see this file's header
+	// for the arithmetic and the pass report for the exact three-hunk wiring.
+	//
+	// THE SHAPE OF THE CONTRACT. The trail still owns the window and still replicates it. What
+	// changes is WHICH INSTANT it anchors to:
+	//
+	//     client   press   -> stamp = GetPressStampSeconds(pawn)  -> ServerRequestParry(stamp)
+	//     server   arrival -> ServerResolvePress(...)             -> the two deadlines to store
+	//     server   trip    -> ServerWasParryOpenAt(carrier, when the sweep resolved)
+	//
+	// so the same press produces the same window on both machines' clocks, and the trip test asks
+	// about the instant the dash actually landed rather than about "right now".
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * The timestamp a client stamps its press with: the SHARED clock, read on the pressing machine.
+	 *
+	 * AGameStateBase::GetServerWorldTimeSeconds() — already replicated and already smoothed, and
+	 * the same clock UTraceTrailComponent's window end times and UTraceWeaponComponent's shot
+	 * timestamps live in. Do not hand-roll a second one; two clocks is the bug this whole item is.
+	 */
+	float GetPressStampSeconds(const AActor* Parrier);
+
+	/** How far back a press may be rewound: UTraceSettings::MaxRewindTime, the hitscan clamp. */
+	float GetMaxPressRewindSeconds();
+
+	/**
+	 * SERVER. Turns a client's stamped press into the two deadlines the trail stores.
+	 *
+	 * THE CLAMP IS THE SECURITY. Whatever the client claims, the press is pinned into
+	 * [ServerNow - MaxRewindTime, ServerNow]: never in the future (you cannot pre-book a window)
+	 * and never further back than a shot may be rewound (so a parry cannot out-cheat a bullet).
+	 * A stamp of 0 — a bot, a host, an old build — resolves to ServerNow and this is a no-op.
+	 *
+	 * THE COOLDOWN IS CHECKED AGAINST THE REWOUND PRESS TOO, which is the point: a client whose
+	 * cooldown expired 5ms before they pressed must not be refused because the packet took 40ms to
+	 * arrive. Same rule, asked at the same instant the window is anchored to.
+	 *
+	 * @param Parrier                       the pawn; null is a refusal, not a crash.
+	 * @param ClientPressServerTime         the client's stamp. <= 0 means "no stamp, use now".
+	 * @param ServerNow                     the server's shared-clock reading at arrival.
+	 * @param ExistingCooldownEndServerTime the carrier's current cooldown deadline.
+	 * @param OutPressServerTime            the anchored press = the window's START.
+	 * @param OutWindowEndServerTime        what to store in ParryEndServerTime.
+	 * @param OutCooldownEndServerTime      what to store in ParryCooldownEndServerTime.
+	 * @param OutRefusal                    OnCooldown when the anchored press was too early.
+	 * @return true when a window should be opened.
+	 */
+	bool ServerResolvePress(
+		ATraceCharacter* Parrier,
+		float ClientPressServerTime,
+		float ServerNow,
+		float ExistingCooldownEndServerTime,
+		float& OutPressServerTime,
+		float& OutWindowEndServerTime,
+		float& OutCooldownEndServerTime,
+		ETraceParryRefusal& OutRefusal);
+
+	/**
+	 * SERVER. "Was @p Parrier's trace protected by a parry at server time @p ServerTime?"
+	 *
+	 * The lag-compensated form of IsParryActiveFor(), and the question the trip test should be
+	 * asking: a sweep resolves at a known instant, and that instant is what the window has to
+	 * cover — not the moment the answer happens to be read.
+	 *
+	 * Answers from the ledger of windows this process granted (bounded, swept, server-side only),
+	 * and falls back to the replicated window when the ledger has nothing for that pawn, so a host,
+	 * a bot and a pre-v8 caller all keep their existing answer exactly.
+	 */
+	bool ServerWasParryOpenAt(const AActor* Parrier, float ServerTime);
+
+	/**
+	 * SERVER. Seconds a LETHAL trip against @p Carrier should be held before it becomes a death.
+	 *
+	 * Zero for the host and for bots — their press is already on the server, so there is nothing to
+	 * wait for and their game does not change by one frame. For a remote carrier it is their own
+	 * estimated upstream lag (half of ExactPing), clamped by MaxRewindTime and by
+	 * Trace.Parry.MaxTripHold, and it is exactly the interval in which their press — sent before
+	 * the trip, arriving after it — is still in flight.
+	 *
+	 * This is the half of the fix that anchoring alone cannot deliver: without a hold, a trip in
+	 * [press, arrival] has already killed the carrier by the time their parry lands, and no amount
+	 * of rewinding brings a dead pawn back. Held trips cost the DASHER a few tens of milliseconds
+	 * of feedback and nothing else; the kill still happens unless a qualifying press arrives.
+	 */
+	float GetTripHoldSeconds(const ATraceCharacter* Carrier);
+
+	/** What a held trip resolved to this frame. See ServerResolveHeldTrip. */
+	enum class EHeldTrip : uint8
+	{
+		/** Keep holding: the carrier's press could still be in flight. */
+		KeepHolding,
+		/** Nobody parried it in time. Kill the carrier now, exactly as before. */
+		KillNow,
+		/** A press covering the trip arrived. The carrier lives and the DASHER should be punished. */
+		Parried,
+	};
+
+	/**
+	 * SERVER. Resolve one held trip. Call once per frame while a trip is pending.
+	 *
+	 * @param Carrier          the carrier the trip would kill.
+	 * @param TripServerTime   shared-clock instant the sweep resolved. This, and not "now", is what
+	 *                         the parry has to have covered.
+	 * @param HeldSoFarSeconds how long the trail has already held it.
+	 */
+	EHeldTrip ServerResolveHeldTrip(const ATraceCharacter* Carrier, float TripServerTime, float HeldSoFarSeconds);
+
+	/**
+	 * SERVER. Withdraw a held trip the caller is legitimately giving up on, WITHOUT it counting as
+	 * abandoned.
+	 *
+	 * There are exactly two legitimate reasons, and neither is "the dasher stopped touching the
+	 * trace" (that one is the bug the dead-man switch hunts): the carrier died of something else
+	 * while the trip was held, or the dasher was destroyed. In both cases the kill is moot. Anything
+	 * that is not one of those must keep calling ServerResolveHeldTrip until it answers.
+	 */
+	void ServerCancelHeldTrip(const ATraceCharacter* Carrier, float TripServerTime);
+
+	/**
+	 * Called once by whoever wires held trips, so this file can tell whether the second half of the
+	 * fix is present in this build (it is a trail-side change; see the pass report).
+	 *
+	 * It is not decoration: while held trips are UNWIRED the window keeps its full length measured
+	 * from packet arrival, because anchoring the start without being able to answer a trip that
+	 * predates the packet would shorten a client's live coverage for no gain. Wire the hold and the
+	 * window anchors to the press instead. Trace.Parry.HeldTrips forces either answer.
+	 */
+	void NotifyHeldTripsWired();
+	bool AreHeldTripsWired();
+
+	// --- verification counters. Never a game rule; printed by Trace.DebugParry and the probe. ----
+
+	/** Stamped presses the server has accepted. */
+	int32 GetPressCount();
+
+	/** Mean / worst rewind the server applied to an accepted press, in milliseconds. */
+	float GetMeanPressRewindMs();
+	float GetMaxPressRewindMs();
+
+	/** Trips answered by a press that arrived AFTER them — the saves anchoring alone cannot make. */
+	int32 GetLateParrySaveCount();
+
+	/**
+	 * Presses whose stamp was further behind than the connection's own ping can explain.
+	 *
+	 * EXPECT THIS TO EQUAL GetPressCount() ON A REAL CONNECTION. Stock UE replicates
+	 * AGameStateBase::ServerWorldTimeSeconds with no half-round-trip correction, so an honest
+	 * client's shared clock sits one downstream lag behind and its stamp lands a full ROUND TRIP
+	 * back: measured 138ms behind at a 105ms ping, 6 presses of 6, plus 1.4-4.7s while a freshly
+	 * joined client is still converging. That is why the rewind is bounded by the SERVER's own ping
+	 * measurement rather than by the stamp, and why that bound carries only a jitter allowance —
+	 * over-rewinding takes milliseconds off the END of a window the carrier is still alive inside.
+	 */
+	int32 GetPressClockPinnedCount();
+
+	/** Held trips opened, and how many expired into an ordinary kill. */
+	int32 GetHeldTripCount();
+	int32 GetHeldTripExpiredCount();
+
+	/**
+	 * Held trips the caller stopped asking about — i.e. lethal dashes that killed NOBODY.
+	 *
+	 * MUST BE 0. Anything else means the trip test dropped a pending trip instead of resolving it,
+	 * and the first one disarms held trips for the session (AreHeldTripsWired goes false, the window
+	 * goes back to the pre-v8 anchor) rather than leaving remote carriers unkillable. The requirement
+	 * it is checking is one sentence: once ServerResolveHeldTrip has answered KeepHolding, the caller
+	 * must keep asking every frame until it answers KillNow or Parried, WHETHER OR NOT the dasher is
+	 * still touching the trace. See the block comment in the .cpp for the measurement behind this.
+	 */
+	int32 GetAbandonedHeldTripCount();
 
 	// ---------------------------------------------------------------------------------------------
 	// SPEC v6 §3 — THE PUNISH
@@ -210,9 +434,14 @@ namespace TraceParry
 	 * dasher's own death panel, and the carrier is credited with the kill on the scoreboard. The
 	 * carrier-side banner is fed by RecordParryKill/GetParryKillFeedback below.
 	 *
+	 * @param TripServerTime  v8 §3: the shared-clock instant the sweep resolved, so the window is
+	 *                        re-checked against WHEN the dash landed rather than when this runs. It
+	 *                        matters only for a HELD trip, where those are tens of milliseconds
+	 *                        apart. 0 (the default, and what a live trip passes) keeps the v6
+	 *                        behaviour exactly: ask the replicated window, now.
 	 * @return true if the dasher was killed.
 	 */
-	bool ServerPunishParriedDash(ATraceCharacter* Carrier, ATraceCharacter* Dasher);
+	bool ServerPunishParriedDash(ATraceCharacter* Carrier, ATraceCharacter* Dasher, float TripServerTime = 0.f);
 
 	// ---------------------------------------------------------------------------------------------
 	// SPEC v7 §6 — A PARRY KILL REFUNDS THE CARRIER'S COOLDOWNS

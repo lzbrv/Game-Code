@@ -28,11 +28,13 @@
 #include "Components/StaticMeshComponent.h"
 #include "CollisionQueryParams.h"
 #include "CollisionShape.h"
+#include "Engine/Engine.h"                      // GEngine->GetWorldContexts() (Trace.ModeB.CoreProbe)
 #include "Engine/EngineTypes.h"
 #include "Engine/HitResult.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"                        // TActorIterator (character gather fallback)
+#include "GameFramework/CharacterMovementComponent.h"   // spec v8 §4: the thrower's own velocity
 #include "GameFramework/Controller.h"
 #include "GameFramework/GameStateBase.h"        // GetServerWorldTimeSeconds()
 #include "GameFramework/PlayerController.h"
@@ -492,6 +494,84 @@ static TAutoConsoleVariable<float> CVarModeBThrowCooldown(
 	TEXT("throw landing on the same frame. UTraceSettings::CoreThrowCooldownSeconds."),
 	ECVF_Default);
 
+// =================================================================================================
+// MODE B ONLY — SPEC v8 §4, THE THROW INHERITS THE THROWER'S MOMENTUM
+//
+// "When jumping and throwing the core, the core doesn't seem to keep momentum. Make sure that the
+// core has the momentum from the throw and also carries momentum from the player."
+//
+// It did not seem to keep momentum because it did not keep any: ThrowFromHolder built the launch as
+// aim * ThrowSpeed + up * (ThrowSpeed * UpBias) and that was the whole of it. The thrower's velocity
+// appeared nowhere, so a Core thrown at a dead stop, at a full sprint and at the apex of a jump all
+// left at exactly 2236 uu/s along the crosshair.
+//
+// ONE KNOB, and it is a FRACTION rather than a fudge (spec v8 §4's [ASSUMPTION] is explicit about
+// this): the default inherits the thrower's velocity IN FULL, INCLUDING Z, and a designer who finds
+// that too strong turns it down instead of a programmer picking 0.6 and burying it in the launch
+// expression. 0 restores the pre-v8 throw exactly, which is the A/B for judging the feel.
+//
+// WHY VERTICAL IS NOT SPECIAL-CASED. The obvious hedge is to inherit horizontal velocity in full and
+// vertical at some smaller fraction, on the grounds that a jump's +Z is large. That hedge would
+// delete the exact case the user reported. A jumping throw is the one the note names, and its whole
+// character is that the Core leaves with the jump still in it.
+//
+// MEASURED at the shipped defaults (throw speed 3000 base -> 2236 after the weight model, up bias
+// 0.12 -> 0.29 after weight, so an impulse of 2236 forward + 649 up = 2328 uu/s), see the numbers
+// in the pass report. Sprint is ~900 uu/s and the jump apex path is ~+560 uu/s Z at release.
+// =================================================================================================
+
+static TAutoConsoleVariable<float> CVarModeBThrowInheritance(
+	TEXT("Trace.ModeB.ThrowVelocityInheritance"),
+	1.f,
+	TEXT("MODE B, spec v8 §4. Fraction of the THROWER'S OWN velocity added to a thrown Core's launch ")
+	TEXT("velocity, vertical included, so a jumping throw carries the jump and a sprinting throw ")
+	TEXT("carries the sprint. 1 = full inheritance (the default), 0 = the pre-v8 throw that inherited ")
+	TEXT("nothing. UTraceSettings::CoreThrowVelocityInheritance."),
+	ECVF_Default);
+
+/**
+ * Armed from the command line as well as the console, and polled, for the reason Trace.ModeB.Verify
+ * is: -ExecCmds runs at engine init, long before there is a match, a Core or anybody holding it. A
+ * plain console command can only be typed into a window, and spec v8's testing policy forbids one.
+ * It stays armed until there is a live holder to throw, then disarms itself.
+ */
+static TAutoConsoleVariable<int32> CVarModeBMomentumTest(
+	TEXT("Trace.ModeB.MomentumTest"),
+	0,
+	TEXT("MODE B, spec v8 §4. 1: as soon as somebody is holding the Core, throw it three times - ")
+	TEXT("standing, running and airborne - and print the launch velocity of each with its pre-v8 ")
+	TEXT("baseline. Server only. Disarms itself after one run."),
+	ECVF_Default);
+
+/**
+ * How long to wait before the armed measurement fires.
+ *
+ * Not cosmetic. Spec v8 §0 requires the result to be observed FROM A CLIENT, and a listen server
+ * grants the Core at kickoff several seconds before a second process has finished joining - so a
+ * measurement that fired the moment somebody held it would be measured on the host by construction,
+ * with nobody connected to see it. This is what lets the throws land inside the client's session.
+ */
+static TAutoConsoleVariable<float> CVarModeBMomentumTestDelay(
+	TEXT("Trace.ModeB.MomentumTestDelaySeconds"),
+	0.f,
+	TEXT("MODE B, spec v8 §4. Seconds of world time to wait before Trace.ModeB.MomentumTest fires, so ")
+	TEXT("a joining client is in the session to observe it."),
+	ECVF_Default);
+
+/**
+ * Spec v8 §0: this is a CLIENT-experience pass, so the flight has to be observable FROM THE CLIENT.
+ *
+ * Runs on every machine, authority or not, and prints that machine's own view. A server-side log of
+ * the arc says nothing about whether the client's Core carries the momentum - which is exactly the
+ * class of "verified on the host" result section 0 rejects.
+ */
+static TAutoConsoleVariable<int32> CVarModeBFlightLog(
+	TEXT("Trace.ModeB.FlightLog"),
+	0,
+	TEXT("MODE B. 1: every machine logs its OWN view of the loose Core (position, velocity, speed) at ")
+	TEXT("10 Hz while it is in flight. Run it on the client as well as the server."),
+	ECVF_Default);
+
 static TAutoConsoleVariable<float> CVarModeBBounce(
 	TEXT("Trace.ModeB.Bounce"),
 	0.35f,
@@ -711,6 +791,13 @@ namespace TraceModeBTuning
 	float LooseResetSeconds() { return Resolve(TEXT("CoreLooseResetSeconds"),             CVarModeBLooseReset,       0.f,   120.f); }
 	float ThrowCooldown()     { return Resolve(TEXT("CoreThrowCooldownSeconds"),          CVarModeBThrowCooldown,    0.f,   10.f); }
 
+	// --- Spec v8 §4. NOT scaled by the weight model, and that is deliberate: MassScale describes how
+	// hard the Core is to THROW, and it already reduces the impulse. The thrower's momentum is
+	// transferred by carrying the Core, not by launching it, so a heavier Core carries the same
+	// velocity out of the same jump. Upper bound 2 rather than 1 so an over-inheriting "throw it like
+	// a Rocket League shot" variant is reachable from the console without a rebuild.
+	float ThrowInheritance()  { return Resolve(TEXT("CoreThrowVelocityInheritance"),      CVarModeBThrowInheritance, 0.f,   2.f); }
+
 	// --- Spec v7 §4, the surface rule. Kept in DEGREES because that is the unit the spec states it in
 	// ("a normal within ~45 degrees of straight up") and the unit a designer can picture; the cosine
 	// the test actually needs is derived once, here, so no caller has to remember which one it holds.
@@ -761,6 +848,10 @@ namespace TraceModeBTuning
 			TEXT("CoreLooseResetSeconds"),
 			TEXT("CoreThrowCooldownSeconds"),
 			TEXT("CoreThrowBounce"),
+			// Spec v8 §4. New this pass; needs declaring on UTraceSettings, and until it is, this list
+			// is what says so out loud rather than leaving a dead slider for a designer to find.
+			// Trace.ModeB.ThrowVelocityInheritance is where it can be retuned in the meantime.
+			TEXT("CoreThrowVelocityInheritance"),
 			// Spec v6 §4.1. New this pass; they need declaring on UTraceSettings, and until they are
 			// this list is what says so out loud instead of leaving three dead sliders to be found by
 			// a designer wondering why nothing changed.
@@ -1045,17 +1136,64 @@ void ATraceCore::Tick(float DeltaSeconds)
 		UpdateVisuals();
 	}
 
+	// Spec v8 §0/§4. Every machine's own view, so "the Core carries the momentum" is a claim that can
+	// be checked on the CLIENT rather than inferred from the server's copy. Costs one int compare.
+	TickFlightLog();
+
 	if (!HasAuthority())
 	{
 		// MODE B, CLIENTS. Dead-reckon the loose Core between net updates so it flies along its arc
 		// instead of stepping along it at the net update rate. Purely presentational: LooseLocation
-		// is overwritten by the next replicated value, and no client ever decides a pickup or a goal.
+		// and LooseVelocity are both overwritten by the next replicated value, and no client ever
+		// decides a pickup or a goal.
 		if (bLoose)
 		{
+			// SPEC v8 §0/§4. THE CLIENT INTEGRATES GRAVITY TOO, with the Core's own gravity - the same
+			// number ServerTickLooseCore uses, asked of the same accessor. Extrapolating at a CONSTANT
+			// velocity between net updates draws a straight line where the server is drawing a
+			// parabola, so the client's Core rode above the true arc and was yanked back down on every
+			// update. That is a client-only artefact by construction (the host integrates the real
+			// thing) and it is worst exactly where spec v8 §4 is looking: a jumping throw, whose Z is
+			// the fastest-changing component there is. Gated on a moving Core so a Core at rest, whose
+			// replicated velocity is zero, is not quietly sunk through the floor between updates.
+			if (!FVector(LooseVelocity).IsNearlyZero())
+			{
+				LooseVelocity = FVector(LooseVelocity)
+					+ FVector(0.0, 0.0, static_cast<double>(GetThrowGravityZ(GetWorld())) * DeltaSeconds);
+			}
+
 			LooseLocation = LooseLocation + LooseVelocity * DeltaSeconds;
 			SetActorLocation(LooseLocation, false, nullptr, ETeleportType::TeleportPhysics);
 		}
 		return;
+	}
+
+	// Spec v8 §4's measurement, armed from the command line. Held until there is a live holder AND,
+	// per spec v8 §0, a joining client actually in the session to observe it.
+	//
+	// SPEC v8 §0 IS THE SECOND HALF OF THE GATE, AND IT IS NOT A STOPWATCH. The first version of this
+	// fired on a fixed 28 s delay, and the second process was still loading plugins when it did - so
+	// the whole measurement was taken with nobody connected, which is the exact "measured on the host"
+	// failure section 0 exists to stop. The delay is now only a FLOOR; what actually releases the
+	// measurement is a remote client's pawn existing. The four-minute timeout is a last resort, and
+	// RunThrowMomentumTest SAYS SO in the log rather than quietly producing a host-side number that
+	// reads like a client-side one.
+	//
+	// One condition, not an early return: the rest of this tick is the Core's own housekeeping (the
+	// queued fallback, the holder-validity check, the pending grant) and skipping it for minutes while
+	// a diagnostic waits would break the match around the measurement.
+	if (!bMomentumTestRun && CVarModeBMomentumTest.GetValueOnGameThread() != 0 && IsModeB()
+		&& GetWorld()->GetTimeSeconds() >= static_cast<double>(CVarModeBMomentumTestDelay.GetValueOnGameThread())
+		&& IsValid(Carrier) && Carrier->IsAlive() && !bLoose && !bCoreStateLocked
+		&& (HasRemoteClientPawn()
+			|| GetWorld()->GetTimeSeconds()
+				>= static_cast<double>(CVarModeBMomentumTestDelay.GetValueOnGameThread()) + 240.0))
+	{
+		// The LATCH is what disarms it. Writing the CVar back to 0 does not: -ExecCmds armed it at
+		// console priority and a code-priority Set is dropped, which fired this 48 times in one match.
+		bMomentumTestRun = true;
+		RunThrowMomentumTest();
+		return;   // The Core is loose now; let the next tick pick it up through the normal path.
 	}
 
 	const float Now = GetServerTimeSeconds();
@@ -2907,6 +3045,377 @@ float ATraceCore::GetThrowMuzzleForward()
 	return static_cast<float>(TraceModeBTuning::ThrowMuzzleForward);
 }
 
+// --- SPEC v8 §4: the inherited term ---------------------------------------------------------------
+
+float ATraceCore::GetThrowVelocityInheritance()
+{
+	return TraceModeBTuning::ThrowInheritance();
+}
+
+FVector ATraceCore::GetInheritedThrowVelocity(const AActor* Thrower)
+{
+	if (!IsValid(Thrower))
+	{
+		return FVector::ZeroVector;
+	}
+
+	// MODE-GATED HERE rather than at every call site, so a caller can add this unconditionally and
+	// still get the mode-A answer (a Core that never moves under its own power) without a mode test.
+	if (!IsModeB(Thrower->GetWorld()))
+	{
+		return FVector::ZeroVector;
+	}
+
+	const float Fraction = TraceModeBTuning::ThrowInheritance();
+	if (Fraction <= 0.f)
+	{
+		return FVector::ZeroVector;
+	}
+
+	// AActor::GetVelocity() resolves to the movement component's velocity for a pawn, which is the
+	// same vector the character's own movement is integrating this frame - vertical included, which is
+	// the entire point of the note. Asking the actor rather than the CMC directly means a thrower with
+	// some other movement model (a spectator, a future vehicle) still contributes what it is doing.
+	return Thrower->GetVelocity() * Fraction;
+}
+
+FVector ATraceCore::ComputeThrowLaunchVelocity(const AActor* Thrower, const FVector& AimDirection)
+{
+	const FVector Direction = AimDirection.GetSafeNormal();
+	const float Speed = TraceModeBTuning::ThrowSpeed();
+
+	const FVector Impulse = Direction * Speed + FVector::UpVector * (Speed * TraceModeBTuning::ThrowUpBias());
+
+	return Impulse + GetInheritedThrowVelocity(Thrower);
+}
+
+ATraceCore::FThrowMomentumSample ATraceCore::LastThrow;
+
+static FAutoConsoleCommand GTraceModeBThrowMomentumCmd(
+	TEXT("Trace.ModeB.ThrowMomentum"),
+	TEXT("MODE B, spec v8 §4. Prints the last throw broken into its parts: the impulse, the velocity ")
+	TEXT("inherited from the thrower, and the launch velocity that left the hand."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		const ATraceCore::FThrowMomentumSample& S = ATraceCore::LastThrow;
+		if (!S.bValid)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ModeB] THROW MOMENTUM: no throw recorded on this machine yet (the record is made ")
+				TEXT("on the SERVER, where the throw is resolved). Inheritance fraction is %.2f."),
+				ATraceCore::GetThrowVelocityInheritance());
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] THROW MOMENTUM (spec v8 §4): %s was %s at %.0f uu/s horizontal, %+.0f uu/s ")
+			TEXT("vertical | impulse %.0f uu/s + inherited %.0f uu/s (x%.2f) = LAUNCH %.0f uu/s, ")
+			TEXT("launch Z %+.0f uu/s"),
+			*S.ThrowerName, S.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("on the ground"),
+			S.ThrowerSpeed2D, S.ThrowerVelocityZ,
+			S.ImpulseSpeed, S.InheritedSpeed, S.Inheritance, S.LaunchSpeed, S.LaunchVelocityZ);
+	}));
+
+bool ATraceCore::HasRemoteClientPawn() const
+{
+	if (!HasAuthority())
+	{
+		return false;
+	}
+
+	TArray<ATraceCharacter*> Characters;
+	GatherCharacters(Characters);
+
+	for (const ATraceCharacter* Candidate : Characters)
+	{
+		if (!IsValid(Candidate) || !Candidate->IsAlive())
+		{
+			continue;
+		}
+
+		// A bare read of the inherited Controller; nothing is declared, so there is nothing to shadow.
+		const APlayerController* CandidateController = Cast<APlayerController>(Candidate->GetController());
+		if (CandidateController != nullptr && !CandidateController->IsLocalController())
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void ATraceCore::TickFlightLog()
+{
+	if (CVarModeBFlightLog.GetValueOnGameThread() == 0)
+	{
+		bFlightLogWasLoose = bLoose;
+		return;
+	}
+
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	const TCHAR* Machine = HasAuthority()
+		? (World->GetNetMode() == NM_ListenServer ? TEXT("HOST") : TEXT("SERVER"))
+		: TEXT("CLIENT");
+
+	if (!bLoose)
+	{
+		if (bFlightLogWasLoose)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[ModeBFlight] %s: no longer loose (holder %s)."),
+				Machine, *GetNameSafe(Carrier));
+		}
+		bFlightLogWasLoose = false;
+		return;
+	}
+
+	// The first frame of a flight is the one the momentum question is about, so it is never dropped
+	// by the throttle: a 10 Hz sample of a 2800 uu/s launch can easily miss the launch itself.
+	const float NowReal = static_cast<float>(World->GetTimeSeconds());
+	const bool bFirst = !bFlightLogWasLoose;
+	bFlightLogWasLoose = true;
+
+	if (!bFirst && NowReal < NextFlightLogTime)
+	{
+		return;
+	}
+	NextFlightLogTime = NowReal + 0.1f;
+
+	const FVector Velocity = LooseVelocity;
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeBFlight] %s%s pos %s vel %s | speed %.0f uu/s (horiz %.0f, Z %+.0f)"),
+		Machine, bFirst ? TEXT(" LAUNCH") : TEXT(""),
+		*FVector(LooseLocation).ToCompactString(), *Velocity.ToCompactString(),
+		Velocity.Size(), Velocity.Size2D(), Velocity.Z);
+}
+
+void ATraceCore::RunThrowMomentumTest()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[ModeBMomentum] server only - a throw is resolved on the authority."));
+		return;
+	}
+
+	if (!IsModeB())
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[ModeBMomentum] mode A: there is no throw. Launch with ?mode=b."));
+		return;
+	}
+
+	// A JOINING CLIENT'S PAWN FIRST, and that preference is spec v8 §0, not tidiness. Measuring this
+	// on the listen host's own pawn would prove only that the arithmetic runs somewhere - the host is
+	// the machine on which every one of this pass's three complaints is invisible by definition. Using
+	// a remote client's pawn puts the whole path under test: the server reads ITS copy of a
+	// client-owned pawn's velocity, releases a client-owned holder, and replicates the loose Core back
+	// to the very client that threw it.
+	ATraceCharacter* Thrower = nullptr;
+
+	TArray<ATraceCharacter*> Characters;
+	GatherCharacters(Characters);
+
+	for (ATraceCharacter* Candidate : Characters)
+	{
+		if (!IsValid(Candidate) || !Candidate->IsAlive())
+		{
+			continue;
+		}
+
+		// A bare read of the inherited Controller, which is correct code - nothing is declared here.
+		const APlayerController* CandidateController = Cast<APlayerController>(Candidate->GetController());
+		if (CandidateController != nullptr && !CandidateController->IsLocalController())
+		{
+			Thrower = Candidate;
+			break;
+		}
+	}
+
+	if (Thrower != nullptr)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBMomentum] thrower is a REMOTE CLIENT's pawn (%s) - spec v8 §0."), *GetNameSafe(Thrower));
+	}
+	else if (IsValid(Carrier) && Carrier->IsAlive())
+	{
+		Thrower = Carrier;
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ModeBMomentum] NO REMOTE CLIENT CONNECTED - falling back to the current holder (%s). ")
+			TEXT("This is a HOST-side measurement and spec v8 §0 does not accept it on its own."),
+			*GetNameSafe(Thrower));
+	}
+	else
+	{
+		for (ATraceCharacter* Candidate : Characters)
+		{
+			if (IsValid(Candidate) && Candidate->IsAlive())
+			{
+				Thrower = Candidate;
+				break;
+			}
+		}
+	}
+
+	if (!IsValid(Thrower))
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[ModeBMomentum] nobody alive to throw it."));
+		return;
+	}
+
+	if (Carrier != Thrower)
+	{
+		GrantTo(Thrower, ETraceCoreGrantReason::Debug);
+	}
+
+	UCharacterMovementComponent* Movement = Thrower->GetCharacterMovement();
+	if (Movement == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[ModeBMomentum] %s has no character movement."), *GetNameSafe(Thrower));
+		return;
+	}
+
+	// Restored at the end: this command is a measurement, not a shove.
+	const FVector SavedVelocity = Movement->Velocity;
+	const EMovementMode SavedMode = Movement->MovementMode;
+
+	const FVector Forward = Thrower->GetActorForwardVector().GetSafeNormal2D();
+	const float RunSpeed = Movement->GetMaxSpeed();
+	const float JumpZ = Movement->JumpZVelocity;
+
+	struct FCase
+	{
+		const TCHAR* Name;
+		FVector Velocity;
+		EMovementMode Mode;
+	};
+
+	const FCase Cases[] =
+	{
+		{ TEXT("STANDING"), FVector::ZeroVector,                            MOVE_Walking },
+		{ TEXT("RUNNING"),  Forward * RunSpeed,                             MOVE_Walking },
+		{ TEXT("JUMPING"),  Forward * RunSpeed + FVector(0.f, 0.f, JumpZ),  MOVE_Falling },
+	};
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeBMomentum] spec v8 §4, thrower %s, inheritance x%.2f, run speed %.0f, jump Z %.0f"),
+		*GetNameSafe(Thrower), TraceModeBTuning::ThrowInheritance(), RunSpeed, JumpZ);
+
+	for (const FCase& Case : Cases)
+	{
+		if (!IsValid(Thrower) || !Thrower->IsAlive())
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBMomentum] thrower died mid-measurement."));
+			return;
+		}
+
+		// Put the Core back and forgive the cooldown: the cooldown is not what is being measured.
+		if (Carrier != Thrower)
+		{
+			GrantTo(Thrower, ETraceCoreGrantReason::Debug);
+		}
+		ThrowCooldownEndServerTime = 0.f;
+
+		Movement->SetMovementMode(Case.Mode);
+		Movement->Velocity = Case.Velocity;
+
+		LastThrow.bValid = false;
+		if (!ThrowFromHolder(Thrower))
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBMomentum] %s: ThrowFromHolder refused."), Case.Name);
+			continue;
+		}
+
+		// The pre-v8 launch is the impulse on its own, which LastThrow already carries - so the A/B is
+		// printed from the SAME throw rather than from a second run with the knob at zero.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBMomentum] %-8s thrower %.0f uu/s horiz %+.0f vert (%s) | pre-v8 launch %.0f uu/s ")
+			TEXT("(Z %+.0f) -> v8 launch %.0f uu/s (Z %+.0f) | inherited %.0f uu/s, %+.0f%%"),
+			Case.Name, LastThrow.ThrowerSpeed2D, LastThrow.ThrowerVelocityZ,
+			LastThrow.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("grounded"),
+			LastThrow.ImpulseSpeed, LastThrow.LaunchVelocityZ - LastThrow.ThrowerVelocityZ * LastThrow.Inheritance,
+			LastThrow.LaunchSpeed, LastThrow.LaunchVelocityZ, LastThrow.InheritedSpeed,
+			100.f * (LastThrow.LaunchSpeed - LastThrow.ImpulseSpeed) / FMath::Max(1.f, LastThrow.ImpulseSpeed));
+	}
+
+	if (IsValid(Thrower) && Movement != nullptr)
+	{
+		Movement->SetMovementMode(SavedMode);
+		Movement->Velocity = SavedVelocity;
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[ModeBMomentum] done. The last throw is still loose; play resumes normally."));
+}
+
+// NAMED "...Now", NOT "Trace.ModeB.MomentumTest". A console OBJECT name is a single namespace shared
+// by variables and commands, and registering a command under the same name as the CVar above is a
+// FATAL error at startup ("can't be replaced with the new one of different type") - which is how this
+// first run died. The CVar is the armable form (-ExecCmds, polled); this is the fire-it-right-now form.
+static FAutoConsoleCommand GTraceModeBMomentumTestCmd(
+	TEXT("Trace.ModeB.MomentumTestNow"),
+	TEXT("MODE B, spec v8 §4. Server. Throws the Core three times - standing, running and airborne - ")
+	TEXT("and prints the pre-v8 and post-v8 launch velocity of each. Immediate; ")
+	TEXT("Trace.ModeB.MomentumTest 1 is the armable form for -ExecCmds."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Context.World();
+			if (World == nullptr || World->GetNetMode() == NM_Client)
+			{
+				continue;
+			}
+
+			if (ATraceCore* Core = ATraceCore::Get(World))
+			{
+				Core->RunThrowMomentumTest();
+			}
+		}
+	}));
+
+/**
+ * Prints THIS MACHINE'S view of the loose Core.
+ *
+ * Deliberately not authority-gated and deliberately not a server RPC: spec v8 §0 is a client-experience
+ * pass, and the question "does the CLIENT see the Core carrying the throw's momentum" cannot be
+ * answered from the server's copy by definition. LooseVelocity is replicated so a client can
+ * dead-reckon; this prints what the client actually received.
+ */
+static FAutoConsoleCommand GTraceModeBCoreProbeCmd(
+	TEXT("Trace.ModeB.CoreProbe"),
+	TEXT("MODE B. Prints the LOCAL machine's view of the Core: held/loose, its replicated position and ")
+	TEXT("velocity, and the actor transform the local renderer is drawing. Run it on a CLIENT."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Context.World();
+			if (World == nullptr || (World->GetNetMode() != NM_Client && World->GetNetMode() != NM_ListenServer
+				&& World->GetNetMode() != NM_Standalone))
+			{
+				continue;
+			}
+
+			ATraceCore* Core = ATraceCore::Get(World);
+			if (Core == nullptr)
+			{
+				continue;
+			}
+
+			const TCHAR* Machine = (World->GetNetMode() == NM_Client) ? TEXT("CLIENT") : TEXT("SERVER/LOCAL");
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ModeB] CORE PROBE (%s): mode %s | holder %s | loose %d | repl pos %s | repl vel %s ")
+				TEXT("(%.0f uu/s, Z %+.0f) | drawn at %s"),
+				Machine, Core->IsModeB() ? TEXT("B") : TEXT("A"), *GetNameSafe(Core->GetCarrier()),
+				Core->IsLoose() ? 1 : 0, *FVector(Core->LooseLocation).ToCompactString(),
+				*FVector(Core->LooseVelocity).ToCompactString(),
+				FVector(Core->LooseVelocity).Size(), FVector(Core->LooseVelocity).Z,
+				*Core->GetActorLocation().ToCompactString());
+		}
+	}));
+
 int32 ATraceCore::GoalsByMethod[static_cast<int32>(ATraceCore::EGoalMethod::Count)] = {};
 
 static FAutoConsoleCommand GTraceModeBTallyCmd(
@@ -3087,12 +3596,41 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
 	}
 	ThrowDirection = ThrowDirection.GetSafeNormal();
 
+	// SPEC v8 §4. THE LAUNCH IS THE IMPULSE PLUS THE THROWER'S OWN MOTION, VERTICAL INCLUDED.
+	//
+	// Read off the SERVER's copy of the thrower, on the same frame and from the same actor the aim
+	// came from, for the identical reason: a client-supplied velocity is a client-supplied launch. On
+	// a listen server the host's pawn velocity is exact; for a joining client the server has already
+	// executed their moves through the movement component, so the velocity here is the authoritative
+	// result of the very moves that produced the jump - not an interpolated proxy's guess. That is
+	// what makes this fix land the same way for a client as for the host (spec v8 §0).
 	const float Speed = TraceModeBTuning::ThrowSpeed();
-	const FVector LaunchVelocity = ThrowDirection * Speed
+	const FVector Impulse = ThrowDirection * Speed
 		+ FVector::UpVector * (Speed * TraceModeBTuning::ThrowUpBias());
 
+	const FVector Inherited = GetInheritedThrowVelocity(Thrower);
+	const FVector LaunchVelocity = Impulse + Inherited;
+
+	// NOT ALSO OFFSET BY THE THROWER'S MOTION. The muzzle is a fixed 70 uu ahead of the eye and stays
+	// there: the eye position is already this frame's, so the launch point already travels with the
+	// thrower. Adding velocity * dt here as well would double-count the frame.
 	const FVector LaunchLocation = Thrower->GetPawnViewLocation()
 		+ ThrowDirection * TraceModeBTuning::ThrowMuzzleForward;
+
+	// Broken into its parts for Trace.ModeB.ThrowMomentum. "It doesn't seem to keep momentum" is a
+	// claim about a launch velocity, and one aggregate number cannot answer it.
+	const FVector ThrowerVelocity = Thrower->GetVelocity();
+	LastThrow.bValid = true;
+	LastThrow.ImpulseSpeed = static_cast<float>(Impulse.Size());
+	LastThrow.InheritedSpeed = static_cast<float>(Inherited.Size());
+	LastThrow.LaunchSpeed = static_cast<float>(LaunchVelocity.Size());
+	LastThrow.LaunchVelocityZ = static_cast<float>(LaunchVelocity.Z);
+	LastThrow.ThrowerSpeed2D = static_cast<float>(ThrowerVelocity.Size2D());
+	LastThrow.ThrowerVelocityZ = static_cast<float>(ThrowerVelocity.Z);
+	LastThrow.bThrowerFalling = Thrower->GetCharacterMovement() != nullptr
+		&& Thrower->GetCharacterMovement()->IsFalling();
+	LastThrow.Inheritance = TraceModeBTuning::ThrowInheritance();
+	LastThrow.ThrowerName = GetNameSafe(Thrower);
 
 	const ETraceTeam ThrowerTeam = Thrower->GetTeam();
 
@@ -3126,9 +3664,14 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
 	ForceNetUpdate();
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[ModeB] THROW by %s (%s) at %.0f uu/s from %s"),
+		TEXT("[ModeB] THROW by %s (%s) at %.0f uu/s from %s | spec v8 §4: impulse %.0f + inherited %.0f ")
+		TEXT("(thrower %.0f uu/s horiz, %+.0f vert, %s, x%.2f), launch Z %+.0f"),
 		*GetNameSafe(Thrower), *TraceTeamName(ThrowerTeam).ToString(),
-		LaunchVelocity.Size(), *LaunchLocation.ToCompactString());
+		LaunchVelocity.Size(), *LaunchLocation.ToCompactString(),
+		LastThrow.ImpulseSpeed, LastThrow.InheritedSpeed,
+		LastThrow.ThrowerSpeed2D, LastThrow.ThrowerVelocityZ,
+		LastThrow.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("grounded"),
+		LastThrow.Inheritance, LastThrow.LaunchVelocityZ);
 
 	return true;
 }

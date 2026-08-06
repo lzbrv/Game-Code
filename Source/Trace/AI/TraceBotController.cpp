@@ -3050,11 +3050,7 @@ static TraceThrowBallistics::FModel MakeThrowModel(const UWorld* World)
 bool ATraceBotController::SolveThrowLaunch(const FVector& From, const FVector& WorldTarget,
 	FVector& OutLaunchDirection, float* OutFlightSeconds) const
 {
-	const FVector Delta = WorldTarget - From;
-	FVector Horizontal = FVector(Delta.X, Delta.Y, 0.0);
-	const float Range = static_cast<float>(Horizontal.Size());
-
-	if (Range < 1.f)
+	if (static_cast<float>(FVector(WorldTarget.X - From.X, WorldTarget.Y - From.Y, 0.0).Size()) < 1.f)
 	{
 		OutLaunchDirection = FVector::UpVector;
 		if (OutFlightSeconds != nullptr)
@@ -3064,23 +3060,64 @@ bool ATraceBotController::SolveThrowLaunch(const FVector& From, const FVector& W
 		return true;
 	}
 
-	Horizontal /= Range;
-
 	const TraceThrowBallistics::FModel Model = MakeThrowModel(GetWorld());
 
-	float Pitch = 0.f;
-	float Flight = 0.f;
-	if (!TraceThrowBallistics::SolvePitch(Model, Range, static_cast<float>(Delta.Z), Pitch, Flight))
+	// SPEC v8 §4 FALLOUT. The Core now leaves at impulse + thrower velocity, so a bot that solves the
+	// impulse alone aims wrong BY ITS OWN VELOCITY — a running bot throwing across its direction of
+	// travel misses by (its speed x flight time), which is thousands of uu on a full-field throw. It
+	// was measured live: a bot running away from its aim launched at 1233 uu/s against a 2081 uu/s
+	// impulse, i.e. the inherited term dominated the shot and the solver never knew.
+	//
+	// THE TRICK: hitting Target at time t with an extra CONSTANT velocity V is exactly hitting
+	// (Target - V*t) without it. V is constant over the flight (the Core's gravity is already in the
+	// model), so no new ballistics are needed — only the target moves, and the existing solve is
+	// reused verbatim.
+	//
+	// It is a fixed point, because the displacement depends on the flight time the solve returns:
+	// two passes, since the flight time barely moves once the range is roughly right. Converges in
+	// two for every case measured; the loop keeps the last successful answer if a later pass falls
+	// out of range, so adding lead can never turn a reachable shot into a refusal.
+	const FVector Inherited = ATraceCore::GetInheritedThrowVelocity(GetBotCharacter());
+
+	FVector EffectiveTarget = WorldTarget;
+	bool bSolved = false;
+
+	for (int32 Pass = 0; Pass < 3; ++Pass)
 	{
-		return false;
+		const FVector Delta = EffectiveTarget - From;
+		FVector Horizontal = FVector(Delta.X, Delta.Y, 0.0);
+		const float Range = static_cast<float>(Horizontal.Size());
+		if (Range < 1.f)
+		{
+			break;
+		}
+		Horizontal /= Range;
+
+		float Pitch = 0.f;
+		float Flight = 0.f;
+		if (!TraceThrowBallistics::SolvePitch(Model, Range, static_cast<float>(Delta.Z), Pitch, Flight))
+		{
+			break;
+		}
+
+		OutLaunchDirection = (Horizontal * FMath::Cos(Pitch) + FVector::UpVector * FMath::Sin(Pitch)).GetSafeNormal();
+		if (OutFlightSeconds != nullptr)
+		{
+			*OutFlightSeconds = Flight;
+		}
+		bSolved = true;
+
+		// Standing still (or inheritance turned off) — the displacement is zero and the extra passes
+		// would be identical. Bail on the first solve so the common case costs exactly what it did.
+		if (Inherited.IsNearlyZero())
+		{
+			break;
+		}
+
+		EffectiveTarget = WorldTarget - Inherited * Flight;
 	}
 
-	OutLaunchDirection = (Horizontal * FMath::Cos(Pitch) + FVector::UpVector * FMath::Sin(Pitch)).GetSafeNormal();
-	if (OutFlightSeconds != nullptr)
-	{
-		*OutFlightSeconds = Flight;
-	}
-	return true;
+	return bSolved;
 }
 
 float ATraceBotController::MaxThrowRange(const FVector& /*From*/, float HeightDelta) const
@@ -3140,7 +3177,12 @@ bool ATraceBotController::HasThrowLane(const FVector& From, const FVector& World
 	}
 
 	const TraceThrowBallistics::FModel Model = MakeThrowModel(World);
-	const FVector LaunchVelocity = LaunchDirection * Model.Speed + FVector::UpVector * (Model.Speed * Model.UpBias);
+
+	// SPEC v8 §4. Sweep the arc the Core ACTUALLY FLIES, not the one the impulse alone would produce.
+	// ComputeThrowLaunchVelocity is ATraceCore's own launch expression (impulse + inherited velocity,
+	// mode-gated and null-safe), so the lane test and the throw cannot drift apart the way a
+	// hand-rebuilt copy of the formula just did — this line used to be that copy.
+	const FVector LaunchVelocity = ATraceCore::ComputeThrowLaunchVelocity(BotCharacter, LaunchDirection);
 
 	FCollisionQueryParams Params(TEXT("TraceBotThrowLane"), /*bTraceComplex=*/false, BotCharacter);
 
