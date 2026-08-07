@@ -955,6 +955,135 @@ namespace TraceGoalRegistry
 
 
 // =================================================================================================
+// SPEC v10 §10 — "the core randomly flies across a players screen, client-side ... after a goal"
+//
+// THE MEASUREMENT CAME FIRST, AND IT CONTRADICTED THE SPEC'S LEAD.
+//
+// The lead was: every reset calls SetActorLocation(..., TeleportPhysics), which is right on the
+// server, but the client INTERPOLATES replicated movement and therefore slides the Core across the
+// map. Read the constructor before believing that: this actor calls SetReplicateMovement(false).
+// ReplicatedMovement is never sent for it, PostNetReceiveLocationAndRotation is never called on it,
+// and there is no interpolator anywhere in its path. The one transform channel it has is its
+// ATTACHMENT to the holder.
+//
+// Which is the actual defect. A server reset moved the actor and told the clients NOTHING:
+//
+//   server                                   client
+//   ------                                   ------
+//   ReleaseHolder(): Carrier = nullptr       OnRep_Carrier -> ApplyAttachment
+//   DetachFromActor(KeepWorldTransform)      DetachFromActor(KeepWorldTransform)
+//   SetActorLocation(home)                   ... nothing. The Core stays in the endzone.
+//   [KickoffDelaySeconds pass]               ... still in the endzone.
+//   GrantTo(next holder): AttachToActor      OnRep_Carrier -> AttachToActor: ONE-FRAME JUMP
+//                                            from the endzone to the far side of the field.
+//
+// So the client's Core is stranded at the far end of the pitch for the whole kickoff delay and then
+// crosses the entire map in a single frame, off an always-relevant beacon that is deliberately
+// visible from anywhere. That is the reported symptom, and "after a goal" fits it for the reason the
+// spec gave — a goal is the longest teleport there is.
+//
+// Two things are wrong and both are fixed:
+//   1. The client was never told. -> ServerTeleport()/TeleportSerial, an explicit teleport channel.
+//   2. The client never applied the rule it already owns. -> PlaceHolderlessCore(), the client half
+//      of the constructor's "holderless => every machine computes the home location identically",
+//      which previously existed only after Tick's `!HasAuthority()` early return.
+//
+// Trace.Core.TeleportAudit is the instrument that established the above and is what the fix is
+// judged by. It runs on EVERY machine (spec v8 §0: a number measured on the host cannot see this)
+// and reports one line per possession reset, classifying it as SNAP, SLIDE or STRANDED-then-JUMP.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarCoreTeleportAudit(
+	TEXT("Trace.Core.TeleportAudit"),
+	0,
+	TEXT("Trace: audit the Core's own transform across possession resets, on whatever machine it is set on.\n")
+	TEXT("Prints one summary per reset: path length, frames spent moving, worst distance from home.\n")
+	TEXT("0 = off (default), 1 = on."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarCoreTeleportAuditJump(
+	TEXT("Trace.Core.TeleportAuditJump"),
+	400.f,
+	TEXT("Trace: single-frame movement, in uu, above which Trace.Core.TeleportAudit logs a JUMP line."),
+	ECVF_Default);
+
+/**
+ * THE A/B SWITCH, AND IT IS WHAT MAKES THE RED ARM OF THE TEST HONEST.
+ *
+ * 0 restores the pre-v10 behaviour EXACTLY, in the same binary: the server still moves the actor with
+ * SetActorLocation(TeleportPhysics) and still tells the clients nothing, and a client still declines
+ * to apply the holderless placement rule it does not know it owns. That is how the symptom was
+ * reproduced failing before the fix went in, on a real client at 40 ms, rather than argued about.
+ *
+ * Kept rather than deleted for the same reason Trace.Trail.ClearOnPossessionLoss was kept: the next
+ * person to doubt this diagnosis can re-run both arms without a rebuild.
+ */
+static TAutoConsoleVariable<int32> CVarCoreTeleportFix(
+	TEXT("Trace.Core.TeleportFix"),
+	1,
+	TEXT("Trace (spec v10 §10): 1 = replicate Core teleports and let clients place a holderless Core (default).\n")
+	TEXT("0 = the pre-v10 behaviour, where a reset moved the Core on the server only. For A/B only."),
+	ECVF_Default);
+
+/** How many post-goal resets Trace.Core.GoalRepro should fire on its own. 0 = manual only. */
+static TAutoConsoleVariable<int32> CVarCoreGoalReproRuns(
+	TEXT("Trace.Core.GoalReproRuns"),
+	0,
+	TEXT("Trace (spec v10 §10): fire this many staged post-goal resets automatically, once a REMOTE ")
+	TEXT("client's pawn exists. 0 = off; drive it by hand with Trace.Core.GoalRepro instead."),
+	ECVF_Default);
+
+/**
+ * Floor, not a stopwatch — the same lesson spec v8 §0 taught the momentum test. The run is released
+ * by a remote client's pawn EXISTING; this only stops it firing into a half-loaded match.
+ */
+static TAutoConsoleVariable<float> CVarCoreGoalReproDelay(
+	TEXT("Trace.Core.GoalReproDelay"),
+	25.f,
+	TEXT("Trace: seconds before the first automatic Trace.Core.GoalReproRuns reset."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarCoreGoalReproInterval(
+	TEXT("Trace.Core.GoalReproInterval"),
+	12.f,
+	TEXT("Trace: seconds between automatic resets. Must exceed the staging delay + the kickoff delay ")
+	TEXT("+ Trace.Core.TeleportAuditWindow, or one audit window swallows the next reset."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarCoreTeleportAuditWindow(
+	TEXT("Trace.Core.TeleportAuditWindow"),
+	3.0f,
+	TEXT("Trace: seconds to watch the Core for after a possession reset before printing the audit summary.\n")
+	TEXT("Must outlast the kickoff delay or the summary closes before the Core is re-granted."),
+	ECVF_Default);
+
+/**
+ * Trace.Core.GoalRepro — server. Stages the exact geometry of a goal and then fires the exact reset
+ * a goal fires, so §10 can be reproduced on demand instead of waited for.
+ *
+ * Two stages, because the symptom is about what the CLIENT does with a reset and the client has to
+ * have SEEN the Core at the far end first: teleport the holder deep into the attacking end, wait out
+ * a staging delay (well over the 40 ms the client is being tested at), then call KickoffTo() — which
+ * is precisely and only what ATraceGameMode::NotifyScored does to this actor on a score.
+ */
+static void TraceCoreGoalReproCommand(UWorld* World)
+{
+	ATraceCore* Core = ATraceCore::Get(World);
+	if (Core == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[CoreAudit] Trace.Core.GoalRepro: no Core in this world."));
+		return;
+	}
+	Core->RequestGoalRepro();
+}
+
+static FAutoConsoleCommand GTraceCoreGoalReproCmd(
+	TEXT("Trace.Core.GoalRepro"),
+	TEXT("Trace: stage a carrier at the far end of the field and then fire the post-goal reset (spec v10 §10)."),
+	FConsoleCommandWithWorldDelegate::CreateStatic(&TraceCoreGoalReproCommand));
+
+
+// =================================================================================================
 // Construction
 // =================================================================================================
 
@@ -1062,6 +1191,13 @@ void ATraceCore::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifeti
 	DOREPLIFETIME(ATraceCore, bLoose);
 	DOREPLIFETIME(ATraceCore, LooseLocation);
 	DOREPLIFETIME(ATraceCore, LooseVelocity);
+
+	// SPEC v10 §10. The teleport channel. Two properties rather than one struct so that the ordering
+	// this depends on is the plain one the engine already guarantees: a bunch's property DATA is all
+	// applied before ANY of that bunch's RepNotifies run, so by the time OnRep_TeleportSerial fires,
+	// TeleportLocation — and Carrier, and bLoose — are already the new values.
+	DOREPLIFETIME(ATraceCore, TeleportLocation);
+	DOREPLIFETIME(ATraceCore, TeleportSerial);
 }
 
 void ATraceCore::BeginPlay()
@@ -1140,6 +1276,10 @@ void ATraceCore::Tick(float DeltaSeconds)
 	// be checked on the CLIENT rather than inferred from the server's copy. Costs one int compare.
 	TickFlightLog();
 
+	// Spec v10 §10, same reasoning and the same placement: ahead of the authority split, because the
+	// machine the bug is ON is the one that is not the server. Costs one int compare when disarmed.
+	TickTeleportAudit();
+
 	if (!HasAuthority())
 	{
 		// MODE B, CLIENTS. Dead-reckon the loose Core between net updates so it flies along its arc
@@ -1164,7 +1304,22 @@ void ATraceCore::Tick(float DeltaSeconds)
 
 			LooseLocation = LooseLocation + LooseVelocity * DeltaSeconds;
 			SetActorLocation(LooseLocation, false, nullptr, ETeleportType::TeleportPhysics);
+			return;
 		}
+
+		// SPEC v10 §10. THE CLIENT HALF OF "holderless => every machine computes the home location
+		// identically", which the constructor has claimed since movement replication was switched off
+		// and which nothing has ever implemented on a client.
+		//
+		// The server's version of this line is step 3 below — and step 3 is on the far side of this
+		// early return, so it has only ever run on the authority. A client that saw a possession end
+		// therefore detached the Core with KeepWorldTransform and left it exactly where the old holder
+		// died or scored, for the entire kickoff delay, until the next GrantTo attached it and it
+		// crossed the map in one frame. See the §10 block at the top of this file.
+		//
+		// Idempotent and the same tolerance the server uses, so in the steady state (holderless, at
+		// home) this is one distance compare per frame and no writes.
+		PlaceHolderlessCore();
 		return;
 	}
 
@@ -1197,6 +1352,10 @@ void ATraceCore::Tick(float DeltaSeconds)
 	}
 
 	const float Now = GetServerTimeSeconds();
+
+	// Spec v10 §10's reproduction, armed from the console or -ExecCmds. Ahead of everything, because
+	// stage two of it IS a reset and must not be run from inside one. One bool compare when disarmed.
+	TickGoalRepro();
 
 	// ---- 0. Mode B: a Core that is out in the world is its own state, and it OWNS this tick. ----
 	//
@@ -1302,10 +1461,13 @@ void ATraceCore::Tick(float DeltaSeconds)
 		}
 
 		// Park it at home so a holderless Core is somewhere sensible rather than on a corpse.
-		if (FVector::DistSquared(GetActorLocation(), GetHomeLocation()) > TraceCoreTuning::HomeToleranceSq)
-		{
-			SetActorLocation(GetHomeLocation(), false, nullptr, ETeleportType::TeleportPhysics);
-		}
+		//
+		// SPEC v10 §10: through the teleport funnel now, so the clients are TOLD. This is the path that
+		// catches a Core left on a corpse or wherever a disconnect abandoned it — a discontinuity by
+		// definition, and previously a purely local one. PlaceHolderlessCore() applies the identical
+		// rule on every machine; this call is what makes the server's answer authoritative when the
+		// two could disagree (a client whose arena builder has not replicated yet, say).
+		PlaceHolderlessCore();
 		return;
 	}
 
@@ -1451,6 +1613,75 @@ FVector ATraceCore::GetHomeLocation() const
 
 // IsPickupLockedOutFor() IS DELETED. Zero callers, and it returned false unconditionally: there is
 // no loose Core and nothing is ever picked up, so there was nothing to be locked out of.
+
+#if !UE_BUILD_SHIPPING
+ATraceCharacter* ATraceCore::DebugForcePassWindow()
+{
+	// See the header for why this exists and what it is for.
+	if (!HasAuthority() || !IsValid(Carrier))
+	{
+		return nullptr;
+	}
+	if (bPassActive)
+	{
+		// ALREADY OPEN — HOLD IT OPEN, do not let it mature.
+		//
+		// A real pass COMPLETES after PassHoldSeconds and hands the Core to its target, and that
+		// completion is what defeated three attempts to stage the knife's carrier rule: the window
+		// opened, the pass matured, the Core moved, and by the time the blade resolved the victim
+		// was an ordinary pawn taking an ordinary 100-damage back-stab. The harness reported
+		// "shieldDownAtPress=1 heldToResolve=0" every time — which was the truth, and is why it kept
+		// refusing to call the red arm reproduced.
+		//
+		// Winding the start stamp forward each tick keeps TickPass permanently short of the hold, so
+		// the shield stays suppressed for as long as the caller keeps asking and the Core never
+		// transfers. Only the STAMP is touched — bPassActive, PassTarget and the trace
+		// invulnerability are left exactly as BeginPass set them, so the state under test is the
+		// state the game produces.
+		PassStartServerTime = GetServerTimeSeconds();
+		return PassTarget;
+	}
+
+	// Any living teammate who is not the holder. FindPassTargetFor is deliberately NOT used: it
+	// requires the holder to be aiming at the teammate, which is the one thing a headless staged
+	// test cannot arrange, and the pass TARGET is irrelevant here — only the shield state is.
+	//
+	// TWO SWEEPS, teammates first. The first staged run failed with "mid-pass to None" because at
+	// that instant the holder's whole surviving team was elsewhere or dead, and a test that silently
+	// declines to open the window reports the interesting case as untested. The shield flag is a
+	// function of bPassActive and the holder alone (ATraceCore::IsShieldSuppressedFor), so ANY valid
+	// target produces the state under test; preferring a teammate only keeps the staged situation
+	// closer to a real one.
+	const ETraceTeam HolderTeam = Carrier->GetTeam();
+	for (int32 Sweep = 0; Sweep < 2; ++Sweep)
+	{
+		const bool bTeammatesOnly = (Sweep == 0);
+		for (TActorIterator<ATraceCharacter> It(GetWorld()); It; ++It)
+		{
+			ATraceCharacter* Candidate = *It;
+			if (Candidate == nullptr || Candidate == Carrier || !Candidate->IsAlive())
+			{
+				continue;
+			}
+			if (bTeammatesOnly && Candidate->GetTeam() != HolderTeam)
+			{
+				continue;
+			}
+
+			// BeginPass is the real entry point, not a hand-set bool: it is what flips bPassActive,
+			// hardens the trace and forces the net update, so the staged window is the same window
+			// the game produces. A test that sets the flag itself proves only that the flag exists.
+			BeginPass(Candidate);
+			if (bPassActive)
+			{
+				return Candidate;
+			}
+		}
+	}
+
+	return nullptr;
+}
+#endif
 
 float ATraceCore::GetServerTimeSeconds() const
 {
@@ -2563,7 +2794,12 @@ void ATraceCore::KickoffTo(ETraceTeam ReceivingTeam)
 	PendingGrantTeam = ReceivingTeam;
 	PendingGrantTime = GetServerTimeSeconds() + TraceCoreTuning::KickoffDelaySeconds;
 
-	SetActorLocation(GetHomeLocation(), false, nullptr, ETeleportType::TeleportPhysics);
+	// SPEC v10 §10. THE GOAL PATH, and the one the user's report is about. ATraceGameMode::NotifyScored
+	// funnels every score, every half-time interval and match start through here, so this single call
+	// site is "kickoff, centre reset, half-time, match start" — four of the six paths §10 lists.
+	// ServerTeleport is what puts the destination on the wire; before it, this was a bare
+	// SetActorLocation and the clients were left holding a Core in the endzone.
+	ServerTeleport(GetHomeLocation(), TEXT("kickoff"));
 	SetActorRotation(FRotator::ZeroRotator);
 
 	OnRep_Carrier();
@@ -3681,7 +3917,12 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
 	// A loose Core belongs to nobody, so it must be visible to everybody - including the thrower,
 	// whose own camera had it hidden while they carried it (bOwnerNoSee, resolved through the actor
 	// owner chain that ReleaseHolder just cleared).
-	SetActorLocation(LaunchLocation, false, nullptr, ETeleportType::TeleportPhysics);
+	//
+	// SPEC v10 §10, the LAUNCH path. A throw jumps the Core from the holder's head to a muzzle point
+	// 70 uu ahead of their eye - short, but still a discontinuity, and on a client it is the frame the
+	// dead reckoner starts from. Sending it explicitly means the client restarts its integration from
+	// the server's launch point rather than from wherever its own copy happened to be attached.
+	ServerTeleport(LaunchLocation, TEXT("throw launch"));
 	ApplyAttachment();
 	UpdateVisuals();
 	ForceNetUpdate();
@@ -4443,7 +4684,9 @@ bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelo
 	LooseLocation = From;
 	LooseVelocity = LaunchVelocity;
 
-	SetActorLocation(From, false, nullptr, ETeleportType::TeleportPhysics);
+	// SPEC v10 §10: the debug launch is a teleport like any other, and it goes through the same funnel
+	// so the verification scenario is testing the shipping path rather than a private one.
+	ServerTeleport(From, TEXT("debug launch"));
 	ApplyAttachment();
 	UpdateVisuals();
 	ForceNetUpdate();
@@ -5729,6 +5972,15 @@ void ATraceCore::OnRep_Carrier()
 	// Server truth about who holds it supersedes any local pass prediction.
 	bLocalPassPredicted = false;
 	LocalPassPredictTarget = nullptr;
+
+	// SPEC v10 §10. THE FRAME POSSESSION ENDS IS THE FRAME THE CORE MOVES, on every machine.
+	//
+	// This is the fast path for the stranding bug: without it, a client that learns "Carrier is now
+	// nobody" detaches with KeepWorldTransform and leaves the Core standing in the endzone until
+	// Tick's reconciliation gets to it. That is only a frame later now, but a reset is exactly the
+	// moment a frame of the Core in the wrong place is most visible, and a caller reading OnRep_Carrier
+	// should see the whole answer here rather than half of it.
+	PlaceHolderlessCore();
 }
 
 void ATraceCore::OnRep_Owner()
@@ -5759,6 +6011,14 @@ void ATraceCore::OnRep_Loose()
 
 	ApplyAttachment();
 	UpdateVisuals();
+
+	// SPEC v10 §10: a Core that has just STOPPED being loose (a catch, a turnover, a reset) is
+	// holderless until the grant lands, and the client's last LooseLocation is stale by then. Same
+	// rule, same tolerance, same function the server uses.
+	if (!bLoose)
+	{
+		PlaceHolderlessCore();
+	}
 }
 
 void ATraceCore::OnRep_PassState()
@@ -5773,4 +6033,381 @@ void ATraceCore::OnRep_PassState()
 	{
 		Carrier->Trail->NotifyInvulnerabilityChanged();
 	}
+}
+
+
+// =================================================================================================
+// SPEC v10 §10 — the teleport funnel, the client-side placement rule, and the audit
+//
+// Read the block at the top of this file first: the spec's "clients interpolate replicated movement"
+// lead is not what is happening, because this actor has movement replication switched off. What was
+// happening is that clients were never told about a reset at all.
+// =================================================================================================
+
+void ATraceCore::ServerTeleport(const FVector& Where, const TCHAR* Why)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// The actual move, unchanged in kind from what every reset path did before: TeleportPhysics,
+	// no sweep. What is new is everything after it.
+	SetActorLocation(Where, false, nullptr, ETeleportType::TeleportPhysics);
+
+	if (CVarCoreTeleportFix.GetValueOnGameThread() == 0)
+	{
+		// A/B, the red arm: move it here and tell nobody, which is what every reset path did before
+		// spec v10 §10. Every caller still does its own ForceNetUpdate for the possession properties,
+		// so this is the old code exactly and not a weakened version of it.
+		return;
+	}
+
+	TeleportLocation = Where;
+
+	// ++ ON EVERY CALL, INCLUDING A TELEPORT TO THE SAME PLACE. The serial, not the location, is what
+	// the clients react to: two kickoffs in a row both land on the centre pedestal, TeleportLocation
+	// is byte-identical between them, and a location-only channel would silently drop the second one.
+	// A client whose own copy had drifted (a dead-reckoned loose Core, say) would keep the drift.
+	++TeleportSerial;
+
+	// The whole point is that this arrives promptly. Without it the destination waits out the actor's
+	// ordinary net update cadence, which on a reset is exactly the window the Core is visibly wrong in.
+	ForceNetUpdate();
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("[Core] teleport #%u (%s) -> %s"),
+		static_cast<uint32>(TeleportSerial), Why != nullptr ? Why : TEXT("unspecified"),
+		*Where.ToCompactString());
+}
+
+void ATraceCore::PlaceHolderlessCore()
+{
+	// Somebody is holding it: the ATTACHMENT owns the transform and this must not fight it. This is
+	// the same test ApplyAttachment() branches on, deliberately, so the two can never disagree about
+	// which of them is placing the actor.
+	if (IsValid(Carrier))
+	{
+		return;
+	}
+
+	// Mode B, in the air or lying on the floor: LooseLocation is the answer, and on a client that is
+	// the dead-reckoned value the Tick branch above already wrote. Asking for it here as well keeps
+	// this function total — "where does a holderless Core belong" has one answer in each mode.
+	const FVector Where = bLoose ? FVector(LooseLocation) : GetHomeLocation();
+
+	if (FVector::DistSquared(GetActorLocation(), Where) <= TraceCoreTuning::HomeToleranceSq)
+	{
+		return;
+	}
+
+	if (HasAuthority())
+	{
+		// A discontinuity the clients have to be told about — see ServerTeleport.
+		ServerTeleport(Where, bLoose ? TEXT("loose placement") : TEXT("park at home"));
+	}
+	else if (CVarCoreTeleportFix.GetValueOnGameThread() != 0)
+	{
+		// A CLIENT DOES NOT INVENT A TELEPORT EVENT; it applies the rule it shares with the server to
+		// state the server has already sent it. If the server disagrees, its next TeleportSerial wins.
+		SetActorLocation(Where, false, nullptr, ETeleportType::TeleportPhysics);
+	}
+}
+
+void ATraceCore::OnRep_TeleportSerial()
+{
+	// Every property in this bunch has already been applied — Carrier, bLoose, LooseLocation and
+	// TeleportLocation included — because the engine runs a bunch's RepNotifies only after all of its
+	// property data has been received. That guarantee is why this can be a plain OnRep and does not
+	// need a struct or a sequencing dance with the possession properties.
+
+	// Get off any parent the previous holder still has us on. AttachmentReplication is an AActor
+	// property with its own OnRep and there is no defined ordering between it and this one, so a
+	// SetActorLocation while still attached would merely rewrite the relative offset and the old
+	// holder would drag the Core around from the new position. ApplyAttachment reads Carrier and
+	// bLoose, both of which are already current.
+	ApplyAttachment();
+
+	if (IsValid(Carrier))
+	{
+		// A teleport while somebody is holding it is not a state ServerTeleport ever produces (every
+		// call site is holderless or loose). If one ever appears, the attachment above is the right
+		// answer and overwriting it with a world location would be the bug.
+		return;
+	}
+
+	if (bLoose)
+	{
+		// Restart the dead reckoner from the server's point rather than from the client's own
+		// integrated copy. Velocity is deliberately NOT touched: on a throw it arrived in this very
+		// bunch and is the launch velocity, and zeroing it here would stop the throw dead.
+		LooseLocation = TeleportLocation;
+	}
+
+	SetActorLocation(TeleportLocation, false, nullptr, ETeleportType::TeleportPhysics);
+	UpdateVisuals();
+}
+
+
+// --- The reproduction ------------------------------------------------------------------------------
+
+bool ATraceCore::RequestGoalRepro()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[CoreAudit] Trace.Core.GoalRepro is a SERVER command - run it on the listen server, not the client."));
+		return false;
+	}
+
+	if (bGoalReproArmed)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[CoreAudit] GoalRepro already staged; ignoring."));
+		return false;
+	}
+
+	// A goal needs a carrier. If nobody has it (a kickoff window), take the first living player and
+	// give it to them through the ordinary funnel.
+	if (!IsValid(Carrier))
+	{
+		TArray<ATraceCharacter*> Characters;
+		GatherCharacters(Characters);
+
+		ATraceCharacter* Candidate = nullptr;
+		for (ATraceCharacter* Character : Characters)
+		{
+			if (IsValid(Character) && Character->IsAlive())
+			{
+				Candidate = Character;
+				break;
+			}
+		}
+
+		if (Candidate == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[CoreAudit] GoalRepro: nobody alive to carry the Core."));
+			return false;
+		}
+
+		bOutOfPlay = false;
+		GrantTo(Candidate, ETraceCoreGrantReason::Debug);
+	}
+
+	if (!IsValid(Carrier))
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[CoreAudit] GoalRepro: the grant did not take; aborting."));
+		return false;
+	}
+
+	// STAGE ONE: put the holder as far from the centre pedestal as the field allows, which is what
+	// makes this the longest reset in the game and the one the user reported. The carrier keeps their
+	// Y and Z, so they stay on the floor and inside the arena.
+	const UWorld* World = GetWorld();
+	const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
+	const FBox Field = (Arena != nullptr) ? Arena->GetFieldBounds() : FBox(ForceInit);
+
+	const FVector CarrierNow = Carrier->GetActorLocation();
+	FVector Staged = CarrierNow;
+	if (Field.IsValid != 0)
+	{
+		// The end furthest from home, but 4000 uu inside the wall — SHORT OF THE ENDZONE ON PURPOSE.
+		// ATraceArenaBuilder::EndzoneDepth is 2400 uu, so parking the carrier any deeper would trip a
+		// REAL score the instant they arrived, and the reset would fire before the client had seen the
+		// Core out there at all. Staging short means the fire below is the only reset in the window,
+		// and it is the same KickoffTo a real goal produces.
+		const FVector Home = GetHomeLocation();
+		const double FarX = (FMath::Abs(Field.Max.X - Home.X) >= FMath::Abs(Home.X - Field.Min.X))
+			? (Field.Max.X - 4000.0) : (Field.Min.X + 4000.0);
+		Staged.X = FarX;
+	}
+
+	Carrier->SetActorLocation(Staged, false, nullptr, ETeleportType::TeleportPhysics);
+	Carrier->ForceNetUpdate();
+
+	GoalReproTeam = TraceOpposingTeam(Carrier->GetTeam());
+	// Long enough that a 40 ms client has certainly rendered the Core out there before the reset -
+	// the whole question is what that client does NEXT, and staging it too fast would let the two
+	// events arrive in one bunch and hide the bug.
+	GoalReproFireTime = GetServerTimeSeconds() + 1.5f;
+	bGoalReproArmed = true;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[CoreAudit] GoalRepro staged: %s carried the Core to %s (%.0f uu from home). ")
+		TEXT("Firing the post-goal KickoffTo(%s) in 1.5s."),
+		*GetNameSafe(Carrier), *Staged.ToCompactString(),
+		FVector::Dist(Staged, GetHomeLocation()), *TraceTeamName(GoalReproTeam).ToString());
+
+	return true;
+}
+
+void ATraceCore::TickGoalRepro()
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// --- Auto-arming. SAME GATE AS THE SPEC v8 §0 MOMENTUM TEST, for the same reason. --------------
+	//
+	// The delay is a FLOOR and not the release condition; what actually releases a run is a REMOTE
+	// CLIENT'S PAWN EXISTING. §10 is a client-side bug, so a reset fired while the second process is
+	// still loading plugins measures the host and nothing else - which is precisely the failure spec
+	// v8 §0 exists to stop, and it has bitten this file once already.
+	const int32 RequestedRuns = CVarCoreGoalReproRuns.GetValueOnGameThread();
+	if (RequestedRuns > 0 && GoalReproRunsDone < RequestedRuns && !bGoalReproArmed)
+	{
+		const float NowReal = static_cast<float>(World->GetTimeSeconds());
+		const float Due = (GoalReproRunsDone == 0)
+			? CVarCoreGoalReproDelay.GetValueOnGameThread()
+			: GoalReproNextAutoTime;
+
+		if (NowReal >= Due && HasRemoteClientPawn())
+		{
+			// Counted only on a run that actually STAGED. A failed attempt (nobody alive yet) must not
+			// silently consume one of the runs the operator asked for.
+			if (RequestGoalRepro())
+			{
+				++GoalReproRunsDone;
+				GoalReproNextAutoTime = NowReal + FMath::Max(4.f, CVarCoreGoalReproInterval.GetValueOnGameThread());
+				UE_LOG(LogTraceGame, Display, TEXT("[CoreAudit] GoalRepro run %d of %d staged."),
+					GoalReproRunsDone, RequestedRuns);
+			}
+		}
+	}
+
+	if (!bGoalReproArmed || GetServerTimeSeconds() < GoalReproFireTime)
+	{
+		return;
+	}
+
+	bGoalReproArmed = false;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[CoreAudit] GoalRepro FIRING: Core at %s, %.0f uu from home. This is the exact call ")
+		TEXT("ATraceGameMode::NotifyScored makes on a goal."),
+		*GetActorLocation().ToCompactString(), FVector::Dist(GetActorLocation(), GetHomeLocation()));
+
+	// STAGE TWO. Not a simulation of a goal's reset - it IS a goal's reset. NotifyScored's only
+	// effect on this actor is this call.
+	KickoffTo(GoalReproTeam);
+}
+
+
+// --- The audit -------------------------------------------------------------------------------------
+
+void ATraceCore::TickTeleportAudit()
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	if (CVarCoreTeleportAudit.GetValueOnGameThread() == 0)
+	{
+		bAuditHasLast = false;
+		bAuditWindowOpen = false;
+		return;
+	}
+
+	// HOST / SERVER / CLIENT, printed on every line, because the entire point of §10 is that the host
+	// and the client disagree and only one of them has the bug (spec v8 §0).
+	const TCHAR* Machine = HasAuthority()
+		? (World->GetNetMode() == NM_ListenServer ? TEXT("HOST") : TEXT("SERVER"))
+		: TEXT("CLIENT");
+
+	const FVector Now = GetActorLocation();
+	const FVector Home = GetHomeLocation();
+	const double HomeError = FVector::Dist(Now, Home);
+	const bool bHeld = IsValid(Carrier);
+	const float DeltaSeconds = World->GetDeltaSeconds();
+
+	const double Step = bAuditHasLast ? FVector::Dist(Now, AuditLastLocation) : 0.0;
+
+	// A single frame that moves the Core further than a player could be expected to. Logged wherever
+	// it happens, in or out of a window: this is the line that says "it crossed the map in one frame".
+	if (bAuditHasLast && Step > static_cast<double>(CVarCoreTeleportAuditJump.GetValueOnGameThread()))
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreAudit] %s JUMP %.0f uu in one frame (%.3f s): %s -> %s | holder %s, loose %d, serial %u"),
+			Machine, Step, DeltaSeconds,
+			*AuditLastLocation.ToCompactString(), *Now.ToCompactString(),
+			bHeld ? *GetNameSafe(Carrier) : TEXT("none"), bLoose ? 1 : 0,
+			static_cast<uint32>(TeleportSerial));
+	}
+
+	// A possession that has just ENDED is the event §10 is about. Open a window and watch.
+	if (bAuditHasLast && bAuditWasHeld && !bHeld && !bAuditWindowOpen)
+	{
+		bAuditWindowOpen = true;
+		AuditWindowEndTime = static_cast<float>(World->GetTimeSeconds())
+			+ FMath::Max(0.5f, CVarCoreTeleportAuditWindow.GetValueOnGameThread());
+		AuditPathLength = 0.0;
+		AuditMaxStep = 0.0;
+		AuditWorstHomeError = 0.0;
+		AuditAwayFromHomeSeconds = 0.f;
+		AuditMovingFrames = 0;
+		AuditFrames = 0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreAudit] %s possession ended with the Core at %s (%.0f uu from home). Watching for %.1fs."),
+			Machine, *Now.ToCompactString(), HomeError,
+			FMath::Max(0.5f, CVarCoreTeleportAuditWindow.GetValueOnGameThread()));
+	}
+
+	if (bAuditWindowOpen)
+	{
+		++AuditFrames;
+		AuditPathLength += Step;
+		AuditMaxStep = FMath::Max(AuditMaxStep, Step);
+
+		// 1 uu of movement in a frame is the difference between "it moved" and float noise. What this
+		// counts is how MANY frames the travel was spread over, which is the whole SLIDE-versus-JUMP
+		// question the spec's lead and the measured cause disagree about.
+		if (Step > 1.0)
+		{
+			++AuditMovingFrames;
+		}
+
+		// Only meaningful while nobody is holding it: a Core riding a live holder is legitimately
+		// nowhere near home.
+		if (!bHeld && !bLoose)
+		{
+			AuditWorstHomeError = FMath::Max(AuditWorstHomeError, HomeError);
+			if (HomeError > FMath::Sqrt(static_cast<double>(TraceCoreTuning::HomeToleranceSq)))
+			{
+				AuditAwayFromHomeSeconds += DeltaSeconds;
+			}
+		}
+
+		if (static_cast<float>(World->GetTimeSeconds()) >= AuditWindowEndTime)
+		{
+			bAuditWindowOpen = false;
+
+			// THE VERDICT, and the three cases it has to be able to tell apart:
+			//   SNAP     one frame of travel, and the Core was never left far from where it belongs.
+			//   SLIDE    the travel was spread over many frames - interpolation, the spec's lead.
+			//   STRANDED it sat far from home for a measurable time and then crossed in one frame.
+			const double HomeTolerance = FMath::Sqrt(static_cast<double>(TraceCoreTuning::HomeToleranceSq));
+			const TCHAR* Verdict = TEXT("SNAP (clean)");
+			if (AuditMovingFrames > 2 && AuditPathLength > 4.0 * AuditMaxStep)
+			{
+				Verdict = TEXT("SLIDE - travelled over many frames (interpolation)");
+			}
+			else if (AuditAwayFromHomeSeconds > 0.15f)
+			{
+				Verdict = TEXT("STRANDED then JUMPED - the reset was never applied here");
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CoreAudit] %s reset summary: %d frames, %d moving, path %.0f uu, max step %.0f uu, ")
+				TEXT("worst dist from home %.0f uu, held wrong place for %.2f s (tolerance %.0f uu) => %s"),
+				Machine, AuditFrames, AuditMovingFrames, AuditPathLength, AuditMaxStep,
+				AuditWorstHomeError, AuditAwayFromHomeSeconds, HomeTolerance, Verdict);
+		}
+	}
+
+	AuditLastLocation = Now;
+	bAuditHasLast = true;
+	bAuditWasHeld = bHeld;
 }

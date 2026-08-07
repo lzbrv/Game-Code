@@ -44,6 +44,7 @@
 
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
+#include "Core/TraceGameState.h"        // ScoringMode, for the mode-A/mode-B grace report
 #include "Gameplay/TraceCore.h"                // IsTraceInvulnerableFor (spec §4)
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceParry.h"               // v3 §3 — the second invulnerability source
@@ -54,13 +55,17 @@
 namespace
 {
 	/**
-	 * SPEC v3 §1: the trace lasts TWO seconds, and the turnover grace is 0.4s.
+	 * The trace lifetime came from spec v3 §1; the turnover grace is now 0.75s (spec v10 §3 raised it
+	 * from 0.5 after the mechanism was tested and found to be working — see Trace.Trail.GraceTest).
 	 *
 	 * BOTH VALUES NOW LIVE IN UTraceSettings (TrailLifetime, CoreTurnoverGraceSeconds). These used to
 	 * be ceilings applied over the settings, because TraceSettings.h belonged to another ownership
-	 * slice mid-pass and a stale 2.8 could otherwise have reinstated the old rule. The settings have
-	 * landed at 2.0 / 0.4, so the min() was an identity and is gone: there is exactly one number for
-	 * each, it is in Project Settings, and it is live-editable in PIE.
+	 * slice mid-pass and a stale 2.8 could otherwise have reinstated the old rule. The settings are
+	 * the single source of truth now, so the min() was an identity and is gone: there is exactly one
+	 * number for each, it is in Project Settings, and it is live-editable in PIE.
+	 *
+	 * THE INI WINS OVER THE HEADER, so neither of those numbers should be quoted from a comment.
+	 * Trace.Trail.GraceTest prints the configured value it actually measured against.
 	 *
 	 * What survives is an OVERRIDE apiece, negative by default, for console experiments during a
 	 * headless run where there is no settings panel to open. Same pattern, and same reasoning, as the
@@ -86,9 +91,154 @@ namespace
 		TEXT("Trace.Trail.TurnoverGrace"),
 		GTurnoverGraceOverride,
 		TEXT("OVERRIDE for seconds after the Core changes team before the new holder's trace BEGINS "
-		     "FORMING (spec v3 1: 0.40). Negative (default) = use UTraceSettings::CoreTurnoverGraceSeconds. "
+		     "FORMING (spec v10 3: 0.75). Negative (default) = use UTraceSettings::CoreTurnoverGraceSeconds. "
 		     "Delays formation only; already-laid segments stay lethal."),
 		ECVF_Default);
+
+	// =============================================================================================
+	// SPEC v10 §2 — WHOLE-MODEL TRIP DETECTION. THE KNOBS.
+	//
+	// The rationale for choosing the mesh bounds over a flat margin or per-bone volumes is in the
+	// header, above UTraceTrailComponent::MeasureModelReach. What lives here is the A/B switch and
+	// the two clamps that bound the over-reach.
+	//
+	// THESE ARE CVARS AND NOT UTraceSettings PROPERTIES ON PURPOSE, and it is a scope fact rather
+	// than a design opinion: this pass owns TraceTrailComponent.{h,cpp} and nothing else, and a
+	// UTraceSettings knob has to be declared in TraceSettings.h AND written into Config/DefaultGame.ini
+	// (the ini wins) by whoever owns those. The follow-up is written up in the report. Until then
+	// these are live-editable from the console exactly like Trace.Trail.Radius/Height beside them,
+	// and the defaults below are the shipping values.
+	// =============================================================================================
+
+	/**
+	 * THE A/B ARM, AND THE REASON THE FIX IS DEMONSTRABLE RATHER THAN ASSERTED.
+	 *
+	 * 1 (default): the trip test is sized to the rendered model.
+	 * 0:           the exact pre-v10 behaviour — capsule radius plus trail radius, nothing else.
+	 *
+	 * Trace.Trail.ModelHitTest runs its whole scenario twice, once per arm, on ONE build in ONE
+	 * match. Arm 0 is the RED arm and it must fail; a harness that cannot be made to fail is not
+	 * evidence. Never ship 0: it is the reported bug.
+	 */
+	int32 GWholeModelTrip = 1;
+
+	/**
+	 * FLOOR on the margin over the capsule radius, in uu.
+	 *
+	 * Exists because the mesh bounds are not guaranteed to be there. A pawn whose animation is not
+	 * ticking (a dedicated server with URO configured to skip it), a pawn whose mesh has not been
+	 * imported yet, a pawn using fixed imported bounds tighter than its own silhouette — in every
+	 * one of those the measured reach collapses back to roughly the capsule and the reported bug
+	 * comes back silently. The floor makes the fix survive all of them.
+	 *
+	 * 10uu is chosen against the trace's own half-width (22.5uu): it widens the scoring band by
+	 * under half a trace-width, which is inside the thickness of the ribbon a player is looking at,
+	 * so it cannot read as a hit at distance even in the worst case where the model really was
+	 * tucked inside its capsule.
+	 */
+	float GModelMarginMin = 10.f;
+
+	/**
+	 * CEILING on the margin over the capsule radius, in uu. THIS IS THE WORST-CASE OVER-REACH OF THE
+	 * WHOLE CHANGE, and it is a hard clamp rather than a hope about the asset.
+	 *
+	 * 20uu, AND THAT NUMBER CAME OFF A RUNNING GAME rather than out of this file. Trace.Trail.ModelReach
+	 * measured the imported Mannequin: 32.7uu of horizontal reach standing (LESS than its own 34uu
+	 * capsule) and 41.3uu mid-dash — the bounds do follow the pose, which is the property the whole
+	 * choice rests on. So the real silhouette wants ~7uu over the capsule and the floor of 10 already
+	 * covers it; 20 exists only as headroom for a more extreme pose than the one that was measured.
+	 *
+	 * What it costs at the limit: the horizontal threshold moves from 22.5 + 34 = 56.5uu to at most
+	 * 22.5 + 54 = 76.5uu (+35%), and in the measured dash pose to 66.5uu (+18%). 20uu is 0.2m and
+	 * under half a ribbon width (the trace is 45uu across), so even the ceiling case is a hit inside
+	 * the silhouette the player is watching rather than a connection at visible distance.
+	 */
+	float GModelMarginMax = 20.f;
+
+	/**
+	 * VERTICAL margin over the capsule half-height, in uu. DEFAULT 0, AND THE ZERO IS THE FINDING.
+	 *
+	 * The first version of this widened vertically by the same rule, and measuring it is what killed
+	 * that idea: the Mannequin's mesh bounds report 141uu of vertical half-extent about the actor
+	 * origin against an 88uu capsule half-height. That 141 is plainly not the silhouette — a
+	 * Mannequin's feet sit on the bottom of its capsule and its head under the top BY CONSTRUCTION,
+	 * so there is no "limb outside the capsule" case vertically at all, and the extra is the mesh
+	 * component's bounds being generous rather than a body part being out there.
+	 *
+	 * Taking it would have bought nothing but air. The vertical test is already |dZ| <= 31.5 + 88 =
+	 * 119.5uu, which every grounded or jumping player passes trivially; pushing it to 145.5 would
+	 * have scored on a dasher whose FEET were a clear 26uu above the top of the ribbon. That is the
+	 * "phantom connection at visible distance" the spec forbids, so the vertical stays at the capsule
+	 * and the knob is here for anyone who later has a pawn the claim is not true of.
+	 *
+	 * The missing hits were never vertical. They were the 22.5uu-wide ribbon against a 34uu capsule.
+	 */
+	float GModelMarginVertical = 0.f;
+
+	/**
+	 * Optional FIXED margin, in uu. Negative (default) = measure the mesh. >= 0 = use this number
+	 * for every pawn and skip the measurement entirely.
+	 *
+	 * Kept because it is the spec's second option and because it is the one thing that makes the
+	 * choice falsifiable at playtest: if the bounds-driven version ever feels wrong, this pins it to
+	 * a constant without a rebuild, and the two can be compared in the same session.
+	 */
+	float GModelMarginFixed = -1.f;
+
+#if !UE_BUILD_SHIPPING
+	FAutoConsoleVariableRef CVarWholeModelTrip(
+		TEXT("Trace.Trail.WholeModelTrip"),
+		GWholeModelTrip,
+		TEXT("1 (default, spec v10 2): the dash trip test is sized to the rendered MODEL, so any part "
+		     "of it touching the trace scores — for the kill and for the parry alike. 0 restores the "
+		     "pre-v10 capsule-only test for A/B measurement ONLY; that is the reported bug."),
+		ECVF_Cheat);
+#endif
+
+	FAutoConsoleVariableRef CVarModelMarginMin(
+		TEXT("Trace.Trail.ModelMarginMin"),
+		GModelMarginMin,
+		TEXT("Spec v10 2. FLOOR, in uu, on how far past the capsule radius the trip test reaches, used "
+		     "when the mesh bounds are unavailable or tighter than the capsule. Default 10."),
+		ECVF_Default);
+
+	FAutoConsoleVariableRef CVarModelMarginMax(
+		TEXT("Trace.Trail.ModelMarginMax"),
+		GModelMarginMax,
+		TEXT("Spec v10 2. CEILING, in uu, on how far past the capsule radius the trip test reaches. This "
+		     "is the WORST-CASE OVER-REACH of whole-model detection and it is a hard clamp. Default 26."),
+		ECVF_Default);
+
+	FAutoConsoleVariableRef CVarModelMarginVertical(
+		TEXT("Trace.Trail.ModelMarginVertical"),
+		GModelMarginVertical,
+		TEXT("Spec v10 2. Margin in uu over the capsule HALF-HEIGHT. Default 0: a Mannequin is inside its "
+		     "capsule vertically by construction, and the mesh bounds' 141uu vertical half-extent is not a "
+		     "silhouette. Raising this scores on air below a dasher's feet."),
+		ECVF_Default);
+
+	FAutoConsoleVariableRef CVarModelMarginFixed(
+		TEXT("Trace.Trail.ModelMargin"),
+		GModelMarginFixed,
+		TEXT("Spec v10 2. Negative (default) = derive the margin from the skeletal mesh's own bounds, "
+		     "clamped to [ModelMarginMin, ModelMarginMax]. >= 0 = use this fixed margin in uu for every "
+		     "pawn instead of measuring."),
+		ECVF_Default);
+
+	/**
+	 * THE KNOCK-ON, COUNTED WHERE IT HAPPENS.
+	 *
+	 * GModelTripsTotal    every lethal trip the test has scored this session.
+	 * GModelTripsWidened  the subset the pre-v10 capsule-only test would have MISSED.
+	 *
+	 * The second number is the entire measurable cost of this change. The spec asks for it by name
+	 * ("bots on Hard already get 82% of their kills from trace dashes ... Measure it and report; do
+	 * not silently retune the bots"), and inferring it from a log afterwards would mean inferring it
+	 * — so the trip test evaluates the old threshold alongside the new one on the rare frames it
+	 * scores, and writes the answer down.
+	 */
+	int32 GModelTripsTotal = 0;
+	int32 GModelTripsWidened = 0;
 
 	// =============================================================================================
 	// SPEC v7 §§1-3 — THE TRACE IS A LENGTH, AND IT IS THINNER AND SHALLOWER
@@ -882,6 +1032,240 @@ namespace
 			: UTraceSettings::Get().TraceGhostGlow;
 		return FMath::Max(0.f, Value);
 	}
+
+#if !UE_BUILD_SHIPPING
+	// =============================================================================================
+	// SPEC v10 §2 — THE STAGED PROBE THAT MAKES THE CLAIM MEASURABLE
+	//
+	// Trace.Trail.ModelHitTest has to put a dashing enemy at a KNOWN perpendicular distance from a
+	// KNOWN lethal segment and then read what the trip test scored. Doing that from a console-command
+	// ticker does not work, and the reason is worth writing down because the obvious version looks
+	// fine and silently measures nothing:
+	//
+	//   FTSTicker runs in FEngineLoop::Tick, BEFORE UWorld::Tick. So between a ticker placing the
+	//   pawn and ServerRunTripTest reading GetActorLocation(), the character movement component has
+	//   run a whole frame — and the pawn is DASHING, which is the entire point, so it has moved tens
+	//   of uu. The band this test is about is a few uu wide. The measurement would be pure drift.
+	//
+	// So the placement happens INSIDE ServerRunTripTest, on the frame the test runs, immediately
+	// before the candidate loop. Nothing downstream is stubbed: the eligibility rules (alive, enemy,
+	// DASHING), the swept segment-to-segment geometry, the thresholds, the kill, the parry punish and
+	// the counters are all the shipping path, evaluated on positions this probe fixed rather than on
+	// positions that drifted.
+	//
+	// PreviousLocation is seeded too, via the component's own debug hook, so the swept segment is
+	// exactly the radial approach the test asserts about and not whatever the last frame left behind.
+	// =============================================================================================
+	struct FTraceModelProbe
+	{
+		bool bArmed = false;
+
+		TWeakObjectPtr<ATraceCharacter> Holder;
+		TWeakObjectPtr<ATraceCharacter> Dasher;
+
+		/** Perpendicular distance from the trace centreline to put the dasher's CAPSULE CENTRE at. */
+		double Offset = 0.0;
+
+		/**
+		 * The case's parry precondition, enforced HERE rather than hoped for by the caller. A parry
+		 * window is 0.175-0.2s long and on a cooldown, so a harness that merely asks for one and then
+		 * places the pawn some frames later is measuring whatever the window happened to be doing.
+		 */
+		bool bRequireParry = false;
+
+		/** Set by the probe when it actually placed the pawn — i.e. the frame the test really ran. */
+		bool bApplied = false;
+
+		/** What it used, for the report. */
+		FVector AppliedStart = FVector::ZeroVector;
+		FVector AppliedEnd = FVector::ZeroVector;
+
+		/** The TRUE closest approach of the applied sweep to the WHOLE trace. See PickProbePlacement. */
+		double AppliedClearance = 0.0;
+
+		/** Why it could not run yet, so a hung harness names its own reason. */
+		const TCHAR* LastRefusal = TEXT("not armed");
+	};
+
+	FTraceModelProbe GTraceModelProbe;
+
+	/** How far back along the approach the swept segment starts. Well under MinTeleportSweepDistance. */
+	constexpr double ModelProbeApproachLength = 150.0;
+
+	/**
+	 * The XY distance from a swept segment to the CLOSEST POINT OF THE WHOLE POLYLINE — not to one
+	 * chosen segment of it.
+	 *
+	 * THIS FUNCTION IS THE FIX FOR A HARNESS THAT LIED, and the lie is worth recording because it is
+	 * the exact shape of mistake this project's testing discipline exists to catch. The first version
+	 * picked a segment, stepped off it perpendicularly by the offset under test, and asserted. It
+	 * reported a CONNECTION on the capsule-only arm at 61.5uu against a 56.5uu threshold, which is
+	 * geometrically impossible — until you notice that a carrier's trace is a 1200uu polyline that
+	 * doubles back on itself, so "61.5uu from THAT segment" was 30uu from a DIFFERENT one. The test
+	 * was scoring a real hit on a piece of trace it was not talking about, and a red arm that goes
+	 * red for the wrong reason is worth nothing.
+	 */
+	double MinSweepDistanceToTraceXY(const TArray<FVector>& Positions, const FVector& From, const FVector& To)
+	{
+		const FVector SweepStart(From.X, From.Y, 0.0);
+		const FVector SweepEnd(To.X, To.Y, 0.0);
+
+		double Best = TNumericLimits<double>::Max();
+		const int32 LastSegment = FMath::Max(0, Positions.Num() - 2);
+		for (int32 SegmentIndex = 0; SegmentIndex <= LastSegment; ++SegmentIndex)
+		{
+			const FVector& TrailStart = Positions[SegmentIndex];
+			const FVector& TrailEnd = Positions[FMath::Min(SegmentIndex + 1, Positions.Num() - 1)];
+
+			FVector ClosestOnSweep = FVector::ZeroVector;
+			FVector ClosestOnTrail = FVector::ZeroVector;
+			FMath::SegmentDistToSegmentSafe(SweepStart, SweepEnd,
+				FVector(TrailStart.X, TrailStart.Y, 0.0), FVector(TrailEnd.X, TrailEnd.Y, 0.0),
+				ClosestOnSweep, ClosestOnTrail);
+
+			Best = FMath::Min(Best, FVector::Dist(ClosestOnSweep, ClosestOnTrail));
+		}
+		return Best;
+	}
+
+	/**
+	 * Find a placement whose closest approach to the WHOLE trace really is the offset under test.
+	 *
+	 * Tries every segment, both perpendicular directions, and accepts only a placement the geometry
+	 * agrees with to within ModelProbeClearanceTolerance. If no candidate qualifies on this frame the
+	 * probe simply waits — a trace that has coiled up on itself has no clean approach at this offset,
+	 * and refusing to test is the honest answer.
+	 */
+	constexpr double ModelProbeClearanceTolerance = 0.75;
+
+	bool PickProbePlacement(const TArray<FVector>& Positions, double Offset, FVector& OutStart,
+		FVector& OutEnd, double& OutClearance)
+	{
+		const int32 LastSegment = FMath::Max(0, Positions.Num() - 2);
+
+		// Walk outward from the middle of the lethal set: clear of the head stub at one end and of the
+		// tail the length trim is eating at the other, so a chosen placement cannot move under the test.
+		const int32 Centre = Positions.Num() / 2 - 1;
+
+		for (int32 Step = 0; Step <= LastSegment; ++Step)
+		{
+			for (int32 Sign = -1; Sign <= 1; Sign += 2)
+			{
+				const int32 Index = FMath::Clamp(Centre + (Step * Sign), 0, LastSegment);
+
+				const FVector A = Positions[Index];
+				const FVector B = Positions[FMath::Min(Index + 1, Positions.Num() - 1)];
+
+				FVector Direction = B - A;
+				Direction.Z = 0.0;
+				if (!Direction.Normalize())
+				{
+					continue;
+				}
+
+				const FVector Midpoint = (A + B) * 0.5;
+
+				for (int32 Side = -1; Side <= 1; Side += 2)
+				{
+					const FVector Perpendicular = FVector(-Direction.Y, Direction.X, 0.0) * static_cast<double>(Side);
+
+					const FVector End = Midpoint + Perpendicular * Offset;
+					const FVector Start = End + Perpendicular * ModelProbeApproachLength;
+
+					const double Clearance = MinSweepDistanceToTraceXY(Positions, Start, End);
+					if (FMath::Abs(Clearance - Offset) <= ModelProbeClearanceTolerance)
+					{
+						OutStart = Start;
+						OutEnd = End;
+						OutClearance = Clearance;
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	void ApplyStagedModelProbe(UTraceTrailComponent* Trail, ATraceCharacter* Holder,
+		const TArray<FVector>& TestPositions)
+	{
+		if (!GTraceModelProbe.bArmed || Trail == nullptr)
+		{
+			return;
+		}
+		if (GTraceModelProbe.Holder.Get() != Holder)
+		{
+			return;   // Another carrier's trace; not the one under test.
+		}
+
+		ATraceCharacter* Dasher = GTraceModelProbe.Dasher.Get();
+		if (Dasher == nullptr || !Dasher->IsAlive())
+		{
+			GTraceModelProbe.LastRefusal = TEXT("the dasher is gone or dead");
+			return;
+		}
+		if (TestPositions.Num() < 2)
+		{
+			GTraceModelProbe.LastRefusal = TEXT("the carrier's trace has fewer than two lethal points");
+			return;
+		}
+
+		// THE DASH GATE IS NOT BYPASSED. The probe waits for a real dash rather than faking one,
+		// because "walking through a trace does nothing" is a rule this harness must not be able to
+		// launder. It simply tries again next frame.
+		if (!Dasher->IsDashing())
+		{
+			GTraceModelProbe.LastRefusal = TEXT("the dasher is not dashing yet");
+			return;
+		}
+
+		// THE PARRY PRECONDITION, checked on the frame the test runs and not on the frame it was
+		// requested. Both directions matter: a parry case measured with the window shut proves
+		// nothing, and a kill case measured with a window open would score a punish instead.
+		if (Trail->IsParryActive() != GTraceModelProbe.bRequireParry)
+		{
+			GTraceModelProbe.LastRefusal = GTraceModelProbe.bRequireParry
+				? TEXT("waiting for the carrier's parry window to be open")
+				: TEXT("waiting for the carrier's parry window to close");
+			return;
+		}
+
+		FVector Start = FVector::ZeroVector;
+		FVector End = FVector::ZeroVector;
+		double Clearance = 0.0;
+		if (!PickProbePlacement(TestPositions, GTraceModelProbe.Offset, Start, End, Clearance))
+		{
+			GTraceModelProbe.LastRefusal =
+				TEXT("no approach on this trace has the offset under test as its CLOSEST approach "
+				     "(the trace has doubled back on itself) — waiting for a cleaner frame");
+			return;
+		}
+
+		// Z matched to the trail point, which is the carrier's own capsule centre — so the vertical
+		// half of the test is trivially satisfied and the only variable under examination is the
+		// HORIZONTAL one this section is about.
+		Dasher->SetActorLocation(End, false, nullptr, ETeleportType::TeleportPhysics);
+		Trail->DebugSeedPreviousLocation(Dasher, Start);
+
+		GTraceModelProbe.AppliedStart = Start;
+		GTraceModelProbe.AppliedEnd = End;
+		GTraceModelProbe.AppliedClearance = Clearance;
+		GTraceModelProbe.bApplied = true;
+		GTraceModelProbe.bArmed = false;
+		GTraceModelProbe.LastRefusal = TEXT("applied");
+	}
+
+	/**
+	 * The last trip the test scored, recorded where it happens so the harness reads a fact rather
+	 * than inferring one from a counter that any bot in the match could also have moved.
+	 */
+	int32 GModelTripSerial = 0;
+	TWeakObjectPtr<ATraceCharacter> GModelTripLastDasher;
+	bool GModelTripLastWidened = false;
+	double GModelTripLastMargin = 0.0;
+	double GModelTripLastThreshold = 0.0;
+	double GModelTripLastCapsuleThreshold = 0.0;
+#endif // !UE_BUILD_SHIPPING
 }
 
 
@@ -1163,6 +1547,135 @@ float UTraceTrailComponent::GetTurnoverGraceSeconds()
 	return FMath::Clamp(Value, 0.f, 5.f);
 }
 
+
+// =================================================================================================
+// SPEC v10 §2 — MEASURING THE MODEL
+// =================================================================================================
+
+FTraceModelReach UTraceTrailComponent::MeasureModelReach(const ATraceCharacter* Candidate)
+{
+	FTraceModelReach Reach;
+
+	if (Candidate == nullptr)
+	{
+		return Reach;
+	}
+
+	// The capsule is both the old answer and the floor under the new one: whatever the mesh says,
+	// the physical body of the pawn is at least this wide, and shrinking the test is not on the
+	// table.
+	if (const UCapsuleComponent* Capsule = Candidate->GetCapsuleComponent())
+	{
+		Reach.CapsuleRadius = Capsule->GetScaledCapsuleRadius();
+		Reach.CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+	}
+	Reach.RawMeshRadius = Reach.CapsuleRadius;
+	Reach.RawMeshHalfHeight = Reach.CapsuleHalfHeight;
+
+	const double MinMargin = FMath::Max(0.0, static_cast<double>(GModelMarginMin));
+	const double MaxMargin = FMath::Max(MinMargin, static_cast<double>(GModelMarginMax));
+
+	// The A/B arm. Arm 0 is byte-for-byte the pre-v10 geometry: capsule, no margin, no measurement.
+	if (GWholeModelTrip == 0)
+	{
+		Reach.EffectiveRadius = Reach.CapsuleRadius;
+		Reach.EffectiveHalfHeight = Reach.CapsuleHalfHeight;
+		return Reach;
+	}
+
+	// The vertical margin is a FLAT number and never a measurement, and the measurement is why. See
+	// GModelMarginVertical: the mesh reports 141uu of vertical half-extent against an 88uu capsule
+	// that already contains the whole model, so taking the mesh's answer here scores on empty air
+	// under a dasher's feet. Default 0 — the vertical test is untouched by this pass.
+	const double VerticalMargin = FMath::Max(0.0, static_cast<double>(GModelMarginVertical));
+	Reach.EffectiveHalfHeight = Reach.CapsuleHalfHeight + VerticalMargin;
+
+	// The fixed-margin option (spec v10 §2's second choice), when it has been pinned.
+	if (GModelMarginFixed >= 0.f)
+	{
+		const double Fixed = FMath::Min(static_cast<double>(GModelMarginFixed), MaxMargin);
+		Reach.EffectiveRadius = Reach.CapsuleRadius + Fixed;
+		return Reach;
+	}
+
+	// --- the measurement --------------------------------------------------------------------------
+	//
+	// MEASURED FROM THE ACTOR LOCATION, NOT FROM THE BOUNDS ORIGIN. This is the whole reason the
+	// function is not a one-liner. The trip test sweeps the pawn's ACTOR LOCATION against the trace
+	// polyline, and the trace polyline is itself laid at the carrier's actor location — one reference
+	// frame, deliberately (see ServerUpdateTrail). A skeletal mesh, however, is attached with an
+	// offset: the Mannequin sits ~88uu below the capsule centre and is free to be off-centre in XY
+	// too. Reporting Bounds.BoxExtent alone would therefore describe a box around the MESH while the
+	// test measures distance from the CAPSULE, and the two would disagree by the offset — quietly,
+	// and in the direction that loses hits, which is the bug this is fixing.
+	//
+	// So: take the half-width of the smallest box CENTRED ON THE ACTOR that still contains the mesh
+	// bounds, per axis, and use the larger horizontal axis. Larger and not the diagonal: the
+	// threshold is applied isotropically, so the diagonal (a factor of 1.41) would score on air in
+	// the two corners for the sake of geometry no player can see.
+	const USkeletalMeshComponent* Mesh = Candidate->GetMesh();
+	if (Mesh != nullptr && Mesh->GetSkinnedAsset() != nullptr)
+	{
+		const FBoxSphereBounds MeshBounds = Mesh->Bounds;
+		const FVector Extent = MeshBounds.BoxExtent;
+
+		// A zero/absurd box means the bounds have never been computed on this machine (an animation
+		// that has not ticked, a mesh that has not been registered). Rejected rather than trusted:
+		// a garbage measurement that happens to be small would silently reinstate the bug, and one
+		// that happens to be huge would score on air.
+		const bool bBoundsUsable = Extent.X > 1.0 && Extent.Y > 1.0 && Extent.Z > 1.0
+			&& Extent.GetMax() < 1000.0;
+
+		if (bBoundsUsable)
+		{
+			const FVector ActorLocation = Candidate->GetActorLocation();
+			const FVector Offset = MeshBounds.Origin - ActorLocation;
+
+			Reach.RawMeshRadius = FMath::Max(
+				FMath::Abs(Offset.X) + Extent.X,
+				FMath::Abs(Offset.Y) + Extent.Y);
+			Reach.RawMeshHalfHeight = FMath::Abs(Offset.Z) + Extent.Z;
+			Reach.bMeshMeasured = true;
+		}
+	}
+
+	// Clamp into [capsule + MinMargin, capsule + MaxMargin]. Both ends matter: the low end is what
+	// keeps the fix alive on a pawn whose mesh reports less than its capsule, the high end is the
+	// stated worst-case over-reach and is the reason an attached actor or a fat physics body cannot
+	// turn this into a phantom connection.
+	Reach.EffectiveRadius = FMath::Clamp(
+		Reach.RawMeshRadius,
+		Reach.CapsuleRadius + MinMargin,
+		Reach.CapsuleRadius + MaxMargin);
+
+	// EffectiveHalfHeight was set above from the FLAT vertical margin, deliberately, and
+	// RawMeshHalfHeight is measured but not used — it is reported by Trace.Trail.ModelReach so the
+	// decision not to use it stays auditable instead of becoming folklore.
+	return Reach;
+}
+
+void UTraceTrailComponent::GetModelTripStats(int32& OutTotal, int32& OutModelOnly)
+{
+	OutTotal = GModelTripsTotal;
+	OutModelOnly = GModelTripsWidened;
+}
+
+void UTraceTrailComponent::ResetModelTripStats()
+{
+	GModelTripsTotal = 0;
+	GModelTripsWidened = 0;
+}
+
+#if !UE_BUILD_SHIPPING
+void UTraceTrailComponent::DebugSeedPreviousLocation(ATraceCharacter* Candidate, const FVector& Location)
+{
+	if (Candidate != nullptr)
+	{
+		PreviousLocations.Add(Candidate, Location);
+	}
+}
+#endif
+
 void UTraceTrailComponent::SetEmitting(bool bEmit)
 {
 	const AActor* Owner = GetOwner();
@@ -1262,8 +1775,9 @@ void UTraceTrailComponent::SetEmitGrace(float Seconds)
 		return;
 	}
 
-	// v3 §1: 1.0s -> 0.4s. Capped rather than replaced, so a caller asking for less still wins and a
-	// stale 1.0 in TraceCoreTuning cannot reinstate the old rule. See the header for the full reason.
+	// 1.0s -> 0.4s (v3 §1) -> 0.5 -> 0.75s (v10 §3). Capped rather than replaced, so a caller asking
+	// for less still wins and a stale constant in TraceCoreTuning cannot reinstate an old rule. See
+	// the header for the full reason.
 	const float Granted = (Seconds > 0.f) ? FMath::Min(Seconds, GetTurnoverGraceSeconds()) : 0.f;
 
 	EmitGraceEndServerTime = (Granted > 0.f) ? (GetServerTimeSeconds() + Granted) : 0.f;
@@ -2017,7 +2531,7 @@ void UTraceTrailComponent::ServerUpdateTrail()
 
 	// 1. Append, distance-gated so a stationary holder does not spam identical points.
 	//
-	//    THE TRANSFER GRACE LIVES RIGHT HERE, AND ONLY HERE (§2; 0.4s since v3 §1). For its duration
+	//    THE TRANSFER GRACE LIVES RIGHT HERE, AND ONLY HERE (§2; 0.75s since v10 §3). For its duration
 	//    the new holder runs around laying nothing. Everything else about the emission window is
 	//    already true — bEmitting is set, THE TRIP TEST IS LIVE — there simply are no points yet,
 	//    which is exactly what "the trace has not begun to form" means.
@@ -2248,6 +2762,15 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		TrailMaxY = FMath::Max(TrailMaxY, Position.Y);
 	}
 
+#if !UE_BUILD_SHIPPING
+	// SPEC v10 §2's harness, and the only line of it that is not in the debug block at the bottom of
+	// this file. It runs here — inside the test, before the loop, after the lethal set is known —
+	// because a console ticker places a DASHING pawn a whole frame of dash movement too early. It is
+	// inert unless Trace.Trail.ModelHitTest has armed it, and it changes nothing but one pawn's
+	// position and the remembered previous position the sweep is built from.
+	ApplyStagedModelProbe(this, Holder, TestPositions);
+#endif
+
 	TArray<ATraceCharacter*> Candidates;
 	GatherTrackedCharacters(Candidates);
 
@@ -2369,21 +2892,27 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 			continue;   // Teleport, not movement.
 		}
 
-		double CapsuleRadius = 34.0;
-		double CapsuleHalfHeight = 88.0;
-		if (const UCapsuleComponent* Capsule = Candidate->GetCapsuleComponent())
-		{
-			CapsuleRadius = Capsule->GetScaledCapsuleRadius();
-			CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
-		}
+		// SPEC v10 §2. THE TRIPPER IS THE MODEL, NOT THE CAPSULE.
+		//
+		// This one line is the whole of the reported fix. It used to read the capsule and nothing
+		// else, and a Mannequin's arms and trailing leg live outside its 34uu capsule in every pose
+		// a dash is ever seen in — so a limb that visibly clipped a 22.5uu-wide trace scored
+		// nothing. MeasureModelReach() answers with the rendered mesh's own extent, measured from
+		// the actor location (the frame the trace itself is laid in) and clamped at both ends. See
+		// the header for why the bounds and not a constant, and for the bounded over-reach.
+		const FTraceModelReach Reach = MeasureModelReach(Candidate);
 
 		// The trace is a vertical volume of radius TrailRadius and height TrailHeight swept along
-		// the holder's path, and the tripper is a capsule swept along its path this tick. Test
+		// the holder's path, and the tripper is their MODEL swept along its path this tick. Test
 		// those two sweeps as: horizontal segment-to-segment distance (which catches tunnelling
 		// at dash speed, unlike a point test), plus a separate vertical overlap check so that
 		// clearing the trace in the air is not a hit.
-		const double HorizontalThreshold = TrailRadius + CapsuleRadius;
-		const double VerticalThreshold = TrailHalfHeight + CapsuleHalfHeight;
+		const double HorizontalThreshold = TrailRadius + Reach.EffectiveRadius;
+		const double VerticalThreshold = TrailHalfHeight + Reach.EffectiveHalfHeight;
+
+		// The pre-v10 thresholds, kept alive purely to be counted against. See GModelTripsWidened.
+		const double CapsuleHorizontalThreshold = TrailRadius + Reach.CapsuleRadius;
+		const double CapsuleVerticalThreshold = TrailHalfHeight + Reach.CapsuleHalfHeight;
 
 		// Broad phase: if this candidate's swept XY box, inflated by the same horizontal threshold
 		// the narrow phase uses, does not touch the trace's XY box, no segment can be within range.
@@ -2405,6 +2934,48 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 
 		if (bHitLethal)
 		{
+			// THE KNOCK-ON, MEASURED RATHER THAN ESTIMATED (spec v10 §2's last paragraph).
+			//
+			// Re-run the SAME sweep at the OLD thresholds and record whether this trip is one the
+			// pre-v10 test would also have scored. Evaluated only on the frames a trip actually
+			// lands — a handful per match — so the second sweep costs nothing measurable, and it is
+			// the only way to say "the widening created N of the M trace kills in this match"
+			// without inferring it from a log. Counted for kills AND for parry punishes, because
+			// they are the same detection and the spec asks about both.
+			const bool bCapsuleWouldHit = SweepIntersectsTrace(
+				TestPositions, PreviousLocation, CurrentLocation,
+				CapsuleHorizontalThreshold, CapsuleVerticalThreshold);
+
+			++GModelTripsTotal;
+
+#if !UE_BUILD_SHIPPING
+			// Written down here, at the only place the answer exists, so Trace.Trail.ModelHitTest
+			// asserts about ITS dasher rather than about a counter every bot in the match also moves.
+			++GModelTripSerial;
+			GModelTripLastDasher = Candidate;
+			GModelTripLastWidened = !bCapsuleWouldHit;
+			GModelTripLastMargin = Reach.HorizontalMargin();
+			GModelTripLastThreshold = HorizontalThreshold;
+			GModelTripLastCapsuleThreshold = CapsuleHorizontalThreshold;
+#endif
+
+			if (!bCapsuleWouldHit)
+			{
+				++GModelTripsWidened;
+
+				// Log level, not Verbose. Every hit that exists only because of this change says so
+				// by name, with the numbers that made it — so "that felt like a phantom hit" is a
+				// grep and not an argument, and so the over-reach can be audited from a real match
+				// instead of from this file's claims about it.
+				UE_LOG(LogTraceGame, Log,
+					TEXT("[TRACEMODEL] %s's dash scored on %s's trace via WHOLE-MODEL reach only: "
+					     "capsule %.1fuu -> model %.1fuu (margin %+.1fuu, mesh measured=%d), threshold "
+					     "%.1f -> %.1fuu. The pre-v10 test would have missed this."),
+					*GetNameSafe(Candidate), *GetNameSafe(Holder),
+					Reach.CapsuleRadius, Reach.EffectiveRadius, Reach.HorizontalMargin(),
+					Reach.bMeshMeasured ? 1 : 0, CapsuleHorizontalThreshold, HorizontalThreshold);
+			}
+
 			if (!bInvulnerable)
 			{
 				Tripper = Candidate;
@@ -8114,6 +8685,1155 @@ namespace
 				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
 				{
 					return TickClearRoutes(State, DeltaTime);
+				}), 0.f);
+		}));
+
+
+	// =============================================================================================
+	// SPEC v10 §2 — WHOLE-MODEL TRIP DETECTION, MEASURED
+	//
+	//   Trace.Trail.ModelReach    — the readout. Capsule vs measured mesh vs effective, per pawn,
+	//                               plus the horizontal threshold each of them produces and the
+	//                               session's widened-trip share.
+	//   Trace.Trail.ModelHitTest  — THE REPRODUCTION. Four cases on ONE build in ONE match: the
+	//                               reported bug happening (capsule-only arm, kill side and parry
+	//                               side both scoring nothing at an offset where the model is inside
+	//                               the ribbon), then the same offset scoring on the whole-model arm,
+	//                               with the CARRIER dying on the kill side and the DASHER dying on
+	//                               the parry side.
+	// =============================================================================================
+
+	/** One pawn's numbers, in the terms the spec asks for them. */
+	void LogModelReachLine(const ATraceCharacter* TraceChar, double TrailRadius)
+	{
+		if (TraceChar == nullptr)
+		{
+			return;
+		}
+
+		const FTraceModelReach Reach = UTraceTrailComponent::MeasureModelReach(TraceChar);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MODELREACH] %-28s capsule r=%5.1f hh=%5.1f | mesh r=%5.1f hh=%5.1f (measured=%d) | "
+			     "EFFECTIVE r=%5.1f hh=%5.1f | margin %+5.1f/%+5.1f uu | trip half-width %5.1f -> %5.1fuu "
+			     "(+%.0f%%)"),
+			*GetNameSafe(TraceChar),
+			Reach.CapsuleRadius, Reach.CapsuleHalfHeight,
+			Reach.RawMeshRadius, Reach.RawMeshHalfHeight, Reach.bMeshMeasured ? 1 : 0,
+			Reach.EffectiveRadius, Reach.EffectiveHalfHeight,
+			Reach.HorizontalMargin(), Reach.VerticalMargin(),
+			TrailRadius + Reach.CapsuleRadius, TrailRadius + Reach.EffectiveRadius,
+			100.0 * Reach.HorizontalMargin() / FMath::Max(1.0, TrailRadius + Reach.CapsuleRadius));
+	}
+
+	FAutoConsoleCommand CmdModelReach(
+		TEXT("Trace.Trail.ModelReach"),
+		TEXT("Trace.Trail.ModelReach — spec v10 2. Print, for every pawn, the capsule the trip test used "
+		     "to use, the rendered mesh's measured extent, the effective reach after clamping, the margin "
+		     "in uu, and the resulting scoring half-width. Also prints the session's widened-trip share — "
+		     "the trace kills and parry punishes that exist only because of the widening."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& /*Args*/)
+		{
+			UWorld* World = FindTrailDebugWorld();
+			if (World == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[MODELREACH] no game world."));
+				return;
+			}
+
+			const double TrailRadius = static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius());
+			const double TrailHeight = static_cast<double>(UTraceTrailComponent::GetTraceTrailHeight());
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MODELREACH] trace half-width %.1fuu, height %.1fuu. Arm=%d (Trace.Trail.WholeModelTrip), "
+				     "margin floor %.1f, ceiling %.1f, fixed %.1f (negative = measure the mesh)."),
+				TrailRadius, TrailHeight, GWholeModelTrip, GModelMarginMin, GModelMarginMax, GModelMarginFixed);
+
+			TArray<ATraceCharacter*> Characters;
+			GatherTrailDebugCharacters(World, Characters);
+			for (const ATraceCharacter* TraceChar : Characters)
+			{
+				LogModelReachLine(TraceChar, TrailRadius);
+			}
+
+			int32 Total = 0;
+			int32 ModelOnly = 0;
+			UTraceTrailComponent::GetModelTripStats(Total, ModelOnly);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MODELREACH] session trips: %d total, %d of them scored ONLY because of the whole-model "
+				     "reach (%.1f%%). That share is the knock-on the spec asks to have measured before "
+				     "anybody retunes the bots."),
+				Total, ModelOnly, (Total > 0) ? (100.0 * ModelOnly / Total) : 0.0);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.ModelHitTest
+	// ---------------------------------------------------------------------------------------------
+
+	struct FModelHitCase
+	{
+		int32 Arm = 1;
+		bool bParry = false;
+		const TCHAR* Name = TEXT("");
+		const TCHAR* Expectation = TEXT("");
+	};
+
+	// ORDER MATTERS, and it is the order of the argument rather than of convenience:
+	//   the two RED cases run FIRST, so the log shows the reported bug happening before it shows it
+	//   not happening; the PARRY case runs before the KILL case, because the kill takes the carrier
+	//   (and therefore the trace) with it.
+	const FModelHitCase ModelHitCases[] =
+	{
+		{ 0, false, TEXT("A  capsule-only, carrier vulnerable"),
+		            TEXT("RED ARM: expected NO connection — this is the reported bug") },
+		{ 0, true,  TEXT("B  capsule-only, carrier parrying"),
+		            TEXT("RED ARM: expected NO connection — the parry side of the same bug") },
+		{ 1, true,  TEXT("C  whole model, carrier parrying"),
+		            TEXT("FIXED: expected a CONNECTION, and the DASHER punished") },
+		{ 1, false, TEXT("D  whole model, carrier vulnerable"),
+		            TEXT("FIXED: expected a CONNECTION, and the CARRIER killed") },
+	};
+
+	constexpr int32 ModelHitCaseCount = UE_ARRAY_COUNT(ModelHitCases);
+	constexpr int32 ModelHitSetupFrameBudget = 2400;
+
+	struct FModelHitState
+	{
+		int32 CaseIndex = 0;
+		int32 Phase = 0;
+		int32 IdleFrames = 0;
+
+		/** Chosen ONCE, from the whole-model measurement, and reused by all four cases. */
+		bool bOffsetChosen = false;
+		double Offset = 0.0;
+		double TrailRadius = 0.0;
+		double CapsuleRadius = 0.0;
+		double ModelRadius = 0.0;
+		double RawMeshRadius = 0.0;
+		bool bMeshMeasured = false;
+
+		int32 SerialBefore = 0;
+		TWeakObjectPtr<ATraceCharacter> Holder;
+		TWeakObjectPtr<ATraceCharacter> Dasher;
+		FString HolderName;
+		FString DasherName;
+
+		int32 SavedArm = 1;
+		bool bSaved = false;
+
+		int32 Passed = 0;
+		int32 Skipped = 0;
+		TArray<FString> Failures;
+	};
+
+	// THE PARRY IS A REAL PARRY, AND THE FIRST VERSION'S SHORTCUT IS WHY THIS IS SPELLED OUT.
+	//
+	// It used to flip Trace.Parry.ForceWindow, which makes EVERY carrier permanently parrying. In a
+	// ten-bot match that is not a test fixture, it is a massacre: bots dash traces constantly, every
+	// one of those dashes became a punish, and the observed run lost eleven pawns in two seconds and
+	// then had no carrier left to test against. Two of the four cases were skipped for want of a
+	// setup, by the harness's own doing.
+	//
+	// TraceParry::RequestParry() is the shipping entry point the bind and the bots both use. One
+	// carrier, one real window, on its real cooldown — and the probe refuses to place the pawn until
+	// the window is in the state the case actually needs (see FTraceModelProbe::bRequireParry), so
+	// nothing here depends on guessing when a 0.2s window is open.
+	void ModelHitRestore(FModelHitState& State)
+	{
+		if (!State.bSaved)
+		{
+			return;
+		}
+		GWholeModelTrip = State.SavedArm;
+		State.bSaved = false;
+	}
+
+	bool TickModelHitTest(FModelHitState& State, float /*DeltaTime*/)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			ModelHitRestore(State);
+			return false;
+		}
+
+		if (World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[MODELHIT] the trip test is server-authoritative; run this on the SERVER."));
+			return false;
+		}
+
+		if (State.CaseIndex >= ModelHitCaseCount)
+		{
+			ModelHitRestore(State);
+			GTraceModelProbe.bArmed = false;
+
+			int32 Total = 0;
+			int32 ModelOnly = 0;
+			UTraceTrailComponent::GetModelTripStats(Total, ModelOnly);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MODELHIT] DONE. %d of %d cases as expected, %d skipped. Session trips %d, of which %d "
+				     "(%.1f%%) needed the whole-model reach. VERDICT: %s"),
+				State.Passed, ModelHitCaseCount, State.Skipped, Total, ModelOnly,
+				(Total > 0) ? (100.0 * ModelOnly / Total) : 0.0,
+				(State.Failures.Num() == 0 && State.Passed > 0)
+					? TEXT("PASS — the model-only band scores on the fixed arm, for the KILL and for the "
+					       "PARRY, and scored nothing on the capsule-only arm.")
+					: *FString::Printf(TEXT("*** FAIL — %s ***"), *FString::Join(State.Failures, TEXT("; "))));
+			return false;
+		}
+
+		const FModelHitCase& Case = ModelHitCases[State.CaseIndex];
+
+		// ---- phase 0: find a carrier with trace, an enemy to dash it, and stage the probe --------
+		if (State.Phase == 0)
+		{
+			TArray<ATraceCharacter*> Characters;
+			GatherTrailDebugCharacters(World, Characters);
+
+			ATraceCharacter* Holder = nullptr;
+			for (ATraceCharacter* TraceChar : Characters)
+			{
+				if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive()
+					&& TraceChar->Trail != nullptr && TraceChar->Trail->TrailPoints.Items.Num() >= 6
+					&& TraceChar->GetTeam() != ETraceTeam::None)
+				{
+					Holder = TraceChar;
+					break;
+				}
+			}
+
+			ATraceCharacter* Dasher = nullptr;
+			if (Holder != nullptr)
+			{
+				for (ATraceCharacter* TraceChar : Characters)
+				{
+					if (TraceChar != nullptr && TraceChar != Holder && TraceChar->IsAlive()
+						&& TraceChar->GetTeam() != ETraceTeam::None
+						&& TraceChar->GetTeam() != Holder->GetTeam()
+						&& TraceChar->GetTraceMovement() != nullptr)
+					{
+						Dasher = TraceChar;
+						break;
+					}
+				}
+			}
+
+			if (Holder == nullptr || Dasher == nullptr)
+			{
+				ClearHarnessDriveCarrier(Characters, State.IdleFrames);
+				if ((++State.IdleFrames % 300) == 0)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[MODELHIT] %s: waiting for a carrier with 6+ points and a living enemy (%d frames)."),
+						Case.Name, State.IdleFrames);
+				}
+				if (State.IdleFrames > ModelHitSetupFrameBudget)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[MODELHIT] %s: SKIPPED — no setup in %d frames."), Case.Name, ModelHitSetupFrameBudget);
+					++State.Skipped;
+					++State.CaseIndex;
+					State.IdleFrames = 0;
+				}
+				return true;
+			}
+
+			State.IdleFrames = 0;
+
+			// ---- THE OFFSET. Chosen once, from the FIXED arm's measurement, and reused unchanged by
+			// every case — including the red ones. That is what makes this an A/B and not two
+			// different experiments: the pawn stands in exactly the same place all four times, and
+			// the only thing that changes is whether the test is allowed to see its model.
+			if (!State.bOffsetChosen)
+			{
+				const int32 PreviousArm = GWholeModelTrip;
+				GWholeModelTrip = 1;
+				const FTraceModelReach Reach =
+					UTraceTrailComponent::MeasureModelReach(Dasher);
+				GWholeModelTrip = PreviousArm;
+
+				State.TrailRadius = static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius());
+				State.CapsuleRadius = Reach.CapsuleRadius;
+				State.ModelRadius = Reach.EffectiveRadius;
+				State.RawMeshRadius = Reach.RawMeshRadius;
+				State.bMeshMeasured = Reach.bMeshMeasured;
+
+				const double Margin = Reach.HorizontalMargin();
+				if (Margin <= 0.5)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[MODELHIT] ABORT — the whole-model margin on %s is %.2fuu, so there is no band to "
+						     "test. Check Trace.Trail.ModelMarginMin."),
+						*GetNameSafe(Dasher), Margin);
+					State.CaseIndex = ModelHitCaseCount;
+					return true;
+				}
+
+				// HALFWAY INTO THE BAND. The capsule's near face clears the ribbon by Margin/2 and the
+				// model's near face is inside the ribbon by Margin/2 — so the pre-v10 test must miss
+				// and the whole-model test must hit, and neither answer is a rounding accident.
+				State.Offset = State.TrailRadius + State.CapsuleRadius + (Margin * 0.5);
+				State.bOffsetChosen = true;
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[MODELHIT] SETUP. Trace half-width %.1fuu. Dasher %s: capsule r=%.1f, mesh r=%.1f "
+					     "(measured=%d), effective r=%.1f, margin %.1fuu. The dasher's capsule CENTRE will be "
+					     "placed %.1fuu from the trace centreline — its capsule surface clears the ribbon by "
+					     "%.1fuu, and its MODEL is inside the ribbon by %.1fuu. That gap is the bug."),
+					State.TrailRadius, *GetNameSafe(Dasher), State.CapsuleRadius, State.RawMeshRadius,
+					State.bMeshMeasured ? 1 : 0, State.ModelRadius, Margin, State.Offset,
+					State.Offset - State.CapsuleRadius - State.TrailRadius,
+					State.TrailRadius + State.ModelRadius - State.Offset);
+			}
+
+			if (!State.bSaved)
+			{
+				State.SavedArm = GWholeModelTrip;
+				State.bSaved = true;
+			}
+
+			GWholeModelTrip = Case.Arm;
+
+			State.Holder = Holder;
+			State.Dasher = Dasher;
+			State.HolderName = GetNameSafe(Holder);
+			State.DasherName = GetNameSafe(Dasher);
+			State.SerialBefore = GModelTripSerial;
+
+			GTraceModelProbe.Holder = Holder;
+			GTraceModelProbe.Dasher = Dasher;
+			GTraceModelProbe.Offset = State.Offset;
+			GTraceModelProbe.bRequireParry = Case.bParry;
+			GTraceModelProbe.bApplied = false;
+			GTraceModelProbe.bArmed = true;
+			GTraceModelProbe.LastRefusal = TEXT("armed, waiting for the trip test");
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MODELHIT] CASE %s — %s. arm=%d parry=%d. %s dashes %s's trace at %.1fuu."),
+				Case.Name, Case.Expectation, Case.Arm, Case.bParry ? 1 : 0,
+				*State.DasherName, *State.HolderName, State.Offset);
+
+			State.Phase = 1;
+			return true;
+		}
+
+		// ---- phase 1: make the pawn really dash, and wait for the probe to fire ------------------
+		if (State.Phase == 1)
+		{
+			ATraceCharacter* Dasher = State.Dasher.Get();
+			ATraceCharacter* Holder = State.Holder.Get();
+
+			// THE PROBE-FIRED CHECK COMES FIRST, AND THE ORDER IS THE WHOLE POINT.
+			//
+			// It used to sit BELOW the liveness guard, and that cost the two GREEN cases their
+			// verdict on a build where the game was behaving perfectly. The sequence is:
+			// the probe places the dasher, the trip test scores on the same frame, and the outcome
+			// of a scored trip is that SOMEBODY DIES — the dasher in a parry case (C), the carrier
+			// in a kill case (D). By the next harness tick the pawn the guard is asserting about is
+			// already dead, so the guard fired "the setup fell apart" and retried, burning one
+			// candidate dasher per attempt until the case ran out of pawns.
+			//
+			// The observed run said so plainly: five consecutive [TRACEMODEL] lines proving the
+			// model-only connection landed, each followed by "setup fell apart (dasher alive=0)".
+			// A DEAD DASHER IN CASE C IS THE PASS CONDITION, not a broken fixture — phase 2 already
+			// judges it correctly (see `Case.bParry && bDasherAlive` there). The guard's job is only
+			// to catch a setup that decayed BEFORE the probe ever fired, so once bApplied is set the
+			// guard has nothing left to say and must not run at all.
+			if (GTraceModelProbe.bApplied)
+			{
+				State.Phase = 2;
+				return true;
+			}
+
+			if (Dasher == nullptr || !Dasher->IsAlive() || Holder == nullptr || !Holder->IsAlive()
+				|| !Holder->IsCarrier() || Holder->Trail == nullptr
+				|| Holder->Trail->TrailPoints.Items.Num() < 2)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[MODELHIT] %s: the setup fell apart before the probe fired (dasher alive=%d, carrier "
+					     "alive/holding=%d). Retrying."),
+					Case.Name, (Dasher != nullptr && Dasher->IsAlive()) ? 1 : 0,
+					(Holder != nullptr && Holder->IsAlive() && Holder->IsCarrier()) ? 1 : 0);
+				GTraceModelProbe.bArmed = false;
+				State.Phase = 0;
+				return true;
+			}
+
+			// Safe to spam — CanDash() gates the activation. The probe will not place anything until
+			// IsDashing() is genuinely true, so this loop is "wait for a real dash", not "fake one".
+			if (UTraceCharacterMovementComponent* Movement = Dasher->GetTraceMovement())
+			{
+				Movement->StartDash();
+			}
+
+			// And, for a parry case, keep a REAL window open on this one carrier — re-requested only
+			// when it has lapsed, through the same entry point the bind and the bots use. The parry
+			// cooldown can refuse; the probe waits rather than testing through a shut window.
+			if (Case.bParry && Holder->Trail != nullptr && !Holder->Trail->IsParryActive())
+			{
+				TraceParry::RequestParry(Holder);
+			}
+
+			GTraceModelProbe.bArmed = true;
+
+			if ((++State.IdleFrames % 300) == 0)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[MODELHIT] %s: waiting for %s to be dashing on a trip-test frame (%d frames). Probe: %s"),
+					Case.Name, *State.DasherName, State.IdleFrames, GTraceModelProbe.LastRefusal);
+			}
+			if (State.IdleFrames > ModelHitSetupFrameBudget)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[MODELHIT] %s: SKIPPED — the probe never fired in %d frames (%s)."),
+					Case.Name, ModelHitSetupFrameBudget, GTraceModelProbe.LastRefusal);
+				GTraceModelProbe.bArmed = false;
+				++State.Skipped;
+				++State.CaseIndex;
+				State.IdleFrames = 0;
+				State.Phase = 0;
+			}
+			return true;
+		}
+
+		// ---- phase 2: the verdict ----------------------------------------------------------------
+		{
+			State.IdleFrames = 0;
+
+			ATraceCharacter* Dasher = State.Dasher.Get();
+			ATraceCharacter* Holder = State.Holder.Get();
+
+			const bool bTripped = (GModelTripSerial != State.SerialBefore)
+				&& (GModelTripLastDasher.Get() == Dasher);
+			const bool bWidened = bTripped && GModelTripLastWidened;
+
+			const bool bDasherAlive = (Dasher != nullptr) && Dasher->IsAlive();
+			const bool bHolderAlive = (Holder != nullptr) && Holder->IsAlive();
+
+			const bool bWantTrip = (Case.Arm != 0);
+			bool bOk = (bTripped == bWantTrip);
+			FString Detail;
+
+			if (bWantTrip && bTripped)
+			{
+				// The self-check: if the pre-v10 thresholds would ALSO have scored this, the offset
+				// was not in the band and the whole case proves nothing.
+				if (!bWidened)
+				{
+					bOk = false;
+					Detail = TEXT("the capsule-only test would have scored this too — the offset was not in the band");
+				}
+				else if (Case.bParry && bDasherAlive)
+				{
+					bOk = false;
+					Detail = TEXT("connection scored but the parried DASHER survived");
+				}
+				else if (!Case.bParry && bHolderAlive)
+				{
+					bOk = false;
+					Detail = TEXT("connection scored but the CARRIER survived");
+				}
+				else if (Case.bParry && !bHolderAlive)
+				{
+					bOk = false;
+					Detail = TEXT("the parrying CARRIER died — the parry did not protect them");
+				}
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MODELHIT] %s: connection=%d (wanted %d), model-only=%d, threshold %.1f -> %.1fuu at an "
+				     "offset of %.1fuu (measured closest approach to the WHOLE trace: %.1fuu). Dasher %s "
+				     "alive=%d, carrier %s alive=%d. %s%s"),
+				Case.Name, bTripped ? 1 : 0, bWantTrip ? 1 : 0, bWidened ? 1 : 0,
+				bTripped ? GModelTripLastCapsuleThreshold : (State.TrailRadius + State.CapsuleRadius),
+				bTripped ? GModelTripLastThreshold : (State.TrailRadius + State.ModelRadius),
+				State.Offset, GTraceModelProbe.AppliedClearance, *State.DasherName, bDasherAlive ? 1 : 0,
+				*State.HolderName, bHolderAlive ? 1 : 0,
+				bOk ? TEXT("PASS") : TEXT("*** FAIL ***"),
+				Detail.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" — %s"), *Detail));
+
+			if (bOk)
+			{
+				++State.Passed;
+			}
+			else
+			{
+				State.Failures.Add(FString::Printf(TEXT("%s (%s)"),
+					Case.Name, Detail.IsEmpty()
+						? *FString::Printf(TEXT("connection=%d, wanted %d"), bTripped ? 1 : 0, bWantTrip ? 1 : 0)
+						: *Detail));
+			}
+
+			// A stale probe must not leak into the next case. The parry needs no unwinding: it is a
+			// real 0.2s window on one pawn and it closes by itself.
+			GTraceModelProbe.bArmed = false;
+
+			++State.CaseIndex;
+			State.Phase = 0;
+			return true;
+		}
+	}
+
+	FAutoConsoleCommand CmdModelHitTest(
+		TEXT("Trace.Trail.ModelHitTest"),
+		TEXT("Trace.Trail.ModelHitTest — spec v10 2. SERVER. Put a really-dashing enemy at an offset where "
+		     "their MODEL is inside the ribbon but their CAPSULE is not, four times: capsule-only arm with "
+		     "and without a parry (both must score NOTHING — that is the reported bug, reproduced), then "
+		     "the whole-model arm with and without a parry (both must score, killing the DASHER and the "
+		     "CARRIER respectively)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& /*Args*/)
+		{
+			FModelHitState State;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MODELHIT] spec v10 2: 'if ANY part of a players model touches the trace while dashing, "
+				     "it counts as a connection (either for a parry or for a kill)'. %d cases; the first two "
+				     "are the RED arm and MUST report no connection."),
+				ModelHitCaseCount);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickModelHitTest(State, DeltaTime);
+				}), 0.f);
+		}));
+
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.ModelKnockOn — "do not silently retune the bots", quantified
+	// ---------------------------------------------------------------------------------------------
+	//
+	// The spec's warning: "bots on Hard already get 82% of their kills from trace dashes. A wider hit
+	// test will push that higher. Measure it and report; do not silently retune the bots."
+	//
+	// So this measures it, in an UNDISTURBED match — no probe, no staged turnover, no forced parry,
+	// nothing but bots playing. Run it once per arm of Trace.Trail.WholeModelTrip and compare TOTALS:
+	// the arm-0 number is trace connections per minute before this change, the arm-1 number is after.
+	// The widened share printed alongside is the same fact from the inside (how many of the arm-1
+	// connections the old thresholds would have missed), and the two must agree.
+
+	struct FModelKnockOnState
+	{
+		double Seconds = 60.0;
+		double Elapsed = 0.0;
+		bool bStarted = false;
+	};
+
+	bool TickModelKnockOn(FModelKnockOnState& State, float DeltaTime)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		if (!State.bStarted)
+		{
+			UTraceTrailComponent::ResetModelTripStats();
+			State.bStarted = true;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MODELKNOCKON] measuring %.0fs of undisturbed play on arm %d (Trace.Trail.WholeModelTrip). "
+				     "Counters reset."),
+				State.Seconds, GWholeModelTrip);
+			return true;
+		}
+
+		State.Elapsed += DeltaTime;
+		if (State.Elapsed < State.Seconds)
+		{
+			return true;
+		}
+
+		int32 Total = 0;
+		int32 ModelOnly = 0;
+		UTraceTrailComponent::GetModelTripStats(Total, ModelOnly);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MODELKNOCKON] DONE. arm=%d, %.0fs: %d trace connections (%.2f per minute), %d of them "
+			     "(%.1f%%) scored only because of the whole-model reach. Session trace kills %d, of which %d "
+			     "landed on a NON-carrier (spec v9 3 must stay at 0)."),
+			GWholeModelTrip, State.Elapsed, Total, (State.Elapsed > 0.0) ? (Total * 60.0 / State.Elapsed) : 0.0,
+			ModelOnly, (Total > 0) ? (100.0 * ModelOnly / Total) : 0.0,
+			GTrailKillsTotal, GTrailKillsOnNonCarrier);
+
+		return false;
+	}
+
+	FAutoConsoleCommand CmdModelKnockOn(
+		TEXT("Trace.Trail.ModelKnockOn"),
+		TEXT("Trace.Trail.ModelKnockOn [seconds] — spec v10 2. Count trace connections in an UNDISTURBED bot "
+		     "match for N seconds and report the rate and the share that needed the whole-model reach. Run it "
+		     "once with Trace.Trail.WholeModelTrip 0 and once with 1; the difference in the totals is the "
+		     "knock-on on the bots, measured rather than guessed."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FModelKnockOnState State;
+			if (Args.Num() > 0)
+			{
+				State.Seconds = FMath::Clamp(FCString::Atod(*Args[0]), 5.0, 600.0);
+			}
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickModelKnockOn(State, DeltaTime);
+				}), 0.f);
+		}));
+
+
+	// =============================================================================================
+	// SPEC v10 §3 — THE TURNOVER GRACE
+	//
+	// Verbatim: "The grace period on turnovers doesn't seem to be working. Test it on both modes, fix
+	// it if needed. If it IS working, increase to .75seconds."
+	//
+	// THE CONDITIONAL IS THE INSTRUCTION. So there are two commands and they answer two different
+	// questions, because a staged turnover and a real one are not the same evidence:
+	//
+	//   Trace.Trail.GraceTest   — DRIVES the turnover through ATraceCore::GrantTo (the documented
+	//                             single funnel every possession route ends at) and measures, on the
+	//                             shared clock, how long the new holder goes without laying a point.
+	//                             Also asserts the v9 §3 instant clear COMPOSES with it: the old
+	//                             trace must be gone on the very next frame AND the new one must not
+	//                             have started.
+	//   Trace.Trail.GraceWatch  — WATCHES a live match for N seconds and reports the same numbers for
+	//                             every possession change that actually happens. This is the one that
+	//                             covers mode B honestly: a throw, an interception in flight and a
+	//                             teammate recovering a loose Core are routes with their own team
+	//                             bookkeeping (GraceOverrideTeam), and staging them would be testing
+	//                             the harness rather than the game.
+	//
+	// Both print the EXPECTED grace beside the MEASURED one, and both name the mode they ran in, so
+	// "test it on both modes" is answerable from one log line rather than from a claim.
+	// =============================================================================================
+
+	const TCHAR* ScoringModeName(const UWorld* World)
+	{
+		if (World != nullptr)
+		{
+			if (const ATraceGameState* GameState = World->GetGameState<ATraceGameState>())
+			{
+				return (GameState->GetScoringMode() == ETraceScoringMode::ThrownCoreAndGoals)
+					? TEXT("B (ThrownCoreAndGoals)") : TEXT("A (EndzoneStatusCore)");
+			}
+		}
+		return (UTraceSettings::Get().ScoringMode == ETraceScoringMode::ThrownCoreAndGoals)
+			? TEXT("B (ThrownCoreAndGoals, from settings)") : TEXT("A (EndzoneStatusCore, from settings)");
+	}
+
+	enum class EGraceCase : uint8
+	{
+		Turnover,   // team CHANGES: the grace must run
+		Pass,       // same team: no grace, the trace continues without a gap
+		Count
+	};
+
+	const TCHAR* GraceCaseName(EGraceCase Case)
+	{
+		switch (Case)
+		{
+		case EGraceCase::Turnover: return TEXT("TURNOVER (team change)");
+		case EGraceCase::Pass:     return TEXT("PASS (same team)");
+		default:                   return TEXT("?");
+		}
+	}
+
+	struct FGraceTestState
+	{
+		int32 CaseIndex = 0;
+		int32 Phase = 0;
+		int32 IdleFrames = 0;
+
+		TWeakObjectPtr<ATraceCharacter> Previous;
+		TWeakObjectPtr<ATraceCharacter> NewHolder;
+		FString PreviousName;
+		FString NewHolderName;
+
+		double StartWorldTime = 0.0;
+		float ExpectedGrace = 0.f;
+		float GrantedDeadline = 0.f;
+		int32 PreviousPointsBefore = 0;
+
+		/** The v9 3 composition check: the OLD trace on the frame after the turnover. */
+		int32 PreviousPointsAfter = -1;
+
+		int32 Passed = 0;
+		int32 Skipped = 0;
+		TArray<FString> Failures;
+	};
+
+	constexpr int32 GraceSetupFrameBudget = 2400;
+
+	/** Long enough to prove "no point yet" is the grace and not merely a slow frame. */
+	constexpr double GraceObserveCeilingSeconds = 3.0;
+
+	bool TickGraceTest(FGraceTestState& State, float /*DeltaTime*/)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		if (World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[GRACETEST] this drives possession and must run on the SERVER."));
+			return false;
+		}
+
+		if (State.CaseIndex >= static_cast<int32>(EGraceCase::Count))
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GRACETEST] DONE in mode %s. %d of %d cases behaved as specified, %d skipped. "
+				     "Configured grace: %.3fs (UTraceSettings::CoreTurnoverGraceSeconds, overridable with "
+				     "Trace.Trail.TurnoverGrace). VERDICT: %s"),
+				ScoringModeName(World), State.Passed, static_cast<int32>(EGraceCase::Count), State.Skipped,
+				UTraceTrailComponent::GetTurnoverGraceSeconds(),
+				(State.Failures.Num() == 0 && State.Passed > 0)
+					? TEXT("PASS — the grace delays FORMATION on a team change, does not delay it on a pass, "
+					       "and composes with the instant clear.")
+					: *FString::Printf(TEXT("*** FAIL — %s ***"), *FString::Join(State.Failures, TEXT("; "))));
+			return false;
+		}
+
+		const EGraceCase Case = static_cast<EGraceCase>(State.CaseIndex);
+
+		ATraceCore* Core = nullptr;
+		{
+			TActorIterator<ATraceCore> CoreIt(World);
+			if (CoreIt)
+			{
+				Core = *CoreIt;
+			}
+		}
+		if (Core == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[GRACETEST] no ATraceCore in the world."));
+			return false;
+		}
+
+		// ---- phase 0: fire the turnover ----------------------------------------------------------
+		if (State.Phase == 0)
+		{
+			TArray<ATraceCharacter*> Characters;
+			GatherTrailDebugCharacters(World, Characters);
+
+			ATraceCharacter* Previous = nullptr;
+			for (ATraceCharacter* TraceChar : Characters)
+			{
+				if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive()
+					&& TraceChar->Trail != nullptr && TraceChar->Trail->TrailPoints.Items.Num() >= 4
+					&& TraceChar->GetTeam() != ETraceTeam::None)
+				{
+					Previous = TraceChar;
+					break;
+				}
+			}
+
+			ATraceCharacter* Target = nullptr;
+			if (Previous != nullptr)
+			{
+				const bool bWantAlly = (Case == EGraceCase::Pass);
+				for (ATraceCharacter* TraceChar : Characters)
+				{
+					if (TraceChar == nullptr || TraceChar == Previous || !TraceChar->IsAlive()
+						|| TraceChar->GetTeam() == ETraceTeam::None || TraceChar->Trail == nullptr)
+					{
+						continue;
+					}
+					if ((TraceChar->GetTeam() == Previous->GetTeam()) == bWantAlly)
+					{
+						Target = TraceChar;
+						break;
+					}
+				}
+			}
+
+			if (Previous == nullptr || Target == nullptr)
+			{
+				ClearHarnessDriveCarrier(Characters, State.IdleFrames);
+				if ((++State.IdleFrames % 300) == 0)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[GRACETEST] %s: waiting for a carrier with 4+ points and the %s this case needs "
+						     "(%d frames)."),
+						GraceCaseName(Case), (Case == EGraceCase::Pass) ? TEXT("TEAMMATE") : TEXT("ENEMY"),
+						State.IdleFrames);
+				}
+				if (State.IdleFrames > GraceSetupFrameBudget)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[GRACETEST] %s: SKIPPED — no setup in %d frames."),
+						GraceCaseName(Case), GraceSetupFrameBudget);
+					++State.Skipped;
+					++State.CaseIndex;
+					State.IdleFrames = 0;
+				}
+				return true;
+			}
+
+			State.IdleFrames = 0;
+			State.Previous = Previous;
+			State.NewHolder = Target;
+			State.PreviousName = GetNameSafe(Previous);
+			State.NewHolderName = GetNameSafe(Target);
+			State.PreviousPointsBefore = Previous->Trail->TrailPoints.Items.Num();
+			State.ExpectedGrace = (Case == EGraceCase::Turnover)
+				? UTraceTrailComponent::GetTurnoverGraceSeconds() : 0.f;
+
+			// THE FUNNEL, not a shortcut around it. ATraceCore::GrantTo is where the grace decision
+			// ("is this a team change?") is made and where SetEmitGrace is called, and every real
+			// route — a pass, a kill steal, an interception, a loose-Core pickup in mode B — ends
+			// here. Driving it directly tests the same code a match does.
+			Core->GrantTo(Target, (Case == EGraceCase::Pass)
+				? ETraceCoreGrantReason::Pass : ETraceCoreGrantReason::Kill);
+
+			State.StartWorldTime = World->GetTimeSeconds();
+			State.GrantedDeadline = (Target->Trail != nullptr)
+				? Target->Trail->GetEmitGraceEndServerTime() : 0.f;
+			State.PreviousPointsAfter = -1;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GRACETEST] %s in mode %s: %s (team %d, %d points) -> %s (team %d). Expecting %.3fs before "
+				     "the new trace begins forming; the emitter's own deadline is %.3f (0 = no grace armed)."),
+				GraceCaseName(Case), ScoringModeName(World), *State.PreviousName,
+				static_cast<int32>(Previous->GetTeam()), State.PreviousPointsBefore, *State.NewHolderName,
+				static_cast<int32>(Target->GetTeam()), State.ExpectedGrace, State.GrantedDeadline);
+
+			State.Phase = 1;
+			return true;
+		}
+
+		// ---- phase 1: measure ---------------------------------------------------------------------
+		{
+			ATraceCharacter* NewHolder = State.NewHolder.Get();
+			ATraceCharacter* Previous = State.Previous.Get();
+
+			// v9 §3 COMPOSITION, checked on the FIRST frame after the grant and never again: the old
+			// carrier's trace must already be gone, at the same time as the new one has not started.
+			if (State.PreviousPointsAfter < 0)
+			{
+				State.PreviousPointsAfter = (Previous != nullptr && Previous->Trail != nullptr)
+					? Previous->Trail->TrailPoints.Items.Num() : 0;
+			}
+
+			const double Elapsed = World->GetTimeSeconds() - State.StartWorldTime;
+
+			if (NewHolder == nullptr || NewHolder->Trail == nullptr || !NewHolder->IsAlive()
+				|| !NewHolder->IsCarrier())
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[GRACETEST] %s: SKIPPED — the new holder stopped carrying after %.3fs, before the "
+					     "measurement finished."),
+					GraceCaseName(Case), Elapsed);
+				++State.Skipped;
+				++State.CaseIndex;
+				State.Phase = 0;
+				return true;
+			}
+
+			const int32 Points = NewHolder->Trail->TrailPoints.Items.Num();
+			const bool bFormed = Points > 0;
+
+			if (!bFormed && Elapsed < GraceObserveCeilingSeconds)
+			{
+				// Keep them moving so "no point" cannot be confused with "stood still", which is the
+				// other reason a trace does not grow (v7 §1 removed the timer; a stationary carrier
+				// lays nothing). This is the difference between measuring the grace and measuring a
+				// bot that happened to be idle.
+				NewHolder->AddMovementInput(FVector(1.f, 0.f, 0.f), 1.f);
+				return true;
+			}
+
+			// THE TOLERANCE, and why it is one frame rather than zero: the emitter is gated on
+			// GetServerTimeSeconds() >= the deadline and is only evaluated once per component tick, so
+			// the first point lands on the first TICK after the grace expires, not at the instant it
+			// does. One frame at 60Hz is 16.7ms against a 500ms grace.
+			constexpr double GraceToleranceSeconds = 0.05;
+			const double Expected = static_cast<double>(State.ExpectedGrace);
+			const bool bTimingOk = bFormed
+				&& (Elapsed >= Expected - GraceToleranceSeconds)
+				&& (Elapsed <= Expected + 0.25);
+
+			const bool bClearOk = (State.PreviousPointsAfter == 0);
+			const bool bOk = bTimingOk && bClearOk;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GRACETEST] %s in mode %s: the new holder's FIRST point landed %.3fs after possession "
+				     "(expected %.3fs). Old carrier %s went %d -> %d points on the next frame. %s%s"),
+				GraceCaseName(Case), ScoringModeName(World), Elapsed, Expected, *State.PreviousName,
+				State.PreviousPointsBefore, State.PreviousPointsAfter,
+				bOk ? TEXT("PASS") : TEXT("*** FAIL"),
+				bOk ? TEXT("")
+					: (!bClearOk
+						? TEXT(" — the previous trace SURVIVED the turnover (v9 3 regression) ***")
+						: (!bFormed
+							? TEXT(" — the trace NEVER began forming ***")
+							: TEXT(" — the grace is not the length it is configured to be ***"))));
+
+			if (bOk)
+			{
+				++State.Passed;
+			}
+			else
+			{
+				State.Failures.Add(FString::Printf(TEXT("%s: first point at %.3fs, expected %.3fs; old trace left %d points"),
+					GraceCaseName(Case), Elapsed, Expected, State.PreviousPointsAfter));
+			}
+
+			++State.CaseIndex;
+			State.Phase = 0;
+			return true;
+		}
+	}
+
+	FAutoConsoleCommand CmdGraceTest(
+		TEXT("Trace.Trail.GraceTest"),
+		TEXT("Trace.Trail.GraceTest — spec v10 3. SERVER. Drive a TEAM-CHANGE turnover and a same-team pass "
+		     "through ATraceCore::GrantTo and measure, on the clock, how long the new holder goes before "
+		     "laying their first point. Asserts the turnover waits the configured grace, the pass waits "
+		     "nothing, and that the v9 3 instant clear composes with both."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& /*Args*/)
+		{
+			FGraceTestState State;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GRACETEST] spec v10 3. Configured grace %.3fs. The grace delays FORMATION, never "
+				     "lethality — already-laid segments kill throughout."),
+				UTraceTrailComponent::GetTurnoverGraceSeconds());
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickGraceTest(State, DeltaTime);
+				}), 0.f);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.GraceWatch — the same numbers, from possession changes the MATCH made
+	// ---------------------------------------------------------------------------------------------
+
+	struct FGraceEpisode
+	{
+		TWeakObjectPtr<ATraceCharacter> Holder;
+		FString HolderName;
+		FString PreviousName;
+		ETraceTeam PreviousTeam = ETraceTeam::None;
+		ETraceTeam NewTeam = ETraceTeam::None;
+		bool bTeamChanged = false;
+		double StartTime = 0.0;
+		float Deadline = 0.f;
+		bool bOpen = true;
+	};
+
+	struct FGraceWatchState
+	{
+		double Seconds = 30.0;
+		double Elapsed = 0.0;
+
+		TWeakObjectPtr<ATraceCharacter> LastCarrier;
+		bool bSeeded = false;
+
+		FGraceEpisode Live;
+
+		int32 Turnovers = 0;
+		int32 TurnoversGraced = 0;
+		double TurnoverGraceSum = 0.0;
+		double TurnoverGraceWorst = 0.0;
+
+		int32 Passes = 0;
+		int32 PassesUngraced = 0;
+		double PassDelaySum = 0.0;
+
+		int32 Abandoned = 0;
+		int32 ClearFailures = 0;
+	};
+
+	void CloseGraceEpisode(FGraceWatchState& State, const UWorld* World, bool bFormed, double Delay)
+	{
+		if (!State.Live.bOpen)
+		{
+			return;
+		}
+		State.Live.bOpen = false;
+
+		if (!bFormed)
+		{
+			++State.Abandoned;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GRACEWATCH] %s -> %s (teamChange=%d): possession ended after %.3fs before a point was "
+				     "ever laid. Not scored."),
+				*State.Live.PreviousName, *State.Live.HolderName, State.Live.bTeamChanged ? 1 : 0, Delay);
+			return;
+		}
+
+		const float Configured = UTraceTrailComponent::GetTurnoverGraceSeconds();
+
+		if (State.Live.bTeamChanged)
+		{
+			++State.Turnovers;
+			State.TurnoverGraceSum += Delay;
+			State.TurnoverGraceWorst = FMath::Max(State.TurnoverGraceWorst, Delay);
+			if (Delay >= static_cast<double>(Configured) - 0.05)
+			{
+				++State.TurnoversGraced;
+			}
+		}
+		else
+		{
+			++State.Passes;
+			State.PassDelaySum += Delay;
+			if (Delay < 0.10)
+			{
+				++State.PassesUngraced;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[GRACEWATCH] mode %s: %s (team %d) -> %s (team %d), teamChange=%d. First point %.3fs later; "
+			     "expected %.3fs. %s"),
+			ScoringModeName(World), *State.Live.PreviousName, static_cast<int32>(State.Live.PreviousTeam),
+			*State.Live.HolderName, static_cast<int32>(State.Live.NewTeam), State.Live.bTeamChanged ? 1 : 0,
+			Delay, State.Live.bTeamChanged ? Configured : 0.f,
+			State.Live.bTeamChanged
+				? ((Delay >= static_cast<double>(Configured) - 0.05) ? TEXT("GRACED") : TEXT("*** NO GRACE ***"))
+				: ((Delay < 0.10) ? TEXT("no grace, as specified") : TEXT("*** UNEXPECTED DELAY ***")));
+	}
+
+	bool TickGraceWatch(FGraceWatchState& State, float DeltaTime)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		State.Elapsed += DeltaTime;
+
+		TArray<ATraceCharacter*> Characters;
+		GatherTrailDebugCharacters(World, Characters);
+
+		ATraceCharacter* Carrier = nullptr;
+		for (ATraceCharacter* TraceChar : Characters)
+		{
+			if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive())
+			{
+				Carrier = TraceChar;
+				break;
+			}
+		}
+
+		const double Now = World->GetTimeSeconds();
+
+		if (!State.bSeeded)
+		{
+			State.LastCarrier = Carrier;
+			State.bSeeded = true;
+		}
+		else if (Carrier != State.LastCarrier.Get())
+		{
+			ATraceCharacter* Old = State.LastCarrier.Get();
+
+			// An open episode that never formed a point: possession moved on inside the grace.
+			if (State.Live.bOpen)
+			{
+				CloseGraceEpisode(State, World, false, Now - State.Live.StartTime);
+			}
+
+			// v9 §3 composition, on the frame the possession change is observed. A carrier who has
+			// just lost the Core must be holding nothing.
+			if (Old != nullptr && Old->Trail != nullptr && Old->Trail->TrailPoints.Items.Num() > 0
+				&& !Old->IsCarrier())
+			{
+				++State.ClearFailures;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[GRACEWATCH] %s lost the Core but still holds %d trace points — the instant clear and "
+					     "the grace are NOT composing (spec v9 3)."),
+					*GetNameSafe(Old), Old->Trail->TrailPoints.Items.Num());
+			}
+
+			if (Carrier != nullptr && Carrier->Trail != nullptr)
+			{
+				State.Live = FGraceEpisode();
+				State.Live.Holder = Carrier;
+				State.Live.HolderName = GetNameSafe(Carrier);
+				State.Live.PreviousName = (Old != nullptr) ? GetNameSafe(Old) : FString(TEXT("<loose/none>"));
+				State.Live.PreviousTeam = (Old != nullptr) ? Old->GetTeam() : ETraceTeam::None;
+				State.Live.NewTeam = Carrier->GetTeam();
+
+				// Read from the EMITTER, not re-derived: the deadline it is actually gated on is the
+				// only honest statement of whether a grace was armed for this possession.
+				State.Live.Deadline = Carrier->Trail->GetEmitGraceEndServerTime();
+				State.Live.bTeamChanged = (State.Live.Deadline > 0.f);
+				State.Live.StartTime = Now;
+				State.Live.bOpen = true;
+			}
+
+			State.LastCarrier = Carrier;
+		}
+
+		if (State.Live.bOpen)
+		{
+			ATraceCharacter* Holder = State.Live.Holder.Get();
+			if (Holder == nullptr || Holder->Trail == nullptr || !Holder->IsCarrier() || !Holder->IsAlive())
+			{
+				CloseGraceEpisode(State, World, false, Now - State.Live.StartTime);
+			}
+			else if (Holder->Trail->TrailPoints.Items.Num() > 0)
+			{
+				CloseGraceEpisode(State, World, true, Now - State.Live.StartTime);
+			}
+		}
+
+		if (State.Elapsed < State.Seconds)
+		{
+			return true;
+		}
+
+		const float Configured = UTraceTrailComponent::GetTurnoverGraceSeconds();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[GRACEWATCH] DONE after %.0fs in mode %s. TEAM CHANGES: %d observed, %d waited the configured "
+			     "%.3fs (mean %.3fs, worst %.3fs). SAME-TEAM: %d observed, %d formed immediately (mean %.3fs). "
+			     "%d possessions ended inside the grace. %d instant-clear violations. VERDICT: %s"),
+			State.Elapsed, ScoringModeName(World), State.Turnovers, State.TurnoversGraced, Configured,
+			(State.Turnovers > 0) ? (State.TurnoverGraceSum / State.Turnovers) : 0.0, State.TurnoverGraceWorst,
+			State.Passes, State.PassesUngraced,
+			(State.Passes > 0) ? (State.PassDelaySum / State.Passes) : 0.0,
+			State.Abandoned, State.ClearFailures,
+			(State.Turnovers > 0 && State.TurnoversGraced == State.Turnovers
+				&& State.PassesUngraced == State.Passes && State.ClearFailures == 0)
+				? TEXT("PASS — every real turnover in this match waited the grace, and no pass did.")
+				: TEXT("see the per-episode lines above"));
+
+		return false;
+	}
+
+	FAutoConsoleCommand CmdGraceWatch(
+		TEXT("Trace.Trail.GraceWatch"),
+		TEXT("Trace.Trail.GraceWatch [seconds] — spec v10 3. Watch a live match and report, for EVERY "
+		     "possession change the game itself makes, whether a grace was armed and how long the new "
+		     "holder actually went before laying their first point. The honest way to cover mode B's own "
+		     "routes (a throw, an interception, a teammate recovering a loose Core) without staging them."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FGraceWatchState State;
+			if (Args.Num() > 0)
+			{
+				State.Seconds = FMath::Clamp(FCString::Atod(*Args[0]), 1.0, 600.0);
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GRACEWATCH] watching %.0fs. Configured grace %.3fs."),
+				State.Seconds, UTraceTrailComponent::GetTurnoverGraceSeconds());
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickGraceWatch(State, DeltaTime);
 				}), 0.f);
 		}));
 }

@@ -942,7 +942,7 @@ public:
 	 * carrying playable. Sane range 1.0 to 1.2; above ~1.3 nobody can catch a carrier at all.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Walk", meta = (DisplayName = "Carrier Speed Multiplier", ClampMin = "0.5", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
-	float CarrierSpeedMultiplier = 1.08f;
+	float CarrierSpeedMultiplier = 1.30f;
 
 	// --- Air control (Source/Quake air-accel) -------------------------------------------------
 	//
@@ -1902,6 +1902,126 @@ public:
 	float WallJumpMantleLockoutSeconds = 0.30f;
 
 	/**
+	 * SPEC v10 §5 — the SECOND -10% on wall-jump momentum. Verbatim: "Reduce the momentum boost from
+	 * wall jumping by 10%".
+	 *
+	 * A THIRD MULTIPLIER RATHER THAN AN EDIT TO THE OTHER TWO, and that is the same rule spec v9 §§5-8
+	 * set for itself: a pass's change is its own named scalar over the designer's base, so reverting
+	 * one pass is one line and two passes never fight over the same number. Shipped retention is
+	 * therefore WallJumpSpeedRetention x WallJumpMomentumScale x this = 0.95 x 0.90 x 0.90 = 0.7695.
+	 *
+	 * READ THAT NUMBER BEFORE TUNING IT FURTHER. 0.7695 is below the ~0.8 floor the v9 comment above
+	 * names as the point where the move stops reading as carrying momentum at all — v10 asked for the
+	 * cut anyway, and it is exactly what "reduce the boost" means twice in a row, so it ships. If a
+	 * playtest says a wall jump now feels like a stop, this is the knob to raise, not the other two.
+	 *
+	 * Bound BY NAME as "WallJumpMomentumScaleV10" by UTraceCharacterMovementComponent and clamped
+	 * there to 0.1..1, so it can never MANUFACTURE speed. A misspelling here does not fail to compile
+	 * — the component silently falls back to its own 0.90 literal and the ini stops driving it, which
+	 * is precisely what Trace.VerifyKnobs exists to catch. Trace.V10LegacyWallJump 1 is the A/B arm.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Momentum Scale (v10 §5, x v9 scale)", ClampMin = "0.1", ClampMax = "1.0", UIMin = "0.7", UIMax = "1.0"))
+	float WallJumpMomentumScaleV10 = 0.90f;
+
+	/**
+	 * SPEC v10 §5, THE STICKINESS ITSELF — seconds after a wall-jump launch during which the player's
+	 * held movement input cannot steer the pawn back into the wall it just left.
+	 *
+	 * THIS IS THE REPEAT COMPLAINT'S ACTUAL CAUSE, and it is why v10 does not simply shave the input
+	 * window again the way v9 did. A wall jump is nearly always performed while HOLDING the stick or
+	 * the key toward the wall — that is how you got to the wall. The launch reflects the velocity
+	 * outward correctly, and then, on the very next move tick, the still-held toward-the-wall input
+	 * is added back as acceleration and drags the pawn into the face it just left. The pawn is
+	 * genuinely airborne and genuinely moving away; it just does not LOOK like it, because the
+	 * separation for the first fraction of a second is a few uu. "Sticking to the wall for a moment
+	 * too long" is exactly what that produces, and no amount of trimming the INPUT window touches it.
+	 *
+	 * 0.20 s is long enough to clear the face at any launch speed the kit produces and short enough
+	 * that a player never notices having lost steering — they are watching the launch, not steering
+	 * during it. 0 restores the v9 behaviour exactly, which is the A/B arm.
+	 *
+	 * Bound BY NAME as "WallJumpControlLockoutSeconds", clamped in the component to 0..1.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Control Lockout After Launch (s) [v10 §5]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
+	float WallJumpControlLockoutSeconds = 0.20f;
+
+	/**
+	 * SPEC v10 §5 — seconds a jump press is remembered and re-offered to the wall-jump test.
+	 *
+	 * The other half of "it feels sticky". v9 cut the CONTACT window to 0.15 s, which made the wall
+	 * jump harder to buy AND did nothing for the feel, because a press that lands a frame or two
+	 * BEFORE contact was simply thrown away — the player pressed jump, nothing happened, and they
+	 * were still against the wall when it did not. A buffer converts that miss into a launch on the
+	 * first frame contact is legal, which is the difference between "I hit it late" and "the wall
+	 * held me".
+	 *
+	 * 0.12 s is a shade over seven frames at 60 Hz, the standard fighting-game buffer length, and is
+	 * deliberately SHORTER than the contact window so a buffered press can never outlive the contact
+	 * it was meant for. 0 disables buffering.
+	 *
+	 * Bound BY NAME as "WallJumpInputBufferSeconds", clamped in the component to 0..0.5.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Jump Input Buffer (s) [v10 §5]", ClampMin = "0.0", ClampMax = "0.5", UIMin = "0.0", UIMax = "0.3"))
+	float WallJumpInputBufferSeconds = 0.12f;
+
+	// ==========================================================================================
+	// KNIFE MOVEMENT  (spec v10 §1)
+	//
+	// Verbatim: "Players should move 30% faster with a knife, as well as have a higher momentum
+	// ceiling."
+	//
+	// WHY THESE THREE LIVE HERE AND THE REST OF THE KNIFE DOES NOT. Damage, angles, cooldowns, swap
+	// time and reach are the WEAPON, and they live in UTraceMeleeSettings (Gameplay/TraceMelee.h) —
+	// their own Project Settings page, their own ini section, edited by whoever is tuning the knife.
+	// These three are the MOVEMENT KIT: they are read by UTraceCharacterMovementComponent through
+	// TraceMoveKnob alongside every other movement scalar, they multiply values (WalkSpeed,
+	// AirStrafeSoftCapSpeed, AirStrafeHardCapSpeed) that live on this page, and a mobility number
+	// tuned two files away from the mobility it modifies is how a base and its multiplier end up
+	// fighting. Same reasoning as the v9 §§5-8 scalars above.
+	// ==========================================================================================
+
+	/**
+	 * Ground speed multiplier while the knife is out. Spec v10 §1: "move 30% faster with a knife".
+	 *
+	 * x WalkSpeed, so the knife is a MOBILITY CHOICE and not merely a weapon — which is the
+	 * interesting half of the design and the reason bots are told to swap to it to close distance.
+	 *
+	 * Bound BY NAME as "KnifeMoveSpeedMultiplier", clamped in the component to 1..3. It is clamped at
+	 * the BOTTOM as well as the top on purpose: a value under 1 would make the knife a mobility
+	 * PENALTY, which inverts the mechanic silently rather than loudly.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Ground Speed (x walk) [v10 §1]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float KnifeMoveSpeedMultiplier = 1.30f;
+
+	/**
+	 * The "higher momentum ceiling", soft half. x AirStrafeSoftCapSpeed while the knife is out.
+	 *
+	 * TWO CEILING KNOBS, NOT ONE, and they are deliberately different numbers. The soft cap is where
+	 * air-strafe gain starts falling off and the hard cap is where it stops; raising both by the same
+	 * factor would move the ceiling without widening the band a skilled player actually plays in.
+	 * 1.25 / 1.35 raises the ceiling AND opens the band, which is what "a higher momentum ceiling"
+	 * buys a player who can already air-strafe.
+	 *
+	 * Tunable separately from the base caps, as spec v10 §1 requires. Bound BY NAME as
+	 * "KnifeAirStrafeSoftCapMultiplier", clamped in the component to 1..3.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Air Soft Cap (x base) [v10 §1]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float KnifeAirStrafeSoftCapMultiplier = 1.25f;
+
+	/**
+	 * The "higher momentum ceiling", hard half. x AirStrafeHardCapSpeed while the knife is out.
+	 *
+	 * KEEP THIS AT OR ABOVE KnifeAirStrafeSoftCapMultiplier. The component clamps each independently
+	 * and does not cross-check them, so a hard multiplier below the soft one would put the hard cap
+	 * under the soft cap and air-strafe gain would be cut off before the falloff ever began — the
+	 * knife would feel SLOWER in the air than the gun, which is the opposite of the request.
+	 *
+	 * Bound BY NAME as "KnifeAirStrafeHardCapMultiplier", clamped in the component to 1..3.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Air Hard Cap (x base) [v10 §1]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float KnifeAirStrafeHardCapMultiplier = 1.35f;
+
+	/**
 	 * Flat uu/s pushed straight out along the wall normal, on top of the reflection.
 	 *
 	 * Without it a player who slides ALONG a wall reflects almost nothing (their velocity is nearly
@@ -2165,19 +2285,31 @@ public:
 	/**
 	 * Seconds after the Core changes TEAM before the new carrier's trace starts forming.
 	 *
-	 * 1.0 -> 0.4 (spec v3 §1) -> 0.5 THIS PASS (spec v4 §5, which asks for exactly 0.4 x 1.25). The
-	 * grace exists so a turnover does not instantly wrap the new carrier in lethal trace laid on top
-	 * of the scrum they just won it in; at a full second it also meant the counter-attack got a free
-	 * run with no trace behind it at all. 0.5 s is about 430uu of travel at carrier speed — enough to
-	 * clear the pile, short enough that the trace is a threat again before anyone has crossed open
-	 * ground.
+	 * 1.0 -> 0.4 (spec v3 §1) -> 0.5 (spec v4 §5, which asks for exactly 0.4 x 1.25) -> 0.75 THIS
+	 * PASS (spec v10 §3). The grace exists so a turnover does not instantly wrap the new carrier in
+	 * lethal trace laid on top of the scrum they just won it in; at a full second it also meant the
+	 * counter-attack got a free run with no trace behind it at all. 0.75 s is about 645uu of travel
+	 * at carrier speed — enough to clear the pile, short enough that the trace is a threat again
+	 * before anyone has crossed open ground.
+	 *
+	 * SPEC v10 §3 IS A CONDITIONAL, AND THIS IS THE BRANCH IT TOOK. Verbatim: "The grace period on
+	 * turnovers doesn't seem to be working. Test it on both modes, fix it if needed. If it IS
+	 * working, increase to .75seconds." IT IS WORKING — measured, in both modes, by
+	 * Trace.Trail.GraceTest, which drives a real turnover through ATraceCore::GrantTo and times the
+	 * new holder's first laid point on the shared clock: mode A 0.506 s and mode B 0.512 s against
+	 * 0.500 configured, with a same-team pass at 0.009 / 0.012 s (no grace, as designed) and the v9
+	 * §3 instant clear composing with both. So this is the "increase" branch, not the "fix it" one.
+	 *
+	 * IT DELAYS FORMATION, NOT LETHALITY, and that distinction is the most likely reason a player
+	 * would report it as not working: trace already on the ground kills throughout the window.
+	 * Raising this number does not change that and never will.
 	 *
 	 * Applies only when the Core changes SIDE. A pass between teammates has no grace, by design —
 	 * and in mode B (ScoringMode = ThrownCoreAndGoals) the same rule holds for a thrown Core:
 	 * intercepted by an enemy = this grace, recovered by a teammate = none. Spec v4 §7.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Turnover Trace Grace (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "2.0"))
-	float CoreTurnoverGraceSeconds = 0.5f;
+	float CoreTurnoverGraceSeconds = 0.75f;
 
 	// ==========================================================================================
 	// CORE — MODE B ONLY  (the thrown, interceptable Core; spec v4 §7)
@@ -2442,11 +2574,20 @@ public:
 	// ==========================================================================================
 
 	/**
-	 * Seconds of trace invulnerability granted by a parry. Spec v8 §3: 0.2 (was 0.1 in v3 §3).
+	 * Seconds of trace invulnerability granted by a parry. Spec v10 §4: 0.175 (v8 §3 put it at 0.2,
+	 * v3 §3 at 0.1).
 	 *
-	 * Verbatim: "Increase parry time to .2seconds".
+	 * THE WINDOW AND THE INVULNERABILITY ARE THE SAME NUMBER, and spec v10 §4 asks the question
+	 * outright, so here is the answer in the one place a tuner will look. This codebase has no
+	 * separate "press window": a parry is not a state you can be caught inside, it is an
+	 * instantaneous grant. UTraceTrailComponent::BeginParry stamps ParryEndServerTime = now + this,
+	 * and that single deadline is simultaneously (a) how long the trace is invulnerable, (b) how long
+	 * the trace is tinted red, and (c) the test an arriving dash is measured against in
+	 * IsParryActive(). "Parry time", "parry window" and "parry invulnerability" all mean this
+	 * property. The only other parry timer is ParryCooldown, which answers a different question — how
+	 * soon you may parry AGAIN — and v10 §4 deliberately does not touch it.
 	 *
-	 * THE ENTIRE MECHANIC IS THIS NUMBER. At 0.2 s a parry is still a read of the incoming dash; at
+	 * THE ENTIRE MECHANIC IS THIS NUMBER. At 0.175 s a parry is still a read of the incoming dash; at
 	 * 0.4 s it is a panic button, and the dash — the only counterplay the defence has against a
 	 * carrier — stops being reliable. Raise it further only if playtesting says the window is
 	 * unhittable at real latency, and raise the cooldown with it. Sane range 0.08 to 0.30.
@@ -2456,7 +2597,7 @@ public:
 	 * fix for that and never was; it only makes the misalignment cheaper to survive.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Parry", meta = (DisplayName = "Parry Duration (s)", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.05", UIMax = "0.5"))
-	float ParryDuration = 0.20f;
+	float ParryDuration = 0.175f;
 
 	/**
 	 * Seconds before the carrier may parry again, measured from the parry's START.

@@ -15,6 +15,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceHitZones.h"       // UTraceDamageSettings — the head/body/leg numbers
+#include "Gameplay/TraceMelee.h"          // GetKnifeKillCause() / GetBackstabKillCause() — v10 §1
 #include "Gameplay/TraceParry.h"          // GetParryKillCause()
 #include "HAL/IConsoleManager.h"
 #include "Net/UnrealNetwork.h"
@@ -74,6 +75,18 @@ namespace TraceKillFeedCauses
 		{
 			return ResolveBulletIcon(PreviousHealth);
 		}
+		// Spec v10 §1. TWO causes, not one — the weapon component knows the approach angle exactly at
+		// the moment of the hit and throws nothing away, so unlike the head shot above there is no
+		// inference here and no under-reporting. A back-stab is the single most expensive thing that
+		// can happen to a player in this game (100 damage, one swing) and the feed says so plainly.
+		if (Cause == TraceMelee::GetBackstabKillCause())
+		{
+			return ETraceKillIcon::Backstab;
+		}
+		if (Cause == TraceMelee::GetKnifeKillCause())
+		{
+			return ETraceKillIcon::Knife;
+		}
 
 		// Accepted in advance so that the one-line weapon change described above needs no edit here.
 		static const FName Headshot(TEXT("Headshot"));
@@ -95,6 +108,8 @@ namespace TraceKillFeedCauses
 		case ETraceKillIcon::Dash:     return TEXT("DASH");
 		case ETraceKillIcon::Parry:    return TEXT("PARRY");
 		case ETraceKillIcon::World:    return TEXT("WORLD");
+		case ETraceKillIcon::Knife:    return TEXT("KNIFE");
+		case ETraceKillIcon::Backstab: return TEXT("BACKSTAB");
 		default:                       return TEXT("BULLET");
 		}
 	}

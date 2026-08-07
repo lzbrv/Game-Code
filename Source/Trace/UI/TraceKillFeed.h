@@ -101,7 +101,11 @@ enum class ETraceKillIcon : uint8
 	/** Cause "Parried" — the carrier killed the dasher. A shield. */
 	Parry = 3,
 	/** Cause "Fell", or any death with no killer. A cross. */
-	World = 4
+	World = 4,
+	/** Cause "Knife" — a front swipe, 30 damage a swing. A blade. (spec v10 §1) */
+	Knife = 5,
+	/** Cause "Backstab" — 100 damage from the rear hemisphere. A blade with a rear chevron. */
+	Backstab = 6
 };
 
 /**

@@ -524,12 +524,18 @@ public:
 
 	// --- Corner banks (the sketch's green arrows) ------------------------------------------------
 	//
-	// Four terraced banks, one per quadrant, raised along the long edges and stepping DOWN toward
-	// the middle of the field. Read the sketch as a shallow stadium bowl: high at the corners,
-	// flat in the centre. See BuildCornerBanks for the shape and for why it is terraced rather
-	// than ramped.
+	// Four banks, one per quadrant, raised along the long edges and sweeping DOWN toward the middle
+	// of the field. Read the sketch as a shallow stadium bowl: high at the corners, flat in the
+	// centre. See BuildCornerBanks for the shape.
+	//
+	// SPEC v10 SECTION 9 - THEY ARE NO LONGER TERRACED. The bank is still built from nested
+	// axis-aligned boxes, for the reason BuildCornerBanks gives (this project's bots have no navmesh
+	// and a pitched collider met side-on is a wall to them), but the boxes a PLAYER STANDS ON and the
+	// boxes a player LOOKS AT are now two different sets at two different resolutions: 20 uu risers
+	// for the invisible colliders, 5 uu for the drawn shell. A 5 uu riser is 2.8% of a player's
+	// height and does not resolve as a step at any distance in this arena.
 
-	/** Master switch for the four terraced corner banks. */
+	/** Master switch for the four corner banks. */
 	UPROPERTY(EditAnywhere, Category = "Trace|Banks")
 	bool bBuildCornerBanks = true;
 
@@ -549,9 +555,10 @@ public:
 	 *
 	 * Defaults to 2x player height (352 uu) so it matches the sketch's mid-height structures: high
 	 * enough that standing on the bank is genuinely high ground and that a body behind it is
-	 * hidden, low enough that it never reads as a wall. The terrace count is derived from this so
-	 * that every riser stays under UCharacterMovementComponent::MaxStepHeight whatever it is set
-	 * to - see BuildCornerBanks.
+	 * hidden, low enough that it never reads as a wall. The step count is derived from this so that
+	 * every riser stays under UCharacterMovementComponent::MaxStepHeight whatever it is set to - and
+	 * since spec v10 section 9 the collision riser is half of even that ceiling, so raising this
+	 * number adds steps rather than height to any of them. See BuildCornerBanks.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Banks", meta = (ClampMin = "0.0"))
 	float BankHeight = 352.f;
@@ -570,19 +577,28 @@ public:
 	//      taper where the bank is only one terrace tall - gets its own small cove from
 	//      BuildWallFillets.
 	//
-	// Both are built by the same profile generator (TraceCoveProfile in the .cpp) under the same
+	// Both are built by the same profile generator (TraceBuildCoveProfile in the .cpp) under the same
 	// three rules, and those rules are what keep the curve WALKABLE and free of false affordances:
-	//   riser <= StepRise          so UCharacterMovementComponent steps up it without the mover
-	//                              ever knowing there was a step (and 40 < MantleMinHeightUU 55, so
-	//                              no single riser can ever read as a climbable ledge);
-	//   tread >= FilletMinTread    so the mantle's top probe, which lands CapsuleRadius*0.5 = 17 uu
-	//                              past the face it found, can never SKIP a tread and report a
-	//                              two-riser ledge that would be inside the mantle window;
+	//   riser <= MaxRiser          so UCharacterMovementComponent steps up it without the mover
+	//                              ever knowing there was a step (and every riser is far below
+	//                              MantleMinHeightUU 55, so none can read as a climbable ledge);
+	//   slope <= FilletMaxSlope    so the mantle's top probe, which lands CapsuleRadius*0.5 = 17 uu
+	//                              past the face it found, can never find a ledge inside the mantle
+	//                              window: the worst it can report is 17 x slope;
 	//   inner edge >= 40 uu        so the cove stops at the pawn standoff line and never leaves a
 	//                              walkable sliver a body cannot actually reach.
-	// A cove is tangent to the wall at its top, so those rules necessarily truncate it: the curve
-	// blends until it is ~57 degrees and the wall goes vertical from there. That is the steepest a
-	// staircase of 37 uu risers can be while still keeping a 24 uu tread.
+	// A cove is tangent to the wall at its top, so those rules necessarily truncate it. On the
+	// shipped geometry the inner-edge rule bites first, at ~45 degrees on the banks and ~52 on the
+	// wall fillets; the wall goes vertical from there.
+	//
+	// SPEC v10 SECTION 9 - "CURVED, NOT TERRACED". v9 answered the note by putting the terraces ON a
+	// curve, which fixed the PLAN and left the CROSS-SECTION a visible flight of 39 uu stairs; the
+	// user looked at it and asked again. Both pieces are now built TWICE from the same envelope:
+	// invisible box colliders at CoveCollisionRiser (half the walkable ceiling, so every Demo 9
+	// property is strictly improved and the box-component budget barely moves) and drawn instanced
+	// shells at CoveVisualRiser, which is 5 uu and costs no registered primitive at all. The three
+	// rules above are stated as SLOPES rather than as absolute treads precisely so that both
+	// resolutions describe the same shape - see FilletMaxSlope in the .cpp.
 
 	/** Master switch for the cove along the base of every wall. */
 	UPROPERTY(EditAnywhere, Category = "Trace|Walls")
@@ -602,8 +618,13 @@ public:
 
 	/**
 	 * Vertical semi-axis of the cove, i.e. how far up the wall it would reach if it ran all the way
-	 * to tangency. The staircase truncates before that - at 296 it yields six 37 uu risers topping
-	 * out at 222 uu with the innermost tread 44 uu off the wall.
+	 * to tangency. The staircase truncates before that, where its inner edge reaches the pawn
+	 * standoff line - at 296 that is ~190 uu up with the innermost edge 40 uu off the wall.
+	 *
+	 * SPEC v10 SECTION 9 CHANGED THE SAMPLING, NOT THE ENVELOPE. Both truncation rules are now
+	 * expressed as slopes rather than as absolute treads, so the curve stops in exactly the same
+	 * place whether it is sampled at the 20 uu collision riser or the 5 uu drawn one. The number
+	 * above still means what it always meant.
 	 *
 	 * KEPT UNDER THE MODE-B GOAL FURNITURE on the end walls, and that clamp is applied per step at
 	 * build time against the real ramp geometry rather than assumed here: the carry-in ramp climbs
@@ -764,11 +785,14 @@ protected:
 	void BuildCentreDais(bool bBuildVisuals);
 
 	/**
-	 * The four terraced corner banks - the sketch's green arrows, i.e. the shallow stadium bowl.
+	 * The four corner banks - the sketch's green arrows, i.e. the shallow stadium bowl.
 	 *
 	 * REPLACED the four stepped wing platforms and the two rows of segmented lane rails. Those
 	 * existed to break up a 12000 uu wide field; at 9600 the banks do that job and do it as
 	 * TERRAIN, which is what the sketch actually draws.
+	 *
+	 * Since spec v10 section 9 it emits TWO things per quadrant: nested box colliders on the coarse
+	 * cove profile, and nested instanced shells on the fine one. See the wall-fillet block above.
 	 */
 	void BuildCornerBanks(bool bBuildVisuals);
 
@@ -779,7 +803,8 @@ protected:
 	 * bank, with the floor and with the mode-B approach ramp is provably still walkable: each of
 	 * those is a monotone staircase whose risers are under StepRise, and the pointwise MAXIMUM of
 	 * two such staircases is another one (max is 1-Lipschitz). That is why this can be overlaid on
-	 * the arena without auditing every surface it crosses.
+	 * the arena without auditing every surface it crosses. Spec v10 section 9 HALVED those risers,
+	 * which cannot break the argument - a smaller bound is still a bound.
 	 *
 	 * Built inside bBuildCornerBanks' sibling switch bBuildWallFillets, and OUTSIDE the bBuildVisuals
 	 * gate for the collision, because a dedicated server has to build the ground its clients are

@@ -34,6 +34,15 @@ namespace
 	FKey Default_Fire()        { return EKeys::LeftMouseButton; }
 	FKey Default_Pass()        { return EKeys::RightMouseButton; }
 	FKey Default_Scoreboard()  { return EKeys::Tab; }
+	/**
+	 * Swap gun <-> knife (spec v10 §1). The spec asked for "a free key, and state it".
+	 *
+	 * Taken already: WASD, Space (jump), LeftCtrl (crouch/slide), LeftShift (dash), Q (parry),
+	 * mouse1 (fire/swing), mouse2 (pass), Tab (scoreboard). F is unclaimed, sits under the index
+	 * finger without leaving WASD, and is the genre-conventional melee key — so a player who has
+	 * never read a keybind screen will find it first.
+	 */
+	FKey Default_SwapWeapon()  { return EKeys::F; }
 }
 
 const TArray<FTraceInputActionInfo>& TraceInputActions::All()
@@ -52,9 +61,10 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire        },
 		{ ETraceInputAction::Pass,        TEXT("Pass"),        TEXT("PASS CORE"),    &Default_Pass        },
 		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard  },
+		{ ETraceInputAction::SwapWeapon,  TEXT("SwapWeapon"),  TEXT("SWAP WEAPON"),  &Default_SwapWeapon  },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 11,
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 12,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 
@@ -132,7 +142,21 @@ bool UTraceUserSettings::IsBindableKey(const FKey& Key)
 		return false;
 	}
 
-	// Axes are what the Look mapping consumes; binding Dash to "MouseX" would fire continuously.
+	// SPEC v10 §8 — "Allow Mouse button 1 and mouse button 2 as keybinds in the settings menu."
+	//
+	// MOUSE BUTTONS ARE BINDABLE AND ALWAYS HAVE BEEN, and this comment exists so the next person to
+	// read the note does not "fix" it here a second time. The shipped defaults are LeftMouseButton
+	// for FIRE and RightMouseButton for PASS (see the table at the top of this file), so a rule that
+	// rejected mouse buttons would have refused to load the game's own default bindings on the first
+	// run — which is not what happens. Trace.VerifyBindableKeys prints the verdict for every mouse
+	// button in the build so this can be checked rather than argued about.
+	//
+	// AXES ARE THE ONLY MOUSE INPUT REFUSED, and that is a different thing entirely. MouseX / MouseY
+	// / Mouse2D / MouseWheelAxis are what the Look mapping consumes; binding Dash to "MouseX" would
+	// fire it continuously for as long as the player looked around. MouseScrollUp and MouseScrollDown
+	// are BUTTONS in UE's model, not axes, so a scroll click stays bindable — which is what a player
+	// who wants dash on the wheel expects.
+	//
 	// Gestures and touch are not reachable on this platform. Everything else — keyboard, mouse
 	// buttons, wheel clicks, gamepad face buttons — is fair game.
 	if (Key.IsAxis1D() || Key.IsAxis2D() || Key.IsAxis3D() || Key.IsGesture() || Key.IsTouch())
@@ -343,4 +367,162 @@ void UTraceUserSettings::Save()
 		TEXT("[Settings] Saved. sensitivity=%.2f yScale=%.2f invertY=%d -> %s"),
 		MouseSensitivity, MouseSensitivityYScale, bInvertMouseY ? 1 : 0,
 		*GetClass()->GetConfigName());
+}
+
+// =================================================================================================
+// Trace.VerifyBindableKeys — SPEC v10 §8, the evidence half.
+//
+// The note is "allow mouse button 1 and mouse button 2 as keybinds", i.e. a report that the rebind
+// UI refuses them. There are exactly two places a key can be refused between a player pressing it
+// and it becoming a binding:
+//
+//   1. VALIDATION — UTraceUserSettings::IsBindableKey, which is what builds the options menu's
+//      capture list and what SetKey and RefreshFromConfig both gate on. If a key fails here it can
+//      never be captured, never be loaded from the ini and never be set programmatically.
+//   2. DELIVERY — whether the press reaches APlayerController::WasInputKeyJustPressed at all while
+//      the options overlay is up, which is an input-routing question, not a settings one.
+//
+// This command answers (1) exhaustively and by name, so (2) is what is left over. It walks every key
+// the engine knows, prints the verdict for the mouse set specifically, and then does a full
+// round trip on LeftMouseButton and RightMouseButton — bind it, read it back, flatten it to the
+// string the ini stores, re-parse it — because "IsBindableKey says yes" and "the binding survives a
+// save and a load" are two different claims and the second is the one a player experiences.
+//
+// The bindings it touches are restored before it returns, so it is safe to run mid-session.
+// =================================================================================================
+
+namespace
+{
+	void VerifyBindableKeys()
+	{
+		UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BindableKeys] ===== spec v10 s8: which keys the rebind UI is allowed to capture ====="));
+
+		// --- The mouse set, named one by one -----------------------------------------------------
+		//
+		// Listed explicitly rather than filtered out of GetAllKeys by IsMouseButton(), because the
+		// question being answered is "is THIS key, the one in the note, bindable" and a filter that
+		// silently returned an empty list would read as a pass.
+		const TArray<FKey> MouseKeys =
+		{
+			EKeys::LeftMouseButton, EKeys::RightMouseButton, EKeys::MiddleMouseButton,
+			EKeys::ThumbMouseButton, EKeys::ThumbMouseButton2,
+			EKeys::MouseScrollUp, EKeys::MouseScrollDown,
+			EKeys::MouseX, EKeys::MouseY, EKeys::MouseWheelAxis
+		};
+
+		int32 MouseButtonsBindable = 0;
+		for (const FKey& Key : MouseKeys)
+		{
+			const bool bBindable = UTraceUserSettings::IsBindableKey(Key);
+			const bool bAxis = Key.IsAxis1D() || Key.IsAxis2D() || Key.IsAxis3D();
+
+			if (bBindable && !bAxis)
+			{
+				++MouseButtonsBindable;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BindableKeys]   %-20s bindable=%d  axis=%d  (%s)"),
+				*Key.GetFName().ToString(), bBindable ? 1 : 0, bAxis ? 1 : 0,
+				*UTraceUserSettings::DescribeKey(Key));
+		}
+
+		// --- The exclusions that must SURVIVE ------------------------------------------------------
+		const bool bEscapeExcluded = !UTraceUserSettings::IsBindableKey(EKeys::Escape);
+		const bool bAnyKeyExcluded = !UTraceUserSettings::IsBindableKey(EKeys::AnyKey);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BindableKeys]   exclusions kept: Escape=%d AnyKey=%d (both must be 1)"),
+			bEscapeExcluded ? 1 : 0, bAnyKeyExcluded ? 1 : 0);
+
+		// --- The whole capture list, counted ------------------------------------------------------
+		TArray<FKey> AllKeys;
+		EKeys::GetAllKeys(AllKeys);
+
+		int32 Capturable = 0;
+		int32 CapturableMouse = 0;
+		for (const FKey& Key : AllKeys)
+		{
+			if (!UTraceUserSettings::IsBindableKey(Key))
+			{
+				continue;
+			}
+			++Capturable;
+			CapturableMouse += Key.IsMouseButton() ? 1 : 0;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BindableKeys]   the options menu's capture list is %d of %d engine keys, %d of them mouse buttons."),
+			Capturable, AllKeys.Num(), CapturableMouse);
+
+		// --- The round trip -----------------------------------------------------------------------
+		//
+		// Dash is the victim on purpose: it is not one of the two actions that already OWN a mouse
+		// button, so a pass here cannot be an accident of the defaults.
+		const FKey Saved = Settings.GetKey(ETraceInputAction::Dash);
+		const FKey SavedFire = Settings.GetKey(ETraceInputAction::Fire);
+		const FKey SavedPass = Settings.GetKey(ETraceInputAction::Pass);
+
+		int32 RoundTripsOk = 0;
+		for (const FKey& Key : { EKeys::LeftMouseButton, EKeys::RightMouseButton })
+		{
+			Settings.SetKey(ETraceInputAction::Dash, Key);
+			const FKey ReadBack = Settings.GetKey(ETraceInputAction::Dash);
+
+			// Through the string form the ini actually stores, and back. This is where a key that
+			// validates but does not SERIALISE would be caught.
+			const FString Serialised = ReadBack.IsValid() ? ReadBack.GetFName().ToString() : TEXT("None");
+			const FKey Reparsed(*Serialised);
+
+			const bool bOk = (ReadBack == Key) && (Reparsed == Key) && UTraceUserSettings::IsBindableKey(Reparsed);
+			RoundTripsOk += bOk ? 1 : 0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BindableKeys]   DASH <- %-18s set=%d ini='%s' reparsed=%s -> %s"),
+				*Key.GetFName().ToString(), (ReadBack == Key) ? 1 : 0, *Serialised,
+				*Reparsed.GetFName().ToString(), bOk ? TEXT("ROUND TRIP OK") : TEXT("FAILED"));
+		}
+
+		// Put everything back, including the two actions SetKey may have stolen the button from.
+		Settings.SetKey(ETraceInputAction::Dash, Saved);
+		Settings.SetKey(ETraceInputAction::Fire, SavedFire);
+		Settings.SetKey(ETraceInputAction::Pass, SavedPass);
+
+		// Two calls rather than a ternary verbosity: UE_LOG's verbosity argument is a token the macro
+		// pastes into a compile-time category check, not a value, so it cannot be an expression.
+		const bool bPass = (MouseButtonsBindable >= 5) && bEscapeExcluded && bAnyKeyExcluded && (RoundTripsOk == 2);
+
+#define TRACE_BINDABLE_VERDICT_ARGS \
+	bPass ? TEXT("VALIDATION ACCEPTS MOUSE BUTTONS") : TEXT("VALIDATION IS REJECTING SOMETHING"), \
+	MouseButtonsBindable, RoundTripsOk, (bEscapeExcluded && bAnyKeyExcluded) ? 1 : 0
+
+#define TRACE_BINDABLE_VERDICT_TEXT \
+	TEXT("[BindableKeys] VERDICT: %s. Mouse buttons bindable=%d/7, round trips=%d/2, Escape and ") \
+	TEXT("AnyKey still excluded=%d. If this passes and the MENU still refuses a mouse click, the ") \
+	TEXT("refusal is in DELIVERY (the press never reaching WasInputKeyJustPressed while the overlay ") \
+	TEXT("is up), not in validation.")
+
+		if (bPass)
+		{
+			UE_LOG(LogTraceGame, Display, TRACE_BINDABLE_VERDICT_TEXT, TRACE_BINDABLE_VERDICT_ARGS);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TRACE_BINDABLE_VERDICT_TEXT, TRACE_BINDABLE_VERDICT_ARGS);
+		}
+
+#undef TRACE_BINDABLE_VERDICT_ARGS
+#undef TRACE_BINDABLE_VERDICT_TEXT
+	}
+
+	FAutoConsoleCommand CmdVerifyBindableKeys(
+		TEXT("Trace.VerifyBindableKeys"),
+		TEXT("Spec v10 s8. Prints whether every mouse button passes UTraceUserSettings::IsBindableKey, ")
+		TEXT("whether Escape and AnyKey are still excluded, and round-trips LeftMouseButton and ")
+		TEXT("RightMouseButton through a real binding and the ini's string form. Restores the bindings it ")
+		TEXT("touches."),
+		FConsoleCommandDelegate::CreateStatic(&VerifyBindableKeys));
 }

@@ -367,6 +367,121 @@
 // slide-jump even if a wall window happens to be open, so nothing about spec v4 §1 or v5 §3 changes.
 // The wall jump is only reached by a jump that is airborne, not a slide-jump, and next to a wall.
 //
+// --- SPEC v10 §5: WHY IT WAS STILL STICKY, AND WHAT WAS ACTUALLY WRONG ---------------------------
+//
+// "Wall jumping still feels like the player is sticking to the wall for a moment too long." Same
+// words as v9, after v9 had already cut the window 0.25 -> 0.15 s and stopped the mantle stealing the
+// press. So the remaining cause was NOT the window, and shaving it again would have been the third
+// pass in a row spent on the wrong number.
+//
+// The stick was measured rather than guessed — see the STICK METER block further down this header for
+// the definition, and RUN -TraceWallJumpTest to reproduce it. It is the milliseconds from the frame
+// the capsule touches a wall to the frame the pawn is genuinely clear of it. Two causes fell out, and
+// neither one is a tuning value:
+//
+//   CAUSE 1 — THE PLAYER'S OWN INPUT PULLS THEM BACK ONTO THE WALL, AND IT IS NOT CLOSE.
+//     A player who just ran into a wall is still holding the stick into it — that is how they got
+//     there — so ApplySourceAirAcceleration spends its entire per-frame allowance cancelling the
+//     launch. Peak separation is v_out² / 2a, where a is AirAcceleration (8000 uu/s²) projected onto
+//     the wall normal and v_out is the launch's outward component. Put the shipped numbers in:
+//
+//       FIRST wall jump of a chain, off a 1100 uu/s ground run, head on:
+//         v_out = 1100 × 0.7695 + 420 = 1266 uu/s  ->  peak 100 uu. It escapes. This is the one
+//         every previous measurement looked at, and it is the one case that was never broken.
+//
+//       EVERY WALL JUMP TAKEN FROM THE AIR — i.e. the second and third of a chain, which is how
+//       players actually use the mechanic:
+//         AirMaxWishSpeed is 160, and it is a hard cap on speed along the wish direction. So a pawn
+//         returning to a wall under its own air control arrives at AT MOST 160 uu/s into the face.
+//         The reflection therefore contributes at most 160 × 0.7695 = 123 uu/s and
+//         WallJumpOutwardImpulse (420, flat) is essentially the whole launch:
+//         v_out ≈ 543 uu/s  ->  peak 543² / 16000 = 18 uu. AGAINST A 34 uu CAPSULE RADIUS.
+//         The pawn never gets half a capsule off the face before it is being driven back into it.
+//
+//     That is the stick. It is invisible to any amount of window tuning because it happens entirely
+//     AFTER the launch, and invisible to a head-on-only harness because the head-on first jump is
+//     the case that works.
+//     THE FIX: for GetWallJumpControlLockoutSeconds() after a launch, the air-strafe wish direction
+//     has its INTO-THE-LAUNCHED-FACE component projected out. Tangential and outward input are
+//     untouched and accelerate at full strength, so the Source strafe survives intact — the player
+//     may steer the launch anywhere except back into the wall they just left.
+//
+//   CAUSE 2 — A PRESS MADE ONE TICK EARLY IS SILENTLY EATEN.
+//     ACharacter::JumpMaxHoldTime is 0, so bPressedJump survives exactly one tick. CheckJumpInput
+//     runs at the START of PerformMovement; HandleImpact — the only thing that opens a wall window —
+//     runs DURING the physics step after it. A press on the tick before contact is therefore handed
+//     to a DoJump that correctly refuses it, and is then discarded. The player pressed jump "right as
+//     they hit the wall", got nothing, and is left scraping down the face until they press again. v9
+//     made this MORE likely, not less: a 0.15 s window means pressing early is now the easy mistake.
+//     THE FIX: a refused mid-air press is remembered for GetWallJumpInputBufferSeconds() and consumed
+//     by OnMovementUpdated the instant a window opens — which is the contact frame itself, one whole
+//     frame earlier than CheckJumpInput could ever deliver it.
+//
+// BOTH ARE PREDICTED. WallJumpLaunchNormal, WallJumpControlLockoutRemaining and
+// WallJumpInputBufferRemaining are saved-move state, round-tripped through Clear / SetMoveFor /
+// PrepMoveFor and refused by CanCombineWith, exactly like the window they extend. The lockout changes
+// the velocity a replayed frame produces and the buffer changes whether a launch happens at all, so
+// either one left out of the saved move would be a several-hundred-uu/s rubber-band on the most
+// visible frame of the move.
+//
+// AND THE 10% the spec also asks for is applied to the RETENTION (WallJumpMomentumScaleV10), not to
+// the outward impulse. The impulse is the pawn's escape velocity from the face, and cause 1 above is
+// the finding that it was already too weak to do that job — cutting it would have made the very
+// symptom the same sentence complains about measurably worse.
+//
+// --- AS MEASURED. READ THIS BEFORE BELIEVING ANY OF THE ABOVE. ----------------------------------
+//
+// THE TWO CAUSES ABOVE ARE A DERIVATION, NOT A RESULT, AND THE PAIRED RUN DID NOT CONFIRM THEM.
+// The first paired run was invalid: the harness pressed once per AIRBORNE APPROACH, so it never
+// chained, and maxConsecutive was 1/2 in both arms — every sample was the first jump off a ground
+// run, which CAUSE 1 itself names as the case that was never broken. That is fixed (see
+// WallJumpTestLastChainCount) and the re-run is matched and chained, 9 head-on + 4 chained samples
+// per arm, maxConsecutive 2/2 in both. Result, RED (v9 behaviour) -> GREEN (this fix):
+//
+//     HEAD-ON   63.6 -> 65.1 ms      GLANCING  75.7 -> 71.4 ms      CHAINED  54.0 -> 56.3 ms
+//
+// Mixed sign, 2-4 ms on samples of 2 to 9, and neverCleared was 0 of every sample in BOTH arms —
+// the pawn always got off the wall, in both builds, in under 80 ms. THE FIX DOES NOT MOVE THE
+// NUMBER. Do not repeat the v9 mistake of reading the paragraphs above as a confirmed fix.
+//
+// TWO THINGS ARE STILL UNTESTED, AND ONE OF THEM IS HALF THE DIAGNOSIS:
+//   * The EARLY press fired ZERO times in both arms of the re-run ("presses early= 0" on every
+//     line), because approach parity stops alternating once the pawn stays airborne and chains. So
+//     the input buffer — the whole of CAUSE 2 — was never exercised. It is written, predicted and
+//     unmeasured. Make the press rule alternate per PRESS rather than per approach before claiming
+//     anything about it.
+//   * peakOut is censored by construction: a sample CLOSES at WallStickClearUU (50 uu), so the
+//     column can never show the 18 uu that CAUSE 1 predicts for the air-initiated case. It reads
+//     ~54-58 uu in every cell of both arms because that is where the meter stops looking. To test
+//     the derivation, raise the clear threshold or record peak separation on a sample that is
+//     allowed to run past it.
+//
+// What IS confirmed by the run: the -10% retention landed (0.8550 -> 0.7695 in the live MOVECFG-V10
+// dump), the lockout and buffer are live in the green arm (0.20 s / 0.12 s), and the change costs
+// nothing in prediction — corrections in wall jump = 0.000 per jump on both arms.
+//
+// --- SPEC v10 §6: NO SHOOTING DURING A DASH -----------------------------------------------------
+//
+// AreWeaponActionsBlocked() is a thin alias of IsDashing() and deliberately nothing more: the spec's
+// "as soon as they end the dash, let them shoot again" forbids any cooldown, so the gate has to be a
+// pure function of DashTimeRemaining, which OnMovementUpdated drives to 0 on the frame the window
+// closes. See the accessor for where the answer is valid and where it is not.
+//
+// --- SPEC v10 §1: THE KNIFE'S MOVEMENT PROFILE --------------------------------------------------
+//
+// "Players should move 30% faster with a knife, as well as have a higher momentum ceiling."
+//
+// One bit, bKnifeMovementProfile, set from the melee slice through SetKnifeMovementProfileActive()
+// and read in four places: GetMaxSpeed() (ground speed × 1.30) and the three air ceilings
+// (GetAirStrafeSoftCapSpeed, GetAirStrafeHardCapSpeed and — necessarily — GetMaxAirSpeed, because
+// ApplySourceAirAcceleration takes the tighter of the last two and a raised hard cap under an
+// unraised MaxAirSpeed would be inert). All four are MULTIPLIERS over the base values, so the knife
+// stays 30% faster than whatever the gun is retuned to.
+//
+// The bit is saved-move state. It is SET from outside the move pipeline, like the carrier bit, and
+// carries the same bounded one-RTT seam documented for that — but restoring it per move is what stops
+// a correction from replaying an entire pre-swap move at post-swap speed.
+//
 // --- WHY CHARGES AND NOT A SECOND TIMER -------------------------------------------------------
 //
 // The Core carrier gets an extra dash. Modelling that as "a second cooldown that only carriers
@@ -535,6 +650,16 @@ public:
 	void LogWallJumpReport() const;
 
 	/**
+	 * SPEC v10 §5 — THE STICK METER, printed. See the STICK METER block in the private section below
+	 * for what is being measured and why the v9 numbers could not have shown it.
+	 *
+	 * Public for the same reason LogWallJumpReport() is: Trace.WallJumpReport is a free function and
+	 * calls both. Two reports rather than one because they answer different questions — that one is
+	 * about what the LAUNCH did, this one is about how long the PLAYER was stuck.
+	 */
+	void LogWallStickReport() const;
+
+	/**
 	 * SPEC v9 §§5-8 — every tuned number and every KNOCK-ON of the gravity change, in one block.
 	 *
 	 * §8 says gravity "touches everything: jump height, air time, the mantle, the wall jump, the
@@ -673,6 +798,51 @@ public:
 
 	/** True for the DashDuration window. Read by the trail trip test — the whole game hangs on it. */
 	bool IsDashing() const;
+
+	/**
+	 * SPEC v10 §6 — "Don't let players shoot while in a dash animation. As soon as they end the dash,
+	 * let them shoot again." THE GATE THE WEAPON SLICE CALLS. Also gates the knife swing (§6's
+	 * [ASSUMPTION], which the spec states outright).
+	 *
+	 * This is deliberately a THIN alias of IsDashing() and nothing more, because the spec's second
+	 * sentence is the whole requirement: there is no cooldown, no grace, no "recovery" — the gate is a
+	 * pure function of DashTimeRemaining, which OnMovementUpdated drives to exactly 0 on the frame the
+	 * dash window closes. The frame IsDashing() goes false, the very next fire press is allowed.
+	 *
+	 * WHERE IT IS VALID. DashTimeRemaining is saved-move state, so it is correct on the owning client
+	 * (predicted, and replayed identically after a correction) and on the SERVER for every pawn it
+	 * simulates — an autonomous proxy's dash clock is advanced by MoveAutonomous -> OnMovementUpdated,
+	 * a bot's by its own PerformMovement. Both ends of the "client predicts the shot, server validates
+	 * it" pattern therefore read the same answer, which is what a fire gate needs.
+	 *
+	 * It is NOT valid on a SIMULATED proxy (another player's pawn, as seen on your machine): nothing
+	 * replicates DashTimeRemaining, so a simulated proxy reads false forever. Do not use this to
+	 * decide whether somebody ELSE may shoot — the shooter's own client and the server both have the
+	 * truth, and that is where the gate belongs.
+	 */
+	bool AreWeaponActionsBlocked() const { return IsDashing(); }
+
+	// --- SPEC v10 §1: THE KNIFE'S MOVEMENT PROFILE -------------------------------------------------
+
+	/**
+	 * SPEC v10 §1 — "Players should move 30% faster with a knife, as well as have a higher momentum
+	 * ceiling." THE ENTRY POINT FOR THE MELEE SLICE. Call it from the equip/swap code with true when
+	 * the knife becomes the active weapon and false when it stops being one.
+	 *
+	 * CALL IT ON BOTH ENDS: on the server (from the authoritative equip) and on the owning client
+	 * (from its predicted equip). The bit is round-tripped through FSavedMove_Trace so a correction
+	 * replays every move under the profile that move actually ran with — but the bit is SET from
+	 * outside the move pipeline, so if only one end is told, that end simulates a different pawn and
+	 * the correction path pays for it on every step. This is the same seam GetMaxSpeed()'s carrier
+	 * multiplier already has and it is documented in exactly the same terms: bounded, self-correcting,
+	 * and only as wide as the time it takes the equip to reach both machines.
+	 *
+	 * Idempotent, and cheap enough to call every frame if that is easier than tracking the edge.
+	 */
+	void SetKnifeMovementProfileActive(bool bActive);
+
+	/** True while the knife movement profile (speed multiplier + raised air-strafe caps) is applied. */
+	bool IsKnifeMovementProfileActive() const { return bKnifeMovementProfile != 0; }
 
 	/**
 	 * SECONDS UNTIL THE POOL GAINS ITS NEXT CHARGE. 0 only when the pool is FULL.
@@ -1130,6 +1300,76 @@ protected:
 	/** Largest |Normal.Z| still counted as a wall. Above it the surface is a ramp, not a face. */
 	float GetWallJumpMaxNormalZ() const;
 
+	// --- SPEC v10 §5, THE TWO NEW WALL-JUMP KNOBS -------------------------------------------------
+	//
+	// See the "WHY THE WALL JUMP STILL FELT STICKY" block at the top of the .cpp for the measurement
+	// these two came out of. Neither is a re-shave of the v9 numbers; they fix two different, measured
+	// causes that the v9 window cut could not have touched.
+
+	/**
+	 * SPEC v10 §5 (CAUSE 1). Seconds after a wall jump during which air-strafe input may NOT push back
+	 * into the face the pawn just launched off.
+	 *
+	 * THE MEASUREMENT THIS EXISTS FOR: a player who ran into a wall is, by definition, still holding
+	 * the stick INTO it, so ApplySourceAirAcceleration (8000 uu/s²) spends its whole allowance
+	 * cancelling the launch. Peak separation is v_out²/2a, and because AirMaxWishSpeed caps return
+	 * speed at 160 uu/s, every wall jump taken FROM THE AIR launches at only ~543 uu/s outward and
+	 * peaks at 18 uu — against a 34 uu capsule radius. The pawn never gets half a capsule off the
+	 * face, which is precisely "sticking to the wall for a moment too long". See the header for the
+	 * full derivation and for why the first jump of a chain hid this from every previous measurement.
+	 *
+	 * IT IS NOT AN AIR-CONTROL LOCKOUT. Only the component of the wish direction pointing INTO the
+	 * launched-off face is removed; everything tangential and everything outward still accelerates at
+	 * full strength, so the player keeps the whole Source air-strafe during the window and can still
+	 * carve the launch anywhere except back into the wall. Removing air control outright would trade
+	 * one bad feeling for another.
+	 *
+	 * Round-tripped through the saved move with WallJumpLaunchNormal — it changes the velocity a
+	 * replayed move produces, so it has to be, or it would rubber-band.
+	 */
+	float GetWallJumpControlLockoutSeconds() const;
+
+	/**
+	 * SPEC v10 §5 (CAUSE 2). Seconds a mid-air jump press that found no wall is remembered for.
+	 *
+	 * THE BUG IT FIXES: ACharacter::JumpMaxHoldTime is 0, so bPressedJump lives for exactly one tick,
+	 * and CheckJumpInput runs at the START of PerformMovement while HandleImpact — the only thing that
+	 * opens a wall window — runs DURING the physics step that follows it. A press made on the tick
+	 * BEFORE contact is therefore consumed by a DoJump that correctly refuses it, and is then gone.
+	 * The player pressed jump "right as they hit the wall", nothing happened, and they are left
+	 * scraping down the face waiting to press again — with v9's 0.15 s window, missing early is now
+	 * the easiest way to miss. Buffering the press converts that dead frame into a wall jump on the
+	 * contact frame itself, which is also one whole frame earlier than the CheckJumpInput path could
+	 * ever deliver.
+	 *
+	 * Consumed in OnMovementUpdated, after the window has been ticked and therefore after HandleImpact
+	 * has had its say for this frame. Saved-move state, like every other clock here.
+	 */
+	float GetWallJumpInputBufferSeconds() const;
+
+	// --- SPEC v10 §1, THE KNIFE MOVEMENT PROFILE KNOBS --------------------------------------------
+	//
+	// All three are multipliers over the BASE values rather than absolute speeds, which is what
+	// "tunable separately from the base values" buys: retuning WalkSpeed or the asymptote moves the
+	// knife with it and the knife stays exactly 30% faster than whatever the gun is.
+
+	/** SPEC v10 §1. Ground speed multiplier while the knife is out. 1.30 = the spec's "30% faster". */
+	float GetKnifeMoveSpeedMultiplier() const;
+
+	/** SPEC v10 §1. Multiplier on AirStrafeSoftCapSpeed while the knife is out. */
+	float GetKnifeAirStrafeSoftCapMultiplier() const;
+
+	/**
+	 * SPEC v10 §1. Multiplier on AirStrafeHardCapSpeed — and on MaxAirSpeed — while the knife is out.
+	 *
+	 * MaxAirSpeed IS SCALED BY THIS TOO, and it has to be. ApplySourceAirAcceleration takes the
+	 * TIGHTER of the two ceilings (min(MaxAirSpeed, HardCap)), so with MaxAirSpeed left at 1600 a hard
+	 * cap raised past it would be silently inert and the knob would do nothing at all — the exact
+	 * "misnamed knob silently does nothing" failure this project keeps paying for, in a different
+	 * costume. Scaling both keeps the hard cap the binding limit at every setting.
+	 */
+	float GetKnifeAirStrafeHardCapMultiplier() const;
+
 	bool  IsLandingMomentumPreserved() const;
 	float GetGroundOverspeedFriction() const;
 	float GetGroundOverspeedBraking() const;
@@ -1376,6 +1616,40 @@ protected:
 	 */
 	int32 WallJumpsSinceGround;
 
+	// --- SPEC v10 §5 state (saved/restored by FSavedMove_Trace, like everything above) -------------
+
+	/**
+	 * The outward normal of the face the LAST wall jump launched off, held for
+	 * WallJumpControlLockoutRemaining and zero otherwise.
+	 *
+	 * Distinct from WallJumpNormal on purpose: that one is the face a jump COULD launch off and is
+	 * cleared the instant the launch happens, so it is gone exactly when this is needed.
+	 */
+	FVector WallJumpLaunchNormal;
+
+	/** Seconds left in which air input may not push back into WallJumpLaunchNormal's face. */
+	float WallJumpControlLockoutRemaining;
+
+	/**
+	 * Seconds left on a remembered mid-air jump press that found no wall. Charged by DoJump's refusal
+	 * path, consumed by OnMovementUpdated the moment a window opens. See
+	 * GetWallJumpInputBufferSeconds() for the frame-ordering bug it exists to close.
+	 */
+	float WallJumpInputBufferRemaining;
+
+	// --- SPEC v10 §1 state ------------------------------------------------------------------------
+
+	/**
+	 * "The knife is the active weapon", as far as MOVEMENT is concerned. Written only by
+	 * SetKnifeMovementProfileActive(); read by GetMaxSpeed() and the three air-strafe ceiling
+	 * accessors.
+	 *
+	 * Saved-move state so a replayed move runs under the profile it originally ran under, and refused
+	 * by CanCombineWith across a change so two moves either side of a swap are never merged into one
+	 * move simulated entirely at the wrong speed.
+	 */
+	uint8 bKnifeMovementProfile : 1;
+
 	/** See GetLastDashActiveWorldTime(). Server observation only; never saved or replicated. */
 	float LastDashActiveWorldTime = -1000.f;
 
@@ -1554,6 +1828,154 @@ protected:
 	float WallJumpTestTime = -1.f;
 	float WallJumpTestYaw = 0.f;
 	uint8 bWallJumpTestReported = 0;
+
+	/**
+	 * SPEC v10 §5 — the harness clock for BACKING OFF AND TAKING ANOTHER RUN AT THE WALL.
+	 *
+	 * THE v8 HARNESS SEIZED UP AND NOBODY NOTICED. It held the movement key into the wall forever, so
+	 * the moment the pawn landed with its nose against the face its planar speed was ~0 — and the
+	 * "grounded, get airborne" branch requires >300 uu/s before it will press jump. The pawn stood
+	 * there for the rest of the run. Measured: THREE wall jumps in 22 seconds, and then nothing.
+	 * Every wall-jump number this project has ever reported was a mean over a handful of samples
+	 * taken in the first few seconds of the run, which is worth knowing about the v8/v9 reports too.
+	 *
+	 * While this clock is ahead of WallJumpTestTime the harness pushes AWAY from the wall (aim stays
+	 * on the wall, only the movement input reverses — a player strafing back for another go) and
+	 * refuses the ordinary get-airborne jump, so the pawn always arrives at the face with a run-up.
+	 */
+	float WallJumpTestRunUpUntil = -1.f;
+
+	/**
+	 * SPEC v10 §5 — HOW THE HARNESS PRESSES JUMP, AND WHY THE OLD RULE COULD NOT SEE THE BUG.
+	 *
+	 * The v8 harness pressed jump ONLY when IsWallJumpAvailable() already said yes. That is a test
+	 * that the mechanic fires when it is asked at the perfect moment — it is structurally incapable of
+	 * reproducing "I pressed jump right as I hit the wall and nothing happened", because it never
+	 * presses at any moment except the perfect one. Measured on this build with the old rule: RED and
+	 * GREEN were indistinguishable at ~48 ms, which is what a harness says when it is not testing the
+	 * complaint.
+	 *
+	 * So approaches now ALTERNATE:
+	 *   EVEN  — press EARLY, aimed WallJumpTestPressLeadSeconds ahead of contact by a line trace along
+	 *           the approach. This is the human press, and in the RED arm it is eaten by frame
+	 *           ordering (CheckJumpInput runs before the physics step that touches the wall).
+	 *   ODD   — press on IsWallJumpAvailable(), i.e. the old rule, kept so the launch-and-escape half
+	 *           of the measurement still has samples in both arms.
+	 *
+	 * One press per approach (the latch), because a human presses once and then wonders why nothing
+	 * happened — a harness that mashes would paper over exactly the bug being measured.
+	 *
+	 * ...EXCEPT AFTER A SUCCESSFUL LAUNCH, AND THAT EXCEPTION IS THE WHOLE MEASUREMENT.
+	 * An "approach" runs from leaving the ground to landing, so with a bare latch the pawn pressed
+	 * once, wall-jumped, and then coasted the rest of the flight without ever pressing again. Every
+	 * sample was therefore the FIRST jump of a chain, off a full-speed ground run — which the CAUSE 1
+	 * derivation at the top of this header identifies as the ONE CASE THAT WAS NEVER BROKEN. The first
+	 * paired run proved it from the other side: maxConsecutive=1/2 in BOTH arms, and peakOut ~55 uu
+	 * against the ~18 uu the air-initiated case predicts. The harness was measuring the healthy case
+	 * and reporting it as the mechanic.
+	 *
+	 * So WallJumpTestLastChainCount watches WallJumpsSinceGround and re-arms the latch the moment it
+	 * INCREASES — i.e. only on a launch that actually happened. A refused press still consumes the
+	 * approach, so the eaten-press columns keep measuring exactly what they measured before, while the
+	 * pawn now chains up to WallJumpMaxConsecutive and the second jump — the one taken from the air at
+	 * AirMaxWishSpeed, with nothing left to reflect — finally appears in the sample.
+	 */
+	int32 WallJumpTestApproach = 0;
+	uint8 bWallJumpTestPressLatched = 0;
+	uint8 bWallJumpTestWasAirborne = 0;
+
+	/** Last WallJumpsSinceGround the harness saw, so a launch (and only a launch) re-arms the latch. */
+	int32 WallJumpTestLastChainCount = 0;
+
+	/** Presses the harness actually made, split by rule, so "the early press never fired" is visible. */
+	int32 WallStickEarlyPresses[2] = { 0, 0 };
+	int32 WallStickOnTimePresses[2] = { 0, 0 };
+
+	// =============================================================================================
+	// SPEC v10 §5 — THE STICK METER. THE NUMBER THE COMPLAINT IS ABOUT.
+	//
+	// "Wall jumping still feels like the player is sticking to the wall for a moment too long" is a
+	// claim about TIME, and v9 answered it by shortening a config value and reporting that the config
+	// value was shorter. That is not a measurement of the symptom. This is:
+	//
+	//   the milliseconds between the frame the capsule first TOUCHES a wall and the frame the pawn
+	//   has actually moved WallStickClearUU away from that face, measured along the face's normal.
+	//
+	// Everything the player calls "sticky" is inside that interval — the wait for the window, the
+	// press that got eaten, the launch, and the launch being clawed straight back by held input. It
+	// makes no assumption about WHICH of those dominates, which is the point: it is the number the
+	// fix has to move, whatever the fix turns out to be.
+	//
+	// The first contact of a bout anchors the sample; re-contacts while the sample is open do not
+	// re-anchor it, because a player scraping down a face is having ONE sticky experience, not thirty.
+	// A sample is closed by clearing the face, by landing, or by WallStickTimeoutSeconds.
+	//
+	// Dev-only, never saved, never read by the simulation.
+	// =============================================================================================
+
+	/** Open sample: world time of first contact, the capsule position then, and the face's normal. */
+	float WallStickContactTime = -1.f;
+	FVector WallStickAnchor = FVector::ZeroVector;
+	FVector WallStickNormal = FVector::ZeroVector;
+
+	/** World time the launch actually fired inside the open sample, or -1 if it has not (yet). */
+	float WallStickLaunchTime = -1.f;
+
+	/** Furthest the pawn has been from the face, along its normal, during the open sample. */
+	float WallStickPeakOutUU = 0.f;
+
+	/** Which harness phase the open sample belongs to: 0 = head-on approach, 1 = glancing. */
+	int32 WallStickPhase = 0;
+
+	/**
+	 * Per-phase aggregates. Index 0 = head-on, 1 = glancing. The glancing column is the one that
+	 * matters: a head-on approach reflects a big outward velocity and escapes on its own, while a
+	 * glancing one has almost nothing to reflect and the flat outward impulse IS the whole launch —
+	 * so it is the case the held input can actually beat.
+	 */
+	int32 WallStickSamples[2] = { 0, 0 };
+	float WallStickClearMsSum[2] = { 0.f, 0.f };
+	float WallStickClearMsWorst[2] = { 0.f, 0.f };
+	float WallStickPressMsSum[2] = { 0.f, 0.f };
+	float WallStickPeakOutSum[2] = { 0.f, 0.f };
+	int32 WallStickNeverCleared[2] = { 0, 0 };
+
+	/**
+	 * Contacts that never produced a launch at all, counted but kept OUT of the aggregates above.
+	 *
+	 * The complaint is "WALL JUMPING feels sticky", so the mean has to be over contacts that were
+	 * actually wall-jumped. Brushing a wall while running past it, or touching one after the
+	 * anti-ladder cap has spent both jumps, is a contact the player never asked anything of — folding
+	 * those into the mean would bury the signal under the arena's geometry. They are reported on their
+	 * own line instead, because a fix that made them MORE common would be worth knowing about.
+	 */
+	int32 WallStickNoLaunch[2] = { 0, 0 };
+
+	/**
+	 * THE CHAINED CUT, AND IT IS THE ONE THE COMPLAINT LIVES IN — see CAUSE 1 at the top of this
+	 * header. A sample is CHAINED if the pawn had already wall-jumped since it last touched the
+	 * ground, i.e. it arrived at this wall under air control alone. AirMaxWishSpeed caps that arrival
+	 * at 160 uu/s, so the reflection contributes ~123 uu/s and the flat WallJumpOutwardImpulse is
+	 * essentially the entire launch — the 18 uu peak against a 34 uu capsule that the derivation
+	 * predicts. The FIRST jump of a chain arrives off a full-speed ground run and escapes on its own.
+	 *
+	 * Kept as one bucket across both phases rather than another [2]: the split that matters here is
+	 * first-vs-chained, and per-phase chained samples would be too thin to mean anything in a run this
+	 * length. The per-phase arrays above still count these samples too — this is a cross-cut of the
+	 * same population, not a separate one, so the two sets of numbers are not additive.
+	 */
+	uint8 bWallStickSampleChained = 0;
+	int32 WallStickChainedSamples = 0;
+	int32 WallStickChainedNoLaunch = 0;
+	float WallStickChainedClearMsSum = 0.f;
+	float WallStickChainedClearMsWorst = 0.f;
+	float WallStickChainedPeakOutSum = 0.f;
+	int32 WallStickChainedNeverCleared = 0;
+
+	/** Opens / advances / closes the sample. Called from HandleImpact and OnMovementUpdated. */
+	void BeginWallStickSample(const FVector& PlanarNormal);
+	void TickWallStickSample();
+	void CloseWallStickSample(bool bCleared);
 
 	// --- SPEC v8 §5: THE CARRIER'S TWO CHARGES, EXERCISED (-TraceCarrierChargeTest) ---------------
 	//
@@ -1776,6 +2198,28 @@ public:
 
 	/** The approach velocity the open window was charged with. See WallJumpEntryVelocity. */
 	FVector SavedWallJumpEntryVelocity;
+
+	/**
+	 * SPEC v10 §5. The post-launch into-wall input lockout and the buffered press.
+	 *
+	 * BOTH ARE LOAD-BEARING FOR PREDICTION, and for the same reason the rest of this block is. The
+	 * lockout changes the VELOCITY a replayed air-strafe frame produces (it removes the into-wall
+	 * component of the wish direction), so a replay that lost it would accelerate the pawn straight
+	 * back at a wall the server never pushed it toward. The buffer decides whether a wall jump happens
+	 * AT ALL on the contact frame, which is the largest single-frame disagreement the kit can have.
+	 */
+	FVector SavedWallJumpLaunchNormal;
+	float SavedWallJumpControlLockoutRemaining;
+	float SavedWallJumpInputBufferRemaining;
+
+	/**
+	 * SPEC v10 §1. The knife movement profile as it stood before this move ran.
+	 *
+	 * Restored by PrepMoveFor so a replayed move uses the ceilings and the ground speed that move
+	 * originally ran under, and tested by CanCombineWith so two moves either side of a weapon swap are
+	 * never merged into one move simulated entirely at the wrong speed.
+	 */
+	uint8 bSavedKnifeMovementProfile : 1;
 };
 
 /** Client prediction data whose only job is to hand out FSavedMove_Trace instances. */

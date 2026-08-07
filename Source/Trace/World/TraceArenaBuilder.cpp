@@ -478,8 +478,104 @@ namespace TraceArenaConstants
 	 * It is also what caps the slope: riser / tread = 37 / 24, i.e. the curve blends until it is
 	 * about 57 degrees and the wall goes vertical from there. A stepped fillet cannot be tangent to
 	 * the wall and still have treads.
+	 *
+	 * SPEC v10 SECTION 9 DEMOTED THIS TO A DERIVATION. It is no longer passed to the profile
+	 * generator, because an ABSOLUTE minimum tread is only the right rule while there is exactly one
+	 * riser height in the arena. v10 builds the cove at TWO resolutions (see CoveCollisionRiser and
+	 * CoveVisualRiser), and a 24 uu floor applied to a 5 uu riser would have truncated the visual
+	 * curve at a 12-degree slope - i.e. deleted the entire cove. What the mantle actually constrains
+	 * is the SLOPE (rise per unit run over the probe's 17 uu reach), and slope is what FilletMaxSlope
+	 * below now carries. This constant survives as the number that DEFINES that slope at the
+	 * historical riser, so the shipped envelope is provably unchanged.
 	 */
 	static constexpr float FilletMinTread = 24.f;
+
+	/**
+	 * Steepest a cove is ever allowed to get, as rise / run. SPEC v10 SECTION 9.
+	 *
+	 * StepRise / FilletMinTread = 40 / 24 = 1.667, i.e. exactly the slope the v9 pair implied, which
+	 * is the point: expressing the stop rule as a slope rather than as a tread makes it INDEPENDENT
+	 * of how finely the curve is sampled, so the same envelope comes out at a 40 uu riser and at a
+	 * 5 uu one. On the shipped geometry the inner-edge rule (FilletMinInner) stops both the bank and
+	 * the wall cove first - measured slope at truncation is 1.00 on the banks and 1.28 on the wall
+	 * fillets, both well under this - so this is a guard rail, not the active limit, and the v9
+	 * envelope is reproduced to the millimetre.
+	 *
+	 * The mantle safety argument, restated in slope terms because that is the form that generalises:
+	 * the top probe reaches 17 uu past the face it found, so the worst ledge it can report is
+	 * 17 * slope. At 1.667 that is 28 uu, against MantleMinHeightUU = 55. At the slope the shipped
+	 * cove actually truncates at (1.28) it is 22 uu. Either way no cove step can present itself as a
+	 * mantleable ledge, and that no longer depends on the riser.
+	 */
+	static constexpr float FilletMaxSlope = StepRise / FilletMinTread;
+
+	// --- Cove sampling: spec v10 section 9, "curved, not terraced" ---------------------------------
+	//
+	// v9 shipped ONE staircase doing two jobs at once - it was both the collision the pawn walks on
+	// and the surface the player looks at - so its riser had to satisfy the walkable ceiling
+	// (StepRise) and that is a 39 uu step you can plainly see. The user looked at it and said so.
+	//
+	// v10 splits the two jobs, because they have completely different cost functions:
+	//
+	//   COLLISION is a UBoxComponent per step and every one of those is a REGISTERED PRIMITIVE, the
+	//   budget spec v10 section 9 explicitly guards (365 today against a 349 pre-cove baseline). It
+	//   is also the thing every verified property of Demo 9 is about - walkable, no false mantle, no
+	//   bot traps - so it is the half that must not be disturbed casually.
+	//
+	//   VISUAL is an INSTANCE in a pooled ISM, which costs no registered primitive at all (see
+	//   AddInstancedBlock). Sampling the same curve eight times as finely is very nearly free.
+	//
+	// So the collision riser is halved (a strict improvement on every Demo 9 property: a smaller
+	// riser is more walkable and less mantleable, and the envelope is identical because the stop
+	// rules are unchanged) and the VISIBLE riser is dropped to 5 uu, which is 2.8% of a player's
+	// height and is not resolvable at any distance a player is ever at.
+	//
+	// WHAT THE SPLIT COSTS, stated up front because it is the honest downside: the pawn stands on
+	// the collision staircase, which circumscribes the ideal curve, while the eye sees the visual
+	// staircase, which also circumscribes it but eight times more tightly. The foot can therefore
+	// sit up to (CoveCollisionRiser - CoveVisualRiser) = 15 uu ABOVE the drawn surface and at most
+	// CoveVisualRiser = 5 uu below it. 15 uu is 8.5% of a player's height, it only reaches that
+	// maximum in the few uu either side of a collision riser, and it is always a hover rather than a
+	// sink (feet clipping INTO the ground reads as a bug; standing a shoe's thickness proud of a
+	// curve does not). Making it zero means giving collision the 5 uu riser too, which is 350-odd
+	// extra box components - the budget this section forbids.
+	static constexpr float CoveCollisionRiser = StepRise * 0.5f;
+
+	/** Riser of the DRAWN cove. Instanced, so the only cost is instances; see the block above. */
+	static constexpr float CoveVisualRiser = 5.f;
+
+	/**
+	 * Vertical spacing of the glowing contour lines on a cove.
+	 *
+	 * v9 put one on EVERY terrace, which was correct when there were seven of them and wrong the
+	 * moment the shape became smooth: 55 evenly spaced glowing lines up a curve IS a terraced look,
+	 * whatever the geometry underneath is doing. At 110 uu a bank carries three and a wall fillet
+	 * two, which reads as deliberate striping on a curved surface rather than as edges of steps -
+	 * and the banks still get the "which half am I on" team-colour read the v9 comment was defending.
+	 */
+	static constexpr float CoveContourSpacing = 110.f;
+
+	/**
+	 * A cove contour is INLAID, not a lip.
+	 *
+	 * AddNeonBlock's lip protrudes LipOut = 12 uu and stands LipHeight = 18 uu tall, which is a
+	 * ledge - fine on a 39 uu terrace whose job is to look like a terrace, and self-defeating on a
+	 * surface that is trying not to. 1.5 uu of protrusion is enough to beat z-fighting and nothing
+	 * like enough to read as a step.
+	 */
+	static constexpr float CoveContourOut = 1.5f;
+	static constexpr float CoveContourHeight = 6.f;
+
+	/**
+	 * How far a drawn cove shell reaches down past the top of the shell outside it.
+	 *
+	 * The visual cove is built from thin nested SHELLS - each one covers only its own riser band and
+	 * its own tread - rather than from solid boxes rising out of the floor the way the collision
+	 * staircase does. With 55 of them per bank, solid boxes would mean 55 nested 1500 x 16000 uu
+	 * slabs of overdraw and 55 full-size shadow casters for a shape 350 uu tall. The overlap exists
+	 * so floating point can never open a hairline crack between two shells.
+	 */
+	static constexpr float CoveShellOverlap = 1.f;
 
 	/**
 	 * The cove stops when its inner edge gets this close to the wall face.
@@ -978,18 +1074,29 @@ namespace TraceArenaConstants
 //                            walkable by construction - and 40 is also below MantleMinHeightUU (55),
 //                            so no single riser can ever present itself as a climbable ledge.
 //
-//   TREAD >= MinTread        The mantle's top probe lands CapsuleRadius * 0.5 = 17 uu past the face
-//                            it found. A narrower tread lets it skip a step and report a two-riser
-//                            ledge INSIDE the mantle window. See FilletMinTread.
+//   SLOPE <= MaxSlope        The mantle's top probe lands CapsuleRadius * 0.5 = 17 uu past the face
+//                            it found, so the tallest ledge it can ever report is 17 * slope. v9
+//                            expressed this as an absolute minimum TREAD, which is the same rule
+//                            only while the arena has exactly one riser height; spec v10 section 9
+//                            samples this curve at two different risers, so it is stated as the
+//                            slope it always was. See FilletMaxSlope for the numbers.
 //
 //   INNER EDGE >= MinInner   A cove is vertical at the top, so the last few steps of an untruncated
 //                            one are slivers against the wall - inside the pawn standoff shell, i.e.
 //                            walkable surfaces no body can reach. Stop before that.
 //
-// The last two are what truncate the curve short of tangency: the steepest a staircase of R uu risers
-// can be while keeping a T uu tread is atan(R / T), about 57 degrees at 37 / 24. The wall goes
-// vertical from there. That is inherent to building a fillet out of boxes and it is why this is a
-// blend rather than a true tangent join.
+// The last two are what truncate the curve short of tangency: the cove blends up to at most
+// atan(MaxSlope) = 59 degrees, and on the shipped geometry the inner-edge rule bites first, at 45
+// degrees on the banks and 52 on the wall fillets. The wall goes vertical from there. That is
+// inherent to filling a concave corner with axis-aligned solids and it is why this is a blend rather
+// than a true tangent join.
+//
+// SPEC v10 SECTION 9 - WHY THIS FUNCTION IS NOW CALLED TWICE PER RUN. The staircase above is a fine
+// COLLIDER and a poor SURFACE, and v9 shipped one staircase doing both jobs, so the riser had to be
+// walkable (<= StepRise) and the result was a visible 39 uu terrace. Callers now build the same
+// curve twice - once at CoveCollisionRiser for the box colliders, once at CoveVisualRiser for the
+// drawn shells - which is only sound because every stop rule above is now scale-free, so the two
+// profiles describe the SAME envelope at two resolutions rather than two different shapes.
 // -------------------------------------------------------------------------------------------------
 namespace
 {
@@ -1005,12 +1112,12 @@ namespace
 	 * first. Empty if the cove is degenerate. Never returns a step that breaks any of the three rules
 	 * above, so a caller can build every step it is handed without re-checking anything.
 	 */
-	void TraceBuildCoveProfile(float Depth, float Height, float MaxRiser, float MinInner, float MinTread,
+	void TraceBuildCoveProfile(float Depth, float Height, float MaxRiser, float MinInner, float MaxSlope,
 		TArray<FTraceCoveStep>& OutSteps)
 	{
 		OutSteps.Reset();
 
-		if (Depth <= 1.f || Height <= 1.f || MaxRiser <= 1.f)
+		if (Depth <= 1.f || Height <= 1.f || MaxRiser <= 1.f || MaxSlope <= 0.f)
 		{
 			return;
 		}
@@ -1018,8 +1125,19 @@ namespace
 		// CEIL, so the riser is always STRICTLY under the ceiling rather than equal to it - the same
 		// rule the corner banks have always used, and for the same reason: a riser that lands exactly
 		// on MaxStepHeight is one floating-point tie away from being an unclimbable wall.
-		const int32 StepCount = FMath::Clamp(FMath::CeilToInt(Height / MaxRiser), 1, 32);
+		//
+		// The 256 ceiling is a runaway guard, not a design limit. It used to be 32, which was one
+		// more than the shipped cove needed and eight times fewer than spec v10 section 9's DRAWN
+		// cove needs: at CoveVisualRiser the 352 uu banks want 71 samples. A clamp that silently
+		// coarsened the curve back to 11 uu risers would have looked exactly like the fix working.
+		const int32 StepCount = FMath::Clamp(FMath::CeilToInt(Height / MaxRiser), 1, 256);
 		const float Riser = Height / static_cast<float>(StepCount);
+
+		// The tread floor is DERIVED from the riser and the slope cap rather than given, so the shape
+		// this produces depends only on Depth/Height/MinInner/MaxSlope and not on how finely it is
+		// sampled. That is the whole reason spec v10 section 9 can draw the same cove at a 5 uu riser
+		// that it collides at a 20 uu one and have the two agree on where the curve stops.
+		const float MinTread = Riser / MaxSlope;
 
 		float PreviousDepth = 0.f;
 
@@ -1043,6 +1161,46 @@ namespace
 			Step.OuterDepth = StepDepth;
 
 			PreviousDepth = StepDepth;
+		}
+	}
+
+	/**
+	 * Marks which shells of a drawn cove carry a glowing contour line. SPEC v10 SECTION 9.
+	 *
+	 * Always the toe and always the crest - those two are the shape's silhouette against the floor
+	 * and against the wall, and they are the lines that were already there in v9 - plus whichever
+	 * shells the height sweeps past a Spacing boundary on. Spacing <= 0 marks every shell, which is
+	 * what the pre-v9 A/B arm wants.
+	 */
+	void TraceMarkCoveContours(const TArray<FTraceCoveStep>& Steps, float Spacing, TArray<bool>& OutMarks)
+	{
+		OutMarks.Init(false, Steps.Num());
+
+		if (Steps.Num() == 0)
+		{
+			return;
+		}
+
+		if (Spacing <= 0.f)
+		{
+			OutMarks.Init(true, Steps.Num());
+			return;
+		}
+
+		OutMarks[0] = true;
+		OutMarks[Steps.Num() - 1] = true;
+
+		float NextContourZ = Spacing;
+		for (int32 Index = 0; Index < Steps.Num(); ++Index)
+		{
+			if (Steps[Index].TopZ >= NextContourZ)
+			{
+				OutMarks[Index] = true;
+				// Advance past this shell rather than by one spacing, so a coarse profile whose
+				// risers exceed the spacing cannot mark every single step and quietly reinstate the
+				// per-terrace lip this constant exists to remove.
+				NextContourZ = Steps[Index].TopZ + Spacing;
+			}
 		}
 	}
 }
@@ -2066,6 +2224,27 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	// out at 274 uu with the crest tread 86 uu off the wall, against nine even ones topping out at
 	// 352 uu. The wall cove (BuildWallFillets) picks the shape up from there.
 	//
+	// SPEC v10 SECTION 9 - CURVED, NOT TERRACED. v9's answer to "curve the corners" was to lay the
+	// terraces on the ellipse, which fixed the PLAN of the shape and left its CROSS-SECTION a visible
+	// flight of 39 uu stairs. The user looked at it and asked again. So the bank is now built twice
+	// over the same envelope:
+	//
+	//   COLLISION - nested box components on the CoveCollisionRiser profile. Invisible. This is the
+	//   surface every Demo 9 property is a statement about, and halving the riser can only improve
+	//   all of them (more walkable, further below MantleMinHeightUU, same axis-aligned nested boxes
+	//   the bots already handle). The envelope is unchanged to the millimetre because both stop rules
+	//   are scale-free - see FilletMaxSlope.
+	//
+	//   VISUAL - thin nested shells on the CoveVisualRiser profile, one instance each in the pools
+	//   the bank body already used, so the registered-primitive budget does not move for them at all.
+	//   At 5 uu a riser is 2.8% of a player's height; there is no distance in this arena at which it
+	//   resolves as a step.
+	//
+	// The X taper is now a CONTINUOUS function of height (BankAlpha below) instead of a per-terrace
+	// index, which is what lets the two resolutions agree: a collision box and the shells that skin
+	// it are cut to the same X span at the same Z, so no invisible collider ever sticks out past the
+	// drawn surface along the field.
+	//
 	// WHY THE BANKS STOP AT THE GOAL LINE. The endzones stay flat and full width. The goal line
 	// decal, the endzone floor patch, the gate towers, the spawn fan and the endzone respawn pads
 	// all assume a floor at Z = 0 out there, and a scoring volume you have to climb into is a rule
@@ -2088,29 +2267,34 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	const int32 TerraceCount = FMath::Clamp(FMath::CeilToInt(Height / TraceArenaConstants::StepRise), 1, 24);
 	const float Riser = Height / static_cast<float>(TerraceCount);
 
-	// The cove, spec v9 section 10. Depth/height/riser are exactly the bank's own, so the terrace
-	// TOPS are unchanged (step k still tops out at Riser * (k + 1)); only how far in from the
-	// sideline each one reaches has moved off a straight line and onto the ellipse.
-	TArray<FTraceCoveStep> Terraces;
+	// The cove, spec v9 section 10, sampled twice for spec v10 section 9 - COLLISION coarse enough
+	// that the box-component count does not move, VISUAL fine enough that no riser is perceptible.
+	// Same generator, same envelope, two resolutions; see TraceBuildCoveProfile.
+	TArray<FTraceCoveStep> Terraces;        // colliders
+	TArray<FTraceCoveStep> Skin;            // drawn shells
 	if (bBuildingSquareCorners)
 	{
 		// THE BEFORE ARM. Evenly spaced terraces, i.e. a straight ramp - byte for byte the geometry
 		// this function built before spec v9 §10, so Trace.Arena.CrossSection can measure the square
-		// join this pass is meant to remove and show it failing first.
+		// join this pass is meant to remove and show it failing first. The v10 split is deliberately
+		// NOT applied here: the before arm has to stay the thing it was, terracing and all.
 		for (int32 Index = 0; Index < TerraceCount; ++Index)
 		{
 			FTraceCoveStep& Terrace = Terraces.AddDefaulted_GetRef();
 			Terrace.TopZ = Riser * static_cast<float>(Index + 1);
 			Terrace.OuterDepth = Depth * (1.f - static_cast<float>(Index) / static_cast<float>(TerraceCount));
 		}
+		Skin = Terraces;
 	}
 	else
 	{
-		TraceBuildCoveProfile(Depth, Height, TraceArenaConstants::StepRise,
-			TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMinTread, Terraces);
+		TraceBuildCoveProfile(Depth, Height, TraceArenaConstants::CoveCollisionRiser,
+			TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMaxSlope, Terraces);
+		TraceBuildCoveProfile(Depth, Height, TraceArenaConstants::CoveVisualRiser,
+			TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMaxSlope, Skin);
 	}
 
-	if (Terraces.Num() == 0)
+	if (Terraces.Num() == 0 || Skin.Num() == 0)
 	{
 		return;
 	}
@@ -2122,18 +2306,43 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	const float Inboard = FMath::Max(0.f, GoalX * TraceArenaConstants::BankInboardTaperFrac);
 	const float Setback = FMath::Min(TraceArenaConstants::BankGoalSetback, FMath::Max(0.f, GoalX * 0.5f));
 
+	// THE X TAPER, AS A CONTINUOUS FUNCTION OF HEIGHT.
+	//
+	// v9 read it off the terrace INDEX (Alpha = k / TerraceCount), which was fine while there was one
+	// staircase and is unusable now that there are two at different resolutions - index 3 of the
+	// collision profile and index 3 of the skin are at completely different heights. Expressed
+	// against Z it is the same line through the same two points: at the lowest step it is 0 (the
+	// bank runs from the halfway line) and it reaches 1 at Z = Height. The v9 note about NOT
+	// re-spacing when the cove drops its top slivers is preserved automatically - the truncation
+	// changes which heights exist, not where a given height sits along the field.
+	const float SafeHeight = FMath::Max(1.f, Height);
+	auto BankAlpha = [SafeHeight](float Z)
+	{
+		return FMath::Clamp((Z - TraceArenaConstants::CoveVisualRiser) / SafeHeight, 0.f, 1.f);
+	};
+
 	// Emissive 0.012, the DAIS number, not the 0.026-0.030 the cover blocks carry - and for exactly
 	// the reason recorded on the dais: a terrace is a large UP-FACING surface, up-facing surfaces
 	// also catch the most key light, and the two terms stack. The palette comment one screen up
 	// records what that costs (platform tops blowing out to a flat pale sheet at ~200/255, judged
 	// from a screenshot of a platform top rather than of a wall), and the banks are by area the
 	// largest up-facing structure in the arena - four of them, 1500 uu deep, the full half length.
-	// The per-terrace lips do all the shape reading here anyway: nine concentric glowing contours
-	// per bank is more edge per square metre than anything except the dais itself.
 	UMaterialInstanceDynamic* BodyMID = bBuildVisuals
 		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f,
 			TraceArenaConstants::NeonNeutral, 0.012f)
 		: nullptr;
+
+	// Which skin shells carry a glowing contour. v9 put one on every terrace, which was the whole
+	// shape read when there were nine of them; at CoveVisualRiser there are 55 and one per shell is
+	// the terraced look the user is asking to be rid of, drawn in neon. See CoveContourSpacing.
+	//
+	// SPACING 0 IN THE BEFORE ARM, i.e. one contour per terrace, which is what v9 drew. The arm has
+	// to stay the thing it was: thinning its contours would make the red arm look better than the
+	// build the user complained about, and an A/B whose red arm has been quietly improved proves
+	// nothing.
+	TArray<bool> SkinContour;
+	TraceMarkCoveContours(Skin,
+		bBuildingSquareCorners ? 0.f : TraceArenaConstants::CoveContourSpacing, SkinContour);
 
 	for (const float XSign : { -1.f, 1.f })
 	{
@@ -2147,24 +2356,17 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 
 		for (const float YSign : { -1.f, 1.f })
 		{
-			for (int32 Terrace = 0; Terrace < Terraces.Num(); ++Terrace)
+			// Y: the lowest step still reaches BankDepth in from the sideline; the ones above it step
+			// in along the ellipse, so the treads are wide and shallow near the floor and tighten as
+			// the bank sweeps up into the wall.
+			//
+			// X: the lowest step runs from the halfway line to just short of the goal line; higher
+			// ones start further out and stop further back, which is what turns a trough along the
+			// sideline into a bank that is highest at the CORNER.
+			auto BankPiece = [&](float TopZ, float OuterDepth, FVector& OutCentre, FVector& OutSize) -> bool
 			{
-				// Alpha is still measured against the FULL terrace count, not against however many the
-				// cove kept, so the X taper below places terrace k exactly where it has always placed
-				// terrace k. Dropping the top two slivers must not silently re-space the seven that
-				// remain across the goal setback - that would move the crest along the field, which is
-				// a gameplay change nobody asked for on top of a shape change somebody did.
-				const float Alpha = static_cast<float>(Terrace) / static_cast<float>(TerraceCount);
-				const float TopZ = Terraces[Terrace].TopZ;
-
-				// Y: terrace 0 still reaches BankDepth in from the sideline; the ones above it now step
-				// in along the ellipse rather than in equal slices, so the treads are wide and shallow
-				// near the floor and tighten as the bank sweeps up into the wall.
-				const float InnerY = HalfY - Terraces[Terrace].OuterDepth;
-
-				// X: terrace 0 runs from the halfway line to just short of the goal line; higher
-				// terraces start further out and stop further back, which is what turns a trough
-				// along the sideline into a bank that is highest at the CORNER.
+				const float Alpha = BankAlpha(TopZ);
+				const float InnerY = HalfY - OuterDepth;
 				const float NearX = Inboard * Alpha;
 				const float FarX = GoalX - TraceArenaConstants::BankGoalClearance - Setback * Alpha;
 
@@ -2172,19 +2374,77 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 				const float SpanY = HalfY - InnerY;
 				if (SpanX <= 1.f || SpanY <= 1.f)
 				{
+					return false;
+				}
+
+				OutCentre = FVector(XSign * (NearX + SpanX * 0.5f), YSign * (InnerY + SpanY * 0.5f), 0.f);
+				OutSize = FVector(SpanX, SpanY, 0.f);
+				return true;
+			};
+
+			// --- The colliders. Invisible, nested, rising out of the floor -------------------------
+			//
+			// AddCollisionBlock rather than AddNeonBlock: the drawn half is built separately below, and
+			// a box component is a REGISTERED PRIMITIVE while a drawn shell is only an instance. This
+			// is the only loop in this function whose iteration count the budget cares about.
+			//
+			// No pawn standoff shell, exactly as before - AddNeonBlock refused one for these too. A
+			// terrace is WALKABLE and a shell would leave players standing on thin air past its edge.
+			for (const FTraceCoveStep& Terrace : Terraces)
+			{
+				FVector Centre;
+				FVector Size;
+				if (!BankPiece(Terrace.TopZ, Terrace.OuterDepth, Centre, Size))
+				{
 					continue;
 				}
 
-				// bVerticalTrim = false: a 39 uu riser would carry four 39 uu corner-rib stubs.
-				// bFaceBands = false: the terraces are NESTED, so a skirt on this one would be
-				// buried inside the solid body of the one outside it. The top lip alone gives each
-				// terrace one glowing contour line, which is the whole read - and its 12 uu
-				// protrusion hangs 13 uu above the tread below, so it never blocks a foot.
-				AddNeonBlock(
-					FVector(XSign * (NearX + SpanX * 0.5f), YSign * (InnerY + SpanY * 0.5f), TopZ * 0.5f),
-					FVector(SpanX, SpanY, TopZ),
-					/*YawDegrees=*/0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("Bank"),
-					/*FaceNeonMID=*/nullptr, /*bVerticalTrim=*/false, /*bFaceBands=*/false);
+				Centre.Z = Terrace.TopZ * 0.5f;
+				Size.Z = Terrace.TopZ;
+				AddCollisionBlock(Centre, Size, TEXT("Bank"));
+			}
+
+			if (!bBuildVisuals)
+			{
+				continue;   // Dedicated server: collision only, byte-identical to a client's.
+			}
+
+			// --- The skin. Thin nested shells, one instance each ------------------------------------
+			for (int32 Index = 0; Index < Skin.Num(); ++Index)
+			{
+				FVector Centre;
+				FVector Size;
+				if (!BankPiece(Skin[Index].TopZ, Skin[Index].OuterDepth, Centre, Size))
+				{
+					continue;
+				}
+
+				// A shell covers its own riser band and its own tread, and overlaps down into the
+				// shell outside it so no crack can open between them. The one at the toe sits on the
+				// floor. See CoveShellOverlap for why these are not solid boxes.
+				const float PrevTopZ = (Index > 0) ? Skin[Index - 1].TopZ : 0.f;
+				const float ShellBottom = FMath::Max(0.f, PrevTopZ - TraceArenaConstants::CoveShellOverlap);
+				const float ShellHeight = FMath::Max(1.f, Skin[Index].TopZ - ShellBottom);
+
+				Centre.Z = ShellBottom + ShellHeight * 0.5f;
+				Size.Z = ShellHeight;
+				AddMeshBlock(CubeMesh, Centre, Size, BodyMID, /*bCastShadow=*/true, TEXT("BankSkin"));
+
+				if (!SkinContour.IsValidIndex(Index) || !SkinContour[Index])
+				{
+					continue;
+				}
+
+				// An INLAID line, not a lip: CoveContourOut of protrusion instead of LipOut's 12, so
+				// it lights the contour without putting a ledge on a surface that is trying to read
+				// as continuous.
+				AddMeshBlock(CubeMesh,
+					FVector(Centre.X, Centre.Y,
+						Skin[Index].TopZ - TraceArenaConstants::CoveContourHeight * 0.5f),
+					FVector(Size.X + TraceArenaConstants::CoveContourOut * 2.f,
+						Size.Y + TraceArenaConstants::CoveContourOut * 2.f,
+						TraceArenaConstants::CoveContourHeight),
+					NeonMID, /*bCastShadow=*/false, TEXT("BankContour"));
 			}
 		}
 	}
@@ -2192,17 +2452,25 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	// The crest, the crest tread and the narrowest tread are all spelled out because they are the
 	// three numbers spec v9 section 10 is answerable on: how high the curve gets, whether a body can
 	// stand at the top of it, and whether any step is tight enough for the mantle probe to skip.
+	// Spec v10 section 9 adds the two that ITS claim rests on: the drawn riser, and the worst-case
+	// gap between where a foot rests and where the surface is drawn.
+	int32 ContourCount = 0;
+	for (bool bOn : SkinContour)
+	{
+		ContourCount += bOn ? 1 : 0;
+	}
+
 	UE_LOG(LogTraceGame, Log,
-		TEXT("Corner banks (elliptical cove, spec v9 s10): %d of %d terraces per bank, %.1f uu riser ")
-		TEXT("(ceiling %.0f), crest %.0f uu of a %.0f uu bank, crest tread %.0f uu off the wall, ")
-		TEXT("narrowest tread %.0f uu (floor %.0f), %.0f uu deep, X %.0f..%.0f."),
-		Terraces.Num(), TerraceCount, Riser, TraceArenaConstants::StepRise,
+		TEXT("Corner banks (smooth elliptical cove, spec v10 s9): %d collision terraces at %.1f uu riser ")
+		TEXT("+ %d drawn shells at %.1f uu riser (%d contour lines) per bank, crest %.0f uu of a %.0f uu ")
+		TEXT("bank, crest tread %.0f uu off the wall, narrowest drawn tread %.1f uu, worst foot/skin gap ")
+		TEXT("%.1f uu, %.0f uu deep, X %.0f..%.0f."),
+		Terraces.Num(), (Terraces.Num() > 0) ? Terraces[0].TopZ : 0.f,
+		Skin.Num(), (Skin.Num() > 0) ? Skin[0].TopZ : 0.f, ContourCount,
 		Terraces.Last().TopZ, Height, Terraces.Last().OuterDepth,
-		(Terraces.Num() > 1)
-			? (Terraces[Terraces.Num() - 2].OuterDepth - Terraces.Last().OuterDepth)
-			: Terraces.Last().OuterDepth,
-		TraceArenaConstants::FilletMinTread, Depth,
-		0.f, GoalX - TraceArenaConstants::BankGoalClearance);
+		(Skin.Num() > 1) ? (Skin[Skin.Num() - 2].OuterDepth - Skin.Last().OuterDepth) : Skin.Last().OuterDepth,
+		TraceArenaConstants::CoveCollisionRiser - TraceArenaConstants::CoveVisualRiser,
+		Depth, 0.f, GoalX - TraceArenaConstants::BankGoalClearance);
 }
 
 float ATraceArenaBuilder::WallFilletToeDepth() const
@@ -2248,11 +2516,18 @@ void ATraceArenaBuilder::BuildWallFillets(bool bBuildVisuals)
 	const float ToeDepth = WallFilletToeDepth();
 	const float Height = FMath::Max(0.f, WallFilletHeight);
 
+	// SPEC v10 SECTION 9 - two resolutions of ONE curve. Steps is what the pawn stands on and is a
+	// box component apiece (the registered-primitive budget); Skin is what the eye sees and is an
+	// instance apiece (free). Both stop rules are scale-free, so the envelope is identical - see
+	// TraceBuildCoveProfile.
 	TArray<FTraceCoveStep> Steps;
-	TraceBuildCoveProfile(ToeDepth, Height, TraceArenaConstants::StepRise,
-		TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMinTread, Steps);
+	TArray<FTraceCoveStep> Skin;
+	TraceBuildCoveProfile(ToeDepth, Height, TraceArenaConstants::CoveCollisionRiser,
+		TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMaxSlope, Steps);
+	TraceBuildCoveProfile(ToeDepth, Height, TraceArenaConstants::CoveVisualRiser,
+		TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMaxSlope, Skin);
 
-	if (Steps.Num() == 0)
+	if (Steps.Num() == 0 || Skin.Num() == 0)
 	{
 		return;
 	}
@@ -2282,15 +2557,25 @@ void ATraceArenaBuilder::BuildWallFillets(bool bBuildVisuals)
 		return RampZ - TraceArenaConstants::FilletRampClearance;
 	};
 
-	int32 EndSteps = 0;
-	for (const FTraceCoveStep& Step : Steps)
+	// Applied to BOTH profiles, and it has to be: clamping only the colliders would leave the drawn
+	// cove sweeping up through the goal ramp with nothing under it, and clamping only the skin would
+	// leave an invisible lip across the run-up. Same predicate, two lists.
+	auto CountUnderRamp = [&EndWallCeilingAt](const TArray<FTraceCoveStep>& Profile) -> int32
 	{
-		if (Step.TopZ > EndWallCeilingAt(Step.OuterDepth))
+		int32 Count = 0;
+		for (const FTraceCoveStep& Step : Profile)
 		{
-			break;   // And every step above it, or the end cove would stop being monotone.
+			if (Step.TopZ > EndWallCeilingAt(Step.OuterDepth))
+			{
+				break;   // And every step above it, or the end cove would stop being monotone.
+			}
+			++Count;
 		}
-		++EndSteps;
-	}
+		return Count;
+	};
+
+	const int32 EndSteps = CountUnderRamp(Steps);
+	const int32 EndSkin = CountUnderRamp(Skin);
 
 	// --- Materials --------------------------------------------------------------------------------
 	//
@@ -2316,31 +2601,33 @@ void ATraceArenaBuilder::BuildWallFillets(bool bBuildVisuals)
 	// join for a capsule to catch on and no z-fighting sliver where the cove meets the wall face.
 	const float Bury = WallThickness;
 
-	// --- The two side walls -----------------------------------------------------------------------
+	// Which drawn shells carry a glowing contour. See CoveContourSpacing: one per shell would be 38
+	// neon lines up a 296 uu curve, which is a terraced look drawn in light whatever the geometry is.
+	TArray<bool> SkinContour;
+	TraceMarkCoveContours(Skin, TraceArenaConstants::CoveContourSpacing, SkinContour);
+
+	// --- The colliders ----------------------------------------------------------------------------
 	//
-	// Full length, running THROUGH both end walls, so the four corners are closed by these alone and
-	// the end runs below can simply cross them. Overlapping solids are free here - the union is what
-	// matters and it is provably walkable.
+	// Side walls first, full length, running THROUGH both end walls, so the four corners are closed
+	// by these alone and the end runs can simply cross them. Overlapping solids are free here - the
+	// union is what matters and it is provably walkable.
+	//
+	// AddCollisionBlock rather than AddNeonBlock, because spec v10 section 9 draws this cove
+	// separately and at eight times the resolution; a box component is a registered primitive and a
+	// drawn shell is not, so these are the only iterations the budget counts.
 	for (const float YSign : { -1.f, 1.f })
 	{
 		for (const FTraceCoveStep& Step : Steps)
 		{
 			const float SpanY = Step.OuterDepth + Bury;
 
-			AddNeonBlock(
+			AddCollisionBlock(
 				FVector(0.f, YSign * (HalfY + Bury - SpanY * 0.5f), Step.TopZ * 0.5f),
 				FVector(FieldLength + 2.f * WallThickness, SpanY, Step.TopZ),
-				/*YawDegrees=*/0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("WallFilletY"),
-				// Same two flags as a bank terrace and for the same two reasons: a 37 uu riser has no
-				// vertical face worth ribbing, and the steps are NESTED so a skirt would be buried
-				// inside the body of the step outside it. The top lip alone is the contour line, and
-				// six concentric ones running the length of the arena is what makes the eye read the
-				// curve instead of a stack of boxes.
-				/*FaceNeonMID=*/nullptr, /*bVerticalTrim=*/false, /*bFaceBands=*/false);
+				TEXT("WallFilletY"));
 		}
 	}
 
-	// --- The two end walls ------------------------------------------------------------------------
 	for (const float XSign : { -1.f, 1.f })
 	{
 		for (int32 Index = 0; Index < EndSteps; ++Index)
@@ -2348,24 +2635,98 @@ void ATraceArenaBuilder::BuildWallFillets(bool bBuildVisuals)
 			const FTraceCoveStep& Step = Steps[Index];
 			const float SpanX = Step.OuterDepth + Bury;
 
-			AddNeonBlock(
+			AddCollisionBlock(
 				FVector(XSign * (HalfX + Bury - SpanX * 0.5f), 0.f, Step.TopZ * 0.5f),
 				FVector(SpanX, FieldWidth, Step.TopZ),
-				/*YawDegrees=*/0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("WallFilletX"),
-				/*FaceNeonMID=*/nullptr, /*bVerticalTrim=*/false, /*bFaceBands=*/false);
+				TEXT("WallFilletX"));
 		}
 	}
 
+	if (!bBuildVisuals)
+	{
+		return;   // Dedicated server: collision only, byte-identical to a client's.
+	}
+
+	// --- The skin ---------------------------------------------------------------------------------
+	//
+	// Thin nested shells rather than solid boxes: at CoveVisualRiser a side-wall run is 38 of them,
+	// and 38 nested 33600 x 600 uu slabs would be a wall of overdraw and 38 full-height shadow
+	// casters for a shape 296 uu tall. See CoveShellOverlap.
+	auto ShellBottomZ = [](const TArray<FTraceCoveStep>& Profile, int32 Index)
+	{
+		const float PrevTopZ = (Index > 0) ? Profile[Index - 1].TopZ : 0.f;
+		return FMath::Max(0.f, PrevTopZ - TraceArenaConstants::CoveShellOverlap);
+	};
+
+	for (const float YSign : { -1.f, 1.f })
+	{
+		for (int32 Index = 0; Index < Skin.Num(); ++Index)
+		{
+			const FTraceCoveStep& Step = Skin[Index];
+			const float SpanY = Step.OuterDepth + Bury;
+			const float BottomZ = ShellBottomZ(Skin, Index);
+			const float ShellHeight = FMath::Max(1.f, Step.TopZ - BottomZ);
+			const float CentreY = YSign * (HalfY + Bury - SpanY * 0.5f);
+
+			AddMeshBlock(CubeMesh,
+				FVector(0.f, CentreY, BottomZ + ShellHeight * 0.5f),
+				FVector(FieldLength + 2.f * WallThickness, SpanY, ShellHeight),
+				BodyMID, /*bCastShadow=*/true, TEXT("WallFilletYSkin"));
+
+			if (SkinContour.IsValidIndex(Index) && SkinContour[Index])
+			{
+				AddMeshBlock(CubeMesh,
+					FVector(0.f, CentreY, Step.TopZ - TraceArenaConstants::CoveContourHeight * 0.5f),
+					FVector(FieldLength + 2.f * WallThickness,
+						SpanY + TraceArenaConstants::CoveContourOut * 2.f,
+						TraceArenaConstants::CoveContourHeight),
+					NeonMID, /*bCastShadow=*/false, TEXT("WallFilletYContour"));
+			}
+		}
+	}
+
+	for (const float XSign : { -1.f, 1.f })
+	{
+		for (int32 Index = 0; Index < EndSkin; ++Index)
+		{
+			const FTraceCoveStep& Step = Skin[Index];
+			const float SpanX = Step.OuterDepth + Bury;
+			const float BottomZ = ShellBottomZ(Skin, Index);
+			const float ShellHeight = FMath::Max(1.f, Step.TopZ - BottomZ);
+			const float CentreX = XSign * (HalfX + Bury - SpanX * 0.5f);
+
+			AddMeshBlock(CubeMesh,
+				FVector(CentreX, 0.f, BottomZ + ShellHeight * 0.5f),
+				FVector(SpanX, FieldWidth, ShellHeight),
+				BodyMID, /*bCastShadow=*/true, TEXT("WallFilletXSkin"));
+
+			if (SkinContour.IsValidIndex(Index) && SkinContour[Index])
+			{
+				AddMeshBlock(CubeMesh,
+					FVector(CentreX, 0.f, Step.TopZ - TraceArenaConstants::CoveContourHeight * 0.5f),
+					FVector(SpanX + TraceArenaConstants::CoveContourOut * 2.f, FieldWidth,
+						TraceArenaConstants::CoveContourHeight),
+					NeonMID, /*bCastShadow=*/false, TEXT("WallFilletXContour"));
+			}
+		}
+	}
+
+	int32 ContourCount = 0;
+	for (bool bOn : SkinContour)
+	{
+		ContourCount += bOn ? 1 : 0;
+	}
+
 	UE_LOG(LogTraceGame, Log,
-		TEXT("Wall fillets (spec v9 s10): %d steps to %.0f uu on the side walls, %d to %.0f uu on the end ")
-		TEXT("walls (mode-B ramp ceiling), %.0f uu toe, %.1f uu riser, innermost tread %.0f uu off the ")
-		TEXT("wall face, narrowest tread %.0f uu (floor %.0f)."),
-		Steps.Num(), Steps.Last().TopZ,
-		EndSteps, (EndSteps > 0) ? Steps[EndSteps - 1].TopZ : 0.f,
-		ToeDepth, Height / static_cast<float>(FMath::Max(1, FMath::CeilToInt(Height / TraceArenaConstants::StepRise))),
-		Steps.Last().OuterDepth,
-		(Steps.Num() > 1) ? (Steps[Steps.Num() - 2].OuterDepth - Steps.Last().OuterDepth) : Steps.Last().OuterDepth,
-		TraceArenaConstants::FilletMinTread);
+		TEXT("Wall fillets (smooth, spec v10 s9): collision %d steps to %.0f uu on the side walls, %d on ")
+		TEXT("the end walls (mode-B ramp ceiling), %.1f uu riser. Drawn %d shells to %.0f uu, %d on the ")
+		TEXT("end walls, %.1f uu riser, %d contour lines. %.0f uu toe, innermost drawn edge %.0f uu off ")
+		TEXT("the wall face, narrowest drawn tread %.1f uu, worst foot/skin gap %.1f uu."),
+		Steps.Num(), Steps.Last().TopZ, EndSteps, Steps[0].TopZ,
+		Skin.Num(), Skin.Last().TopZ, EndSkin, Skin[0].TopZ, ContourCount,
+		ToeDepth, Skin.Last().OuterDepth,
+		(Skin.Num() > 1) ? (Skin[Skin.Num() - 2].OuterDepth - Skin.Last().OuterDepth) : Skin.Last().OuterDepth,
+		TraceArenaConstants::CoveCollisionRiser - TraceArenaConstants::CoveVisualRiser);
 }
 
 void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)

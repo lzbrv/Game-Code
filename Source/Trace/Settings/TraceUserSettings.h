@@ -60,6 +60,18 @@ enum class ETraceInputAction : uint8
 	Fire,
 	Pass,
 	Scoreboard,
+	/**
+	 * Spec v10 §1 — gun <-> knife. APPENDED, never inserted: ETraceInputAction is the index into
+	 * UTraceUserSettings::Bindings, so inserting anywhere above would renumber every action a
+	 * previously-saved TraceUserSettings.ini already refers to *by position* in the runtime array.
+	 * The .ini itself is keyed by ConfigId and survives; the in-memory table is what would tear.
+	 *
+	 * ONE action, not two. The swing rides the existing Fire bind — UTraceWeaponComponent's fire
+	 * path branches on IsKnifeEquipped(), so mouse1 shoots with the gun and swings with the knife.
+	 * Adding a second "Swing" bind would give the player two keys for one verb and a way to put the
+	 * swing on a key the bots and the dead-respawn path do not use.
+	 */
+	SwapWeapon,
 
 	Count UMETA(Hidden)
 };

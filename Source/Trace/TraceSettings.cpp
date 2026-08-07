@@ -828,6 +828,21 @@ namespace
 		const TCHAR* Name;
 		EKnobType Type;
 		const TCHAR* Note;
+
+		/**
+		 * Which settings class owns this knob, as a /Script path. Null means UTraceSettings.
+		 *
+		 * SPEC v10 ADDED THIS because v10 is the first pass whose knobs do not all live on this page.
+		 * The knife's weapon numbers are a separate UDeveloperSettings (UTraceMeleeSettings), which is
+		 * the right home for them — but it shipped with header literals and NO ini section, i.e. the
+		 * exact "slider that silently does nothing" failure this whole command exists to catch, just
+		 * one class over. A verifier that can only see one class would have called that a clean run.
+		 *
+		 * Resolved by PATH at runtime rather than by #including the other header, deliberately: this
+		 * file must keep compiling while another module's settings class is being edited, and a knob
+		 * table that can break the build is a knob table people delete.
+		 */
+		const TCHAR* OwnerPath = nullptr;
 	};
 
 	void VerifyTraceKnobs()
@@ -991,6 +1006,63 @@ namespace
 			{ TEXT("WallJumpWindowScale"),             EKnobType::Float, TEXT("v9 §5: x0.60 over the contact window -> 0.15s [by-name bind]") },
 			{ TEXT("WallJumpMomentumScale"),           EKnobType::Float, TEXT("v9 §5: x0.90 over retention -> 0.855 [by-name bind]") },
 			{ TEXT("WallJumpMantleLockoutSeconds"),    EKnobType::Float, TEXT("v9 §5: a wall jump beats a mantle for this long [by-name bind]") },
+
+			// --- spec v10, every knob this pass introduced or moved ----------------------------
+			//
+			// §5 WALL JUMPING, THE THIRD COMPLAINT. All three are resolved by TraceMoveKnob, i.e. BY
+			// NAME, so a typo reverts the whole v10 wall-jump fix to the component's own literals
+			// while leaving a green build and a full-looking settings panel. Two of them are not
+			// re-tunings of anything - they are the mechanism v10 added after v9's second attempt at
+			// shaving the input window failed to change the feel - so they are listed on the pass
+			// that introduces them, per the v8 note above.
+			{ TEXT("WallJumpControlLockoutSeconds"),   EKnobType::Float, TEXT("v10 §5: THE stickiness fix - held input cannot steer back into the wall [by-name bind]") },
+			{ TEXT("WallJumpInputBufferSeconds"),      EKnobType::Float, TEXT("v10 §5: an early jump press is spent on the first legal frame [by-name bind]") },
+			{ TEXT("WallJumpMomentumScaleV10"),        EKnobType::Float, TEXT("v10 §5: the further x0.90 -> shipped retention 0.95 x 0.90 x 0.90 = 0.7695 [by-name bind]") },
+
+			// §1 THE KNIFE'S MOVEMENT KIT. The weapon's own numbers are on UTraceMeleeSettings below;
+			// these three multiply WalkSpeed and the two air caps, which are on this page, and are
+			// read through TraceMoveKnob with the rest of the movement scalars.
+			{ TEXT("KnifeMoveSpeedMultiplier"),        EKnobType::Float, TEXT("v10 §1: x1.30 over WalkSpeed, the '30% faster' [by-name bind]") },
+			{ TEXT("KnifeAirStrafeSoftCapMultiplier"), EKnobType::Float, TEXT("v10 §1: x1.25 over the soft cap, the 'higher momentum ceiling' [by-name bind]") },
+			{ TEXT("KnifeAirStrafeHardCapMultiplier"), EKnobType::Float, TEXT("v10 §1: x1.35 over the hard cap - MUST stay >= the soft multiplier [by-name bind]") },
+
+			// §4 the parry. Not new, but it MOVED this pass (0.20 -> 0.175) and it is the one number
+			// the whole mechanic is - window and invulnerability are the SAME property, which is the
+			// question v10 §4 asked - so it is worth a line that proves the ini still drives it. It
+			// is already listed in the v8 block above and is deliberately NOT repeated here.
+
+			// §3 the turnover grace. Also not new, but v10 §3 is a REPEAT complaint ("the grace
+			// period on turnovers doesn't seem to be working"), and the first thing to rule out when
+			// a mechanic "doesn't seem to be working" is that its knob reaches the code at all. It
+			// has never been on this list. It is now.
+			{ TEXT("CoreTurnoverGraceSeconds"),        EKnobType::Float, TEXT("v10 §3: seconds the new holder's trace does not FORM after a turnover between teams") },
+
+			// §7 the half length is NOT here, and that is not an oversight: HalfDuration is a
+			// UPROPERTY(config) on ATraceGameMode, not on this page, so this command cannot see it.
+			// Trace.DumpSettings prints it from the running game mode, which is where it is read.
+
+			// --- spec v10 §1, THE KNIFE ITSELF - a DIFFERENT settings class ---------------------
+			//
+			// UTraceMeleeSettings, config = Game, section [/Script/Trace.TraceMeleeSettings]. Every
+			// one of these was a header literal with no ini key behind it until v10 reconciled them.
+			{ TEXT("BackstabDamage"),            EKnobType::Float, TEXT("v10 §1: 100 from behind"),                    TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("FrontDamage"),               EKnobType::Float, TEXT("v10 §1: 30 from the front"),                  TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("BackstabHalfAngleDegrees"),  EKnobType::Float, TEXT("v10 §1: half-angle about directly behind"),   TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("SwingCooldownSeconds"),      EKnobType::Float, TEXT("v10 §1: 0.5s between swings"),                TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("SwapSeconds"),               EKnobType::Float, TEXT("v10 §1: 0.2s pullout, BOTH directions"),      TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("SwingWindupSeconds"),        EKnobType::Float, TEXT("v10 §1: lead-in before the arc goes live"),   TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("SwingAnimSeconds"),          EKnobType::Float, TEXT("v10 §1: must stay under the cooldown"),       TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("SwingRangeUU"),              EKnobType::Float, TEXT("v10 §1: blade reach"),                        TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("SwingArcDegrees"),           EKnobType::Float, TEXT("v10 §1: a sweep, not a hitscan point"),       TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("SwingSamples"),              EKnobType::Int,   TEXT("v10 §1: rays fanned across the arc"),         TEXT("/Script/Trace.TraceMeleeSettings") },
+			// KnifeSpeedMultiplier and KnifeAirCapScale are DELIBERATELY ABSENT from this block. They
+			// existed on UTraceMeleeSettings for part of this pass and were removed once the knife's
+			// mobility landed where it belongs - beside the WalkSpeed and air caps it multiplies, on
+			// the UTraceSettings page above. Two knobs for one number is how a base and its scalar end
+			// up fighting, and this comment is here so nobody re-adds them out of symmetry.
+			{ TEXT("BotEngageRangeUU"),          EKnobType::Float, TEXT("v10 §1: bots must use it to playtest it"),    TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("BotDisengageRangeUU"),       EKnobType::Float, TEXT("v10 §1: > engage, or a bot swaps every frame"), TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("BotSwingRangeFraction"),     EKnobType::Float, TEXT("v10 §1: swing inside its reach, not at the edge"), TEXT("/Script/Trace.TraceMeleeSettings") },
 		};
 
 		const UTraceSettings& Table = UTraceSettings::Get();
@@ -1000,7 +1072,31 @@ namespace
 		for (const FKnobSpec& Knob : Knobs)
 		{
 			const FName KnobName(Knob.Name);
-			const FProperty* Found = UTraceSettings::StaticClass()->FindPropertyByName(KnobName);
+
+			// Which class, and which object to read the value out of. Null OwnerPath is this page,
+			// which is every knob before spec v10 and most of them after it. A named owner is looked
+			// up by path so this file never has to include another settings header - see FKnobSpec.
+			const UClass* OwnerClass = UTraceSettings::StaticClass();
+			const UObject* ContainerObject = &Table;
+
+			if (Knob.OwnerPath != nullptr)
+			{
+				OwnerClass = FindObject<UClass>(nullptr, Knob.OwnerPath);
+				ContainerObject = (OwnerClass != nullptr) ? OwnerClass->GetDefaultObject() : nullptr;
+			}
+
+			const void* Container = ContainerObject;
+
+			if (OwnerClass == nullptr || Container == nullptr)
+			{
+				++DeadCount;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[VerifyKnobs]   DEAD %-34s  owning class '%s' does not exist in this build  (%s)"),
+					Knob.Name, Knob.OwnerPath, Knob.Note);
+				continue;
+			}
+
+			const FProperty* Found = OwnerClass->FindPropertyByName(KnobName);
 
 			FString Value = TEXT("<unbound>");
 			bool bTypeOk = false;
@@ -1013,21 +1109,21 @@ namespace
 					if (const FFloatProperty* AsFloat = CastField<FFloatProperty>(Found))
 					{
 						bTypeOk = true;
-						Value = FString::Printf(TEXT("%.4f"), AsFloat->GetPropertyValue_InContainer(&Table));
+						Value = FString::Printf(TEXT("%.4f"), AsFloat->GetPropertyValue_InContainer(Container));
 					}
 					break;
 				case EKnobType::Bool:
 					if (const FBoolProperty* AsBool = CastField<FBoolProperty>(Found))
 					{
 						bTypeOk = true;
-						Value = AsBool->GetPropertyValue_InContainer(&Table) ? TEXT("true") : TEXT("false");
+						Value = AsBool->GetPropertyValue_InContainer(Container) ? TEXT("true") : TEXT("false");
 					}
 					break;
 				case EKnobType::Int:
 					if (const FIntProperty* AsInt = CastField<FIntProperty>(Found))
 					{
 						bTypeOk = true;
-						Value = FString::Printf(TEXT("%d"), AsInt->GetPropertyValue_InContainer(&Table));
+						Value = FString::Printf(TEXT("%d"), AsInt->GetPropertyValue_InContainer(Container));
 					}
 					break;
 				case EKnobType::Enum:
@@ -1043,7 +1139,7 @@ namespace
 						// and Value still carries the "<unbound>" placeholder the other branches
 						// overwrite wholesale.
 						Value.Reset();
-						Found->ExportText_InContainer(0, Value, &Table, &Table, nullptr, PPF_None);
+						Found->ExportText_InContainer(0, Value, Container, Container, nullptr, PPF_None);
 					}
 					break;
 				}
@@ -1057,8 +1153,13 @@ namespace
 			if (bTypeOk && bConfig && bEditable)
 			{
 				++BoundCount;
-				UE_LOG(LogTraceGame, Display, TEXT("[VerifyKnobs]   OK   %-34s = %-10s  (%s)"),
-					Knob.Name, *Value, Knob.Note);
+
+				// The owning OBJECT is named, not just the class. Spec v10 is the first pass with
+				// knobs on more than one settings page, and the failure mode that costs a whole pass
+				// is reading the RIGHT property's offset out of the WRONG object: every value comes
+				// back plausible and wrong. Printing what was read from makes that impossible to miss.
+				UE_LOG(LogTraceGame, Display, TEXT("[VerifyKnobs]   OK   %-34s = %-10s  [%s]  (%s)"),
+					Knob.Name, *Value, *GetNameSafe(ContainerObject), Knob.Note);
 			}
 			else
 			{

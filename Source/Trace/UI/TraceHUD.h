@@ -96,7 +96,16 @@ protected:
 
 	void DrawHitMarker();
 
-	/** Health, dash CHARGES and the parry cooldown: the bottom-left ability stack. (Boost is gone.) */
+	/**
+	 * Health, the EQUIPPED WEAPON, dash CHARGES and the parry cooldown: the bottom-left ability
+	 * stack. (Boost is gone.)
+	 *
+	 * Row order is load-bearing, not cosmetic. The stack grows UPWARDS from the health bar, so a row
+	 * drawn earlier sits lower and closer to health. Health is drawn last and never moves; the
+	 * weapon row is drawn first because it is the only other row that is ALWAYS present, which makes
+	 * it the only other row that can be found by muscle memory. Everything above it is conditional
+	 * and is allowed to shuffle.
+	 */
 	void DrawHealthAndDash();
 
 	void DrawScoresAndClock();

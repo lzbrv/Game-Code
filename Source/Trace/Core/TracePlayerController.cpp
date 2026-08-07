@@ -25,6 +25,7 @@
 #include "InputMappingContext.h"
 #include "InputModifiers.h"
 #include "InputTriggers.h"                 // ETriggerEvent
+#include "Gameplay/TraceMelee.h"           // TraceMelee::RequestSwapWeapon (spec v10 §1)
 #include "Movement/TraceCharacterMovementComponent.h"   // dash charges, for the HUD accessors
 #include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
 #include "Trace.h"                         // LogTraceGame
@@ -212,6 +213,7 @@ void ATracePlayerController::BuildInputData()
 		IA_Scoreboard = MakeAction(TEXT("IA_Scoreboard"), EInputActionValueType::Boolean);
 		IA_Crouch     = MakeAction(TEXT("IA_Crouch"),     EInputActionValueType::Boolean);
 		IA_Parry      = MakeAction(TEXT("IA_Parry"),      EInputActionValueType::Boolean);
+		IA_SwapWeapon = MakeAction(TEXT("IA_SwapWeapon"), EInputActionValueType::Boolean);
 
 		// Cumulative accumulation is REQUIRED for opposing keys to cancel. UInputAction defaults to
 		// TakeHighestAbsoluteValue, and UEnhancedPlayerInput::ProcessActionMappingEvent merges with
@@ -325,6 +327,7 @@ void ATracePlayerController::ApplyControlSettings()
 	MapButton(IA_Dash,       KeyFor(ETraceInputAction::Dash));
 	MapButton(IA_Parry,      KeyFor(ETraceInputAction::Parry));
 	MapButton(IA_Scoreboard, KeyFor(ETraceInputAction::Scoreboard));
+	MapButton(IA_SwapWeapon, KeyFor(ETraceInputAction::SwapWeapon));
 
 	// The context is already registered by the time a settings change arrives, and Enhanced Input
 	// caches the resolved key->action table. Without this the new bindings sit in the context and
@@ -469,6 +472,12 @@ void ATracePlayerController::SetupInputComponent()
 	EIC->BindAction(IA_Parry, ETriggerEvent::Started,   this, &ATracePlayerController::OnParryStarted);
 	EIC->BindAction(IA_Parry, ETriggerEvent::Completed, this, &ATracePlayerController::OnParryCompleted);
 	EIC->BindAction(IA_Parry, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnParryCompleted);
+
+	// Weapon swap (spec v10 §1). PRESS EDGE ONLY. Every other button in this class binds Completed
+	// and Canceled too, for the symmetry argument above — this one must not. The swap is a toggle,
+	// so a release binding would fire a second swap on key-up and the weapon would come back the
+	// instant you let go. There is no held state to release and nothing to strand on lost focus.
+	EIC->BindAction(IA_SwapWeapon, ETriggerEvent::Started, this, &ATracePlayerController::OnSwapWeaponStarted);
 
 	// Crouch is a HELD action — ground slide while down, stand on release — so it needs the release
 	// edge as well, and Canceled for the same reason the scoreboard does: losing window focus with
@@ -1050,6 +1059,30 @@ void ATracePlayerController::OnParryCompleted()
 	}
 }
 
+void ATracePlayerController::OnSwapWeaponStarted()
+{
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	// Spec v10 §1. Same discipline as the parry handler: this makes NO decision of its own.
+	// TraceMelee::RequestSwapWeapon owns every refusal (dead, carrying the Core, mid-pullout,
+	// mid-dash) and owns the client-side prediction plus the server RPC, so it is safe to call from
+	// a listen-server host and from a remote client alike. A second opinion here is how the
+	// predicted weapon and the authoritative weapon start disagreeing.
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
+	{
+		ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+		const bool bSwapped = TraceMelee::RequestSwapWeapon(TraceChar, &Refusal);
+		if (InputLogLevel() >= 1)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("INPUT SwapWeapon pressed -> %s (refusal=%d)"),
+				bSwapped ? TEXT("swapping") : TEXT("refused"), static_cast<int32>(Refusal));
+		}
+	}
+}
+
 void ATracePlayerController::OnCrouchStarted()
 {
 	if (bGameInputSuppressed)
@@ -1194,6 +1227,7 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 	LogAction(TEXT("IA_Parry     "), IA_Parry);
 	LogAction(TEXT("IA_Crouch    "), IA_Crouch);
 	LogAction(TEXT("IA_Scoreboard"), IA_Scoreboard);
+	LogAction(TEXT("IA_SwapWeapon"), IA_SwapWeapon);
 
 	// The player's own settings are now part of "why does input feel wrong", so they belong in the
 	// same dump. A hand-edited or half-migrated TraceUserSettings.ini is otherwise invisible.

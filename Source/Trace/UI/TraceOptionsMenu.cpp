@@ -276,6 +276,37 @@ void FTraceOptionsMenu::PollInput(APlayerController* PC)
 
 	if (bCapturingKey)
 	{
+		// *** SPEC v10 §8 — WHY MOUSE BUTTONS "COULD NOT BE BOUND". ***
+		//
+		// IsBindableKey never rejected them; it could not, the shipped defaults ARE LMB and RMB. The
+		// defect was a STALE MOUSE EDGE manufactured on the way out of this capture.
+		//
+		// A capture is entered on a mouse RELEASE, so bMouseWasDown is false at that moment. PollMouse
+		// then does not run for the whole capture — the branch below returns before it. The player
+		// presses LMB to bind it, PollKeyCapture calls SetKey and closes the capture, and the player
+		// is STILL PHYSICALLY HOLDING THE BUTTON. The first frame PollMouse runs again it compares
+		// bDown=true against a bMouseWasDown that has been false since before the capture opened,
+		// invents a press edge that never happened, arms PressedRow on the row under the cursor —
+		// which is the binding row the player just used — and activates it on the real release. The
+		// capture re-opens. Every subsequent click does it again, which reads exactly as "this row
+		// refuses to take a mouse button".
+		//
+		// IgnoreInputBeforeFrame = GFrameCounter + 1 was the old defence and it is not enough by an
+		// order of magnitude: it buys ONE frame, and a human holds a mouse button ~80 ms, about five.
+		//
+		// THE FIX IS AN INVARIANT, NOT A PATCH AT THE EXIT SITES. bMouseWasDown means "the button
+		// state last frame", so it must be maintained on EVERY frame this function runs, including
+		// the frames a capture is swallowing input. Then no edge can be synthesised across the
+		// capture at all — not on the SetKey path, not on the Escape-cancel path, and not on any
+		// third exit somebody adds later. Read it before PollKeyCapture, so the frame that closes the
+		// capture is recorded with the button still down.
+		bMouseWasDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
+
+		// Nothing may stay armed across a capture. Even with the edge fixed, a PressedRow armed by
+		// the click that OPENED the capture would fire its activation on the next release.
+		PressedRow = INDEX_NONE;
+		bDraggingSlider = false;
+
 		// A capture swallows everything. Navigating away mid-rebind would leave the player unsure
 		// which action their next key press was about to land on.
 		PollKeyCapture(PC);

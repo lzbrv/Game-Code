@@ -20,7 +20,8 @@
 // still therefore keeps their entire trace indefinitely, which is the whole point: the trace is the
 // only way to kill a carrier, so a timer made "stand still and become unkillable" a real exploit.
 // There is deliberately no surviving time-based expiry anywhere in this file; reintroducing one
-// reintroduces the exploit. The 0.4s TURNOVER GRACE is a separate mechanism and still applies.
+// reintroduces the exploit. The TURNOVER GRACE (0.75s, spec v10 §3) is a separate mechanism and
+// still applies.
 //
 // THE TRACE BELONGS TO POSSESSION, AND ENDS WITH IT (spec v9 §§3-4). Points may exist only while
 // this component is emitting for a live owner who is holding the Core. The instant possession leaves
@@ -35,7 +36,8 @@
 // Three rules sit on top of that and are implemented here:
 //
 //   GRACE (§2)          After the Core changes TEAM, the trace does not begin to form for
-//                       0.4 seconds (spec v3 §1 shortened it from 1.0). ATraceCore calls
+//                       0.75 seconds (1.0 -> 0.4 in spec v3 §1, -> 0.5, -> 0.75 in v10 §3, which
+//                       raised it after the mechanism was verified working). ATraceCore calls
 //                       SetEmitGrace() immediately before it starts the new holder emitting;
 //                       points laid inside the window are simply not laid.
 //
@@ -195,6 +197,37 @@ struct FTraceSmearStyle
 };
 
 /**
+ * SPEC v10 §2. The half-extents the trip test uses for one pawn, measured from its ACTOR LOCATION —
+ * which is the capsule centre, and is the same reference frame every trail point is laid in.
+ *
+ * Filled by UTraceTrailComponent::MeasureModelReach; see the long comment above that declaration for
+ * why the rendered mesh's bounds and not a constant, and for the bounded over-reach. Reported rather
+ * than merely used, because "report the margin chosen and the worst-case over-reach in uu" is a
+ * deliverable, and a number nobody can read is not one.
+ */
+struct FTraceModelReach
+{
+	/** The capsule the old test used, and the floor under the new one. 34 / 88 on the Mannequin. */
+	double CapsuleRadius = 34.0;
+	double CapsuleHalfHeight = 88.0;
+
+	/** What the rendered mesh actually spans, before clamping. Equals the capsule when unknown. */
+	double RawMeshRadius = 34.0;
+	double RawMeshHalfHeight = 88.0;
+
+	/** What the trip test uses. Always >= the capsule and <= capsule + the configured maximum. */
+	double EffectiveRadius = 34.0;
+	double EffectiveHalfHeight = 88.0;
+
+	/** True when a skeletal mesh with usable bounds was found; false means a clamp supplied the answer. */
+	bool bMeshMeasured = false;
+
+	/** EffectiveRadius - CapsuleRadius. The number the spec asks to have reported. */
+	double HorizontalMargin() const { return EffectiveRadius - CapsuleRadius; }
+	double VerticalMargin() const { return EffectiveHalfHeight - CapsuleHalfHeight; }
+};
+
+/**
  * Lays, replicates, evaluates and draws the Core holder's trace.
  *
  * Attach one to every ATraceCharacter (it is dormant until SetEmitting(true)); ATraceCore drives
@@ -268,7 +301,10 @@ public:
 	 * the first point. Stored as an absolute deadline rather than a countdown, so re-asserting
 	 * emission (see SetEmitting) can neither extend nor lose the window.
 	 *
-	 * v3 §1 SHORTENED THE TURNOVER GRACE FROM 1.0s TO 0.4s. The request is capped here rather than
+	 * THE GRACE IS 0.75s (v10 §3; it was 1.0 -> 0.4 in v3 §1 and 0.5 before v10). The value itself
+	 * lives in UTraceSettings::CoreTurnoverGraceSeconds and in Config/DefaultGame.ini, and the ini
+	 * wins — do not read the number off this comment, read it off a running game (the [TRACEGRACE]
+	 * log line prints what was actually granted). The request is capped here rather than
 	 * at the single call site (ATraceCore's TraceCoreTuning::TransferGraceSeconds, still 1.0) for
 	 * exactly the reason GetTraceLifetimeSeconds() caps the lifetime: that constant lives in a file
 	 * this slice does not own, and a stale value there must not be able to reinstate the old rule.
@@ -278,7 +314,7 @@ public:
 	 */
 	void SetEmitGrace(float Seconds);
 
-	/** The turnover grace actually in force, in seconds. v3 §1: 0.4. */
+	/** The turnover grace actually in force, in seconds. v10 §3: 0.75. */
 	static float GetTurnoverGraceSeconds();
 
 	/** Server: drop every point and tell clients to wipe their visuals immediately. */
@@ -433,6 +469,95 @@ public:
 
 	/** v7 §3: the lethal (and drawn) HEIGHT, in uu, centred on the carrier's mid-model. 190 -> ~63. */
 	static float GetTraceTrailHeight();
+
+	// ------------------------------------------------------------------------------------------
+	// SPEC v10 §2 — THE WHOLE MODEL, NOT THE CAPSULE.
+	//
+	// THE REPORT, verbatim: "Ensure that if ANY part of a players model touches the trace while
+	// dashing, it counts as a connection (either for a parry or for a kill). This feels wonky right
+	// now."
+	//
+	// THE MECHANISM. ServerRunTripTest sweeps a CAPSULE against the trace polyline, and the capsule
+	// is 34uu of radius on a Mannequin whose arms, elbows and trailing leg reach further than that
+	// in every animation a dash is ever seen in. The trace itself is only 22.5uu to a side since
+	// Demo 7 shrank it. So the band between "the capsule missed" and "the model visibly clipped it"
+	// is a real, several-inch-wide ring in which the player sees a hit and the game scores nothing.
+	// That band IS the wonkiness, and it is the same band for both outcomes because there is one
+	// test: bHitLethal decides the KILL when the carrier is vulnerable and the PARRY punish when
+	// they are not.
+	//
+	// THE FIX, AND WHY THE BOUNDS AND NOT A CONSTANT. Three options were on the table (mesh bounds,
+	// a flat configurable margin, a set of body-part volumes). This uses the SKELETAL MESH'S OWN
+	// WORLD BOUNDS, clamped, because:
+	//
+	//   * They are, definitionally, the extent of the thing being RENDERED. The felt rule the spec
+	//     states is "if it looks like it touched, it counts" — and what it looks like is exactly what
+	//     the bounds enclose. A flat margin cannot be that; it is a guess that is too small in a
+	//     spread pose and too large in a tucked one.
+	//   * They FOLLOW THE POSE. A pawn standing with its arms down reports very nearly the capsule
+	//     and gets very nearly the old behaviour; a pawn mid-dash with an arm and a leg extended
+	//     reports more, and gets more, on that frame only. That is the correct shape for "do not
+	//     overcorrect into phantom connections at visible distance" — the widening only exists while
+	//     there is visible model out there to justify it.
+	//   * They cost nothing. USceneComponent::Bounds is already computed and cached every frame for
+	//     culling; this reads it. Per-bone body-part volumes would be more precise and would need a
+	//     hardcoded bone list that silently stops matching the moment the mesh is re-imported — and
+	//     this project imports its Mannequin automatically.
+	//
+	// AND WHY IT IS CLAMPED AT BOTH ENDS. Bounds are an AABB and can be inflated by an attached
+	// actor, a stray socket or a physics-asset body that reaches further than the silhouette. The
+	// measured reach is therefore admitted only within [capsule + MinMargin, capsule + MaxMargin],
+	// so the WORST-CASE OVER-REACH OF THIS CHANGE IS EXACTLY MaxMargin uu AND IS BOUNDED BY
+	// CONSTRUCTION rather than by trusting the asset. Both bounds are CVars (Trace.Trail.Model*).
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Measure one pawn for the trip test. Static and public: the trip test uses it, the
+	 * Trace.Trail.ModelReach readout prints it, and the bots' intercept planner should eventually
+	 * ask it too so that what a bot aims at is what the test scores (see the report — that lives in
+	 * AI/, which this pass does not own).
+	 *
+	 * Never returns anything smaller than the capsule. A pawn with no mesh gets the configured
+	 * floor, so the fix does not silently evaporate on a pawn whose animation is not ticking.
+	 */
+	static FTraceModelReach MeasureModelReach(const ATraceCharacter* Candidate);
+
+	/**
+	 * Session counters for the widening, so its blast radius is a measurement and not a claim.
+	 *
+	 * OutTotal        every lethal trip the trip test has scored.
+	 * OutModelOnly    those that the OLD capsule-only test would have MISSED — i.e. the kills and
+	 *                 parry punishes this change created. The spec's "watch the knock-on" number:
+	 *                 bots on Hard already take 82% of their kills off the trace, so the share of
+	 *                 trips that exist only because of the widening is exactly what has to be
+	 *                 reported before anybody retunes anything.
+	 */
+	static void GetModelTripStats(int32& OutTotal, int32& OutModelOnly);
+	static void ResetModelTripStats();
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * HARNESS ONLY (Trace.Trail.ModelHitTest). Force the sweep segment the NEXT trip test will
+	 * evaluate for one candidate, by writing the "where were you last tick" entry the test builds it
+	 * from.
+	 *
+	 * Why this exists rather than "teleport the pawn twice and hope": a dashing pawn is moving at
+	 * DashSpeed, so between the frame the harness places it and the frame the test runs, the
+	 * movement component has already moved it tens of uu — swamping a test whose whole subject is a
+	 * band a few uu wide. Seeding the previous location makes the swept segment EXACTLY the one
+	 * being asserted about, and everything downstream of it (the eligibility rules, the sweep, the
+	 * thresholds, the kill, the parry punish) is the shipping path, untouched.
+	 */
+	void DebugSeedPreviousLocation(ATraceCharacter* Candidate, const FVector& Location);
+#endif
+
+	/**
+	 * Shared-clock instant the turnover grace expires, or 0 when none is running. Exposed so
+	 * Trace.Trail.GraceTest can report what the grace ACTUALLY was rather than what it was asked
+	 * for — spec v10 §3 opens with "the grace period on turnovers doesn't seem to be working", and
+	 * the only way to answer that is to read the deadline the emitter is really gated on.
+	 */
+	float GetEmitGraceEndServerTime() const { return EmitGraceEndServerTime; }
 
 	// ------------------------------------------------------------------------------------------
 	// THE PREDICTED HEAD (spec v5 §2). Owner-only, cosmetic, never lethal. Read-only accessors so

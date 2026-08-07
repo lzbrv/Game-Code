@@ -251,6 +251,44 @@ public:
 	UPROPERTY(Replicated)
 	FVector_NetQuantize LooseLocation = FVector::ZeroVector;
 
+	// --- SPEC v10 §10: the teleport channel. ------------------------------------------------------
+	//
+	// THE PROBLEM THIS SOLVES, and it is NOT the one the spec guessed at.
+	//
+	// The spec's lead was "the client interpolates replicated movement, so it slides the Core across
+	// the map". That cannot be what happens here: the constructor calls SetReplicateMovement(false),
+	// so ReplicatedMovement is never sent for this actor and there is no interpolator to blame. The
+	// measured defect is the opposite one — the client never learns about the reset AT ALL.
+	//
+	// Every server reset (KickoffTo, the park-at-home in Tick, a throw's launch point) moved the actor
+	// with SetActorLocation and replicated NOTHING about it, because the only transform channel this
+	// actor has is its ATTACHMENT. On a goal the client's Core therefore detaches with
+	// KeepWorldTransform and is STRANDED in the endzone for the whole kickoff delay, then snaps the
+	// full length of the field when the next holder finally attaches it. That cross-map jump, off a
+	// bright always-relevant beacon, is "the core randomly flies across a players screen ... after a
+	// goal".
+	//
+	// So the fix is a channel, not a smoothing flag. TeleportLocation carries WHERE and TeleportSerial
+	// carries THAT IT HAPPENED; the serial is what makes a second teleport to the same place still
+	// arrive, and what makes the event legible independently of Carrier / bLoose / AttachmentReplication,
+	// none of whose OnRep order relative to this one is guaranteed. Both are written by exactly one
+	// function, ServerTeleport(), so "cover every path" is a grep with one answer.
+	//
+	// NOT used for the per-frame integration of a loose Core: that is continuous motion, already
+	// covered by LooseLocation + the client's dead reckoning, and bumping a serial 60 times a second
+	// would put 16 bytes on the wire per frame for a discontinuity that is not happening.
+
+	/** Where the last SERVER-SIDE DISCONTINUITY put the Core. Written only by ServerTeleport(). */
+	UPROPERTY(Replicated)
+	FVector_NetQuantize TeleportLocation = FVector::ZeroVector;
+
+	/**
+	 * Bumped by every server-side teleport. Wraps at 256, which is fine: clients react to the CHANGE,
+	 * and 256 resets between two net updates to one client is not a reachable state.
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_TeleportSerial)
+	uint8 TeleportSerial = 0;
+
 	/**
 	 * MODE B. Authoritative velocity of the loose Core, uu/s.
 	 *
@@ -290,6 +328,13 @@ public:
 
 	/** True while the Core is deliberately out of play (see KickoffTo). */
 	bool IsOutOfPlay() const { return bOutOfPlay; }
+
+	/**
+	 * Server, diagnostics only (Trace.Core.GoalRepro). Arms the spec v10 §10 reproduction: teleport
+	 * the current holder deep into the attacking end, then — after a staging delay long enough for a
+	 * 40 ms client to have seen them there — fire the SAME KickoffTo() a scored goal fires.
+	 */
+	bool RequestGoalRepro();
 
 	// =============================================================================================
 	// MODE B — scoring mode, the throw, the loose Core, the goals
@@ -703,6 +748,26 @@ public:
 	/** Arena centre, resolved from the arena builder and falling back to the spawn point. */
 	FVector GetHomeLocation() const;
 
+#if !UE_BUILD_SHIPPING
+	/**
+	 * DEV ONLY. Force the pass window open on the current holder, without hovering a teammate.
+	 *
+	 * Exists for ONE caller: Trace.Knife.CarrierImmunityTest. The knife's carrier immunity has two
+	 * independent guards and only one of them is interesting. A carrier whose shield is UP is
+	 * already skipped by UTraceLagCompensationComponent::ResolveHitscan, which every knife sample
+	 * goes through — so a back-stab against an ordinary carrier proves nothing about
+	 * TraceMelee::ResolveSwing's own rule, and would pass on a build where that rule was deleted.
+	 *
+	 * The rule only does work during a PASS, when ATraceCore::IsShieldSuppressedFor drops the shield
+	 * so bullets can land. That half-second is the entire risk: without the melee-specific rule the
+	 * knife would be immune-by-accident for the rest of the match and lethal for exactly the window
+	 * that decides games. Staging that window is what makes the test able to fail.
+	 *
+	 * Returns the teammate the pass was aimed at, or null if there was no holder or no teammate.
+	 */
+	ATraceCharacter* DebugForcePassWindow();
+#endif
+
 	// =============================================================================================
 	// AActor
 	// =============================================================================================
@@ -725,6 +790,13 @@ public:
 
 	UFUNCTION()
 	void OnRep_Loose();
+
+	/**
+	 * SPEC v10 §10. The server teleported the Core; put it there NOW, this frame, with no
+	 * dead reckoning and no waiting for the next possession event to place it.
+	 */
+	UFUNCTION()
+	void OnRep_TeleportSerial();
 
 	// =============================================================================================
 	// Cosmetic components. No collision anywhere on this actor - it is a status.
@@ -949,6 +1021,67 @@ private:
 	/** Throttle for TickFlightLog. Local to each machine; nothing about it is replicated. */
 	float NextFlightLogTime = 0.f;
 	bool bFlightLogWasLoose = false;
+
+	// =============================================================================================
+	// SPEC v10 §10 — the teleport funnel, and the audit that proved what was actually wrong
+	// =============================================================================================
+
+	/**
+	 * SERVER. The ONE way this actor is moved discontinuously. Places it, records the destination,
+	 * bumps the serial and forces the update, so every client snaps to the same point on the same
+	 * event instead of inferring the reset from a possession change that may not come for a second.
+	 *
+	 * Continuous motion does NOT come through here: an attached Core rides its holder, and a loose
+	 * Core is integrated frame by frame into LooseLocation. This is for discontinuities only —
+	 * kickoff, score, half time, match start, the park-at-home and a throw's launch point.
+	 */
+	void ServerTeleport(const FVector& Where, const TCHAR* Why);
+
+	/**
+	 * EVERY MACHINE. Puts a HOLDERLESS Core where that machine's own rules say it belongs: the loose
+	 * position in mode B, the arena centre otherwise.
+	 *
+	 * This is the second half of the contract the constructor states ("holderless => every machine
+	 * computes the home location identically") and it was previously implemented on the server only —
+	 * the park-at-home in Tick sits after the `!HasAuthority()` early return. A client therefore never
+	 * parked anything, which is the stranding half of the §10 bug. A no-op when somebody is holding
+	 * it: the attachment owns the transform then.
+	 */
+	void PlaceHolderlessCore();
+
+	/**
+	 * EVERY MACHINE, diagnostics only (Trace.Core.TeleportAudit).
+	 *
+	 * Watches this machine's OWN copy of the Core across a possession reset and reports one line per
+	 * reset: how far it travelled, in how many frames, and how far from home it sat while it did.
+	 * That is what separates the three candidate explanations from each other — a multi-frame SLIDE
+	 * (interpolation, the spec's lead), a one-frame JUMP from the wrong place (stranding, what the
+	 * measurement actually found) and a correct SNAP.
+	 */
+	void TickTeleportAudit();
+
+	/** Server, diagnostics only (Trace.Core.GoalRepro). Stages and then fires the post-goal reset. */
+	void TickGoalRepro();
+
+	// --- Audit state. Per machine, never replicated. -----------------------------------------------
+	FVector AuditLastLocation = FVector::ZeroVector;
+	bool bAuditHasLast = false;
+	bool bAuditWasHeld = false;
+	bool bAuditWindowOpen = false;
+	float AuditWindowEndTime = 0.f;
+	double AuditPathLength = 0.0;
+	double AuditMaxStep = 0.0;
+	double AuditWorstHomeError = 0.0;
+	float AuditAwayFromHomeSeconds = 0.f;
+	int32 AuditMovingFrames = 0;
+	int32 AuditFrames = 0;
+
+	// --- Goal-repro state. Server only, never replicated. ------------------------------------------
+	bool bGoalReproArmed = false;
+	float GoalReproFireTime = 0.f;
+	ETraceTeam GoalReproTeam = ETraceTeam::None;
+	int32 GoalReproRunsDone = 0;
+	float GoalReproNextAutoTime = 0.f;
 
 	/**
 	 * The momentum measurement has already run once.

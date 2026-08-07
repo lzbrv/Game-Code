@@ -240,9 +240,17 @@ public:
 	// Match structure (spec §1). All `config`, so DefaultGame.ini tunes the whole format.
 	// ------------------------------------------------------------------------------------------
 
-	/** Seconds of play in ONE half. Two of these is the match. */
+	/**
+	 * Seconds of play in ONE half. Two of these is the match.
+	 *
+	 * 480 = 8 minutes (spec v10 §7, down from 10). THE INI WINS: Config/DefaultGame.ini carries
+	 * `HalfDuration=480.000000` under [/Script/Trace.TraceGameMode] and that is the shipped value.
+	 * This initialiser is only what a config-less run would get, and it is kept in agreement so the
+	 * header cannot be read as documentation of a number the game does not use. Confirm from a
+	 * running game ("1ST HALF started: 480s"), never from this line.
+	 */
 	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Match")
-	float HalfDuration = 600.f;
+	float HalfDuration = 480.f;
 
 	/** Periods of play per match. 2 is the spec; 1 restores the old single-period behaviour. */
 	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Match")

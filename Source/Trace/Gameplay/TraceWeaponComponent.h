@@ -4,12 +4,46 @@
 #include "Components/ActorComponent.h"
 #include "Engine/NetSerialization.h"
 #include "Gameplay/TraceHitZones.h"   // ETraceHitZone
+#include "Gameplay/TraceMelee.h"      // ETraceEquippedWeapon, ETraceMeleeRefusal, FTraceMeleeHit
+#include "UObject/ObjectPtr.h"
 #include "TraceWeaponComponent.generated.h"
 
 class ATraceCharacter;
+class USceneComponent;
+class UStaticMesh;
+class UStaticMeshComponent;
 
 /**
- * The hitscan handgun carried by everyone who is not holding the Core.
+ * The hitscan handgun AND the knife (spec v10 §1) — one component, because they are one selector.
+ *
+ * ============================================================================================
+ * THE KNIFE LIVES HERE, AND Gameplay/TraceMelee.h IS ITS DESIGN DOCUMENT.
+ * ============================================================================================
+ *
+ * Read TraceMelee.h before changing anything below the FIRE section. It carries the full rationale
+ * for the carrier immunity ([USER-CONFIRMED]: the knife can NEVER hurt the Core carrier, not even
+ * mid-pass), for the back/front angle model, for why the swing is a swept arc rather than a point,
+ * and for why the yaw ring exists at all. This header only says how the STATE is arranged.
+ *
+ * WHY BOTH WEAPONS ARE ONE COMPONENT. A separate melee component would mean two replicated objects
+ * agreeing about which weapon is in your hands, and this codebase already carries a four-writer bug
+ * of exactly that shape (ATracePlayerState::bIsCarrier). One component means:
+ *
+ *   * ONE selector on the wire — EquippedWeapon, plus one deadline for the pullout;
+ *   * ONE gate. CanFire() and CanSwing() are two branches of the same question, so "you may not
+ *     shoot while the knife is out" and "you may not swing while the gun is out" cannot disagree;
+ *   * ONE input path. ATraceCharacter::DoFirePressed already routes mouse1 here, so StartFire()
+ *     dispatches to a swing when the knife is equipped and nothing outside this file has to learn
+ *     a new verb — which is also what gets the bots swinging with no change to their controller.
+ *
+ * THE SWAP IS A TOGGLE ON ONE BIND, and 0.2 s of it is dead air in which NEITHER weapon works. That
+ * deadline is replicated (DeployEndServerTime, on the shared clock), so the server refuses a shot
+ * or a swing inside a pullout using the same number the client gated on. The owning client predicts
+ * the swap locally, exactly as it predicts its own tracer; the server's copy arrives ~RTT/2 later
+ * and can only ever push the deadline LATER, never earlier, so prediction cannot buy time.
+ *
+ * ============================================================================================
+ * The handgun.
  *
  * DAMAGE IS POSITIONAL (spec section 6): head 100 / body 40 / legs 25 against 100 health, so a
  * head shot kills outright, three body shots kill, four leg shots kill. There is no headshot
@@ -48,13 +82,25 @@ public:
 
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
-	/** Trigger pressed. Local input path only; fires one shot right away, then repeats while held. */
+	/** EquippedWeapon and DeployEndServerTime. Everything else here is local or RPC-only. */
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+	/**
+	 * ATTACK PRESSED. Local input path only.
+	 *
+	 * Dispatches on the equipped weapon: a shot with the gun, a swing with the knife. This is the
+	 * whole reason the knife needed no new input plumbing and no bot-controller change — mouse1 is
+	 * "attack", and ATraceCharacter::DoFirePressed already routes it here.
+	 */
 	void StartFire();
 
-	/** Trigger released. */
+	/** Attack released. */
 	void StopFire();
 
-	/** False while carrying the Core, while dead, or while the local fire-rate gate is closed. */
+	/**
+	 * False while carrying the Core, while dead, MID-DASH (spec §6), during a weapon pullout, while
+	 * the knife is equipped, or while the local fire-rate gate is closed.
+	 */
 	bool CanFire() const;
 
 	/**
@@ -74,6 +120,115 @@ public:
 	 */
 	UFUNCTION(NetMulticast, Unreliable)
 	void MulticastFireEffects(FVector_NetQuantize Origin, FVector_NetQuantize Impact, bool bImpacted);
+
+	// =============================================================================================
+	// THE KNIFE (spec v10 §1). Design rationale: Gameplay/TraceMelee.h. Read it first.
+	// =============================================================================================
+
+	/** Which weapon is in this pawn's hands. Replicated, so every machine agrees — including the
+	 *  movement component, which multiplies the ground speed limit by 1.30 off the back of it. */
+	ETraceEquippedWeapon GetEquippedWeapon() const { return EquippedWeapon; }
+
+	bool IsKnifeEquipped() const { return EquippedWeapon == ETraceEquippedWeapon::Knife; }
+
+	/** True inside the 0.2 s pullout, during which neither weapon works. Shared clock, so it is the
+	 *  same answer on the client that predicted the swap and on the server that validates it. */
+	bool IsDeploying() const;
+
+	/** Seconds left of the pullout; 0 when the weapon is up. HUD and diagnostics. */
+	float GetDeployRemaining() const;
+
+	/** Seconds until the next swing is legal; 0 when it is legal now. HUD and bots. */
+	float GetSwingCooldownRemaining() const;
+
+	/**
+	 * THE SWAP BIND. Toggles gun <-> knife. Local input path only; safe to call on any machine.
+	 *
+	 * Wire the rebindable key to this (through ATraceCharacter, see the pass report). Both
+	 * directions are one bind and one 0.2 s pullout, because the user gave one pullout number and a
+	 * knife that comes up faster than it goes away is a second mechanic nobody asked for.
+	 */
+	void DoSwapWeaponPressed();
+
+	/**
+	 * Explicit form of the swap — what the bots and the console commands want, since they are not
+	 * toggling. Predicts locally on an owning client and asks the server; acts directly on the
+	 * server. Returns true when a pullout started.
+	 */
+	bool RequestEquip(ETraceEquippedWeapon Desired, ETraceMeleeRefusal* OutRefusal = nullptr);
+
+	/**
+	 * Starts one swing. The blade resolves SwingWindupSeconds later (see TickSwing), which is what
+	 * makes it read as a swing rather than as a very short shotgun. Returns true when it started.
+	 */
+	bool StartSwing(ETraceMeleeRefusal* OutRefusal = nullptr);
+
+	/** The knife's half of CanFire(): alive, not carrying, not dashing, deployed, off cooldown. */
+	bool CanSwing(ETraceMeleeRefusal* OutRefusal = nullptr) const;
+
+	/**
+	 * @param Desired               the weapon to bring up. A request for the weapon already equipped
+	 *                              still costs a pullout, deliberately: refusing it silently would
+	 *                              make a double-tap of the bind feel like a dropped input.
+	 * @param ClientPressServerTime  shared-clock timestamp of the PRESS, from the pressing machine.
+	 *
+	 * THE STAMP IS WHY A CLIENT'S PULLOUT IS 0.2 s AND NOT 0.2 s PLUS THEIR PING, and it is the same
+	 * trick TraceParry::ServerResolvePress plays for the parry window. MEASURED, on a real client at
+	 * 40 ms, before this parameter existed: the client predicted a deadline of press + 0.2 on the
+	 * shared clock, the server anchored ITS deadline at arrival + 0.2, and the replicated value
+	 * pushed the client's out to 0.294 s — a 47% error in one of only three numbers the user gave.
+	 *
+	 * Anchoring the deadline at the stamped press makes both machines compute the identical shared
+	 * clock instant, so the replicated update is a no-op instead of an extension. THE CLAMP IS THE
+	 * SECURITY, exactly as it is for a shot: whatever the client claims, the press is pinned into
+	 * [ServerNow - MaxRewindTime, ServerNow] — never in the future, so a swap cannot be pre-booked,
+	 * and never further back than a bullet may be rewound, so it cannot be used to skip the pullout.
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerRequestEquip(ETraceEquippedWeapon Desired, float ClientPressServerTime);
+
+	/**
+	 * One swing, resolved against rewound poses exactly as ServerFire resolves a shot.
+	 *
+	 * @param Origin                Blade origin the client swung from (GetMuzzleLocation()).
+	 * @param Direction             Centre of the arc; the sweep is built around it identically on
+	 *                              both machines, so there is no arc geometry on the wire.
+	 * @param ClientSwingServerTime Shared-clock timestamp of the RESOLVE INSTANT — the moment the
+	 *                              edge passed through, not the moment the key went down. That is
+	 *                              the instant the client saw the blade cross the target, so it is
+	 *                              the instant the server has to rewind to.
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerSwing(FVector_NetQuantize Origin, FVector_NetQuantizeNormal Direction, float ClientSwingServerTime);
+
+	/**
+	 * Cosmetic slash for everyone except the swinger, who already drew it. Same owner-skipping
+	 * contract as MulticastFireEffects, and for the same reason.
+	 */
+	UFUNCTION(NetMulticast, Unreliable)
+	void MulticastSwingEffects(FVector_NetQuantize Origin, FVector_NetQuantizeNormal Direction, bool bConnected);
+
+	UFUNCTION()
+	void OnRep_EquippedWeapon();
+
+	/**
+	 * SERVER. "Which way was @p Character's body facing at shared-clock time @p ServerTime?"
+	 *
+	 * THE ONE THING THE KNIFE COULD NOT BORROW FROM THE GUN. FTraceLagCompFrame records a capsule
+	 * and no rotation at all, because a bullet does not care which way you are looking — and a
+	 * back-stab cares about nothing else. At 40 ms each way a briskly turning player's yaw is 80 ms
+	 * stale, which at 400 deg/s is 32 degrees: enough to flip a 3.3x damage verdict, in the
+	 * direction the attacker cannot see. So this component keeps its own ring (one float per frame
+	 * per pawn, trimmed by the same UTraceSettings::LagCompHistoryDuration window the pose history
+	 * uses) and TraceMelee::ResolveSwing asks it.
+	 *
+	 * ACTOR yaw, not control yaw: the attacker is aiming at a MESH, and the mesh faces the actor.
+	 *
+	 * @return false when there is no history covering that instant (a fresh spawn, a client, lag
+	 *         compensation switched off); @p OutYaw is then left exactly as the caller set it, so
+	 *         the caller's live-pose fallback survives.
+	 */
+	static bool GetFacingYawAtTime(const ATraceCharacter* Character, float ServerTime, float& OutYaw);
 
 private:
 	ATraceCharacter* GetTraceCharacter() const;
@@ -184,4 +339,188 @@ private:
 
 	/** Absurdity check on the raw payload before any of it is used in maths. */
 	static constexpr double MaxReasonableCoordinateUU = 1.0e7;
+
+	// =============================================================================================
+	// KNIFE STATE (spec v10 §1). Design rationale: Gameplay/TraceMelee.h.
+	// =============================================================================================
+
+	/**
+	 * The selector. Replicated to EVERYONE, not just the owner, and that is load-bearing three ways:
+	 * the movement component multiplies the ground speed limit by it on every machine (so the client
+	 * predicts its own 1040 uu/s instead of being corrected into it), other players see the knife in
+	 * the hand, and the server gates ServerFire/ServerSwing on the same value the client gated on.
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_EquippedWeapon)
+	ETraceEquippedWeapon EquippedWeapon = ETraceEquippedWeapon::Gun;
+
+	/**
+	 * Shared-clock instant the current pullout finishes. Negative means "no pullout in progress".
+	 *
+	 * THE SHARED CLOCK, not a local one, and not a duration. A duration would need a start instant
+	 * to be meaningful and would then have to be replicated alongside it; a deadline on
+	 * AGameStateBase::GetServerWorldTimeSeconds is one float that means the same thing on every
+	 * machine — the same choice UTraceTrailComponent makes for the parry window.
+	 */
+	UPROPERTY(Replicated)
+	float DeployEndServerTime = -1.f;
+
+	/** Local-clock instant of the last swing this machine STARTED. Drives the 0.5 s gate. */
+	double LastLocalSwingTime = -1000.0;
+
+	/** Local-clock instant of the last swing the server accepted. Authority only. */
+	double LastAcceptedSwingTime = -1000.0;
+
+	/** Local-clock instant the pending swing's blade should resolve; see TickSwing. */
+	double SwingResolveAtLocalTime = -1000.0;
+	bool bSwingPendingResolve = false;
+
+	/** Local-clock instant the current swing animation started, or a large negative sentinel. */
+	double SwingAnimStartLocalTime = -1000.0;
+
+	/**
+	 * Fraction of SwingCooldownSeconds the server forgives, for exactly the reason FireRateTolerance
+	 * exists: honest clients time their swings against their own smoothed copy of the shared clock
+	 * and their packets arrive jittered. Cheating past it buys ~20% more swings, not a teleport.
+	 */
+	static constexpr double SwingRateTolerance = 0.2;
+
+	/** Runs the wind-up: resolves the blade and sends ServerSwing when the edge passes through. */
+	void TickSwing(float DeltaTime);
+
+	/**
+	 * Pushes "is the knife the active weapon" into UTraceCharacterMovementComponent.
+	 *
+	 * THE DIVISION OF LABOUR (spec v10 §1): this slice owns the FACT, the movement slice owns the
+	 * NUMBERS. UTraceCharacterMovementComponent::SetKnifeMovementProfileActive is the documented
+	 * entry point for the melee slice and the multipliers behind it (KnifeMoveSpeedMultiplier and
+	 * the two air-cap multipliers) live on UTraceSettings where the movement component reads them.
+	 * There is no second copy of 1.30 anywhere in the melee code, deliberately.
+	 *
+	 * CALLED ON EVERY MACHINE, and that is required rather than tidy: the bit is round-tripped
+	 * through FSavedMove_Trace, so a server correction replays each move under the profile that move
+	 * actually ran with — but only if both ends were told. Their contract says it is idempotent and
+	 * cheap enough to call every frame, so it is called from the tick as well as from the equip, and
+	 * the tick call is what catches a carrier transition (which changes the answer without changing
+	 * the selector) and a pawn whose movement component was not ready at equip time.
+	 */
+	void RefreshMovementProfile();
+
+	/** Applies a swap locally (both the state and the deadline). Server and predicting client. */
+	void ApplyEquip(ETraceEquippedWeapon Desired, double DeployEndSharedTime);
+
+	// --- The victim-facing ring (see GetFacingYawAtTime) ------------------------------------------
+
+	struct FTraceFacingSample
+	{
+		float ServerTime = 0.f;
+		float Yaw = 0.f;
+	};
+
+	/**
+	 * Oldest first, newest last, trimmed by age. Not a UPROPERTY on purpose: plain floats with no
+	 * UObject references, so there is nothing for the GC to keep alive and nothing worth the
+	 * reflection overhead — the same reasoning UTraceLagCompensationComponent::History gives.
+	 */
+	TArray<FTraceFacingSample> FacingHistory;
+
+	/** Server only. Appends one sample and trims the window. Called once per tick. */
+	void RecordFacingSample(float ServerTime);
+
+	/** Hard ceiling so a hitch cannot grow the ring without bound. Matches the pose history's. */
+	static constexpr int32 MaxFacingSamples = 512;
+
+	// --- Bots (spec §1: "Bots must use it, or it will not be playtested") -------------------------
+
+	/**
+	 * The bot's knife rule, in one function: swap to the knife inside BotEngageRangeUU of the
+	 * nearest living enemy, back to the gun outside BotDisengageRangeUU, and let the existing burst
+	 * logic do the swinging — because StartFire() dispatches to a swing, a bot holding its trigger
+	 * with the knife out is already swinging at the 0.5 s cadence with no change to its controller.
+	 *
+	 * TEMPORARY, AND HONESTLY SO. This belongs in ATraceBotController's state machine (a knife pass
+	 * on HuntCarrier / ChaseLooseCore / Fight would be far better than a range band), but that file
+	 * is another ownership slice this pass. It lives here so the weapon is actually exercised by a
+	 * bot match TODAY rather than being shipped untested; see the pass report for the hand-off.
+	 * Authority + bot-controlled only, and switchable with Trace.Knife.BotAuto.
+	 */
+	void TickBotKnife();
+
+	/** Local-clock time of the last bot swap decision, so a bot cannot thrash the 0.2 s pullout. */
+	double LastBotSwapDecisionTime = -1000.0;
+
+	// --- Presentation: the knife you can see ------------------------------------------------------
+	//
+	// TWO rigs, because there are two audiences and they need opposite things:
+	//
+	//   KnifeViewRoot   first person, OnlyOwnerSee, hung under ATraceCharacter::ViewModelRoot so it
+	//                   inherits the sway/bob/recoil transform the gun already gets for free. This
+	//                   is the rig that physically swings, and it is the swinger's whole read.
+	//   KnifeHandRoot   third person, OwnerNoSee, attached to the Mannequin's hand_r bone so every
+	//                   OTHER player can see that this person chose the knife — which is the tell
+	//                   that they are now 30% faster and cannot shoot back.
+	//
+	// Both are built lazily and on rendering machines only. Neither collides, neither casts a
+	// shadow, and neither is ever read by the hit resolution: TraceMelee::ResolveSwing is pure
+	// arithmetic on the aim ray, so the blade can lag, swing and overshoot without the arc it
+	// actually cut moving by a millimetre.
+
+	void EnsureKnifeVisualsBuilt();
+	void UpdateKnifeVisuals(float DeltaTime);
+
+	/**
+	 * Hides the GUN half of ATraceCharacter's viewmodel while the knife is out — the weapon parts
+	 * only, never the hands or forearms, or the player would be holding a knife with no hands.
+	 *
+	 * Identified by NAME, and that is a documented compromise rather than an oversight: the parts
+	 * table is private to ATraceCharacter (another ownership slice) and the only public handle on
+	 * the rig is ViewModelRoot. The failure mode if that table is ever renamed is benign and
+	 * visible — the gun stays on screen next to the knife, which is ugly and immediately obvious,
+	 * rather than the hands vanishing, which is subtle and looks like a rendering bug.
+	 */
+	void SetGunViewModelHidden(bool bHidden);
+
+	/** True for the hand/forearm parts of the viewmodel, which stay visible with either weapon. */
+	static bool IsViewModelHandPart(const UStaticMeshComponent* Part);
+
+	/** One primitive of either knife rig. Mirrors ATraceCharacter::AddViewModelPart's guarantees. */
+	UStaticMeshComponent* AddKnifePart(USceneComponent* AttachTo, const TCHAR* DebugName,
+		UStaticMesh* Mesh, const FVector& Location, const FRotator& Rotation, const FVector& Size,
+		bool bNeon, bool bFirstPerson);
+
+	UPROPERTY(Transient)
+	TObjectPtr<USceneComponent> KnifeViewRoot;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> KnifeViewParts;
+
+	UPROPERTY(Transient)
+	TObjectPtr<USceneComponent> KnifeHandRoot;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> KnifeHandParts;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMesh> KnifeCubeMesh;
+
+	/**
+	 * Two latches, not one, and that is a real bug avoided rather than tidiness.
+	 *
+	 * On a client the controller arrives by replication some frames AFTER the pawn does, so a single
+	 * "visuals built" latch set on the first tick would decide "this pawn is not locally controlled,
+	 * therefore no first-person knife" and never revisit it — the local player would carry an
+	 * invisible knife for the whole match. The two rigs have different preconditions (one needs the
+	 * viewmodel and local control, the other needs the Mannequin's hand_r socket, which does not
+	 * exist at all when the art import has not been run), so they latch independently.
+	 */
+	bool bKnifeViewBuilt = false;
+	bool bKnifeHandBuilt = false;
+
+	/** Set once when /Engine/BasicShapes could not be resolved, so the warning is logged once. */
+	bool bKnifeMeshUnavailable = false;
+
+	bool bGunViewModelHidden = false;
+
+	/** Last visibility pushed to each rig, so the render state is only dirtied on a change. */
+	bool bKnifeViewVisible = false;
+	bool bKnifeHandVisible = false;
 };

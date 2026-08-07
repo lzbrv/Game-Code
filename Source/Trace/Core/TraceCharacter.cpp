@@ -1206,6 +1206,13 @@ bool ATraceCharacter::IsDashing() const
 	return Movement != nullptr && Movement->IsDashing();
 }
 
+bool ATraceCharacter::AreWeaponActionsBlocked() const
+{
+	// Spec v10 §6. See the header for why this is not simply IsDashing() at the call site.
+	const UTraceCharacterMovementComponent* Movement = GetTraceMovement();
+	return Movement != nullptr && Movement->AreWeaponActionsBlocked();
+}
+
 UTraceCharacterMovementComponent* ATraceCharacter::GetTraceMovement() const
 {
 	// Not cached: Cast<> on a known-typed subobject is a pointer compare against the class chain,

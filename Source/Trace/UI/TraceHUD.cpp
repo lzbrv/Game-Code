@@ -16,6 +16,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceMelee.h"          // v10 §1 — the equipped-weapon row and its two timers
 #include "Gameplay/TraceParry.h"          // v6 §3 — the parry-kill banner and the death-panel line
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "InputCoreTypes.h"               // EKeys::Escape, for the pause poll
@@ -1210,6 +1211,73 @@ void ATraceHUD::DrawHealthAndDash()
 
 	const FLinearColor TeamTint = TraceTeamColor(LocalTeam);
 
+	// ---- Equipped weapon (spec v10 §1) ----------------------------------------------------------
+	//
+	// DRAWN FIRST, so it is the row NEAREST the health bar and therefore the one row in this stack
+	// whose screen position never moves. Every other row here is conditional — parry only for a
+	// carrier, slide only mid-slide — so a row drawn after them would slide up and down the screen
+	// as those conditions flicker. The weapon is the one piece of state that is always true, and a
+	// player checking "am I holding the knife?" mid-fight must find it in the same place every time.
+	//
+	// It also carries the two timings the spec names, because both are invisible otherwise and both
+	// are refusals the player will otherwise read as the game ignoring their input:
+	//   - the 0.2 s PULLOUT, during which you can neither shoot nor swing, drawn as a filling meter;
+	//   - the 0.5 s swing COOLDOWN, drawn the same way, so "why did my click do nothing" has an
+	//     answer on screen rather than in a log.
+	// A dead player gets no row at all: the weapon you are not holding is not information.
+	if (LocalChar->IsAlive())
+	{
+		const bool bKnife   = TraceMelee::IsKnifeEquipped(LocalChar);
+		const float Deploy  = TraceMelee::GetDeployRemaining(LocalChar);
+		const float Cooling = TraceMelee::GetSwingCooldownRemaining(LocalChar);
+
+		// The CARRIER's weapon is stowed, not held: they cannot shoot and cannot swing, and saying
+		// "KNIFE" to somebody whose knife does nothing is the same lie the SHIELD DOWN callout exists
+		// to avoid. They get the row, but it says what is actually true.
+		const FString WeaponText = bLocalCarrying
+			? FString(TEXT("STOWED"))
+			: (bKnife ? FString(TEXT("KNIFE")) : FString(TEXT("GUN")));
+
+		DrawTextLeft(TEXT("WEAPON"), bLocalCarrying ? TraceHUDStyle::InkDim : TraceHUDStyle::Ink,
+			Margin, VCenterTextY(FString(TEXT("WEAPON")), FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+		// One meter, three meanings, in priority order — pullout beats cooldown beats ready, which is
+		// exactly the order in which they gate the trigger.
+		float  Fraction = 1.f;
+		FLinearColor WeaponColor = bKnife
+			? FLinearColor(0.85f, 0.85f, 0.92f, 1.f)              // blade white
+			: TraceHUDStyle::Shade(TeamTint, 1.0f, 0.25f);        // the gun wears the team's colour
+		FString StatusText = WeaponText;
+
+		if (Deploy > TraceHUDStyle::TimeEpsilon)
+		{
+			const float SwapTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceMelee::GetSwapSeconds());
+			Fraction = FMath::Clamp(1.f - (Deploy / SwapTotal), 0.f, 1.f);
+			WeaponColor = TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
+			StatusText = FString::Printf(TEXT("%s  DRAWING"), *WeaponText);
+		}
+		else if (bKnife && !bLocalCarrying && Cooling > TraceHUDStyle::TimeEpsilon)
+		{
+			const float CooldownTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceMelee::GetSwingCooldownSeconds());
+			Fraction = FMath::Clamp(1.f - (Cooling / CooldownTotal), 0.f, 1.f);
+			WeaponColor = FLinearColor(0.45f, 0.45f, 0.50f, 1.f);
+			StatusText = FString::Printf(TEXT("%s  %.1f"), *WeaponText, Cooling);
+		}
+		else if (bLocalCarrying)
+		{
+			Fraction = 0.35f;
+			WeaponColor = TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
+		}
+
+		DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, Fraction, WeaponColor);
+
+		DrawTextLeft(StatusText, TraceHUDStyle::InkDim,
+			Margin + BarW + (10.f * UIScale),
+			VCenterTextY(StatusText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+		RowY -= (RowH + RowGap);
+	}
+
 	// ---- Parry (spec §3), where BOOST used to be ------------------------------------------------
 	//
 	// BOOST IS DELETED (spec §1: "remove boost from the game entirely"), and its row is gone with it,
@@ -1872,6 +1940,9 @@ namespace TraceKillFeedArt
 	 *   Round            BULLET.    The default for body and leg shots. Pointed right, with the
 	 *                               case/projectile groove that stops it reading as an arrow.
 	 *   Cross            WORLD.     Fell out of the arena, or an unattributable death.
+	 *   Blade            KNIFE.     A front swipe (30). Neutral, because it is an ordinary trade.
+	 *   Blade + chevron  BACKSTAB.  100 from the rear hemisphere. Amber, the same amber the skull
+	 *                               wears, because those two are the game's only 100-damage events.
 	 */
 	static constexpr int32 GlyphGrid = 13;
 
@@ -1983,6 +2054,53 @@ namespace TraceKillFeedArt
 		TEXT(".............")
 	};
 
+	// A knife, pointed up-right: a wide handle at the bottom-left, a guard step, then a blade whose
+	// spine is straight and whose edge tapers to a point.
+	//
+	// The bullet glyph's rules above apply and were obeyed: interior detail is at least TWO cells
+	// wide (the guard notch is two), and the silhouette is ONE connected shape (no detached guard —
+	// draft 3's battery failure is exactly what a floating cross-guard would reproduce). It is
+	// deliberately ASYMMETRIC about both axes, which is what separates it from the bullet: the round
+	// is exactly horizontally symmetric, so a symmetric blade at 26 px would collide with it.
+	static const TCHAR* const GlyphKnife[GlyphGrid] =
+	{
+		TEXT("..........##."),
+		TEXT(".........###."),
+		TEXT("........####."),
+		TEXT(".......#####."),
+		TEXT("......#####.."),
+		TEXT(".....#####..."),
+		TEXT("....#####...."),
+		TEXT("...#####....."),
+		TEXT("..#####......"),
+		TEXT(".#######....."),
+		TEXT(".#######....."),
+		TEXT("###.........."),
+		TEXT("###..........")
+	};
+
+	// The same blade, plus a double chevron BEHIND it pointing at the handle.
+	//
+	// The chevron is the dash glyph's own shape, and reusing it is the point: a back-stab is "hit
+	// from the direction the victim was not looking", which is the same idea the dash chevron already
+	// means. Two cells thick with a two-cell gap so the dilate cannot close it (see the bullet note).
+	static const TCHAR* const GlyphBackstab[GlyphGrid] =
+	{
+		TEXT("..........##."),
+		TEXT(".........###."),
+		TEXT("........####."),
+		TEXT("##.....#####."),
+		TEXT("###...#####.."),
+		TEXT(".###.#####..."),
+		TEXT("..#######...."),
+		TEXT(".###.#####..."),
+		TEXT("###...#####.."),
+		TEXT("##...####...."),
+		TEXT(".....####...."),
+		TEXT("...###......."),
+		TEXT("...###.......")
+	};
+
 	static const TCHAR* const* GlyphFor(ETraceKillIcon Icon)
 	{
 		switch (Icon)
@@ -1991,6 +2109,8 @@ namespace TraceKillFeedArt
 		case ETraceKillIcon::Dash:     return GlyphDash;
 		case ETraceKillIcon::Parry:    return GlyphParry;
 		case ETraceKillIcon::World:    return GlyphWorld;
+		case ETraceKillIcon::Knife:    return GlyphKnife;
+		case ETraceKillIcon::Backstab: return GlyphBackstab;
 		default:                       return GlyphBullet;
 		}
 	}
@@ -2007,7 +2127,12 @@ namespace TraceKillFeedArt
 		case ETraceKillIcon::Headshot: return TraceHUDStyle::Warning;
 		case ETraceKillIcon::Parry:    return TraceHUDStyle::Danger;
 		case ETraceKillIcon::World:    return TraceHUDStyle::InkDim;
-		default:                       return TraceHUDStyle::Ink;   // Bullet and Dash: neutral
+		// A back-stab is a one-swing kill from behind, so it gets the same amber the head shot gets:
+		// this HUD already means "that was the expensive kind of hit" by amber, and the two are the
+		// only 100-damage single events in the game. The front swipe stays neutral because it is not
+		// one — 30 damage, four swings, an ordinary trade.
+		case ETraceKillIcon::Backstab: return TraceHUDStyle::Warning;
+		default:                       return TraceHUDStyle::Ink;   // Bullet, Dash and Knife: neutral
 		}
 	}
 

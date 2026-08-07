@@ -69,8 +69,9 @@ struct FTraceDashHudState
  *   Fire        bool     LMB           (doubles as "put me back in" while dead)
  *   Pass        bool     RMB
  *   Dash        bool     Left Shift
- *   Parry       bool     Q             (carrier only — 0.2s of trace invulnerability, spec v3 §3 / v8 §3)
+ *   Parry       bool     Q             (carrier only — 0.175s of trace invulnerability, spec v3 §3 / v8 §3 / v10 §4)
  *   Scoreboard  bool     Tab           (held)
+ *   SwapWeapon  bool     F             (gun <-> knife, spec v10 §1; the SWING rides IA_Fire)
  */
 UCLASS()
 class TRACE_API ATracePlayerController : public APlayerController
@@ -340,6 +341,10 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UInputAction> IA_Parry;
 
+	/** Spec v10 §1. Gun <-> knife toggle; default F. There is deliberately no IA_Swing — see below. */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_SwapWeapon;
+
 	/**
 	 * Builds InputMapping and every IA_* exactly once, then lays down the key mappings.
 	 *
@@ -383,6 +388,12 @@ protected:
 	 * held-key bug gets reintroduced the day somebody makes the window hold-to-extend.
 	 */
 	void OnParryCompleted();
+	/**
+	 * Press edge of the weapon swap (spec v10 §1). Press-only, and that asymmetry is deliberate:
+	 * unlike parry, the swap is a state TOGGLE, so binding the release edge as well would swap twice
+	 * per press. TraceMelee::RequestSwapWeapon owns every refusal (carrying, dead, mid-swap, dashing).
+	 */
+	void OnSwapWeaponStarted();
 	void OnCrouchStarted();
 	void OnCrouchCompleted();
 	void OnScoreboardStarted();

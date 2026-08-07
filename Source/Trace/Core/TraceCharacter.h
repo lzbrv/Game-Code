@@ -343,6 +343,25 @@ public:
 	bool IsDashing() const;
 
 	/**
+	 * Spec v10 §6 — "don't let players shoot while in a dash animation; as soon as they end the
+	 * dash, let them shoot again". The gate UTraceWeaponComponent::CanFire and ::CanSwing consult.
+	 *
+	 * Forwards to UTraceCharacterMovementComponent::AreWeaponActionsBlocked(), which is a pure
+	 * function of the dash clock — so it releases on the exact frame the dash ends. It is a GATE,
+	 * not a cooldown: there is no timer here, nothing to expire, and no frame of lockout afterwards.
+	 *
+	 * It is a NAMED forwarder rather than a second IsDashing() call at each gate on purpose. "The
+	 * weapon is blocked" and "the pawn is dashing" happen to be the same fact today, and the day
+	 * they stop being the same fact (a stun, a mantle, a landing recovery) there must be one place
+	 * to change rather than a grep for IsDashing() across two slices.
+	 *
+	 * VALID on the owning client and on the server; MEANINGLESS on a simulated proxy, where nothing
+	 * replicates the dash clock and it reads false forever. Gate the shooter's own machine and the
+	 * server, never somebody else's pawn.
+	 */
+	bool AreWeaponActionsBlocked() const;
+
+	/**
 	 * The view mode this pawn WANTS, which is simply "am I not carrying the Core". The camera may
 	 * still be mid-blend toward it; GetViewBlendAlpha() is the settled truth about the camera.
 	 */
