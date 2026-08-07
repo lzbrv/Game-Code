@@ -30,6 +30,9 @@
 #include "Engine/SkyLight.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "GameFramework/Character.h"                   // Trace.Arena.CoveWalk steers the local pawn
+#include "GameFramework/CharacterMovementComponent.h"   // Trace.Arena.WallStick reads wish vs actual velocity
+#include "GameFramework/PlayerController.h"             // Trace.Arena.CoveWalk / Trace.Arena.Pose
 #include "EngineUtils.h"                       // TActorIterator
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
@@ -452,6 +455,53 @@ namespace TraceArenaConstants
 	 * visible dark gutter between the bank's toe and the lit line.
 	 */
 	static constexpr float BankGoalClearance = 60.f;
+
+	// --- The cove at the base of every wall (spec v9 section 10) -----------------------------------
+	//
+	// THE SKETCH: a vertical side wall curving smoothly into the floor. Built from the same nested
+	// axis-aligned boxes as the corner banks, laid on a quarter ellipse instead of on a straight
+	// line, and governed by exactly three numbers. Every one of them is a GAMEPLAY constraint, not
+	// an art one, which is why they live here rather than in the material block below.
+
+	/**
+	 * Minimum tread on any cove step.
+	 *
+	 * THE MANTLE'S TOP PROBE IS WHAT SETS THIS. TryBeginMantle finds a vertical face ahead, then
+	 * drops a trace CapsuleRadius * 0.5 = 17 uu PAST that face to find the top of the ledge. On a
+	 * staircase with a tread narrower than 17 uu that probe lands on the step ABOVE the one it
+	 * should have found, so it reports a ledge two risers up - 74 uu, which is inside the mantle
+	 * window [55, 230] - and a cove step becomes a climbable ledge. At 24 uu the probe always lands
+	 * on the adjacent tread and reports ONE riser (37 uu), which is below MantleMinHeightUU and is
+	 * refused. 40% of margin on a 17 uu threshold, and the check is in the profile generator so a
+	 * future depth/height change cannot quietly cross it.
+	 *
+	 * It is also what caps the slope: riser / tread = 37 / 24, i.e. the curve blends until it is
+	 * about 57 degrees and the wall goes vertical from there. A stepped fillet cannot be tangent to
+	 * the wall and still have treads.
+	 */
+	static constexpr float FilletMinTread = 24.f;
+
+	/**
+	 * The cove stops when its inner edge gets this close to the wall face.
+	 *
+	 * WallNeonStandoff, deliberately: that pawn-only shell already forbids a body from pressing
+	 * closer than 40 uu to a wall, so a tread inside it would be walkable geometry nobody can stand
+	 * on - visible ground that rejects you, which is exactly the kind of thing that reads as a bug.
+	 * Stopping here also keeps the top tread wide enough to stand on with the standoff pushing you
+	 * outward (the innermost step ends 43.8 uu out on the shipped numbers).
+	 */
+	static constexpr float FilletMinInner = WallNeonStandoff;
+
+	/**
+	 * Clearance kept between the top of a cove step and the mode-B carry-in ramp above it.
+	 *
+	 * The end-wall cove and the ramp occupy the same 940 uu of floor in front of each hoop. The
+	 * union is walkable either way (see BuildWallFillets), but a step poking through the ramp's
+	 * surface would put a lip across the run-up to the goal - and "the only way in on foot" is not a
+	 * place to discover a bump. Steps that would break it are dropped, which on the shipped numbers
+	 * costs the end walls exactly one step against the side walls' six.
+	 */
+	static constexpr float FilletRampClearance = 12.f;
 
 	// --- Interior layout -------------------------------------------------------------------------
 	//
@@ -889,6 +939,115 @@ namespace TraceArenaConstants
 }
 
 // -------------------------------------------------------------------------------------------------
+// SPEC v9 SECTION 10 - THE COVE PROFILE GENERATOR.
+//
+// "Curve the corners of the arena walls, so that the crosssection of the arena looks something along
+// these lines" - the sketch's side wall sweeping into the floor. One generator, used by BOTH callers
+// (the corner banks and the wall fillets), so the two curves are the same curve at different scales
+// and cannot drift apart.
+//
+// THE SHAPE. A quarter ELLIPSE, horizontal semi-axis Depth and vertical semi-axis Height, concave
+// toward the room. Writing the solid's width at a height z, measured in from the wall face:
+//
+//     W(z) = Depth * (1 - sqrt(1 - ((Height - z) / Height)^2))
+//
+// W(0) = Depth (the toe, where the curve lies flat on the floor) and W(Height) = 0 (the top, where it
+// is tangent to the wall). Everything in between is the fillet.
+//
+//     |                                    ###|  <- tangent to the wall
+//     |  wall                            ##   |
+//     |                                ##     |     Height
+//     |                             ###       |
+//     |                       ######          |
+//     |____________###########________________|  <- tangent to the floor
+//                            <-- Depth -->
+//
+// THE STAIRCASE. Not a rotated ramp, for the reason recorded on the corner banks: Trace's bots have
+// no navmesh and steer straight at their target with AddMovementInput, and a pitched collider met
+// side-on is a wall to them. Nested axis-aligned boxes rising from Z = 0 are the same primitive the
+// rest of the arena is made of, and UCharacterMovementComponent walks up anything under MaxStepHeight
+// without the mover ever knowing there was a step. Step k is a box from the wall out to W(k * Riser)
+// whose top is at (k + 1) * Riser, so its TREAD is the strip between its own outer edge and the next
+// step's, and its RISER is exactly Riser.
+//
+// THE THREE STOP RULES, and each of them is a defect that was reasoned out rather than discovered:
+//
+//   RISER <= MaxRiser        Derived, never assumed: the step count is CEILed from Height / MaxRiser
+//                            so raising the cove adds steps instead of making them taller. At
+//                            StepRise (40, itself 5 under the engine's MaxStepHeight) a cove is
+//                            walkable by construction - and 40 is also below MantleMinHeightUU (55),
+//                            so no single riser can ever present itself as a climbable ledge.
+//
+//   TREAD >= MinTread        The mantle's top probe lands CapsuleRadius * 0.5 = 17 uu past the face
+//                            it found. A narrower tread lets it skip a step and report a two-riser
+//                            ledge INSIDE the mantle window. See FilletMinTread.
+//
+//   INNER EDGE >= MinInner   A cove is vertical at the top, so the last few steps of an untruncated
+//                            one are slivers against the wall - inside the pawn standoff shell, i.e.
+//                            walkable surfaces no body can reach. Stop before that.
+//
+// The last two are what truncate the curve short of tangency: the steepest a staircase of R uu risers
+// can be while keeping a T uu tread is atan(R / T), about 57 degrees at 37 / 24. The wall goes
+// vertical from there. That is inherent to building a fillet out of boxes and it is why this is a
+// blend rather than a true tangent join.
+// -------------------------------------------------------------------------------------------------
+namespace
+{
+	/** One box of a cove: how tall it is, and how far its outer edge stands off the wall face. */
+	struct FTraceCoveStep
+	{
+		float TopZ = 0.f;
+		float OuterDepth = 0.f;
+	};
+
+	/**
+	 * Fills OutSteps with the staircase approximation of a quarter-ellipse cove, outermost/lowest
+	 * first. Empty if the cove is degenerate. Never returns a step that breaks any of the three rules
+	 * above, so a caller can build every step it is handed without re-checking anything.
+	 */
+	void TraceBuildCoveProfile(float Depth, float Height, float MaxRiser, float MinInner, float MinTread,
+		TArray<FTraceCoveStep>& OutSteps)
+	{
+		OutSteps.Reset();
+
+		if (Depth <= 1.f || Height <= 1.f || MaxRiser <= 1.f)
+		{
+			return;
+		}
+
+		// CEIL, so the riser is always STRICTLY under the ceiling rather than equal to it - the same
+		// rule the corner banks have always used, and for the same reason: a riser that lands exactly
+		// on MaxStepHeight is one floating-point tie away from being an unclimbable wall.
+		const int32 StepCount = FMath::Clamp(FMath::CeilToInt(Height / MaxRiser), 1, 32);
+		const float Riser = Height / static_cast<float>(StepCount);
+
+		float PreviousDepth = 0.f;
+
+		for (int32 Index = 0; Index < StepCount; ++Index)
+		{
+			// Width of the ideal solid at the BOTTOM of this step, not the top. That is what makes the
+			// staircase CIRCUMSCRIBE the ellipse instead of being cut inside it - with the top reading
+			// the toe would start at W(Riser) and the flattest, widest part of the curve, which is the
+			// part the eye actually reads as "it curves", would be missing.
+			const float BottomZ = Riser * static_cast<float>(Index);
+			const float Normalised = (Height - BottomZ) / Height;                       // 1 at the floor, 0 at the wall
+			const float StepDepth = Depth * (1.f - FMath::Sqrt(FMath::Max(0.f, 1.f - Normalised * Normalised)));
+
+			if (Index > 0 && (StepDepth < MinInner || (PreviousDepth - StepDepth) < MinTread))
+			{
+				break;   // And everything above it too: the steps have to stay monotone in both axes.
+			}
+
+			FTraceCoveStep& Step = OutSteps.AddDefaulted_GetRef();
+			Step.TopZ = Riser * static_cast<float>(Index + 1);
+			Step.OuterDepth = StepDepth;
+
+			PreviousDepth = StepDepth;
+		}
+	}
+}
+
+// -------------------------------------------------------------------------------------------------
 // SPEC v7 §8 - THE A/B ARM.
 //
 // The whole reason this knob exists is the lesson from the last performance pass: a measurement with
@@ -915,6 +1074,21 @@ namespace
 		TEXT("0 = the pre-spec-v7 path, one Movable UStaticMeshComponent per block, kept only as the BEFORE ")
 		TEXT("arm of Trace.Arena.Perf. Read once when the arena is built, so it must be set before then - ")
 		TEXT("use the -TraceArenaLegacyGeometry command line switch."),
+		ECVF_Default);
+
+	/**
+	 * SPEC v9 SECTION 10's A/B. Same shape as the instancing knob above, same reason: a fix with no
+	 * BEFORE arm in the same binary is not a fix anybody can check. 0 rebuilds the arena the way it
+	 * was - straight bank terraces, no cove - so Trace.Arena.CrossSection can be run against both.
+	 */
+	int32 GArenaWallCove = 1;
+	FAutoConsoleVariableRef CVarArenaWallCove(
+		TEXT("Trace.Arena.WallCove"),
+		GArenaWallCove,
+		TEXT("1 (default) = the corner banks are laid on a quarter ellipse and every wall base carries a ")
+		TEXT("cove (spec v9 10). 0 = the pre-v9 shape, evenly spaced bank terraces and a square wall/floor ")
+		TEXT("join, kept as the BEFORE arm. Read once when the arena is built - use -TraceArenaSquareCorners ")
+		TEXT("to get it in place before the game mode builds the arena."),
 		ECVF_Default);
 }
 
@@ -1299,6 +1473,12 @@ void ATraceArenaBuilder::BuildArena()
 	bBuildingInstancedGeometry = (GArenaInstancing != 0)
 		&& !FParse::Param(FCommandLine::Get(), TEXT("TraceArenaLegacyGeometry"));
 
+	// WHICH WALL/FLOOR JOIN (spec v9 §10), latched here for exactly the reason above: the bank profile
+	// and the cove have to agree with each other, and a knob that changed halfway through the build
+	// would produce an arena whose sidelines curved and whose endzones did not.
+	bBuildingSquareCorners = (GArenaWallCove == 0)
+		|| FParse::Param(FCommandLine::Get(), TEXT("TraceArenaSquareCorners"));
+
 	// WHICH SCORING SHAPE TO PRESENT, decided once here and re-applied whenever the authority says it
 	// changed (ApplyScoringModeInWorld). ATraceGameState is the authority and it is asked first; on a
 	// machine that has no game state yet - the editor preview, or a build that runs before the game
@@ -1336,6 +1516,14 @@ void ATraceArenaBuilder::BuildArena()
 	if (bBuildCornerBanks)
 	{
 		BuildCornerBanks(bBuildVisuals);
+	}
+
+	// Spec v9 section 10. AFTER the banks so its own log line reads in the order the cross-section
+	// does, and before anything that stands on the ground - though the order does not actually matter
+	// to the geometry: the cove is a union with whatever it crosses, not a replacement for it.
+	if (bBuildWallFillets && !bBuildingSquareCorners)
+	{
+		BuildWallFillets(bBuildVisuals);
 	}
 
 	if (bBuildInteriorLayout)
@@ -1852,7 +2040,7 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	// descends toward the centre of the field in BOTH axes:
 	//
 	//        goal line                      halfway
-	//    |Y| = 4800  ###############################____        <- terrace N-1 crest, 352 uu
+	//    |Y| = 4800  ###############################____        <- crest, at the side wall
 	//                  ###########################______
 	//                    #######################__________
 	//    |Y| = 3300        ###################______________    <- terrace 0 toe, 39 uu
@@ -1862,6 +2050,21 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	// is DERIVED from BankHeight rather than fixed, so raising the bank adds terraces instead of
 	// making the risers taller - a bank that "just" needed a taller step would silently become a
 	// wall, and a wall along both sidelines is a bot trap and a carrier's dead end at once.
+	//
+	// SPEC v9 SECTION 10 - THE CROSS-SECTION. The terraces used to be spaced EVENLY across the bank's
+	// depth, which is a straight ramp: it met the floor at an angle at the toe and hit the side wall
+	// dead square at the crest, and that square join at the wall is precisely what the sketch is
+	// asking to be curved away. They are now laid on the quarter-ellipse TraceBuildCoveProfile
+	// generates - flat where they meet the floor, steepening into the wall - so the bank IS the
+	// fillet along the side walls rather than something a fillet has to be added to. The bowl, the
+	// depth, the flat playfield width, the X taper and the goal-line setback are all unchanged;
+	// only the Y position of each terrace moves.
+	//
+	// The crest lands lower than BankHeight and that is the truncation, not a bug: a cove is vertical
+	// where it meets the wall, and the last steps of one are slivers inside the pawn standoff. See
+	// TraceBuildCoveProfile. On the shipped 1500 x 352 bank the profile yields seven terraces topping
+	// out at 274 uu with the crest tread 86 uu off the wall, against nine even ones topping out at
+	// 352 uu. The wall cove (BuildWallFillets) picks the shape up from there.
 	//
 	// WHY THE BANKS STOP AT THE GOAL LINE. The endzones stay flat and full width. The goal line
 	// decal, the endzone floor patch, the gate towers, the spawn fan and the endzone respawn pads
@@ -1884,6 +2087,33 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	// STRICTLY under StepRise (which is itself 5 uu under the engine's MaxStepHeight of 45).
 	const int32 TerraceCount = FMath::Clamp(FMath::CeilToInt(Height / TraceArenaConstants::StepRise), 1, 24);
 	const float Riser = Height / static_cast<float>(TerraceCount);
+
+	// The cove, spec v9 section 10. Depth/height/riser are exactly the bank's own, so the terrace
+	// TOPS are unchanged (step k still tops out at Riser * (k + 1)); only how far in from the
+	// sideline each one reaches has moved off a straight line and onto the ellipse.
+	TArray<FTraceCoveStep> Terraces;
+	if (bBuildingSquareCorners)
+	{
+		// THE BEFORE ARM. Evenly spaced terraces, i.e. a straight ramp - byte for byte the geometry
+		// this function built before spec v9 §10, so Trace.Arena.CrossSection can measure the square
+		// join this pass is meant to remove and show it failing first.
+		for (int32 Index = 0; Index < TerraceCount; ++Index)
+		{
+			FTraceCoveStep& Terrace = Terraces.AddDefaulted_GetRef();
+			Terrace.TopZ = Riser * static_cast<float>(Index + 1);
+			Terrace.OuterDepth = Depth * (1.f - static_cast<float>(Index) / static_cast<float>(TerraceCount));
+		}
+	}
+	else
+	{
+		TraceBuildCoveProfile(Depth, Height, TraceArenaConstants::StepRise,
+			TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMinTread, Terraces);
+	}
+
+	if (Terraces.Num() == 0)
+	{
+		return;
+	}
 
 	// The goal line is where the bank has to stop. GoalLineX() rather than a hand-rolled
 	// HalfX - EndzoneDepth, for the reason spelled out on ClampedEndzoneDepth(): three hand-written
@@ -1917,14 +2147,20 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 
 		for (const float YSign : { -1.f, 1.f })
 		{
-			for (int32 Terrace = 0; Terrace < TerraceCount; ++Terrace)
+			for (int32 Terrace = 0; Terrace < Terraces.Num(); ++Terrace)
 			{
+				// Alpha is still measured against the FULL terrace count, not against however many the
+				// cove kept, so the X taper below places terrace k exactly where it has always placed
+				// terrace k. Dropping the top two slivers must not silently re-space the seven that
+				// remain across the goal setback - that would move the crest along the field, which is
+				// a gameplay change nobody asked for on top of a shape change somebody did.
 				const float Alpha = static_cast<float>(Terrace) / static_cast<float>(TerraceCount);
-				const float TopZ = Riser * static_cast<float>(Terrace + 1);
+				const float TopZ = Terraces[Terrace].TopZ;
 
-				// Y: terrace 0 reaches BankDepth in from the sideline, each one after it a step less,
-				// so the sloped strip is Depth wide with TerraceCount treads across it.
-				const float InnerY = HalfY - Depth * (1.f - Alpha);
+				// Y: terrace 0 still reaches BankDepth in from the sideline; the ones above it now step
+				// in along the ellipse rather than in equal slices, so the treads are wide and shallow
+				// near the floor and tighten as the bank sweeps up into the wall.
+				const float InnerY = HalfY - Terraces[Terrace].OuterDepth;
 
 				// X: terrace 0 runs from the halfway line to just short of the goal line; higher
 				// terraces start further out and stop further back, which is what turns a trough
@@ -1953,10 +2189,183 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 		}
 	}
 
+	// The crest, the crest tread and the narrowest tread are all spelled out because they are the
+	// three numbers spec v9 section 10 is answerable on: how high the curve gets, whether a body can
+	// stand at the top of it, and whether any step is tight enough for the mantle probe to skip.
 	UE_LOG(LogTraceGame, Log,
-		TEXT("Corner banks: %d terraces per bank, %.1f uu riser (ceiling %.0f), crest %.0f uu, %.0f uu deep, X %.0f..%.0f."),
-		TerraceCount, Riser, TraceArenaConstants::StepRise, Height, Depth,
+		TEXT("Corner banks (elliptical cove, spec v9 s10): %d of %d terraces per bank, %.1f uu riser ")
+		TEXT("(ceiling %.0f), crest %.0f uu of a %.0f uu bank, crest tread %.0f uu off the wall, ")
+		TEXT("narrowest tread %.0f uu (floor %.0f), %.0f uu deep, X %.0f..%.0f."),
+		Terraces.Num(), TerraceCount, Riser, TraceArenaConstants::StepRise,
+		Terraces.Last().TopZ, Height, Terraces.Last().OuterDepth,
+		(Terraces.Num() > 1)
+			? (Terraces[Terraces.Num() - 2].OuterDepth - Terraces.Last().OuterDepth)
+			: Terraces.Last().OuterDepth,
+		TraceArenaConstants::FilletMinTread, Depth,
 		0.f, GoalX - TraceArenaConstants::BankGoalClearance);
+}
+
+float ATraceArenaBuilder::WallFilletToeDepth() const
+{
+	if (!bBuildWallFillets || bBuildingSquareCorners)
+	{
+		return 0.f;
+	}
+
+	// Never allowed to swallow more than a quarter of the half width from each side: the cove is
+	// dressing on the edge of the field, and a live edit that made it 5000 uu deep would turn the
+	// playfield into a gutter without anything else in this file noticing.
+	return FMath::Clamp(WallFilletDepth, 0.f, HalfWidth() * 0.25f);
+}
+
+void ATraceArenaBuilder::BuildWallFillets(bool bBuildVisuals)
+{
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v9 SECTION 10 - the cove along the base of every perimeter wall.
+	//
+	// The corner banks now carry the curve along the side walls between the goal lines. This carries
+	// it EVERYWHERE ELSE, and the "everywhere else" list is why it exists at all: both end walls, the
+	// endzone stretches of side wall (the banks deliberately stop at the goal line), and the midfield
+	// taper where the bank has thinned to a single 39 uu terrace. Without it three quarters of the
+	// arena's wall/floor joins would still be square.
+	//
+	// WHY IT CAN SIMPLY BE LAID OVER THE TOP OF EVERYTHING. Each run is nested boxes rising from
+	// Z = 0, so the ground height it produces is a monotone staircase of the horizontal distance from
+	// the wall with every jump under StepRise. So are the floor (trivially), the corner banks, and
+	// the mode-B approach ramp. The surface a pawn actually walks on is the pointwise MAXIMUM of
+	// those, and the max of two functions whose jumps are all under R has jumps all under R. So the
+	// union is walkable BY CONSTRUCTION, whatever it happens to cross, and no surface in the arena
+	// had to be audited for this. The union is also why the cove is invisible under the corner banks
+	// (which are taller everywhere they exist) instead of fighting them.
+	//
+	// THE ONE PLACE THAT IS NOT FREE is the mode-B carry-in ramp, because there the union being
+	// walkable is not enough - a step poking up through the ramp would be a lip across the run-up to
+	// the hoop. Steps that would do that are dropped from the end walls; see the clamp below.
+	// ---------------------------------------------------------------------------------------------
+
+	const float HalfX = HalfLength();
+	const float HalfY = HalfWidth();
+	const float ToeDepth = WallFilletToeDepth();
+	const float Height = FMath::Max(0.f, WallFilletHeight);
+
+	TArray<FTraceCoveStep> Steps;
+	TraceBuildCoveProfile(ToeDepth, Height, TraceArenaConstants::StepRise,
+		TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMinTread, Steps);
+
+	if (Steps.Num() == 0)
+	{
+		return;
+	}
+
+	// --- How far up an END wall a step is allowed to reach ----------------------------------------
+	//
+	// The ramp's top surface runs from (Run uu out from the wall, Z = 0) to (the wall, RampTop). A
+	// cove step spanning d in [inner, outer] at height TopZ has to stay under the LOWEST point of the
+	// ramp over that span, which is at its OUTER edge. Computed from the same GoalRampTopZ() and
+	// GoalRampRunPerRise the ramp itself is built from, so re-tuning the ramp re-tunes this and a
+	// zero ramp (the dial is allowed to remove it) falls back to the hoop's own floor clearance.
+	const float RampTop = GoalRampTopZ();
+	const float RampRun = (RampTop > 1.f)
+		? FMath::Max(200.f, RampTop * FMath::Max(0.5f, GoalRampRunPerRise))
+		: 0.f;
+
+	auto EndWallCeilingAt = [this, RampTop, RampRun](float OuterDepth) -> float
+	{
+		// No ramp: nothing between the floor and the hoop except the hoop's own clearance, so keep a
+		// step below it by one riser exactly as GoalRampTopZ() would have.
+		if (RampTop <= 1.f || RampRun <= 1.f)
+		{
+			return FMath::Max(0.f, GoalRingClearanceZ() - TraceArenaConstants::StepRise);
+		}
+
+		const float RampZ = RampTop * (1.f - FMath::Clamp(OuterDepth / RampRun, 0.f, 1.f));
+		return RampZ - TraceArenaConstants::FilletRampClearance;
+	};
+
+	int32 EndSteps = 0;
+	for (const FTraceCoveStep& Step : Steps)
+	{
+		if (Step.TopZ > EndWallCeilingAt(Step.OuterDepth))
+		{
+			break;   // And every step above it, or the end cove would stop being monotone.
+		}
+		++EndSteps;
+	}
+
+	// --- Materials --------------------------------------------------------------------------------
+	//
+	// NEUTRAL CYAN, not the per-half team colour the banks and the flank dressing wear, and that is a
+	// decision rather than a shortcut. This is the single line that runs unbroken round the entire
+	// perimeter of the arena - it is the arena's OUTLINE - and an outline that changes colour at the
+	// halfway line stops reading as one shape. It also keeps this geometry completely out of the
+	// half-time repaint: nothing built here is registered with RegisterSideMID, so a side switch
+	// cannot touch it, and there is no way for the cove to end up lit for the wrong end.
+	//
+	// The body carries the same faint self-lit tint the walls do (0.022) rather than the terrace
+	// number (0.012): a cove is a large up-facing surface like a terrace, but unlike a terrace it is
+	// something a first-person eye ends up pressed into while sliding along a wall, and emissive is
+	// the only term that does not depend on an angle of incidence at that range.
+	UMaterialInstanceDynamic* BodyMID = bBuildVisuals
+		? MakeSurfaceMID(TraceArenaConstants::WallColor, 0.45f, 0.f, TraceArenaConstants::NeonNeutral, 0.022f)
+		: nullptr;
+	UMaterialInstanceDynamic* NeonMID = bBuildVisuals
+		? MakeNeonMID(TraceArenaConstants::NeonNeutral, TraceArenaConstants::GlowLip)
+		: nullptr;
+
+	// Every run buries its inner edge WallThickness INTO the wall it hugs, so there is no seam at the
+	// join for a capsule to catch on and no z-fighting sliver where the cove meets the wall face.
+	const float Bury = WallThickness;
+
+	// --- The two side walls -----------------------------------------------------------------------
+	//
+	// Full length, running THROUGH both end walls, so the four corners are closed by these alone and
+	// the end runs below can simply cross them. Overlapping solids are free here - the union is what
+	// matters and it is provably walkable.
+	for (const float YSign : { -1.f, 1.f })
+	{
+		for (const FTraceCoveStep& Step : Steps)
+		{
+			const float SpanY = Step.OuterDepth + Bury;
+
+			AddNeonBlock(
+				FVector(0.f, YSign * (HalfY + Bury - SpanY * 0.5f), Step.TopZ * 0.5f),
+				FVector(FieldLength + 2.f * WallThickness, SpanY, Step.TopZ),
+				/*YawDegrees=*/0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("WallFilletY"),
+				// Same two flags as a bank terrace and for the same two reasons: a 37 uu riser has no
+				// vertical face worth ribbing, and the steps are NESTED so a skirt would be buried
+				// inside the body of the step outside it. The top lip alone is the contour line, and
+				// six concentric ones running the length of the arena is what makes the eye read the
+				// curve instead of a stack of boxes.
+				/*FaceNeonMID=*/nullptr, /*bVerticalTrim=*/false, /*bFaceBands=*/false);
+		}
+	}
+
+	// --- The two end walls ------------------------------------------------------------------------
+	for (const float XSign : { -1.f, 1.f })
+	{
+		for (int32 Index = 0; Index < EndSteps; ++Index)
+		{
+			const FTraceCoveStep& Step = Steps[Index];
+			const float SpanX = Step.OuterDepth + Bury;
+
+			AddNeonBlock(
+				FVector(XSign * (HalfX + Bury - SpanX * 0.5f), 0.f, Step.TopZ * 0.5f),
+				FVector(SpanX, FieldWidth, Step.TopZ),
+				/*YawDegrees=*/0.f, BodyMID, NeonMID, /*bCollide=*/true, TEXT("WallFilletX"),
+				/*FaceNeonMID=*/nullptr, /*bVerticalTrim=*/false, /*bFaceBands=*/false);
+		}
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Wall fillets (spec v9 s10): %d steps to %.0f uu on the side walls, %d to %.0f uu on the end ")
+		TEXT("walls (mode-B ramp ceiling), %.0f uu toe, %.1f uu riser, innermost tread %.0f uu off the ")
+		TEXT("wall face, narrowest tread %.0f uu (floor %.0f)."),
+		Steps.Num(), Steps.Last().TopZ,
+		EndSteps, (EndSteps > 0) ? Steps[EndSteps - 1].TopZ : 0.f,
+		ToeDepth, Height / static_cast<float>(FMath::Max(1, FMath::CeilToInt(Height / TraceArenaConstants::StepRise))),
+		Steps.Last().OuterDepth,
+		(Steps.Num() > 1) ? (Steps[Steps.Num() - 2].OuterDepth - Steps.Last().OuterDepth) : Steps.Last().OuterDepth,
+		TraceArenaConstants::FilletMinTread);
 }
 
 void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)
@@ -2334,12 +2743,21 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 
 			// Two rails on the floor running from the goal line back to the end wall, one against
 			// each sideline, closing the endzone off visually so it reads as a room you score into
-			// rather than as more floor. They sit ON the sidelines because the zone reaches them:
-			// together with the goal line they draw the exact rectangle the trigger occupies.
+			// rather than as more floor.
+			//
+			// PULLED IN TO THE TOE OF THE WALL COVE (spec v9 section 10). They used to sit ON the
+			// sidelines, 22 uu off the wall - which after the cove landed is 22 uu INSIDE it, i.e.
+			// buried in solid geometry and contributing nothing at all. They now run along the line
+			// where the floor stops being flat and starts curving up into the wall, which is where
+			// the eye reads the edge of the room anyway. The rectangle they draw with the goal line
+			// is that much narrower than the trigger; the full-width floor patch behind them (which
+			// does still reach the sidelines, disappearing under the cove as it goes) is what carries
+			// the "the whole width scores" claim.
+			const float EdgeInset = WallFilletToeDepth() + TraceArenaConstants::GoalLineWidth * 0.5f;
 			for (const float YSign : { -1.f, 1.f })
 			{
 				AddMeshBlock(CubeMesh,
-					FVector(CenterX, YSign * (HalfY - TraceArenaConstants::GoalLineWidth * 0.5f), TraceArenaConstants::GoalLineZ),
+					FVector(CenterX, YSign * FMath::Max(0.f, HalfY - EdgeInset), TraceArenaConstants::GoalLineZ),
 					FVector(Depth, TraceArenaConstants::GoalLineWidth, TraceArenaConstants::GoalLineThickness),
 					LineMID, /*bCastShadow=*/false, TEXT("EndzoneEdge"));
 			}
@@ -5021,6 +5439,564 @@ namespace
 			UE_LOG(LogTraceGame, Display, TEXT("[ARENAPERF] starting: %.1fs warmup + %.1fs sample, no rebuild."),
 				State.WarmupSeconds, State.SampleSeconds);
 			StartArenaPerf(State);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v9 SECTION 10 - THE CROSS-SECTION HARNESS.
+	//
+	// Spec v9 section 0: reproduce the symptom, SEE IT FAIL, then fix it, then show the same
+	// reproduction passing. The symptom here is a shape - "the crosssection of the arena" - so the
+	// reproduction has to be a measurement of the shape, taken from a running game through the same
+	// collision the pawns walk on, not a screenshot somebody squints at.
+	//
+	// Four cuts, each a line of downward traces marching in from a wall face, chosen to land clear of
+	// the buttress row, the corner pylons and the gate towers so that what comes back is the GROUND
+	// and not a piece of furniture standing on it. What each cut answers:
+	//
+	//   blend    ground height at the closest a pawn can stand (the 40 uu standoff line). This is the
+	//            number that says whether the wall comes out of the floor square. Zero is a 90 degree
+	//            join with the full 2600 uu of wall rising straight out of a flat floor.
+	//   toe      how far out the transition starts, i.e. how long the curve is.
+	//   riser    the largest vertical jump between adjacent samples. Over MaxStepHeight (45) and the
+	//            curve is an unclimbable wall; this is the walkability test.
+	//   steps    how many distinct levels the transition is made of. One is a kerb, and a staircase
+	//            of two or three reads as a staircase; it takes six or seven before the eye stops
+	//            counting them and starts seeing a curve.
+	//
+	// Traced on ECC_Visibility rather than ECC_Pawn on purpose: the pawn-only standoff shells are
+	// vertical planes 40 uu off each wall running the full height, so a pawn-channel probe inside one
+	// reports its lid at 2600 uu and the profile becomes nonsense. Visibility sees the real geometry,
+	// and the standoff line is reported separately as the closest a body may stand.
+	// ---------------------------------------------------------------------------------------------
+
+	struct FTraceWallCut
+	{
+		FString Name;
+		FVector Foot;      // world, on the wall's inner face, at floor level
+		FVector Inward;    // unit, pointing into the field
+	};
+
+	void ReportArenaCrossSection(float Reach, float SampleStep)
+	{
+		UWorld* World = FindArenaPerfWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[XSECTION] no game world."));
+			return;
+		}
+
+		ATraceArenaBuilder* Builder = ATraceArenaBuilder::Get(World);
+		if (Builder == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[XSECTION] no ATraceArenaBuilder in this world."));
+			return;
+		}
+
+		const FBox Field = Builder->GetFieldBounds();
+		const float HalfX = Field.GetExtent().X;
+		const float HalfY = Field.GetExtent().Y;
+		const FVector Mid = Field.GetCenter();
+		const float FloorZ = Field.Min.Z;
+
+		// 800 uu up: above anything the cove could ever be and below the flank rail (1640) and the
+		// light bridges (1240), so a cut never lands on a beam and calls it the ground.
+		const float ProbeTopZ = FloorZ + 800.f;
+
+		TArray<FTraceWallCut> Cuts;
+		// Midfield side wall: X = 0.075 * HalfX, i.e. 1050 uu clear of the nearest buttress either way.
+		Cuts.Add({ TEXT("side wall, midfield"),
+			FVector(Mid.X + HalfX * 0.075f, Mid.Y + HalfY, FloorZ), FVector(0.f, -1.f, 0.f) });
+		// Side wall inside the endzone, 600 uu past the goal line: clear of the gate towers (on the
+		// line) and of the corner pylons (mid endzone), and outside the end wall's own cove.
+		Cuts.Add({ TEXT("side wall, endzone"),
+			FVector(Mid.X + HalfX - 1800.f, Mid.Y + HalfY, FloorZ), FVector(0.f, -1.f, 0.f) });
+		// End wall down the scoring lane - the one cut that has to prove the cove stays UNDER the
+		// mode-B carry-in ramp rather than putting a lip across the mouth of the hoop.
+		Cuts.Add({ TEXT("end wall, goal lane"),
+			FVector(Mid.X + HalfX, Mid.Y, FloorZ), FVector(-1.f, 0.f, 0.f) });
+		// End wall off the lane, between two end buttresses.
+		Cuts.Add({ TEXT("end wall, off lane"),
+			FVector(Mid.X + HalfX, Mid.Y + HalfY * 0.65f, FloorZ), FVector(-1.f, 0.f, 0.f) });
+
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceArenaCrossSection), /*bTraceComplex=*/false);
+		Params.bFindInitialOverlaps = false;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[XSECTION] ===== arena cross-section, %.0f uu in from each wall face in %.0f uu steps. ")
+			TEXT("Ground height measured on ECC_Visibility. ====="), Reach, SampleStep);
+
+		for (const FTraceWallCut& Cut : Cuts)
+		{
+			const int32 SampleCount = FMath::Clamp(FMath::CeilToInt(Reach / FMath::Max(1.f, SampleStep)), 2, 512);
+
+			TArray<float> Ground;
+			TArray<float> Distance;
+			Ground.Reserve(SampleCount);
+			Distance.Reserve(SampleCount);
+
+			for (int32 Index = 0; Index < SampleCount; ++Index)
+			{
+				// From 5 uu off the face outward. Never 0: a probe started exactly on a wall face is a
+				// coin toss between the wall and the air beside it.
+				const float D = 5.f + SampleStep * static_cast<float>(Index);
+				const FVector Column = Cut.Foot + Cut.Inward * D;
+
+				FHitResult Hit;
+				const bool bHit = World->LineTraceSingleByChannel(Hit,
+					FVector(Column.X, Column.Y, ProbeTopZ), FVector(Column.X, Column.Y, FloorZ - 200.f),
+					ECC_Visibility, Params);
+
+				Distance.Add(D);
+				Ground.Add(bHit ? (Hit.ImpactPoint.Z - FloorZ) : -999.f);
+			}
+
+			// Walk OUTWARD to INWARD, which is the direction a player climbs, so a "riser" is a step up.
+			float MaxRiser = 0.f;
+			float MaxRiserAt = 0.f;
+			float Toe = -1.f;
+			int32 Levels = 0;
+			float LastLevel = -1000.f;
+
+			for (int32 Index = SampleCount - 1; Index >= 0; --Index)
+			{
+				const float Here = Ground[Index];
+				if (Here < -500.f)
+				{
+					continue;
+				}
+
+				if (Index < SampleCount - 1 && Ground[Index + 1] > -500.f)
+				{
+					const float Rise = Here - Ground[Index + 1];
+					if (Rise > MaxRiser)
+					{
+						MaxRiser = Rise;
+						MaxRiserAt = Distance[Index];
+					}
+				}
+
+				if (Here > 1.f && Toe < 0.f)
+				{
+					Toe = Distance[Index];
+				}
+
+				if (FMath::Abs(Here - LastLevel) > 1.f)
+				{
+					++Levels;
+					LastLevel = Here;
+				}
+			}
+
+			const float Blend = Ground.Num() > 0 ? Ground[0] : 0.f;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[XSECTION] %-22s blend %6.1f uu at the wall | toe %6.0f uu out | max riser %5.1f uu ")
+				TEXT("(at %.0f uu, ceiling 45) | %d levels"),
+				*Cut.Name, Blend, (Toe >= 0.f) ? Toe : 0.f, MaxRiser, MaxRiserAt, Levels);
+
+			// The shape itself, drawn. One row per 40 uu of height so the log carries the actual
+			// cross-section rather than four numbers that describe one.
+			FString Profile;
+			for (int32 Index = 0; Index < SampleCount; ++Index)
+			{
+				Profile += FString::Printf(TEXT("%.0f:%.0f "), Distance[Index], FMath::Max(0.f, Ground[Index]));
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[XSECTION]   %s -> %s"), *Cut.Name, *Profile);
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[XSECTION] ===== END. ====="));
+	}
+
+	FAutoConsoleCommand CmdArenaCrossSection(
+		TEXT("Trace.Arena.CrossSection"),
+		TEXT("Trace.Arena.CrossSection [Reach] [SampleStep] - march downward traces in from each wall face "
+		     "and print the arena's cross-section: the ground height at the wall, how far out the "
+		     "transition starts, the largest riser in it and how many levels it is made of (spec v9 10)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Reach = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 100.f, 4000.f) : 1700.f;
+			const float Step = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 5.f, 200.f) : 25.f;
+			ReportArenaCrossSection(Reach, Step);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v9 SECTION 10 - "IT MUST BE WALKABLE ... confirm nobody gets stuck against the base of a
+	// wall - bots steer directly, so a lip at the bottom of the curve will trap them."
+	//
+	// A pawn standing still against a wall is not evidence of anything: it might be dead, idle, or
+	// holding an angle. WEDGED means something specific and it is what this measures - the pawn is
+	// ASKING to move (non-trivial Acceleration, which is what AddMovementInput leaves behind, or a
+	// requested velocity from path following), it is inside the band of floor the cove occupies, and
+	// it is going nowhere. That triple is exactly the failure the instruction describes and it cannot
+	// be produced by a bot that has simply stopped.
+	// ---------------------------------------------------------------------------------------------
+
+	struct FTraceWallStickState
+	{
+		float Remaining = 30.f;
+		float Band = 900.f;
+
+		int32 Samples = 0;
+		int32 WedgedSamples = 0;
+		int32 InBandSamples = 0;
+		float WorstStreakSeconds = 0.f;
+		float HighestGroundZ = 0.f;
+		FString WorstPawn;
+
+		TMap<FString, float> Streaks;
+	};
+
+	bool TickArenaWallStick(FTraceWallStickState& State, float DeltaTime)
+	{
+		UWorld* World = FindArenaPerfWorld();
+		ATraceArenaBuilder* Builder = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
+		if (World == nullptr || Builder == nullptr)
+		{
+			return true;   // Still loading.
+		}
+
+		const FBox Field = Builder->GetFieldBounds();
+		const FVector Mid = Field.GetCenter();
+		const FVector Extent = Field.GetExtent();
+
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Character = *It;
+			if (!IsValid(Character) || !Character->IsAlive())
+			{
+				continue;
+			}
+
+			const UCharacterMovementComponent* Movement = Character->GetCharacterMovement();
+			if (Movement == nullptr)
+			{
+				continue;
+			}
+
+			const FVector Where = Character->GetActorLocation();
+			const float ToWallY = Extent.Y - FMath::Abs(Where.Y - Mid.Y);
+			const float ToWallX = Extent.X - FMath::Abs(Where.X - Mid.X);
+			const float ToWall = FMath::Min(ToWallX, ToWallY);
+
+			++State.Samples;
+			if (ToWall > State.Band)
+			{
+				State.Streaks.Remove(GetNameSafe(Character));
+				continue;
+			}
+
+			++State.InBandSamples;
+			State.HighestGroundZ = FMath::Max(State.HighestGroundZ, Where.Z - Field.Min.Z);
+
+			// BOTH ways a pawn can be ASKING to move, because Trace has both in play. Trace's bots have
+			// no navmesh and steer with AddMovementInput, which lands in GetCurrentAcceleration(); a
+			// pawn under path following instead leaves its wish in the requested velocity. Read through
+			// GetLastUpdateRequestedVelocity() rather than the RequestedVelocity field - that field and
+			// bHasRequestedVelocity are PROTECTED on UCharacterMovementComponent, and the public
+			// accessor already returns a zero vector on the frames path following did not request
+			// anything, so the "has one" flag is not needed either.
+			const float WishSize = FMath::Max(Movement->GetCurrentAcceleration().Size2D(),
+				static_cast<float>(Movement->GetLastUpdateRequestedVelocity().Size2D()));
+			const bool bWedged = (WishSize > 100.f) && (Movement->Velocity.Size2D() < 50.f);
+
+			float& Streak = State.Streaks.FindOrAdd(GetNameSafe(Character));
+			if (!bWedged)
+			{
+				Streak = 0.f;
+				continue;
+			}
+
+			++State.WedgedSamples;
+			Streak += DeltaTime;
+			if (Streak > State.WorstStreakSeconds)
+			{
+				State.WorstStreakSeconds = Streak;
+				State.WorstPawn = FString::Printf(TEXT("%s at (%.0f, %.0f, %.0f), %.0f uu off a wall"),
+					*GetNameSafe(Character), Where.X, Where.Y, Where.Z, ToWall);
+			}
+		}
+
+		State.Remaining -= DeltaTime;
+		if (State.Remaining > 0.f)
+		{
+			return true;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[WALLSTICK] ===== %d pawn-samples, %d of them inside %.0f uu of a wall. Wedged (wants to ")
+			TEXT("move, is not moving): %d samples = %.2f%% of the in-band ones. Worst continuous wedge ")
+			TEXT("%.2f s%s%s. Highest a pawn stood near a wall: %.0f uu. ====="),
+			State.Samples, State.InBandSamples, State.Band,
+			State.WedgedSamples,
+			(State.InBandSamples > 0) ? (100.f * State.WedgedSamples / State.InBandSamples) : 0.f,
+			State.WorstStreakSeconds,
+			State.WorstPawn.IsEmpty() ? TEXT("") : TEXT(" - "),
+			State.WorstPawn.IsEmpty() ? TEXT("") : *State.WorstPawn,
+			State.HighestGroundZ);
+
+		return false;
+	}
+
+	FAutoConsoleCommand CmdArenaWallStick(
+		TEXT("Trace.Arena.WallStick"),
+		TEXT("Trace.Arena.WallStick [Seconds] [BandUU] - watch every living pawn inside BandUU of a wall and "
+		     "report how often one is asking to move and going nowhere, i.e. caught on the base of the wall "
+		     "cove (spec v9 10)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FTraceWallStickState State;
+			State.Remaining = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 2.f, 600.f) : 45.f;
+			State.Band = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 100.f, 4000.f) : 900.f;
+
+			UE_LOG(LogTraceGame, Display, TEXT("[WALLSTICK] watching for %.0fs within %.0f uu of a wall."),
+				State.Remaining, State.Band);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickArenaWallStick(State, DeltaTime);
+				}), 0.f);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v9 SECTION 10 - "IT MUST BE WALKABLE. Players and bots should ride up it rather than catch
+	// on it."
+	//
+	// WHY Trace.Arena.WallStick IS NOT ENOUGH ON ITS OWN. It watches whoever happens to be near a
+	// wall, and measured over two 100 s ten-bot matches, one per arm, NOBODY EVER IS: 11288 and 5344
+	// pawn-samples, 0 of them inside 900 uu of a wall, in the square arm as well as the coved one.
+	// Trace's bots play the middle of the field. A harness with no exposure to the geometry it is
+	// checking cannot go red, and spec v9 section 0 is a post-mortem on exactly that mistake.
+	//
+	// So this creates the exposure. It walks the local pawn STRAIGHT INTO the base of a wall and
+	// reports how far up it got, which is the question stated as a number.
+	//
+	// It steers with AddMovementInput and nothing else - the same call ATraceBotController uses, and
+	// the reason the instruction singles bots out ("bots steer directly, so a lip at the bottom of the
+	// curve will trap them"). Nothing here writes Velocity, the movement mode or the location after
+	// the initial placement, so the climb is UCharacterMovementComponent's own step-up logic or it
+	// does not happen at all.
+	//
+	// THE TWO ARMS DIFFER IN ONE NUMBER, the feet height reached at the wall:
+	//   -TraceArenaSquareCorners   a vertical face at the floor: the pawn stops dead at 0 uu.
+	//   default                    the cove: the pawn rides it up to the top tread.
+	// A lip anywhere in the curve shows up as a stall PART WAY UP - the report carries the height and
+	// the distance the worst stall happened at, so "it caught" and "it arrived" are different numbers
+	// rather than the same pass/fail.
+	// ---------------------------------------------------------------------------------------------
+
+	struct FTraceCoveWalkState
+	{
+		float Remaining = 20.f;
+		/** 0 = walk at the +X end wall, 1 = walk at the +Y side wall. */
+		int32 Axis = 1;
+
+		bool bPlaced = false;
+		float Elapsed = 0.f;
+
+		float StartDistance = 0.f;
+		float ClosestApproach = TNumericLimits<float>::Max();
+		float BestFeetZ = 0.f;
+		float FinalFeetZ = 0.f;
+
+		float StallSeconds = 0.f;
+		float WorstStall = 0.f;
+		float WorstStallDistance = -1.f;
+		float WorstStallFeetZ = -1.f;
+	};
+
+	bool TickArenaCoveWalk(FTraceCoveWalkState& State, float DeltaTime)
+	{
+		UWorld* World = FindArenaPerfWorld();
+		ATraceArenaBuilder* Builder = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
+		if (World == nullptr || Builder == nullptr)
+		{
+			return true;   // Still loading.
+		}
+
+		// Deliberately the LOCAL player rather than a bot: a bot is being steered by its own
+		// controller every frame and the two inputs would fight. Named TestPawn/TestController
+		// because a local called Pawn or Controller shadows a member on APawn/AController on MSVC,
+		// which clang does not warn about and Windows refuses to compile.
+		APlayerController* TestController = World->GetFirstPlayerController();
+		ACharacter* TestPawn = (TestController != nullptr) ? Cast<ACharacter>(TestController->GetPawn()) : nullptr;
+		if (TestPawn == nullptr || TestPawn->GetCharacterMovement() == nullptr)
+		{
+			return true;   // No pawn possessed yet.
+		}
+
+		const FBox Field = Builder->GetFieldBounds();
+		const FVector Mid = Field.GetCenter();
+		const FVector Extent = Field.GetExtent();
+		const float FloorZ = Field.Min.Z;
+		const float HalfHeight = TestPawn->GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
+
+		// Straight at the wall, on the axis asked for.
+		//
+		// THE START COLUMN IS THE ONE THE CROSS-SECTION ALREADY PROBES, and picking it by hand is how
+		// the first attempt was wasted: a column 1800 uu in from the +X end wall runs through a corner
+		// pylon, and both arms reported the pawn stalling 930 uu short of the wall on the pylon rather
+		// than anywhere near the cove. These two are the "side wall, midfield" and "end wall, off lane"
+		// cuts of Trace.Arena.CrossSection, which are chosen to miss the buttresses, the pylons and the
+		// goal furniture and are printed alongside this so the two measurements are of the same ground.
+		const FVector Direction = (State.Axis == 0) ? FVector(1.f, 0.f, 0.f) : FVector(0.f, 1.f, 0.f);
+		const FRotator Facing(0.f, (State.Axis == 0) ? 0.f : 90.f, 0.f);
+
+		// Far enough out to start on FLAT floor in both arms: the corner bank reaches BankDepth
+		// (1500 uu) in from the sideline, so 1900 begins outside everything and the walk has to cross
+		// the whole transition, bank and cove together, exactly as a bot running at the sideline would.
+		const FVector Start = (State.Axis == 0)
+			? FVector(Mid.X + Extent.X - 1900.f, Mid.Y + Extent.Y * 0.65f, FloorZ + HalfHeight + 20.f)
+			: FVector(Mid.X + Extent.X * 0.075f, Mid.Y + Extent.Y - 1900.f, FloorZ + HalfHeight + 20.f);
+
+		// RESPAWNS PUT THE PAWN BACK ON A SPAWN PAD, and a kickoff during the walk did exactly that in
+		// the first run - the report ended up describing a stall 5429 uu from the wall, i.e. a pawn
+		// that was no longer anywhere near the test. Anything that moves the pawn off the walk line
+		// re-places it and restarts the clock rather than quietly polluting the numbers.
+		const float LateralOffset = (State.Axis == 0)
+			? FMath::Abs(TestPawn->GetActorLocation().Y - Start.Y)
+			: FMath::Abs(TestPawn->GetActorLocation().X - Start.X);
+
+		if (State.bPlaced && LateralOffset > 600.f)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[COVEWALK] pawn left the walk line (%.0f uu off it, probably a respawn) - re-placing."),
+				LateralOffset);
+			State.bPlaced = false;
+			State.Elapsed = 0.f;
+			State.StallSeconds = 0.f;
+			State.WorstStall = 0.f;
+			State.ClosestApproach = TNumericLimits<float>::Max();
+			State.BestFeetZ = 0.f;
+		}
+
+		if (!State.bPlaced)
+		{
+			if (!TestPawn->TeleportTo(Start, Facing))
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[COVEWALK] could not place the pawn at %s."), *Start.ToCompactString());
+				return false;
+			}
+
+			TestController->SetControlRotation(Facing);
+			State.bPlaced = true;
+			State.StartDistance = (State.Axis == 0)
+				? (Extent.X - FMath::Abs(Start.X - Mid.X))
+				: (Extent.Y - FMath::Abs(Start.Y - Mid.Y));
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[COVEWALK] %s pawn placed at %s, %.0f uu from the %s wall, walking straight at it for %.0fs."),
+				*GetNameSafe(TestPawn), *Start.ToCompactString(), State.StartDistance,
+				(State.Axis == 0) ? TEXT("end") : TEXT("side"), State.Remaining);
+		}
+
+		// Hold the aim and the forward key. AddMovementInput only - see the block comment.
+		TestController->SetControlRotation(Facing);
+		TestPawn->AddMovementInput(Direction, 1.f);
+
+		const FVector Here = TestPawn->GetActorLocation();
+		const float Distance = (State.Axis == 0)
+			? (Extent.X - FMath::Abs(Here.X - Mid.X))
+			: (Extent.Y - FMath::Abs(Here.Y - Mid.Y));
+		const float FeetZ = Here.Z - HalfHeight - FloorZ;
+
+		State.Elapsed += DeltaTime;
+		State.ClosestApproach = FMath::Min(State.ClosestApproach, Distance);
+		State.BestFeetZ = FMath::Max(State.BestFeetZ, FeetZ);
+		State.FinalFeetZ = FeetZ;
+
+		// A stall only counts once the pawn has had a second to get moving, or the first frame after
+		// the teleport would be recorded as one.
+		const float Speed = TestPawn->GetCharacterMovement()->Velocity.Size2D();
+		if (State.Elapsed > 1.f && Speed < 40.f)
+		{
+			State.StallSeconds += DeltaTime;
+			if (State.StallSeconds > State.WorstStall)
+			{
+				State.WorstStall = State.StallSeconds;
+				State.WorstStallDistance = Distance;
+				State.WorstStallFeetZ = FeetZ;
+			}
+		}
+		else
+		{
+			State.StallSeconds = 0.f;
+		}
+
+		State.Remaining -= DeltaTime;
+		if (State.Remaining > 0.f)
+		{
+			return true;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[COVEWALK] ===== %s wall: walked in from %.0f uu, closest approach %.0f uu. FEET REACHED ")
+			TEXT("%.0f uu (finished at %.0f uu). Longest stall %.2f s%s. ====="),
+			(State.Axis == 0) ? TEXT("end") : TEXT("side"),
+			State.StartDistance, State.ClosestApproach, State.BestFeetZ, State.FinalFeetZ, State.WorstStall,
+			(State.WorstStall > 0.5f)
+				? *FString::Printf(TEXT(" at %.0f uu out, feet %.0f uu"), State.WorstStallDistance, State.WorstStallFeetZ)
+				: TEXT(""));
+
+		return false;
+	}
+
+	FAutoConsoleCommand CmdArenaCoveWalk(
+		TEXT("Trace.Arena.CoveWalk"),
+		TEXT("Trace.Arena.CoveWalk [side|end] [Seconds] - teleport the local pawn out in front of a wall and "
+		     "walk it straight into the base of that wall with AddMovementInput, then report how far up it "
+		     "got and whether it ever stalled on the way (spec v9 10)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FTraceCoveWalkState State;
+			State.Axis = (Args.Num() > 0 && Args[0].Equals(TEXT("end"), ESearchCase::IgnoreCase)) ? 0 : 1;
+			State.Remaining = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 2.f, 120.f) : 20.f;
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickArenaCoveWalk(State, DeltaTime);
+				}), 0.f);
+		}));
+
+	/**
+	 * The camera, because the engine's BugItGo is a CheatManager exec and there is no cheat manager in
+	 * a -game listen server ("Command not recognized: BugItGo", measured). Screenshotting the cove
+	 * needs the view to be somewhere other than a spawn pad facing an endzone, and this is the whole
+	 * of what that takes: put the pawn there and point it. Pair it with Trace.ForceThirdPerson 1.
+	 */
+	FAutoConsoleCommand CmdArenaPose(
+		TEXT("Trace.Arena.Pose"),
+		TEXT("Trace.Arena.Pose X Y Z [Pitch] [Yaw] - teleport the local pawn to a world position and aim it, "
+		     "so the arena can be photographed from somewhere useful (spec v9 10)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			if (Args.Num() < 3)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[POSE] usage: Trace.Arena.Pose X Y Z [Pitch] [Yaw]"));
+				return;
+			}
+
+			UWorld* World = FindArenaPerfWorld();
+			APlayerController* TestController = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+			APawn* TestPawn = (TestController != nullptr) ? TestController->GetPawn() : nullptr;
+			if (TestPawn == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[POSE] no locally controlled pawn."));
+				return;
+			}
+
+			const FVector Where(FCString::Atof(*Args[0]), FCString::Atof(*Args[1]), FCString::Atof(*Args[2]));
+			const FRotator Aim(
+				(Args.Num() > 3) ? FCString::Atof(*Args[3]) : 0.f,
+				(Args.Num() > 4) ? FCString::Atof(*Args[4]) : 0.f,
+				0.f);
+
+			const bool bMoved = TestPawn->TeleportTo(Where, Aim);
+			TestController->SetControlRotation(Aim);
+
+			UE_LOG(LogTraceGame, Display, TEXT("[POSE] %s -> %s aim %s (moved=%d)"),
+				*GetNameSafe(TestPawn), *Where.ToCompactString(), *Aim.ToCompactString(), bMoved ? 1 : 0);
 		}));
 
 	FAutoConsoleCommand CmdArenaPerfAB(

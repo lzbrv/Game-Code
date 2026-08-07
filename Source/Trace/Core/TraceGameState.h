@@ -105,6 +105,44 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_HalfChanged)
 	bool bHalfTimeBreak = false;
 
+	// ------------------------------------------------------------------------------------------
+	// DEFERRED HALF TIME / FULL TIME (spec v9 §11)
+	//
+	// Verbatim: "Change halftime to trigger after the time runs out and the current play ends, so
+	// that it doesn't cut people off in the middle of a run."
+	//
+	// The period's clock expiring no longer ENDS the period. It arms it. Play carries on, the clock
+	// reads 0:00, and the whistle goes at the next DEAD BALL — a goal, a turnover between the two
+	// teams, or (mode B) the Core coming to rest on the ground. ATraceGameMode owns the state
+	// machine (BeginPendingPeriodEnd / PollPendingPeriodEnd / ResolvePendingPeriodEnd); this pair of
+	// properties is the replicated half, and it exists so the HUD can say so — a clock frozen at
+	// 0:00 with no explanation reads as a broken timer, which is a worse bug than the one §11 fixes.
+	//
+	// NOT a match state and NOT a half-time break: everything is still live. bHalfTimeBreak stays
+	// false until the whistle actually goes, so every "is play running?" test in the codebase keeps
+	// its existing answer for free.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * True from the moment the period's clock expires until the deferred half/full time fires.
+	 *
+	 * Shares OnRep_HalfChanged with the rest of the half block: it changes at most twice a period
+	 * and the callback is a log line, so a separate one would only be a second place to look.
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_HalfChanged)
+	bool bPendingPeriodEnd = false;
+
+	/**
+	 * Absolute server time (same clock as MatchEndServerTime) at which the hard cap gives up waiting
+	 * for a dead ball and ends the period anyway. Zero when nothing is pending, or when the cap is
+	 * disabled (UTraceSettings::PeriodEndMaxDeferSeconds = 0).
+	 *
+	 * Replicated so the HUD can count the guard rail down rather than leaving players guessing how
+	 * long "next dead ball" might be.
+	 */
+	UPROPERTY(Replicated)
+	float PendingPeriodEndCapServerTime = 0.f;
+
 	/**
 	 * The team defending the negative-X end of the field for the current half.
 	 *
@@ -203,6 +241,35 @@ public:
 
 	/** "1ST HALF" / "2ND HALF" / "HALF TIME" — for the HUD, banners and logs. */
 	FString GetHalfLabel() const;
+
+	// ------------------------------------------------------------------------------------------
+	// Deferred half time / full time (spec v9 §11) — the HUD reads these three
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * True while the clock has expired but play continues until the next dead ball.
+	 *
+	 * THE HUD MUST DRAW SOMETHING WHEN THIS IS TRUE. The clock is at 0:00 and still running the
+	 * match; without a note on screen that is indistinguishable from a timer that has hung. Draw
+	 * GetPendingPeriodEndLabel() next to (or under) the clock — see that function.
+	 */
+	bool IsPendingPeriodEnd() const;
+
+	/**
+	 * "HALF ENDS AT NEXT DEAD BALL" / "MATCH ENDS AT NEXT DEAD BALL", or an empty string when
+	 * nothing is pending. One spelling, shared by the HUD, the banners and the logs.
+	 */
+	FString GetPendingPeriodEndLabel() const;
+
+	/**
+	 * Seconds until the hard cap ends the period regardless of whether a dead ball arrived, clamped
+	 * at zero. Returns 0 when nothing is pending or the cap is disabled — so a HUD that wants to
+	 * show it should test IsPendingPeriodEnd() first and treat 0 as "no cap running".
+	 */
+	float GetPendingPeriodEndTimeRemaining() const;
+
+	/** Server only. Arms or disarms the deferred whistle. @p InCapServerTime 0 = no hard cap. */
+	void SetPendingPeriodEnd(bool bInPending, float InCapServerTime);
 
 	/** Server only. Sets the side assignment for the half about to be played. */
 	void SetTeamSides(ETraceTeam InTeamOnNegativeSide);

@@ -42,8 +42,17 @@ enum class ETraceBotDifficulty : uint8
 
 namespace TraceDifficulty
 {
-	/** Default for a fresh title screen. The bots out-shoot a human at Normal; Easy is the way in. */
-	inline constexpr ETraceBotDifficulty Default = ETraceBotDifficulty::Easy;
+	/**
+	 * Default for a fresh title screen.
+	 *
+	 * Spec v9 §9, verbatim: "Set default startup bot difficulty to normal". This constant is the one
+	 * that actually decides it — NOT UTraceSettings::BotDifficulty and not Config/DefaultGame.ini.
+	 * The title screen seeds its DIFFICULTY row from here and then writes "?difficulty=<value>" onto
+	 * the travel URL, and ATraceGameMode::InitGame applies the URL option OVER the ini. So a build
+	 * with BotDifficulty=Normal in the ini and Easy here still plays every menu-started match on
+	 * Easy, which is what shipped before this change. Keep all three in step; this one wins.
+	 */
+	inline constexpr ETraceBotDifficulty Default = ETraceBotDifficulty::Normal;
 
 	inline constexpr int32 Count = 3;
 

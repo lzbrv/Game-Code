@@ -32,6 +32,7 @@
 #include "Engine/Engine.h"
 #include "EngineUtils.h"                       // TActorIterator, for the spec v8 §5 carrier harness
 #include "Gameplay/TraceCore.h"                // spec v8 §5: the real pickup funnel, ATraceCore::TryPickup
+#include "Core/TracePlayerController.h"        // spec v9 §2: the REAL HUD feed, GetDashHudState
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
 #include "GameFramework/PlayerController.h"    // measurement harness: player-controlled check
@@ -148,6 +149,54 @@ namespace TraceMoveKnob
 		}
 		return bDefault;
 	}
+}
+
+// =================================================================================================
+// SPEC v9 §0 — THE A/B ARM FOR THE §§5-8 TUNING ITEMS.
+// =================================================================================================
+//
+// §0's complaint is that a harness which never went red proves nothing. That applies to the TUNING
+// items as much as to the §2 bug: "slide length is 30% shorter" is a claim about a DIFFERENCE, and a
+// single number measured after the change cannot show a difference.
+//
+// Rebuilding the old code to get the "before" number would mean comparing two binaries, which the
+// Trace.DashLegacyAimReplay comment in this file already calls out as dishonest — a second build can
+// differ in ways nobody accounted for. So instead every v9 §§5-8 change is expressed as a NAMED
+// SCALAR ON TOP of the designer's existing value, and this one switch forces every one of those
+// scalars back to its identity. One binary, one harness, both arms.
+//
+// Identity values, stated once so the arm cannot drift from the shipped numbers:
+//   §5 WallJumpMomentumScale        0.90 -> 1.00   (retention back to the designer's 0.95)
+//   §5 WallJumpWindowScale          0.60 -> 1.00   (window back to the designer's 0.25 s)
+//   §5 WallJumpMantleLockoutSeconds 0.30 -> 0.00   (a wall jump stops putting the mantle on cooldown)
+//   §5 mantle-yields-to-wall-jump   on   -> off    (the mantle wins the frame again; see §5 (1 of 2))
+//   §6 SlideMaxLengthScale          0.70 -> 1.00
+//   §7 SlideJumpBonusScale          1.30 -> 1.00
+//   §8 AirStrafeAsymptoteScale      1.10 -> 1.00
+//   §8 MovementGravityScale         1.12 -> 1.00
+//
+// Defined with its CVar down with the other dev globals; declared here because the tuning getters
+// above the CVar block need it.
+extern int32 GTraceV9LegacyTuning;
+
+/**
+ * True while the pre-v9 tuning is in force.
+ *
+ * BOTH A CVAR AND A COMMAND-LINE SWITCH, for the reason GetDashCooldownRemaining() spells out at
+ * length: -ExecCmds fires at PostEngineInit and an ECVF_Cheat variable set that early does not
+ * reliably survive into a session on a client that has not connected yet. FParse of the command line
+ * cannot miss. GRAVITY IS THE REASON THIS MATTERS MORE HERE than it did there: GravityScale is
+ * pushed onto the engine field once per simulated move, so an arm that failed to apply would look
+ * exactly like an arm that applied and changed nothing.
+ *
+ * Read on both machines and on every replayed frame, and a pure function of config either way, so it
+ * needs no saved-move state and cannot rubber-band. It must never be flipped mid-session on one end
+ * of a live connection — that is a config change, not a prediction input.
+ */
+static bool IsV9LegacyTuning()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyTuning"));
+	return GTraceV9LegacyTuning != 0 || bFromCommandLine;
 }
 
 namespace TraceMovement
@@ -559,7 +608,35 @@ FRotator UTraceCharacterMovementComponent::GetDashAimRotation() const
 float UTraceCharacterMovementComponent::GetSlideDuration() const
 {
 	// Floored rather than defaulted: a zero-length slide would still spend the slide cooldown.
-	return FMath::Max(0.05f, UTraceSettings::Get().SlideDuration);
+	//
+	// SPEC v9 §6 — "Reduce max slide length by 30%", x0.7.
+	//
+	// LENGTH IS DURATION HERE, and that is not an approximation. Since spec v4 §1 a slide's speed is
+	// purely what the player carried in (SlideEntrySpeedMultiplier is 1.00, the flat impulse is
+	// deleted) and the only thing that ends it early is decaying to SlideExitSpeedFraction. So the
+	// MAXIMUM distance a slide can cover is entry speed integrated over this clock.
+	//
+	// SCALING THE CLOCK BY 0.7 IS NOT A 30% CUT IN DISTANCE, AND THE DIFFERENCE IS NOT NOISE. Distance
+	// is v0.T - ½.a.T², so shortening T also removes part of the QUADRATIC term the player was never
+	// going to travel anyway. Measured (Trace.V9.Tuning, entry held at 1250 uu/s, a = 260 uu/s²):
+	//
+	//     T = 1.80 s -> 1828.8 uu        T = 1.26 s -> 1368.6 uu       = -25.2%, not -30%.
+	//
+	// The spec's §6 [ASSUMPTION] is explicit — "the maximum distance/duration a slide can cover, ×0.7"
+	// — so ×0.7 ON THE CLOCK is what ships, and DURATION is down exactly 30%. If the design owner
+	// meant 30% off the DISTANCE, the value that delivers it is SlideMaxLengthScale = 0.647 (solving
+	// v0.T - ½.a.T² = 0.7 × 1828.8 gives T = 1.165 s); it is one ini line and it is flagged in the
+	// report rather than applied, because the two readings are 5% of a slide apart and that is the
+	// design owner's call, not this file's.
+	//
+	// Scaling the clock rather than the speed is also the only reading that does not contradict
+	// spec v4 §1: capping SlideMaxSpeed instead would take momentum the player brought in, which is
+	// the exact behaviour Demo 4 asked to have removed.
+	const float Base = FMath::Max(0.05f, UTraceSettings::Get().SlideDuration);
+	const float Scale = IsV9LegacyTuning()
+		? 1.f
+		: FMath::Clamp(TraceMoveKnob::Float(TEXT("SlideMaxLengthScale"), 0.7f), 0.05f, 4.f);
+	return FMath::Max(0.05f, Base * Scale);
 }
 
 float UTraceCharacterMovementComponent::GetSlideDeceleration() const
@@ -642,7 +719,36 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
 	// header default — both have to move or the retune does nothing. 1.10 was a 10% edge on a 0.9s
 	// arc, which is roughly the frame-to-frame noise a player sees anyway; with the hold-to-extend
 	// gone this is the only skill expression sliding has left, so it has to be legible.
-	return FMath::Max(1.f, UTraceSettings::Get().SlideJumpWindowSpeedBonus);
+	//
+	// =============================================================================================
+	// SPEC v9 §7 — "Increase the bonus of timing a slide jump right by 30%". ONE NUMBER TO SWITCH.
+	// =============================================================================================
+	//
+	// The sentence is genuinely ambiguous and the two readings are far apart, so both are
+	// implemented and the choice is a single bool:
+	//
+	//   bSlideJumpBonusScalesGainOnly = true  (SHIPPED, and the spec's [ASSUMPTION])
+	//       "The bonus" is the part above 1.0 — the thing the timing actually buys.
+	//       1 + (1.3125 - 1) x 1.30 = 1 + 0.40625 = 1.40625.
+	//       A well-timed hop at 1900 uu/s carries 2672 uu/s instead of 2494 uu/s: +178 uu/s, a
+	//       legible step up from a bonus that was already legible.
+	//
+	//   bSlideJumpBonusScalesGainOnly = false (THE ALTERNATIVE, flagged as the spec asks)
+	//       "The bonus" is the whole multiplier. 1.3125 x 1.30 = 1.70625.
+	//       The same hop carries 3242 uu/s — 71% over entry speed, which beats DashSpeed's own
+	//       3000 uu/s. A slide-hop that is faster than a dash inverts the game's counterplay
+	//       (the dash is the only answer to a carrier), so this reading is NOT shipped by default.
+	//
+	// Base stays the designer's DefaultGame.ini value (1.3125, which wins over the header) and the
+	// spec's increase is a separate named scalar on top — so re-tuning the base and re-tuning the
+	// v9 increase never fight.
+	const float Base = FMath::Max(1.f, UTraceSettings::Get().SlideJumpWindowSpeedBonus);
+	const float Scale = IsV9LegacyTuning()
+		? 1.f
+		: FMath::Clamp(TraceMoveKnob::Float(TEXT("SlideJumpBonusScale"), 1.30f), 0.1f, 4.f);
+	const bool bGainOnly = TraceMoveKnob::Bool(TEXT("bSlideJumpBonusScalesGainOnly"), true);
+
+	return FMath::Max(1.f, bGainOnly ? (1.f + (Base - 1.f) * Scale) : (Base * Scale));
 }
 
 float UTraceCharacterMovementComponent::GetSlideJumpWindowZBonus() const
@@ -659,11 +765,33 @@ bool UTraceCharacterMovementComponent::IsAirStrafeFalloffEnabled() const
 	return TraceMoveKnob::Bool(TEXT("bAirStrafeGainFalloff"), true);
 }
 
+float UTraceCharacterMovementComponent::GetAirStrafeAsymptoteScale() const
+{
+	// SPEC v9 §8 — "Move the asymptote on momentum slightly higher, to allow for slightly faster
+	// speeds." ONE scalar over BOTH caps, because they are two points on one curve: the soft cap is
+	// where gain starts to taper and the hard cap is where it reaches zero, and moving only one of
+	// them changes the SHAPE of the falloff rather than its position. +10% keeps the shape identical
+	// and slides the whole asymptote up.
+	//
+	// A NUDGE, NOT A REMOVAL. The spec is explicit that the cap the user asked for in Demo 5 stays;
+	// this is 950 -> 1045 and 1250 -> 1375. MaxAirSpeed (1600) is deliberately untouched, so the
+	// tighter of the two is still the hard cap and spec v5 §1 still governs.
+	if (IsV9LegacyTuning())
+	{
+		return 1.f;
+	}
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("AirStrafeAsymptoteScale"), 1.10f), 0.5f, 2.f);
+}
+
 float UTraceCharacterMovementComponent::GetAirStrafeSoftCapSpeed() const
 {
 	// 950 = 1.19 x the 800 walk speed. Below it a strafe is worth EXACTLY what it was in Demo 5,
 	// which is the part the user called incredible and asked not to be touched.
-	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("AirStrafeSoftCapSpeed"), 950.f));
+	//
+	// Spec v9 §8 slides this up by GetAirStrafeAsymptoteScale(); at x1.10 the untouched band grows
+	// from "below 950" to "below 1045", i.e. Demo 5's feel now survives 10% further up the range.
+	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("AirStrafeSoftCapSpeed"), 950.f)
+		* GetAirStrafeAsymptoteScale());
 }
 
 float UTraceCharacterMovementComponent::GetAirStrafeHardCapSpeed() const
@@ -671,8 +799,12 @@ float UTraceCharacterMovementComponent::GetAirStrafeHardCapSpeed() const
 	// Always strictly above the soft cap: the falloff divides by (Hard - Soft), and a designer who
 	// set them equal would otherwise get a divide-by-zero rather than the "cap everything at the soft
 	// cap" they obviously meant.
+	//
+	// Scaled by the same asymptote knob as the soft cap — see GetAirStrafeAsymptoteScale() for why
+	// they have to move together. The Max() below is applied AFTER the scale so the invariant still
+	// holds at any scale.
 	return FMath::Max(GetAirStrafeSoftCapSpeed() + 1.f,
-		TraceMoveKnob::Float(TEXT("AirStrafeHardCapSpeed"), 1250.f));
+		TraceMoveKnob::Float(TEXT("AirStrafeHardCapSpeed"), 1250.f) * GetAirStrafeAsymptoteScale());
 }
 
 float UTraceCharacterMovementComponent::GetAirStrafeFalloffExponent() const
@@ -848,6 +980,29 @@ void UTraceCharacterMovementComponent::RefreshEngineTunablesFromSettings()
 		FallingLateralFriction = DesiredAirFriction;
 	}
 
+	// --- SPEC v9 §8: GRAVITY x1.12 ---------------------------------------------------------------
+	//
+	// Verbatim: "Increase gravity by 12%, to make players feel less floaty when air strafing."
+	//
+	// GravityScale is an engine-owned field for the same reason AirControl above is: PhysFalling
+	// reads it through UCharacterMovementComponent::GetGravityZ() deep inside the fall integration,
+	// at no point this file can intercept. So it is COPIED here rather than read at the point of
+	// use, and pushed once per simulated move — which keeps it live under Trace.LiveEdit like every
+	// other knob, and makes it identical on client, server and every replayed frame (it is a pure
+	// function of config, so it needs no saved-move state and cannot rubber-band).
+	//
+	// AGAINST 1.0, NOT AGAINST ITSELF. Multiplying GravityScale by 1.12 every move would compound to
+	// infinity in about two seconds. The authored value is the engine default 1.0 and nothing else
+	// in the project writes this field (the mode-B throw arc has its own CoreThrowGravityScale on
+	// the Core's projectile, which reads WORLD gravity and is therefore untouched by this).
+	const float DesiredGravityScale = IsV9LegacyTuning()
+		? 1.f
+		: FMath::Clamp(TraceMoveKnob::Float(TEXT("MovementGravityScale"), 1.12f), 0.1f, 4.f);
+	if (!FMath::IsNearlyEqual(GravityScale, DesiredGravityScale))
+	{
+		GravityScale = DesiredGravityScale;
+	}
+
 	// --- SPEC v8 §7: BUY THE QUESTION, NOT THE JUMP ----------------------------------------------
 	//
 	// ACharacter::CheckJumpInput will not call DoJump() at all once JumpCurrentCount has reached
@@ -889,7 +1044,20 @@ float UTraceCharacterMovementComponent::GetWallJumpWindowSeconds() const
 	// "press jump right as they hit a wall". 0.25s is about four frames of slack at 60Hz plus the
 	// human reaction floor — long enough to be hittable, short enough that it is a reaction to the
 	// contact rather than a state you live in. Clamped so a bad ini cannot make it permanent.
-	return FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpWindowSeconds"), 0.25f), 0.f, 1.f);
+	//
+	// SPEC v9 §5: "Make the window of time for performing a wall jump shorter and make the action
+	// happen faster." The base number stays where the designer put it (WallJumpWindowSeconds in
+	// DefaultGame.ini, which WINS over the fallback here) and the spec's cut is applied as its own
+	// named scalar on top, so the two are never confused and the cut is one number to revert.
+	//
+	// The scalar also shortens how long the auto-mantle defers to a live wall-jump opportunity —
+	// see the mantle gate in OnMovementUpdated — so the two halves of §5 move together by
+	// construction.
+	const float Base = FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpWindowSeconds"), 0.25f), 0.f, 1.f);
+	const float Scale = IsV9LegacyTuning()
+		? 1.f
+		: FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpWindowScale"), 0.6f), 0.05f, 1.f);
+	return FMath::Clamp(Base * Scale, 0.f, 1.f);
 }
 
 float UTraceCharacterMovementComponent::GetWallJumpSpeedRetention() const
@@ -898,7 +1066,43 @@ float UTraceCharacterMovementComponent::GetWallJumpSpeedRetention() const
 	// lossy — otherwise a corridor is a frictionless pinball table — but nowhere near the reset the
 	// request is complaining about. Capped at 1: a wall must never MANUFACTURE speed, which is the
 	// same rule spec v4 §1 imposed on the slide.
-	return FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpSpeedRetention"), 0.95f), 0.f, 1.f);
+	//
+	// SPEC v9 §5: "Reduce momentum gained from wall jumping by 10%." The spec's [ASSUMPTION] is
+	// explicit — "scale the retention knob by 0.9" — so that is what this does, as a separate named
+	// scalar rather than by editing the designer's 0.95.
+	//
+	// THE ALTERNATIVE READING, flagged because the two differ by an order of magnitude. Measured
+	// end-to-end retention (launch speed / entry speed) is ~104.6-105.4%, because the outward
+	// impulse adds on top of the 0.95. If "the momentum GAINED" means only the part above 100%,
+	// then a 10% cut is 1.050 -> 1.045 and is invisible. Scaling the knob is the spec's call and is
+	// the change a player will actually feel: 0.95 -> 0.855, which lands measured retention near
+	// ~95%. To switch readings, set WallJumpMomentumScale to 1.0 and cut GetWallJumpOutwardImpulse
+	// instead — it is the only other term in the launch.
+	const float Base = FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpSpeedRetention"), 0.95f), 0.f, 1.f);
+	const float Scale = IsV9LegacyTuning()
+		? 1.f
+		: FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpMomentumScale"), 0.9f), 0.1f, 1.f);
+	return FMath::Clamp(Base * Scale, 0.f, 1.f);
+}
+
+float UTraceCharacterMovementComponent::GetWallJumpMantleLockoutSeconds() const
+{
+	// SPEC v9 §5, THE SECOND HALF OF "A WALL JUMP OVERRIDES A MANTLE".
+	//
+	// Refusing the mantle on the frame of the wall jump is not enough on its own: the pawn is still
+	// a few uu from the same ledge face for the next handful of frames, so the very next move would
+	// pass CanAttemptMantle() and vacuum the player back onto the lip they had just launched away
+	// from — which reads as the wall jump not having happened.
+	//
+	// Implemented by pushing MantleCooldownRemaining rather than adding a new clock ON PURPOSE.
+	// That field is already saved-move state (SetMoveFor/PrepMoveFor capture and restore it) and is
+	// already the thing CanAttemptMantle() consults, so this costs no new prediction plumbing and
+	// cannot rubber-band. It is also self-documenting: "a wall jump puts the mantle on cooldown".
+	if (IsV9LegacyTuning())
+	{
+		return 0.f;
+	}
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpMantleLockoutSeconds"), 0.30f), 0.f, 2.f);
 }
 
 float UTraceCharacterMovementComponent::GetWallJumpOutwardImpulse() const
@@ -1348,16 +1552,79 @@ bool UTraceCharacterMovementComponent::IsDashing() const
 
 float UTraceCharacterMovementComponent::GetDashCooldownRemaining() const
 {
-	// "Ready" means a charge is in hand AND no dash is currently running.
-	if (DashCharges > 0 && DashTimeRemaining <= 0.f)
+	// =============================================================================================
+	// SPEC v9 §2 — THE CARRIER'S "ONE DASH". THIS FUNCTION WAS THE WHOLE BUG.
+	// =============================================================================================
+	//
+	// The user's three symptoms, verbatim: "The carrier still has only one dash, despite the hud
+	// showing two. When the first refills, they both do. When dash is used, both charges are
+	// consumed." Spec v9 §0 is explicit that the last pass measured the POOL, found it correct, and
+	// declared victory. The pool IS correct. The READOUT was not, and the readout is the only thing
+	// the player can see.
+	//
+	// THE OLD CONTRACT WAS BROKEN. ATracePlayerController::GetDashHudState feeds this number
+	// straight into FTraceDashHudState::Remaining, whose own doc comment reads "Seconds until the
+	// NEXT CHARGE lands. 0 when nothing is recharging", and derives
+	// RechargeFraction = 1 - Remaining/(DashDuration + DashCooldown) from it. ATraceHUD::
+	// DrawChargePips then draws pip[Charges] at exactly that fraction.
+	//
+	// The old body returned 0 whenever ANY charge was in hand. So for a carrier at 1 of 2 — one
+	// banked, one 3.68 s away — it answered "0 seconds", the controller computed RechargeFraction
+	// = 1.0, and DrawChargePips filled the regenerating pip SOLID. The meter read 2 of 2 while the
+	// pawn held 1. Every symptom falls out of that single lie:
+	//
+	//   "the hud shows two"            — 1 of 2 renders as two full pips. Directly.
+	//   "when dash is used, BOTH are   — the first spend is invisible (2 pips before, 2 pips
+	//    consumed"                       after), so the second spend is the first one the player
+	//                                    ever sees, and it empties the whole row at once.
+	//   "when the first refills, they  — at 0 of 2 the row is empty and honest. The instant the
+	//    both do"                        refill grants charge #1, this function flipped from ~3.6
+	//                                    to 0, RechargeFraction snapped to 1.0, and BOTH pips lit
+	//                                    on the same frame.
+	//   "the carrier still has only    — the meter only ever tells the truth at zero, so the pool
+	//    one dash"                       behaves, to the eye, exactly like a single charge.
+	//
+	// It also explains why the previous harness passed: it pressed twice from a FULL pool and
+	// counted two launches. Both launches really do happen. Nothing about that test could see a
+	// display that was wrong only in the 1-of-2 and the 0->1 states.
+	//
+	// THE RULE NOW, and it is the struct's documented contract restated: this is the time until the
+	// pool GAINS ITS NEXT CHARGE. Full pool -> 0. Short pool -> the refill clock, whether or not a
+	// charge happens to be banked. DashTimeRemaining is deliberately NOT part of it any more: the
+	// dash window is not a wait for a charge, and reporting it made the meter dip for 0.18 s on a
+	// pawn whose next charge was seconds away.
+	//
+	// "Can I dash right now" is GetDashCharges() > 0 (which is what ATraceHUD::DrawAbilityRows
+	// already uses for its READY tint) and CanDash() — never this.
+#if !UE_BUILD_SHIPPING
+	// The A/B arm (spec v9 §0). The shipped body, verbatim, so -TraceSingleDashTest can be shown
+	// FAILING and then PASSING in the same binary.
+	//
+	// BOTH A COMMAND-LINE SWITCH AND A CVAR, and the switch is not redundant: -ExecCmds fires at
+	// PostEngineInit, and an ECVF_Cheat variable set that early on a client that has not yet
+	// connected does not reliably survive into the session (measured — the sibling
+	// "NetEmulation.PktLag 40" in the same -ExecCmds list applied and this one did not). FParse of
+	// the command line cannot miss, and it is what every other harness in this file already uses.
+	extern int32 GTraceDashLegacyChargeReadout;
+	static const bool bLegacyFromCommandLine =
+		FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyChargeReadout"));
+	if (GTraceDashLegacyChargeReadout != 0 || bLegacyFromCommandLine)
+	{
+		if (DashCharges > 0 && DashTimeRemaining <= 0.f)
+		{
+			return 0.f;
+		}
+		if (DashCharges > 0)
+		{
+			return FMath::Max(0.f, DashTimeRemaining);
+		}
+		return FMath::Max(0.f, DashRechargeRemaining);
+	}
+#endif
+
+	if (DashCharges >= GetMaxDashCharges())
 	{
 		return 0.f;
-	}
-
-	// Mid-dash with a spare charge: the only thing in the way is the dash itself.
-	if (DashCharges > 0)
-	{
-		return FMath::Max(0.f, DashTimeRemaining);
 	}
 
 	return FMath::Max(0.f, DashRechargeRemaining);
@@ -1996,6 +2263,18 @@ bool UTraceCharacterMovementComponent::TryWallJump()
 	WallJumpNormal = FVector::ZeroVector;
 	WallJumpEntryVelocity = FVector::ZeroVector;
 	++WallJumpsSinceGround;
+
+	// SPEC v9 §5 — "IF A PLAYER INPUTS A WALL JUMP, THAT OVERRIDES A MANTLE." (2 of 2.)
+	//
+	// The wall jump has just thrown the pawn OFF this face. Without this, the auto-mantle in
+	// OnMovementUpdated — which needs no input at all, only a reachable ledge — would fire on this
+	// very move or the next one, take the pawn into MOVE_Flying, and drive Velocity straight back at
+	// the lip. Every unit of the launch above would be discarded and the player would see a jump
+	// that "did nothing", which is exactly the complaint spec v9 §5 is answering.
+	//
+	// Max(), never assignment: an existing mantle cooldown is always at least as strong as this one
+	// and must not be shortened by a wall jump.
+	MantleCooldownRemaining = FMath::Max(MantleCooldownRemaining, GetWallJumpMantleLockoutSeconds());
 
 #if !UE_BUILD_SHIPPING
 	// SPEC v8 §7, THE MEASUREMENT. Counted on the RECORD pass only, for BeginDash()'s reason: a
@@ -3064,8 +3343,61 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	//     "get on top of that" is the jump they already made plus the stick they are already holding
 	//     into the wall. TryBeginMantle() is cheap to refuse (two int compares before any trace) and
 	//     runs three traces only once it is genuinely airborne, moving, and pushing forward.
-	if (MantleTimeRemaining <= 0.f && CanAttemptMantle())
+	// =============================================================================================
+	//     SPEC v9 §5 — THE WALL JUMP OUTRANKS THE MANTLE. THIS IS THE PRIORITY, STATED ONCE.
+	// =============================================================================================
+	//
+	//     Verbatim: "If a player inputs a wall jump, that overrides a mantle". The reverse was
+	//     shipping, and the spec warns that the reverse "will look like the wall jump is broken" —
+	//     it did, and it is also the other half of "it feels like the player is sticking to the wall
+	//     for a second", because a mantle is 0.35 s of MOVE_Flying during which CanAttemptJump()
+	//     refuses every press. Hit a ledge face, get vacuumed up it, be unable to jump. That IS the
+	//     stick.
+	//
+	//     WHY THE MANTLE WON BEFORE, precisely. The mantle needs NO input: it is attempted on every
+	//     airborne move as long as a reachable ledge is in front of the capsule. The wall jump needs
+	//     a key press, and the press can only arrive through DoJump, which UCharacterMovementComponent
+	//     ::PerformMovement runs via CheckJumpInput EARLIER IN THE SAME MOVE than this line. So on
+	//     the frame the capsule met the wall the order was: (no press yet) -> mantle starts here ->
+	//     IsWallJumpAvailable() is false for the rest of the contact (it requires
+	//     MantleTimeRemaining <= 0) -> the player's press lands on a pawn the mantle already owns.
+	//     The wall jump could not win a race it was never entered in.
+	//
+	//     THE RULE NOW: while a wall-jump opportunity is LIVE, the automatic mantle yields. The
+	//     player gets the whole (now shorter) contact window to decide, and only when it lapses
+	//     unused does the ledge get handed to the mantle.
+	//
+	//     WHAT IT COSTS, stated honestly: a ledge whose face also registers as a wall delays its
+	//     mantle by at most GetWallJumpWindowSeconds() — 0.15 s at the spec v9 numbers, down from
+	//     the 0.25 s this would have cost before §5 shortened the window. Nothing else changes: a
+	//     ledge that never opened a wall window (too shallow a face, past the consecutive cap, or
+	//     already grounded) mantles on exactly the frame it always did.
+	//
+	//     The other half of the rule lives in TryWallJump(), which puts the mantle on cooldown so it
+	//     cannot cancel the launch a frame later. Both halves read only state that already
+	//     round-trips through SetMoveFor/PrepMoveFor, so neither can rubber-band.
+	//
+	//     bMantleYieldsToWallJump is the §5 rule; IsV9LegacyTuning() forces it off so the "before"
+	//     behaviour (the mantle wins the frame) can be measured in this same binary. See the A/B arm
+	//     at the top of the file.
+	const bool bMantleYieldsToWallJump = !IsV9LegacyTuning();
+	const bool bWallWindowLive = IsWallJumpAvailable();
+
+	if (MantleTimeRemaining <= 0.f && !(bMantleYieldsToWallJump && bWallWindowLive) && CanAttemptMantle())
 	{
+#if !UE_BUILD_SHIPPING
+		// THE MEASUREMENT FOR "THE WALL JUMP IS BROKEN". A mantle that starts while a wall-jump window
+		// is open is a mantle that TOOK a wall jump the player still had the right to make — 0.35 s of
+		// MOVE_Flying in which CanAttemptJump() refuses every press. Counted before TryBeginMantle()
+		// because the count is of OPPORTUNITIES stolen, and only on the record pass (BeginDash()'s
+		// reason: a replayed steal is the same steal).
+		if (bWallWindowLive && CharacterOwner != nullptr
+			&& !CharacterOwner->bClientUpdating && CharacterOwner->IsLocallyControlled())
+		{
+			++WallJumpMantleSteals;
+		}
+#endif
+
 		// OldVelocity, not Velocity: see the note at the top of TryBeginMantle. The frame the capsule
 		// meets the ledge is the frame the collision has already zeroed the planar velocity, and the
 		// approach speed is the only honest measure of "was I moving at that thing".
@@ -3135,6 +3467,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	TickDashPitchTest(DeltaSeconds);
 	TickWallJumpTest(DeltaSeconds);
 	TickCarrierChargeTest(DeltaSeconds);
+	TickSingleDashTest(DeltaSeconds);
 #endif
 }
 
@@ -3253,6 +3586,27 @@ static FAutoConsoleVariableRef CVarTraceDashLegacyAimReplay(
 	ECVF_Cheat);
 
 /**
+ * SPEC v9 §2 / §0 — THE A/B ARM FOR THE CHARGE READOUT.
+ *
+ * Spec v9 §0's whole complaint is that the previous pass produced a harness that never went red. A
+ * fix demonstrated only by a green run is not demonstrated at all, and rebuilding the old code to
+ * get a red run means comparing two binaries — which the Trace.DashLegacyAimReplay comment already
+ * calls out as dishonest for exactly this reason.
+ *
+ * So set this to 1 and GetDashCooldownRemaining() answers the way the shipped build did: 0 whenever
+ * any charge is in hand. Run -TraceSingleDashTest with it on and the reproduction fails; run it with
+ * it off and the same reproduction passes. One binary, one harness, both results.
+ */
+int32 GTraceDashLegacyChargeReadout = 0;
+static FAutoConsoleVariableRef CVarTraceDashLegacyChargeReadout(
+	TEXT("Trace.DashLegacyChargeReadout"),
+	GTraceDashLegacyChargeReadout,
+	TEXT("Dev only. 1 restores the pre-v9 GetDashCooldownRemaining() (returns 0 whenever any charge is "
+	     "banked, so the HUD draws a still-recharging pip as full) to reproduce the spec v9 §2 bug in "
+	     "this build."),
+	ECVF_Cheat);
+
+/**
  * Live charge-pool readout (spec v8 §5), once a second, per locally-controlled pawn.
  *
  * "The two dash charges aren't working anymore, for the carrier" is a claim about two integers, and
@@ -3273,6 +3627,21 @@ static bool IsDashPoolDebugEnabled()
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceDashPoolDebug"));
 	return bFromCommandLine || GTraceDashPoolDebug != 0;
 }
+
+/**
+ * SPEC v9 §0 — the A/B arm for the §§5-8 TUNING items. See IsV9LegacyTuning() at the top of the file
+ * for the identity values it restores and for why the command-line switch (-TraceLegacyTuning) is not
+ * redundant with this variable.
+ */
+int32 GTraceV9LegacyTuning = 0;
+static FAutoConsoleVariableRef CVarTraceV9LegacyTuning(
+	TEXT("Trace.V9LegacyTuning"),
+	GTraceV9LegacyTuning,
+	TEXT("Dev only. 1 restores the pre-v9 movement tuning (wall-jump retention and window, no "
+	     "wall-jump-over-mantle priority, full-length slide, the 1.3125 slide-jump bonus, the "
+	     "un-nudged air-strafe asymptote and gravity x1.0) so the spec v9 secs 5-8 changes can be "
+	     "measured as a BEFORE/AFTER in one binary."),
+	ECVF_Cheat);
 
 void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 {
@@ -4744,7 +5113,9 @@ void UTraceCharacterMovementComponent::LogWallJumpReport() const
 	UE_LOG(LogTraceGame, Display,
 		TEXT("WALLJUMP REPORT %-16s netMode=%d role=%d | jumps=%d entry=%6.0f -> launch=%6.0f uu/s "
 		     "(%.1f%% carried, turned %.1fdeg, launchZ=%6.0f) maxConsecutive=%d/%d capRefusals=%d "
-		     "corrections(in wall jump)=%d => %.3f per jump | hardCap=%.0f%s"),
+		     "corrections(in wall jump)=%d => %.3f per jump | hardCap=%.0f | "
+		     "v9: legacyTuning=%d window=%.3fs mantleSteals=%d (=%.2fs locked out of jumping) "
+		     "mantleLockout=%.2fs%s"),
 		*GetNameSafe(CharacterOwner),
 		(ReportWorld != nullptr) ? static_cast<int32>(ReportWorld->GetNetMode()) : -1,
 		(CharacterOwner != nullptr) ? static_cast<int32>(CharacterOwner->GetLocalRole()) : -1,
@@ -4757,6 +5128,11 @@ void UTraceCharacterMovementComponent::LogWallJumpReport() const
 		WallJumpMaxConsecutiveSeen, GetWallJumpMaxConsecutive(), WallJumpCapRefusals,
 		WallJumpCorrectionsInWindow, WallJumpCorrectionsInWindow / Denominator,
 		GetAirStrafeHardCapSpeed(),
+		IsV9LegacyTuning() ? 1 : 0,
+		GetWallJumpWindowSeconds(),
+		WallJumpMantleSteals,
+		WallJumpMantleSteals * GetMantleDurationSeconds(),
+		GetWallJumpMantleLockoutSeconds(),
 		(CharacterOwner != nullptr && CharacterOwner->HasAuthority())
 			? TEXT("  [AUTHORITY - the correction column is meaningless here]") : TEXT(""));
 }
@@ -5036,6 +5412,418 @@ void UTraceCharacterMovementComponent::TickCarrierChargeTest(float DeltaSeconds)
 	}
 }
 
+// =================================================================================================
+// SPEC v9 §2 / §0 — THE SINGLE-DASH REPRODUCTION (-TraceSingleDashTest)
+// =================================================================================================
+//
+// Spec v9 §0 exists because the last pass's harness pressed dash TWICE FROM A FULL POOL, saw two
+// launches, and called the bug fixed. That test could not fail: both launches genuinely happen. It
+// never touched the state the user described.
+//
+// This one reproduces the user's sentences literally, on a CLIENT, WHILE CARRYING:
+//
+//   "When dash is used, both charges are consumed."   -> dash ONCE from a full pool and read the
+//                                                        pool AND THE HUD.
+//   "When the first refills, they both do."           -> drain to zero and watch the 0 -> 1 refill,
+//                                                        reading the HUD on the frame it lands.
+//   "despite the hud showing two"                     -> every sample compares the true pool with
+//                                                        the number of pips ATraceHUD would DRAW.
+//
+// THE PIP COUNT IS THE POINT. It is recomputed here by the identical rule ATraceHUD::DrawChargePips
+// uses (pip i is full when i < Charges, and pip[Charges] is drawn at RechargeFraction), from the
+// real ATracePlayerController::GetDashHudState — not from a local reimplementation of the maths.
+// What the player sees is a count of full pips, so that is what is asserted against.
+//
+// A test that only reads DashCharges would have gone green on the broken build, because the pool was
+// never the thing that was wrong.
+
+/** One line of the ledger: what the pawn holds, and what the HUD would draw for it. */
+struct FTraceSingleDashSample
+{
+	int32 Charges = 0;
+	int32 MaxCharges = 1;
+	bool  bHudValid = false;
+	int32 HudCharges = 0;
+	int32 HudMaxCharges = 1;
+	float HudRechargeFraction = 0.f;
+	float HudRemaining = 0.f;
+
+	/** Pips ATraceHUD::DrawChargePips would render SOLID. This is the number the player reads. */
+	int32 HudFullPips = 0;
+};
+
+static void TraceSingleDashCheck(const TCHAR* Name, const bool bPass, int32& InOutFailures, const FString& Detail)
+{
+	if (!bPass)
+	{
+		++InOutFailures;
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("SINGLEDASH  [%s] %-46s %s"),
+		bPass ? TEXT("PASS") : TEXT("FAIL"), Name, *Detail);
+}
+
+FTraceSingleDashSample UTraceCharacterMovementComponent::SampleSingleDashTest() const
+{
+	FTraceSingleDashSample Sample;
+	Sample.Charges = DashCharges;
+	Sample.MaxCharges = FMath::Max(1, GetMaxDashCharges());
+
+	// THE REAL HUD PATH, deliberately. Reimplementing GetDashHudState here would test this harness's
+	// idea of the HUD rather than the HUD, which is the exact failure spec v9 §0 is about.
+	const ATracePlayerController* PC = (CharacterOwner != nullptr)
+		? Cast<ATracePlayerController>(CharacterOwner->GetController())
+		: nullptr;
+
+	FTraceDashHudState HudState;
+	if (PC != nullptr && PC->GetDashHudState(HudState))
+	{
+		Sample.bHudValid = true;
+		Sample.HudCharges = HudState.Charges;
+		Sample.HudMaxCharges = FMath::Max(1, HudState.MaxCharges);
+		Sample.HudRechargeFraction = HudState.RechargeFraction;
+		Sample.HudRemaining = HudState.Remaining;
+
+		// ATraceHUD::DrawChargePips, verbatim: banked charges are full, pip[Charges] shows the
+		// recharge progress, everything past it is empty. A pip at fraction 1.0 is indistinguishable
+		// from a banked one on screen, so that is what "full" means here.
+		for (int32 Index = 0; Index < Sample.HudMaxCharges; ++Index)
+		{
+			float Fraction = 0.f;
+			if (Index < HudState.Charges)
+			{
+				Fraction = 1.f;
+			}
+			else if (Index == HudState.Charges)
+			{
+				Fraction = FMath::Clamp(HudState.RechargeFraction, 0.f, 1.f);
+			}
+
+			if (Fraction >= 0.999f)
+			{
+				++Sample.HudFullPips;
+			}
+		}
+	}
+
+	return Sample;
+}
+
+void UTraceCharacterMovementComponent::TickSingleDashTest(float DeltaSeconds)
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("TraceSingleDashTest"));
+	if (!bEnabled || CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	// TickDashPitchTest's reason: a replayed move must not advance a clock that fires input.
+	if (CharacterOwner->bClientUpdating)
+	{
+		return;
+	}
+
+	UWorld* TestWorld = GetWorld();
+	ATraceCharacter* TraceOwner = Cast<ATraceCharacter>(CharacterOwner);
+	if (TestWorld == nullptr || TraceOwner == nullptr)
+	{
+		return;
+	}
+
+	// --- THE SERVER HALF: hand the Core to the JOINED CLIENT's pawn -------------------------------
+	//
+	// Trace.DebugTakeCore only ever targets the LOCAL pawn, which on a listen host is the host — the
+	// one machine spec v9 §0 says does not count. So the authority pushes the Core through
+	// ATraceCore::TryPickup(), the same funnel the pickup sphere uses, and bIsCarrier reaches the
+	// client by replication exactly as it would in a real match.
+	if (CharacterOwner->HasAuthority() && !CharacterOwner->IsLocallyControlled())
+	{
+		if (bSingleDashCoreGiven != 0 || Cast<APlayerController>(CharacterOwner->GetController()) == nullptr)
+		{
+			return;
+		}
+
+		if (TestWorld->GetTimeSeconds() < 10.f)
+		{
+			return;
+		}
+
+		// WAITING FOR A LOOSE CORE IS NOT GOOD ENOUGH, and this cost two whole runs. The original loop
+		// skipped every Core that IsHeld() and simply retried next frame, so it depended on the Core
+		// happening to be on the floor while the ten bots in the match are fighting over it. Measured:
+		// in one arm the wait ended at t=53.7 (the harness arms at t=75, so it barely made it) and in
+		// the next it never ended at all — the client reported "NEVER ARMED ... carrier=0" and the run
+		// produced no measurement. A harness whose ability to take a reading depends on bot behaviour
+		// is not a harness.
+		//
+		// So: prefer a loose Core (TryPickup is the ordinary player funnel and is what a real pickup
+		// does), but after a short grace TAKE it from whoever is holding it. GrantTo() is documented in
+		// TraceCore.h as "the single funnel: every other path ends up here" — a kill, a pass and a
+		// kickoff all reach it — so robbing a bot exercises exactly the code a real turnover does, and
+		// ETraceCoreGrantReason::Debug is the reason the enum reserves for a harness grant.
+		//
+		// This changes NOTHING about what is measured. It only decides which pawn is carrying when the
+		// measurement starts; every check runs afterwards, on the client, through the ordinary
+		// replicated carrier bit.
+		const bool bMayRob = TestWorld->GetTimeSeconds() >= 18.f;
+
+		ATraceCore* Robbable = nullptr;
+		for (TActorIterator<ATraceCore> It(TestWorld); It; ++It)
+		{
+			ATraceCore* Core = *It;
+			if (Core == nullptr)
+			{
+				continue;
+			}
+
+			if (!Core->IsHeld())
+			{
+				Core->TryPickup(TraceOwner);
+				bSingleDashCoreGiven = 1;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("SINGLEDASH [server] gave the LOOSE Core to the joined client's pawn %s at t=%.1f (carrier=%d)"),
+					*GetNameSafe(CharacterOwner), TestWorld->GetTimeSeconds(), TraceOwner->IsCarrier() ? 1 : 0);
+				return;
+			}
+
+			if (Robbable == nullptr)
+			{
+				Robbable = Core;
+			}
+		}
+
+		if (bMayRob && Robbable != nullptr)
+		{
+			Robbable->GrantTo(TraceOwner, ETraceCoreGrantReason::Debug);
+			bSingleDashCoreGiven = 1;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SINGLEDASH [server] TOOK the Core from its holder for the joined client's pawn %s "
+				     "at t=%.1f (carrier=%d)"),
+				*GetNameSafe(CharacterOwner), TestWorld->GetTimeSeconds(), TraceOwner->IsCarrier() ? 1 : 0);
+		}
+
+		return;
+	}
+
+	// A HUMAN'S PAWN, NOT A BOT'S. Bot pawns are locally controlled ON THE SERVER too, and they have
+	// no ATracePlayerController — so GetDashHudState has nothing to answer with and every bot would
+	// report "the HUD draws 0 pips" forever. (Measured: eight bots did exactly that, and one of them
+	// also spent a second charge on its own AI dash mid-phase and failed the consumption check with
+	// it.) The claim under test is about what a PLAYER sees, so only a player's pawn qualifies.
+	if (!CharacterOwner->IsLocallyControlled() || bSingleDashReported != 0
+		|| Cast<ATracePlayerController>(CharacterOwner->GetController()) == nullptr)
+	{
+		return;
+	}
+
+	const FTraceSingleDashSample Sample = SampleSingleDashTest();
+	const float Window = GetDashRechargeWindow();
+
+	// --- PHASE -1: ARM. Wait for the Core to land and the pool to reach the carrier's maximum. -----
+	if (SingleDashPhase < 0)
+	{
+		if (!TraceOwner->IsCarrier() || Sample.MaxCharges < 2 || Sample.Charges < Sample.MaxCharges
+			|| !IsMovingOnGround() || DashTimeRemaining > 0.f)
+		{
+			if (TestWorld->GetTimeSeconds() > 75.f)
+			{
+				bSingleDashReported = 1;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("SINGLEDASH ==== NEVER ARMED by t=75: carrier=%d charges=%d/%d grounded=%d. "
+					     "The Core never reached this client, or the pool never grew with it."),
+					TraceOwner->IsCarrier() ? 1 : 0, Sample.Charges, Sample.MaxCharges,
+					IsMovingOnGround() ? 1 : 0);
+			}
+			return;
+		}
+
+		SingleDashPhase = 0;
+		SingleDashPhaseTime = 0.f;
+		SingleDashPresses = 0;
+		SingleDashPrevCharges = Sample.Charges;
+		SingleDashPrevHudPips = Sample.HudFullPips;
+		SingleDashMaxHudDivergence = 0;
+		SingleDashDivergentSeconds = 0.f;
+		SingleDashMaxTrueGain = 0;
+		SingleDashMaxHudGain = 0;
+		SingleDashHudPipsAtFirstRefill = -1;
+		SingleDashNextSampleTime = 0.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SINGLEDASH ==== ARMED at t=%.1f. netMode=%d role=%d carrier=%d | true=%d/%d  "
+			     "hud=%d/%d frac=%.3f rem=%.2f pips=%d | rechargeWindow=%.2f"),
+			TestWorld->GetTimeSeconds(), static_cast<int32>(GetNetMode()),
+			static_cast<int32>(CharacterOwner->GetLocalRole()), TraceOwner->IsCarrier() ? 1 : 0,
+			Sample.Charges, Sample.MaxCharges, Sample.HudCharges, Sample.HudMaxCharges,
+			Sample.HudRechargeFraction, Sample.HudRemaining, Sample.HudFullPips, Window);
+		return;
+	}
+
+	SingleDashPhaseTime += DeltaSeconds;
+
+	// --- THE LEDGER. Every transition of either number, plus a heartbeat, plus the running worsts. --
+	const int32 TrueGain = Sample.Charges - SingleDashPrevCharges;
+	const int32 HudGain = Sample.HudFullPips - SingleDashPrevHudPips;
+	const bool bChanged = (TrueGain != 0) || (HudGain != 0);
+
+	SingleDashMaxHudDivergence = FMath::Max(SingleDashMaxHudDivergence,
+		FMath::Abs(Sample.HudFullPips - Sample.Charges));
+
+	// See SingleDashDivergentSeconds in the header for why this is timed rather than counted.
+	if (Sample.HudFullPips != Sample.Charges)
+	{
+		SingleDashDivergentSeconds += DeltaSeconds;
+	}
+	SingleDashMaxTrueGain = FMath::Max(SingleDashMaxTrueGain, TrueGain);
+	SingleDashMaxHudGain = FMath::Max(SingleDashMaxHudGain, HudGain);
+
+	// THE "WHEN THE FIRST REFILLS, THEY BOTH DO" MEASUREMENT: the pip count on the exact frame the
+	// pool climbs off zero. If the readout is honest this is 1. Recorded once.
+	if (SingleDashPrevCharges == 0 && Sample.Charges == 1 && SingleDashHudPipsAtFirstRefill < 0)
+	{
+		SingleDashHudPipsAtFirstRefill = Sample.HudFullPips;
+	}
+
+	if (bChanged || TestWorld->GetTimeSeconds() >= SingleDashNextSampleTime)
+	{
+		SingleDashNextSampleTime = static_cast<float>(TestWorld->GetTimeSeconds()) + 0.5f;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SINGLEDASH t=%6.2f ph%d %-7s | TRUE %d/%d | HUD pips %d/%d (charges=%d frac=%.3f rem=%.2f) "
+			     "| refillClock=%5.2f dash=%4.2f%s"),
+			TestWorld->GetTimeSeconds(), SingleDashPhase, bChanged ? TEXT("CHANGE") : TEXT(""),
+			Sample.Charges, Sample.MaxCharges, Sample.HudFullPips, Sample.HudMaxCharges,
+			Sample.HudCharges, Sample.HudRechargeFraction, Sample.HudRemaining,
+			DashRechargeRemaining, DashTimeRemaining,
+			(Sample.HudFullPips != Sample.Charges) ? TEXT("   <<< HUD DISAGREES WITH THE POOL") : TEXT(""));
+	}
+
+	SingleDashPrevCharges = Sample.Charges;
+	SingleDashPrevHudPips = Sample.HudFullPips;
+
+	switch (SingleDashPhase)
+	{
+	case 0:
+	{
+		// --- "When dash is used, both charges are consumed." ONE press, from a full pool. ---------
+		if (SingleDashPhaseTime >= 0.2f && SingleDashPresses == 0)
+		{
+			SingleDashPresses = 1;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SINGLEDASH ---- PHASE 0: ONE dash press from a full pool (true=%d/%d, hud pips=%d)"),
+				Sample.Charges, Sample.MaxCharges, Sample.HudFullPips);
+			StartDash();
+		}
+		else if (SingleDashPhaseTime >= 1.4f)
+		{
+			TraceSingleDashCheck(TEXT("one press spends exactly one charge"),
+				Sample.Charges == Sample.MaxCharges - 1, SingleDashFailures,
+				FString::Printf(TEXT("pool is %d/%d after one press, expected %d/%d"),
+					Sample.Charges, Sample.MaxCharges, Sample.MaxCharges - 1, Sample.MaxCharges));
+
+			TraceSingleDashCheck(TEXT("HUD shows one charge gone after one press"),
+				Sample.HudFullPips == Sample.MaxCharges - 1, SingleDashFailures,
+				FString::Printf(TEXT("HUD draws %d full pips, pool holds %d  (frac=%.3f rem=%.2f)"),
+					Sample.HudFullPips, Sample.Charges, Sample.HudRechargeFraction, Sample.HudRemaining));
+
+			SingleDashPhase = 1;
+			SingleDashPhaseTime = 0.f;
+		}
+		break;
+	}
+
+	case 1:
+	{
+		// --- The 1 -> 2 refill. One charge, not two. ---------------------------------------------
+		if (Sample.Charges >= Sample.MaxCharges || SingleDashPhaseTime > Window + 3.f)
+		{
+			TraceSingleDashCheck(TEXT("the pool refilled back to full"),
+				Sample.Charges >= Sample.MaxCharges, SingleDashFailures,
+				FString::Printf(TEXT("pool is %d/%d after %.1fs (window %.2fs)"),
+					Sample.Charges, Sample.MaxCharges, SingleDashPhaseTime, Window));
+
+			SingleDashPhase = 2;
+			SingleDashPhaseTime = 0.f;
+			SingleDashPresses = 0;
+		}
+		break;
+	}
+
+	case 2:
+	{
+		// --- Drain the pool to ZERO, so the 0 -> 1 refill can be watched. -------------------------
+		const float SecondPressAt = 0.2f + FMath::Max(0.35f, GetDashDuration() + 0.2f);
+		if (SingleDashPhaseTime >= 0.2f && SingleDashPresses == 0)
+		{
+			SingleDashPresses = 1;
+			StartDash();
+		}
+		else if (SingleDashPhaseTime >= SecondPressAt && SingleDashPresses == 1)
+		{
+			SingleDashPresses = 2;
+			StartDash();
+		}
+		else if (SingleDashPhaseTime >= SecondPressAt + 1.2f)
+		{
+			TraceSingleDashCheck(TEXT("two presses spend exactly two charges"),
+				Sample.Charges == 0, SingleDashFailures,
+				FString::Printf(TEXT("pool is %d/%d after two presses, expected 0/%d"),
+					Sample.Charges, Sample.MaxCharges, Sample.MaxCharges));
+
+			TraceSingleDashCheck(TEXT("HUD reads empty when the pool is empty"),
+				Sample.HudFullPips == 0, SingleDashFailures,
+				FString::Printf(TEXT("HUD draws %d full pips on a pool of %d"),
+					Sample.HudFullPips, Sample.Charges));
+
+			SingleDashPhase = 3;
+			SingleDashPhaseTime = 0.f;
+			SingleDashHudPipsAtFirstRefill = -1;
+			SingleDashMaxTrueGain = 0;
+			SingleDashMaxHudGain = 0;
+		}
+		break;
+	}
+
+	case 3:
+	{
+		// --- "When the first refills, they both do." THE MONEY SHOT. -----------------------------
+		if (Sample.Charges >= Sample.MaxCharges || SingleDashPhaseTime > (2.f * Window) + 4.f)
+		{
+			TraceSingleDashCheck(TEXT("charges return ONE at a time"),
+				SingleDashMaxTrueGain <= 1, SingleDashFailures,
+				FString::Printf(TEXT("largest single-frame pool gain was +%d"), SingleDashMaxTrueGain));
+
+			TraceSingleDashCheck(TEXT("when the FIRST refills, the HUD gains ONE pip"),
+				SingleDashHudPipsAtFirstRefill == 1, SingleDashFailures,
+				FString::Printf(TEXT("HUD drew %d full pips on the frame the pool went 0 -> 1"),
+					SingleDashHudPipsAtFirstRefill));
+
+			TraceSingleDashCheck(TEXT("HUD pips never jump by more than one"),
+				SingleDashMaxHudGain <= 1, SingleDashFailures,
+				FString::Printf(TEXT("largest single-frame pip gain was +%d"), SingleDashMaxHudGain));
+
+			// One 60 Hz frame is 16.7 ms; 50 ms is three of them, which is slack for a hitching
+			// offscreen run and still two orders of magnitude below the 3.68 s lie the bug produced.
+			TraceSingleDashCheck(TEXT("HUD agrees with the pool (no visible lie)"),
+				SingleDashDivergentSeconds <= 0.05f, SingleDashFailures,
+				FString::Printf(TEXT("meter disagreed with the pool for %.3fs total "
+					"(worst |pips - charges| = %d); budget 0.050s"),
+					SingleDashDivergentSeconds, SingleDashMaxHudDivergence));
+
+			bSingleDashReported = 1;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SINGLEDASH ==== %s  (%d failing check%s) — client, carrying, netMode=%d role=%d"),
+				(SingleDashFailures == 0) ? TEXT("ALL CHECKS PASSED") : TEXT("FAILED"),
+				SingleDashFailures, (SingleDashFailures == 1) ? TEXT("") : TEXT("s"),
+				static_cast<int32>(GetNetMode()), static_cast<int32>(CharacterOwner->GetLocalRole()));
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+}
+
 static void TraceReportWallJump()
 {
 	if (GEngine == nullptr)
@@ -5078,6 +5866,196 @@ static void TraceReportWallJump()
 		UE_LOG(LogTraceGame, Display, TEXT("WALLJUMP REPORT: no locally-controlled pawn in this process."));
 	}
 }
+
+void UTraceCharacterMovementComponent::LogV9TuningReport() const
+{
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// GetGravityZ() is the engine's own accessor and already includes GravityScale, which is the field
+	// spec v9 §8 moves. Reading it (rather than WorldGravityZ x GravityScale by hand) is what makes
+	// this report the SAME number PhysFalling integrates.
+	const float GravityZ = GetGravityZ();
+	const float G = FMath::Max(1.f, FMath::Abs(GravityZ));
+
+	// --- The launches, and the two things gravity does to each of them ----------------------------
+	// apex = v^2 / 2g and hang time = 2v / g. Both scale as 1/g exactly, so a 12% heavier gravity is
+	// -10.71% on every height and every air time in the game. Printing them per-launch rather than
+	// quoting that one percentage is deliberate: the ABSOLUTE loss is what decides whether a specific
+	// ledge is still clearable, and 10.71% of a big number is a big number.
+	const float JumpZ = FMath::Max(1.f, JumpZVelocity);
+	const float JumpApex = (JumpZ * JumpZ) / (2.f * G);
+	const float JumpAirTime = (2.f * JumpZ) / G;
+
+	const float WallJumpZ = JumpZ * GetWallJumpVerticalMultiplier();
+	const float WallApex = (WallJumpZ * WallJumpZ) / (2.f * G);
+	const float WallAirTime = (2.f * WallJumpZ) / G;
+
+	// A slide-jump's Z is the jump's, times the slide-jump multiplier, times the well-timed Z bonus.
+	const float SlideJumpZ = JumpZ * GetSlideJumpZMultiplier() * GetSlideJumpWindowZBonus();
+	const float SlideJumpApex = (SlideJumpZ * SlideJumpZ) / (2.f * G);
+
+	// The vertical dash. Its rise has TWO parts and only the second is gravity's: for
+	// GetDashDuration() the dash holds DashSpeed on rails, then the exit clamp hands the pawn back at
+	// no more than GetDashExitVerticalSpeedLimit() and the rest is ordinary ballistics.
+	const float DashRailRise = GetDashSpeed() * GetDashDuration();
+	const float DashExitZ = GetDashExitVerticalSpeedLimit();
+	const float DashBallisticRise = (DashExitZ * DashExitZ) / (2.f * G);
+
+	// --- The slide, integrated rather than asserted -----------------------------------------------
+	// v(t) = v0 - a.t, so the slide ends at whichever comes first: the clock, or decaying to the exit
+	// threshold. Distance is the integral to that moment. The reference entry speed is the air-strafe
+	// hard cap, i.e. the fastest a player can legitimately arrive.
+	const float SlideRefEntry = GetAirStrafeHardCapSpeed();
+	const float SlideDecel = GetSlideDeceleration();
+	const float SlideExitSpeed = FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideExitSpeedFraction);
+	const float SlideDecayTime = (SlideDecel > 1.f)
+		? FMath::Max(0.f, (SlideRefEntry - SlideExitSpeed) / SlideDecel)
+		: 1.0e9f;   // a literal, not BIG_NUMBER/MAX_FLT: those macros are UE_-prefixed in UE5.
+	const float SlideT = FMath::Min(GetSlideDuration(), SlideDecayTime);
+	const float SlideLength = SlideRefEntry * SlideT - 0.5f * SlideDecel * SlideT * SlideT;
+	const float SlideEndSpeed = SlideRefEntry - SlideDecel * SlideT;
+
+	// --- The slide-jump bonus, as the speed a player actually leaves at ---------------------------
+	const float SlideJumpMissed = SlideEndSpeed * GetSlideJumpHorizontalRetention();
+	const float SlideJumpTimed = SlideJumpMissed * GetSlideJumpWindowSpeedBonus();
+
+	UE_LOG(LogTraceGame, Display, TEXT("V9TUNING ============================================================"));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING arm=%s  pawn=%s netMode=%d role=%d"),
+		IsV9LegacyTuning() ? TEXT("LEGACY (pre-v9)") : TEXT("V9 (shipped)"),
+		*GetNameSafe(CharacterOwner),
+		(GetWorld() != nullptr) ? static_cast<int32>(GetWorld()->GetNetMode()) : -1,
+		(CharacterOwner != nullptr) ? static_cast<int32>(CharacterOwner->GetLocalRole()) : -1);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §8 gravity   scale=%.3f  gravityZ=%8.1f uu/s^2"),
+		GravityScale, GravityZ);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §8 airstrafe softCap=%7.1f  hardCap=%7.1f  (asymptoteScale=%.3f, maxAirSpeed=%7.1f)"),
+		GetAirStrafeSoftCapSpeed(), GetAirStrafeHardCapSpeed(), GetAirStrafeAsymptoteScale(),
+		Settings.MaxAirSpeed);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §8 knock-on  jump:      z=%6.1f apex=%7.1fuu airTime=%.3fs"),
+		JumpZ, JumpApex, JumpAirTime);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §8 knock-on  wallJump:  z=%6.1f apex=%7.1fuu airTime=%.3fs"),
+		WallJumpZ, WallApex, WallAirTime);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §8 knock-on  slideJump: z=%6.1f apex=%7.1fuu (well-timed, zBonus=%.3f)"),
+		SlideJumpZ, SlideJumpApex, GetSlideJumpWindowZBonus());
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §8 knock-on  dash(up):  railRise=%7.1fuu + ballistic=%7.1fuu = %7.1fuu (exitZ=%6.1f)"),
+		DashRailRise, DashBallisticRise, DashRailRise + DashBallisticRise, DashExitZ);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §8 knock-on  MANTLE HEADROOM: apex=%7.1fuu vs maxLedge=%7.1fuu => %+7.1fuu "
+		     "(minLedge=%6.1f reach=%6.1f dur=%.2fs)"),
+		JumpApex, GetMantleMaxHeightUU(), JumpApex - GetMantleMaxHeightUU(),
+		GetMantleMinHeightUU(), GetMantleReachUU(), GetMantleDurationSeconds());
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §5 wallJump  retention=%.4f  window=%.4fs  outward=%5.1f  zMul=%.3f  "
+		     "mantleLockout=%.2fs  cap=%d"),
+		GetWallJumpSpeedRetention(), GetWallJumpWindowSeconds(), GetWallJumpOutwardImpulse(),
+		GetWallJumpVerticalMultiplier(), GetWallJumpMantleLockoutSeconds(), GetWallJumpMaxConsecutive());
+
+	// THE END-TO-END §5 NUMBER, AT A FIXED ENTRY SPEED — and it has to be fixed, because the aggregate
+	// "% carried" in WALLJUMP REPORT is NOT comparable between arms. Two things confound it: the runs
+	// arrive at the wall at different speeds (the §8 asymptote nudge alone moves the approach), and
+	// GetWallJumpOutwardImpulse() is a FLAT addition, so it is a larger fraction of a slower approach.
+	// That is why the measured legacy run reads 111.5% carried and the v9 run reads 118.3% — the v9 run
+	// simply approached slower. Held at one speed the comparison is clean and monotonic.
+	//
+	// Head-on, so the reflection returns the whole planar component: launch = entry x retention +
+	// outward. This is the arithmetic TryWallJump() performs, not a model of it.
+	const float WallRefEntry = 1100.f;
+	const float WallLaunch = WallRefEntry * GetWallJumpSpeedRetention() + GetWallJumpOutwardImpulse();
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §5 wallJump  HEAD-ON at %6.1f uu/s -> launch %7.1f uu/s = %.1f%% carried "
+		     "(entry x %.4f + %.1f)"),
+		WallRefEntry, WallLaunch, 100.f * WallLaunch / WallRefEntry,
+		GetWallJumpSpeedRetention(), GetWallJumpOutwardImpulse());
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §6 slide     duration=%.4fs  MAX LENGTH=%8.1fuu  (entry=%7.1f decel=%6.1f "
+		     "endSpeed=%7.1f endedBy=%s)"),
+		GetSlideDuration(), SlideLength, SlideRefEntry, SlideDecel, SlideEndSpeed,
+		(SlideDecayTime <= GetSlideDuration()) ? TEXT("decay") : TEXT("clock"));
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("V9TUNING §7 slideJump multiplier=%.5f (base=%.5f gainOnly=%d)  missed=%7.1f -> timed=%7.1f "
+		     "uu/s (+%6.1f)"),
+		GetSlideJumpWindowSpeedBonus(), Settings.SlideJumpWindowSpeedBonus,
+		TraceMoveKnob::Bool(TEXT("bSlideJumpBonusScalesGainOnly"), true) ? 1 : 0,
+		SlideJumpMissed, SlideJumpTimed, SlideJumpTimed - SlideJumpMissed);
+	UE_LOG(LogTraceGame, Display, TEXT("V9TUNING ============================================================"));
+}
+
+/**
+ * Trace.V9.Tuning — the §§5-8 numbers for every locally-controlled pawn in this process.
+ *
+ * Safe on a host: nothing in the report is a prediction quantity, it is all config arithmetic, so
+ * unlike the correction counters it means the same thing on either machine. (The wall-jump RETENTION
+ * measurement is a different matter and still has to come from a client — see Trace.WallJumpReport.)
+ */
+static void TraceReportV9Tuning()
+{
+	if (GEngine == nullptr)
+	{
+		return;
+	}
+
+	int32 Reported = 0;
+	for (const FWorldContext& Context : GEngine->GetWorldContexts())
+	{
+		const UWorld* ContextWorld = Context.World();
+		if (ContextWorld == nullptr)
+		{
+			continue;
+		}
+
+		for (FConstPlayerControllerIterator It = ContextWorld->GetPlayerControllerIterator(); It; ++It)
+		{
+			const APlayerController* PC = It->Get();
+			const ACharacter* PawnCharacter = (PC != nullptr) ? Cast<ACharacter>(PC->GetPawn()) : nullptr;
+			if (PawnCharacter == nullptr || !PawnCharacter->IsLocallyControlled())
+			{
+				continue;
+			}
+
+			const UTraceCharacterMovementComponent* Movement =
+				Cast<UTraceCharacterMovementComponent>(PawnCharacter->GetCharacterMovement());
+			if (Movement == nullptr)
+			{
+				continue;
+			}
+
+			++Reported;
+			Movement->LogV9TuningReport();
+			break;
+		}
+
+		if (Reported > 0)
+		{
+			break;
+		}
+	}
+
+	if (Reported == 0)
+	{
+		// The CDO still answers every getter correctly (they are pure config reads), so a process with
+		// no pawn yet gets the tuning block rather than nothing at all. JumpZVelocity and GravityScale
+		// are the authored defaults there, which is exactly right for a config report.
+		GetDefault<UTraceCharacterMovementComponent>()->LogV9TuningReport();
+	}
+}
+
+static FAutoConsoleCommand GTraceV9TuningCmd(
+	TEXT("Trace.V9.Tuning"),
+	TEXT("Dev only. Spec v9 secs 5-8: every tuned number plus the gravity knock-ons (jump apex, air "
+	     "time, wall-jump apex, the vertical dash arc and the mantle headroom). Run it in both arms - "
+	     "add -TraceLegacyTuning to the command line for the BEFORE numbers - and diff."),
+	FConsoleCommandDelegate::CreateStatic([]() { TraceReportV9Tuning(); }));
 
 static FAutoConsoleCommand GTraceWallJumpReportCmd(
 	TEXT("Trace.WallJumpReport"),

@@ -535,6 +535,25 @@ public:
 	void LogWallJumpReport() const;
 
 	/**
+	 * SPEC v9 §§5-8 — every tuned number and every KNOCK-ON of the gravity change, in one block.
+	 *
+	 * §8 says gravity "touches everything: jump height, air time, the mantle, the wall jump, the
+	 * vertical dash arc" and asks for the knock-on effects WITH NUMBERS. Those numbers are closed-form
+	 * functions of the getters this component already exposes — apex is v²/2g, air time is 2v/g — so
+	 * they are derived here from the live getters rather than eyeballed off a screenshot, which means
+	 * they can never drift from what the pawn is actually simulating.
+	 *
+	 * Run it once per arm (`-TraceLegacyTuning` for BEFORE) and diff the two blocks. Every line prints
+	 * the input knob next to the result so a reader can check the arithmetic.
+	 *
+	 * The headroom lines are the ones that matter: MANTLE HEADROOM is (jump apex - the tallest ledge
+	 * the mantle will take), and if the gravity increase drives it negative the mantle has become
+	 * unreachable by jumping and needs re-tuning. Saying so is the point — §8 asks for that rather
+	 * than for a silent compensation.
+	 */
+	void LogV9TuningReport() const;
+
+	/**
 	 * Drives the wall jump from code so it can be measured offscreen and on a client: runs the pawn at
 	 * the nearest perimeter wall and presses jump through ACharacter::Jump() — the real predicted path,
 	 * saved move and all — every time IsWallJumpAvailable() says a press would count. Enabled with
@@ -563,6 +582,29 @@ public:
 	 * Never runs on a replayed move, for TickDashPitchTest's reason.
 	 */
 	void TickCarrierChargeTest(float DeltaSeconds);
+
+	/**
+	 * SPEC v9 §2, AND THE §0 LESSON — "-TraceSingleDashTest".
+	 *
+	 * The v8 harness above pressed dash TWICE FROM A FULL POOL, counted two launches and reported the
+	 * carrier's charges fixed. The user says it is still broken. That test could not have failed:
+	 * both launches really do happen. It exercised neither the consumption path nor the refill path,
+	 * and it never looked at the HUD at all.
+	 *
+	 * This one reproduces the three reported sentences directly, on a CLIENT, WHILE CARRYING:
+	 *   phase 0  dash ONCE from a full pool  -> "when dash is used, both charges are consumed"
+	 *   phase 1  watch the 1 -> 2 refill
+	 *   phase 2  drain to zero
+	 *   phase 3  watch the 0 -> 1 refill     -> "when the first refills, they both do"
+	 * and at every sample it compares the pool against THE NUMBER OF PIPS ATraceHUD WOULD DRAW,
+	 * obtained from the real ATracePlayerController::GetDashHudState -> "despite the hud showing two".
+	 *
+	 * Never runs on a replayed move, for TickDashPitchTest's reason.
+	 */
+	void TickSingleDashTest(float DeltaSeconds);
+
+	/** One ledger row: the true pool, and what the HUD would render for it. See the .cpp. */
+	struct FTraceSingleDashSample SampleSingleDashTest() const;
 
 	/**
 	 * DIAGNOSTIC ONLY — "Trace.MoveCorrections 1" (or -TraceMoveCorrections).
@@ -633,11 +675,22 @@ public:
 	bool IsDashing() const;
 
 	/**
-	 * Seconds until a dash is available again (0 when one is ready RIGHT NOW, charges included).
+	 * SECONDS UNTIL THE POOL GAINS ITS NEXT CHARGE. 0 only when the pool is FULL.
 	 *
-	 * Kept as the single number the HUD draws: it still spans the active dash window plus the
-	 * refill, so a meter drawn as 1 - Remaining/(DashDuration + DashCooldown) is still correct. A
-	 * carrier who has spent one of two charges reads 0 here, because they can in fact dash again.
+	 * SPEC v9 §2 CHANGED THE MEANING OF THIS FUNCTION, and the old meaning was the bug. It used to
+	 * return 0 whenever any charge was in hand — so a carrier at 1 of 2 reported "nothing is
+	 * recharging", ATracePlayerController::GetDashHudState turned that into RechargeFraction 1.0,
+	 * and ATraceHUD::DrawChargePips filled the still-regenerating pip solid. The HUD read 2 of 2 on
+	 * a pawn holding 1, which is precisely "the carrier still has only one dash, despite the hud
+	 * showing two. When the first refills, they both do." See the .cpp for the full derivation of
+	 * all three reported symptoms from this one line.
+	 *
+	 * It now matches FTraceDashHudState::Remaining's own documented contract exactly, so the meter
+	 * 1 - Remaining/(DashDuration + DashCooldown) is the true progress of the NEXT pip — the divisor
+	 * is GetDashRechargeWindow() by construction, so the two agree.
+	 *
+	 * NOT a readiness test. "Can I dash" is GetDashCharges() > 0 / CanDash(); a carrier with one
+	 * banked charge and one regenerating can dash right now and still reads several seconds here.
 	 */
 	float GetDashCooldownRemaining() const;
 
@@ -1008,6 +1061,14 @@ protected:
 	/** Diminishing returns on the strafe's speed GAIN. Never affects the turn. */
 	bool  IsAirStrafeFalloffEnabled() const;
 
+	/**
+	 * SPEC v9 §8. One scalar over BOTH air-strafe caps — "move the asymptote on momentum slightly
+	 * higher". Scaling them together slides the curve up without changing its shape; scaling only
+	 * one would re-shape the falloff instead of moving it. Ships at 1.10 (a nudge, per the spec:
+	 * the Demo 5 cap stays, it just sits 10% further out). Name-bound as AirStrafeAsymptoteScale.
+	 */
+	float GetAirStrafeAsymptoteScale() const;
+
 	/** Speed at which the falloff starts. Below it a strafe is worth exactly what it was in Demo 5. */
 	float GetAirStrafeSoftCapSpeed() const;
 
@@ -1045,6 +1106,17 @@ protected:
 
 	/** Fraction of the incoming planar SPEED the reflected launch keeps. 1.0 is pure preservation. */
 	float GetWallJumpSpeedRetention() const;
+
+	/**
+	 * SPEC v9 §5. Seconds a wall jump puts the MANTLE on cooldown for.
+	 *
+	 * "If a player inputs a wall jump, that overrides a mantle." Refusing the mantle on the launch
+	 * frame is only half of it — the pawn is still beside the same ledge for several frames after,
+	 * and an auto-mantle needs no input to claim it. This window is what stops the mantle undoing a
+	 * wall jump one frame after it happened. Applied by pushing MantleCooldownRemaining, which is
+	 * already saved-move state, so it adds no prediction plumbing.
+	 */
+	float GetWallJumpMantleLockoutSeconds() const;
 
 	/** Flat uu/s pushed straight out along the wall normal, on top of the reflection. */
 	float GetWallJumpOutwardImpulse() const;
@@ -1462,6 +1534,19 @@ protected:
 	float WallJumpLaunchZSum = 0.f;
 	int32 WallJumpCorrectionsInWindow = 0;
 
+	/**
+	 * SPEC v9 §5, THE MEASUREMENT FOR "IT FEELS LIKE STICKING TO THE WALL FOR A SECOND".
+	 *
+	 * Counts mantles that STARTED while a wall-jump window was open — i.e. wall jumps the player was
+	 * still entitled to make and the automatic mantle took away, locking the pawn in MOVE_Flying (where
+	 * CanAttemptJump() refuses every press) for GetMantleDurationSeconds().
+	 *
+	 * This is the number that separates the two arms: under -TraceLegacyTuning the mantle wins the
+	 * frame and this climbs; with the §5 priority in force it must be ZERO. Dev-only, never saved,
+	 * counted on the record pass only.
+	 */
+	int32 WallJumpMantleSteals = 0;
+
 	/** World time the current wall jump's correction-attribution window closes. Never saved. */
 	float WallJumpAttributionUntil = -1000.f;
 
@@ -1484,6 +1569,50 @@ protected:
 	uint8 bCarrierTestCoreGiven = 0;
 	int32 CarrierTestChargesAtStart = 0;
 	int32 CarrierTestMaxAtStart = 0;
+
+	// --- SPEC v9 §2: THE SINGLE-DASH REPRODUCTION (-TraceSingleDashTest) --------------------------
+	//
+	// Phase -1 = waiting for the Core, 0 = one press, 1 = the 1->2 refill, 2 = drain to zero,
+	// 3 = the 0->1 refill. Nothing here is saved-move state: it is pure observation and never
+	// influences a simulated move except through StartDash(), which is the same call a key press
+	// makes.
+	int32 SingleDashPhase = -1;
+	float SingleDashPhaseTime = 0.f;
+	int32 SingleDashPresses = 0;
+	uint8 bSingleDashCoreGiven = 0;
+	uint8 bSingleDashReported = 0;
+	int32 SingleDashFailures = 0;
+	float SingleDashNextSampleTime = 0.f;
+
+	/** Previous sample, so a single-frame GAIN can be measured rather than inferred from a total. */
+	int32 SingleDashPrevCharges = 0;
+	int32 SingleDashPrevHudPips = 0;
+
+	/** Running worsts. Divergence is |pips drawn - charges held|. */
+	int32 SingleDashMaxHudDivergence = 0;
+	int32 SingleDashMaxTrueGain = 0;
+	int32 SingleDashMaxHudGain = 0;
+
+	/**
+	 * HOW LONG the meter and the pool disagreed, summed over the run — the check that "the HUD shows
+	 * two" is really about.
+	 *
+	 * The first version of this check asked whether the two numbers were EVER unequal on any sampled
+	 * frame, and it failed the fixed build for a reason that is not a bug: a continuous progress meter
+	 * necessarily reaches 100% on the frame BEFORE the integer it is counting up to lands, so a 60 Hz
+	 * sample catches the regenerating pip at fraction 0.999 with the pool still one short, for one
+	 * frame. Tightening the pip threshold would only move that frame; there is no threshold at which a
+	 * filling bar and a stepping integer agree on every sample.
+	 *
+	 * Duration is the honest discriminator, and it is a STRONGER test of the user's complaint rather
+	 * than a weaker one. Their symptom is a meter that reads two while the pawn holds one for the
+	 * WHOLE 3.68 s recharge window — on the legacy arm this accumulates seconds. A sub-frame lead
+	 * accumulates ~16 ms and no player can see it. The budget below is one 60 Hz frame with margin.
+	 */
+	float SingleDashDivergentSeconds = 0.f;
+
+	/** Pips drawn on the exact frame the pool climbed 0 -> 1. "They both do" would read 2 here. */
+	int32 SingleDashHudPipsAtFirstRefill = -1;
 #endif
 };
 

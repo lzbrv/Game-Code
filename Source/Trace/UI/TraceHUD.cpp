@@ -11,6 +11,7 @@
 #include "Engine/Font.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"                  // TActorIterator, for the replicated-character count
+#include "HAL/IConsoleManager.h"          // FAutoConsoleVariableRef, for the v9 §11 A/B arm
 #include "GameFramework/GameStateBase.h"   // AGameStateBase::PlayerArray
 #include "GameFramework/PlayerState.h"
 #include "Gameplay/TraceCore.h"
@@ -31,6 +32,34 @@
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"         // TraceMatchFlow::PostMatchDuration, TraceMaps
 #include "UI/TraceNetworking.h"           // TraceNet — host address, connection state, failures
+
+namespace
+{
+	/**
+	 * A/B ARM FOR THE DEFERRED-WHISTLE INDICATOR (spec v9 §11, HUD half).
+	 *
+	 * 1 (default): the footer under the clock is replaced by "HALF/MATCH ENDS AT NEXT DEAD BALL"
+	 * while the whistle is armed. 0 restores the pre-v9 footer — the half label and nothing else —
+	 * which is what a player saw before this change: a clock frozen at 0:00, "1ST HALF" underneath
+	 * it, and no way to tell a deferred whistle from a hung timer.
+	 *
+	 * It exists so the RED case can be photographed in the SAME binary as the green one. Spec v9 §0
+	 * is about exactly that: a harness that never went red is not evidence. Cheat-only, no ini
+	 * override, so a shipping player can never turn the indicator off.
+	 */
+	int32 GHudPendingPeriodEndLabel = 1;
+
+#if !UE_BUILD_SHIPPING
+	FAutoConsoleVariableRef CVarHudPendingPeriodEndLabel(
+		TEXT("Trace.HUD.PendingPeriodEndLabel"),
+		GHudPendingPeriodEndLabel,
+		TEXT("1 (default, spec v9 11): while the clock has expired and play continues, the panel "
+		     "footer reads 'HALF/MATCH ENDS AT NEXT DEAD BALL' and the hard-cap countdown sits in "
+		     "the panel's right gutter. 0 draws the pre-v9 footer for A/B capture ONLY - a 0:00 "
+		     "clock with no explanation reads as a hung timer."),
+		ECVF_Cheat);
+#endif
+}
 
 namespace TraceHUDStyle
 {
@@ -1450,6 +1479,29 @@ void ATraceHUD::DrawScoresAndClock()
 		FooterText = TEXT("FULL TIME");
 	}
 
+	// ---- Deferred half time / full time (spec v9 §11) --------------------------------------------
+	//
+	// The clock has hit 0:00 and PLAY IS STILL LIVE. Without this the HUD shows a frozen 0:00 with
+	// "1ST HALF" underneath it and nothing happening, which reads exactly like a hung timer — worse
+	// than the mid-run cut-off §11 exists to fix. MEASURED, both arms of this same binary at the same
+	// moment of the same scenario: Trace.HUD.PendingPeriodEndLabel 0 captured "00:00 / 1ST HALF" with
+	// the Core live in Blue's hands and no explanation anywhere on screen.
+	//
+	// The PHASE half of the footer is what gets replaced — "1ST HALF" is the least useful thing on
+	// the panel once the half is over, and it is the exact word that makes the frozen clock look
+	// broken. The MODE suffix below is deliberately still appended: it has to be in every capture.
+	//
+	// ATraceGameState::GetPendingPeriodEndLabel() picks "HALF ENDS AT NEXT DEAD BALL" vs "MATCH ENDS
+	// AT NEXT DEAD BALL" itself, from the same CurrentHalf < NumHalves test ATraceGameMode::
+	// EndPeriodNow() makes, so this can never promise a half time that is really full time. Both
+	// accessors are driven by replicated state and are correct on a client and on the listen host.
+	const bool bPendingWhistle = (TraceGS != nullptr) && TraceGS->IsPendingPeriodEnd()
+		&& (GHudPendingPeriodEndLabel != 0);
+	if (bPendingWhistle)
+	{
+		FooterText = TraceGS->GetPendingPeriodEndLabel();
+	}
+
 	// The mode is appended rather than given a panel of its own. It has to be visible in EVERY
 	// screenshot — the whole point of the A/B toggle is comparing two builds' worth of footage, and
 	// a capture that does not say which mode it is from is a capture nobody can file — but it is
@@ -1461,7 +1513,34 @@ void ATraceHUD::DrawScoresAndClock()
 	}
 
 	const float FooterY = PanelY + PanelH - (22.f * UIScale);
-	DrawTextCentered(FooterText, TraceHUDStyle::InkDim, CX, FooterY, FontSmall, UIScale);
+
+	// Danger, and pulsed, for the same reason the mercy warning is: this is a state the player has
+	// only a few seconds to act inside. InkDim on a 0:00 clock is invisible.
+	const FLinearColor FooterColor = bPendingWhistle
+		? TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.65f + 0.35f * FMath::Sin(Now * 6.f))
+		: TraceHUDStyle::InkDim;
+
+	DrawTextCentered(FooterText, FooterColor, CX, FooterY, FontSmall, UIScale);
+
+	// The hard cap (spec v9 §11's "guard against never breaking") sits at the RIGHT EDGE OF THE
+	// PANEL, on the footer's own baseline. It was under the panel for one capture and landed on top
+	// of the "BLUE HAS THE CORE" banner, which hangs off the panel bottom by TraceHUDStyle::BannerGap
+	// — there is no free strip there, and the collision was legible in the screenshot. The footer is
+	// centred and short, so the right gutter is empty in every phase.
+	//
+	// Dim and bare seconds, deliberately: the label is the RULE, this is only the backstop, and a
+	// player who reads "78s" as "the half ends in 78 seconds" has been misinformed — it is the
+	// latest it can end. GetPendingPeriodEndTimeRemaining() returns 0 when no cap is armed (a
+	// PeriodEndMaxDeferSeconds of 0 disables it), and then nothing is drawn at all.
+	if (bPendingWhistle)
+	{
+		const float CapRemaining = TraceGS->GetPendingPeriodEndTimeRemaining();
+		if (CapRemaining > 0.f)
+		{
+			DrawTextRight(FString::Printf(TEXT("%ds"), FMath::CeilToInt(CapRemaining)),
+				TraceHUDStyle::InkDim, PanelX + PanelW - (12.f * UIScale), FooterY, FontSmall, UIScale);
+		}
+	}
 
 	// ---- Mercy-rule warning ---------------------------------------------------------------------
 	//

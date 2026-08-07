@@ -13,6 +13,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Kismet/GameplayStatics.h"                      // ParseOption / GetIntOption ("?bots=")
 #include "Math/NumericLimits.h"
+#include "HAL/IConsoleManager.h"                       // Trace.HalfTime.Verify (spec v9 §11)
 #include "Misc/CommandLine.h"                            // -TraceBotDebug
 #include "Misc/Parse.h"
 #include "TimerManager.h"
@@ -88,6 +89,27 @@ namespace TraceGameModeConstants
 	 * packaged A/B build.
 	 */
 	static constexpr float ScoringModePollInterval = 0.5f;
+
+	/**
+	 * Spec v9 §11. Seconds between dead-ball checks while a half/full time is pending.
+	 *
+	 * 20 Hz. Two accessor reads on one actor, and only during the seconds between a clock expiring
+	 * and the next break in play — a handful of times per match. Fast enough that the whistle lands
+	 * within a frame or two of the turnover that caused it, which is what stops the break feeling
+	 * detached from the event that earned it.
+	 */
+	static constexpr float PendingPeriodEndPollInterval = 0.05f;
+
+	/**
+	 * Spec v9 §11, mode B. Speed below which a LOOSE Core counts as "the ball has dropped".
+	 *
+	 * The Core's own rest test (ATraceCore::ServerTickLooseCore) is private to that class, so this
+	 * is the same question asked from outside: a Core in flight is never this slow, including at the
+	 * apex of a lob, where all of its speed is horizontal. Comfortably above the residual velocity a
+	 * Core carries while it settles, so a landing is detected on the frame it lands rather than
+	 * several frames of jitter later.
+	 */
+	static constexpr float PendingPeriodEndCoreRestSpeed = 150.f;
 }
 
 ATraceGameMode::ATraceGameMode()
@@ -1319,6 +1341,18 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 		return;
 	}
 
+	// SPEC v9 §11: A GOAL IS THE DEAD BALL THE NOTE NAMES FIRST.
+	//
+	// After the score (the goal counts — the clock expired, the play did not) and after the mercy
+	// check (a mercy win is not a half time), but BEFORE the kickoff: there is no point restarting
+	// play into a whistle, and BeginHalfTimeBreak/FinishMatch do their own ReleaseCore and
+	// ResetPlayersToSpawns, which is exactly the reset the kickoff branch below would have done.
+	if (bCounts && TraceGameState->bPendingPeriodEnd)
+	{
+		ResolvePendingPeriodEnd(TEXT("goal"));
+		return;
+	}
+
 	// Kickoff, then the reset. Both orders release the outgoing holder (and with them the trace);
 	// this one also gets the grant delay lined up with the teleport — see GrantCoreToTeam.
 	//
@@ -2539,6 +2573,11 @@ void ATraceGameMode::BeginHalf(int32 HalfIndex)
 	GetWorldTimerManager().ClearTimer(HalfTimeTimerHandle);
 	GetWorldTimerManager().ClearTimer(MatchTimerHandle);
 
+	// Spec v9 §11. A new period starts with a full clock and no whistle armed. Belt and braces —
+	// every route into here has already resolved one — but a pending flag that survived into a new
+	// half would end it on its first turnover, which is the worst possible way to find this bug.
+	ClearPendingPeriodEnd();
+
 	// A period of play opens with both wipe bonuses armed. The reset below stands everybody up, so a
 	// latch carried in from the previous half would describe a team that is no longer down.
 	bBlueWipeLatched = false;
@@ -2571,14 +2610,227 @@ void ATraceGameMode::BeginHalf(int32 HalfIndex)
 
 void ATraceGameMode::HandleHalfExpired()
 {
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr || TraceGameState->TraceMatchState != ETraceMatchState::InProgress)
+	{
+		return;
+	}
+
+	// SPEC v9 §11. THE CLOCK RUNNING OUT NO LONGER ENDS THE PERIOD.
+	//
+	// Verbatim: "Change halftime to trigger after the time runs out and the current play ends, so
+	// that it doesn't cut people off in the middle of a run". So the expiry ARMS the whistle and
+	// play carries on; ResolvePendingPeriodEnd() blows it at the next dead ball.
+	//
+	// Read at the point of use, so the switch retunes with the game running. Off restores the old
+	// behaviour exactly — the period ends on the tick the clock does.
+	const bool bDefer = UTraceSettings::Get().bDeferPeriodEndToPlayBreak;
+
+	// Already pending means this is the hard cap or a second timer firing; end now rather than
+	// arming a whistle on top of the one that is already armed.
+	if (bDefer && !TraceGameState->bPendingPeriodEnd && !TraceGameState->IsHalfTimeBreak())
+	{
+		BeginPendingPeriodEnd();
+		return;
+	}
+
+	EndPeriodNow(TEXT("clock"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deferred half time / full time (spec v9 §11). See the block comment in TraceGameMode.h for what
+// counts as a dead ball and why, including the two [ASSUMPTION]s about passes and carrier deaths.
+// ---------------------------------------------------------------------------------------------
+
+void ATraceGameMode::BeginPendingPeriodEnd()
+{
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr || !HasAuthority())
+	{
+		return;
+	}
+
+	// The half's own timer has fired; make sure it cannot fire again underneath the pending state.
+	GetWorldTimerManager().ClearTimer(MatchTimerHandle);
+
+	// PIN THE CLOCK AT 0:00. GetMatchTimeRemaining() clamps at zero anyway, but the deadline is a
+	// replicated float that a client extrapolates against a smoothed server clock: a client whose
+	// clock runs a few milliseconds behind would otherwise draw 0:01 for a moment while the server
+	// has already armed the whistle, and "the timer went back up" is exactly the confusion §11 is
+	// trying to avoid.
+	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds());
+
+	// THE GUARD RAIL. A stalemate must not run forever: two teams that never turn the Core over and
+	// never score would otherwise play on past the whistle indefinitely. Read live; 0 disables it.
+	const float MaxDefer = FMath::Max(0.f, UTraceSettings::Get().PeriodEndMaxDeferSeconds);
+	const float CapServerTime = (MaxDefer > 0.f)
+		? static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + MaxDefer)
+		: 0.f;
+
+	TraceGameState->SetPendingPeriodEnd(true, CapServerTime);
+
+	// Seed the turnover detector with WHO HAS IT NOW, so the possession that was already in progress
+	// when the clock expired is not itself mistaken for a turnover on the first poll.
+	const ATraceCore* TheCore = GetCore();
+	PendingEndLastHolderTeam = (TheCore != nullptr) ? TheCore->GetHolderTeam() : ETraceTeam::None;
+
+	GetWorldTimerManager().SetTimer(PendingPeriodEndPollHandle, this, &ATraceGameMode::PollPendingPeriodEnd,
+		TraceGameModeConstants::PendingPeriodEndPollInterval, /*bLoop=*/true);
+
+	if (MaxDefer > 0.f)
+	{
+		// CreateWeakLambda rather than a payload delegate: the cause is a literal, the capture is
+		// only `this`, and the weak binding makes a GameMode torn down mid-defer harmless.
+		GetWorldTimerManager().SetTimer(PendingPeriodEndCapHandle,
+			FTimerDelegate::CreateWeakLambda(this, [this]()
+			{
+				ResolvePendingPeriodEnd(TEXT("hard cap - no dead ball arrived"));
+			}),
+			MaxDefer, /*bLoop=*/false);
+	}
+
+	// Display, not Log. This is the line somebody reads when the clock "stopped working", and this
+	// project has twice declared a working mechanic dead because its log line was suppressed.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Half] %s clock expired - PLAY CONTINUES. %s (hard cap %s). Core held by %s."),
+		*TraceGameState->GetHalfLabel(), *TraceGameState->GetPendingPeriodEndLabel(),
+		(MaxDefer > 0.f) ? *FString::Printf(TEXT("%.0fs"), MaxDefer) : TEXT("disabled"),
+		*TraceTeamName(PendingEndLastHolderTeam).ToString());
+}
+
+void ATraceGameMode::ClearPendingPeriodEnd()
+{
+	GetWorldTimerManager().ClearTimer(PendingPeriodEndPollHandle);
+	GetWorldTimerManager().ClearTimer(PendingPeriodEndCapHandle);
+	PendingEndLastHolderTeam = ETraceTeam::None;
+
+	if (ATraceGameState* TraceGameState = GetTraceGameState())
+	{
+		if (TraceGameState->bPendingPeriodEnd)
+		{
+			TraceGameState->SetPendingPeriodEnd(false, 0.f);
+		}
+	}
+}
+
+void ATraceGameMode::ResolvePendingPeriodEnd(const TCHAR* Cause)
+{
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr || !TraceGameState->bPendingPeriodEnd)
+	{
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Half] Dead ball (%s) - the deferred whistle goes now. Blue %d - Orange %d"),
+		(Cause != nullptr) ? Cause : TEXT("unknown"), TraceGameState->BlueScore, TraceGameState->OrangeScore);
+
+	// Cleared FIRST. EndPeriodNow() runs BeginHalfTimeBreak/FinishMatch, both of which reset the
+	// field and could otherwise be observed by a poll that is still armed.
+	ClearPendingPeriodEnd();
+
+	EndPeriodNow(Cause);
+}
+
+void ATraceGameMode::PollPendingPeriodEnd()
+{
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr || !HasAuthority())
+	{
+		return;
+	}
+
+	// Anything that took the match out of live play took the whistle with it (a mercy win, a
+	// forfeit, an interval started some other way). Stop rather than fire into it.
+	if (!TraceGameState->bPendingPeriodEnd
+		|| TraceGameState->TraceMatchState != ETraceMatchState::InProgress
+		|| TraceGameState->IsHalfTimeBreak())
+	{
+		ClearPendingPeriodEnd();
+		return;
+	}
+
+	const ATraceCore* TheCore = GetCore();
+	if (TheCore == nullptr)
+	{
+		return;
+	}
+
+#if !UE_BUILD_SHIPPING
+	// Counted only once the poll is actually LOOKING AT THE CORE, which is the only state in which
+	// it could detect anything. Trace.HalfTime.Verify waits on this rather than on wall-clock: with
+	// several headless instances on one machine the engine's frame-rate smoothing clamps the world's
+	// delta, ticks arrive seconds apart, and a scripted step timed in seconds can land before the
+	// detector has run even once — which produces a FAIL that says nothing about the code, and a
+	// "did not fire" PASS that is vacuous. Waiting on polls makes both verdicts mean something.
+	++PendingPeriodEndPollCount;
+#endif
+
+	// --- A TURNOVER BETWEEN THE TEAMS -----------------------------------------------------------
+	//
+	// The TEAM, not the holder. A completed pass moves the Core between two players of the same
+	// team and play continues (spec §11 [ASSUMPTION]); a kill that hands it to the other side, a
+	// mode-B interception, and a mode-B surface turnover all move it between teams and are breaks.
+	//
+	// None is skipped rather than treated as a turnover: a thrown Core is holderless while it is in
+	// the air, and the flight is not a dead ball — the landing is, and it is caught below.
+	const ETraceTeam HolderTeam = TheCore->GetHolderTeam();
+	if (HolderTeam != ETraceTeam::None)
+	{
+		if (PendingEndLastHolderTeam != ETraceTeam::None && HolderTeam != PendingEndLastHolderTeam)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[Half] Turnover: %s -> %s."),
+				*TraceTeamName(PendingEndLastHolderTeam).ToString(), *TraceTeamName(HolderTeam).ToString());
+
+			PendingEndLastHolderTeam = HolderTeam;
+			ResolvePendingPeriodEnd(TEXT("turnover between teams"));
+			return;
+		}
+
+		PendingEndLastHolderTeam = HolderTeam;
+		return;
+	}
+
+	// --- MODE B: THE CORE HITS THE GROUND -------------------------------------------------------
+	//
+	// "the ball drops in game mode b". Held separately from the turnover test above because the two
+	// are not the same event: the surface turnover (spec v7 §4) usually grants the Core to the other
+	// team on the frame it lands, but a landing with nobody eligible to receive it leaves the Core
+	// lying there holderless — which is as dead as a ball gets, and must not leave the whistle
+	// waiting. Mode A has no loose Core, so IsLoose() is permanently false there and this costs one
+	// branch.
+	if (TheCore->IsLoose() && TheCore->GetLooseVelocity().Size() < TraceGameModeConstants::PendingPeriodEndCoreRestSpeed)
+	{
+		ResolvePendingPeriodEnd(TEXT("mode B: the Core came down"));
+	}
+}
+
+void ATraceGameMode::EndPeriodNow(const TCHAR* Cause)
+{
 	const ATraceGameState* TraceGameState = GetTraceGameState();
 	if (TraceGameState == nullptr || TraceGameState->TraceMatchState != ETraceMatchState::InProgress)
 	{
 		return;
 	}
 
+	// WHO HAD THE CORE WHEN THE WHISTLE WENT. This is the entire subject of spec v9 §11 — "it
+	// doesn't cut people off in the middle of a run" — and it is the one fact that separates a
+	// correct end from the behaviour the note complains about, so it goes in the log at the moment
+	// of the end rather than being reconstructed afterwards from possession lines.
+	//
+	// With deferral ON the Cause names the dead ball and a carrier here is expected (the turnover's
+	// new owner). With deferral OFF the Cause is "clock" and a carrier here IS the symptom.
+	const ATraceCore* CoreAtWhistle = GetCore();
+	const ETraceTeam TeamAtWhistle = (CoreAtWhistle != nullptr) ? CoreAtWhistle->GetHolderTeam() : ETraceTeam::None;
+	UE_LOG(LogTraceGame, Display, TEXT("[Half] Whistle: %s ends on '%s'. Core %s at that instant."),
+		*TraceGameState->GetHalfLabel(), (Cause != nullptr) ? Cause : TEXT("clock"),
+		(TeamAtWhistle != ETraceTeam::None)
+			? *FString::Printf(TEXT("WAS BEING CARRIED by %s"), *TraceTeamName(TeamAtWhistle).ToString())
+			: TEXT("was not in anybody's hands"));
+
 	if (TraceGameState->CurrentHalf < FMath::Max(1, HalvesPerMatch))
 	{
+		UE_LOG(LogTraceGame, Log, TEXT("[Half] Ending %s (%s)."), *TraceGameState->GetHalfLabel(),
+			(Cause != nullptr) ? Cause : TEXT("clock"));
 		BeginHalfTimeBreak();
 		return;
 	}
@@ -2608,6 +2860,11 @@ void ATraceGameMode::BeginHalfTimeBreak()
 	}
 
 	GetWorldTimerManager().ClearTimer(MatchTimerHandle);
+
+	// Spec v9 §11: the whistle has gone, so nothing is pending any more. Also covers the paths that
+	// reach the interval without going through ResolvePendingPeriodEnd (deferral switched off, or a
+	// direct call from a debug command).
+	ClearPendingPeriodEnd();
 
 	const float BreakDuration = FMath::Max(1.f, HalfTimeBreakDuration);
 	const int32 NextHalf = TraceGameState->CurrentHalf + 1;
@@ -2719,6 +2976,13 @@ void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Re
 	GetWorldTimerManager().ClearTimer(MatchTimerHandle);
 	GetWorldTimerManager().ClearTimer(HalfTimeTimerHandle);
 
+	// SPEC v9 §11 AND THE MERCY RULE, TOGETHER. The deferred whistle is a play boundary; the mercy
+	// rule is not, and must still end the match on the frame the lead reaches the threshold even if
+	// that frame is the middle of a run. So the mercy path does NOT consult the pending state — it
+	// comes straight here — and this call is what makes that safe: whatever was pending is dropped,
+	// its poll and its hard cap are cleared, and nothing is left armed under the results screen.
+	ClearPendingPeriodEnd();
+
 	TraceGameState->TraceMatchState = ETraceMatchState::PostMatch;
 	TraceGameState->SetHalfState(TraceGameState->CurrentHalf, FMath::Max(1, HalvesPerMatch), /*bInHalfTimeBreak=*/false);
 	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds());
@@ -2785,3 +3049,523 @@ void ATraceGameMode::ReturnToMainMenu()
 	// travel would carry this match's URL options (?difficulty=, ?bots=) into it.
 	UGameplayStatics::OpenLevel(World, FName(TraceMaps::MainMenu), /*bAbsolute=*/true);
 }
+
+#if !UE_BUILD_SHIPPING
+
+// =============================================================================================
+// Trace.HalfTime.Verify — the scripted proof for spec v9 §11
+//
+// WHY THIS EXISTS, and it is the same reason spec v9 §0 exists. The organic run — shorten the half,
+// watch the clock hit 0:00, watch play continue, watch the whistle go on the next turnover — only
+// ever exercises the path that FIRES. It is the happy path, and a harness that only ever went green
+// on the happy path is what shipped a "fixed" dash last pass.
+//
+// The two cases that decide whether §11 is right are the ones that must NOT fire:
+//
+//   1. A WITHIN-TEAM PASS. If a team-mate taking the Core ends the half, the note's own complaint
+//      ("it doesn't cut people off in the middle of a run") is unfixed, and worse than before —
+//      because a pass is the single most common possession event in the game.
+//   2. NOTHING AT ALL. If the hard cap does not fire, a stalemate plays past full time forever.
+//
+// Neither is reachable by waiting: in a 10-bot match a between-team turnover arrives within a
+// second or two of the clock expiring, so the interesting windows never open on their own. This
+// drives both on purpose and prints PASS/FAIL per assertion.
+//
+// The cap scenario suppresses dead balls by RELEASING THE CORE every 0.1 s. With no holder there is
+// no possession to turn over, nothing to carry into an endzone and (mode A) nothing loose to come
+// down, so the only thing left that can end the period is the cap — which is exactly the state the
+// cap exists for.
+// =============================================================================================
+
+void ATraceGameMode::StartHalfTimeVerify(ETraceHalfTimeVerifyScenario Scenario)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	const ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TraceGameState == nullptr || TraceGameState->TraceMatchState != ETraceMatchState::InProgress
+		|| TraceGameState->IsHalfTimeBreak())
+	{
+		// WAITS RATHER THAN REFUSING, so this can be handed straight to -ExecCmds. Those run at
+		// engine init, several seconds before warm-up ends and a half exists; a command that simply
+		// said "no live half" there would make the whole harness unusable from a headless run, which
+		// is the only way it ever gets used.
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[HalfTimeVerify] No live half yet (state=%d, break=%d) - waiting."),
+			(TraceGameState != nullptr) ? static_cast<int32>(TraceGameState->TraceMatchState) : -1,
+			(TraceGameState != nullptr && TraceGameState->IsHalfTimeBreak()) ? 1 : 0);
+
+		GetWorldTimerManager().SetTimer(HalfTimeVerifyHandle,
+			FTimerDelegate::CreateWeakLambda(this, [this, Scenario]()
+			{
+				StartHalfTimeVerify(Scenario);
+			}),
+			0.5f, /*bLoop=*/false);
+		return;
+	}
+
+	HalfTimeVerifyScenario = Scenario;
+	HalfTimeVerifyStep = 0;
+	HalfTimeVerifyPassed = 0;
+	HalfTimeVerifyFailed = 0;
+	HalfTimeVerifyHolder = nullptr;
+
+	const TCHAR* ScenarioName = TEXT("TURNOVER vs WITHIN-TEAM PASS");
+	if (Scenario == ETraceHalfTimeVerifyScenario::HardCap)
+	{
+		ScenarioName = TEXT("HARD CAP");
+	}
+	else if (Scenario == ETraceHalfTimeVerifyScenario::MercyWhilePending)
+	{
+		ScenarioName = TEXT("MERCY RULE WHILE A WHISTLE IS PENDING");
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[HalfTimeVerify] ===== %s scenario ====="), ScenarioName);
+
+	// 0.2 s per step: four polls of PollPendingPeriodEnd (20 Hz) between each scripted event, so a
+	// whistle that was going to fire has had every chance to, and short enough that ten bots have
+	// little opportunity to produce an organic turnover in the middle of the scenario. When one
+	// does anyway, the step that notices says so rather than reporting a false FAIL.
+	GetWorldTimerManager().SetTimer(HalfTimeVerifyHandle, this, &ATraceGameMode::RunHalfTimeVerifyStep,
+		0.2f, /*bLoop=*/true, /*FirstDelay=*/0.2f);
+}
+
+void ATraceGameMode::RunHalfTimeVerifyStep()
+{
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	ATraceCore* TheCore = GetCore();
+	if (TraceGameState == nullptr || TheCore == nullptr)
+	{
+		GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+		return;
+	}
+
+	// Local lambdas rather than members: nothing outside this scenario wants them, and keeping them
+	// here means the whole harness is one contiguous block that can be deleted in one edit.
+	const auto Report = [this](bool bCondition, const TCHAR* What)
+	{
+		if (bCondition)
+		{
+			++HalfTimeVerifyPassed;
+			UE_LOG(LogTraceGame, Display, TEXT("[HalfTimeVerify]   PASS  %s"), What);
+		}
+		else
+		{
+			++HalfTimeVerifyFailed;
+			UE_LOG(LogTraceGame, Error, TEXT("[HalfTimeVerify]   FAIL  %s"), What);
+		}
+	};
+
+	/** A living pawn on @p Team (bAlly = true) or not on it (false), other than @p Except. */
+	const auto FindPawnFor = [this](ETraceTeam Team, bool bAlly, const ATraceCharacter* Except) -> ATraceCharacter*
+	{
+		for (const TWeakObjectPtr<ATraceCharacter>& Weak : TrackedCharacters)
+		{
+			ATraceCharacter* Candidate = Weak.Get();
+			if (Candidate == nullptr || Candidate == Except || !Candidate->IsAlive())
+			{
+				continue;
+			}
+
+			const ETraceTeam CandidateTeam = Candidate->GetTeam();
+			if (CandidateTeam == ETraceTeam::None)
+			{
+				continue;
+			}
+
+			if ((CandidateTeam == Team) == bAlly)
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	};
+
+	++HalfTimeVerifyStep;
+
+	// The wait budget belongs to the STEP, not to the tick: DetectorHasRun() below re-enters the
+	// same step by decrementing the counter, so the budget may only be reset when the step number
+	// genuinely moves on.
+	if (HalfTimeVerifyStep != HalfTimeVerifyLastStep)
+	{
+		HalfTimeVerifyLastStep = HalfTimeVerifyStep;
+		HalfTimeVerifyWaitSteps = 0;
+	}
+
+	/**
+	 * Holds the CURRENT step until the production detector has actually run, or until the wait
+	 * budget is spent.
+	 *
+	 * WHY THIS EXISTS, and it is spec v9 §0's lesson in miniature. The scenarios used to be timed in
+	 * seconds (a step every 0.2 s, four 20 Hz polls apart). On a machine running several headless
+	 * instances the engine's frame-rate smoothing clamps the world delta, ticks arrive whole seconds
+	 * apart in wall-clock, and three scripted steps can land on three consecutive FRAMES with the
+	 * poll timer never getting one in between. That produced both failure modes at once:
+	 *
+	 *   * the positive case FAILED ("the turnover did not blow the whistle") when the detector had
+	 *     simply never been given a tick — a red that says nothing about the code;
+	 *   * the negative case PASSED ("a within-team pass did not end the half") for exactly the same
+	 *     reason — a green that proves nothing, which is the failure §0 was written about.
+	 *
+	 * So the steps wait on POLLS, not on seconds. @return true when the step may give its verdict.
+	 */
+	const auto DetectorHasRun = [this](const TCHAR* Waiting) -> bool
+	{
+		if ((PendingPeriodEndPollCount - HalfTimeVerifyPollMark) >= HalfTimeVerifyPollsPerStep)
+		{
+			return true;
+		}
+
+		// The whistle going IS the detector having run — and it stops the poll, so waiting for more
+		// polls after it would wait forever.
+		const ATraceGameState* WaitState = GetTraceGameState();
+		if (WaitState == nullptr || !WaitState->bPendingPeriodEnd)
+		{
+			return true;
+		}
+
+		if (++HalfTimeVerifyWaitSteps > HalfTimeVerifyMaxWaitSteps)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[HalfTimeVerify] TIMED OUT waiting for %s: only %d polls in %d steps. The 20Hz "
+				     "detector is not running at all - that is the finding, not the assertion below."),
+				Waiting, PendingPeriodEndPollCount - HalfTimeVerifyPollMark, HalfTimeVerifyMaxWaitSteps);
+			return true;
+		}
+
+		// Re-enter the same step next tick.
+		--HalfTimeVerifyStep;
+		return false;
+	};
+
+	// ------------------------------------------------------------------------------------------
+	// THE HARD CAP SCENARIO
+	// ------------------------------------------------------------------------------------------
+	// ------------------------------------------------------------------------------------------
+	// THE MERCY SCENARIO — spec v9 §11's one explicit exception, and the one interaction that could
+	// quietly break either rule.
+	//
+	// A mercy win is a MERCY, not a play boundary: it must still end the match on the frame the lead
+	// reaches the threshold, even if that frame is the middle of a run and even if a deferred
+	// whistle is already armed. And once it has, nothing of the pending state may survive under the
+	// results screen — an orphaned cap timer would fire BeginHalfTimeBreak into a finished match and
+	// restart it, which is the restart loop the contract forbids.
+	//
+	// Both halves are asserted here: the match ends immediately with reason Mercy, and BOTH pending
+	// timers are checked directly with IsTimerActive() rather than inferred from the flag.
+	// ------------------------------------------------------------------------------------------
+	if (HalfTimeVerifyScenario == ETraceHalfTimeVerifyScenario::MercyWhilePending)
+	{
+		switch (HalfTimeVerifyStep)
+		{
+		case 1:
+		{
+			ATraceCharacter* Holder = TheCore->GetCarrier();
+			if (Holder == nullptr)
+			{
+				Holder = FindPawnFor(ETraceTeam::Blue, /*bAlly=*/true, nullptr);
+				if (Holder != nullptr)
+				{
+					TheCore->GrantTo(Holder, ETraceCoreGrantReason::Debug);
+				}
+			}
+
+			HandleHalfExpired();
+
+			Report(TraceGameState->bPendingPeriodEnd,
+				TEXT("the clock expiring ARMED the whistle (so the mercy rule has something to pre-empt)"));
+			Report(!TraceGameState->IsHalfTimeBreak() && TraceGameState->TraceMatchState == ETraceMatchState::InProgress,
+				TEXT("play is still live with the whistle pending"));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HalfTimeVerify]   pending, carrier is %s. Now taking an %d-point lead MID-RUN."),
+				*GetNameSafe(TheCore->GetCarrier()), UTraceSettings::Get().MercyRuleLead);
+			return;
+		}
+
+		case 2:
+		{
+			// The lead arrives the way any lead does — through the scoreboard — and then the rule is
+			// asked the same question NotifyScored asks it. Nothing here reaches past CheckMercyRule
+			// into FinishMatch, because what is under test is whether the mercy path is willing to
+			// end a match while a whistle is pending, not whether FinishMatch works.
+			const int32 RequiredLead = FMath::Max(1, UTraceSettings::Get().MercyRuleLead);
+			TraceGameState->AddScore(ETraceTeam::Blue, RequiredLead);
+
+			const bool bEnded = CheckMercyRule(TEXT("HalfTimeVerify mercy scenario"));
+
+			Report(bEnded, TEXT("the mercy rule ended the match IMMEDIATELY - it did not wait for a dead ball"));
+			Report(TraceGameState->TraceMatchState == ETraceMatchState::PostMatch,
+				TEXT("the match is in PostMatch on the same frame the lead arrived"));
+			Report(TraceGameState->GetMatchEndReason() == ETraceMatchEndReason::Mercy,
+				TEXT("the recorded end reason is Mercy, not Clock"));
+			Report(!TraceGameState->IsHalfTimeBreak(),
+				TEXT("no half-time break was entered on the way out - a mercy win skips the interval"));
+			return;
+		}
+
+		case 3:
+		default:
+		{
+			// The residue check. The flag is the easy half; the timers are the half that would
+			// actually restart a finished match.
+			const bool bPollArmed = GetWorldTimerManager().IsTimerActive(PendingPeriodEndPollHandle);
+			const bool bCapArmed = GetWorldTimerManager().IsTimerActive(PendingPeriodEndCapHandle);
+
+			Report(!TraceGameState->bPendingPeriodEnd,
+				TEXT("the pending flag was dropped by the mercy win"));
+			Report(!bPollArmed && !bCapArmed,
+				TEXT("NEITHER pending timer is still armed under the results screen"));
+			Report(TraceGameState->TraceMatchState == ETraceMatchState::PostMatch,
+				TEXT("the match is still finished a step later - nothing re-started it"));
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HalfTimeVerify] ===== MERCY WHILE PENDING: %d passed, %d failed ====="),
+				HalfTimeVerifyPassed, HalfTimeVerifyFailed);
+			GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+			return;
+		}
+		}
+	}
+
+	if (HalfTimeVerifyScenario == ETraceHalfTimeVerifyScenario::HardCap)
+	{
+		if (HalfTimeVerifyStep == 1)
+		{
+			HandleHalfExpired();
+
+			Report(TraceGameState->bPendingPeriodEnd, TEXT("the clock expiring ARMED the whistle"));
+			Report(!TraceGameState->IsHalfTimeBreak(), TEXT("play continued - no half-time break yet"));
+			UE_LOG(LogTraceGame, Display, TEXT("[HalfTimeVerify]   cap armed for %.1fs (setting says %.1f)"),
+				TraceGameState->GetPendingPeriodEndTimeRemaining(),
+				UTraceSettings::Get().PeriodEndMaxDeferSeconds);
+			return;
+		}
+
+		// Hold every dead ball off. See the block comment: no holder means no turnover, no capture
+		// and nothing loose, so the cap is the only thing left that can end the period.
+		if (TraceGameState->bPendingPeriodEnd)
+		{
+			ReleaseCore();
+
+			// Roughly PeriodEndMaxDeferSeconds should elapse. Give it a generous ceiling so a
+			// misconfigured run ends with a FAIL rather than a hung harness.
+			if (HalfTimeVerifyStep > 400)
+			{
+				Report(false, TEXT("the hard cap fired - IT DID NOT, after 80s of suppressed dead balls"));
+				GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+			}
+			return;
+		}
+
+		Report(TraceGameState->IsHalfTimeBreak() || TraceGameState->TraceMatchState == ETraceMatchState::PostMatch,
+			TEXT("the hard cap ended the period with no dead ball available"));
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[HalfTimeVerify] ===== HARD CAP: %d passed, %d failed (whistle went %.1fs after arming) ====="),
+			HalfTimeVerifyPassed, HalfTimeVerifyFailed, (HalfTimeVerifyStep - 1) * 0.2f);
+		GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+		return;
+	}
+
+	// ------------------------------------------------------------------------------------------
+	// THE TURNOVER / WITHIN-TEAM-PASS SCENARIO
+	// ------------------------------------------------------------------------------------------
+	switch (HalfTimeVerifyStep)
+	{
+	case 1:
+	{
+		// Make sure somebody is actually carrying, so "pass to a team-mate" has a meaning.
+		ATraceCharacter* Holder = TheCore->GetCarrier();
+		if (Holder == nullptr)
+		{
+			Holder = FindPawnFor(ETraceTeam::Blue, /*bAlly=*/true, nullptr);
+			if (Holder != nullptr)
+			{
+				TheCore->GrantTo(Holder, ETraceCoreGrantReason::Debug);
+			}
+		}
+		HalfTimeVerifyHolder = Holder;
+
+		UE_LOG(LogTraceGame, Display, TEXT("[HalfTimeVerify] step 1: carrier is %s (%s). Clock %.1fs remaining."),
+			*GetNameSafe(Holder), Holder ? *TraceTeamName(Holder->GetTeam()).ToString() : TEXT("none"),
+			TraceGameState->GetMatchTimeRemaining());
+		return;
+	}
+
+	case 2:
+		// THE CLOCK RUNS OUT. Not by waiting for it — by calling exactly what the half's own timer
+		// calls, so what is under test is the real path and not a stand-in for it.
+		HandleHalfExpired();
+
+		Report(TraceGameState->bPendingPeriodEnd,
+			TEXT("the clock expiring ARMED the whistle instead of ending the half"));
+		Report(!TraceGameState->IsHalfTimeBreak() && TraceGameState->TraceMatchState == ETraceMatchState::InProgress,
+			TEXT("PLAY CONTINUED past 0:00 - no half-time break, match still InProgress"));
+		Report(TraceGameState->GetMatchTimeRemaining() <= 0.01f,
+			TEXT("the clock reads 0:00"));
+		Report(!TraceGameState->GetPendingPeriodEndLabel().IsEmpty(),
+			TEXT("the HUD has a label to draw (GetPendingPeriodEndLabel is non-empty)"));
+		UE_LOG(LogTraceGame, Display, TEXT("[HalfTimeVerify]   label: \"%s\""),
+			*TraceGameState->GetPendingPeriodEndLabel());
+
+		// From here on every verdict waits on the detector rather than on the clock.
+		HalfTimeVerifyPollMark = PendingPeriodEndPollCount;
+		return;
+
+	case 3:
+	{
+		// THE NEGATIVE CASE. Pass WITHIN the team. This must not end the half.
+		//
+		// Gated first on the detector having run since the whistle was armed, so the pass is made
+		// into a poll that is demonstrably awake — otherwise "it did not fire" would be measuring
+		// a detector that was never asked.
+		if (!DetectorHasRun(TEXT("the detector to wake up after arming")))
+		{
+			return;
+		}
+
+		ATraceCharacter* Holder = TheCore->GetCarrier();
+		if (Holder == nullptr || !TraceGameState->bPendingPeriodEnd)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[HalfTimeVerify] step 3 INCONCLUSIVE: an organic event beat the script (carrier=%s pending=%d)."),
+				*GetNameSafe(Holder), TraceGameState->bPendingPeriodEnd ? 1 : 0);
+			GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+			return;
+		}
+
+		ATraceCharacter* Mate = FindPawnFor(Holder->GetTeam(), /*bAlly=*/true, Holder);
+		if (Mate == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[HalfTimeVerify] step 3 INCONCLUSIVE: no living team-mate to pass to."));
+			GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[HalfTimeVerify] step 3: WITHIN-TEAM pass %s -> %s (both %s)."),
+			*GetNameSafe(Holder), *GetNameSafe(Mate), *TraceTeamName(Holder->GetTeam()).ToString());
+		TheCore->GrantTo(Mate, ETraceCoreGrantReason::Pass);
+		HalfTimeVerifyPollMark = PendingPeriodEndPollCount;
+		return;
+	}
+
+	case 4:
+		// "It did not fire" only means something once the detector has SEEN the pass. Waiting on
+		// polls is what makes this negative case evidence instead of a coincidence.
+		if (!DetectorHasRun(TEXT("the detector to inspect the within-team pass")))
+		{
+			return;
+		}
+
+		Report(TraceGameState->bPendingPeriodEnd && !TraceGameState->IsHalfTimeBreak(),
+			TEXT("a WITHIN-TEAM pass did NOT end the half - play continues, as spec v9 §11 asks"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[HalfTimeVerify]   (the detector ran %d times over that pass and stayed quiet)"),
+			PendingPeriodEndPollCount - HalfTimeVerifyPollMark);
+		return;
+
+	case 5:
+	{
+		// THE POSITIVE CASE. Hand it to the other team.
+		ATraceCharacter* Holder = TheCore->GetCarrier();
+		if (Holder == nullptr || !TraceGameState->bPendingPeriodEnd)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[HalfTimeVerify] step 5 INCONCLUSIVE: an organic event beat the script (carrier=%s pending=%d)."),
+				*GetNameSafe(Holder), TraceGameState->bPendingPeriodEnd ? 1 : 0);
+			GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+			return;
+		}
+
+		ATraceCharacter* Enemy = FindPawnFor(Holder->GetTeam(), /*bAlly=*/false, Holder);
+		if (Enemy == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[HalfTimeVerify] step 5 INCONCLUSIVE: no living enemy to turn it over to."));
+			GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[HalfTimeVerify] step 5: BETWEEN-TEAM turnover %s (%s) -> %s (%s)."),
+			*GetNameSafe(Holder), *TraceTeamName(Holder->GetTeam()).ToString(),
+			*GetNameSafe(Enemy), *TraceTeamName(Enemy->GetTeam()).ToString());
+		TheCore->GrantTo(Enemy, ETraceCoreGrantReason::Kill);
+		HalfTimeVerifyPollMark = PendingPeriodEndPollCount;
+		return;
+	}
+
+	case 6:
+	default:
+		// Same gate, and here it is the difference between a real red and a starved one: the whistle
+		// going clears the pending flag, which satisfies DetectorHasRun() immediately, so a working
+		// build falls straight through and only a build that genuinely misses the turnover waits.
+		if (!DetectorHasRun(TEXT("the detector to inspect the between-team turnover")))
+		{
+			return;
+		}
+
+		Report(!TraceGameState->bPendingPeriodEnd,
+			TEXT("the BETWEEN-TEAM turnover blew the deferred whistle"));
+		Report(TraceGameState->IsHalfTimeBreak() || TraceGameState->TraceMatchState == ETraceMatchState::PostMatch,
+			TEXT("the period actually ended (half-time break, or full time)"));
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[HalfTimeVerify] ===== TURNOVER vs PASS: %d passed, %d failed ====="),
+			HalfTimeVerifyPassed, HalfTimeVerifyFailed);
+		GetWorldTimerManager().ClearTimer(HalfTimeVerifyHandle);
+		return;
+	}
+}
+
+namespace
+{
+	/**
+	 * Trace.HalfTime.Verify [cap]
+	 *
+	 * FAutoConsoleCommandWithWorldAndArgs because the harness lives on the GameMode and a GameMode
+	 * only exists inside a world — a world-less console command would have nothing to talk to.
+	 */
+	void TraceHalfTimeVerifyCommand(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		ATraceGameMode* GameMode = World->GetAuthGameMode<ATraceGameMode>();
+		if (GameMode == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[HalfTimeVerify] No authoritative ATraceGameMode here - run this on the server."));
+			return;
+		}
+
+		ETraceHalfTimeVerifyScenario Scenario = ETraceHalfTimeVerifyScenario::TurnoverVsPass;
+		if (Args.Num() > 0)
+		{
+			const FString Arg = Args[0].TrimStartAndEnd();
+			if (Arg.Equals(TEXT("cap"), ESearchCase::IgnoreCase))
+			{
+				Scenario = ETraceHalfTimeVerifyScenario::HardCap;
+			}
+			else if (Arg.Equals(TEXT("mercy"), ESearchCase::IgnoreCase))
+			{
+				Scenario = ETraceHalfTimeVerifyScenario::MercyWhilePending;
+			}
+		}
+
+		GameMode->StartHalfTimeVerify(Scenario);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTraceHalfTimeVerify(
+		TEXT("Trace.HalfTime.Verify"),
+		TEXT("Dev only. Spec v9 §11. No argument: prove the clock expiring only ARMS the whistle, that a "
+		     "within-team pass does NOT end the half, and that a between-team turnover does. "
+		     "'cap': prove the hard cap ends the period when no dead ball is ever available. "
+		     "'mercy': prove a mercy win still ends the match immediately with a whistle pending, and "
+		     "leaves neither pending timer armed."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TraceHalfTimeVerifyCommand));
+}
+
+#endif // !UE_BUILD_SHIPPING

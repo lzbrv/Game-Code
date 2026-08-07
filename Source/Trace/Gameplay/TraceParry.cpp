@@ -1523,6 +1523,28 @@ namespace
 					return true;
 				}
 
+				// DRIVE THE CARRIER WHILE WE WAIT, or this branch never terminates in a bot match.
+				//
+				// The trace is LENGTH-based (v7 §1): a carrier who does not move lays nothing, ever.
+				// Spec v9 §1 is the reason one would not move — bots "run at the carrier ... and stand
+				// by it" — and the measured symptom was this harness aborting with
+				// "gave up waiting for a carrier with 8+ lethal trace points (had 0)", so case C
+				// (parry-no-dash) had never run at all. The trail-clearing probes hit the identical
+				// wall and answered it the identical way (see ClearHarnessDriveCarrier in
+				// TraceTrailComponent.cpp); this is that fix applied to the parry harness.
+				//
+				// AddMovementInput on a slowly rotating heading: the SAME input path a player uses,
+				// through the real movement component, so the trace laid is a real trace at real point
+				// spacing. NOTHING IS TELEPORTED — a jump longer than MaxTrailSegmentLength makes
+				// ServerUpdateTrail restart the trace, which produces exactly the short traces this is
+				// here to avoid. The wide arc also keeps the carrier off the walls.
+				//
+				// It runs ONLY in phase 0, only while waiting for a fixture, and stops the frame one
+				// exists — the parry itself, the dash and the verdict are untouched by it.
+				const float DriveAngle = static_cast<float>(State.WaitFrames) * 0.015f;
+				Carrier->AddMovementInput(
+					FVector(FMath::Cos(DriveAngle), FMath::Sin(DriveAngle), 0.f), 1.f);
+
 				if (++State.WaitFrames > 1800)   // ~30s at 60Hz, with a carrier present the whole time
 				{
 					UE_LOG(LogTraceGame, Warning,

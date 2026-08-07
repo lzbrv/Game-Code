@@ -2504,9 +2504,32 @@ void ATraceCore::ReleaseHolder()
 	// explicit PlayerState write that used to sit here is gone with the other duplicates.
 	Previous->SetCarrying(false);
 
-	// Stop laying, but do NOT wipe what is already there: an expiring trace is counterplay the enemy
-	// team has already earned, and popping it out of existence reads worse than letting it fade.
-	// Death is the one case that clears instantly, and ATraceCharacter::HandleDeath does that.
+	// THE TRACE GOES NOW — every route, not just death. Spec v9 §§3-4, verbatim: "The trace should
+	// disappear the instant a pass/throw is made", and "traces stay on the map way after the carrier
+	// is dead or has made a pass".
+	//
+	// The comment that used to sit here said the opposite ("do NOT wipe what is already there ...
+	// letting it fade ... death is the one case that clears instantly") and it was factually wrong on
+	// both counts, so it is spelled out rather than deleted:
+	//
+	//   1. THERE IS NO FADE. Demo 7 §1 deleted time-based expiry to kill the stand-still exploit, so
+	//      a point is retired only by NEW trace arriving at the head. A component that has stopped
+	//      emitting lays none, so the abandoned trace was immortal — and still lethal, because
+	//      ServerRunTripTest gates on the POINTS, not on bEmitting. Passers were being killed by
+	//      their own trace seconds after giving the Core away.
+	//   2. DEATH WAS NOT THE ONLY CASE, it was only the case the old orphan sweep happened to catch
+	//      (it was gated on `Holder == nullptr || !Holder->IsAlive()`, which a living passer fails).
+	//
+	// ReleaseHolder() is the single funnel for all eight possession-end routes — pass completed,
+	// mode-B throw, turnover, carrier killed, carrier disconnected, score, half time, kickoff, match
+	// end — so clearing HERE, in the same call stack as the possession change, covers all of them
+	// with no timer and no grace frame. The clear itself lives in UTraceTrailComponent::SetEmitting
+	// (which also clears on the already-false path, so the GameMode's wipes can sweep an orphan);
+	// read that function before changing anything here. Trace.Trail.ClearOnPossessionLoss 0 restores
+	// the old behaviour in the same binary if you need to A/B it.
+	//
+	// Do NOT "fix" a future orphan report by reintroducing a lifetime timer: that is the stand-still
+	// exploit Demo 7 removed. Fix the ownership path.
 	if (Previous->Trail != nullptr)
 	{
 		Previous->Trail->SetEmitting(false);

@@ -471,7 +471,8 @@ public:
 	// Three ways in, in priority order:
 	//   1. SetBotDifficulty(), which the arena's first bot calls after reading the travel URL.
 	//   2. "-difficulty=easy|normal|hard" on the command line, for headless measurement runs.
-	//   3. The BotDifficulty config property below, which defaults to Easy.
+	//   3. The BotDifficulty config property below, which defaults to NORMAL as of spec v9 §9
+	//      (and is pinned to the same value in Config/DefaultGame.ini, which wins).
 	//
 	// Resolution is latched for the duration of a match, so a mid-match config reload cannot change
 	// the bots out from under a player. The latch is deliberately NOT process-lifetime: the title
@@ -571,6 +572,49 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Mercy Rule Lead (points, 0 = off)", ClampMin = "0", ClampMax = "50", UIMin = "0", UIMax = "15"))
 	int32 MercyRuleLead = 8;
+
+	// ------------------------------------------------------------------------------------------
+	// DEFERRED HALF TIME / FULL TIME (spec v9 §11, new)
+	//
+	// Verbatim: "Change halftime to trigger after the time runs out and the current play ends, so
+	// that it doesn't cut people off in the middle of a run E.g. the ball drops in game mode b, any
+	// turnover of the core happens between teams, or a goal is scored, then half time triggers."
+	//
+	// Both knobs are read AT THE POINT OF USE by ATraceGameMode, so they retune with a match
+	// running: flipping the switch mid-half changes what the next expiry does, and moving the cap
+	// mid-defer is honoured by the next arm. Neither is latched.
+	//
+	// THE MERCY RULE IS NOT ROUTED THROUGH EITHER OF THESE. It is a mercy, not a play boundary, and
+	// still ends the match on the frame the lead reaches MercyRuleLead — mid-run if that is where it
+	// falls. See ATraceGameMode::FinishMatch, which drops any pending whistle on its way past.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * ON: the clock expiring ARMS the whistle instead of blowing it. Play continues, the HUD shows
+	 * the clock at 0:00 with "HALF/MATCH ENDS AT NEXT DEAD BALL", and the period actually ends at
+	 * the next goal, between-team turnover, or (mode B) Core coming down.
+	 *
+	 * OFF restores the pre-v9 behaviour exactly: the period ends on the tick the clock does, in the
+	 * middle of whatever was happening. Kept as a switch because "the half ended late" and "the half
+	 * ended mid-run" are opposite complaints and this is the one line that swaps between them.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Defer Half/Full Time To The Next Dead Ball"))
+	bool bDeferPeriodEndToPlayBreak = true;
+
+	/**
+	 * THE GUARD RAIL. Seconds a deferred whistle will wait for a dead ball before ending the period
+	 * regardless. Zero disables the cap entirely — DO NOT SHIP IT AT ZERO.
+	 *
+	 * Without this, two teams that neither score nor turn the Core over play past full time forever;
+	 * a stalemate is exactly the situation in which nobody is willing to be the one to concede
+	 * possession, so it is not a hypothetical. 60 s is one long possession's worth of grace
+	 * ([ASSUMPTION], spec §11) — long enough that a genuine run finishes on its own terms, short
+	 * enough that a hung match is over within a minute of the clock.
+	 *
+	 * Read live by ATraceGameMode::BeginPendingPeriodEnd, so an edit lands on the next expiry.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Match", meta = (DisplayName = "Max Defer Before Forcing Half/Full Time (s, 0 = no cap)", ClampMin = "0.0", ClampMax = "600.0", UIMin = "0.0", UIMax = "180.0"))
+	float PeriodEndMaxDeferSeconds = 60.f;
 
 	// ==========================================================================================
 	// SCORING MODE  —  the A/B toggle (spec v4 §7)
@@ -1029,8 +1073,13 @@ public:
 	 * gets expensive — which is what "harder and harder to gain momentum past a certain point" asks
 	 * for. Lower it toward WalkSpeed (800) to make air speed mostly a function of what you jumped in
 	 * with. Must stay below the hard cap or the curve has no room to act.
+	 *
+	 * THIS IS THE BASE, NOT THE EFFECTIVE CAP. Spec v9 §8's "+10%" is NOT baked in here — it is
+	 * applied on top by AirStrafeAsymptoteScale, which the movement component multiplies into both
+	 * caps. Effective soft cap = this x AirStrafeAsymptoteScale = 950 x 1.10 = 1045. Editing this to
+	 * 1045 as well is the double-application trap: it would ship 1149.5 with nothing saying so.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Soft Cap (uu/s, falloff begins)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "2000.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Soft Cap BASE (uu/s, x asymptote scale)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "2000.0"))
 	float AirStrafeSoftCapSpeed = 950.f;
 
 	/**
@@ -1064,9 +1113,62 @@ public:
 	 * a cap can never confiscate momentum a player already had, which is the spec v3 §2.4 rule.
 	 *
 	 * Must stay above AirStrafeSoftCapSpeed and at or below MaxAirSpeed.
+	 *
+	 * ALSO A BASE, for the same reason as the soft cap above: AirStrafeAsymptoteScale multiplies it,
+	 * so the effective hard cap is 1250 x 1.10 = 1375 and MaxAirSpeed (1600) is still the wider of
+	 * the two. Both caps move together on purpose — see AirStrafeAsymptoteScale.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Hard Cap (uu/s)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "600.0", UIMax = "2500.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Hard Cap BASE (uu/s, x asymptote scale)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "600.0", UIMax = "2500.0"))
 	float AirStrafeHardCapSpeed = 1250.f;
+
+	/**
+	 * SPEC v9 §8 — "Move the asymptote on momentum slightly higher, to allow for slightly faster
+	 * speeds." ONE scalar over BOTH air-strafe caps.
+	 *
+	 * The soft cap is where the gain starts to taper and the hard cap is where it reaches zero: they
+	 * are two points on one curve, so moving only one of them changes the SHAPE of the falloff
+	 * instead of its position. This slides the whole asymptote up and leaves the shape identical.
+	 * [ASSUMPTION] +10%, per spec §8 — 950 -> 1045 and 1250 -> 1375.
+	 *
+	 * A NUDGE, NOT A REMOVAL. The Demo 5 ceiling the design owner asked for is still here; it just
+	 * sits 10% further out. MaxAirSpeed (1600) is deliberately not scaled, so the hard cap remains
+	 * the tighter of the two and spec v5 §1 still governs.
+	 *
+	 * NAME IS LOAD-BEARING: UTraceCharacterMovementComponent::GetAirStrafeAsymptoteScale() resolves
+	 * it BY NAME as "AirStrafeAsymptoteScale" and clamps to 0.5..2. A rename here does not fail to
+	 * compile; it silently reverts to the component's built-in 1.10 and the ini stops driving it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Asymptote Scale (x both caps)", ClampMin = "0.5", ClampMax = "2.0", UIMin = "0.8", UIMax = "1.5"))
+	float AirStrafeAsymptoteScale = 1.10f;
+
+	/**
+	 * SPEC v9 §8 — "LESS FLOATY". Multiplier on world gravity for the PLAYER, and only the player.
+	 *
+	 * Verbatim: "Increase gravity by 12%, to make players feel less floaty when air strafing."
+	 * 1.12 is that number, expressed as the engine's UCharacterMovementComponent::GravityScale so it
+	 * applies to jumps, falls, wall jumps and the dash arc alike without touching world gravity —
+	 * which would also have retuned the mode-B throw (UTraceSettings::CoreThrowGravityScale reads
+	 * the world value), and spec §8 asks for the PLAYER to feel heavier, not the ball.
+	 *
+	 * KNOCK-ON EFFECTS, because §8 asks for them to be reported rather than silently compensated:
+	 * apex height scales 1/1.12 (-10.7%) and hang time 1/sqrt(1.12) (-5.5%) for the same jump
+	 * impulse. Everything that measures itself against a jump — MantleMaxHeightUU, the wall jump's
+	 * WallJumpVerticalMultiplier, DashExitVerticalSpeedMultiplier, SlideJumpZMultiplier — is
+	 * expressed as a MULTIPLE of the jump rather than an absolute height, so all of them shrink
+	 * together and stay in proportion. The one thing that does NOT move with them is the arena
+	 * geometry: a ledge at MantleMaxHeightUU is still 230 uu tall, and a jump that used to clear it
+	 * with 10% to spare now clears it with none.
+	 *
+	 * NAME IS LOAD-BEARING, AND IT IS NOT THE OBVIOUS ONE. UTraceCharacterMovementComponent resolves
+	 * this BY NAME through TraceMoveKnob as "MovementGravityScale" — NOT "PlayerGravityScale", which
+	 * is what this property was called for most of this pass and which bound to nothing: the
+	 * component's MOVEKNOB report said "MovementGravityScale FALLBACK", the game ran at 1.0 gravity,
+	 * and neither the build nor the settings panel said a word. A rename here does not fail to
+	 * compile. Trace.VerifyKnobs lists it, and the component's bind report names it on the other
+	 * side, precisely so the pair can never drift apart again.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Player Gravity Scale (x world gravity)", ClampMin = "0.25", ClampMax = "4.0", UIMin = "0.8", UIMax = "1.6"))
+	float MovementGravityScale = 1.12f;
 
 	/**
 	 * Lateral drag in the air, per second (the engine's FallingLateralFriction). ZERO BY DESIGN.
@@ -1310,12 +1412,39 @@ public:
 	/**
 	 * Longest a slide may last, in seconds, even if it has not decayed to the exit speed.
 	 *
-	 * With the gentle deceleration below, this is what actually ends most slides — so this is the
-	 * "make the slide longer" dial. Sane range 0.8 to 2.5. Independent of SlideCooldownSeconds now
-	 * that the cooldown is measured from the slide's end.
+	 * With the gentle deceleration below, this is what actually ends most slides — so this is THE
+	 * "max slide length" dial. Sane range 0.8 to 2.5.
+	 *
+	 * THE BASE, NOT THE SHIPPED LENGTH. Spec v9 §6's "-30%" lives in SlideMaxLengthScale below and is
+	 * applied on top by the movement component: effective duration = this x 0.7 = 1.26 s. Do not cut
+	 * this to 1.26 as well — that ships 0.88 s, a 51% cut, and nothing on either side says so.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Duration (s)", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.3", UIMax = "3.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Duration BASE (s, x max length scale)", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.3", UIMax = "3.0"))
 	float SlideDuration = 1.8f;
+
+	/**
+	 * SPEC v9 §6 — "Reduce max slide length by 30%." x0.7, and this is the whole change.
+	 *
+	 * LENGTH IS SCALED THROUGH DURATION, on purpose. Since spec v4 §1 a slide's speed is purely what
+	 * the player carried in, so the maximum distance one can cover is entry speed integrated over
+	 * SlideDuration — scale the clock and the distance scales with it. With SlideDeceleration at
+	 * 260 uu/s² the decay term is quadratic, so the distance actually falls slightly short of a clean
+	 * 30%: ~1815 uu over 1.8 s becomes ~1300 uu over 1.26 s, -28.4% in distance for -30% in duration.
+	 *
+	 * DELIBERATELY NOT DONE BY RAISING SlideDeceleration OR CAPPING SlideMaxSpeed. Either would
+	 * shorten the slide by CONFISCATING MOMENTUM the player brought in, which is the exact behaviour
+	 * Demo 4 asked to have removed (spec v4 §1). Ending the slide earlier leaves them travelling at
+	 * the speed they earned.
+	 *
+	 * Knock-on: SlideJumpWindowSeconds (0.20 s) is measured from the slide's END and does not move,
+	 * so the well-timed window is now 16% of the slide rather than 11% — the slide-jump got slightly
+	 * EASIER to time, not harder.
+	 *
+	 * NAME IS LOAD-BEARING: bound BY NAME as "SlideMaxLengthScale" by
+	 * UTraceCharacterMovementComponent::GetSlideDuration(), clamped there to 0.05..4.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Max Length Scale (x duration)", ClampMin = "0.05", ClampMax = "4.0", UIMin = "0.4", UIMax = "1.5"))
+	float SlideMaxLengthScale = 0.7f;
 
 	/**
 	 * uu/s bled off the slide every second. THIS IS THE MOMENTUM DIAL — lower preserves more.
@@ -1489,10 +1618,43 @@ public:
 	 * against the curve. Check the two together if chained slide-jumps start looking like a
 	 * traversal exploit.
 	 *
-	 * 1.0 turns the window into a no-op without disabling the move. Do not go far past ~1.35.
+	 * THE BASE, NOT THE SHIPPED MULTIPLIER. Spec v9 §7's "+30% on the bonus" is applied on top by
+	 * SlideJumpBonusScale below — effective 1 + (1.3125 - 1) x 1.30 = 1.40625 — so this line stays
+	 * the designer's v8 number and the two re-tunings never fight.
+	 *
+	 * 1.0 turns the window into a no-op without disabling the move.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Speed Bonus (x)", ClampMin = "1.0", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Speed Bonus BASE (x, x bonus scale)", ClampMin = "1.0", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.8"))
 	float SlideJumpWindowSpeedBonus = 1.3125f;
+
+	/**
+	 * SPEC v9 §7 — "Increase the bonus of timing a slide jump right by 30%." x1.30, and this plus the
+	 * switch below is the whole change.
+	 *
+	 * Applied to SlideJumpWindowSpeedBonus by
+	 * UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus(), bound BY NAME as
+	 * "SlideJumpBonusScale" and clamped there to 0.1..4.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Bonus Scale (v9 §7, x)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.8", UIMax = "2.0"))
+	float SlideJumpBonusScale = 1.30f;
+
+	/**
+	 * WHICH READING OF §7 IS SHIPPED. The spec asks for both to be flagged and for the choice to be
+	 * one number; it is this bool.
+	 *
+	 * TRUE (shipped, and the spec's [ASSUMPTION]): "the bonus" is the part ABOVE 1.0 — the thing the
+	 * timing actually buys. 1 + (1.3125 - 1) x 1.30 = 1.40625. A well-timed hop at 1900 uu/s carries
+	 * 2672 uu/s instead of 2494 uu/s.
+	 *
+	 * FALSE (the alternative): "the bonus" is the whole multiplier. 1.3125 x 1.30 = 1.70625, and the
+	 * same hop carries 3242 uu/s — past DashSpeed's own 3000 uu/s. A slide-hop faster than a dash
+	 * inverts the game's counterplay (the dash is the only answer to a carrier), which is why this
+	 * reading is not the default.
+	 *
+	 * Bound BY NAME as "bSlideJumpBonusScalesGainOnly".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Bonus Scale Applies To The Gain Only (v9 §7 reading)"))
+	bool bSlideJumpBonusScalesGainOnly = true;
 
 	/**
 	 * Extra JUMP HEIGHT multiplier for a slide-jump taken inside the timing window. New in spec v5
@@ -1658,23 +1820,86 @@ public:
 	 * Seconds after touching a wall in which a jump press still counts as a wall jump.
 	 *
 	 * "Press jump RIGHT AS they hit a wall" is the request, so this is a reaction window and not a
-	 * wall-cling: 0.25 s is generous enough to survive a 40 ms client's own latency (the whole point
-	 * of spec v8 §0) while staying far too short to hang on a wall and think about it. Push it past
-	 * ~0.4 and the move stops reading as a timing input.
+	 * wall-cling. 0.25 s is about four frames of slack at 60 Hz plus the human reaction floor.
+	 *
+	 * THE BASE, NOT THE SHIPPED WINDOW. Spec v9 §5's shortening lives in WallJumpWindowScale below:
+	 * effective window = 0.25 x 0.6 = 0.15 s. Cutting this to 0.15 as well ships 0.09 s, which is
+	 * shorter than a 40 ms client's own latency — the move would simply stop existing online.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Contact Window (s)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.05", UIMax = "0.4"))
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Contact Window BASE (s, x window scale)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.05", UIMax = "0.4"))
 	float WallJumpWindowSeconds = 0.25f;
+
+	/**
+	 * SPEC v9 §5 — "Make the window of time for performing a wall jump shorter and make the action
+	 * happen faster." x0.6 on the contact window: 0.25 s -> 0.15 s.
+	 *
+	 * The "sticking to the wall for a second" the note describes IS this window — the time between
+	 * contact and launch during which the pawn is committed to a wall it has not left yet.
+	 * [ASSUMPTION] a 40% cut: still ~4 frames wider than a 40 ms client's own latency (spec v8 §0), so
+	 * the move stays performable online. Do not take the effective window below ~0.10 s.
+	 *
+	 * IT ALSO SHORTENS THE MANTLE DEFERRAL. The movement component uses the same scaled window when
+	 * deciding how long an auto-mantle should stand aside for a live wall-jump opportunity, so the two
+	 * halves of §5 move together by construction rather than by two numbers being kept in step.
+	 *
+	 * Bound BY NAME as "WallJumpWindowScale", clamped in the component to 0.05..1 — it can only ever
+	 * shorten the window, never lengthen it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Contact Window Scale (v9 §5, x)", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.3", UIMax = "1.0"))
+	float WallJumpWindowScale = 0.6f;
 
 	/**
 	 * Fraction of the incoming planar SPEED the reflected launch keeps. 1.0 is pure preservation.
 	 *
-	 * THIS NUMBER IS THE REQUEST. "Carry momentum in a new direction" means the speed survives the
-	 * bounce and only the direction changes, so the default is deliberately near 1: 0.95 keeps the
-	 * move feeling lossless while charging a small toll that stops a corridor of walls from being a
-	 * free perpetual-motion machine. Below ~0.8 it stops reading as carrying momentum at all.
+	 * "Carry momentum in a new direction" means the speed survives the bounce and only the direction
+	 * changes, so this sits near 1 by design: 0.95 charges a small toll so a corridor of walls is not
+	 * a frictionless pinball table.
+	 *
+	 * THE BASE, NOT THE SHIPPED RETENTION. Spec v9 §5's -10% lives in WallJumpMomentumScale below:
+	 * effective retention = 0.95 x 0.9 = 0.855. Setting this to 0.855 as well ships 0.7695, which is
+	 * below the ~0.8 floor at which the move stops reading as carrying momentum at all.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Speed Retention (x)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.7", UIMax = "1.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Speed Retention BASE (x, x momentum scale)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.7", UIMax = "1.0"))
 	float WallJumpSpeedRetention = 0.95f;
+
+	/**
+	 * SPEC v9 §5 — "Reduce momentum gained from wall jumping by 10%." x0.9 on the retention, which is
+	 * the spec's own [ASSUMPTION] stated verbatim ("scale the retention knob by 0.9").
+	 *
+	 * WHY THE KNOB AND NOT THE OUTCOME. Measured end-to-end retention (launch speed / entry speed) was
+	 * ~104.6-105.4%, because the outward impulse and the vertical add on top of the 0.95 — the move
+	 * was a net GAIN. Reading "the momentum gained" as only the part above 100% would make the cut
+	 * 1.050 -> 1.045, which is invisible. Scaling the knob lands measured retention near ~95%, which
+	 * is the change a player will actually feel.
+	 *
+	 * TO SWITCH READINGS: set this to 1.0 and cut WallJumpOutwardImpulse instead — it is the only
+	 * other term in the launch.
+	 *
+	 * Bound BY NAME as "WallJumpMomentumScale", clamped in the component to 0.1..1 so a wall can never
+	 * MANUFACTURE speed (the same rule spec v4 §1 imposed on the slide).
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Momentum Scale (v9 §5, x retention)", ClampMin = "0.1", ClampMax = "1.0", UIMin = "0.7", UIMax = "1.0"))
+	float WallJumpMomentumScale = 0.9f;
+
+	/**
+	 * SPEC v9 §5 — "If a player inputs a wall jump, that overrides a mantle." Seconds the mantle is
+	 * held off after a wall jump.
+	 *
+	 * Refusing the mantle on the frame of the wall jump is not enough on its own: the pawn is still a
+	 * few uu from the same ledge face for the next handful of frames, so the very next move would pass
+	 * the mantle's own test and vacuum the player back onto the lip they had just launched away from —
+	 * which reads as the wall jump not having happened at all.
+	 *
+	 * 0.30 s covers the frames in which the launch is still near the face without being long enough to
+	 * deny a genuine mantle attempt at the next ledge. 0 disables the lockout and leaves only the
+	 * same-frame priority.
+	 *
+	 * Bound BY NAME as "WallJumpMantleLockoutSeconds", clamped in the component to 0..2. The component
+	 * implements it by pushing its existing mantle cooldown rather than adding a second clock, so it
+	 * costs no new prediction state and cannot rubber-band.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Mantle Lockout After Wall Jump (s)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
+	float WallJumpMantleLockoutSeconds = 0.30f;
 
 	/**
 	 * Flat uu/s pushed straight out along the wall normal, on top of the reflection.
@@ -2640,14 +2865,29 @@ public:
 
 	/**
 	 * Difficulty used when nothing else resolved one — i.e. a direct launch straight into the arena
-	 * with no travel URL. EASY on purpose: this is what an unattended run, an automated test and a
-	 * first-time player all get.
+	 * with no travel URL. This is what an unattended run, an automated test and a first-time player
+	 * all get.
+	 *
+	 * EASY -> NORMAL THIS PASS (spec v9 §9, verbatim: "Set default startup bot difficulty to
+	 * normal"). Easy was chosen when the bots could kill an idle human in under two seconds and the
+	 * curve was being retuned; the curve has since been derived rather than guessed, and Normal is
+	 * the intended out-of-the-box opponent.
+	 *
+	 * PINNED IN Config/DefaultGame.ini AS WELL (BotDifficulty=Normal under
+	 * [/Script/Trace.TraceSettings]) AND THE INI WINS. This literal is what a reader sees; the ini
+	 * is what a match uses. Keep the two equal, and verify from a running game with
+	 * Trace.VerifyKnobs rather than by reading this line.
+	 *
+	 * THE TITLE SCREEN HAS ITS OWN DEFAULT and it is NOT this property: TraceDifficulty::Default in
+	 * UI/TraceMatchOptions.h is the value the menu row starts on, and the menu then writes
+	 * "?difficulty=" onto the travel URL, which outranks everything here. Both have to say Normal
+	 * for §9 to be satisfied.
 	 *
 	 * LATCHED PER MATCH. Editing this mid-PIE does nothing until the next map load; edit the profile
 	 * that is already in force instead, which retunes immediately.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Bots", meta = (DisplayName = "Default Bot Difficulty"))
-	EBotDifficulty BotDifficulty = EBotDifficulty::Easy;
+	EBotDifficulty BotDifficulty = EBotDifficulty::Normal;
 
 	/**
 	 * The knob sets, one per difficulty. Values are assigned by name in the UTraceSettings

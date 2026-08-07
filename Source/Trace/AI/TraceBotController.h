@@ -457,8 +457,55 @@ protected:
 	 * OutTangent is what makes the crossing work: the caller aims PAST the trace along the
 	 * perpendicular rather than AT a point on it, so the dash sweeps through instead of pulling up
 	 * alongside.
+	 *
+	 * --- SPEC v9 §1: WHY THIS WAS REWRITTEN ---------------------------------------------------
+	 *
+	 * Both of the filters described above were ABSOLUTE distances calibrated against a trace whose
+	 * length was TrailLifetime x WalkSpeed. Spec v7 §2 then capped a trace at TrailMaxLengthUU =
+	 * 1200 uu. The head filter (BotTrailMinDistanceFromCarrier, 900 uu) and the tail filter
+	 * (BotTrailMinPointLifeRemaining x WalkSpeed, 320 uu) sum to 1220 uu, so on a 1200 uu trace
+	 * they overlap and NO point can satisfy both — for any carrier, at any moment, on every
+	 * difficulty. This function returned false unconditionally, and BehaviourHuntCarrier's fallback
+	 * (steer at a lead point off the carrier's velocity) is a pursuit, which is what the report
+	 * describes: bots mirroring the carrier's turns and standing next to them.
+	 *
+	 * It now:
+	 *   * takes the lethal set from UTraceTrailComponent::ComputeLastLethalIndex(), the same
+	 *     function the server's trip test and the renderer use, instead of re-deriving it from
+	 *     TrailHeadGracePoints and getting a different answer;
+	 *   * measures both margins as a FRACTION OF THE TRACE THAT EXISTS (capped by the settings
+	 *     values), so they can never again meet in the middle;
+	 *   * measures "behind the carrier" along the PATH rather than as a straight line, which is
+	 *     what makes a hairpin huntable — trace 900 uu back along a U-turn is 200 uu away in space,
+	 *     it is fully lethal, and the old test threw it away;
+	 *   * scores candidates by time-to-reach WEIGHTED BY CROSSING ANGLE rather than by raw
+	 *     distance, because the nearest point is frequently the one you can only approach along;
+	 *   * refuses points the length cap will delete before the bot can get there, which is the
+	 *     "running at ghosts" failure expressed in the units a length-based trace has.
 	 */
 	bool FindTrailInterceptPoint(FVector& OutPoint, FVector& OutTangent) const;
+
+	/**
+	 * The pre-v9 version of the above, reachable only with `Trace.Bot.InterceptFix 0`.
+	 *
+	 * Kept verbatim so the before/after measurement is a property of one build rather than of two,
+	 * and so the reproduction can be shown failing on demand. Nothing in the game calls it with the
+	 * cvar at its default.
+	 */
+	bool FindTrailInterceptPointLegacy(FVector& OutPoint, FVector& OutTangent) const;
+
+	/**
+	 * Where a hunter goes when the enemy carrier has no trace worth crossing yet.
+	 *
+	 * NOT the carrier. Pathing at the carrier's current position is a pursuit: it mirrors their
+	 * turns and converges on standing next to them, and it never crosses the trace because the
+	 * trace is BEHIND them. This answers with a point on the line the trace is about to occupy —
+	 * a fixed gap behind the carrier, offset to whichever side the bot is already on by roughly a
+	 * dash's reach — so the bot arrives beside the line it will have to cross, facing across it.
+	 *
+	 * @param OutStation where to run, valid only on true.
+	 */
+	bool FindCutBehindStation(FVector& OutStation) const;
 
 	/**
 	 * This bot's rank by distance to the enemy carrier among living teammates, or INDEX_NONE if it
@@ -647,15 +694,40 @@ private:
 	float BurstRestUntilTime = 0.f;
 
 	/**
-	 * Whether this bot intends to spend its CURRENT dash charge on a trace intercept.
+	 * Whether this bot intends to spend its dash on a trace intercept right now.
 	 *
-	 * Rolled once per charge, on the frame the dash comes off cooldown — not per tick. Rolled per
-	 * tick, FTraceBotProfile::TrailDashCommitChance was not a probability at all: anything above
-	 * about 0.2 fired within two frames of entering range, so every value from 0.3 to 1.0 behaved
-	 * identically and the knob could not be used to tune how hard the defence presses.
+	 * NOT rolled per tick: FTraceBotProfile::TrailDashCommitChance would not be a probability at
+	 * all, because anything above about 0.2 fires within two frames of entering range and every
+	 * value from 0.3 to 1.0 behaves identically.
+	 *
+	 * NOT rolled once per charge either, which is what it used to be and is the bug spec v9 §1
+	 * describes. "One roll per charge" is an absorbing state: declining means never dashing, never
+	 * dashing means the charge is never spent, and a charge that is never spent never arrives to
+	 * trigger another roll — so one unlucky roll disarms the bot for the rest of its life, and it
+	 * spends that life pacing the dash pocket beside the carrier. Measured on Easy: trace dashes
+	 * per 10s ran 1,3,3,0,0,0,0,1,1 while the bots' time inside dash range stayed flat.
+	 *
+	 * Rolled on a charge ARRIVING, and again every TrailCommitRetrySeconds while a hunter is
+	 * holding a charge it has declined to spend. The knob therefore sets how long a difficulty
+	 * hesitates rather than whether it ever commits.
 	 */
 	bool bCommitDashWithThisCharge = false;
-	bool bDashReadyLastTick = false;
+
+	/** Earliest world time the commit roll above may be taken again after declining. */
+	float NextTrailCommitRollTime = 0.f;
+
+	/**
+	 * Dash charges seen last tick, so a charge ARRIVING can be told from a charge merely existing.
+	 *
+	 * SPEC v9 §1. This replaces a `bool bDashReadyLastTick`, and the type change is the fix. Watching
+	 * a boolean means the only observable event is "went from none to some", and an interceptor whose
+	 * dash request the pawn refused (CanDash is false in the air and mid-dash) never produces one:
+	 * the count does not move, so the commit flag it cleared on request is never re-rolled and the
+	 * bot never dashes at a trace again. Measured at 4963 of 8869 hunt ticks refused for "no-commit"
+	 * on a profile that commits 95% of its charges. Watching the count catches every refill,
+	 * including the carrier's second charge, and a refused dash simply stays armed.
+	 */
+	int32 LastSeenDashCharges = 0;
 
 	// --- Dash charge shadow model (see GetDashCharges) ---------------------------------------
 

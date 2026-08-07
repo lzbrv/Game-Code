@@ -38,6 +38,12 @@ void ATraceGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	DOREPLIFETIME(ATraceGameState, CurrentHalf);
 	DOREPLIFETIME(ATraceGameState, NumHalves);
 	DOREPLIFETIME(ATraceGameState, bHalfTimeBreak);
+
+	// Spec v9 §11. Both are on the HUD of every player the moment the clock hits 0:00 and play
+	// carries on, so they travel with the rest of the half block and under the same conditions.
+	DOREPLIFETIME(ATraceGameState, bPendingPeriodEnd);
+	DOREPLIFETIME(ATraceGameState, PendingPeriodEndCapServerTime);
+
 	DOREPLIFETIME(ATraceGameState, TeamOnNegativeSide);
 	DOREPLIFETIME(ATraceGameState, LastWipeBonusTeam);
 	DOREPLIFETIME(ATraceGameState, LastWipeBonusServerTime);
@@ -188,6 +194,65 @@ FString ATraceGameState::GetHalfLabel() const
 	}
 }
 
+// ---------------------------------------------------------------------------------------------
+// Deferred half time / full time (spec v9 §11)
+// ---------------------------------------------------------------------------------------------
+
+bool ATraceGameState::IsPendingPeriodEnd() const
+{
+	// The break itself and the results screen both clear the flag, but ask anyway: a pending whistle
+	// is by definition a thing that happens DURING play, and reporting one during the interval would
+	// have the HUD promise a break that is already on screen.
+	return bPendingPeriodEnd && !bHalfTimeBreak && TraceMatchState == ETraceMatchState::InProgress;
+}
+
+FString ATraceGameState::GetPendingPeriodEndLabel() const
+{
+	if (!IsPendingPeriodEnd())
+	{
+		return FString();
+	}
+
+	// "HALF" or "MATCH" depending on whether there is another period to come — the same test
+	// ATraceGameMode::EndPeriodNow() makes, so the HUD can never promise a half time that is
+	// actually full time.
+	return (CurrentHalf < NumHalves)
+		? FString(TEXT("HALF ENDS AT NEXT DEAD BALL"))
+		: FString(TEXT("MATCH ENDS AT NEXT DEAD BALL"));
+}
+
+float ATraceGameState::GetPendingPeriodEndTimeRemaining() const
+{
+	if (!IsPendingPeriodEnd() || PendingPeriodEndCapServerTime <= 0.f)
+	{
+		return 0.f;
+	}
+
+	// Double maths for the same reason GetMatchTimeRemaining does it: GetServerWorldTimeSeconds()
+	// returns double on 5.3+.
+	const double Remaining = static_cast<double>(PendingPeriodEndCapServerTime) - GetServerWorldTimeSeconds();
+	return FMath::Max(0.f, static_cast<float>(Remaining));
+}
+
+void ATraceGameState::SetPendingPeriodEnd(bool bInPending, float InCapServerTime)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	bPendingPeriodEnd = bInPending;
+	PendingPeriodEndCapServerTime = bInPending ? FMath::Max(0.f, InCapServerTime) : 0.f;
+
+	// OnRep never fires on the authority. The listen host's own HUD has to show "NEXT DEAD BALL"
+	// exactly when a remote client's does.
+	OnRep_HalfChanged();
+
+	// Once or twice a period, and it changes what every player is looking at. Never wait for the
+	// GameState's normal net update slot.
+	ForceNetUpdate();
+}
+
 void ATraceGameState::SetTeamSides(ETraceTeam InTeamOnNegativeSide)
 {
 	if (!HasAuthority() || InTeamOnNegativeSide == ETraceTeam::None)
@@ -333,7 +398,8 @@ void ATraceGameState::OnRep_HalfChanged()
 	// Log at Display, not Verbose: half time is a once-a-match event and the single most useful line
 	// in the log when something about the second half looks wrong. (See the project's hard-won
 	// lesson about mechanics being declared dead because their log line was suppressed.)
-	UE_LOG(LogTraceGame, Display, TEXT("[Half] %s  (half %d of %d)"), *GetHalfLabel(), CurrentHalf, NumHalves);
+	UE_LOG(LogTraceGame, Display, TEXT("[Half] %s  (half %d of %d)%s"), *GetHalfLabel(), CurrentHalf, NumHalves,
+		bPendingPeriodEnd ? TEXT("  [PENDING: ends at the next dead ball]") : TEXT(""));
 }
 
 void ATraceGameState::OnRep_SidesChanged()

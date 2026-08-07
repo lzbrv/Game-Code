@@ -205,6 +205,93 @@ namespace TraceBotConstants
 
 	/** Downward trace length used to answer "how high am I" for the crouch fast-fall. */
 	static constexpr float GroundProbeLength = 2000.f;
+
+	// --- SPEC v9 §1: INTERCEPTING THE TRACE ---------------------------------------------------
+	//
+	// THE BUG THESE EXIST TO MAKE IMPOSSIBLE. Two filters trim the trace down to the stretch worth
+	// dashing at: BotTrailMinDistanceFromCarrier (900uu) drops the newest end, and
+	// BotTrailMinPointLifeRemaining x WalkSpeed (320uu) drops the oldest. Both were calibrated when
+	// a trace was as long as TrailLifetime x WalkSpeed. Spec v7 §2 capped a trace at
+	// TrailMaxLengthUU = 1200uu, and 900 + 320 = 1220 > 1200: the two filters MET IN THE MIDDLE and
+	// the candidate set became empty for every carrier on the field, permanently. Every hunting bot
+	// fell through to the "no usable trace" branch, which pursues the carrier — which is precisely
+	// what the report describes ("they run at the carrier, following the exact motion of the
+	// carrier and stand by it").
+	//
+	// So neither margin is allowed to be an absolute any more. Each is a FRACTION OF THE TRACE THAT
+	// ACTUALLY EXISTS, with the settings value as an upper bound. 0.45 + 0.20 < 1, so a usable band
+	// survives at any trace length, at any future value of TrailMaxLengthUU, and this class of bug
+	// cannot come back by retuning a number in another file.
+	static constexpr float TrailHeadGapMaxFraction  = 0.45f;
+	static constexpr float TrailTailSkipMaxFraction = 0.20f;
+
+	/**
+	 * How much a bad crossing ANGLE costs a candidate segment, as a multiple of its travel time.
+	 *
+	 * Picking the NEAREST trace point is not the same as picking the one you can cross. A point
+	 * dead ahead along the trace's own direction is approached ALONG the line: the dash runs
+	 * parallel to the thing it is trying to trip and the swept segment-vs-segment test never
+	 * intersects. At 1.6 a parallel approach is worth 2.6x its distance, so a slightly further
+	 * point that can be taken side-on wins — which is the difference between a crossing and a
+	 * tail-chase.
+	 */
+	static constexpr float TrailApproachParallelPenalty = 1.6f;
+
+	/**
+	 * Safety factor on "will this point still be there when I arrive?".
+	 *
+	 * The trace is length-capped, so its tail is eaten at the carrier's own speed. A point
+	 * D uu behind the carrier is deleted once the carrier has run a further (MaxLength - D). A bot
+	 * that commits to a point which is trimmed before it arrives spends the whole carry running at
+	 * ghosts — the failure BotTrailMinPointLifeRemaining was written for, expressed in the units
+	 * the length-based trace actually has.
+	 */
+	static constexpr float TrailTrimSafetyFactor = 1.25f;
+
+	/**
+	 * Where an interceptor WAITS when it cannot dash yet, as a fraction of the dash's commit range.
+	 *
+	 * Without this a hunter with its dash on cooldown walks straight through the trace it is
+	 * hunting (walking through it does nothing) and comes out the far side, where it has to turn
+	 * round and come back — and while it is doing that it is, from the outside, a bot milling about
+	 * next to the carrier. Holding just inside dash range on its own side of the line means the
+	 * charge is spent the frame it lands, from a position it is already in.
+	 */
+	static constexpr float TrailPocketDashRangeFraction = 0.62f;
+
+	/**
+	 * How hard a pocketed interceptor paces ALONG the trace toward the carrier, in uu of steering
+	 * bias. Without it a bot that has reached its pocket has nothing to do and stands still while
+	 * the carrier runs away from it.
+	 *
+	 * SPEC v9 §1: it is CLAMPED by how far ahead the chosen point actually is (see the pocket block
+	 * in BehaviourHuntCarrier). Unclamped, a bot that had arrived at its pocket steered almost
+	 * purely along this vector — up the trace, past the head, and into the carrier — then turned
+	 * round and came back. Repeated at 60Hz that is a bot that mirrors the carrier's turns and
+	 * stands next to them, which is the second half of the reported symptom and was being produced
+	 * by the very code written to prevent the first half.
+	 */
+	static constexpr float TrailPocketPaceWeight = 280.f;
+
+	/**
+	 * SPEC v9 §1 — HOW LONG A HUNTER HESITATES AFTER DECLINING A CROSSING, in seconds.
+	 *
+	 * FTraceBotProfile::TrailDashCommitChance used to be rolled once per dash CHARGE. That is an
+	 * absorbing state and it is the reason the signature play disappeared: a bot that rolls "do not
+	 * commit" then never dashes, so its charge is never spent, so no charge ever arrives, so the
+	 * roll is never taken again. It is disarmed for the rest of its life. MEASURED on Easy
+	 * (chance 0.60): trace dashes per 10s window ran 1, 3, 3, 0, 0, 0, 0, 1, 1 while the share of
+	 * hunt ticks inside dash range held flat at ~52% — the bots kept arriving and kept not firing.
+	 *
+	 * Re-rolling on a timer turns the same knob into a HESITATION: expected wait is
+	 * (1-chance)/chance x this, so Easy dithers ~0.8s before committing and Hard ~0.06s. The
+	 * difficulty gradient survives — that is what "how readable is their timing" means here — but
+	 * no value of the knob can permanently switch the mechanic off.
+	 */
+	static constexpr float TrailCommitRetrySeconds = 1.2f;
+
+	/** Below this planar speed a carrier is laying no new trace, so there is no line to cut behind. */
+	static constexpr float TrailCutBehindMinCarrierSpeed = 120.f;
 }
 
 // =================================================================================================
@@ -475,6 +562,60 @@ static TAutoConsoleVariable<int32> CVarTraceBotMetrics(
 	TEXT("Costs one line trace per bot per tick; off by default."),
 	ECVF_Default);
 
+/**
+ * SPEC v9 §1. The A/B LADDER for the interception work. Three rungs, one build.
+ *
+ *   0  the v8 behaviour: absolute trail filters, and a fallback that pursues the carrier.
+ *      This is what the user played and described.
+ *   1  the geometry rewrite: trace-relative filters, crossing-angle selection, trim-aware target
+ *      choice, the cut-behind fallback and the dash pocket. Interceptors now nearly always HAVE a
+ *      plan — and still almost never spend the dash, because of the commit ratchet below.
+ *   2  (default) the commit fix: the trace-dash commitment is re-rolled on a hesitation timer
+ *      instead of once per dash charge, and a pocketed hunter no longer paces into the carrier.
+ *
+ * A ladder rather than a boolean because rung 1 was measured and found insufficient: 12216 hunt
+ * ticks with a plan produced NINE dashes, 8504 of them refused for "no-commit". Reporting "fixed"
+ * off rung 1 is exactly the failure §0 of the spec is about, and keeping rung 1 reachable is what
+ * lets the claim "the commit roll was the blocker" be a measurement rather than an assertion.
+ *
+ * Not a tuning knob. There is no configuration in which 0 or 1 is the right answer for play.
+ */
+static TAutoConsoleVariable<int32> CVarTraceBotInterceptFix(
+	TEXT("Trace.Bot.InterceptFix"),
+	2,
+	TEXT("2 (default): spec v9 §1 complete - the geometry rewrite AND the dash-commit fix.\n")
+	TEXT("1: geometry only (trace-relative filters, crossing angle, cut-behind, pocket). The\n")
+	TEXT("   commit roll still happens once per charge, so a bot that rolls 'no' is disarmed for good.\n")
+	TEXT("0: the v8 behaviour - absolute filters and a pursuit fallback. The reported symptom.\n")
+	TEXT("Never ship a run with this below 2."),
+	ECVF_Default);
+
+#endif // !UE_BUILD_SHIPPING
+
+/** Which rung of the ladder above is in force. Always the top rung in a shipping build. */
+static int32 BotInterceptFixLevel()
+{
+#if !UE_BUILD_SHIPPING
+	return CVarTraceBotInterceptFix.GetValueOnAnyThread();
+#else
+	return 2;
+#endif
+}
+
+/** Rung 1 and above: the interception GEOMETRY (where to stand, which point to cross). */
+static bool BotInterceptFixEnabled()
+{
+	return BotInterceptFixLevel() >= 1;
+}
+
+/** Rung 2: the DECISION to spend the charge (the commit re-roll, and the pocket pace clamp). */
+static bool BotInterceptCommitFixEnabled()
+{
+	return BotInterceptFixLevel() >= 2;
+}
+
+#if !UE_BUILD_SHIPPING
+
 namespace TraceBotTelemetry
 {
 	/** Counters for the current 10-second reporting window. Reset after every dump. */
@@ -568,6 +709,50 @@ namespace TraceBotTelemetry
 
 		/** Teammate throws refused for being beyond what the Core can physically carry. */
 		int32 PassOutOfThrowRange = 0;
+
+		// --- SPEC v9 §1: WHY AN INTERCEPTOR IS OR IS NOT CROSSING THE TRACE -------------------------
+		//
+		// "dash=trace: 3" over a whole match is a symptom with six possible causes and the old counters
+		// could not tell them apart. The user's report is precise — the bots "run at the carrier,
+		// following the exact motion of the carrier and stand by it" — and that is a description of
+		// ONE specific branch: BehaviourHuntCarrier's no-usable-trace fallback, which steers at a lead
+		// point off the carrier's own velocity, i.e. a pursuit. So the first question any measurement
+		// has to answer is how often a hunter has a PLAN (a point on the trace) at all, and when it
+		// does not, which filter threw the trace away.
+		//
+		// The chain, and the counter that names each link:
+		//     bot-tick in HuntCarrier                          HuntTicks
+		//   -> a lethal trace point survived the filters       HuntTicksWithPlan / HuntTicksNoPlan
+		//      (...or it did not, and why)                     PlanRejectShort / Band / Tangent
+		//   -> the bot got within a dash of crossing it        HuntTicksInDashRange
+		//   -> ...and actually spent the dash                  TraceDashes (above)
+		//      (...or it did not, and why)                     DashBlocked*
+		int32 HuntTicks           = 0;
+		int32 HuntTicksWithPlan   = 0;
+		int32 HuntTicksNoPlan     = 0;   // <- the pursuit fallback: this is the user's symptom
+		int32 PlanRejectShort     = 0;   // fewer than two LETHAL points exist yet
+		int32 PlanRejectBand      = 0;   // lethal points exist, but every one was filtered out
+		int32 PlanRejectTangent   = 0;   // chosen segment had two coincident points, no direction
+		int32 HuntTicksInDashRange = 0;  // a dash from here would reach the trace
+		int32 DashBlockedParallel = 0;   // heading nearly along the trace, not across it
+		int32 DashBlockedRange    = 0;   // trace further than the dash can carry
+		int32 DashBlockedAlign    = 0;   // velocity not yet turned onto the crossing line
+		int32 DashBlockedNoCharge = 0;   // no dash charge in hand
+		int32 DashBlockedNoCommit = 0;   // charge in hand, but this charge rolled "do not commit"
+
+		// The commit roll itself, because "no-commit=8504" does not say whether the roll is
+		// UNLUCKY or STUCK, and those want opposite fixes. rolls/armed is the observed commit rate;
+		// if it tracks FTraceBotProfile::TrailDashCommitChance the knob is behaving, and if `rolls`
+		// is a handful across a whole match the bots are sitting in the absorbing state instead.
+		int32 TrailCommitRolls = 0;
+		int32 TrailCommitArmed = 0;
+
+		/** Closest any hunter got to an enemy trace, perpendicular, uu. -1 if never measured. */
+		float HuntClosestPerp = -1.f;
+
+		/** Sum/count of the perpendicular gap on hunt ticks that had a plan, for a mean. */
+		double HuntPerpSum = 0.0;
+		int32  HuntPerpSamples = 0;
 	};
 
 	struct FState
@@ -600,6 +785,18 @@ namespace TraceBotTelemetry
 	static FKit& Kit()
 	{
 		return Get().Kit;
+	}
+
+	/** Records the perpendicular gap between a hunter and the trace point it planned to cross. */
+	static void NoteHuntPerp(float Perp)
+	{
+		FKit& K = Kit();
+		if (K.HuntClosestPerp < 0.f || Perp < K.HuntClosestPerp)
+		{
+			K.HuntClosestPerp = Perp;
+		}
+		K.HuntPerpSum += static_cast<double>(Perp);
+		++K.HuntPerpSamples;
 	}
 
 	static bool Enabled()
@@ -968,6 +1165,35 @@ namespace TraceBotTelemetry
 			K.PunisherTicks, K.PunisherShots,
 			K.EndzoneFlips, K.EndzoneUnresolved);
 
+		// SPEC v9 §1. The interception chain, link by link. Read it left to right and the first
+		// number that collapses is the bug: "plan=0 of 4000" means the bots never had a point on the
+		// trace to run at and were therefore pursuing the carrier, which is exactly what the user
+		// described; "plan high, in-range 0" means they had a plan and never reached it; "in-range
+		// high, dash=0" means they reached it and would not spend the charge.
+		auto HuntPct = [&K](int32 N) -> double
+		{
+			return (K.HuntTicks > 0) ? (100.0 * N / K.HuntTicks) : 0.0;
+		};
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotHunt] t=%.0fs | huntticks=%d plan=%d (%.1f%%) NO-PLAN=%d (%.1f%%) ")
+			TEXT("| plan refused: short=%d band=%d tangent=%d ")
+			TEXT("| in-dash-range=%d (%.1f%%) dashes=%d ")
+			TEXT("| dash refused: parallel=%d range=%d align=%d no-charge=%d no-commit=%d ")
+			TEXT("| commit rolls=%d armed=%d (%.0f%%) ")
+			TEXT("| perp to trace: closest=%.0fuu mean=%.0fuu"),
+			Elapsed,
+			K.HuntTicks, K.HuntTicksWithPlan, HuntPct(K.HuntTicksWithPlan),
+			K.HuntTicksNoPlan, HuntPct(K.HuntTicksNoPlan),
+			K.PlanRejectShort, K.PlanRejectBand, K.PlanRejectTangent,
+			K.HuntTicksInDashRange, HuntPct(K.HuntTicksInDashRange), K.TraceDashes,
+			K.DashBlockedParallel, K.DashBlockedRange, K.DashBlockedAlign,
+			K.DashBlockedNoCharge, K.DashBlockedNoCommit,
+			K.TrailCommitRolls, K.TrailCommitArmed,
+			(K.TrailCommitRolls > 0) ? (100.0 * K.TrailCommitArmed / K.TrailCommitRolls) : 0.0,
+			K.HuntClosestPerp,
+			(K.HuntPerpSamples > 0) ? (K.HuntPerpSum / K.HuntPerpSamples) : 0.0);
+
 		// Mode B, on its own line and only when it has anything to say. In mode A every one of these
 		// is zero and the line is suppressed, so its mere presence in a log is the evidence that the
 		// mode-B bot code ran — and its absence is the evidence that mode A did not touch it.
@@ -998,10 +1224,12 @@ namespace TraceBotTelemetry
 }
 
 #define TRACE_BOT_KIT(Field) (++TraceBotTelemetry::Kit().Field)
+#define TRACE_BOT_HUNT_PERP(Value) TraceBotTelemetry::NoteHuntPerp(Value)
 
 #else
 
 #define TRACE_BOT_KIT(Field) do {} while (0)
+#define TRACE_BOT_HUNT_PERP(Value) do {} while (0)
 
 #endif // !UE_BUILD_SHIPPING
 
@@ -1129,12 +1357,22 @@ void ATraceBotController::OnPossess(APawn* InPawn)
 	// changed while this bot was dead, because half time can happen during a respawn.
 	NextEndzoneResolveTime = 0.f;
 
-	// A fresh pawn spawns with its dash already charged, so there is no cooldown edge to roll on.
-	// Roll here and arm the edge detector as "was not ready", or the first charge of every life
-	// would inherit whatever the previous life happened to decide.
-	bDashReadyLastTick = false;
+	// A fresh pawn spawns with its dash already charged, so there is no refill edge to roll on. Roll
+	// here and zero the watermark, or the first charge of every life would inherit whatever the
+	// previous life happened to decide. Zero, not the live count: the count is read again next tick
+	// and a spawn that comes up charged must not look like a refill that has already been rolled.
+	LastSeenDashCharges = 0;
 	bCommitDashWithThisCharge =
 		FMath::FRand() < FMath::Clamp(UTraceSettings::GetBotProfile().TrailDashCommitChance, 0.f, 1.f);
+
+	// ...and if that roll declined, the hesitation starts now rather than at some stale time from a
+	// previous life. Zero would also work (any past time re-rolls immediately) but would give the
+	// first frame of every life a free second roll, which is the difficulty knob applied twice.
+	if (const UWorld* PossessWorld = GetWorld())
+	{
+		NextTrailCommitRollTime = static_cast<float>(PossessWorld->GetTimeSeconds())
+			+ TraceBotConstants::TrailCommitRetrySeconds;
+	}
 
 	// A fresh spawn gets the full reacquire delay before it may shoot anyone. Without it, ten bots
 	// respawning on the same frame all open fire on frame one, which is what a "wipe in 1.5s"
@@ -1320,18 +1558,69 @@ void ATraceBotController::Tick(float DeltaSeconds)
 	GatherWorldState();
 	TickDashCharges(DeltaSeconds);
 
-	// One roll per dash CHARGE, taken on the frame the cooldown clears. See the field comment: this
-	// is what gives FTraceBotProfile::TrailDashCommitChance a meaning a designer can reason about,
-	// and it is the difference between "the defence presses hard" and "the defence presses always".
+	// ---------------------------------------------------------------------------------------------
+	// One roll per dash CHARGE, taken on the frame a charge ARRIVES. See the field comment: this is
+	// what gives FTraceBotProfile::TrailDashCommitChance a meaning a designer can reason about, and
+	// it is the difference between "the defence presses hard" and "the defence presses always".
+	//
+	// SPEC v9 §1 — MEASURED, AND THE SECOND REASON THE SIGNATURE PLAY WAS MISSING. The edge used to
+	// be `charges > 0 && !was > 0`, and the flag was cleared by the interceptor the moment it ASKED
+	// to dash. Those two do not compose. RequestDash raises an intent; the pawn can still refuse it
+	// (UTraceCharacterMovementComponent::CanDash is false in the air, mid-dash, and for a few frames
+	// after landing), and when it does the charge count never changes — so there is no falling edge,
+	// therefore no rising edge, therefore NO RE-ROLL, and the bot sits on `bCommitDashWithThisCharge
+	// = false` for the rest of its life. A 60 s Hard sample refused 4963 of 8869 hunt ticks for
+	// "no-commit" against a profile that commits 95% of charges.
+	//
+	// So: the flag is no longer cleared on request, and the edge is on the charge COUNT RISING
+	// rather than on the boolean. A charge that was asked for and refused stays armed and is tried
+	// again next tick, which is what a defender standing next to a trace should do; a charge that
+	// was really spent comes back off the cooldown as a new charge and gets a fresh roll.
+	//
+	// SPEC v9 §1, THE REMAINING HALF — AND THE ONE THAT ACTUALLY HID THE MECHANIC.
+	//
+	// Fixing the EDGE was not enough, because "one roll per charge" is itself an absorbing state.
+	// A bot that rolls "do not commit" declines the crossing; declining means it never dashes;
+	// never dashing means the charge is never spent; a charge that is never spent never arrives
+	// again; and the rising edge that would re-roll therefore never happens. The bot is disarmed
+	// permanently — and it does not go and do something else, it stands in the dash pocket beside
+	// the trace pacing after the carrier, which is precisely the behaviour the user described.
+	//
+	// MEASURED on rung 1, Easy (TrailDashCommitChance 0.60), 110s: trace dashes per 10s window ran
+	// 1, 3, 3, 0, 0, 0, 0, 1, 1 — a burst at kickoff while every bot still had its first, unrolled
+	// charge, then nothing — while the share of hunt ticks spent INSIDE dash range held flat at
+	// ~52% and 8504 of 12216 planned ticks were refused for "no-commit". The bots kept arriving in
+	// position and kept not firing. A ratchet, not bad luck.
+	//
+	// A hunter that declines now hesitates for TrailCommitRetrySeconds and rolls again, so the knob
+	// reads as "how long does this difficulty dither before it commits" — Easy ~0.8s, Normal ~0.4s,
+	// Hard ~0.06s — and no setting of it can switch the signature play off. The charge-arrival roll
+	// is kept as well: a charge landing is a genuinely new decision and should not have to wait out
+	// a hesitation timer left over from the last one.
+	// ---------------------------------------------------------------------------------------------
 	{
-		const bool bDashReady = GetDashCharges() > 0;
+		const int32 Charges = GetDashCharges();
+		const float RollNow = (GetWorld() != nullptr) ? static_cast<float>(GetWorld()->GetTimeSeconds()) : 0.f;
 
-		if (bDashReady && !bDashReadyLastTick)
+		const bool bChargeArrived = (Charges > LastSeenDashCharges);
+		const bool bHesitationExpired = BotInterceptCommitFixEnabled()
+			&& (Charges > 0)
+			&& !bCommitDashWithThisCharge
+			&& (RollNow >= NextTrailCommitRollTime);
+
+		if (bChargeArrived || bHesitationExpired)
 		{
 			bCommitDashWithThisCharge =
 				FMath::FRand() < FMath::Clamp(UTraceSettings::GetBotProfile().TrailDashCommitChance, 0.f, 1.f);
+			NextTrailCommitRollTime = RollNow + TraceBotConstants::TrailCommitRetrySeconds;
+
+			TRACE_BOT_KIT(TrailCommitRolls);
+			if (bCommitDashWithThisCharge)
+			{
+				TRACE_BOT_KIT(TrailCommitArmed);
+			}
 		}
-		bDashReadyLastTick = bDashReady;
+		LastSeenDashCharges = Charges;
 	}
 
 	TimeUntilNextDecision -= DeltaSeconds;
@@ -2136,6 +2425,16 @@ void ATraceBotController::BehaviourHuntCarrier(float DeltaSeconds)
 	FVector TrailTangent = FVector::ZeroVector;
 	const bool bHaveTrail = FindTrailInterceptPoint(TrailPoint, TrailTangent);
 
+	TRACE_BOT_KIT(HuntTicks);
+	if (bHaveTrail)
+	{
+		TRACE_BOT_KIT(HuntTicksWithPlan);
+	}
+	else
+	{
+		TRACE_BOT_KIT(HuntTicksNoPlan);
+	}
+
 	// An interceptor has one job. But if the carrier's shield happens to be DOWN — they chose to
 	// pass while we were closing — then take the shot as well: killing a passing carrier is one of
 	// the three legal ways to take the Core (spec §2), and refusing it because "this bot is an
@@ -2153,17 +2452,47 @@ void ATraceBotController::BehaviourHuntCarrier(float DeltaSeconds)
 
 	if (!bHaveTrail)
 	{
-		// No usable trace yet (the carrier has only just taken it — spec §2 gives a 1 s grace before
-		// the trace even begins to form on a change of team — or every laid point is inside the
-		// head-grace window or about to expire). Cut them off rather than tail them: aim at a lead
-		// point in front of the carrier so a trace exists by the time we arrive.
-		const FVector CarrierVelocity = EnemyCarrier->GetVelocity();
-		const float LeadDistance = HalfFieldLength() * FMath::Max(0.f, Settings.BotEscortLeadFieldFraction);
-		const FVector LeadPoint = EnemyCarrier->GetActorLocation() + CarrierVelocity.GetSafeNormal2D() * LeadDistance;
+		// ------------------------------------------------------------------------------------------
+		// No usable trace yet — the carrier has only just taken it, or is standing still and laying
+		// nothing. SPEC v9 §1: THIS BRANCH IS THE REPORTED BUG, so it does not get to be a pursuit.
+		//
+		// It used to steer at `carrier + velocity * 0.18 x half-field`. Two failure modes, and the
+		// report describes both: the lead point is glued to the carrier's velocity, so the bot copies
+		// every turn they make; and when the carrier slows the lead collapses onto the carrier and
+		// the bot walks up and stands next to them. Neither ever crosses the trace, because the trace
+		// is behind the carrier and this aimed in front of them.
+		//
+		// The replacement runs at the line the trace is ABOUT to occupy — a fixed gap behind the
+		// carrier, offset a dash's reach to one side — so the bot is waiting beside the trace, facing
+		// across it, at the moment there is one to cross.
+		// ------------------------------------------------------------------------------------------
+		FVector Station = FVector::ZeroVector;
+		if (!BotInterceptFixEnabled())
+		{
+			// The v8 pursuit, kept behind `Trace.Bot.InterceptFix 0` so the reported symptom can be
+			// reproduced on demand from this build.
+			const FVector CarrierVelocity = EnemyCarrier->GetVelocity();
+			const float LeadDistance = HalfFieldLength() * FMath::Max(0.f, Settings.BotEscortLeadFieldFraction);
+			const FVector LeadPoint = EnemyCarrier->GetActorLocation() + CarrierVelocity.GetSafeNormal2D() * LeadDistance;
 
-		FVector ToLead = LeadPoint - MyLocation;
-		ToLead.Z = 0.f;
-		DesiredMoveDirection = ToLead.GetSafeNormal();
+			FVector ToLead = LeadPoint - MyLocation;
+			ToLead.Z = 0.f;
+			DesiredMoveDirection = ToLead.GetSafeNormal();
+		}
+		else if (FindCutBehindStation(Station))
+		{
+			FVector ToStation = Station - MyLocation;
+			ToStation.Z = 0.f;
+			DesiredMoveDirection = ToStation.GetSafeNormal();
+		}
+		else
+		{
+			// Nothing to cut behind at all (no facing, no velocity, no resolved end). Close the
+			// distance so that whatever happens next happens within reach.
+			FVector ToCarrier = EnemyCarrier->GetActorLocation() - MyLocation;
+			ToCarrier.Z = 0.f;
+			DesiredMoveDirection = ToCarrier.GetSafeNormal();
+		}
 		return;
 	}
 
@@ -2204,11 +2533,88 @@ void ATraceBotController::BehaviourHuntCarrier(float DeltaSeconds)
 	}
 
 	const float Overshoot = FMath::Max(0.f, Settings.BotTrailCrossOvershoot);
-	const FVector ThroughPoint = TrailPoint + CrossDirection * Overshoot;
+	const float DashRange = FMath::Max(50.f, Settings.BotTrailDashRange);
 
-	FVector ToThrough = ThroughPoint - MyLocation;
-	ToThrough.Z = 0.f;
-	DesiredMoveDirection = ToThrough.GetSafeNormal();
+	TRACE_BOT_HUNT_PERP(PerpDistance);
+	if (PerpDistance <= DashRange)
+	{
+		TRACE_BOT_KIT(HuntTicksInDashRange);
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v9 §1: THE POCKET.
+	//
+	// Whether this bot is allowed to cross the line right now is decided BEFORE the steering, not
+	// after it, because it changes where the bot should be standing.
+	//
+	//   * With a charge it may spend: aim PAST the trace, so the dash sweeps through it. (The old
+	//     code did this unconditionally.)
+	//   * Without one: hold just inside dash range on ITS OWN side of the line and pace along it.
+	//
+	// The second case is not caution, it is the difference between a defender and a bystander.
+	// Walking through a trace does nothing — only a dash trips it — so a hunter with its dash on
+	// cooldown that keeps steering at the through-point walks straight over the line, comes out the
+	// far side, turns round, and comes back. From the outside that is a bot milling around next to
+	// the carrier, which is half of what the report describes. Holding the pocket means the charge
+	// is spent the frame it lands, from a position the bot is already in.
+	// ---------------------------------------------------------------------------------------------
+	const bool bMayCross = !BotInterceptFixEnabled()
+		|| ((GetDashCharges() > 0) && bCommitDashWithThisCharge);
+
+	FVector Steer;
+	if (bMayCross)
+	{
+		const FVector ThroughPoint = TrailPoint + CrossDirection * Overshoot;
+		Steer = ThroughPoint - MyLocation;
+		Steer.Z = 0.f;
+	}
+	else
+	{
+		const float Pocket = DashRange * TraceBotConstants::TrailPocketDashRangeFraction;
+		const FVector PocketPoint = TrailPoint - CrossDirection * Pocket;
+
+		Steer = PocketPoint - MyLocation;
+		Steer.Z = 0.f;
+
+		// Pace ALONG the trace toward the carrier while holding. TrailTangent runs from the chosen
+		// point toward the head, i.e. toward the carrier, so this keeps the bot level with the run
+		// instead of being left behind by it — and a bot that has arrived at its pocket has a
+		// direction to move in rather than standing still.
+		//
+		// SPEC v9 §1: CLAMPED BY HOW FAR AHEAD THE POINT ACTUALLY IS. Unclamped this is a constant
+		// 280uu shove up the trace, and `Steer` is a difference vector that goes to zero as the bot
+		// arrives — so an arrived bot steered almost purely along the tangent, ran up the trace,
+		// past the head and into the carrier, then turned round and came back. That IS "following
+		// the exact motion of the carrier and standing by it": the pocket, which exists to stop the
+		// bot walking uselessly through the trace, was generating the other half of the same
+		// symptom. `Ahead` is positive only while the chosen point is still in front of us along
+		// the trace, so the pace dies exactly when the bot is level with it and reverses if it has
+		// overrun.
+		const float PaceWeight = TraceBotConstants::TrailPocketPaceWeight;
+		if (BotInterceptCommitFixEnabled())
+		{
+			const float Ahead = static_cast<float>(FVector::DotProduct(ToPoint, TrailTangent));
+			Steer += TrailTangent * FMath::Clamp(Ahead, -PaceWeight, PaceWeight);
+		}
+		else
+		{
+			Steer += TrailTangent * PaceWeight;
+		}
+	}
+
+	DesiredMoveDirection = Steer.GetSafeNormal();
+
+	if (GetDashCharges() <= 0)
+	{
+		TRACE_BOT_KIT(DashBlockedNoCharge);
+		return;
+	}
+
+	if (!bCommitDashWithThisCharge)
+	{
+		TRACE_BOT_KIT(DashBlockedNoCommit);
+		return;
+	}
 
 	// ---------------------------------------------------------------------------------------------
 	// When to actually spend the dash.
@@ -2224,6 +2630,7 @@ void ATraceBotController::BehaviourHuntCarrier(float DeltaSeconds)
 	const float CrossFraction = static_cast<float>(FVector::DotProduct(DesiredMoveDirection, CrossDirection));
 	if (CrossFraction <= TraceBotConstants::TrailDashAlignmentDot)
 	{
+		TRACE_BOT_KIT(DashBlockedParallel);
 		return;   // Running nearly parallel to the trace; closing further is better than dashing.
 	}
 
@@ -2231,9 +2638,9 @@ void ATraceBotController::BehaviourHuntCarrier(float DeltaSeconds)
 
 	// Dash reach is DashSpeed * DashDuration (~468uu by default). BotTrailDashRange must stay under
 	// it, or the dash stops short of the trace it is aimed at.
-	const float DashRange = FMath::Max(50.f, Settings.BotTrailDashRange);
 	if (DistanceToCross > DashRange)
 	{
+		TRACE_BOT_KIT(DashBlockedRange);
 		return;
 	}
 
@@ -2244,17 +2651,20 @@ void ATraceBotController::BehaviourHuntCarrier(float DeltaSeconds)
 	const bool bAligned = Heading.IsNearlyZero()
 		|| FVector::DotProduct(Heading, DesiredMoveDirection) > TraceBotConstants::TrailDashAlignmentDot;
 
-	if (!bAligned || !bCommitDashWithThisCharge)
+	if (!bAligned)
 	{
+		TRACE_BOT_KIT(DashBlockedAlign);
 		return;
 	}
 
 	// Never reserve here. Breaking the trace is the highest-value thing any dash in this game can
 	// do — it kills the carrier AND transfers the Core in one action — so a defender in position
 	// with a charge in hand spends it.
+	// NOT cleared here any more — see the roll block in Tick(). RequestDash raises an INTENT, and
+	// the pawn is allowed to refuse it; clearing the commit on the request meant one refused dash
+	// disarmed this bot permanently. The charge count coming back up is what ends this charge.
 	if (RequestDash(/*bReserveLast=*/false))
 	{
-		bCommitDashWithThisCharge = false;   // Spent. The next charge gets its own roll.
 		TRACE_BOT_KIT(TraceDashes);
 
 		UE_LOG(LogTraceGame, Verbose, TEXT("[BotIntercept] %s dashing across trace: perp %.0fuu, travel %.0fuu"),
@@ -4550,6 +4960,310 @@ bool ATraceBotController::HasLineOfSight(const AActor* Target) const
 
 bool ATraceBotController::FindTrailInterceptPoint(FVector& OutPoint, FVector& OutTangent) const
 {
+	if (!BotInterceptFixEnabled())
+	{
+		return FindTrailInterceptPointLegacy(OutPoint, OutTangent);
+	}
+
+	const ATraceCharacter* BotCharacter = GetBotCharacter();
+	const ATraceCharacter* EnemyCarrier = Carrier.Get();
+	if (BotCharacter == nullptr || EnemyCarrier == nullptr)
+	{
+		return false;
+	}
+
+	const UTraceTrailComponent* TrailComponent = EnemyCarrier->Trail;
+	if (TrailComponent == nullptr)
+	{
+		return false;
+	}
+
+	const TArray<FTraceTrailPoint>& Points = TrailComponent->TrailPoints.Items;
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// ---------------------------------------------------------------------------------------------
+	// 1. WHAT IS ACTUALLY LETHAL.
+	//
+	// Asked of the trail component rather than re-derived from TrailHeadGracePoints. The old code
+	// took `Points.Num() - TrailHeadGracePoints` wholesale, which has not been the server's rule
+	// since the head exemption became a DISTANCE (one trace radius) capped by that count — so the
+	// bots and the trip test disagreed about which end of the trace kills. ComputeLastLethalIndex()
+	// is the single function the trip test, the renderer and the parry verifier all read; a bot that
+	// asks anything else is planning against a trace that does not exist.
+	// ---------------------------------------------------------------------------------------------
+	const int32 LastLethal = FMath::Min(TrailComponent->ComputeLastLethalIndex(), Points.Num() - 1);
+
+	// A tangent needs two points, so one lethal point is not a segment.
+	if (LastLethal < 1)
+	{
+		TRACE_BOT_KIT(PlanRejectShort);
+		return false;
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// 2. HOW FAR BEHIND THE CARRIER EACH POINT IS, ALONG THE PATH.
+	//
+	// Along the path, not as the crow flies, and that is a real behavioural difference and not a
+	// nicety. A carrier who doubles back leaves trace that is a long way behind them in path terms
+	// and a few hundred uu away in space; it is fully lethal, it is the single most inviting thing
+	// on the field, and a straight-line test rejects it as "too close to the carrier". Path distance
+	// is also the only measure the length cap is expressed in, so it is the measure the trim
+	// prediction below has to use as well.
+	// ---------------------------------------------------------------------------------------------
+	TArray<float, TInlineAllocator<64>> BehindHead;
+	BehindHead.SetNumUninitialized(LastLethal + 1);
+
+	{
+		const int32 HeadIndex = Points.Num() - 1;
+		double Walked = 0.0;
+		for (int32 Index = HeadIndex; Index > LastLethal; --Index)
+		{
+			Walked += FVector::Dist(Points[Index - 1].Location, Points[Index].Location);
+		}
+
+		BehindHead[LastLethal] = static_cast<float>(Walked);
+		for (int32 Index = LastLethal; Index > 0; --Index)
+		{
+			Walked += FVector::Dist(Points[Index - 1].Location, Points[Index].Location);
+			BehindHead[Index - 1] = static_cast<float>(Walked);
+		}
+	}
+
+	const float HeadOffset = BehindHead[LastLethal];          // grace stub under the carrier's feet
+	const float TailDistance = BehindHead[0];                 // the whole lethal path, head to tail
+	const float UsableLength = FMath::Max(0.f, TailDistance - HeadOffset);
+
+	// ---------------------------------------------------------------------------------------------
+	// 3. THE TWO MARGINS — AND THE ARITHMETIC THAT USED TO CANCEL THE WHOLE TRACE.
+	//
+	// 900 (head) + 320 (tail) = 1220 against a 1200uu trace. Read as absolutes they overlapped and
+	// left nothing. Read as a share of the trace in front of us they cannot: 0.45 + 0.20 < 1.
+	// The settings values still bind whenever the trace is long enough for them to mean what they
+	// say, so a designer raising TrailMaxLengthUU gets the intended behaviour back automatically.
+	// ---------------------------------------------------------------------------------------------
+	const float RawHeadGap = FMath::Max(0.f, Settings.BotTrailMinDistanceFromCarrier);
+	const float RawTailSkip = FMath::Max(0.f, Settings.BotTrailMinPointLifeRemaining)
+		* FMath::Max(0.f, Settings.WalkSpeed);
+
+	const float HeadGap = FMath::Min(RawHeadGap,
+		HeadOffset + UsableLength * TraceBotConstants::TrailHeadGapMaxFraction);
+	const float TailSkip = FMath::Min(RawTailSkip,
+		UsableLength * TraceBotConstants::TrailTailSkipMaxFraction);
+	const float TailLimit = TailDistance - TailSkip;
+
+	// ---------------------------------------------------------------------------------------------
+	// 4. HOW LONG EACH POINT HAS LEFT.
+	//
+	// v7 §1 removed age expiry, so a point dies only when NEW trace at the head pushes the path past
+	// TrailMaxLengthUU: a point D behind the carrier is deleted once the carrier has run a further
+	// (MaxLength - D). Divide by the carrier's speed and that is seconds. A carrier standing still
+	// deletes nothing, which is why this has to be derived from their speed and not from a clock.
+	// ---------------------------------------------------------------------------------------------
+	const float MaxLength = UTraceTrailComponent::GetTraceMaxLengthUU();
+	const float CarrierSpeed = static_cast<float>(EnemyCarrier->GetVelocity().Size2D());
+	const float MySpeed = FMath::Max(200.f, Settings.WalkSpeed);
+
+	const FVector MyLocation = BotCharacter->GetActorLocation();
+
+	// ---------------------------------------------------------------------------------------------
+	// 5. CHOOSING. THREE TIERS, AND THE LAST ONE IS WHY THIS FUNCTION CAN NO LONGER RETURN FALSE
+	//    WITH A LETHAL TRACE IN FRONT OF IT.
+	//
+	//   1. in the band AND still there when we arrive   — what we want
+	//   2. in the band but the length cap will eat it   — worth running at anyway; by the time the
+	//                                                     bot arrives the carrier has laid more trace
+	//                                                     in roughly the same place
+	//   3. outside the band                             — a sparsely sampled trace (a dash lays
+	//                                                     points ~540uu apart) can genuinely have no
+	//                                                     vertex inside it; take the nearest one to
+	//                                                     the band rather than giving up
+	//
+	// Tier 3 is the guard rail. Falling through to "no plan" is what turns an interceptor into a
+	// pursuer, and that is the bug this whole section exists to make unreachable.
+	// ---------------------------------------------------------------------------------------------
+	int32 BestIndex = INDEX_NONE;
+	float BestScore = TNumericLimits<float>::Max();
+
+	int32 DoomedIndex = INDEX_NONE;
+	float DoomedScore = TNumericLimits<float>::Max();
+
+	int32 OutOfBandIndex = INDEX_NONE;
+	float OutOfBandError = TNumericLimits<float>::Max();
+
+	for (int32 Index = 0; Index < LastLethal; ++Index)
+	{
+		const FVector PointLocation = Points[Index].Location;
+
+		FVector Tangent = FVector(Points[Index + 1].Location) - PointLocation;
+		Tangent.Z = 0.f;
+		Tangent = Tangent.GetSafeNormal();
+		if (Tangent.IsNearlyZero())
+		{
+			continue;   // Two coincident points: no direction to cross.
+		}
+
+		const float Behind = BehindHead[Index];
+
+		if (Behind < HeadGap || Behind > TailLimit)
+		{
+			const float BandError = FMath::Max(HeadGap - Behind, Behind - TailLimit);
+			if (BandError < OutOfBandError)
+			{
+				OutOfBandError = BandError;
+				OutOfBandIndex = Index;
+			}
+			continue;
+		}
+
+		FVector ToPoint = PointLocation - MyLocation;
+		ToPoint.Z = 0.f;
+		const float Distance = static_cast<float>(ToPoint.Size());
+		const float ArriveSeconds = Distance / MySpeed;
+
+		// Crossing angle. 1 when the bot would arrive square to the trace, 0 when it would arrive
+		// along it. A dash along the line sweeps a segment parallel to the one it has to intersect
+		// and trips nothing, however close it gets — so a nearer point that can only be taken
+		// end-on is a worse target than a further one that can be taken side-on.
+		const FVector ApproachDirection = (Distance > KINDA_SMALL_NUMBER)
+			? (ToPoint / Distance)
+			: FVector::CrossProduct(FVector::UpVector, Tangent).GetSafeNormal();
+		const float Perpendicularity =
+			1.f - FMath::Abs(static_cast<float>(FVector::DotProduct(ApproachDirection, Tangent)));
+
+		const float Score = ArriveSeconds
+			* (1.f + TraceBotConstants::TrailApproachParallelPenalty * (1.f - Perpendicularity));
+
+		// Will it still be there when we get there? Only meaningful while the carrier is moving:
+		// a carrier standing still deletes nothing.
+		bool bSurvives = true;
+		if (CarrierSpeed > KINDA_SMALL_NUMBER)
+		{
+			const float TrimSeconds = FMath::Max(0.f, MaxLength - Behind) / CarrierSpeed;
+			bSurvives = TrimSeconds >= ArriveSeconds * TraceBotConstants::TrailTrimSafetyFactor;
+		}
+
+		if (bSurvives)
+		{
+			if (Score < BestScore)
+			{
+				BestScore = Score;
+				BestIndex = Index;
+			}
+		}
+		else if (Score < DoomedScore)
+		{
+			DoomedScore = Score;
+			DoomedIndex = Index;
+		}
+	}
+
+	if (BestIndex == INDEX_NONE)
+	{
+		BestIndex = (DoomedIndex != INDEX_NONE) ? DoomedIndex : OutOfBandIndex;
+	}
+
+	if (BestIndex == INDEX_NONE)
+	{
+		// Every lethal segment was degenerate — the carrier has been standing still long enough that
+		// the whole path is one blob. There is nothing to cross.
+		TRACE_BOT_KIT(PlanRejectTangent);
+		return false;
+	}
+
+	const FVector Chosen = Points[BestIndex].Location;
+	FVector ChosenTangent = FVector(Points[BestIndex + 1].Location) - Chosen;
+	ChosenTangent.Z = 0.f;
+	ChosenTangent = ChosenTangent.GetSafeNormal();
+
+	if (ChosenTangent.IsNearlyZero())
+	{
+		TRACE_BOT_KIT(PlanRejectTangent);
+		return false;
+	}
+
+	OutPoint = Chosen;
+	OutTangent = ChosenTangent;
+	return true;
+}
+
+bool ATraceBotController::FindCutBehindStation(FVector& OutStation) const
+{
+	const ATraceCharacter* BotCharacter = GetBotCharacter();
+	const ATraceCharacter* EnemyCarrier = Carrier.Get();
+	if (BotCharacter == nullptr || EnemyCarrier == nullptr)
+	{
+		return false;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const FVector MyLocation = BotCharacter->GetActorLocation();
+	const FVector CarrierLocation = EnemyCarrier->GetActorLocation();
+
+	FVector CarrierVelocity = EnemyCarrier->GetVelocity();
+	CarrierVelocity.Z = 0.f;
+	const float CarrierSpeed = static_cast<float>(CarrierVelocity.Size());
+
+	// Which way the trace extends FROM the carrier: straight back down their line of travel.
+	//
+	// When they are barely moving there is no line of travel to use, so fall back to the geometry of
+	// the pitch: a carrier runs at the end they score in, so the trace they are about to lay points
+	// at the end THIS bot scores in. AttackSideSign is that end, already resolved and already
+	// half-time-correct.
+	FVector TraceDirection;
+	if (CarrierSpeed > TraceBotConstants::TrailCutBehindMinCarrierSpeed)
+	{
+		TraceDirection = CarrierVelocity / CarrierSpeed;
+		TraceDirection = -TraceDirection;
+	}
+	else if (AttackSideSign != 0.f)
+	{
+		TraceDirection = FVector(AttackSideSign, 0.f, 0.f);
+	}
+	else
+	{
+		TraceDirection = (MyLocation - CarrierLocation).GetSafeNormal2D();
+	}
+
+	if (TraceDirection.IsNearlyZero())
+	{
+		return false;
+	}
+
+	// How far back down that line to stand. The same head gap the intercept filter uses, budgeted
+	// the same way against the trace's own maximum length so the station is a place trace can
+	// actually be. Spread along the line by this bot's formation bias so three interceptors do not
+	// converge on one spot and shove each other off it.
+	const float MaxLength = UTraceTrailComponent::GetTraceMaxLengthUU();
+	const float Gap = FMath::Min(
+		FMath::Max(0.f, Settings.BotTrailMinDistanceFromCarrier),
+		MaxLength * TraceBotConstants::TrailHeadGapMaxFraction)
+		* (1.f + 0.35f * FormationBias);
+
+	const FVector Anchor = CarrierLocation + TraceDirection * FMath::Max(120.f, Gap);
+
+	// Stand OFF the line, on the side the bot is already on, at roughly a dash's reach — so the
+	// approach is across the future trace rather than along it, and the crossing is one dash away
+	// the moment the trace exists.
+	FVector Perpendicular = FVector::CrossProduct(FVector::UpVector, TraceDirection).GetSafeNormal();
+	if (Perpendicular.IsNearlyZero())
+	{
+		Perpendicular = FVector(0.f, 1.f, 0.f);
+	}
+
+	FVector AnchorToMe = MyLocation - Anchor;
+	AnchorToMe.Z = 0.f;
+	const float Side = (FVector::DotProduct(AnchorToMe, Perpendicular) >= 0.f) ? 1.f : -1.f;
+
+	const float Standoff = FMath::Max(50.f, Settings.BotTrailDashRange)
+		* TraceBotConstants::TrailPocketDashRangeFraction;
+
+	OutStation = Anchor + Perpendicular * (Side * Standoff);
+	OutStation.Z = MyLocation.Z;
+	return true;
+}
+
+bool ATraceBotController::FindTrailInterceptPointLegacy(FVector& OutPoint, FVector& OutTangent) const
+{
 	const ATraceCharacter* BotCharacter = GetBotCharacter();
 	const ATraceCharacter* EnemyCarrier = Carrier.Get();
 	if (BotCharacter == nullptr || EnemyCarrier == nullptr)
@@ -4576,6 +5290,7 @@ bool ATraceBotController::FindTrailInterceptPoint(FVector& OutPoint, FVector& Ou
 	// A tangent needs two points, so one usable point is not a segment.
 	if (Usable < 2)
 	{
+		TRACE_BOT_KIT(PlanRejectShort);
 		return false;
 	}
 
@@ -4653,6 +5368,7 @@ bool ATraceBotController::FindTrailInterceptPoint(FVector& OutPoint, FVector& Ou
 
 	if (BestIndex == INDEX_NONE)
 	{
+		TRACE_BOT_KIT(PlanRejectBand);
 		return false;
 	}
 
@@ -4665,6 +5381,7 @@ bool ATraceBotController::FindTrailInterceptPoint(FVector& OutPoint, FVector& Ou
 	{
 		// Two coincident points (the carrier stood still). No direction to cross, so treat it as no
 		// usable trace rather than crossing an arbitrary way and burning a charge.
+		TRACE_BOT_KIT(PlanRejectTangent);
 		return false;
 	}
 

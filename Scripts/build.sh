@@ -190,6 +190,56 @@ if [ "$TRACE_DRY_RUN" = "1" ]; then
 fi
 
 trace_msg "Success in ${ELAPSED}s."
+
+# ------------------------------------------------------------------------------
+# Guard against the stale-metadata trap
+#
+# UnrealEditor.modules tells the engine WHICH dylib to load. Writing it is a
+# SEPARATE UnrealBuildTool action (WriteMetadata) that frequently does not run in
+# a build that only compiled and linked. Measured repeatedly on this project: a
+# build ends "[2/2] Link ...-0042.dylib" with .modules still naming 0041.
+#
+# The consequence is the nastiest failure mode this project has: the build says
+# "Succeeded", the game launches happily, and you are running the PREVIOUS
+# binary. It has already cost real time twice — once as "the game keeps
+# restarting and nothing changes", and once as a collaborator reporting missing
+# features that were in fact never in the build they were running.
+#
+# So: check it, and repair it by re-running the build (a second invocation has
+# nothing to compile, so WriteMetadata is the only action left and it runs).
+# ------------------------------------------------------------------------------
+trace_check_module_metadata() {
+    local BinDir="${TRACE_PROJECT_ROOT}/Binaries/${TRACE_HOST_PLATFORM}"
+    local Modules="${BinDir}/UnrealEditor.modules"
+    [ -f "$Modules" ] || return 0
+
+    local Newest Named
+    Newest="$(ls -t "${BinDir}"/libUnrealEditor-${TRACE_PROJECT_NAME}-*.dylib 2>/dev/null | head -1)"
+    [ -n "$Newest" ] || return 0
+    Newest="$(basename "$Newest")"
+    Named="$(tr ',' '\n' < "$Modules" | grep -o "libUnrealEditor-${TRACE_PROJECT_NAME}-[0-9]*\.dylib" | head -1)"
+    [ -n "$Named" ] || return 0
+
+    [ "$Named" = "$Newest" ] && return 0
+
+    trace_warn "Module metadata is STALE: UnrealEditor.modules names ${Named}, but ${Newest} is on disk."
+    trace_warn "The engine would load the OLD binary. Re-running the build to force WriteMetadata..."
+    if trace_run "$BUILD_SH" "${ARGS[@]}" >/dev/null 2>&1; then
+        Named="$(tr ',' '\n' < "$Modules" | grep -o "libUnrealEditor-${TRACE_PROJECT_NAME}-[0-9]*\.dylib" | head -1)"
+        if [ "$Named" = "$Newest" ]; then
+            trace_msg "Module metadata repaired — now names ${Named}."
+            return 0
+        fi
+    fi
+    trace_err "Module metadata is STILL stale (${Named} vs ${Newest} on disk)."
+    trace_err "You would be running an OLD binary. Delete Binaries/ and Intermediate/ and rebuild."
+    return 1
+}
+
+if [ "$TRACE_DRY_RUN" != "1" ] && [ "$DO_CLEAN" != "1" ]; then
+    trace_check_module_metadata || exit 1
+fi
+
 case "$TARGET" in
     TraceEditor)
         trace_msg "Next: open the project, or run a listen server with Scripts/run-listen-server.sh"

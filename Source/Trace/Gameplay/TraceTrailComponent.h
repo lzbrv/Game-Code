@@ -22,6 +22,16 @@
 // There is deliberately no surviving time-based expiry anywhere in this file; reintroducing one
 // reintroduces the exploit. The 0.4s TURNOVER GRACE is a separate mechanism and still applies.
 //
+// THE TRACE BELONGS TO POSSESSION, AND ENDS WITH IT (spec v9 §§3-4). Points may exist only while
+// this component is emitting for a live owner who is holding the Core. The instant possession leaves
+// — pass, mode-B throw, death, disconnect, goal, half time, kickoff, match end — the trace is wiped,
+// visually and lethally, in the same call stack as the possession change. See SetEmitting(), and the
+// invariant TickComponent asserts every server frame.
+//
+// THAT IS NOT A LIFETIME AND MUST NEVER BE TURNED INTO ONE. It is triggered by an event, not by a
+// clock: a carrier standing still with the Core keeps every point they have laid, which is what
+// killed the stand-still exploit in v7 §1 and has to stay killed.
+//
 // Three rules sit on top of that and are implemented here:
 //
 //   GRACE (§2)          After the Core changes TEAM, the trace does not begin to form for
@@ -225,12 +235,29 @@ public:
 	// ------------------------------------------------------------------------------------------
 
 	/**
-	 * Server: start or stop laying the trace. Starting wipes whatever was there so a new holder
-	 * never inherits the previous holder's trace. Harmless no-op on clients.
+	 * Server: start or stop laying the trace. Harmless no-op on clients.
 	 *
-	 * Deliberately idempotent and re-assertable: ATraceCore re-calls this every tick, because
-	 * several foreign systems (score reset, death handling) switch every trail in the match off
-	 * wholesale and there is no pickup event left to switch the holder's back on.
+	 * STARTING wipes whatever was there, so a new holder never inherits the previous holder's trace.
+	 *
+	 * STOPPING WIPES IT TOO (spec v9 §§3-4), and that is a rule rather than a tidy-up. Every way
+	 * possession can end — a completed pass, a mode-B throw, the carrier being killed, the carrier
+	 * disconnecting, a goal, half time, a kickoff, the end of the match — funnels through
+	 * ATraceCore::ReleaseHolder(), which ends in exactly one call to this function. So this is the
+	 * single place that can honour "the trace disappears the instant a pass is made", and it does it
+	 * in the same call stack as the possession change: no fade, no grace, no one-frame window in
+	 * which the trip test could still see the points.
+	 *
+	 * It used to stop WITHOUT clearing, on the reasoning that a residual trace was harmless and would
+	 * fade out on its own. Neither was true after v7 §1 deleted time-based expiry: nothing retires a
+	 * point except new trace arriving at the head, and the trip test gates on the POINTS rather than
+	 * on emission — so the abandoned trace was immortal and it went on killing the player who laid
+	 * it. See the implementation for the full account.
+	 *
+	 * Deliberately idempotent and re-assertable: ATraceCore re-calls this every tick
+	 * (EnforceHolderTrailState), because several foreign systems (score reset, death handling) switch
+	 * every trail in the match off wholesale and there is no pickup event left to switch the holder's
+	 * back on. A REDUNDANT STOP STILL CLEARS — see the early-out — so a component that somehow ends
+	 * up holding points with emission already off is swept by the next assertion rather than never.
 	 */
 	void SetEmitting(bool bEmit);
 

@@ -566,6 +566,69 @@ namespace
 	 */
 	constexpr float TrailClearSuppressSeconds = 0.35f;
 
+	// =============================================================================================
+	// SPEC v9 §§3-4 — THE TRACE DIES WITH POSSESSION. THE A/B ARM, AND THE STALE-KILL COUNTER.
+	//
+	// THE BUG, in one sentence: ATraceCore::ReleaseHolder() is the single funnel every possession
+	// end goes through — completed pass, mode-B throw, carrier killed, carrier disconnected, goal,
+	// half time, kickoff, match end — and all it did was SetEmitting(false), on the stated grounds
+	// that "an expiring trace is counterplay the enemy team has already earned" and it would fade
+	// out on its own. THAT FADE NO LONGER EXISTS. Demo 7 (v7 §1) deleted time-based expiry outright
+	// to kill the stand-still exploit, so a point is now retired ONLY by new trace arriving at the
+	// head. A component that has stopped emitting lays no new trace, so nothing ever retires
+	// anything, so the trace is IMMORTAL.
+	//
+	// And it is immortal AND LETHAL, because the trip test's gate is the POINTS, not bEmitting
+	// (ServerRunTripTest), and ComputeLastLethalIndex() answers "the whole array" the moment
+	// emission stops. Which produces both reported symptoms from one cause:
+	//
+	//   §3  "when a player passes/throws the core ... their trace [takes a second] to disappear and
+	//        they can still be killed"  — they can be killed by it FOREVER, not for a second.
+	//   §4  "traces stay on the map way after the carrier is dead or has made a pass"
+	//
+	// The orphan sweep in TickComponent could not catch it either: it was gated on the OWNER being
+	// dead or gone, and a player who passes to a living teammate is neither.
+	//
+	// THE FIX IS OWNERSHIP, NOT A TIMER. Possession ending clears the trace, and points may only
+	// exist while this component is actively emitting for a live owner. Nothing here reintroduces a
+	// lifetime; a stationary carrier who still holds the Core still keeps every point they laid, so
+	// the stand-still exploit stays dead.
+	// =============================================================================================
+
+	/**
+	 * 1 (default): the trace is cleared the instant possession leaves. 0: the pre-v9 behaviour —
+	 * stop emitting and leave the points standing.
+	 *
+	 * IT EXISTS TO BE MEASURED AGAINST, and for no other reason. Same justification as the legacy
+	 * renderer arm behind Trace.Trail.Renderer 0: this pass has to be able to show the reported
+	 * symptom happening and then show it not happening, on ONE build, in the SAME match, or the
+	 * "fix" is an assertion. Trace.Trail.ClearWatch and Trace.Trail.ClearAudit are the two probes.
+	 *
+	 * Never ship 0. It is a live unfair-death bug and it is not compiled into Shipping at all.
+	 */
+	int32 GClearTraceOnPossessionLoss = 1;
+
+#if !UE_BUILD_SHIPPING
+	FAutoConsoleVariableRef CVarClearTraceOnPossessionLoss(
+		TEXT("Trace.Trail.ClearOnPossessionLoss"),
+		GClearTraceOnPossessionLoss,
+		TEXT("1 (default, spec v9 3-4): a trace is wiped — visually and lethally — the instant the Core "
+		     "leaves its owner, by any route. 0 restores the pre-v9 orphan behaviour for A/B measurement "
+		     "ONLY; it is an unfair-death bug. Pair with Trace.Trail.ClearWatch / Trace.Trail.ClearAudit."),
+		ECVF_Cheat);
+#endif
+
+	/**
+	 * THE UNFAIR DEATH, COUNTED WHERE IT HAPPENS (spec v9 §3).
+	 *
+	 * A trace kill whose victim was NOT holding the Core at the moment they died: they passed it
+	 * away, and their own abandoned trace killed them anyway. That is the exact death the user
+	 * describes, so it is counted in ApplyTrailTrip rather than inferred from the log afterwards —
+	 * an unattended bot match then produces a number for it, and the number must be zero.
+	 */
+	int32 GTrailKillsTotal = 0;
+	int32 GTrailKillsOnNonCarrier = 0;
+
 	/**
 	 * Sweeps longer than this are treated as teleports (respawn, post-score reposition) rather
 	 * than movement, and are not tested — otherwise the segment from a player's pre-respawn
@@ -944,19 +1007,58 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 
 	if (Owner->HasAuthority())
 	{
-		// §3: the trace dies with its holder, instantly. ATraceCore drives this in the normal flow;
-		// this is the safety net so a trace can never outlive the body that owns it and go on
-		// killing a corpse.
+		// ------------------------------------------------------------------------------------------
+		// THE INVARIANT, ASSERTED EVERY SERVER FRAME (spec v9 §§3-4):
 		//
-		// Checked whether or not this component is still emitting. A trace kills the player who
-		// LAID it, so once that player is dead it can never kill anyone again — and by the
-		// visible == lethal invariant a set of points that can never kill must not be on screen.
-		// (Before, this was inside an `if (bEmitting)`, so a holder who passed the Core away and
-		// then died left their trace hanging in the air, visible and completely inert.)
+		//     TRAIL POINTS MAY EXIST ONLY WHILE THIS COMPONENT IS EMITTING FOR A LIVE OWNER WHO IS
+		//     ACTUALLY HOLDING THE CORE. Anything else is an ORPHAN and is wiped on this frame.
+		//
+		// WHAT THIS REPLACED, AND WHY IT WAS THE BUG. The old condition was
+		//
+		//     (Holder == nullptr || !Holder->IsAlive()) && (bEmitting || Items.Num() > 0)
+		//
+		// i.e. it only ever fired for a DEAD OR DESTROYED owner. A player who PASSES to a living
+		// teammate is neither: they are alive, standing there, no longer the carrier — and their trace
+		// did not qualify for cleanup by any clause. Since v7 §1 removed time-based expiry there was
+		// no backstop left either, so those points lived until the passer next died. That single gate
+		// produced both reported symptoms (spec v9 §§3-4), exactly as the spec's lead said it would.
+		//
+		// WHY THE TEST IS WRITTEN ON THIS COMPONENT'S OWN STATE and not on "is the Core's holder me":
+		// bEmitting and liveness are facts this component owns and can never be wrong about, while
+		// the Core's opinion of the holder arrives through ATraceCharacter::SetCarrying and could
+		// legitimately be one call deep at the instant this runs. IsCarrier() is still consulted — it
+		// catches a route that forgot to stop the emission altogether — but it is reported when it is
+		// the clause that fires, because that would mean a possession-end path is bypassing
+		// ReleaseHolder() and the log should say so rather than silently paper over it.
+		//
+		// This is a SAFETY NET, not the mechanism. SetEmitting(false) already cleared, in the same
+		// call stack as the possession change; if this ever fires, something reached "not a carrier"
+		// without going through it, and the trace is still gone on the very next server frame.
 		{
 			const ATraceCharacter* Holder = GetOwnerCharacter();
-			if ((Holder == nullptr || !Holder->IsAlive()) && (bEmitting || TrailPoints.Items.Num() > 0))
+			const bool bOwnerGone = (Holder == nullptr) || !Holder->IsAlive();
+			const bool bHasTrace = bEmitting || TrailPoints.Items.Num() > 0;
+
+			// Emission without possession: a route that ended possession without stopping this
+			// component. Never expected; always logged if seen.
+			const bool bEmittingWithoutCore = !bOwnerGone && bEmitting && !Holder->IsCarrier();
+
+			// Points without emission: possession already ended and the clear did not happen.
+			const bool bPointsWithoutEmission = !bEmitting && TrailPoints.Items.Num() > 0;
+
+			if (bHasTrace && (bOwnerGone || bEmittingWithoutCore
+				|| (bPointsWithoutEmission && GClearTraceOnPossessionLoss != 0)))
 			{
+				if (bEmittingWithoutCore || (bPointsWithoutEmission && !bOwnerGone))
+				{
+					UE_LOG(LogTraceGame, Log,
+						TEXT("[TRACEORPHAN] %s: swept an orphaned trace (%d points, emitting=%d, alive=%d, "
+						     "carrier=%d). The possession-end path did not clear it — see SetEmitting()."),
+						*GetNameSafe(GetOwner()), TrailPoints.Items.Num(), bEmitting ? 1 : 0,
+						(Holder != nullptr && Holder->IsAlive()) ? 1 : 0,
+						(Holder != nullptr && Holder->IsCarrier()) ? 1 : 0);
+				}
+
 				SetEmitting(false);
 				ClearTrail();
 			}
@@ -1071,6 +1173,22 @@ void UTraceTrailComponent::SetEmitting(bool bEmit)
 
 	if (bEmitting == bEmit)
 	{
+		// SPEC v9 §3, AND THIS EARLY-OUT IS HALF OF WHY THE BUG SURVIVED A "STOP EMITTING" CALL.
+		//
+		// The stop is IDEMPOTENT but the CLEAR was not reached through it: the first SetEmitting(false)
+		// flipped the flag, and every later assertion — the GameMode wiping every trail on a goal, on
+		// half time, on a kickoff, ATraceCharacter::HandleDeath's belt-and-braces call — returned right
+		// here without ever looking at the points. So a component that had somehow been left holding
+		// points with bEmitting already false could never be swept up by anything short of its owner
+		// dying. Answering the points as well as the flag makes "stop" mean "and leave nothing behind"
+		// on EVERY call rather than only on the first.
+		//
+		// ClearTrail() is itself guarded on there being something to clear, so the common case (a
+		// non-carrier being told to stop for the tenth time) is still two branches and no RPC.
+		if (!bEmit && GClearTraceOnPossessionLoss != 0)
+		{
+			ClearTrail();
+		}
 		return;
 	}
 
@@ -1094,11 +1212,43 @@ void UTraceTrailComponent::SetEmitting(bool bEmit)
 		// Not emitting means not in a grace window either. Leaving a stale deadline behind would
 		// eat the first second of the NEXT emission window this component ever opens.
 		EmitGraceEndServerTime = 0.f;
-	}
 
-	// Note: stopping does NOT clear. A trace left behind by a completed pass is harmless (the trip
-	// test requires bEmitting) and fading out over its lifetime reads much better than popping.
-	// Death is the case that must clear instantly, and it does so explicitly.
+		// ==========================================================================================
+		// SPEC v9 §§3-4. STOPPING CLEARS. THIS LINE IS THE FIX, AND EVERY POSSESSION-END ROUTE IN THE
+		// GAME ARRIVES AT IT.
+		//
+		// The comment that used to stand here said the opposite — "stopping does NOT clear ... a trace
+		// left behind by a completed pass is harmless (the trip test requires bEmitting) and fading
+		// out over its lifetime reads much better than popping". BOTH OF ITS PREMISES ARE NOW FALSE,
+		// and they were falsified by two later changes that each looked local and correct:
+		//
+		//   * "the trip test requires bEmitting" — it does not, and deliberately so. The gate is the
+		//     POINTS (see ServerRunTripTest's block comment), because a residual trace being inert was
+		//     itself once a reported bug. So the passer's abandoned trace does not merely hang in the
+		//     air, IT KILLS THEM. Being killed by trace you laid while holding a Core you no longer
+		//     hold is the unfair death §3 is about.
+		//   * "fading out over its lifetime" — there is no lifetime. v7 §1 removed time-based expiry
+		//     to kill the stand-still exploit, and points now leave only when NEW trace pushes them
+		//     off. A component that has stopped emitting lays no new trace, so its points are retired
+		//     by nothing, ever. That is §4's "traces stay on the map way after ... a pass", verbatim.
+		//
+		// WHY HERE AND NOT AT THE CALL SITES. ATraceCore::ReleaseHolder() is the documented single
+		// funnel — "every path that takes the Core off somebody funnels through here - a completed
+		// pass, a kill, a disconnect, a score, half time" — and it ends in exactly one call, to this
+		// function. Mode B's throw, the goal reset, the half-time wipe and the kickoff all reach it
+		// the same way. Clearing here therefore covers all eight of the routes spec v9 §4 lists,
+		// including any future ninth, and it does it in the SAME CALL STACK as the possession change:
+		// no grace, no fade, no one-frame window in which the trip test could still see the points.
+		//
+		// THIS IS NOT A TIMER AND DOES NOT REINTRODUCE ONE. It is triggered by an event — possession
+		// leaving — and a carrier who stands still holding the Core is still emitting, so nothing here
+		// touches them. The stand-still exploit stays dead.
+		if (GClearTraceOnPossessionLoss != 0)
+		{
+			ClearTrail();
+		}
+		// ==========================================================================================
+	}
 
 	UE_LOG(LogTraceGame, Verbose, TEXT("Trace: %s emitting for %s"),
 		bEmit ? TEXT("started") : TEXT("stopped"), *GetNameSafe(GetOwner()));
@@ -1403,8 +1553,16 @@ int32 UTraceTrailComponent::ComputeLastLethalIndex() const
 	}
 
 	// Nobody is standing on the head of a trace that has stopped growing, so there is nothing to
-	// exempt: a residual trace left behind by a pass or a Core steal is lethal end to end. This is
-	// half of the reported bug — see ServerRunTripTest for the other half.
+	// exempt: a residual trace is lethal end to end.
+	//
+	// SPEC v9 §§3-4 MADE THIS BRANCH ALL BUT UNREACHABLE ON THE AUTHORITY, and that is the fix rather
+	// than a reason to delete it. Possession leaving now clears the points in the same call stack, so
+	// "not emitting AND still holding points" is no longer a state the server can be in — and this
+	// branch was the teeth on the trace that outlived a pass: it promoted every last point, including
+	// the one under the ex-carrier's own feet, into the lethal set. It stays because it is still the
+	// correct answer for the frame a clear is in flight, for a client reading a not-yet-emptied
+	// array, and for the pre-v9 A/B arm (Trace.Trail.ClearOnPossessionLoss 0), which needs the old
+	// behaviour intact to be worth measuring against.
 	if (!bEmitting)
 	{
 		return PointCount - 1;
@@ -2471,6 +2629,42 @@ bool UTraceTrailComponent::ServerAdvancePendingTrip(ATraceCharacter* Holder, flo
 		return false;
 
 	case TraceParry::EHeldTrip::KillNow:
+		// ------------------------------------------------------------------------------------------
+		// SPEC v9 §3 — THE LAST WAY A CLEARED TRACE COULD STILL KILL, AND IT IS NOT THE POINT ARRAY.
+		//
+		// A trip is not resolved on the frame the dasher crosses: TraceParry HOLDS it for the parry
+		// window so the carrier gets their 0.2s to answer. Arbitrary frames therefore pass between
+		// "they dashed through it" and "they die for it", and possession can END inside that gap —
+		// a goal, half time, a kickoff, a mode-B throw, a disconnect, a kill-steal are all
+		// instantaneous. Clearing the points does nothing about a kill already in flight, so without
+		// this branch the fix above would still let a player die to a trace that is provably gone
+		// from the world, after they had already given up the Core. That is exactly §3's unfair
+		// death, arriving by the one route that does not read TrailPoints.
+		//
+		// The comment this replaces argued the other way for the ORDINARY case and was right about
+		// it: "a turnover or a pass clearing the ribbon a frame or two later must not refund the
+		// dasher's kill". That still holds — ServerRunTripTest's empty-trail branch keeps resolving
+		// held trips and this drops NOTHING unless possession itself left. The two conditions are
+		// ANDed for that reason: not a carrier any more, AND the points went with it, which together
+		// only describe a possession end that ran ClearTrail. A carrier who is still carrying, or
+		// whose trace merely got shorter, is untouched and still dies.
+		//
+		// Read through GClearTraceOnPossessionLoss so the A/B arm stays a true pre-v9 build: with the
+		// fix off, this kill lands exactly as it always did, and Trace.Trail.ClearAudit can still show
+		// the symptom.
+		if (GClearTraceOnPossessionLoss != 0 && Holder->IsAlive() && !Holder->IsCarrier()
+			&& TrailPoints.Items.Num() == 0)
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[TRACEDASH] held trip %s -> %s dropped after %.0fms: the Core LEFT %s while the trip "
+				     "was held and their trace was cleared with it. Spec v9 3 — a trace that no longer "
+				     "exists does not kill the player who no longer holds the Core."),
+				*GetNameSafe(Dasher), *GetNameSafe(Holder), PendingTripHeldSeconds * 1000.f,
+				*GetNameSafe(Holder));
+			ServerCancelPendingTrip();
+			return false;
+		}
+
 		// Both liveness checks are re-done HERE and not at the sweep: with a hold, arbitrary frames
 		// pass between "they dashed through it" and "they die for it", and either pawn may have died
 		// of something else in between. Killing a corpse would double-count in the kill feed.
@@ -2522,8 +2716,34 @@ void UTraceTrailComponent::ApplyTrailTrip(ATraceCharacter* Holder, ATraceCharact
 
 	const ETrailLethality Lethality = UTraceSettings::Get().TrailLethality;
 
-	UE_LOG(LogTraceGame, Log, TEXT("Trace broken: %s dashed through %s's trace (lethality %d)"),
-		*GetNameSafe(Tripper), *GetNameSafe(Holder), static_cast<int32>(Lethality));
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v9 §3, COUNTED AT THE POINT OF DEATH.
+	//
+	// "Being killed by your own stale trace AFTER you no longer hold the Core is the worst kind of
+	// unfair death." That sentence is a property of THIS call: the victim is the player who laid the
+	// trace, and either they still hold the Core (fair — the trace is the counterplay to their shield)
+	// or they do not (unfair — they passed it away and died to their own leftovers).
+	//
+	// It is counted here rather than reconstructed from the log afterwards because it is the one
+	// number that says whether the reported bug is happening in a REAL match through the REAL trip
+	// test, as opposed to in a scripted harness. Trace.Trail.ClearAudit prints it. It must be 0.
+	// ---------------------------------------------------------------------------------------------
+	++GTrailKillsTotal;
+	const bool bVictimStillHeldTheCore = Holder->IsCarrier();
+	if (!bVictimStillHeldTheCore)
+	{
+		++GTrailKillsOnNonCarrier;
+
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[STALETRACEKILL] %s was killed by their OWN trace while NOT holding the Core "
+			     "(dasher %s, emitting=%d, %d points still standing). Spec v9 3: the trace should have "
+			     "been gone the instant possession left."),
+			*GetNameSafe(Holder), *GetNameSafe(Tripper), IsEmitting() ? 1 : 0, TrailPoints.Items.Num());
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("Trace broken: %s dashed through %s's trace (lethality %d, victim was %s)"),
+		*GetNameSafe(Tripper), *GetNameSafe(Holder), static_cast<int32>(Lethality),
+		bVictimStillHeldTheCore ? TEXT("the carrier") : TEXT("NOT the carrier - unfair"));
 
 	if (Lethality == ETrailLethality::KillsCarrier || Lethality == ETrailLethality::KillsBoth)
 	{
@@ -6782,6 +7002,1119 @@ namespace
 				{
 					return TickHeadGapTest(State);
 				}));
+		}));
+
+	// =============================================================================================
+	// SPEC v9 §§3-4 — THE TWO PROBES FOR "THE TRACE MUST BE GONE THE INSTANT POSSESSION LEAVES".
+	//
+	// Trace.Trail.ClearWatch   PASSIVE. Watches every trail in the match, every frame, and reports
+	//                          any that is holding points or drawing geometry while its owner is not
+	//                          a live carrier. Runs on the HOST or on a JOINED CLIENT, because "the
+	//                          trace disappeared" is a claim about what a player SEES and the host is
+	//                          the one machine that cannot answer it. This is the §4 measurement.
+	//
+	// Trace.Trail.ClearAudit   ACTIVE, server-side. Forces the exact reported event — a completed
+	//                          pass to a LIVING TEAMMATE — and then measures two things about the
+	//                          passer's trace: how long it takes to disappear, and whether it can
+	//                          still kill them while it lingers. This is the §3 measurement, and the
+	//                          kill half is the unfair death in the user's own words.
+	//
+	// BOTH ARE WRITTEN TO GO RED. Pair either with `Trace.Trail.ClearOnPossessionLoss 0` and the
+	// pre-v9 behaviour comes back, so a run can show the symptom and then show it fixed on one build.
+	// A harness that has never printed a failure is not evidence that there is nothing to fail.
+	// =============================================================================================
+
+	/** One trail's current orphan episode: it has trace, and its owner does not have the Core. */
+	struct FTraceOrphanEpisode
+	{
+		double StartSeconds = 0.0;
+		double LastSeenSeconds = 0.0;
+		int32 MaxPoints = 0;
+		int32 MaxLethal = 0;
+		int32 MaxVisiblePieces = 0;
+		bool bOwnerAlive = false;
+		bool bReported = false;
+	};
+
+	/**
+	 * NUDGE THE CARRIER SO THERE IS A TRACE TO TEST AT ALL.
+	 *
+	 * WHY THIS EXISTS, and it is not a convenience. Both §§3-4 probes need a carrier who has actually
+	 * laid some trace, and the first arm of this pass sat idle for two minutes waiting for one. The
+	 * new idle diagnostic named the reason on its first run: "1 living carrier(s), best trace 1
+	 * points". Spec v9 §1 is the reason — bots "run at the carrier ... and stand by it" — so in an
+	 * unattended match the Core ends up on a bot who barely moves, and the trace is length-based
+	 * (v7 §1), so a carrier who does not move lays nothing. The clearing bug cannot be measured
+	 * because the fixture never forms.
+	 *
+	 * It drives the carrier with AddMovementInput on a slowly rotating heading — the SAME input path
+	 * a player uses, through the real movement component, so the trace laid is a real trace at real
+	 * point spacing on a wide arc that does not simply run into a wall. Nothing is teleported: a
+	 * teleport longer than MaxTrailSegmentLength makes ServerUpdateTrail restart the trace, which
+	 * would quietly produce the short traces this is here to avoid.
+	 *
+	 * It only ever runs while a probe is WAITING for a setup, and it stops the moment one exists, so
+	 * it cannot influence what happens after a route fires.
+	 */
+	void ClearHarnessDriveCarrier(const TArray<ATraceCharacter*>& Characters, int32 Frames)
+	{
+		for (ATraceCharacter* TraceChar : Characters)
+		{
+			if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive())
+			{
+				const float Angle = static_cast<float>(Frames) * 0.015f;
+				TraceChar->AddMovementInput(FVector(FMath::Cos(Angle), FMath::Sin(Angle), 0.f), 1.f);
+				return;
+			}
+		}
+	}
+
+	struct FTraceClearWatchState
+	{
+		float Seconds = 20.f;
+		double Elapsed = 0.0;
+		int32 Frames = 0;
+
+		TMap<TWeakObjectPtr<ATraceCharacter>, FTraceOrphanEpisode> Live;
+
+		int32 Episodes = 0;
+
+		/** Episodes that lasted longer than one packet's worth of disagreement. These are the failures. */
+		int32 LongEpisodes = 0;
+
+		double WorstSeconds = 0.0;
+		FString WorstOwner;
+		int32 WorstPoints = 0;
+		int32 WorstVisible = 0;
+
+		/** Episodes still open when the window closed — i.e. traces that never went away at all. */
+		int32 UnendedEpisodes = 0;
+
+		/** Frames on which at least one orphan existed. The share of the match that is wrong. */
+		int32 OrphanFrames = 0;
+
+		bool bIsClient = false;
+	};
+
+	/**
+	 * Closes one episode into the running worst-case, and prints it.
+	 *
+	 * An episode is only interesting if it lasted longer than a packet. On a joined client the
+	 * possession change (a replicated bool on the pawn) and the point removal (a fast-array delta on
+	 * the component) travel in different property blocks, so a few tens of milliseconds of disagreement
+	 * is the network being a network and not a bug. The threshold is stated rather than hidden: the
+	 * user's report is "it takes a second", and the pre-v9 behaviour is unbounded, so anything this
+	 * pass cares about is orders of magnitude clear of it.
+	 */
+	constexpr double TraceOrphanReportThresholdSeconds = 0.12;
+
+	void CloseOrphanEpisode(FTraceClearWatchState& State, const FString& OwnerName,
+		const FTraceOrphanEpisode& Episode, bool bStillOpen)
+	{
+		const double Duration = FMath::Max(0.0, Episode.LastSeenSeconds - Episode.StartSeconds);
+
+		// EVERY episode counts towards the worst case and the census. Only LONG ones are printed and
+		// only long ones fail the run — but the first arm of this harness produced a four-frame episode
+		// that the old early-return made invisible in every number, and an unreported measurement is
+		// how a real symptom gets described as "nothing to see".
+		++State.Episodes;
+		if (Duration > State.WorstSeconds)
+		{
+			State.WorstSeconds = Duration;
+			State.WorstOwner = OwnerName;
+			State.WorstPoints = Episode.MaxPoints;
+			State.WorstVisible = Episode.MaxVisiblePieces;
+		}
+
+		if (Duration < TraceOrphanReportThresholdSeconds && !bStillOpen)
+		{
+			return;
+		}
+
+		++State.LongEpisodes;
+		if (bStillOpen)
+		{
+			++State.UnendedEpisodes;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CLEARWATCH] ORPHAN: %s held a trace for %.2fs while NOT holding the Core "
+			     "(ownerAlive=%d, up to %d points / %d lethal / %d drawn pieces)%s"),
+			*OwnerName, Duration, Episode.bOwnerAlive ? 1 : 0,
+			Episode.MaxPoints, Episode.MaxLethal, Episode.MaxVisiblePieces,
+			bStillOpen ? TEXT(" — AND IT WAS STILL THERE WHEN THE WATCH ENDED.") : TEXT("."));
+	}
+
+	bool TickClearWatch(FTraceClearWatchState& State, float DeltaTime)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		State.Elapsed += DeltaTime;
+		++State.Frames;
+
+		const bool bFinished = State.Elapsed >= State.Seconds;
+
+		TArray<ATraceCharacter*> Characters;
+		GatherTrailDebugCharacters(World, Characters);
+
+		TSet<TWeakObjectPtr<ATraceCharacter>> SeenThisFrame;
+		int32 OrphansThisFrame = 0;
+
+		for (ATraceCharacter* TraceChar : Characters)
+		{
+			if (TraceChar == nullptr || TraceChar->Trail == nullptr)
+			{
+				continue;
+			}
+
+			UTraceTrailComponent* Trail = TraceChar->Trail;
+
+			int32 StaticVisible = 0;
+			int32 SkinnedVisible = 0;
+			Trail->CountDrawnPieces(StaticVisible, SkinnedVisible);
+
+			const int32 Points = Trail->TrailPoints.Items.Num();
+			const int32 Visible = StaticVisible + SkinnedVisible;
+			const bool bHasTrace = (Points > 0) || (Visible > 0);
+
+			// THE DEFINITION OF AN ORPHAN, and it is deliberately readable on a client: bIsCarrier is
+			// replicated on the pawn, so a joining player's machine can answer "does this trace belong
+			// to somebody who is holding the Core" for itself. Everything else here is local state.
+			const bool bOwnsTheCore = TraceChar->IsCarrier() && TraceChar->IsAlive();
+
+			if (!bHasTrace || bOwnsTheCore)
+			{
+				if (const FTraceOrphanEpisode* Existing = State.Live.Find(TraceChar))
+				{
+					CloseOrphanEpisode(State, GetNameSafe(TraceChar), *Existing, /*bStillOpen=*/false);
+					State.Live.Remove(TraceChar);
+				}
+				continue;
+			}
+
+			++OrphansThisFrame;
+			SeenThisFrame.Add(TraceChar);
+
+			FTraceOrphanEpisode& Episode = State.Live.FindOrAdd(TraceChar);
+			if (Episode.StartSeconds <= 0.0)
+			{
+				Episode.StartSeconds = State.Elapsed;
+			}
+			Episode.LastSeenSeconds = State.Elapsed;
+			Episode.MaxPoints = FMath::Max(Episode.MaxPoints, Points);
+			Episode.MaxLethal = FMath::Max(Episode.MaxLethal, Trail->ComputeLastLethalIndex() + 1);
+			Episode.MaxVisiblePieces = FMath::Max(Episode.MaxVisiblePieces, Visible);
+			Episode.bOwnerAlive = TraceChar->IsAlive();
+		}
+
+		if (OrphansThisFrame > 0)
+		{
+			++State.OrphanFrames;
+		}
+
+		// A pawn that was destroyed (respawn, disconnect) ends its episode too — its trace went with it.
+		for (auto It = State.Live.CreateIterator(); It; ++It)
+		{
+			if (!It.Key().IsValid())
+			{
+				CloseOrphanEpisode(State, TEXT("<destroyed pawn>"), It.Value(), /*bStillOpen=*/false);
+				It.RemoveCurrent();
+			}
+		}
+
+		if (!bFinished)
+		{
+			return true;
+		}
+
+		for (auto It = State.Live.CreateIterator(); It; ++It)
+		{
+			const ATraceCharacter* TraceChar = It.Key().Get();
+			CloseOrphanEpisode(State, GetNameSafe(TraceChar), It.Value(), /*bStillOpen=*/true);
+		}
+		State.Live.Reset();
+
+		const float OrphanFrameShare = (State.Frames > 0)
+			? (100.f * static_cast<float>(State.OrphanFrames) / static_cast<float>(State.Frames)) : 0.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CLEARWATCH] DONE on the %s after %.1fs / %d frames. episodes=%d, of which %d lasted "
+			     "longer than %.0fms (still standing at the end: %d). worst=%.2fs by %s (%d points, %d drawn "
+			     "pieces) orphanFrames=%d (%.1f%%). Trace kills on a NON-carrier this session: %d of %d. "
+			     "VERDICT: %s"),
+			State.bIsClient ? TEXT("CLIENT") : TEXT("HOST"),
+			State.Elapsed, State.Frames, State.Episodes, State.LongEpisodes,
+			TraceOrphanReportThresholdSeconds * 1000.0, State.UnendedEpisodes,
+			State.WorstSeconds, State.WorstOwner.IsEmpty() ? TEXT("nobody") : *State.WorstOwner,
+			State.WorstPoints, State.WorstVisible, State.OrphanFrames, OrphanFrameShare,
+			GTrailKillsOnNonCarrier, GTrailKillsTotal,
+			(State.LongEpisodes == 0 && GTrailKillsOnNonCarrier == 0)
+				? TEXT("PASS — no trace outlived its owner's possession, and nobody died to one.")
+				: TEXT("*** FAIL — spec v9 3-4: a trace outlived possession. ***"));
+
+		return false;
+	}
+
+	FAutoConsoleCommand CmdClearWatch(
+		TEXT("Trace.Trail.ClearWatch"),
+		TEXT("Trace.Trail.ClearWatch [Seconds] — spec v9 3-4. Watch every trail every frame and report any "
+		     "that keeps points or drawn geometry while its owner is not holding the Core. RUN IT ON A "
+		     "CLIENT as well as the host."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FTraceClearWatchState State;
+			State.Seconds = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 1.f, 600.f) : 20.f;
+
+			if (const UWorld* World = FindTrailDebugWorld())
+			{
+				State.bIsClient = (World->GetNetMode() == NM_Client);
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARWATCH] watching every trail for %.1fs on the %s. An ORPHAN is a trace whose owner "
+				     "is not a living Core carrier; spec v9 3-4 says there must be none."),
+				State.Seconds, State.bIsClient ? TEXT("CLIENT") : TEXT("HOST"));
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickClearWatch(State, DeltaTime);
+				}), 0.f);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.ClearAudit — the ACTIVE half. Forces the reported event and times the consequence.
+	// ---------------------------------------------------------------------------------------------
+
+	struct FClearAuditState
+	{
+		int32 TotalRuns = 3;
+		int32 RunIndex = 0;
+		int32 Phase = 0;
+		int32 IdleFrames = 0;
+		int32 PhaseFrames = 0;
+
+		TWeakObjectPtr<ATraceCharacter> Passer;
+		TWeakObjectPtr<ATraceCharacter> Receiver;
+		TWeakObjectPtr<ATraceCharacter> Dasher;
+		FVector DashEnd = FVector::ZeroVector;
+		FVector DasherHome = FVector::ZeroVector;
+
+		double PassSeconds = 0.0;
+		double Elapsed = 0.0;
+
+		int32 PointsAtPass = 0;
+		int32 PointsAfterPassFrame = 0;
+		int32 LethalAfterPassFrame = 0;
+		double SecondsToClear = -1.0;
+
+		/**
+		 * Was the passer still alive when their trace finally went away?
+		 *
+		 * IT DECIDES WHETHER THE CLEAR TIME IS EVIDENCE AT ALL, and the first run of this harness
+		 * proved why the field is needed: the lethality probe dashed an enemy through the abandoned
+		 * trace, the trace killed the passer, and DEATH cleared the trace 37ms after the pass. Scored
+		 * naively that reads "cleared instantly — PASS", which is the exact shape of the verification
+		 * failure spec v9 §0 is about: a number that looks green because the bug fired.
+		 */
+		bool bClearedWhileAlive = false;
+
+		bool bDashIssued = false;
+		bool bPasserDied = false;
+
+		/** Persistence runs (the odd ones) leave the passer alone; see bDashProbeThisRun. */
+		int32 PersistenceRuns = 0;
+		int32 PersistenceInstant = 0;
+		int32 PersistenceLate = 0;
+		int32 PersistenceNever = 0;
+
+		/** Lethality runs (the even ones) dash an enemy through whatever is left. */
+		int32 LethalityRuns = 0;
+		int32 LethalityNoTraceToDash = 0;
+		int32 UnfairKills = 0;
+
+		int32 Aborted = 0;
+
+		double WorstClearSeconds = 0.0;
+	};
+
+	/**
+	 * TWO PROBES, ALTERNATED, BECAUSE THEY DESTROY EACH OTHER'S MEASUREMENT.
+	 *
+	 * EVEN runs are the LETHALITY probe (spec v9 §3's "they can still be killed"): dash an enemy
+	 * through the abandoned trace and see whether the passer dies. It answers the important half —
+	 * and it ends the run early, because the death clears the trace.
+	 *
+	 * ODD runs are the PERSISTENCE probe (§4's "traces stay on the map"): pass, then touch nothing,
+	 * and time how long the trace survives with its owner alive and not carrying. Measured on the
+	 * first arm of this harness: with the lethality probe running, the longest orphan the passive
+	 * watch could see was FOUR FRAMES, because the bug killed its own witness.
+	 */
+	bool ClearAuditIsDashRun(int32 RunIndex) { return (RunIndex % 2) == 0; }
+
+	/** How long a run waits for the passer's trace to vanish before calling it immortal. */
+	constexpr double ClearAuditWatchSeconds = 4.0;
+
+	/**
+	 * "Instant", AND IT IS COUNTED IN FRAMES, NOT SECONDS.
+	 *
+	 * The clear happens inside the same call stack as the possession change, so the honest expectation
+	 * on the authority is ZERO frames: the audit samples on the very next tick and the points must
+	 * already be gone. That is what PointsAfterPassFrame records, and it is the pass criterion.
+	 *
+	 * A WALL-CLOCK THRESHOLD WAS THE FIRST VERSION AND IT WAS THE WRONG INSTRUMENT — spec v9 §0's
+	 * mistake in miniature, a number that can go red for a reason that has nothing to do with the
+	 * claim. These runs share a machine with other agents' editors; the green arm's first run sampled
+	 * its "next frame" 177ms after the pass because the host was managing six frames a second. Points
+	 * 16 -> 0 in one frame is a perfect result and 0.177s would have scored it as a LATE clear. The
+	 * seconds are still printed, because a reader wants to know how long the frame was, but nothing
+	 * is judged on them.
+	 *
+	 * (There is deliberately no ClearAuditInstantSeconds constant any more. Leaving one defined but
+	 * unjudged is how a reader concludes the seconds still decide something.)
+	 */
+
+	bool TickClearAudit(FClearAuditState& State, float DeltaTime)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		if (World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CLEARAUDIT] this drives possession and must run on the SERVER. Use "
+				     "Trace.Trail.ClearWatch on a client instead."));
+			return false;
+		}
+
+		State.Elapsed += DeltaTime;
+		++State.PhaseFrames;
+
+		if (State.RunIndex >= State.TotalRuns)
+		{
+			const bool bPersistenceOk = (State.PersistenceRuns > 0)
+				&& (State.PersistenceInstant == State.PersistenceRuns);
+			const bool bLethalityOk = (State.LethalityRuns > 0)
+				&& (State.LethalityNoTraceToDash == State.LethalityRuns) && (State.UnfairKills == 0);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARAUDIT] DONE. PERSISTENCE (4): %d runs — %d cleared ON THE VERY NEXT FRAME with the "
+				     "passer alive, %d cleared LATE, %d NEVER cleared; worst %.2fs. LETHALITY (3): %d runs — %d "
+				     "had NO TRACE LEFT to dash through, %d killed the passer AFTER they had passed. "
+				     "(%d aborted.) Session: %d of %d trace kills landed on a NON-carrier. VERDICT: %s"),
+				State.PersistenceRuns, State.PersistenceInstant,
+				State.PersistenceLate, State.PersistenceNever, State.WorstClearSeconds,
+				State.LethalityRuns, State.LethalityNoTraceToDash, State.UnfairKills, State.Aborted,
+				GTrailKillsOnNonCarrier, GTrailKillsTotal,
+				(bPersistenceOk && bLethalityOk)
+					? TEXT("PASS — the trace was gone the instant the Core left, and there was nothing left "
+					       "to kill the passer with.")
+					: ((State.PersistenceRuns == 0 && State.LethalityRuns == 0)
+						? TEXT("NO DATA — no pass was ever set up.")
+						: TEXT("*** FAIL — spec v9 3-4: the trace outlived the pass. ***")));
+			return false;
+		}
+
+		const bool bDashProbeThisRun = ClearAuditIsDashRun(State.RunIndex);
+
+		// ---- phase 0: a living carrier with real trace, and a living teammate to pass to ----------
+		if (State.Phase == 0)
+		{
+			TArray<ATraceCharacter*> Characters;
+			GatherTrailDebugCharacters(World, Characters);
+
+			ATraceCharacter* Passer = nullptr;
+			for (ATraceCharacter* TraceChar : Characters)
+			{
+				if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive()
+					&& TraceChar->Trail != nullptr && TraceChar->Trail->TrailPoints.Items.Num() >= 6)
+				{
+					Passer = TraceChar;
+					break;
+				}
+			}
+
+			ATraceCharacter* Receiver = nullptr;
+			if (Passer != nullptr)
+			{
+				for (ATraceCharacter* TraceChar : Characters)
+				{
+					// A LIVING TEAMMATE, which is the whole point: the old orphan sweep fired only for a
+					// dead or destroyed owner, so passing to somebody who is alive is exactly the case
+					// that had no cleanup path at all (spec v9 §4's diagnosed lead).
+					if (TraceChar != nullptr && TraceChar != Passer && TraceChar->IsAlive()
+						&& TraceChar->GetTeam() != ETraceTeam::None
+						&& TraceChar->GetTeam() == Passer->GetTeam())
+					{
+						Receiver = TraceChar;
+						break;
+					}
+				}
+			}
+
+			if (Passer == nullptr || Receiver == nullptr)
+			{
+				// See ClearHarnessDriveCarrier: without this the Core sits on a stationary bot and no
+				// trace is ever laid to test.
+				ClearHarnessDriveCarrier(Characters, State.IdleFrames);
+
+				// AN IDLE HARNESS MUST SAY WHY IT IS IDLE. The first arm of this run set up ONE pass and
+				// then went quiet for two minutes, and the log could not distinguish "the match stopped
+				// producing carriers" from "the ticker died" from "the probe is broken" — which is a
+				// measurement that reports nothing and looks like a measurement. Roughly every four
+				// seconds it now prints the census it is waiting on.
+				if ((++State.IdleFrames % 240) == 0)
+				{
+					int32 Carriers = 0;
+					int32 BestPoints = 0;
+					FString BestName;
+					for (const ATraceCharacter* TraceChar : Characters)
+					{
+						if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive()
+							&& TraceChar->Trail != nullptr)
+						{
+							++Carriers;
+							const int32 Points = TraceChar->Trail->TrailPoints.Items.Num();
+							if (Points >= BestPoints)
+							{
+								BestPoints = Points;
+								BestName = GetNameSafe(TraceChar);
+							}
+						}
+					}
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[CLEARAUDIT %d/%d] waiting %.1fs for a setup: %d characters, %d living carrier(s), "
+						     "best trace %d points (%s) — need 6 and a living teammate."),
+						State.RunIndex + 1, State.TotalRuns, State.IdleFrames * DeltaTime,
+						Characters.Num(), Carriers, BestPoints,
+						BestName.IsEmpty() ? TEXT("nobody carrying") : *BestName);
+				}
+
+				if (State.IdleFrames > 36000)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[CLEARAUDIT] gave up: never found a carrier with 6+ trace points and a living teammate."));
+					return false;
+				}
+				return true;
+			}
+
+			ATraceCore* Core = nullptr;
+			{
+				// `if`, not a `for ... break`: clang's -Wunreachable-code-loop-increment is an error in
+				// this project, and a loop whose body always breaks never reaches its increment.
+				TActorIterator<ATraceCore> CoreIt(World);
+				if (CoreIt)
+				{
+					Core = *CoreIt;
+				}
+			}
+			if (Core == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[CLEARAUDIT] no ATraceCore in the world."));
+				return false;
+			}
+
+			State.IdleFrames = 0;
+			State.Passer = Passer;
+			State.Receiver = Receiver;
+			State.PointsAtPass = Passer->Trail->TrailPoints.Items.Num();
+			State.PassSeconds = State.Elapsed;
+			State.SecondsToClear = -1.0;
+			State.bClearedWhileAlive = false;
+			State.bDashIssued = false;
+			State.bPasserDied = false;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARAUDIT %d/%d] %s PROBE: %s is carrying with %d trace points; passing to LIVING "
+				     "TEAMMATE %s now."),
+				State.RunIndex + 1, State.TotalRuns,
+				bDashProbeThisRun ? TEXT("LETHALITY") : TEXT("PERSISTENCE"),
+				*GetNameSafe(Passer), State.PointsAtPass, *GetNameSafe(Receiver));
+
+			// THE EVENT. GrantTo is the single funnel every possession change goes through — a real
+			// completed pass ends here, so this reproduces it exactly rather than approximating it.
+			Core->GrantTo(Receiver, ETraceCoreGrantReason::Pass);
+
+			State.Phase = 1;
+			State.PhaseFrames = 0;
+			return true;
+		}
+
+		ATraceCharacter* Passer = State.Passer.Get();
+		if (Passer == nullptr || Passer->Trail == nullptr)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[CLEARAUDIT %d] aborted: the passer's pawn went away."), State.RunIndex + 1);
+			++State.Aborted;
+			++State.RunIndex;
+			State.Phase = 0;
+			return true;
+		}
+
+		const int32 PointsNow = Passer->Trail->TrailPoints.Items.Num();
+
+		// ---- phase 1: the very next frame after the pass ------------------------------------------
+		if (State.Phase == 1)
+		{
+			State.PointsAfterPassFrame = PointsNow;
+			State.LethalAfterPassFrame = Passer->Trail->ComputeLastLethalIndex() + 1;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARAUDIT %d/%d] ONE FRAME AFTER THE PASS: %s isCarrier=%d, trace points %d -> %d, "
+				     "lethal points %d, emitting=%d."),
+				State.RunIndex + 1, State.TotalRuns, *GetNameSafe(Passer), Passer->IsCarrier() ? 1 : 0,
+				State.PointsAtPass, State.PointsAfterPassFrame, State.LethalAfterPassFrame,
+				Passer->Trail->IsEmitting() ? 1 : 0);
+
+			State.Phase = 2;
+			State.PhaseFrames = 0;
+			return true;
+		}
+
+		// ---- phase 2: how long until it is actually gone, and can it kill while it lingers? -------
+		if (State.Phase == 2)
+		{
+			if (PointsNow == 0 && State.SecondsToClear < 0.0)
+			{
+				State.SecondsToClear = State.Elapsed - State.PassSeconds;
+				State.bClearedWhileAlive = Passer->IsAlive();
+			}
+
+			// THE UNFAIR DEATH, REPRODUCED. While the passer's abandoned trace still has lethal points,
+			// dash an enemy through the middle of it and see whether the passer — who is not carrying
+			// anything — dies. This is §3's "they can still be killed", performed rather than argued.
+			const int32 LastLethal = Passer->Trail->ComputeLastLethalIndex();
+			if (bDashProbeThisRun && !State.bDashIssued && LastLethal >= 1 && Passer->IsAlive())
+			{
+				const int32 SegmentIndex = FMath::Max(0, LastLethal / 2);
+				const FVector SegmentStart = Passer->Trail->TrailPoints.Items[SegmentIndex].Location;
+				const FVector SegmentEnd = Passer->Trail->TrailPoints.Items[SegmentIndex + 1].Location;
+
+				FVector Along = SegmentEnd - SegmentStart;
+				Along.Z = 0.0;
+				if (Along.Normalize())
+				{
+					const FVector Across = FVector::CrossProduct(Along, FVector::UpVector).GetSafeNormal();
+					const FVector Midpoint = (SegmentStart + SegmentEnd) * 0.5;
+
+					TArray<ATraceCharacter*> Candidates;
+					GatherTrailDebugCharacters(World, Candidates);
+
+					for (ATraceCharacter* Candidate : Candidates)
+					{
+						if (Candidate != nullptr && Candidate != Passer && Candidate->IsAlive()
+							&& Candidate->GetTeam() != ETraceTeam::None
+							&& Candidate->GetTeam() != Passer->GetTeam())
+						{
+							State.Dasher = Candidate;
+							State.DasherHome = Candidate->GetActorLocation();
+							State.DashEnd = Midpoint - Across * 240.0;
+
+							Candidate->SetActorLocation(Midpoint + Across * 260.0, /*bSweep=*/false, nullptr,
+								ETeleportType::TeleportPhysics);
+							Candidate->SetActorRotation((-Across).Rotation());
+							if (UTraceCharacterMovementComponent* Movement = Candidate->GetTraceMovement())
+							{
+								Movement->StartDash();
+							}
+
+							State.bDashIssued = true;
+							UE_LOG(LogTraceGame, Display,
+								TEXT("[CLEARAUDIT %d/%d] %s's trace STILL HAS %d lethal points after the pass — "
+								     "dashing %s through it to see whether it kills a player who is not carrying."),
+								State.RunIndex + 1, State.TotalRuns, *GetNameSafe(Passer), LastLethal + 1,
+								*GetNameSafe(Candidate));
+							break;
+						}
+					}
+				}
+			}
+
+			if (State.bDashIssued && State.Dasher.IsValid() && State.PhaseFrames > 1)
+			{
+				// One teleport across, exactly as the head-gap harness does it, then home again.
+				ATraceCharacter* Dasher = State.Dasher.Get();
+				if (Dasher->IsDashing() && !State.DashEnd.IsZero())
+				{
+					Dasher->SetActorLocation(State.DashEnd, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+					State.DashEnd = FVector::ZeroVector;
+				}
+				else if (State.DashEnd.IsZero())
+				{
+					Dasher->SetActorLocation(State.DasherHome, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+					State.Dasher = nullptr;
+				}
+			}
+
+			if (!Passer->IsAlive())
+			{
+				State.bPasserDied = true;
+			}
+
+			const bool bTimeUp = (State.Elapsed - State.PassSeconds) >= ClearAuditWatchSeconds;
+			if (State.SecondsToClear >= 0.0 || bTimeUp)
+			{
+				if (ATraceCharacter* Dasher = State.Dasher.Get())
+				{
+					Dasher->SetActorLocation(State.DasherHome, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+				}
+				State.Dasher = nullptr;
+				State.Phase = 3;
+				State.PhaseFrames = 0;
+			}
+			return true;
+		}
+
+		// ---- phase 3: score --------------------------------------------------------------------
+		{
+			const double Clear = State.SecondsToClear;
+			const bool bCleared = Clear >= 0.0;
+
+			// A clear the passer did not live to see is not a clear: their DEATH wiped the trace, which
+			// is the pre-v9 behaviour working exactly as it always did. Only a clear that happened while
+			// they were standing there alive says anything about possession.
+			//
+			// THE FRAME READING IS THE CRITERION, not the elapsed seconds — see the "Instant" note above.
+			// PointsAfterPassFrame is sampled on the first tick after the pass and must already be zero.
+			const bool bInstant = bCleared && State.bClearedWhileAlive && (State.PointsAfterPassFrame == 0);
+
+			if (bDashProbeThisRun)
+			{
+				++State.LethalityRuns;
+
+				// The pass condition for the lethality probe is that there was NOTHING LEFT TO DASH
+				// THROUGH — the trace had already gone, so the probe could not even be set up. A run
+				// that got to issue a dash has already failed §3 whatever the dash then did.
+				if (!State.bDashIssued)
+				{
+					++State.LethalityNoTraceToDash;
+				}
+				if (State.bPasserDied)
+				{
+					++State.UnfairKills;
+				}
+			}
+			else
+			{
+				++State.PersistenceRuns;
+				if (!bCleared || !State.bClearedWhileAlive)
+				{
+					++State.PersistenceNever;
+					State.WorstClearSeconds = FMath::Max(State.WorstClearSeconds, ClearAuditWatchSeconds);
+				}
+				else if (bInstant)
+				{
+					++State.PersistenceInstant;
+					State.WorstClearSeconds = FMath::Max(State.WorstClearSeconds, Clear);
+				}
+				else
+				{
+					++State.PersistenceLate;
+					State.WorstClearSeconds = FMath::Max(State.WorstClearSeconds, Clear);
+				}
+			}
+
+			const bool bRunPassed = bDashProbeThisRun
+				? (!State.bDashIssued && !State.bPasserDied)
+				: bInstant;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARAUDIT %d/%d] RESULT (%s): %s passed the Core away holding %d trace points. Points "
+				     "one frame later: %d (lethal %d). Trace gone after: %s. Enemy able to dash the abandoned "
+				     "trace: %s. Passer killed by their own abandoned trace: %s. %s"),
+				State.RunIndex + 1, State.TotalRuns,
+				bDashProbeThisRun ? TEXT("LETHALITY") : TEXT("PERSISTENCE"),
+				*GetNameSafe(Passer), State.PointsAtPass,
+				State.PointsAfterPassFrame, State.LethalAfterPassFrame,
+				bCleared
+					? *FString::Printf(TEXT("%.3fs%s"), Clear,
+						State.bClearedWhileAlive ? TEXT("") : TEXT(" — BUT ONLY BECAUSE THE PASSER DIED"))
+					: *FString::Printf(TEXT("NEVER (still standing %.0fs later)"), ClearAuditWatchSeconds),
+				State.bDashIssued ? TEXT("YES") : TEXT("no - nothing left to dash"),
+				State.bPasserDied ? TEXT("YES — THE UNFAIR DEATH") : TEXT("no"),
+				bRunPassed
+					? TEXT("PASS")
+					: TEXT("*** FAIL — spec v9 3-4: the trace must be gone, visually and lethally, the "
+					       "instant possession leaves ***"));
+
+			++State.RunIndex;
+			State.Phase = 0;
+			State.PhaseFrames = 0;
+			State.Passer = nullptr;
+			State.Receiver = nullptr;
+			return true;
+		}
+	}
+
+	FAutoConsoleCommand CmdClearAudit(
+		TEXT("Trace.Trail.ClearAudit"),
+		TEXT("Trace.Trail.ClearAudit [Runs] — spec v9 3. SERVER. Force a completed pass to a LIVING teammate, "
+		     "then measure how long the passer's trace survives and whether it can still kill them. Pair with "
+		     "Trace.Trail.ClearOnPossessionLoss 0 to see the pre-v9 behaviour fail."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FClearAuditState State;
+			State.TotalRuns = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 20) : 3;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARAUDIT] starting %d forced passes. Spec v9 3: the passer's trace must be gone — "
+				     "visually and lethally — the instant the Core leaves."),
+				State.TotalRuns);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickClearAudit(State, DeltaTime);
+				}), 0.f);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.ClearRoutes — EVERY WAY POSSESSION CAN END, FIRED ON PURPOSE, ONE AT A TIME.
+	//
+	// Spec v9 §4 lists eight of them: "pass completed, throw (mode B), carrier killed, carrier
+	// disconnected, score, half-time, kickoff, match end". Trace.Trail.ClearAudit exercises exactly
+	// one (the pass) and Trace.Trail.ClearWatch only sees the routes a bot match happens to produce —
+	// in the first arm of this pass that was ONE possession change in sixty seconds, which is not
+	// coverage, it is luck. The claim "all eight routes clear the trace" rests on ReleaseHolder()
+	// being the single funnel, and an architectural claim that is never fired is exactly the kind of
+	// thing that is true right up until somebody adds a ninth route. So each one is fired here and
+	// the invariant is read back on the very next frame.
+	//
+	// Three of the eight collapse into one call BY DESIGN, and the collapse is the Core's, not this
+	// harness's: ATraceCore::KickoffTo's own header says "every caller (a score, match start, half
+	// time)" ends here, and ATraceGameMode has "exactly one function to call". Firing KickoffTo
+	// therefore IS firing score / half-time / match-end / kickoff. It is labelled that way rather
+	// than padded out into four identical rows.
+	// ---------------------------------------------------------------------------------------------
+
+	enum class EClearRoute : uint8
+	{
+		Pass = 0,        // §4 "pass completed" — to a LIVING teammate, the case the old gate missed.
+		Turnover,        // an interception / kill steal: the Core crosses to the other team.
+		Throw,           // §4 "throw (mode B)". Skipped with a stated reason in mode A.
+		Kill,            // §4 "carrier killed".
+		Kickoff,         // §4 "score", "half-time", "kickoff", "match end" — one call, see above.
+		Disconnect,      // §4 "carrier disconnected": the pawn goes away underneath the trace.
+		Count
+	};
+
+	const TCHAR* ClearRouteName(EClearRoute Route)
+	{
+		switch (Route)
+		{
+		case EClearRoute::Pass:       return TEXT("PASS COMPLETED (to a living teammate)");
+		case EClearRoute::Turnover:   return TEXT("TURNOVER (Core crosses to the other team)");
+		case EClearRoute::Throw:      return TEXT("THROW (mode B)");
+		case EClearRoute::Kill:       return TEXT("CARRIER KILLED");
+		case EClearRoute::Kickoff:    return TEXT("KICKOFF / SCORE / HALF-TIME / MATCH END");
+		case EClearRoute::Disconnect: return TEXT("CARRIER DISCONNECTED (pawn destroyed)");
+		default:                      return TEXT("?");
+		}
+	}
+
+	struct FClearRoutesState
+	{
+		int32 RouteIndex = 0;
+		int32 Phase = 0;
+		int32 IdleFrames = 0;
+
+		TWeakObjectPtr<ATraceCharacter> Subject;
+		FString SubjectName;
+		int32 PointsBefore = 0;
+
+		int32 Fired = 0;
+		int32 Passed = 0;
+		int32 Skipped = 0;
+		TArray<FString> Failures;
+	};
+
+	/** How long one route waits for a carrier with real trace before it gives up and says so. */
+	constexpr int32 ClearRoutesSetupFrameBudget = 1800;
+
+	bool TickClearRoutes(FClearRoutesState& State, float /*DeltaTime*/)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		if (World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CLEARROUTES] this drives possession and must run on the SERVER."));
+			return false;
+		}
+
+		if (State.RouteIndex >= static_cast<int32>(EClearRoute::Count))
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARROUTES] DONE. %d of %d possession-end routes fired, %d cleared the trace on the "
+				     "NEXT FRAME, %d skipped. Session: %d of %d trace kills landed on a NON-carrier. VERDICT: %s"),
+				State.Fired, static_cast<int32>(EClearRoute::Count), State.Passed, State.Skipped,
+				GTrailKillsOnNonCarrier, GTrailKillsTotal,
+				(State.Failures.Num() == 0 && State.Fired > 0)
+					? TEXT("PASS — no route left a trace behind.")
+					: *FString::Printf(TEXT("*** FAIL — spec v9 4: %s ***"),
+						*FString::Join(State.Failures, TEXT("; "))));
+			return false;
+		}
+
+		const EClearRoute Route = static_cast<EClearRoute>(State.RouteIndex);
+
+		ATraceCore* Core = nullptr;
+		{
+			// `if`, not `for ... break`: -Wunreachable-code-loop-increment is an error here.
+			TActorIterator<ATraceCore> CoreIt(World);
+			if (CoreIt)
+			{
+				Core = *CoreIt;
+			}
+		}
+		if (Core == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[CLEARROUTES] no ATraceCore in the world."));
+			return false;
+		}
+
+		// ---- phase 0: wait for a carrier who has actually laid some trace ------------------------
+		if (State.Phase == 0)
+		{
+			TArray<ATraceCharacter*> Characters;
+			GatherTrailDebugCharacters(World, Characters);
+
+			ATraceCharacter* Subject = nullptr;
+			for (ATraceCharacter* TraceChar : Characters)
+			{
+				if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive()
+					&& TraceChar->Trail != nullptr && TraceChar->Trail->TrailPoints.Items.Num() >= 6)
+				{
+					Subject = TraceChar;
+					break;
+				}
+			}
+
+			// The two grant routes also need somebody to grant TO, and which side they are on is the
+			// whole difference between them.
+			ATraceCharacter* Target = nullptr;
+			if (Subject != nullptr && (Route == EClearRoute::Pass || Route == EClearRoute::Turnover))
+			{
+				const bool bWantAlly = (Route == EClearRoute::Pass);
+				for (ATraceCharacter* TraceChar : Characters)
+				{
+					if (TraceChar == nullptr || TraceChar == Subject || !TraceChar->IsAlive()
+						|| TraceChar->GetTeam() == ETraceTeam::None)
+					{
+						continue;
+					}
+					const bool bAlly = (TraceChar->GetTeam() == Subject->GetTeam());
+					if (bAlly == bWantAlly)
+					{
+						Target = TraceChar;
+						break;
+					}
+				}
+				if (Target == nullptr)
+				{
+					Subject = nullptr;
+				}
+			}
+
+			if (Subject == nullptr)
+			{
+				// See ClearHarnessDriveCarrier.
+				ClearHarnessDriveCarrier(Characters, State.IdleFrames);
+
+				if ((++State.IdleFrames % 240) == 0)
+				{
+					int32 Carriers = 0;
+					int32 BestPoints = 0;
+					for (const ATraceCharacter* TraceChar : Characters)
+					{
+						if (TraceChar != nullptr && TraceChar->IsCarrier() && TraceChar->IsAlive()
+							&& TraceChar->Trail != nullptr)
+						{
+							++Carriers;
+							BestPoints = FMath::Max(BestPoints, TraceChar->Trail->TrailPoints.Items.Num());
+						}
+					}
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[CLEARROUTES] %s: waiting for a setup (%d frames): %d living carrier(s), best "
+						     "trace %d points — need 6 and the partner this route requires."),
+						ClearRouteName(Route), State.IdleFrames, Carriers, BestPoints);
+				}
+
+				if (State.IdleFrames > ClearRoutesSetupFrameBudget)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[CLEARROUTES] %s: SKIPPED — no carrier with 6+ trace points (and the partner it "
+						     "needs) turned up in %d frames."),
+						ClearRouteName(Route), ClearRoutesSetupFrameBudget);
+					++State.Skipped;
+					++State.RouteIndex;
+					State.IdleFrames = 0;
+					State.Phase = 0;
+				}
+				return true;
+			}
+
+			State.IdleFrames = 0;
+			State.Subject = Subject;
+			State.SubjectName = GetNameSafe(Subject);
+			State.PointsBefore = Subject->Trail->TrailPoints.Items.Num();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARROUTES] %s: %s is carrying with %d trace points (%d lethal). Firing the route now."),
+				ClearRouteName(Route), *State.SubjectName, State.PointsBefore,
+				Subject->Trail->ComputeLastLethalIndex() + 1);
+
+			bool bFired = true;
+			switch (Route)
+			{
+			case EClearRoute::Pass:
+				Core->GrantTo(Target, ETraceCoreGrantReason::Pass);
+				break;
+
+			case EClearRoute::Turnover:
+				Core->GrantTo(Target, ETraceCoreGrantReason::Kill);
+				break;
+
+			case EClearRoute::Throw:
+				// Returns false for a wrong mode, a non-holder, a dead holder, an already-loose Core or
+				// a throw on cooldown. Every one of those is "this route does not exist right now", and
+				// saying so is better than scoring an untaken route as a pass.
+				bFired = Core->ThrowFromHolder(Subject);
+				if (!bFired)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[CLEARROUTES] %s: SKIPPED — ThrowFromHolder refused (mode A, or the throw was on "
+						     "cooldown). Run this again with ScoringMode=ThrownCoreAndGoals to cover it."),
+						ClearRouteName(Route));
+				}
+				break;
+
+			case EClearRoute::Kill:
+				if (Subject->Health != nullptr)
+				{
+					Subject->Health->Kill(nullptr, FName(TEXT("ClearRoutes")));
+				}
+				else
+				{
+					bFired = false;
+				}
+				break;
+
+			case EClearRoute::Kickoff:
+				Core->KickoffTo((Subject->GetTeam() == ETraceTeam::Blue) ? ETraceTeam::Orange : ETraceTeam::Blue);
+				break;
+
+			case EClearRoute::Disconnect:
+				// LAST on purpose. This is the only route that takes the pawn with it, and a destroyed
+				// pawn is a bigger disturbance to the rest of the match than anything else here.
+				Subject->Destroy();
+				break;
+
+			default:
+				bFired = false;
+				break;
+			}
+
+			if (!bFired)
+			{
+				++State.Skipped;
+				++State.RouteIndex;
+				State.Phase = 0;
+				return true;
+			}
+
+			++State.Fired;
+			State.Phase = 1;
+			return true;
+		}
+
+		// ---- phase 1: THE VERY NEXT FRAME. Nothing may be left. -----------------------------------
+		{
+			ATraceCharacter* Subject = State.Subject.Get();
+
+			if (Subject == nullptr || Subject->Trail == nullptr)
+			{
+				// The disconnect route's pass condition: the pawn went, and its trail component — and
+				// every mesh it had placed — went with it. There is nothing left to hold points.
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[CLEARROUTES] %s: PASS — %s's pawn (and its trail component, and its %d points) no "
+					     "longer exist one frame later."),
+					ClearRouteName(Route), *State.SubjectName, State.PointsBefore);
+				++State.Passed;
+			}
+			else
+			{
+				const int32 PointsAfter = Subject->Trail->TrailPoints.Items.Num();
+				const int32 LethalAfter = Subject->Trail->ComputeLastLethalIndex() + 1;
+
+				int32 StaticVisible = 0;
+				int32 SkinnedVisible = 0;
+				Subject->Trail->CountDrawnPieces(StaticVisible, SkinnedVisible);
+				const int32 Drawn = StaticVisible + SkinnedVisible;
+
+				// A LISTEN SERVER DRAWS, so "visually gone" is checkable right here and is checked:
+				// §3 says the trace must be gone visually AND lethally, and points-only would pass a
+				// build that emptied the array and left the ribbon standing.
+				const bool bOk = (PointsAfter == 0) && (LethalAfter == 0) && !Subject->Trail->IsEmitting();
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[CLEARROUTES] %s: %s ONE FRAME LATER — isCarrier=%d alive=%d points %d -> %d, lethal %d, "
+					     "emitting=%d, drawn pieces %d. %s"),
+					ClearRouteName(Route), *State.SubjectName, Subject->IsCarrier() ? 1 : 0,
+					Subject->IsAlive() ? 1 : 0, State.PointsBefore, PointsAfter, LethalAfter,
+					Subject->Trail->IsEmitting() ? 1 : 0, Drawn,
+					bOk ? TEXT("PASS") : TEXT("*** FAIL — the trace outlived possession ***"));
+
+				if (bOk)
+				{
+					++State.Passed;
+				}
+				else
+				{
+					State.Failures.Add(FString::Printf(TEXT("%s left %d points / %d lethal / %d drawn"),
+						ClearRouteName(Route), PointsAfter, LethalAfter, Drawn));
+				}
+			}
+
+			++State.RouteIndex;
+			State.Phase = 0;
+			State.Subject = nullptr;
+			return true;
+		}
+	}
+
+	FAutoConsoleCommand CmdClearRoutes(
+		TEXT("Trace.Trail.ClearRoutes"),
+		TEXT("Trace.Trail.ClearRoutes — spec v9 4. SERVER. Fire EVERY way possession can end (pass, turnover, "
+		     "mode-B throw, carrier killed, kickoff/score/half-time/match-end, carrier disconnected) one at a "
+		     "time against a real carrier, and assert the trace is gone — points, lethality and drawn "
+		     "geometry — on the very next frame."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& /*Args*/)
+		{
+			FClearRoutesState State;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CLEARROUTES] firing %d possession-end routes. Spec v9 4: not one of them may leave a "
+				     "trace behind."),
+				static_cast<int32>(EClearRoute::Count));
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickClearRoutes(State, DeltaTime);
+				}), 0.f);
 		}));
 }
 #endif // !UE_BUILD_SHIPPING

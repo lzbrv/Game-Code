@@ -45,6 +45,36 @@ enum class ECoreKickoffMode : uint8
 	Neutral = 2
 };
 
+#if !UE_BUILD_SHIPPING
+/**
+ * Which scripted proof of spec v9 §11 Trace.HalfTime.Verify runs. See
+ * ATraceGameMode::StartHalfTimeVerify.
+ */
+enum class ETraceHalfTimeVerifyScenario : uint8
+{
+	/**
+	 * Arm the whistle, pass WITHIN the team (must NOT fire), then hand the Core to the other team
+	 * (must fire). The negative half of this is the one that matters: a half that ends on a
+	 * team-mate's pass is the same "cut off in the middle of a run" complaint §11 was written about.
+	 */
+	TurnoverVsPass = 0,
+
+	/**
+	 * Arm the whistle and hold every dead ball off — the Core is released on every step so nobody
+	 * can hold it, score with it or drop it — and prove the hard cap ends the period anyway. Pair it
+	 * with a short UTraceSettings::PeriodEndMaxDeferSeconds.
+	 */
+	HardCap = 1,
+
+	/**
+	 * Arm the whistle, then win by the mercy rule while it is still pending. §11 must NOT have made
+	 * the mercy rule wait for a dead ball — it is a mercy, not a play boundary — and the whistle it
+	 * pre-empts must not be left armed underneath the results screen.
+	 */
+	MercyWhilePending = 2
+};
+#endif
+
 /**
  * Server-authoritative rules for a Trace match.
  *
@@ -189,6 +219,22 @@ public:
 
 	/** Living, non-spectating members of @p Team that currently possess an alive ATraceCharacter. */
 	int32 CountLivingOnTeam(ETraceTeam Team) const;
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * Trace.HalfTime.Verify — the scripted proof for spec v9 §11.
+	 *
+	 * The organic evidence (start a short half, watch the clock expire, watch play continue, watch
+	 * the whistle go on the next turnover) only ever exercises the case that FIRES. It says nothing
+	 * about the two cases that must NOT fire, and those are where §11 can go wrong in the way a
+	 * player would actually notice: a half that ends on a team-mate's pass is the same "cut off in
+	 * the middle of a run" complaint the note was written about, and a cap that never fires turns a
+	 * stalemate into a match that does not end.
+	 *
+	 * @param Scenario which of the three runs. See ETraceHalfTimeVerifyScenario.
+	 */
+	void StartHalfTimeVerify(ETraceHalfTimeVerifyScenario Scenario);
+#endif
 
 	// ------------------------------------------------------------------------------------------
 	// Match structure (spec §1). All `config`, so DefaultGame.ini tunes the whole format.
@@ -348,8 +394,68 @@ protected:
 	 */
 	void BeginHalf(int32 HalfIndex);
 
-	/** The half clock ran out. Either the interval or full time, depending on HalvesPerMatch. */
+	/**
+	 * The half clock ran out.
+	 *
+	 * SPEC v9 §11 CHANGED WHAT THIS DOES. It no longer ends the period. Unless deferral is switched
+	 * off (UTraceSettings::bDeferPeriodEndToPlayBreak) it ARMS the period end and lets play carry on;
+	 * the whistle goes in ResolvePendingPeriodEnd() at the next dead ball. EndPeriodNow() is the old
+	 * body, and is still what every path eventually calls.
+	 */
 	void HandleHalfExpired();
+
+	// --- Deferred half time / full time (spec v9 §11) ------------------------------------------
+	//
+	// Verbatim: "Change halftime to trigger after the time runs out and the current play ends, so
+	// that it doesn't cut people off in the middle of a run E.g. the ball drops in game mode b, any
+	// turnover of the core happens between teams, or a goal is scored, then half time triggers."
+	//
+	// WHAT COUNTS AS A DEAD BALL, and why each one:
+	//   * A GOAL. Explicit in the note. Fired from NotifyScored(), after the score and after the
+	//     mercy check, and instead of the kickoff — there is no point kicking off into a whistle.
+	//   * A TURNOVER BETWEEN THE TEAMS. Also explicit. Detected as a change of the Core's holder
+	//     TEAM, which is deliberately not the same thing as a change of holder: a completed pass to
+	//     a team-mate keeps the team and play continues, which is the spec's stated assumption. A
+	//     carrier's death that hands the Core to the other side changes the team and therefore is a
+	//     break, which is the other stated assumption.
+	//   * MODE B: THE CORE COMING TO REST ON THE GROUND. "the ball drops". Usually the same instant
+	//     as the surface turnover (spec v7 §4), but tested separately so a landing that fails to
+	//     find a receiver still ends the half rather than leaving the whistle waiting on a Core
+	//     nobody is near.
+	//
+	// WHAT DOES NOT COUNT: a within-team pass, a within-team mode-B recovery, a kill that does not
+	// move the Core, a wipe bonus. Play continues.
+	//
+	// THE MERCY RULE IS NOT AFFECTED and must not be. It is a mercy, not a play boundary: it still
+	// ends the match on the frame the lead reaches the threshold, in the middle of a run if that is
+	// where it happens. FinishMatch() clears any pending whistle on its way through, so a mercy win
+	// taken while a half time was pending cannot leave a timer armed under the results screen.
+
+	/** Arms the deferred whistle: pins the clock at 0:00, starts the poll and the hard cap. */
+	void BeginPendingPeriodEnd();
+
+	/** Clears the pending state and both of its timers. Idempotent; safe from anywhere. */
+	void ClearPendingPeriodEnd();
+
+	/**
+	 * Blows the deferred whistle. Clears the pending state first, then ends the period.
+	 * @param Cause "goal" / "turnover" / "core down" / "hard cap" — logged, and only logged.
+	 */
+	void ResolvePendingPeriodEnd(const TCHAR* Cause);
+
+	/**
+	 * Looks for a dead ball. Runs on a short repeating timer, and only while a whistle is pending.
+	 *
+	 * A POLL RATHER THAN A CALLBACK, on purpose: ATraceCore is another ownership slice this pass,
+	 * and the possession events this needs (a grant, a landing) are not published as delegates. A
+	 * 20 Hz read of two accessors on one actor, for at most PeriodEndMaxDeferSeconds once or twice
+	 * a match, is cheaper than the coordination — and it cannot miss an event by being registered
+	 * too late, which a callback added to a foreign file could.
+	 */
+	void PollPendingPeriodEnd();
+
+	/** The old HandleHalfExpired body: the interval, or full time, depending on HalvesPerMatch. */
+	void EndPeriodNow(const TCHAR* Cause);
 
 	/**
 	 * Stops the clock, switches ends IMMEDIATELY (so the interval is spent looking at the field you
@@ -547,9 +653,26 @@ private:
 	 */
 	float LastScoreProcessedWorldTime = -10000.f;
 
+	/**
+	 * Spec v9 §11. The Core holder's TEAM as of the last poll, so a change of team can be told from
+	 * a change of holder. ETraceTeam::None means "nobody holds it right now" and is deliberately NOT
+	 * treated as a turnover on its own — a mode-B throw passes through None on its way from one team
+	 * to the next, and the loose flight in between is not a dead ball.
+	 *
+	 * Seeded when the whistle is armed, not at match start: it only ever has to describe the window
+	 * during which a whistle is pending.
+	 */
+	ETraceTeam PendingEndLastHolderTeam = ETraceTeam::None;
+
 	FTimerHandle WarmupTimerHandle;
 	FTimerHandle MatchTimerHandle;
 	FTimerHandle HalfTimeTimerHandle;
+
+	/** Spec v9 §11. Looping while a whistle is pending; drives PollPendingPeriodEnd(). */
+	FTimerHandle PendingPeriodEndPollHandle;
+
+	/** Spec v9 §11. One-shot guard rail: fires the whistle if no dead ball ever arrives. */
+	FTimerHandle PendingPeriodEndCapHandle;
 	FTimerHandle BotFillTimerHandle;
 	FTimerHandle ReturnToMenuTimerHandle;
 
@@ -586,5 +709,48 @@ private:
 
 	/** Drives the scenarios. Fires every frame-ish; each call advances one step. */
 	void RunVerificationStep();
+
+	// --- Trace.HalfTime.Verify (spec v9 §11) ---------------------------------------------------
+
+	/** One step of the deferred-whistle scenario. See StartHalfTimeVerify(). */
+	void RunHalfTimeVerifyStep();
+
+	FTimerHandle HalfTimeVerifyHandle;
+	int32 HalfTimeVerifyStep = 0;
+	int32 HalfTimeVerifyPassed = 0;
+	int32 HalfTimeVerifyFailed = 0;
+
+	/** Which of the three scenarios is running. See StartHalfTimeVerify(). */
+	ETraceHalfTimeVerifyScenario HalfTimeVerifyScenario = ETraceHalfTimeVerifyScenario::TurnoverVsPass;
+
+	/**
+	 * How many times PollPendingPeriodEnd() has actually examined the Core. Monotonic for the
+	 * process; only ever read as a DIFFERENCE.
+	 *
+	 * The scripted scenarios wait on this instead of on wall-clock. Several headless instances share
+	 * one machine here, and the engine's frame-rate smoothing clamps the world delta, so a step timed
+	 * at 0.2 s can arrive before the 20 Hz detector has run once: the positive case then reports a
+	 * FAIL that is really "the detector never got a tick", and the negative case reports a PASS that
+	 * proves nothing. Both of those have burned this project already.
+	 */
+	int32 PendingPeriodEndPollCount = 0;
+
+	/** PendingPeriodEndPollCount as of the scripted event the current step is waiting on. */
+	int32 HalfTimeVerifyPollMark = 0;
+
+	/** Polls a scripted step will wait for before it gives a verdict. 3 = two clean detector passes. */
+	static constexpr int32 HalfTimeVerifyPollsPerStep = 3;
+
+	/** Steps a scripted step will spend waiting for those polls before failing on the timeout. */
+	static constexpr int32 HalfTimeVerifyMaxWaitSteps = 100;
+
+	/** Steps the current scripted step has spent waiting. Reset when the step number moves on. */
+	int32 HalfTimeVerifyWaitSteps = 0;
+
+	/** The step the wait budget above belongs to. See RunHalfTimeVerifyStep(). */
+	int32 HalfTimeVerifyLastStep = -1;
+
+	/** The carrier the scenario started from, so "a team-mate" and "an enemy" mean something. */
+	TWeakObjectPtr<ATraceCharacter> HalfTimeVerifyHolder;
 #endif
 };

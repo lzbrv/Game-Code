@@ -50,7 +50,11 @@ namespace
 	struct FBotDifficultyLatch
 	{
 		bool bResolved = false;
-		EBotDifficulty Difficulty = EBotDifficulty::Easy;
+
+		// Matches the shipped config default (spec v9 §9: Easy -> Normal). Never actually read while
+		// bResolved is false — GetBotDifficulty() falls back to the CDO, not to this — but a latch
+		// whose idle value disagrees with the shipped default is a trap for the next reader.
+		EBotDifficulty Difficulty = EBotDifficulty::Normal;
 	};
 
 	FBotDifficultyLatch& DifficultyLatch()
@@ -431,7 +435,7 @@ void UTraceSettings::ResolveBotDifficultyFromOptions(const FString& Options, boo
 		return;
 	}
 
-	EBotDifficulty Resolved = EBotDifficulty::Easy;
+	EBotDifficulty Resolved = EBotDifficulty::Normal;
 
 	// 1. The travel URL the title screen wrote ("?difficulty=easy"). ParseOption is used rather
 	//    than FParse::Value because option strings are '?'-delimited with no whitespace, so
@@ -450,7 +454,8 @@ void UTraceSettings::ResolveBotDifficultyFromOptions(const FString& Options, boo
 		return;
 	}
 
-	// 3. Nothing said otherwise: honour the config default, which is EASY.
+	// 3. Nothing said otherwise: honour the config default, which is NORMAL as of spec v9 §9 (it is
+	//    pinned in Config/DefaultGame.ini as well as in the header, and the ini wins).
 	SetBotDifficulty(Get().BotDifficulty);
 }
 
@@ -654,6 +659,39 @@ namespace
 			Table.MantleMaxHeightUU, Table.MantleDurationSeconds, Table.MantleUpPhaseFraction,
 			Table.MantleCooldownSeconds, Table.MantleMinForwardSpeed, Table.LedgeGroundGraceSeconds);
 
+		// -----------------------------------------------------------------------------------------
+		// SPEC v9 §§5-8. Every movement change this pass is a SCALE OVER A BASE, so the line above
+		// (which prints the bases) is only half the story — 950 on the soft-cap line is correct and
+		// 1045 on it would be the bug. This line prints base, scale and PRODUCT for each one, because
+		// the product is the number the game is actually played at and it appears nowhere else.
+		//
+		// The double application this catches is not hypothetical: for part of this pass the bases
+		// here had ALSO been cut by the same factors, and the game was running a 0.88 s slide, a
+		// 0.09 s wall-jump window and a 0.77 retention while every individual number looked right.
+		// -----------------------------------------------------------------------------------------
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsDump:%s] SPECv9 move (base x scale = SHIPPED): gravity=%.3f | "
+			     "airSoft %.0f x %.3f = %.0f, airHard %.0f x %.3f = %.0f | "
+			     "slide %.3fs x %.3f = %.3fs | slideJump %.5f x %.3f (gainOnly=%d) = %.5f | "
+			     "wallWindow %.3fs x %.3f = %.3fs, wallRetention %.3f x %.3f = %.3f, mantleLockout=%.2fs"),
+			Tag, Table.MovementGravityScale,
+			Table.AirStrafeSoftCapSpeed, Table.AirStrafeAsymptoteScale,
+			Table.AirStrafeSoftCapSpeed * Table.AirStrafeAsymptoteScale,
+			Table.AirStrafeHardCapSpeed, Table.AirStrafeAsymptoteScale,
+			Table.AirStrafeHardCapSpeed * Table.AirStrafeAsymptoteScale,
+			Table.SlideDuration, Table.SlideMaxLengthScale,
+			Table.SlideDuration * Table.SlideMaxLengthScale,
+			Table.SlideJumpWindowSpeedBonus, Table.SlideJumpBonusScale,
+			Table.bSlideJumpBonusScalesGainOnly ? 1 : 0,
+			Table.bSlideJumpBonusScalesGainOnly
+				? (1.f + (Table.SlideJumpWindowSpeedBonus - 1.f) * Table.SlideJumpBonusScale)
+				: (Table.SlideJumpWindowSpeedBonus * Table.SlideJumpBonusScale),
+			Table.WallJumpWindowSeconds, Table.WallJumpWindowScale,
+			Table.WallJumpWindowSeconds * Table.WallJumpWindowScale,
+			Table.WallJumpSpeedRetention, Table.WallJumpMomentumScale,
+			Table.WallJumpSpeedRetention * Table.WallJumpMomentumScale,
+			Table.WallJumpMantleLockoutSeconds);
+
 		// Mode B geometry and weight. The BASE throw values are printed next to the mass scale that
 		// multiplies them, because the number a designer types is not the number the Core flies at —
 		// ATraceCore derives gravity x M, speed / sqrt(M), bias x M^1.5, bounce / M from these.
@@ -710,16 +748,44 @@ namespace
 	{
 		UTraceSettings* MutableTable = GetMutableDefault<UTraceSettings>();
 		FProperty* Edited = UTraceSettings::StaticClass()->FindPropertyByName(FName(*PropertyName));
-		FFloatProperty* EditedFloat = CastField<FFloatProperty>(Edited);
 
-		if (MutableTable == nullptr || EditedFloat == nullptr)
+		if (MutableTable == nullptr || Edited == nullptr)
 		{
-			UE_LOG(LogTraceGame, Warning, TEXT("[LiveEdit] '%s' is not a float property of UTraceSettings."), *PropertyName);
+			UE_LOG(LogTraceGame, Warning, TEXT("[LiveEdit] '%s' is not a property of UTraceSettings."), *PropertyName);
 			return;
 		}
 
-		const float PreviousValue = EditedFloat->GetPropertyValue_InContainer(MutableTable);
-		EditedFloat->SetPropertyValue_InContainer(MutableTable, NewValue);
+		// FLOATS, BOOLS AND INTS, not floats alone. This used to reject anything that was not an
+		// FFloatProperty, which quietly meant every switch on the page — bAirStrafeGainFalloff,
+		// bWallJumpEnabled, bSlideJumpBonusScalesGainOnly, bDeferPeriodEndToPlayBreak — was NOT
+		// live-editable and could only be moved by an ini edit and a restart. A knob that needs a
+		// restart is half a knob, and the bool ones are exactly the knobs a playtest wants to flip
+		// mid-session to compare two readings of a note.
+		//
+		// Non-zero is true, matching every other console-driven bool in the engine.
+		float PreviousValue = 0.f;
+		if (FFloatProperty* EditedFloat = CastField<FFloatProperty>(Edited))
+		{
+			PreviousValue = EditedFloat->GetPropertyValue_InContainer(MutableTable);
+			EditedFloat->SetPropertyValue_InContainer(MutableTable, NewValue);
+		}
+		else if (FBoolProperty* EditedBool = CastField<FBoolProperty>(Edited))
+		{
+			PreviousValue = EditedBool->GetPropertyValue_InContainer(MutableTable) ? 1.f : 0.f;
+			EditedBool->SetPropertyValue_InContainer(MutableTable, !FMath::IsNearlyZero(NewValue));
+		}
+		else if (FIntProperty* EditedInt = CastField<FIntProperty>(Edited))
+		{
+			PreviousValue = static_cast<float>(EditedInt->GetPropertyValue_InContainer(MutableTable));
+			EditedInt->SetPropertyValue_InContainer(MutableTable, FMath::RoundToInt(NewValue));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[LiveEdit] '%s' exists but is a %s — this path edits float, bool and int knobs only."),
+				*PropertyName, *Edited->GetClass()->GetName());
+			return;
+		}
 
 #if WITH_EDITOR
 		// Byte for byte what the details panel does after it writes the value.
@@ -750,7 +816,12 @@ namespace
 	// knob to hide.
 	// =============================================================================================
 
-	enum class EKnobType : uint8 { Float, Bool, Int };
+	// Enum was added in v9 for BotDifficulty (spec §9). A UPROPERTY of an `enum class X : uint8`
+	// becomes an FEnumProperty in UE5, NOT an FByteProperty — both are accepted below because a
+	// UENUM declared without an explicit underlying type still lands as the latter, and a knob that
+	// reported DEAD purely because of which of the two UHT chose would be a false alarm in the one
+	// tool whose job is to have no false alarms.
+	enum class EKnobType : uint8 { Float, Bool, Int, Enum };
 
 	struct FKnobSpec
 	{
@@ -874,6 +945,52 @@ namespace
 			// §5 the carrier's second dash charge. The spec's first suspect was "CarrierExtraDashCharges
 			// may be 0 in the ini, which WINS over the header default", so the value is worth printing.
 			{ TEXT("CarrierExtraDashCharges"),         EKnobType::Int,   TEXT("v8 §5: the carrier's 2nd charge - must read 1") },
+
+			// --- spec v9, every knob this pass introduced or moved -----------------------------
+			//
+			// §9 the default bot difficulty. It is on this list even though nothing binds it by name,
+			// because the failure mode is the same shape: the value the game uses comes from
+			// DefaultGame.ini, the header literal is only what a reader sees, and "I changed the
+			// default and it still starts on Easy" is exactly what a missing ini key looks like.
+			// MUST PRINT Normal.
+			{ TEXT("BotDifficulty"),                   EKnobType::Enum,  TEXT("v9 §9: Easy -> Normal, must read Normal") },
+
+			// §11 the deferred whistle. Both are read AT THE POINT OF USE by ATraceGameMode, so they
+			// retune live; the cap is the stalemate guard rail and must never ship at 0.
+			{ TEXT("bDeferPeriodEndToPlayBreak"),      EKnobType::Bool,  TEXT("v9 §11: clock expiry ARMS the whistle, next dead ball blows it") },
+			{ TEXT("PeriodEndMaxDeferSeconds"),        EKnobType::Float, TEXT("v9 §11: hard cap on the defer, 60s, 0 = never force it") },
+
+			// §§5-8 THE MOVEMENT SCALARS. Every one of these is a v9 change expressed as its own
+			// named multiplier over the designer's existing base value, rather than as an edit to the
+			// base — so re-tuning the base and re-tuning the v9 change never fight, and reverting a
+			// v9 number is one line rather than an archaeology exercise.
+			//
+			// ALL EIGHT ARE BOUND BY NAME by UTraceCharacterMovementComponent through TraceMoveKnob,
+			// and every one of them shipped DEAD for part of this pass: the component asked for
+			// "MovementGravityScale" while this page declared "PlayerGravityScale", and the other
+			// seven had no property here at all. The component's own MOVEKNOB report said FALLBACK
+			// for all five it had reached, the build was green, the settings panel looked complete,
+			// and the game ran at 1.0 gravity. THAT is the failure this table exists to catch.
+			//
+			// The base + scale pairs, and what the product must come to:
+			//   MovementGravityScale     1.12                                    (§8, gravity x1.12)
+			//   AirStrafeAsymptoteScale  950 x 1.10 = 1045, 1250 x 1.10 = 1375   (§8, asymptote +10%)
+			//   SlideMaxLengthScale      1.80 x 0.70 = 1.26 s                    (§6, length -30%)
+			//   SlideJumpBonusScale      1 + 0.3125 x 1.30 = 1.40625             (§7, bonus +30%)
+			//   WallJumpWindowScale      0.25 x 0.60 = 0.15 s                    (§5, shorter window)
+			//   WallJumpMomentumScale    0.95 x 0.90 = 0.855                     (§5, -10% momentum)
+			// The bases themselves are already listed in the v5/v8 blocks above and are deliberately
+			// NOT repeated here — a second row would double-count them in the bound/dead summary —
+			// but their printed values there are half of the evidence: base x scale is the shipped
+			// number, and a base that has ALSO been cut is the double-application bug.
+			{ TEXT("MovementGravityScale"),            EKnobType::Float, TEXT("v9 §8: x1.12, less floaty [by-name bind]") },
+			{ TEXT("AirStrafeAsymptoteScale"),         EKnobType::Float, TEXT("v9 §8: x1.10 over BOTH air caps -> 1045/1375 [by-name bind]") },
+			{ TEXT("SlideMaxLengthScale"),             EKnobType::Float, TEXT("v9 §6: x0.70 over SlideDuration -> 1.26s [by-name bind]") },
+			{ TEXT("SlideJumpBonusScale"),             EKnobType::Float, TEXT("v9 §7: x1.30 over the bonus -> 1.40625 [by-name bind]") },
+			{ TEXT("bSlideJumpBonusScalesGainOnly"),   EKnobType::Bool,  TEXT("v9 §7: true = scale the gain (1.40625), false = the whole multiplier (1.70625) [by-name bind]") },
+			{ TEXT("WallJumpWindowScale"),             EKnobType::Float, TEXT("v9 §5: x0.60 over the contact window -> 0.15s [by-name bind]") },
+			{ TEXT("WallJumpMomentumScale"),           EKnobType::Float, TEXT("v9 §5: x0.90 over retention -> 0.855 [by-name bind]") },
+			{ TEXT("WallJumpMantleLockoutSeconds"),    EKnobType::Float, TEXT("v9 §5: a wall jump beats a mantle for this long [by-name bind]") },
 		};
 
 		const UTraceSettings& Table = UTraceSettings::Get();
@@ -911,6 +1028,22 @@ namespace
 					{
 						bTypeOk = true;
 						Value = FString::Printf(TEXT("%d"), AsInt->GetPropertyValue_InContainer(&Table));
+					}
+					break;
+				case EKnobType::Enum:
+					if (CastField<FEnumProperty>(Found) != nullptr || CastField<FByteProperty>(Found) != nullptr)
+					{
+						bTypeOk = true;
+
+						// ExportText rather than reading the underlying byte: the ENUMERATOR NAME is
+						// what Config/DefaultGame.ini serialises ("BotDifficulty=Normal"), so printing
+						// the name is what lets a reader compare this line against the ini directly.
+						//
+						// Reset() first — ExportText_InContainer APPENDS to the string it is handed,
+						// and Value still carries the "<unbound>" placeholder the other branches
+						// overwrite wholesale.
+						Value.Reset();
+						Found->ExportText_InContainer(0, Value, &Table, &Table, nullptr, PPF_None);
 					}
 					break;
 				}

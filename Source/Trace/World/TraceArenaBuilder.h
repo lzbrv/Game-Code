@@ -556,6 +556,63 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Trace|Banks", meta = (ClampMin = "0.0"))
 	float BankHeight = 352.f;
 
+	// --- Wall fillets (spec v9 section 10) --------------------------------------------------------
+	//
+	// "Curve the corners of the arena walls, so that the crosssection of the arena looks something
+	// along these lines" - a concave COVE running along the base of every wall instead of a hard 90
+	// degree join. Two pieces answer that, because the arena does not have one wall/floor join, it
+	// has two:
+	//
+	//   1. THE CORNER BANKS were already the transition along the side walls, and they were a
+	//      STRAIGHT ramp that hit the wall dead square at its crest. BuildCornerBanks now lays its
+	//      terraces on a quarter-ellipse instead of on a line, so the bank IS the curve.
+	//   2. EVERYWHERE ELSE - both end walls, the endzone stretches of side wall, and the midfield
+	//      taper where the bank is only one terrace tall - gets its own small cove from
+	//      BuildWallFillets.
+	//
+	// Both are built by the same profile generator (TraceCoveProfile in the .cpp) under the same
+	// three rules, and those rules are what keep the curve WALKABLE and free of false affordances:
+	//   riser <= StepRise          so UCharacterMovementComponent steps up it without the mover
+	//                              ever knowing there was a step (and 40 < MantleMinHeightUU 55, so
+	//                              no single riser can ever read as a climbable ledge);
+	//   tread >= FilletMinTread    so the mantle's top probe, which lands CapsuleRadius*0.5 = 17 uu
+	//                              past the face it found, can never SKIP a tread and report a
+	//                              two-riser ledge that would be inside the mantle window;
+	//   inner edge >= 40 uu        so the cove stops at the pawn standoff line and never leaves a
+	//                              walkable sliver a body cannot actually reach.
+	// A cove is tangent to the wall at its top, so those rules necessarily truncate it: the curve
+	// blends until it is ~57 degrees and the wall goes vertical from there. That is the steepest a
+	// staircase of 37 uu risers can be while still keeping a 24 uu tread.
+
+	/** Master switch for the cove along the base of every wall. */
+	UPROPERTY(EditAnywhere, Category = "Trace|Walls")
+	bool bBuildWallFillets = true;
+
+	/**
+	 * How far the cove reaches IN from a wall face, i.e. the horizontal semi-axis of the quarter
+	 * ellipse. This is the number that decides how much floor the curve eats.
+	 *
+	 * 600 checked against everything that stands near a wall on the shipped 33600 x 9600 field:
+	 * corner pylons are 720 uu off the side wall, the outer lane stripe 1632, the spawn fan 1920,
+	 * the gate towers 300 (the cove is 30 uu tall there, i.e. a floor decal). The wall buttresses
+	 * are flush with the wall and 200 deep, so they simply rise out of the cove.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Walls", meta = (ClampMin = "0.0"))
+	float WallFilletDepth = 600.f;
+
+	/**
+	 * Vertical semi-axis of the cove, i.e. how far up the wall it would reach if it ran all the way
+	 * to tangency. The staircase truncates before that - at 296 it yields six 37 uu risers topping
+	 * out at 222 uu with the innermost tread 44 uu off the wall.
+	 *
+	 * KEPT UNDER THE MODE-B GOAL FURNITURE on the end walls, and that clamp is applied per step at
+	 * build time against the real ramp geometry rather than assumed here: the carry-in ramp climbs
+	 * to GoalRampTopZ (224 uu) over GoalRampRunPerRise x that, and a cove step poking through it
+	 * would put a lip across the mouth of the hoop. See BuildWallFillets.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Walls", meta = (ClampMin = "0.0"))
+	float WallFilletHeight = 296.f;
+
 	/**
 	 * Master switch for the flank dressing: wall buttresses, the high rails they carry, the light
 	 * bridges out to the lane pylons, the outer-lane floor stripes and the corner pylons.
@@ -714,6 +771,21 @@ protected:
 	 * TERRAIN, which is what the sketch actually draws.
 	 */
 	void BuildCornerBanks(bool bBuildVisuals);
+
+	/**
+	 * The concave cove along the base of every perimeter wall (spec v9 section 10).
+	 *
+	 * Four runs of nested boxes rising from Z = 0, exactly like a corner bank, so the union with the
+	 * bank, with the floor and with the mode-B approach ramp is provably still walkable: each of
+	 * those is a monotone staircase whose risers are under StepRise, and the pointwise MAXIMUM of
+	 * two such staircases is another one (max is 1-Lipschitz). That is why this can be overlaid on
+	 * the arena without auditing every surface it crosses.
+	 *
+	 * Built inside bBuildCornerBanks' sibling switch bBuildWallFillets, and OUTSIDE the bBuildVisuals
+	 * gate for the collision, because a dedicated server has to build the ground its clients are
+	 * predicting against.
+	 */
+	void BuildWallFillets(bool bBuildVisuals);
 
 	void BuildCoverField(bool bBuildVisuals);
 	void BuildFlanks(bool bBuildVisuals);
@@ -1011,6 +1083,14 @@ protected:
 	 */
 	float BankInnerHalfWidth() const;
 
+	/**
+	 * How far the wall cove's TOE reaches in from a wall face, or 0 when the cove is switched off.
+	 *
+	 * Anything drawn flat on the floor within this of a wall would be buried inside the cove, so the
+	 * two endzone sideline rails measure themselves against this rather than against the sideline.
+	 */
+	float WallFilletToeDepth() const;
+
 	/** Top of the centre diamond, i.e. the surface the Core pedestal stands on. */
 	float DaisTopZ() const;
 
@@ -1233,6 +1313,18 @@ private:
 	 * build, so the arena can never come out half instanced.
 	 */
 	bool bBuildingInstancedGeometry = true;
+
+	/**
+	 * THE BEFORE ARM FOR SPEC v9 SECTION 10, latched the same way and for the same reason.
+	 *
+	 * Spec v9 section 0 is a post-mortem on a fix that was reported green by a harness that never went
+	 * red, so the square-cornered arena has to still be buildable FROM THIS BINARY: the corner banks
+	 * fall back to evenly spaced terraces (a straight ramp meeting the wall at 90 degrees) and the
+	 * wall cove is not built at all. Set with Trace.Arena.WallCove 0 before the arena is built, or -
+	 * because the arena is built from ATraceGameMode::PreInitializeComponents, earlier than any
+	 * console command can run - with -TraceArenaSquareCorners on the command line.
+	 */
+	bool bBuildingSquareCorners = false;
 
 	/**
 	 * True only while BuildArena() is running for the editor preview.
