@@ -36,6 +36,8 @@
 #include "EngineUtils.h"                       // TActorIterator
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
+#include "Scalability.h"                       // spec v11 §3 - the quality levels the fidelity ladder reads
+#include "Settings/TraceGameUserSettings.h"    // Trace.Video.PresetAB drives the real settings path
 #include "UObject/ConstructorHelpers.h"
 #include "UObject/UObjectGlobals.h"            // NewObject, MakeUniqueObjectName
 
@@ -1600,6 +1602,16 @@ void ATraceArenaBuilder::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 	SpawnedActors.Reset();
 
+	// Unsubscribed on every EndPlay reason, not just Destroyed: the delegate is a global multicast
+	// that outlives the world, and a handle left behind on level teardown is a call into a dead actor
+	// the next time anybody touches the video settings. AddWeakLambda makes that safe rather than
+	// fatal; removing it makes it not happen.
+	if (ScalabilityChangedHandle.IsValid())
+	{
+		Scalability::OnScalabilitySettingsChanged.Remove(ScalabilityChangedHandle);
+		ScalabilityChangedHandle.Reset();
+	}
+
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -1721,6 +1733,21 @@ void ATraceArenaBuilder::BuildArena()
 	// what decides a pool's mobility) and BEFORE ApplyScoringMode (which rewrites instance transforms
 	// through components that must already be registered at the right mobility).
 	FlushInstancePools();
+
+	// SPEC v11 §3. The volume and the lights exist now, so the quality ladder can be written into
+	// them - and it has to be written HERE rather than inside BuildPostProcess/BuildLighting, because
+	// it is re-applied on every later scalability change and there must be exactly one function that
+	// decides what a tier means. Subscribing here rather than in BeginPlay covers the editor preview
+	// and the measurement rebuild, both of which build without ever beginning play.
+	if (!ScalabilityChangedHandle.IsValid())
+	{
+		ScalabilityChangedHandle = Scalability::OnScalabilitySettingsChanged.AddWeakLambda(this,
+			[this](const Scalability::FQualityLevels&)
+			{
+				ApplyFidelity();
+			});
+	}
+	ApplyFidelity();
 
 	// Present one of the two scoring shapes and disarm the other. Forced rather than early-returned
 	// on "the mode did not change", because at this point NOTHING has been presented yet: the goal
@@ -3863,6 +3890,14 @@ void ATraceArenaBuilder::BuildLighting()
 			LightComponent->SetLightColor(Spec.Color);
 			LightComponent->SetCastShadows(Spec.bCastShadows);
 			LightComponent->SetAtmosphereSunLight(Spec.bAtmosphereSun);
+
+			// The one shadow caster is the one the Shadows quality row drives - see ApplyFidelity.
+			// Remembered here rather than re-found later, because "which light casts the shadows" is
+			// decided by the table above and nowhere else.
+			if (Spec.bCastShadows)
+			{
+				KeyLightComponent = LightComponent;
+			}
 		}
 
 		SpawnedActors.Add(Light);
@@ -4031,7 +4066,600 @@ void ATraceArenaBuilder::BuildPostProcess()
 	PP.bOverride_SceneFringeIntensity = true;
 	PP.SceneFringeIntensity = 0.2f;
 
+	// Everything above is the art direction and is the same at every quality level. Everything that
+	// COSTS - ambient occlusion, Lumen, the bloom method, SSR quality - is written by ApplyFidelity
+	// instead, from the scalability levels, and re-written whenever they change. Keeping the two
+	// apart is what stops a quality change from quietly editing the look.
+	ArenaPostProcess = Volume;
+
 	SpawnedActors.Add(Volume);
+}
+
+// =================================================================================================
+// SPEC v11 §3 - THE FIDELITY LADDER
+//
+// One function writes every expensive renderer feature this arena can turn on, from the engine's
+// scalability levels, into the arena's own post-process volume and lights. Read the block above
+// ApplyFidelity() in the header for the group->feature mapping; what follows is why each rung is
+// where it is.
+//
+// THE RULE THIS FILE OBEYS, from spec v11 §0: nothing that costs frames may be on by default. Every
+// ladder below therefore has its cheap end at tier 0 and its expensive end at tier 3, and the two
+// genuinely expensive features - Lumen and FFT bloom - do not appear at all below tier 2 and tier 3
+// respectively. Turning the quality DOWN in this file always removes work; it never substitutes one
+// expensive thing for another.
+//
+// THE OVERRIDE CVARS EXIST FOR MEASUREMENT, not for shipping. Trace.Arena.Fidelity forces every
+// group to one tier; Trace.Arena.Fidelity.<Feature> forces one group and leaves the rest following
+// scalability. Both default to -1, "follow the scalability level", which is what a player's video
+// settings drive. Trace.Arena.FidelityAB uses them to interleave one-feature-at-a-time arms in a
+// single process, which is the only way to get a per-feature cost that is not contaminated by a
+// second UE run starting up inside the sample window (see the Trace.Arena.PerfAB header).
+// =================================================================================================
+
+namespace
+{
+	/** -1 = follow scalability. 0..3 = force Low/Medium/High/Epic on every group at once. */
+	int32 GArenaFidelity = -1;
+
+	/** Per-group overrides. -1 = follow this group's scalability level (then the master above). */
+	int32 GArenaFidelityGI = -1;
+	int32 GArenaFidelityReflections = -1;
+	int32 GArenaFidelityAO = -1;
+	int32 GArenaFidelityShadows = -1;
+	int32 GArenaFidelityBloom = -1;
+	int32 GArenaFidelityLamps = -1;
+
+	/** Every game/PIE world's arena re-reads the ladder. Cheap: a few dozen property writes. */
+	void ApplyArenaFidelityEverywhere()
+	{
+		if (GEngine == nullptr)
+		{
+			return;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if (Context.World() != nullptr)
+			{
+				ATraceArenaBuilder::ApplyFidelityInWorld(Context.World());
+			}
+		}
+	}
+
+	void OnArenaFidelityCVarChanged(IConsoleVariable* /*Changed*/)
+	{
+		ApplyArenaFidelityEverywhere();
+	}
+
+	FAutoConsoleVariableRef CVarArenaFidelity(
+		TEXT("Trace.Arena.Fidelity"),
+		GArenaFidelity,
+		TEXT("-1 (default) = every arena fidelity group follows its own scalability level, i.e. the video ")
+		TEXT("settings. 0/1/2/3 = force Low/Medium/High/Epic on ALL of them. For measurement (spec v11 3)."),
+		FConsoleVariableDelegate::CreateStatic(&OnArenaFidelityCVarChanged), ECVF_Default);
+
+	FAutoConsoleVariableRef CVarArenaFidelityGI(
+		TEXT("Trace.Arena.Fidelity.GI"),
+		GArenaFidelityGI,
+		TEXT("-1 = follow the Global Illumination scalability level. 0/1 = no dynamic GI (the shipped ")
+		TEXT("look). 2 = Lumen GI at half quality. 3 = Lumen GI at full quality. THE EXPENSIVE ONE."),
+		FConsoleVariableDelegate::CreateStatic(&OnArenaFidelityCVarChanged), ECVF_Default);
+
+	FAutoConsoleVariableRef CVarArenaFidelityReflections(
+		TEXT("Trace.Arena.Fidelity.Reflections"),
+		GArenaFidelityReflections,
+		TEXT("-1 = follow the Reflections scalability level. 0..2 = screen-space reflections at rising ")
+		TEXT("quality (2 is the shipped look). 3 = Lumen reflections, but only if GI is already at 2+."),
+		FConsoleVariableDelegate::CreateStatic(&OnArenaFidelityCVarChanged), ECVF_Default);
+
+	FAutoConsoleVariableRef CVarArenaFidelityAO(
+		TEXT("Trace.Arena.Fidelity.AO"),
+		GArenaFidelityAO,
+		TEXT("-1 = follow the Post Processing scalability level. 0 = no ambient occlusion (the shipped ")
+		TEXT("state - r.DefaultFeature.AmbientOcclusion is False). 1..3 = SSAO at rising quality."),
+		FConsoleVariableDelegate::CreateStatic(&OnArenaFidelityCVarChanged), ECVF_Default);
+
+	FAutoConsoleVariableRef CVarArenaFidelityShadows(
+		TEXT("Trace.Arena.Fidelity.Shadows"),
+		GArenaFidelityShadows,
+		TEXT("-1 = follow the Shadows scalability level. 0 = the key light casts NO shadows at all (no ")
+		TEXT("cascade pass). 1/2/3 = 2/3/4 cascades at rising resolution; 3 adds contact shadows."),
+		FConsoleVariableDelegate::CreateStatic(&OnArenaFidelityCVarChanged), ECVF_Default);
+
+	FAutoConsoleVariableRef CVarArenaFidelityBloom(
+		TEXT("Trace.Arena.Fidelity.Bloom"),
+		GArenaFidelityBloom,
+		TEXT("-1 = follow the Post Processing scalability level. 0..2 = standard sum-of-Gaussians bloom ")
+		TEXT("(the shipped look). 3 = FFT convolution bloom. Bloom itself is never switched off: it is ")
+		TEXT("what makes an emissive strip read as neon."),
+		FConsoleVariableDelegate::CreateStatic(&OnArenaFidelityCVarChanged), ECVF_Default);
+
+	FAutoConsoleVariableRef CVarArenaFidelityLamps(
+		TEXT("Trace.Arena.Fidelity.Lamps"),
+		GArenaFidelityLamps,
+		TEXT("-1 = follow the Effects scalability level. 0..3 scales the floor-lamp lattice's attenuation ")
+		TEXT("radius from 45%% to 100%% of what it was built at. Each lamp is an unshadowed deferred light, ")
+		TEXT("so its cost is its SCREEN FOOTPRINT and the radius is the dial on that."),
+		FConsoleVariableDelegate::CreateStatic(&OnArenaFidelityCVarChanged), ECVF_Default);
+
+	/** Every arena fidelity group's resolved tier, 0..3. */
+	struct FArenaFidelityTiers
+	{
+		int32 GI = 0;
+		int32 Reflections = 0;
+		int32 AO = 0;
+		int32 Shadows = 0;
+		int32 Bloom = 0;
+		int32 Lamps = 0;
+	};
+
+	/** Per-feature override, then the master override, then the scalability level. Always 0..3. */
+	int32 ResolveArenaTier(int32 GroupLevel, int32 FeatureOverride)
+	{
+		if (FeatureOverride >= 0)
+		{
+			return FMath::Clamp(FeatureOverride, 0, 3);
+		}
+		if (GArenaFidelity >= 0)
+		{
+			return FMath::Clamp(GArenaFidelity, 0, 3);
+		}
+
+		// Clamped rather than indexed raw: scalability groups can legally read 4 ("Cine") and every
+		// ladder in this file is four rungs long. Cine gets Epic, which is the honest answer - this
+		// file has nothing above Epic to give it.
+		return FMath::Clamp(GroupLevel, 0, 3);
+	}
+
+	FArenaFidelityTiers ResolveArenaFidelityTiers()
+	{
+		const Scalability::FQualityLevels Levels = Scalability::GetQualityLevels();
+
+		FArenaFidelityTiers Tiers;
+		Tiers.GI = ResolveArenaTier(Levels.GlobalIlluminationQuality, GArenaFidelityGI);
+		Tiers.Reflections = ResolveArenaTier(Levels.ReflectionQuality, GArenaFidelityReflections);
+		Tiers.AO = ResolveArenaTier(Levels.PostProcessQuality, GArenaFidelityAO);
+		Tiers.Shadows = ResolveArenaTier(Levels.ShadowQuality, GArenaFidelityShadows);
+		Tiers.Bloom = ResolveArenaTier(Levels.PostProcessQuality, GArenaFidelityBloom);
+		Tiers.Lamps = ResolveArenaTier(Levels.EffectsQuality, GArenaFidelityLamps);
+		return Tiers;
+	}
+
+	const TCHAR* ArenaTierName(int32 Tier)
+	{
+		static const TCHAR* const Names[] = { TEXT("Low"), TEXT("Medium"), TEXT("High"), TEXT("Epic") };
+		return Names[FMath::Clamp(Tier, 0, 3)];
+	}
+
+	/**
+	 * r.GenerateMeshDistanceFields, or -1 if the cvar is not registered.
+	 *
+	 * LUMEN'S SOFTWARE RAY TRACING HAS NOTHING TO TRACE AGAINST WITHOUT IT. The project currently
+	 * ships it False (Config/DefaultEngine.ini), and this arena is not Nanite and never will be (see
+	 * the note in ApplyFidelity), so with distance fields off Lumen builds a surface cache it cannot
+	 * reach and the GI it produces is the sky light and nothing else - at full price. That is exactly
+	 * the "costs 4 ms and you cannot see it" failure spec v11 §4 asks to be reported rather than
+	 * shipped, so the state is logged whenever Lumen is armed instead of being left to a screenshot.
+	 */
+	int32 ArenaMeshDistanceFieldsEnabled()
+	{
+		if (const IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.GenerateMeshDistanceFields")))
+		{
+			return CVar->GetInt();
+		}
+		return -1;
+	}
+
+	/**
+	 * THE RUNG AT WHICH LUMEN ARMS, AND WHY IT IS EPIC AND NOT HIGH.
+	 *
+	 * Spec v11 §0: "Nothing that costs frames may become the default without an auto-detect deciding
+	 * it." The shipped default in Config/DefaultGameUserSettings.ini is HIGH on every group (tier 2),
+	 * and on this Mac it stays High forever because the Metal synthetic benchmark is broken and the
+	 * settings class falls back to the shipped default rather than trusting its garbage reading. So
+	 * "Lumen at tier 2" and "Lumen by default" are the same sentence here, and the spec forbids it.
+	 *
+	 * At tier 3 the ladder reads: LOW/MEDIUM/HIGH = no GI (High reproduces the shipped look exactly,
+	 * which is also what makes "did the fidelity pass regress the default frame?" answerable with a
+	 * yes/no), EPIC = Lumen. A player opts in with one keypress on the VIDEO page, and an auto-detect
+	 * that picks Epic on a strong GPU is the one path allowed to opt in for them.
+	 *
+	 * The honest cost of that choice: GLOBAL ILLUMINATION now has three rungs that render the same
+	 * thing. That is not a knob that does nothing — it is a binary feature drawn on a four-rung
+	 * ladder, because Lumen is the only GI implementation this project has, and a half-priced Lumen
+	 * still pays the whole scene-representation cost, which is most of it on a scene this simple.
+	 */
+	constexpr int32 ArenaLumenMinGITier = 3;
+
+	/**
+	 * True when Lumen GI should actually be armed: the tier asked for it AND the project has mesh
+	 * distance fields for its software tracing to hit.
+	 *
+	 * One function so that ApplyFidelity and DescribeFidelity can never disagree — a log line that
+	 * claims Lumen on a frame that does not have it is worse than no log line.
+	 */
+	bool ArenaLumenGIArmed(int32 GITier)
+	{
+		return (GITier >= ArenaLumenMinGITier) && (ArenaMeshDistanceFieldsEnabled() != 0);
+	}
+}
+
+void ATraceArenaBuilder::ApplyFidelityInWorld(const UWorld* World)
+{
+	if (ATraceArenaBuilder* Builder = Get(World))
+	{
+		Builder->ApplyFidelity();
+	}
+}
+
+FString ATraceArenaBuilder::DescribeFidelity() const
+{
+	const FArenaFidelityTiers Tiers = ResolveArenaFidelityTiers();
+
+	// Shares ArenaLumenGIArmed with ApplyFidelity, so a log line can never claim Lumen on a build
+	// where mesh distance fields hold it off. See the gate for why that is the prerequisite.
+	const bool bLumenGI = ArenaLumenGIArmed(Tiers.GI);
+
+	// Three distinct states, and the third one is the one worth spelling out: a tier that ASKED for
+	// Lumen and did not get it looks identical in a screenshot to a tier that never asked.
+	const TCHAR* const GIState = bLumenGI
+		? TEXT("Lumen")
+		: ((Tiers.GI >= ArenaLumenMinGITier) ? TEXT("Lumen HELD OFF - no mesh distance fields") : TEXT("none"));
+
+	// AO PRINTS ITS ARMED STATE, NOT ITS TIER, and the distinction is the whole point of the AO
+	// block: the tier can read Epic while ambient occlusion is off, because it is only armed where
+	// Lumen makes it free. "AO=Epic" on a frame with no AO in it is exactly the kind of log line
+	// that costs an afternoon.
+	return FString::Printf(
+		TEXT("GI=%s(%s) Reflections=%s(%s) AO=%s Shadows=%s Bloom=%s(%s) Lamps=%s"),
+		ArenaTierName(Tiers.GI), GIState,
+		ArenaTierName(Tiers.Reflections),
+		(bLumenGI && Tiers.Reflections >= 3) ? TEXT("Lumen")
+			: ((Tiers.Reflections <= 0) ? TEXT("off") : TEXT("SSR")),
+		(bLumenGI && Tiers.AO >= 3) ? TEXT("on(Lumen short-range)") : TEXT("off"),
+		ArenaTierName(Tiers.Shadows),
+		ArenaTierName(Tiers.Bloom), (Tiers.Bloom >= 3) ? TEXT("FFT") : TEXT("SOG"),
+		ArenaTierName(Tiers.Lamps));
+}
+
+void ATraceArenaBuilder::ApplyFidelity()
+{
+	// Nothing here renders, and a dedicated server has no post-process volume and no lights to tune.
+	if (GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+
+	const FArenaFidelityTiers Tiers = ResolveArenaFidelityTiers();
+
+	// -----------------------------------------------------------------------------------------
+	// NANITE IS DELIBERATELY ABSENT FROM THIS LADDER, at every tier, and this is the note spec v11
+	// §3 asks for rather than a silent omission.
+	//
+	// The arena is a few hundred INSTANCES of /Engine/BasicShapes/Cube (12 triangles) and Cylinder,
+	// already pooled into a few dozen UInstancedStaticMeshComponents by mesh + material + shadow
+	// (see the INSTANCING block in the header). Nanite's cluster culling, software rasteriser and
+	// visibility-buffer material pass are a fixed per-frame overhead that pays for itself on dense
+	// meshes by removing per-triangle work there is none of here - the whole arena is well under
+	// what a single Nanite cluster page is sized for. Enabling it would add a rasteriser and a
+	// material resolve pass to a frame that is already per-pixel bound, in exchange for culling
+	// nothing. It is not enabled, and it should not be enabled if this arena ever doubles in size
+	// either; the thing that would change that answer is real art, not more boxes.
+	// -----------------------------------------------------------------------------------------
+
+	if (APostProcessVolume* Volume = ArenaPostProcess.Get())
+	{
+		FPostProcessSettings& PP = Volume->Settings;
+
+		// --- 1. LUMEN GI AND REFLECTIONS -----------------------------------------------------
+		//
+		// The one that suits the art direction exactly: every neon strip in this arena is an
+		// emissive surface, and Lumen is the only path in this project that lets an emissive
+		// surface light anything but itself. Everything else - the three directional lights, the
+		// 32-lamp lattice, the BounceLight that exists purely to fake floor bounce - is a
+		// stand-in for the GI that is switched off.
+		//
+		// OFF BELOW EPIC, ENTIRELY. Not "cheap Lumen": the method is set to None, so no Lumen
+		// scene is built, no surface cache is captured and no card capture runs. A half-priced
+		// Lumen would still pay the whole scene-representation cost, which is most of it on a
+		// scene this simple. ArenaLumenMinGITier carries the argument for why that rung is Epic and
+		// not High; the short version is that High is the SHIPPED DEFAULT and spec v11 §0 forbids a
+		// default that costs frames.
+		//
+		// THE SECOND HALF OF THE GATE IS MESH DISTANCE FIELDS, and it is a genuine prerequisite
+		// rather than a safety belt: Lumen's software ray tracing traces against mesh distance
+		// fields, and this arena is not Nanite and must not be, so there is no
+		// surface-cache-from-Nanite path either. With r.GenerateMeshDistanceFields=0 Lumen builds a
+		// surface cache it cannot reach and produces the sky light and nothing else - AT FULL PRICE.
+		// That is exactly the "costs 4 ms and you cannot see it" failure spec v11 §4 asks to be
+		// reported rather than shipped, so it is refused in code and logged, not left to a
+		// screenshot. Config/DefaultEngine.ini now sets it True (it is a restart-and-rebuild
+		// project setting, not a runtime one), which is what makes EPIC mean Lumen.
+		const bool bDistanceFields = (ArenaMeshDistanceFieldsEnabled() != 0);
+
+		const bool bLumenGI = ArenaLumenGIArmed(Tiers.GI);
+		const bool bLumenReflections = bLumenGI && (Tiers.Reflections >= 3);
+
+		if (Tiers.GI >= ArenaLumenMinGITier && !bDistanceFields)
+		{
+			// Once per process, at Log. It is a configuration fact, not a per-frame problem, and this
+			// function runs on every scalability change.
+			static bool bWarnedAboutDistanceFields = false;
+			if (!bWarnedAboutDistanceFields)
+			{
+				bWarnedAboutDistanceFields = true;
+				UE_LOG(LogTraceGame, Log,
+					TEXT("ATraceArenaBuilder: Global Illumination is at %s but r.GenerateMeshDistanceFields ")
+					TEXT("is 0, so Lumen is held OFF - it would cost full price and light nothing without a ")
+					TEXT("distance-field scene to trace. Set r.GenerateMeshDistanceFields=True in ")
+					TEXT("Config/DefaultEngine.ini to make High/Epic mean Lumen."),
+					ArenaTierName(Tiers.GI));
+			}
+		}
+
+		PP.bOverride_DynamicGlobalIlluminationMethod = true;
+		PP.DynamicGlobalIlluminationMethod = bLumenGI
+			? EDynamicGlobalIlluminationMethod::Lumen
+			: EDynamicGlobalIlluminationMethod::None;
+
+		// TIER 0 TURNS THE FLOOR REFLECTION OFF ENTIRELY, and that is a considered Low-preset trade
+		// rather than an oversight. SSR is a full-screen stochastic trace over a frame whose lower
+		// third is a near-mirror; halving its quality halves its noise budget but not its pass. The
+		// arena still reads - the neon is emissive and unaffected - it just loses its mirror.
+		PP.bOverride_ReflectionMethod = true;
+		PP.ReflectionMethod = bLumenReflections
+			? EReflectionMethod::Lumen
+			: ((Tiers.Reflections <= 0) ? EReflectionMethod::None : EReflectionMethod::ScreenSpace);
+
+		if (bLumenGI)
+		{
+			// Always true while ArenaLumenMinGITier is 3, and kept as a named condition rather than
+			// folded away so that the two-rung Lumen ladder below survives intact if a future map
+			// with real art ever earns a cheaper Lumen at High.
+			const bool bEpic = (Tiers.GI >= 3);
+
+			PP.bOverride_LumenSceneLightingQuality = true;
+			PP.LumenSceneLightingQuality = bEpic ? 1.0f : 0.5f;
+			PP.bOverride_LumenSceneDetail = true;
+			PP.LumenSceneDetail = bEpic ? 1.0f : 0.5f;
+			PP.bOverride_LumenFinalGatherQuality = true;
+			PP.LumenFinalGatherQuality = bEpic ? 1.0f : 0.5f;
+			PP.bOverride_LumenSurfaceCacheResolution = true;
+			PP.LumenSurfaceCacheResolution = bEpic ? 1.0f : 0.5f;
+
+			// The field is 33600 uu end to end. Tracing all of it would put the far endzone in
+			// every probe; 14000 covers a bit over a third of the field, which is well past
+			// anything a first-person eye can resolve a bounce from in a scene this dark, and it
+			// is the single biggest dial on Lumen's cost here.
+			PP.bOverride_LumenSceneViewDistance = true;
+			PP.LumenSceneViewDistance = bEpic ? 22000.f : 14000.f;
+			PP.bOverride_LumenMaxTraceDistance = true;
+			PP.LumenMaxTraceDistance = bEpic ? 22000.f : 14000.f;
+
+			// Screen traces bypass the surface cache where the screen already has the answer,
+			// which on a scene whose light sources are mostly ON SCREEN (the neon you are looking
+			// at) is both cheaper and more accurate than the cache.
+			PP.bOverride_LumenFinalGatherScreenTraces = true;
+			PP.LumenFinalGatherScreenTraces = 1;
+
+			// Zero leaking. The sky here is deliberate near-black twilight; letting it leak into
+			// unoccluded interiors would raise the floor of every dark surface, which is the grey
+			// box the palette comment in the header spends a paragraph warning about.
+			PP.bOverride_LumenSkylightLeaking = true;
+			PP.LumenSkylightLeaking = 0.f;
+
+			// Albedos here are 0.011-0.07, i.e. almost nothing bounces. A boost is the honest way
+			// to get a visible second bounce out of a world painted this dark without repainting
+			// it; 1.6 is a nudge, not a repaint (4 is the engine's ceiling).
+			PP.bOverride_LumenDiffuseColorBoost = true;
+			PP.LumenDiffuseColorBoost = bEpic ? 1.6f : 1.3f;
+
+			PP.bOverride_LumenReflectionQuality = true;
+			PP.LumenReflectionQuality = bLumenReflections ? 1.0f : 0.5f;
+
+			// No "distance fields are off" warning here any more: ArenaLumenGIArmed already refused
+			// to arm Lumen in that case, so this branch cannot be reached without them. The refusal
+			// is logged once at the gate instead.
+		}
+
+		// --- 2. AMBIENT OCCLUSION ------------------------------------------------------------
+		//
+		// Currently off project-wide (r.DefaultFeature.AmbientOcclusion=False), which sets the
+		// DEFAULT intensity to zero - a volume override still wins, which is why this works from
+		// here without touching DefaultEngine.ini.
+		//
+		// AO IS ARMED ONLY WHERE IT IS FREE, AND THAT IS THE MOST USEFUL MEASUREMENT IN THIS PASS.
+		//
+		// MEASURED at r.ScreenPercentage 300, 5 interleaved cycles, against a null arm whose noise
+		// floor was 2.4%: Epic SSAO cost +9.0%, and FID_shipped.png and FID_ao.png are the same
+		// picture. Not a tuning miss - structural. AO attenuates INDIRECT/AMBIENT light, and this
+		// arena is (a) unlit emissive neon, which AO does not touch at all, and (b) near-black
+		// albedo (0.011-0.07) under a deliberate near-zero ambient. Darkening almost nothing by 40%
+		// is invisible. Spec v11 §3: "anything that cannot be justified by a screenshot should not
+		// ship enabled".
+		//
+		// So the ladder is not "more AO as the tier rises". AO is off at every tier EXCEPT the one
+		// where Lumen GI is also armed, and there it is free rather than merely affordable:
+		// IndirectLightRendering.cpp:620 skips the SSAO pass entirely when Lumen GI is on
+		// (bLumenWantsSSAO / ShouldRenderAOWithLumenGI), substituting Lumen's own short-range AO,
+		// which reads the same intensity and radius. That is also why the 'epic' arm - which
+		// includes AO - measured CHEAPER than the '+ao' arm: the +9% is only ever paid with Lumen
+		// off. A player who hand-builds Custom with POST PROCESSING on Epic and GLOBAL ILLUMINATION
+		// below it therefore gets no AO and no bill for it, which is the right answer both ways.
+		//
+		// Radius is in WORLD SPACE deliberately. The default screen-space radius makes AO grow
+		// with proximity, so a cover block would gain a huge contact shadow as you walked up to
+		// it; keyed to uu instead, 160 uu is about a player's height and lands where a block meets
+		// the floor at every distance.
+		{
+			const bool bAmbientOcclusion = bLumenGI && (Tiers.AO >= 3);
+
+			PP.bOverride_AmbientOcclusionIntensity = true;
+			PP.AmbientOcclusionIntensity = bAmbientOcclusion ? 0.62f : 0.f;
+			PP.bOverride_AmbientOcclusionQuality = true;
+			PP.AmbientOcclusionQuality = bAmbientOcclusion ? 100.f : 0.f;
+			PP.bOverride_AmbientOcclusionRadius = true;
+			PP.AmbientOcclusionRadius = bAmbientOcclusion ? 160.f : 0.f;
+			PP.bOverride_AmbientOcclusionRadiusInWS = true;
+			PP.AmbientOcclusionRadiusInWS = true;
+			PP.bOverride_AmbientOcclusionPower = true;
+			PP.AmbientOcclusionPower = 2.2f;
+			PP.bOverride_AmbientOcclusionBias = true;
+			PP.AmbientOcclusionBias = 3.f;
+
+			// No static-lighting AO term: r.AllowStaticLighting is False, so there is no baked
+			// lighting for a static fraction to apply to.
+			PP.bOverride_AmbientOcclusionStaticFraction = true;
+			PP.AmbientOcclusionStaticFraction = 0.f;
+
+			// Fade AO out well before the far wall. Grounding is a near-field effect and a
+			// 33600 uu field would otherwise pay for occlusion nobody can resolve.
+			PP.bOverride_AmbientOcclusionFadeDistance = true;
+			PP.AmbientOcclusionFadeDistance = 9000.f;
+			PP.bOverride_AmbientOcclusionMipBlend = true;
+			PP.AmbientOcclusionMipBlend = 0.6f;
+		}
+
+		// --- 3. SCREEN-SPACE REFLECTIONS -----------------------------------------------------
+		//
+		// The floor is the signature surface: near-black, roughness 0.16, and the reflection of
+		// the neon in it is most of what is in the lower third of any frame. Tier 2 is what the
+		// project shipped (quality 100) - it is kept AT tier 2 rather than moved to 3 so that
+		// "High" reproduces the shipped look exactly and Epic is the only rung that changes it.
+		//
+		// Tier 0 does not appear in this table at all - the method is None there (see the reflection
+		// method above), so its quality would be a number nothing reads. Irrelevant when Lumen
+		// reflections are armed too; written anyway so that switching back down from Epic restores a
+		// complete SSR configuration rather than a partial one.
+		{
+			static const float SSRQuality[4] = { 25.f, 50.f, 100.f, 100.f };
+			static const float SSRMaxRoughness[4] = { 0.30f, 0.42f, 0.55f, 0.60f };
+
+			PP.bOverride_ScreenSpaceReflectionQuality = true;
+			PP.ScreenSpaceReflectionQuality = SSRQuality[Tiers.Reflections];
+			PP.bOverride_ScreenSpaceReflectionMaxRoughness = true;
+			PP.ScreenSpaceReflectionMaxRoughness = SSRMaxRoughness[Tiers.Reflections];
+		}
+
+		// --- 4. BLOOM METHOD -----------------------------------------------------------------
+		//
+		// Bloom is never switched off at any tier - an unlit emissive strip without bloom is a
+		// flat coloured rectangle and the whole art direction goes with it. What the tier changes
+		// is HOW the glow is computed: sum-of-Gaussians (the shipped look) up to High, and FFT
+		// convolution at Epic, which convolves the frame with a real lens kernel instead of
+		// stacking six blurs, so a bright strip gets a physically shaped falloff and streaks
+		// rather than a stack of Gaussian haloes.
+		//
+		// THE INTENSITY IS NOT THE SAME NUMBER IN THE TWO PATHS. Standard bloom scales by
+		// BloomIntensity * BloomGaussianIntensity; convolution scales by BloomIntensity *
+		// BloomConvolutionIntensity against an energy-normalised kernel. The convolution number
+		// below is set so the two read at a comparable brightness - if Epic looks like a different
+		// game rather than a better-resolved one, this is the dial, not BloomIntensity.
+		{
+			PP.bOverride_BloomMethod = true;
+			PP.BloomMethod = (Tiers.Bloom >= 3) ? BM_FFT : BM_SOG;
+
+			if (Tiers.Bloom >= 3)
+			{
+				PP.bOverride_BloomConvolutionIntensity = true;
+				PP.BloomConvolutionIntensity = 0.11f;
+				PP.bOverride_BloomConvolutionSize = true;
+				PP.BloomConvolutionSize = 1.6f;
+				PP.bOverride_BloomConvolutionScatterDispersion = true;
+				PP.BloomConvolutionScatterDispersion = 1.f;
+
+				// Half-resolution FFT. The kernel is smooth and the source is a dark frame with a
+				// few very bright lines in it; the full-resolution transform costs roughly twice
+				// as much and the difference does not survive the tonemapper here.
+				PP.bOverride_BloomConvolutionBufferScale = true;
+				PP.BloomConvolutionBufferScale = 0.133f;
+			}
+		}
+	}
+
+	// --- 5. SHADOWS ---------------------------------------------------------------------------
+	//
+	// One shadow-casting light in the whole arena (see the FLightSpec table in BuildLighting), so
+	// this ladder is the entire shadow budget.
+	//
+	// TIER 0 REMOVES THE PASS, not the resolution. A cascade at a low resolution still costs a
+	// depth render of every shadow-casting primitive in range per cascade; switching the caster off
+	// removes all of it. What is lost is every character's shadow, which is a real gameplay cue -
+	// this is a Low-preset trade and it is stated as one.
+	//
+	// VIRTUAL SHADOW MAPS ARE NOT USED. r.Shadow.Virtual.Enable is a project setting (currently 0)
+	// and it is global rather than per-volume, so it is not this file's to set; the measured reason
+	// not to ask for it is in the report - VSMs pay for themselves on scenes with many shadow
+	// casters and high depth complexity, and this arena has one directional light over a few
+	// hundred boxes, which is the case cascades are already good at.
+	if (UDirectionalLightComponent* Key = KeyLightComponent.Get())
+	{
+		const bool bCastShadows = (Tiers.Shadows >= 1);
+		Key->SetCastShadows(bCastShadows);
+
+		if (bCastShadows)
+		{
+			static const int32 Cascades[4] = { 0, 2, 3, 4 };
+			// Tier 2 is the engine's own movable-light default (20000 uu), so "High" reproduces the
+			// shadows this project has always had exactly, and only Epic changes them.
+			static const float ShadowDistance[4] = { 0.f, 9000.f, 20000.f, 28000.f };
+			static const float ResolutionScale[4] = { 1.f, 0.5f, 1.0f, 2.0f };
+
+			Key->SetDynamicShadowCascades(Cascades[Tiers.Shadows]);
+			Key->SetDynamicShadowDistanceMovableLight(ShadowDistance[Tiers.Shadows]);
+
+			// A steep distribution spends the cascades near the eye, which is where a first-person
+			// camera in a 2600 uu-walled arena can actually resolve a shadow edge.
+			Key->SetCascadeDistributionExponent(3.f);
+			Key->SetCascadeTransitionFraction(0.1f);
+
+			Key->ShadowResolutionScale = ResolutionScale[Tiers.Shadows];
+
+			// CONTACT SHADOWS AT EPIC ONLY. A short screen-space ray from each pixel toward the
+			// light, which catches the small contact darkening a 4-cascade map at 24000 uu cannot
+			// resolve - the seam where a cover block meets the floor, and a character's feet.
+			// Length is a fraction of the screen, not world units, so it costs the same wherever
+			// the camera is.
+			Key->ContactShadowLength = (Tiers.Shadows >= 3) ? 0.05f : 0.f;
+			Key->ContactShadowLengthInWS = false;
+		}
+
+		Key->MarkRenderStateDirty();
+	}
+
+	// --- 6. THE FLOOR-LAMP LATTICE ------------------------------------------------------------
+	//
+	// 32 unshadowed point lights a few hundred uu off the deck, and on a per-pixel-bound frame
+	// each one is a deferred lighting pass over its own screen footprint. The footprint is
+	// quadratic in the attenuation radius, so scaling the radius is a far bigger lever than
+	// scaling the intensity, and unlike deleting lamps it thins the cost EVENLY over the field
+	// rather than leaving one sideline lit and the other dark (the lattice is built in
+	// XFrac/XSign/YFrac/YSign order, so any stride over the array is a spatial bias).
+	//
+	// Intensity is raised as the radius falls, because these lights are inverse-square: a tighter
+	// lamp at the same candela is a dimmer pool at the same place. The compensation is deliberately
+	// PARTIAL - a Low arena is a slightly darker arena, and pretending otherwise would mean
+	// blowing out the pool directly under each lamp.
+	if (FloorLamps.Num() > 0 && BuiltFloorLampRadius > 0.f)
+	{
+		static const float LampRadiusScale[4] = { 0.45f, 0.70f, 1.0f, 1.0f };
+		static const float LampIntensityScale[4] = { 1.45f, 1.15f, 1.0f, 1.0f };
+
+		const float Radius = BuiltFloorLampRadius * LampRadiusScale[Tiers.Lamps];
+		const float Intensity = BuiltFloorLampIntensity * LampIntensityScale[Tiers.Lamps];
+
+		for (const TWeakObjectPtr<UPointLightComponent>& LampPtr : FloorLamps)
+		{
+			if (UPointLightComponent* Lamp = LampPtr.Get())
+			{
+				Lamp->SetAttenuationRadius(Radius);
+				Lamp->SetIntensity(Intensity);
+			}
+		}
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("Arena fidelity applied: %s"), *DescribeFidelity());
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -4556,6 +5184,11 @@ UPointLightComponent* ATraceArenaBuilder::AddPointLight(const FVector& LocalCent
 	Light->SetVolumetricScatteringIntensity(0.f);
 
 	Light->RegisterComponent();
+
+	// Remembered so the Effects quality row can thin the lattice live (spec v11 §3) without a
+	// rebuild. Weak: the component's Outer is this actor, so it is already GC reachable.
+	FloorLamps.Add(Light);
+
 	return Light;
 }
 
@@ -4568,6 +5201,11 @@ void ATraceArenaBuilder::BuildFloorLamps()
 	{
 		return;
 	}
+
+	// What every lamp is built at. ApplyFidelity scales against THESE rather than against whatever a
+	// lamp currently has, so repeated quality changes cannot ratchet the lattice brighter or wider.
+	BuiltFloorLampIntensity = FloorLampIntensity;
+	BuiltFloorLampRadius = FloorLampRadius;
 
 	for (const float XFrac : TraceArenaConstants::LampXFracs)
 	{
@@ -4769,6 +5407,24 @@ UMaterialInstanceDynamic* ATraceArenaBuilder::MakeSurfaceMID(const FLinearColor&
 	MID->SetScalarParameterValue(TEXT("Metallic"), FMath::Clamp(Metallic, 0.f, 1.f));
 	MID->SetVectorParameterValue(TEXT("Emissive"), Emissive);
 	MID->SetScalarParameterValue(TEXT("EmissiveStrength"), EmissiveStrength);
+
+	// SPEC v11 §3.6 - THE FRESNEL RIM, AND WHY ROUGHNESS DECIDES WHO GETS IT.
+	//
+	// M_TraceSurface gained a quality switch that adds a Fresnel edge term at High and Epic material
+	// quality and compiles it out below (see generate_content.py). It draws the silhouette of a
+	// near-black block for about six instructions, which is the same job the four pieces of face trim
+	// on every cover block do for four extra instances each.
+	//
+	// IT MUST NOT GO ON THE FLOOR. Fresnel brightens a surface as it turns away from the eye, and a
+	// floor is viewed at a grazing angle across most of the screen - a rim there is not an edge, it is
+	// a white wash over the lower half of the frame, and it would sit exactly on top of the SSR that
+	// is the reason the floor is glossy in the first place. The floor is also the ONLY near-mirror in
+	// the arena (roughness 0.16; the art-direction block in the header says so and every other call
+	// site passes ~0.5), so roughness is a complete and self-maintaining test for "is this the floor" -
+	// no new argument, no forty call sites to audit, and a future glossy surface is excluded for the
+	// same reason the floor is rather than by having been forgotten.
+	MID->SetVectorParameterValue(TEXT("RimColor"), FLinearColor(0.30f, 0.62f, 0.95f));
+	MID->SetScalarParameterValue(TEXT("RimStrength"), (Roughness > 0.3f) ? 0.28f : 0.f);
 
 	// Outered to this actor, so it follows the same transient rule as the components that use it.
 	MID->SetFlags(BuiltObjectFlags());
@@ -5181,6 +5837,17 @@ void ATraceArenaBuilder::DestroyBuiltArena()
 	GoalModePieces.Reset();
 	ScoringVolumes.Reset();
 
+	// Same story for the fidelity handles (spec v11 §3): the volume and every light have just been
+	// destroyed, so ApplyFidelity must find nothing rather than a list of stale weak pointers whose
+	// count would misreport how many lamps the lattice has. The scalability subscription is left
+	// alone on purpose - the measurement rebuild goes straight into another build, and re-subscribing
+	// per rebuild is how a delegate ends up bound twice.
+	ArenaPostProcess.Reset();
+	KeyLightComponent.Reset();
+	FloorLamps.Reset();
+	BuiltFloorLampIntensity = 0.f;
+	BuiltFloorLampRadius = 0.f;
+
 	// The instance pools are the same story with a sharper edge: their INDICES are the identity of
 	// every mode-tagged piece, so a surviving pool entry would have the next build appending into a
 	// component that has just been destroyed and handing out indices that mean nothing. A pool that
@@ -5459,6 +6126,26 @@ namespace
 		int32 Instancing = 1;
 		FString Name;
 
+		/**
+		 * The arm every other arm's delta is quoted against. Exactly one arm should set it.
+		 *
+		 * It used to be inferred from Instancing == 0, which was true while the only A/B in this file
+		 * was instanced-vs-legacy geometry and became wrong the moment spec v11 §3 added arms that all
+		 * share one geometry path and differ only in which renderer feature is armed.
+		 */
+		bool bIsBaseline = false;
+
+		/**
+		 * Puts the renderer into this arm's configuration. Run at the top of the arm, before the
+		 * warmup, so nothing it changes is measured until it has settled.
+		 *
+		 * This is the fidelity A/B's whole mechanism: the arena is NOT rebuilt between these arms (the
+		 * geometry is identical in all of them), so an arm is a handful of console-variable writes and
+		 * one ApplyFidelity call. That is what makes eight arms x three cycles affordable in the one
+		 * process an uncontaminated measurement has to happen in.
+		 */
+		TFunction<void()> ApplyArm;
+
 		TArray<float> FrameMs;
 		double GameMsSum = 0.0;
 		double RenderMsSum = 0.0;
@@ -5485,6 +6172,17 @@ namespace
 		bool bRebuildBetweenArms = true;
 
 		int32 RestoreInstancing = 1;
+
+		/**
+		 * Run once when the last cycle ends, before the report is printed.
+		 *
+		 * An A/B harness that leaves the renderer in whatever the LAST arm happened to be is a trap:
+		 * the fidelity run's last arm is "low", so without this every screenshot and every command
+		 * typed after a run would silently be measuring a Low-preset arena. The instancing A/B has
+		 * always restored itself (RestoreInstancing above); this is the same guarantee for the arms
+		 * that are configuration rather than geometry.
+		 */
+		TFunction<void()> OnFinished;
 	};
 
 	float ArenaPerfMean(const TArray<float>& Values)
@@ -5579,14 +6277,16 @@ namespace
 			TEXT("gameMs"), TEXT("rendMs"), TEXT("gpuMs"), TEXT("fps"));
 
 		float BaselineFrame = 0.f;
+		FString BaselineName = TEXT("legacy");
 		for (FArenaPerfArm& Arm : State.Arms)
 		{
 			const int32 SafeFrames = FMath::Max(1, Arm.Frames);
 			const float MeanFrame = ArenaPerfMean(Arm.FrameMs);
 
-			if (Arm.Instancing == 0)
+			if (Arm.bIsBaseline)
 			{
 				BaselineFrame = MeanFrame;
+				BaselineName = Arm.Name;
 			}
 
 			UE_LOG(LogTraceGame, Display,
@@ -5601,14 +6301,14 @@ namespace
 		{
 			for (FArenaPerfArm& Arm : State.Arms)
 			{
-				if (Arm.Instancing == 0)
+				if (Arm.bIsBaseline)
 				{
 					continue;
 				}
 				const float MeanFrame = ArenaPerfMean(Arm.FrameMs);
 				UE_LOG(LogTraceGame, Display,
-					TEXT("[ARENAPERF] '%s' vs 'legacy': %+.2f ms/frame (%+.1f%%), %.2fx the frame rate."),
-					*Arm.Name, MeanFrame - BaselineFrame,
+					TEXT("[ARENAPERF] '%s' vs '%s': %+.2f ms/frame (%+.1f%%), %.2fx the frame rate."),
+					*Arm.Name, *BaselineName, MeanFrame - BaselineFrame,
 					100.f * (MeanFrame - BaselineFrame) / BaselineFrame,
 					(MeanFrame > 0.f) ? (BaselineFrame / MeanFrame) : 0.f);
 			}
@@ -5661,14 +6361,29 @@ namespace
 			}
 		}
 
+		// The fidelity arms (spec v11 §3) change no geometry, only which renderer features are armed.
+		// Run BEFORE the warmup so that whatever the change costs to set up - Lumen building a scene
+		// representation, an FFT kernel being transformed - happens inside the warmup and not inside
+		// the sample.
+		if (Arm.ApplyArm)
+		{
+			Arm.ApplyArm();
+		}
+
 		GatherArenaPerfCensus(World, Arm.Census);
 
 		State.bWarming = true;
 		State.PhaseElapsed = 0.f;
 
+		FString Configuration = FString::Printf(TEXT("Trace.Arena.Instancing %d"), Arm.Instancing);
+		if (const ATraceArenaBuilder* Builder = ATraceArenaBuilder::Get(World))
+		{
+			Configuration = Builder->DescribeFidelity();
+		}
+
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[ARENAPERF] arm '%s' (Trace.Arena.Instancing %d): %d arena primitives. Warming %.1fs, then sampling %.1fs."),
-			*Arm.Name, Arm.Instancing, Arm.Census.ArenaPrimitives, State.WarmupSeconds, State.SampleSeconds);
+			TEXT("[ARENAPERF] arm '%s' (%s): %d arena primitives. Warming %.1fs, then sampling %.1fs."),
+			*Arm.Name, *Configuration, Arm.Census.ArenaPrimitives, State.WarmupSeconds, State.SampleSeconds);
 	}
 
 	bool TickArenaPerf(FArenaPerfState& State, float DeltaTime)
@@ -5758,6 +6473,11 @@ namespace
 					{
 						It->RebuildForMeasurement();
 					}
+				}
+
+				if (State.OnFinished)
+				{
+					State.OnFinished();
 				}
 
 				ArenaPerfReport(State);
@@ -6379,6 +7099,7 @@ namespace
 			FArenaPerfArm Legacy;
 			Legacy.Instancing = 0;
 			Legacy.Name = TEXT("legacy");
+			Legacy.bIsBaseline = true;
 			FArenaPerfArm Instanced;
 			Instanced.Instancing = 1;
 			Instanced.Name = TEXT("instanced");
@@ -6390,5 +7111,323 @@ namespace
 				State.CyclesTotal, State.WarmupSeconds, State.SampleSeconds,
 				State.CyclesTotal * 2.f * (State.WarmupSeconds + State.SampleSeconds));
 			StartArenaPerf(State);
+		}));
+
+	// =============================================================================================
+	// SPEC v11 §3/§4 - WHAT EACH FIDELITY FEATURE COSTS, ONE AT A TIME
+	//
+	// The request is not "is Epic slower than Low" - that is obvious and useless. It is "what does
+	// each feature cost, so the user can decide what to keep", and the only way to answer that is one
+	// arm per feature, all against a common baseline, interleaved in ONE process for the reason the
+	// Trace.Arena.PerfAB header gives at length (this machine is shared; a second UE run starting up
+	// inside a sample window is not noise, it is a second renderer).
+	//
+	// The arms below are ADDITIVE against a baseline that reproduces the shipped look exactly:
+	// no GI, no AO, 3 shadow cascades, standard bloom, SSR quality 100, full-radius lamps. Each
+	// "+feature" arm changes ONE group. "epic" and "low" are the two ends of the ladder as a player
+	// would actually get them.
+	//
+	//   ... -TraceExec="r.ScreenPercentage 300|Trace.Arena.FidelityAB 4 1.5 2" -TraceExecAt=14
+	// =============================================================================================
+
+	/** Sets every fidelity override at once, then re-applies. INDEX_NONE (-1) means "follow scalability". */
+	void SetArenaFidelityArm(int32 GI, int32 Reflections, int32 AO, int32 Shadows, int32 Bloom, int32 Lamps)
+	{
+		// Written through the cvar objects rather than the ints so the console reports the truth if a
+		// human types `Trace.Arena.Fidelity.GI` mid-run, and so the change callbacks fire exactly once
+		// each. ApplyFidelity is idempotent, so the repeated calls cost property writes and nothing.
+		auto Push = [](const TCHAR* Name, int32 Value)
+		{
+			if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Name))
+			{
+				CVar->Set(Value, ECVF_SetByCode);
+			}
+		};
+
+		Push(TEXT("Trace.Arena.Fidelity.GI"), GI);
+		Push(TEXT("Trace.Arena.Fidelity.Reflections"), Reflections);
+		Push(TEXT("Trace.Arena.Fidelity.AO"), AO);
+		Push(TEXT("Trace.Arena.Fidelity.Shadows"), Shadows);
+		Push(TEXT("Trace.Arena.Fidelity.Bloom"), Bloom);
+		Push(TEXT("Trace.Arena.Fidelity.Lamps"), Lamps);
+
+		ApplyArenaFidelityEverywhere();
+	}
+
+	/** One arm of the fidelity A/B: a name and the six tiers it forces. */
+	struct FArenaFidelityArmSpec
+	{
+		const TCHAR* Name;
+		int32 GI;
+		int32 Reflections;
+		int32 AO;
+		int32 Shadows;
+		int32 Bloom;
+		int32 Lamps;
+		bool bBaseline;
+	};
+
+	// GI, Reflections, AO, Shadows, Bloom, Lamps.
+	const FArenaFidelityArmSpec GArenaFidelityArms[] =
+	{
+		// The shipped look, and the thing every delta below is measured against.
+		{ TEXT("shipped"),   0, 2, 0, 2, 2, 2, true  },
+		// AO ON TOP OF LUMEN, not on top of the shipped look, and the change is deliberate.
+		// ApplyFidelity now refuses to arm ambient occlusion unless Lumen GI is armed too, because
+		// the measured standalone SSAO cost was +9.0% for a screenshot nobody can tell apart (see
+		// the AO block). Against '+lumen' this arm therefore measures what AO costs where it is
+		// actually reachable - which should be ~0, since Lumen replaces the SSAO pass outright.
+		{ TEXT("+lumen+ao"), 3, 2, 3, 2, 2, 2, false },
+		{ TEXT("+shadows"),  0, 2, 0, 3, 2, 2, false },
+		{ TEXT("+fftbloom"), 0, 2, 0, 2, 3, 2, false },
+		{ TEXT("+lumen"),    3, 2, 0, 2, 2, 2, false },
+		{ TEXT("+lumenrefl"),3, 3, 0, 2, 2, 2, false },
+		// THREE SUBTRACTIVE ARMS, and they are the half of this table that matters most for spec
+		// v11 §0: what the SHIPPED look is already paying for the floor mirror, the shadow pass and
+		// the lamp lattice. A cost you can only remove is still a cost, and these are the three
+		// levers a struggling machine has that nobody in this project has ever measured.
+		{ TEXT("-ssr"),      0, 0, 0, 2, 2, 2, false },
+		{ TEXT("lamps-low"), 0, 2, 0, 2, 2, 0, false },
+		{ TEXT("-shadows"),  0, 2, 0, 0, 2, 2, false },
+		// The two ends of the ladder as a player gets them.
+		{ TEXT("epic"),      3, 3, 3, 3, 3, 3, false },
+		{ TEXT("low"),       0, 0, 0, 0, 0, 0, false },
+		// THE NULL ARM, AND EVERY NUMBER IN THE TABLE SHOULD BE READ AGAINST IT.
+		//
+		// Byte for byte the same configuration as 'shipped', sampled at the far end of the cycle from
+		// it. It measures nothing about the renderer and everything about the SCENE: this harness
+		// samples a live 5v5 bot match from a first-person camera on a pawn that walks, dies and
+		// respawns, so what is in front of the eye is different from one 4-second window to the next.
+		//
+		// MEASURED, first run, no null arm: three arms that were configured IDENTICALLY (Lumen was
+		// being held off for want of distance fields, so 'shipped', '+lumen' and '+lumenrefl' were the
+		// same renderer) read 40.68, 36.09 and 34.01 ms - a 16% spread with no cause. Without a null
+		// arm that spread is invisible and every small delta in the table looks like a result. With
+		// one, |control - shipped| is the floor under which nothing may be claimed, and raising the
+		// cycle count until that floor is small is the whole of making this measurement trustworthy.
+		{ TEXT("control"),   0, 2, 0, 2, 2, 2, false },
+	};
+
+	FAutoConsoleCommand CmdArenaFidelityAB(
+		TEXT("Trace.Arena.FidelityAB"),
+		TEXT("Trace.Arena.FidelityAB [SampleSeconds] [WarmupSeconds] [Cycles] - interleave one arm per "
+		     "fidelity feature (spec v11 3) against the shipped configuration and print what each one "
+		     "costs. The arena is NOT rebuilt: every arm is the same geometry with a different set of "
+		     "renderer features armed. Run `r.ScreenPercentage 300` first so the GPU is the bottleneck, "
+		     "or the harness will tell you the result is the display refresh rate."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FArenaPerfState State;
+			State.SampleSeconds = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 2.f, 120.f) : 5.f;
+			State.WarmupSeconds = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 0.5f, 30.f) : 2.f;
+			State.CyclesTotal = (Args.Num() > 2) ? FMath::Clamp(FCString::Atoi(*Args[2]), 1, 20) : 2;
+
+			// NOTHING IS REBUILT. The whole point of these arms is that the geometry is identical in
+			// all of them, so any difference is the renderer feature and not a different arena.
+			State.bRebuildBetweenArms = false;
+
+			for (const FArenaFidelityArmSpec& Spec : GArenaFidelityArms)
+			{
+				FArenaPerfArm Arm;
+				Arm.Name = Spec.Name;
+				Arm.Instancing = GArenaInstancing;
+				Arm.bIsBaseline = Spec.bBaseline;
+				Arm.ApplyArm = [Spec]()
+				{
+					SetArenaFidelityArm(Spec.GI, Spec.Reflections, Spec.AO, Spec.Shadows, Spec.Bloom, Spec.Lamps);
+				};
+				State.Arms.Add(MoveTemp(Arm));
+			}
+
+			// Hand the renderer back to the video settings when the run ends - see OnFinished.
+			State.OnFinished = []()
+			{
+				SetArenaFidelityArm(-1, -1, -1, -1, -1, -1);
+			};
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ARENAPERF] fidelity A/B starting: %d interleaved cycles x %d arms x (%.1fs warmup + ")
+				TEXT("%.1fs sample) = %.0fs total. r.GenerateMeshDistanceFields=%d (Lumen software tracing ")
+				TEXT("needs 1)."),
+				State.CyclesTotal, State.Arms.Num(), State.WarmupSeconds, State.SampleSeconds,
+				State.CyclesTotal * State.Arms.Num() * (State.WarmupSeconds + State.SampleSeconds),
+				ArenaMeshDistanceFieldsEnabled());
+
+			StartArenaPerf(State);
+		}));
+
+	// =============================================================================================
+	// Trace.Video.PresetAB - LOW / MEDIUM / HIGH / EPIC, through the path a player actually uses
+	// =============================================================================================
+	//
+	// WHY THIS EXISTS ALONGSIDE Trace.Arena.FidelityAB, WHICH LOOKS LIKE THE SAME THING.
+	//
+	// FidelityAB drives the Trace.Arena.Fidelity.* OVERRIDE cvars. Those bypass scalability
+	// entirely, which is exactly what you want when isolating one feature - and exactly what you
+	// must not do when answering "does the LOW preset actually make this machine faster?". A preset
+	// is far more than this file's six features: it is also the engine's own scalability tables
+	// (view distance, TSR quality, shadow map resolution, texture streaming pool, effects LODs),
+	// and if the ladder is measured through the overrides then every one of those is missing from
+	// the number.
+	//
+	// So each arm here calls UTraceGameUserSettings::SetOverallQuality + ApplyVideoSettings - the
+	// same two calls the VIDEO page's OVERALL QUALITY row makes - and nothing else. The fidelity
+	// overrides are cleared first so that scalability, and therefore the menu, is genuinely what is
+	// being measured. If this table shows no separation, the ladder in the menu is decorative.
+	//
+	// IT FORCES VSYNC OFF AND THE FRAME CAP TO UNLIMITED before starting, and that is not a
+	// convenience: ApplyVideoSettings re-applies t.MaxFPS from the saved settings on EVERY arm, so
+	// a player ini carrying a 60 fps cap would make all four presets measure 16.67 ms and the run
+	// would be the cap, not a result. That is the trap spec v11 §4 is written about. Both are
+	// restored when the run ends. Still measure at r.ScreenPercentage 300: macOS present pacing
+	// survives both of these settings.
+	//
+	//   ... -TraceExec="r.ScreenPercentage 300|Trace.Video.PresetAB 4 1.5 3" -TraceExecAt=14
+
+	/** One arm of the preset A/B. */
+	struct FArenaPresetArmSpec
+	{
+		const TCHAR* Name;
+		ETraceVideoQuality Quality;
+		bool bBaseline;
+	};
+
+	const FArenaPresetArmSpec GArenaPresetArms[] =
+	{
+		// EPIC IS THE BASELINE, so every delta reads as a saving rather than a cost - this table's
+		// job is to tell a struggling player what LOW buys them.
+		{ TEXT("epic"),    ETraceVideoQuality::Epic,   true  },
+		{ TEXT("high"),    ETraceVideoQuality::High,   false },
+		{ TEXT("medium"),  ETraceVideoQuality::Medium, false },
+		{ TEXT("low"),     ETraceVideoQuality::Low,    false },
+		// The null arm. Byte for byte the same preset as 'epic', sampled at the far end of the
+		// cycle from it, so |control - epic| is the noise floor under which nothing may be claimed.
+		// Without one, a 3% separation between two presets looks like a result. See the long note
+		// on the fidelity table's own control arm.
+		{ TEXT("control"), ETraceVideoQuality::Epic,   false },
+	};
+
+	FAutoConsoleCommand CmdArenaPresetAB(
+		TEXT("Trace.Video.PresetAB"),
+		TEXT("Trace.Video.PresetAB [SampleSeconds] [WarmupSeconds] [Cycles] - interleave the LOW, "
+		     "MEDIUM, HIGH and EPIC presets exactly as the VIDEO page applies them, plus a null arm, "
+		     "and print the frame time of each. Run `r.ScreenPercentage 300` first so the GPU is the "
+		     "bottleneck. Forces vsync off and the frame cap to unlimited for the duration."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			UTraceGameUserSettings* const Video = UTraceGameUserSettings::Get();
+			if (Video == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[ARENAPERF] Trace.Video.PresetAB needs UTraceGameUserSettings and there isn't one. ")
+					TEXT("Check Config/DefaultEngine.ini's GameUserSettingsClassName."));
+				return;
+			}
+
+			// The fidelity overrides would pin the six arena features at one tier across all four
+			// arms, which is the one thing that would make this table lie.
+			SetArenaFidelityArm(-1, -1, -1, -1, -1, -1);
+
+			// See the header note: leaving these as the player has them can cap every arm at the
+			// same number and produce a perfectly consistent, perfectly meaningless table.
+			const bool bRestoreVSync = Video->IsVSyncEnabled();
+			const int32 RestoreCapIndex = Video->GetFrameRateLimitIndex();
+			const ETraceVideoQuality RestoreQuality = Video->GetOverallQuality();
+			Video->SetVSyncEnabled(false);
+			Video->SetFrameRateLimitByIndex(0);
+
+			FArenaPerfState State;
+			State.SampleSeconds = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 2.f, 120.f) : 5.f;
+			State.WarmupSeconds = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 0.5f, 30.f) : 2.f;
+			State.CyclesTotal = (Args.Num() > 2) ? FMath::Clamp(FCString::Atoi(*Args[2]), 1, 20) : 3;
+			State.bRebuildBetweenArms = false;
+
+			for (const FArenaPresetArmSpec& Spec : GArenaPresetArms)
+			{
+				FArenaPerfArm Arm;
+				Arm.Name = Spec.Name;
+				Arm.Instancing = GArenaInstancing;
+				Arm.bIsBaseline = Spec.bBaseline;
+				Arm.ApplyArm = [Spec]()
+				{
+					if (UTraceGameUserSettings* const ArmVideo = UTraceGameUserSettings::Get())
+					{
+						// EXACTLY what the OVERALL QUALITY row does, and nothing else. Resolution is
+						// deliberately excluded: tearing the window down mid-run would invalidate
+						// every sample after it, and the preset does not move render scale anyway.
+						ArmVideo->SetOverallQuality(Spec.Quality);
+						ArmVideo->ApplyVideoSettings(/*bIncludingResolution=*/false);
+					}
+				};
+				State.Arms.Add(MoveTemp(Arm));
+			}
+
+			// Put the machine back the way the player left it, including the preset - a measurement
+			// harness that silently leaves someone on Low is a bug report waiting to happen.
+			State.OnFinished = [bRestoreVSync, RestoreCapIndex, RestoreQuality]()
+			{
+				if (UTraceGameUserSettings* const EndVideo = UTraceGameUserSettings::Get())
+				{
+					if (RestoreQuality != ETraceVideoQuality::Custom)
+					{
+						EndVideo->SetOverallQuality(RestoreQuality);
+					}
+					EndVideo->SetVSyncEnabled(bRestoreVSync);
+					EndVideo->SetFrameRateLimitByIndex(RestoreCapIndex);
+					EndVideo->ApplyVideoSettings(/*bIncludingResolution=*/false);
+				}
+			};
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ARENAPERF] preset A/B starting: %d interleaved cycles x %d arms x (%.1fs warmup + ")
+				TEXT("%.1fs sample) = %.0fs total. Restoring overall=%s vsync=%d cap=%s afterwards."),
+				State.CyclesTotal, State.Arms.Num(), State.WarmupSeconds, State.SampleSeconds,
+				State.CyclesTotal * State.Arms.Num() * (State.WarmupSeconds + State.SampleSeconds),
+				*UTraceGameUserSettings::DescribeOverallQuality(RestoreQuality),
+				bRestoreVSync ? 1 : 0,
+				*UTraceGameUserSettings::DescribeFrameRateLimit(
+					UTraceGameUserSettings::GetFrameRateLimitOptions().IsValidIndex(RestoreCapIndex)
+						? UTraceGameUserSettings::GetFrameRateLimitOptions()[RestoreCapIndex]
+						: 0.f));
+
+			StartArenaPerf(State);
+		}));
+
+	/**
+	 * The readout, because a ladder nobody can see the current rung of is a ladder nobody trusts.
+	 *
+	 * NOT named Trace.Arena.Fidelity: that is a console VARIABLE, and a command and a variable sharing
+	 * a name is fatal at module load in this engine. The project has already been bitten by that once.
+	 */
+	FAutoConsoleCommand CmdArenaQuality(
+		TEXT("Trace.Arena.Quality"),
+		TEXT("Trace.Arena.Quality - print the scalability levels, the tier each arena fidelity feature "
+		     "resolved to, and whether mesh distance fields (which Lumen needs) are on."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			const Scalability::FQualityLevels Levels = Scalability::GetQualityLevels();
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[QUALITY] scalability: ViewDistance=%d AA=%d Shadows=%d GI=%d Reflections=%d ")
+				TEXT("PostProcess=%d Textures=%d Effects=%d Shading=%d"),
+				Levels.ViewDistanceQuality, Levels.AntiAliasingQuality, Levels.ShadowQuality,
+				Levels.GlobalIlluminationQuality, Levels.ReflectionQuality, Levels.PostProcessQuality,
+				Levels.TextureQuality, Levels.EffectsQuality, Levels.ShadingQuality);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[QUALITY] overrides: master=%d GI=%d Reflections=%d AO=%d Shadows=%d Bloom=%d Lamps=%d ")
+				TEXT("(-1 = follow scalability). r.GenerateMeshDistanceFields=%d."),
+				GArenaFidelity, GArenaFidelityGI, GArenaFidelityReflections, GArenaFidelityAO,
+				GArenaFidelityShadows, GArenaFidelityBloom, GArenaFidelityLamps,
+				ArenaMeshDistanceFieldsEnabled());
+
+			UWorld* World = FindArenaPerfWorld();
+			if (const ATraceArenaBuilder* Builder = ATraceArenaBuilder::Get(World))
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[QUALITY] arena: %s"), *Builder->DescribeFidelity());
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[QUALITY] no ATraceArenaBuilder in this world."));
+			}
 		}));
 }

@@ -42,6 +42,7 @@
 #include "Gameplay/TraceWeaponComponent.h"
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Net/TraceLagCompensationComponent.h"
+#include "Settings/TraceGameUserSettings.h"    // ApplySavedFieldOfView(): the VIDEO page's FOV row
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "World/TraceArenaBuilder.h"          // SetBase(): the arena is not a moving platform
@@ -587,6 +588,37 @@ namespace
 		return PC != nullptr && PC->IsLocalController();
 	}
 
+	/**
+	 * Push the player's saved FIELD OF VIEW onto this pawn's camera.
+	 *
+	 * WHY THIS LIVES HERE AND NOT ONLY IN THE SETTINGS CLASS. UTraceGameUserSettings also re-applies
+	 * the FOV from a 1 Hz ticker, which is what made the row work before this pawn knew about it —
+	 * but a ticker can be up to a second late, and the second after a respawn is exactly when a
+	 * player is re-orienting. Called from BeginPlay and again on the frame the pawn becomes locally
+	 * controlled (on a client the controller arrives by replication AFTER the pawn, so BeginPlay
+	 * alone is not enough), the value is correct on the first rendered frame of every life.
+	 *
+	 * Only ever writes a locally controlled human's camera: no other pawn's UCameraComponent is
+	 * rendered through, and a bot's FOV is not the local player's business.
+	 *
+	 * Does nothing when the settings object is unavailable (dedicated server, early startup) — the
+	 * constructor's shipped 95 stands, which is the correct fallback. It deliberately leaves
+	 * FirstPersonFieldOfView alone: that is the view model's own projection, and widening the world
+	 * must not stretch the gun.
+	 */
+	void ApplySavedFieldOfView(const ATraceCharacter& TraceChar, UCameraComponent* InCamera)
+	{
+		if (InCamera == nullptr || !IsLocalPlayerPawn(TraceChar))
+		{
+			return;
+		}
+
+		if (const UTraceGameUserSettings* const Video = UTraceGameUserSettings::Get())
+		{
+			InCamera->SetFieldOfView(Video->GetFieldOfView());
+		}
+	}
+
 	FLinearColor SanitizeTint(const FLinearColor& InColor)
 	{
 		return FLinearColor(
@@ -759,6 +791,15 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
 	Camera->SetupAttachment(SpringArm, USpringArmComponent::SocketName);
 	Camera->bUsePawnControlRotation = false;   // the arm already applied it
+
+	// The SHIPPED default only. The player's own value (VIDEO page -> FIELD OF VIEW, persisted in
+	// GameUserSettings.ini) is pushed on top of this by ApplySavedFieldOfView() from BeginPlay and
+	// again the frame this pawn becomes locally controlled — see the note there. It is deliberately
+	// NOT read here: this runs during CDO construction, before the engine has created the
+	// UTraceGameUserSettings, so a lookup here would either be null or force the settings object
+	// into existence early. TraceCharacterLayout::CameraFOV and
+	// UTraceGameUserSettings::DefaultFieldOfView are the same 95, so a player who never touches the
+	// row never sees a change.
 	Camera->SetFieldOfView(TraceCharacterLayout::CameraFOV);
 
 	// First-person rendering parameters. These affect ONLY primitives tagged
@@ -1054,6 +1095,9 @@ void ATraceCharacter::BeginPlay()
 	ApplyRotationMode();
 	UpdateViewBlend(0.f, /*bSnap=*/true);
 
+	// The player's FOV, on the first frame of the life rather than up to a second into it.
+	ApplySavedFieldOfView(*this, Camera);
+
 	// Team colours are cosmetic, so the poll costs a dedicated server nothing (it never runs there).
 	if (World != nullptr && GetNetMode() != NM_DedicatedServer && GetTeam() == ETraceTeam::None)
 	{
@@ -1100,6 +1144,12 @@ void ATraceCharacter::Tick(float DeltaSeconds)
 	const bool bLocalPlayer = IsLocalPlayerPawn(*this);
 	const bool bJustBecameLocal = bLocalPlayer && !bWasLocallyControlled;
 	bWasLocallyControlled = bLocalPlayer;
+
+	// The client path: BeginPlay ran before this pawn had a controller, so that call declined.
+	if (bJustBecameLocal)
+	{
+		ApplySavedFieldOfView(*this, Camera);
+	}
 
 	ApplyRotationMode();
 

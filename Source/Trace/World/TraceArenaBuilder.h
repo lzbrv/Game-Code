@@ -15,10 +15,12 @@
 #include "TraceArenaBuilder.generated.h"
 
 class ADirectionalLight;
+class APostProcessVolume;
 class ASkyLight;
 class ATraceEndzone;
 class ATraceTeamPlayerStart;
 class UBoxComponent;
+class UDirectionalLightComponent;
 class UInstancedStaticMeshComponent;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
@@ -363,6 +365,59 @@ public:
 	 * steps earlier than any BeginPlay.
 	 */
 	void EnsureBuilt();
+
+	// --- FIDELITY, GATED BEHIND QUALITY (spec v11 §3) ---------------------------------------------
+	//
+	// WHAT THIS IS. Everything expensive the arena can render - Lumen GI and reflections, ambient
+	// occlusion, cascaded shadows, FFT bloom, screen-space reflection quality and the floor-lamp
+	// lattice - is written into the arena's own post-process volume and lights by ONE function,
+	// ApplyFidelity(), from the engine's scalability levels. Nothing here is a build-time decision:
+	// the arena is built once and re-tuned live, so changing Shadows from Low to Epic in the video
+	// settings menu costs a few property writes rather than a rebuild of 1240 blocks.
+	//
+	// WHICH SCALABILITY GROUP DRIVES WHAT, and this mapping is deliberate - it is exactly the row
+	// list spec v11 §2.5 asks the settings UI for, so a player who turns "Reflections" down turns
+	// down the thing labelled reflections and nothing else:
+	//
+	//   Global Illumination  -> Lumen GI. Off below High. THE expensive one, and see the gate below.
+	//   Reflections          -> the floor mirror: OFF at Low, SSR at Medium/High, Lumen at Epic.
+	//   Shadows              -> the key light's cascades; NO shadow pass at all at Low.
+	//   Post Processing      -> ambient occlusion, and FFT (convolution) bloom at Epic only.
+	//   Effects              -> the floor-lamp lattice's radius, i.e. its screen footprint.
+	//
+	// BLOOM IS NEVER SWITCHED OFF at any tier, only changed in method. It is what makes an emissive
+	// strip read as neon rather than as a flat coloured rectangle, and the arena has no other lighting
+	// idea. Turning it off would save frames and delete the art direction.
+	//
+	// LUMEN CANNOT ARM ON THIS PROJECT AS IT SHIPS, AND THAT IS DELIBERATE - it is the one place this
+	// ladder does not simply obey the quality level, so read this before wondering why Epic looks the
+	// same as High.
+	//
+	// MEASURED: the engine's desktop scalability defaults are Epic on EVERY group (a headless run
+	// logs "scalability: ... GI=3 Reflections=3 PostProcess=3 ..."). A ladder that just followed
+	// GlobalIlluminationQuality would therefore turn Lumen on for everybody by DEFAULT, which spec
+	// v11 §0 forbids outright - and it would turn it on over a project whose
+	// r.GenerateMeshDistanceFields is False, so software ray tracing would have had nothing to trace
+	// against: full price, no light. ApplyFidelity holds Lumen off unless distance fields are
+	// enabled, which makes that project setting the explicit, deliberate opt-in to the whole feature.
+	// r.GenerateMeshDistanceFields lives in Config/DefaultEngine.ini, which this file does not own;
+	// the request for it, and what it buys and costs, is in this pass's report.
+
+	/**
+	 * Pushes the current scalability levels into this arena's post-process volume and lights.
+	 *
+	 * Idempotent and cheap - a few dozen property writes plus one render-state dirty per light - and
+	 * safe to call at any time, including before the arena is built (it no-ops). Called at the end of
+	 * BuildArena, from a Scalability::OnScalabilitySettingsChanged handler, and from the
+	 * Trace.Arena.Fidelity* console variables.
+	 */
+	void ApplyFidelity();
+
+	/** Finds this world's builder and re-applies its fidelity. Null-safe; no-op with no builder. */
+	static void ApplyFidelityInWorld(const UWorld* World);
+
+	/** One line naming every fidelity feature and the tier it is currently at. For the log and menu. */
+	FString DescribeFidelity() const;
 
 #if !UE_BUILD_SHIPPING
 	/**
@@ -1362,4 +1417,36 @@ private:
 
 	/** True while an editor preview is standing. See the preview block in the public section. */
 	bool bEditorPreviewBuilt = false;
+
+	// --- Fidelity state (spec v11 §3). Everything ApplyFidelity() re-tunes, remembered at build time
+	//     so re-tuning is a property write rather than a search of the world.
+
+	/** The unbound post-process volume BuildPostProcess spawned. Weak: SpawnedActors owns it. */
+	TWeakObjectPtr<APostProcessVolume> ArenaPostProcess;
+
+	/**
+	 * The ONE shadow-casting directional light (see the FLightSpec table in BuildLighting).
+	 *
+	 * Remembered rather than re-found because the Shadows row has to be able to switch the whole
+	 * cascade pass off, and "the light that casts shadows" is a build-time fact, not something to
+	 * rediscover by iterating ADirectionalLight and guessing which one it is.
+	 */
+	TWeakObjectPtr<UDirectionalLightComponent> KeyLightComponent;
+
+	/**
+	 * The floor-lamp lattice, in build order, so the Effects row can light a subset of it.
+	 *
+	 * These are unshadowed point lights, but on a per-pixel-bound frame an unshadowed light is still
+	 * a full deferred lighting pass over its screen footprint, and at FloorLampRadius 4200 that
+	 * footprint is large. Turning half of them off is one of the few Low-preset levers this file
+	 * owns that costs no geometry - see ApplyFidelity.
+	 */
+	TArray<TWeakObjectPtr<UPointLightComponent>> FloorLamps;
+
+	/** Intensity and radius each lamp was built with, so re-tuning is absolute rather than relative. */
+	float BuiltFloorLampIntensity = 0.f;
+	float BuiltFloorLampRadius = 0.f;
+
+	/** Scalability::OnScalabilitySettingsChanged, so a live quality change re-tunes without a rebuild. */
+	FDelegateHandle ScalabilityChangedHandle;
 };

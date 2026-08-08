@@ -2,11 +2,40 @@
 
 #include "UI/TraceOptionsMenu.h"
 
+#include "Camera/CameraComponent.h"
+#include "Containers/Ticker.h"          // FTSTicker - defer the viewport resize out of DrawHUD
+#include "DynamicRHI.h"                  // RHIGetGPUFrameCycles
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "GameFramework/HUD.h"
+#include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/PlatformTime.h"
+#include "Scalability.h"
+#include "Settings/TraceGameUserSettings.h"
 #include "Trace.h"                       // LogTraceGame
+
+// =================================================================================================
+// WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
+//
+// Every row on the VIDEO page is stored, validated, applied and persisted by
+// UTraceGameUserSettings (Settings/TraceGameUserSettings.h). This file holds NO video state at all:
+// no cached resolution list, no preset ladder, no frame-cap table, no field-of-view value. Each row
+// is read live from that class on the frame it is drawn and written straight back on the frame it
+// is changed.
+//
+// That is a deliberate line, and it is drawn where it is because both halves have been written by
+// somebody who could plausibly have written the other. Two copies of "what resolutions exist" or
+// "which levels count as Epic" would agree on the day they were written and diverge on the first
+// day either was edited, and the symptom of that divergence is a menu row that quietly controls
+// nothing — a failure this project has already been bitten by and now warns about in its own build
+// notes. So: that class decides what a setting MEANS. This one decides what it LOOKS like, where it
+// sits in the list, and what happens when a key is held down on it.
+//
+// The one thing this file argues about is ORDER, and that argument is spec v11 §0: the frame is
+// GPU-bound per pixel, so RESOLUTION SCALE and AUTO-DETECT come first, above the window mode and
+// above all nine quality groups. See RebuildRows.
+// =================================================================================================
 
 // =================================================================================================
 // Palette
@@ -83,7 +112,111 @@ namespace
 		return PC->IsInputKeyDown(A) || PC->IsInputKeyDown(B)
 			|| PC->WasInputKeyJustPressed(A) || PC->WasInputKeyJustPressed(B);
 	}
+
 }
+
+// =================================================================================================
+// Dev access — opening a page without a keyboard
+//
+// A headless run has no way to press anything, so there is no way to CAPTURE the video page, and a
+// menu page that cannot be captured is a menu page nobody can be shown to have checked. This is the
+// same class of hole -TraceAutoPause was added to fill for the pause root.
+//
+// A raw pointer to the last overlay that ticked. Both hosts call Tick() every frame whether the
+// overlay is open or not, so this is always the one the player is looking at; on a travel the two
+// HUDs overlap for a frame and last-writer-wins, which for a dev command is the right answer anyway.
+// Cleared in the destructor so a HUD destroyed by a travel cannot leave this dangling.
+//
+// NOT a CVar, and NOT in the Trace.Video.* namespace. This project fatals at module load if a CVar
+// and a console command share a name, and Trace.Video.* already contains a CVar next door
+// (Trace.Video.FOVAutoApply). Trace.Menu.* is unambiguously this file's.
+// =================================================================================================
+
+#if !UE_BUILD_SHIPPING
+namespace
+{
+	FTraceOptionsMenu* GActiveOptionsMenu = nullptr;
+
+	FAutoConsoleCommand CmdMenuVideo(
+		TEXT("Trace.Menu.Video"),
+		TEXT("Opens the VIDEO settings page on whichever HUD is up. Works on the title screen and in ")
+		TEXT("a match. Exists so a headless run can screenshot the page: -TraceExec=\"Trace.Menu.Video\"."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->OpenVideo();
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Video: no HUD is drawing an overlay yet."));
+			}
+		}));
+
+	FAutoConsoleCommand CmdMenuNudge(
+		TEXT("Trace.Menu.Nudge"),
+		TEXT("Trace.Menu.Nudge <rows-from-top> <delta>. Moves the selection and adjusts it, exactly as ")
+		TEXT("the arrow keys would, then logs the row and its new value.\n")
+		TEXT("This is the ONLY headless way to exercise the menu's own write path: every capture-only ")
+		TEXT("test drives the settings through the Trace.Video.* commands instead, which proves the ")
+		TEXT("settings class persists and proves nothing whatever about the rows on this page."),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+		{
+			if (GActiveOptionsMenu == nullptr || Args.Num() < 2)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Nudge <rows-from-top> <delta>"));
+				return;
+			}
+			GActiveOptionsMenu->DebugNudge(FCString::Atoi(*Args[0]), FCString::Atoi(*Args[1]));
+		}));
+}
+#endif
+
+FTraceOptionsMenu::~FTraceOptionsMenu()
+{
+#if !UE_BUILD_SHIPPING
+	if (GActiveOptionsMenu == this)
+	{
+		GActiveOptionsMenu = nullptr;
+	}
+#endif
+}
+
+#if !UE_BUILD_SHIPPING
+void FTraceOptionsMenu::DebugNudge(int32 RowsFromTop, int32 Delta)
+{
+	if (!Rows.IsValidIndex(RowsFromTop))
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[Options] Nudge: row %d is out of range (%d rows)."),
+			RowsFromTop, Rows.Num());
+		return;
+	}
+	if (!Rows[RowsFromTop].IsSelectable())
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[Options] Nudge: row %d ('%s') is not selectable."),
+			RowsFromTop, *Rows[RowsFromTop].Label);
+		return;
+	}
+
+	Selected = RowsFromTop;
+
+	const int32 Steps = FMath::Abs(Delta);
+	const int32 Dir = (Delta >= 0) ? 1 : -1;
+	for (int32 Step = 0; Step < Steps; ++Step)
+	{
+		AdjustSelected(Dir);
+	}
+
+	float Value = 0.f;
+	float Min = 0.f;
+	float Max = 1.f;
+	float StepSize = 1.f;
+	GetSettingValue(Rows[Selected].Setting, Value, Min, Max, StepSize);
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Nudge: '%s' is now %s."),
+		*Rows[Selected].Label, *FormatSettingValue(Rows[Selected].Setting, Value));
+}
+#endif
 
 // =================================================================================================
 // Lifecycle
@@ -114,6 +247,20 @@ void FTraceOptionsMenu::OpenSettings()
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Settings opened."));
 }
 
+void FTraceOptionsMenu::OpenVideo()
+{
+	Page = EPage::Video;
+	bCapturingKey = false;
+
+	// Closed, not Settings: this entry point IS the top of the stack, so BACK has to close rather
+	// than drop the player onto a settings page they never asked for.
+	VideoReturnPage = EPage::Closed;
+	IgnoreInputBeforeFrame = GFrameCounter + 1;
+
+	RebuildRows();
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Video settings opened."));
+}
+
 void FTraceOptionsMenu::Close()
 {
 	if (Page == EPage::Closed)
@@ -121,11 +268,20 @@ void FTraceOptionsMenu::Close()
 		return;
 	}
 
+	// Before the page goes away: a resolution or window-mode change the player made and then escaped
+	// out of is still a change they made. Dropping it would mean the value they can see in the .ini
+	// next launch is not the one the window is running at.
+	if (bResolutionApplyPending)
+	{
+		ApplyVideo(/*bResolutionAffecting=*/true, /*bPersist=*/true);
+	}
+
 	Page = EPage::Closed;
 	bCapturingKey = false;
 	CapturingAction = ETraceInputAction::Count;
 	PressedRow = INDEX_NONE;
 	bDraggingSlider = false;
+	bAutoDetectPending = false;
 	LastAdjustDir = 0;
 	LastNavDir = 0;
 
@@ -162,16 +318,84 @@ void FTraceOptionsMenu::RebuildRows()
 		Rows.Add(MoveTemp(Row));
 	};
 
+	auto AddNote = [this](const TCHAR* Label)
+	{
+		FRow Row;
+		Row.Kind = ERowKind::Note;
+		Row.Label = Label;
+		Rows.Add(MoveTemp(Row));
+	};
+
+	auto AddValue = [this](ERowKind Kind, const TCHAR* Label, ESetting Setting)
+	{
+		FRow Row;
+		Row.Kind = Kind;
+		Row.Label = Label;
+		Row.Setting = Setting;
+		Rows.Add(MoveTemp(Row));
+	};
+
 	if (Page == EPage::Root)
 	{
 		// Only offered when the host supplied somewhere to go. The title screen has no RESUME.
 		if (OnResume)         { AddAction(TEXT("RESUME"), EAction::Resume); }
 		AddAction(TEXT("SETTINGS"), EAction::OpenSettings);
+
+		// Its own row on the pause root rather than only inside SETTINGS. Spec v11 §0: the player
+		// this feature exists for is one whose frame rate has collapsed, and making them walk past
+		// mouse sensitivity and eleven key bindings to reach the resolution scale is exactly the kind
+		// of burial that left the collaborator with no way to improve anything.
+		AddAction(TEXT("VIDEO"), EAction::OpenVideo);
+
 		if (OnReturnToTitle)  { AddAction(TEXT("RETURN TO TITLE"), EAction::ReturnToTitle); }
 		if (OnQuit)           { AddAction(TEXT("QUIT"), EAction::Quit); }
 	}
+	else if (Page == EPage::Video)
+	{
+		// ---- Performance first ------------------------------------------------------------------
+		//
+		// The order on this page is an argument, not a taxonomy. Spec v11 §0 measured the frame as
+		// GPU-bound PER PIXEL — instancing the arena removed 893 draw calls and bought 1.4% — so the
+		// number of pixels is the dominant term and the two controls that change it come first,
+		// above the mode, the resolution and all nine quality groups.
+		AddHeader(TEXT("PERFORMANCE"));
+		AddValue(ERowKind::Slider, TEXT("RESOLUTION SCALE"), ESetting::ResolutionScale);
+		AddNote(TEXT("THE BIGGEST WIN IF THE GAME RUNS SLOW. THIS FRAME IS LIMITED BY PIXELS."));
+		AddAction(TEXT("AUTO-DETECT QUALITY"), EAction::AutoDetectQuality);
+		AddValue(ERowKind::Choice, TEXT("OVERALL QUALITY"), ESetting::OverallQuality);
+
+		// ---- Display ----------------------------------------------------------------------------
+		AddHeader(TEXT("DISPLAY"));
+		AddValue(ERowKind::Choice, TEXT("WINDOW MODE"), ESetting::WindowMode);
+		AddValue(ERowKind::Choice, TEXT("RESOLUTION"), ESetting::Resolution);
+		AddValue(ERowKind::Toggle, TEXT("VSYNC"), ESetting::VSync);
+		AddValue(ERowKind::Choice, TEXT("FRAME RATE LIMIT"), ESetting::FrameRateLimit);
+		AddValue(ERowKind::Slider, TEXT("FIELD OF VIEW"), ESetting::FieldOfView);
+
+		// ---- The nine groups --------------------------------------------------------------------
+		AddHeader(TEXT("QUALITY"));
+		AddValue(ERowKind::Choice, TEXT("VIEW DISTANCE"), ESetting::QualityViewDistance);
+		AddValue(ERowKind::Choice, TEXT("ANTI-ALIASING"), ESetting::QualityAntiAliasing);
+		AddValue(ERowKind::Choice, TEXT("POST PROCESSING"), ESetting::QualityPostProcess);
+		AddValue(ERowKind::Choice, TEXT("SHADOWS"), ESetting::QualityShadows);
+		AddValue(ERowKind::Choice, TEXT("GLOBAL ILLUMINATION"), ESetting::QualityGlobalIllumination);
+		AddValue(ERowKind::Choice, TEXT("REFLECTIONS"), ESetting::QualityReflections);
+		AddValue(ERowKind::Choice, TEXT("TEXTURES"), ESetting::QualityTextures);
+		AddValue(ERowKind::Choice, TEXT("EFFECTS"), ESetting::QualityEffects);
+		AddValue(ERowKind::Choice, TEXT("SHADING"), ESetting::QualityShading);
+
+		AddHeader(TEXT(""));
+		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetVideoDefaults);
+		AddAction(TEXT("BACK"), EAction::Back);
+	}
 	else if (Page == EPage::Settings)
 	{
+		// First row on the page, above the mouse. Same reasoning as the pause root's VIDEO entry —
+		// and this is the ONLY route to the video page from the title screen, where there is no
+		// pause root at all, so it cannot be buried at the bottom next to RESET.
+		AddHeader(TEXT("DISPLAY"));
+		AddAction(TEXT("VIDEO SETTINGS"), EAction::OpenVideo);
+
 		AddHeader(TEXT("MOUSE"));
 
 		{
@@ -212,6 +436,11 @@ void FTraceOptionsMenu::RebuildRows()
 		AddAction(TEXT("BACK"), EAction::Back);
 	}
 
+	// Before picking a selection, not after: a row that is greyed out right now is not somewhere the
+	// highlight may land, and RESOLUTION is the first selectable row on the video page's DISPLAY
+	// block whenever the window mode is not windowed fullscreen.
+	RefreshRowStates();
+
 	// Land on the first thing that can actually be selected, so a page never opens with the
 	// highlight sitting on a caption.
 	Selected = 0;
@@ -225,15 +454,76 @@ void FTraceOptionsMenu::RebuildRows()
 	}
 }
 
+void FTraceOptionsMenu::RefreshRowStates()
+{
+	// Only one rule so far, and it is worth stating rather than generalising: in windowed fullscreen
+	// the window always takes the desktop's size, so a stored resolution is accepted, saved, and then
+	// ignored by the platform. A row that takes input and changes nothing is the worst kind of
+	// control, so it is greyed and its value reads DESKTOP. IsResolutionSelectable is the settings
+	// class's own answer to that question, so the two files cannot disagree about it.
+	const bool bResolutionMeaningful = (Video() == nullptr) || Video()->IsResolutionSelectable();
+
+	for (FRow& Row : Rows)
+	{
+		if (Row.Setting == ESetting::Resolution)
+		{
+			Row.bEnabled = bResolutionMeaningful;
+		}
+	}
+
+	// The selection may have been sitting on a row that just went grey — switching to windowed
+	// fullscreen while RESOLUTION is highlighted does exactly that. Walk down, then up.
+	if (Rows.IsValidIndex(Selected) && !Rows[Selected].IsSelectable())
+	{
+		for (int32 Index = Selected + 1; Index < Rows.Num(); ++Index)
+		{
+			if (Rows[Index].IsSelectable()) { Selected = Index; return; }
+		}
+		for (int32 Index = Selected - 1; Index >= 0; --Index)
+		{
+			if (Rows[Index].IsSelectable()) { Selected = Index; return; }
+		}
+	}
+}
+
 // =================================================================================================
 // Tick
 // =================================================================================================
 
 void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, float InViewH, float InUIScale, float InNow)
 {
+#if !UE_BUILD_SHIPPING
+	// Claimed every frame, open or not, so Trace.Menu.Video always reaches the overlay the player is
+	// actually looking at. See GActiveOptionsMenu.
+	GActiveOptionsMenu = this;
+#endif
+
+	// ---- Runs even while the overlay is CLOSED ---------------------------------------------------
+	//
+	// Both hosts call Tick unconditionally every frame and rely on it being a no-op while closed, so
+	// this is the one hook the video settings have into an ordinary gameplay frame — and field of
+	// view needs exactly that. ATraceCharacter::ATraceCharacter sets the camera's FOV once, in the
+	// constructor, which means a fresh launch and every single respawn both come back at 95 degrees
+	// no matter what the player saved. Reasserting it here costs one weak-pointer compare and one
+	// float compare per frame, and it is the difference between the row persisting and the row
+	// appearing to persist until the player next dies.
+	MaintainFieldOfView(PC);
+
 	if (Page == EPage::Closed || HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
 	{
 		return;
+	}
+
+	// Sampled every frame the page is up, before anything else can spend time. See UpdatePerfReadout
+	// for why this uses real time rather than the InNow the host passes in.
+	UpdatePerfReadout();
+
+	// Deferred from the click one frame ago so that "MEASURING…" was actually on screen for the
+	// second the benchmark spends blocking the game thread. See bAutoDetectPending.
+	if (bAutoDetectPending)
+	{
+		bAutoDetectPending = false;
+		RunAutoDetect();
 	}
 
 	ViewW = InViewW;
@@ -248,6 +538,9 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 		FontLarge  = GEngine->GetLargeFont();
 	}
 
+	// Before input, so a click cannot land on a row that stopped being meaningful last frame.
+	RefreshRowStates();
+
 	// Input first, then draw, so a value changed this frame is the value the player sees this frame.
 	// The row rects the mouse tests against are from the PREVIOUS draw, which is correct: they are
 	// where the player was actually looking when they clicked.
@@ -258,6 +551,13 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	if (Page == EPage::Closed)
 	{
 		return;
+	}
+
+	// The coalesced window resize, once the player has stopped moving through the list.
+	if (bResolutionApplyPending && Now >= ResolutionApplyAtTime)
+	{
+		ApplyVideo(/*bResolutionAffecting=*/true, /*bPersist=*/true);
+		RefreshRowStates();
 	}
 
 	Draw(HUD);
@@ -490,9 +790,19 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 
 		if (bDraggingSlider)
 		{
-			// The drag already wrote every intermediate value; the release only ends it.
+			// The drag already wrote every intermediate value; the release only ends it — and writes
+			// the one .ini flush the whole gesture is allowed.
 			bDraggingSlider = false;
-			UTraceUserSettings::Get().Save();
+
+			const ESetting Dragged = Rows.IsValidIndex(Selected) ? Rows[Selected].Setting : ESetting::None;
+			if (IsVideoSetting(Dragged))
+			{
+				ApplyVideo(/*bResolutionAffecting=*/false, /*bPersist=*/true);
+			}
+			else
+			{
+				UTraceUserSettings::Get().Save();
+			}
 			return;
 		}
 
@@ -533,6 +843,14 @@ void FTraceOptionsMenu::MoveSelection(int32 Delta)
 
 void FTraceOptionsMenu::GetSettingValue(ESetting Setting, float& OutValue, float& OutMin, float& OutMax, float& OutStep) const
 {
+	// Set before the switch, not in a default case, so that every early return below — and any case
+	// somebody adds later that forgets one of the four — still hands back a coherent 0..1 range
+	// instead of whatever the caller happened to have on its stack.
+	OutValue = 0.f;
+	OutMin = 0.f;
+	OutMax = 1.f;
+	OutStep = 1.f;
+
 	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
 
 	switch (Setting)
@@ -559,11 +877,192 @@ void FTraceOptionsMenu::GetSettingValue(ESetting Setting, float& OutValue, float
 		break;
 
 	default:
-		OutValue = 0.f;
+		break;
+	}
+
+	if (!IsVideoSetting(Setting))
+	{
+		return;
+	}
+
+	// ---- Video ----------------------------------------------------------------------------------
+	//
+	// Ranges come from UTraceGameUserSettings' own constants and option arrays, never from a number
+	// written down again here. A menu that clamps a slider to a range the settings class does not
+	// share is a menu that will one day refuse to reach a value the settings class allows.
+	const UTraceGameUserSettings* GUS = Video();
+	if (GUS == nullptr)
+	{
+		return;
+	}
+
+	static_assert(
+		int32(ESetting::QualityShading) - int32(ESetting::QualityViewDistance) + 1 == int32(ETraceQualityGroup::Count),
+		"ESetting's quality rows and ETraceQualityGroup have diverged. See QualityGroupIndex.");
+
+	if (IsQualityGroup(Setting))
+	{
+		OutMin = float(UTraceGameUserSettings::MinQualityLevel);
+		OutMax = float(UTraceGameUserSettings::MaxQualityLevel);
+		OutStep = 1.f;
+		OutValue = float(GUS->GetGroupQuality(ETraceQualityGroup(QualityGroupIndex(Setting))));
+		return;
+	}
+
+	switch (Setting)
+	{
+	case ESetting::ResolutionScale:
+		OutMin = float(UTraceGameUserSettings::MinResolutionScalePercent);
+		OutMax = float(UTraceGameUserSettings::MaxResolutionScalePercent);
+		// 5% steps: eleven stops across the range, every one of them a round number a player can
+		// report back ("I'm at 70") and a second player can reproduce exactly.
+		OutStep = 5.f;
+		OutValue = float(GUS->GetResolutionScalePercent());
+		break;
+
+	case ESetting::OverallQuality:
+	{
+		const ETraceVideoQuality Quality = GUS->GetOverallQuality();
+		const bool bCustom = (Quality == ETraceVideoQuality::Custom);
+
+		OutMin = float(UTraceGameUserSettings::MinQualityLevel);
+		OutStep = 1.f;
+		// CUSTOM sits one past EPIC and is reachable only by BEING there — it is what the nine rows
+		// below report when they disagree, not something a player can ask for. So the range stops at
+		// EPIC unless we are already in it, and right-arrow on EPIC clamps rather than stepping into
+		// a state that would mean nothing if it were set.
+		OutMax = float(UTraceGameUserSettings::MaxQualityLevel + (bCustom ? 1 : 0));
+		OutValue = float(int32(Quality));
+		break;
+	}
+
+	case ESetting::WindowMode:
+	{
+		const TArray<EWindowMode::Type>& Modes = UTraceGameUserSettings::GetWindowModeOptions();
+		OutMin = 0.f;
+		OutMax = float(FMath::Max(0, Modes.Num() - 1));
+		OutStep = 1.f;
+		OutValue = float(FMath::Max(0, Modes.IndexOfByKey(GUS->GetWindowMode())));
+		break;
+	}
+
+	case ESetting::Resolution:
+	{
+		const int32 Index = GUS->GetResolutionOptionIndex();
+		OutMin = 0.f;
+		OutMax = float(FMath::Max(0, GUS->GetResolutionOptions().Num() - 1));
+		OutStep = 1.f;
+		// INDEX_NONE means the current mode is not in the list — a hand-edited ini, or a monitor
+		// change since it was written. Showing entry 0 would be a lie; FormatSettingValue prints the
+		// real size instead, and the first arrow press moves to a mode that IS in the list.
+		OutValue = float(Index == INDEX_NONE ? 0 : Index);
+		break;
+	}
+
+	case ESetting::VSync:
 		OutMin = 0.f;
 		OutMax = 1.f;
 		OutStep = 1.f;
+		OutValue = GUS->IsVSyncEnabled() ? 1.f : 0.f;
 		break;
+
+	case ESetting::FrameRateLimit:
+		OutMin = 0.f;
+		OutMax = float(FMath::Max(0, UTraceGameUserSettings::GetFrameRateLimitOptions().Num() - 1));
+		OutStep = 1.f;
+		OutValue = float(GUS->GetFrameRateLimitIndex());
+		break;
+
+	case ESetting::FieldOfView:
+		OutMin = UTraceGameUserSettings::MinFieldOfView;
+		OutMax = UTraceGameUserSettings::MaxFieldOfView;
+		OutStep = 1.f;
+		OutValue = GUS->GetFieldOfView();
+		break;
+
+	default:
+		break;
+	}
+}
+
+FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) const
+{
+	// Every label a video row prints comes from UTraceGameUserSettings' own Describe* helpers. This
+	// file does not get to decide what "EPIC" or "UNLIMITED" is called — the settings class prints
+	// the same strings into its log and its Trace.Video.Status output, and a menu that spelled them
+	// differently would make a bug report and the log it came with impossible to line up.
+	if (IsQualityGroup(Setting))
+	{
+		return UTraceGameUserSettings::DescribeQualityLevel(FMath::RoundToInt(Value));
+	}
+
+	switch (Setting)
+	{
+	case ESetting::ResolutionScale:
+		return FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Value));
+
+	case ESetting::FieldOfView:
+		// No degree sign: AHUD::DrawText goes through the engine's bitmap fonts, whose glyph pages
+		// are ASCII, and a missing glyph draws as a blank box that reads as a rendering fault.
+		return FString::Printf(TEXT("%d DEG"), FMath::RoundToInt(Value));
+
+	case ESetting::OverallQuality:
+		return UTraceGameUserSettings::DescribeOverallQuality(ETraceVideoQuality(FMath::RoundToInt(Value)));
+
+	case ESetting::WindowMode:
+	{
+		const TArray<EWindowMode::Type>& Modes = UTraceGameUserSettings::GetWindowModeOptions();
+		const int32 Index = FMath::RoundToInt(Value);
+		return Modes.IsValidIndex(Index)
+			? UTraceGameUserSettings::DescribeWindowMode(Modes[Index])
+			: FString(TEXT("N/A"));
+	}
+
+	case ESetting::Resolution:
+	{
+		const UTraceGameUserSettings* GUS = Video();
+		if (GUS == nullptr)
+		{
+			return TEXT("N/A");
+		}
+
+		if (!GUS->IsResolutionSelectable())
+		{
+			// Not the stored size greyed out — that would still be a claim, and a false one. In
+			// windowed fullscreen the window takes the desktop's size whatever this is set to, so
+			// the row says what is actually true.
+			return TEXT("DESKTOP");
+		}
+
+		const TArray<FTraceResolutionOption>& Options = GUS->GetResolutionOptions();
+		const int32 Index = FMath::RoundToInt(Value);
+
+		// GetResolutionOptionIndex returned INDEX_NONE — the running mode is not one of the offered
+		// ones. Print the truth about the window rather than the label of a row we are not on.
+		if (GUS->GetResolutionOptionIndex() == INDEX_NONE)
+		{
+			const FIntPoint Current = GUS->GetScreenResolution();
+			return FString::Printf(TEXT("%d x %d  (CUSTOM)"), Current.X, Current.Y);
+		}
+
+		return Options.IsValidIndex(Index) ? Options[Index].Label : FString(TEXT("N/A"));
+	}
+
+	case ESetting::VSync:
+	case ESetting::InvertY:
+		return (Value >= 0.5f) ? TEXT("ON") : TEXT("OFF");
+
+	case ESetting::FrameRateLimit:
+	{
+		const TArray<float>& Limits = UTraceGameUserSettings::GetFrameRateLimitOptions();
+		const int32 Index = FMath::RoundToInt(Value);
+		return Limits.IsValidIndex(Index)
+			? UTraceGameUserSettings::DescribeFrameRateLimit(Limits[Index])
+			: FString(TEXT("N/A"));
+	}
+
+	default:
+		return FString::Printf(TEXT("%.2f"), Value);
 	}
 }
 
@@ -581,6 +1080,85 @@ void FTraceOptionsMenu::SetSettingNormalised(ESetting Setting, float Alpha)
 	// printed number never lands on a round figure and two players who both "set it to 1.0" have
 	// different sensitivities.
 	const float Snapped = FMath::Clamp(FMath::RoundToFloat(Raw / Step) * Step, Min, Max);
+
+	if (IsVideoSetting(Setting))
+	{
+		UTraceGameUserSettings* GUS = Video();
+		if (GUS == nullptr)
+		{
+			return;
+		}
+
+		if (IsQualityGroup(Setting))
+		{
+			GUS->SetGroupQuality(ETraceQualityGroup(QualityGroupIndex(Setting)), FMath::RoundToInt(Snapped));
+		}
+		else
+		{
+			switch (Setting)
+			{
+			case ESetting::ResolutionScale:
+				GUS->SetResolutionScalePercent(FMath::RoundToInt(Snapped));
+				break;
+
+			case ESetting::OverallQuality:
+				// Custom is silently ignored by SetOverallQuality, which is why the range in
+				// GetSettingValue only reaches it when we are already there.
+				GUS->SetOverallQuality(ETraceVideoQuality(FMath::RoundToInt(Snapped)));
+				break;
+
+			case ESetting::WindowMode:
+			{
+				const TArray<EWindowMode::Type>& Modes = UTraceGameUserSettings::GetWindowModeOptions();
+				const int32 Index = FMath::RoundToInt(Snapped);
+				if (Modes.IsValidIndex(Index))
+				{
+					GUS->SetWindowMode(Modes[Index]);
+				}
+				break;
+			}
+
+			case ESetting::Resolution:
+				GUS->SetResolutionByOptionIndex(FMath::RoundToInt(Snapped));
+				break;
+
+			case ESetting::VSync:
+				GUS->SetVSyncEnabled(Snapped >= 0.5f);
+				break;
+
+			case ESetting::FrameRateLimit:
+				GUS->SetFrameRateLimitByIndex(FMath::RoundToInt(Snapped));
+				// Cheap, single-cvar, and immediate — the settings class exposes this precisely so a
+				// menu row does not have to drag the whole ApplyNonResolutionSettings machine behind
+				// it just to change t.MaxFPS.
+				GUS->ApplyFrameRateLimitNow();
+				break;
+
+			case ESetting::FieldOfView:
+				// Applies to the live camera inside the setter. Nothing further to push.
+				GUS->SetFieldOfView(Snapped);
+				break;
+
+			default:
+				break;
+			}
+		}
+
+		// RESOLUTION and WINDOW MODE do not apply here at all: they are queued, because applying
+		// them re-creates the swap chain. See bResolutionApplyPending.
+		if (Setting == ESetting::Resolution || Setting == ESetting::WindowMode)
+		{
+			bResolutionApplyPending = true;
+			ResolutionApplyAtTime = Now + ResolutionApplyDelay;
+			return;
+		}
+
+		// Everything else previews live, every step, and is NOT persisted here — same contract as
+		// the mouse sliders below. The commit paths (AdjustSelected, and the mouse release in
+		// PollMouse) go through ApplyVideoSettings, which writes the .ini once.
+		ApplyVideo(/*bResolutionAffecting=*/false, /*bPersist=*/false);
+		return;
+	}
 
 	UTraceUserSettings& Settings = UTraceUserSettings::Get();
 	switch (Setting)
@@ -604,7 +1182,7 @@ void FTraceOptionsMenu::AdjustSelected(int32 Delta)
 	}
 
 	FRow& Row = Rows[Selected];
-	if (Row.Kind != ERowKind::Slider && Row.Kind != ERowKind::Toggle)
+	if (Row.Kind != ERowKind::Slider && Row.Kind != ERowKind::Toggle && Row.Kind != ERowKind::Choice)
 	{
 		return;
 	}
@@ -617,6 +1195,23 @@ void FTraceOptionsMenu::AdjustSelected(int32 Delta)
 
 	const float Range = FMath::Max(UE_KINDA_SMALL_NUMBER, Max - Min);
 	SetSettingNormalised(Row.Setting, ((Value + Delta * Step) - Min) / Range);
+
+	if (IsVideoSetting(Row.Setting))
+	{
+		// The keyboard path commits: one press, one write. RESOLUTION and WINDOW MODE are excluded —
+		// SetSettingNormalised queued those, and persisting here would apply the resize this press
+		// was specifically trying not to trigger. Their commit happens when the coalesce expires, or
+		// when the page is left.
+		if (Row.Setting != ESetting::Resolution && Row.Setting != ESetting::WindowMode)
+		{
+			ApplyVideo(/*bResolutionAffecting=*/false, /*bPersist=*/true);
+		}
+
+		// The window mode decides whether RESOLUTION is a live row, and OVERALL QUALITY moves nine
+		// other rows. Both are visible on screen right now, so both have to be re-evaluated now.
+		RefreshRowStates();
+		return;
+	}
 
 	UTraceUserSettings::Get().Save();
 }
@@ -636,6 +1231,24 @@ void FTraceOptionsMenu::ActivateSelected()
 		// A toggle has one other state, so activating it is unambiguous.
 		AdjustSelected(1);
 		return;
+
+	case ERowKind::Choice:
+	{
+		// Enter WRAPS where the arrows clamp. Clamping is right for arrows — holding right must
+		// arrive somewhere and stay there — but a click on a row whose value is already at the top
+		// has to do something, or the row reads as broken. Wrapping is the only answer that does not
+		// need a second control.
+		float Value = 0.f;
+		float Min = 0.f;
+		float Max = 1.f;
+		float Step = 1.f;
+		GetSettingValue(Row.Setting, Value, Min, Max, Step);
+
+		const int32 StepsAcross = FMath::RoundToInt((Max - Min) / FMath::Max(Step, UE_KINDA_SMALL_NUMBER));
+		const bool bAtTop = (Value >= Max - UE_KINDA_SMALL_NUMBER);
+		AdjustSelected(bAtTop ? -StepsAcross : 1);
+		return;
+	}
 
 	case ERowKind::Slider:
 		// Nothing sensible for Enter to do to a continuous value. Left/right and the mouse own it.
@@ -669,6 +1282,26 @@ void FTraceOptionsMenu::ActivateSelected()
 		RebuildRows();
 		break;
 
+	case EAction::OpenVideo:
+		// Remember where we came from — the pause root and the settings page both reach this row,
+		// and BACK has to undo the step the player actually took.
+		VideoReturnPage = Page;
+		Page = EPage::Video;
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		RebuildRows();
+		break;
+
+	case EAction::AutoDetectQuality:
+		// Deferred one frame so the "MEASURING…" state is drawn before the benchmark blocks. Cleared
+		// and run at the top of the next Tick.
+		bAutoDetectPending = true;
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Hardware benchmark requested."));
+		break;
+
+	case EAction::ResetVideoDefaults:
+		ResetVideoToDefaults();
+		break;
+
 	case EAction::ReturnToTitle:
 		Close();
 		if (OnReturnToTitle) { OnReturnToTitle(); }
@@ -695,6 +1328,28 @@ void FTraceOptionsMenu::ActivateSelected()
 
 void FTraceOptionsMenu::GoBack()
 {
+	if (Page == EPage::Video)
+	{
+		// A queued resize must not be able to outlive the page that queued it. Leaving the page is
+		// as much a commit as pressing enter is, and a mode change that lands two frames after the
+		// menu shut would look like the game deciding on its own to resize.
+		if (bResolutionApplyPending)
+		{
+			ApplyVideo(/*bResolutionAffecting=*/true, /*bPersist=*/true);
+		}
+
+		if (VideoReturnPage == EPage::Root || VideoReturnPage == EPage::Settings)
+		{
+			Page = VideoReturnPage;
+			IgnoreInputBeforeFrame = GFrameCounter + 1;
+			RebuildRows();
+			return;
+		}
+
+		Close();
+		return;
+	}
+
 	if (Page == EPage::Settings && !bSettingsIsRootPage)
 	{
 		// Came in through the pause menu: step back to it rather than dropping the player straight
@@ -713,6 +1368,245 @@ void FTraceOptionsMenu::GoBack()
 	{
 		OnResume();
 	}
+}
+
+// =================================================================================================
+// Video
+// =================================================================================================
+
+UTraceGameUserSettings* FTraceOptionsMenu::Video()
+{
+	return UTraceGameUserSettings::Get();
+}
+
+void FTraceOptionsMenu::ApplyVideo(bool bResolutionAffecting, bool bPersist)
+{
+	UTraceGameUserSettings* GUS = Video();
+	if (GUS == nullptr)
+	{
+		return;
+	}
+
+	if (bPersist)
+	{
+		// ---- The resolution-affecting apply MUST NOT run inside a Canvas draw --------------------
+		//
+		// This whole menu is ticked from inside AHUD::DrawHUD (see ATraceMenuHUD::DrawHUD ->
+		// OptionsMenu.Tick, and the same shape on ATraceHUD). ApplyVideoSettings(true) re-requests
+		// the window, which tears down and rebuilds the viewport — and doing that with a live
+		// FCanvas on the stack frees the memory the canvas is still drawing into. Measured: the
+		// engine's own guard fires ~100 times ("Canvas Draw functions may only be called during the
+		// handling of the DrawHUD event") and the next FCanvas::PushAbsoluteTransform walks a freed
+		// allocation. Both WINDOW MODE and RESOLUTION crashed the process this way.
+		//
+		// The proof it is the call site and not the engine call: the identical
+		// ApplyVideoSettings(true) driven from a console command — same function, same arguments,
+		// but executed from a ticker instead of from DrawHUD — applies cleanly and the process
+		// survives. So the fix is scheduling, not the call.
+		//
+		// Deferring to the next core tick puts it after the draw has finished. The weak pointer is
+		// to the SETTINGS object, not to this menu: the menu is a plain struct owned by the HUD and
+		// can be destroyed between scheduling and firing (closing the menu is one of the paths that
+		// commits a pending resize), whereas the settings object is GC-tracked and outlives it.
+		if (bResolutionAffecting)
+		{
+			bResolutionApplyPending = false;
+
+			TWeakObjectPtr<UTraceGameUserSettings> WeakSettings(GUS);
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([WeakSettings](float /*Delta*/) -> bool
+				{
+					if (UTraceGameUserSettings* Settings = WeakSettings.Get())
+					{
+						Settings->ApplyVideoSettings(/*bResolutionAffecting=*/true);
+					}
+					return false;   // fire exactly once
+				}),
+				0.f);
+			return;
+		}
+
+		// The non-resolution half is safe inline: it writes GameUserSettings.ini, re-pushes the FOV
+		// onto live cameras and broadcasts, but never touches the viewport.
+		GUS->ApplyVideoSettings(/*bResolutionAffecting=*/false);
+		bResolutionApplyPending = false;
+		return;
+	}
+
+	// ---- Preview only ---------------------------------------------------------------------------
+	//
+	// Every frame of a drag comes through here, and ApplyVideoSettings(false) would be wrong for it
+	// twice over: it writes and flushes the .ini (one disk write per frame), and it goes through
+	// ApplyNonResolutionSettings, which re-validates every setting, walks the audio device and calls
+	// every console-variable sink on the way past. None of that belongs on a slider.
+	//
+	// Scalability::SetQualityLevels is the narrow path: it writes the group CVars and
+	// r.ScreenPercentage and skips whatever has not actually moved. It is what makes RESOLUTION
+	// SCALE respond under the cursor, which is the entire reason that row is at the top of the page.
+	// The release then calls this again with bPersist and the value is written exactly once.
+	Scalability::SetQualityLevels(GUS->ScalabilityQuality);
+}
+
+void FTraceOptionsMenu::RunAutoDetect()
+{
+	UTraceGameUserSettings* GUS = Video();
+	if (GUS == nullptr)
+	{
+		return;
+	}
+
+	// Benchmarks, applies, persists and logs — all of it next door. This row is a button, not an
+	// implementation. Note that auto-detect is the one path allowed to move RESOLUTION SCALE, which
+	// is correct: the player asked the machine to decide, and on a weak GPU the render scale is the
+	// biggest single part of that answer.
+	GUS->RunAutoDetect();
+
+	// Nine group rows, the overall row and the scale row have all potentially moved. They are read
+	// live so they redraw correctly on their own; what has to be re-derived is which rows are still
+	// selectable.
+	RefreshRowStates();
+}
+
+void FTraceOptionsMenu::ResetVideoToDefaults()
+{
+	UTraceGameUserSettings* GUS = Video();
+	if (GUS == nullptr)
+	{
+		return;
+	}
+
+	// VIDEO only. The controls page has its own RESET, and a player who pressed this one asked about
+	// their display — silently clearing their key bindings from here would be the single most
+	// destructive thing this menu could do.
+	GUS->ResetVideoToDefaults();
+
+	// Any queued resize is about a mode that no longer exists in the settings; the reset has already
+	// applied the one that does.
+	bResolutionApplyPending = false;
+	RefreshRowStates();
+}
+
+// =================================================================================================
+// Field of view
+//
+// The VALUE and its persistence belong to UTraceGameUserSettings. What is here is only the reassert.
+// =================================================================================================
+
+void FTraceOptionsMenu::MaintainFieldOfView(APlayerController* PC)
+{
+	const UTraceGameUserSettings* GUS = Video();
+	if (PC == nullptr || GUS == nullptr)
+	{
+		return;
+	}
+
+	APawn* ControlledPawn = PC->GetPawn();
+	if (ControlledPawn == nullptr)
+	{
+		// Between death and respawn, or on the title screen, where there is no pawn at all. Drop the
+		// cache so the next pawn is looked up fresh rather than inheriting a stale camera.
+		FovPawn = nullptr;
+		FovCamera = nullptr;
+		return;
+	}
+
+	if (ControlledPawn != FovPawn.Get())
+	{
+		FovPawn = ControlledPawn;
+		FovCamera = ControlledPawn->FindComponentByClass<UCameraComponent>();
+	}
+
+	UCameraComponent* Cam = FovCamera.Get();
+	if (Cam == nullptr)
+	{
+		return;
+	}
+
+	// The same write UTraceGameUserSettings::ApplyFieldOfViewToWorlds does, at frame rate instead of
+	// at 1 Hz. That ticker is what makes the setting survive a respawn at all, but it can be up to a
+	// second late, and a second of the wrong field of view immediately after respawning is a second
+	// of a shooter feeling wrong at exactly the moment the player is trying to re-orient.
+	//
+	// Idempotent and self-limiting: one float compare when nothing has changed, one SetFieldOfView on
+	// the single frame after a respawn when it has. The two writers cannot fight — they write the
+	// same value from the same source.
+	//
+	// NOT APlayerCameraManager::SetFOV, which was the obvious answer and is a dead end: in UE 5.8
+	// LockedFOV is read by GetFOVAngle() and by nothing else in the view pipeline, so it reports a
+	// number without changing a single pixel. The camera component is where the projection actually
+	// comes from.
+	const float DesiredFOV = GUS->GetFieldOfView();
+	if (!FMath::IsNearlyEqual(Cam->FieldOfView, DesiredFOV, 0.01f))
+	{
+		Cam->SetFieldOfView(DesiredFOV);
+	}
+}
+
+// =================================================================================================
+// Live performance readout
+// =================================================================================================
+
+void FTraceOptionsMenu::UpdatePerfReadout()
+{
+	const double RealNow = FPlatformTime::Seconds();
+
+	if (PerfLastRealTime <= 0.0)
+	{
+		// First frame on the page. There is no interval yet, and inventing one from a zero would
+		// print an infinite frame rate for a quarter of a second.
+		PerfLastRealTime = RealNow;
+		return;
+	}
+
+	const float Delta = float(RealNow - PerfLastRealTime);
+	PerfLastRealTime = RealNow;
+
+	// A hitch of half a second — a resolution change, or the benchmark — is not the frame rate and
+	// must not be averaged into it, or the readout spends the next window claiming 2 fps.
+	if (Delta <= 0.f || Delta > 0.5f)
+	{
+		return;
+	}
+
+	PerfWindowSeconds += Delta;
+	++PerfWindowFrames;
+
+	// A quarter of a second: long enough that the number stops flickering, short enough that letting
+	// go of the resolution-scale slider shows a new number before the player has moved their hand.
+	if (PerfWindowSeconds >= 0.25f && PerfWindowFrames > 0)
+	{
+		PerfFrameMs = (PerfWindowSeconds / float(PerfWindowFrames)) * 1000.f;
+		PerfFps = float(PerfWindowFrames) / PerfWindowSeconds;
+		PerfWindowSeconds = 0.f;
+		PerfWindowFrames = 0;
+
+		// The RHI's own timer. Reported directly rather than through FStatUnitData, which is only
+		// filled while the `stat unit` overlay is enabled and would otherwise need this page to
+		// switch on an engine overlay it then has to draw around. Zero on an RHI that does not
+		// implement it, and the readout simply omits the column in that case rather than printing a
+		// confident 0.00.
+		PerfGpuMs = float(FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles()));
+	}
+}
+
+void FTraceOptionsMenu::DrawPerfReadout(AHUD* HUD, float RightX, float Y)
+{
+	if (PerfFps <= 0.f)
+	{
+		return;
+	}
+
+	// Amber below 45 fps, cyan above. The threshold is a judgement, not a measurement: this is a
+	// shooter, and the collaborator's report was about a build that was unplayable rather than one
+	// that was merely not smooth. It exists so the player can tell at a glance whether a change they
+	// just made moved them across the line, which is the entire point of putting this here.
+	const FLinearColor Color = (PerfFps < 45.f) ? TraceOptionsStyle::Amber : TraceOptionsStyle::Cyan;
+
+	const FString Line = (PerfGpuMs > 0.01f)
+		? FString::Printf(TEXT("%.0f FPS    %.2f MS    GPU %.2f MS"), PerfFps, PerfFrameMs, PerfGpuMs)
+		: FString::Printf(TEXT("%.0f FPS    %.2f MS"), PerfFps, PerfFrameMs);
+
+	DrawTextRight(HUD, Line, Color, RightX, Y, FontSmall, 1.1f * UIScale);
 }
 
 // =================================================================================================
@@ -751,10 +1645,19 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	const float Pitch = FMath::Clamp(RowsRegion / RowCount, 18.f * UIScale, PreferredPitch);
 	const float RowH = Pitch * 0.86f;
 
-	// A page of four buttons does not want to be as wide as a page of sixteen labelled settings.
-	const float PanelW = (Page == EPage::Root)
-		? FMath::Min(ViewW * 0.46f, 520.f * UIScale)
-		: FMath::Min(ViewW * 0.74f, 880.f * UIScale);
+	// A page of four buttons does not want to be as wide as a page of sixteen labelled settings — and
+	// the video page is wider still, because its values are words rather than numbers: "WINDOWED
+	// FULLSCREEN" and "GLOBAL ILLUMINATION" have to fit on one line at 720p without the label and
+	// the value colliding in the middle.
+	float PanelW = FMath::Min(ViewW * 0.74f, 880.f * UIScale);
+	if (Page == EPage::Root)
+	{
+		PanelW = FMath::Min(ViewW * 0.46f, 520.f * UIScale);
+	}
+	else if (Page == EPage::Video)
+	{
+		PanelW = FMath::Min(ViewW * 0.86f, 1020.f * UIScale);
+	}
 
 	const float PanelX = (ViewW - PanelW) * 0.5f;
 	const float PanelY = (ViewH - PanelH) * 0.5f;
@@ -764,9 +1667,22 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	DrawFrame(HUD, PanelX, PanelY, PanelW, PanelH);
 
 	// ---- Title ---------------------------------------------------------------------------------
-	const FString Title = (Page == EPage::Root) ? TEXT("PAUSED") : TEXT("SETTINGS");
+	FString Title = TEXT("SETTINGS");
+	if (Page == EPage::Root)       { Title = TEXT("PAUSED"); }
+	else if (Page == EPage::Video) { Title = TEXT("VIDEO"); }
+
 	const float TitleY = PanelY + (22.f * UIScale);
 	DrawTextCentered(HUD, Title, TraceOptionsStyle::Cyan, CX, TitleY, FontLarge, 1.9f * UIScale);
+
+	// The live readout, on the title line and only on the video page. Spec v11 §2: the collaborator
+	// could tell the build was slow and had no way to measure it, so every row on this page is a
+	// control whose effect is visible in the number sitting three inches above it. It is drawn last
+	// in reading order but first in importance, which is why it shares the title's line rather than
+	// being another row at the bottom of twenty-two.
+	if (Page == EPage::Video)
+	{
+		DrawPerfReadout(HUD, PanelX + PanelW - (28.f * UIScale), TitleY + (14.f * UIScale));
+	}
 
 	const float RuleY = TitleY + (46.f * UIScale);
 	HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.45f),
@@ -791,6 +1707,12 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	else if (Page == EPage::Root)
 	{
 		Hint = TEXT("W / S  OR  ARROWS   MOVE          ENTER   SELECT          ESC   RESUME");
+	}
+	else if (Page == EPage::Video)
+	{
+		// No BKSP/UNBIND on this page — there is nothing to unbind — and the hint says so rather
+		// than offering a key that does nothing.
+		Hint = TEXT("ARROWS  MOVE / ADJUST          ENTER  SELECT          ESC  BACK");
 	}
 	else
 	{
@@ -827,6 +1749,18 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		return;
 	}
 
+	// ---- Note ----------------------------------------------------------------------------------
+	//
+	// Amber, indented under the row it belongs to, with no plate. Amber is the palette's "this is
+	// the one you want" colour and it is spent here deliberately: on a page of nineteen controls
+	// the eye needs to be told which one is worth more than the other eighteen.
+	if (Row.Kind == ERowKind::Note)
+	{
+		HUD->DrawText(Row.Label, TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.78f),
+			X + PadX, TextY, FontSmall, 1.0f * UIScale);
+		return;
+	}
+
 	// ---- Plate ---------------------------------------------------------------------------------
 	HUD->DrawRect(FLinearColor(0.f, 0.02f, 0.04f, bSelected ? 0.85f : 0.45f), X, Y, W, H);
 
@@ -837,11 +1771,27 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Pulse), X, Y, 4.f * UIScale, H);
 	}
 
-	const FLinearColor LabelColor = bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim;
+	// A greyed row is not a selected row and cannot be, so this collapses to two states, not four.
+	const FLinearColor LabelColor = !Row.bEnabled
+		? TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.45f)
+		: (bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim);
 
 	// Action rows are buttons; centring their label is what makes them read as one.
 	if (Row.Kind == ERowKind::Action)
 	{
+		// AUTO-DETECT is the row a confused player on a weak machine should press, so it is the only
+		// button on the page drawn in amber with a plate behind it — everything else here is a list.
+		if (Row.Action == EAction::AutoDetectQuality)
+		{
+			const bool bMeasuring = bAutoDetectPending;
+			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, bSelected ? 0.30f : 0.16f), X, Y, W, H);
+
+			const FString Text = bMeasuring ? TEXT("MEASURING THIS MACHINE...") : Row.Label;
+			DrawTextCentered(HUD, Text, bMeasuring ? FLinearColor::White : TraceOptionsStyle::Amber,
+				X + W * 0.5f, TextY, FontMedium, LabelScale);
+			return;
+		}
+
 		DrawTextCentered(HUD, Row.Label, LabelColor, X + W * 0.5f, TextY, FontMedium, LabelScale);
 		return;
 	}
@@ -878,25 +1828,63 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		return;
 	}
 
-	if (Row.Kind == ERowKind::Toggle)
-	{
-		const bool bOn = UTraceUserSettings::Get().bInvertMouseY;
-		const FString ValueText = bOn ? TEXT("ON") : TEXT("OFF");
-		DrawTextRight(HUD, ValueText, bOn ? TraceOptionsStyle::Amber : TraceOptionsStyle::InkDim,
-			ValueRight, TextY, FontMedium, LabelScale);
-		return;
-	}
-
-	// ---- Slider --------------------------------------------------------------------------------
+	// Every remaining kind reads its value the same way, which is what lets one Toggle path serve
+	// INVERT MOUSE Y and VSYNC and one Choice path serve all thirteen enumerated video rows.
 	float Value = 0.f;
 	float Min = 0.f;
 	float Max = 1.f;
 	float Step = 1.f;
 	GetSettingValue(Row.Setting, Value, Min, Max, Step);
 
+	if (Row.Kind == ERowKind::Toggle)
+	{
+		const bool bOn = (Value >= 0.5f);
+		DrawTextRight(HUD, FormatSettingValue(Row.Setting, Value),
+			bOn ? TraceOptionsStyle::Amber : TraceOptionsStyle::InkDim,
+			ValueRight, TextY, FontMedium, LabelScale);
+		return;
+	}
+
+	if (Row.Kind == ERowKind::Choice)
+	{
+		const FString ValueText = FormatSettingValue(Row.Setting, Value);
+
+		// Arrow glyphs, drawn only on the selected row and only on the side there is somewhere to go.
+		// This is the one affordance that tells a player a row is a LIST rather than a label, and
+		// without it the quality groups look like readouts.
+		const FLinearColor ValueColor = !Row.bEnabled
+			? TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.45f)
+			: (bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim);
+
+		// The arrow columns are reserved WHETHER OR NOT an arrow is drawn in them. If the value moved
+		// right every time it hit the end of its range, every list on the page would twitch sideways
+		// as the player walked it, which reads as a layout bug rather than as an end stop.
+		const float ArrowColW = 20.f * UIScale;
+		const float ValueW = MeasureWidth(HUD, ValueText, FontMedium, LabelScale);
+		const float ValueTextRight = ValueRight - ArrowColW;
+
+		DrawTextRight(HUD, ValueText, ValueColor, ValueTextRight, TextY, FontMedium, LabelScale);
+
+		if (bSelected && Row.bEnabled)
+		{
+			const FLinearColor ArrowColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.9f);
+			if (Value > Min + UE_KINDA_SMALL_NUMBER)
+			{
+				DrawTextRight(HUD, TEXT("<"), ArrowColor, ValueTextRight - ValueW - (6.f * UIScale),
+					TextY, FontMedium, LabelScale);
+			}
+			if (Value < Max - UE_KINDA_SMALL_NUMBER)
+			{
+				DrawTextRight(HUD, TEXT(">"), ArrowColor, ValueRight, TextY, FontMedium, LabelScale);
+			}
+		}
+		return;
+	}
+
+	// ---- Slider --------------------------------------------------------------------------------
 	const float Alpha = FMath::Clamp((Value - Min) / FMath::Max(UE_KINDA_SMALL_NUMBER, Max - Min), 0.f, 1.f);
 
-	const FString ValueText = FString::Printf(TEXT("%.2f"), Value);
+	const FString ValueText = FormatSettingValue(Row.Setting, Value);
 	DrawTextRight(HUD, ValueText, bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim,
 		ValueRight, TextY, FontMedium, LabelScale);
 

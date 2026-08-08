@@ -52,10 +52,20 @@
 #     BaseColor = BaseColor (vector param)
 #     Metallic  = Metallic  (scalar param)
 #     Roughness = Roughness (scalar param)
-#     EmissiveColor = Emissive (vector param) * EmissiveStrength (scalar param)
+#     EmissiveColor = Emissive (vector param) * EmissiveStrength (scalar param),
+#                     plus, at HIGH and EPIC material quality only, a Fresnel
+#                     rim: RimColor * Fresnel(4) * RimStrength.
 #     The structural material: near-black, low roughness so screen-space
 #     reflections mirror the neon back off the floor, with an optional emissive
 #     term so a surface can carry a faint self-lit tint without a second draw.
+#
+#     THE RIM IS BEHIND A MaterialExpressionQualitySwitch (spec v11 section 3.6)
+#     so Low and Medium compile the whole branch out and get the material
+#     exactly as it shipped. RimStrength defaults to 0, so nothing changes until
+#     ATraceArenaBuilder::MakeSurfaceMID asks for it - and it does not ask on the
+#     floor. The full reasoning is in build_surface() below; the short version is
+#     that it draws the silhouette of a near-black cover block for six shader
+#     instructions instead of four more instanced blocks of face trim.
 #
 # -----------------------------------------------------------------------------
 # HOW TO RUN IT
@@ -149,6 +159,13 @@ def scalar_param(material, name, value, x, y, group="Trace"):
 
 def multiply(material, a, b, x, y):
     expr = new_expression(material, unreal.MaterialExpressionMultiply, x, y)
+    link(a, "", expr, "A")
+    link(b, "", expr, "B")
+    return expr
+
+
+def add(material, a, b, x, y):
+    expr = new_expression(material, unreal.MaterialExpressionAdd, x, y)
     link(a, "", expr, "A")
     link(b, "", expr, "B")
     return expr
@@ -255,7 +272,63 @@ def build_surface():
     # backlit rather than as a separate neon strip.
     emissive = vector_param(material, "Emissive", unreal.LinearColor(0.0, 0.0, 0.0, 1.0), -560, 160)
     strength = scalar_param(material, "EmissiveStrength", 1.0, -560, 380)
-    link_property(multiply(material, emissive, strength, -280, 240), "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    emissive_base = multiply(material, emissive, strength, -280, 240)
+
+    # -------------------------------------------------------------------------
+    # SPEC v11 SECTION 3.6 - THE MATERIAL QUALITY SWITCH, AND THE RIM IT GATES
+    #
+    # THE QUESTION SPEC v11 SECTION 3.6 ASKS is whether the generated materials
+    # have quality switches and whether a higher tier is worth adding. They did
+    # not; this is the answer, and it is deliberately the SMALLEST thing that
+    # earns its instructions rather than the most impressive.
+    #
+    # WHAT IT ADDS AT HIGH AND EPIC: a Fresnel rim. The arena's structural
+    # albedos are 0.011-0.07 and its three directional lights all come from high
+    # angles, so a cover block seen HEAD ON is a near-black rectangle with no
+    # edge - the exact defect the AddNeonBlock comment in TraceArenaBuilder.h
+    # spends a paragraph on and answers with FOUR EXTRA PIECES OF GEOMETRY per
+    # block. A Fresnel term brightens a surface as it turns away from the eye,
+    # which on a box means the silhouette edges of whichever faces you can see,
+    # i.e. it draws the block's outline for about six shader instructions and no
+    # draw calls at all.
+    #
+    # WHY IT IS BEHIND A QUALITY SWITCH rather than always on: those six
+    # instructions are paid PER PIXEL, on the material that almost every opaque
+    # pixel in the arena wears, on a frame that spec v11 section 0 measures as
+    # per-pixel bound. Low and Medium get the Default pin, which is the material
+    # exactly as it shipped, so the whole branch - the Fresnel, the multiply and
+    # the add - is compiled out of the Low and Medium shader maps. The switch is
+    # driven by r.MaterialQualityLevel, which the Shading scalability group
+    # sets, so it follows the video settings menu's Shading row.
+    #
+    # WHY THE STRENGTH DEFAULTS TO ZERO: the builder is what decides which
+    # surfaces get a rim (see MakeSurfaceMID - the near-mirror FLOOR must not,
+    # because a floor is viewed at a grazing angle over most of the screen and a
+    # Fresnel term there is a white wash across the lower half of the frame, not
+    # an edge). A material that defaults to zero is a material that cannot
+    # change the look of anything that has not asked for it, including the
+    # BasicShapeMaterial fallback path.
+    #
+    # The pin names are "Default", "Low", "High", "Medium", "Epic" - note that
+    # the engine's EMaterialQualityLevel really does order them Low, High,
+    # Medium, Epic (MaterialShared.cpp), so connecting by NAME rather than by
+    # index is not fussiness, it is the only way to get this right.
+    rim_colour = vector_param(material, "RimColor", unreal.LinearColor(0.30, 0.62, 0.95, 1.0), -560, 560)
+    rim_strength = scalar_param(material, "RimStrength", 0.0, -560, 760)
+
+    fresnel = new_expression(material, unreal.MaterialExpressionFresnel, -560, 940)
+    fresnel.set_editor_property("exponent", 4.0)
+    fresnel.set_editor_property("base_reflect_fraction", 0.0)
+
+    rim = multiply(material, rim_colour, multiply(material, fresnel, rim_strength, -380, 800), -220, 640)
+    emissive_high = add(material, emissive_base, rim, -120, 400)
+
+    quality = new_expression(material, unreal.MaterialExpressionQualitySwitch, 40, 300)
+    link(emissive_base, "", quality, "Default")
+    link(emissive_high, "", quality, "High")
+    link(emissive_high, "", quality, "Epic")
+
+    link_property(quality, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
 
     finish_material(material)
 
