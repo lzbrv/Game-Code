@@ -1595,9 +1595,15 @@ namespace
 
 		// The handler's own log lines are half the evidence — "ignored, knife already equipped" is
 		// the sentence §2 asks for — so the probe turns them on rather than hoping the run did.
-		if (IConsoleVariable* LogInput = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.LogInput")))
+		// NOT named LogInput. InputCore declares a global log category by that exact name
+		// (DECLARE_LOG_CATEGORY_EXTERN(LogInput, ...) in InputCoreTypes.h), so a local called
+		// LogInput is C4459 "declaration hides global declaration" — an ERROR on MSVC under
+		// Unreal's warnings-as-errors, and completely silent on clang. That asymmetry has now
+		// broken this project's Windows build three separate times. The identical call in
+		// Source/Trace/Debug/TraceInputHarness.cpp is already named LogInputCVar for this reason.
+		if (IConsoleVariable* LogInputCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.LogInput")))
 		{
-			LogInput->Set(1, ECVF_SetByConsole);
+			LogInputCVar->Set(1, ECVF_SetByConsole);
 		}
 
 		TSharedRef<FV13HotkeyProbe> Probe = MakeShared<FV13HotkeyProbe>();
