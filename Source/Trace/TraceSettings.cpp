@@ -700,6 +700,165 @@ namespace
 			Table.CoreThrowSpeed / FMath::Sqrt(FMath::Max(0.01f, Table.CoreMassScale)),
 			Table.CoreThrowGravityScale * Table.CoreMassScale);
 
+		// -----------------------------------------------------------------------------------------
+		// SPEC v13. The four features this pass tunes, on one line each, for the reason every block
+		// above exists: these numbers are ALSO in Config/DefaultGame.ini and the ini wins.
+		//
+		// THE FIRST LINE IS A PARITY CHECK, not a listing. §3 is "update carrier speed to match the
+		// new knife speed", so the two multipliers are one number written twice and the only failure
+		// worth catching is them disagreeing — which is exactly what shipped for a pass after v12 §3
+		// moved one of them. Printing the SPEEDS as well as the multipliers is deliberate: 1.22 and
+		// 1.22 can still be different speeds if WalkSpeed is ever read from two places.
+		// -----------------------------------------------------------------------------------------
+		{
+			const float CarrierSpeed = Table.WalkSpeed * Table.CarrierSpeedMultiplier;
+			const float KnifeSpeed   = Table.WalkSpeed * Table.KnifeMoveSpeedMultiplier;
+			const bool bParity = FMath::IsNearlyEqual(Table.CarrierSpeedMultiplier, Table.KnifeMoveSpeedMultiplier, 0.001f);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsDump:%s] SPECv13 §3 parity: carrier=%.4f (%.1f uu/s) knife=%.4f (%.1f uu/s) -> %s"),
+				Tag, Table.CarrierSpeedMultiplier, CarrierSpeed,
+				Table.KnifeMoveSpeedMultiplier, KnifeSpeed,
+				bParity ? TEXT("MATCHED") : TEXT("*** BROKEN - v13 §3 asked for these to be equal ***"));
+		}
+
+		// §1's numbers are NOT on this page and are read across by /Script path — see the tombstone in
+		// TraceSettings.h where they used to be declared. They shipped duplicated for one pass (this
+		// page AND UTraceHealthSettings, both ini-backed, only the latter with a reader), so printing
+		// them from the OWNING class is the thing that makes a re-divergence visible: if somebody
+		// re-adds a copy here, this line still reports what the game is actually using.
+		{
+			float RegenDelay = -1.f;
+			float RegenRate  = -1.f;
+			bool  bRegenOn   = false;
+			bool  bRegenFound = false;
+
+			if (const UClass* HealthClass = FindObject<UClass>(nullptr, TEXT("/Script/Trace.TraceHealthSettings")))
+			{
+				if (const UObject* HealthCDO = HealthClass->GetDefaultObject())
+				{
+					const FFloatProperty* DelayProp = CastField<FFloatProperty>(HealthClass->FindPropertyByName(TEXT("RegenDelaySeconds")));
+					const FFloatProperty* RateProp  = CastField<FFloatProperty>(HealthClass->FindPropertyByName(TEXT("RegenRatePerSecond")));
+					const FBoolProperty*  OnProp    = CastField<FBoolProperty>(HealthClass->FindPropertyByName(TEXT("bRegenEnabled")));
+
+					bRegenFound = (DelayProp != nullptr) && (RateProp != nullptr) && (OnProp != nullptr);
+					if (bRegenFound)
+					{
+						RegenDelay = DelayProp->GetPropertyValue_InContainer(HealthCDO);
+						RegenRate  = RateProp->GetPropertyValue_InContainer(HealthCDO);
+						bRegenOn   = OnProp->GetPropertyValue_InContainer(HealthCDO);
+					}
+				}
+			}
+
+			const float DrawnReach = static_cast<float>(UTraceTrailComponent::GetTraceDrawnHalfReach());
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsDump:%s] SPECv13 §1 regen [UTraceHealthSettings]: %s enabled=%d delay=%.2fs "
+				     "rate=%.1fHP/s (0->%.0f in %.1fs) | "
+				     "§5 magnet: radius=%.0fuu contestHysteresis=%.1fuu | "
+				     "§8 landing: minDescent=%.1fdeg (surfaceMaxSlope=%.1fdeg) | "
+				     "§7 trail: wallFit=%d clearanceByHalfWidth=%d margin=%.1f maxPush=%.1f (drawn reach %.1f + margin = %.1fuu asked for%s) maxInsert=%d"),
+				Tag,
+				bRegenFound ? TEXT("") : TEXT("*** PAGE NOT FOUND - regen numbers below are meaningless ***"),
+				bRegenOn ? 1 : 0, RegenDelay, RegenRate,
+				Table.MaxHealth,
+				(RegenRate > 0.f) ? (Table.MaxHealth / RegenRate) : -1.f,
+				Table.CoreCatchRadius, Table.CoreCatchContestHysteresisUU,
+				Table.CoreLandingMinDescentDegrees, Table.CoreSurfaceMaxSlopeDegrees,
+				Table.bTrailWallFitEnabled ? 1 : 0, Table.bTrailWallClearanceEnabled ? 1 : 0,
+				Table.TrailWallFitMarginUU, Table.TrailWallFitMaxPushUU,
+				// THE DRAWN REACH, NOT TrailRadius, and the difference is the whole of §7. This line
+				// printed "halfWidth 22.5 + margin = 26.5uu asked for" for a pass, which is the exact
+				// figure the fix exists to disprove: the ribbon overlaps its joints and the spline
+				// overshoots corners, so it reaches ~36uu. Printing 26.5 beside a 44uu push made the
+				// push look like generous headroom when it is in fact a 3.7uu margin. Read from
+				// GetTraceDrawnHalfReach() rather than re-derived, so it cannot drift from the fitter.
+				DrawnReach, DrawnReach + Table.TrailWallFitMarginUU,
+				// And say so out loud if the setting is once again below what the fitter needs, because
+				// the code silently floors it and this dump would otherwise be the last place that
+				// looked fine.
+				(Table.TrailWallFitMaxPushUU >= (DrawnReach + Table.TrailWallFitMarginUU))
+					? TEXT("")
+					: TEXT(" *** maxPush is BELOW this - the code's derived floor is overriding the setting ***"),
+				Table.TrailWallFitMaxInsert);
+		}
+
+		// §6, with the arithmetic worked out rather than left to the reader. Power at a click and
+		// Power at a full hold are the two ends of the linear rule, and the launch speeds beside them
+		// are what those actually throw at once CoreMassScale has divided the impulse — which is the
+		// number a playtest is judging.
+		{
+			const float Mass = FMath::Sqrt(FMath::Max(0.01f, Table.CoreMassScale));
+			const float ClickPower = FMath::Clamp(Table.CoreThrowChargeFloorFraction, 0.f, 1.f);
+			const float FullPower  = Table.bCoreThrowChargeClampsAtFull
+				? 1.f
+				: FMath::Max(1.f, Table.CoreThrowChargeMaxFraction);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsDump:%s] SPECv13 §6 charge: time=%.2fs floor=%.3f clampsAtFull=%d max=%.2f | "
+				     "click -> %.3f x %.0f / sqrt(%.2f) = %.0f uu/s, full -> %.3f x %.0f / sqrt(%.2f) = %.0f uu/s "
+				     "(+ thrower velocity x %.2f, added on top and NOT scaled by charge)"),
+				Tag, Table.CoreThrowChargeSeconds, Table.CoreThrowChargeFloorFraction,
+				Table.bCoreThrowChargeClampsAtFull ? 1 : 0, Table.CoreThrowChargeMaxFraction,
+				ClickPower, Table.CoreThrowSpeed, Table.CoreMassScale, ClickPower * Table.CoreThrowSpeed / Mass,
+				FullPower, Table.CoreThrowSpeed, Table.CoreMassScale, FullPower * Table.CoreThrowSpeed / Mass,
+				Table.CoreThrowVelocityInheritance);
+		}
+
+		// -----------------------------------------------------------------------------------------
+		// SPEC v13 §4 — WHICH LEVEL DOES THE GAME OPEN. Verbatim: "The game should default to opening
+		// the main menu level."
+		//
+		// THIS IS HERE BECAUSE THE ANSWER CANNOT BE READ FROM Config/DefaultEngine.ini EITHER. The
+		// three map keys are layered exactly like every gameplay number on this page — Base, then
+		// Default, then any platform or user override — so the only honest answer is what
+		// UGameMapsSettings holds at runtime, which is what the engine itself reads:
+		//   * a standalone/packaged launch with no map on the command line opens GameDefaultMap
+		//     (UEngine::Browse -> UGameMapsSettings::GetGameDefaultMap);
+		//   * the EDITOR opens EditorStartupMap at startup (FEditorFileUtils::LoadDefaultMapAtStartup),
+		//     and Play-in-Editor then plays whatever level is open — which is why an EditorStartupMap
+		//     pointing at the arena means Play skips the menu, the actual v13 §4 symptom;
+		//   * a dedicated server opens ServerDefaultMap, which stays on the arena: a server has
+		//     nobody to show a menu to.
+		//
+		// Resolved BY CLASS PATH rather than by including GameMapsSettings.h, for the same reason
+		// FKnobSpec::OwnerPath is: UGameMapsSettings lives in the EngineSettings module, this module
+		// does not link it, and a diagnostic must never be the thing that adds a build dependency.
+		// EditorStartupMap is WITH_EDITORONLY_DATA, so it is absent in a true no-editor build and the
+		// line says so rather than printing a lie.
+		// -----------------------------------------------------------------------------------------
+		if (const UClass* MapsClass = FindObject<UClass>(nullptr, TEXT("/Script/EngineSettings.GameMapsSettings")))
+		{
+			const UObject* MapsCDO = MapsClass->GetDefaultObject();
+
+			auto ReadMapKey = [MapsClass, MapsCDO](const TCHAR* PropertyName) -> FString
+			{
+				const FProperty* Found = MapsClass->FindPropertyByName(FName(PropertyName));
+				if (Found == nullptr || MapsCDO == nullptr)
+				{
+					return TEXT("<not in this build>");
+				}
+				FString Value;
+				Found->ExportText_InContainer(0, Value, MapsCDO, MapsCDO, nullptr, PPF_None);
+				return Value.IsEmpty() ? TEXT("<empty>") : Value;
+			};
+
+			const FString GameDefault   = ReadMapKey(TEXT("GameDefaultMap"));
+			const FString EditorStartup = ReadMapKey(TEXT("EditorStartupMap"));
+			const FString ServerDefault = ReadMapKey(TEXT("ServerDefaultMap"));
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsDump:%s] SPECv13 §4 maps: GameDefaultMap=%s | EditorStartupMap=%s | ServerDefaultMap=%s"),
+				Tag, *GameDefault, *EditorStartup, *ServerDefault);
+
+			const bool bGameMenu   = GameDefault.Contains(TEXT("MainMenu"));
+			const bool bEditorMenu = EditorStartup.Contains(TEXT("MainMenu"));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsDump:%s] SPECv13 §4 verdict: standalone launch -> %s | editor startup + Play -> %s"),
+				Tag,
+				bGameMenu ? TEXT("MENU (correct)") : TEXT("*** NOT the menu ***"),
+				bEditorMenu ? TEXT("MENU (correct)") : TEXT("*** NOT the menu - Play would skip the menu ***"));
+		}
+
 		// Spec v4 §4. The impact sphere is deleted from ATraceTracer, so there is nothing to report
 		// for it — the radii are the whole of what is left to get wrong.
 		UE_LOG(LogTraceGame, Display,
@@ -1030,17 +1189,17 @@ namespace
 			// air ceilings are the "adjust momentum accordingly", scaled by BONUS (the part above 1)
 			// rather than by the multiplier itself, which would have pushed the knife below the gun.
 			//
-			// *** READ THE CARRIER LINE BELOW THESE THREE. The knife dropping to 1.22 leaves
-			// *** CarrierSpeedMultiplier (1.30) FASTER than the knife, and the carrier's 1.30 exists
-			// *** only because the user asked to "increase core carrier speed to match knife speed".
-			// *** The parity is broken as of v12 §3 and it is deliberate: only what was asked was
-			// *** implemented. That is a decision for the user, not a bug to quietly fix.
+			// *** READ THE CARRIER LINE BELOW THESE THREE. v12 §3 left CarrierSpeedMultiplier at 1.30
+			// *** while the knife went to 1.22, which made the CARRIER the faster of the two for one
+			// *** pass. SPEC v13 §3 CLOSES IT — "update carrier speed to match the new knife speed" —
+			// *** so both now read 1.22. The two rows are printed together on purpose: this pair is
+			// *** the parity, and the only way to see it broken is to see both numbers at once.
 			{ TEXT("KnifeMoveSpeedMultiplier"),        EKnobType::Float, TEXT("v12 §3: 1.30 -> 1.22, MUST read 1.22 [by-name bind]") },
 			{ TEXT("KnifeAirStrafeSoftCapMultiplier"), EKnobType::Float, TEXT("v12 §3: 1+0.25x22/30 = 1.1833, MUST read 1.1833 [by-name bind]") },
 			{ TEXT("KnifeAirStrafeHardCapMultiplier"), EKnobType::Float, TEXT("v12 §3: 1+0.35x22/30 = 1.2567, MUST stay >= the soft multiplier [by-name bind]") },
 			// The knife's counterpart. Not moved by v12 and printed here so the broken parity is on the
 			// same screen as the number that broke it, rather than being rediscovered in a playtest.
-			{ TEXT("CarrierSpeedMultiplier"),          EKnobType::Float, TEXT("v12 §3 FLAG: still 1.30 - the carrier is now FASTER than the knife (1.22). User's call.") },
+			{ TEXT("CarrierSpeedMultiplier"),          EKnobType::Float, TEXT("v13 §3: 1.30 -> 1.22, MUST equal KnifeMoveSpeedMultiplier above - parity restored") },
 
 			// §4 the parry. Not new, but it MOVED this pass (0.20 -> 0.175) and it is the one number
 			// the whole mechanic is - window and invulnerability are the SAME property, which is the
@@ -1083,6 +1242,58 @@ namespace
 			// §7 the half length is NOT here, and that is not an oversight: HalfDuration is a
 			// UPROPERTY(config) on ATraceGameMode, not on this page, so this command cannot see it.
 			// Trace.DumpSettings prints it from the running game mode, which is where it is read.
+
+			// --- spec v13, every knob this pass introduced or moved ----------------------------
+			//
+			// ALL EIGHT ARE NEW OR MOVED THIS PASS and every one of them is listed on the pass that
+			// introduces it, per the v8 rule, EVEN THOUGH THREE OF THE FEATURES ARE STILL BEING
+			// WRITTEN in other files as this lands. That is the point of the rule: this table proves
+			// a knob EXISTS, is `config` (so DefaultGame.ini reaches it) and is EditAnywhere (so the
+			// panel does). It cannot prove anybody reads it — see the v12 §6 note above, which says
+			// the same thing about the wall-fit block and was right to. The readers' own binding logs
+			// close that half, and the pass report names the exact property each slice must read.
+			//
+			// §1 HEALTH REGENERATION. "After 9 seconds without taking damage, characters' health
+			// slowly begins to regenerate." The delay is the user's number; the rate is the
+			// [ASSUMPTION]. Read at the point of use by the health path so a live edit retunes a
+			// match in progress rather than the next one.
+			// §1 REGENERATION IS ON UTraceHealthSettings, and the two rows that were here
+			// (HealthRegenDelaySeconds / HealthRegenPerSecond, on UTraceSettings) ARE DELETED WITH THE
+			// PROPERTIES THEY NAMED. Both pages shipped for one pass, both ini-backed, both spelled
+			// correctly — and only one had a reader. These rows reported OK for the copy nothing read,
+			// which is the one blind spot this table has by construction: it proves a property is
+			// reachable, never that anybody reached for it. The rows below name the surviving page by
+			// /Script path, so they verify the knobs the game actually resolves.
+			{ TEXT("bRegenEnabled"),      EKnobType::Bool,  TEXT("v13 §1: master switch; 0 is the RegenTest RED arm"), TEXT("/Script/Trace.TraceHealthSettings") },
+			{ TEXT("RegenDelaySeconds"),  EKnobType::Float, TEXT("v13 §1: 9s untouched before regen starts - the user's number, MUST read 9"), TEXT("/Script/Trace.TraceHealthSettings") },
+			{ TEXT("RegenRatePerSecond"), EKnobType::Float, TEXT("v13 §1: [ASSUMPTION] 10 HP/s = 0->100 in 10s. Keep well under the gun's 100 HP/s"), TEXT("/Script/Trace.TraceHealthSettings") },
+
+			// §5 THE CONTESTED MAGNET. The nearest-player rule needs no knob; the TIE does, or two
+			// chasers at similar range swap the Core between them several times a second. 0 is the
+			// raw rule with no hysteresis, which is the arm that reproduces the flicker.
+			{ TEXT("CoreCatchContestHysteresisUU"),    EKnobType::Float, TEXT("v13 §5: a rival must be closer by MORE than this to steal the magnet. 0 = raw nearest-wins") },
+
+			// §6 THE CHARGE-UP THROW. All four numbers the spec asked for by name: charge time,
+			// floor fraction, whether it clamps, and the ceiling when it does not. Charge scales the
+			// IMPULSE; CoreThrowVelocityInheritance is still added on top and is listed in the v8
+			// block above rather than repeated here.
+			{ TEXT("CoreThrowChargeSeconds"),          EKnobType::Float, TEXT("v13 §6: 1.0s hold = full momentum, the user's number") },
+			{ TEXT("CoreThrowChargeFloorFraction"),    EKnobType::Float, TEXT("v13 §6: [ASSUMPTION] 0.15 - an instant click is 'very low', never zero") },
+			{ TEXT("bCoreThrowChargeClampsAtFull"),    EKnobType::Bool,  TEXT("v13 §6: [ASSUMPTION] true - holding past the charge time adds nothing") },
+			{ TEXT("CoreThrowChargeMaxFraction"),      EKnobType::Float, TEXT("v13 §6: the ceiling when the clamp is OFF. 1.0 so unticking the box changes nothing by itself") },
+
+			// §7 THE TRACE STILL CLIPS INTO WALLS. TrailWallFitMaxPushUU is NOT a new row - it is in
+			// the v12 §6 block above and its note there records the 12 -> 30 move and the measurement
+			// that forced it (26.1 uu of penetration against a 12 uu allowance). Only the new switch
+			// is listed here, and it pairs with Trace.Trail.WallClearance the way the other four pair
+			// with their CVars.
+			{ TEXT("bTrailWallClearanceEnabled"),      EKnobType::Bool,  TEXT("v13 §7: clear by the trace's own half width near geometry, not only on a blocked chord. OFF = v12 behaviour. NOW READ by WallClearanceEnabled() - it was declared with NO reader for a pass") },
+
+			// §8 THE MID-AIR TURNOVER. Added during integration: TraceCore's own startup binding check
+			// listed this name as the one v13 knob with no property behind it, so Trace.ModeB.Landing-
+			// MinDescentDegrees was the only way to retune the fix. It has a property now, and this row
+			// is what keeps the two spellings tied together.
+			{ TEXT("CoreLandingMinDescentDegrees"),    EKnobType::Float, TEXT("v13 §8: arrival angle for a contact to be a LANDING; 0 restores the pre-v13 'any upward normal' bug for A/B") },
 
 			// --- spec v10 §1, THE KNIFE ITSELF - a DIFFERENT settings class ---------------------
 			//

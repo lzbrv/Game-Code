@@ -139,6 +139,29 @@ namespace TraceBotConstants
 	 */
 	static constexpr float ThrowRangeSafetyFraction = 0.85f;
 
+	// --- MODE B, spec v13 §6: the charge-up throw ---------------------------------------------------
+
+	/**
+	 * The weakest a bot will ever release a throw at, as a fraction of full momentum.
+	 *
+	 * The spec's warning is explicit: "a bot that always instant-clicks throws at 15% power and mode B
+	 * will look broken." 0.45 is comfortably above the 0.15 floor a human tap produces, which means a
+	 * bot's shortest pass still leaves the hand like a throw rather than a fumble - and it is the
+	 * charge at which a throw covers about 20% of full range (range goes as the square of speed), which
+	 * is 700-odd uu on this pitch and further than any pass a bot actually chooses.
+	 */
+	static constexpr float ThrowMinCharge = 0.45f;
+
+	/**
+	 * Added to the charge a throw strictly needs, so a bot does not release at exactly the power that
+	 * just barely arrives.
+	 *
+	 * The same argument as ThrowRangeSafetyFraction, one level down: the bots throw through an aim slew
+	 * with error on top, and since spec v6 §4.2 a throw that falls short lands on the floor and is
+	 * handed to the nearest enemy. Over-throwing slightly is recoverable; under-throwing is a turnover.
+	 */
+	static constexpr float ThrowChargeMargin = 0.12f;
+
 	/**
 	 * SPEC v6 section 4.2. Minimum shot quality a bot will take at goal when it is NOT about to die.
 	 *
@@ -1347,6 +1370,9 @@ void ATraceBotController::OnPossess(APawn* InPawn)
 	bPassOwnsAim = false;
 	PassCooldownUntilTime = 0.f;
 	NextPassEvalTime = 0.f;
+	// Spec v13 §6: a wind-up is body state too, and a fresh pawn has not wound anything up.
+	PlannedThrowCharge = 1.f;
+	ThrowChargeReleaseTime = 0.f;
 	bCrouchHeld = false;
 	SlideEndTime = 0.f;
 	SlideReadyTime = 0.f;
@@ -1496,6 +1522,7 @@ const TCHAR* ATraceBotController::PassPhaseToString(ETraceBotPassPhase InPhase)
 	{
 	case ETraceBotPassPhase::Lining:   return TEXT("Lining");
 	case ETraceBotPassPhase::Holding:  return TEXT("Holding");
+	case ETraceBotPassPhase::Charging: return TEXT("Charging");
 	case ETraceBotPassPhase::Cooldown: return TEXT("Cooldown");
 	default:                           return TEXT("None");
 	}
@@ -1663,10 +1690,15 @@ void ATraceBotController::Tick(float DeltaSeconds)
 		// and the grace decision attached: see the [ModeB] INTERCEPTION / RECOVERY lines.)
 		bCommitCarryIn = false;
 
-		if (PassPhase == ETraceBotPassPhase::Lining)
+		// SPEC v13 §6: Charging counts here too, and it is the more important of the two. A bot killed
+		// or intercepted mid-wind-up still has the button DOWN, and AbortThrow is what puts it back up.
+		// Releasing at this point cannot launch anything - ATraceCore cleared the charge when it took
+		// the Core off us, and refuses a release it has no matching press for - but leaving the latch
+		// down would arm the next possession's first frame with a press nobody made.
+		if (PassPhase == ETraceBotPassPhase::Lining || PassPhase == ETraceBotPassPhase::Charging)
 		{
 			TRACE_BOT_KIT(ThrowGiveUps);
-			AbortThrow(TEXT("lost the Core while lining up a throw"));
+			AbortThrow(TEXT("lost the Core while lining up or charging a throw"));
 		}
 	}
 	else if (PassPhase != ETraceBotPassPhase::None && PassPhase != ETraceBotPassPhase::Cooldown)
@@ -3448,17 +3480,58 @@ namespace TraceThrowBallistics
  * variables — so it was already reading numbers the Core was not using, and it would have missed the
  * v5 weight model completely.
  */
-static TraceThrowBallistics::FModel MakeThrowModel(const UWorld* World)
+static TraceThrowBallistics::FModel MakeThrowModel(const UWorld* World, float ChargeScale = 1.f)
 {
 	TraceThrowBallistics::FModel Model;
-	Model.Speed = FMath::Max(100.f, ATraceCore::GetThrowSpeed());
+
+	// SPEC v13 §6. THE CHARGE SCALES THE WHOLE IMPULSE, WHICH IS EXACTLY ONE MULTIPLICATION HERE.
+	//
+	// ATraceCore's launch is (aim * Speed + up * Speed * UpBias) * charge, and this model's own launch
+	// is (aim * Model.Speed + up * Model.Speed * Model.UpBias). Scaling Model.Speed and leaving UpBias
+	// alone reproduces the Core's expression term for term - the loft stays the same FRACTION of a
+	// smaller impulse, which is what makes a half-charged throw the same shape of arc, only shorter.
+	// Scaling UpBias too would make weak throws flatter, which is not what the Core does.
+	Model.Speed = FMath::Max(100.f, ATraceCore::GetThrowSpeed() * FMath::Max(0.05f, ChargeScale));
 	Model.UpBias = ATraceCore::GetThrowUpBias();
 	Model.GravityZ = FMath::Min(-1.f, ATraceCore::GetThrowGravityZ(World));
 	return Model;
 }
 
+float ATraceBotController::ChooseThrowCharge(const FVector& From, const FVector& WorldTarget) const
+{
+	// FULL POWER IS 1.0 BY DEFINITION under UTraceSettings' charge arithmetic - a full hold reaches
+	// exactly the throw the game had before v13, and CoreThrowChargeMaxFraction caps the HOLD rather
+	// than the power. So the bots' ceiling is 1.0 and not that knob: a bot has no reason to overcharge
+	// even where the tuning allows it, because every one of its range decisions (MaxThrowRange,
+	// ChooseReceiver, the shot score) is measured against the full-power arc.
+	constexpr float FullMax = 1.f;
+	const float Floor = ATraceCore::GetThrowChargeFloor();
+
+	// A bot never taps. The spec's own warning - "a bot that always instant-clicks will throw at 15%
+	// power and mode B will look broken" - is about exactly this number, and it is deliberately well
+	// above the floor: even a pass to somebody standing next to you should leave the hand like a throw.
+	const float MinBotCharge = FMath::Clamp(FMath::Max(Floor, TraceBotConstants::ThrowMinCharge), 0.f, FullMax);
+
+	const float Reach = MaxThrowRange(From, static_cast<float>(WorldTarget.Z - From.Z), FullMax)
+		* TraceBotConstants::ThrowRangeSafetyFraction;
+	const float Distance = static_cast<float>(FVector::Dist2D(From, WorldTarget));
+
+	if (Reach <= 1.f || Distance <= 1.f)
+	{
+		return FullMax;   // Nothing to reason about; throw it properly.
+	}
+
+	// Range goes as speed squared, so the charge that just covers D is sqrt(D / R). The margin is not
+	// decoration: since spec v6 §4.2 a throw that lands is handed to the nearest enemy, so arriving at
+	// the exact limit of the arc means arriving on the floor and giving the Core away.
+	const float Needed = FMath::Sqrt(FMath::Clamp(Distance / Reach, 0.f, 1.f)) * FullMax
+		+ TraceBotConstants::ThrowChargeMargin;
+
+	return FMath::Clamp(Needed, MinBotCharge, FullMax);
+}
+
 bool ATraceBotController::SolveThrowLaunch(const FVector& From, const FVector& WorldTarget,
-	FVector& OutLaunchDirection, float* OutFlightSeconds) const
+	FVector& OutLaunchDirection, float* OutFlightSeconds, float ChargeScale) const
 {
 	if (static_cast<float>(FVector(WorldTarget.X - From.X, WorldTarget.Y - From.Y, 0.0).Size()) < 1.f)
 	{
@@ -3470,7 +3543,7 @@ bool ATraceBotController::SolveThrowLaunch(const FVector& From, const FVector& W
 		return true;
 	}
 
-	const TraceThrowBallistics::FModel Model = MakeThrowModel(GetWorld());
+	const TraceThrowBallistics::FModel Model = MakeThrowModel(GetWorld(), ChargeScale);
 
 	// SPEC v8 §4 FALLOUT. The Core now leaves at impulse + thrower velocity, so a bot that solves the
 	// impulse alone aims wrong BY ITS OWN VELOCITY — a running bot throwing across its direction of
@@ -3530,9 +3603,9 @@ bool ATraceBotController::SolveThrowLaunch(const FVector& From, const FVector& W
 	return bSolved;
 }
 
-float ATraceBotController::MaxThrowRange(const FVector& /*From*/, float HeightDelta) const
+float ATraceBotController::MaxThrowRange(const FVector& /*From*/, float HeightDelta, float ChargeScale) const
 {
-	const TraceThrowBallistics::FModel Model = MakeThrowModel(GetWorld());
+	const TraceThrowBallistics::FModel Model = MakeThrowModel(GetWorld(), ChargeScale);
 
 	// Walk the pitch band and keep the furthest range that still arrives at the wanted height. The
 	// bisection in SolvePitch answers "can I reach THIS range"; this answers "how far can I reach at
@@ -3577,7 +3650,7 @@ float ATraceBotController::MaxThrowRange(const FVector& /*From*/, float HeightDe
 }
 
 bool ATraceBotController::HasThrowLane(const FVector& From, const FVector& WorldTarget,
-	const FVector& LaunchDirection, float FlightSeconds) const
+	const FVector& LaunchDirection, float FlightSeconds, float ChargeScale) const
 {
 	const UWorld* World = GetWorld();
 	const ATraceCharacter* BotCharacter = GetBotCharacter();
@@ -3586,13 +3659,17 @@ bool ATraceBotController::HasThrowLane(const FVector& From, const FVector& World
 		return true;   // Nothing to sweep. Refusing here would refuse every point-blank shot.
 	}
 
-	const TraceThrowBallistics::FModel Model = MakeThrowModel(World);
+	const TraceThrowBallistics::FModel Model = MakeThrowModel(World, ChargeScale);
 
 	// SPEC v8 §4. Sweep the arc the Core ACTUALLY FLIES, not the one the impulse alone would produce.
 	// ComputeThrowLaunchVelocity is ATraceCore's own launch expression (impulse + inherited velocity,
 	// mode-gated and null-safe), so the lane test and the throw cannot drift apart the way a
 	// hand-rebuilt copy of the formula just did — this line used to be that copy.
-	const FVector LaunchVelocity = ATraceCore::ComputeThrowLaunchVelocity(BotCharacter, LaunchDirection);
+	//
+	// SPEC v13 §6: at the charge this throw is actually going to be released at. A lane swept for a
+	// full-power arc is the wrong lane for a half-power one - it clears cover the real throw would hit
+	// and hits cover the real throw would clear.
+	const FVector LaunchVelocity = ATraceCore::ComputeThrowLaunchVelocity(BotCharacter, LaunchDirection, ChargeScale);
 
 	FCollisionQueryParams Params(TEXT("TraceBotThrowLane"), /*bTraceComplex=*/false, BotCharacter);
 
@@ -3648,8 +3725,12 @@ FVector ATraceBotController::ComputeThrowAimPoint(const FVector& WorldTarget) co
 
 	const FVector From = BotCharacter->GetPawnViewLocation();
 
+	// SPEC v13 §6. AT THE CHARGE THIS ATTEMPT IS GOING TO BE RELEASED AT, not at full power. This is
+	// the single most important line of the bot half of §6: the aim and the launch have to be solved
+	// for the same impulse or the bot lobs at a full-power solution and then throws at 40%, landing
+	// short of everything by the difference.
 	FVector LaunchDirection = FVector::ZeroVector;
-	if (SolveThrowLaunch(From, WorldTarget, LaunchDirection))
+	if (SolveThrowLaunch(From, WorldTarget, LaunchDirection, nullptr, PlannedThrowCharge))
 	{
 		// A point along the solved launch ray. The caller turns this back into a rotation, so the
 		// distance is arbitrary as long as it is far enough not to lose precision.
@@ -3696,6 +3777,62 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 	// BehaviourCarryToGoal - which reads the latch every frame to decide whether to weave - would be
 	// steering off the mouth the entire way in.
 	UpdateCarryInCommit();
+
+	// --- SPEC v13 §6: A CHARGE IN PROGRESS IS A COMMITMENT, AND IT OUTRANKS EVERYTHING BELOW. ------
+	//
+	// AHEAD OF THE CARRY-IN CHECK AND THE COOLDOWN, deliberately, because the button is already down
+	// and RELEASING IT IS THE THROW. There is no such thing as "abort" once a charge has started: the
+	// only two things a caller can do are release now (a weak throw at whatever is under the crosshair)
+	// or release on time (the throw the bot decided on), and the second is always the better of the
+	// two. The wind-up is at most Trace.ModeB.ThrowChargeSeconds, so the cost of this commitment is
+	// bounded at a second.
+	//
+	// The aim keeps tracking through the hold - a receiver keeps running while the bot winds up - and
+	// PlannedThrowCharge is deliberately NOT re-derived here: the hold length was computed from it when
+	// the button went down, and a charge that changed its mind mid-hold would release at a power the
+	// aim was not solved for.
+	if (PassPhase == ETraceBotPassPhase::Charging)
+	{
+		if (!bThrowAtGoal && PassReceiver.IsValid() && PassReceiver->IsAlive())
+		{
+			ThrowTargetPoint = PassReceiver->GetActorLocation() + FVector(0.f, 0.f, Settings.BotAimBodyOffsetZ);
+		}
+
+		PassAimPoint = ComputeThrowAimPoint(ThrowTargetPoint);
+		bPassOwnsAim = true;
+
+		if (Now < ThrowChargeReleaseTime)
+		{
+			return;   // Still winding up.
+		}
+
+		// RELEASE. Same entry point a human's mouse-up reaches; the Core measures the hold on its own
+		// clock and launches. The bot never tells it how long it held.
+		ApplyPassInput(BotCharacter, false);
+		bPassInputHeld = false;
+
+		TRACE_BOT_KIT(ThrowAttempts);
+		if (bThrowAtGoal)
+		{
+			TRACE_BOT_KIT(ThrowsAtGoal);
+		}
+		else if (PassReceiver.IsValid())
+		{
+			TRACE_BOT_KIT(ThrowsToTeammate);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotThrow] %s RELEASED at %s (%s) after a %.2fs charge (x%.2f of full power)"),
+			*GetNameSafe(GetPlayerState<APlayerState>()),
+			bThrowAtGoal ? TEXT("the GOAL") : (PassReceiver.IsValid()
+				? *GetNameSafe(PassReceiver->GetPlayerState<APlayerState>()) : TEXT("open ground (clearance)")),
+			bThrowAtGoal ? TEXT("shot") : (PassReceiver.IsValid() ? TEXT("pass") : TEXT("clearance")),
+			Now - PassPhaseStartTime, PlannedThrowCharge);
+
+		AbortThrow(nullptr);   // Not a failure: this is how the attempt is closed out and cooled down.
+		return;
+	}
+
 	if (bCommitCarryIn)
 	{
 		if (PassPhase == ETraceBotPassPhase::Lining)
@@ -4009,6 +4146,12 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 		ThrowTargetPoint = Receiver->GetActorLocation() + FVector(0.f, 0.f, Settings.BotAimBodyOffsetZ);
 	}
 
+	// SPEC v13 §6. DECIDE THE POWER BEFORE SOLVING THE AIM, every frame of the line-up, because the aim
+	// is a function of the power: a lofted solution at 40% charge points somewhere quite different from
+	// the same solution at 100%. Recomputed rather than latched at the start of the line-up because the
+	// bot and its receiver are both moving throughout it.
+	PlannedThrowCharge = ChooseThrowCharge(BotCharacter->GetPawnViewLocation(), ThrowTargetPoint);
+
 	PassAimPoint = ComputeThrowAimPoint(ThrowTargetPoint);
 	bPassOwnsAim = true;
 
@@ -4044,29 +4187,31 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 		bTriggerHeld = false;
 	}
 
-	// THROW. ATraceCore::RequestPassInput routes a press to ThrowFromHolder in mode B, so this is
-	// the same entry point a human's mouse1 reaches — the bots do not have a private door.
+	// SPEC v13 §6. START THE CHARGE. The press no longer throws - it winds up, and the release a
+	// fraction of a second later is what launches. Same entry point a human's mouse1 reaches, so the
+	// bots still have no private door: ATraceCore measures the hold on its own clock between these two
+	// calls and derives the momentum from it.
+	//
+	// "Bots must use it - a bot that always instant-clicks throws at 15% power and mode B will look
+	// broken." So the hold is derived from the power the attempt needs (ChooseThrowCharge, above) and
+	// converted by the Core's own inverse, not by a local copy of the curve.
+	const float HoldSeconds = ATraceCore::GetThrowHoldSecondsForScale(PlannedThrowCharge);
+
 	ApplyPassInput(BotCharacter, true);
-	ApplyPassInput(BotCharacter, false);   // Instantaneous: nothing to hold.
+	bPassInputHeld = true;
 
-	TRACE_BOT_KIT(ThrowAttempts);
-	if (bThrowAtGoal)
-	{
-		TRACE_BOT_KIT(ThrowsAtGoal);
-	}
-	else if (PassReceiver.IsValid())
-	{
-		TRACE_BOT_KIT(ThrowsToTeammate);
-	}
+	PassPhase = ETraceBotPassPhase::Charging;
+	PassPhaseStartTime = Now;
+	ThrowChargeReleaseTime = Now + HoldSeconds;
 
-	UE_LOG(LogTraceGame, Display, TEXT("[BotThrow] %s threw at %s (%s), aim error %.1fdeg"),
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[BotThrow] %s CHARGING for %s (%s) - %.0f uu away, x%.2f power, holding %.2fs, aim error %.1fdeg"),
 		*GetNameSafe(GetPlayerState<APlayerState>()),
 		bThrowAtGoal ? TEXT("the GOAL") : (PassReceiver.IsValid()
 			? *GetNameSafe(PassReceiver->GetPlayerState<APlayerState>()) : TEXT("open ground (clearance)")),
 		bThrowAtGoal ? TEXT("shot") : (PassReceiver.IsValid() ? TEXT("pass") : TEXT("clearance")),
+		FVector::Dist2D(ViewLocation, ThrowTargetPoint), PlannedThrowCharge, HoldSeconds,
 		AimErrorDegrees);
-
-	AbortThrow(nullptr);   // Not a failure: this is how the attempt is closed out and cooled down.
 }
 
 void ATraceBotController::UpdateCarryInCommit()
@@ -4161,8 +4306,16 @@ void ATraceBotController::AbortThrow(const TCHAR* Reason)
 	const UWorld* World = GetWorld();
 	const float Now = (World != nullptr) ? static_cast<float>(World->GetTimeSeconds()) : 0.f;
 
-	// A throw never leaves the input latched — it is pressed and released in the same call — but a
-	// mode switch mid-hover-pass can, so release defensively rather than assuming.
+	// SPEC v13 §6 CHANGED WHAT THIS LINE MEANS. Before v13 a throw was pressed and released in the same
+	// call and could never leave the input latched, so this was pure defence against a mode switch
+	// mid-hover-pass. Now a mode-B throw genuinely holds the button for up to a second, and this is the
+	// path that puts it back up when the attempt ends any other way than through a release.
+	//
+	// It is reached with the button still down in exactly one situation: the Core left this bot's hands
+	// mid-charge (killed, intercepted, half-timed). Releasing there cannot launch anything - ATraceCore
+	// clears the charge when it takes the Core off a holder and refuses a release with no matching
+	// press - so this only tidies the latch. The normal release path clears bPassInputHeld itself
+	// BEFORE calling here, so a completed throw never re-enters this branch.
 	if (bPassInputHeld)
 	{
 		if (ATraceCharacter* BotCharacter = GetBotCharacter())
@@ -4174,6 +4327,8 @@ void ATraceBotController::AbortThrow(const TCHAR* Reason)
 
 	bPassOwnsAim = false;
 	bThrowAtGoal = false;
+	PlannedThrowCharge = 1.f;
+	ThrowChargeReleaseTime = 0.f;
 	PassReceiver = nullptr;
 	PassPhase = ETraceBotPassPhase::Cooldown;
 	PassCooldownUntilTime = Now + FMath::Max(0.f, UTraceSettings::Get().BotPassCooldownSeconds);

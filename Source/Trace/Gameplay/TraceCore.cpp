@@ -42,6 +42,8 @@
 #include "Materials/MaterialInterface.h"
 #include "Math/NumericLimits.h"
 #include "Math/UnrealMathUtility.h"             // FMath::SegmentDistToSegmentSafe
+#include "Misc/CommandLine.h"                   // spec v13 §8: -TraceTurnoverRepro= / -TraceLegacyLanding
+#include "Misc/Parse.h"
 #include "UObject/ConstructorHelpers.h"
 #include "UObject/UnrealType.h"                 // FindFProperty / FFloatProperty (mode B settings bridge)
 
@@ -415,6 +417,56 @@ namespace TraceModeBTuning
 		return true;
 	}
 
+	/**
+	 * The same lookup for a BOOL property.
+	 *
+	 * Needed because spec v13 §6's "does it clamp" is a tick box on the settings page
+	 * (UTraceSettings::bCoreThrowChargeClampsAtFull), not a float, and a float bridge cannot see it -
+	 * FindFProperty<FFloatProperty> returns null for a bool, which would have reported the knob as
+	 * MISSING and silently used the console default instead of the shipped one.
+	 */
+	static bool TrySettingsBool(const TCHAR* PropertyName, bool& OutValue)
+	{
+		static TMap<FName, const FBoolProperty*> Cache;
+
+		const FName Key(PropertyName);
+		const FBoolProperty* const* Found = Cache.Find(Key);
+		if (Found == nullptr)
+		{
+			Found = &Cache.Add(Key, FindFProperty<FBoolProperty>(UTraceSettings::StaticClass(), Key));
+		}
+
+		if (*Found == nullptr)
+		{
+			return false;
+		}
+
+		OutValue = (*Found)->GetPropertyValue_InContainer(&UTraceSettings::Get());
+		return true;
+	}
+
+	/** Settings property if it exists and the CVar has not been overridden; otherwise the CVar. */
+	static bool ResolveBool(const TCHAR* SettingsName, const TAutoConsoleVariable<int32>& CVar)
+	{
+		const IConsoleVariable* Console = CVar.AsVariable();
+		const uint32 SetBy = (Console != nullptr)
+			? (static_cast<uint32>(Console->GetFlags()) & static_cast<uint32>(ECVF_SetByMask))
+			: 0u;
+
+		if (SetBy > static_cast<uint32>(ECVF_SetByConstructor))
+		{
+			return CVar.GetValueOnAnyThread() != 0;
+		}
+
+		bool FromSettings = false;
+		if (TrySettingsBool(SettingsName, FromSettings))
+		{
+			return FromSettings;
+		}
+
+		return CVar.GetValueOnAnyThread() != 0;
+	}
+
 	/** Settings property if it exists and the CVar has not been overridden; otherwise the CVar. */
 	static float Resolve(const TCHAR* SettingsName, const TAutoConsoleVariable<float>& CVar, float MinValue, float MaxValue)
 	{
@@ -527,6 +579,70 @@ static TAutoConsoleVariable<float> CVarModeBThrowInheritance(
 	TEXT("velocity, vertical included, so a jumping throw carries the jump and a sprinting throw ")
 	TEXT("carries the sprint. 1 = full inheritance (the default), 0 = the pre-v8 throw that inherited ")
 	TEXT("nothing. UTraceSettings::CoreThrowVelocityInheritance."),
+	ECVF_Default);
+
+// =================================================================================================
+// MODE B ONLY — SPEC v13 §6, THE CHARGE-UP THROW
+//
+// "When a player RELEASES the throw button, the core should instantly be released. The longer the
+// player holds down, the more momentum the core has. Start by making a one second charge up time to
+// reach the current core throw momentum. Charge time to throw momentum should be a linear
+// correlation. So if the player just clicks the throw button it will throw with very low momentum."
+//
+// FOUR KNOBS, because the note contains four decisions and every one of them is a number somebody
+// will want to move after five minutes of play:
+//
+//   ThrowChargeSeconds  1.0   the wind-up. "Start by making a one second charge up time."
+//   ThrowChargeFloor    0.15  what an instant click buys. [ASSUMPTION]. NOT ZERO, and the reason is
+//                             not timidity: at 0 the impulse vanishes and the launch is nothing but
+//                             spec v8 §4's inherited velocity, so a standing tap drops the Core on
+//                             the player's own feet, inside their own pickup radius, and reads as
+//                             "the throw button is broken" rather than as "that was a weak throw".
+//                             0.15 of 2236 uu/s is ~335 uu/s, which travels a couple of metres and
+//                             lands in front of you — visibly a fumble, unmistakably a throw.
+//   ThrowChargeMax      1.0   what a full hold buys. 1.0 IS THE POINT: the note asks the one-second
+//                             hold to reach "the current core throw momentum", i.e. the shipped
+//                             throw is now the CEILING and nothing about it gets faster. This is
+//                             what makes v13 §6 a pure nerf-with-agency rather than a retune.
+//   ThrowChargeClamp    on    whether holding past the charge time keeps adding. [ASSUMPTION]: it
+//                             clamps. Off turns the hold into an unbounded ramp, which is a
+//                             different game and is one console command away for whoever wants it.
+//
+// LINEAR, as asked, and stated once in GetThrowChargeScaleForHold(). The HUD meter, the bot solver
+// and the launch all call that function; nothing re-derives it.
+//
+// WHAT IT SCALES: the impulse only. See ComputeThrowLaunchVelocity.
+// =================================================================================================
+
+static TAutoConsoleVariable<float> CVarModeBThrowChargeSeconds(
+	TEXT("Trace.ModeB.ThrowChargeSeconds"),
+	1.f,
+	TEXT("MODE B, spec v13 §6. Seconds the throw button must be HELD to reach full throw momentum. ")
+	TEXT("Momentum scales linearly from the floor to the max across this time. ")
+	TEXT("UTraceSettings::CoreThrowChargeSeconds."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBThrowChargeFloor(
+	TEXT("Trace.ModeB.ThrowChargeFloor"),
+	0.15f,
+	TEXT("MODE B, spec v13 §6. Fraction of full throw impulse an INSTANT CLICK leaves with. 'Very low' ")
+	TEXT("but deliberately not zero - a zero-momentum throw drops at the thrower's feet and reads as a ")
+	TEXT("bug. UTraceSettings::CoreThrowChargeFloor."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBThrowChargeMax(
+	TEXT("Trace.ModeB.ThrowChargeMax"),
+	1.f,
+	TEXT("MODE B, spec v13 §6. Fraction of full throw impulse a FULL hold leaves with. 1.0 means a full ")
+	TEXT("charge is exactly the pre-v13 throw, which is what 'reach the current core throw momentum' ")
+	TEXT("asks for. UTraceSettings::CoreThrowChargeMax."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarModeBThrowChargeClamp(
+	TEXT("Trace.ModeB.ThrowChargeClamp"),
+	1,
+	TEXT("MODE B, spec v13 §6. 1 (default): holding past Trace.ModeB.ThrowChargeSeconds adds nothing. ")
+	TEXT("0: the linear ramp keeps going, so a long hold throws harder than a full charge."),
 	ECVF_Default);
 
 /**
@@ -645,6 +761,32 @@ static TAutoConsoleVariable<float> CVarModeBCatchThrowerLockout(
 	TEXT("curve straight back into the hands it left. UTraceSettings::CoreCatchThrowerLockoutSeconds."),
 	ECVF_Default);
 
+// --- SPEC v13 §5. The contested zone. -------------------------------------------------------------
+//
+// "If the core is within the 'magnet' zone of two or more players from opposite teams, it should go
+// to the player closest to the core."
+//
+// Nearest wins is not the hard part — the selection loop already kept the smallest surface distance.
+// What was missing is that the answer has to be STABLE. Two players converging on a falling Core sit
+// within a few uu of each other for a good half second, and their distances cross back and forth
+// every frame: without a margin the pull alternates between them, and because the steering is an
+// exponential approach toward whatever point it is handed, alternating targets average into a Core
+// that curves toward NEITHER of them and is caught by nobody. That is a worse outcome than either
+// player winning outright, and it is invisible in any log that prints only the winner.
+//
+// 60 uu is a little under half a capsule radius plus the Core's own: close enough that a genuinely
+// nearer player still takes the Core, wide enough that jitter and a stride's worth of closing speed
+// do not move it.
+static TAutoConsoleVariable<float> CVarModeBCatchContestHysteresis(
+	TEXT("Trace.ModeB.CatchContestHysteresis"),
+	50.f,
+	TEXT("MODE B, spec v13 §5. How much NEARER a challenger must be than the player the magnet is ")
+	TEXT("already pulling toward, in uu, before the pull moves to them. Stops two defenders at a ")
+	TEXT("similar range from making the Core flicker between them. 0 disables the hysteresis, i.e. ")
+	TEXT("strict nearest-wins every frame - the arm that reproduces the flicker. ")
+	TEXT("UTraceSettings::CoreCatchContestHysteresisUU."),
+	ECVF_Default);
+
 // =================================================================================================
 // MODE B ONLY — SPEC v6 §4.2, GROUND CONTACT IS A TURNOVER
 //
@@ -712,6 +854,151 @@ static TAutoConsoleVariable<float> CVarModeBSurfaceMaxSlope(
 	TEXT("default walkable slope, so 'the ground' means the same thing to this rule as it does to the ")
 	TEXT("pawn standing on it. 0 = only a perfectly flat surface turns the Core over; 89 = everything ")
 	TEXT("but a true vertical does. UTraceSettings::CoreSurfaceMaxSlopeDegrees."),
+	ECVF_Default);
+
+// =================================================================================================
+// MODE B ONLY — SPEC v13 §8, "THE CORE TURNS OVER IN MID-AIR"
+//
+// Verbatim: "Sometimes the core is thrown and it turns over before it touches the ground."
+//
+// [DIAGNOSED] IN THE CODE, before a line of it was changed, and it is hypothesis (a) from the spec —
+// the 45-degree rule firing on a GLANCING contact. Until v13 the contact test read, in full:
+//
+//     bLandedOnSurface = (ContactNormal.Z >= SurfaceUpNormalZ());
+//
+// i.e. ANY blocked sweep whose normal pointed upward was a landing, with no reference to how the
+// Core arrived at it or to whether it stayed. That is exactly right for a Core dropping onto a
+// crate and exactly wrong for one crossing the arena at 2200 uu/s whose sphere clips the flat top of
+// a cover block or one of the corner cove's horizontal treads on the way past: the normal there is
+// straight up, the rule fires, and possession changes while the Core is metres above the floor and
+// still travelling. The user is describing the same event from the outside.
+//
+// THE FIX IS TO ASK WHAT A LANDING IS RATHER THAN WHAT A NORMAL IS. A thrown Core has landed on a
+// surface when it has ARRIVED on it, which is two facts and not one:
+//
+//   1. the surface faces up (unchanged — the v7 §4 rule, which stays exactly as it was), AND
+//   2. the Core came DOWN ONTO IT rather than past it. Measured as the angle between the flight and
+//      the surface: the component of the velocity along the inward normal, as a fraction of speed,
+//      must exceed sin(LandingMinDescentDegrees). A Core dropping onto a crate arrives at 25-90
+//      degrees. A Core skimming the same crate mid-flight arrives at 2-8. There is a wide, empty gap
+//      between those two populations, which is why an angle works where a speed threshold would not:
+//      a graze and a landing can have identical speeds.
+//
+//   OR, and this is the other half of "an actual landing", the contact simply STOPPED IT — the Core
+//   came to rest on an upward-facing surface. That case needs no angle: a Core that is sitting on
+//   something has landed on it whatever route it took there, which is also what makes a slow tumble
+//   onto a ledge a turnover.
+//
+// AND THE AT-REST PROBE IS UNCHANGED AND STILL AUTHORITATIVE. Spec v7 §4's "the core gets stuck up
+// top of an object" is the same rule seen from the other end, and every Core that grazes something
+// and is refused a turnover keeps flying, lands, and turns over there instead — later, lower, and
+// where a player watching can see why. Nothing is lost; the turnover moves to the moment it belongs.
+//
+// HYPOTHESES (b) AND (c) WERE TESTED TOO, and closed by construction rather than by argument:
+//   (b) the at-rest probe firing while the Core still has speed — it cannot, bLooseAtRest is only
+//       ever set with LooseVelocity zeroed on the same line, but the probe now ASSERTS that and says
+//       so if it is ever false, rather than trusting an invariant a future edit could break;
+//   (c) a contact on the launch frame, before the Core has cleared the thrower — a landing by
+//       CONTACT now requires the Core to have been in the air for LandingMinFlightSeconds. A Core
+//       genuinely thrown into the floor at the thrower's feet is not lost by this: it is at rest a
+//       frame later and the probe hands it over then.
+// =================================================================================================
+
+static TAutoConsoleVariable<float> CVarModeBLandingMinDescent(
+	TEXT("Trace.ModeB.LandingMinDescentDegrees"),
+	20.f,
+	TEXT("MODE B, spec v13 §8. How steeply a moving Core must arrive at an upward-facing surface for the ")
+	TEXT("contact to count as a LANDING (and so a turnover) rather than a graze it flies on from. ")
+	TEXT("Measured between the flight and the surface plane. A drop onto a crate is 25-90 degrees; a ")
+	TEXT("skim across the top of one is 2-8. A contact that STOPS the Core is a landing at any angle. ")
+	TEXT("0 restores the pre-v13 'any upward normal is a landing' rule. UTraceSettings::CoreLandingMinDescentDegrees."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBLandingMinFlight(
+	TEXT("Trace.ModeB.LandingMinFlightSeconds"),
+	0.05f,
+	TEXT("MODE B, spec v13 §8. Seconds a throw must have been in the air before a CONTACT can be read as ")
+	TEXT("a landing, so a sweep that clips geometry on the launch frame - before the Core has cleared ")
+	TEXT("the thrower - cannot hand possession away. The at-rest probe is not gated by this, so a Core ")
+	TEXT("genuinely thrown into the floor still turns over a frame later."),
+	ECVF_Default);
+
+/**
+ * THE A/B ARM, and the reason the §8 reproduction can go red.
+ *
+ * 1 is the shipped rule. 0 restores the pre-v13 behaviour EXACTLY — any upward-facing contact is a
+ * landing — so `Trace.ModeB.LandingRule 0` reproduces the bug on the fixed build and the same
+ * harness that reports "0 mid-air turnovers" reports a pile of them. A harness that cannot go red is
+ * not evidence, and this switch is what makes this one able to.
+ */
+static TAutoConsoleVariable<int32> CVarModeBLandingRule(
+	TEXT("Trace.ModeB.LandingRule"),
+	1,
+	TEXT("MODE B, spec v13 §8. 1 (default): a turnover requires an ACTUAL LANDING - the Core arrived on ")
+	TEXT("the surface or stopped on it. 0: the pre-v13 rule, where ANY upward-facing contact is a ")
+	TEXT("landing, which is the mid-air turnover bug. 0 is the A/B arm for the reproduction."),
+	ECVF_Default);
+
+/**
+ * SPEC v13 §8. Is the pre-v13 rule armed?
+ *
+ * TWO WAYS IN, and the command-line one is not a convenience. -ExecCmds is comma-separated and a
+ * console variable assignment needs a SPACE ("Trace.ModeB.LandingRule 0"), which means quoting - and
+ * quoting inside -ExecCmds has already, on this project, broken a command line into the URL parser
+ * and produced a verification that "passed" because its commands never ran. A bare switch cannot do
+ * that. The CVar stays for a live A/B from the console.
+ */
+static bool TraceModeBLegacyLandingRule()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyLanding"));
+	return bFromCommandLine || (CVarModeBLandingRule.GetValueOnAnyThread() == 0);
+}
+
+static TAutoConsoleVariable<int32> CVarModeBTurnoverLog(
+	TEXT("Trace.ModeB.TurnoverLog"),
+	0,
+	TEXT("MODE B, spec v13 §8. 1: log EVERY contact a loose thrown Core makes and every turnover, with ")
+	TEXT("the height above the arena floor, the speed, the surface normal, the arrival angle and the ")
+	TEXT("verdict. This is the instrument the mid-air turnover was found with."),
+	ECVF_Default);
+
+/** As above: also armable with a bare -TraceTurnoverLog, which needs no quoting inside -ExecCmds. */
+static bool TraceModeBTurnoverLogEnabled()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceTurnoverLog"));
+	return bFromCommandLine || (CVarModeBTurnoverLog.GetValueOnAnyThread() != 0);
+}
+
+/**
+ * What the repro counts as "in mid-air": a turnover that fired while the Core was still travelling
+ * this fast. REPORTING ONLY — no rule reads it.
+ *
+ * A speed, not a height, and deliberately: a Core that turns over 400 uu up having STOPPED on the
+ * roof of a crate is spec v7 §4 working, and a height threshold would call that the bug. What the
+ * user is describing is possession changing while the Core is still flying.
+ */
+static TAutoConsoleVariable<float> CVarModeBMidAirTurnoverSpeed(
+	TEXT("Trace.ModeB.MidAirTurnoverSpeed"),
+	800.f,
+	TEXT("MODE B, spec v13 §8, REPORTING ONLY. Part one of the mid-air test: the Core must still have ")
+	TEXT("been travelling at least this fast when possession changed. No rule reads it."),
+	ECVF_Default);
+
+/**
+ * Part two, and the part that makes the counter mean what it says.
+ *
+ * A Core dropped straight onto the floor arrives at 1500 uu/s and has unambiguously LANDED, so speed
+ * on its own would call the commonest correct turnover in the game a bug. What the user described is
+ * a Core going PAST something: fast AND barely descending. Deliberately a separate number from the
+ * rule's own LandingMinDescentDegrees so the counter is not merely a restatement of the rule - it
+ * measures the event, and both arms of the A/B measure it the same way.
+ */
+static TAutoConsoleVariable<float> CVarModeBMidAirTurnoverDegrees(
+	TEXT("Trace.ModeB.MidAirTurnoverDegrees"),
+	15.f,
+	TEXT("MODE B, spec v13 §8, REPORTING ONLY. Part two of the mid-air test: the Core must have met the ")
+	TEXT("surface at a shallower angle than this - i.e. it was flying past, not coming down. A turnover ")
+	TEXT("that is both fast and shallow is counted as MID-AIR in SurfaceStats. No rule reads it."),
 	ECVF_Default);
 
 /**
@@ -811,6 +1098,48 @@ namespace TraceModeBTuning
 	// a Rocket League shot" variant is reachable from the console without a rebuild.
 	float ThrowInheritance()  { return Resolve(TEXT("CoreThrowVelocityInheritance"),      CVarModeBThrowInheritance, 0.f,   2.f); }
 
+	// --- Spec v13 §6, the charge. NOT scaled by the weight model either, and for the same reason: the
+	// weight already reduced the impulse the charge is a fraction OF, so a heavier Core is thrown
+	// slower at every charge level without the charge having to know the Core has a weight at all.
+	// Lower bound on the time is 0.01 rather than 0 so a misconfigured 0 cannot divide by zero; at
+	// 0.01 the charge is effectively instant-full, which is the closest thing to "switched off".
+	// THE PROPERTY NAMES ARE UTraceSettings' OWN, NOT NAMES INVENTED HERE. The settings page declares
+	// this pass's four charge knobs as CoreThrowChargeSeconds / CoreThrowChargeFloorFraction /
+	// bCoreThrowChargeClampsAtFull / CoreThrowChargeMaxFraction, and Config/DefaultGame.ini ships
+	// values for all four - so binding to anything else would leave four live sliders driving nothing
+	// while this file quietly used its own console defaults. The ini wins, which is the project's
+	// standing rule, and it can only win if the name matches exactly.
+	float ThrowChargeSeconds() { return Resolve(TEXT("CoreThrowChargeSeconds"),      CVarModeBThrowChargeSeconds, 0.01f, 10.f); }
+	float ThrowChargeFloor()   { return Resolve(TEXT("CoreThrowChargeFloorFraction"), CVarModeBThrowChargeFloor,  0.f,   1.f); }
+
+	/**
+	 * The ceiling on the NORMALISED HOLD (t = held / charge time), used only when the clamp is off.
+	 *
+	 * NOTE WHAT THIS IS AND IS NOT, because the two readings differ once it is raised: it caps t, not
+	 * the resulting power. Power is always Floor + (1 - Floor) * t, so at MaxFraction 1.5 a 1.5 s hold
+	 * gives 0.15 + 0.85 * 1.5 = 1.43x, not 1.5x. That is UTraceSettings' documented arithmetic and the
+	 * ini's, and it is followed here rather than reinterpreted - two definitions of "max charge" that
+	 * disagree by 5% is precisely the kind of drift nobody finds.
+	 */
+	float ThrowChargeMaxFraction() { return Resolve(TEXT("CoreThrowChargeMaxFraction"), CVarModeBThrowChargeMax, 1.f, 4.f); }
+
+	bool  ThrowChargeClamps()  { return ResolveBool(TEXT("bCoreThrowChargeClampsAtFull"), CVarModeBThrowChargeClamp); }
+
+	// --- Spec v13 §5, the contested magnet. UTraceSettings::CoreCatchContestHysteresisUU, 50 uu in
+	// Config/DefaultGame.ini - and the CVar default below is moved to 50 in step with it, because a
+	// fallback that disagrees with the shipped value is a trap for whoever reads one and not the other.
+	float CatchContestHysteresis() { return Resolve(TEXT("CoreCatchContestHysteresisUU"), CVarModeBCatchContestHysteresis, 0.f, 1000.f); }
+
+	// --- Spec v13 §8, the landing rule. Degrees for the same reason the slope threshold is: it is the
+	// unit the question is asked in ("how steeply did it come down"), and the sine the test needs is
+	// derived once, here.
+	float LandingMinDescentDegrees() { return Resolve(TEXT("CoreLandingMinDescentDegrees"), CVarModeBLandingMinDescent, 0.f, 89.f); }
+
+	/** sin(LandingMinDescentDegrees): the minimum |velocity . -normal| / speed of an arrival. */
+	float LandingMinDescentSin() { return FMath::Sin(FMath::DegreesToRadians(LandingMinDescentDegrees())); }
+
+	float LandingMinFlightSeconds() { return FMath::Clamp(CVarModeBLandingMinFlight.GetValueOnAnyThread(), 0.f, 2.f); }
+
 	// --- Spec v7 §4, the surface rule. Kept in DEGREES because that is the unit the spec states it in
 	// ("a normal within ~45 degrees of straight up") and the unit a designer can picture; the cosine
 	// the test actually needs is derived once, here, so no caller has to remember which one it holds.
@@ -872,6 +1201,104 @@ namespace TraceModeBTuning
 		return Steered * Speed;
 	}
 
+	/**
+	 * SPEC v13 §5. One contender for a contested magnet: how far it is, and who it is.
+	 *
+	 * A plain value type with no actor in it, so the SELECTION can be tested without a world. See
+	 * PickContestedCatcher.
+	 */
+	struct FCatchContender
+	{
+		/** Distance from the Core to this player's capsule SURFACE, uu. The thing "closest" means. */
+		double SurfaceDistance = 0.0;
+
+		/**
+		 * A stable, per-player key used ONLY to break an exact tie.
+		 *
+		 * Not cosmetic. Without it two players at identical distance are separated by whichever order
+		 * the roster happened to be gathered in, which is a property of the world's actor list rather
+		 * than of the game — so the same situation can resolve differently on two frames, or on two
+		 * machines, for no reason a player could ever see. The engine's unique object id is stable for
+		 * the lifetime of the actor and is the cheapest thing that has that property.
+		 */
+		uint32 StableKey = 0;
+
+		/** True for the player the magnet is ALREADY pulling toward, if they are still eligible. */
+		bool bIncumbent = false;
+	};
+
+	/**
+	 * SPEC v13 §5. THE CONTEST, as a pure function: which contender does the Core curve toward?
+	 *
+	 * NEAREST WINS. The incumbent keeps the pull unless a challenger is nearer BY MORE THAN
+	 * @p Hysteresis, which is what stops a near-tie oscillating (see ServerApplyCatchZone's header
+	 * comment for why an oscillating magnet catches for nobody). Exact ties break on StableKey, never
+	 * on array order.
+	 *
+	 * It lives here, taking distances rather than pawns, for the same reason SteerTowardCatchPoint
+	 * does: Trace.ModeB.ContestTest drives THIS function with scripted distances - including the
+	 * crossing-over sequence that produces the flicker - so the property being claimed ("stable, and
+	 * nearest still wins") is asserted against the code the game runs and not against a copy of it.
+	 *
+	 * @param bOutHysteresisHeld  set when a strictly nearer challenger was refused by the margin.
+	 * @return index into @p Contenders, or INDEX_NONE when it is empty.
+	 */
+	int32 PickContestedCatcher(const TArray<FCatchContender>& Contenders, float Hysteresis,
+		bool* bOutHysteresisHeld = nullptr)
+	{
+		if (bOutHysteresisHeld != nullptr)
+		{
+			*bOutHysteresisHeld = false;
+		}
+
+		int32 Nearest = INDEX_NONE;
+		int32 Incumbent = INDEX_NONE;
+
+		for (int32 Index = 0; Index < Contenders.Num(); ++Index)
+		{
+			const FCatchContender& Candidate = Contenders[Index];
+
+			if (Candidate.bIncumbent && Incumbent == INDEX_NONE)
+			{
+				Incumbent = Index;
+			}
+
+			if (Nearest == INDEX_NONE)
+			{
+				Nearest = Index;
+				continue;
+			}
+
+			const FCatchContender& Best = Contenders[Nearest];
+			if (Candidate.SurfaceDistance < Best.SurfaceDistance
+				|| (Candidate.SurfaceDistance == Best.SurfaceDistance && Candidate.StableKey < Best.StableKey))
+			{
+				Nearest = Index;
+			}
+		}
+
+		if (Nearest == INDEX_NONE || Incumbent == INDEX_NONE || Nearest == Incumbent || Hysteresis <= 0.f)
+		{
+			return Nearest;
+		}
+
+		// The challenger is nearer — but is it nearer ENOUGH to be worth moving the pull? The margin is
+		// applied once, at the moment of the switch, and not carried: as soon as the pull moves, the new
+		// target is the incumbent and the old one needs the same margin to take it back. That is what
+		// makes this hysteresis rather than a permanent handicap.
+		const double Margin = Contenders[Incumbent].SurfaceDistance - Contenders[Nearest].SurfaceDistance;
+		if (Margin <= static_cast<double>(Hysteresis))
+		{
+			if (bOutHysteresisHeld != nullptr)
+			{
+				*bOutHysteresisHeld = true;
+			}
+			return Incumbent;
+		}
+
+		return Nearest;
+	}
+
 	/** Radius of the sphere swept for the loose Core's collision. Matches the orb the player sees. */
 	constexpr float CollisionRadius = 22.f;
 
@@ -907,20 +1334,31 @@ namespace TraceModeBTuning
 			TEXT("CoreLooseResetSeconds"),
 			TEXT("CoreThrowCooldownSeconds"),
 			TEXT("CoreThrowBounce"),
-			// Spec v8 §4. New this pass; needs declaring on UTraceSettings, and until it is, this list
-			// is what says so out loud rather than leaving a dead slider for a designer to find.
-			// Trace.ModeB.ThrowVelocityInheritance is where it can be retuned in the meantime.
+			// Spec v8 §4. DECLARED on UTraceSettings and shipped in Config/DefaultGame.ini. It was
+			// listed here while it was still missing; it stays listed now that it is not, because the
+			// job of this list is not "to-do" but "these names must keep matching" — the entry is what
+			// would say so out loud if either side were ever renamed.
 			TEXT("CoreThrowVelocityInheritance"),
-			// Spec v6 §4.1. New this pass; they need declaring on UTraceSettings, and until they are
-			// this list is what says so out loud instead of leaving three dead sliders to be found by
-			// a designer wondering why nothing changed.
+			// Spec v6 §4.1. All three declared and ini-backed, same standing-check reason as above.
 			TEXT("CoreCatchRadius"),
 			TEXT("CoreCatchCurveStrength"),
 			TEXT("CoreCatchThrowerLockoutSeconds"),
-			// Spec v7 §4. New this pass, same story: until UTraceSettings declares it, this list is
-			// what says out loud that the slider is not there, and Trace.ModeB.SurfaceMaxSlopeDegrees
-			// is where the threshold can be retuned in the meantime.
+			// Spec v7 §4. Declared and ini-backed.
 			TEXT("CoreSurfaceMaxSlopeDegrees"),
+			// Spec v13 §6's charge and §5's contest margin. UTraceSettings DECLARES ALL OF THESE and
+			// Config/DefaultGame.ini ships values for them, so these entries are a standing check that
+			// the names still match rather than a to-do: rename either side and this list is what says
+			// so out loud, on the frame mode B starts, instead of a slider quietly driving nothing.
+			// (The clamp is a BOOL and is checked separately below - FindFProperty<FFloatProperty>
+			// returns null for a bool, so listing it here would report a bound knob as missing.)
+			TEXT("CoreThrowChargeSeconds"),
+			TEXT("CoreThrowChargeFloorFraction"),
+			TEXT("CoreThrowChargeMaxFraction"),
+			TEXT("CoreCatchContestHysteresisUU"),
+			// Spec v13 §8's landing angle. It WAS the one knob this pass added with no property behind
+			// it - this list is how that was found - and integration declared it on UTraceSettings with
+			// a value in Config/DefaultGame.ini. Trace.ModeB.LandingMinDescentDegrees still overrides.
+			TEXT("CoreLandingMinDescentDegrees"),
 		};
 
 		int32 BoundCount = 0;
@@ -942,7 +1380,23 @@ namespace TraceModeBTuning
 			}
 		}
 
-		const int32 TotalCount = static_cast<int32>(UE_ARRAY_COUNT(KnobNames));
+		// The one BOOL knob (spec v13 §6's clamp), checked with the right property type.
+		const bool bClampBound =
+			FindFProperty<FBoolProperty>(UTraceSettings::StaticClass(), FName(TEXT("bCoreThrowChargeClampsAtFull"))) != nullptr;
+		if (bClampBound)
+		{
+			++BoundCount;
+		}
+		else
+		{
+			if (!DeadNames.IsEmpty())
+			{
+				DeadNames += TEXT(", ");
+			}
+			DeadNames += TEXT("bCoreThrowChargeClampsAtFull (bool)");
+		}
+
+		const int32 TotalCount = static_cast<int32>(UE_ARRAY_COUNT(KnobNames)) + 1;
 
 		if (DeadNames.IsEmpty())
 		{
@@ -1339,6 +1793,30 @@ void ATraceCore::Tick(float DeltaSeconds)
 	// machine the bug is ON is the one that is not the server. Costs one int compare when disarmed.
 	TickTeleportAudit();
 
+	// SPEC v13 §6. THE LOCAL CHARGE METER IS CLEARED WHEN THE CORE IS NOT IN LOCAL HANDS, ON EVERY
+	// MACHINE, AND THIS IS THE CLIENT'S ONLY WAY OUT.
+	//
+	// The server clears its own charge in ReleaseHolder, which is the funnel every possession change
+	// goes through - but ReleaseHolder returns immediately on a non-authority machine, so a CLIENT that
+	// was killed, intercepted or half-timed with the button held would never see its own meter stop.
+	// It would sit at full charge, on screen, for a Core the player no longer has: the exact class of
+	// "predicted state with no server correction" the pass prediction is careful to avoid.
+	//
+	// The test is possession, not the button, because possession is the thing that is replicated. A
+	// player who is still holding the Core and still holding the button keeps their meter; anyone else
+	// loses it on the frame the possession change arrives.
+	if (bLocalThrowCharging)
+	{
+		const bool bStillMine = IsValid(Carrier) && Carrier->IsAlive() && !bLoose
+			&& Carrier->IsLocallyControlled()
+			&& Cast<APlayerController>(Carrier->GetController()) != nullptr;
+
+		if (!bStillMine)
+		{
+			bLocalThrowCharging = false;
+		}
+	}
+
 	if (!HasAuthority())
 	{
 		// MODE B, CLIENTS. Dead-reckon the loose Core between net updates so it flies along its arc
@@ -1439,6 +1917,10 @@ void ATraceCore::Tick(float DeltaSeconds)
 	// Diagnostics, and deliberately ahead of the loose branch's early return so the scenario can
 	// observe a Core that is currently in the air. Costs one int compare when it is not armed.
 	TickModeBVerification();
+
+	// SPEC v13 §8's reproduction, same placement and the same reason: it has to watch a Core that is
+	// in the air to know when the previous shot has resolved. One bool compare when disarmed.
+	TickTurnoverRepro();
 
 	if (bLoose)
 	{
@@ -2196,9 +2678,41 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 	// holding the Core (one arriving during a kickoff window), because a release that is dropped is
 	// exactly what leaves the latch set.
 
+	// ---- SPEC v13 §6: THE LOCAL, INSTANT CHARGE METER. ------------------------------------------
+	//
+	// Set on WHICHEVER machine owns the input, ahead of the authority split, because the host owns its
+	// own input too and a meter that only worked for remote clients would be a meter nobody testing on
+	// a listen server ever saw. The note's requirement is explicit - "the charge indicator must be
+	// LOCAL AND INSTANT (predicted) or the player cannot aim their power" - and it is the one part of
+	// this mechanic that must not wait for a round trip.
+	//
+	// It predicts NOTHING ELSE. No throw, no launch, no Core movement: those are resolved on the
+	// server from the server's own clock, and a client that predicted the Core leaving its hands would
+	// be showing itself a throw the server can still refuse (cooldown, a possession change in flight).
+	// The worst this can do is run a meter for a throw that is then refused.
+	//
+	// A BOT MUST NOT SET IT. Bot pawns are locally controlled on the server, so "is this locally
+	// controlled" alone would have every bot's wind-up driving the human's HUD meter. The extra
+	// question is whether a PLAYER controller owns it.
+	const bool bLocalPlayerInput = Requester->IsLocallyControlled()
+		&& Cast<APlayerController>(Requester->GetController()) != nullptr;
+
+	if (IsModeB() && bLocalPlayerInput)
+	{
+		if (bPressed)
+		{
+			bLocalThrowCharging = true;
+			LocalThrowChargeStartTime = GetServerTimeSeconds();
+		}
+		else
+		{
+			bLocalThrowCharging = false;
+		}
+	}
+
 	if (HasAuthority())
 	{
-		// ---- THE BINDING'S MEANING IS MODE-DEPENDENT (spec v4 §7). -------------------------------
+		// ---- THE BINDING'S MEANING IS MODE-DEPENDENT (spec v4 §7, AS CHANGED BY v13 §6). ---------
 		//
 		// Verbatim: "The carrier should be able to throw the core forward by left clicking." In mode
 		// A the same button starts the 0.5 s hover-pass. The branch lives HERE, at the one door every
@@ -2206,16 +2720,39 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 		// DoPassPressed, ATracePlayerController and the bots' ApplyPassInput all call this function
 		// and none of them has to learn that a second mode exists.
 		//
-		// A throw is instantaneous, so there is nothing to hold and nothing to release: the press
-		// throws, the release is swallowed, and bPassInputHeld is never armed in mode B - which
-		// matters, because an armed latch would make ServerTickPass open a pass window (shield down)
-		// on a Core that is no longer held.
+		// SPEC v13 §6 MOVES THE THROW FROM THE PRESS TO THE RELEASE. "When a player RELEASES the throw
+		// button, the core should instantly be released." So the press now only starts a clock and the
+		// release is what launches - immediately, with no wind-up of its own and no minimum hold: a
+		// press and a release on the same frame is a legal throw and produces the floor momentum.
+		//
+		// bPassInputHeld IS STILL NEVER ARMED IN MODE B. That latch drives ServerTickPass, which opens
+		// a hover-pass window and drops the carrier's shield; mode B has no pass window, and arming it
+		// would drop the shield of a player who is merely winding up a throw.
 		if (IsModeB())
 		{
 			if (bPressed)
 			{
-				ThrowFromHolder(Requester);
+				// A press from anyone but the living holder was already refused above. Re-arming on a
+				// second press without a release (a lost release packet, a rebind pressed twice) simply
+				// restarts the clock, which is the conservative answer: it can only ever produce a
+				// weaker throw than the player asked for, never a stronger one.
+				ThrowChargeStartServerTime = GetServerTimeSeconds();
+				ThrowChargeHolder = Requester;
+				return;
 			}
+
+			// RELEASE. Matched against the press, and only the presser's release can fire it: without
+			// that, a teammate's mouse-up would launch the carrier's charged throw for them - the same
+			// class of shared-latch bug the pass input's own doc comment describes.
+			if (ThrowChargeStartServerTime < 0.f || ThrowChargeHolder.Get() != Requester)
+			{
+				ClearThrowCharge(nullptr);
+				return;
+			}
+
+			const float Held = FMath::Max(0.f, GetServerTimeSeconds() - ThrowChargeStartServerTime);
+			ClearThrowCharge(nullptr);
+			ThrowFromHolder(Requester, Held);
 			return;
 		}
 
@@ -2235,9 +2772,11 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 	// safety it does not have.
 	// Requester, not Carrier: the release half of this runs after a completed pass has already moved
 	// Carrier to the receiver, and it is OUR prediction that has to be unwound, not theirs.
-	// Mode B predicts nothing. A throw is a single server-resolved event with no hold to visualise,
-	// and a client that predicted the Core leaving its own hands would show itself a throw the server
-	// may refuse (cooldown, a possession change in flight).
+	//
+	// MODE B STILL PREDICTS NO GAMEPLAY - only the charge METER, which was set above and which shows
+	// the player their own finger rather than a claim about the world. A client that predicted the
+	// Core leaving its own hands would be showing itself a throw the server may refuse (cooldown, a
+	// possession change in flight), so the hover-pass prediction below stays mode-A only.
 	if (Requester->IsLocallyControlled() && !IsModeB())
 	{
 		if (bPressed)
@@ -2762,6 +3301,15 @@ void ATraceCore::ReleaseHolder()
 	// score, half time - which is why this is the one place it needs saying.
 	ClearPassInput();
 
+	// SPEC v13 §6, and the same argument one line further: a charge is possession-shaped too. A
+	// carrier who is killed, intercepted or half-timed mid-wind-up must not leave a charge armed - the
+	// next player to take the Core would inherit a clock that started in somebody else's hands, and
+	// their first release would throw at whatever power that stranger had wound up to. Cleared HERE,
+	// at the single exit, rather than in each of the six paths that reach it. Deliberately AFTER
+	// ThrowFromHolder has read the hold and spent it: that function clears the charge itself before
+	// calling this, so a legitimate throw is not fighting this line for the same state.
+	ClearThrowCharge(TEXT("possession ended"));
+
 	DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
 
 	// CLEAR THE MIRROR BEFORE THE EARLY-OUT, through the handle cached in GrantTo.
@@ -3067,6 +3615,11 @@ void ATraceCore::OnScoringModeChanged()
 		return;
 	}
 	FCoreStateLock Lock(this);
+
+	// SPEC v13 §6. A charge is a mode-B object. Switching modes with one armed would leave mode A's
+	// hover pass sharing state with a wind-up that can no longer be released, and switching back would
+	// find a clock that started in the other ruleset.
+	ClearThrowCharge(TEXT("the scoring mode changed"));
 
 	// NOT arming or disarming any scoring volume. ATraceArenaBuilder builds both pairs and arms the
 	// one belonging to the selected mode (ATraceEndzone::SetZoneActive); a second arming pass here
@@ -3397,14 +3950,136 @@ FVector ATraceCore::GetInheritedThrowVelocity(const AActor* Thrower)
 	return Thrower->GetVelocity() * Fraction;
 }
 
-FVector ATraceCore::ComputeThrowLaunchVelocity(const AActor* Thrower, const FVector& AimDirection)
+FVector ATraceCore::ComputeThrowLaunchVelocity(const AActor* Thrower, const FVector& AimDirection,
+	float ChargeScale)
 {
 	const FVector Direction = AimDirection.GetSafeNormal();
 	const float Speed = TraceModeBTuning::ThrowSpeed();
 
 	const FVector Impulse = Direction * Speed + FVector::UpVector * (Speed * TraceModeBTuning::ThrowUpBias());
 
-	return Impulse + GetInheritedThrowVelocity(Thrower);
+	// SPEC v13 §6: THE CHARGE SCALES THE IMPULSE, AND THE INHERITED VELOCITY IS ADDED ON TOP OF THE
+	// SCALED IMPULSE, NOT SCALED WITH IT.
+	//
+	// Stated here, in the one expression both the Core and the bot solver use, because the alternative
+	// is easy to write and quietly wrong: scaling the sum would mean a player who jumps and taps has
+	// thrown away most of their own jump, which is neither what the note asks for ("the longer the
+	// player holds down, the more momentum the core has" is about the THROW) nor what spec v8 §4 says
+	// ("the core has the momentum from the throw AND ALSO carries momentum from the player" - two
+	// terms, and only the first one is a throw). So a tap at the top of a jump leaves with the whole
+	// jump in it and almost no impulse; a full charge at the top of the same jump leaves with the jump
+	// plus the full 2236 uu/s.
+	return Impulse * FMath::Max(0.f, ChargeScale) + GetInheritedThrowVelocity(Thrower);
+}
+
+// --- SPEC v13 §6: the charge, resolved -------------------------------------------------------------
+
+float ATraceCore::GetThrowChargeSeconds()      { return TraceModeBTuning::ThrowChargeSeconds(); }
+float ATraceCore::GetThrowChargeFloor()        { return TraceModeBTuning::ThrowChargeFloor(); }
+float ATraceCore::GetThrowChargeMaxFraction()  { return TraceModeBTuning::ThrowChargeMaxFraction(); }
+bool  ATraceCore::DoesThrowChargeClamp()       { return TraceModeBTuning::ThrowChargeClamps(); }
+
+/**
+ * The normalised hold, capped: t in UTraceSettings' own arithmetic.
+ *
+ * Split out so the curve and its inverse cannot disagree about the cap, which is the one place a
+ * round-trip error could hide (and the bots depend on that round trip).
+ */
+static float TraceModeBChargeTCap()
+{
+	return TraceModeBTuning::ThrowChargeClamps() ? 1.f : TraceModeBTuning::ThrowChargeMaxFraction();
+}
+
+float ATraceCore::GetThrowChargeScaleForHold(float HeldSeconds)
+{
+	const float Floor = FMath::Clamp(TraceModeBTuning::ThrowChargeFloor(), 0.f, 1.f);
+
+	// Negative = "full charge", i.e. t = 1, i.e. exactly the throw the game had before v13. The
+	// diagnostics (Trace.ModeB.MomentumTest) throw this way on purpose so the v8 §4 momentum baseline
+	// stays a measurement of the same launch it always was, rather than silently becoming a
+	// measurement of a 15% tap.
+	if (HeldSeconds < 0.f)
+	{
+		return 1.f;
+	}
+
+	const float ChargeSeconds = FMath::Max(0.01f, TraceModeBTuning::ThrowChargeSeconds());
+
+	// UTraceSettings' ARITHMETIC, COPIED RATHER THAN REINTERPRETED:
+	//
+	//     t     = HeldSeconds / CoreThrowChargeSeconds
+	//     tCap  = bCoreThrowChargeClampsAtFull ? min(t, 1) : min(t, CoreThrowChargeMaxFraction)
+	//     Power = CoreThrowChargeFloorFraction + (1 - CoreThrowChargeFloorFraction) * tCap
+	//
+	// Note that the MAX knob caps t and NOT the power: at MaxFraction 1.5 a 1.5 s hold gives
+	// 0.15 + 0.85 * 1.5 = 1.43x, not 1.5x. That is the settings page's stated definition and the ini's,
+	// and reinterpreting it here would give two answers for "max charge" that differ by 5% - a
+	// disagreement that would only ever be found by somebody wondering why a slider lies.
+	const float TCapped = FMath::Clamp(HeldSeconds / ChargeSeconds, 0.f, TraceModeBChargeTCap());
+
+	// THE LINEAR CORRELATION THE NOTE ASKS FOR, in one line: the floor at zero hold, exactly 1.0 (the
+	// current throw momentum) at a full one.
+	return Floor + (1.f - Floor) * TCapped;
+}
+
+float ATraceCore::GetThrowHoldSecondsForScale(float ChargeScale)
+{
+	const float Floor = FMath::Clamp(TraceModeBTuning::ThrowChargeFloor(), 0.f, 1.f);
+	const float ChargeSeconds = FMath::Max(0.01f, TraceModeBTuning::ThrowChargeSeconds());
+
+	if (1.f - Floor <= KINDA_SMALL_NUMBER)
+	{
+		return 0.f;   // Floor of 1 = charging disabled, every throw full power. Do not divide by it.
+	}
+
+	const float TCapped = FMath::Clamp((ChargeScale - Floor) / (1.f - Floor), 0.f, TraceModeBChargeTCap());
+	return TCapped * ChargeSeconds;
+}
+
+bool ATraceCore::IsThrowCharging() const
+{
+	return bLocalThrowCharging;
+}
+
+float ATraceCore::GetThrowChargeAlpha() const
+{
+	if (!bLocalThrowCharging)
+	{
+		return -1.f;
+	}
+
+	// The LOCAL clock, so the meter starts moving on the frame the button went down rather than a
+	// round trip later. GetServerTimeSeconds() is the shared clock both ends already agree on, so the
+	// number the meter shows and the number the server will measure differ only by the player's own
+	// latency at the release - which is the honest error and cannot be removed by any prediction.
+	const float Held = GetServerTimeSeconds() - LocalThrowChargeStartTime;
+	const float ChargeSeconds = FMath::Max(0.01f, TraceModeBTuning::ThrowChargeSeconds());
+	const float Alpha = Held / ChargeSeconds;
+
+	return TraceModeBTuning::ThrowChargeClamps() ? FMath::Clamp(Alpha, 0.f, 1.f) : FMath::Max(0.f, Alpha);
+}
+
+float ATraceCore::GetThrowChargeScaleNow() const
+{
+	if (!bLocalThrowCharging)
+	{
+		return -1.f;
+	}
+	return GetThrowChargeScaleForHold(FMath::Max(0.f, GetServerTimeSeconds() - LocalThrowChargeStartTime));
+}
+
+void ATraceCore::ClearThrowCharge(const TCHAR* Reason)
+{
+	const bool bWasCharging = (ThrowChargeStartServerTime >= 0.f) || bLocalThrowCharging;
+
+	ThrowChargeStartServerTime = -1.f;
+	ThrowChargeHolder = nullptr;
+	bLocalThrowCharging = false;
+
+	if (bWasCharging && Reason != nullptr)
+	{
+		UE_LOG(LogTraceGame, Verbose, TEXT("[ModeB] throw charge cancelled (%s)."), Reason);
+	}
 }
 
 ATraceCore::FThrowMomentumSample ATraceCore::LastThrow;
@@ -3426,11 +4101,11 @@ static FAutoConsoleCommand GTraceModeBThrowMomentumCmd(
 		}
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[ModeB] THROW MOMENTUM (spec v8 §4): %s was %s at %.0f uu/s horizontal, %+.0f uu/s ")
-			TEXT("vertical | impulse %.0f uu/s + inherited %.0f uu/s (x%.2f) = LAUNCH %.0f uu/s, ")
-			TEXT("launch Z %+.0f uu/s"),
+			TEXT("[ModeB] THROW MOMENTUM (spec v8 §4 + v13 §6): %s was %s at %.0f uu/s horizontal, %+.0f ")
+			TEXT("uu/s vertical | held %.2fs -> charge x%.2f | impulse %.0f uu/s (charged) + inherited ")
+			TEXT("%.0f uu/s (x%.2f) = LAUNCH %.0f uu/s, launch Z %+.0f uu/s"),
 			*S.ThrowerName, S.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("on the ground"),
-			S.ThrowerSpeed2D, S.ThrowerVelocityZ,
+			S.ThrowerSpeed2D, S.ThrowerVelocityZ, S.HeldSeconds, S.ChargeScale,
 			S.ImpulseSpeed, S.InheritedSpeed, S.Inheritance, S.LaunchSpeed, S.LaunchVelocityZ);
 	}));
 
@@ -3956,6 +4631,323 @@ static FAutoConsoleCommand GTraceModeBCatchTestCmd(
 	TEXT("radius it was cut from (shipped / 0.9). Takes no arguments on purpose - see the block comment."),
 	FConsoleCommandDelegate::CreateStatic(&RunModeBCatchTest));
 
+// =================================================================================================
+// SPEC v13 §5 — TESTING THE CONTEST. Trace.ModeB.ContestTest
+//
+// It drives TraceModeBTuning::PickContestedCatcher, WHICH IS THE FUNCTION THE GAME CALLS, with
+// scripted distances. It needs no world, no pawns and no match, which is the point: the claim being
+// made ("nearest wins, and the answer is stable and deterministic") is a claim about a selection, and
+// a selection can be tested exhaustively in a millisecond where a live match can only be watched.
+//
+// AND IT HAS A RED ARM. Case 3 runs the same oscillating sequence twice - once at the shipped margin
+// and once at zero, which is strict nearest-wins every frame - and asserts that the second one
+// FLICKERS. If the harness cannot show the flicker it is not measuring stability, and its "no
+// flicker" result on the shipped margin would mean nothing.
+// =================================================================================================
+
+static void RunModeBContestTest()
+{
+	using TraceModeBTuning::FCatchContender;
+	using TraceModeBTuning::PickContestedCatcher;
+
+	const float Margin = TraceModeBTuning::CatchContestHysteresis();
+
+	int32 Passes = 0;
+	int32 Fails = 0;
+
+	auto Check = [&Passes, &Fails](bool bCondition, const FString& What)
+	{
+		(bCondition ? Passes : Fails)++;
+		if (bCondition)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[ModeBContest]   PASS  %s"), *What);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBContest]   FAIL  %s"), *What);
+		}
+	};
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeBContest] ===== spec v13 §5: the contested magnet, margin %.0f uu ====="), Margin);
+
+	// --- 1. NEAREST WINS, with nobody holding the pull. -------------------------------------------
+	{
+		TArray<FCatchContender> Set;
+		Set.Add({ 300.0, 11u, false });
+		Set.Add({ 120.0, 22u, false });   // nearest
+		Set.Add({ 260.0, 33u, false });
+
+		const int32 Winner = PickContestedCatcher(Set, Margin);
+		Check(Winner == 1, FString::Printf(
+			TEXT("three contenders at 300/120/260 uu -> the 120 wins (got index %d)"), Winner));
+	}
+
+	// --- 2. A CLEARLY NEARER CHALLENGER TAKES THE PULL. -------------------------------------------
+	{
+		TArray<FCatchContender> Set;
+		Set.Add({ 400.0, 11u, true });    // incumbent, far
+		Set.Add({ 100.0, 22u, false });   // challenger, much nearer
+
+		const int32 Winner = PickContestedCatcher(Set, Margin);
+		Check(Winner == 1, FString::Printf(
+			TEXT("an incumbent at 400 uu loses to a challenger at 100 uu (got index %d)"), Winner));
+	}
+
+	// --- 3. A NEAR TIE DOES NOT OSCILLATE — AND THE ZERO-MARGIN ARM SHOWS THAT IT WOULD. ----------
+	//
+	// Two players closing on the Core, their distances crossing back and forth by a few uu each frame,
+	// which is what two defenders converging actually looks like frame to frame.
+	{
+		auto RunOscillation = [](float TestMargin) -> int32
+		{
+			int32 Incumbent = INDEX_NONE;
+			int32 Switches = 0;
+
+			for (int32 Frame = 0; Frame < 60; ++Frame)
+			{
+				// A and B converge on the Core together, separated by a jitter of +/-8 uu that changes
+				// sign every few frames. Neither is meaningfully nearer at any point.
+				const double Base = 400.0 - Frame * 4.0;
+				const double Jitter = 8.0 * FMath::Sin(Frame * 0.9);
+
+				TArray<FCatchContender> Set;
+				Set.Add({ Base + Jitter, 11u, Incumbent == 0 });
+				Set.Add({ Base - Jitter, 22u, Incumbent == 1 });
+
+				const int32 Winner = PickContestedCatcher(Set, TestMargin);
+				if (Incumbent != INDEX_NONE && Winner != Incumbent)
+				{
+					++Switches;
+				}
+				Incumbent = Winner;
+			}
+
+			return Switches;
+		};
+
+		const int32 SwitchesShipped = RunOscillation(Margin);
+		const int32 SwitchesNoMargin = RunOscillation(0.f);
+
+		Check(SwitchesShipped == 0, FString::Printf(
+			TEXT("60 frames of a +/-8 uu near-tie at the shipped margin: %d target switches (want 0)"),
+			SwitchesShipped));
+
+		// THE RED ARM. If this does not flicker, the sequence above is not a near tie and the result
+		// above proves nothing about hysteresis.
+		Check(SwitchesNoMargin >= 5, FString::Printf(
+			TEXT("the SAME 60 frames with the margin at 0 flicker %d times, so the test can detect a ")
+			TEXT("flicker (want >= 5 - if this fails, the case above is not measuring anything)"),
+			SwitchesNoMargin));
+	}
+
+	// --- 4. THE MARGIN IS NOT A PERMANENT HANDICAP. -----------------------------------------------
+	//
+	// Once a challenger is nearer by MORE than the margin the pull moves, and the incumbency moves
+	// with it. A margin that accumulated would let the first player into the zone keep the Core for the
+	// whole flight, which is the opposite of "it should go to the player closest to the core".
+	{
+		TArray<FCatchContender> Set;
+		Set.Add({ 200.0, 11u, true });
+		Set.Add({ 200.0 - static_cast<double>(Margin) - 1.0, 22u, false });
+
+		const int32 Winner = PickContestedCatcher(Set, Margin);
+		Check(Winner == 1, FString::Printf(
+			TEXT("a challenger nearer by margin+1 uu takes the pull (got index %d)"), Winner));
+
+		TArray<FCatchContender> Barely;
+		Barely.Add({ 200.0, 11u, true });
+		Barely.Add({ 200.0 - static_cast<double>(Margin) + 1.0, 22u, false });
+
+		bool bHeld = false;
+		const int32 HeldWinner = PickContestedCatcher(Barely, Margin, &bHeld);
+		Check(HeldWinner == 0 && bHeld, FString::Printf(
+			TEXT("a challenger nearer by only margin-1 uu does NOT (got index %d, held=%d)"),
+			HeldWinner, bHeld ? 1 : 0));
+	}
+
+	// --- 5. AN EXACT TIE IS DETERMINISTIC, AND DOES NOT DEPEND ON ROSTER ORDER. --------------------
+	{
+		TArray<FCatchContender> Forward;
+		Forward.Add({ 250.0, 77u, false });
+		Forward.Add({ 250.0, 33u, false });
+
+		TArray<FCatchContender> Reversed;
+		Reversed.Add({ 250.0, 33u, false });
+		Reversed.Add({ 250.0, 77u, false });
+
+		const uint32 WinnerA = Forward[PickContestedCatcher(Forward, Margin)].StableKey;
+		const uint32 WinnerB = Reversed[PickContestedCatcher(Reversed, Margin)].StableKey;
+
+		Check(WinnerA == WinnerB && WinnerA == 33u, FString::Printf(
+			TEXT("two players at an identical 250 uu resolve to the same one (%u) whichever order the ")
+			TEXT("roster returns them in (%u vs %u)"), 33u, WinnerA, WinnerB));
+	}
+
+	// --- 6. AN INCUMBENT WHO LEAVES THE SET KEEPS NOTHING. ----------------------------------------
+	//
+	// Dead, out of range, or behind the Core: the caller simply stops listing them, and the pull must
+	// move to whoever is left rather than being held by a player who is no longer a candidate.
+	{
+		TArray<FCatchContender> Set;
+		Set.Add({ 380.0, 44u, false });   // the old incumbent is not in this list at all
+		Set.Add({ 390.0, 55u, false });
+
+		const int32 Winner = PickContestedCatcher(Set, Margin);
+		Check(Winner == 0, FString::Printf(
+			TEXT("with the incumbent gone from the set the nearest survivor takes it (got index %d)"),
+			Winner));
+	}
+
+	if (Fails == 0)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBContest] ===== ALL %d CHECKS PASSED (spec v13 §5) ====="), Passes);
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ModeBContest] ===== %d PASSED, %d FAILED (spec v13 §5) ====="), Passes, Fails);
+	}
+}
+
+static FAutoConsoleCommand GTraceModeBContestTestCmd(
+	TEXT("Trace.ModeB.ContestTest"),
+	TEXT("MODE B, spec v13 §5. Drives the SHIPPED contested-magnet selection with scripted distances: ")
+	TEXT("nearest wins, a near tie does not oscillate (and the zero-margin arm proves the test can see ")
+	TEXT("a flicker), the margin is not cumulative, and an exact tie is order-independent."),
+	FConsoleCommandDelegate::CreateStatic(&RunModeBContestTest));
+
+// =================================================================================================
+// SPEC v13 §6 — TESTING THE CHARGE CURVE. Trace.ModeB.ChargeTest
+//
+// The note makes four checkable claims about the mapping from hold time to momentum, and every one of
+// them is a property of ATraceCore::GetThrowChargeScaleForHold - the function the throw, the HUD meter
+// and the bots all call. So they are checked against that function directly rather than by watching
+// throws, which cannot separate "the curve is wrong" from "the bot held the button for the wrong
+// length of time".
+// =================================================================================================
+
+static void RunModeBChargeTest()
+{
+	int32 Passes = 0;
+	int32 Fails = 0;
+
+	auto Check = [&Passes, &Fails](bool bCondition, const FString& What)
+	{
+		(bCondition ? Passes : Fails)++;
+		if (bCondition)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[ModeBCharge]   PASS  %s"), *What);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBCharge]   FAIL  %s"), *What);
+		}
+	};
+
+	const float ChargeSeconds = ATraceCore::GetThrowChargeSeconds();
+	const float Floor = ATraceCore::GetThrowChargeFloor();
+	const float MaxHoldFraction = ATraceCore::GetThrowChargeMaxFraction();
+	const float FullSpeed = ATraceCore::GetThrowSpeed();
+
+	// FULL POWER IS 1.0 BY DEFINITION - a full hold reaches exactly the pre-v13 throw. The MAX knob
+	// caps the HOLD, not the power, and is only reachable with the clamp off.
+	constexpr float FullPower = 1.f;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeBCharge] ===== spec v13 §6: charge %.2fs, floor %.2f, hold cap x%.2f, clamp %d | full ")
+		TEXT("throw speed %.0f uu/s ====="),
+		ChargeSeconds, Floor, MaxHoldFraction, ATraceCore::DoesThrowChargeClamp() ? 1 : 0, FullSpeed);
+
+	// 1. "So if the player just clicks the throw button it will throw with very low momentum."
+	const float Instant = ATraceCore::GetThrowChargeScaleForHold(0.f);
+	Check(FMath::IsNearlyEqual(Instant, Floor, 0.001f) && Instant > 0.f,
+		FString::Printf(TEXT("an instant click throws at x%.3f of full - low, and NOT zero (a zero throw ")
+			TEXT("drops at the thrower's feet and reads as a bug)"), Instant));
+
+	// 2. "Start by making a one second charge up time to reach the current core throw momentum."
+	const float Full = ATraceCore::GetThrowChargeScaleForHold(ChargeSeconds);
+	Check(FMath::IsNearlyEqual(Full, FullPower, 0.001f),
+		FString::Printf(TEXT("a %.2fs hold reaches x%.3f, i.e. the current throw momentum (%.0f uu/s)"),
+			ChargeSeconds, Full, FullSpeed * Full));
+
+	// 3. "Charge time to throw momentum should be a linear correlation." Checked as linearity itself -
+	//    equal steps in hold produce equal steps in momentum - rather than by spot-checking a midpoint,
+	//    which any monotonic curve would pass.
+	{
+		bool bLinear = true;
+		float WorstError = 0.f;
+		for (int32 Step = 0; Step <= 20; ++Step)
+		{
+			const float T = ChargeSeconds * (static_cast<float>(Step) / 20.f);
+			const float Expected = Floor + (FullPower - Floor) * (static_cast<float>(Step) / 20.f);
+			const float Actual = ATraceCore::GetThrowChargeScaleForHold(T);
+			WorstError = FMath::Max(WorstError, FMath::Abs(Actual - Expected));
+			bLinear &= FMath::IsNearlyEqual(Actual, Expected, 0.0005f);
+		}
+		Check(bLinear, FString::Printf(
+			TEXT("21 samples across the wind-up are linear in hold time (worst error %.5f)"), WorstError));
+	}
+
+	// 4. "[ASSUMPTION] clamp there." Holding past the charge time buys nothing more.
+	if (ATraceCore::DoesThrowChargeClamp())
+	{
+		const float Overheld = ATraceCore::GetThrowChargeScaleForHold(ChargeSeconds * 5.f);
+		Check(FMath::IsNearlyEqual(Overheld, FullPower, 0.001f),
+			FString::Printf(TEXT("holding 5x the charge time still throws at x%.3f - it clamps"), Overheld));
+	}
+
+	// 5. Monotonic: a longer hold is never a weaker throw. Trivially true of a line, and the check that
+	//    would catch a future non-linear curve being dropped in with the sign wrong.
+	{
+		bool bMonotonic = true;
+		float Previous = -1.f;
+		for (int32 Step = 0; Step <= 40; ++Step)
+		{
+			const float Scale = ATraceCore::GetThrowChargeScaleForHold(ChargeSeconds * Step / 20.f);
+			bMonotonic &= (Scale >= Previous - 0.0001f);
+			Previous = Scale;
+		}
+		Check(bMonotonic, TEXT("a longer hold is never a weaker throw"));
+	}
+
+	// 6. The inverse round-trips, which is what the bots depend on: they pick a POWER and have to turn
+	//    it into a HOLD. A round-trip error here is a bot that throws short or long by that error.
+	{
+		bool bRoundTrips = true;
+		float WorstError = 0.f;
+		for (int32 Step = 0; Step <= 10; ++Step)
+		{
+			const float WantedScale = FMath::Lerp(Floor, FullPower, static_cast<float>(Step) / 10.f);
+			const float Hold = ATraceCore::GetThrowHoldSecondsForScale(WantedScale);
+			const float GotScale = ATraceCore::GetThrowChargeScaleForHold(Hold);
+			WorstError = FMath::Max(WorstError, FMath::Abs(GotScale - WantedScale));
+			bRoundTrips &= FMath::IsNearlyEqual(GotScale, WantedScale, 0.002f);
+		}
+		Check(bRoundTrips, FString::Printf(
+			TEXT("power -> hold -> power round-trips for the bots (worst error %.5f)"), WorstError));
+	}
+
+	if (Fails == 0)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBCharge] ===== ALL %d CHECKS PASSED (spec v13 §6) ====="), Passes);
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ModeBCharge] ===== %d PASSED, %d FAILED (spec v13 §6) ====="), Passes, Fails);
+	}
+}
+
+static FAutoConsoleCommand GTraceModeBChargeTestCmd(
+	TEXT("Trace.ModeB.ChargeTest"),
+	TEXT("MODE B, spec v13 §6. Checks the SHIPPED charge curve: an instant click is low but not zero, a ")
+	TEXT("full hold reaches exactly the current throw momentum, the ramp between them is linear, it ")
+	TEXT("clamps, and the inverse the bots use round-trips."),
+	FConsoleCommandDelegate::CreateStatic(&RunModeBChargeTest));
+
 int32 ATraceCore::GoalsByMethod[static_cast<int32>(ATraceCore::EGoalMethod::Count)] = {};
 
 static FAutoConsoleCommand GTraceModeBTallyCmd(
@@ -3986,6 +4978,40 @@ static FAutoConsoleCommand GTraceModeBSurfaceStatsCmd(
 			Stats.GroundTurnovers, Stats.TopTurnovers, Stats.WallBounces, Stats.WallRestRefusals,
 			Stats.RestProbeRescues,
 			TraceModeBTuning::SurfaceMaxSlopeDegrees(), TraceModeBTuning::SurfaceUpNormalZ());
+
+		// SPEC v13 §8, printed with it rather than under its own command: "how many turnovers" and
+		// "how many of them happened in mid-air" are the same question asked twice, and separating the
+		// two readouts is how somebody ends up quoting one without the other.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] LANDING RULE (spec v13 §8): MID-AIR TURNOVERS %d (fired above %.0f uu/s AND ")
+			TEXT("below %.0f deg to the surface - this must be 0) | landed turnovers %d | glancing ")
+			TEXT("contacts refused a landing %d | rule=%s, min descent %.0f deg, min flight %.2fs"),
+			Stats.MidAirTurnovers, CVarModeBMidAirTurnoverSpeed.GetValueOnAnyThread(),
+			CVarModeBMidAirTurnoverDegrees.GetValueOnAnyThread(),
+			Stats.LandedTurnovers, Stats.GlancingContactsRejected,
+			(!TraceModeBLegacyLandingRule()) ? TEXT("v13 (an actual landing)")
+				: TEXT("PRE-v13 (any upward normal) - THE BUG, ARMED"),
+			TraceModeBTuning::LandingMinDescentDegrees(), TraceModeBTuning::LandingMinFlightSeconds());
+	}));
+
+ATraceCore::FCatchContestStats ATraceCore::CatchStats;
+
+static FAutoConsoleCommand GTraceModeBCatchStatsCmd(
+	TEXT("Trace.ModeB.CatchStats"),
+	TEXT("MODE B, spec v13 §5. Prints how often the magnet zone was CONTESTED (two or more eligible ")
+	TEXT("players in range at once), how many of those contests were cross-team, how often the pull ")
+	TEXT("moved between players, and how often the hysteresis refused a switch."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		const ATraceCore::FCatchContestStats& Stats = ATraceCore::CatchStats;
+		const int32 Frames = Stats.UncontestedFrames + Stats.ContestedFrames;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] CONTESTED MAGNET TALLY (spec v13 §5): magnet frames %d (%d uncontested, %d ")
+			TEXT("contested, %d of them cross-team) | contests entered %d | largest contested set %d | ")
+			TEXT("target switches %d | switches held off by hysteresis %d | margin %.0f uu, radius %.0f uu"),
+			Frames, Stats.UncontestedFrames, Stats.ContestedFrames, Stats.CrossTeamContestedFrames,
+			Stats.Contests, Stats.MaxContenders, Stats.TargetSwitches, Stats.HysteresisHolds,
+			TraceModeBTuning::CatchContestHysteresis(), TraceModeBTuning::CatchRadius());
 	}));
 
 bool ATraceCore::CheckGoalScore(const FVector& From, const FVector& To, ETraceTeam ScoringTeam, EGoalMethod Method,
@@ -4102,7 +5128,7 @@ bool ATraceCore::CheckGoalScore(const FVector& From, const FVector& To, ETraceTe
 
 // --- The throw -----------------------------------------------------------------------------------
 
-bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
+bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 {
 	if (!HasAuthority() || !IsModeB())
 	{
@@ -4144,12 +5170,31 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
 	// executed their moves through the movement component, so the velocity here is the authoritative
 	// result of the very moves that produced the jump - not an interpolated proxy's guess. That is
 	// what makes this fix land the same way for a client as for the host (spec v8 §0).
-	const float Speed = TraceModeBTuning::ThrowSpeed();
-	const FVector Impulse = ThrowDirection * Speed
-		+ FVector::UpVector * (Speed * TraceModeBTuning::ThrowUpBias());
+	//
+	// SPEC v13 §6. THE CHARGE IS MEASURED ON THE SERVER, from the hold @p HeldSeconds carries - which
+	// RequestPassInput computed from ITS OWN press and release timestamps, never from anything a
+	// client said about how long it held down a button. A client-supplied hold is a client-supplied
+	// launch speed, and it would be the single most valuable number in this game to lie about.
+	const float ChargeScale = GetThrowChargeScaleForHold(HeldSeconds);
 
+	const float Speed = TraceModeBTuning::ThrowSpeed();
+	const FVector Impulse = (ThrowDirection * Speed
+		+ FVector::UpVector * (Speed * TraceModeBTuning::ThrowUpBias())) * ChargeScale;
+
+	// THE CHARGE SCALES THE IMPULSE; THE INHERITED VELOCITY IS ADDED ON TOP OF IT, UNSCALED. See
+	// ComputeThrowLaunchVelocity, the published copy of this expression, which states why at length.
 	const FVector Inherited = GetInheritedThrowVelocity(Thrower);
 	const FVector LaunchVelocity = Impulse + Inherited;
+
+	// The published predictor and the real launch, on the same frame, from the same inputs. Every
+	// throw solver in the game aims with the predictor, so a drift between the two is a match in which
+	// no bot can hit anything - the exact failure spec v8 §4 recorded when the bots rebuilt the
+	// formula themselves. It costs one vector compare and it fails loudly rather than by 2000 uu at
+	// the far end of a shot.
+	ensureMsgf(LaunchVelocity.Equals(ComputeThrowLaunchVelocity(Thrower, ThrowDirection, ChargeScale), 1.0),
+		TEXT("[ModeB] ThrowFromHolder and ComputeThrowLaunchVelocity disagree: %s vs %s"),
+		*LaunchVelocity.ToCompactString(),
+		*ComputeThrowLaunchVelocity(Thrower, ThrowDirection, ChargeScale).ToCompactString());
 
 	// NOT ALSO OFFSET BY THE THROWER'S MOTION. The muzzle is a fixed 70 uu ahead of the eye and stays
 	// there: the eye position is already this frame's, so the launch point already travels with the
@@ -4170,6 +5215,8 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
 	LastThrow.bThrowerFalling = Thrower->GetCharacterMovement() != nullptr
 		&& Thrower->GetCharacterMovement()->IsFalling();
 	LastThrow.Inheritance = TraceModeBTuning::ThrowInheritance();
+	LastThrow.HeldSeconds = FMath::Max(0.f, HeldSeconds);
+	LastThrow.ChargeScale = ChargeScale;
 	LastThrow.ThrowerName = GetNameSafe(Thrower);
 
 	const ETraceTeam ThrowerTeam = Thrower->GetTeam();
@@ -4183,12 +5230,15 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
 	// thrower's transform - which is the "stored its home position as a relative offset" family of
 	// bug the file header warns about.
 	CancelPass(nullptr);
+	ClearThrowCharge(nullptr);   // Spec v13 §6: this charge has now been spent. Not cancelled - spent.
 	ReleaseHolder();
 
 	bLoose = true;
 	bLooseAtRest = false;
 	bLooseFromThrow = true;   // Spec v6 §4.2: this Core, and only this kind, turns over on landing.
 	CatchZoneTarget = nullptr;
+	bCatchZoneContested = false;
+	LastContactServerTime = -1.f;
 	LooseFromTeam = ThrowerTeam;
 	LooseThrower = Thrower;
 	LooseStartServerTime = Now;
@@ -4209,10 +5259,13 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower)
 	ForceNetUpdate();
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[ModeB] THROW by %s (%s) at %.0f uu/s from %s | spec v8 §4: impulse %.0f + inherited %.0f ")
-		TEXT("(thrower %.0f uu/s horiz, %+.0f vert, %s, x%.2f), launch Z %+.0f"),
+		TEXT("[ModeB] THROW by %s (%s) at %.0f uu/s from %s | v13 §6: held %.2fs -> charge x%.2f (floor ")
+		TEXT("%.2f, full at %.2fs) | v8 §4: charged impulse %.0f + inherited %.0f (thrower %.0f uu/s ")
+		TEXT("horiz, %+.0f vert, %s, x%.2f), launch Z %+.0f"),
 		*GetNameSafe(Thrower), *TraceTeamName(ThrowerTeam).ToString(),
 		LaunchVelocity.Size(), *LaunchLocation.ToCompactString(),
+		LastThrow.HeldSeconds, ChargeScale,
+		TraceModeBTuning::ThrowChargeFloor(), TraceModeBTuning::ThrowChargeSeconds(),
 		LastThrow.ImpulseSpeed, LastThrow.InheritedSpeed,
 		LastThrow.ThrowerSpeed2D, LastThrow.ThrowerVelocityZ,
 		LastThrow.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("grounded"),
@@ -4251,6 +5304,15 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	FVector SurfacePoint = FVector::ZeroVector;
 	FVector SurfaceNormal = FVector::UpVector;
 
+	// SPEC v13 §8. The speed the Core was travelling at when it met the surface — captured before the
+	// bounce overwrites it, and carried out to the turnover so the tally can say whether possession
+	// changed on a Core that had stopped or on one that was still flying. Zero when the landing came
+	// from the at-rest probe, which by definition means it had stopped.
+	double ArrivalSpeed = 0.0;
+
+	/** sin of the angle between the flight and the surface plane. 1 = straight down onto it. */
+	double ArrivalSin = 1.0;
+
 	// --- 0. SPEC v6 §4.1: the catch zone. ---------------------------------------------------------
 	//
 	// Ahead of the integration, so this frame's motion is already the curved one: applying it
@@ -4265,6 +5327,11 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 			* static_cast<double>(TraceModeBTuning::GravityScale());
 
 		LooseVelocity = FVector(LooseVelocity) + FVector(0.0, 0.0, GravityZ * Step);
+
+		// SPEC v13 §8. The speed the Core ARRIVES with, captured before any bounce can overwrite it.
+		// The landing test is a question about the approach, and after MirrorByVector there is no
+		// approach left to ask about.
+		const double Speed3DBeforeContact = FVector(LooseVelocity).Size();
 
 		const FVector Desired = StartLocation + FVector(LooseVelocity) * Step;
 
@@ -4308,12 +5375,60 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 			const float UpNormalZ = TraceModeBTuning::SurfaceUpNormalZ();
 			const bool bUpwardFacing = (ContactNormal.Z >= UpNormalZ);
 
-			bLandedOnSurface = bUpwardFacing;
 			SurfacePoint = Hit.bStartPenetrating ? Hit.Location : Hit.ImpactPoint;
 			SurfaceNormal = ContactNormal;
+			ArrivalSpeed = Speed3DBeforeContact;
+
+			// --- SPEC v13 §8. AN UPWARD NORMAL IS NOT YET A LANDING. --------------------------------
+			//
+			// "Sometimes the core is thrown and it turns over before it touches the ground." Until v13
+			// the next line was `bLandedOnSurface = bUpwardFacing;` and nothing else - so a Core
+			// crossing the arena at 2200 uu/s whose sphere clipped the flat top of a cover block, or one
+			// of the corner cove's horizontal treads, changed possession in mid-flight. See the §8
+			// tuning block above for the whole diagnosis.
+			//
+			// TWO SIGNALS, taken BEFORE the bounce is applied because both are facts about the ARRIVAL:
+			//
+			//   DESCENT  how steeply the flight met the surface, as an angle rather than a speed. A
+			//            Core dropping onto a crate arrives at 25-90 degrees to the surface; a Core
+			//            skimming past the same crate arrives at 2-8. A speed threshold cannot separate
+			//            those - they can be travelling at identical speeds - and an angle can.
+			//   FLIGHT   how long it has been in the air, which closes hypothesis (c): a sweep that is
+			//            blocked on the launch frame, before the Core has cleared the thrower's own
+			//            footing, is not a landing however vertical its normal looks.
+			//
+			// A contact that STOPS the Core is a landing regardless of both, and that is the third
+			// clause below: bComesToRest. It has to be decided HERE, alongside the other two, rather
+			// than left to the resting block further down - otherwise the verdict this frame's log
+			// prints ("GRAZE") disagrees with the turnover the same frame fires, which is exactly the
+			// kind of instrument that makes a reader distrust a run that was actually correct.
+			const double ApproachSpeed = -FVector::DotProduct(FVector(LooseVelocity), ContactNormal);
+			ArrivalSin = (Speed3DBeforeContact > 1.0)
+				? (ApproachSpeed / Speed3DBeforeContact) : 1.0;
 
 			const FVector Reflected = FVector(LooseVelocity).MirrorByVector(ContactNormal)
 				* TraceModeBTuning::Bounce();
+
+			const bool bLegacyLandingRule = TraceModeBLegacyLandingRule();
+			const bool bClearedTheThrower =
+				(Now - LooseStartServerTime) >= TraceModeBTuning::LandingMinFlightSeconds();
+			const bool bArrivedOnIt = (ArrivalSin >= static_cast<double>(TraceModeBTuning::LandingMinDescentSin()));
+			const bool bComesToRest = bUpwardFacing
+				&& (Reflected.Size() < TraceModeBTuning::RestSpeed());
+
+			// bLegacyLandingRule is the A/B arm (Trace.ModeB.LandingRule 0) and restores the pre-v13
+			// behaviour EXACTLY, which is what lets the §8 reproduction go red on this build.
+			const bool bContactIsLanding = bUpwardFacing
+				&& (bLegacyLandingRule || bComesToRest || (bArrivedOnIt && bClearedTheThrower));
+
+			bLandedOnSurface = bContactIsLanding;
+
+			if (bUpwardFacing && !bContactIsLanding)
+			{
+				// THE BUG'S OWN COUNTER. Every one of these was a turnover before v13.
+				++SurfaceStats.GlancingContactsRejected;
+			}
+
 			LooseVelocity = Reflected;
 
 			if (!bUpwardFacing)
@@ -4325,6 +5440,40 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 					FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(ContactNormal.Z, -1.0, 1.0))));
 			}
 
+			// SPEC v13 §8's instrument. EVERY contact a thrown Core makes, with the four numbers the
+			// report is about - how high, how fast, what normal, and what the rule made of it. This is
+			// how the mid-air turnover was found, and it is left in because a rule about a geometric
+			// event that cannot be watched is a rule nobody can check.
+			if (TraceModeBTurnoverLogEnabled() && bLooseFromThrow)
+			{
+				double FloorZ = 0.0;
+				if (const ATraceArenaBuilder* LogArena = ATraceArenaBuilder::Get(World))
+				{
+					const FBox LogBox = LogArena->GetFieldBounds();
+					FloorZ = (LogBox.IsValid != 0) ? LogBox.Min.Z : 0.0;
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ModeBTurnover] CONTACT at %s | %.0f uu above the floor | speed %.0f -> %.0f uu/s | ")
+					TEXT("normal %s (%.0f deg from up, up-facing=%d) | arrival %.1f deg to the surface ")
+					TEXT("(needs %.0f) | airborne %.3fs (needs %.3f) | VERDICT: %s"),
+					*SurfacePoint.ToCompactString(), SurfacePoint.Z - FloorZ,
+					Speed3DBeforeContact, Reflected.Size(),
+					*ContactNormal.ToCompactString(),
+					FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(ContactNormal.Z, -1.0, 1.0))),
+					bUpwardFacing ? 1 : 0,
+					FMath::RadiansToDegrees(FMath::Asin(FMath::Clamp(ArrivalSin, -1.0, 1.0))),
+					TraceModeBTuning::LandingMinDescentDegrees(),
+					Now - LooseStartServerTime, TraceModeBTuning::LandingMinFlightSeconds(),
+					!bUpwardFacing ? TEXT("WALL - bounce")
+						: (bComesToRest ? TEXT("SETTLED on it - turnover")
+							: (bContactIsLanding ? TEXT("LANDING - turnover")
+								: (!bClearedTheThrower ? TEXT("launch-frame contact - flies on")
+									: TEXT("GRAZE - flies on")))));
+			}
+
+			LastContactServerTime = Now;
+
 			if (Reflected.Size() < TraceModeBTuning::RestSpeed())
 			{
 				// SPEC v7 §4: A WALL IS NOT A RESTING PLACE.
@@ -4335,10 +5484,15 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 				// one surface over, and one that no probe can rescue because nothing is holding it up.
 				// So a slow bounce off a wall keeps only its DOWNWARD component and stays live: gravity
 				// takes it to something horizontal, and the rule fires there instead.
+				// bComesToRest is this same pair of conditions, decided further up so that the landing
+				// verdict and the log line are computed from one expression rather than two that could
+				// drift. bLandedOnSurface has ALREADY been set true by it - see SPEC v13 §8 above - so
+				// this block only has to do the resting itself.
 				if (bUpwardFacing)
 				{
 					LooseVelocity = FVector::ZeroVector;
 					bLooseAtRest = true;
+
 					UE_LOG(LogTraceGame, Verbose, TEXT("[ModeB] loose Core came to rest at %s"),
 						*FVector(LooseLocation).ToCompactString());
 				}
@@ -4365,6 +5519,24 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	//
 	// Cheap by construction: it runs only while the Core is at rest AND has not yet turned over, which
 	// in a real match is the handful of frames between landing and the turnover firing.
+	//
+	// SPEC v13 §8 HYPOTHESIS (b) — "the at-rest probe firing while the Core still has speed" — CLOSED
+	// HERE, BY MEASUREMENT RATHER THAN BY ARGUMENT. It cannot happen today: bLooseAtRest is only ever
+	// set on the two lines above, and both zero the velocity on the line before. But "cannot happen"
+	// is exactly the kind of invariant a later edit breaks silently, and a Core declared at rest while
+	// still travelling would hand possession over in mid-air by a completely different route from the
+	// one this pass fixed. So the invariant is now ASSERTED: if it is ever false the Core is put back
+	// in flight and the log says so, rather than a turnover firing on a moving Core.
+	if (bLooseAtRest && !FVector(LooseVelocity).IsNearlyZero(1.0))
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ModeB] spec v13 §8: the Core was flagged AT REST at %s while still travelling at %.0f ")
+			TEXT("uu/s - refusing the landing and resuming flight. This is the mid-air turnover's ")
+			TEXT("hypothesis (b) and it should never be reachable."),
+			*FVector(LooseLocation).ToCompactString(), FVector(LooseVelocity).Size());
+		bLooseAtRest = false;
+	}
+
 	if (!bLandedOnSurface && bLooseAtRest)
 	{
 		FVector RestPoint = FVector::ZeroVector;
@@ -4413,8 +5585,41 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	// instruction was to generalise the ground path, not to grow a second one beside it.
 	if (bLandedOnSurface && bLooseFromThrow && CVarModeBGroundTurnover.GetValueOnAnyThread() != 0)
 	{
+		// SPEC v13 §8's headline number, taken BEFORE the turnover runs because the turnover can grant,
+		// score and reset the field under us - after which none of this state means anything.
+		//
+		// FAST **AND** SHALLOW, and both halves are load-bearing. A Core dropped straight onto the floor
+		// arrives at 1500 uu/s and has unambiguously landed, so speed alone would report the commonest
+		// correct turnover in the game as the bug; a Core resting on a crate is 400 uu up, so height
+		// alone would report spec v7 §4 as the bug. What the user described is a Core going PAST
+		// something - still travelling, and barely descending. That is the pair.
+		//
+		// Measured from the geometry of the event and NOT from the rule's verdict, so both arms of the
+		// A/B (Trace.ModeB.LandingRule 1 and 0) compute it identically and the counter can go red.
+		const double ArrivalDegrees = FMath::RadiansToDegrees(FMath::Asin(FMath::Clamp(ArrivalSin, -1.0, 1.0)));
+		const bool bStillFlying =
+			(ArrivalSpeed > static_cast<double>(CVarModeBMidAirTurnoverSpeed.GetValueOnAnyThread()))
+			&& (ArrivalDegrees < static_cast<double>(CVarModeBMidAirTurnoverDegrees.GetValueOnAnyThread()));
+
 		if (ServerSurfaceTurnover(SurfacePoint, SurfaceNormal))
 		{
+			(bStillFlying ? SurfaceStats.MidAirTurnovers : SurfaceStats.LandedTurnovers)++;
+
+			if (bStillFlying)
+			{
+				// LOUD, and unconditionally: this is the bug's own signature. On the shipped rule it can
+				// only be reached with Trace.ModeB.LandingRule 0 (the A/B arm that restores the pre-v13
+				// behaviour on purpose), so a line of this in a normal run means the landing rule has
+				// regressed and the report is worth more than the noise.
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[ModeBTurnover] MID-AIR TURNOVER: possession changed while the Core was still ")
+					TEXT("travelling at %.0f uu/s and only %.1f deg off the surface (normal %s) - spec v13 ")
+					TEXT("§8 says this must not happen. Landing rule = %s."),
+					ArrivalSpeed, ArrivalDegrees, *SurfaceNormal.ToCompactString(),
+					(!TraceModeBLegacyLandingRule())
+						? TEXT("v13 (an actual landing)") : TEXT("PRE-v13, DELIBERATELY ARMED"));
+			}
+
 			if (bLandedByRestProbe)
 			{
 				// Counted only on a turnover that actually fired, and only when the AT-REST PROBE is
@@ -4482,6 +5687,7 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 	if (Radius <= 0.f || Curve <= 0.f)
 	{
 		CatchZoneTarget = nullptr;
+		bCatchZoneContested = false;
 		return;   // Magnet switched off. The Core flies exactly as it did before v6.
 	}
 
@@ -4490,6 +5696,7 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 	if (Speed < 1.0)
 	{
 		CatchZoneTarget = nullptr;
+		bCatchZoneContested = false;
 		return;   // Nothing to steer.
 	}
 
@@ -4501,9 +5708,22 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 	TArray<ATraceCharacter*> Candidates;
 	GatherCharacters(Candidates);
 
-	ATraceCharacter* Best = nullptr;
-	FVector BestPoint = FVector::ZeroVector;
-	double BestSurfaceDistance = TNumericLimits<double>::Max();
+	// SPEC v13 §5. EVERY eligible player is collected, not just the running best, because the rule is
+	// about the SET: "within the magnet zone of two or more players". A loop that only ever kept the
+	// winner could not tell a contest from a walkover, could not apply hysteresis (which needs to know
+	// whether the incumbent is still in the set at all) and could not report either.
+	//
+	// Two parallel arrays rather than one array of pairs: the contenders are a plain value type on
+	// purpose so PickContestedCatcher can be driven by a test with no world in it, and the actors it
+	// must not know about live alongside it.
+	TArray<TraceModeBTuning::FCatchContender> Contenders;
+	TArray<ATraceCharacter*> ContenderPawns;
+	TArray<FVector> ContenderPoints;
+	Contenders.Reserve(Candidates.Num());
+	ContenderPawns.Reserve(Candidates.Num());
+	ContenderPoints.Reserve(Candidates.Num());
+
+	const ATraceCharacter* const Incumbent = CatchZoneTarget.Get();
 
 	for (ATraceCharacter* Candidate : Candidates)
 	{
@@ -4551,19 +5771,64 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 			continue;
 		}
 
-		if (SurfaceDistance < BestSurfaceDistance)
-		{
-			BestSurfaceDistance = SurfaceDistance;
-			Best = Candidate;
-			BestPoint = CatchPoint;
-		}
+		TraceModeBTuning::FCatchContender Contender;
+		Contender.SurfaceDistance = SurfaceDistance;
+		Contender.StableKey = Candidate->GetUniqueID();
+		Contender.bIncumbent = (Candidate == Incumbent);
+
+		Contenders.Add(Contender);
+		ContenderPawns.Add(Candidate);
+		ContenderPoints.Add(CatchPoint);
 	}
 
-	if (Best == nullptr)
+	if (Contenders.Num() == 0)
+	{
+		CatchZoneTarget = nullptr;
+		bCatchZoneContested = false;
+		return;
+	}
+
+	// --- SPEC v13 §5. THE CONTEST. ----------------------------------------------------------------
+	//
+	// Counted before it is resolved, so the tally records what the situation WAS rather than what the
+	// rule made of it. "Cross-team" is tracked separately because that is the case the note names, but
+	// the RULE below does not branch on it: nearest wins whoever the contenders are.
+	const bool bContested = (Contenders.Num() >= 2);
+	bool bCrossTeam = false;
+	if (bContested)
+	{
+		const ETraceTeam FirstTeam = ContenderPawns[0]->GetTeam();
+		for (int32 Index = 1; Index < ContenderPawns.Num() && !bCrossTeam; ++Index)
+		{
+			bCrossTeam = (ContenderPawns[Index]->GetTeam() != FirstTeam);
+		}
+
+		++CatchStats.ContestedFrames;
+		CatchStats.CrossTeamContestedFrames += bCrossTeam ? 1 : 0;
+		CatchStats.MaxContenders = FMath::Max(CatchStats.MaxContenders, Contenders.Num());
+		CatchStats.Contests += bCatchZoneContested ? 0 : 1;
+	}
+	else
+	{
+		++CatchStats.UncontestedFrames;
+	}
+	bCatchZoneContested = bContested;
+
+	bool bHysteresisHeld = false;
+	const int32 Winner = TraceModeBTuning::PickContestedCatcher(
+		Contenders, TraceModeBTuning::CatchContestHysteresis(), &bHysteresisHeld);
+
+	if (Winner == INDEX_NONE)
 	{
 		CatchZoneTarget = nullptr;
 		return;
 	}
+
+	CatchStats.HysteresisHolds += bHysteresisHeld ? 1 : 0;
+
+	ATraceCharacter* const Best = ContenderPawns[Winner];
+	const FVector BestPoint = ContenderPoints[Winner];
+	const double BestSurfaceDistance = Contenders[Winner].SurfaceDistance;
 
 	const FVector ToTarget = BestPoint - CoreLocation;
 	if (ToTarget.IsNearlyZero())
@@ -4571,6 +5836,10 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 		return;   // Already there; the pickup poll has it this frame.
 	}
 
+	// ONE TARGET, and only the winner's. This was already true before v13 - there has only ever been
+	// one call to the steering - and it stays true: the change is that the single target is now DECIDED
+	// by distance and held steady, rather than being whichever eligible player the roster reached last
+	// with the smallest number.
 	LooseVelocity = TraceModeBTuning::SteerTowardCatchPoint(
 		CoreLocation, LooseVelocity, BestPoint, BestSurfaceDistance, Radius, Curve, DeltaSeconds);
 
@@ -4579,13 +5848,45 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 	// working - which is precisely how two working mechanics have been declared dead on this project.
 	if (CatchZoneTarget.Get() != Best)
 	{
+		const bool bSwitched = (Incumbent != nullptr);
+		CatchStats.TargetSwitches += bSwitched ? 1 : 0;
 		CatchZoneTarget = Best;
+
+		// The runner-up is named on a contested frame. "The Core curved to X" is unfalsifiable on its
+		// own; "the Core curved to X at 210 uu with Y at 340 uu also in range" is the rule stating its
+		// own working, and it is what a reader checks when somebody reports the Core going to the
+		// wrong player.
+		FString ContestDetail;
+		if (bContested)
+		{
+			int32 RunnerUp = INDEX_NONE;
+			for (int32 Index = 0; Index < Contenders.Num(); ++Index)
+			{
+				if (Index == Winner)
+				{
+					continue;
+				}
+				if (RunnerUp == INDEX_NONE || Contenders[Index].SurfaceDistance < Contenders[RunnerUp].SurfaceDistance)
+				{
+					RunnerUp = Index;
+				}
+			}
+
+			ContestDetail = FString::Printf(
+				TEXT(" | CONTESTED by %d (%s): nearest wins over %s (%s) at %.0f uu"),
+				Contenders.Num(), bCrossTeam ? TEXT("opposite teams") : TEXT("same team"),
+				*GetNameSafe(ContenderPawns[RunnerUp]),
+				*TraceTeamName(ContenderPawns[RunnerUp]->GetTeam()).ToString(),
+				Contenders[RunnerUp].SurfaceDistance);
+		}
+
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[ModeB] CATCH ZONE: the Core is curving toward %s (%s) - %.0f uu from their capsule, ")
-			TEXT("radius %.0f, curve %.1f%s"),
+			TEXT("radius %.0f, curve %.1f%s%s"),
 			*GetNameSafe(Best), *TraceTeamName(Best->GetTeam()).ToString(),
 			BestSurfaceDistance, Radius, Curve,
-			(Best == Thrower) ? TEXT(" (the thrower, past their lockout)") : TEXT(""));
+			(Best == Thrower) ? TEXT(" (the thrower, past their lockout)") : TEXT(""),
+			*ContestDetail);
 	}
 }
 
@@ -4860,6 +6161,8 @@ void ATraceCore::ClearLooseState()
 	bLooseAtRest = false;
 	bLooseFromThrow = false;
 	CatchZoneTarget = nullptr;
+	bCatchZoneContested = false;   // Spec v13 §5: a new flight starts its own contest.
+	LastContactServerTime = -1.f;  // Spec v13 §8: and its own contact history.
 	LooseVelocity = FVector::ZeroVector;
 	LooseThrower = nullptr;
 	LooseStartServerTime = 0.f;
@@ -6035,6 +7338,377 @@ bool ATraceCore::FindVerificationSurfaces(FVector& OutTopPoint, FVector& OutWall
 	}
 
 	return false;
+}
+
+// =================================================================================================
+// SPEC v13 §8 — THE REPRODUCTION
+//
+// "Sometimes the core is thrown and it turns over before it touches the ground." The instruction was
+// to REPRODUCE IT FIRST, and this is what does it: a throw fired repeatedly ACROSS the flat top of a
+// piece of arena cover, at a shallow angle, exactly the shape of throw a player makes over a crate.
+//
+// WHY IT CAN GO RED, WHICH IS THE PART THAT MATTERS. Trace.ModeB.LandingRule 0 restores the pre-v13
+// behaviour verbatim - any upward-facing contact is a landing - and the two arms are otherwise the
+// same code driving the same geometry. So the pass criterion is not "we saw nothing bad": it is a
+// number that MOVES between the arms, measured by a counter (SurfaceStats.MidAirTurnovers) that is
+// computed identically in both and that reads the event's geometry rather than the rule's verdict.
+// A harness that could only ever print zero would be the wall-clip harness this project has already
+// been burned by, and it would prove nothing.
+//
+// It also fires DROP shots - straight down onto open floor - in the same run, so the same tally shows
+// spec v6 §4.2's ordinary ground turnover still firing. A "fix" that stopped every turnover would
+// pass a graze-only harness and would be a much worse bug than the one being fixed.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarModeBTurnoverRepro(
+	TEXT("Trace.ModeB.TurnoverRepro"),
+	0,
+	TEXT("MODE B, spec v13 §8. Set to N: fire N scripted throws - alternating a GRAZE across the flat ")
+	TEXT("top of a piece of cover and a DROP onto open floor - and print how many turnovers fired in ")
+	TEXT("mid-air. Run it twice: once as shipped, and once with Trace.ModeB.LandingRule 0, which arms ")
+	TEXT("the pre-v13 rule and is the arm that must go RED."),
+	ECVF_Default);
+
+/**
+ * How many shots the repro was asked for, from the CVar or from -TraceTurnoverRepro=N.
+ *
+ * The command-line form exists because arming this through -ExecCmds requires a SPACE
+ * ("Trace.ModeB.TurnoverRepro 12"), which requires quoting, and a quoted -ExecCmds argument has
+ * already broken a command line into the URL parser on this project and produced a verification that
+ * "passed" because none of its commands ran. `-TraceTurnoverRepro=12` cannot do that.
+ */
+static int32 TraceModeBTurnoverReproShots()
+{
+	static const int32 FromCommandLine = []() -> int32
+	{
+		int32 Value = 0;
+		return FParse::Value(FCommandLine::Get(), TEXT("TraceTurnoverRepro="), Value) ? Value : 0;
+	}();
+
+	return FMath::Max(FromCommandLine, CVarModeBTurnoverRepro.GetValueOnGameThread());
+}
+
+double ATraceCore::MeasureTopFaceExtent(const FVector& FromPoint, FVector& OutDirection) const
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return 0.0;
+	}
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreTopExtent), /*bTraceComplex=*/false, this);
+	Params.AddIgnoredActor(this);
+
+	static const FVector Compass[] =
+	{
+		FVector(1.0, 0.0, 0.0),  FVector(-1.0, 0.0, 0.0),
+		FVector(0.0, 1.0, 0.0),  FVector(0.0, -1.0, 0.0),
+		FVector(0.707, 0.707, 0.0),  FVector(-0.707, 0.707, 0.0),
+		FVector(0.707, -0.707, 0.0), FVector(-0.707, -0.707, 0.0)
+	};
+
+	constexpr double StepUU = 40.0;
+	constexpr int32 MaxSteps = 24;          // 960 uu, comfortably longer than any cover block here.
+	constexpr double SameFaceTolerance = 8.0;
+
+	double BestRun = 0.0;
+	OutDirection = FVector::ForwardVector;
+
+	for (const FVector& Direction : Compass)
+	{
+		double Run = 0.0;
+
+		for (int32 Step = 1; Step <= MaxSteps; ++Step)
+		{
+			const FVector Column = FromPoint + Direction * (StepUU * Step);
+
+			FHitResult Hit;
+			const bool bHit = World->SweepSingleByChannel(
+				Hit,
+				FVector(Column.X, Column.Y, FromPoint.Z + 120.0),
+				FVector(Column.X, Column.Y, FromPoint.Z - 40.0),
+				FQuat::Identity, ECC_WorldStatic,
+				FCollisionShape::MakeSphere(TraceModeBTuning::CollisionRadius), Params);
+
+			// THE SAME FACE, not merely SOMETHING. A run that wandered onto a taller block beside this
+			// one would aim the graze into a wall and the shot would test the bounce rule instead.
+			if (!bHit
+				|| Hit.ImpactNormal.Z < TraceModeBTuning::SurfaceUpNormalZ()
+				|| FMath::Abs(Hit.ImpactPoint.Z - FromPoint.Z) > SameFaceTolerance)
+			{
+				break;
+			}
+
+			Run = StepUU * Step;
+		}
+
+		if (Run > BestRun)
+		{
+			BestRun = Run;
+			OutDirection = Direction.GetSafeNormal();
+		}
+	}
+
+	return BestRun;
+}
+
+void ATraceCore::TickTurnoverRepro()
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority())
+	{
+		return;
+	}
+
+	const float Now = GetServerTimeSeconds();
+
+	// --- Arm ---------------------------------------------------------------------------------------
+	if (!bTurnoverReproArmed)
+	{
+		const int32 Requested = TraceModeBTurnoverReproShots();
+		if (Requested <= 0 || bTurnoverReproReported)
+		{
+			return;
+		}
+
+		// The same settled-half gate Trace.ModeB.Verify uses, and for the same reason: arming during
+		// the pre-match window puts the first shot on the kickoff frame, which cancels it and makes the
+		// harness report on a rule that never ran.
+		const ATraceGameState* GameState = World->GetGameState<ATraceGameState>();
+		if (!IsModeB() || GameState == nullptr
+			|| GameState->TraceMatchState != ETraceMatchState::InProgress
+			|| GameState->IsHalfTimeBreak()
+			|| !IsValid(Carrier) || !Carrier->IsAlive() || bLoose)
+		{
+			return;
+		}
+
+		FVector TopPoint = FVector::ZeroVector;
+		FVector UnusedWallPoint = FVector::ZeroVector;
+		FVector UnusedWallNormal = FVector::ZeroVector;
+		if (!FindVerificationSurfaces(TopPoint, UnusedWallPoint, UnusedWallNormal))
+		{
+			bTurnoverReproReported = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBTurnoverRepro] REFUSED: no raised cover with a flat top anywhere in the middle ")
+				TEXT("of the pitch, so there is nothing to graze. The harness is NOT reporting a pass - it ")
+				TEXT("could not run."));
+			return;
+		}
+
+		FVector GrazeDirection = FVector::ForwardVector;
+		const double Extent = MeasureTopFaceExtent(TopPoint, GrazeDirection);
+
+		// The graze needs a face long enough for the Core to descend onto it INSIDE the face rather than
+		// sailing off the far edge. Refusing loudly is the honest answer; a shot fired at a 40 uu ledge
+		// would miss and the run would report "no mid-air turnovers" while having tested nothing.
+		if (Extent < 240.0)
+		{
+			bTurnoverReproReported = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBTurnoverRepro] REFUSED: the flat top at %s runs only %.0f uu, which is too ")
+				TEXT("short to graze across. The harness is NOT reporting a pass - it could not run."),
+				*TopPoint.ToCompactString(), Extent);
+			return;
+		}
+
+		bTurnoverReproArmed = true;
+		TurnoverReproShotsLeft = FMath::Clamp(Requested, 1, 100);
+		TurnoverReproTopPoint = TopPoint;
+		TurnoverReproGrazeDirection = GrazeDirection;
+		TurnoverReproTopExtent = Extent;
+		TurnoverReproGrazeShots = 0;
+		TurnoverReproDropShots = 0;
+		TurnoverReproSkipped = 0;
+		TurnoverReproMidAirAtStart = SurfaceStats.MidAirTurnovers;
+		TurnoverReproLandedAtStart = SurfaceStats.LandedTurnovers;
+		TurnoverReproRejectedAtStart = SurfaceStats.GlancingContactsRejected;
+		TurnoverReproNextShotTime = Now + 1.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBTurnoverRepro] ===== spec v13 §8: %d shots across the flat top at %s (the face ")
+			TEXT("runs %.0f uu along %s) | landing rule = %s | mid-air test: faster than %.0f uu/s AND ")
+			TEXT("shallower than %.0f deg ====="),
+			TurnoverReproShotsLeft, *TopPoint.ToCompactString(), Extent,
+			*GrazeDirection.ToCompactString(),
+			(!TraceModeBLegacyLandingRule())
+				? TEXT("v13 (an actual landing)") : TEXT("PRE-v13 (any upward normal) - THE BUG, ARMED"),
+			CVarModeBMidAirTurnoverSpeed.GetValueOnAnyThread(),
+			CVarModeBMidAirTurnoverDegrees.GetValueOnAnyThread());
+		return;
+	}
+
+	// --- Report and stop ---------------------------------------------------------------------------
+	if (TurnoverReproShotsLeft <= 0)
+	{
+		if (bTurnoverReproReported)
+		{
+			return;
+		}
+
+		// Wait for the last shot to actually resolve before judging it. A tally printed while a Core is
+		// still in the air is a tally that is missing its last result.
+		if (bLoose)
+		{
+			return;
+		}
+
+		bTurnoverReproReported = true;
+
+		const int32 MidAir = SurfaceStats.MidAirTurnovers - TurnoverReproMidAirAtStart;
+		const int32 Landed = SurfaceStats.LandedTurnovers - TurnoverReproLandedAtStart;
+		const int32 Rejected = SurfaceStats.GlancingContactsRejected - TurnoverReproRejectedAtStart;
+
+		// TWO CLAUSES, and the second is what stops this from being a harness that passes by doing
+		// nothing. Zero mid-air turnovers is trivially achievable by never turning the Core over at
+		// all, which would be a far worse bug than the one under repair, so the run must ALSO show
+		// ordinary landings still handing possession over.
+		const bool bNoMidAir = (MidAir == 0);
+		const bool bStillTurningOver = (Landed > 0);
+		const bool bPass = bNoMidAir && bStillTurningOver;
+
+		const FString Detail = FString::Printf(
+			TEXT("%d shots (%d grazes across the top, %d drops onto the floor, %d skipped) | MID-AIR ")
+			TEXT("TURNOVERS %d (must be 0) | landed turnovers %d (must be > 0, or the fix has simply ")
+			TEXT("switched the rule off) | glancing contacts refused a landing %d | landing rule = %s"),
+			TurnoverReproGrazeShots + TurnoverReproDropShots,
+			TurnoverReproGrazeShots, TurnoverReproDropShots, TurnoverReproSkipped,
+			MidAir, Landed, Rejected,
+			(!TraceModeBLegacyLandingRule())
+				? TEXT("v13 (an actual landing)") : TEXT("PRE-v13 (any upward normal) - THE BUG, ARMED"));
+
+		if (bPass)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[ModeBTurnoverRepro] PASS: %s"), *Detail);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBTurnoverRepro] FAIL: %s"), *Detail);
+		}
+
+		// SPEC v13 §5's live number, printed here because this is the one scripted run that reliably
+		// puts the Core in the air with ten players chasing it. The rule itself is asserted by
+		// Trace.ModeB.ContestTest against the same selection function; this says how often a real match
+		// actually reaches the situation the note is about, which no unit check can.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBTurnoverRepro] magnet during this run (spec v13 §5): %d frames with somebody in ")
+			TEXT("range (%d uncontested, %d CONTESTED, %d of those cross-team) | %d contests | largest set ")
+			TEXT("%d | %d target switches | %d switches refused by the %.0f uu hysteresis"),
+			CatchStats.UncontestedFrames + CatchStats.ContestedFrames,
+			CatchStats.UncontestedFrames, CatchStats.ContestedFrames, CatchStats.CrossTeamContestedFrames,
+			CatchStats.Contests, CatchStats.MaxContenders, CatchStats.TargetSwitches,
+			CatchStats.HysteresisHolds, TraceModeBTuning::CatchContestHysteresis());
+		return;
+	}
+
+	// --- Fire the next shot ------------------------------------------------------------------------
+	//
+	// One at a time, and only once the previous one has resolved: two Cores in the air at once is not a
+	// state this game has, and a shot fired into a loose Core would be a state lock refusal counted as
+	// a result.
+	if (Now < TurnoverReproNextShotTime || bLoose || bCoreStateLocked)
+	{
+		return;
+	}
+
+	if (!IsValid(Carrier) || !Carrier->IsAlive())
+	{
+		return;   // Between possessions. Wait; the shot is not lost.
+	}
+
+	const ETraceTeam FromTeam = Carrier->GetTeam();
+	const bool bGrazeShot = ((TurnoverReproGrazeShots + TurnoverReproDropShots) % 2) == 0;
+
+	FVector LaunchPoint = FVector::ZeroVector;
+	FVector LaunchVelocity = FVector::ZeroVector;
+
+	if (bGrazeShot)
+	{
+		// THE SHOT THAT REPRODUCES THE BUG.
+		//
+		// A flat, fast throw that meets the top face at a few degrees - the shape a player produces
+		// throwing over cover. The numbers are derived from the Core's own gravity rather than guessed,
+		// so the shot still lands on the face if the weight model is retuned:
+		//
+		//   the Core is released HeightAboveFace above the face with NO vertical velocity, so it
+		//   contacts after t = sqrt(2h/g) seconds and d = V*t uu of travel. Placing the launch point
+		//   d - Extent/2 back from the probe point puts the contact half way along the face, which is
+		//   the furthest possible from either edge.
+		constexpr double HeightAboveFace = 40.0;
+		constexpr double GrazeSpeed = 1400.0;
+
+		const double GravityMagnitude = FMath::Abs(static_cast<double>(GetThrowGravityZ(World)));
+		const double FallTime = (GravityMagnitude > 1.0)
+			? FMath::Sqrt(2.0 * HeightAboveFace / GravityMagnitude) : 0.2;
+		const double TravelToContact = GrazeSpeed * FallTime;
+
+		const double Back = TravelToContact - FMath::Min(TurnoverReproTopExtent * 0.5, TravelToContact * 0.75);
+
+		LaunchPoint = TurnoverReproTopPoint
+			- TurnoverReproGrazeDirection * Back
+			+ FVector(0.0, 0.0, TraceModeBTuning::CollisionRadius + HeightAboveFace);
+		LaunchVelocity = TurnoverReproGrazeDirection * GrazeSpeed;
+	}
+	else
+	{
+		// THE CONTROL. A throw dropped straight onto open floor, well away from the cover, which spec
+		// v6 §4.2 says must turn over. If this stops firing, the "fix" has broken the rule instead of
+		// narrowing it, and the tally says so on the same line as the graze result.
+		const FBox FieldBox = [World]() -> FBox
+		{
+			if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World))
+			{
+				return Arena->GetFieldBounds();
+			}
+			return FBox(ForceInit);
+		}();
+
+		const FVector Centre = (FieldBox.IsValid != 0) ? FieldBox.GetCenter() : FVector::ZeroVector;
+		const double FloorZ = (FieldBox.IsValid != 0) ? FieldBox.Min.Z : 0.0;
+
+		LaunchPoint = FVector(Centre.X, Centre.Y, FloorZ + 900.0);
+		LaunchVelocity = FVector(0.0, 0.0, -1500.0);
+	}
+
+	// The launch point has to be in open air, or the shot tests whatever it started inside.
+	{
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreReproClear), /*bTraceComplex=*/false, this);
+		Params.AddIgnoredActor(this);
+
+		FHitResult ClearHit;
+		if (World->SweepSingleByChannel(ClearHit, LaunchPoint, LaunchPoint, FQuat::Identity, ECC_WorldStatic,
+			FCollisionShape::MakeSphere(TraceModeBTuning::CollisionRadius), Params))
+		{
+			++TurnoverReproSkipped;
+			--TurnoverReproShotsLeft;
+			TurnoverReproNextShotTime = Now + 0.5f;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBTurnoverRepro] shot SKIPPED: the launch point %s is inside %s."),
+				*LaunchPoint.ToCompactString(), *GetNameSafe(ClearHit.GetActor()));
+			return;
+		}
+	}
+
+	if (!DebugLaunchLoose(LaunchPoint, LaunchVelocity, FromTeam, /*bAsThrow=*/true))
+	{
+		++TurnoverReproSkipped;
+		--TurnoverReproShotsLeft;
+		TurnoverReproNextShotTime = Now + 0.5f;
+		UE_LOG(LogTraceGame, Warning, TEXT("[ModeBTurnoverRepro] shot SKIPPED: the launch was refused."));
+		return;
+	}
+
+	(bGrazeShot ? TurnoverReproGrazeShots : TurnoverReproDropShots)++;
+	--TurnoverReproShotsLeft;
+	TurnoverReproNextShotTime = Now + 2.5f;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeBTurnoverRepro] shot %d/%d: a %s throw %s from %s at %.0f uu/s (%d left)"),
+		TurnoverReproGrazeShots + TurnoverReproDropShots,
+		TurnoverReproGrazeShots + TurnoverReproDropShots + TurnoverReproShotsLeft + TurnoverReproSkipped,
+		*TraceTeamName(FromTeam).ToString(),
+		bGrazeShot ? TEXT("GRAZING the top of cover") : TEXT("DROPPED onto open floor"),
+		*LaunchPoint.ToCompactString(), LaunchVelocity.Size(), TurnoverReproShotsLeft);
 }
 
 bool ATraceCore::GetLooseCoreInterceptPoint(float LeadSeconds, FVector& OutPoint) const

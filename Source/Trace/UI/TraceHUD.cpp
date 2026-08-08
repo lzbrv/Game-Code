@@ -1278,6 +1278,69 @@ void ATraceHUD::DrawHealthAndDash()
 		RowY -= (RowH + RowGap);
 	}
 
+	// ---- Throw charge (spec v13 §6) -------------------------------------------------------------
+	//
+	// Verbatim: "The longer the player holds down, the more momentum the core has... So if the player
+	// just clicks the throw button it will throw with very low momentum." A charge you cannot see is a
+	// charge you cannot aim — an instant click throws at 15% and a full hold at 100%, and without a
+	// meter the difference reads as the throw being wildly inconsistent rather than as a skill.
+	//
+	// LOCAL AND INSTANT, WHICH IS THE REQUIREMENT AND NOT AN OPTIMISATION. Every number here comes
+	// from ATraceCore's PREDICTED accessors, which run off a clock started on the frame the button
+	// went down on this machine. A meter fed by replicated state would lag the player's own finger by
+	// their ping, so they would be aiming a power they are being shown late. The THROW is still
+	// resolved entirely on the server from the server's own copy of the hold; the worst this
+	// prediction can do is draw a meter for a throw the server then refuses on cooldown.
+	//
+	// IsThrowCharging() is false for a bot by construction, so this is the local player's meter only
+	// and there is no mode test needed beyond the Core existing — mode A never starts a charge.
+	{
+		ATraceCore* ChargeCore = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
+		if (ChargeCore != nullptr && ChargeCore->IsThrowCharging())
+		{
+			const float Alpha = FMath::Max(0.f, ChargeCore->GetThrowChargeAlpha());
+			const float Power = ChargeCore->GetThrowChargeScaleNow();
+			const bool  bFull = (Alpha >= 1.f);
+
+			const FString ChargeLabel(TEXT("THROW"));
+			DrawTextLeft(ChargeLabel, bFull ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+				Margin, VCenterTextY(ChargeLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+			// Winding up wears the team tint dimly; the instant it is FULL it snaps to Good and pulses
+			// at the same 12 rad/s every other "act now" state on this HUD uses. That transition is the
+			// single most useful thing the meter does, because past full the charge clamps and holding
+			// longer buys nothing — the player needs to know to let go, not to keep holding.
+			const FLinearColor ChargeColor = bFull
+				? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * FMath::Sin(Now * 12.f))
+				: TraceHUDStyle::Shade(TeamTint, 0.75f, 0.1f);
+
+			const float MeterX = Margin + LabelW;
+			const float MeterW = BarW - LabelW;
+			DrawMeter(MeterX, RowY, MeterW, RowH, FMath::Min(Alpha, 1.f), ChargeColor);
+
+			// THE FLOOR TICK. An instant click is not zero power (15%), and a meter that starts empty
+			// implies it is — a player would read a fast tap as "the throw did not happen" rather than
+			// as "the throw was weak", which is the exact misreading the floor exists to prevent. So the
+			// bar carries a mark at the floor: below it is unreachable, and that is worth showing once
+			// rather than explaining never.
+			const float FloorFraction = FMath::Clamp(ATraceCore::GetThrowChargeScaleForHold(0.f), 0.f, 1.f);
+			DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.55f),
+				MeterX + (MeterW * FloorFraction), RowY, FMath::Max(1.f, 1.f * UIScale), RowH);
+
+			// The POWER, not the elapsed hold: momentum is what the player is choosing, and seconds are
+			// a number they would have to convert. Printed from the same published curve the throw
+			// itself releases at (GetThrowChargeScaleForHold), so the readout cannot drift from the game.
+			const FString ChargeText = bFull
+				? FString(TEXT("FULL"))
+				: FString::Printf(TEXT("%.0f%%"), 100.f * FMath::Max(0.f, Power));
+			DrawTextLeft(ChargeText, bFull ? TraceHUDStyle::Good : TraceHUDStyle::InkDim,
+				Margin + BarW + (10.f * UIScale),
+				VCenterTextY(ChargeText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+			RowY -= (RowH + RowGap);
+		}
+	}
+
 	// ---- Parry (spec §3), where BOOST used to be ------------------------------------------------
 	//
 	// BOOST IS DELETED (spec §1: "remove boost from the game entirely"), and its row is gone with it,
@@ -1406,10 +1469,8 @@ void ATraceHUD::DrawHealthAndDash()
 	// ---- Health -----------------------------------------------------------------------------
 	if (const UTraceHealthComponent* HealthComp = LocalChar->Health)
 	{
-		const float Percent = FMath::Clamp(HealthComp->GetHealthPercent(), 0.f, 1.f);
-		const FLinearColor Fill = TraceHUDStyle::LerpColor(TraceHUDStyle::Danger, TraceHUDStyle::Good, Percent);
-
-		DrawMeter(Margin, HealthY, BarW, HealthH, Percent, Fill);
+		// The bar, the regen climb and the regen countdown. See DrawHealthBar().
+		DrawHealthBar(HealthComp, Margin, HealthY, BarW, HealthH);
 
 		const FString HealthText = FString::Printf(TEXT("%d"), FMath::CeilToInt(HealthComp->Health));
 		DrawTextRight(HealthText, TraceHUDStyle::Ink,
@@ -1435,6 +1496,124 @@ void ATraceHUD::DrawHealthAndDash()
 				VCenterTextY(InvulnText, FontSmall, UIScale, HealthY, HealthH), FontSmall, UIScale);
 		}
 	}
+}
+
+void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, float Y, float W, float H)
+{
+	if (HealthComp == nullptr)
+	{
+		return;
+	}
+
+	const float Actual = FMath::Clamp(HealthComp->GetHealthPercent(), 0.f, 1.f);
+
+	// ---- Ease the DRAWN width. See DrawnHealthFraction in the header for why this is asymmetric. --
+	//
+	// Regeneration reaches a client as a replicated float at the actor's net update rate, so the raw
+	// value arrives in steps of roughly 0.1 HP to 0.5 HP. Drawing those steps directly makes healing
+	// look like packet loss. Easing UP hides the steps; damage still snaps, because a bar that
+	// glides down after a body shot is a bar that lies about how close to death the player is.
+	ATraceCharacter* HealthPawn = LocalChar.Get();
+	const bool bSamePawn = (DrawnHealthPawn.Get() == HealthPawn) && (HealthPawn != nullptr);
+
+	// Clamped: a hitch (or the pause menu, which stops the world clock) must not teleport the ease.
+	const float DrawDelta = (bSamePawn && LastHealthDrawTime >= 0.f)
+		? FMath::Clamp(Now - LastHealthDrawTime, 0.f, 0.25f)
+		: 0.f;
+	LastHealthDrawTime = Now;
+	DrawnHealthPawn = HealthPawn;
+
+	if (!bSamePawn || DrawnHealthFraction < 0.f || Actual <= DrawnHealthFraction)
+	{
+		DrawnHealthFraction = Actual;
+	}
+	else
+	{
+		DrawnHealthFraction = FMath::FInterpTo(DrawnHealthFraction, Actual, DrawDelta, 9.f);
+	}
+
+	const float Fraction = FMath::Clamp(DrawnHealthFraction, 0.f, 1.f);
+	const FLinearColor BarColor = TraceHUDStyle::LerpColor(TraceHUDStyle::Danger, TraceHUDStyle::Good, Fraction);
+	DrawMeter(X, Y, W, H, Fraction, BarColor);
+
+	// ---- Regeneration (spec v13 §1) -------------------------------------------------------------
+	//
+	// Negative is "nothing to say": at full health, dead, or the mechanic switched off. The bar goes
+	// back to being exactly what it was before this pass, which is what it should be at 100/100.
+	const float SecondsUntil = HealthComp->GetSecondsUntilRegen();
+	if (SecondsUntil < 0.f)
+	{
+		return;
+	}
+
+	const bool bRegenerating = HealthComp->IsRegenerating();
+	const float Pulse = 0.5f + 0.5f * FMath::Sin(Now * 7.f);
+	const float FillW = Fraction * W;
+
+	// A fuse UNDERNEATH the bar, filling left to right over the delay and solid while regeneration
+	// runs.
+	//
+	// THE FUSE IS THE TEACHING, not the climb. The climb only tells a player that healing exists;
+	// the fuse tells them how long they have to stay out of sight for it to start, which is the
+	// behaviour the spec actually wants out of this feature. It hangs off the health bar rather than
+	// taking a row in the ability stack because every row up there is conditional and shuffles as
+	// parry and slide come and go — this has to be in the one place that never moves.
+	//
+	// *** IT IS BELOW THE BAR BECAUSE ON THE BAR IT WAS INVISIBLE. *** The first version drew it on
+	// the bar's own bottom edge, and the screenshot of a player at 60 HP with 4.0 s to go showed
+	// nothing at all: the fill at 60% is already a yellow-green, the fuse was green, and a green
+	// sliver inside a green fill is not a readout. Its own strip on its own dark trough is the only
+	// arrangement that reads at every health level, which is the point — the countdown matters most
+	// when you are nearly dead, i.e. exactly when the fill behind it would be red.
+	const float FuseH = FMath::Max(3.f, 4.f * UIScale);
+	const float FuseY = Y + H + FMath::Max(2.f, 3.f * UIScale);
+	const float Delay = FMath::Max(0.01f, TraceHealthRegen::GetDelaySeconds());
+	const float FuseFraction = bRegenerating ? 1.f : FMath::Clamp(1.f - (SecondsUntil / Delay), 0.f, 1.f);
+
+	const float FuseEdge = FMath::Max(1.f, 1.f * UIScale);
+	DrawRect(TraceHUDStyle::Shadow, X - FuseEdge, FuseY - FuseEdge, W + FuseEdge * 2.f, FuseH + FuseEdge * 2.f);
+	DrawRect(TraceHUDStyle::Trough, X, FuseY, W, FuseH);
+	if (FuseFraction > 0.f)
+	{
+		DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, bRegenerating ? (0.6f + 0.4f * Pulse) : 0.85f),
+			X, FuseY, W * FuseFraction, FuseH);
+	}
+
+	if (bRegenerating)
+	{
+		// A bright crest riding the leading edge of the fill, plus a lit top rail across it. Between
+		// them they make the bar read as MOVING at a rate the eye can see, which the underlying 10
+		// HP/s (0.1 of the bar per second) genuinely does not on its own.
+		//
+		// Lifted most of the way to Ink rather than left as Good, for the same contrast reason the
+		// fuse moved: at high health the fill IS Good, and a Good-coloured crest on it disappears
+		// precisely as the player approaches the top of the bar.
+		const FLinearColor Crest = TraceHUDStyle::LerpColor(TraceHUDStyle::Good, TraceHUDStyle::Ink, 0.7f);
+
+		const float CrestW = FMath::Min(FMath::Max(4.f, 7.f * UIScale), FMath::Max(0.f, W - FillW) + (7.f * UIScale));
+		const float CrestX = FMath::Clamp(X + FillW - (CrestW * 0.5f), X, X + W - CrestW);
+		DrawRect(TraceHUDStyle::WithAlpha(Crest, 0.45f + 0.5f * Pulse), CrestX, Y, CrestW, H);
+
+		const float RailH = FMath::Max(1.f, 2.f * UIScale);
+		DrawRect(TraceHUDStyle::WithAlpha(Crest, 0.25f + 0.35f * Pulse), X, Y, FillW, RailH);
+	}
+
+	// ---- The words, to the right of the bar, where every other row in this stack puts its status --
+	//
+	// Spelled out rather than left to the colour, because "break line of sight and you heal" is a
+	// RULE the player has to be taught once, and a green shimmer teaches nobody anything. The rate
+	// is printed with it so the player can judge whether waiting is worth it against pushing.
+	const FString RegenText = bRegenerating
+		? FString::Printf(TEXT("REGEN  +%.0f/s"), TraceHealthRegen::GetRatePerSecond())
+		: FString::Printf(TEXT("REGEN IN  %.1f"), SecondsUntil);
+
+	const FLinearColor RegenColor = bRegenerating
+		? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * Pulse)
+		: TraceHUDStyle::InkDim;
+
+	DrawTextLeft(RegenText, RegenColor,
+		X + W + (10.f * UIScale),
+		VCenterTextY(RegenText, FontSmall, UIScale, Y, H), FontSmall, UIScale);
 }
 
 void ATraceHUD::DrawChargePips(float X, float Y, float W, float H, int32 Charges, int32 MaxCharges,

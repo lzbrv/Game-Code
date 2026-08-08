@@ -70,8 +70,37 @@ enum class ETraceInputAction : uint8
 	 * path branches on IsKnifeEquipped(), so mouse1 shoots with the gun and swings with the knife.
 	 * Adding a second "Swing" bind would give the player two keys for one verb and a way to put the
 	 * swing on a key the bots and the dead-respawn path do not use.
+	 *
+	 * SPEC v13 §2 KEPT THIS ACTION rather than deleting it, and the [ASSUMPTION] it was allowed to
+	 * fail is "if it complicates the state machine, remove it and say so". It does not complicate
+	 * anything: EquipKnife and EquipGun below are DIRECT SELECT and this is a TOGGLE, and all three
+	 * end up in the same UTraceWeaponComponent::RequestEquip(Desired) call — a toggle is nothing but
+	 * "the other one". There is no second state, no mode flag and no ordering between them. A player
+	 * who prefers one key keeps F; a player who wants 1 and 2 has them.
 	 */
 	SwapWeapon,
+
+	/**
+	 * Spec v13 §2 — 1 = knife, 2 = gun. Verbatim: "Change default keybinds for switching weapons to
+	 * be: 1 (switch to knife) and 2 (switch to gun)."
+	 *
+	 * THIS IS AN INPUT-MODEL CHANGE, NOT A REBIND, and that is the whole reason there are two new
+	 * enumerators here rather than a new default key on SwapWeapon. SwapWeapon answers "give me the
+	 * other weapon"; these answer "give me THIS weapon". Rebinding the toggle to 1 would have made 1
+	 * and 2 do the same thing (each would swap), which is the opposite of what was asked.
+	 *
+	 * DIRECT SELECT MEANS IDEMPOTENT: pressing 1 with the knife already out does nothing at all, and
+	 * in particular does not restart the 0.2 s pullout. The guard lives in
+	 * ATracePlayerController::OnEquipKnifeStarted/OnEquipGunStarted — see the comment there for why
+	 * the input layer is the right place for it and why it is still correct mid-pullout.
+	 *
+	 * APPENDED, never inserted, for the reason SwapWeapon's comment gives above: ETraceInputAction
+	 * is the index into UTraceUserSettings::Bindings, so anything inserted higher renumbers every
+	 * action a saved TraceUserSettings.ini refers to by position. The .ini is keyed by ConfigId and
+	 * survives either way; the in-memory table is what would tear.
+	 */
+	EquipKnife,
+	EquipGun,
 
 	Count UMETA(Hidden)
 };

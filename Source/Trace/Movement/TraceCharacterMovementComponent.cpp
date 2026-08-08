@@ -950,9 +950,15 @@ float UTraceCharacterMovementComponent::GetKnifeMoveSpeedMultiplier() const
 	// Floored at 1.0: a "knife profile" that made the player SLOWER would be a config typo silently
 	// inverting the design, and there is no reading of the spec that wants it.
 	//
-	// FLAGGED, NOT FIXED (spec v12 §3): CarrierSpeedMultiplier is 1.30 because the user previously
-	// asked for the carrier to MATCH the knife. Dropping the knife to 1.22 breaks that parity and
-	// leaves the carrier faster than the knife. Only the knife was asked for, so only the knife moved.
+	// PARITY WITH THE CARRIER, restored (spec v13 §3). v12 dropped the knife to 1.22 while
+	// CarrierSpeedMultiplier stayed at 1.30 — that was flagged rather than silently changed, because
+	// only the knife had been asked for, and it left the carrier faster than the knife. The user then
+	// asked for the carrier to "match the new knife speed", so both are now 1.22 (800 -> 976 uu/s)
+	// and the parity holds again. Verified live: the grounded Core holder measured 976 uu/s across 54
+	// separate throws.
+	//
+	// If either number moves again, MOVE BOTH or re-flag it. A comment claiming a value the build
+	// does not ship is its own defect — this one said 1.30 for a whole pass after it became 1.22.
 	return FMath::Clamp(TraceMoveKnob::Float(TEXT("KnifeMoveSpeedMultiplier"), 1.22f), 1.f, 3.f);
 }
 

@@ -90,6 +90,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CollisionShape.h"       // v13 §7 — the wall fitter's probe shape crosses this interface
 #include "Components/SceneComponent.h"
 #include "Math/Color.h"
 #include "UObject/ObjectMacros.h"
@@ -470,6 +471,32 @@ public:
 	/** v7 §3: the lethal (and drawn) HEIGHT, in uu, centred on the carrier's mid-model. 190 -> ~63. */
 	static float GetTraceTrailHeight();
 
+	/**
+	 * v13 §7: THE WIDEST DISTANCE FROM A TRAIL POINT AT WHICH ANYTHING IS DRAWN OR ANYTHING KILLS.
+	 *
+	 * This is NOT GetTraceTrailRadius(), and believing that it was is why the previous pass's wall
+	 * fitter could not close the bug. TrailRadius is the ribbon's half width along one axis. The
+	 * geometry actually placed on screen reaches considerably further than that at a corner, from two
+	 * sources that stack:
+	 *
+	 *   1. THE JOINT OVERLAP. A ribbon element is a BOX, and at an interior joint PlaceRibbon runs it
+	 *      one TrailRadius PAST the sample point along its own axis so the wedge on the outside of a
+	 *      corner closes. That box's far corner therefore sits TrailRadius x sqrt(2) from the joint —
+	 *      31.8uu at the shipping 22.5, not 22.5.
+	 *   2. THE SPLINE. RebuildRibbon resamples the polyline through a Catmull-Rom curve, and a
+	 *      Catmull-Rom bulges OUTSIDE its control polygon at a turn. For the worst case a running
+	 *      carrier can produce — a 90-degree corner at one TrailPointSpacing per leg — the curve
+	 *      overshoots the corner vertex by 0.074 x spacing, i.e. ~4.4uu at 60uu spacing.
+	 *
+	 * So the drawn trace reaches ~36uu from the polyline where the lethal column reaches 22.5, and a
+	 * fitter that cleared 22.5 left the remaining ~14uu of ribbon buried in the corner it was
+	 * supposedly fixing. Everything that asks "how much room does the trace need" must ask THIS.
+	 *
+	 * Trace.Trail.WallClip measures the real overhang off the placed components every frame
+	 * (FTraceClipSample::DrawnOutsideLethal), so this number is checked rather than trusted.
+	 */
+	static double GetTraceDrawnHalfReach();
+
 	// ------------------------------------------------------------------------------------------
 	// SPEC v10 §2 — THE WHOLE MODEL, NOT THE CAPSULE.
 	//
@@ -699,6 +726,66 @@ public:
 	void MeasureDrawnVolume(double& OutMaxHalfWidth, double& OutMaxHalfHeight,
 		double& OutWorstUncovered, int32& OutVisiblePieces) const;
 
+	/**
+	 * v13 §7: distance in uu from a world point to the nearest VISIBLE replicated ribbon piece, 0 when
+	 * the point is inside one. -1 when nothing is drawn at all.
+	 *
+	 * The question "is there ribbon HERE, on screen, right now" asked of the placed components rather
+	 * than of the point array — which is the only way to check the standing invariant against what a
+	 * player can actually see. Trace.Trail.WallFitLive asks it at the exact spot it then dashes a pawn
+	 * through, so "died where it was drawn" and "lived where it was not" are claims about the same
+	 * geometry the eye is looking at.
+	 *
+	 * The owner-only predicted stub is excluded, as everywhere else: it is deliberately drawn ahead of
+	 * anything lethal and only its own carrier can see it.
+	 */
+	double DistanceToDrawnRibbon(const FVector& At) const;
+
+	/**
+	 * ONE RENDERED BOX OF THE LEVEL, flattened out of whatever component draws it.
+	 *
+	 * Flattened rather than held as components for two reasons, both of which cost this pass a run.
+	 * First, most of the arena is pooled into UInstancedStaticMeshComponents, so a component's own
+	 * transform is the POOL's and describes nothing a player can see — the instances have to be
+	 * expanded or the measurement silently tests a few dozen boxes stacked at the origin. Second, a
+	 * flat array with precomputed world bounds is what makes a per-frame lattice over the whole trace
+	 * affordable: the trace is ~1200uu long and the arena is thousands of boxes, so almost all of the
+	 * work is rejecting the ones that are nowhere near it.
+	 *
+	 * v13 §7: THIS IS NO LONGER A MEASUREMENT-ONLY TYPE. The wall fitter itself now runs against these
+	 * boxes, because the thing the trace was clipping into has no collision at all — see
+	 * FLevelVisualIndex in the .cpp. It therefore has to compile in Shipping, so it lives OUTSIDE the
+	 * !UE_BUILD_SHIPPING block below.
+	 */
+	struct FTraceClipBox
+	{
+		FTransform Transform;
+		FVector LocalCentre = FVector::ZeroVector;
+		FVector LocalExtent = FVector::ZeroVector;
+		FVector Scale = FVector::OneVector;
+		FBox WorldBounds = FBox(ForceInit);
+		FString Name;
+	};
+
+	/**
+	 * v13 §7: gather every RENDERED box of the arena, expanding instanced pools. Used both by the
+	 * fitter (through the cached index) and by Trace.Trail.WallClip's measurement.
+	 *
+	 * Restricted to the arena builder's own actors on purpose. The endzones and the mode-B goals are
+	 * enormous visible volumes players are supposed to run straight through, and the characters' own
+	 * ribbon pools are themselves visible static meshes. Neither is a wall.
+	 */
+	static void GatherRenderedLevelBoxes(UWorld* World, TArray<FTraceClipBox>& Out, int32& OutSkipped);
+
+	/**
+	 * v13 §7: drop the fitter's cached copy of the rendered arena so the next query rebuilds it.
+	 * Called when a world goes away and by Trace.Trail.WallFitRebuild.
+	 */
+	static void InvalidateLevelVisualIndex();
+
+	/** v13 §7: what the fitter's rendered-geometry index currently holds, for the harness's report. */
+	static void GetLevelVisualIndexStats(int32& OutBoxes, int32& OutCells, bool& OutBuilt);
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * SPEC v12 §6 VERIFICATION. How far the trace is currently INSIDE the level, measured on both
@@ -749,27 +836,74 @@ public:
 		int32 LethalSamplesTotal = 0;
 		int32 VisiblePieces = 0;
 		int32 LethalPoints = 0;
-	};
 
-	/**
-	 * ONE RENDERED BOX OF THE LEVEL, flattened out of whatever component draws it.
-	 *
-	 * Flattened rather than held as components for two reasons, both of which cost this pass a run.
-	 * First, most of the arena is pooled into UInstancedStaticMeshComponents, so a component's own
-	 * transform is the POOL's and describes nothing a player can see — the instances have to be
-	 * expanded or the measurement silently tests a few dozen boxes stacked at the origin. Second, a
-	 * flat array with precomputed world bounds is what makes a per-frame lattice over the whole trace
-	 * affordable: the trace is ~1200uu long and the arena is thousands of boxes, so almost all of the
-	 * work is rejecting the ones that are nowhere near it.
-	 */
-	struct FTraceClipBox
-	{
-		FTransform Transform;
-		FVector LocalCentre = FVector::ZeroVector;
-		FVector LocalExtent = FVector::ZeroVector;
-		FVector Scale = FVector::OneVector;
-		FBox WorldBounds = FBox(ForceInit);
-		FString Name;
+		// -----------------------------------------------------------------------------------------
+		// v13 §7: THE STANDING INVARIANT, MEASURED IN BOTH DIRECTIONS, EVERY FRAME.
+		//
+		// "Lethal must equal drawn" was previously only asserted structurally ("there is one
+		// polyline"), which is true of where the trace GOES and says nothing about how much geometry
+		// each half puts around it. These two numbers close that hole, and they are the reason a fix
+		// that moves the ribbon out of a wall cannot leave a kill volume behind in it.
+		// -----------------------------------------------------------------------------------------
+
+		/**
+		 * Worst uu by which a point of DRAWN ribbon sits outside the LETHAL column — "visible but not
+		 * lethal", the bug that has already been reported and fixed once on this project.
+		 *
+		 * Non-zero is expected and is NOT a fix regression: the ribbon is boxes on a Catmull-Rom
+		 * resample of a polyline the trip test walks as straight segments, so it overhangs at every
+		 * corner. What matters is that it stays at the value GetTraceDrawnHalfReach() predicts — if
+		 * this ever exceeds that, the fitter is clearing less room than the drawing actually needs
+		 * and the wall-clip bug is back by arithmetic rather than by accident.
+		 */
+		double DrawnOutsideLethal = 0.0;
+		FVector DrawnOutsideLethalAt = FVector::ZeroVector;
+
+		/**
+		 * The same overhang measured VERTICALLY, and reported apart from the horizontal figure because
+		 * it is deliberate and the horizontal one is not.
+		 *
+		 * PlaceRibbon gives each element the UNION of its two ends' vertical bands (Height + |dZ|), so
+		 * an element spanning a climb stands proud of the lethal column at its ends on purpose — the
+		 * comment there is explicit that over-drawing a lethal boundary is the safe direction and
+		 * under-drawing it is a trap. Rolled into one number with the horizontal reach it made a
+		 * documented choice look like a fitter bug; measured on its own it is just a fact about stairs.
+		 */
+		double DrawnOutsideLethalVertical = 0.0;
+
+		/**
+		 * Drawn ribbon that lies PAST AN END of the lethal polyline rather than beside it.
+		 *
+		 * Almost entirely the one-frame rebuild lag: the ribbon is regenerated the tick after
+		 * TrailPoints changes, so on the frame the length trim drops a tail point the drawing still
+		 * covers the ~60uu that has just stopped killing. Worth reporting — it is a real, if brief,
+		 * "visible but not lethal" — but it is not a wall-clearance problem and no push allowance
+		 * affects it, so it must not be charged against the fitter's budget.
+		 */
+		double DrawnPastEnd = 0.0;
+
+		/**
+		 * Worst uu by which a point of the LETHAL column sits outside every visible ribbon piece —
+		 * "lethal but not visible", i.e. AN INVISIBLE KILL VOLUME. This is the worse direction and it
+		 * must stay at zero. Anything above the tolerance is a hard fail whatever the clip numbers say.
+		 */
+		double LethalOutsideDrawn = 0.0;
+		FVector LethalOutsideDrawnAt = FVector::ZeroVector;
+
+		/**
+		 * True when the worst undrawn lethal sample is within one TrailRadius of the FIRST or LAST
+		 * lethal point — i.e. it is the trace's own END CAP.
+		 *
+		 * The distinction is the whole diagnosis. The trip test's threshold is radial about a segment,
+		 * so the volume that kills bulges a half-disc of TrailRadius past each end of the polyline,
+		 * while PlaceRibbon deliberately keeps the two outer elements FLUSH with the first and last
+		 * point ("so the ribbon never extends past the polyline the server kills along"). Those two
+		 * correct-looking decisions disagree, and the disagreement is an undrawn lethal cap at the head
+		 * and the tail. That is a real defect and it is NOT this section's — a wall fix cannot cause it
+		 * and cannot cure it — so it has to be nameable rather than turning up as an unexplained number
+		 * that makes every arm look broken.
+		 */
+		bool bLethalOutsideDrawnIsEndCap = false;
 	};
 
 	/**
@@ -788,6 +922,15 @@ public:
 	/** Points appended purely because the direct chord was obstructed. Session totals, all carriers. */
 	static void GetWallFitStats(int32& OutRoutedAppends, int32& OutInsertedPoints, int32& OutUnroutable);
 	static void ResetWallFitStats();
+
+	/**
+	 * v13 §7: the PUSH's counters, kept apart from the router's above because they fix different
+	 * things. OutWorstResidual — how deep the trace still was after the best push available — is the
+	 * fitter's own account of what it failed to clear, and a report without it is a report that can
+	 * only say "I ran".
+	 */
+	static void GetWallFitPushStats(int32& OutPushes, int32& OutUnpushable, double& OutWorstPush,
+		double& OutWorstResidual);
 #endif
 
 private:
@@ -945,11 +1088,40 @@ private:
 	bool IsTrailVolumeClear(const FVector& From, const FVector& To) const;
 
 	/**
+	 * v13 §7: how far the trace's own volume, standing at At, is inside anything the player can SEE,
+	 * and the shortest horizontal push that would get it out.
+	 *
+	 * THIS IS THE HALF OF THE FIX THE PREVIOUS PASS DID NOT HAVE, and the reason its 12uu nudge was
+	 * fighting the wrong geometry. The arena's rendered structure is NoCollision meshes; collision is
+	 * separate, SMALLER invisible boxes behind them, and the emissive trim (the lip, the skirt, the
+	 * face bands, the corner ribs) protrudes 10-13uu past those boxes with no collision of any kind.
+	 * A physics query therefore reports clearance while the ribbon is visibly inside a glowing corner
+	 * rib — which is the report, verbatim. So the fitter now asks the RENDERED geometry.
+	 *
+	 * @param At          world position of the trace's column centre
+	 * @param Radius      horizontal clearance wanted — GetTraceDrawnHalfReach() plus margin, not
+	 *                    TrailRadius
+	 * @param HalfHeight  half the lethal column height; the query is a vertical capsule
+	 * @param OutPush     summed horizontal escape vector (a concave corner contributes two)
+	 * @return            deepest single penetration, 0 when clear
+	 */
+	double MeasureVisualPenetration(const FVector& At, double Radius, double HalfHeight,
+		FVector& OutPush) const;
+
+	/** The same question asked of the PHYSICS scene. Kept because not every map has an arena builder. */
+	double MeasureCollisionPenetration(const FVector& At, const FCollisionShape& Probe,
+		FVector& OutPush) const;
+
+	/**
 	 * Nudge one candidate point out of any geometry it is already inside, horizontally, by at most
 	 * GetWallFitMaxPush() uu — and only if the nudge actually reduces the penetration AND the moved
 	 * point is still in line of sight of where it started (so a thin wall can never be tunnelled
 	 * through, which would put the trace, and therefore the kill volume, on the far side of a wall
 	 * the player never crossed).
+	 *
+	 * v13 §7: it now clears the trace's whole DRAWN reach rather than its lethal half width, against
+	 * the RENDERED level as well as the physics scene, and relaxes over a few passes so a concave
+	 * corner with two faces resolves instead of sliding along the second one.
 	 */
 	FVector FitPointToWorld(const FVector& Candidate) const;
 

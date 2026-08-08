@@ -83,7 +83,8 @@ enum class ETraceScoringMode : uint8;
 //   * what mode B adds is one extra place the Core can be: LOOSE. bLoose is true from the moment a
 //     throw leaves the holder's hands until somebody takes it (or the reset timer fires).
 //   * LMB is mode-dependent. RequestPassInput(true) starts the 0.5 s hover-pass in mode A and
-//     THROWS in mode B, so every existing caller — a human's mouse, DoPassPressed, the bots'
+//     CHARGES A THROW in mode B (spec v13 §6 — the press winds the throw up, the RELEASE launches
+//     it instantly), so every existing caller — a human's mouse, DoPassPressed, the bots'
 //     ApplyPassInput — reaches the right verb without knowing the mode exists.
 //
 // WHAT THIS IS DELIBERATELY *NOT*. Spec v2 deleted a physical Core built from a
@@ -391,10 +392,104 @@ public:
 	 * never from anything a client sent — the same policy that deleted the old PerformPass, whose
 	 * whole payload was a client-supplied direction.
 	 *
+	 * @param HeldSeconds  SPEC v13 §6. How long the throw button was held, measured on the SERVER's
+	 *                     own clock (see RequestPassInput). Negative means "full charge" and is what
+	 *                     the diagnostics use, so a momentum measurement stays comparable with the
+	 *                     pre-v13 numbers.
 	 * @return true when a throw actually left. False for a wrong mode, a non-holder, a dead holder,
 	 *         a Core that is already loose, or a throw still on cooldown.
 	 */
-	bool ThrowFromHolder(ATraceCharacter* Thrower);
+	bool ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds = -1.f);
+
+	// --- SPEC v13 §6 — THE CHARGE-UP THROW ---------------------------------------------------------
+	//
+	// Verbatim: "When a player RELEASES the throw button, the core should instantly be released." /
+	// "The longer the player holds down, the more momentum the core has." / "Start by making a one
+	// second charge up time to reach the current core throw momentum" / "Charge time to throw momentum
+	// should be a linear correlation" / "So if the player just clicks the throw button it will throw
+	// with very low momentum".
+	//
+	// FOUR NUMBERS, ALL TUNABLE, and they are the four the note names:
+	//
+	//   TIME    GetThrowChargeSeconds()      — how long a full wind-up takes. 1.0 s, as asked.
+	//   FLOOR   GetThrowChargeFloor()        — the fraction an instant click gets. 0.15
+	//                                          ([ASSUMPTION]: "very low" but NOT zero, because a
+	//                                          zero-momentum throw drops at the player's feet and
+	//                                          reads as a bug, not as a weak throw).
+	//   MAX     GetThrowChargeMaxFraction()  — the ceiling on the NORMALISED HOLD when the clamp is
+	//                                          off, so an overcharge variant is reachable. 1.0 by
+	//                                          default, which makes a full hold exactly "the current
+	//                                          core throw momentum" and nothing stronger.
+	//   CLAMP   DoesThrowChargeClamp()       — whether holding PAST the charge time keeps adding.
+	//                                          Default on ([ASSUMPTION]: it clamps).
+	//
+	// ALL FOUR ARE UTraceSettings PROPERTIES, bound BY NAME, and the names are the settings page's own
+	// (CoreThrowChargeSeconds, CoreThrowChargeFloorFraction, CoreThrowChargeMaxFraction,
+	// bCoreThrowChargeClampsAtFull) with Config/DefaultGame.ini shipping values for all four. The ini
+	// wins. The arithmetic below is that file's, copied verbatim rather than reinterpreted.
+	//
+	// WHAT THE CHARGE SCALES, EXACTLY: the IMPULSE, and only the impulse. Spec v8 §4's inherited
+	// velocity — the thrower's own motion, vertical included — is added ON TOP at full strength and is
+	// NOT scaled by the charge. So a jumping instant-click still leaves with the whole jump in it (it
+	// simply has almost no impulse of its own), and a jumping full charge leaves with the jump plus a
+	// full-power impulse. See ComputeThrowLaunchVelocity, which is the one expression both the Core
+	// and the bot solver use.
+
+	/** MODE B, spec v13 §6. Seconds of hold that reach full throw momentum. UTraceSettings::CoreThrowChargeSeconds. */
+	static float GetThrowChargeSeconds();
+
+	/** MODE B, spec v13 §6. Impulse fraction an instant click throws with. UTraceSettings::CoreThrowChargeFloor. */
+	static float GetThrowChargeFloor();
+
+	/**
+	 * MODE B, spec v13 §6. Ceiling on the NORMALISED HOLD when the clamp is off — NOT a power ceiling.
+	 *
+	 * Power is always Floor + (1 - Floor) * t, so at 1.5 a 1.5 s hold throws at 1.43x, not 1.5x. That
+	 * is UTraceSettings::CoreThrowChargeMaxFraction's own definition, and it is followed rather than
+	 * re-derived: two definitions of "maximum charge" that differ by 5% is a disagreement nobody finds
+	 * until a designer wonders why the slider lies.
+	 */
+	static float GetThrowChargeMaxFraction();
+
+	/** MODE B, spec v13 §6. False lets a hold past the charge time keep adding momentum. */
+	static bool DoesThrowChargeClamp();
+
+	/**
+	 * MODE B, spec v13 §6. THE LINEAR MAP, published so nothing re-derives it.
+	 *
+	 * Power = Floor + (1 - Floor) * tCap, where t = HeldSeconds / ChargeSeconds and tCap is t capped at
+	 * 1 (clamping) or at GetThrowChargeMaxFraction() (not clamping). A negative @p HeldSeconds means
+	 * "full charge" and returns exactly 1.0 — the throw the game had before v13.
+	 *
+	 * The HUD charge meter, the bots' "charge for distance" solver and the throw itself all call this,
+	 * for the same reason SteerTowardCatchPoint is shared: a second copy of the curve is a second
+	 * answer, and the one the player sees would be the copy.
+	 */
+	static float GetThrowChargeScaleForHold(float HeldSeconds);
+
+	/** The inverse of the above: how long to hold for @p ChargeScale. Used by the bots. */
+	static float GetThrowHoldSecondsForScale(float ChargeScale);
+
+	/**
+	 * EVERY MACHINE, spec v13 §6. Is the LOCAL player winding a throw up right now?
+	 *
+	 * PREDICTED, not replicated, and that is the requirement rather than an optimisation: a charge
+	 * meter that waits for the server is a meter that lags the finger by the round trip, and a player
+	 * cannot aim a power they are shown late. The press starts a purely local clock on the owning
+	 * machine at the instant the button goes down; the THROW itself is still resolved entirely on the
+	 * server from the server's own copy of the hold (see RequestPassInput), so the prediction can
+	 * never launch anything or lie about where the Core went — the worst it can do is show a meter
+	 * for a throw the server refuses on cooldown.
+	 *
+	 * A bot's charge deliberately does NOT set this: it is the local PLAYER's meter.
+	 */
+	bool IsThrowCharging() const;
+
+	/** 0..1 wind-up progress for the HUD meter, or -1 when the local player is not charging. */
+	float GetThrowChargeAlpha() const;
+
+	/** Floor..Max — the momentum fraction a release right now would throw with. -1 when not charging. */
+	float GetThrowChargeScaleNow() const;
 
 	// --- Goals -----------------------------------------------------------------------------------
 
@@ -461,9 +556,75 @@ public:
 
 		/** Landings the at-rest probe found that the contact test alone would have missed. */
 		int32 RestProbeRescues = 0;
+
+		// --- SPEC v13 §8 counters. Verification only, never a rule. ---------------------------------
+
+		/**
+		 * Upward-facing contacts REFUSED as landings because the Core was not settling on them —
+		 * a graze across the flat top of a structure or the corner cove's treads, mid-flight.
+		 *
+		 * THIS IS THE BUG'S OWN COUNTER. Under the pre-v13 rule every one of these was a turnover,
+		 * which is precisely "the core is thrown and it turns over before it touches the ground".
+		 */
+		int32 GlancingContactsRejected = 0;
+
+		/**
+		 * Turnovers that fired on a FAST, SHALLOW arrival — the Core was still travelling above
+		 * Trace.ModeB.MidAirTurnoverSpeed and met the surface at less than
+		 * Trace.ModeB.MidAirTurnoverDegrees. That is a Core flying PAST something, not landing on it.
+		 *
+		 * THE NUMBER THE §8 REPRO READS, and it is deliberately a statement about the GEOMETRY OF THE
+		 * EVENT rather than about the rule's verdict: both arms of the A/B compute it identically, so
+		 * `Trace.ModeB.LandingRule 0` makes it climb and the shipped rule holds it at 0. A counter
+		 * defined as "a turnover the rule refused" could not do that — it would read zero in both arms
+		 * by construction and would prove nothing.
+		 *
+		 * SPEED ALONE IS NOT ENOUGH and neither is height. A Core dropped straight onto the floor
+		 * arrives at 1500 uu/s and is a perfectly good landing; a Core resting on a crate is 400 uu up
+		 * and is spec v7 §4 working. It is the combination of "fast" and "barely descending" that
+		 * describes what the user reported.
+		 */
+		int32 MidAirTurnovers = 0;
+
+		/** Every other turnover: the Core arrived on the surface or stopped on it. The intended outcome. */
+		int32 LandedTurnovers = 0;
 	};
 
 	static FSurfaceRuleStats SurfaceStats;
+
+	/**
+	 * SPEC v13 §5 counters — the contested magnet. Verification only, never a rule.
+	 *
+	 * "If the core is within the 'magnet' zone of two or more players from opposite teams, it should
+	 * go to the player closest to the core." A rule about which of several candidates wins is
+	 * unobservable from a log that only ever names the winner, so the contested frames are counted
+	 * apart from the uncontested ones and every switch of target is counted with them.
+	 */
+	struct FCatchContestStats
+	{
+		/** Frames the magnet ran with EXACTLY ONE eligible player in range. */
+		int32 UncontestedFrames = 0;
+
+		/** Frames with two or more — the case the spec is about. */
+		int32 ContestedFrames = 0;
+
+		/** Of those, frames where the contenders were not all on the same team. */
+		int32 CrossTeamContestedFrames = 0;
+
+		/** Distinct contests entered (a contested frame whose previous frame was not contested). */
+		int32 Contests = 0;
+
+		/** Times the pull moved from one player to another while the Core stayed loose. */
+		int32 TargetSwitches = 0;
+
+		/** Switches HYSTERESIS refused: a challenger was nearer, but not by enough to be worth a flicker. */
+		int32 HysteresisHolds = 0;
+
+		/** Largest contested set seen. */
+		int32 MaxContenders = 0;
+	};
+
+	static FCatchContestStats CatchStats;
 
 	/**
 	 * The centre of the goal @p AttackingTeam scores in, for bot steering and HUD markers.
@@ -562,8 +723,17 @@ public:
 	 * use, including the inherited term. Reconstructing it from GetThrowSpeed()/GetThrowUpBias() alone
 	 * is now WRONG by up to the thrower's full speed, which on a sprinting carrier is ~40% of the
 	 * launch speed.
+	 *
+	 * SPEC v13 §6. @p ChargeScale multiplies THE IMPULSE ONLY:
+	 *
+	 *     launch = (aim * speed + up * speed * upbias) * ChargeScale  +  thrower velocity * inheritance
+	 *
+	 * The inherited term is deliberately outside the bracket. Charge is how hard you threw it; the
+	 * inheritance is the motion the Core already had in your hands, and a player who jumps and taps
+	 * has not undone their own jump. Default 1 = a full-power throw, i.e. exactly the pre-v13 launch.
 	 */
-	static FVector ComputeThrowLaunchVelocity(const AActor* Thrower, const FVector& AimDirection);
+	static FVector ComputeThrowLaunchVelocity(const AActor* Thrower, const FVector& AimDirection,
+		float ChargeScale = 1.f);
 
 	/**
 	 * The last throw, broken into its parts. Diagnostics only (Trace.ModeB.ThrowMomentum).
@@ -589,6 +759,9 @@ public:
 		/** Z of the launch velocity, which is the number the user is watching on a jumping throw. */
 		float LaunchVelocityZ = 0.f;
 		float Inheritance = 0.f;
+		/** SPEC v13 §6. The hold that produced it, and the impulse fraction that hold bought. */
+		float HeldSeconds = 0.f;
+		float ChargeScale = 1.f;
 		FString ThrowerName;
 	};
 
@@ -928,6 +1101,34 @@ private:
 	 * by 10%"). The steering itself is TraceModeBTuning::SteerTowardCatchPoint, which this calls and
 	 * which Trace.ModeB.CatchTest also calls — the measurement and the game run the same function on
 	 * purpose, so a catch rate reported for the magnet is a catch rate for THE magnet.
+	 *
+	 * --- SPEC v13 §5: THE CONTESTED ZONE RESOLVES TO THE NEAREST PLAYER -----------------------------
+	 *
+	 * Verbatim: "If the core is within the 'magnet' zone of two or more players from opposite teams,
+	 * it should go to the player closest to the core."
+	 *
+	 * [ASSUMPTION] "from opposite teams" describes the interesting case rather than restricting the
+	 * rule, so NEAREST-WINS IS APPLIED TO ANY CONTESTED SET, two teammates included. A magnet that
+	 * resolved cross-team contests by distance and same-team contests by roster order would be two
+	 * rules where the note states one, and the second would be invisible until it misbehaved.
+	 *
+	 * THE CORE CURVES TO EXACTLY ONE PLAYER. It always did — one Best, one call to the steering — so
+	 * the change is not "stop pulling toward several", it is that the winner is now DECIDED rather
+	 * than emergent, deterministic frame to frame, and STABLE:
+	 *
+	 *   NEAREST WINS, measured to the capsule SURFACE, which is the same distance the falloff and the
+	 *   pickup radius use. Ties (identical distance to the millimetre) break on a stable per-player
+	 *   key, never on roster order, so two players standing on the same spot cannot make the answer
+	 *   depend on the order GatherCharacters happened to return them in.
+	 *
+	 *   HYSTERESIS. A challenger has to be nearer than the incumbent BY A MARGIN
+	 *   (Trace.ModeB.CatchContestHysteresis, 60 uu) before the pull moves. Without it two defenders
+	 *   converging at a similar range swap the target every few frames, and the steering — which is an
+	 *   exponential approach toward whichever point it is given — averages out to a Core that curves
+	 *   toward neither and is caught by nobody. The margin is one-off, not per-frame: once the pull
+	 *   moves, the new holder is the incumbent and the old one needs the same margin to take it back.
+	 *   It is dropped the instant the incumbent stops being eligible (dead, out of range, behind the
+	 *   Core), because holding a target that no longer qualifies is not stability, it is a stale pull.
 	 */
 	void ServerApplyCatchZone(float DeltaSeconds);
 
@@ -1223,6 +1424,37 @@ private:
 	/** Shared-clock time the holder may next throw. Mirrors the pass cooldown's role in mode A. */
 	float ThrowCooldownEndServerTime = 0.f;
 
+	// --- SPEC v13 §6, the charge. Server truth and the owning machine's prediction, side by side. ---
+
+	/**
+	 * SERVER. Shared-clock time the current holder pressed the throw button, or < 0 when nobody is
+	 * charging.
+	 *
+	 * THE HOLD IS MEASURED ON THE SERVER, from the press RPC to the release RPC, and the client is
+	 * never asked how long it held. That is the same policy the aim direction has had since the old
+	 * PerformPass was deleted: a client-supplied hold is a client-supplied launch velocity, and it
+	 * would be the single most valuable thing in the game to lie about. The cost is that a player's
+	 * charge is shortened by their own latency at the release, which is the honest trade — the meter
+	 * they aim with is local and instant (see LocalThrowChargeStartTime), the momentum is not.
+	 */
+	float ThrowChargeStartServerTime = -1.f;
+
+	/** SERVER. Whose press it is, so a release from anybody else cannot fire it. */
+	TWeakObjectPtr<ATraceCharacter> ThrowChargeHolder;
+
+	/**
+	 * EVERY MACHINE, the LOCAL PLAYER's own meter. Never replicated, and never set for a bot.
+	 *
+	 * On a listen server this exists alongside the server fields above and is set from the same press;
+	 * they are not redundant, they answer different questions ("what will the server launch" against
+	 * "what is my finger doing right now"), and only the second one can be instant.
+	 */
+	bool bLocalThrowCharging = false;
+	float LocalThrowChargeStartTime = 0.f;
+
+	/** Ends any charge in progress WITHOUT throwing. Death, a possession change, a mode switch. */
+	void ClearThrowCharge(const TCHAR* Reason);
+
 	/** True once the loose Core has come to rest, so the log says "thrown" or "loose" correctly. */
 	bool bLooseAtRest = false;
 
@@ -1238,13 +1470,72 @@ private:
 	bool bLooseFromThrow = false;
 
 	/**
-	 * SPEC v6 §4.1. The catcher the magnet is currently pulling toward, for the log line only.
+	 * SPEC v6 §4.1. The catcher the magnet is currently pulling toward.
 	 *
 	 * Held so that "the Core curved toward X" is announced ONCE per catch rather than every frame of
 	 * the curve. An invisible mechanic with no log line is one nobody can tell is broken, and this
 	 * project has twice declared a working mechanic dead for exactly that reason.
+	 *
+	 * SPEC v13 §5 GAVE IT A SECOND JOB AND IT IS NO LONGER "for the log line only": this is the
+	 * INCUMBENT the contest's hysteresis is measured against. That makes it real state rather than a
+	 * reporting convenience, so it is cleared on every path that ends a flight (ClearLooseState, a new
+	 * throw, the magnet finding nobody in range) — a stale incumbent would hand a 50 uu head start to
+	 * a player from the previous possession.
 	 */
 	TWeakObjectPtr<ATraceCharacter> CatchZoneTarget;
+
+	/** SPEC v13 §5. True while the last magnet frame had two or more eligible players in range. */
+	bool bCatchZoneContested = false;
+
+	/**
+	 * SPEC v13 §8. Shared-clock time the CURRENT flight last had a blocked sweep, and the speed it
+	 * was travelling at when it did. Diagnostics for Trace.ModeB.TurnoverLog only.
+	 */
+	float LastContactServerTime = -1.f;
+
+	// --- SPEC v13 §8: the mid-air turnover reproduction. Diagnostics only. --------------------------
+	//
+	// Armed with Trace.ModeB.TurnoverRepro <shots>, from -ExecCmds as well as the console for the
+	// reason every other harness here is: a console command can only be typed into a window, and the
+	// testing policy forbids one.
+
+	/** Server. Fires the repro shots one at a time and prints the tally. See the .cpp. */
+	void TickTurnoverRepro();
+
+	int32 TurnoverReproShotsLeft = 0;
+	float TurnoverReproNextShotTime = 0.f;
+	bool bTurnoverReproArmed = false;
+	bool bTurnoverReproReported = false;
+
+	/** Shots actually launched, split by shape: a GRAZE across a flat top, and a DROP onto the floor. */
+	int32 TurnoverReproGrazeShots = 0;
+	int32 TurnoverReproDropShots = 0;
+	int32 TurnoverReproSkipped = 0;
+
+	/** SurfaceStats snapshot taken when the repro armed, so the tally is the repro's own and not the match's. */
+	int32 TurnoverReproMidAirAtStart = 0;
+	int32 TurnoverReproLandedAtStart = 0;
+	int32 TurnoverReproRejectedAtStart = 0;
+
+	/**
+	 * The graze geometry, resolved ONCE when the repro arms and then reused for every shot.
+	 *
+	 * Re-probing per shot would let the harness quietly measure a different crate each time, which is
+	 * how a repro stops being a repro. Zero extent means no usable cover was found, which is reported
+	 * rather than worked around.
+	 */
+	FVector TurnoverReproTopPoint = FVector::ZeroVector;
+	FVector TurnoverReproGrazeDirection = FVector::ForwardVector;
+	double TurnoverReproTopExtent = 0.0;
+
+	/**
+	 * Server, diagnostics only. Measures how far the flat top under @p FromPoint runs in each of eight
+	 * compass directions and returns the longest, so the graze shot can be aimed ALONG a face rather
+	 * than at whichever way the probe grid happened to sample.
+	 *
+	 * @return the run length in uu (0 when the surface is too small to graze).
+	 */
+	double MeasureTopFaceExtent(const FVector& FromPoint, FVector& OutDirection) const;
 
 	/** Previous frame's holder position, so the mode-B carry-in test is swept rather than sampled. */
 	FVector LastCarrierGoalTestLocation = FVector::ZeroVector;

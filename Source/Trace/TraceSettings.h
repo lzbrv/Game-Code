@@ -695,6 +695,34 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Max Health", ClampMin = "1.0", ClampMax = "1000.0", UIMin = "25.0", UIMax = "250.0"))
 	float MaxHealth = 100.f;
 
+	// ------------------------------------------------------------------------------------------
+	// HEALTH REGENERATION (spec v13 §1) LIVES ON UTraceHealthSettings, NOT HERE.
+	//
+	// *** THE TWO PROPERTIES THAT WERE HERE — HealthRegenDelaySeconds AND HealthRegenPerSecond —
+	// *** ARE DELETED, AND DELETING THEM IS THE FIX RATHER THAN A TIDY-UP. ***
+	//
+	// They were declared on this page in the same pass that the health slice declared
+	// `bRegenEnabled` / `RegenDelaySeconds` / `RegenRatePerSecond` on its own UTraceHealthSettings
+	// page (Gameplay/TraceHealthComponent.h), and Config/DefaultGame.ini shipped BOTH blocks with
+	// the same numbers in them. Two config sections, four keys, one mechanic.
+	//
+	// Nothing ever read the pair on this page. namespace TraceHealthRegen is the only reader of the
+	// regeneration numbers anywhere in the project, and it reads UTraceHealthSettings — so these two
+	// were live-looking, ini-backed, EditAnywhere sliders that moved nothing at all. That is exactly
+	// the "a misnamed knob silently does nothing" failure this file's whole verification apparatus
+	// exists to catch, except that both knobs existed and were spelled correctly; they were simply
+	// not the ones with a reader behind them. Worse than merely dead: a designer retuning the delay
+	// to 6 s here would have seen the game keep using 9, with no error anywhere.
+	//
+	// The surviving page is the one with the reader, per the precedent UTraceMeleeSettings and
+	// UTraceDamageSettings already set — a mechanic's numbers live beside the code that consumes
+	// them. Trace.VerifyKnobs reaches across to it by /Script path (see FKnobSpec::OwnerPath) and
+	// Trace.DumpSettings prints it, so nothing was lost by the move except the second copy.
+	//
+	// DO NOT RE-ADD THEM HERE OUT OF SYMMETRY WITH MaxHealth ABOVE. If regeneration ever does need a
+	// knob on this page, it needs the READER moved with it in the same commit.
+	// ------------------------------------------------------------------------------------------
+
 	// DEAD PROPERTIES REMOVED: HitscanDamage and HeadshotMultiplier.
 	//
 	// Spec §6 replaced flat damage + a headshot multiplier with three positional zone values (head
@@ -940,9 +968,31 @@ public:
 	 *
 	 * The carrier cannot shoot and is hunted by five people, so the speed edge is what makes
 	 * carrying playable. Sane range 1.0 to 1.2; above ~1.3 nobody can catch a carrier at all.
+	 *
+	 * SPEC v13 §3: 1.30 -> 1.22. Verbatim: "Update carrier speed to match the new knife speed."
+	 *
+	 * THIS CLOSES THE PARITY BREAK v12 §3 OPENED AND FLAGGED. The whole reason this number was ever
+	 * 1.30 is an older request to "increase core carrier speed to match knife speed"; v12 §3 then cut
+	 * the knife to 1.22 and deliberately left the carrier alone, so for one pass the CARRIER was the
+	 * faster of the two (1.30 vs 1.22, +6.6%) and a defender who drew the knife to chase a carrier
+	 * could not run them down in a straight line. The user has now made the call, and this number
+	 * exists only to equal KnifeMoveSpeedMultiplier.
+	 *
+	 * *** THE INVARIANT, STATED SO IT SURVIVES THE NEXT KNIFE RETUNE: THIS VALUE TRACKS
+	 * *** KnifeMoveSpeedMultiplier. They are two properties rather than one because they multiply
+	 * *** different things for different reasons and a designer must be able to break parity on
+	 * *** purpose — but if the knife moves and this does not, the parity the user has now twice asked
+	 * *** for is broken again. Both read 1.22 -> 800 x 1.22 = 976 uu/s. Trace.VerifyKnobs prints them
+	 * *** next to each other and flags any disagreement.
+	 *
+	 * The two DO NOT STACK: a carrier holding the knife gets this multiplier only, because
+	 * TraceMelee::ShouldUseKnifeMovementProfile returns false for a carrier (the knife is stowed, not
+	 * active). With both at 1.22 that clause no longer changes any speed — but it still matters, and
+	 * must stay, because it is what stopped 1.30 x 1.22 = 1.59x and is the reason parity means one
+	 * number rather than two multiplied.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Walk", meta = (DisplayName = "Carrier Speed Multiplier", ClampMin = "0.5", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
-	float CarrierSpeedMultiplier = 1.30f;
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Walk", meta = (DisplayName = "Carrier Speed Multiplier [v13 §3: = knife 1.22]", ClampMin = "0.5", ClampMax = "2.0", UIMin = "1.0", UIMax = "1.4"))
+	float CarrierSpeedMultiplier = 1.22f;
 
 	// --- Air control (Source/Quake air-accel) -------------------------------------------------
 	//
@@ -1916,15 +1966,12 @@ public:
 	 * x WalkSpeed, so the knife is a MOBILITY CHOICE and not merely a weapon — which is the
 	 * interesting half of the design and the reason bots are told to swap to it to close distance.
 	 *
-	 * *** THIS BREAKS THE CARRIER/KNIFE SPEED PARITY THE USER ASKED FOR, AND IT IS NOT AN OVERSIGHT.
-	 * *** The user previously asked to "increase core carrier speed to match knife speed", and
-	 * *** CarrierSpeedMultiplier was set to 1.30 for exactly that reason and nothing else. v12 §3
-	 * *** moves ONLY the knife, so the two are no longer equal and the CARRIER IS NOW THE FASTER OF
-	 * *** THE TWO (1.30 vs 1.22, carrier +6.6%). A defender who swaps to the knife to chase the
-	 * *** carrier can no longer catch them on a straight line. Only what was asked has been
-	 * *** implemented — the carrier is deliberately left at 1.30. If parity was the point, set
-	 * *** CarrierSpeedMultiplier to 1.22 as well; that is the one-line change and it is the user's
-	 * *** call, not this pass's.
+	 * *** PARITY WITH THE CARRIER IS RESTORED (spec v13 §3, "update carrier speed to match the new
+	 * *** knife speed"). v12 §3 moved only the knife and left CarrierSpeedMultiplier at 1.30, which
+	 * *** made the CARRIER the faster of the two for one pass; the user has since called it, and
+	 * *** CarrierSpeedMultiplier is now 1.22 as well. THE TWO MUST MOVE TOGETHER: if this number is
+	 * *** retuned again, retune CarrierSpeedMultiplier with it or the same break comes back. They do
+	 * *** not stack — a carrier's knife is stowed, see ShouldUseKnifeMovementProfile.
 	 *
 	 * Bound BY NAME as "KnifeMoveSpeedMultiplier", clamped in the component to 1..3. It is clamped at
 	 * the BOTTOM as well as the top on purpose: a value under 1 would make the knife a mobility
@@ -2336,6 +2383,115 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Velocity Inheritance (fraction) [mode B]", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
 	float CoreThrowVelocityInheritance = 1.0f;
 
+	// ------------------------------------------------------------------------------------------
+	// THE CHARGE-UP THROW (spec v13 §6, new). Four knobs, and the spec asked for all four by name.
+	//
+	// Verbatim, in order:
+	//   "When a player RELEASES the throw button, the core should instantly be released."
+	//   "The longer the player holds down, the more momentum the core has."
+	//   "Start by making a one second charge up time to reach the current core throw momentum"
+	//   "Charge time to throw momentum should be a linear correlation"
+	//   "So if the player just clicks the throw button it will throw with very low momentum"
+	//
+	// *** THE ARITHMETIC, WRITTEN ONCE AND HERE, BECAUSE FOUR KNOBS AND TWO EXISTING ONES MEET IN
+	// *** ONE EXPRESSION AND EVERY MISREADING OF IT IS A PLAUSIBLE-LOOKING WRONG THROW:
+	// ***
+	// ***     t     = HeldSeconds / CoreThrowChargeSeconds                 (0 at a click)
+	// ***     tCap  = bCoreThrowChargeClampsAtFull ? min(t, 1)
+	// ***                                          : min(t, CoreThrowChargeMaxFraction)
+	// ***     Power = CoreThrowChargeFloorFraction
+	// ***             + (1 - CoreThrowChargeFloorFraction) * tCap          (floor..1 linearly)
+	// ***     Launch = Direction * CoreThrowSpeed * Power / sqrt(CoreMassScale)
+	// ***              + ThrowerVelocity * CoreThrowVelocityInheritance
+	// ***
+	// *** CHARGE SCALES THE IMPULSE ONLY. The inherited velocity is added ON TOP, unscaled, exactly
+	// *** as it is today (spec §6 asks for this to be stated explicitly). A tap-throw from a sprint
+	// *** therefore still carries the sprint — which is right: the player's momentum is not something
+	// *** they charge up, and scaling it too would make a tapped throw while running come out
+	// *** backwards relative to the runner.
+	// ***
+	// *** WEIGHT STILL APPLIES AFTER CHARGE, unchanged: CoreMassScale divides the impulse and nothing
+	// *** here touches that ordering. Charge is a fraction of the throw the designer tuned, not a new
+	// *** throw.
+	//
+	// RELEASE IS INSTANT — that is a code rule, not a knob, and it is the first thing the user asked
+	// for: the throw leaves on the release frame with whatever power has accumulated. There is
+	// deliberately no minimum hold and no wind-up-on-release knob to add one, because either would
+	// contradict "the core should instantly be released" while looking like tuning.
+	//
+	// THE CHARGE INDICATOR IS LOCAL AND INSTANT (spec §6). The bar is drawn from the client's own
+	// held-time, which needs no knob and no replication; the THROW stays server-authoritative and
+	// recomputes Power from the server's own held-time, so a client cannot ask for more power than
+	// they held for.
+	//
+	// BOTS MUST CHARGE (spec §6): a bot that always taps throws at the floor fraction and mode B
+	// looks broken. That is bot logic, not a knob — the bot picks a hold time from the distance it
+	// wants, using exactly the expression above.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Seconds of holding the throw button to reach FULL momentum, i.e. the throw the game has today.
+	 *
+	 * 1.0 is the user's number ("start by making a one second charge up time"), and it is the anchor
+	 * the other three are defined against: at exactly this hold, Power is 1 and the Core leaves at
+	 * CoreThrowSpeed, so nothing about the existing throw changes for a player who holds for a second.
+	 *
+	 * NEVER 0. A zero charge time makes every throw full power the instant it is pressed, which is
+	 * the pre-v13 behaviour wearing a charge bar — the clamp below starts at 0.05 for that reason
+	 * rather than at 0, so "I disabled charging" is done by raising the floor fraction to 1, which
+	 * says what it means.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Time (s) [v13 §6]", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
+	float CoreThrowChargeSeconds = 1.0f;
+
+	/**
+	 * Momentum an INSTANT CLICK throws with, as a fraction of full. [ASSUMPTION] 0.15.
+	 *
+	 * The user asked for "very low momentum" on a click and did not give a number. 0.15 is very low
+	 * — 3000 x 0.15 = 450 uu/s, a lob of a few metres — while staying visibly a THROW.
+	 *
+	 * IT IS NOT ZERO, AND THAT IS THE WHOLE REASON THIS KNOB EXISTS. A zero-momentum throw drops the
+	 * Core at the thrower's feet, inside their own pickup radius, and reads as "the throw button is
+	 * broken" rather than as "I did not charge". It would also interact badly with
+	 * CoreThrowerPickupLockoutSeconds, leaving a Core sitting untouchable at the feet of the player
+	 * who just dropped it.
+	 *
+	 * 1.0 is legal and disables charging entirely (every throw full power) — the A/B arm for "is the
+	 * charge-up an improvement", and the honest way to turn the feature off.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Floor (fraction of full) [v13 §6]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.05", UIMax = "0.5"))
+	float CoreThrowChargeFloorFraction = 0.15f;
+
+	/**
+	 * Does holding PAST the charge time add anything? [ASSUMPTION] true — it clamps at full.
+	 *
+	 * The user said one second reaches "the current core throw momentum" and said nothing about
+	 * beyond, so the safe reading is that a second is the maximum and the current throw is still the
+	 * strongest throw in the game. Clamping also keeps the charge bar honest: a bar that fills and
+	 * then keeps mattering is a bar that lies.
+	 *
+	 * Set false to allow OVERCHARGE up to CoreThrowChargeMaxFraction below, which is the pair of
+	 * knobs spec §6 asked for as "max multiplier, and whether it clamps".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Clamps At Full [v13 §6]"))
+	bool bCoreThrowChargeClampsAtFull = true;
+
+	/**
+	 * The ceiling on t when the clamp above is OFF, as a multiple of a full charge. IGNORED while
+	 * bCoreThrowChargeClampsAtFull is true.
+	 *
+	 * 1.0 — the default — makes the two settings agree, so flipping the clamp off changes nothing
+	 * until this is also raised. That is deliberate: an overcharge that appears the moment somebody
+	 * unticks a box is an overcharge nobody chose. At 1.5 a 1.5 s hold throws at 1.5x
+	 * CoreThrowSpeed, and the linear rule above is simply extrapolated.
+	 *
+	 * RAISING THIS RE-TUNES MODE B, not just the throw: CoreThrowGravityScale, the goal distance and
+	 * the 450 uu catch radius were all tuned against a 3000 uu/s ceiling. Treat it as an experiment
+	 * knob, not a difficulty dial.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Max (x full, clamp off) [v13 §6]", ClampMin = "1.0", ClampMax = "4.0", UIMin = "1.0", UIMax = "2.0"))
+	float CoreThrowChargeMaxFraction = 1.0f;
+
 	/**
 	 * World gravity multiplier applied to a Core in flight and rolling loose, BEFORE weight.
 	 *
@@ -2503,6 +2659,40 @@ public:
 	float CoreCatchThrowerLockoutSeconds = 0.5f;
 
 	/**
+	 * SPEC v13 §5 — A CONTESTED MAGNET RESOLVES TO THE NEAREST PLAYER, and this is the number that
+	 * stops it flickering. Verbatim: "If the core is within the 'magnet' zone of two or more players
+	 * from opposite teams, it should go to the player closest to the core."
+	 *
+	 * THE RULE ITSELF NEEDS NO KNOB — nearest wins, full stop, and it is applied to ANY contested
+	 * set rather than only to opposing teams (spec §5 [ASSUMPTION]: the quote describes the
+	 * interesting case, not a restriction; two teammates contesting deserve the same determinism).
+	 * What needs a knob is the TIE, because "nearest" is a float comparison made every server tick
+	 * on two moving players. Two chasers a few uu apart swap the lead several times a second, the
+	 * curve target changes with them, and the Core visibly wobbles between two people — the
+	 * oscillation §5 asks to avoid.
+	 *
+	 * THE RULE THIS NUMBER EXPRESSES: the CURRENT target keeps the Core until a rival is closer by
+	 * MORE than this many uu. It is a margin on the challenger, not on the holder, so it is stable
+	 * without being sticky — a genuine overtake of half a metre still switches immediately.
+	 *
+	 * 50 uu against the 450 uu magnet radius is ~11% of the zone and about one and a half capsule
+	 * radii (34 uu). Small enough that no player can win a contest they are visibly losing; large
+	 * enough to swallow the frame-to-frame jitter of two sprinting capsules and of network-smoothed
+	 * positions on a client's view.
+	 *
+	 * 0 DISABLES THE HYSTERESIS and gives the raw nearest-wins rule — which is exactly the arm to
+	 * run when asking "is the flicker really gone, or did I just hide it". That A/B is the reason
+	 * this is a knob rather than a constant.
+	 *
+	 * SERVER-AUTHORITATIVE, like the catch zone it modifies: the decision must be made once, on the
+	 * server, from the server's positions. A client that ran this rule on its own smoothed copies of
+	 * two pawns would reach a different answer at the boundary and draw the Core curving to the
+	 * wrong player.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Contest Hysteresis (uu) [v13 §5]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "0.0", UIMax = "150.0"))
+	float CoreCatchContestHysteresisUU = 50.f;
+
+	/**
 	 * SPEC v7 §4. The angle from straight up, in degrees, at which a surface stops being something the
 	 * Core can come to rest ON and starts being a wall it must bounce OFF.
 	 *
@@ -2521,6 +2711,38 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Surface Max Slope (deg) [mode B]", ClampMin = "0.0", ClampMax = "89.0", UIMin = "10.0", UIMax = "60.0"))
 	float CoreSurfaceMaxSlopeDegrees = 45.f;
+
+	/**
+	 * SPEC v13 §8 — HOW STEEPLY THE CORE MUST ARRIVE FOR A CONTACT TO COUNT AS A LANDING.
+	 *
+	 * Verbatim: "Sometimes the core is thrown and it turns over before it touches the ground."
+	 *
+	 * THE DIAGNOSED CAUSE was that the contact test read, in full, `Normal.Z >= SurfaceUpNormalZ()`:
+	 * ANY upward-facing normal was a landing. Every structure in this arena has a flat top and the
+	 * corner coves are terraced into flat treads, so a Core grazing across cover at 1400 uu/s and
+	 * 350 uu above the floor presented a perfect V(Z=1.00) and was handed to the nearest enemy in
+	 * mid-flight. Measured on the legacy rule: 7 of 7 graze shots turned over in the air.
+	 *
+	 * THIS IS THE ANGLE OF ARRIVAL, NOT THE ANGLE OF THE SURFACE — the two are separate knobs on
+	 * purpose and CoreSurfaceMaxSlopeDegrees above is the other one. A tread can be perfectly flat
+	 * (surface test passes) while the Core is travelling almost parallel to it (this test fails),
+	 * and that combination is precisely the bug. The test is |velocity · -normal| / speed >= sin(this).
+	 *
+	 * 20 degrees is the [ASSUMPTION]. A Core genuinely dropping onto a crate arrives at 25-90
+	 * degrees, so 20 clears every real landing with room to spare, while the graze that caused the
+	 * bug measured 11.2 degrees. Raising it toward 45 demands a steeper drop and will start refusing
+	 * shallow but genuine landings on open floor; lowering it toward 0 restores the pre-v13 rule
+	 * exactly, which is the A/B arm — and that is why 0 is legal rather than clamped away.
+	 *
+	 * IT IS NOT THE ONLY CONDITION. The shipped rule is upward-facing AND (came to rest on it OR
+	 * arrived at >= this angle AND had cleared the thrower), so a Core that lands shallow and STOPS
+	 * still turns over on the frame it settles — 132 ms later in the measured case. This knob only
+	 * decides whether a still-moving contact counts, which is the only case the bug was about.
+	 *
+	 * Trace.ModeB.LandingMinDescentDegrees overrides it live.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Landing Min Descent (deg) [v13 §8]", ClampMin = "0.0", ClampMax = "89.0", UIMin = "0.0", UIMax = "45.0"))
+	float CoreLandingMinDescentDegrees = 20.f;
 
 	// ==========================================================================================
 	// PARRY  (spec v3 §3 — new mechanic)
@@ -2888,9 +3110,71 @@ public:
 	 * carrier went, and a knob that can move it 100 uu is a knob that can put a kill volume somewhere
 	 * nobody ran. The component additionally refuses any nudge that does not reduce penetration or
 	 * that breaks line of sight to the original point, so a thin wall cannot be tunnelled through.
+	 *
+	 * *** SPEC v13 §7 RAISES IT 12 -> 44, AND THE OLD 12 IS THE MEASURED REASON THE v12 FIX DID NOT
+	 * *** LAND. v13 §7 re-measured the carried-over bug with the symptom forced out: fitter OFF gave
+	 * *** 26.1 uu inside cover on 35.9% of frames, fitter ON gave 24.2 uu on 35.3% — it routed twice
+	 * *** in 1312 frames. A 12 uu allowance cannot clear a 26 uu penetration, so the push was capped
+	 * *** below the problem it was aimed at and the number said "fix on" the whole time.
+	 * ***
+	 * *** WHAT 44 IS, AND WHY IT IS NOT 30. An intermediate 30 was tried during v13 and was STILL
+	 * *** below the real requirement, for the reason the whole §7 diagnosis turns on: the trace's
+	 * *** drawn reach is NOT TrailRadius. PlaceRibbon overlaps interior joints by another TrailRadius
+	 * *** along the element axis, so a box corner stands Radius*sqrt(2) = 31.8 uu from the joint, and
+	 * *** the Catmull-Rom resample overshoots a tight corner by a further 0.0741 * TrailPointSpacing
+	 * *** = 4.4 uu. UTraceTrailComponent::GetTraceDrawnHalfReach() derives that as 36.3 uu; plus
+	 * *** TrailWallFitMarginUU (4) the fitter asks for 40.3 uu of clearance. 30 could not deliver it,
+	 * *** so WallFitMaxPush()'s derived floor was silently the thing deciding — and a knob that has
+	 * *** stopped being the thing deciding is the failure this file exists to prevent. 44 sits above
+	 * *** the requirement with headroom, so THE SETTING IS AGAIN THE AUTHORITY and the floor never
+	 * *** bites. If TrailRadius or TrailPointSpacing move, re-derive: this must stay >= reach+margin.
+	 * ***
+	 * *** THE 34 uu CAPSULE CEILING BELONGS TO TrailWallFitMarginUU, NOT TO THIS KNOB, and conflating
+	 * *** them is what capped this at 30 in the first place. The margin is CLEARANCE ASKED FOR — ask
+	 * *** for more room than the carrier's own body needs and legal routes become unsatisfiable, so
+	 * *** that one is genuinely bounded by the capsule. This is the DISTANCE A BURIED POINT MAY BE
+	 * *** MOVED to reach that clearance, which is a different quantity and is necessarily larger: a
+	 * *** point 36 uu inside a lip needs a >36 uu push to get out of it, whatever the capsule is.
+	 * ***
+	 * *** THE INVARIANT IS UNCHANGED AND IS WHY THIS IS SAFE TO RAISE: the fitter edits TrailPoints,
+	 * *** and the trip test and every renderer arm are both built from TrailPoints, so a point pushed
+	 * *** out of a wall moves the LETHAL volume and the DRAWN volume in the same operation. Pushing
+	 * *** further cannot create a "visible but not lethal" or "lethal but not visible" trace; it can
+	 * *** only move both. Anything that ever edits the RIBBON alone breaks that and must not.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Wall Fit Max Push (uu) [v12 §6]", ClampMin = "0.0", ClampMax = "34.0", UIMin = "0.0", UIMax = "20.0"))
-	float TrailWallFitMaxPushUU = 12.f;
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Wall Fit Max Push (uu) [v13 §7: 12 -> 44]", ClampMin = "0.0", ClampMax = "64.0", UIMin = "0.0", UIMax = "64.0"))
+	float TrailWallFitMaxPushUU = 44.f;
+
+	/**
+	 * SPEC v13 §7 — CLEAR THE TRACE BY ITS OWN HALF WIDTH WHENEVER THE PATH RUNS NEAR GEOMETRY,
+	 * rather than only when a chord is BLOCKED. Pairs with Trace.Trail.WallClearance.
+	 *
+	 * THIS IS THE SHAPE OF THE FIX, WHICH IS WHY IT IS A SWITCH AND NOT A DISTANCE. v12 §6 diagnosed
+	 * corner-cutting — two points straddling a pillar with the chord between them passing through it
+	 * — and fixed exactly that: the router triggers on a blocked chord. But the reported bug is the
+	 * ribbon's own HALF WIDTH pressed against a wall the carrier legally ran alongside, where no
+	 * chord is blocked at all because the centre line is outside the wall the whole way. That is why
+	 * the fitter routed twice in 1312 frames while 35% of frames were 24 uu inside cover: it was
+	 * never asked. ON makes the near-geometry test a SWEEP of the trace's half width plus
+	 * TrailWallFitMarginUU along each segment, so a segment that merely runs too close is corrected
+	 * as well as one that is cut through.
+	 *
+	 * OFF IS THE v12 BEHAVIOUR EXACTLY — blocked chords only — and it is the A/B arm that reproduces
+	 * the residual clipping on demand. Between this and bTrailWallFitEnabled (which turns the whole
+	 * fitter off, i.e. the pre-v12 straight chord) there are three arms to measure rather than two,
+	 * which is what it takes to tell "the fix does nothing" apart from "the fix is aimed at the
+	 * wrong thing" — the mistake this pass is correcting.
+	 *
+	 * THE CLEARANCE DISTANCE IS DELIBERATELY NOT A KNOB OF ITS OWN. It is TrailRadius +
+	 * TrailWallFitMarginUU, derived at the point of use, because TrailRadius is ALSO the half width
+	 * of the lethal volume and of the drawn ribbon. A second, independently editable copy of the
+	 * trace's half width is precisely how "lethal == drawn" gets broken by a well-meaning tune: set
+	 * the clearance below the real half width and the ribbon is pulled out by less than it sticks
+	 * out, leaving the bug; set it above and the fitter starts refusing legal routes. One number,
+	 * one meaning, and TrailWallFitMarginUU is the tuning surface on top of it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Wall Clearance By Half Width [v13 §7]"))
+	bool bTrailWallClearanceEnabled = true;
 
 	/**
 	 * Most extra points the fitter may insert for ONE appended trail point. Pairs with

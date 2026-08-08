@@ -665,6 +665,17 @@ namespace TraceMelee
 	TRACE_API bool RequestEquip(ATraceCharacter* Pawn, ETraceEquippedWeapon Desired,
 		ETraceMeleeRefusal* OutRefusal = nullptr);
 
+	/**
+	 * DIRECT SELECT (spec v13 §2) — the 1 and 2 binds. Asking for the weapon already in hand does
+	 * nothing at all and, crucially, does NOT restart the 0.2 s pullout.
+	 *
+	 * Use this for a key that names a weapon; use RequestEquip above for a key that toggles or for a
+	 * bot deciding what it needs. The difference is documented in full on
+	 * UTraceWeaponComponent::RequestEquipIfDifferent, which is where the gate lives.
+	 */
+	TRACE_API bool RequestEquipIfDifferent(ATraceCharacter* Pawn, ETraceEquippedWeapon Desired,
+		ETraceMeleeRefusal* OutRefusal = nullptr);
+
 	/** THE SWING. Starts one if the rules allow; the blade resolves SwingWindupSeconds later. */
 	TRACE_API bool RequestSwing(ATraceCharacter* Pawn, ETraceMeleeRefusal* OutRefusal = nullptr);
 

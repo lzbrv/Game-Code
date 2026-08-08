@@ -567,6 +567,17 @@ bool TraceMelee::RequestEquip(ATraceCharacter* Pawn, ETraceEquippedWeapon Desire
 	return Weapon->RequestEquip(Desired, OutRefusal);
 }
 
+bool TraceMelee::RequestEquipIfDifferent(ATraceCharacter* Pawn, ETraceEquippedWeapon Desired, ETraceMeleeRefusal* OutRefusal)
+{
+	UTraceWeaponComponent* Weapon = WeaponOf(Pawn);
+	if (Weapon == nullptr)
+	{
+		if (OutRefusal != nullptr) { *OutRefusal = ETraceMeleeRefusal::NoPawn; }
+		return false;
+	}
+	return Weapon->RequestEquipIfDifferent(Desired, OutRefusal);
+}
+
 bool TraceMelee::RequestSwing(ATraceCharacter* Pawn, ETraceMeleeRefusal* OutRefusal)
 {
 	UTraceWeaponComponent* Weapon = WeaponOf(Pawn);

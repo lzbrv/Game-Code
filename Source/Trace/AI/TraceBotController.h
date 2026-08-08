@@ -167,6 +167,20 @@ enum class ETraceBotPassPhase : uint8
 	/** Input down, shield down, holding the crosshair on the receiver until the dwell completes. */
 	Holding,
 
+	/**
+	 * MODE B ONLY, spec v13 §6. Input down, WINDING A THROW UP.
+	 *
+	 * A separate phase from Holding rather than a reuse of it, and the reason is that they are
+	 * opposite trades. Holding is mode A's hover pass: the shield is DOWN and every frame of the dwell
+	 * is a frame of risk, so it is abortable and is aborted often. Charging is mode B's throw: the
+	 * shield is untouched, nothing is at risk, and the only thing the hold buys is momentum — so it is
+	 * a COMMITMENT and is never aborted, because releasing the button IS the throw. Aborting a charge
+	 * by releasing would launch the Core, which is the opposite of what any caller asking to abort
+	 * wants. IsPassing() deliberately still means Holding alone: it is asked "is this bot's shield
+	 * down", and during a charge it is not.
+	 */
+	Charging,
+
 	/** Just finished or aborted; the rules impose a cooldown before another attempt. */
 	Cooldown
 };
@@ -312,11 +326,33 @@ protected:
 	 * Returns the LOW arc when both exist: a flat throw spends less time in the air, which is less
 	 * time for a defender to walk into it.
 	 *
+	 * SPEC v13 §6: solved at @p ChargeScale, because the throw is now only as fast as the charge that
+	 * releases it. A solver that assumed full power and then released at 40% would aim short of
+	 * everything by the difference, every time.
+	 *
 	 * @param OutLaunchDirection unit vector to aim along, valid only on true.
 	 * @param OutFlightSeconds   time of flight, for the caller's lane sweep. Optional.
 	 */
 	bool SolveThrowLaunch(const FVector& From, const FVector& WorldTarget,
-		FVector& OutLaunchDirection, float* OutFlightSeconds = nullptr) const;
+		FVector& OutLaunchDirection, float* OutFlightSeconds = nullptr, float ChargeScale = 1.f) const;
+
+	/**
+	 * MODE B, SPEC v13 §6. How hard should this throw be released?
+	 *
+	 * "Have them charge appropriately for distance." A bot that always charges fully is not wrong -
+	 * every throw would simply be the pre-v13 throw - but it wastes the mechanic and makes every short
+	 * pass a rocket. A bot that always taps throws at 15% and mode B looks broken. So the charge is
+	 * derived from the range the throw actually has to cover:
+	 *
+	 *   a throw's flat range goes as the SQUARE of its launch speed, so the charge needed to cover a
+	 *   distance D out of a full-power reach R is sqrt(D/R) - plus a margin, because arriving exactly
+	 *   at the limit of the arc means arriving on the floor, and since spec v6 §4.2 a throw that lands
+	 *   is the enemy's.
+	 *
+	 * Never returns less than a floor: a bot has no reason to fumble the Core at its own feet, and the
+	 * floor is what stops a very short pass from becoming one.
+	 */
+	float ChooseThrowCharge(const FVector& From, const FVector& WorldTarget) const;
 
 	/**
 	 * MODE B. Furthest horizontal distance a throw from @p From can reach a point @p HeightDelta
@@ -328,7 +364,7 @@ protected:
 	 * but outside the real one throws the Core into the floor in front of a defender. Answered from
 	 * the Core's published flight model so it retunes with it.
 	 */
-	float MaxThrowRange(const FVector& From, float HeightDelta) const;
+	float MaxThrowRange(const FVector& From, float HeightDelta, float ChargeScale = 1.f) const;
 
 	/**
 	 * MODE B. Is the arc from @p From to @p WorldTarget clear of arena geometry?
@@ -340,7 +376,7 @@ protected:
 	 * blocks, pawns do not (a defender standing in the lane is a contest, not a reason not to shoot).
 	 */
 	bool HasThrowLane(const FVector& From, const FVector& WorldTarget, const FVector& LaunchDirection,
-		float FlightSeconds) const;
+		float FlightSeconds, float ChargeScale = 1.f) const;
 
 	/**
 	 * MODE B. Should this carrier stop throwing and run the Core into the goal itself?
@@ -778,6 +814,29 @@ private:
 
 	/** MODE B. What the current attempt is aimed at, BEFORE the ballistic elevation is added. */
 	FVector ThrowTargetPoint = FVector::ZeroVector;
+
+	// --- MODE B, SPEC v13 §6: THE CHARGE ----------------------------------------------------------
+	//
+	// "Bots must use it — a bot that always instant-clicks will throw at 15% power and mode B will
+	// look broken. Have them charge appropriately for distance."
+	//
+	// It is not enough to hold the button and release: the whole throw solver has to know how hard the
+	// throw is going to be. SolveThrowLaunch, MaxThrowRange and HasThrowLane all take the charge now,
+	// because a bot that solves the pitch for a full-power throw and then releases at 40% aims at a
+	// point 60% of the way short of everything it shoots at — which would be a far more visible
+	// regression than instant-clicking.
+
+	/**
+	 * MODE B. The fraction of full throw momentum the current attempt is going to be released at.
+	 *
+	 * Chosen from the DISTANCE (see ChooseThrowCharge) and then used by every part of the attempt: the
+	 * ballistic solve that produces the aim point, the lane sweep, and the length of the hold. One
+	 * number, decided once per frame of the line-up, so the aim and the launch cannot disagree.
+	 */
+	float PlannedThrowCharge = 1.f;
+
+	/** MODE B. World time the held throw button is released, i.e. when the Core actually leaves. */
+	float ThrowChargeReleaseTime = 0.f;
 
 	/**
 	 * MODE B, spec v5 §4. True while this carrier has committed to running the Core INTO the goal

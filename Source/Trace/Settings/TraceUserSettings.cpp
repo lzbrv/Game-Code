@@ -43,6 +43,20 @@ namespace
 	 * never read a keybind screen will find it first.
 	 */
 	FKey Default_SwapWeapon()  { return EKeys::F; }
+	/**
+	 * Spec v13 §2, verbatim: "Change default keybinds for switching weapons to be: 1 (switch to
+	 * knife) and 2 (switch to gun)."
+	 *
+	 * EKeys::One / EKeys::Two are the NUMBER ROW, not the numpad (that is EKeys::NumPadOne). The
+	 * request is the genre convention — weapon slots on the top row — and the number row is what a
+	 * player reaches for without thinking and what a laptop without a numpad still has.
+	 *
+	 * Both pass IsBindableKey: they are real buttons, not axes, not Escape and not AnyKey. Nothing
+	 * else in the table claims a digit, so neither default steals a key from another action on a
+	 * first run (SetKey's stealing rule would have logged it if it did).
+	 */
+	FKey Default_EquipKnife()  { return EKeys::One; }
+	FKey Default_EquipGun()    { return EKeys::Two; }
 }
 
 const TArray<FTraceInputActionInfo>& TraceInputActions::All()
@@ -62,9 +76,15 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		{ ETraceInputAction::Pass,        TEXT("Pass"),        TEXT("PASS CORE"),    &Default_Pass        },
 		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard  },
 		{ ETraceInputAction::SwapWeapon,  TEXT("SwapWeapon"),  TEXT("SWAP WEAPON"),  &Default_SwapWeapon  },
+		// SPEC v13 §2. These two rows exist for the options screen as much as for the game: the
+		// rebind list IS this table, walked in order, so an action that is not here is an action the
+		// player cannot see or rebind however well it is wired up in the controller. "Both new binds
+		// must appear in the settings rebind list" is satisfied by these lines and by nothing else.
+		{ ETraceInputAction::EquipKnife,  TEXT("EquipKnife"),  TEXT("EQUIP KNIFE"),  &Default_EquipKnife  },
+		{ ETraceInputAction::EquipGun,    TEXT("EquipGun"),    TEXT("EQUIP GUN"),    &Default_EquipGun    },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 12,
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 14,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 

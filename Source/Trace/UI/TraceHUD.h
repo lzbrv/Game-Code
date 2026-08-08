@@ -108,6 +108,20 @@ protected:
 	 */
 	void DrawHealthAndDash();
 
+	/**
+	 * The health bar itself, split out of DrawHealthAndDash() because regeneration (spec v13 §1)
+	 * gave it three states to draw rather than one width.
+	 *
+	 * THE POINT OF THE PASS, stated so nobody trims it as decoration: "a player learns to break line
+	 * of sight rather than pushing". A bar that silently refills teaches nothing — the player has to
+	 * see the clock running down while they are exposed, and see the climb start the moment it does.
+	 * So this draws the countdown as well as the climb, and it draws them on the one element in the
+	 * whole HUD that a player already looks at without being asked.
+	 *
+	 * @param X,Y,W,H  The bar's rect, in pixels.
+	 */
+	void DrawHealthBar(const class UTraceHealthComponent* HealthComp, float X, float Y, float W, float H);
+
 	void DrawScoresAndClock();
 	void DrawCoreBanner();
 
@@ -392,6 +406,30 @@ private:
 	 * frame before the feed draws; defaults to the top margin when the panel drew nothing.
 	 */
 	float KillFeedTopY = 0.f;
+
+	// ---- Health bar easing (spec v13 §1) -------------------------------------------------------
+	//
+	// Regeneration arrives on a client as a replicated float updated at the actor's net rate, not
+	// per frame — so the raw value STEPS, and a health bar that jumps in visible increments reads as
+	// a networking fault rather than as healing. These smooth the DRAWN width without ever changing
+	// the number printed on the bar, which stays the authoritative one.
+
+	/**
+	 * The health fraction currently drawn, eased toward the real one.
+	 *
+	 * *** IT EASES UP AND SNAPS DOWN, AND THE ASYMMETRY IS THE WHOLE DESIGN. *** Healing is slow and
+	 * gains nothing from being shown instantly, so it is smoothed. Damage is the single most urgent
+	 * thing this HUD reports and must never lag by even a frame — a bar that glides down after a
+	 * body shot would be a bar that tells the player they are safer than they are. Negative means
+	 * "no value yet"; the next draw snaps.
+	 */
+	float DrawnHealthFraction = -1.f;
+
+	/** Whose health DrawnHealthFraction is easing. A different pawn (a respawn) snaps instead of glides. */
+	TWeakObjectPtr<ATraceCharacter> DrawnHealthPawn;
+
+	/** Time of the previous health draw, so the ease is per-second rather than per-frame. */
+	float LastHealthDrawTime = -1.f;
 
 	/** Client-local time the last capture was observed, and who scored it. */
 	float ScoreFlashTime = -1000.f;

@@ -1397,6 +1397,29 @@ void UTraceWeaponComponent::DoSwapWeaponPressed()
 	}
 }
 
+bool UTraceWeaponComponent::RequestEquipIfDifferent(ETraceEquippedWeapon Desired, ETraceMeleeRefusal* OutRefusal)
+{
+	if (OutRefusal != nullptr)
+	{
+		*OutRefusal = ETraceMeleeRefusal::None;
+	}
+
+	// THE ONLY LINE THAT DIFFERS FROM RequestEquip, and it is checked BEFORE the legality gates on
+	// purpose. "Already holding it" is not a refusal — nothing was asked for — so a dead or carrying
+	// player pressing the bind for the weapon they nominally hold produces None rather than Dead or
+	// Carrying. The caller logs refusals, and a refusal reason for a press that asked for nothing is
+	// noise that reads like a bug report.
+	//
+	// EquippedWeapon is replicated, so the client's answer and the server's are the same answer; this
+	// is not a second opinion about legality, and no state is duplicated to reach it.
+	if (EquippedWeapon == Desired)
+	{
+		return false;
+	}
+
+	return RequestEquip(Desired, OutRefusal);
+}
+
 bool UTraceWeaponComponent::RequestEquip(ETraceEquippedWeapon Desired, ETraceMeleeRefusal* OutRefusal)
 {
 	if (OutRefusal != nullptr)

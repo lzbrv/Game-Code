@@ -71,7 +71,15 @@ struct FTraceDashHudState
  *   Dash        bool     Left Shift
  *   Parry       bool     Q             (carrier only — 0.175s of trace invulnerability, spec v3 §3 / v8 §3 / v10 §4)
  *   Scoreboard  bool     Tab           (held)
- *   SwapWeapon  bool     F             (gun <-> knife, spec v10 §1; the SWING rides IA_Fire)
+ *   SwapWeapon  bool     F             (gun <-> knife TOGGLE, spec v10 §1; the SWING rides IA_Fire)
+ *   EquipKnife  bool     1             (spec v13 §2 — DIRECT SELECT, idempotent)
+ *   EquipGun    bool     2             (spec v13 §2 — DIRECT SELECT, idempotent)
+ *
+ * SPEC v13 §2 IS AN INPUT-MODEL CHANGE, NOT A REBIND, and the three weapon actions above are what
+ * it comes to. A toggle answers "give me the other weapon"; a direct select answers "give me THIS
+ * weapon". Rebinding the toggle onto 1 and 2 would have made both keys do the same thing. All three
+ * converge on one call — UTraceWeaponComponent::RequestEquip(Desired) — so keeping the toggle costs
+ * no state and no ordering.
  */
 UCLASS()
 class TRACE_API ATracePlayerController : public APlayerController
@@ -234,6 +242,33 @@ public:
 	/** Bumped by ClientNotifyHit — a server-confirmed hitscan resolution credited to us. */
 	int32 DebugHitConfirmCount = 0;
 
+	/**
+	 * Spec v13 §2. Bumped on the FIRST LINE of the weapon handlers, before any gate, so they count
+	 * "the key reached a bound delegate" and nothing else.
+	 *
+	 * THEY EXIST BECAUSE THE §2 HARNESS WAS BRIEFLY VACUOUS WITHOUT THEM, and that is worth writing
+	 * down. Trace.V13.Hotkeys proves a redundant press does not restart the pullout by pressing the
+	 * key twice and watching the remaining time keep falling. Its first version held each synthetic
+	 * key for 0.05 s and pressed again 0.05 s later, so the second press landed while the key was
+	 * still logically DOWN — Enhanced Input emits Started only on a down EDGE, the handler never
+	 * ran, and "the pullout was not restarted" was true because NOTHING HAPPENED. It passed. It also
+	 * passed in the red arm, on the unguarded toggle, which is what gave it away.
+	 *
+	 * The fix is a longer gap, but the guarantee is this counter: the probe now asserts the count
+	 * went up across every press, so a swallowed key fails the run loudly instead of passing it
+	 * silently. A test that cannot fail is not evidence.
+	 */
+	int32 DebugEquipPressCount = 0;
+	int32 DebugSwapPressCount = 0;
+
+	// Accessors rather than reading the fields directly, so the harness cannot write them. This
+	// whole block is already inside the class's `public:` section (see line ~89) — no access
+	// specifier is introduced here, because flipping one would silently re-scope every counter
+	// above and the synthetic-input harness reads several of them.
+	/** Read by the v13 §2 harness to prove a synthetic key actually reached a bound delegate. */
+	int32 GetDebugEquipPressCount() const { return DebugEquipPressCount; }
+	int32 GetDebugSwapPressCount() const { return DebugSwapPressCount; }
+
 	FVector2D DebugLastMoveValue = FVector2D::ZeroVector;
 	FVector2D DebugLastLookValue = FVector2D::ZeroVector;
 
@@ -346,6 +381,21 @@ protected:
 	TObjectPtr<UInputAction> IA_SwapWeapon;
 
 	/**
+	 * Spec v13 §2. DIRECT SELECT, default 1 and 2. Separate actions from IA_SwapWeapon because they
+	 * are a different verb, not a different key for the same one.
+	 *
+	 * Two actions rather than one action with a value: an Enhanced Input Boolean action carries no
+	 * payload that could say WHICH weapon, and giving them one action plus a modifier would put the
+	 * weapon identity inside the mapping, where the rebind screen could not see it and where a
+	 * player rebinding "equip" to one key would silently get half a mechanic.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_EquipKnife;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_EquipGun;
+
+	/**
 	 * Builds InputMapping and every IA_* exactly once, then lays down the key mappings.
 	 *
 	 * The two halves are separate on purpose. The ACTIONS must be created exactly once and never
@@ -394,6 +444,20 @@ protected:
 	 * per press. TraceMelee::RequestSwapWeapon owns every refusal (carrying, dead, mid-swap, dashing).
 	 */
 	void OnSwapWeaponStarted();
+	/**
+	 * Spec v13 §2. Press edge of the two DIRECT-SELECT weapon binds. Press-only for the same reason
+	 * the toggle is: there is no held state, and a release binding would fire a second request on
+	 * key-up.
+	 *
+	 * @param bWantKnife  true for the 1 key, false for the 2 key.
+	 *
+	 * ONE implementation behind two handlers rather than two copies: the only difference between
+	 * them is the destination weapon, and the idempotence guard is the part that must not be allowed
+	 * to drift between the knife path and the gun path.
+	 */
+	void OnEquipKnifeStarted();
+	void OnEquipGunStarted();
+	void HandleDirectEquip(bool bWantKnife, const TCHAR* ActionLabel);
 	void OnCrouchStarted();
 	void OnCrouchCompleted();
 	void OnScoreboardStarted();

@@ -158,6 +158,35 @@ public:
 	bool RequestEquip(ETraceEquippedWeapon Desired, ETraceMeleeRefusal* OutRefusal = nullptr);
 
 	/**
+	 * DIRECT SELECT (spec v13 §2). Same as RequestEquip, except that asking for the weapon already in
+	 * hand does NOTHING — it does not restart the 0.2 s pullout, and it returns false with
+	 * ETraceMeleeRefusal::None.
+	 *
+	 * *** THIS IS A SECOND ENTRY POINT AND NOT A CHANGE TO RequestEquip, WHICH WOULD BE A BUG. ***
+	 * The two verbs want opposite things from a redundant press and both are right:
+	 *
+	 *   SwapWeapon (F) TOGGLES. A second press is a second intent, so it costs a pullout — refusing
+	 *                  it silently would make a double-tap feel like a dropped input. RequestEquip's
+	 *                  own doc comment commits to that, and the bots and console commands rely on it.
+	 *   EquipKnife (1) / EquipGun (2) SELECT. Spec §2, verbatim: "pressing 1 while already holding
+	 *                  the knife does nothing (and must not re-trigger the 0.2 s pullout)." A player
+	 *                  mashing 1 before a fight must not be re-drawing the blade on every press.
+	 *
+	 * IT IS CORRECT MID-PULLOUT, which is the case that looks like a hole. ApplyEquip sets
+	 * EquippedWeapon at the PRESS and lets the deploy deadline run on, so GetEquippedWeapon() already
+	 * names the DESTINATION weapon for the whole 0.2 s. Pressing 1 during the knife's own pullout is
+	 * therefore ignored (correct — that IS the "must not re-trigger" case), while pressing 1 during
+	 * the GUN's pullout is allowed and starts a fresh pullout to the knife (correct — the player
+	 * changed their mind, and what is coming up is not what they now want).
+	 *
+	 * The gate lives HERE, on the component, rather than in the controller that binds the key, so
+	 * every direct-select caller gets it — bots, console commands and a future UI all included. The
+	 * legality questions (dead, carrying, no pawn) are untouched and still belong to RequestEquip;
+	 * this only answers "did the player ask for anything at all".
+	 */
+	bool RequestEquipIfDifferent(ETraceEquippedWeapon Desired, ETraceMeleeRefusal* OutRefusal = nullptr);
+
+	/**
 	 * Starts one swing. The blade resolves SwingWindupSeconds later (see TickSwing), which is what
 	 * makes it read as a swing rather than as a very short shotgun. Returns true when it started.
 	 */
