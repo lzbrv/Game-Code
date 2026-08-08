@@ -126,7 +126,7 @@ public:
 	// =============================================================================================
 
 	/** Which weapon is in this pawn's hands. Replicated, so every machine agrees — including the
-	 *  movement component, which multiplies the ground speed limit by 1.30 off the back of it. */
+	 *  movement component, which multiplies the ground speed limit by 1.22 off the back of it (spec v12 s3). */
 	ETraceEquippedWeapon GetEquippedWeapon() const { return EquippedWeapon; }
 
 	bool IsKnifeEquipped() const { return EquippedWeapon == ETraceEquippedWeapon::Knife; }
@@ -347,7 +347,7 @@ private:
 	/**
 	 * The selector. Replicated to EVERYONE, not just the owner, and that is load-bearing three ways:
 	 * the movement component multiplies the ground speed limit by it on every machine (so the client
-	 * predicts its own 1040 uu/s instead of being corrected into it), other players see the knife in
+	 * predicts its own 976 uu/s instead of being corrected into it), other players see the knife in
 	 * the hand, and the server gates ServerFire/ServerSwing on the same value the client gated on.
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_EquippedWeapon)
@@ -394,7 +394,7 @@ private:
 	 * NUMBERS. UTraceCharacterMovementComponent::SetKnifeMovementProfileActive is the documented
 	 * entry point for the melee slice and the multipliers behind it (KnifeMoveSpeedMultiplier and
 	 * the two air-cap multipliers) live on UTraceSettings where the movement component reads them.
-	 * There is no second copy of 1.30 anywhere in the melee code, deliberately.
+	 * There is no second copy of 1.22 anywhere in the melee code, deliberately.
 	 *
 	 * CALLED ON EVERY MACHINE, and that is required rather than tidy: the bit is round-tripped
 	 * through FSavedMove_Trace, so a server correction replays each move under the profile that move
@@ -457,7 +457,12 @@ private:
 	//                   is the rig that physically swings, and it is the swinger's whole read.
 	//   KnifeHandRoot   third person, OwnerNoSee, attached to the Mannequin's hand_r bone so every
 	//                   OTHER player can see that this person chose the knife — which is the tell
-	//                   that they are now 30% faster and cannot shoot back.
+	//                   that they are now 22% faster (spec v12 §3) and cannot shoot back.
+	//
+	// THERE IS NO THIRD-PERSON GUN RIG, and that is worth knowing before hunting spec v12 §7's
+	// "knife and gun at the same time" on somebody else's pawn: ATraceCharacter builds a first-person
+	// viewmodel and nothing else, so the only weapon another player can ever see in your hands is
+	// KnifeHandRoot. That bug was first person only.
 	//
 	// Both are built lazily and on rendering machines only. Neither collides, neither casts a
 	// shadow, and neither is ever read by the hit resolution: TraceMelee::ResolveSwing is pure
@@ -471,6 +476,17 @@ private:
 	 * Hides the GUN half of ATraceCharacter's viewmodel while the knife is out — the weapon parts
 	 * only, never the hands or forearms, or the player would be holding a knife with no hands.
 	 *
+	 * IDEMPOTENT AND RE-ASSERTED EVERY TICK, WHICH IS THE FIX FOR SPEC v12 §7 ("the knife and gun
+	 * can be held at the same time"). This used to early-return when the requested state matched the
+	 * last request, which made it an edge trigger on a set of components it does not exclusively own:
+	 * ATraceCharacter::SetViewModelVisible(true) re-shows every part of its rig, gun included, when
+	 * the carry blend returns to first person or a pawn respawns, and the latch then swallowed the
+	 * correction. The full diagnosis is on the definition.
+	 *
+	 * The rule it now enforces, on every call, is one line: a gun part is visible exactly when the
+	 * character wants its rig on screen AND no knife is out. It can therefore only ever hide a gun
+	 * the character is showing, never resurrect one the character has hidden (a corpse's, say).
+	 *
 	 * Identified by NAME, and that is a documented compromise rather than an oversight: the parts
 	 * table is private to ATraceCharacter (another ownership slice) and the only public handle on
 	 * the rig is ViewModelRoot. The failure mode if that table is ever renamed is benign and
@@ -478,6 +494,17 @@ private:
 	 * rather than the hands vanishing, which is subtle and looks like a rendering bug.
 	 */
 	void SetGunViewModelHidden(bool bHidden);
+
+	/**
+	 * Refills CachedGunParts from ViewModelRoot's children when the rig has changed shape.
+	 *
+	 * Exists so the per-tick re-assert above costs nothing: walking the children every frame would
+	 * allocate a TArray every frame for a list that changes twice in a pawn's life. Keyed on the
+	 * child count because ATraceCharacter builds its viewmodel LAZILY — usually several frames after
+	 * this component starts ticking — so a cache taken once, on the first tick, would be empty
+	 * forever and the gun would never be hidden at all.
+	 */
+	void RefreshGunPartCache(const ATraceCharacter& Character);
 
 	/** True for the hand/forearm parts of the viewmodel, which stay visible with either weapon. */
 	static bool IsViewModelHandPart(const UStaticMeshComponent* Part);
@@ -518,9 +545,37 @@ private:
 	/** Set once when /Engine/BasicShapes could not be resolved, so the warning is logged once. */
 	bool bKnifeMeshUnavailable = false;
 
+	/** The last thing SetGunViewModelHidden was ASKED for. Diagnostics only — it gates nothing now. */
 	bool bGunViewModelHidden = false;
+
+	/** ViewModelRoot's weapon parts, minus the hands. Rebuilt when the rig's child count changes. */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> CachedGunParts;
+
+	/** Child count CachedGunParts was taken at. -1 so the first call always builds. */
+	int32 CachedViewModelChildCount = -1;
 
 	/** Last visibility pushed to each rig, so the render state is only dirtied on a change. */
 	bool bKnifeViewVisible = false;
 	bool bKnifeHandVisible = false;
+
+#if !UE_BUILD_SHIPPING
+public:
+	/**
+	 * Dev-only census of what is actually on screen, for Trace.Knife.DualWeaponTest.
+	 *
+	 * Counts VISIBLE components, not intended ones, because spec v12 §7 is a bug about the two
+	 * rigs disagreeing — a test that asked either rig what it believed would have agreed with itself
+	 * and reported no bug. Everything here is read from the components' own visibility flags.
+	 *
+	 * @param OutGunVisible    first-person GUN parts currently drawn.
+	 * @param OutKnifeVisible  first-person KNIFE parts currently drawn.
+	 * @param OutHandVisible   first-person hand/forearm parts, which belong to neither weapon.
+	 * @param OutBodyKnife     third-person knife parts on the hand_r socket — what OTHER players see.
+	 *                         There is no third-person gun mesh in this project, so this is the whole
+	 *                         of what another player can see in your hands.
+	 */
+	void GetViewModelCensus(int32& OutGunVisible, int32& OutKnifeVisible, int32& OutHandVisible,
+		int32& OutBodyKnife) const;
+#endif
 };

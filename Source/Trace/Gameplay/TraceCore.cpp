@@ -589,8 +589,15 @@ static TAutoConsoleVariable<float> CVarModeBBounce(
 //
 //   RADIUS   how far out the magnet reaches. Deliberately LARGER than the pickup radius (120 uu) and
 //            not by a little: the pickup radius is "you touched it", the catch radius is "it is
-//            coming to you". At 500 uu it is about three player widths - close enough that it reads
-//            as a catch and not as the Core being stolen out of the air from across a lane.
+//            coming to you". SPEC v12 §4 cut it 500 -> 450 ("reduce the 'magnet' radius for catching
+//            in game mode b by 10%"), which is still about two and a half player widths - close
+//            enough that it reads as a catch and not as the Core being stolen from across a lane.
+//            THE CUT IS NOT LINEAR IN FEEL. The pull falls off to zero at the boundary, so a smaller
+//            radius steepens the falloff everywhere inside it as well as removing the outer ring:
+//            the Core is steered less at EVERY distance, not just at the ones that used to be in
+//            range. That matters most for a fast Core, which crosses the zone in fewer frames and
+//            therefore collects fewer corrections - see the v12 §4 measurement, and raise CURVE
+//            rather than RADIUS if the fast case needs help back.
 //   CURVE    how hard it curves, in "fractions of the remaining error per second". 6 means the
 //            velocity is turned most of the way onto the catcher within a fifth of a second at point
 //            blank, and barely at all at the edge of the zone (the pull falls off with distance).
@@ -610,11 +617,17 @@ static TAutoConsoleVariable<float> CVarModeBBounce(
 // way nobody asked for. Curving alone is what "curves towards the player" says.
 // =================================================================================================
 
+// SPEC v12 §4 — "Reduce the 'magnet' radius for catching in game mode b by 10%". 500 -> 450. This is
+// the FALLBACK only: UTraceSettings::CoreCatchRadius wins unless this CVar is explicitly set, and
+// Config/DefaultGame.ini wins over the header. The default is moved in step with them anyway, because
+// a fallback that disagrees with the shipped value is a trap for whoever next reads one and not the
+// other. Setting it live (`Trace.ModeB.CatchRadius 500`) is the A/B arm the v12 catch-rate measurement
+// used, and is the fastest way to answer "was 450 the thing that made fast Cores uncatchable".
 static TAutoConsoleVariable<float> CVarModeBCatchRadius(
 	TEXT("Trace.ModeB.CatchRadius"),
-	500.f,
+	450.f,
 	TEXT("MODE B. Radius of the invisible catch zone around every player, uu, measured from the Core ")
-	TEXT("to the surface of their capsule. A loose Core inside it curves toward them. ")
+	TEXT("to the surface of their capsule. A loose Core inside it curves toward them. v12 §4: 500 -> 450. ")
 	TEXT("UTraceSettings::CoreCatchRadius."),
 	ECVF_Default);
 
@@ -812,6 +825,52 @@ namespace TraceModeBTuning
 	float CatchRadius()          { return Resolve(TEXT("CoreCatchRadius"),                 CVarModeBCatchRadius,      0.f,   3000.f); }
 	float CatchCurveStrength()   { return Resolve(TEXT("CoreCatchCurveStrength"),          CVarModeBCatchCurve,       0.f,   30.f); }
 	float CatchThrowerLockout()  { return Resolve(TEXT("CoreCatchThrowerLockoutSeconds"),  CVarModeBCatchThrowerLockout, 0.f, 5.f); }
+
+	/**
+	 * THE MAGNET ITSELF: one frame of the catch zone's steering, as a pure function.
+	 *
+	 * It lives here rather than inline in ATraceCore::ServerApplyCatchZone for one reason, and it is
+	 * a testing reason. Spec v12 §4 cuts the radius by 10% and asks for the catch rate BEFORE and
+	 * AFTER, which means something has to sweep the miss-distance / Core-speed space and count. A
+	 * harness that re-implemented these four lines would be measuring the harness, and this project
+	 * has already had a verification "pass" that never ran the thing it claimed to test. So the
+	 * shipped path and Trace.ModeB.CatchTest call THE SAME FUNCTION: if this maths is wrong, the
+	 * measurement is wrong in exactly the same way and the numbers stop agreeing with the game.
+	 *
+	 * DIRECTION ONLY. The returned vector has the SAME LENGTH as Velocity — see the tuning block
+	 * above for why a magnet that also accelerated the Core is a different, unasked-for mechanic.
+	 *
+	 * @param SurfaceDistance  distance from the Core to the catcher's capsule SURFACE, not its centre.
+	 * @return the steered velocity, or Velocity unchanged when there is nothing to steer.
+	 */
+	FVector SteerTowardCatchPoint(const FVector& CoreLocation, const FVector& Velocity,
+		const FVector& CatchPoint, double SurfaceDistance, float Radius, float Curve, float DeltaSeconds)
+	{
+		const double Speed = Velocity.Size();
+		const FVector ToTarget = CatchPoint - CoreLocation;
+
+		if (Speed < 1.0 || Radius <= 0.f || Curve <= 0.f || ToTarget.IsNearlyZero() || DeltaSeconds <= 0.f)
+		{
+			return Velocity;
+		}
+
+		// Falloff: full strength on the capsule, nothing at the edge of the zone. This is what makes
+		// the zone read as a catch rather than as a wall of magnetism you can feel the boundary of.
+		//
+		// IT IS ALSO WHY SPEC v12 §4's 10% IS NOT A 10% CHANGE IN FEEL. Falloff is a function of
+		// distance/RADIUS, so shrinking the radius does not merely clip the outer ring off the zone —
+		// at any fixed distance the ratio rises and the pull WEAKENS. The Core is steered less
+		// everywhere inside the zone, not only in the ring that left it.
+		const double Falloff = 1.0 - FMath::Clamp(SurfaceDistance / static_cast<double>(Radius), 0.0, 1.0);
+
+		// Exponential approach, so the curve is identical at 30 fps and at 240. Alpha is the fraction
+		// of the remaining aim error removed this frame.
+		const double Alpha = 1.0 - FMath::Exp(-static_cast<double>(Curve) * Falloff * static_cast<double>(DeltaSeconds));
+
+		// Renormalised to the speed it already had.
+		const FVector Steered = FMath::Lerp(Velocity / Speed, ToTarget.GetSafeNormal(), Alpha).GetSafeNormal();
+		return Steered * Speed;
+	}
 
 	/** Radius of the sphere swept for the loose Core's collision. Matches the orb the player sees. */
 	constexpr float CollisionRadius = 22.f;
@@ -3675,6 +3734,228 @@ static FAutoConsoleCommand GTraceModeBCoreProbeCmd(
 		}
 	}));
 
+// =================================================================================================
+// SPEC v12 §4 — MEASURING THE MAGNET. Trace.ModeB.CatchTest
+//
+// The change is one number (CoreCatchRadius 500 -> 450) and the request is one sentence, but "does
+// the magnet still catch" is not answerable by reading it. So this sweeps the two axes that decide
+// the answer — HOW BADLY THE THROW MISSES and HOW FAST THE CORE IS — and counts catches.
+//
+// IT CALLS THE SHIPPED STEERING FUNCTION. TraceModeBTuning::SteerTowardCatchPoint is the same
+// function ATraceCore::ServerApplyCatchZone calls every frame of every real throw, and the catch
+// test below is the same surface-distance-vs-PickupRadius test ServerTryPickup uses. Nothing here
+// is a second implementation of the magnet: this project has already had a verification declare
+// PASS without ever executing the thing it was verifying, and a re-implemented magnet would fail
+// the same way while looking more thorough. The knobs come from the live accessors too, so what is
+// measured is what UTraceSettings and DefaultGame.ini actually resolved to.
+//
+// WHY THE SWEEP IS FLAT AND UNGRAVITIED, stated plainly rather than buried: gravity would add a
+// second reason for a trial to fail (a slow Core lands short no matter what the magnet does) and
+// the two causes would be indistinguishable in the total. This isolates the magnet's steering
+// authority, which is the only thing the radius changes. The BALLISTIC case — a real throw that
+// inherits a jumping thrower's velocity — is covered by running the sweep at that throw's speed;
+// what the arc does to the Core's height is the throw's business, not the magnet's.
+//
+// WHY IT IS A CONSOLE COMMAND AND NOT A UNIT TEST: the values have to come from a RUNNING game.
+// The ini wins over the header on this project and the header has been wrong before.
+//
+// THE COMMAND TAKES NO ARGUMENTS, AND THAT IS DELIBERATE. It runs BOTH arms itself: the shipped
+// radius, and that radius divided by 0.9, which is the pre-v12 §4 value the cut was made from. Two
+// reasons, and the second one has already cost this project a pass:
+//
+//   1. The comparison IS the deliverable. A command that measures one arm can be run once, reported
+//      as "the catch rate", and mean nothing. Both arms in one invocation cannot be half-run.
+//   2. -TraceExec / -ExecCmds AND SPACES DO NOT MIX HERE. Setting the arm from the command line
+//      would need `Trace.ModeB.CatchRadius 500`, and a quoted argument on this project's command
+//      line has already broken into the URL parser and produced a "verification" whose commands
+//      never executed at all. No argument, no space, no quote, nothing to get wrong.
+//
+// Usage, headless:  -TraceExec=Trace.VerifyKnobs|Trace.DumpSettings|Trace.ModeB.CatchTest
+// =================================================================================================
+static void RunModeBCatchTestAtRadius(const float Radius, const TCHAR* ArmLabel)
+{
+	// Live knobs, not literals. If CoreCatchRadius did not bind, the caller passes the fallback and
+	// the numbers below are the fallback's numbers - itself the answer to a different question.
+	const float Curve = TraceModeBTuning::CatchCurveStrength();
+	const float Pickup = TraceModeBTuning::PickupRadius();
+
+	// The catcher's capsule, taken from a LIVE pawn where there is one: the magnet aims at the
+	// capsule's centre line and measures to its surface, so the capsule's radius is part of the
+	// answer and a guessed 34 would quietly shift every number.
+	double CapsuleRadius = 34.0;
+	double CapsuleHalfHeight = 88.0;
+	const TCHAR* CapsuleSource = TEXT("defaults (no live pawn found)");
+
+	for (const FWorldContext& Context : GEngine->GetWorldContexts())
+	{
+		UWorld* World = Context.World();
+		if (World == nullptr)
+		{
+			continue;
+		}
+
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			if (const UCapsuleComponent* Capsule = It->GetCapsuleComponent())
+			{
+				CapsuleRadius = static_cast<double>(Capsule->GetScaledCapsuleRadius());
+				CapsuleHalfHeight = static_cast<double>(Capsule->GetScaledCapsuleHalfHeight());
+				CapsuleSource = TEXT("a live pawn");
+				break;
+			}
+		}
+	}
+
+	// Seven speeds spanning a walked-in throw to the fastest launch the game can produce: spec v8 §4
+	// has the throw inherit the thrower's velocity, and a jumping throw was measured at ~3357 uu/s.
+	static const float Speeds[] = { 800.f, 1200.f, 1600.f, 2000.f, 2400.f, 2800.f, 3357.f };
+
+	// Miss distances from dead-on to well outside the zone, in 25 uu steps. 25 uu is finer than the
+	// difference the 10% cut makes, so the boundary it moves is resolvable rather than inferred.
+	constexpr double MissStep = 25.0;
+	constexpr int32 MissCount = 25;                 // 0 .. 600 uu
+	constexpr double ApproachDistance = 1500.0;     // where the Core starts, uu from the catcher
+	constexpr float DeltaSeconds = 1.f / 60.f;
+	constexpr int32 MaxSteps = 600;                 // 10 s at 60 Hz; every trial resolves far sooner
+
+	const FVector Catcher(0.0, 0.0, 0.0);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] CATCHTEST [%s]: radius=%.0f curve=%.1f pickup=%.0f | capsule r=%.0f halfH=%.0f from %s | ")
+		TEXT("%d speeds x %d miss offsets (0-%.0f uu, %.0f uu steps), flat approach from %.0f uu, %d Hz"),
+		ArmLabel, Radius, Curve, Pickup, CapsuleRadius, CapsuleHalfHeight, CapsuleSource,
+		static_cast<int32>(UE_ARRAY_COUNT(Speeds)), MissCount, (MissCount - 1) * MissStep, MissStep,
+		ApproachDistance, static_cast<int32>(1.f / DeltaSeconds));
+
+	int32 TotalTrials = 0;
+	int32 TotalCatches = 0;
+	int32 TotalBaselineCatches = 0;
+
+	for (const float Speed : Speeds)
+	{
+		int32 Catches = 0;
+		int32 BaselineCatches = 0;
+		double WidestCatchableMiss = -1.0;
+
+		for (int32 MissIndex = 0; MissIndex < MissCount; ++MissIndex)
+		{
+			const double Miss = MissIndex * MissStep;
+
+			// TWO ARMS PER TRIAL, and the second one is what stops this being a magnet-shaped
+			// tautology. MAGNET ON is the game; MAGNET OFF is the identical trial with the steering
+			// skipped, i.e. what a straight throw would have done on its own. A miss the Core would
+			// have caught anyway is not evidence the magnet works, and without the baseline every
+			// small offset would be counted as a save the magnet did not make.
+			for (int32 Arm = 0; Arm < 2; ++Arm)
+			{
+				const bool bMagnet = (Arm == 0);
+
+				FVector Position = Catcher + FVector(-ApproachDistance, 0.0, 0.0);
+				FVector Velocity = (FVector(ApproachDistance, Miss, 0.0)).GetSafeNormal() * static_cast<double>(Speed);
+
+				bool bCaught = false;
+
+				for (int32 Step = 0; Step < MaxSteps && !bCaught; ++Step)
+				{
+					// Surface distance to the catcher's capsule, computed exactly as
+					// ServerApplyCatchZone and ServerTryPickup both compute it.
+					FVector CatchPoint(Catcher.X, Catcher.Y,
+						FMath::Clamp(Position.Z, Catcher.Z - CapsuleHalfHeight, Catcher.Z + CapsuleHalfHeight));
+					const double SurfaceDistance = FMath::Max(0.0, FVector::Dist(Position, CatchPoint) - CapsuleRadius);
+
+					// ServerTryPickup's test, unchanged: surface distance inside the pickup radius.
+					if (SurfaceDistance <= static_cast<double>(Pickup))
+					{
+						bCaught = true;
+						break;
+					}
+
+					if (bMagnet && SurfaceDistance <= static_cast<double>(Radius))
+					{
+						// The forward-only gate, copied from ServerApplyCatchZone: a catcher the Core
+						// has already passed is refused, or the magnet would drag it backwards.
+						const FVector ToCatcher = CatchPoint - Position;
+						if (!ToCatcher.IsNearlyZero()
+							&& FVector::DotProduct(ToCatcher.GetSafeNormal(), Velocity.GetSafeNormal()) >= 0.0)
+						{
+							Velocity = TraceModeBTuning::SteerTowardCatchPoint(
+								Position, Velocity, CatchPoint, SurfaceDistance, Radius, Curve, DeltaSeconds);
+						}
+					}
+
+					Position += Velocity * static_cast<double>(DeltaSeconds);
+
+					// Once the Core is past the catcher and opening the range, the trial is decided.
+					if (Position.X > Catcher.X + ApproachDistance)
+					{
+						break;
+					}
+				}
+
+				if (bMagnet)
+				{
+					if (bCaught)
+					{
+						++Catches;
+						WidestCatchableMiss = FMath::Max(WidestCatchableMiss, Miss);
+					}
+					++TotalTrials;
+					TotalCatches += bCaught ? 1 : 0;
+				}
+				else
+				{
+					BaselineCatches += bCaught ? 1 : 0;
+					TotalBaselineCatches += bCaught ? 1 : 0;
+				}
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] CATCHTEST [%s]  speed %6.0f uu/s : caught %2d/%d (%5.1f%%)  vs no-magnet %2d/%d (%5.1f%%)  ")
+			TEXT("| magnet saved %2d  | widest catchable miss %.0f uu"),
+			ArmLabel, Speed, Catches, MissCount, 100.f * Catches / MissCount,
+			BaselineCatches, MissCount, 100.f * BaselineCatches / MissCount,
+			Catches - BaselineCatches, WidestCatchableMiss);
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] CATCHTEST TOTAL [%s] at radius %.0f: %d/%d caught (%.1f%%), no-magnet %d/%d (%.1f%%), ")
+		TEXT("magnet saved %d throws"),
+		ArmLabel, Radius, TotalCatches, TotalTrials, 100.f * TotalCatches / FMath::Max(1, TotalTrials),
+		TotalBaselineCatches, TotalTrials, 100.f * TotalBaselineCatches / FMath::Max(1, TotalTrials),
+		TotalCatches - TotalBaselineCatches);
+}
+
+static void RunModeBCatchTest()
+{
+	// THE SHIPPED RADIUS, resolved live: UTraceSettings first, DefaultGame.ini having already won
+	// over the header, the CVar only if somebody set it. This is the AFTER arm by definition — it is
+	// whatever the game is actually going to be played at, not a literal typed here.
+	const float After = TraceModeBTuning::CatchRadius();
+
+	// The BEFORE arm, derived from the request rather than hard-coded: spec v12 §4 is "reduce the
+	// magnet radius by 10%", so the value it was reduced FROM is the shipped radius / 0.9. Deriving
+	// it means the two arms cannot drift apart if the shipped number is retuned again — re-run and
+	// the comparison is still "this value against the 10% it was cut from".
+	const float Before = After / 0.9f;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] CATCHTEST: spec v12 §4 is a 10%% cut, so this runs BOTH arms - BEFORE %.0f uu ")
+		TEXT("(= shipped / 0.9) and AFTER %.0f uu (the shipped value, live from UTraceSettings/ini). ")
+		TEXT("Same sweep, same steering function, same frame rate; the only difference is the radius."),
+		Before, After);
+
+	RunModeBCatchTestAtRadius(Before, TEXT("BEFORE 500"));
+	RunModeBCatchTestAtRadius(After, TEXT("AFTER  450"));
+}
+
+static FAutoConsoleCommand GTraceModeBCatchTestCmd(
+	TEXT("Trace.ModeB.CatchTest"),
+	TEXT("MODE B, spec v12 §4. Sweeps miss distance x Core speed through the SHIPPED catch-zone steering ")
+	TEXT("and reports the catch rate against a no-magnet baseline, at BOTH the shipped radius and the ")
+	TEXT("radius it was cut from (shipped / 0.9). Takes no arguments on purpose - see the block comment."),
+	FConsoleCommandDelegate::CreateStatic(&RunModeBCatchTest));
+
 int32 ATraceCore::GoalsByMethod[static_cast<int32>(ATraceCore::EGoalMethod::Count)] = {};
 
 static FAutoConsoleCommand GTraceModeBTallyCmd(
@@ -4290,18 +4571,8 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 		return;   // Already there; the pickup poll has it this frame.
 	}
 
-	// Falloff: full strength on the capsule, nothing at the edge of the zone. This is what makes the
-	// zone read as a catch rather than as a wall of magnetism you can feel the boundary of.
-	const double Falloff = 1.0 - FMath::Clamp(BestSurfaceDistance / static_cast<double>(Radius), 0.0, 1.0);
-
-	// Exponential approach, so the curve is identical at 30 fps and at 240. Alpha is the fraction of
-	// the remaining aim error removed this frame.
-	const double Alpha = 1.0 - FMath::Exp(-static_cast<double>(Curve) * Falloff * static_cast<double>(DeltaSeconds));
-
-	// DIRECTION ONLY. Renormalised to the speed it already had - see the tuning block for why a
-	// magnet that also accelerated the Core is a different (and unasked-for) mechanic.
-	const FVector Steered = FMath::Lerp(Speed3D / Speed, ToTarget.GetSafeNormal(), Alpha).GetSafeNormal();
-	LooseVelocity = Steered * Speed;
+	LooseVelocity = TraceModeBTuning::SteerTowardCatchPoint(
+		CoreLocation, LooseVelocity, BestPoint, BestSurfaceDistance, Radius, Curve, DeltaSeconds);
 
 	// Announced ONCE per catch, at Display, and only when the target changes. The catch zone is
 	// invisible by design, and an invisible mechanic with no log line is one nobody can tell is

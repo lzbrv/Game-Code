@@ -269,7 +269,7 @@ void UTraceWeaponComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	// TO EVERYONE, not COND_SkipOwner, and both for the same reason: the movement component reads
-	// the selector on every machine to apply the knife's +30% ground speed, so a client that did not
+	// the selector on every machine to apply the knife's +22% ground speed, so a client that did not
 	// receive its own value would be corrected into the speed instead of predicting it. The owner
 	// having predicted the same value already makes the update a no-op, not a fight.
 	DOREPLIFETIME(UTraceWeaponComponent, EquippedWeapon);
@@ -503,7 +503,7 @@ void UTraceWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 	// --- EVERY RENDERING MACHINE: the knife you can see ------------------------------------------
 	//
 	// Deliberately BEFORE the locally-controlled gate. The third-person knife in an enemy's hand is
-	// the tell that they are 30% faster and cannot shoot back, and that tell has to appear on the
+	// the tell that they are 22% faster and cannot shoot back, and that tell has to appear on the
 	// machines watching them, none of which control that pawn.
 	UpdateKnifeVisuals(DeltaTime);
 
@@ -1340,11 +1340,39 @@ void UTraceWeaponComponent::TickSwing(float /*DeltaTime*/)
 	FTraceMeleeHit Predicted;
 	TraceMelee::ResolveSwing(World, Character, Origin, Dir, static_cast<float>(SwingServerTime), Predicted);
 
-	// The swinger draws their own slash immediately; MulticastSwingEffects skips them for it, the
-	// same owner-skipping contract the tracer has.
-	ATraceMeleeArc::Spawn(World, Origin, Dir, TraceMelee::GetSwingAxis(Character, Dir),
-		TraceMelee::GetSwingArcDegrees(), TraceMelee::GetSwingRangeUU(),
-		TraceTeamColor(Character->GetTeam()), Predicted.Victim != nullptr);
+	// ---------------------------------------------------------------------------------------------
+	// NO SLASH ACTOR IS SPAWNED HERE ANY MORE. SPEC v12 §2, verbatim: "Take the 3d 'swipe' line
+	// animation of the knife out of the player's view."
+	//
+	// This call site was the swinger's OWN copy of ATraceMeleeArc — a fan of emissive chords swept
+	// across 140 degrees at blade-tip radius, drawn 140 uu in front of the camera, which is what the
+	// user was looking at when they asked for it to go. It is deleted rather than made conditional:
+	// there is no state in which the swinger wants a lateral arc drawn over their own crosshair now
+	// that the motion is a thrust.
+	//
+	// WHAT REPLACES IT is the viewmodel itself — UpdateKnifeVisuals now drives KnifeViewRoot forward
+	// and back rather than across, so the swinger's read is the blade going out and coming home. That
+	// is procedural, and deliberately so; see the note there.
+	//
+	// THE THIRD-PERSON SLASH IS UNTOUCHED. MulticastSwingEffects still spawns one for everybody
+	// ELSE, because a victim with no first-person blade to look at needs some tell that a hundred
+	// damage just came from a direction, and it is drawn with the same GetSwingArcDegrees() the
+	// server actually resolved — drawn volume and lethal volume stay equal. Reshaping that actor into
+	// a thrust belongs to whoever owns TraceMeleeArc.cpp; see the pass report.
+	//
+	// THE LOCAL RESOLVE ABOVE IS KEPT even though nothing cosmetic consumes it now. It is the client
+	// half of the "compare the two resolutions line for line" contract in TraceMelee.h's FTraceMeleeHit
+	// comment, and it is the only way a mispredicted swing is visible in a log at all — the server's
+	// verdict alone cannot show a disagreement. It costs one 15-ray sweep per 0.5 s per player and
+	// applies no damage on any client, ever.
+	// ---------------------------------------------------------------------------------------------
+	if (TraceMelee::IsDebugLoggingEnabled())
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Knife] %s predicted swing: victim %s, %s, %.0f damage (client-side, cosmetic only)"),
+			*GetNameSafe(Character), *GetNameSafe(Predicted.Victim),
+			Predicted.bBackstab ? TEXT("BACKSTAB") : TEXT("front"), Predicted.Damage);
+	}
 
 	ServerSwing(FVector_NetQuantize(Origin), FVector_NetQuantizeNormal(Dir), static_cast<float>(SwingServerTime));
 }
@@ -1398,7 +1426,7 @@ bool UTraceWeaponComponent::RequestEquip(ETraceEquippedWeapon Desired, ETraceMel
 	{
 		// HANDS FULL. The Core is carried in both hands and in third person; a carrier who could put
 		// a knife away and take it back out would be choosing between two weapons neither of which
-		// they may use, and would be collecting the +30% movement bonus while doing it. See
+		// they may use, and would be collecting the +22% movement bonus while doing it. See
 		// TraceMelee.h. The weapon they were holding is untouched and comes back when they let go.
 		return Refuse(ETraceMeleeRefusal::Carrying);
 	}
@@ -1676,7 +1704,7 @@ void UTraceWeaponComponent::ServerSwing_Implementation(FVector_NetQuantize Origi
 	// reaches 180 uu, so the same 500 uu would let a client swing from nearly four blade-lengths
 	// away — i.e. it would be the dominant term in the weapon's range rather than a rounding
 	// allowance. 200 uu still covers the capsule, the muzzle offset and a couple of frames of
-	// movement at knife speed (1040 uu/s is 17 uu per frame at 60 Hz).
+	// movement at knife speed (976 uu/s is 16 uu per frame at 60 Hz).
 	constexpr double MaxSwingOriginErrorUU = 200.0;
 
 	FVector SwingOrigin(Origin);
@@ -1957,7 +1985,7 @@ void UTraceWeaponComponent::TickBotKnife()
 	const double Engage = TraceMelee::GetBotEngageRangeUU();
 	const double Disengage = TraceMelee::GetBotDisengageRangeUU();
 
-	// The band IS the rule: inside Engage the +30% makes the knife the correct chase tool, outside
+	// The band IS the rule: inside Engage the +22% makes the knife the correct chase tool, outside
 	// Disengage it is not, and the gap between them is what stops a bot at the boundary thrashing.
 	if (!IsKnifeEquipped())
 	{
@@ -2058,15 +2086,103 @@ namespace TraceKnifeLayout
 	const FVector HandOffset(-2.f, 4.f, 0.f);
 	const FRotator HandRotation(0.f, 0.f, 0.f);
 
-	/** Swing animation. Wind-up back and up, sweep across and down, then ease home. */
-	constexpr float WindupYaw = 34.f;
-	constexpr float WindupRoll = -26.f;
-	constexpr float WindupBackUU = 5.5f;
-	constexpr float SweepYaw = -58.f;
-	constexpr float SweepRoll = 46.f;
-	constexpr float SweepForwardUU = 9.0f;
-	constexpr float SweepAcrossUU = -7.0f;
-	constexpr float SweepDownUU = -3.0f;
+	// ---------------------------------------------------------------------------------------------
+	// THE STAB  (spec v12 §2: "Can you make the knife animation a stab instead of a swipe?")
+	//
+	// SAY THIS PLAINLY: THIS IS A PROCEDURAL VIEWMODEL MOTION, NOT AN AUTHORED ANIMATION. Epic's
+	// Mannequin ships no stab, no slash and no melee sequence of any kind — the imported set is
+	// Death, Jump, Pistol, Rifle and Unarmed locomotion, verified previously, and it is the same
+	// absence that forced UpdateCrouchPresentation to pose the slide by hand. There is no sequence to
+	// play, so the motion is arithmetic on KnifeViewRoot's relative transform, three keyframes deep.
+	//
+	// WHAT CHANGED FROM THE SWIPE IT REPLACES, and it is the whole point of the request: the old
+	// motion's signature was SweepYaw -58 and SweepRoll +46, i.e. the blade travelled ACROSS the
+	// screen and rolled over as it went. A stab has no lateral signature at all. Everything below is
+	// dominated by +X — straight out of the lens, down the aim ray — with only a few degrees of yaw
+	// and pitch so it reads as an arm rather than as a mesh sliding on rails. Roll is gone entirely;
+	// roll is what made it a slash.
+	//
+	// FAST OUT, SLOWER RETURN, which is the shape the spec asked for and also the shape of a real
+	// thrust: the arm commits in a snap and recovers under control. Out is a quarter of the
+	// post-windup time, the return is the other three quarters — see UpdateKnifeVisuals.
+	//
+	// DEPTH ARITHMETIC, which has to keep holding (see the layout note at the top of this namespace):
+	// the deepest point of the rig is the blade tip at x = 21.4 + 3.6/2 ~= 23 uu. A 16 uu thrust puts
+	// it at ~39 uu. The gun's muzzle sits at 76 uu and is the piece that had to clear the capsule, so
+	// the fully extended blade is still barely half way there and can never intersect the world.
+	// Raising ThrustForwardUU past ~50 would start to matter; do not.
+
+	/** Cock: the blade draws back and the tip lifts, ready to go. Eased IN, so it loads the thrust. */
+	constexpr float CockBackUU = 4.6f;
+	constexpr float CockUpUU = 1.4f;
+	constexpr float CockInboardUU = 1.2f;
+	constexpr float CockPitch = -13.f;
+	constexpr float CockYaw = 8.f;
+
+	/** Thrust: out along the lens axis and slightly toward the crosshair. The lateral terms are small
+	 *  ON PURPOSE — anything larger reads as the swipe this replaced. */
+	constexpr float ThrustForwardUU = 16.0f;
+	constexpr float ThrustInboardUU = -2.4f;
+	constexpr float ThrustUpUU = 1.0f;
+	constexpr float ThrustPitch = 6.f;
+	constexpr float ThrustYaw = -5.f;
+
+	/** Fraction of the post-cock time spent going OUT. The rest is the return. 0.25 => 1:3, fast:slow. */
+	constexpr float ThrustOutFraction = 0.25f;
+
+	/**
+	 * THE STAB CURVE, and the only copy of it.
+	 *
+	 * @param Alpha       0..1 through the whole animation.
+	 * @param CockEnd     where the cock beat ends, as a fraction of Alpha (the wind-up over the anim).
+	 * @param OutOffset   relative translation for KnifeViewRoot, in rig space (+X out of the lens).
+	 * @param OutRotation relative rotation. Roll is always zero — roll is what made the old motion a
+	 *                    swipe, and its absence is half of what makes this one a stab.
+	 *
+	 * Shared by UpdateKnifeVisuals (which renders it) and Trace.Knife.StabProfile (which measures
+	 * it). One derivation on purpose: the profile command's whole job is to say whether the motion is
+	 * forward-dominant and fast-out/slow-return, and it could not answer that about a curve it had
+	 * its own copy of.
+	 */
+	inline void ComputeStabPose(float Alpha, float CockEnd, FVector& OutOffset, FRotator& OutRotation)
+	{
+		// The two poses the motion interpolates between, named once so the three beats cannot
+		// disagree about where "cocked" and "extended" are.
+		const FVector CockOffset(-CockBackUU, CockInboardUU, CockUpUU);
+		const FRotator CockRotation(CockPitch, CockYaw, 0.f);
+		const FVector ThrustOffset(ThrustForwardUU, ThrustInboardUU, ThrustUpUU);
+		const FRotator ThrustRotation(ThrustPitch, ThrustYaw, 0.f);
+
+		Alpha = FMath::Clamp(Alpha, 0.f, 1.f);
+		CockEnd = FMath::Clamp(CockEnd, 0.05f, 0.6f);
+
+		if (Alpha < CockEnd)
+		{
+			const float T = FMath::Clamp(Alpha / CockEnd, 0.f, 1.f);
+			const float Eased = T * T;                                   // ease in: loads the thrust
+			OutOffset = FMath::Lerp(FVector::ZeroVector, CockOffset, Eased);
+			OutRotation = FMath::Lerp(FRotator::ZeroRotator, CockRotation, Eased);
+			return;
+		}
+
+		// Where we are inside the post-cock portion, 0..1.
+		const float Post = FMath::Clamp((Alpha - CockEnd) / FMath::Max(0.01f, 1.f - CockEnd), 0.f, 1.f);
+		const float OutEnd = FMath::Clamp(ThrustOutFraction, 0.05f, 0.9f);
+
+		if (Post < OutEnd)
+		{
+			const float T = FMath::Clamp(Post / OutEnd, 0.f, 1.f);
+			const float Eased = 1.f - FMath::Square(1.f - T);            // ease out: snap, then settle
+			OutOffset = FMath::Lerp(CockOffset, ThrustOffset, Eased);
+			OutRotation = FMath::Lerp(CockRotation, ThrustRotation, Eased);
+			return;
+		}
+
+		const float T = FMath::Clamp((Post - OutEnd) / FMath::Max(0.01f, 1.f - OutEnd), 0.f, 1.f);
+		const float Eased = T * T * (3.f - 2.f * T);                     // smoothstep home
+		OutOffset = FMath::Lerp(ThrustOffset, FVector::ZeroVector, Eased);
+		OutRotation = FMath::Lerp(ThrustRotation, FRotator::ZeroRotator, Eased);
+	}
 }
 
 bool UTraceWeaponComponent::IsViewModelHandPart(const UStaticMeshComponent* Part)
@@ -2306,12 +2422,123 @@ void UTraceWeaponComponent::EnsureKnifeVisualsBuilt()
 	}
 }
 
-void UTraceWeaponComponent::SetGunViewModelHidden(bool bHidden)
+#if !UE_BUILD_SHIPPING
+/**
+ * Restores the EXACT pre-v12 SetGunViewModelHidden — the early-return latch that caused "the knife
+ * and gun can be held at the same time".
+ *
+ * A TEST HOOK, defaulting to the fix being on, and it exists for the same reason
+ * Trace.Knife.CarrierImmune does: a harness that has never gone RED is not evidence. With this at 1,
+ * Trace.Knife.DualWeaponTest reproduces the user's bug on demand, on the shipped build, and prints
+ * the exact census that proves it. Never ship 1.
+ */
+static TAutoConsoleVariable<int32> CVarKnifeLegacyGunHideLatch(
+	TEXT("Trace.Knife.LegacyGunHideLatch"), 0,
+	TEXT("Dev only. 1 restores the pre-v12 latched gun-hiding, i.e. PUTS THE DUAL-WEAPON BUG BACK, so "
+	     "Trace.Knife.DualWeaponTest can be shown failing on a working build. Never ship 1."),
+	ECVF_Cheat);
+#endif
+
+void UTraceWeaponComponent::RefreshGunPartCache(const ATraceCharacter& Character)
 {
-	if (bGunViewModelHidden == bHidden)
+	// ViewModelRoot's direct children are the gun's parts, the hands/forearms, and KnifeViewRoot
+	// (a USceneComponent, so the cast drops it). ATraceCharacter builds its rig ONCE, lazily, the
+	// first frame the pawn turns out to be locally controlled — which is usually AFTER this component
+	// has started ticking — so the cache is keyed on the child count and rebuilds itself when the rig
+	// appears underneath it. Without that, an empty cache taken on frame one would be permanent and
+	// the gun would never be hidden at all.
+	const int32 ChildCount = Character.ViewModelRoot->GetNumChildrenComponents();
+	if (ChildCount == CachedViewModelChildCount && CachedGunParts.Num() > 0)
 	{
 		return;
 	}
+	CachedViewModelChildCount = ChildCount;
+	CachedGunParts.Reset();
+
+	TArray<USceneComponent*> Children;
+	Character.ViewModelRoot->GetChildrenComponents(/*bIncludeAllDescendants=*/false, Children);
+
+	for (USceneComponent* Child : Children)
+	{
+		UStaticMeshComponent* Part = Cast<UStaticMeshComponent>(Child);
+		if (Part == nullptr || KnifeViewParts.Contains(Part) || KnifeHandParts.Contains(Part))
+		{
+			continue;
+		}
+		if (IsViewModelHandPart(Part))
+		{
+			// The hands and forearms stay with either weapon. A knife held by nothing is a worse
+			// read than no knife, so they are not in this list and are never written to.
+			continue;
+		}
+		CachedGunParts.Add(Part);
+	}
+}
+
+void UTraceWeaponComponent::SetGunViewModelHidden(bool bHidden)
+{
+	// ===============================================================================================
+	// SPEC v12 §7 — "There's a bug where the knife and gun can be held at the same time."
+	//
+	// DIAGNOSED, REPRODUCED AND FIXED HERE. It was never a state bug: EquippedWeapon is a single
+	// replicated selector and cannot hold both. It was this function, and it had two defects that
+	// compounded.
+	//
+	// DEFECT 1 — THE LATCH. This used to open with `if (bGunViewModelHidden == bHidden) return;`,
+	// which made it a one-shot edge trigger. But it is not the only writer of those components'
+	// visibility: ATraceCharacter::SetViewModelVisible(true) sets EVERY part of ViewModelParts
+	// visible, gun included, and it runs whenever the rig comes back — the carry blend returning to
+	// first person, or a respawn. At that moment bGunViewModelHidden was still true, so this
+	// function's next call early-returned and the gun stayed on screen NEXT TO THE KNIFE. That is
+	// the user's bug, exactly, and the comment three lines up in UpdateKnifeVisuals claimed the code
+	// was "re-asserting rather than latching" while this function did the opposite. Reproduction:
+	// equip the knife, go third person and come back (Trace.ForceThirdPerson 1 then 0, which is the
+	// same SetViewModelVisible path the Core carry uses), and both weapons are drawn. Measured, in
+	// exactly that order, by Trace.Knife.DualWeaponTest.
+	//
+	// DEFECT 2 — RE-SHOWING A GUN THAT SHOULD BE GONE. The old body wrote SetVisibility(!bHidden)
+	// unconditionally, so on the frame a knife-holding player DIED, UpdateKnifeVisuals' call with
+	// bHidden=false put the gun back on screen over the death camera — after ATraceCharacter had just
+	// hidden the whole rig for the corpse. Two owners, opposite intentions, last writer wins.
+	//
+	// THE RULE THAT REPLACES BOTH, and it is the only rule this function has:
+	//
+	//     a gun part is visible  <=>  the character wants the rig on screen  AND  no knife is out.
+	//
+	// The character's half is asked for, every time, rather than remembered — IsViewModelVisible() is
+	// its own settled answer, folding in the carry blend, the corpse and the respawn. So this can
+	// only ever REMOVE the gun from a rig the character is showing; it can never resurrect one the
+	// character has hidden. Re-asserted every tick from UpdateKnifeVisuals, from a cached part list so
+	// there is no per-frame allocation, and SetVisibility itself is a no-op when nothing changed.
+	// ===============================================================================================
+
+#if !UE_BUILD_SHIPPING
+	// THE RED ARM. Byte for byte the behaviour described above as DEFECT 1 and DEFECT 2: latch on the
+	// requested state, then write the raw !bHidden with no regard for what the character wants. See
+	// CVarKnifeLegacyGunHideLatch.
+	if (CVarKnifeLegacyGunHideLatch.GetValueOnAnyThread() != 0)
+	{
+		if (bGunViewModelHidden == bHidden)
+		{
+			return;
+		}
+		ATraceCharacter* LegacyCharacter = GetTraceCharacter();
+		if (LegacyCharacter == nullptr || LegacyCharacter->ViewModelRoot == nullptr)
+		{
+			return;
+		}
+		bGunViewModelHidden = bHidden;
+		RefreshGunPartCache(*LegacyCharacter);
+		for (const TObjectPtr<UStaticMeshComponent>& Part : CachedGunParts)
+		{
+			if (Part != nullptr)
+			{
+				Part->SetVisibility(!bHidden);
+			}
+		}
+		return;
+	}
+#endif
 
 	ATraceCharacter* Character = GetTraceCharacter();
 	if (Character == nullptr || Character->ViewModelRoot == nullptr)
@@ -2321,22 +2548,16 @@ void UTraceWeaponComponent::SetGunViewModelHidden(bool bHidden)
 
 	bGunViewModelHidden = bHidden;
 
-	TArray<USceneComponent*> Children;
-	Character->ViewModelRoot->GetChildrenComponents(/*bIncludeAllDescendants=*/false, Children);
+	RefreshGunPartCache(*Character);
 
-	for (USceneComponent* Child : Children)
+	const bool bWantGunParts = Character->IsViewModelVisible() && !bHidden;
+
+	for (const TObjectPtr<UStaticMeshComponent>& Part : CachedGunParts)
 	{
-		UStaticMeshComponent* Part = Cast<UStaticMeshComponent>(Child);
-		if (Part == nullptr || KnifeViewParts.Contains(Part))
+		if (Part != nullptr)
 		{
-			continue;
+			Part->SetVisibility(bWantGunParts);
 		}
-		if (IsViewModelHandPart(Part))
-		{
-			// The hands and forearms stay. A knife held by nothing is a worse read than no knife.
-			continue;
-		}
-		Part->SetVisibility(!bHidden);
 	}
 }
 
@@ -2385,20 +2606,40 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 		}
 
 		// The gun goes away exactly when the knife comes out, and comes back when it does not.
+		//
+		// UNCONDITIONAL, EVERY TICK, AND THAT IS THE FIX FOR SPEC v12 §7. ATraceCharacter is the
+		// other writer of these components and it re-shows the whole rig on its own schedule (the
+		// carry blend, a respawn); an edge-triggered call would miss that and leave a gun on screen
+		// beside the knife. See SetGunViewModelHidden, which now states the rule instead of
+		// remembering an edge.
 		SetGunViewModelHidden(bKnife && bAlive);
 
 		if (bWantView && KnifeViewRoot != nullptr)
 		{
-			// --- The swing, as a transform ------------------------------------------------------
+			// --- The stab, as a transform  (spec v12 §2) ----------------------------------------
 			//
-			// THIS IS THE SWINGER'S ENTIRE READ, and it is why the blade resolves on a wind-up
-			// instead of on the press: the damage lands as the edge crosses the middle of the sweep,
-			// which is the frame a player would point at and say "there".
+			// THIS IS THE SWINGER'S ENTIRE READ now that the 3D slash line has been taken out of
+			// their view, and it is PROCEDURAL: there is no stab animation in the imported Mannequin
+			// set (Death, Jump, Pistol, Rifle, Unarmed locomotion — nothing melee), so the motion is
+			// this arithmetic and nothing else. See TraceKnifeLayout for the constants and for the
+			// depth check that keeps the extended blade inside the capsule's clearance.
+			//
+			// THREE BEATS, and the middle one is the request:
+			//   COCK    0 .. windup. Blade draws back and the tip lifts. Eased IN (T^2), so it
+			//           accelerates into the thrust instead of arriving at the cocked pose and
+			//           stopping. This is also the window the blade resolves in.
+			//   THRUST  a quarter of what is left. Eased OUT, so it snaps to full extension and
+			//           decelerates there — a punch, not a slide.
+			//   RETURN  the remaining three quarters, smoothstepped home. FAST OUT, SLOWER RETURN is
+			//           what §2 asked for, and 1:3 is the ratio that reads as a recovery rather than
+			//           as a rewind.
 			//
 			// Written to KnifeViewRoot, a CHILD of ViewModelRoot, so it composes with the sway and
 			// bob the character is writing to the parent rather than overwriting them. And nothing
 			// in TraceMelee::ResolveSwing reads any of it — the arc that was actually cut is pure
-			// arithmetic on the aim ray, so the blade may lag and overshoot as much as it likes.
+			// arithmetic on the aim ray, so the blade may lag and overshoot as much as it likes. That
+			// separation is why the animation could be replaced outright without touching one line of
+			// hit resolution.
 			const double Elapsed = GetLocalTimeSeconds() - SwingAnimStartLocalTime;
 			const double AnimLength = static_cast<double>(TraceMelee::GetSwingAnimSeconds());
 
@@ -2407,36 +2648,15 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 
 			if (Elapsed >= 0.0 && Elapsed <= AnimLength)
 			{
-				const float WindupEnd = FMath::Clamp(
-					TraceMelee::GetSwingWindupSeconds() / FMath::Max(0.01f, TraceMelee::GetSwingAnimSeconds()), 0.05f, 0.6f);
-				const float Alpha = static_cast<float>(Elapsed / FMath::Max(0.01, AnimLength));
-
-				if (Alpha < WindupEnd)
-				{
-					// Wind-up: back, up and cocked. Eased IN, so it accelerates into the sweep.
-					const float T = FMath::Clamp(Alpha / WindupEnd, 0.f, 1.f);
-					const float Eased = T * T;
-					Offset = FVector(-TraceKnifeLayout::WindupBackUU * Eased, 0.f, 1.5f * Eased);
-					Rotation = FRotator(0.f, TraceKnifeLayout::WindupYaw * Eased, TraceKnifeLayout::WindupRoll * Eased);
-				}
-				else
-				{
-					// Sweep and settle: one eased-out arc from the cocked pose through the strike
-					// and back to rest. One curve, not two, so there is no visible seam at the
-					// moment of impact.
-					const float T = FMath::Clamp((Alpha - WindupEnd) / FMath::Max(0.01f, 1.f - WindupEnd), 0.f, 1.f);
-					const float Strike = FMath::Sin(T * PI);                 // 0 -> 1 -> 0
-					const float Travel = 1.f - FMath::Square(1.f - T);       // 0 -> 1, eased out
-
-					Offset = FVector(
-						FMath::Lerp(-TraceKnifeLayout::WindupBackUU, 0.f, Travel) + TraceKnifeLayout::SweepForwardUU * Strike,
-						TraceKnifeLayout::SweepAcrossUU * Strike,
-						FMath::Lerp(1.5f, 0.f, Travel) + TraceKnifeLayout::SweepDownUU * Strike);
-					Rotation = FRotator(
-						0.f,
-						FMath::Lerp(TraceKnifeLayout::WindupYaw, 0.f, Travel) + TraceKnifeLayout::SweepYaw * Strike,
-						FMath::Lerp(TraceKnifeLayout::WindupRoll, 0.f, Travel) + TraceKnifeLayout::SweepRoll * Strike);
-				}
+				// ONE derivation, shared with Trace.Knife.StabProfile — which walks this same curve at
+				// 1 ms and reports whether the motion is actually a thrust. A test that re-derived the
+				// curve would be measuring its own copy, which is how "the animation is a stab" becomes
+				// a claim instead of a number.
+				TraceKnifeLayout::ComputeStabPose(
+					static_cast<float>(Elapsed / FMath::Max(0.01, AnimLength)),
+					FMath::Clamp(TraceMelee::GetSwingWindupSeconds()
+						/ FMath::Max(0.01f, TraceMelee::GetSwingAnimSeconds()), 0.05f, 0.6f),
+					Offset, Rotation);
 			}
 
 			KnifeViewRoot->SetRelativeLocationAndRotation(Offset, Rotation);
@@ -2448,8 +2668,15 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 	// No animation here on purpose. The imported Mannequin set has no melee sequence (the same
 	// absence that forced UpdateCrouchPresentation to pose the slide by hand), so the arm will not
 	// swing — ATraceMeleeArc draws the cut instead, which is the information a victim actually needs.
-	// What this rig carries is the STATE: a visible blade means that player is 30% faster and cannot
+	// What this rig carries is the STATE: a visible blade means that player is 22% faster and cannot
 	// shoot, and that is worth reading across the arena.
+	//
+	// THERE IS NO THIRD-PERSON GUN MESH ANYWHERE IN THIS PROJECT, which is why spec v12 §7's third
+	// suspect ("the third-person attachment showing both to other players") could be ruled out rather
+	// than fixed: ATraceCharacter builds a first-person viewmodel and nothing else, so the only weapon
+	// another player can ever see on your body is this knife. The dual-weapon bug was first-person
+	// only, and Trace.Knife.DualWeaponTest reports both censuses so that stays checkable rather than
+	// remembered.
 	if (bKnifeHandBuilt)
 	{
 		const bool bWantHand = bKnife && bAlive;
@@ -2468,6 +2695,595 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 }
 
 #if !UE_BUILD_SHIPPING
+
+void UTraceWeaponComponent::GetViewModelCensus(int32& OutGunVisible, int32& OutKnifeVisible,
+	int32& OutHandVisible, int32& OutBodyKnife) const
+{
+	OutGunVisible = 0;
+	OutKnifeVisible = 0;
+	OutHandVisible = 0;
+	OutBodyKnife = 0;
+
+	const ATraceCharacter* Character = GetTraceCharacter();
+	if (Character == nullptr)
+	{
+		return;
+	}
+
+	// The knife rigs first, from our own lists.
+	for (const TObjectPtr<UStaticMeshComponent>& Part : KnifeViewParts)
+	{
+		if (Part != nullptr && Part->IsVisible())
+		{
+			++OutKnifeVisible;
+		}
+	}
+	for (const TObjectPtr<UStaticMeshComponent>& Part : KnifeHandParts)
+	{
+		if (Part != nullptr && Part->IsVisible())
+		{
+			++OutBodyKnife;
+		}
+	}
+
+	// The gun, walked live rather than through CachedGunParts. A census that trusted the same cache
+	// the fix writes through could agree with a broken fix; this asks the rig itself.
+	if (Character->ViewModelRoot == nullptr)
+	{
+		return;
+	}
+	TArray<USceneComponent*> Children;
+	Character->ViewModelRoot->GetChildrenComponents(/*bIncludeAllDescendants=*/false, Children);
+	for (USceneComponent* Child : Children)
+	{
+		const UStaticMeshComponent* Part = Cast<UStaticMeshComponent>(Child);
+		if (Part == nullptr || KnifeViewParts.Contains(Part) || !Part->IsVisible())
+		{
+			continue;
+		}
+		if (IsViewModelHandPart(Part))
+		{
+			++OutHandVisible;
+		}
+		else
+		{
+			++OutGunVisible;
+		}
+	}
+}
+
+// =================================================================================================
+// Trace.Knife.StabProfile — the unattended proof for spec v12 §2.
+//
+// Verbatim: "Take the 3d 'swipe' line animation of the knife out of the player's view. Can you make
+// the knife animation a stab instead of a swipe?"
+//
+// "IT LOOKS LIKE A STAB NOW" IS NOT A MEASUREMENT, and this project has been burned by exactly that
+// class of claim. A stab and a swipe are distinguishable as numbers, so this walks the shipped curve
+// — TraceKnifeLayout::ComputeStabPose, the same function the viewmodel renders from, not a copy — at
+// 1 ms over the whole animation and reports four things, each with a threshold:
+//
+//   FORWARD DOMINANCE   peak |+X| against peak |Y|. A thrust travels down the lens; a swipe travels
+//                       across it. The old motion's peaks were 9.0 forward against 7.0 lateral, i.e.
+//                       barely forward-biased at all, on top of a 58 degree yaw sweep. Requires the
+//                       forward peak to be at least 3x the lateral one.
+//   ROLL                must be exactly 0. Roll is what reads as a slash; the old motion rolled 46
+//                       degrees through the strike.
+//   YAW SWEEP           total yaw excursion. The old motion swept 34 -> -58, i.e. 92 degrees across
+//                       the screen. Requires under 25.
+//   OUT vs RETURN       time from the cocked pose to full extension, against the time from full
+//                       extension back to rest. §2 asks for fast out and slower return, so the
+//                       return must be strictly longer than the out-stroke.
+//
+// It also prints the extended blade's depth so the framing arithmetic in TraceKnifeLayout stays
+// honest: the tip must stay well short of the 76 uu the gun's muzzle needed to clear the capsule.
+//
+// World-free and instant, so it runs anywhere — including in the same -ExecCmds list as the angle
+// test, before a pawn exists.
+// =================================================================================================
+
+int32 TraceRunStabProfile()
+{
+	int32 Failures = 0;
+
+	const float AnimSeconds = TraceMelee::GetSwingAnimSeconds();
+	const float CockEnd = FMath::Clamp(
+		TraceMelee::GetSwingWindupSeconds() / FMath::Max(0.01f, AnimSeconds), 0.05f, 0.6f);
+
+	constexpr int32 Samples = 1000;                     // 1 ms at a 0.32 s animation, near enough
+	float PeakForward = 0.f;
+	float PeakBackward = 0.f;
+	float PeakLateral = 0.f;
+	float PeakRoll = 0.f;
+	float MinYaw = 0.f;
+	float MaxYaw = 0.f;
+	float ForwardPeakAlpha = 0.f;
+
+	for (int32 Index = 0; Index <= Samples; ++Index)
+	{
+		const float Alpha = static_cast<float>(Index) / static_cast<float>(Samples);
+
+		FVector Offset = FVector::ZeroVector;
+		FRotator Rotation = FRotator::ZeroRotator;
+		TraceKnifeLayout::ComputeStabPose(Alpha, CockEnd, Offset, Rotation);
+
+		if (static_cast<float>(Offset.X) > PeakForward)
+		{
+			PeakForward = static_cast<float>(Offset.X);
+			ForwardPeakAlpha = Alpha;
+		}
+		PeakBackward = FMath::Max(PeakBackward, -static_cast<float>(Offset.X));
+		PeakLateral = FMath::Max(PeakLateral, FMath::Abs(static_cast<float>(Offset.Y)));
+		PeakRoll = FMath::Max(PeakRoll, FMath::Abs(static_cast<float>(Rotation.Roll)));
+		MinYaw = FMath::Min(MinYaw, static_cast<float>(Rotation.Yaw));
+		MaxYaw = FMath::Max(MaxYaw, static_cast<float>(Rotation.Yaw));
+	}
+
+	// The two stroke durations, in seconds, from the curve's own structure.
+	const float CockSeconds = CockEnd * AnimSeconds;
+	const float OutSeconds = ForwardPeakAlpha * AnimSeconds - CockSeconds;
+	const float ReturnSeconds = AnimSeconds - ForwardPeakAlpha * AnimSeconds;
+	const float YawSweep = MaxYaw - MinYaw;
+
+	UE_LOG(LogTraceGame, Display, TEXT("========== TRACE KNIFE STAB PROFILE (spec v12 s2) =========="));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[StabProfile] PROCEDURAL viewmodel motion — the Mannequin set ships no melee sequence, so "
+		     "there is no authored stab to play and this curve IS the animation."));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[StabProfile] anim %.3fs = cock %.3fs + out %.3fs + return %.3fs (full extension at alpha %.3f)"),
+		AnimSeconds, CockSeconds, OutSeconds, ReturnSeconds, ForwardPeakAlpha);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[StabProfile] travel: forward +%.2fuu, back -%.2fuu, lateral %.2fuu | roll %.2fdeg | yaw sweep %.2fdeg"),
+		PeakForward, PeakBackward, PeakLateral, PeakRoll, YawSweep);
+
+	auto Check = [&Failures](bool bCondition, const TCHAR* What, const FString& Detail)
+	{
+		if (bCondition)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[StabProfile] PASS  %-28s %s"), What, *Detail);
+		}
+		else
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error, TEXT("[StabProfile] FAIL  %-28s %s"), What, *Detail);
+		}
+	};
+
+	Check(PeakForward >= 3.f * PeakLateral, TEXT("forward-dominant"),
+		FString::Printf(TEXT("forward %.2fuu vs lateral %.2fuu (needs >= 3x — a swipe is lateral-dominant)"),
+			PeakForward, PeakLateral));
+
+	Check(FMath::IsNearlyZero(PeakRoll, 0.01f), TEXT("no roll"),
+		FString::Printf(TEXT("peak roll %.3fdeg (a slash rolls; the motion this replaced rolled 46)"), PeakRoll));
+
+	Check(YawSweep < 25.f, TEXT("no lateral sweep"),
+		FString::Printf(TEXT("yaw excursion %.2fdeg (needs < 25; the motion this replaced swept 92)"), YawSweep));
+
+	Check(ReturnSeconds > OutSeconds, TEXT("fast out, slower return"),
+		FString::Printf(TEXT("out %.3fs vs return %.3fs (spec v12 s2 asks for a fast thrust and a slower recovery)"),
+			OutSeconds, ReturnSeconds));
+
+	// Depth. The blade tip's rest position is x = 21.4 + 3.6/2 = 23.2 uu in rig space.
+	constexpr float BladeTipRestUU = 23.2f;
+	constexpr float MuzzleClearanceUU = 76.f;
+	const float ExtendedTip = BladeTipRestUU + PeakForward;
+	Check(ExtendedTip < MuzzleClearanceUU, TEXT("blade stays inside clearance"),
+		FString::Printf(TEXT("extended tip at %.1fuu vs the gun muzzle's %.0fuu, which is the depth that had to clear the capsule"),
+			ExtendedTip, MuzzleClearanceUU));
+
+	if (Failures == 0)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[StabProfile] 0 failures — the motion is a thrust, not a swipe."));
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("[StabProfile] %d failure(s)."), Failures);
+	}
+	UE_LOG(LogTraceGame, Display, TEXT("============================================================"));
+
+	return Failures;
+}
+
+static FAutoConsoleCommand GTraceStabProfileCmd(
+	TEXT("Trace.Knife.StabProfile"),
+	TEXT("Dev only. Spec v12 s2. Walks the shipped first-person knife motion at 1ms and reports whether "
+	     "it is a forward thrust (fast out, slower return, no roll, no lateral sweep) rather than a swipe."),
+	FConsoleCommandDelegate::CreateStatic([]() { TraceRunStabProfile(); }));
+
+// =================================================================================================
+// Trace.Knife.DualWeaponTest — the unattended proof for spec v12 §7.
+//
+// Verbatim: "There's a bug where the knife and gun can be held at the same time."
+//
+// WHY A HARNESS AND NOT A SCREENSHOT. The two rigs are OnlyOwnerSee first-person primitives, so the
+// only camera that can photograph them is the local player's, and a -RenderOffScreen run has no
+// window to photograph. More importantly a screenshot cannot be made to go RED on demand — and the
+// whole reason this file exists is that a fix nobody watched fail is not a fix. So this counts the
+// components that are actually VISIBLE at each step, through UTraceWeaponComponent::
+// GetViewModelCensus, which reads the components' own flags rather than either rig's opinion.
+//
+// TWO ARMS, RED FIRST, exactly as Trace.Knife.CarrierImmunityTest does it. Arm 0 restores the old
+// latched SetGunViewModelHidden via Trace.Knife.LegacyGunHideLatch and MUST reproduce the bug; arm 1
+// is the shipped code and must be clean. If red does not go red the verdict is NOT PROVEN, because a
+// green arm on its own only demonstrates that the harness can print zero.
+//
+// THE REPRODUCTION, and it is the shipping path rather than a poke at the members:
+//
+//   1  swap to the knife and wait out the 0.2 s pullout   -> expect gun 0, knife >0
+//   2  Trace.ForceThirdPerson 1, wait for the view blend  -> ATraceCharacter hides the whole rig,
+//                                                            exactly as picking up the Core does
+//   3  Trace.ForceThirdPerson 0, wait for the view blend  -> ATraceCharacter SHOWS the whole rig
+//                                                            again, gun parts included
+//   4  census                                             -> THE BUG: gun >0 AND knife >0
+//   5  swap to the gun and back to the knife four times, half of them sampled INSIDE the 0.2 s
+//      pullout — spec v12 §7's second suspect was a race in exactly that window
+//
+// Step 2/3 is not a contrivance: Trace.ForceThirdPerson feeds ATraceCharacter::WantsFirstPersonView,
+// which is the SAME input the Core carry uses, and UpdateViewBlend's SetViewModelVisible call is the
+// same line either way. Carrying the Core is simply the version of this that needs a Core, a pickup
+// and a live match; the cvar is the version an unattended run can drive in four seconds.
+//
+// AS MEASURED — see the pass report for the full logs. On a listen server the RED arm reports the
+// gun and the knife drawn together the instant the camera comes back to first person, and the GREEN
+// arm reports zero across every census point. Both numbers are logged at Display on purpose.
+// =================================================================================================
+
+namespace TraceDualWeaponTest
+{
+	/**
+	 * The pawn the local player is looking out of.
+	 *
+	 * Its own copy rather than TraceRecoilTest's, purely because that namespace is defined further
+	 * down this file and this harness is not worth a forward declaration for.
+	 */
+	ATraceCharacter* FindLocalTraceCharacter()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* TestWorld = Context.World();
+			if (TestWorld == nullptr || !TestWorld->IsGameWorld())
+			{
+				continue;
+			}
+			if (APlayerController* LocalController = TestWorld->GetFirstPlayerController())
+			{
+				if (ATraceCharacter* LocalCharacter = Cast<ATraceCharacter>(LocalController->GetPawn()))
+				{
+					return LocalCharacter;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	struct FState
+	{
+		enum class EPhase : uint8
+		{
+			ToKnife,        // swap, and wait out the pullout
+			ThirdPerson,    // force the camera out, wait for the blend
+			BackToFirst,    // release it, wait for the blend — this is where the bug lands
+			SwapCycle,      // repeated swaps, including one caught mid-pullout
+			Done
+		};
+
+		EPhase Phase = EPhase::ToKnife;
+		double PhaseStart = 0.0;
+		int32 CycleStep = 0;
+
+		int32 Failures = 0;
+		bool bAborted = false;
+		FString AbortReason;
+
+		/** Worst simultaneous count seen anywhere in the run. Non-zero is the bug, by definition. */
+		int32 WorstBothVisible = 0;
+
+		/**
+		 * 0 = RED (the pre-v12 latch restored, MUST reproduce the bug), 1 = GREEN (shipped).
+		 *
+		 * Both arms run, red first, and the verdict is NOT PROVEN unless red went red. That is the
+		 * project rule about harnesses that have never failed, applied to the one bug in this pass
+		 * whose only symptom is a pixel.
+		 */
+		int32 Arm = 0;
+
+		int32 RedFailures = -1;
+		int32 RedWorst = 0;
+	};
+
+	/** One census line. Returns true when BOTH weapons were on screen at once. */
+	bool Sample(const TSharedRef<FState>& State, const UTraceWeaponComponent* Weapon,
+		const ATraceCharacter* Character, const TCHAR* What)
+	{
+		if (Weapon == nullptr || Character == nullptr)
+		{
+			return false;
+		}
+
+		int32 Gun = 0;
+		int32 Knife = 0;
+		int32 Hands = 0;
+		int32 BodyKnife = 0;
+		Weapon->GetViewModelCensus(Gun, Knife, Hands, BodyKnife);
+
+		const bool bBoth = (Gun > 0 && Knife > 0);
+		if (bBoth)
+		{
+			State->WorstBothVisible = FMath::Max(State->WorstBothVisible, FMath::Min(Gun, Knife));
+			++State->Failures;
+		}
+
+		const FString Line = FString::Printf(
+			TEXT("[DualWeapon] %s  %-46s equipped=%-5s deploying=%d rigVisible=%d | 1P gun=%d knife=%d hands=%d | 3P knife=%d"),
+			bBoth ? TEXT("*** BOTH ***") : TEXT("ok          "),
+			What, LexToString(Weapon->GetEquippedWeapon()), Weapon->IsDeploying() ? 1 : 0,
+			Character->IsViewModelVisible() ? 1 : 0, Gun, Knife, Hands, BodyKnife);
+
+		if (bBoth)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("%s"), *Line);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("%s"), *Line);
+		}
+		return bBoth;
+	}
+
+	/** Puts the world back the way it was found, on every exit path. */
+	void RestoreWorld()
+	{
+		if (IConsoleVariable* ForceThird = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ForceThirdPerson")))
+		{
+			ForceThird->Set(0, ECVF_SetByConsole);
+		}
+		if (IConsoleVariable* Legacy = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Knife.LegacyGunHideLatch")))
+		{
+			Legacy->Set(0, ECVF_SetByConsole);   // never leave the bug switched on
+		}
+	}
+
+	void Run(float DelaySeconds, int32 Arm, int32 RedFailures, int32 RedWorst);
+
+	/** Ends one arm, and either chains into the next or prints the combined verdict. */
+	void Report(const TSharedRef<FState>& State)
+	{
+		const bool bRed = (State->Arm == 0);
+
+		UE_LOG(LogTraceGame, Display, TEXT("---------- arm %d (%s): %d census points with BOTH weapons drawn ----------"),
+			State->Arm, bRed ? TEXT("RED — the pre-v12 latch restored") : TEXT("GREEN — shipped"), State->Failures);
+
+		if (State->bAborted)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[DualWeapon] arm %d ABORTED: %s"), State->Arm, *State->AbortReason);
+			RestoreWorld();
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[DualWeapon] RESULT: *** NOT PROVEN *** — the arm did not complete, so neither number means anything."));
+			return;
+		}
+
+		if (bRed)
+		{
+			// Chain straight into the green arm, carrying the red numbers so one verdict line can
+			// compare them. The latch goes off here and RestoreWorld puts it off again at the end.
+			RestoreWorld();
+			Run(1.0f, /*Arm=*/1, State->Failures, State->WorstBothVisible);
+			return;
+		}
+
+		RestoreWorld();
+
+		UE_LOG(LogTraceGame, Display, TEXT("========== TRACE DUAL-WEAPON TEST (spec v12 s7) =========="));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[DualWeapon] RED   arm (bug restored) : %d census points with both weapons drawn, worst overlap %d parts."),
+			State->RedFailures, State->RedWorst);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[DualWeapon] GREEN arm (shipped code) : %d census points with both weapons drawn, worst overlap %d parts."),
+			State->Failures, State->WorstBothVisible);
+
+		const bool bRedReproduced = (State->RedFailures > 0);
+		const bool bGreenClean = (State->Failures == 0);
+
+		if (bRedReproduced && bGreenClean)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DualWeapon] RESULT: FIXED, PROVEN — the bug reproduces with the old latch and is gone without it."));
+		}
+		else if (!bRedReproduced)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[DualWeapon] RESULT: *** NOT PROVEN *** — the RED arm did not reproduce the bug, so the GREEN "
+				     "arm's zero proves nothing. The reproduction, not the fix, is what needs looking at."));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[DualWeapon] RESULT: *** FAIL *** — the gun and the knife are still drawn together on the "
+				     "shipped path (%d census points). This is spec v12 s7, unfixed."),
+				State->Failures);
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("=========================================================="));
+	}
+
+	void Run(float DelaySeconds, int32 Arm, int32 RedFailures, int32 RedWorst)
+	{
+		TSharedRef<FState> State = MakeShared<FState>();
+		State->Arm = Arm;
+		State->RedFailures = RedFailures;
+		State->RedWorst = RedWorst;
+
+		// Arm 0 puts the bug back. Every exit path below clears it again — including the aborts.
+		if (IConsoleVariable* Legacy = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Knife.LegacyGunHideLatch")))
+		{
+			Legacy->Set(Arm == 0 ? 1 : 0, ECVF_SetByConsole);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[DualWeapon] arm %d (%s) in %.1fs: equip the knife, force third person and back (the "
+			     "carry-blend path), then swap repeatedly — counting VISIBLE viewmodel parts at every step."),
+			Arm, (Arm == 0) ? TEXT("RED, bug restored, MUST FAIL") : TEXT("GREEN, shipped"), DelaySeconds);
+
+		// Two tickers, for the reason spelled out in Trace.TestRecoil: FTSTicker's delay applies to
+		// every invocation, not only the first.
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State](float /*Delta*/) -> bool
+			{
+				FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+					[State](float /*DeltaTime*/) -> bool
+					{
+						ATraceCharacter* Character = FindLocalTraceCharacter();
+						UTraceWeaponComponent* Weapon = (Character != nullptr)
+							? Character->FindComponentByClass<UTraceWeaponComponent>() : nullptr;
+						if (Weapon == nullptr || Character == nullptr)
+						{
+							return true;   // no pawn yet — wait rather than reporting zeroes
+						}
+
+						const UWorld* TestWorld = Character->GetWorld();
+						const double Now = (TestWorld != nullptr) ? TestWorld->GetTimeSeconds() : 0.0;
+						if (State->PhaseStart <= 0.0)
+						{
+							State->PhaseStart = Now;
+
+							if (Character->IsCarrier())
+							{
+								State->bAborted = true;
+								State->AbortReason = TEXT("the local player is carrying the Core; carriers cannot swap by design.");
+								Report(State);
+								return false;
+							}
+
+							ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+							if (!Weapon->RequestEquip(ETraceEquippedWeapon::Knife, &Refusal))
+							{
+								State->bAborted = true;
+								State->AbortReason = FString::Printf(
+									TEXT("the swap to the knife was refused: %s"), LexToString(Refusal));
+								Report(State);
+								return false;
+							}
+							Sample(State, Weapon, Character, TEXT("t0: knife requested, mid-pullout"));
+							return true;
+						}
+
+						const double InPhase = Now - State->PhaseStart;
+
+						switch (State->Phase)
+						{
+						case FState::EPhase::ToKnife:
+							// The pullout, plus a beat for the visuals to settle.
+							if (InPhase < static_cast<double>(TraceMelee::GetSwapSeconds()) + 0.35)
+							{
+								return true;
+							}
+							Sample(State, Weapon, Character, TEXT("knife deployed, first person"));
+
+							// The carry-blend path, without needing a Core. See the block comment.
+							{
+								static IConsoleVariable* ForceThird =
+									IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ForceThirdPerson"));
+								if (ForceThird == nullptr)
+								{
+									State->bAborted = true;
+									State->AbortReason = TEXT("Trace.ForceThirdPerson is missing; the rig hide/show path cannot be driven.");
+									Report(State);
+									return false;
+								}
+								ForceThird->Set(1, ECVF_SetByConsole);
+							}
+							State->Phase = FState::EPhase::ThirdPerson;
+							State->PhaseStart = Now;
+							return true;
+
+						case FState::EPhase::ThirdPerson:
+							// ViewBlendSeconds is ATraceCharacter's, and private; 1.2 s is comfortably
+							// past it for any sane value and the census below proves the rig actually
+							// went away rather than assuming it.
+							if (InPhase < 1.2)
+							{
+								return true;
+							}
+							Sample(State, Weapon, Character, TEXT("third person: whole rig should be hidden"));
+							{
+								static IConsoleVariable* ForceThird =
+									IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.ForceThirdPerson"));
+								if (ForceThird != nullptr)
+								{
+									ForceThird->Set(0, ECVF_SetByConsole);
+								}
+							}
+							State->Phase = FState::EPhase::BackToFirst;
+							State->PhaseStart = Now;
+							return true;
+
+						case FState::EPhase::BackToFirst:
+							if (InPhase < 1.2)
+							{
+								return true;
+							}
+							// *** THE BUG'S MOMENT. ATraceCharacter has just re-shown every part of
+							// its rig, gun included, while the knife is still the equipped weapon.
+							Sample(State, Weapon, Character,
+								TEXT("BACK TO FIRST PERSON — the reported bug lands here"));
+							State->Phase = FState::EPhase::SwapCycle;
+							State->PhaseStart = Now;
+							State->CycleStep = 0;
+							return true;
+
+						case FState::EPhase::SwapCycle:
+						{
+							// Four swaps. The odd steps are sampled at 0.10 s — INSIDE the 0.2 s
+							// pullout — because spec v12 §7's second suspect was a race between the
+							// replicated selector and the local prediction during exactly that window.
+							const double StepLength = (State->CycleStep % 2 == 0) ? 0.10 : 0.45;
+							if (InPhase < StepLength)
+							{
+								return true;
+							}
+
+							const bool bMidPullout = (State->CycleStep % 2 == 0);
+							Sample(State, Weapon, Character, bMidPullout
+								? TEXT("swap cycle: sampled INSIDE the 0.2s pullout")
+								: TEXT("swap cycle: sampled after the pullout"));
+
+							if (++State->CycleStep >= 8)
+							{
+								State->Phase = FState::EPhase::Done;
+								Report(State);
+								return false;
+							}
+
+							ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+							Weapon->RequestEquip(Weapon->IsKnifeEquipped()
+								? ETraceEquippedWeapon::Gun : ETraceEquippedWeapon::Knife, &Refusal);
+							State->PhaseStart = Now;
+							return true;
+						}
+
+						case FState::EPhase::Done:
+						default:
+							return false;
+						}
+					}), 0.f);
+				return false;
+			}), FMath::Max(0.f, DelaySeconds));
+	}
+}
+
+static FAutoConsoleCommand GTraceDualWeaponTestCmd(
+	TEXT("Trace.Knife.DualWeaponTest"),
+	TEXT("Dev only. Spec v12 s7. Equips the knife, drives the rig through the carry-blend hide/show "
+	     "and four swaps (two sampled mid-pullout), and counts the viewmodel parts actually VISIBLE at "
+	     "each step. Any census with a gun part and a knife part both drawn is the bug."),
+	FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+	{
+		const float Delay = (Args.Num() > 0) ? FMath::Max(0.f, FCString::Atof(*Args[0])) : 8.f;
+		TraceDualWeaponTest::Run(Delay, /*Arm=*/0, /*RedFailures=*/-1, /*RedWorst=*/0);
+	}));
 
 // =================================================================================================
 // Trace.TestRecoil — the unattended proof for spec v5 section 6.

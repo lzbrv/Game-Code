@@ -649,15 +649,13 @@ namespace
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[SettingsDump:%s] SPECv5 move: AirStrafe falloff=%d soft=%.0f exp=%.2f hardCap=%d hard=%.0f (modelMax=%.0f) | "
 			     "Slide(ability) dur=%.2f hiddenCooldown=%.2f | SlideJump window=%.2f speed=%.2f height=%.2f | "
-			     "Mantle on=%d reach=%.0f minH=%.0f maxH=%.0f dur=%.2f upPhase=%.2f cooldown=%.2f minFwd=%.0f ledgeGrace=%.3f"),
+			     "Ledges ledgeGrace=%.3f (v12 §5: MANTLE REMOVED - no mantle knobs remain to print)"),
 			Tag, Table.bAirStrafeGainFalloff ? 1 : 0, Table.AirStrafeSoftCapSpeed,
 			Table.AirStrafeFalloffExponent, Table.bAirStrafeHardCap ? 1 : 0,
 			Table.AirStrafeHardCapSpeed, Table.MaxAirSpeed,
 			Table.SlideDuration, Table.SlideCooldownSeconds,
 			Table.SlideJumpWindowSeconds, Table.SlideJumpWindowSpeedBonus, Table.SlideJumpWindowZBonus,
-			Table.bMantleEnabled ? 1 : 0, Table.MantleReachUU, Table.MantleMinHeightUU,
-			Table.MantleMaxHeightUU, Table.MantleDurationSeconds, Table.MantleUpPhaseFraction,
-			Table.MantleCooldownSeconds, Table.MantleMinForwardSpeed, Table.LedgeGroundGraceSeconds);
+			Table.LedgeGroundGraceSeconds);
 
 		// -----------------------------------------------------------------------------------------
 		// SPEC v9 §§5-8. Every movement change this pass is a SCALE OVER A BASE, so the line above
@@ -673,7 +671,7 @@ namespace
 			TEXT("[SettingsDump:%s] SPECv9 move (base x scale = SHIPPED): gravity=%.3f | "
 			     "airSoft %.0f x %.3f = %.0f, airHard %.0f x %.3f = %.0f | "
 			     "slide %.3fs x %.3f = %.3fs | slideJump %.5f x %.3f (gainOnly=%d) = %.5f | "
-			     "wallWindow %.3fs x %.3f = %.3fs, wallRetention %.3f x %.3f = %.3f, mantleLockout=%.2fs"),
+			     "wallWindow %.3fs x %.3f = %.3fs, wallRetention %.3f x %.3f = %.3f"),
 			Tag, Table.MovementGravityScale,
 			Table.AirStrafeSoftCapSpeed, Table.AirStrafeAsymptoteScale,
 			Table.AirStrafeSoftCapSpeed * Table.AirStrafeAsymptoteScale,
@@ -689,8 +687,7 @@ namespace
 			Table.WallJumpWindowSeconds, Table.WallJumpWindowScale,
 			Table.WallJumpWindowSeconds * Table.WallJumpWindowScale,
 			Table.WallJumpSpeedRetention, Table.WallJumpMomentumScale,
-			Table.WallJumpSpeedRetention * Table.WallJumpMomentumScale,
-			Table.WallJumpMantleLockoutSeconds);
+			Table.WallJumpSpeedRetention * Table.WallJumpMomentumScale);
 
 		// Mode B geometry and weight. The BASE throw values are printed next to the mass scale that
 		// multiplies them, because the number a designer types is not the number the Core flies at —
@@ -878,23 +875,28 @@ namespace
 			{ TEXT("SlideJumpWindowSpeedBonus"),       EKnobType::Float, TEXT("well-timed speed multiplier - v8 §8: 1.25 -> 1.3125") },
 			{ TEXT("SlideJumpWindowZBonus"),           EKnobType::Float, TEXT("well-timed height multiplier [by-name bind]") },
 
-			// --- spec v5 §7, mantle  [ALL BOUND BY NAME by the CMC] -----------------------------
-			{ TEXT("bMantleEnabled"),                  EKnobType::Bool,  TEXT("mantle master switch [by-name bind]") },
-			{ TEXT("MantleReachUU"),                   EKnobType::Float, TEXT("forward probe [by-name bind]") },
-			{ TEXT("MantleMinHeightUU"),               EKnobType::Float, TEXT("below this the step-up handles it [by-name bind]") },
-			{ TEXT("MantleMaxHeightUU"),               EKnobType::Float, TEXT("tallest climbable ledge [by-name bind]") },
-			{ TEXT("MantleDurationSeconds"),           EKnobType::Float, TEXT("climb duration [by-name bind]") },
-			{ TEXT("MantleUpPhaseFraction"),           EKnobType::Float, TEXT("rise before the step [by-name bind]") },
-			{ TEXT("MantleCooldownSeconds"),           EKnobType::Float, TEXT("gap between mantles [by-name bind]") },
-			{ TEXT("MantleMinForwardSpeed"),           EKnobType::Float, TEXT("a move, not a proximity effect [by-name bind]") },
-			{ TEXT("LedgeGroundGraceSeconds"),         EKnobType::Float, TEXT("the ledge desync half of §7 [by-name bind]") },
+			// --- spec v5 §7, the ledge block. THE MANTLE'S EIGHT KNOBS ARE GONE (spec v12 §5) ---
+			//
+			// bMantleEnabled, MantleReachUU, MantleMinHeightUU, MantleMaxHeightUU,
+			// MantleDurationSeconds, MantleUpPhaseFraction, MantleCooldownSeconds and
+			// MantleMinForwardSpeed were removed from UTraceSettings when the ability was removed, and
+			// their rows are deleted here rather than left to report DEAD: this table's job is to catch
+			// a knob whose READER lost it, and these are the opposite case — the reader was deleted on
+			// purpose and the knob went with it. A permanently-red row trains people to ignore the
+			// summary line, which is the one thing this command cannot afford.
+			//
+			// LedgeGroundGraceSeconds STAYS and is now the whole section. It was never a mantle knob;
+			// it is the prediction-desync half of the original Demo 5 complaint, and with the mantle
+			// gone it is the only thing left addressing "no bug when a player hits the top edge of an
+			// obstacle" (spec v12 §5). If this one ever reads DEAD the ledge bug comes straight back.
+			{ TEXT("LedgeGroundGraceSeconds"),         EKnobType::Float, TEXT("v12 §5: the ledge desync fix, ALL that remains of the mantle block [by-name bind]") },
 
 			// --- spec v5 §4, mode B geometry and weight ----------------------------------------
 			{ TEXT("GoalWidthFieldFraction"),          EKnobType::Float, TEXT("2000uu goal mouth") },
 			{ TEXT("GoalHeightUU"),                    EKnobType::Float, TEXT("goal APPROACH RAMP height since v6 4.3") },
 
 			// --- spec v6 §4.1, the mode-B catch zone  [ALL THREE BOUND BY NAME by ATraceCore] ---
-			{ TEXT("CoreCatchRadius"),                 EKnobType::Float, TEXT("catch magnet radius [by-name bind]") },
+			{ TEXT("CoreCatchRadius"),                 EKnobType::Float, TEXT("v12 §4: 500 -> 450, MUST read 450 [by-name bind]") },
 			{ TEXT("CoreCatchCurveStrength"),          EKnobType::Float, TEXT("catch magnet strength [by-name bind]") },
 			{ TEXT("CoreCatchThrowerLockoutSeconds"),  EKnobType::Float, TEXT("thrower excluded from own zone [by-name bind]") },
 
@@ -1005,7 +1007,8 @@ namespace
 			{ TEXT("bSlideJumpBonusScalesGainOnly"),   EKnobType::Bool,  TEXT("v9 §7: true = scale the gain (1.40625), false = the whole multiplier (1.70625) [by-name bind]") },
 			{ TEXT("WallJumpWindowScale"),             EKnobType::Float, TEXT("v9 §5: x0.60 over the contact window -> 0.15s [by-name bind]") },
 			{ TEXT("WallJumpMomentumScale"),           EKnobType::Float, TEXT("v9 §5: x0.90 over retention -> 0.855 [by-name bind]") },
-			{ TEXT("WallJumpMantleLockoutSeconds"),    EKnobType::Float, TEXT("v9 §5: a wall jump beats a mantle for this long [by-name bind]") },
+			// WallJumpMantleLockoutSeconds (v9 §5) is deleted with the mantle — see the v12 §5 note in
+			// the ledge block above. Its only job was to stop the mantle undoing a wall jump.
 
 			// --- spec v10, every knob this pass introduced or moved ----------------------------
 			//
@@ -1022,9 +1025,22 @@ namespace
 			// §1 THE KNIFE'S MOVEMENT KIT. The weapon's own numbers are on UTraceMeleeSettings below;
 			// these three multiply WalkSpeed and the two air caps, which are on this page, and are
 			// read through TraceMoveKnob with the rest of the movement scalars.
-			{ TEXT("KnifeMoveSpeedMultiplier"),        EKnobType::Float, TEXT("v10 §1: x1.30 over WalkSpeed, the '30% faster' [by-name bind]") },
-			{ TEXT("KnifeAirStrafeSoftCapMultiplier"), EKnobType::Float, TEXT("v10 §1: x1.25 over the soft cap, the 'higher momentum ceiling' [by-name bind]") },
-			{ TEXT("KnifeAirStrafeHardCapMultiplier"), EKnobType::Float, TEXT("v10 §1: x1.35 over the hard cap - MUST stay >= the soft multiplier [by-name bind]") },
+			// v12 §3 MOVED ALL THREE. "Reduce max speed with the knife from the previous 30% increase
+			// to 22% and adjust momentum accordingly." The ground multiplier is the request; the two
+			// air ceilings are the "adjust momentum accordingly", scaled by BONUS (the part above 1)
+			// rather than by the multiplier itself, which would have pushed the knife below the gun.
+			//
+			// *** READ THE CARRIER LINE BELOW THESE THREE. The knife dropping to 1.22 leaves
+			// *** CarrierSpeedMultiplier (1.30) FASTER than the knife, and the carrier's 1.30 exists
+			// *** only because the user asked to "increase core carrier speed to match knife speed".
+			// *** The parity is broken as of v12 §3 and it is deliberate: only what was asked was
+			// *** implemented. That is a decision for the user, not a bug to quietly fix.
+			{ TEXT("KnifeMoveSpeedMultiplier"),        EKnobType::Float, TEXT("v12 §3: 1.30 -> 1.22, MUST read 1.22 [by-name bind]") },
+			{ TEXT("KnifeAirStrafeSoftCapMultiplier"), EKnobType::Float, TEXT("v12 §3: 1+0.25x22/30 = 1.1833, MUST read 1.1833 [by-name bind]") },
+			{ TEXT("KnifeAirStrafeHardCapMultiplier"), EKnobType::Float, TEXT("v12 §3: 1+0.35x22/30 = 1.2567, MUST stay >= the soft multiplier [by-name bind]") },
+			// The knife's counterpart. Not moved by v12 and printed here so the broken parity is on the
+			// same screen as the number that broke it, rather than being rediscovered in a playtest.
+			{ TEXT("CarrierSpeedMultiplier"),          EKnobType::Float, TEXT("v12 §3 FLAG: still 1.30 - the carrier is now FASTER than the knife (1.22). User's call.") },
 
 			// §4 the parry. Not new, but it MOVED this pass (0.20 -> 0.175) and it is the one number
 			// the whole mechanic is - window and invulnerability are the SAME property, which is the
@@ -1037,6 +1053,33 @@ namespace
 			// has never been on this list. It is now.
 			{ TEXT("CoreTurnoverGraceSeconds"),        EKnobType::Float, TEXT("v10 §3: seconds the new holder's trace does not FORM after a turnover between teams") },
 
+			// --- spec v12, every knob this pass introduced or moved ----------------------------
+			//
+			// §6 THE TRACE CLIPPING INTO WALLS. All four are new this pass and all four are read by
+			// UTraceTrailComponent, so they are listed on the pass that introduces them per the v8
+			// rule. Each pairs with the Trace.Trail.WallFit* console variable of the same meaning and
+			// must resolve the way GetTraceTrailRadius() resolves TrailRadius — settings property by
+			// default, CVar when the CVar is explicitly set. Until the component reads them these
+			// rows say OK (the properties exist) while the panel still moves nothing, which is the
+			// ONE case this table cannot see: it proves a knob is reachable, not that anybody reached
+			// for it. §6's own verification is what closes that half.
+			//
+			// The invariant they exist under is the one this project has already broken in both
+			// directions: the fitter edits TrailPoints, which the trip test and every renderer arm
+			// both read, so lethal == drawn survives the fix by construction. Anything that edited
+			// the RIBBON instead would build an invisible kill volume and this table would still say
+			// OK.
+			{ TEXT("bTrailWallFitEnabled"),            EKnobType::Bool,  TEXT("v12 §6: corner fitter on/off - OFF reproduces the reported bug for A/B") },
+			{ TEXT("TrailWallFitMarginUU"),            EKnobType::Float, TEXT("v12 §6: clearance over the trace's own half width; too large = nothing routes") },
+			{ TEXT("TrailWallFitMaxPushUU"),           EKnobType::Float, TEXT("v12 §6: cap on nudging an already-embedded point; residue cleanup only") },
+			{ TEXT("TrailWallFitMaxInsert"),           EKnobType::Int,   TEXT("v12 §6: per-append insert budget; exhausting it falls back to the chord") },
+
+			// §4 and §3 are recorded on the rows they moved (CoreCatchRadius in the v6 block,
+			// the three Knife* rows in the v10 block) rather than repeated here — a second row would
+			// double-count them in the bound/dead summary, which is the same rule v8 §8 set.
+			//
+			// §5's removals are recorded as deletions in the ledge block above.
+
 			// §7 the half length is NOT here, and that is not an oversight: HalfDuration is a
 			// UPROPERTY(config) on ATraceGameMode, not on this page, so this command cannot see it.
 			// Trace.DumpSettings prints it from the running game mode, which is where it is read.
@@ -1047,11 +1090,26 @@ namespace
 			// one of these was a header literal with no ini key behind it until v10 reconciled them.
 			{ TEXT("BackstabDamage"),            EKnobType::Float, TEXT("v10 §1: 100 from behind"),                    TEXT("/Script/Trace.TraceMeleeSettings") },
 			{ TEXT("FrontDamage"),               EKnobType::Float, TEXT("v10 §1: 30 from the front"),                  TEXT("/Script/Trace.TraceMeleeSettings") },
-			{ TEXT("BackstabHalfAngleDegrees"),  EKnobType::Float, TEXT("v10 §1: half-angle about directly behind"),   TEXT("/Script/Trace.TraceMeleeSettings") },
+			// v12 §1 MOVES THIS ONE: 90 -> 30. Verbatim: "Change the 'back' zone for knife damage
+			// being 100 from a boundary at 90 degrees to 60 degrees, with the center of the 60 angle
+			// being at the center of the model."
+			//
+			// SIXTY IS THE CONE, THIRTY IS THIS PROPERTY, and getting that backwards is the whole
+			// risk in the change. The property is a HALF-angle measured from directly behind the
+			// victim, so a 60 degree cone centred on the rear axis is +/-30. Entering 60 here would
+			// ship a 120 degree back zone — a WIDENING of the instant-kill arc dressed up as the
+			// narrowing that was asked for, and every automated check would pass. The row prints the
+			// value so an azimuth sweep and this table can be compared directly.
+			{ TEXT("BackstabHalfAngleDegrees"),  EKnobType::Float, TEXT("v12 §1: 90 -> 30, i.e. a 60deg CONE (+/-30). MUST read 30, NOT 60"), TEXT("/Script/Trace.TraceMeleeSettings") },
 			{ TEXT("SwingCooldownSeconds"),      EKnobType::Float, TEXT("v10 §1: 0.5s between swings"),                TEXT("/Script/Trace.TraceMeleeSettings") },
 			{ TEXT("SwapSeconds"),               EKnobType::Float, TEXT("v10 §1: 0.2s pullout, BOTH directions"),      TEXT("/Script/Trace.TraceMeleeSettings") },
-			{ TEXT("SwingWindupSeconds"),        EKnobType::Float, TEXT("v10 §1: lead-in before the arc goes live"),   TEXT("/Script/Trace.TraceMeleeSettings") },
-			{ TEXT("SwingAnimSeconds"),          EKnobType::Float, TEXT("v10 §1: must stay under the cooldown"),       TEXT("/Script/Trace.TraceMeleeSettings") },
+			// v12 §2 turns the swipe into a stab, so these two are now THE STAB'S TIMING: the windup
+			// is the lead-in before the blade goes live and the anim is thrust-plus-return. The names
+			// are deliberately NOT changed to Stab* — they are ini keys with values behind them in
+			// DefaultGame.ini, and renaming a live key is how a tuned value silently reverts to a
+			// header literal. What they drive changed; what they are called did not.
+			{ TEXT("SwingWindupSeconds"),        EKnobType::Float, TEXT("v12 §2: lead-in before the STAB goes live"),  TEXT("/Script/Trace.TraceMeleeSettings") },
+			{ TEXT("SwingAnimSeconds"),          EKnobType::Float, TEXT("v12 §2: thrust + return, must stay under the cooldown"), TEXT("/Script/Trace.TraceMeleeSettings") },
 			{ TEXT("SwingRangeUU"),              EKnobType::Float, TEXT("v10 §1: blade reach"),                        TEXT("/Script/Trace.TraceMeleeSettings") },
 			{ TEXT("SwingArcDegrees"),           EKnobType::Float, TEXT("v10 §1: a sweep, not a hitscan point"),       TEXT("/Script/Trace.TraceMeleeSettings") },
 			{ TEXT("SwingSamples"),              EKnobType::Int,   TEXT("v10 §1: rays fanned across the arc"),         TEXT("/Script/Trace.TraceMeleeSettings") },

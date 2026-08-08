@@ -8,6 +8,15 @@
 //      do 30 damage in the front. It should take .5seconds after a knife swing before a player can
 //      knife again. Knife and gun pullout time should be roughly .2seconds."
 //
+// AMENDED BY SPEC v12, and the amendments are quoted where they land:
+//   §1  the back zone narrows from a 180-degree rear hemisphere to a 60-degree cone (see BACK OR
+//       FRONT below, and BackstabHalfAngleDegrees, which is the HALF-angle and is therefore 30).
+//   §2  the first-person motion becomes a STAB, not a swipe, and the 3D slash line no longer draws
+//       in the swinger's own view. Both live in UTraceWeaponComponent; both are PROCEDURAL, because
+//       the imported Mannequin set has no melee sequence of any kind.
+//   §3  the movement bonus drops from +30% to +22%, with the air-strafe bonuses scaled by 22/30 to
+//       match. See the Movement note in UTraceMeleeSettings.
+//
 // WHERE THE PIECES LIVE, AND WHY
 //
 // This header is the *policy and the geometry*: the tunables, the pure damage/angle model, the
@@ -56,8 +65,8 @@
 //      second that matters most. Immunity that holds only when nobody is looking is not immunity.
 //
 //   2. THE CARRIER CANNOT SWING, and cannot swap at all. They cannot shoot (spec §4), their hands
-//      are full, and a carrier who could hold a knife would collect the +30% movement bonus on top
-//      of UTraceSettings::CarrierSpeedMultiplier — 1.08 x 1.30 = 1.40x — which would make the Core
+//      are full, and a carrier who could hold a knife would collect the +22% movement bonus on top
+//      of UTraceSettings::CarrierSpeedMultiplier — 1.30 x 1.22 = 1.59x — which would make the Core
 //      uncatchable and quietly retire the one number the carrier's speed was ever tuned with.
 //      GetGroundSpeedMultiplierFor() therefore ALSO returns 1.0 for a carrier, as defence in depth:
 //      if a future change ever lets a knife be equipped before a pickup, the bonus still does not
@@ -77,7 +86,15 @@
 //
 //   * WHAT THE PLAYER FEELS. You do not have to have the crosshair on a body. Anything inside the
 //     arc, at knife range, in line of sight, is cut — which is what a slash is, and it is what makes
-//     the knife usable while sprinting past somebody at 1040 uu/s.
+//     the knife usable while sprinting past somebody at 976 uu/s.
+//
+//   THE LETHAL ARC IS STILL 140 DEGREES AFTER SPEC v12 §2 MADE THE ANIMATION A STAB, and that is a
+//   decision. §2 asked for the ANIMATION to change ("Can you make the knife animation a stab instead
+//   of a swipe?"); it did not ask for the weapon's reach or hit envelope to change, and narrowing the
+//   sampled arc to match a thrust would be a silent nerf nobody requested. The viewmodel thrusts; the
+//   blade still cuts the same volume it cut yesterday. If the user wants the envelope tightened to
+//   match the new motion, SwingArcDegrees is the one number, and SwingSamples must come down with it
+//   (Trace.Knife.AngleTest checks the chord arithmetic).
 //   * WHAT IT COSTS. 13 samples across 140 degrees at 180 uu puts the outermost chord spacing at
 //     ~34 uu, i.e. one capsule radius, so a body cannot slip between two adjacent rays anywhere in
 //     the arc. Thirteen candidate loops once per 0.5 s per player is nothing next to a 150 RPM gun.
@@ -98,11 +115,22 @@
 // attacker to the victim. If the attacker stands behind the victim then A points the same way F
 // does, so:
 //
-//     back-stab  <=>  angle(A, F) <= BackstabHalfAngleDegrees        (default 90 degrees)
+//     back-stab  <=>  angle(A, F) <= BackstabHalfAngleDegrees        (default 30 degrees)
 //
-// At the default the two hemispheres exactly bisect the victim: rear half 100, front half 30. The
-// spec asks for "within ~90 degrees of directly behind" and explicitly refuses a side tier, so the
-// threshold is one number with no third case, and it is exposed (see UTraceMeleeSettings).
+// SPEC v12 §1 NARROWED THIS FROM 90 TO 30. Verbatim: "Change the 'back' zone for knife damage being
+// 100 from a boundary at 90 degrees to 60 degrees, with the center of the 60 angle being at the
+// center of the model." BackstabHalfAngleDegrees is a HALF-angle about the rear axis, so the cone
+// the user described — 60 degrees wide, centred on directly-behind, i.e. ±30 — is this number at 30.
+// It used to be 90, which made the back zone the entire rear HEMISPHERE: standing at a victim's
+// shoulder scored 100. Now it is a genuine flank. Everything outside the cone, the whole 300 degrees
+// of it, is the 30-damage front hit; there is still no third "side" tier, because the user has never
+// asked for one.
+//
+// The threshold stays a tunable (see UTraceMeleeSettings, the .ini, and Trace.Knife.BackstabAngle),
+// and it is pinned by MEASUREMENT rather than by inspection: TraceRunMeleeSelfTest sweeps 24 azimuths
+// around the victim and then binary-searches the flip to 0.05 degrees, so the boundary the running
+// game actually has is compared against the boundary the settings claim. Reading the constant is not
+// evidence — the .ini wins over the initialiser below, and has silently disagreed with it before.
 //
 // THE VICTIM'S FACING HAS TO BE REWOUND TOO, and this is the one place the knife could not reuse
 // the gun's machinery. FTraceLagCompFrame records a capsule — centre, half height, radius, posture
@@ -280,16 +308,23 @@ public:
 	float FrontDamage = 30.f;
 
 	/**
-	 * Half-angle, in degrees, of the rear cone that counts as a back-stab — measured between the
+	 * HALF-angle, in degrees, of the rear cone that counts as a back-stab — measured between the
 	 * victim's forward vector and the direction from the attacker to the victim.
 	 *
-	 * 90 exactly bisects the victim: rear hemisphere 100, front hemisphere 30, no side tier, which
-	 * is what spec §1 asks for ("within ~90 degrees of directly behind"; "There is no side tier").
-	 * Lower it to make back-stabs demand a truer angle; the difference goes to FrontDamage, never to
-	 * a third number.
+	 * 30, i.e. a 60-DEGREE CONE centred on directly-behind (spec v12 §1: "from a boundary at 90
+	 * degrees to 60 degrees, with the center of the 60 angle being at the center of the model").
+	 * The full width of the back zone is therefore 2x this number, which is the number the user
+	 * quoted — if you are reconciling this against the spec, remember the factor of two.
+	 *
+	 * It was 90, which made the back zone the whole rear hemisphere: a hit from directly beside a
+	 * player scored 100. At 30 a back-stab is a genuine flank. Everything outside the cone is
+	 * FrontDamage; the difference never goes to a third number, because there is no side tier.
+	 *
+	 * DO NOT VERIFY THIS BY READING IT. The .ini wins, and the azimuth sweep in TraceRunMeleeSelfTest
+	 * (Trace.Knife.AngleTest) measures where the boundary really is on the running build to 0.05 deg.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Damage", meta = (ClampMin = "5.0", ClampMax = "179.0"))
-	float BackstabHalfAngleDegrees = 90.f;
+	float BackstabHalfAngleDegrees = 30.f;
 
 	// --- Timing (spec §1) ------------------------------------------------------------------------
 
@@ -377,17 +412,34 @@ public:
 	//
 	// *** THE KNIFE'S MOVEMENT NUMBERS ARE NOT HERE, AND MUST NOT BE ADDED HERE. ***
 	//
-	// "Players should move 30% faster with a knife, as well as have a higher momentum ceiling" is
-	// implemented in UTraceCharacterMovementComponent, whose knobs live on UTraceSettings:
+	// "Players should move 30% faster with a knife, as well as have a higher momentum ceiling" —
+	// RETUNED BY SPEC v12 §3 to +22% ("Reduce max speed with the knife from the previous 30% increase
+	// to 22% and adjust momentum accordingly") — is implemented in UTraceCharacterMovementComponent,
+	// whose knobs live on UTraceSettings:
 	//
-	//     KnifeMoveSpeedMultiplier            1.30   ground speed x
-	//     KnifeAirStrafeSoftCapMultiplier     1.25   air-strafe soft cap x
-	//     KnifeAirStrafeHardCapMultiplier     1.35   air-strafe hard cap AND MaxAirSpeed x
+	//     KnifeMoveSpeedMultiplier            1.22     ground speed x   (was 1.30)
+	//     KnifeAirStrafeSoftCapMultiplier     1.18333  air-strafe soft cap x   (was 1.25)
+	//     KnifeAirStrafeHardCapMultiplier     1.25667  air-strafe hard cap AND MaxAirSpeed x (was 1.35)
+	//
+	// THE TWO AIR MULTIPLIERS ARE THE "adjust momentum accordingly" HALF, and the arithmetic is one
+	// rule applied three times: every knife BONUS is scaled by 22/30, so the mobility package stays
+	// proportionate instead of the ground speed dropping while the ceilings keep their +30% values.
+	//     ground  0.30 x 22/30 = 0.220   -> 1.220
+	//     soft    0.25 x 22/30 = 0.18333 -> 1.18333   (1045 -> 1237, was 1306)
+	//     hard    0.35 x 22/30 = 0.25667 -> 1.25667   (1375 -> 1728, was 1856)
+	// The base caps there already include UTraceSettings::AirStrafeAsymptoteScale (x1.10); see
+	// Trace.Knife.DumpSettings, which prints the scaled bases for exactly this reason.
+	//
+	// *** FLAGGED, NOT FIXED: THIS BREAKS THE CARRIER/KNIFE PARITY THE USER ASKED FOR. ***
+	// CarrierSpeedMultiplier is 1.30 because the user previously asked to "increase core carrier speed
+	// to match knife speed". Dropping the knife to 1.22 leaves the CARRIER FASTER THAN THE KNIFE
+	// (1.30 vs 1.22). Spec v12 §3 asks only for the knife change, so only the knife changed. It is one
+	// number either way and it is the user's call — do not silently drag CarrierSpeedMultiplier down.
 	//
 	// That is the right home for them and this file deliberately does not keep a second copy. The
 	// bit is saved-move state round-tripped through FSavedMove_Trace, so a server correction replays
 	// each move under the profile that move actually ran with — something a multiplier read from
-	// here, outside the move pipeline, could not have given. A duplicate 1.30 in this table would be
+	// here, outside the move pipeline, could not have given. A duplicate 1.22 in this table would be
 	// two objects agreeing about one fact, which is the failure this codebase logs by name.
 	//
 	// THE MELEE SLICE OWNS THE BIT, NOT THE NUMBER. UTraceWeaponComponent::RefreshMovementProfile()
@@ -400,14 +452,14 @@ public:
 	/**
 	 * Distance at or inside which a bot swaps to the knife to close on its target.
 	 *
-	 * The +30% makes the knife the correct chase tool, so the bot's rule is a range band rather than
+	 * The +22% makes the knife the correct chase tool, so the bot's rule is a range band rather than
 	 * a state: inside this it is worth trading the gun for the speed, outside BotDisengageRangeUU it
 	 * is not. The gap between the two is hysteresis — without it a bot at exactly the boundary
 	 * swap-thrashes and spends its whole life in a 0.2 s pullout.
 	 *
 	 * 500, NOT 700, AND THE DIFFERENCE IS A BOT-DPS REGRESSION. A bot holding the knife cannot
 	 * shoot, so this range is exactly how far a bot voluntarily disarms itself for. The blade
-	 * reaches 180 uu; at the knife's 1040 uu/s, 500 uu is 0.31 s of closing, which reads as a
+	 * reaches 180 uu; at the knife's 976 uu/s, 500 uu is 0.51 s of closing, which reads as a
 	 * commitment to a finisher. The first measured pass used 700 and produced bots that spent most
 	 * of an engagement unarmed inside comfortable gun range. If bot lethality moves this pass, this
 	 * is the first number to look at.
@@ -444,7 +496,7 @@ namespace TraceMelee
 	//
 	//     Trace.Knife.BackstabDamage    -1
 	//     Trace.Knife.FrontDamage       -1
-	//     Trace.Knife.BackstabAngle     -1     half-angle in degrees
+	//     Trace.Knife.BackstabAngle     -1     HALF-angle in degrees; the cone the user quotes is 2x it
 	//     Trace.Knife.Cooldown          -1     seconds between swings
 	//     Trace.Knife.SwapSeconds       -1     pullout time, both directions
 	//     Trace.Knife.Range             -1     uu
@@ -586,7 +638,7 @@ namespace TraceMelee
 	 * already refused while carrying, so a carrier only ever reaches this by picking the Core up
 	 * with the knife already out — and at that moment the knife is STOWED, not active. They cannot
 	 * swing with it and cannot shoot at all, so "the knife is the active weapon" is false by the
-	 * plain reading of the movement component's own contract. It also stops 1.08 x 1.30 = 1.40x
+	 * plain reading of the movement component's own contract. It also stops 1.30 x 1.22 = 1.59x
 	 * from quietly retiring the one number the carrier's speed was ever tuned with.
 	 */
 	TRACE_API bool ShouldUseKnifeMovementProfile(const AActor* Character);

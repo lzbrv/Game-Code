@@ -1152,12 +1152,18 @@ public:
 	 *
 	 * KNOCK-ON EFFECTS, because §8 asks for them to be reported rather than silently compensated:
 	 * apex height scales 1/1.12 (-10.7%) and hang time 1/sqrt(1.12) (-5.5%) for the same jump
-	 * impulse. Everything that measures itself against a jump — MantleMaxHeightUU, the wall jump's
+	 * impulse. Everything that measures itself against a jump — the wall jump's
 	 * WallJumpVerticalMultiplier, DashExitVerticalSpeedMultiplier, SlideJumpZMultiplier — is
 	 * expressed as a MULTIPLE of the jump rather than an absolute height, so all of them shrink
 	 * together and stay in proportion. The one thing that does NOT move with them is the arena
-	 * geometry: a ledge at MantleMaxHeightUU is still 230 uu tall, and a jump that used to clear it
-	 * with 10% to spare now clears it with none.
+	 * geometry: the cover tier is still 176 uu tall, and a jump that used to clear a lip with 10%
+	 * to spare now clears it with none.
+	 *
+	 * SPEC v12 §5 MAKES THAT LAST SENTENCE MATTER MORE, NOT LESS. It used to be softened by the
+	 * mantle, which caught a player who came up short at a lip and pulled them over it anyway. The
+	 * mantle is gone, so a jump that only just clears an edge now simply only just clears it — this
+	 * is the first knob to look at if "hitting the top edge of an obstacle" reads badly after the
+	 * removal, ahead of LedgeGroundGraceSeconds.
 	 *
 	 * NAME IS LOAD-BEARING, AND IT IS NOT THE OBVIOUS ONE. UTraceCharacterMovementComponent resolves
 	 * this BY NAME through TraceMoveKnob as "MovementGravityScale" — NOT "PlayerGravityScale", which
@@ -1675,111 +1681,33 @@ public:
 	float SlideJumpWindowZBonus = 1.12f;
 
 	// ==========================================================================================
-	// MOVEMENT — MANTLE  (spec v5 §7, new)
+	// MOVEMENT — LEDGES  (spec v12 §5. WAS "MANTLE", spec v5 §7 — THE MANTLE IS GONE)
 	//
-	// Verbatim: "When jumping on the edge of a raised section, it's glitchy and feels like rubber
-	// banding. Add a mantle, to solve this."
+	// v12 verbatim: "Remove mantling from the game, keep wall jumping. Make sure there's no bug when
+	// a player hits the top edge of an obstacle."
 	//
-	// A mantle is a LEDGE CLIMB: a forward probe finds a surface between the two heights below with
-	// clear space above it, and the pawn is pulled up onto it over MantleDurationSeconds instead of
-	// grinding its capsule against the lip. It must run through the saved-move system like the dash
-	// and the slide, or it becomes a new source of exactly the correction the report describes.
+	// NINE KNOBS WERE DELETED HERE, NOT DEPRECATED: bMantleEnabled, MantleReachUU,
+	// MantleMinHeightUU, MantleMaxHeightUU, MantleDurationSeconds, MantleUpPhaseFraction,
+	// MantleCooldownSeconds, MantleMinForwardSpeed, and (in the wall-jump block below)
+	// WallJumpMantleLockoutSeconds. Nothing reads them any more. They are removed from
+	// Trace.VerifyKnobs, from Trace.DumpSettings and from Config/DefaultGame.ini in the same change,
+	// because a knob that survives the code that read it is the "slider that moves nothing" failure
+	// this project has already shipped whole families of — and a mantle knob left on the panel after
+	// the mantle is gone is worse than a typo, it advertises a feature that does not exist.
 	//
-	// NOTE FOR WHOEVER TUNES THIS: a mantle does not fix a prediction desync, it hides one. If the
-	// rubber-banding is the client and server disagreeing about the ledge collision, the disagreement
-	// is still there on every ledge the mantle does not trigger on. LedgeGroundGraceSeconds below is
-	// the movement pass's answer to that half; the rest of this block is the climb itself.
-	//
-	// NAMES ARE LOAD-BEARING. Every property here is resolved BY NAME by
-	// UTraceCharacterMovementComponent (TraceMoveKnob::Float / ::Bool), which was written in the same
-	// pass and could not declare them itself. A rename on either side silently falls back to the
-	// literal at the call site — no build error, no warning, just a slider that does nothing. The
-	// defaults below are exactly the movement component's fallbacks, so the two agree even before
-	// DefaultGame.ini is read. Trace.VerifyKnobs prints the verdict.
+	// WHY LedgeGroundGraceSeconds STAYS, AND WHY IT IS NOW THE WHOLE SECTION. The v5 mantle was
+	// added as the fix for "when jumping on the edge of a raised section, it's glitchy and feels like
+	// rubber banding". A mantle does not fix a prediction desync, it HIDES one — the disagreement was
+	// still there on every ledge the mantle did not trigger on, and v12 asks for the underlying bug
+	// outright ("make sure there's no bug when a player hits the top edge"). Deleting the mantle
+	// hands the original complaint straight back unless the desync half is handled, and this knob IS
+	// that half. It was never a mantle setting; it only lived in the mantle block because that is the
+	// pass that added it.
 	// ==========================================================================================
-
-	/** Master switch. OFF restores the pre-v5 behaviour of jumping and scraping at the lip. */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Mantle Enabled"))
-	bool bMantleEnabled = true;
-
-	/**
-	 * How far ahead of the capsule, in uu, the ledge probe reaches.
-	 *
-	 * Short on purpose: this is "I am at the wall", not "there is a wall over there". The capsule
-	 * radius is 34 uu, so 70 puts the probe about a body-width in front of the chest. Too long and
-	 * the pawn snaps forward onto ledges it was running past; too short and you have to be pressed
-	 * against the lip before it triggers, which is the feel the mantle exists to remove.
-	 * Sane range 50 to 110.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Reach (uu ahead of capsule)", ClampMin = "10.0", ClampMax = "500.0", UIMin = "40.0", UIMax = "200.0"))
-	float MantleReachUU = 70.f;
-
-	/**
-	 * Ledges lower than this, in uu above the pawn's feet, are NOT mantled — the engine's step-up
-	 * already walks the pawn over them, and mantling a kerb reads as the game taking the controls
-	 * away. Keep it at or above UCharacterMovementComponent::MaxStepHeight. Sane range 45 to 70.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Min Ledge Height (uu)", ClampMin = "0.0", ClampMax = "300.0", UIMin = "20.0", UIMax = "120.0"))
-	float MantleMinHeightUU = 55.f;
-
-	/**
-	 * Tallest ledge that may be mantled, in uu above the pawn's feet.
-	 *
-	 * The spec says "hip-to-shoulder height", and 230 is above that on a 176 uu capsule — that is
-	 * deliberate and it is the movement pass's call: the arena's cover boxes are 176 / 352 / 616 uu,
-	 * so a shoulder-height limit would mantle nothing the player could not already step onto and the
-	 * feature would never fire on the geometry that produced the complaint. A jump ADDS to what is
-	 * reachable, so 230 from standing plus a jump covers the 352 tier from a running start.
-	 * Must stay above Min Ledge Height. Sane range 150 to 260.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Max Ledge Height (uu)", ClampMin = "10.0", ClampMax = "600.0", UIMin = "60.0", UIMax = "400.0"))
-	float MantleMaxHeightUU = 230.f;
-
-	/**
-	 * How long the climb takes, in seconds, from trigger to standing on the ledge.
-	 *
-	 * This is a control lockout, so it is the number that decides whether the mantle feels like a
-	 * move or like a cutscene. 0.35 s is roughly a step-and-pull; past ~0.6 s a player being shot at
-	 * mid-climb has time to resent it, and below ~0.2 s it reads as a teleport and stops solving the
-	 * legibility half of the complaint. Sane range 0.25 to 0.5.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Climb Duration (s)", ClampMin = "0.05", ClampMax = "2.0", UIMin = "0.15", UIMax = "0.8"))
-	float MantleDurationSeconds = 0.35f;
-
-	/**
-	 * Fraction of the climb spent going UP before the pawn starts moving forward over the lip.
-	 *
-	 * Never 0 and never 1: the rise has to finish before the pawn crosses the lip or it walks into
-	 * the wall face, and the crossing has to have time left or the climb ends hanging in the air
-	 * over the edge. 0.6 is a rise-then-step. Sane range 0.5 to 0.75.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Up Phase (fraction of duration)", ClampMin = "0.1", ClampMax = "0.9", UIMin = "0.3", UIMax = "0.8"))
-	float MantleUpPhaseFraction = 0.6f;
-
-	/**
-	 * Seconds after a mantle ends before another may start.
-	 *
-	 * Stops a player mantling repeatedly against a wall corner where two ledges are in reach, which
-	 * looks like a stutter rather than a move. Short, because a mantle is traversal and not a
-	 * cooldown ability. Sane range 0.2 to 0.6.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Cooldown (s)", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "2.0"))
-	float MantleCooldownSeconds = 0.35f;
-
-	/**
-	 * Minimum forward speed, uu/s, before a mantle will trigger. This makes the mantle a MOVE rather
-	 * than a proximity effect: you have to be going at the ledge, not standing near it.
-	 *
-	 * 120 is about a seventh of walk speed, so it excludes a pawn drifting into a wall while looking
-	 * around and includes anyone actually running at it. 0 lets a stationary player climb, which
-	 * plays but reads as sticky. Sane range 80 to 250.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Min Forward Speed (uu/s)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "0.0", UIMax = "600.0"))
-	float MantleMinForwardSpeed = 120.f;
 
 	/**
 	 * Seconds of grace during which a pawn that has just lost ground contact is still treated as
-	 * grounded. THE OTHER HALF OF THE LEDGE BUG (spec v5 §7).
+	 * grounded. THE LEDGE-EDGE FIX (spec v5 §7's second half, and spec v12 §5's actual request).
 	 *
 	 * "Feels like rubber banding" at a ledge is a one- or two-frame contact blip as the capsule
 	 * crosses a lip: the client and the server disagree about whether the pawn is walking or falling
@@ -1787,10 +1715,16 @@ public:
 	 * without swallowing anything a player would notice. 0.08 s is about five frames at 60 Hz — far
 	 * too short to let a pawn run off a roof and keep its footing.
 	 *
-	 * 0 restores the exact Demo 5 behaviour, which is what the desync was measured against, so keep
-	 * it as an A/B rather than deleting it. Sane range 0.05 to 0.12.
+	 * WITH THE MANTLE REMOVED THIS IS THE ONLY THING STANDING BETWEEN THE PLAYER AND THE DEMO 5
+	 * COMPLAINT, so do not treat it as a leftover. 0 restores the exact Demo 5 behaviour, which is
+	 * what the desync was measured against, so keep it as an A/B rather than deleting it.
+	 * Sane range 0.05 to 0.12.
+	 *
+	 * NAME IS LOAD-BEARING: resolved BY NAME as "LedgeGroundGraceSeconds" by
+	 * UTraceCharacterMovementComponent through TraceMoveKnob. A rename here does not fail to
+	 * compile — it silently reverts to the component's own literal. Trace.VerifyKnobs lists it.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Mantle", meta = (DisplayName = "Ledge Ground Grace (s)", ClampMin = "0.0", ClampMax = "0.5", UIMin = "0.0", UIMax = "0.2"))
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Ledges", meta = (DisplayName = "Ledge Ground Grace (s) [v12 §5]", ClampMin = "0.0", ClampMax = "0.5", UIMin = "0.0", UIMax = "0.2"))
 	float LedgeGroundGraceSeconds = 0.08f;
 
 	// ==========================================================================================
@@ -1838,9 +1772,9 @@ public:
 	 * [ASSUMPTION] a 40% cut: still ~4 frames wider than a 40 ms client's own latency (spec v8 §0), so
 	 * the move stays performable online. Do not take the effective window below ~0.10 s.
 	 *
-	 * IT ALSO SHORTENS THE MANTLE DEFERRAL. The movement component uses the same scaled window when
-	 * deciding how long an auto-mantle should stand aside for a live wall-jump opportunity, so the two
-	 * halves of §5 move together by construction rather than by two numbers being kept in step.
+	 * IT USED TO SHORTEN THE MANTLE DEFERRAL AS WELL — the component reused this scaled window when
+	 * deciding how long an auto-mantle should stand aside for a live wall-jump opportunity. Spec v12
+	 * §5 removed the mantle, so that second effect is gone and this knob now does exactly one thing.
 	 *
 	 * Bound BY NAME as "WallJumpWindowScale", clamped in the component to 0.05..1 — it can only ever
 	 * shorten the window, never lengthen it.
@@ -1881,25 +1815,17 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Momentum Scale (v9 §5, x retention)", ClampMin = "0.1", ClampMax = "1.0", UIMin = "0.7", UIMax = "1.0"))
 	float WallJumpMomentumScale = 0.9f;
 
-	/**
-	 * SPEC v9 §5 — "If a player inputs a wall jump, that overrides a mantle." Seconds the mantle is
-	 * held off after a wall jump.
-	 *
-	 * Refusing the mantle on the frame of the wall jump is not enough on its own: the pawn is still a
-	 * few uu from the same ledge face for the next handful of frames, so the very next move would pass
-	 * the mantle's own test and vacuum the player back onto the lip they had just launched away from —
-	 * which reads as the wall jump not having happened at all.
-	 *
-	 * 0.30 s covers the frames in which the launch is still near the face without being long enough to
-	 * deny a genuine mantle attempt at the next ledge. 0 disables the lockout and leaves only the
-	 * same-frame priority.
-	 *
-	 * Bound BY NAME as "WallJumpMantleLockoutSeconds", clamped in the component to 0..2. The component
-	 * implements it by pushing its existing mantle cooldown rather than adding a second clock, so it
-	 * costs no new prediction state and cannot rubber-band.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Mantle Lockout After Wall Jump (s)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
-	float WallJumpMantleLockoutSeconds = 0.30f;
+	// SPEC v12 §5 — WallJumpMantleLockoutSeconds (v9 §5, "if a player inputs a wall jump, that
+	// overrides a mantle") IS DELETED. It existed for one purpose: to stop the mantle vacuuming a
+	// player back onto the lip they had just wall-jumped away from. With the mantle gone there is
+	// nothing to hold off, so the knob is removed rather than left at 0 — a knob whose only reader
+	// has been deleted is a dead slider, and this page has shipped those before.
+	//
+	// THE WALL JUMP ITSELF IS UNCHANGED AND MUST STAY THAT WAY: v12 §5 is "remove mantling, KEEP wall
+	// jumping". The priority code that made a wall jump beat a mantle goes away with the mantle, so
+	// the thing to verify after this removal is that the wall jump still fires cleanly at a wall on
+	// its own — it no longer has a competitor to win against, and it must not have lost its trigger
+	// along with it.
 
 	/**
 	 * SPEC v10 §5 — the SECOND -10% on wall-jump momentum. Verbatim: "Reduce the momentum boost from
@@ -1981,17 +1907,31 @@ public:
 	// ==========================================================================================
 
 	/**
-	 * Ground speed multiplier while the knife is out. Spec v10 §1: "move 30% faster with a knife".
+	 * Ground speed multiplier while the knife is out. Spec v12 §3: 1.30 -> 1.22.
+	 *
+	 * Verbatim (v12 §3): "Reduce max speed with the knife from the previous 30% increase to 22% and
+	 * adjust momentum accordingly." v10 §1 asked for the 30% ("Players should move 30% faster with a
+	 * knife, as well as have a higher momentum ceiling"); v12 walks it back to 22%.
 	 *
 	 * x WalkSpeed, so the knife is a MOBILITY CHOICE and not merely a weapon — which is the
 	 * interesting half of the design and the reason bots are told to swap to it to close distance.
+	 *
+	 * *** THIS BREAKS THE CARRIER/KNIFE SPEED PARITY THE USER ASKED FOR, AND IT IS NOT AN OVERSIGHT.
+	 * *** The user previously asked to "increase core carrier speed to match knife speed", and
+	 * *** CarrierSpeedMultiplier was set to 1.30 for exactly that reason and nothing else. v12 §3
+	 * *** moves ONLY the knife, so the two are no longer equal and the CARRIER IS NOW THE FASTER OF
+	 * *** THE TWO (1.30 vs 1.22, carrier +6.6%). A defender who swaps to the knife to chase the
+	 * *** carrier can no longer catch them on a straight line. Only what was asked has been
+	 * *** implemented — the carrier is deliberately left at 1.30. If parity was the point, set
+	 * *** CarrierSpeedMultiplier to 1.22 as well; that is the one-line change and it is the user's
+	 * *** call, not this pass's.
 	 *
 	 * Bound BY NAME as "KnifeMoveSpeedMultiplier", clamped in the component to 1..3. It is clamped at
 	 * the BOTTOM as well as the top on purpose: a value under 1 would make the knife a mobility
 	 * PENALTY, which inverts the mechanic silently rather than loudly.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Ground Speed (x walk) [v10 §1]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
-	float KnifeMoveSpeedMultiplier = 1.30f;
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Ground Speed (x walk) [v12 §3]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float KnifeMoveSpeedMultiplier = 1.22f;
 
 	/**
 	 * The "higher momentum ceiling", soft half. x AirStrafeSoftCapSpeed while the knife is out.
@@ -1999,14 +1939,20 @@ public:
 	 * TWO CEILING KNOBS, NOT ONE, and they are deliberately different numbers. The soft cap is where
 	 * air-strafe gain starts falling off and the hard cap is where it stops; raising both by the same
 	 * factor would move the ceiling without widening the band a skilled player actually plays in.
-	 * 1.25 / 1.35 raises the ceiling AND opens the band, which is what "a higher momentum ceiling"
+	 * The pair raises the ceiling AND opens the band, which is what "a higher momentum ceiling"
 	 * buys a player who can already air-strafe.
+	 *
+	 * SPEC v12 §3, "adjust momentum accordingly": 1.25 -> 1.1833. THE BONUS IS SCALED, NOT THE
+	 * MULTIPLIER. Scaling the multiplier itself (1.25 x 22/30 = 0.917) would put the knife BELOW the
+	 * gun's own air cap, i.e. turn the mobility kit into a penalty. The bonus is the part above 1:
+	 * 1 + 0.25 x (22/30) = 1.18333. Shipped soft cap with a knife = AirStrafeSoftCapSpeed 1045 x
+	 * 1.18333 = ~1237 uu/s (was ~1306).
 	 *
 	 * Tunable separately from the base caps, as spec v10 §1 requires. Bound BY NAME as
 	 * "KnifeAirStrafeSoftCapMultiplier", clamped in the component to 1..3.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Air Soft Cap (x base) [v10 §1]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
-	float KnifeAirStrafeSoftCapMultiplier = 1.25f;
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Air Soft Cap (x base) [v12 §3]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float KnifeAirStrafeSoftCapMultiplier = 1.183333f;
 
 	/**
 	 * The "higher momentum ceiling", hard half. x AirStrafeHardCapSpeed while the knife is out.
@@ -2014,12 +1960,17 @@ public:
 	 * KEEP THIS AT OR ABOVE KnifeAirStrafeSoftCapMultiplier. The component clamps each independently
 	 * and does not cross-check them, so a hard multiplier below the soft one would put the hard cap
 	 * under the soft cap and air-strafe gain would be cut off before the falloff ever began — the
-	 * knife would feel SLOWER in the air than the gun, which is the opposite of the request.
+	 * knife would feel SLOWER in the air than the gun, which is the opposite of the request. The
+	 * v12 rescale below preserves that ordering because it scales both BONUSES by the same 22/30,
+	 * and 0.35 > 0.25 before the scale means 0.2567 > 0.1833 after it.
+	 *
+	 * SPEC v12 §3, "adjust momentum accordingly": 1.35 -> 1.2567, i.e. 1 + 0.35 x (22/30). Shipped
+	 * hard cap with a knife = AirStrafeHardCapSpeed 1375 x 1.25667 = ~1728 uu/s (was ~1856).
 	 *
 	 * Bound BY NAME as "KnifeAirStrafeHardCapMultiplier", clamped in the component to 1..3.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Air Hard Cap (x base) [v10 §1]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
-	float KnifeAirStrafeHardCapMultiplier = 1.35f;
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Knife", meta = (DisplayName = "Knife Air Hard Cap (x base) [v12 §3]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float KnifeAirStrafeHardCapMultiplier = 1.256667f;
 
 	/**
 	 * Flat uu/s pushed straight out along the wall normal, on top of the reflection.
@@ -2510,9 +2461,24 @@ public:
 	 * CorePickupRadius (120): the pickup radius is where possession changes, this is the funnel
 	 * that feeds it. Sane range 300 to 800; past ~1000 the Core visibly homes and interceptions
 	 * stop feeling earned.
+	 *
+	 * SPEC v12 §4: 500 -> 450. Verbatim: "Reduce the 'magnet' radius for catching in game mode b by
+	 * 10%". Mode A never reads this block at all (ServerApplyCatchZone is only reached from the
+	 * mode-B loose-Core tick), so the cut is mode B only by construction rather than by a mode test.
+	 *
+	 * WHAT THE 10% ACTUALLY COSTS, because it is not 10% of anything a player experiences. The pull
+	 * is a falloff cone — full strength on the capsule, ZERO at the boundary — so shrinking the
+	 * radius does not merely clip the outer ring off, it steepens the whole falloff: at any given
+	 * distance the Core is now closer to the (nearer) edge and therefore steered LESS. It also
+	 * removes ~19% of the zone's area and ~27% of its volume, and it costs the fastest Cores the
+	 * most: a throw that inherits a jumping thrower's velocity (up to ~3357 uu/s, see
+	 * CoreThrowVelocityInheritance) crosses the zone in fewer frames, and the magnet integrates its
+	 * correction per frame. Measured catch rate across the speed band is in the v12 report; if a
+	 * fast Core stops being catchable, RAISE CoreCatchCurveStrength rather than putting this back —
+	 * strength is what the fast case is short of, radius is what the user asked to cut.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Zone Radius (uu) [mode B]", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "0.0", UIMax = "1200.0"))
-	float CoreCatchRadius = 500.f;
+	float CoreCatchRadius = 450.f;
 
 	/**
 	 * How hard the catch zone bends the Core, as an exponential approach rate (frame-rate
@@ -2854,6 +2820,93 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Segment Height (uu)", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "40.0", UIMax = "400.0"))
 	float TrailHeight = 63.f;
+
+	// ------------------------------------------------------------------------------------------
+	// TRACE WALL CLEARANCE — THE CORNER FITTER  (spec v12 §6, new)
+	//
+	// Verbatim: "The trace is clipping into walls sometimes, when a model runs close to a
+	// corner/structure."
+	//
+	// [DIAGNOSED] The ribbon meshes are NoCollision, so they never interact with the world. But the
+	// cause is not the drawing: points are laid every TrailPointSpacing (60 uu) of travel and the
+	// trace — ribbon AND trip test alike — is the STRAIGHT CHORD between consecutive points. Rounding
+	// a pillar the carrier's capsule follows an arc, 60 uu of which is most of the turn, so the two
+	// points straddle the corner and the chord between them cuts through the pillar. The lethal
+	// volume takes the identical shortcut, which is why this was never a cosmetic bug.
+	//
+	// THE FIX IS SUBDIVISION, NOT DISPLACEMENT: UTraceTrailComponent keeps the positions the carrier
+	// really occupied and inserts them until no segment passes through the level. Nothing is moved
+	// off the route the player ran — wherever a 34 uu capsule legally stood there is room for a
+	// 22.5 uu trace. The push knob below only cleans up a point that was already inside something.
+	//
+	// *** THE STANDING INVARIANT SURVIVES BY CONSTRUCTION: THE LETHAL VOLUME MATCHES THE DRAWN
+	// *** VOLUME. Both are built from TrailPoints and the fitter edits TrailPoints, so there is one
+	// *** polyline and no pair of geometry paths to keep in agreement by hand. Any future version of
+	// *** this fix that touches the RIBBON instead would create an invisible kill volume, which is
+	// *** the worse of the two failures this project has already had a version of.
+	//
+	// NAMES ARE LOAD-BEARING AND THEY ARE THE COMPONENT'S OWN. Each of the four below pairs with the
+	// Trace.Trail.WallFit* console variable of the same meaning, and must be resolved the way
+	// GetTraceTrailRadius() resolves TrailRadius: settings property by default, CVar when the CVar is
+	// explicitly set. A knob declared here that the component never reads is a dead slider, which is
+	// the failure Trace.VerifyKnobs exists for — it lists all four.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Master switch for the corner fitter. Pairs with Trace.Trail.WallFit.
+	 *
+	 * OFF restores the exact pre-v12 straight chord — i.e. it reproduces the reported bug on demand,
+	 * which is what makes it worth keeping rather than deleting once the fix lands. "Is the clipping
+	 * fixed" and "did the fix change where the trace kills" are two questions, and this is how they
+	 * get asked one at a time.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Wall Fit Enabled [v12 §6]"))
+	bool bTrailWallFitEnabled = true;
+
+	/**
+	 * Clearance in uu the trace asks for OVER its own half width when testing a segment against the
+	 * level. Pairs with Trace.Trail.WallFitMargin.
+	 *
+	 * The ribbon legitimately reaches a little past TrailRadius at joints (interior joints overlap by
+	 * one radius so the wedge on the outside of a corner closes) and a box's corner is further from
+	 * its axis than its face. A few uu covers that without pretending the trace is fatter than it is.
+	 *
+	 * KEEP IT WELL UNDER THE CARRIER'S OWN 34 uu CAPSULE RADIUS. Ask for more clearance than a body
+	 * needs and there are legal routes no polyline can satisfy: the fitter then spends its whole
+	 * insert budget every step, fails, and falls back to the chord — the bug returns while the knob
+	 * says the fix is on. Sane range 2 to 10.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Wall Fit Margin (uu over half width) [v12 §6]", ClampMin = "0.0", ClampMax = "34.0", UIMin = "0.0", UIMax = "12.0"))
+	float TrailWallFitMarginUU = 4.f;
+
+	/**
+	 * Largest horizontal nudge, in uu, applied to a trail point that is ALREADY inside level
+	 * geometry. Pairs with Trace.Trail.WallFitMaxPush. 0 disables the nudge and leaves subdivision.
+	 *
+	 * Deliberately small. Subdivision does the real work; this is residue cleanup, and it must never
+	 * become a mechanism that slides the trace off the route the player ran — the trace is where the
+	 * carrier went, and a knob that can move it 100 uu is a knob that can put a kill volume somewhere
+	 * nobody ran. The component additionally refuses any nudge that does not reduce penetration or
+	 * that breaks line of sight to the original point, so a thin wall cannot be tunnelled through.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Wall Fit Max Push (uu) [v12 §6]", ClampMin = "0.0", ClampMax = "34.0", UIMin = "0.0", UIMax = "20.0"))
+	float TrailWallFitMaxPushUU = 12.f;
+
+	/**
+	 * Most extra points the fitter may insert for ONE appended trail point. Pairs with
+	 * Trace.Trail.WallFitMaxInsert.
+	 *
+	 * A 60 uu chord subdivided by the carrier's real path needs one or two extra points around a
+	 * pillar, so 6 is generous. It exists so a pathological case — a carrier standing inside
+	 * geometry, a mesh no capsule can clear — degrades to the old chord instead of flooding the
+	 * replicated fast array, which is a bandwidth cliff and an ordering hazard on clients.
+	 *
+	 * Raising it costs replication on exactly the frames that already cost the most. If the fitter
+	 * reports unroutable appends, look at TrailWallFitMarginUU first — an over-large margin is a far
+	 * likelier cause than a budget that is genuinely too small.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Wall Fit Max Inserted Points [v12 §6]", ClampMin = "0", ClampMax = "64", UIMin = "0", UIMax = "16"))
+	int32 TrailWallFitMaxInsert = 6;
 
 	/** Hard cap on replicated trail points; oldest are dropped first. A bandwidth dial. */
 	UPROPERTY(config, EditAnywhere, Category = "Trail", meta = (DisplayName = "Max Trail Points", ClampMin = "8", ClampMax = "1024", UIMin = "32", UIMax = "512"))

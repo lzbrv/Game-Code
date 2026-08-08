@@ -2,19 +2,28 @@
 
 #include "Net/UnrealNetwork.h"
 
+#include "Camera/CameraActor.h"                // spec v12 §6 — the capture camera for Trace.Trail.WallClip
 #include "Camera/PlayerCameraManager.h"        // local camera location (proximity glow fade)
+#include "CollisionQueryParams.h"              // spec v12 §6 — the wall-fit world queries
+#include "CollisionShape.h"                    // FCollisionShape::MakeCapsule / MakeSphere
 #include "Components/CapsuleComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"  // the arena pools its rendered geometry
 #include "Components/PoseableMeshComponent.h"  // spec v4 §2 — the character-shaped after-images
 #include "Components/SkeletalMeshComponent.h"  // the live Mannequin the ghosts copy their pose from
 #include "Components/StaticMeshComponent.h"
 #include "Engine/Engine.h"                     // GEngine->GetFirstLocalPlayerController()
 #include "Engine/EngineBaseTypes.h"
+#include "Engine/EngineTypes.h"                // FMTDResult (how deep the trace is inside a wall)
+#include "Engine/OverlapResult.h"              // FOverlapResult (spec v12 §6)
 #include "Engine/SkinnedAsset.h"               // ghost pool identity (which Mannequin is skinned in)
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"                       // TActorIterator (fallback character gather)
+#include "GameFramework/Character.h"           // capsule radius, for the wall-fit clearance ceiling
 #include "GameFramework/Controller.h"
 #include "GameFramework/GameStateBase.h"       // GetServerWorldTimeSeconds()
+#include "HAL/PlatformFileManager.h"           // Trace.Trail.WallClip's screenshot check
+#include "Misc/Paths.h"                        // Trace.Trail.WallClip's screenshot path
 #include "GameFramework/Pawn.h"                 // Trace.Trail.DebugLookBack
 #include "GameFramework/PlayerController.h"    // IsLocalPlayerController() (own-trace near hide)
 #include "Materials/MaterialInstanceDynamic.h"
@@ -310,6 +319,153 @@ namespace
 		     "(spec v7 3: 63, the middle third of the old 190). Negative = fall back to "
 		     "UTraceSettings::TrailHeight."),
 		ECVF_Default);
+
+	// =============================================================================================
+	// SPEC v12 §6 — the trace clips into walls
+	// =============================================================================================
+	//
+	// "The trace is clipping into walls sometimes, when a model runs close to a corner/structure."
+	//
+	// MEASURED CAUSE (see Trace.Trail.WallClip, which reports both halves separately): it is the PATH,
+	// not the drawing. Points are laid every TrailPointSpacing of travel and everything downstream —
+	// the ribbon AND the trip test — treats the polyline between them as straight. A carrier rounding
+	// a corner traces an arc about the corner vertex at their own capsule radius, and one 60uu step is
+	// most of a quarter turn, so consecutive points straddle the corner and the chord between them
+	// passes inside the structure. Both the ribbon and the kill volume take the identical shortcut.
+	//
+	// THE FIX, and why it is this one of the three the spec offered:
+	//
+	//   * Tapering the ribbon near walls, or clipping the drawn ribbon against the world, would both
+	//     mean the DRAWING knows something the TRIP TEST does not. The trip test would then need its
+	//     own copy of the same world query, per segment, every server tick — two implementations of
+	//     one piece of geometry, kept in agreement by hand. That is precisely the arrangement that has
+	//     already produced "visible but not lethal" on this project once.
+	//   * Moving the PATH needs neither. RebuildRibbon and ServerRunTripTest both read TrailPoints and
+	//     neither is modified by this change, so the invariant survives for the reason it always has:
+	//     THERE IS ONLY ONE POLYLINE. Whatever this does to the trace, it does to both halves of it in
+	//     the same instruction.
+	//
+	// And the path can be fixed honestly, without inventing geometry: the carrier's capsule is 34uu of
+	// radius against a 22.5uu trace, so anywhere a body legally stood there is room for the ribbon.
+	// The route is fine; only the chord across it is wrong. So the repair is to SUBDIVIDE the chord
+	// with positions the carrier really occupied (PendingPathSamples) until no segment passes through
+	// the level — plus a small horizontal nudge for a point that is somehow already inside something.
+	//
+	// Everything downstream is unchanged by construction. Length-based expiry still measures the
+	// polyline, and measures the routed one, which is longer than the chord and therefore MORE honest
+	// about how far the carrier ran. No timer is introduced. ClearTrail still empties one array.
+	//
+	// ---- HOW THESE FOUR RESOLVE (integration pass, v12) ----
+	// All four ship as UTraceSettings properties with ini lines in Config/DefaultGame.ini, and the
+	// settings are the SOURCE OF TRUTH. These CVars are console OVERRIDES layered on top, exactly the
+	// arrangement GetTraceTrailRadius()/GetTraceTrailHeight() already use for the trace's dimensions.
+	//
+	// The sentinel is NEGATIVE = "nobody typed a value, follow the settings". It has to be a sentinel
+	// rather than a matching default because 0 is a MEANINGFUL value for three of the four (WallFit 0
+	// is the A/B before-arm, MaxPush 0 disables the nudge, MaxInsert 0 disables subdivision) — so
+	// "equals the default" cannot be used to detect "unset" the way it could for a positive-only knob.
+	//
+	// Read them through WallFitEnabled()/WallFitMargin()/WallFitMaxPush()/WallFitMaxInsert() below and
+	// NEVER off the globals directly, or the ini silently stops working again.
+	int32 GWallFit = -1;
+
+	FAutoConsoleVariableRef CVarWallFit(
+		TEXT("Trace.Trail.WallFit"),
+		GWallFit,
+		TEXT("Console override for bTrailWallFitEnabled; -1 (default) follows the setting. "
+		     "1 = the server subdivides a trail segment that would pass through the level, "
+		     "using the positions the carrier really occupied, so neither the ribbon nor the kill "
+		     "volume cuts across a corner. 0 = the pre-v12 straight chord, i.e. the reported bug, "
+		     "reproduced on demand for A/B. Moves the drawn and the lethal trace together — there is "
+		     "only one polyline."),
+		ECVF_Default);
+
+	/**
+	 * Clearance the trace asks for, OVER its own half width, when deciding whether a segment is inside
+	 * the level. The ribbon is 22.5uu of half width but the DRAWING legitimately reaches a little
+	 * further than that at joints (PlaceRibbon overlaps interior joints by one TrailRadius so the
+	 * wedge on the outside of a corner closes), and a box's corner is further from the axis than its
+	 * face. A few uu of margin covers that without pretending the trace is fatter than it is.
+	 *
+	 * Bounded well under the carrier's own 34uu capsule radius: ask for more clearance than a body
+	 * needs and there are legal routes that no polyline can satisfy, and the fitter would spend its
+	 * insert budget every step for nothing.
+	 */
+	float GWallFitMargin = -1.f;
+
+	FAutoConsoleVariableRef CVarWallFitMargin(
+		TEXT("Trace.Trail.WallFitMargin"),
+		GWallFitMargin,
+		TEXT("Console override for TrailWallFitMarginUU; negative (default) follows the setting. "
+		     "uu of clearance the trace asks for OVER its own half width when testing a segment against "
+		     "the level (spec v12 6). Covers the ribbon's joint overlap and box corners. Clamped to the "
+		     "carrier's capsule radius - past that no legal route would ever be clear."),
+		ECVF_Default);
+
+	/**
+	 * Cap on the horizontal nudge applied to a point that is already inside something. Small on
+	 * purpose: this must never become a mechanism that slides the trace off the route the player ran.
+	 * Subdivision does the real work; this only cleans up the residue.
+	 */
+	float GWallFitMaxPush = -1.f;
+
+	FAutoConsoleVariableRef CVarWallFitMaxPush(
+		TEXT("Trace.Trail.WallFitMaxPush"),
+		GWallFitMaxPush,
+		TEXT("Console override for TrailWallFitMaxPushUU; negative (default) follows the setting. "
+		     "Largest horizontal nudge, in uu, applied to a trail point that is already inside level "
+		     "geometry (spec v12 6). 0 disables the nudge and leaves only the subdivision. Never "
+		     "applied unless it reduces the penetration and the moved point is still in line of sight "
+		     "of where it started, so a thin wall cannot be tunnelled through."),
+		ECVF_Default);
+
+	/**
+	 * Ceiling on points inserted for ONE append. A 60uu chord subdivided by the carrier's real path
+	 * needs one or two extra points around a pillar; the budget exists so that a pathological case
+	 * (a carrier standing inside geometry, a map with a mesh no capsule can clear) degrades to the
+	 * old behaviour instead of flooding the fast array.
+	 */
+	int32 GWallFitMaxInsert = -1;
+
+	FAutoConsoleVariableRef CVarWallFitMaxInsert(
+		TEXT("Trace.Trail.WallFitMaxInsert"),
+		GWallFitMaxInsert,
+		TEXT("Console override for TrailWallFitMaxInsert; negative (default) follows the setting. "
+		     "Most extra points the corner fitter may insert for one appended trail point (spec v12 6). "
+		     "Exhausting it falls back to the straight chord and logs."),
+		ECVF_Default);
+
+	/**
+	 * The four resolvers. CVar when somebody typed one, the shipped setting otherwise. Every read of
+	 * the wall fitter's tuning goes through these — see the sentinel note on GWallFit above for why
+	 * "unset" has to be negative rather than "equal to the default".
+	 */
+	bool WallFitEnabled()
+	{
+		return (GWallFit >= 0) ? (GWallFit != 0) : UTraceSettings::Get().bTrailWallFitEnabled;
+	}
+
+	float WallFitMargin()
+	{
+		return (GWallFitMargin >= 0.f) ? GWallFitMargin : UTraceSettings::Get().TrailWallFitMarginUU;
+	}
+
+	float WallFitMaxPush()
+	{
+		return (GWallFitMaxPush >= 0.f) ? GWallFitMaxPush : UTraceSettings::Get().TrailWallFitMaxPushUU;
+	}
+
+	int32 WallFitMaxInsert()
+	{
+		return (GWallFitMaxInsert >= 0) ? GWallFitMaxInsert : UTraceSettings::Get().TrailWallFitMaxInsert;
+	}
+
+	/** Session counters, printed by Trace.Trail.WallClip. Appends that needed routing / points added. */
+	int32 GWallFitRoutedAppends = 0;
+	int32 GWallFitInsertedPoints = 0;
+
+	/** Appends the fitter could not make clear at all — the honest count of what this does NOT fix. */
+	int32 GWallFitUnroutable = 0;
 
 	/**
 	 * v7 §7: whether a receiving machine repairs the order of the replicated point array.
@@ -792,6 +948,17 @@ namespace
 	 * segment spanning the arena.
 	 */
 	constexpr double MaxTrailSegmentLength = 1000.0;
+
+	/**
+	 * SPEC v12 §6: ceiling on the carrier's remembered route between two appended points.
+	 *
+	 * It is emptied every time a point is laid, i.e. every TrailPointSpacing (60uu) of travel, so in
+	 * normal play it holds two entries at dash speed and six or seven at a walk. The cap only matters
+	 * while a carrier is barely moving, when the distance gate holds the append off indefinitely and
+	 * the samples would otherwise accumulate without bound — and the oldest of those are precisely the
+	 * ones the fitter has no use for.
+	 */
+	constexpr int32 MaxPendingPathSamples = 48;
 
 	/** Divide-by-zero epsilon. Written as a literal on purpose: the KINDA_SMALL_NUMBER family of
 	 *  macros was renamed during the 5.x line and we must compile on 5.4 through 5.8. */
@@ -2152,6 +2319,12 @@ void UTraceTrailComponent::ClearTrail()
 	}
 
 	PreviousLocations.Reset();
+
+	// SPEC v12 §6. The remembered route belongs to the trace that just went away. Kept across a clear
+	// it would let the FIRST point of the next trace be subdivided along the previous holder's path —
+	// a stretch of lethal, drawn trace laid where this carrier has never been.
+	PendingPathSamples.Reset();
+
 	bVisualsDirty = true;
 }
 
@@ -2520,6 +2693,319 @@ void UTraceTrailComponent::OnTrailPointsChanged()
 
 
 // =================================================================================================
+// SPEC v12 §6: keeping the trace — DRAWN AND LETHAL TOGETHER — out of the level
+// =================================================================================================
+
+namespace
+{
+	/**
+	 * Is this overlap a piece of LEVEL, i.e. something a ribbon has no business being inside?
+	 *
+	 * PAWNS ARE NOT WALLS, and that exclusion is doing real work rather than being tidy. Every query
+	 * here is centred on a position a character's capsule occupied a moment ago — the carrier's own
+	 * capsule is the very first thing an ECC_Visibility overlap at their actor location finds — and
+	 * the trace is laid straight through the people playing, constantly, by design.
+	 *
+	 * Touches are ignored as well: only a BLOCKING response counts. Endzone volumes, pickup shells and
+	 * anything else that reports a touch on Visibility is not geometry, and routing the trace around a
+	 * trigger volume would be an invisible change to where the trace can go.
+	 */
+	bool IsWorldObstruction(const FOverlapResult& Overlap)
+	{
+		if (!Overlap.bBlockingHit || Overlap.GetComponent() == nullptr)
+		{
+			return false;
+		}
+
+		const AActor* OverlapOwner = Overlap.GetActor();
+		return OverlapOwner == nullptr || !OverlapOwner->IsA(APawn::StaticClass());
+	}
+
+	/**
+	 * The clearance the trace asks for, in uu — its own half width plus GWallFitMargin, but NEVER more
+	 * than a body needs.
+	 *
+	 * That ceiling is the difference between a fitter that works and one that thrashes. The carrier's
+	 * capsule is ~34uu of radius; if the trace demanded more clearance than that, there would be legal
+	 * routes — a corridor a player can walk down — that NO polyline could satisfy, the segment test
+	 * would report "obstructed" on every append, and the fitter would spend its whole insert budget
+	 * every 60uu achieving nothing.
+	 */
+	double TrailWallFitClearance(const AActor* Owner)
+	{
+		const double Radius = FMath::Max(1.0, static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius()));
+
+		double BodyRadius = 34.0;
+		if (const ACharacter* OwnerCharacter = Cast<ACharacter>(Owner))
+		{
+			if (const UCapsuleComponent* Capsule = OwnerCharacter->GetCapsuleComponent())
+			{
+				BodyRadius = FMath::Max(Radius, static_cast<double>(Capsule->GetScaledCapsuleRadius()));
+			}
+		}
+
+		const double Requested = Radius + FMath::Max(0.0, static_cast<double>(WallFitMargin()));
+		return FMath::Clamp(Requested, Radius, FMath::Max(Radius, BodyRadius - 1.0));
+	}
+
+	/**
+	 * The trace's own cross-section as a query shape: an upright capsule of the requested clearance,
+	 * as tall as the lethal column. A capsule rather than a box because the probe is swept along a
+	 * polyline in every direction including pitch, and an axis-aligned box would have to be re-oriented
+	 * per segment for no gain — the lateral extent, which is the whole question, is identical.
+	 */
+	FCollisionShape MakeTrailProbeShape(double Clearance)
+	{
+		const float ProbeRadius = static_cast<float>(FMath::Max(1.0, Clearance));
+		const float ProbeHalfHeight = FMath::Max(
+			ProbeRadius + 0.1f,
+			static_cast<float>(FMath::Max(1.0, static_cast<double>(UTraceTrailComponent::GetTraceTrailHeight())) * 0.5));
+
+		return FCollisionShape::MakeCapsule(ProbeRadius, ProbeHalfHeight);
+	}
+}
+
+bool UTraceTrailComponent::IsTrailVolumeClear(const FVector& From, const FVector& To) const
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return true;
+	}
+
+	const double Clearance = TrailWallFitClearance(GetOwner());
+	const FCollisionShape Probe = MakeTrailProbeShape(Clearance);
+
+	FCollisionQueryParams Params(FName(TEXT("TraceTrailWallFit")), /*bTraceComplex=*/false);
+	Params.AddIgnoredActor(GetOwner());
+
+	// Stepped rather than swept. A swept multi-overlap stops at the first BLOCK, and on
+	// ECC_Visibility the first block between two points a body walked between is quite often another
+	// player — which would hide the wall behind them and report a segment clear that is not. Stepping
+	// asks the same question at each station and filters the answers, so nothing can mask anything.
+	// The step is a fraction of the probe's own radius, so no gap can slip between two stations.
+	const double Distance = FVector::Dist(From, To);
+	const int32 Steps = FMath::Clamp(
+		FMath::CeilToInt(Distance / FMath::Max(4.0, Clearance * 0.5)), 1, 64);
+
+	TArray<FOverlapResult> Overlaps;
+	for (int32 Step = 0; Step <= Steps; ++Step)
+	{
+		const FVector At = FMath::Lerp(From, To, static_cast<double>(Step) / static_cast<double>(Steps));
+
+		Overlaps.Reset();
+		if (!World->OverlapMultiByChannel(Overlaps, At, FQuat::Identity, ECC_Visibility, Probe, Params))
+		{
+			continue;
+		}
+
+		for (const FOverlapResult& Overlap : Overlaps)
+		{
+			if (IsWorldObstruction(Overlap))
+			{
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+FVector UTraceTrailComponent::FitPointToWorld(const FVector& Candidate) const
+{
+	const double MaxPush = FMath::Max(0.0, static_cast<double>(WallFitMaxPush()));
+	UWorld* World = GetWorld();
+	if (MaxPush <= 0.0 || World == nullptr)
+	{
+		return Candidate;
+	}
+
+	// The PUSH resolves a real penetration, so it probes at the trace's actual half width and not at
+	// the padded clearance the segment test uses. Padding here would shove points off the player's
+	// route to buy margin they did not need.
+	const FCollisionShape Probe = MakeTrailProbeShape(
+		FMath::Max(1.0, static_cast<double>(GetTraceTrailRadius())));
+
+	FCollisionQueryParams Params(FName(TEXT("TraceTrailWallPush")), /*bTraceComplex=*/false);
+	Params.AddIgnoredActor(GetOwner());
+
+	// Returns the deepest penetration at Where, and the summed minimum-translation push that would
+	// resolve every contact at once (a concave corner has two, and honouring only the deepest would
+	// slide the point along the other face).
+	const auto Measure = [&](const FVector& Where, FVector& OutPush) -> double
+	{
+		OutPush = FVector::ZeroVector;
+
+		TArray<FOverlapResult> Overlaps;
+		if (!World->OverlapMultiByChannel(Overlaps, Where, FQuat::Identity, ECC_Visibility, Probe, Params))
+		{
+			return 0.0;
+		}
+
+		double Deepest = 0.0;
+		for (const FOverlapResult& Overlap : Overlaps)
+		{
+			if (!IsWorldObstruction(Overlap))
+			{
+				continue;
+			}
+
+			FMTDResult MTD;
+			if (Overlap.GetComponent()->ComputePenetration(MTD, Probe, Where, FQuat::Identity))
+			{
+				Deepest = FMath::Max(Deepest, static_cast<double>(MTD.Distance));
+
+				// HORIZONTAL ONLY. The trace's height is anchored on the carrier's mid-model, and a
+				// vertical nudge would lift the ribbon off the body that laid it — which is a worse
+				// and more visible lie than the clipping being fixed. A floor or ceiling contact
+				// therefore contributes nothing, which is the correct answer for both.
+				FVector Direction = MTD.Direction;
+				Direction.Z = 0.0;
+				if (Direction.Normalize())
+				{
+					OutPush += Direction * static_cast<double>(MTD.Distance);
+				}
+			}
+		}
+
+		return Deepest;
+	};
+
+	FVector Push = FVector::ZeroVector;
+	const double Before = Measure(Candidate, Push);
+	if (Before <= 0.0 || Push.IsNearlyZero())
+	{
+		return Candidate;
+	}
+
+	const FVector Moved = Candidate + Push.GetClampedToMaxSize(MaxPush);
+
+	// THE GUARD, and it is the reason there is no line-of-sight check here instead. A minimum
+	// translation vector is by definition the SHORTEST way out, so it exits by the nearest face and
+	// cannot carry the point through a wall to the far side. What it can do is fail — push into a
+	// second surface, or not escape at all — so the only acceptance test is whether the trace ended
+	// up less inside the level than it started. If it did not, nothing moves and the fitter's
+	// subdivision is left to do the work.
+	FVector Unused = FVector::ZeroVector;
+	if (Measure(Moved, Unused) >= Before)
+	{
+		return Candidate;
+	}
+
+	return Moved;
+}
+
+int32 UTraceTrailComponent::AppendTrailPointsFitted(const FVector& Target, float Now)
+{
+	const auto AppendOne = [this, Now](const FVector& Where)
+	{
+		FTraceTrailPoint& NewPoint = TrailPoints.Items.AddDefaulted_GetRef();
+		NewPoint.Location = Where;
+		NewPoint.BirthServerTime = Now;
+
+		// Adding or changing an item is signalled per item; only removals need MarkArrayDirty.
+		TrailPoints.MarkItemDirty(NewPoint);
+	};
+
+	if (!WallFitEnabled())
+	{
+		// THE BEFORE ARM. Exactly the pre-v12 behaviour, to the instruction: one point, laid at the
+		// carrier's actor location, joined to the previous one by a straight chord however much level
+		// that chord passes through. This is what Trace.Trail.WallClip reproduces the bug with.
+		AppendOne(Target);
+		return 1;
+	}
+
+	const FVector FittedTarget = FitPointToWorld(Target);
+
+	// Nothing to cut a corner across yet.
+	if (TrailPoints.Items.Num() == 0)
+	{
+		AppendOne(FittedTarget);
+		return 1;
+	}
+
+	FVector Anchor(TrailPoints.Items.Last().Location);
+	if (IsTrailVolumeClear(Anchor, FittedTarget))
+	{
+		// The overwhelmingly common case, and it costs one stepped overlap query per 60uu of travel
+		// per carrier. Nothing is inserted, so a straight run lays exactly the points it always did.
+		AppendOne(FittedTarget);
+		return 1;
+	}
+
+	// The chord is inside the level. Walk the carrier's REAL route instead — the positions their
+	// capsule actually occupied — taking the LARGEST step that stays clear each time. Greedy on
+	// purpose: it inserts the fewest points that remove the shortcut, so a gentle curve adds nothing
+	// and only the tight corner is subdivided.
+	++GWallFitRoutedAppends;
+
+	int32 Appended = 0;
+	const int32 Budget = FMath::Clamp(WallFitMaxInsert(), 0, 32);
+	int32 Cursor = 0;
+
+	while (Appended < Budget)
+	{
+		int32 Best = INDEX_NONE;
+		FVector BestLocation = FVector::ZeroVector;
+
+		for (int32 Index = PendingPathSamples.Num() - 1; Index >= Cursor; --Index)
+		{
+			const FVector Sample = FitPointToWorld(PendingPathSamples[Index]);
+			if (FVector::DistSquared(Sample, Anchor) < 1.0)
+			{
+				continue;
+			}
+			if (IsTrailVolumeClear(Anchor, Sample))
+			{
+				Best = Index;
+				BestLocation = Sample;
+				break;
+			}
+		}
+
+		if (Best == INDEX_NONE)
+		{
+			// Not even the next recorded position can be reached through open space. Either the
+			// carrier is standing inside something (the arena has scenery that blocks sight but not
+			// pawns) or there is no route at this clearance. Stop; the chord below is then no worse
+			// than what shipped before.
+			break;
+		}
+
+		AppendOne(BestLocation);
+		++Appended;
+		++GWallFitInsertedPoints;
+
+		Anchor = BestLocation;
+		Cursor = Best + 1;
+
+		if (IsTrailVolumeClear(Anchor, FittedTarget))
+		{
+			break;
+		}
+	}
+
+	// The head always lands where the carrier is, whatever happened above: the newest point is the
+	// emitter's own footprint and the trace has to stay attached to the body that is laying it.
+	AppendOne(FittedTarget);
+	++Appended;
+
+	if (!IsTrailVolumeClear(Anchor, FittedTarget))
+	{
+		++GWallFitUnroutable;
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("Trace: could not fit the last %.0fuu of %s's trace outside the level (%d samples, "
+			     "%d inserted). Falling back to the straight chord."),
+			FVector::Dist(Anchor, FittedTarget), *GetNameSafe(GetOwner()),
+			PendingPathSamples.Num(), Appended - 1);
+	}
+
+	return Appended;
+}
+
+
+// =================================================================================================
 // Server: laying the trace
 // =================================================================================================
 
@@ -2570,16 +3056,41 @@ void UTraceTrailComponent::ServerUpdateTrail()
 			bChanged = true;
 		}
 
+		// SPEC v12 §6. REMEMBER WHERE THE CARRIER ACTUALLY WENT, every tick, between appends.
+		//
+		// Recorded before the append test so the route leading up to a point is complete by the time
+		// that point is laid. These are raw actor locations — positions a capsule legally occupied —
+		// which is exactly what makes them safe to hand to the fitter: a body that fitted there leaves
+		// room for a trace 11uu narrower. Bounded, and thrown away on every append, so this is a
+		// handful of entries and never a history.
+		if (PendingPathSamples.Num() == 0
+			|| FVector::DistSquared(PendingPathSamples.Last(), Location) >= 1.0)
+		{
+			PendingPathSamples.Add(Location);
+		}
+		if (PendingPathSamples.Num() > MaxPendingPathSamples)
+		{
+			PendingPathSamples.RemoveAt(0, PendingPathSamples.Num() - MaxPendingPathSamples,
+				EAllowShrinking::No);
+		}
+
 		if (TrailPoints.Items.Num() == 0 || DistanceFromHead >= Spacing)
 		{
-			FTraceTrailPoint& NewPoint = TrailPoints.Items.AddDefaulted_GetRef();
-			NewPoint.Location = Location;
-			NewPoint.BirthServerTime = Now;
-
-			// Adding or changing an item is signalled per item; only removals need MarkArrayDirty.
-			TrailPoints.MarkItemDirty(NewPoint);
+			// SPEC v12 §6. One call, and it appends between one and a few points: the target plus
+			// whatever subdivision it took to stop the polyline passing through the level. Everything
+			// downstream reads TrailPoints and is unchanged, which is how the drawn volume and the
+			// lethal volume stay the same object rather than two objects that agree.
+			AppendTrailPointsFitted(Location, Now);
+			PendingPathSamples.Reset();
 			bChanged = true;
 		}
+	}
+	else
+	{
+		// Not laying trace: a route recorded now would be a route the trace never took, and holding
+		// it would let the first point after a grace or a turnover be subdivided along a path that
+		// belongs to a different possession.
+		PendingPathSamples.Reset();
 	}
 
 	// 2. TRIM THE TAIL TO THE MAXIMUM LENGTH (spec v7 §1-2). THIS IS THE ONLY THING THAT RETIRES A
@@ -9836,6 +10347,637 @@ namespace
 					return TickGraceWatch(State, DeltaTime);
 				}), 0.f);
 		}));
+
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.WallClip — SPEC v12 §6, the reproduction and the verdict in one command
+	// ---------------------------------------------------------------------------------------------
+	//
+	// "The trace is clipping into walls sometimes, when a model runs close to a corner/structure."
+	//
+	// So this drives a carrier along the level's walls and round its corners for N seconds and asks,
+	// every frame, how far the trace is INSIDE the level — separately for the ribbon that is on screen
+	// and for the column that kills. It ends by pointing a camera at the worst offender and taking a
+	// picture of it, because "the trace clips into walls" is a thing you look at.
+	//
+	// WHY BOTH NUMBERS. They are the diagnosis, not just the verdict:
+	//
+	//   lethal ~= drawn, both > 0   the PATH goes through the structure. Everything downstream is
+	//                               working from a polyline that cuts the corner, so no amount of
+	//                               changing how the ribbon is DRAWN would fix it, and any fix that
+	//                               only moved the drawing would create an invisible kill volume.
+	//   drawn > lethal              the drawing is reaching outside the volume that kills — the
+	//                               "visible but not lethal" failure, in its own right.
+	//   both 0                      the fix is in.
+	//
+	// AND IT IS AN A/B. `Trace.Trail.WallClip 40 0` forces the pre-v12 straight chord and reproduces
+	// the bug on demand; `Trace.Trail.WallClip 40 1` runs the same drive with the fitter on. Same
+	// build, same route, same measurement — the only difference is the one cvar.
+
+	struct FWallClipState
+	{
+		double Seconds = 40.0;
+		int32 Arm = -1;
+
+		int32 SavedArm = 1;
+		bool bArmSaved = false;
+
+		int32 Phase = 0;
+		int32 Frames = 0;
+		double Elapsed = 0.0;
+
+		TWeakObjectPtr<ATraceCharacter> Carrier;
+
+		double WorstDrawn = 0.0;
+		FVector WorstDrawnAt = FVector::ZeroVector;
+		FVector WorstDrawnPushOut = FVector::ZeroVector;
+		FString WorstDrawnPiece;
+
+		double WorstLethal = 0.0;
+		FVector WorstLethalAt = FVector::ZeroVector;
+		FString WorstLethalPiece;
+
+		/** Closest the ribbon ever came to a surface without entering it — the fixture's own proof. */
+		double NearestSurface = TNumericLimits<double>::Max();
+
+		/** The rendered level pieces, gathered once. */
+		TArray<UTraceTrailComponent::FTraceClipBox> Geometry;
+
+		int32 FramesMeasured = 0;
+		int32 FramesWithDrawnClip = 0;
+		int32 FramesWithLethalClip = 0;
+		int32 MaxPoints = 0;
+
+		/** Closest the carrier's own body ever came to a rendered surface, and to what. */
+		double NearestCarrier = TNumericLimits<double>::Max();
+		FString NearestCarrierPiece;
+
+		/** Smallest pawn-barrier-to-visible-surface standoff the drive found anywhere. */
+		double MinStandoff = TNumericLimits<double>::Max();
+
+		/** Capture bookkeeping: the view has to be set a few frames before the shot is requested. */
+		int32 ShotPhaseFrames = 0;
+		FString ShotPath;
+		TWeakObjectPtr<ACameraActor> Camera;
+	};
+
+	/**
+	 * EVERY RENDERED PIECE OF THE ARENA, gathered once.
+	 *
+	 * Restricted to the arena builder's own actors on purpose. The endzones and the mode-B goals are
+	 * enormous visible volumes that players are supposed to run straight through, and a carrier
+	 * standing in one would otherwise be reported as burying their trace 1200uu inside "the level".
+	 * The Core and the characters (whose ribbon pool is itself a set of visible static meshes) are
+	 * excluded for the same reason: they are not walls.
+	 */
+	/** Degenerate instances counted at gather time, so a silent skip cannot masquerade as coverage. */
+	int32 GClipBoxesSkipped = 0;
+
+	void AddClipBox(TArray<UTraceTrailComponent::FTraceClipBox>& Out, const FTransform& Transform,
+		const FBox& LocalBox, const FString& Name)
+	{
+		// A zero-scaled or zero-thickness instance is not geometry — an instance pool parks its
+		// unused slots by scaling them away — and it poisons every measurement it is in: the point
+		// test lands exactly ON its collapsed face, reports a signed distance of -0.0, and that is
+		// then the minimum for every sample point in the level. Reading "closest approach -0.0uu" on
+		// a carrier standing in open ground is what this guard is here to stop.
+		const FVector Scale = Transform.GetScale3D();
+		const FVector Extent = LocalBox.GetExtent();
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			if (FMath::Abs(Scale[Axis]) < 0.01 || Extent[Axis] < 0.01)
+			{
+				++GClipBoxesSkipped;
+				return;
+			}
+		}
+
+		UTraceTrailComponent::FTraceClipBox& Box = Out.AddDefaulted_GetRef();
+		Box.Transform = Transform;
+		Box.LocalCentre = LocalBox.GetCenter();
+		Box.LocalExtent = LocalBox.GetExtent();
+		Box.Scale = Transform.GetScale3D();
+		Box.Name = Name;
+
+		// World AABB of the oriented box, from its eight transformed corners. Precomputed because it
+		// is the only thing the per-frame broad phase looks at.
+		Box.WorldBounds = FBox(ForceInit);
+		for (int32 Corner = 0; Corner < 8; ++Corner)
+		{
+			const FVector Local = Box.LocalCentre + FVector(
+				(Corner & 1) ? Box.LocalExtent.X : -Box.LocalExtent.X,
+				(Corner & 2) ? Box.LocalExtent.Y : -Box.LocalExtent.Y,
+				(Corner & 4) ? Box.LocalExtent.Z : -Box.LocalExtent.Z);
+			Box.WorldBounds += Transform.TransformPosition(Local);
+		}
+	}
+
+	void GatherArenaVisualGeometry(UWorld* World, TArray<UTraceTrailComponent::FTraceClipBox>& Out)
+	{
+		Out.Reset();
+		GClipBoxesSkipped = 0;
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			AActor* Actor = *It;
+			if (Actor == nullptr || !Actor->GetClass()->GetName().Contains(TEXT("ArenaBuilder")))
+			{
+				continue;
+			}
+
+			TArray<UStaticMeshComponent*> Meshes;
+			Actor->GetComponents<UStaticMeshComponent>(Meshes);
+			for (UStaticMeshComponent* Mesh : Meshes)
+			{
+				if (Mesh == nullptr || !Mesh->IsVisible() || Mesh->GetStaticMesh() == nullptr)
+				{
+					continue;
+				}
+
+				const FBox LocalBox = Mesh->GetStaticMesh()->GetBoundingBox();
+
+				// ISM BEFORE StaticMesh: UInstancedStaticMeshComponent DERIVES from
+				// UStaticMeshComponent, and taking the base branch would collapse a pool of hundreds
+				// of walls into one box sitting at the arena's origin — which is how the first arm of
+				// this measurement came back clean against a level it had never actually tested.
+				if (UInstancedStaticMeshComponent* Pool = Cast<UInstancedStaticMeshComponent>(Mesh))
+				{
+					const int32 InstanceCount = Pool->GetInstanceCount();
+					for (int32 Instance = 0; Instance < InstanceCount; ++Instance)
+					{
+						FTransform InstanceTransform;
+						if (Pool->GetInstanceTransform(Instance, InstanceTransform, /*bWorldSpace=*/true))
+						{
+							AddClipBox(Out, InstanceTransform, LocalBox,
+								FString::Printf(TEXT("%s[%d]"), *Pool->GetName(), Instance));
+						}
+					}
+					continue;
+				}
+
+				AddClipBox(Out, Mesh->GetComponentTransform(), LocalBox, Mesh->GetName());
+			}
+		}
+	}
+
+	/**
+	 * WALL-FOLLOWING STEERING, through AddMovementInput and nothing else.
+	 *
+	 * The whole report is about running close to a structure, so the fixture has to actually do that —
+	 * and it has to do it through the real movement component, sliding along real collision, or the
+	 * positions the trace is laid at are not positions a player could ever be in. Nothing is
+	 * teleported: this picks the nearest wall by line trace, steers along it, and leans in or out to
+	 * hold station a few uu outside the capsule's own radius. Rounding a convex corner at that
+	 * distance is exactly the case in the report.
+	 */
+	void DriveCarrierAlongWall(ATraceCharacter* Carrier, int32 Frames, double& OutStandoff)
+	{
+		OutStandoff = TNumericLimits<double>::Max();
+		UWorld* World = (Carrier != nullptr) ? Carrier->GetWorld() : nullptr;
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		const FVector At = Carrier->GetActorLocation();
+
+		FCollisionQueryParams Params(FName(TEXT("TraceTrailWallDrive")), /*bTraceComplex=*/false);
+		Params.AddIgnoredActor(Carrier);
+
+		// SEEK THE PLACE WHERE THE REPORT IS POSSIBLE, which is not simply the nearest wall.
+		//
+		// Measured on the first arm of this fixture: hugging whatever surface happened to be closest,
+		// the carrier's body never got within 59.3uu of anything rendered. That is not the drive being
+		// timid, it is the arena — colliding structure carries PAWN-ONLY standoff shells inflated 26uu
+		// (interior) to 40uu (perimeter walls) beyond the collision box, so a 34uu capsule stops 60-74uu
+		// short of the surface a player can see. A trace 22.5uu wide cannot reach a wall it is held
+		// 37uu clear of, and a run spent alongside one proves nothing about clipping.
+		//
+		// So each candidate direction is scored by its STANDOFF: how much further the visible surface is
+		// than the barrier a body is actually stopped by. Smallest standoff wins, nearest breaks ties.
+		// That steers the carrier to the structure it can press closest to, which is the only place the
+		// reported symptom can occur.
+		double NearestDistance = TNumericLimits<double>::Max();
+		double BestScore = TNumericLimits<double>::Max();
+		double BestStandoff = TNumericLimits<double>::Max();
+		FVector NearestNormal = FVector::ZeroVector;
+
+		constexpr int32 RayCount = 24;
+		for (int32 Index = 0; Index < RayCount; ++Index)
+		{
+			const double Angle = (2.0 * PI * Index) / RayCount;
+			const FVector Direction(FMath::Cos(Angle), FMath::Sin(Angle), 0.0);
+			const FVector End = At + Direction * 900.0;
+
+			FHitResult VisibleHit;
+			if (!World->LineTraceSingleByChannel(VisibleHit, At, End, ECC_Visibility, Params))
+			{
+				continue;
+			}
+			if (VisibleHit.GetActor() != nullptr && VisibleHit.GetActor()->IsA(APawn::StaticClass()))
+			{
+				continue;
+			}
+
+			FHitResult BodyHit;
+			const bool bBodyBlocked = World->LineTraceSingleByChannel(BodyHit, At, End, ECC_Pawn, Params);
+			const double BodyDistance = bBodyBlocked
+				? static_cast<double>(BodyHit.Distance) : static_cast<double>(VisibleHit.Distance);
+
+			const double Standoff = FMath::Max(0.0, static_cast<double>(VisibleHit.Distance) - BodyDistance);
+			const double Score = Standoff * 1000.0 + static_cast<double>(VisibleHit.Distance);
+
+			if (Score < BestScore)
+			{
+				BestScore = Score;
+				BestStandoff = Standoff;
+				NearestDistance = VisibleHit.Distance;
+				NearestNormal = VisibleHit.ImpactNormal;
+			}
+		}
+
+		OutStandoff = BestStandoff;
+
+		FVector Steer;
+		NearestNormal.Z = 0.0;
+		if (!NearestNormal.Normalize())
+		{
+			// Nothing in reach — wander on a slowly turning heading until a wall shows up.
+			const double Angle = static_cast<double>(Frames) * 0.02;
+			Steer = FVector(FMath::Cos(Angle), FMath::Sin(Angle), 0.0);
+		}
+		else
+		{
+			// Along the wall, leaning in or out to hold station just outside the capsule.
+			const FVector Tangent = FVector::CrossProduct(FVector::UpVector, NearestNormal);
+			const double StandoffTarget = 38.0;
+			const double Correction = FMath::Clamp((NearestDistance - StandoffTarget) / 60.0, -1.0, 1.0);
+			Steer = (Tangent - NearestNormal * Correction).GetSafeNormal();
+		}
+
+		Carrier->AddMovementInput(Steer, 1.f);
+	}
+
+	bool TickWallClip(FWallClipState& State, float DeltaTime)
+	{
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		if (World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[WALLCLIP] the trace is laid on the SERVER; run this on the host."));
+			return false;
+		}
+
+		++State.Frames;
+
+		// ---- phase 0: arm, and get the Core onto somebody who can be driven ---------------------
+		if (State.Phase == 0)
+		{
+			if (!State.bArmSaved)
+			{
+				State.SavedArm = GWallFit;
+				State.bArmSaved = true;
+
+				if (State.Arm >= 0)
+				{
+					GWallFit = State.Arm;
+				}
+
+				UTraceTrailComponent::ResetWallFitStats();
+
+				// RESOLVED values, not the raw globals: since the integration pass those are -1
+				// sentinels meaning "follow the setting", and printing -1 here would make an arm that
+				// is running perfectly well off Config/DefaultGame.ini look disabled.
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[WALLCLIP] arm wallFit=%d (margin %.1fuu, max push %.1fuu, insert "
+					     "budget %d). Trace half width %.1fuu, height %.1fuu, point spacing %.0fuu."),
+					WallFitEnabled() ? 1 : 0, WallFitMargin(), WallFitMaxPush(), WallFitMaxInsert(),
+					UTraceTrailComponent::GetTraceTrailRadius(),
+					UTraceTrailComponent::GetTraceTrailHeight(),
+					UTraceSettings::Get().TrailPointSpacing);
+			}
+
+			TArray<ATraceCharacter*> Characters;
+			GatherTrailDebugCharacters(World, Characters);
+
+			ATraceCharacter* Carrier = nullptr;
+			for (ATraceCharacter* TraceChar : Characters)
+			{
+				if (TraceChar != nullptr && TraceChar->IsAlive() && TraceChar->IsCarrier()
+					&& TraceChar->Trail != nullptr)
+				{
+					Carrier = TraceChar;
+					break;
+				}
+			}
+
+			// Prefer the locally controlled pawn: it is the one no bot brain is also steering, so the
+			// drive below is the only thing deciding where it goes.
+			if (Carrier == nullptr)
+			{
+				for (ATraceCharacter* TraceChar : Characters)
+				{
+					if (IsLocallyControlledHuman(TraceChar) && TraceChar->IsAlive())
+					{
+						if (ATraceCore* Core = ATraceCore::Get(World))
+						{
+							Core->TryPickup(TraceChar);
+						}
+						break;
+					}
+				}
+			}
+
+			if (Carrier == nullptr)
+			{
+				if ((State.Frames % 300) == 0)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[WALLCLIP] waiting for a living carrier (%d frames)."), State.Frames);
+				}
+				if (State.Frames > 1800)
+				{
+					UE_LOG(LogTraceGame, Warning, TEXT("[WALLCLIP] ABORTED — no carrier in 1800 frames."));
+					if (State.bArmSaved)
+					{
+						GWallFit = State.SavedArm;
+					}
+					return false;
+				}
+				return true;
+			}
+
+			GatherArenaVisualGeometry(World, State.Geometry);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[WALLCLIP] carrier %s; %d rendered arena pieces to test against (%d degenerate "
+				     "instances skipped)."),
+				*GetNameSafe(Carrier), State.Geometry.Num(), GClipBoxesSkipped);
+
+			State.Carrier = Carrier;
+			State.Phase = 1;
+			State.Frames = 0;
+			return true;
+		}
+
+		// ---- phase 1: drive along the walls, measuring every frame -------------------------------
+		if (State.Phase == 1)
+		{
+			ATraceCharacter* Carrier = State.Carrier.Get();
+			if (Carrier == nullptr || !Carrier->IsAlive() || !Carrier->IsCarrier()
+				|| Carrier->Trail == nullptr)
+			{
+				// Lost the fixture (a death, a turnover). Go back and find another rather than
+				// reporting on a run that stopped happening.
+				State.Carrier = nullptr;
+				State.Phase = 0;
+				return true;
+			}
+
+			double FrameStandoff = TNumericLimits<double>::Max();
+			DriveCarrierAlongWall(Carrier, State.Frames, FrameStandoff);
+			State.MinStandoff = FMath::Min(State.MinStandoff, FrameStandoff);
+
+			UTraceTrailComponent::FTraceClipSample Sample;
+			Carrier->Trail->MeasureWorldClipping(State.Geometry, Sample);
+
+			++State.FramesMeasured;
+			State.MaxPoints = FMath::Max(State.MaxPoints, Sample.LethalPoints);
+			State.NearestSurface = FMath::Min(State.NearestSurface, Sample.DrawnNearestSurface);
+			if (Sample.CarrierNearestSurface < State.NearestCarrier)
+			{
+				State.NearestCarrier = Sample.CarrierNearestSurface;
+				State.NearestCarrierPiece = Sample.CarrierNearestPiece;
+			}
+
+			if (Sample.DrawnDepth > 0.0)
+			{
+				++State.FramesWithDrawnClip;
+			}
+			if (Sample.LethalDepth > 0.0)
+			{
+				++State.FramesWithLethalClip;
+			}
+
+			if (Sample.DrawnDepth > State.WorstDrawn)
+			{
+				State.WorstDrawn = Sample.DrawnDepth;
+				State.WorstDrawnAt = Sample.DrawnWorst;
+				State.WorstDrawnPushOut = Sample.DrawnWorstPushOut;
+				State.WorstDrawnPiece = Sample.DrawnWorstPiece;
+			}
+			if (Sample.LethalDepth > State.WorstLethal)
+			{
+				State.WorstLethal = Sample.LethalDepth;
+				State.WorstLethalAt = Sample.LethalWorst;
+				State.WorstLethalPiece = Sample.LethalWorstPiece;
+			}
+
+			State.Elapsed += DeltaTime;
+			if (State.Elapsed < State.Seconds)
+			{
+				return true;
+			}
+
+			// ---- the report ----------------------------------------------------------------------
+			int32 Routed = 0;
+			int32 Inserted = 0;
+			int32 Unroutable = 0;
+			UTraceTrailComponent::GetWallFitStats(Routed, Inserted, Unroutable);
+
+			// 1uu of tolerance, and it is not slack: the probe itself has a 1uu radius and the sample
+			// lattice sits 10% inside each surface, so a ribbon laid FLUSH against a wall — which is
+			// the correct and desirable outcome of hugging one — reads as a fraction of a uu.
+			constexpr double ClipTolerance = 1.0;
+			const bool bPass = (State.WorstDrawn <= ClipTolerance) && (State.WorstLethal <= ClipTolerance);
+
+			// AND THE FIXTURE HAS TO PROVE ITSELF. A run in which the carrier never went near a
+			// structure reports no clipping and means nothing; this is the number that tells the two
+			// apart, so it is printed on the PASS line as well as the FAIL one.
+			const bool bHugged = State.NearestCarrier <= 45.0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[WALLCLIP] arm=%d, %.0fs, %d frames measured, longest trace %d lethal points.\n"
+				     "           DRAWN  worst %.1fuu inside %s, on %d/%d frames (%.1f%%), at %s\n"
+				     "           LETHAL worst %.1fuu inside %s, on %d/%d frames (%.1f%%), at %s\n"
+				     "           closest approach: ribbon %.1fuu, carrier body %.1fuu to %s (fixture %s)\n"
+				     "           least pawn-barrier standoff found anywhere: %.1fuu\n"
+				     "           fitter: %d appends routed, %d points inserted, %d could not be fitted.\n"
+				     "           VERDICT: %s"),
+				WallFitEnabled() ? 1 : 0, State.Elapsed, State.FramesMeasured, State.MaxPoints,
+				State.WorstDrawn,
+				State.WorstDrawnPiece.IsEmpty() ? TEXT("(nothing)") : *State.WorstDrawnPiece,
+				State.FramesWithDrawnClip, State.FramesMeasured,
+				(State.FramesMeasured > 0) ? (100.0 * State.FramesWithDrawnClip / State.FramesMeasured) : 0.0,
+				*State.WorstDrawnAt.ToCompactString(),
+				State.WorstLethal,
+				State.WorstLethalPiece.IsEmpty() ? TEXT("(nothing)") : *State.WorstLethalPiece,
+				State.FramesWithLethalClip, State.FramesMeasured,
+				(State.FramesMeasured > 0) ? (100.0 * State.FramesWithLethalClip / State.FramesMeasured) : 0.0,
+				*State.WorstLethalAt.ToCompactString(),
+				(State.NearestSurface == TNumericLimits<double>::Max()) ? -1.0 : State.NearestSurface,
+				(State.NearestCarrier == TNumericLimits<double>::Max()) ? -1.0 : State.NearestCarrier,
+				State.NearestCarrierPiece.IsEmpty() ? TEXT("(nothing)") : *State.NearestCarrierPiece,
+				bHugged ? TEXT("DID press against structure")
+				        : TEXT("*** never got close to anything — this result proves nothing ***"),
+				(State.MinStandoff == TNumericLimits<double>::Max()) ? -1.0 : State.MinStandoff,
+				Routed, Inserted, Unroutable,
+				bPass
+					? TEXT("PASS — neither the ribbon nor the kill volume entered the level.")
+					: TEXT("*** FAIL — the trace is inside the level. ***"));
+
+			// The diagnosis, printed rather than left to be inferred from two numbers.
+			if (!bPass)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[WALLCLIP] drawn-minus-lethal = %+.1fuu. %s"),
+					State.WorstDrawn - State.WorstLethal,
+					(State.WorstLethal > ClipTolerance)
+						? TEXT("The LETHAL polyline is inside the structure too, so this is the PATH cutting "
+						       "the corner and not a drawing artefact — a fix that only moved the ribbon "
+						       "would leave an invisible kill volume behind in the wall.")
+						: TEXT("Only the DRAWING is inside the structure, i.e. the ribbon is reaching past "
+						       "the volume that kills."));
+			}
+
+			State.Phase = 2;
+			State.Frames = 0;
+			return true;
+		}
+
+		// ---- phase 2: point a camera at the worst offender and photograph it ---------------------
+		{
+			++State.ShotPhaseFrames;
+
+			APlayerController* PC = World->GetFirstPlayerController();
+			if (PC == nullptr || State.WorstDrawnAt.IsNearlyZero())
+			{
+				if (State.WorstDrawnAt.IsNearlyZero())
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[WALLCLIP] nothing to photograph — the ribbon never entered the level."));
+				}
+				if (State.bArmSaved)
+				{
+					GWallFit = State.SavedArm;
+				}
+				return false;
+			}
+
+			if (State.ShotPhaseFrames == 1)
+			{
+				// Stand off along the direction the trace would have to move to get OUT of the wall,
+				// which is by construction the open side, so the camera is never inside the geometry
+				// it is photographing.
+				FVector Out = State.WorstDrawnPushOut;
+				Out.Z = 0.0;
+				if (!Out.Normalize())
+				{
+					Out = FVector::ForwardVector;
+				}
+
+				// Far enough back that the STRUCTURE and the ribbon running into it are both in frame.
+				// At close range the camera simply presses against the face the ribbon is buried
+				// behind, and an occluded ribbon photographs as nothing at all.
+				const FVector Eye = State.WorstDrawnAt + Out * 700.0 + FVector(0.0, 0.0, 380.0);
+				const FRotator Look = (State.WorstDrawnAt - Eye).Rotation();
+
+				if (ACameraActor* Camera = World->SpawnActor<ACameraActor>(Eye, Look))
+				{
+					State.Camera = Camera;
+					PC->SetViewTarget(Camera);
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[WALLCLIP] camera at %s looking at the worst penetration (%.1fuu) at %s."),
+					*Eye.ToCompactString(), State.WorstDrawn, *State.WorstDrawnAt.ToCompactString());
+				return true;
+			}
+
+			// A few frames for the view target to take and the ribbon to be re-placed under it.
+			if (State.ShotPhaseFrames == 12)
+			{
+				State.ShotPath = FPaths::ConvertRelativePathToFull(
+					FPaths::ProjectSavedDir() / TEXT("Screenshots")
+					/ FString::Printf(TEXT("WallClip_arm%d_%s.png"), WallFitEnabled() ? 1 : 0,
+						*FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+
+				FScreenshotRequest::RequestScreenshot(State.ShotPath, /*bShowUI=*/false,
+					/*bAddFilenameSuffix=*/false);
+
+				UE_LOG(LogTraceGame, Display, TEXT("[WALLCLIP] screenshot requested: %s"), *State.ShotPath);
+				return true;
+			}
+
+			if (State.ShotPhaseFrames >= 40)
+			{
+				IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+				if (!State.ShotPath.IsEmpty() && PlatformFile.FileExists(*State.ShotPath))
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[WALLCLIP] Screenshot written (%lld bytes): %s"),
+						PlatformFile.FileSize(*State.ShotPath), *State.ShotPath);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[WALLCLIP] no screenshot file appeared at: %s"), *State.ShotPath);
+				}
+
+				if (ACameraActor* Camera = State.Camera.Get())
+				{
+					Camera->Destroy();
+				}
+				if (State.bArmSaved)
+				{
+					GWallFit = State.SavedArm;
+				}
+				return false;
+			}
+
+			return true;
+		}
+	}
+
+	FAutoConsoleCommand CmdWallClip(
+		TEXT("Trace.Trail.WallClip"),
+		TEXT("Trace.Trail.WallClip [Seconds=40] [Arm=-1] — spec v12 6. SERVER. Drive a carrier along the "
+		     "level's walls and round its corners, and measure every frame how deep the trace is INSIDE "
+		     "the level — the DRAWN ribbon and the LETHAL column reported separately so the two can be "
+		     "compared. Ends with a screenshot of the worst offender. Arm 0 forces the pre-v12 straight "
+		     "chord (the reported bug, reproduced); arm 1 forces the corner fitter; -1 leaves "
+		     "Trace.Trail.WallFit alone."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FWallClipState State;
+			if (Args.Num() > 0)
+			{
+				State.Seconds = FMath::Clamp(FCString::Atod(*Args[0]), 2.0, 600.0);
+			}
+			if (Args.Num() > 1)
+			{
+				State.Arm = FMath::Clamp(FCString::Atoi(*Args[1]), -1, 1);
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[WALLCLIP] spec v12 6: 'the trace is clipping into walls sometimes, when a model runs "
+				     "close to a corner/structure'. Driving a carrier along the walls for %.0fs."),
+				State.Seconds);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					return TickWallClip(State, DeltaTime);
+				}), 0.f);
+		}));
 }
 #endif // !UE_BUILD_SHIPPING
 
@@ -9962,6 +11104,303 @@ void UTraceTrailComponent::MeasureDrawnVolume(double& OutMaxHalfWidth, double& O
 		OutWorstUncovered = FMath::Max(OutWorstUncovered, Nearest);
 	}
 }
+
+#if !UE_BUILD_SHIPPING
+namespace
+{
+	/**
+	 * Signed distance, in uu, from a world point to one rendered level box: NEGATIVE inside (and then
+	 * its magnitude is the distance to the nearest face, i.e. how deep the trace is buried), POSITIVE
+	 * outside (distance to the surface).
+	 *
+	 * The arena is built out of boxes — engine cubes, scaled and yawed — so a piece's local bounding
+	 * box IS its shape, and an oriented-box test is exact rather than an approximation. Working in the
+	 * box's local space and scaling the per-axis result back out keeps that exactness under
+	 * non-uniform scale, which every wall, rib and lip in this arena has.
+	 */
+	double SignedDistanceToClipBox(const UTraceTrailComponent::FTraceClipBox& Box, const FVector& Point,
+		int32& OutShallowestAxis)
+	{
+		OutShallowestAxis = 0;
+
+		const FVector Local = Box.Transform.InverseTransformPosition(Point) - Box.LocalCentre;
+
+		double Deepest = TNumericLimits<double>::Max();
+		bool bInside = true;
+		FVector OutsideDelta = FVector::ZeroVector;
+
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			const double AxisScale = FMath::Abs(Box.Scale[Axis]);
+			const double Over = FMath::Abs(Local[Axis]) - Box.LocalExtent[Axis];
+			if (Over > 0.0)
+			{
+				bInside = false;
+				OutsideDelta[Axis] = Over * AxisScale;
+			}
+			else if (bInside)
+			{
+				const double Depth = -Over * AxisScale;
+				if (Depth < Deepest)
+				{
+					Deepest = Depth;
+					OutShallowestAxis = Axis;
+				}
+			}
+		}
+
+		return bInside ? -Deepest : OutsideDelta.Size();
+	}
+
+	/**
+	 * Worst (most negative) signed distance from Point to any candidate box, plus which box it was
+	 * and which way the point would have to move to leave it.
+	 */
+	double MeasureVisualClearance(const TArray<UTraceTrailComponent::FTraceClipBox>& Geometry,
+		const TArray<int32>& Candidates, const FVector& Point, FString& OutPiece, FVector& OutPushOut)
+	{
+		double Worst = TNumericLimits<double>::Max();
+
+		// Anything further away than this is not interesting even as a near miss, and skipping it is
+		// what keeps the lattice affordable. It must NOT be tightened to "only boxes the point is
+		// already inside": that was the first version, and it left the closest-approach figure — the
+		// one that proves the fixture pressed against something — permanently unset, so a run that
+		// tested nothing was indistinguishable from a run that tested everything and passed.
+		constexpr double InterestRadius = 300.0;
+
+		for (const int32 Index : Candidates)
+		{
+			const UTraceTrailComponent::FTraceClipBox& Box = Geometry[Index];
+			if (Box.WorldBounds.ComputeSquaredDistanceToPoint(Point) > InterestRadius * InterestRadius)
+			{
+				continue;
+			}
+
+			int32 ShallowestAxis = 0;
+			const double Signed = SignedDistanceToClipBox(Box, Point, ShallowestAxis);
+			if (Signed < Worst)
+			{
+				Worst = Signed;
+
+				// Named whether it is a hit or a near miss. A clearance figure without the name of
+				// the surface it was measured against cannot be checked, and this pass has already
+				// had one number that turned out to be about the wrong geometry entirely.
+				OutPiece = Box.Name;
+
+				if (Signed < 0.0)
+				{
+
+					// Shortest way out of the box, in world space: along the axis it is least deep on.
+					const FVector Local = Box.Transform.InverseTransformPosition(Point) - Box.LocalCentre;
+					FVector LocalOut = FVector::ZeroVector;
+					LocalOut[ShallowestAxis] = (Local[ShallowestAxis] >= 0.0) ? 1.0 : -1.0;
+					OutPushOut = Box.Transform.TransformVectorNoScale(LocalOut).GetSafeNormal();
+				}
+			}
+		}
+
+		return Worst;
+	}
+}
+
+void UTraceTrailComponent::MeasureWorldClipping(const TArray<FTraceClipBox>& Geometry,
+	FTraceClipSample& Out) const
+{
+	Out = FTraceClipSample();
+
+	if (GetWorld() == nullptr || Geometry.Num() == 0)
+	{
+		return;
+	}
+
+	const double TrailRadius = FMath::Max(0.0, static_cast<double>(GetTraceTrailRadius()));
+	const double TrailHalfHeight = FMath::Max(0.0, static_cast<double>(GetTraceTrailHeight())) * 0.5;
+
+	const int32 LethalCount = ComputeLastLethalIndex() + 1;
+	Out.LethalPoints = LethalCount;
+
+	// -------------------------------------------------------------------------------------------
+	// BROAD PHASE. The trace is ~1200uu long and the arena is thousands of rendered boxes, so the
+	// candidate list is built once per frame from the trace's own world bounds. Without it this
+	// lattice would be millions of oriented-box tests a frame and the harness would change the very
+	// frame rate the carrier is being driven at.
+	// -------------------------------------------------------------------------------------------
+	FBox TraceBounds(ForceInit);
+	for (const UStaticMeshComponent* Piece : SmearMeshes)
+	{
+		if (Piece != nullptr && Piece->IsVisible() && Piece->GetStaticMesh() != nullptr)
+		{
+			TraceBounds += Piece->Bounds.GetBox();
+		}
+	}
+	for (int32 PointIndex = 0; PointIndex < LethalCount; ++PointIndex)
+	{
+		TraceBounds += FVector(TrailRadius + 1.0, TrailRadius + 1.0, TrailHalfHeight + 1.0)
+			+ FVector(TrailPoints.Items[PointIndex].Location);
+		TraceBounds += FVector(TrailPoints.Items[PointIndex].Location)
+			- FVector(TrailRadius + 1.0, TrailRadius + 1.0, TrailHalfHeight + 1.0);
+	}
+	if (!TraceBounds.IsValid)
+	{
+		return;
+	}
+
+	TArray<int32> Candidates;
+	for (int32 Index = 0; Index < Geometry.Num(); ++Index)
+	{
+		if (Geometry[Index].WorldBounds.Intersect(TraceBounds))
+		{
+			Candidates.Add(Index);
+		}
+	}
+
+	// HOW CLOSE THE BODY ITSELF GOT. The fixture's own credential: if the carrier never pressed
+	// against a structure then nothing downstream of it means anything, and this is measured off the
+	// same boxes and the same helper as everything else so the two numbers are on one scale.
+	if (const AActor* OwnerActor = GetOwner())
+	{
+		FVector IgnoredPush = FVector::ZeroVector;
+		Out.CarrierNearestSurface = MeasureVisualClearance(
+			Geometry, Candidates, OwnerActor->GetActorLocation(), Out.CarrierNearestPiece, IgnoredPush);
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// THE DRAWN VOLUME: the oriented box of every visible ribbon piece, exactly as placed. Joint
+	// overlaps, minimum element lengths and the box's own corners are all included, because they are
+	// all on screen and the report is about what is on screen.
+	//
+	// The predicted owner-only stub is excluded for the same reason MeasureDrawnVolume excludes it:
+	// it is deliberately drawn ahead of anything lethal and only its own carrier can see it.
+	// -------------------------------------------------------------------------------------------
+	for (const UStaticMeshComponent* Piece : SmearMeshes)
+	{
+		if (Piece == nullptr || !Piece->IsVisible() || Piece->GetStaticMesh() == nullptr)
+		{
+			continue;
+		}
+
+		++Out.VisiblePieces;
+
+		const FTransform& PieceTransform = Piece->GetComponentTransform();
+		const FBox LocalBox = Piece->GetStaticMesh()->GetBoundingBox();
+		const FVector LocalCentre = LocalBox.GetCenter();
+		const FVector LocalExtent = LocalBox.GetExtent();
+		const FVector Scale = Piece->GetComponentScale();
+
+		// Stations every ~12uu along the element's length, three across its width and three up its
+		// height, pulled a hair inside each face so a ribbon laid FLUSH against a wall — the correct
+		// and desirable outcome of hugging one — is not counted as being inside it.
+		const double LengthUU = 2.0 * FMath::Abs(LocalExtent.X * Scale.X);
+		const int32 LengthSteps = FMath::Clamp(FMath::CeilToInt(LengthUU / 12.0), 1, 24);
+
+		for (int32 Step = 0; Step <= LengthSteps; ++Step)
+		{
+			const double U = -1.0 + 2.0 * (static_cast<double>(Step) / static_cast<double>(LengthSteps));
+			for (int32 WidthIndex = -1; WidthIndex <= 1; ++WidthIndex)
+			{
+				for (int32 HeightIndex = -1; HeightIndex <= 1; ++HeightIndex)
+				{
+					const FVector Local = LocalCentre + FVector(
+						U * LocalExtent.X * 0.98,
+						static_cast<double>(WidthIndex) * LocalExtent.Y * 0.95,
+						static_cast<double>(HeightIndex) * LocalExtent.Z * 0.95);
+
+					const FVector At = PieceTransform.TransformPosition(Local);
+
+					++Out.DrawnSamplesTotal;
+
+					FString Which;
+					FVector PushOut = FVector::ZeroVector;
+					const double Signed = MeasureVisualClearance(Geometry, Candidates, At, Which, PushOut);
+
+					Out.DrawnNearestSurface = FMath::Min(Out.DrawnNearestSurface, Signed);
+
+					if (Signed < 0.0)
+					{
+						++Out.DrawnSamplesInside;
+						if (-Signed > Out.DrawnDepth)
+						{
+							Out.DrawnDepth = -Signed;
+							Out.DrawnWorst = At;
+							Out.DrawnWorstPushOut = PushOut;
+							Out.DrawnWorstPiece = Which;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// THE LETHAL VOLUME: the column the trip test evaluates — TrailRadius to either side, TrailHeight
+	// tall, swept along the lethal polyline. Sampled the same way against the same geometry, so the
+	// two numbers are directly comparable and their DIFFERENCE is the diagnosis.
+	// -------------------------------------------------------------------------------------------
+	for (int32 PointIndex = 0; PointIndex + 1 < LethalCount; ++PointIndex)
+	{
+		const FVector SegStart(TrailPoints.Items[PointIndex].Location);
+		const FVector SegEnd(TrailPoints.Items[PointIndex + 1].Location);
+
+		FVector Along = SegEnd - SegStart;
+		const double Length = Along.Size();
+		FVector Lateral = FVector::CrossProduct(FVector::UpVector,
+			(Length > GeometryEpsilon) ? (Along / Length) : FVector::ForwardVector);
+		if (!Lateral.Normalize())
+		{
+			Lateral = FVector::RightVector;
+		}
+
+		const int32 Steps = FMath::Clamp(FMath::CeilToInt(Length / 12.0), 1, 24);
+		for (int32 Step = 0; Step <= Steps; ++Step)
+		{
+			const FVector Centre = FMath::Lerp(SegStart, SegEnd,
+				static_cast<double>(Step) / static_cast<double>(Steps));
+
+			for (int32 WidthIndex = -1; WidthIndex <= 1; ++WidthIndex)
+			{
+				for (int32 HeightIndex = -1; HeightIndex <= 1; ++HeightIndex)
+				{
+					const FVector At = Centre
+						+ Lateral * (static_cast<double>(WidthIndex) * TrailRadius * 0.95)
+						+ FVector::UpVector * (static_cast<double>(HeightIndex) * TrailHalfHeight * 0.95);
+
+					++Out.LethalSamplesTotal;
+
+					FString Which;
+					FVector PushOut = FVector::ZeroVector;
+					const double Signed = MeasureVisualClearance(Geometry, Candidates, At, Which, PushOut);
+
+					if (Signed < 0.0)
+					{
+						++Out.LethalSamplesInside;
+						if (-Signed > Out.LethalDepth)
+						{
+							Out.LethalDepth = -Signed;
+							Out.LethalWorst = At;
+							Out.LethalWorstPiece = Which;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+void UTraceTrailComponent::GetWallFitStats(int32& OutRoutedAppends, int32& OutInsertedPoints,
+	int32& OutUnroutable)
+{
+	OutRoutedAppends = GWallFitRoutedAppends;
+	OutInsertedPoints = GWallFitInsertedPoints;
+	OutUnroutable = GWallFitUnroutable;
+}
+
+void UTraceTrailComponent::ResetWallFitStats()
+{
+	GWallFitRoutedAppends = 0;
+	GWallFitInsertedPoints = 0;
+	GWallFitUnroutable = 0;
+}
+#endif // !UE_BUILD_SHIPPING
 
 void UTraceTrailComponent::CountDrawnPieces(int32& OutStaticVisible, int32& OutSkinnedVisible) const
 {

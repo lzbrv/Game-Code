@@ -518,7 +518,7 @@ bool TraceMelee::ShouldUseKnifeMovementProfile(const AActor* Character)
 
 	// THE CARRIER CLAUSE. RequestEquip already refuses a swap while carrying, so a carrier only
 	// reaches this by picking the Core up with the knife already out — and at that moment the knife
-	// is STOWED, not active. See the header: this stops 1.08 x 1.30 = 1.40x from making the Core
+	// is STOWED, not active. See the header: this stops 1.30 x 1.22 = 1.59x from making the Core
 	// uncatchable and quietly retiring the one number the carrier's speed was ever tuned with.
 	const ATraceCharacter* TraceChar = Cast<ATraceCharacter>(Character);
 	return (TraceChar == nullptr) || !TraceChar->IsCarrier();
@@ -608,14 +608,59 @@ bool TraceMelee::IsInSwingRange(const ATraceCharacter* Attacker, const AActor* T
 // SELF-TEST — the back/front model, pinned without a world.
 //
 // It exists because the angle rule is the ONE part of this weapon that cannot be checked by looking:
-// a screenshot of a knife hit does not say which side of a 90 degree boundary the attacker was on,
-// and the whole feature is a 3.3x damage swing across that boundary. Every case below states the
-// geometry in words so a failure names the rule it broke rather than a number.
+// a screenshot of a knife hit does not say which side of the boundary the attacker was on, and the
+// whole feature is a 3.3x damage swing across that boundary. Every case below states the geometry in
+// words so a failure names the rule it broke rather than a number.
+//
+// SPEC v12 §1 NARROWED THE BACK ZONE FROM A 180-DEGREE HEMISPHERE TO A 60-DEGREE CONE, and this is
+// the file that proves it. There are three layers, deliberately:
+//
+//   1. NAMED CASES. Hand-written geometry — dead behind, dead in front, the sides, a turned victim,
+//      an attacker on a ledge, the degenerate coincident pair. These say what the rule MEANS.
+//   2. THE 24-POINT AZIMUTH SWEEP. The attacker walks a full circle around the victim in 15 degree
+//      steps and every station reports its verdict. This is the shape of the zone, measured. The old
+//      90-degree boundary was confirmed to the degree this way and the new one is held to the same
+//      standard, because a threshold constant is not evidence that the running build uses it — the
+//      .ini wins over the header, and Config/DefaultGame.ini is where this number really lives.
+//   3. THE BOUNDARY BISECTION. 0.05-degree binary search for the exact flip, compared against the
+//      configured half-angle AND against the 60-degree cone spec v12 §1 asked for.
+//
+// Layer 3's spec pin is what goes RED on a build that still carries the old 90. That is on purpose:
+// this test was written first, run against the shipped 90, and reported the cone as 180 degrees
+// before the number moved.
 // =================================================================================================
+
+namespace TraceMeleeSweep
+{
+	/**
+	 * The attacker's station for a given azimuth, in degrees measured FROM DIRECTLY BEHIND the
+	 * victim, counter-clockwise. 0 = dead behind, 90 = at the victim's shoulder, 180 = dead in front.
+	 *
+	 * The victim stands at the origin facing +X (yaw 0), so "directly behind" is -X. An attacker at
+	 * azimuth phi therefore sits at 100 * (-cos phi, sin phi, 0), and the approach vector the model
+	 * measures — victim minus attacker, normalised — is (cos phi, -sin phi, 0), which makes exactly
+	 * phi with the victim's forward. So the azimuth this function is asked for IS the angle
+	 * TraceMelee::IsBackstab should report back, and any disagreement is a real defect rather than a
+	 * disagreement about conventions.
+	 */
+	FVector AttackerAtAzimuth(double AzimuthDegrees, double RadiusUU = 100.0)
+	{
+		const double Rad = FMath::DegreesToRadians(AzimuthDegrees);
+		return FVector(-RadiusUU * FMath::Cos(Rad), RadiusUU * FMath::Sin(Rad), 0.0);
+	}
+
+	/** IsBackstab at one azimuth around a victim at the origin facing +X. */
+	bool BackstabAtAzimuth(double AzimuthDegrees, double* OutMeasuredAngle = nullptr)
+	{
+		return TraceMelee::IsBackstab(AttackerAtAzimuth(AzimuthDegrees), FVector::ZeroVector, 0.f, OutMeasuredAngle);
+	}
+}
 
 int32 TraceRunMeleeSelfTest()
 {
 	int32 Failures = 0;
+
+	const float Threshold = TraceMelee::GetBackstabHalfAngleDegrees();
 
 	struct FCase
 	{
@@ -623,27 +668,43 @@ int32 TraceRunMeleeSelfTest()
 		FVector Attacker;
 		FVector Victim;
 		float VictimYaw;
-		bool bExpectBackstab;
+
+		/**
+		 * The angle the geometry above STATES, in degrees off the victim's rear axis, which is what
+		 * IsBackstab must report back. -1 marks the degenerate coincident case, which has no
+		 * approach direction and is contracted to resolve FRONT.
+		 *
+		 * The expected verdict is DERIVED from this and the live threshold rather than written down,
+		 * so retuning the tunable retunes the table with it. The 60-degree cone spec v12 §1 asked for
+		 * is pinned separately, by the boundary bisection below — a named case that hard-coded "the
+		 * side is a front hit" would be asserting today's tuning, not the model.
+		 */
+		double KnownAngleDegrees;
 	};
 
 	// The victim always stands at the origin. Yaw 0 faces +X, so an attacker at -X is DEAD BEHIND.
+	//
+	// THE SIDE AND 45-DEGREE CASES FLIPPED IN SPEC v12 §1 and they are why this table is worth
+	// reading: under the old 90-degree half-angle, standing at somebody's shoulder was a 100-damage
+	// back-stab. Under the 30-degree half-angle it is a 30-damage front hit, and so is 45 degrees off
+	// the rear axis. That is the whole change, stated as geometry.
 	const FCase Cases[] =
 	{
-		{ TEXT("dead behind (attacker at -X, victim faces +X)"),          FVector(-100, 0, 0),   FVector::ZeroVector, 0.f,    true  },
-		{ TEXT("dead in front (attacker at +X, victim faces +X)"),        FVector(100, 0, 0),    FVector::ZeroVector, 0.f,    false },
-		{ TEXT("directly to the victim's left (89.9deg from behind)"),    FVector(0, -100, 0),   FVector::ZeroVector, 0.f,    true  },
-		{ TEXT("directly to the victim's right (89.9deg from behind)"),   FVector(0, 100, 0),    FVector::ZeroVector, 0.f,    true  },
-		{ TEXT("45deg behind-left"),                                      FVector(-100, -100, 0), FVector::ZeroVector, 0.f,   true  },
-		{ TEXT("45deg in front-right"),                                   FVector(100, 100, 0),  FVector::ZeroVector, 0.f,    false },
-		{ TEXT("behind a victim who has turned 180deg (now in front)"),   FVector(-100, 0, 0),   FVector::ZeroVector, 180.f,  false },
-		{ TEXT("in front of a victim who has turned 180deg (now behind)"),FVector(100, 0, 0),    FVector::ZeroVector, 180.f,  true  },
-		{ TEXT("behind and 400uu above — Z must not change the verdict"), FVector(-100, 0, 400), FVector::ZeroVector, 0.f,    true  },
-		{ TEXT("planar-coincident — degenerate, must resolve to FRONT"),  FVector(0, 0, 90),     FVector::ZeroVector, 0.f,    false },
-		{ TEXT("offset victim, attacker behind them at yaw 90"),          FVector(500, 400, 0),  FVector(500, 500, 0), 90.f,  true  },
-		{ TEXT("offset victim, attacker in front of them at yaw 90"),     FVector(500, 600, 0),  FVector(500, 500, 0), 90.f,  false },
+		{ TEXT("dead behind (attacker at -X, victim faces +X)"),          FVector(-100, 0, 0),    FVector::ZeroVector,  0.f,   0.0   },
+		{ TEXT("dead in front (attacker at +X, victim faces +X)"),        FVector(100, 0, 0),     FVector::ZeroVector,  0.f,   180.0 },
+		{ TEXT("directly to the victim's left"),                          FVector(0, -100, 0),    FVector::ZeroVector,  0.f,   90.0  },
+		{ TEXT("directly to the victim's right"),                         FVector(0, 100, 0),     FVector::ZeroVector,  0.f,   90.0  },
+		{ TEXT("45deg behind-left"),                                      FVector(-100, -100, 0), FVector::ZeroVector,  0.f,   45.0  },
+		{ TEXT("45deg in front-right"),                                   FVector(100, 100, 0),   FVector::ZeroVector,  0.f,   135.0 },
+		{ TEXT("29deg behind-left — just inside the v12 cone"),           TraceMeleeSweep::AttackerAtAzimuth(29.0), FVector::ZeroVector, 0.f, 29.0 },
+		{ TEXT("31deg behind-right — just outside the v12 cone"),         TraceMeleeSweep::AttackerAtAzimuth(-31.0), FVector::ZeroVector, 0.f, 31.0 },
+		{ TEXT("behind a victim who has turned 180deg (now in front)"),   FVector(-100, 0, 0),    FVector::ZeroVector,  180.f, 180.0 },
+		{ TEXT("in front of a victim who has turned 180deg (now behind)"),FVector(100, 0, 0),     FVector::ZeroVector,  180.f, 0.0   },
+		{ TEXT("behind and 400uu above — Z must not change the verdict"), FVector(-100, 0, 400),  FVector::ZeroVector,  0.f,   0.0   },
+		{ TEXT("planar-coincident — degenerate, must resolve to FRONT"),  FVector(0, 0, 90),      FVector::ZeroVector,  0.f,   -1.0  },
+		{ TEXT("offset victim, attacker behind them at yaw 90"),          FVector(500, 400, 0),   FVector(500, 500, 0), 90.f,  0.0   },
+		{ TEXT("offset victim, attacker in front of them at yaw 90"),     FVector(500, 600, 0),   FVector(500, 500, 0), 90.f,  180.0 },
 	};
-
-	const float Threshold = TraceMelee::GetBackstabHalfAngleDegrees();
 	const float BackDamage = TraceMelee::GetBackstabDamage();
 	const float FrontDamage = TraceMelee::GetFrontDamage();
 
@@ -651,13 +712,24 @@ int32 TraceRunMeleeSelfTest()
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[KnifeTest] model: back-stab when angle(approach, victim forward) <= %.1fdeg -> %.0f damage, else %.0f."),
 		Threshold, BackDamage, FrontDamage);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[KnifeTest] that half-angle is a CONE OF %.1f DEGREES centred on the victim's back (spec v12 s1 asked for 60)."),
+		2.f * Threshold);
 
 	for (const FCase& Case : Cases)
 	{
 		double Angle = -1.0;
 		const bool bBackstab = TraceMelee::IsBackstab(Case.Attacker, Case.Victim, Case.VictimYaw, &Angle);
 		const float Damage = TraceMelee::DamageForApproach(bBackstab);
-		const bool bPass = (bBackstab == Case.bExpectBackstab);
+
+		// Degenerate (-1) is contracted to FRONT; everything else follows the live threshold, so this
+		// table tests the MODEL and stays honest under a retune. The stated geometry is checked too:
+		// a case whose measured angle does not match the angle its name claims is a broken case, and
+		// silently trusting it would let the whole table drift away from what it says it covers.
+		const bool bDegenerate = (Case.KnownAngleDegrees < 0.0);
+		const bool bExpectBackstab = !bDegenerate && (Case.KnownAngleDegrees <= static_cast<double>(Threshold));
+		const bool bAngleAgrees = bDegenerate || FMath::IsNearlyEqual(Angle, Case.KnownAngleDegrees, 0.05);
+		const bool bPass = (bBackstab == bExpectBackstab) && bAngleAgrees;
 
 		if (!bPass)
 		{
@@ -667,10 +739,11 @@ int32 TraceRunMeleeSelfTest()
 		// UE_LOG's verbosity is a compile-time token, so a failing case has to take its own branch
 		// rather than selecting the verbosity with a ternary.
 		const FString Line = FString::Printf(
-			TEXT("[KnifeTest] %s  %-62s angle=%6.1fdeg -> %s (%.0f damage), expected %s"),
+			TEXT("[KnifeTest] %s  %-62s angle=%6.1fdeg (geometry says %6.1f) -> %s (%.0f damage), expected %s"),
 			bPass ? TEXT("PASS") : TEXT("FAIL"), Case.What, Angle,
+			bDegenerate ? -1.0 : Case.KnownAngleDegrees,
 			bBackstab ? TEXT("BACKSTAB") : TEXT("front   "), Damage,
-			Case.bExpectBackstab ? TEXT("BACKSTAB") : TEXT("front"));
+			bExpectBackstab ? TEXT("BACKSTAB") : TEXT("front"));
 
 		if (bPass)
 		{
@@ -679,6 +752,141 @@ int32 TraceRunMeleeSelfTest()
 		else
 		{
 			UE_LOG(LogTraceGame, Error, TEXT("%s"), *Line);
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// THE 24-POINT AZIMUTH SWEEP, and then the boundary, bisected.
+	//
+	// Spec v12 §1 asked for the back zone to be verified "with an azimuth sweep ... rather than by
+	// reading the constant", and this is that. The attacker walks a circle around a stationary victim
+	// in 15-degree steps; each station prints the angle the model measured, the verdict and the
+	// damage. Two invariants are checked per station rather than eyeballed:
+	//
+	//   * the measured angle equals the azimuth folded into 0..180 (the model is symmetric about the
+	//     rear axis — there is no left-handed back-stab), and
+	//   * the verdict is exactly (measured <= threshold), which is the whole rule.
+	//
+	// Then the flip is bisected to 0.05 degrees so the boundary can be stated as a number instead of
+	// as "somewhere between two sample stations". 24 stations at 15 degrees cannot resolve a 30-degree
+	// boundary on their own; the bisection is what makes this "confirmed to the degree".
+	// ---------------------------------------------------------------------------------------------
+
+	UE_LOG(LogTraceGame, Display, TEXT("[KnifeTest] --- azimuth sweep, 24 stations, 0deg = dead behind the victim ---"));
+
+	constexpr int32 SweepStations = 24;
+	int32 BackstabStations = 0;
+	for (int32 Station = 0; Station < SweepStations; ++Station)
+	{
+		const double Azimuth = 360.0 * static_cast<double>(Station) / static_cast<double>(SweepStations);
+
+		double Measured = -1.0;
+		const bool bBackstab = TraceMeleeSweep::BackstabAtAzimuth(Azimuth, &Measured);
+
+		// Unsigned angle off the rear axis: 195 degrees round the circle is 165 degrees off the back.
+		const double FoldedAzimuth = (Azimuth <= 180.0) ? Azimuth : (360.0 - Azimuth);
+		const bool bExpect = (FoldedAzimuth <= static_cast<double>(Threshold));
+
+		// A station sitting EXACTLY on the threshold (which happens if somebody tunes the half-angle
+		// to a multiple of 15) is decided by the last bit of an acos, so its verdict is not a fact
+		// about the model. Its measured angle still is, and the bisection below covers the boundary
+		// properly. At the shipped 30 degrees no station lands there.
+		const bool bOnTheLine = FMath::IsNearlyEqual(FoldedAzimuth, static_cast<double>(Threshold), 0.01);
+		const bool bPass = (bOnTheLine || bBackstab == bExpect)
+			&& FMath::IsNearlyEqual(Measured, FoldedAzimuth, 0.05);
+
+		if (bBackstab)
+		{
+			++BackstabStations;
+		}
+		if (!bPass)
+		{
+			++Failures;
+		}
+
+		const FString Line = FString::Printf(
+			TEXT("[KnifeTest] %s  azimuth %5.1fdeg from behind -> measured %6.1fdeg, %s, %.0f damage"),
+			bPass ? TEXT("PASS") : TEXT("FAIL"), Azimuth, Measured,
+			bBackstab ? TEXT("BACKSTAB") : TEXT("front   "),
+			TraceMelee::DamageForApproach(bBackstab));
+
+		if (bPass)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("%s"), *Line);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("%s"), *Line);
+		}
+	}
+
+	// Bisection. Invariant going in: 0 degrees is a back-stab and 180 is not, for every legal
+	// threshold (the property is clamped to 5..179), so the flip is bracketed from the first step.
+	double Inside = 0.0;
+	double Outside = 180.0;
+	if (!TraceMeleeSweep::BackstabAtAzimuth(Inside) || TraceMeleeSweep::BackstabAtAzimuth(Outside))
+	{
+		++Failures;
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[KnifeTest] FAIL  the model is not a rear cone at all: dead behind=%d, dead in front=%d. Bisection skipped."),
+			TraceMeleeSweep::BackstabAtAzimuth(Inside) ? 1 : 0, TraceMeleeSweep::BackstabAtAzimuth(Outside) ? 1 : 0);
+	}
+	else
+	{
+		// 0.05 degrees needs ~12 halvings of a 180-degree bracket; 40 is free and leaves no doubt.
+		for (int32 Step = 0; Step < 40 && (Outside - Inside) > 0.01; ++Step)
+		{
+			const double Mid = 0.5 * (Inside + Outside);
+			if (TraceMeleeSweep::BackstabAtAzimuth(Mid))
+			{
+				Inside = Mid;
+			}
+			else
+			{
+				Outside = Mid;
+			}
+		}
+
+		const double MeasuredHalfAngle = 0.5 * (Inside + Outside);
+		const double MeasuredCone = 2.0 * MeasuredHalfAngle;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[KnifeTest] boundary MEASURED at %.3fdeg off the rear axis -> a back zone %.2f degrees wide "
+			     "(%d of %d sweep stations scored %.0f damage)."),
+			MeasuredHalfAngle, MeasuredCone, BackstabStations, SweepStations, BackDamage);
+
+		// (a) the running build agrees with its own tunable. This is the check the .ini can break.
+		if (!FMath::IsNearlyEqual(MeasuredHalfAngle, static_cast<double>(Threshold), 0.05))
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KnifeTest] FAIL  the measured boundary %.3fdeg does not match the configured half-angle %.3fdeg."),
+				MeasuredHalfAngle, Threshold);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KnifeTest] PASS  measured boundary %.3fdeg == configured half-angle %.3fdeg."),
+				MeasuredHalfAngle, Threshold);
+		}
+
+		// (b) THE SPEC PIN. Verbatim, spec v12 §1: "Change the 'back' zone for knife damage being 100
+		// from a boundary at 90 degrees to 60 degrees, with the center of the 60 angle being at the
+		// center of the model." 60 is the FULL cone, so the half-angle must be 30. This is the line
+		// that went red on the shipped build, where the cone measured 180.00 degrees.
+		constexpr double SpecConeDegrees = 60.0;
+		if (!FMath::IsNearlyEqual(MeasuredCone, SpecConeDegrees, 0.2))
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KnifeTest] FAIL  spec v12 s1 asks for a %.0f-degree back cone centred on the model; this build measures %.2f."),
+				SpecConeDegrees, MeasuredCone);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KnifeTest] PASS  spec v12 s1: back cone is %.2f degrees, centred on the victim's back (+/-%.2f)."),
+				MeasuredCone, MeasuredHalfAngle);
 		}
 	}
 
@@ -876,7 +1084,11 @@ namespace TraceMeleeConsole
 	//
 	// Both cases are BACK-STABS (100 damage, a one-shot kill on a full-health pawn), staged by
 	// placing the attacker on the victim's forward axis — see TraceMelee::IsBackstab for why that
-	// is the rear hemisphere.
+	// is dead behind them, i.e. the very centre of the rear cone. SPEC v12 §1 NARROWED THAT CONE
+	// FROM 180 TO 60 DEGREES AND THIS STAGING IS UNAFFECTED, precisely because it stages the attack
+	// at 0 degrees rather than somewhere in the old hemisphere that has since stopped counting. If
+	// this harness ever starts reporting the RED arm as landing 30 instead of 100, that is the first
+	// thing to check: the staged approach angle, not the immunity rule.
 	//
 	// Driven off a ticker rather than a single call because the real path has real latencies in it:
 	// a 0.2 s pullout, a swing wind-up before the blade goes live, and a 0.5 s cooldown between the
@@ -892,13 +1104,39 @@ namespace TraceMeleeConsole
 	//     heldToResolve=1, the victim held as the carrier across the whole flight of the blade,
 	//     bladesOntoCarrier=0, health moved 0. That is a real runtime observation of the rule.
 	//
-	//   RED arm, case B: NEVER STAGED. With the rule disabled the blade did not land on ANYTHING —
-	//     `Trace.Knife.Debug 1` logs every resolution that finds a victim, and across six staged
-	//     swings there were ZERO resolution lines. So the red arm does not falsify anything; the
-	//     sweep is missing for a reason not yet found (candidates: the per-tick teleport in
-	//     PlaceBehind versus ServerSwing's MaxSwingOriginErrorUU plausibility check, or the
-	//     lag-compensated pose history disagreeing with a pawn that is being teleported every
-	//     frame).
+	//   RED arm, case B: STAGES CLEANLY AND STILL LANDS NOTHING. With the rule disabled the blade
+	//     does not reach the carrier at all. Re-measured over 7 runs during the spec v12 pass: 0 out
+	//     of 7 reproduced. The `arm=N diagnosis:` line was added then, and it narrows the cause a
+	//     long way past the guesses this comment used to carry:
+	//
+	//         arm=0 diagnosis: Trace.Knife.CarrierImmune=0 (0 = rule disarmed) |
+	//                          attacker->victim 108uu vs reach 180uu |
+	//                          victim still holder=1 suppressed=1 alive=1
+	//
+	//     So at the moment of the swing the rule really was disarmed, the victim really was in
+	//     reach, alive, still holding the Core, and its shield really was suppressed — and no blade
+	//     landed. THREE CANDIDATES ARE THEREFORE DEAD:
+	//       * "the cvar did not stick" — it reads 0, measured, not assumed;
+	//       * "the staging went stale" — every staging predicate is 1 at the report;
+	//       * "ServerSwing's origin plausibility check rejected the teleported attacker" — the
+	//         CLIENT-SIDE predicted resolve in UTraceWeaponComponent::TickSwing also finds nothing,
+	//         and that path never goes near ServerSwing's validation.
+	//
+	//     WHAT IS LEFT is upstream of this file: the sample is being rejected inside
+	//     UTraceLagCompensationComponent::ResolveHitscan, or by world geometry between the two
+	//     pawns. Note ResolveHitscan's own carrier clause is `IsCoreHolder(Target) &&
+	//     !IsShieldSuppressedFor(Target)`, which should NOT skip a suppressed holder — so either
+	//     that predicate is not seeing the suppression the harness sees, or something solid is now
+	//     standing between a carrier and anyone behind them. Both live outside the melee slice.
+	//
+	//     THE KNIFE ITSELF IS HEALTHY, and that control was run rather than assumed: in the same
+	//     matches, bots landed ordinary front hits (30) and a genuine BACKSTAB (100) on non-carrier
+	//     targets under the new 60-degree cone. The failure is specific to swinging at a CARRIER.
+	//
+	//     PRACTICAL CONSEQUENCE, and it is the reassuring direction: the carrier is currently
+	//     protected TWICE — once upstream and once by the rule below. Nothing can reach it. But a
+	//     redundant guard is exactly what makes this red arm unfalsifiable, so the rule below is
+	//     resting on a static reading rather than on a demonstration, and that is the thing to fix.
 	//
 	//   A TRAP THIS HARNESS FELL INTO AND NOW GUARDS AGAINST: the first version judged on the
 	//     victim's HEALTH and reported the rule broken on a 100-point drop that was an ordinary
@@ -907,9 +1145,11 @@ namespace TraceMeleeConsole
 	//     and it is what the verdict now reads.
 	//
 	// So: the carrier's melee immunity is verified STATICALLY (ResolveSwing's branch is
-	// unambiguous) and its OBSERVABLE behaviour is verified at runtime, but the discipline this
-	// project runs on says an arm that never went red leaves the claim a hypothesis. Fix the red
-	// arm before calling it proven.
+	// unambiguous) and its OBSERVABLE behaviour is verified at runtime — across every run of this
+	// harness to date, on both arms, GetCarrierKnifeHitCount() has finished at ZERO — but the
+	// discipline this project runs on says an arm that never went red leaves the claim a hypothesis.
+	// Fix the red arm before calling it proven, and fix it by finding the upstream rejection above
+	// rather than by loosening the staging, which is already correct.
 	// ===========================================================================================
 	//
 	// BOTH ARMS RUN IN ONE INVOCATION, RED FIRST, and that is not a convenience. A harness that has
@@ -1369,6 +1609,43 @@ namespace TraceMeleeConsole
 						TEXT("[KNIFECARRIER] arm=%d CASE B shieldDOWN: swung=%d bladesOntoCarrier=%d (staged=%d, shieldDownAtPress=%d heldToResolve=%d)  [health moved %.0f]  <-- the case only ResolveSwing protects"),
 						State->Arm, State->bSwungB ? 1 : 0, State->CaseBCarrierHits, bValidB ? 1 : 0,
 						State->bShieldDownAtB ? 1 : 0, State->bShieldHeldThroughB ? 1 : 0, DamageB);
+
+					// ---- WHY A STAGED CASE B CAN STILL LAND NOTHING -------------------------------
+					//
+					// Added after this harness reported DID NOT REPRODUCE 6 runs out of 6 while the
+					// GREEN arm passed cleanly every time. "staged=1, bladesOntoCarrier=0" in the RED
+					// arm has three possible causes and the summary line above cannot tell them apart:
+					//
+					//   1. the immunity rule was never actually disarmed (the cvar set did not stick),
+					//   2. the blade was disarmed but never reached a body — a geometry or eligibility
+					//      failure upstream in ResolveHitscan, which would show as ZERO candidates,
+					//   3. it reached a body that was not the carrier.
+					//
+					// Only (1) would mean the harness is lying about the rule; (2) and (3) mean the
+					// staging is stale. Printing the live cvar and the actual resolve settles it in one
+					// line instead of another six runs of guessing.
+					{
+						int32 LiveImmune = -1;
+						if (const IConsoleVariable* ImmuneVar =
+							IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Knife.CarrierImmune")))
+						{
+							LiveImmune = ImmuneVar->GetInt();
+						}
+
+						const ATraceCharacter* DiagVictim = State->Victim.Get();
+						const ATraceCharacter* DiagAttacker = State->Attacker.Get();
+						const double Separation = (DiagVictim != nullptr && DiagAttacker != nullptr)
+							? FVector::Dist(DiagAttacker->GetActorLocation(), DiagVictim->GetActorLocation())
+							: -1.0;
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[KNIFECARRIER] arm=%d diagnosis: Trace.Knife.CarrierImmune=%d (0 = rule disarmed) | "
+							     "attacker->victim %.0fuu vs reach %.0fuu | victim still holder=%d suppressed=%d alive=%d"),
+							State->Arm, LiveImmune, Separation, TraceMelee::GetSwingRangeUU(),
+							(DiagVictim != nullptr && ATraceCore::IsCoreHolder(DiagVictim)) ? 1 : 0,
+							(DiagVictim != nullptr && ATraceCore::IsShieldSuppressedFor(DiagVictim)) ? 1 : 0,
+							(DiagVictim != nullptr && DiagVictim->IsAlive()) ? 1 : 0);
+					}
 
 					if (State->Arm == 0)
 					{

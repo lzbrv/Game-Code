@@ -923,6 +923,11 @@ private:
 	 * EVERY player, friend or enemy (spec: interception is a feature), except the thrower for
 	 * CatchThrowerLockout seconds — without that a throw would curve straight back into the hands it
 	 * left, since it leaves from inside its own thrower's catch zone.
+	 *
+	 * SPEC v12 §4 cut CatchRadius 500 -> 450 ("reduce the 'magnet' radius for catching in game mode b
+	 * by 10%"). The steering itself is TraceModeBTuning::SteerTowardCatchPoint, which this calls and
+	 * which Trace.ModeB.CatchTest also calls — the measurement and the game run the same function on
+	 * purpose, so a catch rate reported for the magnet is a catch rate for THE magnet.
 	 */
 	void ServerApplyCatchZone(float DeltaSeconds);
 

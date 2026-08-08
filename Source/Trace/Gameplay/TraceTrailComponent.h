@@ -699,6 +699,97 @@ public:
 	void MeasureDrawnVolume(double& OutMaxHalfWidth, double& OutMaxHalfHeight,
 		double& OutWorstUncovered, int32& OutVisiblePieces) const;
 
+#if !UE_BUILD_SHIPPING
+	/**
+	 * SPEC v12 §6 VERIFICATION. How far the trace is currently INSIDE the level, measured on both
+	 * halves of the invariant separately so they can be compared rather than assumed equal.
+	 *
+	 * DRAWN is sampled over the oriented box of every visible ribbon piece — the actual on-screen
+	 * geometry, joint overlaps and minimum element lengths included. LETHAL is sampled over the swept
+	 * volume the trip test evaluates (TrailRadius x TrailHeight along the lethal polyline). Both are
+	 * probed against ECC_Visibility blocking geometry with pawns filtered out, so what is being
+	 * measured is "is this inside a wall", not "is this near a player".
+	 *
+	 * The two depths are the diagnosis as well as the verdict:
+	 *   LETHAL ~= DRAWN and both > 0  -> the PATH itself cuts through the structure (a chord across a
+	 *                                    corner), so the fix has to move the path.
+	 *   DRAWN > LETHAL                -> the drawing is reaching outside the volume that kills, which
+	 *                                    is a lethal!=drawn violation in its own right.
+	 */
+	struct FTraceClipSample
+	{
+		/** Deepest uu of DRAWN ribbon inside a piece of level geometry, where, and which piece. */
+		double DrawnDepth = 0.0;
+		FVector DrawnWorst = FVector::ZeroVector;
+		FVector DrawnWorstPushOut = FVector::ZeroVector;
+		FString DrawnWorstPiece;
+
+		/** Deepest uu of the LETHAL swept volume inside a piece of level geometry. */
+		double LethalDepth = 0.0;
+		FVector LethalWorst = FVector::ZeroVector;
+		FString LethalWorstPiece;
+
+		/**
+		 * CLOSEST the drawn ribbon came to a surface WITHOUT entering it, in uu.
+		 *
+		 * The number that stops a clean result being a vacuous one. A run that reports no clipping
+		 * because the carrier never went near a structure looks identical, in every other field, to a
+		 * run that hugged every wall in the arena and stayed out of all of them — and only one of
+		 * those is evidence. Large = the fixture never did the thing the report describes.
+		 */
+		double DrawnNearestSurface = TNumericLimits<double>::Max();
+
+		/** Same measurement taken on the CARRIER's own actor location — how close the BODY got. */
+		double CarrierNearestSurface = TNumericLimits<double>::Max();
+		FString CarrierNearestPiece;
+
+		int32 DrawnSamplesInside = 0;
+		int32 DrawnSamplesTotal = 0;
+		int32 LethalSamplesInside = 0;
+		int32 LethalSamplesTotal = 0;
+		int32 VisiblePieces = 0;
+		int32 LethalPoints = 0;
+	};
+
+	/**
+	 * ONE RENDERED BOX OF THE LEVEL, flattened out of whatever component draws it.
+	 *
+	 * Flattened rather than held as components for two reasons, both of which cost this pass a run.
+	 * First, most of the arena is pooled into UInstancedStaticMeshComponents, so a component's own
+	 * transform is the POOL's and describes nothing a player can see — the instances have to be
+	 * expanded or the measurement silently tests a few dozen boxes stacked at the origin. Second, a
+	 * flat array with precomputed world bounds is what makes a per-frame lattice over the whole trace
+	 * affordable: the trace is ~1200uu long and the arena is thousands of boxes, so almost all of the
+	 * work is rejecting the ones that are nowhere near it.
+	 */
+	struct FTraceClipBox
+	{
+		FTransform Transform;
+		FVector LocalCentre = FVector::ZeroVector;
+		FVector LocalExtent = FVector::ZeroVector;
+		FVector Scale = FVector::OneVector;
+		FBox WorldBounds = FBox(ForceInit);
+		FString Name;
+	};
+
+	/**
+	 * @param Geometry  the RENDERED level boxes to test against, gathered once by the caller.
+	 *
+	 * IT HAS TO BE THE RENDERED MESHES, and the first arm of this pass measured the wrong thing by
+	 * assuming otherwise. The arena's visible structure is built from NoCollision meshes with
+	 * separate, smaller UBoxComponents behind them for physics; on top of that the interior carries
+	 * PAWN-ONLY standoff shells that hold a body 26-40uu further out again. So a query against the
+	 * physics scene reports acres of clearance while the ribbon is visibly inside a corner rib —
+	 * which is exactly the report. What the player sees is the rendered mesh, so that is what a
+	 * measurement of "the trace clips into walls" has to intersect.
+	 */
+	void MeasureWorldClipping(const TArray<FTraceClipBox>& Geometry, FTraceClipSample& Out) const;
+
+	/** Points appended purely because the direct chord was obstructed. Session totals, all carriers. */
+	static void GetWallFitStats(int32& OutRoutedAppends, int32& OutInsertedPoints, int32& OutUnroutable);
+	static void ResetWallFitStats();
+#endif
+
 private:
 	// ------------------------------------------------------------------------------------------
 	// Server state
@@ -818,6 +909,61 @@ private:
 	 * the difference between "the fix works" and "I hope the fix works".
 	 */
 	TArray<FVector> ExemptPositions;
+
+	// ------------------------------------------------------------------------------------------
+	// SPEC v12 §6 — keeping the trace out of the walls
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * THE CARRIER'S ACTUAL ROUTE SINCE THE LAST POINT WAS LAID. Server-only, one entry per server
+	 * tick, cleared every time a point is appended (and by ClearTrail / SetEmitting).
+	 *
+	 * This is the raw material for the whole fix, so it is worth being explicit about why it has to
+	 * exist. Points are laid every TrailPointSpacing (60uu) of travel, and the trace — both the
+	 * ribbon and the trip test — is the STRAIGHT CHORD between consecutive points. Round a pillar
+	 * corner the carrier's capsule follows an arc of radius ~34uu (its own radius) about the corner
+	 * vertex, and 60uu of arc at that radius is more than the whole quarter turn: the two points
+	 * straddle the corner and the chord between them passes ~10uu from the vertex, i.e. straight
+	 * through the pillar. That is the reported bug, and note that it is not a DRAWING bug — the
+	 * lethal volume takes the identical shortcut.
+	 *
+	 * The carrier's real path cannot have that problem: their capsule is 34uu of radius and the trace
+	 * is 22.5uu, so wherever a body legally stood there is room for the trace. So the repair is to
+	 * SUBDIVIDE rather than to invent — insert the positions the carrier really occupied until the
+	 * polyline stops cutting the corner. Nothing is moved off the route the player ran.
+	 */
+	TArray<FVector> PendingPathSamples;
+
+	/**
+	 * Is the trace's own volume — a TrailRadius-wide, TrailHeight-tall upright column — clear of
+	 * blocking level geometry everywhere along the segment From->To?
+	 *
+	 * ECC_Visibility, with pawns filtered out, because "solid enough to hide a bullet" is the same
+	 * set of surfaces as "solid enough to look wrong with a ribbon inside it", and because the arena's
+	 * pawn-standoff shells are deliberately invisible and must not push the trace around.
+	 */
+	bool IsTrailVolumeClear(const FVector& From, const FVector& To) const;
+
+	/**
+	 * Nudge one candidate point out of any geometry it is already inside, horizontally, by at most
+	 * GetWallFitMaxPush() uu — and only if the nudge actually reduces the penetration AND the moved
+	 * point is still in line of sight of where it started (so a thin wall can never be tunnelled
+	 * through, which would put the trace, and therefore the kill volume, on the far side of a wall
+	 * the player never crossed).
+	 */
+	FVector FitPointToWorld(const FVector& Candidate) const;
+
+	/**
+	 * Append Target to TrailPoints, inserting as few of PendingPathSamples as it takes for no
+	 * segment of the polyline to pass through the level. Returns the number of points appended.
+	 *
+	 * THIS IS THE ONE PLACE THE FIX LIVES, AND THAT IS THE POINT. The ribbon is built from
+	 * TrailPoints and the trip test is built from TrailPoints; neither is touched by this change. So
+	 * "the lethal volume matches the drawn volume" is preserved the same way it was already
+	 * guaranteed — by there being one polyline — rather than by two pieces of geometry code being
+	 * kept in agreement by hand.
+	 */
+	int32 AppendTrailPointsFitted(const FVector& Target, float Now);
 
 	// ------------------------------------------------------------------------------------------
 	// Visuals (client + listen server; never created on a dedicated server)

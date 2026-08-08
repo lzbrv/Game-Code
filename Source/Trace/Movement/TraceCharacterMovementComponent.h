@@ -248,10 +248,18 @@
 // Every term is a pure function of (planar speed, config), so the whole thing replays exactly and
 // adds no saved-move state.
 //
-// --- SPEC v5 §7: THE LEDGE RUBBER-BAND, AND THE MANTLE -----------------------------------------
+// --- SPEC v5 §7 / v12 §5: THE LEDGE RUBBER-BAND (THE MANTLE IS GONE) ---------------------------
 //
-// "When jumping on the edge of a raised section, it's glitchy and feels like rubber banding. Add a
-// mantle, to solve this."
+// Demo 5: "When jumping on the edge of a raised section, it's glitchy and feels like rubber
+// banding. Add a mantle, to solve this."
+// Demo 11: "Remove mantling from the game, keep wall jumping. Make sure there's no bug when a
+// player hits the top edge of an obstacle."
+//
+// THE MANTLE HAS BEEN DELETED (spec v12 §5) AND THE DIAGNOSIS BELOW IS WHY THAT IS SAFE. The
+// rubber-band was never the mantle's to fix: it was a client/server disagreement about ground
+// contact at a lip, and the two things that actually fix it — PerchRadiusThreshold and the ledge
+// grace — are both still here and are both untouched by the removal. The mantle was a third fix
+// layered on top, and it was the only one of the three that changed where the pawn ends up.
 //
 // DIAGNOSIS FIRST, because "rubber banding" in a predicted game is a claim about the network and not
 // about feel. The mechanism, in this kit specifically:
@@ -274,7 +282,7 @@
 //   client and server run different code, and the position error compounds until the server
 //   corrects. THAT is the rubber-band, and a mantle bolted on top would not have removed it.
 //
-// So there are three fixes, and only the third is the one that was asked for:
+// THE TWO FIXES THAT REMAIN, AND THEY ARE THE ONES THAT MATTER:
 //
 //   1. PerchRadiusThreshold, set in the constructor. Gives the perch test a real band to decide in
 //      instead of a knife edge, so the walking/falling answer at a lip is stable and both ends reach
@@ -284,35 +292,56 @@
 //      longer end a slide, fire a fast-fall or fake a landing. It deliberately does NOT touch the
 //      engine's own physics mode — only which of this file's branches run — so it cannot change
 //      where the pawn is, only stop the kit from disagreeing about it.
-//   3. THE MANTLE. See below.
 //
-// --- THE MANTLE ---------------------------------------------------------------------------------
+// NEITHER OF THOSE IS ALLOWED TO BE DELETED AS "MANTLE CODE". GetLedgeGroundGraceSeconds() reads a
+// knob that still ships, GroundGraceRemaining still round-trips through the saved move, and
+// PerchRadiusThreshold is still assigned in the constructor. They were written in the same pass as
+// the mantle and they are indexed under the same spec section, which makes them the obvious thing
+// to sweep out alongside it; sweeping them out is what would hand the Demo 5 complaint back.
 //
-// Fully client-predicted, and it needs no new input and no new compressed flag: it triggers itself
-// from state the replay path already restores (Velocity, Acceleration, the updated component's
-// transform) plus the static arena geometry, which is identical on every machine. Detection runs in
-// OnMovementUpdated, once per move, on client, server and every replayed move.
+// --- THE THIRD FIX, WHY IT IS GONE, AND WHAT MEASUREMENT SAYS ABOUT IT --------------------------
 //
-//   REACH   a forward trace at chest height, along the direction of travel, out to MantleReachUU.
-//           Requires a near-vertical face (|Normal.Z| small) and requires the player to be PUSHING
-//           INTO it (Acceleration·forward > 0), so falling past a wall never grabs it.
-//   HEIGHT  a downward trace from above that face finds the ledge top. It must be between
-//           MantleMinHeightUU and MantleMaxHeightUU above the pawn's feet — below the minimum the
-//           engine's own step-up already handles it, above the maximum it is a wall and not a ledge.
-//   CLEAR   a capsule sweep at the destination proves there is room to stand before anything moves.
+// The mantle was an automatic MOVE_Flying pull-up onto any reachable ledge, attempted on every
+// airborne move. It is deleted in full: the ability, its six pieces of saved-move state, its eight
+// tuning knobs, its Trace.MantleDebug CVar and the "a wall jump outranks a mantle" priority rule
+// that only existed to stop it eating wall jumps (spec v9 §5). None of it is behind a switch; a
+// disabled mantle would be a dead knob, and this project has shipped several.
 //
-//   The pull-up is TWO PHASES and never passes through solid geometry: straight up the face for
-//   MantleUpPhaseFraction of MantleDurationSeconds, then forward over the lip for the rest, both as
-//   ordinary swept movement in MOVE_Flying. Velocity is written in CalcVelocity (inside the physics
-//   step, where it moves the pawn on the same frame) as (target − here) / time-left, which is
-//   self-correcting: both ends independently recompute the same target from the same geometry and
-//   converge on it, so even a small difference in where the mantle started cannot accumulate.
+// HOW THAT WAS CHECKED RATHER THAN ASSUMED. -TraceLedgeTest is the rig, and spec v12 §5 made it
+// answer the question Demo 5 never did. It now runs the LIP case — a block SHORTER than the jump
+// apex, so the pawn lands on the top edge instead of climbing the face — and reports, per contact
+// and on the client that experiences it:
 //
-// MantleTimeRemaining, MantleTargetLocation, MantleUpTargetZ, MantleEntrySpeed and
-// MantleCooldownRemaining are ALL saved-move state, round-tripped through Clear / SetMoveFor /
-// PrepMoveFor and blocked from move-merging by CanCombineWith — a correction landing mid-mantle that
-// lost them would replay the pull-up as a fall, which is the biggest rubber-band the kit could
-// produce and the exact bug this section exists to remove.
+//   flips     ground-state changes during the contact window. 2 is the floor (jump, land). Every
+//             extra one is the capsule oscillating on the lip, and every oscillation is a frame on
+//             which client and server can pick different velocity models.
+//   corr      server corrections that land inside the contact window, with their position error.
+//             This is the number that says "prediction desync" or "no prediction desync", and it is
+//             the number Demo 5 should have produced before anyone wrote a mantle.
+//   keptPct   planar speed on the far side of the lip as a fraction of the speed at the jump. This
+//             is "stall" and "pulled back" made countable.
+//
+// WHAT IT MEASURED. Two arms, ONE BINARY, same arena ledge (a TraceArenaBuilder cover box, top at
+// 176 uu, against a 187 uu jump apex — it clears by 12.7 uu, which is why landing on its edge is the
+// common case), same 40 ms client, same two jump distances (251 uu and 393 uu from the face), same
+// contact count. The ONLY difference is PerchRadiusThreshold and the ledge grace:
+//
+//   DEMO 5 ARM (-TraceLedgeLegacy: perch 0, grace 0 — the state the complaint was made about)
+//       flips/contact 2.50 (worst 3) | corr/contact 1.50, worst error 86.05 uu | kept 0.762 (worst
+//       0.525 — 800 uu/s in, 420 uu/s out)
+//       A longer eight-contact session in the same arm: flips 3.12 (worst 4), corr/contact 0.75 over
+//       6 corrections, worst error 115.15 uu, worst retention 0.542.
+//
+//   SHIPPED ARM (perch 15, grace 0.08 — with the mantle deleted)
+//       flips/contact 2.00 (worst 2) | corr/contact 0.00, worst error 0.00 uu | kept 1.000
+//       Eighteen further contacts logged across other sessions: every one flips=2, corr=0, 0.00 uu.
+//
+// SO THE ANSWER TO "IS THERE A BUG AT THE TOP EDGE ONCE THE MANTLE IS GONE" IS NO, AND IT IS AN
+// ANSWER WITH A CONTROL. The desync Demo 5 described is real and reproducible — 86 to 115 uu of
+// correction and up to 48% of the player's speed, on a lip, on a client. It is removed by
+// PerchRadiusThreshold and the ledge grace, NOT by the mantle: the mantle was absent from both arms
+// above and the red arm is still red. That is the evidence that deleting it does not hand the bug
+// back, and it is the measurement Demo 5 should have had before a mantle was written.
 //
 // CanAttemptJump() IS OVERRIDDEN FOR THIS, and it is not optional. The engine's version refuses to
 // jump whenever bWantsToCrouch is set — a sane rule in a game where crouch shrinks the capsule and
@@ -957,13 +986,7 @@ public:
 	 */
 	float GetSlideCooldownRemaining() const { return FMath::Max(0.f, SlideCooldownRemaining); }
 
-	// --- Mantle API (spec v5 §7) -----------------------------------------------------------------
-
-	/** True while the ledge pull-up owns the pawn. Movement input, dash, slide and jump are all off. */
-	bool IsMantling() const;
-
-	/** Seconds of pull-up left, 0 when not mantling. For anim/HUD tells; never feeds the simulation. */
-	float GetMantleTimeRemaining() const { return FMath::Max(0.f, MantleTimeRemaining); }
+	// --- Ledge API (spec v5 §7, minus the mantle removed in v12 §5) -------------------------------
 
 	/**
 	 * "Grounded" as the ABILITY LAYER sees it: actually on the ground, or within LedgeGroundGrace-
@@ -1030,33 +1053,6 @@ protected:
 
 	/** Locks the direction, sets the entry speed and starts the slide's fixed-length window. */
 	void BeginSlide();
-
-	// --- Mantle (spec v5 §7) ---------------------------------------------------------------------
-
-	/**
-	 * Looks for a climbable ledge ahead and, if it finds one with room to stand, starts the pull-up.
-	 * Returns true if a mantle began. Pure function of restored state + static geometry, so it makes
-	 * the same decision on the client, on the server and on every replayed move.
-	 *
-	 * ApproachVelocity is OnMovementUpdated's OldVelocity — the velocity at the START of the move,
-	 * before any collision response. It has to be, and that is not a nicety: the frame a jump's
-	 * capsule meets a ledge face is the frame the sweep zeroes the planar velocity against it, so the
-	 * current Velocity says the pawn was standing still and the speed gate refuses. This parameter is
-	 * why the mantle fires at all.
-	 */
-	bool TryBeginMantle(const FVector& ApproachVelocity);
-
-	/** Cheap pre-test: alive, enabled, off cooldown, airborne, not already busy with another ability. */
-	bool CanAttemptMantle() const;
-
-	/**
-	 * One sub-step of the pull-up, written from inside CalcVelocity so it moves the pawn on the same
-	 * frame. Phase 1 climbs to MantleUpTargetZ, phase 2 crosses to MantleTargetLocation.
-	 */
-	void ApplyMantleVelocity(float DeltaTime);
-
-	/** Hands the pawn back to MOVE_Falling with its entry speed (capped at the ground limit). */
-	void EndMantle();
 
 	// --- Wall jump (spec v8 §7) ------------------------------------------------------------------
 
@@ -1277,16 +1273,10 @@ protected:
 	/** Fraction of the incoming planar SPEED the reflected launch keeps. 1.0 is pure preservation. */
 	float GetWallJumpSpeedRetention() const;
 
-	/**
-	 * SPEC v9 §5. Seconds a wall jump puts the MANTLE on cooldown for.
-	 *
-	 * "If a player inputs a wall jump, that overrides a mantle." Refusing the mantle on the launch
-	 * frame is only half of it — the pawn is still beside the same ledge for several frames after,
-	 * and an auto-mantle needs no input to claim it. This window is what stops the mantle undoing a
-	 * wall jump one frame after it happened. Applied by pushing MantleCooldownRemaining, which is
-	 * already saved-move state, so it adds no prediction plumbing.
-	 */
-	float GetWallJumpMantleLockoutSeconds() const;
+	// SPEC v9 §5's GetWallJumpMantleLockoutSeconds() lived here. It put the mantle on cooldown after a
+	// launch so an auto-mantle could not undo the wall jump a frame later. With the mantle deleted in
+	// v12 §5 there is nothing left to lock out, so the knob is gone rather than left reading a value
+	// nothing consumes. The wall jump itself is untouched: see TryWallJump().
 
 	/** Flat uu/s pushed straight out along the wall normal, on top of the reflection. */
 	float GetWallJumpOutwardImpulse() const;
@@ -1375,30 +1365,7 @@ protected:
 	float GetGroundOverspeedBraking() const;
 	float GetGroundOverspeedTurnRate() const;
 
-	// --- Mantle / ledge tuning (spec v5 §7) -------------------------------------------------------
-
-	bool  IsMantleEnabled() const;
-
-	/** How far ahead of the capsule's surface a ledge face may be and still be grabbed. */
-	float GetMantleReachUU() const;
-
-	/** Below this the engine's own step-up handles it and a mantle would look like a stutter. */
-	float GetMantleMinHeightUU() const;
-
-	/** Above this it is a wall, not a ledge. Hip-to-shoulder plus the jump's own rise. */
-	float GetMantleMaxHeightUU() const;
-
-	/** Total length of the pull-up. */
-	float GetMantleDurationSeconds() const;
-
-	/** Fraction of that spent climbing before the pawn moves forward over the lip. */
-	float GetMantleUpPhaseFraction() const;
-
-	/** Blocks an immediate re-grab of the same lip after a mantle ends. */
-	float GetMantleCooldownSeconds() const;
-
-	/** Minimum planar speed toward the wall. Stops a standing pawn vacuuming itself up every wall. */
-	float GetMantleMinForwardSpeed() const;
+	// --- Ledge tuning (spec v5 §7; the eight Mantle* knobs were deleted in v12 §5) ----------------
 
 	/**
 	 * How long the ability layer keeps believing the pawn is grounded after contact is lost.
@@ -1552,7 +1519,11 @@ protected:
 	 */
 	uint8 bWasAirborneLastMove : 1;
 
-	// --- Ledge / mantle state (all saved/restored by FSavedMove_Trace) ----------------------------
+	// --- Ledge state (saved/restored by FSavedMove_Trace) -----------------------------------------
+	//
+	// One field, and it is the survivor of the v12 §5 mantle removal. See the ledge section of the
+	// header: this is fix (2) of the two that actually address the Demo 5 rubber-band, and it is not
+	// mantle state even though it was written in the same pass.
 
 	/**
 	 * Seconds of "the ability layer still counts this pawn as grounded" left after ground contact is
@@ -1563,24 +1534,6 @@ protected:
 	 * class of divergence it was added to remove.
 	 */
 	float GroundGraceRemaining;
-
-	/** Seconds of pull-up left. Non-zero IS "mantling"; the mantle owns Velocity for its whole run. */
-	float MantleTimeRemaining;
-
-	/** Length the current mantle started with, so the two phases can be timed against a fixed total. */
-	float MantleTotalTime;
-
-	/** Where the pawn is being pulled to: standing on the ledge, capsule centre. */
-	FVector MantleTargetLocation;
-
-	/** Z the climb phase rises to before the pawn moves forward. Always >= the target's Z. */
-	float MantleUpTargetZ;
-
-	/** Planar speed at the instant the mantle began, handed back (capped) on exit. */
-	float MantleEntrySpeed;
-
-	/** Blocks re-grabbing the same lip the frame after a mantle ends. Charged in EndMantle(). */
-	float MantleCooldownRemaining;
 
 	// --- Wall-jump state (all saved/restored by FSavedMove_Trace) — spec v8 §7 -------------------
 
@@ -1748,7 +1701,7 @@ protected:
 
 	/**
 	 * "-TraceLedgeTest": spawns a block of a known height in front of the pawn and runs at it, over
-	 * and over, counting ground-state flips, mantles and (on a client) server corrections.
+	 * and over, measuring what happens at the top edge.
 	 *
 	 * It builds its own geometry on purpose. The arena's raised sections are real ledges, but their
 	 * positions depend on the arena builder's tuning, and a diagnosis of a prediction bug has to be
@@ -1756,6 +1709,26 @@ protected:
 	 *
 	 * Runs on the LOCALLY CONTROLLED pawn in any net mode — unlike TickMomentumMeasure, which is
 	 * standalone-only — because the whole point is to measure what a networked client experiences.
+	 *
+	 * SPEC v12 §5 REWORKED WHAT IT MEASURES, and that is the substance of the task rather than the
+	 * mantle deletion. Before, it asked "did a mantle fire?" against a block TALLER than the jump
+	 * apex, because that is the only case a mantle could ever fire in. But the complaint — "jumping
+	 * on the edge of a raised section" — is the case where the jump CLEARS the top and the capsule
+	 * lands on the lip, which the mantle never touched. So the default block height is now below the
+	 * jump apex, and the harness reports three things PER CONTACT rather than one count per session:
+	 *
+	 *   flips  ground-state changes between the jump and the settle. 2 is clean (leave, arrive).
+	 *          3+ is the capsule chattering on the edge, which is the mechanism by which client and
+	 *          server end up running different velocity models on the same frame.
+	 *   corr   corrections received inside that same window, and their worst position error. This is
+	 *          the direct test for "rubber banding" — it is a claim about the network, so it has to
+	 *          be answered with corrections and not with feel.
+	 *   kept   planar speed after the lip as a fraction of the speed at the jump. Below ~1.0 is a
+	 *          stall; a negative displacement across the window is a pull-back.
+	 *
+	 * The correction numbers are DELTAS of CorrectionCount / CorrectionErrorWorst snapshotted at the
+	 * jump, rather than a new attribution clock: OnClientCorrectionReceived already maintains those
+	 * totals, and a delta of an existing counter cannot drift out of step with the thing it counts.
 	 */
 	void TickLedgeTest(float DeltaSeconds);
 
@@ -1764,11 +1737,32 @@ protected:
 	float LedgeTestPhaseTime = 0.f;
 	int32 LedgeTestRun = 0;
 	int32 LedgeTestGroundFlips = 0;
-	int32 LedgeTestMantles = 0;
 	uint8 bLedgeTestWasGrounded : 1;
-	FVector LedgeTestStart = FVector::ZeroVector;
 	FVector LedgeTestRunDirection = FVector::ForwardVector;
 	TWeakObjectPtr<AActor> LedgeTestBlock;
+
+	/** A point ON the vertical face the pawn runs at, and the top surface just past it. */
+	FVector LedgeTestFacePoint = FVector::ZeroVector;
+	FVector LedgeTestTopPoint = FVector::ZeroVector;
+	float LedgeTestLedgeHeight = 0.f;
+
+	/** Snapshots taken on the jump frame; the per-contact numbers are all deltas against these. */
+	int32 LedgeTestFlipsAtJump = 0;
+	int32 LedgeTestCorrAtJump = 0;
+	float LedgeTestWorstErrAtJump = 0.f;
+	float LedgeTestSpeedAtJump = 0.f;
+	FVector LedgeTestPosAtJump = FVector::ZeroVector;
+
+	/** Aggregates over the whole session, so one line can summarise every contact. */
+	int32 LedgeTestContacts = 0;
+	int32 LedgeTestContactFlips = 0;
+	int32 LedgeTestContactCorrections = 0;
+	int32 LedgeTestWorstContactFlips = 0;
+	float LedgeTestWorstContactErr = 0.f;
+	float LedgeTestKeptFractionTotal = 0.f;
+	float LedgeTestWorstKeptFraction = 1.f;
+	int32 LedgeTestLandedOnTop = 0;
+	int32 LedgeTestPulledBack = 0;
 #endif
 
 #if !UE_BUILD_SHIPPING
@@ -1808,18 +1802,11 @@ protected:
 	float WallJumpLaunchZSum = 0.f;
 	int32 WallJumpCorrectionsInWindow = 0;
 
-	/**
-	 * SPEC v9 §5, THE MEASUREMENT FOR "IT FEELS LIKE STICKING TO THE WALL FOR A SECOND".
-	 *
-	 * Counts mantles that STARTED while a wall-jump window was open — i.e. wall jumps the player was
-	 * still entitled to make and the automatic mantle took away, locking the pawn in MOVE_Flying (where
-	 * CanAttemptJump() refuses every press) for GetMantleDurationSeconds().
-	 *
-	 * This is the number that separates the two arms: under -TraceLegacyTuning the mantle wins the
-	 * frame and this climbs; with the §5 priority in force it must be ZERO. Dev-only, never saved,
-	 * counted on the record pass only.
-	 */
-	int32 WallJumpMantleSteals = 0;
+	// SPEC v9 §5's WallJumpMantleSteals counter lived here: it counted mantles that started while a
+	// wall-jump window was open, i.e. wall jumps the automatic mantle took away. With the mantle
+	// deleted in v12 §5 the quantity is identically zero by construction and the counter is gone.
+	// The wall jump no longer has to win a race against anything — it is the only thing that reads a
+	// wall contact now, and TryWallJump()'s only gate is its own window.
 
 	/** World time the current wall jump's correction-attribution window closes. Never saved. */
 	float WallJumpAttributionUntil = -1000.f;
@@ -2172,20 +2159,15 @@ public:
 	uint8 bSavedSlideJumpGraceWellTimed : 1;
 
 	/**
-	 * The ledge grace and the whole mantle (spec v5 §7).
+	 * The ledge grace (spec v5 §7). The six Mantle* companions that used to sit here went with the
+	 * mantle in v12 §5.
 	 *
-	 * Every one of these is restored by PrepMoveFor. A correction that landed mid-pull-up and lost
-	 * them would replay the mantle as a fall — the pawn would be on top of the ledge on one machine
-	 * and at the bottom of it on the other, which is the largest possible version of the exact bug
-	 * this feature was added to fix.
+	 * Restored by PrepMoveFor, and it must stay that way. It gates EndSlide(), the fast-fall and the
+	 * landing transition, so a replayed move that lost it would resolve a ledge blip differently from
+	 * the original and put the client and the server on different velocity models — which is the
+	 * rubber-band itself, not a symptom of it.
 	 */
 	float SavedGroundGraceRemaining;
-	float SavedMantleTimeRemaining;
-	float SavedMantleTotalTime;
-	FVector SavedMantleTargetLocation;
-	float SavedMantleUpTargetZ;
-	float SavedMantleEntrySpeed;
-	float SavedMantleCooldownRemaining;
 
 	/**
 	 * The wall jump (spec v8 §7). Same argument as the mantle's block above: a correction that landed
