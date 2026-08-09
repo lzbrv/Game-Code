@@ -135,6 +135,19 @@ public:
 	 * @param Delta        arrow-key steps: -1 is one press of left.
 	 */
 	void DebugNudge(int32 RowsFromTop, int32 Delta);
+
+	/**
+	 * Screen rect of the row whose label is exactly @p Label, as of the last draw.
+	 *
+	 * Public only so ATraceMenuHUD's click harness (spec v15 §4) can park a real cursor on a real
+	 * row and then click it through the real input pipeline. Returning the rect rather than a row
+	 * index is deliberate: the thing being measured is the MOUSE path, and a harness that reached in
+	 * by index would prove nothing about hit testing.
+	 *
+	 * @return false when the page has not been drawn yet (every rect is still invalid) or no row on
+	 *         the current page carries that label.
+	 */
+	bool DebugGetRowRect(const TCHAR* Label, FBox2D& OutRect) const;
 #endif
 
 private:
@@ -451,6 +464,19 @@ private:
 	FVector2D CursorPos = FVector2D::ZeroVector;
 	bool bHasCursor = false;
 	bool bMouseWasDown = false;
+
+	/**
+	 * Where the pointer was on the previous poll, so hover can tell "the player moved onto this row"
+	 * from "the pointer happens to be resting there".
+	 *
+	 * Without this, PollMouse sets Selected = HoverRow EVERY frame, and it runs after PollNavigation
+	 * — so an arrow key moved the selection and the pointer immediately dragged it back, meaning the
+	 * keyboard did nothing at all whenever the cursor happened to sit over a row. Measured three
+	 * times through the real viewport input path, and it is also what made the -TraceAutoSettings
+	 * script land on the wrong rows depending on viewport size.
+	 */
+	FVector2D LastHoverCursorPos = FVector2D::ZeroVector;
+	bool bHasHoverCursorPos = false;
 
 	/** Row armed by the current mouse-down, or INDEX_NONE. Activation happens on release. */
 	int32 PressedRow = INDEX_NONE;

@@ -3380,10 +3380,12 @@ float UTraceCharacterMovementComponent::GetMaxSpeed() const
 	// TWO SEPARATE MULTIPLIERS, on purpose:
 	//
 	//   GetMoveSpeedMultiplierFor  asks the pawn's OWN character about its own passive. It is the
-	//                              right question for a buff and the WRONG one for a debuff — spec
-	//                              §3 makes bots characterless, and a poisoned bot has no ability set
-	//                              to ask, so a debuff routed through that hook would silently not
-	//                              apply to more than half the pawns in a bot match.
+	//                              right question for a buff and the WRONG one for a debuff: a
+	//                              poisoned pawn need not have a character at all (mode A, the
+	//                              characters toggle, a roster that could not serve them) and then
+	//                              has no ability set to ask, so a debuff routed through that hook
+	//                              would silently not apply. This used to cite spec §3's "bots are
+	//                              characterless"; spec v15 §2 reversed that rule, not this argument.
 	//   TraceAbilityDebuff::       asks what OTHER players' abilities have done TO this pawn. One
 	//   GetMoveSpeedMultiplier     aggregator, and every provider is a line inside it.
 	//

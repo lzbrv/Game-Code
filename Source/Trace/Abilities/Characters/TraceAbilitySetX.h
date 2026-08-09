@@ -62,13 +62,18 @@
 // ===================================================================================================
 //
 // It does NOT override UTraceCharacterAbilitySet::GetIncomingDamageMultiplier(). That hook looks like
-// the natural home for "+25% incoming" and it is the wrong one, for a reason that is not a matter of
-// taste: the hook is only consulted when the TARGET has an ability set, and spec §3 says "Bots remain
-// characterless". A bee that stung a bot would mark nothing at all. Worse, the ability damage path
-// (UTraceAbilityComponent::ModifyDamageThroughPassives) runs that hook and THEN calls
-// UTraceHealthComponent::ApplyDamage, so implementing it in both places would amplify ability damage
-// twice — 1.5625x instead of 1.25x. Leaving the hook at its 1.0 default is what makes the health
-// component the single site, and it is load-bearing.
+// the natural home for "+25% incoming" and it is the wrong one, and THE DECIDING REASON IS THE DOUBLE
+// AMPLIFICATION: the ability damage path (UTraceAbilityComponent::ModifyDamageThroughPassives) runs
+// that hook and THEN calls UTraceHealthComponent::ApplyDamage, so implementing it in both places
+// would amplify ability damage twice — 1.5625x instead of 1.25x. Leaving the hook at its 1.0 default
+// is what makes the health component the single site, and it is load-bearing.
+//
+// The secondary reason still stands but no longer reads the way it used to. The hook is consulted
+// only when the TARGET has an ability set, and this comment used to justify that with spec v14 §3's
+// "Bots remain characterless" — a rule spec v15 §2 reversed, so "a bee that stung a bot would mark
+// nothing" is simply false now. What is still true is that a stung player may hold no character at
+// all (mode A, the characters toggle, or a full team roster that could not serve them), and a mark
+// that only worked on characters would be a mark that quietly stops working in mode A.
 
 #pragma once
 
@@ -124,7 +129,9 @@ namespace TraceXBees
  *                         HUD and the swarm read, and because a future "loaded but empty" state
  *                         would need them to differ.
  *   EffectEndMatchTime    unused. X's only timer is the per-VICTIM mark, which lives on the victim's
- *                         health component precisely because the victim may be a characterless bot.
+ *                         health component precisely because the victim may hold no character at all
+ *                         (mode A, the characters toggle, an unservable roster) and so may have no
+ *                         ability set to store it on. See the double-amplification note at the top.
  */
 UCLASS()
 class TRACE_API UTraceAbilitySetX : public UTraceCharacterAbilitySet

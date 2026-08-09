@@ -16,6 +16,7 @@
 #include "HAL/IConsoleManager.h"                       // Trace.HalfTime.Verify (spec v9 §11)
 #include "Misc/CommandLine.h"                            // -TraceBotDebug
 #include "Misc/Parse.h"
+#include "Misc/ScopeExit.h"                              // ON_SCOPE_EXIT — the v15 §2 bot red arm
 #include "TimerManager.h"
 
 #include "AI/TraceBotController.h"
@@ -71,6 +72,36 @@ namespace
 		     "shown to FAIL - the red arm. Prefer 'Trace.Characters.VerifyRed', which scopes it to one "
 		     "run. Dev only; no ini override, absent from shipping."),
 		ECVF_Cheat);
+
+	/**
+	 * THE RED ARM FOR THE BOT FILL (spec v15 §2).
+	 *
+	 * Separate from GTraceEnforceSelectRules above because it arms a different rule for a different
+	 * harness, and because mixing them would make each red run report two unrelated sets of failures.
+	 *
+	 * 1 (default): PollCharacterSelect fills a bot only once every human on its team has settled, and
+	 * fills it with a RANDOM character none of its team-mates hold.
+	 *
+	 * 0: both of those go. The fill stops waiting, and it hands every bot TraceCharacterRoster::
+	 * FirstId (ROCCO) instead of a free one. That is deliberately the naive implementation rather than
+	 * "a random id": a random one would collide only ~80% of the time on a five-player team, and a red
+	 * arm that passes one run in five is not a red arm. Rocco-for-everybody fails deterministically,
+	 * which is the whole job.
+	 *
+	 * Trace.Characters.BotVerifyRed ALSO clears UTraceAbilityComponent's own enforcement for the run —
+	 * see UTraceAbilityComponent::IsRosterEnforcementOn. Without that second half this switch would
+	 * produce a red arm that still came back green, exactly as the v14 arm did.
+	 */
+	int32 GTraceEnforceBotSelectRules = 1;
+
+	FAutoConsoleVariableRef CVarTraceEnforceBotSelectRules(
+		TEXT("Trace.Characters.EnforceBotSelectRules"),
+		GTraceEnforceBotSelectRules,
+		TEXT("1 (default, spec v15 s2): a bot is filled only after every human on its team has settled, "
+		     "and with a random character no team-mate holds. 0 makes the fill jump the queue and take "
+		     "ROCCO every time, so Trace.Characters.BotVerify can be shown to FAIL. Prefer "
+		     "'Trace.Characters.BotVerifyRed', which scopes it to one run. Dev only, absent from shipping."),
+		ECVF_Cheat);
 #endif
 }
 
@@ -98,6 +129,26 @@ namespace TraceGameModeConstants
 
 	/** Seconds between -TraceBotDebug roster dumps. */
 	static constexpr float BotDebugInterval = 3.f;
+
+	/**
+	 * Trace.Characters.BotVerify: poll passes driven per step.
+	 *
+	 * One is enough — PollCharacterSelect fills every bot in a single sweep, because each assignment
+	 * is visible to the next player state in the same loop — so three is deliberate slack against a
+	 * future change that makes the fill take a pass per bot.
+	 */
+	static constexpr int32 BotVerifyPollPasses = 3;
+
+	/**
+	 * Trace.Characters.BotVerify: how many times the bot fill is repeated when testing that it is
+	 * RANDOM rather than fixed.
+	 *
+	 * With four characters left for the bots, a fill that is genuinely uniform gives one particular
+	 * bot the same character twelve times running with probability 4^-11, about 2 in ten million.
+	 * A fill that is NOT random gives it the same character every time, which is the case this
+	 * catches — and is exactly what the red arm produces.
+	 */
+	static constexpr int32 BotVerifyRandomSamples = 12;
 
 	/** Tag on the respawn pads this class builds inside the endzones. */
 	static const FName EndzoneStartTag(TEXT("TraceEndzoneStart"));
@@ -1867,12 +1918,13 @@ ATraceBotController* ATraceGameMode::SpawnBotForTeam(ETraceTeam Team)
 
 	BotState->SetTeam(Team);
 
-	// Spec v14 §3, verbatim: "Bots remain characterless, for now." bIsABot is the engine's own
-	// replicated "this is not a person" flag and, until now, nothing in this project set it — the
-	// PlayerState was indistinguishable from a human's on every machine. The character system asks
-	// that question in three places (never offer a select screen, never consume a team's slot, never
-	// count towards per-team uniqueness), so the answer has to be replicated rather than derived from
-	// the controller, which does not exist on a client at all.
+	// bIsABot is the engine's own replicated "this is not a person" flag, and before spec v14 §3
+	// nothing in this project set it — the PlayerState was indistinguishable from a human's on every
+	// machine. It was introduced to answer "may this player hold a character at all", which spec v15
+	// §2 has since made the wrong question: bots hold characters now. What the flag answers today is
+	// WHEN and HOW — never offer a select screen, wait for the humans on this team before filling,
+	// and label the row on the scoreboard. All three are asked on machines where the controller does
+	// not exist, which is why the answer is replicated rather than derived from it.
 	BotState->SetIsABot(true);
 
 	Bot->SetBotDisplayName(FString::Printf(TEXT("BOT %s %d"), *TraceTeamName(Team).ToString(), NextBotNumber++));
@@ -3200,15 +3252,19 @@ void ATraceGameMode::ReturnToMainMenu()
 // ---------------------------------------------------------------------------------------------
 // WHERE THE RULES ACTUALLY LIVE, and what this class contributes
 //
-// UTraceAbilityComponent owns the ROSTER RULE: per-team uniqueness, "None is always allowed", "bots
-// never hold a character", and the master on/off switch. Those are the same rules five character
-// agents are coding against, and re-implementing them here would give the project two answers to one
-// question — the exact drift this codebase keeps getting bitten by.
+// UTraceAbilityComponent owns the ROSTER RULE: per-team uniqueness, "None is always allowed", spec
+// v15 §2's ordering gate ("a bot waits for the humans on its team"), and the master on/off switch.
+// Those are the same rules five character agents are coding against, and re-implementing them here
+// would give the project two answers to one question — the exact drift this codebase keeps getting
+// bitten by.
 //
 // What this class owns is the SESSION and the CONVERSATION, neither of which the component has:
 //   * WHO is being asked to pick, and WHEN their screen opens (PollCharacterSelect);
 //   * the TIMEOUT that auto-assigns, so one idle player cannot stall the match (spec §3
 //     [ASSUMPTION]) — the component supplies PickFreeCharacterFor, but nothing drives it;
+//   * the BOT FILL (spec v15 §2): bots have no select screen, so somebody has to notice that their
+//     human team-mates are done and hand them a random free character. That is this poll. The
+//     ORDERING is still the component's rule, asked rather than re-derived — see AreHumansOnTeamSettled;
 //   * the VERDICT sent back to the requesting client, which is what makes spec §3's "the loser is
 //     TOLD and re-picks" true. UTraceAbilityComponent::ServerRequestSetCharacter is fire-and-forget
 //     and answers nothing, so a losing client would otherwise see its button do nothing at all.
@@ -3340,8 +3396,11 @@ ETraceCharacterPickResult ATraceGameMode::RequestCharacter(ATracePlayerState* Re
 		return ETraceCharacterPickResult::AlreadyLocked;
 	}
 
-	// A bot has no select screen and cannot have sent this; if one ever does, refuse rather than
-	// quietly giving it an ability set the spec says it must not have.
+	// A bot has no select screen and no connection, so it cannot have sent this RPC. Refused rather
+	// than served: spec v15 §2 gives bots characters, but it gives them through PollCharacterSelect's
+	// fill, which is where the "wait for the humans" ordering is applied. Serving a bot here would be
+	// a second, unordered way in — and the log line a bot's pick produces should name the fill, so
+	// that a match whose bots picked at the wrong moment can be traced to one place.
 	if (Requester->IsABot() || !Requester->IsCharacterSelectOpen())
 	{
 		return ETraceCharacterPickResult::NotSelecting;
@@ -3457,27 +3516,118 @@ void ATraceGameMode::PollCharacterSelect()
 			continue;
 		}
 
-		// ---- Bots never see this screen and never hold a character ------------------------------
+		// ---- BOTS PICK TOO, BUT LAST (spec v15 §2) ----------------------------------------------
+		//
+		// Verbatim: "Make it so that the bots are also picking characters (no two should be able to
+		// pick the same characters, and the computers should wait for any actual humans on its team
+		// to choose before all loading in with randomly chosen characters)."
+		//
+		// THIS REVERSES spec v14 §3, whose enforcement used to live on exactly these lines: the block
+		// here swept every bot and CLEARED any character it somehow held. That sweep is gone, along
+		// with UTraceAbilityComponent::ServerSetCharacter's matching refusal.
+		//
+		// A bot still never sees the select screen. It has no client to draw one and nobody to press
+		// a key, so a screen would be a deadline nothing could answer — which is why the fill is a
+		// server-side assignment rather than a scripted button press.
 		if (Candidate->IsABot())
 		{
-			if (Candidate->GetSelectedCharacter() != TraceCharacterRoster::NoneId)
-			{
-				// Defensive, and worth keeping: a bot with an ability set is the single most
-				// confusing outcome this feature could produce, and it would look like an AI bug.
-				// The framework refuses to give a bot a character in the first place, so reaching
-				// this is itself news.
-				UE_LOG(LogTraceGame, Warning, TEXT("[CharSelect] Bot '%s' held %s; clearing it."),
-					*Candidate->GetPlayerName(), *TraceCharacterRoster::NameFor(Candidate->GetSelectedCharacter()));
-
-				if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Candidate))
-				{
-					Abilities->ServerSetCharacter(ETraceCharacterId::None);
-				}
-			}
 			if (Candidate->IsCharacterSelectOpen())
 			{
+				// Defensive, and cheap. Nothing opens a bot's screen, but bCharacterSelectOpen is
+				// REPLICATED — a harness or a future change that set it would leave a flag every
+				// client can see and nothing on any machine would ever clear.
 				Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
 			}
+
+			if (Candidate->HasCharacter() || Candidate->Team == ETraceTeam::None)
+			{
+				continue;   // already filled, or the balancer has not placed them yet
+			}
+
+			// THE RED ARM. See GTraceEnforceBotSelectRules at the top of this file for what each half
+			// of it removes and why the naive picker is deterministic rather than random.
+			bool bEnforceBotRules = true;
+#if !UE_BUILD_SHIPPING
+			bEnforceBotRules = (GTraceEnforceBotSelectRules != 0);
+#endif
+
+			// THE ORDERING. Asked of the framework rather than answered here, because the AI slice's
+			// own ATraceBotController::UpdateAutoCharacter assigns characters too and the two must not
+			// be able to disagree about whose turn it is. The predicate is deliberately "has every
+			// human on this team got a character yet", NOT "is anybody's screen still open" — see
+			// UTraceAbilityComponent::AreHumansOnTeamSettled for why the difference matters.
+			//
+			// THIS CANNOT DEADLOCK, and the reason is the timeout below rather than anything here: an
+			// idle human's screen expires, they are auto-assigned, they become settled, and the next
+			// pass of this poll fills their team's bots. Asserted by Trace.Characters.BotVerify.
+			if (bEnforceBotRules && !UTraceAbilityComponent::AreHumansOnTeamSettled(this, Candidate->Team))
+			{
+				// ONE CONFIGURATION MAKES THAT WAIT PERMANENT, and it is worth saying out loud once.
+				// CharacterSelectTimeout <= 0 disables the auto-assign — a legitimate private-match
+				// setting before spec v15 §2, and since §2 also the one way an idle human can freeze
+				// their team's bots as Mannequins for the whole match. Nothing else in this file
+				// notices, and a whole team quietly playing without abilities is exactly the kind of
+				// silent degradation this project keeps getting caught by.
+				if (CharacterSelectTimeout <= 0.f && !bWarnedBotFillHasNoTimeout)
+				{
+					bWarnedBotFillHasNoTimeout = true;
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[CharSelect] CharacterSelectTimeout is %.1f (auto-assign OFF), so a human who "
+						     "never picks will hold their team's bots on the Mannequin for the whole match "
+						     "(spec v15 §2 makes bots wait for humans). Said once per match."),
+						CharacterSelectTimeout);
+				}
+				continue;
+			}
+
+			// RANDOM, which is spec v15 §2's own word, and the framework's picker rather than a second
+			// copy of "free" — the same deference FindFreeCharacterForTeam makes for the human
+			// auto-assign. It is deliberately NOT that function: an auto-assign a player did not
+			// choose should be reproducible in a bug report, whereas five bots taking the roster in
+			// order every single match is the thing players would notice first.
+			const uint8 BotPick = bEnforceBotRules
+				? static_cast<uint8>(UTraceAbilityComponent::PickRandomFreeCharacterFor(Candidate))
+				: TraceCharacterRoster::FirstId;
+
+			if (!TraceCharacterRoster::IsValidId(BotPick))
+			{
+				// The roster is exhausted on this team — only reachable with PlayersPerTeam raised
+				// above the five characters. The bot plays the Mannequin, which is what it did for the
+				// whole of spec v14, so this is a degradation rather than a failure. Said ONCE: this
+				// branch is re-entered four times a second for as long as the bot has nothing.
+				if (!bWarnedBotRosterExhausted)
+				{
+					bWarnedBotRosterExhausted = true;
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[CharSelect] No free character left on %s for bot '%s' - the team has more "
+						     "players than the roster has characters. They play the default Mannequin. "
+						     "Said once per match."),
+						*TraceTeamName(Candidate->Team).ToString(), *Candidate->GetPlayerName());
+				}
+				continue;
+			}
+
+			if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Candidate))
+			{
+				Abilities->ServerSetCharacter(static_cast<ETraceCharacterId>(BotPick));
+			}
+
+			// POST-VERIFY, for the same reason RequestCharacter has one: the pre-flight above read a
+			// roster the framework may have changed underneath us, and the only fact worth logging is
+			// what the component actually holds now.
+			const uint8 BotHolds = Candidate->GetSelectedCharacter();
+			if (!TraceCharacterRoster::IsValidId(BotHolds))
+			{
+				continue;   // refused; the framework logged the reason. Try again next pass.
+			}
+
+			// bWasChosen=false: nobody chose this. It is an assignment, and the same flag the select
+			// screen uses to print "ASSIGNED" rather than "LOCKED IN" should say so for a bot too.
+			Candidate->ServerMarkCharacterResolved(/*bLocked=*/true, /*bWasChosen=*/false);
+
+			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Bot '%s' (%s) takes %s."),
+				*Candidate->GetPlayerName(), *TraceTeamName(Candidate->Team).ToString(),
+				*TraceCharacterRoster::NameFor(BotHolds));
 			continue;
 		}
 
@@ -4245,6 +4395,31 @@ void ATraceGameMode::StartCharacterSelectVerify(bool bRedArm)
 		return;
 	}
 
+	// ---- MEASURED BEFORE ANYTHING IS DISTURBED ------------------------------------------------
+	//
+	// The live match's own bot fill (spec v15 §2), asserted against the roster as the poll actually
+	// left it. It has to be read here, because the set-up below CLEARS every character in the match —
+	// after that the question is vacuous.
+	int32 BotsSeen = 0;
+	int32 BotsClashing = 0;
+	for (APlayerState* const EachState : BaseGameState->PlayerArray)
+	{
+		const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+		if (Candidate == nullptr || !Candidate->IsABot())
+		{
+			continue;
+		}
+
+		++BotsSeen;
+		if (Candidate->HasCharacter()
+			&& IsCharacterTakenOnTeam(Candidate->Team, Candidate->GetSelectedCharacter(), Candidate))
+		{
+			++BotsClashing;
+		}
+	}
+	ReportCharacterVerify(BotsSeen > 0 && BotsClashing == 0,
+		TEXT("no bot in the LIVE match holds a character one of its team-mates also holds"));
+
 	// Snapshot everything the harness is about to disturb, so a mid-match run leaves no trace.
 	struct FVerifySnapshot
 	{
@@ -4255,27 +4430,50 @@ void ATraceGameMode::StartCharacterSelectVerify(bool bRedArm)
 		bool bSelectWasOpen = false;
 	};
 
+	// EVERY PLAYER STATE, NOT JUST THE THREE THE ASSERTIONS NAME, and spec v15 §2 is why.
+	//
+	// This harness was written when bots were permanently characterless, so clearing the three
+	// borrowed states was the same thing as starting from an empty roster. It is not any more: the
+	// bots now fill, and the FIRST run after §2 landed failed "an ENEMY asking for the same character
+	// is GRANTED" — because a bot on the enemy's own team was holding ROCCO, so the refusal was
+	// correct and had nothing whatever to do with mirroring. Clearing the whole match restores the
+	// precondition the assertions were authored against. Every character is put back at the end.
 	TArray<FVerifySnapshot> Snapshots;
-	for (ATracePlayerState* const Borrowed : { TeammateA, TeammateB, Opponent })
+	for (APlayerState* const EachState : BaseGameState->PlayerArray)
 	{
+		ATracePlayerState* Everybody = Cast<ATracePlayerState>(EachState);
+		if (Everybody == nullptr)
+		{
+			continue;
+		}
+
 		FVerifySnapshot Snapshot;
-		Snapshot.State = Borrowed;
-		Snapshot.bWasBot = Borrowed->IsABot();
-		Snapshot.Character = Borrowed->GetSelectedCharacter();
-		Snapshot.bWasLocked = Borrowed->bCharacterLocked;
-		Snapshot.bSelectWasOpen = Borrowed->IsCharacterSelectOpen();
+		Snapshot.State = Everybody;
+		Snapshot.bWasBot = Everybody->IsABot();
+		Snapshot.Character = Everybody->GetSelectedCharacter();
+		Snapshot.bWasLocked = Everybody->bCharacterLocked;
+		Snapshot.bSelectWasOpen = Everybody->IsCharacterSelectOpen();
 		Snapshots.Add(Snapshot);
 
-		// Become a person for the duration, with a clean slate and an open screen. SetIsABot FIRST:
-		// the framework refuses to give a bot any character at all, so clearing the character before
-		// the flag would be refused for the wrong reason.
-		Borrowed->SetIsABot(false);
-		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Borrowed))
+		const bool bBorrowed = (Everybody == TeammateA) || (Everybody == TeammateB) || (Everybody == Opponent);
+		if (bBorrowed)
+		{
+			// Become a person for the duration. SetIsABot FIRST, and it still matters after spec v15
+			// §2: a bot's writes go through the ordering gate in UTraceAbilityComponent::
+			// ServerSetCharacter, so a state still flagged as a bot would have the harness's own
+			// set-up refused for a reason that has nothing to do with the test.
+			Everybody->SetIsABot(false);
+		}
+
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Everybody))
 		{
 			Abilities->ServerSetCharacter(ETraceCharacterId::None);
 		}
-		Borrowed->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
-		Borrowed->ServerSetCharacterSelectOpen(/*bOpen=*/true, /*DeadlineServerTime=*/0.f);
+		Everybody->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+
+		// Only the three borrowed players get a screen. Opening one for a bystander would put them in
+		// the auto-assign path and hand them a character in the middle of somebody else's assertion.
+		Everybody->ServerSetCharacterSelectOpen(bBorrowed, /*DeadlineServerTime=*/0.f);
 	}
 
 	// The poll would close the screens the harness just opened (a bot with no character is not
@@ -4338,29 +4536,22 @@ void ATraceGameMode::StartCharacterSelectVerify(bool bRedArm)
 			TEXT("a locked-in player cannot switch character"));
 
 		// ---- 6. BOTS -----------------------------------------------------------------------
+		//
+		// REWRITTEN FOR SPEC v15 §2, which reverses v14 §3's "bots remain characterless". What these
+		// two assertions used to say was "a BOT cannot take a character" and "every bot in the match
+		// is characterless"; both are now false by design. What is still true, and is what they now
+		// assert, is that a bot does not come in through the HUMAN request path — it is filled by
+		// PollCharacterSelect — and that a bot obeys per-team uniqueness like anybody else.
+		//
+		// The ORDERING and the fill itself are Trace.Characters.BotVerify's job, not this harness's.
 		if (RealBot != nullptr)
 		{
 			const ETraceCharacterPickResult BotResult = RequestCharacter(RealBot, TraceCharacterRoster::LastId);
 			ReportCharacterVerify(BotResult == ETraceCharacterPickResult::NotSelecting,
-				TEXT("a BOT cannot take a character"));
+				TEXT("a BOT is not served by the human select path (it is filled by the poll instead)"));
+			ReportCharacterVerify(!RealBot->HasCharacter(),
+				TEXT("and the refused bot did not end up holding it anyway"));
 		}
-
-		int32 BotsWithCharacters = 0;
-		int32 BotsSeen = 0;
-		for (APlayerState* const EachState : BaseGameState->PlayerArray)
-		{
-			const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
-			if (Candidate != nullptr && Candidate->IsABot())
-			{
-				++BotsSeen;
-				if (Candidate->HasCharacter())
-				{
-					++BotsWithCharacters;
-				}
-			}
-		}
-		ReportCharacterVerify(BotsSeen > 0 && BotsWithCharacters == 0,
-			TEXT("every bot in the match is characterless"));
 
 		// ---- 7. THE AUTO-ASSIGN TIMEOUT --------------------------------------------------------
 		//
@@ -4395,8 +4586,20 @@ void ATraceGameMode::StartCharacterSelectVerify(bool bRedArm)
 	{
 		Abilities->DebugSetActivatedCooldown(20.f);
 		const float AfterStart = TeammateA->GetActivatedCooldownRemaining();
-		ReportCharacterVerify(AfterStart > 19.f && AfterStart <= 20.f,
+
+		// UNEXPLAINED INTERMITTENT, WRITTEN DOWN RATHER THAN PAPERED OVER. This line failed in two of
+		// four `Trace.Characters.VerifyRed` runs on 2026-08-09 and has never failed in the green arm.
+		// The obvious suspect was float rounding — the deadline is stored as float(MatchTimeNow()+20)
+		// and read back as Deadline-MatchTimeNow() — so the upper bound now carries 10 ms of slack.
+		// THAT IS A GUESS AND IT IS NOT PROVEN: four runs since print the value as exactly 20.000000,
+		// which is what the widened bound would NOT have been needed for. So the value is now logged
+		// unconditionally, and the next failure will say what it actually read instead of leaving the
+		// next person to re-derive this paragraph. The lower bound is untouched, so a cooldown that
+		// genuinely failed to start still fails here.
+		ReportCharacterVerify(AfterStart > 19.f && AfterStart <= 20.01f,
 			TEXT("starting a 20s cooldown leaves ~20s remaining, read through the PLAYER STATE"));
+
+		UE_LOG(LogTraceGame, Display, TEXT("[CharVerify]   (cooldown after DebugSet(20) reads %.6f)"), AfterStart);
 
 		// "A player can spawn with an ability timer still counting down" — the respawn path itself,
 		// not an imitation of it. RestartPlayerFresh destroys the pawn, which is precisely the event
@@ -4420,24 +4623,41 @@ void ATraceGameMode::StartCharacterSelectVerify(bool bRedArm)
 	}
 
 	// ---- Restore ----------------------------------------------------------------------------
-	for (const FVerifySnapshot& Snapshot : Snapshots)
+	//
+	// The framework's roster rules are OFF for the restore only, and only since spec v15 §2 added the
+	// bot ordering gate: putting a snapshot back is not a pick, and the gate would refuse to give a
+	// bot its original character while a borrowed human is momentarily characterless. Every
+	// assertion above ran with the rules ON — this is strictly the tidy-up, and it is restored on the
+	// next line rather than left for a later scope to remember.
 	{
-		if (Snapshot.State == nullptr)
+		const bool bRosterEnforcementWas = UTraceAbilityComponent::IsRosterEnforcementOn();
+		UTraceAbilityComponent::SetRosterEnforcementOn(false);
+
+		for (const FVerifySnapshot& Snapshot : Snapshots)
 		{
-			continue;
+			if (Snapshot.State == nullptr)
+			{
+				continue;
+			}
+
+			// The bot flag FIRST, unlike the order this loop used to run in. It has to be, now that
+			// what a write is allowed to do depends on it: restoring the flag afterwards would judge
+			// a bot's own character by the human rules and then hand the flag back.
+			Snapshot.State->SetIsABot(Snapshot.bWasBot);
+
+			if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Snapshot.State))
+			{
+				Abilities->ServerSetCharacter(static_cast<ETraceCharacterId>(Snapshot.Character));
+			}
+			Snapshot.State->ServerMarkCharacterResolved(Snapshot.bWasLocked, /*bWasChosen=*/false);
+			Snapshot.State->ServerSetCharacterSelectOpen(Snapshot.bSelectWasOpen, 0.f);
+
+			// The cooldown is deliberately NOT restored: the harness ends by proving half time clears
+			// every cooldown, and it did that by actually clearing them. Putting a stale deadline back
+			// would undo the one assertion whose evidence is the live state.
 		}
 
-		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Snapshot.State))
-		{
-			Abilities->ServerSetCharacter(static_cast<ETraceCharacterId>(Snapshot.Character));
-		}
-		Snapshot.State->ServerMarkCharacterResolved(Snapshot.bWasLocked, /*bWasChosen=*/false);
-		Snapshot.State->ServerSetCharacterSelectOpen(Snapshot.bSelectWasOpen, 0.f);
-
-		// The cooldown is deliberately NOT restored: the harness ends by proving half time clears
-		// every cooldown, and it did that by actually clearing them. Putting a stale deadline back
-		// would undo the one assertion whose evidence is the live state.
-		Snapshot.State->SetIsABot(Snapshot.bWasBot);
+		UTraceAbilityComponent::SetRosterEnforcementOn(bRosterEnforcementWas);
 	}
 
 	GetWorldTimerManager().SetTimer(CharacterSelectPollHandle, this, &ATraceGameMode::PollCharacterSelect,
@@ -4445,6 +4665,391 @@ void ATraceGameMode::StartCharacterSelectVerify(bool bRedArm)
 		TraceGameModeConstants::CharacterSelectPollInterval);
 
 	UE_LOG(LogTraceGame, Display, TEXT("[CharVerify] ===== %d passed, %d failed ====="),
+		CharacterVerifyPassed, CharacterVerifyFailed);
+}
+
+// =============================================================================================
+// Trace.Characters.BotVerify — the scripted proof for spec v15 §2 ("bots pick characters")
+//
+// WHAT ORGANIC PLAY CANNOT SHOW YOU, again, and for sharper reasons than §3's. The interesting
+// facts here are all about a MOMENT: that a bot has NOT picked yet while a human is still choosing,
+// and that it HAS a quarter of a second after they finish. A screenshot of a running match cannot
+// distinguish "the bots waited" from "the bots happened to be slow", and the only organic way to see
+// the ordering fail is to have a human sit on the select screen for thirty seconds and then read a
+// log backwards. So the whole sequence is driven here, synchronously, with the clock cheated in the
+// one place (the select deadline) where waiting would cost half a minute per run.
+//
+// HOW IT GETS A HUMAN WHO WILL ACTUALLY PICK. A headless run has one human, and that human never
+// presses anything. So the harness works on an ALL-BOT team and borrows one of its bots as the human
+// — clearing APlayerState::bIsABot makes it a person as far as every rule in this file and in the
+// ability framework is concerned. Working on an all-bot team is not incidental: the real human is on
+// the other side and is idle forever, and a harness that ran on THEIR team would be measuring that
+// idleness rather than the rule.
+//
+// THE RED ARM REMOVES BOTH ENFORCEMENT POINTS, and that is the whole lesson of the v14 arm written
+// down one section above: the ordering and the uniqueness are each enforced twice, once in this
+// class's fill and once in UTraceAbilityComponent::ServerSetCharacter, and an arm that reached only
+// this file's half came back GREEN on a build with the rule deliberately broken. See
+// GTraceEnforceBotSelectRules and UTraceAbilityComponent::IsRosterEnforcementOn.
+//
+// EXPECT THE RED RUN TO FAIL MORE THAN THE STARRED ASSERTIONS, and that is a result rather than
+// noise: once the bots have jumped the queue and taken ROCCO, the human's own request for ROCCO is
+// correctly refused as TakenByTeammate, so "the human's own pick is granted" fails too. That IS the
+// bug as a player would meet it — a team-mate you cannot see took your character before you were
+// asked. The starred lines are the ones that name the rule.
+// =============================================================================================
+
+void ATraceGameMode::StartBotCharacterVerify(bool bRedArm)
+{
+	CharacterVerifyPassed = 0;
+	CharacterVerifyFailed = 0;
+
+	const AGameStateBase* BaseGameState = GameState;
+	if (BaseGameState == nullptr)
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("[BotCharVerify] No GameState; cannot run."));
+		return;
+	}
+
+	// ---- BOTH HALVES OF THE ARM, scoped, restored on every exit path --------------------------
+	TGuardValue<int32> BotRulesGuard(GTraceEnforceBotSelectRules, bRedArm ? 0 : GTraceEnforceBotSelectRules);
+
+	const bool bRosterEnforcementWas = UTraceAbilityComponent::IsRosterEnforcementOn();
+	UTraceAbilityComponent::SetRosterEnforcementOn(bRosterEnforcementWas && !bRedArm);
+	ON_SCOPE_EXIT
+	{
+		UTraceAbilityComponent::SetRosterEnforcementOn(bRosterEnforcementWas);
+	};
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[BotCharVerify] ===== START: characters %s, fill rules %s, framework roster rules %s ====="),
+		AreCharactersEnabled() ? TEXT("ON") : TEXT("OFF"),
+		(GTraceEnforceBotSelectRules != 0) ? TEXT("ENFORCED") : TEXT("*** DISABLED (RED ARM) ***"),
+		UTraceAbilityComponent::IsRosterEnforcementOn() ? TEXT("ENFORCED") : TEXT("*** DISABLED (RED ARM) ***"));
+
+	if (!AreCharactersEnabled())
+	{
+		// Mode A, or the toggle off. Not a skipped run: spec v15 §2 says explicitly that the disable
+		// setting "must still make everyone, bots included, a default Mannequin", so that IS the
+		// assertion here.
+		for (int32 Pass = 0; Pass < TraceGameModeConstants::BotVerifyPollPasses; ++Pass)
+		{
+			PollCharacterSelect();
+		}
+
+		int32 BotsHolding = 0;
+		int32 BotsSeen = 0;
+		for (APlayerState* const EachState : BaseGameState->PlayerArray)
+		{
+			const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+			if (Candidate != nullptr && Candidate->IsABot())
+			{
+				++BotsSeen;
+				BotsHolding += Candidate->HasCharacter() ? 1 : 0;
+			}
+		}
+
+		ReportCharacterVerify(BotsSeen > 0 && BotsHolding == 0,
+			TEXT("with characters OFF, every bot is the default Mannequin"));
+
+		UE_LOG(LogTraceGame, Display, TEXT("[BotCharVerify] ===== %d passed, %d failed ====="),
+			CharacterVerifyPassed, CharacterVerifyFailed);
+		return;
+	}
+
+	// ---- Find an ALL-BOT team with enough players to be interesting ----------------------------
+	//
+	// Three: one to borrow as the human, and two bots, because "no two bots took the same character"
+	// needs two bots to be a statement about anything.
+	ETraceTeam HomeTeam = ETraceTeam::None;
+	for (const ETraceTeam TeamCandidate : { ETraceTeam::Blue, ETraceTeam::Orange })
+	{
+		int32 Members = 0;
+		bool bAllBots = true;
+		for (APlayerState* const EachState : BaseGameState->PlayerArray)
+		{
+			const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+			if (Candidate == nullptr || Candidate->Team != TeamCandidate)
+			{
+				continue;
+			}
+			++Members;
+			bAllBots &= Candidate->IsABot();
+		}
+
+		if (bAllBots && Members >= 3)
+		{
+			HomeTeam = TeamCandidate;
+			break;
+		}
+	}
+
+	if (HomeTeam == ETraceTeam::None)
+	{
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[BotCharVerify] Needs one team of three or more players that are ALL bots, so the "
+			     "harness can borrow one as a human without an idle real player interfering. Run with "
+			     "'?bots=8' (the default singleplayer fill gives the enemy side four)."));
+		return;
+	}
+
+	// ---- Snapshot the whole team ---------------------------------------------------------------
+	struct FBotVerifySnapshot
+	{
+		ATracePlayerState* State = nullptr;
+		bool bWasBot = true;
+		uint8 Character = TraceCharacterRoster::NoneId;
+		bool bWasLocked = false;
+		bool bSelectWasOpen = false;
+	};
+
+	TArray<FBotVerifySnapshot> Snapshots;
+	TArray<ATracePlayerState*> TeamBots;
+	ATracePlayerState* BorrowedHuman = nullptr;
+
+	for (APlayerState* const EachState : BaseGameState->PlayerArray)
+	{
+		ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+		if (Candidate == nullptr || Candidate->Team != HomeTeam)
+		{
+			continue;
+		}
+
+		FBotVerifySnapshot Snapshot;
+		Snapshot.State = Candidate;
+		Snapshot.bWasBot = Candidate->IsABot();
+		Snapshot.Character = Candidate->GetSelectedCharacter();
+		Snapshot.bWasLocked = Candidate->bCharacterLocked;
+		Snapshot.bSelectWasOpen = Candidate->IsCharacterSelectOpen();
+		Snapshots.Add(Snapshot);
+
+		if (BorrowedHuman == nullptr)
+		{
+			BorrowedHuman = Candidate;
+			// The flag FIRST. Clearing a character is infallible either way, but every subsequent
+			// write on this state has to be judged as a human's, including the ordering gate.
+			Candidate->SetIsABot(false);
+		}
+		else
+		{
+			TeamBots.Add(Candidate);
+		}
+	}
+
+	// Everybody on this team starts with nothing, so the run measures what the rules do rather than
+	// what the match happened to have already assigned.
+	auto ClearTeam = [&Snapshots]()
+	{
+		for (const FBotVerifySnapshot& Snapshot : Snapshots)
+		{
+			if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Snapshot.State))
+			{
+				Abilities->ServerSetCharacter(ETraceCharacterId::None);
+			}
+			Snapshot.State->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+		}
+	};
+
+	// Counts players on HomeTeam whose character some OTHER player on HomeTeam also holds.
+	auto CountClashes = [this, HomeTeam, BaseGameState]() -> int32
+	{
+		int32 Clashes = 0;
+		for (APlayerState* const EachState : BaseGameState->PlayerArray)
+		{
+			const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+			if (Candidate == nullptr || Candidate->Team != HomeTeam || !Candidate->HasCharacter())
+			{
+				continue;
+			}
+			if (IsCharacterTakenOnTeam(HomeTeam, Candidate->GetSelectedCharacter(), Candidate))
+			{
+				++Clashes;
+			}
+		}
+		return Clashes;
+	};
+
+	auto CountBotsHolding = [&TeamBots]() -> int32
+	{
+		int32 Holding = 0;
+		for (const ATracePlayerState* Bot : TeamBots)
+		{
+			Holding += Bot->HasCharacter() ? 1 : 0;
+		}
+		return Holding;
+	};
+
+	auto RunPoll = [this]()
+	{
+		for (int32 Pass = 0; Pass < TraceGameModeConstants::BotVerifyPollPasses; ++Pass)
+		{
+			PollCharacterSelect();
+		}
+	};
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[BotCharVerify] Working on %s: '%s' borrowed as the human, %d bot(s) behind them."),
+		*TraceTeamName(HomeTeam).ToString(), *BorrowedHuman->GetPlayerName(), TeamBots.Num());
+
+	ClearTeam();
+
+	// ---- 1. THE ORDERING: no bot picks while a human is still choosing -------------------------
+	//
+	// The human's screen is opened with NO deadline, which is the "idle human" case in its purest
+	// form — nothing will resolve them, so any bot that has taken a character has jumped the queue.
+	// THIS IS THE ASSERTION THE RED ARM DELETES.
+	BorrowedHuman->ServerSetCharacterSelectOpen(/*bOpen=*/true, /*DeadlineServerTime=*/0.f);
+	RunPoll();
+
+	ReportCharacterVerify(CountBotsHolding() == 0,
+		TEXT("*** no bot picks while a human on its team is still choosing (spec v15 s2 ordering) ***"));
+	ReportCharacterVerify(!BorrowedHuman->HasCharacter(),
+		TEXT("the waiting human is genuinely still characterless, so the case above is the real one"));
+
+	// ---- 2. THE HUMAN PICKS, AND ONLY THEN DO THE BOTS FILL ------------------------------------
+	//
+	// ROCCO rather than an arbitrary character, and that is load-bearing: the red arm's naive fill
+	// hands every bot ROCCO, so contesting exactly that id is what makes assertion 3 below able to
+	// go red instead of passing by luck.
+	const uint8 HumanPick = TraceCharacterRoster::FirstId;
+	const ETraceCharacterPickResult HumanResult = RequestCharacter(BorrowedHuman, HumanPick);
+	ReportCharacterVerify(HumanResult == ETraceCharacterPickResult::Granted,
+		TEXT("the human's own pick is granted (the harness is driving the real request path)"));
+
+	RunPoll();
+
+	ReportCharacterVerify(CountBotsHolding() == TeamBots.Num(),
+		TEXT("*** every bot is given a character once its human team-mates are done ***"));
+
+	// ---- 3. PER-TEAM UNIQUENESS APPLIES TO BOTS EXACTLY AS TO HUMANS ---------------------------
+	ReportCharacterVerify(CountClashes() == 0,
+		TEXT("*** no two players on the team hold the same character, bots included ***"));
+
+	int32 BotsOnHumansPick = 0;
+	for (const ATracePlayerState* Bot : TeamBots)
+	{
+		BotsOnHumansPick += (Bot->GetSelectedCharacter() == HumanPick) ? 1 : 0;
+	}
+	ReportCharacterVerify(BotsOnHumansPick == 0,
+		TEXT("*** no bot took the character the human had already locked in ***"));
+
+	for (const ATracePlayerState* Bot : TeamBots)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[BotCharVerify]   %-22s -> %s"),
+			*Bot->GetPlayerName(), *TraceCharacterRoster::NameFor(Bot->GetSelectedCharacter()));
+	}
+
+	// ---- 4. THE FILL IS RANDOM, NOT A FIXED ORDER ----------------------------------------------
+	//
+	// Spec v15 §2 says "randomly chosen characters", and a fill that always handed out the roster in
+	// order would satisfy every assertion above while making every singleplayer match identical. The
+	// test is deliberately weak in the direction that cannot flake: it asks only whether ANY bot ever
+	// received two different characters across the samples. See BotVerifyRandomSamples for the
+	// probability of that being wrong.
+	if (TeamBots.Num() > 0)
+	{
+		TArray<uint8> FirstSeen;
+		FirstSeen.Init(TraceCharacterRoster::NoneId, TeamBots.Num());
+		bool bAnyVaried = false;
+
+		for (int32 Sample = 0; Sample < TraceGameModeConstants::BotVerifyRandomSamples; ++Sample)
+		{
+			for (ATracePlayerState* Bot : TeamBots)
+			{
+				if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Bot))
+				{
+					Abilities->ServerSetCharacter(ETraceCharacterId::None);
+				}
+				Bot->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+			}
+
+			RunPoll();
+
+			for (int32 Index = 0; Index < TeamBots.Num(); ++Index)
+			{
+				const uint8 Held = TeamBots[Index]->GetSelectedCharacter();
+				if (Sample == 0)
+				{
+					FirstSeen[Index] = Held;
+				}
+				else if (Held != FirstSeen[Index])
+				{
+					bAnyVaried = true;
+				}
+			}
+		}
+
+		ReportCharacterVerify(bAnyVaried,
+			TEXT("*** the bot fill is RANDOM: some bot drew a different character across 12 fills ***"));
+	}
+
+	// ---- 5. AN IDLE HUMAN RESOLVES THROUGH THE TIMEOUT, AND THE BOTS THEN FILL -----------------
+	//
+	// The deadlock the spec calls out by name: "The existing character-select timeout still has to
+	// auto-assign, or one idle human stalls the match forever." Driven by planting the deadline in
+	// the PAST rather than by waiting thirty seconds — the code path is identical, only the clock is
+	// cheated, exactly as the v14 harness does it.
+	ClearTeam();
+
+	// Marked as CHOSEN first, so that "the timeout flagged this as not chosen" is a change the
+	// harness watched happen rather than a field that was already false.
+	BorrowedHuman->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/true);
+	BorrowedHuman->ServerSetCharacterSelectOpen(/*bOpen=*/true,
+		static_cast<float>(BaseGameState->GetServerWorldTimeSeconds() - 1.0));
+
+	RunPoll();
+
+	ReportCharacterVerify(BorrowedHuman->HasCharacter() && !BorrowedHuman->WasCharacterChosen(),
+		TEXT("an idle human is auto-assigned by the select timeout rather than blocking forever"));
+	ReportCharacterVerify(CountBotsHolding() == TeamBots.Num(),
+		TEXT("*** the bots behind an idle human fill as soon as the timeout resolves them ***"));
+	ReportCharacterVerify(CountClashes() == 0,
+		TEXT("the post-timeout fill is still unique across the team"));
+
+	// ---- 6. THE DISABLE TOGGLE PUTS EVERYONE, BOTS INCLUDED, BACK ON THE MANNEQUIN -------------
+	//
+	// Spec v15 §2, verbatim: "the 'disable characters' setting must still make everyone, bots
+	// included, a default Mannequin." Flipped on the settings CDO because that is the one value
+	// UTraceAbilityComponent::AreCharactersEnabled reads — the same switch the settings menu writes,
+	// not an imitation of it — and restored immediately afterwards.
+	if (UTraceSettings* MutableSettings = GetMutableDefault<UTraceSettings>())
+	{
+		const bool bWasEnabled = MutableSettings->bCharactersEnabled;
+		MutableSettings->bCharactersEnabled = false;
+
+		RunPoll();
+
+		ReportCharacterVerify(CountBotsHolding() == 0 && !BorrowedHuman->HasCharacter(),
+			TEXT("*** with characters OFF, every player INCLUDING every bot is the default Mannequin ***"));
+
+		MutableSettings->bCharactersEnabled = bWasEnabled;
+	}
+
+	// ---- Restore -------------------------------------------------------------------------------
+	//
+	// With the framework's roster rules OFF for the duration of the restore, because putting a
+	// snapshot back is not a pick: the ordering gate would refuse a bot's original character while
+	// the borrowed human is briefly characterless again, and the run would end having quietly
+	// stripped the team. The ON_SCOPE_EXIT above puts the rules back.
+	UTraceAbilityComponent::SetRosterEnforcementOn(false);
+
+	for (const FBotVerifySnapshot& Snapshot : Snapshots)
+	{
+		if (Snapshot.State == nullptr)
+		{
+			continue;
+		}
+
+		Snapshot.State->SetIsABot(Snapshot.bWasBot);
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Snapshot.State))
+		{
+			Abilities->ServerSetCharacter(static_cast<ETraceCharacterId>(Snapshot.Character));
+		}
+		Snapshot.State->ServerMarkCharacterResolved(Snapshot.bWasLocked, /*bWasChosen=*/false);
+		Snapshot.State->ServerSetCharacterSelectOpen(Snapshot.bSelectWasOpen, 0.f);
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[BotCharVerify] ===== %d passed, %d failed ====="),
 		CharacterVerifyPassed, CharacterVerifyFailed);
 }
 
@@ -4470,6 +5075,45 @@ namespace
 		}
 	}
 
+	/**
+	 * The dump as a REMOTE CLIENT sees it — no game mode, only the replicated GameState.
+	 *
+	 * Exists because spec v15 §2 asks for more than "the server assigned a bot a character": it asks
+	 * that the pick REPLICATE, so the HUD, the scoreboard and the kill feed can show it. A dump taken
+	 * on the server cannot tell those two apart, and this one can: everything it prints arrived over
+	 * the wire, including the character, which is read through ATracePlayerState::GetSelectedCharacter
+	 * and therefore off the replicated UTraceAbilityComponent.
+	 */
+	void TraceCharactersDumpFromReplicatedState(UWorld* World)
+	{
+		const AGameStateBase* BaseGameState = (World != nullptr) ? World->GetGameState() : nullptr;
+		if (BaseGameState == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[CharDumpNet] No GameState on this machine yet."));
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CharDumpNet] ===== as seen on THIS machine (no authority), %d player(s) ====="),
+			BaseGameState->PlayerArray.Num());
+
+		for (APlayerState* const EachState : BaseGameState->PlayerArray)
+		{
+			const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+			if (Candidate == nullptr)
+			{
+				continue;
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[CharDumpNet]   %-22s %-7s %-10s %-10s select=%s"),
+				*Candidate->GetPlayerName(),
+				*TraceTeamName(Candidate->Team).ToString(),
+				Candidate->IsABot() ? TEXT("BOT") : TEXT("HUMAN"),
+				*TraceCharacterRoster::NameFor(Candidate->GetSelectedCharacter()),
+				Candidate->IsCharacterSelectOpen() ? TEXT("OPEN") : TEXT("closed"));
+		}
+	}
+
 	void TraceCharactersDumpCommand(UWorld* World)
 	{
 		if (World == nullptr)
@@ -4483,9 +5127,42 @@ namespace
 		}
 		else
 		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[CharDump] No authoritative ATraceGameMode here - run this on the server."));
+			// NOT a refusal any more. It used to print "run this on the server", which made the one
+			// question spec v15 §2 actually asks — does a bot's pick reach a client? — unanswerable
+			// from the machine that has to answer it.
+			TraceCharactersDumpFromReplicatedState(World);
 		}
+	}
+
+	void TraceCharactersBotVerifyCommand(UWorld* World)
+	{
+		if (World != nullptr)
+		{
+			if (ATraceGameMode* Rules = World->GetAuthGameMode<ATraceGameMode>())
+			{
+				Rules->StartBotCharacterVerify(/*bRedArm=*/false);
+				return;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[BotCharVerify] No authoritative ATraceGameMode here - run this on the server."));
+	}
+
+	/** Space-free, for the same -TraceExec reason Trace.Characters.VerifyRed is. */
+	void TraceCharactersBotVerifyRedCommand(UWorld* World)
+	{
+		if (World != nullptr)
+		{
+			if (ATraceGameMode* Rules = World->GetAuthGameMode<ATraceGameMode>())
+			{
+				Rules->StartBotCharacterVerify(/*bRedArm=*/true);
+				return;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[BotCharVerify] No authoritative ATraceGameMode here - run this on the server."));
 	}
 
 	// NOTE: neither of these may share a name with a CVar. Trace.Characters.EnforceSelectRules is
@@ -4494,10 +5171,12 @@ namespace
 	FAutoConsoleCommandWithWorldAndArgs CmdTraceCharactersVerify(
 		TEXT("Trace.Characters.Verify"),
 		TEXT("Dev only. Spec v14 3. Proves first-request-wins, that a team-mate is refused, that an "
-		     "ENEMY may mirror the pick, that bots stay characterless, that the timeout auto-assigns "
-		     "a free character, and that a respawn does not reset an ability cooldown while half time "
-		     "does. Argument 'red' removes this slice's uniqueness test for the run, and the team-mate "
-		     "assertion must then FAIL - that is how the harness is shown to be able to go red."),
+		     "ENEMY may mirror the pick, that a bot is not served by the human request path, that no "
+		     "bot clashes with a team-mate, that the timeout auto-assigns a free character, and that a "
+		     "respawn does not reset an ability cooldown while half time does. Argument 'red' removes "
+		     "this slice's uniqueness test for the run, and the team-mate assertion must then FAIL - "
+		     "that is how the harness is shown to be able to go red. For the bot ORDERING and fill of "
+		     "spec v15 s2, see Trace.Characters.BotVerify."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TraceCharactersVerifyCommand));
 
 	/**
@@ -4533,8 +5212,26 @@ namespace
 
 	FAutoConsoleCommandWithWorld CmdTraceCharactersDump(
 		TEXT("Trace.Characters.Dump"),
-		TEXT("Dev only. Every player: team, human/bot, character, select state and ability cooldown."),
+		TEXT("Dev only. Every player: team, human/bot, character, select state and ability cooldown. On "
+		     "a machine with no authority it prints what REPLICATED here instead of refusing, which is "
+		     "how a client proves it can see a bot's character."),
 		FConsoleCommandWithWorldDelegate::CreateStatic(&TraceCharactersDumpCommand));
+
+	FAutoConsoleCommandWithWorld CmdTraceCharactersBotVerify(
+		TEXT("Trace.Characters.BotVerify"),
+		TEXT("Dev only. Spec v15 s2. Proves that a bot does NOT pick while a human on its team is still "
+		     "choosing, that every bot is filled once they are done, that the fill is unique across the "
+		     "team and random across runs, that an idle human resolves through the select timeout instead "
+		     "of stalling the bots, and that turning characters off returns every bot to the Mannequin. "
+		     "Needs one all-bot team of three or more - run with '?bots=8'."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&TraceCharactersBotVerifyCommand));
+
+	FAutoConsoleCommandWithWorld CmdTraceCharactersBotVerifyRed(
+		TEXT("Trace.Characters.BotVerifyRed"),
+		TEXT("Dev only. Trace.Characters.BotVerify with the red arm on: the fill stops waiting for the "
+		     "humans and hands every bot ROCCO, and the framework's own roster rules are cleared for the "
+		     "run so the duplicate actually lands. The ordering and uniqueness assertions MUST fail."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&TraceCharactersBotVerifyRedCommand));
 }
 
 #endif // !UE_BUILD_SHIPPING

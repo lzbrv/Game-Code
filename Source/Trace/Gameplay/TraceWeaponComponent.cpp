@@ -1416,23 +1416,10 @@ void UTraceWeaponComponent::TickSwing(float /*DeltaTime*/)
 
 // -------------------------------------------------------------------------------------------------
 // The swap
+//
+// DoSwapWeaponPressed() lived here and is deleted (spec v15 §5) — see the note at its old declaration
+// in TraceWeaponComponent.h. The toggle verb survives once, in TraceMelee::RequestSwapWeapon.
 // -------------------------------------------------------------------------------------------------
-
-void UTraceWeaponComponent::DoSwapWeaponPressed()
-{
-	const ETraceEquippedWeapon Desired = IsKnifeEquipped()
-		? ETraceEquippedWeapon::Gun
-		: ETraceEquippedWeapon::Knife;
-
-	ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
-	if (!RequestEquip(Desired, &Refusal))
-	{
-		// A bind that is silent BY DESIGN is indistinguishable from a bind that is not wired up, and
-		// this project has already paid for that lesson once with the carrier's gun.
-		UE_LOG(LogTraceGame, Verbose, TEXT("[%s] Weapon swap refused: %s"),
-			*GetNameSafe(GetOwner()), LexToString(Refusal));
-	}
-}
 
 bool UTraceWeaponComponent::RequestEquipIfDifferent(ETraceEquippedWeapon Desired, ETraceMeleeRefusal* OutRefusal)
 {

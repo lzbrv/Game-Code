@@ -11,6 +11,7 @@
 #include "UnrealClient.h"             // FViewport::IsForegroundWindow
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "HAL/IConsoleManager.h"      // FAutoConsoleVariableRef — spec v15 §4's red arm
 #include "InputCoreTypes.h"
 #include "InputKeyEventArgs.h"
 #include "Misc/CommandLine.h"
@@ -203,6 +204,7 @@ void ATraceMenuHUD::BeginPlay()
 	ArmAutoPlay();
 	ArmAutoJoin();
 	ArmAutoSettings();
+	ArmClickTest();
 #endif
 }
 
@@ -225,12 +227,26 @@ namespace
 	 *   Enter      -> arms the rebind capture         (Binding)
 	 *   K          -> becomes the new MOVE FORWARD    (capture)
 	 *
-	 * *** THIS SCRIPT IS POSITIONAL AND MUST BE RE-WALKED WHENEVER A ROW IS ADDED. *** It navigates
-	 * by key presses, not by row identity, so inserting a row above SENSITIVITY silently re-aims
-	 * every step after it — the run still "passes" while adjusting something nobody asked about. It
-	 * was re-walked when spec v14 §3 added the MATCH / CHARACTERS row above MOUSE, which is where the
-	 * leading Down and the two Enters come from. The log line each step prints is the check: if a
-	 * step's description stops matching what the screenshot shows selected, this list is stale.
+	 * *** THIS SCRIPT IS POSITIONAL AND MUST BE RE-WALKED WHENEVER A ROW IS ADDED OR REMOVED. ***
+	 * It navigates by key presses, not by row identity, so a row inserted or deleted anywhere the
+	 * script walks PAST silently re-aims every step after it — the run still "passes" while
+	 * adjusting something nobody asked about. It was re-walked when spec v14 §3 added the MATCH /
+	 * CHARACTERS row above MOUSE, which is where the leading Down and the two Enters come from. The
+	 * log line each step prints is the check: if a step's description stops matching what the
+	 * screenshot shows selected, this list is stale.
+	 *
+	 * RE-WALKED FOR SPEC v15 §5, which DELETED the SWAP WEAPON row. Verdict: NOT AFFECTED, and here
+	 * is the walk that says so. FTraceOptionsMenu::RebuildRows lays the settings page out as
+	 *
+	 *    0 header DISPLAY   1 VIDEO SETTINGS  <- the selection starts here (first selectable row)
+	 *    2 header MATCH     3 CHARACTERS      4 note   5 note
+	 *    6 header MOUSE     7 SENSITIVITY     8 VERTICAL SENSITIVITY   9 INVERT MOUSE Y
+	 *   10 header CONTROLS 11 MOVE FORWARD   12..  the rest of TraceInputActions::All(), in order
+	 *
+	 * and the script's four Downs land on 3, 7, 8, 9 and 11 — every one of them AT OR ABOVE the
+	 * first binding row. SWAP WEAPON was the twelfth binding, six rows BELOW MOVE FORWARD, so
+	 * deleting it moves nothing the script ever selects. Nothing to re-aim; the descriptions below
+	 * still name what is selected.
 	 */
 	struct FAutoSettingsKey { FKey (*Key)(); const TCHAR* What; };
 
@@ -528,6 +544,306 @@ void ATraceMenuHUD::AutoSettingsStep()
 		RestoreUserSettings();
 	}
 }
+
+// =================================================================================================
+// -TraceMenuClickTest — SPEC v15 §4. See ArmClickTest() in the header for the argument.
+//
+// The two channels a click arrives on are driven separately, because that is how the engine
+// delivers them and because only one of them was ever in doubt:
+//
+//   POSITION  APlayerController::SetMouseLocation -> FViewport::SetMouse, which writes the viewport's
+//             cached cursor position — the exact value ATraceMenuHUD::GetCursorPoint reads back out
+//             of APlayerController::GetMousePosition. It also asks the platform to move the real
+//             pointer, which is a visible side effect of a dev-only switch and is why this is not
+//             armed by default.
+//   BUTTON    APlayerController::InputKey, the same entry point ATraceMenuHUD's own -TraceAutoSettings
+//             script uses for the keyboard, and the same one a physical mouse ends up at.
+//
+// Steps are 0.10 s apart so several frames — and therefore several DrawHUD passes — separate the
+// cursor move from the press and the press from the release. That matters: the hover pass, the
+// window-focus sample and the cursor-movement test all live in DrawHUD, and a harness that pressed
+// and released inside one frame would be measuring something no player can produce.
+// =================================================================================================
+
+#if !UE_BUILD_SHIPPING
+/**
+ * Spec v15 §4's red arm. 1 restores the foreground-window guard MousePressed used to have, so the
+ * "two clicks" bug can be reproduced on demand in a shipped-fix build and the fix re-measured
+ * against it.
+ *
+ * File-scope and distinctively named rather than an anonymous-namespace static: UBT compiles this
+ * module as a unity/jumbo build, where two files' anonymous namespaces become one.
+ */
+static int32 GTraceMenuFocusGuardRedArm = 0;
+
+static FAutoConsoleVariableRef CVarTraceMenuFocusGuardRedArm(
+	TEXT("Trace.Menu.FocusGuardRedArm"),
+	GTraceMenuFocusGuardRedArm,
+	TEXT("Dev only. Spec v15 s4 RED ARM. 1 puts back the guard that dropped any menu mouse-down ")
+	TEXT("arriving while the game window was not foreground — the thing that made every menu row ")
+	TEXT("take two clicks. Run -TraceMenuClickTest with it on and off to compare."),
+	ECVF_Cheat);
+#endif
+
+// NAMED, not anonymous: UBT compiles this module as a unity/jumbo build, so two files that each
+// define something at the top of an anonymous namespace become one namespace with two definitions.
+// Scripts/check-jumbo-build-collisions.py gates the build on exactly that.
+namespace TraceMenuClickTest
+{
+	/** Complete down/up pairs a single row is given before the phase is declared dead. */
+	constexpr int32 MaxPairs = 4;
+
+	/** Label of the overlay row phase 2 clicks. A toggle, so its effect is readable in one bool. */
+	const TCHAR* const OverlayRow = TEXT("INVERT MOUSE Y");
+}
+
+void ATraceMenuHUD::ArmClickTest()
+{
+	float DelaySeconds = 0.f;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("TraceMenuClickTest="), DelaySeconds))
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// -TraceMenuFocusGuardRedArm as well as the cvar, because the cvar cannot be set reliably from a
+	// launch: -ExecCmds splits on whitespace and "Trace.Menu.FocusGuardRedArm 1" arrives as two
+	// arguments with the value on the floor. A bare switch has no such trap.
+	if (FParse::Param(FCommandLine::Get(), TEXT("TraceMenuFocusGuardRedArm")))
+	{
+		GTraceMenuFocusGuardRedArm = 1;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ClickTest] RED ARM ON: the foreground-window guard spec v15 §4 removed is back for "
+			     "this run, and every row is expected to need more than one click."));
+	}
+
+	// Well clear of TraceMenuStyle::ActivationGraceSeconds and of the 0.75 s cursor-settling window,
+	// so neither of those can be what the measurement reports. Both are legitimate and both are
+	// meant to have expired long before a human has read the menu, let alone clicked it.
+	DelaySeconds = FMath::Max(1.50f, DelaySeconds);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ClickTest] Counting clicks-per-activation in %.2fs. One pair per row is the requirement."),
+		DelaySeconds);
+
+	World->GetTimerManager().SetTimer(ClickTestArmTimer,
+		FTimerDelegate::CreateWeakLambda(this, [this]() { BeginClickTest(); }), DelaySeconds, false);
+}
+
+void ATraceMenuHUD::BeginClickTest()
+{
+	// Phase 2 writes INVERT MOUSE Y through the shipping save path. Same snapshot the
+	// -TraceAutoSettings script takes, and for the same reason: a verification run that leaves the
+	// developer's own mouse inverted gets reported as a game bug. See SnapshotUserSettings.
+	SnapshotUserSettings();
+
+	ClickTestBaselineDifficulty = Difficulty;
+	bClickTestBaselineInvertY = UTraceUserSettings::Get().bInvertMouseY;
+
+	ClickTestPhase = 0;
+	ClickTestSubStep = 0;
+	ClickTestDeadPairs = 0;
+	ClickTestPairsUsed[0] = ClickTestPairsUsed[1] = ClickTestPairsUsed[2] = 0;
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimer(ClickTestStepTimer,
+			FTimerDelegate::CreateWeakLambda(this, [this]() { ClickTestStep(); }), 0.10f, true);
+	}
+}
+
+bool ATraceMenuHUD::ClickTestRowCenter(int32 Phase, FVector2D& OutPoint)
+{
+	if (Phase == 0 || Phase == 1)
+	{
+		// DIFFICULTY, never PLAY: activating PLAY would travel and end the run mid-measurement.
+		const int32 Row = static_cast<int32>(Phase == 0 ? ETraceMenuRow::Difficulty : ETraceMenuRow::Settings);
+		if (!bRowRectsValid || !RowRects[Row].bIsValid)
+		{
+			return false;
+		}
+		OutPoint = RowRects[Row].GetCenter();
+		return true;
+	}
+
+	FBox2D Rect(ForceInit);
+	if (!OptionsMenu.DebugGetRowRect(TraceMenuClickTest::OverlayRow, Rect))
+	{
+		return false;
+	}
+	OutPoint = Rect.GetCenter();
+	return true;
+}
+
+void ATraceMenuHUD::ClickTestStep()
+{
+	APlayerController* PC = GetOwningPlayerController();
+	UWorld* World = GetWorld();
+	if (PC == nullptr || World == nullptr)
+	{
+		return;
+	}
+
+	// ---- Phase 3: report, put everything back, stop ----------------------------------------------
+	if (ClickTestPhase >= 3)
+	{
+		World->GetTimerManager().ClearTimer(ClickTestStepTimer);
+
+		OptionsMenu.Close();
+		Difficulty = ClickTestBaselineDifficulty;
+		TraceDifficulty::ApplyToSettings(Difficulty);
+
+		const bool bPass = (ClickTestPairsUsed[0] == 1) && (ClickTestPairsUsed[1] == 1) && (ClickTestPairsUsed[2] == 1);
+
+		// Two calls rather than a ternary verbosity: UE_LOG's verbosity is a token the macro pastes
+		// into a compile-time category check, not a value, so it cannot be an expression.
+#define TRACE_CLICKTEST_ARGS \
+	bPass ? TEXT("ONE PRESS = ONE ACTION") : TEXT("A MENU ROW NEEDS MORE THAN ONE CLICK"), \
+	ClickTestPairsUsed[0], ClickTestPairsUsed[1], ClickTestPairsUsed[2]
+
+#define TRACE_CLICKTEST_TEXT \
+	TEXT("[ClickTest] VERDICT: %s. Clicks needed — title row=%d, SETTINGS row=%d, overlay row=%d ") \
+	TEXT("(1 each is the requirement; 0 means the row never acted at all).")
+
+		if (bPass)
+		{
+			UE_LOG(LogTraceGame, Display, TRACE_CLICKTEST_TEXT, TRACE_CLICKTEST_ARGS);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TRACE_CLICKTEST_TEXT, TRACE_CLICKTEST_ARGS);
+		}
+
+#undef TRACE_CLICKTEST_ARGS
+#undef TRACE_CLICKTEST_TEXT
+
+		// Strictly after the verdict, exactly as -TraceAutoSettings does it: restoring first would
+		// erase the state the run exists to report.
+		RestoreUserSettings();
+		return;
+	}
+
+	// ---- Sub-step 0: park the cursor on the row --------------------------------------------------
+	if (ClickTestSubStep == 0)
+	{
+		// Phase 2 needs the overlay up. If phase 1 could not open it with a click, open it here and
+		// say so — the overlay row is still worth measuring, and silently skipping it would turn one
+		// failure into two unanswered questions.
+		if (ClickTestPhase == 2 && !OptionsMenu.IsOpen())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ClickTest] The overlay is not open, so phase 1's click never landed. Opening it "
+				     "directly so the overlay row can still be measured."));
+			Selected = ETraceMenuRow::Settings;
+			OpenOptions();
+			return;   // next tick: the overlay draws, and its row rects become real
+		}
+
+		FVector2D Point = FVector2D::ZeroVector;
+		if (!ClickTestRowCenter(ClickTestPhase, Point))
+		{
+			// Nothing has been drawn yet. Wait rather than click into the dark.
+			return;
+		}
+
+		PC->SetMouseLocation(FMath::RoundToInt(Point.X), FMath::RoundToInt(Point.Y));
+
+		float ReadX = 0.f;
+		float ReadY = 0.f;
+		const bool bReadBack = PC->GetMousePosition(ReadX, ReadY);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ClickTest] phase %d: cursor -> (%.0f, %.0f); the menu reads it back as (%.0f, %.0f) valid=%d."),
+			ClickTestPhase, Point.X, Point.Y, ReadX, ReadY, bReadBack ? 1 : 0);
+
+		if (!bReadBack)
+		{
+			// The one failure mode that would make every number below a lie. Say it, do not measure it.
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[ClickTest] The viewport will not report a cursor position in this run, so no click "
+				     "can be aimed. This is a harness failure, not a menu failure."));
+			ClickTestPhase = 3;
+			return;
+		}
+
+		ClickTestSubStep = 1;
+		return;
+	}
+
+	// ---- Sub-step 1: press ------------------------------------------------------------------------
+	if (ClickTestSubStep == 1)
+	{
+		// The two states that can silently eat a press are named on every attempt. Without this the
+		// verdict says "two clicks" and leaves the next person to guess WHICH guard did it — which is
+		// the position spec v15 §4 explicitly refuses to start from.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ClickTest] phase %d, click %d: pressing. windowFocusedLastFrame=%d cursorHasMoved=%d"),
+			ClickTestPhase, ClickTestDeadPairs + 1,
+			bWindowFocusedLastFrame ? 1 : 0, bCursorHasMoved ? 1 : 0);
+
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		ClickTestSubStep = 2;
+		return;
+	}
+
+	// ---- Sub-step 2: release --------------------------------------------------------------------
+	if (ClickTestSubStep == 2)
+	{
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		ClickTestSubStep = 3;
+		return;
+	}
+
+	// ---- Sub-step 3: JUDGE, a whole step after the release ---------------------------------------
+	//
+	// SEPARATE FROM THE RELEASE, and the first version of this harness got it wrong in exactly the
+	// way this project keeps getting caught by. APlayerController::InputKey does not run the bound
+	// delegate; it queues the event for the next ProcessInputStack. Judging on the same call as the
+	// release therefore asked "did that click work?" BEFORE the click had been delivered, so every
+	// row appeared to need one more click than it does — the harness reported 2/2/3 on a build whose
+	// title screen is single-click, which is the reported bug manufactured out of nothing. The log
+	// gave it away: "[ClickTest] phase 0 ACTED" was printed BEFORE the "[MenuInput] LMB up" it was
+	// supposedly judging.
+	//
+	// The overlay needs the extra step twice over: FTraceOptionsMenu polls IsInputKeyDown from
+	// DrawHUD, so the release has to reach the input stack AND then be seen by a later draw.
+	bool bActed = false;
+	switch (ClickTestPhase)
+	{
+	case 0:  bActed = (Difficulty != ClickTestBaselineDifficulty); break;
+	case 1:  bActed = OptionsMenu.IsOpen(); break;
+	default: bActed = (UTraceUserSettings::Get().bInvertMouseY != bClickTestBaselineInvertY); break;
+	}
+
+	++ClickTestDeadPairs;
+
+	if (bActed)
+	{
+		ClickTestPairsUsed[ClickTestPhase] = ClickTestDeadPairs;
+		UE_LOG(LogTraceGame, Display, TEXT("[ClickTest] phase %d ACTED after %d click(s)."),
+			ClickTestPhase, ClickTestDeadPairs);
+	}
+	else if (ClickTestDeadPairs >= TraceMenuClickTest::MaxPairs)
+	{
+		ClickTestPairsUsed[ClickTestPhase] = 0;
+		UE_LOG(LogTraceGame, Error, TEXT("[ClickTest] phase %d did NOTHING after %d complete clicks."),
+			ClickTestPhase, ClickTestDeadPairs);
+	}
+	else
+	{
+		// Same row, same cursor, another complete click. Back to the press, not to the cursor move:
+		// re-parking the pointer every attempt would hide a bug that only bites the FIRST click.
+		ClickTestSubStep = 1;
+		return;
+	}
+
+	++ClickTestPhase;
+	ClickTestSubStep = 0;
+	ClickTestDeadPairs = 0;
+}
 #endif
 
 // =================================================================================================
@@ -717,22 +1033,50 @@ void ATraceMenuHUD::MousePressed()
 		return;
 	}
 
-	// THE STRAY ACTIVATION, caught at its cause.
+	// *** SPEC v15 §4 — "menu presses are a single press not two clicks". THIS IS WHERE THE FIRST
+	// CLICK WAS GOING, and it was a guard this file added on purpose. ***
 	//
-	// If the window was not foreground as of the last drawn frame, this down edge is the click that
-	// is bringing it forward. macOS delivers that click to the application like any other, so it
-	// used to land on whatever row was under the cursor — PLAY, at the default selection — and the
-	// player watched the title screen skip itself. Arm nothing; the matching release will find no
-	// armed row and do nothing either.
-	if (!bWindowFocusedLastFrame)
+	// A test used to stand here that dropped the mouse-down whenever the viewport had not reported
+	// itself foreground as of the last drawn frame, on the theory that such a press must be the
+	// click bringing the window forward. It is REMOVED, for two reasons that both had to hold:
+	//
+	//   IT NEVER CAUGHT THE BUG IT WAS ADDED FOR. Read the history on AcceptUnlockTime in the
+	//   header: every one of the five logged self-activations arrived "while the viewport already
+	//   reported itself foreground". The stray pair was the viewport leaving
+	//   CapturePermanently_IncludingInitialMouseDown, fixed at its cause in
+	//   ATraceMenuPlayerController::BeginPlay (NoCapture), and the discriminator that DOES catch it
+	//   is the cursor-movement test below. This branch was defending nothing.
+	//
+	//   IT COST A REAL CLICK EVERY TIME, which IS the reported bug. Measured with
+	//   -TraceMenuClickTest against a real window whose focus another application had taken:
+	//   windowFocusedLastFrame=0 on every attempt, "Ignored the mouse-down that brought the window
+	//   to the foreground" on every attempt, and the row never activated at all. In a real session
+	//   the first physical click restores the key window and is swallowed here; the second lands
+	//   with focus and works. Two clicks — on PLAY, on JOIN and on SETTINGS — every time the player
+	//   had clicked away from the game, which on a windowed macOS build is most of the time.
+	//
+	// The focus state is still SAMPLED, and it is printed on the press below rather than acted on.
+	// "Was the window ours when that click landed?" is a question this file has had to answer twice
+	// now, and the answer must stay in the log; it must just not eat the click.
+	//
+#if !UE_BUILD_SHIPPING
+	// THE RED ARM, kept rather than deleted, because a fix nobody can re-measure against the bug is
+	// a fix that gets undone by the next person who reads the comment above and disagrees with it.
+	//   Trace.Menu.FocusGuardRedArm 1
+	// puts the removed guard back for this session, so -TraceMenuClickTest can be run both ways in
+	// ONE build: 1 click per row with it off, and the row never activating at all with it on. Same
+	// pattern as Trace.V13.Hotkeys' `toggle` arm.
+	if (GTraceMenuFocusGuardRedArm != 0 && !bWindowFocusedLastFrame)
 	{
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[MenuInput] Ignored the mouse-down that brought the window to the foreground."));
+			TEXT("[MenuInput] [RED ARM] Ignored the mouse-down that brought the window to the foreground."));
 		return;
 	}
+#endif
 
-	// ...and the one that actually catches it. See bCursorHasMoved: the spurious click is a
-	// complete down/up pair at a pointer that has not moved since the window appeared.
+	// THE DEFENCE THAT ACTUALLY WORKS is next. See bCursorHasMoved: the spurious pair lands at a
+	// pointer that has not moved since the title screen appeared, and a player always moves the
+	// mouse onto a button before pressing it.
 	if (!bCursorHasMoved)
 	{
 		UE_LOG(LogTraceGame, Display,
@@ -756,6 +1100,11 @@ void ATraceMenuHUD::MousePressed()
 	// Highlight on press so the row visibly depresses under the cursor; commit on release.
 	Selected = static_cast<ETraceMenuRow>(Row);
 	PressedRow = Row;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[MenuInput] Armed row %d at (%.0f, %.0f). windowFocused=%d — this press counts whether or "
+		     "not the window was ours (spec v15 §4)."),
+		Row, Point.X, Point.Y, bWindowFocusedLastFrame ? 1 : 0);
 }
 
 void ATraceMenuHUD::MouseReleased()

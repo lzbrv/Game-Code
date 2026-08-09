@@ -189,7 +189,9 @@ bool UTraceAbilitySetX::MarkVulnerable(ATraceCharacter* Target) const
 	}
 
 	// The victim's HEALTH COMPONENT owns the mark, not X and not the victim's ability set — the
-	// victim may be a characterless bot (spec §3) and would have no ability set to hold it.
+	// victim may hold no character at all (mode A, the characters toggle, an unservable roster) and
+	// would then have no ability set to hold it. This used to say "a characterless bot (spec §3)",
+	// which spec v15 §2 made false; the reason is unchanged, the example was.
 	return TargetHealth->ApplyVulnerable(TraceVulnerable::GetDurationSeconds(), Credited);
 }
 

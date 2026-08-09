@@ -106,10 +106,31 @@ fi
 ARGS+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
 
 trace_msg "Creating ${TRACE_C_BOLD}${MAP}${TRACE_C_OFF} (TRACE_FORCE_MAP=${FORCE})"
+
+# THE EXIT CODE OF THE COMMANDLET IS NOT THE RESULT OF THE RUN, and treating it as
+# one under `set -e` is a trap this project has now walked into twice (see the same
+# comment in bake-arena.sh, where it cost an afternoon). UnrealEditor
+# -run=pythonscript returns non-zero if ANY error was LOGGED during the whole
+# session — including engine ensures and config warnings raised at startup by
+# modules that have nothing to do with this script. Under `set -euo pipefail` the
+# script would then abort HERE, before reaching its own on-disk check, and report
+# failure for a map it had just written successfully.
+#
+# The authoritative check is what landed on disk, below. The status is captured and
+# reported so a genuine failure is still loud.
+set +e
 trace_run "$CMD_BIN" "${ARGS[@]}"
+GENERATE_STATUS=$?
+set -e
 
 if [ "$TRACE_DRY_RUN" = "1" ]; then
     exit 0
+fi
+
+if [ "$GENERATE_STATUS" != "0" ]; then
+    trace_warn "The editor exited ${GENERATE_STATUS}. That means errors were LOGGED, not necessarily that"
+    trace_warn "map creation failed — checking what actually reached disk. Search the output above for"
+    trace_warn "the '[Trace]' lines from generate_map.py: they name the API that failed."
 fi
 
 REL="${MAP#/Game/}"

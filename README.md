@@ -96,11 +96,17 @@ Config/
   DefaultGame.ini           Gameplay tunables — [/Script/Trace.TraceSettings] lives here.
   DefaultInput.ini          Switches the engine to Enhanced Input classes, mouse/console keys.
 Content/
-  Maps/                     The one and only content directory. Holds Arena.umap (see Setup).
+  Maps/                     Arena.umap (empty — see Setup) and Arena_Baked.umap (the bake, opt-in).
+  Trace/Materials/          M_TraceSurface, M_TraceNeon and their instances. COMMITTED, unlike the
+                            /Game/Generated copies, so the baked map is not broken on a fresh clone.
+  __ExternalActors__/       One .uasset per actor of Arena_Baked. This is One File Per Actor — it is
+                            what lets several people edit one map without fighting over the .umap.
 Scripts/
   build.sh                  Wraps UnrealBuildTool. Also --projectfiles and --clean.
   generate-map.sh           Creates the empty /Game/Maps/Arena level headlessly.
   generate_map.py           The editor-Python it drives. Not a standalone python3 script.
+  bake-arena.sh             Bakes the procedural arena into the editable /Game/Maps/Arena_Baked.
+  bake-arena.py             The editor-Python it drives. Same rules as generate_map.py.
   generate_content.py       Produces M_TraceSurface / M_TraceNeon into /Game/Generated/Materials.
   import-mannequin.sh       Imports Epic's Mannequin (~126 MB) from your own engine install.
                             build.sh runs this for you when the art is missing.
@@ -199,6 +205,37 @@ to *Play As Listen Server*. For two real processes:
 Scripts/run-listen-server.sh                   # window 1: host
 Scripts/run-client.sh 127.0.0.1 --pos 700,0    # window 2: joiner
 ```
+
+### The baked arena (`/Game/Maps/Arena_Baked`) — opt-in
+
+`/Game/Maps/Arena` is an empty level and the arena is built from C++ at `BeginPlay`, which means
+nobody can open it, click a wall and move it. `Scripts/bake-arena.sh` runs that same builder once in
+the editor and saves the result as a real level of ~570 placed, individually selectable, readably
+labelled actors (`Wall_North_01`, `Cover_037`, `Goal_Ring_Rim_12`), with **One File Per Actor**
+enabled so several people can edit it at once.
+
+```bash
+Scripts/bake-arena.sh                                        # bake (again: --force)
+Scripts/run-listen-server.sh --map /Game/Maps/Arena_Baked    # play it
+```
+
+or open `Content/Maps/Arena_Baked.umap` in the editor and press Play.
+
+Three things worth knowing before you rely on it:
+
+- **`/Game/Maps/Arena` is still the shipping map.** The baked one is opt-in this pass so the two can
+  be compared. Nothing defaults to it.
+- **The runtime build skips itself on a baked level.** `ATraceArenaBuilder` detects it (via its
+  `bLevelIsPreBaked` flag, and independently via the presence of any `ATraceBakedPiece`) and adopts
+  the placed actors instead of constructing a second arena on top of them.
+- **It costs draw calls.** Cross-actor batching is impossible once the geometry is real actors:
+  the arena's primitive count goes from ~411 to ~1048. That is the price of editability, and it is
+  why the procedural path stays.
+
+`Scripts/bake-arena.sh --help` documents the rest, including `--nullrhi` (only safe once
+`Content/Trace/Materials` exists — a first bake has to compile shader maps and needs a real RHI).
+
+---
 
 A **listen server is the supported path today.** A true dedicated server (`TraceServer`) cannot be
 built from a Launcher-installed engine — the build fails with *"Server targets are not currently

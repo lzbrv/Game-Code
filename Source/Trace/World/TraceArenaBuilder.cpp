@@ -1578,10 +1578,22 @@ void ATraceArenaBuilder::BeginPlay()
 
 void ATraceArenaBuilder::EnsureBuilt()
 {
-	if (!bArenaBuilt)
+	if (bArenaBuilt)
 	{
-		BuildArena();
+		return;
 	}
+
+	// SPEC v15 §1.5 - "turn OFF the runtime build for a baked level", and the check lives here rather
+	// than in ATraceGameMode because the game mode has no business knowing which levels are baked.
+	// The geometry is already in the .umap; what is missing is the wiring, and that is what adopting
+	// does. See bLevelIsPreBaked in the header for why this actor is still in the baked level at all.
+	if (IsLevelPreBaked())
+	{
+		AdoptBakedArena();
+		return;
+	}
+
+	BuildArena();
 }
 
 void ATraceArenaBuilder::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -3211,7 +3223,7 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 		// must never be serialised into a level, least of all by the editor preview below.
 		FActorSpawnParameters ZoneParams;
 		ZoneParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-		ZoneParams.ObjectFlags |= RF_Transient;
+		ZoneParams.ObjectFlags |= SpawnedActorFlags();
 		ZoneParams.bDeferConstruction = true;
 
 		ATraceEndzone* Zone = World->SpawnActor<ATraceEndzone>(
@@ -3662,7 +3674,7 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 
 		FActorSpawnParameters ZoneParams;
 		ZoneParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-		ZoneParams.ObjectFlags |= RF_Transient;
+		ZoneParams.ObjectFlags |= SpawnedActorFlags();
 		ZoneParams.bDeferConstruction = true;
 
 		ATraceEndzone* Goal = World->SpawnActor<ATraceEndzone>(
@@ -3712,7 +3724,7 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 
 	FActorSpawnParameters SpawnParams;
 	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	SpawnParams.ObjectFlags |= RF_Transient; // Purely runtime scaffolding; never save it into a level.
+	SpawnParams.ObjectFlags |= SpawnedActorFlags();   // Runtime scaffolding, except during a bake - see SpawnedActorFlags.
 
 	const ETraceTeam Teams[] = { ETraceTeam::Blue, ETraceTeam::Orange };
 	for (const ETraceTeam Team : Teams)
@@ -3792,7 +3804,7 @@ void ATraceArenaBuilder::BuildLighting()
 	// their own lights.
 	FActorSpawnParameters SpawnParams;
 	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	SpawnParams.ObjectFlags |= RF_Transient;
+	SpawnParams.ObjectFlags |= SpawnedActorFlags();
 
 	const FVector SkyPosition = GetActorTransform().TransformPosition(FVector(0.f, 0.f, WallHeight * 2.f));
 
@@ -3900,6 +3912,16 @@ void ATraceArenaBuilder::BuildLighting()
 			}
 		}
 
+		// The table above is the ONLY place that knows this light is the fill and that one is the
+		// bounce - the actors themselves are four identical ADirectionalLights differing in rotation
+		// and colour. A bake has to label them for a human reading the World Outliner, so the name
+		// travels out as an actor tag, which is a UPROPERTY and therefore survives into the .umap.
+		// Bake-only: a tag on every runtime light would be dead weight in a match.
+		if (bBakingToLevel)
+		{
+			Light->Tags.Add(FName(Spec.Name));
+		}
+
 		SpawnedActors.Add(Light);
 	}
 
@@ -3971,7 +3993,7 @@ void ATraceArenaBuilder::BuildPostProcess()
 
 	FActorSpawnParameters SpawnParams;
 	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	SpawnParams.ObjectFlags |= RF_Transient;
+	SpawnParams.ObjectFlags |= SpawnedActorFlags();
 
 	APostProcessVolume* Volume = World->SpawnActor<APostProcessVolume>(
 		APostProcessVolume::StaticClass(), FTransform(GetActorLocation()), SpawnParams);
@@ -4671,7 +4693,28 @@ EObjectFlags ATraceArenaBuilder::BuiltObjectFlags() const
 	// RF_Transient during an editor preview and nothing at runtime. This is the flag that keeps the
 	// preview out of the .umap: a transient object is skipped when the level is saved, so a user who
 	// builds a preview and then saves the map saves the builder actor and none of its geometry.
+	//
+	// A BAKE RUNS AS A PREVIEW and therefore lands on RF_Transient here, which is correct and load
+	// bearing: the components a bake builds are scaffolding it reads and throws away, and the actors
+	// it leaves in the level are separate objects made by EmitBakedActors. See SpawnedActorFlags for
+	// the one thing a bake genuinely does have to serialise.
 	return bBuildingEditorPreview ? RF_Transient : RF_NoFlags;
+}
+
+EObjectFlags ATraceArenaBuilder::SpawnedActorFlags() const
+{
+	return bBakingToLevel ? RF_NoFlags : RF_Transient;
+}
+
+bool ATraceArenaBuilder::RecordForBake(const FTraceBakeRecord& Record)
+{
+	if (!bBakingToLevel)
+	{
+		return false;
+	}
+
+	BakeRecords.Add(Record);
+	return true;
 }
 
 void ATraceArenaBuilder::AddMeshBlock(UStaticMesh* Mesh, const FVector& LocalCenter, const FVector& Size,
@@ -4696,6 +4739,21 @@ void ATraceArenaBuilder::AddMeshBlockRotated(UStaticMesh* Mesh, const FVector& L
 	// relative transform does, so the instanced and legacy arms place a block IDENTICALLY. That is the
 	// whole safety property of this change: nothing about where anything is has moved.
 	const FTransform LocalTransform(Rotation, LocalCenter, Size / TraceArenaConstants::ShapeUnit);
+
+	// SPEC v15 §1 - THE BAKE WATCHES HERE, above both geometry arms rather than inside
+	// AddInstancedBlock, so it records the same block whichever arm the build is running: the baked
+	// level must not depend on Trace.Arena.Instancing being on.
+	if (bBakingToLevel)
+	{
+		FTraceBakeRecord Record;
+		Record.Kind = FTraceBakeRecord::EKind::MeshBlock;
+		Record.PieceName = FName(DebugName);
+		Record.Transform = LocalTransform;
+		Record.BlockMesh = Mesh;
+		Record.BlockMID = MID;
+		Record.bCastShadow = bCastShadow;
+		RecordForBake(Record);
+	}
 
 	if (bBuildingInstancedGeometry)
 	{
@@ -4884,6 +4942,16 @@ UBoxComponent* ATraceArenaBuilder::AddCollisionBlockRotated(const FVector& Local
 	Component->SetHiddenInGame(true);
 
 	Component->RegisterComponent();
+
+	if (bBakingToLevel)
+	{
+		FTraceBakeRecord Record;
+		Record.Kind = FTraceBakeRecord::EKind::CollisionBox;
+		Record.PieceName = FName(DebugName);
+		Record.SourceComponent = Component;
+		RecordForBake(Record);
+	}
+
 	return Component;
 }
 
@@ -4927,6 +4995,16 @@ UBoxComponent* ATraceArenaBuilder::AddPawnStandoff(const FVector& LocalCenter, c
 	Component->SetHiddenInGame(true);
 
 	Component->RegisterComponent();
+
+	if (bBakingToLevel)
+	{
+		FTraceBakeRecord Record;
+		Record.Kind = FTraceBakeRecord::EKind::PawnStandoff;
+		Record.PieceName = FName(DebugName);
+		Record.SourceComponent = Component;
+		RecordForBake(Record);
+	}
+
 	return Component;
 }
 
@@ -5188,6 +5266,15 @@ UPointLightComponent* ATraceArenaBuilder::AddPointLight(const FVector& LocalCent
 	// Remembered so the Effects quality row can thin the lattice live (spec v11 §3) without a
 	// rebuild. Weak: the component's Outer is this actor, so it is already GC reachable.
 	FloorLamps.Add(Light);
+
+	if (bBakingToLevel)
+	{
+		FTraceBakeRecord Record;
+		Record.Kind = FTraceBakeRecord::EKind::PointLight;
+		Record.PieceName = FName(DebugName);
+		Record.SourceComponent = Light;
+		RecordForBake(Record);
+	}
 
 	return Light;
 }
@@ -5568,6 +5655,7 @@ ATraceArenaBuilder::FTraceBuildMark ATraceArenaBuilder::MarkBuiltComponents() co
 	FTraceBuildMark Mark;
 	Mark.Components = (Root != nullptr) ? Root->GetAttachChildren().Num() : 0;
 	Mark.Instances = BuiltInstances.Num();
+	Mark.BakeRecords = BakeRecords.Num();
 	return Mark;
 }
 
@@ -5653,6 +5741,27 @@ void ATraceArenaBuilder::CollectPiecesSince(const FTraceBuildMark& Mark, TArray<
 		// collision state to remember or restore. The blocking half of a mode-tagged structure is its
 		// separate box component, tagged in the loop above.
 	}
+
+	// --- THE BAKE'S THIRD RANGE (spec v15 §1) -----------------------------------------------------
+	//
+	// Same mark/build/diff idea, one list further along. WHICH mode is being collected is read off
+	// the destination array's IDENTITY rather than passed in, and that is deliberate: the alternative
+	// was a fourth argument on a function with eight call sites, seven of which would have had to
+	// repeat the same constant. There are exactly two tagged sets in this class and both are members,
+	// so the test is total - anything else is untagged, which is what Always means.
+	if (!bBakingToLevel)
+	{
+		return;
+	}
+
+	const ETraceBakedScoringTag Tag = (&Out == &GoalModePieces)
+		? ETraceBakedScoringTag::GoalModeOnly
+		: ((&Out == &EndzoneModePieces) ? ETraceBakedScoringTag::EndzoneModeOnly : ETraceBakedScoringTag::Always);
+
+	for (int32 Index = FMath::Max(0, Mark.BakeRecords); Index < BakeRecords.Num(); ++Index)
+	{
+		BakeRecords[Index].ModeTag = Tag;
+	}
 }
 
 void ATraceArenaBuilder::SetPiecesPresented(const TArray<FTraceModePiece>& Pieces, bool bPresented)
@@ -5719,6 +5828,12 @@ void ATraceArenaBuilder::ApplyScoringMode(ETraceScoringMode NewMode)
 	SetPiecesPresented(EndzoneModePieces, !bGoalMode);
 	SetPiecesPresented(GoalModePieces, bGoalMode);
 
+	// The same two sets on a baked level, where a piece is a whole actor. Exactly one of the two
+	// mechanisms is ever non-empty - see BakedEndzoneModeActors - so this costs a pair of empty loops
+	// on the procedural path.
+	SetBakedActorsPresented(BakedEndzoneModeActors, !bGoalMode);
+	SetBakedActorsPresented(BakedGoalModeActors, bGoalMode);
+
 	// Arm one pair of volumes, disarm the other. Empty on clients (no scoring volume is ever spawned
 	// there), which is correct: a client has nothing to arm.
 	int32 Armed = 0;
@@ -5737,11 +5852,18 @@ void ATraceArenaBuilder::ApplyScoringMode(ETraceScoringMode NewMode)
 
 	// Display, not Log: this is the answer to "which game am I looking at", and on an A/B toggle
 	// that is the first thing anybody reading a log wants to see.
+	//
+	// BOTH COUNTS, and that is not padding. On a baked level the component counts are legitimately
+	// zero and the actor counts carry the whole meaning; reporting only the first pair printed
+	// "0 endzone pieces hidden, 0 goal pieces shown" over a level that had just correctly hidden 24
+	// pieces and shown 84, which is precisely the sort of log line this project has lost a day to.
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[Arena] Presenting %s: %d endzone pieces %s, %d goal pieces %s, %d of %d volumes armed."),
+		TEXT("[Arena] Presenting %s: %d endzone pieces %s, %d goal pieces %s (baked actors: %d / %d), ")
+		TEXT("%d of %d volumes armed."),
 		*TraceScoringModeLabel(ScoringMode),
 		EndzoneModePieces.Num(), bGoalMode ? TEXT("hidden") : TEXT("shown"),
 		GoalModePieces.Num(), bGoalMode ? TEXT("shown") : TEXT("hidden"),
+		BakedEndzoneModeActors.Num(), BakedGoalModeActors.Num(),
 		Armed, ScoringVolumes.Num());
 }
 
@@ -5837,6 +5959,13 @@ void ATraceArenaBuilder::DestroyBuiltArena()
 	GoalModePieces.Reset();
 	ScoringVolumes.Reset();
 
+	// The baked equivalents, and the bake's own scratch list. Nothing here DESTROYS a baked actor -
+	// they belong to the level, not to this builder - it only forgets them, exactly as the two lines
+	// above forget components that have just died. A re-adopt finds them again.
+	BakedEndzoneModeActors.Reset();
+	BakedGoalModeActors.Reset();
+	BakeRecords.Reset();
+
 	// Same story for the fidelity handles (spec v11 §3): the volume and every light have just been
 	// destroyed, so ApplyFidelity must find nothing rather than a list of stale weak pointers whose
 	// count would misreport how many lamps the lattice has. The scalability subscription is left
@@ -5879,6 +6008,22 @@ void ATraceArenaBuilder::RebuildForMeasurement()
 	// side assignment to the builder's default, so a match that survives it is a match whose endzones
 	// may be the wrong colour until the next half-time push. Trace.Arena.PerfAB accepts that because
 	// it is measuring frame time, not playing a game.
+
+	// NOT ON A BAKED LEVEL (spec v15 §1). This is the one path that reaches BuildArena() without
+	// going through EnsureBuilt(), so the pre-baked check there does not cover it — and on
+	// /Game/Maps/Arena_Baked the result would be a full second arena constructed on top of the 517
+	// pieces already in the .umap: two floors, two sets of walls, and a measurement of a scene that
+	// exists nowhere. DestroyBuiltArena would not even clean it up afterwards, because it only walks
+	// what THIS actor built.
+	if (IsLevelPreBaked())
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] Trace.Arena.Perf's A/B rebuild does nothing on a baked level: the geometry belongs to ")
+			TEXT("the .umap, not to this builder, so there is nothing to rebuild and no BEFORE arm to switch to. ")
+			TEXT("Run the A/B on /Game/Maps/Arena, which is still fully procedural."));
+		return;
+	}
+
 	DestroyBuiltArena();
 	BuildArena();
 }
@@ -5911,6 +6056,18 @@ void ATraceArenaBuilder::BuildPreviewInEditor()
 			TEXT("BuildPreviewInEditor is an editor-only tool and does nothing in a play session — the arena ")
 			TEXT("builds itself at BeginPlay. Stop PIE, then press it in the level editor."));
 		return;
+	}
+
+	// A BAKED LEVEL ALREADY HAS ONE. The preview is transient and Clear Preview takes it away again,
+	// so this is a warning rather than a refusal — previewing a layout change before re-baking is a
+	// perfectly reasonable thing to want. But the viewport is about to show the arena twice, and
+	// somebody who does not know that will read the doubled geometry as a bake bug.
+	if (bLevelIsPreBaked)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] This level is already baked: the preview you are about to see is a SECOND, transient ")
+			TEXT("arena drawn on top of the 517 saved pieces. Press Clear Preview In Editor to remove it. To ")
+			TEXT("make a layout change permanent, edit the properties and re-run Scripts/bake-arena.sh --force."));
 	}
 
 	// Idempotent: pressing the button twice, or pressing it after changing FieldLength, replaces the
@@ -5994,6 +6151,30 @@ void ATraceArenaBuilder::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
 	if (bEditorPreviewBuilt && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive)
 	{
 		BuildPreviewInEditor();
+	}
+
+	// THE ONE FOOTGUN A BAKED LEVEL ADDS, and it is silent without this. On /Game/Maps/Arena these
+	// properties ARE the arena: change FieldLength and the next build is longer. On a baked level the
+	// geometry is already on disk and does not move, but the properties still answer
+	// GetFieldBounds(), GetCoreSpawnLocation(), GetScoringBounds() and ClampedEndzoneDepth() — which
+	// the bots steer inside, the Core spawns at, and the endzone triggers are re-sized from at load.
+	// Editing one here therefore does not resize the arena; it makes the arena and the rules
+	// DISAGREE, with the walls in one place and the scoring volumes in another.
+	if (bLevelIsPreBaked && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive)
+	{
+		const FName Changed = PropertyChangedEvent.GetPropertyName();
+		if (Changed != GET_MEMBER_NAME_CHECKED(ATraceArenaBuilder, bLevelIsPreBaked)
+			&& Changed != GET_MEMBER_NAME_CHECKED(ATraceArenaBuilder, BakeMaxPiecesPerName)
+			&& Changed != GET_MEMBER_NAME_CHECKED(ATraceArenaBuilder, BakePieceGroupSlack))
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Arena] '%s' changed on a builder in a BAKED level. The geometry is already saved in this ")
+				TEXT(".umap and will NOT move — but this property still answers GetFieldBounds / ")
+				TEXT("GetCoreSpawnLocation / the endzone volume sizes, so the arena you can see and the arena ")
+				TEXT("that scores will now disagree. Either put it back, or re-run Scripts/bake-arena.sh --force ")
+				TEXT("to regenerate the level from the new numbers."),
+				*Changed.ToString());
+		}
 	}
 }
 

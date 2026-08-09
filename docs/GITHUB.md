@@ -591,6 +591,13 @@ git lfs lock   Content/Maps/Arena.umap    # BEFORE opening it in the editor
 git lfs locks                             # who holds what
 git lfs unlock Content/Maps/Arena.umap    # AFTER pushing
 
+# Content — /Game/Maps/Arena_Baked only. It has One File Per Actor on, so the
+# level is a tiny .umap plus one .uasset per actor. Lock the ACTOR, not the map:
+# that is the whole point of the migration, and locking the .umap blocks nobody.
+# Find the actor by its LABEL in the World Outliner (Wall_North_01, Cover_037)
+# and let the editor's source control integration lock the file behind it.
+git lfs lock Content/__ExternalActors__/Maps/Arena_Baked/<xx>/<yy>/<guid>.uasset
+
 # LFS health
 git lfs ls-files                          # what's actually in LFS
 git lfs status

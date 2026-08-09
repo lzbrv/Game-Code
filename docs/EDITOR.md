@@ -91,22 +91,24 @@ Under the hood these are `UFUNCTION(CallInEditor)` members —
 plus a `PostEditChangeProperty` override for the live rebuild. `CallInEditor` is the general Unreal
 mechanism for "a button on the Details panel"; it is worth remembering if you want one of your own.
 
+There is now a **third** button beside them, `Bake Arena Into Level`, and it is a different kind of
+thing: the preview is transient and disappears, whereas the bake writes the arena into the level as
+real placed actors you can select and move. See §3.5.
+
 ---
 
-## 3. Opening the two maps
-
-There are exactly two levels.
+## 3. Opening the maps
 
 | Level | What it is |
 |---|---|
-| `/Game/Maps/Arena` | The match. Empty until `ATraceArenaBuilder` runs. |
+| `/Game/Maps/Arena` | The match, and the **shipping** map. Empty until `ATraceArenaBuilder` runs. |
 | `/Game/Maps/MainMenu` | The **title screen**. Empty; `ATraceMenuHUD` draws the whole menu in Canvas. |
+| `/Game/Maps/Arena_Baked` | The same arena, **baked into real editable actors**. Opt-in — see §3.5. |
 
-Two ways to open either one:
+Ways to open any of them:
 
-- **Content Browser** (bottom of the window) → `Content` → `Maps` → double-click `Arena` or
-  `MainMenu`.
-- **File → Open Level…** (`Cmd+O` / `Ctrl+O`) → same two entries.
+- **Content Browser** (bottom of the window) → `Content` → `Maps` → double-click.
+- **File → Open Level…** (`Cmd+O` / `Ctrl+O`) → same entries.
 
 ### Which map the game boots into, and why
 
@@ -139,6 +141,50 @@ buttons, and starting a match from it travels you to the arena the same way the 
 
 ---
 
+## 3.5 `/Game/Maps/Arena_Baked` — the arena as actors you can actually move
+
+Everything in §1 and §2 is about working around a level with nothing in it. `Arena_Baked` is the
+level that does have something in it: ~570 placed actors, each with a readable label
+(`Wall_North_01`, `Cover_037`, `Goal_Ring_Rim_12`, `Key_Light`), foldered in the World Outliner
+under `Arena/Wall`, `Arena/Cover`, `Arena/Scoring`, `Arena/Spawns`, `Arena/Lighting`. You can click
+a wall and drag it, and it stays dragged.
+
+**To produce or re-produce it**, from a terminal:
+
+```bash
+Scripts/bake-arena.sh            # first time
+Scripts/bake-arena.sh --force    # replace an existing bake
+```
+
+or, in the editor, select the builder in `Arena` and press **Bake Arena Into Level** on its Details
+panel. Either way the bake runs the *same* `BuildArena()` the game runs and records what it built,
+so the baked geometry is the procedural geometry — not a second implementation that can drift.
+
+**To play it**: `Scripts/run-listen-server.sh --map /Game/Maps/Arena_Baked`, or just press Play with
+the level open.
+
+Four things to know before you rely on it:
+
+- **`/Game/Maps/Arena` is still the shipping map.** The baked one is opt-in so the two can be
+  compared. Nothing boots into it by default.
+- **The runtime build skips itself here.** The builder detects a baked level (its `bLevelIsPreBaked`
+  flag, and independently the presence of any `ATraceBakedPiece`) and *adopts* the placed actors —
+  re-wiring the scoring volumes, the mode-tagged furniture, the half-time repaint and the lighting —
+  instead of constructing a second arena on top of the saved one.
+- **One File Per Actor is on**, so the level is a ~6 KB `.umap` plus one `.uasset` per actor under
+  `Content/__ExternalActors__/Maps/Arena_Baked/`. Lock the *actor*, not the map — see
+  `.gitattributes`.
+- **It costs draw calls.** Cross-actor batching is impossible once geometry is real actors: the
+  arena goes from ~411 primitives to ~1048. That is the price of editability, and it is why the
+  procedural path stays.
+
+Two edits will not survive a reload, and both are known: the floor lamps' intensity and radius are
+re-applied from the builder's properties whenever video settings change, and a hand-resized endzone
+is re-derived from the builder's layout at load. Move them by changing the builder's properties and
+re-baking, not by hand.
+
+---
+
 ## 4. The panels that matter
 
 If you have closed one, everything below is under the **Window** menu.
@@ -148,16 +194,24 @@ preview above) a place to look at the arena's shape. Right-mouse-drag looks, `WA
 right-dragging flies, `F` frames the selected actor, `Alt+drag` orbits. The **G** key toggles "game
 view", which hides editor-only icons and grid.
 
-**Content Browser** — every asset in the project. There is very little: `Maps/` (two empty levels),
-`Characters/Mannequins/` (imported Epic animation content), and `Generated/Materials/` (two
-materials produced by a script — see §7). There are no Blueprints and no input assets; all of that
-is C++.
+**Content Browser** — every asset in the project. Still not much: `Maps/` (three levels — `MainMenu`
+and `Arena` are empty and build themselves at runtime; **`Arena_Baked` is not**, see below),
+`Characters/Mannequins/` (imported Epic animation content), `Generated/Materials/` (two materials
+produced by a script — see §7, and NOT committed), and `Trace/Materials/` (the same two materials
+plus 64 instances, committed, which is what `Arena_Baked` references). There are no Blueprints and
+no input assets; all of that is still C++.
 
-**Outliner** — the list of actors in the level. On this project it is **nearly empty before you
-press Play and full afterwards**, which is a good live demonstration of §1: hit Play and watch it
+**Outliner** — the list of actors in the level. On `MainMenu` and `Arena` it is **nearly empty
+before you press Play and full afterwards**, which is a good live demonstration of §1: hit Play and
+watch it
 fill with the arena builder, the endzones, the player starts, the Core, ten characters and their
 controllers. It is genuinely useful during PIE — select a running actor there and its live state
 appears in the Details panel.
+
+`Arena_Baked` is the opposite and that is the whole point of it: **572 actors are already there
+before you press Play**, foldered under `Arena/Wall`, `Arena/Cover`, `Arena/Scoring`, `Arena/Spawns`
+and `Arena/Lighting`, each with a readable name (`Wall_North_01`, `Cover_037`). Click one and move
+it. The builder is still in that level but it adopts the placed geometry instead of rebuilding it.
 
 **Details** — properties of whatever is selected. This is where a placed `ATraceArenaBuilder`
 exposes `FieldLength`, `FieldWidth`, `WallHeight`, `EndzoneDepth`, the lighting intensities and the

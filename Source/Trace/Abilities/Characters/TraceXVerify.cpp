@@ -167,9 +167,12 @@ namespace TraceXVerify
 	/**
 	 * Makes the first HUMAN player X and returns their set.
 	 *
-	 * A human, because spec §3 says bots stay characterless and ServerSetCharacter refuses them —
-	 * so in a headless run with bots the host's own pawn is the only candidate, and a harness that
-	 * silently settled for a bot would be testing nothing.
+	 * A human, and it still must be, though the reason changed. It used to be that spec v14 §3 kept
+	 * bots characterless and ServerSetCharacter refused them outright, so a bot was not a legal
+	 * candidate at all. Spec v15 §2 reversed that — a bot holds a real character now — but the
+	 * harness must STILL take the human: it hands its subject a character of its own choosing, and
+	 * doing that to a bot would fight ATraceGameMode::PollCharacterSelect's 4 Hz fill for ownership
+	 * of that player state and measure whichever won.
 	 */
 	UTraceAbilitySetX* MakePlayerIntoX(UWorld* WorldPtr, FString& OutWhy)
 	{

@@ -71,7 +71,10 @@ UTraceOysterPoisonComponent::UTraceOysterPoisonComponent()
 	// clamping before it would be overwritten by the same step it is trying to limit.
 	PrimaryComponentTick.TickGroup = TG_PostPhysics;
 
-	SetIsReplicated(true);
+	// SetIsReplicatedByDefault, NOT SetIsReplicated — same reason as UTraceAbilityInputRelay's
+	// constructor: SetIsReplicated during CDO construction trips a handled ensure at engine init on
+	// every run. The runtime call in EnsureOn below is the legitimate case and is unchanged.
+	SetIsReplicatedByDefault(true);
 }
 
 void UTraceOysterPoisonComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const

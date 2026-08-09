@@ -62,6 +62,7 @@
 #include "TraceAbilitySetMace.generated.h"
 
 class ATraceMaceSpike;
+struct FHitResult;
 
 /** Mace's bits in FTraceAbilityNetState::Flags. Only one character is live per component, so these cannot collide. */
 namespace TraceMaceFlags
@@ -97,10 +98,15 @@ public:
 	 * §6: "+30% magnet radius ... Derive it, do not hardcode." 1 + UTraceSettings::MaceMagnetRadiusBonus,
 	 * read live, so 450 x 1.30 = 585 falls out of CoreCatchRadius and follows it if it is retuned.
 	 *
-	 * NOTHING CALLS THIS YET. Gameplay/TraceCore.cpp must multiply its per-player catch radius by
-	 * UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Candidate); that file is not this slice's.
-	 * The multiplier is correct and provable in isolation (Trace.Mace.Verify prints the derived uu),
-	 * and it does nothing in a live match until that one line lands.
+	 * IT IS WIRED UP. ATraceCore::ServerApplyCatchZone multiplies its PER-CANDIDATE catch radius by
+	 * UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Candidate) — per candidate and not once
+	 * globally, because the magnet is a contest (spec v13 §5) and a single widened radius would have
+	 * let Mace's bonus pull the Core toward her opponent as well. This comment used to say "nothing
+	 * calls this yet", which was true when the character was written and is not true now; the call
+	 * arrived with the integration seam (see TraceAbilityIntegration in TraceAbilityComponent.h) and
+	 * is gated on Trace.Ability.Integration so the whole set of hooks can be shown failing at once.
+	 * Trace.Mace.Verify still proves the multiplier in isolation; Trace.Integration.Verify and the
+	 * MagnetWidenedFrames counter are what prove it is reached in a live match.
 	 */
 	virtual float GetMagnetRadiusMultiplier() const override;
 
@@ -128,12 +134,31 @@ public:
 	 * weakening that check for one character would put a second opinion into the one cooldown
 	 * contract the whole framework rests on. The relay routes the press here instead.
 	 *
-	 * Safe to call on any machine; does nothing unless a spike is embedded and ready.
+	 * Safe to call on any machine. If the spike is still IN FLIGHT the press is REMEMBERED and the
+	 * pull begins on the frame it lands — see bPullQueued.
 	 */
 	void RequestSpikePull();
 
-	/** True when a press of E should be read as the reactivation rather than as a fresh throw. */
+	/**
+	 * True when a press of E should be read as the reactivation rather than as a fresh throw.
+	 *
+	 * TRUE WHILE THE SPIKE IS STILL FLYING, TOO, and that is the point rather than an oversight. The
+	 * alternative is handing the press back to the framework, where TryActivate() refuses it against
+	 * the cooldown this very spike started — so a player who throws and immediately double-taps loses
+	 * the input entirely. Routed here it is remembered instead.
+	 */
 	bool IsSpikeReadyToPull() const;
+
+	/**
+	 * Is there a spike, and has it landed? Reads the ACTOR on the server and the replicated state
+	 * everywhere else, because only the server ever holds the pointer — see the block comment above
+	 * these in the .cpp, which is the bug that made the reactivation unusable on a client.
+	 */
+	bool HasSpikeEmbedded() const;
+	bool HasSpikeInFlight() const;
+
+	/** Where the spike is (or is heading). Actor on the server, replicated AuxLocation elsewhere. */
+	FVector GetSpikeAnchorLocation() const;
 
 	/** Called by the spike actor the frame its flight ends. Server only. */
 	void NotifySpikeEmbedded(ATraceMaceSpike* WhichSpike);
@@ -158,6 +183,9 @@ public:
 
 	/** HARNESS ONLY. The aim sweep on its own: "would a throw from here find a wall, and where?" */
 	bool ResolveSpikeAnchor(FVector& OutAnchor, FVector& OutNormal, FString& OutWhy) const;
+
+	/** The wall test, on one hit: "is this a surface a spike may embed in, and if not, why not?" */
+	bool IsSpikeableSurface(const FHitResult& Hit, FString& OutWhy) const;
 
 private:
 	// --- suspend ------------------------------------------------------------------------------------
@@ -191,6 +219,21 @@ private:
 	 * cancels then.
 	 */
 	bool bPullSkipInputTestThisTick = false;
+
+	/**
+	 * A reactivation pressed while the spike was still travelling, held until it lands.
+	 *
+	 * Nothing may pull on a spike that has not landed, and the framework cannot take the press either
+	 * (TryActivate refuses it against the cooldown the throw just started), so before v15 §6 that
+	 * press was simply gone. A player who throws to reach height and immediately double-taps does
+	 * this every time; at 20000 uu/s the window is a third of a second, which is exactly the length
+	 * of time a dropped input is blamed on the ability being "inconsistent".
+	 *
+	 * A REMEMBERED PRESS, NOT A TIMED WINDOW. Cleared by the pull starting, by the spike going away,
+	 * and by ClearSpike (so a second throw cannot inherit the first throw's press), which means it
+	 * can never outlive the throw that armed it and can never queue a pull she did not ask for.
+	 */
+	bool bPullQueued = false;
 
 	void StartPull();
 	void StopPull(const TCHAR* Why, bool bRemoveSpike);

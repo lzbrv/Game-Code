@@ -25,7 +25,14 @@
 
 namespace TraceCharacterRoster
 {
-	/** ETraceCharacterId::None — the default characterless Mannequin. Bots are always this. */
+	/**
+	 * ETraceCharacterId::None — the default characterless Mannequin.
+	 *
+	 * Who ends up here: mode A (frozen by spec v14 §2), every player when the "disable characters"
+	 * setting is off, and anybody a full team roster cannot serve. NOT bots — this used to say "bots
+	 * are always this", which spec v15 §2 reverses: bots pick like everybody else, they simply pick
+	 * after the humans on their team and are assigned rather than asked.
+	 */
 	inline constexpr uint8 NoneId = 0;
 
 	/** ETraceCharacterId::Rocco. */

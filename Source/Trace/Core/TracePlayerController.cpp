@@ -28,7 +28,7 @@
 #include "InputMappingContext.h"
 #include "InputModifiers.h"
 #include "InputTriggers.h"                 // ETriggerEvent
-#include "Gameplay/TraceMelee.h"           // TraceMelee::RequestSwapWeapon (spec v10 §1)
+#include "Gameplay/TraceMelee.h"           // TraceMelee::RequestEquipIfDifferent (spec v13 §2)
 #include "Movement/TraceCharacterMovementComponent.h"   // dash charges, for the HUD accessors
 #include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
 #include "Trace.h"                         // LogTraceGame
@@ -216,8 +216,8 @@ void ATracePlayerController::BuildInputData()
 		IA_Scoreboard = MakeAction(TEXT("IA_Scoreboard"), EInputActionValueType::Boolean);
 		IA_Crouch     = MakeAction(TEXT("IA_Crouch"),     EInputActionValueType::Boolean);
 		IA_Parry      = MakeAction(TEXT("IA_Parry"),      EInputActionValueType::Boolean);
-		IA_SwapWeapon = MakeAction(TEXT("IA_SwapWeapon"), EInputActionValueType::Boolean);
-		// Spec v13 §2, the two direct-select binds. Boolean like every other button here.
+		// Spec v13 §2, the two direct-select binds — the whole weapon input model as of spec v15 §5,
+		// which deleted IA_SwapWeapon. Boolean like every other button here.
 		IA_EquipKnife = MakeAction(TEXT("IA_EquipKnife"), EInputActionValueType::Boolean);
 		IA_EquipGun   = MakeAction(TEXT("IA_EquipGun"),   EInputActionValueType::Boolean);
 		// SPEC v14 §5 — the ability binds.
@@ -336,7 +336,6 @@ void ATracePlayerController::ApplyControlSettings()
 	MapButton(IA_Dash,       KeyFor(ETraceInputAction::Dash));
 	MapButton(IA_Parry,      KeyFor(ETraceInputAction::Parry));
 	MapButton(IA_Scoreboard, KeyFor(ETraceInputAction::Scoreboard));
-	MapButton(IA_SwapWeapon, KeyFor(ETraceInputAction::SwapWeapon));
 	// Spec v13 §2. Mapped through the same KeyFor/MapButton path as everything else, so the player's
 	// rebind of "1" is honoured on the next settings change without a restart — and so an action the
 	// player has deliberately UNBOUND gets no mapping at all rather than a dead one.
@@ -492,17 +491,12 @@ void ATracePlayerController::SetupInputComponent()
 	EIC->BindAction(IA_Parry, ETriggerEvent::Completed, this, &ATracePlayerController::OnParryCompleted);
 	EIC->BindAction(IA_Parry, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnParryCompleted);
 
-	// Weapon swap (spec v10 §1). PRESS EDGE ONLY. Every other button in this class binds Completed
-	// and Canceled too, for the symmetry argument above — this one must not. The swap is a toggle,
-	// so a release binding would fire a second swap on key-up and the weapon would come back the
-	// instant you let go. There is no held state to release and nothing to strand on lost focus.
-	EIC->BindAction(IA_SwapWeapon, ETriggerEvent::Started, this, &ATracePlayerController::OnSwapWeaponStarted);
-
-	// Spec v13 §2, direct select. PRESS EDGE ONLY, same argument as the toggle above: there is no
-	// held state to release, and a Completed binding would send a second equip request on key-up.
-	// (For the toggle that would have swapped back; for a direct select it would be a redundant
-	// request, which the idempotence guard in HandleDirectEquip would swallow — but a binding that
-	// only works because something downstream ignores it is a binding waiting to be a bug.)
+	// Spec v13 §2, direct select — and, since spec v15 §5 deleted IA_SwapWeapon, the only weapon
+	// binds there are. PRESS EDGE ONLY. Every other button in this class binds Completed and
+	// Canceled too, for the symmetry argument above; these must not. There is no held state to
+	// release, and a Completed binding would send a second equip request on key-up — which the
+	// idempotence guard in HandleDirectEquip would swallow, but a binding that only works because
+	// something downstream ignores it is a binding waiting to be a bug.
 	EIC->BindAction(IA_EquipKnife, ETriggerEvent::Started, this, &ATracePlayerController::OnEquipKnifeStarted);
 	EIC->BindAction(IA_EquipGun,   ETriggerEvent::Started, this, &ATracePlayerController::OnEquipGunStarted);
 
@@ -1126,35 +1120,6 @@ void ATracePlayerController::OnParryCompleted()
 	}
 }
 
-void ATracePlayerController::OnSwapWeaponStarted()
-{
-	// FIRST LINE, before any gate: this counts "the key reached a bound delegate", which is a
-	// different question from "the swap happened" and is the one the v13 §2 harness must be able to
-	// ask. See the counter's declaration for the vacuous-test it exists to prevent.
-	++DebugSwapPressCount;
-
-	if (bGameInputSuppressed)
-	{
-		return;
-	}
-
-	// Spec v10 §1. Same discipline as the parry handler: this makes NO decision of its own.
-	// TraceMelee::RequestSwapWeapon owns every refusal (dead, carrying the Core, mid-pullout,
-	// mid-dash) and owns the client-side prediction plus the server RPC, so it is safe to call from
-	// a listen-server host and from a remote client alike. A second opinion here is how the
-	// predicted weapon and the authoritative weapon start disagreeing.
-	if (ATraceCharacter* TraceChar = GetLivingCharacter())
-	{
-		ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
-		const bool bSwapped = TraceMelee::RequestSwapWeapon(TraceChar, &Refusal);
-		if (InputLogLevel() >= 1)
-		{
-			UE_LOG(LogTraceGame, Display, TEXT("INPUT SwapWeapon pressed -> %s (refusal=%d)"),
-				bSwapped ? TEXT("swapping") : TEXT("refused"), static_cast<int32>(Refusal));
-		}
-	}
-}
-
 void ATracePlayerController::OnEquipKnifeStarted()
 {
 	HandleDirectEquip(/*bWantKnife=*/true, TEXT("EquipKnife"));
@@ -1165,9 +1130,23 @@ void ATracePlayerController::OnEquipGunStarted()
 	HandleDirectEquip(/*bWantKnife=*/false, TEXT("EquipGun"));
 }
 
+#if !UE_BUILD_SHIPPING
+/**
+ * Set only by `Trace.V13.Hotkeys toggle`, the red arm at the bottom of this file. While it is true,
+ * the direct-select handler below routes to the UNGUARDED equip so the harness can watch its own
+ * assertions fail. Cleared again when the probe finishes.
+ *
+ * File-scope and distinctively named rather than an anonymous-namespace static: UBT compiles this
+ * module as a unity/jumbo build, where two files' anonymous namespaces become one.
+ */
+static bool GTraceForceUnguardedEquip = false;
+#endif
+
 void ATracePlayerController::HandleDirectEquip(bool bWantKnife, const TCHAR* ActionLabel)
 {
-	// FIRST LINE, before any gate — see OnSwapWeaponStarted above and the counter's declaration.
+	// FIRST LINE, before any gate: this counts "the key reached a bound delegate", which is a
+	// different question from "the weapon changed" and is the one the v13 §2 harness must be able
+	// to ask. See the counter's declaration for the vacuous test it exists to prevent.
 	++DebugEquipPressCount;
 
 	if (bGameInputSuppressed)
@@ -1192,11 +1171,13 @@ void ATracePlayerController::HandleDirectEquip(bool bWantKnife, const TCHAR* Act
 	// everywhere else — a bot or a console command doing a direct select still restarted the pullout.
 	// A game rule that only holds when a particular key is the thing that asked is not a game rule.
 	//
-	// RequestEquip (the toggle's entry point) is deliberately UNCHANGED and still costs a pullout on
-	// a redundant request; IA_SwapWeapon still calls it. The two verbs want opposite things from a
-	// repeat press and the component now offers both, which is why this is a second function rather
-	// than an edit to the first. Read UTraceWeaponComponent::RequestEquipIfDifferent for the full
-	// argument, including why it is correct mid-pullout.
+	// RequestEquip (the UNGUARDED entry point) is deliberately UNCHANGED and still costs a pullout on
+	// a redundant request. Nothing binds a key to it any more — spec v15 §5 deleted the toggle — but
+	// it is still the console's swap verb and, more usefully, it is what Trace.V13.Hotkeys' RED ARM
+	// substitutes below to prove this test can fail. The two verbs want opposite things from a repeat
+	// press and the component offers both, which is why this is a second function rather than an edit
+	// to the first. Read UTraceWeaponComponent::RequestEquipIfDifferent for the full argument,
+	// including why it is correct mid-pullout.
 	//
 	// The refusal reason is logged rather than acted on: "already holding it" comes back as
 	// false/None, which is distinguishable from a genuine refusal (Dead, Carrying, NoPawn) and is
@@ -1209,7 +1190,19 @@ void ATracePlayerController::HandleDirectEquip(bool bWantKnife, const TCHAR* Act
 	const bool bAlready = (TraceMelee::IsKnifeEquipped(TraceChar) == bWantKnife);
 
 	ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+#if !UE_BUILD_SHIPPING
+	// THE RED ARM, and it is one line on purpose. `Trace.V13.Hotkeys toggle` sets this and the
+	// handler then calls the UNGUARDED equip — same key, same binding, same handler, same press
+	// counter, one gate different. Before spec v15 §5 the red arm reached the unguarded path by
+	// pressing the SwapWeapon key instead, which was a weaker A/B: it changed the action, the
+	// binding, the handler and the counter all at once, so a failure could not be attributed to the
+	// guard. Deleting the toggle bind forced the better version.
+	const bool bEquipped = GTraceForceUnguardedEquip
+		? TraceMelee::RequestEquip(TraceChar, Desired, &Refusal)
+		: TraceMelee::RequestEquipIfDifferent(TraceChar, Desired, &Refusal);
+#else
 	const bool bEquipped = TraceMelee::RequestEquipIfDifferent(TraceChar, Desired, &Refusal);
+#endif
 
 	if (InputLogLevel() >= 1)
 	{
@@ -1435,7 +1428,6 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 	LogAction(TEXT("IA_Parry     "), IA_Parry);
 	LogAction(TEXT("IA_Crouch    "), IA_Crouch);
 	LogAction(TEXT("IA_Scoreboard"), IA_Scoreboard);
-	LogAction(TEXT("IA_SwapWeapon"), IA_SwapWeapon);
 	LogAction(TEXT("IA_EquipKnife"), IA_EquipKnife);
 	LogAction(TEXT("IA_EquipGun  "), IA_EquipGun);
 
@@ -1596,10 +1588,17 @@ void ATracePlayerController::ServerRequestRespawn_Implementation()
 // HOW IT GOES RED, WHICH IS THE PART THAT MATTERS
 //
 //   Trace.V13.Hotkeys toggle
-//       THE RED ARM. Identical sequence, identical assertions, but every press that would be "1"
-//       is sent to the SwapWeapon TOGGLE — the same code path minus the idempotence guard §2 added.
-//       Steps 5 fails on it (the third press swaps the weapon back AND starts a fresh pullout),
-//       which is precisely the behaviour §2 asked to be rid of. Same build, same run, same checks.
+//       THE RED ARM. Identical keys, identical sequence, identical assertions — but the handler is
+//       switched to the UNGUARDED equip (UTraceWeaponComponent::RequestEquip, which re-anchors the
+//       pullout on a redundant request BY DESIGN). Steps 3 and 5 fail on it: the redundant press
+//       restarts the 0.2 s pullout, which is precisely the behaviour §2 asked to be rid of.
+//       Same build, same run, same key, same binding, same handler, ONE GATE DIFFERENT.
+//
+//       SPEC v15 §5 IMPROVED THIS ARM BY DELETING SOMETHING. The old red arm sent the presses to
+//       the SwapWeapon toggle's own key and handler, so it changed the action, the binding, the
+//       handler and the press counter all at once and a failure could not be pinned on the guard.
+//       With the toggle bind gone there was nothing to send them to, and the honest A/B — flip one
+//       flag, change nothing else — is what replaced it.
 //
 // AND HOW IT WAS ITSELF WRONG ONCE, RECORDED BECAUSE THE PROJECT KEEPS PAYING FOR THIS CLASS OF
 // MISTAKE: the first version held each synthetic key for 0.05 s and pressed again 0.05 s later, so
@@ -1632,12 +1631,37 @@ namespace
 		/** Pullout remaining sampled just before the redundant press. */
 		float DeployBeforeRedundant = -1.f;
 
+		/**
+		 * World time the next step is allowed to run, i.e. a GAP FROM THE PREVIOUS STEP rather than a
+		 * deadline measured from the start.
+		 *
+		 * THIS IS A CORRECTION, and the failure it fixes is the one this file's header already warns
+		 * about in another form: a test that passes for the wrong reason, or fails for one. The steps
+		 * used to gate on absolute offsets (T > 0.35, 0.45, 0.53, ...) from the probe's own start. One
+		 * hitch — and the frames right after a match starts are nothing but hitches — put T past ALL of
+		 * them at once, so six steps ran on six consecutive frames with a single frame of pullout decay
+		 * between them and three assertions about a 0.2 s timer failed against perfectly correct
+		 * behaviour. Measured: remaining fell 0.200 -> 0.176 -> 0.148 -> 0.120, a flat 0.028 per step,
+		 * which is one frame and not the 0.08-0.12 s each gap claims.
+		 *
+		 * Gaps cannot be skipped by a hitch: however late a step runs, the next one is still a real
+		 * interval later.
+		 */
+		double NextStepTime = 0.0;
+
+		/** Waits @p Gap seconds from now before the next step. Called as each step completes. */
+		void Advance(double Now, double Gap)
+		{
+			++Step;
+			NextStepTime = Now + Gap;
+		}
+
 		/** Press counter sampled at the moment of the last synthetic press. */
 		int32 CountAtPress = -1;
 
 		/**
-		 * THE RED ARM. When true, every press that would be "1" is sent to the SwapWeapon TOGGLE
-		 * instead, against the identical checks. See the file-block header.
+		 * THE RED ARM. When true the direct-select handler is routed to the UNGUARDED equip for the
+		 * duration of the probe, against the identical checks. See the file-block header.
 		 */
 		bool bToggleArm = false;
 
@@ -1721,9 +1745,14 @@ namespace
 		TSharedRef<FV13HotkeyProbe> Probe = MakeShared<FV13HotkeyProbe>();
 		Probe->bToggleArm = bToggleArm;
 
-		// The knife presses go to the direct-select bind, or — in the red arm — to the toggle.
-		const ETraceInputAction KnifeAction = bToggleArm ? ETraceInputAction::SwapWeapon : ETraceInputAction::EquipKnife;
-		const TCHAR* const KnifeLabel = bToggleArm ? TEXT("SwapWeapon [RED ARM]") : TEXT("EquipKnife");
+		// THE ONLY DIFFERENCE BETWEEN THE ARMS. Same key, same binding, same handler; the handler's
+		// equip call is the one thing that changes. Cleared again when the probe finishes, so a red
+		// run cannot leave the build behaving like the bug it was demonstrating.
+		GTraceForceUnguardedEquip = bToggleArm;
+
+		// Both arms press the SAME key: spec v13 §2's "1".
+		const ETraceInputAction KnifeAction = ETraceInputAction::EquipKnife;
+		const TCHAR* const KnifeLabel = bToggleArm ? TEXT("EquipKnife [RED ARM: unguarded]") : TEXT("EquipKnife");
 
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
 			[Probe, World, KnifeAction, KnifeLabel](float /*Delta*/) -> bool
@@ -1743,28 +1772,51 @@ namespace
 					return true;
 				}
 
+				// ...AND WAIT FOR GAMEPLAY INPUT TO BE LIVE. Spec v14 §3's character-select screen is up
+				// for the first frames of every match: it PAUSES the world and sets
+				// bGameInputSuppressed, so HandleDirectEquip bumps its press counter and then returns
+				// without equipping anything. Measured before this check existed: "pressing EquipKnife
+				// (key One)" was immediately followed by "[CharSelect] Requesting ROCCO" — the 1 key was
+				// picking a character, not drawing a knife — and four assertions failed for a reason
+				// that had nothing to do with what they assert.
+				//
+				// THE PRESS COUNTER DOES NOT CATCH THIS, which is worth stating because it is exactly
+				// the vacuity the counter was added to prevent. It is bumped on the handler's FIRST
+				// line, ahead of the suppression gate on purpose, so it answers "did the key reach a
+				// bound delegate?" and not "did anything happen?". While the select screen is up the
+				// honest answer to the first is yes and to the second is no.
+				if (PC->IsGameInputSuppressed())
+				{
+					return true;
+				}
+
 				// Whichever handler this arm is exercising, this is the count of presses that have
 				// reached a bound delegate. Comparing it either side of a synthetic press is what
 				// makes a swallowed key a FAILURE rather than a silent pass.
-				const int32 PressCount = Probe->bToggleArm
-					? PC->GetDebugSwapPressCount()
-					: PC->GetDebugEquipPressCount();
+				const int32 PressCount = PC->GetDebugEquipPressCount();
 
-				const double Now = FPlatformTime::Seconds();
+				// WORLD TIME, NOT WALL CLOCK, and that is a correction rather than a preference.
+				// Every value this probe asserts on — TraceMelee::GetDeployRemaining, the 0.2 s pullout
+				// — is measured in WORLD seconds, so scheduling the steps off FPlatformTime::Seconds
+				// silently assumed the two run at the same rate. On a machine with other headless rigs
+				// on it they do not: measured at 0.026 s of world time elapsing across 0.080 s of wall
+				// clock, which put step 3's "the pullout has had time to tick down" check a third of the
+				// way to where it thought it was and failed three assertions about behaviour that was
+				// entirely correct. One clock for the schedule and the assertions, and frame rate stops
+				// being able to decide the verdict.
+				const double Now = World->GetTimeSeconds();
 				if (Probe->StartTime < 0.0)
 				{
 					Probe->StartTime = Now;
 					UE_LOG(LogTraceGame, Display,
-						TEXT("[V13.Hotkeys] start on %s, arm=%s. EquipKnife=%s EquipGun=%s SwapWeapon=%s | pullout=%.3fs hold=%.2fs"),
+						TEXT("[V13.Hotkeys] start on %s, arm=%s. EquipKnife=%s EquipGun=%s | pullout=%.3fs hold=%.2fs"),
 						*GetNameSafe(Pawn),
-						Probe->bToggleArm ? TEXT("TOGGLE (RED ARM — these checks are EXPECTED to fail)") : TEXT("direct select"),
+						Probe->bToggleArm ? TEXT("UNGUARDED (RED ARM — these checks are EXPECTED to fail)") : TEXT("direct select"),
 						*UTraceUserSettings::DescribeKey(UTraceUserSettings::Get().GetKey(ETraceInputAction::EquipKnife)),
 						*UTraceUserSettings::DescribeKey(UTraceUserSettings::Get().GetKey(ETraceInputAction::EquipGun)),
-						*UTraceUserSettings::DescribeKey(UTraceUserSettings::Get().GetKey(ETraceInputAction::SwapWeapon)),
 						TraceMelee::GetSwapSeconds(), V13PressHoldSeconds);
 				}
 
-				const double T = Now - Probe->StartTime;
 				const bool bKnife = TraceMelee::IsKnifeEquipped(Pawn);
 				const float Deploy = TraceMelee::GetDeployRemaining(Pawn);
 
@@ -1774,23 +1826,26 @@ namespace
 					// Baseline: put the GUN in hand with the "2" key, so the run starts from a known
 					// weapon whatever the pawn spawned with.
 					V13PressBoundKey(World, ETraceInputAction::EquipGun, TEXT("EquipGun"));
-					++Probe->Step;
+					// 0.35 s: comfortably clear of the 0.2 s pullout the baseline press costs.
+					Probe->Advance(Now, 0.35);
 					break;
 
 				case 1:
-					if (T > 0.35)
+					if (Now >= Probe->NextStepTime)
 					{
 						Probe->Check(!bKnife, TEXT("step 1: '2' put the GUN in hand"));
 						Probe->Check(FMath::IsNearlyZero(Deploy, 1e-3f),
 							FString::Printf(TEXT("step 1: baseline pullout finished (remaining=%.3f)"), Deploy));
 						Probe->CountAtPress = PressCount;
 						V13PressBoundKey(World, KnifeAction, KnifeLabel);
-						++Probe->Step;
+						// 0.10 s: long enough for the press to be delivered and the equip applied, far
+						// short of the 0.2 s pullout it starts — step 2 must land MID-pullout.
+						Probe->Advance(Now, 0.10);
 					}
 					break;
 
 				case 2:
-					if (T > 0.45)
+					if (Now >= Probe->NextStepTime)
 					{
 						Probe->Check(PressCount > Probe->CountAtPress,
 							FString::Printf(TEXT("step 2: the press REACHED the handler (count %d -> %d) — without this the rest of this test would be vacuous"),
@@ -1804,38 +1859,43 @@ namespace
 						// now and the remaining time JUMPS BACK UP to the full 0.2 s.
 						Probe->CountAtPress = PressCount;
 						V13PressBoundKey(World, KnifeAction, KnifeLabel);
-						++Probe->Step;
+						// 0.08 s: still inside the pullout, and enough decay to be measurable.
+						Probe->Advance(Now, 0.08);
 					}
 					break;
 
 				case 3:
-					if (T > 0.53)
+					if (Now >= Probe->NextStepTime)
 					{
 						Probe->Check(PressCount > Probe->CountAtPress,
 							FString::Printf(TEXT("step 3: the REDUNDANT mid-pullout press reached the handler (count %d -> %d)"),
 								Probe->CountAtPress, PressCount));
-						Probe->Check(bKnife, TEXT("step 3: still the KNIFE — direct select did not toggle back to the gun"));
+						Probe->Check(bKnife, TEXT("step 3: still the KNIFE — a repeat press did not put it away again"));
 						Probe->Check(Deploy < Probe->DeployBeforeRedundant,
 							FString::Printf(TEXT("step 3: pullout NOT restarted — remaining fell %.3f -> %.3f"),
 								Probe->DeployBeforeRedundant, Deploy));
-						++Probe->Step;
+						// 0.20 s, up from the 0.12 the absolute schedule allowed: step 4 asserts the
+						// pullout has RUN OUT, and the pullout is 0.2 s from the step-2 press, so 0.12
+						// only ever cleared it because the old deadlines were measured from a common
+						// origin. From here it has to be a full pullout plus slack.
+						Probe->Advance(Now, 0.20);
 					}
 					break;
 
 				case 4:
-					if (T > 0.65)
+					if (Now >= Probe->NextStepTime)
 					{
 						Probe->Check(FMath::IsNearlyZero(Deploy, 1e-3f),
 							FString::Printf(TEXT("step 4: pullout ran to completion (remaining=%.3f)"), Deploy));
 						// And again with the weapon fully up: still nothing.
 						Probe->CountAtPress = PressCount;
 						V13PressBoundKey(World, KnifeAction, KnifeLabel);
-						++Probe->Step;
+						Probe->Advance(Now, 0.10);
 					}
 					break;
 
 				case 5:
-					if (T > 0.75)
+					if (Now >= Probe->NextStepTime)
 					{
 						Probe->Check(PressCount > Probe->CountAtPress,
 							FString::Printf(TEXT("step 5: the third press reached the handler (count %d -> %d)"),
@@ -1844,34 +1904,39 @@ namespace
 						Probe->Check(FMath::IsNearlyZero(Deploy, 1e-3f),
 							FString::Printf(TEXT("step 5: NO new pullout from the redundant press (remaining=%.3f)"), Deploy));
 						V13PressBoundKey(World, ETraceInputAction::EquipGun, TEXT("EquipGun"));
-						++Probe->Step;
+						Probe->Advance(Now, 0.10);
 					}
 					break;
 
 				case 6:
-					if (T > 0.85)
+					if (Now >= Probe->NextStepTime)
 					{
 						Probe->Check(!bKnife, TEXT("step 6: '2' switched back to the GUN"));
 						Probe->Check(Deploy > 0.f,
 							FString::Printf(TEXT("step 6: a genuine change DOES cost a pullout (remaining=%.3f)"), Deploy));
-						++Probe->Step;
+						Probe->Advance(Now, 0.0);
 					}
 					break;
 
 				default:
+					// Put the handler back before reporting, whichever arm ran. A red run that left the
+					// build routing "1" through the unguarded equip would turn a demonstration into the
+					// very regression it was demonstrating.
+					GTraceForceUnguardedEquip = false;
+
 					if (Probe->Failures == 0)
 					{
 						UE_LOG(LogTraceGame, Display,
 							TEXT("[V13.Hotkeys] RESULT: PASS — %d checks (arm=%s). 1 = knife, 2 = gun, direct select, "
 							     "every press verified to have reached the handler, and a redundant press costs no pullout."),
-							Probe->Passes, Probe->bToggleArm ? TEXT("toggle") : TEXT("direct select"));
+							Probe->Passes, Probe->bToggleArm ? TEXT("unguarded") : TEXT("direct select"));
 					}
 					else
 					{
 						UE_LOG(LogTraceGame, Error,
 							TEXT("[V13.Hotkeys] RESULT: FAIL — %d passed, %d FAILED (arm=%s%s)."),
 							Probe->Passes, Probe->Failures,
-							Probe->bToggleArm ? TEXT("toggle") : TEXT("direct select"),
+							Probe->bToggleArm ? TEXT("unguarded") : TEXT("direct select"),
 							Probe->bToggleArm ? TEXT(" — THIS IS THE RED ARM AND FAILING IS THE POINT") : TEXT(""));
 					}
 					return false;   // done
@@ -1883,7 +1948,7 @@ namespace
 
 	FAutoConsoleCommand CmdV13Hotkeys(
 		TEXT("Trace.V13.Hotkeys"),
-		TEXT("Dev only. Spec v13 §2: press the bound EquipKnife/EquipGun keys through the real input pipeline and prove direct select does not re-trigger the pullout. Pass 'toggle' for the RED ARM, which sends the same presses to the SwapWeapon toggle and is expected to FAIL."),
+		TEXT("Dev only. Spec v13 §2: press the bound EquipKnife/EquipGun keys through the real input pipeline and prove direct select does not re-trigger the pullout. Pass 'toggle' for the RED ARM, which sends the SAME presses through the UNGUARDED equip and is expected to FAIL."),
 		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
 		{
 			const bool bToggleArm = (Args.Num() > 0) && Args[0].Equals(TEXT("toggle"), ESearchCase::IgnoreCase);

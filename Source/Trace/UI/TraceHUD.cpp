@@ -3143,25 +3143,18 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 	const float RowH = 28.f * UIScale;
 	const float HeaderH = 30.f * UIScale;
 
-	// Column anchors. Name is left-aligned; the three numeric columns are right-aligned so their
-	// digits line up regardless of width.
+	// Column anchors. Name is left-aligned; the character and the three numeric columns are
+	// right-aligned so their digits line up regardless of width.
 	const float NameX   = X + (12.f * UIScale);
+	const float CharX   = X + Width * 0.58f;
 	const float KillsX  = X + Width * 0.66f;
 	const float DeathsX = X + Width * 0.80f;
 	const float PingX   = X + Width * 0.97f;
 
-	// ---- Header -------------------------------------------------------------------------------
-	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.25f), X, Y, Width, HeaderH);
-
-	const FString TeamLabel = TraceTeamName(Team).ToString().ToUpper();
-	DrawTextLeft(TeamLabel, TeamColor, NameX, VCenterTextY(TeamLabel, FontMedium, UIScale, Y, HeaderH), FontMedium, UIScale);
-
-	const float HeaderTextY = VCenterTextY(TEXT("K"), FontSmall, UIScale, Y, HeaderH);
-	DrawTextRight(TEXT("K"),    TraceHUDStyle::InkDim, KillsX,  HeaderTextY, FontSmall, UIScale);
-	DrawTextRight(TEXT("D"),    TraceHUDStyle::InkDim, DeathsX, HeaderTextY, FontSmall, UIScale);
-	DrawTextRight(TEXT("PING"), TraceHUDStyle::InkDim, PingX,   HeaderTextY, FontSmall, UIScale);
-
 	// ---- Gather this team's players -----------------------------------------------------------
+	//
+	// BEFORE the header, because whether the character column exists at all is a property of the
+	// roster. See bShowCharacters below.
 	TArray<ATracePlayerState*> Members;
 	if (TraceGS != nullptr)
 	{
@@ -3175,6 +3168,44 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 			}
 		}
 	}
+
+	// ---- THE CHARACTER COLUMN (spec v15 §2) ---------------------------------------------------
+	//
+	// "A bot's pick must replicate so the HUD, scoreboard and kill feed show it." Nothing here ever
+	// showed a character for ANYBODY — human or bot — so this column is new for both. The value is
+	// ATracePlayerState::GetSelectedCharacter(), which forwards to the replicated
+	// UTraceAbilityComponent on that player state, so it is already correct on every machine
+	// (proven on a remote client by Trace.Characters.Dump's no-authority fallback).
+	//
+	// DRAWN ONLY WHEN SOMEBODY ON THIS TEAM HOLDS ONE, and that is not tidiness. In mode A and with
+	// the characters toggle off, every player is deliberately the Mannequin (spec v14 §2 / §3), and a
+	// column reading MANNEQUIN ten times is noise that says nothing — worse, it invites the reader to
+	// think something failed. No character on the team means the scoreboard is pixel-identical to the
+	// one that shipped before this pass.
+	bool bShowCharacters = false;
+	for (const ATracePlayerState* Member : Members)
+	{
+		if (Member != nullptr && Member->HasCharacter())
+		{
+			bShowCharacters = true;
+			break;
+		}
+	}
+
+	// ---- Header -------------------------------------------------------------------------------
+	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.25f), X, Y, Width, HeaderH);
+
+	const FString TeamLabel = TraceTeamName(Team).ToString().ToUpper();
+	DrawTextLeft(TeamLabel, TeamColor, NameX, VCenterTextY(TeamLabel, FontMedium, UIScale, Y, HeaderH), FontMedium, UIScale);
+
+	const float HeaderTextY = VCenterTextY(TEXT("K"), FontSmall, UIScale, Y, HeaderH);
+	if (bShowCharacters)
+	{
+		DrawTextRight(TEXT("CHAR"), TraceHUDStyle::InkDim, CharX, HeaderTextY, FontSmall, UIScale);
+	}
+	DrawTextRight(TEXT("K"),    TraceHUDStyle::InkDim, KillsX,  HeaderTextY, FontSmall, UIScale);
+	DrawTextRight(TEXT("D"),    TraceHUDStyle::InkDim, DeathsX, HeaderTextY, FontSmall, UIScale);
+	DrawTextRight(TEXT("PING"), TraceHUDStyle::InkDim, PingX,   HeaderTextY, FontSmall, UIScale);
 
 	// Best first. TArray's pointer overload of Sort wraps the predicate in TDereferenceWrapper,
 	// which is why the lambda takes references rather than pointers.
@@ -3211,6 +3242,24 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 		const float TextY = VCenterTextY(Name, FontSmall, RowTextScale, RowY, RowH);
 
 		DrawTextLeft(Name, RowColor, NameX, TextY, FontSmall, RowTextScale);
+		if (bShowCharacters)
+		{
+			// The roster's OWN name, not a second table. Tinted with that character's accent so the
+			// column is scannable at a glance, dimmed on somebody else's row exactly as the numbers
+			// are. A player the roster could not serve reads MANNEQUIN, which is a real state and
+			// not a fault — see TraceCharacterRoster::NameFor's comment on why it never says "NONE".
+			const uint8 HeldCharacterId = Member->GetSelectedCharacter();
+			const FString CharacterLabel = TraceCharacterRoster::NameFor(HeldCharacterId);
+
+			FLinearColor CharacterColor = RowColor;
+			if (const TraceCharacterRoster::FTraceCharacterEntry* RosterEntry = TraceCharacterRoster::Find(HeldCharacterId))
+			{
+				CharacterColor = bIsLocal ? RosterEntry->Accent
+				                          : TraceHUDStyle::WithAlpha(RosterEntry->Accent, 0.75f);
+			}
+
+			DrawTextRight(CharacterLabel, CharacterColor, CharX, TextY, FontSmall, RowTextScale);
+		}
 		DrawTextRight(FString::FromInt(Member->Kills), RowColor, KillsX, TextY, FontSmall, RowTextScale);
 		DrawTextRight(FString::FromInt(Member->Deaths), RowColor, DeathsX, TextY, FontSmall, RowTextScale);
 		DrawTextRight(FString::FromInt(FMath::RoundToInt(Member->GetPingInMilliseconds())), RowColor,

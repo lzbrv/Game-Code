@@ -199,6 +199,17 @@ namespace TraceAbilityVerify
 		bool bGreenArmRan = false;
 		bool bGreenArmClean = false;
 		bool bGreenArmControlWorked = false;
+
+		/**
+		 * Was the green arm's victim STILL a live Core carrier at the moment of the strike?
+		 *
+		 * Gated on, not merely logged, because this harness was caught printing PASS on a run where
+		 * it was false: the subject died and dropped the Core between the arm header and the strike,
+		 * so the "0 damage to a carrier" reading was 0 damage to a corpse who was not carrying
+		 * anything. 1 run in 3 was a vacuous green reported as a pass — the exact failure mode this
+		 * fixture exists to rule out, sitting inside the fixture.
+		 */
+		bool bGreenArmVictimStillCarrier = false;
 	};
 
 	/** The damage the staged strikes ask for. Unambiguous, and well short of lethal. */
@@ -418,6 +429,7 @@ namespace TraceAbilityVerify
 			// GREEN. The shipped rule. Nothing may have got through, by any measure.
 			State->bGreenArmRan = true;
 			State->bGreenArmControlWorked = bControlWorked;
+			State->bGreenArmVictimStillCarrier = bStillCarrier && (CarrierHealthAfter > 0.f);
 			State->bGreenArmClean = (State->CarrierDamageReturned <= 0.f)
 				&& (CarrierDelta <= 0.01f)
 				&& (AlarmDelta == 0);
@@ -431,20 +443,25 @@ namespace TraceAbilityVerify
 			//   * the RED arm never reached the carrier — then a green arm 1 is not evidence;
 			//   * the CONTROL strike never moved health — then the call under test reaches nothing at
 			//     all and every zero in the run is the fixture's, not the rule's.
+			//   * the GREEN arm's victim was not a live carrier at the strike — then "0 damage to a
+			//     carrier" was 0 damage to somebody who was not carrying, which is not the rule.
+			//     Added after this harness was caught reporting PASS on exactly that, 1 run in 3.
 			const bool bFixtureValid = State->bRedArmRan
 				&& State->bRedArmReachedCarrier
 				&& State->bRedArmControlWorked
-				&& State->bGreenArmControlWorked;
+				&& State->bGreenArmControlWorked
+				&& State->bGreenArmVictimStillCarrier;
 
 			if (!bFixtureValid)
 			{
 				UE_LOG(LogTraceGame, Error,
 					TEXT("[ABILITYCHOKE] VERDICT: INVALID — redArmReachedCarrier=%d redArmControlLanded=%d "
-					     "greenArmControlLanded=%d. The fixture did not demonstrate that it can reach a carrier with "
-					     "the rule removed AND move health on a normal target, so arm 1 passing says nothing about "
-					     "the rule. Fix the fixture before trusting the green."),
+					     "greenArmControlLanded=%d greenArmVictimStillLiveCarrier=%d. The fixture did not "
+					     "demonstrate that it can reach a carrier with the rule removed, move health on a normal "
+					     "target, AND still have a live carrier to strike in the green arm — so arm 1 passing says "
+					     "nothing about the rule. Fix the fixture before trusting the green."),
 					State->bRedArmReachedCarrier ? 1 : 0, State->bRedArmControlWorked ? 1 : 0,
-					State->bGreenArmControlWorked ? 1 : 0);
+					State->bGreenArmControlWorked ? 1 : 0, State->bGreenArmVictimStillCarrier ? 1 : 0);
 			}
 			else if (State->bGreenArmClean)
 			{

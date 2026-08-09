@@ -31,9 +31,12 @@
 //
 // *** IT IS NOT ON UTraceCharacterAbilitySet::GetIncomingDamageMultiplier(), AND THAT IS FORCED. ***
 // That hook is only consulted when the TARGET has an ability set — i.e. when the target has picked a
-// character. Bots are characterless by spec §3 and have no set at all, so a bee that stung a bot
-// would mark nothing. The victim of a mark is not necessarily a character; the victim of a mark is
-// always a health component. UTraceAbilitySetX therefore deliberately does NOT override that hook,
+// character. A player may legitimately have none: mode A freezes everybody to the Mannequin, so does
+// the characters toggle, and so does a full team roster that could not serve them. A mark that only
+// worked on characters would quietly stop working in mode A. (This paragraph used to say "bots are
+// characterless by spec §3"; spec v15 §2 reversed that rule — bots hold characters now — but the
+// conclusion is unchanged.) The victim of a mark is not necessarily a character; the victim of a mark
+// is always a health component. UTraceAbilitySetX therefore deliberately does NOT override that hook,
 // which is also what keeps the amplification from being applied twice on the ability damage path
 // (UTraceAbilityComponent::ModifyDamageThroughPassives runs the hook, then calls ApplyDamage here).
 //

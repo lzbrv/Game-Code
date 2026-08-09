@@ -650,28 +650,45 @@ namespace TraceMelee
 	TRACE_API float GetDeployRemaining(const AActor* Character);
 
 	// ---------------------------------------------------------------------------------------------
-	// ENTRY POINTS. Wire the swap bind, the bots and any debug command to these.
+	// ENTRY POINTS. Wire the weapon binds, the bots and any debug command to these.
+	//
+	// SPEC v15 §5 — "Switch weapon keybind so that it's only switch to knife/switch to gun." THE
+	// PLAYER-FACING ENTRY POINT IS NOW RequestEquipIfDifferent AND NOTHING ELSE: no key is bound to
+	// the toggle any more, and ETraceInputAction has no SwapWeapon enumerator to bind. The two
+	// unguarded verbs below stay because the bots, the dev console and the v13 §2 harness's red arm
+	// all still need "the other one" / "this one, cost included" — they are simply no longer
+	// reachable from a keyboard.
 	// ---------------------------------------------------------------------------------------------
 
 	/**
-	 * THE SWAP. Toggles gun <-> knife on @p Pawn, both directions, one bind.
+	 * THE SWAP VERB. Toggles gun <-> knife on @p Pawn, both directions.
+	 *
+	 * NO LONGER BOUND TO A KEY (spec v15 §5). Its callers are Trace.Knife.Swap / Trace.Knife.SwapIn
+	 * and anything else that genuinely means "give me the other one" without naming it.
 	 *
 	 * Safe from any machine: on the server it swaps directly, on an owning client it predicts the
 	 * swap locally and asks the server. Returns true if a swap started.
 	 */
 	TRACE_API bool RequestSwapWeapon(ATraceCharacter* Pawn, ETraceMeleeRefusal* OutRefusal = nullptr);
 
-	/** As above but explicit about the destination — what the bots want, since they are not toggling. */
+	/**
+	 * As above but explicit about the destination — what the bots want, since they are not toggling.
+	 *
+	 * UNGUARDED: asking for the weapon already in hand re-anchors the 0.2 s pullout, by design. That
+	 * is the whole difference from RequestEquipIfDifferent below, and it is what the v13 §2 harness's
+	 * red arm substitutes to prove its assertions can fail.
+	 */
 	TRACE_API bool RequestEquip(ATraceCharacter* Pawn, ETraceEquippedWeapon Desired,
 		ETraceMeleeRefusal* OutRefusal = nullptr);
 
 	/**
-	 * DIRECT SELECT (spec v13 §2) — the 1 and 2 binds. Asking for the weapon already in hand does
-	 * nothing at all and, crucially, does NOT restart the 0.2 s pullout.
+	 * DIRECT SELECT (spec v13 §2) — the 1 and 2 binds, and as of spec v15 §5 the only weapon input
+	 * there is. Asking for the weapon already in hand does nothing at all and, crucially, does NOT
+	 * restart the 0.2 s pullout.
 	 *
-	 * Use this for a key that names a weapon; use RequestEquip above for a key that toggles or for a
-	 * bot deciding what it needs. The difference is documented in full on
-	 * UTraceWeaponComponent::RequestEquipIfDifferent, which is where the gate lives.
+	 * Use this for a key that names a weapon; use RequestEquip above for a bot deciding what it
+	 * needs. The difference is documented in full on UTraceWeaponComponent::RequestEquipIfDifferent,
+	 * which is where the gate lives.
 	 */
 	TRACE_API bool RequestEquipIfDifferent(ATraceCharacter* Pawn, ETraceEquippedWeapon Desired,
 		ETraceMeleeRefusal* OutRefusal = nullptr);

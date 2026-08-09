@@ -269,15 +269,27 @@ public:
 	 */
 	ETraceCharacterPickResult RequestCharacter(ATracePlayerState* Requester, uint8 RequestedCharacter);
 
-	/** True when a NON-BOT team-mate of @p Team already holds @p CharacterId. @p Except is skipped. */
+	/**
+	 * True when ANY team-mate of @p Team already holds @p CharacterId. @p Except is skipped.
+	 *
+	 * Bots count. They used to be unable to hold anything (spec v14 §3) so this read "NON-BOT"; spec
+	 * v15 §2 reverses that, and the underlying UTraceAbilityComponent::FindTeammateHolding has always
+	 * walked every player state on the team rather than filtering — which is why the rule extended to
+	 * bots without a line changing here.
+	 */
 	bool IsCharacterTakenOnTeam(ETraceTeam InTeam, uint8 CharacterId, const ATracePlayerState* Except) const;
 
 	/**
-	 * The lowest-numbered character no team-mate holds, for the auto-assign. TraceCharacterRoster::
+	 * The lowest-numbered character no team-mate holds, for the HUMAN auto-assign. TraceCharacterRoster::
 	 * NoneId when the team somehow has more players than there are characters.
 	 *
 	 * Deterministic rather than random on purpose: an auto-assign is already a thing the player did
 	 * not choose, and making it also unpredictable makes it impossible to reproduce in a bug report.
+	 *
+	 * NOT what the spec v15 §2 bot fill uses. That one asks UTraceAbilityComponent::
+	 * PickRandomFreeCharacterFor, because "randomly chosen" is the spec's own word for it and because
+	 * five bots taking the roster in order every single match is the thing a player would notice
+	 * first. The asymmetry is deliberate; see PollCharacterSelect.
 	 */
 	uint8 FindFreeCharacterForTeam(ETraceTeam InTeam, const ATracePlayerState* Except) const;
 
@@ -304,6 +316,22 @@ public:
 	 * the header line prints which arm actually ran.
 	 */
 	void StartCharacterSelectVerify(bool bRedArm);
+
+	/**
+	 * Trace.Characters.BotVerify — the scripted proof for spec v15 §2 ("bots pick characters").
+	 *
+	 * Four things organic play will not show you inside one match: that a bot does NOT pick while a
+	 * human on its team is still choosing, that it DOES pick once they are done, that its pick is
+	 * unique on the team, and that an idle human resolves through the select timeout instead of
+	 * deadlocking the bots behind them. Also asserts that the "disable characters" toggle puts bots
+	 * back on the Mannequin.
+	 *
+	 * @param bRedArm true removes BOTH halves of the rule for the run — this class's ordering and
+	 *                random-free fill, AND UTraceAbilityComponent's own refusals. Both, because the
+	 *                rule is enforced twice and the v14 arm proved that reaching one of two
+	 *                enforcement points produces a red run that reports green.
+	 */
+	void StartBotCharacterVerify(bool bRedArm);
 
 	/** Trace.Characters.Dump — the whole roster, who holds what, and every cooldown. */
 	void DumpCharacterState() const;
@@ -823,6 +851,20 @@ private:
 
 	/** Drives PollCharacterSelect(). Looping, quarter second, for the whole session. */
 	FTimerHandle CharacterSelectPollHandle;
+
+	/**
+	 * One-shot latch for "this team has more players than the roster has characters" (spec v15 §2's
+	 * bot fill). Not shipped as a warning per poll: the fill re-enters that branch four times a
+	 * second for as long as the bot has nothing, and a log line at 4 Hz for a whole match is how a
+	 * real warning gets scrolled past. Server-only and never replicated.
+	 */
+	bool bWarnedBotRosterExhausted = false;
+
+	/**
+	 * One-shot latch for "the bot fill is waiting on a human and the select timeout is switched off".
+	 * Same 4 Hz reasoning as bWarnedBotRosterExhausted. Server-only, never replicated.
+	 */
+	bool bWarnedBotFillHasNoTimeout = false;
 
 #if !UE_BUILD_SHIPPING
 	FTimerHandle BotDebugTimerHandle;

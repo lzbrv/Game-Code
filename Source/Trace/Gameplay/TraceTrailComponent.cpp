@@ -3374,7 +3374,9 @@ namespace
 				UE_LOG(LogTraceGame, Warning,
 					TEXT("Trace: the wall fitter found NO rendered arena geometry in %s. It will fall back "
 					     "to collision-only fitting, which cannot see the emissive trim the trace clips "
-					     "into (spec v13 7). Expected on a test map with no ATraceArenaBuilder."),
+					     "into (spec v13 7). Expected ONLY on a test map with no ATraceArenaBuilder and "
+					     "no ATraceBakedPiece — on either of those this warning means the index is "
+					     "broken, not that the map is bare."),
 					*GetNameSafe(InWorld));
 			}
 			else
@@ -3612,7 +3614,17 @@ void UTraceTrailComponent::GatherRenderedLevelBoxes(UWorld* World, TArray<FTrace
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
 		AActor* Actor = *It;
-		if (Actor == nullptr || !Actor->GetClass()->GetName().Contains(TEXT("ArenaBuilder")))
+
+		// BakedPiece as well as ArenaBuilder, and this is a real regression that was measured, not a
+		// precaution: on /Game/Maps/Arena_Baked every mesh lives on an ATraceBakedPiece rather than
+		// on the builder, so an ArenaBuilder-only filter indexed ZERO boxes there against 1269 on
+		// /Game/Maps/Arena. The wall fitter then fell back to collision-only fitting, which cannot
+		// see the emissive trim the trace clips into (spec v13 §7) — the fix silently degraded on
+		// the map the whole bake exists to produce, while still reporting itself healthy.
+		const bool bIsArenaGeometry = Actor != nullptr
+			&& (Actor->GetClass()->GetName().Contains(TEXT("ArenaBuilder"))
+				|| Actor->GetClass()->GetName().Contains(TEXT("BakedPiece")));
+		if (!bIsArenaGeometry)
 		{
 			continue;
 		}

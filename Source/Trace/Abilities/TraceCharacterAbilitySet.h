@@ -173,9 +173,19 @@ public:
 	virtual void OnHalfTime() {}
 
 	/**
-	 * Per-frame, on every machine that has the component. Called from the component's tick, which
-	 * runs on the PlayerState and therefore keeps ticking while the player is DEAD — that is
-	 * deliberate and is how a cooldown counts down through a death.
+	 * *** 20 Hz, NOT PER FRAME. *** On every machine that has the component. Called from the
+	 * component's tick, which runs on the PlayerState and therefore keeps ticking while the player is
+	 * DEAD — that is deliberate and is how a cooldown counts down through a death.
+	 *
+	 * THE RATE IS LOAD-BEARING and this comment used to say "per-frame", which is wrong and will make
+	 * you mis-reason about anything continuous. UTraceAbilityComponent's constructor sets
+	 * PrimaryComponentTick.TickInterval = 0.05f, so DeltaSeconds arrives in ~50 ms lumps while
+	 * physics integrates every frame. Mace's pull and V-suspend write Velocity from here, i.e. they
+	 * write it 20 times a second into a simulation that steps 60+ times a second. That was measured
+	 * rather than assumed (spec v15 §6: 37.9 uu of suspend drift over 1.25 s against 529 uu of free
+	 * fall, pull peak within 6 uu/s of the cap) and found to be adequate — but it is a granularity
+	 * limit, and a future ability that needs frame-accurate integration needs an opt-in on the
+	 * component rather than a character quietly poking PrimaryComponentTick behind its back.
 	 *
 	 * Guard anything that needs a pawn on GetCharacter() != nullptr.
 	 */

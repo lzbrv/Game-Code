@@ -143,7 +143,9 @@ FString TraceCharacterRoster::NameFor(uint8 Id)
 	{
 		// Never "NONE". This string ends up in a kill feed, a log line and on the select screen's
 		// "you are playing as" footer, and "none" reads as a fault where "mannequin" reads as a
-		// deliberate state — which is exactly what it is for bots and for mode A.
+		// deliberate state — which is exactly what it is in mode A, with the characters toggle off,
+		// and for anybody a full team roster could not serve. (It is no longer the bots' permanent
+		// state: spec v15 §2 gives them characters too.)
 		return TEXT("MANNEQUIN");
 	}
 

@@ -141,14 +141,11 @@ public:
 	/** Seconds until the next swing is legal; 0 when it is legal now. HUD and bots. */
 	float GetSwingCooldownRemaining() const;
 
-	/**
-	 * THE SWAP BIND. Toggles gun <-> knife. Local input path only; safe to call on any machine.
-	 *
-	 * Wire the rebindable key to this (through ATraceCharacter, see the pass report). Both
-	 * directions are one bind and one 0.2 s pullout, because the user gave one pullout number and a
-	 * knife that comes up faster than it goes away is a second mechanic nobody asked for.
-	 */
-	void DoSwapWeaponPressed();
+	// DoSwapWeaponPressed() USED TO SIT HERE and is deleted (spec v15 §5). It was "the swap bind" —
+	// the component-level toggle handler — and it had already lost its last caller before §5, because
+	// TraceMelee::RequestSwapWeapon goes straight to RequestEquip. With the F bind gone there is no
+	// key that could ever reach it. The toggle VERB still exists, once, at TraceMelee.h's
+	// RequestSwapWeapon, which is where the console commands and the bots find it.
 
 	/**
 	 * Explicit form of the swap — what the bots and the console commands want, since they are not
@@ -165,9 +162,12 @@ public:
 	 * *** THIS IS A SECOND ENTRY POINT AND NOT A CHANGE TO RequestEquip, WHICH WOULD BE A BUG. ***
 	 * The two verbs want opposite things from a redundant press and both are right:
 	 *
-	 *   SwapWeapon (F) TOGGLES. A second press is a second intent, so it costs a pullout — refusing
-	 *                  it silently would make a double-tap feel like a dropped input. RequestEquip's
-	 *                  own doc comment commits to that, and the bots and console commands rely on it.
+	 *   RequestEquip is UNGUARDED. A redundant request is a second intent, so it costs a pullout —
+	 *                  swallowing it silently would make a double-tap feel like a dropped input.
+	 *                  RequestEquip's own doc comment commits to that. It is no longer on a key
+	 *                  (spec v15 §5 deleted the SwapWeapon toggle that used to be F), but it is still
+	 *                  what the bots, the dev console, TraceMelee::RequestSwapWeapon and the v13 §2
+	 *                  harness's red arm all call, so the behaviour is load-bearing.
 	 *   EquipKnife (1) / EquipGun (2) SELECT. Spec §2, verbatim: "pressing 1 while already holding
 	 *                  the knife does nothing (and must not re-trigger the 0.2 s pullout)." A player
 	 *                  mashing 1 before a fight must not be re-drawing the blade on every press.

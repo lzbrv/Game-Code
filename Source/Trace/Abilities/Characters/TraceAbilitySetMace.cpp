@@ -26,6 +26,7 @@ void UTraceAbilitySetMace::OnEquipped()
 	SuspendEndMatchTime = 0.f;
 	SuspendReadyMatchTime = 0.f;
 	bPulling = false;
+	bPullQueued = false;
 	SpikeEmbedEndMatchTime = 0.f;
 	ClearSpike();
 
@@ -40,10 +41,14 @@ void UTraceAbilitySetMace::OnEquipped()
 		PublishState();
 	}
 
-	UE_LOG(LogTraceGame, Log, TEXT("[Mace] Equipped. magnet x%.2f | suspend %.2fs @ %.0f uu/s | spike %.0f uu, embed %.1fs, pull %.0f uu/s | cooldown %.0fs [ASSUMPTION: §6 unspecified]"),
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Mace] Equipped. magnet x%.2f | suspend %.2fs @ %.0f uu/s | spike %.0f uu @ %.0f uu/s, wall test "
+		     "|n.Z|<=%.2f, aim forgiveness %.0f uu, embed %.1fs, pull %.0f uu/s | cooldown %.0fs [ASSUMPTION: §6 unspecified]"),
 		GetMagnetRadiusMultiplier(),
 		UTraceSettings::Get().MaceSuspendMaxSeconds, UTraceSettings::Get().MaceSuspendLateralSpeedCap,
-		UTraceSettings::Get().MaceSpikeRangeUU, UTraceSettings::Get().MaceSpikeEmbedSeconds,
+		UTraceSettings::Get().MaceSpikeRangeUU, UTraceSettings::Get().MaceSpikeTravelSpeed,
+		UTraceSettings::Get().MaceSpikeMaxSurfaceNormalZ, UTraceSettings::Get().MaceSpikeTraceRadiusUU,
+		UTraceSettings::Get().MaceSpikeEmbedSeconds,
 		GetPullSpeed(), GetActivatedCooldownSeconds());
 }
 
@@ -243,6 +248,30 @@ bool UTraceAbilitySetMace::CanActivate(FText& OutReason) const
 	return true;
 }
 
+bool UTraceAbilitySetMace::IsSpikeableSurface(const FHitResult& Hit, FString& OutWhy) const
+{
+	// "On hitting a WALL it embeds."
+	//
+	// THIS USED TO READ WallJumpMaxNormalZ, on the reasoning that the project should have exactly one
+	// definition of a wall. Trace.Mace.SpikeConsistency measured that reasoning wrong: the wall jump's
+	// 0.40 is a surface 66 degrees off horizontal, so every surface between the 45-degree walkable
+	// limit and 66 degrees was refused — geometry she can neither stand on, walk up, NOR spike. Plates
+	// at |normal.Z| 0.50 and 0.64 scored 0/14.
+	//
+	// MaceSpikeMaxSurfaceNormalZ defaults to the walkable floor limit instead, so the rule the spike
+	// applies is "if she cannot walk on it, she can stick a spike in it". The wall jump keeps its own
+	// number, which is a movement-feel decision that has been tuned against and has no reason to move
+	// because the spike moved.
+	const float MaxNormalZ = FMath::Clamp(UTraceSettings::Get().MaceSpikeMaxSurfaceNormalZ, 0.f, 1.f);
+	if (FMath::Abs(Hit.ImpactNormal.Z) > MaxNormalZ)
+	{
+		OutWhy = FString::Printf(TEXT("hit a surface with |normal.Z| %.2f > %.2f — a floor or a ramp, not a wall"),
+			FMath::Abs(Hit.ImpactNormal.Z), MaxNormalZ);
+		return false;
+	}
+	return true;
+}
+
 bool UTraceAbilitySetMace::ResolveSpikeAnchor(FVector& OutAnchor, FVector& OutNormal, FString& OutWhy) const
 {
 	OutAnchor = FVector::ZeroVector;
@@ -256,7 +285,8 @@ bool UTraceAbilitySetMace::ResolveSpikeAnchor(FVector& OutAnchor, FVector& OutNo
 		return false;
 	}
 
-	const float Range = FMath::Max(100.f, UTraceSettings::Get().MaceSpikeRangeUU);
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const float Range = FMath::Max(100.f, Settings.MaceSpikeRangeUU);
 	const FVector Start = MyPawn->GetMuzzleLocation();
 	const FVector End = Start + MyPawn->GetAimDirection() * Range;
 
@@ -270,29 +300,61 @@ bool UTraceAbilitySetMace::ResolveSpikeAnchor(FVector& OutAnchor, FVector& OutNo
 	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(MaceSpikeThrow), /*bTraceComplex*/ false);
 	QueryParams.AddIgnoredActor(MyPawn);
 
+	// ---- STAGE 1: THE EXACT AIM RAY. Tried first, and it wins whenever it lands. ------------------
+	//
+	// It has to stay first, and it has to stay a line: the crosshair is exact in first person
+	// (ATraceCharacter::GetAimDirection is arithmetically the view forward), so the wall the player
+	// is looking AT must beat any wall the forgiveness below would settle for.
+	FString WhyExactRayFailed;
 	FHitResult Hit;
-	if (!WorldPtr->LineTraceSingleByObjectType(Hit, Start, End, ObjectParams, QueryParams))
+	if (WorldPtr->LineTraceSingleByObjectType(Hit, Start, End, ObjectParams, QueryParams))
 	{
-		OutWhy = FString::Printf(TEXT("nothing within %.0f uu"), Range);
-		return false;
+		if (IsSpikeableSurface(Hit, WhyExactRayFailed))
+		{
+			OutAnchor = Hit.ImpactPoint;
+			OutNormal = Hit.ImpactNormal;
+			OutWhy = TEXT("wall");
+			return true;
+		}
+	}
+	else
+	{
+		WhyExactRayFailed = FString::Printf(TEXT("nothing within %.0f uu"), Range);
 	}
 
-	// "On hitting a WALL it embeds". The project already has exactly one definition of a wall —
-	// UTraceSettings::WallJumpMaxNormalZ, "largest |Normal.Z| still counted as a wall" — and this
-	// reads it rather than inventing a second one, so a floor and a ramp stay non-walls for Mace and
-	// for the wall jump together.
-	const float MaxNormalZ = FMath::Clamp(UTraceSettings::Get().WallJumpMaxNormalZ, 0.f, 1.f);
-	if (FMath::Abs(Hit.ImpactNormal.Z) > MaxNormalZ)
+	// ---- STAGE 2: THE FORGIVENESS SWEEP. Only reached when the exact ray found nothing to stick to.
+	//
+	// An infinitely thin ray misses a 40 uu pillar at 1200 uu on one degree of aim error and a 16 uu
+	// railing on half a degree — while the crosshair is still visibly on them. MEASURED at 5/7 and
+	// 3/7 by Trace.Mace.SpikeConsistency, and the player has no way to tell that silence apart from
+	// a bug. A sphere the width of the spike head is the smallest thing that fixes it.
+	//
+	// bStartPenetrating is refused rather than used: a sweep that begins inside geometry reports the
+	// depenetration direction, not a surface, and anchoring to that would put the spike inside a wall
+	// at a normal nobody asked about. Stage 1 is the path for anything that close.
+	const float SweepRadius = FMath::Clamp(Settings.MaceSpikeTraceRadiusUU, 0.f, 60.f);
+	if (SweepRadius > KINDA_SMALL_NUMBER)
 	{
-		OutWhy = FString::Printf(TEXT("hit a surface with |normal.Z| %.2f > %.2f — a floor or a ramp, not a wall"),
-			FMath::Abs(Hit.ImpactNormal.Z), MaxNormalZ);
-		return false;
+		FHitResult SweepHit;
+		if (WorldPtr->SweepSingleByObjectType(SweepHit, Start, End, FQuat::Identity, ObjectParams,
+				FCollisionShape::MakeSphere(SweepRadius), QueryParams)
+			&& !SweepHit.bStartPenetrating)
+		{
+			FString WhySweepFailed;
+			if (IsSpikeableSurface(SweepHit, WhySweepFailed))
+			{
+				OutAnchor = SweepHit.ImpactPoint;
+				OutNormal = SweepHit.ImpactNormal;
+				OutWhy = TEXT("wall (aim forgiveness sweep)");
+				return true;
+			}
+		}
 	}
 
-	OutAnchor = Hit.ImpactPoint;
-	OutNormal = Hit.ImpactNormal;
-	OutWhy = TEXT("wall");
-	return true;
+	// The exact ray's complaint is the one reported: it is the one that describes what the player was
+	// actually pointing at, and the harness classifies fizzles by reading it.
+	OutWhy = WhyExactRayFailed;
+	return false;
 }
 
 bool UTraceAbilitySetMace::ActivateAbility()
@@ -418,12 +480,66 @@ void UTraceAbilitySetMace::NotifySpikeEmbedded(ATraceMaceSpike* WhichSpike)
 
 	UE_LOG(LogTraceGame, Verbose, TEXT("[Mace] Spike embedded; pullable for %.1fs."),
 		UTraceSettings::Get().MaceSpikeEmbedSeconds);
+
+	// A press made while it was still travelling fires HERE, on the frame it lands. See bPullQueued.
+	if (bPullQueued)
+	{
+		bPullQueued = false;
+		StartPull();
+	}
+}
+
+// =================================================================================================
+// WHOSE SPIKE IS IT — the two accessors below exist because only the SERVER has the pointer
+// =================================================================================================
+//
+// ActivateAbility() spawns the actor inside `if (HasAuthority())`, so `Spike` is set on the server
+// and NEVER on a remote client — the client's copy of the actor exists (it replicates) but nothing
+// hands the ability set a pointer to it. Everything that asked `Spike.Get()` was therefore answering
+// "no spike" on every machine that is not the server, which is why the reactivation could not be
+// pressed on a client at all: IsSpikeReadyToPull() was false, the relay fell through to a fresh
+// TryActivate(), and the cooldown the throw had just started refused it.
+//
+// The replicated scratch pad already carries both facts for the HUD — the flags and AuxLocation —
+// so these read the pointer where it exists and the replicated state everywhere else.
+
+bool UTraceAbilitySetMace::HasSpikeEmbedded() const
+{
+	if (const ATraceMaceSpike* MySpike = Spike.Get())
+	{
+		return MySpike->IsEmbedded();
+	}
+	return !HasAuthority() && (State().Flags & TraceMaceFlags::SpikeEmbedded) != 0;
+}
+
+bool UTraceAbilitySetMace::HasSpikeInFlight() const
+{
+	if (const ATraceMaceSpike* MySpike = Spike.Get())
+	{
+		return !MySpike->IsEmbedded();
+	}
+	return !HasAuthority() && (State().Flags & TraceMaceFlags::SpikeInFlight) != 0;
+}
+
+FVector UTraceAbilitySetMace::GetSpikeAnchorLocation() const
+{
+	if (const ATraceMaceSpike* MySpike = Spike.Get())
+	{
+		return MySpike->GetAnchorLocation();
+	}
+	return State().AuxLocation;
 }
 
 bool UTraceAbilitySetMace::IsSpikeReadyToPull() const
 {
-	const ATraceMaceSpike* MySpike = Spike.Get();
-	if (MySpike == nullptr || !MySpike->IsEmbedded() || bPulling)
+	if (bPulling)
+	{
+		return false;
+	}
+	// IN FLIGHT COUNTS. See RequestSpikePull: the press cannot pull yet, but it must not be handed
+	// back to the framework as a fresh throw either, because TryActivate() will refuse it against the
+	// cooldown this same spike started and the input is then simply gone.
+	if (!HasSpikeEmbedded() && !HasSpikeInFlight())
 	{
 		return false;
 	}
@@ -450,14 +566,28 @@ void UTraceAbilitySetMace::RequestSpikePull()
 	{
 		return;
 	}
+
+	// THE PRESS IS REMEMBERED RATHER THAN DROPPED. A player who throws to reach height and
+	// immediately double-taps is pressing during the flight every single time, and the flight is a
+	// third of a second at the v15 travel speed. Before this the press went nowhere at all: nothing
+	// may pull on a spike that has not landed, so RequestSpikePull returned and TryActivate had
+	// already been ruled out by the cooldown.
+	//
+	// It is a remembered press, NOT a timed window: it is cleared by the pull starting, by the spike
+	// going away, and by a second throw (ClearSpike), so it cannot outlive the throw that armed it.
+	if (!HasSpikeEmbedded())
+	{
+		bPullQueued = true;
+		return;
+	}
+
 	StartPull();
 }
 
 void UTraceAbilitySetMace::StartPull()
 {
-	const ATraceMaceSpike* MySpike = Spike.Get();
 	ATraceCharacter* MyPawn = GetCharacter();
-	if (MySpike == nullptr || MyPawn == nullptr)
+	if (!HasSpikeEmbedded() || MyPawn == nullptr)
 	{
 		return;
 	}
@@ -465,7 +595,8 @@ void UTraceAbilitySetMace::StartPull()
 	StopSuspend(TEXT("pull started"));
 
 	bPulling = true;
-	PullAnchor = MySpike->GetAnchorLocation();
+	bPullQueued = false;
+	PullAnchor = GetSpikeAnchorLocation();
 	PullLastLocation = MyPawn->GetActorLocation();
 	bPullSkipInputTestThisTick = true;
 
@@ -500,6 +631,7 @@ void UTraceAbilitySetMace::StopPull(const TCHAR* Why, bool bRemoveSpike)
 
 	bPulling = false;
 	bPullSkipInputTestThisTick = false;
+	bPullQueued = false;
 
 	if (bRemoveSpike)
 	{
@@ -518,9 +650,11 @@ void UTraceAbilitySetMace::ApplyPull(float DeltaSeconds)
 {
 	ATraceCharacter* MyPawn = GetCharacter();
 	UTraceCharacterMovementComponent* MoveComp = GetMovement();
-	const ATraceMaceSpike* MySpike = Spike.Get();
 
-	if (MyPawn == nullptr || !MyPawn->IsAlive() || MoveComp == nullptr || MySpike == nullptr)
+	// HasSpikeEmbedded() rather than Spike.Get(): on the owning client the pointer is always null (see
+	// the accessors above), so asking for it here cancelled the predicted pull on its very first tick
+	// and the client saw a pull that never moved her.
+	if (MyPawn == nullptr || !MyPawn->IsAlive() || MoveComp == nullptr || !HasSpikeEmbedded())
 	{
 		StopPull(TEXT("pawn or spike gone"), /*bRemoveSpike*/ true);
 		return;
@@ -594,6 +728,9 @@ void UTraceAbilitySetMace::ClearSpike()
 	}
 	Spike.Reset();
 	SpikeEmbedEndMatchTime = 0.f;
+	// A remembered reactivation belongs to ONE throw. ActivateAbility clears the old spike before
+	// spawning the new one, so this is also what stops a press aimed at a spike she has replaced.
+	bPullQueued = false;
 
 	if (HasAuthority())
 	{
@@ -646,6 +783,23 @@ void UTraceAbilitySetMace::TickAbilities(float DeltaSeconds)
 	if (!ShouldDriveMovement())
 	{
 		return;
+	}
+
+	// THE REMEMBERED REACTIVATION. NotifySpikeEmbedded fires this on the server the instant the spike
+	// lands; this is the path for the owning client, where "it landed" arrives as a replicated flag
+	// rather than as a call. Also the place a remembered press is forgotten when the spike it was
+	// meant for stopped existing — a queued press must never survive its own throw.
+	if (bPullQueued && !bPulling)
+	{
+		if (HasSpikeEmbedded())
+		{
+			bPullQueued = false;
+			StartPull();
+		}
+		else if (!HasSpikeInFlight())
+		{
+			bPullQueued = false;
+		}
 	}
 
 	if (bPulling)

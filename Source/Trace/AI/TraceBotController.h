@@ -72,6 +72,7 @@
 #include "UObject/ObjectMacros.h"
 #include "UObject/WeakObjectPtrTemplates.h"
 
+#include "AI/TraceBotAbilityBrain.h"    // spec v15 §3: the ability half of the brain, held by value
 #include "TraceTypes.h"                 // ETraceTeam
 
 #include "TraceBotController.generated.h"
@@ -234,6 +235,16 @@ public:
 	static const TCHAR* StateToString(ETraceBotState InState);
 	static const TCHAR* PassPhaseToString(ETraceBotPassPhase InPhase);
 
+	/**
+	 * Only static geometry blocks this: the Pawn collision profile ignores ECC_Visibility.
+	 *
+	 * PUBLIC for FTraceBotAbilityBrain (spec v15 §3). The ability brain has to answer "can I see the
+	 * player I am about to Sting" and there must be exactly ONE answer to that in the bot layer — a
+	 * second copy in the brain would be free to drift, and "the bots shoot through a wall" and "the
+	 * bots throw jars through a wall" would then be two separate bugs with two separate fixes.
+	 */
+	bool HasLineOfSight(const AActor* Target) const;
+
 protected:
 	// ------------------------------------------------------------------------------------------
 	// Per-tick pipeline
@@ -250,6 +261,39 @@ protected:
 
 	/** Slide, crouch fast-fall and the unstick jump. Runs every tick, after the behaviours. */
 	void UpdateMovementTech(float DeltaSeconds);
+
+	/**
+	 * SPEC v15 §3. Asks FTraceBotAbilityBrain what this bot wants to do with E / V / jump / dash, and
+	 * turns the answer into the same latches the rest of this class uses.
+	 *
+	 * ORDERING, and it is not arbitrary. This runs AFTER the behaviours (which choose ShootTarget and
+	 * DesiredMoveDirection — both are inputs to an ability decision) and BEFORE UpdateCombat (which
+	 * writes the control rotation, and therefore has to know when an ability owns the crosshair). The
+	 * actual key PRESS is deferred to ApplySteering, because Rocco's Ripple composes its direction
+	 * from the pawn's acceleration exactly as the dash does: pressed before AddMovementInput it would
+	 * fire along last frame's steering.
+	 */
+	void UpdateAbilities(float DeltaSeconds);
+
+	/**
+	 * SPEC v15 §3. Presses the keys the brain asked for, through the same entry points a human's key
+	 * press reaches. Called from the tail of ApplySteering — see UpdateAbilities for why.
+	 */
+	void ApplyAbilityInputs();
+
+	/**
+	 * SPEC v15 §3, and it is a BACKSTOP — §2 owns bot character selection.
+	 *
+	 * ATraceGameMode::PollCharacterSelect fills every bot at 4 Hz with a random free character, once
+	 * every human on its team has settled, and it wins essentially every race with this 0.5 Hz poll.
+	 * This runs only for a bot still holding ETraceCharacterId::None, and asks for a RANDOM free one
+	 * so that whichever path gets there first obeys the same sentence of the spec.
+	 *
+	 * It respects the ordering the same way §2 does: it defers while any team-mate's select screen is
+	 * open, and ServerSetCharacter enforces the rest. Behind Trace.Bot.AutoCharacter, whose 0 setting
+	 * is the red arm for "is this behaviour really coming from the character".
+	 */
+	void UpdateAutoCharacter();
 
 	/** Aim, reaction delay, aim error, burst discipline and the trigger. Suppressed while carrying. */
 	void UpdateCombat(float DeltaSeconds);
@@ -457,9 +501,6 @@ protected:
 	 */
 	float HalfFieldLength() const;
 	float HalfFieldWidth() const;
-
-	/** Only static geometry blocks this: the Pawn collision profile ignores ECC_Visibility. */
-	bool HasLineOfSight(const AActor* Target) const;
 
 	/**
 	 * Nearest living enemy inside the profile's engagement range with line of sight, or null.
@@ -682,6 +723,28 @@ private:
 
 	/** Same ordering argument as the dash: a jump is a launch and wants this tick's heading. */
 	bool bWantsJumpThisTick = false;
+
+	// ------------------------------------------------------------------------------------------
+	// Abilities  (spec v15 §3)
+	// ------------------------------------------------------------------------------------------
+
+	/** The per-character decision layer. By value: no replicated state, dies with the controller. */
+	FTraceBotAbilityBrain AbilityBrain;
+
+	/** This tick's orders, produced by UpdateAbilities and consumed by UpdateCombat/ApplySteering. */
+	FTraceBotAbilityOrders AbilityOrders;
+
+	/**
+	 * Mirror of the V (secondary) input, so the release is delivered exactly once.
+	 *
+	 * The same argument as bPassInputHeld, and for the same reason it is dangerous to get wrong: on
+	 * the pawn side a held V is Mace suspended with gravity switched off, and a release that never
+	 * arrives leaves her floating for the rest of the match.
+	 */
+	bool bSecondaryInputHeld = false;
+
+	/** Earliest world time UpdateAutoCharacter may ask again. Also the post-spawn grace period. */
+	float NextAutoCharacterTime = 0.f;
 
 	// ------------------------------------------------------------------------------------------
 	// Timers and per-bot personality

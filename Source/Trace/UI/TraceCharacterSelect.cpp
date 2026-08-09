@@ -9,7 +9,10 @@
 #include "GameFramework/HUD.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/PlatformTime.h"           // FPlatformTime::Cycles64 — the click harness's injector
 #include "InputCoreTypes.h"
+#include "InputKeyEventArgs.h"          // FInputKeyEventArgs — same injector
+#include "Misc/CoreMiscDefines.h"       // FInputDeviceId
 
 #include "Core/TracePlayerState.h"
 #include "Trace.h"                      // LogTraceGame
@@ -17,6 +20,42 @@
 
 #if !UE_BUILD_SHIPPING
 int32 GTraceCharacterSelectDebugPick = 0;
+int32 GTraceCharacterSelectClickTest = 0;
+
+// NAMED, not anonymous: UBT compiles this module as a unity/jumbo build, so two files that each
+// define something at the top of an anonymous namespace become one namespace with two definitions.
+// Scripts/check-jumbo-build-collisions.py gates the build on exactly that.
+namespace TraceCharSelectClickTest
+{
+	/** Frames between stages. Enough that a Tick, and therefore a Draw and a PollInput, lands between. */
+	constexpr uint64 FramesPerStage = 6;
+
+	/** Complete down/up pairs a card is given before the test is called a failure. */
+	constexpr int32 MaxPairs = 3;
+
+	/** One key edge through the same entry point a physical mouse reaches. */
+	void InjectKey(APlayerController* PC, const FKey& Key, bool bPressed)
+	{
+		if (PC == nullptr)
+		{
+			return;
+		}
+
+		// Internal id 0 rather than IPlatformInputDeviceMapper::GetDefaultInputDevice(): that lives in
+		// the ApplicationCore module, and desktop maps keyboard and mouse to id 0. Same call and same
+		// reasoning as ATraceMenuHUD's injector.
+		const FInputKeyEventArgs Args(
+			/*Viewport*/ nullptr,
+			FInputDeviceId::CreateFromInternalId(0),
+			Key,
+			bPressed ? IE_Pressed : IE_Released,
+			/*AmountDepressed*/ bPressed ? 1.f : 0.f,
+			/*bIsTouchEvent*/ false,
+			FPlatformTime::Cycles64());
+
+		PC->InputKey(Args);
+	}
+}
 #endif
 
 namespace TraceSelectStyle
@@ -70,7 +109,22 @@ namespace
 	/** "TAKEN BY BOB" needs the holder's name; APlayerState::GetPlayerName is not const-safe to call blind. */
 	FString SafePlayerName(const ATracePlayerState* State)
 	{
-		return (State != nullptr) ? State->GetPlayerName() : FString(TEXT("A TEAM-MATE"));
+		if (State == nullptr)
+		{
+			return FString(TEXT("A TEAM-MATE"));
+		}
+
+		// The BOT suffix is not decoration. Since spec v15 §2 a card can be greyed out by a computer
+		// team-mate, and "TAKEN BY BOT BLUE 3" is the difference between a player understanding why
+		// and a player thinking the screen is broken. The bot names this project generates already
+		// begin with "BOT ", so the suffix is only added when they do not — a server may rename them.
+		const FString Name = State->GetPlayerName();
+		if (State->IsABot() && !Name.StartsWith(TEXT("BOT"), ESearchCase::IgnoreCase))
+		{
+			return Name + TEXT(" (BOT)");
+		}
+
+		return Name;
 	}
 }
 
@@ -128,18 +182,37 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 			// Start the highlight on the first character no team-mate is believed to hold, so the
 			// default action is a legal one rather than one that will be refused.
 			Highlighted = 0;
+			bool bFoundFree = false;
+
+			// The believed roster, printed once per opening.
+			//
+			// It is here because spec v15 §2 made this screen's belief able to be wrong in a NEW way:
+			// a BOT team-mate can now hold a card, and until §2 this function skipped bots entirely.
+			// A greyed card is otherwise invisible to a headless run and indistinguishable in a
+			// screenshot from a card that failed to draw, so the screen says out loud what it thinks
+			// is taken and by whom — which is also the first thing to read when a player reports
+			// "it would not let me pick".
+			FString RosterBelief;
 			for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
 			{
 				const uint8 CandidateId = static_cast<uint8>(TraceCharacterRoster::FirstId + Index);
-				if (FindTeammateHolding(LocalState, CandidateId) == nullptr)
+				const ATracePlayerState* const Holder = FindTeammateHolding(LocalState, CandidateId);
+
+				if (Holder == nullptr && !bFoundFree)
 				{
 					Highlighted = Index;
-					break;
+					bFoundFree = true;
 				}
+
+				RosterBelief += FString::Printf(TEXT("%s%s=%s"),
+					(Index > 0) ? TEXT(" ") : TEXT(""),
+					*TraceCharacterRoster::NameFor(CandidateId),
+					(Holder != nullptr) ? *SafePlayerName(Holder).ToUpper() : TEXT("free"));
 			}
 
-			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Screen opened (team %s, %.0fs to pick)."),
-				*TraceTeamName(LocalState->Team).ToString(), LocalState->GetCharacterSelectTimeRemaining());
+			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Screen opened (team %s, %.0fs to pick). Believes: %s"),
+				*TraceTeamName(LocalState->Team).ToString(), LocalState->GetCharacterSelectTimeRemaining(),
+				*RosterBelief);
 
 			if (OnOpened)
 			{
@@ -149,6 +222,12 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 		else
 		{
 			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Screen closed."));
+#if !UE_BUILD_SHIPPING
+			// A click that WORKS closes the screen, and Tick returns below without ever reaching the
+			// judging stage. Reporting here is what makes the passing run the one that prints a
+			// verdict, instead of the one that goes quiet.
+			ReportClickTest(LocalState);
+#endif
 			if (OnClosed)
 			{
 				OnClosed();
@@ -184,6 +263,21 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 		GTraceCharacterSelectDebugPick = 0;
 		DebugPick(RequestedId);
 		ConfirmHighlighted(LocalState);
+	}
+
+	// Spec v15 §4. Armed the same way, and for the same reason: the cards have to have been DRAWN
+	// before a cursor can be parked on one.
+	if (GTraceCharacterSelectClickTest != 0 && ClickTestCard == INDEX_NONE)
+	{
+		ClickTestCard = FMath::Clamp(GTraceCharacterSelectClickTest, 1, TraceCharacterRoster::Count) - 1;
+		GTraceCharacterSelectClickTest = 0;
+		ClickTestStage = 0;
+		ClickTestClicks = 0;
+		ClickTestNextFrame = GFrameCounter;
+	}
+	if (ClickTestCard != INDEX_NONE)
+	{
+		ClickTestStep(PC, LocalState);
 	}
 #endif
 
@@ -342,10 +436,20 @@ const ATracePlayerState* FTraceCharacterSelect::FindTeammateHolding(const ATrace
 			continue;
 		}
 
-		// Bots hold nothing (spec v14 §3) and enemies are allowed to mirror the pick, so neither is
-		// consulted. Getting this wrong in the permissive direction merely costs a round trip; getting
-		// it wrong in the restrictive direction would grey out a card the player is entitled to.
-		if (Candidate->IsABot() || Candidate->Team != LocalState->Team)
+		// BOTS ARE CONSULTED NOW. Spec v14 §3 made them permanently characterless and this test used to
+		// skip them for that reason; spec v15 §2 reverses it, and a bot team-mate holding MACE greys
+		// MACE out exactly as a human team-mate would. Leaving the skip in would have been a card that
+		// looked free, was sent, and came back refused — the one outcome this local belief exists to
+		// avoid.
+		//
+		// WHEN THIS ACTUALLY SHOWS SOMETHING. Under §2's ordering the bots on your team hold nothing
+		// while your screen is open, so on a fresh match every card is free. The case it is for is the
+		// player who joins a match ALREADY IN PROGRESS: the bots filled long ago, and their picks are
+		// the only reason a card would be grey.
+		//
+		// Enemies are still skipped: mirroring the pick is legal (§3), so an enemy holding a character
+		// blocks nothing.
+		if (Candidate->Team != LocalState->Team)
 		{
 			continue;
 		}
@@ -360,6 +464,126 @@ const ATracePlayerState* FTraceCharacterSelect::FindTeammateHolding(const ATrace
 }
 
 #if !UE_BUILD_SHIPPING
+void FTraceCharacterSelect::ReportClickTest(ATracePlayerState* LocalState)
+{
+	if (ClickTestCard == INDEX_NONE)
+	{
+		return;
+	}
+
+	const uint8 Picked = (LocalState != nullptr) ? LocalState->GetSelectedCharacter() : TraceCharacterRoster::NoneId;
+	const bool bPicked = TraceCharacterRoster::IsValidId(Picked);
+
+	if (bPicked && ClickTestClicks == 1)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CharSelect.ClickTest] VERDICT: ONE PRESS = ONE ACTION. Card %d locked in %s on click %d."),
+			ClickTestCard + 1, *TraceCharacterRoster::NameFor(Picked), ClickTestClicks);
+	}
+	else if (bPicked)
+	{
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[CharSelect.ClickTest] VERDICT: A CARD NEEDS MORE THAN ONE CLICK. Card %d locked in %s only on click %d."),
+			ClickTestCard + 1, *TraceCharacterRoster::NameFor(Picked), ClickTestClicks);
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[CharSelect.ClickTest] VERDICT: card %d picked NOTHING after %d complete click(s)."),
+			ClickTestCard + 1, ClickTestClicks);
+	}
+
+	ClickTestCard = INDEX_NONE;
+}
+
+void FTraceCharacterSelect::ClickTestStep(APlayerController* PC, ATracePlayerState* LocalState)
+{
+	if (PC == nullptr || LocalState == nullptr || !CardRects[ClickTestCard].bIsValid)
+	{
+		return;
+	}
+	if (GFrameCounter < ClickTestNextFrame)
+	{
+		return;
+	}
+	ClickTestNextFrame = GFrameCounter + TraceCharSelectClickTest::FramesPerStage;
+
+	switch (ClickTestStage)
+	{
+	case 0:
+	{
+		// SetMouseLocation writes the viewport's cached cursor position, which is the exact value
+		// PollInput reads back out of GetMousePosition above.
+		const FVector2D Point = CardRects[ClickTestCard].GetCenter();
+		PC->SetMouseLocation(FMath::RoundToInt(Point.X), FMath::RoundToInt(Point.Y));
+
+		float ReadX = 0.f;
+		float ReadY = 0.f;
+		const bool bReadBack = PC->GetMousePosition(ReadX, ReadY);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CharSelect.ClickTest] card %d: cursor -> (%.0f, %.0f); the screen reads it back as (%.0f, %.0f) valid=%d."),
+			ClickTestCard + 1, Point.X, Point.Y, ReadX, ReadY, bReadBack ? 1 : 0);
+
+		if (!bReadBack)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[CharSelect.ClickTest] No cursor position in this run, so no click can be aimed. "
+				     "That is a harness failure, not a screen failure."));
+			ClickTestCard = INDEX_NONE;
+			return;
+		}
+		ClickTestStage = 1;
+		return;
+	}
+
+	case 1:
+		UE_LOG(LogTraceGame, Display, TEXT("[CharSelect.ClickTest] card %d, click %d: pressing."),
+			ClickTestCard + 1, ClickTestClicks + 1);
+		TraceCharSelectClickTest::InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		ClickTestStage = 2;
+		return;
+
+	case 2:
+		TraceCharSelectClickTest::InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		// Counted HERE, on the release, not at the judging stage below. A successful click closes the
+		// screen, which stops Tick calling this function at all — so if the count only moved at
+		// judging time the run that PASSES would be the one that never printed a verdict. Measured
+		// exactly that way once: "click 1: pressing" then "Requesting OYSTER" and then silence.
+		++ClickTestClicks;
+		ClickTestStage = 3;
+		return;
+
+	default:
+		break;
+	}
+
+	// JUDGE, a stage after the release. APlayerController::InputKey queues the event for the next
+	// input pass and this screen then polls IsInputKeyDown from Tick, so the release needs a pass and
+	// a Tick before it can have had any effect. Judging on the release call itself reports every
+	// surface as needing one extra click — which is the reported bug, manufactured by the harness.
+	//
+	// The server's answer, not our own request: PendingRequest is cleared as soon as the reply lands,
+	// so a test that watched it would race. A granted pick is the only thing a player would call
+	// "the click worked".
+	const bool bPicked = TraceCharacterRoster::IsValidId(LocalState->GetSelectedCharacter());
+
+	if (bPicked)
+	{
+		ReportClickTest(LocalState);
+		return;
+	}
+
+	if (ClickTestClicks >= TraceCharSelectClickTest::MaxPairs)
+	{
+		ReportClickTest(LocalState);
+		return;
+	}
+
+	// Same card, same cursor, another complete click. Back to the press rather than the cursor move:
+	// re-parking every attempt would hide a bug that only bites the FIRST click.
+	ClickTestStage = 1;
+}
+
 void FTraceCharacterSelect::DebugPick(int32 CharacterId)
 {
 	if (!TraceCharacterRoster::IsValidId(static_cast<uint8>(CharacterId)))
@@ -723,6 +947,28 @@ namespace
 		UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Console pick queued: %s."),
 			*TraceCharacterRoster::NameFor(static_cast<uint8>(Requested)));
 	}
+
+	/**
+	 * Trace.Characters.ClickTest <1..5>
+	 *
+	 * Spec v15 §4 for this screen. Parks a real cursor on the card and clicks it through the real
+	 * input pipeline, then reports how many complete clicks it took. One is the requirement.
+	 */
+	void TraceCharacterSelectClickTestCommand(const TArray<FString>& Args)
+	{
+		const int32 Requested = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 1;
+		GTraceCharacterSelectClickTest = FMath::Clamp(Requested, 1, TraceCharacterRoster::Count);
+
+		UE_LOG(LogTraceGame, Display, TEXT("[CharSelect.ClickTest] Queued a click on card %d."),
+			GTraceCharacterSelectClickTest);
+	}
+
+	FAutoConsoleCommand CmdTraceCharacterSelectClickTest(
+		TEXT("Trace.Characters.ClickTest"),
+		TEXT("Dev only. Spec v15 s4. Parks the cursor on card 1..5 and clicks it through the real input "
+		     "pipeline, then reports how many complete clicks the card needed. No effect unless the "
+		     "select screen is open on this machine."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&TraceCharacterSelectClickTestCommand));
 
 	FAutoConsoleCommand CmdTraceCharacterSelect(
 		TEXT("Trace.Characters.Select"),

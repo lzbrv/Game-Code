@@ -121,8 +121,12 @@ namespace TraceMaceOysterVerify
 	}
 
 	/**
-	 * The one player who can legally be given a character: a human (spec §3 keeps bots characterless,
-	 * and ServerSetCharacter refuses them outright).
+	 * The player this harness may safely give a character to: a human.
+	 *
+	 * It used to be the only one who COULD have a character — spec v14 §3 kept bots characterless and
+	 * ServerSetCharacter refused them. Spec v15 §2 reversed that; a bot holds a real character now.
+	 * The human is still the right subject, because a bot's character belongs to
+	 * ATraceGameMode::PollCharacterSelect's fill and this harness would be racing it.
 	 */
 	UTraceAbilityComponent* FindHumanAbilityComponent(UWorld* WorldPtr)
 	{

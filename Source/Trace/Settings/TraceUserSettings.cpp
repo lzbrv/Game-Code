@@ -35,15 +35,6 @@ namespace
 	FKey Default_Pass()        { return EKeys::RightMouseButton; }
 	FKey Default_Scoreboard()  { return EKeys::Tab; }
 	/**
-	 * Swap gun <-> knife (spec v10 §1). The spec asked for "a free key, and state it".
-	 *
-	 * Taken already: WASD, Space (jump), LeftCtrl (crouch/slide), LeftShift (dash), Q (parry),
-	 * mouse1 (fire/swing), mouse2 (pass), Tab (scoreboard). F is unclaimed, sits under the index
-	 * finger without leaving WASD, and is the genre-conventional melee key — so a player who has
-	 * never read a keybind screen will find it first.
-	 */
-	FKey Default_SwapWeapon()  { return EKeys::F; }
-	/**
 	 * Spec v13 §2, verbatim: "Change default keybinds for switching weapons to be: 1 (switch to
 	 * knife) and 2 (switch to gun)."
 	 *
@@ -54,14 +45,19 @@ namespace
 	 * Both pass IsBindableKey: they are real buttons, not axes, not Escape and not AnyKey. Nothing
 	 * else in the table claims a digit, so neither default steals a key from another action on a
 	 * first run (SetKey's stealing rule would have logged it if it did).
+	 *
+	 * SPEC v15 §5: these two are now the ONLY weapon binds. The SwapWeapon toggle that used to sit
+	 * above them — ConfigId "SwapWeapon", default F — is deleted, so F is unclaimed again and a
+	 * player's saved `SwapWeapon=F` line is dropped on load like any other line naming an action
+	 * that no longer exists. See the ETraceInputAction::EquipKnife comment for the full argument.
 	 */
 	FKey Default_EquipKnife()  { return EKeys::One; }
 	FKey Default_EquipGun()    { return EKeys::Two; }
 	/**
-	 * SPEC v14 §5. E and V are NAMED BY THE DOC, so unlike SwapWeapon there is no key to choose here
-	 * — only a collision to check. Taken already: WASD, Space, LeftCtrl, LeftShift, Q, mouse1,
-	 * mouse2, Tab, F, 1, 2. Neither E nor V is claimed by any row above, so neither default steals a
-	 * key on a first run (SetKey's stealing rule would log it if it did).
+	 * SPEC v14 §5. E and V are NAMED BY THE DOC, so there is no key to choose here — only a collision
+	 * to check. Taken already: WASD, Space, LeftCtrl, LeftShift, Q, mouse1, mouse2, Tab, 1, 2.
+	 * Neither E nor V is claimed by any row above, so neither default steals a key on a first run
+	 * (SetKey's stealing rule would log it if it did).
 	 *
 	 * Historical note worth keeping: E was the pre-v3 BOOST key. That action is gone and its ConfigId
 	 * ("Boost") is not this one, so an old TraceUserSettings.ini's `Boost=E` line is dropped by
@@ -87,11 +83,14 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire        },
 		{ ETraceInputAction::Pass,        TEXT("Pass"),        TEXT("PASS CORE"),    &Default_Pass        },
 		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard  },
-		{ ETraceInputAction::SwapWeapon,  TEXT("SwapWeapon"),  TEXT("SWAP WEAPON"),  &Default_SwapWeapon  },
 		// SPEC v13 §2. These two rows exist for the options screen as much as for the game: the
 		// rebind list IS this table, walked in order, so an action that is not here is an action the
 		// player cannot see or rebind however well it is wired up in the controller. "Both new binds
 		// must appear in the settings rebind list" is satisfied by these lines and by nothing else.
+		//
+		// SPEC v15 §5 DELETED THE `SwapWeapon` ROW that used to sit directly above these two. That is
+		// also what removes "SWAP WEAPON" from the options screen's rebind list — the list is this
+		// table walked in order and nothing else, so there is no second place to go and delete it.
 		{ ETraceInputAction::EquipKnife,  TEXT("EquipKnife"),  TEXT("EQUIP KNIFE"),  &Default_EquipKnife  },
 		{ ETraceInputAction::EquipGun,    TEXT("EquipGun"),    TEXT("EQUIP GUN"),    &Default_EquipGun    },
 		// SPEC v14 §5. Same reasoning as the two rows above: the rebind list IS this table, so an
@@ -102,7 +101,7 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		{ ETraceInputAction::AbilitySecondary, TEXT("AbilitySecondary"), TEXT("ABILITY (SECONDARY)"), &Default_AbilitySecondary },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 16,
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 15,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 
@@ -555,6 +554,207 @@ namespace
 #undef TRACE_BINDABLE_VERDICT_ARGS
 #undef TRACE_BINDABLE_VERDICT_TEXT
 	}
+
+	// =============================================================================================
+	// Trace.Settings.VerifyBinds — SPEC v15 §5, the evidence half.
+	//
+	// §5 deletes ETraceInputAction::SwapWeapon, which RENUMBERS every enumerator below it. The claim
+	// is that a player's existing TraceUserSettings.ini survives that unharmed, because the file is
+	// keyed by ConfigId STRING and never by position. That claim is cheap to write and has been
+	// wrong in this codebase before, so this command checks it against the file that is actually on
+	// disk rather than against the in-memory table:
+	//
+	//   1. It reads the RAW `KeyBindings` lines back out of GConfig — the same strings the .ini
+	//      holds — instead of trusting UTraceUserSettings::KeyBindings, which any Save() in the run
+	//      would already have rewritten from the current table.
+	//   2. For every line naming an action that still exists, it asserts the resolved binding IS the
+	//      key that line names. That is what "every other bind still lands on the right action"
+	//      means, and a renumber would break it wholesale.
+	//   3. For every line naming an action that no longer exists — `SwapWeapon=F`, and pre-v3
+	//      `Boost=E` — it asserts the line was DROPPED and names it. Dropped, not defaulted-over:
+	//      the check below proves no surviving action inherited that key.
+	//   4. For every action the file does NOT mention, it asserts the shipped default is in place.
+	//
+	// Together those four exhaust the file: every line is either honoured or explicitly discarded,
+	// and every action is either from the file or from the defaults. There is no third outcome for a
+	// renumber to hide in.
+	// =============================================================================================
+	void VerifyBinds()
+	{
+		UTraceUserSettings& Settings = UTraceUserSettings::Get();
+		const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[VerifyBinds] ===== spec v15 s5: does a pre-v15 TraceUserSettings.ini still load correctly? ====="));
+
+		// Straight out of the config cache, so this reports the FILE and not our own idea of it.
+		TArray<FString> RawLines;
+		const FString Section = UTraceUserSettings::StaticClass()->GetPathName();
+		const FString Filename = UTraceUserSettings::StaticClass()->GetConfigName();
+		if (GConfig != nullptr)
+		{
+			GConfig->GetArray(*Section, TEXT("KeyBindings"), RawLines, Filename);
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[VerifyBinds]   file '%s' section '%s' holds %d KeyBindings line(s)."),
+			*Filename, *Section, RawLines.Num());
+
+		int32 Failures = 0;
+		int32 Honoured = 0;
+		int32 Dropped = 0;
+		TSet<FString> NamedIds;
+
+		for (const FString& Line : RawLines)
+		{
+			FString ConfigId;
+			FString KeyName;
+			if (!Line.Split(TEXT("="), &ConfigId, &KeyName))
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[VerifyBinds]   '%s' is not 'Id=Key'; skipped."), *Line);
+				continue;
+			}
+			ConfigId.TrimStartAndEndInline();
+			KeyName.TrimStartAndEndInline();
+			NamedIds.Add(ConfigId.ToLower());
+
+			const int32 Index = Table.IndexOfByPredicate(
+				[&ConfigId](const FTraceInputActionInfo& Info) { return ConfigId.Equals(Info.ConfigId, ESearchCase::IgnoreCase); });
+
+			if (Index == INDEX_NONE)
+			{
+				++Dropped;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[VerifyBinds]   DROPPED  '%s' — no action by that ConfigId any more. This is the case ")
+					TEXT("spec v15 s5 is about; a 'SwapWeapon=F' line from a pre-v15 build lands here."),
+					*Line);
+				continue;
+			}
+
+			const FKey Wanted(*KeyName);
+			const FKey Actual = Settings.GetKey(static_cast<ETraceInputAction>(Index));
+			const bool bWantsUnbound = KeyName.IsEmpty() || KeyName.Equals(TEXT("None"), ESearchCase::IgnoreCase);
+			const bool bOk = bWantsUnbound ? !Actual.IsValid() : (Actual == Wanted);
+
+			if (bOk)
+			{
+				++Honoured;
+				UE_LOG(LogTraceGame, Display, TEXT("[VerifyBinds]   ok       %-18s -> %-16s (%s)"),
+					*ConfigId, *KeyName, Table[Index].DisplayName);
+			}
+			else
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[VerifyBinds]   WRONG    %-18s asked for '%s' but %s resolved to '%s' — the file has been ")
+					TEXT("read BY POSITION somewhere."),
+					*ConfigId, *KeyName, Table[Index].DisplayName, *Actual.GetFName().ToString());
+			}
+		}
+
+		// Everything the file did not mention must be sitting on its shipped default. This is the half
+		// that catches a dropped line quietly leaking its key onto a neighbour.
+		for (int32 Index = 0; Index < Table.Num(); ++Index)
+		{
+			if (NamedIds.Contains(FString(Table[Index].ConfigId).ToLower()))
+			{
+				continue;
+			}
+
+			const FKey Actual = Settings.GetKey(static_cast<ETraceInputAction>(Index));
+			const FKey Default = Table[Index].DefaultKey();
+			if (Actual == Default)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[VerifyBinds]   default  %-18s -> %s"),
+					Table[Index].ConfigId, *Actual.GetFName().ToString());
+			}
+			else
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[VerifyBinds]   WRONG    %s is not named in the file, so it should be its default '%s', but it is '%s'."),
+					Table[Index].ConfigId, *Default.GetFName().ToString(), *Actual.GetFName().ToString());
+			}
+		}
+
+		// ---- THE VACUITY GUARD, and it is the most important line in this command --------------------
+		//
+		// Everything above passes trivially on a file whose bindings are all defaults, or whose lines
+		// happen to sit in table order: by-ConfigId and by-position agree there, so the run would prove
+		// nothing about the renumber it exists to be worried about. So COUNT the disagreement. This is
+		// what a positional loader — the bug — would have produced from these very lines, and if it is
+		// identical to what we got, the fixture cannot tell the two loaders apart and this run is not
+		// evidence.
+		int32 PositionalWouldDiffer = 0;
+		for (int32 Line = 0; Line < RawLines.Num() && Line < Table.Num(); ++Line)
+		{
+			FString ConfigId;
+			FString KeyName;
+			if (!RawLines[Line].Split(TEXT("="), &ConfigId, &KeyName))
+			{
+				continue;
+			}
+			KeyName.TrimStartAndEndInline();
+
+			const FKey AsPositional(*KeyName);
+			if (Settings.GetKey(static_cast<ETraceInputAction>(Line)) != AsPositional)
+			{
+				++PositionalWouldDiffer;
+			}
+		}
+
+		if (PositionalWouldDiffer == 0)
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[VerifyBinds]   VACUOUS: reading this file BY POSITION would have produced the same ")
+				TEXT("bindings as reading it by ConfigId, so it cannot tell a correct loader from a ")
+				TEXT("renumbered one. Use a file whose binds are non-default and out of table order."));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[VerifyBinds]   discriminating: a by-POSITION read of this file would have put %d of %d ")
+				TEXT("action(s) on the wrong key. It did not, which is the claim."),
+				PositionalWouldDiffer, Table.Num());
+		}
+
+		// The removed action, by name. Stated separately because "SwapWeapon is gone" is the actual
+		// requirement and an empty ini would otherwise let every check above pass vacuously.
+		const bool bSwapGone = Table.IndexOfByPredicate(
+			[](const FTraceInputActionInfo& Info) { return FCString::Stricmp(Info.ConfigId, TEXT("SwapWeapon")) == 0; }) == INDEX_NONE;
+		if (!bSwapGone)
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error, TEXT("[VerifyBinds]   SwapWeapon is STILL in the action table — spec v15 s5 removes it."));
+		}
+
+#define TRACE_VERIFYBINDS_ARGS \
+	(Failures == 0) ? TEXT("THE PRE-v15 FILE LOADS CORRECTLY") : TEXT("A BINDING LANDED ON THE WRONG ACTION"), \
+	Honoured, Dropped, Table.Num(), bSwapGone ? 1 : 0, Failures
+
+#define TRACE_VERIFYBINDS_TEXT \
+	TEXT("[VerifyBinds] VERDICT: %s. %d line(s) honoured, %d stale line(s) dropped, %d action(s) in the ") \
+	TEXT("table, SwapWeapon removed=%d, %d failure(s).")
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display, TRACE_VERIFYBINDS_TEXT, TRACE_VERIFYBINDS_ARGS);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TRACE_VERIFYBINDS_TEXT, TRACE_VERIFYBINDS_ARGS);
+		}
+
+#undef TRACE_VERIFYBINDS_ARGS
+#undef TRACE_VERIFYBINDS_TEXT
+	}
+
+	FAutoConsoleCommand CmdVerifyBinds(
+		TEXT("Trace.Settings.VerifyBinds"),
+		TEXT("Spec v15 s5. Reads the raw KeyBindings lines back out of TraceUserSettings.ini and proves ")
+		TEXT("every line naming a live action resolved to that action's key, every line naming a dead one ")
+		TEXT("(SwapWeapon, Boost) was dropped, and every unmentioned action is on its shipped default."),
+		FConsoleCommandDelegate::CreateStatic(&VerifyBinds));
 
 	FAutoConsoleCommand CmdVerifyBindableKeys(
 		TEXT("Trace.VerifyBindableKeys"),

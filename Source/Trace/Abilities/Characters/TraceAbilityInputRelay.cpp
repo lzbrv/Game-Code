@@ -19,7 +19,13 @@ UTraceAbilityInputRelay::UTraceAbilityInputRelay()
 	// nothing to spread over a slower cadence: a 5 Hz poll would eat presses.
 	PrimaryComponentTick.TickGroup = TG_PrePhysics;
 
-	SetIsReplicated(true);
+	// SetIsReplicatedByDefault, NOT SetIsReplicated. This runs during CDO construction, where
+	// SetIsReplicated trips a handled ensure at engine init on EVERY run — "Ensure condition failed:
+	// !NeedsInitialization() ... SetIsReplicatedByDefault is preferred during Component Construction"
+	// (ActorComponent.cpp). It was firing in every measured run this pass, red arms included, and a
+	// permanent ensure in the log is how a real one gets scrolled past. The runtime call in EnsureOn
+	// below is a different case and stays as it is — see the ordering note there.
+	SetIsReplicatedByDefault(true);
 }
 
 // =================================================================================================
@@ -201,6 +207,13 @@ void UTraceAbilityInputRelay::RouteActivatePressed(APlayerState* ForPlayerState)
 
 	// MACE'S REACTIVATION comes first. See the header: TryActivate() refuses while the cooldown the
 	// throw just started is running, so the second press of Spike cannot reach her through it.
+	//
+	// SPEC v15 §6 WIDENED IsSpikeReadyToPull(): it is now also true while the spike is still IN
+	// FLIGHT, and RequestSpikePull remembers such a press (bPullQueued) and fires it on the frame the
+	// spike lands. So this branch is taken from the moment of the throw, not only once the spike is
+	// embedded — which is the point, because the alternative was routing an in-flight press to a
+	// TryActivate that the cooldown was guaranteed to refuse, i.e. an input the player would swear
+	// they made and the game would swear they did not.
 	if (UTraceAbilitySetMace* Mace = Comp->GetAbilitySetAs<UTraceAbilitySetMace>())
 	{
 		if (Mace->IsSpikeReadyToPull())

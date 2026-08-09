@@ -18,6 +18,9 @@
 #include "Misc/Parse.h"
 #include "Math/UnrealMathUtility.h"
 
+#include "Abilities/TraceAbilityComponent.h"                  // spec v15 §3: the bots' ability path
+#include "Abilities/Characters/TraceAbilityInputRelay.h"      // ...and the E router (Mace's reactivation)
+#include "Abilities/Characters/TraceAbilitySetMace.h"         // ...and IsSpikeReadyToPull, to tell a pull from a throw
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
 #include "Core/TraceGameState.h"
@@ -466,6 +469,27 @@ namespace TraceBotPawnAPI
 }
 
 /**
+ * SPEC v15 §3 — the V (secondary ability) level, mirrored onto the pawn.
+ *
+ * Routed through UTraceAbilityInputRelay::RouteSecondaryEdge, which is the same function a human's V
+ * key reaches, so a bot's suspend obeys every rule a player's does. Named after the file's existing
+ * ApplyPassInput / ApplyCrouchInput pattern: the call site says what it MEANS rather than which
+ * subsystem happens to implement it.
+ */
+static void ApplySecondaryInput(ATraceCharacter* Character, bool bPressed)
+{
+	if (Character == nullptr)
+	{
+		return;
+	}
+
+	if (APlayerState* OwnerState = Character->GetPlayerState<APlayerState>())
+	{
+		UTraceAbilityInputRelay::RouteSecondaryEdge(OwnerState, bPressed);
+	}
+}
+
+/**
  * Crouch as one call, routed to whichever half of the pawn owns it.
  *
  * SetWantsToSlide() is a level on the movement component and is the predicted path; Crouch/UnCrouch
@@ -614,6 +638,36 @@ static TAutoConsoleVariable<int32> CVarTraceBotInterceptFix(
 	ECVF_Default);
 
 #endif // !UE_BUILD_SHIPPING
+
+/**
+ * SPEC v15 §3's dependency on spec v15 §2 — a BACKSTOP now, and a red arm.
+ *
+ * WHAT CHANGED. This was written while §2 was another slice's unlanded work: ServerSetCharacter
+ * refused every bot by name (spec v14 §3, "Bots remain characterless"), so everything in
+ * TraceBotAbilityBrain.cpp was unreachable — not broken, unreachable, which is much harder to
+ * notice — and this poll existed to make §3 measurable at all. §2 HAS LANDED.
+ * ATraceGameMode::PollCharacterSelect fills every bot at 4 Hz, randomly, once the humans on its team
+ * have settled, and it wins essentially every race with this 0.5 Hz poll.
+ *
+ * WHY IT IS STILL HERE, AND STILL 1. It only ever acts on a bot holding ETraceCharacterId::None, so
+ * with §2 working it is a no-op — and if §2 ever leaves a bot behind (a bot spawned mid-match, a
+ * roster edge case), the difference is a bot with no abilities rather than a crash, which is exactly
+ * the failure that is invisible in a playtest. It obeys the same ordering rule §2 does: it defers
+ * while any team-mate's select screen is open, and ServerSetCharacter enforces the rest.
+ *
+ * Set it to 0 to prove a bot ability behaviour is genuinely coming from the character: every
+ * decision then short-circuits at "no character".
+ */
+static TAutoConsoleVariable<int32> CVarTraceBotAutoCharacter(
+	TEXT("Trace.Bot.AutoCharacter"),
+	1,
+	TEXT("1 (default): a bot that STILL has no character once the match is live asks for a random\n")
+	TEXT("   free one. A backstop behind spec v15 §2's own 4 Hz fill, which normally gets there first;\n")
+	TEXT("   per-team uniqueness and §2's 'bots pick after the humans' ordering are enforced by\n")
+	TEXT("   UTraceAbilityComponent::ServerSetCharacter, not here.\n")
+	TEXT("0: this poll never fires. A bot §2 has not yet reached stays characterless and every bot\n")
+	TEXT("   ability decision short-circuits at 'no character', which is an independent red arm."),
+	ECVF_Default);
 
 /** Which rung of the ladder above is in force. Always the top rung in a shipping build. */
 static int32 BotInterceptFixLevel()
@@ -1379,6 +1433,22 @@ void ATraceBotController::OnPossess(APawn* InPawn)
 	SpentDashCharges = 0;
 	NextDashRefillTime = 0.f;
 
+	// SPEC v15 §3. A new body has pressed nothing and wants nothing; the brain re-rolls this life's
+	// ability tempo off the same PersonalitySkillBias the aim and reaction clocks use, so a bot that
+	// dies twenty times does not use its E on the same beat every time.
+	AbilityOrders = FTraceBotAbilityOrders();
+	bSecondaryInputHeld = false;
+	if (const UWorld* AbilityWorld = GetWorld())
+	{
+		const float NowSeconds = static_cast<float>(AbilityWorld->GetTimeSeconds());
+		AbilityBrain.OnPossessed(NowSeconds, PersonalitySkillBias);
+
+		// The auto-character grace period. Deliberately generous: spec v15 §2's own selection has to
+		// be able to win every race, and a bot picking its own character a beat before the select
+		// screen resolves would be this pass quietly overriding another one.
+		NextAutoCharacterTime = NowSeconds + 6.f;
+	}
+
 	// The attacking end has to be re-derived for the new pawn — and it is genuinely allowed to have
 	// changed while this bot was dead, because half time can happen during a respawn.
 	NextEndzoneResolveTime = 0.f;
@@ -1476,13 +1546,22 @@ void ATraceBotController::OnUnPossess()
 		{
 			ApplyCrouchInput(BotCharacter, false);
 		}
+		// SPEC v15 §3. The same argument as the pass input, one level worse: a held V is Mace with
+		// gravity switched off, and a release that never arrives leaves her floating forever.
+		if (bSecondaryInputHeld)
+		{
+			ApplySecondaryInput(BotCharacter, false);
+		}
 	}
 
 	bTriggerHeld = false;
 	bPassInputHeld = false;
 	bCrouchHeld = false;
+	bSecondaryInputHeld = false;
 	PassPhase = ETraceBotPassPhase::None;
 	PassReceiver = nullptr;
+	AbilityBrain.OnUnPossessed();
+	AbilityOrders = FTraceBotAbilityOrders();
 
 	Super::OnUnPossess();
 }
@@ -1563,15 +1642,25 @@ void ATraceBotController::Tick(float DeltaSeconds)
 			{
 				ApplyCrouchInput(BotCharacter, false);
 			}
+			if (bSecondaryInputHeld)
+			{
+				ApplySecondaryInput(BotCharacter, false);
+			}
 		}
 
 		bTriggerHeld = false;
 		bPassInputHeld = false;
 		bCrouchHeld = false;
+		bSecondaryInputHeld = false;
 		PassPhase = ETraceBotPassPhase::None;
 		PassReceiver = nullptr;
 		bCommitCarryIn = false;
 		State = ETraceBotState::Idle;
+
+		// The cooldown keeps running while dead (spec v14 §5) and that is deliberate, but a latched
+		// INTENT must not survive: the reason it was latched for died with the pawn.
+		AbilityBrain.OnUnPossessed();
+		AbilityOrders = FTraceBotAbilityOrders();
 		return;
 	}
 
@@ -1728,9 +1817,15 @@ void ATraceBotController::Tick(float DeltaSeconds)
 		AbortPass(bCompleted ? TEXT("transfer landed") : TEXT("lost the Core mid-attempt"));
 	}
 
+	// SPEC v15 §3. Between the behaviours and the aim, for the ordering argument on UpdateAbilities().
+	UpdateAutoCharacter();
+	UpdateAbilities(DeltaSeconds);
+
 	UpdateCombat(DeltaSeconds);
 	UpdateMovementTech(DeltaSeconds);
 	ApplySteering(DeltaSeconds);
+
+	TraceBotAbilityStats::Poll(GetWorld());
 
 #if !UE_BUILD_SHIPPING
 	// Measurement only, and only when a run asked for it. See the TraceBotTelemetry block above for
@@ -4694,6 +4789,281 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 }
 
 // =================================================================================================
+// ABILITIES  (spec v15 §3)
+//
+// The DECISION is in FTraceBotAbilityBrain (AI/TraceBotAbilityBrain.h). What lives here is the
+// plumbing: gathering the situation the brain is allowed to see, and turning its orders into the
+// same key presses a human makes. Nothing below decides what an ability does to anybody — every
+// effect still runs inside the character's own ability set, behind the spec §4 choke point.
+// =================================================================================================
+
+void ATraceBotController::UpdateAbilities(float DeltaSeconds)
+{
+	UWorld* World = GetWorld();
+	ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (World == nullptr || BotCharacter == nullptr)
+	{
+		AbilityOrders = FTraceBotAbilityOrders();
+		return;
+	}
+
+	FTraceBotAbilitySituation Situation;
+	Situation.Self               = BotCharacter;
+	Situation.BotController      = this;
+	Situation.Abilities          = UTraceAbilityComponent::Get(BotCharacter);
+	Situation.BotState           = State;
+	Situation.Enemies            = &LiveEnemies;
+	Situation.Carrier            = Carrier.Get();
+	Situation.bIAmCarrier        = bIAmCarrier;
+	Situation.bTeammateIsCarrier = bTeammateIsCarrier;
+	Situation.bEnemyIsCarrier    = bEnemyIsCarrier;
+	Situation.ShootTarget        = ShootTarget.Get();
+	// Lining up counts as passing here as well as holding: the aim is already committed to a
+	// team-mate, and an ability that grabbed the crosshair back would abort the attempt.
+	Situation.bPassing           = (PassPhase == ETraceBotPassPhase::Lining
+	                                || PassPhase == ETraceBotPassPhase::Holding
+	                                || PassPhase == ETraceBotPassPhase::Charging);
+	Situation.DesiredMoveDirection = DesiredMoveDirection;
+	Situation.AttackGoal         = GetAttackGoalLocation();
+	Situation.DashCharges        = GetDashCharges();
+	Situation.Now                = static_cast<float>(World->GetTimeSeconds());
+
+	AbilityBrain.Plan(Situation, DeltaSeconds, AbilityOrders);
+
+	// --- apply the two orders that are not key presses --------------------------------------------
+
+	// Mace's spike pull is cancelled by ANY movement input (spec v14 §6), and a bot steers every
+	// frame — so the only way for a bot to use the pull at all is to genuinely let go of the stick.
+	// Checked before the redirect because the two are mutually exclusive and this one is a hard rule
+	// rather than a preference.
+	if (AbilityOrders.bSuppressMove)
+	{
+		DesiredMoveDirection = FVector::ZeroVector;
+	}
+	// Rocco's midair redirect only means anything if the bot is also steering the new way on the same
+	// frame — the ability blends the pawn's velocity toward its ACCELERATION, so with no steering
+	// change it is a small hop and nothing else.
+	else if (AbilityOrders.bOverrideMove && !AbilityOrders.MoveDirection.IsNearlyZero())
+	{
+		DesiredMoveDirection = AbilityOrders.MoveDirection.GetSafeNormal();
+	}
+
+	// V is a LEVEL, so it is mirrored rather than pressed: the edge is wherever the level changes,
+	// and every other exit from this class (death, unpossess) releases it explicitly.
+	if (AbilityOrders.bSecondaryHeld != bSecondaryInputHeld)
+	{
+		bSecondaryInputHeld = AbilityOrders.bSecondaryHeld;
+		ApplySecondaryInput(BotCharacter, bSecondaryInputHeld);
+
+		if (Situation.Abilities != nullptr)
+		{
+			TraceBotAbilityStats::NoteSecondary(Situation.Abilities->GetCharacterId(), bSecondaryInputHeld);
+		}
+	}
+
+	// A dash asked for by an ability goes through the SAME charge model everything else uses, so a
+	// Chut bot cannot bash its way out of the reserve a carrier is supposed to keep back.
+	//
+	// Counted only in [BotAbility], deliberately NOT in the existing [BotKit] dash counters: those
+	// three (trace / escape / duel) are a partition of why a dash was spent, and folding a fourth
+	// reason into one of them would corrupt a number this project has already tuned against twice.
+	if (AbilityOrders.bDash && RequestDash(/*bReserveLast=*/bIAmCarrier))
+	{
+		if (Situation.Abilities != nullptr)
+		{
+			TraceBotAbilityStats::NoteAbilityDash(Situation.Abilities->GetCharacterId());
+			TraceBotAbilityStats::NoteLatency(AbilityOrders.MeasuredLatencySeconds);
+		}
+	}
+
+	// The jump is raised here and consumed in ApplySteering, where the ability hook gets first
+	// refusal — same ordering argument as the dash.
+	if (AbilityOrders.bJump)
+	{
+		bWantsJumpThisTick = true;
+	}
+}
+
+void ATraceBotController::ApplyAbilityInputs()
+{
+	if (!AbilityOrders.bActivate)
+	{
+		return;
+	}
+	AbilityOrders.bActivate = false;   // one press per order, whatever happens below
+
+	ATraceCharacter* BotCharacter = GetBotCharacter();
+	UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(BotCharacter);
+	if (Abilities == nullptr)
+	{
+		return;
+	}
+
+	const ETraceCharacterId MyCharacter = Abilities->GetCharacterId();
+	if (MyCharacter == ETraceCharacterId::None)
+	{
+		return;
+	}
+
+	// The cooldown BEFORE the press, so "did it fire" is a fact rather than an inference. A press
+	// that lands moves the deadline; one refused by CanActivate or fizzled (Mace's spike finding no
+	// wall) leaves it exactly where it was.
+	const float CooldownBefore = Abilities->GetActivatedCooldownRemaining();
+
+	// Mace's reactivation is the one press that is NOT an activation, and telling the two apart
+	// afterwards is impossible (a pull charges no cooldown, and neither does a refusal), so ask
+	// before pressing.
+	bool bWasSpikePull = false;
+	if (const UTraceAbilitySetMace* Mace = Abilities->GetAbilitySetAs<UTraceAbilitySetMace>())
+	{
+		bWasSpikePull = Mace->IsSpikeReadyToPull();
+	}
+
+	// THE HUMAN'S PATH, not a private one. RouteActivatePressed is where "a second E means PULL"
+	// lives — UTraceAbilityComponent::TryActivate() cannot carry it, because the throw has just
+	// started a 20 s cooldown. See TraceAbilityInputRelay.h.
+	UTraceAbilityInputRelay::RouteActivatePressed(BotCharacter->GetPlayerState<APlayerState>());
+
+	const bool bFired = bWasSpikePull
+		|| (Abilities->GetActivatedCooldownRemaining() > CooldownBefore);
+
+	TraceBotAbilityStats::NoteActivate(MyCharacter, bFired, bWasSpikePull, AbilityOrders.Reason,
+		GetPlayerState<APlayerState>());
+	TraceBotAbilityStats::NoteLatency(AbilityOrders.MeasuredLatencySeconds);
+}
+
+void ATraceBotController::UpdateAutoCharacter()
+{
+	if (CVarTraceBotAutoCharacter.GetValueOnAnyThread() == 0)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	const float Now = static_cast<float>(World->GetTimeSeconds());
+	if (Now < NextAutoCharacterTime)
+	{
+		return;
+	}
+	NextAutoCharacterTime = Now + 2.f;
+
+	APlayerState* MyState = GetPlayerState<APlayerState>();
+	UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(MyState);
+	if (MyState == nullptr || Abilities == nullptr)
+	{
+		return;
+	}
+
+	if (Abilities->GetCharacterId() != ETraceCharacterId::None)
+	{
+		return;   // somebody has already given this bot a character. Nothing to do.
+	}
+
+	// Characters off (the §3 toggle, or mode A's freeze) means characterless is the CORRECT state and
+	// this function must not fight it. UTraceAbilityComponent::AreCharactersEnabled is the one answer
+	// to that question for the whole project; asked rather than re-derived.
+	if (!UTraceAbilityComponent::AreCharactersEnabled(this))
+	{
+		return;
+	}
+
+	// ---- DEFER TO A SELECTION THAT IS STILL IN PROGRESS ------------------------------------------
+	//
+	// Spec v15 §2's ordering requirement, respected from the outside: "bots must not pick until every
+	// human on their team has locked in". This function cannot know whose turn it is, but it can see
+	// that SOMEBODY on this team still has the select screen open — and while that is true, picking
+	// would be exactly the queue-jump §2 forbids. The existing 30 s select timeout is what guarantees
+	// this is not a deadlock: it closes every screen and auto-assigns, and only then does this run.
+	//
+	// Costs one scan of at most ten player states, on a 2 s poll.
+	if (const AGameStateBase* BaseState = World->GetGameState())
+	{
+		const ATracePlayerState* MyTraceState = Cast<ATracePlayerState>(MyState);
+		for (const APlayerState* Entry : BaseState->PlayerArray)
+		{
+			const ATracePlayerState* Other = Cast<ATracePlayerState>(Entry);
+			if (Other == nullptr || Other == MyTraceState)
+			{
+				continue;
+			}
+			if (MyTraceState != nullptr && Other->Team != MyTraceState->Team)
+			{
+				continue;   // per-team uniqueness is per team; the other side's screen is not our business
+			}
+			if (Other->IsCharacterSelectOpen())
+			{
+				return;
+			}
+		}
+	}
+
+	// A -TraceBotCharacterOverride SCAFFOLD USED TO SIT HERE and is deleted. It cleared
+	// APlayerState::bIsABot so a bot could hold a character at all, because two places then enforced
+	// spec v14 §3's "bots remain characterless" — UTraceAbilityComponent::ServerSetCharacter refused
+	// bots outright, and ATraceGameMode::PollCharacterSelect swept any character a bot was holding
+	// back off it. Spec v15 §2 reversed both, so the scaffold is dead: bots hold characters through
+	// the ordinary path now. Do not bring it back; forcing bIsABot false also breaks scoreboard and
+	// kill-feed bot labelling, which is exactly the sort of measurement distortion §2 no longer needs.
+
+	// A character nobody on this team holds, chosen at RANDOM among the free ones — spec v15 §2, "all
+	// loading in with randomly chosen characters". The framework's own picker, so per-team uniqueness
+	// is its rule and not a second copy of it here.
+	//
+	// PickRandomFreeCharacterFor, not PickFreeCharacterFor (which returns the lowest free id): this is
+	// the second of the two paths that can assign a bot a character — ATraceGameMode::
+	// PollCharacterSelect's 4 Hz fill is the first, and it wins nearly every race — and the two must
+	// obey the same sentence of the spec. A bot filled by whichever path happened to get there first
+	// must not be the difference between "random" and "always Rocco".
+	const ETraceCharacterId Wanted = UTraceAbilityComponent::PickRandomFreeCharacterFor(MyState);
+	if (Wanted == ETraceCharacterId::None)
+	{
+		return;   // the team is full of characters. Fine: this bot plays as a Mannequin.
+	}
+
+	Abilities->ServerSetCharacter(Wanted);
+
+	if (Abilities->GetCharacterId() == Wanted)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[BotAbility] %s took %s (Trace.Bot.AutoCharacter)."),
+			*MyState->GetPlayerName(), TraceCharacterIdToString(Wanted));
+		return;
+	}
+
+	// REFUSED — say so once instead of retrying in silence for the whole match, but note that this is
+	// no longer the alarm it was.
+	//
+	// Since spec v15 §2 there are exactly two ways ServerSetCharacter refuses a bot, and BOTH are
+	// TEMPORARY and self-resolving, so this poll picking the character up two seconds later is the
+	// expected outcome rather than a failure:
+	//
+	//   1. THE ORDERING GATE. A human on this bot's team has not settled yet (§2: "the computers
+	//      should wait for any actual humans on its team to choose"). The 30 s select timeout is what
+	//      guarantees it ends — and note the screen-open scan above already catches the common case,
+	//      so reaching here means a human whose screen is shut but who holds no character yet.
+	//   2. PER-TEAM UNIQUENESS. Somebody took this character between the pick above and the request —
+	//      the game mode's 4 Hz fill is the other assignment path and it usually gets there first.
+	//
+	// It is a Log and not a Warning for that reason. What it must NOT say is the thing it used to:
+	// that ServerSetCharacter "still enforces spec v14 §3, bots stay characterless". That rule is
+	// gone, and a reader chasing it would be chasing code that no longer exists.
+	static bool bWarnedRefused = false;
+	if (!bWarnedRefused)
+	{
+		bWarnedRefused = true;
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[BotAbility] %s asked for %s and was refused — either a human on its team has not settled "
+			     "yet (spec v15 §2's ordering rule) or a team-mate took it first. Both are temporary; this "
+			     "poll retries every 2s and the select timeout bounds the wait. Logged once."),
+			*MyState->GetPlayerName(), TraceCharacterIdToString(Wanted));
+	}
+}
+
+// =================================================================================================
 // Combat
 // =================================================================================================
 
@@ -4760,6 +5130,34 @@ void ATraceBotController::UpdateCombat(float DeltaSeconds)
 		FRotator NewRotation = FMath::RInterpConstantTo(GetControlRotation(), DesiredRotation, DeltaSeconds, TurnRate);
 		NewRotation.Roll = 0.f;
 		SetControlRotation(NewRotation);
+		return;
+	}
+
+	// --- ...and so does an AIMED ability (spec v15 §3) ---------------------------------------------
+	//
+	// Mace's spike goes where she is LOOKING and Oyster's jar is lobbed along the aim direction, so
+	// for those the crosshair has a job that is not shooting — exactly as it does during a pass, and
+	// handled the same way rather than by biasing the combat aim, because a blended aim would satisfy
+	// neither. Ranked BELOW the pass: dropping the shield is the more dangerous commitment and the
+	// brain already declines to plan anything while one is in flight.
+	//
+	// The trigger comes off for the duration, for the same reason it does during a pass: the aim
+	// point here is frequently a WALL (Mace) or a patch of floor (Oyster), and a held trigger would
+	// empty a burst into it. The gate below is measured against the bot's own aim point, so without
+	// this a bot lining up a spike would read as "on target" and fire the whole time.
+	if (AbilityOrders.bOwnsAim)
+	{
+		const FRotator DesiredRotation = (AbilityOrders.AimPoint - BotCharacter->GetPawnViewLocation()).Rotation();
+		const float TurnRate = FMath::Max(10.f, Profile.AimTurnRateDegrees);
+		FRotator NewRotation = FMath::RInterpConstantTo(GetControlRotation(), DesiredRotation, DeltaSeconds, TurnRate);
+		NewRotation.Roll = 0.f;
+		SetControlRotation(NewRotation);
+
+		if (bTriggerHeld)
+		{
+			BotCharacter->DoFireReleased();
+			bTriggerHeld = false;
+		}
 		return;
 	}
 
@@ -5625,6 +6023,12 @@ void ATraceBotController::ApplySteering(float DeltaSeconds)
 	// ticks: UTraceCharacterMovementComponent::BeginDash locks the direction from Acceleration,
 	// which is derived from the input vector we have only just contributed, and the jump wants the
 	// same frame's heading. The tick prerequisite installed in OnPossess guarantees that ordering.
+	// SPEC v15 §3. E goes here and not earlier, and the reason is the same one the dash has: Rocco's
+	// Ripple composes its direction with the SAME pure function the dash uses
+	// (UTraceCharacterMovementComponent::ComputeDashDirection over the pawn's acceleration), so a
+	// press issued before AddMovementInput lays the path along last frame's steering.
+	ApplyAbilityInputs();
+
 	if (bWantsDashThisTick)
 	{
 		BotCharacter->DoDash();
@@ -5633,7 +6037,28 @@ void ATraceBotController::ApplySteering(float DeltaSeconds)
 
 	if (bWantsJumpThisTick)
 	{
-		BotCharacter->Jump();
+		// THE ABILITY GETS FIRST REFUSAL ON THE JUMP KEY, exactly as it does for a human — see
+		// ATracePlayerController::OnJumpStarted. Rocco's midair redirect and Oyster's jar jump both
+		// live behind this hook, and a bot that called Jump() directly would be the one player on the
+		// field for whom those two abilities did not exist. Everybody else returns false and reaches
+		// ACharacter::Jump exactly as before.
+		//
+		// No ServerHandleJumpPressed: a bot controller only ever exists on the server, so the call
+		// above already WAS the authoritative one.
+		bool bAbilityTookTheJump = false;
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(BotCharacter))
+		{
+			if (Abilities->GetCharacterId() != ETraceCharacterId::None && TraceBotAbilityStats::AbilitiesEnabled())
+			{
+				bAbilityTookTheJump = Abilities->HandleJumpPressed();
+				TraceBotAbilityStats::NoteAbilityJump(Abilities->GetCharacterId(), bAbilityTookTheJump);
+			}
+		}
+
+		if (!bAbilityTookTheJump)
+		{
+			BotCharacter->Jump();
+		}
 	}
 	bWantsJumpThisTick = false;
 }

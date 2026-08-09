@@ -1453,8 +1453,10 @@ namespace
 			{ TEXT("MaceSuspendCooldownSeconds"),      EKnobType::Float, TEXT("v14 §6: UNSPECIFIED; shipped at 0") },
 			{ TEXT("MaceSpikeRangeUU"),                EKnobType::Float, TEXT("v14 §6: 'a medium distance'") },
 			{ TEXT("MaceSpikeTravelSpeed"),            EKnobType::Float, TEXT("v14 §6: how fast the spike reaches its wall") },
+			{ TEXT("MaceSpikeMaxSurfaceNormalZ"),      EKnobType::Float, TEXT("v15 §6: largest |Normal.Z| still called a wall — half of the inconsistency fix") },
+			{ TEXT("MaceSpikeTraceRadiusUU"),          EKnobType::Float, TEXT("v15 §6: forgiveness sweep radius — the other half of the inconsistency fix") },
 			{ TEXT("MaceSpikeEmbedSeconds"),           EKnobType::Float, TEXT("v14 §6: embeds in a WALL for 2s") },
-			{ TEXT("MaceSpikePullSpeedMultiplier"),    EKnobType::Float, TEXT("v14 §6: pull at the momentum ceiling = air-strafe hard cap. DERIVED") },
+			{ TEXT("MaceSpikePullSpeedMultiplier"),    EKnobType::Float, TEXT("v15 §6: 2.0 — the pull became the slow part once the range tripled") },
 			{ TEXT("MaceSpikeArriveRadiusUU"),         EKnobType::Float, TEXT("v14 §6: how close ends the pull") },
 			{ TEXT("MaceSpikeCooldownSeconds"),        EKnobType::Float, TEXT("v14 §6 ASSUMPTION: 20s, unspecified in the doc") },
 

@@ -60,44 +60,38 @@ enum class ETraceInputAction : uint8
 	Fire,
 	Pass,
 	Scoreboard,
-	/**
-	 * Spec v10 §1 — gun <-> knife. APPENDED, never inserted: ETraceInputAction is the index into
-	 * UTraceUserSettings::Bindings, so inserting anywhere above would renumber every action a
-	 * previously-saved TraceUserSettings.ini already refers to *by position* in the runtime array.
-	 * The .ini itself is keyed by ConfigId and survives; the in-memory table is what would tear.
-	 *
-	 * ONE action, not two. The swing rides the existing Fire bind — UTraceWeaponComponent's fire
-	 * path branches on IsKnifeEquipped(), so mouse1 shoots with the gun and swings with the knife.
-	 * Adding a second "Swing" bind would give the player two keys for one verb and a way to put the
-	 * swing on a key the bots and the dead-respawn path do not use.
-	 *
-	 * SPEC v13 §2 KEPT THIS ACTION rather than deleting it, and the [ASSUMPTION] it was allowed to
-	 * fail is "if it complicates the state machine, remove it and say so". It does not complicate
-	 * anything: EquipKnife and EquipGun below are DIRECT SELECT and this is a TOGGLE, and all three
-	 * end up in the same UTraceWeaponComponent::RequestEquip(Desired) call — a toggle is nothing but
-	 * "the other one". There is no second state, no mode flag and no ordering between them. A player
-	 * who prefers one key keeps F; a player who wants 1 and 2 has them.
-	 */
-	SwapWeapon,
 
 	/**
 	 * Spec v13 §2 — 1 = knife, 2 = gun. Verbatim: "Change default keybinds for switching weapons to
 	 * be: 1 (switch to knife) and 2 (switch to gun)."
 	 *
-	 * THIS IS AN INPUT-MODEL CHANGE, NOT A REBIND, and that is the whole reason there are two new
-	 * enumerators here rather than a new default key on SwapWeapon. SwapWeapon answers "give me the
-	 * other weapon"; these answer "give me THIS weapon". Rebinding the toggle to 1 would have made 1
-	 * and 2 do the same thing (each would swap), which is the opposite of what was asked.
+	 * THIS IS AN INPUT-MODEL CHANGE, NOT A REBIND. A toggle answers "give me the other weapon";
+	 * these answer "give me THIS weapon", and no amount of rebinding turns one into the other —
+	 * putting a toggle on 1 and on 2 would have made both keys do the same thing.
 	 *
 	 * DIRECT SELECT MEANS IDEMPOTENT: pressing 1 with the knife already out does nothing at all, and
 	 * in particular does not restart the 0.2 s pullout. The guard lives in
-	 * ATracePlayerController::OnEquipKnifeStarted/OnEquipGunStarted — see the comment there for why
-	 * the input layer is the right place for it and why it is still correct mid-pullout.
+	 * ATracePlayerController::HandleDirectEquip -> TraceMelee::RequestEquipIfDifferent — see the
+	 * comment there for why it is still correct mid-pullout.
 	 *
-	 * APPENDED, never inserted, for the reason SwapWeapon's comment gives above: ETraceInputAction
-	 * is the index into UTraceUserSettings::Bindings, so anything inserted higher renumbers every
-	 * action a saved TraceUserSettings.ini refers to by position. The .ini is keyed by ConfigId and
-	 * survives either way; the in-memory table is what would tear.
+	 * SPEC v15 §5 DELETED THE `SwapWeapon` TOGGLE THAT USED TO SIT IMMEDIATELY ABOVE THIS LINE,
+	 * verbatim: "Switch weapon keybind so that it's only switch to knife/switch to gun." It had a
+	 * ConfigId of "SwapWeapon" and a default of F, and it is gone — the action, its IA_, its
+	 * binding, its handler and its row in the rebind list. This supersedes spec v13 §2's
+	 * [ASSUMPTION] that the toggle was worth keeping as a third rebindable action.
+	 *
+	 * WHAT THAT DELETION COSTS, AND WHY IT IS NOTHING. Removing an enumerator RENUMBERS every action
+	 * below it, and this table's positions are the indices into UTraceUserSettings::Bindings — so a
+	 * previously-saved TraceUserSettings.ini that referred to actions by POSITION would now be
+	 * reading the wrong rows. It does not: RefreshFromConfig matches each `ConfigId=Key` line
+	 * against FTraceInputActionInfo::ConfigId by STRING (see the parse loop) and a line naming an
+	 * action that no longer exists is dropped, exactly as pre-v3 `Boost=E` lines already are. A
+	 * player's `SwapWeapon=F` line is now one of those, and every other bind in their file still
+	 * lands on the action it names. Trace.Settings.VerifyBinds prints the whole resolution, stale
+	 * lines included, so this paragraph can be checked rather than believed.
+	 *
+	 * STILL APPEND-ONLY BELOW THIS POINT. The .ini survives a renumber; the in-memory table is what
+	 * would tear if two builds disagreed about it mid-session, and there is no reason to find out.
 	 */
 	EquipKnife,
 	EquipGun,
@@ -106,9 +100,9 @@ enum class ETraceInputAction : uint8
 	 * SPEC v14 §5 — "Activated abilities bind to E by default, rebindable" and "Mace's suspend needs
 	 * its own bind (V, per the doc)."
 	 *
-	 * APPENDED, never inserted, for the reason SwapWeapon's comment gives above: ETraceInputAction is
+	 * APPENDED, never inserted, for the reason EquipKnife's comment gives above: ETraceInputAction is
 	 * the index into UTraceUserSettings::Bindings, so anything inserted higher renumbers every action
-	 * a saved TraceUserSettings.ini refers to by position.
+	 * in the runtime table.
 	 *
 	 * THE CONFIG IDS ARE LOAD-BEARING AND ARE NOT FREE TO RENAME. "Ability" and "AbilitySecondary"
 	 * are the exact strings ATraceHUD's ability row and UTraceAbilityInputRelay already look up (both

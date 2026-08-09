@@ -124,7 +124,13 @@ namespace TraceCharacterVerify
 		return nullptr;
 	}
 
-	/** The first non-bot player's ability component. Bots are characterless by spec §3. */
+	/**
+	 * The first non-bot player's ability component.
+	 *
+	 * NOT because bots are characterless — spec v15 §2 gives them characters. Because this harness
+	 * ASSIGNS its subject a character, and a bot's is owned by ATraceGameMode::PollCharacterSelect's
+	 * 4 Hz fill, which would take it back or take it first.
+	 */
 	UTraceAbilityComponent* FindHumanAbilityComponent(UWorld* WorldPtr)
 	{
 		const AGameStateBase* GS = (WorldPtr != nullptr) ? WorldPtr->GetGameState() : nullptr;

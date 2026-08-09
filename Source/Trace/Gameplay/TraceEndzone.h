@@ -207,7 +207,27 @@ private:
 	 */
 	float LastScoreTime = -10000.f;
 
+	// =============================================================================================
+	// WHY THE SHAPE FIELDS BELOW ARE UPROPERTYs (spec v15 §1)
+	//
+	// They used to be plain C++ members, which was correct while the ONLY way an endzone came into
+	// existence was ATraceArenaBuilder spawning one and calling ConfigureZone/ConfigureRing in the
+	// same breath. Spec v15 §1 bakes the arena into a real .umap, so an endzone can now be PLACED -
+	// saved to disk and loaded again with nobody to reconfigure it. A plain member does not survive
+	// that round trip, and the failure mode is the ugly kind: the actor loads with bZoneActive true
+	// and RingRadius 0, i.e. a mode-B goal silently degraded to its own bounding slab - "an invisible
+	// one that scores off the corners", exactly what the ring comment below warns about.
+	//
+	// Serialised, so a placed endzone keeps its shape. bRingGoal is serialised WITH RingRadius even
+	// though only the radius was asked for: IsRingGoal() reads both, and a ring whose radius survived
+	// but whose flag did not is a goal that looks right in the details panel and scores as a box.
+	// EditAnywhere rather than VisibleAnywhere because §1's whole point is a level a human can edit -
+	// but note that typing a new RingRadius does NOT resize the trigger box (ConfigureRing's comment
+	// says why the caller owns the extent), so hand-editing the radius wants the box adjusted too.
+	// =============================================================================================
+
 	/** Shape flag: the narrow mode-B goal rather than the full-width mode-A endzone. */
+	UPROPERTY(EditAnywhere, Category = "Trace")
 	bool bGoalVolume = false;
 
 	/**
@@ -218,7 +238,10 @@ private:
 	 * goal to a full box - which would be a goal the size of its own bounding slab, i.e. an invisible
 	 * one that scores off the corners.
 	 */
+	UPROPERTY(EditAnywhere, Category = "Trace")
 	bool bRingGoal = false;
+
+	UPROPERTY(EditAnywhere, Category = "Trace")
 	float RingRadius = 0.f;
 
 	/**
@@ -228,5 +251,6 @@ private:
 	 * before mode B existed - a level-placed endzone, or any future caller that spawns one directly,
 	 * must not be silently dead.
 	 */
+	UPROPERTY(EditAnywhere, Category = "Trace")
 	bool bZoneActive = true;
 };

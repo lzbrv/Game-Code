@@ -260,11 +260,17 @@ struct TRACE_API FTraceAbilityDamageContext
  * ===================================================================================================
  *
  * That hook asks a pawn's OWN character about its OWN passive — Rocco's headshot stack, X's +10%.
- * It is the right question for a buff and the wrong one for a debuff, because spec §3 makes bots
- * characterless: a bot has no ability set to ask, so Oyster's poison slow routed through that hook
- * would silently fail to slow more than half the pawns in a bot match. The victim of a debuff is not
- * necessarily a character. (This is the same argument that put X's vulnerable mark on
- * UTraceHealthComponent rather than on GetIncomingDamageMultiplier.)
+ * It is the right question for a buff and the wrong one for a debuff, because THE VICTIM OF A DEBUFF
+ * IS NOT NECESSARILY A CHARACTER: mode A freezes everybody to the Mannequin (spec v14 §2), the
+ * characters toggle does the same, and anybody a full team roster cannot serve stays characterless
+ * too. Routed through the pawn's own set, Oyster's poison slow would silently do nothing to all of
+ * them. (This is the same argument that put X's vulnerable mark on UTraceHealthComponent rather than
+ * on GetIncomingDamageMultiplier.)
+ *
+ * This used to say "spec §3 makes bots characterless", which spec v15 §2 reversed — bots hold real
+ * characters now. The reasoning above never depended on that and the code is unchanged; only the
+ * example was wrong, and an aggregator justified by a rule that no longer exists is an invitation to
+ * delete it.
  *
  * ONE AGGREGATOR, and every provider is a line inside it. UTraceCharacterMovementComponent calls
  * exactly this and knows about no particular ability; the definition lives in TraceAbilityTypes.cpp

@@ -11,6 +11,7 @@
 #include "TraceTypes.h"              // ETraceTeam
 #include "Core/TraceMatchTypes.h"    // TraceIsGoalMode / TraceScoringModeLabel, and ETraceScoringMode
                                      // itself via TraceSettings.h - the A/B toggle (spec v4 §7)
+#include "World/TraceBakedPiece.h"   // ETraceBakedScoringTag - the bake's mode tag (spec v15 §1)
 
 #include "TraceArenaBuilder.generated.h"
 
@@ -363,8 +364,118 @@ public:
 	 * BeginPlay — which is the whole point: ATraceGameMode::PreInitializeComponents has to get the
 	 * player starts into the world before AGameModeBase::Login runs FindPlayerStart, and that is two
 	 * steps earlier than any BeginPlay.
+	 *
+	 * ON A BAKED LEVEL IT BUILDS NOTHING (spec v15 §1.5). See bLevelIsPreBaked: the geometry is
+	 * already in the .umap, so this adopts it instead of constructing a second copy on top of it.
 	 */
 	void EnsureBuilt();
+
+	// --- THE BAKED LEVEL (spec v15 §1) -------------------------------------------------------------
+	//
+	// /Game/Maps/Arena_Baked is this builder run once and written down: every piece of geometry
+	// exploded into an individually selectable ATraceBakedPiece actor with a readable label, the
+	// gameplay actors placed for real, and the materials promoted to committed assets under
+	// /Game/Trace/Materials. Scripts/bake-arena.sh produces it; nothing about the procedural path
+	// changed, and /Game/Maps/Arena still builds itself at BeginPlay exactly as it always did.
+	//
+	// THE DOUBLE-BUILD PROBLEM, AND WHERE THE FIX LIVES. ATraceGameMode finds this actor (or spawns
+	// one) and calls EnsureBuilt() from PreInitializeComponents, whatever level is loaded. On a baked
+	// level that would put a second floor, a second set of walls and a second pair of endzone
+	// triggers on top of the ones already in the map. The check therefore lives HERE, in the builder,
+	// not in the game mode: the game mode has no business knowing which levels are baked, and a level
+	// that gains a bake later must not need a game-mode edit to go with it.
+
+	/**
+	 * True on the builder that the bake leaves behind in /Game/Maps/Arena_Baked.
+	 *
+	 * WHY THE BUILDER IS STILL IN THE BAKED LEVEL AT ALL, given it builds nothing there. Because it
+	 * is the arena's ORACLE as much as its constructor: GetFieldBounds(), GetCoreSpawnLocation(),
+	 * GetScoringBounds(), ClampedEndzoneDepth() and GoalRingCentre() are pure functions of the layout
+	 * properties above, and the game mode, the Core, the bots and the half-time switch all ask them.
+	 * Deleting it from the baked level would leave that geometry unanswerable — the Core would spawn
+	 * at ATraceGameMode's fallback location and the bots would steer inside a default box.
+	 *
+	 * It is also what adopts the baked level's endzones, lights and post-process volume back into the
+	 * live state ApplyScoringMode / ApplyTeamSides / ApplyFidelity operate on. See AdoptBakedArena.
+	 *
+	 * A second, independent trigger exists so that a designer who deletes and re-places the builder
+	 * does not silently get a double-built level: any actor in the world carrying the
+	 * TraceBakedArenaTag() tag also switches the build off. The bake stamps that tag on every piece
+	 * it emits, so the level is self-describing.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Bake")
+	bool bLevelIsPreBaked = false;
+
+	/** The actor tag every baked piece carries. Also the level's "I am already built" marker. */
+	static FName TraceBakedArenaTag();
+
+	/** True when this builder must not construct geometry: its own flag, or a marker in the level. */
+	bool IsLevelPreBaked() const;
+
+#if WITH_EDITOR
+	/**
+	 * Runs the whole build ONCE and writes it into the current editor level as real, editable,
+	 * saveable actors. The entry point Scripts/bake-arena.py drives. Editor worlds only.
+	 *
+	 * WHAT IT EMITS
+	 *   * one ATraceBakedPiece per logical piece — a wall, a cover block, a pylon, a bank terrace —
+	 *     carrying that piece's mesh components, its BlockAll box and its pawn standoff shell, and
+	 *     labelled with what it is (`Wall_PosY`, `CoverBlock_014`), never `StaticMeshActor_417`;
+	 *   * one ATraceBakedPiece per instanced RUN for the pieces there are too many of to be worth a
+	 *     click each — the wall cove's 5 uu shells, the floor grid — as a single
+	 *     UInstancedStaticMeshComponent. That is BakeMaxPiecesPerName's job and the count is logged;
+	 *   * the gameplay actors as ordinary placed actors: both pairs of ATraceEndzone, ten
+	 *     ATraceTeamPlayerStarts, the three directional lights, the sky light, the atmosphere, the
+	 *     height fog, the post-process volume and the floor-lamp lattice as real APointLights;
+	 *   * committed UMaterialInstanceConstants under /Game/Trace/Materials/Instances for every
+	 *     distinct tint the build asked for, because a .umap may not reference Content/Generated/
+	 *     (it is gitignored, so the map would be broken on every other machine).
+	 *
+	 * It then sets bLevelIsPreBaked on itself, so saving the level is all that is left to do.
+	 *
+	 * NOT IDEMPOTENT ACROSS RUNS in the sense of cleaning up after a previous bake: run it into a
+	 * fresh empty level, which is what Scripts/bake-arena.py does. Running it twice into one level
+	 * gives you two arenas, exactly as pressing Build Preview twice would if it did not clear first.
+	 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Trace|Bake")
+	void BakeArenaIntoLevel();
+#endif
+
+	// The two bake dials are OUTSIDE the #if WITH_EDITOR above on purpose: UnrealHeaderTool rejects a
+	// UPROPERTY wrapped in WITH_EDITOR ("use WITH_EDITORONLY_DATA instead"), and stripping them from a
+	// packaged build would buy two floats and cost the ability to read, in a shipped build's Details
+	// panel, the numbers the level in front of you was baked with.
+
+	/**
+	 * How many separate ATraceBakedPiece actors one debug name may produce before the bake stops
+	 * giving that name's blocks loose static mesh components and batches every one of them into
+	 * instanced components instead.
+	 *
+	 * IT DOES NOT CHANGE THE ACTOR COUNT. Every piece is still its own actor, still labelled, still
+	 * individually clickable — this dial is about what is INSIDE the piece. The cover field is the
+	 * case it was written for: 152 cover blocks, each of which would otherwise contribute two or
+	 * three loose UStaticMeshComponents on top of its batched trim. Spec v7 §8 rebuilt the whole
+	 * arena on instanced meshes because ~1450 loose components cost 1.8-3.1 ms of draw submission,
+	 * and a bake that handed that back would be a regression dressed up as a migration.
+	 *
+	 * The bake logs which names crossed the line and the full per-name census, so the trade is
+	 * visible rather than assumed.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Bake", meta = (ClampMin = "1"))
+	int32 BakeMaxPiecesPerName = 48;
+
+	/**
+	 * How far apart two blocks sharing a debug name may be, in the horizontal plane, and still be
+	 * treated as one piece.
+	 *
+	 * This is what turns a flat list of blocks back into THINGS without threading a "which piece am I
+	 * part of" argument through forty call sites. AddNeonBlock's twelve components all sit inside the
+	 * block's own footprint (the widest is the standoff shell, 26 uu proud on each side); the next
+	 * cover block is thousands of uu away. 96 uu clears the former with room to spare and cannot
+	 * reach the latter.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Bake", meta = (ClampMin = "0.0"))
+	float BakePieceGroupSlack = 96.f;
 
 	// --- FIDELITY, GATED BEHIND QUALITY (spec v11 §3) ---------------------------------------------
 	//
@@ -905,6 +1016,106 @@ protected:
 	EObjectFlags BuiltObjectFlags() const;
 
 	/**
+	 * Object flags for the ACTORS the build spawns - endzones, player starts, lights, fog, the
+	 * post-process volume.
+	 *
+	 * RF_Transient normally, which is the rule that has always applied: these are runtime scaffolding
+	 * and must never be serialised into a level, least of all by the editor preview button. RF_NoFlags
+	 * during a bake, because a bake is the one time serialising them into a level is the entire point
+	 * (spec v15 §1.4 - "the gameplay actors must exist in the saved level as ordinary placed actors").
+	 */
+	EObjectFlags SpawnedActorFlags() const;
+
+	// --- BAKE RECORDING (spec v15 §1) --------------------------------------------------------------
+	//
+	// HOW THE BAKE REUSES THE BUILD instead of duplicating it. Spec v15 §1 is explicit that there
+	// must not be a second builder, and it is right: a parallel "bake path" that laid out its own
+	// arena would drift from this one in a week and the baked map would stop being the arena.
+	//
+	// So the bake runs THE SAME BuildArena(), as a transient editor preview, and simply WATCHES it:
+	// the four primitive factories append a record here as well as doing their normal work. When the
+	// build finishes, EmitBakedActors() groups those records back into logical pieces, spawns one
+	// actor per piece, and then the preview is torn down as usual.
+	//
+	// WATCHING RATHER THAN DIVERTING is the whole reason this is safe, and it was not the first
+	// design. A bake that RETURNED EARLY from the factories would have silently dropped every
+	// customisation a caller applies to the component it gets back - and there is one that matters:
+	// BuildCentreDais makes the Core pedestal's collision box ignore ECC_Pawn ("waist-high scenery
+	// you can walk through beats an unwinnable match"). A diverted bake would have baked a
+	// pawn-blocking pedestal in the dead centre of the field and nothing would have logged it.
+	// Because the real component is built, the emit step copies its FINAL state, whatever a caller
+	// did to it.
+
+	/** One primitive the bake watched being built. Kinds mirror the four factories. */
+	struct FTraceBakeRecord
+	{
+		enum class EKind : uint8
+		{
+			MeshBlock,      // AddMeshBlockRotated - visible geometry, an instance rather than a component
+			CollisionBox,   // AddCollisionBlockRotated - the BlockAll boxes
+			PawnStandoff,   // AddPawnStandoff - the pawn-only shells
+			PointLight      // AddPointLight - the floor-lamp lattice
+		};
+
+		EKind Kind = EKind::MeshBlock;
+
+		/** The DebugName the factory was called with. Becomes the actor label. */
+		FName PieceName;
+
+		/** MeshBlock only: builder-local transform, scale included (the shapes are 100 uu). */
+		FTransform Transform = FTransform::Identity;
+
+		/** MeshBlock only. Weak because the engine basic shapes outlive any bake. */
+		TWeakObjectPtr<UStaticMesh> BlockMesh;
+
+		/** MeshBlock only. Resolved to a committed MaterialInstanceConstant at emit time. */
+		TWeakObjectPtr<UMaterialInstanceDynamic> BlockMID;
+
+		/** MeshBlock only. A per-component flag on an ISM, so it is part of the pool key. */
+		bool bCastShadow = false;
+
+		/**
+		 * Every other kind: the component the factory actually built, copied verbatim at emit time.
+		 * That is what preserves per-call collision-response edits - see the note above.
+		 */
+		TWeakObjectPtr<USceneComponent> SourceComponent;
+
+		/** Filled in by CollectPiecesSince, which is the only thing in this file that knows modes. */
+		ETraceBakedScoringTag ModeTag = ETraceBakedScoringTag::Always;
+	};
+
+	/** Everything recorded by the current bake, in construction order. Empty outside a bake. */
+	TArray<FTraceBakeRecord> BakeRecords;
+
+	/**
+	 * True only while BuildArena() is running for a bake.
+	 *
+	 * Declared unconditionally rather than under #if WITH_EDITOR for exactly the reason
+	 * bBuildingEditorPreview is: BuiltObjectFlags() and the four primitive factories are the hottest
+	 * paths in this file and must be one function with one body in every configuration.
+	 */
+	bool bBakingToLevel = false;
+
+	/** Appends @p Record to BakeRecords. Returns false (and records nothing) outside a bake. */
+	bool RecordForBake(const FTraceBakeRecord& Record);
+
+	// --- ADOPTING A BAKED LEVEL --------------------------------------------------------------------
+
+	/**
+	 * Wires a level that was baked earlier back into the live state this builder owns, without
+	 * constructing any geometry.
+	 *
+	 * WHY IT IS NEEDED AT ALL. The arena is not just meshes; it is four things this class holds
+	 * pointers to and drives at runtime: the scoring volumes ApplyScoringMode arms, the mode-tagged
+	 * furniture it shows and hides, the MIDs ApplyTeamSides repaints at half time, and the lights and
+	 * post-process volume ApplyFidelity re-tunes on a quality change. A baked level has all of those
+	 * as placed actors and none of them registered. Skipping the build WITHOUT adopting would give a
+	 * level that looks right and then, at the first half-time switch, keeps both endzones painted the
+	 * colour they were baked in and leaves both scoring shapes armed at once.
+	 */
+	void AdoptBakedArena();
+
+	/**
 	 * Destroys everything BuildArena() made - every component attached under Root, every actor in
 	 * SpawnedActors, every MID, every instance pool - and resets the built flag so the next build
 	 * starts from nothing.
@@ -1227,6 +1438,13 @@ protected:
 	{
 		int32 Components = 0;
 		int32 Instances = 0;
+
+		/**
+		 * Third counter for the bake (spec v15 §1). A bake builds no components and no instances - it
+		 * records - so without this a mode-tagged build step would collect an empty range and the
+		 * baked level would present mode A's endzone paint and mode B's ring at the same time.
+		 */
+		int32 BakeRecords = 0;
 	};
 
 	/**
@@ -1333,6 +1551,20 @@ private:
 
 	/** Furniture that only exists in mode B: the goal posts, crossbar and lit mouth. */
 	TArray<FTraceModePiece> GoalModePieces;
+
+	/**
+	 * The same two sets on a BAKED level, where a piece is a whole actor rather than a component.
+	 *
+	 * Kept separate from the two arrays above rather than folded into FTraceModePiece because hiding
+	 * an actor and hiding a component are different calls (SetActorHiddenInGame / SetActorEnableCollision
+	 * against SetVisibility / SetCollisionEnabled), and because exactly one of the two mechanisms is
+	 * ever populated: a procedural arena has no baked actors and a baked one has no built components.
+	 */
+	TArray<TWeakObjectPtr<ATraceBakedPiece>> BakedEndzoneModeActors;
+	TArray<TWeakObjectPtr<ATraceBakedPiece>> BakedGoalModeActors;
+
+	/** Shows or hides one baked set. The actor-level twin of SetPiecesPresented. */
+	static void SetBakedActorsPresented(const TArray<TWeakObjectPtr<ATraceBakedPiece>>& Actors, bool bPresented);
 
 	/**
 	 * Every ATraceEndzone this builder spawned, both shapes, server only.

@@ -71,15 +71,18 @@ struct FTraceDashHudState
  *   Dash        bool     Left Shift
  *   Parry       bool     Q             (carrier only — 0.175s of trace invulnerability, spec v3 §3 / v8 §3 / v10 §4)
  *   Scoreboard  bool     Tab           (held)
- *   SwapWeapon  bool     F             (gun <-> knife TOGGLE, spec v10 §1; the SWING rides IA_Fire)
- *   EquipKnife  bool     1             (spec v13 §2 — DIRECT SELECT, idempotent)
+ *   EquipKnife  bool     1             (spec v13 §2 — DIRECT SELECT, idempotent; the SWING rides IA_Fire)
  *   EquipGun    bool     2             (spec v13 §2 — DIRECT SELECT, idempotent)
  *
- * SPEC v13 §2 IS AN INPUT-MODEL CHANGE, NOT A REBIND, and the three weapon actions above are what
- * it comes to. A toggle answers "give me the other weapon"; a direct select answers "give me THIS
- * weapon". Rebinding the toggle onto 1 and 2 would have made both keys do the same thing. All three
- * converge on one call — UTraceWeaponComponent::RequestEquip(Desired) — so keeping the toggle costs
- * no state and no ordering.
+ * SPEC v15 §5: TWO WEAPON KEYS, AND NO TOGGLE. Verbatim: "Switch weapon keybind so that it's only
+ * switch to knife/switch to gun." The `SwapWeapon` action — gun <-> knife on F, spec v10 §1 — is
+ * deleted outright: the enumerator, IA_SwapWeapon, its mapping, its handler and its row in the
+ * rebind list. This supersedes spec v13 §2's [ASSUMPTION] that it was worth keeping alongside the
+ * two direct selects.
+ *
+ * The toggle VERB survives one level down as TraceMelee::RequestSwapWeapon, because the weapon
+ * component still needs "give me the other one" for the dev console (Trace.Knife.Swap) and for the
+ * v13 §2 harness's red arm. What no longer exists is a KEY that means it, which is what was asked.
  */
 UCLASS()
 class TRACE_API ATracePlayerController : public APlayerController
@@ -243,31 +246,33 @@ public:
 	int32 DebugHitConfirmCount = 0;
 
 	/**
-	 * Spec v13 §2. Bumped on the FIRST LINE of the weapon handlers, before any gate, so they count
+	 * Spec v13 §2. Bumped on the FIRST LINE of the weapon handler, before any gate, so it counts
 	 * "the key reached a bound delegate" and nothing else.
 	 *
-	 * THEY EXIST BECAUSE THE §2 HARNESS WAS BRIEFLY VACUOUS WITHOUT THEM, and that is worth writing
+	 * IT EXISTS BECAUSE THE §2 HARNESS WAS BRIEFLY VACUOUS WITHOUT IT, and that is worth writing
 	 * down. Trace.V13.Hotkeys proves a redundant press does not restart the pullout by pressing the
 	 * key twice and watching the remaining time keep falling. Its first version held each synthetic
 	 * key for 0.05 s and pressed again 0.05 s later, so the second press landed while the key was
 	 * still logically DOWN — Enhanced Input emits Started only on a down EDGE, the handler never
 	 * ran, and "the pullout was not restarted" was true because NOTHING HAPPENED. It passed. It also
-	 * passed in the red arm, on the unguarded toggle, which is what gave it away.
+	 * passed in the red arm, on the unguarded path, which is what gave it away.
 	 *
 	 * The fix is a longer gap, but the guarantee is this counter: the probe now asserts the count
 	 * went up across every press, so a swallowed key fails the run loudly instead of passing it
 	 * silently. A test that cannot fail is not evidence.
+	 *
+	 * ONE counter, not two: spec v15 §5 deleted the SwapWeapon handler that used to own the second,
+	 * and BOTH arms of the v13 §2 harness now press the same direct-select key. That is what makes
+	 * the red arm a genuine A/B — same key, same handler, same counter, one gate different.
 	 */
 	int32 DebugEquipPressCount = 0;
-	int32 DebugSwapPressCount = 0;
 
-	// Accessors rather than reading the fields directly, so the harness cannot write them. This
+	// An accessor rather than reading the field directly, so the harness cannot write it. This
 	// whole block is already inside the class's `public:` section (see line ~89) — no access
 	// specifier is introduced here, because flipping one would silently re-scope every counter
 	// above and the synthetic-input harness reads several of them.
 	/** Read by the v13 §2 harness to prove a synthetic key actually reached a bound delegate. */
 	int32 GetDebugEquipPressCount() const { return DebugEquipPressCount; }
-	int32 GetDebugSwapPressCount() const { return DebugSwapPressCount; }
 
 	FVector2D DebugLastMoveValue = FVector2D::ZeroVector;
 	FVector2D DebugLastLookValue = FVector2D::ZeroVector;
@@ -376,13 +381,11 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UInputAction> IA_Parry;
 
-	/** Spec v10 §1. Gun <-> knife toggle; default F. There is deliberately no IA_Swing — see below. */
-	UPROPERTY(Transient)
-	TObjectPtr<UInputAction> IA_SwapWeapon;
-
 	/**
-	 * Spec v13 §2. DIRECT SELECT, default 1 and 2. Separate actions from IA_SwapWeapon because they
-	 * are a different verb, not a different key for the same one.
+	 * Spec v13 §2. DIRECT SELECT, default 1 and 2. These two are the WHOLE weapon input model as of
+	 * spec v15 §5 — there is no IA_SwapWeapon any more, and there is deliberately no IA_Swing
+	 * either: the swing rides IA_Fire, because UTraceWeaponComponent's fire path branches on
+	 * IsKnifeEquipped(), so mouse1 shoots with the gun and swings with the knife.
 	 *
 	 * Two actions rather than one action with a value: an Enhanced Input Boolean action carries no
 	 * payload that could say WHICH weapon, and giving them one action plus a modifier would put the
@@ -453,15 +456,9 @@ protected:
 	 */
 	void OnParryCompleted();
 	/**
-	 * Press edge of the weapon swap (spec v10 §1). Press-only, and that asymmetry is deliberate:
-	 * unlike parry, the swap is a state TOGGLE, so binding the release edge as well would swap twice
-	 * per press. TraceMelee::RequestSwapWeapon owns every refusal (carrying, dead, mid-swap, dashing).
-	 */
-	void OnSwapWeaponStarted();
-	/**
-	 * Spec v13 §2. Press edge of the two DIRECT-SELECT weapon binds. Press-only for the same reason
-	 * the toggle is: there is no held state, and a release binding would fire a second request on
-	 * key-up.
+	 * Spec v13 §2. Press edge of the two DIRECT-SELECT weapon binds. Press-only, and that asymmetry
+	 * is deliberate: there is no held state here, so a release binding would fire a second request
+	 * on key-up.
 	 *
 	 * @param bWantKnife  true for the 1 key, false for the 2 key.
 	 *

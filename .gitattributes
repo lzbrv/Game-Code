@@ -21,6 +21,20 @@
 #     git lfs unlock Content/Maps/Arena.umap
 # `git lfs locks` lists who holds what. Locked files are checked out read-only
 # for everyone else, which is the point: the OS stops you before Git has to.
+#
+# ONE FILE PER ACTOR CHANGES WHAT YOU LOCK, NOT WHETHER YOU LOCK (spec v15 §1.6).
+# /Game/Maps/Arena_Baked has "Use External Actors" on, so the arena is not one
+# .umap — it is a ~6 KB .umap plus one .uasset per actor under
+#     Content/__ExternalActors__/Maps/Arena_Baked/<2 hex>/<2 hex>/<guid>.uasset
+# Those are .uasset, so the rule above already covers them: LFS, and lockable.
+# That combination is the entire payoff of the migration. Before it, moving one
+# wall meant locking the whole level and everybody else waited; now two people
+# lock two actors and neither notices the other. The unreadable GUID filenames
+# are the engine's, not ours — find the actor by its LABEL in the World Outliner
+# (Wall_North_01, Cover_037, Goal_Ring_Rim_12) and let the editor's source
+# control integration lock the file behind it.
+#
+# Produce or re-produce that map with:  Scripts/bake-arena.sh --force
 # ==============================================================================
 
 # ------------------------------------------------------------------------------

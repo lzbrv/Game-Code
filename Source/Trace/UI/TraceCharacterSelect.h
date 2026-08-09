@@ -21,6 +21,12 @@
 // and the "TAKEN - PICK AGAIN" line this screen shows is a server verdict being reported, never a
 // local decision being made.
 //
+// A BOT TEAM-MATE COUNTS. Spec v15 §2 gives bots characters, so the greying above consults them
+// exactly as it consults a human — the card says "TAKEN BY BOT BLUE 3" and means it. Under §2's
+// ordering the bots on your team hold nothing while your screen is open, so on a fresh match every
+// card is free; the case this is for is joining a match already in progress, where the bots filled
+// long ago and their picks are the only reason a card would be grey.
+//
 // It does not decide whether the screen is open either. ATracePlayerState::bCharacterSelectOpen is
 // replicated from the server and is the only condition. That is what makes "mode A shows no select
 // screen at all" true by construction rather than by a client-side mode test that could be wrong for
@@ -183,6 +189,40 @@ private:
 	float NextNavTime = 0.f;
 	static constexpr float NavRepeatDelay = 0.35f;
 	static constexpr float NavRepeatInterval = 0.12f;
+
+#if !UE_BUILD_SHIPPING
+	// ---- Trace.Characters.ClickTest — spec v15 §4's measurement for THIS screen -------------------
+	//
+	// §4 is "one press = one action" everywhere a menu takes a click, and this screen is one of the
+	// four named surfaces. It cannot be measured the way the title screen is: the click harness on
+	// ATraceMenuHUD lives on the menu map and this screen only exists inside a match. So it gets its
+	// own, in the same shape — park a real cursor on a real card, deliver complete LMB down/up pairs
+	// through the real input path, and count how many the card needed.
+	//
+	// Deliberately tiny and deliberately here rather than in the HUD: ATraceHUD belongs to another
+	// slice, and the whole point is to exercise THIS class's PollInput.
+
+	/** 0..4 while a click test is running, INDEX_NONE otherwise. */
+	int32 ClickTestCard = INDEX_NONE;
+
+	/** 0 = park the cursor, 1 = press, 2 = release, 3 = judge. Same reason for the split as the menu's. */
+	int32 ClickTestStage = 0;
+
+	/** Frame before which the current stage does not advance; several frames per stage. */
+	uint64 ClickTestNextFrame = 0;
+
+	/** Complete down/up pairs delivered so far in this test. */
+	int32 ClickTestClicks = 0;
+
+	/** Runs one stage. Called from Tick while the screen is open and a test is armed. */
+	void ClickTestStep(APlayerController* PC, ATracePlayerState* LocalState);
+
+	/**
+	 * Prints the verdict and disarms. Called from the judging stage AND from the screen-closed path,
+	 * because a click that works closes the screen and Tick then stops driving the test at all.
+	 */
+	void ReportClickTest(ATracePlayerState* LocalState);
+#endif
 };
 
 #if !UE_BUILD_SHIPPING
@@ -194,4 +234,10 @@ private:
  * waiting for a map change. An int is safe to leave behind.
  */
 extern TRACE_API int32 GTraceCharacterSelectDebugPick;
+
+/**
+ * Set by Trace.Characters.ClickTest, consumed by the next Tick of whichever screen is open. 1..5,
+ * or 0 for idle. Same file-scope-int reasoning as GTraceCharacterSelectDebugPick above.
+ */
+extern TRACE_API int32 GTraceCharacterSelectClickTest;
 #endif

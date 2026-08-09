@@ -95,6 +95,26 @@ namespace TraceAbility
 	TRACE_API void  ResetCarrierAbilityDamageHitCount() { GCarrierAbilityDamageHits = 0; }
 }
 
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// THE SPEC v15 §2 RED ARM, framework half. See UTraceAbilityComponent::IsRosterEnforcementOn.
+//
+// A plain int rather than a TAutoConsoleVariable::GetValueOnAnyThread() read, because the bot
+// harness flips it around one scoped run with TGuardValue and reads it back on the same thread in
+// the same call — the console-variable sink is asynchronous on some paths and this must not be.
+// FAutoConsoleVariableRef still publishes it under a name so a manual session can reach it.
+// =================================================================================================
+static int32 GTraceEnforceRosterRules = 1;
+
+static FAutoConsoleVariableRef CVarTraceEnforceRosterRules(
+	TEXT("Trace.Characters.EnforceRosterRules"),
+	GTraceEnforceRosterRules,
+	TEXT("1 (default): UTraceAbilityComponent::ServerSetCharacter enforces per-team uniqueness AND "
+	     "spec v15 s2's rule that a bot waits for every human on its team. 0 removes both so "
+	     "Trace.Characters.BotVerifyRed can be shown to FAIL. Dev only; absent from shipping."),
+	ECVF_Cheat);
+#endif
+
 // A scratch instance handed out by GetMutableNetState() on a machine with no authority, so a
 // character file that forgets a HasAuthority() check writes into a bin rather than into replicated
 // state that the next OnRep silently reverts. Deliberately shared and deliberately never read.
@@ -115,7 +135,17 @@ UTraceAbilityComponent::UTraceAbilityComponent()
 	//
 	// 20 Hz, not every frame. Nothing in this component's own tick is a per-frame fact — the
 	// cooldown is a timestamp compared on read, not a counter — and the per-character work is
-	// forwarded to TickAbilities() which characters may raise if they genuinely need 60 Hz.
+	// forwarded to TickAbilities().
+	//
+	// THIS RATE IS THE ONE EVERY CHARACTER GETS, and there is deliberately no supported way for a
+	// character to raise it. An earlier version of this comment said characters "may raise" it, which
+	// invited exactly the wrong fix: a character reaching into PrimaryComponentTick from its own
+	// equip would change the rate for the whole component, including the cooldown bookkeeping, and
+	// the next character to be equipped on that PlayerState would inherit it. If a future ability
+	// genuinely needs frame-accurate integration, add an explicit opt-in here (SetAbilityTickRate)
+	// so the component owns the decision and can put it back. Mace's pull and V-suspend write
+	// Velocity at this rate today and were measured to be fine at it — see TickAbilities' doc in
+	// TraceCharacterAbilitySet.h for the numbers.
 	PrimaryComponentTick.TickInterval = 0.05f;
 
 	SetIsReplicatedByDefault(true);
@@ -208,15 +238,6 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 		return;
 	}
 
-	// Spec §3, verbatim: "Bots remain characterless, for now. They play the game the exact same way,
-	// as default mannequins with no abilities."
-	if (IsBot())
-	{
-		UE_LOG(LogTraceGame, Verbose, TEXT("[Ability] %s is a bot; bots stay characterless (spec §3)."),
-			*GetNameSafe(GetOwningPlayerState()));
-		return;
-	}
-
 	if (static_cast<int32>(NewCharacter) >= static_cast<int32>(ETraceCharacterId::Count))
 	{
 		UE_LOG(LogTraceGame, Warning, TEXT("[Ability] %s asked for character id %d, which does not exist."),
@@ -229,17 +250,53 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 		return;   // idempotent; a re-request is not a re-equip and must not wipe transient state
 	}
 
-	// PER-TEAM UNIQUENESS. Spec §3: "Do not allow players to select a character who has already been
-	// chosen by a player on their team." FIRST REQUEST WINS — this runs on the server, so two
-	// teammates pressing the same key in the same frame are two sequential calls here and the second
-	// one finds the first already recorded. The loser keeps what they had and the select screen
-	// re-queries IsCharacterAvailableFor to redraw.
-	if (const APlayerState* Holder = FindTeammateHolding(this, GetTeam(), NewCharacter))
+	// THE TWO ROSTER RULES BELOW ARE THE ONES THE §2 RED ARM REMOVES. See IsRosterEnforcementOn().
+	bool bEnforceRoster = true;
+#if !UE_BUILD_SHIPPING
+	bEnforceRoster = IsRosterEnforcementOn();
+#endif
+
+	// ---- SPEC v15 §2's ORDERING RULE ------------------------------------------------------------
+	//
+	// Verbatim: "the computers should wait for any actual humans on its team to choose before all
+	// loading in with randomly chosen characters."
+	//
+	// ENFORCED HERE rather than only where bots are filled, and that is the whole reason it is
+	// trustworthy: TWO independent things assign a bot a character (ATraceGameMode::
+	// PollCharacterSelect at 4 Hz, and ATraceBotController::UpdateAutoCharacter's own 0.5 Hz poll in
+	// the AI slice), and a rule implemented in one of them is a rule the other can walk straight
+	// past. Putting it on the single function BOTH must go through makes the ordering true by
+	// construction instead of by two files agreeing.
+	//
+	// Note that this replaced spec v14 §3's outright "bots stay characterless" refusal, which used to
+	// live on exactly these lines.
+	if (bEnforceRoster && IsBot() && !AreHumansOnTeamSettled(this, GetTeam()))
 	{
 		UE_LOG(LogTraceGame, Log,
-			TEXT("[Ability] %s asked for %s — REFUSED, teammate %s already holds it (per-team uniqueness, spec §3)."),
-			*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(NewCharacter), *GetNameSafe(Holder));
+			TEXT("[Ability] %s (bot) asked for %s — REFUSED, a human on its team has not settled yet "
+			     "(spec v15 §2: bots pick last). The select timeout is what guarantees this ends."),
+			*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(NewCharacter));
 		return;
+	}
+
+	// PER-TEAM UNIQUENESS. Spec v14 §3: "Do not allow players to select a character who has already
+	// been chosen by a player on their team", and spec v15 §2 extends it verbatim to bots: "no two
+	// should be able to pick the same characters". FIRST REQUEST WINS — this runs on the server, so
+	// two teammates pressing the same key in the same frame are two sequential calls here and the
+	// second one finds the first already recorded. The loser keeps what they had and the select
+	// screen re-queries IsCharacterAvailableFor to redraw.
+	//
+	// There is deliberately no "unless one of them is a bot" branch: FindTeammateHolding walks every
+	// player state on the team, and a bot is a player state.
+	if (bEnforceRoster)
+	{
+		if (const APlayerState* Holder = FindTeammateHolding(this, GetTeam(), NewCharacter))
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[Ability] %s asked for %s — REFUSED, teammate %s already holds it (per-team uniqueness, spec §3)."),
+				*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(NewCharacter), *GetNameSafe(Holder));
+			return;
+		}
 	}
 
 	const ETraceCharacterId Previous = CharacterId;
@@ -875,6 +932,93 @@ ETraceCharacterId UTraceAbilityComponent::PickFreeCharacterFor(const APlayerStat
 	}
 	return ETraceCharacterId::None;
 }
+
+ETraceCharacterId UTraceAbilityComponent::PickRandomFreeCharacterFor(const APlayerState* ForPlayerState)
+{
+	// Collect first, then roll ONCE. The obvious alternative — roll a number 1..5 and retry until it
+	// lands on a free one — has no bound on its worst case and, on a team holding four of the five,
+	// spends most of its rolls being wrong. This is one pass and one FMath::RandHelper.
+	TArray<ETraceCharacterId, TInlineAllocator<TraceCharacterCount>> Free;
+
+	for (int32 Index = 1; Index < static_cast<int32>(ETraceCharacterId::Count); ++Index)
+	{
+		const ETraceCharacterId Candidate = static_cast<ETraceCharacterId>(Index);
+		if (IsCharacterAvailableFor(ForPlayerState, Candidate))
+		{
+			Free.Add(Candidate);
+		}
+	}
+
+	if (Free.Num() == 0)
+	{
+		return ETraceCharacterId::None;
+	}
+
+	// FMath::RandHelper, not rand(): it is the engine's own stream, so a run started with -FixedSeed
+	// reproduces the same fill — which is the difference between "the bots picked oddly" being a bug
+	// report and being a shrug.
+	return Free[FMath::RandHelper(Free.Num())];
+}
+
+bool UTraceAbilityComponent::AreHumansOnTeamSettled(const UObject* WorldContextObject, ETraceTeam Team)
+{
+	if (Team == ETraceTeam::None)
+	{
+		// No team means no team-mates, so there is nobody this player could be made to wait for. The
+		// bot fill has its own "wait for a team" check; answering true here keeps this predicate about
+		// humans and only about humans.
+		return true;
+	}
+
+	const UWorld* WorldPtr = (WorldContextObject != nullptr) ? WorldContextObject->GetWorld() : nullptr;
+	const AGameStateBase* BaseState = (WorldPtr != nullptr) ? WorldPtr->GetGameState() : nullptr;
+	if (BaseState == nullptr)
+	{
+		// No roster to read. FALSE — "not settled" — is the safe direction: it delays a bot's pick by
+		// one poll rather than letting the whole team fill before the humans exist.
+		return false;
+	}
+
+	for (APlayerState* Entry : BaseState->PlayerArray)
+	{
+		const ATracePlayerState* AsTraceState = Cast<ATracePlayerState>(Entry);
+		if (AsTraceState == nullptr || AsTraceState->Team != Team || AsTraceState->IsABot())
+		{
+			continue;
+		}
+
+		const UTraceAbilityComponent* Comp = Entry->FindComponentByClass<UTraceAbilityComponent>();
+		if (Comp != nullptr && Comp->GetCharacterId() != ETraceCharacterId::None)
+		{
+			continue;   // chose it, or the select timeout assigned it. Either way they are done.
+		}
+
+		// THE UNSERVICEABLE HUMAN. If the roster has nothing left for them, waiting cannot help and
+		// would keep every bot on this team a Mannequin for the rest of the match. Reachable only
+		// when a team has more players than the roster has characters, which is also the one case
+		// ATraceGameMode::FindFreeCharacterForTeam already warns about.
+		if (PickFreeCharacterFor(Entry) == ETraceCharacterId::None)
+		{
+			continue;
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+#if !UE_BUILD_SHIPPING
+bool UTraceAbilityComponent::IsRosterEnforcementOn()
+{
+	return GTraceEnforceRosterRules != 0;
+}
+
+void UTraceAbilityComponent::SetRosterEnforcementOn(bool bEnforced)
+{
+	GTraceEnforceRosterRules = bEnforced ? 1 : 0;
+}
+#endif
 
 // =================================================================================================
 // Input and notification forwarding

@@ -4066,26 +4066,83 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Suspend Cooldown (s, 0 = none; UNSPECIFIED in §6)", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "10.0"))
 	float MaceSuspendCooldownSeconds = 0.f;
 
-	/** §6: "throws a roped spike in her aim direction for a MEDIUM distance." */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Range (uu)", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "800.0", UIMax = "5000.0"))
-	float MaceSpikeRangeUU = 2200.f;
+	/**
+	 * §6: "throws a roped spike in her aim direction for a MEDIUM distance."
+	 *
+	 * v15 §6: "expand the range for its use 200%". [ASSUMPTION] "200% more" read as x3, so 2200 -> 6600.
+	 * MEASURED WHY IT MATTERED: at 2200 uu, Trace.Mace.SpikeConsistency's arena census found a wall on
+	 * only 21.6% of 648 aim directions taken from real player positions — three times out of four,
+	 * looking somewhere and pressing E did nothing at all. That is most of what "inconsistent" was.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Range (uu) [v15 §6: 2200 -> 6600, +200%]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "800.0", UIMax = "8000.0"))
+	float MaceSpikeRangeUU = 6600.f;
 
-	/** How fast the spike travels to its anchor. Fast enough to feel like a grapple, not a grenade. */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Travel Speed (uu/s)", ClampMin = "100.0", ClampMax = "30000.0", UIMin = "2000.0", UIMax = "10000.0"))
-	float MaceSpikeTravelSpeed = 5000.f;
+	/**
+	 * How fast the spike travels to its anchor. Fast enough to feel like a grapple, not a grenade.
+	 *
+	 * v15 §6: "make it 300% faster". [ASSUMPTION] "300% faster" read as x4, so 5000 -> 20000. At the
+	 * raised range that is a 0.33 s flight for a maximum throw, against 1.32 s if the old speed had
+	 * been kept — the range change on its own would have made the ability SLOWER to use.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Travel Speed (uu/s) [v15 §6: 5000 -> 20000, +300%]", ClampMin = "100.0", ClampMax = "30000.0", UIMin = "2000.0", UIMax = "24000.0"))
+	float MaceSpikeTravelSpeed = 20000.f;
+
+	/**
+	 * THE WALL TEST. "Largest |Normal.Z| the spike will still call a wall."
+	 *
+	 * This USED to read WallJumpMaxNormalZ (0.40), on the reasoning that the project should have one
+	 * definition of a wall. MEASURED, that was wrong for the spike: 0.40 is a surface 66 degrees off
+	 * horizontal, so everything between the 45-degree walkable limit and 66 degrees was refused —
+	 * geometry she cannot stand on, cannot walk up, and could not spike either. Trace.Mace.
+	 * SpikeConsistency scored 0/14 on plates at |normal.Z| 0.50 and 0.64 with that threshold.
+	 *
+	 * 0.70 is the walkable floor limit (cos 45 degrees = 0.707), so the rule is now exactly "if she
+	 * cannot walk on it, she can spike it" — and a ramp at |normal.Z| 0.82 is still refused, which
+	 * the same harness proves in its FIZZLE arm.
+	 *
+	 * SEPARATE FROM WallJumpMaxNormalZ ON PURPOSE. The wall jump's 0.40 is a movement feel decision
+	 * that has been tuned against; moving it to fix the spike would have retuned the wall jump by
+	 * accident, and the two rules have no reason to be the same number.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Wall Test: max |normal.Z| [v15 §6]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.2", UIMax = "0.9"))
+	float MaceSpikeMaxSurfaceNormalZ = 0.7f;
+
+	/**
+	 * Radius of the FALLBACK sweep the throw runs when the exact aim ray finds nothing to stick to.
+	 * 0 disables it and leaves the throw a pure line trace, which is what it was before v15 §6.
+	 *
+	 * WHY IT EXISTS. The throw resolved its anchor with an infinitely thin line, so a 40 uu pillar at
+	 * 1200 uu was missed by one degree of aim error and a 16 uu railing by half a degree — while the
+	 * crosshair was visibly still on them. Measured: 5/7 and 3/7. The exact ray is still tried FIRST
+	 * and still wins whenever it lands, so nothing about a clean shot changes; this only catches the
+	 * ones that used to be silent nothings.
+	 *
+	 * 16 uu is the spike head's own radius (the cone mesh at 0.28 scale), which is the honest answer
+	 * to "how forgiving should it be" — as forgiving as the thing being thrown is wide.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Aim Forgiveness Radius (uu, 0 = exact line only) [v15 §6]", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "32.0"))
+	float MaceSpikeTraceRadiusUU = 16.f;
 
 	/** §6: "On hitting a wall it embeds for 2 s." After that it is gone whether she used it or not. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Embed Duration (s)", ClampMin = "0.1", ClampMax = "30.0", UIMin = "0.5", UIMax = "6.0"))
 	float MaceSpikeEmbedSeconds = 2.f;
 
 	/**
-	 * Pull speed as a multiple of the momentum ceiling. §6: "pulls her toward it AT THE MOMENTUM
+	 * Pull speed as a multiple of the momentum ceiling. v14 §6: "pulls her toward it AT THE MOMENTUM
 	 * CEILING (the air-strafe hard cap)". DERIVED — the ceiling is AirStrafeHardCapSpeed x
 	 * AirStrafeAsymptoteScale under Movement|Air, and it stays the only place that number lives.
-	 * 1.0 is the spec; the knob exists so the pull can be softened without moving the air cap.
+	 *
+	 * 2.0, NOT the 1.0 v14 derived, and the reason is measured. v15 §6 made the throw 4x faster and
+	 * the range 3x longer, and verification then showed the PULL had become the slow part: it runs
+	 * at 1375 uu/s, so crossing the new 6600 uu range takes 4.8 s against a 0.33 s throw. The user's
+	 * complaint was "her ability is way too slow", and at 1.0 that complaint would have been only
+	 * half answered — the spike would arrive quickly and then she would crawl to it.
+	 *
+	 * This deliberately breaks v14 §6's "at the momentum ceiling" derivation, because that rule was
+	 * written when the range was 2200 uu. The air cap itself is untouched; only Mace's pull scales.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Pull Speed (x air-strafe hard cap) [v14 §6: derive]", ClampMin = "0.1", ClampMax = "3.0", UIMin = "0.5", UIMax = "1.5"))
-	float MaceSpikePullSpeedMultiplier = 1.f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Pull Speed (x air-strafe hard cap) [v15 §6: 1.0 -> 2.0, the pull became the slow part]", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "3.0"))
+	float MaceSpikePullSpeedMultiplier = 2.f;
 
 	/** How close to the spike counts as arrived, ending the pull. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Arrive Radius (uu)", ClampMin = "20.0", ClampMax = "600.0", UIMin = "60.0", UIMax = "250.0"))

@@ -217,6 +217,22 @@ void FTraceOptionsMenu::DebugNudge(int32 RowsFromTop, int32 Delta)
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Nudge: '%s' is now %s."),
 		*Rows[Selected].Label, *FormatSettingValue(Rows[Selected].Setting, Value));
 }
+
+bool FTraceOptionsMenu::DebugGetRowRect(const TCHAR* Label, FBox2D& OutRect) const
+{
+	for (const FRow& Row : Rows)
+	{
+		// bIsValid, not just a label match: FRow::Rect is only written by DrawRow, so a page that has
+		// been rebuilt but not yet drawn would otherwise hand back a zero rect and the harness would
+		// click at (0,0) and report a failure that is its own.
+		if (Row.Rect.bIsValid && Row.Label.Equals(Label, ESearchCase::IgnoreCase))
+		{
+			OutRect = Row.Rect;
+			return true;
+		}
+	}
+	return false;
+}
 #endif
 
 // =================================================================================================
@@ -754,9 +770,20 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		return;
 	}
 
-	// Hover follows the pointer whenever it is over a selectable row. Unlike the title screen this
-	// does not need a "has the cursor moved" guard: the overlay is only ever opened by a deliberate
-	// key press or click, so there is no window-activation click to defend against.
+	// Hover follows the pointer, but ONLY when the pointer actually moved.
+	//
+	// The guard is not about window-activation clicks (an earlier comment here claimed that and used
+	// it to justify having no guard). It is about the keyboard: this runs AFTER PollNavigation, so
+	// without it an arrow key moved Selected and the very same frame a STATIONARY cursor resting
+	// over a row dragged it straight back. The measured symptom was that the arrow keys did nothing
+	// whatsoever whenever the pointer happened to be over the list — and it is also why the
+	// -TraceAutoSettings script landed on different rows depending on viewport size.
+	const float CursorMoveThresholdSq = 4.f;   // 2 px; below that it is jitter, not intent
+	const bool bCursorMoved = !bHasHoverCursorPos
+		|| FVector2D::DistSquared(CursorPos, LastHoverCursorPos) > CursorMoveThresholdSq;
+	LastHoverCursorPos = CursorPos;
+	bHasHoverCursorPos = true;
+
 	int32 HoverRow = INDEX_NONE;
 	for (int32 Index = 0; Index < Rows.Num(); ++Index)
 	{
@@ -767,7 +794,9 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		}
 	}
 
-	if (HoverRow != INDEX_NONE && !bDraggingSlider)
+	// bCursorMoved, or the keyboard cannot win an argument with a resting pointer. A click still
+	// selects regardless — that path reads HoverRow directly below.
+	if (HoverRow != INDEX_NONE && !bDraggingSlider && bCursorMoved)
 	{
 		Selected = HoverRow;
 	}

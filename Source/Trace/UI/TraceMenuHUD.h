@@ -275,7 +275,10 @@ private:
 	 *
 	 * Two further defences remain, both independently correct: activation requires a press AND a
 	 * release on the same row (see PressedRow), and a click is ignored until the cursor has actually
-	 * moved (see bCursorHasMoved).
+	 * moved (see bCursorHasMoved). A THIRD one used to sit alongside them — dropping any press that
+	 * arrived while the window was not foreground — and spec v15 §4 removed it: the paragraph above
+	 * is the reason, because a defence aimed at a window-focus click was aimed at something that
+	 * never happened, and it was charging the player a click to be there. See bWindowFocusedLastFrame.
 	 *
 	 * The deadline stays as a shortened backstop, and it is the ONLY defence left on the keyboard
 	 * path: a stray Enter can still arrive from the terminal that launched the game, and a key press
@@ -299,9 +302,16 @@ private:
 	/**
 	 * Whether the game window was foreground as of the previous frame, sampled in DrawHUD.
 	 *
-	 * A mouse-down that arrives when this is false IS the click that brought the window forward, so
-	 * it is dropped rather than armed. This is the specific, testable form of the bug the grace
-	 * period was papering over.
+	 * DIAGNOSTIC ONLY — IT IS NOT A GATE, AND MAKING IT ONE AGAIN WOULD REINTRODUCE SPEC v15 §4's
+	 * BUG. MousePressed used to drop any press that arrived while this was false, on the theory that
+	 * such a press must be the click bringing the window forward. It was not defending anything (see
+	 * AcceptUnlockTime: every logged self-activation arrived while the viewport ALREADY reported
+	 * itself foreground) and it cost the player a real click on every row, every time they had
+	 * clicked away from the game — which is the "two clicks" that was reported. Measured, removed,
+	 * and re-measured; see the block in MousePressed.
+	 *
+	 * It is still sampled and still printed on every armed press, because "was the window ours when
+	 * that click landed?" has been the deciding question here twice and must stay answerable.
 	 */
 	bool bWindowFocusedLastFrame = false;
 
@@ -427,6 +437,61 @@ private:
 	float SavedMouseSensitivityYScale = 1.f;
 	bool bSavedInvertMouseY = false;
 	TArray<FKey> SavedBindings;
+
+	/**
+	 * -TraceMenuClickTest=<seconds> — SPEC v15 §4's measurement: HOW MANY CLICKS DOES A ROW TAKE?
+	 *
+	 * The report was "menu presses are a single press not two clicks", and the title screen's mouse
+	 * path already reads like a single click by inspection (press arms PressedRow, release activates
+	 * the same row). Inspection is exactly what has been wrong here before, so this counts instead:
+	 * it parks a real cursor on a real row with APlayerController::SetMouseLocation, delivers
+	 * complete LMB down/up pairs through APlayerController::InputKey — the same entry point a
+	 * physical mouse reaches — and reports how many pairs the row needed before it did anything.
+	 *
+	 * ONE is the requirement. Anything else is the bug, and "never" is the bug at its loudest.
+	 *
+	 * Three surfaces, because §4 says "everywhere a menu takes a click":
+	 *   1. a title row      (DIFFICULTY — activating it cycles a value we can read back)
+	 *   2. the SETTINGS row (opening the overlay is the observable)
+	 *   3. an overlay row   (INVERT MOUSE Y — a toggle we can read back)
+	 * The JOIN prompt has no clickable control of its own; it is driven by the keyboard, so the JOIN
+	 * ROW is the click that matters there and it is the same code path as (1).
+	 *
+	 * It writes INVERT MOUSE Y through the real save path, so it takes the SAME snapshot the
+	 * -TraceAutoSettings script does and puts the player's config back when it finishes. Do not pass
+	 * both switches in one run: they would fight over that one snapshot.
+	 */
+	void ArmClickTest();
+	void BeginClickTest();
+	void ClickTestStep();
+
+	/** Row centre, in viewport pixels, or false when the rect has never been drawn. */
+	bool ClickTestRowCenter(int32 Phase, FVector2D& OutPoint);
+
+	FTimerHandle ClickTestArmTimer;
+	FTimerHandle ClickTestStepTimer;
+
+	/** 0 = title DIFFICULTY row, 1 = title SETTINGS row, 2 = overlay INVERT MOUSE Y row, 3 = done. */
+	int32 ClickTestPhase = 0;
+
+	/**
+	 * 0 = park the cursor, 1 = LMB down, 2 = LMB up, 3 = judge.
+	 *
+	 * JUDGING IS ITS OWN STEP and that is not tidiness. APlayerController::InputKey queues the event
+	 * for the next ProcessInputStack rather than calling the bound delegate, so judging on the same
+	 * call as the release asks "did that click work?" before the click has been delivered — and
+	 * reports every row as needing one extra click. See the comment at the judging step.
+	 */
+	int32 ClickTestSubStep = 0;
+
+	/** Complete down/up pairs delivered in this phase that changed nothing. */
+	int32 ClickTestDeadPairs = 0;
+
+	/** Pairs each phase needed. 0 means "never acted", which is the loudest possible failure. */
+	int32 ClickTestPairsUsed[3] = { 0, 0, 0 };
+
+	ETraceBotDifficulty ClickTestBaselineDifficulty = TraceDifficulty::Default;
+	bool bClickTestBaselineInvertY = false;
 
 	/**
 	 * -TraceAutoJoin=<seconds> -TraceJoinAddress=<ip:port> drives the JOIN row for you.

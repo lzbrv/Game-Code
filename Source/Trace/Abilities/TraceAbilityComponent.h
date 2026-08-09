@@ -144,8 +144,11 @@ namespace TraceAbilityIntegration
 }
 
 /**
- * One player's character choice, cooldown and abilities. One per PlayerState, humans and bots alike
- * (a bot simply stays at ETraceCharacterId::None forever — spec §3: "Bots remain characterless").
+ * One player's character choice, cooldown and abilities. One per PlayerState, humans and bots alike —
+ * and since spec v15 §2 that is literal rather than nominal: a bot holds a real character with a real
+ * ability set. What differs is only HOW it gets one. A human is offered a select screen and asks; a
+ * bot is assigned one by ATraceGameMode::PollCharacterSelect, and only once every human on its team
+ * has settled. See ServerSetCharacter and AreHumansOnTeamSettled.
  */
 UCLASS(ClassGroup = (Trace), meta = (BlueprintSpawnableComponent))
 class TRACE_API UTraceAbilityComponent : public UActorComponent
@@ -175,9 +178,17 @@ public:
 	 *   - called without authority;
 	 *   - characters are disabled (UTraceSettings::bCharactersEnabled false, or mode A — §2 freezes
 	 *     mode A with no characters at all);
-	 *   - this player is a bot (§3);
+	 *   - this player is a BOT and a human on its team has not settled yet. Spec v15 §2's ORDERING
+	 *     rule: "the computers should wait for any actual humans on its team to choose before all
+	 *     loading in with randomly chosen characters". See AreHumansOnTeamSettled;
 	 *   - a LIVING teammate already holds @p NewCharacter. First request wins; the loser keeps what
-	 *     they had and IsCharacterAvailableFor() tells the select screen to re-pick.
+	 *     they had and IsCharacterAvailableFor() tells the select screen to re-pick. Bots are subject
+	 *     to this exactly as humans are (spec v15 §2, "no two should be able to pick the same
+	 *     characters") — there is deliberately no bot branch in the uniqueness test.
+	 *
+	 * IT NO LONGER REFUSES BOTS OUTRIGHT. Spec v14 §3 said "bots remain characterless, for now" and
+	 * this function enforced it; spec v15 §2 reverses that and bots now pick. The refusal above is an
+	 * ORDERING rule, not a ban.
 	 *
 	 * Setting ETraceCharacterId::None is ALWAYS allowed and never refused — it is the way back to the
 	 * default Mannequin and the select screen's timeout needs it to be infallible.
@@ -336,7 +347,15 @@ public:
 	/** The player's team, read off ATracePlayerState. */
 	ETraceTeam GetTeam() const;
 
-	/** True when this player is a bot. Bots are always characterless (§3). */
+	/**
+	 * True when this player is a bot.
+	 *
+	 * NOT a synonym for "characterless" any more. Spec v14 §3 made bots permanently Mannequins and
+	 * several call sites still read that way; spec v15 §2 reverses it and bots hold characters like
+	 * anybody else. What this flag still decides is WHEN and HOW one is assigned — a bot has no
+	 * select screen, so it is filled by ATraceGameMode::PollCharacterSelect once its human team-mates
+	 * have settled, rather than by a client RPC.
+	 */
 	bool IsBot() const;
 
 	// =============================================================================================
@@ -357,6 +376,60 @@ public:
 
 	/** AUTHORITY ONLY. A character nobody on @p Team holds, for the select screen's timeout. */
 	static ETraceCharacterId PickFreeCharacterFor(const APlayerState* ForPlayerState);
+
+	/**
+	 * AUTHORITY ONLY. Like PickFreeCharacterFor, but a UNIFORM RANDOM one of the free characters.
+	 *
+	 * Spec v15 §2, verbatim: bots "all loading in with randomly chosen characters". Kept separate
+	 * from PickFreeCharacterFor rather than replacing it, because the two answer different questions:
+	 * the auto-assign a HUMAN gets on the select timeout is deliberately DETERMINISTIC (see
+	 * ATraceGameMode::FindFreeCharacterForTeam — an assignment the player did not choose should at
+	 * least be reproducible in a bug report), while a bot's fill is deliberately not, so a
+	 * singleplayer match does not open with the same five characters every time.
+	 *
+	 * None when nothing is free, which is the same "the team has more players than the roster has
+	 * characters" case PickFreeCharacterFor reports.
+	 */
+	static ETraceCharacterId PickRandomFreeCharacterFor(const APlayerState* ForPlayerState);
+
+	/**
+	 * AUTHORITY ONLY. Spec v15 §2's ORDERING RULE, as a predicate: has every HUMAN on @p Team
+	 * finished choosing?
+	 *
+	 * Verbatim: "the computers should wait for any actual humans on its team to choose before all
+	 * loading in with randomly chosen characters". A human is SETTLED when they hold a character —
+	 * whether they picked it or the select timeout assigned it — and a human who cannot be served at
+	 * all (their team already holds every character in the roster) is settled too, because otherwise
+	 * one unserviceable player would keep every bot on their team a Mannequin forever.
+	 *
+	 * Note what is NOT consulted: whether the select screen is currently OPEN. That would let a bot
+	 * jump the queue in the quarter second between a human joining and PollCharacterSelect opening
+	 * their screen — "no character yet" is the fact that matters, and it is true across that gap.
+	 *
+	 * True for a team with no humans on it, which is the ordinary singleplayer case for the enemy
+	 * side: there is nobody to wait for.
+	 */
+	static bool AreHumansOnTeamSettled(const UObject* WorldContextObject, ETraceTeam Team);
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * THE FRAMEWORK'S HALF OF THE SPEC v15 §2 RED ARM. Dev only, cheat-gated, absent from shipping.
+	 *
+	 * False removes the two roster rules ServerSetCharacter enforces — per-team uniqueness and the
+	 * bot ordering gate above — so ATraceGameMode's bot harness can be shown to FAIL.
+	 *
+	 * IT EXISTS BECAUSE THE RULE IS ENFORCED TWICE. The v14 red arm learned this the expensive way
+	 * (see GTraceEnforceSelectRules in TraceGameMode.cpp): an arm that switched off only the game
+	 * mode's copy came back 19/19 green, because this function was still refusing underneath it. A
+	 * red arm that reports green is manufactured evidence, so the bot arm reaches both.
+	 *
+	 * Deliberately NOT touched by Trace.Characters.VerifyRed, whose documented result — "the loser
+	 * does not end up holding the contested character stays GREEN, because the rule is enforced
+	 * twice" — is still exactly true and is still worth knowing.
+	 */
+	static bool IsRosterEnforcementOn();
+	static void SetRosterEnforcementOn(bool bEnforced);
+#endif
 
 	/**
 	 * The master switch, answered from the WORLD so it is correct on clients too.
