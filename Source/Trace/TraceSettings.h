@@ -1331,12 +1331,12 @@ public:
 	/**
 	 * Speed clamp while dashing, in uu/s.
 	 *
-	 * DASH REACH = DashSpeed * DashDuration. At 3000 x 0.18 that is 540uu. Bots' BotTrailDashRange
+	 * DASH REACH = DashSpeed * DashDuration. At 3300 x 0.18 that is 594uu (v16: 3000 -> 3300). Bots' BotTrailDashRange
 	 * must stay comfortably under that number or the signature trail-crossing kill stops landing —
 	 * if you change this, check that one. Sane range 2200 to 3600.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "Dash Speed (uu/s)", ClampMin = "100.0", ClampMax = "10000.0", UIMin = "1000.0", UIMax = "5000.0"))
-	float DashSpeed = 3000.f;
+	float DashSpeed = 3300.f;
 
 	/**
 	 * How long a dash lasts, in seconds. Multiplied by DashSpeed this is the dash's reach.
@@ -1388,7 +1388,7 @@ public:
 	 * Ceiling on the UPWARD velocity a dash hands back when it ends, as a multiple of JumpZVelocity.
 	 *
 	 * SPEC v7 §5 made the dash a true 3D ray, so a straight-up dash now exists — and the air-strafe
-	 * cap does NOT bound it, being planar by construction. Unclamped, a vertical dash was 540uu on
+	 * cap does NOT bound it, being planar by construction. Unclamped, a vertical dash was 594uu on
 	 * rails PLUS 3000uu/s of exit velocity, about 4592uu of coast, straight through the arena's
 	 * 1640uu ceiling. At 1.0 a dash may hand back at most one jump's worth of climb, making the
 	 * straight-up total ~749uu once, then a fall, with the next dash a full cooldown away.
@@ -1693,7 +1693,8 @@ public:
 	 * traversal exploit.
 	 *
 	 * THE BASE, NOT THE SHIPPED MULTIPLIER. Spec v9 §7's "+30% on the bonus" is applied on top by
-	 * SlideJumpBonusScale below — effective 1 + (1.3125 - 1) x 1.30 = 1.40625 — so this line stays
+	 * SlideJumpBonusScale below — effective 1 + (1.3125 - 1) x 1.43 = 1.446875 (v16: the bonus, i.e.
+	 * the GAIN, raised 10%) — so this line stays
 	 * the designer's v8 number and the two re-tunings never fight.
 	 *
 	 * 1.0 turns the window into a no-op without disabling the move.
@@ -1710,7 +1711,7 @@ public:
 	 * "SlideJumpBonusScale" and clamped there to 0.1..4.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Bonus Scale (v9 §7, x)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.8", UIMax = "2.0"))
-	float SlideJumpBonusScale = 1.30f;
+	float SlideJumpBonusScale = 1.43f;
 
 	/**
 	 * WHICH READING OF §7 IS SHIPPED. The spec asks for both to be flagged and for the choice to be
@@ -1721,7 +1722,7 @@ public:
 	 * 2672 uu/s instead of 2494 uu/s.
 	 *
 	 * FALSE (the alternative): "the bonus" is the whole multiplier. 1.3125 x 1.30 = 1.70625, and the
-	 * same hop carries 3242 uu/s — past DashSpeed's own 3000 uu/s. A slide-hop faster than a dash
+	 * same hop carries 3336 uu/s — past DashSpeed's own 3300 uu/s. A slide-hop faster than a dash
 	 * inverts the game's counterplay (the dash is the only answer to a carrier), which is why this
 	 * reading is not the default.
 	 *
@@ -2045,7 +2046,7 @@ public:
 	 * glancing wall jump still a wall jump.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Outward Impulse (uu/s)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "150.0", UIMax = "800.0"))
-	float WallJumpOutwardImpulse = 420.f;
+	float WallJumpOutwardImpulse = 360.f;
 
 	/**
 	 * Vertical launch, as a MULTIPLE OF JumpZVelocity — the unit every other launch in this kit uses,
@@ -2392,7 +2393,7 @@ public:
 	 *
 	 * 0 replays the pre-v8 throw exactly, which is the A/B to reach for if this proves too strong.
 	 * 0.6 is the middle setting that keeps a jumping throw feeling like a jumping throw while cutting
-	 * the dash-throw tail case (dash 3000 + impulse ~= 5300 uu/s) by 40%.
+	 * the dash-throw tail case (dash 3300 + impulse ~= 5600 uu/s) by 40%.
 	 *
 	 * NAME IS LOAD-BEARING: ATraceCore resolves this by reflection under exactly this spelling, and
 	 * says so at runtime — the mode-B binding check prints "NO UTraceSettings PROPERTY FOUND FOR:"
@@ -2450,7 +2451,9 @@ public:
 	/**
 	 * Seconds of holding the throw button to reach FULL momentum, i.e. the throw the game has today.
 	 *
-	 * 1.0 is the user's number ("start by making a one second charge up time"), and it is the anchor
+	 * 0.8 as of v16 ("Make 100% charge be at .8seconds vs 1second, keeping the linear scale"). The
+	 * original 1.0 was the user's own starting number; the linear scale is unchanged, only the time
+	 * to reach full. This is the anchor
 	 * the other three are defined against: at exactly this hold, Power is 1 and the Core leaves at
 	 * CoreThrowSpeed, so nothing about the existing throw changes for a player who holds for a second.
 	 *
@@ -2460,7 +2463,7 @@ public:
 	 * says what it means.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Time (s) [v13 §6]", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
-	float CoreThrowChargeSeconds = 1.0f;
+	float CoreThrowChargeSeconds = 0.8f;
 
 	/**
 	 * Momentum an INSTANT CLICK throws with, as a fraction of full. [ASSUMPTION] 0.15.
@@ -3416,14 +3419,14 @@ public:
 	// length or half-width, read from ATraceArenaBuilder::GetFieldBounds() at runtime.
 	//
 	// Distances that describe the CHARACTER rather than the pitch — dash reach, the trail dash
-	// commit band, wall clearance — stay absolute, because a dash is 540uu no matter how big the
+	// commit band, wall clearance — stay absolute, because a dash is 594uu no matter how big the
 	// arena is.
 	// ------------------------------------------------------------------------------------------
 
 	/**
 	 * Perpendicular distance to the trail line inside which a hunting bot commits its dash, in uu.
 	 *
-	 * Must stay comfortably under the dash's own reach (DashSpeed * DashDuration, ~540uu by
+	 * Must stay comfortably under the dash's own reach (DashSpeed * DashDuration, ~594uu by
 	 * default) or the dash stops short of the trail and the signature kill never lands. ABSOLUTE,
 	 * not field-relative: it is a property of the dash. Sane range 0.6 to 0.85 of dash reach.
 	 */
@@ -3945,7 +3948,7 @@ public:
 
 	/** Ripple dash speed, as a multiple of Movement|Dash > Dash Speed. DERIVED — see rule 1 above. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Dash Speed (x Dash Speed)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "2.0"))
-	float RoccoRippleDashSpeedMultiplier = 1.f;
+	float RoccoRippleDashSpeedMultiplier = 0.636364f;
 
 	/** Ripple dash duration, as a multiple of Movement|Dash > Dash Duration. Sets the path's length. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Dash Duration (x Dash Duration)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "2.0"))
@@ -3953,7 +3956,7 @@ public:
 
 	/** Speed a RIDER is propelled along the path, as a multiple of Dash Speed. Riders may shoot. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Ride Speed (x Dash Speed)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "2.0"))
-	float RoccoRippleRideSpeedMultiplier = 1.f;
+	float RoccoRippleRideSpeedMultiplier = 0.636364f;
 
 	/** How close to the START ring a player must be to be picked up. §6: entry is at the start only. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Entry Radius (uu)", ClampMin = "20.0", ClampMax = "1000.0", UIMin = "60.0", UIMax = "300.0"))
@@ -3997,9 +4000,47 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Knife Back Damage [v14 §6 ASSUMPTION: unchanged at 100]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "50.0", UIMax = "200.0"))
 	float ChutKnifeBackDamage = 100.f;
 
-	/** Speed the bash imparts, along Chut's direction of travel. NEVER applies to a Core carrier. */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Bash Knockback Speed (uu/s)", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
-	float ChutBashKnockbackSpeed = 1000.f;
+	/**
+	 * Speed the bash imparts, along Chut's direction of travel. NEVER applies to a Core carrier.
+	 *
+	 * *** 1000 -> 1250 -> 1118 THIS PASS, AND THE MIDDLE VALUE IS THE INTERESTING ONE. *** Spec v16
+	 * §0 asked for *"Increase the distance which Chut's bash knocks players by 25%"* — a DISTANCE —
+	 * and this knob is a SPEED. 1250 was the naive +25% on the speed, and §0 flagged it for
+	 * measurement rather than shipping it. Trace.Move.AuditV16.Bash measured it twice, in two
+	 * separate worlds, through the shipped UTraceAbilitySetChut::TryBash with the victim frozen:
+	 *
+	 *   run A   1000 uu/s -> air  584.2 uu, total  875.6 uu | 1250 uu/s -> air 907.1 uu, total 1452.0 uu
+	 *   run B   1000 uu/s -> air  647.8 uu, total 1530.4 uu | 1103 uu/s -> air 779.4 uu, total 1776.8 uu
+	 *
+	 * so +25% SPEED bought +65.8% DISTANCE and the naive 1250 had to go.
+	 *
+	 * *** TUNE THE AIRBORNE LEG, BECAUSE IT IS THE ONLY PART THAT IS REPRODUCIBLE. *** Compare the
+	 * two runs at the SAME 1000 uu/s: the air leg agrees to 11% (584 vs 648) but the TOTAL differs by
+	 * 75% (876 vs 1530), because the ground slide after touchdown is 291 uu in one world and 883 uu
+	 * in the other. The slide is a function of where the bash happened — slope, cover, what the
+	 * victim's feet found — not of this knob. Its fitted exponent swung 2.267 -> 1.523 between the
+	 * two runs, i.e. the total cannot pick a number and would have picked a different one each time.
+	 *
+	 * The airborne leg is the one with a closed form — d_air = (2 x ChutBashUpBias / g) x Speed^2 —
+	 * so the value is the quadratic solve, 1000 x sqrt(1.25) = **1118 uu/s**.
+	 *
+	 * *** WHAT 1118 ACTUALLY DELIVERS, MEASURED AND NOT ASSUMED: +21.5% and +22.8% on the airborne
+	 * leg over two runs, against the +25% asked. *** It lands slightly under, and the reason is
+	 * physical rather than noise: the victim is launched from standing height and lands on the floor,
+	 * so the arc is asymmetric and its flight time grows a little slower than the pure form predicts.
+	 * The fitted exponent is therefore below 2 — but it came out 1.74, 1.84, 1.89 and 1.97 across
+	 * four samples, so solving for it gives a different answer (1103 / 1126 / 1133 / 1158) every time
+	 * it is asked. 1118 is the value that does NOT depend on which sample you happened to take, and
+	 * ~22% against a target of 25% is inside that spread. Chasing the last two points here means
+	 * fitting noise.
+	 *
+	 * WHAT THIS DOES NOT PROMISE: the TOTAL knock will not be uniformly +25%, because the ground
+	 * bleed is terrain's to decide. A single speed cannot make it so. Re-measure with
+	 * Trace.Move.AuditV16.Bash (~40 s) before moving this; read the AIRBORNE LEG line, not the total,
+	 * and take more than one sample.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Bash Knockback Speed (uu/s) [v16 §0: tuned for +25% DISTANCE, not +25% speed]", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
+	float ChutBashKnockbackSpeed = 1118.f;
 
 	/** Upward component of the bash, as a fraction of the knockback speed. A little pop reads better. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Bash Upward Bias (fraction of knockback)", ClampMin = "0.0", ClampMax = "1.5", UIMin = "0.0", UIMax = "0.6"))
@@ -4332,4 +4373,97 @@ public:
 	// Look sensitivity belongs in the in-game options menu, not in Project Settings, and having it
 	// in both is how somebody ends up tuning the copy that does nothing.
 	// ==========================================================================================
+
+	// ==========================================================================================
+	// AMMO  (spec v16 §1, new)
+	//
+	// Verbatim: "Add ammo to the guns. 30 bullets per clip, then the gun reloads. R to reload."
+	// "Reloading takes .5seconds"
+	//
+	// APPENDED AT THE END OF THE CLASS RATHER THAN FILED UNDER "Combat" BESIDE FireInterval, and
+	// that is a file-position choice only — the `Category` meta below is what decides where these
+	// appear in Project Settings, so they land next to Fire Interval in the editor regardless. The
+	// pass that added them owned this header only for appends.
+	//
+	// BOTH ARE MIRRORED IN `Config/DefaultGame.ini` under `[/Script/Trace.TraceSettings]`, beside
+	// FireInterval, and *** THE INI IS THE ONE THAT DECIDES *** — it is layered over these
+	// initialisers at startup, so editing only this header changes nothing at runtime. Move both or
+	// neither, and read the live numbers back with `Trace.Ammo.Dump` rather than trusting either
+	// file. (They were header-only for the length of the pass that added them, which is why the
+	// pass's own evidence quotes `Trace.Ammo.Dump` everywhere instead of the ini.)
+	// ==========================================================================================
+
+	/**
+	 * ROUNDS PER CLIP. Spec v16 §1: "30 bullets per clip".
+	 *
+	 * THE RESERVE IS INFINITE — there is deliberately no carried-ammo knob beside this one. The
+	 * document never mentions carried ammo, and a shooter that can run permanently dry is a much
+	 * bigger design change than the line asks for. Only the clip is finite, and a reload always
+	 * refills it completely.
+	 *
+	 * Worth reading in the units of the gun that spends it: FireInterval is 0.40 s, so a full clip
+	 * is 12.0 s of continuous fire, and at 40 damage a body shot that is 750 potential damage
+	 * between reloads. Lowering this is the single strongest lever on how often a fight is
+	 * interrupted; it is not a cosmetic number.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Clip Size (rounds) [v16 §1]", ClampMin = "1", ClampMax = "999", UIMin = "5", UIMax = "60"))
+	int32 ClipSize = 30;
+
+	/**
+	 * SECONDS THE RELOAD TAKES, during which the gun refuses to fire. Spec v16 §1: "Reloading takes
+	 * .5seconds".
+	 *
+	 * It is a DEADLINE on the shared clock at runtime, not a countdown (see
+	 * UTraceWeaponComponent::ReloadEndServerTime), for the same reason the knife's 0.2 s pullout is:
+	 * one float that means the same instant on the client that predicted it and the server that
+	 * validates against it.
+	 *
+	 * The knife is unaffected — CanSwing() does not consult ammo at all, so a player caught mid
+	 * reload can still swing. That is deliberate and it is the counterplay to an empty clip.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Reload Time (s) [v16 §1]", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.2", UIMax = "3.0"))
+	float ReloadSeconds = 0.5f;
+
+	// ==========================================================================================
+	// X's VULNERABLE, NOW STACKING  (spec v16 §4, new)
+	//
+	// Verbatim: "Change X's vulnerable to stack with each hit. The first stack still causes 25%
+	// extra damage, but each additional stack only adds 5%. Whenever the timer runs out, all stacks
+	// disappear."
+	//
+	// The FIRST stack is still XVulnerableDamageBonus (0.25) above; the two knobs below are the
+	// per-extra-stack term and the ceiling. N stacks resolve to 1 + 0.25 + (N-1) * 0.05.
+	//
+	// Mirrored in Config/DefaultGame.ini beside XVulnerableDamageBonus, and the ini is the one that
+	// decides — see the AMMO note above. `Trace.Health.DumpSettings` prints what this process
+	// resolved.
+	// ==========================================================================================
+
+	/**
+	 * What each stack after the first adds. §4: "each additional stack only adds 5%".
+	 *
+	 * So 1 stack = +25%, 2 = +30%, 3 = +35%, and so on up to the cap below.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable: Bonus Per Extra Stack (fraction) [v16 §4]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.2"))
+	float XVulnerableStackBonus = 0.05f;
+
+	/**
+	 * HARD CEILING ON THE STACK COUNT. §4 does not give one; [ASSUMPTION], and this is the knob it
+	 * was made a knob for.
+	 *
+	 * FIVE, and the reason is X's own arithmetic rather than a round number: five is the bee count
+	 * (XBeeCount) and the Sting clip (XStingBulletCount), so it is exactly the number of marks X can
+	 * deliver in one engagement without waiting for a cooldown. A cap below five would make the last
+	 * bees of a Sting clip do nothing; a cap above five could only be reached by two Xs or by a
+	 * target standing inside the orbiting swarm, which is not a case worth designing a damage cliff
+	 * around.
+	 *
+	 * WHAT IT BUYS THE TARGET, in the units of the gun: at the cap the multiplier is x1.45, so a
+	 * 25-damage leg shot becomes 36.25 and kills in three instead of four. (The 40-damage body shot
+	 * already dropped from three rounds to two at ONE stack — 40 x 1.25 = 50 — so the body cliff is
+	 * not what this cap is protecting.) Unbounded stacking would put a headshot-equivalent on the
+	 * fourth leg shot, which is the bug this exists to prevent.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable: Max Stacks [v16 §4, capped at 5]", ClampMin = "1", ClampMax = "50", UIMin = "1", UIMax = "10"))
+	int32 XVulnerableMaxStacks = 5;
 };

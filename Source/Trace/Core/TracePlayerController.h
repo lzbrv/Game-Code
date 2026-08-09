@@ -73,6 +73,7 @@ struct FTraceDashHudState
  *   Scoreboard  bool     Tab           (held)
  *   EquipKnife  bool     1             (spec v13 §2 — DIRECT SELECT, idempotent; the SWING rides IA_Fire)
  *   EquipGun    bool     2             (spec v13 §2 — DIRECT SELECT, idempotent)
+ *   Reload      bool     R             (spec v16 §1 — the clip also reloads itself when it empties)
  *
  * SPEC v15 §5: TWO WEAPON KEYS, AND NO TOGGLE. Verbatim: "Switch weapon keybind so that it's only
  * switch to knife/switch to gun." The `SwapWeapon` action — gun <-> knife on F, spec v10 §1 — is
@@ -274,6 +275,20 @@ public:
 	/** Read by the v13 §2 harness to prove a synthetic key actually reached a bound delegate. */
 	int32 GetDebugEquipPressCount() const { return DebugEquipPressCount; }
 
+	/**
+	 * SPEC v16 §1. How many times OnReloadStarted has been ENTERED, counted on its first line before
+	 * any gate — so it answers "the R key reached a bound delegate", which is a different question
+	 * from "a reload started" and is the one Trace.Ammo.BindTest has to be able to ask.
+	 *
+	 * The distinction is the whole reason it exists, and DebugEquipPressCount's comment above records
+	 * what it cost to learn: a probe that only watched the OUTCOME passed on a build where the key
+	 * never reached the handler at all, because "nothing happened" and "the guard worked" look
+	 * identical from outside.
+	 */
+	int32 DebugReloadPressCount = 0;
+
+	int32 GetDebugReloadPressCount() const { return DebugReloadPressCount; }
+
 	FVector2D DebugLastMoveValue = FVector2D::ZeroVector;
 	FVector2D DebugLastLookValue = FVector2D::ZeroVector;
 
@@ -413,6 +428,17 @@ protected:
 	TObjectPtr<UInputAction> IA_AbilitySecondary;
 
 	/**
+	 * SPEC v16 §1 — "R to reload". Default R, rebindable like everything else.
+	 *
+	 * Bound on Started ONLY, with the same asymmetry argument as IA_EquipKnife / IA_EquipGun: there is
+	 * no held state to release, and a Completed binding would send a second reload request on key-up
+	 * that UTraceWeaponComponent::RequestReload would then swallow because a reload is already
+	 * running — a binding that only works because something downstream ignores it.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_Reload;
+
+	/**
 	 * Builds InputMapping and every IA_* exactly once, then lays down the key mappings.
 	 *
 	 * The two halves are separate on purpose. The ACTIONS must be created exactly once and never
@@ -469,6 +495,18 @@ protected:
 	void OnEquipKnifeStarted();
 	void OnEquipGunStarted();
 	void HandleDirectEquip(bool bWantKnife, const TCHAR* ActionLabel);
+
+	/**
+	 * SPEC v16 §1. Press edge of the reload bind (R).
+	 *
+	 * Makes NO decision of its own — every refusal (full clip, already reloading, dead, carrying, the
+	 * knife out, an ability-loaded clip) lives behind UTraceWeaponComponent::RequestReload, which is
+	 * also what the AUTOMATIC reload goes through. A second opinion here about whether a reload is
+	 * legal is exactly how a predicted state and an authoritative one come to disagree, and it is the
+	 * same reasoning OnParryStarted's comment gives.
+	 */
+	void OnReloadStarted();
+
 	void OnCrouchStarted();
 	void OnCrouchCompleted();
 	void OnScoreboardStarted();

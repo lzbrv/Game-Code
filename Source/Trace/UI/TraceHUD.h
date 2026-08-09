@@ -44,6 +44,38 @@ public:
 	virtual void DrawHUD() override;
 	//~ End AHUD interface
 
+#if !UE_BUILD_SHIPPING
+	/**
+	 * Spec v16 §2 — prints WHAT THE LAST DRAWN FRAME ACTUALLY CONTAINED, for Trace.HUD.V16.Report
+	 * and for the shot sequence that pairs a line of this with every screenshot it takes.
+	 *
+	 * It reports the DRAW RECORD, never the gameplay state that fed it. A report built from the
+	 * weapon component would say "30 rounds" for a HUD that drew nothing at all, which is the exact
+	 * class of self-certifying harness this project has already been burned by. Every field it
+	 * prints is written at the point the pixels are emitted — including the number of magazine ticks
+	 * and ring chords actually issued, so an element that computed a healthy value and then drew
+	 * nothing shows up as a zero rather than as a pass.
+	 */
+	void LogV16DrawRecord(const TCHAR* Tag) const;
+
+	/** The same record, for a harness that has to ASSERT on it rather than print it. */
+	struct FV16DrawRecord
+	{
+		bool  bAmmoBlock = false;
+		FString AmmoText;
+		bool  bBeeClip = false;
+		bool  bReloadBar = false;
+		int32 MagazineTicks = 0;
+		int32 ChipCount = 0;
+		FString ChipText;
+		bool  bChargeRing = false;
+		float ChargeRingAlpha = -1.f;
+		int32 ChargeRingChords = 0;
+		bool  bChargeBar = false;
+	};
+	FV16DrawRecord GetV16DrawRecord() const;
+#endif
+
 protected:
 	// ---- Draw passes, in back-to-front order --------------------------------------------------
 
@@ -92,8 +124,52 @@ protected:
 	 * the carrier's trace becomes invulnerable AND their own shield drops — so the player needs to
 	 * see the timer, not guess at it. Sits at screen centre because that is also where the receiver
 	 * they must stay on is.
+	 *
+	 * *** THIS IS "THE OLD CIRCLE AROUND THE CROSSHAIR ANIMATION FOR GAME MODE A". *** Spec v16 §2
+	 * asks for it to be reused for the throw charge; DrawThrowChargeRing() below is that reuse, and
+	 * both go through the same DrawCrosshairRing() so there is exactly one ring in this file.
 	 */
 	void DrawPassProgress();
+
+	/**
+	 * SPEC v16 §2 — the throw charge, MOVED OFF THE BOTTOM-LEFT BAR AND ONTO THE CROSSHAIR.
+	 *
+	 * Verbatim: "For the throw charge, use the old circle around the crosshair animation for game
+	 * mode a to demonstrate how charged /100% the throw is, rather than a bar on the hud."
+	 *
+	 * The old animation was not invented for this and was not recovered from git either: it is
+	 * DrawPassProgress(), which has drawn mode A's hover-pass hold as a closing ring around the
+	 * crosshair since the "Mechanics v2" commit and is still called every frame. This pass feeds the
+	 * SAME ring geometry from ATraceCore's predicted charge instead, so the thing the player
+	 * remembers is literally the thing they get.
+	 *
+	 * The two can never collide: mode A starts a hover pass and never a throw, mode B throws and
+	 * never passes. The pass still wins if a build ever manages both at once — see the early-out.
+	 */
+	void DrawThrowChargeRing();
+
+	/**
+	 * True when DrawThrowChargeRing() will draw this frame. ONE definition, read by two passes.
+	 *
+	 * DrawCrosshair() needs it as well as DrawThrowChargeRing() does, because both write a caption
+	 * under the reticle and the ring's has to win. Measured, not theorised: the first armed capture
+	 * of the ring photographed "52%  -  POWER 66%" printed directly on top of "LMB  -  THROW", which
+	 * was unreadable. DrawCrosshair already suppresses itself the same way for the pass ring; this is
+	 * the same rule for the same reason.
+	 */
+	bool IsThrowChargeRingUp() const;
+
+	/**
+	 * THE ONE RING. A @p FillAlpha-fraction arc closing clockwise from twelve o'clock around the
+	 * centre crosshair, over a dim full-circle track, with @p Caption centred underneath it.
+	 *
+	 * Split out of DrawPassProgress() by spec v16 §2 so the pass hold and the throw charge are the
+	 * same animation rather than two rings that drift apart. Radius is derived from the live
+	 * ThirdPersonCrosshairScale setting, not from a literal — a ring pinned to a constant gets
+	 * sliced by the crosshair arms the moment a designer raises that.
+	 */
+	void DrawCrosshairRing(float FillAlpha, const FLinearColor& FillColor,
+		const FString& Caption, const FLinearColor& CaptionColor);
 
 	void DrawHitMarker();
 
@@ -138,6 +214,62 @@ protected:
 	 * @param X,Y,W,H  The bar's rect, in pixels.
 	 */
 	void DrawHealthBar(const class UTraceHealthComponent* HealthComp, float X, float Y, float W, float H);
+
+	/**
+	 * SPEC v16 §2 — THE BOTTOM-RIGHT CORNER: ammo in the corner itself, statuses stacking above it.
+	 *
+	 * Verbatim: "Show ammo in the hud on the bottom right" and "Statuses should show on the hud in
+	 * the bottom right, separate from cooldowns (eg speed boost, poisoned, vulnerable, etc)".
+	 *
+	 * *** THE LAYOUT IS THE DECISION, SO IT IS WRITTEN DOWN HERE. *** Two features were told to
+	 * share one corner, and the arrangement is the same one the bottom-left stack already uses and
+	 * for the same reason:
+	 *
+	 *   * AMMO IS PINNED TO THE CORNER AND NEVER MOVES. It is read constantly, mid-fight, without
+	 *     looking — exactly like health on the left — so it gets the fixed home. Every status is
+	 *     conditional and would otherwise push it around.
+	 *   * STATUSES STACK UPWARDS ABOVE IT, in a fixed priority order, so a status appearing or
+	 *     expiring never moves the ammo count and only ever shuffles other statuses.
+	 *
+	 * "SEPARATE FROM COOLDOWNS" IS ANSWERED TWICE, because the corner alone is not enough — a player
+	 * glancing down still has to be able to tell a status from a cooldown at speed:
+	 *
+	 *   1. cooldowns live in the bottom-LEFT stack and are untouched by this pass;
+	 *   2. cooldowns FILL toward ready; statuses DRAIN toward gone. Opposite directions, so the two
+	 *      never read as the same widget even out of the corner of an eye.
+	 *
+	 * Nothing here is drawn for a dead player: a status on a corpse is not information, and
+	 * UTraceWeaponComponent::ShouldShowAmmo() already answers the ammo half.
+	 */
+	void DrawAmmoAndStatuses();
+
+	/**
+	 * The ammo block itself, right-aligned with its bottom edge at @p BottomY. Returns the Y its top
+	 * edge landed on, which is where the status stack starts growing upward from.
+	 *
+	 * GATED ENTIRELY ON UTraceWeaponComponent::ShouldShowAmmo() — never on a locally re-derived
+	 * "the carrier has no gun", which would be a second definition of the rule able to disagree with
+	 * the one the gun itself enforces. Returns @p BottomY unchanged when it draws nothing.
+	 *
+	 * SPEC v16 §1's Sting clause is the other half of this pass: X's Sting REPLACES the clip with 5
+	 * bee rounds, so a player who does not know that sees 25 rounds vanish and reads it as the gun
+	 * eating their ammo. A bee clip therefore changes three independent things at once — the colour,
+	 * the shape of the magazine strip, and the words — so the difference survives a small window, a
+	 * colour-blind player, and a compressed screenshot.
+	 */
+	float DrawAmmoBlock(float RightX, float BottomY, float BlockW);
+
+	/**
+	 * One status chip, right-aligned, with its BOTTOM edge at @p BottomY. Returns the Y above it.
+	 *
+	 * @param Fraction  0..1 of the effect REMAINING — the draining indicator spec v16 §2 demands
+	 *                  ("a bare icon that never changes is not a status display"). Drains to empty.
+	 * @param Readout   the duration text, right-aligned inside the chip. Never empty in practice;
+	 *                  the two statuses with no clock (Mace's pull) pass a distance instead, which
+	 *                  is that effect's real progress.
+	 */
+	float DrawStatusChip(float RightX, float BottomY, float ChipW, const FString& Label,
+		const FString& Readout, float Fraction, const FLinearColor& Tint);
 
 	void DrawScoresAndClock();
 	void DrawCoreBanner();
@@ -469,4 +601,30 @@ private:
 	float MatchStartTime = -1000.f;
 	ETraceMatchState LastSeenMatchState = ETraceMatchState::WaitingForPlayers;
 	bool bMatchStateCacheValid = false;
+
+#if !UE_BUILD_SHIPPING
+	// ---- Spec v16 §2 draw record ----------------------------------------------------------------
+	//
+	// *** WHAT WAS ACTUALLY DRAWN, NOT WHAT THE GAME STATE SAYS. *** Every field here is written by
+	// the draw pass itself, at the point the pixels are emitted, and Trace.HUD.V16.Report prints
+	// them back. That distinction is the whole point: a harness that asked the weapon component how
+	// much ammo it had would pass with a HUD that draws nothing at all, which is exactly the failure
+	// this project has been bitten by (a geometry index reporting itself healthy while returning 0).
+	//
+	// Cleared at the top of every DrawHUD so a stale record can never be read as a live one.
+
+	bool  bDrewAmmoBlock = false;
+	FString DrawnAmmoText;
+	bool  bDrewBeeClip = false;
+	bool  bDrewReloadBar = false;
+	int32 DrawnMagazineTicks = 0;      // lit ticks actually emitted, so an empty strip cannot pass
+
+	/** One entry per status chip drawn, in the order drawn (bottom-up). */
+	TArray<FString> DrawnStatusChips;
+
+	bool  bDrewChargeRing = false;
+	float DrawnChargeRingAlpha = -1.f;
+	int32 DrawnChargeRingSegments = 0;  // filled chords emitted; 0 with a positive alpha is a lie
+	bool  bDrewChargeBar = false;       // the SUPERSEDED bottom-left row. Must be false when armed.
+#endif
 };

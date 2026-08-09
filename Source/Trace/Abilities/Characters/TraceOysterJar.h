@@ -34,6 +34,12 @@
 //   Burst()              poison attachment -> CanAffectTarget (both)        -> never a carrier
 //   (and the poison's own per-tick re-check, in UTraceOysterPoisonComponent)
 //
+// STILL FOUR, after spec v16 §3. Burst() now also spawns ATraceOysterPoisonCloud, and that is NOT a
+// fifth vector: the cloud is a replicated, collisionless, purely cosmetic marker of the volume the
+// burst covered. It reads no player, touches no player, and no rule anywhere reads it — so it is
+// deliberately NOT behind the choke point, because there is nobody to ask about. It is sized from the
+// same Radius the loop above it uses, which is the only contract it has.
+//
 // COLLISION: the jar blocks WORLD STATIC ONLY, and ignores everything else. It has to block geometry
 // or the lob could not land; it must ignore pawns or it would become a movement base, block a
 // bullet, and let a player push a live jar around. "Touching" a jar is a radius test in Tick, not a
@@ -136,7 +142,7 @@ private:
 	/** Server. Pickler's "30 damage in an area and pulls enemies within a small radius toward it". */
 	void FireLandingEffect();
 
-	/** Server. The poison burst a break produces. */
+	/** Server. The poison burst a break produces, and (spec v16 §3) the cloud that announces it. */
 	void Burst();
 
 	/** Server. The touch test: is a living enemy inside the break radius. */

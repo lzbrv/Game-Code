@@ -52,11 +52,18 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "GameFramework/Actor.h"
 #include "UObject/ObjectMacros.h"
+#include "UObject/ObjectPtr.h"
 
 #include "TraceOysterPoison.generated.h"
 
 class ATraceCharacter;
+class UMaterialInstanceDynamic;
+class UMaterialInterface;
+class USceneComponent;
+class UStaticMesh;
+class UStaticMeshComponent;
 class UTraceAbilityComponent;
 
 /**
@@ -192,4 +199,170 @@ private:
 
 	/** Every machine that simulates the victim. The clamp itself. */
 	void ApplySlowClamp();
+};
+
+/**
+ * THE CLOUD A BREAKING JAR LEAVES BEHIND — spec v16 §3.
+ *
+ * ===================================================================================================
+ * SPEC v16 §3, VERBATIM
+ * ===================================================================================================
+ *
+ *   "Add a small, semi transparent cloud when oyster's poison jars break. This cloud should be the
+ *    radius of the explosion"
+ *
+ * ===================================================================================================
+ * IT IS A SPHERE, AND IT IS EXACTLY THE RADIUS THE DAMAGE USES. BOTH OF THOSE ARE THE POINT.
+ * ===================================================================================================
+ *
+ * ATraceOysterJar::Burst() decides who is poisoned with ONE test — a 3D distance from the jar against
+ * OysterPoisonRadiusUU — so the volume the poison occupies is a sphere of that radius centred on the
+ * jar, and nothing else. The cloud is therefore a sphere of that radius centred on the jar:
+ *
+ *   * the radius is PASSED IN from Burst(), out of the same local the loop above it tests against.
+ *     It is not a second read of the knob and it is certainly not a number typed in here. A cloud
+ *     that drifted from the damage would be worse than no cloud at all — it would tell a player the
+ *     poison is somewhere it is not.
+ *   * it is NOT squashed into a ground disc. A disc would look better and would lie: the burst really
+ *     does reach a player 380 uu straight up. What is buried under the floor is hidden by the floor
+ *     for free, because additive geometry is still depth-TESTED, so what a player actually sees is a
+ *     dome sitting on the ground — the honest shape, at no cost.
+ *
+ * ===================================================================================================
+ * "SEMI TRANSPARENT... MUST NOT OBSCURE A FIGHT" IS A MATERIAL DECISION, NOT AN OPACITY SLIDER
+ * ===================================================================================================
+ *
+ * This project ships no VFX assets and generates only two materials, both BLEND_Opaque (see
+ * Scripts/generate_content.py). A blend mode cannot be changed on a dynamic instance — it is compiled
+ * into the parent — so "semi transparent" had to come from a parent that already is.
+ *
+ * /Engine/EngineMaterials/EmissiveMeshMaterial is unlit and BLEND_Additive, and ATraceTracer already
+ * leans on it for exactly this reason: additive geometry WRITES NO DEPTH, so it cannot hide anything.
+ * A player standing in front of the cloud is drawn over it; a player standing behind it is brightened
+ * slightly, never occluded. That is a stronger guarantee than a translucent material with a low alpha
+ * would have given, because it holds no matter how many puffs overlap. If that material is missing the
+ * puffs are HIDDEN rather than drawn opaque — a solid green ball dropped into a firefight is far worse
+ * than no cloud, which is the same call ATraceTracer makes for its sheath.
+ *
+ * ===================================================================================================
+ * REPLICATED, COSMETIC, AND ON A CLOCK IT SHARES WITH THE POISON
+ * ===================================================================================================
+ *
+ * §3: "Replicated: every client must see it, not just the server. It is cosmetic — no gameplay
+ * collision." So it is a replicated server-spawned actor, like ATraceRippleActor, rather than a
+ * client-side effect off a multicast: the jar is DESTROYED in the same call that bursts it, and an RPC
+ * on a corpse is exactly the kind of thing that works on a listen server and quietly does not on a
+ * client. Nothing on it collides, damages, or affects navigation, and no rule anywhere reads it.
+ *
+ * It fades out over the poison's own duration and dies with it, so what you can see is what is still
+ * dangerous — the [ASSUMPTION] flagged in §3. Both ends are absolute match-clock times, never
+ * durations, which is this project's rule everywhere and is what lets a client that received the actor
+ * late still fade it correctly.
+ */
+UCLASS()
+class TRACE_API ATraceOysterPoisonCloud : public AActor
+{
+	GENERATED_BODY()
+
+public:
+	ATraceOysterPoisonCloud();
+
+	virtual void Tick(float DeltaSeconds) override;
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+	/**
+	 * SERVER ONLY. The one way a cloud is ever made. Call it from the break path with the radius the
+	 * burst itself used — see the class comment on why it is a parameter and not a lookup.
+	 *
+	 * @param WorldPtr          the world to spawn into.
+	 * @param Origin            the jar, i.e. the centre of the burst's distance test.
+	 * @param RadiusUU          the burst radius, in uu. The cloud's silhouette is exactly this.
+	 * @param DurationSeconds   how long the poison it announces lasts.
+	 * @return the cloud, or null (bad world, no authority, a non-positive radius).
+	 */
+	static ATraceOysterPoisonCloud* ServerSpawnForBurst(UWorld* WorldPtr, const FVector& Origin,
+	                                                    float RadiusUU, float DurationSeconds);
+
+	/** The burst radius this cloud was built for. Replicated, so a client draws the server's number. */
+	float GetCloudRadiusUU() const { return CloudRadius; }
+
+	/** Absolute match time the jar broke, and the time the cloud is gone. Both replicated. */
+	float GetBurstMatchTime() const { return BurstMatchTime; }
+	float GetExpireMatchTime() const { return ExpireMatchTime; }
+
+	/** How many puffs this machine actually built. ZERO IS A FAILURE, not a quiet nothing. */
+	int32 GetBuiltPuffCount() const;
+
+	/**
+	 * The cloud's real extent in uu, measured off the REGISTERED COMPONENTS' own bounds rather than
+	 * off the numbers this class intended — max over puffs of (distance from the centre + that puff's
+	 * own radius).
+	 *
+	 * It reads the renderer's view on purpose. A puff whose mesh failed to resolve has zero bounds and
+	 * drags this number down; a harness that trusted the intent instead would report a healthy radius
+	 * for a cloud nobody can see.
+	 */
+	float MeasureBuiltExtentUU() const;
+
+	/** The parent material the puffs ended up on, for the harness. "<none>" when they are hidden. */
+	FString DescribePuffMaterial() const;
+
+	/** True if ANY component on this actor has collision enabled. §3 says it is cosmetic; must be false. */
+	bool HasAnyCollisionEnabled() const;
+
+	/** The brightness last pushed into the puffs. The harness checks a captured frame was not black. */
+	float GetLastAppliedIntensity() const { return LastAppliedIntensity; }
+
+protected:
+	virtual void BeginPlay() override;
+
+	/** REPLICATED. The burst radius. Everything about the geometry is derived from it. */
+	UPROPERTY(Replicated)
+	float CloudRadius = 0.f;
+
+	/** REPLICATED. Absolute match times — see the class comment on why these are not durations. */
+	UPROPERTY(Replicated)
+	float BurstMatchTime = 0.f;
+
+	UPROPERTY(Replicated)
+	float ExpireMatchTime = 0.f;
+
+	UPROPERTY()
+	TObjectPtr<USceneComponent> CloudRoot = nullptr;
+
+	/**
+	 * The puffs. Default subobjects, so spawning a cloud is a template copy — same reason, and the
+	 * same plain UPROPERTY() declaration, as ATraceMeleeArc's fan: these are references to default
+	 * subobjects and the instancing graph has to be allowed to remap them onto the spawned actor's
+	 * own components.
+	 */
+	UPROPERTY()
+	TArray<TObjectPtr<UStaticMeshComponent>> Puffs;
+
+	UPROPERTY()
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> PuffMIDs;
+
+	/** /Engine/BasicShapes/Sphere. Held hard so the cooker follows it. */
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> PuffMesh = nullptr;
+
+	/** /Engine/EngineMaterials/EmissiveMeshMaterial — additive, and the whole "must not obscure" answer. */
+	UPROPERTY()
+	TObjectPtr<UMaterialInterface> AdditiveMaterial = nullptr;
+
+private:
+	/** Idempotent, and cheap until CloudRadius arrives — on a client that is some frames after BeginPlay. */
+	void BuildPuffsIfNeeded();
+
+	/** Pushes one brightness into every puff. The only thing that animates; the size never moves. */
+	void ApplyIntensity(float Intensity);
+
+	float MatchTimeNow() const;
+
+	bool bPuffsBuilt = false;
+
+	/** False when the additive material was missing and the puffs were hidden rather than drawn opaque. */
+	bool bPuffsVisible = false;
+
+	float LastAppliedIntensity = 0.f;
 };

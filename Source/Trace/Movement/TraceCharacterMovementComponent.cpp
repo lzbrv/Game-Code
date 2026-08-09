@@ -171,7 +171,7 @@ namespace TraceMoveKnob
 //   §5 WallJumpMomentumScale        0.90 -> 1.00   (retention back to the designer's 0.95)
 //   §5 WallJumpWindowScale          0.60 -> 1.00   (window back to the designer's 0.25 s)
 //   §6 SlideMaxLengthScale          0.70 -> 1.00
-//   §7 SlideJumpBonusScale          1.30 -> 1.00
+//   §7 SlideJumpBonusScale          1.43 -> 1.00   (v16 §0 raised it from 1.30)
 //   §8 AirStrafeAsymptoteScale      1.10 -> 1.00
 //   §8 MovementGravityScale         1.12 -> 1.00
 //
@@ -767,15 +767,20 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
 	//
 	//   bSlideJumpBonusScalesGainOnly = true  (SHIPPED, and the spec's [ASSUMPTION])
 	//       "The bonus" is the part above 1.0 — the thing the timing actually buys.
-	//       1 + (1.3125 - 1) x 1.30 = 1 + 0.40625 = 1.40625.
-	//       A well-timed hop at 1900 uu/s carries 2672 uu/s instead of 2494 uu/s: +178 uu/s, a
+	//       1 + (1.3125 - 1) x 1.43 = 1 + 0.446875 = 1.446875.
+	//       A well-timed hop at 1900 uu/s carries 2749 uu/s instead of 2494 uu/s: +255 uu/s, a
 	//       legible step up from a bonus that was already legible.
 	//
 	//   bSlideJumpBonusScalesGainOnly = false (THE ALTERNATIVE, flagged as the spec asks)
-	//       "The bonus" is the whole multiplier. 1.3125 x 1.30 = 1.70625.
-	//       The same hop carries 3242 uu/s — 71% over entry speed, which beats DashSpeed's own
-	//       3000 uu/s. A slide-hop that is faster than a dash inverts the game's counterplay
+	//       "The bonus" is the whole multiplier. 1.3125 x 1.43 = 1.876875.
+	//       The same hop carries 3566 uu/s — 88% over entry speed, which beats DashSpeed's own
+	//       3300 uu/s. A slide-hop that is faster than a dash inverts the game's counterplay
 	//       (the dash is the only answer to a carrier), so this reading is NOT shipped by default.
+	//
+	// SPEC v16 §0 raised the SCALE from 1.30 to 1.43 — "increase the well-timed slide jump bonus by
+	// 10%" read as +10% ON THE GAIN, which is what bSlideJumpBonusScalesGainOnly already means: the
+	// gain goes 0.40625 -> 0.446875, exactly +10%. Read against the WHOLE multiplier instead, "+10%"
+	// would have been 1.546875, and this file's own semantics are what settled it.
 	//
 	// Base stays the designer's DefaultGame.ini value (1.3125, which wins over the header) and the
 	// spec's increase is a separate named scalar on top — so re-tuning the base and re-tuning the
@@ -783,7 +788,7 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
 	const float Base = FMath::Max(1.f, UTraceSettings::Get().SlideJumpWindowSpeedBonus);
 	const float Scale = IsV9LegacyTuning()
 		? 1.f
-		: FMath::Clamp(TraceMoveKnob::Float(TEXT("SlideJumpBonusScale"), 1.30f), 0.1f, 4.f);
+		: FMath::Clamp(TraceMoveKnob::Float(TEXT("SlideJumpBonusScale"), 1.43f), 0.1f, 4.f);
 	const bool bGainOnly = TraceMoveKnob::Bool(TEXT("bSlideJumpBonusScalesGainOnly"), true);
 
 	return FMath::Max(1.f, bGainOnly ? (1.f + (Base - 1.f) * Scale) : (Base * Scale));
@@ -1189,8 +1194,9 @@ float UTraceCharacterMovementComponent::GetWallJumpControlLockoutSeconds() const
 	// wall jump launches at ~543 uu/s outward against 8000 uu/s² of air acceleration pointed back at
 	// the wall, and peaks 18 uu out — half a capsule radius — before it is being driven back in.
 	//
-	// 0.20 s is chosen as "long enough that the impulse alone clears the face". At 420 uu/s the pawn
-	// travels 84 uu in that time — two and a half capsule radii, unambiguously off the wall — and the
+	// 0.20 s is chosen as "long enough that the impulse alone clears the face". At 360 uu/s (v16 §0:
+	// 420 -> 360) the pawn travels 72 uu in that time — over two capsule radii, unambiguously off the
+	// wall — and the
 	// window then ends while the player still has most of their airtime to strafe with. Deliberately
 	// SHORTER than the mantle lockout (0.30 s) so the two do not read as one long dead zone, and long
 	// enough to cover the 0.15 s wall window so a second contact cannot re-open a launch inside it.
@@ -1237,7 +1243,7 @@ float UTraceCharacterMovementComponent::GetWallJumpOutwardImpulse() const
 	// Flat push along the normal, on top of the reflection. Without it a player who slid down a wall
 	// with almost no planar speed would wall-jump straight back into the wall on the next frame and
 	// the mechanic would read as broken; with it, even a standing wall jump clears the face.
-	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("WallJumpOutwardImpulse"), 420.f));
+	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("WallJumpOutwardImpulse"), 360.f));
 }
 
 float UTraceCharacterMovementComponent::GetWallJumpVerticalMultiplier() const
@@ -1477,7 +1483,7 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 	// are still holding it on the frame after the launch. The arithmetic is one-sided and brutal:
 	// peak separation is v_out²/2a with a = 8000 uu/s², and AirMaxWishSpeed (160) caps how fast a
 	// pawn can return to a wall under air control — so every wall jump taken FROM THE AIR has almost
-	// nothing to reflect, launches at roughly the flat 420 impulse alone, and peaks at ~18 uu against
+	// nothing to reflect, launches at roughly the flat 360 impulse alone, and peaks at ~15 uu against
 	// a 34 uu capsule radius. It is glued to the face by its own input, and no launch value could
 	// have outrun it: doubling the impulse buys 4x the separation and still loses to 8000 uu/s².
 	//
@@ -2337,7 +2343,7 @@ void UTraceCharacterMovementComponent::HandleImpact(const FHitResult& Hit, float
 	// client, a head-on approach reads entry=0 by the time the jump is pressed, because PhysFalling
 	// re-derives Velocity from the distance the capsule actually moved and a pawn stopped by a wall
 	// moved nothing. Without this capture the "preserve and redirect momentum" of spec v8 §7 is a
-	// 420 uu/s nudge and nothing else. Captured planar; the vertical component is the wall jump's own
+	// 360 uu/s nudge and nothing else. Captured planar; the vertical component is the wall jump's own
 	// number.
 	//
 	// Take the FASTER of this frame's velocity and whatever the window already holds: the engine can
@@ -2425,7 +2431,7 @@ bool UTraceCharacterMovementComponent::TryWallJump()
 	// ceiling exists to stop speed being BUILT in the air, not to brake speed that was carried into
 	// it. So the cap is floored at the speed the pawn arrived with — a wall jump keeps every unit it
 	// was already carrying, and can never add past the hard cap. Without this the outward impulse
-	// would be a free, repeatable +420 uu/s that the whole of spec v5 §1 was written to prevent.
+	// would be a free, repeatable +360 uu/s that the whole of spec v5 §1 was written to prevent.
 	if (IsAirStrafeHardCapEnabled())
 	{
 		const float Ceiling = FMath::Max(EntrySpeed, GetAirStrafeHardCapSpeed());
@@ -2736,7 +2742,8 @@ void UTraceCharacterMovementComponent::ApplyDashExitSpeed()
 
 	// SPEC v7 §5, AND THE THING THAT KEEPS A VERTICAL DASH FROM BEING A ROCKET. The dash suspends
 	// gravity for its window, so a straight-up one would hand back the whole DashSpeed as upward
-	// velocity — 3000 uu/s, another 4592 uu of coast, past the arena's 1640 uu ceiling. THE AIR-STRAFE
+	// velocity — 3300 uu/s (v16 §0), another 4960 uu of coast at the shipped 1.12 gravity scale, past
+	// the arena's 1640 uu ceiling. THE AIR-STRAFE
 	// CEILING CANNOT HELP HERE: it is planar-only by construction (see ApplySourceAirAcceleration,
 	// which never touches Z) and so bounds nothing vertical at all.
 	//
@@ -5585,7 +5592,7 @@ void UTraceCharacterMovementComponent::TickWallJumpTest(float DeltaSeconds)
 	//
 	// PHASE 1, GLANCING (22-44 s). Running along a face at ~20° to it — which is what a player
 	// actually does in a corridor. There is almost nothing pointing into the wall to reflect even on
-	// the first jump, so WallJumpOutwardImpulse (420 uu/s, flat) is essentially the whole outward
+	// the first jump, so WallJumpOutwardImpulse (360 uu/s, flat) is essentially the whole outward
 	// launch, and it is the case the player's held input can beat. THIS IS THE COLUMN THE COMPLAINT
 	// LIVES IN, and the old harness never ran it — a large part of why v9 "verified" a fix the
 	// players did not feel.

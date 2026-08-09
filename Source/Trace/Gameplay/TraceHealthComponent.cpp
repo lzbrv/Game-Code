@@ -21,6 +21,7 @@
 #include "GameFramework/GameStateBase.h"   // GetServerWorldTimeSeconds — the one clock both ends share
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/PlatformTime.h"              // FPlatformTime::Seconds — the v16 §4 harnesses pace on real time
 #include "Math/UnrealMathUtility.h"
 #include "Trace.h"
 #include "TraceSettings.h"
@@ -112,6 +113,23 @@ static TAutoConsoleVariable<int32> CVarVulnerableCarrierImmune(
 	ECVF_Default);
 
 /**
+ * THE STACKING ARM (spec v16 §4). 0 pins every mark at one stack.
+ *
+ * A separate arm from CVarVulnerable, and the separation is what makes it useful: with the master
+ * arm at 0 a marked target takes 40 and an unmarked target takes 40, which says nothing about
+ * stacking. With THIS arm at 0 the mark still lands, still amplifies, and still resets its timer —
+ * the ONLY thing that changes is that the third hit measures x1.25 instead of x1.35. That is a
+ * single-variable A/B on the sentence the spec actually added.
+ */
+static TAutoConsoleVariable<int32> CVarVulnerableStacking(
+	TEXT("Trace.X.VulnerableStacking"), 1,
+	TEXT("1 (shipped, spec v16 §4): vulnerable stacks — +25% for the first hit and +5% for each one "
+	     "after, all of them expiring together. 0: the RED arm — the mark still lands and still "
+	     "amplifies, but the count is pinned at 1, so Trace.X.VulnerableStackTest measures x1.25 "
+	     "where it expects x1.35."),
+	ECVF_Default);
+
+/**
  * The four counters. File-static for the same reason GRegenSameFrameRescinds is: the facts being
  * counted are about the RULES, not about any one pawn.
  *
@@ -142,7 +160,40 @@ namespace TraceVulnerable
 	{
 		// Derived from the knob, never hardcoded: spec §6 says +25%, UTraceSettings::
 		// XVulnerableDamageBonus says 0.25, and Config/DefaultGame.ini wins over both.
+		//
+		// STILL THE ONE-STACK ANSWER after spec v16 §4 — see the header. Callers that predate
+		// stacking mean "the multiplier of a mark", and that is what they still get.
 		return 1.f + FMath::Clamp(UTraceSettings::Get().XVulnerableDamageBonus, 0.f, 3.f);
+	}
+
+	int32 GetMaxStacks()
+	{
+		return FMath::Clamp(UTraceSettings::Get().XVulnerableMaxStacks, 1, 50);
+	}
+
+	float GetStackBonus()
+	{
+		return FMath::Clamp(UTraceSettings::Get().XVulnerableStackBonus, 0.f, 1.f);
+	}
+
+	float GetMultiplierForStacks(int32 Stacks)
+	{
+		if (Stacks <= 0)
+		{
+			return 1.f;
+		}
+
+		// The cap is applied HERE as well as at the point the count is written, and that is not
+		// belt-and-braces for its own sake: a stack count can also arrive by REPLICATION from a
+		// server whose XVulnerableMaxStacks differs from this machine's (a mid-session .ini edit, a
+		// dev-console change on one end). Clamping the arithmetic means the worst such a mismatch can
+		// do is disagree by a multiplier, never produce an unbounded one.
+		const int32 Effective = FMath::Clamp(Stacks, 1, GetMaxStacks());
+
+		// SPEC v16 §4, verbatim: "The first stack still causes 25% extra damage, but each additional
+		// stack only adds 5%." So the first stack is the whole of GetDamageMultiplier() and the
+		// (N - 1) after it are worth GetStackBonus() each.
+		return GetDamageMultiplier() + static_cast<float>(Effective - 1) * GetStackBonus();
 	}
 
 	float GetDurationSeconds()
@@ -151,6 +202,7 @@ namespace TraceVulnerable
 	}
 
 	bool IsEnabled()          { return CVarVulnerable.GetValueOnAnyThread() != 0; }
+	bool IsStackingEnabled()  { return CVarVulnerableStacking.GetValueOnAnyThread() != 0; }
 	bool IsApplyOrderShipped(){ return CVarVulnerableApplyOrder.GetValueOnAnyThread() != 0; }
 	bool IsCarrierImmune()    { return CVarVulnerableCarrierImmune.GetValueOnAnyThread() != 0; }
 }
@@ -262,6 +314,11 @@ void UTraceHealthComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 	// know they are marked, X needs to see the payoff, and everyone else needs to know which enemy is
 	// worth shooting first. One float that changes only when a bee connects.
 	DOREPLIFETIME(UTraceHealthComponent, VulnerableUntilServerTime);
+
+	// Spec v16 §4: the HUD draws the stack count, so it travels with the deadline. One BYTE, and it
+	// changes on exactly the same events the deadline does, so this adds no new replication cadence
+	// at all — the two are written together and go out in the same bunch.
+	DOREPLIFETIME(UTraceHealthComponent, VulnerableStacks);
 }
 
 float UTraceHealthComponent::ServerTimeNow() const
@@ -338,6 +395,36 @@ float UTraceHealthComponent::GetVulnerableRemaining() const
 	return FMath::Max(0.f, VulnerableUntilServerTime - ServerTimeNow());
 }
 
+int32 UTraceHealthComponent::GetVulnerableStacks() const
+{
+	// *** "WHENEVER THE TIMER RUNS OUT, ALL STACKS DISAPPEAR" (spec v16 §4), IMPLEMENTED. ***
+	//
+	// The count is gated on the deadline rather than being zeroed by anything, so every stack stops
+	// counting on the same frame — there is no drain, no per-stack timer and nothing to tick. It also
+	// means an expired VulnerableStacks left sitting in the field is harmless: it is unreadable
+	// through this accessor, and the next application overwrites it (see ApplyVulnerable).
+	if (!IsVulnerable())
+	{
+		return 0;
+	}
+
+	// A carrier can never hold a stack. ApplyVulnerable refuses them, so this is a second, cheap
+	// statement of the same rule for anything that reads the count rather than the multiplier — the
+	// HUD included, which must not draw a stack badge over a carrier.
+	if (TraceVulnerable::IsCarrierImmune())
+	{
+		if (const ATraceCharacter* OwningCharacter = Cast<ATraceCharacter>(GetOwner()))
+		{
+			if (ATraceCore::IsCoreHolder(OwningCharacter) || OwningCharacter->IsCarrier())
+			{
+				return 0;
+			}
+		}
+	}
+
+	return FMath::Clamp(static_cast<int32>(VulnerableStacks), 0, TraceVulnerable::GetMaxStacks());
+}
+
 float UTraceHealthComponent::GetVulnerableDamageMultiplier() const
 {
 	if (!TraceVulnerable::IsEnabled() || !IsVulnerable())
@@ -364,7 +451,15 @@ float UTraceHealthComponent::GetVulnerableDamageMultiplier() const
 		}
 	}
 
-	return TraceVulnerable::GetDamageMultiplier();
+	// SPEC v16 §4. The stack count decides the number now; one stack still resolves to exactly
+	// TraceVulnerable::GetDamageMultiplier(), so nothing about the pre-v16 single-mark case moved.
+	//
+	// The floor of 1 matters for one real case: a mark that landed while stacking was DISARMED, or
+	// one replicated from a machine that wrote 0 stacks alongside a live deadline. IsVulnerable() is
+	// true there but the count is 0, and multiplying by GetMultiplierForStacks(0) = 1.0 is the right
+	// answer — never a silent x0 that would delete the damage entirely.
+	const int32 Stacks = FMath::Max(1, GetVulnerableStacks());
+	return TraceVulnerable::GetMultiplierForStacks(Stacks);
 }
 
 float UTraceHealthComponent::AmplifyForVulnerable(float Amount) const
@@ -447,10 +542,25 @@ bool UTraceHealthComponent::ApplyVulnerable(float DurationSeconds, AController* 
 		}
 	}
 
-	// NON-STACKING, AND THE WHOLE REASON THIS IS A DEADLINE. Spec §6: "Does not stack; a new
-	// application RESETS the timer." A plain write both resets a running mark and starts a new one,
-	// and can never accumulate past DurationSeconds.
+	// *** THE STACK COUNT (spec v16 §4), COMPUTED BEFORE THE DEADLINE IS REWRITTEN. ***
+	//
+	// The order is load-bearing and it is the whole of "whenever the timer runs out, all stacks
+	// disappear": GetVulnerableStacks() is read while the OLD deadline is still in the field, so a
+	// mark whose timer had already run out reads 0 and this application starts again at one stack. If
+	// the write below happened first, an expired mark would read as live and a target could
+	// accumulate stacks across arbitrarily long gaps — the exact bug the sentence forbids.
+	//
+	// It is also what makes the count belong to the DEADLINE rather than to the player.
+	const int32 PreviousStacks = GetVulnerableStacks();
+	const int32 NewStacks = TraceVulnerable::IsStackingEnabled()
+		? FMath::Clamp(PreviousStacks + 1, 1, TraceVulnerable::GetMaxStacks())
+		: 1;   // the RED arm: the mark lands and amplifies, but never stacks
+
+	// THE DEADLINE IS WRITTEN, NEVER ACCUMULATED. Spec §6: "a new application RESETS the timer."
+	// A plain write both resets a running mark and starts a new one, and can never accumulate past
+	// DurationSeconds — which is what makes ONE timer enough for N stacks.
 	VulnerableUntilServerTime = ServerTimeNow() + DurationSeconds;
+	VulnerableStacks = static_cast<uint8>(NewStacks);
 	VulnerableSource = Source;
 	++GVulnerableMarksApplied;
 
@@ -458,8 +568,10 @@ bool UTraceHealthComponent::ApplyVulnerable(float DurationSeconds, AController* 
 	// the marker on the same frame a remote client does.
 	OnRep_Vulnerable();
 
-	UE_LOG(LogTraceGame, Verbose, TEXT("[Vulnerable] %s marked for %.2fs by %s (x%.2f damage)."),
-		*GetNameSafe(GetOwner()), DurationSeconds, *GetNameSafe(Source), TraceVulnerable::GetDamageMultiplier());
+	UE_LOG(LogTraceGame, Verbose,
+		TEXT("[Vulnerable] %s marked for %.2fs by %s — stack %d of %d, x%.2f damage."),
+		*GetNameSafe(GetOwner()), DurationSeconds, *GetNameSafe(Source),
+		NewStacks, TraceVulnerable::GetMaxStacks(), TraceVulnerable::GetMultiplierForStacks(NewStacks));
 	return true;
 }
 
@@ -471,6 +583,11 @@ void UTraceHealthComponent::ClearVulnerable()
 	}
 
 	VulnerableUntilServerTime = -1000.f;
+	// Zeroed as well as expired. The deadline alone would already make GetVulnerableStacks() report
+	// 0, but leaving a stale count in a REPLICATED field means every client's HUD holds a number it
+	// is only not drawing because of a second field — and the next mark would overwrite it anyway.
+	// Clearing both keeps the wire state and the game state saying the same thing.
+	VulnerableStacks = 0;
 	VulnerableSource = nullptr;
 	OnRep_Vulnerable();
 }
@@ -1322,6 +1439,13 @@ static FAutoConsoleCommandWithWorld CmdHealthDumpSettings(
 			TraceVulnerable::IsApplyOrderShipped() ? TEXT("SHIPPED (after carrier check)") : TEXT("*** RED (before) ***"),
 			TraceVulnerable::IsCarrierImmune() ? 1 : 0);
 		UE_LOG(LogTraceGame, Display,
+			TEXT("VULN    stacking   : enabled=%d, +%.0f%% per extra stack, cap %d => x%.3f / x%.3f / x%.3f ... x%.3f (v16 §4)"),
+			TraceVulnerable::IsStackingEnabled() ? 1 : 0, TraceVulnerable::GetStackBonus() * 100.f,
+			TraceVulnerable::GetMaxStacks(),
+			TraceVulnerable::GetMultiplierForStacks(1), TraceVulnerable::GetMultiplierForStacks(2),
+			TraceVulnerable::GetMultiplierForStacks(3),
+			TraceVulnerable::GetMultiplierForStacks(TraceVulnerable::GetMaxStacks()));
+		UE_LOG(LogTraceGame, Display,
 			TEXT("VULN    alarms     : carrierMarked=%d carrierAmplified=%d (both MUST be 0) | marks=%d amplifiedHits=%d"),
 			TraceVulnerable::GetCarrierMarkedCount(), TraceVulnerable::GetCarrierAmplifiedCount(),
 			TraceVulnerable::GetMarkAppliedCount(), TraceVulnerable::GetAmplifiedHitCount());
@@ -1466,5 +1590,640 @@ static FAutoConsoleCommandWithWorldAndArgs CmdHealthWatch(
 			return WatchWorld->GetTimeSeconds() < EndTime;
 		}), Interval);
 	}));
+
+// =================================================================================================
+// SPEC v16 §4 — VULNERABLE STACKS, AND THE CARRIER STILL BEING IMMUNE TO ALL OF IT
+//
+//   Trace.X.VulnerableStackTest   the arithmetic (x1.25 / x1.30 / x1.35), the cap, the single
+//                                 refreshed timer, and "all stacks disappear together". RED ARM
+//                                 FIRST: with Trace.X.VulnerableStacking 0 the same three marks
+//                                 measure x1.25, so a green run is a measurement of the stacking
+//                                 code rather than of the multiplier that predates it.
+//
+//   Trace.X.StackCarrierTest      *** THE §4 INVARIANT, RE-PROVEN WITH STACKING IN PLAY. *** Three
+//                                 marks aimed at the Core carrier. RED ARM (Trace.X.
+//                                 VulnerableCarrierImmune 0) must show the carrier reaching three
+//                                 stacks and x1.35 and moving both alarms; the shipped arm must
+//                                 show 0 stacks, x1.000 and neither alarm moving. Plus a CONTROL on
+//                                 a NON-carrier taking the identical three marks and really losing
+//                                 the amplified health — without it the run cannot tell "the carrier
+//                                 rule held" from "the fixture never fired", which is the failure
+//                                 this project has been bitten by more than once.
+//
+// WHY THE STACK TEST USES THE REGEN FIXTURE AND THE CARRIER TEST USES REAL PAWNS. The arithmetic
+// needs a health component nothing else in the match can touch — a bot landing a body shot between
+// two measurements would be indistinguishable from a broken multiplier — and the fixture sits
+// 20000 uu above the field for exactly that reason. The carrier rule cannot be tested on it at all:
+// the locks are `Cast<ATraceCharacter>` on the owner, so a fixture would pass every one of them
+// vacuously, having never been a character in the first place.
+// =================================================================================================
+
+namespace TraceVulnerableStackTest
+{
+	/** 40 is the body shot, and 40 x 1.35 = 54 — three numbers nobody can confuse with each other. */
+	constexpr float StackTestDamage = 40.f;
+
+	const FName StackTestCause(TEXT("VulnStackVerify"));
+
+	void SetArm(const TCHAR* Name, int32 Value)
+	{
+		if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name))
+		{
+			Var->Set(Value, ECVF_SetByConsole);
+		}
+	}
+
+	/** Every arm this file's two commands touch, back to shipped. Called on EVERY exit path. */
+	void RestoreArms()
+	{
+		SetArm(TEXT("Trace.X.Vulnerable"), 1);
+		SetArm(TEXT("Trace.X.VulnerableStacking"), 1);
+		SetArm(TEXT("Trace.X.VulnerableApplyOrder"), 1);
+		SetArm(TEXT("Trace.X.VulnerableCarrierImmune"), 1);
+		SetArm(TEXT("Trace.Ability.CarrierImmune"), 1);
+	}
+
+	/**
+	 * Applies @p Amount and returns what was actually taken off.
+	 *
+	 * Read-apply-read with NOTHING in between — no tick, no await — for the reason TraceXVerify's
+	 * header gives: a bot shooting the subject between two reads would look exactly like a broken
+	 * multiplier. ApplyDamage is synchronous, so this is a measurement rather than an anecdote.
+	 */
+	float MeasureDamage(UTraceHealthComponent* Target, float Amount)
+	{
+		if (Target == nullptr)
+		{
+			return -1.f;
+		}
+		const float Before = Target->Health;
+		Target->ApplyDamage(Amount, nullptr, StackTestCause);
+		return Before - Target->Health;
+	}
+
+	/** The same checklist shape TraceXVerify uses, so a FAIL is impossible to skim past. */
+	struct FChecklist
+	{
+		const TCHAR* Tag = TEXT("VULNSTACK");
+		int32 Passed = 0;
+		int32 Failed = 0;
+		bool  bInvalid = false;
+		FString InvalidReason;
+
+		void Check(bool bCondition, const FString& Name, const FString& Detail)
+		{
+			if (bCondition) { ++Passed; } else { ++Failed; }
+			UE_LOG(LogTraceGame, Display, TEXT("[%s] %s  %s  |  %s"),
+				Tag, bCondition ? TEXT("PASS") : TEXT("*** FAIL ***"), *Name, *Detail);
+		}
+
+		void Invalidate(const FString& Reason)
+		{
+			bInvalid = true;
+			InvalidReason = Reason;
+		}
+
+		void Report()
+		{
+			if (bInvalid)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[%s] VERDICT: INVALID — %s (%d passed, %d failed)"),
+					Tag, *InvalidReason, Passed, Failed);
+			}
+			else if (Failed == 0)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[%s] VERDICT: PASS — %d checks, 0 failed."), Tag, Passed);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[%s] VERDICT: *** FAIL *** — %d passed, %d FAILED."),
+					Tag, Passed, Failed);
+			}
+		}
+	};
+
+	/** Marks @p Target @p Count times through the shipping entry point. Returns the resulting stacks. */
+	int32 MarkTimes(UTraceHealthComponent* Target, int32 Count)
+	{
+		for (int32 Index = 0; Index < Count; ++Index)
+		{
+			Target->ApplyVulnerable(TraceVulnerable::GetDurationSeconds(), nullptr);
+		}
+		return Target->GetVulnerableStacks();
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.X.VulnerableStackTest
+	// ---------------------------------------------------------------------------------------------
+
+	struct FStackState
+	{
+		int32 Step = 0;
+		double NextStepRealTime = 0.0;
+		FChecklist List;
+		TWeakObjectPtr<ATraceHealthRegenFixture> Fixture;
+
+		/** The red arm's measurement, kept so the verdict can invalidate a run that never went red. */
+		float RedThreeMarkDelta = -1.f;
+		bool  bRedReproduced = false;
+	};
+
+	void RunStackTest(UWorld* World)
+	{
+		if (World == nullptr || World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[VULNSTACK] Server only — the mark is applied on the authority and arrives on a client "
+				     "by replication, so a client run would measure nothing."));
+			return;
+		}
+
+		ATraceHealthRegenFixture* Fixture = FindOrSpawnRegenFixture(World);
+		if (Fixture == nullptr || Fixture->Health == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[VULNSTACK] could not obtain the health fixture."));
+			return;
+		}
+
+		TSharedPtr<FStackState> State = MakeShared<FStackState>();
+		State->Fixture = Fixture;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[VULNSTACK] ===== spec v16 §4: 'vulnerable stacks with each hit. The first stack still causes 25%% "
+			     "extra damage, but each additional stack only adds 5%%. Whenever the timer runs out, all stacks "
+			     "disappear.' Resolved: cap %d, x%.3f / x%.3f / x%.3f, duration %.2fs. arm 0 = RED "
+			     "(Trace.X.VulnerableStacking 0) must measure %.2f for three marks; arm 1 = shipped must measure "
+			     "%.2f. ====="),
+			TraceVulnerable::GetMaxStacks(),
+			TraceVulnerable::GetMultiplierForStacks(1), TraceVulnerable::GetMultiplierForStacks(2),
+			TraceVulnerable::GetMultiplierForStacks(3), TraceVulnerable::GetDurationSeconds(),
+			StackTestDamage * TraceVulnerable::GetMultiplierForStacks(1),
+			StackTestDamage * TraceVulnerable::GetMultiplierForStacks(3));
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State](float) -> bool
+		{
+			const double NowReal = FPlatformTime::Seconds();
+			if (NowReal < State->NextStepRealTime)
+			{
+				return true;
+			}
+
+			ATraceHealthRegenFixture* Subject = State->Fixture.Get();
+			if (Subject == nullptr || Subject->Health == nullptr)
+			{
+				State->List.Invalidate(TEXT("the fixture went away mid-test"));
+				State->List.Report();
+				RestoreArms();
+				return false;
+			}
+			UTraceHealthComponent* Health = Subject->Health;
+
+			// ---- step 0: THE RED ARM. Stacking off; the mark still lands and still amplifies. ----
+			if (State->Step == 0)
+			{
+				SetArm(TEXT("Trace.X.VulnerableStacking"), 0);
+
+				Health->ResetHealth();                     // ResetHealth clears the mark, so mark AFTER
+				const int32 RedStacks = MarkTimes(Health, 3);
+				const float RedMultiplier = Health->GetVulnerableDamageMultiplier();
+				State->RedThreeMarkDelta = MeasureDamage(Health, StackTestDamage);
+
+				const float OneStackExpected = StackTestDamage * TraceVulnerable::GetMultiplierForStacks(1);
+				State->bRedReproduced = (RedStacks == 1)
+					&& FMath::IsNearlyEqual(State->RedThreeMarkDelta, OneStackExpected, 0.01f);
+
+				State->List.Check(RedStacks == 1,
+					TEXT("RED ARM: with stacking disarmed, three marks are still ONE stack"),
+					FString::Printf(TEXT("stacks=%d multiplier=x%.3f — this is what a build without §4 does"),
+						RedStacks, RedMultiplier));
+
+				State->List.Check(FMath::IsNearlyEqual(State->RedThreeMarkDelta, OneStackExpected, 0.01f),
+					TEXT("RED ARM: three marks measure the UNSTACKED number"),
+					FString::Printf(TEXT("took %.2f, expected %.2f (the stacked answer would be %.2f)"),
+						State->RedThreeMarkDelta, OneStackExpected,
+						StackTestDamage * TraceVulnerable::GetMultiplierForStacks(3)));
+
+				SetArm(TEXT("Trace.X.VulnerableStacking"), 1);
+				State->Step = 1;
+				return true;
+			}
+
+			// ---- step 1: THE GREEN ARM. The identical calls, one arm different. ----
+			if (State->Step == 1)
+			{
+				// One mark. Must be EXACTLY what the pre-v16 build did — §4 changed what happens on the
+				// SECOND hit, and a first hit that moved would be a regression dressed as a feature.
+				Health->ResetHealth();
+				const int32 OneStack = MarkTimes(Health, 1);
+				const float OneDelta = MeasureDamage(Health, StackTestDamage);
+				const float OneExpected = StackTestDamage * TraceVulnerable::GetMultiplierForStacks(1);
+
+				State->List.Check(OneStack == 1 && FMath::IsNearlyEqual(OneDelta, OneExpected, 0.01f),
+					TEXT("1 stack: 'the first stack still causes 25% extra damage'"),
+					FString::Printf(TEXT("stacks=%d, took %.2f, expected %.2f (x%.3f)"),
+						OneStack, OneDelta, OneExpected, TraceVulnerable::GetMultiplierForStacks(1)));
+
+				// Two.
+				Health->ResetHealth();
+				const int32 TwoStacks = MarkTimes(Health, 2);
+				const float TwoDelta = MeasureDamage(Health, StackTestDamage);
+				const float TwoExpected = StackTestDamage * TraceVulnerable::GetMultiplierForStacks(2);
+
+				State->List.Check(TwoStacks == 2 && FMath::IsNearlyEqual(TwoDelta, TwoExpected, 0.01f),
+					TEXT("2 stacks: 'each additional stack only adds 5%'"),
+					FString::Printf(TEXT("stacks=%d, took %.2f, expected %.2f (x%.3f) — NOT %.2f, which is what "
+					                     "a second FULL 25%% would give"),
+						TwoStacks, TwoDelta, TwoExpected, TraceVulnerable::GetMultiplierForStacks(2),
+						StackTestDamage * (TraceVulnerable::GetDamageMultiplier() * 2.f - 1.f)));
+
+				// Three.
+				Health->ResetHealth();
+				const int32 ThreeStacks = MarkTimes(Health, 3);
+				const float ThreeDelta = MeasureDamage(Health, StackTestDamage);
+				const float ThreeExpected = StackTestDamage * TraceVulnerable::GetMultiplierForStacks(3);
+
+				State->List.Check(ThreeStacks == 3 && FMath::IsNearlyEqual(ThreeDelta, ThreeExpected, 0.01f),
+					TEXT("3 stacks: +35%"),
+					FString::Printf(TEXT("stacks=%d, took %.2f, expected %.2f (x%.3f)"),
+						ThreeStacks, ThreeDelta, ThreeExpected, TraceVulnerable::GetMultiplierForStacks(3)));
+
+				// ---- THE UNMARKED CONTROL. Proves the numbers above were the MARK's doing. ----
+				Health->ResetHealth();
+				const float PlainDelta = MeasureDamage(Health, StackTestDamage);
+				State->List.Check(FMath::IsNearlyEqual(PlainDelta, StackTestDamage, 0.01f),
+					TEXT("CONTROL: an unmarked target takes exactly the asked damage"),
+					FString::Printf(TEXT("took %.2f, expected %.1f"), PlainDelta, StackTestDamage));
+
+				// ---- THE CAP. Ask for far more than the ceiling and check both the count and the
+				//      number, because a cap on one and not the other is a real and silent bug. ----
+				const int32 Cap = TraceVulnerable::GetMaxStacks();
+				Health->ResetHealth();
+				const int32 CappedStacks = MarkTimes(Health, Cap + 7);
+				const float CappedDelta = MeasureDamage(Health, StackTestDamage);
+				const float CappedExpected = StackTestDamage * TraceVulnerable::GetMultiplierForStacks(Cap);
+
+				State->List.Check(CappedStacks == Cap && FMath::IsNearlyEqual(CappedDelta, CappedExpected, 0.01f),
+					TEXT("the stack count is CAPPED (v16 §4 [ASSUMPTION]: cap is a knob)"),
+					FString::Printf(TEXT("%d applications -> %d stacks (cap %d), took %.2f, expected %.2f (x%.3f)"),
+						Cap + 7, CappedStacks, Cap, CappedDelta, CappedExpected,
+						TraceVulnerable::GetMultiplierForStacks(Cap)));
+
+				// Stamp two stacks and let ~1s of the duration burn off; step 2 checks the refresh.
+				Health->ResetHealth();
+				MarkTimes(Health, 2);
+				State->Step = 2;
+				State->NextStepRealTime = NowReal + 1.0;
+				return true;
+			}
+
+			// ---- step 2: ONE TIMER, REFRESHED BY EVERY HIT, SHARED BY EVERY STACK ----
+			if (State->Step == 2)
+			{
+				const float Duration = TraceVulnerable::GetDurationSeconds();
+				const float BeforeRefresh = Health->GetVulnerableRemaining();
+				const int32 BeforeStacks = Health->GetVulnerableStacks();
+
+				Health->ApplyVulnerable(Duration, nullptr);
+
+				const float AfterRefresh = Health->GetVulnerableRemaining();
+				const int32 AfterStacks = Health->GetVulnerableStacks();
+
+				State->List.Check(BeforeStacks == 2 && BeforeRefresh > 0.f && BeforeRefresh < Duration * 0.85f,
+					TEXT("the shared timer decays with the stacks still on"),
+					FString::Printf(TEXT("%d stacks, %.2fs left of %.2fs after ~1s of real time"),
+						BeforeStacks, BeforeRefresh, Duration));
+
+				State->List.Check(AfterStacks == 3 && FMath::IsNearlyEqual(AfterRefresh, Duration, 0.15f),
+					TEXT("each hit adds a stack AND refreshes the ONE timer"),
+					FString::Printf(TEXT("%d -> %d stacks, %.2fs -> %.2fs (and NOT %.2fs, which is what a "
+					                     "per-stack timer or an extension would give)"),
+						BeforeStacks, AfterStacks, BeforeRefresh, AfterRefresh, BeforeRefresh + Duration));
+
+				State->Step = 3;
+				State->NextStepRealTime = NowReal + static_cast<double>(Duration) + 0.5;
+				return true;
+			}
+
+			// ---- step 3: "WHENEVER THE TIMER RUNS OUT, ALL STACKS DISAPPEAR" ----
+			{
+				const int32 ExpiredStacks = Health->GetVulnerableStacks();
+				const float ExpiredMultiplier = Health->GetVulnerableDamageMultiplier();
+				const bool bStillMarked = Health->IsVulnerable();
+
+				Health->ResetHealth();
+				const float ExpiredDelta = MeasureDamage(Health, StackTestDamage);
+
+				State->List.Check(!bStillMarked && ExpiredStacks == 0
+					&& FMath::IsNearlyEqual(ExpiredMultiplier, 1.f, 0.001f),
+					TEXT("ALL THREE stacks vanish together when the timer runs out"),
+					FString::Printf(TEXT("marked=%d stacks=%d multiplier=x%.3f — not 2, not 1, zero, and all in "
+					                     "the same instant"),
+						bStillMarked ? 1 : 0, ExpiredStacks, ExpiredMultiplier));
+
+				State->List.Check(FMath::IsNearlyEqual(ExpiredDelta, StackTestDamage, 0.01f),
+					TEXT("an expired target is back to unamplified damage"),
+					FString::Printf(TEXT("took %.2f, expected %.1f"), ExpiredDelta, StackTestDamage));
+
+				// ---- the verdict, and the red arm gating it ----
+				if (!State->bRedReproduced)
+				{
+					State->List.Invalidate(FString::Printf(
+						TEXT("the RED arm did not reproduce (three marks measured %.2f with stacking disarmed, "
+						     "expected %.2f) — with nothing falsified, the green arm's numbers are uninformative"),
+						State->RedThreeMarkDelta,
+						StackTestDamage * TraceVulnerable::GetMultiplierForStacks(1)));
+				}
+
+				Health->ResetHealth();
+				State->List.Report();
+				RestoreArms();
+				return false;
+			}
+		}));
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.X.StackCarrierTest — spec v16 §4's carrier clause, red-armed
+	// ---------------------------------------------------------------------------------------------
+
+	struct FCarrierStackState
+	{
+		int32 Arm = 0;              // 0 = RED (carrier locks removed), 1 = GREEN (shipped)
+		double Deadline = 0.0;
+		FChecklist List;
+		TWeakObjectPtr<ATraceCharacter> CarrierPawn;
+		TWeakObjectPtr<ATraceCharacter> ControlPawn;
+
+		int32 RedStacks = -1;
+		float RedMultiplier = -1.f;
+		bool  bRedAlarmMoved = false;
+
+		int32 GreenStacks = -1;
+		float GreenMultiplier = -1.f;
+		bool  bGreenAlarmsQuiet = false;
+
+		int32 ControlStacks = -1;
+		float ControlDelta = -1.f;
+		bool  bControlWorked = false;
+	};
+
+	/** A living, non-carrier ATraceCharacter that is not @p Exclude. The control subject. */
+	ATraceCharacter* FindLiveNonCarrier(UWorld* World, const ATraceCharacter* Exclude)
+	{
+		const ATraceCore* CoreActor = ATraceCore::Get(World);
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Candidate = *It;
+			if (Candidate == nullptr || Candidate == Exclude || !Candidate->IsAlive()
+				|| Candidate->Health == nullptr)
+			{
+				continue;
+			}
+			if (Candidate->IsCarrier() || (CoreActor != nullptr && CoreActor->Carrier == Candidate))
+			{
+				continue;
+			}
+			return Candidate;
+		}
+		return nullptr;
+	}
+
+	void RunCarrierStackTest(UWorld* World)
+	{
+		if (World == nullptr || World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[VULNSTACKCARRIER] Server only."));
+			return;
+		}
+
+		TSharedPtr<FCarrierStackState> State = MakeShared<FCarrierStackState>();
+		State->List.Tag = TEXT("VULNSTACKCARRIER");
+		State->Deadline = FPlatformTime::Seconds() + 90.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[VULNSTACKCARRIER] ===== spec v14 §4 re-proven under spec v16 §4's STACKING: a Core carrier can "
+			     "neither collect stacks nor have any multiplier evaluated on their damage. arm 0 removes the "
+			     "carrier locks and MUST reproduce (carrier reaches %d stacks at x%.3f and both alarms move); "
+			     "arm 1 is shipped and must show 0 stacks, x1.000 and silent alarms. ====="),
+			3, TraceVulnerable::GetMultiplierForStacks(3));
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			const double NowReal = FPlatformTime::Seconds();
+			if (TickWorld == nullptr)
+			{
+				RestoreArms();
+				return false;
+			}
+
+			ATraceCore* CoreActor = ATraceCore::Get(TickWorld);
+			ATraceCharacter* CarrierPawn = (CoreActor != nullptr) ? CoreActor->Carrier : nullptr;
+
+			// ---- staging ----------------------------------------------------------------------
+			if (!State->CarrierPawn.IsValid() || !State->ControlPawn.IsValid())
+			{
+				if (CarrierPawn == nullptr && CoreActor != nullptr)
+				{
+					// No holder right now (the Core is loose, or in flight). Volunteer somebody, the
+					// same way Trace.X.CarrierTest does — a fixture that can only run when a bot
+					// happens to be carrying is a fixture that mostly does not run.
+					if (ATraceCharacter* Volunteer = FindLiveNonCarrier(TickWorld, nullptr))
+					{
+						CoreActor->GrantTo(Volunteer, ETraceCoreGrantReason::Debug);
+						CarrierPawn = CoreActor->Carrier;
+					}
+				}
+
+				ATraceCharacter* ControlPawn = FindLiveNonCarrier(TickWorld, CarrierPawn);
+
+				if (CarrierPawn == nullptr || CarrierPawn->Health == nullptr
+					|| ControlPawn == nullptr || ControlPawn->Health == nullptr)
+				{
+					if (NowReal > State->Deadline)
+					{
+						State->List.Invalidate(FString::Printf(
+							TEXT("could not stage: carrier=%s control=%s — this test needs a live match with at "
+							     "least two pawns"),
+							*GetNameSafe(CarrierPawn), *GetNameSafe(ControlPawn)));
+						State->List.Report();
+						RestoreArms();
+						return false;
+					}
+					return true;
+				}
+
+				State->CarrierPawn = CarrierPawn;
+				State->ControlPawn = ControlPawn;
+				UE_LOG(LogTraceGame, Display, TEXT("[VULNSTACKCARRIER] staged: CARRIER %s | CONTROL %s"),
+					*GetNameSafe(CarrierPawn), *GetNameSafe(ControlPawn));
+				return true;
+			}
+
+			ATraceCharacter* Carrier = State->CarrierPawn.Get();
+			ATraceCharacter* Control = State->ControlPawn.Get();
+			if (Carrier == nullptr || Control == nullptr
+				|| Carrier->Health == nullptr || Control->Health == nullptr)
+			{
+				State->List.Invalidate(TEXT("a participant went away mid-test"));
+				State->List.Report();
+				RestoreArms();
+				return false;
+			}
+
+			// *** THE LIVE-CARRIER GATE, HELD EVERY TICK. *** Bots pass and score, and a subject who
+			// stopped carrying between staging and the strike would turn the case under test into an
+			// ordinary damage test that passes for entirely the wrong reason. Held for the CONTROL too:
+			// a control that picked the Core up would be immune for the same reason the subject is.
+			if (CoreActor != nullptr && CoreActor->Carrier != Carrier)
+			{
+				CoreActor->TryPickup(Carrier);
+			}
+			const bool bStaged = (CoreActor != nullptr) && (CoreActor->Carrier == Carrier)
+				&& Carrier->IsAlive() && Control->IsAlive()
+				&& (CoreActor->Carrier != Control) && !Control->IsCarrier();
+			if (!bStaged)
+			{
+				if (NowReal > State->Deadline)
+				{
+					State->List.Invalidate(FString::Printf(
+						TEXT("could not hold the staging (carrier alive=%d holds=%d | control alive=%d carrying=%d)"),
+						Carrier->IsAlive() ? 1 : 0,
+						(CoreActor != nullptr && CoreActor->Carrier == Carrier) ? 1 : 0,
+						Control->IsAlive() ? 1 : 0, Control->IsCarrier() ? 1 : 0));
+					State->List.Report();
+					RestoreArms();
+					return false;
+				}
+				return true;
+			}
+
+			// ---- arm 0: RED. Carrier locks removed, ordering moved above the shield. ----
+			if (State->Arm == 0)
+			{
+				SetArm(TEXT("Trace.Ability.CarrierImmune"), 0);
+				SetArm(TEXT("Trace.X.VulnerableCarrierImmune"), 0);
+				SetArm(TEXT("Trace.X.VulnerableApplyOrder"), 0);
+
+				const int32 AmplifiedBefore = TraceVulnerable::GetCarrierAmplifiedCount();
+				const int32 MarkedBefore = TraceVulnerable::GetCarrierMarkedCount();
+
+				Carrier->Health->ResetHealth();          // also clears any mark
+				State->RedStacks = MarkTimes(Carrier->Health, 3);
+				State->RedMultiplier = Carrier->Health->GetVulnerableDamageMultiplier();
+				Carrier->Health->ApplyDamage(StackTestDamage, nullptr, StackTestCause);
+
+				State->bRedAlarmMoved = (TraceVulnerable::GetCarrierMarkedCount() > MarkedBefore)
+					&& (TraceVulnerable::GetCarrierAmplifiedCount() > AmplifiedBefore);
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[VULNSTACKCARRIER] arm=0 (RED): carrier reached %d stacks at x%.3f | carrierMarked +%d "
+					     "carrierAmplified +%d"),
+					State->RedStacks, State->RedMultiplier,
+					TraceVulnerable::GetCarrierMarkedCount() - MarkedBefore,
+					TraceVulnerable::GetCarrierAmplifiedCount() - AmplifiedBefore);
+
+				Carrier->Health->ClearVulnerable();
+				Carrier->Health->ResetHealth();
+				State->Arm = 1;
+				return true;
+			}
+
+			// ---- arm 1: GREEN. The shipped build, identical calls. ----
+			RestoreArms();
+
+			const int32 AmplifiedBefore = TraceVulnerable::GetCarrierAmplifiedCount();
+			const int32 MarkedBefore = TraceVulnerable::GetCarrierMarkedCount();
+
+			Carrier->Health->ResetHealth();
+			State->GreenStacks = MarkTimes(Carrier->Health, 3);
+			State->GreenMultiplier = Carrier->Health->GetVulnerableDamageMultiplier();
+			Carrier->Health->ApplyDamage(StackTestDamage, nullptr, StackTestCause);
+			State->bGreenAlarmsQuiet = (TraceVulnerable::GetCarrierMarkedCount() == MarkedBefore)
+				&& (TraceVulnerable::GetCarrierAmplifiedCount() == AmplifiedBefore);
+
+			// ---- THE CONTROL. The identical three marks on a NON-carrier must stack and must really
+			//      take amplified health off, or this run has proved something about itself only. ----
+			Control->Health->ResetHealth();
+			State->ControlStacks = MarkTimes(Control->Health, 3);
+			State->ControlDelta = MeasureDamage(Control->Health, StackTestDamage);
+			const float ControlExpected = StackTestDamage * TraceVulnerable::GetMultiplierForStacks(3);
+			State->bControlWorked = (State->ControlStacks == 3)
+				&& FMath::IsNearlyEqual(State->ControlDelta, ControlExpected, 0.01f);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[VULNSTACKCARRIER] arm=1 (GREEN): carrier %d stacks at x%.3f, alarms quiet=%d | CONTROL %d "
+				     "stacks took %.2f (expected %.2f) -> fixture %s"),
+				State->GreenStacks, State->GreenMultiplier, State->bGreenAlarmsQuiet ? 1 : 0,
+				State->ControlStacks, State->ControlDelta, ControlExpected,
+				State->bControlWorked ? TEXT("REACHES HEALTH") : TEXT("*** DEAD — measures nothing ***"));
+
+			// ---- verdict ----------------------------------------------------------------------
+			if (!State->bControlWorked)
+			{
+				State->List.Invalidate(TEXT("the CONTROL's three marks on a NON-carrier did not produce three "
+				                            "stacks of amplified damage — the fixture cannot reach health, so "
+				                            "nothing it says about the carrier means anything"));
+			}
+			else if (State->RedStacks < 3 || !State->bRedAlarmMoved)
+			{
+				State->List.Invalidate(FString::Printf(
+					TEXT("the RED arm did not reproduce (carrier reached %d stacks, alarms moved=%d) — with "
+					     "nothing falsified, the green arm's clean run is uninformative"),
+					State->RedStacks, State->bRedAlarmMoved ? 1 : 0));
+			}
+
+			State->List.Check(State->RedStacks == 3 && State->RedMultiplier > 1.f,
+				TEXT("RED: with the carrier locks removed a carrier DOES collect stacks"),
+				FString::Printf(TEXT("%d stacks at x%.3f — this is the failure the shipped build prevents"),
+					State->RedStacks, State->RedMultiplier));
+			State->List.Check(State->bRedAlarmMoved,
+				TEXT("RED: both carrier alarms move"),
+				TEXT("carrierMarked and carrierAmplified — the ordering claim made observable, since the "
+				     "carrier shield is a `return` and leaves no damage number behind"));
+			State->List.Check(State->GreenStacks == 0,
+				TEXT("GREEN: three marks leave the carrier on ZERO stacks"),
+				FString::Printf(TEXT("stacks=%d — ApplyVulnerable refuses a carrier, so there is nothing to "
+				                     "count up from"), State->GreenStacks));
+			State->List.Check(FMath::IsNearlyEqual(State->GreenMultiplier, 1.f, 0.001f),
+				TEXT("GREEN: GetVulnerableDamageMultiplier is exactly 1 for a carrier, stacking or not"),
+				FString::Printf(TEXT("x%.3f"), State->GreenMultiplier));
+			State->List.Check(State->bGreenAlarmsQuiet,
+				TEXT("GREEN: neither carrier alarm moves across the whole arm"),
+				FString::Printf(TEXT("carrierMarked +%d carrierAmplified +%d (both must be +0; running totals "
+				                     "%d and %d, which include the red arm's)"),
+					TraceVulnerable::GetCarrierMarkedCount() - MarkedBefore,
+					TraceVulnerable::GetCarrierAmplifiedCount() - AmplifiedBefore,
+					TraceVulnerable::GetCarrierMarkedCount(), TraceVulnerable::GetCarrierAmplifiedCount()));
+			State->List.Check(State->bControlWorked,
+				TEXT("CONTROL: the identical three marks DO stack on a non-carrier"),
+				FString::Printf(TEXT("%d stacks, %.2f damage, expected %.2f"),
+					State->ControlStacks, State->ControlDelta, ControlExpected));
+
+			Carrier->Health->ClearVulnerable();
+			Control->Health->ClearVulnerable();
+			Control->Health->ResetHealth();
+			State->List.Report();
+			RestoreArms();
+			return false;
+		}));
+	}
+}
+
+static FAutoConsoleCommandWithWorld CmdVulnerableStackTest(
+	TEXT("Trace.X.VulnerableStackTest"),
+	TEXT("Dev only, SERVER. Spec v16 §4: prove vulnerable stacks (+25% then +5% each), that the cap holds, that "
+	     "every hit refreshes the ONE timer, and that all stacks expire together. Red-arms itself with "
+	     "Trace.X.VulnerableStacking 0 first and reports INVALID if that arm did not reproduce."),
+	FConsoleCommandWithWorldDelegate::CreateStatic(&TraceVulnerableStackTest::RunStackTest));
+
+static FAutoConsoleCommandWithWorld CmdVulnerableStackCarrierTest(
+	TEXT("Trace.X.StackCarrierTest"),
+	TEXT("Dev only, SERVER. Spec v14 §4 re-proven with v16 §4 stacking in play: three marks at the Core carrier "
+	     "collect no stacks and evaluate no multiplier. Red-arms the carrier locks first and carries a live "
+	     "non-carrier CONTROL, so a clean run cannot be a fixture that never fired."),
+	FConsoleCommandWithWorldDelegate::CreateStatic(&TraceVulnerableStackTest::RunCarrierStackTest));
 
 #endif // !UE_BUILD_SHIPPING

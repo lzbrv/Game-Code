@@ -14,6 +14,60 @@ class UStaticMesh;
 class UStaticMeshComponent;
 
 /**
+ * AMMO'S RESOLVED NUMBERS AND ITS ALARMS (spec v16 §1).
+ *
+ * Same shape as TraceVulnerable in Gameplay/TraceHealthComponent.h and for the same two reasons: the
+ * .ini can win over the header, so every reader must go through one clamped accessor rather than
+ * touching UTraceSettings directly; and a rule worth stating is a rule worth COUNTING, so a harness
+ * can measure it instead of asserting something about code somebody has read.
+ *
+ * THE COUNTERS SPLIT INTO ALARMS AND LIVENESS, deliberately:
+ *
+ *   GetCarrierRoundsConsumed()  *** ALARM. *** A round was taken out of a clip belonging to the Core
+ *                               carrier. Spec v16 §1: "The Core carrier has no gun, so ammo must not
+ *                               be consumed or shown while carrying." Zero for the life of a correct
+ *                               process; only reachable with Trace.Ammo.CarrierGuard 0.
+ *   GetRoundsConsumed()         LIVENESS. Rounds actually spent, ever, on this machine.
+ *   GetReloadsCompleted()       LIVENESS. Reloads that actually finished.
+ *   GetDryFireRefusals()        how often CanFire() said no because the clip was empty.
+ *   GetReloadFireRefusals()     how often CanFire() said no because a reload was running.
+ *
+ * The liveness half is the other side of the evidence: a harness that only ever reads zeros cannot
+ * tell "the carrier rule held" from "nothing ever fired".
+ */
+namespace TraceAmmo
+{
+	/** Rounds per clip: UTraceSettings::ClipSize, clamped. Shipped 30. */
+	TRACE_API int32 GetClipSize();
+
+	/** Seconds a reload takes: UTraceSettings::ReloadSeconds, clamped. Shipped 0.5. */
+	TRACE_API float GetReloadSeconds();
+
+	/** True when the mechanic is armed (Trace.Ammo.Enabled). 0 is the RED arm: the clip never falls. */
+	TRACE_API bool IsEnabled();
+
+	/** True when a running reload refuses fire (Trace.Ammo.ReloadBlocksFire). 0 is the RED arm. */
+	TRACE_API bool DoesReloadBlockFire();
+
+	/** True when the carrier guard inside the consumption path is armed. 0 is the RED arm. */
+	TRACE_API bool IsCarrierGuardArmed();
+
+	/**
+	 * True when an owning client predicts its own rounds (Trace.Ammo.Predict). 0 is the RED arm for
+	 * spec v16 §1's "the local player must see their own count drop immediately": the client then
+	 * waits for replication and its number lags its own muzzle flash by a round trip.
+	 */
+	TRACE_API bool IsPredictionEnabled();
+
+	TRACE_API int32 GetCarrierRoundsConsumed();
+	TRACE_API int32 GetRoundsConsumed();
+	TRACE_API int32 GetReloadsCompleted();
+	TRACE_API int32 GetDryFireRefusals();
+	TRACE_API int32 GetReloadFireRefusals();
+	TRACE_API void  ResetCounters();
+}
+
+/**
  * The hitscan handgun AND the knife (spec v10 §1) — one component, because they are one selector.
  *
  * ============================================================================================
@@ -99,9 +153,120 @@ public:
 
 	/**
 	 * False while carrying the Core, while dead, MID-DASH (spec §6), during a weapon pullout, while
-	 * the knife is equipped, or while the local fire-rate gate is closed.
+	 * the knife is equipped, WITH AN EMPTY CLIP, MID-RELOAD (spec v16 §1), or while the local
+	 * fire-rate gate is closed.
 	 */
 	bool CanFire() const;
+
+	// =============================================================================================
+	// AMMO  (spec v16 §1). Read the block comment on GetClipAmmo() before changing any of it.
+	// =============================================================================================
+
+	/**
+	 * *** WHAT THIS MACHINE BELIEVES IS IN THE CLIP, AND THE ONE ACCESSOR EVERYTHING SHOULD USE. ***
+	 *
+	 * On the AUTHORITY it is ClipAmmo, which is the truth. On a remote owning client it is the
+	 * PREDICTED count, which is the truth minus the shots that have not reached the server yet — and
+	 * that is exactly what spec v16 §1 asks for: "the local player must see their own count drop
+	 * immediately." A client that waited for the round trip would watch 30 stay on screen for a whole
+	 * ping after the muzzle flashed.
+	 *
+	 * On a SIMULATED PROXY (somebody else's pawn on your machine) it is meaningless and reads as a
+	 * full clip: ClipAmmo replicates to the owner only, because nothing in this game draws another
+	 * player's ammo. Do not build a feature on another pawn's count without changing that condition
+	 * first.
+	 */
+	int32 GetClipAmmo() const;
+
+	/** Rounds a full clip holds. Resolved from UTraceSettings; shipped 30. */
+	int32 GetClipSize() const { return TraceAmmo::GetClipSize(); }
+
+	/**
+	 * True while the 0.5 s reload is running. Shared clock, so the client that predicted the reload
+	 * and the server that validates against it compute the same answer — the same contract
+	 * IsDeploying() has for the pullout, and for the same reason.
+	 */
+	bool IsReloading() const;
+
+	/** Seconds of reload left; 0 when the gun is up. HUD and diagnostics. */
+	float GetReloadRemaining() const;
+
+	/**
+	 * How many of the rounds in the clip were loaded by an ABILITY rather than by an ordinary reload.
+	 * Zero for every ordinary clip.
+	 *
+	 * Spec v16 §1: "X's Sting ability reloads the clip with just the 5 bee bullets; after shooting
+	 * those, his next reload is normal." The gun deliberately does NOT know what an ability round
+	 * DOES — that is the ability layer's business — only that this clip contains some, so the HUD can
+	 * say so and so the ability can ask whether the round that just left was one of them.
+	 */
+	int32 GetAbilityRoundsInClip() const;
+
+	/**
+	 * True when the LAST round this weapon consumed came out of the ability-loaded part of the clip.
+	 *
+	 * SERVER-SIDE AND READ IMMEDIATELY AFTER THE SHOT, which is the only window in which it means
+	 * anything: UTraceAbilitySetX::NotifyBulletHit is called from ServerFire a few statements later,
+	 * and it needs to know whether the bullet that just landed was a bee round. Asking "are there
+	 * ability rounds left" instead would get the wrong answer on the fifth and last one.
+	 */
+	bool WasLastRoundAbilityRound() const { return bLastRoundWasAbilityRound; }
+
+	/**
+	 * True when this pawn's ammo should appear on screen at all.
+	 *
+	 * FALSE WHILE CARRYING THE CORE — spec v16 §1, verbatim: "The Core carrier has no gun, so ammo
+	 * must not be consumed or shown while carrying." Also false with the knife out (it has no
+	 * magazine) and while dead. This is a PRESENTATION question and it is answered here rather than
+	 * in the HUD so that the "has no gun" rule has one definition instead of two.
+	 */
+	bool ShouldShowAmmo() const;
+
+	/**
+	 * MANUAL RELOAD — the R bind (ETraceInputAction::Reload). Returns true when a reload started.
+	 *
+	 * Refuses, and each refusal is a rule rather than an oversight:
+	 *   - a FULL clip. [ASSUMPTION] (spec v16 §1): pressing R with 30 rounds does nothing at all. The
+	 *     alternative — restarting the timer — would let a player lock their own gun for half a
+	 *     second by leaning on the key, which no shooter does;
+	 *   - a reload already running, for the same reason: R is not a way to extend it;
+	 *   - dead, carrying the Core, mid-pullout, or with the knife out.
+	 *
+	 * Predicts locally on an owning client and asks the server; acts directly on the server. The
+	 * client stamps the PRESS on the shared clock and ships it, so both machines anchor the same
+	 * deadline — see ServerRequestReload for the measurement that made that necessary for the pullout.
+	 */
+	bool RequestReload();
+
+	/**
+	 * @param ClientPressServerTime shared-clock timestamp of the PRESS, from the pressing machine.
+	 *
+	 * THE STAMP IS WHY A CLIENT'S RELOAD IS 0.5 s AND NOT 0.5 s PLUS THEIR PING, and it is the same
+	 * trick ServerRequestEquip plays for the 0.2 s pullout — where it was MEASURED turning 0.2 s into
+	 * 0.294 s at 40 ms of latency before the parameter existed. The clamp is the security: whatever
+	 * the client claims, the press is pinned into [ServerNow - MaxRewindTime, ServerNow], so a reload
+	 * can neither be pre-booked nor back-dated past the point where it would already be finished.
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerRequestReload(float ClientPressServerTime);
+
+	/**
+	 * SERVER ONLY. Replaces the whole clip with @p RoundCount ability-loaded rounds.
+	 *
+	 * Spec v16 §1, X's Sting: "reloads the clip with just the 5 bee bullets". It REPLACES rather than
+	 * adds — [ASSUMPTION], stated in the spec — so 20 ordinary rounds become 5 bee rounds and the
+	 * count on the HUD goes DOWN. Any reload in progress is cancelled; the clip is up immediately,
+	 * because the ability's own cast is the cost and charging a second 0.5 s on top would make Sting
+	 * feel like a punishment.
+	 *
+	 * The gun does not know what an ability round does, and this is deliberately not called
+	 * "LoadBeeRounds" — see GetAbilityRoundsInClip() and Abilities/Characters/TraceAbilityWeaponHooks.h
+	 * for why the weapon stays character-agnostic.
+	 */
+	void LoadAbilityClip(int32 RoundCount);
+
+	UFUNCTION()
+	void OnRep_Ammo();
 
 	/**
 	 * @param Origin               Muzzle position the client fired from.
@@ -399,6 +564,128 @@ private:
 	/** Local-clock instant of the last swing the server accepted. Authority only. */
 	double LastAcceptedSwingTime = -1000.0;
 
+	// =============================================================================================
+	// AMMO STATE  (spec v16 §1)
+	//
+	// FOUR REPLICATED FACTS AND TWO PREDICTION MIRRORS, and the split is the whole design:
+	//
+	//   ClipAmmo          the truth. Written ONLY on the authority, ONLY by ConsumeRound/RefillClip.
+	//   ClipSerial        ++ on every REFILL. It is what lets a client tell "the server reloaded"
+	//                     apart from "the server is simply behind my predicted shots".
+	//   AbilityRoundsInClip  how many of ClipAmmo came from an ability (X's Sting).
+	//   ReloadEndServerTime  the deadline, on the SHARED clock — a deadline rather than a countdown,
+	//                     for the reason DeployEndServerTime's comment gives, and anchored at the
+	//                     stamped press/shot so the client's prediction and the server's copy are the
+	//                     same number rather than two numbers a ping apart.
+	//
+	//   PredictedClipAmmo / PredictedClipSerial   the OWNING CLIENT's copy, and nothing else's.
+	//
+	// WHY THE PREDICTION IS A SEPARATE FIELD RATHER THAN A LOCAL WRITE TO ClipAmmo. A local write is
+	// what a replicated property update is guaranteed to undo: the shooter fires, predicts 29, and
+	// the packet the server sent a moment BEFORE it heard about that shot arrives carrying 30. The
+	// count would bounce 30 -> 29 -> 30 -> 29, which reads as the gun refunding a bullet. Keeping the
+	// prediction beside the truth means OnRep_Ammo can reconcile the two with a rule (see there)
+	// instead of being overwritten by whichever packet landed last.
+	//
+	// AND WHY THE SERVER DOES NOT PREDICT AT ALL. On the authority — a listen host's own pawn, and
+	// every bot — FireOnce() and ServerFire_Implementation() both run in this same process, so a
+	// decrement in each would spend two rounds per trigger pull. ConsumeRound is therefore called
+	// from exactly one side of that pair on each machine: the authority spends in ServerFire, a
+	// remote client predicts in FireOnce. GetClipAmmo() picks the right one to read.
+	// =============================================================================================
+
+	/** SERVER TRUTH. Rounds in the clip. See the block comment above before writing to it. */
+	UPROPERTY(ReplicatedUsing = OnRep_Ammo)
+	uint8 ClipAmmo = 0;
+
+	/**
+	 * Incremented by RefillClip() on every server-side refill (a finished reload, an ability clip, a
+	 * respawn). Wraps at 255 and that is harmless: the reconcile only ever asks whether it CHANGED.
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_Ammo)
+	uint8 ClipSerial = 0;
+
+	/** How many of ClipAmmo are ability-loaded rounds (X's Sting). Always <= ClipAmmo. */
+	UPROPERTY(Replicated)
+	uint8 AbilityRoundsInClip = 0;
+
+	/**
+	 * Shared-clock instant the reload finishes. Negative means "not reloading".
+	 *
+	 * WRITTEN BY BOTH ENDS AND THAT IS SAFE, exactly as DeployEndServerTime is: both anchor at the
+	 * same stamped instant, so the replicated update is a no-op rather than an extension, and a
+	 * client can never predict a deadline EARLIER than the one the server will compute.
+	 */
+	UPROPERTY(Replicated)
+	float ReloadEndServerTime = -1.f;
+
+	/** OWNING CLIENT ONLY. -1 until the first OnRep seeds it; see GetClipAmmo(). */
+	int32 PredictedClipAmmo = -1;
+
+	/** The serial PredictedClipAmmo was last reconciled against. */
+	uint8 PredictedClipSerial = 0;
+
+	/**
+	 * OWNING CLIENT ONLY. True between the client predicting a refill and the server's refill landing.
+	 *
+	 * It exists for one packet: while the client is ahead, an update carrying the OLD (nearly empty)
+	 * clip under the OLD serial must not be allowed to pull the predicted count back down to 2 rounds
+	 * for the ~RTT/2 before the real refill arrives. That flicker is at the END of the reload, which
+	 * is precisely the moment the player is looking at the number to decide whether to re-engage.
+	 */
+	bool bPredictedRefillPending = false;
+
+	/** Set by ConsumeRound for the round it just spent. See WasLastRoundAbilityRound(). */
+	bool bLastRoundWasAbilityRound = false;
+
+	/** Server-side lifetime bookkeeping, per pawn. Read by Trace.Ammo.BotWatch. */
+	int32 TotalRoundsConsumed = 0;
+	int32 TotalReloadsCompleted = 0;
+
+	/**
+	 * Spends one round on the machine that owns the decision (authority, or a predicting client).
+	 *
+	 * *** CARRIES ITS OWN CARRIER GUARD, AND THAT IS A BELT TO CanFire's BRACES. *** CanFire() and
+	 * ServerFire() both refuse a carrier already (spec §4), so this can only fire if some future
+	 * caller reaches the consumption path another way — which is exactly the failure mode
+	 * UTraceHealthComponent::ApplyVulnerable's second carrier lock exists for. It counts and logs
+	 * rather than silently coping, and Trace.Ammo.CarrierGuard 0 is its red arm.
+	 */
+	void ConsumeRound();
+
+	/**
+	 * AUTHORITY ONLY. Sets the clip to @p Rounds (of which @p AbilityRounds are ability-loaded),
+	 * clears any running reload and bumps ClipSerial.
+	 *
+	 * The serial bump is the point: it is what tells an owning client "this is a new clip, throw your
+	 * prediction away" rather than "I am behind you".
+	 */
+	void RefillClip(int32 Rounds, int32 AbilityRounds);
+
+	/**
+	 * Starts the 0.5 s reload with its deadline anchored at @p AnchorSharedTime.
+	 *
+	 * THE ANCHOR IS THE WHOLE REASON THIS TAKES A PARAMETER. For a manual reload it is the stamped
+	 * key press; for the automatic one it is the SHOT that emptied the clip — the same clamped
+	 * timestamp ServerFire already rewinds to. Both ends therefore compute one instant, and a client
+	 * whose gun came back up at T does not then find the server refusing to fire until T + ping.
+	 */
+	void BeginReload(double AnchorSharedTime);
+
+	/** Cancels a running reload without refilling. Death and picking up the Core. */
+	void CancelReload();
+
+	/**
+	 * Runs the reload state machine once per tick: completion, the automatic reload of an empty clip,
+	 * and the two cancellations (death, and picking up the Core).
+	 *
+	 * ON EVERY MACHINE THAT OWNS A DECISION — the authority for the truth, a predicting client for
+	 * its own mirror. The automatic reload is what makes "30 bullets per clip, then the gun reloads"
+	 * true for BOTS as well as humans without a line of AI code: a bot's pawn is authoritative and
+	 * locally controlled in the same process, so it reloads through this identical path.
+	 */
+	void TickReload();
+
 	/** Local-clock instant the pending swing's blade should resolve; see TickSwing. */
 	double SwingResolveAtLocalTime = -1000.0;
 	bool bSwingPendingResolve = false;
@@ -606,5 +893,30 @@ public:
 	 */
 	void GetViewModelCensus(int32& OutGunVisible, int32& OutKnifeVisible, int32& OutHandVisible,
 		int32& OutBodyKnife) const;
+
+	/**
+	 * Dev-only: drive ConsumeRound() directly, for Trace.Ammo.CarrierTest.
+	 *
+	 * IT EXISTS TO REACH A GUARD THAT IS OTHERWISE UNREACHABLE, and that is the honest description.
+	 * The shipped path cannot spend a carrier's round — CanFire() and ServerFire() both refuse a
+	 * carrier before consumption ever comes up — so a harness driving the shipped path would watch
+	 * the clip hold steady and learn nothing about ConsumeRound's own carrier guard, which is the
+	 * second lock and the one that survives a future caller forgetting the first. This calls that
+	 * lock directly so Trace.Ammo.CarrierGuard 0 can be shown breaking it and 1 can be shown holding.
+	 *
+	 * It is NOT how the §4 gate itself is tested; that is a separate check in the same command, made
+	 * against CanFire() on a real carrier.
+	 */
+	void DebugConsumeRound() { ConsumeRound(); }
+
+	/** Dev-only read-back of the raw server-side count, bypassing GetClipAmmo()'s owner/proxy rules. */
+	int32 DebugGetAuthoritativeClipAmmo() const { return static_cast<int32>(ClipAmmo); }
+
+	/** Dev-only: rounds this pawn has ever spent, and reloads it has ever finished. Server-side. */
+	void DebugGetAmmoTotals(int32& OutRoundsConsumed, int32& OutReloadsCompleted) const
+	{
+		OutRoundsConsumed = TotalRoundsConsumed;
+		OutReloadsCompleted = TotalReloadsCompleted;
+	}
 #endif
 };

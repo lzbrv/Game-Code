@@ -14,7 +14,22 @@
 //        +25% from ALL sources UTraceHealthComponent::ApplyDamage — ONE multiplication, in the one
 //                              function every damage source in the project already funnels through.
 //                              *** Read the block comment at the top of TraceHealthComponent.h. ***
-//        "does not stack"      the mark is a DEADLINE, so a new application is a plain write.
+//        "does not stack"      *** SUPERSEDED BY SPEC v16 §4. *** It stacks now: +25% for the first
+//                              hit and +5% for each after, all of them expiring together on the ONE
+//                              timer. Nothing in THIS file changed for it — the mark is still one
+//                              ApplyVulnerable call and the count lives on the victim's health
+//                              component, which is what made the change a two-line one there and a
+//                              no-op here. The "a new application RESETS the timer" half still holds.
+//
+//   *** SPEC v16 §1 RESHAPED STING: it is a CLIP now, not a tag on the next five shots. ***
+//   "X's Sting ability reloads the clip with just the 5 bee bullets; after shooting those, his next
+//    reload is normal."
+//        ActivateAbility()      calls UTraceWeaponComponent::LoadAbilityClip(5), which REPLACES the
+//                               clip. The count of bee rounds left is the CLIP's from then on, and
+//                               FTraceAbilityNetState::Stacks is a downward-only mirror of it
+//                               (SyncStingToClip) kept for the swarm and the HUD.
+//        the consequence        a bee round that MISSES is spent. Under v14 §6 only a landed mark
+//                               cost a bee; a clip cannot work that way.
 //
 //   "MOVEMENT: +10% speed while ANY enemy is vulnerable."
 //
@@ -161,7 +176,14 @@ public:
 
 	// ---- queries, for the HUD, the harness and the swarm ----------------------------------------
 
-	/** Bees loaded in the gun right now. 0 when they are orbiting. Correct on clients. */
+	/**
+	 * Bee rounds in the gun right now. 0 when the bees are orbiting. Correct on clients.
+	 *
+	 * SPEC v16 §1 MADE THIS A MIRROR. The authoritative count is now the CLIP's
+	 * UTraceWeaponComponent::GetAbilityRoundsInClip(), because rounds leave the gun whether or not
+	 * they hit anybody; FTraceAbilityNetState::Stacks follows it (SyncStingToClip) and is what
+	 * clients and the swarm read, since the weapon's ammo is replicated to its owner only.
+	 */
 	int32 GetLoadedBees() const;
 
 	/** True while Sting is up: the bees are in the gun and are not orbiting or stinging. */
@@ -173,10 +195,12 @@ public:
 	/**
 	 * SERVER ONLY. A bullet from X landed on @p Victim.
 	 *
-	 * Consumes one loaded bee IF the mark actually landed, and only then — a bullet that found a Core
-	 * carrier (who is bullet-proof anyway) or a target the choke point refused does not cost X one of
-	 * his five. [ASSUMPTION]: §6 does not say what happens to a wasted Sting bullet; being forgiving
-	 * is the tunable direction, and it is one line here to reverse.
+	 * Marks the victim when the round that just left the gun was one of the bee rounds. It no longer
+	 * decides how many bees are LEFT — spec v16 §1 moved that to the clip, and a round is spent when
+	 * it is fired rather than when it connects. The v14 §6 [ASSUMPTION] that a wasted Sting bullet
+	 * cost X nothing is therefore superseded: a bee round that misses, or that finds a Core carrier,
+	 * is gone. See the implementation for the exact two-term test that decides "was this a bee round"
+	 * and for why the old per-hit decrement is still there.
 	 */
 	void NotifyBulletHit(ATraceCharacter* Victim, bool bHeadshot);
 
@@ -189,6 +213,17 @@ public:
 	bool MarkVulnerable(ATraceCharacter* Target) const;
 
 private:
+	/**
+	 * SERVER ONLY. Pulls FTraceAbilityNetState::Stacks down to the gun's ability-round count.
+	 *
+	 * ONE-WAY, ALWAYS DOWNWARD, AND THAT IS THE WHOLE CONTRACT (spec v16 §1). The clip is the source
+	 * of truth for how many bee rounds are left; Stacks is the replicated display of it, because the
+	 * clip itself is replicated to its owner only and the swarm has to be drawn on every machine.
+	 * Only ActivateAbility ever raises Stacks. A second writer that could raise it would be the
+	 * four-writer bug this codebase already carries once.
+	 */
+	void SyncStingToClip();
+
 	/** SERVER ONLY. The passive: every bee, against every living enemy, once per tick. */
 	void SweepBeeContacts();
 

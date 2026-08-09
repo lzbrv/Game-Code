@@ -1069,6 +1069,12 @@ namespace
 			// --- spec v5 §5, fire rate ---------------------------------------------------------
 			{ TEXT("FireInterval"),                    EKnobType::Float, TEXT("150 RPM = 0.40s") },
 
+			// --- spec v16 §1, ammo (a system that did not exist before that pass) ---------------
+			// There is deliberately NO reserve/carried-ammo row: the reserve is infinite and has no
+			// knob, so a row here would be the kind of dead entry this table exists to expose.
+			{ TEXT("ClipSize"),                        EKnobType::Int,   TEXT("v16 §1: '30 bullets per clip'. Reserve is INFINITE and has no knob") },
+			{ TEXT("ReloadSeconds"),                   EKnobType::Float, TEXT("v16 §1: 'Reloading takes .5seconds'; a shared-clock deadline, not a countdown") },
+
 			// --- spec v5 §6, upwards recoil ----------------------------------------------------
 			{ TEXT("bRecoilEnabled"),                  EKnobType::Bool,  TEXT("recoil master switch") },
 			{ TEXT("RecoilPitchPerShot"),              EKnobType::Float, TEXT("per-shot kick") },
@@ -1338,7 +1344,7 @@ namespace
 			// floor fraction, whether it clamps, and the ceiling when it does not. Charge scales the
 			// IMPULSE; CoreThrowVelocityInheritance is still added on top and is listed in the v8
 			// block above rather than repeated here.
-			{ TEXT("CoreThrowChargeSeconds"),          EKnobType::Float, TEXT("v13 §6: 1.0s hold = full momentum, the user's number") },
+			{ TEXT("CoreThrowChargeSeconds"),          EKnobType::Float, TEXT("v16: 0.8s hold = full momentum (was v13's 1.0s); the crosshair ring is read against this") },
 			{ TEXT("CoreThrowChargeFloorFraction"),    EKnobType::Float, TEXT("v13 §6: [ASSUMPTION] 0.15 - an instant click is 'very low', never zero") },
 			{ TEXT("bCoreThrowChargeClampsAtFull"),    EKnobType::Bool,  TEXT("v13 §6: [ASSUMPTION] true - holding past the charge time adds nothing") },
 			{ TEXT("CoreThrowChargeMaxFraction"),      EKnobType::Float, TEXT("v13 §6: the ceiling when the clamp is OFF. 1.0 so unticking the box changes nothing by itself") },
@@ -1484,8 +1490,10 @@ namespace
 			{ TEXT("XBeeOrbitRadiusUU"),               EKnobType::Float, TEXT("v14 §6 ASSUMPTION: bees hit on contact; X's body is the delivery") },
 			{ TEXT("XBeeOrbitSpeedDegPerSecond"),      EKnobType::Float, TEXT("v14 §6: orbit rate") },
 			{ TEXT("XBeeHitRadiusUU"),                 EKnobType::Float, TEXT("v14 §6: a bee's own touch radius") },
-			{ TEXT("XVulnerableDurationSeconds"),      EKnobType::Float, TEXT("v14 §6: 2s; does not stack, a new application RESETS it") },
-			{ TEXT("XVulnerableDamageBonus"),          EKnobType::Float, TEXT("v14 §6: +25% from all sources") },
+			{ TEXT("XVulnerableDurationSeconds"),      EKnobType::Float, TEXT("v14 §6: 2s, and a new application RESETS it. 'Does not stack' is SUPERSEDED by v16 §4 — one deadline, N stacks") },
+			{ TEXT("XVulnerableDamageBonus"),          EKnobType::Float, TEXT("v14 §6: +25% from all sources — since v16 §4 this is the FIRST stack only") },
+			{ TEXT("XVulnerableStackBonus"),           EKnobType::Float, TEXT("v16 §4: 'each additional stack only adds 5%'") },
+			{ TEXT("XVulnerableMaxStacks"),            EKnobType::Int,   TEXT("v16 §4 ASSUMPTION: cap the stacks. 5 = XBeeCount = XStingBulletCount, so x1.45 is the ceiling") },
 			{ TEXT("XVulnerableSpeedBonus"),           EKnobType::Float, TEXT("v14 §6: +10% while ANY enemy is vulnerable") },
 			{ TEXT("XStingCooldownSeconds"),           EKnobType::Float, TEXT("v14 §6: 25s — the one that is not 20") },
 			{ TEXT("XStingBulletCount"),               EKnobType::Int,   TEXT("v14 §6: the next five bullets. Keep equal to XBeeCount") },

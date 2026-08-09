@@ -65,6 +65,15 @@ namespace
 	 */
 	FKey Default_Ability()          { return EKeys::E; }
 	FKey Default_AbilitySecondary() { return EKeys::V; }
+	/**
+	 * SPEC v16 §1, verbatim: "R to reload."
+	 *
+	 * R is NAMED BY THE DOC, so there is no key to choose — only a collision to check. Claimed
+	 * already: WASD, Space, LeftCtrl, LeftShift, Q, mouse1, mouse2, Tab, 1, 2, E, V. R is free, so
+	 * this default steals nothing on a first run (SetKey's stealing rule would log it if it did), and
+	 * it is the genre convention besides.
+	 */
+	FKey Default_Reload()           { return EKeys::R; }
 }
 
 const TArray<FTraceInputActionInfo>& TraceInputActions::All()
@@ -99,9 +108,13 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// UTraceAbilityInputRelay already search for by name — do not rename them.
 		{ ETraceInputAction::Ability,          TEXT("Ability"),          TEXT("ABILITY"),           &Default_Ability          },
 		{ ETraceInputAction::AbilitySecondary, TEXT("AbilitySecondary"), TEXT("ABILITY (SECONDARY)"), &Default_AbilitySecondary },
+		// SPEC v16 §1, "R to reload". Same reasoning as every row above: the options screen's rebind
+		// list IS this table walked in order, so an action missing from here is an action the player
+		// cannot see or rebind however well it is wired up in the controller.
+		{ ETraceInputAction::Reload,           TEXT("Reload"),           TEXT("RELOAD"),            &Default_Reload           },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 15,
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 16,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 

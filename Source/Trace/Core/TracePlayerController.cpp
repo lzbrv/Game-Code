@@ -29,6 +29,7 @@
 #include "InputModifiers.h"
 #include "InputTriggers.h"                 // ETriggerEvent
 #include "Gameplay/TraceMelee.h"           // TraceMelee::RequestEquipIfDifferent (spec v13 §2)
+#include "Gameplay/TraceWeaponComponent.h" // RequestReload (spec v16 §1 — the R bind)
 #include "Movement/TraceCharacterMovementComponent.h"   // dash charges, for the HUD accessors
 #include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
 #include "Trace.h"                         // LogTraceGame
@@ -223,6 +224,8 @@ void ATracePlayerController::BuildInputData()
 		// SPEC v14 §5 — the ability binds.
 		IA_Ability          = MakeAction(TEXT("IA_Ability"),          EInputActionValueType::Boolean);
 		IA_AbilitySecondary = MakeAction(TEXT("IA_AbilitySecondary"), EInputActionValueType::Boolean);
+		// SPEC v16 §1 — "R to reload". Boolean like every other button here.
+		IA_Reload           = MakeAction(TEXT("IA_Reload"),           EInputActionValueType::Boolean);
 
 		// Cumulative accumulation is REQUIRED for opposing keys to cancel. UInputAction defaults to
 		// TakeHighestAbsoluteValue, and UEnhancedPlayerInput::ProcessActionMappingEvent merges with
@@ -346,6 +349,11 @@ void ATracePlayerController::ApplyControlSettings()
 	// UTraceAbilityInputRelay's ConfigId lookup and this mapping can never disagree about the key.
 	MapButton(IA_Ability,          KeyFor(ETraceInputAction::Ability));
 	MapButton(IA_AbilitySecondary, KeyFor(ETraceInputAction::AbilitySecondary));
+	// SPEC v16 §1. Through the same KeyFor/MapButton path as everything else, so a player who rebinds
+	// R in the options screen is rebinding the reload and not just its label — and so an action they
+	// deliberately UNBOUND gets no mapping at all rather than a dead one. The clip still reloads
+	// itself when it empties; unbinding R costs the manual reload only.
+	MapButton(IA_Reload,           KeyFor(ETraceInputAction::Reload));
 
 	// The context is already registered by the time a settings change arrives, and Enhanced Input
 	// caches the resolved key->action table. Without this the new bindings sit in the context and
@@ -499,6 +507,11 @@ void ATracePlayerController::SetupInputComponent()
 	// something downstream ignores it is a binding waiting to be a bug.
 	EIC->BindAction(IA_EquipKnife, ETriggerEvent::Started, this, &ATracePlayerController::OnEquipKnifeStarted);
 	EIC->BindAction(IA_EquipGun,   ETriggerEvent::Started, this, &ATracePlayerController::OnEquipGunStarted);
+
+	// SPEC v16 §1, the reload bind. PRESS EDGE ONLY, for the same reason the two above are: there is
+	// no held state to release, and a Completed binding would fire a second request on key-up that
+	// only works out because RequestReload happens to refuse a reload while one is running.
+	EIC->BindAction(IA_Reload, ETriggerEvent::Started, this, &ATracePlayerController::OnReloadStarted);
 
 	// SPEC v14 §5. Ability is a PRESS. AbilitySecondary is a HOLD, so it gets the full
 	// Started/Completed/Canceled shape — Canceled included, for the reason IA_Pass documents: a
@@ -1130,6 +1143,40 @@ void ATracePlayerController::OnEquipGunStarted()
 	HandleDirectEquip(/*bWantKnife=*/false, TEXT("EquipGun"));
 }
 
+void ATracePlayerController::OnReloadStarted()
+{
+	// FIRST LINE, before any gate, for the reason DebugEquipPressCount's declaration gives: this
+	// counts "the R key reached a bound delegate", which Trace.Ammo.BindTest needs to be able to ask
+	// separately from "a reload started". A probe that could only see the outcome would report a
+	// dead binding and a correctly-refused reload identically.
+	++DebugReloadPressCount;
+
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	// SPEC v16 §1, "R to reload". This handler makes NO decision of its own — see the header. It does
+	// not even ask whether the clip is full, because UTraceWeaponComponent::RequestReload has to
+	// answer that for the automatic reload and for the bots anyway, and two copies of "is a reload
+	// legal" is how a predicted state and an authoritative one come to disagree.
+	//
+	// GetLivingCharacter() rather than GetPawn(): a dead player's R press is not a reload request, and
+	// mouse1 is already their "put me back in" button.
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
+	{
+		if (UTraceWeaponComponent* Weapon = TraceChar->Weapon)
+		{
+			const bool bStarted = Weapon->RequestReload();
+			if (InputLogLevel() >= 1)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("INPUT Reload pressed: started=%d (clip %d/%d)"),
+					bStarted ? 1 : 0, Weapon->GetClipAmmo(), Weapon->GetClipSize());
+			}
+		}
+	}
+}
+
 #if !UE_BUILD_SHIPPING
 /**
  * Set only by `Trace.V13.Hotkeys toggle`, the red arm at the bottom of this file. While it is true,
@@ -1430,6 +1477,7 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 	LogAction(TEXT("IA_Scoreboard"), IA_Scoreboard);
 	LogAction(TEXT("IA_EquipKnife"), IA_EquipKnife);
 	LogAction(TEXT("IA_EquipGun  "), IA_EquipGun);
+	LogAction(TEXT("IA_Reload    "), IA_Reload);
 
 	// The player's own settings are now part of "why does input feel wrong", so they belong in the
 	// same dump. A hand-edited or half-migrated TraceUserSettings.ini is otherwise invisible.
@@ -1954,6 +2002,235 @@ namespace
 			const bool bToggleArm = (Args.Num() > 0) && Args[0].Equals(TEXT("toggle"), ESearchCase::IgnoreCase);
 			V13RunHotkeyProbe(bToggleArm);
 		}));
+}
+
+// =================================================================================================
+// Trace.Ammo.BindTest — spec v16 §1's "R to reload", through the real input pipeline
+//
+// WHY A SEPARATE COMMAND FROM Trace.Ammo.Test. That one proves the RELOAD works by calling
+// UTraceWeaponComponent::RequestReload directly, which is the right way to test the rules (full clip,
+// mid-reload, carrying, an ability clip) and says nothing whatsoever about whether a key is wired to
+// it. Everything between "the player pressed R" and "RequestReload was called" — the action table
+// row, the mapping context, the Enhanced Input binding, the handler — is invisible to it.
+//
+// SO THIS PRESSES THE KEY. Trace.SimInput on whatever UTraceUserSettings currently has bound to
+// ETraceInputAction::Reload, exactly as the v13 §2 hotkey probe does for 1 and 2. A rebind, an
+// unbound action, a mapping that never reached the subsystem and a handler that was never bound all
+// fail it.
+//
+// ITS CONTROL IS AN UNBOUND KEY, and that is what stops it being vacuous. A probe that only pressed
+// R and watched the counter rise could not tell "R is bound to reload" from "the counter rises on
+// any key at all" — so it first presses a key nothing claims and requires the counter NOT to move.
+// The press counter is deliberately incremented on the handler's first line, before every gate, so
+// "the key arrived" and "a reload started" are two separate observations rather than one.
+// =================================================================================================
+
+namespace TraceReloadBindTest
+{
+	/** Same 0.02 s synthetic hold the v13 probe uses; the gaps between steps are what matter. */
+	constexpr float PressHoldSeconds = 0.02f;
+
+	/** A key nothing in TraceInputActions::All() claims. Pressed as the control. */
+	FKey UnclaimedKey()
+	{
+		return EKeys::K;
+	}
+
+	struct FProbe
+	{
+		int32 Step = 0;
+		double NextStepTime = 0.0;
+		int32 Passes = 0;
+		int32 Failures = 0;
+
+		int32 CountBeforeControl = 0;
+		int32 CountAfterControl = 0;
+		int32 CountBeforeReal = 0;
+		int32 ClipBeforePress = 0;
+
+		void Check(bool bCondition, const FString& What)
+		{
+			if (bCondition)
+			{
+				++Passes;
+				UE_LOG(LogTraceGame, Display, TEXT("[Ammo.BindTest]   PASS  %s"), *What);
+			}
+			else
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error, TEXT("[Ammo.BindTest]   FAIL  %s"), *What);
+			}
+		}
+	};
+
+	void PressKey(UWorld* World, const FKey& Key, const TCHAR* Label)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[Ammo.BindTest]   pressing %s (key %s)"),
+			Label, *Key.GetFName().ToString());
+		GEngine->Exec(World, *FString::Printf(TEXT("Trace.SimInput %s %.2f"),
+			*Key.GetFName().ToString(), PressHoldSeconds));
+	}
+
+	void Run()
+	{
+		UWorld* World = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->IsGameWorld())
+				{
+					World = Context.World();
+					break;
+				}
+			}
+		}
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[Ammo.BindTest] no game world yet."));
+			return;
+		}
+
+		TSharedPtr<FProbe> Probe = MakeShared<FProbe>();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Ammo.BindTest] ===== spec v16 §1: 'R to reload', pressed through the real pipeline. Reload is "
+			     "bound to %s. Control: %s, which no action claims. ====="),
+			*UTraceUserSettings::DescribeKey(UTraceUserSettings::Get().GetKey(ETraceInputAction::Reload)),
+			*UTraceUserSettings::DescribeKey(UnclaimedKey()));
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Probe, WeakWorld = TWeakObjectPtr<UWorld>(World)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				return false;
+			}
+			const double Now = FPlatformTime::Seconds();
+			if (Now < Probe->NextStepTime)
+			{
+				return true;
+			}
+
+			ATracePlayerController* PC = Cast<ATracePlayerController>(TickWorld->GetFirstPlayerController());
+			ATraceCharacter* Pawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+			UTraceWeaponComponent* Weapon = (Pawn != nullptr) ? Pawn->Weapon : nullptr;
+
+			if (PC == nullptr || Pawn == nullptr || Weapon == nullptr || !Pawn->IsAlive()
+				|| Pawn->IsCarrier() || Weapon->IsKnifeEquipped())
+			{
+				if (Probe->Step == 0)
+				{
+					return true;   // still waiting for a usable pawn; safe at launch
+				}
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[Ammo.BindTest] VERDICT: INVALID — the local pawn stopped being usable mid-probe."));
+				return false;
+			}
+
+			// ...AND WAIT FOR GAMEPLAY INPUT TO BE LIVE, which is the same trap the v13 §2 probe
+			// documents at length a few hundred lines above — and which this probe walked straight into
+			// on its first run. Spec v14 §3's character-select screen is up for the first seconds of
+			// every match: it sets bGameInputSuppressed, so OnReloadStarted bumps its press counter and
+			// then returns without asking for anything.
+			//
+			// MEASURED, before this gate existed: "the bound key REACHES OnReloadStarted (count 0 -> 1)"
+			// passed and "a reload is actually running" failed — a perfectly correct build reported as
+			// a broken bind. The press counter cannot catch this and is not meant to: it answers "did
+			// the key reach a bound delegate", and while the select screen is up the honest answer to
+			// that is yes and to "did anything happen" is no.
+			if (PC->IsGameInputSuppressed())
+			{
+				if (Probe->Step == 0)
+				{
+					return true;
+				}
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[Ammo.BindTest] VERDICT: INVALID — gameplay input was suppressed mid-probe (a menu or "
+					     "the character-select screen came up), so a swallowed press cannot be told from a "
+					     "broken bind."));
+				return false;
+			}
+
+			switch (Probe->Step)
+			{
+			case 0:
+				// A PARTIAL CLIP, or the reload would be refused for a reason that has nothing to do
+				// with the key and the whole probe would measure the full-clip rule instead.
+				for (int32 Index = 0; Index < 5; ++Index)
+				{
+					Weapon->DebugConsumeRound();
+				}
+				Probe->CountBeforeControl = PC->GetDebugReloadPressCount();
+				PressKey(TickWorld, UnclaimedKey(), TEXT("the CONTROL key"));
+				Probe->Step = 1;
+				Probe->NextStepTime = Now + 0.30;
+				return true;
+
+			case 1:
+				Probe->CountAfterControl = PC->GetDebugReloadPressCount();
+				Probe->Check(Probe->CountAfterControl == Probe->CountBeforeControl,
+					FString::Printf(TEXT("CONTROL: an unclaimed key does NOT reach the reload handler "
+					                     "(count %d -> %d)"),
+						Probe->CountBeforeControl, Probe->CountAfterControl));
+				Probe->Check(!Weapon->IsReloading(),
+					TEXT("CONTROL: ...and starts no reload"));
+
+				Probe->CountBeforeReal = PC->GetDebugReloadPressCount();
+				Probe->ClipBeforePress = Weapon->GetClipAmmo();
+				PressKey(TickWorld, UTraceUserSettings::Get().GetKey(ETraceInputAction::Reload),
+					TEXT("the bound RELOAD key"));
+				Probe->Step = 2;
+				Probe->NextStepTime = Now + 0.30;
+				return true;
+
+			case 2:
+			{
+				const int32 CountNow = PC->GetDebugReloadPressCount();
+				Probe->Check(CountNow > Probe->CountBeforeReal,
+					FString::Printf(TEXT("the bound key REACHES ATracePlayerController::OnReloadStarted "
+					                     "(count %d -> %d)"),
+						Probe->CountBeforeReal, CountNow));
+
+				// The reload is 0.5 s and this step runs 0.30 s after the press, so it must still be
+				// running — which also rules out "it finished, therefore nothing happened".
+				Probe->Check(Weapon->IsReloading(),
+					FString::Printf(TEXT("...and a reload is actually running %.3fs later (%.3fs left, clip was "
+					                     "%d/%d)"),
+						0.30, Weapon->GetReloadRemaining(), Probe->ClipBeforePress, Weapon->GetClipSize()));
+
+				Probe->Step = 3;
+				Probe->NextStepTime = Now + static_cast<double>(TraceAmmo::GetReloadSeconds()) + 0.25;
+				return true;
+			}
+
+			default:
+				Probe->Check(Weapon->GetClipAmmo() == Weapon->GetClipSize(),
+					FString::Printf(TEXT("...and it refills the clip (%d/%d)"),
+						Weapon->GetClipAmmo(), Weapon->GetClipSize()));
+
+				if (Probe->Failures == 0)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[Ammo.BindTest] VERDICT: PASS — %d checks, 0 failed."),
+						Probe->Passes);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Error, TEXT("[Ammo.BindTest] VERDICT: *** FAIL *** — %d passed, %d FAILED."),
+						Probe->Passes, Probe->Failures);
+				}
+				return false;
+			}
+		}));
+	}
+
+	FAutoConsoleCommand CmdAmmoBindTest(
+		TEXT("Trace.Ammo.BindTest"),
+		TEXT("Dev only. Spec v16 §1: press the bound RELOAD key through the real Enhanced Input pipeline and "
+		     "prove it reaches the handler and starts a reload. Presses an UNCLAIMED key first as the control, "
+		     "so the run cannot pass by responding to any key at all."),
+		FConsoleCommandDelegate::CreateStatic(&Run));
 }
 
 #endif // !UE_BUILD_SHIPPING

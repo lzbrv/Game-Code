@@ -320,9 +320,24 @@ void ATraceOysterJar::Burst()
 		return;
 	}
 
-	const float Radius = FMath::Max(1.f, UTraceSettings::Get().OysterPoisonRadiusUU);
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const float Radius = FMath::Max(1.f, Settings.OysterPoisonRadiusUU);
 	const FVector Origin = GetActorLocation();
 	int32 PoisonedCount = 0;
+
+	// SPEC v16 §3: "Add a small, semi transparent cloud when oyster's poison jars break. This cloud
+	// should be the radius of the explosion."
+	//
+	// Spawned from the SAME `Radius` local the loop below tests every candidate against — not from a
+	// second read of the knob, and certainly not from a number of its own. That is the whole of §3's
+	// second sentence: if the two were ever allowed to diverge the cloud would be telling players the
+	// poison is somewhere it is not, which is worse than drawing nothing.
+	//
+	// FIRST, and unconditionally: the cloud is the shape of the BURST, not a report on who it caught.
+	// A jar that breaks in an empty corridor still poisoned that volume for the next four seconds and
+	// still has to say so. It is cosmetic — nothing below reads it, and it touches nobody.
+	const ATraceOysterPoisonCloud* Cloud = ATraceOysterPoisonCloud::ServerSpawnForBurst(
+		WorldPtr, Origin, Radius, Settings.OysterPoisonDurationSeconds);
 
 	for (TActorIterator<ATraceCharacter> It(WorldPtr); It; ++It)
 	{
@@ -361,6 +376,11 @@ void ATraceOysterJar::Burst()
 		}
 	}
 
-	UE_LOG(LogTraceGame, Log, TEXT("[Oyster] Jar burst at %s: poisoned %d within %.0f uu."),
-		*Origin.ToCompactString(), PoisonedCount, Radius);
+	// The cloud is reported from the POINTER, not from the fact that the call was made: "spawned a
+	// cloud" and "asked for a cloud" are different claims and only one of them is worth logging.
+	UE_LOG(LogTraceGame, Log, TEXT("[Oyster] Jar burst at %s: poisoned %d within %.0f uu; cloud %s."),
+		*Origin.ToCompactString(), PoisonedCount, Radius,
+		(Cloud != nullptr)
+			? *FString::Printf(TEXT("spawned at %.0f uu (spec v16 §3)"), Cloud->GetCloudRadiusUU())
+			: TEXT("NOT spawned"));
 }

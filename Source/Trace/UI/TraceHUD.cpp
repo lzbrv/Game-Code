@@ -18,6 +18,19 @@
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceMelee.h"          // v10 §1 — the equipped-weapon row and its two timers
 #include "Gameplay/TraceParry.h"          // v6 §3 — the parry-kill banner and the death-panel line
+#include "Gameplay/TraceWeaponComponent.h" // v16 §1/§2 — the ammo block reads the clip through this
+// v16 §2 — the status stack. Six statuses live on four different owners, so the corner has to ask
+// four different objects; every one of these is a READ of an accessor that slice already published
+// for the HUD, and nothing here writes gameplay state.
+#include "Abilities/TraceAbilityComponent.h"
+#include "Abilities/TraceCharacterAbilitySet.h"
+#include "Abilities/Characters/TraceAbilitySetChut.h"   // Chud
+#include "Abilities/Characters/TraceAbilitySetMace.h"   // suspend / Spike pull
+#include "Abilities/Characters/TraceAbilitySetRocco.h"  // the headshot speed stack
+#include "Abilities/Characters/TraceAbilitySetX.h"      // v16 §1 — the bee clip's loaded size
+#include "Abilities/Characters/TraceOysterPoison.h"     // poisoned + slowed
+#include "Containers/Ticker.h"                          // FTSTicker — the v16 §2 shot sequence
+#include "HAL/PlatformFileManager.h"                    // the screenshot directory
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Core/TraceCharacterRoster.h"    // v14 §3 — the accent colour and the ability's name
 #include "Settings/TraceUserSettings.h"   // v14 §5 — the ability's bound key, if the input slice has one
@@ -62,6 +75,43 @@ namespace
 		     "clock with no explanation reads as a hung timer."),
 		ECVF_Cheat);
 #endif
+}
+
+/**
+ * SPEC v16 §2's A/B ARM, and the whole of this pass's red-arm discipline.
+ *
+ * Named after the file rather than anonymous, per the build contract: this .cpp already carries one
+ * unnamed namespace and a second set of symbols in it is how the Windows jumbo build breaks.
+ *
+ * 1 (default) is the shipped v16 HUD: ammo and the status stack in the bottom-right corner, and the
+ * throw charge drawn as the crosshair ring. 0 restores EXACTLY what a player saw before this pass —
+ * no ammo anywhere, no statuses anywhere, and the throw charge as a bar in the bottom-left stack.
+ *
+ * *** IT EXISTS SO THE RED CASE CAN BE PHOTOGRAPHED IN THE SAME BINARY, AGAINST THE SAME FIXTURE,
+ * AS THE GREEN ONE. *** Spec v16's testing rule is that a harness which cannot go red is not
+ * evidence, and for a drawing change the only evidence is a frame. With the arm, Trace.HUD.V16Shots
+ * stages one set of real gameplay states and photographs both HUDs off it seconds apart — so a
+ * "before" screenshot cannot be a different build, a different fixture or a different camera.
+ *
+ * Cheat-only and no ini override, exactly like Trace.HUD.PendingPeriodEndLabel above: a shipping
+ * player must not be able to switch their own ammo counter off.
+ */
+namespace TraceHUDV16
+{
+	static int32 GArmed = 1;
+
+#if !UE_BUILD_SHIPPING
+	static FAutoConsoleVariableRef CVarArmed(
+		TEXT("Trace.HUD.V16"),
+		GArmed,
+		TEXT("1 (default, spec v16 2): ammo + the status stack in the bottom-right corner, and the "
+		     "throw charge on the crosshair ring. 0 is the RED ARM - the pre-v16 HUD, with no ammo, "
+		     "no statuses and the throw charge back on a bottom-left bar. Capture ONLY; it is the "
+		     "before-and-after pair, not a preference."),
+		ECVF_Cheat);
+#endif
+
+	static bool IsArmed() { return GArmed != 0; }
 }
 
 namespace TraceHUDStyle
@@ -333,6 +383,21 @@ void ATraceHUD::DrawHUD()
 
 	LogAffordanceAvailabilityOnce();
 
+#if !UE_BUILD_SHIPPING
+	// Spec v16 §2's draw record, cleared before anything draws. A stale record read back as a live
+	// one is precisely how a harness ends up reporting PASS while striking a corpse.
+	bDrewAmmoBlock = false;
+	DrawnAmmoText.Reset();
+	bDrewBeeClip = false;
+	bDrewReloadBar = false;
+	DrawnMagazineTicks = 0;
+	DrawnStatusChips.Reset();
+	bDrewChargeRing = false;
+	DrawnChargeRingAlpha = -1.f;
+	DrawnChargeRingSegments = 0;
+	bDrewChargeBar = false;
+#endif
+
 	// Escape raises the pause menu. Polled rather than bound for the same reason the overlay itself
 	// polls: the menu pauses the world in standalone, and a bound delegate only survives that if
 	// every binding remembered bExecuteWhenPaused. FTraceOptionsMenu::OpenRoot swallows input for the
@@ -385,8 +450,18 @@ void ATraceHUD::DrawHUD()
 
 		DrawCrosshair();
 		DrawPassProgress();
+
+		// Spec v16 §2 — the throw charge, on the ring the pass hold has always used. Immediately
+		// after the pass so the two are unmistakably the same element drawn from two sources.
+		DrawThrowChargeRing();
+
 		DrawHitMarker();
 		DrawHealthAndDash();
+
+		// Spec v16 §2 — the bottom-right corner. After the bottom-left stack purely so the two
+		// corners are read in the same order in this function as they are on screen.
+		DrawAmmoAndStatuses();
+
 		DrawScoresAndClock();
 		DrawCoreBanner();
 		DrawPhaseBanner();
@@ -1072,6 +1147,15 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 		return;
 	}
 
+	// Spec v16 §2 — the same rule for the throw charge, and it is not a style call. The ring writes
+	// "62%  -  POWER 72%" on this exact pixel row, and the first armed capture photographed it
+	// printed straight through "LMB  -  THROW" into an unreadable smear. Whichever ring is up owns
+	// the caption; the crosshair goes quiet.
+	if (IsThrowChargeRingUp())
+	{
+		return;
+	}
+
 	FString Caption;
 	FLinearColor CaptionColor = TraceHUDStyle::InkDim;
 
@@ -1149,6 +1233,15 @@ void ATraceHUD::DrawPassProgress()
 		return;
 	}
 
+	// The filled arc is TEAM COLOURED, because a pass is the one action whose whole point is the
+	// teammate on the other end of it.
+	DrawCrosshairRing(Progress, TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.30f),
+		TEXT("PASSING"), TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.85f));
+}
+
+void ATraceHUD::DrawCrosshairRing(float FillAlpha, const FLinearColor& FillColor,
+	const FString& Caption, const FLinearColor& CaptionColor)
+{
 	// The ring closes around the CENTRE CROSSHAIR, because that is now where the crosshair always is
 	// (see DrawCrosshair) and a progress ring that is not concentric with the thing it is the
 	// progress of reads as two unrelated pieces of UI. It used to close around the pass anchor, back
@@ -1169,7 +1262,7 @@ void ATraceHUD::DrawPassProgress()
 	// size this is ever drawn at and costs ~48 DrawLine calls on the one frame in a hundred that a
 	// pass is actually being held.
 	constexpr int32 Segments = 48;
-	const float Alpha = FMath::Clamp(Progress, 0.f, 1.f);
+	const float ClampedAlpha = FMath::Clamp(FillAlpha, 0.f, 1.f);
 
 	auto PointAt = [CX, CY, Radius](float T)
 	{
@@ -1180,7 +1273,13 @@ void ATraceHUD::DrawPassProgress()
 	};
 
 	// Unfilled track first, so the ring reads as a dial rather than as a growing arc from nowhere.
-	const FLinearColor Track = FLinearColor(1.f, 1.f, 1.f, 0.18f);
+	//
+	// DIMMED IN RGB, NOT IN ALPHA, and that is not a style preference. AHUD::DrawLine builds an
+	// FCanvasLineItem, and FCanvasItem's constructor sets SE_BLEND_Opaque — so the alpha handed to
+	// DrawLine is DISCARDED. This line used to be FLinearColor(1,1,1,0.18) and rendered as pure
+	// white: the "faint" track was the brightest thing on the dial and the contrast read backwards.
+	// Over this HUD's dark backdrop, scaling RGB is what alpha-over-black would have looked like.
+	const FLinearColor Track = FLinearColor(0.18f, 0.18f, 0.18f, 1.f);
 	for (int32 Index = 0; Index < Segments; ++Index)
 	{
 		const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
@@ -1188,19 +1287,110 @@ void ATraceHUD::DrawPassProgress()
 		DrawLine(A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
 	}
 
-	// The filled arc is TEAM COLOURED, because a pass is the one action whose whole point is the
-	// teammate on the other end of it.
-	const FLinearColor Fill = TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.30f);
-	const int32 Filled = FMath::CeilToInt(Alpha * Segments);
+	const int32 Filled = FMath::CeilToInt(ClampedAlpha * Segments);
 	for (int32 Index = 0; Index < Filled; ++Index)
 	{
 		const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
-		const FVector2D B = PointAt(FMath::Min(Alpha, static_cast<float>(Index + 1) / Segments));
-		DrawLine(A.X, A.Y, B.X, B.Y, Fill, Thickness);
+		const FVector2D B = PointAt(FMath::Min(ClampedAlpha, static_cast<float>(Index + 1) / Segments));
+		DrawLine(A.X, A.Y, B.X, B.Y, FillColor, Thickness);
 	}
 
-	DrawTextCentered(TEXT("PASSING"), TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.85f),
-		CX, CY + Radius + (10.f * UIScale), FontSmall, UIScale);
+#if !UE_BUILD_SHIPPING
+	// The CHORDS, not the alpha. A ring that computed a healthy 0.62 and then emitted nothing would
+	// otherwise report itself as drawn — the exact shape of failure this project has already been
+	// caught by once (a geometry index returning 0 while calling itself healthy).
+	DrawnChargeRingSegments = Filled;
+#endif
+
+	if (!Caption.IsEmpty())
+	{
+		DrawTextCentered(Caption, CaptionColor, CX, CY + Radius + (10.f * UIScale), FontSmall, UIScale);
+	}
+}
+
+bool ATraceHUD::IsThrowChargeRingUp() const
+{
+	// THE RED ARM OWNS THIS TOO, and the first run of Trace.HUD.V16Shots is why the line exists: with
+	// only the corner gated, the arm drew the superseded BAR and the new RING at the same time, so
+	// the "before" frame was not a before at all. The draw record caught it (chargeRing=YES with
+	// arm=0) where a glance at the screenshot would not have.
+	if (!TraceHUDV16::IsArmed())
+	{
+		return false;
+	}
+
+	// IsThrowCharging() is false for a bot by construction, so this is the local player's ring only
+	// and there is no mode test needed beyond the Core existing — mode A never starts a charge.
+	const ATraceCore* ChargeCore = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
+	if (ChargeCore == nullptr || !ChargeCore->IsThrowCharging())
+	{
+		return false;
+	}
+
+	// The pass ring wins the pixel. It cannot happen in a shipped mode — mode A passes and never
+	// throws, mode B throws and never passes — but the two rings are concentric and identical, so if
+	// a future mode ever managed both at once the result would be an unreadable double arc rather
+	// than an obvious bug. One line to make that impossible.
+	return (TracePC == nullptr) || (TracePC->GetPassProgress() < 0.f);
+}
+
+void ATraceHUD::DrawThrowChargeRing()
+{
+	// LOCAL AND INSTANT, WHICH IS THE REQUIREMENT AND NOT AN OPTIMISATION. Every number here comes
+	// from ATraceCore's PREDICTED accessors, which run off a clock started on the frame the button
+	// went down on this machine. A meter fed by replicated state would lag the player's own finger by
+	// their ping, so they would be aiming a power they are being shown late. The THROW is still
+	// resolved entirely on the server from the server's own copy of the hold; the worst this
+	// prediction can do is draw a ring for a throw the server then refuses on cooldown.
+	if (!IsThrowChargeRingUp())
+	{
+		return;
+	}
+
+	ATraceCore* ChargeCore = TraceGS->Core;
+
+	// *** THE SWEEP IS THE HOLD, LINEARLY, AND FULL AT CoreThrowChargeSeconds (0.8 s after v16 §0).
+	// *** Spec v16 §2: "to demonstrate how charged /100% the throw is". GetThrowChargeAlpha() is
+	// exactly that fraction and nothing else; GetThrowChargeScaleNow() is the resulting MOMENTUM,
+	// which starts at the 15% floor rather than at zero and would therefore draw a ring that is
+	// already a sixth full the instant the button goes down.
+	const float ChargeAlpha = FMath::Clamp(ChargeCore->GetThrowChargeAlpha(), 0.f, 1.f);
+	const float Power = ChargeCore->GetThrowChargeScaleNow();
+	const bool  bFull = (ChargeCore->GetThrowChargeAlpha() >= 1.f);
+
+	// Winding up wears the team tint; the instant it is FULL it snaps to Good and pulses at the same
+	// 12 rad/s every other "act now" state on this HUD uses. That transition is the single most
+	// useful thing the ring does, because past full the charge clamps and holding longer buys
+	// nothing — the player needs to know to let go, not to keep holding.
+	//
+	// THE PULSE IS IN BRIGHTNESS, NOT ALPHA. This was WithAlpha(Good, 0.7 + 0.3*sin), and the ring
+	// therefore did not pulse at all: DrawLine discards alpha (see the track comment above), so
+	// three full-charge frames captured at unrelated moments measured bit-identical. Two comments
+	// claimed a pulse that never once happened. Shade() scales RGB, which survives.
+	const float FullPulse = 0.7f + 0.3f * FMath::Sin(Now * 12.f);
+	const FLinearColor RingColor = bFull
+		? TraceHUDStyle::Shade(TraceHUDStyle::Good, FullPulse, 0.f)
+		: TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.30f);
+
+	// THE POWER, not the elapsed hold, and it is what replaces the bar's floor tick.
+	//
+	// The deleted bar carried a mark at 15% to teach that an instant click is weak rather than
+	// nothing. A tick at 15% of a sweep that measures TIME would have been marking a power value on a
+	// time axis — the bar's one muddle. The caption says the floor outright instead: at zero charge
+	// it already reads "POWER 15%", which is the same lesson stated correctly and read from the same
+	// published curve the throw itself releases at, so the readout cannot drift from the game.
+	const FString RingCaption = bFull
+		? FString(TEXT("FULL  -  POWER 100%"))
+		: FString::Printf(TEXT("%.0f%%  -  POWER %.0f%%"),
+			100.f * ChargeAlpha, 100.f * FMath::Max(0.f, Power));
+
+	DrawCrosshairRing(ChargeAlpha, RingColor, RingCaption,
+		bFull ? TraceHUDStyle::Good : TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.85f));
+
+#if !UE_BUILD_SHIPPING
+	bDrewChargeRing = true;
+	DrawnChargeRingAlpha = ChargeAlpha;
+#endif
 }
 
 void ATraceHUD::DrawHitMarker()
@@ -1368,26 +1558,26 @@ void ATraceHUD::DrawHealthAndDash()
 		RowY -= (RowH + RowGap);
 	}
 
-	// ---- Throw charge (spec v13 §6) -------------------------------------------------------------
+	// ---- Throw charge — SUPERSEDED BY THE CROSSHAIR RING (spec v16 §2) --------------------------
 	//
-	// Verbatim: "The longer the player holds down, the more momentum the core has... So if the player
-	// just clicks the throw button it will throw with very low momentum." A charge you cannot see is a
-	// charge you cannot aim — an instant click throws at 15% and a full hold at 100%, and without a
-	// meter the difference reads as the throw being wildly inconsistent rather than as a skill.
+	// Verbatim: "For the throw charge, use the old circle around the crosshair animation for game
+	// mode a to demonstrate how charged /100% the throw is, RATHER THAN A BAR ON THE HUD." So this
+	// row is off in a shipped build; DrawThrowChargeRing() is where the charge is drawn now.
 	//
-	// LOCAL AND INSTANT, WHICH IS THE REQUIREMENT AND NOT AN OPTIMISATION. Every number here comes
-	// from ATraceCore's PREDICTED accessors, which run off a clock started on the frame the button
-	// went down on this machine. A meter fed by replicated state would lag the player's own finger by
-	// their ping, so they would be aiming a power they are being shown late. The THROW is still
-	// resolved entirely on the server from the server's own copy of the hold; the worst this
-	// prediction can do is draw a meter for a throw the server then refuses on cooldown.
+	// IT IS KEPT, BEHIND THE RED ARM, AND ONLY FOR THAT. Trace.HUD.V16 0 puts the bar back so the
+	// superseded HUD can be photographed against the same fixture in the same binary as the ring —
+	// which for a drawing change is the only "before" that proves anything. Delete it the day the
+	// arm goes, not before.
 	//
-	// IsThrowCharging() is false for a bot by construction, so this is the local player's meter only
-	// and there is no mode test needed beyond the Core existing — mode A never starts a charge.
+	// The v13 §6 reasoning it was written under is unchanged and now lives on DrawThrowChargeRing().
+	if (!TraceHUDV16::IsArmed())
 	{
 		ATraceCore* ChargeCore = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
 		if (ChargeCore != nullptr && ChargeCore->IsThrowCharging())
 		{
+#if !UE_BUILD_SHIPPING
+			bDrewChargeBar = true;
+#endif
 			const float Alpha = FMath::Max(0.f, ChargeCore->GetThrowChargeAlpha());
 			const float Power = ChargeCore->GetThrowChargeScaleNow();
 			const bool  bFull = (Alpha >= 1.f);
@@ -1836,6 +2026,443 @@ void ATraceHUD::DrawChargePips(float X, float Y, float W, float H, int32 Charges
 
 		DrawMeter(PipX, Y, PipW, H, Fraction, FillColor);
 	}
+}
+
+// -------------------------------------------------------------------------------------------
+// Bottom right: ammo in the corner, statuses stacking above it — spec v16 §2
+//
+// The layout decision and the "separate from cooldowns" reasoning are on DrawAmmoAndStatuses() in
+// the header. This block is only the palette.
+// -------------------------------------------------------------------------------------------
+
+namespace TraceHUDStatusStyle
+{
+	/**
+	 * SIX SEPARATED HUES, AND DELIBERATELY *NOT* THE CHARACTER ACCENT COLOURS.
+	 *
+	 * The accents already mean something on this HUD: the ability row wears them because they say
+	 * WHICH CHARACTER YOU ARE, learned on the select screen. A status says what is HAPPENING TO YOU,
+	 * which is a different question, and it is frequently not your own character's doing at all — the
+	 * poison on a Chut came from an Oyster. Reusing Chut's mint for Chud would also have put two
+	 * greens on a poisoned Chut's screen at once, which is the exact collision this palette exists to
+	 * avoid. So statuses get their own wheel, spread far enough apart to survive a small window.
+	 */
+	static const FLinearColor SpeedBoost (0.30f, 0.95f, 0.95f, 1.f);   // electric cyan
+	static const FLinearColor Poisoned   (0.35f, 0.95f, 0.20f, 1.f);   // toxic green, the cloud's own
+	static const FLinearColor Slowed     (0.35f, 0.55f, 1.00f, 1.f);   // cold blue
+	static const FLinearColor Vulnerable (1.00f, 0.35f, 0.45f, 1.f);   // rose — X's mark
+	static const FLinearColor Chud       (1.00f, 0.80f, 0.30f, 1.f);   // armour gold
+	static const FLinearColor Suspend    (0.72f, 0.55f, 1.00f, 1.f);   // violet — Mace
+	static const FLinearColor Pull       (0.85f, 0.72f, 1.00f, 1.f);   // the same family: one ability
+
+	/**
+	 * BEE AMBER — the one colour in this file whose whole job is to stop a misreading.
+	 *
+	 * Spec v16 §1: Sting "reloads the clip with just the 5 bee bullets", REPLACING whatever was in it.
+	 * A player holding 25 rounds who presses E and sees "5" has, from their side of the screen,
+	 * watched the gun eat twenty of their bullets. The spec's own [ASSUMPTION] says the HUD must make
+	 * it obvious, so a bee clip changes THREE independent things at once — this colour, the SHAPE of
+	 * the magazine strip (five fat pips instead of thirty thin ticks) and the words "BEE ROUNDS".
+	 * Any one of the three survives a compressed screenshot, a colour-blind player or a glance.
+	 *
+	 * Amber-black is what a bee is; it is deliberately not X's rose accent, which would say "this is
+	 * X's gun" rather than "these are not normal bullets".
+	 */
+	static const FLinearColor BeeRounds  (1.00f, 0.78f, 0.10f, 1.f);
+
+	/** Ordinary rounds wear the ammo block's own neutral, so the bee clip is the only loud state. */
+	static const FLinearColor NormalRounds(0.90f, 0.93f, 1.00f, 1.f);
+
+	/** Reload gold: the gun is unavailable, which is the same news the empty clip was. */
+	static const FLinearColor Reloading  (1.00f, 0.62f, 0.20f, 1.f);
+
+	/** Below this fraction of a clip the count turns red. Two shots' worth at the shipped 30. */
+	static constexpr float LowAmmoFraction = 0.2f;
+}
+
+void ATraceHUD::DrawAmmoAndStatuses()
+{
+	// The red arm (Trace.HUD.V16 0) is the pre-v16 corner: empty. See TraceHUDV16.
+	if (!TraceHUDV16::IsArmed())
+	{
+		return;
+	}
+
+	// A dead player has no gun and no live effects — poison dies with the body and the mark is
+	// cleared on respawn — so the whole corner goes quiet rather than each block testing separately.
+	if (LocalChar == nullptr || !LocalChar->IsAlive())
+	{
+		return;
+	}
+
+	// Mirrors the bottom-left stack's margin exactly, so the two corners read as one system rather
+	// than as two features that landed in different passes.
+	const float Margin = 40.f * UIScale;
+	const float BlockW = 260.f * UIScale;
+	const float RightEdge = ViewW - Margin;
+
+	// Ammo first and pinned: it owns the corner and never moves. See the header.
+	const float StackBottom = DrawAmmoBlock(RightEdge, ViewH - Margin, BlockW);
+
+	// ---- The status stack, growing upward -------------------------------------------------------
+	//
+	// ORDER IS FIXED AND IT IS A DECISION. Nearest the corner (drawn first, lowest) are the things
+	// being done TO the player, most urgent first: vulnerable, then the two Oyster debuffs, then
+	// Mace's control. The player's own buffs sit above them. A status appearing or expiring
+	// therefore only ever shuffles statuses ABOVE it and can never move the ammo count.
+	float ChipBottom = StackBottom - (12.f * UIScale);
+
+	// ---- VULNERABLE (spec v16 §4 — "The HUD status from §2 shows the stack count") ---------------
+	//
+	// GetVulnerableStacks() is the ONE accessor for this and it already answers the two questions the
+	// HUD would otherwise get wrong: it returns 0 the instant the deadline passes (all stacks vanish
+	// together, which is why this never draws a draining count) and 0 for a Core carrier, who cannot
+	// be marked at all. Deriving either here would be a second copy of a rule.
+	if (const UTraceHealthComponent* HealthComp = LocalChar->Health.Get())
+	{
+		const int32 Stacks = HealthComp->GetVulnerableStacks();
+		if (Stacks > 0)
+		{
+			const float Remaining = HealthComp->GetVulnerableRemaining();
+			const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceVulnerable::GetDurationSeconds());
+
+			// The BONUS, printed from the published pure function rather than re-derived from the two
+			// knobs — that is how a HUD and a damage path end up agreeing on a shared mistake.
+			const float Bonus = 100.f * (TraceVulnerable::GetMultiplierForStacks(Stacks) - 1.f);
+
+			ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+				FString::Printf(TEXT("VULNERABLE  x%d  +%.0f%%"), Stacks, Bonus),
+				FString::Printf(TEXT("%.1fs"), Remaining),
+				Remaining / Total, TraceHUDStatusStyle::Vulnerable);
+		}
+	}
+
+	// ---- POISONED and SLOWED (Oyster) ------------------------------------------------------------
+	//
+	// TWO CHIPS OFF ONE COMPONENT, AND THAT IS THE INFORMATION, not duplication. The poison keeps
+	// ticking on a player who picks the Core up, but the §4 choke point switches the SLOW off the
+	// same frame — so a carrier sees POISONED without SLOWED, and the pair is the only thing on
+	// screen that says the difference out loud. bSlowActive is the server's own per-frame answer,
+	// replicated, so this cannot disagree with the speed the player is actually moving at.
+	if (const UTraceOysterPoisonComponent* PoisonComp = UTraceOysterPoisonComponent::Find(LocalChar))
+	{
+		// The poison replicates an ABSOLUTE match time, which is what makes it correct for a client
+		// that joined late. GetServerWorldTimeSeconds() is the same clock it was written against.
+		const float MatchNow = (TraceGS != nullptr)
+			? static_cast<float>(TraceGS->GetServerWorldTimeSeconds()) : 0.f;
+		const float Remaining = PoisonComp->GetEndMatchTime() - MatchNow;
+		const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
+			UTraceSettings::Get().OysterPoisonDurationSeconds);
+
+		if (Remaining > 0.f)
+		{
+			ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+				TEXT("POISONED"), FString::Printf(TEXT("%.1fs"), Remaining),
+				Remaining / Total, TraceHUDStatusStyle::Poisoned);
+
+			if (PoisonComp->IsSlowActive())
+			{
+				const float SlowPercent = 100.f * (1.f - PoisonComp->GetSpeedMultiplier());
+				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+					FString::Printf(TEXT("SLOWED  -%.0f%% SPEED"), SlowPercent),
+					FString::Printf(TEXT("%.1fs"), Remaining),
+					Remaining / Total, TraceHUDStatusStyle::Slowed);
+			}
+		}
+	}
+
+	// ---- Mace's suspend and pull, and Chut's Chud, and Rocco's speed stack ------------------------
+	//
+	// All four hang off the local player's OWN ability set, so one lookup serves them and a character
+	// who is none of the three simply matches no branch.
+	if (const UTraceCharacterAbilitySet* LocalSet = UTraceAbilityComponent::GetAbilitySetFor(LocalChar))
+	{
+		if (const UTraceAbilitySetMace* MaceSet = Cast<UTraceAbilitySetMace>(LocalSet))
+		{
+			if (MaceSet->IsSuspending())
+			{
+				const float Remaining = MaceSet->GetSuspendRemaining();
+				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
+					UTraceSettings::Get().MaceSuspendMaxSeconds);
+
+				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+					TEXT("SUSPENDED"), FString::Printf(TEXT("%.2fs"), Remaining),
+					Remaining / Total, TraceHUDStatusStyle::Suspend);
+			}
+
+			// THE PULL HAS NO CLOCK, so its draining indicator is DISTANCE — which is the pull's real
+			// progress and the only honest thing to drain here. Spec v16 §2 asks for "a duration
+			// readout OR a draining indicator"; inventing a fake timer to satisfy the first would
+			// have been a HUD that lies about a mechanic that ends on arrival, not on a stopwatch.
+			if (MaceSet->IsPulling())
+			{
+				const float ToAnchor = static_cast<float>(
+					FVector::Dist(LocalChar->GetActorLocation(), MaceSet->GetSpikeAnchorLocation()));
+				const float Range = FMath::Max(1.f, UTraceSettings::Get().MaceSpikeRangeUU);
+
+				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+					TEXT("SPIKE PULL"), FString::Printf(TEXT("%.0fm"), ToAnchor / 100.f),
+					FMath::Clamp(ToAnchor / Range, 0.f, 1.f), TraceHUDStatusStyle::Pull);
+			}
+		}
+		else if (const UTraceAbilitySetChut* ChutSet = Cast<UTraceAbilitySetChut>(LocalSet))
+		{
+			if (ChutSet->IsChudActive())
+			{
+				const float Remaining = ChutSet->GetChudSecondsRemaining();
+				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
+					UTraceSettings::Get().ChudDurationSeconds);
+				const float Reduction = 100.f * UTraceSettings::Get().ChudDamageReduction;
+
+				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+					FString::Printf(TEXT("CHUD  -%.0f%% DAMAGE"), Reduction),
+					FString::Printf(TEXT("%.1fs"), Remaining),
+					Remaining / Total, TraceHUDStatusStyle::Chud);
+			}
+		}
+		else if (const UTraceAbilitySetRocco* RoccoSet = Cast<UTraceAbilitySetRocco>(LocalSet))
+		{
+			// ONE timer over the WHOLE stack, refreshed by every headshot kill — not one timer per
+			// stack (see TraceAbilitySetRocco.h). So there is exactly one bar to drain, and the stack
+			// count belongs in the label beside it rather than as N separate chips.
+			const int32 Stacks = RoccoSet->GetLiveStackCount();
+			if (Stacks > 0)
+			{
+				const float Remaining = RoccoSet->GetStackSecondsRemaining();
+				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
+					UTraceSettings::Get().RoccoHeadshotSpeedDurationSeconds);
+
+				// The multiplier the movement component is ACTUALLY using, not stacks x the per-stack
+				// knob: the set clamps at RoccoHeadshotSpeedStackMax and this way the readout keeps
+				// telling the truth at the cap instead of counting past it.
+				const float BoostPercent = 100.f * (RoccoSet->GetMoveSpeedMultiplier() - 1.f);
+
+				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+					FString::Printf(TEXT("SPEED BOOST  x%d  +%.0f%%"), Stacks, BoostPercent),
+					FString::Printf(TEXT("%.1fs"), Remaining),
+					Remaining / Total, TraceHUDStatusStyle::SpeedBoost);
+			}
+		}
+	}
+}
+
+float ATraceHUD::DrawAmmoBlock(float RightX, float BottomY, float BlockW)
+{
+	const UTraceWeaponComponent* WeaponComp = (LocalChar != nullptr) ? LocalChar->Weapon.Get() : nullptr;
+
+	// *** ONE GATE, AND IT IS THE GUN'S OWN. *** ShouldShowAmmo() is false while carrying the Core
+	// (spec v16 §1: "The Core carrier has no gun, so ammo must not be consumed or shown while
+	// carrying"), with the knife out, and while dead. Re-deriving any of that here would give the
+	// rule a second definition able to drift from the one the weapon enforces — which is how a HUD
+	// ends up showing a count for a gun that cannot fire.
+	if (WeaponComp == nullptr || !WeaponComp->ShouldShowAmmo())
+	{
+		return BottomY;
+	}
+
+	const int32 InClip = WeaponComp->GetClipAmmo();
+	const int32 AbilityRounds = WeaponComp->GetAbilityRoundsInClip();
+	const bool  bBeeClip = (AbilityRounds > 0);
+	const bool  bReloading = WeaponComp->IsReloading();
+
+	// THE DENOMINATOR IS THE CLIP THAT IS ACTUALLY LOADED. A bee clip holds five, and printing "3/30"
+	// for it would say the gun is nearly empty when it is more than half full of the thing X just
+	// spent his ability on.
+	//
+	// *** IT IS THE SIZE THE BEE CLIP WAS LOADED AT, NOT THE ROUNDS STILL IN IT. *** This was written
+	// as Max(InClip, AbilityRounds), and UTraceWeaponComponent::ConsumeRound decrements
+	// AbilityRoundsInClip in lockstep with ClipAmmo — so the denominator tracked the numerator and
+	// the block read "5/5", then "4/4", then "3/3", while the pip strip below LOST a pip per shot
+	// instead of dimming one. A bee clip looked full right up until it was gone, which is the exact
+	// thing this branch exists to prevent. The capacity now comes from the same knob that produced
+	// the clip — XStingBulletCount, which is what UTraceAbilitySetX::ActivateAbility hands to
+	// LoadAbilityClip — for the same reason §3's cloud reads the poison's own radius rather than a
+	// second copy of it: two numbers for one fact drift, and the HUD is always the copy that lies.
+	// Max() against the loaded count so a future ability that loads MORE rounds than X does can
+	// never produce a denominator below its own numerator.
+	const int32 ClipCapacity = bBeeClip
+		? FMath::Max(AbilityRounds, TraceXBees::GetStingBulletCount())
+		: FMath::Max(1, WeaponComp->GetClipSize());
+
+	const FLinearColor RoundsColor = bBeeClip
+		? TraceHUDStatusStyle::BeeRounds
+		: TraceHUDStatusStyle::NormalRounds;
+
+	// ---- Geometry, laid out upward from the corner ------------------------------------------------
+	// THE COUNT IS DRAWN AT DOUBLE THE BODY SCALE, and that is a measurement rather than a taste.
+	// At 1280x720 (UIScale 0.667) the engine's large font renders about 14 px tall, which the first
+	// capture showed sitting no larger than the "AMMO" label beside it — for the one number on this
+	// HUD a player reads without looking directly at it. 2.0x puts it at ~28 px, comfortably the
+	// biggest thing in the corner, and it still clears the status stack above.
+	constexpr float CountScale = 2.0f;
+	const float NumberH = 40.f * UIScale;
+	const float StripH  = 12.f * UIScale;
+	const float LabelH  = 14.f * UIScale;
+	const float Gap     = 5.f * UIScale;
+
+	const float NumberTop = BottomY - NumberH;
+	const float StripTop  = NumberTop - Gap - StripH;
+	const float LabelTop  = StripTop - Gap - LabelH;
+
+	// ---- The plate -------------------------------------------------------------------------------
+	//
+	// A PANEL BEHIND THE WHOLE BLOCK, and it is not decoration. This arena is emissive neon at Glow
+	// 3.5 with a bloom pass to match, and the first armed capture put the white "26" straight over a
+	// blown-out light: it was almost unreadable, while the status chips a few pixels above it — which
+	// already had a panel — read perfectly. The one number a player checks without looking cannot be
+	// allowed to depend on what happens to be behind it.
+	//
+	// The border is tinted by the ROUNDS colour, so a bee clip changes the plate as well as its
+	// contents and the whole corner announces itself.
+	const float PlatePad = 6.f * UIScale;
+	DrawPanel(RightX - BlockW - PlatePad, LabelTop - PlatePad,
+		BlockW + (PlatePad * 2.f), (BottomY - LabelTop) + (PlatePad * 2.f),
+		TraceHUDStyle::PanelFill, TraceHUDStyle::WithAlpha(RoundsColor, bBeeClip ? 0.55f : 0.30f));
+
+	// ---- The count -------------------------------------------------------------------------------
+	//
+	// Right-aligned as two pieces so the number a player actually reads is large and the capacity it
+	// is out of is subordinate — "7" has to be legible in peripheral vision; "/30" never does.
+	const FString CapacityText = FString::Printf(TEXT("/%d"), ClipCapacity);
+	const FString CountText = bReloading ? FString(TEXT("--")) : FString::Printf(TEXT("%d"), InClip);
+
+	const bool bLow = !bBeeClip && !bReloading
+		&& (static_cast<float>(InClip) <= TraceHUDStatusStyle::LowAmmoFraction * ClipCapacity);
+
+	const FLinearColor CountColor = bReloading
+		? TraceHUDStatusStyle::Reloading
+		: (bLow ? TraceHUDStyle::Danger : RoundsColor);
+
+	// The capacity is BASELINE-ALIGNED to the bottom of the count rather than centred on it, so
+	// "26" and "/30" sit on one line instead of stepping down the way the first capture showed.
+	const float CountH = MeasureHeight(CountText, FontLarge, UIScale * CountScale);
+	const float CountTop = NumberTop + FMath::Max(0.f, NumberH - CountH);
+	const float CapacityH = MeasureHeight(CapacityText, FontSmall, UIScale);
+
+	DrawTextRight(CapacityText, TraceHUDStyle::InkDim, RightX,
+		CountTop + FMath::Max(0.f, CountH - CapacityH) - (2.f * UIScale), FontSmall, UIScale);
+
+	const float CapacityW = MeasureWidth(CapacityText, FontSmall, UIScale);
+	DrawTextRight(CountText, CountColor, RightX - CapacityW - (4.f * UIScale),
+		CountTop, FontLarge, UIScale * CountScale);
+
+	// ---- The magazine strip -----------------------------------------------------------------------
+	//
+	// ONE TICK PER ROUND, and the tick COUNT is what makes a bee clip unmistakable at a glance: five
+	// fat pips is a visibly different object from thirty thin ones, before any colour or word is
+	// read. Mid-reload the strip becomes a single filling bar instead — a third shape, so "the gun is
+	// coming back" never has to be inferred from a number that is briefly meaningless.
+	DrawRect(TraceHUDStyle::Trough, RightX - BlockW, StripTop, BlockW, StripH);
+
+	int32 LitTicks = 0;
+	if (bReloading)
+	{
+		const float ReloadTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceAmmo::GetReloadSeconds());
+		const float Elapsed = FMath::Clamp(ReloadTotal - WeaponComp->GetReloadRemaining(), 0.f, ReloadTotal);
+		DrawRect(TraceHUDStatusStyle::Reloading, RightX - BlockW, StripTop,
+			BlockW * (Elapsed / ReloadTotal), StripH);
+	}
+	else
+	{
+		// Integer widths, pixel-snapped, for the same reason the crosshair and the kill-feed glyphs
+		// use them: a fractional rect on a half-pixel boundary is anti-aliased into a smudge, and at
+		// 1280x720 a 30-tick strip has under five pixels per tick to work with.
+		const float TickGap = FMath::Max(1.f, FMath::RoundToFloat(1.5f * UIScale));
+		const float TickW = FMath::Max(2.f,
+			FMath::FloorToFloat((BlockW - (ClipCapacity - 1) * TickGap) / ClipCapacity));
+		const float StrideW = TickW + TickGap;
+		const float StripLeft = RightX - ((ClipCapacity * StrideW) - TickGap);
+
+		for (int32 Index = 0; Index < ClipCapacity; ++Index)
+		{
+			const bool bLit = (Index < InClip);
+			DrawRect(bLit ? RoundsColor : TraceHUDStyle::WithAlpha(RoundsColor, 0.14f),
+				StripLeft + (Index * StrideW), StripTop, TickW, StripH);
+			LitTicks += bLit ? 1 : 0;
+		}
+	}
+
+	// ---- The label line ---------------------------------------------------------------------------
+	//
+	// The WORDS are the third independent bee-round signal, and the right-hand half is the reload
+	// key — read from the player's own bindings rather than hardcoded to R, exactly as the ability
+	// row does. A HUD that hardcodes a key is a HUD that lies to the first player who rebinds it.
+	const FString AmmoLabel = bBeeClip ? FString(TEXT("BEE ROUNDS")) : FString(TEXT("AMMO"));
+	DrawTextLeft(AmmoLabel, bBeeClip ? TraceHUDStatusStyle::BeeRounds : TraceHUDStyle::InkDim,
+		RightX - BlockW, LabelTop, FontSmall, UIScale);
+
+	FString ReloadKeyLabel(TEXT("R"));
+	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+	{
+		if (FCString::Stricmp(Info.ConfigId, TEXT("Reload")) == 0)
+		{
+			const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
+			if (BoundKey.IsValid())
+			{
+				ReloadKeyLabel = BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
+			}
+			break;
+		}
+	}
+
+	const FString RightLabel = bReloading
+		? FString::Printf(TEXT("RELOADING  %.1f"), WeaponComp->GetReloadRemaining())
+		: FString::Printf(TEXT("[%s]  RELOAD"), *ReloadKeyLabel);
+
+	DrawTextRight(RightLabel,
+		bReloading ? TraceHUDStatusStyle::Reloading : TraceHUDStyle::InkDim,
+		RightX, LabelTop, FontSmall, UIScale);
+
+#if !UE_BUILD_SHIPPING
+	bDrewAmmoBlock = true;
+	bDrewBeeClip = bBeeClip;
+	bDrewReloadBar = bReloading;
+	DrawnMagazineTicks = LitTicks;
+	DrawnAmmoText = FString::Printf(TEXT("%s%s"), *CountText, *CapacityText);
+#endif
+
+	return LabelTop;
+}
+
+float ATraceHUD::DrawStatusChip(float RightX, float BottomY, float ChipW, const FString& Label,
+	const FString& Readout, float Fraction, const FLinearColor& Tint)
+{
+	const float ChipH = 24.f * UIScale;
+	const float ChipTop = BottomY - ChipH;
+	const float ChipLeft = RightX - ChipW;
+	const float TabW = FMath::Max(2.f, FMath::RoundToFloat(4.f * UIScale));
+	const float DrainH = FMath::Max(2.f, FMath::RoundToFloat(3.f * UIScale));
+
+	// Panel, then a saturated tab down the left edge. The tab is what carries the colour at a glance;
+	// the fill stays dark so six chips stacked up never turn the corner into a light box.
+	DrawPanel(ChipLeft, ChipTop, ChipW, ChipH,
+		TraceHUDStyle::PanelFill, TraceHUDStyle::WithAlpha(Tint, 0.45f));
+	DrawRect(Tint, ChipLeft, ChipTop, TabW, ChipH);
+
+	const float TextTop = VCenterTextY(Label, FontSmall, UIScale, ChipTop, ChipH - DrainH);
+	DrawTextLeft(Label, TraceHUDStyle::Ink, ChipLeft + TabW + (6.f * UIScale), TextTop, FontSmall, UIScale);
+	DrawTextRight(Readout, TraceHUDStyle::WithAlpha(Tint, 0.95f), RightX - (6.f * UIScale),
+		TextTop, FontSmall, UIScale);
+
+	// *** THE DRAINING INDICATOR, AND IT DRAINS — the opposite direction to every cooldown meter in
+	// the bottom-left stack, which FILLS toward ready. That is the second half of spec v16 §2's
+	// "separate from cooldowns": the corner separates them in space, this separates them in motion,
+	// so the two never read as the same widget out of the corner of an eye. It also rules out the
+	// thing the spec explicitly forbids — "a bare icon that never changes is not a status display".
+	const float DrainW = ChipW * FMath::Clamp(Fraction, 0.f, 1.f);
+	DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Shadow, 0.5f),
+		ChipLeft, ChipTop + ChipH - DrainH, ChipW, DrainH);
+	DrawRect(Tint, ChipLeft, ChipTop + ChipH - DrainH, DrainW, DrainH);
+
+#if !UE_BUILD_SHIPPING
+	// The chip records the LABEL AND THE FRACTION IT ACTUALLY DREW, not the state it was handed —
+	// so a chip that drew a zero-width drain is distinguishable in the report from one that drew a
+	// live one, and neither can be inferred from the gameplay state that fed it.
+	DrawnStatusChips.Add(FString::Printf(TEXT("%s | %s | drain=%.2f"), *Label, *Readout,
+		FMath::Clamp(Fraction, 0.f, 1.f)));
+#endif
+
+	return ChipTop - (6.f * UIScale);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -3343,3 +3970,917 @@ FString ATraceHUD::FormatClock(float Seconds)
 	const int32 Total = FMath::Max(0, FMath::CeilToInt(Seconds));
 	return FString::Printf(TEXT("%02d:%02d"), Total / 60, Total % 60);
 }
+
+// ===================================================================================================
+// SPEC v16 §2 — THE EVIDENCE HARNESS
+//
+//   Trace.HUD.V16.Report        one line describing WHAT THE LAST DRAWN FRAME CONTAINED.
+//   Trace.HUD.V16Shots          stages real gameplay states and photographs the corner, the bee
+//                               clip, the reload, four statuses and the charge ring — RED ARM FIRST,
+//                               then the same fixture again with the feature on.
+//
+// ---------------------------------------------------------------------------------------------------
+// WHY IT IS BUILT THIS WAY
+// ---------------------------------------------------------------------------------------------------
+//
+// A drawing change can only be verified by looking at a frame, and this project has already been
+// caught three times by a harness that certified itself: a wall fitter that indexed 0 boxes while
+// reporting healthy, a fix that existed in code but not on disk, a carrier test that printed PASS
+// while striking a corpse. So two rules govern everything below.
+//
+//   1. THE REPORT READS THE DRAW RECORD, NOT THE GAME. Every field it prints was written by the draw
+//      pass at the moment it emitted pixels — the ammo string that was rendered, the number of
+//      magazine ticks actually issued, the number of ring chords actually issued, one entry per
+//      status chip. Ask the weapon component instead and a HUD that draws nothing still reports 30.
+//
+//   2. RED BEFORE GREEN, SAME BINARY, SAME FIXTURE, SAME CAMERA. Trace.HUD.V16 0 restores the
+//      pre-v16 HUD exactly — no corner, and the throw charge back on its bottom-left bar. The
+//      sequence photographs the red arm FIRST, from a world already carrying the poison, the three
+//      vulnerable stacks and the part-spent clip, and only then flips the arm and photographs the
+//      identical frame again. A "before" that came from a different build or a different fixture
+//      would prove nothing at all.
+//
+// SERVER ONLY, and locally controlled: it stages authoritative state (a poison component, vulnerable
+// stacks, a character swap) and photographs the machine that owns a viewport. On a listen host those
+// are the same process, which is what every headless run of this project already is.
+// ===================================================================================================
+
+#if !UE_BUILD_SHIPPING
+
+ATraceHUD::FV16DrawRecord ATraceHUD::GetV16DrawRecord() const
+{
+	FV16DrawRecord Record;
+	Record.bAmmoBlock = bDrewAmmoBlock;
+	Record.AmmoText = DrawnAmmoText;
+	Record.bBeeClip = bDrewBeeClip;
+	Record.bReloadBar = bDrewReloadBar;
+	Record.MagazineTicks = DrawnMagazineTicks;
+	Record.ChipCount = DrawnStatusChips.Num();
+	Record.bChargeRing = bDrewChargeRing;
+	Record.ChargeRingAlpha = DrawnChargeRingAlpha;
+	Record.ChargeRingChords = DrawnChargeRingSegments;
+	Record.bChargeBar = bDrewChargeBar;
+
+	for (const FString& Chip : DrawnStatusChips)
+	{
+		Record.ChipText += FString::Printf(TEXT("\n[HUDV16]     chip: %s"), *Chip);
+	}
+	if (DrawnStatusChips.Num() == 0)
+	{
+		Record.ChipText = TEXT("\n[HUDV16]     chip: <none>");
+	}
+	return Record;
+}
+
+void ATraceHUD::LogV16DrawRecord(const TCHAR* Tag) const
+{
+	const FV16DrawRecord Record = GetV16DrawRecord();
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[HUDV16] %s | arm=%d | ammoBlock=%s text='%s' bee=%s reloadBar=%s litTicks=%d | chips=%d%s")
+		TEXT("\n[HUDV16]     chargeRing=%s alpha=%.3f chords=%d | SUPERSEDED chargeBar=%s"),
+		Tag,
+		TraceHUDV16::GArmed,
+		Record.bAmmoBlock ? TEXT("YES") : TEXT("no"),
+		*Record.AmmoText,
+		Record.bBeeClip ? TEXT("YES") : TEXT("no"),
+		Record.bReloadBar ? TEXT("YES") : TEXT("no"),
+		Record.MagazineTicks,
+		Record.ChipCount,
+		*Record.ChipText,
+		Record.bChargeRing ? TEXT("YES") : TEXT("no"),
+		Record.ChargeRingAlpha,
+		Record.ChargeRingChords,
+		Record.bChargeBar ? TEXT("YES") : TEXT("no"));
+}
+
+/**
+ * The staging + capture sequence. Named after the file, per the build contract's jumbo rule.
+ */
+namespace TraceHUDV16Shots
+{
+	/** One scripted run. Real-time gated, so it survives a stalled or slow headless frame. */
+	struct FRun
+	{
+		int32 Step = 0;
+		double NextRealTime = 0.0;
+		int32 TicksLeft = 40000;
+		bool bModeB = false;
+		TWeakObjectPtr<ATraceHUD> Hud;
+		TWeakObjectPtr<APlayerController> PC;
+
+		/** Every assertion this run made, so the last line of the log is a verdict and not a vibe. */
+		TArray<FString> Passes;
+		TArray<FString> Failures;
+
+		/**
+		 * Scenes this world CANNOT stage, as opposed to scenes that failed.
+		 *
+		 * MODE A FREEZES THE CHARACTER SYSTEM OUTRIGHT ("characters are OFF here (mode A is frozen -
+		 * spec 2)"), so there is no X to load a bee clip, no Chut to raise Chud, no Rocco to stack a
+		 * boost and no Mace to suspend. Reporting those as FAILURES would be a harness crying wolf
+		 * about a rule the game is enforcing on purpose; reporting them as passes would be worse.
+		 * They get their own list and the verdict names it.
+		 */
+		TArray<FString> NotApplicable;
+
+		/** False when this world refuses characters at all - see NotApplicable. */
+		bool bCharacters = true;
+	};
+
+	/** The one local, authoritative player controller - the only machine that can both stage and draw. */
+	APlayerController* FindLocalAuthorityPC(UWorld* WorldPtr)
+	{
+		if (WorldPtr == nullptr)
+		{
+			return nullptr;
+		}
+
+		// Listen host or standalone only: this command stages AUTHORITATIVE state and photographs a
+		// VIEWPORT, and only these two net modes have both in one process.
+		if (!WorldPtr->IsNetMode(NM_ListenServer) && !WorldPtr->IsNetMode(NM_Standalone))
+		{
+			return nullptr;
+		}
+
+		for (FConstPlayerControllerIterator It = WorldPtr->GetPlayerControllerIterator(); It; ++It)
+		{
+			if (APlayerController* Candidate = It->Get())
+			{
+				if (Candidate->IsLocalController())
+				{
+					return Candidate;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	/** The local controller's pass progress, or -1. Sugar; the pass ring is fed by exactly this. */
+	float TracePC_PassProgress(const FRun& Run)
+	{
+		const ATracePlayerController* PC = Cast<ATracePlayerController>(Run.PC.Get());
+		return (PC != nullptr) ? PC->GetPassProgress() : -1.f;
+	}
+
+	ATraceCharacter* PawnOf(const FRun& Run)
+	{
+		APlayerController* PC = Run.PC.Get();
+		return (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+	}
+
+	void SetCVarInt(const TCHAR* Name, int32 Value)
+	{
+		if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name))
+		{
+			Var->Set(Value, ECVF_SetByConsole);
+		}
+	}
+
+	void SetArm(int32 Value) { SetCVarInt(TEXT("Trace.HUD.V16"), Value); }
+
+	/** One assertion against the DRAW RECORD. Never against the gameplay state that fed it. */
+	void Expect(FRun& Run, bool bCondition, const FString& Claim)
+	{
+		if (bCondition)
+		{
+			Run.Passes.Add(Claim);
+		}
+		else
+		{
+			Run.Failures.Add(Claim);
+			UE_LOG(LogTraceGame, Warning, TEXT("[HUDV16] *** FAIL: %s ***"), *Claim);
+		}
+	}
+
+	/**
+	 * Requests a full-frame capture and logs the draw record alongside it.
+	 *
+	 * Filenames are namespaced with the tag AND this process id, because other agents run their own
+	 * rigs into the same Saved/Screenshots and an overwritten frame is destroyed evidence.
+	 */
+	ATraceHUD::FV16DrawRecord Shot(FRun& Run, const TCHAR* Tag)
+	{
+		const FString FileName = FString::Printf(TEXT("HudV16_%s_pid%d.png"), Tag, FPlatformProcess::GetCurrentProcessId());
+		const FString FullPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Screenshots") / FileName);
+
+		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(FullPath));
+		FScreenshotRequest::RequestScreenshot(FullPath, /*bShowUI=*/false, /*bAddFilenameSuffix=*/false);
+
+		UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] shot requested: %s"), *FullPath);
+
+		ATraceHUD* HudPtr = Run.Hud.Get();
+		if (HudPtr == nullptr)
+		{
+			return ATraceHUD::FV16DrawRecord();
+		}
+		HudPtr->LogV16DrawRecord(Tag);
+		return HudPtr->GetV16DrawRecord();
+	}
+
+	/** An ability component belonging to somebody on the OTHER team, or null. */
+	UTraceAbilityComponent* FindEnemySource(UWorld* WorldPtr, const ATraceCharacter* Victim)
+	{
+		const AGameStateBase* GS = (WorldPtr != nullptr) ? WorldPtr->GetGameState() : nullptr;
+		if (GS == nullptr || Victim == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (APlayerState* Candidate : GS->PlayerArray)
+		{
+			const ATracePlayerState* TraceState = Cast<ATracePlayerState>(Candidate);
+			if (TraceState == nullptr || TraceState == Victim->GetPlayerState())
+			{
+				continue;
+			}
+			if (TraceState->Team == Victim->GetTeam())
+			{
+				continue;
+			}
+			if (UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(Candidate))
+			{
+				return Comp;
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Keeps the two inflicted debuffs live across a multi-second scene, at a STABLE three stacks.
+	 *
+	 * Re-applied on a threshold rather than every tick: vulnerable refreshes one shared 2 s deadline
+	 * and adds a stack each time, so a per-frame re-application would race to the cap of five and the
+	 * screenshot would show a number nobody asked for. Topping up only below three keeps the frame
+	 * reading "x3 +35%", which is the arithmetic spec v16 4 spells out by name.
+	 *
+	 * *** THE POISON IS APPLIED BY AN ENEMY, AND THAT IS NOT COSMETIC. *** The first run of this
+	 * harness attributed it to the victim's own ability component; the poison attached and the
+	 * POISONED chip drew, but the 4 slice's choke point correctly refused to SLOW somebody on
+	 * account of themselves, so bSlowActive stayed false and the SLOWED chip never appeared. The
+	 * fixture was wrong, not the HUD - but a fixture that cannot produce a state cannot photograph
+	 * one either.
+	 */
+	void HoldDebuffs(UWorld* WorldPtr, ATraceCharacter* Target, APlayerController* Source)
+	{
+		if (Target == nullptr || !Target->IsAlive())
+		{
+			return;
+		}
+
+		// *** THE MARK IS REBUILT BEFORE IT EXPIRES, NOT AFTER. ***
+		//
+		// Spec v16 4 is that all stacks vanish together the instant the deadline passes, and
+		// GetVulnerableStacks() implements exactly that - so a fixture that only tops up once the
+		// count has already fallen to zero leaves a window, one tick wide, in which the correct
+		// answer is "no mark". Two captures landed in it and reported the vulnerable chip missing.
+		// The HUD was right both times; the fixture was letting the thing it was photographing
+		// legitimately end.
+		//
+		// Rebuilt rather than topped up: ApplyVulnerable ADDS a stack as well as resetting the
+		// deadline, so refreshing early would walk the count to the cap of five and the frame would
+		// read "x5 +45%" instead of the "x3 +35%" this scene is meant to show. Clearing first pins it
+		// at exactly three, and the 0.75 s threshold keeps the deadline more than a second away from
+		// any frame the camera might catch.
+		if (UTraceHealthComponent* HealthComp = Target->Health.Get())
+		{
+			const float MarkDuration = TraceVulnerable::GetDurationSeconds();
+			if (HealthComp->GetVulnerableStacks() != 3 || HealthComp->GetVulnerableRemaining() < 0.75f)
+			{
+				HealthComp->ClearVulnerable();
+				for (int32 Stack = 0; Stack < 3; ++Stack)
+				{
+					HealthComp->ApplyVulnerable(MarkDuration, Source);
+				}
+			}
+		}
+
+		const UTraceOysterPoisonComponent* Live = UTraceOysterPoisonComponent::Find(Target);
+		const AGameStateBase* ClockState = (WorldPtr != nullptr) ? WorldPtr->GetGameState() : nullptr;
+		const float MatchNow = (ClockState != nullptr) ? static_cast<float>(ClockState->GetServerWorldTimeSeconds()) : 0.f;
+
+		if (Live == nullptr || (Live->GetEndMatchTime() - MatchNow) < 1.5f)
+		{
+			UTraceOysterPoisonComponent::ApplyTo(Target, FindEnemySource(WorldPtr, Target));
+		}
+	}
+
+	bool Tick(TSharedPtr<FRun> Run);
+
+	void Schedule(TSharedPtr<FRun> Run, float DelaySeconds)
+	{
+		Run->NextRealTime = FPlatformTime::Seconds() + static_cast<double>(DelaySeconds);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run](float) -> bool
+			{
+				if (FPlatformTime::Seconds() < Run->NextRealTime)
+				{
+					// Debuffs decay in real time while a scene is being held for the camera.
+					if (Run->Step >= 3 && Run->Step <= 11)
+					{
+						APlayerController* PC = Run->PC.Get();
+						HoldDebuffs(PC ? PC->GetWorld() : nullptr, PawnOf(*Run), PC);
+					}
+					return (--Run->TicksLeft) > 0;
+				}
+				return Tick(Run);
+			}), 0.f);
+	}
+
+	/** Runs one console command through the engine, so the shipped path is what gets exercised. */
+	void Exec(UWorld* WorldPtr, const TCHAR* Command)
+	{
+		if (GEngine != nullptr && WorldPtr != nullptr)
+		{
+			GEngine->Exec(WorldPtr, Command);
+		}
+	}
+
+	/** Puts the local player on @p CharacterName and says whether it took. */
+	bool SwitchCharacter(UWorld* WorldPtr, const FRun& Run, const TCHAR* CharacterName, ETraceCharacterId Expected)
+	{
+		Exec(WorldPtr, *FString::Printf(TEXT("Trace.Ability.SetCharacter %s"), CharacterName));
+
+		const UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(PawnOf(Run));
+		const bool bTook = (Comp != nullptr) && (Comp->GetCharacterId() == Expected);
+		if (!bTook)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[HUDV16] character switch to %s did NOT take (now %d). Any status that needs it will be "
+				     "reported as NOT PHOTOGRAPHED rather than quietly skipped."),
+				CharacterName, Comp != nullptr ? (int32)Comp->GetCharacterId() : -1);
+		}
+		return bTook;
+	}
+
+	bool Tick(TSharedPtr<FRun> Run)
+	{
+		ATraceHUD* HudPtr = Run->Hud.Get();
+		APlayerController* PC = Run->PC.Get();
+		UWorld* WorldPtr = (PC != nullptr) ? PC->GetWorld() : nullptr;
+
+		if (HudPtr == nullptr || PC == nullptr || WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[HUDV16] *** ABORTED at step %d: the HUD or the local controller went away. "
+				"This is NOT a pass. ***"), Run->Step);
+			return false;
+		}
+
+		const int32 ThisStep = Run->Step++;
+		float NextDelay = 1.0f;
+
+		switch (ThisStep)
+		{
+		case 0:
+			// FIXTURE FIRST, AND OUT LOUD. A run that photographed a HUD with no pawn would produce a
+			// set of empty frames and a green-looking log.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HUDV16] ===== spec v16 2 shot sequence ===== mode=%s pawn=%s alive=%d"),
+				Run->bModeB ? TEXT("B (goals)") : TEXT("A (endzones)"),
+				*GetNameSafe(PawnOf(*Run)), PawnOf(*Run) != nullptr ? (int32)PawnOf(*Run)->IsAlive() : 0);
+
+			// The per-team uniqueness rule hands three of the five characters to bots before this
+			// command ever runs, so a fixture that has to BE Chut, Rocco and Mace in turn cannot get
+			// there without lifting it. This is the framework's own documented dev arm, not a new one,
+			// and it is a FIXTURE change: nothing about the HUD reads it.
+			Exec(WorldPtr, TEXT("Trace.Characters.EnforceRosterRules 0"));
+
+			// Mode B refuses to give the Core back to whoever last threw it for a short window. The
+			// ring scene picks it up three times in six seconds, so the lockout is stood down for the
+			// fixture. Also a gameplay-side knob the HUD never reads.
+			SetCVarInt(TEXT("Trace.ModeB.SelfPickupLockout"), 0);
+
+			Run->bCharacters = SwitchCharacter(WorldPtr, *Run, TEXT("X"), ETraceCharacterId::X);
+			if (!Run->bCharacters)
+			{
+				Run->NotApplicable.Add(TEXT("BEE ROUNDS, CHUD, SPEED BOOST and SUSPEND - this world refuses "
+					"characters outright (mode A is frozen, spec 2), so none of the four can be staged here. "
+					"Run the same command in a mode B world to photograph them."));
+			}
+			NextDelay = 1.5f;
+			break;
+
+		case 1:
+			// Spend part of the clip through the REAL trigger, so the count on screen is one the gun
+			// arrived at by firing rather than one the harness wrote into it.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				if (UTraceWeaponComponent* Gun = Pawn->Weapon.Get())
+				{
+					Gun->StartFire();
+				}
+			}
+			NextDelay = 1.6f;
+			break;
+
+		case 2:
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				if (UTraceWeaponComponent* Gun = Pawn->Weapon.Get())
+				{
+					Gun->StopFire();
+				}
+			}
+			HoldDebuffs(WorldPtr, PawnOf(*Run), PC);
+			NextDelay = 0.6f;
+			break;
+
+		case 3:
+			// *** RED ARM. The pre-v16 HUD, over a world that already has everything to show. ***
+			SetArm(0);
+			HoldDebuffs(WorldPtr, PawnOf(*Run), PC);
+			NextDelay = 0.5f;
+			break;
+
+		case 4:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("RED_corner"));
+			Expect(*Run, !Record.bAmmoBlock, TEXT("RED: the bottom-right corner draws NO ammo block"));
+			Expect(*Run, Record.ChipCount == 0, TEXT("RED: the bottom-right corner draws NO status chips"));
+			NextDelay = 1.2f;
+			break;
+		}
+
+		case 5:
+			SetArm(1);
+			HoldDebuffs(WorldPtr, PawnOf(*Run), PC);
+			NextDelay = 0.5f;
+			break;
+
+		case 6:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("GREEN_corner"));
+			Expect(*Run, Record.bAmmoBlock, TEXT("GREEN: the ammo block draws"));
+			Expect(*Run, Record.MagazineTicks > 0 && Record.MagazineTicks < 30,
+				TEXT("GREEN: the magazine strip emitted a PART-SPENT number of lit ticks (not 0, not a full clip)"));
+			Expect(*Run, Record.AmmoText.Contains(TEXT("/30")), TEXT("GREEN: the ammo readout is out of a 30-round clip"));
+			Expect(*Run, !Record.bBeeClip, TEXT("GREEN: an ordinary clip is NOT flagged as bee rounds"));
+			Expect(*Run, Record.ChipCount >= 3,
+				TEXT("GREEN: at least three status chips drew (vulnerable + poisoned + slowed)"));
+			Expect(*Run, Record.ChipText.Contains(TEXT("VULNERABLE  x3  +35%")),
+				TEXT("GREEN: the vulnerable chip shows the STACK COUNT and spec v16 4's arithmetic (x3 = +35%)"));
+			Expect(*Run, Record.ChipText.Contains(TEXT("POISONED")), TEXT("GREEN: the poisoned chip drew"));
+			Expect(*Run, Record.ChipText.Contains(TEXT("SLOWED")), TEXT("GREEN: the slowed chip drew"));
+			Expect(*Run, !Record.ChipText.Contains(TEXT("drain=0.00")),
+				TEXT("GREEN: every chip drew a NON-EMPTY draining indicator"));
+			NextDelay = 1.2f;
+			break;
+		}
+
+		case 7:
+			// The reload state of the ammo block: a third strip shape and a live countdown.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				if (UTraceWeaponComponent* Gun = Pawn->Weapon.Get())
+				{
+					const bool bStarted = Gun->RequestReload();
+					UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] manual reload requested: started=%d"), (int32)bStarted);
+				}
+			}
+			NextDelay = 0.15f;
+			break;
+
+		case 8:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("GREEN_reload"));
+			Expect(*Run, Record.bReloadBar, TEXT("GREEN: mid-reload the magazine strip becomes a filling reload bar"));
+			NextDelay = 1.2f;
+			break;
+		}
+
+		case 9:
+			if (!Run->bCharacters)
+			{
+				Run->Step = 21;   // straight to the ring scene; there is no Sting to photograph
+				NextDelay = 0.1f;
+				break;
+			}
+			// STING: the clip becomes five bee rounds. This is spec v16 1's "or it reads as the gun
+			// eating your ammo" case, and the only frame that can answer it.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				if (UTraceCharacterAbilitySet* Set = UTraceAbilityComponent::GetAbilitySetFor(Pawn))
+				{
+					const bool bActivated = Set->ActivateAbility();
+					UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] X Sting activated=%d"), (int32)bActivated);
+				}
+			}
+			NextDelay = 0.6f;
+			break;
+
+		case 10:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("GREEN_bee"));
+			Expect(*Run, Record.bBeeClip, TEXT("BEE: the ammo block flags the clip as bee rounds"));
+			Expect(*Run, Record.AmmoText.Contains(TEXT("/5")),
+				TEXT("BEE: the denominator is the 5-round bee clip, not 30 - so 5 rounds does not read as nearly empty"));
+			Expect(*Run, Record.MagazineTicks == 5,
+				TEXT("BEE: the magazine strip emitted FIVE fat pips, a different shape from the 30-tick strip"));
+			NextDelay = 1.2f;
+			break;
+		}
+
+		case 11:
+			Run->Step = 12;
+			if (SwitchCharacter(WorldPtr, *Run, TEXT("Chut"), ETraceCharacterId::Chut))
+			{
+				NextDelay = 1.2f;
+			}
+			else
+			{
+				Run->Step = 14;   // skip Chud rather than photograph an empty frame and call it evidence
+				NextDelay = 0.1f;
+			}
+			break;
+
+		case 12:
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				if (UTraceCharacterAbilitySet* Set = UTraceAbilityComponent::GetAbilitySetFor(Pawn))
+				{
+					const bool bActivated = Set->ActivateAbility();
+					UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] Chut Chud activated=%d"), (int32)bActivated);
+				}
+			}
+			NextDelay = 0.6f;
+			break;
+
+		case 13:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("GREEN_chud"));
+			Expect(*Run, Record.ChipText.Contains(TEXT("CHUD")), TEXT("GREEN: the Chud chip drew, with its damage reduction"));
+			NextDelay = 1.2f;
+			break;
+		}
+
+		case 14:
+			Run->Step = 15;
+			if (SwitchCharacter(WorldPtr, *Run, TEXT("Rocco"), ETraceCharacterId::Rocco))
+			{
+				NextDelay = 1.2f;
+			}
+			else
+			{
+				Run->Step = 17;
+				NextDelay = 0.1f;
+			}
+			break;
+
+		case 15:
+			// Three headshot kills through Rocco's OWN passive hook - the same call the kill router
+			// makes - rather than by writing his replicated stack count from outside.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				if (UTraceCharacterAbilitySet* Set = UTraceAbilityComponent::GetAbilitySetFor(Pawn))
+				{
+					for (int32 Kill = 0; Kill < 3; ++Kill)
+					{
+						Set->OnKill(nullptr, FName(TEXT("Bullet")), /*bHeadshot=*/true);
+					}
+				}
+			}
+			NextDelay = 0.3f;
+			break;
+
+		case 16:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("GREEN_speed"));
+			Expect(*Run, Record.ChipText.Contains(TEXT("SPEED BOOST  x3")),
+				TEXT("GREEN: the speed-boost chip drew with its stack count"));
+			NextDelay = 1.2f;
+			break;
+		}
+
+		case 17:
+			Run->Step = 18;
+			if (SwitchCharacter(WorldPtr, *Run, TEXT("Mace"), ETraceCharacterId::Mace))
+			{
+				NextDelay = 1.2f;
+			}
+			else
+			{
+				Run->Step = 21;   // straight to the ring scene; do not photograph a Mace chip without a Mace
+				NextDelay = 0.1f;
+			}
+			break;
+
+		case 18:
+			// Mace's suspend only exists in the air, so the fixture has to put her there first - a
+			// suspend staged on the ground would be a status chip over a mechanic that is not running.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				Pawn->LaunchCharacter(FVector(0.f, 0.f, 1600.f), true, true);
+			}
+			NextDelay = 0.3f;
+			break;
+
+		case 19:
+			// *** RE-LAUNCHED IMMEDIATELY BEFORE THE PRESS, AND THAT IS A FIX, NOT BELT-AND-BRACES.
+			// *** One 900 uu/s hop gave roughly 1.4 s of airtime, which sounds like plenty against a
+			// 1.25 s suspend - but this run is frame-rate bound and headless frame times wander, and
+			// one capture landed with the pawn already back on the deck: OnSecondaryPressed returned
+			// true on a frame where IsFalling() was still set, and ApplySuspend then stopped it with
+			// "landed" before the next draw. The chip was correctly absent and the harness correctly
+			// failed - the FIXTURE was flaky. Boosting on the same tick as the press removes the
+			// dependency on how long the previous step actually took.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				Pawn->LaunchCharacter(FVector(0.f, 0.f, 1600.f), true, true);
+
+				if (UTraceCharacterAbilitySet* Set = UTraceAbilityComponent::GetAbilitySetFor(Pawn))
+				{
+					const bool bSuspended = Set->OnSecondaryPressed();
+					UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] Mace suspend pressed=%d (falling=%d)"),
+						(int32)bSuspended,
+						Pawn->GetCharacterMovement() != nullptr ? (int32)Pawn->GetCharacterMovement()->IsFalling() : -1);
+				}
+			}
+			// A SEPARATE STEP FOR THE SHOT, and every other scene above already had one. The draw
+			// record is written by DrawHUD, so reading it in the same tick as the state change reads
+			// the frame BEFORE the change - which is exactly how the first armed run reported "the
+			// suspend chip did not draw" for a chip that was about to. The suspend runs 1.25 s, so
+			// two tenths is comfortably inside it.
+			NextDelay = 0.2f;
+			break;
+
+		case 20:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("GREEN_suspend"));
+			Expect(*Run, Record.ChipText.Contains(TEXT("SUSPENDED")), TEXT("GREEN: the suspend chip drew"));
+			Expect(*Run, !Record.ChipText.Contains(TEXT("SUSPENDED | 0.00s")),
+				TEXT("GREEN: the suspend chip carries a live countdown, not a frozen one"));
+			NextDelay = 1.2f;
+			break;
+		}
+
+		case 21:
+			// ---- THE RING SCENE ------------------------------------------------------------------
+			//
+			// MODE A GETS A SCENE OF ITS OWN RATHER THAN A SKIP, and it is a REGRESSION test, not a
+			// bonus. Spec v16 2's ring is mode A's own pass-hold animation, and this pass moved the
+			// drawing out of DrawPassProgress into a shared DrawCrosshairRing so that both callers
+			// are one animation. That refactor can only break in mode A, which is exactly the world
+			// the charge scene cannot run in - so mode A photographs the PASS ring instead and
+			// proves the shared geometry still serves its original caller.
+			if (!Run->bModeB)
+			{
+				// *** A PASS NEEDS A RECEIVER, AND THE FIRST ATTEMPT DID NOT STAGE ONE. *** Holding
+				// LMB with nobody under the reticle leaves GetPassProgress() at -1 and draws no ring
+				// at all, which the harness dutifully reported as a failure of a feature that was
+				// never exercised. So the fixture puts a teammate in front of the carrier and turns
+				// the carrier to face them before it touches the input.
+				if (ATraceCharacter* Pawn = PawnOf(*Run))
+				{
+					ATraceCharacter* Receiver = nullptr;
+					for (TActorIterator<ATraceCharacter> It(WorldPtr); It; ++It)
+					{
+						ATraceCharacter* Candidate = *It;
+						if (Candidate != nullptr && Candidate != Pawn && Candidate->IsAlive()
+							&& Candidate->GetTeam() == Pawn->GetTeam())
+						{
+							Receiver = Candidate;
+							break;
+						}
+					}
+
+					if (Receiver != nullptr)
+					{
+						const FVector Ahead = Pawn->GetActorLocation() + (Pawn->GetActorForwardVector() * 700.f);
+						Receiver->SetActorLocation(Ahead, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+						PC->SetControlRotation((Ahead - Pawn->GetActorLocation()).Rotation());
+					}
+
+					if (ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>())
+					{
+						if (ATraceCore* CorePtr = GS->Core)
+						{
+							CorePtr->SetActorLocation(Pawn->GetActorLocation());
+							CorePtr->TryPickup(Pawn);
+							UE_LOG(LogTraceGame, Display,
+								TEXT("[HUDV16] mode A: receiver=%s staged; carrier=%d"),
+								*GetNameSafe(Receiver), (int32)Pawn->IsCarrier());
+						}
+					}
+				}
+				Run->Step = 199;
+				NextDelay = 0.35f;
+				break;
+			}
+
+			// Put the Core in the local player's hands through the shipped pickup, then start the
+			// wind-up through the shipped input entry point - the same call the left mouse button
+			// makes. Nothing here writes the charge clock directly.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				if (ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>())
+				{
+					if (ATraceCore* CorePtr = GS->Core)
+					{
+						CorePtr->SetActorLocation(Pawn->GetActorLocation());
+						CorePtr->TryPickup(Pawn);
+						UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] Core pickup attempted; carrier=%d"),
+							(int32)Pawn->IsCarrier());
+					}
+				}
+			}
+			NextDelay = 0.4f;
+			break;
+
+		case 22:
+			SetArm(0);                                    // *** RED ARM: the superseded BAR. ***
+			if (ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>())
+			{
+				if (ATraceCore* CorePtr = GS->Core)
+				{
+					CorePtr->RequestPassInput(true, PawnOf(*Run));
+				}
+			}
+			NextDelay = 0.45f;
+			break;
+
+		case 23:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("RED_chargebar"));
+			Expect(*Run, Record.bChargeBar, TEXT("RED: the throw charge draws as a BAR in the bottom-left stack"));
+			Expect(*Run, !Record.bChargeRing, TEXT("RED: no ring is drawn around the crosshair"));
+			NextDelay = 0.5f;
+			break;
+		}
+
+		case 24:
+			// Releasing THROWS the Core (there is no other way to end a wind-up), so the green arm
+			// gets a fresh pickup and a fresh press rather than inheriting the red arm's hold. The
+			// first run of this harness released and re-pressed on one hold and photographed two
+			// frames with no charge at all.
+			if (ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>())
+			{
+				if (ATraceCore* CorePtr = GS->Core)
+				{
+					CorePtr->RequestPassInput(false, PawnOf(*Run));
+				}
+			}
+			SetArm(1);
+			NextDelay = 0.6f;
+			break;
+
+		case 25:
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				if (ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>())
+				{
+					if (ATraceCore* CorePtr = GS->Core)
+					{
+						CorePtr->SetActorLocation(Pawn->GetActorLocation());
+						CorePtr->TryPickup(Pawn);
+						CorePtr->RequestPassInput(true, Pawn);
+						UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] re-armed the wind-up; carrier=%d"),
+							(int32)Pawn->IsCarrier());
+					}
+				}
+			}
+			// 0.40 s into a 0.8 s charge (spec v16 0) - the ring must read about HALF full, which is
+			// the one measurement that proves it sweeps LINEARLY IN TIME and not in momentum. A ring
+			// fed by GetThrowChargeScaleNow() would read ~0.58 here because of the 15% floor.
+			NextDelay = 0.40f;
+			break;
+
+		case 26:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("GREEN_ring_half"));
+			Expect(*Run, Record.bChargeRing, TEXT("GREEN: the throw charge draws as a RING around the crosshair"));
+			Expect(*Run, !Record.bChargeBar, TEXT("GREEN: the bottom-left charge BAR is gone"));
+			Expect(*Run, Record.ChargeRingChords > 0,
+				TEXT("GREEN: the ring emitted actual filled chords (a ring that computes an alpha and draws nothing is not a ring)"));
+			Expect(*Run, Record.ChargeRingAlpha > 0.35f && Record.ChargeRingAlpha < 0.75f,
+				TEXT("GREEN: 0.40 s into a 0.8 s charge the ring is about HALF full - it sweeps linearly in TIME, not in momentum"));
+			NextDelay = 0.7f;
+			break;
+		}
+
+		case 27:
+		{
+			const ATraceHUD::FV16DrawRecord Record = Shot(*Run, TEXT("GREEN_ring_full"));
+			Expect(*Run, Record.bChargeRing && Record.ChargeRingAlpha >= 0.999f,
+				TEXT("GREEN: past 0.8 s the ring reads 100% full"));
+			Expect(*Run, Record.ChargeRingChords == 48, TEXT("GREEN: a full ring emitted all 48 chords"));
+			NextDelay = 0.5f;
+			break;
+		}
+
+		case 199:
+			// A separate step so the receiver probe has run a frame before the hold is asked for.
+			if (ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>())
+			{
+				if (ATraceCore* CorePtr = GS->Core)
+				{
+					CorePtr->RequestPassInput(true, PawnOf(*Run));
+				}
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] mode A: pass hold requested; progress=%.3f"),
+				TracePC_PassProgress(*Run));
+			NextDelay = 0.25f;
+			break;
+
+		case 200:
+		{
+			// The mode A regression frame. Asserted on the CONTROLLER's pass progress rather than on
+			// the draw record, because the pass ring predates this pass and deliberately does not
+			// write one - what is being proven is that the shared geometry still draws for its
+			// original caller, and the frame is what shows that.
+			const float Progress = TracePC_PassProgress(*Run);
+			Shot(*Run, TEXT("MODEA_passring"));
+			Expect(*Run, Progress >= 0.f,
+				TEXT("MODE A REGRESSION: the pass hold is live, so DrawPassProgress drew the shared crosshair ring"));
+			Run->Step = 300;
+			NextDelay = 0.6f;
+			break;
+		}
+
+		default:
+		{
+			if (ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>())
+			{
+				if (ATraceCore* CorePtr = GS->Core)
+				{
+					CorePtr->RequestPassInput(false, PawnOf(*Run));
+				}
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] ===== VERDICT: %d passed, %d FAILED, %d NOT APPLICABLE HERE ====="),
+				Run->Passes.Num(), Run->Failures.Num(), Run->NotApplicable.Num());
+			for (const FString& Line : Run->NotApplicable)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[HUDV16]   N/A   %s"), *Line);
+			}
+			for (const FString& Line : Run->Passes)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[HUDV16]   PASS  %s"), *Line);
+			}
+			for (const FString& Line : Run->Failures)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[HUDV16]   FAIL  %s"), *Line);
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] ===== sequence complete: %s ====="),
+				Run->Failures.Num() == 0 ? TEXT("ALL GREEN") : TEXT("*** NOT A PASS ***"));
+			return false;
+		}
+		}
+
+		Schedule(Run, NextDelay);
+		return false;   // this ticker is done; Schedule installed the next one
+	}
+
+	FAutoConsoleCommandWithWorld CmdReport(
+		TEXT("Trace.HUD.V16.Report"),
+		TEXT("Spec v16 2. Prints WHAT THE LAST DRAWN HUD FRAME CONTAINED - the ammo string and tick "
+		     "count actually emitted, every status chip actually drawn, and the charge ring's chord "
+		     "count. Reads the draw record, never the gameplay state that fed it."),
+		FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* WorldPtr)
+		{
+			APlayerController* PC = FindLocalAuthorityPC(WorldPtr);
+			ATraceHUD* HudPtr = (PC != nullptr) ? Cast<ATraceHUD>(PC->GetHUD()) : nullptr;
+			if (HudPtr == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[HUDV16] no local ATraceHUD - nothing to report."));
+				return;
+			}
+			HudPtr->LogV16DrawRecord(TEXT("Report"));
+		}));
+
+	FAutoConsoleCommandWithWorld CmdShots(
+		TEXT("Trace.HUD.V16Shots"),
+		TEXT("Spec v16 2. Stages real gameplay state and photographs the bottom-right corner and the "
+		     "crosshair charge ring, RED ARM FIRST (Trace.HUD.V16 0, the superseded HUD) then the same "
+		     "fixture armed. Writes Saved/Screenshots/HudV16_*_pid<n>.png, asserts on the draw record "
+		     "beside every frame, and ends in a verdict. Listen server or standalone only; the ring "
+		     "needs a mode B world (?mode=b)."),
+		FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* WorldPtr)
+		{
+			APlayerController* PC = FindLocalAuthorityPC(WorldPtr);
+			if (PC == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[HUDV16] *** REFUSED: no local, authoritative player controller. This command stages "
+					     "server state and photographs a viewport, so it needs both in one process. ***"));
+				return;
+			}
+
+			ATraceHUD* HudPtr = Cast<ATraceHUD>(PC->GetHUD());
+			if (HudPtr == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[HUDV16] *** REFUSED: the local HUD is not an ATraceHUD. ***"));
+				return;
+			}
+
+			TSharedPtr<FRun> Run = MakeShared<FRun>();
+			Run->Hud = HudPtr;
+			Run->PC = PC;
+
+			const ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>();
+			Run->bModeB = (GS != nullptr) && GS->IsGoalMode();
+
+			Schedule(Run, 0.1f);
+		}));
+}
+
+#endif // !UE_BUILD_SHIPPING

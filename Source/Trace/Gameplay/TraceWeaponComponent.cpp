@@ -32,6 +32,7 @@
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
 #include "Movement/TraceCharacterMovementComponent.h"   // SetKnifeMovementProfileActive (spec v10 §1)
+#include "Gameplay/TraceCore.h"                        // spec v16 §1: the carrier has no gun and no ammo
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceHitZones.h"
 #include "Gameplay/TraceMelee.h"
@@ -99,6 +100,124 @@ static TAutoConsoleVariable<int32> CVarTraceShotStats(
 	0,
 	TEXT("1: accumulate the hit-zone / impact-height distribution for every server-accepted shot. Trace.ShotStats.Dump prints it."),
 	ECVF_Default);
+
+// =================================================================================================
+// AMMO — spec v16 §1. THREE ARMS, THREE SEPARATE SENTENCES THEY FALSIFY.
+//
+// None of these shares a name with a console COMMAND (that collision is fatal at module load in this
+// engine version): the commands are all verbs — Trace.Ammo.Dump, .Test, .CarrierTest, .BotWatch —
+// and these three are nouns.
+// =================================================================================================
+
+/**
+ * MASTER ARM. 0 makes the clip infinite and never reloads.
+ *
+ * It is the arm that falsifies "30 bullets per clip, then the gun reloads" as a whole: with it at 0
+ * a pawn can fire a hundred rounds without the count moving, which is exactly the build that existed
+ * before this pass. Trace.Ammo.Test's red arm uses it to prove its own measurement is measuring
+ * something.
+ */
+static TAutoConsoleVariable<int32> CVarAmmoEnabled(
+	TEXT("Trace.Ammo.Enabled"), 1,
+	TEXT("1 (shipped, spec v16 §1): 30 rounds per clip, auto-reload on empty, 0.5 s reload. "
+	     "0: the RED arm — the clip is infinite and nothing ever reloads."),
+	ECVF_Default);
+
+/**
+ * THE RELOAD GATE ARM. 0 lets a player fire straight through a reload.
+ *
+ * Separate from the master arm because "reloading takes .5 seconds" is only a rule if something is
+ * refused during it. With the master arm at 0 there is no reload to fire through and the sentence is
+ * untestable; with this one at 0 the reload still runs, still shows on the HUD and still refills —
+ * the only thing that changes is whether CanFire() says no. One variable.
+ */
+static TAutoConsoleVariable<int32> CVarAmmoReloadBlocksFire(
+	TEXT("Trace.Ammo.ReloadBlocksFire"), 1,
+	TEXT("1 (shipped): firing is refused for the whole 0.5 s reload. 0: the RED arm — the reload still "
+	     "runs and still refills, but the trigger works through it."),
+	ECVF_Default);
+
+/**
+ * THE PREDICTION ARM. 0 makes an owning client WAIT for the server's count instead of predicting it.
+ *
+ * Spec v16 §1 asks for "server-authoritative, client-predicted for feel — the local player must see
+ * the count drop on their own shot without waiting for a round trip", and a HOST-SIDE measurement
+ * cannot see a prediction bug by definition: on the authority the predicted path is not even taken.
+ * So the arm and its probe (Trace.Ammo.ClientPredictTest) both live on the CLIENT, and the arm turns
+ * the feature off without turning the ammo system off — with it at 0 the clip still empties, still
+ * reloads and is still authoritative, and the only thing that changes is WHEN the shooter's own
+ * number moves.
+ */
+static TAutoConsoleVariable<int32> CVarAmmoPredict(
+	TEXT("Trace.Ammo.Predict"), 1,
+	TEXT("1 (shipped): an owning client decrements its own clip on its own shot, before the server has "
+	     "heard about it. 0: the RED arm — the client waits for replication, so its count lags its own "
+	     "muzzle flash by a round trip."),
+	ECVF_Default);
+
+/**
+ * THE CARRIER ARM. 0 removes the carrier guard inside UTraceWeaponComponent::ConsumeRound.
+ *
+ * Spec v16 §1: "The Core carrier has no gun, so ammo must not be consumed or shown while carrying."
+ * The SHIPPED path cannot reach the consumption code with a carrier at all — CanFire() and
+ * ServerFire() both refuse one first — so this arm is about the SECOND lock, the one that survives a
+ * future caller reaching ConsumeRound another way. Trace.Ammo.CarrierTest drives that lock directly
+ * (see UTraceWeaponComponent::DebugConsumeRound) and checks the first lock separately.
+ */
+static TAutoConsoleVariable<int32> CVarAmmoCarrierGuard(
+	TEXT("Trace.Ammo.CarrierGuard"), 1,
+	TEXT("1 (shipped): a Core carrier's clip can never lose a round, even if something calls the "
+	     "consumption path directly. 0: the RED arm — the guard is removed and "
+	     "TraceAmmo::GetCarrierRoundsConsumed() moves."),
+	ECVF_Default);
+
+/**
+ * The ammo counters. File-static for the same reason UTraceHealthComponent's vulnerable alarms are:
+ * the facts being counted are about the RULES, not about any one pawn.
+ *
+ * The first must be zero for the life of a correct process. The rest are LIVENESS, and they are what
+ * lets a harness distinguish "the carrier rule held" from "nothing ever fired a shot".
+ */
+static int32 GAmmoCarrierRoundsConsumed = 0;
+static int32 GAmmoRoundsConsumed        = 0;
+static int32 GAmmoReloadsCompleted      = 0;
+static int32 GAmmoDryFireRefusals       = 0;
+static int32 GAmmoReloadFireRefusals    = 0;
+
+namespace TraceAmmo
+{
+	int32 GetClipSize()
+	{
+		// Derived from the knob, never hardcoded: spec v16 §1 says 30 and UTraceSettings::ClipSize
+		// says 30. Read it here so a designer retuning it live is obeyed by every caller at once.
+		return FMath::Clamp(UTraceSettings::Get().ClipSize, 1, 999);
+	}
+
+	float GetReloadSeconds()
+	{
+		return FMath::Clamp(UTraceSettings::Get().ReloadSeconds, 0.05f, 10.f);
+	}
+
+	bool IsEnabled()             { return CVarAmmoEnabled.GetValueOnAnyThread() != 0; }
+	bool DoesReloadBlockFire()   { return CVarAmmoReloadBlocksFire.GetValueOnAnyThread() != 0; }
+	bool IsCarrierGuardArmed()   { return CVarAmmoCarrierGuard.GetValueOnAnyThread() != 0; }
+	bool IsPredictionEnabled()   { return CVarAmmoPredict.GetValueOnAnyThread() != 0; }
+
+	int32 GetCarrierRoundsConsumed() { return GAmmoCarrierRoundsConsumed; }
+	int32 GetRoundsConsumed()        { return GAmmoRoundsConsumed; }
+	int32 GetReloadsCompleted()      { return GAmmoReloadsCompleted; }
+	int32 GetDryFireRefusals()       { return GAmmoDryFireRefusals; }
+	int32 GetReloadFireRefusals()    { return GAmmoReloadFireRefusals; }
+
+	void ResetCounters()
+	{
+		GAmmoCarrierRoundsConsumed = 0;
+		GAmmoRoundsConsumed = 0;
+		GAmmoReloadsCompleted = 0;
+		GAmmoDryFireRefusals = 0;
+		GAmmoReloadFireRefusals = 0;
+	}
+}
 
 static TAutoConsoleVariable<float> CVarTraceShotStatsInterval(
 	TEXT("Trace.ShotStats.Interval"),
@@ -276,11 +395,43 @@ void UTraceWeaponComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 	// having predicted the same value already makes the update a no-op, not a fight.
 	DOREPLIFETIME(UTraceWeaponComponent, EquippedWeapon);
 	DOREPLIFETIME(UTraceWeaponComponent, DeployEndServerTime);
+
+	// --- AMMO (spec v16 §1) ---------------------------------------------------------------------
+	//
+	// COND_OwnerOnly, and that is the OPPOSITE choice from the two above, deliberately. The selector
+	// has to be on every machine because the movement component reads it on every machine; ammo is
+	// read by exactly one thing — the owning player's own HUD, in the bottom right. Nothing in this
+	// game draws another player's ammo, nothing gates on it, and the third-person rig has no
+	// magazine to show. Sending four bytes per pawn to every client for a number none of them can
+	// see would be a pure bandwidth cost.
+	//
+	// *** THE CONSEQUENCE, STATED SO THE NEXT READER DOES NOT HAVE TO FIND IT: *** on a simulated
+	// proxy these stay at their defaults forever. GetClipAmmo() says so; do not build "he's out of
+	// ammo, push him" on another pawn's count without widening this condition first.
+	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, ClipAmmo,            COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, ClipSerial,          COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, AbilityRoundsInClip, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, ReloadEndServerTime, COND_OwnerOnly);
 }
 
 void UTraceWeaponComponent::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// --- AMMO: the pawn starts with a full clip (spec v16 §1) ------------------------------------
+	//
+	// *** BEFORE THE EARLY RETURN BELOW, AND THAT ORDER IS LOAD-BEARING. *** Everything after this
+	// block is about the local human's camera boom and bails out for a bot, a proxy and a dedicated
+	// server's copy of anybody. Seeding the clip down there would have left every bot in the match
+	// with ClipAmmo at its class default of 0 — thirty players unable to fire a single round, which
+	// is a bug that would have read as "the ammo system broke the bots".
+	//
+	// Authority only: a client receives the count by replication, and a local write here would just
+	// be a number it briefly believed in before the server told it otherwise.
+	if (const AActor* AmmoOwner = GetOwner(); AmmoOwner != nullptr && AmmoOwner->HasAuthority())
+	{
+		RefillClip(TraceAmmo::GetClipSize(), 0);
+	}
 
 	// -------------------------------------------------------------------------------------------
 	// TICK ORDER, AND THE ONE-FRAME CAMERA LAG IT FIXES.
@@ -399,6 +550,30 @@ bool UTraceWeaponComponent::CanFire() const
 		return false;
 	}
 
+	// --- SPEC v16 §1: AMMO. "30 bullets per clip, then the gun reloads." -------------------------
+	//
+	// TWO REFUSALS, NOT ONE, AND THEY ARE COUNTED SEPARATELY. An empty clip and a running reload feel
+	// identical through the trigger and mean completely different things to anyone reading a log: the
+	// first says the automatic reload has not started yet (or has been cancelled), the second says it
+	// is doing its job. A single "no ammo" counter would have made those indistinguishable, which is
+	// the shape of the bug where a gun stops working and nobody can say why.
+	//
+	// Both sit BELOW the dash/pullout/knife gates on purpose, so the counters only move for a shot
+	// that ammo was genuinely the reason for.
+	if (TraceAmmo::IsEnabled())
+	{
+		if (GetClipAmmo() <= 0)
+		{
+			++GAmmoDryFireRefusals;
+			return false;
+		}
+		if (TraceAmmo::DoesReloadBlockFire() && IsReloading())
+		{
+			++GAmmoReloadFireRefusals;
+			return false;
+		}
+	}
+
 	const double FireInterval = FMath::Max(0.01f, UTraceSettings::Get().FireInterval);
 	return (GetLocalTimeSeconds() - LastLocalFireTime) >= FireInterval;
 }
@@ -457,6 +632,477 @@ void UTraceWeaponComponent::StartFire()
 	}
 }
 
+// =================================================================================================
+// AMMO  (spec v16 §1)
+//
+//     press    -> CanFire            refuses an empty clip and a running reload
+//     shot     -> ConsumeRound       one round, on the machine that owns the decision
+//     empty    -> BeginReload        anchored at the SHOT, so both ends compute one deadline
+//     +0.5s    -> RefillClip         30 ordinary rounds, and the serial moves
+//     R        -> RequestReload      predicted locally, stamped, re-gated on the server
+//
+// The state, the prediction split and the reasoning behind each field are on the header. This is the
+// state machine.
+// =================================================================================================
+
+int32 UTraceWeaponComponent::GetClipAmmo() const
+{
+	const AActor* OwnerActor = GetOwner();
+	if (OwnerActor != nullptr && OwnerActor->HasAuthority())
+	{
+		// The truth, and the only reading that matters for a bot, a listen host's own pawn, or a
+		// remote client's pawn as the server sees it.
+		return static_cast<int32>(ClipAmmo);
+	}
+
+	// A remote owning client. -1 means the first replication has not arrived yet, in which case the
+	// replicated field is still the best answer available (and is the class default until then).
+	return (PredictedClipAmmo >= 0) ? PredictedClipAmmo : static_cast<int32>(ClipAmmo);
+}
+
+int32 UTraceWeaponComponent::GetAbilityRoundsInClip() const
+{
+	return static_cast<int32>(AbilityRoundsInClip);
+}
+
+bool UTraceWeaponComponent::IsReloading() const
+{
+	// The SHARED clock, exactly as IsDeploying() uses it, and for the same reason: this deadline is
+	// computed on one machine and honoured on two, so it has to be expressed in the one clock they
+	// agree on. (The fire-RATE gate deliberately uses the local clock instead — a clock resync must
+	// never be able to stall the trigger. A reload is a replicated deadline; a fire rate is not.)
+	return ReloadEndServerTime > 0.f && GetServerTimeSeconds() < static_cast<double>(ReloadEndServerTime);
+}
+
+float UTraceWeaponComponent::GetReloadRemaining() const
+{
+	if (ReloadEndServerTime <= 0.f)
+	{
+		return 0.f;
+	}
+	return static_cast<float>(FMath::Max(0.0, static_cast<double>(ReloadEndServerTime) - GetServerTimeSeconds()));
+}
+
+bool UTraceWeaponComponent::ShouldShowAmmo() const
+{
+	const ATraceCharacter* Character = GetTraceCharacter();
+	if (Character == nullptr || !Character->IsAlive())
+	{
+		return false;
+	}
+
+	// *** SPEC v16 §1: "The Core carrier has no gun, so ammo must not be consumed or shown while
+	// carrying." *** The HUD asks this rather than asking IsCarrier() itself, so that the "has no
+	// gun" rule has ONE definition. The consumption half of the same sentence is enforced twice over
+	// — CanFire()/ServerFire() refuse a carrier, and ConsumeRound carries its own guard.
+	if (Character->IsCarrier())
+	{
+		return false;
+	}
+
+	// The knife has no magazine. Drawing "30" beside a blade would be worse than drawing nothing.
+	return !IsKnifeEquipped();
+}
+
+void UTraceWeaponComponent::ConsumeRound()
+{
+	if (!TraceAmmo::IsEnabled())
+	{
+		// THE RED ARM. The clip never falls, so nothing ever empties and nothing ever reloads — the
+		// build that existed before spec v16 §1, reachable in one CVar.
+		return;
+	}
+
+	// *** SPEC v16 §1 / v14 §4, THE SECOND CARRIER LOCK. ***
+	//
+	// CanFire() and ServerFire() both refuse a carrier before a shot can ever reach this function, so
+	// in the shipped build this branch is unreachable — which is exactly the argument
+	// UTraceHealthComponent::ApplyVulnerable makes for ITS second carrier lock, and exactly why that
+	// one exists: the rule has to survive a future caller who reaches the consumption path another
+	// way. Both predicates are asked (the Core's authoritative pointer AND the pawn's replicated
+	// mirror) so that a frame in which the two disagree cannot open the door.
+	const ATraceCharacter* Character = GetTraceCharacter();
+	const bool bCarrying = Character != nullptr
+		&& (ATraceCore::IsCoreHolder(Character) || Character->IsCarrier());
+	if (bCarrying)
+	{
+		if (TraceAmmo::IsCarrierGuardArmed())
+		{
+			return;
+		}
+
+		// The red arm reached a carrier. Counted and logged as an Error so a harness can prove the
+		// arm actually disarmed something rather than reporting a green that had no rule to break.
+		++GAmmoCarrierRoundsConsumed;
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[Ammo] *** A ROUND WAS SPENT FROM THE CORE CARRIER %s's CLIP (round #%d). Spec v16 §1: the "
+			     "carrier has no gun. This is only reachable with Trace.Ammo.CarrierGuard 0."),
+			*GetNameSafe(GetOwner()), GAmmoCarrierRoundsConsumed);
+	}
+
+	const AActor* OwnerActor = GetOwner();
+	const bool bAuthority = (OwnerActor != nullptr && OwnerActor->HasAuthority());
+
+	bLastRoundWasAbilityRound = false;
+
+	if (bAuthority)
+	{
+		if (ClipAmmo == 0)
+		{
+			return;
+		}
+		--ClipAmmo;
+
+		// The ability-loaded rounds are spent FIRST and are simply the front of the clip. Recording
+		// which kind of round just left is what lets UTraceAbilitySetX::NotifyBulletHit answer "was
+		// that a bee round" a few statements later in ServerFire — including for the fifth and last
+		// one, where "are there any left" would already say no.
+		if (AbilityRoundsInClip > 0)
+		{
+			--AbilityRoundsInClip;
+			bLastRoundWasAbilityRound = true;
+		}
+
+		++TotalRoundsConsumed;
+		++GAmmoRoundsConsumed;
+		return;
+	}
+
+	// A predicting client. Seed from the replicated truth on the first shot of the connection, so a
+	// player who fires before their first ammo update does not start from -1.
+	if (PredictedClipAmmo < 0)
+	{
+		PredictedClipAmmo = static_cast<int32>(ClipAmmo);
+	}
+	PredictedClipAmmo = FMath::Max(0, PredictedClipAmmo - 1);
+	bLastRoundWasAbilityRound = (AbilityRoundsInClip > 0);
+
+	// Counted on a client too, and the counter means something slightly different there: PREDICTED
+	// rounds rather than spent ones. Said out loud because a client-side Trace.Ammo.Dump would
+	// otherwise look like it was reporting authoritative numbers.
+	++GAmmoRoundsConsumed;
+}
+
+void UTraceWeaponComponent::RefillClip(int32 Rounds, int32 AbilityRounds)
+{
+	const AActor* OwnerActor = GetOwner();
+	if (OwnerActor == nullptr || !OwnerActor->HasAuthority())
+	{
+		// Clients receive a refill by replication and predict their own through TickReload. A local
+		// write here would be a number they briefly believed in before the server contradicted it.
+		return;
+	}
+
+	const int32 NewRounds = FMath::Clamp(Rounds, 0, 255);
+	ClipAmmo = static_cast<uint8>(NewRounds);
+	AbilityRoundsInClip = static_cast<uint8>(FMath::Clamp(AbilityRounds, 0, NewRounds));
+	ReloadEndServerTime = -1.f;
+
+	// *** THE SERIAL IS THE POINT OF THIS FUNCTION. *** It is what tells an owning client "this is a
+	// NEW clip, throw your prediction away" as distinct from "I am simply behind your shots". Without
+	// it, OnRep_Ammo could not tell a refill from a stale packet and would have to choose between
+	// refusing refills and refunding bullets. Wraps at 255, which is harmless — the reconcile only
+	// ever asks whether it CHANGED, never by how much.
+	++ClipSerial;
+
+	// Deliberately does NOT call OnRep_Ammo() by hand, which is the opposite of what this project
+	// does for Health and the vulnerable mark. Those OnReps do presentation work every machine needs;
+	// this one only reconciles the CLIENT's prediction mirror, and the authority has no mirror to
+	// reconcile — it reads ClipAmmo directly (see GetClipAmmo).
+}
+
+void UTraceWeaponComponent::BeginReload(double AnchorSharedTime)
+{
+	if (!TraceAmmo::IsEnabled())
+	{
+		return;
+	}
+
+	const double Now = GetServerTimeSeconds();
+
+	// *** THE CLAMP IS THE SECURITY, AND ITS COST IS WORTH STATING IN NUMBERS. ***
+	//
+	// The anchor comes from the machine that pressed the key or fired the shot, so it is client data
+	// and is pinned into [Now - MaxRewindTime, Now] exactly as ServerFire pins a shot's timestamp:
+	// never in the future, so a reload cannot be pre-booked, and never further back than a bullet may
+	// be rewound.
+	//
+	// What a liar buys with the full 0.25 s of back-dating is half a reload. Against a 30-round clip
+	// at FireInterval 0.40 that is 0.25 s off a 12.5 s cycle — about 2% more sustained DPS, which is
+	// an order of magnitude less than the 20% the fire-rate gate already forgives honest jitter
+	// (FireRateTolerance). Anchoring is what stops a 40 ms client's reload from actually taking
+	// 0.54 s, which is a 9% error in one of the three numbers spec v16 §1 gives; refusing to anchor
+	// to avoid a 2% exploit would be trading a real defect for a smaller one.
+	const double MaxRewind = FMath::Max(0.f, UTraceSettings::Get().MaxRewindTime);
+	const double Anchor = FMath::Clamp(AnchorSharedTime, Now - MaxRewind, Now);
+
+	ReloadEndServerTime = static_cast<float>(Anchor + static_cast<double>(TraceAmmo::GetReloadSeconds()));
+	bPredictedRefillPending = false;
+}
+
+void UTraceWeaponComponent::CancelReload()
+{
+	ReloadEndServerTime = -1.f;
+	bPredictedRefillPending = false;
+}
+
+void UTraceWeaponComponent::TickReload()
+{
+	const AActor* OwnerActor = GetOwner();
+	ATraceCharacter* Character = GetTraceCharacter();
+	if (OwnerActor == nullptr || Character == nullptr)
+	{
+		return;
+	}
+
+	const bool bAuthority = OwnerActor->HasAuthority();
+
+	// A SIMULATED PROXY OWNS NO AMMO DECISION AT ALL. It has no replicated count (COND_OwnerOnly), so
+	// letting it run this state machine would have it "reloading" a clip it cannot see, on numbers
+	// that are class defaults. Authority decides; the owning client predicts; everyone else watches.
+	if (!bAuthority && !Character->IsLocallyControlled())
+	{
+		return;
+	}
+
+	if (!TraceAmmo::IsEnabled())
+	{
+		// THE RED ARM: the mechanic is ABSENT, not half-present. Any reload already in flight is
+		// abandoned rather than left to complete, so a red run cannot report a reload it inherited
+		// from the green build that preceded it.
+		if (ReloadEndServerTime > 0.f)
+		{
+			CancelReload();
+		}
+		return;
+	}
+
+	// --- THE TWO CANCELLATIONS. Spec v16 §1 [ASSUMPTION]: "reloading is cancelled by death and by
+	//     picking up the Core." ---------------------------------------------------------------------
+	const bool bDead = !Character->IsAlive();
+	const bool bCarrying = Character->IsCarrier();
+	if (bDead || bCarrying)
+	{
+		if (ReloadEndServerTime > 0.f)
+		{
+			CancelReload();
+		}
+
+		// A NEW LIFE STARTS WITH A FULL CLIP, and it is done from the death side rather than from a
+		// respawn hook because this component has no respawn hook to hang it on — ATraceCharacter is
+		// another ownership slice. Refilling while dead is equivalent and needs nothing from anyone
+		// else. The guard is what keeps it from bumping the serial (and therefore replicating) sixty
+		// times a second for the whole respawn countdown.
+		if (bAuthority && bDead
+			&& (static_cast<int32>(ClipAmmo) != TraceAmmo::GetClipSize() || AbilityRoundsInClip != 0))
+		{
+			RefillClip(TraceAmmo::GetClipSize(), 0);
+		}
+		return;
+	}
+
+	// --- COMPLETION --------------------------------------------------------------------------------
+	if (ReloadEndServerTime > 0.f && GetServerTimeSeconds() >= static_cast<double>(ReloadEndServerTime))
+	{
+		if (bAuthority)
+		{
+			RefillClip(TraceAmmo::GetClipSize(), 0);
+			++TotalReloadsCompleted;
+			++GAmmoReloadsCompleted;
+
+			UE_LOG(LogTraceGame, Verbose, TEXT("[Ammo] %s reloaded: %d rounds."),
+				*GetNameSafe(GetOwner()), TraceAmmo::GetClipSize());
+		}
+		else
+		{
+			// THE PREDICTED REFILL. The client's gun comes back up on ITS deadline rather than a ping
+			// later, and bPredictedRefillPending is what stops the server's last pre-refill packet
+			// from yanking the count back to empty for that ping — see OnRep_Ammo.
+			PredictedClipAmmo = TraceAmmo::GetClipSize();
+			bPredictedRefillPending = true;
+			ReloadEndServerTime = -1.f;
+			++GAmmoReloadsCompleted;
+		}
+	}
+
+	// --- THE AUTOMATIC RELOAD. "30 bullets per clip, then the gun reloads." ------------------------
+	//
+	// The ordinary path starts this at the SHOT that emptied the clip (ServerFire / FireOnce), which
+	// is what gets both machines onto one deadline. This is the safety net for every other way a pawn
+	// can end up standing there with an empty gun: a reload cancelled by picking up the Core and then
+	// passing it on, a death mid-reload, a clip emptied by something other than the trigger.
+	//
+	// *** IT IS ALSO THE WHOLE OF "BOTS MUST RELOAD". *** A bot's pawn is authoritative and locally
+	// controlled in the same process, so it runs this identical branch. There is not one line of AI
+	// code in the ammo feature, and a bot that dry-fires forever is impossible by construction rather
+	// than by a rule somebody remembered to add to the bot controller.
+	if (GetClipAmmo() <= 0 && !IsReloading() && !IsKnifeEquipped())
+	{
+		BeginReload(GetServerTimeSeconds());
+	}
+}
+
+bool UTraceWeaponComponent::RequestReload()
+{
+	const AActor* OwnerActor = GetOwner();
+	ATraceCharacter* Character = GetTraceCharacter();
+	if (OwnerActor == nullptr || Character == nullptr || !TraceAmmo::IsEnabled())
+	{
+		return false;
+	}
+
+	// Every refusal below is a rule; see the header for why each one is where it is.
+	if (!Character->IsAlive() || Character->IsCarrier())
+	{
+		return false;
+	}
+	if (IsKnifeEquipped() || IsDeploying())
+	{
+		return false;
+	}
+	if (IsReloading())
+	{
+		return false;
+	}
+	if (GetClipAmmo() >= TraceAmmo::GetClipSize())
+	{
+		// A FULL CLIP: NOTHING AT ALL. [ASSUMPTION], spec v16 §1. Restarting the timer instead would
+		// let a player weld their own gun shut for half a second by leaning on R, which no shooter
+		// does and which would read as the bind being broken.
+		return false;
+	}
+
+	// *** AN ABILITY-LOADED CLIP IS NOT MANUALLY RELOADABLE. [ASSUMPTION], spec v16 §1. ***
+	//
+	// X's Sting puts five bee rounds in the gun off a 25 s cooldown, and R would otherwise throw them
+	// on the floor on a mis-press — a whole ability lost to a reflex, with no undo and no feedback.
+	// The spec's own sentence assumes they get FIRED ("after shooting those, his next reload is
+	// normal"), so refusing here is the reading that matches it. Reverse it by deleting this block if
+	// playtesting wants a dump.
+	if (AbilityRoundsInClip > 0)
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Ammo] %s: manual reload refused — the clip holds %d ability round(s) and they must be fired."),
+			*GetNameSafe(GetOwner()), static_cast<int32>(AbilityRoundsInClip));
+		return false;
+	}
+
+	const double PressTime = GetServerTimeSeconds();
+
+	if (OwnerActor->HasAuthority())
+	{
+		BeginReload(PressTime);
+		return true;
+	}
+
+	if (!Character->IsLocallyControlled())
+	{
+		// A proxy copy of somebody else's pawn. Input is a local concept.
+		return false;
+	}
+
+	// Predict, then ask. Both ends anchor at PressTime, so the server's copy of the deadline arrives
+	// as a no-op rather than as an extension.
+	BeginReload(PressTime);
+	ServerRequestReload(static_cast<float>(PressTime));
+	return true;
+}
+
+bool UTraceWeaponComponent::ServerRequestReload_Validate(float ClientPressServerTime)
+{
+	// Validation failure disconnects the client, so only reject what is impossible to reason about.
+	return FMath::IsFinite(ClientPressServerTime);
+}
+
+void UTraceWeaponComponent::ServerRequestReload_Implementation(float ClientPressServerTime)
+{
+	const AActor* OwnerActor = GetOwner();
+	ATraceCharacter* Character = GetTraceCharacter();
+	if (OwnerActor == nullptr || Character == nullptr || !OwnerActor->HasAuthority())
+	{
+		return;
+	}
+	if (!TraceAmmo::IsEnabled())
+	{
+		return;
+	}
+
+	// RE-GATED FROM SCRATCH, never trusted. The client gated on its own copy of all of this before it
+	// sent the RPC; that gate is for FEEL, this one is the rule. A client that has been corrected
+	// into a state where the reload is illegal simply gets nothing.
+	if (!Character->IsAlive() || Character->IsCarrier() || IsKnifeEquipped() || IsDeploying())
+	{
+		return;
+	}
+	if (IsReloading() || ClipAmmo >= static_cast<uint8>(TraceAmmo::GetClipSize()) || AbilityRoundsInClip > 0)
+	{
+		return;
+	}
+
+	BeginReload(static_cast<double>(ClientPressServerTime));
+}
+
+void UTraceWeaponComponent::LoadAbilityClip(int32 RoundCount)
+{
+	const AActor* OwnerActor = GetOwner();
+	if (OwnerActor == nullptr || !OwnerActor->HasAuthority())
+	{
+		return;
+	}
+
+	// REPLACES, never adds — spec v16 §1's [ASSUMPTION], stated there: "Sting overwrites whatever was
+	// in the clip (20 rounds left -> 5 bee rounds)". RefillClip clears any running reload too, so an
+	// ability cast during a reload puts the gun up immediately instead of stranding the player behind
+	// a timer they can no longer see the point of.
+	const int32 Rounds = FMath::Clamp(RoundCount, 0, TraceAmmo::GetClipSize());
+	RefillClip(Rounds, Rounds);
+
+	UE_LOG(LogTraceGame, Log, TEXT("[Ammo] %s: the clip is now %d ability round(s)."),
+		*GetNameSafe(GetOwner()), Rounds);
+}
+
+void UTraceWeaponComponent::OnRep_Ammo()
+{
+	// CLIENTS ONLY (replication callbacks never fire on the authority), and its whole job is to
+	// reconcile the prediction mirror with the truth. Three cases, and the third is the interesting
+	// one.
+	if (PredictedClipAmmo < 0)
+	{
+		// First update of the connection. Adopt everything; there is nothing predicted to protect.
+		PredictedClipAmmo = static_cast<int32>(ClipAmmo);
+		PredictedClipSerial = ClipSerial;
+		bPredictedRefillPending = false;
+		return;
+	}
+
+	if (ClipSerial != PredictedClipSerial)
+	{
+		// A NEW CLIP. The server reloaded, an ability replaced the clip, or this pawn respawned. The
+		// prediction is about a magazine that no longer exists, so it is discarded outright.
+		PredictedClipSerial = ClipSerial;
+		PredictedClipAmmo = static_cast<int32>(ClipAmmo);
+		bPredictedRefillPending = false;
+		return;
+	}
+
+	if (bPredictedRefillPending)
+	{
+		// We have finished a reload the server has not told us about yet, so every packet still in
+		// flight describes the OLD, nearly empty clip under the OLD serial. Taking it would drop the
+		// count back to 1 or 2 for a ping — at the exact moment the player is reading the number to
+		// decide whether to re-engage. Wait for the serial to move.
+		return;
+	}
+
+	// SAME CLIP, and our shots are ahead of the server's knowledge of them, so the server's count can
+	// only be >= ours. Take the LOWER: a stale packet must never hand a round back. The cost of being
+	// wrong here is that a shot the server REJECTED (rate limit, a state change) leaves the client one
+	// round pessimistic until the next refill re-seats both — which is the right direction to be
+	// wrong in, because it can only ever make the client reload early, never fire a round the server
+	// will not honour.
+	PredictedClipAmmo = FMath::Min(PredictedClipAmmo, static_cast<int32>(ClipAmmo));
+}
+
 void UTraceWeaponComponent::StopFire()
 {
 	// The tick is NOT switched off here, and as of the knife it is never switched off at all — see
@@ -494,6 +1140,14 @@ void UTraceWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 		RecordFacingSample(static_cast<float>(GetServerTimeSeconds()));
 		TickBotKnife();
 	}
+
+	// --- AMMO: the reload state machine (spec v16 §1) ---------------------------------------------
+	//
+	// DELIBERATELY ABOVE THE locally-controlled GATE. The server has to run this for every pawn it
+	// owns, and most of those — every remote human — are not locally controlled here. Putting it
+	// below would have left exactly the players with the worst latency as the ones whose guns never
+	// reloaded. TickReload decides for itself which machines own a decision.
+	TickReload();
 
 	// --- EVERY MACHINE: the knife's movement profile ---------------------------------------------
 	//
@@ -780,6 +1434,32 @@ void UTraceWeaponComponent::FireOnce()
 		++TraceShotStats::GStats.LocalShotsFired;
 	}
 
+	// --- AMMO: the CLIENT-PREDICTED half (spec v16 §1) -------------------------------------------
+	//
+	// *** ONLY OFF THE AUTHORITY, AND THAT CONDITION IS NOT AN OPTIMISATION. *** On a listen host's
+	// own pawn and on every bot, this function and ServerFire_Implementation both run in this same
+	// process — ServerFire is a local call there, not an RPC — so consuming in both would spend two
+	// rounds per trigger pull and halve the clip. Each machine consumes on exactly one side of that
+	// pair: the authority in ServerFire, a remote client here.
+	//
+	// The count therefore drops on the shooter's HUD in the same frame as the muzzle flash, which is
+	// the "client-predicted for feel" half of §1, and the server's copy arrives ~RTT/2 later and
+	// reconciles through OnRep_Ammo rather than overwriting.
+	const AActor* FireOwner = GetOwner();
+	if ((FireOwner == nullptr || !FireOwner->HasAuthority()) && TraceAmmo::IsPredictionEnabled())
+	{
+		ConsumeRound();
+
+		// The automatic reload, anchored at THIS SHOT rather than at "now". The server anchors its own
+		// at the same (clamped) stamp when it processes the same round, so both machines compute one
+		// deadline — without that, a 40 ms client would come off a 0.5 s reload and find the server
+		// still refusing to fire for another 40 ms, every single clip.
+		if (TraceAmmo::IsEnabled() && GetClipAmmo() <= 0 && !IsReloading())
+		{
+			BeginReload(FireServerTime);
+		}
+	}
+
 	const FVector Origin = Character->GetMuzzleLocation();
 	FVector Dir = Character->GetAimDirection().GetSafeNormal();
 	if (Dir.IsNearlyZero())
@@ -1022,6 +1702,38 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 		return;
 	}
 
+	// ---- AMMO (spec v16 §1): the SERVER's copy of the gate the client fired through ---------
+	//
+	// The client gated on its own predicted clip before it sent this; that gate is for feel, and a
+	// modified client simply would not run it. Re-asked here, this is the rule — without it "30
+	// bullets per clip" would be a client-side suggestion.
+	if (TraceAmmo::IsEnabled())
+	{
+		if (ClipAmmo == 0)
+		{
+			UE_LOG(LogTraceGame, Verbose, TEXT("ServerFire: %s fired on an empty clip"), *GetNameSafe(OwnerActor));
+			if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedState; }
+			return;
+		}
+
+		// THE GRACE EXISTS FOR CLOCK ESTIMATION, NOT FOR CHEATS, and it is the same argument
+		// FireRateTolerance makes. Both ends anchor the reload at one stamped instant, so they agree
+		// to within each machine's error in its estimate of the shared clock — tens of milliseconds.
+		// Refusing a shot inside that error would drop the first round of a burst after every single
+		// reload, for honest players only. What 50 ms of forgiveness buys a liar is one extra round
+		// per reload at most, because the fire-rate gate is 0.32 s wide.
+		constexpr double ReloadGateGraceSeconds = 0.05;
+		if (TraceAmmo::DoesReloadBlockFire()
+			&& ReloadEndServerTime > 0.f
+			&& GetServerTimeSeconds() < static_cast<double>(ReloadEndServerTime) - ReloadGateGraceSeconds)
+		{
+			UE_LOG(LogTraceGame, Verbose, TEXT("ServerFire: %s fired %.3fs into a reload"),
+				*GetNameSafe(OwnerActor), TraceAmmo::GetReloadSeconds() - GetReloadRemaining());
+			if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedState; }
+			return;
+		}
+	}
+
 	const UTraceSettings& Settings = UTraceSettings::Get();
 
 	// ---- fire rate, with slack for honest jitter -----------------------------------------
@@ -1046,6 +1758,18 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 		// we only ever look back at most MaxRewindTime and never forward at all.
 		const double MaxRewind = FMath::Max(0.f, Settings.MaxRewindTime);
 		RewindTime = FMath::Clamp(static_cast<double>(ClientFireServerTime), ServerNow - MaxRewind, ServerNow);
+	}
+
+	// ---- AMMO: the AUTHORITATIVE round, spent (spec v16 §1) --------------------------------
+	//
+	// After the rate gate (so a rejected shot costs nothing) and after RewindTime is resolved (so the
+	// automatic reload can be anchored at the same clamped instant the bullet is resolved at, which is
+	// the same instant the client anchored ITS predicted reload at in FireOnce). Before the trace,
+	// because a round leaves the gun whether or not it finds anybody.
+	ConsumeRound();
+	if (TraceAmmo::IsEnabled() && ClipAmmo == 0 && !IsReloading())
+	{
+		BeginReload(RewindTime);
 	}
 
 	// ---- muzzle sanity, measured against where the shooter *was* --------------------------
@@ -3910,6 +4634,1275 @@ namespace TraceKnifeTest
 			const float DelaySeconds = (Args.Num() > 1) ? FMath::Max(0.f, FCString::Atof(*Args[1])) : 0.f;
 			Run(SwingSeconds, DelaySeconds);
 		}));
+}
+
+// =================================================================================================
+// AMMO'S SELF-TESTS  (spec v16 §1)
+//
+//   Trace.Ammo.Dump         what this process actually resolved, plus the live state of the local
+//                           pawn's clip. The .ini can win over the header, so this is the only
+//                           honest way to read the numbers.
+//
+//   Trace.Ammo.Test         the mechanic. RED ARM FIRST (Trace.Ammo.Enabled 0): the clip must refuse
+//                           to fall, or the green arm's arithmetic is a measurement of nothing.
+//                           Then: one round per shot THROUGH THE REAL TRIGGER, the automatic reload
+//                           at zero, fire refused for the whole 0.5 s (with Trace.Ammo.ReloadBlocksFire
+//                           0 as its own A/B), the refill to a full clip, and the manual R rules.
+//
+//   Trace.Ammo.CarrierTest  *** "The Core carrier has no gun, so ammo must not be consumed or shown
+//                           while carrying." *** Both locks, red-armed, plus a live non-carrier
+//                           CONTROL — a clip that cannot be moved at all would otherwise report the
+//                           carrier rule holding when nothing had been tested.
+//
+//   Trace.Ammo.BotWatch     "Bots must respect it and reload; a bot that dry-fires forever will read
+//                           as broken." Watches every bot's real clip for N seconds and reports what
+//                           it saw. INVALID rather than PASS when the bots did not fire enough to
+//                           make the question meaningful.
+//
+// TWO WAYS OF DRIVING A SHOT, AND EACH IS USED WHERE IT IS HONEST.
+//   * THE REAL TRIGGER (StartFire, and the component's own tick) is used to prove the shipping path
+//     spends exactly one round per shot. It is the only thing that proves the input path is wired.
+//   * THE CONSUMPTION FUNCTION (DebugConsumeRound) is used for the parts a real trigger cannot
+//     reach in reasonable time or at all: emptying a 30-round clip would take 12 s of live fire in a
+//     match where a bot may kill the subject halfway through, and the carrier's ConsumeRound guard
+//     is by construction unreachable through the trigger, because CanFire() refuses a carrier first.
+//     Both drive the SAME function a shot drives; neither invents a number.
+// =================================================================================================
+
+namespace TraceAmmoTest
+{
+	IConsoleVariable* FindArm(const TCHAR* Name)
+	{
+		return IConsoleManager::Get().FindConsoleVariable(Name);
+	}
+
+	void SetArm(const TCHAR* Name, int32 Value)
+	{
+		if (IConsoleVariable* Var = FindArm(Name))
+		{
+			Var->Set(Value, ECVF_SetByConsole);
+		}
+	}
+
+	/** Every arm these commands touch, back to shipped. Called on EVERY exit path, aborts included. */
+	void RestoreArms()
+	{
+		SetArm(TEXT("Trace.Ammo.Enabled"), 1);
+		SetArm(TEXT("Trace.Ammo.ReloadBlocksFire"), 1);
+		SetArm(TEXT("Trace.Ammo.CarrierGuard"), 1);
+	}
+
+	/** The project's usual checklist, so a FAIL is impossible to skim past in a headless log. */
+	struct FChecklist
+	{
+		const TCHAR* Tag = TEXT("AMMO");
+		int32 Passed = 0;
+		int32 Failed = 0;
+		bool  bInvalid = false;
+		FString InvalidReason;
+
+		void Check(bool bCondition, const FString& Name, const FString& Detail)
+		{
+			if (bCondition) { ++Passed; } else { ++Failed; }
+			UE_LOG(LogTraceGame, Display, TEXT("[%s] %s  %s  |  %s"),
+				Tag, bCondition ? TEXT("PASS") : TEXT("*** FAIL ***"), *Name, *Detail);
+		}
+
+		void Invalidate(const FString& Reason)
+		{
+			bInvalid = true;
+			InvalidReason = Reason;
+		}
+
+		void Report()
+		{
+			if (bInvalid)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[%s] VERDICT: INVALID — %s (%d passed, %d failed)"),
+					Tag, *InvalidReason, Passed, Failed);
+			}
+			else if (Failed == 0)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[%s] VERDICT: PASS — %d checks, 0 failed."), Tag, Passed);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[%s] VERDICT: *** FAIL *** — %d passed, %d FAILED."),
+					Tag, Passed, Failed);
+			}
+		}
+	};
+
+	UWorld* FindAuthoritativeWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* Candidate = Context.World();
+			if (Candidate != nullptr && Candidate->IsGameWorld() && Candidate->GetAuthGameMode() != nullptr)
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * A pawn this harness may drive: alive, holding the gun, not carrying the Core, LOCALLY
+	 * CONTROLLED (StartFire refuses anything else — input is a local concept) and authoritative.
+	 *
+	 * The local human first, then any bot. A human is the better subject in a headless run because
+	 * nothing else is steering them: a bot's own TickBotKnife would draw the blade the moment an
+	 * enemy came within BotEngageRangeUU and quietly turn "the clip did not fall" into a true
+	 * statement about a pawn holding a knife.
+	 */
+	ATraceCharacter* FindDrivableSubject(UWorld* World)
+	{
+		auto IsUsable = [](const ATraceCharacter* Candidate) -> bool
+		{
+			return Candidate != nullptr && Candidate->IsAlive() && !Candidate->IsCarrier()
+				&& Candidate->Weapon != nullptr && !Candidate->Weapon->IsKnifeEquipped()
+				&& Candidate->IsLocallyControlled() && Candidate->HasAuthority();
+		};
+
+		if (const APlayerController* PC = World->GetFirstPlayerController())
+		{
+			if (ATraceCharacter* HumanPawn = Cast<ATraceCharacter>(PC->GetPawn()); IsUsable(HumanPawn))
+			{
+				return HumanPawn;
+			}
+		}
+
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			if (ATraceCharacter* Candidate = *It; IsUsable(Candidate))
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	}
+
+	/** True when @p Character is driven by AI rather than by a human. Used by Trace.Ammo.BotWatch. */
+	bool IsBotControlled(const ATraceCharacter* Character)
+	{
+		const AController* Controller = (Character != nullptr) ? Character->GetController() : nullptr;
+		return Controller != nullptr && Cast<const APlayerController>(Controller) == nullptr;
+	}
+
+	// =============================================================================================
+	// Trace.Ammo.Dump
+	// =============================================================================================
+
+	void RunDump(UWorld* World)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("========== TRACE AMMO (spec v16 §1) =========="));
+		UE_LOG(LogTraceGame, Display, TEXT("CLIP    size       : %d rounds (UTraceSettings::ClipSize)"),
+			TraceAmmo::GetClipSize());
+		UE_LOG(LogTraceGame, Display, TEXT("RELOAD  time       : %.3fs (UTraceSettings::ReloadSeconds)"),
+			TraceAmmo::GetReloadSeconds());
+		UE_LOG(LogTraceGame, Display,
+			TEXT("CYCLE   sustained  : %.2fs of fire per clip at FireInterval %.2fs, then %.2fs reloading"),
+			TraceAmmo::GetClipSize() * FMath::Max(0.01f, UTraceSettings::Get().FireInterval),
+			FMath::Max(0.01f, UTraceSettings::Get().FireInterval), TraceAmmo::GetReloadSeconds());
+		UE_LOG(LogTraceGame, Display,
+			TEXT("ARMS    enabled=%d reloadBlocksFire=%d carrierGuard=%d predict=%d (all 1 = shipped)"),
+			TraceAmmo::IsEnabled() ? 1 : 0, TraceAmmo::DoesReloadBlockFire() ? 1 : 0,
+			TraceAmmo::IsCarrierGuardArmed() ? 1 : 0, TraceAmmo::IsPredictionEnabled() ? 1 : 0);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("ALARM   carrierRoundsConsumed=%d (MUST be 0) | liveness: rounds=%d reloads=%d "
+			     "refusedEmpty=%d refusedReloading=%d"),
+			TraceAmmo::GetCarrierRoundsConsumed(), TraceAmmo::GetRoundsConsumed(),
+			TraceAmmo::GetReloadsCompleted(), TraceAmmo::GetDryFireRefusals(),
+			TraceAmmo::GetReloadFireRefusals());
+
+		if (World != nullptr)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("NET     mode       : %d (0 standalone, 1 dedicated, 2 listen, 3 client)"),
+				static_cast<int32>(World->GetNetMode()));
+
+			if (const APlayerController* PC = World->GetFirstPlayerController())
+			{
+				if (const ATraceCharacter* Pawn = Cast<ATraceCharacter>(PC->GetPawn());
+					Pawn != nullptr && Pawn->Weapon != nullptr)
+				{
+					const UTraceWeaponComponent* Weapon = Pawn->Weapon;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("LOCAL   %s: clip %d/%d (%d ability round(s)) | reloading=%d (%.3fs left) | "
+						     "shown=%d canFire=%d"),
+						*GetNameSafe(Pawn), Weapon->GetClipAmmo(), Weapon->GetClipSize(),
+						Weapon->GetAbilityRoundsInClip(), Weapon->IsReloading() ? 1 : 0,
+						Weapon->GetReloadRemaining(), Weapon->ShouldShowAmmo() ? 1 : 0,
+						Weapon->CanFire() ? 1 : 0);
+				}
+			}
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("============================================="));
+	}
+
+	// =============================================================================================
+	// Trace.Ammo.Test
+	// =============================================================================================
+
+	struct FAmmoTestState
+	{
+		int32 Step = 0;
+		double NextStepRealTime = 0.0;
+		double Deadline = 0.0;
+		FChecklist List;
+		TWeakObjectPtr<ATraceCharacter> Subject;
+
+		/** Set by the red arm. Without it the green arm's numbers are uninformative. */
+		bool bRedReproduced = false;
+
+		/** Live-fire bookkeeping (step 2). */
+		int32 LiveFireClipBefore = 0;
+		int32 LiveFireConsumedBefore = 0;
+		double LiveFireStartRealTime = 0.0;
+
+		/** Snapshots the later steps compare against. */
+		int32 ClipBeforeDrain = 0;
+		int32 DrainCalls = 0;
+		double ReloadObservedAtRealTime = 0.0;
+	};
+
+	void RunAmmoTest()
+	{
+		UWorld* World = FindAuthoritativeWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[AMMO] no authoritative game world — the clip is server state, so this must run on the server."));
+			return;
+		}
+
+		TSharedPtr<FAmmoTestState> State = MakeShared<FAmmoTestState>();
+		State->Deadline = FPlatformTime::Seconds() + 60.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[AMMO] ===== spec v16 §1: '30 bullets per clip, then the gun reloads. R to reload.' "
+			     "'Reloading takes .5seconds'. Resolved: %d rounds, %.2fs reload. arm 0 = RED "
+			     "(Trace.Ammo.Enabled 0) must leave the clip untouched. ====="),
+			TraceAmmo::GetClipSize(), TraceAmmo::GetReloadSeconds());
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			const double NowReal = FPlatformTime::Seconds();
+			if (TickWorld == nullptr)
+			{
+				RestoreArms();
+				return false;
+			}
+			if (NowReal < State->NextStepRealTime)
+			{
+				return true;
+			}
+
+			// ---- staging -------------------------------------------------------------------
+			if (State->Step == 0)
+			{
+				ATraceCharacter* Subject = FindDrivableSubject(TickWorld);
+				if (Subject == nullptr)
+				{
+					if (NowReal > State->Deadline)
+					{
+						State->List.Invalidate(TEXT("no drivable subject: this needs a live, locally controlled, "
+						                            "authoritative pawn holding the gun and not carrying the Core"));
+						State->List.Report();
+						RestoreArms();
+						return false;
+					}
+					return true;
+				}
+
+				State->Subject = Subject;
+				UE_LOG(LogTraceGame, Display, TEXT("[AMMO] staged on %s (clip %d/%d)."),
+					*GetNameSafe(Subject), Subject->Weapon->GetClipAmmo(), TraceAmmo::GetClipSize());
+
+				// The resolved knobs are checked once, here, because every later assertion is stated
+				// in terms of them and a wrong ClipSize would make the rest pass against the wrong game.
+				State->List.Check(TraceAmmo::GetClipSize() == 30,
+					TEXT("'30 bullets per clip'"),
+					FString::Printf(TEXT("resolved %d"), TraceAmmo::GetClipSize()));
+				State->List.Check(FMath::IsNearlyEqual(TraceAmmo::GetReloadSeconds(), 0.5f, 0.001f),
+					TEXT("'Reloading takes .5seconds'"),
+					FString::Printf(TEXT("resolved %.3fs"), TraceAmmo::GetReloadSeconds()));
+
+				State->Step = 1;
+				return true;
+			}
+
+			// *** THE SUBJECT IS RE-VALIDATED ON EVERY TICK, NOT JUST AT STAGING. *** A pawn that died,
+			// picked up the Core or drew the knife between two steps would turn the rest of this run
+			// into a set of true statements about the wrong situation — the exact shape of the carrier
+			// harness that once printed PASS while striking a corpse.
+			ATraceCharacter* Subject = State->Subject.Get();
+			UTraceWeaponComponent* Weapon = (Subject != nullptr) ? Subject->Weapon : nullptr;
+			if (Subject == nullptr || Weapon == nullptr || !Subject->IsAlive()
+				|| Subject->IsCarrier() || Weapon->IsKnifeEquipped())
+			{
+				State->List.Invalidate(FString::Printf(
+					TEXT("the subject stopped being testable mid-run (alive=%d carrying=%d knife=%d) — rerun in a "
+					     "quieter match"),
+					(Subject != nullptr && Subject->IsAlive()) ? 1 : 0,
+					(Subject != nullptr && Subject->IsCarrier()) ? 1 : 0,
+					(Weapon != nullptr && Weapon->IsKnifeEquipped()) ? 1 : 0));
+				State->List.Report();
+				RestoreArms();
+				return false;
+			}
+
+			// ---- step 1: THE RED ARM ---------------------------------------------------------
+			if (State->Step == 1)
+			{
+				SetArm(TEXT("Trace.Ammo.Enabled"), 0);
+
+				const int32 Before = Weapon->GetClipAmmo();
+				for (int32 Index = 0; Index < 10; ++Index)
+				{
+					Weapon->DebugConsumeRound();
+				}
+				const int32 After = Weapon->GetClipAmmo();
+
+				State->bRedReproduced = (After == Before);
+				State->List.Check(State->bRedReproduced,
+					TEXT("RED ARM: with the mechanic disarmed, ten rounds cost nothing"),
+					FString::Printf(TEXT("clip %d -> %d — this is the build that existed before §1"), Before, After));
+
+				SetArm(TEXT("Trace.Ammo.Enabled"), 1);
+
+				// LIVE FIRE, through the real trigger, starts now and is measured next step.
+				State->LiveFireClipBefore = Weapon->GetClipAmmo();
+				int32 ReloadsBefore = 0;
+				Weapon->DebugGetAmmoTotals(State->LiveFireConsumedBefore, ReloadsBefore);
+				State->LiveFireStartRealTime = NowReal;
+				Weapon->StartFire();
+
+				State->Step = 2;
+				// Long enough for three shots at the shipped 0.40 s interval, short enough that the
+				// subject is unlikely to be killed in the middle of it.
+				State->NextStepRealTime = NowReal + 1.4;
+				return true;
+			}
+
+			// ---- step 2: ONE ROUND PER SHOT, THROUGH THE SHIPPING INPUT PATH -----------------
+			if (State->Step == 2)
+			{
+				Weapon->StopFire();
+
+				int32 ConsumedNow = 0;
+				int32 ReloadsNow = 0;
+				Weapon->DebugGetAmmoTotals(ConsumedNow, ReloadsNow);
+
+				const int32 RoundsSpent = ConsumedNow - State->LiveFireConsumedBefore;
+				const int32 ClipDrop = State->LiveFireClipBefore - Weapon->GetClipAmmo();
+
+				// *** THE EXPECTED SHOT COUNT IS DERIVED FROM THE CLOCK, NOT FROM ANY AMMO COUNTER. ***
+				//
+				// This was a vacuous check once and the fix's own sabotage run is what caught it: with
+				// ConsumeRound() removed from ServerFire, BOTH the clip and the component's round
+				// counter stayed still, "0 == 0" was true, and "exactly one round per shot" printed
+				// PASS on a build where no shot cost anything. Two numbers written by the same function
+				// cannot disagree, so they cannot witness each other.
+				//
+				// Elapsed wall time over FireInterval is an independent witness: the trigger was held
+				// for a measured duration and the gun's cadence is a published knob. +/-1 covers the
+				// ticker's granularity at each end of the burst.
+				const double FireInterval = FMath::Max(0.01, static_cast<double>(UTraceSettings::Get().FireInterval));
+				const double HeldSeconds = NowReal - State->LiveFireStartRealTime;
+				const int32 ExpectedShots = FMath::FloorToInt(HeldSeconds / FireInterval);
+				const bool bPlausibleCount = (ClipDrop >= ExpectedShots - 1) && (ClipDrop <= ExpectedShots + 1);
+
+				State->List.Check(ClipDrop > 0 && bPlausibleCount,
+					TEXT("the REAL trigger actually spends rounds: StartFire -> FireOnce -> ServerFire -> the clip"),
+					FString::Printf(TEXT("clip fell by %d in %.2fs at FireInterval %.2f, so ~%d shot(s) were "
+					                     "expected (+/-1)"),
+						ClipDrop, HeldSeconds, FireInterval, ExpectedShots));
+
+				State->List.Check(ClipDrop > 0 && RoundsSpent == ClipDrop,
+					TEXT("exactly ONE round leaves the clip per shot"),
+					FString::Printf(TEXT("clip fell by %d for %d recorded round(s) — %d/%d left. The `> 0` is "
+					                     "load-bearing: without it a gun that consumed nothing would report both "
+					                     "numbers as 0 and PASS"),
+						ClipDrop, RoundsSpent, Weapon->GetClipAmmo(), TraceAmmo::GetClipSize()));
+
+				// ---- drain the rest through the same consumption function a shot uses ----
+				State->ClipBeforeDrain = Weapon->GetClipAmmo();
+				State->DrainCalls = 0;
+				while (Weapon->GetClipAmmo() > 0 && State->DrainCalls <= 1000)
+				{
+					Weapon->DebugConsumeRound();
+					++State->DrainCalls;
+				}
+
+				State->List.Check(State->DrainCalls == State->ClipBeforeDrain,
+					TEXT("the clip holds exactly the rounds it says it holds"),
+					FString::Printf(TEXT("%d consumption(s) took %d rounds to zero"),
+						State->DrainCalls, State->ClipBeforeDrain));
+
+				State->Step = 3;
+				State->NextStepRealTime = NowReal + 0.1;   // let one TickReload run
+				return true;
+			}
+
+			// ---- step 3: "then the gun reloads" — automatic, and it refuses fire -------------
+			if (State->Step == 3)
+			{
+				const bool bReloading = Weapon->IsReloading();
+				const float Remaining = Weapon->GetReloadRemaining();
+				const bool bRefused = !Weapon->CanFire();
+
+				State->List.Check(bReloading,
+					TEXT("'30 bullets per clip, THEN THE GUN RELOADS' — with no key pressed"),
+					FString::Printf(TEXT("reloading=%d with %.3fs left of %.2fs"),
+						bReloading ? 1 : 0, Remaining, TraceAmmo::GetReloadSeconds()));
+
+				State->List.Check(bRefused,
+					TEXT("firing is refused while the reload runs"),
+					FString::Printf(TEXT("CanFire()=%d, empty-clip refusals %d, mid-reload refusals %d"),
+						Weapon->CanFire() ? 1 : 0, TraceAmmo::GetDryFireRefusals(),
+						TraceAmmo::GetReloadFireRefusals()));
+
+				State->ReloadObservedAtRealTime = NowReal;
+				State->Step = 4;
+				State->NextStepRealTime = NowReal + static_cast<double>(TraceAmmo::GetReloadSeconds()) + 0.25;
+				return true;
+			}
+
+			// ---- step 4: the refill, then the MANUAL reload rules ----------------------------
+			if (State->Step == 4)
+			{
+				State->List.Check(Weapon->GetClipAmmo() == TraceAmmo::GetClipSize() && !Weapon->IsReloading(),
+					TEXT("the reload finishes and the clip is full again"),
+					FString::Printf(TEXT("clip %d/%d, reloading=%d, ~%.2fs after it started"),
+						Weapon->GetClipAmmo(), TraceAmmo::GetClipSize(), Weapon->IsReloading() ? 1 : 0,
+						NowReal - State->ReloadObservedAtRealTime));
+
+				// R WITH A FULL CLIP DOES NOTHING. [ASSUMPTION], spec v16 §1.
+				const bool bFullReload = Weapon->RequestReload();
+				State->List.Check(!bFullReload && !Weapon->IsReloading(),
+					TEXT("R with a FULL clip does nothing at all"),
+					FString::Printf(TEXT("RequestReload()=%d, reloading=%d — it must not restart the timer"),
+						bFullReload ? 1 : 0, Weapon->IsReloading() ? 1 : 0));
+
+				// A partial clip, then R.
+				for (int32 Index = 0; Index < 5; ++Index)
+				{
+					Weapon->DebugConsumeRound();
+				}
+				const int32 PartialClip = Weapon->GetClipAmmo();
+
+				// THE CONTROL FOR THE NEXT CHECK: the gun must be able to fire RIGHT NOW, or "refused
+				// during a reload" would be true for some entirely unrelated reason.
+				const bool bCanFireBefore = Weapon->CanFire();
+
+				const bool bManualReload = Weapon->RequestReload();
+				State->List.Check(bManualReload && Weapon->IsReloading(),
+					TEXT("R with a partial clip starts a reload"),
+					FString::Printf(TEXT("clip was %d/%d, RequestReload()=%d, %.3fs left"),
+						PartialClip, TraceAmmo::GetClipSize(), bManualReload ? 1 : 0,
+						Weapon->GetReloadRemaining()));
+
+				// ---- THE RELOAD GATE'S OWN A/B, on a NON-empty clip so the empty-clip refusal
+				//      cannot be what is being measured. One arm, nothing else changed. ----
+				const bool bRefusedArmed = !Weapon->CanFire();
+				SetArm(TEXT("Trace.Ammo.ReloadBlocksFire"), 0);
+				const bool bAllowedDisarmed = Weapon->CanFire();
+				SetArm(TEXT("Trace.Ammo.ReloadBlocksFire"), 1);
+
+				State->List.Check(bCanFireBefore && bRefusedArmed && bAllowedDisarmed,
+					TEXT("the mid-reload refusal is the RELOAD's doing and nothing else's"),
+					FString::Printf(TEXT("canFire before the reload=%d | during, armed=%d | during, "
+					                     "Trace.Ammo.ReloadBlocksFire 0=%d (want 1 / 0 / 1)"),
+						bCanFireBefore ? 1 : 0, bRefusedArmed ? 0 : 1, bAllowedDisarmed ? 1 : 0));
+
+				State->Step = 5;
+				State->NextStepRealTime = NowReal + static_cast<double>(TraceAmmo::GetReloadSeconds()) + 0.25;
+				return true;
+			}
+
+			// ---- step 5: the manual reload also refills, and the verdict ---------------------
+			State->List.Check(Weapon->GetClipAmmo() == TraceAmmo::GetClipSize() && !Weapon->IsReloading(),
+				TEXT("the manual reload refills the clip too"),
+				FString::Printf(TEXT("clip %d/%d, reloading=%d"),
+					Weapon->GetClipAmmo(), TraceAmmo::GetClipSize(), Weapon->IsReloading() ? 1 : 0));
+
+			State->List.Check(TraceAmmo::GetCarrierRoundsConsumed() == 0,
+				TEXT("no round was ever taken from a Core carrier's clip during this run"),
+				FString::Printf(TEXT("alarm=%d (Trace.Ammo.CarrierTest is what red-arms this properly)"),
+					TraceAmmo::GetCarrierRoundsConsumed()));
+
+			if (!State->bRedReproduced)
+			{
+				State->List.Invalidate(TEXT("the RED arm did not reproduce — Trace.Ammo.Enabled 0 failed to stop "
+				                            "the clip falling, so nothing above is a measurement of the ammo code"));
+			}
+
+			State->List.Report();
+			RestoreArms();
+			return false;
+		}));
+	}
+
+	// =============================================================================================
+	// Trace.Ammo.CarrierTest
+	// =============================================================================================
+
+	struct FCarrierAmmoState
+	{
+		int32 Step = 0;
+		double NextStepRealTime = 0.0;
+		double Deadline = 0.0;
+		FChecklist List;
+		TWeakObjectPtr<ATraceCharacter> CarrierPawn;
+		TWeakObjectPtr<ATraceCharacter> ControlPawn;
+
+		bool bRedReproduced = false;
+		bool bControlWorked = false;
+	};
+
+	void RunCarrierTest()
+	{
+		UWorld* World = FindAuthoritativeWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[AMMOCARRIER] no authoritative game world."));
+			return;
+		}
+
+		TSharedPtr<FCarrierAmmoState> State = MakeShared<FCarrierAmmoState>();
+		State->List.Tag = TEXT("AMMOCARRIER");
+		State->Deadline = FPlatformTime::Seconds() + 90.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[AMMOCARRIER] ===== spec v16 §1: 'The Core carrier has no gun, so ammo must not be consumed or "
+			     "shown while carrying.' TWO locks: (1) CanFire()/ServerFire refuse a carrier outright, (2) "
+			     "ConsumeRound refuses one even when called directly. arm 0 (Trace.Ammo.CarrierGuard 0) must "
+			     "reproduce on lock 2, or arm 1's clean run is uninformative. ====="));
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			const double NowReal = FPlatformTime::Seconds();
+			if (TickWorld == nullptr)
+			{
+				RestoreArms();
+				return false;
+			}
+			if (NowReal < State->NextStepRealTime)
+			{
+				return true;
+			}
+
+			ATraceCore* CoreActor = ATraceCore::Get(TickWorld);
+
+			// ---- staging: a live carrier and a live non-carrier control ----------------------
+			if (State->Step == 0)
+			{
+				ATraceCharacter* CarrierPawn = (CoreActor != nullptr) ? CoreActor->Carrier : nullptr;
+				ATraceCharacter* ControlPawn = nullptr;
+
+				for (TActorIterator<ATraceCharacter> It(TickWorld); It; ++It)
+				{
+					ATraceCharacter* Candidate = *It;
+					if (Candidate == nullptr || !Candidate->IsAlive() || Candidate->Weapon == nullptr
+						|| !Candidate->HasAuthority())
+					{
+						continue;
+					}
+					if (Candidate == CarrierPawn || Candidate->IsCarrier())
+					{
+						continue;
+					}
+					ControlPawn = Candidate;
+					break;
+				}
+
+				// GrantTo, not TryPickup: TryPickup is a no-op while there is already a holder, which is
+				// exactly the case that has to be corrected when the Core is loose or in flight.
+				if (CarrierPawn == nullptr && CoreActor != nullptr && ControlPawn != nullptr)
+				{
+					CoreActor->GrantTo(ControlPawn, ETraceCoreGrantReason::Debug);
+					CarrierPawn = CoreActor->Carrier;
+					ControlPawn = nullptr;   // it is the carrier now; find another next tick
+				}
+
+				if (CarrierPawn == nullptr || CarrierPawn->Weapon == nullptr
+					|| ControlPawn == nullptr || ControlPawn->Weapon == nullptr)
+				{
+					if (NowReal > State->Deadline)
+					{
+						State->List.Invalidate(FString::Printf(
+							TEXT("could not stage: carrier=%s control=%s — this needs a live match with at least "
+							     "two pawns"),
+							*GetNameSafe(CarrierPawn), *GetNameSafe(ControlPawn)));
+						State->List.Report();
+						RestoreArms();
+						return false;
+					}
+					return true;
+				}
+
+				State->CarrierPawn = CarrierPawn;
+				State->ControlPawn = ControlPawn;
+				UE_LOG(LogTraceGame, Display, TEXT("[AMMOCARRIER] staged: CARRIER %s | CONTROL %s"),
+					*GetNameSafe(CarrierPawn), *GetNameSafe(ControlPawn));
+				State->Step = 1;
+				return true;
+			}
+
+			ATraceCharacter* Carrier = State->CarrierPawn.Get();
+			ATraceCharacter* Control = State->ControlPawn.Get();
+			UTraceWeaponComponent* CarrierWeapon = (Carrier != nullptr) ? Carrier->Weapon : nullptr;
+			UTraceWeaponComponent* ControlWeapon = (Control != nullptr) ? Control->Weapon : nullptr;
+			if (CarrierWeapon == nullptr || ControlWeapon == nullptr
+				|| !Carrier->IsAlive() || !Control->IsAlive())
+			{
+				State->List.Invalidate(TEXT("a participant went away or died mid-test"));
+				State->List.Report();
+				RestoreArms();
+				return false;
+			}
+
+			// *** THE LIVE-CARRIER GATE, RE-ASSERTED EVERY TICK — BUT ONLY WHILE THE SUBJECT IS THE
+			// CARRIER. *** Bots pass and score, so a subject who stopped carrying between staging and
+			// the strike would make steps 1 and 2 an ordinary ammo test that passes for entirely the
+			// wrong reason.
+			//
+			// IT IS SKIPPED FOR STEP 3, AND THAT IS A BUG THIS HARNESS ALREADY HAD ONCE. Step 2 ends by
+			// GRANTING the Core to the control on purpose (that is the cancellation under test), and
+			// the gate below would then dutifully take it straight back — so step 3 measured a
+			// cancelled reload on a pawn that was no longer carrying anything, and printed
+			// "reloading=0, carrying=0", which is a PASS that says nothing. The check now runs while
+			// the control is still holding the Core and asserts BOTH facts in one statement.
+			if (State->Step < 3)
+			{
+				if (CoreActor != nullptr && CoreActor->Carrier != Carrier)
+				{
+					CoreActor->TryPickup(Carrier);
+				}
+				if (CoreActor == nullptr || CoreActor->Carrier != Carrier || Control->IsCarrier())
+				{
+					if (NowReal > State->Deadline)
+					{
+						State->List.Invalidate(TEXT("could not keep the Core on the carrier (and off the control)"));
+						State->List.Report();
+						RestoreArms();
+						return false;
+					}
+					return true;
+				}
+			}
+
+			// ---- step 1: LOCK 1 — the shipped path refuses a carrier the trigger, and RED lock 2 ----
+			if (State->Step == 1)
+			{
+				State->List.Check(!CarrierWeapon->CanFire(),
+					TEXT("LOCK 1: a carrier cannot fire at all, so no round can reach the clip"),
+					FString::Printf(TEXT("CanFire()=%d on a live carrier (spec §4's own rule, re-checked here "
+					                     "because it is the FIRST reason ammo is not consumed)"),
+						CarrierWeapon->CanFire() ? 1 : 0));
+
+				State->List.Check(!CarrierWeapon->ShouldShowAmmo(),
+					TEXT("'...or SHOWN while carrying'"),
+					FString::Printf(TEXT("ShouldShowAmmo()=%d on the carrier, %d on the control"),
+						CarrierWeapon->ShouldShowAmmo() ? 1 : 0, ControlWeapon->ShouldShowAmmo() ? 1 : 0));
+
+				// THE RED ARM for lock 2. Driven through DebugConsumeRound because the shipped path
+				// cannot reach ConsumeRound with a carrier at all — lock 1 stops it first — so a
+				// trigger-driven red arm would watch the clip hold and prove nothing about lock 2.
+				SetArm(TEXT("Trace.Ammo.CarrierGuard"), 0);
+				const int32 AlarmBefore = TraceAmmo::GetCarrierRoundsConsumed();
+				const int32 ClipBefore = CarrierWeapon->GetClipAmmo();
+				CarrierWeapon->DebugConsumeRound();
+				const int32 ClipAfter = CarrierWeapon->GetClipAmmo();
+				const int32 AlarmAfter = TraceAmmo::GetCarrierRoundsConsumed();
+				SetArm(TEXT("Trace.Ammo.CarrierGuard"), 1);
+
+				State->bRedReproduced = (ClipAfter == ClipBefore - 1) && (AlarmAfter > AlarmBefore);
+				State->List.Check(State->bRedReproduced,
+					TEXT("RED: with the guard removed a carrier's clip DOES lose a round"),
+					FString::Printf(TEXT("clip %d -> %d, alarm +%d — this is the failure the shipped guard prevents"),
+						ClipBefore, ClipAfter, AlarmAfter - AlarmBefore));
+
+				State->Step = 2;
+				return true;
+			}
+
+			// ---- step 2: LOCK 2 GREEN, plus the control, plus the pickup cancellation ----------
+			if (State->Step == 2)
+			{
+				RestoreArms();
+
+				const int32 AlarmBefore = TraceAmmo::GetCarrierRoundsConsumed();
+				const int32 ClipBefore = CarrierWeapon->GetClipAmmo();
+				CarrierWeapon->DebugConsumeRound();
+				CarrierWeapon->DebugConsumeRound();
+				CarrierWeapon->DebugConsumeRound();
+				const int32 ClipAfter = CarrierWeapon->GetClipAmmo();
+
+				State->List.Check(ClipAfter == ClipBefore && TraceAmmo::GetCarrierRoundsConsumed() == AlarmBefore,
+					TEXT("LOCK 2 (GREEN): three direct consumptions cost a carrier nothing"),
+					FString::Printf(TEXT("clip %d -> %d, alarm +%d (must be +0)"),
+						ClipBefore, ClipAfter, TraceAmmo::GetCarrierRoundsConsumed() - AlarmBefore));
+
+				// ---- THE CONTROL. The IDENTICAL call on a non-carrier must really take a round, or
+				//      this harness has proved something about itself and nothing about the carrier. ----
+				const int32 ControlBefore = ControlWeapon->GetClipAmmo();
+				ControlWeapon->DebugConsumeRound();
+				const int32 ControlAfter = ControlWeapon->GetClipAmmo();
+				State->bControlWorked = (ControlAfter == ControlBefore - 1);
+
+				State->List.Check(State->bControlWorked,
+					TEXT("CONTROL: the identical call DOES spend a non-carrier's round"),
+					FString::Printf(TEXT("clip %d -> %d on %s"),
+						ControlBefore, ControlAfter, *GetNameSafe(Control)));
+
+				// ---- "reloading is cancelled by picking up the Core" ----
+				ControlWeapon->RequestReload();
+				State->List.Check(ControlWeapon->IsReloading(),
+					TEXT("the control starts a reload (the fixture for the cancellation below)"),
+					FString::Printf(TEXT("reloading=%d, %.3fs left"),
+						ControlWeapon->IsReloading() ? 1 : 0, ControlWeapon->GetReloadRemaining()));
+
+				if (CoreActor != nullptr)
+				{
+					CoreActor->GrantTo(Control, ETraceCoreGrantReason::Debug);
+				}
+
+				State->Step = 3;
+				State->NextStepRealTime = NowReal + 0.15;   // let one TickReload see the new carrier
+				return true;
+			}
+
+			// ---- step 3: the cancellation landed, and the verdict ------------------------------
+			//
+			// BOTH FACTS IN ONE ASSERTION. "Not reloading" on its own is satisfied by a pawn that never
+			// started one, by one whose reload simply finished, and by a pawn that is not carrying at
+			// all — so the carrying half is what makes this a statement about the CANCELLATION. The
+			// timing is deliberate too: the check runs ~0.15 s into a 0.5 s reload, so a reload that
+			// merely ran to completion cannot be mistaken for one that was cancelled.
+			{
+				const bool bStillCarrying = Control->IsCarrier()
+					|| (CoreActor != nullptr && CoreActor->Carrier == Control);
+				State->List.Check(bStillCarrying && !ControlWeapon->IsReloading(),
+					TEXT("picking up the Core CANCELS a reload in progress"),
+					FString::Printf(TEXT("carrying=%d reloading=%d, ~0.35s of the %.2fs reload was still owed"),
+						bStillCarrying ? 1 : 0, ControlWeapon->IsReloading() ? 1 : 0,
+						TraceAmmo::GetReloadSeconds()));
+
+				// Put the Core back where the harness found it. It is a legal game state either way, but
+				// leaving a test's staging behind in a live match is how the NEXT test gets a surprise.
+				if (CoreActor != nullptr && Carrier->IsAlive())
+				{
+					CoreActor->GrantTo(Carrier, ETraceCoreGrantReason::Debug);
+				}
+			}
+
+			if (!State->bControlWorked)
+			{
+				State->List.Invalidate(TEXT("the CONTROL consumption on a non-carrier did not move a clip — the "
+				                            "fixture cannot spend a round at all, so nothing it says about the "
+				                            "carrier means anything"));
+			}
+			else if (!State->bRedReproduced)
+			{
+				State->List.Invalidate(TEXT("the RED arm did not reproduce — Trace.Ammo.CarrierGuard 0 failed to "
+				                            "let a carrier's clip fall, so the green arm proves nothing"));
+			}
+
+			State->List.Report();
+			RestoreArms();
+			return false;
+		}));
+	}
+
+	// =============================================================================================
+	// Trace.Ammo.BotWatch
+	// =============================================================================================
+
+	/**
+	 * Two halves, because "bots must reload" needs both an OBSERVATION and an EXPERIMENT.
+	 *
+	 * The observation alone is not enough, and a 120 s run proved it: nine bots spent 21 rounds
+	 * between them, which is fewer than one clip, so "no bot reloaded" was a fact about how much the
+	 * bots shoot and not about the code. Waiting for a bot to fire thirty rounds in a live match is
+	 * waiting on the AI, not on the feature.
+	 *
+	 * So the experiment DRAINS one live bot's clip through the same consumption function a shot uses,
+	 * and then watches that bot put the gun back together with no bot-side code involved at all. The
+	 * observation still runs alongside and carries the alarm the experiment cannot: whether any bot,
+	 * anywhere, was ever caught standing at zero rounds with no reload running.
+	 */
+	struct FBotWatchState
+	{
+		int32 Step = 0;
+		double ObserveSeconds = 0.0;
+		double ObserveUntilRealTime = 0.0;
+		double NextStepRealTime = 0.0;
+		double Deadline = 0.0;
+		FChecklist List;
+
+		/** Sampled every tick across every live bot. The "dry-fires forever" alarm. */
+		int32 StuckSamples = 0;
+		int32 BotSamples = 0;
+		int32 BotsSeen = 0;
+		int32 BotRoundsAtEnd = 0;
+
+		/** Process-wide deltas. These survive a bot dying and respawning; per-pawn totals do not. */
+		int32 GlobalRoundsAtStart = 0;
+		int32 GlobalReloadsAtStart = 0;
+
+		TWeakObjectPtr<ATraceCharacter> Victim;
+		int32 VictimClipBeforeDrain = 0;
+		int32 VictimDrainCalls = 0;
+		bool bRedReproduced = false;
+	};
+
+	/** A live bot that could reload right now: alive, gun in hand, not carrying the Core. */
+	ATraceCharacter* FindDrainableBot(UWorld* World)
+	{
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Candidate = *It;
+			if (Candidate == nullptr || !Candidate->HasAuthority() || Candidate->Weapon == nullptr
+				|| !IsBotControlled(Candidate))
+			{
+				continue;
+			}
+			if (Candidate->IsAlive() && !Candidate->IsCarrier() && !Candidate->Weapon->IsKnifeEquipped())
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	}
+
+	void RunBotWatch(const TArray<FString>& Args)
+	{
+		UWorld* World = FindAuthoritativeWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[AMMOBOTS] no authoritative game world."));
+			return;
+		}
+
+		const double ObserveSeconds = (Args.Num() > 0)
+			? FMath::Clamp(FCString::Atod(*Args[0]), 2.0, 600.0) : 20.0;
+
+		TSharedPtr<FBotWatchState> State = MakeShared<FBotWatchState>();
+		State->List.Tag = TEXT("AMMOBOTS");
+		State->ObserveSeconds = ObserveSeconds;
+		State->ObserveUntilRealTime = FPlatformTime::Seconds() + ObserveSeconds;
+		State->Deadline = FPlatformTime::Seconds() + ObserveSeconds + 60.0;
+		State->GlobalRoundsAtStart = TraceAmmo::GetRoundsConsumed();
+		State->GlobalReloadsAtStart = TraceAmmo::GetReloadsCompleted();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[AMMOBOTS] ===== spec v16 §1: 'Bots must respect it and reload; a bot that dry-fires forever "
+			     "will read as broken.' Observing every bot for %.0fs, then DRAINING one bot's clip and watching "
+			     "it reload itself. ====="), ObserveSeconds);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			const double NowReal = FPlatformTime::Seconds();
+			if (TickWorld == nullptr)
+			{
+				RestoreArms();
+				return false;
+			}
+
+			// --- the observation runs on EVERY tick, through every phase ---------------------
+			{
+				int32 BotCount = 0;
+				int32 RoundsNow = 0;
+				for (TActorIterator<ATraceCharacter> It(TickWorld); It; ++It)
+				{
+					const ATraceCharacter* Candidate = *It;
+					if (Candidate == nullptr || !Candidate->HasAuthority() || Candidate->Weapon == nullptr
+						|| !IsBotControlled(Candidate))
+					{
+						continue;
+					}
+					++BotCount;
+
+					int32 Rounds = 0;
+					int32 Reloads = 0;
+					Candidate->Weapon->DebugGetAmmoTotals(Rounds, Reloads);
+					RoundsNow += Rounds;
+
+					// *** THE DRY-FIRE ALARM. *** A living, gun-holding, non-carrying bot at zero rounds
+					// with no reload running is exactly the "reads as broken" case §1 names. Sampled
+					// rather than asserted once, because it is a STATE a bot can only be caught in while
+					// it lasts — and if the automatic reload works it never lasts a whole frame.
+					if (Candidate->IsAlive() && !Candidate->IsCarrier()
+						&& !Candidate->Weapon->IsKnifeEquipped())
+					{
+						++State->BotSamples;
+						if (Candidate->Weapon->GetClipAmmo() <= 0 && !Candidate->Weapon->IsReloading())
+						{
+							++State->StuckSamples;
+						}
+					}
+				}
+				State->BotsSeen = FMath::Max(State->BotsSeen, BotCount);
+				State->BotRoundsAtEnd = RoundsNow;
+			}
+
+			if (NowReal < State->NextStepRealTime)
+			{
+				return true;
+			}
+
+			// --- phase 0: just observe ------------------------------------------------------
+			if (State->Step == 0)
+			{
+				if (NowReal < State->ObserveUntilRealTime)
+				{
+					return true;
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[AMMOBOTS] observation over %.0fs: %d bot(s) | process-wide rounds +%d, reloads +%d | "
+					     "bot-pawn rounds now %d | dry-stuck %d of %d samples"),
+					State->ObserveSeconds,
+					State->BotsSeen,
+					TraceAmmo::GetRoundsConsumed() - State->GlobalRoundsAtStart,
+					TraceAmmo::GetReloadsCompleted() - State->GlobalReloadsAtStart,
+					State->BotRoundsAtEnd, State->StuckSamples, State->BotSamples);
+
+				State->Step = 1;
+				return true;
+			}
+
+			ATraceCharacter* Victim = State->Victim.Get();
+
+			// --- phase 1: pick a bot and RED-ARM the drain ----------------------------------
+			if (State->Step == 1)
+			{
+				Victim = FindDrainableBot(TickWorld);
+				if (Victim == nullptr)
+				{
+					if (NowReal > State->Deadline)
+					{
+						State->List.Invalidate(TEXT("no live, gun-holding, non-carrying bot to drain — this needs "
+						                            "a match with bots in it"));
+						State->List.Report();
+						RestoreArms();
+						return false;
+					}
+					return true;
+				}
+				State->Victim = Victim;
+
+				SetArm(TEXT("Trace.Ammo.Enabled"), 0);
+				const int32 RedBefore = Victim->Weapon->GetClipAmmo();
+				for (int32 Index = 0; Index < RedBefore + 5; ++Index)
+				{
+					Victim->Weapon->DebugConsumeRound();
+				}
+				State->bRedReproduced = (Victim->Weapon->GetClipAmmo() == RedBefore)
+					&& !Victim->Weapon->IsReloading();
+				SetArm(TEXT("Trace.Ammo.Enabled"), 1);
+
+				State->List.Check(State->bRedReproduced,
+					TEXT("RED ARM: with the mechanic disarmed a bot's clip cannot empty, so it never reloads"),
+					FString::Printf(TEXT("%s: clip %d after %d consumptions, reloading=%d"),
+						*GetNameSafe(Victim), Victim->Weapon->GetClipAmmo(), RedBefore + 5,
+						Victim->Weapon->IsReloading() ? 1 : 0));
+
+				State->Step = 2;
+				return true;
+			}
+
+			// The bot has to still be a legal subject for the rest of this to mean anything — one that
+			// died, took the Core or drew the knife would be a true statement about the wrong pawn.
+			if (Victim == nullptr || Victim->Weapon == nullptr || !Victim->IsAlive()
+				|| Victim->IsCarrier() || Victim->Weapon->IsKnifeEquipped())
+			{
+				State->List.Invalidate(TEXT("the drained bot stopped being a legal subject mid-test (died, took "
+				                            "the Core, or drew the knife) — rerun"));
+				State->List.Report();
+				RestoreArms();
+				return false;
+			}
+
+			// --- phase 2: drain it for real -------------------------------------------------
+			if (State->Step == 2)
+			{
+				State->VictimClipBeforeDrain = Victim->Weapon->GetClipAmmo();
+				State->VictimDrainCalls = 0;
+				while (Victim->Weapon->GetClipAmmo() > 0 && State->VictimDrainCalls <= 1000)
+				{
+					Victim->Weapon->DebugConsumeRound();
+					++State->VictimDrainCalls;
+				}
+
+				State->List.Check(State->VictimDrainCalls == State->VictimClipBeforeDrain
+					&& Victim->Weapon->GetClipAmmo() == 0,
+					TEXT("a bot's clip is the same finite clip a human's is"),
+					FString::Printf(TEXT("%s: %d consumption(s) took %d rounds to zero"),
+						*GetNameSafe(Victim), State->VictimDrainCalls, State->VictimClipBeforeDrain));
+
+				State->Step = 3;
+				State->NextStepRealTime = NowReal + 0.15;   // let one TickReload run on that pawn
+				return true;
+			}
+
+			// --- phase 3: it reloads itself -------------------------------------------------
+			if (State->Step == 3)
+			{
+				State->List.Check(Victim->Weapon->IsReloading(),
+					TEXT("'Bots must respect it and reload' — the bot starts a reload with nobody telling it to"),
+					FString::Printf(TEXT("%s: reloading=%d, %.3fs left. There is no bot-side ammo code at all; "
+					                     "TickReload runs on its pawn because the pawn is authoritative and "
+					                     "locally controlled in this process"),
+						*GetNameSafe(Victim), Victim->Weapon->IsReloading() ? 1 : 0,
+						Victim->Weapon->GetReloadRemaining()));
+
+				State->Step = 4;
+				State->NextStepRealTime = NowReal + static_cast<double>(TraceAmmo::GetReloadSeconds()) + 0.25;
+				return true;
+			}
+
+			// --- phase 4: and comes back with a full clip, then the verdict ------------------
+			State->List.Check(Victim->Weapon->GetClipAmmo() == TraceAmmo::GetClipSize(),
+				TEXT("...and comes back with a full clip"),
+				FString::Printf(TEXT("%s: clip %d/%d"), *GetNameSafe(Victim),
+					Victim->Weapon->GetClipAmmo(), TraceAmmo::GetClipSize()));
+
+			State->List.Check(State->StuckSamples == 0,
+				TEXT("no bot was EVER caught standing at zero rounds with no reload running"),
+				FString::Printf(TEXT("%d dry-stuck sample(s) of %d live bot samples across the whole run — this "
+				                     "is the 'dry-fires forever' failure, sampled every tick on every bot"),
+					State->StuckSamples, State->BotSamples));
+
+			// LIVENESS, and it is reported rather than asserted. Bots in a headless match shoot far less
+			// than one clip's worth in a minute (measured: 21 rounds across 9 bots in 120 s), so
+			// "no bot organically emptied a clip" is a fact about the AI and not about this feature. The
+			// experiment above is what makes the verdict mean something; this is context.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[AMMOBOTS] context: %d bot(s) seen, %d round(s) on their current pawns, process-wide +%d "
+				     "rounds and +%d reloads since this command started (the drain and reload above are inside "
+				     "those two numbers)"),
+				State->BotsSeen, State->BotRoundsAtEnd,
+				TraceAmmo::GetRoundsConsumed() - State->GlobalRoundsAtStart,
+				TraceAmmo::GetReloadsCompleted() - State->GlobalReloadsAtStart);
+
+			if (State->BotSamples == 0)
+			{
+				State->List.Invalidate(TEXT("no live bot was ever sampled — the dry-fire alarm had nothing to "
+				                            "watch, so its zero means nothing"));
+			}
+			else if (!State->bRedReproduced)
+			{
+				State->List.Invalidate(TEXT("the RED arm did not reproduce — Trace.Ammo.Enabled 0 failed to stop "
+				                            "the bot's clip emptying, so the reload below proves nothing"));
+			}
+
+			State->List.Report();
+			RestoreArms();
+			return false;
+		}));
+	}
+
+	// =============================================================================================
+	// Trace.Ammo.ClientPredictTest — spec v16 §1's prediction clause, measured where it exists
+	//
+	// "Server-authoritative, client-predicted for feel — the local player must see the count drop on
+	// their own shot without waiting for a round trip, exactly like the existing fire path."
+	//
+	// *** THIS CANNOT BE RUN ON THE HOST, AND REFUSES TO BE. *** On the authority FireOnce does not
+	// take the predicted branch at all (ServerFire spends the round instead), so a host-side run would
+	// watch the count drop for entirely the wrong reason and report the feature working on a build
+	// that had no prediction in it. It runs on a JOINED CLIENT or not at all.
+	//
+	// THE MEASUREMENT IS ONE SHOT, READ ON THE NEXT TICK. A burst would be ambiguous — at 0.40 s
+	// between rounds and a 200 ms round trip, "the count is one behind" is only about half an
+	// interval and reads as noise. One round, sampled ~16 ms later, is unambiguous: predicted means
+	// -1 now, replicated means -0 now and -1 a round trip later. Run the client under
+	// NetEmulation.PktLag 150 or more and the two answers are half a second apart.
+	// =============================================================================================
+
+	struct FPredictTestState
+	{
+		int32 Step = 0;
+		double NextStepRealTime = 0.0;
+		double Deadline = 0.0;
+		FChecklist List;
+		TWeakObjectPtr<ATraceCharacter> Subject;
+		int32 ClipBefore = 0;
+		int32 ClipImmediatelyAfter = 0;
+		double FiredAtRealTime = 0.0;
+	};
+
+	void RunClientPredictTest()
+	{
+		// Any game world; the point is that it must NOT be authoritative.
+		UWorld* World = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (UWorld* Candidate = Context.World(); Candidate != nullptr && Candidate->IsGameWorld())
+				{
+					World = Candidate;
+					break;
+				}
+			}
+		}
+
+		if (World == nullptr || World->GetNetMode() != NM_Client)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[AMMOPREDICT] *** CLIENT ONLY. *** netmode=%d. On the server (or a listen host's own pawn) "
+				     "the predicted branch in FireOnce is never taken — ServerFire spends the round — so a run "
+				     "here would report prediction working on a build that has none. Join a host and run it there."),
+				(World != nullptr) ? static_cast<int32>(World->GetNetMode()) : -1);
+			return;
+		}
+
+		TSharedPtr<FPredictTestState> State = MakeShared<FPredictTestState>();
+		State->List.Tag = TEXT("AMMOPREDICT");
+		State->Deadline = FPlatformTime::Seconds() + 60.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[AMMOPREDICT] ===== spec v16 §1: 'client-predicted for feel — the local player must see the "
+			     "count drop on their own shot without waiting for a round trip.' Trace.Ammo.Predict is %d "
+			     "(1 = shipped, 0 = the RED arm: wait for replication). ====="),
+			TraceAmmo::IsPredictionEnabled() ? 1 : 0);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			const double NowReal = FPlatformTime::Seconds();
+			if (TickWorld == nullptr)
+			{
+				return false;
+			}
+			if (NowReal < State->NextStepRealTime)
+			{
+				return true;
+			}
+
+			ATraceCharacter* Subject = State->Subject.Get();
+			if (State->Step == 0)
+			{
+				const APlayerController* PC = TickWorld->GetFirstPlayerController();
+				Subject = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+				if (Subject == nullptr || Subject->Weapon == nullptr || !Subject->IsAlive()
+					|| Subject->IsCarrier() || Subject->Weapon->IsKnifeEquipped()
+					|| !Subject->Weapon->CanFire())
+				{
+					if (NowReal > State->Deadline)
+					{
+						State->List.Invalidate(TEXT("no local pawn that could fire right now — this needs a live, "
+						                            "gun-holding, non-carrying pawn off cooldown"));
+						State->List.Report();
+						return false;
+					}
+					return true;
+				}
+				State->Subject = Subject;
+
+				State->ClipBefore = Subject->Weapon->GetClipAmmo();
+				State->FiredAtRealTime = NowReal;
+				Subject->Weapon->StartFire();     // exactly one round: StopFire lands next tick
+				State->Step = 1;
+				return true;
+			}
+
+			if (Subject == nullptr || Subject->Weapon == nullptr || !Subject->IsAlive())
+			{
+				State->List.Invalidate(TEXT("the local pawn went away mid-test"));
+				State->List.Report();
+				return false;
+			}
+
+			// ---- the next tick: the shot has been fired and NOTHING has come back from the server ----
+			if (State->Step == 1)
+			{
+				Subject->Weapon->StopFire();
+				State->ClipImmediatelyAfter = Subject->Weapon->GetClipAmmo();
+
+				const double ElapsedMs = (NowReal - State->FiredAtRealTime) * 1000.0;
+				const bool bDroppedNow = (State->ClipImmediatelyAfter == State->ClipBefore - 1);
+
+				State->List.Check(bDroppedNow,
+					TEXT("the SHOOTER's own count drops on their own shot, with no round trip"),
+					FString::Printf(TEXT("clip %d -> %d, %.1f ms after the trigger. Trace.Ammo.Predict=%d. A "
+					                     "replication-driven count would still read %d here and only fall a "
+					                     "round trip later"),
+						State->ClipBefore, State->ClipImmediatelyAfter, ElapsedMs,
+						TraceAmmo::IsPredictionEnabled() ? 1 : 0, State->ClipBefore));
+
+				State->Step = 2;
+				State->NextStepRealTime = NowReal + 1.5;   // comfortably more than any sane round trip
+				return true;
+			}
+
+			// ---- 1.5 s later: the server's copy has landed and must AGREE, not refund ----
+			const int32 ClipAfterSettle = Subject->Weapon->GetClipAmmo();
+
+			State->List.Check(ClipAfterSettle <= State->ClipBefore - 1,
+				TEXT("the server's copy CONFIRMS the predicted round rather than handing it back"),
+				FString::Printf(TEXT("clip %d immediately after the shot, %d once replication settled. A count "
+				                     "that climbed back to %d would be the 30 -> 29 -> 30 -> 29 bounce "
+				                     "OnRep_Ammo's min-rule exists to prevent"),
+					State->ClipImmediatelyAfter, ClipAfterSettle, State->ClipBefore));
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[AMMOPREDICT] netmode=%d | clip before %d, immediately after %d, settled %d | "
+				     "reloading=%d | predict arm=%d"),
+				static_cast<int32>(TickWorld->GetNetMode()), State->ClipBefore, State->ClipImmediatelyAfter,
+				ClipAfterSettle, Subject->Weapon->IsReloading() ? 1 : 0,
+				TraceAmmo::IsPredictionEnabled() ? 1 : 0);
+
+			State->List.Report();
+			return false;
+		}));
+	}
+
+	FAutoConsoleCommandWithWorld CmdAmmoDump(
+		TEXT("Trace.Ammo.Dump"),
+		TEXT("Dev only. Log the ammo values this process resolved RIGHT NOW, the alarms, and the local pawn's live clip."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&RunDump));
+
+	FAutoConsoleCommand CmdAmmoTest(
+		TEXT("Trace.Ammo.Test"),
+		TEXT("Dev only, SERVER. Spec v16 §1: prove one round per shot through the real trigger, the automatic "
+		     "reload at zero, fire refused for the whole 0.5 s, the refill, and the manual R rules. Red-arms "
+		     "itself with Trace.Ammo.Enabled 0 first and reports INVALID if that arm did not reproduce."),
+		FConsoleCommandDelegate::CreateStatic(&RunAmmoTest));
+
+	FAutoConsoleCommand CmdAmmoCarrierTest(
+		TEXT("Trace.Ammo.CarrierTest"),
+		TEXT("Dev only, SERVER. Spec v16 §1: the Core carrier consumes no ammo, shows no ammo, and has any "
+		     "reload cancelled by the pickup. Red-arms the consumption guard and carries a live non-carrier "
+		     "CONTROL, so a clean run cannot be a fixture that never fired."),
+		FConsoleCommandDelegate::CreateStatic(&RunCarrierTest));
+
+	FAutoConsoleCommand CmdAmmoClientPredictTest(
+		TEXT("Trace.Ammo.ClientPredictTest"),
+		TEXT("Dev only, *** CLIENT ONLY ***. Spec v16 §1: prove the shooter's own ammo count drops on their own "
+		     "shot with no round trip, and that the server's copy then confirms it rather than refunding the "
+		     "round. Red arm: Trace.Ammo.Predict 0. Run the client under NetEmulation.PktLag 150+."),
+		FConsoleCommandDelegate::CreateStatic(&RunClientPredictTest));
+
+	FAutoConsoleCommand CmdAmmoBotWatch(
+		TEXT("Trace.Ammo.BotWatch"),
+		TEXT("Dev only, SERVER. Trace.Ammo.BotWatch [seconds=60]: watch every bot's real clip and prove bots "
+		     "spend rounds, complete reloads, and are never caught dry with no reload running."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RunBotWatch));
 }
 
 #endif // !UE_BUILD_SHIPPING

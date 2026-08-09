@@ -10,7 +10,9 @@
 //   Trace.X.VulnerableTest   THE AMPLIFIER. Two arms on one binary: arm 0 marks the target and turns
 //                            the multiplier off (Trace.X.Vulnerable 0) and must measure 40; arm 1 is
 //                            the shipped build and must measure 50. Same target, same call, same
-//                            frame budget. Also: non-stacking, the timer reset, and expiry.
+//                            frame budget. Also: the timer reset, expiry, and — since spec v16 §4
+//                            reversed v14's "does not stack" — that three marks are three stacks and
+//                            measure 54. Trace.X.VulnerableStackTest owns stacking in depth.
 //
 //   Trace.X.CarrierTest      *** SPEC §4. *** Three independent locks stop X's mark from ever
 //                            reaching a Core carrier, and this red-arms all three at once
@@ -397,9 +399,11 @@ namespace TraceXVerify
 		State->Deadline = FPlatformTime::Seconds() + 60.0;
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[XVULN] ===== spec v14 §6: 'VULNERABLE for 2s, taking +25%% damage FROM ALL SOURCES. Does not "
-			     "stack; a new application RESETS the timer.' arm 0 = RED (Trace.X.Vulnerable 0, the mark still "
-			     "lands but multiplies nothing) must measure %.0f; arm 1 = shipped must measure %.0f. ====="),
+			TEXT("[XVULN] ===== spec v14 §6: 'VULNERABLE for 2s, taking +25%% damage FROM ALL SOURCES... a new "
+			     "application RESETS the timer' — v14's 'does not stack' is SUPERSEDED by v16 §4, so three marks "
+			     "measure x%.3f here and not x%.3f. arm 0 = RED (Trace.X.Vulnerable 0, the mark still lands but "
+			     "multiplies nothing) must measure %.0f; arm 1 = shipped must measure %.0f. ====="),
+			TraceVulnerable::GetMultiplierForStacks(3), TraceVulnerable::GetDamageMultiplier(),
 			XTestDamage, XTestDamage * TraceVulnerable::GetDamageMultiplier());
 
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
@@ -511,16 +515,39 @@ namespace TraceXVerify
 					FString::Printf(TEXT("asked %.1f, took %.2f — this is what proves the %.2f above was the mark"),
 						XTestDamage, UnmarkedDelta, Expected));
 
-				// ---- NON-STACKING: mark twice, then measure ----
+				// ---- STACKING: mark three times, then measure ----
+				//
+				// *** THIS CHECK USED TO ASSERT THE OPPOSITE, AND SPEC v16 §4 REVERSED IT. *** It read
+				// "NON-STACKING: three marks amplify exactly once" and expected x1.25, because v14 §6
+				// said the mark did not stack. §4 says verbatim "Change X's vulnerable to stack with
+				// each hit... each additional stack only adds 5%", so three marks are now three stacks
+				// and measure x1.35 (54.00 on this fixture's 40). The old expectation is not a
+				// regression guard any more, it is the superseded rule, so it is replaced rather than
+				// left failing — a red check that nothing can ever satisfy trains people to ignore the
+				// verdict line. Step 3 below still asserts the half of v14 §6 that SURVIVED: a new
+				// application resets the one timer.
+				//
+				// The expected number comes from TraceVulnerable::GetMultiplierForStacks() rather than
+				// a literal, so it cannot drift from the shipped arithmetic when the knobs move; and
+				// it honours the stacking RED arm (Trace.X.VulnerableStacking 0 pins every application
+				// at one stack), so running this inside a red-armed batch reports the truth instead of
+				// a false failure. Trace.X.VulnerableStackTest owns the stacking rule in depth — its
+				// own red arm, the cap, the shared deadline, and all-stacks-vanish-together.
 				TargetHealth->ResetHealth();
 				XSet->MarkVulnerable(Target);
 				XSet->MarkVulnerable(Target);
 				XSet->MarkVulnerable(Target);
+				const int32 ExpectedStacks = TraceVulnerable::IsStackingEnabled()
+					? FMath::Min(3, TraceVulnerable::GetMaxStacks())
+					: 1;
+				const int32 MeasuredStacks = TargetHealth->GetVulnerableStacks();
+				const float TripleExpected = XTestDamage * TraceVulnerable::GetMultiplierForStacks(ExpectedStacks);
 				const float TripleMarkedDelta = MeasureDamage(TargetHealth, XTestDamage);
-				State->List.Check(FMath::IsNearlyEqual(TripleMarkedDelta, Expected, 0.01f),
-					TEXT("NON-STACKING: three marks amplify exactly once"),
-					FString::Printf(TEXT("took %.2f — expected %.2f, NOT %.2f (which is what stacking would give)"),
-						TripleMarkedDelta, Expected, XTestDamage * FMath::Pow(TraceVulnerable::GetDamageMultiplier(), 3.f)));
+				State->List.Check(MeasuredStacks == ExpectedStacks
+						&& FMath::IsNearlyEqual(TripleMarkedDelta, TripleExpected, 0.01f),
+					TEXT("v16 §4 STACKING: three marks are three stacks, +25%/+30%/+35%"),
+					FString::Printf(TEXT("stacks=%d (want %d), took %.2f — expected %.2f, NOT %.2f (the superseded v14 non-stacking answer)"),
+						MeasuredStacks, ExpectedStacks, TripleMarkedDelta, TripleExpected, Expected));
 
 				// Stamp a mark and let it decay; step 3 re-applies it and step 4 watches it expire.
 				TargetHealth->ResetHealth();
@@ -932,6 +959,16 @@ namespace TraceXVerify
 					bStungWhileLoaded ? 1 : 0));
 
 			// ---- a carrier does not spend a bee ----
+			//
+			// *** READ THIS AS A STATEMENT ABOUT THE HOOK, NOT ABOUT THE GUN, SINCE v16 §1. *** This
+			// whole test drives TraceAbilityWeaponHooks::OnBulletHit directly, with no weapon
+			// component anywhere, so no clip ever moves and the bee count it watches is
+			// FTraceAbilityNetState::Stacks. In a real match Sting is a CLIP (§1: "reloads the clip
+			// with just the 5 bee bullets"), and a round that has left the clip has left it — so
+			// firing at a Core carrier DOES spend the round, even though, as measured below, it still
+			// marks nothing. What stays true either way is the carrier invariant the check is really
+			// here for: a Sting bullet cannot make a carrier vulnerable. Trace.X.StingClipTest owns
+			// the clip's own accounting.
 			int32 BeesBeforeCarrier = XSet->GetLoadedBees();
 			if (ATraceCore* CoreActor = ATraceCore::Get(TickWorld))
 			{

@@ -117,6 +117,24 @@ enum class ETraceInputAction : uint8
 	Ability,
 	AbilitySecondary,
 
+	/**
+	 * SPEC v16 §1 — "R to reload".
+	 *
+	 * A PROPER REBINDABLE ACTION AND NOT A HARDCODED EKeys::R, which is the whole reason this row
+	 * exists rather than a `case EKeys::R:` somewhere in the controller. Everything else a player
+	 * touches in this game is on this table and therefore on the options screen; a reload key that
+	 * was not would be the one control they could not change, and the one nobody could find.
+	 *
+	 * APPENDED, never inserted — ETraceInputAction is the index into UTraceUserSettings::Bindings, so
+	 * anything placed higher renumbers every action below it. See EquipKnife's comment for what that
+	 * costs and why the .ini survives it anyway (it is matched by ConfigId STRING, never by position).
+	 *
+	 * The RELOAD VERB itself is UTraceWeaponComponent::RequestReload, which is also what the
+	 * AUTOMATIC reload uses, so the bind and the empty-clip case cannot drift apart. R is not the only
+	 * way to reload and deliberately so: spec v16 §1 asks for both.
+	 */
+	Reload,
+
 	Count UMETA(Hidden)
 };
 

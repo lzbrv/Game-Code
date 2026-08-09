@@ -18,10 +18,24 @@
 // ways rather than one.
 //
 // ===================================================================================================
-// VULNERABLE (spec v14 §6, X's passive) — AND WHY IT LIVES HERE AND NOWHERE ELSE
+// VULNERABLE (spec v14 §6, X's passive; NOW STACKING — spec v16 §4) — AND WHY IT LIVES HERE
 // ===================================================================================================
 //
-// Verbatim: "An enemy hit by a bee becomes VULNERABLE for 2s, taking +25% damage FROM ALL SOURCES."
+// Verbatim (v14 §6): "An enemy hit by a bee becomes VULNERABLE for 2s, taking +25% damage FROM ALL
+// SOURCES."
+// Verbatim (v16 §4): "Change X's vulnerable to stack with each hit. The first stack still causes 25%
+// extra damage, but each additional stack only adds 5%. Whenever the timer runs out, all stacks
+// disappear."
+//
+// *** ONE DEADLINE, N STACKS, AND THAT SHAPE IS THE WHOLE OF v16 §4. *** There is exactly one timer
+// (VulnerableUntilServerTime) and one count (VulnerableStacks). Every hit adds a stack AND rewrites
+// the single deadline, so "whenever the timer runs out, all stacks disappear" needs no expiry tick,
+// no per-stack timers and no cleanup pass: GetVulnerableStacks() reports 0 the instant the deadline
+// passes, because it asks IsVulnerable() first. A design with one timer per stack would have made
+// that sentence false — stacks would have drained one at a time — which is why it is not that.
+//
+// v14 §6 said "does not stack; a new application RESETS the timer". v16 §4 supersedes the first half
+// and keeps the second: a new application still resets the timer, and now also adds one stack.
 //
 // "From all sources" is the whole requirement, so the mark is stored on the thing every source
 // already funnels through: this component. Bullets (UTraceWeaponComponent::ServerFire), the knife
@@ -178,14 +192,45 @@ namespace TraceVulnerable
 	TRACE_API int32 GetMarkAppliedCount();
 	TRACE_API void  ResetCounters();
 
-	/** The resolved multiplier a vulnerable target takes: 1 + UTraceSettings::XVulnerableDamageBonus. */
+	/**
+	 * The resolved multiplier for ONE stack: 1 + UTraceSettings::XVulnerableDamageBonus (x1.25).
+	 *
+	 * DELIBERATELY STILL THE ONE-STACK ANSWER after spec v16 §4 made the mark stack. It is what every
+	 * caller written before v16 meant by "the vulnerable multiplier", and silently turning it into
+	 * "the multiplier for however many stacks happen to be on somebody" would have changed the
+	 * meaning of code that never asked about stacks. GetMultiplierForStacks() below is the stacking
+	 * form, and UTraceHealthComponent::GetVulnerableDamageMultiplier() is what damage actually uses.
+	 */
 	TRACE_API float GetDamageMultiplier();
+
+	/**
+	 * Spec v16 §4's arithmetic, as a pure function: 1 + Bonus + (Stacks - 1) * StackBonus, clamped to
+	 * the cap, and exactly 1 for @p Stacks <= 0.
+	 *
+	 * So 1 -> x1.25, 2 -> x1.30, 3 -> x1.35, and 5 (the shipped cap) -> x1.45. Pure and public so a
+	 * harness can state the expected number without re-deriving it from two knobs, which is how the
+	 * test and the implementation end up agreeing on a shared mistake.
+	 */
+	TRACE_API float GetMultiplierForStacks(int32 Stacks);
+
+	/** The resolved stack ceiling: UTraceSettings::XVulnerableMaxStacks, clamped. Shipped 5. */
+	TRACE_API int32 GetMaxStacks();
+
+	/** What each stack after the first adds: UTraceSettings::XVulnerableStackBonus. Shipped 0.05. */
+	TRACE_API float GetStackBonus();
 
 	/** The resolved mark duration in seconds: UTraceSettings::XVulnerableDurationSeconds. */
 	TRACE_API float GetDurationSeconds();
 
 	/** True when the whole mechanic is armed (Trace.X.Vulnerable). 0 is the RED arm. */
 	TRACE_API bool  IsEnabled();
+
+	/**
+	 * True when STACKING is armed (Trace.X.VulnerableStacking). 0 is the RED arm for spec v16 §4:
+	 * the mark still lands and still amplifies, but every application pins the count at one, so a
+	 * harness can watch three hits measure x1.25 instead of x1.35.
+	 */
+	TRACE_API bool  IsStackingEnabled();
 
 	/** True when the amplifier is evaluated in the SHIPPED position, after the carrier early-out. */
 	TRACE_API bool  IsApplyOrderShipped();
@@ -258,15 +303,33 @@ public:
 
 	/**
 	 * REPLICATED. Absolute server time (the same clock as LastDamageServerTime) at which X's
-	 * vulnerable mark expires. -1000 = never marked. Spec v14 §6: "vulnerable for 2 s… Does not
-	 * stack; a new application RESETS the timer" — a reset is a plain write of a later deadline,
-	 * which is exactly why this is a deadline and not a countdown.
+	 * vulnerable mark expires. -1000 = never marked. Spec v14 §6: "a new application RESETS the
+	 * timer" — a reset is a plain write of a later deadline, which is exactly why this is a deadline
+	 * and not a countdown.
+	 *
+	 * *** THERE IS ONE OF THESE FOR ANY NUMBER OF STACKS (spec v16 §4). *** See the block comment at
+	 * the top of this file: the single deadline is what makes "whenever the timer runs out, all
+	 * stacks disappear" true without an expiry pass.
 	 *
 	 * Replicated so every machine can draw the mark and so a client's own damage numbers and the
 	 * server's agree about who was marked when. One float that changes only when a bee connects.
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_Vulnerable, VisibleAnywhere, Category = "Trace|Health")
 	float VulnerableUntilServerTime = -1000.f;
+
+	/**
+	 * REPLICATED. How many vulnerable stacks have been applied under the CURRENT deadline (spec
+	 * v16 §4). Capped at TraceVulnerable::GetMaxStacks().
+	 *
+	 * *** NEVER READ THIS DIRECTLY — CALL GetVulnerableStacks(). *** This raw field is not zeroed
+	 * when the deadline passes (nothing ticks to zero it, deliberately), so between expiry and the
+	 * next application it still holds the count of a mark that is no longer live. The accessor asks
+	 * IsVulnerable() first and is the only honest reading of "how many stacks are on this player".
+	 * It is a UPROPERTY here rather than private state for the same reason the deadline is: the HUD
+	 * on every machine draws the number.
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_Vulnerable, VisibleAnywhere, Category = "Trace|Health")
+	uint8 VulnerableStacks = 0;
 
 	UPROPERTY(BlueprintAssignable, Category = "Trace|Health")
 	FTraceOnDeath OnDeath;
@@ -288,14 +351,20 @@ public:
 	 *     exist because "the mark must not become a damage path" has to survive a future caller who
 	 *     forgets the choke point.
 	 *
-	 * NON-STACKING: the deadline is written, never accumulated, so a new application resets the 2 s
-	 * and never extends it past 2 s.
+	 * THE DEADLINE IS WRITTEN, NEVER ACCUMULATED, so a new application resets the duration and never
+	 * extends it past DurationSeconds.
+	 *
+	 * STACKS (spec v16 §4). Every application that LANDS also adds one stack, up to
+	 * TraceVulnerable::GetMaxStacks(). An application that lands on a target whose previous mark has
+	 * already EXPIRED starts again at one stack — the count belongs to the deadline, not to the
+	 * player. A refused application (carrier, dead, disarmed) adds nothing, which is what keeps the
+	 * carrier locks below from being bypassed by counting.
 	 *
 	 * @param Source  the controller credited with the mark. May be null; kept server-side only.
 	 */
 	bool ApplyVulnerable(float DurationSeconds, AController* Source);
 
-	/** SERVER ONLY. Removes the mark. Called on respawn and at half time. */
+	/** SERVER ONLY. Removes the mark AND its stacks. Called on respawn and at half time. */
 	void ClearVulnerable();
 
 	/** True while the mark is live. Correct on clients — the deadline is replicated. */
@@ -305,12 +374,25 @@ public:
 	float GetVulnerableRemaining() const;
 
 	/**
+	 * *** THE STACK COUNT, AND THE ONE THE HUD MUST DRAW (spec v16 §4). *** 0 when not marked.
+	 *
+	 * Correct on clients: both the deadline and the count are replicated, and this derives the
+	 * answer from both rather than trusting the count on its own. "Whenever the timer runs out, all
+	 * stacks disappear" is implemented HERE, by asking IsVulnerable() first — which is why the
+	 * number falls to zero all at once and never drains.
+	 *
+	 * Returns 0 for a Core carrier too, because a carrier can never be marked at all (spec §4).
+	 */
+	int32 GetVulnerableStacks() const;
+
+	/**
 	 * THE ONE MULTIPLIER, and the reason this feature is not five call sites.
 	 *
-	 * 1 + UTraceSettings::XVulnerableDamageBonus (1.25 as shipped) while marked, otherwise 1.
+	 * Spec v16 §4's arithmetic for the live stack count: 1 + 0.25 + (N - 1) * 0.05, i.e. x1.25 at one
+	 * stack, x1.30 at two, x1.35 at three, x1.45 at the shipped cap of five. Exactly 1 when unmarked.
 	 * *** ALWAYS 1 FOR A CORE HOLDER *** — unconditionally, including inside the hover-pass window
 	 * where a carrier is deliberately shootable, so the amplifier can never contribute a single point
-	 * of damage to a carrier under any circumstance.
+	 * of damage to a carrier under any circumstance, at any stack count.
 	 */
 	float GetVulnerableDamageMultiplier() const;
 

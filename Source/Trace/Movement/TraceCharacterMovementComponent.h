@@ -92,8 +92,9 @@
 // the direction from the same two inputs. No new saved-move field and no extra bandwidth.
 //
 // THE CLIMB. A dash is velocity on rails for its window, so a vertical one rises DashSpeed ×
-// DashDuration (3000 × 0.18 = 540 uu) with gravity suspended, and would then exit still carrying
-// 3000 uu/s upward — another 4592 uu of coast, well past the arena's 1640 uu ceiling. The air-strafe
+// DashDuration (3300 × 0.18 = 594 uu, v16 §0) with gravity suspended, and would then exit still
+// carrying 3300 uu/s upward — another 4960 uu of coast at the shipped 1.12 gravity scale, well past
+// the arena's 1640 uu ceiling. The air-strafe
 // ceiling does NOT bound this: it is planar-only by construction and cannot touch Z. So
 // ApplyDashExitSpeed() now clamps POSITIVE exit Z to GetDashExitVerticalSpeedLimit() (JumpZVelocity)
 // exactly as it already clamped planar speed to DashExitSpeedMultiplier × the ground limit. Total
@@ -415,7 +416,7 @@
 //     the wall normal and v_out is the launch's outward component. Put the shipped numbers in:
 //
 //       FIRST wall jump of a chain, off a 1100 uu/s ground run, head on:
-//         v_out = 1100 × 0.7695 + 420 = 1266 uu/s  ->  peak 100 uu. It escapes. This is the one
+//         v_out = 1100 × 0.7695 + 360 = 1206 uu/s  ->  peak 91 uu. It escapes. This is the one
 //         every previous measurement looked at, and it is the one case that was never broken.
 //
 //       EVERY WALL JUMP TAKEN FROM THE AIR — i.e. the second and third of a chain, which is how
@@ -423,8 +424,9 @@
 //         AirMaxWishSpeed is 160, and it is a hard cap on speed along the wish direction. So a pawn
 //         returning to a wall under its own air control arrives at AT MOST 160 uu/s into the face.
 //         The reflection therefore contributes at most 160 × 0.7695 = 123 uu/s and
-//         WallJumpOutwardImpulse (420, flat) is essentially the whole launch:
-//         v_out ≈ 543 uu/s  ->  peak 543² / 16000 = 18 uu. AGAINST A 34 uu CAPSULE RADIUS.
+//         WallJumpOutwardImpulse (360, flat — v16 §0 cut it from 420) is essentially the whole
+//         launch:
+//         v_out ≈ 483 uu/s  ->  peak 483² / 16000 = 15 uu. AGAINST A 34 uu CAPSULE RADIUS.
 //         The pawn never gets half a capsule off the face before it is being driven back into it.
 //
 //     That is the stick. It is invisible to any amount of window tuning because it happens entirely
@@ -1037,6 +1039,48 @@ public:
 	 * This is the state that used to be erased on landing and is now bled off instead.
 	 */
 	bool IsCarryingExcessSpeed() const;
+
+	// --- The audit surface (spec v16 §5) ---------------------------------------------------------
+	//
+	// Read-only forwarders onto tuning getters and instrument counters that are otherwise protected,
+	// so Movement/TraceMovementAuditV16.cpp can print an EXPECTED column that IS the shipped
+	// derivation rather than a second copy of it.
+	//
+	// WHY NOT JUST RECOMPUTE IN THE HARNESS. Because "1 + (SlideJumpWindowSpeedBonus - 1) x
+	// SlideJumpBonusScale" typed into a test file is a second opinion about the rule, and this
+	// project's standing lesson is that two copies of a rule are two things that can disagree — a
+	// harness holding the stale copy reports PASS forever after the shipped one moves. Forwarding
+	// keeps one definition.
+	//
+	// Nothing here has a setter and nothing here is called by gameplay. If a future pass makes these
+	// getters public in their own right, delete these forwarders rather than leaving both.
+
+	/** Live slide velocity, in uu/s. Zero when not sliding. */
+	float GetSlideSpeedForAudit() const { return SlideSpeed; }
+
+	/** Seconds of slide left, the same number the well-timed window is measured against. */
+	float GetSlideTimeLeftForAudit() const { return GetSlideTimeLeft(); }
+
+	/** The well-timed multiplier actually in force, both readings of spec v9 §7 resolved. */
+	float GetSlideJumpWindowSpeedBonusForAudit() const { return GetSlideJumpWindowSpeedBonus(); }
+
+	/** Planar retention a slide-jump applies OUTSIDE the well-timed window. */
+	float GetSlideJumpHorizontalRetentionForAudit() const { return GetSlideJumpHorizontalRetention(); }
+
+	/** Length of the well-timed window, in seconds, at the end of a slide. */
+	float GetSlideJumpWindowSecondsForAudit() const { return GetSlideJumpWindowSeconds(); }
+
+	/** Server movement corrections this client has received. Always 0 on an authority. */
+	int32 GetCorrectionCountForAudit() const { return CorrectionCount; }
+
+	/** Worst single correction distance, in uu. */
+	float GetCorrectionWorstForAudit() const { return CorrectionErrorWorst; }
+
+	/** Mean correction distance, in uu, over every correction so far. */
+	float GetCorrectionMeanForAudit() const
+	{
+		return CorrectionErrorTotal / static_cast<float>(FMath::Max(1, CorrectionCount));
+	}
 
 	// --- Per-move intents ------------------------------------------------------------------------
 	//
