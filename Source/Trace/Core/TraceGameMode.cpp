@@ -19,6 +19,7 @@
 #include "TimerManager.h"
 
 #include "AI/TraceBotController.h"
+#include "Abilities/TraceAbilityComponent.h"   // v14 §3 — the roster rules this class defers to
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
@@ -35,10 +36,55 @@
 #include "World/TraceArenaBuilder.h"
 #include "World/TraceTeamPlayerStart.h"
 
+namespace
+{
+	/**
+	 * THE RED ARM FOR THE CHARACTER-SELECT SLICE (spec v14 §3).
+	 *
+	 * 1 (default): this class enforces the two rules it owns — a request for a character a team-mate
+	 * holds is REFUSED with a reason, and a select screen that runs out of time AUTO-ASSIGNS. 0
+	 * removes both, and Trace.Characters.Verify must then FAIL on exactly those two assertions.
+	 *
+	 * *** WHAT THE ARM CAN AND CANNOT REACH, STATED PLAINLY, BECAUSE THE FIRST VERSION OF IT LIED. ***
+	 * The first attempt bypassed only this class's pre-flight availability test — and the red run came
+	 * back 19/19 GREEN. Two independent things were catching it: the post-verify below (which reads
+	 * what the component actually holds rather than trusting the pre-flight), and
+	 * UTraceAbilityComponent::ServerSetCharacter's own refusal, which lives in another ownership slice
+	 * this switch cannot touch at all. A red arm that reports green is worse than no red arm — it is
+	 * evidence that has been manufactured — so the arm now also skips the post-verify.
+	 *
+	 * That means the arm reaches THIS SLICE'S enforcement and nothing else. The assertion "the loser
+	 * does not end up holding the contested character" therefore stays GREEN under the red arm, and
+	 * that is a result rather than a defect: it says the roster rule is enforced twice, independently,
+	 * and that only the REPORTING of it lives here.
+	 *
+	 * Cheat-only and compiled out of shipping, so no player can reach it and no ini can turn it off.
+	 */
+#if !UE_BUILD_SHIPPING
+	int32 GTraceEnforceSelectRules = 1;
+
+	FAutoConsoleVariableRef CVarTraceEnforceSelectRules(
+		TEXT("Trace.Characters.EnforceSelectRules"),
+		GTraceEnforceSelectRules,
+		TEXT("1 (default, spec v14 3): the character-select slice refuses a pick a team-mate already "
+		     "holds and auto-assigns on the timeout. 0 removes both so Trace.Characters.Verify can be "
+		     "shown to FAIL - the red arm. Prefer 'Trace.Characters.VerifyRed', which scopes it to one "
+		     "run. Dev only; no ini override, absent from shipping."),
+		ECVF_Cheat);
+#endif
+}
+
 namespace TraceGameModeConstants
 {
 	/** Fallback Core spawn height if the arena builder is missing or returns garbage. */
 	static const FVector FallbackCoreLocation(0.f, 0.f, 200.f);
+
+	/**
+	 * Seconds between PollCharacterSelect() passes. 4 Hz: the screen it opens is a menu, not a
+	 * mechanic, and a quarter second of latency on "your select screen appeared" is imperceptible
+	 * against the auto-pick timeout it is measured against.
+	 */
+	static constexpr float CharacterSelectPollInterval = 0.25f;
 
 	/** Smallest respawn delay we will honour; zero would respawn inside the death frame. */
 	static constexpr float MinRespawnDelay = 0.1f;
@@ -174,6 +220,12 @@ void ATraceGameMode::InitGame(const FString& MapName, const FString& Options, FS
 	// InitGame is the last point before PreInitializeComponents builds the arena, and the arena is
 	// one of the things the mode decides the shape of.
 	ResolveScoringMode(Options);
+
+	// Characters on or off for this match (spec v14 §3's settings toggle). AFTER ResolveScoringMode,
+	// which is not merely tidy: AreCharactersEnabled() gates on mode B, and resolving the toggle
+	// before the mode was published would log "characters are ON" for a mode A match that will never
+	// have any. Same three-way resolution as the mode and the difficulty above.
+	ResolveCharactersEnabled(Options);
 
 	// Test hook for the MERCY RULE, and it earns its place for the same reason the half-length hooks
 	// above do: at the shipped threshold of 8 the rule fires perhaps once in a long lopsided match,
@@ -314,6 +366,15 @@ void ATraceGameMode::BeginPlay()
 	GetWorldTimerManager().SetTimer(ScoringModePollHandle, this, &ATraceGameMode::PollScoringModeSetting,
 		TraceGameModeConstants::ScoringModePollInterval, /*bLoop=*/true,
 		TraceGameModeConstants::ScoringModePollInterval);
+
+	// Character selection (spec v14 §3). Started here rather than from PostLogin because the listen
+	// server's host logs in during map load, before this class has a GameState to read the mode from
+	// — and because the poll has to keep running to close screens when the A/B toggle switches the
+	// match to mode A. First fire is immediate so the host is offered a pick on the opening frames
+	// rather than a quarter second in. See PollCharacterSelect().
+	GetWorldTimerManager().SetTimer(CharacterSelectPollHandle, this, &ATraceGameMode::PollCharacterSelect,
+		TraceGameModeConstants::CharacterSelectPollInterval, /*bLoop=*/true,
+		TraceGameModeConstants::CharacterSelectPollInterval);
 
 #if !UE_BUILD_SHIPPING
 	if (FParse::Param(FCommandLine::Get(), TEXT("TraceBotDebug")))
@@ -853,6 +914,52 @@ void ATraceGameMode::NotifyCharacterDied(ATraceCharacter* Victim, AController* K
 		(KillerState != nullptr) ? *KillerState->GetPlayerName() : TEXT("<world>"),
 		*Cause.ToString());
 
+	// =============================================================================================
+	// SPEC v14 §6 — THE ABILITY LAYER'S KILL AND DEATH HOOKS. This function is the whole funnel.
+	// =============================================================================================
+	//
+	// Rocco's passive ("3% speed boost from headshot kills") and Chut's Chud refresh ("the timer
+	// refreshes on a knife kill") both hang off NotifyKill, and until this call existed neither had
+	// any way to fire — Rocco's stack could never leave zero however correct its arithmetic was.
+	//
+	// HEADSHOT IS DERIVED FROM THE CAUSE, not from a new parameter. UTraceWeaponComponent already
+	// distinguishes the two ("Headshot" vs "Bullet") when it names the damage, and that FName is
+	// carried all the way here — so the kill feed, Rocco's stack and the death panel all read one
+	// value rather than three that can disagree. UTraceAbilitySetChut applies the same reading on
+	// the incoming-damage side (it matches "Knife" / "Backstab" by name), which is why the two
+	// halves of a character's rules cannot drift.
+	//
+	// The SAME EXCLUSIONS the score uses: a suicide and a team kill are not kills, so they must not
+	// feed a passive either. bSelfKill and bTeamKill are computed above and reused rather than
+	// recomputed, so a change to what counts as a kill cannot move the scoreboard and leave the
+	// abilities behind.
+	if (TraceAbilityIntegration::IsEnabled())
+	{
+		static const FName HeadshotCause(TEXT("Headshot"));
+		const bool bHeadshotKill = (Cause == HeadshotCause);
+
+		if (!bSelfKill && !bTeamKill && KillerState != nullptr)
+		{
+			if (UTraceAbilityComponent* KillerAbilities = UTraceAbilityComponent::Get(KillerState))
+			{
+				++TraceAbilityIntegration::Counters().Kills;
+				KillerAbilities->NotifyKill(Victim, Cause, bHeadshotKill);
+			}
+		}
+
+		// The victim's own abilities are told unconditionally — a suicide is still a death, and a
+		// character tearing down its world actors on death must not be skipped because nobody got
+		// the credit. Oyster's jars and Mace's spike clean up through here.
+		if (VictimState != nullptr)
+		{
+			if (UTraceAbilityComponent* VictimAbilities = UTraceAbilityComponent::Get(VictimState))
+			{
+				++TraceAbilityIntegration::Counters().PawnDied;
+				VictimAbilities->NotifyPawnDied();
+			}
+		}
+	}
+
 	// 4. Tell the victim who got them, so their HUD can show the death panel.
 	if (ATracePlayerController* VictimPC = Cast<ATracePlayerController>(VictimController))
 	{
@@ -985,6 +1092,24 @@ void ATraceGameMode::RestartPlayerFresh(AController* Controller)
 		if (FreshCharacter != nullptr && FreshCharacter->IsAlive())
 		{
 			ClearWipeLatchIfAlive(RestartedState->Team);
+		}
+
+		// SPEC v14 §5/§6. Every path that hands out a fresh pawn funnels through this function, which
+		// is exactly why the hook belongs here and not in RespawnController().
+		//
+		// IT MUST NOT TOUCH THE COOLDOWN, and it does not: NotifyPawnSpawned() reaches only the
+		// character's OnPawnSpawned() and the framework's cooldown lives on the PlayerState, which
+		// survived the Destroy() twenty lines up. That is the whole reason "a player can spawn with
+		// an ability timer still counting down" is true — see the cooldown contract in
+		// Abilities/TraceAbilityComponent.h — and it is what Trace.Ability.CooldownPersistenceTest
+		// measures across a real pawn identity change.
+		if (TraceAbilityIntegration::IsEnabled())
+		{
+			if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(RestartedState))
+			{
+				++TraceAbilityIntegration::Counters().PawnSpawned;
+				Abilities->NotifyPawnSpawned();
+			}
 		}
 	}
 }
@@ -1741,6 +1866,15 @@ ATraceBotController* ATraceGameMode::SpawnBotForTeam(ETraceTeam Team)
 	}
 
 	BotState->SetTeam(Team);
+
+	// Spec v14 §3, verbatim: "Bots remain characterless, for now." bIsABot is the engine's own
+	// replicated "this is not a person" flag and, until now, nothing in this project set it — the
+	// PlayerState was indistinguishable from a human's on every machine. The character system asks
+	// that question in three places (never offer a select screen, never consume a team's slot, never
+	// count towards per-team uniqueness), so the answer has to be replicated rather than derived from
+	// the controller, which does not exist on a client at all.
+	BotState->SetIsABot(true);
+
 	Bot->SetBotDisplayName(FString::Printf(TEXT("BOT %s %d"), *TraceTeamName(Team).ToString(), NextBotNumber++));
 
 	Bots.Add(Bot);
@@ -2882,6 +3016,15 @@ void ATraceGameMode::BeginHalfTimeBreak()
 	ReleaseCore();
 	ResetPlayersToSpawns();
 
+	// Spec v14 §5, verbatim: "They should all reset at halftime." HERE, at the top of the interval,
+	// and not at the start of the second half — a player who spends the break watching an ability
+	// meter that is still counting down has been told the rule does not work, and the fact that it
+	// would have snapped to ready twelve seconds later does not help them.
+	//
+	// This is also the ONLY reset in the codebase. Death, respawns and goals deliberately do not
+	// touch ActivatedCooldownEndServerTime; see the note on that property in TracePlayerState.h.
+	ResetAbilityCooldownsForHalfTime();
+
 	// The scores deliberately survive: the second half continues the first (spec §9 q5).
 	UE_LOG(LogTraceGame, Display, TEXT("HALF TIME (%.0fs). Sides switch: %s now defends -X. Blue %d - Orange %d"),
 		BreakDuration, *TraceTeamName(GetNegativeSideTeamForHalf(NextHalf)).ToString(),
@@ -3048,6 +3191,393 @@ void ATraceGameMode::ReturnToMainMenu()
 	// Absolute travel: the menu runs a different game mode on a different map, and a relative
 	// travel would carry this match's URL options (?difficulty=, ?bots=) into it.
 	UGameplayStatics::OpenLevel(World, FName(TraceMaps::MainMenu), /*bAbsolute=*/true);
+}
+
+// =============================================================================================
+// CHARACTER SELECTION (spec v14 §3)
+// =============================================================================================
+
+// ---------------------------------------------------------------------------------------------
+// WHERE THE RULES ACTUALLY LIVE, and what this class contributes
+//
+// UTraceAbilityComponent owns the ROSTER RULE: per-team uniqueness, "None is always allowed", "bots
+// never hold a character", and the master on/off switch. Those are the same rules five character
+// agents are coding against, and re-implementing them here would give the project two answers to one
+// question — the exact drift this codebase keeps getting bitten by.
+//
+// What this class owns is the SESSION and the CONVERSATION, neither of which the component has:
+//   * WHO is being asked to pick, and WHEN their screen opens (PollCharacterSelect);
+//   * the TIMEOUT that auto-assigns, so one idle player cannot stall the match (spec §3
+//     [ASSUMPTION]) — the component supplies PickFreeCharacterFor, but nothing drives it;
+//   * the VERDICT sent back to the requesting client, which is what makes spec §3's "the loser is
+//     TOLD and re-picks" true. UTraceAbilityComponent::ServerRequestSetCharacter is fire-and-forget
+//     and answers nothing, so a losing client would otherwise see its button do nothing at all.
+//
+// So RequestCharacter below is a REPORTER, not a second rulebook: it asks the component's own
+// predicate, calls the component's own setter, and then CHECKS WHAT ACTUALLY HAPPENED rather than
+// assuming its own pre-flight was right.
+// ---------------------------------------------------------------------------------------------
+
+void ATraceGameMode::ResolveCharactersEnabled(const FString& Options)
+{
+	// Priority order, highest first. Each source answers a different question, which is why there are
+	// four of them and why the order is what it is:
+	//
+	//   1. "?characters=0|1" — what the player just chose in the settings menu, carried across the
+	//      travel by the title screen. The most recent human decision wins over everything.
+	//   2. "-TraceCharacters=0|1" — a headless run's override, so an automated pass can test both
+	//      arms of the toggle in one build without touching any saved file.
+	//   3. TraceCharacters::GetEnabledSetting() — the saved toggle, for the case the URL is dropped
+	//      (a map opened directly, a PIE run, a listen server restarted from the console).
+	//   4. the shipped default in Config/DefaultGame.ini.
+	//
+	// The RESOLVED answer is written onto the UTraceSettings CDO, which is where
+	// UTraceAbilityComponent::AreCharactersEnabled reads it from — exactly the shape
+	// TraceScoring::ApplyToSettings uses for the A/B mode, and for the same reason: writing it back
+	// means the settings page, the travel URL and the framework are all reading one value rather than
+	// three that can disagree.
+	//
+	// Note the '?' separator rule this file already learned the hard way (see the bots/difficulty
+	// block in InitGame): UE URL options chain with '?', never with '&'.
+	bool bResolved = UTraceSettings::Get().bCharactersEnabled;
+	const TCHAR* Source = TEXT("project settings");
+
+	if (UGameplayStatics::HasOption(Options, TraceCharacters::UrlOption))
+	{
+		bResolved = UGameplayStatics::GetIntOption(Options, TraceCharacters::UrlOption, 1) != 0;
+		Source = TEXT("travel URL '?characters='");
+	}
+	else
+	{
+		int32 CommandLineValue = -1;
+		if (FParse::Value(FCommandLine::Get(), TEXT("TraceCharacters="), CommandLineValue))
+		{
+			bResolved = (CommandLineValue != 0);
+			Source = TEXT("command line '-TraceCharacters='");
+		}
+		else if (TraceCharacters::HasSavedSetting())
+		{
+			bResolved = TraceCharacters::GetEnabledSetting();
+			Source = TEXT("saved settings toggle");
+		}
+	}
+
+	if (UTraceSettings* MutableSettings = GetMutableDefault<UTraceSettings>())
+	{
+		MutableSettings->bCharactersEnabled = bResolved;
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Characters are %s for this match (%s)."),
+		bResolved ? TEXT("ON") : TEXT("OFF"), Source);
+}
+
+bool ATraceGameMode::AreCharactersEnabled() const
+{
+	// FORWARDED, not re-derived. The framework's version already answers both halves — the settings
+	// toggle and spec §2's mode A freeze — and it is the version every ability in the game obeys. A
+	// second implementation here could say "on" in a match where no ability would ever fire.
+	return HasAuthority() && UTraceAbilityComponent::AreCharactersEnabled(this);
+}
+
+bool ATraceGameMode::IsCharacterTakenOnTeam(ETraceTeam InTeam, uint8 CharacterId, const ATracePlayerState* Except) const
+{
+	if (InTeam == ETraceTeam::None || !TraceCharacterRoster::IsValidId(CharacterId))
+	{
+		return false;
+	}
+
+	const APlayerState* const Holder = UTraceAbilityComponent::FindTeammateHolding(
+		this, InTeam, static_cast<ETraceCharacterId>(CharacterId));
+
+	return (Holder != nullptr) && (Holder != Except);
+}
+
+uint8 ATraceGameMode::FindFreeCharacterForTeam(ETraceTeam InTeam, const ATracePlayerState* Except) const
+{
+	// The framework's own picker, so the auto-assign and a manual pick agree about what "free" means.
+	// It takes the asking player state rather than a team, which is what makes "except me" implicit.
+	const ETraceCharacterId Picked = UTraceAbilityComponent::PickFreeCharacterFor(Except);
+	if (Picked != ETraceCharacterId::None)
+	{
+		return static_cast<uint8>(Picked);
+	}
+
+	// Five characters and five players per team, so this is only reachable if PlayersPerTeam is
+	// raised above the roster size. Say so rather than handing back Rocco twice.
+	UE_LOG(LogTraceGame, Warning,
+		TEXT("[CharSelect] No free character left on %s - the team has more players than the roster has characters."),
+		*TraceTeamName(InTeam).ToString());
+
+	return TraceCharacterRoster::NoneId;
+}
+
+ETraceCharacterPickResult ATraceGameMode::RequestCharacter(ATracePlayerState* Requester, uint8 RequestedCharacter)
+{
+	if (!HasAuthority() || Requester == nullptr)
+	{
+		return ETraceCharacterPickResult::Disabled;
+	}
+
+	if (!AreCharactersEnabled())
+	{
+		return ETraceCharacterPickResult::Disabled;
+	}
+
+	if (!TraceCharacterRoster::IsValidId(RequestedCharacter))
+	{
+		return ETraceCharacterPickResult::InvalidId;
+	}
+
+	// LOCKED IS TESTED BEFORE "not selecting", and the order is the fix for a bug the scripted proof
+	// caught on its first run: a locked-in player's screen is CLOSED (closing it is what a grant
+	// does), so the not-selecting test below matched first and a player who tried to switch was told
+	// "NOT PICKING RIGHT NOW" instead of "YOU HAVE ALREADY LOCKED IN". Both refuse, so nothing was
+	// broken — but the message named the wrong reason, and a wrong reason on a screen whose entire job
+	// is telling the player why they were refused is the failure this feature is most likely to be
+	// reported for.
+	if (Requester->bCharacterLocked)
+	{
+		return ETraceCharacterPickResult::AlreadyLocked;
+	}
+
+	// A bot has no select screen and cannot have sent this; if one ever does, refuse rather than
+	// quietly giving it an ability set the spec says it must not have.
+	if (Requester->IsABot() || !Requester->IsCharacterSelectOpen())
+	{
+		return ETraceCharacterPickResult::NotSelecting;
+	}
+
+	UTraceAbilityComponent* const Abilities = UTraceAbilityComponent::Get(Requester);
+	if (Abilities == nullptr)
+	{
+		// The framework has not attached a component yet. Refusing as "not selecting" rather than
+		// granting is the safe direction — a grant we cannot write is a grant the player would see
+		// accepted and then lose.
+		return ETraceCharacterPickResult::NotSelecting;
+	}
+
+	const ETraceCharacterId Wanted = static_cast<ETraceCharacterId>(RequestedCharacter);
+
+	// THE RULE. Spec v14 §3, verbatim: "Do not allow players to select a character who has already
+	// been chosen by a player on their team". Enemies mirroring the pick are explicitly fine, which
+	// is why this asks IsCharacterAvailableFor (per-TEAM) rather than "is anybody holding it".
+	//
+	// Asked here as a PRE-FLIGHT so the refusal can be reported with a reason. The authoritative
+	// enforcement is ServerSetCharacter's own, checked immediately below — see the post-verify.
+	bool bAvailable = UTraceAbilityComponent::IsCharacterAvailableFor(Requester, Wanted);
+
+	// THE RED ARM. See GTraceEnforceSelectRules at the top of this file for exactly what it reaches
+	// and what it deliberately does not.
+	bool bEnforceHere = true;
+#if !UE_BUILD_SHIPPING
+	bEnforceHere = (GTraceEnforceSelectRules != 0);
+#endif
+
+	if (!bEnforceHere)
+	{
+		bAvailable = true;
+	}
+
+	if (!bAvailable)
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("[CharSelect] '%s' asked for %s; a team-mate already has it."),
+			*Requester->GetPlayerName(), *TraceCharacterRoster::NameFor(RequestedCharacter));
+		return ETraceCharacterPickResult::TakenByTeammate;
+	}
+
+	Abilities->ServerSetCharacter(Wanted);
+
+	// THE POST-VERIFY, and it is the reason this function is trustworthy. The pre-flight above is a
+	// separate read of a roster that another request may have changed in between; the only fact worth
+	// reporting is what the component actually holds now. Without this, a losing client could be told
+	// "granted" for a character the framework quietly refused.
+	//
+	// Skipped by the red arm as well as the pre-flight, and it has to be: with only the pre-flight
+	// bypassed this check silently produced the correct refusal anyway and the red run reported 19/19
+	// green. See GTraceEnforceSelectRules.
+	if (bEnforceHere && Abilities->GetCharacterId() != Wanted)
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("[CharSelect] '%s' asked for %s; the framework refused it."),
+			*Requester->GetPlayerName(), *TraceCharacterRoster::NameFor(RequestedCharacter));
+		return ETraceCharacterPickResult::TakenByTeammate;
+	}
+
+	Requester->ServerMarkCharacterResolved(/*bLocked=*/true, /*bWasChosen=*/true);
+	Requester->ServerSetCharacterSelectOpen(/*bOpen=*/false, /*DeadlineServerTime=*/0.f);
+
+	return ETraceCharacterPickResult::Granted;
+}
+
+void ATraceGameMode::PollCharacterSelect()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	const AGameStateBase* BaseGameState = GameState;
+	if (BaseGameState == nullptr)
+	{
+		return;
+	}
+
+	const bool bEnabled = AreCharactersEnabled();
+	const double NowServer = BaseGameState->GetServerWorldTimeSeconds();
+
+	for (APlayerState* const EachState : BaseGameState->PlayerArray)
+	{
+		ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+		if (Candidate == nullptr)
+		{
+			continue;
+		}
+
+		// ---- Characters off, or mode A: force everyone back to the Mannequin --------------------
+		//
+		// Not just "do not open a screen". Spec v14 §2's [ASSUMPTION] is that loading mode A forces
+		// every player to the default characterless Mannequin, and the toggle has to be able to undo
+		// a selection made before it was flipped — otherwise turning characters off mid-session would
+		// leave everyone holding the abilities it was supposed to remove.
+		if (!bEnabled)
+		{
+			if (Candidate->IsCharacterSelectOpen())
+			{
+				Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+			}
+			if (Candidate->GetSelectedCharacter() != TraceCharacterRoster::NoneId)
+			{
+				if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Candidate))
+				{
+					// Setting None is documented as always allowed and never refused, which is what
+					// makes this a safe unconditional clear rather than a request that might bounce.
+					Abilities->ServerSetCharacter(ETraceCharacterId::None);
+				}
+				Candidate->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+			}
+			continue;
+		}
+
+		// ---- Bots never see this screen and never hold a character ------------------------------
+		if (Candidate->IsABot())
+		{
+			if (Candidate->GetSelectedCharacter() != TraceCharacterRoster::NoneId)
+			{
+				// Defensive, and worth keeping: a bot with an ability set is the single most
+				// confusing outcome this feature could produce, and it would look like an AI bug.
+				// The framework refuses to give a bot a character in the first place, so reaching
+				// this is itself news.
+				UE_LOG(LogTraceGame, Warning, TEXT("[CharSelect] Bot '%s' held %s; clearing it."),
+					*Candidate->GetPlayerName(), *TraceCharacterRoster::NameFor(Candidate->GetSelectedCharacter()));
+
+				if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Candidate))
+				{
+					Abilities->ServerSetCharacter(ETraceCharacterId::None);
+				}
+			}
+			if (Candidate->IsCharacterSelectOpen())
+			{
+				Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+			}
+			continue;
+		}
+
+		// A player with no team yet has no team-mates to be unique against, so the screen would be
+		// drawing an answer it cannot enforce. Wait for the balancer.
+		if (Candidate->Team == ETraceTeam::None)
+		{
+			continue;
+		}
+
+		// ---- Already sorted --------------------------------------------------------------------
+		if (Candidate->HasCharacter())
+		{
+			if (Candidate->IsCharacterSelectOpen())
+			{
+				Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+			}
+			continue;
+		}
+
+		// ---- Open the screen -------------------------------------------------------------------
+		if (!Candidate->IsCharacterSelectOpen())
+		{
+			const float Deadline = (CharacterSelectTimeout > 0.f)
+				? static_cast<float>(NowServer + CharacterSelectTimeout)
+				: 0.f;
+
+			Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/true, Deadline);
+
+			UE_LOG(LogTraceGame, Log, TEXT("[CharSelect] Select screen opened for '%s' (%s)%s."),
+				*Candidate->GetPlayerName(), *TraceTeamName(Candidate->Team).ToString(),
+				(Deadline > 0.f) ? *FString::Printf(TEXT("; auto-pick in %.0fs"), CharacterSelectTimeout) : TEXT("; no timeout"));
+			continue;
+		}
+
+		// ---- The timeout (spec v14 §3 [ASSUMPTION]) ---------------------------------------------
+		//
+		// The SECOND thing the red arm reaches. This one is wholly ours — nothing in the ability
+		// framework drives a timeout — so switching it off makes the harness's auto-assign assertion
+		// fail outright, with no second layer to mask it. That is what makes the red run informative
+		// rather than merely different.
+		bool bAutoAssign = true;
+#if !UE_BUILD_SHIPPING
+		bAutoAssign = (GTraceEnforceSelectRules != 0);
+#endif
+
+		const float Deadline = Candidate->CharacterSelectDeadlineServerTime;
+		if (bAutoAssign && Deadline > 0.f && NowServer >= static_cast<double>(Deadline))
+		{
+			const uint8 AutoPick = FindFreeCharacterForTeam(Candidate->Team, Candidate);
+
+			if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Candidate))
+			{
+				Abilities->ServerSetCharacter(static_cast<ETraceCharacterId>(AutoPick));
+			}
+
+			// Closed either way. A player the roster cannot serve still must not sit behind a screen
+			// forever — they play the Mannequin, which is a worse outcome than picking and a much
+			// better one than being stuck.
+			Candidate->ServerMarkCharacterResolved(
+				/*bLocked=*/TraceCharacterRoster::IsValidId(AutoPick), /*bWasChosen=*/false);
+			Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+
+			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] '%s' did not pick in time; auto-assigned %s."),
+				*Candidate->GetPlayerName(), *TraceCharacterRoster::NameFor(AutoPick));
+		}
+	}
+}
+
+void ATraceGameMode::ResetAbilityCooldownsForHalfTime()
+{
+	if (!HasAuthority() || GameState == nullptr)
+	{
+		return;
+	}
+
+	// Spec v14 §5, verbatim: "They should all reset at halftime." EVERY player state, including ones
+	// whose owner is dead and ones whose pawn does not exist — which is the whole reason the ability
+	// component hangs off the player state rather than the pawn. A loop over live pawns would silently
+	// skip exactly the players the rule was written to protect.
+	//
+	// UTraceAbilityWorldSubsystem also watches the GameState for the break and calls OnHalfTime()
+	// itself. Both drivers are kept on purpose and are harmless together: OnHalfTime() zeroes an
+	// absolute deadline and is idempotent, and this one fires on the SAME FRAME the break begins
+	// rather than on whatever tick the subsystem next notices it — which is the difference between a
+	// player watching their meter snap to ready and a player watching it keep counting for a moment.
+	int32 ResetCount = 0;
+	for (APlayerState* const EachState : GameState->PlayerArray)
+	{
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(EachState))
+		{
+			if (Abilities->GetActivatedCooldownRemaining() > 0.f)
+			{
+				++ResetCount;
+			}
+			Abilities->OnHalfTime();
+		}
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("[Ability] Half time: %d running cooldown(s) reset."), ResetCount);
 }
 
 #if !UE_BUILD_SHIPPING
@@ -3566,6 +4096,445 @@ namespace
 		     "'mercy': prove a mercy win still ends the match immediately with a whistle pending, and "
 		     "leaves neither pending timer armed."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TraceHalfTimeVerifyCommand));
+}
+
+// =============================================================================================
+// Trace.Characters.Verify — the scripted proof for spec v14 §3
+//
+// WHAT ORGANIC PLAY CANNOT SHOW YOU. Every interesting case here is a RACE or a REFUSAL, and neither
+// is reachable by playing: two team-mates pressing the same key inside one frame does not happen on
+// demand, an enemy mirroring a pick looks identical to a bug unless you already know it is legal,
+// and the auto-assign timeout takes thirty seconds of doing nothing. So all four are driven here.
+//
+// HOW IT GETS TWO HUMANS. A headless run has one human at most. The harness borrows bots: it clears
+// APlayerState::bIsABot on three of them for the duration, which makes them ordinary players as far
+// as every rule in this file is concerned — the SAME RequestCharacter path a real client's RPC lands
+// in, not a shortcut past it — and restores the flag at the end. Borrowing rather than faking is the
+// point: a harness that called the uniqueness test directly would still pass with the game mode's
+// entire request path disconnected.
+//
+// THE RED ARM. `Trace.Characters.VerifyRed` removes THIS SLICE's enforcement. The team-mate assertion
+// must then FAIL, and the enemy-mirror assertion must still PASS — that pair is what shows the
+// harness is measuring the rule rather than measuring nothing.
+// =============================================================================================
+
+bool ATraceGameMode::ReportCharacterVerify(bool bCondition, const TCHAR* What)
+{
+	if (bCondition)
+	{
+		++CharacterVerifyPassed;
+		UE_LOG(LogTraceGame, Display, TEXT("[CharVerify] PASS: %s"), What);
+	}
+	else
+	{
+		++CharacterVerifyFailed;
+		UE_LOG(LogTraceGame, Error, TEXT("[CharVerify] FAIL: %s"), What);
+	}
+
+	return bCondition;
+}
+
+void ATraceGameMode::DumpCharacterState() const
+{
+	const AGameStateBase* BaseGameState = GameState;
+
+	UE_LOG(LogTraceGame, Display, TEXT("[CharDump] ===== characters %s, mode %s, timeout %.0fs ====="),
+		AreCharactersEnabled() ? TEXT("ON") : TEXT("OFF"),
+		(GetTraceGameState() != nullptr && GetTraceGameState()->IsGoalMode()) ? TEXT("B (goals)") : TEXT("A (endzones)"),
+		CharacterSelectTimeout);
+
+	if (BaseGameState == nullptr)
+	{
+		return;
+	}
+
+	for (APlayerState* const EachState : BaseGameState->PlayerArray)
+	{
+		const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+		if (Candidate == nullptr)
+		{
+			continue;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CharDump]   %-22s %-7s %-10s %-10s select=%s%s  cooldown=%.1f"),
+			*Candidate->GetPlayerName(),
+			*TraceTeamName(Candidate->Team).ToString(),
+			Candidate->IsABot() ? TEXT("BOT") : TEXT("HUMAN"),
+			*TraceCharacterRoster::NameFor(Candidate->GetSelectedCharacter()),
+			Candidate->IsCharacterSelectOpen() ? TEXT("OPEN") : TEXT("closed"),
+			Candidate->WasCharacterChosen() ? TEXT(" chosen") : TEXT(" auto"),
+			Candidate->GetActivatedCooldownRemaining());
+	}
+}
+
+void ATraceGameMode::StartCharacterSelectVerify(bool bRedArm)
+{
+	CharacterVerifyPassed = 0;
+	CharacterVerifyFailed = 0;
+
+	// Scoped, and restored on every exit path below, so a red run cannot leave the rule off for the
+	// rest of the session.
+	TGuardValue<int32> SelectRulesGuard(GTraceEnforceSelectRules, bRedArm ? 0 : GTraceEnforceSelectRules);
+
+	const AGameStateBase* BaseGameState = GameState;
+	if (BaseGameState == nullptr)
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("[CharVerify] No GameState; cannot run."));
+		return;
+	}
+
+	const bool bEnabledNow = AreCharactersEnabled();
+	const bool bGoalModeNow = (GetTraceGameState() != nullptr) && GetTraceGameState()->IsGoalMode();
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[CharVerify] ===== START: mode %s, characters %s, select-slice rules %s ====="),
+		bGoalModeNow ? TEXT("B (goals)") : TEXT("A (endzones)"),
+		bEnabledNow ? TEXT("ON") : TEXT("OFF"),
+		(GTraceEnforceSelectRules != 0) ? TEXT("ENFORCED") : TEXT("*** DISABLED (RED ARM) ***"));
+
+	// ---- Borrow three player states: two on one team, one on the other ------------------------
+	ATracePlayerState* TeammateA = nullptr;
+	ATracePlayerState* TeammateB = nullptr;
+	ATracePlayerState* Opponent  = nullptr;
+	ATracePlayerState* RealBot   = nullptr;
+
+	ETraceTeam HomeTeam = ETraceTeam::None;
+
+	for (APlayerState* const EachState : BaseGameState->PlayerArray)
+	{
+		ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+		if (Candidate == nullptr || Candidate->Team == ETraceTeam::None)
+		{
+			continue;
+		}
+
+		if (TeammateA == nullptr)
+		{
+			TeammateA = Candidate;
+			HomeTeam = Candidate->Team;
+			continue;
+		}
+
+		if (TeammateB == nullptr && Candidate->Team == HomeTeam)
+		{
+			TeammateB = Candidate;
+			continue;
+		}
+
+		if (Opponent == nullptr && Candidate->Team != HomeTeam)
+		{
+			Opponent = Candidate;
+			continue;
+		}
+
+		if (RealBot == nullptr && Candidate->IsABot())
+		{
+			RealBot = Candidate;
+		}
+	}
+
+	if (TeammateA == nullptr || TeammateB == nullptr || Opponent == nullptr)
+	{
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[CharVerify] Needs at least two players on one team and one on the other "
+			     "(found %s / %s / %s). Run with bots enabled."),
+			(TeammateA != nullptr) ? TEXT("A") : TEXT("-"),
+			(TeammateB != nullptr) ? TEXT("B") : TEXT("-"),
+			(Opponent != nullptr) ? TEXT("enemy") : TEXT("-"));
+		return;
+	}
+
+	// Snapshot everything the harness is about to disturb, so a mid-match run leaves no trace.
+	struct FVerifySnapshot
+	{
+		ATracePlayerState* State = nullptr;
+		bool bWasBot = false;
+		uint8 Character = TraceCharacterRoster::NoneId;
+		bool bWasLocked = false;
+		bool bSelectWasOpen = false;
+	};
+
+	TArray<FVerifySnapshot> Snapshots;
+	for (ATracePlayerState* const Borrowed : { TeammateA, TeammateB, Opponent })
+	{
+		FVerifySnapshot Snapshot;
+		Snapshot.State = Borrowed;
+		Snapshot.bWasBot = Borrowed->IsABot();
+		Snapshot.Character = Borrowed->GetSelectedCharacter();
+		Snapshot.bWasLocked = Borrowed->bCharacterLocked;
+		Snapshot.bSelectWasOpen = Borrowed->IsCharacterSelectOpen();
+		Snapshots.Add(Snapshot);
+
+		// Become a person for the duration, with a clean slate and an open screen. SetIsABot FIRST:
+		// the framework refuses to give a bot any character at all, so clearing the character before
+		// the flag would be refused for the wrong reason.
+		Borrowed->SetIsABot(false);
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Borrowed))
+		{
+			Abilities->ServerSetCharacter(ETraceCharacterId::None);
+		}
+		Borrowed->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+		Borrowed->ServerSetCharacterSelectOpen(/*bOpen=*/true, /*DeadlineServerTime=*/0.f);
+	}
+
+	// The poll would close the screens the harness just opened (a bot with no character is not
+	// offered one) and would auto-assign underneath the assertions. Pause it for the run.
+	GetWorldTimerManager().ClearTimer(CharacterSelectPollHandle);
+
+	const uint8 Contested = TraceCharacterRoster::FirstId;   // ROCCO
+
+	if (!bEnabledNow)
+	{
+		// MODE A / TOGGLE OFF is not a skipped run, it is its own assertion — spec v14 §2 and §6 both
+		// require that no selection is possible here at all.
+		const ETraceCharacterPickResult ModeAResult = RequestCharacter(TeammateA, Contested);
+		ReportCharacterVerify(ModeAResult == ETraceCharacterPickResult::Disabled,
+			TEXT("with characters off (mode A or the toggle), a pick is REFUSED as Disabled"));
+		ReportCharacterVerify(!TeammateA->HasCharacter(),
+			TEXT("with characters off, nobody ends up holding a character"));
+	}
+	else
+	{
+		// ---- 1. FIRST REQUEST WINS ------------------------------------------------------------
+		const ETraceCharacterPickResult FirstResult = RequestCharacter(TeammateA, Contested);
+		ReportCharacterVerify(FirstResult == ETraceCharacterPickResult::Granted,
+			TEXT("the first request for a free character is GRANTED"));
+		ReportCharacterVerify(TeammateA->GetSelectedCharacter() == Contested,
+			TEXT("the winner actually holds the character they asked for"));
+		ReportCharacterVerify(!TeammateA->IsCharacterSelectOpen(),
+			TEXT("the winner's select screen closes on the grant"));
+
+		// ---- 2. THE TEAM-MATE LOSES, AND IS TOLD ----------------------------------------------
+		//
+		// THIS IS THE ASSERTION THE RED ARM DELETES. With the red arm on
+		// it must fail; if it passes with the rule switched off, the rule is not what is producing
+		// the refusal and the whole verification is worthless.
+		const ETraceCharacterPickResult SecondResult = RequestCharacter(TeammateB, Contested);
+		ReportCharacterVerify(SecondResult == ETraceCharacterPickResult::TakenByTeammate,
+			TEXT("*** a TEAM-MATE asking for the same character is REFUSED (TakenByTeammate) ***"));
+		ReportCharacterVerify(TeammateB->GetSelectedCharacter() != Contested,
+			TEXT("*** the loser does not end up holding the contested character ***"));
+
+		// ---- 3. AN ENEMY MAY MIRROR THE PICK ---------------------------------------------------
+		//
+		// Spec v14 §3: uniqueness is PER TEAM. This is the assertion that stops a future "fix" from
+		// making the roster globally unique, which would silently halve the game.
+		const ETraceCharacterPickResult EnemyResult = RequestCharacter(Opponent, Contested);
+		ReportCharacterVerify(EnemyResult == ETraceCharacterPickResult::Granted,
+			TEXT("an ENEMY asking for the same character is GRANTED (mirroring is legal)"));
+		ReportCharacterVerify(Opponent->GetSelectedCharacter() == Contested,
+			TEXT("the enemy holds the mirrored character"));
+
+		// ---- 4. THE LOSER RE-PICKS SUCCESSFULLY ------------------------------------------------
+		const uint8 SecondChoice = TraceCharacterRoster::FirstId + 1;   // CHUT
+		const ETraceCharacterPickResult RepickResult = RequestCharacter(TeammateB, SecondChoice);
+		ReportCharacterVerify(RepickResult == ETraceCharacterPickResult::Granted,
+			TEXT("the loser's second pick, of a free character, is GRANTED"));
+
+		// ---- 5. LOCK-IN IS FINAL ---------------------------------------------------------------
+		const ETraceCharacterPickResult RelockResult = RequestCharacter(TeammateA, SecondChoice + 1);
+		ReportCharacterVerify(RelockResult == ETraceCharacterPickResult::AlreadyLocked,
+			TEXT("a locked-in player cannot switch character"));
+
+		// ---- 6. BOTS -----------------------------------------------------------------------
+		if (RealBot != nullptr)
+		{
+			const ETraceCharacterPickResult BotResult = RequestCharacter(RealBot, TraceCharacterRoster::LastId);
+			ReportCharacterVerify(BotResult == ETraceCharacterPickResult::NotSelecting,
+				TEXT("a BOT cannot take a character"));
+		}
+
+		int32 BotsWithCharacters = 0;
+		int32 BotsSeen = 0;
+		for (APlayerState* const EachState : BaseGameState->PlayerArray)
+		{
+			const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+			if (Candidate != nullptr && Candidate->IsABot())
+			{
+				++BotsSeen;
+				if (Candidate->HasCharacter())
+				{
+					++BotsWithCharacters;
+				}
+			}
+		}
+		ReportCharacterVerify(BotsSeen > 0 && BotsWithCharacters == 0,
+			TEXT("every bot in the match is characterless"));
+
+		// ---- 7. THE AUTO-ASSIGN TIMEOUT --------------------------------------------------------
+		//
+		// Driven by planting a deadline in the PAST and running one poll, rather than by waiting
+		// thirty seconds. The code path is identical; only the clock is cheated.
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(TeammateA))
+		{
+			Abilities->ServerSetCharacter(ETraceCharacterId::None);
+		}
+		TeammateA->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+		TeammateA->ServerSetCharacterSelectOpen(/*bOpen=*/true,
+			static_cast<float>(BaseGameState->GetServerWorldTimeSeconds() - 1.0));
+
+		PollCharacterSelect();
+
+		ReportCharacterVerify(TeammateA->HasCharacter(),
+			TEXT("an expired select screen AUTO-ASSIGNS a character"));
+		ReportCharacterVerify(!TeammateA->IsCharacterSelectOpen(),
+			TEXT("the auto-assign closes the select screen"));
+		ReportCharacterVerify(!TeammateA->WasCharacterChosen(),
+			TEXT("an auto-assigned character is flagged as NOT chosen"));
+		ReportCharacterVerify(
+			!IsCharacterTakenOnTeam(TeammateA->Team, TeammateA->GetSelectedCharacter(), TeammateA),
+			TEXT("*** the auto-assigned character is one no team-mate already holds ***"));
+	}
+
+	// ---- 8. COOLDOWNS (spec v14 §5) -------------------------------------------------------------
+	//
+	// Included in this harness rather than in one of its own because it is the same fact from another
+	// angle: the cooldown, like the character, has to live somewhere that outlives the pawn.
+	if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(TeammateA))
+	{
+		Abilities->DebugSetActivatedCooldown(20.f);
+		const float AfterStart = TeammateA->GetActivatedCooldownRemaining();
+		ReportCharacterVerify(AfterStart > 19.f && AfterStart <= 20.f,
+			TEXT("starting a 20s cooldown leaves ~20s remaining, read through the PLAYER STATE"));
+
+		// "A player can spawn with an ability timer still counting down" — the respawn path itself,
+		// not an imitation of it. RestartPlayerFresh destroys the pawn, which is precisely the event
+		// that used to be able to take a cooldown with it.
+		if (AController* const Respawning = TeammateA->GetOwningController())
+		{
+			RestartPlayerFresh(Respawning);
+		}
+		ReportCharacterVerify(TeammateA->GetActivatedCooldownRemaining() > 19.f,
+			TEXT("*** a RESPAWN does not reset the activated cooldown ***"));
+
+		ResetAbilityCooldownsForHalfTime();
+		ReportCharacterVerify(TeammateA->GetActivatedCooldownRemaining() <= 0.f,
+			TEXT("*** HALF TIME resets the activated cooldown ***"));
+		ReportCharacterVerify(TeammateA->IsActivatedAbilityReady(),
+			TEXT("the ability reads as ready after half time"));
+	}
+	else
+	{
+		ReportCharacterVerify(false, TEXT("the borrowed player has an ability component to test with"));
+	}
+
+	// ---- Restore ----------------------------------------------------------------------------
+	for (const FVerifySnapshot& Snapshot : Snapshots)
+	{
+		if (Snapshot.State == nullptr)
+		{
+			continue;
+		}
+
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Snapshot.State))
+		{
+			Abilities->ServerSetCharacter(static_cast<ETraceCharacterId>(Snapshot.Character));
+		}
+		Snapshot.State->ServerMarkCharacterResolved(Snapshot.bWasLocked, /*bWasChosen=*/false);
+		Snapshot.State->ServerSetCharacterSelectOpen(Snapshot.bSelectWasOpen, 0.f);
+
+		// The cooldown is deliberately NOT restored: the harness ends by proving half time clears
+		// every cooldown, and it did that by actually clearing them. Putting a stale deadline back
+		// would undo the one assertion whose evidence is the live state.
+		Snapshot.State->SetIsABot(Snapshot.bWasBot);
+	}
+
+	GetWorldTimerManager().SetTimer(CharacterSelectPollHandle, this, &ATraceGameMode::PollCharacterSelect,
+		TraceGameModeConstants::CharacterSelectPollInterval, /*bLoop=*/true,
+		TraceGameModeConstants::CharacterSelectPollInterval);
+
+	UE_LOG(LogTraceGame, Display, TEXT("[CharVerify] ===== %d passed, %d failed ====="),
+		CharacterVerifyPassed, CharacterVerifyFailed);
+}
+
+namespace
+{
+	void TraceCharactersVerifyCommand(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		const bool bRedArm = (Args.Num() > 0) && Args[0].TrimStartAndEnd().Equals(TEXT("red"), ESearchCase::IgnoreCase);
+
+		if (ATraceGameMode* Rules = World->GetAuthGameMode<ATraceGameMode>())
+		{
+			Rules->StartCharacterSelectVerify(bRedArm);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CharVerify] No authoritative ATraceGameMode here - run this on the server."));
+		}
+	}
+
+	void TraceCharactersDumpCommand(UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		if (const ATraceGameMode* Rules = World->GetAuthGameMode<ATraceGameMode>())
+		{
+			Rules->DumpCharacterState();
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CharDump] No authoritative ATraceGameMode here - run this on the server."));
+		}
+	}
+
+	// NOTE: neither of these may share a name with a CVar. Trace.Characters.EnforceSelectRules is
+	// a CVar and these two are COMMANDS; a collision on the same string is a fatal error at module
+	// load, which this project has hit before.
+	FAutoConsoleCommandWithWorldAndArgs CmdTraceCharactersVerify(
+		TEXT("Trace.Characters.Verify"),
+		TEXT("Dev only. Spec v14 3. Proves first-request-wins, that a team-mate is refused, that an "
+		     "ENEMY may mirror the pick, that bots stay characterless, that the timeout auto-assigns "
+		     "a free character, and that a respawn does not reset an ability cooldown while half time "
+		     "does. Argument 'red' removes this slice's uniqueness test for the run, and the team-mate "
+		     "assertion must then FAIL - that is how the harness is shown to be able to go red."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TraceCharactersVerifyCommand));
+
+	/**
+	 * The red arm as its own COMMAND rather than only as an argument.
+	 *
+	 * Not redundancy. The headless harness delivers commands through -TraceExec, whose values are read
+	 * with FParse::Value and therefore end at the first space — so "Trace.Characters.Verify red" is
+	 * unreachable from a command line without quoting, and this project's own contract notes that a
+	 * quoted argument has already once broken a command line into the URL parser and made a
+	 * verification "pass" because its commands never ran. A second, space-free name removes the
+	 * quoting from the problem entirely.
+	 */
+	void TraceCharactersVerifyRedCommand(UWorld* World)
+	{
+		if (World != nullptr)
+		{
+			if (ATraceGameMode* Rules = World->GetAuthGameMode<ATraceGameMode>())
+			{
+				Rules->StartCharacterSelectVerify(/*bRedArm=*/true);
+				return;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[CharVerify] No authoritative ATraceGameMode here - run this on the server."));
+	}
+
+	FAutoConsoleCommandWithWorld CmdTraceCharactersVerifyRed(
+		TEXT("Trace.Characters.VerifyRed"),
+		TEXT("Dev only. Trace.Characters.Verify with the red arm on, as one space-free token so it can "
+		     "be delivered by -TraceExec. The team-mate assertion MUST fail."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&TraceCharactersVerifyRedCommand));
+
+	FAutoConsoleCommandWithWorld CmdTraceCharactersDump(
+		TEXT("Trace.Characters.Dump"),
+		TEXT("Dev only. Every player: team, human/bot, character, select state and ability cooldown."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&TraceCharactersDumpCommand));
 }
 
 #endif // !UE_BUILD_SHIPPING

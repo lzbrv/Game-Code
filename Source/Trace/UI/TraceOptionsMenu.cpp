@@ -14,6 +14,7 @@
 #include "Scalability.h"
 #include "Settings/TraceGameUserSettings.h"
 #include "Trace.h"                       // LogTraceGame
+#include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 
 // =================================================================================================
 // WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
@@ -395,6 +396,20 @@ void FTraceOptionsMenu::RebuildRows()
 		// pause root at all, so it cannot be buried at the bottom next to RESET.
 		AddHeader(TEXT("DISPLAY"));
 		AddAction(TEXT("VIDEO SETTINGS"), EAction::OpenVideo);
+
+		// ---- Match rules (spec v14 §3) ----------------------------------------------------------
+		//
+		// Above MOUSE and above CONTROLS, because it is the only row on this page that changes what
+		// the GAME is rather than how it is driven, and because the one thing a player is looking for
+		// when they come here about characters is the switch that turns them off.
+		//
+		// The note is not optional. This row cannot retro-apply to a match already being served by
+		// somebody else's machine, and a toggle that appears to do nothing is worse than no toggle —
+		// the player needs to be told it is a HOST setting and that it lands on the next match.
+		AddHeader(TEXT("MATCH"));
+		AddValue(ERowKind::Toggle, TEXT("CHARACTERS"), ESetting::CharactersEnabled);
+		AddNote(TEXT("OFF: EVERYONE PLAYS THE DEFAULT MANNEQUIN, NO ABILITIES, NO SELECT SCREEN."));
+		AddNote(TEXT("APPLIES TO MATCHES YOU HOST, FROM THE NEXT MATCH. GOALS MODE ONLY."));
 
 		AddHeader(TEXT("MOUSE"));
 
@@ -876,6 +891,16 @@ void FTraceOptionsMenu::GetSettingValue(ESetting Setting, float& OutValue, float
 		OutStep = 1.f;
 		break;
 
+	// Spec v14 §3. Read live from its own storage — see TraceCharacters in UI/TraceMatchOptions.h.
+	// It is neither a UTraceUserSettings value nor a video value, which is why it is answered here
+	// and then falls through the IsVideoSetting() early-out below untouched.
+	case ESetting::CharactersEnabled:
+		OutValue = TraceCharacters::GetEnabledSetting() ? 1.f : 0.f;
+		OutMin = 0.f;
+		OutMax = 1.f;
+		OutStep = 1.f;
+		break;
+
 	default:
 		break;
 	}
@@ -1050,6 +1075,7 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 
 	case ESetting::VSync:
 	case ESetting::InvertY:
+	case ESetting::CharactersEnabled:
 		return (Value >= 0.5f) ? TEXT("ON") : TEXT("OFF");
 
 	case ESetting::FrameRateLimit:
@@ -1157,6 +1183,16 @@ void FTraceOptionsMenu::SetSettingNormalised(ESetting Setting, float Alpha)
 		// the mouse sliders below. The commit paths (AdjustSelected, and the mouse release in
 		// PollMouse) go through ApplyVideoSettings, which writes the .ini once.
 		ApplyVideo(/*bResolutionAffecting=*/false, /*bPersist=*/false);
+		return;
+	}
+
+	// Spec v14 §3, and it is handled BEFORE the UTraceUserSettings block below because it does not
+	// live there: it persists into GameUserSettings.ini through TraceCharacters, and falling into the
+	// switch below would hit `default: return` and silently do nothing — which is precisely the
+	// failure mode a settings row must never have.
+	if (Setting == ESetting::CharactersEnabled)
+	{
+		TraceCharacters::SetEnabledSetting(Snapped >= 0.5f);
 		return;
 	}
 

@@ -214,12 +214,22 @@ namespace
 	 *
 	 * Chosen to touch one of each row kind exactly once, because a sequence that exercises three
 	 * sliders proves no more than one that exercises one:
+	 *   Down       -> CHARACTERS                      (spec v14 §3's new MATCH row)
+	 *   Left, Right-> off, then back on               (Toggle, and it leaves the machine unchanged)
+	 *   Down       -> SENSITIVITY
 	 *   4 x Right  -> SENSITIVITY 1.00 -> 1.20        (Slider, and the held-key adjust path)
-	 *   2 x Down   -> INVERT MOUSE Y                  (navigation, skipping nothing yet)
+	 *   2 x Down   -> INVERT MOUSE Y                  (navigation)
 	 *   Enter      -> toggles it ON                   (Toggle)
 	 *   2 x Down   -> MOVE FORWARD                    (navigation ACROSS the CONTROLS header)
 	 *   Enter      -> arms the rebind capture         (Binding)
 	 *   K          -> becomes the new MOVE FORWARD    (capture)
+	 *
+	 * *** THIS SCRIPT IS POSITIONAL AND MUST BE RE-WALKED WHENEVER A ROW IS ADDED. *** It navigates
+	 * by key presses, not by row identity, so inserting a row above SENSITIVITY silently re-aims
+	 * every step after it — the run still "passes" while adjusting something nobody asked about. It
+	 * was re-walked when spec v14 §3 added the MATCH / CHARACTERS row above MOUSE, which is where the
+	 * leading Down and the two Enters come from. The log line each step prints is the check: if a
+	 * step's description stops matching what the screenshot shows selected, this list is stale.
 	 */
 	struct FAutoSettingsKey { FKey (*Key)(); const TCHAR* What; };
 
@@ -227,6 +237,16 @@ namespace
 	{
 		static const TArray<FAutoSettingsKey> Script =
 		{
+			{ []{ return EKeys::Down;  }, TEXT("-> characters (spec v14 3)") },
+
+			// LEFT/RIGHT rather than ENTER, and this is worth knowing before writing another script
+			// step: ActivateSelected on a Toggle routes through AdjustSelected(+1), so ENTER
+			// INCREMENTS a toggle rather than flipping it. On a row that is already ON it clamps and
+			// does nothing at all — which is exactly what the first version of this step did, and it
+			// produced a run with no write and no log while looking like it had exercised the row.
+			{ []{ return EKeys::Left;  }, TEXT("characters -> OFF") },
+			{ []{ return EKeys::Right; }, TEXT("characters -> ON (put back)") },
+			{ []{ return EKeys::Down;  }, TEXT("-> sensitivity") },
 			{ []{ return EKeys::Right; }, TEXT("sensitivity +") },
 			{ []{ return EKeys::Right; }, TEXT("sensitivity +") },
 			{ []{ return EKeys::Right; }, TEXT("sensitivity +") },
@@ -726,9 +746,15 @@ void ATraceMenuHUD::StartMatch()
 	// second is silently ignored. That has already happened once in this project (see
 	// ATraceGameMode::InitGame), and it is exactly the kind of bug that makes an A/B toggle look
 	// like it does nothing.
-	const FString Options = FString::Printf(TEXT("%s=%s?%s=%s?listen"),
+	//
+	// "?characters=0|1" joins them for spec v14 §3's toggle, and it goes on the URL rather than being
+	// left to the destination's own settings read for the same reason the mode does: the settings
+	// page the player just used lives in THIS process, and a listen server that resolved the toggle
+	// from its own ini would honour a value the player may have changed a second ago.
+	const FString Options = FString::Printf(TEXT("%s=%s?%s=%s?%s=%d?listen"),
 		TraceDifficulty::UrlOption, *TraceDifficulty::ToUrlValue(Difficulty),
-		TraceScoringModeUrlOption, *TraceScoringModeToUrlValue(ScoringMode));
+		TraceScoringModeUrlOption, *TraceScoringModeToUrlValue(ScoringMode),
+		TraceCharacters::UrlOption, TraceCharacters::GetEnabledSetting() ? 1 : 0);
 
 	// Checked BEFORE travelling, and the reason is subtle enough to be worth spelling out.
 	//

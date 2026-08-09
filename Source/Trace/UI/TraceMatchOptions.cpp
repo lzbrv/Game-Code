@@ -2,6 +2,7 @@
 
 #include "UI/TraceMatchOptions.h"
 
+#include "Misc/ConfigCacheIni.h"   // GConfig — the characters toggle's storage
 #include "Trace.h"          // LogTraceGame
 #include "TraceSettings.h"
 
@@ -96,4 +97,79 @@ void TraceScoring::ApplyToSettings(ETraceScoringMode Mode)
 ETraceScoringMode TraceScoring::GetCurrentSetting()
 {
 	return UTraceSettings::Get().ScoringMode;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Characters on / off (spec v14 §3)
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+	/**
+	 * GameUserSettings.ini, not DefaultGame.ini. See the header: this is a per-machine player choice
+	 * and must never end up in a repo diff. GGameUserSettingsIni resolves to
+	 *     <Project>/Saved/Config/<Platform>/GameUserSettings.ini
+	 * which is writable, per-user and outside source control — the same file the video settings use.
+	 */
+	const TCHAR* CharactersConfigSection = TEXT("/Script/Trace.TraceCharacters");
+	const TCHAR* CharactersConfigKey     = TEXT("bCharactersEnabled");
+}
+
+bool TraceCharacters::HasSavedSetting()
+{
+	bool bSaved = false;
+	return (GConfig != nullptr)
+		&& GConfig->GetBool(CharactersConfigSection, CharactersConfigKey, bSaved, GGameUserSettingsIni);
+}
+
+bool TraceCharacters::GetEnabledSetting()
+{
+	// Read live rather than cached. The row is drawn every frame the settings page is open, and a
+	// cache here would be a second copy of a value that already exists twice — which is exactly how
+	// the scoring-mode row nearly ended up showing something the match was not playing.
+	//
+	// The CDO is the fallback rather than a hardcoded `true`, so a project that ships characters off
+	// in Config/DefaultGame.ini sees a row that says OFF on a machine that has never touched it.
+	bool bEnabled = UTraceSettings::Get().bCharactersEnabled;
+
+	if (GConfig != nullptr)
+	{
+		GConfig->GetBool(CharactersConfigSection, CharactersConfigKey, bEnabled, GGameUserSettingsIni);
+	}
+
+	return bEnabled;
+}
+
+void TraceCharacters::SetEnabledSetting(bool bEnabled)
+{
+	UTraceSettings* MutableSettings = GetMutableDefault<UTraceSettings>();
+	const bool bAlreadyThere = (GetEnabledSetting() == bEnabled)
+		&& (MutableSettings == nullptr || MutableSettings->bCharactersEnabled == bEnabled);
+
+	if (bAlreadyThere)
+	{
+		return;
+	}
+
+	// 1. THE CDO, so it takes effect. This is the value UTraceAbilityComponent::AreCharactersEnabled
+	//    reads, and writing it here is what makes flipping the row on the title screen change the
+	//    match that is about to start rather than only the one after it.
+	if (MutableSettings != nullptr)
+	{
+		MutableSettings->bCharactersEnabled = bEnabled;
+	}
+
+	// 2. GameUserSettings.ini, so it survives a restart WITHOUT writing to the repo-tracked
+	//    Config/DefaultGame.ini that UTraceSettings otherwise persists to.
+	if (GConfig != nullptr)
+	{
+		GConfig->SetBool(CharactersConfigSection, CharactersConfigKey, bEnabled, GGameUserSettingsIni);
+
+		// Flushed immediately, for the reason UTraceUserSettings::Save() gives: the way this build is
+		// usually closed is pkill, and a setting that only survives a clean exit does not survive.
+		GConfig->Flush(/*bRead=*/false, GGameUserSettingsIni);
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("Characters %s for matches hosted from this machine."),
+		bEnabled ? TEXT("ENABLED") : TEXT("DISABLED"));
 }

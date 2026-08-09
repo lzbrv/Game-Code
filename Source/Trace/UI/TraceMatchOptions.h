@@ -109,6 +109,46 @@ namespace TraceScoring
 	TRACE_API ETraceScoringMode GetCurrentSetting();
 }
 
+/**
+ * The "turn off all characters" toggle's half of the menu/match contract (spec v14 §3).
+ *
+ * Verbatim: "Include a toggle in game settings to turn off all characters". Shaped exactly like
+ * TraceDifficulty and TraceScoring above, because it travels the same way and for the same reason:
+ * the settings menu chooses it, the URL carries it, and ATraceGameMode::ResolveCharactersEnabled
+ * resolves it.
+ *
+ * WHERE THE VALUE LIVES, AND THE TWO STORAGES IT NEEDS.
+ * The value the GAME reads is UTraceSettings::bCharactersEnabled — that is what
+ * UTraceAbilityComponent::AreCharactersEnabled consults and therefore what every ability obeys. But
+ * UTraceSettings is the DESIGNER's table: `defaultconfig`, shipped in Config/DefaultGame.ini, checked
+ * into the repo. A player switching characters off for their own matches must not produce a diff.
+ *
+ * So the toggle is written to BOTH, with different jobs: the CDO so it takes effect, and the
+ * per-machine GameUserSettings.ini so it survives a restart without touching source control. The ini
+ * is only ever read back by ATraceGameMode::ResolveCharactersEnabled, at the one moment a match
+ * starts and only when neither the URL nor the command line has an opinion.
+ *
+ * IT IS A HOST SETTING, and the menu says so. A client cannot change a rule the server is enforcing;
+ * what this row actually decides is the next match THIS machine hosts.
+ */
+namespace TraceCharacters
+{
+	/** URL option carried across the travel from the menu into the arena: "?characters=0". */
+	inline const TCHAR* UrlOption = TEXT("characters");
+
+	/** The saved toggle. Falls back to UTraceSettings::bCharactersEnabled when nothing was saved. */
+	TRACE_API bool GetEnabledSetting();
+
+	/** True once this machine has ever written the toggle. Distinguishes "off" from "never asked". */
+	TRACE_API bool HasSavedSetting();
+
+	/**
+	 * Writes the toggle to the UTraceSettings CDO (so it takes effect) and to GameUserSettings.ini
+	 * (so it survives). Cheap enough to call from a key press; a no-op when nothing changed.
+	 */
+	TRACE_API void SetEnabledSetting(bool bEnabled);
+}
+
 namespace TraceMatchFlow
 {
 	/**

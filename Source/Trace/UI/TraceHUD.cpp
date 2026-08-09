@@ -19,6 +19,8 @@
 #include "Gameplay/TraceMelee.h"          // v10 §1 — the equipped-weapon row and its two timers
 #include "Gameplay/TraceParry.h"          // v6 §3 — the parry-kill banner and the death-panel line
 #include "Movement/TraceCharacterMovementComponent.h"
+#include "Core/TraceCharacterRoster.h"    // v14 §3 — the accent colour and the ability's name
+#include "Settings/TraceUserSettings.h"   // v14 §5 — the ability's bound key, if the input slice has one
 #include "InputCoreTypes.h"               // EKeys::Escape, for the pause poll
 #include "Misc/CommandLine.h"
 #include "Misc/DateTime.h"
@@ -219,6 +221,11 @@ void ATraceHUD::BeginPlay()
 	// rather than behind a cvar nobody sets before playing.
 	TraceNet::LogNetworkDiagnostics(GetWorld(), TEXT("Match HUD ready"));
 
+	// Spec v14 §3. Bound once, here: the select screen opens itself off replicated state, so if the
+	// callbacks were wired lazily at the moment it opened there would be a window in which the screen
+	// was up and gameplay input was still live — the player would be walking around behind it.
+	WireCharacterSelect();
+
 #if !UE_BUILD_SHIPPING
 	TraceAutoShot::Arm(this, TEXT("Match"));
 	// -TraceExec="a|b" -TraceExecAt=<sec>: run the in-match verification commands headlessly. See
@@ -408,8 +415,79 @@ void ATraceHUD::DrawHUD()
 	// reading on the full-time screen, and they are the only record of how a half ended.
 	DrawKillFeed();
 
+	// Spec v14 §3 — the character select screen, over the match and under the pause menu.
+	//
+	// UNDER the pause menu, and it keeps DRAWING while the pause menu is up rather than hiding: a
+	// select screen that vanished when the player pressed Escape would read as the pick having been
+	// cancelled, and the auto-pick clock is still running underneath. It stops taking input instead,
+	// which is what bInputAllowed says.
+	//
+	// Outside the bPostMatch gate for a duller reason: the screen is closed by then anyway (the server
+	// closes it the moment a character is held), and a gate here would be a second condition able to
+	// disagree with the replicated one.
+	CharacterSelect.Tick(this, TracePC.Get(), LocalPS.Get(), ViewW, ViewH, UIScale, Now,
+		/*bInputAllowed=*/!PauseMenu.IsOpen());
+
 	// Last, over everything including the full-time takeover. A no-op while closed.
 	PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
+}
+
+void ATraceHUD::WireCharacterSelect()
+{
+	TWeakObjectPtr<ATraceHUD> WeakThis(this);
+
+	// Nearly the contract the pause menu has: gameplay input goes quiet and the mouse comes back
+	// while the overlay owns the screen, and is restored from ONE place however the overlay closed —
+	// a pick, a timeout, or the server closing it because the toggle was switched off.
+	//
+	// *** WITH ONE DELIBERATE DIFFERENCE: THIS SCREEN MUST NOT PAUSE THE WORLD. ***
+	//
+	// MEASURED, not theorised. The first headless run of this feature logged
+	//     [TracePlayerController_0] Gameplay input suppressed (menu open). netMode=2 paused=1
+	// and then the log went completely silent for the rest of the run. SetGameInputSuppressed pauses
+	// whenever it can do so without affecting anybody else — which is exactly the solo-with-bots case
+	// every playtest of this build actually runs — and a paused world stops every FTimerManager timer
+	// with it. That takes out, in order:
+	//
+	//   * ATraceGameMode::PollCharacterSelect, so the AUTO-PICK TIMEOUT NEVER FIRES. Spec v14 §3's
+	//     [ASSUMPTION] exists precisely "so one idle player cannot stall the match", and a paused
+	//     select screen is a match stalled forever by one idle player — the opposite of the rule.
+	//   * GetServerWorldTimeSeconds, so the countdown this screen draws freezes at its opening value
+	//     while claiming to be counting down.
+	//   * the warm-up clock, the bots, and every verification hook (which is how the run announced it).
+	//
+	// So the pause is undone on the same frame it is taken. SetPause(false) on an unpaused world is a
+	// documented no-op (see the else branch of SetGameInputSuppressed), and on a remote client the
+	// pause was never taken in the first place — so this is correct on every machine and costs
+	// nothing on the ones that did not need it.
+	CharacterSelect.OnOpened = [WeakThis]()
+	{
+		if (const ATraceHUD* Strong = WeakThis.Get())
+		{
+			if (ATracePlayerController* PC = Strong->TracePC.Get())
+			{
+				PC->SetGameInputSuppressed(true);
+				PC->SetPause(false);
+			}
+		}
+	};
+
+	CharacterSelect.OnClosed = [WeakThis]()
+	{
+		if (const ATraceHUD* Strong = WeakThis.Get())
+		{
+			if (ATracePlayerController* PC = Strong->TracePC.Get())
+			{
+				// Only if the pause menu is not ALSO holding input down. Restoring unconditionally
+				// here would hand movement back to a player staring at a pause menu — the exact class
+				// of bug the pause menu's own single-exit-path comment is about.
+				if (!Strong->PauseMenu.IsOpen())
+				{
+					PC->SetGameInputSuppressed(false);
+				}
+			}
+		}
+	};
 }
 
 // -------------------------------------------------------------------------------------------
@@ -440,7 +518,14 @@ void ATraceHUD::OpenPauseMenu()
 		{
 			if (ATracePlayerController* PC = Strong->TracePC.Get())
 			{
-				PC->SetGameInputSuppressed(false);
+				// ...unless the character select screen (spec v14 §3) is still up underneath. It is
+				// perfectly reachable to open the pause menu over a select screen and close it again,
+				// and handing movement back to a player who is still choosing a character would let
+				// them walk out of the arena behind the overlay.
+				if (!Strong->CharacterSelect.IsOpen())
+				{
+					PC->SetGameInputSuppressed(false);
+				}
 			}
 		}
 	};
@@ -1191,7 +1276,12 @@ void ATraceHUD::DrawHitMarker()
 
 void ATraceHUD::DrawHealthAndDash()
 {
-	if (LocalChar == nullptr || TracePC == nullptr)
+	// LocalChar IS ALLOWED TO BE NULL HERE, and that is a spec v14 §5 requirement rather than
+	// defensive slack. The activated ability's cooldown keeps running while its owner is dead, so the
+	// row that shows it has to be drawn on a frame where there is no pawn at all. Every block below
+	// that touches the pawn now null-checks it; the ability row and the stack geometry do not need one
+	// because they are fed by the player state.
+	if (TracePC == nullptr)
 	{
 		return;
 	}
@@ -1225,7 +1315,7 @@ void ATraceHUD::DrawHealthAndDash()
 	//   - the 0.5 s swing COOLDOWN, drawn the same way, so "why did my click do nothing" has an
 	//     answer on screen rather than in a log.
 	// A dead player gets no row at all: the weapon you are not holding is not information.
-	if (LocalChar->IsAlive())
+	if (LocalChar != nullptr && LocalChar->IsAlive())
 	{
 		const bool bKnife   = TraceMelee::IsKnifeEquipped(LocalChar);
 		const float Deploy  = TraceMelee::GetDeployRemaining(LocalChar);
@@ -1351,7 +1441,7 @@ void ATraceHUD::DrawHealthAndDash()
 	// gated key on the same stack as dash. Drawn only when the mechanic actually reports state (see
 	// ATraceCharacter::GetParryHudState) and only for the CARRIER, since a non-carrier pressing parry
 	// does nothing at all and a meter for a key that does nothing is worse than no meter.
-	if (bLocalCarrying)
+	if (bLocalCarrying && LocalChar != nullptr)
 	{
 		float ParryRemaining = 0.f;
 		float ParryTotal = 0.f;
@@ -1437,8 +1527,9 @@ void ATraceHUD::DrawHealthAndDash()
 	// states the player is in — armed, or armed AND inside the bonus window. Deliberately a separate
 	// row rather than a flash on the dash pips: dash and slide are different resources spent on
 	// different keys, and overloading one meter to mean both is how a player learns the wrong thing.
-	if (const UTraceCharacterMovementComponent* TraceMove =
-			Cast<UTraceCharacterMovementComponent>(LocalChar->GetCharacterMovement()))
+	if (const UTraceCharacterMovementComponent* TraceMove = (LocalChar != nullptr)
+			? Cast<UTraceCharacterMovementComponent>(LocalChar->GetCharacterMovement())
+			: nullptr)
 	{
 		if (TraceMove->IsSlideJumpAvailable())
 		{
@@ -1466,8 +1557,15 @@ void ATraceHUD::DrawHealthAndDash()
 		}
 	}
 
+	// ---- Activated ability (spec v14 §5) --------------------------------------------------------
+	//
+	// Drawn LAST of the conditional rows, so it sits highest in the stack and nothing below it moves
+	// when it appears — and, critically, it is the only row here that is drawn on a dead player's
+	// frame. See DrawAbilityRow().
+	RowY = DrawAbilityRow(RowY, Margin, BarW, RowH, LabelW, TeamTint);
+
 	// ---- Health -----------------------------------------------------------------------------
-	if (const UTraceHealthComponent* HealthComp = LocalChar->Health)
+	if (const UTraceHealthComponent* HealthComp = (LocalChar != nullptr) ? LocalChar->Health.Get() : nullptr)
 	{
 		// The bar, the regen climb and the regen countdown. See DrawHealthBar().
 		DrawHealthBar(HealthComp, Margin, HealthY, BarW, HealthH);
@@ -1496,6 +1594,103 @@ void ATraceHUD::DrawHealthAndDash()
 				VCenterTextY(InvulnText, FontSmall, UIScale, HealthY, HealthH), FontSmall, UIScale);
 		}
 	}
+}
+
+float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH, float LabelW, const FLinearColor& TeamTint)
+{
+	// FED BY THE PLAYER STATE, NEVER BY THE PAWN. See the header: this row's whole reason to exist is
+	// that spec v14 §5 requires the cooldown to be visible on a frame where the pawn does not exist.
+	// If this ever starts reading ATraceCharacter or a component on it, the feature is broken again
+	// and the symptom will be "the meter disappears when I die", which reads as a HUD bug rather than
+	// as the rule violation it is.
+	if (LocalPS == nullptr || !LocalPS->HasCharacter())
+	{
+		// No character means mode A, the settings toggle, a bot, or a player who has not picked yet.
+		// In every one of those there is no ability, and a row saying "ABILITY  READY" would be a
+		// promise about a key that does nothing.
+		return RowY;
+	}
+
+	const uint8 CharacterId = LocalPS->GetSelectedCharacter();
+	const TraceCharacterRoster::FTraceCharacterEntry* const Entry = TraceCharacterRoster::Find(CharacterId);
+
+	const float Remaining = LocalPS->GetActivatedCooldownRemaining();
+	const bool  bReady    = (Remaining <= TraceHUDStyle::TimeEpsilon);
+
+	// The FRACTION is derived from the roster's published cooldown length rather than from a second
+	// replicated float. The framework replicates a DEADLINE (an absolute match time), which is the
+	// right thing to replicate — it makes a late joiner correct for free — but a meter needs a
+	// denominator, and the character's cooldown is a constant the card already prints. Deriving it
+	// costs nothing and cannot go stale; storing it would be one more value able to disagree.
+	const float CooldownLength = (Entry != nullptr) ? FMath::Max(0.01f, Entry->ActivatedCooldown) : 20.f;
+	const float Fraction = FMath::Clamp(1.f - (Remaining / CooldownLength), 0.f, 1.f);
+
+	// THE KEY, read from the player's own bindings rather than hardcoded to "E".
+	//
+	// Spec v14 §5 says activated abilities bind to E "by default, rebindable", and the binding itself
+	// belongs to the input slice, not here. This looks the action up BY ITS STABLE CONFIG ID, so the
+	// moment that slice appends an "Ability" action to ETraceInputAction this row starts printing
+	// whatever the player actually bound — and until then it prints the documented default. A HUD
+	// that hardcodes a key is a HUD that lies to the first player who rebinds it.
+	FString KeyLabel(TEXT("E"));
+	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+	{
+		if (FCString::Stricmp(Info.ConfigId, TEXT("Ability")) == 0)
+		{
+			const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
+			if (BoundKey.IsValid())
+			{
+				KeyLabel = BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
+			}
+			break;
+		}
+	}
+
+	const FString Label = FString::Printf(TEXT("[%s]"), *KeyLabel);
+	DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+		Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+	// Ready pulses in the character's own accent colour; charging is a dim version of it. The accent
+	// rather than the team tint, matching the select screen — the player learned the colour there and
+	// it is the one thing on this HUD that says WHICH character they are.
+	const FLinearColor Accent = (Entry != nullptr) ? Entry->Accent : TeamTint;
+	const FLinearColor RowColor = bReady
+		? TraceHUDStyle::WithAlpha(Accent, 0.75f + 0.25f * FMath::Sin(Now * 8.f))
+		: TraceHUDStyle::Shade(Accent, 0.40f, 0.0f);
+
+	DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bReady ? 1.f : Fraction, RowColor);
+
+	// The right-hand caption. Three states, and the DEAD one is the reason this pass exists:
+	//
+	//   ready               -> "<ABILITY NAME>"
+	//   cooling, alive      -> "<ABILITY NAME>  12.4"
+	//   cooling, DEAD       -> "<ABILITY NAME>  12.4  RUNNING"
+	//
+	// Spec v14 §5 is explicit that a player "can spawn with an ability timer still counting down".
+	// Without the third caption, a dead player watching a number tick down has no way to know whether
+	// that is intended or whether the game has forgotten to reset it — and the spec's own note says
+	// that reads as a bug. So the HUD says out loud that it is deliberate.
+	const FString AbilityName = (Entry != nullptr) ? FString(Entry->ActivatedName) : TraceCharacterRoster::NameFor(CharacterId);
+
+	FString StatusText = AbilityName;
+	FLinearColor StatusColor = bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim;
+
+	if (!bReady)
+	{
+		StatusText = FString::Printf(TEXT("%s  %.1f"), *AbilityName, Remaining);
+
+		if (bLocalDead)
+		{
+			StatusText += TEXT("  RUNNING");
+			StatusColor = TraceHUDStyle::Warning;
+		}
+	}
+
+	DrawTextLeft(StatusText, StatusColor,
+		Margin + BarW + (10.f * UIScale),
+		VCenterTextY(StatusText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+	return RowY - (RowH + (8.f * UIScale));
 }
 
 void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, float Y, float W, float H)

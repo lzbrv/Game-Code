@@ -102,6 +102,27 @@ enum class ETraceInputAction : uint8
 	EquipKnife,
 	EquipGun,
 
+	/**
+	 * SPEC v14 §5 — "Activated abilities bind to E by default, rebindable" and "Mace's suspend needs
+	 * its own bind (V, per the doc)."
+	 *
+	 * APPENDED, never inserted, for the reason SwapWeapon's comment gives above: ETraceInputAction is
+	 * the index into UTraceUserSettings::Bindings, so anything inserted higher renumbers every action
+	 * a saved TraceUserSettings.ini refers to by position.
+	 *
+	 * THE CONFIG IDS ARE LOAD-BEARING AND ARE NOT FREE TO RENAME. "Ability" and "AbilitySecondary"
+	 * are the exact strings ATraceHUD's ability row and UTraceAbilityInputRelay already look up (both
+	 * were written against a table that did not yet contain these rows, and both print / poll the
+	 * documented default until it does). Changing either string silently re-orphans them.
+	 *
+	 * TWO ACTIONS, NOT ONE. Ability is a PRESS (the activated ability, and Mace's spike reactivation);
+	 * AbilitySecondary is a HOLD (Mace suspends only while it is down). An Enhanced Input Boolean
+	 * action carries no payload that could distinguish them, and the two have different trigger
+	 * events bound in ATracePlayerController.
+	 */
+	Ability,
+	AbilitySecondary,
+
 	Count UMETA(Hidden)
 };
 

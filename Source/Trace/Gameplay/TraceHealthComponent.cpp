@@ -5,7 +5,12 @@
 #include "Net/UnrealNetwork.h"
 
 #include "Components/SceneComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "Containers/Ticker.h"             // FTSTicker — the per-frame driver for the self-test
+#include "Engine/StaticMesh.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialInterface.h"
+#include "UObject/ConstructorHelpers.h"
 #include "CoreGlobals.h"                   // GFrameCounter — the same-frame guarantee is counted in frames
 #include "Core/TraceCharacter.h"
 #include "Engine/World.h"
@@ -61,6 +66,94 @@ static TAutoConsoleVariable<float> CVarHealthRegenRate(
  * a later tick group than it used to be in.
  */
 static int32 GRegenSameFrameRescinds = 0;
+
+// =================================================================================================
+// VULNERABLE — spec v14 §6 (X's passive), guarded by spec v14 §4.
+//
+// Three arms, three separate things they falsify. None of them shares a name with a console COMMAND;
+// the commands that read them live in Abilities/Characters/TraceXVerify.cpp and are all verbs
+// (Trace.X.VulnerableTest, Trace.X.CarrierTest), never these nouns.
+// =================================================================================================
+
+/** MASTER ARM. 0 removes the amplification entirely, so "+25% is real" can be shown failing. */
+static TAutoConsoleVariable<int32> CVarVulnerable(
+	TEXT("Trace.X.Vulnerable"), 1,
+	TEXT("1 (shipped): a vulnerable target takes +XVulnerableDamageBonus damage from every source. "
+	     "0: the RED arm — the mark is still applied and still drawn, but multiplies nothing, so "
+	     "Trace.X.VulnerableTest can be shown measuring 40 instead of 50."),
+	ECVF_Default);
+
+/**
+ * THE ORDERING ARM, and the only observable form the ordering claim can take.
+ *
+ * Spec brief, verbatim: "make sure the multiplier is applied AFTER the carrier check, never before
+ * it, or a 0 becomes a 0 by luck rather than by rule."
+ *
+ * ApplyDamage()'s carrier check is a `return`, not a scale — so moving the multiply above it does
+ * not change the damage a carrier takes (it is zero either way) and a red arm that only watched
+ * health would be uninformative, which is exactly the failure mode this project has been bitten by.
+ * What DOES change is whether the amplifier ran on a carrier's damage at all, and that is counted:
+ * GCarrierAmplified increments only from AmplifyForVulnerable(), only for a Core holder. On the red
+ * arm (0) the counter moves; on the shipped arm (1) it cannot, because the function is never reached
+ * with a carrier as the owner.
+ */
+static TAutoConsoleVariable<int32> CVarVulnerableApplyOrder(
+	TEXT("Trace.X.VulnerableApplyOrder"), 1,
+	TEXT("1 (shipped): the vulnerable multiplier is evaluated AFTER ApplyDamage's carrier early-out. "
+	     "0: the RED arm — evaluated BEFORE it, which makes the amplifier run on a Core carrier's "
+	     "damage and moves TraceVulnerable::GetCarrierAmplifiedCount()."),
+	ECVF_Default);
+
+/** THE CARRIER ARM. 0 removes both carrier locks so Trace.X.CarrierTest can reproduce the failure. */
+static TAutoConsoleVariable<int32> CVarVulnerableCarrierImmune(
+	TEXT("Trace.X.VulnerableCarrierImmune"), 1,
+	TEXT("1 (shipped): a Core carrier can neither be marked vulnerable nor have the multiplier "
+	     "applied to them. 0: the RED arm for spec v14 §4 — both locks removed."),
+	ECVF_Default);
+
+/**
+ * The four counters. File-static for the same reason GRegenSameFrameRescinds is: the facts being
+ * counted are about the RULES, not about any one pawn.
+ *
+ * The first two must be zero for the life of a correct process. The second two are LIVENESS — they
+ * are what lets a harness distinguish "the carrier rule held" from "the fixture never fired".
+ */
+static int32 GVulnerableCarrierMarked   = 0;
+static int32 GVulnerableCarrierAmplified = 0;
+static int32 GVulnerableAmplifiedHits    = 0;
+static int32 GVulnerableMarksApplied     = 0;
+
+namespace TraceVulnerable
+{
+	int32 GetCarrierMarkedCount()    { return GVulnerableCarrierMarked; }
+	int32 GetCarrierAmplifiedCount() { return GVulnerableCarrierAmplified; }
+	int32 GetAmplifiedHitCount()     { return GVulnerableAmplifiedHits; }
+	int32 GetMarkAppliedCount()      { return GVulnerableMarksApplied; }
+
+	void ResetCounters()
+	{
+		GVulnerableCarrierMarked = 0;
+		GVulnerableCarrierAmplified = 0;
+		GVulnerableAmplifiedHits = 0;
+		GVulnerableMarksApplied = 0;
+	}
+
+	float GetDamageMultiplier()
+	{
+		// Derived from the knob, never hardcoded: spec §6 says +25%, UTraceSettings::
+		// XVulnerableDamageBonus says 0.25, and Config/DefaultGame.ini wins over both.
+		return 1.f + FMath::Clamp(UTraceSettings::Get().XVulnerableDamageBonus, 0.f, 3.f);
+	}
+
+	float GetDurationSeconds()
+	{
+		return FMath::Clamp(UTraceSettings::Get().XVulnerableDurationSeconds, 0.01f, 30.f);
+	}
+
+	bool IsEnabled()          { return CVarVulnerable.GetValueOnAnyThread() != 0; }
+	bool IsApplyOrderShipped(){ return CVarVulnerableApplyOrder.GetValueOnAnyThread() != 0; }
+	bool IsCarrierImmune()    { return CVarVulnerableCarrierImmune.GetValueOnAnyThread() != 0; }
+}
 
 // =================================================================================================
 // Settings object
@@ -164,6 +257,11 @@ void UTraceHealthComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 	// pawn's regeneration state (a spectator, and the scoreboard's alive/dead already pays this
 	// cost), and this is one float that changes only when somebody is hit.
 	DOREPLIFETIME(UTraceHealthComponent, LastDamageServerTime);
+
+	// COND_None as well. The mark has to be visible on every machine — the marked player needs to
+	// know they are marked, X needs to see the payoff, and everyone else needs to know which enemy is
+	// worth shooting first. One float that changes only when a bee connects.
+	DOREPLIFETIME(UTraceHealthComponent, VulnerableUntilServerTime);
 }
 
 float UTraceHealthComponent::ServerTimeNow() const
@@ -224,6 +322,162 @@ bool UTraceHealthComponent::IsInvulnerable() const
 float UTraceHealthComponent::GetHealthPercent() const
 {
 	return FMath::Clamp(Health / GetMaxHealth(), 0.f, 1.f);
+}
+
+// -------------------------------------------------------------------------------------------
+// VULNERABLE (spec v14 §6, guarded by spec v14 §4)
+// -------------------------------------------------------------------------------------------
+
+bool UTraceHealthComponent::IsVulnerable() const
+{
+	return VulnerableUntilServerTime > ServerTimeNow();
+}
+
+float UTraceHealthComponent::GetVulnerableRemaining() const
+{
+	return FMath::Max(0.f, VulnerableUntilServerTime - ServerTimeNow());
+}
+
+float UTraceHealthComponent::GetVulnerableDamageMultiplier() const
+{
+	if (!TraceVulnerable::IsEnabled() || !IsVulnerable())
+	{
+		return 1.f;
+	}
+
+	// *** SPEC §4, LOCK 2. The amplifier never touches a Core holder's damage. ***
+	//
+	// IsCoreHolder(), NOT IsInvulnerable(). The two differ inside the mode-A hover-pass window, where
+	// IsInvulnerable() is deliberately false so that a passing carrier is shootable (spec §4's risk
+	// beat). A bullet in that window is not an ability and is allowed to land — but amplifying it
+	// with an ability's mark would be an ability contributing damage to a carrier, which is the
+	// sentence §4 forbids. So the strictest of the two predicates is the one used here, and the cost
+	// is nil: mode A has no characters at all, so nothing in mode A can ever be marked.
+	if (TraceVulnerable::IsCarrierImmune())
+	{
+		if (const ATraceCharacter* OwningCharacter = Cast<ATraceCharacter>(GetOwner()))
+		{
+			if (ATraceCore::IsCoreHolder(OwningCharacter) || OwningCharacter->IsCarrier())
+			{
+				return 1.f;
+			}
+		}
+	}
+
+	return TraceVulnerable::GetDamageMultiplier();
+}
+
+float UTraceHealthComponent::AmplifyForVulnerable(float Amount) const
+{
+	const float Multiplier = GetVulnerableDamageMultiplier();
+	if (Multiplier <= 1.f)
+	{
+		return Amount;
+	}
+
+	// THE ALARM. Reaching here with a carrier as the owner means either the carrier lock in
+	// GetVulnerableDamageMultiplier() was disarmed (the red arm) or the ordering regressed. Logged as
+	// an Error, counted, and read by Trace.X.CarrierTest.
+	if (const ATraceCharacter* OwningCharacter = Cast<ATraceCharacter>(GetOwner()))
+	{
+		if (ATraceCore::IsCoreHolder(OwningCharacter) || OwningCharacter->IsCarrier())
+		{
+			++GVulnerableCarrierAmplified;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Vulnerable] *** THE +%.0f%% VULNERABLE MULTIPLIER WAS EVALUATED ON DAMAGE AIMED AT THE CORE "
+				     "CARRIER %s (hit #%d). Spec v14 §4: no ability may contribute damage to a carrier. Check "
+				     "Trace.X.VulnerableCarrierImmune and Trace.X.VulnerableApplyOrder."),
+				(Multiplier - 1.f) * 100.f, *GetNameSafe(GetOwner()), GVulnerableCarrierAmplified);
+		}
+	}
+
+	++GVulnerableAmplifiedHits;
+	return Amount * Multiplier;
+}
+
+bool UTraceHealthComponent::ApplyVulnerable(float DurationSeconds, AController* Source)
+{
+	if (!HasAuthority())
+	{
+		// Clients get the mark by replication. A local write would be overwritten and would make a
+		// client briefly believe in a mark the server never granted.
+		return false;
+	}
+
+	// NOTE: Trace.X.Vulnerable is NOT consulted here, deliberately. That arm disarms the AMPLIFIER,
+	// not the mark, so that the red run and the green run differ in exactly one thing — the
+	// multiplication — and are otherwise the same marked target taking the same call. An arm that
+	// also suppressed the mark would be comparing "marked, unamplified" against "not marked at all",
+	// which tests nothing about the multiplier.
+	if (!IsAlive() || DurationSeconds <= 0.f || !FMath::IsFinite(DurationSeconds))
+	{
+		return false;
+	}
+
+	// *** SPEC §4, LOCK 1 (the second half of it). ***
+	//
+	// The caller is expected to have asked UTraceAbilityComponent::CanAffectTarget(Target, Control)
+	// and been refused already — UTraceAbilitySetX does. This is the belt to that pair of braces, and
+	// it exists because "the mark must not become a damage path" has to survive a future caller who
+	// reaches for ApplyVulnerable() directly and forgets the choke point.
+	if (TraceVulnerable::IsCarrierImmune())
+	{
+		if (const ATraceCharacter* OwningCharacter = Cast<ATraceCharacter>(GetOwner()))
+		{
+			if (ATraceCore::IsCoreHolder(OwningCharacter) || OwningCharacter->IsCarrier())
+			{
+				UE_LOG(LogTraceGame, Verbose,
+					TEXT("[Vulnerable] mark on %s refused: they are the Core carrier (spec v14 §4)."),
+					*GetNameSafe(GetOwner()));
+				return false;
+			}
+		}
+	}
+	else if (const ATraceCharacter* RedArmCharacter = Cast<ATraceCharacter>(GetOwner()))
+	{
+		// The red arm reached a carrier. Counted so the harness can prove the arm actually disarmed
+		// something rather than reporting a green that never had a rule to break.
+		if (ATraceCore::IsCoreHolder(RedArmCharacter) || RedArmCharacter->IsCarrier())
+		{
+			++GVulnerableCarrierMarked;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Vulnerable] *** THE CORE CARRIER %s WAS MARKED VULNERABLE (mark #%d). Spec v14 §4. This is "
+				     "only reachable with Trace.X.VulnerableCarrierImmune 0."),
+				*GetNameSafe(GetOwner()), GVulnerableCarrierMarked);
+		}
+	}
+
+	// NON-STACKING, AND THE WHOLE REASON THIS IS A DEADLINE. Spec §6: "Does not stack; a new
+	// application RESETS the timer." A plain write both resets a running mark and starts a new one,
+	// and can never accumulate past DurationSeconds.
+	VulnerableUntilServerTime = ServerTimeNow() + DurationSeconds;
+	VulnerableSource = Source;
+	++GVulnerableMarksApplied;
+
+	// Replication callbacks never fire on the authority; call it directly so a listen server draws
+	// the marker on the same frame a remote client does.
+	OnRep_Vulnerable();
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("[Vulnerable] %s marked for %.2fs by %s (x%.2f damage)."),
+		*GetNameSafe(GetOwner()), DurationSeconds, *GetNameSafe(Source), TraceVulnerable::GetDamageMultiplier());
+	return true;
+}
+
+void UTraceHealthComponent::ClearVulnerable()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	VulnerableUntilServerTime = -1000.f;
+	VulnerableSource = nullptr;
+	OnRep_Vulnerable();
+}
+
+void UTraceHealthComponent::OnRep_Vulnerable()
+{
+	UpdateVulnerableMarker();
 }
 
 // -------------------------------------------------------------------------------------------
@@ -324,6 +578,17 @@ void UTraceHealthComponent::ApplyDamage(float Amount, AController* Instigator, F
 		return;
 	}
 
+	// *** THE RED ARM FOR THE ORDERING CLAIM, AND THE ONLY THING ABOVE THE CARRIER CHECK. ***
+	//
+	// Shipped is Trace.X.VulnerableApplyOrder 1, so this branch is dead in a shipped process and the
+	// amplification happens below, after IsInvulnerable() has returned. Setting the arm to 0 moves the
+	// multiply to the wrong side of the carrier rule, which is what makes "applied AFTER the carrier
+	// check" a claim a harness can falsify instead of a claim about code somebody has read.
+	if (!TraceVulnerable::IsApplyOrderShipped())
+	{
+		Amount = AmplifyForVulnerable(Amount);
+	}
+
 	if (IsInvulnerable())
 	{
 		// The carrier is bullet-proof. Dropping the hit here (rather than at the weapon) means
@@ -366,6 +631,25 @@ void UTraceHealthComponent::ApplyDamage(float Amount, AController* Instigator, F
 			*GetNameSafe(GetOwner()), LastRegenApplied, static_cast<uint64>(GFrameCounter));
 
 		LastRegenApplied = 0.f;
+	}
+
+	// *** THE ONE PLACE THE VULNERABLE MULTIPLIER IS APPLIED (spec v14 §6, X's passive). ***
+	//
+	// "+25% damage FROM ALL SOURCES" — bullets, headshots, the knife, Oyster's poison, Pickler and
+	// every future ability reach this function and nothing else has to remember. See the block
+	// comment at the top of the header for why the mark lives on this component and not on
+	// UTraceCharacterAbilitySet::GetIncomingDamageMultiplier().
+	//
+	// *** POSITION IS LOAD-BEARING: STRICTLY AFTER THE IsInvulnerable() EARLY-OUT ABOVE. *** A Core
+	// carrier's damage never reaches this line, so a carrier's zero is produced by the carrier rule
+	// and not by an amplifier that happened to multiply zero. Trace.X.VulnerableApplyOrder 0 is the
+	// red arm that moves it above and makes the difference observable.
+	//
+	// The arm MOVES the multiplication, it does not add a second one — hence the guard. Without it
+	// the red arm would amplify twice (1.5625x) and would be testing a defect nobody proposed.
+	if (TraceVulnerable::IsApplyOrderShipped())
+	{
+		Amount = AmplifyForVulnerable(Amount);
 	}
 
 	// And the clock restarts here, for every hit that actually lands — before the health write, so
@@ -416,6 +700,12 @@ void UTraceHealthComponent::ResetHealth()
 	LastDamageServerTime = ServerTimeNow();
 	LastRegenApplied = 0.f;
 
+	// A new life is not born marked. ResetHealth() is the respawn/half-time path, and X's mark is a
+	// 2 s tactical state, not something to inherit across a death. This is NOT the cooldown rule
+	// being violated — spec §5's "cooldowns keep running through death" is about the ACTIVATED
+	// ability's cooldown, which lives on the PlayerState and is untouched by anything here.
+	ClearVulnerable();
+
 	OnRep_Health();
 }
 
@@ -446,6 +736,160 @@ void UTraceHealthComponent::OnRep_Health()
 	if (ATraceCharacter* OwningCharacter = Cast<ATraceCharacter>(GetOwner()))
 	{
 		OwningCharacter->SetDeadPresentation(!IsAlive());
+	}
+}
+
+// =================================================================================================
+// The vulnerable marker — cosmetic only, local to each machine
+// =================================================================================================
+
+void UTraceHealthComponent::UpdateVulnerableMarker()
+{
+	UWorld* CurrentWorld = GetWorld();
+	if (CurrentWorld == nullptr || !CurrentWorld->IsGameWorld())
+	{
+		return;
+	}
+
+	// A dedicated server draws nothing; a listen server draws for its own player like any client.
+	if (CurrentWorld->GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+
+	// Only ATraceCharacters get a marker. The regen fixture can be marked by a harness and there is
+	// nothing above its head to hang a ring on.
+	ATraceCharacter* OwningCharacter = Cast<ATraceCharacter>(GetOwner());
+	if (OwningCharacter == nullptr)
+	{
+		return;
+	}
+
+	const bool bWantMarker = IsVulnerable();
+	AActor* Existing = VulnerableMarker.Get();
+
+	if (!bWantMarker)
+	{
+		// Leave the destroy to the marker's own tick, which also handles the deadline simply passing
+		// (an expiry is not a replication event and would never reach an OnRep).
+		return;
+	}
+
+	if (Existing != nullptr)
+	{
+		return;   // already up; the deadline moved and the marker re-reads it every tick
+	}
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = OwningCharacter;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParams.ObjectFlags |= RF_Transient;
+
+	ATraceVulnerableMarker* Marker = CurrentWorld->SpawnActor<ATraceVulnerableMarker>(
+		ATraceVulnerableMarker::StaticClass(), OwningCharacter->GetActorLocation(), FRotator::ZeroRotator, SpawnParams);
+	if (Marker != nullptr)
+	{
+		Marker->Watching = this;
+		VulnerableMarker = Marker;
+	}
+}
+
+ATraceVulnerableMarker::ATraceVulnerableMarker()
+{
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = true;
+
+	// LOCAL AND COSMETIC. Never replicated: every machine derives it from the replicated deadline,
+	// which is one float instead of one actor per marked player per client.
+	bReplicates = false;
+	SetReplicateMovement(false);
+
+	USceneComponent* MarkerRoot = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+	SetRootComponent(MarkerRoot);
+	MarkerRoot->SetMobility(EComponentMobility::Movable);
+
+	Ring = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Ring"));
+	Ring->SetupAttachment(MarkerRoot);
+	// NO COLLISION. It floats where a head is and must never eat a bullet meant for one.
+	Ring->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Ring->SetCollisionProfileName(TEXT("NoCollision"));
+	Ring->SetGenerateOverlapEvents(false);
+	Ring->SetCanEverAffectNavigation(false);
+	Ring->SetCastShadow(false);
+	Ring->bReceivesDecals = false;
+	Ring->SetRelativeScale3D(FVector(0.55f, 0.55f, 0.06f));
+
+	// Constructor-time finders, the same policy TraceCore uses: engine assets referenced this way
+	// cook into a packaged build, a runtime LoadObject would resolve to null once cooked.
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> CylinderFinder(TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
+	if (CylinderFinder.Succeeded())
+	{
+		Ring->SetStaticMesh(CylinderFinder.Object);
+	}
+
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon"));
+	if (NeonFinder.Succeeded())
+	{
+		BaseMaterial = NeonFinder.Object;
+	}
+
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> BasicFinder(TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+	if (BaseMaterial == nullptr && BasicFinder.Succeeded())
+	{
+		BaseMaterial = BasicFinder.Object;
+	}
+}
+
+void ATraceVulnerableMarker::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+	const UTraceHealthComponent* Watched = Watching.Get();
+	if (Watched == nullptr || !Watched->IsVulnerable() || !Watched->IsAlive())
+	{
+		// THE EXPIRY PATH. A deadline passing is not a replication event, so nothing will ever call
+		// an OnRep to tear this down — the marker retires itself.
+		Destroy();
+		return;
+	}
+
+	const AActor* MarkedActor = Watched->GetOwner();
+	const UWorld* MarkerWorld = GetWorld();
+	if (MarkedActor == nullptr || MarkerWorld == nullptr)
+	{
+		Destroy();
+		return;
+	}
+
+	// Follow the head, spin, and pulse faster as the 2 s runs out so the mark reads as a timer.
+	const float Remaining = Watched->GetVulnerableRemaining();
+	const float Total = FMath::Max(0.01f, TraceVulnerable::GetDurationSeconds());
+	const float Fraction = FMath::Clamp(Remaining / Total, 0.f, 1.f);
+	const float LocalNow = static_cast<float>(MarkerWorld->GetTimeSeconds());
+
+	// NOT named "Location": AActor has had a member by that name in this engine's lineage, and MSVC
+	// errors on a local shadowing an enclosing class's member where clang says nothing. That exact
+	// mistake has broken the Windows build in this project three times.
+	FVector MarkerLocation = MarkedActor->GetActorLocation();
+	MarkerLocation.Z += 118.f + 6.f * FMath::Sin(LocalNow * 6.f);
+	SetActorLocation(MarkerLocation);
+	SetActorRotation(FRotator(0.f, LocalNow * 220.f, 0.f));
+
+	if (Ring != nullptr)
+	{
+		if (RingMID == nullptr && BaseMaterial != nullptr)
+		{
+			RingMID = Ring->CreateDynamicMaterialInstance(0, BaseMaterial);
+		}
+		if (RingMID != nullptr)
+		{
+			// Amber -> red as it expires. Both parameter names are set because the neon material and
+			// the engine basic material do not agree on one; the absent one is a no-op.
+			const FLinearColor Colour = FMath::Lerp(FLinearColor(1.f, 0.15f, 0.05f, 1.f),
+			                                        FLinearColor(1.f, 0.75f, 0.05f, 1.f), Fraction);
+			RingMID->SetVectorParameterValue(TEXT("Color"), Colour);
+			RingMID->SetVectorParameterValue(TEXT("BaseColor"), Colour);
+		}
 	}
 }
 
@@ -871,6 +1315,16 @@ static FAutoConsoleCommandWithWorld CmdHealthDumpSettings(
 			Rate, Table.RegenRatePerSecond, CVarHealthRegenRate.GetValueOnAnyThread(), Max, Max / Rate);
 		UE_LOG(LogTraceGame, Display, TEXT("REGEN   rescinds   : %d heal(s) taken back by same-frame damage since launch"),
 			TraceHealthRegen::GetSameFrameRescindCount());
+		UE_LOG(LogTraceGame, Display,
+			TEXT("VULN    (v14 §6 X): enabled=%d multiplier=x%.3f duration=%.2fs | applyOrder=%s carrierImmune=%d"),
+			TraceVulnerable::IsEnabled() ? 1 : 0, TraceVulnerable::GetDamageMultiplier(),
+			TraceVulnerable::GetDurationSeconds(),
+			TraceVulnerable::IsApplyOrderShipped() ? TEXT("SHIPPED (after carrier check)") : TEXT("*** RED (before) ***"),
+			TraceVulnerable::IsCarrierImmune() ? 1 : 0);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("VULN    alarms     : carrierMarked=%d carrierAmplified=%d (both MUST be 0) | marks=%d amplifiedHits=%d"),
+			TraceVulnerable::GetCarrierMarkedCount(), TraceVulnerable::GetCarrierAmplifiedCount(),
+			TraceVulnerable::GetMarkAppliedCount(), TraceVulnerable::GetAmplifiedHitCount());
 		UE_LOG(LogTraceGame, Display, TEXT("NET     mode       : %d (0 standalone, 1 dedicated, 2 listen, 3 client)"),
 			World != nullptr ? static_cast<int32>(World->GetNetMode()) : -1);
 		UE_LOG(LogTraceGame, Display, TEXT("=========================================="));

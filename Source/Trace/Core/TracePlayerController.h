@@ -396,6 +396,20 @@ protected:
 	TObjectPtr<UInputAction> IA_EquipGun;
 
 	/**
+	 * SPEC v14 §5 — the two ability binds, default E and V.
+	 *
+	 * IA_Ability is bound on Started only: the activated ability is a press. IA_AbilitySecondary is
+	 * bound on Started AND Completed AND Canceled, because Mace's suspend is a HOLD and a dropped
+	 * release edge would leave her floating — the same asymmetry, and for the same reason, as
+	 * IA_Pass's hover pass.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_Ability;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_AbilitySecondary;
+
+	/**
 	 * Builds InputMapping and every IA_* exactly once, then lays down the key mappings.
 	 *
 	 * The two halves are separate on purpose. The ACTIONS must be created exactly once and never
@@ -462,6 +476,22 @@ protected:
 	void OnCrouchCompleted();
 	void OnScoreboardStarted();
 	void OnScoreboardCompleted();
+
+	/**
+	 * SPEC v14 §5. Press edge of the activated ability (E).
+	 *
+	 * Routed through UTraceAbilityInputRelay::RouteActivatePressed rather than straight into
+	 * UTraceAbilityComponent::HandleActivatePressed, because ONE character's press is not an
+	 * activation: Mace's second press of Spike is the reactivation that pulls her, and
+	 * TryActivate() correctly refuses it (the throw's own 20 s cooldown is running). That routing
+	 * rule is written down exactly once, in the relay, and both the key path and the relay's own
+	 * interim poll call it.
+	 */
+	void OnAbilityStarted();
+
+	/** SPEC v14 §5. Press / release of the secondary ability (V) — Mace's suspend is a hold. */
+	void OnAbilitySecondaryStarted();
+	void OnAbilitySecondaryCompleted();
 
 	/** GetTraceCharacter(), but null when the pawn is missing or dead. */
 	ATraceCharacter* GetLivingCharacter() const;

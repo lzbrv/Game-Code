@@ -200,6 +200,20 @@ private:
 		SensitivityY,
 		InvertY,
 
+		/**
+		 * Spec v14 §3 — "Include a toggle in game settings to turn off all characters".
+		 *
+		 * INSERTED ABOVE THE VIDEO BLOCK, deliberately. IsVideoSetting() is `>= ResolutionScale`, so
+		 * anything added below ResolutionScale silently becomes a "video setting" and gets read and
+		 * written through UTraceGameUserSettings, which knows nothing about it — the row would draw
+		 * 0.00 and adjusting it would do nothing at all. Nothing that is not video goes below this
+		 * line.
+		 *
+		 * Its value lives in neither of the two settings objects this page normally talks to: see
+		 * TraceCharacters in UI/TraceMatchOptions.h for where it persists and why.
+		 */
+		CharactersEnabled,
+
 		// ---- Video. IsVideoSetting() is the boundary and depends on this ordering. ----
 		ResolutionScale,
 		OverallQuality,

@@ -710,14 +710,20 @@ namespace
 	 * Z-FIGHTING, and Z-fighting on an unlit emissive surface reads precisely as a flickering band at
 	 * every single joint, i.e. as sections.
 	 *
-	 * Insetting every other element's cross-section by 0.6% (0.54uu of the 90uu width, 1.1uu of the
-	 * 190uu height) makes the overlapping faces non-coplanar, so the depth test resolves them
-	 * consistently and the ribbon reads as one surface. It is far below the width of a pixel at any
-	 * range the trace is judged from, and it only ever makes the drawn thing SMALLER than the lethal
-	 * volume by half a uu on alternate elements — inside the 34uu of tripper-capsule inflation the
-	 * trip test already adds, so it cannot manufacture a graze.
+	 * Offsetting every other element's cross-section by 0.6% makes the overlapping faces non-coplanar,
+	 * so the depth test resolves them consistently and the ribbon reads as one surface. It is far
+	 * below the width of a pixel at any range the trace is judged from.
+	 *
+	 * v14 §1 FLIPPED ITS SIGN, AND THE SIGN IS THE WHOLE POINT. It used to be 0.994 — every other
+	 * element drawn very slightly SMALLER than the lethal volume — with the argument that 0.14uu of
+	 * under-draw is lost inside the tripper's own capsule. That argument is fine for feel and wrong
+	 * for the invariant: "lethal outside drawn must be ZERO" cannot be asserted at zero while the
+	 * drawing is deliberately a tenth of a uu narrow, and a harness forced to carry a tolerance to
+	 * accommodate a cosmetic constant is a harness that will one day absorb a real defect in the same
+	 * tolerance. 1.006 breaks the coplanarity exactly as well and spends its 0.14uu in the
+	 * over-drawing direction, which the standing budget already covers many times over.
 	 */
-	constexpr double RibbonAlternateInset = 0.994;
+	constexpr double RibbonAlternateOutset = 1.006;
 
 	/**
 	 * Fraction of the LETHAL width the ribbon is drawn at. 1.0, and it should stay 1.0.
@@ -1242,6 +1248,291 @@ namespace
 			return 0.0;
 		}
 		return FMath::Clamp(FVector::DotProduct(P - A, Segment) / LengthSquared, 0.0, 1.0);
+	}
+
+	// =============================================================================================
+	// SPEC v14 §1 — "ENSURE THAT THE TRACE SHOWS EXACTLY WHAT IS LETHAL"
+	//
+	// Two numbers were measured last pass and both were wrong in a way nobody could see from the
+	// code, because "lethal" and "drawn" were each computed correctly from the same polyline and
+	// still described different solids:
+	//
+	//   lethal outside drawn  22.3uu at the END CAPS — an INVISIBLE KILL VOLUME, the worse direction.
+	//   drawn outside lethal  29.1uu — visible ribbon that kills nothing, against a 13.8uu budget.
+	//
+	// THE TWO CAUSES, DIAGNOSED. Neither is about where the points are; both are about what shape
+	// each half puts around them.
+	//
+	//  1. THE END CAPS. ServerRunTripTest asks "how far is the dasher's swept segment from the trail
+	//     SEGMENT", and a point-to-segment distance is RADIAL at the ends: the volume that kills
+	//     bulges a half-disc of TrailRadius (22.5uu) past the first and last point, in every
+	//     horizontal direction. PlaceRibbon, correctly and deliberately, keeps the two outer elements
+	//     FLUSH with those points "so the ribbon never extends past the polyline the server kills
+	//     along". Both decisions read as right on their own; together they are 22.5uu of kill volume
+	//     with nothing drawn on it. That is the 22.3uu, and it is the number the spec put first.
+	//
+	//     THE FIX IS TO FLATTEN THE VOLUME, NOT TO EXTEND THE DRAWING, and the direction matters.
+	//     Extending the ribbon 22.5uu past the head would draw ribbon over the head-grace stub — the
+	//     one stretch that is deliberately NOT lethal — and swap an invisible kill volume for a
+	//     visible lie. Flattening the caps instead makes the exemption exactly the one body width its
+	//     own comment claims, and makes the tail stop killing exactly where it stops being drawn.
+	//     The lethal set only ever SHRINKS, so nothing that was avoidable becomes lethal.
+	//
+	//  2. THE CROSS-SECTION'S TILT — see GRibbonUpright. The lethal volume is a VERTICAL column;
+	//     PlaceRibbon pitched each element to follow the path through the air, so on any climb or
+	//     drop the drawn slab leans out of that column sideways. That is the 29.1uu.
+	//
+	// EVERYTHING that asks either question now goes through SegmentGapToTraceVolume below. There is
+	// one definition of the solid, the trip test and both halves of the measurement share it, and a
+	// future change to one cannot silently fail to reach the other.
+	// =============================================================================================
+
+	/**
+	 * FLAT OUTER END CAPS ON THE LETHAL VOLUME (spec v14 §1). 1 = the volume stops dead at the first
+	 * and last lethal point, exactly where the ribbon stops being drawn. 0 = the pre-v14 radial cap,
+	 * which is the reported bug and the RED arm of Trace.Trail.LethalDrawn.
+	 *
+	 * INTERIOR joints keep their round cap and must: PlaceRibbon runs each element one TrailRadius
+	 * PAST every interior joint along its own axis, and that overlap box provably contains the disc
+	 * of radius TrailRadius about the joint (any point of the disc is within TrailRadius laterally
+	 * AND within TrailRadius along the next element's axis, which is exactly its back overlap). So
+	 * the interior is already covered in the safe direction and only the two OUTER caps were bare.
+	 */
+	int32 GTrailFlatEndCaps = 1;
+
+	FAutoConsoleVariableRef CVarTrailFlatEndCaps(
+		TEXT("Trace.Trail.FlatEndCaps"),
+		GTrailFlatEndCaps,
+		TEXT("Spec v14 1. 1 (default): the lethal volume is the union of FLAT-ENDED slabs, one per "
+		     "trail segment - the same chain of boxes the ribbon draws. 0: the pre-v14 radial "
+		     "distance-to-segment, whose cap is a disc at every joint AND at both outer ends, so it "
+		     "kills up to one TrailRadius past the head and the tail with nothing drawn there. 0 is "
+		     "the reported bug and the red arm of Trace.Trail.LethalDrawn."),
+		ECVF_Default);
+
+	/**
+	 * THE RIBBON'S CROSS-SECTION STANDS UPRIGHT (spec v14 §1). 1 = yaw only; 0 = the pre-v14
+	 * yaw+pitch, kept as the other red arm.
+	 *
+	 * WHY THIS IS THE 29.1uu. The volume that kills is defined in ServerRunTripTest as a HORIZONTAL
+	 * distance to the polyline plus a VERTICAL band about it — a vertical column, whatever the path
+	 * does. PlaceRibbon oriented each element with `Direction.Rotation()`, i.e. yaw AND pitch, so on
+	 * a climb the element's height axis leans away from world up. An element spanning a 60uu step is
+	 * (63 + 60) = 123uu tall about an axis pitched ~45 degrees, which puts its corner
+	 * 123/2 * sin(45) = 43uu HORIZONTALLY from the path where the column reaches 22.5. That is
+	 * visible ribbon, in mid-air, that kills nothing — and it also broke GetTraceDrawnHalfReach(),
+	 * which the wall fitter clears room by, so the fitter was under-clearing on every slope.
+	 *
+	 * THE COST, STATED PLAINLY. A trace laid over a jump is now a series of upright slabs whose
+	 * heights union across each step instead of one banked ribbon. GRibbonVerticalStep exists to
+	 * keep those steps small enough that it reads as a ramp rather than a staircase. This is a real
+	 * change to how a jumping trace LOOKS, taken deliberately: the spec's line is "ensure that the
+	 * trace shows exactly what is lethal", and what is lethal is a vertical column.
+	 */
+	int32 GRibbonUpright = 1;
+
+	FAutoConsoleVariableRef CVarRibbonUpright(
+		TEXT("Trace.Trail.RibbonUpright"),
+		GRibbonUpright,
+		TEXT("Spec v14 1. 1 (default): ribbon elements are yaw-only, so the drawn cross-section is the "
+		     "vertical column the trip test actually uses. 0: the pre-v14 yaw+pitch element, which "
+		     "leans out of the lethal column on every slope - the red arm of Trace.Trail.LethalDrawn."),
+		ECVF_Default);
+
+	/**
+	 * Largest vertical rise, in uu, a single upright ribbon element may span (spec v14 §1).
+	 *
+	 * An upright element covers the UNION of its two ends' vertical bands, so at the LOW end of a
+	 * climbing element its top stands a full |dZ| above the lethal band there (and |dZ|/2 in the
+	 * middle). That is over-drawing, i.e. the safe direction, but it is still the trace showing
+	 * something that does not kill, so it is bounded rather than accepted: BuildRibbonSamples
+	 * subdivides a segment until no piece climbs more than this.
+	 *
+	 * 8, AND THE NUMBER WAS MEASURED, NOT CHOSEN. At 16 the 45 CLIMB fixture reported 15.0uu against
+	 * the 13.8uu budget — the one fixture still failing after everything else was fixed, and failing
+	 * by the exact |dZ| the subdivision was allowing. At 8 it reports well inside. The cost is
+	 * elements on slopes only: a 45-degree climb of 42uu per point becomes six per segment where a
+	 * flat run is still one.
+	 *
+	 * COARSEN, NEVER TRUNCATE still holds — the element budget grows this step exactly as it grows
+	 * the horizontal one, so a long fall gets chunkier elements and never a missing stretch.
+	 */
+	float GRibbonVerticalStep = 8.f;
+
+	FAutoConsoleVariableRef CVarRibbonVerticalStep(
+		TEXT("Trace.Trail.RibbonVerticalStep"),
+		GRibbonVerticalStep,
+		TEXT("Spec v14 1. Largest vertical rise one upright ribbon element may span, in uu. Caps the "
+		     "vertical over-draw at half this. Lower = smoother slopes and more elements. Purely "
+		     "cosmetic - the kill volume is unchanged."),
+		ECVF_Default);
+
+	/**
+	 * THE ONE DEFINITION OF THE TRACE'S OWN SOLID, in the two axes the trip test has always kept
+	 * apart, as a GAP rather than as a yes/no.
+	 *
+	 * Returns how far the swept segment [SweepFrom, SweepTo] is from the volume belonging to trail
+	 * segment [A, B]: @p OutHorizontal uu horizontally, @p OutVertical uu vertically, both zero when
+	 * the sweep is inside. A tripper is caught when the gaps are within ITS OWN reach — which is why
+	 * the trace's radius and the tripper's inflation are separate arguments now instead of being
+	 * pre-summed into one threshold. Pre-summing is what made a flat cap unexpressible: "distance to
+	 * the segment <= R + r" cannot say where the trace's own surface is.
+	 *
+	 * Passing SweepFrom == SweepTo asks the same question about a single point, and that is how both
+	 * halves of the measurement are taken, so the harness and the game cannot drift apart.
+	 *
+	 * bFlatAtA / bFlatAtB replace the radial cap at that end of THIS segment with a flat face
+	 * through it, perpendicular to the segment. Only ever true for the two OUTER ends of the whole
+	 * polyline; see GTrailFlatEndCaps.
+	 */
+	void SegmentGapToTraceVolume(const FVector& A, const FVector& B, bool bFlatAtA, bool bFlatAtB,
+		const FVector& SweepFrom, const FVector& SweepTo,
+		double TraceRadius, double TraceHalfHeight,
+		double& OutHorizontal, double& OutVertical, bool& bOutBeyondFlatCap)
+	{
+		bOutBeyondFlatCap = false;
+
+		const FVector FlatFrom(SweepFrom.X, SweepFrom.Y, 0.0);
+		const FVector FlatTo(SweepTo.X, SweepTo.Y, 0.0);
+		const FVector FlatA(A.X, A.Y, 0.0);
+		const FVector FlatB(B.X, B.Y, 0.0);
+
+		// Returns void — the closest point on each segment, not the distance.
+		FVector ClosestOnSweep = FVector::ZeroVector;
+		FVector ClosestOnTrail = FVector::ZeroVector;
+		FMath::SegmentDistToSegmentSafe(FlatFrom, FlatTo, FlatA, FlatB, ClosestOnSweep, ClosestOnTrail);
+
+		// The radial answer: distance to the CLAMPED segment, i.e. round caps at both ends. This is
+		// what the trip test has always computed and it stays the answer everywhere except the two
+		// outer caps.
+		double Lateral = FVector::Dist(ClosestOnSweep, ClosestOnTrail);
+		double Overshoot = 0.0;
+
+		const FVector Axis = FlatB - FlatA;
+		const double AxisLength = Axis.Size();
+
+		// A degenerate (zero-length in plan) segment has no direction to be flat against, so it keeps
+		// its disc — which is the honest shape for it, and is what a one-point trace is drawn as.
+		if (AxisLength > GeometryEpsilon && (bFlatAtA || bFlatAtB))
+		{
+			const FVector Direction = Axis / AxisLength;
+			const FVector Offset = ClosestOnSweep - FlatA;
+			const double Along = FVector::DotProduct(Offset, Direction);
+			const double Perpendicular = (Offset - Direction * Along).Size();
+
+			if (bFlatAtA && Along < 0.0)
+			{
+				Overshoot = -Along;
+				Lateral = Perpendicular;
+				bOutBeyondFlatCap = true;
+			}
+			else if (bFlatAtB && Along > AxisLength)
+			{
+				Overshoot = Along - AxisLength;
+				Lateral = Perpendicular;
+				bOutBeyondFlatCap = true;
+			}
+		}
+
+		const double LateralGap = FMath::Max(0.0, Lateral - TraceRadius);
+		OutHorizontal = (Overshoot > 0.0)
+			? FMath::Sqrt(Overshoot * Overshoot + LateralGap * LateralGap)
+			: LateralGap;
+
+		// Heights are compared WHERE THE CLOSEST HORIZONTAL APPROACH HAPPENED — the flattened test
+		// threw the Z away — exactly as the trip test has always done it.
+		const double SweepAlpha = SegmentAlpha(FlatFrom, FlatTo, ClosestOnSweep);
+		const double ToucherZ = FMath::Lerp(SweepFrom.Z, SweepTo.Z, SweepAlpha);
+
+		double TrailZ = 0.0;
+		if (AxisLength > GeometryEpsilon)
+		{
+			const double TrailAlpha = SegmentAlpha(FlatA, FlatB, ClosestOnTrail);
+			TrailZ = FMath::Lerp(A.Z, B.Z, TrailAlpha);
+		}
+		else
+		{
+			// A SEGMENT THAT IS A POINT IN PLAN — i.e. a FALL — and this branch is a v14 §1 bug fix,
+			// not a tidy-up.
+			//
+			// SegmentAlpha of a zero-length segment returns 0, so the old code compared every height
+			// against A.Z and NEVER against B.Z. On a carrier falling 300uu that made the lethal volume
+			// five disconnected 63uu bands stacked around the points, with the LAST point's band
+			// missing altogether — the bottom 60uu of a fall was drawn and killed nothing, measured at
+			// 60.2uu of over-draw on the VERTICAL DROP fixture. Since there is no horizontal
+			// information to interpolate by, the honest volume is the whole span the segment covers:
+			// clamp into [A.Z, B.Z] and the column becomes continuous, exactly as the drawn element's
+			// unioned band already was.
+			TrailZ = FMath::Clamp(ToucherZ, FMath::Min(A.Z, B.Z), FMath::Max(A.Z, B.Z));
+		}
+
+		OutVertical = FMath::Max(0.0, FMath::Abs(ToucherZ - TrailZ) - TraceHalfHeight);
+	}
+
+	/**
+	 * The same solid, asked about a single world point: how far outside the LETHAL volume is it?
+	 *
+	 * Zero on both axes means the point is inside the thing that kills. The pair reported is the one
+	 * from the segment with the smallest COMBINED gap — a point is outside the whole volume only if
+	 * it is outside every segment's — and the two components are then handed back as they stand,
+	 * because the vertical overhang is deliberate (the union of an element's two ends' bands) and
+	 * the horizontal one is not. Rolling them together once made a documented design choice read as
+	 * a fitter bug.
+	 */
+	void MeasurePointGapToTrace(const TArray<FVector>& Polyline, const FVector& At,
+		double TraceRadius, double TraceHalfHeight,
+		double& OutHorizontal, double& OutVertical, bool& bOutBeyondEnd)
+	{
+		OutHorizontal = 0.0;
+		OutVertical = 0.0;
+		bOutBeyondEnd = false;
+
+		if (Polyline.Num() == 0)
+		{
+			return;
+		}
+
+		const bool bFlatCaps = (GTrailFlatEndCaps != 0);
+		const int32 LastSegment = FMath::Max(0, Polyline.Num() - 2);
+
+		double BestCombined = TNumericLimits<double>::Max();
+
+		for (int32 SegmentIndex = 0; SegmentIndex <= LastSegment; ++SegmentIndex)
+		{
+			const FVector& A = Polyline[SegmentIndex];
+			const FVector& B = Polyline[FMath::Min(SegmentIndex + 1, Polyline.Num() - 1)];
+
+			double Horizontal = 0.0;
+			double Vertical = 0.0;
+			bool bBeyond = false;
+			SegmentGapToTraceVolume(A, B, bFlatCaps, bFlatCaps,
+				At, At, TraceRadius, TraceHalfHeight, Horizontal, Vertical, bBeyond);
+
+			const double Combined = FMath::Sqrt(Horizontal * Horizontal + Vertical * Vertical);
+			if (Combined < BestCombined)
+			{
+				BestCombined = Combined;
+				OutHorizontal = Horizontal;
+				OutVertical = Vertical;
+				bOutBeyondEnd = bBeyond;
+			}
+
+			if (BestCombined <= 0.0)
+			{
+				break;
+			}
+		}
+	}
+
+	/** True when @p At is inside the volume the server kills along. The harness's filter. */
+	bool IsPointLethal(const TArray<FVector>& Polyline, const FVector& At,
+		double TraceRadius, double TraceHalfHeight)
+	{
+		double Horizontal = 0.0;
+		double Vertical = 0.0;
+		bool bBeyond = false;
+		MeasurePointGapToTrace(Polyline, At, TraceRadius, TraceHalfHeight, Horizontal, Vertical, bBeyond);
+		return (Horizontal <= 0.0) && (Vertical <= 0.0);
 	}
 
 	// =============================================================================================
@@ -4178,12 +4469,16 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		// those two sweeps as: horizontal segment-to-segment distance (which catches tunnelling
 		// at dash speed, unlike a point test), plus a separate vertical overlap check so that
 		// clearing the trace in the air is not a hit.
+		// v14 §1: the narrow phase no longer takes a pre-summed threshold — it takes the trace's own
+		// half width and the tripper's reach separately, because a summed threshold cannot express
+		// where the trace's own surface is and therefore cannot have a flat cap. This sum survives for
+		// the BROAD phase (where a conservative radius is all that is wanted) and for the log line
+		// that quotes the widening, and it is still the same number the narrow phase effectively uses
+		// away from the two outer caps.
 		const double HorizontalThreshold = TrailRadius + Reach.EffectiveRadius;
-		const double VerticalThreshold = TrailHalfHeight + Reach.EffectiveHalfHeight;
 
-		// The pre-v10 thresholds, kept alive purely to be counted against. See GModelTripsWidened.
+		// The pre-v10 threshold, kept alive purely to be counted against. See GModelTripsWidened.
 		const double CapsuleHorizontalThreshold = TrailRadius + Reach.CapsuleRadius;
-		const double CapsuleVerticalThreshold = TrailHalfHeight + Reach.CapsuleHalfHeight;
 
 		// Broad phase: if this candidate's swept XY box, inflated by the same horizontal threshold
 		// the narrow phase uses, does not touch the trace's XY box, no segment can be within range.
@@ -4201,7 +4496,8 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		}
 
 		const bool bHitLethal = bNearTrace
-			&& SweepIntersectsTrace(TestPositions, PreviousLocation, CurrentLocation, HorizontalThreshold, VerticalThreshold);
+			&& SweepIntersectsTrace(TestPositions, PreviousLocation, CurrentLocation,
+				TrailRadius, TrailHalfHeight, Reach.EffectiveRadius, Reach.EffectiveHalfHeight);
 
 		if (bHitLethal)
 		{
@@ -4215,7 +4511,7 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 			// they are the same detection and the spec asks about both.
 			const bool bCapsuleWouldHit = SweepIntersectsTrace(
 				TestPositions, PreviousLocation, CurrentLocation,
-				CapsuleHorizontalThreshold, CapsuleVerticalThreshold);
+				TrailRadius, TrailHalfHeight, Reach.CapsuleRadius, Reach.CapsuleHalfHeight);
 
 			++GModelTripsTotal;
 
@@ -4283,7 +4579,8 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		// state and the lethal state have drifted apart, which is the whole bug class this pass
 		// exists to close — so it is reported at Log, not at Verbose.
 		if (ExemptPositions.Num() > 1
-			&& SweepIntersectsTrace(ExemptPositions, PreviousLocation, CurrentLocation, HorizontalThreshold, VerticalThreshold))
+			&& SweepIntersectsTrace(ExemptPositions, PreviousLocation, CurrentLocation,
+				TrailRadius, TrailHalfHeight, Reach.EffectiveRadius, Reach.EffectiveHalfHeight))
 		{
 			UE_LOG(LogTraceGame, Log,
 				TEXT("[TRACEDASH] %s dashed through the NON-DRAWN head stub of %s's trace: NO KILL (emitter footprint, %.0fuu). points=%d lethal=%d"),
@@ -4358,17 +4655,13 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 }
 
 bool UTraceTrailComponent::SweepIntersectsTrace(const TArray<FVector>& Positions, const FVector& PreviousLocation,
-	const FVector& CurrentLocation, double HorizontalThreshold, double VerticalThreshold) const
+	const FVector& CurrentLocation, double TraceRadius, double TraceHalfHeight,
+	double TripperRadius, double TripperHalfHeight) const
 {
 	if (Positions.Num() == 0)
 	{
 		return false;
 	}
-
-	const double HorizontalThresholdSquared = HorizontalThreshold * HorizontalThreshold;
-
-	const FVector SweepStart(PreviousLocation.X, PreviousLocation.Y, 0.0);
-	const FVector SweepEnd(CurrentLocation.X, CurrentLocation.Y, 0.0);
 
 	// A single point is tested as a zero-length segment rather than skipped. The old code needed
 	// two testable points before ANYTHING was lethal, which — stacked on the head exemption — meant
@@ -4376,37 +4669,30 @@ bool UTraceTrailComponent::SweepIntersectsTrace(const TArray<FVector>& Positions
 	// handles a degenerate segment correctly, so there is no reason for that hole to exist.
 	const int32 LastSegment = FMath::Max(0, Positions.Num() - 2);
 
+	// SPEC v14 §1. The two OUTER caps are flat, so the volume that kills stops exactly where the
+	// ribbon stops being drawn. Interior joints keep their disc — the drawing's own joint overlap
+	// already contains it. See GTrailFlatEndCaps for why this, and not extending the drawing.
+	const bool bFlatCaps = (GTrailFlatEndCaps != 0);
+
 	for (int32 SegmentIndex = 0; SegmentIndex <= LastSegment; ++SegmentIndex)
 	{
 		const FVector& TrailStart = Positions[SegmentIndex];
 		const FVector& TrailEnd = Positions[FMath::Min(SegmentIndex + 1, Positions.Num() - 1)];
 
-		const FVector FlatTrailStart(TrailStart.X, TrailStart.Y, 0.0);
-		const FVector FlatTrailEnd(TrailEnd.X, TrailEnd.Y, 0.0);
+		// ONE definition of the solid, shared with both halves of every measurement — see
+		// SegmentGapToTraceVolume. The tripper's own reach is applied HERE, to the gap, rather than
+		// being folded into a threshold, which is what lets the trace's own surface be flat.
+		double HorizontalGap = 0.0;
+		double VerticalGap = 0.0;
+		bool bBeyondCap = false;
+		SegmentGapToTraceVolume(TrailStart, TrailEnd, bFlatCaps, bFlatCaps,
+			PreviousLocation, CurrentLocation, TraceRadius, TraceHalfHeight,
+			HorizontalGap, VerticalGap, bBeyondCap);
 
-		// Returns void — the closest point on each segment, not the distance.
-		FVector ClosestOnSweep = FVector::ZeroVector;
-		FVector ClosestOnTrail = FVector::ZeroVector;
-		FMath::SegmentDistToSegmentSafe(SweepStart, SweepEnd, FlatTrailStart, FlatTrailEnd, ClosestOnSweep, ClosestOnTrail);
-
-		if (FVector::DistSquared(ClosestOnSweep, ClosestOnTrail) > HorizontalThresholdSquared)
+		if (HorizontalGap <= TripperRadius && VerticalGap <= TripperHalfHeight)
 		{
-			continue;
+			return true;
 		}
-
-		// Recover where along each segment the closest approach happened so we can compare
-		// heights there (the flattened test threw the Z away).
-		const double SweepAlpha = SegmentAlpha(SweepStart, SweepEnd, ClosestOnSweep);
-		const double TrailAlpha = SegmentAlpha(FlatTrailStart, FlatTrailEnd, ClosestOnTrail);
-		const double ToucherZ = FMath::Lerp(PreviousLocation.Z, CurrentLocation.Z, SweepAlpha);
-		const double TrailZ = FMath::Lerp(TrailStart.Z, TrailEnd.Z, TrailAlpha);
-
-		if (FMath::Abs(ToucherZ - TrailZ) > VerticalThreshold)
-		{
-			continue;
-		}
-
-		return true;
 	}
 
 	return false;
@@ -5155,7 +5441,7 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float Invulnerab
 //                                     rectangle spanning the whole lethal height;
 //                                  3. Z-FIGHTING between the coplanar faces of overlapping elements,
 //                                     which strobes as a bright band at every joint — see
-//                                     RibbonAlternateInset.
+//                                     RibbonAlternateOutset.
 //                                Elements still overlap by half a body width at interior joints, so
 //                                the outside of a corner is never open; on a flat unlit emissive
 //                                material an overlap is not visible as anything at all.
@@ -5191,8 +5477,17 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float Invulnerab
 void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, const TArray<float>& Births,
 	double Step, int32 MaxElements)
 {
-	RibbonSamples.Reset();
-	RibbonSampleBirth.Reset();
+	ComputeRibbonSamples(Points, Births, Step, MaxElements,
+		RibbonSamples, RibbonSampleBirth, RibbonSampleSlack);
+}
+
+void UTraceTrailComponent::ComputeRibbonSamples(const TArray<FVector>& Points, const TArray<float>& Births,
+	double Step, int32 MaxElements, TArray<FVector>& OutSamples, TArray<float>& OutBirths,
+	TArray<float>& OutSlack)
+{
+	OutSamples.Reset();
+	OutBirths.Reset();
+	OutSlack.Reset();
 
 	const int32 PointCount = Points.Num();
 	if (PointCount == 0)
@@ -5206,10 +5501,12 @@ void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, con
 	{
 		// A one-point trace is a real, lethal, degenerate segment (SweepIntersectsTrace tests it as
 		// one), so it gets one stub element rather than nothing at all.
-		RibbonSamples.Add(Points[0]);
-		RibbonSamples.Add(Points[0]);
-		RibbonSampleBirth.Add(bHaveBirths ? Births[0] : 0.f);
-		RibbonSampleBirth.Add(bHaveBirths ? Births[0] : 0.f);
+		OutSamples.Add(Points[0]);
+		OutSamples.Add(Points[0]);
+		OutBirths.Add(bHaveBirths ? Births[0] : 0.f);
+		OutBirths.Add(bHaveBirths ? Births[0] : 0.f);
+		OutSlack.Add(0.f);
+		OutSlack.Add(0.f);
 		return;
 	}
 
@@ -5228,10 +5525,12 @@ void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, con
 
 	if (TotalLength <= GeometryEpsilon)
 	{
-		RibbonSamples.Add(Points[0]);
-		RibbonSamples.Add(Points.Last());
-		RibbonSampleBirth.Add(bHaveBirths ? Births[0] : 0.f);
-		RibbonSampleBirth.Add(bHaveBirths ? Births.Last() : 0.f);
+		OutSamples.Add(Points[0]);
+		OutSamples.Add(Points.Last());
+		OutBirths.Add(bHaveBirths ? Births[0] : 0.f);
+		OutBirths.Add(bHaveBirths ? Births.Last() : 0.f);
+		OutSlack.Add(0.f);
+		OutSlack.Add(0.f);
 		return;
 	}
 
@@ -5261,6 +5560,14 @@ void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, con
 	// COARSEN, NEVER TRUNCATE, is preserved: if the budget cannot hold the subdivision the step grows
 	// until it can, and the control points themselves always survive (there are ~21 of them against a
 	// pool of MaxRibbonElements), so a long trace gets longer elements and never a missing tail.
+	// v14 §1: AND IT MAY NOT CLIMB MORE THAN ONE VERTICAL STEP EITHER, for the same reason one step
+	// further on. An upright element (GRibbonUpright) covers the UNION of its two ends' vertical
+	// bands, so it stands |dZ|/2 proud of the lethal band in the middle of a slope. Subdividing on
+	// rise as well as on run caps that overhang at GRibbonVerticalStep/2 instead of leaving it to
+	// whatever the terrain did. It coarsens with the horizontal step, so the budget is still a
+	// budget and the trace is still never truncated.
+	double SafeVerticalStep = FMath::Max(2.0, static_cast<double>(GRibbonVerticalStep));
+
 	TArray<double, TInlineAllocator<128>> SampleDistances;
 	for (int32 Attempt = 0; Attempt < 12; ++Attempt)
 	{
@@ -5270,7 +5577,10 @@ void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, con
 		for (int32 Index = 1; Index < PointCount; ++Index)
 		{
 			const double SegLength = Cumulative[Index] - Cumulative[Index - 1];
-			const int32 Pieces = FMath::Max(1, FMath::CeilToInt(SegLength / SafeStep));
+			const double SegRise = FMath::Abs(Points[Index].Z - Points[Index - 1].Z);
+			const int32 Pieces = FMath::Max(1, FMath::Max(
+				FMath::CeilToInt(SegLength / SafeStep),
+				FMath::CeilToInt(SegRise / SafeVerticalStep)));
 			for (int32 Piece = 1; Piece <= Pieces; ++Piece)
 			{
 				SampleDistances.Add(Cumulative[Index - 1] + (SegLength * Piece) / static_cast<double>(Pieces));
@@ -5282,12 +5592,14 @@ void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, con
 			break;
 		}
 		SafeStep *= 1.6;
+		SafeVerticalStep *= 1.6;
 	}
 
 	const int32 ElementCount = FMath::Max(1, SampleDistances.Num() - 1);
 
-	RibbonSamples.Reserve(ElementCount + 1);
-	RibbonSampleBirth.Reserve(ElementCount + 1);
+	OutSamples.Reserve(ElementCount + 1);
+	OutBirths.Reserve(ElementCount + 1);
+	OutSlack.Reserve(ElementCount + 1);
 
 	int32 Segment = 0;
 	for (int32 SampleIndex = 0; SampleIndex <= ElementCount; ++SampleIndex)
@@ -5329,9 +5641,18 @@ void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, con
 		// overshoot is BOUNDED HERE rather than estimated there, and the reach becomes a guarantee
 		// instead of a model of a corner nobody promised to run.
 		//
-		// Pulling a sample TOWARD the polyline can only shrink "visible but not lethal"; it cannot
-		// create "lethal but not visible", because each element is still TrailRadius wide about a
-		// sample that is now nearer the line it is covering.
+		// v14 §1 CORRECTED THE LAST SENTENCE OF THAT ARGUMENT, and the correction was worth 2.5uu of
+		// invisible kill volume at a hairpin. "Each element is still TrailRadius wide about a sample
+		// that is nearer the line" is true and does not say what it was taken to say: TrailRadius
+		// wide ABOUT THE SAMPLE is not TrailRadius wide about the POLYLINE. A sample sitting Slack uu
+		// to one side of the line leaves the far edge of its element only (TrailRadius - Slack) from
+		// the line, and the strip between there and TrailRadius kills with nothing drawn on it. The
+		// measured figure on the HAIRPIN fixture was exactly that: 2.5uu.
+		//
+		// So the residual deviation is RECORDED per sample and BuildRibbonElements adds it back to
+		// that element's half width. The spline keeps its smoothing, the cost is paid where it is
+		// incurred (a few uu, on curved elements only) and it is paid in the over-drawing direction.
+		double SampleDeviation = 0.0;
 		FVector CurveSample = CatmullRom(P0, P1, P2, P3, T);
 		{
 			const double Slack = 0.0741
@@ -5356,19 +5677,22 @@ void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, con
 				CurveSample = NearestOnPolyline
 					+ (CurveSample - NearestOnPolyline) * (Slack / NearestDistance);
 			}
+
+			SampleDeviation = FMath::Min(NearestDistance, Slack);
 		}
 
-		RibbonSamples.Add(CurveSample);
+		OutSlack.Add(static_cast<float>(SampleDeviation));
+		OutSamples.Add(CurveSample);
 
 		if (bHaveBirths)
 		{
 			const float BirthA = Births[Segment];
 			const float BirthB = Births[FMath::Min(PointCount - 1, Segment + 1)];
-			RibbonSampleBirth.Add(FMath::Lerp(BirthA, BirthB, static_cast<float>(T)));
+			OutBirths.Add(FMath::Lerp(BirthA, BirthB, static_cast<float>(T)));
 		}
 		else
 		{
-			RibbonSampleBirth.Add(0.f);
+			OutBirths.Add(0.f);
 		}
 	}
 }
@@ -5402,6 +5726,213 @@ void UTraceTrailComponent::RebuildRibbon(int32 LethalPointCount, float Invulnera
 		/*bOverlapAtStart=*/false);
 }
 
+void UTraceTrailComponent::BuildRibbonElements(const TArray<FVector>& Samples,
+	const TArray<float>& SampleSlack, double Radius,
+	double Height, double WidthScale, bool bOverlapAtStart, TArray<FTraceRibbonElement>& OutElements)
+{
+	OutElements.Reset();
+
+	const int32 ElementCount = FMath::Max(0, Samples.Num() - 1);
+	if (ElementCount <= 0)
+	{
+		return;
+	}
+
+	// EXACTLY the lethal cross-section, both axes, unless somebody has explicitly dialled the width
+	// down with Trace.Trail.RibbonWidthScale (default 1.0 — see the comment there for what a
+	// narrower ribbon costs the player). A boundary drawn narrower than it really is turns the trace
+	// into a trap rather than a warning.
+	const double LethalWidth = FMath::Max(1.0, 2.0 * Radius);
+	const double Width = LethalWidth * FMath::Clamp(WidthScale, 0.05, 2.0);
+	const double LethalHeight = FMath::Max(1.0, Height);
+
+	const bool bUpright = (GRibbonUpright != 0);
+
+	// -----------------------------------------------------------------------------------------
+	// THE JOINT OVERLAP IS NOW A SEAM, NOT A CAP (spec v14 §1). This is the last of the four
+	// disagreements between the drawn solid and the lethal one, and it is the one that took two
+	// attempts, so the reasoning is written out.
+	//
+	// The overlap existed to close the wedge on the OUTSIDE of a corner. That wedge is only lethal
+	// because the trip test measured distance TO A SEGMENT, whose cap is a disc — so the volume that
+	// killed bulged a half-disc of TrailRadius past every interior joint as well as past the two
+	// ends, and a box chain had to run TrailRadius past each joint to cover it.
+	//
+	// THAT IS NOT PAYABLE ON A SLOPE, and the measurement says so rather than the argument. On a
+	// 45-degree climb every joint is straight in plan, so the extension buys nothing and costs
+	// everything: the element runs 22.5uu further horizontally while its vertical band stays where it
+	// was, and the lethal band has climbed 22.5uu by then — 28.0uu of drawn ribbon outside the kill
+	// volume on a path with no corner in it. Cutting the overlap to a turn-dependent miter fixed that
+	// and immediately opened the other direction: the disc at a joint on a climb reaches 22.5uu BACK
+	// in plan at the joint's own height, which is above the previous element's band, so 7.5uu of that
+	// disc had nothing drawn on it. A short segment does the same thing sideways — 9.7uu on the mixed
+	// spacing fixture, where a 6uu last segment let its neighbour's disc reach straight through the
+	// trace's own flat end cap.
+	//
+	// Both of those are the DISC, not the overlap. So the disc goes (Trace.Trail.FlatEndCaps applies
+	// to every cap now, not only the two outer ones), the lethal volume becomes exactly the union of
+	// flat-ended slabs — which is exactly what a chain of boxes is — and the overlap has no covering
+	// job left to do. It survives at one uu, purely so consecutive elements always share a sliver and
+	// no seam can open between two boxes of very slightly different width.
+	//
+	// WHAT THIS COSTS IN PLAY, said plainly: the outside of a sharp corner stops killing. The notch
+	// is TrailRadius * tan(turn/2) deep — 22.5uu at a right angle, ~4uu at the 20-degree turns a
+	// carrier actually lays at 60uu spacing — and it is now DRAWN as a notch, so a player who cuts a
+	// corner sees the gap they are cutting through. That is the whole point of the section.
+	const double SeamOverlap = 1.0;
+
+	TArray<double, TInlineAllocator<128>> JointOverlaps;
+	JointOverlaps.SetNumZeroed(ElementCount + 1);
+	for (int32 Joint = 1; Joint < ElementCount; ++Joint)
+	{
+		JointOverlaps[Joint] = SeamOverlap;
+	}
+
+	// The stub's backward join into the real ribbon is a seam a carrier looks straight at from a
+	// metre away, and it is owner-only and excluded from every measurement, so it keeps the generous
+	// overlap that makes the join invisible.
+	if (bOverlapAtStart)
+	{
+		JointOverlaps[0] = FMath::Max(1.0, Radius);
+	}
+
+	OutElements.Reserve(ElementCount);
+
+	// The last heading with any horizontal travel in it. A stretch of pure fall has no direction in
+	// plan, so it inherits one rather than snapping to world forward — which would spin the ribbon.
+	double CarriedYaw = 0.0;
+	bool bHaveCarriedYaw = false;
+
+	for (int32 ElementIndex = 0; ElementIndex < ElementCount; ++ElementIndex)
+	{
+		const FVector SegStart = Samples[ElementIndex];
+		const FVector SegEnd = Samples[ElementIndex + 1];
+
+		// Interior joints overlap; the two OUTER ends stay flush with the first and last lethal point,
+		// so the ribbon never extends past the polyline the server kills along — and since v14 §1 the
+		// server does not kill past it either (GTrailFlatEndCaps), which is what makes "flush" the
+		// right answer in BOTH directions instead of only one.
+		//
+		// bOverlapAtStart is the one exception, and it is the seam the user is looking straight at: the
+		// owner-only predicted stub begins exactly where the drawn lethal set ends, so ITS first
+		// element overlaps BACKWARD into the last real one. Without that, the one joint a carrier sees
+		// from a metre away is the only butt joint in the whole trace.
+		const double BackOverlap = JointOverlaps[ElementIndex];
+		const double ForwardOverlap = (ElementIndex + 1 < ElementCount) ? JointOverlaps[ElementIndex + 1] : 0.0;
+
+		// v14 §1: THE SPLINE'S RESIDUAL DEVIATION IS ADDED BACK TO THIS ELEMENT'S HALF WIDTH.
+		//
+		// A ribbon element is Radius wide about a SAMPLE, and the sample can sit up to the clamped
+		// slack off the polyline the trip test kills along. Without this, the far edge of a curved
+		// element reaches only (Radius - deviation) from the line, and the strip beyond it kills with
+		// nothing drawn on it — 2.5uu of invisible kill volume, measured on the HAIRPIN fixture. The
+		// deviation is per sample and usually zero, so straight trace is untouched.
+		const double SampleWiden = FMath::Max(
+			SampleSlack.IsValidIndex(ElementIndex) ? static_cast<double>(SampleSlack[ElementIndex]) : 0.0,
+			SampleSlack.IsValidIndex(ElementIndex + 1) ? static_cast<double>(SampleSlack[ElementIndex + 1]) : 0.0);
+
+		// Union of the two ends' vertical bands: over-drawing a lethal boundary is the safe direction,
+		// under-drawing it is a trap. Bounded by GRibbonVerticalStep, which is why this is now a few uu
+		// of honest overhang rather than half a storey of it.
+		const double SpanHeight = LethalHeight + FMath::Abs(SegEnd.Z - SegStart.Z);
+		const double MidZ = (SegStart.Z + SegEnd.Z) * 0.5;
+
+		FTraceRibbonElement& Element = OutElements.AddDefaulted_GetRef();
+
+		if (bUpright)
+		{
+			// v14 §1. YAW ONLY. The volume that kills is a vertical column of half width Radius about
+			// the polyline's PLAN projection, with a vertical band about its height — so the element
+			// that draws it is a vertical box whose length runs along the plan direction. See
+			// GRibbonUpright for the 29.1uu this removes and for what it costs the look of a jump.
+			FVector Plan(SegEnd.X - SegStart.X, SegEnd.Y - SegStart.Y, 0.0);
+			const double PlanLength = Plan.Size();
+
+			double Yaw = bHaveCarriedYaw ? CarriedYaw : 0.0;
+			if (PlanLength > GeometryEpsilon)
+			{
+				Yaw = FMath::RadiansToDegrees(FMath::Atan2(Plan.Y, Plan.X));
+				CarriedYaw = Yaw;
+				bHaveCarriedYaw = true;
+			}
+
+			Element.Rotation = FRotator(0.0, Yaw, 0.0);
+
+			const FVector PlanCentre(
+				(SegStart.X + SegEnd.X) * 0.5,
+				(SegStart.Y + SegEnd.Y) * 0.5,
+				MidZ);
+
+			if (PlanLength > GeometryEpsilon)
+			{
+				const FVector Direction = Element.Rotation.Vector();
+				Element.Centre = PlanCentre + Direction * ((ForwardOverlap - BackOverlap) * 0.5);
+				Element.Size = FVector(PlanLength + BackOverlap + ForwardOverlap,
+					Width + 2.0 * SampleWiden, SpanHeight);
+			}
+			else
+			{
+				// STRAIGHT DOWN (or straight up). In plan this segment is a POINT, so the volume that
+				// kills is a disc of Radius about it and the smallest box that covers a disc is the
+				// square that circumscribes it. That over-draws the disc's corners by
+				// Radius * (sqrt(2) - 1) = 9.3uu, which is inside the standing overhang budget and is
+				// the same corner allowance every sharp turn already spends. Anything narrower would
+				// leave part of a kill volume undrawn, which is the direction that is not allowed.
+				Element.Centre = PlanCentre;
+				Element.Size = FVector(LethalWidth + 2.0 * SampleWiden,
+					Width + 2.0 * SampleWiden, SpanHeight);
+			}
+		}
+		else
+		{
+			// THE PRE-v14 ARM, kept verbatim so Trace.Trail.LethalDrawn 0 reproduces the reported bug
+			// on the shipping build. Yaw AND pitch: the element leans to follow the path, and on any
+			// slope it leans straight out of the vertical column that actually kills.
+			FVector Along = SegEnd - SegStart;
+			const double Length = Along.Size();
+			const FVector Direction = (Length > GeometryEpsilon) ? (Along / Length) : FVector::ForwardVector;
+
+			Element.Rotation = Direction.Rotation();
+			Element.Size = FVector(
+				FMath::Max(LethalWidth, Length + BackOverlap + ForwardOverlap), Width, SpanHeight);
+			Element.Centre = (SegStart + SegEnd) * 0.5 + Direction * ((ForwardOverlap - BackOverlap) * 0.5);
+		}
+
+		// See RibbonAlternateOutset: the anti-Z-fight, and it is applied HERE rather than at the mesh
+		// so that what the harness measures is what is on screen, down to the last tenth of a uu.
+		if ((ElementIndex & 1) != 0)
+		{
+			Element.Size.Y *= RibbonAlternateOutset;
+			Element.Size.Z *= RibbonAlternateOutset;
+		}
+	}
+}
+
+double UTraceTrailComponent::DistanceOutsideRibbonElements(const TArray<FTraceRibbonElement>& Elements,
+	const FVector& At)
+{
+	double Nearest = TNumericLimits<double>::Max();
+
+	for (const FTraceRibbonElement& Element : Elements)
+	{
+		const FVector Half = Element.Size * 0.5;
+		const FVector Local = Element.Rotation.UnrotateVector(At - Element.Centre);
+		const FVector Clamped(
+			FMath::Clamp(Local.X, -Half.X, Half.X),
+			FMath::Clamp(Local.Y, -Half.Y, Half.Y),
+			FMath::Clamp(Local.Z, -Half.Z, Half.Z));
+
+		// The rotation is rigid, so the local distance IS the world distance.
+		Nearest = FMath::Min(Nearest, FVector::Dist(Local, Clamped));
+		if (Nearest <= 0.0)
+		{
+			return 0.0;
+		}
+	}
+
+	return (Nearest == TNumericLimits<double>::Max()) ? 0.0 : Nearest;
+}
+
 void UTraceTrailComponent::PlaceRibbon(
 	TArray<TObjectPtr<UStaticMeshComponent>>& Pieces,
 	TArray<TObjectPtr<UMaterialInstanceDynamic>>& Materials,
@@ -5427,17 +5958,14 @@ void UTraceTrailComponent::PlaceRibbon(
 	}
 
 
-	// EXACTLY the lethal cross-section, both axes, unless somebody has explicitly dialled the width
-	// down with Trace.Trail.RibbonWidthScale (default 1.0 — see the comment there for what a
-	// narrower ribbon costs the player). A boundary drawn narrower than it really is turns the trace
-	// into a trap rather than a warning.
-	const double LethalWidth = FMath::Max(1.0, 2.0 * static_cast<double>(GetTraceTrailRadius()));
-	const double Width = LethalWidth * FMath::Clamp(static_cast<double>(GRibbonWidthScale), 0.05, 2.0);
-	const double Height = FMath::Max(1.0, static_cast<double>(GetTraceTrailHeight()));
-
-	// Half a body width of overlap at interior joints — enough to close the wedge on the outside of a
-	// corner up to a 90-degree turn between two consecutive elements.
-	const double JointOverlap = FMath::Max(1.0, static_cast<double>(GetTraceTrailRadius()));
+	// THE SHAPE IS DECIDED IN ONE PLACE AND ONLY ONE PLACE (v14 §1). Everything below this line is
+	// meshes, materials, glow and pooling; nothing below it may move a surface.
+	BuildRibbonElements(RibbonSamples, RibbonSampleSlack,
+		static_cast<double>(GetTraceTrailRadius()),
+		static_cast<double>(GetTraceTrailHeight()),
+		static_cast<double>(GRibbonWidthScale),
+		bOverlapAtStart,
+		RibbonElements);
 
 	const float RibbonGlow = ResolvedRibbonGlow();
 
@@ -5487,51 +6015,22 @@ void UTraceTrailComponent::PlaceRibbon(
 			continue;
 		}
 
-		const FVector SegStart = RibbonSamples[ElementIndex];
-		const FVector SegEnd = RibbonSamples[ElementIndex + 1];
-
-		FVector Along = SegEnd - SegStart;
-		const double Length = Along.Size();
-		// FULL 3D, pitch included — this is what makes the ribbon curve through the air rather than
-		// step through it. Roll is left at zero so the ribbon always stands upright: the lethal volume
-		// is a vertical column, and a banked cross-section would advertise a boundary that is not
-		// there. Rotation() yields yaw+pitch with roll 0 by construction.
-		const FVector Direction = (Length > GeometryEpsilon) ? (Along / Length) : FVector::ForwardVector;
-		const FRotator Facing = Direction.Rotation();
-
-		// Interior joints overlap; the two OUTER ends stay flush with the first and last lethal point,
-		// so the ribbon never extends past the polyline the server kills along.
-		//
-		// bOverlapAtStart is the one exception, and it is the seam the user is looking straight at: the
-		// owner-only predicted stub begins exactly where the drawn lethal set ends, so ITS first
-		// element overlaps BACKWARD into the last real one. Without that, the one joint a carrier sees
-		// from a metre away is the only butt joint in the whole trace.
-		const double BackOverlap = (ElementIndex > 0 || bOverlapAtStart) ? JointOverlap : 0.0;
-		const double ForwardOverlap = (ElementIndex + 1 < ElementCount) ? JointOverlap : 0.0;
-
-		// Never shorter than one body width, so a degenerate (but lethal) one-point trace draws a
-		// block you can see rather than a sliver you cannot.
-		const double ElementLength = FMath::Max(LethalWidth, Length + BackOverlap + ForwardOverlap);
-		const FVector ElementCentre = (SegStart + SegEnd) * 0.5
-			+ Direction * ((ForwardOverlap - BackOverlap) * 0.5);
-
-		// Union of the two ends' vertical bands, exactly as the smear did it: over-drawing a lethal
-		// boundary is the safe direction, under-drawing it is a trap.
-		const double SpanHeight = Height + FMath::Abs(SegEnd.Z - SegStart.Z);
-
-		// See RibbonAlternateInset: this is the anti-Z-fight, not a taper.
-		const double Inset = ((ElementIndex & 1) != 0) ? RibbonAlternateInset : 1.0;
+		if (!RibbonElements.IsValidIndex(ElementIndex))
+		{
+			break;
+		}
+		const FTraceRibbonElement& Element = RibbonElements[ElementIndex];
 
 		const FVector Scale(
-			ElementLength / (2.0 * HalfSize.X),
-			(Width * Inset) / (2.0 * HalfSize.Y),
-			(SpanHeight * Inset) / (2.0 * HalfSize.Z));
+			Element.Size.X / (2.0 * HalfSize.X),
+			Element.Size.Y / (2.0 * HalfSize.Y),
+			Element.Size.Z / (2.0 * HalfSize.Z));
 
 		// Corrects for a source mesh whose pivot is not at its bounds centre, so we never assume
 		// anything about the engine primitives' authoring.
-		const FVector PivotCorrection = Facing.RotateVector(PivotOffset * Scale);
+		const FVector PivotCorrection = Element.Rotation.RotateVector(PivotOffset * Scale);
 
-		Piece->SetWorldLocationAndRotation(ElementCentre - PivotCorrection, Facing);
+		Piece->SetWorldLocationAndRotation(Element.Centre - PivotCorrection, Element.Rotation);
 		Piece->SetWorldScale3D(Scale);
 		if (!Piece->IsVisible())
 		{
@@ -11522,6 +12021,16 @@ namespace
 	 * The stall detector is what makes the corner happen rather than a body grinding into a wall
 	 * forever: no progress for a second and the tour moves on.
 	 */
+	/**
+	 * How far PAST a rendered face the drive aims, in uu (spec v14 §1).
+	 *
+	 * Not a distance the body ever reaches — it is a distance the STEERING is allowed to keep asking
+	 * for. See the two comments in DriveWallTour. 150 is comfortably more than the 34uu capsule
+	 * radius plus the thickest standoff shell in the arena, so the input is still saturated inward at
+	 * the moment collision takes over.
+	 */
+	constexpr double WallPressDepth = 150.0;
+
 	void DriveWallTour(ATraceCharacter* Carrier, FWallClipState& State, float DeltaTime)
 	{
 		if (Carrier == nullptr)
@@ -11571,7 +12080,19 @@ namespace
 			// APPROACH. Straight at the verified standing spot; collision decides where that stops.
 			FVector ToStand = Target.Stand - At;
 			ToStand.Z = 0.0;
-			Steer = ToStand.GetSafeNormal();
+
+			// v14 §1: STEER AT A POINT INSIDE THE STRUCTURE, NOT AT THE SPOT BESIDE IT.
+			//
+			// This is the fix for "the fixture cannot go red". Aiming at Stand — the place a capsule
+			// was PROVEN to fit, often 2uu off a rendered face — sounds like the tightest thing that
+			// can be asked for, and it is not: AddMovementInput is an acceleration into a movement
+			// component with friction and a collision solve, so a body converging on a waypoint slows
+			// as it arrives and settles a body-radius short of it. Five runs measured that as 44-48uu
+			// from a surface, against the 36.3uu of drawn reach the run has to beat to be a test at
+			// all. Aiming PAST the face instead means the input never eases off and the only thing
+			// that decides the standoff is the collision solve — which is the definition of "as close
+			// as anyone can get", and is what the credential claims to be measuring.
+			Steer = (ToStand - Target.Normal * WallPressDepth).GetSafeNormal();
 
 			// 45uu, not 90. At 90 the drive declared ARRIVED — in its own log — while still 83uu from a
 			// spot a capsule had been measured to fit 2.0uu off the surface, and then hugged from there,
@@ -11639,7 +12160,16 @@ namespace
 				State.TangentSign = (Along > 0.0) ? -1.0 : 1.0;
 			}
 
-			const FVector Waypoint = Target.Stand + Tangent * (Along + 150.0 * State.TangentSign);
+			// v14 §1: AND THE WAYPOINT IS PUT INSIDE THE STRUCTURE, for the same reason the approach
+			// now is. A waypoint on the verified standing line is a point the body converges ON, and
+			// converging is exactly the behaviour that leaves it a body-radius short. Sunk
+			// WallPressDepth past the face, the lateral component of the input never decays, the body
+			// runs the length of the surface HELD against it, and the standoff is decided by collision
+			// rather than by how a proportional controller settles. The tangential half is unchanged,
+			// so the turnarounds at the ends of the face — the sharpest corner the trace can be asked
+			// to draw, pressed against a wall — still happen.
+			const FVector Waypoint = Target.Stand + Tangent * (Along + 150.0 * State.TangentSign)
+				- Target.Normal * WallPressDepth;
 
 			FVector ToWaypoint = Waypoint - At;
 			ToWaypoint.Z = 0.0;
@@ -12023,8 +12553,9 @@ namespace
 				     "drawn reach of %.1fuu -> %s\n"
 				     "           tightest face the tour could actually reach: %.1fuu (%s)\n"
 				     "           INVARIANT/OVERHANG   drawn outside lethal %.1fuu HORIZONTAL at %s "
-				     "(budget %.1f) -> %s; %.1fuu vertical (by design, PlaceRibbon unions the ends' bands); "
-				     "%.1fuu past an END of the path (the one-frame rebuild lag, not a clearance problem)\n"
+				     "(budget %.1f) -> %s; %.1fuu vertical (by design, BuildRibbonElements unions the "
+				     "ends' bands, capped by Trace.Trail.RibbonVerticalStep); of the horizontal figure "
+				     "%.1fuu was past a flat END cap (v14 1: charged, not excused)\n"
 				     "           INVARIANT/INVISIBLE  LETHAL outside drawn %.1fuu at %s (must be 0) -> %s%s\n"
 				     "           fitter push: %d points moved, worst move %.1fuu, worst residual depth "
 				     "%.1fuu, %d could not be improved at all.\n"
@@ -12072,9 +12603,10 @@ namespace
 				           : TEXT("*** FAIL: INVISIBLE KILL VOLUME ***"),
 				(!bVisibleOk && State.bWorstLethalOutsideDrawnIsEndCap)
 					? TEXT(" — and it is the trace's own END CAP: the trip test is radial about the "
-					       "first and last point while PlaceRibbon keeps the outer elements flush with "
-					       "them. Pre-existing, unrelated to wall fitting, and unchanged by every arm "
-					       "of this command.")
+					       "first and last point while the ribbon keeps its outer elements flush with "
+					       "them. That is the v14 1 defect; it should be impossible with "
+					       "Trace.Trail.FlatEndCaps 1, so seeing it here means the cap arm is off or "
+					       "the flattening is not reaching this path.")
 					: TEXT(""),
 				Pushes, WorstPush, WorstResidual, Unpushable,
 				Routed, Inserted, Unroutable,
@@ -12585,6 +13117,398 @@ namespace
 					return TickWallFitLive(State, DeltaTime);
 				}), 0.f);
 		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Trail.LethalDrawn — SPEC v14 §1, THE INVARIANT WITH NOTHING BETWEEN IT AND THE GEOMETRY
+	// ---------------------------------------------------------------------------------------------
+	//
+	// "Fix drawn outside lethal and lethal outside drawn bug. Ensure that the trace shows exactly
+	// what is lethal."
+	//
+	// WHY THIS EXISTS ALONGSIDE Trace.Trail.WallClip, WHICH ALREADY MEASURES BOTH DIRECTIONS.
+	//
+	// WallClip measures them off a live carrier driven round a real level for forty seconds. That is
+	// the right instrument for "does the trace enter a wall", and it is a terrible one for "is the
+	// drawn solid the lethal solid": whether it ever tests a hairpin, a climb or a two-point trace
+	// depends on where the bots pushed the fixture that run, its answer changes between runs, and —
+	// as the spec's own note records — it spent two passes reporting VERDICT: INVALID because the
+	// drive could not press close enough to a surface to be a test of anything at all. A run that
+	// cannot go red teaches nothing, and a run whose coverage is decided by a bot brain cannot be
+	// asked whether the END CAPS agree.
+	//
+	// So this command asks the geometry directly. It builds THE REAL ribbon — the shipping
+	// ComputeRibbonSamples and the shipping BuildRibbonElements, not a copy of their maths — over
+	// fixture polylines chosen to contain every shape that has ever broken this, and measures both
+	// directions against the SAME predicate the server kills with. No world, no pawn, no level, no
+	// bots, no frame rate; it runs in a millisecond and gives the same answer every time.
+	//
+	// AND IT GOES RED ON DEMAND. `Trace.Trail.LethalDrawn 0` forces the pre-v14 arms
+	// (Trace.Trail.RibbonUpright 0 + Trace.Trail.FlatEndCaps 0) and reproduces both reported numbers
+	// on the shipping build; `Trace.Trail.LethalDrawn 1` runs the identical fixtures with the fix in.
+	// Same build, same code path, one pair of cvars between them.
+
+	struct FLethalDrawnFixture
+	{
+		const TCHAR* Name;
+		const TCHAR* Why;
+		TArray<FVector> Points;
+	};
+
+	/**
+	 * THE SHAPES THAT HAVE BROKEN THIS, one fixture each. Spacings are the shipping
+	 * TrailPointSpacing (60uu) unless the fixture is specifically about spacing.
+	 */
+	void BuildLethalDrawnFixtures(TArray<FLethalDrawnFixture>& Out)
+	{
+		Out.Reset();
+
+		{
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("STRAIGHT");
+			Fixture.Why = TEXT("the floor: if this is not clean nothing else matters");
+			for (int32 Index = 0; Index < 8; ++Index)
+			{
+				Fixture.Points.Add(FVector(Index * 60.0, 0.0, 0.0));
+			}
+		}
+
+		{
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("RIGHT ANGLE");
+			Fixture.Why = TEXT("the joint overlap has to cover the round cap at the corner");
+			for (int32 Index = 0; Index < 5; ++Index)
+			{
+				Fixture.Points.Add(FVector(Index * 60.0, 0.0, 0.0));
+			}
+			for (int32 Index = 1; Index <= 4; ++Index)
+			{
+				Fixture.Points.Add(FVector(240.0, Index * 60.0, 0.0));
+			}
+		}
+
+		{
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("HAIRPIN");
+			Fixture.Why = TEXT("a 180 turn — the sharpest thing a carrier can lay, and the worst case "
+			                   "for a straight box drawing a curve");
+			for (int32 Index = 0; Index < 5; ++Index)
+			{
+				Fixture.Points.Add(FVector(Index * 60.0, 0.0, 0.0));
+			}
+			for (int32 Index = 1; Index <= 4; ++Index)
+			{
+				Fixture.Points.Add(FVector(240.0 - Index * 60.0, 70.0, 0.0));
+			}
+		}
+
+		{
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("45 CLIMB");
+			Fixture.Why = TEXT("the pitched-cross-section bug: a leaning element leaves the vertical "
+			                   "column sideways");
+			for (int32 Index = 0; Index < 8; ++Index)
+			{
+				Fixture.Points.Add(FVector(Index * 42.0, 0.0, Index * 42.0));
+			}
+		}
+
+		{
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("VERTICAL DROP");
+			Fixture.Why = TEXT("a fall: in plan the path is a POINT, so the lethal volume is a disc and "
+			                   "the drawn primitive is a square");
+			for (int32 Index = 0; Index < 6; ++Index)
+			{
+				Fixture.Points.Add(FVector(0.0, 0.0, -Index * 60.0));
+			}
+		}
+
+		{
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("MIXED SPACING");
+			Fixture.Why = TEXT("6uu next to 70uu — what the wall fitter's inserted points and the "
+			                   "length trim actually produce, and what the spline clamp is for");
+			Fixture.Points.Add(FVector(0.0, 0.0, 0.0));
+			Fixture.Points.Add(FVector(70.0, 0.0, 0.0));
+			Fixture.Points.Add(FVector(76.0, 0.0, 0.0));
+			Fixture.Points.Add(FVector(146.0, 30.0, 0.0));
+			Fixture.Points.Add(FVector(152.0, 36.0, 0.0));
+			Fixture.Points.Add(FVector(160.0, 106.0, 20.0));
+			Fixture.Points.Add(FVector(166.0, 112.0, 26.0));
+		}
+
+		{
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("TWO POINTS");
+			Fixture.Why = TEXT("the shortest trace that has two ends — both caps are outer caps");
+			Fixture.Points.Add(FVector(0.0, 0.0, 0.0));
+			Fixture.Points.Add(FVector(60.0, 0.0, 0.0));
+		}
+
+		{
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("ONE POINT");
+			Fixture.Why = TEXT("a degenerate but LETHAL trace: SweepIntersectsTrace tests it as a "
+			                   "zero-length segment, so something must be drawn on it");
+			Fixture.Points.Add(FVector(0.0, 0.0, 0.0));
+		}
+	}
+
+	struct FLethalDrawnResult
+	{
+		double DrawnOutsideLethal = 0.0;
+		FVector DrawnOutsideLethalAt = FVector::ZeroVector;
+		double DrawnOutsideLethalVertical = 0.0;
+		double LethalOutsideDrawn = 0.0;
+		FVector LethalOutsideDrawnAt = FVector::ZeroVector;
+		int32 Elements = 0;
+		int32 LethalSamples = 0;
+		int32 DrawnSamples = 0;
+	};
+
+	void MeasureLethalDrawn(const TArray<FVector>& Points, FLethalDrawnResult& Out)
+	{
+		Out = FLethalDrawnResult();
+
+		const double Radius = static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius());
+		const double Height = static_cast<double>(UTraceTrailComponent::GetTraceTrailHeight());
+		const double HalfHeight = Height * 0.5;
+
+		TArray<FVector> Samples;
+		TArray<float> Births;
+		TArray<float> Slack;
+		UTraceTrailComponent::ComputeRibbonSamples(Points, TArray<float>(),
+			static_cast<double>(FMath::Max(5.f, GRibbonStep)), MaxRibbonElements,
+			Samples, Births, Slack);
+
+		TArray<UTraceTrailComponent::FTraceRibbonElement> Elements;
+		UTraceTrailComponent::BuildRibbonElements(Samples, Slack, Radius, Height,
+			static_cast<double>(GRibbonWidthScale), /*bOverlapAtStart=*/false, Elements);
+
+		Out.Elements = Elements.Num();
+
+		// ---- DIRECTION ONE: every drawn surface has to be inside the thing that kills -------------
+		//
+		// Sampled a hair inside each face, because a ribbon laid exactly ON the lethal boundary is the
+		// correct outcome and must not read as an overhang.
+		for (const UTraceTrailComponent::FTraceRibbonElement& Element : Elements)
+		{
+			const FVector Half = Element.Size * 0.5;
+			const int32 LengthSteps = FMath::Clamp(FMath::CeilToInt(Element.Size.X / 8.0), 1, 48);
+
+			for (int32 Step = 0; Step <= LengthSteps; ++Step)
+			{
+				const double U = -1.0 + 2.0 * (static_cast<double>(Step) / static_cast<double>(LengthSteps));
+				for (int32 WidthIndex = -1; WidthIndex <= 1; ++WidthIndex)
+				{
+					for (int32 HeightIndex = -1; HeightIndex <= 1; ++HeightIndex)
+					{
+						const FVector Local(
+							U * Half.X * 0.999,
+							static_cast<double>(WidthIndex) * Half.Y * 0.999,
+							static_cast<double>(HeightIndex) * Half.Z * 0.999);
+						const FVector At = Element.Centre + Element.Rotation.RotateVector(Local);
+
+						++Out.DrawnSamples;
+
+						double Horizontal = 0.0;
+						double Vertical = 0.0;
+						bool bBeyond = false;
+						MeasurePointGapToTrace(Points, At, Radius, HalfHeight,
+							Horizontal, Vertical, bBeyond);
+
+						if (Horizontal > Out.DrawnOutsideLethal)
+						{
+							Out.DrawnOutsideLethal = Horizontal;
+							Out.DrawnOutsideLethalAt = At;
+						}
+						Out.DrawnOutsideLethalVertical =
+							FMath::Max(Out.DrawnOutsideLethalVertical, Vertical);
+					}
+				}
+			}
+		}
+
+		// ---- DIRECTION TWO: every lethal place has to be inside something drawn -------------------
+		//
+		// A RING at each station, not a rectangle, and every candidate filtered through the real
+		// predicate — so the end caps are asked about, in whatever shape they currently have. This is
+		// the sampling change that lets the fixture see the 22.5uu the previous one could not.
+		static const FVector Bearings[] =
+		{
+			FVector(0.0, 0.0, 0.0),
+			FVector(1.0, 0.0, 0.0),  FVector(-1.0, 0.0, 0.0),
+			FVector(0.0, 1.0, 0.0),  FVector(0.0, -1.0, 0.0),
+			FVector(0.7071, 0.7071, 0.0),  FVector(-0.7071, 0.7071, 0.0),
+			FVector(0.7071, -0.7071, 0.0), FVector(-0.7071, -0.7071, 0.0)
+		};
+		static const double HeightFractions[] = { -0.999, -0.5, 0.0, 0.5, 0.999 };
+
+		const int32 LastPoint = FMath::Max(0, Points.Num() - 1);
+		for (int32 PointIndex = 0; PointIndex <= LastPoint; ++PointIndex)
+		{
+			const FVector SegStart = Points[PointIndex];
+			const FVector SegEnd = Points[FMath::Min(PointIndex + 1, LastPoint)];
+
+			const double Length = FVector::Dist(SegStart, SegEnd);
+			const int32 Steps = FMath::Clamp(FMath::CeilToInt(Length / 8.0), 1, 48);
+
+			for (int32 Step = 0; Step <= Steps; ++Step)
+			{
+				const FVector Centre = FMath::Lerp(SegStart, SegEnd,
+					static_cast<double>(Step) / static_cast<double>(Steps));
+
+				for (const FVector& Bearing : Bearings)
+				{
+					for (const double HeightFraction : HeightFractions)
+					{
+						const FVector At = Centre
+							+ Bearing * (Radius * 0.999)
+							+ FVector::UpVector * (HeightFraction * HalfHeight);
+
+						if (!IsPointLethal(Points, At, Radius, HalfHeight))
+						{
+							continue;
+						}
+
+						++Out.LethalSamples;
+
+						const double Outside =
+							UTraceTrailComponent::DistanceOutsideRibbonElements(Elements, At);
+						if (Outside > Out.LethalOutsideDrawn)
+						{
+							Out.LethalOutsideDrawn = Outside;
+							Out.LethalOutsideDrawnAt = At;
+						}
+					}
+				}
+			}
+
+			if (PointIndex == LastPoint)
+			{
+				break;
+			}
+		}
+	}
+
+	FAutoConsoleCommand CmdLethalDrawn(
+		TEXT("Trace.Trail.LethalDrawn"),
+		TEXT("Trace.Trail.LethalDrawn [Arm=-1] — spec v14 1. Measures BOTH directions of "
+		     "'the trace shows exactly what is lethal' on fixture polylines, using the shipping ribbon "
+		     "builder and the shipping trip-test geometry. No world, no pawn, no level needed. "
+		     "Arm 0 forces the pre-v14 pitched cross-section and radial end caps (the reported bug, "
+		     "reproduced); arm 1 forces the v14 arms; -1 measures whatever is configured."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const int32 Arm = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), -1, 1) : -1;
+
+			const int32 SavedUpright = GRibbonUpright;
+			const int32 SavedFlatCaps = GTrailFlatEndCaps;
+			if (Arm >= 0)
+			{
+				GRibbonUpright = Arm;
+				GTrailFlatEndCaps = Arm;
+			}
+
+			const double Radius = static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius());
+			const double DrawnReach = UTraceTrailComponent::GetTraceDrawnHalfReach();
+
+			// THE BUDGET, DERIVED AND NOT TYPED. Two terms, both forced by drawing a round-cornered
+			// solid with straight boxes:
+			//   Radius * (sqrt(2) - 1) = 9.3uu   the corner of the joint-overlap box, which must cover
+			//                                    the round cap at every interior joint.
+			//   0.0741 * TrailPointSpacing = 4.4uu   the clamped Catmull-Rom slack.
+			// That is GetTraceDrawnHalfReach() - TrailRadius. Anything above it is a defect; anything
+			// below it is the price of boxes, paid in the OVER-drawing direction.
+			const double Budget = DrawnReach - Radius;
+
+			// Direction two has no budget at all. The only tolerance is arithmetic: the drawn faces are
+			// sampled at 0.999 of their extents and doubles are doubles.
+			constexpr double InvisibleTolerance = 0.05;
+
+			TArray<FLethalDrawnFixture> Fixtures;
+			BuildLethalDrawnFixtures(Fixtures);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LETHALDRAWN] spec v14 1: 'ensure that the trace shows exactly what is lethal'. "
+				     "arm upright=%d flatEndCaps=%d. Trace half width %.1fuu, height %.1fuu, spacing "
+				     "%.0fuu, ribbon step %.0fuu, vertical step %.0fuu. Overhang budget %.1fuu "
+				     "(= drawn reach %.1f - half width %.1f); invisible-kill budget is ZERO."),
+				GRibbonUpright, GTrailFlatEndCaps, Radius,
+				static_cast<double>(UTraceTrailComponent::GetTraceTrailHeight()),
+				UTraceSettings::Get().TrailPointSpacing, GRibbonStep, GRibbonVerticalStep,
+				Budget, DrawnReach, Radius);
+
+			double WorstOverhang = 0.0;
+			double WorstVertical = 0.0;
+			double WorstInvisible = 0.0;
+			FString WorstOverhangFixture;
+			FString WorstInvisibleFixture;
+			int32 Failures = 0;
+
+			for (const FLethalDrawnFixture& Fixture : Fixtures)
+			{
+				FLethalDrawnResult Result;
+				MeasureLethalDrawn(Fixture.Points, Result);
+
+				const bool bOverhangOk = (Result.DrawnOutsideLethal <= Budget);
+				const bool bVisibleOk = (Result.LethalOutsideDrawn <= InvisibleTolerance);
+
+				// A fixture that drew nothing, or that found no lethal sample, has not tested anything
+				// and says so rather than passing quietly.
+				const bool bMeasured = (Result.Elements > 0) && (Result.LethalSamples > 0)
+					&& (Result.DrawnSamples > 0);
+
+				if (!bMeasured || !bOverhangOk || !bVisibleOk)
+				{
+					++Failures;
+				}
+
+				if (Result.DrawnOutsideLethal > WorstOverhang)
+				{
+					WorstOverhang = Result.DrawnOutsideLethal;
+					WorstOverhangFixture = Fixture.Name;
+				}
+				WorstVertical = FMath::Max(WorstVertical, Result.DrawnOutsideLethalVertical);
+				if (Result.LethalOutsideDrawn > WorstInvisible)
+				{
+					WorstInvisible = Result.LethalOutsideDrawn;
+					WorstInvisibleFixture = Fixture.Name;
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[LETHALDRAWN] %-14s %2d pts -> %2d elements, %d lethal / %d drawn samples. "
+					     "DRAWN outside lethal %5.1fuu at %s (budget %.1f) %s | vertical %5.1fuu | "
+					     "LETHAL outside drawn %5.1fuu at %s %s   [%s]"),
+					Fixture.Name, Fixture.Points.Num(), Result.Elements,
+					Result.LethalSamples, Result.DrawnSamples,
+					Result.DrawnOutsideLethal, *Result.DrawnOutsideLethalAt.ToCompactString(), Budget,
+					bOverhangOk ? TEXT("PASS") : TEXT("*** FAIL ***"),
+					Result.DrawnOutsideLethalVertical,
+					Result.LethalOutsideDrawn, *Result.LethalOutsideDrawnAt.ToCompactString(),
+					bVisibleOk ? TEXT("PASS") : TEXT("*** FAIL: INVISIBLE KILL VOLUME ***"),
+					bMeasured ? Fixture.Why : TEXT("*** NOTHING MEASURED — this fixture is not a test ***"));
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LETHALDRAWN] DONE. %d fixtures, %d failed.\n"
+				     "           WORST drawn outside lethal  %.1fuu (%s), budget %.1fuu\n"
+				     "           WORST vertical over-draw     %.1fuu (deliberate: an element unions its "
+				     "two ends' bands; capped by Trace.Trail.RibbonVerticalStep)\n"
+				     "           WORST lethal outside drawn   %.1fuu (%s), budget 0\n"
+				     "           VERDICT: %s"),
+				Fixtures.Num(), Failures,
+				WorstOverhang, WorstOverhangFixture.IsEmpty() ? TEXT("-") : *WorstOverhangFixture, Budget,
+				WorstVertical,
+				WorstInvisible, WorstInvisibleFixture.IsEmpty() ? TEXT("-") : *WorstInvisibleFixture,
+				(Failures == 0)
+					? TEXT("PASS — the drawn solid and the lethal solid are the same solid, within the "
+					       "stated budget, on every fixture.")
+					: TEXT("*** FAIL — lethal != drawn. ***"));
+
+			GRibbonUpright = SavedUpright;
+			GTrailFlatEndCaps = SavedFlatCaps;
+		}));
 }
 #endif // !UE_BUILD_SHIPPING
 
@@ -12843,95 +13767,30 @@ namespace
 	}
 
 	/**
-	 * v13 §7, INVARIANT DIRECTION ONE. How far outside the LETHAL column the world point At lies, in
-	 * uu — 0 if it is inside the volume that kills.
+	 * v13 §7, INVARIANT DIRECTION ONE. How far outside the LETHAL volume the world point At lies, in
+	 * uu — 0 if it is inside the thing that kills.
 	 *
-	 * The column is exactly what SweepIntersectsTrace evaluates: XY distance to the polyline within
-	 * TrailRadius, AND height within TrailHeight/2 of the polyline's height at that closest approach.
-	 * So "outside" is measured against both limits and combined, which is the true distance to the
-	 * column's surface rather than the flattering horizontal-only figure.
+	 * v14 §1 GUTTED THIS AND FORWARDED IT. It used to be a second, independent implementation of the
+	 * trip test's geometry sitting a few hundred lines away from the trip test — and independent
+	 * implementations of the same solid is the exact mechanism by which "lethal" and "drawn" drifted
+	 * 22uu apart without a single line of either half being wrong on its own. There is now one
+	 * definition (SegmentGapToTraceVolume) and the measurement asks IT, so the harness cannot be
+	 * measuring a volume the server does not kill in.
 	 *
-	 * A NON-ZERO ANSWER IS NOT AUTOMATICALLY A BUG — the ribbon is boxes on a spline and the trip test
-	 * walks straight chords, so it overhangs at every corner by a knowable amount. It is a bug when it
-	 * exceeds GetTraceDrawnHalfReach() - GetTraceTrailRadius(), because that is the fitter's own
-	 * arithmetic being wrong, which is precisely the failure that put ribbon in the wall.
+	 * The two axes stay apart in the report: an element's height is the UNION of its two ends' bands,
+	 * so vertical overhang is deliberate over-drawing while horizontal overhang is the fitter's
+	 * business. Rolling them into one number once made a documented design choice read as a bug.
+	 *
+	 * bOutPastEnd now means "past a FLAT outer cap" — with GTrailFlatEndCaps on, that is drawn ribbon
+	 * beyond where anything kills and it is CHARGED, not excused. It is reported separately only so
+	 * the diagnosis can name it.
 	 */
 	void DistanceOutsideLethalColumn(const TArray<FVector>& Polyline, const FVector& At,
 		double Radius, double HalfHeight, double& OutHorizontal, double& OutVertical, bool& bOutPastEnd)
 	{
-		OutHorizontal = 0.0;
-		OutVertical = 0.0;
-		bOutPastEnd = false;
-
-		if (Polyline.Num() == 0)
-		{
-			return;
-		}
-
-		const FVector FlatAt(At.X, At.Y, 0.0);
-
-		// THE TWO AXES ARE KEPT APART, and that is a correction to the first version of this check.
-		//
-		// It combined them into one distance, and the number it produced (28.9uu against a 13.8uu
-		// budget) read as "the ribbon reaches much further sideways than the fitter clears" — a
-		// terrifying result that was almost entirely VERTICAL and entirely deliberate: PlaceRibbon
-		// sets each element's height to the UNION of its two ends' vertical bands
-		// (Height + |dZ|), so an element spanning a 60uu climb stands ~30uu proud of the lethal column
-		// at its ends on purpose, over-drawing a boundary rather than under-drawing it.
-		//
-		// Only the HORIZONTAL figure is the fitter's business — it is the one that decides how much
-		// room a point needs beside a wall. Reporting them together made a documented design choice
-		// look like this section's bug.
-		double BestCombined = TNumericLimits<double>::Max();
-		const int32 LastSegment = FMath::Max(0, Polyline.Num() - 2);
-
-		for (int32 SegmentIndex = 0; SegmentIndex <= LastSegment; ++SegmentIndex)
-		{
-			const FVector& A = Polyline[SegmentIndex];
-			const FVector& B = Polyline[FMath::Min(SegmentIndex + 1, Polyline.Num() - 1)];
-
-			const FVector FlatA(A.X, A.Y, 0.0);
-			const FVector FlatB(B.X, B.Y, 0.0);
-
-			const FVector Closest = FMath::ClosestPointOnSegment(FlatAt, FlatA, FlatB);
-			const double Span = FVector::Dist(FlatA, FlatB);
-			const double Along = (Span > GeometryEpsilon)
-				? FMath::Clamp(FVector::Dist(FlatA, Closest) / Span, 0.0, 1.0)
-				: 0.0;
-
-			const double HorizontalOut = FMath::Max(0.0, FVector::Dist(FlatAt, Closest) - Radius);
-			const double VerticalOut = FMath::Max(0.0,
-				FMath::Abs(At.Z - FMath::Lerp(A.Z, B.Z, Along)) - HalfHeight);
-
-			// The nearest segment is chosen by the combined distance — a point is outside the whole
-			// column only if it is outside EVERY segment's column — and its two components are then
-			// reported as they stand.
-			const double Combined = FMath::Sqrt(HorizontalOut * HorizontalOut + VerticalOut * VerticalOut);
-			if (Combined < BestCombined)
-			{
-				BestCombined = Combined;
-				OutHorizontal = HorizontalOut;
-				OutVertical = VerticalOut;
-
-				// PAST THE END OF THE PATH, or BESIDE IT? Only the second is the fitter's business,
-				// and separating them is a correction to a number that read alarmingly.
-				//
-				// The drawing is rebuilt from TrailPoints one frame after the array changes, so on the
-				// frame the length trim drops a tail point the ribbon is still drawn over the 60uu that
-				// has just stopped being lethal. That is a real one-frame artefact worth knowing about,
-				// but it is an artefact AT AN END of the path, it is not the ribbon bulging sideways
-				// into a wall, and no push allowance in the world would change it. Counting the two
-				// together put 27.3uu against a 13.8uu budget and pointed the diagnosis at the fitter.
-				bOutPastEnd = (SegmentIndex == 0 && Along <= 0.0)
-					|| (SegmentIndex == LastSegment && Along >= 1.0);
-			}
-
-			if (BestCombined <= 0.0)
-			{
-				break;
-			}
-		}
+		MeasurePointGapToTrace(Polyline, At, Radius, HalfHeight, OutHorizontal, OutVertical, bOutPastEnd);
 	}
+
 
 	/**
 	 * v13 §7, INVARIANT DIRECTION TWO — THE ONE THAT MATTERS MOST. How far the world point At is from
@@ -13183,14 +14042,22 @@ void UTraceTrailComponent::MeasureWorldClipping(const TArray<FTraceClipBox>& Geo
 					DistanceOutsideLethalColumn(LethalPolyline, At, TrailRadius, TrailHalfHeight,
 						OutsideH, OutsideV, bPastEnd);
 
-					if (bPastEnd)
-					{
-						Out.DrawnPastEnd = FMath::Max(Out.DrawnPastEnd, OutsideH);
-					}
-					else if (OutsideH > Out.DrawnOutsideLethal)
+					// v14 §1: PAST-THE-END IS NO LONGER AN EXCUSE, IT IS A SUBTOTAL.
+					//
+					// It was excused because the caps were radial and the ribbon was flush, so anything
+					// the drawing put beyond an end was covered by the kill volume's own bulge and could
+					// only ever be the one-frame rebuild lag. Now that the caps are FLAT, ribbon past an
+					// end is ribbon nothing kills on, which is the same defect as ribbon beside the path
+					// and is charged the same way. It is still counted separately so the report can say
+					// which kind it was, but it is no longer subtracted from the verdict.
+					if (OutsideH > Out.DrawnOutsideLethal)
 					{
 						Out.DrawnOutsideLethal = OutsideH;
 						Out.DrawnOutsideLethalAt = At;
+					}
+					if (bPastEnd)
+					{
+						Out.DrawnPastEnd = FMath::Max(Out.DrawnPastEnd, OutsideH);
 					}
 					Out.DrawnOutsideLethalVertical = FMath::Max(Out.DrawnOutsideLethalVertical, OutsideV);
 				}
@@ -13199,37 +14066,64 @@ void UTraceTrailComponent::MeasureWorldClipping(const TArray<FTraceClipBox>& Geo
 	}
 
 	// -------------------------------------------------------------------------------------------
-	// THE LETHAL VOLUME: the column the trip test evaluates — TrailRadius to either side, TrailHeight
-	// tall, swept along the lethal polyline. Sampled the same way against the same geometry, so the
-	// two numbers are directly comparable and their DIFFERENCE is the diagnosis.
+	// THE LETHAL VOLUME — AND v14 §1 CHANGED HOW IT IS SAMPLED, WHICH IS WHY THIS FIXTURE COULD NOT
+	// SEE ITS OWN WORST BUG.
+	//
+	// It used to walk a rectangular lattice along each segment: lateral offsets perpendicular to the
+	// chord, vertical offsets about it, at stations between the two endpoints. Every one of those
+	// samples is genuinely lethal, so nothing it reported was false — but the lattice STOPPED AT THE
+	// ENDPOINTS, and the trip test does not. A point-to-segment distance is radial at the ends, so
+	// the volume that kills bulged a half-disc of TrailRadius past the first and last point, and the
+	// measurement of "is every lethal place drawn" never once asked about that disc. It could only
+	// ever have found the end-cap bug by accident, through a lateral sample on a steeply pitched
+	// element. A test that cannot see the defect it exists to find is the same failure as a fixture
+	// that cannot reach a wall.
+	//
+	// So the lattice is now a RING at each station — eight compass bearings at the volume's own half
+	// width plus the centreline — and every candidate is put through the REAL predicate before it is
+	// charged. The backward bearings at the first point and the forward ones at the last ARE the end
+	// caps: with the radial cap they pass the filter and the ribbon is not there (red); with the flat
+	// cap they fail it and are correctly not counted (green). Same lattice, same code, both arms.
 	// -------------------------------------------------------------------------------------------
+	static const FVector CompassBearings[] =
+	{
+		FVector(0.0, 0.0, 0.0),
+		FVector(1.0, 0.0, 0.0),  FVector(-1.0, 0.0, 0.0),
+		FVector(0.0, 1.0, 0.0),  FVector(0.0, -1.0, 0.0),
+		FVector(0.7071, 0.7071, 0.0),  FVector(-0.7071, 0.7071, 0.0),
+		FVector(0.7071, -0.7071, 0.0), FVector(-0.7071, -0.7071, 0.0)
+	};
+	static const double HeightFractions[] = { -0.999, -0.5, 0.0, 0.5, 0.999 };
+
 	for (int32 PointIndex = 0; PointIndex + 1 < LethalCount; ++PointIndex)
 	{
 		const FVector SegStart(TrailPoints.Items[PointIndex].Location);
 		const FVector SegEnd(TrailPoints.Items[PointIndex + 1].Location);
 
-		FVector Along = SegEnd - SegStart;
-		const double Length = Along.Size();
-		FVector Lateral = FVector::CrossProduct(FVector::UpVector,
-			(Length > GeometryEpsilon) ? (Along / Length) : FVector::ForwardVector);
-		if (!Lateral.Normalize())
-		{
-			Lateral = FVector::RightVector;
-		}
-
+		const double Length = FVector::Dist(SegStart, SegEnd);
 		const int32 Steps = FMath::Clamp(FMath::CeilToInt(Length / 12.0), 1, 24);
+
 		for (int32 Step = 0; Step <= Steps; ++Step)
 		{
 			const FVector Centre = FMath::Lerp(SegStart, SegEnd,
 				static_cast<double>(Step) / static_cast<double>(Steps));
 
-			for (int32 WidthIndex = -1; WidthIndex <= 1; ++WidthIndex)
+			for (const FVector& Bearing : CompassBearings)
 			{
-				for (int32 HeightIndex = -1; HeightIndex <= 1; ++HeightIndex)
+				for (const double HeightFraction : HeightFractions)
 				{
 					const FVector At = Centre
-						+ Lateral * (static_cast<double>(WidthIndex) * TrailRadius * 0.95)
-						+ FVector::UpVector * (static_cast<double>(HeightIndex) * TrailHalfHeight * 0.95);
+						+ Bearing * (TrailRadius * 0.999)
+						+ FVector::UpVector * (HeightFraction * TrailHalfHeight);
+
+					// THE FILTER, AND IT IS THE REAL PREDICATE. A sample is only evidence about the
+					// kill volume if the kill volume contains it, and "contains" is answered by the
+					// same function ServerRunTripTest answers it with — not by this lattice's own idea
+					// of the shape. Everything the ring throws past a flat cap is discarded here.
+					if (!IsPointLethal(LethalPolyline, At, TrailRadius, TrailHalfHeight))
+					{
+						continue;
+					}
 
 					++Out.LethalSamplesTotal;
 

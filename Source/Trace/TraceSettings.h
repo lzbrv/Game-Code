@@ -89,7 +89,10 @@ enum class EBotDifficulty : uint8
  * which writes "?mode=a|b" onto the travel URL) rather than being a second game mode class, because
  * a second class would double every rule that the two modes share.
  *
- * EndzoneStatusCore is mode A and is the DEFAULT: it is the shipped game and must not regress.
+ * SPEC v14 §2 CHANGED WHICH ONE IS DEFAULT. ThrownCoreAndGoals (mode B) is now the default
+ * everywhere — settings, menu, fresh install. EndzoneStatusCore (mode A) is FROZEN: it must keep
+ * working exactly as it does, it takes no characters and no abilities, and every player in it is
+ * the default characterless Mannequin.
  *
  *   EndzoneStatusCore     Endzones spanning the full field width. The Core is a STATUS, not an
  *                         object: it cannot exist on the ground, LMB starts the 0.5 s hover-pass,
@@ -630,13 +633,28 @@ public:
 	// ==========================================================================================
 
 	/**
-	 * Which ruleset the next match plays. A is the shipped game and the default.
+	 * Which ruleset the next match plays.
+	 *
+	 * *** SPEC v14 §2: MODE B IS NOW THE DEFAULT. *** Verbatim: "Change game mode b to the default
+	 * game mode." This property is THE fresh-install default and it is the only thing that had to
+	 * change to make that true everywhere:
+	 *
+	 *   settings default   this line, mirrored in Config/DefaultGame.ini (and the ini wins).
+	 *   menu default       ATraceMenuHUD::BeginPlay READS the mode from here rather than holding its
+	 *                      own copy ("The mode goes the other way: it is READ from the settings"),
+	 *                      so the title screen comes up on B without a UI change.
+	 *   match default      ATraceGameMode::ResolveScoringMode starts from this value and only a
+	 *                      travel-URL "?mode=a" or "-TraceScoringMode=a" overrides it.
+	 *
+	 * MODE A IS FROZEN, NOT DELETED (§2): it must keep working exactly as it does, and selecting it
+	 * still plays the shipped endzone game — with no characters and no abilities, because
+	 * UTraceAbilityComponent::AreCharactersEnabled returns false in mode A.
 	 *
 	 * NOT a live knob in the way the rest of this page is: read it at match start, not at the point
 	 * of use. See the latching note above.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Scoring Mode (A/B test)"))
-	ETraceScoringMode ScoringMode = ETraceScoringMode::EndzoneStatusCore;
+	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Scoring Mode (A/B test) [v14 §2: B IS THE DEFAULT]"))
+	ETraceScoringMode ScoringMode = ETraceScoringMode::ThrownCoreAndGoals;
 
 	/**
 	 * MODE B ONLY. Width of each goal as a fraction of the FULL field width.
@@ -3791,6 +3809,429 @@ public:
 	// Tune FTraceBotProfile (Bots|Difficulty > Easy/Normal/Hard Profile) instead. Every knob those
 	// seven pretended to be is in there, and those ones are live.
 	// ------------------------------------------------------------------------------------------
+
+	// ==========================================================================================
+	// ABILITIES — spec v14 §§4, 5 and 6
+	//
+	// EVERY constant from every character in spec §6 is here, categorised, clamped and tooltipped,
+	// and every one of them is checked by Trace.VerifyKnobs. Nothing in an ability may be a header
+	// literal: the user's own framing for this pass is "all of this will need extensive tuning",
+	// which is a request for knobs first and balance second.
+	//
+	// THREE RULES FOR THIS BLOCK.
+	//
+	// 1. DERIVE, DO NOT DUPLICATE. Where §6 gives a number that is really a fraction of an existing
+	//    one, the knob here is the FRACTION and the base stays where it already lives. Mace's magnet
+	//    is "+30% ... The base is now 450 uu, so Mace's is 585 uu. Derive it, do not hardcode" —
+	//    so MaceMagnetRadiusBonus is 0.30 and CoreCatchRadius stays the only place 450 is written.
+	//    Same for the Spike's pull speed (the air-strafe hard cap) and the Ripple's dash speed.
+	//
+	// 2. NOTHING HERE CAN TURN OFF THE CARRIER RULE. There is no "abilities may damage carriers"
+	//    knob and there must never be one — spec §4 is an invariant, not a tuning value. The single
+	//    exception is bCarrierImmuneToAbilityControl, which is the knob for the §4 [ASSUMPTION]
+	//    about slows and pulls, and it is clearly marked as such.
+	//
+	// 3. THE INI WINS. Every value below is also written in Config/DefaultGame.ini. Read them back
+	//    from a running game with Trace.DumpSettings or Trace.VerifyKnobs, never from this header.
+	// ==========================================================================================
+
+	// ------------------------------------------------------------------------------------------
+	// Framework
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * SPEC §3, verbatim: "Include a toggle in game settings to turn off all characters."
+	 *
+	 * Off means everybody plays the default characterless Mannequin — no select screen, no passives,
+	 * no E, no V. The whole framework becomes inert rather than partially active, which is the only
+	 * safe meaning for a switch a playtest will flip mid-session.
+	 *
+	 * NOTE THIS IS NOT THE ONLY THING THAT DISABLES CHARACTERS. Mode A does too, unconditionally and
+	 * with no knob (spec §2 freezes mode A). UTraceAbilityComponent::AreCharactersEnabled answers
+	 * for both, and is the only correct way to ask.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Framework", meta = (DisplayName = "Characters And Abilities Enabled [v14 §3]"))
+	bool bCharactersEnabled = true;
+
+	/**
+	 * *** THE SPEC §4 [ASSUMPTION], AND THE ONE KNOB THAT TOUCHES THE CARRIER RULE. ***
+	 *
+	 * Damage to a carrier is an invariant with no knob. This is about the OTHER half: slows, pulls
+	 * and knockbacks. Spec §4, verbatim: "slows, pulls and knockbacks do NOT apply to a carrier
+	 * either — the doc explicitly exempts the carrier from Chut's bash, and a carrier who can be
+	 * yanked by Oyster's Pickler or slowed by poison is functionally disabled without being damaged,
+	 * which is against the spirit. Flag this clearly as an assumption they may want to reverse
+	 * per-ability."
+	 *
+	 * True (shipped) = a carrier cannot be bashed, pulled or slowed by any ability.
+	 * False = every ability's control effect applies to carriers again. Damage is unaffected either
+	 * way — nothing about this knob can make an ability damage a carrier.
+	 *
+	 * IT IS ONE SWITCH, NOT PER-ABILITY, and that is deliberate: the assumption is global, and five
+	 * per-ability switches would be five places for it to be half-reversed. If the answer comes back
+	 * "per-ability", the right change is an argument on ETraceAbilityEffect, not four more bools.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Framework", meta = (DisplayName = "Carrier Immune To Ability Slows/Pulls/Knockbacks [v14 §4 ASSUMPTION]"))
+	bool bCarrierImmuneToAbilityControl = true;
+
+	/**
+	 * The cooldown an activated (E) ability costs when its character does not override it.
+	 *
+	 * 20 s is what §6 gives for Rocco's Ripple and Chut's Chud outright, and is the [ASSUMPTION]
+	 * cooldown for Mace's Spike and Oyster's Pickler, which the doc leaves unspecified. X's Sting is
+	 * the one stated exception at 25 s.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Framework", meta = (DisplayName = "Default Activated Cooldown (s)", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float AbilityDefaultCooldownSeconds = 20.f;
+
+	/**
+	 * Seconds a player has on the character select screen before one is assigned for them.
+	 *
+	 * Spec §3 [ASSUMPTION]: "a timeout that auto-assigns a free character, so one idle player cannot
+	 * stall the match." Zero disables the timeout, which is a legitimate thing to want in a private
+	 * playtest and a bad idea anywhere else.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Framework", meta = (DisplayName = "Character Select Timeout (s, 0 = never) [v14 §3]", ClampMin = "0.0", ClampMax = "300.0", UIMin = "0.0", UIMax = "60.0"))
+	float CharacterSelectTimeoutSeconds = 30.f;
+
+	// ------------------------------------------------------------------------------------------
+	// ROCCO — spec §6
+	//
+	// Passive: "3% speed boost from headshot kills for 1 second, stacking, each kill extends the
+	// timer on the entire boost."  Movement: "a very small second jump, which allows Rocco to change
+	// direction midair, instantly."  Activated (Ripple): a dash on its own cooldown leaving rings
+	// any character of either team — INCLUDING THE CORE CARRIER — may ride, for 4 s, 20 s cooldown.
+	// ------------------------------------------------------------------------------------------
+
+	/** +3% max speed per headshot kill. The whole stack shares ONE timer, refreshed by each kill. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Headshot Speed Bonus Per Stack (fraction)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.15"))
+	float RoccoHeadshotSpeedBonusPerStack = 0.03f;
+
+	/**
+	 * Cap on the stack. Spec §6 [ASSUMPTION]: "cap the stack (say 10 = +30%) — unbounded is a bug
+	 * waiting to happen; make the cap a knob." This is that knob. At the shipped 3% and 10 it is
+	 * +30% max, which is roughly the carrier's own speed multiplier and therefore a sane ceiling.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Headshot Speed Stack Cap [v14 §6 ASSUMPTION]", ClampMin = "1", ClampMax = "50", UIMin = "1", UIMax = "20"))
+	int32 RoccoHeadshotSpeedStackMax = 10;
+
+	/** The single timer covering the whole stack. Each headshot kill refreshes it — it never splits. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Headshot Speed Duration (s)", ClampMin = "0.05", ClampMax = "30.0", UIMin = "0.5", UIMax = "5.0"))
+	float RoccoHeadshotSpeedDurationSeconds = 1.f;
+
+	/**
+	 * The second jump's upward speed. "A VERY SMALL second jump" — this is deliberately a fraction
+	 * of a real jump, because §6 says "the direction change is the point, not the height."
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Second Jump Z Velocity (uu/s)", ClampMin = "0.0", ClampMax = "1200.0", UIMin = "0.0", UIMax = "500.0"))
+	float RoccoSecondJumpZVelocity = 260.f;
+
+	/**
+	 * How completely the second jump replaces horizontal velocity with the new wish direction.
+	 * 1 = "change direction midair, INSTANTLY" (the spec's word). 0 = no redirect at all, which
+	 * would make the ability pointless — this exists so the instantaneous version can be softened
+	 * if it feels teleporty, not so it can be switched off.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Second Jump Direction Change (0-1, 1 = instant)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.5", UIMax = "1.0"))
+	float RoccoSecondJumpRedirectFraction = 1.f;
+
+	/** Ripple lifetime. §6: "Lasts 4 s, then all effects and visuals vanish." */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Lifetime (s)", ClampMin = "0.25", ClampMax = "30.0", UIMin = "1.0", UIMax = "10.0"))
+	float RoccoRippleLifetimeSeconds = 4.f;
+
+	/** §6: "20 s cooldown", and it is SEPARATE from the standard dash's cooldown. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Cooldown (s)", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float RoccoRippleCooldownSeconds = 20.f;
+
+	/** Ripple dash speed, as a multiple of Movement|Dash > Dash Speed. DERIVED — see rule 1 above. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Dash Speed (x Dash Speed)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "2.0"))
+	float RoccoRippleDashSpeedMultiplier = 1.f;
+
+	/** Ripple dash duration, as a multiple of Movement|Dash > Dash Duration. Sets the path's length. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Dash Duration (x Dash Duration)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "2.0"))
+	float RoccoRippleDashDurationMultiplier = 1.f;
+
+	/** Speed a RIDER is propelled along the path, as a multiple of Dash Speed. Riders may shoot. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Ride Speed (x Dash Speed)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "2.0"))
+	float RoccoRippleRideSpeedMultiplier = 1.f;
+
+	/** How close to the START ring a player must be to be picked up. §6: entry is at the start only. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Entry Radius (uu)", ClampMin = "20.0", ClampMax = "1000.0", UIMin = "60.0", UIMax = "300.0"))
+	float RoccoRippleEntryRadiusUU = 140.f;
+
+	/** Spacing of the rings drawn along the path. §6: "a short series of rings along the path". */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Ring Spacing (uu)", ClampMin = "20.0", ClampMax = "2000.0", UIMin = "100.0", UIMax = "500.0"))
+	float RoccoRippleRingSpacingUU = 220.f;
+
+	/** Radius of each ring. Cosmetic, but it must read as an entrance rather than a decal. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Ring Radius (uu)", ClampMin = "10.0", ClampMax = "500.0", UIMin = "50.0", UIMax = "200.0"))
+	float RoccoRippleRingRadiusUU = 90.f;
+
+	/** §6: "the starting ring in a different colour so it is obvious where to take it." */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple START Ring Colour [v14 §6]"))
+	FLinearColor RoccoRippleStartRingColor = FLinearColor(1.f, 0.55f, 0.1f, 1.f);
+
+	/** Every ring after the first. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Trail Ring Colour"))
+	FLinearColor RoccoRippleTrailRingColor = FLinearColor(0.2f, 0.75f, 1.f, 1.f);
+
+	// ------------------------------------------------------------------------------------------
+	// CHUT — spec §6
+	//
+	// Passive: knife deals 50 from the front (vs the standard 30); the 60° back zone stays 100.
+	// Movement: bash — the END of his standard dash knocks a player in his direction of travel,
+	// with NO EFFECT ON THE CORE CARRIER (the doc's own words, and the reason the choke point has a
+	// Control class at all).  Activated (Chud): 30% less damage from body shots and melees for 10 s,
+	// refreshed by a knife kill, does not stack, 20 s cooldown.
+	// ------------------------------------------------------------------------------------------
+
+	/** Chut's front knife damage. The standard is UTraceMeleeSettings::FrontDamage (30). */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Knife Front Damage [v14 §6: 50 vs the standard 30]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "10.0", UIMax = "120.0"))
+	float ChutKnifeFrontDamage = 50.f;
+
+	/**
+	 * Chut's back-stab damage. §6 [ASSUMPTION]: "back damage stays 100." Present as a knob rather
+	 * than left implicit so that the assumption is visible and reversible in one place — and so
+	 * nobody has to work out whether Chut inherits the standard value or overrides it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Knife Back Damage [v14 §6 ASSUMPTION: unchanged at 100]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "50.0", UIMax = "200.0"))
+	float ChutKnifeBackDamage = 100.f;
+
+	/** Speed the bash imparts, along Chut's direction of travel. NEVER applies to a Core carrier. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Bash Knockback Speed (uu/s)", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
+	float ChutBashKnockbackSpeed = 1000.f;
+
+	/** Upward component of the bash, as a fraction of the knockback speed. A little pop reads better. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Bash Upward Bias (fraction of knockback)", ClampMin = "0.0", ClampMax = "1.5", UIMin = "0.0", UIMax = "0.6"))
+	float ChutBashUpBias = 0.3f;
+
+	/**
+	 * What counts as "the END of his standard dash": the last this fraction of the dash's duration.
+	 * §6 is specific about the end rather than the whole dash, so this must never default to 1.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Bash Window (final fraction of the dash)", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.1", UIMax = "0.6"))
+	float ChutBashEndFraction = 0.35f;
+
+	/** How close the bash reaches. Roughly a capsule and a half at the shipped value. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Bash Radius (uu)", ClampMin = "20.0", ClampMax = "800.0", UIMin = "60.0", UIMax = "250.0"))
+	float ChutBashRadiusUU = 130.f;
+
+	/** §6: "30% less damage from body shots and melees for 10 s." This is the 0.30. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Chud Damage Reduction (fraction)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.6"))
+	float ChudDamageReduction = 0.3f;
+
+	/** §6: 10 s. Does not stack; a knife kill REFRESHES this window rather than adding to it. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Chud Duration (s)", ClampMin = "0.5", ClampMax = "60.0", UIMin = "2.0", UIMax = "20.0"))
+	float ChudDurationSeconds = 10.f;
+
+	/** §6: 20 s. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Chud Cooldown (s)", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float ChudCooldownSeconds = 20.f;
+
+	/** §6: "The timer refreshes on a knife kill." Off makes Chud a plain 10 s window. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Chud Refreshes On Knife Kill"))
+	bool bChudRefreshesOnKnifeKill = true;
+
+	// ------------------------------------------------------------------------------------------
+	// MACE — spec §6
+	//
+	// Passive: +30% magnet radius for the Core arcing to her. DERIVED from CoreCatchRadius.
+	// Movement: hold V in the air to suspend for up to 1.25 s, gravity off, lateral movement capped
+	// at 550 uu/s; releasing V cancels immediately.
+	// Activated (Spike): a roped spike; embeds in a WALL for 2 s; reactivating pulls her at the
+	// momentum ceiling; ANY movement input cancels; she obeys physics and can shoot and be shot.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * §6: "+30% magnet radius ... The base is now 450 uu (reduced 10% in Demo 12), so Mace's is
+	 * 585 uu. DERIVE IT, DO NOT HARDCODE." So this is the 0.30 and the base stays CoreCatchRadius
+	 * under Core|Mode B. 450 x 1.30 = 585. If somebody retunes the base, Mace follows for free.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Magnet Radius Bonus (fraction of Core Catch Radius) [v14 §6: derive, do not hardcode]", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.6"))
+	float MaceMagnetRadiusBonus = 0.3f;
+
+	/** §6: "suspend for up to 1.25 s". A hard cap, not a resource — releasing V ends it early. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Suspend Max Duration (s)", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
+	float MaceSuspendMaxSeconds = 1.25f;
+
+	/** §6: "she may move laterally capped at 550 uu/s" while suspended. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Suspend Lateral Speed Cap (uu/s)", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "200.0", UIMax = "1200.0"))
+	float MaceSuspendLateralSpeedCap = 550.f;
+
+	/**
+	 * Cooldown between suspends. §6 gives none, so the shipped value is 0 — the 1.25 s cap and
+	 * needing to be airborne are the whole cost. A knob, not a literal, because "she can suspend
+	 * every frame she is in the air" is exactly the kind of thing a playtest reverses.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Suspend Cooldown (s, 0 = none; UNSPECIFIED in §6)", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "10.0"))
+	float MaceSuspendCooldownSeconds = 0.f;
+
+	/** §6: "throws a roped spike in her aim direction for a MEDIUM distance." */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Range (uu)", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "800.0", UIMax = "5000.0"))
+	float MaceSpikeRangeUU = 2200.f;
+
+	/** How fast the spike travels to its anchor. Fast enough to feel like a grapple, not a grenade. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Travel Speed (uu/s)", ClampMin = "100.0", ClampMax = "30000.0", UIMin = "2000.0", UIMax = "10000.0"))
+	float MaceSpikeTravelSpeed = 5000.f;
+
+	/** §6: "On hitting a wall it embeds for 2 s." After that it is gone whether she used it or not. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Embed Duration (s)", ClampMin = "0.1", ClampMax = "30.0", UIMin = "0.5", UIMax = "6.0"))
+	float MaceSpikeEmbedSeconds = 2.f;
+
+	/**
+	 * Pull speed as a multiple of the momentum ceiling. §6: "pulls her toward it AT THE MOMENTUM
+	 * CEILING (the air-strafe hard cap)". DERIVED — the ceiling is AirStrafeHardCapSpeed x
+	 * AirStrafeAsymptoteScale under Movement|Air, and it stays the only place that number lives.
+	 * 1.0 is the spec; the knob exists so the pull can be softened without moving the air cap.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Pull Speed (x air-strafe hard cap) [v14 §6: derive]", ClampMin = "0.1", ClampMax = "3.0", UIMin = "0.5", UIMax = "1.5"))
+	float MaceSpikePullSpeedMultiplier = 1.f;
+
+	/** How close to the spike counts as arrived, ending the pull. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Arrive Radius (uu)", ClampMin = "20.0", ClampMax = "600.0", UIMin = "60.0", UIMax = "250.0"))
+	float MaceSpikeArriveRadiusUU = 150.f;
+
+	/** §6 [ASSUMPTION]: "cooldown 20 s to match the others; flag it as unspecified." Flagged. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Cooldown (s) [v14 §6 ASSUMPTION: unspecified]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float MaceSpikeCooldownSeconds = 20.f;
+
+	// ------------------------------------------------------------------------------------------
+	// OYSTER — spec §6
+	//
+	// Passive: a poison jar at the START OF EVERY DASH, including while carrying the Core. An enemy
+	// touching a jar breaks it: 3 damage every 0.5 s for 4 s and −30% speed for 4 s to nearby
+	// enemies. Jars last 4 s on the ground, max 3, a fourth despawns the oldest.
+	// Movement: jumping while stood on one of his jars breaks it and boosts him upward.
+	// Activated (Pickler): a lobbed jar that ON LANDING deals 30 area damage and pulls enemies in a
+	// small radius toward it — AND THEN PERSISTS as a normal jar (the doc's own clarification).
+	//
+	// EVERY ONE OF THESE EFFECTS IS SUBJECT TO THE CHOKE POINT. Spec §4 names Oyster's poison ticks
+	// and Pickler's 30 area damage as specific risks: neither may touch a Core carrier, and neither
+	// may slow or pull one while the §4 [ASSUMPTION] stands.
+	// ------------------------------------------------------------------------------------------
+
+	/** §6: jars "last 4 s on the ground". */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Jar Lifetime (s)", ClampMin = "0.25", ClampMax = "60.0", UIMin = "1.0", UIMax = "10.0"))
+	float OysterJarLifetimeSeconds = 4.f;
+
+	/** §6: "Max 3; a fourth despawns the oldest." */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Max Live Jars", ClampMin = "1", ClampMax = "20", UIMin = "1", UIMax = "6"))
+	int32 OysterMaxJars = 3;
+
+	/** How close an enemy must come to break a jar by touching it. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Jar Break Radius (uu)", ClampMin = "20.0", ClampMax = "500.0", UIMin = "50.0", UIMax = "200.0"))
+	float OysterJarBreakRadiusUU = 100.f;
+
+	/** §6: "3 damage every 0.5 s for 4 s". This is the 3. Damage, so it never reaches a carrier. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Poison Damage Per Tick", ClampMin = "0.0", ClampMax = "100.0", UIMin = "1.0", UIMax = "15.0"))
+	float OysterPoisonDamagePerTick = 3.f;
+
+	/** §6: every 0.5 s. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Poison Tick Interval (s)", ClampMin = "0.05", ClampMax = "5.0", UIMin = "0.1", UIMax = "1.5"))
+	float OysterPoisonTickIntervalSeconds = 0.5f;
+
+	/** §6: for 4 s. At the shipped tick that is 8 ticks and 24 damage total. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Poison Duration (s)", ClampMin = "0.25", ClampMax = "30.0", UIMin = "1.0", UIMax = "10.0"))
+	float OysterPoisonDurationSeconds = 4.f;
+
+	/** §6: "−30% speed for 4 s". A CONTROL effect — blocked on carriers by the §4 [ASSUMPTION]. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Poison Slow (fraction) [CONTROL: see the §4 assumption]", ClampMin = "0.0", ClampMax = "0.95", UIMin = "0.0", UIMax = "0.6"))
+	float OysterPoisonSlowFraction = 0.3f;
+
+	/** How far the burst reaches. §6 says "poisoning nearby enemies" and leaves the radius open. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Poison Burst Radius (uu)", ClampMin = "50.0", ClampMax = "3000.0", UIMin = "200.0", UIMax = "800.0"))
+	float OysterPoisonRadiusUU = 380.f;
+
+	/** §6: "jumping while stood on one of his jars breaks it and boosts him upward." */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Jar-Jump Z Velocity (uu/s)", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "400.0", UIMax = "1600.0"))
+	float OysterJarJumpZVelocity = 1050.f;
+
+	/** How close to a jar Oyster must be standing for the jar-jump to trigger instead of a jump. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Jar-Jump Stand Radius (uu)", ClampMin = "20.0", ClampMax = "400.0", UIMin = "50.0", UIMax = "200.0"))
+	float OysterJarJumpRadiusUU = 110.f;
+
+	/** §6: Pickler "deals 30 damage in an area" on landing. Damage — never reaches a carrier. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Impact Damage", ClampMin = "0.0", ClampMax = "300.0", UIMin = "5.0", UIMax = "80.0"))
+	float OysterPicklerDamage = 30.f;
+
+	/** The area that 30 covers. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Damage Radius (uu)", ClampMin = "50.0", ClampMax = "3000.0", UIMin = "200.0", UIMax = "800.0"))
+	float OysterPicklerDamageRadiusUU = 420.f;
+
+	/** §6: "pulls enemies within a SMALL radius toward it" — smaller than the damage radius. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Pull Radius (uu) [CONTROL]", ClampMin = "20.0", ClampMax = "2000.0", UIMin = "100.0", UIMax = "500.0"))
+	float OysterPicklerPullRadiusUU = 260.f;
+
+	/** How hard the pull is. A CONTROL effect — blocked on carriers by the §4 [ASSUMPTION]. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Pull Speed (uu/s) [CONTROL]", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
+	float OysterPicklerPullSpeed = 1300.f;
+
+	/** How fast the jar is lobbed. It is a LOB — it arcs, lands, and then behaves as a normal jar. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Throw Speed (uu/s)", ClampMin = "100.0", ClampMax = "10000.0", UIMin = "800.0", UIMax = "3000.0"))
+	float OysterPicklerThrowSpeed = 1900.f;
+
+	/** Upward bias on the lob, as a fraction of the throw speed. Zero would be a bullet, not a lob. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Throw Up Bias (fraction)", ClampMin = "0.0", ClampMax = "1.5", UIMin = "0.0", UIMax = "0.8"))
+	float OysterPicklerThrowUpBias = 0.35f;
+
+	/** §6 [ASSUMPTION]: "cooldown 20 s; unspecified." Flagged. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Cooldown (s) [v14 §6 ASSUMPTION: unspecified]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float OysterPicklerCooldownSeconds = 20.f;
+
+	// ------------------------------------------------------------------------------------------
+	// X — spec §6
+	//
+	// Passive: orbited by five mechanical bees; an enemy hit by one becomes VULNERABLE for 2 s,
+	// taking +25% damage from all sources. Does not stack; a new application RESETS the timer.
+	// Movement: +10% speed while ANY enemy is vulnerable.
+	// Activated (Sting): loads the 5 bees into his gun; his next five bullets apply vulnerable at
+	// NORMAL damage; when all five are fired the bees resume orbiting. 25 s cooldown.
+	// ------------------------------------------------------------------------------------------
+
+	/** §6: five bees. The same five are the Sting's five bullets, so this is one number, not two. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Bee Count", ClampMin = "1", ClampMax = "20", UIMin = "1", UIMax = "8"))
+	int32 XBeeCount = 5;
+
+	/** How far out the bees orbit. §6 [ASSUMPTION]: "the orbiting bees hit on contact — X's body is the delivery mechanism." */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Bee Orbit Radius (uu)", ClampMin = "20.0", ClampMax = "600.0", UIMin = "60.0", UIMax = "250.0"))
+	float XBeeOrbitRadiusUU = 120.f;
+
+	/** How fast they go round. Cosmetic except that it sets which bee is where when a body touches. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Bee Orbit Speed (deg/s)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "60.0", UIMax = "500.0"))
+	float XBeeOrbitSpeedDegPerSecond = 240.f;
+
+	/** A bee's own touch radius, on top of the victim's capsule. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Bee Hit Radius (uu)", ClampMin = "5.0", ClampMax = "300.0", UIMin = "20.0", UIMax = "100.0"))
+	float XBeeHitRadiusUU = 50.f;
+
+	/** §6: vulnerable for 2 s. "Does not stack; a new application RESETS the timer." */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable Duration (s)", ClampMin = "0.1", ClampMax = "30.0", UIMin = "0.5", UIMax = "6.0"))
+	float XVulnerableDurationSeconds = 2.f;
+
+	/**
+	 * §6: "+25% damage from ALL sources."
+	 *
+	 * NOTE FOR WHOEVER BUILDS X: this is an amplifier on damage, and spec §4 says the vulnerable
+	 * mark "must not become a damage path". Applying the mark is a CONTROL effect and is refused on
+	 * a carrier; the amplifier itself is harmless because nothing can damage a carrier anyway.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable Damage Bonus (fraction)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
+	float XVulnerableDamageBonus = 0.25f;
+
+	/** §6 movement: "+10% speed while ANY enemy is vulnerable." Any, not the one he marked. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Speed Bonus While Any Enemy Vulnerable (fraction)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.3"))
+	float XVulnerableSpeedBonus = 0.1f;
+
+	/** §6: "25 s cooldown" — the one activated ability that is not 20. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Sting Cooldown (s) [v14 §6: 25, not 20]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float XStingCooldownSeconds = 25.f;
+
+	/**
+	 * How many loaded bullets carry the mark. §6 says five, and says the bees resume orbiting when
+	 * all five are fired — so this and XBeeCount are the same five and should move together.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Sting Loaded Bullets [keep equal to Bee Count]", ClampMin = "1", ClampMax = "20", UIMin = "1", UIMax = "8"))
+	int32 XStingBulletCount = 5;
 
 	// ==========================================================================================
 	// NET

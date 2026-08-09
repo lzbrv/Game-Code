@@ -24,7 +24,15 @@ class ATraceCharacter;
 class ATraceCore;
 class ATraceEndzone;
 class ATraceGameState;
+class ATracePlayerState;
 class ATraceTeamPlayerStart;
+
+/**
+ * Declared in Core/TracePlayerState.h. Forward declared here (legal: the underlying type is fixed)
+ * for the same reason ATraceGameState forward declares ETraceScoringMode — this header is included
+ * by half the module and does not need to drag the player state in for one return type.
+ */
+enum class ETraceCharacterPickResult : uint8;
 
 /**
  * Who gets the Core after a goal.
@@ -220,6 +228,87 @@ public:
 	/** Living, non-spectating members of @p Team that currently possess an alive ATraceCharacter. */
 	int32 CountLivingOnTeam(ETraceTeam Team) const;
 
+	// ------------------------------------------------------------------------------------------
+	// CHARACTER SELECTION (spec v14 §3)
+	//
+	// This class is the ONLY authority on who may have which character. Everything else — the select
+	// screen, the player state's server RPC, the ability component — asks it. That is not style: the
+	// rule is "no two players on the SAME TEAM may hold the same character", which is a statement
+	// about the whole roster at one instant, and the only object that can see the whole roster at one
+	// instant on the machine that decides things is the game mode.
+	//
+	// THE RACE, and why there is no lock. Two team-mates pressing ROCCO on the same frame send two
+	// server RPCs. Those arrive as two ordinary function calls on the game thread, executed one after
+	// the other. The first runs the uniqueness test against a roster in which Rocco is free, takes
+	// it, and writes it. The second runs the same test against a roster in which Rocco is now taken,
+	// and is refused. "First request wins" is therefore a property of the execution model rather than
+	// of any tie-break code — which is exactly why it is implemented here and not in the UI, where
+	// two clients cannot see each other at all.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Whether this match has characters at all.
+	 *
+	 * THREE ways to be off, and all three must be, because they answer different questions:
+	 *   * MODE A (spec v14 §2, verbatim: "Do not implement abilities or characters into what was game
+	 *     mode a") — frozen, and this is the hard gate that keeps it that way whatever the settings
+	 *     say. Read from the GameState, so it follows a live A/B mode switch rather than latching.
+	 *   * the SETTINGS TOGGLE (spec v14 §3, verbatim: "Include a toggle in game settings to turn off
+	 *     all characters"), resolved once in InitGame from the travel URL / command line / the saved
+	 *     user setting / this class's own config default. See ResolveCharactersEnabled.
+	 *   * no authority. A client asking this is asking a question only the server can answer.
+	 */
+	bool AreCharactersEnabled() const;
+
+	/**
+	 * THE arbitration entry point. Server only. Called by ATracePlayerState::ServerRequestCharacter.
+	 *
+	 * Refuses — with a reason — rather than silently ignoring, because a select screen that gets no
+	 * answer is a select screen the player presses again forever. On success the pick is written to
+	 * the player state, locked, and the select screen is closed.
+	 */
+	ETraceCharacterPickResult RequestCharacter(ATracePlayerState* Requester, uint8 RequestedCharacter);
+
+	/** True when a NON-BOT team-mate of @p Team already holds @p CharacterId. @p Except is skipped. */
+	bool IsCharacterTakenOnTeam(ETraceTeam InTeam, uint8 CharacterId, const ATracePlayerState* Except) const;
+
+	/**
+	 * The lowest-numbered character no team-mate holds, for the auto-assign. TraceCharacterRoster::
+	 * NoneId when the team somehow has more players than there are characters.
+	 *
+	 * Deterministic rather than random on purpose: an auto-assign is already a thing the player did
+	 * not choose, and making it also unpredictable makes it impossible to reproduce in a bug report.
+	 */
+	uint8 FindFreeCharacterForTeam(ETraceTeam InTeam, const ATracePlayerState* Except) const;
+
+	/** Half time (spec v14 §5). Clears every player's activated cooldown. Server only, idempotent. */
+	void ResetAbilityCooldownsForHalfTime();
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * Trace.Characters.Verify — the scripted proof for spec v14 §3.
+	 *
+	 * Drives the three cases organic play will not produce on demand: two same-team requests for one
+	 * character in the same frame, the same request from an ENEMY (which must SUCCEED — mirroring is
+	 * legal), and the auto-assign timeout. Logs a PASS/FAIL per assertion.
+	 *
+	 * @param bRedArm true removes this slice's uniqueness test FOR THE DURATION OF THE RUN, so the
+	 *                team-mate assertion must FAIL. A harness that cannot be made to go red proves
+	 *                nothing, and this project has already lost two passes to exactly that.
+	 *
+	 * The arm is an ARGUMENT rather than a cvar set from the command line, and that is a measured
+	 * decision: the first attempt shipped it as `-dpcvars=Trace.Characters.EnforceSelectRules=0`
+	 * and the run came back reporting "uniqueness rule ENFORCED" — the value never reached the cvar,
+	 * so the red arm silently ran green and would have been recorded as evidence. `Trace.Characters.
+	 * Verify red` cannot fail that way: the flag is set inside the same function that reads it, and
+	 * the header line prints which arm actually ran.
+	 */
+	void StartCharacterSelectVerify(bool bRedArm);
+
+	/** Trace.Characters.Dump — the whole roster, who holds what, and every cooldown. */
+	void DumpCharacterState() const;
+#endif
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * Trace.HalfTime.Verify — the scripted proof for spec v9 §11.
@@ -303,6 +392,28 @@ public:
 	 */
 	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Match")
 	bool bRespawnInOwnEndzone = true;
+
+	// ------------------------------------------------------------------------------------------
+	// Characters (spec v14 §3)
+	// ------------------------------------------------------------------------------------------
+
+	// NOTE: there is no bCharactersEnabled here. The toggle spec v14 §3 asks for lives on
+	// UTraceSettings::bCharactersEnabled, which is what UTraceAbilityComponent::AreCharactersEnabled
+	// reads and therefore what every ability in the game actually obeys. ResolveCharactersEnabled()
+	// below resolves the URL / command line / saved setting and writes the answer THERE, exactly as
+	// TraceScoring::ApplyToSettings does for the A/B mode. A second copy on this class would be a
+	// switch that could disagree with the one the framework honours.
+
+	/**
+	 * Seconds a player gets to pick before one is assigned to them (spec v14 §3 [ASSUMPTION]:
+	 * "a timeout that auto-assigns a free character, so one idle player cannot stall the match").
+	 *
+	 * Long enough to read five cards, short enough that an AFK player costs one warm-up. Zero or less
+	 * disables the auto-assign entirely, which is a legitimate configuration for a private match and
+	 * a terrible one for a public server.
+	 */
+	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Characters")
+	float CharacterSelectTimeout = 30.f;
 
 protected:
 	/** Spawned at the origin if the level does not already contain an ATraceArenaBuilder. */
@@ -564,6 +675,29 @@ protected:
 	/** Config AND "?bots=0". The URL wins, so a session can be forced human-only without editing ini. */
 	bool AreBotsEnabled() const;
 
+	// --- Character selection -------------------------------------------------------------------
+
+	/**
+	 * Resolves the characters-on/off toggle for this map load and latches it. See bCharactersEnabled
+	 * for the priority order. Called once, from InitGame, for the same reason ResolveScoringMode is:
+	 * it is the last point at which the raw travel URL is guaranteed to be what the session opened
+	 * with.
+	 */
+	void ResolveCharactersEnabled(const FString& Options);
+
+	/**
+	 * The whole select-screen state machine, on a 4 Hz timer.
+	 *
+	 * A POLL RATHER THAN EVENTS, and deliberately so. Three separate things have to be true for a
+	 * player to be offered a selection — they are human, they are on a team, and characters are on —
+	 * and each of those becomes true on its own schedule: PostLogin, the balancer, a live A/B mode
+	 * switch. An event-driven version would need a hook on each and would still miss the listen-server
+	 * host, who logs in during map load before the GameState exists. This is idempotent and
+	 * self-correcting in both directions (it closes screens as well as opening them), which is the
+	 * same shape UpdateBotFill() has and for the same reason.
+	 */
+	void PollCharacterSelect();
+
 	/** Spawns one bot on @p Team, names it, and gives it a pawn. Null on failure. */
 	ATraceBotController* SpawnBotForTeam(ETraceTeam Team);
 
@@ -687,6 +821,9 @@ private:
 	/** Drives PollScoringModeSetting(). Looping, half a second, for the whole session. */
 	FTimerHandle ScoringModePollHandle;
 
+	/** Drives PollCharacterSelect(). Looping, quarter second, for the whole session. */
+	FTimerHandle CharacterSelectPollHandle;
+
 #if !UE_BUILD_SHIPPING
 	FTimerHandle BotDebugTimerHandle;
 
@@ -760,5 +897,13 @@ private:
 
 	/** The carrier the scenario started from, so "a team-mate" and "an enemy" mean something. */
 	TWeakObjectPtr<ATraceCharacter> HalfTimeVerifyHolder;
+
+	// --- Trace.Characters.Verify (spec v14 §3) --------------------------------------------------
+
+	int32 CharacterVerifyPassed = 0;
+	int32 CharacterVerifyFailed = 0;
+
+	/** One assertion of the scripted proof. Logs, counts, and returns @p bCondition unchanged. */
+	bool ReportCharacterVerify(bool bCondition, const TCHAR* What);
 #endif
 };

@@ -379,6 +379,22 @@ public:
 	/** MODE B. Velocity of the loose Core, uu/s. Zero when held or at rest. */
 	FVector GetLooseVelocity() const { return LooseVelocity; }
 
+	/** MODE B. Authoritative position of the loose Core. Only meaningful while IsLoose(). */
+	FVector GetLooseLocation() const { return LooseLocation; }
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * DEV ONLY. The catcher ServerApplyCatchZone last chose, or null.
+	 *
+	 * Exists for ONE caller: Trace.Integration.Verify's magnet check (spec v14 §6 — Mace's +30%
+	 * magnet radius). That passive is a change to WHO IS IN RANGE, and "who is in range" is not
+	 * observable from outside the catch loop by any other means. The alternative was to
+	 * re-implement the loop inside the harness, which is exactly how this project has previously
+	 * verified something other than its shipping code.
+	 */
+	ATraceCharacter* GetCatchZoneTargetForTest() const { return CatchZoneTarget.Get(); }
+#endif
+
 	/**
 	 * MODE B. Where a chaser should run: the loose Core's position, lead by @p LeadSeconds of its
 	 * own velocity so a bot does not chase where the Core WAS. False when the Core is not loose.

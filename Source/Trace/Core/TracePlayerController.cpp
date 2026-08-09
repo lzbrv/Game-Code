@@ -2,6 +2,8 @@
 
 #include "Core/TracePlayerController.h"
 
+#include "Abilities/TraceAbilityComponent.h"                  // spec v14 §5 — the E / V binds
+#include "Abilities/Characters/TraceAbilityInputRelay.h"      // ... and Mace's reactivation routing
 #include "Containers/Ticker.h"             // FTSTicker — the v13 §2 hotkey probe
 #include "Core/TraceCharacter.h"
 #include "Core/TracePlayerState.h"
@@ -218,6 +220,9 @@ void ATracePlayerController::BuildInputData()
 		// Spec v13 §2, the two direct-select binds. Boolean like every other button here.
 		IA_EquipKnife = MakeAction(TEXT("IA_EquipKnife"), EInputActionValueType::Boolean);
 		IA_EquipGun   = MakeAction(TEXT("IA_EquipGun"),   EInputActionValueType::Boolean);
+		// SPEC v14 §5 — the ability binds.
+		IA_Ability          = MakeAction(TEXT("IA_Ability"),          EInputActionValueType::Boolean);
+		IA_AbilitySecondary = MakeAction(TEXT("IA_AbilitySecondary"), EInputActionValueType::Boolean);
 
 		// Cumulative accumulation is REQUIRED for opposing keys to cancel. UInputAction defaults to
 		// TakeHighestAbsoluteValue, and UEnhancedPlayerInput::ProcessActionMappingEvent merges with
@@ -337,6 +342,11 @@ void ATracePlayerController::ApplyControlSettings()
 	// player has deliberately UNBOUND gets no mapping at all rather than a dead one.
 	MapButton(IA_EquipKnife, KeyFor(ETraceInputAction::EquipKnife));
 	MapButton(IA_EquipGun,   KeyFor(ETraceInputAction::EquipGun));
+	// SPEC v14 §5. Through the same KeyFor/MapButton path as everything else, so a player who
+	// rebinds E in the options screen is rebinding the ability and not just the label — and so
+	// UTraceAbilityInputRelay's ConfigId lookup and this mapping can never disagree about the key.
+	MapButton(IA_Ability,          KeyFor(ETraceInputAction::Ability));
+	MapButton(IA_AbilitySecondary, KeyFor(ETraceInputAction::AbilitySecondary));
 
 	// The context is already registered by the time a settings change arrives, and Enhanced Input
 	// caches the resolved key->action table. Without this the new bindings sit in the context and
@@ -495,6 +505,14 @@ void ATracePlayerController::SetupInputComponent()
 	// only works because something downstream ignores it is a binding waiting to be a bug.)
 	EIC->BindAction(IA_EquipKnife, ETriggerEvent::Started, this, &ATracePlayerController::OnEquipKnifeStarted);
 	EIC->BindAction(IA_EquipGun,   ETriggerEvent::Started, this, &ATracePlayerController::OnEquipGunStarted);
+
+	// SPEC v14 §5. Ability is a PRESS. AbilitySecondary is a HOLD, so it gets the full
+	// Started/Completed/Canceled shape — Canceled included, for the reason IA_Pass documents: a
+	// release edge that never arrives leaves Mace suspended in mid-air with gravity switched off.
+	EIC->BindAction(IA_Ability, ETriggerEvent::Started, this, &ATracePlayerController::OnAbilityStarted);
+	EIC->BindAction(IA_AbilitySecondary, ETriggerEvent::Started,   this, &ATracePlayerController::OnAbilitySecondaryStarted);
+	EIC->BindAction(IA_AbilitySecondary, ETriggerEvent::Completed, this, &ATracePlayerController::OnAbilitySecondaryCompleted);
+	EIC->BindAction(IA_AbilitySecondary, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnAbilitySecondaryCompleted);
 
 	// Crouch is a HELD action — ground slide while down, stand on release — so it needs the release
 	// edge as well, and Canceled for the same reason the scoreboard does: losing window focus with
@@ -922,6 +940,38 @@ void ATracePlayerController::OnJumpStarted()
 	// prediction-safe and routes through the movement component's saved moves.
 	if (ATraceCharacter* TraceChar = GetLivingCharacter())
 	{
+		// SPEC v14 §5/§6 — THE ABILITY GETS FIRST REFUSAL ON THE JUMP KEY, and a TRUE return means
+		// the normal jump must NOT also run.
+		//
+		// Two characters claim this key and each does so under a condition the other cannot meet, so
+		// there is no arbitration to do here: Rocco's second jump only fires while AIRBORNE (on the
+		// ground it declines, or a 600 uu/s launch would be replaced by a 260 uu/s one and read as
+		// the jump being broken), and Oyster's jar jump only fires while STOOD ON one of his jars.
+		// Everybody else — every Mannequin, every bot, every character without a jump ability —
+		// returns false here and reaches ACharacter::Jump() exactly as before.
+		//
+		// Sent to the server as well as run locally. Neither ability is saved-move state (see the
+		// report), so the local write alone would be corrected away within a round trip; running the
+		// identical hook on both ends is what makes it survive. This is a documented limitation, not
+		// a claim of prediction correctness.
+		UTraceAbilityComponent* Abilities = TraceAbilityIntegration::IsEnabled()
+			? UTraceAbilityComponent::Get(TraceChar) : nullptr;
+		if (Abilities != nullptr)
+		{
+			if (Abilities->HandleJumpPressed())
+			{
+				++TraceAbilityIntegration::Counters().JumpConsumed;
+				// Not on a listen-server host: there the call above WAS the authoritative one, and a
+				// Server RPC executes locally, which would run the hook a second time in the same
+				// frame. Both hooks happen to be latched against that, and neither is asked to be.
+				if (!HasAuthority())
+				{
+					Abilities->ServerHandleJumpPressed();
+				}
+				return;
+			}
+		}
+
 		TraceChar->Jump();
 	}
 }
@@ -1240,6 +1290,68 @@ void ATracePlayerController::OnScoreboardCompleted()
 	}
 
 	bScoreboardOpen = false;
+}
+
+// -------------------------------------------------------------------------------------------
+// SPEC v14 §5 — the ability binds
+//
+// Both handlers are deliberately three lines and hold no rules of their own. Every refusal an
+// ability can have — dead, no pawn, no character, characters disabled (mode A or the toggle),
+// match not live, half-time break, cooldown still running, the character's own CanActivate() —
+// lives in UTraceAbilityComponent::TryActivate(), which is also what the console command and the
+// interim relay call. A second copy of any of those tests here is how the two paths would come to
+// disagree about whether E did anything.
+//
+// The PlayerState, not the pawn, is the component's home (it must survive death — see the cooldown
+// contract), but Get() resolves through either, so the pawn is the natural handle to pass.
+// -------------------------------------------------------------------------------------------
+
+void ATracePlayerController::OnAbilityStarted()
+{
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	if (!TraceAbilityIntegration::IsEnabled())
+	{
+		return;   // RED ARM: the key is bound but reaches nothing, exactly as before this pass.
+	}
+
+	// Through the relay's router, not straight to HandleActivatePressed: see the declaration.
+	// The router works with or without a relay component present, and applies Mace's reactivation
+	// rule in exactly one place.
+	++TraceAbilityIntegration::Counters().ActivatePressed;
+	UTraceAbilityInputRelay::RouteActivatePressed(GetPlayerState<APlayerState>());
+}
+
+void ATracePlayerController::OnAbilitySecondaryStarted()
+{
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	if (!TraceAbilityIntegration::IsEnabled())
+	{
+		return;
+	}
+
+	++TraceAbilityIntegration::Counters().SecondaryEdges;
+	UTraceAbilityInputRelay::RouteSecondaryEdge(GetPlayerState<APlayerState>(), /*bDown=*/true);
+}
+
+void ATracePlayerController::OnAbilitySecondaryCompleted()
+{
+	// NOT gated on suppression, exactly like OnPassCompleted and OnCrouchCompleted: a release must
+	// always propagate. Opening the pause menu while holding V must not leave Mace hanging in the
+	// air with gravity switched off until she dies.
+	//
+	// NOT gated on the integration red arm either, for the same reason: disarming the wiring
+	// mid-hold must not strand her. Release is always safe — the ability's own hook decides whether
+	// there is anything to end.
+	++TraceAbilityIntegration::Counters().SecondaryEdges;
+	UTraceAbilityInputRelay::RouteSecondaryEdge(GetPlayerState<APlayerState>(), /*bDown=*/false);
 }
 
 // -------------------------------------------------------------------------------------------

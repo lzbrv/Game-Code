@@ -21,6 +21,7 @@
 #include "UObject/ObjectPtr.h"
 
 #include "TraceTypes.h"          // ETraceTeam, TraceTeamColor
+#include "UI/TraceCharacterSelect.h" // FTraceCharacterSelect — spec v14 §3
 #include "UI/TraceKillFeed.h"     // ETraceKillIcon, ATraceKillFeedRelay — spec v8 §6
 #include "UI/TraceOptionsMenu.h"  // FTraceOptionsMenu
 
@@ -107,6 +108,22 @@ protected:
 	 * and is allowed to shuffle.
 	 */
 	void DrawHealthAndDash();
+
+	/**
+	 * Spec v14 §5 — the ACTIVATED ability's cooldown row, drawn as part of the bottom-left stack.
+	 *
+	 * *** IT DRAWS WHILE THE PLAYER IS DEAD, AND THAT IS THE WHOLE POINT OF THE PASS. *** The spec is
+	 * explicit: "Character ability cooldowns should continue to countdown while a player is dead. They
+	 * should not automatically reset due to death or a goal (a player can spawn with an ability timer
+	 * still counting down)." A player who dies at 18 seconds remaining, respawns, presses E and gets
+	 * nothing has been shown a bug unless the countdown was on screen the whole time. So this row is
+	 * fed from ATracePlayerState — which survives the pawn — and never from the pawn or its component.
+	 *
+	 * Returns the Y the next row up should use, so the stack keeps growing upwards from health.
+	 *
+	 * @param RowY  top of the row to draw at.
+	 */
+	float DrawAbilityRow(float RowY, float Margin, float BarW, float RowH, float LabelW, const FLinearColor& TeamTint);
 
 	/**
 	 * The health bar itself, split out of DrawHealthAndDash() because regeneration (spec v13 §1)
@@ -337,6 +354,19 @@ private:
 
 	/** Opens the pause menu, wires its callbacks and silences gameplay input. */
 	void OpenPauseMenu();
+
+	/**
+	 * The character select screen (spec v14 §3).
+	 *
+	 * Owned by the HUD for the same reason the pause menu is: it is a drawn thing, and every screen in
+	 * this project is drawn by an AHUD. It needs no Open() call — it follows the replicated
+	 * ATracePlayerState::bCharacterSelectOpen, so a player who joins mid-warm-up gets it without the
+	 * HUD having to notice them arriving. See TraceCharacterSelect.h.
+	 */
+	FTraceCharacterSelect CharacterSelect;
+
+	/** Binds the select screen's input-suppression callbacks. Idempotent; called from BeginPlay. */
+	void WireCharacterSelect();
 
 #if !UE_BUILD_SHIPPING
 	/**

@@ -26,6 +26,8 @@
 #include "Math/UnrealMathUtility.h"
 #include "Net/UnrealNetwork.h"                  // DOREPLIFETIME
 
+#include "Abilities/Characters/TraceAbilityWeaponHooks.h"   // spec v14 §6: X's Sting bullets
+#include "Abilities/TraceAbilityComponent.h"                 // spec v14 §6: the damage passives
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
@@ -1095,7 +1097,10 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			// Spec section 6: head 100 / body 40 / legs 25. No multiplier, no base damage - the zone
 			// IS the damage. UTraceSettings::HitscanDamage and HeadshotMultiplier are no longer read
 			// by the weapon (see the report); the numbers live in UTraceDamageSettings.
-			const float Damage = FTraceHitZoneModel::DamageForZone(Zone);
+			// NOT const: the ability passives below may modify it (spec v14 §6). The ZONE is still
+			// the only thing that decides the base number — see spec section 6, head 100 / body 40 /
+			// legs 25 — and a character with no passives leaves it exactly as it was.
+			float Damage = FTraceHitZoneModel::DamageForZone(Zone);
 
 			// SPEC v8 §6, the kill feed's headshot icon. The zone is known EXACTLY here and nowhere
 			// after: ApplyDamage takes a cause and the health component clamps at zero, so a head
@@ -1108,11 +1113,43 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			// exact in both directions. The feed already accepts this name; every other cause is
 			// unchanged, so nothing else in the taxonomy moves.
 			const FName DamageCause = (Zone == ETraceHitZone::Head) ? FName(TEXT("Headshot")) : FName(TEXT("Bullet"));
+
+			// SPEC v14 §6 — THE ABILITY PASSIVE PIPELINE, FOLDED IN AT THE ONE PLACE A BULLET'S
+			// NUMBER IS DECIDED.
+			//
+			// This runs the INSTIGATOR's outgoing passives and the TARGET's incoming ones — Chut's
+			// Chud is "30% less damage from body shots", and a body shot is this line. It is a no-op
+			// for a Mannequin and for every player who has not picked a character, so mode A and bots
+			// are unaffected.
+			//
+			// *** X's VULNERABLE IS NOT APPLIED HERE, AND MUST NOT BE. *** "+25% damage from all
+			// sources" is one multiplication inside UTraceHealthComponent::ApplyDamage, which this
+			// call is about to reach; UTraceAbilitySetX deliberately leaves
+			// GetIncomingDamageMultiplier() at 1 so that the amplification cannot happen twice on one
+			// bullet. See the block comment at the top of TraceHealthComponent.h.
+			FTraceAbilityDamageContext AbilityContext;
+			AbilityContext.Instigator   = Character;
+			AbilityContext.Target       = Victim;
+			AbilityContext.Cause        = DamageCause;
+			AbilityContext.bHeadshot    = (Zone == ETraceHitZone::Head);
+			AbilityContext.bMelee       = false;
+			AbilityContext.bFromAbility = false;
+			Damage = UTraceAbilityComponent::ModifyDamageThroughPassives(Damage, AbilityContext);
+
 			VictimHealth->ApplyDamage(Damage, Character->GetController(), DamageCause);
 
 			// ApplyDamage no-ops against an invulnerable target, so read the result rather than
 			// assuming the hit landed.
 			bKilled = !VictimHealth->IsAlive();
+
+			// SPEC v14 §6 — X's STING: "His NEXT FIVE BULLETS apply vulnerable on hit, at NORMAL
+			// damage." AFTER the damage, deliberately: the delivering bullet must not be amplified by
+			// the mark it delivers, and being on this side of ApplyDamage is what guarantees it
+			// rather than a comment asking the next reader to be careful.
+			//
+			// One character-agnostic call. See Abilities/Characters/TraceAbilityWeaponHooks.h for why
+			// the gun does not know X's class name.
+			TraceAbilityWeaponHooks::OnBulletHit(Character, Victim, Zone == ETraceHitZone::Head);
 		}
 
 		if (ATracePlayerController* ShooterController = Cast<ATracePlayerController>(Character->GetController()))
@@ -1765,7 +1802,28 @@ void UTraceWeaponComponent::ServerSwing_Implementation(FVector_NetQuantize Origi
 			// component clamps at zero, so a back-stab and a front swipe would otherwise arrive at
 			// the death handler as one indistinguishable "Knife".
 			const FName Cause = Hit.bBackstab ? TraceMelee::GetBackstabKillCause() : TraceMelee::GetKnifeKillCause();
-			VictimHealth->ApplyDamage(Hit.Damage, Character->GetController(), Cause);
+
+			// SPEC v14 §6 — the ability passive pipeline, exactly as ServerFire does it. Chut's Chud
+			// is "30% less damage from body shots AND MELEES", so the knife has to pass through it
+			// too, and bMelee is the flag that tells it apart from a bullet.
+			//
+			// X's vulnerable is again NOT here: it is one multiplication inside
+			// UTraceHealthComponent::ApplyDamage, which the next line reaches. A knife on a marked
+			// target is amplified there, once.
+			//
+			// The carrier is unaffected by any of this: TraceMelee::ResolveSwing already refused to
+			// return a carrier as a victim (Hit.bBlockedByCarrierShield below), so this branch is
+			// unreachable for one — which is the proven 5/5 rule, untouched.
+			FTraceAbilityDamageContext AbilityContext;
+			AbilityContext.Instigator   = Character;
+			AbilityContext.Target       = Hit.Victim;
+			AbilityContext.Cause        = Cause;
+			AbilityContext.bHeadshot    = (Hit.Zone == ETraceHitZone::Head);
+			AbilityContext.bMelee       = true;
+			AbilityContext.bFromAbility = false;
+			const float MeleeDamage = UTraceAbilityComponent::ModifyDamageThroughPassives(Hit.Damage, AbilityContext);
+
+			VictimHealth->ApplyDamage(MeleeDamage, Character->GetController(), Cause);
 
 			// ApplyDamage no-ops against an invulnerable target, so read the result rather than
 			// assuming the hit landed.

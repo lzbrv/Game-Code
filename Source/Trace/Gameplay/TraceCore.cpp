@@ -5,6 +5,7 @@
 
 #include "Gameplay/TraceCore.h"
 
+#include "Abilities/TraceAbilityComponent.h"   // spec v14 §6: Mace's per-player magnet radius
 #include "Net/UnrealNetwork.h"
 
 #include "Trace.h"
@@ -5719,9 +5720,15 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 	TArray<TraceModeBTuning::FCatchContender> Contenders;
 	TArray<ATraceCharacter*> ContenderPawns;
 	TArray<FVector> ContenderPoints;
+	// SPEC v14 §6, MACE: "+30% magnet radius ... Derive it, do not hardcode." The radius is now
+	// PER CANDIDATE, so it is carried alongside them — the steering below needs the winner's own
+	// radius, not the global one, or a Core caught at 560 uu by Mace would be steered as though it
+	// were already 110 uu outside the zone.
+	TArray<float> ContenderRadii;
 	Contenders.Reserve(Candidates.Num());
 	ContenderPawns.Reserve(Candidates.Num());
 	ContenderPoints.Reserve(Candidates.Num());
+	ContenderRadii.Reserve(Candidates.Num());
 
 	const ATraceCharacter* const Incumbent = CatchZoneTarget.Get();
 
@@ -5756,7 +5763,29 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 				FVector::Dist(CoreLocation, CatchPoint) - static_cast<double>(Capsule->GetScaledCapsuleRadius()));
 		}
 
-		if (SurfaceDistance > static_cast<double>(Radius))
+		// SPEC v14 §6 — MACE'S PASSIVE, AND THE ONLY PLACE IT EXISTS.
+		//
+		// "The base is now 450 uu ... so Mace's is 585 uu. Derive it, do not hardcode." 585 appears
+		// nowhere: this is Radius (the live CoreCatchRadius knob) times a multiplier the character
+		// derives from UTraceSettings::MaceMagnetRadiusBonus. Retuning the base radius moves Mace's
+		// with it, which is what "derive" asks for.
+		//
+		// 1.0 for every other player and for every bot, so the loop is unchanged for them.
+		//
+		// IT IS PER CANDIDATE AND NOT A GLOBAL WIDENING. The magnet is a contest (spec v13 §5): a
+		// single wider radius would have let Mace's bonus pull the Core toward HER OPPONENT too.
+		float CandidateRadius = Radius;
+		if (TraceAbilityIntegration::IsEnabled())
+		{
+			const float MagnetScale = UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Candidate);
+			if (!FMath::IsNearlyEqual(MagnetScale, 1.f))
+			{
+				CandidateRadius = Radius * MagnetScale;
+				++TraceAbilityIntegration::Counters().MagnetWidenedFrames;
+			}
+		}
+
+		if (SurfaceDistance > static_cast<double>(CandidateRadius))
 		{
 			continue;
 		}
@@ -5779,6 +5808,7 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 		Contenders.Add(Contender);
 		ContenderPawns.Add(Candidate);
 		ContenderPoints.Add(CatchPoint);
+		ContenderRadii.Add(CandidateRadius);
 	}
 
 	if (Contenders.Num() == 0)
@@ -5840,8 +5870,11 @@ void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 	// one call to the steering - and it stays true: the change is that the single target is now DECIDED
 	// by distance and held steady, rather than being whichever eligible player the roster reached last
 	// with the smallest number.
+	// THE WINNER'S OWN RADIUS, not the global knob — see the per-candidate note in the loop above.
+	// SteerTowardCatchPoint normalises the distance by this value, so passing the base radius while
+	// Mace caught at 560 uu would hand it a ratio above 1 and steer as if the Core were escaping.
 	LooseVelocity = TraceModeBTuning::SteerTowardCatchPoint(
-		CoreLocation, LooseVelocity, BestPoint, BestSurfaceDistance, Radius, Curve, DeltaSeconds);
+		CoreLocation, LooseVelocity, BestPoint, BestSurfaceDistance, ContenderRadii[Winner], Curve, DeltaSeconds);
 
 	// Announced ONCE per catch, at Display, and only when the target changes. The catch zone is
 	// invisible by design, and an invisible mechanic with no log line is one nobody can tell is

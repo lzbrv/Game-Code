@@ -494,6 +494,16 @@ public:
 	 *
 	 * Trace.Trail.WallClip measures the real overhang off the placed components every frame
 	 * (FTraceClipSample::DrawnOutsideLethal), so this number is checked rather than trusted.
+	 *
+	 * v14 §1 MADE THIS A CONSERVATIVE BOUND RATHER THAN A TIGHT ONE, AND DELIBERATELY LEFT THE VALUE
+	 * ALONE. The joint overlap is now a 1uu seam instead of a full TrailRadius (see
+	 * BuildRibbonElements), so the corner term above no longer describes the geometry: the real reach
+	 * is TrailRadius + twice the spline's clamped slack ~= 31.4uu, and the worst single case is the
+	 * square column drawn over a pure fall's disc at TrailRadius * sqrt(2) ~= 31.8uu. Both are inside
+	 * the 36.3 this returns, so every consumer — above all the wall fitter, which clears room by it —
+	 * still clears at least what the drawing needs. Tightening it is a WALL-FITTING decision with its
+	 * own measurements to take, and this pass is not that pass; over-clearing is the safe direction
+	 * and it is left over-clearing on purpose.
 	 */
 	static double GetTraceDrawnHalfReach();
 
@@ -1430,9 +1440,18 @@ private:
 	 * ("a dash crossed the trace but did not kill, and here is why") possible at all.
 	 *
 	 * A single-point polyline is tested as a degenerate segment, so a two-point trace is lethal.
+	 *
+	 * SPEC v14 §1: THE TRACE'S OWN HALF WIDTH AND THE TRIPPER'S REACH ARE SEPARATE ARGUMENTS, where
+	 * they used to arrive pre-summed as one threshold. That is not tidying. A summed threshold says
+	 * only "within R + r of the polyline", which cannot express WHERE THE TRACE'S OWN SURFACE IS —
+	 * and so cannot have a flat end cap, which is exactly the invisible kill volume this section
+	 * exists to remove. With the two apart, the gap to the trace's solid is computed first (by the
+	 * one shared definition, SegmentGapToTraceVolume) and the tripper's body is applied to that gap.
+	 * Away from the two outer caps the answer is identical to the old arithmetic.
 	 */
 	bool SweepIntersectsTrace(const TArray<FVector>& Positions, const FVector& PreviousLocation,
-		const FVector& CurrentLocation, double HorizontalThreshold, double VerticalThreshold) const;
+		const FVector& CurrentLocation, double TraceRadius, double TraceHalfHeight,
+		double TripperRadius, double TripperHalfHeight) const;
 
 	/** Server: applies UTraceSettings::TrailLethality. Called only after the trip loops finish. */
 	void ApplyTrailTrip(ATraceCharacter* Holder, ATraceCharacter* Tripper);
@@ -1495,6 +1514,69 @@ private:
 
 	/** Spec v6 §2: the whole lethal set as ONE swept, curved rectangle. */
 	void RebuildRibbon(int32 LethalPointCount, float InvulnerableScale);
+
+public:
+	/**
+	 * ONE DRAWN ELEMENT, AS A SOLID, before anything to do with meshes, pivots, materials or pools.
+	 *
+	 * v14 §1. The geometry of the ribbon used to exist only as a side effect of pushing transforms
+	 * at pooled UStaticMeshComponents, so the only way to ask "what shape is on screen" was to have
+	 * a running world with a carrier in it — which is why the invariant could only ever be measured
+	 * by driving a pawn round a level for forty seconds, and why a fixture that could not reach a
+	 * wall silently stopped being a test. Splitting the solid out lets Trace.Trail.LethalDrawn ask
+	 * the question directly, deterministically, and in a millisecond.
+	 *
+	 * Size is FULL extents: X length along Rotation's forward, Y width, Z height.
+	 */
+	struct FTraceRibbonElement
+	{
+		FVector Centre = FVector::ZeroVector;
+		FRotator Rotation = FRotator::ZeroRotator;
+		FVector Size = FVector::ZeroVector;
+	};
+
+	/**
+	 * The ribbon's resample, written into caller-supplied arrays and with no component state involved.
+	 *
+	 * v14 §1: it exists so Trace.Trail.LethalDrawn can build THE REAL ribbon geometry off a fixture
+	 * polyline with no world, no pawn and no level loaded, and therefore measure the invariant
+	 * against the code that ships rather than against a second implementation of it. A harness with
+	 * its own copy of this maths would agree with the game right up to the moment one of them
+	 * changed, which is precisely the failure mode this section is here to close.
+	 */
+	static void ComputeRibbonSamples(const TArray<FVector>& Points, const TArray<float>& Births,
+		double Step, int32 MaxElements, TArray<FVector>& OutSamples, TArray<float>& OutBirths,
+		TArray<float>& OutSlack);
+
+	/**
+	 * The solids the ribbon is made of, for a given sample chain. THE function that decides what the
+	 * player is shown; PlaceRibbon does nothing but hand these to meshes.
+	 *
+	 * @param Radius            the LETHAL half width. The drawn half width is this times @p WidthScale.
+	 * @param Height            the LETHAL height.
+	 * @param bOverlapAtStart   only the owner-only predicted stub, which joins backwards into the
+	 *                          real ribbon rather than starting flush.
+	 */
+	static void BuildRibbonElements(const TArray<FVector>& Samples, const TArray<float>& SampleSlack,
+		double Radius, double Height, double WidthScale, bool bOverlapAtStart,
+		TArray<FTraceRibbonElement>& OutElements);
+
+	/** How far @p At lies outside every one of @p Elements, in uu. 0 = inside something drawn. */
+	static double DistanceOutsideRibbonElements(const TArray<FTraceRibbonElement>& Elements,
+		const FVector& At);
+
+private:
+	/** Scratch for PlaceRibbon, so a steady-state rebuild allocates nothing. */
+	TArray<FTraceRibbonElement> RibbonElements;
+
+	/**
+	 * How far each ribbon sample ended up from the polyline after the spline clamp, in uu.
+	 *
+	 * v14 §1: an element is drawn TrailRadius wide about the SAMPLE, so a sample that sits off the
+	 * line leaves lethal ground beyond the element's far edge with nothing drawn on it. The deviation
+	 * is recorded where it is created and spent where it matters — see BuildRibbonElements.
+	 */
+	TArray<float> RibbonSampleSlack;
 
 	/**
 	 * Places the elements of RibbonSamples into @p Pieces. Shared by the replicated ribbon and by the

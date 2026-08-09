@@ -16,6 +16,38 @@
 // comment on UTraceHealthSettings and on TickComponent() before touching either half; the
 // "immediately" in that sentence is a same-FRAME guarantee and it is enforced in two independent
 // ways rather than one.
+//
+// ===================================================================================================
+// VULNERABLE (spec v14 §6, X's passive) — AND WHY IT LIVES HERE AND NOWHERE ELSE
+// ===================================================================================================
+//
+// Verbatim: "An enemy hit by a bee becomes VULNERABLE for 2s, taking +25% damage FROM ALL SOURCES."
+//
+// "From all sources" is the whole requirement, so the mark is stored on the thing every source
+// already funnels through: this component. Bullets (UTraceWeaponComponent::ServerFire), the knife
+// (ServerSwing), ability damage (UTraceAbilityComponent::ApplyAbilityDamage), Oyster's poison ticks
+// and Pickler's area damage ALL end at UTraceHealthComponent::ApplyDamage. One multiplication there
+// is the whole feature; five call sites each remembering to multiply is how one of them forgets.
+//
+// *** IT IS NOT ON UTraceCharacterAbilitySet::GetIncomingDamageMultiplier(), AND THAT IS FORCED. ***
+// That hook is only consulted when the TARGET has an ability set — i.e. when the target has picked a
+// character. Bots are characterless by spec §3 and have no set at all, so a bee that stung a bot
+// would mark nothing. The victim of a mark is not necessarily a character; the victim of a mark is
+// always a health component. UTraceAbilitySetX therefore deliberately does NOT override that hook,
+// which is also what keeps the amplification from being applied twice on the ability damage path
+// (UTraceAbilityComponent::ModifyDamageThroughPassives runs the hook, then calls ApplyDamage here).
+//
+// *** SPEC §4: THE MARK MUST NEVER BECOME A PATH TO DAMAGING A CORE CARRIER. ***
+// Two independent locks, either one sufficient:
+//   1. Applying the mark is an ETraceAbilityEffect::Control effect and goes through the ability
+//      framework's choke point, which refuses a carrier. ApplyVulnerable() ALSO refuses a carrier by
+//      itself, so a future caller that forgets the choke point still cannot mark one.
+//   2. GetVulnerableDamageMultiplier() returns 1.0 for a Core holder, unconditionally — including
+//      inside the mode-A hover-pass window where the carrier is deliberately shootable. The
+//      amplification is evaluated STRICTLY AFTER ApplyDamage()'s IsInvulnerable() early-out, so a
+//      carrier's zero is produced by the carrier rule and not by an amplifier that multiplied zero.
+// TraceVulnerable::GetCarrierAmplifiedCount() and GetCarrierMarkedCount() are the alarms for those
+// two locks; both are zero for the life of a correct process, and Trace.X.CarrierTest reads them.
 
 #pragma once
 
@@ -115,6 +147,51 @@ namespace TraceHealthRegen
 }
 
 /**
+ * THE ALARMS FOR X's VULNERABLE MARK (spec v14 §6, guarded by spec v14 §4).
+ *
+ * Twins of TraceAbility::GetCarrierAbilityDamageHitCount and TraceMelee::GetCarrierKnifeHitCount:
+ * counters that are zero for the whole life of a correct process, that log an Error on every
+ * increment, and that a harness reads so its verdict is a measurement rather than an assertion about
+ * code somebody has already read.
+ *
+ *   GetCarrierMarkedCount()     a Core carrier was handed the vulnerable mark. Must never happen.
+ *   GetCarrierAmplifiedCount()  the +25% multiplier was evaluated on damage aimed at a Core carrier.
+ *                               Must never happen — that is the ORDERING claim, and it is the one
+ *                               thing about "the multiplier is applied AFTER the carrier check" that
+ *                               is observable at all, because the carrier check is a `return` and
+ *                               therefore leaves no damage number behind to inspect.
+ *
+ * The two liveness counters are the other half of the evidence: a harness that only ever reads zeros
+ * cannot tell "the rule held" from "nothing happened".
+ *
+ *   GetAmplifiedHitCount()      how many hits the multiplier has actually amplified, ever.
+ *   GetMarkAppliedCount()       how many marks have actually landed, ever.
+ */
+namespace TraceVulnerable
+{
+	TRACE_API int32 GetCarrierMarkedCount();
+	TRACE_API int32 GetCarrierAmplifiedCount();
+	TRACE_API int32 GetAmplifiedHitCount();
+	TRACE_API int32 GetMarkAppliedCount();
+	TRACE_API void  ResetCounters();
+
+	/** The resolved multiplier a vulnerable target takes: 1 + UTraceSettings::XVulnerableDamageBonus. */
+	TRACE_API float GetDamageMultiplier();
+
+	/** The resolved mark duration in seconds: UTraceSettings::XVulnerableDurationSeconds. */
+	TRACE_API float GetDurationSeconds();
+
+	/** True when the whole mechanic is armed (Trace.X.Vulnerable). 0 is the RED arm. */
+	TRACE_API bool  IsEnabled();
+
+	/** True when the amplifier is evaluated in the SHIPPED position, after the carrier early-out. */
+	TRACE_API bool  IsApplyOrderShipped();
+
+	/** True when the carrier locks are armed (Trace.X.VulnerableCarrierImmune). 0 is the RED arm. */
+	TRACE_API bool  IsCarrierImmune();
+}
+
+/**
  * Broadcast once, on the server, the moment health reaches zero.
  * ATraceCharacter binds this to route into HandleDeath(); anything else may listen too.
  */
@@ -176,10 +253,66 @@ public:
 	UPROPERTY(Replicated, VisibleAnywhere, Category = "Trace|Health")
 	float LastDamageServerTime = -1000.f;
 
+	/**
+	 * REPLICATED. Absolute server time (the same clock as LastDamageServerTime) at which X's
+	 * vulnerable mark expires. -1000 = never marked. Spec v14 §6: "vulnerable for 2 s… Does not
+	 * stack; a new application RESETS the timer" — a reset is a plain write of a later deadline,
+	 * which is exactly why this is a deadline and not a countdown.
+	 *
+	 * Replicated so every machine can draw the mark and so a client's own damage numbers and the
+	 * server's agree about who was marked when. One float that changes only when a bee connects.
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_Vulnerable, VisibleAnywhere, Category = "Trace|Health")
+	float VulnerableUntilServerTime = -1000.f;
+
 	UPROPERTY(BlueprintAssignable, Category = "Trace|Health")
 	FTraceOnDeath OnDeath;
 
 	bool IsAlive() const;
+
+	// =============================================================================================
+	// VULNERABLE (spec v14 §6). See the block comment at the top of this file.
+	// =============================================================================================
+
+	/**
+	 * SERVER ONLY. Marks this owner vulnerable for @p DurationSeconds. Returns true if it landed.
+	 *
+	 * REFUSES, and that is the point of it returning a bool:
+	 *   - off the server, or with the mechanic disarmed (Trace.X.Vulnerable 0);
+	 *   - a dead owner;
+	 *   - *** A CORE CARRIER. Spec §4. *** This is the second of the two locks; the first is that the
+	 *     caller asked UTraceAbilityComponent::CanAffectTarget(Target, Control) and was refused. Both
+	 *     exist because "the mark must not become a damage path" has to survive a future caller who
+	 *     forgets the choke point.
+	 *
+	 * NON-STACKING: the deadline is written, never accumulated, so a new application resets the 2 s
+	 * and never extends it past 2 s.
+	 *
+	 * @param Source  the controller credited with the mark. May be null; kept server-side only.
+	 */
+	bool ApplyVulnerable(float DurationSeconds, AController* Source);
+
+	/** SERVER ONLY. Removes the mark. Called on respawn and at half time. */
+	void ClearVulnerable();
+
+	/** True while the mark is live. Correct on clients — the deadline is replicated. */
+	bool IsVulnerable() const;
+
+	/** Seconds of mark left, 0 when not marked. Safe on clients. */
+	float GetVulnerableRemaining() const;
+
+	/**
+	 * THE ONE MULTIPLIER, and the reason this feature is not five call sites.
+	 *
+	 * 1 + UTraceSettings::XVulnerableDamageBonus (1.25 as shipped) while marked, otherwise 1.
+	 * *** ALWAYS 1 FOR A CORE HOLDER *** — unconditionally, including inside the hover-pass window
+	 * where a carrier is deliberately shootable, so the amplifier can never contribute a single point
+	 * of damage to a carrier under any circumstance.
+	 */
+	float GetVulnerableDamageMultiplier() const;
+
+	UFUNCTION()
+	void OnRep_Vulnerable();
 
 	/**
 	 * True when health is climbing RIGHT NOW. Safe and correct on clients — see LastDamageServerTime.
@@ -265,6 +398,25 @@ private:
 	void BroadcastDeath(AController* Instigator, FName Cause);
 
 	/**
+	 * Applies GetVulnerableDamageMultiplier() to @p Amount and keeps the alarms.
+	 *
+	 * Separated from ApplyDamage() so that the RED ARM (Trace.X.VulnerableApplyOrder 0) can call it
+	 * from the wrong side of the carrier early-out and the harness can see the difference. On the
+	 * shipped arm it is called from exactly one place, immediately after IsInvulnerable() has had
+	 * its say.
+	 */
+	float AmplifyForVulnerable(float Amount) const;
+
+	/** The controller credited with the live mark. Server-side only; never replicated. */
+	TWeakObjectPtr<AController> VulnerableSource;
+
+	/** The purely cosmetic marker actor, spawned locally on every non-dedicated machine. */
+	TWeakObjectPtr<AActor> VulnerableMarker;
+
+	/** Spawns / destroys VulnerableMarker to match IsVulnerable(). Cosmetic, never authoritative. */
+	void UpdateVulnerableMarker();
+
+	/**
 	 * Latches once OnDeath has fired. Damage arriving in the same frame as a lethal hit (two
 	 * bullets in flight, or a bullet landing on the same tick as a trail trip) must not produce a
 	 * second death — the GameMode would count two deaths and schedule two respawns.
@@ -301,4 +453,44 @@ public:
 
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Health")
 	TObjectPtr<UTraceHealthComponent> Health;
+};
+
+/**
+ * The purely cosmetic "this player is VULNERABLE" marker (spec v14 §6).
+ *
+ * A small emissive ring above a marked player's head. It exists so that the mark is a thing a player
+ * can SEE — a +25% amplifier nobody can perceive is a balance change disguised as a mechanic — and so
+ * that a screenshot can show the feature working rather than a log line claiming it.
+ *
+ * *** LOCAL, NEVER REPLICATED, NEVER AUTHORITATIVE. *** Each machine spawns its own from the
+ * replicated VulnerableUntilServerTime, exactly the way the Core's beacon is driven. It has no
+ * collision, is not a ATraceCharacter and can never eat a bullet, and it lives in this header rather
+ * than in the Abilities folder so that the health component — which is where the mark lives — does
+ * not acquire a dependency on any one character's files.
+ *
+ * It is declared here alongside ATraceHealthRegenFixture for the same reason that one is: it is a
+ * helper actor with exactly one owner and no independent existence.
+ */
+UCLASS(NotPlaceable, Transient)
+class TRACE_API ATraceVulnerableMarker : public AActor
+{
+	GENERATED_BODY()
+
+public:
+	ATraceVulnerableMarker();
+
+	virtual void Tick(float DeltaSeconds) override;
+
+	/** The health component whose mark this is drawing. Cleared -> the marker destroys itself. */
+	TWeakObjectPtr<UTraceHealthComponent> Watching;
+
+	UPROPERTY(VisibleAnywhere, Category = "Trace|Health")
+	TObjectPtr<class UStaticMeshComponent> Ring;
+
+private:
+	UPROPERTY(Transient)
+	TObjectPtr<class UMaterialInstanceDynamic> RingMID;
+
+	UPROPERTY(Transient)
+	TObjectPtr<class UMaterialInterface> BaseMaterial;
 };

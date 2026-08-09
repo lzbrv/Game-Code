@@ -57,6 +57,18 @@ namespace
 	 */
 	FKey Default_EquipKnife()  { return EKeys::One; }
 	FKey Default_EquipGun()    { return EKeys::Two; }
+	/**
+	 * SPEC v14 §5. E and V are NAMED BY THE DOC, so unlike SwapWeapon there is no key to choose here
+	 * — only a collision to check. Taken already: WASD, Space, LeftCtrl, LeftShift, Q, mouse1,
+	 * mouse2, Tab, F, 1, 2. Neither E nor V is claimed by any row above, so neither default steals a
+	 * key on a first run (SetKey's stealing rule would log it if it did).
+	 *
+	 * Historical note worth keeping: E was the pre-v3 BOOST key. That action is gone and its ConfigId
+	 * ("Boost") is not this one, so an old TraceUserSettings.ini's `Boost=E` line is dropped by
+	 * RefreshFromConfig exactly as it is for Parry — nobody inherits an ability bound by accident.
+	 */
+	FKey Default_Ability()          { return EKeys::E; }
+	FKey Default_AbilitySecondary() { return EKeys::V; }
 }
 
 const TArray<FTraceInputActionInfo>& TraceInputActions::All()
@@ -82,9 +94,15 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// must appear in the settings rebind list" is satisfied by these lines and by nothing else.
 		{ ETraceInputAction::EquipKnife,  TEXT("EquipKnife"),  TEXT("EQUIP KNIFE"),  &Default_EquipKnife  },
 		{ ETraceInputAction::EquipGun,    TEXT("EquipGun"),    TEXT("EQUIP GUN"),    &Default_EquipGun    },
+		// SPEC v14 §5. Same reasoning as the two rows above: the rebind list IS this table, so an
+		// ability the player cannot see here is an ability they cannot rebind however well it is
+		// wired in the controller. The ConfigIds are the two strings ATraceHUD and
+		// UTraceAbilityInputRelay already search for by name — do not rename them.
+		{ ETraceInputAction::Ability,          TEXT("Ability"),          TEXT("ABILITY"),           &Default_Ability          },
+		{ ETraceInputAction::AbilitySecondary, TEXT("AbilitySecondary"), TEXT("ABILITY (SECONDARY)"), &Default_AbilitySecondary },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 14,
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 16,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 

@@ -14,6 +14,8 @@
 
 #include "Movement/TraceCharacterMovementComponent.h"
 
+#include "Abilities/TraceAbilityComponent.h"    // spec v14 §6: the speed passives and the dash hooks
+#include "Abilities/TraceAbilityTypes.h"        // spec v14 §6: TraceAbilityDebuff — Oyster's poison slow
 #include "Components/CapsuleComponent.h"        // mantle: capsule dimensions and the clearance sweep
 #include "Components/SceneComponent.h"
 #include "CollisionQueryParams.h"
@@ -1916,6 +1918,28 @@ void UTraceCharacterMovementComponent::BeginDash()
 		SetMovementMode(MOVE_Falling);
 	}
 
+	// SPEC v14 §6 — the ability layer's dash hook (Oyster's jar at the start of every dash, Chut's
+	// bash window).
+	//
+	// NOT ON A REPLAYED MOVE. bClientUpdating is true while a correction re-runs frames that already
+	// happened; without this guard one dash would drop a jar for every frame the server rewound. The
+	// hook is called on the authority AND on the owning client, because both halves of an ability
+	// that writes velocity have to see the same event — the ability's own code decides which machine
+	// acts (Oyster's jar is authority-only, and says so).
+	//
+	// Both character hooks are latched against a duplicate anyway: Oyster's TickAbilities polls
+	// IsDashing() as a backstop and shares bDashJarSpawnedThisDash with OnDashStarted, and Chut's
+	// TryBash is idempotent against its own poll. That is belt and braces on purpose — this project
+	// has shipped a "wired" hook that fired twice.
+	if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating && TraceAbilityIntegration::IsEnabled())
+	{
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(CharacterOwner))
+		{
+			++TraceAbilityIntegration::Counters().DashStarted;
+			Abilities->NotifyDashStarted(DashDirection);
+		}
+	}
+
 #if !UE_BUILD_SHIPPING
 	if (IsDashDebugEnabled())
 	{
@@ -2965,6 +2989,22 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 				GetDashExitVerticalSpeedLimit(), static_cast<int32>(MovementMode.GetValue()));
 		}
 #endif
+
+		// SPEC v14 §6. The closing edge, on the same terms as the opening one in BeginDash().
+		//
+		// bReachedFullDistance is reported as TRUE because this branch is the dash CLOCK running out,
+		// which is the only way a dash ends in this component — there is no early cancel. If one is
+		// ever added, it must pass false here, and Oyster's OnDashEnded (which clears the "a jar has
+		// been dropped for this dash" latch) must still be called on that path or his next dash
+		// silently drops no jar.
+		if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating && TraceAbilityIntegration::IsEnabled())
+		{
+			if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(CharacterOwner))
+			{
+				++TraceAbilityIntegration::Counters().DashEnded;
+				Abilities->NotifyDashEnded(/*bReachedFullDistance=*/true);
+			}
+		}
 	}
 
 	// 1e. A slide whose duration has just run out exits through EndSlide() like every other slide
@@ -3149,6 +3189,64 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 	}
 
+	// 4b. SPEC v14 §6 — THE PER-FRAME DASH CONTACT SWEEP. The last unwired ability hook.
+	//
+	//     Chut's bash was driven only by his own 20 Hz poll on the ability component's tick. A dash
+	//     covers 150 uu between two of those samples and the bash reach is 130 uu, so a victim could
+	//     be passed clean through between samples; his poll closes that with a swept segment, which
+	//     is a correct approximation of a sweep the mover was in a position to do exactly. This is
+	//     that exact sweep, once per movement frame, on the frames it can matter.
+	//
+	//     CHARACTER-AGNOSTIC BY CONSTRUCTION. This block knows a radius and nothing else — no
+	//     character, no knob, no rule. GetDashHitSweepRadiusFor() returns 0 for every Mannequin,
+	//     every bot and four of the five characters, and 0 skips the whole block, so the cost for
+	//     everyone who is not Chut is one virtual call per dash frame. What to DO with a contact
+	//     (the end-of-dash window, the reach, the §4 choke point, one-bash-per-victim) stays in the
+	//     character's OnDashHitCharacter and is not duplicated here.
+	//
+	//     AUTHORITY ONLY, and not on a replayed move: a knockback is server truth, and a correction
+	//     replaying five frames must not deliver five contacts. The character's apply path is
+	//     idempotent per victim per dash anyway — belt and braces, deliberately, because this
+	//     project has shipped a "wired" hook that fired twice.
+	if (DashTimeRemaining > 0.f && CharacterOwner != nullptr && CharacterOwner->HasAuthority()
+		&& !CharacterOwner->bClientUpdating && TraceAbilityIntegration::IsEnabled())
+	{
+		const float SweepRadius = UTraceAbilityComponent::GetDashHitSweepRadiusFor(CharacterOwner);
+		if (SweepRadius > 0.f)
+		{
+			UTraceAbilityComponent* DashAbilities = UTraceAbilityComponent::Get(CharacterOwner);
+			UWorld* SweepWorld = GetWorld();
+			if (DashAbilities != nullptr && SweepWorld != nullptr)
+			{
+				// Progress is measured the same way the ability layer's poll measures it, so the
+				// two drivers cannot disagree about whether a contact was inside the end window.
+				const float Duration = FMath::Max(0.01f, GetDashDuration());
+				const float Progress = FMath::Clamp(1.f - (DashTimeRemaining / Duration), 0.f, 1.f);
+
+				const FVector MyLocation = CharacterOwner->GetActorLocation();
+				const float RadiusSq = SweepRadius * SweepRadius;
+
+				// A distance test over the handful of pawns in the arena rather than a collision
+				// query: it needs no channel, no response setup and no profile, which are three
+				// things a query could be silently misconfigured by. TryBash re-tests the gap
+				// itself, so a generous candidate list cannot widen the ability.
+				for (TActorIterator<ATraceCharacter> It(SweepWorld); It; ++It)
+				{
+					ATraceCharacter* Candidate = *It;
+					if (Candidate == nullptr || Candidate == CharacterOwner || !IsValid(Candidate))
+					{
+						continue;
+					}
+					if (FVector::DistSquared(MyLocation, Candidate->GetActorLocation()) <= RadiusSq)
+					{
+						++TraceAbilityIntegration::Counters().DashHits;
+						DashAbilities->NotifyDashHitCharacter(Candidate, Progress);
+					}
+				}
+			}
+		}
+	}
+
 	// 5. Consume the one-shot intent and remember the held one for the next move's edge test. On
 	//    the server the intents are re-supplied by the next ServerMove's flags, on the client by the
 	//    next StartDash(), and during replay by UpdateFromCompressedFlags — so one key press can
@@ -3266,6 +3364,42 @@ float UTraceCharacterMovementComponent::GetMaxSpeed() const
 	if (bKnifeMovementProfile)
 	{
 		Speed *= GetKnifeMoveSpeedMultiplier();
+	}
+
+	// =============================================================================================
+	// SPEC v14 §6 — THE ABILITY SPEED PASSIVES. Rocco's headshot-kill stack, X's +10% while an enemy
+	// is vulnerable, and any external debuff another player's ability has put on this pawn.
+	// =============================================================================================
+	//
+	// GROUND ONLY, and that is a decision rather than an oversight. The air ceilings in this project
+	// are the momentum model (soft cap, hard cap, falloff) and are not expressed through
+	// GetMaxSpeed(); scaling this value while airborne would change nothing for a strafing player
+	// and everything for a walking one on the single frame they touch down. A dash is unaffected in
+	// every case — the IsDashing() branch at the top of this function returns before any of this.
+	//
+	// TWO SEPARATE MULTIPLIERS, on purpose:
+	//
+	//   GetMoveSpeedMultiplierFor  asks the pawn's OWN character about its own passive. It is the
+	//                              right question for a buff and the WRONG one for a debuff — spec
+	//                              §3 makes bots characterless, and a poisoned bot has no ability set
+	//                              to ask, so a debuff routed through that hook would silently not
+	//                              apply to more than half the pawns in a bot match.
+	//   TraceAbilityDebuff::       asks what OTHER players' abilities have done TO this pawn. One
+	//   GetMoveSpeedMultiplier     aggregator, and every provider is a line inside it.
+	//
+	// Both are 1.0 for a Mannequin, so this costs a PlayerState lookup and a component scan on a
+	// path that already does one for the carrier test.
+	if (IsMovingOnGround() && TraceAbilityIntegration::IsEnabled())
+	{
+		const float AbilityScale =
+			UTraceAbilityComponent::GetMoveSpeedMultiplierFor(CharacterOwner)
+			* TraceAbilityDebuff::GetMoveSpeedMultiplier(CharacterOwner);
+
+		if (!FMath::IsNearlyEqual(AbilityScale, 1.f))
+		{
+			Speed *= AbilityScale;
+			++TraceAbilityIntegration::Counters().SpeedMultiplierApplied;
+		}
 	}
 
 	// A slide is faster than a walk, and CalcVelocity clamps to this value during the physics step

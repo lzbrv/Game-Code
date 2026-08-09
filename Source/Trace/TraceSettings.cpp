@@ -805,6 +805,62 @@ namespace
 		}
 
 		// -----------------------------------------------------------------------------------------
+		// SPEC v14. Three lines, and each one exists because the number it prints CANNOT be trusted
+		// from the header.
+		//
+		// LINE 1 IS THE MODE, AND IT IS THE MOST IMPORTANT LINE IN THIS DUMP THIS PASS. §2 is "change
+		// game mode b to the default game mode", and the default lives in three layered places (this
+		// header, DefaultGame.ini which outranks it, and a travel-URL override which outranks both).
+		// The only honest answer is the CDO's value, which is what this prints. It also prints
+		// whether characters are consequently ON, because §2 freezes mode A with no characters at
+		// all — so "mode=A" and "charactersEnabled=True" together still means nobody has a character,
+		// and reading only the toggle would be reading the wrong half.
+		//
+		// LINE 2 IS THE TWO DERIVED NUMBERS §6 explicitly says to derive rather than hardcode. Mace's
+		// magnet is a fraction of CoreCatchRadius and her spike pull is a multiple of the air-strafe
+		// hard cap; both PRODUCTS are printed beside their bases, because the product is the number
+		// the game is played at and it appears nowhere else. 585 on this line is correct; 450 or
+		// 760.5 would be the two bugs (base not applied, or applied twice).
+		//
+		// LINE 3 IS THE COOLDOWN LADDER, because §6 gives 20s four times and 25s once, and "X is on
+		// 20 like everyone else" is exactly the kind of thing that ships unnoticed.
+		{
+			const float MaceMagnetRadius = Table.CoreCatchRadius * (1.f + Table.MaceMagnetRadiusBonus);
+			const float MomentumCeiling  = Table.AirStrafeHardCapSpeed * Table.AirStrafeAsymptoteScale;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsDump:%s] SPECv14 §2 mode: ScoringMode=%s (v14 wants B) | §3 charactersEnabled=%d "
+				     "(and mode A forces everyone characterless regardless) | §4 carrierControlImmune=%d [ASSUMPTION]"),
+				Tag,
+				(Table.ScoringMode == ETraceScoringMode::ThrownCoreAndGoals) ? TEXT("B-ThrownCoreAndGoals") : TEXT("A-EndzoneStatusCore"),
+				Table.bCharactersEnabled ? 1 : 0,
+				Table.bCarrierImmuneToAbilityControl ? 1 : 0);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsDump:%s] SPECv14 §6 derived (base x bonus = PLAYED): Mace magnet %.0f x (1 + %.3f) = %.0fuu "
+				     "(§6 says 585) | Mace spike pull = airHardCap %.0f x %.3f x %.3f = %.0f uu/s | "
+				     "Rocco ripple dash = DashSpeed %.0f x %.3f = %.0f uu/s for %.3fs x %.3f"),
+				Tag, Table.CoreCatchRadius, Table.MaceMagnetRadiusBonus, MaceMagnetRadius,
+				Table.AirStrafeHardCapSpeed, Table.AirStrafeAsymptoteScale, Table.MaceSpikePullSpeedMultiplier,
+				MomentumCeiling * Table.MaceSpikePullSpeedMultiplier,
+				Table.DashSpeed, Table.RoccoRippleDashSpeedMultiplier, Table.DashSpeed * Table.RoccoRippleDashSpeedMultiplier,
+				Table.DashDuration, Table.RoccoRippleDashDurationMultiplier);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsDump:%s] SPECv14 §6 cooldowns (s): default=%.1f | Rocco ripple=%.1f Chut chud=%.1f "
+				     "Mace spike=%.1f [ASSUMPTION] Oyster pickler=%.1f [ASSUMPTION] X sting=%.1f (the only 25) | "
+				     "Rocco stack %.0f%% x%d for %.2fs | Chud -%.0f%% for %.1fs | poison %.0f/%.2fs for %.1fs, slow %.0f%%"),
+				Tag, Table.AbilityDefaultCooldownSeconds,
+				Table.RoccoRippleCooldownSeconds, Table.ChudCooldownSeconds, Table.MaceSpikeCooldownSeconds,
+				Table.OysterPicklerCooldownSeconds, Table.XStingCooldownSeconds,
+				Table.RoccoHeadshotSpeedBonusPerStack * 100.f, Table.RoccoHeadshotSpeedStackMax,
+				Table.RoccoHeadshotSpeedDurationSeconds,
+				Table.ChudDamageReduction * 100.f, Table.ChudDurationSeconds,
+				Table.OysterPoisonDamagePerTick, Table.OysterPoisonTickIntervalSeconds,
+				Table.OysterPoisonDurationSeconds, Table.OysterPoisonSlowFraction * 100.f);
+		}
+
+		// -----------------------------------------------------------------------------------------
 		// SPEC v13 §4 — WHICH LEVEL DOES THE GAME OPEN. Verbatim: "The game should default to opening
 		// the main menu level."
 		//
@@ -977,7 +1033,12 @@ namespace
 	// UENUM declared without an explicit underlying type still lands as the latter, and a knob that
 	// reported DEAD purely because of which of the two UHT chose would be a false alarm in the one
 	// tool whose job is to have no false alarms.
-	enum class EKnobType : uint8 { Float, Bool, Int, Enum };
+	// Struct was added by spec v14: Rocco's two ripple-ring COLOURS are FLinearColor properties, and
+	// a colour a designer can move is a knob like any other. Without this case they would have had
+	// to be left out of the table — i.e. the two knobs most likely to be typo'd in an ini
+	// (Color/Colour, and a struct literal the parser can silently reject) would have been the two
+	// nothing checked.
+	enum class EKnobType : uint8 { Float, Bool, Int, Enum, Struct };
 
 	struct FKnobSpec
 	{
@@ -1332,6 +1393,100 @@ namespace
 			{ TEXT("BotEngageRangeUU"),          EKnobType::Float, TEXT("v10 §1: bots must use it to playtest it"),    TEXT("/Script/Trace.TraceMeleeSettings") },
 			{ TEXT("BotDisengageRangeUU"),       EKnobType::Float, TEXT("v10 §1: > engage, or a bot swaps every frame"), TEXT("/Script/Trace.TraceMeleeSettings") },
 			{ TEXT("BotSwingRangeFraction"),     EKnobType::Float, TEXT("v10 §1: swing inside its reach, not at the edge"), TEXT("/Script/Trace.TraceMeleeSettings") },
+
+			// =========================================================================================
+			// SPEC v14 §§2, 4, 5, 6 — THE ABILITY FRAMEWORK AND ALL FIVE CHARACTERS
+			//
+			// Every ability constant from every character in §6 is a row here, and that is a
+			// requirement of the pass rather than diligence: five character agents are about to read
+			// these values BY NAME out of UTraceSettings, and a misspelled property is a silent no-op
+			// that their code cannot detect. This table is the only thing that turns that into a
+			// visible failure before anybody plays a match.
+			//
+			// The ONE knob on this list that touches the carrier invariant is
+			// bCarrierImmuneToAbilityControl, and it is the §4 [ASSUMPTION] about slows/pulls only.
+			// There is deliberately NO knob for "abilities may damage carriers".
+			// =========================================================================================
+
+			// --- v14 §2: which mode a fresh install plays -------------------------------------------
+			{ TEXT("ScoringMode"),                     EKnobType::Enum,  TEXT("v14 §2: MUST read ThrownCoreAndGoals — mode B is the default now") },
+
+			// --- v14 §§3-5: the framework ------------------------------------------------------------
+			{ TEXT("bCharactersEnabled"),              EKnobType::Bool,  TEXT("v14 §3: the 'turn off all characters' toggle") },
+			{ TEXT("bCarrierImmuneToAbilityControl"),  EKnobType::Bool,  TEXT("v14 §4 ASSUMPTION: carriers also immune to slows/pulls/knockbacks. Damage immunity has NO knob") },
+			{ TEXT("AbilityDefaultCooldownSeconds"),   EKnobType::Float, TEXT("v14 §5: 20s, the cooldown a character gets if it names none") },
+			{ TEXT("CharacterSelectTimeoutSeconds"),   EKnobType::Float, TEXT("v14 §3 ASSUMPTION: auto-assign so one idle player cannot stall the match") },
+
+			// --- v14 §6: Rocco ------------------------------------------------------------------------
+			{ TEXT("RoccoHeadshotSpeedBonusPerStack"), EKnobType::Float, TEXT("v14 §6: 3% per headshot kill") },
+			{ TEXT("RoccoHeadshotSpeedStackMax"),      EKnobType::Int,   TEXT("v14 §6 ASSUMPTION: cap the stack (10 = +30%)") },
+			{ TEXT("RoccoHeadshotSpeedDurationSeconds"), EKnobType::Float, TEXT("v14 §6: ONE 1s timer for the whole stack, refreshed per kill") },
+			{ TEXT("RoccoSecondJumpZVelocity"),        EKnobType::Float, TEXT("v14 §6: 'a very small second jump'") },
+			{ TEXT("RoccoSecondJumpRedirectFraction"), EKnobType::Float, TEXT("v14 §6: change direction midair, INSTANTLY (1 = instant)") },
+			{ TEXT("RoccoRippleLifetimeSeconds"),      EKnobType::Float, TEXT("v14 §6: 4s, then all effects and visuals vanish") },
+			{ TEXT("RoccoRippleCooldownSeconds"),      EKnobType::Float, TEXT("v14 §6: 20s, SEPARATE from the standard dash") },
+			{ TEXT("RoccoRippleDashSpeedMultiplier"),  EKnobType::Float, TEXT("v14 §6: derived from Movement|Dash DashSpeed") },
+			{ TEXT("RoccoRippleDashDurationMultiplier"), EKnobType::Float, TEXT("v14 §6: derived from DashDuration; sets the path length") },
+			{ TEXT("RoccoRippleRideSpeedMultiplier"),  EKnobType::Float, TEXT("v14 §6: riders are propelled along the path and MAY SHOOT") },
+			{ TEXT("RoccoRippleEntryRadiusUU"),        EKnobType::Float, TEXT("v14 §6: entry is at the START ring only") },
+			{ TEXT("RoccoRippleRingSpacingUU"),        EKnobType::Float, TEXT("v14 §6: 'a short series of rings along the path'") },
+			{ TEXT("RoccoRippleRingRadiusUU"),         EKnobType::Float, TEXT("v14 §6: ring size") },
+			{ TEXT("RoccoRippleStartRingColor"),       EKnobType::Struct,TEXT("v14 §6: 'the starting ring in a different colour'") },
+			{ TEXT("RoccoRippleTrailRingColor"),       EKnobType::Struct,TEXT("v14 §6: every ring after the first") },
+
+			// --- v14 §6: Chut -------------------------------------------------------------------------
+			{ TEXT("ChutKnifeFrontDamage"),            EKnobType::Float, TEXT("v14 §6: 50 from the front vs the standard 30") },
+			{ TEXT("ChutKnifeBackDamage"),             EKnobType::Float, TEXT("v14 §6 ASSUMPTION: back damage stays 100") },
+			{ TEXT("ChutBashKnockbackSpeed"),          EKnobType::Float, TEXT("v14 §6: bash — NO EFFECT ON THE CORE CARRIER (Control class)") },
+			{ TEXT("ChutBashUpBias"),                  EKnobType::Float, TEXT("v14 §6: vertical component of the bash") },
+			{ TEXT("ChutBashEndFraction"),             EKnobType::Float, TEXT("v14 §6: the END of his standard dash, not the whole dash") },
+			{ TEXT("ChutBashRadiusUU"),                EKnobType::Float, TEXT("v14 §6: bash reach") },
+			{ TEXT("ChudDamageReduction"),             EKnobType::Float, TEXT("v14 §6: 30% less from body shots and melees") },
+			{ TEXT("ChudDurationSeconds"),             EKnobType::Float, TEXT("v14 §6: 10s, does not stack") },
+			{ TEXT("ChudCooldownSeconds"),             EKnobType::Float, TEXT("v14 §6: 20s") },
+			{ TEXT("bChudRefreshesOnKnifeKill"),       EKnobType::Bool,  TEXT("v14 §6: 'the timer refreshes on a knife kill'") },
+
+			// --- v14 §6: Mace -------------------------------------------------------------------------
+			{ TEXT("MaceMagnetRadiusBonus"),           EKnobType::Float, TEXT("v14 §6: +30% of CoreCatchRadius (450 -> 585). DERIVED, not hardcoded") },
+			{ TEXT("MaceSuspendMaxSeconds"),           EKnobType::Float, TEXT("v14 §6: hold V in the air, up to 1.25s") },
+			{ TEXT("MaceSuspendLateralSpeedCap"),      EKnobType::Float, TEXT("v14 §6: lateral movement capped at 550 uu/s while suspended") },
+			{ TEXT("MaceSuspendCooldownSeconds"),      EKnobType::Float, TEXT("v14 §6: UNSPECIFIED; shipped at 0") },
+			{ TEXT("MaceSpikeRangeUU"),                EKnobType::Float, TEXT("v14 §6: 'a medium distance'") },
+			{ TEXT("MaceSpikeTravelSpeed"),            EKnobType::Float, TEXT("v14 §6: how fast the spike reaches its wall") },
+			{ TEXT("MaceSpikeEmbedSeconds"),           EKnobType::Float, TEXT("v14 §6: embeds in a WALL for 2s") },
+			{ TEXT("MaceSpikePullSpeedMultiplier"),    EKnobType::Float, TEXT("v14 §6: pull at the momentum ceiling = air-strafe hard cap. DERIVED") },
+			{ TEXT("MaceSpikeArriveRadiusUU"),         EKnobType::Float, TEXT("v14 §6: how close ends the pull") },
+			{ TEXT("MaceSpikeCooldownSeconds"),        EKnobType::Float, TEXT("v14 §6 ASSUMPTION: 20s, unspecified in the doc") },
+
+			// --- v14 §6: Oyster -----------------------------------------------------------------------
+			{ TEXT("OysterJarLifetimeSeconds"),        EKnobType::Float, TEXT("v14 §6: jars last 4s on the ground") },
+			{ TEXT("OysterMaxJars"),                   EKnobType::Int,   TEXT("v14 §6: max 3; a fourth despawns the oldest") },
+			{ TEXT("OysterJarBreakRadiusUU"),          EKnobType::Float, TEXT("v14 §6: an enemy TOUCHING a jar breaks it") },
+			{ TEXT("OysterPoisonDamagePerTick"),       EKnobType::Float, TEXT("v14 §6: 3 damage — §4 names this as a carrier risk") },
+			{ TEXT("OysterPoisonTickIntervalSeconds"), EKnobType::Float, TEXT("v14 §6: every 0.5s") },
+			{ TEXT("OysterPoisonDurationSeconds"),     EKnobType::Float, TEXT("v14 §6: for 4s") },
+			{ TEXT("OysterPoisonSlowFraction"),        EKnobType::Float, TEXT("v14 §6: -30% speed. CONTROL — refused on a carrier per the §4 assumption") },
+			{ TEXT("OysterPoisonRadiusUU"),            EKnobType::Float, TEXT("v14 §6: 'poisoning nearby enemies'") },
+			{ TEXT("OysterJarJumpZVelocity"),          EKnobType::Float, TEXT("v14 §6: jumping on his own jar breaks it and boosts him") },
+			{ TEXT("OysterJarJumpRadiusUU"),           EKnobType::Float, TEXT("v14 §6: how close counts as stood on it") },
+			{ TEXT("OysterPicklerDamage"),             EKnobType::Float, TEXT("v14 §6: 30 in an area — §4 names this as a carrier risk") },
+			{ TEXT("OysterPicklerDamageRadiusUU"),     EKnobType::Float, TEXT("v14 §6: the area the 30 covers") },
+			{ TEXT("OysterPicklerPullRadiusUU"),       EKnobType::Float, TEXT("v14 §6: 'a small radius'. CONTROL") },
+			{ TEXT("OysterPicklerPullSpeed"),          EKnobType::Float, TEXT("v14 §6: pulls enemies toward it. CONTROL") },
+			{ TEXT("OysterPicklerThrowSpeed"),         EKnobType::Float, TEXT("v14 §6: it is LOBBED, and it does NOT explode — it persists as a jar") },
+			{ TEXT("OysterPicklerThrowUpBias"),        EKnobType::Float, TEXT("v14 §6: the arc on the lob") },
+			{ TEXT("OysterPicklerCooldownSeconds"),    EKnobType::Float, TEXT("v14 §6 ASSUMPTION: 20s, unspecified in the doc") },
+
+			// --- v14 §6: X ----------------------------------------------------------------------------
+			{ TEXT("XBeeCount"),                       EKnobType::Int,   TEXT("v14 §6: five mechanical bees") },
+			{ TEXT("XBeeOrbitRadiusUU"),               EKnobType::Float, TEXT("v14 §6 ASSUMPTION: bees hit on contact; X's body is the delivery") },
+			{ TEXT("XBeeOrbitSpeedDegPerSecond"),      EKnobType::Float, TEXT("v14 §6: orbit rate") },
+			{ TEXT("XBeeHitRadiusUU"),                 EKnobType::Float, TEXT("v14 §6: a bee's own touch radius") },
+			{ TEXT("XVulnerableDurationSeconds"),      EKnobType::Float, TEXT("v14 §6: 2s; does not stack, a new application RESETS it") },
+			{ TEXT("XVulnerableDamageBonus"),          EKnobType::Float, TEXT("v14 §6: +25% from all sources") },
+			{ TEXT("XVulnerableSpeedBonus"),           EKnobType::Float, TEXT("v14 §6: +10% while ANY enemy is vulnerable") },
+			{ TEXT("XStingCooldownSeconds"),           EKnobType::Float, TEXT("v14 §6: 25s — the one that is not 20") },
+			{ TEXT("XStingBulletCount"),               EKnobType::Int,   TEXT("v14 §6: the next five bullets. Keep equal to XBeeCount") },
 		};
 
 		const UTraceSettings& Table = UTraceSettings::Get();
@@ -1409,6 +1564,19 @@ namespace
 						// overwrite wholesale.
 						Value.Reset();
 						Found->ExportText_InContainer(0, Value, Container, Container, nullptr, PPF_None);
+					}
+					break;
+				case EKnobType::Struct:
+					// Same ExportText treatment as Enum, and for the same reason: what a struct knob
+					// round-trips through the ini is its TEXT form — "(R=1.000000,G=0.550000,...)" —
+					// so printing that form is what lets this line be compared against DefaultGame.ini
+					// directly. A colour that failed to parse comes back as the header default and
+					// looks perfectly healthy in a debugger.
+					if (const FStructProperty* AsStruct = CastField<FStructProperty>(Found))
+					{
+						bTypeOk = true;
+						Value.Reset();
+						AsStruct->ExportText_InContainer(0, Value, Container, Container, nullptr, PPF_None);
 					}
 					break;
 				}

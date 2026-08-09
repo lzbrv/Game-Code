@@ -1,0 +1,734 @@
+// Trace — the character select screen. See TraceCharacterSelect.h.
+
+#include "UI/TraceCharacterSelect.h"
+
+#include "Engine/Engine.h"
+#include "Engine/Font.h"
+#include "Engine/World.h"
+#include "GameFramework/GameStateBase.h"
+#include "GameFramework/HUD.h"
+#include "GameFramework/PlayerController.h"
+#include "HAL/IConsoleManager.h"
+#include "InputCoreTypes.h"
+
+#include "Core/TracePlayerState.h"
+#include "Trace.h"                      // LogTraceGame
+#include "TraceTypes.h"                 // TraceTeamColor / TraceTeamName
+
+#if !UE_BUILD_SHIPPING
+int32 GTraceCharacterSelectDebugPick = 0;
+#endif
+
+namespace TraceSelectStyle
+{
+	// The same neon instrument-panel palette the title screen and the options overlay use, so this
+	// screen reads as another page of one machine rather than as a dialog dropped on top of it.
+	static const FLinearColor Cyan   (0.16f, 0.88f, 1.00f, 1.00f);
+	static const FLinearColor Ink    (0.90f, 0.97f, 1.00f, 1.00f);
+	static const FLinearColor InkDim (0.42f, 0.58f, 0.66f, 1.00f);
+	static const FLinearColor Panel  (0.004f, 0.014f, 0.026f, 0.96f);
+	static const FLinearColor Danger (0.95f, 0.28f, 0.22f, 1.00f);
+	static const FLinearColor Good   (0.24f, 0.90f, 0.42f, 1.00f);
+
+	/**
+	 * Full-screen scrim. Opaque enough to read a card over, transparent enough to keep the arena.
+	 *
+	 * 0.94 rather than the 0.86 this shipped with for one frame: the first capture showed the
+	 * bottom-left ability stack (DASH / WEAPON / health) and the top-centre score panel reading
+	 * clearly THROUGH the overlay and colliding with this screen's own footer. A menu you can read a
+	 * health bar through is a menu that looks broken.
+	 */
+	static const FLinearColor Scrim  (0.00f, 0.005f, 0.02f, 0.94f);
+
+	static FLinearColor WithAlpha(const FLinearColor& C, float A)
+	{
+		return FLinearColor(C.R, C.G, C.B, A);
+	}
+
+	/** Everything below is authored against a 1080p-tall viewport, exactly like the HUD. */
+	static constexpr float ReferenceHeight = 1080.f;
+
+	/** How long a server verdict stays on screen. Long enough to read at a glance, short enough to go. */
+	static constexpr float MessageDuration = 3.5f;
+}
+
+namespace
+{
+	/** The five number keys, in roster order, so "press 3 for Mace" is literally true. */
+	const FKey& NumberKeyForIndex(int32 Index)
+	{
+		switch (Index)
+		{
+		case 0:  return EKeys::One;
+		case 1:  return EKeys::Two;
+		case 2:  return EKeys::Three;
+		case 3:  return EKeys::Four;
+		default: return EKeys::Five;
+		}
+	}
+
+	/** "TAKEN BY BOB" needs the holder's name; APlayerState::GetPlayerName is not const-safe to call blind. */
+	FString SafePlayerName(const ATracePlayerState* State)
+	{
+		return (State != nullptr) ? State->GetPlayerName() : FString(TEXT("A TEAM-MATE"));
+	}
+}
+
+// =============================================================================================
+// Lifecycle + input
+// =============================================================================================
+
+void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerState* LocalState,
+	float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed)
+{
+	if (HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
+	{
+		return;
+	}
+
+	ViewW = InViewW;
+	ViewH = InViewH;
+	UIScale = InUIScale;
+	Now = InNow;
+
+	if (GEngine != nullptr)
+	{
+		FontSmall  = GEngine->GetSmallFont();
+		FontMedium = GEngine->GetMediumFont();
+		FontLarge  = GEngine->GetLargeFont();
+	}
+
+	// THE ONLY CONDITION. Replicated from the server, so mode A, the settings toggle, bots and
+	// "already picked" are all answered upstream and none of them are re-derived here. See the
+	// header for why that matters.
+	const bool bShouldBeOpen = (LocalState != nullptr) && LocalState->IsCharacterSelectOpen();
+
+	if (bShouldBeOpen != bOpen)
+	{
+		bOpen = bShouldBeOpen;
+
+		if (bOpen)
+		{
+			HoveredCard = INDEX_NONE;
+			PendingRequest = TraceCharacterRoster::NoneId;
+
+			// FBox2D's default constructor leaves bIsValid UNINITIALISED, and PollInput runs before
+			// Draw on this very frame — so without this the first frame's hit test would read garbage
+			// and could report the pointer as being inside a card that has never been drawn. Cleared
+			// here rather than in a member initialiser so the array's size stays a single constant.
+			for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
+			{
+				CardRects[Index] = FBox2D(ForceInit);
+			}
+
+			// Swallow the remainder of this frame's input. Without it, the key that was being held
+			// when the screen appeared — most often a movement key during warm-up — lands on a card.
+			IgnoreInputBeforeFrame = GFrameCounter + 1;
+
+			// Start the highlight on the first character no team-mate is believed to hold, so the
+			// default action is a legal one rather than one that will be refused.
+			Highlighted = 0;
+			for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
+			{
+				const uint8 CandidateId = static_cast<uint8>(TraceCharacterRoster::FirstId + Index);
+				if (FindTeammateHolding(LocalState, CandidateId) == nullptr)
+				{
+					Highlighted = Index;
+					break;
+				}
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Screen opened (team %s, %.0fs to pick)."),
+				*TraceTeamName(LocalState->Team).ToString(), LocalState->GetCharacterSelectTimeRemaining());
+
+			if (OnOpened)
+			{
+				OnOpened();
+			}
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Screen closed."));
+			if (OnClosed)
+			{
+				OnClosed();
+			}
+		}
+	}
+
+	if (!bOpen)
+	{
+		return;
+	}
+
+	// A request that never came back must not lock the screen. Reliable RPCs do not get dropped, but
+	// a server that travelled mid-request, or a listen server that lost its game mode, would leave
+	// this pending forever — and an unresponsive select screen with a running auto-pick timer is the
+	// worst combination this feature can produce.
+	if (PendingRequest != TraceCharacterRoster::NoneId && (Now - PendingRequestTime) > PendingRequestTimeout)
+	{
+		PendingRequest = TraceCharacterRoster::NoneId;
+	}
+
+	if (bInputAllowed && PC != nullptr && GFrameCounter >= IgnoreInputBeforeFrame)
+	{
+		PollInput(PC, LocalState);
+	}
+
+#if !UE_BUILD_SHIPPING
+	// Consumed here rather than acted on inside the console command, so the scripted pick lands on a
+	// frame where the screen is genuinely up and the rects are genuinely drawn.
+	if (GTraceCharacterSelectDebugPick != 0)
+	{
+		const int32 RequestedId = GTraceCharacterSelectDebugPick;
+		GTraceCharacterSelectDebugPick = 0;
+		DebugPick(RequestedId);
+		ConfirmHighlighted(LocalState);
+	}
+#endif
+
+	Draw(HUD, LocalState);
+}
+
+void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* LocalState)
+{
+	// ---- Direct number keys. Five characters, five keys — no walking required. -------------------
+	for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
+	{
+		if (PC->WasInputKeyJustPressed(NumberKeyForIndex(Index)))
+		{
+			Highlighted = Index;
+			ConfirmHighlighted(LocalState);
+			return;
+		}
+	}
+
+	// ---- Left / right, with repeat --------------------------------------------------------------
+	const bool bLeft  = PC->IsInputKeyDown(EKeys::Left)  || PC->IsInputKeyDown(EKeys::A);
+	const bool bRight = PC->IsInputKeyDown(EKeys::Right) || PC->IsInputKeyDown(EKeys::D);
+	const int32 NavDir = (bRight ? 1 : 0) - (bLeft ? 1 : 0);
+
+	if (NavDir != 0)
+	{
+		if (NavDir != LastNavDir)
+		{
+			LastNavDir = NavDir;
+			NextNavTime = Now + NavRepeatDelay;
+			MoveHighlight(NavDir);
+		}
+		else if (Now >= NextNavTime)
+		{
+			NextNavTime = Now + NavRepeatInterval;
+			MoveHighlight(NavDir);
+		}
+	}
+	else
+	{
+		LastNavDir = 0;
+	}
+
+	// ---- Commit ---------------------------------------------------------------------------------
+	if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar))
+	{
+		ConfirmHighlighted(LocalState);
+		return;
+	}
+
+	// ---- Mouse ----------------------------------------------------------------------------------
+	float MouseX = 0.f;
+	float MouseY = 0.f;
+	if (PC->GetMousePosition(MouseX, MouseY))
+	{
+		CursorPos = FVector2D(MouseX, MouseY);
+		bHasCursor = true;
+	}
+
+	const bool bDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
+	const bool bJustReleased = !bDown && bMouseWasDown;
+	bMouseWasDown = bDown;
+
+	if (!bHasCursor)
+	{
+		return;
+	}
+
+	HoveredCard = INDEX_NONE;
+	for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
+	{
+		if (CardRects[Index].bIsValid && CardRects[Index].IsInside(CursorPos))
+		{
+			HoveredCard = Index;
+			Highlighted = Index;
+			break;
+		}
+	}
+
+	// ACTIVATION ON RELEASE, matching the options overlay: a press that started on one card and
+	// finished on another is a slip, not a choice, and this is a decision the player lives with for
+	// the whole match.
+	if (bJustReleased && HoveredCard != INDEX_NONE)
+	{
+		ConfirmHighlighted(LocalState);
+	}
+}
+
+void FTraceCharacterSelect::MoveHighlight(int32 Delta)
+{
+	// CLAMPED, NOT WRAPPED. The roster is five cards on one row; wrapping from X back to Rocco makes
+	// a held key cycle forever and makes the highlight's position uninformative about where the ends
+	// are. Same call the options overlay makes for the same reason.
+	Highlighted = FMath::Clamp(Highlighted + Delta, 0, TraceCharacterRoster::Count - 1);
+}
+
+void FTraceCharacterSelect::ConfirmHighlighted(ATracePlayerState* LocalState)
+{
+	if (LocalState == nullptr || !TraceCharacterRoster::All().IsValidIndex(Highlighted))
+	{
+		return;
+	}
+
+	const uint8 RequestedId = TraceCharacterRoster::All()[Highlighted].Id;
+
+	// One request in flight at a time. Without this a held Enter sends one per frame, and each one is
+	// a reliable RPC the server must process — the second onwards would all come back AlreadyLocked
+	// and the screen would end on a refusal message for a pick that actually succeeded.
+	if (PendingRequest != TraceCharacterRoster::NoneId)
+	{
+		return;
+	}
+
+	// A card we believe a team-mate holds is not sent. This is the ONLY place local belief is allowed
+	// to stop anything, and it is a courtesy rather than a rule: it saves a round trip in the common
+	// case. If the belief is stale the server refuses, which is the path that actually enforces §3.
+	if (const ATracePlayerState* Holder = FindTeammateHolding(LocalState, RequestedId))
+	{
+		LocalState->LastPickResult = ETraceCharacterPickResult::TakenByTeammate;
+		LocalState->LastPickResultCharacter = RequestedId;
+		LocalState->LastPickResultLocalTime = Now;
+
+		UE_LOG(LogTraceGame, Verbose, TEXT("[CharSelect] %s is held by team-mate '%s'; not sending."),
+			*TraceCharacterRoster::NameFor(RequestedId), *SafePlayerName(Holder));
+		return;
+	}
+
+	PendingRequest = RequestedId;
+	PendingRequestTime = Now;
+
+	UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Requesting %s."), *TraceCharacterRoster::NameFor(RequestedId));
+
+	// THE ONE CALL OFF THIS SCREEN. Everything about whether it succeeds happens on the server.
+	LocalState->ServerRequestCharacter(RequestedId);
+}
+
+const ATracePlayerState* FTraceCharacterSelect::FindTeammateHolding(const ATracePlayerState* LocalState, uint8 CharacterId) const
+{
+	if (LocalState == nullptr || LocalState->Team == ETraceTeam::None || !TraceCharacterRoster::IsValidId(CharacterId))
+	{
+		return nullptr;
+	}
+
+	const UWorld* const ThisWorld = LocalState->GetWorld();
+	const AGameStateBase* const BaseGameState = (ThisWorld != nullptr) ? ThisWorld->GetGameState() : nullptr;
+	if (BaseGameState == nullptr)
+	{
+		return nullptr;
+	}
+
+	for (APlayerState* const EachState : BaseGameState->PlayerArray)
+	{
+		const ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
+		if (Candidate == nullptr || Candidate == LocalState)
+		{
+			continue;
+		}
+
+		// Bots hold nothing (spec v14 §3) and enemies are allowed to mirror the pick, so neither is
+		// consulted. Getting this wrong in the permissive direction merely costs a round trip; getting
+		// it wrong in the restrictive direction would grey out a card the player is entitled to.
+		if (Candidate->IsABot() || Candidate->Team != LocalState->Team)
+		{
+			continue;
+		}
+
+		if (Candidate->GetSelectedCharacter() == CharacterId)
+		{
+			return Candidate;
+		}
+	}
+
+	return nullptr;
+}
+
+#if !UE_BUILD_SHIPPING
+void FTraceCharacterSelect::DebugPick(int32 CharacterId)
+{
+	if (!TraceCharacterRoster::IsValidId(static_cast<uint8>(CharacterId)))
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[CharSelect] Trace.Characters.Select: %d is not 1..5."), CharacterId);
+		return;
+	}
+
+	Highlighted = CharacterId - TraceCharacterRoster::FirstId;
+}
+#endif
+
+// =============================================================================================
+// Draw
+// =============================================================================================
+
+void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
+{
+	if (LocalState == nullptr)
+	{
+		return;
+	}
+
+	const FLinearColor TeamTint = TraceTeamColor(LocalState->Team);
+
+	// ---- Scrim ----------------------------------------------------------------------------------
+	//
+	// Not opaque. The arena stays faintly visible behind the cards, which is the difference between
+	// "the match is loading" and "the match is running and waiting for you" — and the second is the
+	// truth: the warm-up clock is ticking underneath this.
+	HUD->DrawRect(TraceSelectStyle::Scrim, 0.f, 0.f, ViewW, ViewH);
+
+	// ---- Title ----------------------------------------------------------------------------------
+	const float Margin = 44.f * UIScale;
+	float HeaderY = 40.f * UIScale;
+
+	DrawTextCentered(HUD, TEXT("SELECT YOUR CHARACTER"), TraceSelectStyle::Ink, ViewW * 0.5f, HeaderY, FontLarge, UIScale * 1.15f);
+	HeaderY += MeasureHeight(HUD, TEXT("X"), FontLarge, UIScale * 1.15f) + (6.f * UIScale);
+
+	{
+		// The team, in the team's colour. It is the single most load-bearing fact on this screen —
+		// per-team uniqueness means the greyed-out cards only make sense once you know which team you
+		// are on, and a player who just joined does not.
+		const FString TeamLine = FString::Printf(TEXT("%s TEAM"), *TraceTeamName(LocalState->Team).ToString().ToUpper());
+		DrawTextCentered(HUD, TeamLine, TeamTint, ViewW * 0.5f, HeaderY, FontMedium, UIScale);
+		HeaderY += MeasureHeight(HUD, TeamLine, FontMedium, UIScale) + (4.f * UIScale);
+	}
+
+	{
+		const FString RuleLine(TEXT("NOBODY ON YOUR TEAM MAY TAKE THE SAME CHARACTER. THE ENEMY MAY MIRROR YOUR PICK."));
+		DrawTextCentered(HUD, RuleLine, TraceSelectStyle::InkDim, ViewW * 0.5f, HeaderY, FontSmall, UIScale);
+		HeaderY += MeasureHeight(HUD, RuleLine, FontSmall, UIScale) + (10.f * UIScale);
+	}
+
+	// ---- The auto-pick countdown ----------------------------------------------------------------
+	//
+	// Spec v14 §3 [ASSUMPTION] gives this screen a timeout so one idle player cannot stall the match.
+	// A timeout the player cannot see is indistinguishable from the game choosing for them at random,
+	// so it is drawn as prominently as the title.
+	const float SelectRemaining = LocalState->GetCharacterSelectTimeRemaining();
+	if (LocalState->CharacterSelectDeadlineServerTime > 0.f)
+	{
+		const bool bUrgent = (SelectRemaining <= 5.f);
+		const FLinearColor CountColor = bUrgent
+			? TraceSelectStyle::WithAlpha(TraceSelectStyle::Danger, 0.65f + 0.35f * FMath::Sin(Now * 12.f))
+			: TraceSelectStyle::Cyan;
+
+		const FString CountLine = FString::Printf(TEXT("AUTO-PICK IN %d"), FMath::CeilToInt(SelectRemaining));
+		DrawTextCentered(HUD, CountLine, CountColor, ViewW * 0.5f, HeaderY, FontMedium, UIScale);
+		HeaderY += MeasureHeight(HUD, CountLine, FontMedium, UIScale) + (12.f * UIScale);
+	}
+
+	// ---- Cards ----------------------------------------------------------------------------------
+	const float FooterH = 74.f * UIScale;
+	const float CardGap = 12.f * UIScale;
+
+	// HEIGHT IS CAPPED, NOT STRETCHED, and the first capture is why. Filling the space between the
+	// header and the footer gave 555-pixel-tall cards holding 170 pixels of text, i.e. three quarters
+	// of each card was empty box — which reads as text that failed to load rather than as a layout
+	// choice. 420 (at the 1080p reference) comfortably clears the longest card, Oyster's, with room
+	// for a narrower viewport to wrap another line or two into.
+	const float CardsH = FMath::Clamp(ViewH - HeaderY - FooterH - Margin, 160.f * UIScale, 420.f * UIScale);
+
+	// Capping the height leaves slack, so the block is floated rather than pinned under the header —
+	// otherwise a 720p screen gets a tidy row of cards glued to the top and 300 px of nothing beneath
+	// it. 40% of the slack rather than 50%: the eye reads a menu as centred when it sits slightly
+	// above the true middle, and the header above it already carries weight.
+	const float CardsY = HeaderY + FMath::Max(0.f, (ViewH - HeaderY - Margin - CardsH - FooterH) * 0.40f);
+
+	const float TotalW = ViewW - (2.f * Margin);
+	const float CardW = (TotalW - (CardGap * (TraceCharacterRoster::Count - 1))) / TraceCharacterRoster::Count;
+
+	// One line, once per opening. A screenshot cannot tell "the cap is not compiled in" from "the cap
+	// is compiled in and computes a big number", and this screen has already cost one round trip to
+	// that exact ambiguity — the first capture after the cap was added looked identical to the one
+	// before it and there was no way to tell which of the two had happened.
+	if (!bLoggedLayoutOnce)
+	{
+		bLoggedLayoutOnce = true;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CharSelect] Layout: view %.0fx%.0f scale %.3f | cards y=%.0f h=%.0f w=%.0f (cap %.0f)"),
+			ViewW, ViewH, UIScale, CardsY, CardsH, CardW, 420.f * UIScale);
+	}
+
+	for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
+	{
+		const float CardX = Margin + Index * (CardW + CardGap);
+		DrawCard(HUD, LocalState, Index, CardX, CardsY, CardW, CardsH);
+	}
+
+	// ---- Footer: controls, and the last server verdict -------------------------------------------
+	float FooterY = CardsY + CardsH + (14.f * UIScale);
+
+	{
+		const FString Controls(TEXT("1-5 OR ARROWS TO CHOOSE      ENTER TO LOCK IN      OR CLICK A CARD"));
+		DrawTextCentered(HUD, Controls, TraceSelectStyle::InkDim, ViewW * 0.5f, FooterY, FontSmall, UIScale);
+		FooterY += MeasureHeight(HUD, Controls, FontSmall, UIScale) + (8.f * UIScale);
+	}
+
+	// THE VERDICT LINE. Spec v14 §3's "the loser is TOLD and re-picks" is this. It reads the answer
+	// the server sent back to ClientCharacterPickResult and prints it in plain words — a refusal that
+	// only appeared in a log is a refusal the player never received.
+	if ((Now - LocalState->LastPickResultLocalTime) < TraceSelectStyle::MessageDuration)
+	{
+		FString Message;
+		FLinearColor MessageColor = TraceSelectStyle::Danger;
+
+		const FString PickName = TraceCharacterRoster::NameFor(LocalState->LastPickResultCharacter);
+
+		switch (LocalState->LastPickResult)
+		{
+		case ETraceCharacterPickResult::Granted:
+			Message = FString::Printf(TEXT("%s LOCKED IN"), *PickName);
+			MessageColor = TraceSelectStyle::Good;
+			break;
+		case ETraceCharacterPickResult::TakenByTeammate:
+			Message = FString::Printf(TEXT("%s WAS TAKEN BY A TEAM-MATE FIRST - PICK ANOTHER"), *PickName);
+			break;
+		case ETraceCharacterPickResult::AlreadyLocked:
+			Message = TEXT("YOU HAVE ALREADY LOCKED IN");
+			break;
+		case ETraceCharacterPickResult::Disabled:
+			Message = TEXT("CHARACTERS ARE OFF IN THIS MATCH");
+			break;
+		case ETraceCharacterPickResult::NotSelecting:
+			Message = TEXT("NOT PICKING RIGHT NOW");
+			break;
+		default:
+			Message = TEXT("THAT IS NOT ONE OF THE FIVE");
+			break;
+		}
+
+		// Pulsed, because it may replace a message that was already there — a static line that merely
+		// changed its words would be missed by a player who is looking at the cards.
+		const FLinearColor Pulsed = TraceSelectStyle::WithAlpha(MessageColor, 0.7f + 0.3f * FMath::Sin(Now * 10.f));
+		DrawTextCentered(HUD, Message, Pulsed, ViewW * 0.5f, FooterY, FontMedium, UIScale);
+	}
+	else if (PendingRequest != TraceCharacterRoster::NoneId)
+	{
+		DrawTextCentered(HUD, FString::Printf(TEXT("ASKING THE SERVER FOR %s..."),
+			*TraceCharacterRoster::NameFor(PendingRequest)),
+			TraceSelectStyle::InkDim, ViewW * 0.5f, FooterY, FontSmall, UIScale);
+	}
+
+	DrawCursor(HUD);
+}
+
+void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, int32 CardIndex, float X, float Y, float W, float H)
+{
+	const TArray<TraceCharacterRoster::FTraceCharacterEntry>& Roster = TraceCharacterRoster::All();
+	if (!Roster.IsValidIndex(CardIndex))
+	{
+		return;
+	}
+
+	const TraceCharacterRoster::FTraceCharacterEntry& Entry = Roster[CardIndex];
+
+	CardRects[CardIndex] = FBox2D(FVector2D(X, Y), FVector2D(X + W, Y + H));
+
+	const ATracePlayerState* Holder = FindTeammateHolding(LocalState, Entry.Id);
+	const bool bTaken = (Holder != nullptr);
+	const bool bSelected = (CardIndex == Highlighted);
+
+	// Dead cards are drawn, never removed. A card that vanished would move its neighbours under the
+	// player's pointer and would hide the ONE thing they need to understand — that a team-mate has it.
+	const float Dim = bTaken ? 0.32f : 1.f;
+
+	HUD->DrawRect(TraceSelectStyle::WithAlpha(TraceSelectStyle::Panel, bTaken ? 0.80f : 0.96f), X, Y, W, H);
+
+	// The accent stripe down the left edge is the card's identity at a glance, and it is per-character
+	// rather than per-team on purpose: on this one screen both teams look identical, because an enemy
+	// mirroring your pick is legal, so a team colour here would carry no information at all.
+	const float StripeW = FMath::Max(2.f, 4.f * UIScale);
+	HUD->DrawRect(TraceSelectStyle::WithAlpha(Entry.Accent, Dim), X, Y, StripeW, H);
+
+	DrawFrame(HUD, X, Y, W, H,
+		bSelected ? TraceSelectStyle::WithAlpha(Entry.Accent, 0.95f)
+		          : TraceSelectStyle::WithAlpha(TraceSelectStyle::Cyan, bTaken ? 0.12f : 0.30f));
+
+	if (bSelected)
+	{
+		// A second, breathing frame just inside the first. The highlight has to survive being one of
+		// five similar rectangles on a dark screen; a single border does not manage it.
+		const float Inset = 3.f * UIScale;
+		DrawFrame(HUD, X + Inset, Y + Inset, W - 2.f * Inset, H - 2.f * Inset,
+			TraceSelectStyle::WithAlpha(Entry.Accent, 0.35f + 0.25f * FMath::Sin(Now * 6.f)));
+	}
+
+	const float PadX = 12.f * UIScale;
+	const float TextW = W - (2.f * PadX) - StripeW;
+	const float TextX = X + StripeW + PadX;
+	float TextY = Y + (12.f * UIScale);
+
+	// ---- Number + name --------------------------------------------------------------------------
+	{
+		const FString KeyHint = FString::Printf(TEXT("%d"), CardIndex + 1);
+		HUD->DrawText(KeyHint, TraceSelectStyle::WithAlpha(TraceSelectStyle::InkDim, Dim), TextX, TextY, FontSmall, UIScale);
+
+		const FString NameText = Entry.Name;
+		HUD->DrawText(NameText, TraceSelectStyle::WithAlpha(bTaken ? TraceSelectStyle::InkDim : Entry.Accent, 1.f),
+			TextX + (20.f * UIScale), TextY - (2.f * UIScale), FontMedium, UIScale * 1.1f);
+
+		TextY += MeasureHeight(HUD, NameText, FontMedium, UIScale * 1.1f) + (8.f * UIScale);
+	}
+
+	// ---- Taken banner ----------------------------------------------------------------------------
+	if (bTaken)
+	{
+		const FString TakenLine = FString::Printf(TEXT("TAKEN BY %s"), *SafePlayerName(Holder).ToUpper());
+		HUD->DrawRect(TraceSelectStyle::WithAlpha(TraceSelectStyle::Danger, 0.18f),
+			TextX, TextY - (2.f * UIScale), TextW, MeasureHeight(HUD, TakenLine, FontSmall, UIScale) + (4.f * UIScale));
+		TextY = DrawWrapped(HUD, TakenLine, TraceSelectStyle::Danger, TextX, TextY, TextW, FontSmall, UIScale, 2.f * UIScale);
+		TextY += 6.f * UIScale;
+	}
+
+	// ---- The three abilities ----------------------------------------------------------------------
+	//
+	// Spec v14 §3 asks for exactly this: "show each one's movement, passive and activated ability so a
+	// player can choose meaningfully". The order is the doc's, and the ACTIVATED block carries its
+	// key and its cooldown because those are the two facts that decide whether a player will actually
+	// use it.
+	auto DrawBlock = [&](const TCHAR* Caption, const FString& Body, const FLinearColor& CaptionColor)
+	{
+		HUD->DrawText(Caption, TraceSelectStyle::WithAlpha(CaptionColor, Dim), TextX, TextY, FontSmall, UIScale * 0.95f);
+		TextY += MeasureHeight(HUD, FString(Caption), FontSmall, UIScale * 0.95f) + (2.f * UIScale);
+		TextY = DrawWrapped(HUD, Body, TraceSelectStyle::WithAlpha(TraceSelectStyle::Ink, Dim * 0.92f),
+			TextX, TextY, TextW, FontSmall, UIScale, 2.f * UIScale);
+		TextY += 9.f * UIScale;
+	};
+
+	DrawBlock(TEXT("MOVEMENT"), Entry.Movement, TraceSelectStyle::Cyan);
+	DrawBlock(TEXT("PASSIVE"), Entry.Passive, TraceSelectStyle::Cyan);
+
+	DrawBlock(*FString::Printf(TEXT("ACTIVATED [E] - %s - %ds CD"),
+		Entry.ActivatedName, FMath::RoundToInt(Entry.ActivatedCooldown)), Entry.Activated, Entry.Accent);
+}
+
+float FTraceCharacterSelect::DrawWrapped(AHUD* HUD, const FString& Text, const FLinearColor& Color,
+	float X, float Y, float MaxWidth, UFont* Font, float Scale, float LineGap)
+{
+	// Greedy word wrap. The engine's bitmap fonts have no shaping and no kerning, so measuring a
+	// candidate line and backing off one word is exact rather than approximate — there is no case
+	// where adding a word makes the line narrower.
+	TArray<FString> Words;
+	Text.ParseIntoArray(Words, TEXT(" "), /*InCullEmpty=*/true);
+
+	const float LineH = MeasureHeight(HUD, TEXT("X"), Font, Scale);
+	float CursorY = Y;
+	FString Line;
+
+	for (const FString& Word : Words)
+	{
+		const FString Candidate = Line.IsEmpty() ? Word : (Line + TEXT(" ") + Word);
+		if (!Line.IsEmpty() && MeasureWidth(HUD, Candidate, Font, Scale) > MaxWidth)
+		{
+			HUD->DrawText(Line, Color, X, CursorY, Font, Scale);
+			CursorY += LineH + LineGap;
+			Line = Word;
+		}
+		else
+		{
+			Line = Candidate;
+		}
+	}
+
+	if (!Line.IsEmpty())
+	{
+		HUD->DrawText(Line, Color, X, CursorY, Font, Scale);
+		CursorY += LineH + LineGap;
+	}
+
+	return CursorY;
+}
+
+void FTraceCharacterSelect::DrawFrame(AHUD* HUD, float X, float Y, float W, float H, const FLinearColor& Color)
+{
+	const float Thin = FMath::Max(1.f, 1.f * UIScale);
+
+	HUD->DrawRect(Color, X, Y, W, Thin);
+	HUD->DrawRect(Color, X, Y + H - Thin, W, Thin);
+	HUD->DrawRect(Color, X, Y, Thin, H);
+	HUD->DrawRect(Color, X + W - Thin, Y, Thin, H);
+}
+
+void FTraceCharacterSelect::DrawCursor(AHUD* HUD)
+{
+	// The OS cursor does not appear in captured frames and is hidden outright during a match, so the
+	// overlay draws its own — the same shape and reasoning as FTraceOptionsMenu::DrawCursor.
+	if (!bHasCursor)
+	{
+		return;
+	}
+
+	const float Size = 9.f * UIScale;
+	const float Thick = FMath::Max(1.f, 1.5f * UIScale);
+	const FLinearColor Color = TraceSelectStyle::WithAlpha(TraceSelectStyle::Cyan, 0.95f);
+
+	HUD->DrawLine(CursorPos.X - Size, CursorPos.Y, CursorPos.X - Size * 0.35f, CursorPos.Y, Color, Thick);
+	HUD->DrawLine(CursorPos.X + Size * 0.35f, CursorPos.Y, CursorPos.X + Size, CursorPos.Y, Color, Thick);
+	HUD->DrawLine(CursorPos.X, CursorPos.Y - Size, CursorPos.X, CursorPos.Y - Size * 0.35f, Color, Thick);
+	HUD->DrawLine(CursorPos.X, CursorPos.Y + Size * 0.35f, CursorPos.X, CursorPos.Y + Size, Color, Thick);
+}
+
+float FTraceCharacterSelect::MeasureWidth(AHUD* HUD, const FString& Text, UFont* Font, float Scale) const
+{
+	float OutWidth = 0.f;
+	float OutHeight = 0.f;
+	HUD->GetTextSize(Text, OutWidth, OutHeight, Font, Scale);
+	return OutWidth;
+}
+
+float FTraceCharacterSelect::MeasureHeight(AHUD* HUD, const FString& Text, UFont* Font, float Scale) const
+{
+	float OutWidth = 0.f;
+	float OutHeight = 0.f;
+	HUD->GetTextSize(Text, OutWidth, OutHeight, Font, Scale);
+	return OutHeight;
+}
+
+void FTraceCharacterSelect::DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color,
+	float CenterX, float Y, UFont* Font, float Scale)
+{
+	HUD->DrawText(Text, Color, CenterX - MeasureWidth(HUD, Text, Font, Scale) * 0.5f, Y, Font, Scale);
+}
+
+#if !UE_BUILD_SHIPPING
+namespace
+{
+	/**
+	 * Trace.Characters.Select <1..5>
+	 *
+	 * Drives a pick from the console so a headless run can prove the SCREEN's request path, not just
+	 * the game mode's. It sets a plain int that the open screen consumes on its next Tick; see the
+	 * note on GTraceCharacterSelectDebugPick in the header for why it is not a pointer.
+	 */
+	void TraceCharacterSelectCommand(const TArray<FString>& Args)
+	{
+		const int32 Requested = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 1;
+		GTraceCharacterSelectDebugPick = Requested;
+
+		UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Console pick queued: %s."),
+			*TraceCharacterRoster::NameFor(static_cast<uint8>(Requested)));
+	}
+
+	FAutoConsoleCommand CmdTraceCharacterSelect(
+		TEXT("Trace.Characters.Select"),
+		TEXT("Dev only. Spec v14 3. Picks character 1..5 through the select screen's own request path "
+		     "(highlight, then confirm), so a headless run exercises the screen rather than bypassing "
+		     "it. No effect unless the select screen is open on this machine."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&TraceCharacterSelectCommand));
+}
+#endif
