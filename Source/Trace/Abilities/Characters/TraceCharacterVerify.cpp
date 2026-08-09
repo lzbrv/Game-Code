@@ -55,7 +55,7 @@
 #include "Trace.h"
 #include "TraceSettings.h"
 
-namespace
+namespace TraceCharacterVerify
 {
 	// =============================================================================================
 	// Shared plumbing
@@ -1554,6 +1554,6 @@ namespace
 
 			UE_LOG(LogTraceGame, Display, TEXT("[RoccoChut] %d live ripple(s)."), RippleCount);
 		}));
-}
+}   // namespace TraceCharacterVerify
 
 #endif   // !UE_BUILD_SHIPPING

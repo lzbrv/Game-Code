@@ -74,7 +74,7 @@
 #include "Trace.h"
 #include "TraceSettings.h"
 
-namespace
+namespace TraceAbilityVerify
 {
 	/** The one authoritative game world, or null. Every command here is server only. */
 	UWorld* FindAuthoritativeWorld()
@@ -832,6 +832,6 @@ namespace
 				}
 			}
 		}));
-}
+}   // namespace TraceAbilityVerify
 
 #endif // !UE_BUILD_SHIPPING

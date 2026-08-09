@@ -220,6 +220,7 @@ namespace
 	 *   4 x Right  -> SENSITIVITY 1.00 -> 1.20        (Slider, and the held-key adjust path)
 	 *   2 x Down   -> INVERT MOUSE Y                  (navigation)
 	 *   Enter      -> toggles it ON                   (Toggle)
+	 *   Enter      -> toggles it back OFF             (Toggle, and the one-way-toggle red arm)
 	 *   2 x Down   -> MOVE FORWARD                    (navigation ACROSS the CONTROLS header)
 	 *   Enter      -> arms the rebind capture         (Binding)
 	 *   K          -> becomes the new MOVE FORWARD    (capture)
@@ -239,11 +240,15 @@ namespace
 		{
 			{ []{ return EKeys::Down;  }, TEXT("-> characters (spec v14 3)") },
 
-			// LEFT/RIGHT rather than ENTER, and this is worth knowing before writing another script
-			// step: ActivateSelected on a Toggle routes through AdjustSelected(+1), so ENTER
-			// INCREMENTS a toggle rather than flipping it. On a row that is already ON it clamps and
-			// does nothing at all — which is exactly what the first version of this step did, and it
-			// produced a run with no write and no log while looking like it had exercised the row.
+			// LEFT/RIGHT rather than ENTER. This is now belt-and-braces: ActivateSelected on a
+			// Toggle USED to route through AdjustSelected(+1), which clamps, so ENTER could turn a
+			// toggle on but never off. The first version of this step hit exactly that and produced
+			// a run with no write and no log while looking like it had exercised the row.
+			//
+			// Working around it here instead of fixing it is why the bug survived to be reported by
+			// a player as "the button to uninvert the mouse didn't work". ActivateSelected now
+			// flips, so ENTER would work here too; these stay LEFT/RIGHT because a step that
+			// asserts a specific end state is clearer than one that asserts a transition.
 			{ []{ return EKeys::Left;  }, TEXT("characters -> OFF") },
 			{ []{ return EKeys::Right; }, TEXT("characters -> ON (put back)") },
 			{ []{ return EKeys::Down;  }, TEXT("-> sensitivity") },
@@ -253,7 +258,13 @@ namespace
 			{ []{ return EKeys::Right; }, TEXT("sensitivity +") },
 			{ []{ return EKeys::Down;  }, TEXT("-> vertical sensitivity") },
 			{ []{ return EKeys::Down;  }, TEXT("-> invert mouse y") },
-			{ []{ return EKeys::Enter; }, TEXT("toggle invert y") },
+			{ []{ return EKeys::Enter; }, TEXT("toggle invert y ON") },
+
+			// THE RED ARM for the one-way-toggle bug. Pressing the same button a second time must
+			// put the row back. Before the ActivateSelected fix this clamped and the row stayed ON,
+			// so the DONE line below printed invertY=1 — which is the failure, and is what a player
+			// actually hit when they could not turn the inverted mouse off again.
+			{ []{ return EKeys::Enter; }, TEXT("toggle invert y OFF again (must actually flip)") },
 			{ []{ return EKeys::Down;  }, TEXT("-> move forward (across the CONTROLS header)") },
 			{ []{ return EKeys::Enter; }, TEXT("arm rebind capture") },
 			{ []{ return EKeys::K;     }, TEXT("bind move forward to K") },
@@ -382,6 +393,59 @@ void ATraceMenuHUD::ArmAutoJoin()
 	}), DelaySeconds, false);
 }
 
+void ATraceMenuHUD::SnapshotUserSettings()
+{
+	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	SavedMouseSensitivity = Settings.MouseSensitivity;
+	SavedMouseSensitivityYScale = Settings.MouseSensitivityYScale;
+	bSavedInvertMouseY = Settings.bInvertMouseY;
+
+	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
+	SavedBindings.Reset(Table.Num());
+	for (int32 Index = 0; Index < Table.Num(); ++Index)
+	{
+		SavedBindings.Add(Settings.GetKey(static_cast<ETraceInputAction>(Index)));
+	}
+
+	bAutoSettingsSnapshotTaken = true;
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[AutoSettings] Snapshotted the real settings (invertY=%d, %d bindings); they are put "
+		     "back when the script finishes."),
+		bSavedInvertMouseY ? 1 : 0, SavedBindings.Num());
+}
+
+void ATraceMenuHUD::RestoreUserSettings()
+{
+	if (!bAutoSettingsSnapshotTaken)
+	{
+		return;
+	}
+	bAutoSettingsSnapshotTaken = false;
+
+	UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	Settings.MouseSensitivity = SavedMouseSensitivity;
+	Settings.MouseSensitivityYScale = SavedMouseSensitivityYScale;
+	Settings.bInvertMouseY = bSavedInvertMouseY;
+
+	for (int32 Index = 0; Index < SavedBindings.Num(); ++Index)
+	{
+		if (SavedBindings[Index].IsValid())
+		{
+			Settings.SetKey(static_cast<ETraceInputAction>(Index), SavedBindings[Index]);
+		}
+	}
+
+	// Save() rather than leaving it in memory: the script's own writes were flushed to disk, so
+	// only a flushed restore actually undoes them.
+	Settings.Save();
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[AutoSettings] RESTORED. invertY=%d moveForward=%s — the run left no trace in the "
+		     "player's config."),
+		Settings.bInvertMouseY ? 1 : 0,
+		*UTraceUserSettings::DescribeKey(Settings.GetKey(ETraceInputAction::MoveForward)));
+}
+
 void ATraceMenuHUD::ArmAutoSettings()
 {
 	float DelaySeconds = 0.f;
@@ -401,6 +465,9 @@ void ATraceMenuHUD::ArmAutoSettings()
 
 	World->GetTimerManager().SetTimer(AutoSettingsTimer, FTimerDelegate::CreateWeakLambda(this, [this]()
 	{
+		// Before the first injected key, not after: the script's very first steps already write.
+		SnapshotUserSettings();
+
 		Selected = ETraceMenuRow::Settings;
 		OpenOptions();
 
@@ -440,7 +507,10 @@ void ATraceMenuHUD::AutoSettingsStep()
 	if (!Script.IsValidIndex(AutoSettingsIndex))
 	{
 		// Report the end state at Display. This line IS the test result: if it does not read
-		// sensitivity=1.20 invertY=1 moveForward=K, the settings path did not work.
+		// sensitivity=1.20 invertY=0 moveForward=K, the settings path did not work.
+		//
+		// invertY=0 after TWO presses is the assertion, not a typo. One press turns it on, the
+		// second must turn it off; invertY=1 here means Enter could not undo a toggle.
 		const UTraceUserSettings& Settings = UTraceUserSettings::Get();
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[AutoSettings] DONE. sensitivity=%.2f yScale=%.2f invertY=%d moveForward=%s dash=%s"),
@@ -452,6 +522,10 @@ void ATraceMenuHUD::AutoSettingsStep()
 		{
 			World->GetTimerManager().ClearTimer(AutoSettingsStepTimer);
 		}
+
+		// Strictly AFTER the DONE line above, which is the assertion: restoring first would erase
+		// the very state the run exists to report.
+		RestoreUserSettings();
 	}
 }
 #endif

@@ -74,7 +74,7 @@
 #include "Trace.h"
 #include "TraceSettings.h"
 
-namespace
+namespace TraceMaceOysterVerify
 {
 	// =============================================================================================
 	// Shared fixture helpers
@@ -1409,6 +1409,6 @@ namespace
 		TEXT("Trace.MaceOyster.DumpState"),
 		TEXT("Dev only. Mace's and Oyster's live state, the resolved ability keys, and the per-vector carrier alarm."),
 		FConsoleCommandDelegate::CreateStatic(&RunDumpState));
-}
+}   // namespace TraceMaceOysterVerify
 
 #endif // !UE_BUILD_SHIPPING

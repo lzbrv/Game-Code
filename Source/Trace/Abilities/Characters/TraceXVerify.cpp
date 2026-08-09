@@ -69,7 +69,7 @@
 
 #if !UE_BUILD_SHIPPING
 
-namespace
+namespace TraceXVerify
 {
 	/** The damage every measurement below asks for. Unambiguous, well short of lethal, and 40 x 1.25
 	 *  is 50 — two numbers nobody can confuse with each other or with a regen tick. */
@@ -1477,6 +1477,6 @@ namespace
 		TEXT("Spec v14 §6: the orbiting bees sting on contact. Red half first — an enemy at 3x the orbit radius "
 		     "must NOT be marked."),
 		FConsoleCommandDelegate::CreateStatic(&RunBeeTest));
-}
+}   // namespace TraceXVerify
 
 #endif // !UE_BUILD_SHIPPING

@@ -1264,9 +1264,25 @@ void FTraceOptionsMenu::ActivateSelected()
 	switch (Row.Kind)
 	{
 	case ERowKind::Toggle:
-		// A toggle has one other state, so activating it is unambiguous.
-		AdjustSelected(1);
+	{
+		// FLIP, do not increment. This used to be AdjustSelected(1), and AdjustSelected clamps at
+		// Max — so pressing Enter or clicking a toggle that was already ON did nothing at all, and
+		// the row could never be turned back off by the control a player actually reaches for. Only
+		// the LEFT arrow could undo it.
+		//
+		// This shipped, and it was reported from the other side: "the mouse was inverted and the
+		// button to uninvert it didn't work." INVERT MOUSE Y, VSYNC and CHARACTERS were all one-way.
+		// The behaviour was even known — the -TraceAutoSettings script documents it and steers around
+		// it with LEFT/RIGHT instead of pressing Enter, which is how it stayed invisible in testing.
+		float Value = 0.f;
+		float Min = 0.f;
+		float Max = 1.f;
+		float Step = 1.f;
+		GetSettingValue(Row.Setting, Value, Min, Max, Step);
+
+		AdjustSelected((Value >= 0.5f) ? -1 : 1);
 		return;
+	}
 
 	case ERowKind::Choice:
 	{

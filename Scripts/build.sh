@@ -166,6 +166,30 @@ if [ "$DO_PROJECTFILES" = "1" ]; then
     exit 0
 fi
 
+# ------------------------------------------------------------------------------
+# Guard: anonymous-namespace collisions under the unity/jumbo build
+#
+# ("unity build" here is the C++ compilation technique -- UBT concatenates many
+# .cpp files into one translation unit to compile faster. Nothing to do with the
+# Unity engine.)
+#
+# Two files may each legally define a private `namespace { UWorld* FindWorld(); }`.
+# Concatenated, that is one namespace with two definitions -- MSVC C2084. Which
+# files get grouped depends on file count and ordering, so this builds clean on
+# macOS and breaks on Windows, which is exactly what happened to a collaborator.
+# Catch it here instead.
+#
+# Skip with TRACE_SKIP_COLLISION_CHECK=1.
+# ------------------------------------------------------------------------------
+COLLISION_PY="${TRACE_SCRIPT_DIR}/check-jumbo-build-collisions.py"
+if [ "${TRACE_SKIP_COLLISION_CHECK:-0}" != "1" ] && [ -f "$COLLISION_PY" ]; then
+    if ! python3 "$COLLISION_PY"; then
+        trace_die "Anonymous-namespace collisions would break the Windows unity build (see above).
+Fix by naming the namespace after its file, e.g. 'namespace TraceFooVerify', rather than
+renaming the individual symbol."
+    fi
+fi
+
 ARGS=("$TARGET" "$PLATFORM" "$CONFIG" "$TRACE_UPROJECT" -waitmutex)
 # Note: `[ x = y ] && ARGS+=(...)` would return 1 on the false branch and `set -e`
 # would kill the script. Always use a full `if` for conditional appends.

@@ -402,10 +402,31 @@ private:
 	 */
 	void ArmAutoSettings();
 	void AutoSettingsStep();
+
+	/**
+	 * Snapshot of the player's REAL settings, taken before the script runs and put back when it
+	 * finishes.
+	 *
+	 * This exists because it did not, and the omission escaped into a person's game: the script
+	 * drives the shipping options menu, which saves and flushes to the shipping
+	 * TraceUserSettings.ini, so a verification run left INVERT MOUSE Y on and MOVE FORWARD bound
+	 * to K in the developer's own config. It was reported as a bug in the game.
+	 *
+	 * A test that drives the real UI has to drive the real save path, so the answer is not to stop
+	 * writing — it is to put the settings back afterwards.
+	 */
+	void SnapshotUserSettings();
+	void RestoreUserSettings();
+
 	FTimerHandle AutoSettingsTimer;
 	FTimerHandle AutoSettingsStepTimer;
 	int32 AutoSettingsIndex = 0;
 	bool bAutoSettingsAwaitingRelease = false;
+	bool bAutoSettingsSnapshotTaken = false;
+	float SavedMouseSensitivity = 1.f;
+	float SavedMouseSensitivityYScale = 1.f;
+	bool bSavedInvertMouseY = false;
+	TArray<FKey> SavedBindings;
 
 	/**
 	 * -TraceAutoJoin=<seconds> -TraceJoinAddress=<ip:port> drives the JOIN row for you.
