@@ -9,6 +9,7 @@
 #include "Engine/HitResult.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"                 // TActorIterator
+#include "Abilities/Characters/TraceSlimewall.h"   // v18: slime blocks bot vision (NoCollision by design)
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
@@ -20,6 +21,7 @@
 
 #include "Abilities/TraceAbilityComponent.h"                  // spec v15 §3: the bots' ability path
 #include "Abilities/Characters/TraceAbilityInputRelay.h"      // ...and the E router (Mace's reactivation)
+#include "Abilities/Characters/TraceAbilitySetElle.h"         // ...and IsAwaitingSecondGate, for the same reason
 #include "Abilities/Characters/TraceAbilitySetMace.h"         // ...and IsSpikeReadyToPull, to tell a pull from a throw
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
@@ -4857,7 +4859,19 @@ void ATraceBotController::UpdateAbilities(float DeltaSeconds)
 
 		if (Situation.Abilities != nullptr)
 		{
-			TraceBotAbilityStats::NoteSecondary(Situation.Abilities->GetCharacterId(), bSecondaryInputHeld);
+			TraceBotAbilityStats::NoteSecondary(Situation.Abilities->GetCharacterId(), bSecondaryInputHeld,
+				bSecondaryInputHeld ? AbilityOrders.SecondaryReason : nullptr);
+
+			// SPEC v18 §3. Roxie's rocket is the one V ability that is a DECISION with a reaction delay
+			// in front of it (Mace's suspend and Slimeball's stick are levels raised by a decision that
+			// has already been counted against its own key), so its latency is reported here and only
+			// on the tick the brain says the tap resolved. Without the flag this branch would also
+			// count Slimeball's stick, whose latency the jump above has already reported — and the
+			// reaction mean is the number spec v15 §3 is judged on.
+			if (AbilityOrders.bSecondaryPressedNow)
+			{
+				TraceBotAbilityStats::NoteLatency(AbilityOrders.MeasuredLatencySeconds);
+			}
 		}
 	}
 
@@ -4881,6 +4895,15 @@ void ATraceBotController::UpdateAbilities(float DeltaSeconds)
 	if (AbilityOrders.bJump)
 	{
 		bWantsJumpThisTick = true;
+
+		// The jump is an ability press like any other and it was made to wait like any other, so it
+		// belongs in the reaction sample. It was missing from it until spec v18 §3: with Rocco's
+		// redirect, Mace's "jump to suspend" and now Slimeball's "jump to the wall" all arriving on
+		// this key, leaving it out was quietly dropping the majority of the presses this pass makes.
+		if (Situation.Abilities != nullptr)
+		{
+			TraceBotAbilityStats::NoteLatency(AbilityOrders.MeasuredLatencySeconds);
+		}
 	}
 }
 
@@ -4919,12 +4942,25 @@ void ATraceBotController::ApplyAbilityInputs()
 		bWasSpikePull = Mace->IsSpikeReadyToPull();
 	}
 
+	// SPEC v18 §2 GAVE THE COOLDOWN TEST A SECOND BLIND SPOT, and it is Mace's exactly.
+	//
+	// Elle's SNAP is one cast made of two presses, and press 1 deliberately charges NOTHING
+	// (UTraceAbilitySetElle::GetActivatedCooldownSeconds returns 0 while the 4 s window is open) so
+	// that press 2 can reach ActivateAbility at all. The cooldown therefore does not move on the press
+	// that puts the FIRST gate on the ground — and a first gate is unambiguously the ability working.
+	// Read before, compared after, for the same reason the cooldown is.
+	const UTraceAbilitySetElle* Elle = Abilities->GetAbilitySetAs<UTraceAbilitySetElle>();
+	const bool bElleWasIdle = (Elle != nullptr) && !Elle->IsAwaitingSecondGate();
+
 	// THE HUMAN'S PATH, not a private one. RouteActivatePressed is where "a second E means PULL"
 	// lives — UTraceAbilityComponent::TryActivate() cannot carry it, because the throw has just
 	// started a 20 s cooldown. See TraceAbilityInputRelay.h.
 	UTraceAbilityInputRelay::RouteActivatePressed(BotCharacter->GetPlayerState<APlayerState>());
 
+	const bool bElleOpenedTheWindow = bElleWasIdle && Elle != nullptr && Elle->IsAwaitingSecondGate();
+
 	const bool bFired = bWasSpikePull
+		|| bElleOpenedTheWindow
 		|| (Abilities->GetActivatedCooldownRemaining() > CooldownBefore);
 
 	TraceBotAbilityStats::NoteActivate(MyCharacter, bFired, bWasSpikePull, AbilityOrders.Reason,
@@ -5471,6 +5507,107 @@ ATraceCharacter* ATraceBotController::FindBestShootTarget() const
 	return Best;
 }
 
+/**
+ * Does a live Slimewall stand between these two points?
+ *
+ * WHY THIS EXISTS, AND WHY IT IS NOT A COLLISION CHANNEL. Spec v18 §2 says Slimeball's wall "can be
+ * shot through, but obstructs vision", so the slab is deliberately NoCollision on every channel —
+ * and this project's hitscan traces on ECC_Visibility. Giving the slab a Visibility response to
+ * block bot sight would therefore also eat bullets and break the ability's own headline clause.
+ *
+ * The consequence, caught by verification rather than by play: the wall blocked a HUMAN's vision and
+ * not a BOT's, because ATraceBotController::HasLineOfSight is an ECC_Visibility ray. Half the
+ * ability simply did not exist against AI, which is the mode this team playtests most.
+ *
+ * So vision is asked as a geometry trace AND this test. Slimewalls are rare (a handful alive, 4 s
+ * each), so the iteration is cheap; the maths is an exact segment-vs-OBB slab test rather than a
+ * bounds approximation, because a wall you can see round the edge of is worse than no wall.
+ *
+ * Named distinctively and file-static on purpose: UBT concatenates .cpp files into one translation
+ * unit, so a generic helper name here would collide with another file's (see
+ * Scripts/check-jumbo-build-collisions.py).
+ */
+static bool TraceBotSlimewallBlocksSegment(const UWorld* WorldPtr, const FVector& SegStart, const FVector& SegEnd)
+{
+	if (WorldPtr == nullptr)
+	{
+		return false;
+	}
+
+	for (TActorIterator<ATraceSlimewall> It(const_cast<UWorld*>(WorldPtr)); It; ++It)
+	{
+		const ATraceSlimewall* Wall = *It;
+		if (!IsValid(Wall))
+		{
+			continue;
+		}
+
+		const FVector Extents = Wall->GetHalfExtentsUU();
+		if (Extents.IsNearlyZero())
+		{
+			continue;
+		}
+
+		// The slab's own basis: X along the aim (its thickness), Y across it, Z up — the order
+		// ServerSpawn documents for InHalfExtents.
+		FVector AxisX = Wall->GetWallAim().GetSafeNormal();
+		if (AxisX.IsNearlyZero())
+		{
+			continue;
+		}
+		const FVector AxisZ = FVector::UpVector;
+		const FVector AxisY = FVector::CrossProduct(AxisZ, AxisX).GetSafeNormal();
+
+		// Segment into the slab's local space, then the standard slab (ray-vs-AABB) test.
+		const FVector Centre = Wall->GetWallCenter();
+		const FVector LocalStart(
+			FVector::DotProduct(SegStart - Centre, AxisX),
+			FVector::DotProduct(SegStart - Centre, AxisY),
+			FVector::DotProduct(SegStart - Centre, AxisZ));
+		const FVector LocalEnd(
+			FVector::DotProduct(SegEnd - Centre, AxisX),
+			FVector::DotProduct(SegEnd - Centre, AxisY),
+			FVector::DotProduct(SegEnd - Centre, AxisZ));
+
+		const FVector Delta = LocalEnd - LocalStart;
+		float EnterT = 0.f;
+		float ExitT = 1.f;
+		bool bMiss = false;
+
+		for (int32 Axis = 0; Axis < 3 && !bMiss; ++Axis)
+		{
+			const float Origin = LocalStart[Axis];
+			const float Direction = Delta[Axis];
+			const float Limit = Extents[Axis];
+
+			if (FMath::IsNearlyZero(Direction))
+			{
+				// Parallel to this pair of faces: only a miss if it starts outside them.
+				bMiss = (Origin < -Limit) || (Origin > Limit);
+				continue;
+			}
+
+			float Near = (-Limit - Origin) / Direction;
+			float Far = (Limit - Origin) / Direction;
+			if (Near > Far)
+			{
+				Swap(Near, Far);
+			}
+
+			EnterT = FMath::Max(EnterT, Near);
+			ExitT = FMath::Min(ExitT, Far);
+			bMiss = (EnterT > ExitT);
+		}
+
+		if (!bMiss)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool ATraceBotController::HasLineOfSight(const AActor* Target) const
 {
 	const UWorld* World = GetWorld();
@@ -5503,12 +5640,21 @@ bool ATraceBotController::HasLineOfSight(const AActor* Target) const
 	// feet-ish between them survive a strip of geometry cutting one ray.
 	const FVector TargetOrigin = Target->GetActorLocation();
 
-	if (!World->LineTraceTestByChannel(Start, TargetOrigin + FVector(0.f, 0.f, UTraceSettings::Get().BotAimBodyOffsetZ), ECC_Visibility, Params))
+	const FVector HighPoint = TargetOrigin + FVector(0.f, 0.f, UTraceSettings::Get().BotAimBodyOffsetZ);
+	const FVector LowPoint = TargetOrigin + FVector(0.f, 0.f, TraceBotConstants::TargetLowOffsetZ);
+
+	// Geometry AND slime. A Slimewall is NoCollision by design (spec v18 §2's "can be shot through"),
+	// so it is invisible to the ECC_Visibility rays below and has to be asked about separately —
+	// otherwise the wall obstructs a human's vision and not a bot's, which is exactly what
+	// verification caught.
+	if (!World->LineTraceTestByChannel(Start, HighPoint, ECC_Visibility, Params)
+		&& !TraceBotSlimewallBlocksSegment(World, Start, HighPoint))
 	{
 		return true;
 	}
 
-	return !World->LineTraceTestByChannel(Start, TargetOrigin + FVector(0.f, 0.f, TraceBotConstants::TargetLowOffsetZ), ECC_Visibility, Params);
+	return !World->LineTraceTestByChannel(Start, LowPoint, ECC_Visibility, Params)
+		&& !TraceBotSlimewallBlocksSegment(World, Start, LowPoint);
 }
 
 bool ATraceBotController::FindTrailInterceptPoint(FVector& OutPoint, FVector& OutTangent) const

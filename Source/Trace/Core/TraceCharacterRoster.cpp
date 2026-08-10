@@ -1,6 +1,6 @@
-// Trace — the five characters, as data. See TraceCharacterRoster.h.
+// Trace — the eight characters, as data. See TraceCharacterRoster.h.
 //
-// Since spec v17 §5 this file answers All() from ONE OF TWO PLACES: the five
+// Since spec v17 §5 this file answers All() from ONE OF TWO PLACES: the
 // UTraceCharacterDefinition assets under /Game/Trace/Data/Characters, or the C++ table below. The
 // C++ table is not dead code kept for sentiment — it is the fallback rule §0.1 requires, it is what
 // the generator reads when it authors the assets, and it is what Trace.VerifyCharacterData compares
@@ -27,14 +27,27 @@
 // can see both — a static_assert cannot be argued with, cannot go stale, and costs nothing.
 // ---------------------------------------------------------------------------------------------
 
-static_assert(static_cast<uint8>(ETraceCharacterId::None)   == TraceCharacterRoster::NoneId,
+static_assert(static_cast<uint8>(ETraceCharacterId::None)      == TraceCharacterRoster::NoneId,
 	"TraceCharacterRoster::NoneId must equal ETraceCharacterId::None.");
-static_assert(static_cast<uint8>(ETraceCharacterId::Rocco)  == TraceCharacterRoster::FirstId,
+static_assert(static_cast<uint8>(ETraceCharacterId::Rocco)     == TraceCharacterRoster::FirstId,
 	"TraceCharacterRoster::FirstId must equal ETraceCharacterId::Rocco.");
-static_assert(static_cast<uint8>(ETraceCharacterId::X)      == TraceCharacterRoster::LastId,
-	"TraceCharacterRoster::LastId must equal ETraceCharacterId::X.");
+
+// *** THE ONE THAT MOVES. *** It named X until spec v18 §2 appended Roxie, Elle and Slimeball; it
+// names Slimeball now and it must name whoever is last after the NEXT character is added. This is
+// the assertion that turns "somebody appended an enumerator and forgot the roster" — a bug whose
+// only symptom is a character nobody can pick and a whole asset table that quietly stops being used
+// — into a build that will not compile.
+static_assert(static_cast<uint8>(ETraceCharacterId::Slimeball) == TraceCharacterRoster::LastId,
+	"TraceCharacterRoster::LastId must equal the LAST enumerator of ETraceCharacterId (Slimeball as "
+	"of spec v18 §2). If you appended a character, this line and TraceCharacterRoster::Count move too.");
+
 static_assert(TraceCharacterCount == TraceCharacterRoster::Count,
 	"The roster table and ETraceCharacterId disagree about how many characters there are.");
+static_assert(TraceCharacterRoster::Count
+	== (static_cast<int32>(TraceCharacterRoster::LastId) - static_cast<int32>(TraceCharacterRoster::FirstId) + 1),
+	"Count must be the length of the CONTIGUOUS id range FirstId..LastId — Find() indexes the table "
+	"with (Id - FirstId) rather than searching it, so a gap in the ids would hand a player the wrong "
+	"character rather than failing.");
 
 // The file's own namespace rather than an anonymous one. UBT compiles this module as a unity/jumbo
 // build, so two files that each say `namespace { ... }` become one namespace with two definitions of
@@ -53,8 +66,13 @@ namespace TraceCharacterRosterFile
 	 *
 	 * THE PROSE IS THE SPEC'S, TRIMMED TO FIT A CARD. Where a number was assumed rather than stated
 	 * (Mace's and Oyster's cooldowns) the card still prints it, because a player choosing between
-	 * five characters needs to compare them on the same axes — but see the report: those two are
+	 * eight characters needs to compare them on the same axes — but see the report: those two are
 	 * [ASSUMPTION] 20 s and the ability framework, not this table, is what actually enforces any of it.
+	 *
+	 * *** THE COOLDOWN IN A ROW IS THE PRINTED ONE AND IT MUST MATCH THE ENFORCED ONE. *** The card
+	 * and the HUD ring read it from here; the E key reads UTraceSettings. Trace.VerifyCharacterData
+	 * section D compares the two and FAILS when they drift, which is how the three v18 §2 rows below
+	 * were checked (Modded 25 s, Snap 35 s, Slimewall 25 s).
 	 *
 	 * *** THIS IS THE ORIGIN OF THE GENERATED ASSETS. *** Scripts/generate-data-assets.py contains no
 	 * character data at all; it calls UTraceCharacterDefinition::CopyFallbackValues, which reads this.
@@ -118,6 +136,52 @@ namespace TraceCharacterRosterFile
 				     "DAMAGE. THE BEES RESUME ORBITING ONCE ALL FIVE ARE FIRED."),
 				25.f,
 				FLinearColor(1.00f, 0.40f, 0.55f, 1.f)    // rose
+			},
+
+			// ---------------------------------------------------------------------------------
+			// SPEC v18 §2 — the three new characters.
+			//
+			// The prose is the Demo 16 doc's, trimmed the same way the first five were. Every NUMBER
+			// quoted in these strings is also a UTraceSettings knob under "Abilities|<Name>", and the
+			// knob is the one that plays — a card that says 35% and a game that slows by 20% is a card
+			// that lied, so retuning any of these means editing the sentence here as well.
+			//
+			// THE ACCENTS ARE ALL NEW HUES. There are eight cards on one screen now and the stripe is
+			// how a player finds theirs at a glance, so none of the three below is a near-neighbour of
+			// amber / mint / violet / cyan / rose.
+			// ---------------------------------------------------------------------------------
+			{
+				6, TEXT("ROXIE"),
+				TEXT("V FIRES A WOBBLING ROCKET THAT THROWS HER BACKWARDS, FAST AND FAR. IT IS HARD TO "
+				     "AIM AND DEALS 100 ANYWHERE IT HITS. 35S COOLDOWN."),
+				TEXT("JUMPS 15% HIGHER THAN EVERYONE ELSE."),
+				TEXT("MODDED"),
+				TEXT("LOAD A MODDED CLIP: THE GUN GOES FULL AUTO AND FIRES 1.65X FASTER. ENDS AFTER ONE "
+				     "CLIP OR 5S, WHICHEVER COMES FIRST."),
+				25.f,
+				FLinearColor(1.00f, 0.45f, 0.12f, 1.f)    // ember
+			},
+			{
+				7, TEXT("ELLE"),
+				TEXT("WELL-TIMED SLIDE JUMPS GIVE HER 40% MORE OF THE MOMENTUM BOOST THAN ANYONE ELSE."),
+				TEXT("PASSING OR THROWING THE CORE CLOAKS HER FOR 3S - SEMI-TRANSPARENT AND HARD TO SEE "
+				     "OR AIM AT."),
+				TEXT("SNAP"),
+				TEXT("PLACE A GATE, THEN PRESS AGAIN WITHIN 4S TO PLACE ITS PAIR. PLAYERS ON EITHER TEAM "
+				     "CAN TELEPORT BETWEEN THEM. BOTH VANISH AFTER 8S."),
+				35.f,
+				FLinearColor(0.85f, 0.42f, 1.00f, 1.f)    // orchid
+			},
+			{
+				8, TEXT("SLIMEBALL"),
+				TEXT("HOLD V TO STICK TO A WALL."),
+				TEXT("WHILE STUCK: FIRES 30% FASTER AND TAKES 30% LESS FROM BODY SHOTS AND FRONT KNIFE "
+				     "STABS. HEADSHOTS AND BACKSTABS STILL HURT IN FULL."),
+				TEXT("SLIMEWALL"),
+				TEXT("THROW UP A WALL WHERE YOU ARE AIMING, FOR 4S. BULLETS PASS STRAIGHT THROUGH IT BUT "
+				     "NOBODY CAN SEE THROUGH IT, AND ENEMIES WALKING THROUGH ARE SLOWED 35%."),
+				25.f,
+				FLinearColor(0.66f, 0.92f, 0.16f, 1.f)    // slime
 			}
 		};
 
@@ -129,7 +193,7 @@ namespace TraceCharacterRosterFile
 	// =============================================================================================
 
 	/**
-	 * The five entries built from the assets, and the strings they point INTO.
+	 * The Count entries built from the assets, and the strings they point INTO.
 	 *
 	 * FTraceCharacterEntry holds `const TCHAR*`, because it is read by a Canvas HUD that draws every
 	 * frame and by a header that deliberately takes no dependency on UObject. Those pointers must
@@ -165,7 +229,7 @@ namespace TraceCharacterRosterFile
 	void OnUseAssetsCVarChanged(IConsoleVariable* /*Variable*/);
 
 	/**
-	 * RULE §0.1's toggle. 1 (default) = use the assets when all five are present and valid;
+	 * RULE §0.1's toggle. 1 (default) = use the assets when ALL of them are present and valid;
 	 * 0 = the C++ table, unconditionally, exactly as the game behaved before spec v17 §5.
 	 *
 	 * Default 1 rather than 0 because spec v17 §5 asks for "loads definitions from assets when
@@ -177,7 +241,7 @@ namespace TraceCharacterRosterFile
 	TAutoConsoleVariable<int32> CVarUseCharacterAssets(
 		TEXT("Trace.Data.UseCharacterAssets"),
 		1,
-		TEXT("Trace, spec v17 §5. 1 = the roster reads /Game/Trace/Data/Characters when all five assets\n")
+		TEXT("Trace, spec v17 §5. 1 = the roster reads /Game/Trace/Data/Characters when ALL the character assets\n")
 		TEXT("load and validate; 0 = always use the C++ table compiled into TraceCharacterRoster.cpp.\n")
 		TEXT("Either way the game plays identically — the assets are generated from the C++ values and\n")
 		TEXT("Trace.VerifyCharacterData proves it. Changing this re-resolves the roster immediately."),
@@ -185,16 +249,17 @@ namespace TraceCharacterRosterFile
 		ECVF_Default);
 
 	/**
-	 * Load and validate all five, or none.
+	 * Load and validate ALL of them, or none. See the all-or-none note in the header.
 	 *
 	 * @param OutWhyNot  why the C++ table is being used, phrased for a log line a designer will read.
-	 * @return true only when Storage holds five good entries in id order.
+	 * @return true only when Storage holds Count good entries in id order.
 	 */
 	bool TryBuildFromAssets(FAssetRosterStorage& Storage, FString& OutWhyNot)
 	{
 		Storage.Reset();
 
-		// FIVE strings per character (name, movement, passive, activated name, activated), reserved
+		// FIVE strings PER CHARACTER (name, movement, passive, activated name, activated) — five is the
+		// number of STRINGS on a row, not the number of characters, and it did not move in v18 §2. Reserved
 		// up front so no Add can ever reallocate — see FAssetRosterStorage's comment.
 		Storage.Strings.Reserve(TraceCharacterRoster::Count * 5);
 		Storage.Entries.Reserve(TraceCharacterRoster::Count);
@@ -206,7 +271,7 @@ namespace TraceCharacterRosterFile
 			const FString ObjectPath  = UTraceCharacterDefinition::ObjectPathFor(TypedId);
 
 			// Asked BEFORE LoadObject so that the ordinary "the assets have not been generated yet"
-			// case produces one calm log line rather than five engine load warnings.
+			// case produces one calm log line rather than one engine load warning per character.
 			if (!FPackageName::DoesPackageExist(PackagePath))
 			{
 				OutWhyNot = FString::Printf(TEXT("%s does not exist"), *PackagePath);
@@ -299,7 +364,7 @@ namespace TraceCharacterRosterFile
 			{
 				UE_LOG(LogTraceGame, Display,
 					TEXT("[CharacterData] Roster source: C++ table — Trace.Data.UseCharacterAssets is 0. "
-					     "The five characters are exactly what they were before spec v17 §5."));
+					     "The characters are exactly what they were before spec v17 §5."));
 			}
 			else
 			{

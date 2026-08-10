@@ -1388,7 +1388,8 @@ void ATraceHUD::DrawThrowChargeRing()
 
 	ATraceCore* ChargeCore = TraceGS->Core;
 
-	// *** THE SWEEP IS THE HOLD, LINEARLY, AND FULL AT CoreThrowChargeSeconds (0.8 s after v16 §0).
+	// *** THE SWEEP IS THE HOLD, LINEARLY, AND FULL AT CoreThrowChargeSeconds (0.6 s after v18 §0;
+	// *** 1.0 in v13, 0.8 in v16 — read the knob, never this sentence).
 	// *** Spec v16 §2: "to demonstrate how charged /100% the throw is". GetThrowChargeAlpha() is
 	// exactly that fraction and nothing else; GetThrowChargeScaleNow() is the resulting MOMENTUM,
 	// which starts at the 15% floor rather than at zero and would therefore draw a ring that is
@@ -2616,19 +2617,25 @@ namespace TraceHudCornerUmg
 	 * Default for the SHARED switch, applied ONLY if this file is the one that registers it.
 	 *
 	 * As things stand it never is: TraceMenuHUD.cpp registers `Trace.UI.UseUMG` with an
-	 * FAutoConsoleVariableRef at static-init time, long before the first frame draws, and this
-	 * file finds it. The value here matters only if the menus' conversion is ever backed out — and
-	 * it agrees with theirs, so the answer does not depend on which file wins the race.
+	 * FAutoConsoleVariableRef at static-init time, long before the first frame draws, and this file
+	 * finds it. The value here therefore matters only if the menus' conversion is ever backed out.
 	 *
-	 * 1, and the measurement is in the step's report: the spec v16 §2 evidence harness
-	 * (Trace.HUD.V16Shots) was run against the same fixture with the corner on Canvas and on UMG and
-	 * produced the same verdict — 27 passed, 0 failed, both times — and the same draw record: the
-	 * same ammo string, the same lit-tick count, the same chips in the same order with the same
-	 * drains. The photographs of the two agree to within a few pixels at 720p (the magazine strip
-	 * lands on exactly the same scanlines). Spec v17 §4 asks for the default to be "whichever you can
-	 * prove is at least as good"; that is the proof, and the Canvas path is still one cvar away.
+	 * *** IT IS 0, AND IT USED TO BE 1, AND THE COMMENT HERE USED TO CLAIM THE TWO AGREED. ***
+	 * They did not: TraceMenuHUD.cpp ships GUseUMG = 0 and this said 1, so a change of registration
+	 * order — or simply deleting the menus' FAutoConsoleVariableRef — would have silently turned UMG
+	 * on for the whole game. Spec v18 §4's do-not-regress list says "UMG stays OFF by default" in as
+	 * many words, and a default that depends on which translation unit initialises first is not a
+	 * default. The two numbers now genuinely agree and the answer does not depend on the race.
+	 *
+	 * WHAT THIS DOES NOT SAY. It is not a verdict on the corner's UMG path, which measured
+	 * equivalent: Trace.HUD.V16Shots ran the same fixture on Canvas and on UMG and reported 27
+	 * passed / 0 failed both times, with the same ammo string, the same lit-tick count and the same
+	 * chips in the same order, photographs agreeing to within a few pixels at 720p. The reasons the
+	 * SHIPPED default is off are the menus' — ~40 s of black screen at launch and a mis-stroked
+	 * wordmark — and they are written out at length beside TraceMenuHUD.cpp's own variable. Flip both
+	 * to 1 together when those close; `Trace.UI.HUD.UseUMG 1` still A/Bs this corner alone meanwhile.
 	 */
-	static constexpr int32 SharedToggleDefault = 1;
+	static constexpr int32 SharedToggleDefault = 0;
 
 	/** Z-order of the corner on the player's screen. Above nothing in particular — it is the only widget. */
 	static constexpr int32 CornerZOrder = 10;
@@ -3487,6 +3494,31 @@ namespace TraceKillFeedArt
 		TEXT("...###.......")
 	};
 
+	// SPEC v18 §2 — Roxie's rocket. A rocket flying right: fins at the tail, an ogive nose, and a
+	// two-cell exhaust flame separated from the body by a one-cell gap.
+	//
+	// THE FINS AND THE FLAME ARE THE WHOLE DESIGN, because the thing this glyph has to be
+	// distinguishable from at 26 px is the BULLET, which is also a right-pointing ogive. A rocket
+	// drawn as "a longer bullet" would have been indistinguishable at feed size and the row would have
+	// been a lie that looked like a typo. The flame is deliberately DETACHED — the same trick the
+	// back-stab chevron uses — because a separated element survives the dilate and reads as motion.
+	static const TCHAR* const GlyphRocket[GlyphGrid] =
+	{
+		TEXT("............."),
+		TEXT("............."),
+		TEXT("...##........"),
+		TEXT("...###......."),
+		TEXT("...########.."),
+		TEXT("##.#########."),
+		TEXT("##.##########"),
+		TEXT("##.#########."),
+		TEXT("...########.."),
+		TEXT("...###......."),
+		TEXT("...##........"),
+		TEXT("............."),
+		TEXT(".............")
+	};
+
 	static const TCHAR* const* GlyphFor(ETraceKillIcon Icon)
 	{
 		switch (Icon)
@@ -3497,6 +3529,7 @@ namespace TraceKillFeedArt
 		case ETraceKillIcon::World:    return GlyphWorld;
 		case ETraceKillIcon::Knife:    return GlyphKnife;
 		case ETraceKillIcon::Backstab: return GlyphBackstab;
+		case ETraceKillIcon::Ability:  return GlyphRocket;
 		default:                       return GlyphBullet;
 		}
 	}
@@ -3514,10 +3547,14 @@ namespace TraceKillFeedArt
 		case ETraceKillIcon::Parry:    return TraceHUDStyle::Danger;
 		case ETraceKillIcon::World:    return TraceHUDStyle::InkDim;
 		// A back-stab is a one-swing kill from behind, so it gets the same amber the head shot gets:
-		// this HUD already means "that was the expensive kind of hit" by amber, and the two are the
-		// only 100-damage single events in the game. The front swipe stays neutral because it is not
+		// this HUD already means "that was the expensive kind of hit" by amber, and it is one of the
+		// three 100-damage single events in the game. The front swipe stays neutral because it is not
 		// one — 30 damage, four swings, an ordinary trade.
 		case ETraceKillIcon::Backstab: return TraceHUDStyle::Warning;
+		// Roxie's rocket is the third: flat 100 anywhere on the body, one press, 35 s of cooldown
+		// behind it. Same amber for the same reason — the victim needs to know instantly that this was
+		// not a fight they could have out-aimed.
+		case ETraceKillIcon::Ability:  return TraceHUDStyle::Warning;
 		default:                       return TraceHUDStyle::Ink;   // Bullet, Dash and Knife: neutral
 		}
 	}

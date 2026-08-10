@@ -294,6 +294,55 @@ public:
 	virtual float GetMagnetRadiusMultiplier() const { return 1.f; }
 
 	/**
+	 * INTEGRATION SEAM (spec v18 §2). Multiplier the gun applies to UTraceSettings::FireInterval for
+	 * this player. 1.0 = the ordinary rate, which is every character except two.
+	 *
+	 * *** IT SCALES A PERIOD, SO A FASTER GUN RETURNS A SMALLER NUMBER. *** Roxie's Modded is "fire
+	 * rate ×1.65", i.e. 1/1.65 = 0.606 of the interval; Slimeball's stuck passive is "+30% fire rate",
+	 * i.e. 1/1.30 = 0.769. A character that returned 1.65 here would fire SLOWER while its card and
+	 * its HUD both claimed faster — which reads in a playtest as "the ability does nothing" rather
+	 * than as a bug, and is the inversion every note on both characters warns about.
+	 *
+	 * THE GUN MUST NOT KNOW EITHER CHARACTER'S NAME, which is the whole reason this is a virtual here
+	 * rather than two casts in Gameplay/TraceWeaponComponent.cpp — the same argument
+	 * GetDashHitSweepRadius() makes for the movement component and Chut.
+	 */
+	virtual float GetFireIntervalScale() const { return 1.f; }
+
+	/**
+	 * INTEGRATION SEAM (spec v18 §2). This character's WELL-TIMED slide-jump planar multiplier,
+	 * derived from the one the movement component computes for everybody.
+	 *
+	 * @param InWellTimedBonus  whatever UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus()
+	 *                          answers globally (1.446875 today).
+	 *
+	 * The global number is passed IN rather than read here so there is exactly one definition of "the
+	 * base" and it is the shipped one — a character that read UTraceSettings itself would quietly stop
+	 * tracking a retune of the base. Elle is the only override (+40% of the GAIN, not the multiplier);
+	 * everybody else returns their argument, which is what makes spec v18 §4's "slide-jump 1.446875
+	 * (Elle changes only her own)" true by construction.
+	 */
+	virtual float ModifySlideJumpWindowSpeedBonus(float InWellTimedBonus) const { return InWellTimedBonus; }
+
+	/**
+	 * Seconds this CHARACTER will refuse its own activated ability for, over and above the framework's
+	 * cooldown. 0 (the default) means "the framework's timer is the whole truth", which is every
+	 * character but one.
+	 *
+	 * WHY IT EXISTS: the HUD's cooldown ring reads the framework timer, and for a character whose
+	 * CanActivate() enforces a longer wait of its own the ring says READY while the ability refuses.
+	 * That is worse than a wrong number — a player presses a lit button, nothing happens, and there is
+	 * nothing on screen that could explain it. Elle's Snap is the case: her FIRST press deliberately
+	 * charges no framework cooldown (or the second press could never reach her), so a cast she never
+	 * completes leaves the framework at zero and Elle refusing for up to 31 s.
+	 *
+	 * Read through UTraceAbilityComponent::GetActivatedCooldownRemaining(), which takes the max of
+	 * this and its own two deadlines — so a character can only ever make the ring MORE conservative,
+	 * never make a genuinely-cooling ability look ready.
+	 */
+	virtual float GetCharacterOwnedCooldownRemaining() const { return 0.f; }
+
+	/**
 	 * Damage this player is ABOUT to take, before it lands. Return the modified amount.
 	 * Chut's Chud is here (−30% from body shots and melees). Called on the server.
 	 */

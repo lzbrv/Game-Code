@@ -108,11 +108,17 @@
 //   AIR ACCELERATION is the real Quake/Source projection formula, in CalcVelocity() while falling.
 //        Project the current planar velocity onto the wish direction; the input may only raise that
 //        PROJECTION up to AirMaxWishSpeed, at AirAcceleration uu/s². Input can therefore only ever
-//        ADD velocity along the wish direction and can never subtract any, so input perpendicular
-//        to travel ROTATES the velocity vector at (slightly more than) constant magnitude instead
-//        of braking it. There is no lerp toward the input direction anywhere in this file, because
-//        a lerp is exactly the thing that makes strafing cost speed.
+//        ADD velocity along the wish direction, so input perpendicular to travel ROTATES the
+//        velocity vector at (slightly more than) constant magnitude instead of braking it. There is
+//        no lerp toward the input direction anywhere in this file, because a lerp is exactly the
+//        thing that makes strafing cost speed.
 //        There is also NO air friction: releasing the stick in mid-air coasts at full speed.
+//
+//        SPEC v18 §1a ADDS ONE TERM AND ONLY ONE: an OPPOSITION BRAKE, scaled by the negative part
+//        of dot(wish, travel). It is exactly zero from dead-ahead round to a dead-square 90° strafe
+//        — so every frame of every gaining strafe is arithmetically unchanged — and rises smoothly
+//        to AirStrafeOpposingDeceleration at a full 180° reversal. See ComputeAirStrafeStep() for
+//        why the reversal produced NO change at all before it, which is the reported bug.
 //
 //   LANDING DOES NOT CLAMP. UCharacterMovementComponent::CalcVelocity brakes hard the moment
 //        `IsExceedingMaxSpeed(MaxWalkSpeed)` is true — GroundFriction 8 × BrakingFrictionFactor 2
@@ -232,7 +238,8 @@
 // The implementation is one extra step at the end of the formula:
 //
 //   1. Compute the new planar vector exactly as before (rotated, very slightly longer).
-//   2. Gain = |new| − |old|, which the projection formula guarantees is >= 0.
+//   2. Gain = max(0, |new| − |old|). READ THE NEXT PARAGRAPH BEFORE TOUCHING THAT max(): it is not
+//      belt and braces, it is load-bearing, and for four passes its comment said the opposite.
 //   3. Scale that gain by ((HardCap − |old|) / (HardCap − SoftCap))^Exponent, clamped to [0,1] and
 //      equal to 1 below the soft cap. At the soft cap the strafe is worth 100%; at the hard cap it
 //      is worth 0%; in between it decays as an exponential falloff, which is what "harder and harder
@@ -248,6 +255,45 @@
 // "falloff only", "cap only", "both" and "neither, i.e. Demo 5 behaviour" are all one ini edit away.
 // Every term is a pure function of (planar speed, config), so the whole thing replays exactly and
 // adds no saved-move state.
+//
+// --- SPEC v18 §1a: WHY REVERSING IN THE AIR DID NOTHING, AND IT WAS STEP 2 ---------------------
+//
+// "When inputting solely A or D and jumping, when you go the opposite direction during the jump (if
+// pressing A and jumping then letting go of A and pressing D, for example) your momentum doesn't
+// change at all. We want it so doing so slows down your momentum."
+//
+// THE DIAGNOSIS THAT WAS IN THIS FILE WAS WRONG, and it is worth spelling out because it survived
+// four passes. Step 2's comment used to read "which the projection formula guarantees is >= 0", i.e.
+// the formula never brakes. It does. "Only ever ADD along the wish direction" and "only ever make
+// the vector longer" are different statements, and they come apart the moment the wish direction is
+// opposed to travel: adding 128 uu/s of +X onto 800 uu/s of −X gives a vector 672 uu/s long. The
+// projection formula, left alone, DOES slow a reversal — hard, at the full AirAcceleration.
+//
+// It was step 2's max(0, ...) that erased it, and then step 4 put the speed back. Worked through at
+// the shipped numbers with a 16 ms frame:
+//
+//     |old| = 800 (−X)   wish = +X   AccelSpeed = min(8000·0.016, 160+800) = 128
+//     |new| = |(−800,0) + (128,0)| = 672
+//     Gain  = max(0, 672 − 800) = 0        <-- the loss is discarded here
+//     Target= 800 + 0·GainScale = 800
+//     step 4: rescale the 672-long vector to 800.  IDENTICAL TO WHERE IT STARTED.
+//
+// That is not "barely changes". It is a bit-exact restoration of the player's momentum on every
+// single frame of the reversal, which is precisely the sentence the user wrote.
+//
+// THE FIX IS ONE NAMED TERM, NOT A REVERTED CLAMP. Letting the raw loss through would decelerate at
+// AirAcceleration itself — 8000 uu/s², a dead stop from 800 in 0.1 s — which is the "feels like
+// hitting a wall" outcome the spec rules out in as many words. So the max(0,...) STAYS (which also
+// keeps the gain path byte-identical) and a separate AirStrafeOpposingDeceleration is subtracted,
+// scaled by the negative part of dot(wish, travel):
+//
+//     Opposition = max(0, −dot(wish, travel))        0 at 90°, 0.5 at 120°, 1 at 180°
+//     Target    -= AirStrafeOpposingDeceleration · Opposition · InputScale · dt
+//
+// AT 90° AND INSIDE IT THE TERM IS EXACTLY ZERO. Not small — zero, because the dot product is. So
+// every frame of every speed-gaining strafe produces the identical float it produced before this
+// existed, and "do not flatten the skill ceiling" is an equality rather than a hope.
+// Trace.Move.V18.AirReverse checks it as one, in both arms, off one binary.
 //
 // --- SPEC v5 §7 / v12 §5: THE LEDGE RUBBER-BAND (THE MANTLE IS GONE) ---------------------------
 //
@@ -691,6 +737,14 @@ public:
 	void LogWallStickReport() const;
 
 	/**
+	 * SPEC v18 §1b — arms the air drift ledger on THIS pawn for @p Seconds of world time.
+	 *
+	 * Public because Trace.Move.V18.AirDrift is a free console command and the ledger's state is not.
+	 * Re-arming restarts the session; the report prints itself when the window closes.
+	 */
+	void ArmAirDriftMeter(float Seconds);
+
+	/**
 	 * SPEC v9 §§5-8 — every tuned number and every KNOCK-ON of the gravity change, in one block.
 	 *
 	 * §8 says gravity "touches everything: jump height, air time, the mantle, the wall jump, the
@@ -1040,6 +1094,32 @@ public:
 	 */
 	bool IsCarryingExcessSpeed() const;
 
+	/**
+	 * SPEC v18 §1a. ONE SUB-STEP OF THE AIR MODEL, AS A PURE FUNCTION.
+	 *
+	 * The whole of the Source air formula, the spec v5 §1 accumulation ceiling and the v18 §1a
+	 * opposition brake, taking their inputs as arguments and reading nothing but the tuning getters.
+	 * ApplySourceAirAcceleration() is now a thin wrapper that resolves the wish direction (including
+	 * the v10 §5 into-wall projection, which needs member state) and calls this.
+	 *
+	 * IT IS SPLIT OUT FOR EXACTLY THE REASON ComputeDashDirection() IS. "Reversing in the air slows
+	 * you, and turning into your travel direction still does not" is a claim about this arithmetic at
+	 * a range of angles, and the only honest way to check it is to drive the SHIPPED arithmetic with
+	 * synthetic vectors — a harness that re-implements the formula is measuring its own copy, and this
+	 * project has already been bitten by a harness holding a stale copy of a rule. If you are tempted
+	 * to inline this back into ApplySourceAirAcceleration(), don't.
+	 *
+	 * @param InPlanarVelocity current horizontal velocity. Z is ignored and never written.
+	 * @param InWishDirection  the wish direction, normalised inside. Zero-length means "no input", and
+	 *                         returns the velocity untouched (Source has no air friction and neither
+	 *                         do we).
+	 * @param InInputScale     analog deflection in [0,1]. 1 for a keyboard.
+	 * @param InDeltaTime      the sub-step length, in seconds.
+	 * @return the new planar velocity. Z is always 0.
+	 */
+	FVector ComputeAirStrafeStep(const FVector& InPlanarVelocity, const FVector& InWishDirection,
+		float InInputScale, float InDeltaTime) const;
+
 	// --- The audit surface (spec v16 §5) ---------------------------------------------------------
 	//
 	// Read-only forwarders onto tuning getters and instrument counters that are otherwise protected,
@@ -1057,6 +1137,27 @@ public:
 
 	/** Live slide velocity, in uu/s. Zero when not sliding. */
 	float GetSlideSpeedForAudit() const { return SlideSpeed; }
+
+	/** SPEC v18 §1a. The opposition brake actually in force, uu/s² at a dead-on reversal. */
+	float GetAirStrafeOpposingDecelerationForAudit() const { return GetAirStrafeOpposingDeceleration(); }
+
+	/** Fraction of a strafe's speed GAIN granted at this planar speed. Never touches the brake. */
+	float GetAirStrafeGainScaleForAudit(const float PlanarSpeed) const { return GetAirStrafeGainScale(PlanarSpeed); }
+
+	/** Seconds left on the v10 §5 buffered mid-air jump press. See GetWallJumpInputBufferSeconds(). */
+	float GetWallJumpInputBufferRemainingForAudit() const { return WallJumpInputBufferRemaining; }
+
+	/** Seconds left on the wall-jump contact window. Zero when no face is latched. */
+	float GetWallJumpWindowRemainingForAudit() const { return WallJumpWindowRemaining; }
+
+	/** Seconds of "the ability layer still counts this pawn as grounded" left. See the ledge grace. */
+	float GetGroundGraceRemainingForAudit() const { return GroundGraceRemaining; }
+
+	/** Seconds of dash window left. Zero when not dashing. */
+	float GetDashTimeRemainingForAudit() const { return DashTimeRemaining; }
+
+	/** Seconds of slide-jump coyote grace left. Zero when no slide has recently ended. */
+	float GetSlideJumpGraceRemainingForAudit() const { return SlideJumpGraceRemaining; }
 
 	/** Seconds of slide left, the same number the well-timed window is measured against. */
 	float GetSlideTimeLeftForAudit() const { return GetSlideTimeLeft(); }
@@ -1156,6 +1257,11 @@ protected:
 	/**
 	 * Quake/Source air acceleration for one sub-step. Assumes Velocity.Z has already been stripped
 	 * by PhysFalling and never writes it.
+	 *
+	 * A THIN WRAPPER since spec v18 §1a: it resolves the wish direction from Acceleration, applies the
+	 * v10 §5 into-wall projection (the only part that needs member state), and hands the rest to
+	 * ComputeAirStrafeStep(). Put new air-model arithmetic in THAT function, not here, or the measured
+	 * verification stops covering it.
 	 */
 	void ApplySourceAirAcceleration(float DeltaTime);
 
@@ -1299,6 +1405,34 @@ protected:
 	 * curve is defined. The measurement harness prints it at a range of speeds.
 	 */
 	float GetAirStrafeGainScale(float PlanarSpeed) const;
+
+	// --- SPEC v18 §1a: THE OPPOSITION BRAKE ------------------------------------------------------
+
+	/**
+	 * SPEC v18 §1a. Deceleration, in uu/s², applied when the air input points AGAINST travel.
+	 *
+	 * "When inputting solely A or D and jumping, when you go the opposite direction during the jump
+	 * your momentum doesn't change at all. We want it so doing so slows down your momentum."
+	 *
+	 * SCALED BY HOW OPPOSED THE INPUT IS — by the negative part of dot(wish, travel), so this value is
+	 * the rate at a dead-on 180° reversal, half of it at 120°, and EXACTLY ZERO at 90° and anywhere
+	 * inside it. That last clause is the load-bearing one: the air strafe is a ~90° input, so the
+	 * brake is arithmetically absent from every frame of a normal strafe and the skill ceiling cannot
+	 * have moved. A binary "is the input opposed" test would have made a 91° counter-steer feel like
+	 * hitting a wall, which is why it is a ramp.
+	 *
+	 * WHY IT IS NEEDED AT ALL, given that the raw projection formula already loses speed on a
+	 * reversal: see ComputeAirStrafeStep(). The spec v5 §1 gain ceiling clamps the frame's speed DELTA
+	 * at zero and then rescales the turned vector back to the entry speed, which erases that loss
+	 * exactly. Left alone it produces "momentum doesn't change at all" to the last float bit.
+	 *
+	 * 2200 uu/s² is deliberately well under AirAcceleration (8000): a full reversal bleeds at about a
+	 * quarter of the rate a strafe builds, so 1000 uu/s takes ~0.45 s to kill. That reads as "I slowed
+	 * myself down", not "I hit a wall" — the spec asks for the first in as many words.
+	 *
+	 * Pure function of config, so it needs no saved-move state and replays exactly.
+	 */
+	float GetAirStrafeOpposingDeceleration() const;
 
 	// --- Wall-jump tuning (spec v8 §7) -----------------------------------------------------------
 	//
@@ -1651,6 +1785,81 @@ protected:
 	float LastDashActiveWorldTime = -1000.f;
 
 #if !UE_BUILD_SHIPPING
+	// --- SPEC v18 §1b: THE AIR DRIFT LEDGER -------------------------------------------------------
+	//
+	// "When mid jump with some forward momentum already, it feels like new movement vectors happen
+	// without any player inputs or strafes, which is awkward."
+	//
+	// The spec's instruction is "reproduce it before theorising", and the only honest reproduction of
+	// "velocity changed and I did not ask for it" is a PER-MOVE LEDGER: for every simulated move on
+	// which the pawn is airborne AND its input acceleration is zero, record how much the planar
+	// velocity moved and which of this component's mid-air velocity writers was live at the time.
+	//
+	// Ticked from OnMovementUpdated (the record pass only — a replay re-runs the same frames and would
+	// count each one several times), armed by Trace.Move.V18.AirDrift, defined in
+	// Movement/TraceMovementV18.cpp next to the command that reads it. Observation only: nothing here
+	// is read by the simulation, so it cannot desync anything and it is not saved-move state.
+	//
+	// @param OldVelocity the velocity at the START of this move, which is exactly what
+	//                    OnMovementUpdated is handed — so the delta covers the whole move including
+	//                    every physics sub-step, which is the window the player perceives.
+	void TickAirDriftMeter(float DeltaSeconds, const FVector& OldVelocity);
+
+	/** World seconds the ledger stops recording at. Negative when disarmed, which is the default. */
+	float AirDriftUntilTime = -1.f;
+
+	/** Airborne, zero-input moves seen; and of those, how many moved the planar velocity at all. */
+	int32 AirDriftSamples = 0;
+	int32 AirDriftMovedSamples = 0;
+
+	/** Worst single-move planar change over the session, and the total, both in uu/s. */
+	float AirDriftWorstStep = 0.f;
+	float AirDriftTotalStep = 0.f;
+
+	/** Which of this component's writers was live on the worst move. See the .cpp for the bit list. */
+	int32 AirDriftWorstFlags = 0;
+	float AirDriftWorstBefore = 0.f;
+	float AirDriftWorstAfter = 0.f;
+
+	/** Per-writer tallies, so the report can name a cause instead of printing a number. */
+	int32 AirDriftWallLaunches = 0;
+	int32 AirDriftDashExits = 0;
+	int32 AirDriftSlideExits = 0;
+
+	/**
+	 * Moves that changed the planar velocity with NOTHING live to explain it — no wall contact, no
+	 * dash exit, no slide exit, no ledge grace.
+	 *
+	 * THIS IS THE ONLY NUMBER THAT WOULD CONVICT THE AIR MODEL ITSELF, which is why it is counted
+	 * separately rather than derived by subtraction in the report. "Moved samples minus the ones I can
+	 * name" silently counts a wall contact as unexplained the moment a new writer is added and nobody
+	 * updates the subtraction.
+	 */
+	int32 AirDriftUnexplained = 0;
+
+	/** Snapshot taken when the ledger was armed, so the correction count is a delta. */
+	int32 AirDriftCorrectionsAtArm = 0;
+
+	/**
+	 * SPEC v18 §1b. Wall jumps launched by the v10 §5 CAUSE 2 press buffer rather than by a press on
+	 * that frame — i.e. the only way this component can hand a player several hundred uu/s on a frame
+	 * they pressed nothing.
+	 *
+	 * Lifetime count, incremented in OnMovementUpdated; the drift report prints a delta against the
+	 * value at arming. Observation only, never read by the simulation, never saved-move state.
+	 */
+	int32 WallJumpBufferedLaunches = 0;
+	int32 AirDriftBufferedLaunchesAtArm = 0;
+
+	/**
+	 * Previous-move values, so an EVENT ("a wall jump fired", "the dash window closed") can be derived
+	 * as a transition. TickAirDriftMeter runs after OnMovementUpdated has already advanced every clock,
+	 * so the state it sees is post-event and only a transition can name what happened.
+	 */
+	int32 AirDriftPrevWallJumps = 0;
+	float AirDriftPrevDashTime = 0.f;
+	float AirDriftPrevSlideTime = 0.f;
+
 	// --- Slide measurement ("-TraceSlideDebug", or `Trace.SlideDebug 1`) -------------------------
 	//
 	// Deliberately NOT saved-move state and never read by the simulation: these only observe. They

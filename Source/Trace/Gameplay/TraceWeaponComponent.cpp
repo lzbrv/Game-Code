@@ -574,7 +574,18 @@ bool UTraceWeaponComponent::CanFire() const
 		}
 	}
 
-	const double FireInterval = FMath::Max(0.01f, UTraceSettings::Get().FireInterval);
+	// SPEC v18 §2 — the per-character fire rate. Roxie's Modded is "fire rate x1.65" and Slimeball's
+	// stuck passive is "+30% fire rate"; both arrive here as a scale ON THE INTERVAL, i.e. a number
+	// BELOW 1 for a faster gun (1/1.65 = 0.606, 1/1.30 = 0.769). The gun multiplies and never divides
+	// — dividing by 1.65 here would make Roxie fire slower while her card, her HUD and her ability log
+	// all said faster, which reads in a playtest as "the ability does nothing" rather than as a bug.
+	//
+	// One character-agnostic call, exactly like TraceAbilityWeaponHooks::OnBulletHit above it: the gun
+	// must not learn the name of a character, or the third character that needs a fire-rate change
+	// adds a third cast next to the first two. 1.0 for everybody else, including every Mannequin and
+	// every bot, so nothing about the base gun's cadence moves.
+	const double FireInterval = FMath::Max(0.01f, UTraceSettings::Get().FireInterval)
+		* UTraceAbilityComponent::GetFireIntervalScaleFor(Character);
 	return (GetLocalTimeSeconds() - LastLocalFireTime) >= FireInterval;
 }
 
@@ -1737,7 +1748,15 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	const UTraceSettings& Settings = UTraceSettings::Get();
 
 	// ---- fire rate, with slack for honest jitter -----------------------------------------
-	const double FireInterval = FMath::Max(0.01f, Settings.FireInterval);
+	//
+	// SPEC v18 §2: scaled by the SAME per-character seam CanFire() uses, and it has to be. If only the
+	// client's gate scaled, a Roxie with Modded up would fire every 0.242 s and this validation would
+	// reject every second shot as rate-limited — which reads as the gun eating bullets, i.e. strictly
+	// worse than the ability not working at all. The server re-derives the scale from its own
+	// authoritative ability state rather than trusting anything in the RPC payload, so a client that
+	// lied about being Roxie gains nothing.
+	const double FireInterval = FMath::Max(0.01f, Settings.FireInterval)
+		* UTraceAbilityComponent::GetFireIntervalScaleFor(Character);
 	const double LocalNow = GetLocalTimeSeconds();
 	if ((LocalNow - LastAcceptedFireTime) < FireInterval * (1.0 - FireRateTolerance))
 	{

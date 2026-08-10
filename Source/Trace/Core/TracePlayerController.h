@@ -611,6 +611,23 @@ protected:
 	ATraceCharacter* GetLivingCharacter() const;
 
 private:
+	/**
+	 * SPEC v18 §1c. Re-fires the press edge of every HOLD-shaped gameplay action whose key is still
+	 * physically down at the moment gameplay input is handed back.
+	 *
+	 * Called from exactly one place, the restore branch of SetGameInputSuppressed, and it is the
+	 * mirror of the DoFireReleased/StopJumping/DoMove(0) that the suppress branch does. Enhanced Input
+	 * fires Started on a TRANSITION, so a key that was already held when a menu opened produces no
+	 * further Started after it closes — the player has to release and press again. Held axes recover
+	 * on their own (IA_Move is bound on Triggered); buttons are what get lost, which is why §1c reads
+	 * as "movement is fine but the action did not happen".
+	 *
+	 * NOT A BUFFER. It asks the input device what is down RIGHT NOW, so a press made and released
+	 * under the overlay is correctly gone. And deliberately only the hold-shaped actions — see the
+	 * comment at the call site for why a resting finger must not spend a dash or a 35 s ability.
+	 */
+	void RedeliverHeldPressEdges();
+
 	/** Priority of our mapping context. Nothing else adds a context, so 0 is fine. */
 	static constexpr int32 InputMappingPriority = 0;
 

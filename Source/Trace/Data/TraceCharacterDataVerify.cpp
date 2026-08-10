@@ -6,7 +6,7 @@
 //
 // §5 asks for the character assets to be "generated from the CURRENT C++ values so nothing changes —
 // prove the values round-trip identically". "Prove" is the operative word: a migration that moved
-// five characters into five .uassets and quietly rounded one cooldown would look completely healthy
+// every character into a .uasset and quietly rounded one cooldown would look completely healthy
 // from the outside, and the first person to notice would be a player who felt that Rocco's ripple
 // came back late.
 //
@@ -127,7 +127,7 @@ namespace TraceCharacterDataVerify
 	 * The cooldown the game ENFORCES for @p Id, asked of the shipped function rather than re-derived.
 	 *
 	 * UTraceCharacterAbilitySet::GetActivatedCooldownSeconds() is what
-	 * UTraceAbilityComponent::ServerActivateAbility calls, and every one of the five overrides is a
+	 * UTraceAbilityComponent::ServerActivateAbility calls, and every one of the overrides is a
 	 * pure read of UTraceSettings — no pawn, no component, no world. That is what makes it safe to
 	 * ask the CLASS DEFAULT OBJECT, which is the only instance available outside a live match, and
 	 * asking it is the whole point: a table of knob names copied into this file would be a fourth
@@ -238,7 +238,7 @@ namespace TraceCharacterDataVerify
 		if (!bAssets)
 		{
 			// Same array, so a field-by-field comparison would be comparing a thing with itself and
-			// printing five PASSes that mean nothing. Say what is actually true instead.
+			// printing a row of PASSes that mean nothing. Say what is actually true instead.
 			List.Check(&Live == &Cpp, TEXT("live table IS the C++ table"),
 				TEXT("the fallback is in force, so there is nothing to differ — this is the pre-v17 behaviour, exactly"));
 		}
@@ -298,7 +298,7 @@ namespace TraceCharacterDataVerify
 		else if (PresentAssets < TraceCharacterRoster::Count)
 		{
 			UE_LOG(LogTraceGame, Warning,
-				TEXT("[CharacterData] VERDICT: PARTIAL — %d of %d assets exist. The roster is all-five-or-none, so the "
+				TEXT("[CharacterData] VERDICT: PARTIAL — %d of %d assets exist. The roster is ALL-OR-NONE, so the "
 				     "C++ table is what runs. Regenerate with Scripts/generate-data-assets.py."),
 				PresentAssets, TraceCharacterRoster::Count);
 		}
@@ -357,7 +357,7 @@ namespace TraceCharacterDataVerify
 {
 	FAutoConsoleCommand CmdVerifyCharacterData(
 		TEXT("Trace.VerifyCharacterData"),
-		TEXT("Dev only. spec v17 §5. Prove the five character assets round-trip identically to the C++ table, that "
+		TEXT("Dev only. spec v17 §5. Prove every character asset round-trips identically to the C++ table, that "
 		     "the live roster matches it, and that every printed cooldown equals the one UTraceSettings enforces."),
 		FConsoleCommandDelegate::CreateStatic(&VerifyCharacterData));
 

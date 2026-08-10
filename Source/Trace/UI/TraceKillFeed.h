@@ -105,7 +105,16 @@ enum class ETraceKillIcon : uint8
 	/** Cause "Knife" — a front swipe, 30 damage a swing. A blade. (spec v10 §1) */
 	Knife = 5,
 	/** Cause "Backstab" — 100 damage from the rear hemisphere. A blade with a rear chevron. */
-	Backstab = 6
+	Backstab = 6,
+	/**
+	 * Cause "RoxieRocket" (spec v18 §2) — a projectile ability killed them. A rocket.
+	 *
+	 * A SEPARATE GLYPH BECAUSE IT IS A SEPARATE CLAIM. Before this existed a rocket kill fell through
+	 * to the default and drew the ordinary rifle round, i.e. the feed told the victim they had been
+	 * shot by a gun they never saw and could have duelled. The rocket is dodged, not out-aimed, and a
+	 * player who cannot tell which of the two killed them cannot learn anything from the feed.
+	 */
+	Ability = 7
 };
 
 /**

@@ -1210,6 +1210,32 @@ public:
 	float AirStrafeAsymptoteScale = 1.10f;
 
 	/**
+	 * SPEC v18 §1a — "when you go the opposite direction during the jump ... your momentum doesn't
+	 * change at all. We want it so doing so slows down your momentum." This is how fast it slows, in
+	 * uu/s^2, at a DEAD 180-degree reversal.
+	 *
+	 * SCALED BY HOW OPPOSED THE INPUT IS, which is the spec's own [ASSUMPTION] and the thing that
+	 * makes it feel like braking rather than like a wall: the brake is multiplied by the NEGATIVE part
+	 * of dot(wish direction, direction of travel), so it is EXACTLY ZERO at 90 degrees and at every
+	 * angle inside it. Air-strafing — turning INTO your direction of travel — is therefore untouched
+	 * as a float equality, not as a tolerance, which is what §1's "do NOT break air-strafing itself"
+	 * demands. 5 degrees past square bleeds 9% of a full reversal, 120 degrees 50%, 180 degrees 100%.
+	 *
+	 * 2200 IS 28% OF AirAcceleration (8000), so a reversal bleeds at roughly a quarter of the rate a
+	 * strafe builds and 1000 uu/s dies in 0.45 s. The component ceilings it at AirAcceleration, so it
+	 * can never be tuned hard enough to read as hitting a wall — the outcome §1a rules out by name.
+	 *
+	 * NAME IS LOAD-BEARING. UTraceCharacterMovementComponent::GetAirStrafeOpposingDeceleration()
+	 * resolves it BY NAME through TraceMoveKnob as "AirStrafeOpposingDeceleration". A rename here does
+	 * not fail to compile: the component silently falls back to its own built-in 2200 and the ini
+	 * stops driving it. Its BeginPlay report prints MOVEKNOB BOUND or FALLBACK for this name every
+	 * run, and Trace.VerifyKnobs lists it, precisely so the two sides cannot drift apart in silence.
+	 * `Trace.Move.AirOpposingDecel <value>` overrides it live for tuning, with no rebuild.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Opposing Deceleration (uu/s^2 at a full reversal)", ClampMin = "0.0", ClampMax = "20000.0", UIMin = "0.0", UIMax = "6000.0"))
+	float AirStrafeOpposingDeceleration = 2200.f;
+
+	/**
 	 * SPEC v9 §8 — "LESS FLOATY". Multiplier on world gravity for the PLAYER, and only the player.
 	 *
 	 * Verbatim: "Increase gravity by 12%, to make players feel less floaty when air strafing."
@@ -4331,6 +4357,435 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Sting Loaded Bullets [keep equal to Bee Count]", ClampMin = "1", ClampMax = "20", UIMin = "1", UIMax = "8"))
 	int32 XStingBulletCount = 5;
+
+	// ==========================================================================================
+	// SPEC v18 §2 — ROXIE, ELLE AND SLIMEBALL
+	//
+	// *** EVERY KNOB BELOW EXISTS BEFORE THE ABILITY THAT READS IT. THAT IS THE POINT. ***
+	//
+	// Three character agents write these three characters IN PARALLEL after this lands, and NONE of
+	// them may edit this header. Three simultaneous edits to one 4500-line file is three merge
+	// conflicts and a knob quietly lost in the resolution — so the plumbing pass declares the whole
+	// tuning surface up front, from the numbers §2 states plus the ones any honest implementation of
+	// §2 obviously needs (a projectile has to expire; a slow has to linger or a 176 uu slab is
+	// imperceptible; a pair of portals has to stop bouncing a player between them).
+	//
+	// THE THREE RULES OF THE v14 ABILITIES BLOCK STILL APPLY, unchanged, and rule 2 is the one this
+	// pass leans on hardest: NOTHING HERE CAN TURN OFF THE CARRIER RULE. Roxie's flat 100, Elle's
+	// teleport and Slimeball's 35% slow are the three most dangerous additions this game has taken,
+	// and every one of them is a call to UTraceAbilityComponent::CanAffectTarget. There is no row
+	// below that could bypass it and there must never be one.
+	//
+	// EVERY ONE OF THESE IS IN Trace.VerifyKnobs (TraceSettings.cpp). Until the three character files
+	// land they will all report OK while moving nothing, which is the one blind spot that table has
+	// by construction — it proves a knob is REACHABLE, never that anybody reached for it.
+	//
+	// THEY ARE NOT YET IN Config/DefaultGame.ini, and on this project THE INI WINS wherever it has a
+	// key. With no key, the initialisers below ARE the shipped values — the same state the v16 ammo
+	// knobs shipped in for a pass. Mirror them into DefaultGame.ini beside the Rocco/Chut/Mace/
+	// Oyster/X block when the tuning starts, and read the live numbers back with Trace.VerifyKnobs
+	// rather than trusting either file.
+	// ==========================================================================================
+
+	// ------------------------------------------------------------------------------------------
+	// ROXIE — spec v18 §2
+	//
+	// Passive: jumps 15% higher.
+	// Movement (V): a rocket that launches her backwards, fast and far. 100 damage on impact
+	// ANYWHERE on the body — no headshot/body distinction — and it WOBBLES in flight, deliberately
+	// inaccurate and hard to aim. 35 s cooldown.
+	// Activated (Modded): a modded clip — full auto at x1.65 fire rate, for one clip OR 5 s,
+	// whichever comes first. 25 s cooldown.
+	//
+	// §2 says of the rocket: "tuning to come after first implementation - so make every part of it a
+	// knob and do not agonise over the values." Everything below that is not 100, 35 or 25 is a first
+	// guess that is MEANT to move.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * §2: "jumps 15% higher". THE FRACTION IS A HEIGHT, AND HEIGHT IS NOT VELOCITY.
+	 *
+	 * *** READ THIS BEFORE YOU MULTIPLY JumpZVelocity BY 1.15. *** Apex height under gravity is
+	 * v^2 / 2g, so it goes as the SQUARE of launch speed: the velocity scale for a +15% apex is
+	 * sqrt(1.15) = 1.0724, and 1.15 on the velocity would buy +32.25% height — more than double what
+	 * was asked for.
+	 *
+	 * This project has already shipped that exact mistake once and had to measure its way back out:
+	 * spec v16 §0 asked for "+25% DISTANCE" on Chut's bash, the naive +25% on the SPEED knob bought
+	 * +65.8% distance, and the shipped value is the quadratic solve (see ChutBashKnockbackSpeed).
+	 * The knob is named for what the designer asked for; the code does the square root.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Jump HEIGHT Bonus (fraction; velocity scales as sqrt(1+this)) [v18 §2]", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.5"))
+	float RoxieJumpHeightBonus = 0.15f;
+
+	/**
+	 * §2: "The rocket deals 100 damage on impact, ANYWHERE ON THE BODY - no headshot/body distinction."
+	 *
+	 * *** THE SINGLE MOST DANGEROUS NUMBER IN THIS FILE. *** 100 is a full health bar, it ignores hit
+	 * zones, and the game's founding invariant is that NO ABILITY MAY DAMAGE A CORE CARRIER. It must
+	 * be dealt through UTraceCharacterAbilitySet::DealDamage, which routes to
+	 * UTraceAbilityComponent::CanAffectTarget — never by reaching for UTraceHealthComponent, and
+	 * never behind a carrier test written in Roxie's own file.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Damage [v18 §2: flat 100, no hit zones. DAMAGE - never a carrier]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "20.0", UIMax = "200.0"))
+	float RoxieRocketDamage = 100.f;
+
+	/**
+	 * How fast the rocket flies. DELIBERATELY WELL UNDER a thrown Core (3300) and nowhere near
+	 * hitscan: §2 wants something "deliberately inaccurate and hard to aim", and a projectile that
+	 * arrives instantly cannot be either. 2600 uu/s is roughly a second to cross the gap between two
+	 * midfield cover blocks.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Speed (uu/s)", ClampMin = "200.0", ClampMax = "20000.0", UIMin = "800.0", UIMax = "6000.0"))
+	float RoxieRocketSpeed = 2600.f;
+
+	/** How long before the rocket gives up. Speed x this is the effective range: 2600 x 3 = 7800 uu. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Lifetime (s)", ClampMin = "0.1", ClampMax = "30.0", UIMin = "0.5", UIMax = "8.0"))
+	float RoxieRocketLifetimeSeconds = 3.f;
+
+	/**
+	 * The rocket's OWN touch radius, on top of the victim's capsule — the same idea as XBeeHitRadiusUU.
+	 * IT IS NOT A SPLASH RADIUS. §2 says "on impact", once, for 100; an area-of-effect rocket would be
+	 * a different and much stronger ability than the doc describes.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Hit Radius (uu, NOT splash)", ClampMin = "1.0", ClampMax = "300.0", UIMin = "10.0", UIMax = "120.0"))
+	float RoxieRocketHitRadiusUU = 45.f;
+
+	/**
+	 * §2: it "WOBBLES in flight, deliberately inaccurate and hard to aim". This is how far off the
+	 * straight line the path swings, at its widest.
+	 *
+	 * ZERO IS THE RED ARM: a rocket with no wobble is a straight, easily-aimed 100-damage projectile,
+	 * which is a materially different (and much better) ability. Any verification of "hard to aim"
+	 * should be able to A/B against 0.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Wobble Amplitude (uu, 0 = flies straight) [v18 §2]", ClampMin = "0.0", ClampMax = "1000.0", UIMin = "0.0", UIMax = "300.0"))
+	float RoxieRocketWobbleAmplitudeUU = 120.f;
+
+	/** Wobbles per second. With the amplitude above, these two ARE "hard to aim" — tune them together. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Wobble Frequency (Hz)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.5", UIMax = "8.0"))
+	float RoxieRocketWobbleFrequencyHz = 3.f;
+
+	/**
+	 * §2: the rocket "launches her BACKWARDS, fast and far". Applied to ROXIE, opposite her aim.
+	 *
+	 * Worth reading against the two speeds this game already has in the hands: the dash is 3300 uu/s
+	 * and a wall jump throws 360 uu/s outward. 2200 is firmly a movement ability rather than a nudge,
+	 * and it is on a 35 s cooldown for that reason.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Self-Launch Impulse (uu/s, backwards)", ClampMin = "0.0", ClampMax = "8000.0", UIMin = "500.0", UIMax = "4000.0"))
+	float RoxieRocketSelfLaunchImpulse = 2200.f;
+
+	/**
+	 * Upward share of that impulse. "FAR" needs air time — a purely horizontal shove on the ground is
+	 * eaten by friction in half a second. Same shape and the same reason as ChutBashUpBias.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Self-Launch Up Bias (fraction of the impulse)", ClampMin = "0.0", ClampMax = "1.5", UIMin = "0.0", UIMax = "0.8"))
+	float RoxieRocketSelfLaunchUpBias = 0.35f;
+
+	/**
+	 * §2: "35 s cooldown". SEPARATE from the E ability's — this one is on V, exactly as Rocco's
+	 * Ripple is separate from the standard dash.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Cooldown (s) [v18 §2: 35]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float RoxieRocketCooldownSeconds = 35.f;
+
+	/**
+	 * §2: Modded makes the gun fire "x1.65".
+	 *
+	 * IT IS A RATE, AND FireInterval IS A PERIOD, so this DIVIDES: 0.40 s / 1.65 = 0.242 s, i.e. 150
+	 * RPM becomes 248. Multiplying FireInterval by 1.65 would make her fire SLOWER, which is the kind
+	 * of inversion that reads as "the ability does nothing" in a playtest rather than as a bug.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Modded Fire Rate (x; DIVIDES Fire Interval) [v18 §2: 1.65]", ClampMin = "0.1", ClampMax = "5.0", UIMin = "1.0", UIMax = "3.0"))
+	float RoxieModdedFireRateMultiplier = 1.65f;
+
+	/** §2: "the gun becomes FULL AUTO" for the duration. Off leaves it semi-auto but still faster. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Modded Makes The Gun Full Auto [v18 §2]"))
+	bool bRoxieModdedFullAuto = true;
+
+	/** §2: "lasts one clip OR 5 seconds, whichever comes first". This is the 5 s half of that. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Modded Duration (s) [v18 §2: 5, or one clip]", ClampMin = "0.1", ClampMax = "60.0", UIMin = "1.0", UIMax = "15.0"))
+	float RoxieModdedDurationSeconds = 5.f;
+
+	/**
+	 * The "one clip" half. §2 [ASSUMPTION]: "one clip" means the clip that was loaded when Modded
+	 * started, so a reload ends the effect.
+	 *
+	 * A knob rather than an omission because the other reading — Modded survives reloads and only the
+	 * 5 s stops it — is defensible and much stronger, and it should be one tick box to try rather than
+	 * a code change. At 30 rounds and 0.242 s a full clip is 7.3 s of fire, so with this OFF the 5 s
+	 * timer is what ends it in practice and the "one clip" clause never fires.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Modded Ends On Reload [v18 §2 ASSUMPTION: 'one clip' = the one loaded when it started]"))
+	bool bRoxieModdedEndsOnReload = true;
+
+	/** §2: "25 s cooldown". The card prints this too — Trace.VerifyCharacterData compares the pair. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Modded Cooldown (s) [v18 §2: 25]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float RoxieModdedCooldownSeconds = 25.f;
+
+	// ------------------------------------------------------------------------------------------
+	// ELLE — spec v18 §2
+	//
+	// Passive: "right after passing or throwing the trace, Elle automatically cloaks themselves for
+	// 3 seconds" — semi-transparent and hard to see or aim at. [ASSUMPTION] "the trace" means THE
+	// CORE (a trail is not passed or thrown), the cloak is VISUAL ONLY (no hitbox or aim-assist
+	// change), and it drops early if she picks the Core back up.
+	// Passive 2: +40% on well-timed slide-jump momentum boosts.
+	// Activated (Snap): a portal gate where she stands; reactivate within 4 s for its pair; players
+	// teleport between them; both expire 8 s after the pair is complete. 35 s cooldown.
+	// ------------------------------------------------------------------------------------------
+
+	/** §2: "cloaks themselves for 3 seconds" after passing or throwing the Core. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Cloak Duration (s) [v18 §2: 3]", ClampMin = "0.1", ClampMax = "30.0", UIMin = "0.5", UIMax = "8.0"))
+	float ElleCloakDurationSeconds = 3.f;
+
+	/**
+	 * How see-through she is while cloaked. 0 is fully invisible, 1 is not cloaked at all.
+	 *
+	 * §2 says "SEMI-transparent and hard to see or aim at", not invisible, and the difference matters
+	 * to the other team: a target that cannot be seen at all cannot be counterplayed, and this game
+	 * has no detection tools. 1.0 IS THE RED ARM for any "is she harder to see" verification.
+	 *
+	 * *** VISUAL ONLY. *** [ASSUMPTION] the cloak changes no hitbox, no lag-compensation pose and no
+	 * aim assist. Anything that made her physically harder to HIT rather than harder to SEE would be
+	 * a defensive ability the doc did not ask for, and it would interact with the lag-comp rewind in
+	 * ways nobody has designed.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Cloak Opacity (0 = invisible, 1 = no cloak) [VISUAL ONLY]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.6"))
+	float ElleCloakOpacity = 0.22f;
+
+	/** §2 [ASSUMPTION]: picking the Core back up drops the cloak early. Off leaves the full 3 s. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Cloak Drops If She Retakes The Core [v18 §2 ASSUMPTION]"))
+	bool bElleCloakEndsOnCorePickup = true;
+
+	/**
+	 * §2: "+40% on well-timed slide-jump momentum boosts". *** IT SCALES THE GAIN, NOT THE WHOLE
+	 * MULTIPLIER. ***
+	 *
+	 * Everyone's well-timed slide jump is x1.446875 today, which is 1 + 0.446875 of GAIN. +40% of the
+	 * gain is 0.446875 x 1.40 = 0.625, so Elle's is x1.625. Scaling the whole multiplier instead would
+	 * give x2.025 — an ability more than twice the size of the one asked for.
+	 *
+	 * That reading is not invented here: it is how EVERY previous slide-jump change on this project
+	 * was read, and the global switch that says so out loud is bSlideJumpBonusScalesGainOnly under
+	 * Movement|Slide. DERIVE from the shipped bonus, do not hardcode 1.625 — if the base is retuned,
+	 * Elle follows for free, which is rule 1 of the abilities block.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Slide-Jump GAIN Bonus (fraction of the gain, not the multiplier) [v18 §2: 0.446875 -> 0.625]", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
+	float ElleSlideJumpGainBonus = 0.4f;
+
+	/** §2: "she may reactivate within 4 s to place a second gate". No second gate and the first expires. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Second-Gate Window (s) [v18 §2: 4]", ClampMin = "0.25", ClampMax = "30.0", UIMin = "1.0", UIMax = "10.0"))
+	float ElleSnapSecondGateWindowSeconds = 4.f;
+
+	/** §2: "with both placed, both expire after 8 s". The clock starts when the PAIR completes. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Pair Lifetime (s) [v18 §2: 8]", ClampMin = "0.5", ClampMax = "60.0", UIMin = "2.0", UIMax = "20.0"))
+	float ElleSnapPairLifetimeSeconds = 8.f;
+
+	/** How close to a gate counts as stepping into it. Sized like Rocco's ripple entry (140 uu). */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Gate Radius (uu)", ClampMin = "20.0", ClampMax = "1000.0", UIMin = "60.0", UIMax = "300.0"))
+	float ElleSnapGateRadiusUU = 130.f;
+
+	/**
+	 * Seconds a player who has just teleported is ignored by BOTH gates.
+	 *
+	 * WITHOUT THIS THE ABILITY IS A TRAP, not a portal: you arrive standing inside the far gate, which
+	 * immediately sends you back, forever. Zero is therefore the RED arm rather than a legitimate
+	 * setting, and 1 s is long enough to walk clear of a 130 uu radius at any speed in this game.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Re-Entry Lockout (s, 0 = ping-pong forever)", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
+	float ElleSnapTeleportLockoutSeconds = 1.f;
+
+	/**
+	 * *** THE §2 [ASSUMPTION] THE USER IS MOST LIKELY TO REVERSE, AND §2 SAYS SO ITSELF. ***
+	 *
+	 * §2 verbatim: "'allowing players to teleport' means ANY player, both teams - it says players, not
+	 * teammates, and Rocco's Ripple set the precedent that a placed thing is usable by everyone. Flag
+	 * it prominently; it is the most reversible-by-them decision in this doc."
+	 *
+	 * True (shipped) = either team may use either gate. False = Elle's team only.
+	 * It is one switch and it is here so the answer is a tick box rather than a pass.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Usable By BOTH Teams [v18 §2 ASSUMPTION - the most reversible call in the doc]"))
+	bool bElleSnapUsableByBothTeams = true;
+
+	/**
+	 * May a CORE CARRIER step through a gate on purpose?
+	 *
+	 * *** THIS KNOB IS ONLY ABOUT THE VOLUNTARY CASE. *** A carrier being MOVED by an enemy gate is
+	 * ETraceAbilityEffect::Control applied to a carrier, and UTraceAbilityComponent::CanAffectTarget
+	 * already refuses that while the §4 [ASSUMPTION] stands — no knob, no exception, and nothing in
+	 * Elle's file should re-implement the test. §2 is explicit: "a Core carrier must not be teleported
+	 * by an enemy gate".
+	 *
+	 * True (shipped) = a carrier who walks into a FRIENDLY gate is carried through, classified
+	 * Beneficial, exactly as §6 lets a carrier ride Rocco's Ripple. False = gates ignore carriers
+	 * entirely, which is the safer reading if a portal-assisted carry proves too strong.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: A Carrier May Use A Gate VOLUNTARILY (an ENEMY gate can never move one) [v18 §2]"))
+	bool bElleSnapCarrierMayUseGate = true;
+
+	/** §2: "35 s cooldown". The card prints this too — Trace.VerifyCharacterData compares the pair. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap Cooldown (s) [v18 §2: 35]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float ElleSnapCooldownSeconds = 35.f;
+
+	// ------------------------------------------------------------------------------------------
+	// SLIMEBALL — spec v18 §2
+	//
+	// Movement (hold V): sticks to walls while held.
+	// Passive: while stuck, +30% fire rate and 30% damage reduction on body shots and FRONT knife
+	// stabs. [ASSUMPTION] headshots and BACK stabs are unreduced — it names body shots and front
+	// stabs, exactly as Chut's Chud names body shots and melees.
+	// Activated (Slimewall): a wall in his aim direction, one player height tall and wide and about
+	// the length of a standard in-game box — "(for now, make this changeable)", so all three
+	// dimensions are knobs. It can be SHOT THROUGH but obstructs vision, and moving through it slows
+	// enemies by 35%. Lasts 4 s, 25 s cooldown.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * THE WALL TEST for the stick: largest |Normal.Z| a surface may have and still be a wall.
+	 *
+	 * 0.70 is cos(45 degrees), the walkable floor limit, so the rule reads exactly "if he cannot stand
+	 * on it, he can stick to it". That is the same value and the same argument as
+	 * MaceSpikeMaxSurfaceNormalZ — and it is a SEPARATE knob for the same reason that one is separate
+	 * from WallJumpMaxNormalZ (0.40): the wall jump's threshold is a movement-feel decision that has
+	 * been tuned against, and moving it to fix a different ability would retune the wall jump by
+	 * accident.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Wall Stick: max |normal.Z| (0.70 = the walkable limit)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.2", UIMax = "0.9"))
+	float SlimeballWallStickMaxSurfaceNormalZ = 0.7f;
+
+	/** How close to a wall he must be for hold-V to grab it. The capsule's own radius is 34 uu. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Wall Stick: Reach (uu)", ClampMin = "10.0", ClampMax = "500.0", UIMin = "40.0", UIMax = "200.0"))
+	float SlimeballWallStickRangeUU = 90.f;
+
+	/**
+	 * How fast he creeps down the wall while stuck. 0 = welded in place, which is what "sticks to
+	 * walls" says; a small positive value is the classic slide if being motionless proves too safe.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Wall Stick: Slide Speed (uu/s, 0 = fully stuck)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "0.0", UIMax = "400.0"))
+	float SlimeballWallStickSlideSpeed = 0.f;
+
+	/**
+	 * Hard cap on one stick. §2 gives none, so the shipped value is 0 = as long as V is held.
+	 *
+	 * A knob rather than a literal for the same reason MaceSuspendCooldownSeconds is one: "he can hang
+	 * on a wall indefinitely, firing 30% faster and taking 30% less" is exactly the kind of thing a
+	 * playtest reverses, and reversing it should be a number rather than a pass.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Wall Stick: Max Duration (s, 0 = while held; UNSPECIFIED in §2)", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "10.0"))
+	float SlimeballWallStickMaxSeconds = 0.f;
+
+	/** Cooldown between sticks. §2 gives none; 0 ships, exactly as Mace's suspend does. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Wall Stick: Cooldown (s, 0 = none; UNSPECIFIED in §2)", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "10.0"))
+	float SlimeballWallStickCooldownSeconds = 0.f;
+
+	/**
+	 * §2: "+30% fire rate" WHILE STUCK ONLY.
+	 *
+	 * A RATE bonus over a PERIOD knob, like Roxie's: FireInterval is divided by (1 + this), so 0.40 s
+	 * becomes 0.308 s. Multiplying instead would slow him down while claiming to speed him up.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Stuck: Fire Rate Bonus (fraction; DIVIDES Fire Interval) [v18 §2: 0.30]", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
+	float SlimeballStuckFireRateBonus = 0.3f;
+
+	/**
+	 * §2: "30% damage reduction on body shots and front knife stabs" while stuck.
+	 *
+	 * [ASSUMPTION] HEADSHOTS AND BACKSTABS ARE UNREDUCED, because the doc names body shots and front
+	 * stabs specifically — the same reading, and the same shape of implementation, as Chut's Chud
+	 * (ChudDamageReduction, applied in ModifyIncomingDamage off FTraceAbilityDamageContext's
+	 * bHeadshot / bMelee). Copy Chud rather than inventing a second way to read a hit zone.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Stuck: Damage Reduction (fraction, body + FRONT stabs only) [v18 §2: 0.30]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.6"))
+	float SlimeballStuckDamageReduction = 0.3f;
+
+	/**
+	 * SLIMEWALL, DIMENSION 1 of 3 — HEIGHT, straight up from the floor.
+	 *
+	 * §2: "one player height tall". A Trace pawn is a 34 x 88 capsule, so one player height is 176 uu,
+	 * and that is the value here. §2 also says, of all three dimensions, "(for now, make this
+	 * changeable)" — which is why there are three knobs rather than one hardcoded box.
+	 *
+	 * *** THE AXIS EACH KNOB MEANS IS AN [ASSUMPTION], and it is the one to check first if the wall
+	 * comes out the wrong shape. *** The doc's "one player height tall and wide, and about the length
+	 * of a standard in-game box" does not say which of its words is the span and which is the
+	 * thickness. The reading here: HEIGHT is vertical, WIDTH is the thickness along his aim (the part
+	 * an enemy walks THROUGH, which is what the 35% slow needs to be non-instantaneous), and LENGTH is
+	 * the span across his aim (the part you hide behind, sized by the box). Swapping Width and Length
+	 * is a two-value edit and nothing else.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall HEIGHT (uu, vertical) [v18 §2: 176 = one player height]", ClampMin = "20.0", ClampMax = "3000.0", UIMin = "80.0", UIMax = "600.0"))
+	float SlimewallHeightUU = 176.f;
+
+	/**
+	 * SLIMEWALL, DIMENSION 2 of 3 — WIDTH, the THICKNESS along his aim direction.
+	 *
+	 * This is how far an enemy travels while inside the wall, so it is the knob that decides whether
+	 * the 35% slow is felt at all. 176 uu is the doc's "and wide", read as one player height.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall WIDTH (uu, thickness along aim - what enemies walk through) [v18 §2: 176]", ClampMin = "10.0", ClampMax = "2000.0", UIMin = "50.0", UIMax = "500.0"))
+	float SlimewallWidthUU = 176.f;
+
+	/**
+	 * SLIMEWALL, DIMENSION 3 of 3 — LENGTH, the SPAN across his aim direction.
+	 *
+	 * §2: "about the length of a standard in-game box". The arena's one-player-height cover blocks are
+	 * 1100 x 1100 (TraceArenaConstants::ApproachCover, entry D — the low diamond), so 1100 is what "a
+	 * standard in-game box" measures on this map. It is a little over six player widths of cover.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall LENGTH (uu, span across aim - the part you hide behind) [v18 §2: ~1 cover block]", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
+	float SlimewallLengthUU = 1100.f;
+
+	/** How far in front of him the wall goes up. Far enough to not be inside his own capsule. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall: Placement Distance (uu)", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "100.0", UIMax = "1500.0"))
+	float SlimewallRangeUU = 400.f;
+
+	/**
+	 * §2: "moving through it slows enemies by 35%".
+	 *
+	 * A CONTROL effect — so it goes through UTraceAbilityComponent::CanAffectTarget and does NOT apply
+	 * to a Core carrier while the §4 [ASSUMPTION] stands, exactly like Oyster's poison slow. 0 leaves
+	 * a wall that only blocks sight, which is the RED arm for any "does it slow" verification.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall: Slow (fraction) [v18 §2: 0.35. CONTROL - see the §4 assumption]", ClampMin = "0.0", ClampMax = "0.95", UIMin = "0.0", UIMax = "0.6"))
+	float SlimewallSlowFraction = 0.35f;
+
+	/**
+	 * [ASSUMPTION] how long the slow lasts after leaving the slab. §2 does not say.
+	 *
+	 * IT CANNOT SENSIBLY BE ZERO. At 176 uu thick and 800 uu/s walk speed an enemy is inside the wall
+	 * for 0.22 s; a slow that ended on the far side would be a rounding error nobody could feel, and
+	 * the ability would read as broken rather than as weak. 0.75 s is long enough that walking through
+	 * is a decision.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall: Slow Lingers For (s, after leaving) [v18 §2 ASSUMPTION]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "3.0"))
+	float SlimewallSlowLingerSeconds = 0.75f;
+
+	/** §2: "lasts 4 s". */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall Duration (s) [v18 §2: 4]", ClampMin = "0.25", ClampMax = "60.0", UIMin = "1.0", UIMax = "12.0"))
+	float SlimewallDurationSeconds = 4.f;
+
+	/**
+	 * How solid the wall LOOKS. §2: it "obstructs vision".
+	 *
+	 * *** THIS IS APPEARANCE ONLY AND IT MUST STAY THAT WAY. *** §2 is explicit that the wall "can be
+	 * shot through", so it must have no blocking collision on the weapon/trace channels — a wall that
+	 * ate bullets would silently break every hitscan crossing it, including shots that never meant to
+	 * involve Slimeball. Opacity is what makes it a sight blocker; collision is what would make it a
+	 * bullet blocker, and it does not get any.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall Opacity (LOOK ONLY - it never blocks bullets) [v18 §2]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.3", UIMax = "1.0"))
+	float SlimewallOpacity = 0.9f;
+
+	/** §2 [ASSUMPTION]: it does not slow Slimeball or his own team. On makes it a hazard for everyone. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall Slows His Own Team Too [v18 §2 ASSUMPTION: false]"))
+	bool bSlimewallSlowsOwnTeam = false;
+
+	/** §2: "25 s cooldown". The card prints this too — Trace.VerifyCharacterData compares the pair. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall Cooldown (s) [v18 §2: 25]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float SlimewallCooldownSeconds = 25.f;
 
 	// ==========================================================================================
 	// NET

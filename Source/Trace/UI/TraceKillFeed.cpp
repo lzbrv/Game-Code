@@ -2,6 +2,7 @@
 
 #include "UI/TraceKillFeed.h"
 
+#include "Abilities/Characters/TraceRoxieRocket.h"   // GetKillCause() — spec v18 §2
 #include "Containers/Ticker.h"
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
@@ -88,6 +89,20 @@ namespace TraceKillFeedCauses
 			return ETraceKillIcon::Knife;
 		}
 
+		// SPEC v18 §2 — Roxie's rocket. Asked of TraceRoxieRocket rather than matched against a
+		// literal here, so a rename of the cause is a compile-time move rather than a feed that
+		// silently goes back to drawing a rifle round for a rocket kill.
+		//
+		// NO HEAD-SHOT INFERENCE, and that is not an omission: the rocket is flat 100 "anywhere on the
+		// body" with no zone lookup anywhere in the feature, so ResolveBulletIcon's arithmetic — which
+		// deduces a head shot from the victim having been above BodyDamage — would report a skull for
+		// every single rocket kill on a healthy player. Exactly the over-reporting that function is
+		// written to avoid.
+		if (Cause == TraceRoxieRocket::GetKillCause())
+		{
+			return ETraceKillIcon::Ability;
+		}
+
 		// Accepted in advance so that the one-line weapon change described above needs no edit here.
 		static const FName Headshot(TEXT("Headshot"));
 		if (Cause == Headshot)
@@ -110,6 +125,7 @@ namespace TraceKillFeedCauses
 		case ETraceKillIcon::World:    return TEXT("WORLD");
 		case ETraceKillIcon::Knife:    return TEXT("KNIFE");
 		case ETraceKillIcon::Backstab: return TEXT("BACKSTAB");
+		case ETraceKillIcon::Ability:  return TEXT("ROCKET");
 		default:                       return TEXT("BULLET");
 		}
 	}

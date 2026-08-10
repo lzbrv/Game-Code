@@ -12,13 +12,19 @@ const TCHAR* TraceCharacterIdToString(ETraceCharacterId Id)
 {
 	switch (Id)
 	{
-	case ETraceCharacterId::Rocco:  return TEXT("Rocco");
-	case ETraceCharacterId::Chut:   return TEXT("Chut");
-	case ETraceCharacterId::Mace:   return TEXT("Mace");
-	case ETraceCharacterId::Oyster: return TEXT("Oyster");
-	case ETraceCharacterId::X:      return TEXT("X");
-	case ETraceCharacterId::None:   return TEXT("None");
-	default:                        return TEXT("<invalid>");
+	case ETraceCharacterId::Rocco:     return TEXT("Rocco");
+	case ETraceCharacterId::Chut:      return TEXT("Chut");
+	case ETraceCharacterId::Mace:      return TEXT("Mace");
+	case ETraceCharacterId::Oyster:    return TEXT("Oyster");
+	case ETraceCharacterId::X:         return TEXT("X");
+	// spec v18 §2. These spellings are load-bearing beyond a log line: AssetNameFor() builds
+	// "DA_Character_Roxie" out of them, so a typo here renames an asset the roster then cannot find
+	// — and the roster is all-or-none, so ONE typo drops all eight characters back to C++ values.
+	case ETraceCharacterId::Roxie:     return TEXT("Roxie");
+	case ETraceCharacterId::Elle:      return TEXT("Elle");
+	case ETraceCharacterId::Slimeball: return TEXT("Slimeball");
+	case ETraceCharacterId::None:      return TEXT("None");
+	default:                           return TEXT("<invalid>");
 	}
 }
 

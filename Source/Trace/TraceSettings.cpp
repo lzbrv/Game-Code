@@ -1497,6 +1497,101 @@ namespace
 			{ TEXT("XVulnerableSpeedBonus"),           EKnobType::Float, TEXT("v14 §6: +10% while ANY enemy is vulnerable") },
 			{ TEXT("XStingCooldownSeconds"),           EKnobType::Float, TEXT("v14 §6: 25s — the one that is not 20") },
 			{ TEXT("XStingBulletCount"),               EKnobType::Int,   TEXT("v14 §6: the next five bullets. Keep equal to XBeeCount") },
+
+			// =========================================================================================
+			// SPEC v18 §2 — ROXIE, ELLE AND SLIMEBALL, EVERY TUNING VALUE THEY WILL NEED
+			//
+			// *** THESE ROWS EXIST BEFORE THE ABILITIES DO, AND THAT IS THE POINT OF THE PASS. ***
+			// Three character agents write these three characters IN PARALLEL after this lands, and not
+			// one of them may edit UTraceSettings — three simultaneous edits to one 4500-line header is
+			// three merge conflicts and a knob quietly lost in the resolution. So every number spec v18
+			// §2 names, plus every number an implementation of it obviously needs (a projectile's
+			// lifetime, a slow's linger, a wall's third dimension), is declared here first.
+			//
+			// Which means this table is the ONLY thing standing between those agents and a silent
+			// no-op: they will read these by name, a misspelling is not a build error, and a
+			// misspelled read returns a default-constructed nothing. The v8 rule — "a brand-new
+			// mechanic's knobs are listed on the pass that introduces them, not the pass after" — is
+			// doing more work here than it has ever done.
+			//
+			// WHAT THIS TABLE STILL CANNOT PROVE, said again because three passes are about to depend
+			// on it: it proves a property EXISTS, is `config` (so DefaultGame.ini reaches it) and is
+			// EditAnywhere (so the panel does). It cannot prove anybody READS it. Until the three
+			// character files land, every row below says OK while the panel moves nothing — exactly
+			// the v12 §6 wall-fit situation, and it was right about that one too.
+			//
+			// THE CARRIER RULE IS NOT A KNOB, AND NOTHING BELOW IS ONE. Roxie's flat 100, Elle's
+			// teleport and Slimeball's 35% slow are the three most dangerous additions this game has
+			// taken; each of them goes through UTraceAbilityComponent::CanAffectTarget, and there is
+			// deliberately no row here that could switch that off.
+			// =========================================================================================
+
+			// --- v18 §1a: the air-reversal brake ------------------------------------------------------
+			//
+			// The one MOVEMENT knob this pass adds, listed with the v18 block rather than the air block
+			// above it for the v8 reason: a brand-new mechanic's knob belongs on the pass that
+			// introduces it. It shipped for part of this pass with no property at all, and the movement
+			// component's own MOVEKNOB report said so out loud every run —
+			//     MOVEKNOB AirStrafeOpposingDeceleration FALLBACK ... (property missing -> ini CANNOT
+			//     tune it)
+			// — which is the failure mode this whole table exists to make loud instead of silent. The
+			// component ran on its own built-in 2200 the entire time, so the FIX changed no number a
+			// player can feel; it changed whether a designer can retune it without a rebuild.
+			{ TEXT("AirStrafeOpposingDeceleration"),   EKnobType::Float, TEXT("v18 §1a: uu/s^2 bled at a DEAD 180 reversal, scaled by the negative part of dot(wish, travel) so it is EXACTLY 0 at 90 degrees and inside it - the air strafe is untouched [by-name bind]") },
+
+			// --- v18 §2: Roxie -----------------------------------------------------------------------
+			//
+			// "Tuning to come after first implementation - so make every part of it a knob and do not
+			// agonise over the values" is the doc's own instruction for the rocket, and the values below
+			// are first guesses that are meant to be moved. The two that are NOT guesses are the ones
+			// the doc states outright: 100 damage and the two cooldowns.
+			{ TEXT("RoxieJumpHeightBonus"),            EKnobType::Float, TEXT("v18 §2: 'jumps 15% higher'. A HEIGHT fraction - velocity scales as sqrt(1+this) = 1.0724, NOT 1.15. See the header") },
+			{ TEXT("RoxieRocketDamage"),               EKnobType::Float, TEXT("v18 §2: flat 100 'anywhere on the body', no headshot zone. DAMAGE - never reaches a carrier") },
+			{ TEXT("RoxieRocketSpeed"),                EKnobType::Float, TEXT("v18 §2: how fast the rocket travels; slow enough to be dodged is the point of the wobble") },
+			{ TEXT("RoxieRocketLifetimeSeconds"),      EKnobType::Float, TEXT("v18 §2: a projectile needs an end. Speed x this is the effective range") },
+			{ TEXT("RoxieRocketHitRadiusUU"),          EKnobType::Float, TEXT("v18 §2: the rocket's OWN radius on top of the victim capsule. Not a splash radius - there is no splash") },
+			{ TEXT("RoxieRocketWobbleAmplitudeUU"),    EKnobType::Float, TEXT("v18 §2: 'wobbles in flight, deliberately inaccurate'. 0 = a straight, easily-aimed rocket = the RED arm") },
+			{ TEXT("RoxieRocketWobbleFrequencyHz"),    EKnobType::Float, TEXT("v18 §2: wobbles per second. With the amplitude, this is the whole 'hard to aim'") },
+			{ TEXT("RoxieRocketSelfLaunchImpulse"),    EKnobType::Float, TEXT("v18 §2: 'launches her backwards, fast and far'. Applied to ROXIE, opposite her aim") },
+			{ TEXT("RoxieRocketSelfLaunchUpBias"),     EKnobType::Float, TEXT("v18 §2: fraction of the impulse sent upward - 'far' needs air time, same shape as ChutBashUpBias") },
+			{ TEXT("RoxieRocketCooldownSeconds"),      EKnobType::Float, TEXT("v18 §2: 35s, stated. SEPARATE from the E cooldown - this is the V ability") },
+			{ TEXT("RoxieModdedFireRateMultiplier"),   EKnobType::Float, TEXT("v18 §2: x1.65 fire rate. DIVIDES FireInterval; it is a RATE, so 0.40s becomes 0.242s") },
+			{ TEXT("bRoxieModdedFullAuto"),            EKnobType::Bool,  TEXT("v18 §2: 'the gun becomes full auto' for the duration") },
+			{ TEXT("RoxieModdedDurationSeconds"),      EKnobType::Float, TEXT("v18 §2: 5s, 'one clip OR 5 seconds, whichever comes first'") },
+			{ TEXT("bRoxieModdedEndsOnReload"),        EKnobType::Bool,  TEXT("v18 §2 ASSUMPTION: 'one clip' = the clip loaded when Modded started, so reloading ends it") },
+			{ TEXT("RoxieModdedCooldownSeconds"),      EKnobType::Float, TEXT("v18 §2: 25s. THE ENFORCED number - the card prints 25 too and Trace.VerifyCharacterData compares them") },
+
+			// --- v18 §2: Elle ------------------------------------------------------------------------
+			{ TEXT("ElleCloakDurationSeconds"),        EKnobType::Float, TEXT("v18 §2: 3s of cloak after passing or throwing THE CORE (ASSUMPTION: 'the trace' means the Core)") },
+			{ TEXT("ElleCloakOpacity"),                EKnobType::Float, TEXT("v18 §2: 'semi-transparent and hard to see or aim at'. 0 = invisible, 1 = no cloak at all = the RED arm") },
+			{ TEXT("bElleCloakEndsOnCorePickup"),      EKnobType::Bool,  TEXT("v18 §2 ASSUMPTION: picking the Core back up drops the cloak early") },
+			{ TEXT("ElleSlideJumpGainBonus"),          EKnobType::Float, TEXT("v18 §2: +40% of the GAIN, not the multiplier. 0.446875 x 1.40 = 0.625, so hers is 1.625 vs everyone's 1.446875") },
+			{ TEXT("ElleSnapSecondGateWindowSeconds"), EKnobType::Float, TEXT("v18 §2: 4s to place the second gate; miss it and the first expires") },
+			{ TEXT("ElleSnapPairLifetimeSeconds"),     EKnobType::Float, TEXT("v18 §2: with both placed, both expire after 8s") },
+			{ TEXT("ElleSnapGateRadiusUU"),            EKnobType::Float, TEXT("v18 §2: how close counts as stepping into a gate") },
+			{ TEXT("ElleSnapTeleportLockoutSeconds"),  EKnobType::Float, TEXT("v18 §2: per-player re-entry lockout. 0 ping-pongs a player between the two gates forever = the RED arm") },
+			{ TEXT("bElleSnapUsableByBothTeams"),      EKnobType::Bool,  TEXT("v18 §2 ASSUMPTION, THE MOST REVERSIBLE DECISION IN THE DOC: 'players' read as EITHER team, on Ripple's precedent") },
+			{ TEXT("bElleSnapCarrierMayUseGate"),      EKnobType::Bool,  TEXT("v18 §2: may a CARRIER step through VOLUNTARILY. Being moved by an ENEMY gate is Control and is refused by the choke point either way - that half has no knob") },
+			{ TEXT("ElleSnapCooldownSeconds"),         EKnobType::Float, TEXT("v18 §2: 35s. THE ENFORCED number; the card prints 35 too") },
+
+			// --- v18 §2: Slimeball -------------------------------------------------------------------
+			{ TEXT("SlimeballWallStickMaxSurfaceNormalZ"), EKnobType::Float, TEXT("v18 §2: largest |normal.Z| still called a wall. 0.70 = the walkable limit, i.e. 'if he cannot stand on it he can stick to it'. Same reasoning as MaceSpikeMaxSurfaceNormalZ, deliberately a SEPARATE knob") },
+			{ TEXT("SlimeballWallStickRangeUU"),       EKnobType::Float, TEXT("v18 §2: how close to a wall he must be for hold-V to grab it") },
+			{ TEXT("SlimeballWallStickSlideSpeed"),    EKnobType::Float, TEXT("v18 §2: uu/s he creeps down while stuck. 0 = welded in place, which is what 'sticks' says") },
+			{ TEXT("SlimeballWallStickMaxSeconds"),    EKnobType::Float, TEXT("v18 §2: UNSPECIFIED; shipped at 0 = as long as V is held, holding is the whole cost") },
+			{ TEXT("SlimeballWallStickCooldownSeconds"), EKnobType::Float, TEXT("v18 §2: UNSPECIFIED; shipped at 0, same reasoning as MaceSuspendCooldownSeconds") },
+			{ TEXT("SlimeballStuckFireRateBonus"),     EKnobType::Float, TEXT("v18 §2: +30% fire rate WHILE STUCK ONLY. A RATE bonus - it divides FireInterval") },
+			{ TEXT("SlimeballStuckDamageReduction"),   EKnobType::Float, TEXT("v18 §2: 30% off BODY SHOTS AND FRONT KNIFE STABS while stuck. ASSUMPTION: headshots and backstabs unreduced, exactly like Chud") },
+			{ TEXT("SlimewallHeightUU"),               EKnobType::Float, TEXT("v18 §2: 'one player height tall' = 176uu (2 x the 88 capsule half-height). CHANGEABLE, the doc says so explicitly") },
+			{ TEXT("SlimewallWidthUU"),                EKnobType::Float, TEXT("v18 §2: the slab's THICKNESS along his aim, i.e. how far an enemy walks through it. 176 = the doc's 'and wide'") },
+			{ TEXT("SlimewallLengthUU"),               EKnobType::Float, TEXT("v18 §2: the SPAN across his aim - the part you hide behind. 1100 = the arena's one-player-height cover block") },
+			{ TEXT("SlimewallRangeUU"),                EKnobType::Float, TEXT("v18 §2: how far in front of him it goes up") },
+			{ TEXT("SlimewallSlowFraction"),           EKnobType::Float, TEXT("v18 §2: 35%. CONTROL - refused on a carrier per the §4 assumption. 0 = a wall that only blocks sight = the RED arm") },
+			{ TEXT("SlimewallSlowLingerSeconds"),      EKnobType::Float, TEXT("v18 §2 ASSUMPTION: how long the slow lasts after leaving the slab; 0 makes a 176uu-thick wall barely noticeable") },
+			{ TEXT("SlimewallDurationSeconds"),        EKnobType::Float, TEXT("v18 §2: 4s, stated") },
+			{ TEXT("SlimewallOpacity"),                EKnobType::Float, TEXT("v18 §2: 'obstructs vision'. This is the LOOK only - it must never be given blocking collision, bullets pass through") },
+			{ TEXT("bSlimewallSlowsOwnTeam"),          EKnobType::Bool,  TEXT("v18 §2 ASSUMPTION: false - it does not slow Slimeball or his team") },
+			{ TEXT("SlimewallCooldownSeconds"),        EKnobType::Float, TEXT("v18 §2: 25s. THE ENFORCED number; the card prints 25 too") },
 		};
 
 		const UTraceSettings& Table = UTraceSettings::Get();

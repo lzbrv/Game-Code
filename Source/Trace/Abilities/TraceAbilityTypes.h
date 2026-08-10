@@ -29,12 +29,23 @@
 class ATraceCharacter;
 
 /**
- * The roster. Spec v14 §5, verbatim:
+ * The roster. Spec v14 §5 declared the first five:
  *     UENUM() enum class ETraceCharacterId : uint8 { None=0, Rocco, Chut, Mace, Oyster, X };
+ * and SPEC v18 §2 APPENDS THREE MORE — Roxie, Elle, Slimeball — taking the roster from 5 to 8.
  *
  * DO NOT REORDER AND DO NOT INSERT. The value is replicated as a uint8 and is persisted per player
  * for the length of a match; a renumber would silently swap two players' characters mid-match. New
- * characters APPEND, in front of Count.
+ * characters APPEND, in front of Count — which is exactly what v18 did, so a save or a replay from
+ * the v17 build still names the same five characters it always did.
+ *
+ * *** THE THREE PLACES THAT MUST MOVE WITH THIS ENUM, and the one that shouts when they do not. ***
+ *   1. TraceCharacterRoster::LastId / ::Count (Core/TraceCharacterRoster.h) — the UI slice's copy of
+ *      the id space, kept honest by static_asserts at the top of TraceCharacterRoster.cpp. Appending
+ *      here without moving those is a COMPILE ERROR, deliberately, and that is the whole point.
+ *   2. A row in the roster's C++ table, and a regenerated DA_Character_<Name> asset beside the
+ *      others — the asset table is ALL-OR-NONE, so one missing asset drops EVERY character back to
+ *      the C++ values.
+ *   3. TraceCharacterIdToString below, or every log line and console command prints "<invalid>".
  *
  * None is not "no character selected yet" in the loose sense — it is the DEFAULT CHARACTERLESS
  * MANNEQUIN, and it is a fully supported state that must keep working forever: it is what mode A
@@ -44,12 +55,17 @@ class ATraceCharacter;
 UENUM()
 enum class ETraceCharacterId : uint8
 {
-	None   = 0 UMETA(DisplayName = "None (default Mannequin)"),
-	Rocco  = 1,
-	Chut   = 2,
-	Mace   = 3,
-	Oyster = 4,
-	X      = 5,
+	None      = 0 UMETA(DisplayName = "None (default Mannequin)"),
+	Rocco     = 1,
+	Chut      = 2,
+	Mace      = 3,
+	Oyster    = 4,
+	X         = 5,
+
+	// --- spec v18 §2, appended ---------------------------------------------------------------
+	Roxie     = 6,
+	Elle      = 7,
+	Slimeball = 8,
 
 	Count  UMETA(Hidden)
 };

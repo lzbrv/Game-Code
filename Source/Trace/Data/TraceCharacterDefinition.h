@@ -27,7 +27,7 @@
 //
 //     Scripts/generate-data-assets.py   (via the editor's pythonscript commandlet)
 //
-// The script creates the five packages and then calls CopyFallbackValues() below, which reads the
+// The script creates one package per character and then calls CopyFallbackValues() below, which reads the
 // C++ table in Core/TraceCharacterRoster.cpp. The generator therefore CANNOT invent a number: there
 // is no character data in the Python at all. MatchesFallback() is the proof in the other direction —
 // it re-reads a saved asset and compares it, field by field, with the same C++ table.
@@ -163,7 +163,7 @@ public:
 	// =============================================================================================
 
 	/**
-	 * "Is this asset safe to put on the select screen?" Checks the id is one of the five, that the
+	 * "Is this asset safe to put on the select screen?" Checks the id is a real character, that the
 	 * name and the three descriptions are non-empty, and that the accent is finite. The roster
 	 * refuses the WHOLE asset table if any one character fails, and says which — a roster that is
 	 * four assets and one C++ row is a half-migration nobody can reason about.
@@ -200,9 +200,10 @@ public:
 	 * Fill @p Target from the C++ table in Core/TraceCharacterRoster.cpp. THIS is why the generator
 	 * script contains no character data: every value it writes comes through here.
 	 *
-	 * @param CharacterIdValue  1..5 (ETraceCharacterId as an int, because a plain UENUM is awkward
-	 *                          to name from Python and an int cannot be mis-imported).
-	 * @return false, with nothing written, for an id outside 1..5.
+	 * @param CharacterIdValue  TraceCharacterRoster::FirstId..LastId (1..8 as of spec v18 §2), as an
+	 *                          int, because a plain UENUM is awkward to name from Python and an int
+	 *                          cannot be mis-imported.
+	 * @return false, with nothing written, for an id outside that range.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Trace|Data",
 		meta = (DisplayName = "Copy Fallback Values From C++ Table"))

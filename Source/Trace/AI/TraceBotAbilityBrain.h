@@ -65,6 +65,26 @@
 //
 // None of that is optional and none of it is free: Trace.Bot.AbilityLatencyScale 0 and
 // Trace.Bot.AbilityUseScale 4 exist so a measurement run can prove the gates are load-bearing.
+//
+// ===================================================================================================
+// SPEC v18 §3 — THREE MORE CHARACTERS, AND THE ONE THING THAT CHANGED SHAPE
+// ===================================================================================================
+//
+// "The three new ones must be pickable by bots and used by bots — a bot Roxie that never fires a
+// rocket, or a bot Slimeball that never sticks, will read as broken."
+//
+// PICKABLE needed no code: both assignment paths (ATraceGameMode::PollCharacterSelect's fill and
+// ATraceBotController::UpdateAutoCharacter) go through UTraceAbilityComponent::PickRandomFreeCharacterFor,
+// which walks the whole id space, so appending to ETraceCharacterId was enough — and a red-arm match
+// on the build before this pass confirmed bots holding ROXIE and SLIMEBALL while pressing nothing.
+// USED is PlanRoxie / PlanElle / PlanSlimeball below, and Trace.Bot.NewCharacterAbilities 0 removes
+// exactly those three and nothing else, which is what makes their counts a measurement.
+//
+// THE ONE THING THAT CHANGED SHAPE IS V. Spec v18 §2 gave it to three characters at once — Mace's
+// suspend (hold), Slimeball's wall stick (hold) and Roxie's rocket (press) — so the single V LEVEL
+// this class asserts is now shared, and Roxie's press is expressed as a very short hold rather than
+// as a second mechanism. See SecondaryHoldUntilTime. There is still no key test anywhere in here and
+// there must never be one: the brain decides WHEN, the character decides WHAT.
 
 #pragma once
 
@@ -112,8 +132,43 @@ namespace TraceBotAbilityStats
 	void NoteActivate(ETraceCharacterId Id, bool bFired, bool bWasSpikePull, const TCHAR* Reason,
 	                  const APlayerState* Who);
 
-	/** The V level changed. */
-	void NoteSecondary(ETraceCharacterId Id, bool bDown);
+	/**
+	 * The V level changed. Counted PER CHARACTER since v18 — V now means three different abilities.
+	 *
+	 * @param Reason  the brain's reason, when the level rose because a latched decision resolved this
+	 *                tick, otherwise null. A press WITH a reason is logged at Display like an E press
+	 *                is, because two of the three V abilities are now real decisions with a play
+	 *                behind them and "V-holds=9" says nothing about which play it was.
+	 */
+	void NoteSecondary(ETraceCharacterId Id, bool bDown, const TCHAR* Reason = nullptr);
+
+	/**
+	 * SPEC v18 §3 — the three new characters' OUTCOMES, observed by the brain on its own pawn.
+	 *
+	 * A press count is not enough evidence for these three and the reason is specific to them. Roxie's
+	 * V and Slimeball's V are not activations the framework arbitrates: Roxie's rocket has its own
+	 * cooldown inside her set, and Slimeball's stick can be held for a whole second against thin air
+	 * and never attach. "Pressed V 40 times" is therefore compatible with "never fired a rocket" and
+	 * with "never once stuck to a wall", which is exactly the reading of broken §3 names.
+	 *
+	 * So each of these is a state TRANSITION the brain watches on its own ability set — the rocket
+	 * cooldown going from ready to charging, the stick flag going up, the cloak going up. They are
+	 * facts about the game, not about the decision.
+	 */
+	void NoteRocketFired();
+	void NoteWallStick();
+	void NoteCloak();
+
+	/**
+	 * A cloaked Elle actually STARTED breaking away. Counted separately from the cloak itself, because
+	 * "she cloaked" and "she used the cloak" are different claims and only the second one is §3's.
+	 *
+	 * It is the only behaviour in this pass that is steering rather than a key press, so without a
+	 * counter of its own there would be nothing in any log to distinguish a build where the escape
+	 * works from one where the branch is never reached — which is the uninformative green this project
+	 * has shipped twice.
+	 */
+	void NoteCloakEscape();
 
 	/** A jump was offered to the ability hook. @p bConsumed is what the hook said. */
 	void NoteAbilityJump(ETraceCharacterId Id, bool bConsumed);
@@ -146,7 +201,14 @@ enum class ETraceBotAbilityAct : uint8
 	/** Jump, offered to the ability hook first (Rocco's midair redirect, Oyster's jar jump). */
 	Jump,
 	/** A dash spent for an ability reason (Chut's bash, Oyster's jar-on-the-approach). */
-	Dash
+	Dash,
+	/**
+	 * A TAP of V — press and release — for the one V ability that is an EDGE rather than a hold:
+	 * Roxie's rocket (spec v18 §2). Mace's suspend and Slimeball's stick are levels and are asserted
+	 * through SecondaryHoldUntilTime instead, because "how long do I hold it" is not a decision the
+	 * reaction latch can carry.
+	 */
+	Secondary
 };
 
 /** What Want() did with a request. Callers act on Declined, which is the difficulty knob biting. */
@@ -228,6 +290,30 @@ struct FTraceBotAbilityOrders
 	/** The V level. The controller mirrors this onto the pawn and releases it on death / unpossess. */
 	bool bSecondaryHeld = false;
 
+	/**
+	 * MEASUREMENT ONLY, and true on exactly one tick: the tick a latched ETraceBotAbilityAct::Secondary
+	 * resolved into the V press above.
+	 *
+	 * It exists so the controller can attribute MeasuredLatencySeconds to the right decision. The V
+	 * LEVEL also changes on the tick Slimeball's stick-jump fires, and that press's latency is already
+	 * reported against the jump — without this flag the two would be counted twice and the reaction
+	 * mean, which is the number spec v15 §3 is actually judged on, would drift.
+	 */
+	bool bSecondaryPressedNow = false;
+
+	/**
+	 * Why V went down, on the tick a DECISION put it down, and null otherwise.
+	 *
+	 * Not the same condition as bSecondaryPressedNow above, and the difference is Slimeball: his stick
+	 * is a hold raised alongside the jump that the latch actually fired, so it HAS a reason worth
+	 * printing but its latency belongs to the jump. Mace's suspend has neither — PlanMace raises that
+	 * level directly, and there has never been a reason string behind it.
+	 *
+	 * A separate field rather than the controller inspecting Reason, because Reason on a given tick
+	 * can belong to a completely different intent that is still slewing its aim.
+	 */
+	const TCHAR* SecondaryReason = nullptr;
+
 	/** True while an ability owns the crosshair. Suppresses the combat aim, like the pass does. */
 	bool bOwnsAim = false;
 	FVector AimPoint = FVector::ZeroVector;
@@ -291,6 +377,18 @@ private:
 	void PlanMace(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
 	void PlanOyster(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
 	void PlanX(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
+
+	// --- spec v18 §3, the three new characters ---------------------------------------------------
+	void PlanRoxie(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
+	void PlanElle(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
+	void PlanSlimeball(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
+
+	/**
+	 * Watches the three new sets for the state transitions that prove the ability LANDED — see
+	 * TraceBotAbilityStats::NoteRocketFired. Called once per Plan(), before any decision, because a
+	 * decision this tick must not be able to hide the outcome of the last one.
+	 */
+	void ObserveNewCharacterOutcomes(const FTraceBotAbilitySituation& Situation);
 
 	// ---------------------------------------------------------------------------------------------
 	// THE INTENT LATCH — the whole of "no frame-one ability use"
@@ -377,6 +475,17 @@ private:
 	/** Earliest world time this bot may press ANY ability key again. Stops same-frame chaining. */
 	float NextAnyAbilityTime = 0.f;
 
+	/**
+	 * World time the V LEVEL is released. Zero when V is not being held at all.
+	 *
+	 * SHARED BY EVERY V ABILITY, and it has to be, because V is one key: spec v18 §2 gave it to three
+	 * characters (Mace's suspend, Roxie's rocket, Slimeball's wall stick) and a bot with two competing
+	 * V levels would fight itself. It was called SuspendReleaseTime while Mace was the only holder;
+	 * the rename is the whole change. Roxie's TAP sets it to now + a few frames, which is what makes an
+	 * edge out of a level.
+	 */
+	float SecondaryHoldUntilTime = 0.f;
+
 	// --- ability aim error, refreshed on the same cadence the combat wobble uses ---
 	FVector2D AbilityAimError = FVector2D::ZeroVector;
 	float AbilityAimErrorRefreshTime = 0.f;
@@ -386,8 +495,6 @@ private:
 	FVector SpikeCandidateAnchor = FVector::ZeroVector;
 	bool  bHasSpikeCandidate = false;
 	float NextSpikeProbeTime = 0.f;
-	/** World time the current V hold ends. Zero when not suspending. */
-	float SuspendReleaseTime = 0.f;
 	float NextSuspendTime = 0.f;
 
 	// --- Oyster ---
@@ -404,4 +511,44 @@ private:
 	// --- Rocco ---
 	/** Hesitation after a DECLINED redirect. Firing needs none: the extra jump is one per airtime. */
 	float NextRedirectTime = 0.f;
+
+	// --- Roxie (spec v18 §3) ---
+	/** Hesitation after a DECLINED rocket. Firing throttles itself on the rocket's own 35 s. */
+	float NextRocketTime = 0.f;
+	/** Last tick's rocket readiness, so "she actually fired one" is a transition and not a guess. */
+	bool bRocketWasReady = false;
+
+	// --- Elle (spec v18 §3) ---
+	/**
+	 * Where she stood, and when, on the press that put the FIRST gate down.
+	 *
+	 * Recorded by the brain rather than read off the gate, because the useful number is the SPAN the
+	 * pair will have — and a gate knows where it is, not where the second one is going to be. The
+	 * whole value of a rotation is that span: two mouths four metres apart is a 35 s cooldown spent on
+	 * nothing.
+	 */
+	FVector SnapFirstGateLocation = FVector::ZeroVector;
+	float SnapFirstPressTime = 0.f;
+	bool  bSnapFirstGatePlaced = false;
+	/** Hesitation after a DECLINED opening gate. The completing press never hesitates — see PlanElle. */
+	float NextSnapTime = 0.f;
+	/** World time the cloak escape starts. Rolled once per cloak so the vanish is not instant. */
+	float CloakEscapeStartTime = 0.f;
+	/** The willingness roll for THIS cloak. Taken once, when it goes up — see the note in the .cpp. */
+	bool  bCloakEscapeAllowed = false;
+	/** One count per cloak, not one per tick: the escape is asserted every frame it is running. */
+	bool  bCloakEscapeCounted = false;
+	bool  bWasCloaked = false;
+
+	// --- Slimeball (spec v18 §3) ---
+	/** A wall within reach of a jump, found by the bot's own probe. His own sweep is the authority. */
+	FVector StickWallPoint = FVector::ZeroVector;
+	bool  bHasStickWall = false;
+	float NextStickProbeTime = 0.f;
+	/** Hesitation after a DECLINED stick, and the throttle between two sticks. */
+	float NextStickTime = 0.f;
+	/** World time the lean toward the wall ends. The jump is useless if he jumps straight up. */
+	float StickApproachUntilTime = 0.f;
+	/** Last tick's stuck flag, so "he actually got hold of the wall" is a transition. */
+	bool bWasStuck = false;
 };

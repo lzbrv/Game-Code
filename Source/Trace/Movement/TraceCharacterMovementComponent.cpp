@@ -175,9 +175,18 @@ namespace TraceMoveKnob
 //   §8 AirStrafeAsymptoteScale      1.10 -> 1.00
 //   §8 MovementGravityScale         1.12 -> 1.00
 //
-// Defined with its CVar down with the other dev globals; declared here because the tuning getters
-// above the CVar block need it.
-extern int32 GTraceV9LegacyTuning;
+// DEFINED HERE, OUTSIDE ANY BUILD GUARD, AND THAT IS A LINK FIX RATHER THAN A STYLE CHOICE. It used
+// to be declared `extern` at this point and DEFINED inside the `#if !UE_BUILD_SHIPPING` dev block
+// several thousand lines below, while IsV9LegacyTuning() — read by GetSlideJumpWindowSpeedBonus(),
+// GetAirStrafeAsymptoteScale(), GetWallJumpSpeedRetention() and RefreshEngineTunablesFromSettings(),
+// all of which ship — reads it. A Shipping build compiles every one of those readers and then finds
+// no definition to link them against. macOS never noticed because nobody builds Shipping here.
+//
+// Only the CONSOLE REGISTRATION belongs in the dev block, and that is where it stays: the variable
+// costs four bytes in Shipping and is always zero there, so the legacy arm is unreachable in a shipped
+// build exactly as intended. Same shape as the v18 §1a globals below, which were written this way
+// from the start after this bug was spotted.
+int32 GTraceV9LegacyTuning = 0;
 
 /**
  * True while the pre-v9 tuning is in force.
@@ -214,13 +223,49 @@ static bool IsV9LegacyTuning()
 // Read on both machines and on every replayed frame, and a pure function of config either way, so it
 // needs no saved-move state. Do not flip it mid-session on one end of a live connection.
 // =================================================================================================
-extern int32 GTraceV10LegacyWallJump;
+// Defined here rather than `extern`-declared, for the Shipping-link reason spelled out on
+// GTraceV9LegacyTuning above: IsV10LegacyWallJump() is read by GetWallJumpSpeedRetention(), which
+// ships. Its console registration still lives in the dev block.
+int32 GTraceV10LegacyWallJump = 0;
 
 static bool IsV10LegacyWallJump()
 {
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyWallJump"));
 	return GTraceV10LegacyWallJump != 0 || bFromCommandLine || IsV9LegacyTuning();
 }
+
+// =================================================================================================
+// SPEC v18 §1a — THE A/B ARM FOR THE AIR REVERSAL BRAKE.
+//
+// Same argument as the two arms above, and the same shape. "Reversing in the air does nothing" is a
+// claim about a DIFFERENCE between two builds, and this project's standing rule is that a harness
+// which cannot go red is not evidence. Non-zero (or -TraceLegacyAirReverse) forces
+// GetAirStrafeOpposingDeceleration() to 0, which is EXACTLY the shipped v17 air model — the brake is
+// the only thing v18 §1a adds, and at 0 the arithmetic below is line-for-line what it always was.
+//
+// So Trace.Move.V18.AirReverse can run both arms in one binary, and the RED arm must reproduce the
+// user's sentence ("your momentum doesn't change at all") while the GREEN arm slows.
+//
+// Read on both machines and on every replayed frame, and a pure function of config either way, so it
+// needs no saved-move state. Do not flip it mid-session on one end of a live connection.
+// =================================================================================================
+//
+// DEFINED HERE RATHER THAN DOWN IN THE DEV CVAR BLOCK WITH ITS NEIGHBOURS, and deliberately: they are
+// read by GetAirStrafeOpposingDeceleration(), which is shipping code, so a definition inside
+// `#if !UE_BUILD_SHIPPING` would fail the Shipping link. The v9 and v10 arms above had exactly that
+// latent bug when this was written; the v18 §2 integration pass moved their definitions out here too,
+// so all four now follow this pattern and only their console registrations live in the dev block.
+int32 GTraceV18LegacyAirReverse = 0;
+
+/** Live override for the v18 §1a brake, uu/s². Negative means "use the name-bound knob". */
+float GTraceAirOpposingDecel = -1.f;
+
+static bool IsV18LegacyAirReverse()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyAirReverse"));
+	return GTraceV18LegacyAirReverse != 0 || bFromCommandLine;
+}
+
 
 namespace TraceMovement
 {
@@ -542,6 +587,24 @@ void UTraceCharacterMovementComponent::BeginPlay()
 				GetAirStrafeHardCapSpeed() * GetKnifeAirStrafeHardCapMultiplier(),
 				GetMaxAirSpeed() * GetKnifeAirStrafeHardCapMultiplier());
 
+			// --- SPEC v18 §1a, and the same bind-report argument again ---------------------------
+			//
+			// GetAirStrafeOpposingDeceleration() is READ HERE EXPLICITLY for the reason the knife
+			// multipliers above are: nothing else resolves it until a player is actually airborne and
+			// actually counter-steering, so without this call the knob would be absent from the bind
+			// report for the whole of a headless run and a rename would kill it in silence.
+			//
+			// The derived line next to it is the number a designer actually wants: how long a dead
+			// reversal takes to kill 1000 uu/s. t = v / decel, exactly, because the brake is constant
+			// at a full 180°.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MOVECFG-V18 AIRREVERSE opposingDecel=%.0f uu/s^2 (cvar override=%.0f, <0 = use knob) "
+				     "legacyArm=%d | derived: a dead 180 reversal kills 1000 uu/s in %.2f s, and is "
+				     "EXACTLY 0 at 90 degrees and inside it (the air strafe is untouched by construction)"),
+				GetAirStrafeOpposingDeceleration(), GTraceAirOpposingDecel,
+				IsV18LegacyAirReverse() ? 1 : 0,
+				1000.f / FMath::Max(1.f, GetAirStrafeOpposingDeceleration()));
+
 			// The knob hygiene check the project's own history demands. A name-bound knob that does
 			// not resolve is not a build error and not a runtime error — it is a setting that
 			// silently does nothing, which is how five of eight knobs died last pass. Every one of
@@ -791,7 +854,21 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
 		: FMath::Clamp(TraceMoveKnob::Float(TEXT("SlideJumpBonusScale"), 1.43f), 0.1f, 4.f);
 	const bool bGainOnly = TraceMoveKnob::Bool(TEXT("bSlideJumpBonusScalesGainOnly"), true);
 
-	return FMath::Max(1.f, bGainOnly ? (1.f + (Base - 1.f) * Scale) : (Base * Scale));
+	const float Global = FMath::Max(1.f, bGainOnly ? (1.f + (Base - 1.f) * Scale) : (Base * Scale));
+
+	// SPEC v18 §2 — Elle's second passive, "+40% on well-timed slide-jump momentum boosts", and the
+	// ONE place a character is allowed to change this number.
+	//
+	// THE GLOBAL IS COMPUTED FIRST AND HANDED OVER, which is what keeps §4's "slide-jump 1.446875
+	// (Elle changes only her own)" true: every knob, every legacy arm and both readings of "the bonus"
+	// are resolved above, and the ability layer only ever gets to scale the finished number. A
+	// character that read UTraceSettings for itself would be a second opinion about what "the bonus"
+	// means, and this file has already had two.
+	//
+	// This component must not learn Elle's name — the same rule GetDashHitSweepRadiusFor() follows for
+	// Chut — so the question goes to the character-agnostic seam. Null-safe and identity-returning for
+	// every Mannequin, every bot and the other seven characters.
+	return UTraceAbilityComponent::GetSlideJumpWindowSpeedBonusFor(CharacterOwner, Global);
 }
 
 float UTraceCharacterMovementComponent::GetSlideJumpWindowZBonus() const
@@ -895,6 +972,37 @@ float UTraceCharacterMovementComponent::GetAirStrafeGainScale(const float Planar
 	// of (PlanarSpeed, config) — no state, no time, so a replayed frame lands on the identical value.
 	const float Headroom = (Hard - PlanarSpeed) / (Hard - Soft);
 	return FMath::Pow(FMath::Clamp(Headroom, 0.f, 1.f), GetAirStrafeFalloffExponent());
+}
+
+float UTraceCharacterMovementComponent::GetAirStrafeOpposingDeceleration() const
+{
+	// The A/B arm's identity value. See IsV18LegacyAirReverse(): 0 IS the shipped v17 air model, so
+	// the red arm is not an approximation of the old behaviour, it is the old behaviour.
+	if (IsV18LegacyAirReverse())
+	{
+		return 0.f;
+	}
+
+	// Name-bound like every other knob resolved through TraceMoveKnob. UTraceSettings now carries
+	// `float AirStrafeOpposingDeceleration = 2200.f;` and DefaultGame.ini carries the matching key, so
+	// this reads BOUND and the ini drives it; it ran on the fallback literal below for part of this
+	// pass and behaved identically, because the two numbers are the same. BeginPlay's MOVEKNOB report
+	// prints BOUND or FALLBACK for the name every run, so a future rename can never be silent — this
+	// project has shipped five dead knobs that way once already.
+	//
+	// The live override exists because this number is the one thing in v18 §1 that can only be settled
+	// by feel, and the spec says the tuning comes after the first implementation. Negative means "use
+	// the knob", which is why the CVar's default is -1 rather than the shipped value: a CVar holding a
+	// second copy of the default is a second thing that can drift.
+	const float Override = GTraceAirOpposingDecel;
+	const float Value = (Override >= 0.f)
+		? Override
+		: TraceMoveKnob::Float(TEXT("AirStrafeOpposingDeceleration"), 2200.f);
+
+	// Ceilinged at the air acceleration: a brake stronger than the accel would make a full reversal
+	// come to a dead stop faster than the player could build the speed back, which is the "hitting a
+	// wall" feel the spec rules out in as many words.
+	return FMath::Clamp(Value, 0.f, FMath::Max(1.f, GetAirAcceleration()));
 }
 
 bool UTraceCharacterMovementComponent::IsSourceAirAccelerationEnabled() const
@@ -1457,7 +1565,6 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 	// PhysFalling has already stripped Velocity.Z for the duration of this call and restores it
 	// afterwards, so everything here is honestly planar. Never write Z.
 	const FVector PlanarVelocity(Velocity.X, Velocity.Y, 0.f);
-	const float SpeedBefore = PlanarVelocity.Size();
 
 	// Acceleration here is FallAcceleration: planar, scaled by AirControl (which
 	// RefreshEngineTunablesFromSettings pins at 1.0 for exactly this reason) and clamped to
@@ -1513,6 +1620,11 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 				// Input aimed dead-on at the face. There is no tangential component to keep, so the
 				// honest answer is "no acceleration this frame" — not a redirect to some direction the
 				// player did not ask for.
+				//
+				// SPEC v18 §1a DELIBERATELY DOES NOT REACH HERE. Holding the stick straight into the
+				// face you just launched off is, by definition, opposed to the launch — so letting the
+				// new brake run would let the player cancel their own wall jump with the exact input
+				// v10 §5 CAUSE 1 exists to neutralise, and the stickiness would come straight back.
 				return;
 			}
 			WishDirection = Allowed;
@@ -1520,6 +1632,34 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 	}
 
 	const float InputScale = FMath::Clamp(WishMagnitude / FMath::Max(1.f, GetMaxAcceleration()), 0.f, 1.f);
+
+	// EVERYTHING THAT NEEDS MEMBER STATE IS NOW DONE. The rest of the model is a pure function of
+	// (planar velocity, wish direction, input scale, dt, config) — which is what lets the shipped
+	// arithmetic be driven directly by Trace.Move.V18.AirReverse instead of re-typed into a harness.
+	const FVector NewPlanar = ComputeAirStrafeStep(PlanarVelocity, WishDirection, InputScale, DeltaTime);
+
+	Velocity.X = NewPlanar.X;
+	Velocity.Y = NewPlanar.Y;
+}
+
+FVector UTraceCharacterMovementComponent::ComputeAirStrafeStep(
+	const FVector& InPlanarVelocity, const FVector& InWishDirection,
+	const float InInputScale, const float InDeltaTime) const
+{
+	const FVector PlanarVelocity(InPlanarVelocity.X, InPlanarVelocity.Y, 0.f);
+	const float SpeedBefore = static_cast<float>(PlanarVelocity.Size());
+
+	FVector WishDirection(InWishDirection.X, InWishDirection.Y, 0.f);
+
+	// NO INPUT MEANS NO CHANGE. Not "decay toward zero" — Source has no air friction and neither do
+	// we, and a decay here would make every jump cost speed, which is precisely the complaint.
+	// A zero dt is the same answer for a different reason: nothing has happened yet.
+	if (!WishDirection.Normalize() || InDeltaTime <= 0.f)
+	{
+		return PlanarVelocity;
+	}
+
+	const float InputScale = FMath::Clamp(InInputScale, 0.f, 1.f);
 
 	// THE FORMULA (Quake's PM_AirAccelerate, Source's CAirAccelerate, same maths):
 	//
@@ -1546,18 +1686,21 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 
 	if (AddSpeed <= 0.f)
 	{
-		return;
+		// Already travelling at or above the wish speed ALONG the wish direction, so there is nothing
+		// to add. There is nothing to BRAKE either, and that is provable rather than assumed:
+		// AddSpeed <= 0 means SpeedAlongWish >= WishSpeed >= 0, i.e. dot(wish, velocity) >= 0, i.e. the
+		// input is not opposed at all. So returning here cannot skip the v18 §1a brake below — it can
+		// only skip a brake that is arithmetically zero.
+		return PlanarVelocity;
 	}
 
-	const float AccelSpeed = FMath::Min(GetAirAcceleration() * DeltaTime, AddSpeed);
+	const float AccelSpeed = FMath::Min(GetAirAcceleration() * InDeltaTime, AddSpeed);
 	FVector NewPlanar = PlanarVelocity + WishDirection * AccelSpeed;
 
-	const float NewSpeed = NewPlanar.Size();
+	const float NewSpeed = static_cast<float>(NewPlanar.Size());
 	if (NewSpeed <= UE_KINDA_SMALL_NUMBER)
 	{
-		Velocity.X = NewPlanar.X;
-		Velocity.Y = NewPlanar.Y;
-		return;
+		return NewPlanar;
 	}
 
 	// =============================================================================================
@@ -1566,14 +1709,34 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 	// "The air strafing feels incredible, but its too powerful with how much momentum can be gained."
 	//
 	// NewPlanar is already the fully turned vector. The only thing left to decide is HOW LONG it is,
-	// and the two limiters below touch nothing else — which is the whole reason the turn survives:
-	// the direction computed by the projection formula is preserved exactly, and a player at the hard
-	// cap can still carve their velocity round at constant speed indefinitely, for free, forever.
+	// and the limiters below touch nothing else — which is the whole reason the turn survives: the
+	// direction computed by the projection formula is preserved exactly, and a player at the hard cap
+	// can still carve their velocity round at constant speed indefinitely, for free, forever.
 	// What they cannot do is make it any longer.
 	// =============================================================================================
 
-	// The projection formula can only ever ADD along the wish direction, so this is >= 0 by
-	// construction; the Max is belt and braces against float noise at very low speeds.
+	// THE GAIN, AND THE Max(0) THAT USED TO BE THE BUG.
+	//
+	// SPEC v18 §1a: "if pressing A and jumping then letting go of A and pressing D, your momentum
+	// doesn't change at all. We want it so doing so slows down your momentum."
+	//
+	// The comment that used to sit here said the projection formula "can only ever ADD along the wish
+	// direction, so this is >= 0 by construction; the Max is belt and braces against float noise".
+	// THAT WAS WRONG, and it was wrong in the one case the user is complaining about. The formula only
+	// ever adds ALONG THE WISH DIRECTION — when the wish direction OPPOSES travel, adding along it
+	// SHORTENS the vector, and NewSpeed is genuinely less than SpeedBefore. Worked at the shipped
+	// numbers, a dead reversal at 800 uu/s and a 16 ms frame gives NewPlanar 672 uu/s...
+	//
+	//   ...and then Max(0, 672 - 800) = 0, TargetSpeed = SpeedBefore = 800, and the last line rescales
+	//   the 672 vector straight back up to 800. The player's momentum is restored to the last float
+	//   bit, every frame, forever. "Your momentum doesn't change at all" is not an exaggeration; it is
+	//   arithmetically exact, and this is the line that does it.
+	//
+	// The Max(0) STAYS, because the frame-by-frame loss the raw formula produces is AirAcceleration
+	// (8000 uu/s²) pointed backwards — a dead stop from 800 uu/s in 0.1 s, which is exactly the "feels
+	// like hitting a wall" the spec rules out. Instead the loss is re-expressed as its own named,
+	// tunable term below, so there is one number a designer can turn instead of a side effect of the
+	// acceleration constant. Keeping the clamp also means the GAIN path is byte-for-byte what it was.
 	const float RawGain = FMath::Max(0.f, NewSpeed - SpeedBefore);
 
 	// DIMINISHING RETURNS. Sampled at the speed the frame STARTED at, not at NewSpeed: sampling the
@@ -1582,6 +1745,41 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 	// prediction from, and there is no reason to add another one.
 	const float GainScale = GetAirStrafeGainScale(SpeedBefore);
 	float TargetSpeed = SpeedBefore + RawGain * GainScale;
+
+	// =============================================================================================
+	// SPEC v18 §1a — THE OPPOSITION BRAKE, AND WHY IT IS A RAMP AND NOT A SWITCH.
+	//
+	// Opposition is the NEGATIVE PART of dot(wish, travel), i.e. 0 for anything from dead-ahead round
+	// to a dead-square 90° strafe, rising smoothly to 1 at a full 180° reversal. Multiplying the
+	// deceleration by it is what makes "a slight counter-steer barely bites and a full reversal bites
+	// properly" true by construction rather than by tuning.
+	//
+	// THIS IS ALSO THE PROOF THAT THE AIR STRAFE IS UNTOUCHED, and it is worth stating as arithmetic
+	// rather than as an intention: the Source strafe is an input at (or inside) 90° to travel, where
+	// the dot product is >= 0 and Opposition is therefore EXACTLY ZERO — not small, zero. Every frame
+	// of every gaining strafe takes Brake = 0 and lands on the identical float it landed on before
+	// this block existed. Trace.Move.V18.AirReverse checks that as an equality, not as a tolerance.
+	//
+	// Scaled by InputScale for the same reason the gain is: a half-deflected stick asking for half the
+	// turn must not get the whole brake.
+	//
+	// Applied BEFORE the ceilings below, so a player braking from above the hard cap keeps braking
+	// (the ceiling is floored at SpeedBefore and would otherwise be a no-op on the way down).
+	// =============================================================================================
+	const float OpposingDeceleration = GetAirStrafeOpposingDeceleration();
+	if (OpposingDeceleration > 0.f && SpeedBefore > UE_KINDA_SMALL_NUMBER)
+	{
+		const float Opposition = FMath::Max(0.f, -static_cast<float>(
+			FVector::DotProduct(WishDirection, PlanarVelocity / SpeedBefore)));
+		if (Opposition > 0.f)
+		{
+			// Floored at zero rather than allowed to go negative: the brake's job is to kill momentum,
+			// and pushing the pawn backwards is the acceleration term's job. Letting this go negative
+			// would flip the vector's direction on the rescale below, which reads as a snap.
+			TargetSpeed = FMath::Max(0.f,
+				TargetSpeed - OpposingDeceleration * Opposition * InputScale * InDeltaTime);
+		}
+	}
 
 	// THE BACKSTOPS. Both are floored at SpeedBefore so that a ceiling can only ever remove speed
 	// THIS CALL just added, and can never brake momentum carried into the air — a slide-jump that
@@ -1595,10 +1793,7 @@ void UTraceCharacterMovementComponent::ApplySourceAirAcceleration(float DeltaTim
 
 	// Rescale, KEEPING THE DIRECTION. This one line is the difference between "limit how much speed
 	// can accumulate" and "undo the Source feel".
-	NewPlanar *= (TargetSpeed / NewSpeed);
-
-	Velocity.X = NewPlanar.X;
-	Velocity.Y = NewPlanar.Y;
+	return NewPlanar * (TargetSpeed / NewSpeed);
 }
 
 void UTraceCharacterMovementComponent::ApplyGroundOverspeedBleed(float DeltaTime)
@@ -2909,6 +3104,15 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		if (DashTimeRemaining <= 0.f && IsWallJumpAvailable() && TryWallJump())
 		{
 			WallJumpInputBufferRemaining = 0.f;
+
+#if !UE_BUILD_SHIPPING
+			// SPEC v18 §1b. THE ONE PLACE IN THIS COMPONENT THAT LAUNCHES A PAWN WITH NO PRESS ON THE
+			// FRAME IT LAUNCHES, counted so "velocity appears mid-jump with no input" can be answered
+			// with a number instead of an argument. It is not a bug by itself — the press was real, one
+			// or two frames earlier, and buffering it is the whole of v10 §5 CAUSE 2 — but it is the
+			// only candidate mechanism, so it has to be countable. Observation only.
+			++WallJumpBufferedLaunches;
+#endif
 		}
 		else
 		{
@@ -3298,6 +3502,13 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 	}
 
+	// SPEC v18 §1b. The record pass only — a replay re-runs the same frames and would count each one
+	// several times, which is exactly how a drift ledger invents drift that never happened.
+	if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating)
+	{
+		TickAirDriftMeter(DeltaSeconds, OldVelocity);
+	}
+
 	TickMomentumMeasure(DeltaSeconds);
 	TickLedgeTest(DeltaSeconds);
 	TickDashPitchTest(DeltaSeconds);
@@ -3544,7 +3755,11 @@ static bool IsDashPoolDebugEnabled()
  * for the identity values it restores and for why the command-line switch (-TraceLegacyTuning) is not
  * redundant with this variable.
  */
-int32 GTraceV9LegacyTuning = 0;
+// The variable itself is DEFINED at the top of the file, outside this dev block, because
+// IsV9LegacyTuning() is read from shipping code (GetSlideJumpWindowSpeedBonus,
+// GetAirStrafeAsymptoteScale, GetWallJumpSpeedRetention, RefreshEngineTunablesFromSettings). Only the
+// console registration belongs here. See the comment on the definition for the Shipping link failure
+// this arrangement fixes.
 static FAutoConsoleVariableRef CVarTraceV9LegacyTuning(
 	TEXT("Trace.V9LegacyTuning"),
 	GTraceV9LegacyTuning,
@@ -3559,7 +3774,8 @@ static FAutoConsoleVariableRef CVarTraceV9LegacyTuning(
  * top of the file. Separate from V9LegacyTuning on purpose: that switch reverts eight unrelated tuning
  * values as well, and a stick number measured against it would be measuring gravity and the slide too.
  */
-int32 GTraceV10LegacyWallJump = 0;
+// Defined at the top of the file, outside this dev block — GetWallJumpSpeedRetention() reads it and
+// ships. Registration only, here.
 static FAutoConsoleVariableRef CVarTraceV10LegacyWallJump(
 	TEXT("Trace.V10LegacyWallJump"),
 	GTraceV10LegacyWallJump,
@@ -3567,6 +3783,28 @@ static FAutoConsoleVariableRef CVarTraceV10LegacyWallJump(
 	     "no buffered jump press, and the v9 momentum retention. The RED arm for the spec v10 sec 5 "
 	     "stick meter -- run -TraceWallJumpTest with and without it in ONE binary."),
 	ECVF_Cheat);
+
+// SPEC v18 §1a. The variables themselves are DEFINED at the top of the file, outside this dev block,
+// because GetAirStrafeOpposingDeceleration() reads them and that is shipping code. Only the console
+// registration belongs here. See the note above IsV18LegacyAirReverse() for why the v9/v10 arms above
+// do it the other way round and why that is a latent Shipping-link bug rather than a pattern to copy.
+static FAutoConsoleVariableRef CVarTraceV18LegacyAirReverse(
+	TEXT("Trace.Move.V18.LegacyAirReverse"),
+	GTraceV18LegacyAirReverse,
+	TEXT("Dev only. 1 restores the shipped v17 air model exactly by forcing the spec v18 sec 1a "
+	     "opposition brake to zero -- i.e. reversing in mid-air changes your momentum by nothing at "
+	     "all. The RED arm for Trace.Move.V18.AirReverse; run both arms in ONE binary."),
+	ECVF_Cheat);
+
+static FAutoConsoleVariableRef CVarTraceAirOpposingDecel(
+	TEXT("Trace.Move.AirOpposingDecel"),
+	GTraceAirOpposingDecel,
+	TEXT("Spec v18 sec 1a. Deceleration in uu/s^2 applied when air input opposes travel, at a full "
+	     "180 degree reversal; scaled down by the negative part of dot(wish, travel), so it is exactly "
+	     "0 at 90 degrees and inside it and the air strafe is untouched. NEGATIVE (the default) means "
+	     "'use the AirStrafeOpposingDeceleration knob'. This is the number the spec expects to be "
+	     "tuned by feel."),
+	ECVF_Default);
 
 void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 {
@@ -5307,6 +5545,22 @@ void UTraceCharacterMovementComponent::LogWallJumpReport() const
 		GetWallJumpWindowSeconds(),
 		(CharacterOwner != nullptr && CharacterOwner->HasAuthority())
 			? TEXT("  [AUTHORITY - the correction column is meaningless here]") : TEXT(""));
+
+	// SPEC v18 §1b. PRINTED HERE AS WELL AS IN THE DRIFT LEDGER, because this is the report a human
+	// runs after a play session and the drift ledger has to be armed in advance.
+	//
+	// A BUFFERED LAUNCH IS A WALL JUMP THE PLAYER DID NOT PRESS ON THE FRAME IT HAPPENED — the press
+	// was real, up to GetWallJumpInputBufferSeconds() earlier, and v10 §5 CAUSE 2 buffers it on
+	// purpose. MEASURED on a client (spec v18 §1b) at 1016 uu/s of planar vector change on one move,
+	// plus Velocity.Z assigned outright to JumpZVelocity x GetWallJumpVerticalMultiplier() — by a wide
+	// margin the largest thing in this component that can move a hands-off airborne player. If
+	// "velocity appears mid-jump with no input" is reported again, this counter is the first number to
+	// look at.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("WALLJUMP %-16s buffered launches (no press on the launch frame) = %d of %d total. "
+		     "Buffer window %.3f s; contact window %.3f s."),
+		*GetNameSafe(CharacterOwner), WallJumpBufferedLaunches, WallJumpCount,
+		GetWallJumpInputBufferSeconds(), GetWallJumpWindowSeconds());
 }
 
 // =================================================================================================

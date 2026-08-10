@@ -1004,6 +1004,31 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 		// viewport, and that warp arrives as one enormous mouse delta; without this the player closes
 		// the settings screen and is instantly spun around. Exactly the spawn-time bug, same fix.
 		ApplyGameInputMode();
+
+		// SPEC v18 §1c — "sometimes the movement feels like it takes a second to register inputs".
+		//
+		// THE SYMMETRIC HALF OF THE RELEASE ABOVE, and the measured half of §1c. Going IN, this
+		// function synthesises the release edges that are about to be swallowed. Coming OUT it has to
+		// synthesise the PRESS edges that were swallowed, because Enhanced Input only fires Started on
+		// a transition: a key that was already down when the overlay opened is still down now, and
+		// will produce no further Started event until the player physically releases it and presses it
+		// again. Held AXES recover on their own (IA_Move is bound on Triggered, which re-fires every
+		// frame the key is down) — buttons do not, which is exactly why the complaint is about
+		// movement feeling fine and actions feeling dead.
+		//
+		// STILL-HELD ONLY. Nothing is buffered and nothing is replayed from history: the question
+		// asked is "is this key physically down at the instant input comes back?", so a jump pressed
+		// and released while browsing a menu is correctly discarded, and a finger that is on the key
+		// right now gets the press it is making. Anything else would be a menu handing the player
+		// actions they took twenty seconds ago.
+		//
+		// THE HOLD-SHAPED ACTIONS ONLY, and the omissions are deliberate. Fire, Jump, Crouch, Pass,
+		// Parry, the secondary ability and the scoreboard are all "while held" — a key down means the
+		// player wants the thing NOW, and that is what they would get had they pressed a frame later.
+		// Dash, Reload, the two equips and the primary ability are TAPS: a resting finger on one of
+		// those keys is not a request, and firing them here would spend a 35 s ability or a full clip
+		// on somebody who was leaning on a key while they read a menu.
+		RedeliverHeldPressEdges();
 	}
 
 	// The world's pause state is printed alongside, because "does opening the settings screen still
@@ -1014,6 +1039,83 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 		*GetName(), bSuppressed ? TEXT("suppressed (menu open)") : TEXT("restored"),
 		LogWorld != nullptr ? static_cast<int32>(LogWorld->GetNetMode()) : -1,
 		(LogWorld != nullptr && LogWorld->IsPaused()) ? 1 : 0);
+}
+
+/**
+ * SPEC v18 §1c — the A/B arm for the held-press re-delivery.
+ *
+ * 0 restores the behaviour exactly as it shipped before: a press edge made before a menu opened is
+ * swallowed and never comes back, so a player still holding the key when the overlay closes has to
+ * release it and press it again. That is the RED arm — the reproduction of the user's "sometimes the
+ * movement feels like it takes a second to register inputs" — and it exists because this project's
+ * standing rule is that a harness which cannot go red is not evidence.
+ *
+ * Not `ECVF_Cheat`: it changes no gameplay rule, only whether one class of input is dropped, and a
+ * playtester who dislikes the new behaviour should be able to turn it off without a cheat-enabled
+ * build.
+ */
+static int32 GTraceRedeliverHeldPressEdges = 1;
+static FAutoConsoleVariableRef CVarTraceRedeliverHeldPressEdges(
+	TEXT("Trace.Input.RedeliverHeldOnRestore"),
+	GTraceRedeliverHeldPressEdges,
+	TEXT("Spec v18 sec 1c. 1 (default): when a menu hands gameplay input back, the press edge of every "
+	     "HOLD-shaped action whose key is still physically down is re-delivered, because Enhanced Input "
+	     "only fires Started on a transition and that transition already happened behind the overlay. "
+	     "0 is the RED arm: the press stays swallowed and the player must release and press again."),
+	ECVF_Default);
+
+void ATracePlayerController::RedeliverHeldPressEdges()
+{
+	if (GTraceRedeliverHeldPressEdges == 0)
+	{
+		// The RED arm. Logged rather than silent, so a run that measures nothing cannot be mistaken
+		// for a run in which there was nothing to measure.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] Input restored: held press edges NOT re-delivered "
+			     "(Trace.Input.RedeliverHeldOnRestore 0 — the pre-v18 behaviour)."),
+			*GetName());
+		return;
+	}
+
+	// bGameInputSuppressed is already false by the time this runs — that is required, not incidental.
+	// Every handler below early-returns while it is true, so calling them any earlier would be a
+	// no-op that looked like a fix.
+	if (bGameInputSuppressed || !IsLocalController())
+	{
+		return;
+	}
+
+	const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+
+	// The key is asked of the SAME table ApplyControlSettings maps from, so a rebound key is honoured
+	// here without this function knowing anything about defaults. An unbound action has an invalid
+	// key, which IsInputKeyDown would answer nonsense for, hence the validity test.
+	auto IsHeld = [this, &UserSettings](ETraceInputAction Action)
+	{
+		const FKey Key = UserSettings.GetKey(Action);
+		return Key.IsValid() && IsInputKeyDown(Key);
+	};
+
+	int32 Redelivered = 0;
+
+	// Ordered as the player would experience them: the two that change where the pawn IS come first,
+	// so a player who came out of the menu already holding forward-and-crouch is sliding on the same
+	// frame they are moving, rather than one frame later.
+	if (IsHeld(ETraceInputAction::Crouch))          { OnCrouchStarted();           ++Redelivered; }
+	if (IsHeld(ETraceInputAction::Jump))            { OnJumpStarted();             ++Redelivered; }
+	if (IsHeld(ETraceInputAction::Fire))            { OnFireStarted();             ++Redelivered; }
+	if (IsHeld(ETraceInputAction::Pass))            { OnPassStarted();             ++Redelivered; }
+	if (IsHeld(ETraceInputAction::Parry))           { OnParryStarted();            ++Redelivered; }
+	if (IsHeld(ETraceInputAction::AbilitySecondary)){ OnAbilitySecondaryStarted(); ++Redelivered; }
+	if (IsHeld(ETraceInputAction::Scoreboard))      { OnScoreboardStarted();       ++Redelivered; }
+
+	// Printed even at zero, and that is the point: "nobody was holding anything" and "the re-delivery
+	// did not run" are different facts, and a line that only appears on success cannot tell them
+	// apart. One line per menu close either way.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[%s] Input restored: re-delivered %d held press edge(s) that the overlay swallowed "
+		     "(spec v18 §1c). Held axes recover on their own; buttons do not."),
+		*GetName(), Redelivered);
 }
 
 // -------------------------------------------------------------------------------------------

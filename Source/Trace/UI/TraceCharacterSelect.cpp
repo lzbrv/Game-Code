@@ -91,9 +91,55 @@ namespace TraceSelectStyle
 	static constexpr float MessageDuration = 3.5f;
 }
 
-namespace
+/**
+ * THE CARD GRID — spec v18 §2, because eight cards do not fit the row that five did.
+ *
+ * Everything here is compile-time, derived from TraceCharacterRoster::Count and nothing else, which
+ * is what lets PollInput (which runs BEFORE the first Draw of a frame) and Draw agree about where the
+ * rows are without one of them caching the other's arithmetic.
+ *
+ * WHY IT WRAPS RATHER THAN JUST GETTING NARROWER. Measured at the 1280x720 the harnesses capture:
+ * five cards across leave 219 px of text width per card, and Oyster's — the longest — fills most of
+ * the 280 px of card height that leaves. Eight across would have given 127 px of text width, i.e.
+ * roughly DOUBLE the wrapped lines in a card that is no taller, so every long card would have run its
+ * activated block off the bottom edge. Two rows of four give 280 px of text width — WIDER than the
+ * five-card row this replaces — at a little over half the height, which is the trade that fits.
+ *
+ * A ROSTER OF FIVE OR FEWER STILL DRAWS EXACTLY AS IT DID: Rows collapses to 1 and every number
+ * below reduces to the old expression. That is deliberate, so this change cannot be what altered the
+ * look of a screen nobody asked to change.
+ */
+namespace TraceSelectGrid
 {
-	/** The five number keys, in roster order, so "press 3 for Mace" is literally true. */
+	/** Cards per row before the screen wraps. Five is what the pre-v18 layout was authored against. */
+	constexpr int32 MaxPerRow = 5;
+
+	/** 1 up to five characters, 2 beyond. A third row would need the header to shrink; say so then. */
+	constexpr int32 Rows = (TraceCharacterRoster::Count <= MaxPerRow) ? 1 : 2;
+
+	/** Rounded UP, so with 9 characters the last row is the short one and gets centred. */
+	constexpr int32 Columns = (TraceCharacterRoster::Count + Rows - 1) / Rows;
+
+	static_assert(Rows * Columns >= TraceCharacterRoster::Count,
+		"The card grid must have room for every character, or the last ones would never be drawn - "
+		"and an undrawn card cannot be clicked, because the hit test reads the rects the draw left.");
+}
+
+// NAMED after the file rather than anonymous. UBT compiles this module as a unity/jumbo build, so two
+// files that each open `namespace { }` become ONE namespace holding both sets of definitions, and
+// "NumberKeyForIndex" is exactly the kind of name a second UI file would also want.
+// Scripts/check-jumbo-build-collisions.py gates the build on it; this used to be anonymous.
+namespace TraceCharacterSelectFile
+{
+	/**
+	 * The number keys, in roster order, so "press 3 for Mace" is literally true.
+	 *
+	 * ONE KEY PER CARD ONLY WORKS WHILE THE ROSTER FITS THE NUMBER ROW. It reaches 9 and then stops:
+	 * a tenth character gets arrows and the mouse, and would need a different scheme (modifiers, or
+	 * a second page) rather than a silently overloaded key. Returning EKeys::Invalid is what makes
+	 * that honest — WasInputKeyJustPressed on it is simply always false, so no card is ever picked by
+	 * a key that is really some other card's.
+	 */
 	const FKey& NumberKeyForIndex(int32 Index)
 	{
 		switch (Index)
@@ -102,7 +148,12 @@ namespace
 		case 1:  return EKeys::Two;
 		case 2:  return EKeys::Three;
 		case 3:  return EKeys::Four;
-		default: return EKeys::Five;
+		case 4:  return EKeys::Five;
+		case 5:  return EKeys::Six;
+		case 6:  return EKeys::Seven;
+		case 7:  return EKeys::Eight;
+		case 8:  return EKeys::Nine;
+		default: return EKeys::Invalid;
 		}
 	}
 
@@ -207,7 +258,7 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 				RosterBelief += FString::Printf(TEXT("%s%s=%s"),
 					(Index > 0) ? TEXT(" ") : TEXT(""),
 					*TraceCharacterRoster::NameFor(CandidateId),
-					(Holder != nullptr) ? *SafePlayerName(Holder).ToUpper() : TEXT("free"));
+					(Holder != nullptr) ? *TraceCharacterSelectFile::SafePlayerName(Holder).ToUpper() : TEXT("free"));
 			}
 
 			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Screen opened (team %s, %.0fs to pick). Believes: %s"),
@@ -286,10 +337,10 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 
 void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* LocalState)
 {
-	// ---- Direct number keys. Five characters, five keys — no walking required. -------------------
+	// ---- Direct number keys. One key per card — no walking required. -----------------------------
 	for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
 	{
-		if (PC->WasInputKeyJustPressed(NumberKeyForIndex(Index)))
+		if (PC->WasInputKeyJustPressed(TraceCharacterSelectFile::NumberKeyForIndex(Index)))
 		{
 			Highlighted = Index;
 			ConfirmHighlighted(LocalState);
@@ -297,10 +348,29 @@ void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* 
 		}
 	}
 
-	// ---- Left / right, with repeat --------------------------------------------------------------
+	// ---- Left / right / up / down, with repeat ---------------------------------------------------
+	//
+	// UP AND DOWN ARE NEW IN SPEC v18 §2 and they exist because the cards do. With one row they moved
+	// nothing and were not offered; with two, a player who wants the card directly below theirs would
+	// otherwise have to walk the whole rest of the top row to reach it. Left/right still walk the
+	// roster in reading order and still step from the end of one row to the start of the next, which
+	// is what makes "press right four times from ROCCO" land where the numbers say it should.
 	const bool bLeft  = PC->IsInputKeyDown(EKeys::Left)  || PC->IsInputKeyDown(EKeys::A);
 	const bool bRight = PC->IsInputKeyDown(EKeys::Right) || PC->IsInputKeyDown(EKeys::D);
-	const int32 NavDir = (bRight ? 1 : 0) - (bLeft ? 1 : 0);
+	// bNavUp / bNavDown rather than bUp / bDown: `bDown` is already the LEFT MOUSE BUTTON further down
+	// this same function, and clang caught the collision as a redefinition. Worth the ugly prefix —
+	// had the mouse's line come FIRST this would have been a shadow in a nested scope instead, which
+	// MSVC reports as C4458/C4459 and this platform structurally cannot see.
+	const bool bNavUp   = PC->IsInputKeyDown(EKeys::Up)   || PC->IsInputKeyDown(EKeys::W);
+	const bool bNavDown = PC->IsInputKeyDown(EKeys::Down) || PC->IsInputKeyDown(EKeys::S);
+
+	// One repeat clock for both axes, and horizontal wins a diagonal. Two independent clocks would
+	// let a player holding right-and-down travel twice as fast as one holding either.
+	int32 NavDir = (bRight ? 1 : 0) - (bLeft ? 1 : 0);
+	if (NavDir == 0)
+	{
+		NavDir = ((bNavDown ? 1 : 0) - (bNavUp ? 1 : 0)) * TraceSelectGrid::Columns;
+	}
 
 	if (NavDir != 0)
 	{
@@ -368,9 +438,13 @@ void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* 
 
 void FTraceCharacterSelect::MoveHighlight(int32 Delta)
 {
-	// CLAMPED, NOT WRAPPED. The roster is five cards on one row; wrapping from X back to Rocco makes
-	// a held key cycle forever and makes the highlight's position uninformative about where the ends
-	// are. Same call the options overlay makes for the same reason.
+	// CLAMPED, NOT WRAPPED. Wrapping from the last card back to the first makes a held key cycle
+	// forever and makes the highlight's position uninformative about where the ends are. Same call
+	// the options overlay makes for the same reason.
+	//
+	// One clamp covers both axes because Delta is already an index step: +/-1 walks the roster and
+	// +/-Columns is a row. Down from the bottom row lands on the last card rather than doing nothing,
+	// which is the behaviour a player reads as "that is the end" instead of "that key is broken".
 	Highlighted = FMath::Clamp(Highlighted + Delta, 0, TraceCharacterRoster::Count - 1);
 }
 
@@ -401,7 +475,7 @@ void FTraceCharacterSelect::ConfirmHighlighted(ATracePlayerState* LocalState)
 		LocalState->LastPickResultLocalTime = Now;
 
 		UE_LOG(LogTraceGame, Verbose, TEXT("[CharSelect] %s is held by team-mate '%s'; not sending."),
-			*TraceCharacterRoster::NameFor(RequestedId), *SafePlayerName(Holder));
+			*TraceCharacterRoster::NameFor(RequestedId), *TraceCharacterSelectFile::SafePlayerName(Holder));
 		return;
 	}
 
@@ -588,7 +662,9 @@ void FTraceCharacterSelect::DebugPick(int32 CharacterId)
 {
 	if (!TraceCharacterRoster::IsValidId(static_cast<uint8>(CharacterId)))
 	{
-		UE_LOG(LogTraceGame, Warning, TEXT("[CharSelect] Trace.Characters.Select: %d is not 1..5."), CharacterId);
+		UE_LOG(LogTraceGame, Warning, TEXT("[CharSelect] Trace.Characters.Select: %d is not %d..%d."),
+			CharacterId, static_cast<int32>(TraceCharacterRoster::FirstId),
+			static_cast<int32>(TraceCharacterRoster::LastId));
 		return;
 	}
 
@@ -659,46 +735,76 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 	// ---- Cards ----------------------------------------------------------------------------------
 	const float FooterH = 74.f * UIScale;
 	const float CardGap = 12.f * UIScale;
+	const float RowGap  = 12.f * UIScale;
 
-	// HEIGHT IS CAPPED, NOT STRETCHED, and the first capture is why. Filling the space between the
-	// header and the footer gave 555-pixel-tall cards holding 170 pixels of text, i.e. three quarters
-	// of each card was empty box — which reads as text that failed to load rather than as a layout
-	// choice. 420 (at the 1080p reference) comfortably clears the longest card, Oyster's, with room
-	// for a narrower viewport to wrap another line or two into.
-	const float CardsH = FMath::Clamp(ViewH - HeaderY - FooterH - Margin, 160.f * UIScale, 420.f * UIScale);
+	// HEIGHT IS CAPPED PER ROW, NOT STRETCHED, and the first capture is why. Filling the space between
+	// the header and the footer gave 555-pixel-tall cards holding 170 pixels of text, i.e. three
+	// quarters of each card was empty box — which reads as text that failed to load rather than as a
+	// layout choice. 420 (at the 1080p reference) comfortably clears the longest card, Oyster's, with
+	// room for a narrower viewport to wrap another line or two into.
+	//
+	// PER ROW is the v18 §2 change. It used to cap the whole block, which with two rows would have
+	// squeezed both of them into the space one used to have.
+	const float AvailableH = ViewH - HeaderY - FooterH - Margin;
+	const float CardH = FMath::Clamp(
+		(AvailableH - RowGap * (TraceSelectGrid::Rows - 1)) / static_cast<float>(TraceSelectGrid::Rows),
+		160.f * UIScale, 420.f * UIScale);
+
+	/** The whole grid's height, which is what the block is centred by. */
+	const float CardsH = CardH * TraceSelectGrid::Rows + RowGap * (TraceSelectGrid::Rows - 1);
 
 	// Capping the height leaves slack, so the block is floated rather than pinned under the header —
 	// otherwise a 720p screen gets a tidy row of cards glued to the top and 300 px of nothing beneath
 	// it. 40% of the slack rather than 50%: the eye reads a menu as centred when it sits slightly
 	// above the true middle, and the header above it already carries weight.
-	const float CardsY = HeaderY + FMath::Max(0.f, (ViewH - HeaderY - Margin - CardsH - FooterH) * 0.40f);
+	const float CardsY = HeaderY + FMath::Max(0.f, (AvailableH - CardsH) * 0.40f);
 
 	const float TotalW = ViewW - (2.f * Margin);
-	const float CardW = (TotalW - (CardGap * (TraceCharacterRoster::Count - 1))) / TraceCharacterRoster::Count;
+	const float CardW = (TotalW - (CardGap * (TraceSelectGrid::Columns - 1))) / TraceSelectGrid::Columns;
 
 	// One line, once per opening. A screenshot cannot tell "the cap is not compiled in" from "the cap
 	// is compiled in and computes a big number", and this screen has already cost one round trip to
 	// that exact ambiguity — the first capture after the cap was added looked identical to the one
-	// before it and there was no way to tell which of the two had happened.
+	// before it and there was no way to tell which of the two had happened. The grid shape is on the
+	// same line for the same reason: "8 cards" and "2 rows of 4" look identical in a log that only
+	// prints the count.
 	if (!bLoggedLayoutOnce)
 	{
 		bLoggedLayoutOnce = true;
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[CharSelect] Layout: view %.0fx%.0f scale %.3f | cards y=%.0f h=%.0f w=%.0f (cap %.0f)"),
-			ViewW, ViewH, UIScale, CardsY, CardsH, CardW, 420.f * UIScale);
+			TEXT("[CharSelect] Layout: view %.0fx%.0f scale %.3f | %d cards as %d row(s) x %d col(s) | "
+			     "grid y=%.0f h=%.0f, card %.0fx%.0f (row-height cap %.0f)"),
+			ViewW, ViewH, UIScale, TraceCharacterRoster::Count, TraceSelectGrid::Rows,
+			TraceSelectGrid::Columns, CardsY, CardsH, CardW, CardH, 420.f * UIScale);
 	}
 
 	for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
 	{
-		const float CardX = Margin + Index * (CardW + CardGap);
-		DrawCard(HUD, LocalState, Index, CardX, CardsY, CardW, CardsH);
+		const int32 Row = Index / TraceSelectGrid::Columns;
+		const int32 Column = Index % TraceSelectGrid::Columns;
+
+		// A SHORT LAST ROW IS CENTRED, not left-aligned. With eight characters both rows are full and
+		// this is a no-op; with nine the second row holds four and hanging them off the left edge under
+		// five would read as a card having failed to draw rather than as the roster being odd.
+		const int32 CardsInRow = FMath::Min(TraceSelectGrid::Columns,
+			TraceCharacterRoster::Count - Row * TraceSelectGrid::Columns);
+		const float RowW = CardsInRow * CardW + (CardsInRow - 1) * CardGap;
+		const float RowX = Margin + FMath::Max(0.f, (TotalW - RowW) * 0.5f);
+
+		DrawCard(HUD, LocalState, Index,
+			RowX + Column * (CardW + CardGap), CardsY + Row * (CardH + RowGap), CardW, CardH);
 	}
 
 	// ---- Footer: controls, and the last server verdict -------------------------------------------
 	float FooterY = CardsY + CardsH + (14.f * UIScale);
 
 	{
-		const FString Controls(TEXT("1-5 OR ARROWS TO CHOOSE      ENTER TO LOCK IN      OR CLICK A CARD"));
+		// Built from the roster rather than written out, so adding a character cannot leave the screen
+		// telling the player about one fewer key than it accepts. The upper bound is the number row:
+		// see TraceCharacterSelectFile::NumberKeyForIndex for what happens past nine.
+		const FString Controls = FString::Printf(
+			TEXT("1-%d OR ARROWS TO CHOOSE      ENTER TO LOCK IN      OR CLICK A CARD"),
+			FMath::Min(TraceCharacterRoster::Count, 9));
 		DrawTextCentered(HUD, Controls, TraceSelectStyle::InkDim, ViewW * 0.5f, FooterY, FontSmall, UIScale);
 		FooterY += MeasureHeight(HUD, Controls, FontSmall, UIScale) + (8.f * UIScale);
 	}
@@ -732,7 +838,7 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 			Message = TEXT("NOT PICKING RIGHT NOW");
 			break;
 		default:
-			Message = TEXT("THAT IS NOT ONE OF THE FIVE");
+			Message = TEXT("THAT IS NOT ONE OF THE CHARACTERS");
 			break;
 		}
 
@@ -786,7 +892,7 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 	if (bSelected)
 	{
 		// A second, breathing frame just inside the first. The highlight has to survive being one of
-		// five similar rectangles on a dark screen; a single border does not manage it.
+		// eight similar rectangles on a dark screen; a single border does not manage it.
 		const float Inset = 3.f * UIScale;
 		DrawFrame(HUD, X + Inset, Y + Inset, W - 2.f * Inset, H - 2.f * Inset,
 			TraceSelectStyle::WithAlpha(Entry.Accent, 0.35f + 0.25f * FMath::Sin(Now * 6.f)));
@@ -812,7 +918,7 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 	// ---- Taken banner ----------------------------------------------------------------------------
 	if (bTaken)
 	{
-		const FString TakenLine = FString::Printf(TEXT("TAKEN BY %s"), *SafePlayerName(Holder).ToUpper());
+		const FString TakenLine = FString::Printf(TEXT("TAKEN BY %s"), *TraceCharacterSelectFile::SafePlayerName(Holder).ToUpper());
 		HUD->DrawRect(TraceSelectStyle::WithAlpha(TraceSelectStyle::Danger, 0.18f),
 			TextX, TextY - (2.f * UIScale), TextW, MeasureHeight(HUD, TakenLine, FontSmall, UIScale) + (4.f * UIScale));
 		TextY = DrawWrapped(HUD, TakenLine, TraceSelectStyle::Danger, TextX, TextY, TextW, FontSmall, UIScale, 2.f * UIScale);
@@ -930,10 +1036,13 @@ void FTraceCharacterSelect::DrawTextCentered(AHUD* HUD, const FString& Text, con
 }
 
 #if !UE_BUILD_SHIPPING
-namespace
+// Named after the file, like the block at the top of it and for the same jumbo-build reason —
+// "TraceCharacterSelectCommand" is a name a second console-command file could plausibly reuse, and
+// under the unity build both would land in the same anonymous namespace and fail to link on MSVC.
+namespace TraceCharacterSelectCommands
 {
 	/**
-	 * Trace.Characters.Select <1..5>
+	 * Trace.Characters.Select <1..N>   (N = TraceCharacterRoster::LastId, 8 since spec v18 §2)
 	 *
 	 * Drives a pick from the console so a headless run can prove the SCREEN's request path, not just
 	 * the game mode's. It sets a plain int that the open screen consumes on its next Tick; see the
@@ -949,7 +1058,7 @@ namespace
 	}
 
 	/**
-	 * Trace.Characters.ClickTest <1..5>
+	 * Trace.Characters.ClickTest <1..N>   (N = TraceCharacterRoster::Count, 8 since spec v18 §2)
 	 *
 	 * Spec v15 §4 for this screen. Parks a real cursor on the card and clicks it through the real
 	 * input pipeline, then reports how many complete clicks it took. One is the requirement.
@@ -965,16 +1074,17 @@ namespace
 
 	FAutoConsoleCommand CmdTraceCharacterSelectClickTest(
 		TEXT("Trace.Characters.ClickTest"),
-		TEXT("Dev only. Spec v15 s4. Parks the cursor on card 1..5 and clicks it through the real input "
-		     "pipeline, then reports how many complete clicks the card needed. No effect unless the "
-		     "select screen is open on this machine."),
+		TEXT("Dev only. Spec v15 s4. Parks the cursor on card 1..N (N = the roster size, 8 since spec "
+		     "v18 s2) and clicks it through the real input pipeline, then reports how many complete "
+		     "clicks the card needed. No effect unless the select screen is open on this machine."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&TraceCharacterSelectClickTestCommand));
 
 	FAutoConsoleCommand CmdTraceCharacterSelect(
 		TEXT("Trace.Characters.Select"),
-		TEXT("Dev only. Spec v14 3. Picks character 1..5 through the select screen's own request path "
-		     "(highlight, then confirm), so a headless run exercises the screen rather than bypassing "
-		     "it. No effect unless the select screen is open on this machine."),
+		TEXT("Dev only. Spec v14 3. Picks character 1..N (N = the roster size, 8 since spec v18 s2) "
+		     "through the select screen's own request path (highlight, then confirm), so a headless run "
+		     "exercises the screen rather than bypassing it. No effect unless the select screen is open "
+		     "on this machine."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&TraceCharacterSelectCommand));
 }
 #endif

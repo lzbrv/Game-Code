@@ -14,9 +14,12 @@
 #include "AI/TraceBotController.h"
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/Characters/TraceAbilitySetChut.h"
+#include "Abilities/Characters/TraceAbilitySetElle.h"
 #include "Abilities/Characters/TraceAbilitySetMace.h"
 #include "Abilities/Characters/TraceAbilitySetOyster.h"
 #include "Abilities/Characters/TraceAbilitySetRocco.h"
+#include "Abilities/Characters/TraceAbilitySetRoxie.h"
+#include "Abilities/Characters/TraceAbilitySetSlimeball.h"
 #include "Abilities/Characters/TraceAbilitySetX.h"
 #include "Core/TraceCharacter.h"
 #include "Gameplay/TraceHealthComponent.h"
@@ -81,6 +84,54 @@ namespace TraceBotAbilityBrainLocal
 		TEXT("ability jumps and ability dashes. Off by default; free when off."),
 		ECVF_Default);
 
+	// =============================================================================================
+	// SPEC v18 §3 — the three new characters
+	// =============================================================================================
+
+	static TAutoConsoleVariable<int32> CVarBotNewCharacterAbilities(
+		TEXT("Trace.Bot.NewCharacterAbilities"),
+		1,
+		TEXT("1 (default): bots play Roxie, Elle and Slimeball with their abilities (spec v18 §3).\n")
+		TEXT("0: THE RED ARM FOR THIS PASS, and it is narrower than Trace.Bot.Abilities on purpose.\n")
+		TEXT("   It removes ONLY the three new planners, so a measurement run shows Rocco, Chut, Mace,\n")
+		TEXT("   Oyster and X still using their abilities in the same match while a bot Roxie never\n")
+		TEXT("   fires a rocket, a bot Elle never places a gate and a bot Slimeball never sticks —\n")
+		TEXT("   which is exactly the state spec v18 §3 calls \"reads as broken\", reproduced on demand."),
+		ECVF_Default);
+
+	static TAutoConsoleVariable<float> CVarBotRoxieRocketRoomBehind(
+		TEXT("Trace.Bot.RoxieRocketRoomBehindUU"),
+		380.f,
+		TEXT("How much clear space a bot Roxie wants BEHIND her before she fires the rocket, in uu.\n")
+		TEXT("The rocket's whole point is that it throws her backwards; firing it with a wall two feet\n")
+		TEXT("behind her spends a 35 s cooldown on a bump. 0 disables the check."),
+		ECVF_Default);
+
+	static TAutoConsoleVariable<float> CVarBotSnapRotationSpan(
+		TEXT("Trace.Bot.SnapRotationSpanUU"),
+		1100.f,
+		TEXT("How far a bot Elle wants to have travelled from her first SNAP gate before she plants the\n")
+		TEXT("second, in uu. This is the length of the rotation the pair opens; two mouths a few metres\n")
+		TEXT("apart are a 35 s cooldown spent on nothing. She plants it anyway when the 4 s window is\n")
+		TEXT("about to lapse, because a lapsed cast costs the full cooldown and gives nothing at all."),
+		ECVF_Default);
+
+	static TAutoConsoleVariable<float> CVarBotSlimeballWallSearch(
+		TEXT("Trace.Bot.SlimeballWallSearchUU"),
+		300.f,
+		TEXT("How far a bot Slimeball looks for a wall worth sticking to, in uu. Larger than the\n")
+		TEXT("ability's own SlimeballWallStickRangeUU (90) on purpose: the bot LEANS toward the wall it\n")
+		TEXT("found for a moment as it jumps, so the wall only has to be within a step, not in reach."),
+		ECVF_Default);
+
+	/** How long the V TAP that fires Roxie's rocket is held down for, in seconds. */
+	static constexpr float SecondaryTapSeconds = 0.12f;
+
+	static bool NewCharacterAbilitiesEnabled()
+	{
+		return CVarBotNewCharacterAbilities.GetValueOnAnyThread() != 0;
+	}
+
 	/** Minimum world seconds between any two ability key presses by the same bot. */
 	static constexpr float MinGapBetweenPresses = 0.45f;
 
@@ -140,7 +191,20 @@ namespace TraceBotAbilityStats
 			int32 Attempts[static_cast<int32>(ETraceCharacterId::Count)] = {};
 
 			int32 SpikePulls = 0;
-			int32 SecondaryDowns = 0;
+
+			/**
+			 * V presses, PER CHARACTER since spec v18 §2 gave the key to three of them. One total was
+			 * enough while Mace's suspend was the only V ability; it would now sum a suspend, a rocket
+			 * and a wall stick into a number that describes none of them.
+			 */
+			int32 SecondaryDowns[static_cast<int32>(ETraceCharacterId::Count)] = {};
+
+			/** The v18 §3 OUTCOMES — see TraceBotAbilityStats::NoteRocketFired for why presses are not enough. */
+			int32 RoxieRocketsFired = 0;
+			int32 SlimeballSticks = 0;
+			int32 ElleCloaks = 0;
+			int32 ElleCloakEscapes = 0;
+
 			int32 AbilityJumps = 0;
 			int32 AbilityJumpsConsumed = 0;
 			int32 AbilityDashes = 0;
@@ -195,14 +259,51 @@ namespace TraceBotAbilityStats
 			(Reason != nullptr) ? Reason : TEXT("?"));
 	}
 
-	void NoteSecondary(ETraceCharacterId Id, bool bDown)
+	void NoteSecondary(ETraceCharacterId Id, bool bDown, const TCHAR* Reason)
 	{
 		if (!bDown)
 		{
 			return;
 		}
-		++Counters().SecondaryDowns;
-		UE_LOG(LogTraceGame, Verbose, TEXT("[BotAbility] %s held V (secondary)."), TraceCharacterIdToString(Id));
+		const int32 Index = FMath::Clamp(static_cast<int32>(Id), 0, static_cast<int32>(ETraceCharacterId::Count) - 1);
+		++Counters().SecondaryDowns[Index];
+
+		if (Reason != nullptr)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[BotAbility] %s pressed V  reason=%s"),
+				TraceCharacterIdToString(Id), Reason);
+		}
+		else
+		{
+			// Mace's suspend reaches here: its hold is started directly by PlanMace rather than by the
+			// intent latch, so there is no reason string to print and there never was one.
+			UE_LOG(LogTraceGame, Verbose, TEXT("[BotAbility] %s pressed V (secondary)."), TraceCharacterIdToString(Id));
+		}
+	}
+
+	void NoteRocketFired()
+	{
+		++Counters().RoxieRocketsFired;
+		UE_LOG(LogTraceGame, Display, TEXT("[BotAbility] Roxie: rocket away (V). She is on her way backwards."));
+	}
+
+	void NoteWallStick()
+	{
+		++Counters().SlimeballSticks;
+		UE_LOG(LogTraceGame, Display, TEXT("[BotAbility] Slimeball: got hold of a wall (V held)."));
+	}
+
+	void NoteCloak()
+	{
+		++Counters().ElleCloaks;
+		UE_LOG(LogTraceGame, Display, TEXT("[BotAbility] Elle: cloaked (she just passed or threw the Core)."));
+	}
+
+	void NoteCloakEscape()
+	{
+		++Counters().ElleCloakEscapes;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotAbility] Elle: breaking away under the cloak — steering away from the nearest enemy."));
 	}
 
 	void NoteAbilityJump(ETraceCharacterId Id, bool bConsumed)
@@ -259,16 +360,32 @@ namespace TraceBotAbilityStats
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[BotAbility] t=%.0fs | E fired/attempted per character: Rocco=%d/%d Chut=%d/%d ")
-			TEXT("Mace=%d/%d Oyster=%d/%d X=%d/%d | none(should be 0)=%d/%d ")
-			TEXT("| spike-pulls=%d V-holds=%d ability-jumps=%d (consumed %d) ability-dashes=%d"),
+			TEXT("Mace=%d/%d Oyster=%d/%d X=%d/%d Roxie=%d/%d Elle=%d/%d Slimeball=%d/%d ")
+			TEXT("| none(should be 0)=%d/%d ")
+			TEXT("| spike-pulls=%d ability-jumps=%d (consumed %d) ability-dashes=%d"),
 			Now - C.StartTime,
 			C.Fired[Slot(ETraceCharacterId::Rocco)],  C.Attempts[Slot(ETraceCharacterId::Rocco)],
 			C.Fired[Slot(ETraceCharacterId::Chut)],   C.Attempts[Slot(ETraceCharacterId::Chut)],
 			C.Fired[Slot(ETraceCharacterId::Mace)],   C.Attempts[Slot(ETraceCharacterId::Mace)],
 			C.Fired[Slot(ETraceCharacterId::Oyster)], C.Attempts[Slot(ETraceCharacterId::Oyster)],
 			C.Fired[Slot(ETraceCharacterId::X)],      C.Attempts[Slot(ETraceCharacterId::X)],
+			C.Fired[Slot(ETraceCharacterId::Roxie)],  C.Attempts[Slot(ETraceCharacterId::Roxie)],
+			C.Fired[Slot(ETraceCharacterId::Elle)],   C.Attempts[Slot(ETraceCharacterId::Elle)],
+			C.Fired[Slot(ETraceCharacterId::Slimeball)], C.Attempts[Slot(ETraceCharacterId::Slimeball)],
 			C.Fired[Slot(ETraceCharacterId::None)],   C.Attempts[Slot(ETraceCharacterId::None)],
-			C.SpikePulls, C.SecondaryDowns, C.AbilityJumps, C.AbilityJumpsConsumed, C.AbilityDashes);
+			C.SpikePulls, C.AbilityJumps, C.AbilityJumpsConsumed, C.AbilityDashes);
+
+		// SPEC v18 §3's own acceptance test, on its own line. V is three abilities now, and the three
+		// OUTCOME columns are the ones that answer "does a bot Roxie actually fire a rocket" — a press
+		// column cannot, because her rocket, unlike E, is arbitrated inside her own ability set.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotAbility] t=%.0fs | V presses: Mace(suspend)=%d Roxie(rocket)=%d Slimeball(stick)=%d ")
+			TEXT("| v18 outcomes: rockets away=%d wall-sticks=%d Elle cloaks=%d (escaped under %d)"),
+			Now - C.StartTime,
+			C.SecondaryDowns[Slot(ETraceCharacterId::Mace)],
+			C.SecondaryDowns[Slot(ETraceCharacterId::Roxie)],
+			C.SecondaryDowns[Slot(ETraceCharacterId::Slimeball)],
+			C.RoxieRocketsFired, C.SlimeballSticks, C.ElleCloaks, C.ElleCloakEscapes);
 
 		// THE "NATURAL" MEASUREMENT. min must never be 0.00 — that would mean an ability fired on the
 		// frame it was decided, which is the single most robotic thing a bot can do and is what spec
@@ -302,9 +419,10 @@ void FTraceBotAbilityBrain::OnPossessed(float Now, float InPersonalityBias)
 	AbilityAimError = FVector2D::ZeroVector;
 	AbilityAimErrorRefreshTime = 0.f;
 
+	SecondaryHoldUntilTime = 0.f;
+
 	bHasSpikeCandidate = false;
 	NextSpikeProbeTime = 0.f;
-	SuspendReleaseTime = 0.f;
 	NextSuspendTime = 0.f;
 
 	NextPicklerProbeTime = 0.f;
@@ -313,14 +431,41 @@ void FTraceBotAbilityBrain::OnPossessed(float Now, float InPersonalityBias)
 
 	NextBashTime = 0.f;
 	NextRedirectTime = 0.f;
+
+	// --- spec v18 §3 ---
+	//
+	// The three "was it true last tick" flags are cleared to FALSE rather than sampled, and that is
+	// deliberate: a fresh pawn is not stuck, not cloaked and has a ready rocket, so false is the truth
+	// AND it means the first sample after a respawn cannot invent an outcome that never happened.
+	NextRocketTime = 0.f;
+	bRocketWasReady = false;
+
+	SnapFirstGateLocation = FVector::ZeroVector;
+	SnapFirstPressTime = 0.f;
+	bSnapFirstGatePlaced = false;
+	NextSnapTime = 0.f;
+	CloakEscapeStartTime = 0.f;
+	bCloakEscapeAllowed = false;
+	bCloakEscapeCounted = false;
+	bWasCloaked = false;
+
+	StickWallPoint = FVector::ZeroVector;
+	bHasStickWall = false;
+	NextStickProbeTime = 0.f;
+	NextStickTime = 0.f;
+	StickApproachUntilTime = 0.f;
+	bWasStuck = false;
 }
 
 void FTraceBotAbilityBrain::OnUnPossessed()
 {
 	ClearIntent();
-	SuspendReleaseTime = 0.f;
+	SecondaryHoldUntilTime = 0.f;
 	bHasSpikeCandidate = false;
 	bHasPicklerAim = false;
+	bHasStickWall = false;
+	bSnapFirstGatePlaced = false;
+	StickApproachUntilTime = 0.f;
 	PlannedCharacter = ETraceCharacterId::None;
 }
 
@@ -439,6 +584,17 @@ void FTraceBotAbilityBrain::Resolve(const FTraceBotAbilitySituation& Situation, 
 	case ETraceBotAbilityAct::Activate: Out.bActivate = true; break;
 	case ETraceBotAbilityAct::Jump:     Out.bJump = true;     break;
 	case ETraceBotAbilityAct::Dash:     Out.bDash = true;     break;
+
+	// THE V TAP. It is expressed as a very short HOLD rather than a one-frame flag, because V is a
+	// level all the way down to UTraceAbilityInputRelay::RouteSecondaryEdge — the press and the
+	// release are two calls and the ability sees both, exactly as it does from a human's key. The
+	// level block at the end of Plan() turns this deadline back into the bool the controller mirrors.
+	case ETraceBotAbilityAct::Secondary:
+		SecondaryHoldUntilTime = Situation.Now + TraceBotAbilityBrainLocal::SecondaryTapSeconds;
+		Out.bSecondaryPressedNow = true;
+		Out.SecondaryReason = PendingReason;
+		break;
+
 	default: break;
 	}
 
@@ -629,7 +785,7 @@ void FTraceBotAbilityBrain::Plan(const FTraceBotAbilitySituation& Situation, flo
 	if (!TraceBotAbilityStats::AbilitiesEnabled())
 	{
 		ClearIntent();
-		SuspendReleaseTime = 0.f;
+		SecondaryHoldUntilTime = 0.f;
 		return;
 	}
 
@@ -639,9 +795,17 @@ void FTraceBotAbilityBrain::Plan(const FTraceBotAbilitySituation& Situation, flo
 		// The character changed under us (selection, half time, the mode-A freeze). Everything latched
 		// belonged to the character that has just left.
 		ClearIntent();
-		SuspendReleaseTime = 0.f;
+		SecondaryHoldUntilTime = 0.f;
 		bHasSpikeCandidate = false;
 		bHasPicklerAim = false;
+		bHasStickWall = false;
+		bSnapFirstGatePlaced = false;
+		StickApproachUntilTime = 0.f;
+		bRocketWasReady = false;
+		bWasStuck = false;
+		bWasCloaked = false;
+		bCloakEscapeAllowed = false;
+		bCloakEscapeCounted = false;
 		PlannedCharacter = MyCharacter;
 	}
 
@@ -656,9 +820,13 @@ void FTraceBotAbilityBrain::Plan(const FTraceBotAbilitySituation& Situation, flo
 	if (Situation.bPassing)
 	{
 		ClearIntent();
-		SuspendReleaseTime = 0.f;
+		SecondaryHoldUntilTime = 0.f;
 		return;
 	}
+
+	// SPEC v18 §3. Watched BEFORE any decision, so a press made this tick cannot be mistaken for the
+	// outcome of the last one. Costs three pointer compares on the five older characters.
+	ObserveNewCharacterOutcomes(Situation);
 
 	switch (MyCharacter)
 	{
@@ -667,19 +835,157 @@ void FTraceBotAbilityBrain::Plan(const FTraceBotAbilitySituation& Situation, flo
 	case ETraceCharacterId::Mace:   PlanMace(Situation, Out);   break;
 	case ETraceCharacterId::Oyster: PlanOyster(Situation, Out); break;
 	case ETraceCharacterId::X:      PlanX(Situation, Out);      break;
+
+	// --- spec v18 §3. The red arm is INSIDE the switch rather than around the three calls, so that
+	//     "a bot Roxie that never fires a rocket" is reproduced by the same default: break; the code
+	//     had before this pass existed. -----------------------------------------------------------
+	case ETraceCharacterId::Roxie:
+		if (TraceBotAbilityBrainLocal::NewCharacterAbilitiesEnabled()) { PlanRoxie(Situation, Out); }
+		break;
+	case ETraceCharacterId::Elle:
+		if (TraceBotAbilityBrainLocal::NewCharacterAbilitiesEnabled()) { PlanElle(Situation, Out); }
+		break;
+	case ETraceCharacterId::Slimeball:
+		if (TraceBotAbilityBrainLocal::NewCharacterAbilitiesEnabled()) { PlanSlimeball(Situation, Out); }
+		break;
+
 	default: break;
 	}
 
 	Resolve(Situation, Out);
 
-	// The suspend is a LEVEL, not an edge, so it is asserted after Resolve() rather than through it.
-	if (SuspendReleaseTime > 0.f)
+	// SPEC v18 §3 — SLIMEBALL'S STICK STARTS ON THE SAME TICK AS THE JUMP THAT MAKES IT POSSIBLE.
+	//
+	// His own file describes the natural human input as "hold V, then jump into the wall", and its
+	// retry loop only looks for a wall while V is down AND he is falling. So the V level has to go
+	// down as the jump is pressed, not after he has landed again — and the jump is the act the
+	// reaction latch is carrying, so this is the first moment the decision is known to have fired.
+	// Pressing V early costs nothing: OnSecondaryPressed with no wall in reach is a free no-op.
+	if (MyCharacter == ETraceCharacterId::Slimeball && Out.bJump && SecondaryHoldUntilTime <= 0.f)
 	{
-		Out.bSecondaryHeld = (Situation.Now < SuspendReleaseTime);
+		const float MinHold = 1.1f;
+		const float MaxHold = 2.6f;
+		SecondaryHoldUntilTime = Situation.Now + FMath::FRandRange(MinHold, MaxHold);
+
+		// The jump's reason IS the V press's reason — they are one decision arriving on two keys.
+		Out.SecondaryReason = Out.Reason;
+
+		// Lean toward the wall for a moment after take-off. A jump straight up beside a wall is 90 uu
+		// of nothing: ProbeForWall measures from his capsule CENTRE and reaches 90 uu, so he has to
+		// close most of the gap himself. This is the same argument as Rocco's redirect needing the
+		// steering to be there on the frame it fires.
+		StickApproachUntilTime = Situation.Now + 0.7f;
+
+		// One stick at a time, and a gap after it: the hold plus a few seconds. Without this he would
+		// re-latch the moment the hold lapsed and live on the wall.
+		NextStickTime = SecondaryHoldUntilTime + 3.f;
+	}
+
+	// SPEC v18 §3 — ELLE'S FIRST GATE. Recorded here rather than in PlanElle because THIS is the tick
+	// the press actually happens on (the controller runs ApplyAbilityInputs later in the same frame),
+	// and because IsAwaitingSecondGate() is still false right now, which is what identifies it as the
+	// OPENING press rather than the completing one.
+	if (MyCharacter == ETraceCharacterId::Elle && Out.bActivate)
+	{
+		if (const UTraceAbilitySetElle* ElleSet = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetElle>())
+		{
+			if (!ElleSet->IsAwaitingSecondGate())
+			{
+				SnapFirstGateLocation = Situation.Self->GetActorLocation();
+				SnapFirstPressTime = Situation.Now;
+				bSnapFirstGatePlaced = true;
+			}
+			else
+			{
+				bSnapFirstGatePlaced = false;   // that was the completing press; the cast is over
+			}
+		}
+	}
+
+	// V is a LEVEL, not an edge — Mace's suspend, Slimeball's stick and (as a very short hold) Roxie's
+	// rocket tap all arrive through it — so it is asserted after Resolve() rather than through it.
+	if (SecondaryHoldUntilTime > 0.f)
+	{
+		Out.bSecondaryHeld = (Situation.Now < SecondaryHoldUntilTime);
 		if (!Out.bSecondaryHeld)
 		{
-			SuspendReleaseTime = 0.f;
+			SecondaryHoldUntilTime = 0.f;
 		}
+	}
+}
+
+// =================================================================================================
+// SPEC v18 §3 — did the ability actually LAND?
+// =================================================================================================
+
+void FTraceBotAbilityBrain::ObserveNewCharacterOutcomes(const FTraceBotAbilitySituation& Situation)
+{
+	switch (PlannedCharacter)
+	{
+	case ETraceCharacterId::Roxie:
+	{
+		const UTraceAbilitySetRoxie* Roxie = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetRoxie>();
+		if (Roxie != nullptr)
+		{
+			// READY -> NOT READY is the rocket leaving the tube. Nothing else moves that deadline:
+			// the 35 s is charged by ATraceRoxieRocket's spawn and by nothing else in her set.
+			const bool bReadyNow = Roxie->IsRocketReady();
+			if (bRocketWasReady && !bReadyNow)
+			{
+				TraceBotAbilityStats::NoteRocketFired();
+			}
+			bRocketWasReady = bReadyNow;
+		}
+		break;
+	}
+
+	case ETraceCharacterId::Slimeball:
+	{
+		const UTraceAbilitySetSlimeball* Slime = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetSlimeball>();
+		if (Slime != nullptr)
+		{
+			const bool bStuckNow = Slime->IsStuck();
+			if (!bWasStuck && bStuckNow)
+			{
+				TraceBotAbilityStats::NoteWallStick();
+			}
+			bWasStuck = bStuckNow;
+		}
+		break;
+	}
+
+	case ETraceCharacterId::Elle:
+	{
+		const UTraceAbilitySetElle* ElleSet = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetElle>();
+		if (ElleSet != nullptr)
+		{
+			// The cloak is a PASSIVE nobody presses, so this count is the only evidence that a bot
+			// Elle is triggering it at all — i.e. that bots pass and throw the Core often enough for
+			// her defining trait to exist in a match.
+			const bool bCloakedNow = ElleSet->IsCloaked();
+			if (!bWasCloaked && bCloakedNow)
+			{
+				TraceBotAbilityStats::NoteCloak();
+
+				// BOTH GATES ROLLED ONCE, HERE, rather than per tick in the planner — a per-tick roll
+				// averages out to "always, immediately", which is the frame-one behaviour spec v15 §3
+				// names first and the difficulty knob doing nothing at all.
+				//
+				// The willingness roll is what puts the cloak escape under Trace.Bot.AbilityUseScale
+				// with everything else in this file. Without it, an Easy bot would still disengage
+				// perfectly every time she gave the Core away — the one thing in this pass that no
+				// difficulty setting could soften.
+				CloakEscapeStartTime = Situation.Now + TraceBotAbilityBrainLocal::ReactionDelay(PersonalityBias);
+				bCloakEscapeAllowed = (FMath::FRand() < TraceBotAbilityBrainLocal::Willingness(PersonalityBias));
+				bCloakEscapeCounted = false;
+			}
+			bWasCloaked = bCloakedNow;
+		}
+		break;
+	}
+
+	default:
+		break;
 	}
 }
 
@@ -1027,7 +1333,7 @@ void FTraceBotAbilityBrain::PlanMace(const FTraceBotAbilitySituation& Situation,
 		? FindVisibleEnemy(Situation, UTraceSettings::GetBotProfile().MaxEngagementRange, AngleTargetDist)
 		: nullptr;
 
-	if (SuspendReleaseTime <= 0.f && AngleTarget != nullptr)
+	if (SecondaryHoldUntilTime <= 0.f && AngleTarget != nullptr)
 	{
 		const float MaxHold = FMath::Max(0.2f, UTraceSettings::Get().MaceSuspendMaxSeconds);
 
@@ -1038,7 +1344,7 @@ void FTraceBotAbilityBrain::PlanMace(const FTraceBotAbilitySituation& Situation,
 				// The hold is SHORTER than the ability's own 1.25 s cap, and rolled. A bot that always
 				// suspends for exactly the maximum reads as a machine, and running the meter out in
 				// mid-air is strictly worse than choosing to come down.
-				SuspendReleaseTime = Situation.Now + FMath::FRandRange(MaxHold * 0.45f, MaxHold * 0.85f);
+				SecondaryHoldUntilTime = Situation.Now + FMath::FRandRange(MaxHold * 0.45f, MaxHold * 0.85f);
 				NextSuspendTime = Situation.Now + MaxHold + 2.f;
 			}
 			else
@@ -1065,7 +1371,7 @@ void FTraceBotAbilityBrain::PlanMace(const FTraceBotAbilitySituation& Situation,
 
 	// A suspend that is running owns the body. Throwing a spike out of it is legal and is also two
 	// decisions at once, which is not what a person does.
-	if (SuspendReleaseTime > 0.f)
+	if (SecondaryHoldUntilTime > 0.f)
 	{
 		return;
 	}
@@ -1422,4 +1728,549 @@ void FTraceBotAbilityBrain::PlanX(const FTraceBotAbilitySituation& Situation, FT
 	}
 
 	Want(Situation, ETraceBotAbilityAct::Activate, TEXT("X: Sting before a duel"));
+}
+
+// =================================================================================================
+// ROXIE (spec v18 §3) — "rocket for the displacement as much as the damage; Modded before a fight."
+// =================================================================================================
+//
+// THE ORDER OF THE TWO BLOCKS BELOW IS A DECISION, and it is the opposite of Chut's and Oyster's.
+//
+// Those two put E first because E was the scarce resource and the dash was offered on nearly every
+// tick. Roxie has no dash ability at all: her two cooldowns are 35 s (the rocket, on V) and 25 s
+// (MODDED, on E), and it is the ROCKET whose opportunity is narrow — it needs somebody roughly in
+// front of her AND clear ground behind her to be thrown into. MODDED's trigger is "a fight is about
+// to happen", which is true for whole seconds at a time. So the narrow window goes first; if it were
+// second, the intent latch would be holding a MODDED press through every one of them.
+// =================================================================================================
+
+void FTraceBotAbilityBrain::PlanRoxie(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& /*Out*/)
+{
+	ATraceCharacter* BotPawn = Situation.Self;
+	UWorld* WorldPtr = BotPawn->GetWorld();
+	const UTraceAbilitySetRoxie* Roxie = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetRoxie>();
+	if (WorldPtr == nullptr || Roxie == nullptr)
+	{
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const FTraceBotProfile& Profile = UTraceSettings::GetBotProfile();
+	const FVector MyLocation = BotPawn->GetActorLocation();
+
+	// --- THE ROCKET: "for the displacement as much as the damage" ---------------------------------
+	if (Roxie->IsRocketReady() && Situation.Now >= NextRocketTime)
+	{
+		// How far the thing actually flies, from the two knobs that decide it. Clamped to what the bot
+		// can see anyway: a rocket at a man it has no line of sight to is a rocket at a wall.
+		const float RocketReach = FMath::Min(
+			FMath::Max(400.f, Settings.RoxieRocketSpeed * Settings.RoxieRocketLifetimeSeconds),
+			Profile.MaxEngagementRange);
+
+		float TargetDist = 0.f;
+		ATraceCharacter* Victim = FindVisibleEnemy(Situation, RocketReach, TargetDist);
+
+		// THE §4 CHOKE POINT, ASKED RATHER THAN RE-DERIVED — and for Roxie this matters more than for
+		// anybody else on the roster, because her rocket is the flat 100 that spec v18 §2 calls "the
+		// most dangerous addition yet". The rule itself lives in ATraceRoxieRocket ->
+		// UTraceAbilitySetRoxie::ApplyRocketDamageTo -> UTraceCharacterAbilitySet::DealDamage ->
+		// UTraceAbilityComponent::CanAffectTarget, and a carrier is safe from this bot whatever this
+		// function decides. What asking HERE buys is that she does not spend a 35 s cooldown on a
+		// target the rules will make the rocket fly straight through.
+		//
+		// It DOES cost her one situation, and it is the right trade: a bot Roxie whose only visible
+		// enemy is the Core carrier will not rocket at all, even though the recoil alone would still
+		// carry her out of trouble. 35 s is a lot to spend on a shot that is guaranteed to deal zero,
+		// and the nearest visible enemy behind her is almost never the carrier — a carrier is being
+		// chased, not chasing.
+		if (Victim != nullptr && !Situation.Abilities->CanAffectTarget(Victim, ETraceAbilityEffect::Damage))
+		{
+			Victim = nullptr;
+		}
+
+		if (Victim != nullptr)
+		{
+			FVector ToVictim = Victim->GetActorLocation() - MyLocation;
+			ToVictim.Z = 0.f;
+			const FVector AimDirection = ToVictim.GetSafeNormal();
+
+			// IS THERE ANYWHERE TO GO? The rocket's own words in §2 are "launches her backwards, fast
+			// and far", so firing it with a wall at her shoulder blades spends the whole cooldown on a
+			// bump and a bang. One trace, against the same visibility channel the bot's sight uses.
+			bool bRoomBehind = true;
+			const float RoomWanted = FMath::Max(0.f,
+				TraceBotAbilityBrainLocal::CVarBotRoxieRocketRoomBehind.GetValueOnAnyThread());
+			if (RoomWanted > 0.f && !AimDirection.IsNearlyZero())
+			{
+				const FVector Behind = MyLocation - AimDirection * RoomWanted;
+				FCollisionQueryParams Params(TEXT("TraceBotRoxieBackswing"), /*bTraceComplex=*/false, BotPawn);
+				FHitResult Hit;
+				bRoomBehind = !WorldPtr->LineTraceSingleByChannel(Hit, MyLocation, Behind, ECC_Visibility, Params);
+			}
+
+			// A CARRIER MAY FIRE IT, BUT ONLY DOWN THE LANE SHE CAME FROM.
+			//
+			// Every other movement ability in this file refuses outright while carrying (Rocco's
+			// redirect, Mace's suspend), and for them that is right: a carrier who hops or hangs has
+			// simply stopped running. The rocket is different in kind, because the displacement has a
+			// SIGN — she is thrown away from whatever she shoots. Fired at the chasers behind her, the
+			// recoil throws her at the endzone, which is the best use of the ability on the whole
+			// roster. Fired at somebody ahead, it throws her back down the pitch and undoes the run.
+			// So the carrier keeps it, with the direction test that tells the two apart.
+			bool bAllowedWhileCarrying = true;
+			if (Situation.bIAmCarrier)
+			{
+				FVector ToGoal = Situation.AttackGoal - MyLocation;
+				ToGoal.Z = 0.f;
+				const FVector GoalDirection = ToGoal.GetSafeNormal();
+				bAllowedWhileCarrying = !GoalDirection.IsNearlyZero()
+					&& FVector::DotProduct(AimDirection, GoalDirection) < -0.5f;
+			}
+
+			if (bRoomBehind && bAllowedWhileCarrying)
+			{
+				// Two reasons, and the log tells them apart because they are genuinely different plays.
+				// "Hurt and being shot at" is the escape — she is buying distance and the 100 damage is
+				// the bonus. Anything else is the shot, and being thrown backwards is the cost she pays
+				// for taking it.
+				const bool bEscaping = (BotPawn->Health != nullptr) && BotPawn->Health->GetHealthPercent() < 0.55f;
+
+				const FVector AimAt = ApplyAbilityAimError(Situation,
+					Victim->GetActorLocation() + FVector(0.f, 0.f, 40.f));
+
+				const ETraceBotWantResult Result = Want(Situation, ETraceBotAbilityAct::Secondary,
+					Situation.bIAmCarrier ? TEXT("Roxie: rocket back down the lane, ride the recoil to the endzone")
+					: bEscaping           ? TEXT("Roxie: rocket to blow herself out of a losing fight")
+					                      : TEXT("Roxie: rocket — 100 on impact and a long way backwards"),
+					&AimAt);
+
+				if (Result == ETraceBotWantResult::Declined)
+				{
+					NextRocketTime = Situation.Now + 1.5f;
+				}
+			}
+		}
+	}
+
+	// --- MODDED: "before a fight" ------------------------------------------------------------------
+	//
+	// Chut's Chud, verbatim in shape, and deliberately so: both are a several-second buff whose entire
+	// value is that it is ALREADY UP when the shooting starts, so both trigger on an enemy who is
+	// about to be in a fight with this bot rather than on one who is already shooting it. The reaction
+	// latch then puts the press a beat before contact.
+	//
+	// MODDED is 5 seconds and "one clip", though, which is much shorter than Chud's 10 — so the range
+	// test is tighter (1.25x preferred combat range, against Chut's 1.6x). Pressed at 1.6x she would
+	// spend half of it walking.
+	if (Roxie->IsModdedActive() || Situation.Abilities->GetActivatedCooldownRemaining() > 0.f)
+	{
+		return;
+	}
+
+	float ContactDist = 0.f;
+	const ATraceCharacter* Contact = FindVisibleEnemy(Situation, Profile.PreferredCombatRange * 1.25f, ContactDist);
+	if (Contact != nullptr)
+	{
+		Want(Situation, ETraceBotAbilityAct::Activate, TEXT("Roxie: MODDED before a fight"));
+	}
+}
+
+// =================================================================================================
+// ELLE (spec v18 §3) — "Snap to make a rotation; cloak-escape after passing."
+// =================================================================================================
+
+void FTraceBotAbilityBrain::PlanElle(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out)
+{
+	ATraceCharacter* BotPawn = Situation.Self;
+	const UTraceAbilitySetElle* Elle = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetElle>();
+	if (Elle == nullptr)
+	{
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const FVector MyLocation = BotPawn->GetActorLocation();
+
+	// --- THE CLOAK ESCAPE: "right after passing or throwing the trace" -----------------------------
+	//
+	// The cloak is a PASSIVE — nothing presses it, it simply arrives the moment she gives the Core
+	// away — so "use it" cannot mean pressing a key. It means doing the thing the three seconds are
+	// FOR: leaving. A bot that passes and then stands in the same doorway has been handed the best
+	// disengage on the roster and used it to stand still.
+	//
+	// This is steering and not a key press, so it is not routed through Want(). It is still gated: the
+	// escape does not begin until CloakEscapeStartTime, one rolled reaction delay after the cloak went
+	// up (see ObserveNewCharacterOutcomes), because vanishing and sprinting away on the same frame is
+	// the frame-one behaviour spec v15 §3 names first.
+	if (Elle->IsCloaked() && bCloakEscapeAllowed && Situation.Now >= CloakEscapeStartTime
+		&& !Situation.bIAmCarrier)
+	{
+		float ThreatDist = 0.f;
+		const ATraceCharacter* Threat = FindVisibleEnemy(Situation,
+			UTraceSettings::GetBotProfile().MaxEngagementRange, ThreatDist);
+
+		if (Threat != nullptr)
+		{
+			FVector Away = MyLocation - Threat->GetActorLocation();
+			Away.Z = 0.f;
+			Away = Away.GetSafeNormal();
+			if (!Away.IsNearlyZero())
+			{
+				// Away and ACROSS, not straight back. Running directly away from a shooter is the one
+				// direction their crosshair does not have to move at all — the same argument Rocco's
+				// dodge makes, and it matters more here because the cloak is her only protection.
+				const float Sign = (PersonalityBias < 0.5f) ? -1.f : 1.f;
+				const FVector Lateral = FVector::CrossProduct(FVector::UpVector, Away) * Sign;
+
+				Out.bOverrideMove = true;
+				Out.MoveDirection = (Away * 0.75f + Lateral * 0.65f).GetSafeNormal();
+				Out.Reason = TEXT("Elle: cloaked after the pass — break away while they cannot see her");
+
+				// Counted ONCE per cloak, on the first frame the steering is actually taken over. The
+				// escape is the only thing in this pass that presses no key, so this counter is the
+				// only thing that can tell a build where it runs from one where it never gets here.
+				if (!bCloakEscapeCounted)
+				{
+					bCloakEscapeCounted = true;
+					TraceBotAbilityStats::NoteCloakEscape();
+				}
+			}
+		}
+	}
+
+	// --- SNAP, PRESS 2: the far end of the rotation, and it has a HARD DEADLINE --------------------
+	//
+	// This block is first among the key presses and it is not a preference. §2: "If no second gate
+	// inside 4 s the first expires", and Elle's own file charges the FULL 35 s cooldown when that
+	// happens. A fluffed cast is therefore the single most expensive mistake this character can make,
+	// so nothing else is allowed to occupy the intent latch while the window is open.
+	if (Elle->IsAwaitingSecondGate())
+	{
+		if (!bSnapFirstGatePlaced)
+		{
+			// The window is open but this brain did not open it — she was mid-cast when the bot took
+			// the pawn over, or the first gate went down before the character change. Complete it
+			// anyway rather than letting it lapse; a pair somewhere beats 35 s for nothing.
+			SnapFirstGateLocation = MyLocation;
+			SnapFirstPressTime = Situation.Now;
+			bSnapFirstGatePlaced = true;
+		}
+
+		const float Window = FMath::Max(0.1f, Settings.ElleSnapSecondGateWindowSeconds);
+		const float WindowLeft = (SnapFirstPressTime + Window) - Situation.Now;
+		const float Span = static_cast<float>(FVector::Dist2D(MyLocation, SnapFirstGateLocation));
+		const float WantedSpan = FMath::Max(0.f,
+			TraceBotAbilityBrainLocal::CVarBotSnapRotationSpan.GetValueOnAnyThread());
+
+		// 2.5 s, and the number is derived rather than picked: the longest reaction this pass can roll
+		// is Easy's 0.70 s x 1.35 (personality) x 1.35 (Trace.Bot.AbilityLatencyScale) x 1.45 (jitter)
+		// = 1.85 s, so a decision taken with 2.5 s left still lands inside a 4 s window on the slowest
+		// bot in the game. Below that she stops holding out for distance and plants it where she is.
+		const bool bFarEnough = (Span >= WantedSpan);
+		const bool bOutOfTime = (WindowLeft <= 2.5f);
+
+		if (bFarEnough || bOutOfTime)
+		{
+			// No hesitation on a decline, unlike every other caller in this file. A decline here is not
+			// "maybe later", it is the 4 s window ticking away — so the offer is re-made every tick and
+			// the willingness roll gets as many chances as the window has frames.
+			Want(Situation, ETraceBotAbilityAct::Activate,
+				bFarEnough ? TEXT("Elle: second gate — the rotation is long enough to be worth it")
+				           : TEXT("Elle: second gate before the window lapses"));
+		}
+		return;
+	}
+
+	bSnapFirstGatePlaced = false;
+
+	// --- SNAP, PRESS 1: "to make a rotation" -------------------------------------------------------
+	//
+	// A rotation is a long move between two places, so the trigger is the same shape as Rocco's "cross
+	// open ground": a long way still to go, and the bot actually running it. Placed in a fight it is
+	// not a rotation, it is a portal in a doorway two people are standing in — so a visible enemy
+	// close by cancels it, which also keeps her from casting instead of shooting.
+	// BOTH cooldowns are asked, and they are not the same number. Elle's own bookkeeping is the one the
+	// ability enforces (her file explains the one branch where the two disagree, after a fluffed cast),
+	// while the framework's is the one UTraceAbilityComponent::TryActivate tests before it asks her
+	// anything. A press that either would refuse is a press the intent latch should never have been
+	// occupied by.
+	FText Refusal;
+	if (Situation.Now < NextSnapTime
+		|| Situation.Abilities->GetActivatedCooldownRemaining() > 0.f
+		|| !Elle->CanActivate(Refusal))
+	{
+		return;
+	}
+
+	FVector Heading = Situation.DesiredMoveDirection;
+	Heading.Z = 0.f;
+	Heading = Heading.GetSafeNormal();
+	if (Heading.IsNearlyZero())
+	{
+		return;   // she is not going anywhere, so there is no rotation to open
+	}
+
+	const float ToObjective = static_cast<float>(FVector::Dist2D(MyLocation, Situation.AttackGoal));
+	const float WantedSpan = FMath::Max(200.f,
+		TraceBotAbilityBrainLocal::CVarBotSnapRotationSpan.GetValueOnAnyThread());
+
+	float NearestEnemyDist = 0.f;
+	const bool bEnemyClose = FindVisibleEnemy(Situation, 1200.f, NearestEnemyDist) != nullptr;
+
+	// Twice the span she is going to try to open, so that the run she is about to make is long enough
+	// to contain the whole cast with distance to spare.
+	if (ToObjective < WantedSpan * 2.f || bEnemyClose)
+	{
+		return;
+	}
+
+	// Escorting the carrier is the rotation worth having: the mouth goes down on the ground the
+	// carrier is about to leave, and the far one opens where the team needs to arrive.
+	const bool bWithCarrier = Situation.bTeammateIsCarrier && Situation.Carrier != nullptr
+		&& FVector::Dist2D(MyLocation, Situation.Carrier->GetActorLocation()) < 2500.f;
+
+	const ETraceBotWantResult Result = Want(Situation, ETraceBotAbilityAct::Activate,
+		bWithCarrier ? TEXT("Elle: SNAP — open a rotation for the carrier's team")
+		             : TEXT("Elle: SNAP — open a rotation across open ground"));
+
+	if (Result == ETraceBotWantResult::Declined)
+	{
+		NextSnapTime = Situation.Now + 2.f;
+	}
+}
+
+// =================================================================================================
+// SLIMEBALL (spec v18 §3) — "stick to a wall to hold an angle; wall off a choke."
+// =================================================================================================
+
+void FTraceBotAbilityBrain::PlanSlimeball(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out)
+{
+	ATraceCharacter* BotPawn = Situation.Self;
+	UWorld* WorldPtr = BotPawn->GetWorld();
+	const UTraceAbilitySetSlimeball* Slime = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetSlimeball>();
+	if (WorldPtr == nullptr || Slime == nullptr)
+	{
+		return;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const FTraceBotProfile& Profile = UTraceSettings::GetBotProfile();
+	const FVector MyLocation = BotPawn->GetActorLocation();
+
+	// --- ALREADY ON THE WALL: hold on, and SHOOT ---------------------------------------------------
+	//
+	// Mace's suspend takes the same early return and for the same reason. Being stuck IS the play —
+	// +30% fire rate and 30% off body shots, from an angle a running player cannot hold — and throwing
+	// a wall out of it would be two decisions at once, which is not a thing a person does. The V level
+	// is already asserted; the hold's own deadline brings him down.
+	if (Slime->IsStuck())
+	{
+		return;
+	}
+
+	// LEAN TOWARD THE WALL FOR THE MOMENT AFTER TAKE-OFF.
+	//
+	// His own ProbeForWall measures 90 uu from the capsule CENTRE, so "beside a wall" and "in reach of
+	// it" are not the same place and a jump straight up beside one grabs nothing. The window is set on
+	// the tick the jump fires (see Plan()) and this is what spends it.
+	//
+	// Asserted here, before the E block, and it survives Resolve(): the only intent that could
+	// overwrite bOverrideMove is one that was latched WITH a move direction, and the Slimewall below
+	// latches with an aim point and no move.
+	if (Situation.Now < StickApproachUntilTime && bHasStickWall)
+	{
+		FVector ToWall = StickWallPoint - MyLocation;
+		ToWall.Z = 0.f;
+		if (!ToWall.IsNearlyZero())
+		{
+			Out.bOverrideMove = true;
+			Out.MoveDirection = ToWall.GetSafeNormal();
+			Out.Reason = TEXT("Slimeball: into the wall");
+		}
+	}
+
+	// --- THE SLIMEWALL: "wall off a choke" ---------------------------------------------------------
+	//
+	// E first, for the reason PlanChut and PlanOyster both spell out: Want() refuses a second act while
+	// one is latched, and the stick is offered on nearly every tick a wall is nearby, so with the
+	// blocks the other way round the 25 s ability would go unused for whole matches.
+	//
+	// The aim point is where the wall GOES, near enough: it is thrown 400 uu along his planar aim, so
+	// aiming at a knot of enemies drops it between him and them. Aim error is applied like every other
+	// aimed ability here — a bot that sprays with a rifle does not place a wall to the millimetre.
+	//
+	// NO PRE-CHECK AGAINST ResolveSlimewallPlacement(), deliberately. That query reads his CURRENT aim,
+	// and during the reaction delay his aim is still slewing toward the point below — so a pre-check
+	// would be answering a question about the wrong direction, and the honest failure mode is already
+	// free: ActivateAbility returns false when there is nowhere to put it and charges no cooldown.
+	if (Slime->GetActiveWall() == nullptr && Situation.Abilities->GetActivatedCooldownRemaining() <= 0.f)
+	{
+		const float SlowRadius = FMath::Max(200.f, Settings.SlimewallLengthUU * 0.5f);
+
+		FVector WallAt = FVector::ZeroVector;
+		const TCHAR* WallWhy = nullptr;
+
+		// 1. A KNOT OF ENEMIES. The 35% slow is Control and goes through the choke point inside
+		//    ATraceSlimewall, so CountAffectableEnemiesNear is asked with the same effect class the
+		//    wall will use: a lone enemy carrier, whom the wall may not slow, is not a reason to spend
+		//    the cooldown on the slow. (He may still get one thrown at him by rule 3 below, and should
+		//    — blocking sight is not something an ability does TO a person, so the carrier rule has
+		//    nothing to say about it.)
+		if (Situation.Enemies != nullptr)
+		{
+			int32 BestCount = 0;
+			for (const ATraceCharacter* Other : *Situation.Enemies)
+			{
+				if (Other == nullptr || !Other->IsAlive())
+				{
+					continue;
+				}
+				if (FVector::Dist2D(MyLocation, Other->GetActorLocation()) > 2200.f)
+				{
+					continue;
+				}
+
+				FVector Centroid = FVector::ZeroVector;
+				const int32 Count = CountAffectableEnemiesNear(Situation, Other->GetActorLocation(),
+					SlowRadius, ETraceAbilityEffect::Control, Centroid);
+				if (Count >= 2 && Count > BestCount)
+				{
+					BestCount = Count;
+					WallAt = Centroid;
+					WallWhy = TEXT("Slimeball: Slimewall across a choke they are pushing through");
+				}
+			}
+		}
+
+		// 2. SCREEN THE CORE. Carrying it, or running with whoever is: the wall goes up between the
+		//    Core and the nearest chaser, which is what the 35% slow and the blocked sight are both
+		//    for.
+		if (WallWhy == nullptr && (Situation.bIAmCarrier || Situation.BotState == ETraceBotState::EscortCarrier))
+		{
+			float ChaserDist = 0.f;
+			const ATraceCharacter* Chaser = FindVisibleEnemy(Situation, 1800.f, ChaserDist);
+			if (Chaser != nullptr)
+			{
+				WallAt = Chaser->GetActorLocation();
+				WallWhy = Situation.bIAmCarrier
+					? TEXT("Slimeball: Slimewall behind him to screen his own run")
+					: TEXT("Slimeball: Slimewall to screen the carrier");
+			}
+		}
+
+		// 3. BREAK THE LINE OF SIGHT HE IS LOSING TO. Hurt, in somebody's crosshair, and a wall is the
+		//    only thing in his kit that ends the exchange without him having to win it.
+		if (WallWhy == nullptr && BotPawn->Health != nullptr && BotPawn->Health->GetHealthPercent() < 0.5f)
+		{
+			float ShooterDist = 0.f;
+			const ATraceCharacter* Shooter = FindVisibleEnemy(Situation, Profile.MaxEngagementRange, ShooterDist);
+			if (Shooter != nullptr)
+			{
+				WallAt = Shooter->GetActorLocation();
+				WallWhy = TEXT("Slimeball: Slimewall to break the sightline while he is hurt");
+			}
+		}
+
+		if (WallWhy != nullptr)
+		{
+			const FVector AimAt = ApplyAbilityAimError(Situation, WallAt + FVector(0.f, 0.f, 40.f));
+			Want(Situation, ETraceBotAbilityAct::Activate, WallWhy, &AimAt);
+		}
+	}
+
+	// --- THE WALL STICK: "to hold an angle" --------------------------------------------------------
+	//
+	// The whole ability is unreachable from the ground: UTraceAbilitySetSlimeball::OnSecondaryPressed
+	// requires IsFalling(), and the bot movement kit only leaves the ground for a slide-jump, an
+	// unstick jump or a jar jump — none of which happen in a duel. This is the same hole Rocco's
+	// redirect and Mace's suspend both fell into and it has the same answer: the decision that starts
+	// the ability is A JUMP, which costs Slimeball nothing (his set claims no jump hook) and buys the
+	// airtime the stick lives in. The V level goes down with it, in Plan().
+	if (Situation.bIAmCarrier || Situation.Now < NextStickTime)
+	{
+		return;   // a carrier who welds himself to a wall has stopped running the Core in
+	}
+
+	const UTraceCharacterMovementComponent* Movement = BotPawn->GetTraceMovement();
+	if (Movement == nullptr || !Movement->IsMovingOnGround())
+	{
+		return;   // already airborne: this is the jump's decision and the jump has not been made here
+	}
+
+	// Somebody to hold the angle ON. Sticking to a wall in an empty corridor is the "press it off
+	// cooldown" behaviour spec v15 §3 refuses, and it would pin him in the open for nothing.
+	float TargetDist = 0.f;
+	if (FindVisibleEnemy(Situation, Profile.MaxEngagementRange, TargetDist) == nullptr)
+	{
+		return;
+	}
+
+	// Probe for a wall on a slow cadence — eight traces, and the answer is about the next few seconds.
+	if (Situation.Now >= NextStickProbeTime)
+	{
+		NextStickProbeTime = Situation.Now + 0.5f;
+		bHasStickWall = false;
+
+		const float Search = FMath::Max(60.f,
+			TraceBotAbilityBrainLocal::CVarBotSlimeballWallSearch.GetValueOnAnyThread());
+		const float MaxNormalZ = FMath::Clamp(Settings.SlimeballWallStickMaxSurfaceNormalZ, 0.f, 1.f);
+
+		// BY OBJECT TYPE, not by channel, for the reason his own ProbeForWall records: the stock Pawn
+		// profile BLOCKS the WorldStatic channel, so a channel trace would report a team-mate standing
+		// beside him as a wall and he would jump at a person.
+		FCollisionObjectQueryParams ObjectParams;
+		ObjectParams.AddObjectTypesToQuery(ECC_WorldStatic);
+		FCollisionQueryParams QueryParams(TEXT("TraceBotSlimeWallProbe"), /*bTraceComplex=*/false, BotPawn);
+
+		float BestDistSq = TNumericLimits<float>::Max();
+		for (int32 Step = 0; Step < 8; ++Step)
+		{
+			const FRotator Spoke(0.f, static_cast<float>(Step) * 45.f, 0.f);
+			const FVector Direction = Spoke.Vector();
+
+			FHitResult Hit;
+			if (!WorldPtr->LineTraceSingleByObjectType(Hit, MyLocation, MyLocation + Direction * Search,
+				ObjectParams, QueryParams))
+			{
+				continue;
+			}
+			if (FMath::Abs(Hit.ImpactNormal.Z) > MaxNormalZ)
+			{
+				continue;   // a floor or a ramp. His own sweep applies exactly this test.
+			}
+
+			// NEAREST wins. A wall he can be against by the top of the jump is the only kind that is
+			// any use — his own probe reaches 90 uu from the capsule centre and no further.
+			const float DistSq = static_cast<float>(FVector::DistSquared(MyLocation, Hit.ImpactPoint));
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				StickWallPoint = Hit.ImpactPoint;
+				bHasStickWall = true;
+			}
+		}
+	}
+
+	if (!bHasStickWall)
+	{
+		return;
+	}
+
+	// The steering is carried BY THE LATCH: the lean has to already be there on the frame the jump
+	// fires, one reaction delay from now, or he takes off from where he was standing.
+	FVector ToWall = StickWallPoint - MyLocation;
+	ToWall.Z = 0.f;
+	const FVector Lean = ToWall.GetSafeNormal();
+	if (Lean.IsNearlyZero())
+	{
+		return;
+	}
+
+	const ETraceBotWantResult Result = Want(Situation, ETraceBotAbilityAct::Jump,
+		TEXT("Slimeball: up the wall to hold an angle"), /*AimPoint*/ nullptr, &Lean);
+
+	if (Result == ETraceBotWantResult::Declined)
+	{
+		NextStickTime = Situation.Now + 2.f;
+	}
 }

@@ -1,4 +1,4 @@
-// Trace — the five characters, as DATA.
+// Trace — the eight characters, as DATA.
 //
 // Spec v14 §3 asks for a select screen that shows "each one's movement, passive and activated
 // ability so a player can choose meaningfully". That means the prose is a shipped asset, not
@@ -9,14 +9,20 @@
 // UI/TraceMatchOptions.h: this header is included by the game mode, the player state and the HUD, so
 // keeping UnrealHeaderTool out of it keeps the include free.
 //
-// *** THE ID SPACE IS ETraceCharacterId's (spec v14 §5). ***
-//     None = 0, Rocco = 1, Chut = 2, Mace = 3, Oyster = 4, X = 5
+// *** THE ID SPACE IS ETraceCharacterId's (spec v14 §5, EXTENDED BY SPEC v18 §2). ***
+//     None = 0, Rocco = 1, Chut = 2, Mace = 3, Oyster = 4, X = 5,
+//     Roxie = 6, Elle = 7, Slimeball = 8
 // Every id in this project — the replicated byte on ATracePlayerState, the argument to
 // UTraceAbilityComponent::ServerSetCharacter, the number a console command takes — is that value.
 // This file stores it as a uint8 rather than as the enum ONLY so that the character-select slice
 // does not have to include the ability framework's header to draw a menu; the two are the same
 // number and the static_asserts at the top of TraceCharacterRoster.cpp are where that agreement is asserted
 // once the enum exists. Do not introduce a second numbering.
+//
+// SPEC v18 §2 TOOK THE ROSTER FROM FIVE TO EIGHT. Nothing in the shape of this file changed — still
+// one table, still in id order, still Count entries — which is the reason the change was three
+// constants and three rows rather than a migration. Per-team uniqueness still holds; with 5 players
+// a side and 8 characters there is now slack, and that is fine.
 
 #pragma once
 
@@ -38,11 +44,23 @@ namespace TraceCharacterRoster
 	/** ETraceCharacterId::Rocco. */
 	inline constexpr uint8 FirstId = 1;
 
-	/** ETraceCharacterId::X. */
-	inline constexpr uint8 LastId = 5;
+	/**
+	 * ETraceCharacterId::Slimeball — the LAST character, whichever one that currently is.
+	 *
+	 * *** THIS IS THE CONSTANT THAT MOVES EVERY TIME A CHARACTER IS ADDED. *** It was 5 (X) until
+	 * spec v18 §2 appended Roxie, Elle and Slimeball. Everything that walks the roster walks
+	 * FirstId..LastId — the select screen, the asset loader, Trace.VerifyCharacterData, the player
+	 * state's RPC validation — so leaving it behind does not produce a small bug, it produces a
+	 * character nobody can pick and an asset table that is silently one row short (and therefore, by
+	 * the all-or-none rule below, an entire roster that falls back to C++ values).
+	 *
+	 * The static_asserts at the top of TraceCharacterRoster.cpp turn exactly that mistake into a
+	 * compile error. Do not delete them.
+	 */
+	inline constexpr uint8 LastId = 8;
 
-	/** Selectable characters. NOT the size of the enum — None is not selectable. */
-	inline constexpr int32 Count = 5;
+	/** Selectable characters. NOT the size of the enum — None is not selectable. 5 -> 8 in v18 §2. */
+	inline constexpr int32 Count = 8;
 
 	/**
 	 * One character's shipped description.
@@ -83,7 +101,8 @@ namespace TraceCharacterRoster
 	};
 
 	/**
-	 * The table, in the doc's order: Rocco, Chut, Mace, Oyster, X. Always Count entries.
+	 * The table, in the doc's order: Rocco, Chut, Mace, Oyster, X, Roxie, Elle, Slimeball. Always
+	 * Count entries.
 	 *
 	 * *** SINCE SPEC v17 §5 THIS MAY BE SERVED FROM ASSETS. *** See the "TWO SOURCES" block at the
 	 * bottom of this header. Nothing about the shape changed: still Count entries, still in id
@@ -94,7 +113,7 @@ namespace TraceCharacterRoster
 	/** Null for NoneId and for anything out of range. */
 	TRACE_API const FTraceCharacterEntry* Find(uint8 Id);
 
-	/** True for 1..5. NoneId is deliberately NOT valid — "no character" is not a character. */
+	/** True for FirstId..LastId. NoneId is deliberately NOT valid — "no character" is not a character. */
 	TRACE_API bool IsValidId(uint8 Id);
 
 	/** "ROCCO" / ... / "MANNEQUIN" for NoneId, so a log line never prints a bare number. */
@@ -104,14 +123,21 @@ namespace TraceCharacterRoster
 	// TWO SOURCES, ONE SHAPE — spec v17 §5, and rule §0.1 (opt-in, with a LIVE C++ fallback)
 	// =============================================================================================
 	//
-	// The five characters now also exist as UTraceCharacterDefinition assets under
+	// The characters now also exist as UTraceCharacterDefinition assets under
 	// /Game/Trace/Data/Characters, generated from the C++ table below by
-	// Scripts/generate-data-assets.py. All() serves the ASSETS when all five load and validate, and
-	// the C++ table otherwise — asset missing, asset corrupt, an id out of place, or the toggle off.
+	// Scripts/generate-data-assets.py. All() serves the ASSETS when ALL of them load and validate,
+	// and the C++ table otherwise — asset missing, asset corrupt, an id out of place, or toggle off.
 	//
-	// IT IS ALL FIVE OR NONE, deliberately. A roster that was four assets and one C++ row would be a
-	// half-migration: the select screen would look right and nobody could say which row came from
-	// where. One decision, logged once, at the top of the log.
+	// IT IS ALL OF THEM OR NONE, deliberately. A roster that was seven assets and one C++ row would
+	// be a half-migration: the select screen would look right and nobody could say which row came
+	// from where. One decision, logged once, at the top of the log.
+	//
+	// *** THIS IS THE TRAP SPEC v18 §2 WALKS INTO. *** Adding a character adds a row to the C++ table
+	// and a NEW asset that does not exist yet, so between those two commits the roster is 7-of-8 and
+	// EVERY character silently reverts to its C++ values. It is not a crash and it is not a visible
+	// difference (the assets are generated from the C++ table, so the two agree) — but it means the
+	// asset path has stopped being exercised. Re-run Scripts/generate-data-assets.py in the SAME
+	// change that adds the enumerator, and read the verdict from Trace.VerifyCharacterData.
 	//
 	// THE TOGGLE:  Trace.Data.UseCharacterAssets  0|1   (default 1; 0 forces the C++ table)
 	// THE PROOF:   Trace.VerifyCharacterData            (field-by-field, and it can go red)

@@ -486,6 +486,29 @@ public:
 	/** Aggregate magnet-radius multiplier. Mace is 1.30 of UTraceSettings::CoreCatchRadius. */
 	static float GetMagnetRadiusMultiplierFor(const AActor* Actor);
 
+	/**
+	 * SPEC v18 §2. Multiplier the gun must apply to UTraceSettings::FireInterval for @p Actor.
+	 *
+	 * *** MULTIPLY THE INTERVAL BY THIS. DO NOT ALSO DIVIDE. *** It is already the reciprocal of the
+	 * rate: Roxie's Modded ×1.65 comes back as 0.606 and Slimeball's stuck +30% as 0.769, so a 0.40 s
+	 * interval becomes 0.242 s and 0.308 s respectively. See
+	 * UTraceCharacterAbilitySet::GetFireIntervalScale for why the gun asks this instead of casting.
+	 *
+	 * Static and null-safe: the two callers are the local fire gate and the server's rate validation,
+	 * and both run for Mannequins and bots that have no ability component at all. 1.0 in every one of
+	 * those cases, so the shipped feel of every other character is byte-identical.
+	 */
+	static float GetFireIntervalScaleFor(const AActor* Actor);
+
+	/**
+	 * SPEC v18 §2. @p Actor's well-timed slide-jump planar multiplier, given the global one.
+	 *
+	 * Elle is the only character that changes it (+40% of the GAIN → 1.625 against everybody's
+	 * 1.446875). Everybody else — and every pawn with no component — gets @p InWellTimedBonus back
+	 * unchanged, which is spec v18 §4's "Elle changes only her own" made structural.
+	 */
+	static float GetSlideJumpWindowSpeedBonusFor(const AActor* Actor, float InWellTimedBonus);
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * DEV ONLY, AUTHORITY ONLY. Forces the activated cooldown to @p Seconds from now.

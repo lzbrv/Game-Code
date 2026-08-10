@@ -37,7 +37,7 @@ namespace TraceCharacterDefinitionFile
 }
 
 // =================================================================================================
-// The convention: five known names, in one known folder
+// The convention: one known name per character, in one known folder
 // =================================================================================================
 
 const TCHAR* UTraceCharacterDefinition::CharactersPackageRoot()
@@ -98,7 +98,8 @@ bool UTraceCharacterDefinition::IsUsable(FString& OutWhyNot) const
 		|| IdValue > static_cast<int32>(TraceCharacterRoster::LastId))
 	{
 		OutWhyNot = FString::Printf(
-			TEXT("CharacterId is %d; it must be 1..5 (None is not a character)."), IdValue);
+			TEXT("CharacterId is %d; it must be %d..%d (None is not a character)."),
+			IdValue, static_cast<int32>(TraceCharacterRoster::FirstId), static_cast<int32>(TraceCharacterRoster::LastId));
 		return false;
 	}
 
@@ -169,8 +170,9 @@ bool UTraceCharacterDefinition::CopyFallbackValues(UTraceCharacterDefinition* Ta
 		|| CharacterIdValue > static_cast<int32>(TraceCharacterRoster::LastId))
 	{
 		UE_LOG(LogTraceGame, Error,
-			TEXT("[CharacterData] CopyFallbackValues: %d is not one of the five character ids (1..5)."),
-			CharacterIdValue);
+			TEXT("[CharacterData] CopyFallbackValues: %d is not a character id (%d..%d)."),
+			CharacterIdValue, static_cast<int32>(TraceCharacterRoster::FirstId),
+			static_cast<int32>(TraceCharacterRoster::LastId));
 		return false;
 	}
 

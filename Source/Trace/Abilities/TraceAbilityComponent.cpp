@@ -402,7 +402,19 @@ float UTraceAbilityComponent::GetActivatedCooldownRemaining() const
 	// a prediction that fired locally must grey the HUD button immediately, and the replicated value
 	// arriving a round trip later must not let it flash back to ready in between.
 	const float Deadline = FMath::Max(ActivatedCooldownEndMatchTime, PredictedCooldownEndMatchTime);
-	return FMath::Max(0.f, Deadline - MatchTimeNow());
+	const float FrameworkRemaining = FMath::Max(0.f, Deadline - MatchTimeNow());
+
+	// ...and a THIRD, for the one character whose own CanActivate() refuses for longer than the
+	// framework's timer runs. See UTraceCharacterAbilitySet::GetCharacterOwnedCooldownRemaining():
+	// Elle's fluffed Snap cast leaves the framework at zero while she refuses for up to 31 s, and a
+	// ring that reads READY on a button that does nothing is the worst of the available lies. Max, so
+	// a character can only ever be more conservative than the framework, never less.
+	if (AbilitySet != nullptr)
+	{
+		return FMath::Max(FrameworkRemaining, FMath::Max(0.f, AbilitySet->GetCharacterOwnedCooldownRemaining()));
+	}
+
+	return FrameworkRemaining;
 }
 
 bool UTraceAbilityComponent::TryActivate()
@@ -1123,6 +1135,36 @@ float UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(const AActor* Actor)
 {
 	const UTraceCharacterAbilitySet* Set = GetAbilitySetFor(Actor);
 	return (Set != nullptr) ? FMath::Max(0.01f, Set->GetMagnetRadiusMultiplier()) : 1.f;
+}
+
+float UTraceAbilityComponent::GetFireIntervalScaleFor(const AActor* Actor)
+{
+	const UTraceCharacterAbilitySet* Set = GetAbilitySetFor(Actor);
+	if (Set == nullptr)
+	{
+		return 1.f;
+	}
+
+	// Floored well above zero, and that floor is the safety rail rather than a tuning value: this
+	// number divides the gun's minimum interval, so a character (or a mistyped ini) answering 0 would
+	// hand that player an unbounded fire rate. 0.05 is a 20x rate cap — twenty times anything spec §2
+	// asks for, so it can never bind on a legitimate value. Ceilinged at 10 for the same reason in the
+	// other direction: a gun that will not fire for four seconds reads as broken, not as a nerf.
+	return FMath::Clamp(Set->GetFireIntervalScale(), 0.05f, 10.f);
+}
+
+float UTraceAbilityComponent::GetSlideJumpWindowSpeedBonusFor(const AActor* Actor, float InWellTimedBonus)
+{
+	const UTraceCharacterAbilitySet* Set = GetAbilitySetFor(Actor);
+	if (Set == nullptr)
+	{
+		return InWellTimedBonus;
+	}
+
+	// Never below the global number the movement component just computed. The rule there is that a
+	// well-timed hop must never be worth LESS than a mistimed one; a character passive is not allowed
+	// to smuggle in an exception to it, however its own knob is tuned.
+	return FMath::Max(InWellTimedBonus, Set->ModifySlideJumpWindowSpeedBonus(InWellTimedBonus));
 }
 
 #if !UE_BUILD_SHIPPING

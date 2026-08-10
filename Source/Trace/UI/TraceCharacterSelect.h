@@ -96,6 +96,7 @@ public:
 #if !UE_BUILD_SHIPPING
 	/**
 	 * Trace.Characters.Select <n> — drives the highlight and the pick exactly as the keyboard would.
+	 * @param CharacterId  a character ID (FirstId..LastId, i.e. 1..8 since spec v18 §2), NOT a card index.
 	 *
 	 * Public only so the console command can reach it, and it goes through the SAME request path a
 	 * key press does rather than calling the player state directly: what a headless verification of
@@ -152,13 +153,25 @@ private:
 
 	bool bOpen = false;
 
-	/** 0..4, an index into TraceCharacterRoster::All(). Never an id; convert at the point of use. */
+	/**
+	 * 0..Count-1, an index into TraceCharacterRoster::All(). Never an id; convert at the point of use.
+	 *
+	 * It is a LINEAR index even though spec v18 §2 draws the cards as a grid: the grid is a drawing
+	 * decision (see TraceSelectGrid in the .cpp) and left/right still walk the roster in reading
+	 * order, so "press right four times" and "press 5" agree about where they land.
+	 */
 	int32 Highlighted = 0;
 
 	/** The card the pointer is over, or INDEX_NONE. Recomputed every frame from the drawn rects. */
 	int32 HoveredCard = INDEX_NONE;
 
-	/** Screen rects of the five cards as of the last draw. Hit testing and hover use them. */
+	/**
+	 * Screen rects of every card as of the last draw. Hit testing and hover use them.
+	 *
+	 * Sized by the roster, so adding a character grows it — the ONE thing that must not happen here is
+	 * a fixed 5 that a ninth card writes past. Cleared to FBox2D(ForceInit) every time the screen
+	 * opens, because FBox2D leaves bIsValid uninitialised and PollInput runs before the first Draw.
+	 */
 	FBox2D CardRects[TraceCharacterRoster::Count];
 
 	/** The request this screen is waiting on, or NoneId. Stops a held key sending ten a second. */
@@ -212,7 +225,7 @@ private:
 	// Deliberately tiny and deliberately here rather than in the HUD: ATraceHUD belongs to another
 	// slice, and the whole point is to exercise THIS class's PollInput.
 
-	/** 0..4 while a click test is running, INDEX_NONE otherwise. */
+	/** 0..Count-1 while a click test is running, INDEX_NONE otherwise. */
 	int32 ClickTestCard = INDEX_NONE;
 
 	/** 0 = park the cursor, 1 = press, 2 = release, 3 = judge. Same reason for the split as the menu's. */
