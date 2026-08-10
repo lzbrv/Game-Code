@@ -103,13 +103,37 @@ namespace TraceMenuHUDFile
 	 * draws while the settings overlay or the JOIN prompt is up (both are Canvas modals, and Canvas
 	 * draws UNDER Slate, so the widget stands down for those frames).
 	 */
-	static int32 GUseUMG = 1;
+	/**
+	 * DEFAULT 0 — CANVAS — AND THAT IS A DELIBERATE RETREAT FROM THE v17 DEFAULT OF 1.
+	 *
+	 * The UMG path is finished enough to develop against and NOT finished enough to be what a
+	 * teammate meets on launch day. Three measured reasons, all from the v17 verification:
+	 *
+	 *   1. STARTUP. With UMG on, the title screen took 12-47 s to appear (median ~40 s) and the
+	 *      window is frozen and black for all of it. With it off: 0.02 s. The cause is in
+	 *      Scripts/generate-menu-widgets.py, which retires widgets by renaming them
+	 *      (TraceRetired_1, ...) and leaves their old IDs in the .uasset, so the editor re-resolves
+	 *      and complains 49 times per launch. It is fixable in the generator, not the engine.
+	 *   2. THE WORDMARK IS DRAWN WRONG. On the UMG path the TRACE logo's letters break apart - the
+	 *      R's loop becomes disconnected blocks, the A's point is chopped - because the stroke
+	 *      thickness is about half again what the Canvas path uses.
+	 *   3. ONLY TWO OF FOUR SCREENS EXIST. The title menu and the HUD corner converted; the OPTIONS
+	 *      menu and CHARACTER SELECT are still Canvas, because that agent did not survive the pass.
+	 *
+	 * So the shipped default is the renderer that is complete and fast, and the new one is one
+	 * console line away. Flip this back to 1 once (1) and (2) are closed - nothing else needs to
+	 * change, and the Canvas path is not going anywhere: it still draws the settings overlay and the
+	 * JOIN prompt regardless, because those are Canvas modals and Canvas draws UNDER Slate.
+	 */
+	static int32 GUseUMG = 0;
 	static FAutoConsoleVariableRef CVarUseUMG(
 		TEXT("Trace.UI.UseUMG"),
 		GUseUMG,
 		TEXT("1 = draw the title screen with the UMG widget (/Game/Trace/UI/Menu/WBP_TitleMenu).\n")
-		TEXT("0 = draw it with the original AHUD::DrawHUD Canvas path. Both are live; the Canvas\n")
-		TEXT("path is also used automatically whenever the asset is missing or the wrong shape."),
+		TEXT("0 = DEFAULT. Draw it with the original AHUD::DrawHUD Canvas path. Both are live; the\n")
+		TEXT("Canvas path is also used automatically whenever the asset is missing or the wrong\n")
+		TEXT("shape. UMG is off by default because it currently costs ~40s of black screen on\n")
+		TEXT("launch and draws the wordmark wrong - see the comment above this variable."),
 		ECVF_Default);
 
 	/** Where the generated asset lives. Soft, by path: a missing asset must fall back, not fail. */
