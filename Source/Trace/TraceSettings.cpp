@@ -1344,7 +1344,7 @@ namespace
 			// floor fraction, whether it clamps, and the ceiling when it does not. Charge scales the
 			// IMPULSE; CoreThrowVelocityInheritance is still added on top and is listed in the v8
 			// block above rather than repeated here.
-			{ TEXT("CoreThrowChargeSeconds"),          EKnobType::Float, TEXT("v16: 0.8s hold = full momentum (was v13's 1.0s); the crosshair ring is read against this") },
+			{ TEXT("CoreThrowChargeSeconds"),          EKnobType::Float, TEXT("v18: 0.6s hold = full momentum (1.0 in v13, 0.8 in v16); the crosshair ring is read against this") },
 			{ TEXT("CoreThrowChargeFloorFraction"),    EKnobType::Float, TEXT("v13 §6: [ASSUMPTION] 0.15 - an instant click is 'very low', never zero") },
 			{ TEXT("bCoreThrowChargeClampsAtFull"),    EKnobType::Bool,  TEXT("v13 §6: [ASSUMPTION] true - holding past the charge time adds nothing") },
 			{ TEXT("CoreThrowChargeMaxFraction"),      EKnobType::Float, TEXT("v13 §6: the ceiling when the clamp is OFF. 1.0 so unticking the box changes nothing by itself") },

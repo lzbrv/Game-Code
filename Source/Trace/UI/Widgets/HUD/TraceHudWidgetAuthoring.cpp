@@ -129,7 +129,10 @@ bool UTraceHudWidgetAuthoring::ClearWidgetTree(UObject* WidgetBlueprintAsset)
 	// a previous run that failed halfway leaves orphans, and an orphan holding a name is exactly as
 	// fatal to the next NewObject as a live widget holding it.
 	TArray<UObject*> Residents;
-	GetObjectsWithOuter(Tree, Residents, /*bIncludeNestedObjects=*/true);
+	// The EGetObjectsFlags overload, not the bool one: the boolean form is deprecated and MSVC
+	// raises C4996 for it. Same behaviour — the deprecated overload just forwards `true` to
+	// EGetObjectsFlags::IncludeNestedObjects, which is what this call always wanted.
+	GetObjectsWithOuter(Tree, Residents, EGetObjectsFlags::IncludeNestedObjects);
 
 	int32 Evicted = 0;
 	for (UObject* Resident : Residents)

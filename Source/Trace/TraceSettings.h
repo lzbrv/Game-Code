@@ -2356,7 +2356,7 @@ public:
 	 * describe the throw anybody is playing.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Speed (uu/s, before weight) [mode B]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
-	float CoreThrowSpeed = 3000.f;
+	float CoreThrowSpeed = 3300.f;
 
 	/**
 	 * Fraction of the throw speed added as upward velocity, so a throw arcs instead of running flat
@@ -2451,7 +2451,8 @@ public:
 	/**
 	 * Seconds of holding the throw button to reach FULL momentum, i.e. the throw the game has today.
 	 *
-	 * 0.8 as of v16 ("Make 100% charge be at .8seconds vs 1second, keeping the linear scale"). The
+	 * 0.6 as of v17 ("Reduce max charge time from .8 to .6 seconds, but keep max velocity the
+	 * same"); v16 had already taken it 1.0 -> 0.8. The
 	 * original 1.0 was the user's own starting number; the linear scale is unchanged, only the time
 	 * to reach full. This is the anchor
 	 * the other three are defined against: at exactly this hold, Power is 1 and the Core leaves at
@@ -2463,7 +2464,7 @@ public:
 	 * says what it means.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Time (s) [v13 §6]", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
-	float CoreThrowChargeSeconds = 0.8f;
+	float CoreThrowChargeSeconds = 0.6f;
 
 	/**
 	 * Momentum an INSTANT CLICK throws with, as a fraction of full. [ASSUMPTION] 0.15.

@@ -345,7 +345,13 @@ void UTraceHudCornerWidget::EnsureTicks(int32 InCount)
 		// dragged the whole corner out to two and a half times its size. Measured, from a photograph;
 		// the draw record was perfectly happy throughout. The real width comes from the Fill rule and
 		// the plate's own SizeBox.
-		NewTick->SetBrushSize(FVector2D(1.f, 1.f));
+		//
+		// SetDesiredSizeOverride, not SetBrushSize: the latter is UE_DEPRECATED(5.0) and MSVC raises
+		// C4996 for it ("your project will no longer compile" on the next engine release). clang did
+		// not warn, so this reached a teammate's Windows build. The override is also the more honest
+		// call — the problem being solved IS the desired size, and SetBrushSize only moved it as a
+		// side effect of resizing the brush.
+		NewTick->SetDesiredSizeOverride(FVector2D(1.f, 1.f));
 
 		if (UHorizontalBoxSlot* TickSlot = MagazineStrip->AddChildToHorizontalBox(NewTick))
 		{
