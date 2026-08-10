@@ -6,16 +6,23 @@ Trace is a networking prototype first and a game second. It exists to prove out 
 multiplayer stack — client-side prediction, server-authoritative hitscan with server-side rewind,
 delta-replicated state — on top of a game idea that is small enough to actually finish.
 
-**There are no binary assets in this repository.** No `.uasset` we authored, no Blueprints. The
-arena, the Core, the trail and the entire HUD are built in C++ from engine primitives
-(`/Engine/BasicShapes/*` and Canvas drawing). The only content file in the repo is one empty level.
-This is a deliberate constraint: it keeps the repo diffable, keeps merges sane for a four-person
-team, and means a fresh clone builds and runs with zero asset pipeline.
+**The gameplay logic is all C++, and the repository now also contains real, editable assets.** For
+most of this project's life it held no authored binaries at all — the arena, the Core, the trail and
+the whole HUD were built in code from engine primitives (`/Engine/BasicShapes/*` and Canvas
+drawing). That is still how the game runs by default, but it is no longer the whole story: the repo
+now tracks **641 binary assets, 5.14 MiB via Git LFS** — the baked arena `/Game/Maps/Arena_Baked`
+(one `.uasset` per actor, 572 of them), its 66 materials, and three levels.
+
+**What that means for you in practice:** binary assets cannot be merged, so the team locks a file
+*before* editing it rather than resolving conflicts afterwards. `Content/**` is checked out
+read-only until you take a lock — that is deliberate, and `chmod` is not the fix. Read
+**[docs/GITHUB.md](docs/GITHUB.md) §4 before you open anything in the editor.** A fresh clone is
+about 8.3 MiB.
 
 **One exception worth understanding:** the characters use Epic's default Mannequin
 (`SKM_Manny_Simple` + `ABP_Unarmed`) for heads, limbs and run cycles. That is ~126 MB of engine
 content and it is **gitignored**, so it is not in a fresh clone — it is copied out of the Unreal
-install you already have, which is why the repo is ~1.3 MB instead of hundreds.
+install you already have, which is why a clone is ~8.3 MiB instead of hundreds of megabytes.
 
 `Scripts/build.sh` (and `build.bat`) now **imports it automatically** when it is missing, so a
 fresh clone just works. Pass `--no-art`, or set `TRACE_SKIP_ART_IMPORT=1`, to skip that. To run it
@@ -115,6 +122,9 @@ Scripts/
   run-client.sh             Connect a client to <ip>:7777.
   run-dedicated-server.sh   Headless server. Needs --editor on a launcher engine — see NETWORKING.
   setup-lfs.sh              One-time Git LFS bootstrap after cloning.
+  lock.sh / unlock.sh       Take/release the Git LFS lock you need BEFORE editing an asset.
+                            Accepts a World Outliner actor label (Cover_37) as well as a path,
+                            and resolves it to the right One File Per Actor package.
   _trace_common.sh          Shared library: finds the engine, checks the toolchain.
   *.bat                     Windows counterparts of all of the above, same flags. See SETUP.
 Source/
@@ -211,8 +221,9 @@ Scripts/run-client.sh 127.0.0.1 --pos 700,0    # window 2: joiner
 `/Game/Maps/Arena` is an empty level and the arena is built from C++ at `BeginPlay`, which means
 nobody can open it, click a wall and move it. `Scripts/bake-arena.sh` runs that same builder once in
 the editor and saves the result as a real level of ~570 placed, individually selectable, readably
-labelled actors (`Wall_North_01`, `Cover_037`, `Goal_Ring_Rim_12`), with **One File Per Actor**
-enabled so several people can edit it at once.
+labelled actors (`Wall_North_01`, `Cover_37`, `Goal_Ring_Rim_12`), with **One File Per Actor**
+enabled so several people can edit it at once — each actor is its own lockable file, so two people
+moving two different pieces never block each other. See [docs/GITHUB.md §4.4](docs/GITHUB.md).
 
 ```bash
 Scripts/bake-arena.sh                                        # bake (again: --force)
@@ -260,9 +271,19 @@ See [docs/NETWORKING.md](docs/NETWORKING.md#3-dedicated-server--requires-a-sourc
 | **`Q`** | Parry — carrier only. 0.1s of trace invulnerability; the whole trace flashes red |
 | `Tab` | Scoreboard |
 
-Input is Enhanced Input, constructed entirely in C++ at runtime — there are no input `.uasset`s to
-open. **Every action above is rebindable in-game** (Options → Controls); the bindings persist
-through `UTraceUserSettings`, and the defaults live in `Source/Trace/Settings/TraceUserSettings.cpp`.
+Input is Enhanced Input. As of spec v17 §6 there ARE input assets to open — fourteen `IA_*` actions
+and `IMC_Trace` under `Content/Trace/Input/` — and if they are missing the controller builds the same
+objects in C++ at runtime, exactly as it always did, and logs which path it took. (This paragraph
+used to say "there are no input `.uasset`s to open". That was true until this pass.)
+
+**But the keys do not come from `IMC_Trace`, and this is the one thing that catches people out.**
+Re-keying that asset changes what you see in the editor, not what you play: the runtime mappings are
+rebuilt from `UTraceUserSettings` on every settings change. **Every action above is rebindable
+in-game** (Options → Controls); each player's bindings persist in
+`Saved/Config/<Platform>/TraceUserSettings.ini`, and the shipped defaults live in the action table in
+`Source/Trace/Settings/TraceUserSettings.cpp`. Change a default there, then re-run
+`Scripts/generate-input-assets.py` so the asset stops being a stale picture — `Trace.Input.VerifyAssets`
+in the console tells you, in red, when the two have drifted apart.
 
 ---
 

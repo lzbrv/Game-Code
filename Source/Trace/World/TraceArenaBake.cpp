@@ -26,9 +26,10 @@
 //      See the grouping block below: blocks are gathered back into logical PIECES and one actor is
 //      emitted per piece.
 //   2. Nothing baked may reference Content/Generated/, which is gitignored — a map that did would be
-//      broken on every other machine. See PromoteMaterials: the two generated materials are required
-//      to exist at /Game/Trace/Materials (Scripts/bake-arena.py puts them there) and every MID the
-//      build made is written out as a committed UMaterialInstanceConstant beside them.
+//      broken on every other machine. The two parent materials are required to exist at
+//      /Game/Trace/Materials/Parents (committed; Scripts/generate_content.py authors them) and every
+//      MID the build made is written out as a committed UMaterialInstanceConstant into
+//      /Game/Trace/Materials/Instances — which is the layer a designer retunes (spec v17 §3).
 //   3. The runtime build must not run on a baked level. See ATraceArenaBuilder::EnsureBuilt and
 //      bLevelIsPreBaked.
 // =================================================================================================
@@ -41,6 +42,7 @@
 #include "Core/TraceGameState.h"
 #include "Gameplay/TraceEndzone.h"
 #include "World/TraceBakedPiece.h"
+#include "World/TraceCoreSpawn.h"          // spec v17 §2 - the Core spawn is a placed actor now
 #include "World/TraceTeamPlayerStart.h"
 
 #include "Components/BoxComponent.h"
@@ -79,8 +81,11 @@
 // the file is the fix that does not just defer the next collision.
 namespace TraceArenaBakeLocal
 {
-	/** Where the promoted, committed materials live. NOT Content/Generated - that is gitignored. */
-	static const TCHAR* PromotedMaterialDir = TEXT("/Game/Trace/Materials");
+	/**
+	 * Where the committed PARENT materials live (spec v17 §3's Materials/{Parents,Instances}).
+	 * NOT Content/Generated - that is gitignored, and a baked map may not reference it.
+	 */
+	static const TCHAR* PromotedMaterialDir = TEXT("/Game/Trace/Materials/Parents");
 
 	/** Where this file writes one UMaterialInstanceConstant per distinct tint the build asked for. */
 	static const TCHAR* BakedInstanceDir = TEXT("/Game/Trace/Materials/Instances");
@@ -269,6 +274,15 @@ void ATraceArenaBuilder::AdoptBakedArena()
 	// arena exists", and on a baked level it did before this actor woke up.
 	bArenaBuilt = true;
 
+	// A baked level's pieces wear their own committed MaterialInstanceConstants and do not need
+	// these two — but the ONE log line saying which material set the process resolved is worth
+	// having on both paths, and it is what spec v17 §0 rule 1 asks the fallback to say out loud.
+	ResolveArenaMaterials();
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Arena] Materials: surface '%s', neon '%s' (a baked level's geometry wears the committed ")
+		TEXT("instances under /Game/Trace/Materials/Instances, not these)."),
+		*GetPathNameSafe(SurfaceMaterial), *GetPathNameSafe(NeonMaterial));
+
 	// Same question, same authority, same fallback as BuildArena: ATraceGameState if there is one,
 	// the settings page if the world has not published yet.
 	{
@@ -346,31 +360,44 @@ void ATraceArenaBuilder::AdoptBakedArena()
 
 	// --- The scoring volumes ----------------------------------------------------------------------
 	//
-	// RE-CONFIGURED, NOT JUST FOUND.
+	// VERIFIED AND WARNED ABOUT — NO LONGER OVERWRITTEN.  (spec v17 §2)
 	//
-	// The original reason was that ATraceEndzone kept its shape (bGoalVolume, the ring radius, the
-	// armed flag) in plain C++ members, so none of it survived being written into a .umap. THAT IS
-	// NO LONGER TRUE — those four are UPROPERTYs now (TraceEndzone.h), so they do serialise.
+	// THE HISTORY, BECAUSE THE OLD BEHAVIOUR LOOKED DELIBERATE. ATraceEndzone used to keep its shape
+	// (bGoalVolume, bRingGoal, RingRadius, the armed flag) in plain C++ members, so none of it
+	// survived being written into a .umap and this function REBUILT all of it on every load. Those
+	// fields are UPROPERTYs now (TraceEndzone.h) and the trigger's box extent always was one, so the
+	// shape does serialise. The comment that used to sit here claimed Arena_Baked.umap on disk
+	// predated that change and still carried only OwningTeam — MEASURED AND FALSE: its four external
+	// actor packages contain bGoalVolume, bRingGoal, RingRadius, bZoneActive and BoxExtent today.
 	//
-	// What is still true is that Arena_Baked.umap on disk was SAVED BEFORE they became UPROPERTYs,
-	// so its four endzone packages carry only OwningTeam and the shape is still supplied entirely by
-	// this rebuild. Re-running Scripts/bake-arena.sh --force is what changes that. Until then, and
-	// for any map baked by an older build, this rebuild is what makes a placed endzone a goal.
+	// So overwriting was silently destroying work: a designer who selected Goal_Volume_Blue_01,
+	// dragged its box out by 200 uu and saved got their edit back on the next load — with nothing in
+	// the log to say why. Spec v17 §2 asks for verify-and-warn, and this is it:
 	//
-	// Everything needed is a pure function of this class's layout properties, so it is rebuilt from
-	// the same functions BuildEndzones and BuildGoals use, and the tag — which has always been
-	// serialised, tags are a UPROPERTY on AActor — says which of the two shapes to rebuild.
+	//   * shape MISSING (a degenerate, near-zero box, which no real endzone can be) — the level was
+	//     baked by a build that could not serialise it. REBUILT, and said out loud. This is the
+	//     migration arm and it is what keeps every older map playable.
+	//   * shape PRESENT and matching what this builder would make — nothing to do, logged at Verbose.
+	//   * shape PRESENT and different — THE PLACED VALUE WINS. Warned, with both numbers, because the
+	//     other reason the two can differ is that somebody changed a layout property or a settings
+	//     knob (GoalWidthFieldFraction, EndzoneDepth) and the baked map has not been re-baked since.
+	//     "The map is stale, re-run Scripts/bake-arena.sh --force" is exactly what that warning means.
 	//
-	// FOLLOW-UP, deliberately not done here: once every baked map is re-baked, this should VERIFY
-	// the serialised values and warn on a mismatch rather than overwrite, so that a designer who
-	// hand-resizes a baked endzone keeps their edit.
+	// Note that OwningTeam is never touched either way: it always serialised, and it is what decides
+	// which half of the field scores where.
 	int32 VolumeCount = 0;
+	int32 VolumesRebuilt = 0;
+	int32 VolumesDiffering = 0;
 	if (HasAuthority())
 	{
 		const float HalfY = HalfWidth();
 		const float Depth = ClampedEndzoneDepth();
 		const float Radius = GoalRingRadius();
 		const float SlabDepth = FMath::Clamp(GoalRingDepth, 60.f, Depth);
+
+		// 1 uu. Big enough to swallow float round-tripping through a package, far smaller than any
+		// edit a person makes by dragging a box handle.
+		constexpr float ShapeTolerance = 1.f;
 
 		for (TActorIterator<ATraceEndzone> It(World); It; ++It)
 		{
@@ -380,14 +407,62 @@ void ATraceArenaBuilder::AdoptBakedArena()
 				continue;
 			}
 
-			if (Zone->ActorHasTag(FName(TraceArenaBakeLocal::GoalVolumeTag)))
+			const bool bTaggedGoal = Zone->ActorHasTag(FName(TraceArenaBakeLocal::GoalVolumeTag));
+			const bool bTaggedEndzone = Zone->ActorHasTag(FName(TraceArenaBakeLocal::EndzoneVolumeTag));
+
+			if (bTaggedGoal || bTaggedEndzone)
 			{
-				Zone->ConfigureZone(Zone->OwningTeam, FVector(SlabDepth * 0.5f, Radius, Radius), /*bInGoalVolume=*/true);
-				Zone->ConfigureRing(Radius);
-			}
-			else if (Zone->ActorHasTag(FName(TraceArenaBakeLocal::EndzoneVolumeTag)))
-			{
-				Zone->ConfigureZone(Zone->OwningTeam, FVector(Depth * 0.5f, HalfY, WallHeight * 0.5f), /*bInGoalVolume=*/false);
+				const FVector Expected = bTaggedGoal
+					? FVector(SlabDepth * 0.5f, Radius, Radius)
+					: FVector(Depth * 0.5f, HalfY, WallHeight * 0.5f);
+				const float ExpectedRadius = bTaggedGoal ? Radius : 0.f;
+
+				const UBoxComponent* Box = Zone->Trigger;
+				const FVector Placed = (Box != nullptr) ? Box->GetUnscaledBoxExtent() : FVector::ZeroVector;
+				const float PlacedRadius = Zone->GetRingRadius();
+
+				// A real endzone is thousands of uu across. Anything this small is not an edit, it is
+				// a shape that never made it into the package.
+				const bool bShapeUnset = Placed.GetMin() <= ShapeTolerance;
+
+				if (bShapeUnset)
+				{
+					Zone->ConfigureZone(Zone->OwningTeam, Expected, bTaggedGoal);
+					if (bTaggedGoal)
+					{
+						Zone->ConfigureRing(ExpectedRadius);
+					}
+					++VolumesRebuilt;
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[Arena] %s carries no serialised shape (box extent %s), so it was rebuilt from the ")
+						TEXT("builder's layout: extent %s%s. That means this level was baked before the shape ")
+						TEXT("fields serialised — re-run Scripts/bake-arena.sh --force to make it editable."),
+						*Zone->GetName(), *Placed.ToCompactString(), *Expected.ToCompactString(),
+						bTaggedGoal ? *FString::Printf(TEXT(", ring radius %.0f"), ExpectedRadius) : TEXT(""));
+				}
+				else if (!Placed.Equals(Expected, ShapeTolerance)
+					|| !FMath::IsNearlyEqual(PlacedRadius, ExpectedRadius, ShapeTolerance)
+					|| Zone->IsGoalVolume() != bTaggedGoal)
+				{
+					++VolumesDiffering;
+
+					// KEPT, NOT FIXED. This is the whole point of the change: the .umap is the
+					// authority on a placed actor's shape.
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[Arena] %s is placed with a shape this builder would not make, and THE PLACED SHAPE ")
+						TEXT("IS BEING KEPT. Placed: extent %s, ring radius %.0f, goal=%d. Builder would make: ")
+						TEXT("extent %s, ring radius %.0f, goal=%d. If you edited it deliberately, ignore this. ")
+						TEXT("If you did not, the map is stale against a layout or settings change — re-run ")
+						TEXT("Scripts/bake-arena.sh --force."),
+						*Zone->GetName(), *Placed.ToCompactString(), PlacedRadius, Zone->IsGoalVolume() ? 1 : 0,
+						*Expected.ToCompactString(), ExpectedRadius, bTaggedGoal ? 1 : 0);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Verbose,
+						TEXT("[Arena] %s matches the builder's layout; left exactly as placed."), *Zone->GetName());
+				}
 			}
 			else
 			{
@@ -455,12 +530,26 @@ void ATraceArenaBuilder::AdoptBakedArena()
 
 	ApplyScoringMode(ScoringMode);
 
+	// Which Core spawn this level is playing with, resolved and logged HERE rather than left for the
+	// GameMode's one-line "Core spawned at ..." — spec v17 §0 rule 1 wants the fallback to say so, and
+	// "there is no marker so the old derived point was used" is exactly the sentence it has to say.
+	{
+		const ATraceCoreSpawn* Marker = FindPlacedCoreSpawn();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Arena] Core spawn: %s, at %s."),
+			(Marker != nullptr)
+				? TEXT("the PLACED ATraceCoreSpawn in this level")
+				: TEXT("DERIVED from the builder's layout (no ATraceCoreSpawn placed — this is the fallback)"),
+			*GetCoreSpawnLocation().ToCompactString());
+	}
+
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[Arena] Baked level adopted, nothing built: %d baked pieces (%d endzone-mode, %d goal-mode), ")
-		TEXT("%d scoring volumes, %d floor lamps, %d side-tinted surfaces promoted to dynamic instances. ")
+		TEXT("%d scoring volumes (%d rebuilt from a shapeless legacy bake, %d kept a placed shape the builder ")
+		TEXT("would not make), %d floor lamps, %d side-tinted surfaces promoted to dynamic instances. ")
 		TEXT("Field %.0f x %.0f uu, mode %s."),
 		PieceCount, BakedEndzoneModeActors.Num(), BakedGoalModeActors.Num(),
-		VolumeCount, FloorLamps.Num(), TintedSurfaces,
+		VolumeCount, VolumesRebuilt, VolumesDiffering, FloorLamps.Num(), TintedSurfaces,
 		FieldLength, FieldWidth, *TraceScoringModeLabel(ScoringMode));
 
 	if (PieceCount == 0)
@@ -477,6 +566,73 @@ void ATraceArenaBuilder::AdoptBakedArena()
 // -------------------------------------------------------------------------------------------------
 
 #if WITH_EDITOR
+
+void ATraceArenaBuilder::EnsureCoreSpawnActor()
+{
+	// SPEC v17 §2, CLOSING SPEC v15 §1.4: "The Core spawn is still not a placed actor."
+	//
+	// Every other gameplay position in the arena became a real actor when the map was baked — the
+	// endzone triggers, the goal volumes, the ten team player starts, the whole lighting rig. The
+	// Core's did not: it stayed a pure function of the layout properties, so a designer who dragged
+	// the centre dais in the baked level left the Core spawning over thin air with nothing in the
+	// World Outliner to grab.
+	//
+	// IDEMPOTENT AND POSITION-PRESERVING. If a marker already exists it is left exactly where it is,
+	// which is what makes this safe to run on a level somebody has already edited AND what makes a
+	// re-bake keep a moved spawn point. The location used for a NEW marker is whatever
+	// GetCoreSpawnLocation() answers right now, which with no marker present is the derived point —
+	// so placing it changes nothing about where the Core starts. It only writes the answer down.
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	if (World->WorldType != EWorldType::Editor && World->WorldType != EWorldType::EditorPreview)
+	{
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[Bake] EnsureCoreSpawnActor is an editor-only tool: it places a permanent actor in the ")
+			TEXT("level. Run it from Scripts/bake-arena.sh --add-core-spawn, or from the Details panel of a ")
+			TEXT("builder in a level with PIE stopped."));
+		return;
+	}
+
+	if (const ATraceCoreSpawn* Existing = FindPlacedCoreSpawn())
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Bake] This level already has a Core spawn marker ('%s' at %s); left exactly where it is."),
+			*Existing->GetActorLabel(), *Existing->GetActorLocation().ToCompactString());
+		return;
+	}
+
+	const FVector CoreSpawnLocation = GetCoreSpawnLocation();
+
+	FActorSpawnParameters MarkerParams;
+	MarkerParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	ATraceCoreSpawn* Marker = World->SpawnActor<ATraceCoreSpawn>(
+		ATraceCoreSpawn::StaticClass(), CoreSpawnLocation, FRotator::ZeroRotator, MarkerParams);
+
+	if (Marker == nullptr)
+	{
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[Bake] Could not spawn the ATraceCoreSpawn marker. The level still plays — ")
+			TEXT("GetCoreSpawnLocation() falls back to the derived point and says so — but the Core spawn ")
+			TEXT("will not be editable in this map."));
+		return;
+	}
+
+	Marker->Tags.Add(TraceBakedArenaTag());
+	Marker->SetActorLabel(TEXT("Core_Spawn"));
+	Marker->SetFolderPath(TEXT("Arena/Spawns"));
+	PlacedCoreSpawn = Marker;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Bake] Core spawn written down as a placed ATraceCoreSpawn at %s (World Outliner: ")
+		TEXT("Arena/Spawns/Core_Spawn). Move that actor and the kickoff, the reset-after-score and the ")
+		TEXT("'the Core is home' test all move with it. Save the level to keep it."),
+		*CoreSpawnLocation.ToCompactString());
+}
 
 void ATraceArenaBuilder::BakeArenaIntoLevel()
 {
@@ -1012,6 +1168,20 @@ void ATraceArenaBuilder::BakeArenaIntoLevel()
 		Lamp->SetFolderPath(TEXT("Arena/Lighting"));
 	}
 
+	// --- 7b. The Core spawn, as a real placed actor  (spec v17 §2, closing spec v15 §1.4) ---------
+	//
+	// Every other gameplay position in the arena is an actor in the saved level: the endzone
+	// triggers, the goal volumes, the team player starts. The Core's was not — it was a pure
+	// function of the layout properties, so moving the centre dais in the baked level left the Core
+	// spawning over thin air with nothing in the outliner to drag.
+	//
+	// Emitted at whatever GetCoreSpawnLocation() answers RIGHT NOW, which on a fresh bake is the
+	// derived point. So a bake changes nothing about where the Core starts; it just writes the answer
+	// down where a person can move it. Re-baking a level that already has a marker picks the marker's
+	// own position back up, which is exactly what a designer expects a re-bake to preserve.
+	EnsureCoreSpawnActor();
+	const int32 CoreSpawnActors = (FindPlacedCoreSpawn() != nullptr) ? 1 : 0;
+
 	// --- 8. Label and tag the gameplay actors the build already spawned for real ------------------
 	//
 	// These are ordinary spawned actors that SpawnedActorFlags() made non-transient for this run, so
@@ -1114,11 +1284,13 @@ void ATraceArenaBuilder::BakeArenaIntoLevel()
 
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[Bake] Arena baked into the current level: %d piece actors + %d floor lamps + %d gameplay actors ")
-		TEXT("= %d actors, from %d recorded blocks. Components: %d static meshes, %d instanced batches, ")
-		TEXT("%d collision/standoff boxes. Materials: %d committed instances under %s."),
-		PieceActors, LampActors, GameplayActors, PieceActors + LampActors + GameplayActors + 1,
+		TEXT("+ %d Core spawn + this builder = %d actors, from %d recorded blocks. Components: %d static meshes, ")
+		TEXT("%d instanced batches, %d collision/standoff boxes. Materials: %d committed instances under %s ")
+		TEXT("(parents: %s)."),
+		PieceActors, LampActors, GameplayActors, CoreSpawnActors,
+		PieceActors + LampActors + GameplayActors + CoreSpawnActors + 1,
 		RecordedBlocks, MeshComponentsEmitted, InstancedComponentsEmitted, CollisionComponentsEmitted,
-		MaterialsWritten, TraceArenaBakeLocal::BakedInstanceDir);
+		MaterialsWritten, TraceArenaBakeLocal::BakedInstanceDir, TraceArenaBakeLocal::PromotedMaterialDir);
 
 	for (const FName& Collapsed : CollapsedNames)
 	{

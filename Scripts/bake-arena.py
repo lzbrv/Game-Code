@@ -24,15 +24,17 @@
 # -----------------------------------------------------------------------------
 # WHAT IT PRODUCES
 # -----------------------------------------------------------------------------
-#   /Game/Trace/Materials/M_TraceSurface   the two generated materials, COMMITTED
-#   /Game/Trace/Materials/M_TraceNeon      this time (Content/Generated/ is
+#   /Game/Trace/Materials/Parents/M_TraceSurface  the two authored parent
+#   /Game/Trace/Materials/Parents/M_TraceNeon      materials, COMMITTED (spec v17
+#                                          section 3 - Content/Generated/ is
 #                                          gitignored, so a baked map that
 #                                          referenced it would render as grey
 #                                          default material on every machine but
 #                                          the one that baked it)
 #   /Game/Trace/Materials/Instances/...    one MaterialInstanceConstant per
 #                                          distinct tint the build asked for,
-#                                          written by the C++ bake
+#                                          written by the C++ bake. THIS is the
+#                                          layer a designer retunes.
 #   /Game/Maps/Arena_Baked                 the level, with One File Per Actor on
 #
 # -----------------------------------------------------------------------------
@@ -75,7 +77,13 @@
 #   TRACE_BAKE_MATERIALS  package dir for the promoted materials.
 #                         Default /Game/Trace/Materials
 #   TRACE_BAKE_FORCE      "1" to delete and rebuild an existing baked map and
-#                         its promoted materials. Default off.
+#                         its material instances. Default off. The PARENT
+#                         materials are never touched by a bake.
+#   TRACE_BAKE_ADD_CORE_SPAWN
+#                         "1" to skip the bake entirely and instead add the
+#                         placed Core spawn marker to an existing baked level
+#                         (spec v17 section 2). One new package; nothing else in
+#                         the level is rewritten. Idempotent.
 # =============================================================================
 
 import os
@@ -96,6 +104,18 @@ MAP_PATH = os.environ.get("TRACE_BAKE_MAP", "/Game/Maps/Arena_Baked").rstrip("/"
 MATERIAL_DIR = os.environ.get("TRACE_BAKE_MATERIALS", "/Game/Trace/Materials").rstrip("/")
 FORCE = os.environ.get("TRACE_BAKE_FORCE", "0") == "1"
 
+# Top-up mode: do not bake, just add the Core spawn marker to an already baked
+# level and save. See add_core_spawn() for why this is not "just re-bake".
+TOPUP = os.environ.get("TRACE_BAKE_ADD_CORE_SPAWN", "0") == "1"
+
+# Spec v17 section 3's layout. The two halves are separated because they have
+# different lifetimes: the PARENTS are authored by generate_content.py and change
+# when somebody edits the shader graph, the INSTANCES are rewritten by the C++
+# bake on every re-bake. Keeping them in one folder made "which of these do I
+# lock before I edit it" unanswerable.
+PARENT_DIR = "{0}/Parents".format(MATERIAL_DIR)
+INSTANCE_DIR = "{0}/Instances".format(MATERIAL_DIR)
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -108,19 +128,19 @@ def log_error(message):
 
 
 # -----------------------------------------------------------------------------
-# 1. Promote the materials out of Content/Generated/
+# 1. Make sure the committed parent materials exist
 #
 # THE POINT OF THIS STEP, and it is the one that decides whether the baked map is
-# usable by anybody else. ATraceArenaBuilder wears two generated materials that
-# live at /Game/Generated/Materials, which .gitignore excludes on purpose (the
-# repo stays text-only; every developer regenerates them from the pinned engine).
-# A .umap that referenced them would be fine here and broken everywhere else.
+# usable by anybody else: NOTHING THE GAME SHIPS MAY REFERENCE Content/Generated/,
+# which .gitignore excludes. A .umap that did would be fine here and broken
+# everywhere else - grey default material on every machine but the one that baked.
 #
-# So the SAME generator runs again, pointed at a committed directory. Running
-# Scripts/generate_content.py rather than reimplementing the two materials is
-# deliberate: two copies of a material definition is two things to keep in step,
-# and the day they drift the baked arena is a different colour from the
-# procedural one and nobody knows why.
+# Since spec v17 section 3 the committed copies at /Game/Trace/Materials/Parents
+# ARE the source of truth rather than a promoted duplicate, so on a normal bake
+# this step finds them already present and does nothing. It still runs the SAME
+# generator rather than reimplementing the two materials, because two copies of a
+# material definition is two things to keep in step and the day they drift the
+# baked arena is a different colour from the procedural one and nobody knows why.
 # -----------------------------------------------------------------------------
 
 def promote_materials():
@@ -129,9 +149,15 @@ def promote_materials():
         raise RuntimeError("generate_content.py not found next to this script ({0})".format(generator))
 
     previous_dir = os.environ.get("TRACE_CONTENT_DIR")
+    previous_instances = os.environ.get("TRACE_INSTANCE_DIR")
     previous_force = os.environ.get("TRACE_FORCE_CONTENT")
-    os.environ["TRACE_CONTENT_DIR"] = MATERIAL_DIR
-    os.environ["TRACE_FORCE_CONTENT"] = "1" if FORCE else "0"
+    os.environ["TRACE_CONTENT_DIR"] = PARENT_DIR
+    os.environ["TRACE_INSTANCE_DIR"] = INSTANCE_DIR
+    # NOT forced by a --force bake. --force means "replace the LEVEL"; the parent
+    # materials are hand-authored assets that a re-bake has no business rebuilding
+    # (and rebuilding them would silently discard a graph edit somebody committed).
+    # Rebuild them deliberately with TRACE_FORCE_CONTENT=1 on generate_content.py.
+    os.environ["TRACE_FORCE_CONTENT"] = "0"
 
     try:
         # exec, not import: generate_content.py reads its configuration from the
@@ -145,16 +171,20 @@ def promote_materials():
             os.environ.pop("TRACE_CONTENT_DIR", None)
         else:
             os.environ["TRACE_CONTENT_DIR"] = previous_dir
+        if previous_instances is None:
+            os.environ.pop("TRACE_INSTANCE_DIR", None)
+        else:
+            os.environ["TRACE_INSTANCE_DIR"] = previous_instances
         if previous_force is None:
             os.environ.pop("TRACE_FORCE_CONTENT", None)
         else:
             os.environ["TRACE_FORCE_CONTENT"] = previous_force
 
     for name in ("M_TraceSurface", "M_TraceNeon"):
-        path = "{0}/{1}".format(MATERIAL_DIR, name)
+        path = "{0}/{1}".format(PARENT_DIR, name)
         if not unreal.EditorAssetLibrary.does_asset_exist(path):
             raise RuntimeError("{0} was not created; the bake would produce a broken map".format(path))
-        log("Promoted {0}".format(path))
+        log("Committed parent present: {0}".format(path))
 
 
 # -----------------------------------------------------------------------------
@@ -240,10 +270,14 @@ def bake():
         # RENAMED tint would otherwise leave an orphan behind, and an orphaned
         # MI_Neon_* that nothing references is exactly the kind of thing that
         # sits in a repo for a year.
-        instances = "{0}/Instances".format(MATERIAL_DIR)
-        if unreal.EditorAssetLibrary.does_directory_exist(instances):
-            unreal.EditorAssetLibrary.delete_directory(instances)
-            log("Deleted the existing {0}".format(instances))
+        #
+        # THE PARENTS ARE NOT TOUCHED. They live one folder over, in Parents/,
+        # precisely so that this line cannot reach them: they are authored assets
+        # with hand-tuned graphs, and a --force re-bake deleting them would be a
+        # silent loss of work.
+        if unreal.EditorAssetLibrary.does_directory_exist(INSTANCE_DIR):
+            unreal.EditorAssetLibrary.delete_directory(INSTANCE_DIR)
+            log("Deleted the existing {0}".format(INSTANCE_DIR))
 
     level_editor = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
     if not level_editor.new_level(MAP_PATH):
@@ -300,7 +334,69 @@ def bake():
     return len(actors)
 
 
+# -----------------------------------------------------------------------------
+# 4. Top-up: add the Core spawn marker to a level that is ALREADY baked
+#    (spec v17 section 2)
+#
+# WHY THIS IS NOT "JUST RE-BAKE". A --force re-bake deletes and rewrites all ~572
+# external actor packages - about 5.4 MB of LFS churn, a new version of every
+# single actor for everyone to pull, and it throws away every hand edit anybody
+# has made to the level. Adding the ONE actor spec v15 section 1.4 asked for
+# should not cost that. This opens the existing level, presses the builder's
+# EnsureCoreSpawnActor button and saves: one new package, nothing else touched.
+#
+# Idempotent. A level that already has a marker is left alone, marker included -
+# so this cannot move a Core spawn somebody has deliberately dragged.
+# -----------------------------------------------------------------------------
+
+def add_core_spawn():
+    if not unreal.EditorAssetLibrary.does_asset_exist(MAP_PATH):
+        raise RuntimeError("{0} does not exist; there is nothing to top up. Bake it first.".format(MAP_PATH))
+
+    level_editor = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    if not level_editor.load_level(MAP_PATH):
+        raise RuntimeError("could not open {0}".format(MAP_PATH))
+    log("Opened {0}".format(MAP_PATH))
+
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+
+    builders = [a for a in actor_subsystem.get_all_level_actors()
+                if isinstance(a, unreal.TraceArenaBuilder)]
+    if not builders:
+        raise RuntimeError(
+            "{0} has no ATraceArenaBuilder. The builder is the arena's oracle - it is what knows "
+            "where the Core spawn goes - so a baked level without one is broken for more reasons "
+            "than this.".format(MAP_PATH))
+    if len(builders) > 1:
+        log_error("{0} contains {1} arena builders; using the first.".format(MAP_PATH, len(builders)))
+
+    before = len([a for a in actor_subsystem.get_all_level_actors()
+                  if isinstance(a, unreal.TraceCoreSpawn)])
+    builders[0].ensure_core_spawn_actor()
+    after = len([a for a in actor_subsystem.get_all_level_actors()
+                 if isinstance(a, unreal.TraceCoreSpawn)])
+
+    if after == 0:
+        raise RuntimeError("EnsureCoreSpawnActor ran but the level still has no ATraceCoreSpawn.")
+
+    if after == before:
+        log("{0} already had a Core spawn marker; nothing changed, nothing saved.".format(MAP_PATH))
+        return 0
+
+    if not level_editor.save_current_level():
+        raise RuntimeError("save_current_level() failed")
+
+    log("Saved {0} with a placed Core spawn marker ({1} -> {2}).".format(MAP_PATH, before, after))
+    return after - before
+
+
 def main():
+    if TOPUP:
+        log("Topping up {0}: placing the Core spawn marker if it is missing.".format(MAP_PATH))
+        added = add_core_spawn()
+        log("bake-arena.py finished: {0} actor(s) added.".format(added))
+        return
+
     log("Baking {0} (materials -> {1}, force={2})".format(MAP_PATH, MATERIAL_DIR, FORCE))
     promote_materials()
     count = bake()

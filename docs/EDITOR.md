@@ -33,12 +33,16 @@ launch) does.
 
 This was a choice, not an accident, and it cuts both ways.
 
-**What it buys.** The entire game is text. There is no authored `.umap` to merge, no asset to lock,
-no lighting build to check in. The whole tracked repo is 94 files and about 1.8 MB, and `.git`
-itself is 1.4 MB — an authored arena of this size with imported meshes and baked lighting would be
-in the hundreds of megabytes to gigabytes. Every change to the arena layout shows up in a pull
-request as a readable diff with a comment explaining it, and four people can work on the world at
-once without coordinating.
+**What it buys.** The gameplay is text. Every change to the arena layout shows up in a pull request
+as a readable diff with a comment explaining it, and an authored arena of this size with imported
+meshes and baked lighting would be in the hundreds of megabytes to gigabytes rather than the ~8 MiB
+a clone costs today.
+
+**This section used to claim there was "no asset to lock". That is no longer true** — see §3.5. The
+repo now tracks 641 binary assets (5.14 MiB in Git LFS): the baked arena, its materials and three
+levels. Anything under `Content/` is checked out **read-only** and you must take a lock before you
+can edit it. If Unreal refuses to save an asset, that is why, and the fix is a lock rather than a
+`chmod` — see [GITHUB.md §4](GITHUB.md).
 
 **What it costs.** You lose WYSIWYG. You cannot drag a cover block six metres to the left and see
 how it feels; changing the arena means editing C++ constants, rebuilding, playing, and looking — a
@@ -48,8 +52,9 @@ Details panel), but placing individual pieces by hand is genuinely not available
 cost and it gets worse as the arena gets more detailed. If Trace ever hires someone whose job is
 level layout, this constraint is the first thing to revisit.
 
-(The no-binary-assets rule applies to things *we* author. `Content/Characters/Mannequins/` is
-imported Epic content and is binary; it is tracked with Git LFS. See [GITHUB.md](GITHUB.md).)
+(`Content/Characters/Mannequins/` is imported Epic content, and unlike the rest it is **gitignored**
+rather than tracked — every developer copies it out of their own engine install. See
+[GITHUB.md](GITHUB.md).)
 
 ---
 
@@ -101,9 +106,9 @@ real placed actors you can select and move. See §3.5.
 
 | Level | What it is |
 |---|---|
-| `/Game/Maps/Arena` | The match, and the **shipping** map. Empty until `ATraceArenaBuilder` runs. |
-| `/Game/Maps/MainMenu` | The **title screen**. Empty; `ATraceMenuHUD` draws the whole menu in Canvas. |
-| `/Game/Maps/Arena_Baked` | The same arena, **baked into real editable actors**. Opt-in — see §3.5. |
+| `/Game/Maps/Arena_Baked` | The match, and **the map the game now ships and opens**. 573 real actors you can select and drag — see §3.5. |
+| `/Game/Maps/Arena` | The same arena, built from code at `BeginPlay`. Empty in the editor. **Kept on purpose** as the control you compare against. |
+| `/Game/Maps/MainMenu` | The **title screen**. Empty; `ATraceMenuHUD` draws the menu (UMG as of spec v17 §4, Canvas as the fallback). |
 
 Ways to open any of them:
 
@@ -116,21 +121,35 @@ From `Config/DefaultEngine.ini`:
 
 ```ini
 [/Script/EngineSettings.GameMapsSettings]
-EditorStartupMap=/Game/Maps/Arena
+EditorStartupMap=/Game/Maps/MainMenu
 GameDefaultMap=/Game/Maps/MainMenu
-ServerDefaultMap=/Game/Maps/Arena
+ServerDefaultMap=/Game/Maps/Arena_Baked
 ```
 
 - `GameDefaultMap` is why launching the *game* (packaged, or `-game` from the command line) shows
   the title screen instead of dropping you into a match already in progress.
-- `EditorStartupMap` is why the *editor* opens on `Arena` — that is what you are usually here to
-  work on.
-- `ServerDefaultMap` stays on the arena because a dedicated server has nobody to show a menu to.
+- `EditorStartupMap` is why the *editor* opens on the menu. It used to open on `Arena`; spec v17
+  moved it so that pressing Play in a fresh editor gives you the same first screen a player gets.
+- `ServerDefaultMap` is the dedicated-server path only — a dedicated server has nobody to show a
+  menu to, so it needs an arena. It is on the **baked** one as of spec v17 §2.
+
+**There are FOUR places that name a default arena, and this is the complete list** — you need it if
+you ever want to go back to the procedural map:
+
+| Where | Governs | Revert to |
+|---|---|---|
+| `Source/Trace/UI/TraceMatchOptions.h` → `TraceMaps::Arena` | The title screen's **PLAY button**. This is the one that matters day to day. | `TEXT("/Game/Maps/Arena")` |
+| `Config/DefaultEngine.ini` → `ServerDefaultMap` | A dedicated server started with no map argument | `/Game/Maps/Arena` |
+| `Scripts/_trace_common.sh` → `TRACE_DEFAULT_MAP` (and `_trace_common.bat`) | `Scripts/run-*.sh` when you do not pass `--map` | `/Game/Maps/Arena` |
+| `Config/DefaultGame.ini` → `+MapsToCook` | What a packaged build contains. **Both** maps are listed; leave it that way. | — |
+
+For a single run you never need to change any of them: `Scripts/run-listen-server.sh --map
+/Game/Maps/Arena`.
 
 Each map finds its game mode differently, which is worth knowing because it is invisible in the
 editor UI:
 
-- `Arena` uses `GlobalDefaultGameMode` → `ATraceGameMode`.
+- `Arena` and `Arena_Baked` use `GlobalDefaultGameMode` → `ATraceGameMode`.
 - `MainMenu` is matched by name against `+GameModeMapPrefixes=(Name="MainMenu", …)` →
   `ATraceMenuGameMode`. The prefix table is used instead of a per-map override because a per-map
   override would have to be saved *inside* the binary `.umap`, which is exactly the hidden state
@@ -144,8 +163,9 @@ buttons, and starting a match from it travels you to the arena the same way the 
 ## 3.5 `/Game/Maps/Arena_Baked` — the arena as actors you can actually move
 
 Everything in §1 and §2 is about working around a level with nothing in it. `Arena_Baked` is the
-level that does have something in it: ~570 placed actors, each with a readable label
-(`Wall_North_01`, `Cover_037`, `Goal_Ring_Rim_12`, `Key_Light`), foldered in the World Outliner
+level that does have something in it: 573 placed actors, each with a readable label
+(`Wall_North_01`, `Cover_37`, `Goal_Ring_Rim_12`, `Key_Light` — note the numbering is zero-padded to
+two digits, so it is `Cover_37`, not `Cover_037`), foldered in the World Outliner
 under `Arena/Wall`, `Arena/Cover`, `Arena/Scoring`, `Arena/Spawns`, `Arena/Lighting`. You can click
 a wall and drag it, and it stays dragged.
 
@@ -163,25 +183,66 @@ so the baked geometry is the procedural geometry — not a second implementation
 **To play it**: `Scripts/run-listen-server.sh --map /Game/Maps/Arena_Baked`, or just press Play with
 the level open.
 
-Four things to know before you rely on it:
+Five things to know before you rely on it:
 
-- **`/Game/Maps/Arena` is still the shipping map.** The baked one is opt-in so the two can be
-  compared. Nothing boots into it by default.
+- **`Arena_Baked` IS the default arena now, and `/Game/Maps/Arena` is kept as the control.** Spec
+  v17 §2 promoted it: the PLAY button on the title screen, `Scripts/run-listen-server.sh` with no
+  `--map`, and a dedicated server started with no map argument all open `Arena_Baked`. (An earlier
+  version of this page said the opposite — "nothing boots into it by default" — and that sentence
+  was left behind by the promotion.) The procedural map is not deprecated and is not going away: it
+  is the thing you measure the baked map against when the baked map starts behaving oddly, and both
+  were measured side by side producing the same field size, the same endzone and goal volumes, the
+  same Core spawn point and the same ~1291 wall-fitter boxes. Three single lines choose the default,
+  each documented in place: `Source/Trace/UI/TraceMatchOptions.h` (`TraceMaps::Arena` — the PLAY
+  button), `Config/DefaultEngine.ini` (`ServerDefaultMap`) and `Scripts/_trace_common.sh`
+  (`TRACE_DEFAULT_MAP`, mirrored in `_trace_common.bat`). To play the procedural one for a single
+  run: `Scripts/run-listen-server.sh --map /Game/Maps/Arena`.
 - **The runtime build skips itself here.** The builder detects a baked level (its `bLevelIsPreBaked`
   flag, and independently the presence of any `ATraceBakedPiece`) and *adopts* the placed actors —
   re-wiring the scoring volumes, the mode-tagged furniture, the half-time repaint and the lighting —
   instead of constructing a second arena on top of the saved one.
-- **One File Per Actor is on**, so the level is a ~6 KB `.umap` plus one `.uasset` per actor under
-  `Content/__ExternalActors__/Maps/Arena_Baked/`. Lock the *actor*, not the map — see
-  `.gitattributes`.
+- **One File Per Actor is on**, so the level is a 6.6 KB `.umap` plus one `.uasset` per actor (573
+  of them today — 572 from the v15 bake plus the `Core_Spawn` marker spec v17 added) under
+  `Content/__ExternalActors__/Maps/Arena_Baked/`. **This is the thing that lets two
+  people edit the arena at the same time** — you lock the *actor*, not the map, so one person moving
+  `Cover_37` does not block anyone else from touching the other 572. Lock the `.umap` itself only
+  for level-wide changes (World Settings, the level Blueprint, a lighting build).
+
+  In practice: **right-click the actor in the World Outliner → Revision Control → Check Out**, which
+  takes the lock for you and is the only route a designer needs. From a terminal, the label works
+  too — `Scripts/lock.sh Cover_37` finds the GUID-named package behind it. Release it with
+  `Scripts/unlock.sh Cover_37` once you have pushed. Full workflow in [GITHUB.md §4](GITHUB.md).
+
+  Assets are checked out **read-only** until you hold the lock, so "Unreal will not let me save" is
+  the expected first symptom of forgetting to take one.
 - **It costs draw calls.** Cross-actor batching is impossible once geometry is real actors: the
   arena goes from ~411 primitives to ~1048. That is the price of editability, and it is why the
   procedural path stays.
+- **YOU CANNOT CLICK ONE TILE INSIDE A PIECE — 659 of the 835 blocks are batched.** This is the one
+  limit of the bake that surprises people, and until spec v17 it was written down nowhere. A "piece"
+  (a wall, a cover block, a bank terrace) is one `ATraceBakedPiece` actor, and inside it the repeated
+  blocks live in an *Instanced Static Mesh* component rather than as separate components. You can
+  always select, move, rotate, hide or delete a **whole piece** in the viewport. You cannot
+  rubber-band-select tile 12 of a terrace. **Every piece now tells you its own numbers**: select it
+  and read the read-only **Editing Note** box in the Details panel, which reports how many selectable
+  meshes and how many batched blocks *that* piece has, and the three ways round it —
+  (i) change the Instanced Static Mesh component's mesh or material to change all of them at once,
+  (ii) expand that component's `Instances` array in the Details panel and edit one transform there,
+  or (iii) re-bake with different settings and accept the extra draw calls. The note is editor-only
+  and transient: it is recomputed from the real components every time the actor registers, so it
+  cannot go stale and it is not saved into the `.uasset`.
 
-Two edits will not survive a reload, and both are known: the floor lamps' intensity and radius are
-re-applied from the builder's properties whenever video settings change, and a hand-resized endzone
-is re-derived from the builder's layout at load. Move them by changing the builder's properties and
-re-baking, not by hand.
+**Your endzone edits DO survive now, and that changed in spec v17.** Older versions of this page
+said a hand-resized endzone was "re-derived from the builder's layout at load", and that was true:
+`AdoptBakedArena` used to overwrite the placed shape silently. It now *verifies* instead — if the
+placed volume differs from what the builder would have made, **the placed shape is kept** and the
+log prints a warning naming both numbers. Read that warning the other way round too: if you see it
+and you did not edit anything, the map has gone stale against a code or settings change, and
+`Scripts/bake-arena.sh --force` is the fix.
+
+One edit still will not survive a reload, and it is known: the floor lamps' intensity and radius are
+re-applied from the builder's properties whenever video settings change. Move those by changing the
+builder's properties and re-baking, not by hand.
 
 ---
 
@@ -194,12 +255,34 @@ preview above) a place to look at the arena's shape. Right-mouse-drag looks, `WA
 right-dragging flies, `F` frames the selected actor, `Alt+drag` orbits. The **G** key toggles "game
 view", which hides editor-only icons and grid.
 
-**Content Browser** — every asset in the project. Still not much: `Maps/` (three levels — `MainMenu`
-and `Arena` are empty and build themselves at runtime; **`Arena_Baked` is not**, see below),
-`Characters/Mannequins/` (imported Epic animation content), `Generated/Materials/` (two materials
-produced by a script — see §7, and NOT committed), and `Trace/Materials/` (the same two materials
-plus 64 instances, committed, which is what `Arena_Baked` references). There are no Blueprints and
-no input assets; all of that is still C++.
+**Content Browser** — every asset in the project. Spec v17 changed this list substantially, so here
+is the whole of it:
+
+| Folder | What is in it | Generated? |
+|---|---|---|
+| `Maps/` | Three levels. `MainMenu` and `Arena` are empty and build themselves at runtime; **`Arena_Baked` is not** — it is 573 real actors, see below, and it is now the map the PLAY button opens | `Arena_Baked` was baked once |
+| `Trace/Materials/Parents/` | `M_TraceSurface`, `M_TraceNeon` — the two hand-authored shader graphs. Editing one recompiles shaders and changes all 64 instances at once | `Scripts/generate_content.py` |
+| `Trace/Materials/Instances/` | 64 `MI_*` assets, one per colour the arena uses. **These are the ones you want.** Tick a checkbox, change a number, save — nothing recompiles | from the bake |
+| `Trace/Input/` | 14 `IA_*` input actions and `IMC_Trace` | `Scripts/generate-input-assets.py` |
+| `Trace/Data/Characters/` | 5 `DA_Character_*` definitions — name, accent colour, the three ability card texts | `Scripts/generate-data-assets.py` |
+| `Trace/UI/HUD/` | `WBP_TraceHudCorner`, `WBP_TraceHudStatusChip` — the ammo plate and status chips in the bottom-right | `Scripts/generate-hud-widgets.py` |
+| `Trace/UI/Menu/` | `WBP_TitleMenu`, `WBP_MenuRow` — the title screen | `Scripts/generate-menu-widgets.py` |
+| `Characters/Mannequins/` | Imported Epic animation content | `Scripts/import-mannequin.sh`, **not committed** |
+| `Generated/Materials/` | The old script output. Kept only as the second fallback arm for materials — see §7 | **not committed** |
+
+**Two rules that cover almost everything in that table.** (1) Anything in the "Generated?" column
+naming a `Scripts/generate-*.py` is **rewritten from scratch every time that script runs** — a hand
+edit in the editor is fine for trying something out, but treat it as temporary; to make a change
+stick, change the script (or the C++ table it reads) and regenerate. (2) Every one of these files is
+a binary `.uasset`, so Git cannot merge two people's edits — **lock it before you open it**
+(`Scripts/lock.sh`), and see [GITHUB.md](GITHUB.md).
+
+There are still no Blueprint *classes* with gameplay logic. The four `WBP_` assets are Widget
+Blueprints, and they deliberately carry only the widget tree and its styling: every behaviour lives
+in a C++ `UUserWidget` subclass with `BindWidget` properties, under the same harnesses as before. If
+you rename or delete one of the bound widgets, the game notices, says so at Error level with the
+missing name, and falls back to the old Canvas drawing rather than showing you a HUD with a hole in
+it.
 
 **Outliner** — the list of actors in the level. On `MainMenu` and `Arena` it is **nearly empty
 before you press Play and full afterwards**, which is a good live demonstration of §1: hit Play and
@@ -208,10 +291,13 @@ fill with the arena builder, the endzones, the player starts, the Core, ten char
 controllers. It is genuinely useful during PIE — select a running actor there and its live state
 appears in the Details panel.
 
-`Arena_Baked` is the opposite and that is the whole point of it: **572 actors are already there
+`Arena_Baked` is the opposite and that is the whole point of it: **573 actors are already there
 before you press Play**, foldered under `Arena/Wall`, `Arena/Cover`, `Arena/Scoring`, `Arena/Spawns`
-and `Arena/Lighting`, each with a readable name (`Wall_North_01`, `Cover_037`). Click one and move
-it. The builder is still in that level but it adopts the placed geometry instead of rebuilding it.
+and `Arena/Lighting`, each with a readable name (`Wall_North_01`, `Cover_37`, `Core_Spawn`). Click
+one and move it — after taking its lock (§3.5). The builder is still in that level but it adopts the
+placed geometry instead of rebuilding it. Note `Arena/Spawns/Core_Spawn`: dragging that one marker
+moves where the Core starts at kickoff, where it resets to after a score, and where the game treats
+as its home. Delete it and the game quietly computes the same point itself and says so in the log.
 
 **Details** — properties of whatever is selected. This is where a placed `ATraceArenaBuilder`
 exposes `FieldLength`, `FieldWidth`, `WallHeight`, `EndzoneDepth`, the lighting intensities and the

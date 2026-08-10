@@ -41,6 +41,7 @@ MAP="/Game/Maps/Arena_Baked"
 MATERIALS="/Game/Trace/Materials"
 FORCE=0
 NULL_RHI=0
+ADD_CORE_SPAWN=0
 EXTRA_ARGS=()
 
 usage() {
@@ -56,6 +57,13 @@ OPTIONS
                          Default: ${MATERIALS}
   -f, --force            Replace an existing baked level (and its external
                          actor packages) instead of refusing
+      --add-core-spawn   Do NOT bake. Open the existing level, add the placed
+                         Core spawn marker if it has none, save, exit. Writes
+                         ONE new actor package and leaves everything else alone,
+                         which is why it exists: a --force re-bake would rewrite
+                         all ~570 packages and discard every hand edit. Safe to
+                         run twice; a level that already has a marker keeps it
+                         exactly where it is. (spec v17 section 2)
       --nullrhi          Add -NullRHI. FASTER, but only safe once
                          Content/Trace/Materials already exists: material shader
                          compilation needs a real RHI, and without one the
@@ -82,6 +90,7 @@ while [ $# -gt 0 ]; do
         -m|--map)      [ $# -ge 2 ] || trace_die "--map needs a value"; MAP="$2"; shift 2 ;;
         --materials)   [ $# -ge 2 ] || trace_die "--materials needs a value"; MATERIALS="$2"; shift 2 ;;
         -f|--force)    FORCE=1; shift ;;
+        --add-core-spawn) ADD_CORE_SPAWN=1; shift ;;
         --nullrhi)     NULL_RHI=1; shift ;;
         -n|--dry-run)  TRACE_DRY_RUN=1; shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -109,6 +118,14 @@ REL_MAP="${MAP#/Game/}"
 MAP_FILE="${TRACE_PROJECT_ROOT}/Content/${REL_MAP}.umap"
 EXTERNAL_DIR="${TRACE_PROJECT_ROOT}/Content/__ExternalActors__/${REL_MAP}"
 
+if [ "$ADD_CORE_SPAWN" = "1" ] && [ "$FORCE" = "1" ]; then
+    trace_die "--add-core-spawn and --force are opposites: one adds a single actor to the level you already have, the other throws that level away. Pick one."
+fi
+
+if [ "$ADD_CORE_SPAWN" = "1" ] && [ ! -f "$MAP_FILE" ]; then
+    trace_die "Content/${REL_MAP}.umap does not exist; there is nothing to top up. Bake it first."
+fi
+
 if [ "$FORCE" = "1" ] && [ "$TRACE_DRY_RUN" != "1" ]; then
     # The .umap is deleted by the Python side (it has to go through the asset
     # registry), but the per-actor packages are just files and the editor will
@@ -124,6 +141,7 @@ fi
 export TRACE_BAKE_MAP="$MAP"
 export TRACE_BAKE_MATERIALS="$MATERIALS"
 export TRACE_BAKE_FORCE="$FORCE"
+export TRACE_BAKE_ADD_CORE_SPAWN="$ADD_CORE_SPAWN"
 
 EDITOR_BIN="$(trace_editor_binary)"
 
@@ -140,7 +158,11 @@ if [ "$NULL_RHI" = "1" ]; then
 fi
 ARGS+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
 
-trace_msg "Baking ${TRACE_C_BOLD}${MAP}${TRACE_C_OFF} (materials ${MATERIALS}, force=${FORCE})"
+if [ "$ADD_CORE_SPAWN" = "1" ]; then
+    trace_msg "Topping up ${TRACE_C_BOLD}${MAP}${TRACE_C_OFF}: placing the Core spawn marker if it is missing"
+else
+    trace_msg "Baking ${TRACE_C_BOLD}${MAP}${TRACE_C_OFF} (materials ${MATERIALS}, force=${FORCE})"
+fi
 
 # THE EXIT CODE OF THE COMMANDLET IS NOT THE RESULT OF THE BAKE, and treating it
 # as one under `set -e` cost an afternoon here. UnrealEditor -run=pythonscript
@@ -192,6 +214,24 @@ trace_msg "One File Per Actor: ${EXTERNAL_COUNT} external actor packages, ${EXTE
 if [ "$EXTERNAL_COUNT" -lt 100 ]; then
     trace_err "Only ${EXTERNAL_COUNT} actors were written. A complete bake of this arena is ~570."
     exit 1
+fi
+
+# THE AUTHORITATIVE CHECK FOR BOTH MODES IS WHAT LANDED ON DISK, not the log. An
+# actor package carries its class name in its name table, so grep answers "is the
+# Core spawn marker really in this level" without opening the editor again.
+CORE_SPAWN_COUNT="$(grep -ral 'TraceCoreSpawn' "$EXTERNAL_DIR" 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$ADD_CORE_SPAWN" = "1" ] || [ "$FORCE" = "1" ]; then
+    if [ "$CORE_SPAWN_COUNT" = "0" ]; then
+        trace_err "No ATraceCoreSpawn package in Content/__ExternalActors__/${REL_MAP}."
+        trace_err "The Core spawn marker was NOT written. The level still plays - the builder falls back"
+        trace_err "to the derived spawn point and logs that it did - but the spawn is not editable."
+        exit 1
+    fi
+    trace_msg "Core spawn marker: ${CORE_SPAWN_COUNT} placed ATraceCoreSpawn actor(s) (World Outliner: Arena/Spawns)"
+fi
+
+if [ "$ADD_CORE_SPAWN" = "1" ]; then
+    trace_msg "Nothing else in the level was rewritten. ${TRACE_C_BOLD}git status${TRACE_C_OFF} should show one new package."
 fi
 
 trace_msg "Play it:  ${TRACE_C_BOLD}Scripts/run-listen-server.sh --map ${MAP}${TRACE_C_OFF}"

@@ -48,6 +48,12 @@
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"         // TraceMatchFlow::PostMatchDuration, TraceMaps
 #include "UI/TraceNetworking.h"           // TraceNet — host address, connection state, failures
+// v17 §4 (step 4b) — the bottom-right corner's second presenter. UMG is linked by Trace.Build.cs,
+// which retired "contract 7: Canvas only" in this same pass; nothing else on this HUD uses it.
+#include "Blueprint/UserWidget.h"         // CreateWidget
+#include "Blueprint/WidgetLayoutLibrary.h" // GetViewportScale — the DPI half of the design scale
+#include "UI/Widgets/HUD/TraceHudCornerWidget.h"
+#include "UI/Widgets/HUD/TraceHudStatusChipWidget.h" // Trace.HUD.Corner.Verify probes the chip too
 
 namespace
 {
@@ -383,9 +389,19 @@ void ATraceHUD::DrawHUD()
 
 	LogAffordanceAvailabilityOnce();
 
+	// Spec v17 §4 (step 4b). Cleared here and set by DrawAmmoAndStatuses; read at the bottom of this
+	// function. A UMG widget keeps painting until something tells it not to, and there are three
+	// perfectly ordinary frames on which the corner pass does not run at all — post-match, and the
+	// two frames either side of a travel.
+	bCornerAddressedThisDraw = false;
+
 #if !UE_BUILD_SHIPPING
 	// Spec v16 §2's draw record, cleared before anything draws. A stale record read back as a live
 	// one is precisely how a harness ends up reporting PASS while striking a corpse.
+	//
+	// It is cleared for BOTH corner presenters and written by whichever one runs, so the record keeps
+	// meaning "what the corner actually put on screen" after spec v17 §4 rather than "what the Canvas
+	// pass did". That is what lets Trace.HUD.V16Shots verify the UMG corner without being rewritten.
 	bDrewAmmoBlock = false;
 	DrawnAmmoText.Reset();
 	bDrewBeeClip = false;
@@ -505,6 +521,29 @@ void ATraceHUD::DrawHUD()
 
 	// Last, over everything including the full-time takeover. A no-op while closed.
 	PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
+
+	// SPEC v17 §4 (step 4b). The Canvas corner simply is not drawn on a frame where its pass does not
+	// run; a UMG corner has to be TOLD, or the last ammo count of the match hangs over the full-time
+	// screen forever. This is the "draws nothing, or draws twice" failure the spec names, closed at
+	// the one place that knows the whole frame is over.
+	if (!bCornerAddressedThisDraw)
+	{
+		HideCornerWidget();
+	}
+}
+
+void ATraceHUD::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// The corner is added to the PLAYER's screen, not to this actor, so it outlives the HUD unless it
+	// is taken down by hand — and a travel builds a new HUD, which would then add a second one over
+	// the first. Measured elsewhere in this project as "the menu appeared twice"; not a theory.
+	if (CornerWidget != nullptr)
+	{
+		CornerWidget->RemoveFromParent();
+		CornerWidget = nullptr;
+	}
+
+	Super::EndPlay(EndPlayReason);
 }
 
 void ATraceHUD::WireCharacterSelect()
@@ -2082,35 +2121,148 @@ namespace TraceHUDStatusStyle
 
 void ATraceHUD::DrawAmmoAndStatuses()
 {
+	// Told DrawHUD that the corner had its say this frame, so the tail of DrawHUD does not collapse
+	// a UMG corner that is legitimately up. See bCornerAddressedThisDraw.
+	bCornerAddressedThisDraw = true;
+
+	FTraceHudCornerState CornerState;
+	const bool bCornerLive = BuildCornerState(CornerState);
+
+	// *** THE ONE DELIBERATE DIFFERENCE BETWEEN THE TWO PRESENTERS, AND IT IS A PORT OF THE INTENT.
+	// *** The pause menu and the character select screen each lay a near-opaque full-screen scrim
+	// over everything (alpha 0.88 and 0.94), and the Canvas corner is drawn UNDER it — so a player
+	// with the pause menu up cannot see their ammo. A UMG widget is a Slate widget: it paints OVER
+	// the HUD canvas, scrim included. Hiding it while either overlay owns the screen is what makes
+	// the two paths look the same; leaving it up would be a change in what the player sees, which
+	// spec v17 §0 calls a bug rather than a feature.
+	const bool bOverlayOwnsScreen = PauseMenu.IsOpen() || CharacterSelect.IsOpen();
+
+	if (PresentCornerUmg(bCornerLive && !bOverlayOwnsScreen, CornerState))
+	{
+		return;
+	}
+
+	// Canvas: the shipped path, and the live fallback whenever the widget is unavailable.
+	HideCornerWidget();
+	if (bCornerLive)
+	{
+		PresentCornerCanvas(CornerState);
+	}
+}
+
+bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
+{
 	// The red arm (Trace.HUD.V16 0) is the pre-v16 corner: empty. See TraceHUDV16.
 	if (!TraceHUDV16::IsArmed())
 	{
-		return;
+		return false;
 	}
 
 	// A dead player has no gun and no live effects — poison dies with the body and the mark is
 	// cleared on respawn — so the whole corner goes quiet rather than each block testing separately.
 	if (LocalChar == nullptr || !LocalChar->IsAlive())
 	{
-		return;
+		return false;
 	}
 
-	// Mirrors the bottom-left stack's margin exactly, so the two corners read as one system rather
-	// than as two features that landed in different passes.
-	const float Margin = 40.f * UIScale;
-	const float BlockW = 260.f * UIScale;
-	const float RightEdge = ViewW - Margin;
+	// ---- The ammo block ---------------------------------------------------------------------------
+	//
+	// *** ONE GATE, AND IT IS THE GUN'S OWN. *** ShouldShowAmmo() is false while carrying the Core
+	// (spec v16 §1: "The Core carrier has no gun, so ammo must not be consumed or shown while
+	// carrying"), with the knife out, and while dead. Re-deriving any of that here would give the
+	// rule a second definition able to drift from the one the weapon enforces — which is how a HUD
+	// ends up showing a count for a gun that cannot fire.
+	const UTraceWeaponComponent* WeaponComp = LocalChar->Weapon.Get();
+	if (WeaponComp != nullptr && WeaponComp->ShouldShowAmmo())
+	{
+		OutState.bAmmoBlock = true;
+		OutState.InClip = WeaponComp->GetClipAmmo();
 
-	// Ammo first and pinned: it owns the corner and never moves. See the header.
-	const float StackBottom = DrawAmmoBlock(RightEdge, ViewH - Margin, BlockW);
+		const int32 AbilityRounds = WeaponComp->GetAbilityRoundsInClip();
+		OutState.bBeeClip = (AbilityRounds > 0);
+		OutState.bReloading = WeaponComp->IsReloading();
+
+		// THE DENOMINATOR IS THE CLIP THAT IS ACTUALLY LOADED. A bee clip holds five, and printing
+		// "3/30" for it would say the gun is nearly empty when it is more than half full of the thing
+		// X just spent his ability on.
+		//
+		// *** IT IS THE SIZE THE BEE CLIP WAS LOADED AT, NOT THE ROUNDS STILL IN IT. *** This was
+		// written as Max(InClip, AbilityRounds), and UTraceWeaponComponent::ConsumeRound decrements
+		// AbilityRoundsInClip in lockstep with ClipAmmo — so the denominator tracked the numerator and
+		// the block read "5/5", then "4/4", then "3/3", while the pip strip below LOST a pip per shot
+		// instead of dimming one. A bee clip looked full right up until it was gone, which is the exact
+		// thing this branch exists to prevent. The capacity now comes from the same knob that produced
+		// the clip — XStingBulletCount, which is what UTraceAbilitySetX::ActivateAbility hands to
+		// LoadAbilityClip — for the same reason §3's cloud reads the poison's own radius rather than a
+		// second copy of it: two numbers for one fact drift, and the HUD is always the copy that lies.
+		// Max() against the loaded count so a future ability that loads MORE rounds than X does can
+		// never produce a denominator below its own numerator.
+		OutState.ClipCapacity = OutState.bBeeClip
+			? FMath::Max(AbilityRounds, TraceXBees::GetStingBulletCount())
+			: FMath::Max(1, WeaponComp->GetClipSize());
+
+		OutState.RoundsColor = OutState.bBeeClip
+			? TraceHUDStatusStyle::BeeRounds
+			: TraceHUDStatusStyle::NormalRounds;
+
+		OutState.CapacityText = FString::Printf(TEXT("/%d"), OutState.ClipCapacity);
+		OutState.CountText = OutState.bReloading ? FString(TEXT("--")) : FString::FromInt(OutState.InClip);
+
+		OutState.bLowAmmo = !OutState.bBeeClip && !OutState.bReloading
+			&& (static_cast<float>(OutState.InClip)
+				<= TraceHUDStatusStyle::LowAmmoFraction * OutState.ClipCapacity);
+
+		OutState.CountColor = OutState.bReloading
+			? TraceHUDStatusStyle::Reloading
+			: (OutState.bLowAmmo ? TraceHUDStyle::Danger : OutState.RoundsColor);
+
+		if (OutState.bReloading)
+		{
+			const float ReloadTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceAmmo::GetReloadSeconds());
+			OutState.ReloadRemaining = WeaponComp->GetReloadRemaining();
+			OutState.ReloadFraction =
+				FMath::Clamp(ReloadTotal - OutState.ReloadRemaining, 0.f, ReloadTotal) / ReloadTotal;
+		}
+
+		// The WORDS are the third independent bee-round signal, and the right-hand half is the reload
+		// key — read from the player's own bindings rather than hardcoded to R, exactly as the ability
+		// row does. A HUD that hardcodes a key is a HUD that lies to the first player who rebinds it.
+		OutState.AmmoLabel = OutState.bBeeClip ? FString(TEXT("BEE ROUNDS")) : FString(TEXT("AMMO"));
+		OutState.AmmoLabelColor = OutState.bBeeClip
+			? TraceHUDStatusStyle::BeeRounds
+			: TraceHUDStyle::InkDim;
+
+		FString ReloadKeyLabel(TEXT("R"));
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			if (FCString::Stricmp(Info.ConfigId, TEXT("Reload")) == 0)
+			{
+				const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
+				if (BoundKey.IsValid())
+				{
+					ReloadKeyLabel = BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
+				}
+				break;
+			}
+		}
+
+		OutState.RightLabel = OutState.bReloading
+			? FString::Printf(TEXT("RELOADING  %.1f"), OutState.ReloadRemaining)
+			: FString::Printf(TEXT("[%s]  RELOAD"), *ReloadKeyLabel);
+
+		OutState.RightLabelColor = OutState.bReloading
+			? TraceHUDStatusStyle::Reloading
+			: TraceHUDStyle::InkDim;
+
+		OutState.ReloadBarColor = TraceHUDStatusStyle::Reloading;
+	}
 
 	// ---- The status stack, growing upward -------------------------------------------------------
 	//
-	// ORDER IS FIXED AND IT IS A DECISION. Nearest the corner (drawn first, lowest) are the things
-	// being done TO the player, most urgent first: vulnerable, then the two Oyster debuffs, then
-	// Mace's control. The player's own buffs sit above them. A status appearing or expiring
-	// therefore only ever shuffles statuses ABOVE it and can never move the ammo count.
-	float ChipBottom = StackBottom - (12.f * UIScale);
+	// ORDER IS FIXED AND IT IS A DECISION. Nearest the corner (first in this array, drawn lowest) are
+	// the things being done TO the player, most urgent first: vulnerable, then the two Oyster
+	// debuffs, then Mace's control. The player's own buffs sit above them. A status appearing or
+	// expiring therefore only ever shuffles statuses ABOVE it and can never move the ammo count.
 
 	// ---- VULNERABLE (spec v16 §4 — "The HUD status from §2 shows the stack count") ---------------
 	//
@@ -2130,10 +2282,10 @@ void ATraceHUD::DrawAmmoAndStatuses()
 			// knobs — that is how a HUD and a damage path end up agreeing on a shared mistake.
 			const float Bonus = 100.f * (TraceVulnerable::GetMultiplierForStacks(Stacks) - 1.f);
 
-			ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+			OutState.Chips.Add({
 				FString::Printf(TEXT("VULNERABLE  x%d  +%.0f%%"), Stacks, Bonus),
 				FString::Printf(TEXT("%.1fs"), Remaining),
-				Remaining / Total, TraceHUDStatusStyle::Vulnerable);
+				Remaining / Total, TraceHUDStatusStyle::Vulnerable });
 		}
 	}
 
@@ -2156,17 +2308,17 @@ void ATraceHUD::DrawAmmoAndStatuses()
 
 		if (Remaining > 0.f)
 		{
-			ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+			OutState.Chips.Add({
 				TEXT("POISONED"), FString::Printf(TEXT("%.1fs"), Remaining),
-				Remaining / Total, TraceHUDStatusStyle::Poisoned);
+				Remaining / Total, TraceHUDStatusStyle::Poisoned });
 
 			if (PoisonComp->IsSlowActive())
 			{
 				const float SlowPercent = 100.f * (1.f - PoisonComp->GetSpeedMultiplier());
-				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+				OutState.Chips.Add({
 					FString::Printf(TEXT("SLOWED  -%.0f%% SPEED"), SlowPercent),
 					FString::Printf(TEXT("%.1fs"), Remaining),
-					Remaining / Total, TraceHUDStatusStyle::Slowed);
+					Remaining / Total, TraceHUDStatusStyle::Slowed });
 			}
 		}
 	}
@@ -2185,9 +2337,9 @@ void ATraceHUD::DrawAmmoAndStatuses()
 				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
 					UTraceSettings::Get().MaceSuspendMaxSeconds);
 
-				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+				OutState.Chips.Add({
 					TEXT("SUSPENDED"), FString::Printf(TEXT("%.2fs"), Remaining),
-					Remaining / Total, TraceHUDStatusStyle::Suspend);
+					Remaining / Total, TraceHUDStatusStyle::Suspend });
 			}
 
 			// THE PULL HAS NO CLOCK, so its draining indicator is DISTANCE — which is the pull's real
@@ -2200,9 +2352,9 @@ void ATraceHUD::DrawAmmoAndStatuses()
 					FVector::Dist(LocalChar->GetActorLocation(), MaceSet->GetSpikeAnchorLocation()));
 				const float Range = FMath::Max(1.f, UTraceSettings::Get().MaceSpikeRangeUU);
 
-				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+				OutState.Chips.Add({
 					TEXT("SPIKE PULL"), FString::Printf(TEXT("%.0fm"), ToAnchor / 100.f),
-					FMath::Clamp(ToAnchor / Range, 0.f, 1.f), TraceHUDStatusStyle::Pull);
+					FMath::Clamp(ToAnchor / Range, 0.f, 1.f), TraceHUDStatusStyle::Pull });
 			}
 		}
 		else if (const UTraceAbilitySetChut* ChutSet = Cast<UTraceAbilitySetChut>(LocalSet))
@@ -2214,10 +2366,10 @@ void ATraceHUD::DrawAmmoAndStatuses()
 					UTraceSettings::Get().ChudDurationSeconds);
 				const float Reduction = 100.f * UTraceSettings::Get().ChudDamageReduction;
 
-				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+				OutState.Chips.Add({
 					FString::Printf(TEXT("CHUD  -%.0f%% DAMAGE"), Reduction),
 					FString::Printf(TEXT("%.1fs"), Remaining),
-					Remaining / Total, TraceHUDStatusStyle::Chud);
+					Remaining / Total, TraceHUDStatusStyle::Chud });
 			}
 		}
 		else if (const UTraceAbilitySetRocco* RoccoSet = Cast<UTraceAbilitySetRocco>(LocalSet))
@@ -2237,56 +2389,56 @@ void ATraceHUD::DrawAmmoAndStatuses()
 				// telling the truth at the cap instead of counting past it.
 				const float BoostPercent = 100.f * (RoccoSet->GetMoveSpeedMultiplier() - 1.f);
 
-				ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+				OutState.Chips.Add({
 					FString::Printf(TEXT("SPEED BOOST  x%d  +%.0f%%"), Stacks, BoostPercent),
 					FString::Printf(TEXT("%.1fs"), Remaining),
-					Remaining / Total, TraceHUDStatusStyle::SpeedBoost);
+					Remaining / Total, TraceHUDStatusStyle::SpeedBoost });
 			}
 		}
 	}
+
+	return true;
 }
 
-float ATraceHUD::DrawAmmoBlock(float RightX, float BottomY, float BlockW)
+void ATraceHUD::PresentCornerCanvas(const FTraceHudCornerState& InState)
 {
-	const UTraceWeaponComponent* WeaponComp = (LocalChar != nullptr) ? LocalChar->Weapon.Get() : nullptr;
+	// Mirrors the bottom-left stack's margin exactly, so the two corners read as one system rather
+	// than as two features that landed in different passes.
+	const float Margin = TraceHudCornerLayout::StackMarginDesignPx * UIScale;
+	const float BlockW = 260.f * UIScale;
+	const float RightEdge = ViewW - Margin;
 
-	// *** ONE GATE, AND IT IS THE GUN'S OWN. *** ShouldShowAmmo() is false while carrying the Core
-	// (spec v16 §1: "The Core carrier has no gun, so ammo must not be consumed or shown while
-	// carrying"), with the knife out, and while dead. Re-deriving any of that here would give the
-	// rule a second definition able to drift from the one the weapon enforces — which is how a HUD
-	// ends up showing a count for a gun that cannot fire.
-	if (WeaponComp == nullptr || !WeaponComp->ShouldShowAmmo())
+	// Ammo first and pinned: it owns the corner and never moves. See the header.
+	const float StackBottom = DrawAmmoBlock(InState, RightEdge, ViewH - Margin, BlockW);
+
+	// The stack grows upward from there, in the order BuildCornerState filled it: index 0 nearest
+	// the corner. Twelve pixels of clearance above the ammo block's own top edge.
+	float ChipBottom = StackBottom - (12.f * UIScale);
+	for (const FTraceHudCornerChip& Chip : InState.Chips)
+	{
+		ChipBottom = DrawStatusChip(RightEdge, ChipBottom, BlockW,
+			Chip.Label, Chip.Readout, Chip.Fraction, Chip.Tint);
+	}
+}
+
+float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX, float BottomY, float BlockW)
+{
+	// The gate lives in BuildCornerState now — UTraceWeaponComponent::ShouldShowAmmo(), asked once
+	// for both presenters. Returns @p BottomY unchanged when there is nothing to draw, exactly as it
+	// always has, so the status stack starts from the corner instead of from a phantom plate.
+	if (!InState.bAmmoBlock)
 	{
 		return BottomY;
 	}
 
-	const int32 InClip = WeaponComp->GetClipAmmo();
-	const int32 AbilityRounds = WeaponComp->GetAbilityRoundsInClip();
-	const bool  bBeeClip = (AbilityRounds > 0);
-	const bool  bReloading = WeaponComp->IsReloading();
-
-	// THE DENOMINATOR IS THE CLIP THAT IS ACTUALLY LOADED. A bee clip holds five, and printing "3/30"
-	// for it would say the gun is nearly empty when it is more than half full of the thing X just
-	// spent his ability on.
-	//
-	// *** IT IS THE SIZE THE BEE CLIP WAS LOADED AT, NOT THE ROUNDS STILL IN IT. *** This was written
-	// as Max(InClip, AbilityRounds), and UTraceWeaponComponent::ConsumeRound decrements
-	// AbilityRoundsInClip in lockstep with ClipAmmo — so the denominator tracked the numerator and
-	// the block read "5/5", then "4/4", then "3/3", while the pip strip below LOST a pip per shot
-	// instead of dimming one. A bee clip looked full right up until it was gone, which is the exact
-	// thing this branch exists to prevent. The capacity now comes from the same knob that produced
-	// the clip — XStingBulletCount, which is what UTraceAbilitySetX::ActivateAbility hands to
-	// LoadAbilityClip — for the same reason §3's cloud reads the poison's own radius rather than a
-	// second copy of it: two numbers for one fact drift, and the HUD is always the copy that lies.
-	// Max() against the loaded count so a future ability that loads MORE rounds than X does can
-	// never produce a denominator below its own numerator.
-	const int32 ClipCapacity = bBeeClip
-		? FMath::Max(AbilityRounds, TraceXBees::GetStingBulletCount())
-		: FMath::Max(1, WeaponComp->GetClipSize());
-
-	const FLinearColor RoundsColor = bBeeClip
-		? TraceHUDStatusStyle::BeeRounds
-		: TraceHUDStatusStyle::NormalRounds;
+	// Local aliases so the drawing below is character-for-character what it was before the state was
+	// split out. Deliberately verbatim: this is a REORGANISATION (spec v17 §0), and every one of
+	// these numbers was arrived at by looking at a capture.
+	const int32 InClip = InState.InClip;
+	const int32 ClipCapacity = InState.ClipCapacity;
+	const bool  bBeeClip = InState.bBeeClip;
+	const bool  bReloading = InState.bReloading;
+	const FLinearColor RoundsColor = InState.RoundsColor;
 
 	// ---- Geometry, laid out upward from the corner ------------------------------------------------
 	// THE COUNT IS DRAWN AT DOUBLE THE BODY SCALE, and that is a measurement rather than a taste.
@@ -2323,15 +2475,9 @@ float ATraceHUD::DrawAmmoBlock(float RightX, float BottomY, float BlockW)
 	//
 	// Right-aligned as two pieces so the number a player actually reads is large and the capacity it
 	// is out of is subordinate — "7" has to be legible in peripheral vision; "/30" never does.
-	const FString CapacityText = FString::Printf(TEXT("/%d"), ClipCapacity);
-	const FString CountText = bReloading ? FString(TEXT("--")) : FString::Printf(TEXT("%d"), InClip);
-
-	const bool bLow = !bBeeClip && !bReloading
-		&& (static_cast<float>(InClip) <= TraceHUDStatusStyle::LowAmmoFraction * ClipCapacity);
-
-	const FLinearColor CountColor = bReloading
-		? TraceHUDStatusStyle::Reloading
-		: (bLow ? TraceHUDStyle::Danger : RoundsColor);
+	const FString& CapacityText = InState.CapacityText;
+	const FString& CountText = InState.CountText;
+	const FLinearColor CountColor = InState.CountColor;
 
 	// The capacity is BASELINE-ALIGNED to the bottom of the count rather than centred on it, so
 	// "26" and "/30" sit on one line instead of stepping down the way the first capture showed.
@@ -2357,10 +2503,8 @@ float ATraceHUD::DrawAmmoBlock(float RightX, float BottomY, float BlockW)
 	int32 LitTicks = 0;
 	if (bReloading)
 	{
-		const float ReloadTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceAmmo::GetReloadSeconds());
-		const float Elapsed = FMath::Clamp(ReloadTotal - WeaponComp->GetReloadRemaining(), 0.f, ReloadTotal);
-		DrawRect(TraceHUDStatusStyle::Reloading, RightX - BlockW, StripTop,
-			BlockW * (Elapsed / ReloadTotal), StripH);
+		DrawRect(InState.ReloadBarColor, RightX - BlockW, StripTop,
+			BlockW * FMath::Clamp(InState.ReloadFraction, 0.f, 1.f), StripH);
 	}
 	else
 	{
@@ -2387,31 +2531,10 @@ float ATraceHUD::DrawAmmoBlock(float RightX, float BottomY, float BlockW)
 	// The WORDS are the third independent bee-round signal, and the right-hand half is the reload
 	// key — read from the player's own bindings rather than hardcoded to R, exactly as the ability
 	// row does. A HUD that hardcodes a key is a HUD that lies to the first player who rebinds it.
-	const FString AmmoLabel = bBeeClip ? FString(TEXT("BEE ROUNDS")) : FString(TEXT("AMMO"));
-	DrawTextLeft(AmmoLabel, bBeeClip ? TraceHUDStatusStyle::BeeRounds : TraceHUDStyle::InkDim,
-		RightX - BlockW, LabelTop, FontSmall, UIScale);
-
-	FString ReloadKeyLabel(TEXT("R"));
-	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
-	{
-		if (FCString::Stricmp(Info.ConfigId, TEXT("Reload")) == 0)
-		{
-			const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
-			if (BoundKey.IsValid())
-			{
-				ReloadKeyLabel = BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
-			}
-			break;
-		}
-	}
-
-	const FString RightLabel = bReloading
-		? FString::Printf(TEXT("RELOADING  %.1f"), WeaponComp->GetReloadRemaining())
-		: FString::Printf(TEXT("[%s]  RELOAD"), *ReloadKeyLabel);
-
-	DrawTextRight(RightLabel,
-		bReloading ? TraceHUDStatusStyle::Reloading : TraceHUDStyle::InkDim,
-		RightX, LabelTop, FontSmall, UIScale);
+	// (Both strings, and both colours, are resolved once in BuildCornerState so the UMG corner says
+	// the identical words with the identical key.)
+	DrawTextLeft(InState.AmmoLabel, InState.AmmoLabelColor, RightX - BlockW, LabelTop, FontSmall, UIScale);
+	DrawTextRight(InState.RightLabel, InState.RightLabelColor, RightX, LabelTop, FontSmall, UIScale);
 
 #if !UE_BUILD_SHIPPING
 	bDrewAmmoBlock = true;
@@ -2463,6 +2586,268 @@ float ATraceHUD::DrawStatusChip(float RightX, float BottomY, float ChipW, const 
 #endif
 
 	return ChipTop - (6.f * UIScale);
+}
+
+// ===================================================================================================
+// SPEC v17 §4, STEP 4b — THE UMG PRESENTER FOR THE BOTTOM-RIGHT CORNER
+//
+// Everything above this line is the Canvas corner, unchanged in what it puts on screen. Everything
+// below is the second presenter and the toggle that chooses between them.
+//
+// ---------------------------------------------------------------------------------------------------
+// THE TOGGLE IS SHARED, AND THIS FILE DOES NOT OWN IT
+// ---------------------------------------------------------------------------------------------------
+// `Trace.UI.UseUMG` is one switch for the whole of spec v17 §4 — the menus and this corner were
+// converted by two different agents working at the same time, and TWO FAutoConsoleVariableRef
+// registrations of one name is an ensure() at static-init time, i.e. a crash on launch for a
+// coordination mistake. So this file FINDS the variable and only registers it if nobody else has,
+// lazily, on the first frame that asks — by which time every static initialiser in the module has
+// long since run. Whichever file gets there first wins, and both then read the same object.
+//
+// `Trace.UI.HUD.UseUMG` is the corner's own override and IS owned here: -1 (default) follows the
+// shared switch, 0 forces Canvas, 1 forces UMG. It exists so this element can be A/B'd without
+// disturbing the menus, and so a corner-specific problem can be turned off by somebody who is not
+// prepared to turn the whole of §4 off.
+// ===================================================================================================
+
+namespace TraceHudCornerUmg
+{
+	/**
+	 * Default for the SHARED switch, applied ONLY if this file is the one that registers it.
+	 *
+	 * As things stand it never is: TraceMenuHUD.cpp registers `Trace.UI.UseUMG` with an
+	 * FAutoConsoleVariableRef at static-init time, long before the first frame draws, and this
+	 * file finds it. The value here matters only if the menus' conversion is ever backed out — and
+	 * it agrees with theirs, so the answer does not depend on which file wins the race.
+	 *
+	 * 1, and the measurement is in the step's report: the spec v16 §2 evidence harness
+	 * (Trace.HUD.V16Shots) was run against the same fixture with the corner on Canvas and on UMG and
+	 * produced the same verdict — 27 passed, 0 failed, both times — and the same draw record: the
+	 * same ammo string, the same lit-tick count, the same chips in the same order with the same
+	 * drains. The photographs of the two agree to within a few pixels at 720p (the magazine strip
+	 * lands on exactly the same scanlines). Spec v17 §4 asks for the default to be "whichever you can
+	 * prove is at least as good"; that is the proof, and the Canvas path is still one cvar away.
+	 */
+	static constexpr int32 SharedToggleDefault = 1;
+
+	/** Z-order of the corner on the player's screen. Above nothing in particular — it is the only widget. */
+	static constexpr int32 CornerZOrder = 10;
+
+	/**
+	 * The shared switch, found or (once, lazily) registered. Never a second FAutoConsoleVariableRef.
+	 *
+	 * The pointer is cached because IConsoleManager::FindConsoleVariable is a lock plus a map lookup
+	 * and this is asked once per drawn frame. A console variable object lives for the life of the
+	 * process, so caching the pointer is safe; caching the VALUE would not be, and is exactly what
+	 * would stop `Trace.UI.UseUMG 0` from taking effect until the next map load.
+	 */
+	static IConsoleVariable* SharedToggle()
+	{
+		static IConsoleVariable* CachedShared = nullptr;
+		if (CachedShared != nullptr)
+		{
+			return CachedShared;
+		}
+
+		CachedShared = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.UI.UseUMG"));
+		if (CachedShared == nullptr)
+		{
+			CachedShared = IConsoleManager::Get().RegisterConsoleVariable(
+				TEXT("Trace.UI.UseUMG"),
+				SharedToggleDefault,
+				TEXT("Spec v17 4. 1 (default): UI elements that have a UMG asset use it. 0: every one of "
+				     "them falls back to the Canvas path that shipped before the migration. Registered by "
+				     "whichever converted element runs first; the HUD corner's own override is "
+				     "Trace.UI.HUD.UseUMG."),
+				ECVF_Default);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HUDUMG] registered the shared toggle Trace.UI.UseUMG (default %d) - no other UI "
+				     "element had claimed it yet."),
+				SharedToggleDefault);
+		}
+		return CachedShared;
+	}
+
+	/** -1 follows the shared switch, 0 forces Canvas, 1 forces UMG. Owned here. */
+	static int32 GCornerOverride = -1;
+
+#if !UE_BUILD_SHIPPING
+	static FAutoConsoleVariableRef CVarCornerOverride(
+		TEXT("Trace.UI.HUD.UseUMG"),
+		GCornerOverride,
+		TEXT("Spec v17 4 (step 4b), the bottom-right ammo/status corner ONLY. -1 (default) follows "
+		     "Trace.UI.UseUMG. 0 forces the Canvas corner that shipped in v16. 1 forces the UMG corner "
+		     "(WBP_TraceHudCorner). Changing it takes effect on the next drawn frame, both ways - it is "
+		     "an A/B arm, so the before and the after can be photographed in one binary."),
+		ECVF_Default);
+#endif
+
+	static bool IsCornerEnabled()
+	{
+		if (GCornerOverride >= 0)
+		{
+			return GCornerOverride != 0;
+		}
+
+		const IConsoleVariable* Toggle = SharedToggle();
+		return (Toggle != nullptr) && (Toggle->GetInt() != 0);
+	}
+}
+
+bool ATraceHUD::IsUmgCornerEnabled() const
+{
+	return TraceHudCornerUmg::IsCornerEnabled();
+}
+
+void ATraceHUD::SetCornerPath(ECornerPath InPath, const FString& InReason)
+{
+	if (bLoggedCornerPath && InPath == CornerPath && InReason == CornerFallbackReason)
+	{
+		return;
+	}
+
+	CornerPath = InPath;
+	CornerFallbackReason = InReason;
+	bLoggedCornerPath = true;
+
+	if (InPath == ECornerPath::Umg)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[HUDUMG] the bottom-right ammo/status corner is drawn by %s. Everything else on this "
+			     "HUD is still Canvas."),
+			UTraceHudCornerWidget::CornerBlueprintPath());
+	}
+	else
+	{
+		// Display, not Warning: a Canvas corner is a SUPPORTED CONFIGURATION and the shipped one.
+		// Warning-level noise for a correct outcome is how a log stops being read.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[HUDUMG] the bottom-right ammo/status corner is drawn on CANVAS (the v16 path) - %s."),
+			*InReason);
+	}
+}
+
+void ATraceHUD::HideCornerWidget()
+{
+	if (CornerWidget != nullptr)
+	{
+		CornerWidget->HideCorner();
+	}
+}
+
+bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InState)
+{
+	if (!TraceHudCornerUmg::IsCornerEnabled())
+	{
+		SetCornerPath(ECornerPath::Canvas, TEXT("Trace.UI.UseUMG / Trace.UI.HUD.UseUMG is off"));
+		return false;
+	}
+
+	// ONE ATTEMPT PER HUD. A missing asset is a perfectly ordinary state (a fresh clone that has not
+	// run Scripts/generate-hud-widgets.py yet), and retrying LoadClass every frame for the rest of
+	// the match would cost a package-store lookup per frame to reach the same answer.
+	if (bCornerAdoptFailed)
+	{
+		return false;
+	}
+
+	if (CornerWidget == nullptr)
+	{
+		// The lambda keeps the four failure exits identical: one reason string, one log line, one
+		// latch, and Canvas from here on.
+		auto AbandonAdoption = [this](const FString& InWhy) -> bool
+		{
+			bCornerAdoptFailed = true;
+			SetCornerPath(ECornerPath::Canvas, InWhy);
+			return false;
+		};
+
+		APlayerController* OwningController = PlayerOwner.Get();
+		if (OwningController == nullptr || OwningController->GetLocalPlayer() == nullptr)
+		{
+			// No latch: a HUD can legitimately exist for a frame before its local player does, and
+			// latching here would send a perfectly healthy client to Canvas for the whole match.
+			return false;
+		}
+
+		UClass* LoadedCornerClass = LoadClass<UTraceHudCornerWidget>(nullptr,
+			UTraceHudCornerWidget::CornerBlueprintPath());
+		if (LoadedCornerClass == nullptr)
+		{
+			return AbandonAdoption(FString::Printf(
+				TEXT("%s did not load (run Scripts/generate-hud-widgets.py to author it). This is a "
+				     "supported configuration, not an error"),
+				UTraceHudCornerWidget::CornerBlueprintPath()));
+		}
+
+		UTraceHudCornerWidget* NewCorner = CreateWidget<UTraceHudCornerWidget>(OwningController, LoadedCornerClass);
+		if (NewCorner == nullptr)
+		{
+			return AbandonAdoption(FString::Printf(TEXT("CreateWidget failed for %s"),
+				UTraceHudCornerWidget::CornerBlueprintPath()));
+		}
+
+		FString AdoptReason;
+		if (!NewCorner->InitialiseCorner(AdoptReason))
+		{
+			// Error, unlike the missing-asset case: an asset that EXISTS and does not match the C++
+			// contract is a broken generate or a hand edit, and it is the one outcome somebody has to
+			// go and fix. The game keeps playing on Canvas either way.
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[HUDUMG] *** %s is present but does not match the C++ contract: %s. *** The corner "
+				     "falls back to Canvas. Re-run Scripts/generate-hud-widgets.py."),
+				UTraceHudCornerWidget::CornerBlueprintPath(), *AdoptReason);
+			return AbandonAdoption(FString::Printf(TEXT("the widget asset failed validation (%s)"), *AdoptReason));
+		}
+
+		NewCorner->AddToPlayerScreen(TraceHudCornerUmg::CornerZOrder);
+		CornerWidget = NewCorner;
+	}
+
+	SetCornerPath(ECornerPath::Umg, FString());
+
+	if (!bInLive)
+	{
+		CornerWidget->HideCorner();
+		return true;
+	}
+
+	// THE ONE NUMBER THAT MAKES THE TWO PATHS THE SAME SIZE. The Canvas HUD scales itself by
+	// ViewH/1080 (clamped); UMG has already scaled every widget by the project's DPI curve. Dividing
+	// one by the other leaves exactly the Canvas geometry. At 720p and 1080p the engine's default
+	// curve and the HUD's rule agree, so this is 1.0 and the transform costs nothing.
+	const float ViewportDpiScale = FMath::Max(0.01f, UWidgetLayoutLibrary::GetViewportScale(this));
+	const float CornerDesignScale = UIScale / ViewportDpiScale;
+	const FTraceHudCornerPresented Presented = CornerWidget->PresentCorner(InState, CornerDesignScale);
+
+	// One line, once, naming the three numbers that decide whether the two corners come out the same
+	// SIZE. Printed rather than assumed because getting it wrong is invisible in a log and obvious
+	// only in a photograph — which is exactly how the first armed capture of this corner came out
+	// two and a half times too big.
+	if (!bLoggedCornerScale)
+	{
+		bLoggedCornerScale = true;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[HUDUMG] scale: viewport=%.0fx%.0f  HUD UIScale=%.4f  viewport DPI scale=%.4f  =>  "
+			     "corner render scale=%.4f"),
+			ViewW, ViewH, UIScale, ViewportDpiScale, CornerDesignScale);
+	}
+
+#if !UE_BUILD_SHIPPING
+	// The spec v16 §2 draw record, written from WHAT THE WIDGET REPORTED IT EMITTED — never from the
+	// state it was handed. That is what keeps Trace.HUD.V16Shots a real test of this path rather than
+	// a test of the state builder: a corner that set every text block and then painted nothing at all
+	// would still have to come back with zero lit ticks.
+	bDrewAmmoBlock = Presented.bAmmoBlock;
+	DrawnAmmoText = Presented.AmmoText;
+	bDrewBeeClip = Presented.bBeeClip;
+	bDrewReloadBar = Presented.bReloadBar;
+	DrawnMagazineTicks = Presented.LitTicks;
+	DrawnStatusChips = Presented.Chips;
+#endif
+
+	return true;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -4158,6 +4543,20 @@ namespace TraceHUDV16Shots
 	 *
 	 * Filenames are namespaced with the tag AND this process id, because other agents run their own
 	 * rigs into the same Saved/Screenshots and an overwritten frame is destroyed evidence.
+	 *
+	 * *** bShowUI IS TRUE, AND IT WAS FALSE UNTIL SPEC v17 §4 (step 4b). MEASURED. *** The Canvas HUD
+	 * draws through FCanvas into the scene, so it lands in a screenshot either way — but a UMG widget
+	 * is a SLATE widget, composited after the scene, and bShowUI=false excludes it outright. The
+	 * first armed capture of the UMG corner proved it the hard way: the draw record said
+	 * "ammoBlock=YES text='26/30' litTicks=26 chips=3" and the photograph of that very frame had an
+	 * empty bottom-right corner, with the Canvas score panel and health bar plainly visible in the
+	 * same image. Nothing was wrong with the corner; the camera could not see that class of thing.
+	 *
+	 * So this is not a cosmetic change to an existing harness. With bShowUI=false the harness CANNOT
+	 * photograph the element spec v17 §4 converted, which would leave a drawing change verified only
+	 * by a log — precisely the self-certifying evidence this whole file exists to refuse. The Canvas
+	 * arm's frames are unaffected (checked: same corner, same pixels), so the before/after pair the
+	 * red arm produces is still a like-for-like comparison.
 	 */
 	ATraceHUD::FV16DrawRecord Shot(FRun& Run, const TCHAR* Tag)
 	{
@@ -4165,7 +4564,7 @@ namespace TraceHUDV16Shots
 		const FString FullPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Screenshots") / FileName);
 
 		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(FullPath));
-		FScreenshotRequest::RequestScreenshot(FullPath, /*bShowUI=*/false, /*bAddFilenameSuffix=*/false);
+		FScreenshotRequest::RequestScreenshot(FullPath, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
 
 		UE_LOG(LogTraceGame, Display, TEXT("[HUDV16] shot requested: %s"), *FullPath);
 
@@ -4880,6 +5279,198 @@ namespace TraceHUDV16Shots
 			Run->bModeB = (GS != nullptr) && GS->IsGoalMode();
 
 			Schedule(Run, 0.1f);
+		}));
+}
+
+// ===================================================================================================
+// SPEC v17 §4 (STEP 4b) — THE CORNER'S OWN VERIFIER
+//
+//   Trace.HUD.Corner.Verify   which presenter drew the last frame, whether the widget assets are
+//                             present and whether they satisfy the C++ BindWidget contract, and — in
+//                             black and white — what on this HUD was NOT converted.
+//
+// IT HAS THREE VERDICTS, NOT TWO, and the middle one is the point: "no assets" is a SUPPORTED
+// configuration (a fresh clone that has not run the generator yet plays exactly as it did in v16),
+// while "assets present but invalid" is a real fault somebody has to fix. Collapsing those two into
+// one FAIL would cry wolf at the working case; collapsing them into one PASS would hide the broken
+// one. The same three-verdict shape spec v17 §6's input verifier uses, for the same reason.
+//
+// PARITY between the two presenters is NOT asserted here, and deliberately: a drawing change can
+// only be verified by looking at frames. The evidence is Trace.HUD.V16Shots run twice against the
+// same fixture — `Trace.UI.HUD.UseUMG 0` then `1` — which photographs both corners and asserts on
+// the draw record each time. This command tells you which arm you are in; that one tells you whether
+// the arm works.
+// ===================================================================================================
+
+namespace TraceHudCornerVerify
+{
+	/** The local HUD, whatever the net mode. Unlike the shot sequence this stages nothing. */
+	ATraceHUD* FindLocalHud(UWorld* WorldPtr)
+	{
+		if (WorldPtr == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (FConstPlayerControllerIterator It = WorldPtr->GetPlayerControllerIterator(); It; ++It)
+		{
+			if (APlayerController* Candidate = It->Get())
+			{
+				if (Candidate->IsLocalController())
+				{
+					if (ATraceHUD* HudPtr = Cast<ATraceHUD>(Candidate->GetHUD()))
+					{
+						return HudPtr;
+					}
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	/** The first local controller, HUD or no HUD — enough to build a throwaway widget with. */
+	APlayerController* FindLocalController(UWorld* WorldPtr)
+	{
+		if (WorldPtr == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (FConstPlayerControllerIterator It = WorldPtr->GetPlayerControllerIterator(); It; ++It)
+		{
+			if (APlayerController* Candidate = It->Get())
+			{
+				if (Candidate->IsLocalController())
+				{
+					return Candidate;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	FAutoConsoleCommandWithWorld CmdVerify(
+		TEXT("Trace.HUD.Corner.Verify"),
+		TEXT("Spec v17 4 (step 4b). Reports which presenter drew the bottom-right ammo/status corner on "
+		     "the last frame, whether Content/Trace/UI/HUD's widget assets load and satisfy the C++ "
+		     "BindWidget contract, and which HUD elements are still Canvas. Three verdicts: UMG live, "
+		     "no assets (supported), or assets present but invalid (a fault)."),
+		FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* WorldPtr)
+		{
+			ATraceHUD* HudPtr = FindLocalHud(WorldPtr);
+
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] ===== spec v17 4 (4b): the bottom-right corner ====="));
+
+			// ---- The toggle ----------------------------------------------------------------------
+			const IConsoleVariable* SharedVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.UI.UseUMG"));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HUDUMG] Trace.UI.UseUMG=%s  Trace.UI.HUD.UseUMG=%d (-1 = follow the shared one)  =>  %s"),
+				SharedVar != nullptr ? *FString::FromInt(SharedVar->GetInt()) : TEXT("<unregistered>"),
+				TraceHudCornerUmg::GCornerOverride,
+				TraceHudCornerUmg::IsCornerEnabled() ? TEXT("UMG requested") : TEXT("Canvas requested"));
+
+			// ---- What actually drew --------------------------------------------------------------
+			if (HudPtr == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[HUDUMG] no local ATraceHUD in this world - the asset check below still runs, but "
+					     "nothing can be said about what drew."));
+			}
+			else
+			{
+				switch (HudPtr->GetCornerPath())
+				{
+				case ATraceHUD::ECornerPath::Umg:
+					UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] LIVE PATH: UMG (%s)"),
+						UTraceHudCornerWidget::CornerBlueprintPath());
+					break;
+				case ATraceHUD::ECornerPath::Canvas:
+					UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] LIVE PATH: CANVAS - %s"),
+						*HudPtr->GetCornerFallbackReason());
+					break;
+				default:
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[HUDUMG] LIVE PATH: undecided - the corner pass has not run yet (no drawn frame, "
+						     "or the player is dead and the corner is correctly quiet)."));
+					break;
+				}
+
+				HudPtr->LogV16DrawRecord(TEXT("Corner.Verify"));
+			}
+
+			// ---- The assets themselves, independently of adoption --------------------------------
+			//
+			// Loaded and CONSTRUCTED here rather than inspected: BindWidget properties are populated by
+			// widget construction, so a class that loads is not yet evidence that a widget built from it
+			// binds. The throwaway instance is never added to a viewport and is collected normally.
+			UClass* CornerClass = LoadClass<UTraceHudCornerWidget>(nullptr,
+				UTraceHudCornerWidget::CornerBlueprintPath());
+			UClass* ChipClass = LoadClass<UTraceHudStatusChipWidget>(nullptr,
+				UTraceHudCornerWidget::ChipBlueprintPath());
+
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] %s : %s"),
+				UTraceHudCornerWidget::CornerBlueprintPath(),
+				CornerClass != nullptr ? TEXT("loads") : TEXT("ABSENT"));
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] %s : %s"),
+				UTraceHudCornerWidget::ChipBlueprintPath(),
+				ChipClass != nullptr ? TEXT("loads") : TEXT("ABSENT"));
+
+			FString AssetVerdict;
+			APlayerController* OwnerPC = FindLocalController(WorldPtr);
+
+			if (CornerClass == nullptr || ChipClass == nullptr)
+			{
+				AssetVerdict = TEXT("NO ASSETS - the corner is drawn on Canvas exactly as it was in v16. "
+				                    "This is a SUPPORTED configuration. Run Scripts/generate-hud-widgets.py "
+				                    "to author them.");
+			}
+			else if (OwnerPC == nullptr)
+			{
+				AssetVerdict = TEXT("both assets load, but there is no local player controller to build a "
+				                    "widget with, so the BindWidget contract could not be checked here.");
+			}
+			else if (UTraceHudCornerWidget* ProbeCorner = CreateWidget<UTraceHudCornerWidget>(OwnerPC, CornerClass))
+			{
+				FString ProbeReason;
+				if (ProbeCorner->InitialiseCorner(ProbeReason))
+				{
+					AssetVerdict = FString::Printf(
+						TEXT("both assets satisfy the C++ contract (%d bound widgets on the corner, %d on the "
+						     "chip)."),
+						UTraceHudCornerWidget::RequiredWidgetNames().Num(),
+						UTraceHudStatusChipWidget::RequiredWidgetNames().Num());
+				}
+				else
+				{
+					AssetVerdict = FString::Printf(
+						TEXT("*** ASSETS PRESENT BUT INVALID: %s. Re-run Scripts/generate-hud-widgets.py. ***"),
+						*ProbeReason);
+				}
+				ProbeCorner->RemoveFromParent();
+			}
+			else
+			{
+				AssetVerdict = TEXT("*** ASSETS PRESENT BUT CreateWidget FAILED. ***");
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] ASSETS: %s"), *AssetVerdict);
+
+			// ---- What was NOT converted, said out loud -------------------------------------------
+			//
+			// Spec v17 4: "Anything you do not convert stays on Canvas and is REPORTED as not
+			// converted." Reported HERE, in the running game, and not only in a report nobody has open
+			// six months from now.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HUDUMG] STILL CANVAS, deliberately: the crosshair and its charge/pass ring; the "
+				     "bottom-LEFT stack (health, weapon, dash charges, parry and the ACTIVATED ABILITY "
+				     "COOLDOWN row); the kill feed; the score/clock panel; the scoreboard; the death panel; "
+				     "every banner; the pause menu; the character select screen."));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HUDUMG] NOTE ON 'COOLDOWNS': the corner this step converted is spec v16 2's ammo + "
+				     "STATUS corner. Cooldowns are not in it and never were - they live in the bottom-left "
+				     "stack because v16 put them there on purpose, so the two never read as one widget "
+				     "(statuses DRAIN, cooldowns FILL). Converting them would have been a redesign."));
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] ====="));
 		}));
 }
 

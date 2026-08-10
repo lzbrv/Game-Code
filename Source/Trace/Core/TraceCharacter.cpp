@@ -343,13 +343,24 @@ namespace TraceCharacterAssets
 	const FName EmissivePowerParam(TEXT("EmissivePower"));
 
 	/**
-	 * The two generated Tron materials, shared with ATraceArenaBuilder. NOT in the repository:
-	 * Scripts/generate_content.py writes them into the gitignored Content/Generated, exactly like
-	 * the arena's copies, and exactly like the arena this degrades to BasicShapeMaterial rather than
-	 * failing - a flat-shaded gun beats no gun.
+	 * The two Tron materials, shared with ATraceArenaBuilder.
+	 *
+	 * COMMITTED FIRST, LEGACY SECOND — and getting this wrong is invisible on a machine that has run
+	 * the generator. Spec v17 §3 promoted these to /Game/Trace/Materials/Parents, which IS in the
+	 * repository; /Game/Generated is the pre-v17 generator output and is GITIGNORED. The arena
+	 * builder was migrated to prefer the committed pair, and this file was missed because it belongs
+	 * to no agent's slice — so on a fresh clone the ARENA rendered correctly while every CHARACTER
+	 * silently degraded to BasicShapeMaterial. That asymmetry is the giveaway if it ever regresses.
+	 *
+	 * A miss on BOTH is still tolerated: MakeViewModelMaterials() falls back to BasicShapeMaterial,
+	 * because a flat-shaded gun beats no gun.
 	 */
-	const TCHAR* const SurfaceMaterialPath = TEXT("/Game/Generated/Materials/M_TraceSurface.M_TraceSurface");
-	const TCHAR* const NeonMaterialPath = TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon");
+	const TCHAR* const SurfaceMaterialPath = TEXT("/Game/Trace/Materials/Parents/M_TraceSurface.M_TraceSurface");
+	const TCHAR* const NeonMaterialPath = TEXT("/Game/Trace/Materials/Parents/M_TraceNeon.M_TraceNeon");
+
+	/** Pre-v17 generator output. Gitignored, so present only on a machine that ran the generator. */
+	const TCHAR* const LegacySurfaceMaterialPath = TEXT("/Game/Generated/Materials/M_TraceSurface.M_TraceSurface");
+	const TCHAR* const LegacyNeonMaterialPath = TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon");
 
 	/** Printed at most once per process, so a missing import is loud but not spam. */
 	const TCHAR* const MissingImportHint =
@@ -872,21 +883,35 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 		}
 	}
 
-	// The generated Tron materials, resolved the same way ATraceArenaBuilder resolves them: a
-	// constructor-time finder so the reference lands on the CDO and the cooker follows it, and a
-	// tolerated miss (the folder is gitignored and produced by Scripts/generate_content.py) that
+	// The Tron materials, resolved the same way ATraceArenaBuilder resolves them: constructor-time
+	// finders so the reference lands on the CDO and the cooker follows it, COMMITTED pair first and
+	// the gitignored legacy pair only as a fallback, and a tolerated miss on both that
 	// MakeViewModelMaterials() turns into a BasicShapeMaterial fallback.
+	//
+	// Separate static finders per path rather than a loop: ConstructorHelpers::FObjectFinder must be
+	// static and is only legal during construction, so each candidate needs its own.
 	{
 		static ConstructorHelpers::FObjectFinder<UMaterialInterface> SurfaceFinder(TraceCharacterAssets::SurfaceMaterialPath);
 		static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TraceCharacterAssets::NeonMaterialPath);
+		static ConstructorHelpers::FObjectFinder<UMaterialInterface> LegacySurfaceFinder(TraceCharacterAssets::LegacySurfaceMaterialPath);
+		static ConstructorHelpers::FObjectFinder<UMaterialInterface> LegacyNeonFinder(TraceCharacterAssets::LegacyNeonMaterialPath);
 
 		if (SurfaceFinder.Succeeded())
 		{
 			SurfaceMaterial = SurfaceFinder.Object;
 		}
+		else if (LegacySurfaceFinder.Succeeded())
+		{
+			SurfaceMaterial = LegacySurfaceFinder.Object;
+		}
+
 		if (NeonFinder.Succeeded())
 		{
 			NeonMaterial = NeonFinder.Object;
+		}
+		else if (LegacyNeonFinder.Succeeded())
+		{
+			NeonMaterial = LegacyNeonFinder.Object;
 		}
 	}
 

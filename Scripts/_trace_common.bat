@@ -51,7 +51,17 @@ if "%TRACE_SCRIPT_DIR:~-1%"=="\" set "TRACE_SCRIPT_DIR=%TRACE_SCRIPT_DIR:~0,-1%"
 for %%I in ("%TRACE_SCRIPT_DIR%\..") do set "TRACE_PROJECT_ROOT=%%~fI"
 set "TRACE_PROJECT_NAME=Trace"
 set "TRACE_UPROJECT=%TRACE_PROJECT_ROOT%\%TRACE_PROJECT_NAME%.uproject"
-set "TRACE_DEFAULT_MAP=/Game/Maps/Arena"
+rem The map Scripts\run-*.bat open when you do not pass --map.
+rem
+rem Spec v17 section 2 promoted the BAKED arena to the default. /Game/Maps/Arena_Baked
+rem is a real level you can open in the editor and edit actor by actor; /Game/Maps/Arena
+rem is the empty level that ATraceArenaBuilder fills in from code at BeginPlay. They
+rem play identically - same field, same volumes, same Core spawn, same ~1291 wall boxes.
+rem
+rem To get the procedural one back for a single run:  --map /Game/Maps/Arena
+rem To change the default back permanently, put "/Game/Maps/Arena" on the line below.
+rem Mirrors TRACE_DEFAULT_MAP in Scripts/_trace_common.sh - change both together.
+set "TRACE_DEFAULT_MAP=/Game/Maps/Arena_Baked"
 set "TRACE_DEFAULT_PORT=7777"
 rem Engine version this project is pinned to. Kept in sync with
 rem "EngineAssociation" in Trace.uproject by hand - if you bump one, bump both.

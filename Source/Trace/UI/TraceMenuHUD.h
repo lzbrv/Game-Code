@@ -1,19 +1,31 @@
 // Trace — title screen.
 //
-// Same rules as the in-game HUD: pure AHUD::DrawHUD Canvas drawing, no UMG, no widget blueprints,
-// no .uasset of any kind. Nothing here touches gameplay — the menu map is empty and this class
-// draws every pixel on it, which is why it can commit to a look instead of negotiating with a
-// scene.
+// TWO RENDERERS, ONE STATE (spec v17 §4).
+//
+// This class has always drawn every pixel of the title screen itself through AHUD::DrawHUD, and it
+// still can. As of the v17 migration it can ALSO drive a real UMG widget —
+// /Game/Trace/UI/Menu/WBP_TitleMenu, backed by UTraceTitleMenuWidget — so that a designer can open
+// the title screen in the editor and move things around instead of editing pixel constants in a
+// .cpp. The switch is `Trace.UI.UseUMG`, and the Canvas path is a LIVE fallback, not a corpse: if
+// the asset is missing, fails to load, or has the wrong shape, the game draws exactly what it drew
+// before and says so in the log (spec v17 §0 rule 1).
+//
+// WHAT DID NOT MOVE, and must not: this class still owns menu *state* — which row is selected,
+// which difficulty, which scoring mode, the press-arms/release-fires mouse contract, the
+// cursor-has-moved discriminator, the activation grace period — and it still owns HIT TESTING. The
+// widget is HitTestInvisible and takes no input whatsoever; it only reports where its rows landed
+// (UTraceTitleMenuWidget::GetRowViewportRect) and this class feeds that into the same RowRects array
+// its own layout maths used to fill. So -TraceAutoPlay, -TraceAutoJoin, -TraceAutoSettings and
+// -TraceMenuClickTest all drive the same code on either renderer.
 //
 // The look is stroke-drawn, not typeset. The engine's built-in fonts are bitmaps and go to mush
-// somewhere around 3x, so the wordmark is a tiny vector font (TraceStrokeFont in the .cpp) made of
-// line segments and drawn at whatever size the viewport wants. Everything smaller — menu rows,
-// hints, the difficulty blurb — uses the bitmap fonts at scales they actually hold up at.
+// somewhere around 3x, so the wordmark is a tiny vector font (TraceStrokeFont in the .cpp, and
+// UTraceStrokeText on the UMG side) made of line segments and drawn at whatever size the viewport
+// wants. Everything smaller — menu rows, hints, the difficulty blurb — uses the bitmap fonts at
+// scales they actually hold up at.
 //
-// This class owns menu *state* (which row is selected, which difficulty is chosen) as well as its
-// presentation. ATraceMenuPlayerController owns nothing but the key bindings and forwards them
-// here; that split keeps the layout maths and the hit testing in one file instead of two copies
-// that drift.
+// ATraceMenuPlayerController owns nothing but the key bindings and forwards them here; that split
+// keeps the layout maths and the hit testing in one file instead of two copies that drift.
 
 #pragma once
 
@@ -31,6 +43,9 @@
 #include "TraceMenuHUD.generated.h"
 
 class UFont;
+class UTraceTitleMenuWidget;
+struct FTraceMenuRowView;
+struct FTraceTitleMenuView;
 
 /** Rows of the title menu, top to bottom. */
 enum class ETraceMenuRow : uint8
@@ -82,7 +97,34 @@ public:
 	//~ Begin AHUD interface
 	virtual void BeginPlay() override;
 	virtual void DrawHUD() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	//~ End AHUD interface
+
+	// ---- Spec v17 §4: which renderer is live, and where its rows landed -------------------------
+	//
+	// Public only so `Trace.UI.VerifyMenu` (UI/Widgets/Menu/TraceMenuUIVerify.cpp) can ask. It has to
+	// ask rather than infer: the whole point of a fallback is that the answer can be "Canvas" for
+	// reasons the caller cannot see from the outside, and a verifier that assumed would report a
+	// clean pass on a build where the assets never loaded at all.
+
+	/** True on frames the UMG widget drew the screen. False means the Canvas path drew it. */
+	bool IsMenuUmgActive() const { return bMenuUmgActive; }
+
+	/** Why the last adoption attempt went the way it did, in one line, for the verifier to print. */
+	const FString& GetMenuUmgStatus() const { return MenuUmgStatus; }
+
+	/** The UMG widget's rect for a row, in viewport pixels. False when there is no widget. */
+	bool GetUmgRowRect(int32 InRowIndex, FBox2D& OutRect) const;
+
+	/**
+	 * The CANVAS layout maths for a row, computed fresh from the current viewport — not a cached
+	 * copy of the last draw.
+	 *
+	 * This is what makes the verifier's comparison meaningful rather than circular: it is the number
+	 * the Canvas renderer WOULD produce this frame, measured against the number Slate actually laid
+	 * the widget out at.
+	 */
+	bool GetCanvasRowRect(int32 InRowIndex, FBox2D& OutRect) const;
 
 	// ---- Input entry points, called by ATraceMenuPlayerController --------------------------------
 
@@ -164,6 +206,18 @@ protected:
 
 	/** One menu row. Returns the row's screen rect so the caller can store it for hit testing. */
 	FBox2D DrawRow(ETraceMenuRow Row, float CenterX, float Y, float Width, bool bSelected);
+
+	// ---- What a row SAYS, once, for both renderers ------------------------------------------------
+	//
+	// Extracted from DrawRow and DrawMenuRows in spec v17 §4. The Canvas path and the UMG path must
+	// put the same words on screen, and the only way to guarantee that is for there to be one place
+	// the words come from. DrawRow now draws a view rather than deciding one.
+
+	/** Label, readout, value, colour and arrow state for @p Row as things currently stand. */
+	void BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRowView& OutView) const;
+
+	/** The line of plain English under the rows, describing whichever row is selected. */
+	FString BuildBlurb() const;
 
 	// ---- Actions ---------------------------------------------------------------------------------
 
@@ -376,6 +430,56 @@ private:
 	UPROPERTY(Transient) TObjectPtr<UFont> FontSmall;
 	UPROPERTY(Transient) TObjectPtr<UFont> FontMedium;
 	UPROPERTY(Transient) TObjectPtr<UFont> FontLarge;
+
+	// ---- Spec v17 §4 — the UMG renderer ----------------------------------------------------------
+
+	/**
+	 * The title screen as a widget, or null when the Canvas path is drawing.
+	 *
+	 * Created lazily on the first DrawHUD rather than in BeginPlay, because the decision depends on
+	 * `Trace.UI.UseUMG` and on an asset load, and a title screen that failed to appear because a
+	 * .uasset was missing would be the worst possible outcome of a migration whose entire promise is
+	 * that the old path still works.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UTraceTitleMenuWidget> MenuWidget;
+
+	/**
+	 * Loads the widget class, creates the widget and adds it to the viewport, ONCE.
+	 *
+	 * @return true when the UMG renderer is available and wanted. False means the Canvas path draws,
+	 *         which is a supported configuration and not an error.
+	 */
+	bool TryAdoptMenuWidget();
+
+	/** Fills @p OutView with this frame's state. Reads state; changes none. */
+	void BuildMenuView(FTraceTitleMenuView& OutView) const;
+
+	/**
+	 * Copies the widget's laid-out row rectangles into RowRects, so hit testing keeps working off
+	 * exactly the same array on both renderers.
+	 *
+	 * Leaves bRowRectsValid alone until EVERY row answers. A half-filled RowRects would make
+	 * RowAtPoint return INDEX_NONE for the rows that had not been laid out yet, and a click on PLAY
+	 * that silently did nothing on the first frame is precisely the class of bug spec v15 §4 spent a
+	 * pass removing.
+	 */
+	void PublishRowRectsFromWidget();
+
+	/** True on frames the widget drew. Read by the verifier; see IsMenuUmgActive(). */
+	bool bMenuUmgActive = false;
+
+	/** Set once, so the adoption decision is logged exactly once per title screen rather than 60x/s. */
+	bool bMenuUmgDecisionLogged = false;
+
+	/**
+	 * What TryAdoptMenuWidget decided last time, so a change of answer is logged and a stale
+	 * MenuUmgStatus cannot outlive it. `Trace.UI.UseUMG 0` typed mid-session is a real thing to do.
+	 */
+	bool bMenuUmgWantedLastDecision = false;
+
+	/** One line explaining the last adoption decision, for `Trace.UI.VerifyMenu`. */
+	FString MenuUmgStatus;
 
 	/**
 	 * The settings overlay, shared verbatim with the in-game pause menu.

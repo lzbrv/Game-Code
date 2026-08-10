@@ -95,6 +95,36 @@ struct FTraceBakedSideTint
  * memory across a save: ScoringModeTag (which of the A/B shapes this belongs to) and SideTints (which
  * of its materials the half-time switch repaints). ATraceArenaBuilder::AdoptBakedArena reads both
  * back on load — see the skip-the-build note on ATraceArenaBuilder::bLevelIsPreBaked.
+ *
+ * ==================================================================================================
+ * THE ONE THING THIS IS NOT: YOU CANNOT SELECT A SINGLE BLOCK INSIDE A PIECE  (spec v17 §2)
+ * ==================================================================================================
+ * MEASURED, on the shipped /Game/Maps/Arena_Baked: of 835 blocks emitted, 659 are INSTANCES inside a
+ * UInstancedStaticMeshComponent rather than components of their own. Every piece is still its own
+ * clickable, labelled, movable actor — that part is real and it is what the bake was for — but the
+ * repetition INSIDE a piece is batched, so you can grab "Bank_Terrace_04" and you cannot grab tile 12
+ * of it.
+ *
+ * WHY, AND IT IS NOT AN OVERSIGHT. Spec v7 §8 rebuilt the arena on instanced meshes because ~1,450
+ * loose static mesh components cost 1.8–3.1 ms of game thread in draw submission alone. Baking every
+ * block back out as its own component would hand all of that straight back, on a frame this project
+ * has repeatedly measured as tight. So the bake splits the difference: a piece's DISTINCT parts (the
+ * dark body, the glowing lip, the collision box) stay as their own named components you can click,
+ * and its REPETITION (the eight corner ribs of a cover block, the hundreds of 5 uu shells that make
+ * the wall cove read as curved) collapses into one instanced component. The threshold is four; see
+ * InstanceCollapseThreshold in TraceArenaBake.cpp.
+ *
+ * WHAT TO DO INSTEAD, in rough order of how often you will want it:
+ *   * Move / rotate / delete the WHOLE PIECE — works, that is the normal edit.
+ *   * Change what a batch is made of — select the UInstancedStaticMeshComponent in the Details panel
+ *     and change its Static Mesh or its Material. Every instance in it follows.
+ *   * Move ONE instance — expand the instanced component's Instances array in the Details panel and
+ *     edit that entry's transform. Fiddly, but it is there.
+ *   * Need real per-block actors for a section? Raise BakeMaxPiecesPerName on the builder, or lower
+ *     InstanceCollapseThreshold, and re-bake. Expect the frame cost back.
+ *
+ * EVERY PIECE REPORTS ITS OWN SITUATION in the Details panel — see EditingNote below, which is where
+ * a designer actually meets this rather than in a spec nobody opens.
  */
 UCLASS()
 class TRACE_API ATraceBakedPiece : public AActor
@@ -119,4 +149,31 @@ public:
 	/** Surfaces on this piece that the half-time side switch repaints. Usually empty. */
 	UPROPERTY(EditAnywhere, Category = "Trace|Baked")
 	TArray<FTraceBakedSideTint> SideTints;
+
+#if WITH_EDITORONLY_DATA
+	/**
+	 * WHAT YOU CAN AND CANNOT CLICK ON THIS PIECE, in plain words, in the Details panel.
+	 *
+	 * THIS IS THE ANSWER TO SPEC v17 §2's "this is written down nowhere". The batching caveat above
+	 * used to live only in a C++ comment and a spec document, so the first person to discover it was
+	 * whoever spent twenty minutes trying to select one tile of a terrace. Now the piece says so
+	 * itself, at the moment you select it, with ITS OWN numbers rather than the arena's average.
+	 *
+	 * Transient and rebuilt from the actual components every time the actor registers, so it can
+	 * never go stale against an edit and it never dirties the package — you will not be asked to save
+	 * a level just because you looked at it.
+	 */
+	UPROPERTY(VisibleAnywhere, Transient, Category = "Trace|Baked",
+		meta = (DisplayName = "Editing Note", MultiLine = true))
+	FString EditingNote;
+#endif
+
+	//~ AActor
+	virtual void PostRegisterAllComponents() override;
+	//~ End AActor
+
+#if WITH_EDITOR
+	/** Recomputes EditingNote from the components actually on this actor. Editor only. */
+	void RefreshEditingNote();
+#endif
 };

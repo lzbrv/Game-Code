@@ -18,6 +18,7 @@
 class ADirectionalLight;
 class APostProcessVolume;
 class ASkyLight;
+class ATraceCoreSpawn;
 class ATraceEndzone;
 class ATraceTeamPlayerStart;
 class UBoxComponent;
@@ -153,13 +154,18 @@ class UStaticMeshComponent;
  *  - Client-and-listen-server-only pieces: lights, fog, post process, every mesh. A dedicated
  *    server builds collision only.
  *
- * ASSET DEPENDENCY
- * ----------------
- * The two materials live at /Game/Generated/Materials/ and are produced by
- * Scripts/generate_content.py, not committed (Content/Generated/ is gitignored - the repo stays
- * text-only, see the policy note at the top of that script). If they are missing the builder falls
- * back to /Engine/BasicShapes/BasicShapeMaterial and logs a warning: the arena still plays, it just
- * renders flat and lit instead of neon.
+ * ASSET DEPENDENCY  (spec v17 §3)
+ * ------------------------------
+ * The two parent materials are COMMITTED ASSETS at /Game/Trace/Materials/Parents/, authored by
+ * Scripts/generate_content.py. The old note here said they lived in the gitignored
+ * Content/Generated/ because "the repo stays text-only" - that policy is retired; the repo has
+ * shipped a 639-file baked map since spec v15, and spec v17 §3 requires that nothing the game ships
+ * depends on a gitignored asset.
+ *
+ * Three arms, in order, all in ResolveArenaMaterials(), and the one that answered is LOGGED:
+ *   1. /Game/Trace/Materials/Parents/M_*        committed, cooked, normal.
+ *   2. /Game/Generated/Materials/M_*            legacy generator output, dev machines only.
+ *   3. /Engine/BasicShapes/BasicShapeMaterial   flat and lit. The arena plays; it is not neon.
  */
 UCLASS()
 class TRACE_API ATraceArenaBuilder : public AActor
@@ -183,8 +189,21 @@ public:
 	 */
 	static ATraceArenaBuilder* Get(const UWorld* World);
 
-	/** World-space point the Core spawns at and resets to: just above the centre pedestal. */
+	/**
+	 * World-space point the Core spawns at and resets to.
+	 *
+	 * A PLACED ATraceCoreSpawn IN THE LEVEL WINS (spec v17 §2, closing spec v15 §1.4). With no marker
+	 * this is the derived point it has always been: just above the centre pedestal. Either way it is
+	 * the ONE answer — ATraceGameMode::SpawnCoreIfNeeded and ATraceCore::GetHomeLocation() both come
+	 * through here, so kickoff, reset-after-score and the "is the Core home" test cannot disagree.
+	 */
 	FVector GetCoreSpawnLocation() const;
+
+	/**
+	 * The placed Core spawn marker, or null when the level has none (which is the normal state of
+	 * /Game/Maps/Arena). Warns, once per resolve, if there is more than one.
+	 */
+	ATraceCoreSpawn* FindPlacedCoreSpawn() const;
 
 	/** World-space playable volume: floor to wall top, inside faces of the four walls. */
 	FBox GetFieldBounds() const;
@@ -439,6 +458,20 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Trace|Bake")
 	void BakeArenaIntoLevel();
+
+	/**
+	 * Places the Core spawn marker in this level if it does not already have one, at whatever
+	 * GetCoreSpawnLocation() currently answers. Editor only, idempotent, safe to press twice.
+	 *
+	 * WHY THIS IS A SEPARATE BUTTON AND NOT JUST PART OF A BAKE (spec v17 §2). A full re-bake
+	 * rewrites all ~572 external actor packages, which is ~5.4 MB of LFS churn and throws away every
+	 * hand edit anybody has made to the level. Adding the one actor spec v15 §1.4 asked for should
+	 * not cost that. So: press this on the builder in an already-baked level, save, done — one new
+	 * package, nothing else touched. Scripts/bake-arena.sh --add-core-spawn does exactly that
+	 * headlessly, and a fresh bake places the marker on its own.
+	 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Trace|Bake")
+	void EnsureCoreSpawnActor();
 #endif
 
 	// The two bake dials are OUTSIDE the #if WITH_EDITOR above on purpose: UnrealHeaderTool rejects a
@@ -1338,6 +1371,15 @@ protected:
 	void AddPylon(const FVector2D& LocalCentre, float Side, float Height,
 		UMaterialInstanceDynamic* BodyMID, UMaterialInstanceDynamic* NeonMID, const TCHAR* DebugName);
 
+	/**
+	 * Resolves SurfaceMaterial/NeonMaterial and logs which of the three arms answered.
+	 *
+	 * Committed parents (constructor FObjectFinder) -> legacy /Game/Generated (runtime LoadObject,
+	 * deliberately NOT a finder so the cooker never records a gitignored dependency) -> the engine
+	 * grey. Spec v17 §0 rule 1. Idempotent; safe to call from any build or adopt path.
+	 */
+	void ResolveArenaMaterials();
+
 	/** Dark lit structural surface. All parameters are M_TraceSurface's; see generate_content.py. */
 	UMaterialInstanceDynamic* MakeSurfaceMID(const FLinearColor& BaseColor, float Roughness,
 		float Metallic = 0.f, const FLinearColor& Emissive = FLinearColor::Black, float EmissiveStrength = 1.f);
@@ -1567,6 +1609,16 @@ private:
 	static void SetBakedActorsPresented(const TArray<TWeakObjectPtr<ATraceBakedPiece>>& Actors, bool bPresented);
 
 	/**
+	 * Resolved answer for FindPlacedCoreSpawn(), so the level is not swept on every kickoff.
+	 *
+	 * MUTABLE because GetCoreSpawnLocation() is const and must stay const - ATraceCore asks it from a
+	 * const accessor. Weak rather than strong so that deleting the marker in the editor re-resolves
+	 * instead of returning a dangling answer, and not a UPROPERTY for the same reason the instance
+	 * pools are not: this is a cache of something the world already owns.
+	 */
+	mutable TWeakObjectPtr<ATraceCoreSpawn> PlacedCoreSpawn;
+
+	/**
 	 * Every ATraceEndzone this builder spawned, both shapes, server only.
 	 *
 	 * Weak, and separate from SpawnedActors (which owns them): ApplyScoringMode has to arm one pair
@@ -1600,11 +1652,11 @@ private:
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> BaseMaterial;
 
-	/** /Game/Generated/Materials/M_TraceSurface - see the asset note in the class comment. */
+	/** /Game/Trace/Materials/Parents/M_TraceSurface - see the asset note in the class comment. */
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> SurfaceMaterial;
 
-	/** /Game/Generated/Materials/M_TraceNeon. */
+	/** /Game/Trace/Materials/Parents/M_TraceNeon. */
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> NeonMaterial;
 

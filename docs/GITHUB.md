@@ -8,6 +8,33 @@ do not transfer are the ones that will cost you a weekend. This document is abou
 **The one-sentence version:** in Unreal, source code merges fine and content does not merge at all,
 so the team uses branches for code and *file locks* for content, and never the other way round.
 
+### The whole thing on one screen
+
+If you read nothing else, read this. Everything below is the reasoning behind it.
+
+```bash
+# CODE (Source/, Config/, Scripts/, docs/) — normal Git. Branch, PR, merge.
+git checkout -b feat/<name>/<thing>   &&   gh pr create --fill
+
+# CONTENT (anything under Content/) — never branch it. Lock it.
+git pull                              # 1. always first
+Scripts/lock.sh Cover_37              # 2. BEFORE you open it in the editor
+#    ... edit in Unreal, save ...
+git add -A && git commit && git push  # 3. push BEFORE you unlock
+Scripts/unlock.sh Cover_37            # 4. immediately after pushing
+```
+
+| The rule | Why, in one line |
+|---|---|
+| **Lock before you edit, not before you save** | A `.uasset` cannot be merged; after the fact, someone's work is simply deleted. |
+| **Assets are read-only until you lock** | That is the enforcement, not a bug. Never `chmod` it away. |
+| **Lock the ACTOR, not the map** | `Arena_Baked` is One File Per Actor, so two people can edit it at once (§4.4). |
+| **Push before you unlock, unlock as soon as you push** | A held lock blocks a teammate silently. |
+| **Everyone on the same engine version — 5.8** | One save from a newer editor locks everybody out of that asset, permanently (§8). |
+| **Never commit `Saved/`, `Intermediate/`, `Binaries/`, `DerivedDataCache/`** | All generated, all huge, all guaranteed conflicts (§2). |
+| **Never commit an `EngineAssociation` change** | It silently repoints the whole team's engine (§8). |
+| **`main` always builds** | If you break it, fixing it is your only job. |
+
 ---
 
 ## 1. Why Unreal breaks the normal Git workflow
@@ -50,7 +77,7 @@ This is not us being cautious. It is the reason most Unreal studios eventually l
 | `Trace.uproject` | Project descriptor. Watch `EngineAssociation` — see §8. |
 | `Source/**` | All C++, `.Build.cs`, `.Target.cs`. This is the actual work. |
 | `Config/*.ini` | Project settings, gameplay tunables, input config. **Text — merges fine.** |
-| `Content/**` | Assets. Via LFS. For Trace this is one empty `Arena.umap`. |
+| `Content/**` | Assets. Via LFS, and lockable. 641 files today — see §2.1. |
 | `Scripts/**`, `docs/**`, `README.md` | Text. |
 | `.gitignore`, `.gitattributes` | Critical. Commit these **first**, before anything else. |
 | `Plugins/**` (source of plugins we author) | Same rules as `Source/`. |
@@ -77,6 +104,47 @@ The repo already contains a `.gitignore` covering all of the above. Do not "fix"
 `Binaries/` back because a build failed. It failed for a different reason.
 
 If you have already committed one of them by accident, see §10.
+
+### 2.1 What is actually in this repo — measured, not assumed
+
+**This repo is no longer asset-free.** Earlier versions of this document said it was, and that
+sentence is why you may have been told locking does not matter here. It does now.
+
+Measured on 2026-08-09 at commit `a1f8a7f`:
+
+| | Files | LFS bytes | Share |
+|---|---:|---:|---:|
+| `Content/__ExternalActors__/` — one `.uasset` per actor of `Arena_Baked` | 572 | 4.80 MiB | 93% |
+| `Content/Trace/Materials/` — `M_TraceSurface`, `M_TraceNeon` + 64 instances | 66 | 0.32 MiB | 6% |
+| `Content/Maps/` — `Arena.umap`, `Arena_Baked.umap`, `MainMenu.umap` | 3 | 19 KB | 0.4% |
+| **Total in LFS** | **641** | **5.14 MiB** | |
+| Everything else (C++, scripts, docs, config) — plain Git, 810 tracked files total | 169 | — | |
+
+A fresh full clone therefore costs about **8.3 MiB**: 3.12 MiB of Git objects plus 5.14 MiB of LFS
+payload. Of that, only the 5.14 MiB counts against the LFS bandwidth quota (§5).
+
+Reproduce any of it yourself:
+
+```bash
+git lfs ls-files | wc -l     # 641 — files stored in LFS
+git ls-files    | wc -l      # 810 — files tracked in total
+git lfs ls-files -s          # every LFS file with its size, one per line
+du -sh .git/lfs/objects      # 6.4M on disk — see the note below
+```
+
+`du` reads **6.4M** rather than 5.14 MiB, and that is not a contradiction: `du` counts allocated
+disk blocks, and 641 mostly-small files each round up to a 4 KB block. The 5.14 MiB figure is the
+sum of the actual file sizes, which is what GitHub bills and what a clone transfers. The gap is a
+property of your filesystem, not of the repository.
+
+Two facts worth holding on to:
+
+- **Every one of the 641 binaries went into LFS, not into Git.** `git ls-files '*.uasset' '*.umap'`
+  and `git lfs ls-files` both return 641, and the sets match. Nothing slipped past `.gitattributes`.
+- **Across all 24 commits there are still only 641 unique LFS objects.** Nobody has re-saved a map
+  yet. That is why storage today equals the working-tree size — and it is exactly what stops being
+  true the first time someone opens `Arena_Baked`, moves a wall and commits: that version is added,
+  the old one is kept forever, and the repo grows by the size of every actor that changed.
 
 ---
 
@@ -111,12 +179,16 @@ Here is the shape of it, so you understand what you are looking at:
 # <ext> filter=lfs diff=lfs merge=lfs -text   → store in LFS, never try to diff or merge it
 # lockable                                     → checked out READ-ONLY until you take a lock
 
+# Merge-hostile things a person opens and edits in place — LFS *and* lockable:
 *.uasset  filter=lfs diff=lfs merge=lfs -text lockable
 *.umap    filter=lfs diff=lfs merge=lfs -text lockable
 *.fbx     filter=lfs diff=lfs merge=lfs -text lockable
-*.png     filter=lfs diff=lfs merge=lfs -text lockable
-*.wav     filter=lfs diff=lfs merge=lfs -text lockable
-# ... plus the other binary media extensions
+*.psd     filter=lfs diff=lfs merge=lfs -text lockable
+*.blend   filter=lfs diff=lfs merge=lfs -text lockable
+
+# Binary, but exported rather than co-edited — LFS, NOT lockable:
+*.png     filter=lfs diff=lfs merge=lfs -text
+*.wav     filter=lfs diff=lfs merge=lfs -text
 
 # Explicitly NOT lfs, NOT lockable — these are text and must merge normally:
 *.ini     text
@@ -124,6 +196,11 @@ Here is the shape of it, so you understand what you are looking at:
 *.h       text
 *.cs      text
 ```
+
+**Why `.png` is not lockable but `.psd` is.** `lockable` makes the file read-only in *everyone's*
+working tree, which is a real cost — it should be paid only for files a human opens and edits in
+place. A `.psd` is authored; the `.png` beside it is exported from it. Lock the source, not the
+export. If we ever start hand-editing PNGs, that rule changes.
 
 Two things to internalise:
 
@@ -151,8 +228,41 @@ This is why `.gitattributes` must be the first commit in the repo.
 ```bash
 git lfs ls-files            # lists files actually stored in LFS
 git lfs status              # what's staged, and whether it's going to LFS
-git check-attr -a Content/Maps/Arena.umap   # should show filter: lfs, lockable: set
+git check-attr filter lockable -- <file>    # why is this file treated the way it is
 ```
+
+`check-attr` is the only real proof, so here it is run against the three kinds of asset this repo
+now contains — a level, an ordinary asset, and one of the One File Per Actor packages (§4.4).
+This is verbatim output, not an example of what you might see:
+
+```
+$ git check-attr filter lockable -- Content/Maps/Arena_Baked.umap
+Content/Maps/Arena_Baked.umap: filter: lfs
+Content/Maps/Arena_Baked.umap: lockable: set
+
+$ git check-attr filter lockable -- Content/Trace/Materials/Instances/MI_Neon_Bank_Contour.uasset
+Content/Trace/Materials/Instances/MI_Neon_Bank_Contour.uasset: filter: lfs
+Content/Trace/Materials/Instances/MI_Neon_Bank_Contour.uasset: lockable: set
+
+$ git check-attr filter lockable -- Content/__ExternalActors__/Maps/Arena_Baked/0/0Y/DHAHYUYNR63XVN364NOAXU.uasset
+Content/__ExternalActors__/Maps/Arena_Baked/0/0Y/DHAHYUYNR63XVN364NOAXU.uasset: filter: lfs
+Content/__ExternalActors__/Maps/Arena_Baked/0/0Y/DHAHYUYNR63XVN364NOAXU.uasset: lockable: set
+```
+
+`filter: lfs` means the bytes live in LFS. `lockable: set` means the file is checked out read-only
+until somebody takes the lock. You can see the second one on disk:
+
+```
+$ stat -f '%Sp %N' Content/Maps/Arena_Baked.umap
+-r--r--r-- Content/Maps/Arena_Baked.umap
+```
+
+That `r--` is not a mistake and you should not `chmod` it away. It is the enforcement.
+
+**One thing that looks alarming and is not.** `git check-attr -a` on a `.uasset` also prints
+`eol: lf`, inherited from the `* text=auto eol=lf` default at the top of `.gitattributes`. It is
+inert: the same line prints `text: unset`, because the rule for `.uasset` says `-text`, and `eol`
+only has any effect when `text` is set. No newline conversion happens to your binaries.
 
 If `git lfs ls-files` is empty but you have `.uasset` files committed, they went in as raw Git
 objects. Stop and fix it (§10) before the repo grows.
@@ -164,44 +274,194 @@ objects. Stop and fix it (§10) before the repo grows.
 This is the part that replaces branching for content. It takes ten seconds and it prevents the one
 failure mode that has no recovery.
 
-```bash
-# BEFORE you open an asset to edit it:
-git lfs lock Content/Maps/Arena.umap
+### 4.1 Why you lock *before* editing, and not after
 
-# See who holds what, across the whole team:
+Re-read §1 if you skimmed it, because the whole workflow follows from one fact: **a `.uasset`
+cannot be merged.** Not "merges badly" — there is no merge algorithm for a serialised binary object
+graph, and Git does not pretend otherwise. When two people edit one asset, Git offers you exactly
+two outcomes: keep mine, or keep theirs. One person's afternoon is deleted.
+
+Every other version-control habit you have assumes that a bad outcome can be repaired afterwards.
+This one cannot. So the enforcement has to happen *before* the work, which is what a lock is: a
+claim registered on the server saying "I am the only person editing this file right now."
+
+The mechanism is blunt and effective. Files marked `lockable` in `.gitattributes` are checked out
+**read-only** — `-r--r--r--`, as shown in §3. Unreal sees a read-only file and refuses to save over
+it. So the failure mode is a small annoyance at the start ("why can't I save?") instead of lost work
+at the end. Taking the lock is what flips your copy to writable:
+
+```
+$ stat -f '%Sp %N' <the asset>
+-r--r--r-- ...                 # before: read-only, for everyone
+
+$ git lfs lock <the asset>
+Locked <the asset>
+
+$ stat -f '%Sp %N' <the asset>
+-rw-r--r-- ...                 # after: writable, for you only
+```
+
+### 4.2 The loop
+
+```bash
+# 0. Always start here. You want to lock the newest version of the file,
+#    not the one you happened to have on disk from last week.
+git pull
+
+# 1. BEFORE you open the asset in the editor:
+Scripts/lock.sh Content/Maps/Arena_Baked.umap      # or: git lfs lock <path>
+
+# 2. See who holds what, across the whole team, at any time:
 git lfs locks
 
-# Edit, save, commit, push as normal:
-git add Content/Maps/Arena.umap
+# 3. Edit in Unreal, save, commit, push as normal:
+git add -A
 git commit -m "Arena: widen the endzones"
 git push
 
-# THEN release it — immediately. Do not hold locks overnight.
-git lfs unlock Content/Maps/Arena.umap
+# 4. THEN release it — immediately. Do not hold locks overnight.
+Scripts/unlock.sh Content/Maps/Arena_Baked.umap    # or: git lfs unlock <path>
 ```
+
+`git lfs locks` prints one line per lock — the file, who holds it, and the lock ID you need if you
+ever have to force it:
+
+```
+$ git lfs locks
+Content/__ExternalActors__/Maps/Arena_Baked/3/NV/E0T93XXVAQZHVSCVX0S44T.uasset	gregory-karaev	ID:48121353
+```
+
+Empty output means nobody holds anything, which is what it should look like most of the time.
 
 The rules, in order of importance:
 
 1. **Lock before you open the asset in the editor, not before you save.** By the time you save you
    have already done the work someone else is also doing.
-2. **Push before you unlock.** Unlocking before pushing means someone locks it, edits the old
-   version, and you both have divergent binaries.
-3. **Unlock as soon as you have pushed.** A forgotten lock blocks a teammate silently.
-4. **`git pull` before locking.** You want the latest version of the file you are about to become
-   the sole author of.
+2. **Push before you unlock.** Unlocking before pushing means someone locks it, edits the version
+   you have already superseded, and now there are two divergent binaries and no way to combine them.
+3. **Unlock as soon as you have pushed.** A forgotten lock blocks a teammate silently — all they see
+   is a read-only file with no explanation attached.
+4. **`git pull` before locking.** You are about to become the sole author of that file; start from
+   the newest copy.
 5. If someone else holds the lock: **wait, or talk to them.** Do not force it.
 
-Force-unlocking someone else's lock (only when they are unreachable, and say so in chat first):
+**You need Write access to the repository to take a lock.** Read-only collaborators cannot lock,
+which quietly defeats the entire workflow — check this when you add someone to the team (§11).
 
-```bash
-git lfs locks                            # get the lock ID
-git lfs unlock --id=<id> --force
+### 4.3 When someone is on holiday and still holding a lock
+
+This will happen. The honest first answer is **work on something else** — that is why locks are
+supposed to be short, and it is the correct answer if the person is merely asleep or at lunch.
+
+When it is genuinely blocking and they are genuinely unreachable:
+
+1. **Post in chat first**, naming the file, and wait a reasonable time. This is not ceremony: if
+   they have the editor open with unsaved changes, forcing the lock is how that work dies.
+2. Then break it:
+
+   ```bash
+   git lfs locks                            # find the file and its ID
+   git lfs unlock --id=48121353 --force     # by ID
+   # or, equivalently, by path:
+   Scripts/unlock.sh --force Content/Maps/Arena_Baked.umap
+   ```
+
+3. **Say in chat which file you forced.** The person who comes back needs to know to `git pull`
+   before they open anything, or they will save over your work and re-create the problem in the
+   other direction.
+
+**Who is allowed to force:** whoever is unblocked by it, after step 1. There is no approver and no
+ticket. The obligation is the announcement, not the permission.
+
+What `--force` actually does: it deletes the lock record on the server and makes the file writable
+for everybody again. It does not merge, does not notify, and does not touch any file contents. It
+simply removes the guarantee — from that moment, two people can edit the file and one of them will
+lose.
+
+`Scripts/unlock.sh --force` will make you type the word `force` at a prompt before it proceeds, for
+exactly this reason.
+
+### 4.4 One File Per Actor — why two people *can* edit the arena at once
+
+This is the part of the migration nobody has been told about, and it is the whole payoff.
+
+`/Game/Maps/Arena_Baked` has **Use External Actors** turned on. That means the level is not one big
+`.umap`. It is a **6.6 KB `.umap`** plus **one `.uasset` per actor** — 572 of them — living under:
+
+```
+Content/__ExternalActors__/Maps/Arena_Baked/<2 chars>/<2 chars>/<guid>.uasset
 ```
 
-That does not merge anything. It just makes the file writable again. Whoever was editing it is
-about to have a bad time — hence "talk first."
+Compare the two worlds:
 
-### From inside the Unreal editor
+| | Without OFPA | With OFPA (what we have) |
+|---|---|---|
+| The level on disk | one `.umap`, all actors inside it | 6.6 KB `.umap` + 572 separate `.uasset` files |
+| To move one cover block | lock the whole level | lock that one actor's file |
+| Meanwhile, everyone else | blocked from the entire arena | unaffected |
+
+So this is now a normal Tuesday:
+
+- Ana locks `Cover_37`, nudges it out of a sightline, pushes, unlocks.
+- At the same time Ben locks `Goal_Ring_Rim_12`, raises it, pushes, unlocks.
+- **Neither of them ever notices the other.** Two different files, two different locks, no conflict,
+  nothing to merge. Before OFPA this was one lock and one of them waited.
+
+**You lock the ACTOR, not the MAP.** Locking `Content/Maps/Arena_Baked.umap` is almost always the
+wrong move: it is a 6.6 KB file that hardly ever changes, and locking it blocks nobody from anything
+useful. Lock it only when you are changing something level-wide — World Settings, the level
+Blueprint, or a lighting build — because those genuinely do live in the `.umap`.
+
+**The problem: the filenames are unreadable.** `E0T93XXVAQZHVSCVX0S44T.uasset` tells you nothing.
+Those GUID names are the engine's, not ours, and there is no renaming them. What you actually know
+is the **label in the World Outliner** — `Cover_37`, `Wall_North_01`, `Goal_Ring_Rim_12`. Two ways
+to get from one to the other:
+
+**a) From the editor (preferred).** Set up the Git provider (§4.6), then right-click the actor in
+the World Outliner → **Revision Control → Check Out**. The editor knows which package backs that
+actor and takes the LFS lock on it for you. This is the route to teach a designer; they never see a
+GUID at all.
+
+**b) From a terminal.** `Scripts/lock.sh` takes the label and finds the file:
+
+```
+$ Scripts/lock.sh Cover_37
+[trace] Actor Cover_37 lives in Content/__ExternalActors__/Maps/Arena_Baked/3/NV/E0T93XXVAQZHVSCVX0S44T.uasset
+==> git lfs lock Content/__ExternalActors__/Maps/Arena_Baked/3/NV/E0T93XXVAQZHVSCVX0S44T.uasset
+Locked Content/__ExternalActors__/Maps/Arena_Baked/3/NV/E0T93XXVAQZHVSCVX0S44T.uasset
+```
+
+It works by searching the package bytes for the label, and it **refuses to guess**: an ambiguous
+label prints every match and stops rather than locking the wrong actor.
+
+**Actor labels are zero-padded to two digits.** It is `Cover_37`, not `Cover_037`. Earlier versions
+of these docs used `Cover_037` as the example and no such actor exists — if a lookup comes back
+empty, check that first, then check the spelling in the World Outliner.
+
+### 4.5 The helper scripts
+
+`Scripts/lock.sh` and `Scripts/unlock.sh` are thin wrappers over `git lfs lock` / `git lfs unlock`.
+They print the raw `git` command before running it, so they teach the underlying command rather than
+hiding it. Everything they do, you can do by hand.
+
+```bash
+Scripts/lock.sh Cover_37                    # by actor label
+Scripts/lock.sh Content/Maps/MainMenu.umap  # by path
+Scripts/lock.sh --list                      # same as: git lfs locks
+Scripts/lock.sh --dry-run Cover_37          # show the command, run nothing
+
+Scripts/unlock.sh Cover_37
+Scripts/unlock.sh --force <path>            # holiday case (§4.3); prompts first
+```
+
+`lock.sh` also warns you if the file you are locking is **not** marked `lockable`, because such a
+lock is recorded on the server but leaves the file writable for everyone else — it protects nothing,
+and silently believing you are protected is worse than knowing you are not.
+
+**These are `.sh` only — there is no `lock.bat`.** Windows collaborators use `git lfs lock <path>`
+directly, or run these from Git Bash. The locks themselves are server-side and identical either way.
+
+### 4.6 From inside the Unreal editor
 
 Unreal has a built-in Git source-control provider that drives all of this from the UI, which is
 much more pleasant than remembering to run commands.
@@ -217,8 +477,11 @@ policy people follow and a policy people forget at 1 a.m.
 
 ## 5. GitHub's LFS quota — the numbers, and the wall
 
-Verified against GitHub's current billing documentation (August 2026). **These numbers changed
-recently** — a lot of blog posts and older docs still quote 1 GiB, which was the figure for years.
+Verified against GitHub's current billing documentation, re-checked 2026-08-09. **These numbers
+changed** — a great many blog posts, older docs, and one earlier draft of the Trace migration brief
+still quote **1 GiB storage + 1 GiB/month and $5 data packs**, which was the arrangement for years
+and is now wrong in both the allowance and the billing model. If you are reading a figure from
+anywhere else, check the date on it.
 
 | Plan | Included LFS storage | Included LFS bandwidth |
 |---|---|---|
@@ -252,14 +515,61 @@ Three things eat it far faster than people expect:
    handful of audio stems and a few weeks of level iteration puts you past 10 GiB comfortably
    inside a month of real production.
 
-**Trace is fine right now** — it is deliberately asset-free, so LFS holds essentially one empty
-`.umap`. You will not notice the quota this month. **You will notice it the week someone imports
-real art.** Treat the current comfort as temporary.
+### Where Trace actually stands — the arithmetic
 
-Check usage: GitHub → Settings → **Billing and plans** → look for Git LFS Data. Watch it. Running
-out of bandwidth mid-month means **nobody on the team can clone or pull LFS content until the quota
-resets or someone pays.** That is a hard stop on the whole team, and it always happens at the worst
-moment.
+Earlier versions of this section said Trace was "deliberately asset-free, so LFS holds essentially
+one empty `.umap`." **That is no longer true** — see §2.1. Here is the real position, and the
+tripwires that matter.
+
+**Storage used today: 5.14 MiB of the 10 GiB included.** That is 0.05%. Not close to binding.
+
+**A full fresh clone costs 5.14 MiB of bandwidth** (the LFS payload; the 3.12 MiB of Git objects
+does not count against the LFS quota). So:
+
+| Scenario | LFS bandwidth | Share of the 10 GiB month |
+|---|---:|---:|
+| One person clones once | 5.14 MiB | 0.05% |
+| Four people each clone once | 20.6 MiB | 0.2% |
+| Four people re-clone *every day for a month* | 617 MiB | 6% |
+
+At today's size you would need roughly **1,990 full clones in one month** to exhaust the bandwidth
+allowance. Re-cloning is not currently a risk. It is worth knowing *why* it is not, because the
+thing that changes is the repo size, not the habit:
+
+> **The tripwire:** bandwidth binds when *(repo LFS size) × (clones and `git lfs pull`s per month)*
+> exceeds 10 GiB. For four developers pulling fresh a couple of times a week — call it 32 clones a
+> month — the repo can reach about **320 MiB** before that starts to bite. Today it is 5 MiB. A
+> single imported character with textures is ~500 MB.
+
+So the honest summary is: **four people re-cloning is the risk that arrives the month someone
+imports real art, not the risk you have today.** One character import takes the repo past the point
+where habitual re-cloning costs real money, and it does so in a single commit.
+
+**Storage has a different shape, and it is the one this project will hit first.** Storage counts
+every version forever. Right now all 641 LFS objects are first versions — nobody has re-saved a map.
+The moment `Arena_Baked` starts being edited, every actor you touch adds a new permanent copy, and a
+full re-bake rewrites all 572 external actors: **~4.8 MiB per re-bake, kept forever.** That is
+~2,100 re-bakes to fill 10 GiB, so the arena alone will not do it — but iterating on real textures
+fifty times will.
+
+### When you have to pay, and how
+
+**There are no data packs to buy any more.** GitHub removed the pre-paid $5/50 GiB packs and
+replaced them with metered billing, so there is no purchase to make and no button to press: you
+cross the included 10 GiB and the overage simply bills to the account. The practical consequences:
+
+- **Nothing blocks at the moment you cross the line** if metered billing is enabled — it bills.
+- **If spending limits are set to zero** (which is the default on a personal account that has never
+  configured billing), you do not get billed — you get **cut off**. Running out of LFS bandwidth
+  mid-month means **nobody on the team can clone or pull LFS content** until the quota resets or
+  someone raises the limit. That is a hard stop on all four of you, and it always lands at the worst
+  moment.
+- Because the quota is **account-wide**, it is shared with every other repository on the account
+  that uses LFS. Somebody else's video-heavy side project spends the same 10 GiB.
+
+**What to actually do:** check GitHub → Settings → **Billing and plans** → *Git LFS Data* once a
+month, and again the week anyone imports art. Decide the spending-limit question *before* you need
+it, not while four people are blocked.
 
 ---
 
@@ -323,10 +633,13 @@ Perforce server, especially given four people and no ops appetite.
 
 ### Recommendation for Trace, right now
 
-**Stay on GitHub + LFS + locking.** The project is asset-free by design and the quota is not close
-to binding. Revisit the moment someone says the words "I'm importing the character model." Migrating
-later is annoying but entirely doable; migrating *after* burning three months of LFS bandwidth is
-annoying *and* expensive.
+**Stay on GitHub + LFS + locking.** The project now has 5.14 MiB of real assets (§2.1) and the quota
+is nowhere near binding — 0.05% of storage. What has changed is that the *workflow* now matters:
+locking was theoretical when there was nothing to lock, and it is not any more.
+
+Revisit the hosting question the moment someone says the words "I'm importing the character model."
+Migrating later is annoying but entirely doable; migrating *after* burning three months of LFS
+bandwidth is annoying *and* expensive.
 
 ---
 
@@ -488,12 +801,18 @@ git lfs pull
 ### "Someone else has the level locked and they're asleep"
 
 Work on something else. Genuinely — that is the correct answer, and it is why locks should be short.
-If it is blocking and they are unreachable, post in chat, then:
+
+If they are unreachable rather than asleep and it is genuinely blocking, **§4.3 is the full
+procedure** — post in chat naming the file, wait, then break it and say that you did:
 
 ```bash
-git lfs locks
+git lfs locks                            # find the file and its ID
 git lfs unlock --id=<id> --force
 ```
+
+Also check whether they are holding the *map* when they only needed one *actor* — under One File Per
+Actor that is usually an unnecessary lock, and pointing it out fixes the problem permanently rather
+than once (§4.4).
 
 ### "Merge conflict on a `.uasset`"
 
@@ -523,8 +842,13 @@ Nothing in those directories is authored. You cannot lose work this way.
 
 ## 11. First-time repo bootstrap
 
-`lzbrv/Game-Code` is currently empty. Doing this in the right order matters, because
-`.gitattributes` must exist **before** any binary is added, or the binary bypasses LFS forever.
+**This is already done.** `lzbrv/Game-Code` has 24 commits on `main`, and all 641 binaries went
+into LFS correctly — verified in §2.1. You do not need to run any of this. It is recorded because
+the *order* is the part people get wrong, and because you will need it if you ever start a second
+repo.
+
+The rule: `.gitattributes` must exist and be committed **before** any binary is added, or that
+binary bypasses LFS permanently and only a history rewrite gets it back (§10).
 
 ```bash
 cd ~/trace
@@ -536,28 +860,26 @@ git init -b main
 git add .gitattributes .gitignore
 git commit -m "Add .gitattributes (LFS + locking) and .gitignore"
 
-# 2. Verify the rules actually apply before adding anything binary.
-git check-attr -a Content/Maps/Arena.umap
-#   expect: filter: lfs / diff: lfs / merge: lfs / text: unset / lockable: set
+# 2. Verify the rules actually apply BEFORE adding anything binary.
+git check-attr filter lockable -- Content/Maps/Arena.umap
+#   expect: filter: lfs / lockable: set
 
 # 3. Now everything else.
 git add .
 git status                       # eyeball it: no Binaries/, Intermediate/, DerivedDataCache/, Saved/
-git commit -m "Trace: C++ prototype, arena built at runtime, no binary assets"
+git commit -m "Trace: C++ prototype and the baked arena"
 
-# 4. Confirm any binaries went to LFS, not to Git.
-git lfs ls-files                 # lists Content/Maps/Arena.umap once that level exists
+# 4. Confirm the binaries went to LFS, not to Git. These two must agree:
+git ls-files '*.uasset' '*.umap' | wc -l
+git lfs ls-files | wc -l
 
 # 5. Push.
 git remote add origin https://github.com/lzbrv/Game-Code.git
 git push -u origin main
 ```
 
-Note on `Content/Maps/`: the directory is held open by a `.gitkeep` file, because Git tracks files
-and not directories. If you bootstrap the repo before running `Scripts/generate-map.sh`, that
-`.gitkeep` is all that is in there and `git lfs ls-files` is legitimately empty. Whoever generates
-`Arena.umap` first commits it — under a lock, and then never touches it again, since it is
-permanently empty by design.
+Step 4 is the one people skip and the one that matters. If the counts differ, some binary went in as
+a raw Git object and the repo will grow without bound — fix it now, while it is small (§10).
 
 Then, in the GitHub UI: **Settings → Collaborators** → add the other three with **Write** access.
 Write access is required to take LFS locks — read-only collaborators cannot lock, which defeats
@@ -586,17 +908,26 @@ git add -p                                # stage in reviewable pieces
 git commit -m "..."
 git push
 
-# Content
-git lfs lock   Content/Maps/Arena.umap    # BEFORE opening it in the editor
-git lfs locks                             # who holds what
-git lfs unlock Content/Maps/Arena.umap    # AFTER pushing
+# Content — the loop, in order. Never skip the pull, never unlock before pushing.
+git pull
+Scripts/lock.sh   Content/Maps/MainMenu.umap   # BEFORE opening it in the editor
+git lfs locks                                  # who holds what, across the team
+#   ... edit, save, git add -A, git commit, git push ...
+Scripts/unlock.sh Content/Maps/MainMenu.umap   # AFTER pushing
 
-# Content — /Game/Maps/Arena_Baked only. It has One File Per Actor on, so the
-# level is a tiny .umap plus one .uasset per actor. Lock the ACTOR, not the map:
-# that is the whole point of the migration, and locking the .umap blocks nobody.
-# Find the actor by its LABEL in the World Outliner (Wall_North_01, Cover_037)
-# and let the editor's source control integration lock the file behind it.
-git lfs lock Content/__ExternalActors__/Maps/Arena_Baked/<xx>/<yy>/<guid>.uasset
+# Content — /Game/Maps/Arena_Baked. It has One File Per Actor on, so the level is
+# a 6.6 KB .umap plus one .uasset per actor. Lock the ACTOR, not the map: that is
+# what lets two people edit the arena at once, and locking the .umap blocks
+# nobody. You know the LABEL from the World Outliner (Cover_37, Wall_North_01,
+# Goal_Ring_Rim_12) — these resolve it to the GUID-named package for you:
+Scripts/lock.sh   Cover_37
+Scripts/unlock.sh Cover_37
+#   Labels are zero-padded to two digits: Cover_37, NOT Cover_037.
+#   In the editor: right-click the actor -> Revision Control -> Check Out.
+
+# Someone is on holiday still holding a lock (announce in chat first, §4.3):
+git lfs locks                             # get the ID
+git lfs unlock --id=<id> --force
 
 # LFS health
 git lfs ls-files                          # what's actually in LFS

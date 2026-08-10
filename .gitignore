@@ -147,8 +147,11 @@ $RECYCLE.BIN/
 # embedded /Game references require them to be.
 #
 # Everyone is pinned to the same engine version, so everyone gets byte-identical
-# files. Importing them beats committing them: the repo stays text-only, there is
-# no LFS bill, and nothing here is content we authored or may redistribute.
+# files. Importing them beats committing them: ~126 MB of art nobody has to pay
+# LFS bandwidth for on every clone, and nothing here is content we authored or may
+# redistribute. (The repo is NOT "text-only" any more — spec v17 committed the
+# baked arena, the materials, the input, character and UI assets. That claim used
+# to be here and it was retired with the rest of build contract 2.)
 #
 # Run Scripts/import-mannequin.sh after cloning. Without it the game still runs —
 # ATraceCharacter falls back to a team-coloured capsule and logs a warning.
@@ -158,6 +161,27 @@ $RECYCLE.BIN/
 # is untouched.
 # ------------------------------------------------------------------------------
 /Content/Characters/
+
+# ------------------------------------------------------------------------------
+# Per-developer scratch space inside Content/ — spec v17 §1.
+#
+# Content/Developers/<you>/ is Unreal's OWN convention for personal work-in-progress
+# assets: the Content Browser has a "Show Developers Content" toggle and drops new
+# assets there. Both directories exist on this machine already and were NOT ignored,
+# so the first person to save a test asset would have pushed it into the team's LFS
+# storage without meaning to — and LFS storage counts EVERY version FOREVER, so that
+# is not recoverable without rewriting history.
+#
+# Content/Collections/ is the editor's saved-search files. They are per-person
+# working state, they churn constantly, and nobody has ever needed one of someone
+# else's. If your team later decides a shared collection is worth versioning,
+# delete the second line rather than adding a "!" exception (git cannot re-include
+# a file whose parent directory is excluded).
+#
+# Both anchored to the repo root so they cannot accidentally match anything else.
+# ------------------------------------------------------------------------------
+/Content/Developers/
+/Content/Collections/
 
 # ------------------------------------------------------------------------------
 # Explicitly kept (belt-and-braces, and documentation for the next person).

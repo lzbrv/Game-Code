@@ -86,9 +86,32 @@ namespace
 
 		// bAddFilenameSuffix = false so the path we log is the path that gets written.
 		// FScreenshotRequest treats a filename containing a slash as a complete path and leaves it
-		// alone. bShowUI = false keeps engine on-screen debug text out of the capture; the HUD itself
-		// is drawn into the scene's back buffer and IS captured, which is what we want to verify.
-		FScreenshotRequest::RequestScreenshot(State.PendingPath, /*bShowUI=*/false, /*bAddFilenameSuffix=*/false);
+		// alone.
+		//
+		// *** bShowUI IS TRUE, AND IT WAS FALSE UNTIL SPEC v17 §4. MEASURED, NOT ASSUMED. ***
+		//
+		// The old comment here said "bShowUI = false keeps engine on-screen debug text out of the
+		// capture; the HUD itself is drawn into the scene's back buffer and IS captured". The first
+		// half is still true and the second half stopped being true in this pass. bShowUI=false does
+		// not filter debug text — it excludes the ENTIRE SLATE LAYER. That was invisible while every
+		// pixel of UI in this project came from AHUD::DrawHUD (Canvas, drawn into the scene), which
+		// is why nobody noticed. Spec v17 §4 moved the title menu and the HUD's ammo/status corner
+		// onto UMG, and a UMG widget IS a Slate widget composited after the scene.
+		//
+		// The step-4b agent reproduced the failure rather than reasoning about it: a frame whose draw
+		// record said the corner had drawn showed an EMPTY corner, with the Canvas score panel and
+		// health bar plainly visible in the same image. Left at false, -TraceAutoShot would silently
+		// photograph the game with its new menu and its new HUD corner MISSING, and every screenshot
+		// it produced would be evidence for a conclusion that is not true. This project has been
+		// burned three times by self-certifying evidence; a harness that cannot see what it is
+		// testing is exactly that.
+		//
+		// Cost of the change: engine on-screen debug text (stat displays, "Ctrl+Shift+, "-style
+		// overlays) can now appear in a capture. That is a cosmetic nuisance in a harness that runs
+		// -unattended with no debug displays enabled, and it is the strictly smaller risk.
+		// ATraceHUD's own Trace.HUD.V16Shots harness made the identical change for the identical
+		// reason, and its Canvas-path frames were checked to be unaffected.
+		FScreenshotRequest::RequestScreenshot(State.PendingPath, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
 
 		UE_LOG(LogTraceGame, Display, TEXT("[AutoShot] Screenshot requested: %s"), *State.PendingPath);
 

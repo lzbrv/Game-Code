@@ -1,7 +1,19 @@
-// Trace — Canvas HUD.
+// Trace — the in-match HUD.
 //
-// Pure AHUD::DrawHUD Canvas drawing: no UMG, no widget blueprints, no .uasset of any kind
-// (contract §2). Text uses the engine's built-in fonts via GEngine->Get*Font().
+// Mostly AHUD::DrawHUD Canvas drawing, with text from the engine's built-in fonts via
+// GEngine->Get*Font(). The old header here said "no UMG, no widget blueprints, no .uasset of any
+// kind (contract §2)"; BOTH of those contracts are retired (spec v17 §0) and the line is corrected
+// rather than deleted, because a stale justification is how this project has repeatedly fooled
+// itself. Trace.Build.cs now links UMG/Slate/SlateCore, and the arena bake authored 572 actors.
+//
+// *** WHAT IS UMG TODAY, AND WHAT IS NOT. *** Spec v17 §4 step 4b converted exactly ONE element:
+// the bottom-right ammo + status corner, which now has two presenters behind the Trace.UI.UseUMG
+// toggle — Content/Trace/UI/HUD/WBP_TraceHudCorner, with the Canvas pass below it as a live
+// fallback that runs whenever the asset is absent, fails to validate, or the toggle is off.
+// EVERYTHING ELSE ON THIS HUD IS STILL CANVAS and is not half-converted: the crosshair, the charge
+// ring, the bottom-LEFT health/dash/weapon/ability-cooldown stack, the kill feed, the scoreboard,
+// the death panel, the banners, the pause menu and the character select screen. See
+// DrawAmmoAndStatuses() and BuildCornerState().
 //
 // This is the only UI the team gets for a while, so it is written to be edited:
 //   * every element lives in its own small pass, called in back-to-front order from DrawHUD();
@@ -24,6 +36,7 @@
 #include "UI/TraceCharacterSelect.h" // FTraceCharacterSelect — spec v14 §3
 #include "UI/TraceKillFeed.h"     // ETraceKillIcon, ATraceKillFeedRelay — spec v8 §6
 #include "UI/TraceOptionsMenu.h"  // FTraceOptionsMenu
+#include "UI/Widgets/HUD/TraceHudCornerData.h" // FTraceHudCornerState — spec v17 §4 (step 4b)
 
 #include "TraceHUD.generated.h"
 
@@ -32,6 +45,7 @@ class ATraceGameState;
 class ATracePlayerController;
 class ATracePlayerState;
 class UFont;
+class UTraceHudCornerWidget;
 
 UCLASS()
 class TRACE_API ATraceHUD : public AHUD
@@ -42,7 +56,25 @@ public:
 	//~ Begin AHUD interface
 	virtual void BeginPlay() override;
 	virtual void DrawHUD() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	//~ End AHUD interface
+
+	/** Which presenter drew the bottom-right corner. Reported by Trace.HUD.Corner.Verify. */
+	enum class ECornerPath : uint8
+	{
+		/** Nothing decided yet — no frame has been drawn. */
+		Undecided,
+		/** The shipped Canvas passes. The fallback, and still the default. */
+		Canvas,
+		/** WBP_TraceHudCorner + WBP_TraceHudStatusChip, behind Trace.UI.UseUMG. */
+		Umg,
+	};
+
+	/** Which presenter the LAST DRAWN FRAME used, and why. Never what was intended. */
+	ECornerPath GetCornerPath() const { return CornerPath; }
+
+	/** Human-readable reason the UMG corner was not adopted, or empty while it is in use. */
+	const FString& GetCornerFallbackReason() const { return CornerFallbackReason; }
 
 #if !UE_BUILD_SHIPPING
 	/**
@@ -243,6 +275,50 @@ protected:
 	 */
 	void DrawAmmoAndStatuses();
 
+	// ---- Spec v17 §4 (step 4b): ONE STATE, TWO PRESENTERS --------------------------------------
+	//
+	// The corner is the only element on this HUD with a UMG path. The split below is what makes that
+	// safe: everything that ASKS THE GAME A QUESTION happens once, in BuildCornerState(), and both
+	// presenters are handed the answers. Neither may look at a weapon component, a health component
+	// or an ability set. A UMG port that re-derived "is this a bee clip" would be a second definition
+	// of a rule the gun already enforces, free to drift from it — which is the exact failure this
+	// file's own comments spend two hundred lines warning about.
+
+	/**
+	 * Everything the corner shows this frame, asked of gameplay ONCE.
+	 *
+	 * @return false when the corner draws nothing at all: the red arm (Trace.HUD.V16 0), or a dead
+	 *         player — a status on a corpse is not information, and poison dies with the body.
+	 */
+	bool BuildCornerState(FTraceHudCornerState& OutState) const;
+
+	/** The shipped Canvas presenter. Unchanged pixels; it simply reads the state instead of the game. */
+	void PresentCornerCanvas(const FTraceHudCornerState& InState);
+
+	/**
+	 * The UMG presenter. @return false when it could not run — no asset, a binding that did not
+	 * resolve, no local player — in which case the caller falls back to Canvas THIS FRAME.
+	 *
+	 * @param bInLive false hides the corner without tearing the widget down (dead, red arm, an
+	 *                overlay covering the screen, or the whistle having gone).
+	 */
+	bool PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InState);
+
+	/** True when Trace.UI.UseUMG says the corner may use the widget. Never registers the cvar. */
+	bool IsUmgCornerEnabled() const;
+
+	/** Collapses the UMG corner if one exists. A no-op otherwise; safe every frame. */
+	void HideCornerWidget();
+
+	/**
+	 * Records which presenter owns the corner and says so in the log — ONCE, on change.
+	 *
+	 * Spec v17 §0.1 does not merely ask for a fallback, it asks the fallback to ANNOUNCE ITSELF: a
+	 * migration that quietly degrades is one nobody can tell has degraded. Per-frame logging would
+	 * bury it, so this only speaks when the answer changes.
+	 */
+	void SetCornerPath(ECornerPath InPath, const FString& InReason);
+
 	/**
 	 * The ammo block itself, right-aligned with its bottom edge at @p BottomY. Returns the Y its top
 	 * edge landed on, which is where the status stack starts growing upward from.
@@ -257,7 +333,7 @@ protected:
 	 * the shape of the magazine strip, and the words — so the difference survives a small window, a
 	 * colour-blind player, and a compressed screenshot.
 	 */
-	float DrawAmmoBlock(float RightX, float BottomY, float BlockW);
+	float DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX, float BottomY, float BlockW);
 
 	/**
 	 * One status chip, right-aligned, with its BOTTOM edge at @p BottomY. Returns the Y above it.
@@ -499,6 +575,45 @@ private:
 
 	/** Binds the select screen's input-suppression callbacks. Idempotent; called from BeginPlay. */
 	void WireCharacterSelect();
+
+	// ---- The UMG corner (spec v17 §4, step 4b) --------------------------------------------------
+	//
+	// *** THE CANVAS PATH IS A LIVE FALLBACK, NOT A DELETED ONE (spec v17 §0.1). *** Asset missing,
+	// asset invalid, toggle off — the corner is the one the game has drawn since v16 and the log says
+	// which arm won, once, by name. That is also why the widget is created LAZILY on the first frame
+	// the toggle asks for it rather than in BeginPlay: a build with no UI assets never touches UMG.
+
+	/** The corner widget, once adopted. Null while on the Canvas path. */
+	UPROPERTY(Transient)
+	TObjectPtr<UTraceHudCornerWidget> CornerWidget;
+
+	/**
+	 * Set once adoption has been attempted and failed, so a missing asset costs one LoadClass for the
+	 * lifetime of the HUD instead of one per frame. Cleared only by a new HUD (a travel, a respawn of
+	 * the whole world), which is also the only moment the asset could plausibly have appeared.
+	 */
+	bool bCornerAdoptFailed = false;
+
+	/** Which presenter drew the corner on the last frame, and why the other one did not. */
+	ECornerPath CornerPath = ECornerPath::Undecided;
+	FString CornerFallbackReason;
+
+	/** Guards the one-per-HUD adoption line, so the log names the arm once rather than every frame. */
+	bool bLoggedCornerPath = false;
+
+	/** Guards the one-per-HUD line naming the viewport, the HUD scale and the DPI scale. */
+	bool bLoggedCornerScale = false;
+
+	/**
+	 * True when the UMG corner was addressed this frame, so DrawHUD can collapse it when it was not.
+	 *
+	 * Needed because the corner pass is INSIDE DrawHUD's `!bPostMatch` branch and behind a live
+	 * player check, while a UMG widget added to the player screen keeps painting until something
+	 * tells it not to. Without this, the last frame of a match would leave a frozen ammo count
+	 * hanging over the full-time screen — the exact "a half-converted screen that draws nothing, or
+	 * draws twice" failure spec v17 §4 calls out by name.
+	 */
+	bool bCornerAddressedThisDraw = false;
 
 #if !UE_BUILD_SHIPPING
 	/**

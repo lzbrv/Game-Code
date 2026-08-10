@@ -1,17 +1,34 @@
 // Trace — player controller.
 //
-// Owns the *entire* Enhanced Input setup. The project ships no .uasset (contract §2), so the
-// mapping context, every UInputAction and every modifier are constructed here with NewObject and
-// kept alive by UPROPERTY members. All gameplay input is funnelled through the
+// Owns the *entire* Enhanced Input setup. All gameplay input is funnelled through the
 // ATraceCharacter::Do* entry points; the controller itself never mutates gameplay state.
 //
-// Why transient input objects are safe (and in fact better than assets): MapKey() mutates the
-// mapping context it is called on. Done to a loaded .uasset that mutation persists past PIE and
-// dirties the asset. A NewObject'd context is per-controller and dies with it.
+// TWO WAYS THE INPUT DATA CAN COME INTO EXISTENCE, AND BOTH ARE LIVE (spec v17 §6).
 //
-// The one thing that will silently break this file: dropping the UPROPERTY on any IA_* member.
-// NewObject'd UInputActions have no other owner rooting them, so they would be collected at the
-// next GC and input would stop working mid-match with no error anywhere.
+//   1. ASSETS — /Game/Trace/Input/IA_*.uasset and IMC_Trace.uasset, written by
+//      Scripts/generate-input-assets.py FROM the same action table the C++ path uses. Preferred
+//      when they are present, load cleanly and pass validation.
+//   2. C++ — NewObject, exactly as this class has always done it. Used when the assets are
+//      missing, fail to load, disagree with the C++ table, or when the toggle is off.
+//
+// The fallback is not a formality: the game plays identically either way, and which path ran is
+// stated at Display in every log. `Trace.Input.VerifyAssets` prints the whole comparison.
+//
+// The project USED to cite "build contract §2: this project cannot author .uassets" as the reason
+// everything here was built in code. That contract is retired — the arena bake authored 572 actors
+// and 66 materials from a headless commandlet, and these input assets come from the same mechanism.
+//
+// WHY THE LOADED CONTEXT IS DUPLICATED RATHER THAN USED DIRECTLY, which is the one real hazard of
+// the asset path: MapKey()/UnmapAll() MUTATE the context they are called on, and ApplyControlSettings
+// rebuilds the whole mapping list on every settings change. Done to a loaded .uasset that mutation
+// outlives PIE, dirties the asset, and would be shared by every local player. So the asset is a
+// TEMPLATE: DuplicateObject gives this controller its own copy, which dies with it. The IA_* actions
+// are NOT duplicated — they are never mutated, and Enhanced Input keys its per-action runtime state
+// off the local player, not off the action object, so sharing them is correct.
+//
+// The one thing that will silently break this file: dropping the UPROPERTY on any IA_* member. A
+// NewObject'd UInputAction has no other owner rooting it, so it would be collected at the next GC
+// and input would stop working mid-match with no error anywhere.
 
 #pragma once
 
@@ -59,8 +76,11 @@ struct FTraceDashHudState
 /**
  * Trace's player controller.
  *
- * Input model (contract §7). Every key below is the DEFAULT — all of them are rebindable through
- * the options screen, and the authority at runtime is UTraceUserSettings, not this comment:
+ * Input model. Every key below is the DEFAULT — all of them are rebindable through the options
+ * screen, and the authority at runtime is UTraceUserSettings, not this comment. (This list used to
+ * cite "contract §7: Canvas only"; that contract is retired and the citation was never relevant to
+ * the key table anyway.) The ACTIONS themselves are assets under /Game/Trace/Input when they exist,
+ * with the C++ constructors as the live fallback — see the file header:
  *   Move        Axis2D   WASD          -> X = strafe (+right), Y = forward (+forward)
  *   Look        Axis2D   Mouse X / Y   -> X = yaw delta, Y = pitch delta, scaled and signed by
  *                                         the player's sensitivity and invert-Y settings
@@ -302,6 +322,36 @@ public:
 	 */
 	void LogInputDiagnostics(const TCHAR* Context) const;
 
+	/**
+	 * SPEC v17 §6. True when the IA_ and IMC_Trace assets were loaded, validated and adopted; false
+	 * when this controller built its input in C++ (assets missing, invalid, or the toggle off).
+	 *
+	 * Read by Trace.Input.VerifyAssets. Not a setting — the decision is made once, in BuildInputData.
+	 */
+	bool IsUsingInputAssets() const { return bUsingInputAssets; }
+
+	/**
+	 * SPEC v17 §6. Prints this controller's live mapping list — action name, key and modifier
+	 * classes, in order — so the asset path and the C++ path can be compared line for line.
+	 *
+	 * A member rather than a free function in the harness because InputMapping and every IA_* are
+	 * protected, and because "what is actually bound right now" is the only question that
+	 * distinguishes a migration that worked from one that merely compiled.
+	 */
+	void LogLiveInputMappings(const TCHAR* Context) const;
+
+	/**
+	 * SPEC v17 §6. The UInputAction each live key mapping points at, in mapping order.
+	 *
+	 * Exists for POINTER IDENTITY, which is the only thing that can tell the two paths apart: the
+	 * C++ fallback names its NewObject'd action "IA_Move" too, so a name comparison would call the
+	 * fallback a success. Trace.Input.VerifyAssets checks these against the loaded asset objects.
+	 *
+	 * An out-parameter of raw pointers rather than the mapping array itself, so this header does not
+	 * have to pull in Enhanced Input's structs for a diagnostic.
+	 */
+	void GetLiveMappedActions(TArray<const UInputAction*>& OutActions) const;
+
 	// -----------------------------------------------------------------------------------------
 	// Networking diagnostics (spec v5 §0).
 	//
@@ -361,11 +411,21 @@ private:
 public:
 
 protected:
-	// ---- Enhanced Input data, all built in C++ ------------------------------------------------
+	// ---- Enhanced Input data ------------------------------------------------------------------
 	//
-	// These MUST stay UPROPERTYs — see the file header. Transient because they are rebuilt from
-	// code on every load and must never be serialised.
+	// Populated EITHER from /Game/Trace/Input (preferred) OR by NewObject (the live fallback) —
+	// see the file header for the whole argument. Which one ran is in the log and in
+	// IsUsingInputAssets().
+	//
+	// These MUST stay UPROPERTYs. On the C++ path nothing else roots the NewObject'd actions; on
+	// the asset path the pointers are what keep the loaded assets referenced. Transient because
+	// they are resolved from scratch on every load and must never be serialised.
 
+	/**
+	 * Always a PER-CONTROLLER object, never the asset itself: on the asset path this is a
+	 * DuplicateObject of the loaded IMC_Trace. ApplyControlSettings calls UnmapAll/MapKey on it a
+	 * dozen times per settings change, and doing that to a loaded .uasset would dirty the asset.
+	 */
 	UPROPERTY(Transient)
 	TObjectPtr<UInputMappingContext> InputMapping;
 
@@ -439,14 +499,33 @@ protected:
 	TObjectPtr<UInputAction> IA_Reload;
 
 	/**
-	 * Builds InputMapping and every IA_* exactly once, then lays down the key mappings.
+	 * Resolves InputMapping and every IA_* exactly once, then lays down the key mappings.
 	 *
-	 * The two halves are separate on purpose. The ACTIONS must be created exactly once and never
+	 * The two halves are separate on purpose. The ACTIONS must be resolved exactly once and never
 	 * replaced, because SetupInputComponent binds delegates to those specific objects and a fresh
 	 * UInputAction would leave every binding pointing at an action nothing maps to. The KEY MAPPINGS
 	 * are torn down and rebuilt on every settings change. Cheap and safe to call repeatedly.
+	 *
+	 * SPEC v17 §6: tries the assets first, falls back to the C++ constructors. Both are below.
 	 */
 	void BuildInputData();
+
+	/**
+	 * SPEC v17 §6. Loads /Game/Trace/Input, validates it against the C++ table and adopts it.
+	 *
+	 * @return true only if EVERY action loaded, every ValueType and AccumulationBehavior matched
+	 *         what the C++ path would have produced, and the mapping context loaded. Partial
+	 *         success is treated as failure and nothing is assigned — half an input scheme is worse
+	 *         than the fallback, and the fallback is known-good.
+	 *
+	 * Never mutates a loaded asset. Validation is a comparison, not a repair: an asset that
+	 * disagrees with the C++ table is a REGENERATE that did not happen, and silently fixing it up
+	 * in memory would hide exactly the drift Trace.Input.VerifyAssets exists to find.
+	 */
+	bool TryAdoptInputAssets();
+
+	/** The original path, unchanged: NewObject for the context and all fourteen actions. */
+	void ConstructInputDataInCode();
 
 	/** Registers InputMapping with the local player's Enhanced Input subsystem. Idempotent. */
 	void AddInputMappings();
@@ -558,6 +637,9 @@ private:
 	ETraceHitZone LastHitMarkerZone = ETraceHitZone::None;
 
 	bool bScoreboardOpen = false;
+
+	/** SPEC v17 §6. Set once by BuildInputData. See IsUsingInputAssets(). */
+	bool bUsingInputAssets = false;
 
 	/**
 	 * Latches once AddInputMappings() has REPORTED a mapping-context failure, so a persistent

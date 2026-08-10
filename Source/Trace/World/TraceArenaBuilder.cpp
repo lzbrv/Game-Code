@@ -8,6 +8,7 @@
 #include "Core/TraceCharacter.h"        // PlayerHeightUU() reads the capsule off the CDO
 #include "Core/TraceGameState.h"        // GetScoringModeFor - the one authority on which mode runs
 #include "Gameplay/TraceEndzone.h"
+#include "World/TraceCoreSpawn.h"       // spec v17 §2 - the placed Core spawn marker
 #include "World/TraceTeamPlayerStart.h"
 
 #include "Components/BoxComponent.h"
@@ -1318,21 +1319,90 @@ ATraceArenaBuilder::ATraceArenaBuilder()
 		BaseMaterial = MaterialFinder.Object;
 	}
 
-	// The two generated Tron materials. These are NOT in the repo (Content/Generated/ is gitignored)
-	// and are produced by Scripts/generate_content.py - see the asset note in the class comment. A
-	// missing asset here is a soft failure: MakeSurfaceMID/MakeNeonMID fall back to BasicShapeMaterial
-	// and the arena renders flat but still plays. FObjectFinder logs the miss, which is exactly the
-	// breadcrumb a developer who has not run the script needs.
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> SurfaceFinder(TEXT("/Game/Generated/Materials/M_TraceSurface.M_TraceSurface"));
+	// THE TWO TRON MATERIALS, AND WHERE THEY LIVE NOW (spec v17 §3).
+	//
+	// These used to be resolved from /Game/Generated/Materials, which .gitignore excludes, under the
+	// old policy that "the repo stays text-only and every developer regenerates them". That policy is
+	// RETIRED: the arena bake committed a 639-file map and 66 material assets, and spec v17 §3 is
+	// explicit that "nothing the game ships may depend on a gitignored generated asset". So the
+	// COMMITTED parents at /Game/Trace/Materials/Parents are the source of truth and the only path
+	// resolved here.
+	//
+	// A constructor-time FObjectFinder is what makes the cooker keep them; a bare runtime LoadObject
+	// would resolve to null once cooked. That is also exactly why the /Game/Generated fallback is NOT
+	// a finder - see ResolveArenaMaterials(). Cooking a reference to a gitignored directory is the
+	// failure this section exists to prevent.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> SurfaceFinder(TEXT("/Game/Trace/Materials/Parents/M_TraceSurface.M_TraceSurface"));
 	if (SurfaceFinder.Succeeded())
 	{
 		SurfaceMaterial = SurfaceFinder.Object;
 	}
 
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Trace/Materials/Parents/M_TraceNeon.M_TraceNeon"));
 	if (NeonFinder.Succeeded())
 	{
 		NeonMaterial = NeonFinder.Object;
+	}
+}
+
+void ATraceArenaBuilder::ResolveArenaMaterials()
+{
+	// -----------------------------------------------------------------------------------------
+	// SPEC v17 §0 RULE 1, FOR THE MATERIALS: "asset missing, asset fails to load, or toggle off =>
+	// the game does exactly what it does today and SAYS SO in the log."
+	//
+	// Three arms, tried in order, and the one that won is logged every time so nobody has to guess
+	// which materials a screenshot was taken with:
+	//
+	//   1. /Game/Trace/Materials/Parents/M_*        committed, cooked, the source of truth. Resolved
+	//                                               in the constructor above.
+	//   2. /Game/Generated/Materials/M_*            the LEGACY generator output. Gitignored, so it
+	//                                               exists only on a machine that has run
+	//                                               Scripts/generate_content.py pointed there. Loaded
+	//                                               HERE rather than in the constructor precisely so
+	//                                               the cooker never records a dependency on it.
+	//   3. /Engine/BasicShapes/BasicShapeMaterial   flat and lit. The arena still plays; it just is
+	//                                               not neon. MakeSurfaceMID/MakeNeonMID do this on
+	//                                               their own when both of the above are null.
+	//
+	// Idempotent and cheap: once arm 1 or 2 has answered, both pointers are non-null and the whole
+	// function is two branches. Called at the top of BuildArena and again from AdoptBakedArena, which
+	// needs it for a completely different reason - a baked level's pieces already wear committed
+	// instances, but the ONE log line saying which material set is live is worth having on both paths.
+	if (SurfaceMaterial != nullptr && NeonMaterial != nullptr)
+	{
+		return;
+	}
+
+	auto LoadLegacy = [](const TCHAR* Path) -> UMaterialInterface*
+	{
+		return LoadObject<UMaterialInterface>(nullptr, Path, nullptr, LOAD_NoWarn | LOAD_Quiet);
+	};
+
+	const bool bWantedSurface = (SurfaceMaterial == nullptr);
+	const bool bWantedNeon = (NeonMaterial == nullptr);
+
+	if (bWantedSurface)
+	{
+		SurfaceMaterial = LoadLegacy(TEXT("/Game/Generated/Materials/M_TraceSurface.M_TraceSurface"));
+	}
+	if (bWantedNeon)
+	{
+		NeonMaterial = LoadLegacy(TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon"));
+	}
+
+	const bool bRecovered = (bWantedSurface && SurfaceMaterial != nullptr)
+		|| (bWantedNeon && NeonMaterial != nullptr);
+
+	if (bRecovered)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] /Game/Trace/Materials/Parents is missing or failed to load. FELL BACK to the ")
+			TEXT("legacy generator output at /Game/Generated/Materials (surface %s, neon %s). The arena ")
+			TEXT("renders as it always did, but that directory is GITIGNORED - restore ")
+			TEXT("Content/Trace/Materials from the repo, or re-author it with Scripts/generate_content.py."),
+			(SurfaceMaterial != nullptr) ? TEXT("ok") : TEXT("MISSING"),
+			(NeonMaterial != nullptr) ? TEXT("ok") : TEXT("MISSING"));
 	}
 }
 
@@ -1411,8 +1481,71 @@ float ATraceArenaBuilder::BankInnerHalfWidth() const
 	return HalfWidth() - Depth;
 }
 
+ATraceCoreSpawn* ATraceArenaBuilder::FindPlacedCoreSpawn() const
+{
+	// Cached because ATraceCore::GetHomeLocation() asks this question on every kickoff, every reset
+	// after a score and from a couple of debug paths, and it already pays one full actor iteration to
+	// find this builder. The weak pointer is re-resolved if the marker is destroyed, so a designer
+	// deleting it in the editor is not left with a stale answer.
+	if (ATraceCoreSpawn* Cached = PlacedCoreSpawn.Get())
+	{
+		return Cached;
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return nullptr;
+	}
+
+	ATraceCoreSpawn* Found = nullptr;
+	int32 Count = 0;
+
+	for (TActorIterator<ATraceCoreSpawn> It(World); It; ++It)
+	{
+		ATraceCoreSpawn* Marker = *It;
+		if (!IsValid(Marker))
+		{
+			continue;
+		}
+
+		++Count;
+		if (Found == nullptr)
+		{
+			Found = Marker;
+		}
+	}
+
+	// Reported ONCE per resolve rather than per call: the first one wins so the arena is never left
+	// with no Core spawn at all, but a second marker means half the answers in the level are wrong
+	// and that is a very expensive thing to find by playing.
+	if (Count > 1)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] %d ATraceCoreSpawn actors in this level; there must be exactly one. Using '%s' ")
+			TEXT("at %s and ignoring the rest. Delete the spares in the World Outliner (Arena/Spawns)."),
+			Count, *Found->GetName(), *Found->GetActorLocation().ToCompactString());
+	}
+
+	PlacedCoreSpawn = Found;
+	return Found;
+}
+
 FVector ATraceArenaBuilder::GetCoreSpawnLocation() const
 {
+	// --- SPEC v17 §2: THE PLACED MARKER WINS, AND IT IS OPT-IN ------------------------------------
+	//
+	// Spec v15 §1.4 asked for the Core spawn to be a real placed actor and it never became one. It is
+	// one now: if the level contains an ATraceCoreSpawn, ITS transform is the answer, so a designer
+	// who drags the centre dais can drag the Core spawn with it. See that class's header.
+	//
+	// No marker means exactly the old behaviour, derived from the layout properties below — which is
+	// what /Game/Maps/Arena still does, and what any level baked before this pass does.
+	if (const ATraceCoreSpawn* Marker = FindPlacedCoreSpawn())
+	{
+		return Marker->GetActorLocation();
+	}
+
 	// Just above the pedestal top, which now stands on the dais rather than on the floor. The Core is
 	// spawned/reset here and drops the last few uu onto it. ATraceCore treats anything within 75 uu
 	// of this point as "already home", so the resting position must stay inside that tolerance -
@@ -1678,11 +1811,25 @@ void ATraceArenaBuilder::BuildArena()
 	// for server targets and nothing there ever renders.
 	const bool bBuildVisuals = (GetNetMode() != NM_DedicatedServer);
 
+	// Committed parents first, legacy generated output second, engine grey third - and it logs which
+	// (spec v17 §0 rule 1). Called here rather than in the constructor because arm 2 must never become
+	// a cooked dependency on a gitignored directory.
+	ResolveArenaMaterials();
+
 	if (bBuildVisuals && (SurfaceMaterial == nullptr || NeonMaterial == nullptr))
 	{
 		UE_LOG(LogTraceGame, Warning,
-			TEXT("ATraceArenaBuilder: /Game/Generated/Materials is missing, falling back to BasicShapeMaterial. ")
-			TEXT("The arena will render flat and lit instead of neon. Run Scripts/generate_content.py."));
+			TEXT("ATraceArenaBuilder: neither /Game/Trace/Materials/Parents nor the legacy ")
+			TEXT("/Game/Generated/Materials could supply M_TraceSurface and M_TraceNeon, so the build falls ")
+			TEXT("back to /Engine/BasicShapes/BasicShapeMaterial. The arena will render flat and lit instead ")
+			TEXT("of neon, and it still plays. Restore Content/Trace/Materials from the repo (git lfs pull), ")
+			TEXT("or re-author the parents with Scripts/generate_content.py."));
+	}
+	else if (bBuildVisuals)
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Arena] Materials: surface '%s', neon '%s'."),
+			*GetPathNameSafe(SurfaceMaterial), *GetPathNameSafe(NeonMaterial));
 	}
 
 	BuildFloorAndWalls(bBuildVisuals);

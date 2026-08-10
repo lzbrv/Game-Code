@@ -2,6 +2,7 @@
 
 #include "UI/TraceMenuHUD.h"
 
+#include "Blueprint/UserWidget.h"
 #include "Engine/Canvas.h"
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
@@ -24,90 +25,24 @@
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"
 #include "UI/TraceNetworking.h"
+#include "UI/Widgets/Menu/TraceMenuPalette.h"
+#include "UI/Widgets/Menu/TraceTitleMenuWidget.h"
 
-// =================================================================================================
-// Palette and layout
-//
-// Authored against a 1080p-tall viewport; every pixel constant below is multiplied by UIScale.
-// The whole screen is two hues — a cyan that carries the interface and an amber that only ever
-// marks danger or the Hard setting — over near-black. That restraint is the entire look: the
-// moment a third colour appears, the grid stops reading as a grid and starts reading as noise.
-// =================================================================================================
-
-namespace TraceMenuStyle
-{
-	static constexpr float ReferenceHeight = 1080.f;
-
-	static const FLinearColor Void      (0.006f, 0.011f, 0.022f, 1.00f);
-	static const FLinearColor Cyan      (0.16f,  0.88f,  1.00f,  1.00f);
-	static const FLinearColor CyanDeep  (0.04f,  0.34f,  0.48f,  1.00f);
-	static const FLinearColor Amber     (1.00f,  0.46f,  0.08f,  1.00f);
-	static const FLinearColor Ink       (0.90f,  0.97f,  1.00f,  1.00f);
-	static const FLinearColor InkDim    (0.42f,  0.58f,  0.66f,  1.00f);
-
-	/**
-	 * Row geometry, in reference pixels.
-	 *
-	 * Spacing came down from 78 to 71 when JOIN was added: six rows at the old pitch put the bottom
-	 * of the console panel under the footer's dark strip at 1080p, which is the kind of collision
-	 * that only shows up on somebody else's monitor.
-	 */
-	static constexpr float RowHeight  = 60.f;
-	static constexpr float RowSpacing = 71.f;
-	static constexpr float RowPadX    = 30.f;
-
-	/**
-	 * Where the grid floor meets the dark. Shared by the backdrop glow and the grid itself so the
-	 * glow can never end somewhere the horizon line is not.
-	 */
-	static constexpr float HorizonFraction = 0.66f;
-
-	/**
-	 * Seconds after the title screen appears during which Enter/Space will not activate a row.
-	 *
-	 * Shortened from 0.75s now that the mouse path — which was the actual bug — is fixed at its
-	 * cause by press/release semantics plus foreground-click suppression. See
-	 * ATraceMenuHUD::AcceptUnlockTime.
-	 */
-	static constexpr float ActivationGraceSeconds = 0.35f;
-
-	static FLinearColor WithAlpha(const FLinearColor& C, float A)
-	{
-		return FLinearColor(C.R, C.G, C.B, A);
-	}
-
-	/** Colour that marks each difficulty, so the setting is legible without reading the word. */
-	static FLinearColor DifficultyColor(ETraceBotDifficulty Difficulty)
-	{
-		switch (Difficulty)
-		{
-		case ETraceBotDifficulty::Easy: return FLinearColor(0.30f, 1.00f, 0.72f, 1.f);
-		case ETraceBotDifficulty::Hard: return Amber;
-		default:                        return Cyan;
-		}
-	}
-
-	static FString DifficultyBlurb(ETraceBotDifficulty Difficulty)
-	{
-		switch (Difficulty)
-		{
-		case ETraceBotDifficulty::Easy:
-			return TEXT("BOTS REACT SLOWLY AND SHOOT LOOSELY.  START HERE.");
-		case ETraceBotDifficulty::Hard:
-			return TEXT("BOTS REACT FAST, AIM TIGHT AND PUSH THE CORE.");
-		default:
-			return TEXT("BOTS PLAY THE SHIPPED TUNING.  A FAIR FIGHT.");
-		}
-	}
-}
+// The palette and the layout constants used to live here. They moved to
+// UI/Widgets/Menu/TraceMenuPalette.h in spec v17 §4, because there are now two renderers for this
+// screen and two copies of a palette is two palettes that drift. Nothing about the values changed.
 
 // =================================================================================================
 // Stroke font
 //
 // Five letters and a space, drawn as line segments in a unit box (x and y both 0..1, y downward).
-// The built-in engine fonts are bitmaps; at the size a title wants they are a blurry mess, and
-// there is no .uasset budget for a real typeface (contract: no assets). Segments cost nothing,
-// stay sharp at any resolution, and look like something a light cycle would drive on.
+// The built-in engine fonts are bitmaps; at the size a title wants they are a blurry mess. Segments
+// cost nothing, stay sharp at any resolution, and look like something a light cycle would drive on.
+//
+// The comment here used to add "and there is no .uasset budget for a real typeface (contract: no
+// assets)". THAT CONTRACT IS RETIRED — see spec v17 §0 and Trace.Build.cs. The stroke font stays
+// because it is better at this size, not because anything forbids a font asset. UTraceStrokeText
+// (UI/Widgets/Menu/TraceStrokeTextWidget.h) is the same five glyphs for the UMG renderer.
 // =================================================================================================
 
 namespace TraceStrokeFont
@@ -147,8 +82,295 @@ namespace TraceStrokeFont
 }
 
 // =================================================================================================
+// Spec v17 §4 — the UMG renderer, and the toggle that keeps Canvas alive
+// =================================================================================================
+
+namespace TraceMenuHUDFile
+{
+	/**
+	 * `Trace.UI.UseUMG 0|1` — which renderer draws the title screen.
+	 *
+	 * The DEFAULT IS 1, and that is a claim this pass has to back up rather than assert. What it
+	 * rests on: `Trace.UI.VerifyMenu` measures the widget's laid-out row rectangles against the
+	 * Canvas layout maths for the same frame and reports the worst error in pixels — hit testing,
+	 * hover and the click harness all run off those rectangles, so if they agree the two renderers
+	 * are interchangeable to the player's mouse. -TraceMenuClickTest still reports one press per
+	 * row, -TraceAutoSettings still opens the overlay and restores the config, and -TraceAutoPlay
+	 * still reaches the arena.
+	 *
+	 * Set it to 0 and everything falls back to the Canvas path with no other change. That is not a
+	 * degraded mode: it is the shipped renderer, still compiled, still tested, still the thing that
+	 * draws while the settings overlay or the JOIN prompt is up (both are Canvas modals, and Canvas
+	 * draws UNDER Slate, so the widget stands down for those frames).
+	 */
+	static int32 GUseUMG = 1;
+	static FAutoConsoleVariableRef CVarUseUMG(
+		TEXT("Trace.UI.UseUMG"),
+		GUseUMG,
+		TEXT("1 = draw the title screen with the UMG widget (/Game/Trace/UI/Menu/WBP_TitleMenu).\n")
+		TEXT("0 = draw it with the original AHUD::DrawHUD Canvas path. Both are live; the Canvas\n")
+		TEXT("path is also used automatically whenever the asset is missing or the wrong shape."),
+		ECVF_Default);
+
+	/** Where the generated asset lives. Soft, by path: a missing asset must fall back, not fail. */
+	static const TCHAR* TitleWidgetPath = TEXT("/Game/Trace/UI/Menu/WBP_TitleMenu.WBP_TitleMenu_C");
+
+	/**
+	 * Command line beats console variable, and that ordering is not arbitrary.
+	 *
+	 * A cvar set with -ExecCmds arrives during engine init, which is AFTER the first title screen has
+	 * already decided which renderer to build. Step 6 hit exactly this with the input assets. So the
+	 * switches are read from FCommandLine directly, where they are available before anything runs.
+	 *
+	 *   -TraceNoMenuUMG   force the Canvas path (the fallback drill: run this to prove rule 1)
+	 *   -TraceMenuUMG     force the widget, even if the cvar says otherwise
+	 */
+	static bool WantsUMG()
+	{
+		if (FParse::Param(FCommandLine::Get(), TEXT("TraceNoMenuUMG")))
+		{
+			return false;
+		}
+		if (FParse::Param(FCommandLine::Get(), TEXT("TraceMenuUMG")))
+		{
+			return true;
+		}
+		return GUseUMG != 0;
+	}
+}
+
+bool ATraceMenuHUD::TryAdoptMenuWidget()
+{
+	if (!TraceMenuHUDFile::WantsUMG())
+	{
+		// Re-logged whenever the ANSWER changes, not just once. `Trace.UI.UseUMG 0` typed into the
+		// console mid-session switches the screen back to Canvas without a restart, and a status line
+		// still reading "UMG adopted" while Canvas is drawing is exactly the kind of stale report that
+		// makes a fallback impossible to trust.
+		if (!bMenuUmgDecisionLogged || bMenuUmgWantedLastDecision)
+		{
+			bMenuUmgDecisionLogged = true;
+			bMenuUmgWantedLastDecision = false;
+			MenuUmgStatus = (MenuWidget != nullptr)
+				? FString(TEXT("CANVAS — the widget was adopted, then Trace.UI.UseUMG was set to 0. ")
+					TEXT("It is standing down; set it back to 1 to bring it in again."))
+				: FString(TEXT("CANVAS — Trace.UI.UseUMG is 0 (or -TraceNoMenuUMG was passed)."));
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuUI] %s"), *MenuUmgStatus);
+		}
+		return false;
+	}
+
+	if (MenuWidget != nullptr)
+	{
+		if (!bMenuUmgWantedLastDecision)
+		{
+			bMenuUmgWantedLastDecision = true;
+			MenuUmgStatus = FString::Printf(TEXT("UMG — %s adopted, %d rows."),
+				TraceMenuHUDFile::TitleWidgetPath, static_cast<int32>(ETraceMenuRow::Count));
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuUI] %s"), *MenuUmgStatus);
+		}
+		return true;
+	}
+
+	APlayerController* PC = GetOwningPlayerController();
+	if (PC == nullptr)
+	{
+		// No local controller yet. Not a failure and not logged as one — try again next frame.
+		return false;
+	}
+
+	// LoadClass, not a constructor FClassFinder. A finder would make the asset a HARD dependency of
+	// this class: a fresh clone without the .uasset would fail to construct the HUD at all, which is
+	// the exact opposite of the fallback spec v17 §0 rule 1 demands.
+	UClass* WidgetClass = LoadClass<UTraceTitleMenuWidget>(nullptr, TraceMenuHUDFile::TitleWidgetPath);
+	if (WidgetClass == nullptr)
+	{
+		if (!bMenuUmgDecisionLogged)
+		{
+			bMenuUmgDecisionLogged = true;
+			MenuUmgStatus = FString::Printf(
+				TEXT("CANVAS — %s did not load. Run Scripts/generate-menu-widgets.py to author it. ")
+				TEXT("The game is drawing the original Canvas title screen and is fully playable."),
+				TraceMenuHUDFile::TitleWidgetPath);
+			UE_LOG(LogTraceGame, Warning, TEXT("[MenuUI] %s"), *MenuUmgStatus);
+		}
+		return false;
+	}
+
+	UTraceTitleMenuWidget* Created = CreateWidget<UTraceTitleMenuWidget>(PC, WidgetClass);
+	if (Created == nullptr)
+	{
+		if (!bMenuUmgDecisionLogged)
+		{
+			bMenuUmgDecisionLogged = true;
+			MenuUmgStatus = TEXT("CANVAS — CreateWidget failed for WBP_TitleMenu. Drawing Canvas instead.");
+			UE_LOG(LogTraceGame, Error, TEXT("[MenuUI] %s"), *MenuUmgStatus);
+		}
+		return false;
+	}
+
+	// ALL-OR-NOTHING, and validating. A widget whose row count does not match ETraceMenuRow would
+	// draw rows that nothing behind them can select — the same reasoning step 6 applies to the input
+	// assets, and for the same reason: a silently half-adopted asset is worse than no asset.
+	const int32 ExpectedRows = static_cast<int32>(ETraceMenuRow::Count);
+	if (Created->GetRowCount() != ExpectedRows)
+	{
+		bMenuUmgDecisionLogged = true;
+		MenuUmgStatus = FString::Printf(
+			TEXT("CANVAS — WBP_TitleMenu offers %d row widget(s), C++ has %d (ETraceMenuRow::Count). ")
+			TEXT("Re-run Scripts/generate-menu-widgets.py."),
+			Created->GetRowCount(), ExpectedRows);
+		UE_LOG(LogTraceGame, Error, TEXT("[MenuUI] %s"), *MenuUmgStatus);
+		Created->MarkAsGarbage();
+		return false;
+	}
+
+	// ZOrder 0 and HitTestInvisible: this widget is a picture. See the header of
+	// UTraceTitleMenuWidget for why the clicks deliberately do not come through Slate.
+	Created->SetVisibility(ESlateVisibility::HitTestInvisible);
+	Created->AddToViewport(0);
+	MenuWidget = Created;
+
+	bMenuUmgDecisionLogged = true;
+	bMenuUmgWantedLastDecision = true;
+	MenuUmgStatus = FString::Printf(TEXT("UMG — %s adopted, %d rows."),
+		TraceMenuHUDFile::TitleWidgetPath, ExpectedRows);
+	UE_LOG(LogTraceGame, Display, TEXT("[MenuUI] %s"), *MenuUmgStatus);
+	return true;
+}
+
+void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
+{
+	OutView.Now = Now;
+	OutView.RowCount = FMath::Min(static_cast<int32>(ETraceMenuRow::Count), FTraceTitleMenuView::MaxRows);
+	for (int32 Index = 0; Index < OutView.RowCount; ++Index)
+	{
+		const ETraceMenuRow Row = static_cast<ETraceMenuRow>(Index);
+		BuildRowView(Row, Row == Selected, OutView.Rows[Index]);
+	}
+
+	OutView.Blurb = BuildBlurb();
+	OutView.Tagline = TEXT("5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER");
+	OutView.AddressCaption = TEXT("YOUR ADDRESS");
+	OutView.AddressValue = TraceNet::GetHostEndpoint();
+
+	// MEASURED CAVEAT, kept verbatim from the Canvas path. If something else already holds UDP 7777,
+	// UIpNetDriver does not fail — it binds the next free port instead. The match is still joinable,
+	// but the number in the chip is then a lie, and a host reciting it would send everybody to a port
+	// nothing is listening on.
+	OutView.PortWarning = TraceNet::IsDefaultPortFreeCached()
+		? FString()
+		: FString(TEXT("PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"));
+
+	OutView.FooterKeys = TEXT("W / S  OR  ARROWS   MOVE          A / D   CHANGE          ENTER   SELECT          ESC   QUIT");
+	OutView.FooterHint = TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE   -   OTHERS PICK JOIN AND TYPE YOUR ADDRESS ABOVE");
+
+	// ---- Failure banner ---------------------------------------------------------------------------
+	{
+		FString Headline;
+		FString Detail;
+		double AgeSeconds = 0.0;
+		if (TraceNet::GetLastFailure(Headline, Detail, AgeSeconds))
+		{
+			// A minute is a long time for a banner, and it is deliberate: the failure that matters
+			// happens while the player is looking at a DIFFERENT screen.
+			constexpr double VisibleSeconds = 60.0;
+			if (AgeSeconds <= VisibleSeconds)
+			{
+				OutView.bFailureVisible = true;
+				OutView.FailureHeadline = Headline;
+				OutView.FailureDetail = Detail;
+				OutView.FailureFade = static_cast<float>(FMath::Clamp((VisibleSeconds - AgeSeconds) / 6.0, 0.0, 1.0));
+			}
+		}
+	}
+
+	// ---- Travel overlay ---------------------------------------------------------------------------
+	OutView.bTravelVisible = bTravelling;
+	if (bTravelling)
+	{
+		OutView.TravelCaption = TravelCaption.IsEmpty() ? FString(TEXT("ENTERING THE ARENA")) : TravelCaption;
+		OutView.TravelHint = TravelCaption.StartsWith(TEXT("CONNECTING"))
+			? FString(TEXT("THIS CAN TAKE A FEW SECONDS.  A FAILURE WILL BE REPORTED, NOT SWALLOWED."))
+			: FString();
+	}
+
+	// ---- Cursor ------------------------------------------------------------------------------------
+	OutView.bCursorVisible = bHasCursor && !bTravelling;
+	if (OutView.bCursorVisible && ViewW > 0.f && ViewH > 0.f)
+	{
+		// Fractions rather than pixels: the widget knows its own size and nothing here has to know
+		// what the DPI scale did.
+		OutView.CursorFraction = FVector2D(LastCursorPos.X / ViewW, LastCursorPos.Y / ViewH);
+	}
+}
+
+void ATraceMenuHUD::PublishRowRectsFromWidget()
+{
+	if (MenuWidget == nullptr)
+	{
+		return;
+	}
+
+	const int32 RowCount = static_cast<int32>(ETraceMenuRow::Count);
+	FBox2D Fetched[static_cast<int32>(ETraceMenuRow::Count)];
+	for (int32 Index = 0; Index < RowCount; ++Index)
+	{
+		if (!MenuWidget->GetRowViewportRect(Index, Fetched[Index]))
+		{
+			// Not laid out yet. Leave RowRects and bRowRectsValid alone: the previous frame's rects
+			// are still true, and on the very first frame there are none, which is the same state the
+			// Canvas path is in before its first DrawMenuRows.
+			return;
+		}
+	}
+
+	for (int32 Index = 0; Index < RowCount; ++Index)
+	{
+		RowRects[Index] = Fetched[Index];
+	}
+	bRowRectsValid = true;
+}
+
+bool ATraceMenuHUD::GetUmgRowRect(int32 InRowIndex, FBox2D& OutRect) const
+{
+	return (MenuWidget != nullptr) && MenuWidget->GetRowViewportRect(InRowIndex, OutRect);
+}
+
+bool ATraceMenuHUD::GetCanvasRowRect(int32 InRowIndex, FBox2D& OutRect) const
+{
+	const int32 RowCount = static_cast<int32>(ETraceMenuRow::Count);
+	if (InRowIndex < 0 || InRowIndex >= RowCount || ViewW <= 0.f || ViewH <= 0.f)
+	{
+		return false;
+	}
+
+	const TraceMenuStyle::FConsoleLayout Layout =
+		TraceMenuStyle::ComputeConsoleLayout(ViewW, ViewH, UIScale, RowCount);
+	const float RowH = TraceMenuStyle::RowHeight * UIScale;
+	const float Y = Layout.FirstRowY + InRowIndex * (TraceMenuStyle::RowSpacing * UIScale);
+
+	OutRect = FBox2D(FVector2D(Layout.RowX, Y), FVector2D(Layout.RowX + Layout.RowW, Y + RowH));
+	return true;
+}
+
+// =================================================================================================
 // Lifecycle
 // =================================================================================================
+
+void ATraceMenuHUD::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// Explicit, rather than trusting the travel to tear it down. A widget added to the game
+	// viewport's screen layer outlives the world that made it in some paths, and a title screen
+	// still painted over the arena would be a very loud bug for a very quiet omission.
+	if (MenuWidget != nullptr)
+	{
+		MenuWidget->RemoveFromParent();
+		MenuWidget = nullptr;
+	}
+
+	Super::EndPlay(EndPlayReason);
+}
 
 void ATraceMenuHUD::BeginPlay()
 {
@@ -1007,8 +1229,10 @@ int32 ATraceMenuHUD::RowAtPoint(const FVector2D& Point) const
 
 void ATraceMenuHUD::UpdateWindowFocus()
 {
-	// FViewport, not Slate: this module deliberately does not depend on Slate (see Trace.Build.cs),
-	// and IsForegroundWindow is on the Engine-side viewport interface.
+	// FViewport, not Slate. The comment here used to justify that with "this module deliberately does
+	// not depend on Slate (see Trace.Build.cs)", which is FALSE as of spec v17 §4 — UMG, Slate and
+	// SlateCore are all dependencies now. The real reason is simpler and still holds:
+	// IsForegroundWindow is on the Engine-side viewport interface, which is where the answer lives.
 	bool bFocused = true;
 	if (const UWorld* World = GetWorld())
 	{
@@ -1408,28 +1632,65 @@ void ATraceMenuHUD::DrawHUD()
 		}
 	}
 
-	DrawBackdrop();
-	DrawGridFloor();
-	DrawWordmark();
-	DrawAddressChip();
-	DrawMenuRows();
-	DrawFooter();
+	// ---- Which renderer draws this frame (spec v17 §4) --------------------------------------------
+	//
+	// The JOIN prompt and the settings overlay are Canvas modals, and the HUD's Canvas draws UNDER
+	// every Slate widget in the viewport. So while either is up the widget stands down and the Canvas
+	// path draws the whole screen underneath it, exactly as it did before this migration. That is
+	// also why neither of those two is converted yet: converting half of a modal stack is how you get
+	// a screen that draws twice.
+	const bool bWidgetAvailable = TryAdoptMenuWidget();
+	const bool bUseWidgetThisFrame = bWidgetAvailable && !OptionsMenu.IsOpen() && !IsJoinPromptOpen();
+	bMenuUmgActive = bUseWidgetThisFrame;
 
-	// After the footer, not before: the footer's dark strip runs to the bottom edge and would
-	// otherwise swallow the frame's bottom rail and two of its corner ticks.
-	DrawBezel();
-	DrawCursor();
-	DrawTravelOverlay();
+	if (bUseWidgetThisFrame)
+	{
+		MenuWidget->SetVisibility(ESlateVisibility::HitTestInvisible);
+
+		FTraceTitleMenuView View;
+		BuildMenuView(View);
+		MenuWidget->ApplyView(View);
+
+		// Hit testing stays here, off the rectangles Slate actually laid the rows out at. See
+		// PublishRowRectsFromWidget and the header of UTraceTitleMenuWidget.
+		PublishRowRectsFromWidget();
+	}
+	else
+	{
+		if (MenuWidget != nullptr)
+		{
+			MenuWidget->SetVisibility(ESlateVisibility::Collapsed);
+		}
+
+		DrawBackdrop();
+		DrawGridFloor();
+		DrawWordmark();
+		DrawAddressChip();
+		DrawMenuRows();
+		DrawFooter();
+
+		// After the footer, not before: the footer's dark strip runs to the bottom edge and would
+		// otherwise swallow the frame's bottom rail and two of its corner ticks.
+		DrawBezel();
+		DrawCursor();
+		DrawTravelOverlay();
+	}
 
 	// Over everything except the settings overlay, which cannot be open at the same time. A no-op
-	// while the field is inactive.
+	// while the field is inactive — and while it is NOT a no-op, bUseWidgetThisFrame is false, so
+	// this is always drawing over the Canvas title screen and never under a widget.
 	DrawJoinPrompt();
 
 	// AFTER the join prompt, not before. Measured from a screenshot: drawn earlier, the prompt's
 	// 78%-black scrim sat on top of the banner and turned the one message the player most needs to
 	// read into a dim brown smudge. The failure has to outrank every modal on this screen — the
 	// commonest moment to see it is the moment you are about to retype the address that just failed.
-	DrawFailureBanner();
+	//
+	// On the widget path the banner is a widget too, at the top of the tree, for the same reason.
+	if (!bUseWidgetThisFrame)
+	{
+		DrawFailureBanner();
+	}
 
 	// Last of all, over everything, including the travel overlay. Tick() is a no-op while closed.
 	OptionsMenu.Tick(this, GetOwningPlayerController(), ViewW, ViewH, UIScale, Now);
@@ -1770,22 +2031,25 @@ void ATraceMenuHUD::DrawMenuRows()
 	const int32 RowCount = static_cast<int32>(ETraceMenuRow::Count);
 
 	const float CX = ViewW * 0.5f;
-	const float RowW = FMath::Min(ViewW * 0.52f, 720.f * UIScale);
 	const float Spacing = TraceMenuStyle::RowSpacing * UIScale;
 
 	// The rows sit on an opaque console rather than straight on the grid. Without it the perspective
 	// lines run right through the labels and the blurb underneath is simply unreadable — the grid
 	// wins every legibility contest it is allowed to enter.
-	const float PadX = 34.f * UIScale;
-	const float PadTop = 22.f * UIScale;
-	const float PanelW = RowW + PadX * 2.f;
-	const float PanelX = CX - PanelW * 0.5f;
+	//
+	// The arithmetic moved into TraceMenuStyle::ComputeConsoleLayout in spec v17 §4 so that
+	// GetCanvasRowRect (which the UMG verifier compares against) and this draw cannot disagree.
 	// 0.395 rather than 0.415: JOIN made this a six-row panel, and at 1080p the old anchor pushed its
 	// bottom edge 7px under the footer's dark strip.
-	const float PanelY = ViewH * 0.395f;
-	const float PanelH = PadTop + (RowCount - 1) * Spacing + (TraceMenuStyle::RowHeight * UIScale) + (58.f * UIScale);
+	const TraceMenuStyle::FConsoleLayout Layout =
+		TraceMenuStyle::ComputeConsoleLayout(ViewW, ViewH, UIScale, RowCount);
+	const float RowW = Layout.RowW;
+	const float PanelX = Layout.PanelX;
+	const float PanelY = Layout.PanelY;
+	const float PanelW = Layout.PanelW;
+	const float PanelH = Layout.PanelH;
 
-	DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 0.94f), PanelX, PanelY, PanelW, PanelH);
+	DrawRect(TraceMenuStyle::PanelFill, PanelX, PanelY, PanelW, PanelH);
 
 	const float Edge = FMath::Max(1.f, 1.2f * UIScale);
 	const FLinearColor PanelEdge = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.28f);
@@ -1794,7 +2058,7 @@ void ATraceMenuHUD::DrawMenuRows()
 	DrawRect(PanelEdge, PanelX, PanelY, Edge, PanelH);
 	DrawRect(PanelEdge, PanelX + PanelW - Edge, PanelY, Edge, PanelH);
 
-	const float FirstY = PanelY + PadTop;
+	const float FirstY = Layout.FirstRowY;
 	for (int32 Index = 0; Index < RowCount; ++Index)
 	{
 		const ETraceMenuRow Row = static_cast<ETraceMenuRow>(Index);
@@ -1802,43 +2066,95 @@ void ATraceMenuHUD::DrawMenuRows()
 	}
 	bRowRectsValid = true;
 
+	DrawTextCentered(BuildBlurb(), TraceMenuStyle::InkDim,
+		CX, PanelY + PanelH - (36.f * UIScale), FontSmall, 1.1f * UIScale);
+}
+
+FString ATraceMenuHUD::BuildBlurb() const
+{
 	// One line of plain English under the rows, so "EASY" and "MODE B" mean something before you
 	// commit to them. It describes whichever row is SELECTED — every row now has something worth
 	// saying, and the two multiplayer rows have the most: PLAY silently became "host a server", and
 	// a player who is not told that will keep asking somebody else to host.
-	FString Blurb;
 	switch (Selected)
 	{
 	case ETraceMenuRow::Play:
-		Blurb = FString::Printf(TEXT("HOSTS A GAME ON %s.  OTHERS PICK JOIN AND TYPE THAT."),
+		return FString::Printf(TEXT("HOSTS A GAME ON %s.  OTHERS PICK JOIN AND TYPE THAT."),
 			*TraceNet::GetHostEndpoint());
-		break;
 
 	case ETraceMenuRow::Join:
-		Blurb = LastJoinAddress.IsEmpty()
+		return LastJoinAddress.IsEmpty()
 			? FString(TEXT("CONNECT TO SOMEBODY ELSE'S GAME.  YOU WILL NEED THEIR ADDRESS."))
 			: FString::Printf(TEXT("CONNECT TO SOMEBODY ELSE'S GAME.  ENTER RECONNECTS TO %s."), *LastJoinAddress);
-		break;
 
 	case ETraceMenuRow::Mode:
-		Blurb = FString(TraceScoringModeBlurb(ScoringMode));
-		break;
+		return FString(TraceScoringModeBlurb(ScoringMode));
 
 	case ETraceMenuRow::Settings:
-		Blurb = TEXT("MOUSE SENSITIVITY, INVERT Y AND EVERY KEY BINDING.");
-		break;
+		return TEXT("MOUSE SENSITIVITY, INVERT Y AND EVERY KEY BINDING.");
 
 	case ETraceMenuRow::Quit:
-		Blurb = TEXT("CLOSE TRACE.");
-		break;
+		return TEXT("CLOSE TRACE.");
 
 	default:
-		Blurb = TraceMenuStyle::DifficultyBlurb(Difficulty);
-		break;
+		return TraceMenuStyle::DifficultyBlurb(Difficulty);
+	}
+}
+
+void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRowView& OutView) const
+{
+	OutView = FTraceMenuRowView();
+	OutView.bSelected = bSelected;
+
+	switch (Row)
+	{
+	case ETraceMenuRow::Play:       OutView.Label = TEXT("PLAY");         break;
+	case ETraceMenuRow::Join:       OutView.Label = TEXT("JOIN");         break;
+	case ETraceMenuRow::Difficulty: OutView.Label = TEXT("DIFFICULTY");   break;
+	case ETraceMenuRow::Mode:       OutView.Label = TEXT("SCORING MODE"); break;
+	case ETraceMenuRow::Settings:   OutView.Label = TEXT("SETTINGS");     break;
+	case ETraceMenuRow::Quit:       OutView.Label = TEXT("QUIT");         break;
+	default:                        OutView.Label = TEXT("");             break;
 	}
 
-	DrawTextCentered(Blurb, TraceMenuStyle::InkDim,
-		CX, PanelY + PanelH - (36.f * UIScale), FontSmall, 1.1f * UIScale);
+	// The two NETWORK rows carry a right-aligned status word instead of a stepper. Small font, not
+	// the row font: an IPv4 address plus a port is twenty characters, and at the label's size it
+	// would collide with "JOIN" on a 1280-wide window. It is a readout, not a value to change.
+	if (Row == ETraceMenuRow::Play)
+	{
+		OutView.Status = FString::Printf(TEXT("HOST  %s"), *TraceNet::GetHostEndpoint());
+	}
+	else if (Row == ETraceMenuRow::Join)
+	{
+		OutView.Status = LastJoinAddress.IsEmpty() ? FString(TEXT("ENTER AN ADDRESS")) : LastJoinAddress;
+	}
+
+	// The two VALUE rows share one description: right-aligned value, arrows either side, dimmed at
+	// the ends of the range.
+	if (Row == ETraceMenuRow::Difficulty || Row == ETraceMenuRow::Mode)
+	{
+		const bool bIsModeRow = (Row == ETraceMenuRow::Mode);
+
+		// "A - ENDZONES" rather than the full "MODE A - ENDZONES": the row already says SCORING MODE
+		// on its left, and repeating the word inside the value pushes it into the label at 720p.
+		OutView.Value = bIsModeRow
+			? FString::Printf(TEXT("%s - %s"), TraceScoringModeLetter(ScoringMode), TraceScoringModeName(ScoringMode))
+			: TraceDifficulty::ToDisplayName(Difficulty);
+
+		// Mode B wears the amber that this screen reserves for "this is not the default" — the same
+		// colour HARD gets, for the same reason. Mode A is the shipped game and takes the plain cyan.
+		OutView.ValueColor = bIsModeRow
+			? (TraceIsGoalMode(ScoringMode) ? TraceMenuStyle::Amber : TraceMenuStyle::Cyan)
+			: TraceMenuStyle::DifficultyColor(Difficulty);
+
+		OutView.bShowArrows = true;
+		OutView.bCanLeft = bIsModeRow
+			? (ScoringMode != ETraceScoringMode::EndzoneStatusCore)
+			: (Difficulty != ETraceBotDifficulty::Easy);
+		OutView.bCanRight = bIsModeRow
+			? (ScoringMode != ETraceScoringMode::ThrownCoreAndGoals)
+			: (Difficulty != ETraceBotDifficulty::Hard);
+	}
 }
 
 FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float Width, bool bSelected)
@@ -1873,91 +2189,59 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 	const FLinearColor LabelColor = bSelected ? TraceMenuStyle::Ink : TraceMenuStyle::InkDim;
 	const float LabelScale = 1.55f * UIScale;
 
-	FString Label;
-	switch (Row)
+	// WHAT the row says is decided in exactly one place, BuildRowView, because the UMG renderer says
+	// the same things from the same call (spec v17 §4). This function is now purely HOW it looks on
+	// a Canvas.
+	FTraceMenuRowView RowView;
+	BuildRowView(Row, bSelected, RowView);
+
+	const float LabelY = Y + (RowH - MeasureHeight(RowView.Label, FontMedium, LabelScale)) * 0.5f;
+	DrawText(RowView.Label, LabelColor, X + PadX, LabelY, FontMedium, LabelScale);
+
+	if (!RowView.Status.IsEmpty())
 	{
-	case ETraceMenuRow::Play:       Label = TEXT("PLAY");         break;
-	case ETraceMenuRow::Join:       Label = TEXT("JOIN");         break;
-	case ETraceMenuRow::Difficulty: Label = TEXT("DIFFICULTY");   break;
-	case ETraceMenuRow::Mode:       Label = TEXT("SCORING MODE"); break;
-	case ETraceMenuRow::Settings:   Label = TEXT("SETTINGS");     break;
-	case ETraceMenuRow::Quit:       Label = TEXT("QUIT");         break;
-	default:                        Label = TEXT("");             break;
-	}
-
-	const float LabelY = Y + (RowH - MeasureHeight(Label, FontMedium, LabelScale)) * 0.5f;
-	DrawText(Label, LabelColor, X + PadX, LabelY, FontMedium, LabelScale);
-
-	// The two NETWORK rows carry a right-aligned status word instead of a stepper. Small font, not
-	// the row font: an IPv4 address plus a port is twenty characters, and at the label's size it
-	// would collide with "JOIN" on a 1280-wide window. It is a readout, not a value to change.
-	if (Row == ETraceMenuRow::Play || Row == ETraceMenuRow::Join)
-	{
-		const bool bIsPlayRow = (Row == ETraceMenuRow::Play);
-
-		const FString Value = bIsPlayRow
-			? FString::Printf(TEXT("HOST  %s"), *TraceNet::GetHostEndpoint())
-			: (LastJoinAddress.IsEmpty() ? FString(TEXT("ENTER AN ADDRESS")) : LastJoinAddress);
-
 		const float ValueScale = 1.05f * UIScale;
-		const FLinearColor ValueColor = bSelected
+		const FLinearColor StatusColor = bSelected
 			? TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.95f)
 			: TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.85f);
 
-		const float ValueW = MeasureWidth(Value, FontSmall, ValueScale);
-		const float ValueY = Y + (RowH - MeasureHeight(Value, FontSmall, ValueScale)) * 0.5f;
-		DrawText(Value, ValueColor, X + Width - PadX - ValueW, ValueY, FontSmall, ValueScale);
+		const float StatusW = MeasureWidth(RowView.Status, FontSmall, ValueScale);
+		const float StatusY = Y + (RowH - MeasureHeight(RowView.Status, FontSmall, ValueScale)) * 0.5f;
+		DrawText(RowView.Status, StatusColor, X + Width - PadX - StatusW, StatusY, FontSmall, ValueScale);
 	}
 
 	// The two VALUE rows share one renderer: right-aligned value, arrows either side, dimmed at the
 	// ends of the range. Written once because two copies of this maths is two copies to keep in
 	// alignment, and a title screen where one row's arrows sit two pixels off the other's is the
 	// kind of thing that reads as sloppy without anyone being able to say why.
-	if (Row == ETraceMenuRow::Difficulty || Row == ETraceMenuRow::Mode)
+	if (!RowView.Value.IsEmpty())
 	{
-		const bool bIsModeRow = (Row == ETraceMenuRow::Mode);
-
-		// "A - ENDZONES" rather than the full "MODE A - ENDZONES": the row already says SCORING MODE
-		// on its left, and repeating the word inside the value pushes it into the label at 720p.
-		const FString Value = bIsModeRow
-			? FString::Printf(TEXT("%s - %s"), TraceScoringModeLetter(ScoringMode), TraceScoringModeName(ScoringMode))
-			: TraceDifficulty::ToDisplayName(Difficulty);
-
-		// Mode B wears the amber that this screen reserves for "this is not the default" — the same
-		// colour HARD gets, for the same reason. Mode A is the shipped game and takes the plain cyan.
-		const FLinearColor ValueColor = bIsModeRow
-			? (TraceIsGoalMode(ScoringMode) ? TraceMenuStyle::Amber : TraceMenuStyle::Cyan)
-			: TraceMenuStyle::DifficultyColor(Difficulty);
-
-		const float ValueW = MeasureWidth(Value, FontMedium, LabelScale);
+		const float ValueW = MeasureWidth(RowView.Value, FontMedium, LabelScale);
 		const float ValueRight = X + Width - PadX;
-		const float ValueY = Y + (RowH - MeasureHeight(Value, FontMedium, LabelScale)) * 0.5f;
+		const float ValueY = Y + (RowH - MeasureHeight(RowView.Value, FontMedium, LabelScale)) * 0.5f;
 
-		DrawText(Value, ValueColor, ValueRight - ValueW, ValueY, FontMedium, LabelScale);
+		DrawText(RowView.Value, RowView.ValueColor, ValueRight - ValueW, ValueY, FontMedium, LabelScale);
 
-		// Arrows on both sides of the value, dimmed at the ends of the range so the player can see
-		// there is nothing further in that direction.
-		const float ArrowY = Y + RowH * 0.5f;
-		const float ArrowS = 8.f * UIScale;
-		const float ArrowT = FMath::Max(1.f, 2.f * UIScale);
-		const bool bCanLeft  = bIsModeRow
-			? (ScoringMode != ETraceScoringMode::EndzoneStatusCore)
-			: (Difficulty != ETraceBotDifficulty::Easy);
-		const bool bCanRight = bIsModeRow
-			? (ScoringMode != ETraceScoringMode::ThrownCoreAndGoals)
-			: (Difficulty != ETraceBotDifficulty::Hard);
+		if (RowView.bShowArrows)
+		{
+			// Arrows on both sides of the value, dimmed at the ends of the range so the player can see
+			// there is nothing further in that direction.
+			const float ArrowY = Y + RowH * 0.5f;
+			const float ArrowS = 8.f * UIScale;
+			const float ArrowT = FMath::Max(1.f, 2.f * UIScale);
 
-		const float LeftX = ValueRight - ValueW - (22.f * UIScale);
-		DrawLine(LeftX, ArrowY, LeftX + ArrowS, ArrowY - ArrowS,
-			TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bCanLeft ? 0.95f : 0.20f), ArrowT);
-		DrawLine(LeftX, ArrowY, LeftX + ArrowS, ArrowY + ArrowS,
-			TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bCanLeft ? 0.95f : 0.20f), ArrowT);
+			const float LeftX = ValueRight - ValueW - (22.f * UIScale);
+			DrawLine(LeftX, ArrowY, LeftX + ArrowS, ArrowY - ArrowS,
+				TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, RowView.bCanLeft ? 0.95f : 0.20f), ArrowT);
+			DrawLine(LeftX, ArrowY, LeftX + ArrowS, ArrowY + ArrowS,
+				TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, RowView.bCanLeft ? 0.95f : 0.20f), ArrowT);
 
-		const float RightX = ValueRight + (14.f * UIScale);
-		DrawLine(RightX, ArrowY - ArrowS, RightX + ArrowS, ArrowY,
-			TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bCanRight ? 0.95f : 0.20f), ArrowT);
-		DrawLine(RightX, ArrowY + ArrowS, RightX + ArrowS, ArrowY,
-			TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bCanRight ? 0.95f : 0.20f), ArrowT);
+			const float RightX = ValueRight + (14.f * UIScale);
+			DrawLine(RightX, ArrowY - ArrowS, RightX + ArrowS, ArrowY,
+				TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, RowView.bCanRight ? 0.95f : 0.20f), ArrowT);
+			DrawLine(RightX, ArrowY + ArrowS, RightX + ArrowS, ArrowY,
+				TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, RowView.bCanRight ? 0.95f : 0.20f), ArrowT);
+		}
 	}
 
 	return FBox2D(FVector2D(X, Y), FVector2D(X + Width, Y + RowH));

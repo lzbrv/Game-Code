@@ -13,14 +13,21 @@
 # extensions that DCC tools most often emit in caps (.PNG from some exporters,
 # .TGA / .FBX from older Max/Maya pipelines).
 #
+# THIS REPO HAS REAL ASSETS. As of 2026-08-09: 641 files / 5.14 MiB in LFS (the
+# baked arena's 572 external actors, 66 materials, 3 levels). Earlier docs called
+# the project "asset-free"; that has not been true since the arena was baked, and
+# the locking rules below are load-bearing rather than theoretical.
+#
 # `lockable` is set on the merge-hostile Unreal formats (.uasset/.umap/.fbx).
 # Those files cannot be merged — two people editing one is always data loss —
 # so the workflow is:
-#     git lfs lock   Content/Maps/Arena.umap
+#     git pull
+#     Scripts/lock.sh   Content/Maps/Arena_Baked.umap   # or: git lfs lock <path>
 #     ... edit, commit, push ...
-#     git lfs unlock Content/Maps/Arena.umap
+#     Scripts/unlock.sh Content/Maps/Arena_Baked.umap   # or: git lfs unlock <path>
 # `git lfs locks` lists who holds what. Locked files are checked out read-only
-# for everyone else, which is the point: the OS stops you before Git has to.
+# (-r--r--r--) for everyone else, which is the point: the OS stops you before Git
+# has to. Do not chmod it away — take the lock. Full workflow: docs/GITHUB.md §4.
 #
 # ONE FILE PER ACTOR CHANGES WHAT YOU LOCK, NOT WHETHER YOU LOCK (spec v15 §1.6).
 # /Game/Maps/Arena_Baked has "Use External Actors" on, so the arena is not one
@@ -31,8 +38,10 @@
 # wall meant locking the whole level and everybody else waited; now two people
 # lock two actors and neither notices the other. The unreadable GUID filenames
 # are the engine's, not ours — find the actor by its LABEL in the World Outliner
-# (Wall_North_01, Cover_037, Goal_Ring_Rim_12) and let the editor's source
-# control integration lock the file behind it.
+# (Wall_North_01, Cover_37, Goal_Ring_Rim_12; the numbering is zero-padded to two
+# digits, so Cover_37 and NOT Cover_037) and either let the editor's source
+# control integration lock the file behind it, or run `Scripts/lock.sh Cover_37`,
+# which resolves the label to its package for you.
 #
 # Produce or re-produce that map with:  Scripts/bake-arena.sh --force
 # ==============================================================================

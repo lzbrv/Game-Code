@@ -310,8 +310,33 @@ Scripts/setup-lfs.sh            # installs the filters if needed, verifies, and 
 command it runs, so it doubles as an explanation of what LFS is doing to your checkout. Run it with
 `--verify` any time you suspect LFS is not engaged.
 
-Read **[GITHUB.md](GITHUB.md) before your first commit.** Unreal breaks the normal Git workflow in
-ways that are not obvious and are painful to undo.
+The clone pulls about **8.3 MiB**: 3.12 MiB of Git objects and 5.14 MiB of binary assets through
+LFS (641 files — the baked arena, its materials, three levels).
+
+### The first thing that will confuse you: `Content/` is read-only
+
+Straight after cloning, every asset is checked out read-only:
+
+```
+$ stat -f '%Sp %N' Content/Maps/Arena_Baked.umap
+-r--r--r-- Content/Maps/Arena_Baked.umap
+```
+
+**This is deliberate and you must not `chmod` it away.** Binary assets cannot be merged, so the team
+takes a *lock* before editing one; the read-only bit is what stops two people starting the same edit
+in the first place. Taking the lock makes your copy writable:
+
+```bash
+Scripts/lock.sh Content/Maps/Arena_Baked.umap   # before you open it
+#   ... edit, commit, push ...
+Scripts/unlock.sh Content/Maps/Arena_Baked.umap # after you have pushed
+```
+
+If Unreal ever says it cannot save an asset, this is why — you do not hold the lock.
+
+Read **[GITHUB.md](GITHUB.md) before your first commit**, and §4 of it before you open any asset in
+the editor. Unreal breaks the normal Git workflow in ways that are not obvious and are painful to
+undo.
 
 ---
 
@@ -417,9 +442,11 @@ If every player on the field is a plain coloured capsule, this section is why.
 
 The characters use Epic's default Mannequin (`SKM_Manny_Simple` + `ABP_Unarmed`) for heads, limbs
 and run cycles. That art is **not in the repository** — `.gitignore` excludes `/Content/Characters/`
-deliberately. It is ~126 MB of binary content, and committing it would consume GitHub's Git-LFS free
-tier (roughly 1 GiB of storage *and* 1 GiB/month of bandwidth) that a four-person team cloning would
-burn through quickly. Keeping it out is what makes this repo ~1.3 MB.
+deliberately. It is ~126 MB of binary content, and it would be ~126 MB added to *every* clone and
+pull, against a GitHub Git-LFS free tier of 10 GiB of storage and 10 GiB/month of bandwidth shared
+across the whole account. Keeping it out is a large part of why a clone is ~8.3 MiB rather than
+~135 MB. (See [GITHUB.md §5](GITHUB.md) for the quota arithmetic — and note that the widely-quoted
+"1 GiB free" figure is out of date.)
 
 Instead it is copied out of **the Unreal install you already have** — every UE 5.8 install ships it
 under `Templates/TemplateResources`. No network access is involved.

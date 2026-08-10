@@ -18,11 +18,30 @@
 
 #include "Core/TraceMatchTypes.h"   // ETraceScoringMode (forward declaration) + its string helpers
 
-/** The only two levels in the project. */
+/**
+ * The three levels in the project.
+ *
+ * `Arena` IS THE ONE THE PLAY BUTTON OPENS, and spec v17 §2 repointed it from the procedural
+ * `/Game/Maps/Arena` to the baked `/Game/Maps/Arena_Baked`. That is the whole point of the
+ * migration — "the map you can edit is the map you ship".
+ *
+ * TO GO BACK, change ONE line: make `Arena` point at `ArenaProcedural` below. Nothing else in
+ * the project needs touching; `Config/DefaultEngine.ini`'s `ServerDefaultMap` and
+ * `Scripts/_trace_common.sh`'s `TRACE_DEFAULT_MAP` are the other two places that name a default
+ * arena, and each is a single documented line.
+ *
+ * `ArenaProcedural` is NOT dead. `/Game/Maps/Arena` is an empty level that ATraceArenaBuilder
+ * fills in from code at BeginPlay, and it is the control you measure the baked map against when
+ * the baked map starts behaving oddly. Reach it with `Scripts/run-listen-server.sh --map
+ * /Game/Maps/Arena`, or by opening it in the editor and pressing Play. Both maps were measured
+ * side by side and produce the same field, the same endzone and goal volumes, the same Core
+ * spawn and the same ~1291 wall-fitter boxes.
+ */
 namespace TraceMaps
 {
-	inline const TCHAR* MainMenu = TEXT("/Game/Maps/MainMenu");
-	inline const TCHAR* Arena    = TEXT("/Game/Maps/Arena");
+	inline const TCHAR* MainMenu        = TEXT("/Game/Maps/MainMenu");
+	inline const TCHAR* Arena           = TEXT("/Game/Maps/Arena_Baked");
+	inline const TCHAR* ArenaProcedural = TEXT("/Game/Maps/Arena");
 }
 
 /**

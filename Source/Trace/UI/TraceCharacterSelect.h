@@ -5,11 +5,21 @@
 //
 // SHAPED EXACTLY LIKE FTraceOptionsMenu, and for the same three reasons that class spells out: it is
 // plain C++ rather than a UObject (it holds nothing that outlives a frame and never replicates), it
-// is drawn entirely through AHUD::DrawRect / DrawText / DrawLine (contract §2 — no UMG, no .uasset),
-// and it POLLS input rather than binding it. The polling argument is the strongest one here: the
-// screen is up during the warm-up, when the local pawn may not exist yet and the gameplay input
-// component may not be wired, and a bound delegate on a pawn that has not spawned is a key press
-// that goes nowhere.
+// is drawn entirely through AHUD::DrawRect / DrawText / DrawLine, and it POLLS input rather than
+// binding it. The polling argument is the strongest one here: the screen is up during the warm-up,
+// when the local pawn may not exist yet and the gameplay input component may not be wired, and a
+// bound delegate on a pawn that has not spawned is a key press that goes nowhere.
+//
+// STILL ON CANVAS AS OF SPEC v17 §4, AND THAT IS A REPORTED DECISION, NOT AN OVERSIGHT.
+// The middle sentence above used to end "(contract §2 — no UMG, no .uasset)". THAT CONTRACT IS
+// RETIRED: the project commits .uassets now and the TITLE SCREEN is a real UMG widget behind
+// `Trace.UI.UseUMG` (see UI/Widgets/Menu/TraceTitleMenuWidget.h). This screen was not converted in
+// that pass because §4 orders the work title menu -> options -> character select and says plainly
+// that a half-converted screen is worse than an honest "not yet". What a conversion here has to
+// carry, and what makes it a pass of its own: per-team uniqueness is a SERVER verdict this screen
+// only reports, the bot-fill ordering of spec v15 §2, the pending-request timeout, and
+// `Trace.Characters.ClickTest`'s one-press-per-card measurement. None of that is layout.
+// Nothing here changed in that pass; it draws and behaves exactly as it did.
 //
 // ---------------------------------------------------------------------------------------------
 // WHAT THIS CLASS IS NOT ALLOWED TO DECIDE

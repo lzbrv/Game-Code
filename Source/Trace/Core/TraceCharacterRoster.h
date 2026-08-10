@@ -82,7 +82,13 @@ namespace TraceCharacterRoster
 		FLinearColor Accent = FLinearColor::White;
 	};
 
-	/** The table, in the doc's order: Rocco, Chut, Mace, Oyster, X. Always Count entries. */
+	/**
+	 * The table, in the doc's order: Rocco, Chut, Mace, Oyster, X. Always Count entries.
+	 *
+	 * *** SINCE SPEC v17 §5 THIS MAY BE SERVED FROM ASSETS. *** See the "TWO SOURCES" block at the
+	 * bottom of this header. Nothing about the shape changed: still Count entries, still in id
+	 * order, still TCHAR pointers with process lifetime, so every caller is unaffected.
+	 */
 	TRACE_API const TArray<FTraceCharacterEntry>& All();
 
 	/** Null for NoneId and for anything out of range. */
@@ -93,4 +99,56 @@ namespace TraceCharacterRoster
 
 	/** "ROCCO" / ... / "MANNEQUIN" for NoneId, so a log line never prints a bare number. */
 	TRACE_API FString NameFor(uint8 Id);
+
+	// =============================================================================================
+	// TWO SOURCES, ONE SHAPE — spec v17 §5, and rule §0.1 (opt-in, with a LIVE C++ fallback)
+	// =============================================================================================
+	//
+	// The five characters now also exist as UTraceCharacterDefinition assets under
+	// /Game/Trace/Data/Characters, generated from the C++ table below by
+	// Scripts/generate-data-assets.py. All() serves the ASSETS when all five load and validate, and
+	// the C++ table otherwise — asset missing, asset corrupt, an id out of place, or the toggle off.
+	//
+	// IT IS ALL FIVE OR NONE, deliberately. A roster that was four assets and one C++ row would be a
+	// half-migration: the select screen would look right and nobody could say which row came from
+	// where. One decision, logged once, at the top of the log.
+	//
+	// THE TOGGLE:  Trace.Data.UseCharacterAssets  0|1   (default 1; 0 forces the C++ table)
+	// THE PROOF:   Trace.VerifyCharacterData            (field-by-field, and it can go red)
+	// THE DUMP:    Trace.Data.DumpCharacters            (says which source, and prints every row)
+	//
+	// THE NUMBERS THE ASSETS DO NOT HOLD: everything UTraceSettings holds today still lives there
+	// and only there. The assets carry a character's identity and the words on its card. See
+	// Data/TraceCharacterDefinition.h for the full statement of who owns what.
+
+	/** Which table All() is serving right now. */
+	enum class ESource : uint8
+	{
+		/** The table compiled into TraceCharacterRoster.cpp. Always available. */
+		CppTable = 0,
+
+		/** The five UTraceCharacterDefinition assets. */
+		Assets = 1
+	};
+
+	/** Resolves the source on the first call, exactly as All() does. */
+	TRACE_API ESource CurrentSource();
+
+	/** "C++ table" / "assets (/Game/Trace/Data/Characters)". For logs and the HUD's dev overlay. */
+	TRACE_API const TCHAR* CurrentSourceName();
+
+	/**
+	 * THE C++ TABLE, ALWAYS — whatever All() is currently serving.
+	 *
+	 * This is what makes rule §0.1 checkable rather than asserted: the verifier compares the loaded
+	 * assets against this, and the fallback is not a code path that only runs when something is
+	 * broken, it is a table that is always there and always readable.
+	 */
+	TRACE_API const TArray<FTraceCharacterEntry>& CppFallbackTable();
+
+	/**
+	 * Drop the resolved table so the next All() decides again. Called by the console commands and by
+	 * the generator's verification pass; there is no reason for gameplay code to call it.
+	 */
+	TRACE_API void ForceReload();
 }
