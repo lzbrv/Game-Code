@@ -34,8 +34,10 @@
 
 #include "Core/TraceGameMode.h"
 #include "Core/TraceGameState.h"
+#include "Abilities/TraceAbilityComponent.h"    // Trace.Bounds.Verify: "the cooldown kept ticking"
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"
+#include "Gameplay/TraceRailgunFireCurve.h"
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceParry.h"                // the parry entry point and its queries (spec §3)
 #include "Gameplay/TraceTrailComponent.h"
@@ -315,6 +317,51 @@ namespace TraceCharacterLayout
 
 	/** One kick per shot however many code paths report the same shot. */
 	constexpr double FireKickRefractorySeconds = 0.02;
+
+	// --- The railgun ------------------------------------------------------------------------------
+	//
+	// The blocky procedural gun above is the FALLBACK now. When the imported railgun art resolves,
+	// three static meshes stand in for the twelve gun cubes (the hands, knuckles, forearms and cuffs
+	// are still built from the table — they hold the new weapon, they were never part of it).
+	//
+	// SCALE. The source model is authored 1:1 in metres and measures 185 cm nose to tail, which is a
+	// real railgun and about six times the length of the cube gun it replaces. Everything is placed
+	// against the mesh's own measured landmarks, so these three numbers are the whole placement:
+	//
+	//   grip     mesh-local (-30.0, 0, -9.0) uu   ->  rig (-0.8, 0, -4.6), the right hand
+	//   foregrip mesh-local (+30.0, 0, -4.5) uu   ->  rig, where the left hand is moved to
+	//   muzzle   mesh-local (107.4, 0, +4.5) uu   ->  rig  29.4 uu out, vs the cube gun's 19.6
+	//
+	// RailgunOrigin is therefore not a taste value: it is (right hand) - RailgunScale * (grip).
+	constexpr float RailgunScale = 0.22f;
+	const FVector RailgunOrigin(5.8f, 0.f, -2.6f);
+
+	/** Mesh-local landmarks, in the mesh's own centimetres. Read out of railgun_manifest.json. */
+	const FVector RailgunMuzzleLocal(107.4f, 0.f, 4.5f);
+
+	/**
+	 * The left hand moves off the cube gun's frame and onto the railgun's foregrip, dropped half the
+	 * foregrip's depth so the fist closes around it rather than resting on top.
+	 */
+	const FVector RailgunLeftHand(12.4f, -2.6f, -5.5f);
+	const FVector RailgunLeftKnuckle(14.5f, -2.6f, -4.5f);
+
+	// Fire animation. The artist's clip is 1.90 s: 1.05 s of charge, a 0.10 s discharge, then 0.75 s
+	// of decay. Trace's gun has NO windup — it is a 150 RPM hitscan — so the charge segment is not
+	// played; the shot IS the discharge frame, and what plays is the tail from there to the end,
+	// time-warped to finish inside one fire interval so the rails are always shut before the next
+	// round leaves. See Source/Trace/Gameplay/TraceRailgunFireCurve.h for the authored table.
+	constexpr float RailgunFireMinSeconds = 0.12f;
+	constexpr float RailgunFireIntervalFraction = 0.9f;
+
+	/** Rail walls throw ±75 mm apart and cant outward; both are mesh centimetres, so both scale. */
+	constexpr float RailgunRailThrowUU = 7.5f;
+	constexpr float RailgunRailCantDegrees = 4.f;
+
+	/** The receiver's own recoil INSIDE the hands — 45 mm back, 0.10 rad down, as authored. This is
+	  * on top of ViewModelKick, which recoils the whole rig (hands included) and is not replaced. */
+	constexpr float RailgunRecoilBackUU = 4.5f;
+	constexpr float RailgunRecoilPitchDegrees = 5.73f;
 }
 
 namespace TraceCharacterAssets
@@ -361,6 +408,26 @@ namespace TraceCharacterAssets
 	/** Pre-v17 generator output. Gitignored, so present only on a machine that ran the generator. */
 	const TCHAR* const LegacySurfaceMaterialPath = TEXT("/Game/Generated/Materials/M_TraceSurface.M_TraceSurface");
 	const TCHAR* const LegacyNeonMaterialPath = TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon");
+
+	/**
+	 * The railgun. COMMITTED, unlike the Mannequin — this is our own art, not Epic's, so it lives in
+	 * the repository (through LFS) and needs no import step on a fresh clone.
+	 *
+	 * Authored in Art/Railgun/railgun.glb and turned into these assets by Scripts/import-railgun.sh.
+	 * Three meshes rather than one because the fire animation throws the two rail walls apart; each
+	 * wall is baked around its own hinge so rotating the component swings the muzzle end outward.
+	 *
+	 * All optional. If any of the three misses, EnsureViewModelBuilt() falls back to the procedural
+	 * cube gun and says so — the same contract every other asset in this file honours. Launch with
+	 * -TraceNoRailgun to take that path deliberately.
+	 */
+	const TCHAR* const RailgunBodyMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_Railgun_Body.SM_Railgun_Body");
+	const TCHAR* const RailgunRailLeftMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_Railgun_RailL.SM_Railgun_RailL");
+	const TCHAR* const RailgunRailRightMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_Railgun_RailR.SM_Railgun_RailR");
+
+	/** Material slot names baked into the meshes, used to find the two glowing slots to animate. */
+	const FName RailgunCyanSlot(TEXT("circuit_cyan"));
+	const FName RailgunAmberSlot(TEXT("core_amber"));
 
 	/** Printed at most once per process, so a missing import is loud but not spam. */
 	const TCHAR* const MissingImportHint =
@@ -915,6 +982,29 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 		}
 	}
 
+	// The railgun's three meshes. Constructor-time finders for the same reason as everything above:
+	// the reference lands on the CDO, so the cooker packages the art without anyone maintaining a
+	// list of "additional assets to cook". A miss is not an error here — EnsureViewModelBuilt()
+	// checks all three and builds the cube gun instead if any is absent.
+	{
+		static ConstructorHelpers::FObjectFinder<UStaticMesh> RailgunBodyFinder(TraceCharacterAssets::RailgunBodyMeshPath);
+		static ConstructorHelpers::FObjectFinder<UStaticMesh> RailgunRailLeftFinder(TraceCharacterAssets::RailgunRailLeftMeshPath);
+		static ConstructorHelpers::FObjectFinder<UStaticMesh> RailgunRailRightFinder(TraceCharacterAssets::RailgunRailRightMeshPath);
+
+		if (RailgunBodyFinder.Succeeded())
+		{
+			RailgunBodyMesh = RailgunBodyFinder.Object;
+		}
+		if (RailgunRailLeftFinder.Succeeded())
+		{
+			RailgunRailLeftMesh = RailgunRailLeftFinder.Object;
+		}
+		if (RailgunRailRightFinder.Succeeded())
+		{
+			RailgunRailRightMesh = RailgunRailRightFinder.Object;
+		}
+	}
+
 	// Body: a cylinder standing on the bottom of the capsule, as wide as the capsule is.
 	{
 		const float BodyScaleXY = (TraceCharacterLayout::CapsuleRadius * 2.f) / TraceCharacterLayout::BasicShapeSize;
@@ -1161,7 +1251,13 @@ void ATraceCharacter::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	// The only reason this pawn ticks. See UpdateViewBlend().
+	// SPEC v19 §4.1, first, and server-only. It is here rather than in the game mode because the
+	// question is about ONE pawn's transform and this is the function that already runs once per pawn
+	// per frame; a game-mode sweep would be a second iteration over the same actors to ask the same
+	// thing. Two branches on a client, where it returns immediately.
+	ServerCheckArenaBounds();
+
+	// The rest of this function is presentation. See UpdateViewBlend().
 	//
 	// The rotation model is re-asserted here rather than only on possession because on a client the
 	// controller arrives by replication, after the pawn: there is no PossessedBy() on that machine.
@@ -1215,6 +1311,177 @@ void ATraceCharacter::OnRep_PlayerState()
 	// Client side, the PlayerState pointer can arrive before or after the pawn, and its Team can
 	// arrive after that again. Every path that could learn the team ends up here.
 	ApplyTeamColors();
+}
+
+// =================================================================================================
+// SPEC v19 §4.1 — OUT OF BOUNDS: DIE AND RESPAWN
+//
+// Verbatim: "If a player ever goes out of bounds of the arena, they should die and respawn."
+//
+// WHAT WAS ALREADY THERE, AND WHY IT IS NOT ENOUGH. FellOutOfWorld() below already turns the engine's
+// KillZ into a real death, so falling THROUGH the floor was covered. Nothing covered leaving the
+// arena sideways — through a seam, over a wall, out past a goal alcove — and the two characters
+// landing this pass make that dramatically more reachable: Lily gets five seconds of flight and
+// Mortimer gets a mantle. The spec's own warning is the design constraint here.
+//
+// *** THIS IS DELIBERATELY A HORIZONTAL TEST, PLUS A FLOOR. THERE IS NO CEILING BY DEFAULT. ***
+// "Out of bounds" has to mean GENUINELY OUTSIDE THE ARENA and not "higher than usual", because the
+// arena has no roof and a flying Lily above the wall line is still over the pitch, still inside the
+// playing area seen from above, and still coming down. A ceiling that killed her would be a new bug
+// wearing this feature's clothes. Trace.Bounds.CeilingMargin exists for a designer who disagrees and
+// is 0 (off) as shipped.
+//
+// The margins are generous on purpose. This rule's failure modes are wildly asymmetric: a boundary
+// that is slightly too tight kills players who are standing somewhere legal, which is unplayable; a
+// boundary that is slightly too loose lets somebody stand in a void for another half second before
+// dying, which nobody will ever notice.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarBoundsEnabled(
+	TEXT("Trace.Bounds.Enabled"), 1,
+	TEXT("SPEC v19 §4.1. 1 (shipped): a player genuinely outside the arena dies and respawns, credited "
+	     "to nobody. 0: removes the rule, which is the A/B arm Trace.Bounds.Verify must go RED on."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarBoundsMarginXY(
+	TEXT("Trace.Bounds.MarginXY"), 1200.f,
+	TEXT("SPEC v19 §4.1. How far OUTSIDE the arena footprint, in uu, a player may be before it counts "
+	     "as out of bounds. Generous by design: goal alcoves and the standoff shells all sit at or just "
+	     "past the wall line, and killing somebody standing in a legal alcove is far worse than letting "
+	     "somebody hang in a void for another half second."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarBoundsMarginBelow(
+	TEXT("Trace.Bounds.MarginBelow"), 800.f,
+	TEXT("SPEC v19 §4.1. How far BELOW the arena floor, in uu, before a player is out of bounds. This "
+	     "usually fires before the engine's KillZ does, which is the point: it produces a death that "
+	     "reads as 'you left the arena' rather than one that reads as the world ending."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarBoundsCeilingMargin(
+	TEXT("Trace.Bounds.CeilingMargin"), 0.f,
+	TEXT("SPEC v19 §4.1. 0 (shipped, and the default on purpose): THERE IS NO CEILING. Lily flies and "
+	     "Mortimer mantles, so 'above the wall line' is a legal place to be and must not be a death. "
+	     "Set it to a positive number of uu above the wall tops to add one anyway."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarBoundsGraceSeconds(
+	TEXT("Trace.Bounds.GraceSeconds"), 0.35f,
+	TEXT("SPEC v19 §4.1. How long a player must be continuously outside before the rule kills them. "
+	     "Not a hair trigger: a depenetration push, an unratified teleport and the frame between a "
+	     "spawn transform and its first movement update all look like one frame out of bounds."),
+	ECVF_Default);
+
+/** Counts real out-of-bounds deaths. Read by Trace.Bounds.Verify so the harness is evidence. */
+static int32 GTraceOutOfBoundsDeaths = 0;
+
+/** The FName the death panel and the kill credit see. "the arena" is what the panel prints for it. */
+static const FName GTraceOutOfBoundsCause(TEXT("OutOfBounds"));
+
+bool ATraceCharacter::IsLocationOutOfArenaBounds(const UWorld* World, const FVector& Location, FString& OutReason)
+{
+	OutReason.Reset();
+
+	if (World == nullptr || CVarBoundsEnabled.GetValueOnAnyThread() == 0)
+	{
+		return false;
+	}
+
+	const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
+	if (Arena == nullptr)
+	{
+		// No arena means no bounds to be outside of — a menu map, the practice range if it is carved
+		// somewhere else, a test fixture. Refusing to guess is the only safe answer: a rule that kills
+		// on a map it does not understand is a rule that deletes somebody else's feature.
+		return false;
+	}
+
+	const FBox Field = Arena->GetFieldBounds();
+	if (Field.IsValid == 0)
+	{
+		return false;
+	}
+
+	const double MarginXY = FMath::Max(0.f, CVarBoundsMarginXY.GetValueOnAnyThread());
+	const double MarginBelow = FMath::Max(0.f, CVarBoundsMarginBelow.GetValueOnAnyThread());
+	const double CeilingMargin = CVarBoundsCeilingMargin.GetValueOnAnyThread();
+
+	if (Location.X < Field.Min.X - MarginXY || Location.X > Field.Max.X + MarginXY)
+	{
+		OutReason = FString::Printf(TEXT("%.0f uu past the end wall"),
+			(Location.X < Field.Min.X) ? (Field.Min.X - Location.X) : (Location.X - Field.Max.X));
+		return true;
+	}
+
+	if (Location.Y < Field.Min.Y - MarginXY || Location.Y > Field.Max.Y + MarginXY)
+	{
+		OutReason = FString::Printf(TEXT("%.0f uu past the sideline wall"),
+			(Location.Y < Field.Min.Y) ? (Field.Min.Y - Location.Y) : (Location.Y - Field.Max.Y));
+		return true;
+	}
+
+	if (Location.Z < Field.Min.Z - MarginBelow)
+	{
+		OutReason = FString::Printf(TEXT("%.0f uu below the floor"), Field.Min.Z - Location.Z);
+		return true;
+	}
+
+	// See the block above: OFF by default, and that is a decision rather than an oversight.
+	if (CeilingMargin > 0.f && Location.Z > Field.Max.Z + CeilingMargin)
+	{
+		OutReason = FString::Printf(TEXT("%.0f uu above the wall tops"), Location.Z - Field.Max.Z);
+		return true;
+	}
+
+	return false;
+}
+
+void ATraceCharacter::ServerCheckArenaBounds()
+{
+	UWorld* const MyWorld = GetWorld();
+	if (!HasAuthority() || MyWorld == nullptr || !IsAlive() || Health == nullptr)
+	{
+		OutOfBoundsSinceServerTime = -1.f;
+		return;
+	}
+
+	FString Reason;
+	if (!IsLocationOutOfArenaBounds(MyWorld, GetActorLocation(), Reason))
+	{
+		OutOfBoundsSinceServerTime = -1.f;
+		return;
+	}
+
+	const float NowSeconds = static_cast<float>(MyWorld->GetTimeSeconds());
+	if (OutOfBoundsSinceServerTime < 0.f)
+	{
+		OutOfBoundsSinceServerTime = NowSeconds;
+		return;   // The grace starts here. See the field's comment for what it is protecting against.
+	}
+
+	if ((NowSeconds - OutOfBoundsSinceServerTime) < FMath::Max(0.f, CVarBoundsGraceSeconds.GetValueOnAnyThread()))
+	{
+		return;
+	}
+
+	OutOfBoundsSinceServerTime = -1.f;
+	++GTraceOutOfBoundsDeaths;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Bounds] spec v19 §4.1: %s went OUT OF BOUNDS at %s (%s) - killing them. Credited to "
+		     "nobody; their ability cooldowns keep running through it."),
+		*GetName(), *GetActorLocation().ToCompactString(), *Reason);
+
+	// Kill(), not ApplyDamage(), for the same reason FellOutOfWorld() uses it: a Core carrier is
+	// invulnerable to damage, and a carrier who walks out of the world would otherwise take the Core
+	// with them permanently. This is a world death, so it goes through the door the trail uses.
+	//
+	// *** THE KILLER IS DELIBERATELY nullptr. *** That is what makes it uncreditable:
+	// ATraceGameMode::NotifyCharacterDied reads a null killer as bSelfKill, which skips the Kills
+	// column entirely and makes the victim's death panel say "by the arena". Passing GetController()
+	// would reach the same place today, but only because a self-kill happens to be excluded too —
+	// null says the thing we actually mean.
+	Health->Kill(nullptr, GTraceOutOfBoundsCause);
 }
 
 void ATraceCharacter::FellOutOfWorld(const UDamageType& DmgType)
@@ -2025,42 +2292,77 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		FRotator Rotation;
 		FVector Size;
 		bool bNeon;
+		/** Part of the WEAPON (skipped when the railgun was built) rather than part of the HANDS. */
+		bool bWeapon;
 	};
+
+	// The railgun replaces the twelve gun parts if its art resolved. The hands and arms below are
+	// built either way — they are what holds whichever weapon won.
+	const bool bRailgun = BuildRailgunViewModel();
 
 	const FViewModelPart Parts[] =
 	{
 		// The gun. A slide over a frame over a raked grip: three masses, which is what makes a
 		// blocky shape read as a handgun rather than as a brick.
-		{ TEXT("VMSlide"),      false, FVector(9.0f, 0.f, 2.4f),    FRotator::ZeroRotator,        FVector(21.0f, 4.6f, 5.2f),  false },
-		{ TEXT("VMFrame"),      false, FVector(7.0f, 0.f, -1.6f),   FRotator::ZeroRotator,        FVector(16.5f, 4.2f, 4.4f),  false },
-		{ TEXT("VMGrip"),       false, FVector(-1.6f, 0.f, -8.2f),  FRotator(14.f, 0.f, 0.f),     FVector(5.6f, 4.0f, 13.5f),  false },
-		{ TEXT("VMGuard"),      false, FVector(3.2f, 0.f, -4.6f),   FRotator::ZeroRotator,        FVector(5.6f, 3.0f, 1.4f),   false },
+		{ TEXT("VMSlide"),      false, FVector(9.0f, 0.f, 2.4f),    FRotator::ZeroRotator,        FVector(21.0f, 4.6f, 5.2f),  false, true  },
+		{ TEXT("VMFrame"),      false, FVector(7.0f, 0.f, -1.6f),   FRotator::ZeroRotator,        FVector(16.5f, 4.2f, 4.4f),  false, true  },
+		{ TEXT("VMGrip"),       false, FVector(-1.6f, 0.f, -8.2f),  FRotator(14.f, 0.f, 0.f),     FVector(5.6f, 4.0f, 13.5f),  false, true  },
+		{ TEXT("VMGuard"),      false, FVector(3.2f, 0.f, -4.6f),   FRotator::ZeroRotator,        FVector(5.6f, 3.0f, 1.4f),   false, true  },
 
 		// Light channels. The muzzle ring is a cylinder turned to point down the barrel (pitch 90
 		// swings the shape's own +Z axis onto +X), and it is the piece that makes the gun read as a
 		// weapon at a glance: a lit circle where the shot comes out.
-		{ TEXT("VMMuzzle"),     true,  FVector(19.6f, 0.f, 2.4f),   FRotator(90.f, 0.f, 0.f),     FVector(5.8f, 5.8f, 2.2f),   true  },
-		{ TEXT("VMSlideNeon"),  false, FVector(8.4f, 0.f, 5.3f),    FRotator::ZeroRotator,        FVector(16.5f, 1.8f, 1.5f),  true  },
-		{ TEXT("VMSight"),      false, FVector(17.6f, 0.f, 5.6f),   FRotator::ZeroRotator,        FVector(1.4f, 1.4f, 2.0f),   true  },
-		{ TEXT("VMSideNeonL"),  false, FVector(7.6f, -2.4f, 0.4f),  FRotator::ZeroRotator,        FVector(12.5f, 0.9f, 1.6f),  true  },
-		{ TEXT("VMSideNeonR"),  false, FVector(7.6f, 2.4f, 0.4f),   FRotator::ZeroRotator,        FVector(12.5f, 0.9f, 1.6f),  true  },
-		{ TEXT("VMGripNeon"),   false, FVector(-3.9f, 0.f, -8.0f),  FRotator(14.f, 0.f, 0.f),     FVector(1.2f, 3.0f, 9.5f),   true  },
-		{ TEXT("VMRearSight"),  false, FVector(1.4f, 0.f, 5.6f),    FRotator::ZeroRotator,        FVector(1.6f, 3.6f, 2.0f),   true  },
-		{ TEXT("VMRailNeon"),   false, FVector(6.5f, 0.f, -3.9f),   FRotator::ZeroRotator,        FVector(13.0f, 1.6f, 1.0f),  true  },
+		{ TEXT("VMMuzzle"),     true,  FVector(19.6f, 0.f, 2.4f),   FRotator(90.f, 0.f, 0.f),     FVector(5.8f, 5.8f, 2.2f),   true,  true  },
+		{ TEXT("VMSlideNeon"),  false, FVector(8.4f, 0.f, 5.3f),    FRotator::ZeroRotator,        FVector(16.5f, 1.8f, 1.5f),  true,  true  },
+		{ TEXT("VMSight"),      false, FVector(17.6f, 0.f, 5.6f),   FRotator::ZeroRotator,        FVector(1.4f, 1.4f, 2.0f),   true,  true  },
+		{ TEXT("VMSideNeonL"),  false, FVector(7.6f, -2.4f, 0.4f),  FRotator::ZeroRotator,        FVector(12.5f, 0.9f, 1.6f),  true,  true  },
+		{ TEXT("VMSideNeonR"),  false, FVector(7.6f, 2.4f, 0.4f),   FRotator::ZeroRotator,        FVector(12.5f, 0.9f, 1.6f),  true,  true  },
+		{ TEXT("VMGripNeon"),   false, FVector(-3.9f, 0.f, -8.0f),  FRotator(14.f, 0.f, 0.f),     FVector(1.2f, 3.0f, 9.5f),   true,  true  },
+		{ TEXT("VMRearSight"),  false, FVector(1.4f, 0.f, 5.6f),    FRotator::ZeroRotator,        FVector(1.6f, 3.6f, 2.0f),   true,  true  },
+		{ TEXT("VMRailNeon"),   false, FVector(6.5f, 0.f, -3.9f),   FRotator::ZeroRotator,        FVector(13.0f, 1.6f, 1.0f),  true,  true  },
 
 		// Hands. Blocks, not fingers: at this scale and this framing a gloved fist is a shape, and
 		// trying to model knuckles on a 6 uu cube only produces noise. What DOES read is a lit bar
 		// across each one — a knuckle line, in the same language as everything else in this world.
-		{ TEXT("VMHandR"),      false, FVector(-0.8f, 0.f, -4.6f),  FRotator(14.f, 0.f, 0.f),     FVector(5.6f, 5.4f, 7.0f),   false },
-		{ TEXT("VMKnuckleR"),   false, FVector(1.4f, 0.f, -3.2f),   FRotator(14.f, 0.f, 0.f),     FVector(1.2f, 5.0f, 4.6f),   true  },
-		{ TEXT("VMHandL"),      false, FVector(2.8f, -3.4f, -4.0f), FRotator::ZeroRotator,        FVector(5.0f, 4.8f, 5.6f),   false },
-		{ TEXT("VMKnuckleL"),   false, FVector(4.9f, -3.4f, -3.0f), FRotator::ZeroRotator,        FVector(1.1f, 4.4f, 3.8f),   true  }
+		{ TEXT("VMHandR"),      false, FVector(-0.8f, 0.f, -4.6f),  FRotator(14.f, 0.f, 0.f),     FVector(5.6f, 5.4f, 7.0f),   false, false },
+		{ TEXT("VMKnuckleR"),   false, FVector(1.4f, 0.f, -3.2f),   FRotator(14.f, 0.f, 0.f),     FVector(1.2f, 5.0f, 4.6f),   true,  false },
+		{ TEXT("VMHandL"),      false, FVector(2.8f, -3.4f, -4.0f), FRotator::ZeroRotator,        FVector(5.0f, 4.8f, 5.6f),   false, false },
+		{ TEXT("VMKnuckleL"),   false, FVector(4.9f, -3.4f, -3.0f), FRotator::ZeroRotator,        FVector(1.1f, 4.4f, 3.8f),   true,  false }
 	};
 
-	for (const FViewModelPart& Part : Parts)
+	// The right hand does not move: RailgunOrigin was DERIVED from it, so the railgun's grip lands
+	// in it by construction. The left hand does — it comes off the cube gun's frame and forward onto
+	// the railgun's foregrip, which is 9.6 uu further out.
+	constexpr int32 LeftHandIndex = 14;
+	constexpr int32 LeftKnuckleIndex = 15;
+	checkf(FCString::Strcmp(Parts[LeftHandIndex].Name, TEXT("VMHandL")) == 0
+		&& FCString::Strcmp(Parts[LeftKnuckleIndex].Name, TEXT("VMKnuckleL")) == 0,
+		TEXT("The viewmodel part table was reordered; the left-hand indices below no longer point "
+			 "at the left hand, so the railgun would be held by nothing."));
+
+	const FVector LeftHand = bRailgun ? TraceCharacterLayout::RailgunLeftHand : Parts[LeftHandIndex].Location;
+	const FVector LeftKnuckle = bRailgun ? TraceCharacterLayout::RailgunLeftKnuckle : Parts[LeftKnuckleIndex].Location;
+
+	for (int32 Index = 0; Index < UE_ARRAY_COUNT(Parts); ++Index)
 	{
+		const FViewModelPart& Part = Parts[Index];
+		if (bRailgun && Part.bWeapon)
+		{
+			continue;
+		}
+
+		FVector Location = Part.Location;
+		if (Index == LeftHandIndex)
+		{
+			Location = LeftHand;
+		}
+		else if (Index == LeftKnuckleIndex)
+		{
+			Location = LeftKnuckle;
+		}
+
 		AddViewModelPart(Part.bCylinder ? CylinderMesh : CubeMesh, Part.Name,
-			Part.Location, Part.Rotation, Part.Size,
+			Location, Part.Rotation, Part.Size,
 			Part.bNeon ? ViewModelNeonMID : ViewModelBodyMID);
 	}
 
@@ -2083,7 +2385,7 @@ void ATraceCharacter::EnsureViewModelBuilt()
 	const FForearmSpec Forearms[] =
 	{
 		{ TEXT("VMForearmR"), TEXT("VMCuffR"), FVector(-0.8f, 0.f, -4.6f),  FVector(-0.42f, 0.36f, -0.86f),  17.f, 7.0f },
-		{ TEXT("VMForearmL"), TEXT("VMCuffL"), FVector(2.8f, -3.4f, -4.0f), FVector(-0.40f, -0.38f, -0.86f), 16.f, 6.7f }
+		{ TEXT("VMForearmL"), TEXT("VMCuffL"), LeftHand,                    FVector(-0.40f, -0.38f, -0.86f), 16.f, 6.7f }
 	};
 
 	for (const FForearmSpec& Arm : Forearms)
@@ -2120,6 +2422,225 @@ void ATraceCharacter::EnsureViewModelBuilt()
 
 	UE_LOG(LogTraceGame, Verbose, TEXT("%s built a first-person viewmodel (%d parts)."),
 		*GetName(), ViewModelParts.Num());
+}
+
+bool ATraceCharacter::BuildRailgunViewModel()
+{
+	if (RailgunBodyMesh == nullptr || RailgunRailLeftMesh == nullptr || RailgunRailRightMesh == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("Railgun art did not resolve (body=%s railL=%s railR=%s); building the fallback gun. ")
+			TEXT("Run Scripts/import-railgun.sh, or `git lfs pull` if this is a fresh clone."),
+			RailgunBodyMesh != nullptr ? TEXT("ok") : TEXT("MISSING"),
+			RailgunRailLeftMesh != nullptr ? TEXT("ok") : TEXT("MISSING"),
+			RailgunRailRightMesh != nullptr ? TEXT("ok") : TEXT("MISSING"));
+		return false;
+	}
+
+	// The same escape hatch -TraceNoCharacterArt gives the Mannequin: a way to SEE the fallback
+	// without deleting anything, so "does the fallback still work" is a launch flag and not a
+	// destructive experiment.
+	if (FParse::Param(FCommandLine::Get(), TEXT("TraceNoRailgun")))
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("-TraceNoRailgun: building the procedural gun on purpose."));
+		return false;
+	}
+
+	const float S = TraceCharacterLayout::RailgunScale;
+	const FVector Size(TraceCharacterLayout::ViewModelShapeUnit * S);   // AddViewModelPart divides by the unit
+
+	// The body carries its own materials from the asset, so no MID is passed: AddViewModelPart only
+	// overrides slot 0, and this mesh has five slots that are already correct.
+	RailgunBodyPart = AddViewModelPart(RailgunBodyMesh, TEXT("VMRailgunBody"),
+		TraceCharacterLayout::RailgunOrigin, FRotator::ZeroRotator, Size, nullptr);
+
+	// Each wall's mesh is baked around its hinge, so its rest position is the hinge offset scaled
+	// into rig space and its rest rotation is zero. Those offsets came out of the source model and
+	// are mirrored, hence one constant and a sign.
+	const FVector HingeOffset(-5.0f, 7.8f, 4.5f);
+	RailgunRailLeftPart = AddViewModelPart(RailgunRailLeftMesh, TEXT("VMRailgunRailL"),
+		TraceCharacterLayout::RailgunOrigin + FVector(HingeOffset.X, -HingeOffset.Y, HingeOffset.Z) * S,
+		FRotator::ZeroRotator, Size, nullptr);
+	RailgunRailRightPart = AddViewModelPart(RailgunRailRightMesh, TEXT("VMRailgunRailR"),
+		TraceCharacterLayout::RailgunOrigin + HingeOffset * S,
+		FRotator::ZeroRotator, Size, nullptr);
+
+	if (RailgunBodyPart == nullptr || RailgunRailLeftPart == nullptr || RailgunRailRightPart == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("Railgun parts failed to attach; falling back."));
+		RailgunBodyPart = nullptr;
+		RailgunRailLeftPart = nullptr;
+		RailgunRailRightPart = nullptr;
+		return false;
+	}
+
+	// Pull the two glowing slots out as dynamic instances. Found BY SLOT NAME, not by index: the
+	// import assigns five slots and their order is an artefact of the OBJ writer, not a contract.
+	const int32 CyanSlot = RailgunBodyPart->GetMaterialIndex(TraceCharacterAssets::RailgunCyanSlot);
+	const int32 AmberSlot = RailgunBodyPart->GetMaterialIndex(TraceCharacterAssets::RailgunAmberSlot);
+	if (CyanSlot != INDEX_NONE)
+	{
+		RailgunCyanMID = RailgunBodyPart->CreateDynamicMaterialInstance(CyanSlot);
+	}
+	if (AmberSlot != INDEX_NONE)
+	{
+		RailgunAmberMID = RailgunBodyPart->CreateDynamicMaterialInstance(AmberSlot);
+	}
+	if (RailgunCyanMID == nullptr || RailgunAmberMID == nullptr)
+	{
+		// Not fatal: the gun renders, it just will not flare. Loud, because a silently dead effect
+		// is the exact failure this project keeps having to hunt down after the fact.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("Railgun built, but its glow will not animate: slot '%s'=%d, '%s'=%d."),
+			*TraceCharacterAssets::RailgunCyanSlot.ToString(), CyanSlot,
+			*TraceCharacterAssets::RailgunAmberSlot.ToString(), AmberSlot);
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("%s built the railgun viewmodel (muzzle at rig x=%.1f)."),
+		*GetName(),
+		TraceCharacterLayout::RailgunOrigin.X + TraceCharacterLayout::RailgunMuzzleLocal.X * S);
+	return true;
+}
+
+void ATraceCharacter::UpdateRailgunFire(float DeltaSeconds)
+{
+	if (RailgunBodyPart == nullptr)
+	{
+		return;
+	}
+
+	// Trace.Railgun.Hold pins the pose so a screenshot can catch it. Checked before the early-out
+	// below, because a held pose has no shot behind it.
+	bool bHeld = false;
+	if (RailgunDebugHoldAlpha >= 0.f)
+	{
+		const UWorld* World = GetWorld();
+		if (World != nullptr && World->GetTimeSeconds() < RailgunDebugHoldUntil)
+		{
+			bHeld = true;
+		}
+		else
+		{
+			RailgunDebugHoldAlpha = -1.f;
+			RailgunFireElapsed = -1.f;
+		}
+	}
+
+	if (!bHeld && RailgunFireElapsed < 0.f)
+	{
+		return;
+	}
+
+	if (!bHeld)
+	{
+		RailgunFireElapsed += DeltaSeconds;
+	}
+
+	// Map elapsed real time onto the authored clip, starting at the discharge frame. The charge
+	// segment is deliberately skipped: this weapon has no windup to charge through.
+	const float Span = TraceRailgunFireCurve::ClipSeconds - TraceRailgunFireCurve::DischargeSeconds;
+	const float Alpha = bHeld
+		? FMath::Clamp(RailgunDebugHoldAlpha, 0.f, 1.f)
+		: ((RailgunFireDuration > KINDA_SMALL_NUMBER)
+			? FMath::Clamp(RailgunFireElapsed / RailgunFireDuration, 0.f, 1.f) : 1.f);
+	const float ClipTime = TraceRailgunFireCurve::DischargeSeconds + Alpha * Span;
+
+	float Cyan = 1.f;
+	float Amber = 1.f;
+	TraceRailgunFireCurve::Sample(ClipTime, Cyan, Amber);
+
+	if (RailgunCyanMID != nullptr)
+	{
+		RailgunCyanMID->SetScalarParameterValue(TEXT("EmissiveIntensity"), Cyan);
+	}
+	if (RailgunAmberMID != nullptr)
+	{
+		RailgunAmberMID->SetScalarParameterValue(TEXT("EmissiveIntensity"), Amber);
+	}
+
+	// The MECHANICS ride the same authored curve as the glow, normalised to 0..1, so the rails are
+	// widest at the brightest frame and shut as the flash dies. Two effects, one curve, no chance of
+	// them drifting apart the way two hand-tuned timelines would.
+	const float Mechanical = FMath::Clamp(
+		(Cyan - 1.f) / FMath::Max(TraceRailgunFireCurve::PeakCyan - 1.f, KINDA_SMALL_NUMBER), 0.f, 1.f);
+
+	const float S = TraceCharacterLayout::RailgunScale;
+	const FVector Recoil(-TraceCharacterLayout::RailgunRecoilBackUU * S * Mechanical, 0.f, 0.f);
+	const FRotator RecoilPitch(-TraceCharacterLayout::RailgunRecoilPitchDegrees * Mechanical, 0.f, 0.f);
+
+	RailgunBodyPart->SetRelativeLocationAndRotation(
+		TraceCharacterLayout::RailgunOrigin + Recoil, RecoilPitch);
+
+	const float Throw = TraceCharacterLayout::RailgunRailThrowUU * S * Mechanical;
+	const float Cant = TraceCharacterLayout::RailgunRailCantDegrees * Mechanical;
+	const FVector HingeOffset(-5.0f, 7.8f, 4.5f);
+
+	if (RailgunRailLeftPart != nullptr)
+	{
+		RailgunRailLeftPart->SetRelativeLocationAndRotation(
+			TraceCharacterLayout::RailgunOrigin
+				+ FVector(HingeOffset.X, -HingeOffset.Y, HingeOffset.Z) * S
+				+ Recoil + FVector(0.f, -Throw, 0.f),
+			RecoilPitch + FRotator(0.f, -Cant, 0.f));
+	}
+	if (RailgunRailRightPart != nullptr)
+	{
+		RailgunRailRightPart->SetRelativeLocationAndRotation(
+			TraceCharacterLayout::RailgunOrigin + HingeOffset * S
+				+ Recoil + FVector(0.f, Throw, 0.f),
+			RecoilPitch + FRotator(0.f, Cant, 0.f));
+	}
+
+	// Finished: park the state so the next shot restarts cleanly, and so a rig that is never fired
+	// again is not doing this arithmetic forever.
+	if (Alpha >= 1.f && !bHeld)
+	{
+		RailgunFireElapsed = -1.f;
+	}
+}
+
+void ATraceCharacter::DebugHoldRailgunPhase(float Alpha, float HoldSeconds)
+{
+	const UWorld* World = GetWorld();
+	RailgunDebugHoldAlpha = Alpha;
+	RailgunDebugHoldUntil = (World != nullptr && Alpha >= 0.f)
+		? World->GetTimeSeconds() + FMath::Max(0.f, HoldSeconds) : -1.0;
+}
+
+void ATraceCharacter::DebugGetRailgunParts(UStaticMeshComponent*& OutBody,
+	UStaticMeshComponent*& OutRailLeft, UStaticMeshComponent*& OutRailRight) const
+{
+	OutBody = RailgunBodyPart;
+	OutRailLeft = RailgunRailLeftPart;
+	OutRailRight = RailgunRailRightPart;
+}
+
+bool ATraceCharacter::DebugGetRailgunEmissive(float& OutCyan, float& OutAmber) const
+{
+	OutCyan = -1.f;
+	OutAmber = -1.f;
+	if (RailgunCyanMID == nullptr || RailgunAmberMID == nullptr)
+	{
+		return false;
+	}
+	const bool bCyan = RailgunCyanMID->GetScalarParameterValue(TEXT("EmissiveIntensity"), OutCyan);
+	const bool bAmber = RailgunAmberMID->GetScalarParameterValue(TEXT("EmissiveIntensity"), OutAmber);
+	return bCyan && bAmber;
+}
+
+bool ATraceCharacter::UsesRailgunViewModel() const
+{
+	return RailgunBodyPart != nullptr;
+}
+
+UMaterialInstanceDynamic* ATraceCharacter::GetViewModelBodyMID() const
+{
+	return ViewModelBodyMID;
+}
+
+UMaterialInstanceDynamic* ATraceCharacter::GetViewModelNeonMID() const
+{
+	return ViewModelNeonMID;
 }
 
 void ATraceCharacter::SetViewModelVisible(bool bVisible)
@@ -2216,6 +2737,10 @@ void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
 			ViewModelSwayYaw, 0.f);
 
 	ViewModelRoot->SetRelativeLocationAndRotation(TraceCharacterLayout::ViewModelRestLocation + Offset, Rotation);
+
+	// The railgun's own animation runs on top of the rig transform above: the rig carries the whole
+	// weapon-and-hands assembly, this moves parts of the weapon relative to it.
+	UpdateRailgunFire(DeltaSeconds);
 }
 
 void ATraceCharacter::NotifyWeaponFired()
@@ -2234,6 +2759,20 @@ void ATraceCharacter::NotifyWeaponFired()
 	LastFireKickTime = Now;
 
 	ViewModelKick = 1.f;
+
+	// Restart the railgun's discharge, time-warped so it always finishes before the next round can
+	// leave: at 150 RPM that is 0.36 s for the clip's 0.85 s tail, and it shortens further for the
+	// characters that fire faster. Rails caught half-open by the next shot would read as a stutter.
+	if (RailgunBodyPart != nullptr)
+	{
+		const float FireInterval = FMath::Max(0.01f, UTraceSettings::Get().FireInterval)
+			* UTraceAbilityComponent::GetFireIntervalScaleFor(this);
+		RailgunFireDuration = FMath::Clamp(
+			FireInterval * TraceCharacterLayout::RailgunFireIntervalFraction,
+			TraceCharacterLayout::RailgunFireMinSeconds,
+			TraceRailgunFireCurve::ClipSeconds - TraceRailgunFireCurve::DischargeSeconds);
+		RailgunFireElapsed = 0.f;
+	}
 }
 
 // =================================================================================================
@@ -3584,6 +4123,320 @@ namespace
 					}
 
 					return (++Emitted < Samples);
+				}),
+				0.f);
+		}));
+}
+
+#endif // !UE_BUILD_SHIPPING
+
+// =================================================================================================
+// SPEC v19 §4.1 — THE REPRODUCTION
+//
+// "If a player ever goes out of bounds of the arena, they should die and respawn."
+//
+// The rule is three lines of arithmetic, which is exactly the kind of rule that gets shipped broken:
+// the arithmetic is trivially right and the CONSEQUENCES are the whole feature. So this asserts the
+// consequences, not the arithmetic — a death, credited to nobody, with the cooldowns still running,
+// and a pawn back inside the arena afterwards.
+//
+// WHY IT CAN GO RED, WHICH IS THE PART THAT MATTERS. Trace.Bounds.Enabled 0 removes the rule and
+// nothing else, and the harness then reports FAIL with "still alive N seconds after being put
+// outside". A harness whose only possible outcome is PASS proves nothing, and this project has
+// already shipped one of those.
+//
+// It also asserts the two clauses that are easy to get wrong in the other direction and that a
+// player would notice immediately:
+//   * NOBODY IS CREDITED. Every other player's kill count must be unchanged. A world death that pays
+//     out to whoever last shot at you is worse than no rule at all.
+//   * THE COOLDOWN KEPT TICKING. Spec v19 §4.2's rule, restated by the user in the same breath, and
+//     an out-of-bounds death is still a death, so it has to hold here too. Measured across the death
+//     rather than argued from where the timer lives.
+// =================================================================================================
+
+#if !UE_BUILD_SHIPPING
+
+namespace TraceCharacterBoundsVerify
+{
+	/** How long after the shove to wait for the rule to fire, in seconds. Grace + generous slack. */
+	constexpr float DeathWindowSeconds = 3.0f;
+
+	/** Cooldown parked on the victim before the shove, so "it kept ticking" is measurable at all. */
+	constexpr float ParkedCooldownSeconds = 30.f;
+
+	UWorld* PlayingWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if ((Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+				&& Context.World() != nullptr && Context.World()->GetAuthGameMode() != nullptr)
+			{
+				return Context.World();
+			}
+		}
+		return nullptr;
+	}
+
+	/** Every other player's kills, summed. The number that must not move. */
+	int32 SumOtherKills(const UWorld* World, const APlayerState* Excluding)
+	{
+		int32 Total = 0;
+		const AGameStateBase* GS = (World != nullptr) ? World->GetGameState() : nullptr;
+		if (GS == nullptr)
+		{
+			return 0;
+		}
+
+		for (APlayerState* PS : GS->PlayerArray)
+		{
+			const ATracePlayerState* TracePS = Cast<ATracePlayerState>(PS);
+			if (TracePS != nullptr && TracePS != Excluding)
+			{
+				Total += TracePS->Kills;
+			}
+		}
+		return Total;
+	}
+
+	struct FRun
+	{
+		TWeakObjectPtr<ATraceCharacter> Victim;
+		TWeakObjectPtr<ATracePlayerState> VictimState;
+		TWeakObjectPtr<AController> VictimController;
+		int32  DeathsAtStart = 0;
+		int32  OtherKillsAtStart = 0;
+		float  CooldownAtStart = 0.f;
+		float  Elapsed = 0.f;
+		bool   bDeathSeen = false;
+		float  CooldownAtDeath = 0.f;
+		int32  Failures = 0;
+		int32  Stage = 0;   // 0 = waiting for the death, 1 = waiting for the respawn
+	};
+
+	void Report(FRun& Run, bool bPass, const FString& Detail)
+	{
+		if (bPass)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[BoundsVerify] PASS: %s"), *Detail);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[BoundsVerify] FAIL: %s"), *Detail);
+		}
+	}
+
+	FAutoConsoleCommand CmdBoundsVerify(
+		TEXT("Trace.Bounds.Verify"),
+		TEXT("SPEC v19 §4.1. Parks a cooldown on a living player, teleports them outside the arena, and "
+		     "asserts that they DIE, that nobody is credited with the kill, that the cooldown kept "
+		     "ticking through the death, and that they respawn inside. Run it again with "
+		     "Trace.Bounds.Enabled 0, which is the arm that must go RED."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			UWorld* const World = PlayingWorld();
+			if (World == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[BoundsVerify] INVALID: no authoritative world. NOT a pass - it could not run."));
+				return;
+			}
+
+			const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
+			const FBox Field = (Arena != nullptr) ? Arena->GetFieldBounds() : FBox(ForceInit);
+			if (Field.IsValid == 0)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[BoundsVerify] INVALID: no arena, so there are no bounds to leave. NOT a pass."));
+				return;
+			}
+
+			// A living pawn that is NOT holding the Core. The carrier would drag the possession rules
+			// into a test about a boundary, and those are proven separately.
+			ATraceCharacter* Victim = nullptr;
+			for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+			{
+				ATraceCharacter* const Candidate = *It;
+				if (IsValid(Candidate) && Candidate->IsAlive() && !Candidate->IsCarrier()
+					&& Candidate->GetController() != nullptr)
+				{
+					Victim = Candidate;
+					break;
+				}
+			}
+
+			if (Victim == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[BoundsVerify] INVALID: nobody alive to push out of the world. NOT a pass."));
+				return;
+			}
+
+			TSharedRef<FRun> Run = MakeShared<FRun>();
+			Run->Victim = Victim;
+			Run->VictimState = Victim->GetPlayerState<ATracePlayerState>();
+			Run->VictimController = Victim->GetController();
+			Run->DeathsAtStart = Run->VictimState.IsValid() ? Run->VictimState->Deaths : 0;
+			Run->OtherKillsAtStart = SumOtherKills(World, Run->VictimState.Get());
+
+			// Park a cooldown so "it kept ticking" is a measurement rather than an assertion about
+			// where a float lives. DebugSetActivatedCooldown works with no character assigned, which is
+			// deliberate here: this harness must be runnable in the first seconds of a match, before
+			// the bots have claimed characters.
+			if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Run->VictimState.Get()))
+			{
+				Abilities->DebugSetActivatedCooldown(ParkedCooldownSeconds);
+				Run->CooldownAtStart = Abilities->GetActivatedCooldownRemaining();
+			}
+
+			// Well outside, along +X, and far enough that no margin setting could call it inside.
+			const FVector Outside(
+				Field.Max.X + FMath::Max(4000.f, CVarBoundsMarginXY.GetValueOnAnyThread() * 2.f),
+				Field.GetCenter().Y,
+				Field.Min.Z + 400.0);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BoundsVerify] ===== pushing %s from %s to %s (the arena runs X %.0f..%.0f, Y %.0f..%.0f, ")
+				TEXT("Z %.0f..%.0f; margins XY %.0f, below %.0f, ceiling %.0f = %s; grace %.2fs) | rule = %s ====="),
+				*Victim->GetName(), *Victim->GetActorLocation().ToCompactString(), *Outside.ToCompactString(),
+				Field.Min.X, Field.Max.X, Field.Min.Y, Field.Max.Y, Field.Min.Z, Field.Max.Z,
+				CVarBoundsMarginXY.GetValueOnAnyThread(), CVarBoundsMarginBelow.GetValueOnAnyThread(),
+				CVarBoundsCeilingMargin.GetValueOnAnyThread(),
+				(CVarBoundsCeilingMargin.GetValueOnAnyThread() > 0.f) ? TEXT("ON") : TEXT("OFF (Lily flies)"),
+				CVarBoundsGraceSeconds.GetValueOnAnyThread(),
+				(CVarBoundsEnabled.GetValueOnAnyThread() != 0)
+					? TEXT("v19 §4.1 ON") : TEXT("OFF - THE RED ARM, ARMED"));
+
+			Victim->SetActorLocation(Outside, false, nullptr, ETeleportType::TeleportPhysics);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([Run](float DeltaTime) -> bool
+				{
+					Run->Elapsed += DeltaTime;
+
+					UWorld* const TickWorld = PlayingWorld();
+					if (TickWorld == nullptr || !Run->VictimState.IsValid())
+					{
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[BoundsVerify] INVALID: the world or the player went away mid-run. NOT a pass."));
+						return false;
+					}
+
+					UTraceAbilityComponent* const Abilities =
+						UTraceAbilityComponent::Get(Run->VictimState.Get());
+					const float CooldownNow =
+						(Abilities != nullptr) ? Abilities->GetActivatedCooldownRemaining() : 0.f;
+
+					// --- Stage 0: did the rule kill them? -------------------------------------------
+					if (Run->Stage == 0)
+					{
+						const bool bDiedByCount = (Run->VictimState->Deaths > Run->DeathsAtStart);
+						const bool bDiedByPawn = Run->Victim.IsValid() && !Run->Victim->IsAlive();
+
+						if (bDiedByCount || bDiedByPawn)
+						{
+							Run->bDeathSeen = true;
+							Run->CooldownAtDeath = CooldownNow;
+							Run->Stage = 1;
+
+							const int32 OtherKillsNow = SumOtherKills(TickWorld, Run->VictimState.Get());
+							if (OtherKillsNow != Run->OtherKillsAtStart)
+							{
+								++Run->Failures;
+								Report(*Run, false, FString::Printf(
+									TEXT("somebody was CREDITED with the out-of-bounds death (other players' "
+									     "kills %d -> %d). It must be creditable to nobody."),
+									Run->OtherKillsAtStart, OtherKillsNow));
+							}
+
+							// The cooldown must be RUNNING, and must be LOWER than it was: a reset would
+							// snap it back to 30, and a stopped clock would hold it exactly.
+							if (Abilities == nullptr)
+							{
+								++Run->Failures;
+								Report(*Run, false, TEXT("the victim has no ability component, so the cooldown "
+								                         "clause could not be measured. NOT a pass."));
+							}
+							else if (CooldownNow <= 0.f)
+							{
+								++Run->Failures;
+								Report(*Run, false, FString::Printf(
+									TEXT("the cooldown was CLEARED by the death (%.2fs -> %.2fs). Spec v19 §4.2: "
+									     "cooldowns keep ticking down through a death."),
+									Run->CooldownAtStart, CooldownNow));
+							}
+							else if (CooldownNow >= Run->CooldownAtStart)
+							{
+								++Run->Failures;
+								Report(*Run, false, FString::Printf(
+									TEXT("the cooldown did not TICK across the death (%.2fs -> %.2fs). It must "
+									     "keep counting down, not freeze or restart."),
+									Run->CooldownAtStart, CooldownNow));
+							}
+
+							return true;   // now wait for the respawn
+						}
+
+						if (Run->Elapsed >= DeathWindowSeconds)
+						{
+							Report(*Run, false, FString::Printf(
+								TEXT("%s was still ALIVE %.1fs after being teleported outside the arena. Spec "
+								     "v19 §4.1 says out of bounds is a death. Rule = %s."),
+								*GetNameSafe(Run->Victim.Get()), Run->Elapsed,
+								(CVarBoundsEnabled.GetValueOnAnyThread() != 0)
+									? TEXT("ON - THIS IS A REAL FAILURE")
+									: TEXT("OFF - this is the RED ARM reproducing correctly")));
+							return false;
+						}
+
+						return true;
+					}
+
+					// --- Stage 1: did they come back, inside? ---------------------------------------
+					const APawn* const FreshPawn = Run->VictimController.IsValid()
+						? Run->VictimController->GetPawn() : nullptr;
+					const ATraceCharacter* const FreshCharacter = Cast<ATraceCharacter>(FreshPawn);
+
+					if (FreshCharacter != nullptr && FreshCharacter->IsAlive())
+					{
+						FString Unused;
+						const bool bInside = !ATraceCharacter::IsLocationOutOfArenaBounds(
+							TickWorld, FreshCharacter->GetActorLocation(), Unused);
+
+						if (!bInside)
+						{
+							++Run->Failures;
+							Report(*Run, false, FString::Printf(
+								TEXT("they respawned at %s, which is STILL out of bounds - so the rule would "
+								     "kill them again in a loop."),
+								*FreshCharacter->GetActorLocation().ToCompactString()));
+						}
+
+						Report(*Run, Run->Failures == 0, FString::Printf(
+							TEXT("%s went out of bounds, DIED (deaths %d -> %d, cause is not creditable to any "
+							     "enemy - their kills stayed at %d), their E cooldown kept ticking straight "
+							     "through it (%.2fs at the push -> %.2fs at the death -> %.2fs now, never "
+							     "reset), and they respawned INSIDE at %s. %d sub-check(s) failed."),
+							*GetNameSafe(FreshCharacter), Run->DeathsAtStart, Run->VictimState->Deaths,
+							Run->OtherKillsAtStart, Run->CooldownAtStart, Run->CooldownAtDeath, CooldownNow,
+							*FreshCharacter->GetActorLocation().ToCompactString(), Run->Failures));
+						return false;
+					}
+
+					if (Run->Elapsed >= DeathWindowSeconds + 15.f)
+					{
+						Report(*Run, false, FString::Printf(
+							TEXT("%s died out of bounds but never respawned within %.0fs. 'Die AND respawn' is "
+							     "one requirement, not two."),
+							*GetNameSafe(Run->Victim.Get()), Run->Elapsed));
+						return false;
+					}
+
+					return true;
 				}),
 				0.f);
 		}));

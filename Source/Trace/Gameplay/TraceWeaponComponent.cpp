@@ -3075,24 +3075,34 @@ UStaticMeshComponent* UTraceWeaponComponent::AddKnifePart(USceneComponent* Attac
 	UMaterialInterface* Material = nullptr;
 	if (const ATraceCharacter* Character = GetTraceCharacter())
 	{
-		if (Character->ViewModelRoot != nullptr)
+		// Ask the owner first. The child-walk below identifies the gun's lit channels by finding
+		// "Neon" in a COMPONENT NAME, which only ever worked because the gun was a table of cubes
+		// named after their function. The railgun's parts are named after their meshes, so on that
+		// rig the search matches nothing and the knife drops all the way to BasicShapeMaterial —
+		// visible as a knife that is not made of the same stuff as everything around it.
+		Material = bNeon ? Character->GetViewModelNeonMID() : Character->GetViewModelBodyMID();
+	}
+
+	const ATraceCharacter* OwningCharacter = GetTraceCharacter();
+	if (Material == nullptr && OwningCharacter != nullptr && OwningCharacter->ViewModelRoot != nullptr)
+	{
+		TArray<USceneComponent*> Children;
+		OwningCharacter->ViewModelRoot->GetChildrenComponents(/*bIncludeAllDescendants=*/false, Children);
+		for (USceneComponent* Child : Children)
 		{
-			TArray<USceneComponent*> Children;
-			Character->ViewModelRoot->GetChildrenComponents(/*bIncludeAllDescendants=*/false, Children);
-			for (USceneComponent* Child : Children)
+			UStaticMeshComponent* GunPart = Cast<UStaticMeshComponent>(Child);
+			if (GunPart == nullptr || KnifeViewParts.Contains(GunPart) || KnifeHandParts.Contains(GunPart))
 			{
-				UStaticMeshComponent* GunPart = Cast<UStaticMeshComponent>(Child);
-				if (GunPart == nullptr || KnifeViewParts.Contains(GunPart) || KnifeHandParts.Contains(GunPart))
-				{
-					continue;
-				}
-				// "Neon" in the name is how the gun's own table marks its lit channels.
-				const bool bPartIsNeon = GunPart->GetName().Contains(TEXT("Neon"));
-				if (bPartIsNeon == bNeon)
-				{
-					Material = GunPart->GetMaterial(0);
-					break;
-				}
+				continue;
+			}
+			// "Neon" in the name is how the CUBE gun's table marks its lit channels. Kept as a
+			// second chance for a rig whose MIDs were never made (a simulated proxy builds no
+			// viewmodel), not as the primary route.
+			const bool bPartIsNeon = GunPart->GetName().Contains(TEXT("Neon"));
+			if (bPartIsNeon == bNeon)
+			{
+				Material = GunPart->GetMaterial(0);
+				break;
 			}
 		}
 	}

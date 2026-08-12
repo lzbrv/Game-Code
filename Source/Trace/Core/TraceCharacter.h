@@ -374,6 +374,41 @@ public:
 	int32 GetViewModelPartCount() const;
 	bool IsViewModelVisible() const;
 
+	/** True when the imported railgun art was used; false when the procedural cube gun was built. */
+	bool UsesRailgunViewModel() const;
+
+	/**
+	 * Verification only (Trace.Railgun.Hold). Pins the fire animation at @p Alpha — 0 is the
+	 * discharge frame with the rails at full throw and the glow at peak, 1 is rest — for
+	 * @p HoldSeconds, so a screenshot can catch a pose that otherwise lasts 0.36 s. Pass a negative
+	 * Alpha to release. Never called by gameplay.
+	 */
+	void DebugHoldRailgunPhase(float Alpha, float HoldSeconds);
+
+	/** Verification only. The three railgun parts, or nulls on the fallback rig. */
+	void DebugGetRailgunParts(UStaticMeshComponent*& OutBody,
+		UStaticMeshComponent*& OutRailLeft, UStaticMeshComponent*& OutRailRight) const;
+
+	/**
+	 * Verification only. Reads EmissiveIntensity BACK OFF the two live material instances, so a
+	 * probe reports what the renderer will actually use rather than what we believe we set. A
+	 * parameter name that does not exist on the material silently does nothing when written; the
+	 * only way to catch that is to read it.
+	 */
+	bool DebugGetRailgunEmissive(float& OutCyan, float& OutAmber) const;
+
+	/**
+	 * The two shared viewmodel materials, so anything else that wants to be made of the same stuff
+	 * as the gun can ask instead of guessing.
+	 *
+	 * The knife used to find these by walking ViewModelRoot's children and matching "Neon" in a
+	 * component's NAME. That worked only for as long as the gun was a table of cubes named after
+	 * their function; the railgun's parts are named after the mesh, so the search found nothing and
+	 * the knife silently fell back to BasicShapeMaterial. Ask the owner instead.
+	 */
+	UMaterialInstanceDynamic* GetViewModelBodyMID() const;
+	UMaterialInstanceDynamic* GetViewModelNeonMID() const;
+
 	UTraceCharacterMovementComponent* GetTraceMovement() const;
 
 	// --- Server-authoritative state changes -------------------------------------------------------
@@ -383,6 +418,36 @@ public:
 
 	/** Server only. Called from the health component's OnDeath; notifies the GameMode. */
 	void HandleDeath(AController* Killer, FName Cause);
+
+	// --- SPEC v19 §4.1: OUT OF BOUNDS ------------------------------------------------------------
+	//
+	// Verbatim: "If a player ever goes out of bounds of the arena, they should die and respawn."
+	//
+	// [ASSUMPTION], carried from the spec: a REAL death — the death panel names it, the Deaths column
+	// moves, the respawn timer runs and their ability cooldowns keep ticking through it — rather than
+	// a silent teleport back inside. And credited to NOBODY: it is passed no killer at all, so
+	// ATraceGameMode::NotifyCharacterDied's bSelfKill branch names "the arena" and no enemy is paid
+	// for it.
+	//
+	// *** THE TRAP THIS PASS SETS, AND THE REASON THE TEST IS HORIZONTAL-ONLY. *** Two characters
+	// landing beside this one make players legitimately go UP: Lily gains five seconds of flight, and
+	// Mortimer gains a mantle. "Out of bounds" therefore cannot mean "higher than usual" — the arena
+	// has no ceiling and a player above the walls is still over the pitch and still coming down. What
+	// it means is OUTSIDE THE FOOTPRINT, or under the floor. There is a ceiling knob
+	// (Trace.Bounds.CeilingMargin) and it is OFF by default for exactly that reason.
+
+	/** SPEC v19 §4.1. Server only. Kills this pawn if it is genuinely outside the arena. */
+	void ServerCheckArenaBounds();
+
+	/**
+	 * SPEC v19 §4.1. Is @p Location outside the arena, by the margins in the Trace.Bounds.* CVars?
+	 *
+	 * Static and pure so the rule has ONE definition that the harness can also ask, rather than a
+	 * check in a Tick and a second, drifting copy in whatever proves it.
+	 *
+	 * @param OutReason  filled with a short human phrase ("past the east wall") when it returns true.
+	 */
+	static bool IsLocationOutOfArenaBounds(const UWorld* World, const FVector& Location, FString& OutReason);
 
 	// --- Presentation -----------------------------------------------------------------------------
 
@@ -671,6 +736,20 @@ protected:
 	 */
 	void UpdateViewModel(float DeltaSeconds);
 
+	/**
+	 * Builds the railgun in place of the cube gun's twelve parts. Returns false without building
+	 * anything if the art did not resolve, which is the caller's cue to build the fallback.
+	 */
+	bool BuildRailgunViewModel();
+
+	/**
+	 * Plays the discharge-and-decay tail of the artist's Fire clip: the rail walls throw apart and
+	 * cant outward, the receiver recoils inside the hands, and both glowing materials flare. Driven
+	 * by the authored curve in TraceRailgunFireCurve.h, so the motion and the glow cannot drift
+	 * apart. No-op when the fallback gun is in use.
+	 */
+	void UpdateRailgunFire(float DeltaSeconds);
+
 	/** Guarded show/hide for the whole rig. Also stops UpdateViewModel doing arithmetic for nothing. */
 	void SetViewModelVisible(bool bVisible);
 
@@ -718,6 +797,50 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> SlideSkidMID;
 
+	/**
+	 * The railgun's three meshes: a body plus the two rail walls that throw apart when it fires.
+	 * Committed art (Content/Trace/Weapons), authored in Art/Railgun/railgun.glb and imported by
+	 * Scripts/import-railgun.sh. All three are optional — a miss on any one builds the older
+	 * procedural cube gun instead.
+	 */
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> RailgunBodyMesh;
+
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> RailgunRailLeftMesh;
+
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> RailgunRailRightMesh;
+
+	/** The three railgun parts, in build order: body, left wall, right wall. Null when the fallback
+	  * cube gun was built instead, which is what UsesRailgunViewModel() reports. */
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> RailgunBodyPart;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> RailgunRailLeftPart;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> RailgunRailRightPart;
+
+	/** The two glowing slots, pulled out as dynamic instances so the fire curve can drive their
+	  * EmissiveIntensity per player without touching the shared asset. */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> RailgunCyanMID;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> RailgunAmberMID;
+
+	/** Seconds since the shot that started the fire animation; negative when nothing is playing. */
+	float RailgunFireElapsed = -1.f;
+
+	/** How long the played segment lasts, chosen at fire time from the weapon's own fire interval. */
+	float RailgunFireDuration = 0.f;
+
+	/** Trace.Railgun.Hold only: a pinned phase and the world time it expires. -1 means not held. */
+	float RailgunDebugHoldAlpha = -1.f;
+	double RailgunDebugHoldUntil = -1.0;
+
 	/** Every part of the viewmodel, so visibility is one loop and the parts cannot be orphaned. */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UStaticMeshComponent>> ViewModelParts;
@@ -755,6 +878,17 @@ private:
 
 	/** Latches so one life produces exactly one death, however many sources fire at once. */
 	bool bDeathHandled = false;
+
+	/**
+	 * SPEC v19 §4.1. Server-side world time this pawn was FIRST seen outside the arena, or -1.
+	 *
+	 * A grace, not a hair trigger, and it is there because the alternative has already cost this
+	 * project a bug class: a single frame outside the box is what a depenetration push, a teleport
+	 * that has not been ratified, or the frame between a spawn transform and its first movement update
+	 * all look like. Killing on the first frame would make those indistinguishable from a player
+	 * walking out of the world. Trace.Bounds.GraceSeconds is how long they have to come back.
+	 */
+	float OutOfBoundsSinceServerTime = -1.f;
 
 	/** Current state of SetDeadPresentation(), so repeated calls are free and cannot double-apply. */
 	bool bDeadPresentation = false;
