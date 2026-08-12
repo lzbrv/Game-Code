@@ -61,6 +61,18 @@ class USphereComponent;
 class UStaticMeshComponent;
 class UTraceAbilityComponent;
 
+namespace TraceOysterJar
+{
+	/**
+	 * SPEC v19 §4.4 TEST ARM. True while Trace.Oyster.LegacyThrow is 1, which restores every part of
+	 * the pre-v19 Pickler throw — the raw-muzzle release, the one-Euler-step-per-frame flight, and the
+	 * jar cap being allowed to delete a jar that is still in the air. It exists so
+	 * Trace.Oyster.PicklerThrowTest can be shown FAILING in the same process it later passes in.
+	 * NEVER SHIP 1.
+	 */
+	TRACE_API bool IsLegacyThrow();
+}
+
 UCLASS()
 class TRACE_API ATraceOysterJar : public AActor
 {
@@ -88,6 +100,50 @@ public:
 	/** Absolute match time this jar despawns untouched. 0 while still in the air. */
 	float GetExpiryMatchTime() const { return ExpiryMatchTime; }
 
+	/** The sphere the flight is swept with, and the radius a release point has to be clear by. */
+	static float GetJarCollisionRadiusUU() { return 18.f; }
+
+	/**
+	 * SPEC v19 §4.4 — WHERE A LOBBED JAR MAY BE LET GO OF.
+	 *
+	 * @p DesiredRelease is the muzzle: 22 uu along the aim ray from the eye, and the jar's own sphere is
+	 * 18 uu on top of that. A WALL can never swallow it — the 34 uu capsule radius keeps every vertical
+	 * face at least 12 uu beyond the muzzle's furthest reach — but a CEILING can, and easily: the eye
+	 * sits 64 uu above the capsule centre and the capsule is 88 uu tall, so a roof may be 24 uu above
+	 * the eye while he stands comfortably under it. Aim up and the muzzle goes 22 of those 24. A swept
+	 * move that starts penetrating is refused at Time 0, so the jar was BORN inside that roof and came
+	 * to rest buried in it, invisible.
+	 *
+	 * HONEST SIZE OF THIS: it moves where the jar ends up, not how far it flies — the lob is stopped by
+	 * the ceiling either way. The frame-rate and jar-cap fixes are the ones that carry "more consistent
+	 * to throw"; Trace.Oyster.PicklerThrowTest measures all three and says which is which.
+	 *
+	 * Sweeps the jar's own sphere from @p InsideThrower — the eye, which is inside a capsule that is by
+	 * definition standing in clear space — out to @p DesiredRelease, and returns the last point on that
+	 * segment the jar fits in. Never returns a point the jar is embedded at, and never returns a point
+	 * behind the thrower's eye.
+	 */
+	static FVector ResolveReleaseLocation(const UWorld* WorldPtr, const FVector& InsideThrower,
+	                                      const FVector& DesiredRelease, const AActor* IgnoreActor);
+
+	// --- measurement, for Trace.Oyster.PicklerThrowTest ------------------------------------------------
+
+	/** Where the lob was let go of, and at what velocity. Both zero for a dash jar. */
+	FVector GetLaunchLocation() const { return LaunchLocation; }
+	FVector GetLaunchVelocity() const { return LaunchVelocity; }
+
+	/** True once Pickler's impact has fired. Always false on a dash jar. */
+	bool HasFiredLandingEffect() const { return bLandingEffectFired; }
+
+	/** Absolute match time it came to rest. 0 while it is still in the air. */
+	float GetLandedMatchTime() const { return LandedMatchTime; }
+
+	/** How many swept steps the flight took. The frame-rate independence measurement reads it. */
+	int32 GetFlightSweepCount() const { return FlightSweepCount; }
+
+	/** True when the release point had to be pulled back out of geometry. */
+	bool WasReleaseClamped() const { return bReleaseClamped; }
+
 	/** The player who threw it, for the choke point and the kill feed. May be null later. */
 	UTraceAbilityComponent* GetSourceComponent() const { return SourceComponent.Get(); }
 
@@ -99,6 +155,9 @@ public:
 
 	/** SERVER ONLY. Forces an airborne Pickler jar to land here and now. For the harness. */
 	void ServerForceLandNow();
+
+	/** SERVER ONLY. Records that this jar was released from a clamped point. Called by the thrower. */
+	void NoteReleaseWasClamped() { bReleaseClamped = true; }
 
 protected:
 	virtual void BeginPlay() override;
@@ -130,6 +189,13 @@ private:
 
 	/** A landing effect fires exactly once, however the jar came to rest. */
 	bool bLandingEffectFired = false;
+
+	/** MEASUREMENT ONLY. The state a throw was launched with, and what the flight cost. */
+	FVector LaunchLocation = FVector::ZeroVector;
+	FVector LaunchVelocity = FVector::ZeroVector;
+	float   LandedMatchTime = 0.f;
+	int32   FlightSweepCount = 0;
+	bool    bReleaseClamped = false;
 
 	float MatchTimeNow() const;
 

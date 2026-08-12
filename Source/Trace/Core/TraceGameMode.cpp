@@ -923,7 +923,51 @@ void ATraceGameMode::NotifyCharacterDied(ATraceCharacter* Victim, AController* K
 	{
 		if (TheCore->GetCarrier() == Victim)
 		{
-			TheCore->DropAt(Victim->GetActorLocation(), FVector::ZeroVector);
+			// SPEC v19 §4.1 MADE "WHERE THE CARRIER FELL" A PLACE THAT CAN BE OFF THE MAP. Out of bounds
+			// is now a death, and the commonest way to reach it is to be a carrier who walked out — so
+			// this line, unchanged, would have dropped the Core in the void the player just died in. The
+			// Core's own out-of-world rescue would eventually recover it, but only after a reset timer
+			// spent watching a ball nobody can reach.
+			//
+			// Clamped, not moved: a death inside the arena drops the Core in exactly the same place it
+			// always did, because the clamp is a no-op there. This is deliberately here and not in the
+			// bounds rule itself — EVERY death funnels through this function, so a future way of dying
+			// somewhere silly is covered without anybody remembering to.
+			FVector DropLocation = Victim->GetActorLocation();
+
+			// GATED ON THE BOUNDS RULE ITSELF, not on a second opinion about the box. The first cut of
+			// this clamped unconditionally and moved the Core on EVERY death in the middle of the pitch,
+			// because "clamp Z to at least floor + inset" lifts a body lying at Z=90 to Z=200 — a ball
+			// left hanging in the air after any ordinary kill. Asking the one rule that defines "out of
+			// bounds" means an in-bounds death is now not merely a no-op, it is not even considered.
+			FString BoundsReason;
+			if (ATraceCharacter::IsLocationOutOfArenaBounds(GetWorld(), DropLocation, BoundsReason))
+			{
+				if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(GetWorld()))
+				{
+					const FBox Field = Arena->GetFieldBounds();
+					if (Field.IsValid != 0)
+					{
+						// A little way INSIDE the wall line rather than exactly on it, so the ball is not
+						// dropped inside the wall's own collision. Z is only ever raised to the floor
+						// plane, never above it: the Core falls from wherever it is put, and a fall onto
+						// the floor is a landing the turnover rule already understands.
+						constexpr double Inset = 200.0;
+						DropLocation = FVector(
+							FMath::Clamp(DropLocation.X, Field.Min.X + Inset, Field.Max.X - Inset),
+							FMath::Clamp(DropLocation.Y, Field.Min.Y + Inset, Field.Max.Y - Inset),
+							FMath::Max(DropLocation.Z, Field.Min.Z + Inset));
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[Bounds] the carrier died at %s, which is %s - dropping the Core at %s ")
+							TEXT("instead so it stays reachable (spec v19 §4.1)."),
+							*Victim->GetActorLocation().ToCompactString(), *BoundsReason,
+							*DropLocation.ToCompactString());
+					}
+				}
+			}
+
+			TheCore->DropAt(DropLocation, FVector::ZeroVector);
 		}
 	}
 

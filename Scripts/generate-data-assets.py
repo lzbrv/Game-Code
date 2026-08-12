@@ -4,12 +4,14 @@
 # Authors one UTraceCharacterDefinition asset per character under
 #
 #     /Game/Trace/Data/Characters/DA_Character_{Rocco,Chut,Mace,Oyster,X,
-#                                                Roxie,Elle,Slimeball}
+#                                                Roxie,Elle,Slimeball,
+#                                                Mortimer,Lily}
 #
-# Spec v18 section 2 took the roster from five to EIGHT. THE THREE NEW ONES ARE
-# NOT OPTIONAL EXTRAS: the roster is all-or-none, so a build where five assets
-# exist and three do not runs every character from the C++ table instead. Adding
-# a name to CHARACTERS below without re-running this is how that happens.
+# Spec v18 section 2 took the roster from five to EIGHT and spec v19 section 3
+# takes it to TEN. THE NEW ONES ARE NOT OPTIONAL EXTRAS: the roster is
+# all-or-none, so a build where eight assets exist and two do not runs every
+# character from the C++ table instead. Adding a name to CHARACTERS below
+# without re-running this is how that happens.
 #
 # -----------------------------------------------------------------------------
 # THE ONE THING TO UNDERSTAND ABOUT THIS SCRIPT
@@ -86,7 +88,7 @@ import unreal
 
 PACKAGE_DIR = "/Game/Trace/Data/Characters"
 
-# ETraceCharacterId, 1..8. The NAMES here are only used to build the asset name
+# ETraceCharacterId, 1..10. The NAMES here are only used to build the asset name
 # and to print a readable log line; the C++ side is asked for everything else.
 # They are checked against C++ below rather than trusted.
 #
@@ -103,6 +105,9 @@ CHARACTERS = [
     (6, "Roxie"),
     (7, "Elle"),
     (8, "Slimeball"),
+    # --- spec v19 section 3 -------------------------------------------------
+    (9, "Mortimer"),
+    (10, "Lily"),
 ]
 
 

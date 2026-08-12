@@ -1398,6 +1398,32 @@ public:
 	int32 CarrierExtraDashCharges = 1;
 
 	/**
+	 * DEMO 17 item 7, verbatim: "Add a toggle to test dash cooldown refreshing on every kill."
+	 *
+	 * *** AN EXPERIMENT, AND OFF IS THE SHIPPED ANSWER. *** Demo 17 asks for a way to TRY it, not for
+	 * the behaviour — so this defaults to false and the game plays exactly as it did with it there.
+	 * Turning it on hands the killer one dash charge back on every kill, which is the same grant
+	 * (UTraceCharacterMovementComponent::RefundDashCharge) that a successful parry already makes, and
+	 * therefore the same "one charge, and a full pool is not an error" semantics:
+	 *
+	 *     0 of 2 charges -> 1 of 2, the refill clock already running keeps running for the second;
+	 *     1 of 2         -> 2 of 2, pool full, clock cleared;
+	 *     2 of 2         -> nothing, and that is not a failure.
+	 *
+	 * *** IT IS NOW WIRED. *** UTraceAbilityComponent::NotifyKill honours it — the framework's kill
+	 * notification, so it works for all ten characters from one call site and no character file knows
+	 * it exists. Turning it on in the settings panel or the ini therefore takes effect.
+	 *
+	 * Two things the call site does, both copied from the parry's grant rather than reinvented: it is
+	 * SERVER ONLY (RefundDashCharge refuses off the authority anyway, and mirrors itself to the owning
+	 * client so the HUD meter moves on the same frame), and it refuses a SELF-KILL — otherwise a
+	 * player farms charges off their own out-of-bounds deaths, which spec v19 §4.1 has just made a
+	 * routine way to die.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Dash", meta = (DisplayName = "EXPERIMENT: Refresh A Dash Charge On Every Kill (Demo 17 item 7 - default OFF)"))
+	bool bRefreshDashChargeOnKill = false;
+
+	/**
 	 * Multiple of the ground speed limit a dash hands back when it ends. 1.0 = the old behaviour.
 	 *
 	 * Spec v3 §2.4: "state transitions should preserve velocity vectors rather than resetting
@@ -3965,9 +3991,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Second Jump Direction Change (0-1, 1 = instant)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.5", UIMax = "1.0"))
 	float RoccoSecondJumpRedirectFraction = 1.f;
 
-	/** Ripple lifetime. §6: "Lasts 4 s, then all effects and visuals vanish." */
+	/** Ripple lifetime. v14 §6 said "Lasts 4 s"; Demo 17 raised it to 5.5 s. Effects and visuals
+	    still vanish together at expiry. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Lifetime (s)", ClampMin = "0.25", ClampMax = "30.0", UIMin = "1.0", UIMax = "10.0"))
-	float RoccoRippleLifetimeSeconds = 4.f;
+	float RoccoRippleLifetimeSeconds = 5.5f;
 
 	/** §6: "20 s cooldown", and it is SEPARATE from the standard dash's cooldown. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Cooldown (s)", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
@@ -4127,12 +4154,25 @@ public:
 	float MaceSuspendLateralSpeedCap = 550.f;
 
 	/**
-	 * Cooldown between suspends. §6 gives none, so the shipped value is 0 — the 1.25 s cap and
-	 * needing to be airborne are the whole cost. A knob, not a literal, because "she can suspend
-	 * every frame she is in the air" is exactly the kind of thing a playtest reverses.
+	 * DEMO 17 item 6, verbatim: "Add a 3 second cooldown to Mace's V. Time it from when she releases V
+	 * or the suspend expires, not from when it started. Do not show it on the HUD."
+	 *
+	 * *** TIMED FROM THE END, AND THAT IS WHERE THE CODE ALREADY PUTS IT. *** It is stamped by
+	 * UTraceAbilitySetMace::StopSuspend(), which is the ONE exit every way out of a suspend goes
+	 * through — the key coming up, the 1.25 s cap elapsing, landing, a pull starting, dying. So a
+	 * player who holds the full 1.25 s waits 3 s from the moment she drops, i.e. 4.25 s after the
+	 * press, and a player who taps V waits 3 s from the tap. Timing it from the START would have made a
+	 * long hold cost less than a short one, which is backwards.
+	 *
+	 * *** HIDDEN. *** Nothing draws it: ATraceHUD's Mace branch draws a SUSPENDED chip while
+	 * IsSuspending() is true and nothing at all when it is not, and this character does not override
+	 * GetCharacterOwnedCooldownRemaining(), so the E ring never learns about it either. The player is
+	 * meant to find it by feel, which is what Demo 17 asked for.
+	 *
+	 * §6 specified no cooldown at all, so this was 0 until Demo 17. 0 restores that and is the red arm.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Suspend Cooldown (s, 0 = none; UNSPECIFIED in §6)", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "10.0"))
-	float MaceSuspendCooldownSeconds = 0.f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Suspend Cooldown (s, from RELEASE or expiry; NOT drawn on the HUD) [Demo 17: 3]", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "10.0"))
+	float MaceSuspendCooldownSeconds = 3.f;
 
 	/**
 	 * §6: "throws a roped spike in her aim direction for a MEDIUM distance."
@@ -4285,7 +4325,11 @@ public:
 
 	/** §6: "pulls enemies within a SMALL radius toward it" — smaller than the damage radius. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Pull Radius (uu) [CONTROL]", ClampMin = "20.0", ClampMax = "2000.0", UIMin = "100.0", UIMax = "500.0"))
-	float OysterPicklerPullRadiusUU = 260.f;
+	// SPEC v19 §4.4 "a greater pull radius": 260 -> 380, matching the poison burst radius the game
+	// already draws, so the ring a player SEES is the ring that grabs them. The C++ default and
+	// Config/DefaultGame.ini's pinned value are kept equal deliberately — when they disagreed the ini
+	// silently won and the header lied to anyone reading it for the shipped number.
+	float OysterPicklerPullRadiusUU = 380.f;
 
 	/** How hard the pull is. A CONTROL effect — blocked on carriers by the §4 [ASSUMPTION]. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Pull Speed (uu/s) [CONTROL]", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
@@ -4308,7 +4352,7 @@ public:
 	//
 	// Passive: orbited by five mechanical bees; an enemy hit by one becomes VULNERABLE for 2 s,
 	// taking +25% damage from all sources. Does not stack; a new application RESETS the timer.
-	// Movement: +10% speed while ANY enemy is vulnerable.
+	// Movement: +15% speed while ANY enemy is vulnerable (v14 §6 said 10%; Demo 18 raised it).
 	// Activated (Sting): loads the 5 bees into his gun; his next five bullets apply vulnerable at
 	// NORMAL damage; when all five are fired the bees resume orbiting. 25 s cooldown.
 	// ------------------------------------------------------------------------------------------
@@ -4343,9 +4387,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable Damage Bonus (fraction)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
 	float XVulnerableDamageBonus = 0.25f;
 
-	/** §6 movement: "+10% speed while ANY enemy is vulnerable." Any, not the one he marked. */
+	/** Movement passive: speed while ANY enemy is vulnerable — any, not the one he marked.
+	    v14 §6 specified 10%; Demo 18 raised it to 15%. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Speed Bonus While Any Enemy Vulnerable (fraction)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.3"))
-	float XVulnerableSpeedBonus = 0.1f;
+	float XVulnerableSpeedBonus = 0.15f;
 
 	/** §6: "25 s cooldown" — the one activated ability that is not 20. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Sting Cooldown (s) [v14 §6: 25, not 20]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
@@ -4461,6 +4506,21 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Wobble Amplitude (uu, 0 = flies straight) [v18 §2]", ClampMin = "0.0", ClampMax = "1000.0", UIMin = "0.0", UIMax = "300.0"))
 	float RoxieRocketWobbleAmplitudeUU = 120.f;
+
+	/**
+	 * DEMO 17 item 3, verbatim: "make the model of the rocket bigger, so it is easy to see."
+	 *
+	 * A multiplier on the DRAWN body, whose base size is RoxieRocketHitRadiusUU above — so 1.0 means
+	 * "the rocket is drawn exactly as big as the thing that kills you". Before Demo 17 the body was a
+	 * fixed 13 uu dart around a 45 uu lethal radius, i.e. three and a half times narrower than its own
+	 * hit test: a near miss looked like a clean miss, which is the same class of defect as a trail
+	 * whose lethal volume is not its drawn volume.
+	 *
+	 * Raise it to exaggerate the rocket further; it changes NOTHING about what the rocket hits.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket: Drawn Size (x its own hit radius) [Demo 17]", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.5", UIMax = "3.0"))
+	float RoxieRocketVisualScale = 1.f;
+
 
 	/** Wobbles per second. With the amplitude above, these two ARE "hard to aim" — tune them together. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Wobble Frequency (Hz)", ClampMin = "0.0", ClampMax = "20.0", UIMin = "0.5", UIMax = "8.0"))
@@ -4590,11 +4650,14 @@ public:
 	/**
 	 * Seconds a player who has just teleported is ignored by BOTH gates.
 	 *
-	 * WITHOUT THIS THE ABILITY IS A TRAP, not a portal: you arrive standing inside the far gate, which
-	 * immediately sends you back, forever. Zero is therefore the RED arm rather than a legitimate
-	 * setting, and 1 s is long enough to walk clear of a 130 uu radius at any speed in this game.
+	 * SINCE DEMO 17 THIS IS THE BACKSTOP AND NOT THE MECHANISM. A gate now fires on the frame somebody
+	 * STEPS IN — an edge, not a proximity poll (see ATraceElleGate::InsideLastLook) — so an arrival is
+	 * no longer an entry and standing in a mouth does nothing at all. That is what stops the pair being
+	 * a trap; before it, this lockout was the only thing between a stationary player and being thrown
+	 * across the map once a second for the pair's whole life. What is left for this knob is the fast
+	 * in-out-in case, and 1 s is long enough to walk clear of a 130 uu radius at any speed in this game.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Re-Entry Lockout (s, 0 = ping-pong forever)", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Re-Entry Lockout (s) [a backstop since Demo 17; the step-in edge is the rule]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
 	float ElleSnapTeleportLockoutSeconds = 1.f;
 
 	/**
@@ -4629,6 +4692,23 @@ public:
 	/** §2: "35 s cooldown". The card prints this too — Trace.VerifyCharacterData compares the pair. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap Cooldown (s) [v18 §2: 35]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
 	float ElleSnapCooldownSeconds = 35.f;
+
+	/**
+	 * DEMO 17 item 1. How far the SECOND mouth must be from the first, in uu, before Snap will accept
+	 * it. Below this the reactivation is refused, is charged NOTHING, and the 4 s window keeps running
+	 * so she can step away and finish the cast.
+	 *
+	 * *** THIS IS HALF OF "IT DOESN'T WORK AT ALL", AND IT IS THE HALF A PLAYER CAUSES THEMSELVES. ***
+	 * A player whose first press seems to do nothing presses again immediately, standing exactly where
+	 * they were. That used to place both mouths inside one gate radius, which is not a portal: it is
+	 * one blob that teleports you to where you already are, and it burned the whole 35 s cooldown on
+	 * it. Measured that way in a two-process run before this landed.
+	 *
+	 * Defaults to 2x the gate radius (260 uu at the shipped 130), which is the smallest separation at
+	 * which the two mouths cannot overlap at all. 0 disables the rule and restores the old behaviour.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Minimum Distance Between The Two Mouths (uu, 0 = allow both on one spot)", ClampMin = "0.0", ClampMax = "2000.0", UIMin = "0.0", UIMax = "600.0"))
+	float ElleSnapMinimumMouthSeparationUU = 260.f;
 
 	// ------------------------------------------------------------------------------------------
 	// SLIMEBALL — spec v18 §2
@@ -4680,6 +4760,35 @@ public:
 	/** Cooldown between sticks. §2 gives none; 0 ships, exactly as Mace's suspend does. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Wall Stick: Cooldown (s, 0 = none; UNSPECIFIED in §2)", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "10.0"))
 	float SlimeballWallStickCooldownSeconds = 0.f;
+
+	/**
+	 * DEMO 17 item 2, verbatim: "Slimeball should be able to cancel the wall stick with jump, and
+	 * perform a wall jump off the wall."
+	 *
+	 * How long after that jump he may NOT grab the same wall again, in seconds. Nothing to do with the
+	 * ordinary stick cooldown above: this exists only so that a player who is still HOLDING V — which
+	 * everyone is, because the stick is a hold — does not have the 20 Hz re-stick sweep glue him
+	 * straight back onto the face he just launched off. That is precisely the wall-jump stickiness spec
+	 * v10 §5 removed for everybody else, and it must not come back through one character.
+	 *
+	 * 0.35 s is deliberately a little longer than the movement layer's own into-wall control lockout
+	 * (WallJumpControlLockoutSeconds, 0.20 s): the launch clears the 90 uu stick reach in about a
+	 * quarter of a second at the shipped outward impulse, and the sweep only looks 20 times a second,
+	 * so a lockout equal to the movement one could still catch on its last look. 0 = no lockout, which
+	 * is the RED setting rather than a legitimate one.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Wall Stick: Re-Grab Lockout After A Wall Jump (s) [Demo 17]", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.1", UIMax = "1.0"))
+	float SlimeballWallJumpRestickLockoutSeconds = 0.35f;
+
+	/**
+	 * DEMO 17 item 2. Whether the jump that cancels the stick launches him off the wall at all.
+	 *
+	 * True (shipped) = jump is a real wall jump: he leaves along the surface normal with the shipped
+	 * wall-jump numbers. False = jump merely lets go and he falls, which is the smaller reading of the
+	 * same sentence and one tick box away.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Wall Stick: Jump Performs A WALL JUMP (off = jump only lets go) [Demo 17]"))
+	bool bSlimeballWallStickJumpLaunches = true;
 
 	/**
 	 * §2: "+30% fire rate" WHILE STUCK ONLY.
@@ -4922,4 +5031,248 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable: Max Stacks [v16 §4, capped at 5]", ClampMin = "1", ClampMax = "50", UIMin = "1", UIMax = "10"))
 	int32 XVulnerableMaxStacks = 5;
+
+	// ==========================================================================================
+	// MORTIMER  (spec v19 §3, new — roster 8 -> 10)
+	//
+	// Verbatim, Demo 18:
+	//   PASSIVE   "his dash is 75% shorter" AND "he can charge the core up to 2x as long as anyone
+	//             else, on the same linear scale, so he throws it twice as far"
+	//   MOVEMENT  "he can mantle onto objects, 30% more generous than the old in-game mantle"
+	//   ACTIVATED "only while carrying the core AND standing on the ground or the top of an object,
+	//             a blast that knocks nearby enemies away"
+	//
+	// *** THREE OF THESE FIVE KNOBS ARE READ BY CODE THIS PASS DID NOT OWN. *** The dash scale, the
+	// mantle pair and the throw-charge scale are surfaced through TraceAbilityTraits (see
+	// Abilities/TraceAbilityTypes.h) and are INERT until the one-line call sites named there exist in
+	// Movement/ and Gameplay/TraceCore.cpp. That is stated in the report, not hidden here: a knob
+	// nothing reads is worse than a missing knob, because it looks finished.
+	//
+	// NO ini LINES. These take their C++ defaults; nothing in Config/DefaultGame.ini pins them, so
+	// editing the numbers here is enough. (Contrast MaceSuspendCooldownSeconds, which the ini pins.)
+	// ==========================================================================================
+
+	/**
+	 * MULTIPLIER ON DASH REACH. §3: "his dash is 75% shorter", so 0.25.
+	 *
+	 * IT SCALES THE DASH'S SPEED, NOT ITS DURATION, and that is a decision worth stating. Reach is
+	 * DashSpeed x DashDuration (3300 x 0.18 = 594 uu), so either factor would shorten it — but the
+	 * DURATION is what the trace, the parry window and the dash-hit sweep are all measured against
+	 * (see UTraceCharacterMovementComponent::IsDashing), and a Mortimer whose dash window was a
+	 * quarter as long would be a quarter as parryable. Scaling the speed leaves every timing in the
+	 * game where it is and moves only the distance, which is the sentence the doc actually wrote.
+	 *
+	 * 594 uu -> 149 uu. That is deliberately close to useless as an escape and still useful as a
+	 * repositioning step, which is the trade the mantle and the Core throw pay him back for.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Dash Reach Scale (0.25 = 75% shorter) [v19 §3]", ClampMin = "0.05", ClampMax = "2.0", UIMin = "0.1", UIMax = "1.0"))
+	float MortimerDashDistanceScale = 0.25f;
+
+	/**
+	 * HOW MANY TIMES LONGER HE MAY USEFULLY HOLD A CORE THROW. §3: "up to 2x as long as anyone else".
+	 *
+	 * It multiplies the CAP on t = HeldSeconds / CoreThrowChargeSeconds, and nothing else. With the
+	 * shared charge at 0.6 s (v18 §0) his ceiling is 1.2 s, and the shipped line
+	 *     Power = CoreThrowChargeFloorFraction + (1 - Floor) x t
+	 * is extrapolated to t = 2 rather than given a multiplier of its own — "ON THE SAME LINEAR SCALE"
+	 * is the doc's phrase and this is what it means arithmetically.
+	 *
+	 * *** SO THE HONEST NUMBER IS x1.85 SPEED, NOT x2.00. *** Floor is 0.15, so a full 0.6 s hold is
+	 * 0.15 + 0.85 = 1.00 and a full 1.2 s hold is 0.15 + 1.70 = 1.85. The doc says "twice as far";
+	 * on the same line the answer is 1.85x the launch speed, and launch speed is not distance — a
+	 * flat-ground throw's range goes as the SQUARE of speed, so 1.85x speed is about 3.4x the range,
+	 * which overshoots "twice as far" rather than falling short of it. Flagged in the report as the
+	 * one place the doc's two sentences cannot both be exactly true.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Core Throw: Charge Hold Scale (2 = may hold twice as long) [v19 §3]", ClampMin = "1.0", ClampMax = "6.0", UIMin = "1.0", UIMax = "3.0"))
+	float MortimerThrowChargeHoldScale = 2.f;
+
+	/**
+	 * *** THE MANTLE GATE, AND IT IS OFF FOR EVERY OTHER CHARACTER BY CONSTRUCTION. ***
+	 *
+	 * The mantle was added in `dffea7c` and deleted in `d2319b2`; the deletion commit MEASURES why
+	 * (shipped 5/5 ledge contacts at 0.00 corrections and 0.00 uu worst error, against the legacy
+	 * mantle's 1.00 corrections per contact and 88.11 uu). Spec v19 §3 asks for it back for Mortimer
+	 * alone, so this is a per-character switch and not a global one: nobody but Mortimer ever reaches
+	 * the probe, which is what makes "bringing it back for one character must not bring the ledge bug
+	 * back for everyone" structural rather than hoped-for.
+	 *
+	 * Setting this false disables Mortimer's mantle and restores today's shipped movement for all ten
+	 * characters — i.e. it is also the red arm and the panic switch.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Mantle Enabled (MORTIMER ONLY - nobody else can ever mantle) [v19 §3]"))
+	bool bMortimerCanMantle = true;
+
+	/**
+	 * HOW MUCH MORE GENEROUS HIS MANTLE IS THAN THE RECOVERED ONE. §3: "30% more generous".
+	 *
+	 * Applied to the four numbers that decide whether a ledge is climbable at all, from the values
+	 * `git show dffea7c` restores:
+	 *     reach          70   -> 91 uu       (x this)
+	 *     min height     55   -> 42.3 uu     (/ this — a LOWER floor is more generous)
+	 *     max height     230  -> 299 uu      (x this)
+	 *     min approach   120  -> 92.3 uu/s   (/ this — asking for LESS speed is more generous)
+	 * Duration, the up-phase fraction and the cooldown are NOT scaled: they are the feel of the
+	 * pull-up, not the size of the window, and "more generous" is a statement about what counts as a
+	 * ledge.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Mantle Generosity (1.30 = 30% more generous than the old one) [v19 §3]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float MortimerMantleGenerosity = 1.3f;
+
+	/**
+	 * QUAKE'S REACH, in uu, measured centre to centre.
+	 *
+	 * 600 is a little under the dash reach everybody else has (594 uu) and a lot more than Chut's
+	 * bash (130 uu), which is the right shape for the two abilities: the bash is a contact effect on
+	 * a moving player, and this is a "get off me" a stationary carrier pays a 20 s cooldown for.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Radius (uu) [v19 §3]", ClampMin = "50.0", ClampMax = "3000.0", UIMin = "200.0", UIMax = "1200.0"))
+	float MortimerBlastRadiusUU = 600.f;
+
+	/**
+	 * HOW HARD QUAKE THROWS A VICTIM, in uu/s, at the centre of the blast.
+	 *
+	 * Same units and the same launch shape as Chut's bash (1118 uu/s), a little stronger because it
+	 * is on a 20 s cooldown and costs the carrier their whole aim for the frame. Like the bash it is
+	 * an OVERRIDE and not an addition, so a sprinting enemy is thrown exactly as far as a standing
+	 * one — see the LaunchCharacter call.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Knockback Speed (uu/s) [v19 §3]", ClampMin = "0.0", ClampMax = "6000.0", UIMin = "400.0", UIMax = "2500.0"))
+	float MortimerBlastKnockbackSpeed = 1300.f;
+
+	/** Upward part of the launch, as a fraction of the speed. Same shape and reason as ChutBashUpBias. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Up Bias (fraction of the knockback speed)", ClampMin = "0.0", ClampMax = "1.5", UIMin = "0.0", UIMax = "0.8"))
+	float MortimerBlastUpBias = 0.35f;
+
+	/**
+	 * FALLS OFF WITH DISTANCE, or is flat.
+	 *
+	 * True (default) scales the launch linearly from full at his feet to
+	 * MortimerBlastMinFalloffScale at the rim. A flat blast makes the rim a cliff — one uu decides
+	 * between full knockback and none — which reads as inconsistent rather than as a radius.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Falls Off With Distance [v19 §3 ASSUMPTION: true]"))
+	bool bMortimerBlastFallsOff = true;
+
+	/** What the launch is worth at the very rim, as a fraction of the centre value. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Knockback At The Rim (fraction of centre)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.1", UIMax = "1.0"))
+	float MortimerBlastMinFalloffScale = 0.35f;
+
+	/**
+	 * REQUIRE AN UNBLOCKED LINE TO THE VICTIM.
+	 *
+	 * §3 says "nearby enemies" and says nothing about walls; true is the [ASSUMPTION], because a
+	 * blast that reaches through a solid wall is the kind of thing that reads as a bug rather than as
+	 * a big radius, and Mortimer is stood still on the ground when he casts it — the geometry between
+	 * him and his victim is exactly the counterplay.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Needs Line Of Sight [v19 §3 ASSUMPTION: true]"))
+	bool bMortimerBlastNeedsLineOfSight = true;
+
+	/**
+	 * §3 does not give one. [ASSUMPTION] 20 s, the same as Chut's, Rocco's and Mace's — it is a
+	 * defensive reset with no damage attached, so it sits at the roster's baseline rather than with
+	 * the 25-35 s abilities that end fights.
+	 *
+	 * The card PRINTS this number too (Core/TraceCharacterRoster.cpp) and Trace.VerifyCharacterData
+	 * section D fails if the two ever drift.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Cooldown (s) [v19 §3 ASSUMPTION: 20]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float MortimerBlastCooldownSeconds = 20.f;
+
+	// ==========================================================================================
+	// LILY  (spec v19 §3, new — roster 8 -> 10)
+	//
+	// Verbatim, Demo 18:
+	//   MOVEMENT  "an extra dash" — 2 normally, 3 while carrying the Core — and "only 60 health"
+	//   PASSIVE   "+30% wall-jump momentum bonus"   (hers alone)
+	//   ACTIVATED "Zip (30 s): for 5 s she can fly. Jump goes up at walking speed, slide/crouch goes
+	//             down, all other movement mechanics apply as usual. With the core the duration is
+	//             halved. If she activates it and then picks up the core, the remaining duration is
+	//             halved."
+	//
+	// *** THREE OF THESE ARE ALSO INERT UNTIL SOMEBODY ELSE'S ONE-LINERS LAND. *** The extra charge,
+	// the 60 health and the wall-jump bonus are surfaced through TraceAbilityTraits and are read by
+	// nothing today. Zip itself is fully live — it is written entirely inside her own ability set.
+	// ==========================================================================================
+
+	/**
+	 * EXTRA dash charges, ON TOP of everybody's pool. §3: "an extra dash — 2 normally, 3 while
+	 * carrying the Core", against the shipped BaseDashCharges 1 + CarrierExtraDashCharges 1.
+	 *
+	 * AN ADDEND, NOT A TOTAL, deliberately: written as "2" it would stop tracking a retune of
+	 * BaseDashCharges and Lily would silently stop being "one more than everyone".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Extra Dash Charges (ON TOP of everyone's pool) [v19 §3]", ClampMin = "0", ClampMax = "5", UIMin = "0", UIMax = "2"))
+	int32 LilyExtraDashCharges = 1;
+
+	/**
+	 * HER MAX HEALTH. §3: "she has only 60 health", against UTraceSettings::MaxHealth's 100.
+	 *
+	 * AN ABSOLUTE, NOT A FRACTION, because the doc states an absolute: a "0.6 multiplier" would stop
+	 * being 60 the moment somebody retuned MaxHealth, and 60 is the number the card prints.
+	 *
+	 * WHAT IT MEANS IN THE UNITS OF THE GUN: two 40-damage body shots (80) kill her outright where
+	 * they leave everybody else at 20, and one 100-damage backstab or headshot always did. She is the
+	 * only character in the game who dies to two body shots.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Max Health (ABSOLUTE, not a fraction of MaxHealth) [v19 §3: 60]", ClampMin = "1.0", ClampMax = "1000.0", UIMin = "20.0", UIMax = "200.0"))
+	float LilyMaxHealth = 60.f;
+
+	/**
+	 * +30% ON THE WALL JUMP'S MOMENTUM. §3: "+30% wall-jump momentum bonus (hers alone; the global
+	 * wall-jump numbers must not move)".
+	 *
+	 * IT SCALES THE RETENTION TERM ONLY — the part of the launch that is the speed she ARRIVED with
+	 * (WallJumpSpeedRetention x WallJumpMomentumScale x WallJumpMomentumScaleV10) — and never the
+	 * flat WallJumpOutwardImpulse or WallJumpVerticalMultiplier. "Momentum" is the carried speed;
+	 * the outward impulse is a fixed shove that a player who arrived at a standstill also gets, and
+	 * scaling that would make her standing wall jumps stronger rather than her fast ones.
+	 *
+	 * THE AIR-STRAFE HARD CAP STILL APPLIES ON TOP. TryWallJump()'s ceiling is
+	 * max(entry speed, AirStrafeHardCapSpeed), so this can hand her back more of what she arrived
+	 * with but can never let her BUILD speed in the air — the whole point of spec v5 §1 survives.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Wall-Jump Momentum Bonus (fraction; HERS ALONE) [v19 §3: 0.30]", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.6"))
+	float LilyWallJumpMomentumBonus = 0.3f;
+
+	/** §3: "for 5 s she can fly". The full-length Zip, taken without the Core. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Duration (s) [v19 §3: 5]", ClampMin = "0.25", ClampMax = "60.0", UIMin = "1.0", UIMax = "15.0"))
+	float LilyZipDurationSeconds = 5.f;
+
+	/**
+	 * *** THE HALVING. ONE KNOB, TWO CLAUSES, AND THAT IS THE POINT. ***
+	 *
+	 * §3 says both "with the core the duration is halved" AND "if she activates it and then picks up
+	 * the core, the remaining duration is halved". Those are the same 0.5 applied at two different
+	 * moments — at the cast if she is already carrying, and to WHAT IS LEFT if the Core arrives
+	 * mid-flight. Writing it once is what stops the second clause being implemented as "re-clamp to
+	 * 2.5 s", which is the misreading the spec explicitly calls out: 4 s in with 1 s left, picking up
+	 * the Core must leave 0.5 s, not 2.5 s.
+	 *
+	 * It applies once per PICKUP, not once per Zip: drop the Core and take it again and the remaining
+	 * time halves again. That is the literal reading and it is the one that cannot be farmed.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip: Core Halves It (at the cast, AND halves what is LEFT on a mid-Zip pickup) [v19 §3]", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.25", UIMax = "1.0"))
+	float LilyZipCarrierDurationScale = 0.5f;
+
+	/**
+	 * CLIMB RATE WHILE JUMP IS HELD, as a multiple of WalkSpeed. §3: "jump goes up at walking speed",
+	 * so 1.0 and DERIVED — the 800 is UTraceSettings::WalkSpeed and is written down nowhere here.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Climb Speed (x WalkSpeed) [v19 §3: 1.0 = 'walking speed']", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.25", UIMax = "2.0"))
+	float LilyZipClimbSpeedScale = 1.f;
+
+	/**
+	 * DESCENT RATE WHILE CROUCH/SLIDE IS HELD, as a multiple of WalkSpeed.
+	 *
+	 * §3 says only "slide/crouch goes down" and gives no rate; [ASSUMPTION] the same magnitude as the
+	 * climb, so the control is symmetric and a player learns one number rather than two.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Descend Speed (x WalkSpeed) [v19 §3 ASSUMPTION: same as the climb]", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.25", UIMax = "2.0"))
+	float LilyZipDescendSpeedScale = 1.f;
+
+	/** §3: "Zip (30 s)". The card prints this too — Trace.VerifyCharacterData compares the pair. */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Cooldown (s) [v19 §3: 30]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
+	float LilyZipCooldownSeconds = 30.f;
 };

@@ -6,6 +6,14 @@
 //
 //   MOVEMENT  "Wall stick (Hold V): sticks to walls while held."
 //
+//             DEMO 17 gave it an EXIT: "Slimeball should be able to cancel the wall stick with jump,
+//             and perform a wall jump off the wall." So the stick is a position to take rather than a
+//             commitment to make — see OnJumpPressed() below, and note the two things that fix has to
+//             not break: he must not be able to re-grab the same face on the next 20 Hz sweep while V
+//             is still held (that is wall-jump stickiness, which spec v10 §5 removed for everybody),
+//             and stick-jump-stick-jump must not be an infinite ladder (spec v8 §7's consecutive
+//             cap, which this launch does not go through and therefore has to honour itself).
+//
 //   PASSIVE   while stuck, "+30% fire rate and 30% damage reduction on body shots and front knife
 //             stabs."   [ASSUMPTION] headshots and BACK stabs are unreduced — the doc names body
 //             shots and front stabs, exactly as Chut's Chud names body shots and melees.
@@ -135,6 +143,28 @@ public:
 	/** V released. Lets go immediately — gravity resumes on the same tick. */
 	virtual void OnSecondaryReleased() override;
 
+	/**
+	 * DEMO 17 item 2, verbatim: "Slimeball should be able to cancel the wall stick with jump, and
+	 * perform a wall jump off the wall."
+	 *
+	 * Returns TRUE — consuming the press — only while he is actually stuck. Consuming matters: a
+	 * mid-air press that reached ACharacter::Jump() with no wall-jump window open is refused by
+	 * UTraceCharacterMovementComponent::DoJump anyway, so returning false would spend the stick and
+	 * launch nothing.
+	 *
+	 * *** IT DOES NOT CALL THE MOVEMENT COMPONENT'S TryWallJump(), AND CANNOT. *** That function is
+	 * protected, is only reachable from inside DoJump, and needs a contact window that a stuck pawn
+	 * does not have — the stick zeroes Velocity, so nothing collides with the wall and HandleImpact
+	 * never opens one. So the launch is written here, the way Rocco's second jump and Oyster's jar jump
+	 * are written in their own files, and every NUMBER in it is read from the shipped wall-jump knobs
+	 * (WallJumpOutwardImpulse, WallJumpVerticalMultiplier, WallJumpSpeedRetention) so a retune of the
+	 * wall jump carries him with it. A stuck pawn's planar speed is zero by construction, which is the
+	 * case TryWallJump itself describes as "the outward impulse is the whole launch".
+	 *
+	 * Off the wall it returns false and the ordinary jump runs, untouched.
+	 */
+	virtual bool OnJumpPressed() override;
+
 	// --- PASSIVE: while stuck -----------------------------------------------------------------------
 
 	/**
@@ -214,6 +244,18 @@ private:
 
 	/** Absolute match time the next stick is allowed. 0 = ready (the shipped knob). */
 	float StickReadyMatchTime = 0.f;
+
+	/**
+	 * DEMO 17 item 2. Wall jumps taken OFF A STICK since he last touched the ground.
+	 *
+	 * *** THIS IS THE ANTI-LADDER CAP AND IT IS NOT OPTIONAL. *** The movement component keeps its own
+	 * WallJumpsSinceGround and refuses past WallJumpMaxConsecutive (2) — spec v8 §7 asks for that by
+	 * name, because "two close walls become an infinite ladder" otherwise. This launch does not go
+	 * through that counter and therefore cannot be stopped by it, so stick-jump-stick-jump would have
+	 * been a free lift to the skybox for exactly one character. Counted here, capped against the SAME
+	 * shipped knob, and cleared by the ground exactly as the movement component clears its own.
+	 */
+	int32 StickJumpsSinceGround = 0;
 
 	/** The surface he is on. Used to re-probe along the same axis each tick rather than sweeping again. */
 	FVector StickWallNormal = FVector::ZeroVector;

@@ -38,6 +38,20 @@ static TAutoConsoleVariable<int32> CVarRoxieRocketWobble(
 	     "straight, so Trace.Roxie.RocketFlightTest can be shown FAILING. Never ship 0."),
 	ECVF_Cheat);
 
+/**
+ * File-private constants. Named after the file rather than left anonymous, because an unnamed
+ * namespace collides with every other unnamed namespace concatenated into the same unity translation
+ * unit — a Windows-only failure macOS structurally cannot see.
+ */
+namespace TraceRoxieRocketFile
+{
+	/**
+	 * How long the drawn rocket is, as a multiple of its radius. 3 is a rocket rather than a ball or a
+	 * needle; it is a look, not a rule, which is why it is a file constant and not a twelfth knob.
+	 */
+	constexpr float VisualLengthPerRadius = 3.f;
+}
+
 namespace TraceRoxieRocket
 {
 	float GetDamage()
@@ -60,6 +74,11 @@ namespace TraceRoxieRocket
 	float GetHitRadiusUU()
 	{
 		return FMath::Clamp(UTraceSettings::Get().RoxieRocketHitRadiusUU, 1.f, 300.f);
+	}
+
+	float GetVisualScale()
+	{
+		return FMath::Clamp(UTraceSettings::Get().RoxieRocketVisualScale, 0.1f, 6.f);
 	}
 
 	float GetWobbleAmplitudeUU()
@@ -204,7 +223,10 @@ ATraceRoxieRocket::ATraceRoxieRocket()
 	Body->SetCanEverAffectNavigation(false);
 	Body->SetCastShadow(false);
 	Body->bReceivesDecals = false;
-	Body->SetRelativeScale3D(FVector(0.13f, 0.13f, 0.42f));
+
+	// The SIZE is applied in BeginPlay, not here: it is derived from the rocket's own hit radius, which
+	// is a live settings knob, and a CDO built before the .ini layers over the header would bake the
+	// wrong one in for the whole process. See ApplyVisualSize().
 
 	// ConstructorHelpers rather than a runtime LoadObject, for the reason ATraceCore's constructor
 	// gives: a constructor-time reference is what makes an engine asset cook into a packaged build,
@@ -235,6 +257,8 @@ void ATraceRoxieRocket::BeginPlay()
 		SpawnWorldTime = RocketWorld->GetTimeSeconds();
 	}
 
+	ApplyVisualSize();
+
 	// Ember, matching the select card's stripe, so a player who has seen the card recognises the
 	// thing coming at them. Built here rather than in the constructor because a dynamic material
 	// instance is per-instance state; the base material is resolved by path and may legitimately be
@@ -249,6 +273,17 @@ void ATraceRoxieRocket::BeginPlay()
 				const FLinearColor Ember(1.f, 0.45f, 0.12f, 1.f);
 				RocketMID->SetVectorParameterValue(TEXT("Color"), Ember);
 				RocketMID->SetVectorParameterValue(TEXT("BaseColor"), Ember);
+
+				// DEMO 17 item 3 asks for a model that is EASY TO SEE, and on this arena half of that is
+				// brightness rather than size: the field is black and everything a player reads at range
+				// is emissive. These four are the names the project's material families use for the same
+				// two ideas, and setting one a material does not have is a documented silent no-op (see
+				// ApplyColorToSkeletalMesh) — so the rocket glows on M_TraceNeon and is merely ember on
+				// the BasicShapes fallback, with no branch here.
+				RocketMID->SetVectorParameterValue(TEXT("EmissiveColor"), Ember * 4.f);
+				RocketMID->SetScalarParameterValue(TEXT("Glow"), 4.f);
+				RocketMID->SetScalarParameterValue(TEXT("EmissiveStrength"), 4.f);
+				RocketMID->SetScalarParameterValue(TEXT("EmissivePower"), 4.f);
 			}
 		}
 	}
@@ -304,6 +339,31 @@ FVector ATraceRoxieRocket::GetCurrentPosition() const
 	return TraceRoxieRocket::GetPositionAtTime(LaunchOrigin, LaunchDirection, GetSecondsInFlight(),
 		TraceRoxieRocket::GetSpeedUU(), TraceRoxieRocket::GetWobbleAmplitudeUU(),
 		TraceRoxieRocket::GetWobbleFrequencyHz(), WobbleSeedTurns);
+}
+
+void ATraceRoxieRocket::ApplyVisualSize()
+{
+	if (Body == nullptr)
+	{
+		return;
+	}
+
+	// *** DEMO 17 item 3: "the model gets BIGGER so it is easy to see." ***
+	//
+	// The size is DERIVED FROM THE HIT RADIUS rather than being a second free number, and that is the
+	// whole point of this function. The rocket kills anything whose capsule comes within
+	// RoxieRocketHitRadiusUU of the path; drawing a 13 uu dart around a 45 uu lethal radius meant the
+	// thing a player was dodging was three and a half times wider than the thing they could see — which
+	// is the "the lethal volume is not the drawn volume" defect this project already spent a pass
+	// removing from the ribbon. Now the body is exactly as wide as its own touch radius, so a near miss
+	// LOOKS like a near miss.
+	//
+	// RoxieRocketVisualScale is the tuning dial on top of that, and it defaults to 1.0 = "draw the
+	// lethal size". /Engine/BasicShapes/Cone is 100 uu across and 100 uu tall, so a scale of 1 is 100 uu.
+	const float Radius = TraceRoxieRocket::GetHitRadiusUU() * TraceRoxieRocket::GetVisualScale();
+	const float Length = Radius * TraceRoxieRocketFile::VisualLengthPerRadius;
+
+	Body->SetRelativeScale3D(FVector((Radius * 2.f) / 100.f, (Radius * 2.f) / 100.f, Length / 100.f));
 }
 
 void ATraceRoxieRocket::UpdateVisual(const FVector& AtPosition)

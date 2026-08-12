@@ -90,13 +90,14 @@ namespace TraceMenuHUDFile
 	/**
 	 * `Trace.UI.UseUMG 0|1` — which renderer draws the title screen.
 	 *
-	 * The DEFAULT IS 1, and that is a claim this pass has to back up rather than assert. What it
-	 * rests on: `Trace.UI.VerifyMenu` measures the widget's laid-out row rectangles against the
-	 * Canvas layout maths for the same frame and reports the worst error in pixels — hit testing,
-	 * hover and the click harness all run off those rectangles, so if they agree the two renderers
-	 * are interchangeable to the player's mouse. -TraceMenuClickTest still reports one press per
-	 * row, -TraceAutoSettings still opens the overlay and restores the config, and -TraceAutoPlay
-	 * still reaches the arena.
+	 * Either way the SCREEN BEHAVES THE SAME. `Trace.UI.VerifyMenu` measures the widget's laid-out
+	 * row rectangles against the Canvas layout maths for the same frame and reports the worst error
+	 * in pixels — hit testing, hover and the click harness all run off those rectangles, so if they
+	 * agree the two renderers are interchangeable to the player's mouse. Last measured on spec v19
+	 * §5: 6 of 6 rows, worst corner error 0.00 px, with the red arm (each row against its NEIGHBOUR)
+	 * correctly failing at 355 px. -TraceMenuClickTest still reports one press per row,
+	 * -TraceAutoSettings still opens the overlay and restores the config, -TraceAutoPlay still
+	 * reaches the arena.
 	 *
 	 * Set it to 0 and everything falls back to the Canvas path with no other change. That is not a
 	 * degraded mode: it is the shipped renderer, still compiled, still tested, still the thing that
@@ -104,36 +105,52 @@ namespace TraceMenuHUDFile
 	 * draws UNDER Slate, so the widget stands down for those frames).
 	 */
 	/**
-	 * DEFAULT 0 — CANVAS — AND THAT IS A DELIBERATE RETREAT FROM THE v17 DEFAULT OF 1.
+	 * DEFAULT 0 — CANVAS. STILL 0 AFTER SPEC v19 §5, AND FOR ONE REMAINING REASON, NOT THE OLD THREE.
 	 *
-	 * The UMG path is finished enough to develop against and NOT finished enough to be what a
-	 * teammate meets on launch day. Three measured reasons, all from the v17 verification:
+	 * *** WHAT THE PLAYER GIVES UP AT 0: ALL OF IT. The artist's sheet — the TRACE wordmark, the
+	 * swoosh, the three button plates, the PLAY and SETTINGS lettering, the pointer — is drawn by the
+	 * UMG tree ONLY. At 0 the title screen is still the stroked-vector one. `Trace.UI.UseUMG 1`, or
+	 * -TraceMenuUMG on the command line, is how anyone sees the new art today. ***
 	 *
-	 *   1. STARTUP. With UMG on, the title screen took 12-47 s to appear (median ~40 s) and the
-	 *      window is frozen and black for all of it. With it off: 0.02 s. The cause is in
-	 *      Scripts/generate-menu-widgets.py, which retires widgets by renaming them
-	 *      (TraceRetired_1, ...) and leaves their old IDs in the .uasset, so the editor re-resolves
-	 *      and complains 49 times per launch. It is fixable in the generator, not the engine.
-	 *   2. THE WORDMARK IS DRAWN WRONG. On the UMG path the TRACE logo's letters break apart - the
-	 *      R's loop becomes disconnected blocks, the A's point is chopped - because the stroke
-	 *      thickness is about half again what the Canvas path uses.
-	 *   3. ONLY TWO OF FOUR SCREENS EXIST. The title menu and the HUD corner converted; the OPTIONS
-	 *      menu and CHARACTER SELECT are still Canvas, because that agent did not survive the pass.
+	 * The v17 retreat listed three measured reasons. Two are now closed, measured the same way they
+	 * were measured when they were opened:
 	 *
-	 * So the shipped default is the renderer that is complete and fast, and the new one is one
-	 * console line away. Flip this back to 1 once (1) and (2) are closed - nothing else needs to
-	 * change, and the Canvas path is not going anywhere: it still draws the settings overlay and the
-	 * JOIN prompt regardless, because those are Canvas modals and Canvas draws UNDER Slate.
+	 *   1. STARTUP — CLOSED. The cause was real and was in Scripts/generate-menu-widgets.py: it
+	 *      retired widgets by renaming them (TraceRetired_1, ...) inside the package, so their
+	 *      variable GUIDs stayed in the .uasset and the widget compiler re-resolved and ensure()d
+	 *      over them on every load. The generator now renames them into the TRANSIENT package.
+	 *      Re-measured headless on /Game/Maps/MainMenu, same machine, same flags: the committed
+	 *      pre-v19 asset logs 49 TraceRetired resolves and 13 ensures and takes 23.1 s wall;
+	 *      the regenerated asset logs 0 and 0 and takes 17.0 s, against 17.5 s for the Canvas path
+	 *      it is being compared to. Map load itself is 0.03 s on both and the widget is adopted
+	 *      23 ms after it.
+	 *   2. THE WORDMARK — CLOSED. It is no longer stroked at all. It is the artist's own sprite
+	 *      (T_TraceWordmark), so there is no stroke thickness left to get wrong.
+	 *   3. ONLY TWO OF FOUR SCREENS EXIST — STILL OPEN, and it is the whole of the reason this is
+	 *      still 0. The title menu and the HUD corner are widgets; the OPTIONS menu and CHARACTER
+	 *      SELECT are still Canvas (FTraceOptionsMenu, ATraceCharacterSelect). Opening SETTINGS
+	 *      therefore hands the whole screen back to the Canvas renderer mid-session — see
+	 *      bUseWidgetThisFrame in DrawHUD — and the artist's KEYBIND / KEY / slider sprites are
+	 *      imported but not yet placed, because they belong to a file this pass did not own.
+	 *
+	 * AND ONE THING TO KNOW BEFORE FLIPPING IT: this variable is SHARED. TraceHUD.cpp's in-match
+	 * corner follows it whenever `Trace.UI.HUD.UseUMG` is -1 (its default), so flipping this to 1
+	 * moves the corner onto its UMG path too. That path measured equivalent in v16 (Trace.HUD.V16Shots,
+	 * 27 passed / 0 failed on both renderers), but it is a second system's behaviour changing on the
+	 * back of a menu decision, so it is the corner owner's call as much as this file's.
 	 */
 	static int32 GUseUMG = 0;
 	static FAutoConsoleVariableRef CVarUseUMG(
 		TEXT("Trace.UI.UseUMG"),
 		GUseUMG,
 		TEXT("1 = draw the title screen with the UMG widget (/Game/Trace/UI/Menu/WBP_TitleMenu).\n")
-		TEXT("0 = DEFAULT. Draw it with the original AHUD::DrawHUD Canvas path. Both are live; the\n")
-		TEXT("Canvas path is also used automatically whenever the asset is missing or the wrong\n")
-		TEXT("shape. UMG is off by default because it currently costs ~40s of black screen on\n")
-		TEXT("launch and draws the wordmark wrong - see the comment above this variable."),
+		TEXT("    THIS IS THE ONLY PATH THAT DRAWS THE ARTIST'S MENU ART (spec v19 5).\n")
+		TEXT("0 = DEFAULT. Draw it with the original AHUD::DrawHUD Canvas path, which has none of\n")
+		TEXT("    that art on it. Both are live; Canvas is also used automatically whenever the\n")
+		TEXT("    asset is missing or the wrong shape, and for the settings and JOIN modals.\n")
+		TEXT("The ~40s launch stall and the broken wordmark that kept this at 0 are both fixed; what\n")
+		TEXT("still keeps it at 0 is that the OPTIONS and CHARACTER SELECT screens are still Canvas.\n")
+		TEXT("NOTE this switch is shared with the in-match HUD corner - see the comment above it."),
 		ECVF_Default);
 
 	/** Where the generated asset lives. Soft, by path: a missing asset must fall back, not fail. */
@@ -1165,6 +1182,10 @@ void ATraceMenuHUD::ActivateSelection()
 		OpenJoinPrompt();
 		break;
 
+	case ETraceMenuRow::Practice:
+		StartPracticeRange();
+		break;
+
 	case ETraceMenuRow::Difficulty:
 		// Activating the row cycles it. Wraps, unlike the arrow keys: a click has no "other
 		// direction" to offer, so stopping dead at HARD would just look broken.
@@ -1539,6 +1560,44 @@ void ATraceMenuHUD::OpenOptions()
 	};
 
 	OptionsMenu.OpenSettings();
+}
+
+void ATraceMenuHUD::StartPracticeRange()
+{
+	if (bTravelling)
+	{
+		return;
+	}
+	bTravelling = true;
+
+	// A new attempt: whatever went wrong last time is no longer what is happening now.
+	TraceNet::ClearFailure();
+
+	// =============================================================================================
+	// SPEC v19 §2 — "?game=" IS THE WHOLE MECHANISM, AND IT IS A URL OPTION, NOT A SWITCH.
+	//
+	// TracePracticeRange::IsActive() asks exactly one question — "is the authoritative game mode an
+	// ATracePracticeGameMode?" — and a game mode can only arrive on the travel URL. No setting, no
+	// CVar and no ini key can turn a match into a range, which is what makes the range's cheats
+	// structurally unable to leak into a real match rather than merely gated by a bool somebody
+	// could flip. This row must therefore travel with ?game= and nothing else may set it.
+	//
+	// SEPARATED WITH '?', NOT '&'. UE chains URL options with '?'; "a=1&b=2" parses as ONE option
+	// called "a" whose value is the whole rest of the string. StartMatch()'s comment records that
+	// this has already cost this project real bugs, and this pass alone found two more of them in
+	// harness launch URLs — a "?mode=b&bots=8" that silently ran mode A for an entire test slice.
+	//
+	// NO "listen". The range is a single-player room and standing a net driver up for it would put
+	// a joinable server on 7777 that nobody should be able to join. It is also why IsActive()'s
+	// GetAuthGameMode() answer — always false on a remote client — is the safe direction.
+	// =============================================================================================
+	const FString Options = TEXT("game=/Script/Trace.TracePracticeGameMode");
+
+	TravelCaption = TEXT("ENTERING THE PRACTICE RANGE");
+
+	UE_LOG(LogTraceGame, Display, TEXT("Title screen: PRACTICE -> %s?%s"), TraceMaps::Arena, *Options);
+
+	UGameplayStatics::OpenLevel(this, FName(TraceMaps::Arena), /*bAbsolute=*/true, Options);
 }
 
 void ATraceMenuHUD::QuitGame()
@@ -2111,6 +2170,9 @@ FString ATraceMenuHUD::BuildBlurb() const
 			? FString(TEXT("CONNECT TO SOMEBODY ELSE'S GAME.  YOU WILL NEED THEIR ADDRESS."))
 			: FString::Printf(TEXT("CONNECT TO SOMEBODY ELSE'S GAME.  ENTER RECONNECTS TO %s."), *LastJoinAddress);
 
+	case ETraceMenuRow::Practice:
+		return TEXT("ALONE IN THE ARENA WITH FIVE DUMMIES.  NO MATCH, NO CLOCK, NO SCORE.");
+
 	case ETraceMenuRow::Mode:
 		return FString(TraceScoringModeBlurb(ScoringMode));
 
@@ -2130,10 +2192,24 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	OutView = FTraceMenuRowView();
 	OutView.bSelected = bSelected;
 
+	// Spec v19 §5: the artist's sheet has a PRESSED-looking hover state and a DISABLED state, so both
+	// are now wired to the things that were already true and simply never drawn.
+	//
+	// PRESSED is the row a mouse-down armed and has not released — the same PressedRow the
+	// press-arms/release-fires contract of spec v15 §4 has always kept.
+	//
+	// DISABLED is the two moments this screen genuinely refuses a press: the 0.35 s grace period after
+	// the title appears (AcceptsActivation swallows an Enter that early — see AcceptUnlockTime) and
+	// after PLAY or JOIN has been taken and the level is loading. Both used to look completely live
+	// while doing nothing, which is the worst thing a button can do.
+	OutView.bPressed = (PressedRow == static_cast<int32>(Row));
+	OutView.bEnabled = !bTravelling && AcceptsActivation();
+
 	switch (Row)
 	{
 	case ETraceMenuRow::Play:       OutView.Label = TEXT("PLAY");         break;
 	case ETraceMenuRow::Join:       OutView.Label = TEXT("JOIN");         break;
+	case ETraceMenuRow::Practice:   OutView.Label = TEXT("PRACTICE");     break;
 	case ETraceMenuRow::Difficulty: OutView.Label = TEXT("DIFFICULTY");   break;
 	case ETraceMenuRow::Mode:       OutView.Label = TEXT("SCORING MODE"); break;
 	case ETraceMenuRow::Settings:   OutView.Label = TEXT("SETTINGS");     break;

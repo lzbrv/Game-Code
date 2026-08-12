@@ -1434,6 +1434,49 @@ namespace TraceRoxieVerify
 			TEXT("the same arguments produced the same point twice; nothing in the path reads a local clock, "
 			     "a random stream or a frame time"));
 
+		// ---- DEMO 17 item 3: "IT NOW HAS TRAVEL TIME, SO IT CAN MISS, BE DODGED, AND BE WATCHED" ----
+		//
+		// *** THE SPEC'S [DIAGNOSED] "it was built as an instant trace" DOES NOT MATCH THIS BUILD. ***
+		// The rocket is already a spawned, replicated ATraceRoxieRocket that walks GetPositionAtTime()
+		// every frame and resolves hits with a swept segment; nothing about it is hitscan, and this
+		// section exists to say so with numbers rather than with a claim. What Demo 17 asked for that was
+		// genuinely missing is the SIZE, which is now derived from the hit radius (see ApplyVisualSize).
+		//
+		// "Dodgeable" is made a measurement rather than an adjective: at a realistic engagement range,
+		// how long is the rocket in the air, and can a player running at the shipped ground speed clear
+		// its lethal cross-section in that time? If they can, it can be dodged; if they cannot, it is a
+		// hitscan with a delay.
+		{
+			const float EngagementRangeUU = 2000.f;                  // a long lane on this arena
+			const float TimeOfFlight = EngagementRangeUU / FMath::Max(1.f, Speed);
+			const float LethalHalfWidth = TraceRoxieRocket::GetHitRadiusUU() + 34.f;   // + a pawn capsule
+			const float DodgeSpeed = FMath::Max(1.f, UTraceSettings::Get().WalkSpeed);
+			const float SidestepUU = DodgeSpeed * TimeOfFlight;
+
+			List.Check(TimeOfFlight > 0.25f,
+				TEXT("DEMO 17: the rocket has REAL TRAVEL TIME — it is a projectile, not a trace"),
+				FString::Printf(TEXT("%.2fs in the air over %.0f uu at %.0f uu/s. A hitscan would be 0.00s; "
+				                     "this is a quarter of a second of flight a player can watch and react to"),
+					TimeOfFlight, EngagementRangeUU, Speed));
+
+			List.Check(SidestepUU > LethalHalfWidth,
+				TEXT("DEMO 17: ...so it CAN BE DODGED — a running player clears the lethal width in the time "
+				     "it takes to arrive"),
+				FString::Printf(TEXT("%.0f uu of sidestep at %.0f uu/s against a %.0f uu lethal half-width "
+				                     "(rocket %.0f + capsule 34)"),
+					SidestepUU, DodgeSpeed, LethalHalfWidth, TraceRoxieRocket::GetHitRadiusUU()));
+
+			// AND THE DRAWN SIZE, WHICH IS THE PART OF ITEM 3 THAT WAS ACTUALLY MISSING. The body is
+			// sized off the hit radius, so "as wide as the thing that kills you" is a property of the
+			// code rather than of two numbers somebody keeps in step by hand.
+			const float DrawnDiameter = TraceRoxieRocket::GetHitRadiusUU() * TraceRoxieRocket::GetVisualScale() * 2.f;
+			List.Check(DrawnDiameter >= TraceRoxieRocket::GetHitRadiusUU() * 2.f * 0.9f,
+				TEXT("DEMO 17: the MODEL IS AS BIG AS THE HIT — 'make the model bigger, so it is easy to see'"),
+				FString::Printf(TEXT("drawn %.0f uu across against a %.0f uu hit radius (x%.2f). It was a fixed "
+				                     "13 uu before Demo 17, i.e. narrower than its own hit test"),
+					DrawnDiameter, TraceRoxieRocket::GetHitRadiusUU(), TraceRoxieRocket::GetVisualScale()));
+		}
+
 		List.Report();
 	}
 

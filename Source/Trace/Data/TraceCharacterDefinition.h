@@ -200,7 +200,7 @@ public:
 	 * Fill @p Target from the C++ table in Core/TraceCharacterRoster.cpp. THIS is why the generator
 	 * script contains no character data: every value it writes comes through here.
 	 *
-	 * @param CharacterIdValue  TraceCharacterRoster::FirstId..LastId (1..8 as of spec v18 §2), as an
+	 * @param CharacterIdValue  TraceCharacterRoster::FirstId..LastId (1..10 as of spec v19 §3), as an
 	 *                          int, because a plain UENUM is awkward to name from Python and an int
 	 *                          cannot be mis-imported.
 	 * @return false, with nothing written, for an id outside that range.

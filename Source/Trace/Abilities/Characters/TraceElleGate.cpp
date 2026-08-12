@@ -42,6 +42,15 @@ static TAutoConsoleVariable<int32> CVarElleSnapTeleportEnabled(
 	     "Trace.Elle.Verify must go red. Never ship 0."),
 	ECVF_Cheat);
 
+static TAutoConsoleVariable<int32> CVarElleSnapStepIn(
+	TEXT("Trace.Elle.SnapStepIn"),
+	1,
+	TEXT("Dev/red arm for DEMO 17 item 1. 1 (default) = a gate takes you on the frame you STEP IN, so "
+	     "standing in a mouth does nothing. 0 = the pre-Demo-17 proximity poll, which throws a "
+	     "stationary player across the map once per re-entry lockout for the pair's whole life — the "
+	     "reported 'it doesn't work at all'. Never ship 0."),
+	ECVF_Cheat);
+
 namespace TraceElleGateFile
 {
 	/** Beads per ring. Twenty reads as a ring without being a mesh budget — the Ripple's number. */
@@ -228,9 +237,15 @@ void ATraceElleGate::PairWith(ATraceElleGate* Other, float InPairExpireMatchTime
 			{
 				continue;
 			}
-			if (IsInsideMouth(Candidate) || Other->IsInsideMouth(Candidate))
+			if (IsInsideMouth(Candidate))
 			{
 				ApplyLockout(Candidate);
+				MarkAlreadyInside(Candidate);
+			}
+			if (Other->IsInsideMouth(Candidate))
+			{
+				ApplyLockout(Candidate);
+				Other->MarkAlreadyInside(Candidate);
 			}
 		}
 	}
@@ -306,10 +321,29 @@ void ATraceElleGate::ServerTickGate()
 
 	PruneLockouts();
 
+	// THE EDGE IS COLLECTED FIRST AND THE SET IS REBUILT FROM SCRATCH, so a player who dies, is
+	// destroyed, or simply walks away cannot leave a stale "already inside" entry that suppresses their
+	// next real entry. It is rebuilt every server tick from the same IsInsideMouth() the decision uses,
+	// which is what keeps the two from ever disagreeing.
+	TSet<TWeakObjectPtr<ATraceCharacter>> InsideNow;
+
 	for (TActorIterator<ATraceCharacter> It(WorldPtr); It; ++It)
 	{
 		ATraceCharacter* Candidate = *It;
 		if (Candidate == nullptr || !Candidate->IsAlive() || !IsInsideMouth(Candidate))
+		{
+			continue;
+		}
+
+		InsideNow.Add(Candidate);
+
+		// *** DEMO 17 item 1: A GATE TAKES YOU WHEN YOU STEP IN, NOT WHILE YOU STAND IN IT. ***
+		//
+		// Without this the pair is a hazard rather than an ability: a stationary player inside either
+		// mouth is thrown to the other one every time the re-entry lockout lapses, for the pair's whole
+		// 8 s — seven teleports in seven seconds, measured, on an Elle standing in the mouth she had
+		// just placed. See InsideLastLook. Trace.Elle.SnapStepIn 0 restores the old poll.
+		if (CVarElleSnapStepIn.GetValueOnAnyThread() != 0 && InsideLastLook.Contains(Candidate))
 		{
 			continue;
 		}
@@ -372,7 +406,14 @@ void ATraceElleGate::ServerTickGate()
 
 		++Tally.TeleportsCommitted;
 		CommitTeleport(Candidate);
+
+		// The arrival is at the PARTNER's mouth, so the subject is no longer in this one. Dropping them
+		// here means a player who walks straight back gets a fresh edge rather than being suppressed by
+		// a stale record of a mouth they are not standing in any more.
+		InsideNow.Remove(Candidate);
 	}
+
+	InsideLastLook = MoveTemp(InsideNow);
 }
 
 void ATraceElleGate::CommitTeleport(ATraceCharacter* Candidate)
@@ -408,6 +449,11 @@ void ATraceElleGate::CommitTeleport(ATraceCharacter* Candidate)
 
 	ApplyLockout(Candidate);
 
+	// THE ARRIVAL IS NOT AN ENTRY. They were PUT in the far mouth; they did not step into it. Without
+	// this the far gate sees a body appear inside itself and, one lockout later, sends it straight back
+	// — which is the ping-pong the edge rule exists to end.
+	Partner->MarkAlreadyInside(Candidate);
+
 	UE_LOG(LogTraceGame, Log,
 		TEXT("[Elle] SNAP teleport: %s (team %d, carrier=%d) taken by %s's gate as %s -> (%s)."),
 		*GetNameSafe(Candidate), static_cast<int32>(Candidate->GetTeam()),
@@ -428,6 +474,11 @@ bool ATraceElleGate::IsInsideMouth(const ATraceCharacter* Candidate) const
 	}
 	return FVector::DistSquared(Candidate->GetActorLocation(), FVector(MouthLocation))
 		<= (RadiusUU * RadiusUU);
+}
+
+int32 ATraceElleGate::GetDrawnBeadCount() const
+{
+	return (RingMesh != nullptr) ? RingMesh->GetInstanceCount() : 0;
 }
 
 ETraceAbilityEffect ATraceElleGate::ClassifyEntry(const ATraceCharacter* Candidate) const
@@ -518,6 +569,17 @@ void ATraceElleGate::PruneLockouts()
 		{
 			Iterator.RemoveCurrent();
 		}
+	}
+
+	// InsideLastLook needs no pruning: ServerTickGate rebuilds it from scratch out of the pawns it can
+	// actually see every tick, so a dead or destroyed one falls out on its own.
+}
+
+void ATraceElleGate::MarkAlreadyInside(ATraceCharacter* Candidate)
+{
+	if (Candidate != nullptr)
+	{
+		InsideLastLook.Add(Candidate);
 	}
 }
 

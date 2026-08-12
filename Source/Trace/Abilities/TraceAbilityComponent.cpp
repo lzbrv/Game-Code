@@ -9,8 +9,11 @@
 
 #include "Abilities/TraceAbilityComponent.h"
 
+#include "Containers/Ticker.h"           // FTSTicker — Trace.Ability.DeathWipeTest
+#include "Engine/Engine.h"                // GEngine — the harness's world lookup
 #include "Engine/World.h"
 #include "GameFramework/Controller.h"
+#include "GameFramework/GameStateBase.h"
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
@@ -19,6 +22,7 @@
 #include "Abilities/TraceCharacterAbilitySet.h"
 #include "Abilities/TraceAbilityWorldSubsystem.h"
 #include "Core/TraceCharacter.h"
+#include "Movement/TraceCharacterMovementComponent.h"   // Demo 17 item 7: RefundDashCharge on a kill
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"          // ATraceCore::IsCoreHolder — the SAME predicate the knife uses
@@ -1111,10 +1115,126 @@ void UTraceAbilityComponent::NotifyPawnSpawned()
 
 void UTraceAbilityComponent::NotifyPawnDied()
 {
+	// THE CHARACTER FIRST. Its OnPawnDied() is where world actors it owns are torn down and where its
+	// LOCAL mirrors are cleared (Mace's spike, Oyster's jars, X's swarm, Roxie's Modded). Several of
+	// those characters re-publish their flags into AbilityState every tick from those mirrors, so a
+	// framework wipe that ran first would be overwritten one frame later by a stale mirror.
 	if (AbilitySet != nullptr)
 	{
 		AbilitySet->OnPawnDied();
 	}
+
+	// ...THEN THE FRAMEWORK. See ApplyDeathStateWipe: this is spec v19 §4.2's ONE central place.
+	ApplyDeathStateWipe();
+}
+
+// =================================================================================================
+// *** SPEC v19 §4.2 — THE DEATH WIPE. THE ONE PLACE. ***
+//
+// Verbatim: "E.g chut should not have his ability active when he is dead. It should stop, and the
+// cooldown timer should start." And, restated in the same breath: "cooldown timers should still not
+// reset when players die, and should just continue ticking down."
+//
+// So the sentence has two halves that pull in opposite directions, and the whole difficulty of this
+// function is that they share one struct. EFFECTS STOP. COOLDOWNS DO NOT.
+//
+// [DIAGNOSED] CHUT IS EXACTLY RIGHT AND IT IS NOT A CHUT BUG. UTraceAbilitySetChut::OnPawnDied()
+// reads, in full, `ResetDashTracking();` — it never clears Chud. Chud lives in the replicated
+// AbilityState, AbilityState lives on the component, and the component lives on the PLAYERSTATE,
+// which by design survives the pawn (see the cooldown contract at the top of the header). So Chud
+// ran on happily through Chut's corpse and into his next life until its ten seconds expired. Rocco's
+// headshot speed stack had the same shape. Both are single characters forgetting a line, which is
+// precisely why the spec says to fix it centrally: the next character to be written will forget it
+// too.
+//
+// WHICH FIELDS, AND WHY NOT ALL OF THEM. A blanket AbilityState.Reset() was the obvious move and is
+// WRONG, and the code says so rather than the reader having to find out:
+//
+//   Flags bits 0 and 1   CLEARED. TraceAbilityTypes.h names them EffectActive and MovementActive,
+//                        and every character's private alias sits on the same two bits (Mace's
+//                        Suspending/Pulling, Roxie's ModdedActive, Slimeball's Stuck). They mean
+//                        "something of mine is running on my body right now", which is the exact
+//                        thing a corpse must not have.
+//   EffectEndMatchTime   CLEARED. Its documented job is the deadline of that running effect —
+//                        Chud's 10 s, Mace's 1.25 s suspend, Modded's window.
+//   Flags bit 2 (Aux)    KEPT. It means "a thing I put in the WORLD is still there" — Rocco's
+//                        Ripple, Elle's gates, Slimeball's wall, Oyster's jars, a rocket in flight.
+//                        Each character already documents its own [ASSUMPTION] about whether that
+//                        outlives its author, and those decisions are theirs, not this function's.
+//   Flags bit 3          KEPT, for the same reason: Elle's Charged is a placed pair, not a buff.
+//   AuxEndMatchTime      *** KEPT, AND THIS IS THE HALF THAT MATTERS. *** It is a COOLDOWN for at
+//                        least two shipped characters — Elle stores Snap's ready time in it and
+//                        Roxie stores the rocket's — so clearing it would hand a dead player a free
+//                        ability, which is the precise thing the user restated in the same
+//                        paragraph. This is why the blanket Reset() is not used.
+//   Stacks               KEPT. It is X's Sting clip mirror and Rocco's stack count; Rocco's stack is
+//                        already dead because its EffectActive bit is gone, and zeroing X's would
+//                        edit ammunition rather than a status.
+//   ActivatedCooldown*   NEVER TOUCHED. OnHalfTime() remains the only automatic reset in the whole
+//                        framework, exactly as the header's contract promises.
+//
+// The cooldown "starting" that the user asks for needs no code: TryActivate() sets the deadline at
+// ACTIVATION, so Chut's cooldown has been running since he pressed E and simply keeps running.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarAbilityDeathWipe(
+	TEXT("Trace.Ability.DeathWipe"), 1,
+	TEXT("TEST ARM ONLY. 1 (shipped): death stops every ability effect and status a player has "
+	     "running, while their cooldowns keep ticking — spec v19 §4.2. 0: removes the wipe so "
+	     "Trace.Ability.DeathWipeTest can be shown FAILING (Chut keeps Chud through his own corpse). "
+	     "Never ship 0."),
+	ECVF_Cheat);
+
+/** Times the central wipe actually stopped something. Read by Trace.Ability.DeathWipeTest. */
+static int32 GAbilityDeathWipes = 0;
+
+// Named after this file, and static, because the module builds in unity blobs: an anonymous
+// namespace or an externally-linked helper called IsEnabled() would be one merge away from
+// colliding with somebody else's.
+namespace TraceAbilityDeathWipe
+{
+	static int32 GetCount() { return GAbilityDeathWipes; }
+	static bool  IsEnabled() { return CVarAbilityDeathWipe.GetValueOnAnyThread() != 0; }
+}
+
+void UTraceAbilityComponent::ApplyDeathStateWipe()
+{
+	if (!HasAuthorityOwner() || !TraceAbilityDeathWipe::IsEnabled())
+	{
+		return;
+	}
+
+	// The two bits that mean "an effect of mine is running on my body". See the block above.
+	// The cast is not decoration: `uint8 | uint8` promotes to int, and MSVC calls the implicit
+	// narrowing back to uint8 a conversion warning that some configurations treat as an error.
+	constexpr uint8 RunningBits = static_cast<uint8>(
+		TraceAbilityFlags::EffectActive | TraceAbilityFlags::MovementActive);
+
+	const bool bHadSomethingRunning =
+		((AbilityState.Flags & RunningBits) != 0) || (AbilityState.EffectEndMatchTime != 0.f);
+
+	if (!bHadSomethingRunning)
+	{
+		return;   // The overwhelmingly common case: nothing was up. No replication, no log.
+	}
+
+	const uint8 FlagsBefore = AbilityState.Flags;
+	const float EffectEndBefore = AbilityState.EffectEndMatchTime;
+
+	AbilityState.Flags &= static_cast<uint8>(~RunningBits);
+	AbilityState.EffectEndMatchTime = 0.f;
+	MarkNetStateDirty();
+
+	++GAbilityDeathWipes;
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Ability] spec v19 §4.2 DEATH WIPE: %s (%s) died with an effect running (flags 0x%02x -> ")
+		TEXT("0x%02x, effect had %.2fs left) - it is STOPPED. E cooldown untouched and still %.2fs from ")
+		TEXT("ready; the second timer (AuxEndMatchTime %.2f) is a cooldown for some characters and is ")
+		TEXT("untouched too."),
+		*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(CharacterId),
+		FlagsBefore, AbilityState.Flags, FMath::Max(0.f, EffectEndBefore - MatchTimeNow()),
+		GetActivatedCooldownRemaining(), AbilityState.AuxEndMatchTime);
 }
 
 void UTraceAbilityComponent::NotifyKill(ATraceCharacter* Victim, FName Cause, bool bHeadshot)
@@ -1122,6 +1242,39 @@ void UTraceAbilityComponent::NotifyKill(ATraceCharacter* Victim, FName Cause, bo
 	if (AbilitySet != nullptr && HasAuthorityOwner())
 	{
 		AbilitySet->OnKill(Victim, Cause, bHeadshot);
+	}
+
+	// =============================================================================================
+	// DEMO 17 ITEM 7 — "a toggle to test dash cooldown refreshing on every kill".
+	//
+	// HERE, and not in any character file, because the ask is for the experiment to apply to the
+	// GAME: one call site in the framework's kill notification gives all ten characters the same
+	// rule, and no ability set has to know the toggle exists.
+	//
+	// DEFAULT OFF. This is a knob to TRY the idea with, not the idea shipped — with it off this block
+	// is one bool read and the game plays exactly as it did.
+	//
+	// THE TWO REFUSALS ARE THE WHOLE CARE HERE, both copied from the parry's identical grant rather
+	// than reasoned about again:
+	//   - SERVER ONLY. RefundDashCharge refuses off the authority in any case and mirrors itself onto
+	//     the owning client, so the meter moves on the same frame the kill lands.
+	//   - NEVER A SELF-KILL. Spec v19 §4.1 has just made "walk out of the arena" an ordinary death
+	//     credited to nobody, and NotifyCharacterDied reads a null killer as a self-kill; without this
+	//     guard a player could top their dash pool up by repeatedly stepping off the map.
+	// A full pool is not an error: RefundDashCharge returns false harmlessly and nothing is logged.
+	// =============================================================================================
+	if (UTraceSettings::Get().bRefreshDashChargeOnKill
+		&& HasAuthorityOwner()
+		&& Victim != nullptr
+		&& Victim != GetOwningCharacter())
+	{
+		if (ATraceCharacter* Killer = GetOwningCharacter())
+		{
+			if (UTraceCharacterMovementComponent* KillerMovement = Killer->GetTraceMovement())
+			{
+				KillerMovement->RefundDashCharge();
+			}
+		}
 	}
 }
 
@@ -1179,3 +1332,278 @@ void UTraceAbilityComponent::DebugSetActivatedCooldown(float Seconds)
 	PredictedCooldownEndMatchTime = ActivatedCooldownEndMatchTime;
 }
 #endif
+
+// =================================================================================================
+// SPEC v19 §4.2 — THE REPRODUCTION
+//
+// Verbatim: "E.g chut should not have his ability active when he is dead. It should stop, and the
+// cooldown timer should start." Plus the standing rule restated in the same paragraph: "cooldown
+// timers should still not reset when players die, and should just continue ticking down."
+//
+// So it uses the user's own example, end to end and through the shipping path: give somebody Chut,
+// press E for real (TryActivate, which is what a key press calls), confirm Chud is UP, kill them,
+// and then assert BOTH halves at once — Chud is down, and the cooldown is still counting.
+//
+// WHY IT CAN GO RED, WHICH IS THE PART THAT MATTERS. Trace.Ability.DeathWipe 0 removes the central
+// wipe and nothing else, and the harness then reports FAIL with the seconds of Chud still on the
+// corpse — which is the build the project shipped before this pass, because
+// UTraceAbilitySetChut::OnPawnDied() never cleared it. Both arms measure the same two numbers.
+//
+// The two clauses pull against each other on purpose. "Everything stops" is trivially satisfiable by
+// wiping the whole state, which would clear the cooldowns too; "cooldowns keep running" is trivially
+// satisfiable by wiping nothing. Only a run that reports both can tell those apart.
+// =================================================================================================
+
+#if !UE_BUILD_SHIPPING
+
+// Named after this file rather than anonymous: the module builds in unity blobs and a bare
+// `namespace {}` here would be one merge away from colliding with another slice's helper.
+namespace TraceAbilityDeathWipeVerify
+{
+	/**
+	 * ARM AND WAIT, rather than run-or-refuse, and that is the testing policy rather than politeness:
+	 * this harness has to be startable from -ExecCmds, which fires on the very first frame — before
+	 * there is a GameState, before the match is InProgress, and before anybody holds a pawn. A command
+	 * that gave up there would report INVALID every time it was run the only way it is allowed to be.
+	 *
+	 * It still gives up eventually, and loudly. "Could not run" is a different result from "passed".
+	 */
+	constexpr float ArmTimeoutSeconds = 45.f;
+
+	/** Seconds after the kill before the two clauses are read, so the death has cleared the funnel. */
+	constexpr float SettleSeconds = 0.25f;
+
+	static UWorld* PlayingWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if ((Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+				&& Context.World() != nullptr && Context.World()->GetAuthGameMode() != nullptr)
+			{
+				return Context.World();
+			}
+		}
+		return nullptr;
+	}
+
+	struct FRun
+	{
+		TWeakObjectPtr<UTraceAbilityComponent> Abilities;
+		FString VictimName;
+		float EffectRemainingAtDeath = 0.f;
+		float CooldownAtDeath = 0.f;
+		float SinceKill = 0.f;
+		float SinceArmed = 0.f;
+		bool  bKilled = false;
+		bool  bGaveUp = false;
+	};
+
+	/**
+	 * Sets a living player to Chut, presses E for real, and kills them.
+	 * @return false while the match is not yet in a state where that is possible.
+	 */
+	static bool TryStartRun(FRun& Run)
+	{
+		UWorld* const World = PlayingWorld();
+		if (World == nullptr || !UTraceAbilityComponent::AreCharactersEnabled(World))
+		{
+			return false;
+		}
+
+		const ATraceGameState* const TraceGS = World->GetGameState<ATraceGameState>();
+		if (TraceGS == nullptr
+			|| TraceGS->TraceMatchState != ETraceMatchState::InProgress
+			|| TraceGS->IsHalfTimeBreak())
+		{
+			return false;
+		}
+
+		// A living pawn that is NOT the carrier: a carrier's own rules are proven elsewhere and would
+		// only add a second possible reason for whatever this run reports.
+		UTraceAbilityComponent* Abilities = nullptr;
+		ATraceCharacter* Victim = nullptr;
+
+		for (APlayerState* PS : TraceGS->PlayerArray)
+		{
+			UTraceAbilityComponent* const Candidate = UTraceAbilityComponent::Get(PS);
+			ATraceCharacter* const Pawn = (Candidate != nullptr) ? Candidate->GetOwningCharacter() : nullptr;
+
+			if (Candidate == nullptr || Pawn == nullptr || !Pawn->IsAlive() || Pawn->IsCarrier())
+			{
+				continue;
+			}
+
+			// Per-TEAM uniqueness (spec §3): whoever is picked has to be ALLOWED to hold Chut.
+			if (Candidate->GetCharacterId() == ETraceCharacterId::Chut
+				|| UTraceAbilityComponent::IsCharacterAvailableFor(PS, ETraceCharacterId::Chut))
+			{
+				Abilities = Candidate;
+				Victim = Pawn;
+				break;
+			}
+		}
+
+		if (Abilities == nullptr || Victim == nullptr)
+		{
+			return false;
+		}
+
+		Abilities->ServerSetCharacter(ETraceCharacterId::Chut);
+		if (Abilities->GetCharacterId() != ETraceCharacterId::Chut)
+		{
+			return false;   // The roster refused; try again next frame with somebody else.
+		}
+
+		// THE SHIPPING PATH. TryActivate() is literally what the E key calls, so this exercises the
+		// same activation, the same cooldown write and the same net state a player produces.
+		if (!Abilities->TryActivate())
+		{
+			return false;
+		}
+
+		const FTraceAbilityNetState& State = Abilities->GetNetState();
+		if ((State.Flags & TraceAbilityFlags::EffectActive) == 0)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[DeathWipeTest] INVALID: E fired on Chut but no effect flag came up, so there is "
+				     "nothing to watch stop. NOT a pass."));
+			Run.bGaveUp = true;
+			return true;   // Stop arming; the run is over and it did not pass.
+		}
+
+		const float MatchNow = static_cast<float>(TraceGS->GetServerWorldTimeSeconds());
+
+		Run.Abilities = Abilities;
+		Run.VictimName = GetNameSafe(Victim);
+		Run.EffectRemainingAtDeath = FMath::Max(0.f, State.EffectEndMatchTime - MatchNow);
+		Run.CooldownAtDeath = Abilities->GetActivatedCooldownRemaining();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[DeathWipeTest] ===== %s is Chut with CHUD UP (%.2fs left) and an E cooldown of %.2fs ")
+			TEXT("already running. Killing them now. | rule = %s ====="),
+			*Run.VictimName, Run.EffectRemainingAtDeath, Run.CooldownAtDeath,
+			TraceAbilityDeathWipe::IsEnabled()
+				? TEXT("v19 §4.2 ON") : TEXT("OFF - THE RED ARM, ARMED"));
+
+		UTraceHealthComponent* const Health = Victim->FindComponentByClass<UTraceHealthComponent>();
+		if (Health == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[DeathWipeTest] INVALID: the victim has no health component to kill. NOT a pass."));
+			Run.bGaveUp = true;
+			return true;
+		}
+
+		Health->Kill(nullptr, FName(TEXT("DeathWipeTest")));
+		Run.bKilled = true;
+		return true;
+	}
+
+	/** Reads the two clauses and prints the verdict. @return false when the run is finished. */
+	static bool ReportRun(FRun& Run)
+	{
+		UTraceAbilityComponent* const Abilities = Run.Abilities.Get();
+		const UWorld* const World = PlayingWorld();
+		const AGameStateBase* const Clock = (World != nullptr) ? World->GetGameState() : nullptr;
+
+		if (Abilities == nullptr || Clock == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[DeathWipeTest] INVALID: the world or the player went away mid-run. NOT a pass."));
+			return false;
+		}
+
+		const float MatchNow = static_cast<float>(Clock->GetServerWorldTimeSeconds());
+		const FTraceAbilityNetState& State = Abilities->GetNetState();
+
+		const float EffectLeft = FMath::Max(0.f, State.EffectEndMatchTime - MatchNow);
+		const bool bStillRunning =
+			((State.Flags & TraceAbilityFlags::EffectActive) != 0) && (EffectLeft > 0.f);
+		const float CooldownNow = Abilities->GetActivatedCooldownRemaining();
+
+		// THE TWO CLAUSES, ASSERTED TOGETHER, because neither means anything alone: "everything stops"
+		// is trivially satisfied by wiping the whole state (which would clear the cooldowns the user
+		// explicitly said must survive), and "cooldowns keep running" is trivially satisfied by wiping
+		// nothing at all. Only a run that reports both can tell a fix from either failure.
+		const bool bEffectStopped = !bStillRunning;
+		const bool bCooldownKeptTicking = (CooldownNow > 0.f) && (CooldownNow < Run.CooldownAtDeath);
+		const bool bPass = bEffectStopped && bCooldownKeptTicking;
+
+		const FString Detail = FString::Printf(
+			TEXT("%s died with %.2fs of Chud left. AFTER the death: Chud still active = %d (must be 0 - ")
+			TEXT("\"chut should not have his ability active when he is dead\"), %.2fs of it still on the ")
+			TEXT("clock | E cooldown %.2fs -> %.2fs (must be > 0 and FALLING - \"cooldown timers should ")
+			TEXT("still not reset when players die\") | central wipes this session %d | rule = %s"),
+			*Run.VictimName, Run.EffectRemainingAtDeath, bStillRunning ? 1 : 0, EffectLeft,
+			Run.CooldownAtDeath, CooldownNow, TraceAbilityDeathWipe::GetCount(),
+			TraceAbilityDeathWipe::IsEnabled()
+				? TEXT("v19 §4.2 ON") : TEXT("OFF - THE RED ARM, ARMED"));
+
+		if (bPass)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[DeathWipeTest] PASS: %s"), *Detail);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[DeathWipeTest] FAIL: %s"), *Detail);
+		}
+		return false;
+	}
+
+	FAutoConsoleCommand CmdDeathWipeVerify(
+		TEXT("Trace.Ability.DeathWipeTest"),
+		TEXT("SPEC v19 §4.2. Gives a living player Chut, presses E for real, confirms Chud is UP, kills "
+		     "them, and then asserts BOTH halves of the rule at once: Chud stopped, and the E cooldown "
+		     "kept ticking down. Waits for the match to go live, so it is safe from -ExecCmds. Run it "
+		     "again with Trace.Ability.DeathWipe 0, which is the arm that must go RED."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			TSharedRef<FRun> Run = MakeShared<FRun>();
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([Run](float DeltaTime) -> bool
+				{
+					if (Run->bGaveUp)
+					{
+						return false;
+					}
+
+					if (!Run->bKilled)
+					{
+						Run->SinceArmed += DeltaTime;
+
+						if (TryStartRun(*Run))
+						{
+							return !Run->bGaveUp;
+						}
+
+						if (Run->SinceArmed >= ArmTimeoutSeconds)
+						{
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[DeathWipeTest] INVALID: gave up after %.0fs waiting for a live match with ")
+								TEXT("somebody alive who could be given Chut and press E. NOT a pass - it could ")
+								TEXT("not run."),
+								Run->SinceArmed);
+							return false;
+						}
+						return true;
+					}
+
+					Run->SinceKill += DeltaTime;
+					if (Run->SinceKill < SettleSeconds)
+					{
+						return true;
+					}
+
+					return ReportRun(*Run);
+				}),
+				0.f);
+		}));
+}
+
+#endif // !UE_BUILD_SHIPPING

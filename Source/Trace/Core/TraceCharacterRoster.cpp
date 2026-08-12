@@ -1,4 +1,4 @@
-// Trace — the eight characters, as data. See TraceCharacterRoster.h.
+// Trace — the ten characters, as data. See TraceCharacterRoster.h.
 //
 // Since spec v17 §5 this file answers All() from ONE OF TWO PLACES: the
 // UTraceCharacterDefinition assets under /Game/Trace/Data/Characters, or the C++ table below. The
@@ -32,14 +32,17 @@ static_assert(static_cast<uint8>(ETraceCharacterId::None)      == TraceCharacter
 static_assert(static_cast<uint8>(ETraceCharacterId::Rocco)     == TraceCharacterRoster::FirstId,
 	"TraceCharacterRoster::FirstId must equal ETraceCharacterId::Rocco.");
 
-// *** THE ONE THAT MOVES. *** It named X until spec v18 §2 appended Roxie, Elle and Slimeball; it
-// names Slimeball now and it must name whoever is last after the NEXT character is added. This is
-// the assertion that turns "somebody appended an enumerator and forgot the roster" — a bug whose
-// only symptom is a character nobody can pick and a whole asset table that quietly stops being used
-// — into a build that will not compile.
-static_assert(static_cast<uint8>(ETraceCharacterId::Slimeball) == TraceCharacterRoster::LastId,
-	"TraceCharacterRoster::LastId must equal the LAST enumerator of ETraceCharacterId (Slimeball as "
-	"of spec v18 §2). If you appended a character, this line and TraceCharacterRoster::Count move too.");
+// *** THE ONE THAT MOVES. *** It named X until spec v18 §2 appended Roxie, Elle and Slimeball, and
+// Slimeball until spec v19 §3 appended Mortimer and Lily; it names Lily now and it must name whoever
+// is last after the NEXT character is added. This is the assertion that turns "somebody appended an
+// enumerator and forgot the roster" — a bug whose only symptom is a character nobody can pick and a
+// whole asset table that quietly stops being used — into a build that will not compile.
+//
+// IT DID ITS JOB THIS PASS. Appending Mortimer and Lily to the enum before touching this file is a
+// compile error on exactly these three lines, which is the point of writing them down.
+static_assert(static_cast<uint8>(ETraceCharacterId::Lily) == TraceCharacterRoster::LastId,
+	"TraceCharacterRoster::LastId must equal the LAST enumerator of ETraceCharacterId (Lily as "
+	"of spec v19 §3). If you appended a character, this line and TraceCharacterRoster::Count move too.");
 
 static_assert(TraceCharacterCount == TraceCharacterRoster::Count,
 	"The roster table and ETraceCharacterId disagree about how many characters there are.");
@@ -66,7 +69,7 @@ namespace TraceCharacterRosterFile
 	 *
 	 * THE PROSE IS THE SPEC'S, TRIMMED TO FIT A CARD. Where a number was assumed rather than stated
 	 * (Mace's and Oyster's cooldowns) the card still prints it, because a player choosing between
-	 * eight characters needs to compare them on the same axes — but see the report: those two are
+	 * ten characters needs to compare them on the same axes — but see the report: those two are
 	 * [ASSUMPTION] 20 s and the ability framework, not this table, is what actually enforces any of it.
 	 *
 	 * *** THE COOLDOWN IN A ROW IS THE PRINTED ONE AND IT MUST MATCH THE ENFORCED ONE. *** The card
@@ -182,6 +185,51 @@ namespace TraceCharacterRosterFile
 				     "NOBODY CAN SEE THROUGH IT, AND ENEMIES WALKING THROUGH ARE SLOWED 35%."),
 				25.f,
 				FLinearColor(0.66f, 0.92f, 0.16f, 1.f)    // slime
+			},
+
+			// ---------------------------------------------------------------------------------
+			// SPEC v19 §3 — the two Demo 18 characters.
+			//
+			// Same rules as the v18 §2 block above: the prose is the doc's, trimmed to a card, and
+			// every NUMBER quoted in it is also a UTraceSettings knob under "Abilities|<Name>". A card
+			// that says 30% while the game does 20% is a card that lied.
+			//
+			// TWO ACCENTS THAT ARE NOT NEIGHBOURS OF THE EIGHT ABOVE. Ten cards now share one screen
+			// across two rows, so the stripe is doing more work than ever: slate is the only strongly
+			// desaturated blue in the set (cyan is far greener, violet far redder) and ice is the only
+			// near-white.
+			//
+			// *** BOTH ACTIVATED NAMES ARE [ASSUMPTION] AND ARE FLAGGED IN THE REPORT. *** Demo 18
+			// names Lily's ability ("Zip") and does NOT name Mortimer's blast; "QUAKE" is ours, chosen
+			// because the ability is refused unless he is stood on something. Renaming it is this one
+			// string plus a regenerate.
+			// ---------------------------------------------------------------------------------
+			{
+				9, TEXT("MORTIMER"),
+				TEXT("MANTLE. HE IS THE ONLY CHARACTER WHO CAN PULL HIMSELF UP ONTO A LEDGE OR THE TOP "
+				     "OF AN OBJECT, AND HIS REACH AND HEIGHT WINDOW ARE 30% MORE GENEROUS THAN THE OLD "
+				     "IN-GAME MANTLE."),
+				TEXT("HIS DASH COVERS ONLY A QUARTER OF THE NORMAL DISTANCE. IN EXCHANGE HE MAY CHARGE "
+				     "A CORE THROW FOR TWICE AS LONG AS ANYONE ELSE, ON THE SAME SCALE, SO HE THROWS IT "
+				     "ABOUT TWICE AS FAR."),
+				TEXT("QUAKE"),
+				TEXT("ONLY WHILE CARRYING THE CORE AND STOOD ON THE GROUND OR ON TOP OF AN OBJECT: A "
+				     "BLAST THAT KNOCKS EVERY NEARBY ENEMY AWAY FROM HIM. IT CANNOT MOVE A CORE "
+				     "CARRIER."),
+				20.f,
+				FLinearColor(0.38f, 0.52f, 0.85f, 1.f)    // slate
+			},
+			{
+				10, TEXT("LILY"),
+				TEXT("ONE EXTRA DASH CHARGE, ALWAYS: TWO NORMALLY AND THREE WHILE CARRYING THE CORE."),
+				TEXT("WALL JUMPS CARRY 30% MORE MOMENTUM THAN ANYONE ELSE'S. SHE IS ALSO THE FRAILEST "
+				     "CHARACTER IN THE GAME AT 60 HEALTH INSTEAD OF 100."),
+				TEXT("ZIP"),
+				TEXT("FLY FOR 5S. JUMP CLIMBS AT WALKING SPEED, CROUCH DESCENDS, AND EVERYTHING ELSE "
+				     "PLAYS AS NORMAL. CARRYING THE CORE HALVES IT - AND PICKING THE CORE UP MID-FLIGHT "
+				     "HALVES WHATEVER IS LEFT."),
+				30.f,
+				FLinearColor(0.75f, 0.92f, 1.00f, 1.f)    // ice
 			}
 		};
 

@@ -5,11 +5,11 @@
 #include "Blueprint/SlateBlueprintLibrary.h"
 #include "Components/Border.h"
 #include "Components/CanvasPanelSlot.h"
+#include "Components/Image.h"
 #include "Components/TextBlock.h"
 
-#include "UI/Widgets/Menu/TraceMenuCanvasArt.h"
+#include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
-#include "UI/Widgets/Menu/TraceStrokeTextWidget.h"
 
 void UTraceTitleMenuWidget::NativeOnInitialized()
 {
@@ -38,13 +38,29 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 	};
 
 	// ---- Art -------------------------------------------------------------------------------------
-	if (Backdrop != nullptr)
-	{
-		Backdrop->SetAnimationTime(InView.Now);
-	}
+	//
+	// The backdrop and the swoosh are static and are authored in the asset; nothing here touches them.
+	// Only the cursor moves.
 	if (MenuCursor != nullptr)
 	{
-		MenuCursor->SetCursor(InView.bCursorVisible, InView.CursorFraction);
+		MenuCursor->SetVisibility(InView.bCursorVisible
+			? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
+
+		// Re-ANCHORED, not offset. The view hands over a 0..1 fraction of the viewport, so setting the
+		// anchor to it puts the sprite in the right place at any DPI scale and any window size without
+		// this widget having to know either. Offsets would have needed both.
+		if (InView.bCursorVisible)
+		{
+			if (UCanvasPanelSlot* CursorSlot = Cast<UCanvasPanelSlot>(MenuCursor->Slot))
+			{
+				const FVector2D Fraction(
+					FMath::Clamp(InView.CursorFraction.X, 0.0, 1.0),
+					FMath::Clamp(InView.CursorFraction.Y, 0.0, 1.0));
+				CursorSlot->SetAnchors(FAnchors(
+					static_cast<float>(Fraction.X), static_cast<float>(Fraction.Y),
+					static_cast<float>(Fraction.X), static_cast<float>(Fraction.Y)));
+			}
+		}
 	}
 
 	// ---- Headline --------------------------------------------------------------------------------
@@ -152,6 +168,53 @@ void UTraceTitleMenuWidget::SyncConsoleWidth()
 		PanelSize.X = PanelWidth;
 		PanelSlot->SetSize(PanelSize);
 	}
+}
+
+int32 UTraceTitleMenuWidget::CountResolvedArt(int32& OutTotal, TArray<FString>& OutMissing, bool bIncludeBackdrop) const
+{
+	OutTotal = 0;
+	int32 Resolved = 0;
+
+	const auto Check = [&OutTotal, &Resolved, &OutMissing](const UImage* InImage, const TCHAR* InName)
+	{
+		++OutTotal;
+		if (InImage != nullptr && InImage->GetBrush().GetResourceObject() != nullptr)
+		{
+			++Resolved;
+			return;
+		}
+		OutMissing.Add(InName);
+	};
+
+	// Backdrop is deliberately NOT in this list: it is a flat black fill and has no texture by design.
+	// Which is exactly what makes it the red arm — see the parameter's comment in the header.
+	if (bIncludeBackdrop)
+	{
+		Check(Backdrop, TEXT("Backdrop (red arm — this one is SUPPOSED to have no texture)"));
+	}
+	Check(SwooshImage, TEXT("SwooshImage"));
+	Check(Wordmark, TEXT("Wordmark"));
+	Check(MenuCursor, TEXT("MenuCursor"));
+	Check(TravelWordmark, TEXT("TravelWordmark"));
+
+	// Each row is asked slot by slot rather than as a yes/no, because the slots that go missing
+	// unnoticed are the ones that are not on screen right now — the hover plate, the disabled plate,
+	// the chevron. See UTraceMenuRow::CountResolvedArt.
+	for (int32 Index = 0; Index < OrderedRows.Num(); ++Index)
+	{
+		const UTraceMenuRow* Row = OrderedRows[Index];
+		if (Row == nullptr)
+		{
+			// A null row is a BindWidget that did not resolve, i.e. the asset is older than this
+			// class. One line, not five missing brushes, because there is one thing to fix.
+			++OutTotal;
+			OutMissing.Add(FString::Printf(TEXT("row %d is not in the asset at all"), Index));
+			continue;
+		}
+		Resolved += Row->CountResolvedArt(OutTotal, OutMissing, FString::Printf(TEXT("row %d"), Index));
+	}
+
+	return Resolved;
 }
 
 bool UTraceTitleMenuWidget::GetRowViewportRect(int32 InRowIndex, FBox2D& OutRect) const

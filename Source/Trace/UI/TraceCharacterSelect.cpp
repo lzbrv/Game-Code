@@ -134,11 +134,15 @@ namespace TraceCharacterSelectFile
 	/**
 	 * The number keys, in roster order, so "press 3 for Mace" is literally true.
 	 *
-	 * ONE KEY PER CARD ONLY WORKS WHILE THE ROSTER FITS THE NUMBER ROW. It reaches 9 and then stops:
-	 * a tenth character gets arrows and the mouse, and would need a different scheme (modifiers, or
-	 * a second page) rather than a silently overloaded key. Returning EKeys::Invalid is what makes
-	 * that honest — WasInputKeyJustPressed on it is simply always false, so no card is ever picked by
-	 * a key that is really some other card's.
+	 * ONE KEY PER CARD ONLY WORKS WHILE THE ROSTER FITS THE NUMBER ROW, AND SPEC v19 §3 IS EXACTLY
+	 * WHERE IT RUNS OUT. This used to stop at 9 and hand the tenth card nothing but the arrows and
+	 * the mouse; the tenth character now exists (Lily), so the tenth card takes ZERO — the last key
+	 * on the number row, and the one every player already reads as "ten".
+	 *
+	 * IT STOPS THERE FOR REAL. An ELEVENTH character has no key left and gets EKeys::Invalid, which
+	 * is deliberate rather than an omission: WasInputKeyJustPressed on Invalid is simply always
+	 * false, so a card is never picked by a key that is really some other card's. The next roster
+	 * addition needs a different scheme (modifiers, or a second page), not another entry here.
 	 */
 	const FKey& NumberKeyForIndex(int32 Index)
 	{
@@ -153,6 +157,7 @@ namespace TraceCharacterSelectFile
 		case 6:  return EKeys::Seven;
 		case 7:  return EKeys::Eight;
 		case 8:  return EKeys::Nine;
+		case 9:  return EKeys::Zero;      // spec v19 §3 — Lily. "0" is the tenth key, not a tenth name.
 		default: return EKeys::Invalid;
 		}
 	}
@@ -800,11 +805,14 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 
 	{
 		// Built from the roster rather than written out, so adding a character cannot leave the screen
-		// telling the player about one fewer key than it accepts. The upper bound is the number row:
-		// see TraceCharacterSelectFile::NumberKeyForIndex for what happens past nine.
-		const FString Controls = FString::Printf(
-			TEXT("1-%d OR ARROWS TO CHOOSE      ENTER TO LOCK IN      OR CLICK A CARD"),
-			FMath::Min(TraceCharacterRoster::Count, 9));
+		// telling the player about one fewer key than it accepts. The upper bound is the number ROW,
+		// which holds TEN keys and not nine — 1..9 then 0 — so at the spec v19 §3 roster of ten this
+		// prints "1-9 AND 0". See TraceCharacterSelectFile::NumberKeyForIndex for the eleventh.
+		const FString Controls = (TraceCharacterRoster::Count >= 10)
+			? FString(TEXT("1-9 AND 0, OR ARROWS TO CHOOSE      ENTER TO LOCK IN      OR CLICK A CARD"))
+			: FString::Printf(
+				TEXT("1-%d OR ARROWS TO CHOOSE      ENTER TO LOCK IN      OR CLICK A CARD"),
+				TraceCharacterRoster::Count);
 		DrawTextCentered(HUD, Controls, TraceSelectStyle::InkDim, ViewW * 0.5f, FooterY, FontSmall, UIScale);
 		FooterY += MeasureHeight(HUD, Controls, FontSmall, UIScale) + (8.f * UIScale);
 	}
@@ -905,7 +913,13 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 
 	// ---- Number + name --------------------------------------------------------------------------
 	{
-		const FString KeyHint = FString::Printf(TEXT("%d"), CardIndex + 1);
+		// THE KEY THAT ACTUALLY PICKS THIS CARD, not the card's ordinal — the two stop agreeing at the
+		// tenth character, whose key is 0 (see NumberKeyForIndex). Printing "10" beside a card that
+		// only answers to 0 would be the screen lying about its own controls. Past the tenth there is
+		// no key at all and the hint is blank rather than wrong.
+		const FString KeyHint = (CardIndex < 9)
+			? FString::Printf(TEXT("%d"), CardIndex + 1)
+			: (CardIndex == 9 ? FString(TEXT("0")) : FString());
 		HUD->DrawText(KeyHint, TraceSelectStyle::WithAlpha(TraceSelectStyle::InkDim, Dim), TextX, TextY, FontSmall, UIScale);
 
 		const FString NameText = Entry.Name;

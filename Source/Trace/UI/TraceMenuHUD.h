@@ -69,23 +69,37 @@ enum class ETraceMenuRow : uint8
 	 * feature as invisible as its absence was.
 	 */
 	Join       = 1,
-	Difficulty = 2,
+	/**
+	 * SPEC v19 §2 — the PRACTICE RANGE, and the reason this row exists at all.
+	 *
+	 * The range is reachable ONLY by travelling to the arena with
+	 * "?game=/Script/Trace.TracePracticeGameMode" on the URL; there is no setting, no CVar and no ini
+	 * key that can turn a match into one, which is precisely what makes the range's cheats
+	 * (infinite abilities, free character switching, the no-turnover rack) structurally unable to
+	 * reach a real match. The cost of that safety is that WITHOUT THIS ROW the feature shipped with
+	 * no way for a player to find it — you had to know a shell script existed.
+	 *
+	 * Third, with PLAY and JOIN, because those three are the rows that start something. The tuning
+	 * rows and the one destructive row stay below them.
+	 */
+	Practice   = 2,
+	Difficulty = 3,
 	/**
 	 * SCORING MODE — the A/B toggle (spec v4 §7). Directly under DIFFICULTY, and above SETTINGS,
 	 * because it is the second thing a playtester picks and the entire point of this build: the
 	 * notes ask for the two rulesets to be compared back to back, which means switching between them
 	 * has to be one keypress on the way into a match rather than a trip through a settings panel.
 	 */
-	Mode       = 3,
+	Mode       = 4,
 	/**
 	 * Sensitivity, invert-Y and the key bindings. Sits above QUIT rather than below the blurb so
 	 * that the things a player might change before their first match are adjacent, and the one
 	 * destructive row stays last.
 	 */
-	Settings   = 4,
-	Quit       = 5,
+	Settings   = 5,
+	Quit       = 6,
 
-	Count      = 6
+	Count      = 7
 };
 
 UCLASS()
@@ -115,6 +129,16 @@ public:
 
 	/** The UMG widget's rect for a row, in viewport pixels. False when there is no widget. */
 	bool GetUmgRowRect(int32 InRowIndex, FBox2D& OutRect) const;
+
+	/**
+	 * The live title widget, or null on the Canvas path.
+	 *
+	 * Public for `Trace.UI.VerifyMenuArt` only. Spec v19 §5 put the artist's sprites in this tree, and
+	 * Slate draws a brush with no texture as a solid WHITE RECTANGLE — a menu missing half its art
+	 * therefore looks like a different design rather than a broken one, and nobody investigates. The
+	 * verifier has to be able to ask the real widget what actually resolved.
+	 */
+	const UTraceTitleMenuWidget* GetMenuWidget() const { return MenuWidget; }
 
 	/**
 	 * The CANVAS layout maths for a row, computed fresh from the current viewport — not a cached
@@ -244,6 +268,12 @@ protected:
 
 	/** Raises the settings overlay on its settings page, with BACK closing it outright. */
 	void OpenOptions();
+
+	/**
+	 * SPEC v19 §2. Travels to the arena with the practice game mode on the URL — the ONE way into the
+	 * range, and deliberately the only one. See ETraceMenuRow::Practice.
+	 */
+	void StartPracticeRange();
 
 	void QuitGame();
 

@@ -85,6 +85,14 @@ namespace TraceRoxieRocket
 	/** The rocket's OWN touch radius, added to the victim's capsule radius. NOT a splash radius. */
 	TRACE_API float GetHitRadiusUU();
 
+	/**
+	 * DEMO 17 item 3. Multiplier on the DRAWN body, whose base size is the hit radius above.
+	 *
+	 * 1.0 means "draw it exactly as big as the thing that kills you", which is the honest default and a
+	 * seven-fold widening of what shipped before Demo 17 (a 13 uu dart around a 45 uu lethal radius).
+	 */
+	TRACE_API float GetVisualScale();
+
 	/** Widest lateral excursion from the aim line, in uu. ZERO IS THE RED ARM — it flies straight. */
 	TRACE_API float GetWobbleAmplitudeUU();
 
@@ -224,6 +232,15 @@ private:
 
 	/** Places the mesh and points it along the instantaneous direction of travel. Every machine. */
 	void UpdateVisual(const FVector& AtPosition);
+
+	/**
+	 * DEMO 17 item 3. Sizes the drawn body from the rocket's own HIT RADIUS, times RoxieRocketVisualScale.
+	 *
+	 * Runs in BeginPlay rather than the constructor because both numbers are live settings knobs and a
+	 * CDO built before the .ini layers over the header would bake the wrong pair in for the whole
+	 * process — so a retune during PIE reaches the next rocket.
+	 */
+	void ApplyVisualSize();
 
 	/** Roxie. The rules — the damage and the choke point — are hers; see the file header. */
 	TWeakObjectPtr<UTraceAbilitySetRoxie> OwnerSet;

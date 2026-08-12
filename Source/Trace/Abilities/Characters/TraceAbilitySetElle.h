@@ -82,6 +82,15 @@
 //   press 2   inside the window places gate B, pairs them, and GetActivatedCooldownSeconds() returns
 //             the REMAINDER of 35 s measured from press 1 — so the ring counts 35 s down from the
 //             start of the cast, not from the end of it.
+//
+//             *** DEMO 17 ADDED ONE REFUSAL HERE, AND IT IS THE FIX FOR HALF OF "IT DOESN'T WORK AT
+//             ALL". *** Gate B may not land on top of gate A: inside
+//             UTraceSettings::ElleSnapMinimumMouthSeparationUU, CanActivate() says no, the press
+//             costs NOTHING (TryActivate charges no cooldown for a refusal) and the 4 s window keeps
+//             running, so she can step away and finish the cast. Without it, a player whose first
+//             press looked like it did nothing pressed again on the spot and got two mouths inside
+//             one gate radius — a portal whose ends are the same place, which teleports you to where
+//             you already are and burns the whole 35 s.
 //   no press  the window lapses, gate A expires, and AuxEndMatchTime is rewritten to press 1 + 35 s.
 //             CanActivate() refuses until then, so a fluffed cast still costs the full cooldown and
 //             Elle cannot farm free decoy gates every 4 s.

@@ -6,6 +6,7 @@
 #include "Gameplay/TraceCore.h"
 
 #include "Abilities/TraceAbilityComponent.h"   // spec v14 §6: Mace's per-player magnet radius
+#include "Abilities/TraceAbilityTypes.h"       // spec v19 §3: TraceAbilityTraits — Mortimer's longer charge hold
 #include "Net/UnrealNetwork.h"
 
 #include "Trace.h"
@@ -890,10 +891,16 @@ static TAutoConsoleVariable<float> CVarModeBSurfaceMaxSlope(
 //   something has landed on it whatever route it took there, which is also what makes a slow tumble
 //   onto a ledge a turnover.
 //
-// AND THE AT-REST PROBE IS UNCHANGED AND STILL AUTHORITATIVE. Spec v7 §4's "the core gets stuck up
-// top of an object" is the same rule seen from the other end, and every Core that grazes something
-// and is refused a turnover keeps flying, lands, and turns over there instead — later, lower, and
-// where a player watching can see why. Nothing is lost; the turnover moves to the moment it belongs.
+// AND THE AT-REST PROBE IS STILL AUTHORITATIVE. Spec v7 §4's "the core gets stuck up top of an
+// object" is the same rule seen from the other end, and every Core that grazes something and is
+// refused a turnover keeps flying, lands, and turns over there instead — later, lower, and where a
+// player watching can see why. Nothing is lost; the turnover moves to the moment it belongs.
+//
+// (This paragraph used to open "UNCHANGED AND still authoritative". Spec v19 §1.5 changed it: the
+// probe's verdict is now ALSO required to pass the visible-support test, because the probe accepts
+// anything within 24 uu of the collision sphere and that includes a corner the Core is wedged
+// against rather than sitting on. Still authoritative, no longer unchanged — see the §1.5 block
+// below.)
 //
 // HYPOTHESES (b) AND (c) WERE TESTED TOO, and closed by construction rather than by argument:
 //   (b) the at-rest probe firing while the Core still has speed — it cannot, bLooseAtRest is only
@@ -1002,6 +1009,40 @@ static TAutoConsoleVariable<float> CVarModeBMidAirTurnoverDegrees(
 	TEXT("that is both fast and shallow is counted as MID-AIR in SurfaceStats. No rule reads it."),
 	ECVF_Default);
 
+// =================================================================================================
+// MODE B ONLY — SPEC v19 §1.5, "IT MUST VISIBLY TOUCH SOMETHING FIRST"
+//
+// Verbatim, and the capitals are theirs: "ENSURE the ball does not turnover until it actually
+// visibly touches the ground or the top of an obstacle."
+//
+// THIS IS A RE-REPORT, and that is the whole reason this block exists rather than another turn of
+// the v13 §8 dials. v13 §8 fixed the GRAZE — a Core flying PAST the top of a crate — by asking how
+// steeply the Core ARRIVED, and Trace.ModeB.TurnoverRepro shows that fix still holding. The sentence
+// came back anyway, so the remaining case is one the arrival test cannot see.
+//
+// [DIAGNOSED] IT IS THE LIP. The flight is a SPHERE SWEEP, and a sphere that clips the top EDGE of a
+// block reports the depenetration direction as its normal — which, for a ball resting against a
+// corner from slightly above, points UP. Every test the rule had then passes:
+//
+//     up-facing normal      yes, the corner's depenetration direction is above 45 degrees
+//     steep arrival         yes, a Core dropping onto a lip arrives at 40-90 degrees
+//     cleared the thrower   yes, it has been in the air for most of a second
+//     came to rest          often yes, a corner contact kills most of the speed
+//
+// ...and the ball is BESIDE the block with several hundred uu of clear air underneath it. Possession
+// changes, and then the Core carries on falling to the floor while the player watches. From the
+// outside that is exactly the reported sentence, and no further tuning of an ARRIVAL angle can reach
+// it, because the thing the rule is wrong about is BELOW the Core, not in front of it.
+//
+// THE FIX IS TO ASK THE PLAYER'S OWN QUESTION, ONCE, AT THE MOMENT POSSESSION WOULD CHANGE: is the
+// orb a player can see actually resting on something? Answered by sweeping a sphere of the RENDERED
+// radius straight down (ATraceCore::MeasureVisibleSupportGap) and requiring the gap to be inside
+// TurnoverContactSlack. A contact that fails it is not a landing; the Core keeps its downward
+// velocity, falls off the lip, and turns over on the floor a moment later — later, lower, and where
+// a player watching can see why. Nothing is lost, the turnover moves to the moment it belongs, and
+// that is the same shape of fix v13 §8 applied one surface over.
+// =================================================================================================
+
 /**
  * How far a Core at rest probes downward to find what is holding it up.
  *
@@ -1009,6 +1050,77 @@ static TAutoConsoleVariable<float> CVarModeBMidAirTurnoverDegrees(
  * plus the sphere's own radius plus a little slack for a surface it settled into.
  */
 static constexpr float TraceModeBRestProbeDepth = 24.f;
+
+/**
+ * SPEC v19 §1.5. The RENDERED radius of the orb, in uu — what "visibly" means, numerically.
+ *
+ * The mesh is /Engine/BasicShapes/Sphere, which is 100 uu across, scaled by TraceCoreTuning::OrbScale
+ * (0.40). So the ball a player sees is 20 uu in radius, against a 22 uu collision sphere: the
+ * COLLISION IS ALREADY BIGGER THAN THE BALL, which is why the gap has to be measured with the drawn
+ * size and not the swept one. Asking the collision sphere "are you touching?" is a question it
+ * answers yes to 2 uu before the eye agrees.
+ */
+static constexpr double TraceModeBVisibleOrbRadius = 100.0 * 0.5 * 0.40;
+
+static TAutoConsoleVariable<float> CVarModeBTurnoverContactSlack(
+	TEXT("Trace.ModeB.TurnoverContactSlack"),
+	6.f,
+	TEXT("MODE B, spec v19 §1.5. How much clear air may be under the VISIBLE orb at the instant "
+	     "possession changes, in uu. The Core parks 2 uu off whatever it lands on and its collision "
+	     "sphere is 2 uu larger than the drawn one, so a ball genuinely sitting on the floor measures "
+	     "about 4; 6 is that plus a frame of slack. Raise it and mid-air turnovers come back."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBTurnoverContactProbe(
+	TEXT("Trace.ModeB.TurnoverContactProbe"),
+	600.f,
+	TEXT("MODE B, spec v19 §1.5. How far below the Core to look for the surface holding it up, in uu. "
+	     "Also the number reported as the gap when there is nothing under it at all, so it wants to be "
+	     "comfortably taller than the arena's cover (the tallest top face here is ~350 uu)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBTurnoverSettleSeconds(
+	TEXT("Trace.ModeB.TurnoverSettleSeconds"),
+	0.15f,
+	TEXT("MODE B, spec v19 §1.5. How long the Core stays loose ON the surface it landed on before "
+	     "possession changes, in seconds. Before this pass it was 0 and the award happened on the same "
+	     "TICK as the first contact, so the ball was never drawn touching anything - which is the "
+	     "reported bug. 0.15 is about nine frames at 60fps and five at 30, i.e. legible at any frame "
+	     "rate, and the ball is bouncing or resting for all of them. 0 restores the pre-v19 instant "
+	     "award."),
+	ECVF_Default);
+
+/**
+ * THE A/B ARM for spec v19 §1.5, and the reason its reproduction can go red.
+ *
+ * 1 is the shipped rule. 0 removes ONLY the "is the orb actually on top of something" test and
+ * leaves every v7 §4 and v13 §8 rule exactly as it was — so Trace.ModeB.GroundedTurnover 0
+ * reproduces the lip turnover on the fixed build, and the same harness that reports "0 ungrounded
+ * turnovers" reports a pile of them.
+ *
+ * Trace.ModeB.LandingRule 0 (the v13 arm) implies this one, so that switch still means "everything
+ * as it was before any of this" and the §8 A/B is bit-identical to the run it was written for.
+ */
+static TAutoConsoleVariable<int32> CVarModeBGroundedTurnover(
+	TEXT("Trace.ModeB.GroundedTurnover"),
+	1,
+	TEXT("MODE B, spec v19 §1.5. 1 (default): a turnover additionally requires the VISIBLE orb to be "
+	     "resting on the surface AND to have been drawn there for Trace.ModeB.TurnoverSettleSeconds. "
+	     "0: removes both, which is the pre-v19 build exactly and the A/B arm the reproduction must go "
+	     "RED on. Never ship 0."),
+	ECVF_Default);
+
+/** As the v13 switches: also armable with a bare -TraceLegacyGroundedTurnover, which needs no quoting. */
+static bool TraceModeBLegacyGroundedRule()
+{
+	static const bool bFromCommandLine =
+		FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyGroundedTurnover"));
+
+	// The v13 arm implies this one — see the CVar's comment.
+	return bFromCommandLine
+		|| (CVarModeBGroundedTurnover.GetValueOnAnyThread() == 0)
+		|| TraceModeBLegacyLandingRule();
+}
 
 /**
  * How far above the arena floor a surface has to be before the log and the tallies call it "the top
@@ -3991,7 +4103,7 @@ static float TraceModeBChargeTCap()
 	return TraceModeBTuning::ThrowChargeClamps() ? 1.f : TraceModeBTuning::ThrowChargeMaxFraction();
 }
 
-float ATraceCore::GetThrowChargeScaleForHold(float HeldSeconds)
+float ATraceCore::GetThrowChargeScaleForHold(float HeldSeconds, const AActor* Thrower)
 {
 	const float Floor = FMath::Clamp(TraceModeBTuning::ThrowChargeFloor(), 0.f, 1.f);
 
@@ -4016,7 +4128,11 @@ float ATraceCore::GetThrowChargeScaleForHold(float HeldSeconds)
 	// 0.15 + 0.85 * 1.5 = 1.43x, not 1.5x. That is the settings page's stated definition and the ini's,
 	// and reinterpreting it here would give two answers for "max charge" that differ by 5% - a
 	// disagreement that would only ever be found by somebody wondering why a slider lies.
-	const float TCapped = FMath::Clamp(HeldSeconds / ChargeSeconds, 0.f, TraceModeBChargeTCap());
+	// SPEC v19 §3 — the cap on t, stretched by the thrower's own hold scale (1.0 for everybody but
+	// Mortimer, and for a null thrower, so this is identity on every pre-v19 path). It is the CAP that
+	// moves, not the curve: he walks further along the same line rather than up a steeper one.
+	const float HoldScale = FMath::Max(1.f, TraceAbilityTraits::GetThrowChargeHoldScale(Thrower));
+	const float TCapped = FMath::Clamp(HeldSeconds / ChargeSeconds, 0.f, TraceModeBChargeTCap() * HoldScale);
 
 	// THE LINEAR CORRELATION THE NOTE ASKS FOR, in one line: the floor at zero hold, exactly 1.0 (the
 	// current throw momentum) at a full one.
@@ -4057,7 +4173,12 @@ float ATraceCore::GetThrowChargeAlpha() const
 	const float ChargeSeconds = FMath::Max(0.01f, TraceModeBTuning::ThrowChargeSeconds());
 	const float Alpha = Held / ChargeSeconds;
 
-	return TraceModeBTuning::ThrowChargeClamps() ? FMath::Clamp(Alpha, 0.f, 1.f) : FMath::Max(0.f, Alpha);
+	// SPEC v19 §3: the meter's ceiling stretches with the carrier's own hold scale for the same reason
+	// GetThrowChargeScaleNow() does — while Mortimer is still gaining power his meter must still be
+	// moving. 1.0 for everybody else, so this is the shipped clamp untouched for the other nine.
+	const float HoldScale = FMath::Max(1.f, TraceAbilityTraits::GetThrowChargeHoldScale(GetCarrier()));
+
+	return TraceModeBTuning::ThrowChargeClamps() ? FMath::Clamp(Alpha, 0.f, HoldScale) : FMath::Max(0.f, Alpha);
 }
 
 float ATraceCore::GetThrowChargeScaleNow() const
@@ -4066,7 +4187,12 @@ float ATraceCore::GetThrowChargeScaleNow() const
 	{
 		return -1.f;
 	}
-	return GetThrowChargeScaleForHold(FMath::Max(0.f, GetServerTimeSeconds() - LocalThrowChargeStartTime));
+	// SPEC v19 §3: the CARRIER is the thrower, so the local meter walks the same extended cap the
+	// server will apply at the release. Without this the HUD would pin at 1.0 while Mortimer kept
+	// charging, i.e. the meter would stop telling him the truth exactly when his passive starts
+	// paying — the "two answers for max charge" failure this function exists to prevent.
+	return GetThrowChargeScaleForHold(
+		FMath::Max(0.f, GetServerTimeSeconds() - LocalThrowChargeStartTime), GetCarrier());
 }
 
 void ATraceCore::ClearThrowCharge(const TCHAR* Reason)
@@ -4993,6 +5119,20 @@ static FAutoConsoleCommand GTraceModeBSurfaceStatsCmd(
 			(!TraceModeBLegacyLandingRule()) ? TEXT("v13 (an actual landing)")
 				: TEXT("PRE-v13 (any upward normal) - THE BUG, ARMED"),
 			TraceModeBTuning::LandingMinDescentDegrees(), TraceModeBTuning::LandingMinFlightSeconds());
+
+		// SPEC v19 §1.5, printed on the same command for the same reason §8 is: "how many turnovers"
+		// and "how many of them happened with clear air under the ball" belong on one line.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] GROUNDED RULE (spec v19 §1.5): UNGROUNDED TURNOVERS %d (this must be 0) | ")
+			TEXT("grounded turnovers %d | worst gap under any turnover %.0f uu | landings refused for ")
+			TEXT("not being on top of anything %d | rule=%s, slack %.0f uu, probe %.0f uu, orb radius %.0f uu"),
+			Stats.UngroundedTurnovers, Stats.GroundedTurnovers, Stats.WorstTurnoverGapUU,
+			Stats.UngroundedLandingsRefused,
+			(!TraceModeBLegacyGroundedRule()) ? TEXT("v19 (the orb must be on it)")
+				: TEXT("PRE-v19 (any up-facing contact) - THE BUG, ARMED"),
+			CVarModeBTurnoverContactSlack.GetValueOnAnyThread(),
+			CVarModeBTurnoverContactProbe.GetValueOnAnyThread(),
+			TraceModeBVisibleOrbRadius);
 	}));
 
 ATraceCore::FCatchContestStats ATraceCore::CatchStats;
@@ -5176,7 +5316,9 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	// RequestPassInput computed from ITS OWN press and release timestamps, never from anything a
 	// client said about how long it held down a button. A client-supplied hold is a client-supplied
 	// launch speed, and it would be the single most valuable number in this game to lie about.
-	const float ChargeScale = GetThrowChargeScaleForHold(HeldSeconds);
+	// SPEC v19 §3: the THROWER is passed so Mortimer's longer useful hold is honoured here, on the
+	// server, from the server's own press/release timestamps. Everybody else's scale is 1.0.
+	const float ChargeScale = GetThrowChargeScaleForHold(HeldSeconds, Thrower);
 
 	const float Speed = TraceModeBTuning::ThrowSpeed();
 	const FVector Impulse = (ThrowDirection * Speed
@@ -5240,6 +5382,7 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	CatchZoneTarget = nullptr;
 	bCatchZoneContested = false;
 	LastContactServerTime = -1.f;
+	ClearPendingTurnover();   // Spec v19 §1.5: this throw is awarded on its own landing, not the last one's.
 	LooseFromTeam = ThrowerTeam;
 	LooseThrower = Thrower;
 	LooseStartServerTime = Now;
@@ -5417,16 +5560,52 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 			const bool bComesToRest = bUpwardFacing
 				&& (Reflected.Size() < TraceModeBTuning::RestSpeed());
 
+			// --- SPEC v19 §1.5. AN UPWARD NORMAL IS NOT YET SOMETHING TO STAND ON. ------------------
+			//
+			// "ENSURE the ball does not turnover until it actually visibly touches the ground or the
+			// top of an obstacle." Measured DOWNWARD from the Core, with the drawn radius, AFTER the
+			// push-out above has put the Core where it will actually be this frame — so this is the
+			// gap a player would see on the screen and not a fact about the sweep that produced it.
+			// See the §1.5 block near the top of this file for why the lip of a block passes every
+			// other test in this function.
+			//
+			// Computed only for an upward-facing contact: a wall bounce is not a landing candidate and
+			// must not pay for a sweep.
+			double ContactSupportGap = 0.0;
+			FVector ContactSupportPoint = FVector::ZeroVector;
+			bool bVisiblyOnTop = true;
+			if (bUpwardFacing)
+			{
+				ContactSupportGap = MeasureVisibleSupportGap(ContactSupportPoint);
+				bVisiblyOnTop = TraceModeBLegacyGroundedRule()
+					|| (ContactSupportGap <= static_cast<double>(CVarModeBTurnoverContactSlack.GetValueOnAnyThread()));
+			}
+
 			// bLegacyLandingRule is the A/B arm (Trace.ModeB.LandingRule 0) and restores the pre-v13
 			// behaviour EXACTLY, which is what lets the §8 reproduction go red on this build.
-			const bool bContactIsLanding = bUpwardFacing
+			// bVisiblyOnTop is the v19 §1.5 arm (Trace.ModeB.GroundedTurnover 0) and is deliberately
+			// OUTSIDE that bracket, as a separate AND: the two arms disarm different rules, and a
+			// single combined switch could not tell the reader which one a red run had proven.
+			const bool bContactIsLanding = bUpwardFacing && bVisiblyOnTop
 				&& (bLegacyLandingRule || bComesToRest || (bArrivedOnIt && bClearedTheThrower));
 
 			bLandedOnSurface = bContactIsLanding;
 
-			if (bUpwardFacing && !bContactIsLanding)
+			if (bUpwardFacing && !bVisiblyOnTop)
 			{
-				// THE BUG'S OWN COUNTER. Every one of these was a turnover before v13.
+				// THE v19 §1.5 BUG'S OWN COUNTER: an up-facing contact with clear air under the ball.
+				// Every one of these was a mid-air turnover before this pass.
+				++SurfaceStats.UngroundedLandingsRefused;
+
+				UE_LOG(LogTraceGame, Verbose,
+					TEXT("[ModeB] spec v19 §1.5: refused a landing at %s - the contact normal points up ")
+					TEXT("but the orb has %.0f uu of clear air under it (slack %.0f). Keeping it falling."),
+					*FVector(LooseLocation).ToCompactString(), ContactSupportGap,
+					CVarModeBTurnoverContactSlack.GetValueOnAnyThread());
+			}
+			else if (bUpwardFacing && !bContactIsLanding)
+			{
+				// THE v13 §8 BUG'S OWN COUNTER. Every one of these was a turnover before v13.
 				++SurfaceStats.GlancingContactsRejected;
 			}
 
@@ -5454,10 +5633,15 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 					FloorZ = (LogBox.IsValid != 0) ? LogBox.Min.Z : 0.0;
 				}
 
+				// THE VERDICT IS READ OFF bContactIsLanding FIRST, and that ordering is a correction
+				// rather than a tidy-up: before v19 the "SETTLED" arm came first, and now that a
+				// contact can come to rest on a lip AND be refused, a chain that reported "SETTLED on
+				// it - turnover" would be printing the opposite of what the same frame did.
 				UE_LOG(LogTraceGame, Display,
 					TEXT("[ModeBTurnover] CONTACT at %s | %.0f uu above the floor | speed %.0f -> %.0f uu/s | ")
 					TEXT("normal %s (%.0f deg from up, up-facing=%d) | arrival %.1f deg to the surface ")
-					TEXT("(needs %.0f) | airborne %.3fs (needs %.3f) | VERDICT: %s"),
+					TEXT("(needs %.0f) | airborne %.3fs (needs %.3f) | orb %.0f uu above what is under it ")
+					TEXT("(needs <= %.0f) | VERDICT: %s"),
 					*SurfacePoint.ToCompactString(), SurfacePoint.Z - FloorZ,
 					Speed3DBeforeContact, Reflected.Size(),
 					*ContactNormal.ToCompactString(),
@@ -5466,9 +5650,11 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 					FMath::RadiansToDegrees(FMath::Asin(FMath::Clamp(ArrivalSin, -1.0, 1.0))),
 					TraceModeBTuning::LandingMinDescentDegrees(),
 					Now - LooseStartServerTime, TraceModeBTuning::LandingMinFlightSeconds(),
+					ContactSupportGap, CVarModeBTurnoverContactSlack.GetValueOnAnyThread(),
 					!bUpwardFacing ? TEXT("WALL - bounce")
-						: (bComesToRest ? TEXT("SETTLED on it - turnover")
-							: (bContactIsLanding ? TEXT("LANDING - turnover")
+						: (bContactIsLanding
+							? (bComesToRest ? TEXT("SETTLED on it - turnover") : TEXT("LANDING - turnover"))
+							: (!bVisiblyOnTop ? TEXT("NOT ON TOP OF IT (v19 §1.5) - keeps falling")
 								: (!bClearedTheThrower ? TEXT("launch-frame contact - flies on")
 									: TEXT("GRAZE - flies on")))));
 			}
@@ -5489,7 +5675,14 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 				// verdict and the log line are computed from one expression rather than two that could
 				// drift. bLandedOnSurface has ALREADY been set true by it - see SPEC v13 §8 above - so
 				// this block only has to do the resting itself.
-				if (bUpwardFacing)
+				//
+				// SPEC v19 §1.5 EXTENDS THE SAME SENTENCE TO A LIP. "A wall is not a resting place"
+				// because nothing is holding the Core up there; the top EDGE of a block is the same
+				// statement with a normal that happens to point upward, and leaving the Core parked on
+				// one would hang it in mid-air against the corner with the integration switched off -
+				// the identical stuck-forever failure. So it takes the identical treatment: keep the
+				// downward component, stay live, and land on something that is actually underneath.
+				if (bUpwardFacing && bVisiblyOnTop)
 				{
 					LooseVelocity = FVector::ZeroVector;
 					bLooseAtRest = true;
@@ -5499,7 +5692,15 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 				}
 				else
 				{
-					++SurfaceStats.WallRestRefusals;
+					// WallRestRefusals stays what its name says — a WALL refused a resting place. A
+					// v19 §1.5 lip refusal has already been counted, once, by UngroundedLandingsRefused
+					// in the verdict block above; counting it a second time under a wall's name would
+					// make both numbers lie.
+					if (!bUpwardFacing)
+					{
+						++SurfaceStats.WallRestRefusals;
+					}
+
 					LooseVelocity = FVector(0.0, 0.0, FMath::Min(0.0, Reflected.Z));
 				}
 			}
@@ -5544,7 +5745,18 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 		FVector RestNormal = FVector::UpVector;
 		const bool bSupported = ServerProbeRestingSurface(RestPoint, RestNormal);
 
-		if (bSupported)
+		// SPEC v19 §1.5, THE SECOND HALF OF THE SAME RULE. ServerProbeRestingSurface answers with the
+		// COLLISION sphere and accepts anything within 24 uu, so a Core wedged against the corner of a
+		// block reads as "supported" — by the corner, with the floor several hundred uu below. This is
+		// the same question asked with the DRAWN radius, straight down: is the ball a player can see
+		// resting on something? Measured once here and reused, so the probe and the rule cannot
+		// disagree about the same frame.
+		FVector RestSupportPoint = FVector::ZeroVector;
+		const double RestSupportGap = MeasureVisibleSupportGap(RestSupportPoint);
+		const bool bRestVisiblyOnTop = TraceModeBLegacyGroundedRule()
+			|| (RestSupportGap <= static_cast<double>(CVarModeBTurnoverContactSlack.GetValueOnAnyThread()));
+
+		if (bSupported && bRestVisiblyOnTop)
 		{
 			bLandedOnSurface = (RestNormal.Z >= TraceModeBTuning::SurfaceUpNormalZ());
 			bLandedByRestProbe = bLandedOnSurface;
@@ -5555,10 +5767,21 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 		{
 			// Nothing under it. A Core "at rest" in mid-air is a contradiction and the state that
 			// produced every stuck-Core report; put it back in flight and let gravity resolve it.
+			// Since v19 §1.5 that includes a Core "at rest" on a lip it is not actually on top of —
+			// the same contradiction, one geometry over, and the same answer.
 			bLooseAtRest = false;
+
+			if (bSupported)
+			{
+				++SurfaceStats.UngroundedLandingsRefused;
+			}
+
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[ModeB] loose Core was at rest at %s with nothing under it - resuming flight (spec v7 §4)."),
-				*FVector(LooseLocation).ToCompactString());
+				TEXT("[ModeB] loose Core was at rest at %s with %s under it (orb %.0f uu clear, slack %.0f) ")
+				TEXT("- resuming flight (spec v7 §4 / v19 §1.5)."),
+				*FVector(LooseLocation).ToCompactString(),
+				bSupported ? TEXT("nothing it is sitting ON") : TEXT("nothing at all"),
+				RestSupportGap, CVarModeBTurnoverContactSlack.GetValueOnAnyThread());
 		}
 	}
 
@@ -5584,58 +5807,190 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	// ONE call site for both ways of establishing the landing (contact this frame, or at rest on
 	// something horizontal), because they are the same rule about the same geometry - the spec's
 	// instruction was to generalise the ground path, not to grow a second one beside it.
-	if (bLandedOnSurface && bLooseFromThrow && CVarModeBGroundTurnover.GetValueOnAnyThread() != 0)
+	//
+	// SPEC v19 §1.5 SPLIT THE INSTANT IN TWO, and this is where. "ENSURE the ball does not turnover
+	// until it actually visibly touches the ground or the top of an obstacle." Until this pass the
+	// landing and the award were the same TICK - measured, twelve times out of twelve, by the CONTACT
+	// and SURFACE TURNOVER log lines carrying the identical frame number - so rendering, which happens
+	// after the tick, never once drew the ball in contact. So the landing is now LATCHED here and the
+	// award happens further down, after the ball has actually been on screen sitting on the thing it
+	// hit. The rule is unchanged; only the moment it fires has moved, and it has moved to the moment
+	// the sentence describes.
+	// THE LooseFromTeam CLAUSE IS NOT BELT AND BRACES. ServerSurfaceTurnover declines outright when
+	// there is no team to award the Core TO ("nobody threw it" — a debug launch, or a Core left loose
+	// across a mode switch), and the settle below suppresses the pickup poll while a landing is
+	// pending. Latching a landing the rule was always going to decline would therefore hold the Core
+	// unpickupable until the reset timer expired. Asking the same question one line earlier means the
+	// latch is only ever taken for a throw the rule actually has an opinion about.
+	const bool bTurnoverRuleArmed = bLooseFromThrow
+		&& (LooseFromTeam != ETraceTeam::None)
+		&& (CVarModeBGroundTurnover.GetValueOnAnyThread() != 0);
+
+	if (bTurnoverRuleArmed && bLandedOnSurface)
 	{
-		// SPEC v13 §8's headline number, taken BEFORE the turnover runs because the turnover can grant,
-		// score and reset the field under us - after which none of this state means anything.
-		//
-		// FAST **AND** SHALLOW, and both halves are load-bearing. A Core dropped straight onto the floor
-		// arrives at 1500 uu/s and has unambiguously landed, so speed alone would report the commonest
-		// correct turnover in the game as the bug; a Core resting on a crate is 400 uu up, so height
-		// alone would report spec v7 §4 as the bug. What the user described is a Core going PAST
-		// something - still travelling, and barely descending. That is the pair.
-		//
-		// Measured from the geometry of the event and NOT from the rule's verdict, so both arms of the
-		// A/B (Trace.ModeB.LandingRule 1 and 0) compute it identically and the counter can go red.
-		const double ArrivalDegrees = FMath::RadiansToDegrees(FMath::Asin(FMath::Clamp(ArrivalSin, -1.0, 1.0)));
-		const bool bStillFlying =
-			(ArrivalSpeed > static_cast<double>(CVarModeBMidAirTurnoverSpeed.GetValueOnAnyThread()))
-			&& (ArrivalDegrees < static_cast<double>(CVarModeBMidAirTurnoverDegrees.GetValueOnAnyThread()));
-
-		if (ServerSurfaceTurnover(SurfacePoint, SurfaceNormal))
+		if (PendingTurnoverLandedServerTime < 0.f)
 		{
-			(bStillFlying ? SurfaceStats.MidAirTurnovers : SurfaceStats.LandedTurnovers)++;
+			PendingTurnoverLandedServerTime = Now;
+			PendingTurnoverLandedFrame = GFrameCounter;
 
-			if (bStillFlying)
-			{
-				// LOUD, and unconditionally: this is the bug's own signature. On the shipped rule it can
-				// only be reached with Trace.ModeB.LandingRule 0 (the A/B arm that restores the pre-v13
-				// behaviour on purpose), so a line of this in a normal run means the landing rule has
-				// regressed and the report is worth more than the noise.
-				UE_LOG(LogTraceGame, Warning,
-					TEXT("[ModeBTurnover] MID-AIR TURNOVER: possession changed while the Core was still ")
-					TEXT("travelling at %.0f uu/s and only %.1f deg off the surface (normal %s) - spec v13 ")
-					TEXT("§8 says this must not happen. Landing rule = %s."),
-					ArrivalSpeed, ArrivalDegrees, *SurfaceNormal.ToCompactString(),
-					(!TraceModeBLegacyLandingRule())
-						? TEXT("v13 (an actual landing)") : TEXT("PRE-v13, DELIBERATELY ARMED"));
-			}
+			// SPEC v13 §8's numbers, captured HERE and not at the award. They describe how the Core met
+			// the surface, and a few frames later the live velocity answers a different question - see
+			// the header fields. Reading the fresh one would have quietly retired the §8 counter.
+			PendingTurnoverArrivalSpeed = ArrivalSpeed;
+			PendingTurnoverArrivalSin = ArrivalSin;
+			bPendingTurnoverByRestProbe = bLandedByRestProbe;
 
-			if (bLandedByRestProbe)
+			if (TraceModeBTurnoverLogEnabled())
 			{
-				// Counted only on a turnover that actually fired, and only when the AT-REST PROBE is
-				// what established it: this is the number that says the v7 probe caught a landing the
-				// v6 contact test had missed, i.e. how often the reported bug would have happened.
-				// Counting it where the probe runs instead would tick up every frame a Core sat
-				// somewhere no turnover was due, and the number would mean nothing.
-				++SurfaceStats.RestProbeRescues;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ModeBTurnover] LANDED at %s on frame %llu - holding possession for %.2fs so the ")
+					TEXT("ball is actually drawn on it before it changes hands (spec v19 §1.5)."),
+					*FVector(LooseLocation).ToCompactString(),
+					static_cast<uint64>(PendingTurnoverLandedFrame),
+					CVarModeBTurnoverSettleSeconds.GetValueOnAnyThread());
 			}
-			return;   // Possession changed (or the Core was reset). Touch nothing.
+		}
+
+		// Refreshed every frame contact continues, so the log names the surface the Core is on NOW
+		// rather than the first one it clipped on the way down.
+		PendingTurnoverSurfacePoint = SurfacePoint;
+		PendingTurnoverSurfaceNormal = SurfaceNormal;
+	}
+
+	if (bTurnoverRuleArmed && PendingTurnoverLandedServerTime >= 0.f)
+	{
+		// THE SETTLE. Trace.ModeB.GroundedTurnover 0 zeroes it, which is the pre-v19 build exactly and
+		// the arm the reproduction goes RED on.
+		const float SettleSeconds = TraceModeBLegacyGroundedRule()
+			? 0.f : FMath::Max(0.f, CVarModeBTurnoverSettleSeconds.GetValueOnAnyThread());
+
+		const float DwellSeconds = Now - PendingTurnoverLandedServerTime;
+		const int32 DwellFrames = static_cast<int32>(
+			FMath::Min<uint64>(GFrameCounter - PendingTurnoverLandedFrame, static_cast<uint64>(MAX_int32)));
+
+		// BOTH, and neither on its own. Seconds is what "visibly" means to a person. The FRAME clause
+		// is there for one specific case the clock cannot see: a hitching or slow-ticking server, where
+		// a single tick can be longer than the whole settle. On such a frame the time test passes with
+		// zero frames rendered - which is precisely the defect being fixed, arrived at by a different
+		// road. Requiring at least one elapsed frame closes it for any tick rate.
+		const bool bSettled = (SettleSeconds <= 0.f)
+			|| ((DwellSeconds >= SettleSeconds) && (DwellFrames >= 1));
+
+		// *** SPEC v19 §1.5's OTHER HEADLINE NUMBER: HOW HIGH WAS THE BALL WHEN POSSESSION CHANGED? ***
+		//
+		// Taken HERE - one line before the award - because that is the only instant the question is
+		// about, and because after ServerSurfaceTurnover returns the Core may already have been
+		// granted, scored and reset. Measured with the DRAWN radius (see MeasureVisibleSupportGap), so
+		// it is the gap a player could check on the screen.
+		//
+		// It is also a GATE and not only a report: a Core that bounced high off its landing must not be
+		// awarded at the top of the bounce just because the clock ran out. It comes down, and the award
+		// waits for it - later, lower, and where a player watching can see why.
+		FVector TurnoverSupportPoint = FVector::ZeroVector;
+		const double TurnoverGap = MeasureVisibleSupportGap(TurnoverSupportPoint);
+		const bool bOrbIsTouching = TraceModeBLegacyGroundedRule()
+			|| (TurnoverGap <= static_cast<double>(CVarModeBTurnoverContactSlack.GetValueOnAnyThread()));
+
+		if (bSettled && bOrbIsTouching)
+		{
+			// SPEC v13 §8's classification of the ARRIVAL, computed from the latched numbers.
+			//
+			// FAST **AND** SHALLOW, and both halves are load-bearing. A Core dropped straight onto the
+			// floor arrives at 1500 uu/s and has unambiguously landed, so speed alone would report the
+			// commonest correct turnover in the game as the bug; a Core resting on a crate is 400 uu up,
+			// so height alone would report spec v7 §4 as the bug. What the user described in v13 was a
+			// Core going PAST something - still travelling, and barely descending. That is the pair.
+			//
+			// Measured from the geometry of the event and NOT from the rule's verdict, so both arms of
+			// every A/B compute it identically and the counter can go red.
+			const double ArrivalDegrees = FMath::RadiansToDegrees(
+				FMath::Asin(FMath::Clamp(PendingTurnoverArrivalSin, -1.0, 1.0)));
+			const bool bStillFlying =
+				(PendingTurnoverArrivalSpeed > static_cast<double>(CVarModeBMidAirTurnoverSpeed.GetValueOnAnyThread()))
+				&& (ArrivalDegrees < static_cast<double>(CVarModeBMidAirTurnoverDegrees.GetValueOnAnyThread()));
+
+			// Read before the call: a turnover can grant, score and reset the field under us.
+			const bool bWasRestProbe = bPendingTurnoverByRestProbe;
+			const double AwardGap = TurnoverGap;
+
+			if (ServerSurfaceTurnover(PendingTurnoverSurfacePoint, PendingTurnoverSurfaceNormal))
+			{
+				(bStillFlying ? SurfaceStats.MidAirTurnovers : SurfaceStats.LandedTurnovers)++;
+				((AwardGap <= static_cast<double>(CVarModeBTurnoverContactSlack.GetValueOnAnyThread()))
+					? SurfaceStats.GroundedTurnovers : SurfaceStats.UngroundedTurnovers)++;
+				SurfaceStats.WorstTurnoverGapUU =
+					FMath::Max(SurfaceStats.WorstTurnoverGapUU, static_cast<float>(AwardGap));
+
+				// THE §1.5 COUNTERS. DwellFrames is how many rendered frames a player had the ball on
+				// screen in contact; zero is the reported bug and is what the pre-v19 arm produces for
+				// every single turnover.
+				((DwellFrames >= 1) ? SurfaceStats.SeenTurnovers : SurfaceStats.UnseenTurnovers)++;
+				SurfaceStats.FewestTurnoverContactFrames = (SurfaceStats.FewestTurnoverContactFrames < 0)
+					? DwellFrames : FMath::Min(SurfaceStats.FewestTurnoverContactFrames, DwellFrames);
+				SurfaceStats.ShortestTurnoverDwellSeconds = (SurfaceStats.ShortestTurnoverDwellSeconds < 0.f)
+					? DwellSeconds : FMath::Min(SurfaceStats.ShortestTurnoverDwellSeconds, DwellSeconds);
+
+				if (DwellFrames < 1)
+				{
+					// LOUD, and unconditionally: this is the v19 §1.5 report's own signature. On the
+					// shipped rule it is only reachable with Trace.ModeB.GroundedTurnover 0, so a line of
+					// this in a normal run means the settle has regressed.
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[ModeBTurnover] UNSEEN TURNOVER: possession changed on the SAME FRAME the Core ")
+						TEXT("landed, so no frame was ever drawn with the ball touching anything - spec v19 ")
+						TEXT("§1.5 says this must not happen. Grounded rule = %s."),
+						(!TraceModeBLegacyGroundedRule())
+							? TEXT("v19 (settle then award)") : TEXT("PRE-v19, DELIBERATELY ARMED"));
+				}
+
+				if (AwardGap > static_cast<double>(CVarModeBTurnoverContactSlack.GetValueOnAnyThread()))
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[ModeBTurnover] UNGROUNDED TURNOVER: possession changed with the orb %.0f uu ")
+						TEXT("above whatever is under it (slack %.0f) - spec v19 §1.5 says the ball must ")
+						TEXT("visibly touch the ground or the top of an obstacle first. Grounded rule = %s."),
+						AwardGap, CVarModeBTurnoverContactSlack.GetValueOnAnyThread(),
+						(!TraceModeBLegacyGroundedRule())
+							? TEXT("v19 (the orb must be on it)") : TEXT("PRE-v19, DELIBERATELY ARMED"));
+				}
+
+				if (bStillFlying)
+				{
+					// LOUD, and unconditionally: this is the v13 bug's own signature. On the shipped rule
+					// it can only be reached with Trace.ModeB.LandingRule 0 (the A/B arm that restores the
+					// pre-v13 behaviour on purpose), so a line of this in a normal run means the landing
+					// rule has regressed and the report is worth more than the noise.
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[ModeBTurnover] MID-AIR TURNOVER: possession changed while the Core was still ")
+						TEXT("travelling at %.0f uu/s and only %.1f deg off the surface - spec v13 §8 says ")
+						TEXT("this must not happen. Landing rule = %s."),
+						PendingTurnoverArrivalSpeed, ArrivalDegrees,
+						(!TraceModeBLegacyLandingRule())
+							? TEXT("v13 (an actual landing)") : TEXT("PRE-v13, DELIBERATELY ARMED"));
+				}
+
+				if (bWasRestProbe)
+				{
+					// Counted only on a turnover that actually fired, and only when the AT-REST PROBE is
+					// what established it: this is the number that says the v7 probe caught a landing the
+					// v6 contact test had missed, i.e. how often the reported bug would have happened.
+					// Counting it where the probe runs instead would tick up every frame a Core sat
+					// somewhere no turnover was due, and the number would mean nothing.
+					++SurfaceStats.RestProbeRescues;
+				}
+				return;   // Possession changed (or the Core was reset). Touch nothing.
+			}
 		}
 	}
 
 	// --- 3. First contact takes it. ---------------------------------------------------------------
-	if (ServerTryLoosePickup())
+	//
+	// NOT WHILE A LANDING IS PENDING. "A throw that comes down is a turnover, full stop" is the rule
+	// §2b is built around, and it is enforced by running ahead of this poll; the v19 §1.5 settle would
+	// have opened a window in which the throwing team could jog over and reclaim their own bad throw,
+	// which is the v4 behaviour spec v6 §4.2 deleted. The settle moves WHEN possession changes, and it
+	// must not change WHO it changes to.
+	if (PendingTurnoverLandedServerTime < 0.f && ServerTryLoosePickup())
 	{
 		return;
 	}
@@ -5958,6 +6313,50 @@ bool ATraceCore::ServerProbeRestingSurface(FVector& OutPoint, FVector& OutNormal
 	return true;
 }
 
+double ATraceCore::MeasureVisibleSupportGap(FVector& OutSupportPoint) const
+{
+	const UWorld* World = GetWorld();
+	const double ProbeDepth =
+		FMath::Max(1.0, static_cast<double>(CVarModeBTurnoverContactProbe.GetValueOnAnyThread()));
+
+	if (World == nullptr)
+	{
+		return ProbeDepth;
+	}
+
+	// THE DRAWN RADIUS, NOT THE SWEPT ONE. See TraceModeBVisibleOrbRadius: the collision sphere is
+	// larger than the ball, so measuring with it would report "touching" 2 uu before a player agrees,
+	// and this whole rule exists because the user is reporting what they can SEE.
+	const FVector From = LooseLocation;
+	const FVector To = From - FVector(0.0, 0.0, ProbeDepth);
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreSupportGap), /*bTraceComplex=*/false, this);
+	Params.AddIgnoredActor(this);
+
+	FHitResult Hit;
+	const bool bHit = World->SweepSingleByChannel(
+		Hit, From, To, FQuat::Identity, ECC_WorldStatic,
+		FCollisionShape::MakeSphere(static_cast<float>(TraceModeBVisibleOrbRadius)), Params);
+
+	if (!bHit)
+	{
+		// Nothing at all underneath within the probe. The strongest possible "this is mid-air", and
+		// returning the full depth rather than a sentinel keeps the tallies' Max() honest.
+		return ProbeDepth;
+	}
+
+	OutSupportPoint = Hit.bStartPenetrating ? Hit.Location : Hit.ImpactPoint;
+
+	// A probe that starts already overlapping is a ball buried in the surface. That is touching by
+	// any reading, and Hit.Distance is 0 for it anyway; stated rather than relied on.
+	if (Hit.bStartPenetrating)
+	{
+		return 0.0;
+	}
+
+	return FMath::Max(0.0, static_cast<double>(Hit.Distance));
+}
+
 bool ATraceCore::ServerSurfaceTurnover(const FVector& SurfacePoint, const FVector& SurfaceNormal)
 {
 	// SPEC v6 §4.2, GENERALISED BY v7 §4. "When a team has possession of the core, throws it, and it
@@ -6196,11 +6595,23 @@ void ATraceCore::ClearLooseState()
 	CatchZoneTarget = nullptr;
 	bCatchZoneContested = false;   // Spec v13 §5: a new flight starts its own contest.
 	LastContactServerTime = -1.f;  // Spec v13 §8: and its own contact history.
+	ClearPendingTurnover();        // Spec v19 §1.5: and its own landing.
 	LooseVelocity = FVector::ZeroVector;
 	LooseThrower = nullptr;
 	LooseStartServerTime = 0.f;
 	// LooseFromTeam is deliberately NOT cleared here: TakeLooseCore reads it immediately afterwards
 	// to decide the grace, and KickoffTo/GrantTo overwrite it on the next possession.
+}
+
+void ATraceCore::ClearPendingTurnover()
+{
+	PendingTurnoverLandedServerTime = -1.f;
+	PendingTurnoverLandedFrame = 0;
+	PendingTurnoverSurfacePoint = FVector::ZeroVector;
+	PendingTurnoverSurfaceNormal = FVector::UpVector;
+	PendingTurnoverArrivalSpeed = 0.0;
+	PendingTurnoverArrivalSin = 1.0;
+	bPendingTurnoverByRestProbe = false;
 }
 
 void ATraceCore::ResetLooseCore(const TCHAR* Reason)
@@ -6285,6 +6696,8 @@ bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelo
 	// that step would silently stop testing the timer and start testing the turnover.
 	bLooseFromThrow = bAsThrow;
 	CatchZoneTarget = nullptr;
+	LastContactServerTime = -1.f;
+	ClearPendingTurnover();   // Spec v19 §1.5: as the real throw above.
 	LooseFromTeam = FromTeam;
 	LooseThrower = nullptr;
 	LooseStartServerTime = GetServerTimeSeconds();
@@ -6521,10 +6934,33 @@ void ATraceCore::TickModeBVerification()
 
 			if (bTimedOut)
 			{
+				// RE-FIRE RATHER THAN FAIL, up to a few times, and this is a correction to the harness
+				// rather than a leniency. [DIAGNOSED] from three runs of its own log: the shot is fired
+				// across open pitch with ten bots playing on it, and what actually happens on a failing
+				// run is that a bot standing in the corridor INTERCEPTS the Core 0.09s after launch —
+				// the catch-zone magnet even curves it into them — so the step never tests the wall at
+				// all. It then reports the WALL RULE broken on the strength of where a bot was standing.
+				//
+				// It surfaced this pass because spec v19 §1.5's settle moves step 8's turnover 0.15s
+				// later, which reshuffles where everybody is when step 9 fires; the underlying weakness
+				// is older than that and was passing by luck. A retry makes the step measure the thing
+				// it names. When the retries run out it still FAILS, loudly, and says which it was.
+				if (VerifyWallShotRetriesLeft > 0)
+				{
+					--VerifyWallShotRetriesLeft;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ModeBVerify] step 9: the shot never reached the wall (a bot took it, or it was ")
+						TEXT("reset) - RE-FIRING, %d attempt(s) left."),
+						VerifyWallShotRetriesLeft);
+
+					VerifyStepDeadline = 0.f;
+					return;   // VerifyStep is unchanged, so the launcher below fires it again.
+				}
+
 				++VerifyFailCount;
 				UE_LOG(LogTraceGame, Warning,
-					TEXT("[ModeBVerify] step 9 FAIL: the Core never struck the wall (loose=%d, at rest=%d, ")
-					TEXT("at %s, turnovers %d -> %d)."),
+					TEXT("[ModeBVerify] step 9 FAIL: the Core never struck the wall in any attempt (loose=%d, ")
+					TEXT("at rest=%d, at %s, turnovers %d -> %d)."),
 					bLoose ? 1 : 0, bLooseAtRest ? 1 : 0, *FVector(LooseLocation).ToCompactString(),
 					VerifyTurnoversAtStart, TurnoversNow);
 
@@ -7233,6 +7669,14 @@ void ATraceCore::TickModeBVerification()
 		bVerifyAwaitingTake = false;
 		bVerifyTakeSeen = false;
 
+		// Only on the FIRST attempt: a retry must not top its own allowance back up, or a step that can
+		// never reach the wall would retry forever instead of failing.
+		if (VerifyWallShotRetriesLeft <= 0 && !bVerifyWallShotFiredOnce)
+		{
+			bVerifyWallShotFiredOnce = true;
+			VerifyWallShotRetriesLeft = 3;
+		}
+
 		if (!DebugLaunchLoose(Start, LaunchVelocity, FromTeam, /*bAsThrow=*/true))
 		{
 			++VerifyFailCount;
@@ -7556,16 +8000,27 @@ void ATraceCore::TickTurnoverRepro()
 		TurnoverReproMidAirAtStart = SurfaceStats.MidAirTurnovers;
 		TurnoverReproLandedAtStart = SurfaceStats.LandedTurnovers;
 		TurnoverReproRejectedAtStart = SurfaceStats.GlancingContactsRejected;
+		TurnoverReproUnseenAtStart = SurfaceStats.UnseenTurnovers;
+		TurnoverReproSeenAtStart = SurfaceStats.SeenTurnovers;
+		TurnoverReproUngroundedAtStart = SurfaceStats.UngroundedTurnovers;
+		TurnoverReproGroundedAtStart = SurfaceStats.GroundedTurnovers;
+		SurfaceStats.FewestTurnoverContactFrames = -1;
+		SurfaceStats.ShortestTurnoverDwellSeconds = -1.f;
+		SurfaceStats.WorstTurnoverGapUU = 0.f;
 		TurnoverReproNextShotTime = Now + 1.f;
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[ModeBTurnoverRepro] ===== spec v13 §8: %d shots across the flat top at %s (the face ")
-			TEXT("runs %.0f uu along %s) | landing rule = %s | mid-air test: faster than %.0f uu/s AND ")
-			TEXT("shallower than %.0f deg ====="),
+			TEXT("[ModeBTurnoverRepro] ===== spec v13 §8 + v19 §1.5: %d shots across the flat top at %s ")
+			TEXT("(the face runs %.0f uu along %s) | landing rule = %s | grounded rule = %s (settle %.2fs, ")
+			TEXT("slack %.0f uu) | mid-air test: faster than %.0f uu/s AND shallower than %.0f deg ====="),
 			TurnoverReproShotsLeft, *TopPoint.ToCompactString(), Extent,
 			*GrazeDirection.ToCompactString(),
 			(!TraceModeBLegacyLandingRule())
 				? TEXT("v13 (an actual landing)") : TEXT("PRE-v13 (any upward normal) - THE BUG, ARMED"),
+			(!TraceModeBLegacyGroundedRule())
+				? TEXT("v19 (settle, then award)") : TEXT("PRE-v19 (award on the contact frame) - THE BUG, ARMED"),
+			TraceModeBLegacyGroundedRule() ? 0.f : CVarModeBTurnoverSettleSeconds.GetValueOnAnyThread(),
+			CVarModeBTurnoverContactSlack.GetValueOnAnyThread(),
 			CVarModeBMidAirTurnoverSpeed.GetValueOnAnyThread(),
 			CVarModeBMidAirTurnoverDegrees.GetValueOnAnyThread());
 		return;
@@ -7592,23 +8047,43 @@ void ATraceCore::TickTurnoverRepro()
 		const int32 Landed = SurfaceStats.LandedTurnovers - TurnoverReproLandedAtStart;
 		const int32 Rejected = SurfaceStats.GlancingContactsRejected - TurnoverReproRejectedAtStart;
 
-		// TWO CLAUSES, and the second is what stops this from being a harness that passes by doing
-		// nothing. Zero mid-air turnovers is trivially achievable by never turning the Core over at
-		// all, which would be a far worse bug than the one under repair, so the run must ALSO show
-		// ordinary landings still handing possession over.
+		// SPEC v19 §1.5's half of the same run.
+		const int32 Unseen = SurfaceStats.UnseenTurnovers - TurnoverReproUnseenAtStart;
+		const int32 Seen = SurfaceStats.SeenTurnovers - TurnoverReproSeenAtStart;
+		const int32 Ungrounded = SurfaceStats.UngroundedTurnovers - TurnoverReproUngroundedAtStart;
+		const int32 Grounded = SurfaceStats.GroundedTurnovers - TurnoverReproGroundedAtStart;
+
+		// FOUR CLAUSES, and the two "> 0" ones are what stop this from being a harness that passes by
+		// doing nothing. Zero mid-air and zero unseen turnovers are both trivially achievable by never
+		// turning the Core over at all, which would be a far worse bug than the ones under repair, so
+		// the run must ALSO show ordinary landings still handing possession over — and, since v19,
+		// show that those landings were WATCHED.
 		const bool bNoMidAir = (MidAir == 0);
 		const bool bStillTurningOver = (Landed > 0);
-		const bool bPass = bNoMidAir && bStillTurningOver;
+		const bool bNoneUnseen = (Unseen == 0);
+		const bool bNoneUngrounded = (Ungrounded == 0);
+		const bool bSomeWereSeen = (Seen > 0);
+		const bool bPass = bNoMidAir && bStillTurningOver && bNoneUnseen && bNoneUngrounded && bSomeWereSeen;
 
 		const FString Detail = FString::Printf(
 			TEXT("%d shots (%d grazes across the top, %d drops onto the floor, %d skipped) | MID-AIR ")
 			TEXT("TURNOVERS %d (must be 0) | landed turnovers %d (must be > 0, or the fix has simply ")
-			TEXT("switched the rule off) | glancing contacts refused a landing %d | landing rule = %s"),
+			TEXT("switched the rule off) | glancing contacts refused a landing %d | landing rule = %s ")
+			TEXT("|| v19 §1.5: UNSEEN TURNOVERS %d (must be 0 - fired on the same frame the ball landed, ")
+			TEXT("so nobody could see it touch) | SEEN turnovers %d (must be > 0) | UNGROUNDED turnovers ")
+			TEXT("%d (must be 0) | grounded %d | fewest frames of contact behind any turnover %d | ")
+			TEXT("shortest hold %.3fs | worst gap under any turnover %.0f uu | grounded rule = %s"),
 			TurnoverReproGrazeShots + TurnoverReproDropShots,
 			TurnoverReproGrazeShots, TurnoverReproDropShots, TurnoverReproSkipped,
 			MidAir, Landed, Rejected,
 			(!TraceModeBLegacyLandingRule())
-				? TEXT("v13 (an actual landing)") : TEXT("PRE-v13 (any upward normal) - THE BUG, ARMED"));
+				? TEXT("v13 (an actual landing)") : TEXT("PRE-v13 (any upward normal) - THE BUG, ARMED"),
+			Unseen, Seen, Ungrounded, Grounded,
+			SurfaceStats.FewestTurnoverContactFrames, SurfaceStats.ShortestTurnoverDwellSeconds,
+			SurfaceStats.WorstTurnoverGapUU,
+			(!TraceModeBLegacyGroundedRule())
+				? TEXT("v19 (settle, then award)")
+				: TEXT("PRE-v19 (award on the contact frame) - THE BUG, ARMED"));
 
 		if (bPass)
 		{

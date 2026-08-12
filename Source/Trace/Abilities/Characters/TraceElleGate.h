@@ -192,6 +192,16 @@ public:
 	bool IsInsideMouth(const ATraceCharacter* Candidate) const;
 
 	/**
+	 * How many ring beads this machine has actually built, and 0 on a machine that draws nothing.
+	 *
+	 * "The gate exists" and "the gate is visible" are DIFFERENT FACTS and Demo 17 is what taught us to
+	 * separate them: the user's report was "isn't opening a portal", which is a statement about what
+	 * they SAW, and a harness that only asserts the actor exists cannot tell that apart from a mouth
+	 * nobody can find. Trace.Elle.SnapPressTest prints it for every gate it places.
+	 */
+	int32 GetDrawnBeadCount() const;
+
+	/**
 	 * The effect class an entry by @p Candidate is asked about, and the ONE decision that makes the
 	 * founding invariant work. Public so a harness can print it rather than infer it.
 	 *
@@ -259,6 +269,9 @@ private:
 	/** Drops lockout entries whose pawn has gone, so the map cannot grow across a long pair. */
 	void PruneLockouts();
 
+	/** Marks @p Candidate as already standing in this mouth, so only a fresh ENTRY can fire it. */
+	void MarkAlreadyInside(ATraceCharacter* Candidate);
+
 	/** Cosmetic half. Builds the rings once the replicated mouth has arrived. */
 	void BuildRingsIfNeeded();
 
@@ -271,11 +284,29 @@ private:
 	/**
 	 * Who may not be taken again yet, and until when (absolute match time).
 	 *
-	 * WITHOUT THIS THE ABILITY IS A TRAP, NOT A PORTAL: you arrive standing inside the far mouth,
-	 * which sends you straight back, forever. UTraceSettings::ElleSnapTeleportLockoutSeconds is
-	 * therefore documented with 0 as its RED ARM rather than as a legitimate setting.
+	 * A BACKSTOP SINCE DEMO 17, NOT THE MECHANISM. The rule that keeps the pair from being a trap is
+	 * now the step-in EDGE below (InsideLastLook): an arrival is not an entry, so the far mouth does
+	 * not send you back at all. This still covers the fast in-out-in case, where a player really did
+	 * leave and really did step in again inside a second.
 	 */
 	TMap<TWeakObjectPtr<ATraceCharacter>, float> LockoutUntilMatchTime;
+
+	/**
+	 * DEMO 17 item 1. Who was standing in this mouth when it was last looked at.
+	 *
+	 * *** A GATE TAKES YOU WHEN YOU STEP IN, NOT WHILE YOU STAND IN IT. *** Entry used to be a pure
+	 * proximity poll with a 1 s lockout in front of it, which meant a player who simply stood still
+	 * near one of the mouths was thrown to the other one EVERY SECOND for the pair's whole 8 s life —
+	 * measured at seven teleports in seven seconds on a stationary Elle standing in the mouth she had
+	 * just placed. That is not a portal doing nothing, it is a portal doing something awful, and it
+	 * reads to a player exactly as "the ability doesn't work".
+	 *
+	 * So the rule is an EDGE: outside on the previous look, inside now. Arriving through the partner
+	 * seeds the destination's set (you did not step into the far mouth, you were put there), and
+	 * PairWith seeds both, because Elle is by construction stood in the second mouth as she places it.
+	 * The lockout above survives as a backstop for a player who sprints out and straight back in.
+	 */
+	TSet<TWeakObjectPtr<ATraceCharacter>> InsideLastLook;
 
 	bool bRingsBuilt = false;
 

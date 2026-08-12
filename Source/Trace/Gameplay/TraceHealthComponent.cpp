@@ -4,6 +4,8 @@
 
 #include "Net/UnrealNetwork.h"
 
+#include "Abilities/TraceAbilityTypes.h"   // spec v19 §3: TraceAbilityTraits — Lily's 60 health
+
 #include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Containers/Ticker.h"             // FTSTicker — the per-frame driver for the self-test
@@ -347,6 +349,22 @@ bool UTraceHealthComponent::HasAuthority() const
 
 float UTraceHealthComponent::GetMaxHealth() const
 {
+	// SPEC v19 §3 — LILY'S 60 HEALTH, AS AN ABSOLUTE AND NOT AS A FRACTION.
+	//
+	// Zero means "this character has no opinion, use the shared number", which is every character but
+	// Lily. It is an absolute because the spec states one: a fraction of a retuned MaxHealth would
+	// silently stop being 60 the first time somebody moved the global, and "Lily has 60 health" would
+	// quietly become a lie in a file nobody thought to re-read.
+	//
+	// Read live and on every call, exactly like the shared number below it, so that the value the
+	// health bar divides by, the value a heal clamps to and the value the server enforces cannot
+	// disagree — and so a character SWITCH in the practice range takes effect immediately.
+	const float Override = TraceAbilityTraits::GetMaxHealthOverride(GetOwner());
+	if (Override > 0.f)
+	{
+		return FMath::Max(1.f, Override);
+	}
+
 	return FMath::Max(1.f, UTraceSettings::Get().MaxHealth);
 }
 
@@ -833,6 +851,20 @@ void UTraceHealthComponent::BroadcastDeath(AController* Instigator, FName Cause)
 		return;
 	}
 	bDeathBroadcast = 1;
+
+	// SPEC v19 §4.2, the health slice's one line of it: "Death wipes active abilities and statuses."
+	//
+	// X's vulnerable mark is a STATUS and it lives here rather than on the ability set (see the block
+	// at the top of the header for why), so this is the only place that can end it at the moment of
+	// death. ResetHealth() already cleared it on the way BACK, which covers the respawned pawn; what
+	// that could not cover is the corpse, which keeps its replicated mark — and therefore its marker
+	// on every client's screen — for the whole respawn delay. A dead player is not "vulnerable"; they
+	// are dead.
+	//
+	// NOT A COOLDOWN, so the rule restated in the same paragraph is untouched: the mark is a 2 s
+	// tactical state on a body, and the ability that applies it keeps counting down on X's own
+	// PlayerState exactly as before.
+	ClearVulnerable();
 
 	UE_LOG(LogTraceGame, Log, TEXT("[%s] died (cause '%s', killer '%s')"),
 		*GetNameSafe(GetOwner()), *Cause.ToString(), *GetNameSafe(Instigator));

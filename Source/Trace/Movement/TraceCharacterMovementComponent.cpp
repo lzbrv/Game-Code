@@ -639,7 +639,16 @@ bool UTraceCharacterMovementComponent::CanCrouchInCurrentState() const
 
 float UTraceCharacterMovementComponent::GetDashSpeed() const
 {
-	return FMath::Max(1.f, UTraceSettings::Get().DashSpeed);
+	// SPEC v19 §3 — THE PER-CHARACTER DASH REACH, APPLIED TO SPEED AND NOT TO DURATION.
+	//
+	// Mortimer's passive is "his dash is much shorter than everybody else's". Reach is speed x
+	// duration, and only ONE of those two may move: the duration is what the dash trail's length,
+	// the parry window and the i-frames are all measured against, so scaling it would quietly retune
+	// three unrelated systems. Scaling the speed moves the reach and nothing else.
+	//
+	// The trait is 1.0 for every other character and for any pawn without an ability component, so
+	// this line is arithmetically identity for the other nine and cannot drift away from them.
+	return FMath::Max(1.f, UTraceSettings::Get().DashSpeed * TraceAbilityTraits::GetDashDistanceScale(CharacterOwner));
 }
 
 float UTraceCharacterMovementComponent::GetDashDuration() const
@@ -1406,7 +1415,17 @@ int32 UTraceCharacterMovementComponent::GetMaxDashCharges() const
 		Max += FMath::Max(0, Settings.CarrierExtraDashCharges);
 	}
 
-	return Max;
+	// SPEC v19 §3 — LILY'S EXTRA DASH CHARGE, AS AN ADDEND AND NOT AS A TOTAL.
+	//
+	// "2 normally, 3 while carrying the Core" is exactly +1 on top of the shipped 1 / 2, so it is
+	// written as +1 rather than as the numbers 2 and 3. A future retune of BaseDashCharges or
+	// CarrierExtraDashCharges therefore still moves her WITH everybody else instead of leaving her
+	// pinned at a pair of literals nobody remembers to update.
+	//
+	// 0 for every other character, so this line is identity for the other nine.
+	Max += TraceAbilityTraits::GetExtraDashCharges(CharacterOwner);
+
+	return FMath::Max(1, Max);
 }
 
 bool UTraceCharacterMovementComponent::RefundDashCharge()
@@ -2618,7 +2637,19 @@ bool UTraceCharacterMovementComponent::TryWallJump()
 		LaunchDirection = Normal;
 	}
 
-	FVector Launch = LaunchDirection * (EntrySpeed * GetWallJumpSpeedRetention()) + Normal * GetWallJumpOutwardImpulse();
+	// SPEC v19 §3 — LILY'S WALL-JUMP BONUS TOUCHES THE RETENTION TERM AND NOTHING ELSE.
+	//
+	// The scale multiplies ONLY the speed the wall hands back (EntrySpeed x retention). It is
+	// deliberately kept off the flat outward impulse and off the vertical multiplier below, because
+	// those two are the global feel of a wall jump — how far it shoves you off the face and how high
+	// it throws you — and §3 says her bonus is hers alone, the global numbers must not move.
+	//
+	// Written as a per-pawn query rather than as an edit to WallJumpSpeedRetention for that reason:
+	// the shipped knob keeps meaning what it says for the other nine, who get 1.0 here.
+	const float WallJumpRetention =
+		GetWallJumpSpeedRetention() * TraceAbilityTraits::GetWallJumpMomentumScale(CharacterOwner);
+
+	FVector Launch = LaunchDirection * (EntrySpeed * WallJumpRetention) + Normal * GetWallJumpOutwardImpulse();
 
 	// --- AND IT MAY NOT BEAT THE AIR-STRAFE CEILING (spec v5 §1) ----------------------------------
 	//

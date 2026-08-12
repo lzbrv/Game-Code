@@ -1,4 +1,4 @@
-// Trace — the eight characters, as DATA.
+// Trace — the ten characters, as DATA.
 //
 // Spec v14 §3 asks for a select screen that shows "each one's movement, passive and activated
 // ability so a player can choose meaningfully". That means the prose is a shipped asset, not
@@ -9,9 +9,9 @@
 // UI/TraceMatchOptions.h: this header is included by the game mode, the player state and the HUD, so
 // keeping UnrealHeaderTool out of it keeps the include free.
 //
-// *** THE ID SPACE IS ETraceCharacterId's (spec v14 §5, EXTENDED BY SPEC v18 §2). ***
+// *** THE ID SPACE IS ETraceCharacterId's (spec v14 §5, EXTENDED BY v18 §2 AND v19 §3). ***
 //     None = 0, Rocco = 1, Chut = 2, Mace = 3, Oyster = 4, X = 5,
-//     Roxie = 6, Elle = 7, Slimeball = 8
+//     Roxie = 6, Elle = 7, Slimeball = 8, Mortimer = 9, Lily = 10
 // Every id in this project — the replicated byte on ATracePlayerState, the argument to
 // UTraceAbilityComponent::ServerSetCharacter, the number a console command takes — is that value.
 // This file stores it as a uint8 rather than as the enum ONLY so that the character-select slice
@@ -19,10 +19,10 @@
 // number and the static_asserts at the top of TraceCharacterRoster.cpp are where that agreement is asserted
 // once the enum exists. Do not introduce a second numbering.
 //
-// SPEC v18 §2 TOOK THE ROSTER FROM FIVE TO EIGHT. Nothing in the shape of this file changed — still
-// one table, still in id order, still Count entries — which is the reason the change was three
-// constants and three rows rather than a migration. Per-team uniqueness still holds; with 5 players
-// a side and 8 characters there is now slack, and that is fine.
+// SPEC v18 §2 TOOK THE ROSTER FROM FIVE TO EIGHT and SPEC v19 §3 TOOK IT TO TEN. Nothing in the shape
+// of this file changed — still one table, still in id order, still Count entries — which is the reason
+// each change was three constants and some rows rather than a migration. Per-team uniqueness still
+// holds; with 5 players a side and 10 characters there is comfortable slack, and that is fine.
 
 #pragma once
 
@@ -45,10 +45,11 @@ namespace TraceCharacterRoster
 	inline constexpr uint8 FirstId = 1;
 
 	/**
-	 * ETraceCharacterId::Slimeball — the LAST character, whichever one that currently is.
+	 * ETraceCharacterId::Lily — the LAST character, whichever one that currently is.
 	 *
 	 * *** THIS IS THE CONSTANT THAT MOVES EVERY TIME A CHARACTER IS ADDED. *** It was 5 (X) until
-	 * spec v18 §2 appended Roxie, Elle and Slimeball. Everything that walks the roster walks
+	 * spec v18 §2 appended Roxie, Elle and Slimeball, and 8 until spec v19 §3 appended Mortimer and
+	 * Lily. Everything that walks the roster walks
 	 * FirstId..LastId — the select screen, the asset loader, Trace.VerifyCharacterData, the player
 	 * state's RPC validation — so leaving it behind does not produce a small bug, it produces a
 	 * character nobody can pick and an asset table that is silently one row short (and therefore, by
@@ -57,10 +58,10 @@ namespace TraceCharacterRoster
 	 * The static_asserts at the top of TraceCharacterRoster.cpp turn exactly that mistake into a
 	 * compile error. Do not delete them.
 	 */
-	inline constexpr uint8 LastId = 8;
+	inline constexpr uint8 LastId = 10;
 
-	/** Selectable characters. NOT the size of the enum — None is not selectable. 5 -> 8 in v18 §2. */
-	inline constexpr int32 Count = 8;
+	/** Selectable characters. NOT the size of the enum — None is not selectable. 8 -> 10 in v19 §3. */
+	inline constexpr int32 Count = 10;
 
 	/**
 	 * One character's shipped description.
@@ -101,8 +102,8 @@ namespace TraceCharacterRoster
 	};
 
 	/**
-	 * The table, in the doc's order: Rocco, Chut, Mace, Oyster, X, Roxie, Elle, Slimeball. Always
-	 * Count entries.
+	 * The table, in the doc's order: Rocco, Chut, Mace, Oyster, X, Roxie, Elle, Slimeball, Mortimer,
+	 * Lily. Always Count entries.
 	 *
 	 * *** SINCE SPEC v17 §5 THIS MAY BE SERVED FROM ASSETS. *** See the "TWO SOURCES" block at the
 	 * bottom of this header. Nothing about the shape changed: still Count entries, still in id
@@ -153,7 +154,7 @@ namespace TraceCharacterRoster
 		/** The table compiled into TraceCharacterRoster.cpp. Always available. */
 		CppTable = 0,
 
-		/** The five UTraceCharacterDefinition assets. */
+		/** The Count UTraceCharacterDefinition assets, all of them or none. */
 		Assets = 1
 	};
 

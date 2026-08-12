@@ -40,6 +40,14 @@ static TAutoConsoleVariable<int32> CVarSlimeballWallStick(
 	     "is accepted and does nothing, so he falls past the wall and every stick assertion must go red."),
 	ECVF_Cheat);
 
+static TAutoConsoleVariable<int32> CVarSlimeballStickJumpCancel(
+	TEXT("Trace.Slimeball.StickJumpCancel"),
+	1,
+	TEXT("Dev/red arm for DEMO 17 item 2. 1 (default) = jump cancels the wall stick and wall-jumps him off "
+	     "the face. 0 = the pre-Demo-17 behaviour: the press is ignored while stuck, so the stick is a "
+	     "commitment with no exit and Trace.Slimeball.WallJumpTest must go red. Never ship 0."),
+	ECVF_Cheat);
+
 static TAutoConsoleVariable<int32> CVarSlimeballStuckPassive(
 	TEXT("Trace.Slimeball.StuckPassive"),
 	1,
@@ -121,6 +129,11 @@ void UTraceAbilitySetSlimeball::OnPawnSpawned()
 	// player may spawn with an ability timer still counting down.
 	StopStick(TEXT("new pawn"));
 
+	// A fresh pawn is standing on a spawn pad, so the anti-ladder count starts at zero like anybody
+	// else's. This is a POSITION fact, not a cooldown, which is why clearing it here does not conflict
+	// with §5's "cooldowns keep running through a death".
+	StickJumpsSinceGround = 0;
+
 	// bSecondaryHeld deliberately survives: a player who was holding V through their own death and
 	// respawn is still holding it, and the retry in TickAbilities will grab the first wall they jump
 	// into. Clearing it here would silently require them to let go and press again.
@@ -190,6 +203,17 @@ void UTraceAbilitySetSlimeball::TickAbilities(float DeltaSeconds)
 	if (!ShouldDriveMovement())
 	{
 		return;
+	}
+
+	// THE GROUND CLEARS THE ANTI-LADDER COUNT, exactly as it does for the movement component's own
+	// WallJumpsSinceGround. Checked before the stick branch so that landing while still holding V —
+	// which is the ordinary way a chain of these ends — hands the count back.
+	if (const UTraceCharacterMovementComponent* GroundCheck = GetMovement())
+	{
+		if (StickJumpsSinceGround != 0 && GroundCheck->IsMovingOnGround())
+		{
+			StickJumpsSinceGround = 0;
+		}
 	}
 
 	if (bStuck)
@@ -295,6 +319,110 @@ void UTraceAbilitySetSlimeball::OnSecondaryReleased()
 	{
 		StopStick(TEXT("V released"));
 	}
+}
+
+bool UTraceAbilitySetSlimeball::OnJumpPressed()
+{
+	// DEMO 17 item 2: "Slimeball should be able to cancel the wall stick with jump, and perform a wall
+	// jump off the wall." Off the wall this hook has no opinion and the ordinary jump runs.
+	if (!bStuck)
+	{
+		return false;
+	}
+
+	if (CVarSlimeballStickJumpCancel.GetValueOnAnyThread() == 0)
+	{
+		// RED ARM: the press is declined exactly as it was before Demo 17, so the stick is a commitment
+		// again and the jump key does nothing while he hangs there. Nothing else about the ability
+		// changes, which is what makes Trace.Slimeball.WallJumpTest's red half unambiguous.
+		return false;
+	}
+
+	ATraceCharacter* MyPawn = GetCharacter();
+	UTraceCharacterMovementComponent* MoveComp = GetMovement();
+	if (MyPawn == nullptr || MoveComp == nullptr)
+	{
+		return false;
+	}
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	// THE ANTI-LADDER CAP, against the SHIPPED number rather than a new one. See StickJumpsSinceGround:
+	// this launch bypasses the movement component's own WallJumpsSinceGround, so without this a stuck
+	// Slimeball could stick, jump, stick, jump up a single wall forever — the exact thing spec v8 §7's
+	// cap exists to refuse for everybody else.
+	const int32 MaxConsecutive = FMath::Max(1, Settings.WallJumpMaxConsecutive);
+	const bool bCapReached = (StickJumpsSinceGround >= MaxConsecutive);
+
+	const FVector Normal = StickWallNormal.GetSafeNormal();
+
+	// LET GO FIRST, ALWAYS, cap or no cap. "Cancel the wall stick with jump" is the half of the
+	// sentence that must never depend on anything: a press that refused to let go because he was one
+	// wall jump over the cap would leave him glued to a wall with the jump key doing nothing, which is
+	// worse than the commitment Demo 17 asked us to remove.
+	//
+	// StopStick charges the ordinary stick cooldown; the LONGER re-grab lockout below is what stops the
+	// 20 Hz re-stick sweep gluing him back onto the same face while V is still held.
+	StopStick(TEXT("jumped off the wall"));
+
+	const float Restick = FMath::Max(0.f, Settings.SlimeballWallJumpRestickLockoutSeconds);
+	StickReadyMatchTime = FMath::Max(StickReadyMatchTime, MatchTimeNow() + Restick);
+
+	if (!Settings.bSlimeballWallStickJumpLaunches || bCapReached || Normal.IsNearlyZero()
+		|| CVarSlimeballWallStick.GetValueOnAnyThread() == 0)
+	{
+		// He is off the wall and falling. Consumed anyway: the alternative is handing the press to
+		// ACharacter::Jump, which with no wall-jump window open would either be refused (nothing
+		// happens, and he has lost the stick for free) or — if a window happened to be open — fire a
+		// SECOND launch on top of the one he was just refused. Neither is a jump the player asked for.
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Slimeball] jump cancelled the stick without a launch (launchEnabled=%d capReached=%d "
+			     "consecutive=%d/%d)."),
+			Settings.bSlimeballWallStickJumpLaunches ? 1 : 0, bCapReached ? 1 : 0,
+			StickJumpsSinceGround, MaxConsecutive);
+		return true;
+	}
+
+	// --- THE LAUNCH, in the shipped wall jump's own numbers --------------------------------------
+	//
+	// A stuck pawn's planar velocity is zero (ApplyStick writes it there every tick), which is the case
+	// UTraceCharacterMovementComponent::TryWallJump describes as "pressed flat against the wall with no
+	// planar speed at all. The outward impulse is the whole launch in that case, which is what makes a
+	// standing wall jump an escape rather than a wasted press." The retention term is kept anyway and
+	// applied to whatever planar speed he does have, so a tuned-up SlimeballWallStickSlideSpeed or a
+	// future non-zero stick velocity cannot silently change the shape of this.
+	FVector Planar(MoveComp->Velocity.X, MoveComp->Velocity.Y, 0.f);
+	const float EntrySpeed = static_cast<float>(Planar.Size());
+	const float IntoWall = static_cast<float>(FVector::DotProduct(Planar, Normal));
+	if (IntoWall < 0.f)
+	{
+		Planar -= 2.f * IntoWall * Normal;      // reflect only what was heading into the face
+	}
+
+	FVector LaunchDirection = Planar;
+	if (!LaunchDirection.Normalize())
+	{
+		LaunchDirection = Normal;
+	}
+
+	const float Retention = FMath::Clamp(Settings.WallJumpSpeedRetention, 0.f, 1.f);
+	const float Outward = FMath::Max(0.f, Settings.WallJumpOutwardImpulse);
+	const FVector Launch = LaunchDirection * (EntrySpeed * Retention) + Normal * Outward;
+
+	MoveComp->Velocity.X = Launch.X;
+	MoveComp->Velocity.Y = Launch.Y;
+	MoveComp->Velocity.Z = MoveComp->JumpZVelocity * FMath::Max(0.f, Settings.WallJumpVerticalMultiplier);
+	MoveComp->SetMovementMode(MOVE_Falling);
+
+	++StickJumpsSinceGround;
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Slimeball] WALL JUMP off the stick: normal (%s), out %.0f uu/s, up %.0f uu/s (%d of %d before "
+		     "the ground resets it). He may not re-grab for %.2fs."),
+		*Normal.ToCompactString(), Outward, MoveComp->Velocity.Z,
+		StickJumpsSinceGround, MaxConsecutive, Restick);
+
+	return true;
 }
 
 void UTraceAbilitySetSlimeball::StartStick(const FVector& WallNormal)
@@ -2296,8 +2424,295 @@ namespace TraceSlimeballVerify
 	}
 
 	// =============================================================================================
+	// Trace.Slimeball.WallJumpTest — DEMO 17 item 2, two arms, RED first
+	//
+	// Verbatim: "Slimeball should be able to cancel the wall stick with jump, and perform a wall jump
+	// off the wall." Two claims, and they fail differently, so both are measured:
+	//
+	//   CANCEL   after the press he is no longer stuck. The RED arm
+	//            (Trace.Slimeball.StickJumpCancel 0) must show him still stuck, i.e. must reproduce the
+	//            commitment Demo 17 asked us to remove.
+	//   WALL JUMP  he leaves ALONG THE SURFACE NORMAL and upwards, rather than simply dropping.
+	//
+	// AND THE THIRD THING, WHICH IS THE ONE THAT COULD HURT SOMEBODY ELSE: half a second later he must
+	// still be off the wall. V is a HOLD, so a player who wall-jumps is by definition still holding it,
+	// and the 20 Hz re-stick sweep would otherwise glue him straight back on — which is wall-jump
+	// stickiness, the exact complaint spec v10 §5 removed for the whole roster. Setting
+	// SlimeballWallJumpRestickLockoutSeconds to 0 is what makes that assertion go red.
+	//
+	// The press is the REAL JUMP KEY, injected through the real input pipeline, so it exercises
+	// ATracePlayerController::OnJumpStarted -> UTraceAbilityComponent::HandleJumpPressed -> the hook.
+	// =============================================================================================
+
+	struct FWallJumpState
+	{
+		int32 Arm = 0;              // 0 = RED (Trace.Slimeball.StickJumpCancel 0), 1 = GREEN (shipped)
+		int32 Step = 0;
+		double Deadline = 0.0;
+		double StepStartReal = 0.0;
+
+		FVector StickLocation = FVector::ZeroVector;
+		FVector StickNormal = FVector::ZeroVector;
+
+		bool bWasStuckBeforeJump = false;
+		bool bStuckAfterJumpRed = false;
+		bool bStuckAfterJumpGreen = false;
+
+		/** Velocity along the wall normal, and Z, one beat after the press. Measured in BOTH arms. */
+		float OutwardAfterJump = 0.f;
+		float UpwardAfterJump = 0.f;
+		float RedOutwardAfterJump = 0.f;
+		float RedUpwardAfterJump = 0.f;
+
+		bool bStuckAgainHalfASecondLater = false;
+
+		FChecklist List;
+	};
+
+	void RunWallJumpTest()
+	{
+		UWorld* WorldPtr = FindAuthoritativeWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[SLIMEWJ] no authoritative game world — run this on the server."));
+			return;
+		}
+
+		TSharedPtr<FWallJumpState> State = MakeShared<FWallJumpState>();
+		State->List.Tag = TEXT("SLIMEWJ");
+		State->Deadline = FPlatformTime::Seconds() + 120.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SLIMEWJ] ===== DEMO 17 item 2: 'cancel the wall stick with jump, and perform a wall jump off "
+			     "the wall.' Arm 0 is RED (Trace.Slimeball.StickJumpCancel 0) and MUST leave him stuck. ====="));
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				RestoreAllArms();
+				return false;
+			}
+
+			const double NowReal = FPlatformTime::Seconds();
+
+			FString Why;
+			UTraceAbilitySetSlimeball* Slime = MakePlayerIntoSlimeball(TickWorld, Why);
+			ATraceCharacter* MyPawn = (Slime != nullptr) ? Slime->GetCharacter() : nullptr;
+			UTraceCharacterMovementComponent* MoveComp = (MyPawn != nullptr) ? MyPawn->GetTraceMovement() : nullptr;
+
+			if (Slime == nullptr || MyPawn == nullptr || MoveComp == nullptr)
+			{
+				if (NowReal > State->Deadline)
+				{
+					State->List.Invalidate(FString::Printf(TEXT("could not stage: %s"), *Why));
+					State->List.Report();
+					RestoreAllArms();
+					return false;
+				}
+				return true;
+			}
+
+			// ---- Step 0: put him on a wall and hold V --------------------------------------
+			if (State->Step == 0)
+			{
+				SetCVar(TEXT("Trace.Slimeball.StickJumpCancel"), State->Arm == 0 ? 0 : 1);
+
+				FVector Stand = FVector::ZeroVector;
+				FString StandWhy;
+				if (!FindWallStandpoint(TickWorld, MyPawn, Stand, StandWhy))
+				{
+					if (NowReal > State->Deadline)
+					{
+						State->List.Invalidate(FString::Printf(TEXT("no wall to test against: %s"), *StandWhy));
+						State->List.Report();
+						RestoreAllArms();
+						return false;
+					}
+					return true;
+				}
+
+				MyPawn->TeleportTo(Stand, MyPawn->GetActorRotation(), /*bIsATest*/ false, /*bNoCheck*/ true);
+				MoveComp->SetMovementMode(MOVE_Falling);
+				MoveComp->Velocity = FVector::ZeroVector;
+
+				Slime->OnSecondaryPressed();
+				State->Step = 1;
+				State->StepStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Step 1: wait for the stick to take ----------------------------------------
+			if (State->Step == 1)
+			{
+				if (!Slime->IsStuck())
+				{
+					if ((NowReal - State->StepStartReal) > 3.0)
+					{
+						State->List.Invalidate(TEXT("he never stuck to the wall at all, so there was nothing for "
+						                            "the jump to cancel. That is Trace.Slimeball.StickTest's "
+						                            "business, not this one's"));
+						State->List.Report();
+						RestoreAllArms();
+						return false;
+					}
+					return true;
+				}
+
+				State->bWasStuckBeforeJump = true;
+				State->StickLocation = MyPawn->GetActorLocation();
+
+				// The wall he is on, re-asked through the ability's own probe so the "outward" direction
+				// this test judges by is the same one the launch used.
+				FVector ProbePoint = FVector::ZeroVector;
+				FVector ProbeNormal = FVector::ZeroVector;
+				float ProbeDistance = 0.f;
+				FString ProbeWhy;
+				if (Slime->ProbeForWall(ProbePoint, ProbeNormal, ProbeDistance, ProbeWhy))
+				{
+					State->StickNormal = ProbeNormal.GetSafeNormal();
+				}
+
+				// THE REAL JUMP KEY, not the hook. Everything between the key and the ability — the bind,
+				// the controller's first-refusal call into HandleJumpPressed, the "a true return means the
+				// normal jump must NOT also run" rule — is only exercised this way.
+				if (APlayerController* LocalPC = TickWorld->GetFirstPlayerController())
+				{
+					LocalPC->ConsoleCommand(TEXT("Trace.SimInput SpaceBar 0.05"), /*bWriteToLog=*/false);
+				}
+
+				State->Step = 2;
+				State->StepStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Step 2: one beat after the press, read the launch -------------------------
+			if (State->Step == 2)
+			{
+				if ((NowReal - State->StepStartReal) < 0.20)
+				{
+					return true;
+				}
+
+				const bool bStuckNow = Slime->IsStuck();
+
+				// MEASURED IN BOTH ARMS, and that is the correction this harness needed. Its first
+				// version asserted only "the red arm leaves him stuck", which turned out not to be the
+				// whole of the old behaviour — a press refused by this hook still reaches
+				// ACharacter::Jump, and the movement layer's v10 §5 input BUFFER can spend it on a wall
+				// contact a frame or two later. So the honest red/green difference is not "does he come
+				// off the wall" but "is the press a WALL JUMP, reliably, in the frame it was made".
+				const FVector Velocity = MoveComp->Velocity;
+				const float Outward = State->StickNormal.IsNearlyZero()
+					? 0.f
+					: static_cast<float>(FVector::DotProduct(FVector(Velocity.X, Velocity.Y, 0.f), State->StickNormal));
+
+				if (State->Arm == 0)
+				{
+					State->bStuckAfterJumpRed = bStuckNow;
+					State->RedOutwardAfterJump = Outward;
+					State->RedUpwardAfterJump = static_cast<float>(Velocity.Z);
+				}
+				else
+				{
+					State->bStuckAfterJumpGreen = bStuckNow;
+					State->OutwardAfterJump = Outward;
+					State->UpwardAfterJump = static_cast<float>(Velocity.Z);
+				}
+
+				State->Step = 3;
+				State->StepStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Step 3: half a second later — is he glued back on? ------------------------
+			if (State->Step == 3)
+			{
+				if ((NowReal - State->StepStartReal) < 0.5)
+				{
+					return true;
+				}
+
+				if (State->Arm == 1)
+				{
+					State->bStuckAgainHalfASecondLater = Slime->IsStuck();
+				}
+
+				// V is released between arms so the second arm starts from the same clean state the
+				// first did — a held key surviving into the next arm would re-stick him during staging.
+				Slime->OnSecondaryReleased();
+
+				if (State->Arm == 0)
+				{
+					State->Arm = 1;
+					State->Step = 0;
+					State->Deadline = NowReal + 120.0;
+					return true;
+				}
+
+				// ---- verdict ----------------------------------------------------------------
+				const UTraceSettings& Knobs = UTraceSettings::Get();
+
+				// THE RED ARM IS JUDGED FIRST. With nothing falsified, a clean green says only that the
+				// code did not crash — this project has shipped that mistake twice.
+				const float LaunchFloor = Knobs.WallJumpOutwardImpulse * 0.5f;
+				const bool bRedLaunched = (State->RedOutwardAfterJump > LaunchFloor)
+					&& (State->RedUpwardAfterJump > 0.f);
+				if (bRedLaunched)
+				{
+					State->List.Invalidate(FString::Printf(
+						TEXT("the RED arm ALSO launched him (%.0f uu/s out, %.0f up), so the disarmed build and "
+						     "the shipped one are indistinguishable here and the green arm proves nothing"),
+						State->RedOutwardAfterJump, State->RedUpwardAfterJump));
+				}
+
+				State->List.Check(State->bWasStuckBeforeJump && !bRedLaunched,
+					TEXT("RED (Trace.Slimeball.StickJumpCancel 0): the press is NOT a wall jump"),
+					FString::Printf(TEXT("still stuck=%d, %.0f uu/s outward and %.0f up — a press that either does "
+					                     "nothing or drops him, which is the commitment Demo 17 reported"),
+						State->bStuckAfterJumpRed ? 1 : 0, State->RedOutwardAfterJump, State->RedUpwardAfterJump));
+
+				State->List.Check(!State->bStuckAfterJumpGreen,
+					TEXT("GREEN: JUMP CANCELS THE WALL STICK"),
+					FString::Printf(TEXT("stuck after the press = %d"), State->bStuckAfterJumpGreen ? 1 : 0));
+
+				State->List.Check(State->OutwardAfterJump > (Knobs.WallJumpOutwardImpulse * 0.5f),
+					TEXT("GREEN: ...and it is a WALL JUMP, not a drop — he leaves ALONG THE WALL NORMAL"),
+					FString::Printf(TEXT("%.0f uu/s outward against the shipped %.0f impulse"),
+						State->OutwardAfterJump, Knobs.WallJumpOutwardImpulse));
+
+				State->List.Check(State->UpwardAfterJump > 0.f,
+					TEXT("GREEN: ...and upwards"),
+					FString::Printf(TEXT("%.0f uu/s of Z, i.e. the jump x %.2f"),
+						State->UpwardAfterJump, Knobs.WallJumpVerticalMultiplier));
+
+				State->List.Check(!State->bStuckAgainHalfASecondLater,
+					TEXT("GREEN: he is STILL OFF the wall half a second later, with V still held"),
+					FString::Printf(TEXT("re-grab lockout %.2fs — 0 here is what resurrects wall-jump "
+					                     "stickiness for one character"),
+						Knobs.SlimeballWallJumpRestickLockoutSeconds));
+
+				State->List.Report();
+				RestoreAllArms();
+				return false;
+			}
+
+			return true;
+		}), 0.05f);
+	}
+
+	// =============================================================================================
 	// Registration
 	// =============================================================================================
+
+	FAutoConsoleCommand CmdSlimeballWallJumpTest(
+		TEXT("Trace.Slimeball.WallJumpTest"),
+		TEXT("DEMO 17 item 2, two arms RED first: stuck to a real wall, the REAL jump key must cancel the "
+		     "stick AND launch him off the face, and he must still be off it half a second later with V "
+		     "still held. Drives the local pawn — do not batch it with another test that drives pawns."),
+		FConsoleCommandDelegate::CreateStatic(&RunWallJumpTest));
 
 	FAutoConsoleCommand CmdSlimeballDump(
 		TEXT("Trace.Slimeball.Dump"),

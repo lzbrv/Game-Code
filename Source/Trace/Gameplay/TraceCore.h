@@ -480,8 +480,20 @@ public:
 	 * The HUD charge meter, the bots' "charge for distance" solver and the throw itself all call this,
 	 * for the same reason SteerTowardCatchPoint is shared: a second copy of the curve is a second
 	 * answer, and the one the player sees would be the copy.
+	 *
+	 * SPEC v19 §3 — @p Thrower EXTENDS THE CAP ON t, AND NOTHING ELSE ABOUT THE CURVE.
+	 *
+	 * Mortimer may usefully hold for TraceAbilityTraits::GetThrowChargeHoldScale() times as long as
+	 * anybody else, so his tCap is that much larger and the SAME line Power = Floor + (1 - Floor) * t
+	 * is simply extrapolated further along. He is not given a separate multiplier, a separate floor or
+	 * a separate curve — there is still exactly one curve in this game, which is the whole point of
+	 * this function existing.
+	 *
+	 * Defaults to nullptr = "no character opinion", which reproduces the shipped clamp exactly, so
+	 * every existing caller (the meter's floor probe, the diagnostics that measure the curve itself)
+	 * keeps measuring what it always did.
 	 */
-	static float GetThrowChargeScaleForHold(float HeldSeconds);
+	static float GetThrowChargeScaleForHold(float HeldSeconds, const AActor* Thrower = nullptr);
 
 	/** The inverse of the above: how long to hold for @p ChargeScale. Used by the bots. */
 	static float GetThrowHoldSecondsForScale(float ChargeScale);
@@ -604,6 +616,79 @@ public:
 
 		/** Every other turnover: the Core arrived on the surface or stopped on it. The intended outcome. */
 		int32 LandedTurnovers = 0;
+
+		// --- SPEC v19 §1.5 counters. Verification only, never a rule. --------------------------------
+		//
+		// Verbatim, with the user's own emphasis: "ENSURE the ball does not turnover until it actually
+		// visibly touches the ground or the top of an obstacle." That word is a re-report — v13 §8
+		// already fixed the GRAZE (a Core flying PAST a surface), and the sentence came back anyway. So
+		// the number this pass drives to zero is deliberately NOT another statement about the arrival:
+		// it is a statement about WHERE THE VISIBLE ORB WAS when possession changed.
+		//
+		// Measured by ATraceCore::MeasureVisibleSupportGap(): a sphere of the ORB'S RENDERED RADIUS,
+		// swept straight down from the Core's centre, answering "how far is the ball a player can see
+		// from the thing that is holding it up". Zero-ish means it is sitting on something. A large
+		// number means possession changed with clear air under the ball, which is the report.
+
+		/** Turnovers whose orb was within Trace.ModeB.TurnoverContactSlack of the surface below it. */
+		int32 GroundedTurnovers = 0;
+
+		/**
+		 * THE SPEC v19 §1.5 BUG'S OWN COUNTER: turnovers that fired with a VISIBLE GAP under the orb.
+		 *
+		 * MUST BE ZERO. Computed from the geometry of the event and not from the rule's verdict, so
+		 * both arms of the A/B compute it identically: Trace.ModeB.GroundedTurnover 0 removes the rule
+		 * and makes this climb, the shipped rule holds it at 0.
+		 */
+		int32 UngroundedTurnovers = 0;
+
+		/** Largest gap seen under any turnover, uu. The headline number of the §1.5 report. */
+		float WorstTurnoverGapUU = 0.f;
+
+		/**
+		 * Landings REFUSED by the §1.5 rule: an upward-facing contact the Core was not actually
+		 * resting on top of — the lip or corner of a block, where the depenetration normal points up
+		 * but there is nothing underneath. Before this pass every one of these was a turnover in
+		 * mid-air.
+		 */
+		int32 UngroundedLandingsRefused = 0;
+
+		// --- SPEC v19 §1.5, THE OTHER HALF: "VISIBLY" IS A STATEMENT ABOUT FRAMES. -------------------
+		//
+		// [DIAGNOSED] FROM THE SHIPPED BUILD'S OWN INSTRUMENT, before a line was changed. A
+		// Trace.ModeB.TurnoverRepro run with Trace.ModeB.TurnoverLog on prints, twelve times out of
+		// twelve, a CONTACT line and a SURFACE TURNOVER line CARRYING THE SAME FRAME NUMBER. The Core
+		// is moved onto the surface and handed to the enemy inside one tick, and rendering happens
+		// after the tick — so THE BALL IS NEVER DRAWN TOUCHING ANYTHING. The last frame a player sees
+		// it loose it is still in the air; the next frame it is in an enemy's hands.
+		//
+		// That is the sentence the user re-sent with ENSURE in capitals, and it is why the v13 §8 fix
+		// (which is still holding — 0 mid-air turnovers on the same run) did not close the report:
+		// every arrival test in the world is a question about the frame BEFORE the ball touches, and
+		// this one is about the frames AFTER.
+		//
+		// So the landing is now LATCHED and possession is held for Trace.ModeB.TurnoverSettleSeconds,
+		// during which the ball is drawn resting or bouncing where it fell. These two counters are the
+		// proof, and they measure the EVENT — how many frames of contact a player could actually have
+		// seen — rather than the rule's verdict, so both arms of the A/B compute them identically.
+
+		/**
+		 * *** THE §1.5 BUG'S OWN COUNTER. MUST BE ZERO. *** Turnovers that fired on the very frame the
+		 * landing was established, i.e. with zero rendered frames of the ball in contact.
+		 *
+		 * Trace.ModeB.GroundedTurnover 0 restores the pre-v19 behaviour exactly and makes this equal
+		 * the total. On the shipped rule it is 0.
+		 */
+		int32 UnseenTurnovers = 0;
+
+		/** Turnovers the player could actually watch land. The intended outcome; must be > 0. */
+		int32 SeenTurnovers = 0;
+
+		/** Fewest rendered frames of contact behind any turnover. -1 until a turnover has fired. */
+		int32 FewestTurnoverContactFrames = -1;
+
+		/** Shortest time any turnover was held for, seconds. -1 until a turnover has fired. */
+		float ShortestTurnoverDwellSeconds = -1.f;
 	};
 
 	static FSurfaceRuleStats SurfaceStats;
@@ -1188,11 +1273,47 @@ private:
 	 */
 	bool ServerProbeRestingSurface(FVector& OutPoint, FVector& OutNormal) const;
 
+	/**
+	 * SPEC v19 §1.5. How far the ORB A PLAYER CAN SEE is from whatever is holding it up, in uu.
+	 *
+	 * *** THIS IS THE MEASUREMENT THE SPEC ASKS FOR, AND IT IS NOT THE ONE THE RULE ALREADY HAD. ***
+	 * v7 §4 asks what the contact NORMAL was; v13 §8 asks how the Core ARRIVED. Both are questions
+	 * about an event, and both can be satisfied by a Core that is nowhere near the top of anything —
+	 * the case that survives them is a contact with the LIP OR CORNER of a block, where the sphere
+	 * sweep's depenetration normal points up (so it reads as a floor), the descent is steep (so it
+	 * reads as a landing), and the ball is beside the block with clear air underneath. Possession
+	 * changes; the player watches the Core carry on falling. That is "it turned over before it
+	 * touched", and no amount of extra angle tuning can see it, because the geometry it is wrong
+	 * about is BELOW the Core rather than in front of it.
+	 *
+	 * So this asks the player's question directly: sweep a sphere of the RENDERED orb radius (the
+	 * mesh is the 100 uu engine sphere at TraceCoreTuning::OrbScale, so 20 uu — deliberately NOT the
+	 * 22 uu collision radius, because the number that matters is the one the eye can check) straight
+	 * down from the Core's centre and return the distance it travelled before touching something.
+	 *
+	 * @param OutSupportPoint  where the support was found. Untouched when nothing was found.
+	 * @return 0 when the orb is already touching, the gap in uu when it is not, and
+	 *         Trace.ModeB.TurnoverContactProbe (the full probe length) when there is nothing under it
+	 *         at all — which is the strongest possible "this is mid-air" and sorts correctly as the
+	 *         worst case in the tallies.
+	 */
+	double MeasureVisibleSupportGap(FVector& OutSupportPoint) const;
+
 	/** Server, mode B. The guarded loose -> held transition. Sets the grace override, then grants. */
 	void TakeLooseCore(ATraceCharacter* Taker);
 
 	/** Clears every loose field. Does NOT grant: callers decide where the Core goes next. */
 	void ClearLooseState();
+
+	/**
+	 * SPEC v19 §1.5. Forgets any pending landing, so the next flight is awarded on its own clock.
+	 *
+	 * Called by ClearLooseState() (every path that ENDS a flight) and by both paths that START one —
+	 * the real throw and DebugLaunchLoose — because those two set the loose fields by hand rather than
+	 * through ClearLooseState, and a stale latch there would award a fresh throw the instant it left
+	 * the hand.
+	 */
+	void ClearPendingTurnover();
 
 	/** Server, mode B. The Core has been loose too long, or has left the world. Put it back in play. */
 	void ResetLooseCore(const TCHAR* Reason);
@@ -1509,6 +1630,41 @@ private:
 	 */
 	float LastContactServerTime = -1.f;
 
+	// --- SPEC v19 §1.5: THE LANDING IS LATCHED, THEN SHOWN, THEN AWARDED. --------------------------
+	//
+	// "ENSURE the ball does not turnover until it actually visibly touches the ground or the top of an
+	// obstacle." Before this pass the landing and the change of possession were the SAME TICK, so no
+	// rendered frame ever contained the ball in contact — see FSurfaceRuleStats::UnseenTurnovers for
+	// the measurement that says so. These fields are what turns one instant into two: the landing is
+	// recorded here, the ball keeps being drawn where it fell, and ServerSurfaceTurnover runs once the
+	// player has actually had frames to see it.
+	//
+	// Every one of them is server-only and is cleared by ClearLooseState(), so a new flight can never
+	// inherit the previous one's pending landing.
+
+	/** Shared-clock time this flight's landing was established, or -1 when none is pending. */
+	float PendingTurnoverLandedServerTime = -1.f;
+
+	/** GFrameCounter at that instant, so "how many frames was it drawn touching" is exact. */
+	uint64 PendingTurnoverLandedFrame = 0;
+
+	/** The surface the pending landing was established on. Refreshed while contact continues. */
+	FVector PendingTurnoverSurfacePoint = FVector::ZeroVector;
+	FVector PendingTurnoverSurfaceNormal = FVector::UpVector;
+
+	/**
+	 * The v13 §8 arrival numbers, captured at the LANDING rather than at the award.
+	 *
+	 * Load-bearing rather than tidy: MidAirTurnovers asks how the Core was travelling WHEN IT MET THE
+	 * SURFACE, and once the award is a few frames later the live velocity is a different question's
+	 * answer. Reading the fresh one would silently retire the §8 counter.
+	 */
+	double PendingTurnoverArrivalSpeed = 0.0;
+	double PendingTurnoverArrivalSin = 1.0;
+
+	/** Whether the at-rest probe established the pending landing (feeds RestProbeRescues). */
+	bool bPendingTurnoverByRestProbe = false;
+
 	// --- SPEC v13 §8: the mid-air turnover reproduction. Diagnostics only. --------------------------
 	//
 	// Armed with Trace.ModeB.TurnoverRepro <shots>, from -ExecCmds as well as the console for the
@@ -1532,6 +1688,12 @@ private:
 	int32 TurnoverReproMidAirAtStart = 0;
 	int32 TurnoverReproLandedAtStart = 0;
 	int32 TurnoverReproRejectedAtStart = 0;
+
+	/** SPEC v19 §1.5's half of the same snapshot. */
+	int32 TurnoverReproUnseenAtStart = 0;
+	int32 TurnoverReproSeenAtStart = 0;
+	int32 TurnoverReproUngroundedAtStart = 0;
+	int32 TurnoverReproGroundedAtStart = 0;
 
 	/**
 	 * The graze geometry, resolved ONCE when the repro arms and then reused for every shot.
@@ -1645,6 +1807,20 @@ private:
 	int32 VerifyWallBouncesAtStart = 0;
 	int32 VerifyTurnoversAtStart = 0;
 	int32 VerifyRescuesAtStart = 0;
+
+	/**
+	 * Step 9 only: re-fires the wall shot left before the step is allowed to report a failure.
+	 *
+	 * The wall shot crosses open pitch with ten bots playing on it, and its own log shows what a
+	 * failing run actually is: a bot standing in the corridor intercepts the Core a tenth of a second
+	 * after launch — the catch magnet even curves it into them — so the step reports THE WALL RULE
+	 * broken on the strength of where somebody was standing. Retrying makes it measure its own
+	 * subject. It still fails when the retries run out, and says that is what happened.
+	 */
+	int32 VerifyWallShotRetriesLeft = 0;
+
+	/** Step 9 only: has the wall shot been fired at all yet? Gates the one-time retry allowance. */
+	bool bVerifyWallShotFiredOnce = false;
 
 	/**
 	 * Step 8 only: the parked Core has settled and has been declared thrown.

@@ -9,6 +9,11 @@
 //             and -30% speed for 4 s. Jars last 4 s on the ground. Max 3; a fourth despawns the
 //             oldest."
 //
+//             *** SPEC v19 §4.3 MOVES THE DROP TO THE OTHER END OF THE DASH. *** Verbatim: "Oyster's
+//             jar spawns at the END of his dash, not the beginning." Everything else about the jar is
+//             unchanged — one per dash, same 4 s, same cap, same break. Only the place it lands moved,
+//             from where he left to where he arrives.
+//
 //   MOVEMENT  "jumping while stood on one of his jars breaks it and boosts him upward."
 //
 //   ACTIVATED "Pickler: lobs a jar that, ON LANDING, deals 30 damage in an area and pulls enemies
@@ -64,13 +69,17 @@ public:
 	virtual void OnHalfTime() override;
 	virtual void TickAbilities(float DeltaSeconds) override;
 
-	// --- PASSIVE: a jar at the start of every dash ----------------------------------------------------
+	// --- PASSIVE: a jar at the END of every dash (spec v19 §4.3) --------------------------------------
 
 	/**
-	 * The framework's dash hook. NOTHING CALLS IT YET (a cross-file need in
-	 * Movement/TraceCharacterMovementComponent.cpp, filed by both foundation reports), so
-	 * TickAbilities also watches ATraceCharacter::IsDashing() for a rising edge and drops the jar
-	 * itself. Both routes go through the same latch, so wiring the hook cannot produce two jars.
+	 * The framework's dash hooks. Both are wired now — UTraceCharacterMovementComponent::BeginDash
+	 * calls NotifyDashStarted and the frame the dash clock runs out calls NotifyDashEnded — on the
+	 * authority and on the owning client, and never on a replayed move.
+	 *
+	 * SPEC v19 §4.3 makes OnDashEnded the one that drops the jar; OnDashStarted now only ARMS it. The
+	 * arm/drop pair is latched so the hook and the IsDashing() poll in TickAbilities (kept as the
+	 * backstop for any dash that ends without the hook firing, e.g. the clock being cleared out from
+	 * under it) cannot between them produce two jars for one dash.
 	 *
 	 * "including WHILE CARRYING THE CORE" — there is deliberately no carrier test on Oyster's own
 	 * side of this. The choke point governs what a jar does to other players, never what Oyster is
@@ -85,8 +94,9 @@ public:
 	 * "jumping while stood on one of his jars breaks it and boosts him upward."
 	 *
 	 * Returns TRUE to consume the jump, so the boost REPLACES the normal jump rather than adding to
-	 * it. Also unreachable today (the same cross-file need), so TickAbilities detects a jump off the
-	 * ground and applies the boost on the way up; the two share one latch.
+	 * it. Reached from ATracePlayerController's jump binding through
+	 * UTraceAbilityComponent::HandleJumpPressed; TickAbilities also detects a jump off the ground and
+	 * applies the boost on the way up, and the two share one latch so a press cannot boost twice.
 	 */
 	virtual bool OnJumpPressed() override;
 
@@ -106,8 +116,19 @@ public:
 	/** HARNESS. The dash jar, without a dash. Server only. */
 	ATraceOysterJar* DebugDropDashJar();
 
+	/**
+	 * HARNESS. The Pickler lob, without the cooldown or the input. Server only.
+	 *
+	 * Calls the same ThrowPickler() the E key reaches through ActivateAbility(), so a measurement taken
+	 * here is a measurement of the shipping throw and not of a second implementation of it.
+	 */
+	ATraceOysterJar* DebugThrowPickler();
+
 	/** HARNESS. Attempts the jar jump right now. Returns true if it fired. */
 	bool DebugTryJarJump();
+
+	/** HARNESS. Clears the field so one measurement cannot be polluted by the jars of the last. */
+	void DebugDestroyAllJars() { DestroyAllJars(); }
 
 private:
 	/**
@@ -116,11 +137,22 @@ private:
 	 */
 	TArray<TWeakObjectPtr<ATraceOysterJar>> LiveJars;
 
-	/** Rising-edge state for the dash poll. Server only. */
+	/** Edge state for the dash poll alone. Server only. */
 	bool bWasDashing = false;
 
-	/** One jar per dash, whichever route noticed the dash first. */
-	bool bDashJarSpawnedThisDash = false;
+	/**
+	 * TRUE between the opening edge of a dash and its closing edge, whichever of the hook or the poll
+	 * saw each. It is what stops the two routes from treating one dash as two.
+	 */
+	bool bDashTracked = false;
+
+	/**
+	 * SPEC v19 §4.3. One jar per dash, dropped at the END, by whichever route notices the end first.
+	 *
+	 * TRUE from the opening edge until the jar has been dropped; the drop clears it, so the closing
+	 * hook and the closing poll cannot both drop one for the same dash.
+	 */
+	bool bDashJarOwedForThisDash = false;
 
 	/** Ground-state edge for the jar-jump poll. */
 	bool bWasOnGround = false;
@@ -131,8 +163,20 @@ private:
 	/** Absolute match time of the last jar jump; a short latch so two routes cannot both boost. */
 	float LastJarJumpMatchTime = -100.f;
 
-	/** Server. Spawns a jar and enforces the max of 3. @p Velocity zero places it on the ground. */
-	ATraceOysterJar* SpawnJar(const FVector& Location, const FVector& Velocity, bool bPickler);
+	/** Server. Spawns a jar and enforces the max of 3. @p LaunchVelocity zero places it on the ground. */
+	ATraceOysterJar* SpawnJar(const FVector& SpawnLocation, const FVector& LaunchVelocity, bool bPickler);
+
+	/**
+	 * Server. THE ONE PLACE A PICKLER JAR LEAVES HIS HAND. ActivateAbility() and DebugThrowPickler()
+	 * both go through it, so the harness cannot measure a throw the game does not make.
+	 */
+	ATraceOysterJar* ThrowPickler();
+
+	/** Server. The opening edge of a dash, from either route. Arms the debt exactly once. */
+	void NoteDashBegan();
+
+	/** Server. Settles the debt from bDashJarOwedForThisDash — the one place the dash jar is dropped. */
+	void DropOwedDashJar();
 
 	/** Server. Drops LiveJars entries that have gone and pops the oldest while over the cap. */
 	void PruneJars();

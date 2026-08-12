@@ -176,6 +176,20 @@ public:
 	float GetSuspendRemaining() const;
 
 	/**
+	 * DEMO 17 item 6. Seconds until V will be accepted again, 0 when it is ready.
+	 *
+	 * *** FOR THE HARNESS AND THE LOG. NOT FOR THE HUD, AND THAT IS THE REQUIREMENT. *** Demo 17 asks
+	 * for a cooldown the player is not shown ("do not show it on the HUD"), so this exists to make the
+	 * rule TESTABLE, not to make it visible. Nothing in UI/ calls it; if something ever does, that is
+	 * the change Demo 17 explicitly refused. The E ring is unaffected either way — this character does
+	 * not override GetCharacterOwnedCooldownRemaining(), so the framework's ring never sees it.
+	 *
+	 * Counted from the END of the last suspend (release, expiry, landing, a pull, or death), because
+	 * that is where UTraceAbilitySetMace::StopSuspend stamps it.
+	 */
+	float GetSuspendCooldownRemaining() const;
+
+	/**
 	 * HARNESS ONLY. Throws a spike at an explicit anchor, bypassing the aim sweep, so the spike and
 	 * pull can be exercised without steering a pawn at a wall. Server only.
 	 */

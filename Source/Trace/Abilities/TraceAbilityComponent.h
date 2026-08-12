@@ -476,6 +476,17 @@ public:
 	static float GetDashHitSweepRadiusFor(const AActor* Actor);
 
 	void NotifyPawnSpawned();
+
+	/**
+	 * The pawn died. Runs the character's own OnPawnDied() and then SPEC v19 §4.2's central wipe.
+	 *
+	 * *** THIS IS THE ONE PLACE DEATH STOPS ABILITIES. *** "E.g chut should not have his ability
+	 * active when he is dead. It should stop, and the cooldown timer should start." It is done here,
+	 * once, rather than in each character, because the two characters it was already wrong for (Chut's
+	 * Chud and Rocco's speed stack) were wrong by OMISSION — and an omission cannot be fixed by asking
+	 * the next author to remember. See ApplyDeathStateWipe for exactly which state goes and which
+	 * stays, and why a blanket reset would break the cooldown rule stated in the same paragraph.
+	 */
 	void NotifyPawnDied();
 	/** SERVER ONLY. Rocco's headshot stack, Chud's knife-kill refresh. */
 	void NotifyKill(ATraceCharacter* Victim, FName Cause, bool bHeadshot);
@@ -598,6 +609,16 @@ protected:
 	TObjectPtr<UTraceCharacterAbilitySet> AbilitySet = nullptr;
 
 private:
+	/**
+	 * SPEC v19 §4.2. AUTHORITY ONLY. Stops every ability EFFECT this player has running, and leaves
+	 * every COOLDOWN alone. Called by NotifyPawnDied() and by nothing else.
+	 *
+	 * The .cpp carries the full field-by-field reasoning, including why AbilityState.Reset() is the
+	 * wrong tool: two shipped characters keep a cooldown in AuxEndMatchTime, and wiping it would give
+	 * a dead player a free ability — the exact thing the same spec paragraph forbids.
+	 */
+	void ApplyDeathStateWipe();
+
 	/** Destroys the old set and builds the one CharacterId names. Runs on every machine. */
 	void RebuildAbilitySet();
 

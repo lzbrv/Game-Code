@@ -26,7 +26,9 @@
 
 #include "Trace.h"                                    // LogTraceGame
 #include "UI/TraceMenuHUD.h"
+#include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
+#include "UI/Widgets/Menu/TraceTitleMenuWidget.h"
 
 #if !UE_BUILD_SHIPPING
 
@@ -220,6 +222,116 @@ namespace TraceMenuUIVerifyFile
 		TEXT("viewport pixel space the mouse works in. Pass 'redarm' to compare each row against its ")
 		TEXT("neighbour instead, which must FAIL — that is what proves the check can detect anything."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyMenu));
+
+	/**
+	 * Spec v19 §5 — is the artist's art ACTUALLY on screen, and what font is the rest of it in?
+	 *
+	 * This is a separate question from VerifyMenu's, and a nastier one. A row can be in exactly the
+	 * right rectangle and be drawing a plain white box, because that is what Slate does with a brush
+	 * whose texture failed to load: it draws the tint. A menu missing half its sprites therefore does
+	 * not look broken — it looks like somebody chose a flat style — so nobody reports it.
+	 *
+	 * It also states the substitution out loud every time it runs. The artist asked for their exact
+	 * font; the art arrived as a PNG, which can carry the four words drawn on it and cannot carry a
+	 * typeface, so every other label is Roboto Light standing in. That is not a detail to leave in a
+	 * commit message.
+	 */
+	static void VerifyMenuArt(const TArray<FString>& Args)
+	{
+		const bool bRedArm = Args.ContainsByPredicate([](const FString& Arg)
+		{
+			return Arg.Equals(TEXT("redarm"), ESearchCase::IgnoreCase);
+		});
+
+		UE_LOG(LogTraceGame, Display, TEXT("=============== Trace.UI.VerifyMenuArt =============="));
+
+		// The font answer does not need a title screen — say it whatever else is true.
+		UE_LOG(LogTraceGame, Display, TEXT("[MenuArt] Type is drawn in: %s"),
+			*TraceMenuArtStyle::DescribeMenuFont());
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MenuArt] Sprite words (the artist's own letterforms): PLAY, SETTINGS. ")
+			TEXT("KEYBIND and KEY are imported and belong to the settings screen. ")
+			TEXT("Every other label on this menu is engine-rendered in the stand-in font."));
+
+		ATraceMenuHUD* MenuHUD = FindMenuHUD();
+		if (MenuHUD == nullptr)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MenuArt] VERDICT: NOT APPLICABLE (no title screen — this only means something ")
+				TEXT("on /Game/Maps/MainMenu)."));
+			UE_LOG(LogTraceGame, Display, TEXT("====================================================="));
+			return;
+		}
+
+		const UTraceTitleMenuWidget* Widget = MenuHUD->GetMenuWidget();
+		if (Widget == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[MenuArt] VERDICT: NO WIDGET — %s. The sprites live in the UMG tree, so there is ")
+				TEXT("nothing to measure while the Canvas path is drawing. Set Trace.UI.UseUMG 1."),
+				*MenuHUD->GetMenuUmgStatus());
+			UE_LOG(LogTraceGame, Display, TEXT("====================================================="));
+			return;
+		}
+
+		int32 Total = 0;
+		TArray<FString> Missing;
+		const int32 Resolved = Widget->CountResolvedArt(Total, Missing, bRedArm);
+
+		for (const FString& Name : Missing)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[MenuArt]   MISSING: %s"), *Name);
+		}
+
+		if (bRedArm)
+		{
+			// The red arm asks about Backdrop, which is a flat black fill with no texture BY DESIGN.
+			// A working check must report it. One that does not cannot report anything.
+			const bool bCaught = Missing.ContainsByPredicate([](const FString& Name)
+			{
+				return Name.StartsWith(TEXT("Backdrop"));
+			});
+			if (bCaught)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[MenuArt] RED ARM VERDICT: GOOD — the deliberately textureless Backdrop was ")
+					TEXT("caught (%d of %d resolved). The real check can detect a missing sprite."),
+					Resolved, Total);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[MenuArt] RED ARM VERDICT: BROKEN HARNESS — an image with no texture at all ")
+					TEXT("was reported as resolved. Every pass this command has ever printed is worthless."));
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("====================================================="));
+			return;
+		}
+
+		if (Resolved == Total)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MenuArt] VERDICT: PASS — all %d sprite slots resolved to a texture. The screen ")
+				TEXT("is drawing the artist's art, not white boxes."), Total);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[MenuArt] VERDICT: FAIL — %d of %d sprite slots have no texture and are drawing ")
+				TEXT("as flat rectangles. Run `python3 Scripts/slice-ui-assets.py` and then ")
+				TEXT("Scripts/generate-menu-widgets.py in the editor."), Total - Resolved, Total);
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("====================================================="));
+	}
+
+	static FAutoConsoleCommand CmdVerifyMenuArt(
+		TEXT("Trace.UI.VerifyMenuArt"),
+		TEXT("Spec v19 §5. Reports which of the artist's sprites actually resolved in the live title ")
+		TEXT("screen, and names the font every non-sprite label is being drawn in. Pass 'redarm' to ")
+		TEXT("include an image that has no texture by design, which must be REPORTED MISSING — that ")
+		TEXT("is what proves the check can fail."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyMenuArt));
 }
 
 #endif // !UE_BUILD_SHIPPING

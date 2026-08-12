@@ -45,9 +45,8 @@
 #include "TraceTitleMenuWidget.generated.h"
 
 class UBorder;
+class UImage;
 class UTextBlock;
-class UTraceMenuCanvasArt;
-class UTraceStrokeText;
 
 /** One frame of the title screen, as ATraceMenuHUD sees it. */
 struct FTraceTitleMenuView
@@ -114,18 +113,50 @@ public:
 	/** How many rows the asset actually provides. Six today; the HUD asserts it matches its enum. */
 	int32 GetRowCount() const { return OrderedRows.Num(); }
 
+	/**
+	 * Every sprite this screen is supposed to be made of, and whether it actually arrived.
+	 *
+	 * `Trace.UI.VerifyMenuArt` prints it. It exists because a UImage with no texture in its brush is
+	 * drawn by Slate as a plain WHITE RECTANGLE, not as nothing — so a menu missing half the artist's
+	 * art does not look broken, it looks like a different design, and nobody investigates.
+	 *
+	 * @param bIncludeBackdrop  THE RED ARM. Backdrop is the one image on this screen that is SUPPOSED
+	 *                          to have no texture — it is a flat black fill — so including it must
+	 *                          make this report a missing sprite. If it does not, the "has a texture"
+	 *                          test cannot return false and none of its passes mean anything.
+	 * @return the number of sprite slots that resolved; @p OutTotal is how many there are.
+	 */
+	int32 CountResolvedArt(int32& OutTotal, TArray<FString>& OutMissing, bool bIncludeBackdrop = false) const;
+
 	//~ Begin UUserWidget interface
 	virtual void NativeOnInitialized() override;
 	//~ End UUserWidget interface
 
 protected:
-	// ---- The art layers, bottom to top -----------------------------------------------------------
+	// ---- The art layers, bottom to top (spec v19 §5) -----------------------------------------------
+	//
+	// The stroke-drawn backdrop is gone. The brief was explicit — "Keep the background black" — so
+	// Backdrop is now a plain black fill and the grid floor, the horizon glow and the bezel that used
+	// to sit on it are not drawn at all. What is on the black is the artist's: their swoosh, their
+	// wordmark, their buttons, their cursor.
 
+	/** Black. Opaque, and first, so the empty menu map behind it can never show through. */
 	UPROPERTY(meta = (BindWidget))
-	TObjectPtr<UTraceMenuCanvasArt> Backdrop;
+	TObjectPtr<UImage> Backdrop;
 
+	/** The white sweep from the sheet, behind the title. Decorative; never hit-tested. */
 	UPROPERTY(meta = (BindWidget))
-	TObjectPtr<UTraceStrokeText> Wordmark;
+	TObjectPtr<UImage> SwooshImage;
+
+	/**
+	 * The TRACE mark, as the artist drew it.
+	 *
+	 * This replaces UTraceStrokeText, whose five hand-built glyphs were the second of the two reasons
+	 * `Trace.UI.UseUMG` was turned off in v17: at the widget path's stroke thickness the R came apart
+	 * and the A's point was chopped. A sprite has no thickness to get wrong.
+	 */
+	UPROPERTY(meta = (BindWidget))
+	TObjectPtr<UImage> Wordmark;
 
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTextBlock> TaglineText;
@@ -177,15 +208,14 @@ protected:
 	TObjectPtr<UTextBlock> FooterHintText;
 
 	/**
-	 * ABOVE the footer, deliberately: the footer's dark strip runs to the bottom edge and would
-	 * otherwise swallow the frame's bottom rail and two of its corner ticks. Measured on Canvas,
-	 * reproduced here by tree order.
+	 * The artist's pointer, and the reason the OS cursor is not it.
+	 *
+	 * Moved by re-anchoring rather than by an offset, so it lands in the same place whatever the DPI
+	 * scale is: ATraceMenuHUD hands over a 0..1 fraction of the viewport and this sets the anchor to
+	 * it. The sprite's tip is its top-left corner, which is why the alignment is (0,0).
 	 */
 	UPROPERTY(meta = (BindWidget))
-	TObjectPtr<UTraceMenuCanvasArt> Bezel;
-
-	UPROPERTY(meta = (BindWidget))
-	TObjectPtr<UTraceMenuCanvasArt> MenuCursor;
+	TObjectPtr<UImage> MenuCursor;
 
 	// ---- The two things that outrank everything else ---------------------------------------------
 
@@ -193,7 +223,7 @@ protected:
 	TObjectPtr<UBorder> TravelOverlay;
 
 	UPROPERTY(meta = (BindWidget))
-	TObjectPtr<UTraceStrokeText> TravelWordmark;
+	TObjectPtr<UImage> TravelWordmark;
 
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTextBlock> TravelCaptionText;
