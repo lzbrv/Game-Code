@@ -173,9 +173,9 @@ namespace TraceElleVerify
 	FString DescribeTally(const TraceElle::FGateTally& Tally)
 	{
 		return FString::Printf(
-			TEXT("teleports=%d chokePoint=%d teamKnob=%d carrierKnob=%d lockout=%d"),
-			Tally.TeleportsCommitted, Tally.RefusedByChokePoint, Tally.RefusedByTeamKnob,
-			Tally.RefusedByCarrierKnob, Tally.RefusedByLockout);
+			TEXT("teleports=%d (asControl=%d) chokePoint=%d teamKnob=%d carrierKnob=%d lockout=%d"),
+			Tally.TeleportsCommitted, Tally.TeleportsCommittedAsControl, Tally.RefusedByChokePoint,
+			Tally.RefusedByTeamKnob, Tally.RefusedByCarrierKnob, Tally.RefusedByLockout);
 	}
 
 	// =============================================================================================
@@ -454,7 +454,9 @@ namespace TraceElleVerify
 			if (State->Arm == 0)
 			{
 				State->bRedRan = true;
-				State->bRedMovedCarrier = (CarrierTally.TeleportsCommitted > 0);
+				// AS CONTROL on both arms, so the two arms are compared on the same quantity — the
+				// ENEMY gate's decision — rather than on "did anything anywhere move this player".
+				State->bRedMovedCarrier = (CarrierTally.TeleportsCommittedAsControl > 0);
 				State->bRedMovedControl = (OtherTally.TeleportsCommitted > 0);
 
 				// Straight into the green arm, from the same staging, so the two arms differ in exactly
@@ -467,7 +469,10 @@ namespace TraceElleVerify
 			}
 
 			State->bGreenRan = true;
-			State->bGreenHeldCarrier = (CarrierTally.TeleportsCommitted == 0);
+			// THE INVARIANT, MEASURED ON THE ENEMY GATE ONLY. A friendly gate moving a carrier is
+			// allowed by design (Beneficial, plus bElleSnapCarrierMayUseGate), and counting it here
+			// made this harness fail 1 run in 3 whenever another Elle in the match had a portal down.
+			State->bGreenHeldCarrier = (CarrierTally.TeleportsCommittedAsControl == 0);
 			State->bGreenRefusedByChokePoint = (CarrierTally.RefusedByChokePoint > 0);
 			State->bGreenMovedControl = (OtherTally.TeleportsCommitted > 0);
 

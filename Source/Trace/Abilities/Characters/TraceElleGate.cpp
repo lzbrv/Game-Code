@@ -405,6 +405,13 @@ void ATraceElleGate::ServerTickGate()
 		}
 
 		++Tally.TeleportsCommitted;
+		if (Effect == ETraceAbilityEffect::Control)
+		{
+			// The ENEMY-gate half, tallied separately because that is the half the founding invariant
+			// is about. A Beneficial (own-team) entry is allowed for a carrier by design and must not
+			// read as a displacement — see FGateTally::TeleportsCommittedAsControl.
+			++Tally.TeleportsCommittedAsControl;
+		}
 		CommitTeleport(Candidate);
 
 		// The arrival is at the PARTNER's mouth, so the subject is no longer in this one. Dropping them

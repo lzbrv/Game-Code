@@ -106,8 +106,26 @@ namespace TraceElle
 {
 	struct FGateTally
 	{
-		/** The gate asked, was allowed, and moved somebody. */
+		/** The gate asked, was allowed, and moved somebody. ANY gate, ANY effect. */
 		int32 TeleportsCommitted = 0;
+		/**
+		 * The subset of the above that were CONTROL — i.e. an ENEMY gate moving the subject.
+		 *
+		 * *** THIS, AND NOT TeleportsCommitted, IS THE FOUNDING INVARIANT'S COUNTER. ***
+		 *
+		 * TeleportsCommitted counts every gate standing in the world, including the ones belonging to
+		 * OTHER Elles in the same match, and a friendly gate entry is Beneficial — which a carrier is
+		 * deliberately allowed to take (see bElleSnapCarrierMayUseGate, and spec v14 §6's carrier
+		 * riding Rocco's Ripple). Judging "was a carrier displaced?" on the total therefore reports a
+		 * BY-DESIGN teleport through a team-mate's portal as a broken invariant.
+		 *
+		 * That is not hypothetical: Trace.Elle.CarrierTest failed 1 run in 3 for exactly this reason,
+		 * with the log line naming the culprit — "taken by TracePlayerState_6's gate as Beneficial",
+		 * a second Elle bot's own portal — while the enemy gate under test refused via the choke point
+		 * the same 2 times it did in the runs that passed. A founding-invariant harness that cries
+		 * wolf is the same failure as one that cannot go red, so the counter is now specific.
+		 */
+		int32 TeleportsCommittedAsControl = 0;
 		/** UTraceAbilityComponent::CanAffect said no. On a carrier + Control this IS the invariant. */
 		int32 RefusedByChokePoint = 0;
 		/** bElleSnapUsableByBothTeams is off and the entrant was an enemy of Elle. */
