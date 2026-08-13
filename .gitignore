@@ -198,3 +198,20 @@ $RECYCLE.BIN/
 # from the pinned UE 5.8.1 install - never committed. See the asset policy in
 # Scripts/generate_content.py.
 /Content/Generated/
+
+# Licensed fonts: usable per-developer, NEVER redistributed. This repo is public.
+# See Scripts/generate_font_atlas.py and docs/FONTS.md.
+Art/Fonts/*.otf
+Art/Fonts/*.ttf
+Art/Fonts/*.pdf
+
+# ...EXCEPT the open-licence ones, which are the whole point of having an interim face.
+# Lato is SIL Open Font Licence 1.1: redistribution IS permitted (and required to carry the
+# licence, which Art/Fonts/README.md does). Spec v20 §1 asks for the interim .ttf to be
+# committed so a clean clone can re-run the import; the blanket rules above were written for
+# Sofachrome, which is commercial and must stay out. Keep this list to fonts whose licence you
+# have actually read - never add MyriadPro, ProximaNova, TrajanPro or Sofachrome.
+!Art/Fonts/Lato-Regular.ttf
+# Lato is SIL OFL — safe to commit, unlike the licensed faces above.
+!Art/Fonts/Lato-Regular.ttf
+!Art/Fonts/README*

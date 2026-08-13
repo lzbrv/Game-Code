@@ -49,6 +49,8 @@
 
 #include "UI/Widgets/HUD/TraceHudCornerData.h"
 
+#include "UI/Text/TraceAtlasTextSwap.h"
+
 #include "TraceHudCornerWidget.generated.h"
 
 class UBorder;
@@ -191,4 +193,19 @@ private:
 
 	/** Grows the tick pool to @p InCount visible ticks, collapsing any beyond it. */
 	void EnsureTicks(int32 InCount);
+
+	// ---- SPEC v22 §A1: THE CORNER TYPES IN THE ARTIST'S FACE ---------------------------------------
+	//
+	// The Canvas half of this HUD types from the glyph atlas (ATraceHUD's text helpers). This is the
+	// UMG half of the SAME corner — `Trace.UI.HUD.UseUMG` picks which one draws — so leaving it alone
+	// would have made the game's typeface depend on a cvar. The four text blocks stay as the model and
+	// keep receiving exactly the SetText they always did; see UI/Text/TraceAtlasTextSwap.h.
+
+	/** Installed once, on the first PresentAmmo. */
+	bool bAtlasLabelsInstalled = false;
+
+	UPROPERTY(Transient)
+	TArray<FTraceAtlasLabel> AtlasLabels;
+
+	void InstallAtlasLabels();
 };

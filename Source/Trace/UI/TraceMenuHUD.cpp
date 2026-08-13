@@ -22,6 +22,7 @@
 #include "Settings/TraceUserSettings.h"
 #include "TimerManager.h"
 #include "Trace.h"                    // LogTraceGame
+#include "UI/Text/TraceCanvasText.h"   // spec v22 §A1 — this renderer types from the atlas
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"
 #include "UI/TraceNetworking.h"
@@ -45,6 +46,7 @@
 // (UI/Widgets/Menu/TraceStrokeTextWidget.h) is the same five glyphs for the UMG renderer.
 // =================================================================================================
 
+// Spec v22 §A1 — this renderer types in the artist's face too. See TraceMenuHUDType below.
 namespace TraceStrokeFont
 {
 	struct FSeg { float X0, Y0, X1, Y1; };
@@ -85,6 +87,53 @@ namespace TraceStrokeFont
 // Spec v17 §4 — the UMG renderer, and the toggle that keeps Canvas alive
 // =================================================================================================
 
+// =================================================================================================
+// SPEC v22 §A1 — THE CANVAS MENU TYPES IN THE ARTIST'S FACE
+// =================================================================================================
+//
+// This renderer is not the default any more, but it is not dead either, and that is exactly why it
+// matters here. The JOIN prompt stands the UMG title screen down for the frames it is up (see the
+// comment at DrawJoinPrompt), so the shipped, default menu drops onto THIS code the moment a player
+// presses JOIN. Photographed at 1920x1080 in v22integ_06_join_prompt.png: a screen of Sofachrome
+// became a screen of the engine's stand-in font in one keypress.
+//
+// Same translation as the settings page, for the same reason, and the reasoning is written out once
+// at the top of UI/TraceOptionsMenu.cpp: this file's layout vocabulary is (UFont*, Scale) and
+// TraceText wants a point size, so SizeFor() MEASURES what that font at that scale draws and
+// inverts TraceText::LineHeight to match it. Row heights and baselines therefore do not move; only
+// the letterforms and the measured widths do.
+// =================================================================================================
+
+namespace TraceMenuHUDType
+{
+	/** The point size whose line height equals what @p Font at @p Scale draws. */
+	static float SizeFor(AHUD* HUD, UFont* Font, float Scale)
+	{
+		float MeasuredW = 0.f;
+		float MeasuredH = 0.f;
+		if (HUD != nullptr)
+		{
+			HUD->GetTextSize(TEXT("Ag"), MeasuredW, MeasuredH, Font, Scale);
+		}
+
+		const float UnitLine = TraceText::LineHeight(1.f);
+		if (MeasuredH > 1.f && UnitLine > KINDA_SMALL_NUMBER)
+		{
+			return MeasuredH / UnitLine;
+		}
+		return FMath::Max(1.f, 16.f * Scale);
+	}
+
+	static void Draw(AHUD* HUD, const FString& Text, const FLinearColor& Color,
+		float X, float Y, UFont* Font, float Scale,
+		TraceText::EHAlign HAlign = TraceText::EHAlign::Left)
+	{
+		TraceText::FStyle Style(SizeFor(HUD, Font, Scale), Color);
+		Style.HAlign = HAlign;
+		TraceCanvasText::Draw(HUD, Text, X, Y, Style);
+	}
+}
+
 namespace TraceMenuHUDFile
 {
 	/**
@@ -105,53 +154,77 @@ namespace TraceMenuHUDFile
 	 * draws UNDER Slate, so the widget stands down for those frames).
 	 */
 	/**
-	 * DEFAULT 0 — CANVAS. STILL 0 AFTER SPEC v19 §5, AND FOR ONE REMAINING REASON, NOT THE OLD THREE.
+	 * DEFAULT 1 — UMG. FLIPPED BY THE SPEC v20 INTEGRATION PASS. It was 0 from v17 to v19.
 	 *
-	 * *** WHAT THE PLAYER GIVES UP AT 0: ALL OF IT. The artist's sheet — the TRACE wordmark, the
-	 * swoosh, the three button plates, the PLAY and SETTINGS lettering, the pointer — is drawn by the
-	 * UMG tree ONLY. At 0 the title screen is still the stroked-vector one. `Trace.UI.UseUMG 1`, or
-	 * -TraceMenuUMG on the command line, is how anyone sees the new art today. ***
+	 * *** THIS IS THE LINE THAT DECIDES WHETHER A PLAYER SEES THE ARTIST'S MENU. The sheet — the
+	 * TRACE wordmark, the swoosh, the three button plates, the PLAY and SETTINGS lettering, the
+	 * pointer — is drawn by the UMG tree ONLY. At 0 the title screen is the old stroked-vector one
+	 * and none of the art is on screen. The user's report that opened spec v20 was, in their words,
+	 * "the menu UI currently looks the same, not sure if anything was changed" — and it looked the
+	 * same because of this number, not because the art was missing. ***
 	 *
-	 * The v17 retreat listed three measured reasons. Two are now closed, measured the same way they
-	 * were measured when they were opened:
+	 * The v17 retreat listed three measured reasons. ALL THREE ARE NOW CLOSED:
 	 *
-	 *   1. STARTUP — CLOSED. The cause was real and was in Scripts/generate-menu-widgets.py: it
-	 *      retired widgets by renaming them (TraceRetired_1, ...) inside the package, so their
-	 *      variable GUIDs stayed in the .uasset and the widget compiler re-resolved and ensure()d
-	 *      over them on every load. The generator now renames them into the TRANSIENT package.
-	 *      Re-measured headless on /Game/Maps/MainMenu, same machine, same flags: the committed
-	 *      pre-v19 asset logs 49 TraceRetired resolves and 13 ensures and takes 23.1 s wall;
-	 *      the regenerated asset logs 0 and 0 and takes 17.0 s, against 17.5 s for the Canvas path
-	 *      it is being compared to. Map load itself is 0.03 s on both and the widget is adopted
-	 *      23 ms after it.
-	 *   2. THE WORDMARK — CLOSED. It is no longer stroked at all. It is the artist's own sprite
-	 *      (T_TraceWordmark), so there is no stroke thickness left to get wrong.
-	 *   3. ONLY TWO OF FOUR SCREENS EXIST — STILL OPEN, and it is the whole of the reason this is
-	 *      still 0. The title menu and the HUD corner are widgets; the OPTIONS menu and CHARACTER
-	 *      SELECT are still Canvas (FTraceOptionsMenu, ATraceCharacterSelect). Opening SETTINGS
-	 *      therefore hands the whole screen back to the Canvas renderer mid-session — see
-	 *      bUseWidgetThisFrame in DrawHUD — and the artist's KEYBIND / KEY / slider sprites are
-	 *      imported but not yet placed, because they belong to a file this pass did not own.
+	 *   1. STARTUP — closed in v19. The cause was in Scripts/generate-menu-widgets.py: it retired
+	 *      widgets by renaming them (TraceRetired_1, ...) inside the package, so their variable GUIDs
+	 *      stayed in the .uasset and the widget compiler re-resolved and ensure()d over them on every
+	 *      load. The generator now renames them into the TRANSIENT package. Re-measured headless on
+	 *      /Game/Maps/MainMenu: pre-v19 asset 49 TraceRetired resolves, 13 ensures, 23.1 s wall;
+	 *      regenerated asset 0 and 0 and 17.0 s, against 17.5 s for the Canvas path.
+	 *   2. THE WORDMARK — closed in v19/v20. It is no longer stroked at all; it is the artist's own
+	 *      sprite (T_TraceWordmark), lifted to legible ink at load by UTraceTitleMenuWidget.
+	 *   3. ONLY TWO OF FOUR SCREENS EXIST — CLOSED IN v20, and this was the whole of the reason the
+	 *      switch stayed at 0. FTraceOptionsMenu now draws the artist's button plates, slider,
+	 *      value chips, KEYBIND/KEY lettering and cursor on the SHARED options path, so the title
+	 *      screen's SETTINGS page and the in-match pause SETTINGS page get the same treatment.
+	 *      ATraceCharacterSelect was redesigned onto the same plates, chips and cursor.
+	 *      Both are still CANVAS renderers - opening SETTINGS still hands the screen back to the
+	 *      Canvas path mid-session (see bUseWidgetThisFrame in DrawHUD) - but the thing that made
+	 *      that a blocker was that the Canvas screens had none of the art, and now they do.
 	 *
-	 * AND ONE THING TO KNOW BEFORE FLIPPING IT: this variable is SHARED. TraceHUD.cpp's in-match
-	 * corner follows it whenever `Trace.UI.HUD.UseUMG` is -1 (its default), so flipping this to 1
-	 * moves the corner onto its UMG path too. That path measured equivalent in v16 (Trace.HUD.V16Shots,
-	 * 27 passed / 0 failed on both renderers), but it is a second system's behaviour changing on the
-	 * back of a menu decision, so it is the corner owner's call as much as this file's.
+	 * WHAT WAS WALKED BEFORE FLIPPING, at 1920x1080, every frame looked at (Saved/Screenshots/v20integ):
+	 * title -> SETTINGS -> BACK -> character select -> live match -> Escape -> in-match SETTINGS.
+	 *
+	 * THE SHARED-SWITCH CONSEQUENCE, CHECKED RATHER THAN ASSUMED: TraceHUD.cpp's in-match ammo/status
+	 * corner follows this variable whenever `Trace.UI.HUD.UseUMG` is -1 (its default), so this flip
+	 * moves that corner onto its UMG path too. Photographed both arms in a live match on this build
+	 * (v20integ_corner-umg1 / v20integ_corner-umg0): same ammo string, same 30 ticks, same [R] RELOAD,
+	 * same box - the UMG one is a few pixels tighter and crisper. `Trace.UI.HUD.UseUMG 0` still A/Bs
+	 * that corner back to Canvas alone if anyone wants it.
+	 *
+	 * Set this to 0 and everything falls back to the Canvas path with no other change. That is not a
+	 * degraded mode: it is the shipped v16 renderer, still compiled, still tested, and still what
+	 * draws whenever the widget asset is missing or the wrong shape.
 	 */
-	static int32 GUseUMG = 0;
+	static int32 GUseUMG = 1;
 	static FAutoConsoleVariableRef CVarUseUMG(
 		TEXT("Trace.UI.UseUMG"),
 		GUseUMG,
-		TEXT("1 = draw the title screen with the UMG widget (/Game/Trace/UI/Menu/WBP_TitleMenu).\n")
-		TEXT("    THIS IS THE ONLY PATH THAT DRAWS THE ARTIST'S MENU ART (spec v19 5).\n")
-		TEXT("0 = DEFAULT. Draw it with the original AHUD::DrawHUD Canvas path, which has none of\n")
-		TEXT("    that art on it. Both are live; Canvas is also used automatically whenever the\n")
-		TEXT("    asset is missing or the wrong shape, and for the settings and JOIN modals.\n")
-		TEXT("The ~40s launch stall and the broken wordmark that kept this at 0 are both fixed; what\n")
-		TEXT("still keeps it at 0 is that the OPTIONS and CHARACTER SELECT screens are still Canvas.\n")
+		TEXT("1 = DEFAULT since spec v20. Draw the title screen with the UMG widget\n")
+		TEXT("    (/Game/Trace/UI/Menu/WBP_TitleMenu). THIS IS THE ONLY PATH THAT DRAWS THE\n")
+		TEXT("    ARTIST'S MENU ART.\n")
+		TEXT("0 = the original AHUD::DrawHUD Canvas path, which has none of that art on it. Both\n")
+		TEXT("    are live; Canvas is also used automatically whenever the asset is missing or the\n")
+		TEXT("    wrong shape, and for the settings and JOIN modals.\n")
+		TEXT("The launch stall, the broken wordmark and the art-less OPTIONS / CHARACTER SELECT\n")
+		TEXT("screens that kept this at 0 are all closed - see the comment above the variable.\n")
 		TEXT("NOTE this switch is shared with the in-match HUD corner - see the comment above it."),
 		ECVF_Default);
+
+	/**
+	 * Red arm for the one-pointer-one-owner guard in ATraceMenuHUD::DrawCursor. 1 restores the old
+	 * behaviour: this HUD draws its cyan cross at the frozen cursor position even while the settings
+	 * overlay is drawing the artist's arrow at the live one. Exists so the guard is falsifiable from
+	 * a single binary, per spec v20 §4's red-arm rule.
+	 */
+	static int32 GCursorRedArm = 0;
+	static FAutoConsoleVariableRef CVarCursorRedArm(
+		TEXT("Trace.Menu.CursorRedArm"),
+		GCursorRedArm,
+		TEXT("1 = draw the title screen's own cyan cursor even while the settings overlay owns the\n")
+		TEXT("    pointer, i.e. the pre-v20 double-cursor behaviour. 0 = DEFAULT, one pointer.\n")
+		TEXT("Diagnostic only. See ATraceMenuHUD::DrawCursor."),
+		ECVF_Cheat);
 
 	/** Where the generated asset lives. Soft, by path: a missing asset must fall back, not fail. */
 	static const TCHAR* TitleWidgetPath = TEXT("/Game/Trace/UI/Menu/WBP_TitleMenu.WBP_TitleMenu_C");
@@ -846,6 +919,43 @@ static FAutoConsoleVariableRef CVarTraceMenuFocusGuardRedArm(
 	TEXT("arriving while the game window was not foreground — the thing that made every menu row ")
 	TEXT("take two clicks. Run -TraceMenuClickTest with it on and off to compare."),
 	ECVF_Cheat);
+
+/**
+ * Put the pointer somewhere, from the console, so a headless run can photograph what the menu draws
+ * at a chosen cursor position: `Trace.Menu.CursorAt 200 540`.
+ *
+ * Added by the spec v20 integration pass for one specific reason. The double-cursor defect that
+ * ATraceMenuHUD::DrawCursor now guards against is only VISIBLE when the frozen pointer lands outside
+ * the settings panel, and every existing harness that moves the mouse (-TraceMenuClickTest) moves it
+ * to the horizontal centre of the screen, which the panel always covers. Without this there was no
+ * way to photograph either arm, and "I reasoned about it" is not what spec v20 §4 asks for.
+ *
+ * Goes through APlayerController::SetMouseLocation, the same call -TraceMenuClickTest uses, so the
+ * menu's own sampling path sees an ordinary mouse move and nothing is faked past it.
+ */
+static FAutoConsoleCommandWithWorldAndArgs CmdMenuCursorAt(
+	TEXT("Trace.Menu.CursorAt"),
+	TEXT("Dev only. Trace.Menu.CursorAt <X> <Y> - move the pointer to viewport pixel (X, Y). Exists so ")
+	TEXT("a capture can choose where the cursor is. See Trace.Menu.CursorRedArm."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			if (Args.Num() < 2 || World == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Menu] Trace.Menu.CursorAt needs an X and a Y."));
+				return;
+			}
+			APlayerController* PC = World->GetFirstPlayerController();
+			if (PC == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Menu] Trace.Menu.CursorAt: no player controller yet."));
+				return;
+			}
+			const int32 X = FCString::Atoi(*Args[0]);
+			const int32 Y = FCString::Atoi(*Args[1]);
+			PC->SetMouseLocation(X, Y);
+			UE_LOG(LogTraceGame, Display, TEXT("[Menu] Trace.Menu.CursorAt: pointer -> (%d, %d)."), X, Y);
+		}));
 #endif
 
 // NAMED, not anonymous: UBT compiles this module as a unity/jumbo build, so two files that each
@@ -1725,6 +1835,7 @@ void ATraceMenuHUD::DrawHUD()
 	const bool bWidgetAvailable = TryAdoptMenuWidget();
 	const bool bUseWidgetThisFrame = bWidgetAvailable && !OptionsMenu.IsOpen() && !IsJoinPromptOpen();
 	bMenuUmgActive = bUseWidgetThisFrame;
+	bMenuUmgAvailable = bWidgetAvailable;
 
 	if (bUseWidgetThisFrame)
 	{
@@ -1943,11 +2054,11 @@ void ATraceMenuHUD::DrawAddressChip()
 	DrawRect(EdgeColor, ChipX + ChipW - Edge, ChipY, Edge, ChipH);
 
 	const float CaptionY = ChipY + (ChipH - MeasureHeight(Caption, FontSmall, CaptionScale)) * 0.5f;
-	DrawText(Caption, TraceMenuStyle::InkDim, ChipX + PadX, CaptionY, FontSmall, CaptionScale);
+	TraceMenuHUDType::Draw(this, Caption, TraceMenuStyle::InkDim, ChipX + PadX, CaptionY, FontSmall, CaptionScale);
 
 	// Bright cyan, and it is the only place on this screen a raw number is allowed to be the loudest
 	// thing in its own box.
-	DrawText(Endpoint, TraceMenuStyle::Cyan, ChipX + PadX + CaptionW + Gap, ChipY + PadY, FontMedium, ValueScale);
+	TraceMenuHUDType::Draw(this, Endpoint, TraceMenuStyle::Cyan, ChipX + PadX + CaptionW + Gap, ChipY + PadY, FontMedium, ValueScale);
 
 	// MEASURED CAVEAT. If something else already holds UDP 7777, UIpNetDriver does not fail — it
 	// binds the next free port instead (observed: "IpNetDriver listening on port 7778"). The match is
@@ -2020,7 +2131,32 @@ void ATraceMenuHUD::DrawJoinPrompt()
 
 	// Dim everything behind it. The prompt has swallowed the keyboard — including the W/A/S/D that
 	// normally move the selection — so the screen has to say plainly that the menu is not listening.
-	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.78f), 0.f, 0.f, ViewW, ViewH);
+	//
+	// ---- WHY THIS SCRIM HAS TWO STRENGTHS (spec v20 integration) --------------------------------
+	//
+	// This modal is Canvas, and AHUD's Canvas draws UNDER every Slate widget in the viewport, so the
+	// UMG title screen has to stand down for the frames the prompt is up (see bUseWidgetThisFrame in
+	// DrawHUD) and the Canvas title screen draws underneath instead. The two title screens do not
+	// look alike: one is the artist's sprite wordmark, the other is the old stroked-vector one.
+	//
+	// While GUseUMG defaulted to 0 that cost nothing, because the screen behind the prompt was the
+	// screen you were already looking at. Spec v20 flipped the default, and at 0.78 the swap is
+	// plainly legible through the scrim — press JOIN and the game's own name changes design. That
+	// reads as two different games, and it is the single most visible artefact of the flip.
+	//
+	// The honest fix is a UMG join prompt, which is a screen this pass did not build. This is the
+	// containment: when the artist's menu is the one that would otherwise be drawing, take the scrim
+	// to 0.94 so the stand-in behind it reads as unlit background rather than as a second, different
+	// title screen. MEASURED, both arms off 1920x1080 captures of one binary
+	// (Saved/Screenshots/v20integ/v20integ_joinprompt_1.png vs _joinprompt-GREEN_1.png): the Canvas
+	// wordmark's peak luminance over the scrim goes 56/255 -> 15/255, i.e. from "a wordmark in a
+	// different typeface" to "a dark shape". The prompt itself does not pay for it — its panel is
+	// opaque, so the field text measures byte-identical in both arms (mean 210.5, peak 232.7).
+	//
+	// Only when the widget is available: on a genuine Canvas session (GUseUMG 0, or a missing asset)
+	// nothing has changed behind the prompt and the original 0.78 is what that screen was tuned for.
+	const float ScrimAlpha = bMenuUmgAvailable ? 0.94f : 0.78f;
+	DrawRect(FLinearColor(0.f, 0.f, 0.f, ScrimAlpha), 0.f, 0.f, ViewW, ViewH);
 
 	const float CX = ViewW * 0.5f;
 	const float PanelW = FMath::Min(ViewW * 0.72f, 900.f * UIScale);
@@ -2062,12 +2198,12 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	if (Typed.IsEmpty())
 	{
 		// Ghost text, dim enough that nobody mistakes it for a value they can press Enter on.
-		DrawText(FString::Printf(TEXT("100.101.102.103:%d"), TraceNet::DefaultPort),
+		TraceMenuHUDType::Draw(this, FString::Printf(TEXT("100.101.102.103:%d"), TraceNet::DefaultPort),
 			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.35f), TextX, TextY, FontMedium, TextScale);
 	}
 	else
 	{
-		DrawText(Typed, TraceMenuStyle::Ink, TextX, TextY, FontMedium, TextScale);
+		TraceMenuHUDType::Draw(this, Typed, TraceMenuStyle::Ink, TextX, TextY, FontMedium, TextScale);
 	}
 
 	// Caret. Measured off the substring LEFT of the caret rather than assuming a fixed advance —
@@ -2149,8 +2285,12 @@ void ATraceMenuHUD::DrawMenuRows()
 	}
 	bRowRectsValid = true;
 
-	DrawTextCentered(BuildBlurb(), TraceMenuStyle::InkDim,
-		CX, PanelY + PanelH - (36.f * UIScale), FontSmall, 1.1f * UIScale);
+	// Remembered, not recomputed: DrawFooter() places the key hints under this line rather than at a
+	// fixed height, so that adding a menu row cannot slide the blurb onto them. See BlurbBottomY.
+	const FString Blurb = BuildBlurb();
+	const float BlurbY = PanelY + PanelH - (36.f * UIScale);
+	DrawTextCentered(Blurb, TraceMenuStyle::InkDim, CX, BlurbY, FontSmall, 1.1f * UIScale);
+	BlurbBottomY = BlurbY + MeasureHeight(Blurb, FontSmall, 1.1f * UIScale);
 }
 
 FString ATraceMenuHUD::BuildBlurb() const
@@ -2296,7 +2436,7 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 	BuildRowView(Row, bSelected, RowView);
 
 	const float LabelY = Y + (RowH - MeasureHeight(RowView.Label, FontMedium, LabelScale)) * 0.5f;
-	DrawText(RowView.Label, LabelColor, X + PadX, LabelY, FontMedium, LabelScale);
+	TraceMenuHUDType::Draw(this, RowView.Label, LabelColor, X + PadX, LabelY, FontMedium, LabelScale);
 
 	if (!RowView.Status.IsEmpty())
 	{
@@ -2307,7 +2447,7 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 
 		const float StatusW = MeasureWidth(RowView.Status, FontSmall, ValueScale);
 		const float StatusY = Y + (RowH - MeasureHeight(RowView.Status, FontSmall, ValueScale)) * 0.5f;
-		DrawText(RowView.Status, StatusColor, X + Width - PadX - StatusW, StatusY, FontSmall, ValueScale);
+		TraceMenuHUDType::Draw(this, RowView.Status, StatusColor, X + Width - PadX - StatusW, StatusY, FontSmall, ValueScale);
 	}
 
 	// The two VALUE rows share one renderer: right-aligned value, arrows either side, dimmed at the
@@ -2320,7 +2460,7 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 		const float ValueRight = X + Width - PadX;
 		const float ValueY = Y + (RowH - MeasureHeight(RowView.Value, FontMedium, LabelScale)) * 0.5f;
 
-		DrawText(RowView.Value, RowView.ValueColor, ValueRight - ValueW, ValueY, FontMedium, LabelScale);
+		TraceMenuHUDType::Draw(this, RowView.Value, RowView.ValueColor, ValueRight - ValueW, ValueY, FontMedium, LabelScale);
 
 		if (RowView.bShowArrows)
 		{
@@ -2352,7 +2492,35 @@ void ATraceMenuHUD::DrawFooter()
 	const float CX = ViewW * 0.5f;
 	// Both lines have to clear the bezel's bottom rail, which sits 3.8% of the height up from the
 	// edge; anchoring off the bottom in reference pixels alone puts the second line under it.
-	const float Y = ViewH - (100.f * UIScale) - (ViewH * 0.02f);
+	float Y = ViewH - (100.f * UIScale) - (ViewH * 0.02f);
+
+	// ---- ...AND they have to clear the CONSOLE BLURB (spec v20 §0.4) -----------------------------
+	//
+	// The line above is anchored to the viewport bottom; the blurb is anchored to the bottom of the
+	// rows panel, which grows with the row count. At seven rows on a 1080-high screen they met, and
+	// the screen printed "HOSTS A GAME ON <addr>. OTHERS PICK JOIN AND TYPE THAT." straight through
+	// "W/S OR ARROWS MOVE ... ESC QUIT" on one baseline. That is the defect the spec lists as "the
+	// footer text is drawn twice, overlapping itself", and it is still reachable here because this
+	// Canvas renderer is the fallback whenever the widget asset is missing or -TraceNoMenuUMG is set.
+	//
+	// Taking the MEASURED bottom of the blurb (DrawMenuRows ran earlier this frame and recorded it)
+	// rather than a second hard-coded constant is what stops another row from recreating it. The
+	// FMath::Max keeps the old position whenever there is already room, so nothing moves on the
+	// layouts that were fine — only the crowded ones change.
+	// 26, not 8: the dark strip below starts 22px ABOVE Y, and that strip is opaque. Clearing only
+	// the text would tuck the blurb under the strip instead of under the words - the same line lost,
+	// by a different mechanism. 22 puts the strip's top edge on the blurb's last row of pixels; the
+	// extra 4 is the visible gap.
+	const float MinGap = 26.f * UIScale;
+	if (BlurbBottomY > 0.f)
+	{
+		Y = FMath::Max(Y, BlurbBottomY + MinGap);
+	}
+
+	// Never off the bottom edge: the second line sits 24px under the first and still needs its own
+	// height. If the panel is so tall that even this cannot fit, the hints win and the blurb is what
+	// gets overlapped - the keys are the line a stuck player actually needs.
+	Y = FMath::Min(Y, ViewH - (46.f * UIScale));
 
 	// The grid runs all the way to the bottom edge, so the key hints get their own dark strip.
 	// Same reasoning as the console panel above: legibility beats atmosphere every time.
@@ -2373,6 +2541,27 @@ void ATraceMenuHUD::DrawCursor()
 	// The OS cursor is drawn by the platform and is invisible in captures, so the menu draws its
 	// own. It is also simply nicer: a system arrow on this screen would look like a mistake.
 	if (!bHasCursor || bTravelling)
+	{
+		return;
+	}
+
+	// ---- ONE POINTER, ONE OWNER (spec v20 integration) -------------------------------------------
+	//
+	// While the settings overlay is up, FTraceOptionsMenu draws the ARTIST'S arrow at the live mouse
+	// position — and this function would draw a SECOND pointer, the old cyan cross, at a position
+	// that is deliberately frozen (the sample above is skipped while the overlay is open, so that
+	// closing it does not re-select whichever title row the pointer happened to be over). Two
+	// pointers, one of them stale and lying about where the mouse is.
+	//
+	// This was invisible until spec v20 because both marks were the same cyan cross, and it is STILL
+	// invisible in most captures because OptionsMenu.Tick() paints its 880x972 panel into this same
+	// Canvas AFTER this call and covers the stale mark. It shows wherever the frozen point falls
+	// outside that panel — roughly half the screen at 1920x1080 — which is exactly the case where a
+	// player leaves the pointer at a screen edge and opens SETTINGS from the keyboard.
+	//
+	// Red arm: `Trace.Menu.CursorRedArm 1` restores the old unconditional draw, so one binary
+	// produces both arms and the guard below can be shown to be load-bearing rather than asserted.
+	if (OptionsMenu.IsOpen() && TraceMenuHUDFile::GCursorRedArm == 0)
 	{
 		return;
 	}
@@ -2418,25 +2607,24 @@ void ATraceMenuHUD::DrawTravelOverlay()
 // Helpers
 // =================================================================================================
 
+// All three go through UI/Text now — spec v22 §A1. The (UFont*, Scale) signatures are this file's
+// layout vocabulary and are kept; TraceMenuHUDType::SizeFor translates them.
+
 void ATraceMenuHUD::DrawTextCentered(const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale)
 {
-	DrawText(Text, Color, CenterX - MeasureWidth(Text, Font, Scale) * 0.5f, Y, Font, Scale);
+	TraceMenuHUDType::Draw(this, Text, Color, CenterX, Y, Font, Scale, TraceText::EHAlign::Center);
 }
 
 float ATraceMenuHUD::MeasureWidth(const FString& Text, UFont* Font, float Scale)
 {
-	float OutWidth = 0.f;
-	float OutHeight = 0.f;
-	GetTextSize(Text, OutWidth, OutHeight, Font, Scale);
-	return OutWidth;
+	return TraceText::MeasureWidth(Text, TraceMenuHUDType::SizeFor(this, Font, Scale));
 }
 
 float ATraceMenuHUD::MeasureHeight(const FString& Text, UFont* Font, float Scale)
 {
-	float OutWidth = 0.f;
-	float OutHeight = 0.f;
-	GetTextSize(Text, OutWidth, OutHeight, Font, Scale);
-	return OutHeight;
+	// The LINE BOX, independent of @p Text, so a row's height cannot change with its contents.
+	(void)Text;
+	return TraceText::LineHeight(TraceMenuHUDType::SizeFor(this, Font, Scale));
 }
 
 void ATraceMenuHUD::DrawGlowLine(float X0, float Y0, float X1, float Y1, const FLinearColor& Color, float Thickness)

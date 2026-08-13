@@ -5191,9 +5191,15 @@ public:
 	//             halved. If she activates it and then picks up the core, the remaining duration is
 	//             halved."
 	//
-	// *** THREE OF THESE ARE ALSO INERT UNTIL SOMEBODY ELSE'S ONE-LINERS LAND. *** The extra charge,
-	// the 60 health and the wall-jump bonus are surfaced through TraceAbilityTraits and are read by
-	// nothing today. Zip itself is fully live — it is written entirely inside her own ability set.
+	// ALL OF THESE ARE LIVE. The extra charge, the 60 health and the wall-jump bonus are surfaced
+	// through TraceAbilityTraits and the three owning slices now call them (GetMaxDashCharges,
+	// TraceHealthComponent::GetMaxHealth, TryWallJump's retention term). Zip is written entirely
+	// inside her own ability set. An older note here said three of them were inert; it was true when
+	// written and stopped being true without being edited.
+	//
+	// DEMO 19 changed two things here: the two Zip speed scales halve (item 4), and the extra dash
+	// charge is now conditional on NOT carrying the Core (item 8 — the condition is in her ability
+	// set, not in this knob).
 	// ==========================================================================================
 
 	/**
@@ -5202,6 +5208,11 @@ public:
 	 *
 	 * AN ADDEND, NOT A TOTAL, deliberately: written as "2" it would stop tracking a retune of
 	 * BaseDashCharges and Lily would silently stop being "one more than everyone".
+	 *
+	 * *** DEMO 19 ITEM 8 GATES IT ON NOT CARRYING. *** The knob is still 1 and still an addend; the
+	 * CONDITION lives in UTraceAbilitySetLily::GetExtraDashCharges(), which returns 0 while she has
+	 * the Core. Two dashes free-running, two while carrying — the carrier's own extra charge is what
+	 * she gets then, not hers stacked on top of it.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Extra Dash Charges (ON TOP of everyone's pool) [v19 §3]", ClampMin = "0", ClampMax = "5", UIMin = "0", UIMax = "2"))
 	int32 LilyExtraDashCharges = 1;
@@ -5257,20 +5268,31 @@ public:
 	float LilyZipCarrierDurationScale = 0.5f;
 
 	/**
-	 * CLIMB RATE WHILE JUMP IS HELD, as a multiple of WalkSpeed. §3: "jump goes up at walking speed",
-	 * so 1.0 and DERIVED — the 800 is UTraceSettings::WalkSpeed and is written down nowhere here.
+	 * CLIMB RATE WHILE JUMP IS HELD, as a multiple of WalkSpeed.
+	 *
+	 * §3 said "jump goes up at walking speed" (1.0). *** DEMO 19 ITEM 4 HALVES IT: "half the speed she
+	 * moves vertically at" *** — so 0.5, i.e. 400 uu/s against the shipped WalkSpeed of 800.
+	 *
+	 * STILL A MULTIPLE OF WalkSpeed AND NOT THE NUMBER 400, for the reason it was derived in the first
+	 * place: the flight should follow a retune of the walk rather than drift away from it.
+	 *
+	 * Also in Config/DefaultGame.ini, which BEATS this default. Change both or change nothing.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Climb Speed (x WalkSpeed) [v19 §3: 1.0 = 'walking speed']", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.25", UIMax = "2.0"))
-	float LilyZipClimbSpeedScale = 1.f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Climb Speed (x WalkSpeed) [Demo 19 item 4: 0.5 = half a walk]", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.25", UIMax = "2.0"))
+	float LilyZipClimbSpeedScale = 0.5f;
 
 	/**
 	 * DESCENT RATE WHILE CROUCH/SLIDE IS HELD, as a multiple of WalkSpeed.
 	 *
 	 * §3 says only "slide/crouch goes down" and gives no rate; [ASSUMPTION] the same magnitude as the
-	 * climb, so the control is symmetric and a player learns one number rather than two.
+	 * climb, so the control is symmetric and a player learns one number rather than two. Demo 19 item
+	 * 4 asks for "half the speed she moves VERTICALLY at" — vertically, not upwards — so the descent
+	 * halves with the climb and the assumption is preserved rather than quietly abandoned.
+	 *
+	 * Also in Config/DefaultGame.ini, which BEATS this default. Change both or change nothing.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Descend Speed (x WalkSpeed) [v19 §3 ASSUMPTION: same as the climb]", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.25", UIMax = "2.0"))
-	float LilyZipDescendSpeedScale = 1.f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Descend Speed (x WalkSpeed) [Demo 19 item 4 ASSUMPTION: same as the climb]", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.25", UIMax = "2.0"))
+	float LilyZipDescendSpeedScale = 0.5f;
 
 	/** §3: "Zip (30 s)". The card prints this too — Trace.VerifyCharacterData compares the pair. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Cooldown (s) [v19 §3: 30]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))

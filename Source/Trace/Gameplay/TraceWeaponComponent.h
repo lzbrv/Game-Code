@@ -361,6 +361,32 @@ public:
 	bool CanSwing(ETraceMeleeRefusal* OutRefusal = nullptr) const;
 
 	/**
+	 * "MAY THIS PAWN'S WEAPON ACT WITHOUT BEING TOLD TO?" Default yes; false makes it a TARGET.
+	 *
+	 * DEMO 19 ITEM 2, verbatim: "Don't let the bots attack." The practice range's five targets are
+	 * possessed by a bare ATracePracticeDummyController that deliberately steers nothing and presses
+	 * nothing — but TickBotKnife() below does not consult the controller's intentions. It fires for
+	 * ANY pawn whose controller is not an APlayerController, so the range's targets were drawing the
+	 * knife and swinging it at whatever came within reach, which is exactly the "bots attacking" the
+	 * user reported and precisely what a row of stationary targets must not do.
+	 *
+	 * WHY A PER-PAWN BIT RATHER THAN Trace.Knife.BotAuto 0. The cvar is global: switching it off in
+	 * the range would also silence the bots of a range deliberately opened with `?bots=5`, and it
+	 * would silence them in a real match on the same machine. This bit is a property of the PAWN, so
+	 * "this body is a target" travels with the body and nothing else changes.
+	 *
+	 * WHY IT LIVES ON THE WEAPON AND NOT ON THE AI. The autonomy being switched off is this
+	 * component's own (TickBotKnife is a melee-slice behaviour, not an ATraceBotController one), so
+	 * the switch belongs at the thing it switches. The AI slice stays untouched.
+	 *
+	 * NOT REPLICATED and not saved: it only gates a server-side tick, and a target's pawn is rebuilt
+	 * from scratch on every respawn — ATracePracticeDummyController::OnPossess re-applies it there,
+	 * which is the only place it is ever set.
+	 */
+	void SetAutonomousAttacksAllowed(bool bAllowed) { bAutonomousAttacksAllowed = bAllowed; }
+	bool AreAutonomousAttacksAllowed() const { return bAutonomousAttacksAllowed; }
+
+	/**
 	 * @param Desired               the weapon to bring up. A request for the weapon already equipped
 	 *                              still costs a pullout, deliberately: refusing it silently would
 	 *                              make a double-tap of the bind feel like a dropped input.
@@ -763,6 +789,9 @@ private:
 
 	/** Local-clock time of the last bot swap decision, so a bot cannot thrash the 0.2 s pullout. */
 	double LastBotSwapDecisionTime = -1000.0;
+
+	/** See SetAutonomousAttacksAllowed. True for everything except a practice-range target. */
+	bool bAutonomousAttacksAllowed = true;
 
 	// --- Presentation: the knife you can see ------------------------------------------------------
 	//

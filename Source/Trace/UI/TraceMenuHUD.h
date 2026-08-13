@@ -451,6 +451,19 @@ private:
 	 */
 	float TaglineBottomY = 0.f;
 
+	/**
+	 * Bottom of the console blurb as of the last DrawMenuRows(), so DrawFooter() can sit UNDER it
+	 * instead of at a hard-coded height. Exactly the TaglineBottomY pattern above, and it exists for
+	 * a defect that shipped: spec v20 §0.4's "footer drawn twice, overlapping itself".
+	 *
+	 * The blurb hangs off the bottom of the rows panel, and that panel GROWS WITH THE ROW COUNT,
+	 * while the key hints were anchored to the viewport bottom. At seven rows on a 1080-high screen
+	 * the two arrived within a few pixels of each other and printed one string on top of the other.
+	 * Deriving the footer from the measured blurb means adding a row cannot recreate the collision.
+	 * The UMG renderer had the same bug and was fixed the same way (PlaceFooterBelowBlurb).
+	 */
+	float BlurbBottomY = 0.f;
+
 	/** Viewport size and the layout scale every constant in the .cpp is authored against. */
 	float ViewW = 0.f;
 	float ViewH = 0.f;
@@ -498,6 +511,19 @@ private:
 
 	/** True on frames the widget drew. Read by the verifier; see IsMenuUmgActive(). */
 	bool bMenuUmgActive = false;
+
+	/**
+	 * True when the UMG title screen is AVAILABLE this frame, which is not the same as bMenuUmgActive
+	 * — the widget is available and yet stands down for every frame a Canvas modal is up.
+	 *
+	 * Read by DrawJoinPrompt, and the reason it exists: the JOIN prompt (and the settings overlay)
+	 * force the Canvas renderer for their frames, so the title screen BEHIND the modal is the old
+	 * stroked-vector one even when the player's actual title screen is the artist's. That was
+	 * invisible while GUseUMG defaulted to 0, because both states looked the same. It became a
+	 * visible wart the moment spec v20 flipped the default: press JOIN and the game's own name
+	 * changes design behind the prompt. See DrawJoinPrompt for what is done about it.
+	 */
+	bool bMenuUmgAvailable = false;
 
 	/** Set once, so the adoption decision is logged exactly once per title screen rather than 60x/s. */
 	bool bMenuUmgDecisionLogged = false;

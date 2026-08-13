@@ -1,19 +1,42 @@
 // Trace — the artist's menu art, named once (spec v19 §5).
 //
 // -------------------------------------------------------------------------------------------------
-// THE FONT IS NOT HERE, AND THAT IS THE POINT OF THIS FILE
+// THIS FILE NO LONGER DECIDES THE TYPEFACE. Source/Trace/UI/Text DOES. (spec v22 §A1)
 // -------------------------------------------------------------------------------------------------
-// The brief says "use the exact font". The art arrived as ONE PNG. A PNG can supply the four words
-// that were drawn into it — PLAY, SETTINGS, KEYBIND, KEY — and it cannot supply a letter that is not
-// on it, which is every other label this menu needs: JOIN, DIFFICULTY, SCORING MODE, QUIT, every key
-// name on the settings screen, every character name. There is no way to typeset "SCORING MODE" out
-// of a picture of the word "PLAY".
+// Read this before believing anything below about fonts.
 //
-// So the four baked words ARE used, as sprites, at the artist's own letterforms — and everything else
-// is engine-rendered in the closest thing this project has, which is Roboto Light. That is a stand-in
-// and it is NOT the same typeface. It is declared in exactly one place, MenuFontAsset /
-// MenuFontTypeface below, and swapping in the real .ttf or .otf is those two lines plus one import.
-// Nothing else in the UI names a font.
+// The brief said "use the exact font", the art arrived as ONE PNG, and for two specs the answer was
+// a split: the four words baked into that PNG — PLAY, SETTINGS, KEYBIND, KEY — were used as sprites
+// at the artist's own letterforms, and every other label (JOIN, DIFFICULTY, SCORING MODE, QUIT, key
+// names, character names) was engine-rendered in an interim substitute, Lato Regular. Two faces, one
+// column, one row apart. That was the most obvious "this isn't my art" tell on the screen.
+//
+// The owner then supplied SOFACHROME as a glyph atlas, and the split is over: the whole charset is
+// available, so any string can be set in the artist's face.
+//
+// *** The atlas cannot be a UFont, so it is not reached through this file. *** An offline (bitmap)
+// UFont returns nullptr from GetCompositeFont and Slate silently substitutes its last-resort face —
+// measured, see TraceText.h. The glyphs are therefore drawn by hand, one quad each, by:
+//
+//     UI/Text/TraceText.h              layout, measurement, and which face is live
+//     UI/Text/TraceCanvasText.h        the Canvas screens
+//     UI/Text/TraceAtlasTextWidget.h   UMG — UTraceAtlasText, the drop-in for a UTextBlock
+//
+// WHAT IS LEFT HERE IS THE FALLBACK, and it is still load-bearing. When the atlas texture is missing
+// or stale, or -TraceNoFontAtlas / `Trace.Text.Atlas 0` forces the degraded path, everything in
+// UI/Text typesets MenuFont() below instead. A menu in the wrong font beats a menu with no text.
+// `Trace.Text.Report` says which of the two is on screen at any moment.
+//
+// So MenuFontSourceFile is no longer "the one line that changes the screen" — it is the one line that
+// changes the FALLBACK. Changing the real face means re-running Scripts/generate_font_atlas.py and
+// Scripts/import-font-atlas.sh.
+//
+// The three copies problem this file used to have: Scripts/generate-menu-widgets.py bakes an
+// FSlateFontInfo into every text block of WBP_TitleMenu, so for years the constant below decided
+// NOTHING on screen — the generator kept its own hard-coded copy and the C++ one only fed a log
+// line. It no longer does: the generator PARSES its font out of this header (see art_style_constant()
+// there), so this is the only place in the project a FONT is named. If you add a third copy
+// anywhere, you have re-broken it.
 //
 // -------------------------------------------------------------------------------------------------
 // THE SPRITES
@@ -48,31 +71,72 @@
 namespace TraceMenuArtStyle
 {
 	// =============================================================================================
-	// THE FONT. Two lines. This is the whole substitution.
+	// THE FONT. ONE constant (spec v20 §1). Everything under it is plumbing that a font swap does
+	// not touch.
 	// =============================================================================================
 
 	/**
-	 * Stand-in for the artist's typeface until we are sent the file.
+	 * *** THE FALLBACK FACE. Since spec v22 §A1 this is NOT what the menu normally draws in. ***
 	 *
-	 * Roboto Light is the closest thing bundled with the engine: the sheet's face is a thin, wide,
-	 * geometric display sans with flat-cut terminals, and of Roboto's shipped weights (Light, Regular,
-	 * Medium, Bold, Black, BoldCondensed) the Light one is the only one that is not visibly heavier
-	 * than the art. It is still the wrong typeface — its A is rounded and the sheet's is a hard
-	 * triangle — and the difference is visible on any row next to the PLAY sprite.
+	 * The artist's face is Sofachrome and it arrives as a glyph atlas drawn by UI/Text, not as a font
+	 * — see the header of this file. This constant decides what is used when that atlas is
+	 * unavailable or has been switched off on purpose.
+	 *
+	 * A file name inside Art/Fonts/. Scripts/generate-menu-widgets.py reads this very line out of
+	 * this header, imports that file to MenuFontAsset below, and bakes it into every text block of
+	 * WBP_TitleMenu; this file loads the same asset for everything drawn on a Canvas. Drop the real
+	 * .ttf/.otf into Art/Fonts/, change this string, re-run the generator, done.
+	 *
+	 * WHY LATO, AND WHY IT IS STILL WRONG. The user supplied twelve candidate fonts. None is the
+	 * sheet's face, and that was measured rather than eyeballed: each baked word (SETTINGS, PLAY,
+	 * KEYBIND, KEY) was segmented into letters and every candidate glyph scored by IoU at matched
+	 * cap height. Lato-Regular won at 0.5645, Myriad Pro Regular 0.5595, everything else below 0.48.
+	 * The artist's face is a hairline-weight, wide, squared-off geometric techno design; Lato is a
+	 * humanist text face and is visibly heavier and rounder. It is the closest of the twelve that is
+	 * also safe to ship — Myriad Pro, Proxima Nova and Trajan Pro 3 are COMMERCIAL and must never be
+	 * committed to this repository. So this is an interim substitute, and it is a substitute for
+	 * Roboto Light, which was a substitute already.
 	 */
-	static const TCHAR* const MenuFontAsset = TEXT("/Engine/EngineFonts/Roboto");
-	static const TCHAR* const MenuFontTypeface = TEXT("Light");
+	static const TCHAR* const MenuFontSourceFile = TEXT("Lato-Regular.ttf");
+
+	/**
+	 * Where the generator lands it. Fixed on purpose: the ASSET name does not change when the FILE
+	 * does, so a font swap never touches C++ that loads it, a .uasset reference, or a redirector.
+	 */
+	static const TCHAR* const MenuFontAsset = TEXT("/Game/Trace/UI/Fonts/F_TraceMenu.F_TraceMenu");
+
+	/**
+	 * The typeface inside that font asset. A UFont imported from a single .ttf carries exactly one,
+	 * and UE 5.8 names it "Default"; if a future font file carries several, name the one you want
+	 * here. Getting it wrong is not silent — MenuFont() below says so in the log and then draws in
+	 * the font's first face, which is what Slate would have done anyway.
+	 */
+	static const TCHAR* const MenuFontTypeface = TEXT("Default");
+
+	/**
+	 * Fallback, used only when MenuFontAsset fails to load — nobody re-ran the generator, the import
+	 * failed, the asset was not cooked. A menu in the wrong font beats a menu with no text, and this
+	 * is the font the whole menu was drawn in before spec v20, so falling back is a visible
+	 * regression rather than an invisible one.
+	 */
+	static const TCHAR* const MenuFontFallbackAsset = TEXT("/Engine/EngineFonts/Roboto");
+	static const TCHAR* const MenuFontFallbackTypeface = TEXT("Light");
 
 	/**
 	 * The font, at @p InSize points. Resolved once and cached.
 	 *
-	 * Falls back to the engine's default font — loudly, once — rather than returning an empty
-	 * FSlateFontInfo, which Slate draws as nothing at all. A menu with no words in it is a much worse
-	 * failure than a menu in the wrong words.
+	 * Falls back to MenuFontFallbackAsset — loudly, once — rather than returning an empty
+	 * FSlateFontInfo. A menu with no words in it is a much worse failure than a menu in the wrong
+	 * words, and an empty FSlateFontInfo is not even that: Slate silently substitutes its last-resort
+	 * face, so nothing looks broken and the design is simply gone.
 	 */
 	TRACE_API FSlateFontInfo MenuFont(float InSize);
 
-	/** True when MenuFontAsset/MenuFontTypeface both resolved. Reported by `Trace.UI.VerifyMenuArt`. */
+	/**
+	 * True only when the INTENDED font resolved: MenuFontAsset loaded AND it contains
+	 * MenuFontTypeface. False while the menu is drawing in the Roboto fallback, which is the state
+	 * this is here to catch — a fallback looks like a working menu.
+	 */
 	TRACE_API bool IsMenuFontResolved();
 
 	/** One line naming what is actually being drawn with, for the verifier and the log. */
@@ -89,7 +153,21 @@ namespace TraceMenuArtStyle
 	static const TCHAR* const BtnHover    = TEXT("/Game/Trace/UI/Art/T_MenuBtn_Hover.T_MenuBtn_Hover");
 	static const TCHAR* const BtnDisabled = TEXT("/Game/Trace/UI/Art/T_MenuBtn_Disabled.T_MenuBtn_Disabled");
 
-	/** The four words the sheet actually contains, lifted off their plates as white-on-transparent. */
+	/**
+	 * The four words the sheet actually contains, lifted off their plates as white-on-transparent.
+	 *
+	 * *** RETIRED AS A SOURCE OF TEXT (spec v22 §A1). *** These existed only because the atlas did
+	 * not, and a picture of the word PLAY cannot typeset SCORING MODE. Now that the whole charset is
+	 * available, setting PLAY and SETTINGS as sprites while their neighbours are live text is what
+	 * PUT two typefaces in one column. Draw them as live text like every other label:
+	 *
+	 *     Label->SetSize(TraceText::SizeForCapHeight(<the cap height the sprite occupied>));
+	 *     Label->VerticalAlignment = ... EVAlign::CapTop;   // a word sprite's top edge IS its cap line
+	 *
+	 * They are deliberately KEPT in the repository and kept named here: they are the artist's own
+	 * raster of those four words and the reference the atlas is checked against. Do not delete them;
+	 * just stop typesetting with them.
+	 */
 	static const TCHAR* const WordPlay     = TEXT("/Game/Trace/UI/Art/T_MenuWord_Play.T_MenuWord_Play");
 	static const TCHAR* const WordSettings = TEXT("/Game/Trace/UI/Art/T_MenuWord_Settings.T_MenuWord_Settings");
 	static const TCHAR* const WordKeybind  = TEXT("/Game/Trace/UI/Art/T_MenuWord_Keybind.T_MenuWord_Keybind");

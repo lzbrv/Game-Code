@@ -195,6 +195,22 @@ FTraceHudCornerPresented UTraceHudCornerWidget::PresentCorner(const FTraceHudCor
 	return Presented;
 }
 
+void UTraceHudCornerWidget::InstallAtlasLabels()
+{
+	if (bAtlasLabelsInstalled)
+	{
+		return;
+	}
+	bAtlasLabelsInstalled = true;
+
+	AtlasLabels.Reset();
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CountText));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CapacityText));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AmmoLabelText));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReloadLabelText));
+	AtlasLabels.RemoveAll([](const FTraceAtlasLabel& Label) { return !Label.IsValid(); });
+}
+
 void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 	FTraceHudCornerPresented& OutPresented)
 {
@@ -215,6 +231,8 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 		InState.bBeeClip ? TraceHudCornerWidgetFile::PlateEdgeAlphaBee
 		                 : TraceHudCornerWidgetFile::PlateEdgeAlphaNormal));
 
+	InstallAtlasLabels();
+
 	CountText->SetText(FText::FromString(InState.CountText));
 	CountText->SetColorAndOpacity(FSlateColor(InState.CountColor));
 	CapacityText->SetText(FText::FromString(InState.CapacityText));
@@ -224,6 +242,9 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 
 	ReloadLabelText->SetText(FText::FromString(InState.RightLabel));
 	ReloadLabelText->SetColorAndOpacity(FSlateColor(InState.RightLabelColor));
+
+	// After all four SetTexts, before the magazine strip: this is what moves them onto the screen.
+	TraceAtlasTextSwap::MirrorAll(AtlasLabels);
 
 	// ---- The magazine strip ---------------------------------------------------------------------
 	//

@@ -16,6 +16,7 @@
 #include "Core/TraceCharacter.h"
 #include "Gameplay/TraceCore.h"
 #include "Movement/TraceCharacterMovementComponent.h"
+#include "Settings/TraceUserSettings.h"                   // the player's Jump / Crouch binds
 #include "Trace.h"
 #include "TraceSettings.h"
 
@@ -46,6 +47,42 @@ static TAutoConsoleVariable<int32> CVarLilyZip(
 	1,
 	TEXT("Dev/red arm. 1 (default) = E flies her for 5s (spec v19 §3). 0 = the press is accepted, the cooldown "
 	     "starts, and she does not fly."),
+	ECVF_Cheat);
+
+/**
+ * *** THE RED ARM FOR DEMO 19 ITEM 4. *** 0 restores, exactly, the code the user complained about.
+ *
+ * With 0 the climb is driven by the old bJumpHeld latch and nothing else: the key poll does not run,
+ * so nothing ever clears it, so one press of space climbs for the rest of the flight and crouch can
+ * never win the `!climbing && IsCrouchHeld()` test. That is not an imitation of the bug — it is the
+ * shipped v21 code path, selected by an if.
+ *
+ * Trace.Lily.KeyTest runs this arm FIRST and refuses to grade the fix unless it reproduces. NEVER
+ * SHIP 0.
+ */
+/**
+ * *** THE RED ARM FOR DEMO 19 ITEM 8. *** 0 restores the shipped v21 rule: the extra charge always.
+ *
+ * With 0, GetExtraDashCharges() stops asking whether she is carrying, so she is back to two dashes
+ * free-running and THREE while carrying — which is what the character-select card used to promise and
+ * what Trace.Lily.DashTest's red arm has to reproduce before the green reading is worth anything.
+ * NEVER SHIP 0.
+ */
+static TAutoConsoleVariable<int32> CVarLilyDashCarrierGate(
+	TEXT("Trace.Lily.DashCarrierGate"),
+	1,
+	TEXT("Dev/red arm. 1 (default) = Demo 19 item 8: Lily's extra dash charge applies ONLY while she is NOT "
+	     "carrying the Core (2 free-running, 2 carrying). 0 = the shipped v21 rule, the charge always (2 "
+	     "free-running, 3 carrying). NEVER SHIP 0."),
+	ECVF_Cheat);
+
+static TAutoConsoleVariable<int32> CVarLilyZipHoldRelease(
+	TEXT("Trace.Lily.ZipHoldRelease"),
+	1,
+	TEXT("Dev/red arm. 1 (default) = the climb follows the jump key as a LEVEL, polled on the machine with the "
+	     "keyboard and carried to the server on FLAG_Custom_1, so letting go stops the climb and crouch then "
+	     "descends. 0 = the shipped v21 behaviour: the press latches, the release never arrives (the framework's "
+	     "release hook has no caller), she climbs for the whole flight and crouch does nothing. NEVER SHIP 0."),
 	ECVF_Cheat);
 
 // =================================================================================================
@@ -111,6 +148,26 @@ bool UTraceAbilitySetLily::ShouldDriveMovement() const
 
 int32 UTraceAbilitySetLily::GetExtraDashCharges() const
 {
+	// DEMO 19 ITEM 8: "only ... when she is not carrying the core".
+	//
+	// THE CONDITION IS ON THE ADDEND, NOT ON THE TOTAL, and that distinction is the whole item.
+	// UTraceCharacterMovementComponent::GetMaxDashCharges() has already added the carrier's own extra
+	// charge by the time it asks this function, so returning 0 while carrying leaves her on the same
+	// two dashes as everybody else who is carrying — it does not take her down to one. Returning
+	// "2 minus whatever" here instead would have.
+	//
+	// READ THROUGH UTraceAbilityComponent::IsCarrier, which ORs the pawn's replicated mirror with the
+	// Core's own holder, so a client answers the same as the server on the frame of a pickup. That
+	// matters more here than it does for the duration halvings: this value is read inside the
+	// PREDICTED movement path, and a client that disagreed for a frame would spend a charge the
+	// server then refunded.
+	const ATraceCharacter* MyPawn = GetCharacter();
+	if (MyPawn != nullptr && UTraceAbilityComponent::IsCarrier(MyPawn)
+		&& CVarLilyDashCarrierGate.GetValueOnAnyThread() != 0)
+	{
+		return 0;
+	}
+
 	return FMath::Clamp(UTraceSettings::Get().LilyExtraDashCharges, 0, 5);
 }
 
@@ -231,6 +288,13 @@ void UTraceAbilitySetLily::StopZip(const TCHAR* Why)
 	ZipEndMatchTime = 0.f;
 	bJumpHeld = false;
 
+	// The climb level goes with the flight. It would go stale on its own inside a quarter second, but
+	// "the ability ended" is a better reason for it to be false than "nobody refreshed it".
+	if (UTraceCharacterMovementComponent* MoveComp = GetMovement())
+	{
+		MoveComp->SetJumpHeld(false);
+	}
+
 	// NOTHING HERE TOUCHES THE COOLDOWN. It was started by the framework when ActivateAbility
 	// returned true and it keeps running through the flight, through death and through a respawn —
 	// spec §5, and spec v19 §4.2 restates it.
@@ -296,8 +360,69 @@ void UTraceAbilitySetLily::TickAbilities(float DeltaSeconds)
 
 	if (bZipping)
 	{
+		// BEFORE ApplyZip, never after: this is where the release the framework never delivers is
+		// discovered, and reading the level a tick before refreshing it would put a 50 ms delay on
+		// every press and every let-go instead of only on the let-go.
+		SampleClimbIntent();
+
 		ApplyZip(DeltaSeconds);
 	}
+}
+
+void UTraceAbilitySetLily::SampleClimbIntent()
+{
+	// See the header for the missing release hook this exists to work around.
+	if (CVarLilyZipHoldRelease.GetValueOnAnyThread() == 0)
+	{
+		return;   // RED ARM: the latch is left in charge, which is the shipped v21 bug.
+	}
+
+	// ONLY THE MACHINE WITH THE KEYBOARD SAMPLES. On the authority for a REMOTE client this returns
+	// early and the level arrives instead on FLAG_Custom_1, inside that client's next saved move —
+	// which is the point of putting it there.
+	if (!IsLocallyControlled())
+	{
+		return;
+	}
+
+	ATraceCharacter* MyPawn = GetCharacter();
+	UTraceCharacterMovementComponent* MoveComp = GetMovement();
+	if (MyPawn == nullptr || MoveComp == nullptr)
+	{
+		return;
+	}
+
+	// A BOT HAS NO KEYBOARD, so there is nothing to sample and nothing to clear. ATraceBotController
+	// calls HandleJumpPressed() like a player does; what stops a bot Lily climbing forever is the
+	// staleness watchdog inside SetJumpHeld(), which is exactly why that watchdog is there.
+	const APlayerController* PC = Cast<APlayerController>(MyPawn->GetController());
+	if (PC == nullptr)
+	{
+		return;
+	}
+
+	// THE PLAYER'S OWN BIND, from the same table ApplyControlSettings maps from, so a rebound jump is
+	// honoured here without this file knowing any defaults. An unbound action has an invalid key,
+	// which IsInputKeyDown would answer nonsense for — in that case say nothing and let the press
+	// latch plus the watchdog carry it, rather than pinning her to the floor for the whole flight.
+	const FKey JumpKey = UTraceUserSettings::Get().GetKey(ETraceInputAction::Jump);
+	if (!JumpKey.IsValid())
+	{
+		return;
+	}
+
+	MoveComp->SetJumpHeld(PC->IsInputKeyDown(JumpKey));
+}
+
+bool UTraceAbilitySetLily::IsClimbHeld() const
+{
+	if (CVarLilyZipHoldRelease.GetValueOnAnyThread() == 0)
+	{
+		return bJumpHeld;   // RED ARM: the latch, which nothing clears until the flight ends.
+	}
+
+	const UTraceCharacterMovementComponent* MoveComp = GetMovement();
+	return (MoveComp != nullptr) && MoveComp->IsJumpHeld();
 }
 
 void UTraceAbilitySetLily::ApplyZip(float DeltaSeconds)
@@ -333,18 +458,20 @@ void UTraceAbilitySetLily::ApplyZip(float DeltaSeconds)
 	const UTraceSettings& Settings = UTraceSettings::Get();
 	const float WalkSpeed = FMath::Max(1.f, Settings.WalkSpeed);
 
-	// "JUMP GOES UP AT WALKING SPEED" — derived from WalkSpeed, so the 800 is written down nowhere
-	// here and a retune of the walk carries the climb with it.
+	// §3 said "jump goes up at walking speed"; DEMO 19 ITEM 4 says "half the speed she moves
+	// vertically at", so both scales are 0.5 and the climb is half a walk. Still derived from
+	// WalkSpeed rather than written as 400, so a retune of the walk carries the flight with it.
 	const float ClimbSpeed   = WalkSpeed * FMath::Clamp(Settings.LilyZipClimbSpeedScale, 0.1f, 4.f);
 	const float DescendSpeed = WalkSpeed * FMath::Clamp(Settings.LilyZipDescendSpeedScale, 0.1f, 4.f);
 
-	// "SLIDE/CROUCH GOES DOWN". IsCrouchHeld() is the movement component's own union of this slice's
-	// slide flag and the engine's bWantsToCrouch, so both keys mean the same thing here without this
-	// file learning either binding.
-	const bool bDescending = !bJumpHeld && MoveComp->IsCrouchHeld();
+	// THE TWO KEYS, BOTH AS LEVELS. IsCrouchHeld() is the movement component's union of this slice's
+	// slide flag and the engine's bWantsToCrouch; IsClimbHeld() is its new twin for jump, and adding
+	// it is what makes this line's `!bClimbing` capable of being false at all. See the header.
+	const bool bClimbing   = IsClimbHeld();
+	const bool bDescending = !bClimbing && MoveComp->IsCrouchHeld();
 
 	float CommandedZ = 0.f;
-	if (bJumpHeld)        { CommandedZ =  ClimbSpeed; }
+	if (bClimbing)        { CommandedZ =  ClimbSpeed; }
 	else if (bDescending) { CommandedZ = -DescendSpeed; }
 
 	// --- THE ONE TICK OF GRAVITY THIS COMMAND HAS TO SURVIVE --------------------------------------
@@ -367,7 +494,7 @@ void UTraceAbilitySetLily::ApplyZip(float DeltaSeconds)
 	// walked off an edge. One nudge into MOVE_Falling on the frame she asks to climb is the whole fix,
 	// and it is done through LaunchCharacter rather than SetMovementMode so the engine's own
 	// take-off path (and its replication of the mode) runs exactly as it does for a jump.
-	if (bJumpHeld && MoveComp->IsMovingOnGround())
+	if (bClimbing && MoveComp->IsMovingOnGround())
 	{
 		MyPawn->LaunchCharacter(FVector(0.f, 0.f, ClimbSpeed), /*bXYOverride*/ false, /*bZOverride*/ true);
 	}
@@ -380,7 +507,15 @@ bool UTraceAbilitySetLily::OnJumpPressed()
 		return false;   // Not flying: an ordinary jump, an ordinary wall jump, an ordinary slide-jump.
 	}
 
-	bJumpHeld = true;
+	bJumpHeld = true;   // the red arm's latch, and nothing else reads it while the fix is on
+
+	// THE PRESS DOES NOT WAIT FOR THE 20 Hz POLL. Setting the level here is what keeps the key
+	// feeling instant; SampleClimbIntent's job is the RELEASE, which is the edge nothing else in the
+	// project delivers.
+	if (UTraceCharacterMovementComponent* MoveComp = GetMovement())
+	{
+		MoveComp->SetJumpHeld(true);
+	}
 
 	// TRUE = CONSUMED, so ACharacter::Jump never runs. §3 rebinds the key for the duration of the
 	// flight ("jump goes up at walking speed"), and letting the normal jump fire underneath would add
@@ -390,7 +525,18 @@ bool UTraceAbilitySetLily::OnJumpPressed()
 
 void UTraceAbilitySetLily::OnJumpReleased()
 {
+	// *** THIS FUNCTION IS DEAD CODE IN A REAL MATCH AND THAT IS THE BUG, NOT AN OVERSIGHT HERE. ***
+	// UTraceAbilityComponent::HandleJumpReleased() — its only possible caller — is itself called by
+	// nothing; ATracePlayerController::OnJumpCompleted() stops at ACharacter::StopJumping(). It is
+	// kept correct and kept wired so that the day somebody adds that one line, the release arrives
+	// twice and means the same thing both times. What actually ends the climb today is
+	// SampleClimbIntent().
 	bJumpHeld = false;
+
+	if (UTraceCharacterMovementComponent* MoveComp = GetMovement())
+	{
+		MoveComp->SetJumpHeld(false);
+	}
 }
 
 // =================================================================================================
@@ -514,6 +660,51 @@ namespace TraceLilyVerifyFile
 		}
 
 		OutWhy = TEXT("no human player controller with a pawn");
+		return nullptr;
+	}
+
+	/**
+	 * *** WHY EVERY KEY-PRESSING HARNESS IN THIS FILE NOW WAITS. ***
+	 *
+	 * The v22 baseline run of Trace.Lily.FlightTest reported climb 0 uu, sag 0 uu, z 90 -> 90 -> 90 in
+	 * BOTH arms and a verdict of INVALID. Nothing was wrong with the flight: the CHARACTER SELECT
+	 * SCREEN was still open, so the world was PAUSED, and the E press the harness fired to cast Zip was
+	 * eaten by the screen as a card pick — the log line right after it reads "[CharSelect] Requesting
+	 * SLIMEBALL". The harness then spent both arms measuring a paused Slimeball.
+	 *
+	 * That is worth a named function rather than a comment: a harness that runs at the wrong moment
+	 * does not fail, it produces zeroes, and zeroes are the easiest number in the world to mistake for
+	 * "the ability does nothing".
+	 *
+	 * The select screen pauses the world and the match does not, so IsPaused() is the exact gate.
+	 */
+	bool IsWorldReadyForKeyPresses(const UWorld* WorldPtr)
+	{
+		if (WorldPtr == nullptr || WorldPtr->IsPaused())
+		{
+			return false;
+		}
+
+		const APlayerController* PC = WorldPtr->GetFirstPlayerController();
+		return (PC != nullptr) && (PC->GetPawn() != nullptr);
+	}
+
+	/** The local game world — the one with a keyboard, which is not always the authoritative one. */
+	UWorld* FindLocalKeyboardWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if (Context.World() != nullptr && Context.World()->IsGameWorld()
+				&& Context.World()->GetFirstPlayerController() != nullptr)
+			{
+				return Context.World();
+			}
+		}
 		return nullptr;
 	}
 
@@ -710,8 +901,11 @@ namespace TraceLilyVerifyFile
 	{
 		/** 0 = RED (Trace.Lily.Zip 0), 1 = GREEN (shipped). */
 		int32 Arm = 0;
-		/** -1 arm setup, 0 climbing, 1 hovering. */
-		int32 Phase = -1;
+		/** -2 waiting for the select screen to close, -1 arm setup, 0 climbing, 1 hovering. */
+		int32 Phase = -2;
+
+		/** Real-time deadline for the -2 wait. See IsWorldReadyForKeyPresses. */
+		double ReadyGiveUpAt = 0.0;
 
 		/** REAL time. The select screen can pause the world; every other harness here learned that. */
 		double PhaseDeadline = 0.0;
@@ -800,40 +994,6 @@ namespace TraceLilyVerifyFile
 	{
 		const TCHAR* const Tag = TEXT("LILYFLIGHT");
 
-		// THE LOCAL world, not "the authoritative" one — a key press needs a keyboard. Same correction
-		// Elle's press test made, and for the same reason.
-		UWorld* LocalWorld = nullptr;
-		if (GEngine != nullptr)
-		{
-			for (const FWorldContext& Context : GEngine->GetWorldContexts())
-			{
-				if (Context.World() != nullptr && Context.World()->IsGameWorld()
-					&& Context.World()->GetFirstPlayerController() != nullptr)
-				{
-					LocalWorld = Context.World();
-					break;
-				}
-			}
-		}
-
-		if (LocalWorld == nullptr)
-		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[%s] VERDICT: INVALID — no game world with a local player controller. A key cannot be "
-				     "pressed on a machine nobody is sitting at."),
-				Tag);
-			return;
-		}
-
-		FString Why;
-		UTraceAbilitySetLily* Lily = MakePlayerIntoLily(LocalWorld, Why);
-		if (Lily == nullptr || Lily->GetCharacter() == nullptr)
-		{
-			UE_LOG(LogTraceGame, Warning, TEXT("[%s] VERDICT: INVALID — %s."), Tag,
-				(Lily == nullptr) ? *Why : TEXT("Lily has no pawn"));
-			return;
-		}
-
 		IConsoleVariable* const Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Lily.Zip"));
 		if (Arm == nullptr)
 		{
@@ -842,15 +1002,55 @@ namespace TraceLilyVerifyFile
 		}
 
 		FLilyFlightState* State = new FLilyFlightState();
-		State->Lily = Lily;
+		State->ReadyGiveUpAt = FPlatformTime::Seconds() + 30.0;
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[%s] starting. Two arms, RED first, ~%.1fs each, driving the REAL E and SPACE keys."),
+			TEXT("[%s] armed. Waiting for a live, UNPAUSED match with a local pawn, then two arms, RED first, "
+			     "~%.1fs each, driving the REAL E and SPACE keys."),
 			Tag, FlightClimbSeconds + FlightHoverSeconds + 0.5f);
 
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
 			[State, Arm](float /*Delta*/) -> bool
 			{
+				const double Now = FPlatformTime::Seconds();
+
+				// --- PHASE -2: WAIT FOR A WORLD THAT WILL ACCEPT A KEY PRESS ---------------------
+				//
+				// And claim Lily only once it will. Doing it earlier is what produced the v22 baseline's
+				// three zeroes: the select screen was still up, it ate the E as a card pick, and the run
+				// measured a paused Slimeball. See IsWorldReadyForKeyPresses.
+				if (State->Phase == -2)
+				{
+					UWorld* WaitWorld = FindLocalKeyboardWorld();
+					if (!IsWorldReadyForKeyPresses(WaitWorld))
+					{
+						if (Now > State->ReadyGiveUpAt)
+						{
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[LILYFLIGHT] VERDICT: INVALID — 30s went by with no unpaused match and a "
+								     "local pawn. A key cannot be pressed on a machine nobody is sitting at, and "
+								     "the select screen would have eaten it anyway."));
+							delete State;
+							return false;
+						}
+						return true;
+					}
+
+					FString Why;
+					UTraceAbilitySetLily* Claimed = MakePlayerIntoLily(WaitWorld, Why);
+					if (Claimed == nullptr || Claimed->GetCharacter() == nullptr)
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[LILYFLIGHT] VERDICT: INVALID — %s."),
+							(Claimed == nullptr) ? *Why : TEXT("Lily has no pawn"));
+						delete State;
+						return false;
+					}
+
+					State->Lily = Claimed;
+					State->Phase = -1;
+					return true;
+				}
+
 				UTraceAbilitySetLily* TickLily = State->Lily.Get();
 				ATraceCharacter* Pawn = (TickLily != nullptr) ? TickLily->GetCharacter() : nullptr;
 				UWorld* TickWorld = (Pawn != nullptr) ? Pawn->GetWorld() : nullptr;
@@ -864,8 +1064,6 @@ namespace TraceLilyVerifyFile
 					delete State;
 					return false;
 				}
-
-				const double Now = FPlatformTime::Seconds();
 
 				if (State->Phase == -1)
 				{
@@ -949,6 +1147,525 @@ namespace TraceLilyVerifyFile
 		     "hover drift the 20 Hz gravity correction exists to remove."),
 		FConsoleCommandDelegate::CreateStatic(&RunFlightTest));
 
+	// =============================================================================================
+	// Trace.Lily.KeyTest — DEMO 19 ITEM 4, FROM THE PLAYER'S CHAIR
+	//
+	// The complaint is not a number, it is a sequence of key presses with a wrong outcome:
+	//
+	//     "Pressing space once makes her continuously move up even after I let go,
+	//      and pressing control doesn't make her come down."
+	//
+	// So this harness performs exactly that sequence, on the real keys, through the real input
+	// pipeline, and judges it by where the pawn ENDS UP:
+	//
+	//     E                       cast Zip
+	//     hold JUMP    1.0 s      she should rise
+	//     LET GO       1.0 s      *** SHE SHOULD STOP RISING ***      <- half the complaint
+	//     hold CROUCH  0.8 s      *** SHE SHOULD COME DOWN ***        <- the other half
+	//
+	// TWO ARMS, RED FIRST, and the red arm is not an imitation: Trace.Lily.ZipHoldRelease 0 selects
+	// the shipped v21 code path (the latch that nothing ever cleared), so the RED numbers ARE the
+	// user's bug. If red does not reproduce — if letting go already stopped her — then the harness is
+	// not measuring its rule and it says INVALID rather than PASS.
+	//
+	// IT ALSO MEASURES THE SPEED, because "half the speed she moves vertically at" is item 4's third
+	// sentence and a knob set to 0.5 is not evidence that anything moves at half speed.
+	// =============================================================================================
+
+	struct FLilyKeyTestState
+	{
+		/** 0 = RED (Trace.Lily.ZipHoldRelease 0 — the shipped bug), 1 = GREEN (the fix). */
+		int32 Arm = 0;
+
+		/** -2 wait for an unpaused match, -1 cast and settle, 0 hold jump, 1 let go, 2 hold crouch. */
+		int32 Phase = -2;
+
+		double PhaseDeadline = 0.0;
+		double ReadyGiveUpAt = 0.0;
+
+		TWeakObjectPtr<UTraceAbilitySetLily> Lily;
+
+		FString JumpKeyName;
+		FString CrouchKeyName;
+
+		/** Z at each phase boundary, in world units. */
+		float ZAtHoldStart = 0.f;
+		float ZAtRelease = 0.f;
+		float ZAfterCoast = 0.f;
+
+		/** Per arm [RED, GREEN]: uu climbed while held, uu drifted after letting go, uu moved on crouch. */
+		float Climb[2] = { 0.f, 0.f };
+		float Coast[2] = { 0.f, 0.f };
+		float Crouched[2] = { 0.f, 0.f };
+		bool bRan[2] = { false, false };
+		bool bFlew[2] = { false, false };
+	};
+
+	constexpr float KeyTestSettleSeconds = 0.40f;   // Zip live, and any fall from the previous arm arrested
+	constexpr float KeyTestHoldSeconds   = 1.00f;   // jump held
+	constexpr float KeyTestCoastSeconds  = 1.00f;   // nothing held — THE COMPLAINT
+	constexpr float KeyTestCrouchSeconds = 0.80f;   // crouch held — THE OTHER HALF
+
+	void FinishKeyTest(FLilyKeyTestState* State)
+	{
+		const TCHAR* const Tag = TEXT("LILYKEYS");
+		const UTraceSettings& Settings = UTraceSettings::Get();
+
+		const float WalkSpeed    = FMath::Max(1.f, Settings.WalkSpeed);
+		const float ClimbSpeed   = WalkSpeed * FMath::Clamp(Settings.LilyZipClimbSpeedScale, 0.1f, 4.f);
+		const float DescendSpeed = WalkSpeed * FMath::Clamp(Settings.LilyZipDescendSpeedScale, 0.1f, 4.f);
+		const float ExpectedClimb   = ClimbSpeed * KeyTestHoldSeconds;
+		const float ExpectedDescend = DescendSpeed * KeyTestCrouchSeconds;
+
+		for (int32 Index = 0; Index < 2; ++Index)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] arm=%-22s  hold jump %.1fs: %+.0f uu  |  LET GO %.1fs: %+.0f uu  |  "
+				     "hold crouch %.1fs: %+.0f uu   (flying=%d)"),
+				Tag,
+				(Index == 1) ? TEXT("GREEN (the fix)") : TEXT("RED (shipped v21 bug)"),
+				KeyTestHoldSeconds, State->Climb[Index],
+				KeyTestCoastSeconds, State->Coast[Index],
+				KeyTestCrouchSeconds, State->Crouched[Index],
+				State->bFlew[Index] ? 1 : 0);
+		}
+
+		// ---- THE RED ARM HAS TO REPRODUCE THE USER'S SENTENCE, OR NOTHING BELOW COUNTS -------------
+		//
+		// Both halves of it. "She kept going up after I let go" is Coast >> 0, and "control did not
+		// bring her down" is Crouched >= 0 — under the latch she was still climbing through the crouch,
+		// because the descend branch was behind `!climbing`.
+		const bool bRedKeptClimbing  = State->Coast[0] > ExpectedClimb * 0.5f;
+		const bool bRedIgnoredCrouch = State->Crouched[0] > -ExpectedDescend * 0.1f;
+
+		if (!State->bRan[0] || !State->bRan[1] || !State->bFlew[0] || !State->bFlew[1]
+			|| !bRedKeptClimbing || !bRedIgnoredCrouch)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — the red arm did not reproduce the complaint. "
+				     "redRan=%d greenRan=%d flying(red/green)=%d/%d | after letting go she moved %+.0f uu "
+				     "(the bug needs more than %+.0f) | on crouch she moved %+.0f uu (the bug needs it to be "
+				     "no lower than %+.0f). A harness that cannot go red has proved nothing."),
+				Tag, State->bRan[0] ? 1 : 0, State->bRan[1] ? 1 : 0,
+				State->bFlew[0] ? 1 : 0, State->bFlew[1] ? 1 : 0,
+				State->Coast[0], ExpectedClimb * 0.5f,
+				State->Crouched[0], -ExpectedDescend * 0.1f);
+			return;
+		}
+
+		int32 Failed = 0;
+
+		// (1) She still flies at all.
+		if (State->Climb[1] < ExpectedClimb * 0.6f)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: holding jump for %.1fs raised her %+.0f uu, expected about %.0f "
+				     "(%.0f uu/s). The fix must not have cost her the climb."),
+				Tag, KeyTestHoldSeconds, State->Climb[1], ExpectedClimb, ClimbSpeed);
+		}
+
+		// (2) *** "even after I let go" ***
+		if (State->Coast[1] > ExpectedClimb * 0.25f)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: 'pressing space once makes her continuously move up even after I let go' — "
+				     "she rose another %+.0f uu in the %.1fs after the key came up. The release is still not "
+				     "reaching her."),
+				Tag, State->Coast[1], KeyTestCoastSeconds);
+		}
+
+		// (3) *** "pressing control doesn't make her come down" ***
+		if (State->Crouched[1] > -ExpectedDescend * 0.4f)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: 'pressing control doesn't make her come down' — %.1fs of crouch moved her "
+				     "%+.0f uu, expected about %+.0f (%.0f uu/s down)."),
+				Tag, KeyTestCrouchSeconds, State->Crouched[1], -ExpectedDescend, DescendSpeed);
+		}
+
+		// (4) *** "half the speed she moves vertically at" ***, MEASURED and not read off the knob.
+		const float MeasuredClimbRate = State->Climb[1] / KeyTestHoldSeconds;
+		if (MeasuredClimbRate > WalkSpeed * 0.65f)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: 'half the speed she moves vertically at' — she climbed at %.0f uu/s against a "
+				     "walk of %.0f. Half a walk is %.0f."),
+				Tag, MeasuredClimbRate, WalkSpeed, WalkSpeed * 0.5f);
+		}
+
+		if (Failed == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] VERDICT: PASS — the SAME three key presses. WITH THE BUG: let go and she rose "
+				     "another %+.0f uu, then crouch moved her %+.0f uu (still upward). FIXED: letting go left "
+				     "her within %+.0f uu, and crouch took her DOWN %+.0f uu. She climbs at %.0f uu/s, half "
+				     "the %.0f walk."),
+				Tag, State->Coast[0], State->Crouched[0], State->Coast[1], State->Crouched[1],
+				MeasuredClimbRate, WalkSpeed);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[%s] VERDICT: *** FAIL *** — %d of 4 checks failed."), Tag, Failed);
+		}
+	}
+
+	void RunKeyTest()
+	{
+		const TCHAR* const Tag = TEXT("LILYKEYS");
+
+		IConsoleVariable* const Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Lily.ZipHoldRelease"));
+		if (Arm == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — Trace.Lily.ZipHoldRelease is not registered, so there is no red arm."),
+				Tag);
+			return;
+		}
+
+		FLilyKeyTestState* State = new FLilyKeyTestState();
+		State->ReadyGiveUpAt = FPlatformTime::Seconds() + 30.0;
+
+		// THE PLAYER'S OWN BINDS, not the literals SpaceBar and LeftControl. If somebody rebinds jump
+		// this harness follows them, which is the only way it can claim to be pressing "the key the
+		// user pressed" rather than "the key we assume they pressed".
+		const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+		const FKey JumpKey   = UserSettings.GetKey(ETraceInputAction::Jump);
+		const FKey CrouchKey = UserSettings.GetKey(ETraceInputAction::Crouch);
+		if (!JumpKey.IsValid() || !CrouchKey.IsValid())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — jump or crouch is UNBOUND (jump='%s', crouch='%s'). There is no "
+				     "key to press."),
+				Tag, *JumpKey.ToString(), *CrouchKey.ToString());
+			delete State;
+			return;
+		}
+		State->JumpKeyName   = JumpKey.ToString();
+		State->CrouchKeyName = CrouchKey.ToString();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] armed. Two arms, RED (the shipped bug) first. Per arm: E, hold %s %.1fs, LET GO %.1fs, "
+			     "hold %s %.1fs — judged by the pawn's world Z."),
+			Tag, *State->JumpKeyName, KeyTestHoldSeconds, KeyTestCoastSeconds,
+			*State->CrouchKeyName, KeyTestCrouchSeconds);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, Arm](float /*Delta*/) -> bool
+			{
+				const double Now = FPlatformTime::Seconds();
+
+				if (State->Phase == -2)
+				{
+					UWorld* WaitWorld = FindLocalKeyboardWorld();
+					if (!IsWorldReadyForKeyPresses(WaitWorld))
+					{
+						if (Now > State->ReadyGiveUpAt)
+						{
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[LILYKEYS] VERDICT: INVALID — 30s went by with no unpaused match and a local "
+								     "pawn. The select screen pauses the world and eats the E."));
+							delete State;
+							return false;
+						}
+						return true;
+					}
+
+					FString Why;
+					UTraceAbilitySetLily* Claimed = MakePlayerIntoLily(WaitWorld, Why);
+					if (Claimed == nullptr || Claimed->GetCharacter() == nullptr)
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[LILYKEYS] VERDICT: INVALID — %s."),
+							(Claimed == nullptr) ? *Why : TEXT("Lily has no pawn"));
+						delete State;
+						return false;
+					}
+
+					State->Lily = Claimed;
+					State->Phase = -1;
+					return true;
+				}
+
+				UTraceAbilitySetLily* TickLily = State->Lily.Get();
+				ATraceCharacter* Pawn = (TickLily != nullptr) ? TickLily->GetCharacter() : nullptr;
+				UWorld* TickWorld = (Pawn != nullptr) ? Pawn->GetWorld() : nullptr;
+
+				if (TickLily == nullptr || Pawn == nullptr || TickWorld == nullptr || !Pawn->IsAlive())
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[LILYKEYS] VERDICT: INVALID — Lily's pawn went away mid-test. Run this early in "
+						     "a match."));
+					Arm->Set(1, ECVF_SetByConsole);
+					delete State;
+					return false;
+				}
+
+				const float ZNow = static_cast<float>(Pawn->GetActorLocation().Z);
+
+				// --- PHASE -1: arm, cast, and let the flight settle -------------------------------
+				if (State->Phase == -1)
+				{
+					Arm->Set(State->Arm, ECVF_SetByConsole);
+
+					if (UTraceAbilityComponent* Comp = TickLily->GetAbilityComponent())
+					{
+						Comp->OnHalfTime();   // the framework's own cooldown clear, so arm 2's E is accepted
+					}
+
+					GEngine->Exec(TickWorld, TEXT("Trace.SimInput E 0.05"));
+
+					// THE SETTLE IS LOAD-BEARING. The previous arm leaves her hundreds of uu up and
+					// falling; measuring the climb from a fall would flatter the fix. ApplyZip arrests
+					// her within a tick or two of the cast, and this waits for that.
+					State->Phase = 0;
+					State->PhaseDeadline = Now + KeyTestSettleSeconds;
+					return true;
+				}
+
+				// --- PHASE 0: settle, then HOLD JUMP ----------------------------------------------
+				if (State->Phase == 0)
+				{
+					if (Now < State->PhaseDeadline)
+					{
+						if (TickLily->IsZipping())
+						{
+							State->bFlew[State->Arm] = true;
+						}
+						return true;
+					}
+
+					State->ZAtHoldStart = ZNow;
+					GEngine->Exec(TickWorld, *FString::Printf(TEXT("Trace.SimInput %s %.2f"),
+						*State->JumpKeyName, KeyTestHoldSeconds));
+
+					State->Phase = 1;
+					State->PhaseDeadline = Now + KeyTestHoldSeconds;
+					return true;
+				}
+
+				// --- PHASE 1: the key is up. HOLD NOTHING. *** THE COMPLAINT *** ------------------
+				if (State->Phase == 1)
+				{
+					if (Now < State->PhaseDeadline)
+					{
+						return true;
+					}
+
+					State->ZAtRelease = ZNow;
+					State->Climb[State->Arm] = State->ZAtRelease - State->ZAtHoldStart;
+
+					State->Phase = 2;
+					State->PhaseDeadline = Now + KeyTestCoastSeconds;
+					return true;
+				}
+
+				// --- PHASE 2: HOLD CROUCH. *** THE OTHER HALF OF THE COMPLAINT *** ----------------
+				if (State->Phase == 2)
+				{
+					if (Now < State->PhaseDeadline)
+					{
+						return true;
+					}
+
+					State->ZAfterCoast = ZNow;
+					State->Coast[State->Arm] = State->ZAfterCoast - State->ZAtRelease;
+
+					GEngine->Exec(TickWorld, *FString::Printf(TEXT("Trace.SimInput %s %.2f"),
+						*State->CrouchKeyName, KeyTestCrouchSeconds));
+
+					State->Phase = 3;
+					State->PhaseDeadline = Now + KeyTestCrouchSeconds;
+					return true;
+				}
+
+				if (Now < State->PhaseDeadline)
+				{
+					return true;
+				}
+
+				State->Crouched[State->Arm] = ZNow - State->ZAfterCoast;
+				State->bRan[State->Arm] = true;
+
+				if (State->Arm == 0)
+				{
+					State->Arm = 1;
+					State->Phase = -1;
+					return true;
+				}
+
+				Arm->Set(1, ECVF_SetByConsole);
+				TickLily->OnHalfTime();
+				FinishKeyTest(State);
+				delete State;
+				return false;
+			}),
+			0.f);
+	}
+
+	FAutoConsoleCommand CmdKeyTest(
+		TEXT("Trace.Lily.KeyTest"),
+		TEXT("DEMO 19 item 4, from the player's chair. Two arms, RED first (Trace.Lily.ZipHoldRelease 0 = the "
+		     "shipped bug, not an imitation of it): presses E, HOLDS jump, LETS GO, then HOLDS crouch through "
+		     "the real input pipeline and judges the pawn's world Z. Proves 'she stops when I let go', 'crouch "
+		     "brings her down' and 'she climbs at half a walk'."),
+		FConsoleCommandDelegate::CreateStatic(&RunKeyTest));
+
+	// =============================================================================================
+	// Trace.Lily.DashTest — DEMO 19 ITEM 8, MEASURED ON THE POOL THE HUD DRAWS
+	//
+	// "Change Lily so she only has an extra dash when she is not carrying the core."
+	//
+	// The number asked for is UTraceCharacterMovementComponent::GetMaxDashCharges() — the same call
+	// ATracePlayerController::GetDashHudState() makes to fill the dash meter, so this reads exactly
+	// the number of pips the player sees. It is taken with the Core in her hands and again without,
+	// in both arms, from the real Core actor rather than from a fake carrier bit.
+	//
+	// TWO ARMS, RED FIRST. Trace.Lily.DashCarrierGate 0 is the shipped v21 rule; if the red arm does
+	// not print 3 while carrying then this harness is not measuring the gate and says so.
+	//
+	// SYNCHRONOUS, like ZipVerify: ATraceCore::TryPickup is an authority-side grant that lands in the
+	// same frame, and GetMaxDashCharges() is a pure read.
+	// =============================================================================================
+
+	void RunDashTest()
+	{
+		const TCHAR* const Tag = TEXT("LILYDASH");
+
+		UWorld* TestWorld = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->IsGameWorld()
+					&& Context.World()->GetAuthGameMode() != nullptr)
+				{
+					TestWorld = Context.World();
+					break;
+				}
+			}
+		}
+
+		if (TestWorld == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — no authoritative game world. Run this on the server/host."), Tag);
+			return;
+		}
+
+		FString Why;
+		UTraceAbilitySetLily* Lily = MakePlayerIntoLily(TestWorld, Why);
+		ATraceCharacter* MyPawn = (Lily != nullptr) ? Lily->GetCharacter() : nullptr;
+		ATraceCore* CoreActor = ATraceCore::Get(TestWorld);
+		UTraceCharacterMovementComponent* MoveComp = (MyPawn != nullptr) ? MyPawn->GetTraceMovement() : nullptr;
+
+		if (Lily == nullptr || MyPawn == nullptr || CoreActor == nullptr || MoveComp == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — %s."), Tag,
+				(Lily == nullptr) ? *Why : TEXT("Lily has no pawn, no movement component, or there is no Core"));
+			return;
+		}
+
+		IConsoleVariable* const Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Lily.DashCarrierGate"));
+		if (Arm == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — Trace.Lily.DashCarrierGate is not registered, so there is no red arm."),
+				Tag);
+			return;
+		}
+		const int32 ArmBefore = Arm->GetInt();
+
+		// Somewhere to park the Core so "not carrying" is a real state and not a wish.
+		ATraceCharacter* Parker = nullptr;
+		for (TActorIterator<ATraceCharacter> It(TestWorld); It; ++It)
+		{
+			if (*It != nullptr && *It != MyPawn && (*It)->IsAlive()) { Parker = *It; break; }
+		}
+
+		int32 Free[2] = { 0, 0 };
+		int32 Carrying[2] = { 0, 0 };
+
+		for (int32 ArmIndex = 0; ArmIndex < 2; ++ArmIndex)
+		{
+			Arm->Set(ArmIndex, ECVF_SetByConsole);   // 0 = RED (ungated), 1 = GREEN (item 8)
+
+			if (Parker != nullptr)
+			{
+				CoreActor->TryPickup(Parker);
+			}
+			Free[ArmIndex] = MoveComp->GetMaxDashCharges();
+
+			CoreActor->TryPickup(MyPawn);
+			Carrying[ArmIndex] = MoveComp->GetMaxDashCharges();
+		}
+
+		if (Parker != nullptr)
+		{
+			CoreActor->TryPickup(Parker);   // leave the match roughly as it was found
+		}
+		Arm->Set(ArmBefore, ECVF_SetByConsole);
+
+		const UTraceSettings& Settings = UTraceSettings::Get();
+		const int32 EverybodyFree     = FMath::Max(1, Settings.BaseDashCharges);
+		const int32 EverybodyCarrying = EverybodyFree + FMath::Max(0, Settings.CarrierExtraDashCharges);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] RED (gate off, the v21 rule)  Lily %d free / %d carrying   |   "
+			     "GREEN (item 8)  Lily %d free / %d carrying   |   everybody else %d / %d."),
+			Tag, Free[0], Carrying[0], Free[1], Carrying[1], EverybodyFree, EverybodyCarrying);
+
+		// ---- THE RED ARM FIRST ---------------------------------------------------------------------
+		if (Free[0] != EverybodyFree + 1 || Carrying[0] != EverybodyCarrying + 1)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — with the gate OFF she should show the old rule, %d free and %d "
+				     "carrying, and she showed %d and %d. The harness is not measuring the gate."),
+				Tag, EverybodyFree + 1, EverybodyCarrying + 1, Free[0], Carrying[0]);
+			return;
+		}
+
+		int32 Failed = 0;
+		if (Free[1] != EverybodyFree + 1)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: item 8 keeps her extra dash while she is NOT carrying — expected %d, got %d."),
+				Tag, EverybodyFree + 1, Free[1]);
+		}
+		if (Carrying[1] != EverybodyCarrying)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: 'only ... when she is not carrying the core' — carrying, she should be on the "
+				     "same %d as everybody else and she is on %d. (%d would mean the gate did nothing; %d would "
+				     "mean it took the carrier's charge away too.)"),
+				Tag, EverybodyCarrying, Carrying[1], EverybodyCarrying + 1, EverybodyCarrying - 1);
+		}
+
+		if (Failed == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] VERDICT: PASS — the SAME pickup, measured on the pool the dash meter draws: with the "
+				     "old rule %d carrying, with item 8 %d. Free-running she keeps her %d either way."),
+				Tag, Carrying[0], Carrying[1], Free[1]);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[%s] VERDICT: *** FAIL *** — %d of 2 checks failed."), Tag, Failed);
+		}
+	}
+
+	FAutoConsoleCommand CmdDashTest(
+		TEXT("Trace.Lily.DashTest"),
+		TEXT("DEMO 19 item 8. Two arms, RED first (Trace.Lily.DashCarrierGate 0 = the shipped v21 rule): hands "
+		     "Lily the real Core and reads GetMaxDashCharges() — the same number the dash meter draws — with "
+		     "and without it. Proves her extra charge is hers only when she is NOT carrying."),
+		FConsoleCommandDelegate::CreateStatic(&RunDashTest));
+
 	/** The numbers §3 states, checked against the knobs, plus an honest note about what is not wired. */
 	void RunLilyVerify()
 	{
@@ -974,12 +1691,20 @@ namespace TraceLilyVerifyFile
 		Check(FMath::IsNearlyEqual(Settings.LilyZipCooldownSeconds, 30.f, 0.01f),
 			FString::Printf(TEXT("§3 says a 30s cooldown; the knob is %.2f"), Settings.LilyZipCooldownSeconds));
 
+		// DEMO 19 ITEM 8 in the units a designer reads. Everybody: base, plus one while carrying.
+		// Lily: base plus hers while FREE-RUNNING, and base plus the carrier's — not both — while
+		// carrying. The point of printing all four numbers is that "she has an extra dash" and "she
+		// has an extra dash while carrying" are now different sentences.
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[%s] DASHES  everybody %d (+%d carrying) -> Lily %d (+%d carrying). "
+			TEXT("[%s] DASHES  everybody %d free / %d carrying -> Lily %d free / %d carrying "
+			     "(item 8: her extra charge is hers only when she is NOT carrying the Core). "
 			     "HEALTH  everybody %.0f -> Lily %.0f, i.e. two body shots instead of three. "
 			     "WALL JUMP  retention x%.2f, hers alone."),
-			Tag, Settings.BaseDashCharges, Settings.CarrierExtraDashCharges,
-			Settings.BaseDashCharges + Settings.LilyExtraDashCharges, Settings.CarrierExtraDashCharges,
+			Tag,
+			Settings.BaseDashCharges,
+			Settings.BaseDashCharges + Settings.CarrierExtraDashCharges,
+			Settings.BaseDashCharges + Settings.LilyExtraDashCharges,
+			Settings.BaseDashCharges + Settings.CarrierExtraDashCharges,
 			Settings.MaxHealth, Settings.LilyMaxHealth,
 			1.f + Settings.LilyWallJumpMomentumBonus);
 
@@ -992,12 +1717,11 @@ namespace TraceLilyVerifyFile
 			Settings.WalkSpeed * Settings.LilyZipDescendSpeedScale,
 			Settings.WalkSpeed, Settings.LilyZipCooldownSeconds);
 
-		UE_LOG(LogTraceGame, Warning,
-			TEXT("[%s] NOT YET LIVE: the extra dash charge, the 60 health and the wall-jump bonus are exposed "
-			     "through TraceAbilityTraits and are read by NOTHING today — they need one call each in "
-			     "Movement/TraceCharacterMovementComponent.cpp (GetMaxDashCharges, TryWallJump) and "
-			     "Gameplay/TraceHealthComponent.cpp (GetMaxHealth). Until then Lily has 100 health, one dash "
-			     "and an ordinary wall jump. ZIP IS LIVE."),
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] ALL FOUR ARE LIVE. The extra charge is read by GetMaxDashCharges(), the 60 health by "
+			     "TraceHealthComponent::GetMaxHealth(), the wall-jump bonus by TryWallJump()'s retention term, "
+			     "and Zip runs in this file. (This line used to say the first three were wired to nothing; it "
+			     "was true when it was written and stopped being true without being edited.)"),
 			Tag);
 
 		if (Failed == 0)

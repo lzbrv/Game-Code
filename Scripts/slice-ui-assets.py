@@ -21,7 +21,7 @@
 #     python3 Scripts/slice-ui-assets.py
 #
 # -----------------------------------------------------------------------------
-# THE FOUR THINGS THIS SCRIPT DOES THAT ARE NOT OBVIOUS
+# THE SIX THINGS THIS SCRIPT DOES THAT ARE NOT OBVIOUS
 # -----------------------------------------------------------------------------
 # 1. IT KEYS BLACK TO ALPHA. The sheet is RGB with no alpha channel and a black
 #    background, and every sprite on it is a GLOW - a bright core with a soft
@@ -73,6 +73,29 @@
 #
 #    An earlier version removed only the disc, and shipped a cursor with a blue
 #    circle drawn on its tail. That is the failure this version is written against.
+#
+# 5. IT TAKES THE HANDLE BACK OUT OF THE TRACK. The slider is ONE connected mark
+#    on the sheet - a long thin rail with the angular handle sitting on it - and
+#    the two are cut apart here. build_slider_handle() has always subtracted the
+#    rail from the HANDLE; nothing subtracted the handle from the TRACK, so the
+#    track sprite shipped with the blade still baked into it, at columns 37-78 of
+#    512 and 6.1x the trough's own luminance. A track is STRETCHED to whatever
+#    width the setting needs, so that blade came out as a phantom second handle
+#    frozen a fifth of the way along the bar, wherever the real handle happened to
+#    be. The rail is uniform along its length (measured: the column-mean varies by
+#    a standard deviation of 0.34 counts over 4000 columns), so a clean column of
+#    it is an exact substitution. See build_slider_track.
+#
+# 6. IT LIFTS THE TRACE WORDMARK, WHICH IS DRAWN DARK ON BLACK. Every other mark
+#    on this sheet is a bright core with a halo, so black-keying it (note 1) is
+#    the whole job. The wordmark is the exception: the artist drew the letters as
+#    a flat NAVY stroke, RGB(29,41,81), and put the bright part - an amber rim at
+#    up to luminance 129 - AROUND them. Black-keyed verbatim the rim therefore
+#    comes out brighter than the letters and the mark reads as two offset words,
+#    which is precisely what shipped. build_wordmark() lifts it the way
+#    build_word() lifts PLAY off its plate: the stroke's OWN luminance is the
+#    ceiling for alpha, the stroke is white and the rim keeps the artist's amber.
+#    The letterforms are never re-cut, re-shaped or moved - only re-toned.
 #
 # -----------------------------------------------------------------------------
 # SIZES - and why each one
@@ -134,6 +157,17 @@ BAND_BOTTOM = PLATE_H - 290
 # Rows over which the repaint fades back into the artist's pixels, so the band
 # cannot leave a horizontal seam. No lettering reaches into either fade.
 BAND_FADE = 40
+
+# The same idea one axis over, for the slider rail: COLUMNS over which the rebuilt
+# span fades back into the artist's own rail. See build_slider_track.
+TRACK_FADE = 30
+
+# Peak luminance over black at which the TRACE wordmark counts as legible, i.e. as
+# a white word rather than a navy one inside an amber rim. It is not a number this
+# script gets to choose: it is UTraceTitleMenuWidget's own runtime threshold
+# (TraceTitleMenuWidgetLocal::WordmarkLiftThreshold), and a sprite that clears it
+# is a sprite whose runtime repair stands down. Change one and change both.
+WORDMARK_LEGIBLE = 0.62
 
 Failures = []
 
@@ -477,6 +511,162 @@ def build_value_box(sheet):
                    knee=min(ALPHA_KNEE, float(fill.max())))
 
 
+def build_slider_track(sheet):
+    """The rail, with the HANDLE that was sitting on it taken back out.
+
+    See note 5 in the header. The failure this replaces: the crop simply included
+    the handle, and since the track is stretched to whatever width a setting needs,
+    the blade came out as a phantom second handle painted into the bar - measured
+    on the shipped sprite at columns 37-78 of 512 and 6.1x the trough's own
+    luminance.
+
+    The substitution is exact rather than approximate because the rail IS uniform:
+    its column-mean varies by a standard deviation of 0.34 counts over the 4000
+    columns nothing sits on. So the repair is a median column of clean rail,
+    stamped across the contaminated span, with the span found by MEASURING which
+    columns are too bright rather than by trusting SLIDER_HANDLE's box."""
+    rgb = np.asarray(sheet.crop(SLIDER_TRACK)).astype(np.float32)
+    width = rgb.shape[1]
+
+    # A span of rail the handle cannot reach: the handle is at the left-hand end
+    # (SLIDER_HANDLE starts 315 px into a 5092-px crop), so the clean rail is the
+    # right-hand half. Taken as a MEDIAN column so a stray pixel cannot become the
+    # profile the whole span is rebuilt from.
+    clean_lo = int(width * 0.55)
+    clean_hi = int(width * 0.95)
+    profile = np.median(rgb[:, clean_lo:clean_hi, :], axis=1)
+
+    # Where the handle actually is, per column, by peak luminance. The rail's ENDS
+    # are darker than its middle, not brighter, so a brightness test cannot mistake
+    # them for the blade.
+    peak = rgb.max(axis=2).max(axis=0)
+    baseline = float(np.median(peak[clean_lo:clean_hi]))
+    hot = np.where(peak > baseline * 1.05)[0]
+    if len(hot) == 0:
+        log("    T_MenuSliderTrack: no handle found on the rail - the crop or the sheet changed. "
+            "Check the sprite before shipping.")
+        return to_rgba(rgb.astype(np.uint8))
+
+    pad = 60
+    lo = max(0, int(hot.min()) - pad)
+    hi = min(width, int(hot.max()) + 1 + pad)
+
+    rebuilt = rgb.copy()
+    rebuilt[:, lo:hi, :] = profile[:, None, :]
+
+    # Crossfade back into the artist's own columns at each end of the span, for the
+    # same reason the button band does: if the rail ever gains a length-wise shade,
+    # one stamped column must not break it at a hard edge.
+    fade = min(TRACK_FADE, (hi - lo) // 2)
+    for index in range(fade):
+        blend = index / float(fade)
+        for column in (lo + index, hi - 1 - index):
+            rebuilt[:, column, :] = (blend * rebuilt[:, column, :]
+                                     + (1.0 - blend) * rgb[:, column, :])
+
+    # RED ARM: the point of this function is that the blade is GONE. Re-measure the
+    # rail rather than trust the mask - a phantom handle frozen in the bar is
+    # exactly what shipped last time, and on a still screenshot it looked like the
+    # real one.
+    after = rebuilt.max(axis=2).max(axis=0)
+    worst = float(after[lo:hi].max())
+    if worst > baseline * 1.05:
+        fail("T_MenuSliderTrack: the rail still peaks at {0:.0f} inside the repaired span against a "
+             "trough baseline of {1:.0f} - the handle blade is still in the track.".format(
+                 worst, baseline))
+        return None
+
+    log("    T_MenuSliderTrack: handle blade removed from sheet columns {0}-{1} of {2}; the span "
+        "peaked at {3:.0f} against a trough baseline of {4:.0f} ({5:.1f}x), now {6:.0f} ({7:.2f}x)"
+        .format(lo, hi, width, float(peak[lo:hi].max()), baseline,
+                float(peak[lo:hi].max()) / baseline, worst, worst / baseline))
+    return to_rgba(rebuilt.astype(np.uint8))
+
+
+def build_wordmark(sheet):
+    """TRACE, lifted off the black the way build_word lifts PLAY off its plate.
+
+    See note 6 in the header. The artist drew this word DARK - a flat navy stroke -
+    with the bright part, an amber rim, around it. Black-keying it verbatim makes
+    the rim the brightest thing in the sprite and the mark reads as two offset
+    words. build_word's lift does not transfer unchanged, because it keys UP from a
+    fill toward white and this word is the other way round; what transfers is the
+    idea, which is that ALPHA carries the letterform and COLOUR carries the state.
+
+    So: alpha ramps from the black ground to the stroke's own luminance, the stroke
+    is white, and the rim keeps the artist's amber at the hue they drew it. No
+    letterform is re-cut, re-shaped or moved.
+
+    This is the ROOT of the repair UTraceTitleMenuWidget::LiftWordmarkFromSprite
+    used to do at runtime, on the already-downscaled texture. That code measures
+    the sprite's peak luminance over black and stands down at 0.62; this sprite
+    ships at 1.00, so it stands down, and the lift now happens once at sheet
+    resolution instead of every launch at a sixteenth of it."""
+    rgb = np.asarray(sheet.crop(MARKS["wordmark"])).astype(np.float32)
+    lum = rgb.max(axis=2)
+
+    # The two tones are unambiguous and need no threshold to tune: the stroke is
+    # navy (blue leads red) and the rim is amber (red leads blue).
+    body = rgb[:, :, 2] > rgb[:, :, 0]
+
+    ground = float(np.median(lum))                       # the black the mark sits on
+    lit = body & (lum > ground + 20.0)
+    if not lit.any():
+        fail("T_TraceWordmark: no navy lettering found in the crop - the sheet or MARKS['wordmark'] "
+             "changed, and this would ship the mark inverted.")
+        return None
+    stroke = float(np.median(lum[lit]))                   # the flat fill of the letters
+
+    # The artist's amber, sampled off the brightest part of their own rim and
+    # normalised to full brightness - the same move build_word makes when it writes
+    # the letters as pure white. Un-normalised it would ship at the sheet's 84/255
+    # and the glow would stay the dim brown it is on a dark sheet.
+    halo = (~body) & (lum > ground + 8.0)
+    bright = halo & (lum > 0.6 * float(lum[halo].max()))
+    amber = np.median(rgb[bright], axis=0)
+    amber = amber * 255.0 / max(1.0, float(amber.max()))
+
+    alpha = np.clip((lum - ground) / max(1.0, stroke - ground), 0.0, 1.0)
+
+    out = np.zeros((rgb.shape[0], rgb.shape[1], 4), dtype=np.uint8)
+    out[:, :, :3] = np.where(body[:, :, None],
+                             np.array([255.0, 255.0, 255.0], dtype=np.float32),
+                             amber[None, None, :]).astype(np.uint8)
+    out[:, :, 3] = (alpha * 255.0).astype(np.uint8)
+
+    # RED ARM: the defect was measurable - the crop peaked at 0.28 over black and the
+    # widget's own threshold for "legible" is 0.62.
+    #
+    # IT MUST BE THE WIDGET'S OWN FORMULA, not a convenient stand-in. UTraceTitleMenuWidget's
+    # ByteLuminance is REC. 709 WEIGHTED - 0.2126 R + 0.7152 G + 0.0722 B - and an earlier
+    # version of this check used max(R,G,B) instead. On this sprite the two agree, because
+    # the lifted stroke is pure white and every formula returns 1.00 for white; on an
+    # AMBER-dominant mark they do not, and that is the case that matters here, because the
+    # thing this function is guarding against is precisely a mark whose brightest pixels are
+    # the artist's amber rim. A flat RGB(255,127,0) scores 1.00 under max() and 0.57 under
+    # Rec. 709 - so the old check would have passed a sprite the widget would then have gone
+    # on to repair at runtime anyway, i.e. a green arm that could not fail. Rec. 709 it is,
+    # and the agreement is checkable: this measures the shipped crop at 0.28 and
+    # TraceTitleMenuWidgetLocal::WordmarkLiftThreshold's own comment records 0.28.
+    grey = (0.2126 * out[:, :, 0].astype(np.float32)
+            + 0.7152 * out[:, :, 1].astype(np.float32)
+            + 0.0722 * out[:, :, 2].astype(np.float32))
+    peak_over_black = float((grey * (out[:, :, 3].astype(np.float32) / 255.0)).max() / 255.0)
+    if peak_over_black < WORDMARK_LEGIBLE:
+        fail("T_TraceWordmark: the lifted mark still peaks at only {0:.2f} over black; "
+             "UTraceTitleMenuWidget wants {1:.2f} and would repair it at runtime again."
+             .format(peak_over_black, WORDMARK_LEGIBLE))
+        return None
+
+    log("    T_TraceWordmark: stroke fill luminance {0:.0f} on a ground of {1:.0f}; {2} px of navy "
+        "stroke are now white, {3} px of rim keep the artist's amber RGB({4}). Peak over black "
+        "{5:.2f}, Rec. 709 (the verbatim crop was 0.28; legible at {6:.2f})".format(
+            stroke, ground, int(lit.sum()), int(halo.sum()),
+            ",".join(str(int(round(c))) for c in amber),
+            peak_over_black, WORDMARK_LEGIBLE))
+    return out
+
+
 def build_slider_handle(sheet):
     """The angular handle, with the rail it is sitting on taken out from under it.
 
@@ -531,11 +721,19 @@ def main():
     if rgba is not None:
         write("T_MenuValueBox", rgba)
 
-    write("T_MenuSliderTrack", to_rgba(np.asarray(sheet.crop(SLIDER_TRACK))))
+    rgba = build_slider_track(sheet)
+    if rgba is not None:
+        write("T_MenuSliderTrack", rgba)
     write("T_MenuSliderHandle", build_slider_handle(sheet))
     write("T_MenuCursor", build_cursor(sheet))
-    for key, name in (("wordmark", "T_TraceWordmark"),
-                      ("swoosh", "T_MenuSwoosh"),
+
+    rgba = build_wordmark(sheet)
+    if rgba is not None:
+        write("T_TraceWordmark", rgba)
+
+    # The two marks that ARE what note 1 assumes: a bright core with a halo, on
+    # black. Black-keying them is the whole job.
+    for key, name in (("swoosh", "T_MenuSwoosh"),
                       ("back", "T_MenuBack")):
         write(name, to_rgba(np.asarray(sheet.crop(MARKS[key]))))
 

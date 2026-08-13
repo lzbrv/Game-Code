@@ -4,6 +4,7 @@
 
 #include "Engine/World.h"
 #include "GameFramework/Controller.h"
+#include "GameFramework/PlayerController.h"     // ChoosePlayerStart's human test — demo 19 item 1
 #include "Kismet/GameplayStatics.h"             // UGameplayStatics::HasOption
 #include "TimerManager.h"
 
@@ -114,6 +115,25 @@ AActor* ATracePracticeGameMode::ChoosePlayerStart_Implementation(AController* Pl
 		if (AActor* Post = Range->FindRespawnPostFor(Player))
 		{
 			return Post;
+		}
+
+		// *** DEMO 19 ITEM 1, "make it smaller" — the half of it that is about DYING. ***
+		//
+		// Without this a human takes the shipped endzone spawn, which is mid-endzone and about
+		// 15600 uu from the range's target row: correct for a real match, and in the range it means
+		// every death costs a 200 m walk back to the thing you were practising. The range's own spawn
+		// line is a start spot like any other, so this is the same one-line answer to "where?" that
+		// the targets already get, and the rest of the shipped respawn pipeline is untouched.
+		//
+		// Humans only: FindRespawnPostFor has already claimed every dummy above, and a null here
+		// (the range is not furnished yet) falls through to the shipped pipeline rather than
+		// refusing to spawn anybody.
+		if (Player != nullptr && Player->IsA<APlayerController>())
+		{
+			if (AActor* StartPost = Range->GetPlayerStartPost())
+			{
+				return StartPost;
+			}
 		}
 	}
 

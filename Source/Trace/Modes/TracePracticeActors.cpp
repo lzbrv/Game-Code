@@ -15,6 +15,7 @@
 
 #include "Core/TraceCharacter.h"
 #include "Core/TracePlayerState.h"
+#include "Gameplay/TraceWeaponComponent.h"      // SetAutonomousAttacksAllowed — demo 19 item 2
 #include "Modes/TracePracticeRange.h"
 #include "Trace.h"                              // LogTraceGame
 #include "TraceTypes.h"                         // ETraceTeam
@@ -276,7 +277,27 @@ void ATracePracticeDummyController::OnPossess(APawn* InPawn)
 
 	if (ATraceCharacter* DummyPawn = Cast<ATraceCharacter>(InPawn))
 	{
-		UE_LOG(LogTraceGame, Verbose, TEXT("[Practice] dummy '%s' possessed %s at %s."),
+		// *** DEMO 19 ITEM 2: "Don't let the bots attack." ***
+		//
+		// THIS CLASS DOING NOTHING WAS NEVER ENOUGH, and the header's confidence that it was is the
+		// bug. UTraceWeaponComponent::TickBotKnife runs on the SERVER for every pawn whose controller
+		// is not an APlayerController and asks the controller nothing at all: it found the nearest
+		// non-teammate, drew the knife inside 500 uu and swung inside 153 uu. A dummy on
+		// ETraceTeam::None has no teammates, so every one of the other four targets and the player
+		// were enemies to it — the row armed itself the moment it was built, and it swung at anyone
+		// who closed to knifing distance, which is the only distance you can knife one from.
+		//
+		// HERE, and not in BuildRange, because this runs on EVERY possession: a target that dies goes
+		// through the shipped respawn pipeline and comes back with a BRAND NEW pawn and a brand new
+		// weapon component, whose bit is back at its default. Disarming at spawn time would have
+		// re-armed the row on the first death — the kind of fix that measures green once.
+		if (UTraceWeaponComponent* DummyWeapon = DummyPawn->FindComponentByClass<UTraceWeaponComponent>())
+		{
+			DummyWeapon->SetAutonomousAttacksAllowed(false);
+		}
+
+		UE_LOG(LogTraceGame, Verbose, TEXT("[Practice] dummy '%s' possessed %s at %s (weapon disarmed: "
+			"a target does not fight back)."),
 			*GetName(), *DummyPawn->GetName(), *DummyPawn->GetActorLocation().ToCompactString());
 	}
 }

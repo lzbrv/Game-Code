@@ -54,6 +54,20 @@ bool UTraceHudStatusChipWidget::ValidateBindings(FString& OutMissing) const
 	return true;
 }
 
+void UTraceHudStatusChipWidget::InstallAtlasLabels()
+{
+	if (bAtlasLabelsInstalled)
+	{
+		return;
+	}
+	bAtlasLabelsInstalled = true;
+
+	AtlasLabels.Reset();
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, LabelText));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReadoutText));
+	AtlasLabels.RemoveAll([](const FTraceAtlasLabel& Label) { return !Label.IsValid(); });
+}
+
 FString UTraceHudStatusChipWidget::ApplyChip(const FTraceHudCornerChip& InChip)
 {
 	FString Unbound;
@@ -75,8 +89,12 @@ FString UTraceHudStatusChipWidget::ApplyChip(const FTraceHudCornerChip& InChip)
 		InChip.Tint, TraceHudStatusChipWidgetFile::ReadoutAlpha)));
 	DrainBar->SetFillColorAndOpacity(InChip.Tint);
 
+	InstallAtlasLabels();
+
 	LabelText->SetText(FText::FromString(InChip.Label));
 	ReadoutText->SetText(FText::FromString(InChip.Readout));
+
+	TraceAtlasTextSwap::MirrorAll(AtlasLabels);
 
 	const float DrainFraction = FMath::Clamp(InChip.Fraction, 0.f, 1.f);
 	DrainBar->SetPercent(DrainFraction);

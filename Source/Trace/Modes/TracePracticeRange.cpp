@@ -10,6 +10,8 @@
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/CommandLine.h"                   // -TracePracticeOldSize, item 1's red arm
+#include "Misc/Parse.h"
 #include "Components/CapsuleComponent.h"
 #include "TimerManager.h"
 #include "UObject/UObjectGlobals.h"
@@ -33,15 +35,96 @@ namespace TracePracticeRangeLocal
 	/** How many stationary targets the range furnishes. One per player on a team, so a full row. */
 	constexpr int32 DummyCount = 5;
 
+	// =============================================================================================
+	// *** THE RANGE FOOTPRINT — DEMO 19 ITEM 1, VERBATIM: "Make it smaller." ***
+	// =============================================================================================
+	//
+	// WHAT WAS BIG. The range is the arena, and the arena is 33600 x 9600 uu (336 m long). Nothing
+	// placed the player inside the range, so they took the shipped endzone spawn — mid-endzone, about
+	// 15600 uu from the centre circle — while the target row sat at 0.18 of the field length on the
+	// FAR side of centre, i.e. +6048. That is a 21600 uu walk, over 200 metres, before the first
+	// shot, repeated after every death. The three pads then sat 900 uu behind centre, another 7000 uu
+	// back from the targets, so using the CHANGE CHARACTER pad and then shooting was a round trip of
+	// nearly 15000 uu.
+	//
+	// WHAT SMALL MEANS HERE, and why these numbers. The range keeps the arena (see the header: spec
+	// v19 §4.1 kills anything outside GetFieldBounds(), and the walls and ramps you would come here
+	// to practise movement on are already in it). What shrinks is THE FURNISHED FOOTPRINT — the part
+	// you are put in and expected to use:
+	//
+	//   2200 uu from the spawn line to the targets. Chosen as a firing distance, not as a small
+	//     number: the gun reaches 36000 uu, but 2200 is far enough that aim matters and close enough
+	//     that a knife rush is about four seconds. It is also inside the 2400 uu the arena's own
+	//     endzone is deep, so the whole range is smaller than one end of the field.
+	//   260 uu between targets, so the five-wide row spans 1040 uu and the outermost target is 13
+	//     degrees off the crosshair — one glance takes in the whole row.
+	//   450 uu from the spawn line to the two toggle pads, +/-620 uu out: a second's walk, in view
+	//     from the spawn, and clear of the firing line to the targets.
+	//
+	// THE CORE RACK IS DELIBERATELY BEHIND YOU. It has to sit on ATraceCore::GetHomeLocation() (the
+	// field centre) — that is what makes "leave the Core here" a real state of the shipped Core
+	// rather than a rule this file re-implements — so the spawn line is placed 900 uu FORWARD of
+	// centre and everything else forward of that. Walking from the spawn to the targets therefore
+	// never crosses the rack, which matters now that the range opens with the Core parked on it:
+	// crossing it would hand you the Core, and a carrier can neither shoot nor knife.
+	//
+	// Total furnished footprint, rack to far targets: 3100 x 1240 uu, against ~21600 uu before.
+
+	/** Distance from the player's spawn line to the target row, in uu. */
+	constexpr float TargetStandbackUU = 2200.f;
+
+	/** How far FORWARD of the field centre (and so of the Core rack) the spawn line sits, in uu. */
+	constexpr float PlayerSpawnForwardUU = 900.f;
+
 	/** Lateral spacing between the targets, in uu. */
-	constexpr float DummySpacingY = 400.f;
+	constexpr float DummySpacingY = 260.f;
 
-	/** Where along the field the target row stands, as a fraction of the field length from centre. */
-	constexpr float DummyRowFraction = 0.18f;
+	/** How far ahead of the spawn line, and how far out to the sides, the two toggle pads sit. */
+	constexpr float TogglePadForwardUU = 450.f;
+	constexpr float TogglePadOutY = 620.f;
 
-	/** How far back from centre, and how far out to the sides, the two toggle pads sit. */
-	constexpr float TogglePadBackX = 900.f;
-	constexpr float TogglePadOutY = 650.f;
+	// ---- THE RED ARM FOR ITEM 1 -----------------------------------------------------------------
+	//
+	// Restores the footprint above EXACTLY as it was, and nothing else: same target row fraction, same
+	// spacing, same pads behind centre, and no spawn line — so the player takes the shipped endzone
+	// spawn and has to walk. It deliberately does NOT restore the Core-on-kickoff behaviour, because
+	// that is item 3's bug and an arm that moves two things at once measures neither.
+	//
+	// It exists so the BEFORE and AFTER screenshots come from one binary, taken minutes apart, rather
+	// than from two builds that differ in whatever else landed in between.
+	TAutoConsoleVariable<int32> CVarPracticeOldSize(
+		TEXT("Trace.Practice.OldSize"),
+		0,
+		TEXT("DEV ONLY. RED ARM for demo 19 item 1. 1 rebuilds the practice range with the OLD, big "
+		     "footprint: target row at 0.18 of the field, pads 900uu behind centre, and no range spawn "
+		     "line, so the player starts in the endzone ~21600uu from the targets."),
+		ECVF_Cheat);
+
+	/**
+	 * The arm, as one question.
+	 *
+	 * ALSO READABLE AS A BARE LAUNCH SWITCH (`-TracePracticeOldSize`), and that is not belt-and-braces:
+	 * the BEFORE screenshot needs the arm live before the player's FIRST spawn is chosen, which happens
+	 * before any console command this project can deliver (-TraceExec waits for a pawn, which is the
+	 * very thing being placed). A switch is parsed from the command line at engine init, so it is the
+	 * only form that is certainly early enough. Latched: the command line cannot change mid-session.
+	 */
+	bool IsOldSizeArmed()
+	{
+		static const bool bFromCommandLine =
+			FParse::Param(FCommandLine::Get(), TEXT("TracePracticeOldSize"));
+		return bFromCommandLine || CVarPracticeOldSize.GetValueOnAnyThread() != 0;
+	}
+
+	/** The old target row's distance from centre, as a fraction of field length. Arm only. */
+	constexpr float OldDummyRowFraction = 0.18f;
+
+	/** The old lateral spacing between targets, in uu. Arm only. */
+	constexpr float OldDummySpacingY = 400.f;
+
+	/** The old pad placement: behind centre, and further out. Arm only. */
+	constexpr float OldTogglePadBackX = 900.f;
+	constexpr float OldTogglePadOutY = 650.f;
 
 	/** Fallback pawn half height when the pawn class cannot be interrogated. */
 	constexpr float FallbackCapsuleHalfHeight = 90.f;
@@ -174,10 +257,28 @@ void UTracePracticeRangeSubsystem::PollRange()
 		return;
 	}
 
+	// DEMO 19 ITEM 1's RED ARM. Trace.Practice.OldSize restores the footprint the user called too big,
+	// and rebuilding on the flip is what lets the BEFORE and AFTER screenshots come out of ONE binary
+	// instead of one build each. BuildRange and TearDownRange are both idempotent, which is the whole
+	// reason this is three lines.
+	const bool bWantOldSize = TracePracticeRangeLocal::IsOldSizeArmed();
+	if (bBuilt && bWantOldSize != bBuiltOldSize)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Practice] Trace.Practice.OldSize flipped to %d - rebuilding the range's furniture."),
+			bWantOldSize ? 1 : 0);
+		TearDownRange();
+	}
+
 	if (!bBuilt)
 	{
 		BuildRange();
 	}
+
+	// DEMO 19 ITEM 1. In the poll rather than in BuildRange because the two facts arrive on different
+	// schedules: the range is furnished at about 2 s and the solo player's pawn does not exist until
+	// they have left the character select screen. It is a one-shot per player — see the body.
+	GatherPlayersIntoRange();
 
 	KeepCoreParked();
 	SuppressScore();
@@ -221,18 +322,32 @@ void UTracePracticeRangeSubsystem::BuildRange()
 	const FVector FieldCentre = FieldBox.GetCenter();
 	const FVector FieldSize = FieldBox.GetSize();
 
+	// DEMO 19 ITEM 1's RED ARM — see CVarPracticeOldSize. Latched into bBuiltOldSize at the bottom so
+	// PollRange can notice a flip and rebuild.
+	const bool bOldSize = TracePracticeRangeLocal::IsOldSizeArmed();
+
+	// ---- the spawn line ---------------------------------------------------------------------------
+	//
+	// DEMO 19 ITEM 1. Everything the range furnishes is now measured from HERE rather than from the
+	// two ends of a 336 m field, and the player is put on it (SpawnPlayerStartPost + the game mode's
+	// ChoosePlayerStart, so a death brings them back to the range and not to the endzone).
+	const float SpawnLineX = FieldCentre.X + TracePracticeRangeLocal::PlayerSpawnForwardUU;
+
 	// ---- the stationary targets ------------------------------------------------------------------
 	//
-	// A row across the field, on the far side of centre from the Blue endzone the solo player spawns
-	// in, at a distance you would actually shoot from.
-	const float RowX = FieldCentre.X + FieldSize.X * TracePracticeRangeLocal::DummyRowFraction;
-	const float FirstY = FieldCentre.Y
-		- TracePracticeRangeLocal::DummySpacingY * (TracePracticeRangeLocal::DummyCount - 1) * 0.5f;
+	// A row across the range, TargetStandbackUU in front of the spawn line, facing back down it.
+	const float RowX = bOldSize
+		? (FieldCentre.X + FieldSize.X * TracePracticeRangeLocal::OldDummyRowFraction)
+		: (SpawnLineX + TracePracticeRangeLocal::TargetStandbackUU);
+	const float SpacingY = bOldSize
+		? TracePracticeRangeLocal::OldDummySpacingY
+		: TracePracticeRangeLocal::DummySpacingY;
+	const float FirstY = FieldCentre.Y - SpacingY * (TracePracticeRangeLocal::DummyCount - 1) * 0.5f;
 
 	int32 SpawnedDummies = 0;
 	for (int32 Index = 0; Index < TracePracticeRangeLocal::DummyCount; ++Index)
 	{
-		const FVector Where(RowX, FirstY + TracePracticeRangeLocal::DummySpacingY * Index, FieldCentre.Z);
+		const FVector Where(RowX, FirstY + SpacingY * Index, FieldCentre.Z);
 		if (SpawnDummy(Where) != nullptr)
 		{
 			++SpawnedDummies;
@@ -252,26 +367,151 @@ void UTracePracticeRangeSubsystem::BuildRange()
 
 	SpawnPad(ETracePracticePadRole::CoreRack, RackPoint, TEXT("CORE RACK\nwalk on to drop / collect"));
 
+	const float PadX = bOldSize
+		? (FieldCentre.X - TracePracticeRangeLocal::OldTogglePadBackX)
+		: (SpawnLineX + TracePracticeRangeLocal::TogglePadForwardUU);
+	const float PadOutY = bOldSize
+		? TracePracticeRangeLocal::OldTogglePadOutY
+		: TracePracticeRangeLocal::TogglePadOutY;
+
 	SpawnPad(ETracePracticePadRole::InfiniteAbilities,
-		FVector(FieldCentre.X - TracePracticeRangeLocal::TogglePadBackX,
-		        FieldCentre.Y - TracePracticeRangeLocal::TogglePadOutY,
-		        FieldCentre.Z),
+		FVector(PadX, FieldCentre.Y - PadOutY, FieldCentre.Z),
 		TEXT("INFINITE ABILITIES: OFF"));
 
 	SpawnPad(ETracePracticePadRole::CharacterSwap,
-		FVector(FieldCentre.X - TracePracticeRangeLocal::TogglePadBackX,
-		        FieldCentre.Y + TracePracticeRangeLocal::TogglePadOutY,
-		        FieldCentre.Z),
+		FVector(PadX, FieldCentre.Y + PadOutY, FieldCentre.Z),
 		TEXT("CHANGE CHARACTER\nwalk on to reopen select"));
 
-	bBuilt = true;
-	bInfiniteAbilities = false;   // a range always opens with the cheat OFF
-	bCoreOnRack = false;
+	// ---- where the player stands ------------------------------------------------------------------
+	//
+	// Armed, no spawn line is built at all — which is precisely the old behaviour: GetPlayerStartPost
+	// returns null, ChoosePlayerStart falls through to the shipped endzone pipeline, and
+	// GatherPlayersIntoRange has nothing to gather anyone onto.
+	if (!bOldSize)
+	{
+		SpawnPlayerStartPost(FVector(SpawnLineX, FieldCentre.Y, FieldCentre.Z));
+	}
 
+	bBuilt = true;
+	bBuiltOldSize = bOldSize;     // so PollRange can notice the arm flipping and rebuild
+	bInfiniteAbilities = false;   // a range always opens with the cheat OFF
+
+	// ---- *** THE CORE STARTS ON THE RACK — DEMO 19 ITEM 3 *** -------------------------------------
+	//
+	// MEASURED, not anticipated. Saved/Logs/v22range-knife-red.log: the range's ordinary start-of-half
+	// kickoff (ATraceGameMode::BeginHalf -> GrantCoreToTeam -> KickoffTo(Blue)) hands the Core to Blue
+	// — and in a solo practice session the player IS Blue, so they are handed the Core about nine
+	// seconds in and never put it down. A CARRIER CANNOT DRAW THE KNIFE AND CANNOT SWING IT
+	// (UTraceWeaponComponent::RequestEquip and CanSwing both refuse with ETraceMeleeRefusal::Carrying,
+	// silently), and cannot fire the gun either. That is the whole of "knife backstabs don't work" as
+	// seen from the practice range: the knife never comes out at all.
+	//
+	// The fix is the range's own existing machinery pointed at the opening state: bCoreOnRack is the
+	// flag KeepCoreParked() already watches, and its kickoff-catching arm — written for exactly this
+	// event, with the measurement in its comment — takes the Core back off whoever a kickoff hands it
+	// to within one 200 ms poll. So the range opens with the Core PARKED, the player opens with empty
+	// hands, and the CORE RACK pad is how you deliberately pick it up. No rule is switched off: the
+	// Core is out of play, which is a state ATraceCore already has.
+	bCoreOnRack = true;
+	LastCoreParkWorldTime = WorldPtr->GetTimeSeconds();
+	if (ATraceCore* TheCore = GetCore())
+	{
+		TheCore->KickoffTo(ETraceTeam::None);
+	}
+
+	// The two numbers demo 19 item 1 is a claim about, printed rather than described: where the target
+	// row ended up, and how far the player has to travel to reach it from where they start.
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[Practice] RANGE OPEN in the arena: %d/%d stationary targets, %d pads. "
-		     "Core rack at %s. Infinite abilities OFF."),
-		SpawnedDummies, TracePracticeRangeLocal::DummyCount, GetPadCount(), *RackPoint.ToCompactString());
+		TEXT("[Practice] RANGE OPEN in the arena (%s): %d/%d stationary targets at X=%.0f spaced %.0fuu, "
+		     "%d pads. Spawn line %s. Core rack at %s (the Core starts PARKED, so your hands are free). "
+		     "Infinite abilities OFF."),
+		bOldSize ? TEXT("*** OLD, BIG FOOTPRINT — Trace.Practice.OldSize is ON ***") : TEXT("small footprint"),
+		SpawnedDummies, TracePracticeRangeLocal::DummyCount, RowX, SpacingY, GetPadCount(),
+		bOldSize
+			? TEXT("NONE - the player takes the shipped endzone spawn")
+			: *FString::Printf(TEXT("X=%.0f, %.0fuu behind the targets"),
+				SpawnLineX, TracePracticeRangeLocal::TargetStandbackUU),
+		*RackPoint.ToCompactString());
+}
+
+ATracePracticePost* UTracePracticeRangeSubsystem::SpawnPlayerStartPost(const FVector& DesiredPoint)
+{
+	UWorld* const WorldPtr = GetWorld();
+	if (WorldPtr == nullptr)
+	{
+		return nullptr;
+	}
+
+	FVector FloorPoint = FVector::ZeroVector;
+	if (!TraceToFloor(DesiredPoint, FloorPoint))
+	{
+		return nullptr;
+	}
+
+	// Facing the targets. ChoosePlayerStart hands this actor back, and AGameModeBase spawns the pawn
+	// on the start spot's ROTATION — so this one number is what makes a player open the range already
+	// looking down the firing line instead of at a wall 300 metres from anything.
+	FActorSpawnParameters PostParams;
+	PostParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	ATracePracticePost* const PostActor = WorldPtr->SpawnActor<ATracePracticePost>(
+		ATracePracticePost::StaticClass(), FloorPoint + FVector(0.f, 0.f, 3.f),
+		FRotator::ZeroRotator, PostParams);
+	if (PostActor == nullptr)
+	{
+		return nullptr;
+	}
+
+	PlayerStartPost = PostActor;
+	Posts.Add(PostActor);   // so TearDownRange destroys it with everything else
+	return PostActor;
+}
+
+void UTracePracticeRangeSubsystem::GatherPlayersIntoRange()
+{
+	UWorld* const WorldPtr = GetWorld();
+	ATracePracticePost* const StartPost = PlayerStartPost.Get();
+	const AGameStateBase* const BaseState = (WorldPtr != nullptr) ? WorldPtr->GetGameState() : nullptr;
+	if (StartPost == nullptr || BaseState == nullptr)
+	{
+		return;
+	}
+
+	// ONCE PER PLAYER, EVER. ChoosePlayerStart covers every respawn; this covers only the FIRST life,
+	// which the shipped endzone spawn had already handed out before the subsystem's 5 Hz poll got to
+	// build anything. Repeating it would be a range that yanks you back every time you walked off to
+	// wall-jump on the arena's ramps — which is a thing you came here to do (see the header).
+	for (APlayerState* const EachState : BaseState->PlayerArray)
+	{
+		if (EachState == nullptr || EachState->IsABot())
+		{
+			continue;
+		}
+
+		ATraceCharacter* const PlayerPawn = Cast<ATraceCharacter>(EachState->GetPawn());
+		if (PlayerPawn == nullptr)
+		{
+			continue;   // still in character select, or mid-respawn; try again next poll
+		}
+
+		if (GatheredPlayers.Contains(EachState))
+		{
+			continue;
+		}
+		GatheredPlayers.Add(EachState);
+
+		const FVector Where = StartPost->GetActorLocation() + FVector(0.f, 0.f, 120.f);
+		const double MovedFrom = FVector::Dist(PlayerPawn->GetActorLocation(), Where);
+		PlayerPawn->TeleportTo(Where, StartPost->GetActorRotation(), /*bIsATest=*/false, /*bNoCheck=*/true);
+		if (AController* PlayerCtrl = PlayerPawn->GetController())
+		{
+			PlayerCtrl->SetControlRotation(StartPost->GetActorRotation());
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Practice] '%s' was %0.f uu away when the range opened; moved onto the range's spawn "
+			     "line. Every later respawn comes back here through ChoosePlayerStart."),
+			*EachState->GetPlayerName(), MovedFrom);
+	}
 }
 
 void UTracePracticeRangeSubsystem::TearDownRange()
@@ -307,6 +547,9 @@ void UTracePracticeRangeSubsystem::TearDownRange()
 		}
 	}
 	Pads.Reset();
+
+	PlayerStartPost.Reset();
+	GatheredPlayers.Reset();
 
 	bBuilt = false;
 	bInfiniteAbilities = false;
@@ -778,6 +1021,15 @@ AActor* UTracePracticeRangeSubsystem::FindRespawnPostFor(const AController* ForC
 	return DummyCtrl->GetHomePost();
 }
 
+AActor* UTracePracticeRangeSubsystem::GetPlayerStartPost() const
+{
+	// DEMO 19 ITEM 1. Null until BuildRange has run, which is the honest answer during the couple of
+	// seconds before the range is furnished — ATracePracticeGameMode::ChoosePlayerStart falls through
+	// to the shipped endzone pipeline on null, and GatherPlayersIntoRange collects the player once
+	// the post does exist.
+	return PlayerStartPost.Get();
+}
+
 int32 UTracePracticeRangeSubsystem::GetDummyCount() const
 {
 	int32 Count = 0;
@@ -823,6 +1075,34 @@ void UTracePracticeRangeSubsystem::RefreshInfiniteAbilitiesPad()
 	}
 }
 
+double UTracePracticeRangeSubsystem::GetPlayerDistanceToTargets() const
+{
+	const UWorld* const WorldPtr = GetWorld();
+	const APlayerController* const FirstPC = (WorldPtr != nullptr) ? WorldPtr->GetFirstPlayerController() : nullptr;
+	const APawn* const PlayerPawn = (FirstPC != nullptr) ? FirstPC->GetPawn() : nullptr;
+	if (PlayerPawn == nullptr)
+	{
+		return -1.0;
+	}
+
+	double Nearest = -1.0;
+	for (const TWeakObjectPtr<ATracePracticeDummyController>& EachDummy : Dummies)
+	{
+		const ATracePracticeDummyController* const DummyCtrl = EachDummy.Get();
+		const APawn* const DummyPawn = (DummyCtrl != nullptr) ? DummyCtrl->GetPawn() : nullptr;
+		if (DummyPawn == nullptr)
+		{
+			continue;
+		}
+		const double Distance = FVector::Dist2D(PlayerPawn->GetActorLocation(), DummyPawn->GetActorLocation());
+		if (Nearest < 0.0 || Distance < Nearest)
+		{
+			Nearest = Distance;
+		}
+	}
+	return Nearest;
+}
+
 void UTracePracticeRangeSubsystem::LogStatus() const
 {
 	const UWorld* const WorldPtr = GetWorld();
@@ -835,6 +1115,18 @@ void UTracePracticeRangeSubsystem::LogStatus() const
 		GetDummyCount(), GetPadCount(),
 		bInfiniteAbilities ? TEXT("ON") : TEXT("OFF"),
 		bCoreOnRack ? TEXT("yes") : TEXT("no"));
+
+	// DEMO 19 ITEM 1's measurement, printed rather than described. "Make it smaller" is a claim about
+	// how far the player has to walk, so this is the number that has to move.
+	const double ToTargets = GetPlayerDistanceToTargets();
+	const APlayerController* const FirstPC = (WorldPtr != nullptr) ? WorldPtr->GetFirstPlayerController() : nullptr;
+	const APawn* const PlayerPawn = (FirstPC != nullptr) ? FirstPC->GetPawn() : nullptr;
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Practice] the player is at %s, %.0f uu from the nearest target (the whole furnished "
+		     "footprint is %.0f uu deep)."),
+		(PlayerPawn != nullptr) ? *PlayerPawn->GetActorLocation().ToCompactString() : TEXT("<no pawn>"),
+		ToTargets,
+		TracePracticeRangeLocal::PlayerSpawnForwardUU + TracePracticeRangeLocal::TargetStandbackUU);
 
 #if !UE_BUILD_SHIPPING
 	if (TracePracticeRange::IsLeakArmed())

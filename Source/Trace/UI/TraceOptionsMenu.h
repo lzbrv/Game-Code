@@ -151,6 +151,33 @@ public:
 #endif
 
 private:
+#if !UE_BUILD_SHIPPING
+	/**
+	 * `-TraceMenuActivate=<ROW LABEL>`: presses one row, once, a few DRAWN FRAMES after the overlay
+	 * opens — through MoveSelection/ActivateSelected, the same path Enter takes.
+	 *
+	 * WHY IT COUNTS DRAWS AND NOT SECONDS, which is the whole reason it has to exist: the pause menu
+	 * stops the world in standalone, so every world timer freezes the instant the menu appears — and
+	 * both -TraceExec and -TraceAutoShot are scheduled on world timers. There was therefore NO
+	 * headless way to photograph a page one keystroke deeper than the in-match pause root, which is
+	 * exactly where spec v20 §0.6's slider, key chips and KEYBIND/KEY lettering live. ATraceHUD's own
+	 * auto-pause screenshot counts drawn frames for the identical reason.
+	 *
+	 *     -TraceAutoPause=6 -TraceMenuActivate=SETTINGS
+	 *
+	 * Dev-only, opt-in, and it drives the real rows rather than reaching past them, so a capture it
+	 * produces is evidence about the menu and not about the harness.
+	 */
+	void TickAutoActivate();
+
+	/** Drawn frames since the overlay opened. Reset by every Open*(). */
+	int32 DrawsSinceOpen = 0;
+	bool bAutoActivateDone = false;
+#endif
+
+private:
+
+private:
 	// ---- Rows -----------------------------------------------------------------------------------
 
 	enum class ERowKind : uint8
@@ -397,6 +424,19 @@ private:
 	void DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected);
 	void DrawFrame(AHUD* HUD, float X, float Y, float W, float H);
 	void DrawCursor(AHUD* HUD);
+
+	/**
+	 * The artist's value chip (T_MenuValueBox), landed so its PLATE is exactly (X, Y, W, H).
+	 *
+	 * Spec v20 §0.6. Two callers want it — the key chip on a Binding row and the value column beside
+	 * a Slider — and both of them already computed that rectangle for the plain cyan rect they used
+	 * to draw, so nothing about the layout moves.
+	 *
+	 * @return false when the sprite is unavailable (missing, uncooked, or Trace.Menu.Art 0) and
+	 *         NOTHING was drawn, which is the caller's cue to draw what it drew before. Every sprite
+	 *         on this screen is optional in exactly this way; see the art block in the .cpp.
+	 */
+	bool DrawValueChip(AHUD* HUD, float X, float Y, float W, float H) const;
 
 	/** Centred text helper; AHUD::DrawText is top-left anchored and has no measure-and-centre form. */
 	void DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale);

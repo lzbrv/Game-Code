@@ -61,6 +61,8 @@
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceMelee.h"
+#include "Gameplay/TraceWeaponComponent.h"
 #include "Modes/TracePracticeActors.h"
 #include "Modes/TracePracticeGameMode.h"
 #include "Modes/TracePracticeRange.h"
@@ -1083,8 +1085,860 @@ namespace TracePracticeVerify
 	}
 
 	// =============================================================================================
+	// Trace.Practice.KnifeTest — "KNIFE BACKSTABS DON'T WORK" (spec v21 demo 19, item 3)
+	// =============================================================================================
+	//
+	// WHY THIS EXISTS WHEN Trace.Knife.AngleTest ALREADY PASSES. AngleTest sweeps the PURE PREDICATE
+	// TraceMelee::IsBackstab around a hypothetical victim at the origin and checks the arithmetic. It
+	// has never once applied damage, and it cannot: it builds no attacker, swings no blade and never
+	// reaches ResolveSwing, ServerSwing or UTraceHealthComponent::ApplyDamage. The same is true of
+	// Trace.TestKnife's "DAMAGE PROBE", which reports the damage a swing *would* score by calling
+	// IsBackstab itself. Both of them can be green on a build where nobody has ever taken 100 damage
+	// from behind, which is exactly the shape of the two harnesses this project has already been
+	// burned by.
+	//
+	// So this one measures the ONE number the user can see: A DUMMY'S HEALTH BAR. It stands the local
+	// player behind a target, presses the shipped input path (RequestEquip -> StartSwing -> TickSwing
+	// -> ServerSwing), and reads the health that came off. Then it does the same from the front. If
+	// those two numbers are equal the harness is not measuring its own rule and says so.
+	//
+	// RED ARM: Trace.Practice.KnifeArm 1 makes the "back" stab be delivered from DIRECTLY IN FRONT of
+	// the target while every assertion still asks for a back-stab. All the back-stab assertions must
+	// then FAIL. An arm that leaves the verdict green means this harness cannot tell back from front.
+
+	/** How far from the target's capsule centre the harness stands to stab, in uu. */
+	constexpr float KnifeStandOffUU = 110.f;
+
+	/** Real seconds allowed for the blade to resolve and the damage to land. Windup is 0.1 s. */
+	constexpr double KnifeResolveWait = 0.45;
+
+	/** Real seconds between the two stabs. The swing cooldown is 0.5 s and is stamped at the press. */
+	constexpr double KnifeCooldownWait = 0.85;
+
+	TAutoConsoleVariable<int32> CVarPracticeKnifeArm(
+		TEXT("Trace.Practice.KnifeArm"),
+		0,
+		TEXT("DEV ONLY. RED ARM for Trace.Practice.KnifeTest. 1 delivers the 'back' stab from directly "
+		     "IN FRONT of the target while the assertions still ask for a back-stab, so every back-stab "
+		     "assertion must FAIL. If they pass, the harness cannot tell back from front and its green "
+		     "arm proves nothing."),
+		ECVF_Cheat);
+
+	struct FKnifeRun
+	{
+		TWeakObjectPtr<UWorld> WorldPtr;
+		FPracticeTally Tally;
+
+		int32 Step = 0;
+		double StepStartRealTime = 0.0;
+
+		/** The two victims. A back-stab is meant to be lethal, so the front stab needs its own body. */
+		TWeakObjectPtr<ATraceCharacter> BackVictim;
+		TWeakObjectPtr<ATraceCharacter> FrontVictim;
+
+		/** Where the player was before the harness walked them into stabbing range. */
+		FVector PlayerHome = FVector::ZeroVector;
+		FRotator PlayerHomeRotation = FRotator::ZeroRotator;
+
+		float HealthBefore = 0.f;
+
+		/** Health that actually came off, per approach. -1 until measured. */
+		float BackDamage = -1.f;
+		float FrontDamage = -1.f;
+		bool bBackKilled = false;
+		bool bFrontKilled = false;
+
+		/** What the pure predicate said about the spot the harness stood on. */
+		double BackPredicateAngle = -1.0;
+		double FrontPredicateAngle = -1.0;
+		bool bBackPredicate = false;
+		bool bFrontPredicate = false;
+
+		/** The victim's facing at the moment of the back stab, both ways of asking. */
+		float VictimActorYaw = 0.f;
+		float VictimRingYaw = 0.f;
+		bool bVictimRingHadHistory = false;
+
+		/** Refusals, so "the blade never swung" is distinguishable from "it swung and did 30". */
+		bool bBackSwingAccepted = false;
+		bool bFrontSwingAccepted = false;
+		bool bKnifeEquipped = false;
+
+		static constexpr double ReadyWaitSeconds = 25.0;
+	};
+
+	TSharedPtr<FKnifeRun> GKnifeRun;
+
+	bool TickKnifeRun(float /*Unused*/);
+
+	/** Every living ATraceCharacter that is not @p Exclude, nearest first is not required. */
+	void CollectVictims(UWorld* WorldPtr, const ATraceCharacter* Exclude, TArray<ATraceCharacter*>& Out)
+	{
+		Out.Reset();
+		if (WorldPtr == nullptr)
+		{
+			return;
+		}
+		for (TActorIterator<ATraceCharacter> It(WorldPtr); It; ++It)
+		{
+			ATraceCharacter* const Candidate = *It;
+			if (Candidate == nullptr || Candidate == Exclude || !Candidate->IsAlive())
+			{
+				continue;
+			}
+			if (Candidate->Health == nullptr || Candidate->IsCarrier())
+			{
+				continue;   // a carrier is immune to melee BY DESIGN — see TraceMelee.h
+			}
+			Out.Add(Candidate);
+		}
+	}
+
+	/**
+	 * Stands @p Attacker at @p StandOff uu from @p Victim on the side asked for, looking at it.
+	 *
+	 * bBehind chooses the side by the VICTIM'S OWN FORWARD, which is the only thing the back/front
+	 * rule reads: behind means "on the far side from where the victim is looking", so the approach
+	 * vector attacker->victim agrees with the victim's forward. See TraceMelee::IsBackstab.
+	 */
+	void StandToStab(ATraceCharacter& Attacker, const ATraceCharacter& Victim, bool bBehind)
+	{
+		const FVector VictimLocation = Victim.GetActorLocation();
+		const FVector VictimForward = FRotator(0.f, Victim.GetActorRotation().Yaw, 0.f).Vector();
+		const FVector Offset = bBehind ? -VictimForward : VictimForward;
+
+		const FVector StandPoint = VictimLocation + Offset * KnifeStandOffUU;
+		Attacker.TeleportTo(StandPoint, Attacker.GetActorRotation(), /*bIsATest=*/false, /*bNoCheck=*/true);
+
+		// Aim at the victim's capsule centre from the eye, so the swept arc really crosses the body
+		// rather than passing over its head. The back/front verdict is PLANAR and cannot see this
+		// pitch — which is the point: the harness must not be able to buy a verdict with its aim.
+		const FRotator LookAt = (VictimLocation - Attacker.GetPawnViewLocation()).Rotation();
+		if (AController* Ctrl = Attacker.GetController())
+		{
+			Ctrl->SetControlRotation(LookAt);
+		}
+		Attacker.SetActorRotation(FRotator(0.f, LookAt.Yaw, 0.f));
+	}
+
+	void RunKnifeTest()
+	{
+		UWorld* const WorldPtr = FindPracticeVerifyWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[KNIFEBACK] no game world; nothing to test."));
+			return;
+		}
+
+		UnpauseFor(WorldPtr);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("================================================================================"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[KNIFEBACK] DEMO 19 item 3: \"Knife backstabs don't work\". Measured as HEALTH TAKEN "
+			     "OFF A BODY through the shipped input path, not as an angle."));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[KNIFEBACK] settings in force: back %.0f dmg inside +/-%.0fdeg of the rear axis, "
+			     "front %.0f dmg, reach %.0fuu, arc %.0fdeg. Red arm Trace.Practice.KnifeArm is %s."),
+			TraceMelee::GetBackstabDamage(), TraceMelee::GetBackstabHalfAngleDegrees(),
+			TraceMelee::GetFrontDamage(), TraceMelee::GetSwingRangeUU(), TraceMelee::GetSwingArcDegrees(),
+			CVarPracticeKnifeArm.GetValueOnAnyThread() != 0 ? TEXT("*** ON ***") : TEXT("off"));
+
+		TSharedPtr<FKnifeRun> Run = MakeShared<FKnifeRun>();
+		Run->WorldPtr = WorldPtr;
+		Run->StepStartRealTime = FPlatformTime::Seconds();
+
+		GKnifeRun = Run;
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&TickKnifeRun), 0.f);
+	}
+
+	void GoToKnifeStep(FKnifeRun& Run, int32 NextStep)
+	{
+		Run.Step = NextStep;
+		Run.StepStartRealTime = FPlatformTime::Seconds();
+	}
+
+	bool TickKnifeRun(float /*Unused*/)
+	{
+		TSharedPtr<FKnifeRun> Run = GKnifeRun;
+		if (!Run.IsValid())
+		{
+			return false;
+		}
+
+		UWorld* const WorldPtr = Run->WorldPtr.Get();
+		if (WorldPtr == nullptr)
+		{
+			GKnifeRun.Reset();
+			return false;
+		}
+
+		const double SinceStep = FPlatformTime::Seconds() - Run->StepStartRealTime;
+		ATraceCharacter* const PlayerPawn = LocalPawn(WorldPtr);
+		UTraceWeaponComponent* const Weapon = (PlayerPawn != nullptr)
+			? PlayerPawn->FindComponentByClass<UTraceWeaponComponent>() : nullptr;
+
+		switch (Run->Step)
+		{
+		// -----------------------------------------------------------------------------------------
+		case 0:   // two bodies and a player holding a knife
+		{
+			TArray<ATraceCharacter*> Victims;
+			CollectVictims(WorldPtr, PlayerPawn, Victims);
+
+			const bool bReady = (PlayerPawn != nullptr) && PlayerPawn->IsAlive()
+				&& (Weapon != nullptr) && Victims.Num() >= 2;
+			if (!bReady && SinceStep < FKnifeRun::ReadyWaitSeconds)
+			{
+				return true;
+			}
+
+			Run->Tally.Report(PlayerPawn != nullptr && Weapon != nullptr, TEXT("KNIFEBACK"),
+				TEXT("there is a local pawn with a weapon component to swing."));
+			Run->Tally.Report(Victims.Num() >= 2, TEXT("KNIFEBACK"),
+				*FString::Printf(TEXT("there are at least two stabbable bodies (found %d). A back-stab is "
+				                      "meant to be lethal, so the front stab needs its own."), Victims.Num()));
+
+			if (PlayerPawn == nullptr || Weapon == nullptr || Victims.Num() < 2)
+			{
+				GoToKnifeStep(*Run, 90);
+				return true;
+			}
+
+			Run->BackVictim = Victims[0];
+			Run->FrontVictim = Victims[1];
+			Run->PlayerHome = PlayerPawn->GetActorLocation();
+			Run->PlayerHomeRotation = PlayerPawn->GetActorRotation();
+
+			// The shipped swap, the same call the swap bind makes. It costs the 0.2 s pullout, which
+			// the next step waits out through the shipped IsDeploying() rather than a private timer.
+			Weapon->RequestEquip(ETraceEquippedWeapon::Knife);
+			GoToKnifeStep(*Run, 1);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 1:   // stand behind the first body, knife out
+		{
+			ATraceCharacter* const Victim = Run->BackVictim.Get();
+			if (PlayerPawn == nullptr || Weapon == nullptr || Victim == nullptr || Victim->Health == nullptr)
+			{
+				Run->Tally.Report(false, TEXT("KNIFEBACK"), TEXT("the target survived long enough to be stabbed."));
+				GoToKnifeStep(*Run, 90);
+				return true;
+			}
+
+			if (Weapon->IsDeploying() && SinceStep < 1.5)
+			{
+				return true;
+			}
+
+			Run->bKnifeEquipped = Weapon->IsKnifeEquipped();
+			Run->Tally.Report(Run->bKnifeEquipped, TEXT("KNIFEBACK"),
+				TEXT("the player is holding the KNIFE (the swap is the shipped RequestEquip)."));
+
+			// *** THE RED ARM. *** Armed, the "back" stab is delivered from the victim's FACE while
+			// every assertion below still asks for a back-stab.
+			const bool bArmed = CVarPracticeKnifeArm.GetValueOnAnyThread() != 0;
+			StandToStab(*PlayerPawn, *Victim, /*bBehind=*/!bArmed);
+
+			// The pure predicate, asked about the spot the harness is really standing on. This is the
+			// cross-check between "the geometry is a back-stab" and "the damage was a back-stab" — and
+			// the two disagreeing is the whole diagnosis this command exists to produce.
+			Run->VictimActorYaw = static_cast<float>(Victim->GetActorRotation().Yaw);
+			Run->VictimRingYaw = Run->VictimActorYaw;
+			Run->bVictimRingHadHistory = UTraceWeaponComponent::GetFacingYawAtTime(
+				Victim, static_cast<float>(WorldPtr->GetGameState() != nullptr
+					? WorldPtr->GetGameState()->GetServerWorldTimeSeconds()
+					: WorldPtr->GetTimeSeconds()),
+				Run->VictimRingYaw);
+
+			Run->bBackPredicate = TraceMelee::IsBackstab(PlayerPawn->GetMuzzleLocation(),
+				Victim->GetActorLocation(), Run->VictimActorYaw, &Run->BackPredicateAngle);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KNIFEBACK] stand %s: attacker %s, victim %s, victim yaw %.1f (ring %.1f, history=%s), "
+				     "approach %.1fdeg, predicate says %s, gap %.0fuu."),
+				bArmed ? TEXT("IN FRONT (RED ARM)") : TEXT("BEHIND"),
+				*PlayerPawn->GetActorLocation().ToCompactString(),
+				*Victim->GetActorLocation().ToCompactString(),
+				Run->VictimActorYaw, Run->VictimRingYaw,
+				Run->bVictimRingHadHistory ? TEXT("yes") : TEXT("no"),
+				Run->BackPredicateAngle, Run->bBackPredicate ? TEXT("BACKSTAB") : TEXT("front"),
+				FVector::Dist(PlayerPawn->GetActorLocation(), Victim->GetActorLocation()));
+
+			Run->HealthBefore = Victim->Health->Health;
+			GoToKnifeStep(*Run, 2);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 2:   // swing
+		{
+			ATraceCharacter* const Victim = Run->BackVictim.Get();
+			if (Weapon == nullptr || Victim == nullptr)
+			{
+				GoToKnifeStep(*Run, 90);
+				return true;
+			}
+
+			// One frame of settle after the teleport before the press, so the movement component has
+			// published the new location into the lag-compensation history the server rewinds into.
+			if (SinceStep < 0.15)
+			{
+				return true;
+			}
+
+			ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+			Run->bBackSwingAccepted = Weapon->StartSwing(&Refusal);
+			Run->Tally.Report(Run->bBackSwingAccepted, TEXT("KNIFEBACK"),
+				*FString::Printf(TEXT("the swing was accepted (refusal code %d)."), static_cast<int32>(Refusal)));
+
+			GoToKnifeStep(*Run, 3);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 3:   // *** THE ASSERTION THE USER WOULD MAKE: it took a hundred off ***
+		{
+			if (SinceStep < KnifeResolveWait)
+			{
+				return true;
+			}
+
+			ATraceCharacter* const Victim = Run->BackVictim.Get();
+			const bool bVictimGone = (Victim == nullptr) || !Victim->IsAlive();
+			const float HealthAfter = (Victim != nullptr && Victim->Health != nullptr)
+				? Victim->Health->Health : 0.f;
+
+			Run->bBackKilled = bVictimGone || HealthAfter <= 0.f;
+			Run->BackDamage = Run->bBackKilled
+				? Run->HealthBefore                        // clamped at zero; it took everything it could
+				: (Run->HealthBefore - HealthAfter);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KNIFEBACK] BACK stab: %.0f -> %.0f health, %.0f damage, %s."),
+				Run->HealthBefore, HealthAfter, Run->BackDamage,
+				Run->bBackKilled ? TEXT("KILLED") : TEXT("survived"));
+
+			GoToKnifeStep(*Run, 4);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 4:   // the same swing from the front, on a fresh body
+		{
+			ATraceCharacter* const Victim = Run->FrontVictim.Get();
+			if (PlayerPawn == nullptr || Weapon == nullptr || Victim == nullptr || Victim->Health == nullptr)
+			{
+				Run->Tally.Report(false, TEXT("KNIFEBACK"),
+					TEXT("a second body survived to take the FRONT stab (without it, back and front "
+					     "cannot be compared and this run proves nothing)."));
+				GoToKnifeStep(*Run, 90);
+				return true;
+			}
+
+			if (SinceStep < KnifeCooldownWait)
+			{
+				return true;
+			}
+
+			StandToStab(*PlayerPawn, *Victim, /*bBehind=*/false);
+
+			Run->bFrontPredicate = TraceMelee::IsBackstab(PlayerPawn->GetMuzzleLocation(),
+				Victim->GetActorLocation(), static_cast<float>(Victim->GetActorRotation().Yaw),
+				&Run->FrontPredicateAngle);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KNIFEBACK] stand IN FRONT: approach %.1fdeg, predicate says %s."),
+				Run->FrontPredicateAngle, Run->bFrontPredicate ? TEXT("BACKSTAB") : TEXT("front"));
+
+			Run->HealthBefore = Victim->Health->Health;
+			GoToKnifeStep(*Run, 5);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 5:
+		{
+			if (SinceStep < 0.15)
+			{
+				return true;
+			}
+
+			ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+			Run->bFrontSwingAccepted = (Weapon != nullptr) && Weapon->StartSwing(&Refusal);
+			Run->Tally.Report(Run->bFrontSwingAccepted, TEXT("KNIFEBACK"),
+				*FString::Printf(TEXT("the FRONT swing was accepted (refusal code %d)."), static_cast<int32>(Refusal)));
+
+			GoToKnifeStep(*Run, 6);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 6:
+		{
+			if (SinceStep < KnifeResolveWait)
+			{
+				return true;
+			}
+
+			ATraceCharacter* const Victim = Run->FrontVictim.Get();
+			const bool bVictimGone = (Victim == nullptr) || !Victim->IsAlive();
+			const float HealthAfter = (Victim != nullptr && Victim->Health != nullptr)
+				? Victim->Health->Health : 0.f;
+
+			Run->bFrontKilled = bVictimGone || HealthAfter <= 0.f;
+			Run->FrontDamage = Run->bFrontKilled ? Run->HealthBefore : (Run->HealthBefore - HealthAfter);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KNIFEBACK] FRONT stab: %.0f -> %.0f health, %.0f damage, %s."),
+				Run->HealthBefore, HealthAfter, Run->FrontDamage,
+				Run->bFrontKilled ? TEXT("KILLED") : TEXT("survived"));
+
+			// Put the player back where they were standing; a harness must not leave the range
+			// arranged around itself.
+			if (PlayerPawn != nullptr)
+			{
+				PlayerPawn->TeleportTo(Run->PlayerHome, Run->PlayerHomeRotation,
+					/*bIsATest=*/false, /*bNoCheck=*/true);
+			}
+
+			GoToKnifeStep(*Run, 7);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 7:   // judgement
+		{
+			const float WantBack = TraceMelee::GetBackstabDamage();
+			const float WantFront = TraceMelee::GetFrontDamage();
+
+			// A. the geometry really was a back-stab. If this fails the harness stood in the wrong
+			//    place and every number below it is about something else.
+			Run->Tally.Report(Run->bBackPredicate, TEXT("KNIFEBACK"),
+				*FString::Printf(TEXT("the spot the harness stabbed from IS behind the target: approach "
+				                      "%.1fdeg, threshold %.0fdeg."),
+					Run->BackPredicateAngle, TraceMelee::GetBackstabHalfAngleDegrees()));
+
+			// B. *** THE USER'S COMPLAINT. ***
+			Run->Tally.Report(FMath::IsNearlyEqual(Run->BackDamage, WantBack, 0.51f), TEXT("KNIFEBACK"),
+				*FString::Printf(TEXT("*** A STAB FROM BEHIND TOOK %.0f DAMAGE (want %.0f). *** This is "
+				                      "the number \"backstabs don't work\" is about."),
+					Run->BackDamage, WantBack));
+
+			Run->Tally.Report(Run->bBackKilled, TEXT("KNIFEBACK"),
+				*FString::Printf(TEXT("...and it KILLED a %.0f-health target in one hit."), WantBack));
+
+			// C. the front stab is the control. A harness whose two arms give the same number is not
+			//    measuring its rule — this project's house rule, applied to itself.
+			Run->Tally.Report(FMath::IsNearlyEqual(Run->FrontDamage, WantFront, 0.51f), TEXT("KNIFEBACK"),
+				*FString::Printf(TEXT("a stab from the FRONT took %.0f damage (want %.0f)."),
+					Run->FrontDamage, WantFront));
+
+			Run->Tally.Report(!FMath::IsNearlyEqual(Run->BackDamage, Run->FrontDamage, 0.51f), TEXT("KNIFEBACK"),
+				*FString::Printf(TEXT("back (%.0f) and front (%.0f) are DIFFERENT numbers — the harness "
+				                      "can tell the two approaches apart."),
+					Run->BackDamage, Run->FrontDamage));
+
+			const bool bArmed = CVarPracticeKnifeArm.GetValueOnAnyThread() != 0;
+			const bool bAllGreen = (Run->Tally.Failed == 0);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("--------------------------------------------------------------------------------"));
+			if (bArmed)
+			{
+				if (bAllGreen)
+				{
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[KNIFEBACK] RED ARM VERDICT: *** BROKEN HARNESS *** — Trace.Practice.KnifeArm "
+						     "is ON, so the \"back\" stab was delivered to the target's FACE, and every "
+						     "assertion still passed. This harness cannot tell back from front."));
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[KNIFEBACK] RED ARM VERDICT: correct — %d/%d assertions FAILED with the stab "
+						     "moved to the target's face. The harness can see the difference, so its green "
+						     "arm is evidence. Set Trace.Practice.KnifeArm 0 and run again."),
+						Run->Tally.Failed, Run->Tally.Failed + Run->Tally.Passed);
+				}
+			}
+			else if (bAllGreen)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[KNIFEBACK] VERDICT: *** PASS *** — %d/%d. A stab from behind takes %.0f and "
+					     "kills; the same stab from the front takes %.0f."),
+					Run->Tally.Passed, Run->Tally.Passed, Run->BackDamage, Run->FrontDamage);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[KNIFEBACK] VERDICT: *** FAIL *** — %d of %d. back=%.0f front=%.0f "
+					     "(want %.0f / %.0f), predicate said %s."),
+					Run->Tally.Failed, Run->Tally.Failed + Run->Tally.Passed,
+					Run->BackDamage, Run->FrontDamage, WantBack, WantFront,
+					Run->bBackPredicate ? TEXT("BACKSTAB") : TEXT("front"));
+			}
+
+			GKnifeRun.Reset();
+			return false;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		default:
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KNIFEBACK] VERDICT: *** INVALID *** — the run could not be set up, so nothing was "
+				     "measured. %d of %d assertions failed on the way. This is NOT a pass."),
+				Run->Tally.Failed, Run->Tally.Failed + Run->Tally.Passed);
+			GKnifeRun.Reset();
+			return false;
+		}
+		}
+	}
+
+	// =============================================================================================
+	// Trace.Practice.BotAttackTest — "DON'T LET THE BOTS ATTACK" (spec v21 demo 19, item 2)
+	// =============================================================================================
+	//
+	// WHAT THE USER SAW, and therefore what this measures. The range's five targets were arming
+	// themselves and swinging: UTraceWeaponComponent::TickBotKnife runs on the server for every pawn
+	// whose controller is not an APlayerController and asks that controller nothing, so a target drew
+	// the blade at 500 uu and swung it at 153 uu. A dummy is on ETraceTeam::None, and TickBotKnife's
+	// teammate skip is guarded by `MyTeam != ETraceTeam::None` — so it never applies to a dummy and
+	// EVERY other body in the world is an enemy to it, the other four targets included.
+	//
+	// So there are two independent signals here and the harness reads both:
+	//   1. HOW MANY TARGETS HAVE A KNIFE OUT. The row is 260 uu wide-spaced, inside the 500 uu engage
+	//      range, so an armed row draws on ITSELF even with no player nearby. This is the signal that
+	//      does not depend on the harness standing anywhere in particular.
+	//   2. HEALTH OFF THE PLAYER, standing inside knifing distance of the middle target. This is the
+	//      user's actual complaint — "the bots attack ME" — and it is the number they can see.
+	//
+	// RED ARM: Trace.Practice.BotArm 1 puts the autonomy bit BACK on every target and the assertions
+	// are unchanged, so they must all FAIL. An arm that leaves the verdict green would mean the
+	// harness cannot see a bot attacking and its green arm proves nothing — which is exactly the
+	// failure mode this project has shipped twice.
+
+	/** How far from the target's capsule centre the harness parks the player, in uu. */
+	constexpr float BotAttackStandOffUU = 110.f;
+
+	/**
+	 * Real seconds the player stands there being a target of opportunity.
+	 *
+	 * TickBotKnife decides 4x a second, the pullout is 0.2 s and the swing cooldown 0.5 s, so this is
+	 * roughly a dozen decisions and several complete swings — long enough that "nothing happened"
+	 * means the rule held rather than that the clock ran out.
+	 */
+	constexpr double BotAttackWatchSeconds = 3.5;
+
+	TAutoConsoleVariable<int32> CVarPracticeBotArm(
+		TEXT("Trace.Practice.BotArm"),
+		0,
+		TEXT("DEV ONLY. RED ARM for Trace.Practice.BotAttackTest. 1 puts the autonomous-attack bit back "
+		     "on every practice target while the assertions still demand that no target attacks, so "
+		     "every one of them must FAIL. If they pass, the harness cannot see a bot attacking."),
+		ECVF_Cheat);
+
+	struct FBotAttackRun
+	{
+		TWeakObjectPtr<UWorld> WorldPtr;
+		FPracticeTally Tally;
+
+		int32 Step = 0;
+		double StepStartRealTime = 0.0;
+
+		/** The target the player is parked next to. */
+		TWeakObjectPtr<ATraceCharacter> NearTarget;
+
+		float PlayerHealthBefore = 0.f;
+
+		/** Peak count of targets seen holding a knife at any one sample. */
+		int32 PeakArmedTargets = 0;
+
+		/** Targets present when the watch began, so "they all died" is distinguishable from "quiet". */
+		int32 TargetsWatched = 0;
+
+		bool bArmed = false;
+
+		static constexpr double ReadyWaitSeconds = 25.0;
+	};
+
+	TSharedPtr<FBotAttackRun> GBotAttackRun;
+
+	bool TickBotAttackRun(float /*Unused*/);
+
+	/** Every living range target, i.e. an ATraceCharacter possessed by a dummy controller. */
+	void CollectRangeTargets(UWorld* WorldPtr, TArray<ATraceCharacter*>& Out)
+	{
+		Out.Reset();
+		if (WorldPtr == nullptr)
+		{
+			return;
+		}
+		for (TActorIterator<ATraceCharacter> It(WorldPtr); It; ++It)
+		{
+			ATraceCharacter* const Candidate = *It;
+			if (Candidate == nullptr || !Candidate->IsAlive())
+			{
+				continue;
+			}
+			if (Cast<ATracePracticeDummyController>(Candidate->GetController()) != nullptr)
+			{
+				Out.Add(Candidate);
+			}
+		}
+	}
+
+	/** How many of @p Targets are holding the knife right now. */
+	int32 CountArmedTargets(const TArray<ATraceCharacter*>& Targets)
+	{
+		int32 Count = 0;
+		for (const ATraceCharacter* const EachTarget : Targets)
+		{
+			if (TraceMelee::IsKnifeEquipped(EachTarget))
+			{
+				++Count;
+			}
+		}
+		return Count;
+	}
+
+	void RunBotAttackTest()
+	{
+		UWorld* const WorldPtr = FindPracticeVerifyWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[BOTATTACK] no game world; nothing to test."));
+			return;
+		}
+
+		UnpauseFor(WorldPtr);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("================================================================================"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BOTATTACK] DEMO 19 item 2: \"Don't let the bots attack\". Measured as KNIVES DRAWN by "
+			     "the range's targets and HEALTH TAKEN OFF THE PLAYER standing inside their reach."));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BOTATTACK] bot engage range %.0fuu, swing reach %.0fuu x %.2f, targets spaced 260uu. "
+			     "Red arm Trace.Practice.BotArm is %s."),
+			TraceMelee::GetBotEngageRangeUU(), TraceMelee::GetSwingRangeUU(),
+			TraceMelee::GetBotSwingRangeFraction(),
+			CVarPracticeBotArm.GetValueOnAnyThread() != 0 ? TEXT("*** ON ***") : TEXT("off"));
+
+		TSharedPtr<FBotAttackRun> Run = MakeShared<FBotAttackRun>();
+		Run->WorldPtr = WorldPtr;
+		Run->StepStartRealTime = FPlatformTime::Seconds();
+
+		GBotAttackRun = Run;
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&TickBotAttackRun), 0.f);
+	}
+
+	void GoToBotAttackStep(FBotAttackRun& Run, int32 NextStep)
+	{
+		Run.Step = NextStep;
+		Run.StepStartRealTime = FPlatformTime::Seconds();
+	}
+
+	bool TickBotAttackRun(float /*Unused*/)
+	{
+		TSharedPtr<FBotAttackRun> Run = GBotAttackRun;
+		if (!Run.IsValid())
+		{
+			return false;
+		}
+
+		UWorld* const WorldPtr = Run->WorldPtr.Get();
+		if (WorldPtr == nullptr)
+		{
+			GBotAttackRun.Reset();
+			return false;
+		}
+
+		const double SinceStep = FPlatformTime::Seconds() - Run->StepStartRealTime;
+
+		APlayerController* const PC = WorldPtr->GetFirstPlayerController();
+		ATraceCharacter* const PlayerPawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+
+		TArray<ATraceCharacter*> Targets;
+		CollectRangeTargets(WorldPtr, Targets);
+
+		switch (Run->Step)
+		{
+		// -----------------------------------------------------------------------------------------
+		case 0:   // wait for a pawn and a furnished row, then apply the arm and park the player
+		{
+			const bool bReady = (PlayerPawn != nullptr) && (PlayerPawn->Health != nullptr) && Targets.Num() >= 2;
+			if (!bReady && SinceStep < FBotAttackRun::ReadyWaitSeconds)
+			{
+				return true;
+			}
+
+			Run->Tally.Report(PlayerPawn != nullptr && PlayerPawn->Health != nullptr, TEXT("BOTATTACK"),
+				TEXT("there is a local pawn with health to lose."));
+			Run->Tally.Report(Targets.Num() >= 2, TEXT("BOTATTACK"),
+				*FString::Printf(TEXT("the target row is furnished (found %d). An armed row draws on "
+				                      "ITSELF, which is the signal that needs no player."), Targets.Num()));
+
+			if (PlayerPawn == nullptr || PlayerPawn->Health == nullptr || Targets.Num() < 2)
+			{
+				GoToBotAttackStep(*Run, 90);
+				return true;
+			}
+
+			// *** THE RED ARM, AND ONLY THE RED ARM, TOUCHES THE BIT. ***
+			//
+			// Armed, every target gets its autonomy back and the assertions below are unchanged, so
+			// they must all fail. UNARMED, THIS LOOP DOES NOT RUN: the green arm has to observe what
+			// ATracePracticeDummyController::OnPossess actually left on these pawns, because that is
+			// the fix under test. A harness that re-applied the fix and then checked it would be
+			// measuring its own setup call — which is the shape of the two harnesses this project has
+			// already shipped and had to throw away.
+			Run->bArmed = CVarPracticeBotArm.GetValueOnAnyThread() != 0;
+			if (Run->bArmed)
+			{
+				for (ATraceCharacter* const EachTarget : Targets)
+				{
+					if (UTraceWeaponComponent* TargetWeapon = EachTarget->FindComponentByClass<UTraceWeaponComponent>())
+					{
+						TargetWeapon->SetAutonomousAttacksAllowed(true);
+					}
+				}
+			}
+
+			// Park the player inside knifing reach of the middle target, in its FACE — the front is
+			// where a bot that is attacking you would be met, and it keeps the 30-damage front stab
+			// (not the 100 back-stab) as the thing being detected, so a survivable hit still registers.
+			ATraceCharacter* const Near = Targets[Targets.Num() / 2];
+			Run->NearTarget = Near;
+			const FVector TargetForward = FRotator(0.f, Near->GetActorRotation().Yaw, 0.f).Vector();
+			PlayerPawn->TeleportTo(Near->GetActorLocation() + TargetForward * BotAttackStandOffUU,
+				PlayerPawn->GetActorRotation(), /*bIsATest=*/false, /*bNoCheck=*/true);
+
+			Run->PlayerHealthBefore = PlayerPawn->Health->Health;
+			Run->TargetsWatched = Targets.Num();
+			Run->PeakArmedTargets = CountArmedTargets(Targets);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BOTATTACK] player parked %.0fuu from a target (reach is %.0fuu), health %.0f, "
+				     "%d targets watched. Arm is %s."),
+				BotAttackStandOffUU,
+				TraceMelee::GetSwingRangeUU() * TraceMelee::GetBotSwingRangeFraction(),
+				Run->PlayerHealthBefore, Run->TargetsWatched,
+				Run->bArmed ? TEXT("*** ON ***") : TEXT("off"));
+
+			GoToBotAttackStep(*Run, 1);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 1:   // stand there and watch
+		{
+			Run->PeakArmedTargets = FMath::Max(Run->PeakArmedTargets, CountArmedTargets(Targets));
+
+			if (SinceStep < BotAttackWatchSeconds)
+			{
+				return true;
+			}
+
+			const float HealthNow = (PlayerPawn != nullptr && PlayerPawn->Health != nullptr)
+				? PlayerPawn->Health->Health
+				: 0.f;
+			const float HealthLost = Run->PlayerHealthBefore - HealthNow;
+			const bool bPlayerDied = (PlayerPawn == nullptr) || !PlayerPawn->IsAlive();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BOTATTACK] after %.1fs: peak %d of %d targets holding a knife, player health "
+				     "%.0f -> %.0f (%.0f lost)%s."),
+				BotAttackWatchSeconds, Run->PeakArmedTargets, Run->TargetsWatched,
+				Run->PlayerHealthBefore, HealthNow, HealthLost,
+				bPlayerDied ? TEXT(", PLAYER DIED") : TEXT(""));
+
+			Run->Tally.Report(Run->PeakArmedTargets == 0, TEXT("BOTATTACK"),
+				*FString::Printf(TEXT("no target ever drew the knife (peak %d of %d holding one)."),
+					Run->PeakArmedTargets, Run->TargetsWatched));
+
+			Run->Tally.Report(HealthLost <= 0.f && !bPlayerDied, TEXT("BOTATTACK"),
+				*FString::Printf(TEXT("the player standing inside their reach took NOTHING (%.0f health "
+				                      "lost). This is the number \"don't let the bots attack\" is about."),
+					HealthLost));
+
+			GoToBotAttackStep(*Run, 90);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		default:   // verdict
+		{
+			// Disarm again on the way out whatever the arm said, so a red run does not leave a live
+			// row of knife-fighting targets behind it for the next command to trip over.
+			for (ATraceCharacter* const EachTarget : Targets)
+			{
+				if (UTraceWeaponComponent* TargetWeapon = EachTarget->FindComponentByClass<UTraceWeaponComponent>())
+				{
+					TargetWeapon->SetAutonomousAttacksAllowed(false);
+				}
+			}
+
+			const bool bGreen = Run->Tally.Failed == 0;
+
+			if (Run->bArmed)
+			{
+				// THE ARM'S OWN VERDICT. Armed, the assertions above are supposed to fail.
+				if (bGreen)
+				{
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[BOTATTACK] RED ARM VERDICT: *** BROKEN HARNESS *** — Trace.Practice.BotArm "
+						     "was ON, every target had its autonomy back, and the harness still reported "
+						     "everything green. It cannot see a bot attacking, so its green arm is not "
+						     "evidence. Set Trace.Practice.BotArm 0 and run again."));
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[BOTATTACK] RED ARM VERDICT: *** CORRECTLY FAILED *** — %d of %d assertions "
+						     "failed with the targets re-armed. The harness can see a bot attacking, so a "
+						     "green run with the arm off means something."),
+						Run->Tally.Failed, Run->Tally.Passed + Run->Tally.Failed);
+				}
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[BOTATTACK] VERDICT: %s — %d of %d."),
+					bGreen ? TEXT("*** PASS ***") : TEXT("*** FAIL ***"),
+					Run->Tally.Passed, Run->Tally.Passed + Run->Tally.Failed);
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("================================================================================"));
+
+			GBotAttackRun.Reset();
+			return false;
+		}
+		}
+	}
+
+	// =============================================================================================
 	// Registration
 	// =============================================================================================
+
+	FAutoConsoleCommand CmdPracticeBotAttackTest(
+		TEXT("Trace.Practice.BotAttackTest"),
+		TEXT("DEMO 19 item 2. Parks the local player inside knifing reach of a practice target and "
+		     "watches for 3.5 s: counts targets that draw a knife and health taken off the player. "
+		     "RED ARM: Trace.Practice.BotArm 1 gives every target its autonomy back and every "
+		     "assertion must FAIL."),
+		FConsoleCommandDelegate::CreateStatic(&RunBotAttackTest));
+
+	FAutoConsoleCommand CmdPracticeKnifeTest(
+		TEXT("Trace.Practice.KnifeTest"),
+		TEXT("DEMO 19 item 3. Stands the local player behind a stationary target, swings the knife "
+		     "through the shipped input path and reports the HEALTH THAT CAME OFF; then repeats from "
+		     "the front. RED ARM: Trace.Practice.KnifeArm 1 delivers the 'back' stab to the target's "
+		     "face and every back-stab assertion must FAIL."),
+		FConsoleCommandDelegate::CreateStatic(&RunKnifeTest));
 
 	FAutoConsoleCommand CmdPracticeVerify(
 		TEXT("Trace.Practice.Verify"),

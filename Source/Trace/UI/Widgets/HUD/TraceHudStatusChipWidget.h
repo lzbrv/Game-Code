@@ -26,6 +26,8 @@
 
 #include "UI/Widgets/HUD/TraceHudCornerData.h"
 
+#include "UI/Text/TraceAtlasTextSwap.h"
+
 #include "TraceHudStatusChipWidget.generated.h"
 
 class UBorder;
@@ -88,4 +90,12 @@ protected:
 	 */
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UProgressBar> DrainBar;
+
+	// SPEC v22 §A1 — the chip's two strings come off the glyph atlas, like the corner it sits under.
+	bool bAtlasLabelsInstalled = false;
+
+	UPROPERTY(Transient)
+	TArray<FTraceAtlasLabel> AtlasLabels;
+
+	void InstallAtlasLabels();
 };

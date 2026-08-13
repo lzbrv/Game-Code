@@ -7,9 +7,210 @@
 #include "Components/CanvasPanelSlot.h"
 #include "Components/Image.h"
 #include "Components/TextBlock.h"
+#include "Engine/Texture2D.h"
+#include "TextureResource.h"
 
+#include "Trace.h"   // LogTraceGame
+#include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
+
+// Named after the file, not anonymous: UBT concatenates .cpp files for the unity build and two
+// anonymous namespaces become one. See Scripts/check-jumbo-build-collisions.py.
+namespace TraceTitleMenuWidgetLocal
+{
+	// ---- The title block, in the 1080-tall reference pixels the asset is authored in --------------
+	//
+	// These five numbers ARE spec v20 §0.2's fix, and every one of them is measured rather than
+	// chosen. The two sprites' ink boxes were taken off the artist's sheet ("UI Test Export_2.png"):
+	// the wordmark's ink is 14265 x 2200 sheet px, the swoosh's is 18521 x 3729, the swoosh sits
+	// 474 sheet px BELOW the mark's ink with its centre 427 px to the LEFT of it. Divide through by
+	// the mark's ink width and those become the four ratios below. Both sprites are cut so tightly
+	// (ink fills 99% of each crop) that the sprite rect and the ink rect are the same rectangle.
+
+	/** The mark's width in reference px, and the fraction of a narrow viewport it may not exceed. */
+	static constexpr float MarkWidth = 660.f;
+	static constexpr float MarkMaxWidthFraction = 0.46f;
+	static constexpr float MarkTopY = 46.f;
+
+	/** Swoosh ink / wordmark ink on the sheet is 1.298. Held a shade under it so the mark leads. */
+	static constexpr float SwooshWidthOfMark = 1.24f;
+
+	/** The artist's clear space: 474 sheet px / 14265 sheet px of mark = 0.0332. */
+	static constexpr float SwooshGapOfMark = 0.033f;
+
+	/** The artist's horizontal offset: 427 / 14265 = 0.0299, to the left. */
+	static constexpr float SwooshLeftOfMark = 0.030f;
+
+	/** Reference px the flourish must stop short of the tagline by, if the clamp has to bite. */
+	static constexpr float SwooshClearOfTagline = 16.f;
+
+	/**
+	 * The swoosh's opacity, down from the authored 0.78.
+	 *
+	 * It is a backdrop for the title, and it is drawn from a sprite whose mean luminance over black
+	 * is 148 against the mark's 24. Even after the mark is lifted to near-white, a flourish at full
+	 * strength competes with the six things on this screen a player actually has to read.
+	 */
+	static constexpr float SwooshOpacity = 0.55f;
+
+	// ---- The footer, once it is no longer sitting on the blurb ------------------------------------
+
+	/** Reference px between the blurb's bottom and the line under it. */
+	static constexpr float FooterGapBelowBlurb = 13.f;
+
+	/** Reference px between the two footer lines. Matches the asset's authored 982.4 - 958.4. */
+	static constexpr float FooterLineGap = 24.f;
+
+	/** Extra air under the port-busy line, which is a notice and should not read as a key hint. */
+	static constexpr float FooterGapAfterWarning = 7.f;
+
+	/** The last line keeps at least this much air under it, whatever the console did. */
+	static constexpr float FooterBottomMargin = 16.f;
+
+	// ---- The lifted wordmark ---------------------------------------------------------------------
+
+	/**
+	 * Peak over-black luminance, 0..1, at or above which the sprite is left completely alone.
+	 *
+	 * THE SELF-DISABLING TEST. Today's crop peaks at 0.28 — that is the defect. A word lifted the way
+	 * build_word() lifts PLAY and SETTINGS peaks at 1.0. Anything at 0.62 or brighter already reads
+	 * on black and does not want a second opinion from this file.
+	 */
+	static constexpr float WordmarkLiftThreshold = 0.62f;
+
+	/** The glyph body. Near-white, very slightly cool, matching the tagline's ink. */
+	static const FColor WordmarkInk(242, 246, 255, 255);
+
+	/** The glow the artist drew the mark with. TraceMenuArtStyle::Amber, at a strength that shows. */
+	static const FColor WordmarkGlow(255, 140, 40, 255);
+
+	/** Rec. 709 luminance of an sRGB byte triple, 0..1. Perceptual weighting, not an average. */
+	static float ByteLuminance(const FColor& InColor)
+	{
+		return (0.2126f * InColor.R + 0.7152f * InColor.G + 0.0722f * InColor.B) / 255.f;
+	}
+
+	/**
+	 * A BGRA8 copy of @p InTexture's top mip, or false if this build cannot reach the pixels.
+	 *
+	 * Two sources, in the order of how much they can be trusted:
+	 *   1. the imported SOURCE art, which the editor keeps and which has never been compressed,
+	 *      mip-dropped or thrown away after upload. This is the path that runs in-editor and in
+	 *      -game off the editor binary, which is every way this screen is looked at today;
+	 *   2. the cooked platform data, for a packaged build — present only while the CPU copy has not
+	 *      been discarded, which is why the caller must treat failure as normal and fall back.
+	 */
+	static bool ReadTexturePixels(UTexture2D* InTexture, TArray<FColor>& OutPixels, int32& OutWidth, int32& OutHeight)
+	{
+		if (InTexture == nullptr)
+		{
+			return false;
+		}
+
+#if WITH_EDITORONLY_DATA
+		if (InTexture->Source.IsValid() && InTexture->Source.GetFormat() == TSF_BGRA8)
+		{
+			TArray64<uint8> Raw;
+			if (InTexture->Source.GetMipData(Raw, 0))
+			{
+				OutWidth = static_cast<int32>(InTexture->Source.GetSizeX());
+				OutHeight = static_cast<int32>(InTexture->Source.GetSizeY());
+				const int64 Expected = static_cast<int64>(OutWidth) * OutHeight * 4;
+				if (OutWidth > 0 && OutHeight > 0 && Raw.Num() == Expected)
+				{
+					OutPixels.SetNumUninitialized(OutWidth * OutHeight);
+					FMemory::Memcpy(OutPixels.GetData(), Raw.GetData(), Expected);
+					return true;
+				}
+			}
+		}
+#endif
+
+		FTexturePlatformData* PlatformData = InTexture->GetPlatformData();
+		if (PlatformData == nullptr || PlatformData->Mips.Num() == 0 || PlatformData->PixelFormat != PF_B8G8R8A8)
+		{
+			return false;
+		}
+
+		FTexture2DMipMap& Mip = PlatformData->Mips[0];
+		const int64 Expected = static_cast<int64>(Mip.SizeX) * Mip.SizeY * 4;
+		if (Expected <= 0 || Mip.BulkData.GetBulkDataSize() != Expected)
+		{
+			return false;
+		}
+
+		bool bRead = false;
+		if (const void* Data = Mip.BulkData.LockReadOnly())
+		{
+			OutWidth = Mip.SizeX;
+			OutHeight = Mip.SizeY;
+			OutPixels.SetNumUninitialized(OutWidth * OutHeight);
+			FMemory::Memcpy(OutPixels.GetData(), Data, Expected);
+			bRead = true;
+		}
+		Mip.BulkData.Unlock();
+		return bRead;
+	}
+
+	/**
+	 * One horizontal edge of @p InWidget in @p InRoot's local (reference-pixel) space.
+	 *
+	 * MEASURED, not recomputed: it is the same rectangle Slate drew with, which is the whole point —
+	 * the collisions this file exists to fix were all somebody recomputing a position that Slate had
+	 * already decided differently.
+	 *
+	 * @param InFraction 0 for the widget's top edge, 1 for its bottom.
+	 * @return a negative number before the widget has ever been laid out, which is the first frame.
+	 */
+	static float LocalEdgeY(const FGeometry& InRoot, const UWidget* InWidget, float InFraction)
+	{
+		if (InWidget == nullptr)
+		{
+			return -1.f;
+		}
+
+		const FGeometry& Geometry = InWidget->GetCachedGeometry();
+		const FVector2D Size = Geometry.GetLocalSize();
+		if (Size.Y <= 1.0)
+		{
+			return -1.f;
+		}
+
+		const FVector2D Absolute = Geometry.LocalToAbsolute(FVector2D(0.0, Size.Y * InFraction));
+		return static_cast<float>(InRoot.AbsoluteToLocal(Absolute).Y);
+	}
+
+	/**
+	 * Puts @p InSlot at @p InPosition, and at @p InSize when that is positive — an auto-sizing slot
+	 * (the two footer lines) passes a negative width to say "leave the size to Slate".
+	 *
+	 * Every write is guarded by a comparison because a SetPosition/SetSize invalidates layout: called
+	 * unguarded from ApplyView this would re-run the canvas panel's arrange pass every single frame.
+	 *
+	 * @return true if anything actually moved.
+	 */
+	static bool SetSlotRect(UCanvasPanelSlot* InSlot, const FVector2D& InPosition, const FVector2D& InSize)
+	{
+		if (InSlot == nullptr)
+		{
+			return false;
+		}
+
+		bool bChanged = false;
+		if (!InSlot->GetPosition().Equals(InPosition, 0.25))
+		{
+			InSlot->SetPosition(InPosition);
+			bChanged = true;
+		}
+		if (InSize.X > 0.0 && !InSlot->GetSize().Equals(InSize, 0.25))
+		{
+			InSlot->SetSize(InSize);
+			bChanged = true;
+		}
+		return bChanged;
+	}
+}
 
 void UTraceTitleMenuWidget::NativeOnInitialized()
 {
@@ -31,10 +232,52 @@ void UTraceTitleMenuWidget::NativeOnInitialized()
 	OrderedRows.Add(RowMode);
 	OrderedRows.Add(RowSettings);
 	OrderedRows.Add(RowQuit);
+
+	// Once, here rather than in ApplyView: it reads a texture and builds another one, and the answer
+	// cannot change while the game is running. See the header for why it is done in code at all.
+	LiftWordmarkFromSprite();
+}
+
+void UTraceTitleMenuWidget::InstallAtlasLabels()
+{
+	if (bAtlasLabelsInstalled)
+	{
+		return;
+	}
+	bAtlasLabelsInstalled = true;
+
+	// The three strings that run the full width of the screen get a fit bound; nothing else does.
+	// These are LOCAL units, and the root canvas of WBP_TitleMenu is 1920 of them wide at any window
+	// size (UMG's DPI curve keeps the reference resolution fixed), so 1760 is the screen with a 80-px
+	// margin down each side. The footer hint is the longest string on the title screen and it is the
+	// one Sofachrome's extra width would have pushed off the edge.
+	constexpr float FullWidthFit = 1760.f;
+
+	AtlasLabels.Reset();
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, TaglineText, FullWidthFit));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AddressCaptionText));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AddressValueText));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, PortWarningText, FullWidthFit));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, BlurbText, FullWidthFit));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, FooterKeysText, FullWidthFit));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, FooterHintText, FullWidthFit));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, TravelCaptionText, FullWidthFit));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, TravelHintText, FullWidthFit));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, FailureHeadlineText, FullWidthFit));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, FailureDetailText, FullWidthFit));
+
+	AtlasLabels.RemoveAll([](const FTraceAtlasLabel& Label) { return !Label.IsValid(); });
+
+	UE_LOG(LogTemp, Log, TEXT("[MenuText] Title screen: %d label(s) moved onto the glyph atlas. %s"),
+		AtlasLabels.Num(), *TraceText::DescribeFace());
 }
 
 void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 {
+	// Spec v22 §A1. First frame only; see the header. Before the SetTextOn calls below, so the very
+	// first frame this screen draws is already in the artist's face rather than one frame of Lato.
+	InstallAtlasLabels();
+
 	const auto SetTextOn = [](UTextBlock* Block, const FString& InText)
 	{
 		if (Block != nullptr)
@@ -45,8 +288,11 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 
 	// ---- Art -------------------------------------------------------------------------------------
 	//
-	// The backdrop and the swoosh are static and are authored in the asset; nothing here touches them.
-	// Only the cursor moves.
+	// The backdrop is static and authored in the asset. The wordmark and the swoosh are NOT any more:
+	// spec v20 §0.1-0.2 are both authored rects, and this is the file that can enforce them and be
+	// photographed doing it. See ComposeTitleBlock().
+	ComposeTitleBlock();
+
 	if (MenuCursor != nullptr)
 	{
 		MenuCursor->SetVisibility(InView.bCursorVisible
@@ -82,6 +328,7 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 		{
 			PortWarningText->SetText(FText::FromString(InView.PortWarning));
 		}
+		// WHERE it goes is decided with the rest of the bottom stack, in PlaceFooterBelowBlurb().
 	}
 
 	// ---- Rows ------------------------------------------------------------------------------------
@@ -107,6 +354,9 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 	SetTextOn(BlurbText, InView.Blurb);
 	SetTextOn(FooterKeysText, InView.FooterKeys);
 	SetTextOn(FooterHintText, InView.FooterHint);
+
+	// AFTER the three strings are set, because it measures where the blurb ended up. Spec v20 §0.4.
+	PlaceFooterBelowBlurb();
 
 	// ---- Travel ----------------------------------------------------------------------------------
 	if (TravelOverlay != nullptr)
@@ -141,6 +391,10 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 			SetTextOn(FailureDetailText, InView.FailureDetail);
 		}
 	}
+
+	// LAST. Every SetTextOn above wrote to a model; this is the line that puts the frame on screen in
+	// the artist's typeface. See UI/Text/TraceAtlasTextSwap.h.
+	TraceAtlasTextSwap::MirrorAll(AtlasLabels);
 }
 
 void UTraceTitleMenuWidget::SyncConsoleWidth()
@@ -174,6 +428,256 @@ void UTraceTitleMenuWidget::SyncConsoleWidth()
 		PanelSize.X = PanelWidth;
 		PanelSlot->SetSize(PanelSize);
 	}
+}
+
+void UTraceTitleMenuWidget::LiftWordmarkFromSprite()
+{
+	using namespace TraceTitleMenuWidgetLocal;
+
+	if (bWordmarkLiftAttempted)
+	{
+		return;
+	}
+	bWordmarkLiftAttempted = true;
+
+	UTexture2D* Source = (Wordmark != nullptr)
+		? Cast<UTexture2D>(Wordmark->GetBrush().GetResourceObject()) : nullptr;
+	if (Source == nullptr)
+	{
+		// No sprite at all is somebody else's failure — CountResolvedArt already reports it, and
+		// `Trace.UI.VerifyMenuArt` already fails on it. Nothing to lift, nothing to say twice.
+		return;
+	}
+
+	TArray<FColor> Pixels;
+	int32 Width = 0;
+	int32 Height = 0;
+	if (!ReadTexturePixels(Source, Pixels, Width, Height))
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[MenuArt] The TRACE wordmark could not be read back (%s), so it is drawn as the artist's ")
+			TEXT("crop: a navy glyph in an amber glow on black, which reads as two offset words. ")
+			TEXT("Re-cut the sprite in Scripts/slice-ui-assets.py to fix it at the source."),
+			*Source->GetName());
+		return;
+	}
+
+	// THE SELF-DISABLING TEST, and the measurement the fix is justified by. Composited over the black
+	// backdrop a pixel contributes colour * alpha, so this is literally how bright the brightest part
+	// of the mark can get on this screen.
+	float PeakLuminance = 0.f;
+	for (const FColor& Pixel : Pixels)
+	{
+		PeakLuminance = FMath::Max(PeakLuminance, ByteLuminance(Pixel) * (Pixel.A / 255.f));
+	}
+
+	if (PeakLuminance >= WordmarkLiftThreshold)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MenuArt] The TRACE wordmark already peaks at luminance %.2f over black, so it is drawn ")
+			TEXT("exactly as it was cut. Nothing was recoloured."), PeakLuminance);
+		return;
+	}
+
+	// The lift itself. The artist's two tones are unambiguous — the glyph body is navy (B > R) and the
+	// glow is amber (R >= B) — so the split needs no threshold to tune and no letterform is moved,
+	// re-cut or re-shaped. ALPHA IS COPIED UNTOUCHED, which is what keeps the artist's stroke weights,
+	// their antialiasing and the soft fall-off of their glow exactly as drawn.
+	int32 BodyPixels = 0;
+	int32 GlowPixels = 0;
+	for (FColor& Pixel : Pixels)
+	{
+		if (Pixel.A == 0)
+		{
+			continue;
+		}
+		const bool bGlyphBody = Pixel.B > Pixel.R;
+		const FColor Replacement = bGlyphBody ? WordmarkInk : WordmarkGlow;
+		Pixel.R = Replacement.R;
+		Pixel.G = Replacement.G;
+		Pixel.B = Replacement.B;
+		(bGlyphBody ? BodyPixels : GlowPixels) += 1;
+	}
+
+	UTexture2D* Lifted = UTexture2D::CreateTransient(Width, Height, PF_B8G8R8A8, TEXT("T_TraceWordmark_Lifted"));
+	if (Lifted == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[MenuArt] Could not create the lifted TRACE wordmark; drawing the crop."));
+		return;
+	}
+
+	Lifted->SRGB = Source->SRGB;
+	Lifted->Filter = Source->Filter;
+	Lifted->AddressX = TA_Clamp;
+	Lifted->AddressY = TA_Clamp;
+	Lifted->NeverStream = true;
+
+	FTexture2DMipMap& Mip = Lifted->GetPlatformData()->Mips[0];
+	if (void* Destination = Mip.BulkData.Lock(LOCK_READ_WRITE))
+	{
+		FMemory::Memcpy(Destination, Pixels.GetData(), static_cast<int64>(Width) * Height * 4);
+	}
+	Mip.BulkData.Unlock();
+	Lifted->UpdateResource();
+
+	LiftedWordmark = Lifted;
+
+	// BOTH places the mark is drawn. The travel overlay uses the same sprite at 420 px and 55%
+	// opacity, and it is on screen for exactly as long as a join takes — i.e. the one screen a
+	// title-screen screenshot can never catch. Leaving it on the old crop would have shipped the
+	// defect somewhere nobody looks.
+	Wordmark->SetBrushResourceObject(LiftedWordmark);
+	if (TravelWordmark != nullptr && TravelWordmark->GetBrush().GetResourceObject() == Source)
+	{
+		TravelWordmark->SetBrushResourceObject(LiftedWordmark);
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[MenuArt] TRACE wordmark lifted: the crop peaked at luminance %.2f over black (navy glyph, ")
+		TEXT("amber glow), which reads as two words. %d glyph pixels are now ink and %d glow pixels are ")
+		TEXT("the artist's amber; the alpha, and so every letterform, is untouched."),
+		PeakLuminance, BodyPixels, GlowPixels);
+}
+
+void UTraceTitleMenuWidget::ComposeTitleBlock()
+{
+	using namespace TraceTitleMenuWidgetLocal;
+
+	UCanvasPanelSlot* MarkSlot = (Wordmark != nullptr) ? Cast<UCanvasPanelSlot>(Wordmark->Slot) : nullptr;
+	UCanvasPanelSlot* SwooshSlot = (SwooshImage != nullptr) ? Cast<UCanvasPanelSlot>(SwooshImage->Slot) : nullptr;
+	if (MarkSlot == nullptr || SwooshSlot == nullptr)
+	{
+		return;
+	}
+
+	// Reference pixels: UMG's DPI scale is (shortest side / 1080), so this is 1080 tall at every
+	// window size the game runs at and these numbers mean the same thing on all of them.
+	const FVector2D RootSize = GetCachedGeometry().GetLocalSize();
+	if (RootSize.X <= 1.0)
+	{
+		return;
+	}
+
+	// Aspect from the TEXTURE, not from a constant, so a re-slice that changes the crop cannot leave
+	// this file stretching it. The fallbacks are the sheet's own crop ratios.
+	const auto SpriteAspect = [](const UImage* InImage, float InFallback) -> float
+	{
+		const UTexture2D* Texture = (InImage != nullptr)
+			? Cast<UTexture2D>(InImage->GetBrush().GetResourceObject()) : nullptr;
+		if (Texture != nullptr && Texture->GetSizeX() > 0)
+		{
+			return static_cast<float>(Texture->GetSizeY()) / static_cast<float>(Texture->GetSizeX());
+		}
+		return InFallback;
+	};
+
+	const float MarkW = FMath::Min(MarkWidth, static_cast<float>(RootSize.X) * MarkMaxWidthFraction);
+	const float MarkH = MarkW * SpriteAspect(Wordmark, 2392.f / 14480.f);
+
+	float SwooshW = MarkW * SwooshWidthOfMark;
+	const float SwooshAspect = SpriteAspect(SwooshImage, 3856.f / 18600.f);
+	const float SwooshTop = MarkTopY + MarkH + MarkW * SwooshGapOfMark;
+
+	// The clamp, and the only part of this that is not the artist's own proportion: whatever the
+	// sheet says, the flourish stops above the tagline. Taken from where the tagline actually IS so
+	// that moving it in the asset moves this too.
+	float TaglineTop = 359.f;
+	if (const UCanvasPanelSlot* TaglineSlot = (TaglineText != nullptr)
+		? Cast<UCanvasPanelSlot>(LiveText(TaglineText)->Slot) : nullptr)
+	{
+		TaglineTop = static_cast<float>(TaglineSlot->GetPosition().Y);
+	}
+
+	const float MaxSwooshH = FMath::Max(1.f, TaglineTop - SwooshClearOfTagline - SwooshTop);
+	if (SwooshW * SwooshAspect > MaxSwooshH)
+	{
+		SwooshW = MaxSwooshH / FMath::Max(SwooshAspect, KINDA_SMALL_NUMBER);
+	}
+	const float SwooshH = SwooshW * SwooshAspect;
+
+	// Both slots are anchored top-centre and aligned (0.5, 0), so X is an offset from the centre line
+	// and the artist's leftward bias is a negative number rather than a re-anchor.
+	SetSlotRect(MarkSlot, FVector2D(0.0, MarkTopY), FVector2D(MarkW, MarkH));
+	SetSlotRect(SwooshSlot, FVector2D(-MarkW * SwooshLeftOfMark, SwooshTop), FVector2D(SwooshW, SwooshH));
+
+	if (!FMath::IsNearlyEqual(SwooshImage->GetRenderOpacity(), SwooshOpacity, 0.01f))
+	{
+		SwooshImage->SetRenderOpacity(SwooshOpacity);
+	}
+}
+
+void UTraceTitleMenuWidget::PlaceFooterBelowBlurb()
+{
+	using namespace TraceTitleMenuWidgetLocal;
+
+	// LiveText, not the text block itself: spec v22 §A1 moved every one of these onto the glyph
+	// atlas, and a swapped text block has no slot of its own any more. See TraceAtlasTextSwap::Live.
+	UCanvasPanelSlot* KeysSlot = (FooterKeysText != nullptr)
+		? Cast<UCanvasPanelSlot>(LiveText(FooterKeysText)->Slot) : nullptr;
+	UCanvasPanelSlot* HintSlot = (FooterHintText != nullptr)
+		? Cast<UCanvasPanelSlot>(LiveText(FooterHintText)->Slot) : nullptr;
+	if (KeysSlot == nullptr && HintSlot == nullptr)
+	{
+		return;
+	}
+
+	const FGeometry& RootGeometry = GetCachedGeometry();
+	const FVector2D RootSize = RootGeometry.GetLocalSize();
+	if (RootSize.Y <= 1.0)
+	{
+		return;
+	}
+
+	// WHERE THE BLURB ACTUALLY IS, measured off Slate rather than recomputed from the row count.
+	// The blurb is a grandchild of the root canvas (ConsolePanel -> vertical box -> here), so its
+	// bottom is converted through absolute space; it is the same number the pixels are drawn at.
+	float BlurbBottom = LocalEdgeY(RootGeometry, LiveText(BlurbText), 1.f);
+
+	if (BlurbBottom <= 0.f)
+	{
+		// First frame, before Slate has laid the console out. Derived from the SAME shared layout the
+		// Canvas renderer uses, so the two agree even on the frame nothing has been measured yet.
+		const TraceMenuStyle::FConsoleLayout Layout = TraceMenuStyle::ComputeConsoleLayout(
+			static_cast<float>(RootSize.X), static_cast<float>(RootSize.Y), 1.f,
+			FMath::Max(OrderedRows.Num(), 1));
+		BlurbBottom = Layout.FirstRowY
+			+ (FMath::Max(OrderedRows.Num(), 1) - 1) * TraceMenuStyle::RowSpacing
+			+ TraceMenuStyle::RowHeight
+			+ 22.f    // the blurb's own top padding in the asset
+			+ 19.f;   // one line of it at FS_BLURB
+	}
+
+	float KeysY = BlurbBottom + FooterGapBelowBlurb;
+
+	// THE PORT-BUSY LINE, when it is on at all, is part of this stack — and that placement is a
+	// concession, not a preference. It belongs under the address chip it contradicts, which is where
+	// the Canvas renderer puts it (ATraceMenuHUD::DrawAddressChip, at ChipY + ChipH + 4). It does not
+	// fit there on THIS renderer: the artist's chip wears a 9-sliced button plate whose glow reaches
+	// y 437, the first row's plate glow starts at y 442, and the line's ink is 11 px tall. Measured
+	// from a capture with UDP 7777 deliberately held, it overlapped the PLAY row at its authored y of
+	// 436 and overlapped the chip at every y that cleared the row. So it flows with the blurb
+	// instead, above the key hints, where there is room for it to be read.
+	if (PortWarningText != nullptr && PortWarningText->GetVisibility() != ESlateVisibility::Collapsed)
+	{
+		if (UCanvasPanelSlot* WarningSlot = Cast<UCanvasPanelSlot>(LiveText(PortWarningText)->Slot))
+		{
+			SetSlotRect(WarningSlot, FVector2D(0.0, KeysY), FVector2D(-1.0, -1.0));
+			KeysY += FMath::Max(1.f,
+				static_cast<float>(LiveText(PortWarningText)->GetCachedGeometry().GetLocalSize().Y))
+				+ FooterGapAfterWarning;
+		}
+	}
+
+	const float LastLineHeight = (HintSlot != nullptr && LiveText(FooterHintText)->GetCachedGeometry().GetLocalSize().Y > 1.0)
+		? static_cast<float>(LiveText(FooterHintText)->GetCachedGeometry().GetLocalSize().Y) : 17.f;
+
+	// The console can only grow downwards, so the last thing to check is that the screen still has
+	// room. If it ever does not, both lines slide up together rather than one of them walking off.
+	const float LowestKeysY = static_cast<float>(RootSize.Y) - FooterBottomMargin - LastLineHeight - FooterLineGap;
+	KeysY = FMath::Min(KeysY, LowestKeysY);
+
+	SetSlotRect(KeysSlot, FVector2D(0.0, KeysY), FVector2D(-1.0, -1.0));
+	SetSlotRect(HintSlot, FVector2D(0.0, KeysY + FooterLineGap), FVector2D(-1.0, -1.0));
 }
 
 int32 UTraceTitleMenuWidget::CountResolvedArt(int32& OutTotal, TArray<FString>& OutMissing, bool bIncludeBackdrop) const

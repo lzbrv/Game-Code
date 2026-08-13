@@ -26,6 +26,7 @@
 
 #include "Trace.h"                                    // LogTraceGame
 #include "UI/TraceMenuHUD.h"
+#include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
 #include "UI/Widgets/Menu/TraceTitleMenuWidget.h"
@@ -233,8 +234,13 @@ namespace TraceMenuUIVerifyFile
 	 *
 	 * It also states the substitution out loud every time it runs. The artist asked for their exact
 	 * font; the art arrived as a PNG, which can carry the four words drawn on it and cannot carry a
-	 * typeface, so every other label is Roboto Light standing in. That is not a detail to leave in a
-	 * commit message.
+	 * typeface, so every other label is a stand-in. That is not a detail to leave in a commit message.
+	 *
+	 * WHICH stand-in is deliberately NOT named here. It used to say "Roboto Light" and that went stale
+	 * the moment spec v20 §1 made Lato-Regular the interim face — a comment that names a value the code
+	 * next to it reads from somewhere else is a comment that will lie again. The line this prints comes
+	 * from TraceMenuArtStyle::DescribeMenuFont(), which reports whichever font actually resolved and
+	 * says so when it is on the fallback rather than the intended asset.
 	 */
 	static void VerifyMenuArt(const TArray<FString>& Args)
 	{
@@ -248,10 +254,18 @@ namespace TraceMenuUIVerifyFile
 		// The font answer does not need a title screen — say it whatever else is true.
 		UE_LOG(LogTraceGame, Display, TEXT("[MenuArt] Type is drawn in: %s"),
 			*TraceMenuArtStyle::DescribeMenuFont());
+		// SPEC v22 §A1 MADE THE OLD LINE HERE FALSE, so it is replaced rather than left to lie. It
+		// said "Sprite words (the artist's own letterforms): PLAY, SETTINGS ... every other label on
+		// this menu is engine-rendered in the stand-in font". That was true when it was written and
+		// stopped being true the moment the rows started typing from the glyph atlas — and a verifier
+		// that reports a retired design is exactly the stale evidence this project keeps getting burnt
+		// by. The four word sprites are still in the repo and still import; nothing draws them.
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[MenuArt] Sprite words (the artist's own letterforms): PLAY, SETTINGS. ")
-			TEXT("KEYBIND and KEY are imported and belong to the settings screen. ")
-			TEXT("Every other label on this menu is engine-rendered in the stand-in font."));
+			TEXT("[MenuArt] Word sprites: RETIRED for text (spec v22 §A1). T_MenuWord_Play, _Settings, ")
+			TEXT("_Keybind and _Key are still in the repo and still import, and nothing draws them — ")
+			TEXT("every label on the title screen and the settings page is now LIVE TEXT in one ")
+			TEXT("typeface. Which typeface that actually is on this run: %s"),
+			*TraceText::FaceName());
 
 		ATraceMenuHUD* MenuHUD = FindMenuHUD();
 		if (MenuHUD == nullptr)

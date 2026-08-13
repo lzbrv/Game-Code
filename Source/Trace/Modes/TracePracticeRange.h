@@ -150,6 +150,17 @@ public:
 	 */
 	AActor* FindRespawnPostFor(const AController* ForController) const;
 
+	/**
+	 * THE RANGE'S OWN SPAWN LINE (demo 19 item 1, "make it smaller"), or null before it is built.
+	 *
+	 * ATracePracticeGameMode::ChoosePlayerStart hands this back for a HUMAN, which is what stops a
+	 * death in the range depositing the player 15600 uu away in the endzone the shipped pipeline
+	 * quite correctly uses for a real match. The post's ROTATION matters as much as its location:
+	 * AGameModeBase spawns the pawn facing it, so it is what makes you open the range already looking
+	 * down the firing line.
+	 */
+	AActor* GetPlayerStartPost() const;
+
 	// ---------------------------------------------------------------------------------------------
 	// Introspection, for the console commands and the harnesses
 	// ---------------------------------------------------------------------------------------------
@@ -193,6 +204,29 @@ private:
 	/** Places one pad on the floor under @p DesiredPoint. Null on failure. */
 	ATracePracticePad* SpawnPad(ETracePracticePadRole InRole, const FVector& DesiredPoint, const FString& InLabel);
 
+	/**
+	 * Places the HUMAN's spawn line post on the floor under @p DesiredPoint (demo 19 item 1).
+	 *
+	 * Spawned facing +X, which is where the target row is, because AGameModeBase spawns a pawn on the
+	 * start spot's rotation as well as its location. Null on failure.
+	 */
+	ATracePracticePost* SpawnPlayerStartPost(const FVector& DesiredPoint);
+
+	/**
+	 * Moves a human who is already standing somewhere else onto the range's spawn line (demo 19
+	 * item 1). ONE-SHOT PER PLAYER — see the body for why a repeat would be wrong.
+	 *
+	 * Needed because the shipped endzone spawn has already happened by the time the 5 Hz poll
+	 * furnishes the range: ChoosePlayerStart fixes every LATER life, this fixes the first one.
+	 */
+	void GatherPlayersIntoRange();
+
+	/**
+	 * Planar distance from the local player to the nearest target, or -1 when there is no pawn.
+	 * This is the number demo 19 item 1 is a claim about, so LogStatus prints it.
+	 */
+	double GetPlayerDistanceToTargets() const;
+
 	/** Drops @p Point onto whatever is beneath it. False when there is nothing to stand on. */
 	bool TraceToFloor(const FVector& Point, FVector& OutFloorPoint) const;
 
@@ -229,10 +263,30 @@ private:
 	UPROPERTY(Transient)
 	TArray<TWeakObjectPtr<ATracePracticePad>> Pads;
 
+	/**
+	 * The human's spawn line (demo 19 item 1). Also lives in Posts, which is what destroys it.
+	 * Weak rather than owning for the same reason every other handle here is: the range's actors are
+	 * ordinary world actors and the world outlives none of them.
+	 */
+	TWeakObjectPtr<ATracePracticePost> PlayerStartPost;
+
+	/**
+	 * Players GatherPlayersIntoRange has already moved once. Weak keys so a player who leaves does
+	 * not keep a PlayerState alive; cleared with everything else by TearDownRange.
+	 */
+	TSet<TWeakObjectPtr<APlayerState>> GatheredPlayers;
+
 	FTimerHandle PollHandle;
 
 	/** True once BuildRange has run for the current activation. Cleared by TearDownRange. */
 	bool bBuilt = false;
+
+	/**
+	 * Which footprint the furniture currently standing in the world was built with, so PollRange can
+	 * notice Trace.Practice.OldSize flipping and rebuild. See CVarPracticeOldSize in the .cpp — it is
+	 * demo 19 item 1's red arm, and it is what lets the before and after shots share one binary.
+	 */
+	bool bBuiltOldSize = false;
 
 	/** The spec's toggle. Deliberately not config and not saved: a range opens with it OFF. */
 	bool bInfiniteAbilities = false;

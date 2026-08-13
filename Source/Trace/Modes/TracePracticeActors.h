@@ -21,6 +21,14 @@
 //                         shoots and fires abilities every tick, and "stationary enemy bots that
 //                         take damage" is the opposite of all five.
 //
+//                         *** AND DOING NOTHING WAS NOT ENOUGH. *** Demo 19 item 2, verbatim: "Don't
+//                         let the bots attack." UTraceWeaponComponent::TickBotKnife runs on the
+//                         server for every pawn that is not player-controlled and consults its
+//                         controller about nothing, so these targets armed themselves and swung at
+//                         whatever came within 153 uu — the only range you can knife one from. The
+//                         controller therefore disarms its pawn explicitly, on EVERY possession, in
+//                         OnPossess. See UTraceWeaponComponent::SetAutonomousAttacksAllowed.
+//
 // WHY THE DUMMIES ARE ON ETraceTeam::None AND NOT ON THE ENEMY TEAM. Four separate rules fall out of
 // it correctly, and every one of them would need special-casing otherwise:
 //   * they stay damageable — both the shot resolver (UTraceLagCompensationComponent, "skip when the

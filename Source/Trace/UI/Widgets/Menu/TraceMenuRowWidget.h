@@ -21,10 +21,15 @@
 // SPEC v19 §5 — THE ROW IS NOW THE ARTIST'S BUTTON
 // -------------------------------------------------------------------------------------------------
 // The plate used to be three coloured rectangles. It is now ONE sprite off the artist's sheet, swapped
-// between three brushes for the three states they drew: default (blue fill, white word), hover (amber
-// ring, gold word) and disabled (near-black fill, grey ring). Those are real states now, not decoration
-// — ATraceMenuHUD fills bSelected / bPressed / bEnabled from the actual mouse and the actual
-// activation gate, and the row draws whichever one is true.
+// between three brushes for the three states they drew: default (blue fill), hover (amber ring) and
+// disabled (near-black fill, grey ring). Those are real states now, not decoration — ATraceMenuHUD
+// fills bSelected / bPressed / bEnabled from the actual mouse and the actual activation gate, and the
+// row draws whichever one is true.
+//
+// THE WORD ON THE HOVER STATE IS NOT THE SHEET'S. The artist's hover word is a muted gold that
+// measured 1.9:1 against the plate it sits on, which made the SELECTED row the hardest row on the
+// screen to read — see the argument at the top of TraceMenuRowWidget.cpp (spec v20 §0.5). The plate,
+// the amber ring and the chevron are still theirs; the word is white.
 //
 // PRESSED IS THE ONE STATE THE SHEET DOES NOT CONTAIN. There are three plates on it and a press is
 // not one of them, so pressed is the HOVER plate at 72% brightness. That is a stand-in and it is
@@ -41,6 +46,8 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "Styling/SlateBrush.h"
+
+#include "UI/Text/TraceAtlasTextSwap.h"
 
 #include "TraceMenuRowWidget.generated.h"
 
@@ -165,7 +172,16 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UImage> WordSprite;
 
-	/** Sits OUTSIDE the row's left edge, which is why the row must not clip its children. */
+	/**
+	 * The selection mark. Sits OUTSIDE the row's left edge, which is why the row must not clip its
+	 * children.
+	 *
+	 * STILL CALLED ChevronSprite because the NAME IS A CONTRACT: it is a BindWidget, so it has to
+	 * match the widget in WBP_MenuRow exactly, and that asset is authored by
+	 * Scripts/generate-menu-widgets.py. Renaming it here without renaming it there fails the
+	 * Blueprint compile. What it draws is no longer a sprite — see spec v22 §A4 at the top of
+	 * TraceMenuRowWidget.cpp.
+	 */
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UImage> ChevronSprite;
 
@@ -188,4 +204,35 @@ protected:
 
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTextBlock> RightArrowText;
+
+private:
+	/**
+	 * Whether the leading-edge selection rail has replaced the crescent WBP_MenuRow still ships in
+	 * ChevronSprite's slot. Latched so the swap costs one brush assignment per row for the life of
+	 * the menu instead of one per frame. Not serialised — the asset is authored with the artist's
+	 * brush and every run re-applies the rail over it.
+	 */
+	bool bSelectionMarkApplied = false;
+
+	// ---- SPEC v22 §A1: THE ROW IS ONE TYPEFACE ------------------------------------------------------
+	//
+	// "Retire the split ... set those labels as live text like every other label so the whole screen
+	// is one typeface." Every string on this row — the word, the address readout, the value and its
+	// two arrows — is drawn from the Sofachrome atlas by a UTraceAtlasText that has taken the
+	// authored UTextBlock's place in its panel. The text blocks above are still the model and are
+	// still what ApplyView writes to; see UI/Text/TraceAtlasTextSwap.h for why it is done that way
+	// round.
+	//
+	// WordSprite is collapsed for good once this lands. The sprite stays in the repo and stays in the
+	// asset, exactly as A1 asks — it is simply no longer how this row spells PLAY, because the row
+	// can now spell anything in the same letterforms.
+
+	/** Installed once, on the first ApplyView, when the widget tree is certain to exist. */
+	bool bAtlasLabelsInstalled = false;
+
+	UPROPERTY(Transient)
+	TArray<FTraceAtlasLabel> AtlasLabels;
+
+	/** Install the five swaps. Idempotent; a failure leaves the authored text blocks drawing. */
+	void InstallAtlasLabels();
 };

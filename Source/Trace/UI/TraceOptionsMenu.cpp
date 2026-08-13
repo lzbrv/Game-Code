@@ -7,14 +7,18 @@
 #include "DynamicRHI.h"                  // RHIGetGPUFrameCycles
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
+#include "Engine/Texture2D.h"            // the artist's sprites - see the art block below
 #include "GameFramework/HUD.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/PlatformTime.h"
+#include "Misc/CommandLine.h"            // -TraceMenuActivate, the paused-world capture hook
+#include "Misc/Parse.h"
 #include "Scalability.h"
 #include "Settings/TraceGameUserSettings.h"
 #include "Trace.h"                       // LogTraceGame
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
+#include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
 
 // =================================================================================================
 // WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
@@ -48,6 +52,79 @@
 // would exist purely to hold six colours.
 // =================================================================================================
 
+// =================================================================================================
+// SPEC v22 §A1 — THIS PAGE IS ONE TYPEFACE, AND IT IS THE ARTIST'S
+// =================================================================================================
+//
+// The settings page had exactly the defect the spec calls the headline, one screen further in than
+// anybody looked. Its CONTROLS header drew the artist's baked KEYBIND and KEY word sprites, and
+// every other string on the page — SETTINGS, DISPLAY, MOUSE, MOVE FORWARD, the key names, the
+// numbers — came out of AHUD::DrawText in the engine's stand-in font, in the same column, four
+// pixels apart. Photographed at 1920x1080 in v22integ_03_settings_open.png before this change.
+//
+// Now every one of them goes through UI/Text: TraceCanvasText blits one atlas quad per glyph, and
+// the word sprites are retired the same way the title row's PLAY and SETTINGS were.
+//
+// ---- THE ONE THING THAT IS NOT OBVIOUS: THE UNITS ------------------------------------------------
+//
+// This page's whole layout is expressed as (UFont*, Scale) pairs, where Scale is a MULTIPLIER on a
+// bitmap font's natural size — `FontMedium, 1.5f * UIScale`. TraceText wants a point size in
+// pixels. Converting with a constant would have been a guess, so SizeFor() measures instead: it
+// asks the engine what line height that font at that scale actually produces, and returns the point
+// size whose line height matches. TraceText::LineHeight is linear in size, so that inverse is exact.
+//
+// The consequence is the one that matters for a page this dense: every row keeps the height it had.
+// MeasureHeight() below returns the same number it returned before this change, so the vertical
+// rhythm of nineteen rows, their plates and their hit rects are all untouched. Only the letterforms
+// and the WIDTHS move — and the widths are measured, not assumed, by the same call that draws.
+//
+// The fallback needs no branch here. With no atlas, TraceCanvasText types Lato at the same size and
+// TraceText measures Lato, so this page degrades to "the wrong face, laid out correctly".
+// =================================================================================================
+
+namespace TraceOptionsMenuType
+{
+	/** The point size whose line height equals what @p Font at @p Scale draws. See the block above. */
+	static float SizeFor(AHUD* HUD, UFont* Font, float Scale)
+	{
+		float MeasuredW = 0.f;
+		float MeasuredH = 0.f;
+		if (HUD != nullptr)
+		{
+			HUD->GetTextSize(TEXT("Ag"), MeasuredW, MeasuredH, Font, Scale);
+		}
+
+		const float UnitLine = TraceText::LineHeight(1.f);
+		if (MeasuredH > 1.f && UnitLine > KINDA_SMALL_NUMBER)
+		{
+			return MeasuredH / UnitLine;
+		}
+
+		// Only reachable with no HUD or a font the engine could not measure. 16 px is the engine's own
+		// medium font line box, so the page comes out readable rather than microscopic.
+		return FMath::Max(1.f, 16.f * Scale);
+	}
+
+	static float Width(AHUD* HUD, const FString& Text, UFont* Font, float Scale)
+	{
+		return TraceText::MeasureWidth(Text, SizeFor(HUD, Font, Scale));
+	}
+
+	/** The LINE BOX, which is what every caller on this page uses it for. */
+	static float Height(AHUD* HUD, UFont* Font, float Scale)
+	{
+		return TraceText::LineHeight(SizeFor(HUD, Font, Scale));
+	}
+
+	static void Draw(AHUD* HUD, const FString& Text, const FLinearColor& Color,
+		float X, float Y, UFont* Font, float Scale, TraceText::EHAlign HAlign = TraceText::EHAlign::Left)
+	{
+		TraceText::FStyle Style(SizeFor(HUD, Font, Scale), Color);
+		Style.HAlign = HAlign;
+		TraceCanvasText::Draw(HUD, Text, X, Y, Style);
+	}
+}
+
 namespace TraceOptionsStyle
 {
 	static const FLinearColor Cyan     (0.16f, 0.88f, 1.00f, 1.00f);
@@ -60,6 +137,307 @@ namespace TraceOptionsStyle
 	static FLinearColor WithAlpha(const FLinearColor& C, float A)
 	{
 		return FLinearColor(C.R, C.G, C.B, A);
+	}
+}
+
+// =================================================================================================
+// THE ARTIST'S ART, ON THIS SCREEN — spec v20 §0.6
+//
+// The artist's menu sheet was sliced into /Game/Trace/UI/Art and hung on a UMG title screen. This
+// overlay could not reach any of it: it is a plain C++ class that paints through AHUD::DrawRect /
+// DrawText / DrawLine from inside DrawHUD, and there is no Slate here to hang a Box brush on. So
+// the same textures are drawn through AHUD::DrawTexture, which is the Canvas equivalent — same
+// assets, same package, no new plumbing, and identical on both hosts.
+//
+// AND IT HAS TO BE BOTH HOSTS. This class draws the title screen's SETTINGS page and the in-match
+// pause menu (Escape during a match) from one Draw(); the user asked for the art in-game, not only
+// on the way in. Everything below is therefore in the shared path, and the pause root — RESUME /
+// SETTINGS / VIDEO / RETURN TO TITLE / QUIT — is five Action rows that pick up the artist's button
+// plates without a single line of host-specific code.
+//
+// THREE THINGS MAKE THIS SAFE TO PUT IN FRONT OF A PAUSED MATCH:
+//
+//  1. EVERY CALL SITE HAS A FALLBACK. Sprite() returns null if a texture is missing, if the package
+//     failed to cook, or if the layer is switched off, and every caller then draws the exact
+//     rectangle it drew before this change. A missing asset cannot produce a white box or an empty
+//     row; it produces last week's screen. Grep this file for DrawTexture: not one of them stands
+//     without an else.
+//
+//  2. NO GEOMETRY MOVES. Every sprite is fitted to a rectangle that was already being computed —
+//     the row rect, the slider track, the key chip. FRow::Rect and FRow::Track are written from the
+//     same expressions as before, so hit testing, slider dragging, Trace.Menu.Nudge, DebugGetRowRect
+//     and the -TraceMenuClickTest harness all measure exactly what they measured before. Art shrinks
+//     to fit a row; a row never grows to fit art.
+//
+//  3. THE TEXTURES ARE ROOTED ON FIRST USE. This class is deliberately not a UObject and holds no
+//     UObject reference that outlives a frame (see the header). In a match nothing else in the world
+//     references these textures, so a cached raw pointer would be collected out from under the pause
+//     menu and a bare weak pointer would re-stream the art off disk mid-match. AddToRoot costs about
+//     a megabyte for ten small UI textures and makes both failures impossible — and it is done here,
+//     at file scope, rather than in a member, so the header's invariant still holds.
+//
+// CANVAS HAS NO 9-SLICE. FCanvasTileItem stretches the whole bitmap, so the 160x91 chip drawn 120x17
+// would come out with its corner squashed 7:1 — which reads as sloppy art rather than as a missing
+// engine feature. Everything with a corner is therefore drawn as a THREE-slice in X: left cap,
+// stretched middle, right cap, with the cap's on-screen width derived from the sprite's HEIGHT
+// scale, which is what keeps the corner circular at every row width. Three and not nine because the
+// vertical scale is the reference — nothing here is ever stretched past its natural aspect in Y.
+// =================================================================================================
+
+namespace TraceOptionsMenuArt
+{
+	/**
+	 * Off switch for the whole layer, so ONE binary produces both arms of a before/after.
+	 *
+	 * Spec v20 §4: a harness that cannot fail is not evidence. `Trace.Menu.Art 0` puts every fallback
+	 * path on screen in the same session, which is both the red arm for these captures and the
+	 * fastest way to confirm the fallbacks are still there.
+	 */
+	static int32 GEnabled = 1;
+
+#if !UE_BUILD_SHIPPING
+	// A CVar, not a console command: this file already fatals at module load if the two share a name
+	// (see the Trace.Menu.Video block), and Trace.Menu.Art collides with neither command next door.
+	static FAutoConsoleVariableRef CVarMenuArt(
+		TEXT("Trace.Menu.Art"),
+		GEnabled,
+		TEXT("1 (default): the settings / pause overlay draws the artist's sprites. 0: the plain ")
+		TEXT("rectangles it drew before spec v20. Both arms come out of one build, which is what makes ")
+		TEXT("a before/after capture evidence rather than decoration."),
+		ECVF_Default);
+#endif
+
+	enum class ESprite : uint8
+	{
+		PlateDefault = 0,
+		PlateHover,
+		PlateDisabled,
+		SliderTrack,
+		SliderHandle,
+		ValueBox,
+		WordKeybind,
+		WordKey,
+		Cursor,
+		Chevron,
+		Count
+	};
+
+	static const TCHAR* const SpritePaths[int32(ESprite::Count)] =
+	{
+		TEXT("/Game/Trace/UI/Art/T_MenuBtn_Default.T_MenuBtn_Default"),
+		TEXT("/Game/Trace/UI/Art/T_MenuBtn_Hover.T_MenuBtn_Hover"),
+		TEXT("/Game/Trace/UI/Art/T_MenuBtn_Disabled.T_MenuBtn_Disabled"),
+		TEXT("/Game/Trace/UI/Art/T_MenuSliderTrack.T_MenuSliderTrack"),
+		TEXT("/Game/Trace/UI/Art/T_MenuSliderHandle.T_MenuSliderHandle"),
+		TEXT("/Game/Trace/UI/Art/T_MenuValueBox.T_MenuValueBox"),
+		TEXT("/Game/Trace/UI/Art/T_MenuWord_Keybind.T_MenuWord_Keybind"),
+		TEXT("/Game/Trace/UI/Art/T_MenuWord_Key.T_MenuWord_Key"),
+		TEXT("/Game/Trace/UI/Art/T_MenuCursor.T_MenuCursor"),
+		TEXT("/Game/Trace/UI/Art/T_MenuBack.T_MenuBack"),
+	};
+
+	static TWeakObjectPtr<UTexture2D> GCache[int32(ESprite::Count)];
+
+	/** Set only on a genuine load failure, so a collected texture is re-fetched but a missing one is not re-hunted every frame. */
+	static bool GFailed[int32(ESprite::Count)] = {};
+
+	/** The texture, or null — which every caller treats as "draw the rectangle you drew before". */
+	static UTexture2D* Sprite(ESprite Which)
+	{
+		if (GEnabled == 0)
+		{
+			return nullptr;
+		}
+
+		const int32 Index = int32(Which);
+		if (UTexture2D* Cached = GCache[Index].Get())
+		{
+			return Cached;
+		}
+		if (GFailed[Index])
+		{
+			return nullptr;
+		}
+
+		UTexture2D* Loaded = LoadObject<UTexture2D>(nullptr, SpritePaths[Index]);
+		if (Loaded == nullptr)
+		{
+			// Once. A warning per frame per sprite in front of a paused match is its own defect.
+			GFailed[Index] = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Options] Menu art '%s' did not load; that control keeps its plain rectangle."),
+				SpritePaths[Index]);
+			return nullptr;
+		}
+
+		// See point 3 in the block above: nothing else in a match holds these.
+		Loaded->AddToRoot();
+		GCache[Index] = Loaded;
+		return Loaded;
+	}
+
+	/** Plain stretch. For alpha masks and for anything whose corners are not being distorted. */
+	static void Draw(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H, const FLinearColor& Tint)
+	{
+		HUD->DrawTexture(Tex, X, Y, W, H, 0.f, 0.f, 1.f, 1.f, Tint, BLEND_Translucent);
+	}
+
+	/**
+	 * Three-slice in X: the two caps keep their shape, only the middle stretches.
+	 *
+	 * @param CapU   the cap as a fraction of the sprite's WIDTH (a texture coordinate)
+	 * @param CapPx  the cap's width on screen, derived from the sprite's height scale by the caller
+	 */
+	static void Draw3H(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H,
+		float CapU, float CapPx, const FLinearColor& Tint)
+	{
+		// A row narrower than two caps is not a layout this screen produces, but clamping is one line
+		// and the alternative is the two caps drawing over each other back to front.
+		const float Cap = FMath::Min(CapPx, W * 0.5f);
+		const float MidW = W - Cap * 2.f;
+
+		HUD->DrawTexture(Tex, X, Y, Cap, H, 0.f, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
+		if (MidW > 0.f)
+		{
+			HUD->DrawTexture(Tex, X + Cap, Y, MidW, H, CapU, 0.f, 1.f - CapU * 2.f, 1.f, Tint, BLEND_Translucent);
+		}
+		HUD->DrawTexture(Tex, X + W - Cap, Y, Cap, H, 1.f - CapU, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
+	}
+
+	/**
+	 * A sprite that was cut as a PLATE plus a margin of glow, in the sheet's own pixels.
+	 *
+	 * Mirrored from TraceMenuArtStyle::FSpriteFrame rather than included: that header describes Slate
+	 * Box brushes, which do not exist on this side of the fence, and the numbers below are the sheet's
+	 * and not the engine's. If the slicer's crop boxes change, both copies change.
+	 */
+	struct FPlateFrame
+	{
+		float PlateW;
+		float PlateH;
+		/** Sheet pixels of glow kept OUTSIDE the plate on every side. */
+		float Glow;
+		/** Sheet pixels from the sprite's edge to where the corner curve is fully open. */
+		float Cap;
+
+		float SpriteW() const { return PlateW + Glow * 2.f; }
+	};
+
+	/** The wide button: plate 4723x1230 inside a 4979x1486 crop, corner open by 428. */
+	static const FPlateFrame ButtonFrame = { 4723.f, 1230.f, 128.f, 428.f };
+
+	/** The chip beside a slider: ring 1034x538 inside a 1154x656 crop, corner open by 150. */
+	static const FPlateFrame ValueFrame  = { 1034.f,  538.f,  60.f, 150.f };
+
+	/**
+	 * Draws @p Tex so that its PLATE lands exactly on (X, Y, W, H), with the glow overhanging outside.
+	 *
+	 * Forget the overhang and the plate comes out a fifth small inside its own row — which is the
+	 * mistake the UMG row widget documents having made once already.
+	 */
+	static void DrawPlate(AHUD* HUD, UTexture2D* Tex, const FPlateFrame& Frame,
+		float X, float Y, float W, float H, const FLinearColor& Tint)
+	{
+		// Height is the reference scale: the glow and the corner are square in the sheet, so scaling
+		// both by H/PlateH is what keeps the corner circular however wide the row is.
+		const float Scale = H / Frame.PlateH;
+		const float GlowPx = Frame.Glow * Scale;
+		const float CapPx = Frame.Cap * Scale;
+		const float CapU = Frame.Cap / Frame.SpriteW();
+
+		Draw3H(HUD, Tex, X - GlowPx, Y - GlowPx, W + GlowPx * 2.f, H + GlowPx * 2.f, CapU, CapPx, Tint);
+	}
+
+	// Sprite aspects, measured off the PNGs rather than guessed, so nothing here is stretched.
+	static constexpr float CursorAspect  = 64.f / 87.f;
+	static constexpr float HandleAspect  = 64.f / 87.f;
+	static constexpr float ChevronAspect = 96.f / 125.f;
+	static constexpr float KeybindAspect = 256.f / 42.f;
+	static constexpr float KeyAspect     = 128.f / 47.f;
+
+	/**
+	 * The tip of T_MenuCursor, as a fraction of the sprite, measured from its alpha: the arrow's point
+	 * is at about (11.5, 6.5) of 64x87.
+	 *
+	 * It matters because PollMouse hit-tests at CursorPos. A centre-anchored arrow would draw its
+	 * point about eleven pixels away from the pixel it is about to click, and every click in every
+	 * screenshot would look like it landed on the wrong row.
+	 */
+	static constexpr float CursorTipU = 0.180f;
+	static constexpr float CursorTipV = 0.075f;
+
+	/** The slider sprite is a trough: its solid rail occupies rows 6..17 of its 23. */
+	static constexpr float TrackRailTopV = 6.f / 23.f;
+	static constexpr float TrackRailV    = 11.f / 23.f;
+
+	/**
+	 * Draws T_MenuSliderTrack as a trough, AVOIDING THE HANDLE THAT IS BAKED INTO IT.
+	 *
+	 * MEASURED, because it cost a capture to find: the slicer's crop kept the artist's own handle
+	 * blade inside the track sprite. Columns 37..78 of its 512 — 7.2% to 15.2% along — are a bright
+	 * white diagonal, and a plain stretch therefore paints a SECOND, immovable handle at a fixed
+	 * tenth of every slider, next to the real one. The first capture of this work had two blades on
+	 * every row and it read as a rendering bug.
+	 *
+	 * So the middle is sampled from a clean band in the sprite's uniform centre rather than from the
+	 * span between the caps. The caps themselves (16 px at each end, the artist's soft lip) are clear
+	 * of the blade and are drawn as they were cut.
+	 *
+	 * The real fix is a re-cut in Scripts/slice-ui-assets.py, which is not this agent's file — this
+	 * is a faithful presentation of the sprite as shipped, not a workaround hiding a bad asset.
+	 */
+	static void DrawTrough(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H, const FLinearColor& Tint)
+	{
+		constexpr float CapU = 16.f / 512.f;   // the lip, and it is clean
+		constexpr float MidU = 0.30f;          // a band of the uniform centre, well past the blade
+		constexpr float MidUW = 0.40f;
+
+		const float Cap = FMath::Min(H * (16.f / 23.f), W * 0.5f);
+		const float MidW = W - Cap * 2.f;
+
+		HUD->DrawTexture(Tex, X, Y, Cap, H, 0.f, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
+		if (MidW > 0.f)
+		{
+			HUD->DrawTexture(Tex, X + Cap, Y, MidW, H, MidU, 0.f, MidUW, 1.f, Tint, BLEND_Translucent);
+		}
+		HUD->DrawTexture(Tex, X + W - Cap, Y, Cap, H, 1.f - CapU, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
+	}
+
+	/**
+	 * Resolves every sprite once and says out loud what landed.
+	 *
+	 * `Trace.UI.VerifyMenuArt` only ever asked the UMG title screen's brushes whether they had a
+	 * texture; it has no opinion about this screen at all, and its own message still says these
+	 * sprites "belong to the settings screen, which is still Canvas". So this is the only thing that
+	 * can tell a reader of a log whether the pause menu in front of them is wearing the art or its
+	 * fallbacks — and it prints the count both ways round, which is what makes a red arm readable.
+	 */
+	static void LogOnce()
+	{
+		static bool bLogged = false;
+		if (bLogged)
+		{
+			return;
+		}
+		bLogged = true;
+
+		int32 Resolved = 0;
+		for (int32 Index = 0; Index < int32(ESprite::Count); ++Index)
+		{
+			if (Sprite(ESprite(Index)) != nullptr)
+			{
+				++Resolved;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Options] Menu art: %d of %d sprites resolved (Trace.Menu.Art = %d). %s"),
+			Resolved, int32(ESprite::Count), GEnabled,
+			(GEnabled == 0)
+				? TEXT("Art is OFF: every control is drawing the plain rectangle it drew before spec v20.")
+				: ((Resolved == int32(ESprite::Count))
+					? TEXT("Plates, slider, chips, KEYBIND/KEY and the cursor are the artist's, on both hosts.")
+					: TEXT("Some controls are drawing their fallback rectangles; see the warnings above.")));
 	}
 }
 
@@ -151,6 +529,24 @@ namespace
 			else
 			{
 				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Video: no HUD is drawing an overlay yet."));
+			}
+		}));
+
+	FAutoConsoleCommand CmdMenuSettings(
+		TEXT("Trace.Menu.Settings"),
+		TEXT("Opens the SETTINGS page on whichever HUD is up. Works on the title screen and in a match. ")
+		TEXT("Twin of Trace.Menu.Video, and it exists for the same reason: until spec v20 there was no ")
+		TEXT("headless way to photograph the page that has the most art on it, so nobody could show a ")
+		TEXT("before and an after of it. -TraceExec=\"Trace.Menu.Settings\"."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->OpenSettings();
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Settings: no HUD is drawing an overlay yet."));
 			}
 		}));
 
@@ -249,6 +645,11 @@ void FTraceOptionsMenu::OpenRoot()
 	// IgnoreInputBeforeFrame in the header.
 	IgnoreInputBeforeFrame = GFrameCounter + 1;
 
+#if !UE_BUILD_SHIPPING
+	// See TickAutoActivate: the capture hook is armed per opening, not per process.
+	DrawsSinceOpen = 0;
+	bAutoActivateDone = false;
+#endif
 	RebuildRows();
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Pause menu opened."));
 }
@@ -260,6 +661,11 @@ void FTraceOptionsMenu::OpenSettings()
 	bCapturingKey = false;
 	IgnoreInputBeforeFrame = GFrameCounter + 1;
 
+#if !UE_BUILD_SHIPPING
+	// See TickAutoActivate: the capture hook is armed per opening, not per process.
+	DrawsSinceOpen = 0;
+	bAutoActivateDone = false;
+#endif
 	RebuildRows();
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Settings opened."));
 }
@@ -274,6 +680,11 @@ void FTraceOptionsMenu::OpenVideo()
 	VideoReturnPage = EPage::Closed;
 	IgnoreInputBeforeFrame = GFrameCounter + 1;
 
+#if !UE_BUILD_SHIPPING
+	// See TickAutoActivate: the capture hook is armed per opening, not per process.
+	DrawsSinceOpen = 0;
+	bAutoActivateDone = false;
+#endif
 	RebuildRows();
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Video settings opened."));
 }
@@ -591,8 +1002,67 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 		RefreshRowStates();
 	}
 
+#if !UE_BUILD_SHIPPING
+	// After input and before the draw, so the page a capture photographs is the page this frame
+	// actually drew. Counted in DRAWN FRAMES - see the header for why seconds cannot work here.
+	++DrawsSinceOpen;
+	TickAutoActivate();
+
+	// It presses a real row, and a real row can be BACK or QUIT. Same guard, same reason, as the one
+	// after PollInput above: drawing a closed overlay leaves a frame of dimmed screen over a game
+	// that has already resumed.
+	if (Page == EPage::Closed)
+	{
+		return;
+	}
+#endif
+
 	Draw(HUD);
 }
+
+#if !UE_BUILD_SHIPPING
+void FTraceOptionsMenu::TickAutoActivate()
+{
+	// Parsed once per process. FParse over the whole command line every frame in front of a paused
+	// match would be its own small crime.
+	static bool bParsed = false;
+	static FString WantedRow;
+	if (!bParsed)
+	{
+		bParsed = true;
+		FParse::Value(FCommandLine::Get(), TEXT("TraceMenuActivate="), WantedRow);
+	}
+
+	// Twelve drawn frames: long enough that the opening frame's IgnoreInputBeforeFrame guard and the
+	// first layout have both passed, and comfortably inside ATraceHUD's own auto-pause capture, which
+	// fires twenty draws after the menu appears. Order matters - the page has to change BEFORE the
+	// screenshot, or the capture is of the root again.
+	if (WantedRow.IsEmpty() || bAutoActivateDone || DrawsSinceOpen < 12)
+	{
+		return;
+	}
+	bAutoActivateDone = true;
+
+	for (int32 Index = 0; Index < Rows.Num(); ++Index)
+	{
+		if (Rows[Index].IsSelectable() && Rows[Index].Label.Equals(WantedRow, ESearchCase::IgnoreCase))
+		{
+			Selected = Index;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Options] -TraceMenuActivate: pressing row %d ('%s')."), Index, *Rows[Index].Label);
+
+			// Through the real activation, not around it. A harness that set Page directly would
+			// photograph a page no key press can reach.
+			ActivateSelected();
+			return;
+		}
+	}
+
+	UE_LOG(LogTraceGame, Warning,
+		TEXT("[Options] -TraceMenuActivate=%s: no selectable row on this page carries that label."),
+		*WantedRow);
+}
+#endif
 
 // =================================================================================================
 // Input
@@ -1696,6 +2166,11 @@ void FTraceOptionsMenu::DrawPerfReadout(AHUD* HUD, float RightX, float Y)
 
 void FTraceOptionsMenu::Draw(AHUD* HUD)
 {
+	// Once per process, and on the first frame the panel is up rather than at module load: it forces
+	// the ten UI textures resident before the player can move a selection, and it puts a line in the
+	// log that says whether this screen is wearing the art or its fallbacks.
+	TraceOptionsMenuArt::LogOnce();
+
 	// Dim whatever is behind us. In a match that is the arena; on the title screen it is the grid.
 	// Either way the panel has to be the only thing the eye can land on, and the arena in particular
 	// is a field of bright emissive strips that a translucent panel loses to.
@@ -1818,14 +2293,60 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	// ---- Header --------------------------------------------------------------------------------
 	if (Row.Kind == ERowKind::Header)
 	{
-		if (!Row.Label.IsEmpty())
+		if (Row.Label.IsEmpty())
 		{
-			HUD->DrawText(Row.Label, TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.75f),
+			return;
+		}
+
+		const float Gap = 10.f * UIScale;
+		float RuleLeft = 0.f;
+		float RuleRight = X + W;
+		bool bWordsDrawn = false;
+
+		// THE CONTROLS HEADER IS WHERE THE ARTIST'S LETTERING BELONGS. KEYBIND and KEY were cut off
+		// the sheet as a left/right pair on one row — a wide label plate beside a narrow key chip —
+		// which is exactly the two columns every Binding row underneath this one is laid out in. They
+		// are drawn INSTEAD of the word "CONTROLS", not beside it: at a 24px row there is no room for
+		// three labels, and "KEYBIND ......... KEY" is what those columns actually are.
+		//
+		// FRow::Label is untouched. DebugGetRowRect and the click harness match on it, and nothing
+		// about this is allowed to be a contract change.
+		// SPEC v22 §A1 RETIRED THE SPRITES HERE TOO. This branch used to blit the artist's baked
+		// T_MenuWord_Keybind and T_MenuWord_Key, which is why the shipped settings page had TWO faces
+		// on it: those two words in the artist's squared lettering and the nineteen rows under them in
+		// the engine's stand-in font, four pixels apart. The page can type in the artist's face now,
+		// so the header is typed like everything else and the two-column KEYBIND / KEY layout — which
+		// is the part that was actually worth keeping — survives unchanged.
+		//
+		// The sprites stay in the repo and stay loadable, exactly as A1 asks. Nothing draws them.
+		if (Row.Label.Equals(TEXT("CONTROLS"), ESearchCase::IgnoreCase))
+		{
+			const FLinearColor WordTint = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.80f);
+			const float ValueRightHdr = X + W - PadX;
+
+			TraceOptionsMenuType::Draw(HUD, TEXT("KEYBIND"), WordTint, X, TextY, FontSmall, 1.0f * UIScale);
+			TraceOptionsMenuType::Draw(HUD, TEXT("KEY"), WordTint, ValueRightHdr, TextY, FontSmall,
+				1.0f * UIScale, TraceText::EHAlign::Right);
+
+			// The rule has to stop short at BOTH ends, or it strikes straight through KEY.
+			RuleLeft = X + MeasureWidth(HUD, TEXT("KEYBIND"), FontSmall, 1.0f * UIScale) + Gap;
+			RuleRight = ValueRightHdr - MeasureWidth(HUD, TEXT("KEY"), FontSmall, 1.0f * UIScale) - Gap;
+			bWordsDrawn = true;
+		}
+
+		if (!bWordsDrawn)
+		{
+			TraceOptionsMenuType::Draw(HUD, Row.Label,
+				TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.75f),
 				X, TextY, FontSmall, 1.0f * UIScale);
 
-			const float LabelW = MeasureWidth(HUD, Row.Label, FontSmall, 1.0f * UIScale);
+			RuleLeft = X + MeasureWidth(HUD, Row.Label, FontSmall, 1.0f * UIScale) + Gap;
+		}
+
+		if (RuleRight > RuleLeft)
+		{
 			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.20f),
-				X + LabelW + (10.f * UIScale), Y + H * 0.5f, W - LabelW - (10.f * UIScale), FMath::Max(1.f, 1.f * UIScale));
+				RuleLeft, Y + H * 0.5f, RuleRight - RuleLeft, FMath::Max(1.f, 1.f * UIScale));
 		}
 		return;
 	}
@@ -1837,19 +2358,73 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	// the eye needs to be told which one is worth more than the other eighteen.
 	if (Row.Kind == ERowKind::Note)
 	{
-		HUD->DrawText(Row.Label, TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.78f),
+		TraceOptionsMenuType::Draw(HUD, Row.Label,
+			TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.78f),
 			X + PadX, TextY, FontSmall, 1.0f * UIScale);
 		return;
 	}
 
 	// ---- Plate ---------------------------------------------------------------------------------
-	HUD->DrawRect(FLinearColor(0.f, 0.02f, 0.04f, bSelected ? 0.85f : 0.45f), X, Y, W, H);
+	//
+	// The artist's own button plate, one sprite per state, landed exactly on the row rect the mouse
+	// already hit-tests. This is what makes a row here the same object as a row on the title screen —
+	// and because the pause root is nothing but Action rows, it is also what puts the art in front of
+	// a player who pressed Escape mid-match.
+	//
+	// The three states are the sheet's three states and they differ in the PLATE, not in the word:
+	// default is a bare navy plate, hover adds the amber ring, disabled is near-black with a grey one.
+	// So the selected row is marked by its ring and by a BRIGHTER label, never by a dimmer one — spec
+	// v20 §0.5 is what happens when a decorative hover tint gets promoted to a selection indicator.
+	bool bPlateDrawn = false;
+	{
+		const TraceOptionsMenuArt::ESprite Which = !Row.bEnabled
+			? TraceOptionsMenuArt::ESprite::PlateDisabled
+			: (bSelected ? TraceOptionsMenuArt::ESprite::PlateHover : TraceOptionsMenuArt::ESprite::PlateDefault);
+
+		if (UTexture2D* Plate = TraceOptionsMenuArt::Sprite(Which))
+		{
+			// Unselected rows are knocked back rather than the selected row being knocked forward: a
+			// page of thirty plates all at full strength is a wall, and the eye needs the selected one
+			// to be the brightest thing in the list.
+			const FLinearColor Tint = !Row.bEnabled
+				? FLinearColor(0.80f, 0.80f, 0.80f, 0.75f)
+				: (bSelected ? FLinearColor::White : FLinearColor(0.78f, 0.78f, 0.78f, 0.90f));
+
+			TraceOptionsMenuArt::DrawPlate(HUD, Plate, TraceOptionsMenuArt::ButtonFrame, X, Y, W, H, Tint);
+			bPlateDrawn = true;
+		}
+	}
+	if (!bPlateDrawn)
+	{
+		HUD->DrawRect(FLinearColor(0.f, 0.02f, 0.04f, bSelected ? 0.85f : 0.45f), X, Y, W, H);
+	}
 
 	if (bSelected)
 	{
 		const float Pulse = 0.72f + 0.28f * FMath::Sin(Now * 4.5f);
+
+		// A wash, never a dim: this only ever ADDS light to the selected plate. The pulse rides on the
+		// wash and on the marker, not on the plate itself, so a before/after capture of the selected
+		// row cannot be moved by more than a few percent by the phase it was caught at.
 		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.10f * Pulse), X, Y, W, H);
-		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Pulse), X, Y, 4.f * UIScale, H);
+
+		// A SOLID RAIL ON THE LEADING EDGE — the same mark, in the same place, as the UMG title row
+		// (spec v22 §A4, UI/Widgets/Menu/TraceMenuRowWidget.cpp), and for the same reason.
+		//
+		// This slot drew the artist's T_MenuBack crescent until this pass. A4 replaced it on the title
+		// screen because a tapered stroke at ~20 px stops reading as a pointer and starts reading as a
+		// stray ")" — and then left this page still drawing it, so pressing SETTINGS swapped the mark
+		// for the thing A4 had just removed. Photographed at 1920x1080 beside VIDEO SETTINGS in
+		// v22integ_03_settings_open.png before this change.
+		//
+		// A filled bar has no small-size failure mode; this is a rectangle rather than the title row's
+		// rounded capsule only because there is no Slate brush on a Canvas and a 9-px-wide rounded end
+		// is under one pixel of difference at this size. Height is tied to the row, not to a constant,
+		// so it tracks the 18px row this page clamps to at 720p as well as the full-height one.
+		const float MarkW = FMath::Max(3.f, 5.f * UIScale);
+		const float MarkH = H * 0.66f;
+		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Pulse),
+			X - MarkW - (6.f * UIScale), Y + (H - MarkH) * 0.5f, MarkW, MarkH);
 	}
 
 	// A greyed row is not a selected row and cannot be, so this collapses to two states, not four.
@@ -1877,7 +2452,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		return;
 	}
 
-	HUD->DrawText(Row.Label, LabelColor, X + PadX, TextY, FontMedium, LabelScale);
+	TraceOptionsMenuType::Draw(HUD, Row.Label, LabelColor, X + PadX, TextY, FontMedium, LabelScale);
 
 	// ---- Value ---------------------------------------------------------------------------------
 	const float ValueRight = X + W - PadX;
@@ -1902,9 +2477,21 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			ValueColor = Key.IsValid() ? TraceOptionsStyle::Ink : TraceOptionsStyle::Amber;
 		}
 
+		// UNCHANGED ARITHMETIC. The chip rect this screen has always drawn is exactly the shape of
+		// T_MenuValueBox, so the sprite is a one-for-one swap onto a rectangle that already existed.
 		const float PlateW = FMath::Max(MeasureWidth(HUD, ValueText, FontMedium, LabelScale) + (16.f * UIScale), 120.f * UIScale);
-		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, bWaiting ? 0.22f : 0.10f),
-			ValueRight - PlateW, Y + H * 0.14f, PlateW, H * 0.72f);
+		const float ChipX = ValueRight - PlateW;
+		const float ChipY = Y + H * 0.14f;
+		const float ChipH = H * 0.72f;
+
+		const bool bChipDrawn = DrawValueChip(HUD, ChipX, ChipY, PlateW, ChipH);
+
+		// The cyan wash the chip used to BE, kept on top of the sprite at a whisper. The artist's chip
+		// is the same navy as the plate it sits on — its amber ring is what separates them, and a
+		// little light inside it is what stops the key name reading as a hole in the row.
+		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan,
+			bWaiting ? 0.22f : (bChipDrawn ? 0.05f : 0.10f)), ChipX, ChipY, PlateW, ChipH);
+
 		DrawTextCentered(HUD, ValueText, ValueColor, ValueRight - PlateW * 0.5f, TextY, FontMedium, LabelScale);
 		return;
 	}
@@ -1966,8 +2553,21 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	const float Alpha = FMath::Clamp((Value - Min) / FMath::Max(UE_KINDA_SMALL_NUMBER, Max - Min), 0.f, 1.f);
 
 	const FString ValueText = FormatSettingValue(Row.Setting, Value);
-	DrawTextRight(HUD, ValueText, bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim,
-		ValueRight, TextY, FontMedium, LabelScale);
+	const FLinearColor SliderValueColor = bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim;
+
+	// The sheet drew this control as a slider WITH a numbered chip beside it — the slicer erased the
+	// "13" that was in it and kept the chip. So the chip goes back where the artist put it, behind the
+	// value, in the column the track already stops short of (TrackRight below is its left edge).
+	if (DrawValueChip(HUD, ValueRight - ValueColW, Y + H * 0.14f, ValueColW, H * 0.72f))
+	{
+		// Centred in the chip rather than right-aligned to the panel, because it now sits inside a
+		// box and a number pinned to one wall of its box looks like a mistake.
+		DrawTextCentered(HUD, ValueText, SliderValueColor, ValueRight - ValueColW * 0.5f, TextY, FontMedium, LabelScale);
+	}
+	else
+	{
+		DrawTextRight(HUD, ValueText, SliderValueColor, ValueRight, TextY, FontMedium, LabelScale);
+	}
 
 	const float TrackRight = ValueRight - ValueColW;
 	const float TrackLeft = X + W * 0.48f;
@@ -1975,18 +2575,75 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	const float TrackH = FMath::Max(3.f, 6.f * UIScale);
 	const float TrackY = Y + (H - TrackH) * 0.5f;
 
-	HUD->DrawRect(TraceOptionsStyle::Trough, TrackLeft, TrackY, TrackW, TrackH);
-	HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, bSelected ? 0.95f : 0.55f),
-		TrackLeft, TrackY, TrackW * Alpha, TrackH);
+	bool bTrackDrawn = false;
+	if (UTexture2D* TrackTex = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::SliderTrack))
+	{
+		// The sprite is a TROUGH — 23 rows with the solid rail occupying its middle eleven and a halo
+		// above and below — so drawing it at the 6px the plain bar used would throw the shape away. It
+		// takes the height the row can spare instead. TrackLeft and TrackW are untouched, which is the
+		// only thing that matters: Row.Track is still computed from them at the bottom of this
+		// function, and that rect is what a drag maps the pointer across.
+		const float SpriteH = FMath::Clamp(H * 0.60f, TrackH, 21.f * UIScale);
+		const float SpriteY = Y + (H - SpriteH) * 0.5f;
+		TraceOptionsMenuArt::DrawTrough(HUD, TrackTex, TrackLeft, SpriteY, TrackW, SpriteH, FLinearColor::White);
+
+		// THE FILL IS STILL A PLAIN BAR, deliberately. The sheet has no filled-track sprite (the
+		// slicer's own note says the artist drew an empty trough), and tinting this one cannot make a
+		// fill: a Canvas tint MULTIPLIES, so a navy trough times cyan is a darker navy trough. So the
+		// rail is drawn INSIDE the artist's trough, inset to the sprite's own solid band, and the
+		// artist's lip and halo frame it.
+		const float RailTop = SpriteY + SpriteH * TraceOptionsMenuArt::TrackRailTopV;
+		const float RailH = FMath::Max(2.f, SpriteH * TraceOptionsMenuArt::TrackRailV);
+		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, bSelected ? 0.95f : 0.55f),
+			TrackLeft, RailTop, TrackW * Alpha, RailH);
+
+		bTrackDrawn = true;
+	}
+	if (!bTrackDrawn)
+	{
+		HUD->DrawRect(TraceOptionsStyle::Trough, TrackLeft, TrackY, TrackW, TrackH);
+		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, bSelected ? 0.95f : 0.55f),
+			TrackLeft, TrackY, TrackW * Alpha, TrackH);
+	}
 
 	// Handle, so the value has a thing to grab as well as a bar to read.
 	const float HandleW = FMath::Max(4.f, 6.f * UIScale);
 	const float HandleH = H * 0.56f;
-	HUD->DrawRect(bSelected ? FLinearColor::White : TraceOptionsStyle::Cyan,
-		TrackLeft + TrackW * Alpha - HandleW * 0.5f, Y + (H - HandleH) * 0.5f, HandleW, HandleH);
+	bool bHandleDrawn = false;
+	if (UTexture2D* HandleTex = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::SliderHandle))
+	{
+		// The artist subtracted the rail from underneath the blade, so this composites over the trough
+		// with no stub showing through. It is a white alpha mask, so the tint is the whole state.
+		const float SpriteHandleH = FMath::Min(H * 0.92f, 26.f * UIScale);
+		const float SpriteHandleW = SpriteHandleH * TraceOptionsMenuArt::HandleAspect;
+		TraceOptionsMenuArt::Draw(HUD, HandleTex,
+			TrackLeft + TrackW * Alpha - SpriteHandleW * 0.5f, Y + (H - SpriteHandleH) * 0.5f,
+			SpriteHandleW, SpriteHandleH,
+			bSelected ? FLinearColor::White : TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.85f));
+		bHandleDrawn = true;
+	}
+	if (!bHandleDrawn)
+	{
+		HUD->DrawRect(bSelected ? FLinearColor::White : TraceOptionsStyle::Cyan,
+			TrackLeft + TrackW * Alpha - HandleW * 0.5f, Y + (H - HandleH) * 0.5f, HandleW, HandleH);
+	}
 
 	// Stored AFTER drawing so the poll on the next frame drags against exactly what was on screen.
+	// UNCHANGED BY SPEC v20: the sprite above is fitted to TrackLeft/TrackW, never the other way
+	// round, so this is the same rectangle it has always been and a drag lands where it always did.
 	Row.Track = FBox2D(FVector2D(TrackLeft, TrackY - H * 0.4f), FVector2D(TrackLeft + TrackW, TrackY + H * 0.4f));
+}
+
+bool FTraceOptionsMenu::DrawValueChip(AHUD* HUD, float X, float Y, float W, float H) const
+{
+	UTexture2D* Chip = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::ValueBox);
+	if (Chip == nullptr)
+	{
+		return false;
+	}
+
+	TraceOptionsMenuArt::DrawPlate(HUD, Chip, TraceOptionsMenuArt::ValueFrame, X, Y, W, H, FLinearColor::White);
+	return true;
 }
 
 void FTraceOptionsMenu::DrawFrame(AHUD* HUD, float X, float Y, float W, float H)
@@ -2024,6 +2681,23 @@ void FTraceOptionsMenu::DrawCursor(AHUD* HUD)
 		return;
 	}
 
+	// The artist's pointer, everywhere this overlay is — which is the title screen's SETTINGS page AND
+	// the in-match pause menu. Spec v20 §0.8: until now it existed only on the UMG title screen.
+	//
+	// TIP-ANCHORED, NOT CENTRED. PollMouse hit-tests at CursorPos, so an arrow whose middle sat on the
+	// hit point would draw its point about eleven pixels away from the pixel it is about to click, and
+	// every click in every screenshot would look like it landed on the wrong row.
+	if (UTexture2D* Arrow = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::Cursor))
+	{
+		const float CursorH = 30.f * UIScale;
+		const float CursorW = CursorH * TraceOptionsMenuArt::CursorAspect;
+		TraceOptionsMenuArt::Draw(HUD, Arrow,
+			CursorPos.X - CursorW * TraceOptionsMenuArt::CursorTipU,
+			CursorPos.Y - CursorH * TraceOptionsMenuArt::CursorTipV,
+			CursorW, CursorH, FLinearColor::White);
+		return;
+	}
+
 	const float S = 9.f * UIScale;
 	const float T = FMath::Max(1.f, 1.5f * UIScale);
 	const FLinearColor Color = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.95f);
@@ -2038,28 +2712,31 @@ void FTraceOptionsMenu::DrawCursor(AHUD* HUD)
 // Text helpers
 // =================================================================================================
 
+// ALL FOUR go through UI/Text now — spec v22 §A1. The (UFont*, Scale) signatures stay because they
+// are this page's layout vocabulary and forty call sites speak it; TraceOptionsMenuType::SizeFor
+// translates. See the block at the top of this file for why the translation is a measurement.
+
 float FTraceOptionsMenu::MeasureWidth(AHUD* HUD, const FString& Text, UFont* Font, float Scale)
 {
-	float OutWidth = 0.f;
-	float OutHeight = 0.f;
-	HUD->GetTextSize(Text, OutWidth, OutHeight, Font, Scale);
-	return OutWidth;
+	return TraceOptionsMenuType::Width(HUD, Text, Font, Scale);
 }
 
 float FTraceOptionsMenu::MeasureHeight(AHUD* HUD, const FString& Text, UFont* Font, float Scale)
 {
-	float OutWidth = 0.f;
-	float OutHeight = 0.f;
-	HUD->GetTextSize(Text, OutWidth, OutHeight, Font, Scale);
-	return OutHeight;
+	// The LINE BOX, deliberately independent of @p Text — every caller on this page uses it to sit a
+	// row's baseline, and a row whose height depended on whether its label happened to contain a
+	// descender would jitter as the value changed. Measured to equal what the old bitmap path
+	// returned, which is what keeps nineteen rows in exactly the places they were.
+	(void)Text;
+	return TraceOptionsMenuType::Height(HUD, Font, Scale);
 }
 
 void FTraceOptionsMenu::DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale)
 {
-	HUD->DrawText(Text, Color, CenterX - MeasureWidth(HUD, Text, Font, Scale) * 0.5f, Y, Font, Scale);
+	TraceOptionsMenuType::Draw(HUD, Text, Color, CenterX, Y, Font, Scale, TraceText::EHAlign::Center);
 }
 
 void FTraceOptionsMenu::DrawTextRight(AHUD* HUD, const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale)
 {
-	HUD->DrawText(Text, Color, RightX - MeasureWidth(HUD, Text, Font, Scale), Y, Font, Scale);
+	TraceOptionsMenuType::Draw(HUD, Text, Color, RightX, Y, Font, Scale, TraceText::EHAlign::Right);
 }

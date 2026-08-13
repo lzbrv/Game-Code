@@ -47,6 +47,7 @@
 class UBorder;
 class UImage;
 class UTextBlock;
+class UTexture2D;
 
 /** One frame of the title screen, as ATraceMenuHUD sees it. */
 struct FTraceTitleMenuView
@@ -139,6 +140,14 @@ protected:
 	// Backdrop is now a plain black fill and the grid floor, the horizon glow and the bezel that used
 	// to sit on it are not drawn at all. What is on the black is the artist's: their swoosh, their
 	// wordmark, their buttons, their cursor.
+	//
+	// SPEC v20: THE TITLE BLOCK'S COMPOSITION IS NOW OWNED BY THIS CLASS, not by the asset. The rects
+	// the generator authored put the swoosh through the middle of the wordmark and the footer on top
+	// of the blurb, and both are re-derived every frame by ComposeTitleBlock() / PlaceFooterBelowBlurb()
+	// from measurements taken off the artist's sheet and off Slate's own layout. Re-running
+	// Scripts/generate-menu-widgets.py cannot bring either defect back, and a designer who wants to
+	// move the title has to move it HERE — which is stated because the asset's own header claims the
+	// opposite for everything else in the tree.
 
 	/** Black. Opaque, and first, so the empty menu map behind it can never show through. */
 	UPROPERTY(meta = (BindWidget))
@@ -256,7 +265,114 @@ private:
 	 */
 	void SyncConsoleWidth();
 
+	// ---- Spec v20 §0.1-0.4: the three title-screen defects this class can reach -------------------
+	//
+	// All three were AUTHORED defects — the rects and the sprite came out of
+	// Scripts/generate-menu-widgets.py and Scripts/slice-ui-assets.py — but a generated asset is not
+	// where a fix can be VERIFIED: re-running the generator needs the editor, and the next run of it
+	// would silently take a hand-edit back out. So the three fixes live here, in code, in the class
+	// that already owns "where the cursor goes" and "how wide the console is", and each one states
+	// the number it is enforcing so the asset and this file cannot drift silently.
+
+	/**
+	 * DEFECT 1 — the doubled, mis-coloured wordmark, fixed at its actual cause.
+	 *
+	 * The mark is NOT drawn twice; it is drawn once, and the sprite itself is two-tone. The artist's
+	 * TRACE is a NAVY glyph — RGB(29,41,81), byte-identical to the button plates — inside an AMBER
+	 * outer glow, and the slicer shipped that crop verbatim onto a pure-black backdrop. On black the
+	 * body sits at luminance 45 while the glow reaches 199, so the eye reads the glow as one word and
+	 * the dark body as a second, offset one. A Slate tint cannot repair it: a tint MULTIPLIES, so
+	 * every colour it can produce is darker than the navy already is.
+	 *
+	 * So the sprite's own ALPHA is lifted into a new texture: the glyph body becomes ink-white, the
+	 * glow keeps the artist's amber at full strength, and the letterforms — which are the part that
+	 * is actually the artist's work — are untouched. The result is one mark, in the artist's own
+	 * hand, that reads on black.
+	 *
+	 * SELF-DISABLING. If the sprite ever arrives already legible (a re-slice that lifts the word the
+	 * way build_word() lifts PLAY and SETTINGS), the peak-luminance test below finds it and this does
+	 * nothing at all. And if the pixels cannot be read — a cooked build that dropped its CPU copy —
+	 * it leaves the authored brush alone and says so in the log. Neither case can make the screen
+	 * worse than it is today.
+	 */
+	void LiftWordmarkFromSprite();
+
+	/**
+	 * DEFECT 2 — the swoosh cutting through the lettering.
+	 *
+	 * Not a z-order bug: the mark is already on top. The RECT is the bug. The asset draws the swoosh
+	 * 940 wide at y=150 while the mark is 660 wide at y=72, so the brightest object on the screen
+	 * (peak luminance 199) crosses the dimmest one 23 px above its baseline.
+	 *
+	 * The artist's own sheet says what the relationship should be. Measured off "UI Test Export_2.png"
+	 * as ink bounding boxes: the swoosh is ~1.30x the mark's ink width and its ink top sits ~22 px
+	 * BELOW the mark's ink bottom at this scale, i.e. they do not touch at all. That is what this
+	 * reproduces, clamped so the flourish always stops short of the tagline.
+	 */
+	void ComposeTitleBlock();
+
+	/**
+	 * DEFECT 3 — two different strings on one baseline.
+	 *
+	 * BlurbText lives INSIDE ConsolePanel, so it moves down with the row count; FooterKeysText is a
+	 * sibling on the root canvas at a hard-coded y of 958.4, which is the Canvas path's footer
+	 * formula evaluated once at 1080p and pasted in. The 7th row (PRACTICE, spec v19 §2) pushed the
+	 * blurb onto it — 956.6 against 958.4, 1.8 px apart.
+	 *
+	 * Fixed by MEASURING rather than by picking a new literal: the footer is placed under the blurb's
+	 * actual laid-out bottom every frame, so it cannot collide again the next time a row is added.
+	 * The Canvas renderer has the identical collision and hides it under an opaque footer strip
+	 * (ATraceMenuHUD::DrawFooter) — it is not a reference to copy.
+	 *
+	 * IT ALSO PLACES THE PORT-BUSY WARNING, which is the same defect one screen higher and was found
+	 * in this pass's own 1280x720 capture: PortWarningText is authored at a fixed y of 436 and the
+	 * first row starts at 448.6, so the one line that tells a player their address chip is lying was
+	 * drawn across the PLAY button. It is Collapsed unless UDP 7777 is already taken on this machine,
+	 * which is why no earlier capture caught it — it took a second process holding the port to make
+	 * it appear at all. There is no room for it under the chip on this renderer; the call site says
+	 * why, with the measurements.
+	 */
+	void PlaceFooterBelowBlurb();
+
 	/** The six rows in ETraceMenuRow order, resolved once. Empty before NativeOnInitialized. */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UTraceMenuRow>> OrderedRows;
+
+	// ---- SPEC v22 §A1: THE WHOLE SCREEN IS ONE TYPEFACE ---------------------------------------------
+	//
+	// The rows retire their own word sprites (UTraceMenuRow::ApplyView). These are everything ELSE on
+	// the title screen with letters in it — the tagline, the address chip, the port warning, the
+	// blurb, both footer lines, the travel card and the failure banner — moved onto the same
+	// Sofachrome atlas, so the screen has no second face left anywhere on it.
+	//
+	// Each UTextBlock stays as the model and keeps receiving exactly the SetText it always did; a
+	// UTraceAtlasText draws it from the atlas. See UI/Text/TraceAtlasTextSwap.h.
+
+	/** Installed once, on the first ApplyView. */
+	bool bAtlasLabelsInstalled = false;
+
+	UPROPERTY(Transient)
+	TArray<FTraceAtlasLabel> AtlasLabels;
+
+	/** Idempotent; anything that fails leaves that one authored text block drawing as before. */
+	void InstallAtlasLabels();
+
+	/**
+	 * The widget actually in the panel for @p Block — the atlas label if it was swapped, else
+	 * @p Block itself. Anything asking a text block for its Slot or its geometry must go through
+	 * this; TraceAtlasTextSwap::Live explains why.
+	 */
+	UWidget* LiveText(UTextBlock* Block) const { return TraceAtlasTextSwap::Live(AtlasLabels, Block); }
+
+	/**
+	 * The recoloured mark from LiftWordmarkFromSprite(), kept alive by being a UPROPERTY.
+	 *
+	 * It is a transient texture in the transient package: nothing else in the reference graph holds
+	 * it, so a raw pointer would be collected out from under the title screen on the first GC.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UTexture2D> LiftedWordmark;
+
+	/** LiftWordmarkFromSprite() has run. It runs once, whatever its outcome was. */
+	bool bWordmarkLiftAttempted = false;
 };

@@ -39,16 +39,33 @@
 // *** LIVE, END TO END: ZIP. *** The flight, both halvings, the jump/crouch controls and the death
 // stop are all in this file and run today. Trace.Lily.ZipVerify proves the halvings red-arm first.
 //
-// *** NOT LIVE: ALL THREE OF THE OTHERS. *** The extra dash charge, the 60 health and the wall-jump
-// bonus each change a number owned by a slice this pass does not own:
+// *** THE OTHER THREE ARE LIVE TOO, as of the pass that added the call sites. *** They are still
+// implemented here and still exposed through TraceAbilityTraits (Abilities/TraceAbilityTypes.h); what
+// changed is that the three slices that own the numbers now ask:
 //
-//     the charge pool   Movement/TraceCharacterMovementComponent.cpp  (GetMaxDashCharges)
-//     max health        Gameplay/TraceHealthComponent.cpp             (GetMaxHealth)
-//     the wall jump     Movement/TraceCharacterMovementComponent.cpp  (TryWallJump)
+//     the charge pool   Movement/TraceCharacterMovementComponent.cpp  GetMaxDashCharges()
+//     max health        Gameplay/TraceHealthComponent.cpp             GetMaxHealth()
+//     the wall jump     Movement/TraceCharacterMovementComponent.cpp  the retention term in TryWallJump
 //
-// They are implemented here, exposed through TraceAbilityTraits (Abilities/TraceAbilityTypes.h), and
-// need one call each. UNTIL THOSE CALLS EXIST LILY HAS 100 HEALTH, ONE DASH AND AN ORDINARY WALL
-// JUMP. That is in the report, not buried here.
+// (An older version of this block said none of them were wired. It was true when it was written and
+// it stopped being true without being edited, which is the failure mode every "not yet live" note in
+// this project has. Trace.Lily.Verify prints what is actually read rather than what is intended.)
+//
+// ===================================================================================================
+// DEMO 19, AND THE TWO THINGS IT CHANGED
+// ===================================================================================================
+//
+// ITEM 4, verbatim: "Lily's E isn't working right. Pressing space once makes her continuously move up
+// even after I let go, and pressing control doesn't make her come down. Half the speed she moves
+// vertically at."
+//
+// The first two sentences are ONE bug with one cause — the framework's jump-RELEASE hook has no
+// caller anywhere, so the climb latch could never be cleared and the crouch test could never be
+// reached. See SampleClimbIntent() below; that is where the whole story is written down. The third
+// sentence is the two speed scales, both now 0.5.
+//
+// ITEM 8: the extra dash charge is now hers only while she is NOT carrying the Core. See
+// GetExtraDashCharges().
 //
 // ===================================================================================================
 // HOW ZIP MOVES HER, AND THE LIMIT OF DOING IT FROM AN ABILITY SET
@@ -110,7 +127,23 @@ public:
 	// MOVEMENT + PASSIVE — all three read through TraceAbilityTraits, never by casting
 	// =============================================================================================
 
-	/** §3: "an extra dash". +1 on top of everybody's pool, from UTraceSettings::LilyExtraDashCharges. */
+	/**
+	 * §3: "an extra dash", as amended by DEMO 19 ITEM 8: *** ONLY WHILE SHE IS NOT CARRYING THE CORE. ***
+	 *
+	 * "Change Lily so she only has an extra dash when she is not carrying the core." Read against the
+	 * shipped pool (BaseDashCharges 1, CarrierExtraDashCharges 1) this is:
+	 *
+	 *     free-running  1 + 1 (hers)     = 2      unchanged
+	 *     carrying      1 + 1 (carrier's) = 2      was 3
+	 *
+	 * So the change is worth stating in one sentence: SHE NO LONGER STACKS HER CHARGE ON TOP OF THE
+	 * CARRIER'S. She keeps two dashes at all times, and picking the Core up stops being a straight
+	 * upgrade for her the way it is for everyone else.
+	 *
+	 * Written as "+1 unless carrying" rather than as the literals 2 and 2, for the same reason the
+	 * addend was written that way in the first place: a retune of BaseDashCharges must still move her
+	 * with everybody else.
+	 */
 	int32 GetExtraDashCharges() const;
 
 	/** §3: "only 60 health". An ABSOLUTE, from UTraceSettings::LilyMaxHealth. 0 would mean "no opinion". */
@@ -179,6 +212,39 @@ private:
 	/** §3's SECOND clause: the Core has just arrived mid-flight, so halve WHAT IS LEFT. */
 	void HalveRemainingForCorePickup();
 
+	/**
+	 * DEMO 19 ITEM 4 — THE FIX, AND THE ONE SENTENCE WORTH READING IN THIS FILE.
+	 *
+	 * The user: "Pressing space once makes her continuously move up even after I let go, and pressing
+	 * control doesn't make her come down."
+	 *
+	 * ONE CAUSE, BOTH HALVES. UTraceAbilityComponent::HandleJumpReleased() has NO CALLER anywhere in
+	 * the project — ATracePlayerController::OnJumpCompleted() sends the release to
+	 * ACharacter::StopJumping() and stops there, while OnJumpStarted() does forward the press. So
+	 * OnJumpReleased() below was never once invoked in a real match, bJumpHeld latched true at the
+	 * first press and stayed true for the rest of the flight, and ApplyZip's descend test
+	 * (`!bJumpHeld && IsCrouchHeld()`) could therefore never be reached. Crouch was not "wired but
+	 * ineffective": it was correct code standing behind a condition that could not go false.
+	 *
+	 * (For the record, since it is the fix everyone reaches for first and this codebase already
+	 * documents it as a trap in Mace's and Slimeball's headers: GravityScale had nothing to do with
+	 * it, and setting it to 0 would have left the climb-forever bug exactly where it was.)
+	 *
+	 * So the climb intent stops being a latch and becomes a LEVEL, sampled here from the key itself on
+	 * whichever machine has a keyboard, and published into
+	 * UTraceCharacterMovementComponent::SetJumpHeld() — which rides FLAG_Custom_1 to the server, the
+	 * same saved-move road IsCrouchHeld() already travels. That is what makes the release arrive on
+	 * the authority as well as on the owning client without a release RPC that does not exist.
+	 *
+	 * THE POLL IS 20 Hz, so a release lands within 50 ms — about 20 uu of overshoot at the halved
+	 * climb speed. The press does NOT wait for it: OnJumpPressed() sets the level immediately, so the
+	 * key still feels instant.
+	 */
+	void SampleClimbIntent();
+
+	/** "Is she climbing right now?" — the level above, or the old latch under the red arm. */
+	bool IsClimbHeld() const;
+
 	/** Server: push bZipping / ZipEndMatchTime into the replicated scratch pad. */
 	void PublishState();
 
@@ -191,7 +257,15 @@ private:
 	/** Absolute match-clock time the flight ends. Never a countdown — see the cooldown contract. */
 	float ZipEndMatchTime = 0.f;
 
-	/** Jump held, for the climb. Press and release both arrive; a lost release must not fly her forever. */
+	/**
+	 * THE OLD LATCH. Kept for exactly one purpose: it is the RED ARM of Trace.Lily.KeyTest.
+	 *
+	 * The comment that used to sit here said "press and release both arrive; a lost release must not
+	 * fly her forever" — and every word of it was wrong, which is why it is quoted rather than
+	 * deleted. The release never arrived (see SampleClimbIntent), so this latched at the first press
+	 * and flew her for the whole flight. Trace.Lily.ZipHoldRelease 0 puts it back in charge so the
+	 * user's complaint can be reproduced on the same harness that shows it fixed.
+	 */
 	bool bJumpHeld = false;
 
 	/** Last carrier reading, so a PICKUP is an edge and not a level. Halving on a level would halve every tick. */

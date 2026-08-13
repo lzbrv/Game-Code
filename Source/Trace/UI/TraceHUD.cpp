@@ -45,6 +45,7 @@
 #include "Trace.h"                        // LogTraceGame
 #include "TraceSettings.h"
 #include "TraceTypes.h"
+#include "UI/Text/TraceCanvasText.h"   // spec v22 §A1 — the match HUD types from the atlas
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"         // TraceMatchFlow::PostMatchDuration, TraceMaps
 #include "UI/TraceNetworking.h"           // TraceNet — host address, connection state, failures
@@ -4329,31 +4330,69 @@ void ATraceHUD::DrawTextLeft(const FString& Text, const FLinearColor& Color, flo
 	DrawText(Text, Color, X, Y, Font, Scale);
 }
 
+// =================================================================================================
+// SPEC v22 §A1 — THE IN-MATCH HUD TYPES IN THE ARTIST'S FACE TOO
+// =================================================================================================
+//
+// A1 names three Canvas consumers: "TraceOptionsMenu, TraceCharacterSelect, THE IN-MATCH HUD". The
+// menu could have been done without this file and the result would have been a game whose menus are
+// the artist's and whose match is not — the split moved rather than retired.
+//
+// Every string this class draws goes through the four functions below, so this is the whole change.
+// The (UFont*, Scale) vocabulary is kept and TraceHUDType::SizeFor translates it by MEASURING what
+// the engine draws for that pair and inverting TraceText::LineHeight, exactly as the settings page
+// and the Canvas menu do; the reasoning is written out once at the top of UI/TraceOptionsMenu.cpp.
+//
+// MeasureHeight keeps returning the same number it returned before, so no box, chip, bar or
+// baseline on this HUD moves. Widths change, because the face is wider, and every consumer of a
+// width on this HUD measures it rather than assuming it.
+
+namespace TraceHUDType
+{
+	/** The point size whose line height equals what @p Font at @p Scale draws. */
+	static float SizeFor(AHUD* HUD, UFont* Font, float Scale)
+	{
+		float MeasuredW = 0.f;
+		float MeasuredH = 0.f;
+		if (HUD != nullptr)
+		{
+			HUD->GetTextSize(TEXT("Ag"), MeasuredW, MeasuredH, Font, Scale);
+		}
+
+		const float UnitLine = TraceText::LineHeight(1.f);
+		if (MeasuredH > 1.f && UnitLine > KINDA_SMALL_NUMBER)
+		{
+			return MeasuredH / UnitLine;
+		}
+		return FMath::Max(1.f, 16.f * Scale);
+	}
+}
+
 void ATraceHUD::DrawTextCentered(const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale)
 {
-	DrawText(Text, Color, CenterX - MeasureWidth(Text, Font, Scale) * 0.5f, Y, Font, Scale);
+	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
+	Style.HAlign = TraceText::EHAlign::Center;
+	TraceCanvasText::Draw(this, Text, CenterX, Y, Style);
 }
 
 void ATraceHUD::DrawTextRight(const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale)
 {
-	DrawText(Text, Color, RightX - MeasureWidth(Text, Font, Scale), Y, Font, Scale);
+	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
+	Style.HAlign = TraceText::EHAlign::Right;
+	TraceCanvasText::Draw(this, Text, RightX, Y, Style);
 }
 
 float ATraceHUD::MeasureWidth(const FString& Text, UFont* Font, float Scale)
 {
-	float OutWidth = 0.f;
-	float OutHeight = 0.f;
-	// AHUD::GetTextSize substitutes the medium font when Font is null, so this is null-safe.
-	GetTextSize(Text, OutWidth, OutHeight, Font, Scale);
-	return OutWidth;
+	return TraceText::MeasureWidth(Text, TraceHUDType::SizeFor(this, Font, Scale));
 }
 
 float ATraceHUD::MeasureHeight(const FString& Text, UFont* Font, float Scale)
 {
-	float OutWidth = 0.f;
-	float OutHeight = 0.f;
-	GetTextSize(Text, OutWidth, OutHeight, Font, Scale);
-	return OutHeight;
+	// The LINE BOX, independent of @p Text. Every caller here uses it to sit a box or a baseline, and
+	// a chip whose height depended on whether its label had a descender would breathe as it changed.
+	(void)Text;
+	return TraceText::LineHeight(TraceHUDType::SizeFor(this, Font, Scale));
 }
 
 float ATraceHUD::VCenterTextY(const FString& Text, UFont* Font, float Scale, float BoxY, float BoxH)

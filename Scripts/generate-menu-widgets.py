@@ -104,6 +104,21 @@
 # -NullRHI is safe: widget blueprints compile no shaders, and texture import does
 # not need a swap chain.
 #
+# THE ONE THING THAT COMMAND LINE CANNOT DO IS IMPORT THE FONT. A .ttf import
+# ends in UFontFace::PostEditChangeProperty, which calls FSlateApplication::Get()
+# unconditionally, and a commandlet has no Slate application - so it does not
+# fail, it asserts and SIGSEGVs the run. When the font asset does not exist yet
+# (or you changed TraceMenuArtStyle::MenuFontSourceFile), run this from an editor
+# instead, which has one:
+#
+#     "$UE" "$PWD/Trace.uproject" \
+#         -ExecCmds="py $PWD/Scripts/generate-menu-widgets.py,QUIT_EDITOR" \
+#         -unattended -nosplash -nosound -RenderOffScreen \
+#         -log -abslog="$PWD/Saved/Logs/trace-generate-menu-widgets.log"
+#
+# Once /Game/Trace/UI/Fonts/F_TraceMenu exists, the commandlet form above works
+# again: it re-uses the imported asset and never touches the importer.
+#
 # You must have built the game module first - the parent classes come out of it,
 # and the script fails immediately rather than authoring an asset with the wrong
 # parent.
@@ -112,10 +127,14 @@
 # to pass argv through -script=)
 #   TRACE_MENU_UI_DIR   package dir for the widgets. Default /Game/Trace/UI/Menu
 #   TRACE_MENU_ART_DIR  package dir for the sprites. Default /Game/Trace/UI/Art
+#   TRACE_MENU_FONT_DIR package dir for the font.    Default /Game/Trace/UI/Fonts
 #   TRACE_SKIP_IMPORT   set to 1 to re-author the widgets without re-importing
+#   TRACE_FONT_IMPORT   0 to never attempt the font import, 1 to force it (see
+#                       slate_is_available(); forcing it in a commandlet crashes)
 # =============================================================================
 
 import os
+import re
 import sys
 
 try:
@@ -366,14 +385,198 @@ FS_TRAVEL_CAP  = 22
 FS_TRAVEL_HINT = 13
 FS_WARNING     = 13
 
-# THE FONT. One place, and it is the same one C++ names - see
-# Source/Trace/UI/Widgets/Menu/TraceMenuArtStyle.h. Roboto Light is a STAND-IN
-# for the artist's typeface, which is not in the project because the art arrived
-# as a PNG. Only PLAY and SETTINGS draw their real letterforms, as sprites.
-MENU_FONT_ASSET = "/Engine/EngineFonts/Roboto"
-MENU_FONT_TYPEFACE = "Light"
+# =============================================================================
+# THE FONT (spec v20 section 1). NOT DECLARED HERE - PARSED OUT OF THE C++.
+#
+# This script bakes an FSlateFontInfo into every text block of WBP_TitleMenu, so
+# whatever is named here IS the font on screen. Until v20 it named its own copy
+# of the same two strings that TraceMenuArtStyle.h names, and the two drifted in
+# the worst possible direction: the C++ constant fed a log line and NOTHING on
+# screen, so an agent could change the font in C++, watch the log say Lato, and
+# photograph a menu still in Roboto.
+#
+# So there is now exactly ONE declaration and it is the C++ one. This reads it.
+# The parse is deliberately dumb (a regex over `static const TCHAR* const NAME =
+# TEXT("...")`) and it FAILS LOUDLY rather than defaulting, because a silent
+# default here is precisely the drift it exists to end.
+# =============================================================================
 
-MENU_FONT = unreal.EditorAssetLibrary.load_asset(MENU_FONT_ASSET)
+ART_STYLE_HEADER = os.path.join(PROJECT_DIR, "Source", "Trace", "UI", "Widgets",
+                                "Menu", "TraceMenuArtStyle.h")
+
+# Where the .ttf lives in source control, and where its imported UFont lands.
+FONT_SOURCE_DIR = os.path.join(PROJECT_DIR, "Art", "Fonts")
+FONT_DIR = os.environ.get("TRACE_MENU_FONT_DIR", "/Game/Trace/UI/Fonts")
+
+
+def art_style_constant(name):
+    """`static const TCHAR* const <name> = TEXT("value");` out of TraceMenuArtStyle.h."""
+    try:
+        with open(ART_STYLE_HEADER, "r") as handle:
+            header = handle.read()
+    except IOError as error:
+        fail("could not read {0}: {1}. That header is the ONLY place this project names a font; "
+             "this script has no copy to fall back on, by design.".format(ART_STYLE_HEADER, error))
+        return None
+
+    match = re.search(r"\b" + re.escape(name) + r"\s*=\s*TEXT\(\s*\"([^\"]*)\"\s*\)", header)
+    if match is None:
+        fail("{0} does not declare {1}. Spec v20 section 1 requires the font to be named in exactly "
+             "one constant, and this script reads that constant rather than keeping its own copy."
+             .format(ART_STYLE_HEADER, name))
+        return None
+    return match.group(1)
+
+
+def package_path(object_path):
+    """/Game/X/Y.Y -> /Game/X/Y. EditorAssetLibrary wants the package, C++ wants the object."""
+    return object_path.split(".")[0] if object_path else object_path
+
+
+MENU_FONT_SOURCE_FILE = art_style_constant("MenuFontSourceFile")
+MENU_FONT_ASSET = package_path(art_style_constant("MenuFontAsset"))
+MENU_FONT_TYPEFACE = art_style_constant("MenuFontTypeface")
+MENU_FONT_FALLBACK_ASSET = package_path(art_style_constant("MenuFontFallbackAsset"))
+MENU_FONT_FALLBACK_TYPEFACE = art_style_constant("MenuFontFallbackTypeface")
+
+# The UFontFace the .ttf imports to. A UFont is a wrapper around one or more of
+# these; only the UFont is named in C++, because only the UFont can be handed to
+# Slate (UFontFace does not implement IFontProviderInterface, so an
+# FSlateFontInfo pointed at one silently draws the last-resort face).
+MENU_FONT_FACE_ASSET = MENU_FONT_ASSET + "_Face" if MENU_FONT_ASSET else None
+
+MENU_FONT = None
+MENU_FONT_IS_FALLBACK = False
+
+
+def live_typeface():
+    """The typeface name to bake into a text block: it follows whichever font we
+    actually got. Baking 'Default' into a Roboto fallback would quietly draw
+    Roboto Regular instead of Roboto Light, which is a second wrong font on top
+    of the first."""
+    return MENU_FONT_FALLBACK_TYPEFACE if MENU_FONT_IS_FALLBACK else MENU_FONT_TYPEFACE
+
+
+def slate_is_available():
+    """Can this process import a font without taking the editor down?
+
+    IT CANNOT IN A COMMANDLET, and the failure is not an exception - it is an
+    assert. UFontFace::PostEditChangeProperty (Engine/Source/Runtime/Engine/
+    Private/FontFace.cpp:224) ends with an unconditional
+
+        FSlateApplication::Get().GetRenderer()->FlushFontCache(...)
+
+    and FEngineLoop only creates a Slate application for a regular client or the
+    editor token (LaunchEngineLoop.cpp:3109), never for `-run=<commandlet>`. So
+    importing a .ttf from `-run=pythonscript` hits
+    `Assertion failed: CurrentApplication.IsValid()` and SIGSEGVs the whole run
+    AFTER the sprites have imported - measured, in Saved/Logs/v20font-probe.log.
+
+    There is no script-exposed IsRunningCommandlet, so this asks the command line
+    the same question the engine did. Being wrong in the safe direction costs one
+    clear error message; being wrong in the other direction costs the editor."""
+    if os.environ.get("TRACE_FONT_IMPORT") == "0":
+        return False
+    if os.environ.get("TRACE_FONT_IMPORT") == "1":
+        return True
+    try:
+        return "-run=" not in unreal.SystemLibrary.get_command_line()
+    except Exception:
+        return False
+
+
+def import_menu_font():
+    """Art/Fonts/<MenuFontSourceFile> -> a UFont at MENU_FONT_ASSET.
+
+    Returns the UFont, or the /Engine/EngineFonts/Roboto fallback, or None. The
+    fallback matters: a menu in the wrong font beats a menu with no text, and it
+    is the same fallback TraceMenuArtStyle.cpp takes at runtime, so the two
+    cannot disagree about what a missing font means."""
+
+    def fall_back(reason):
+        global MENU_FONT_IS_FALLBACK
+        MENU_FONT_IS_FALLBACK = True
+        log("  falling back to {0} '{1}': {2}".format(
+            MENU_FONT_FALLBACK_ASSET, MENU_FONT_FALLBACK_TYPEFACE, reason))
+        return unreal.EditorAssetLibrary.load_asset(MENU_FONT_FALLBACK_ASSET)
+
+    if not MENU_FONT_ASSET or not MENU_FONT_SOURCE_FILE:
+        return fall_back("the font constants did not parse out of TraceMenuArtStyle.h")
+
+    existing = unreal.EditorAssetLibrary.load_asset(MENU_FONT_ASSET)
+    source = os.path.join(FONT_SOURCE_DIR, MENU_FONT_SOURCE_FILE)
+
+    if not os.path.isfile(source):
+        if isinstance(existing, unreal.Font):
+            log("  {0} is not on disk, but {1} is already imported - using it.".format(
+                source, MENU_FONT_ASSET))
+            return existing
+        fail("{0} does not exist. TraceMenuArtStyle::MenuFontSourceFile names it and this script "
+             "imports it; put the file there or change that one constant.".format(source))
+        return fall_back("the source file is missing")
+
+    if isinstance(existing, unreal.Font) and not slate_is_available():
+        # Already imported and we are in a commandlet: use it rather than crash.
+        log("  {0} already imported; not re-importing (no Slate application in this process).".format(
+            MENU_FONT_ASSET))
+        return existing
+
+    if not slate_is_available():
+        fail("{0} is not imported and this process cannot import a font: a .ttf import asserts "
+             "without a Slate application (see slate_is_available). Re-run this script from an "
+             "editor rather than `-run=pythonscript`:\n"
+             "    UnrealEditor Trace.uproject -ExecCmds=\"py <this script>,QUIT_EDITOR\" "
+             "-unattended -nosplash -nosound -RenderOffScreen".format(MENU_FONT_ASSET))
+        return fall_back("no Slate application in this process")
+
+    # A .ttf imports as a UFontFace. BatchCreateFontAsset asks the factory to
+    # build the UFont wrapper around it in the same step - the same thing the
+    # content browser's "create a Font asset too?" prompt does, minus the prompt.
+    factory = unreal.FontFileImportFactory()
+    set_prop(factory, "batch_create_font_asset", "BatchCreateFontAsset",
+             unreal.BatchCreateFontAsset.YES)
+
+    task = unreal.AssetImportTask()
+    task.set_editor_property("filename", source)
+    task.set_editor_property("destination_path", FONT_DIR)
+    task.set_editor_property("destination_name", os.path.basename(MENU_FONT_FACE_ASSET))
+    task.set_editor_property("automated", True)
+    task.set_editor_property("replace_existing", True)
+    task.set_editor_property("save", True)
+    task.set_editor_property("factory", factory)
+
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+
+    # The factory names the UFont itself - in UE 5.8 it appends "_Font" to the
+    # face, i.e. F_TraceMenu_Face_Font - and that name is an engine detail nobody
+    # should have to know. Find whatever Font came out and move it to the name
+    # C++ asked for, so the one constant in the header stays the truth even if a
+    # future engine names it something else.
+    font = unreal.EditorAssetLibrary.load_asset(MENU_FONT_ASSET)
+    if not isinstance(font, unreal.Font):
+        for path in unreal.EditorAssetLibrary.list_assets(FONT_DIR, recursive=True):
+            candidate = unreal.EditorAssetLibrary.load_asset(path)
+            if isinstance(candidate, unreal.Font):
+                stripped = package_path(path)
+                log("  factory created the UFont as {0}; renaming to {1}".format(
+                    stripped, MENU_FONT_ASSET))
+                unreal.EditorAssetLibrary.rename_asset(stripped, MENU_FONT_ASSET)
+                font = unreal.EditorAssetLibrary.load_asset(MENU_FONT_ASSET)
+                break
+
+    if not isinstance(font, unreal.Font):
+        fail("{0} imported no UFont. A UFontFace on its own cannot be handed to Slate - an "
+             "FSlateFontInfo pointing at one draws the last-resort face and says nothing."
+             .format(source))
+        return fall_back("the import produced no UFont")
+
+    for path in (MENU_FONT_ASSET, MENU_FONT_FACE_ASSET):
+        if unreal.EditorAssetLibrary.does_asset_exist(path):
+            unreal.EditorAssetLibrary.save_asset(path)
+
+    log("  {0} -> {1} (typeface '{2}')".format(
+        os.path.relpath(source, PROJECT_DIR), MENU_FONT_ASSET, MENU_FONT_TYPEFACE))
+    return font
 
 UMG_SETTINGS_PATH = "/Script/UMGEditor.Default__UMGEditorProjectSettings"
 
@@ -575,7 +778,7 @@ def make_text(tree, name, placeholder, size, color, justify=unreal.TextJustify.C
     block.set_editor_property("text", placeholder)
     font = block.get_editor_property("font")
     font.set_editor_property("font_object", MENU_FONT)
-    font.set_editor_property("typeface_font_name", MENU_FONT_TYPEFACE)
+    font.set_editor_property("typeface_font_name", live_typeface())
     font.set_editor_property("size", size)
     block.set_editor_property("font", font)
     block.set_editor_property("color_and_opacity", unreal.SlateColor(specified_color=color))
@@ -1179,19 +1382,28 @@ def main():
     log("Sprites: {0}      Widgets: {1}".format(ART_DIR, MENU_DIR))
     log("=" * 70)
 
+    global MENU_FONT
+
+    log("Importing the font named by TraceMenuArtStyle::MenuFontSourceFile ({0}):".format(
+        MENU_FONT_SOURCE_FILE))
+    MENU_FONT = import_menu_font()
+
     if MENU_FONT is None:
-        fail("{0} did not load. Every text block would fall back to a default font, and the whole "
-             "point of naming the font in one place is that it is the one thing we are substituting."
-             .format(MENU_FONT_ASSET))
+        fail("no font loaded at all - neither {0} nor the {1} fallback. Every text block would take "
+             "Slate's last-resort face, and the whole point of naming the font in one place is that "
+             "it is the one thing we are substituting."
+             .format(MENU_FONT_ASSET, MENU_FONT_FALLBACK_ASSET))
         return 1
 
-    # Whether '<MENU_FONT_TYPEFACE>' actually exists in that composite font is checked at RUNTIME, in
+    # Whether '<typeface>' actually exists in that composite font is checked at RUNTIME, in
     # TraceMenuArtStyle.cpp, and reported by `Trace.UI.VerifyMenuArt`. It is not checked here because
     # FCompositeFont's DefaultTypeface is not script-exposed in UE 5.8 - asking for it throws. One
     # check in the place that can actually do it beats two, one of which is a guess.
-    log("Font for every non-sprite label: {0} '{1}'. A STAND-IN: the art arrived as a PNG and a PNG "
-        "cannot carry a typeface. Only PLAY and SETTINGS draw the artist's real letterforms."
-        .format(MENU_FONT_ASSET, MENU_FONT_TYPEFACE))
+    log("Font for every non-sprite label: {0} '{1}'{2}. A SUBSTITUTE: the art arrived as a PNG and a "
+        "PNG cannot carry a typeface. Only PLAY and SETTINGS draw the artist's real letterforms."
+        .format(MENU_FONT_ASSET if not MENU_FONT_IS_FALLBACK else MENU_FONT_FALLBACK_ASSET,
+                live_typeface(),
+                " (THE FALLBACK - the intended font did not import)" if MENU_FONT_IS_FALLBACK else ""))
 
     log("Importing the sliced sheet:")
     import_sprites()

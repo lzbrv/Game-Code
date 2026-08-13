@@ -2727,6 +2727,19 @@ bool UTraceWeaponComponent::GetFacingYawAtTime(const ATraceCharacter* Character,
 
 void UTraceWeaponComponent::TickBotKnife()
 {
+	// *** DEMO 19 ITEM 2: "Don't let the bots attack." ***
+	//
+	// FIRST, before the cvar and before anything is measured, because this is a statement about the
+	// BODY rather than about the feature. A practice-range target is possessed by a controller that
+	// steers nothing and presses nothing — but this function never asked the controller what it
+	// wanted. It fires for every pawn that is not player-controlled, so the range's five stationary
+	// targets were drawing the blade and swinging it at anyone who came within 153 uu: which is
+	// exactly the distance you have to close to knife one. See SetAutonomousAttacksAllowed.
+	if (!bAutonomousAttacksAllowed)
+	{
+		return;
+	}
+
 	if (!TraceMelee::IsBotAutoKnifeEnabled())
 	{
 		return;
