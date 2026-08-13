@@ -220,14 +220,19 @@ namespace TraceCharacterRosterFile
 				FLinearColor(0.38f, 0.52f, 0.85f, 1.f)    // slate
 			},
 			{
+				// DEMO 19 ITEMS 8 AND 4 MADE BOTH OF LILY'S FIRST TWO STRINGS UNTRUE, so both moved.
+				// The card used to promise "THREE WHILE CARRYING THE CORE" (item 8 took that away) and
+				// "CLIMBS AT WALKING SPEED" (item 4 halved it). A card that lies about the kit is worse
+				// than no card, and these are the only two edits: the layout, the colour and every other
+				// character's rows are untouched.
 				10, TEXT("LILY"),
-				TEXT("ONE EXTRA DASH CHARGE, ALWAYS: TWO NORMALLY AND THREE WHILE CARRYING THE CORE."),
+				TEXT("ONE EXTRA DASH CHARGE, BUT ONLY WHILE SHE IS NOT CARRYING THE CORE: TWO EITHER WAY."),
 				TEXT("WALL JUMPS CARRY 30% MORE MOMENTUM THAN ANYONE ELSE'S. SHE IS ALSO THE FRAILEST "
 				     "CHARACTER IN THE GAME AT 60 HEALTH INSTEAD OF 100."),
 				TEXT("ZIP"),
-				TEXT("FLY FOR 5S. JUMP CLIMBS AT WALKING SPEED, CROUCH DESCENDS, AND EVERYTHING ELSE "
-				     "PLAYS AS NORMAL. CARRYING THE CORE HALVES IT - AND PICKING THE CORE UP MID-FLIGHT "
-				     "HALVES WHATEVER IS LEFT."),
+				TEXT("FLY FOR 5S. JUMP CLIMBS AND CROUCH DESCENDS, BOTH AT HALF WALKING SPEED, AND "
+				     "EVERYTHING ELSE PLAYS AS NORMAL. CARRYING THE CORE HALVES IT - AND PICKING THE "
+				     "CORE UP MID-FLIGHT HALVES WHATEVER IS LEFT."),
 				30.f,
 				FLinearColor(0.75f, 0.92f, 1.00f, 1.f)    // ice
 			}
