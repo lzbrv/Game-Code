@@ -1029,6 +1029,49 @@ public:
 	/** The crouch key as the simulation sees it: this slice's flag OR the engine's bWantsToCrouch. */
 	bool IsCrouchHeld() const { return (bWantsToSlide != 0) || (bWantsToCrouch != 0); }
 
+	// --- Jump held (Demo 19 item 4) --------------------------------------------------------------
+
+	/**
+	 * THE JUMP KEY AS A HELD LEVEL — the twin of IsCrouchHeld(), and it exists because until now
+	 * NOTHING IN THIS PROJECT COULD ANSWER THE QUESTION "is jump still down?".
+	 *
+	 * THE BUG THIS CLOSES, because it is worth writing down where the next person will find it:
+	 * UTraceAbilityComponent::HandleJumpReleased() — and therefore every character's OnJumpReleased()
+	 * hook — HAS NO CALLER ANYWHERE. ATracePlayerController::OnJumpCompleted() forwards the release to
+	 * ACharacter::StopJumping() and stops there, while OnJumpStarted() *does* forward the press. So a
+	 * character that latched "jump is down" in its press hook latched it FOREVER. Lily's Zip did
+	 * exactly that: one tap of space flew her up for the whole 5 s flight and crouch could never win,
+	 * because her descend test was `!bJumpHeld && IsCrouchHeld()`. That is Demo 19 item 4, both halves,
+	 * from one cause.
+	 *
+	 * ACharacter::bPressedJump is NOT this. JumpMaxHoldTime is 0, so ClearJumpInput drops it after a
+	 * single tick (see the note above TryConsumeSlideJump) — and Lily's hook consumes the press before
+	 * ACharacter::Jump() ever runs, so for her it is never even set.
+	 *
+	 * A LEVEL, LIKE THE SLIDE FLAG, AND FOR THE SAME REASONS. It rides FLAG_Custom_1 — the bit spec v3
+	 * §1 freed when boost was deleted — so the server learns a remote client's release through the
+	 * ordinary saved-move path rather than through an RPC that does not exist. Re-assert it while the
+	 * key is down; the writer is UTraceAbilitySetLily::SampleClimbIntent(), which polls the player's
+	 * bound Jump key on the machine that has a keyboard.
+	 *
+	 * *** IT GOES STALE ON PURPOSE. *** IsJumpHeld() answers false once JumpHeldStaleSeconds have
+	 * passed without a re-assert, so a writer that is switched off, disconnected or simply forgets to
+	 * send the release can no longer fly anybody forever. The failure mode of the whole mechanism is a
+	 * quarter of a second of unwanted climb, not five seconds of it.
+	 */
+	void SetJumpHeld(bool bHeld);
+
+	/** True while the jump key is down AND that fact is fresh. See SetJumpHeld(). */
+	bool IsJumpHeld() const;
+
+	/**
+	 * How long a SetJumpHeld(true) stays true without being re-asserted.
+	 *
+	 * Comfortably longer than the 20 Hz (50 ms) ability tick that re-asserts it and than a listen
+	 * server's move cadence, and far shorter than anything a player would call "it kept going".
+	 */
+	static constexpr double JumpHeldStaleSeconds = 0.25;
+
 	/** True for the duration of a slide. */
 	bool IsSliding() const;
 
@@ -1191,6 +1234,23 @@ public:
 
 	uint8 bWantsToDash : 1;
 	uint8 bWantsToSlide : 1;
+
+	/**
+	 * Demo 19 item 4. The jump key as a level, riding FLAG_Custom_1. WRITE IT THROUGH SetJumpHeld()
+	 * and READ IT THROUGH IsJumpHeld() — the raw bit is only half the state, because the staleness
+	 * stamp below is what stops a missing release from lasting forever.
+	 *
+	 * Nothing in the movement simulation reads it: it is carried here because this component already
+	 * has a client -> server channel for exactly this shape of fact and the ability layer does not.
+	 */
+	uint8 bWantsToJumpHold : 1;
+
+	/**
+	 * FPlatformTime::Seconds() at the last SetJumpHeld(true). Real time, not match time, and
+	 * deliberately NOT saved-move state: it is a local freshness watchdog on each machine, never an
+	 * input to a simulated move, so it cannot desync prediction.
+	 */
+	double JumpHeldStampSeconds = 0.0;
 
 protected:
 	/** Locks the direction, spends a charge, starts the dash window and launches the velocity. */
@@ -2358,10 +2418,14 @@ public:
 		APlayerController* PC, const FVector& OldStartLocation) override;
 
 	/**
-	 * Intents. FLAG_Custom_0 = dash, FLAG_Custom_2 = crouch/slide held.
-	 * FLAG_Custom_1 used to be boost and is now FREE — spec v3 §1 deleted the ability.
+	 * Intents. FLAG_Custom_0 = dash, FLAG_Custom_1 = jump held, FLAG_Custom_2 = crouch/slide held.
+	 *
+	 * FLAG_Custom_1 was boost's, was freed by spec v3 §1, and is spent again by Demo 19 item 4 on the
+	 * jump-held level — see UTraceCharacterMovementComponent::SetJumpHeld() for why the release had to
+	 * reach the server through a saved move rather than through the ability layer.
 	 */
 	uint8 bSavedWantsToDash : 1;
+	uint8 bSavedWantsToJumpHold : 1;
 	uint8 bSavedWantsToSlide : 1;
 
 	/**

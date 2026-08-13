@@ -378,6 +378,11 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	bWantsToDash = 0;
 	bWantsToSlide = 0;
 
+	// Demo 19 item 4. Zeroed through the setter so the freshness stamp starts cleared too — a
+	// non-zero stamp with a zero bit would be harmless today and a trap the first time somebody
+	// reordered these two lines.
+	SetJumpHeld(false);
+
 	DashTimeRemaining = 0.f;
 	DashCharges = 1;
 	DashRechargeRemaining = 0.f;
@@ -1517,10 +1522,15 @@ void UTraceCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 
 	// Pure state restore. The actual activations happen in OnMovementUpdated, on every machine,
 	// from these flags — so server, client and replay all go through one code path.
-	//
-	// FLAG_Custom_1 is unused: it was boost, and boost is gone (spec v3 §1).
 	bWantsToDash  = ((Flags & FSavedMove_Character::FLAG_Custom_0) != 0) ? 1 : 0;
 	bWantsToSlide = ((Flags & FSavedMove_Character::FLAG_Custom_2) != 0) ? 1 : 0;
+
+	// DEMO 19 ITEM 4. FLAG_Custom_1 was boost's free bit; it now carries the jump-held LEVEL, which is
+	// how a remote client's RELEASE reaches the server at all — UTraceAbilityComponent's release hook
+	// has no caller and there is no release RPC. Through the setter, not the raw bit, so the freshness
+	// stamp is refreshed by every move that still says "down" and a move that says "up" clears it
+	// immediately rather than waiting for the watchdog.
+	SetJumpHeld((Flags & FSavedMove_Character::FLAG_Custom_1) != 0);
 }
 
 // =================================================================================================
@@ -2205,6 +2215,30 @@ void UTraceCharacterMovementComponent::SetWantsToSlide(bool bWants)
 bool UTraceCharacterMovementComponent::IsSliding() const
 {
 	return SlideTimeRemaining > 0.f && MovementMode != MOVE_None;
+}
+
+// --- Jump held (Demo 19 item 4) ---------------------------------------------------------------
+
+void UTraceCharacterMovementComponent::SetJumpHeld(bool bHeld)
+{
+	// A LEVEL PLUS A TIMESTAMP. The bit is what travels (FLAG_Custom_1); the stamp is what makes a
+	// writer that stops talking stop flying the pawn. See the header for the release hook that was
+	// never wired and the five seconds of unwanted climb it bought.
+	bWantsToJumpHold = bHeld ? 1 : 0;
+	JumpHeldStampSeconds = bHeld ? FPlatformTime::Seconds() : 0.0;
+}
+
+bool UTraceCharacterMovementComponent::IsJumpHeld() const
+{
+	if (bWantsToJumpHold == 0)
+	{
+		return false;
+	}
+
+	// REAL time, on purpose. This is a watchdog on a caller, not a gameplay clock: it must keep
+	// counting while the match clock is paused (the select screen pauses the world) so a key held
+	// into a menu cannot come back out of it as a five-second flight.
+	return (FPlatformTime::Seconds() - JumpHeldStampSeconds) < JumpHeldStaleSeconds;
 }
 
 bool UTraceCharacterMovementComponent::CanStartSlide() const
@@ -6930,6 +6964,7 @@ static FAutoConsoleCommand GTraceDashVectorTestCmd(
 
 FSavedMove_Trace::FSavedMove_Trace()
 	: bSavedWantsToDash(0)
+	, bSavedWantsToJumpHold(0)
 	, bSavedWantsToSlide(0)
 	, bSavedMomentumActive(0)
 	, SavedDashTimeRemaining(0.f)
@@ -6962,6 +6997,7 @@ void FSavedMove_Trace::Clear()
 	// Saved moves are pooled and recycled — every added field must be reset or a stale ability will
 	// resurrect itself several moves later.
 	bSavedWantsToDash = 0;
+	bSavedWantsToJumpHold = 0;
 	bSavedWantsToSlide = 0;
 	bSavedMomentumActive = 0;
 
@@ -7018,7 +7054,13 @@ uint8 FSavedMove_Trace::GetCompressedFlags() const
 	{
 		Result |= FLAG_Custom_0;
 	}
-	// FLAG_Custom_1 is FREE. It was boost; spec v3 §1 deleted the ability.
+	// DEMO 19 ITEM 4. FLAG_Custom_1 was boost's and was free from spec v3 §1 until now; it carries the
+	// jump-held level, which is the only way a remote client's RELEASE reaches the server — the
+	// ability layer's release hook has no caller and there is no release RPC.
+	if (bSavedWantsToJumpHold)
+	{
+		Result |= FLAG_Custom_1;
+	}
 	if (bSavedWantsToSlide)
 	{
 		Result |= FLAG_Custom_2;
@@ -7041,7 +7083,14 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// activation on the server. The slide flag is included even though it is a level rather than an
 	// edge, because the edge is DERIVED from it: merging a held frame with a released one would
 	// erase a press the fast-fall depends on.
+	//
+	// The jump-held level joins them for a narrower reason. Nothing in PerformMovement reads it, so a
+	// merge could not corrupt a simulation — but the server learns the RELEASE from this bit and from
+	// nothing else, and a merge that straddled the release would hand the server a frame that still
+	// said "held". On a flying Lily that is a frame of climb the player did not ask for, which is the
+	// exact complaint this bit was added to fix.
 	if (bSavedWantsToDash != Other->bSavedWantsToDash
+		|| bSavedWantsToJumpHold != Other->bSavedWantsToJumpHold
 		|| bSavedWantsToSlide != Other->bSavedWantsToSlide)
 	{
 		return false;
@@ -7221,6 +7270,10 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			bSavedWantsToDash  = Movement->bWantsToDash;
 			bSavedWantsToSlide = Movement->bWantsToSlide;
 
+			// DEMO 19 ITEM 4. The FRESH answer, not the raw bit: a writer that has gone quiet must
+			// send "up" to the server rather than keep re-sending a stale "down" every move.
+			bSavedWantsToJumpHold = Movement->IsJumpHeld() ? 1 : 0;
+
 			// Not CMC state and deliberately not restored by PrepMoveFor: this is a property OF the
 			// move, read only by CanCombineWith. See the field's comment.
 			bSavedMomentumActive = (Movement->IsFalling() || Movement->IsCarryingExcessSpeed()) ? 1 : 0;
@@ -7299,6 +7352,12 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			// Acceleration, both of which Super::PrepMoveFor and MoveAutonomous already restore.
 			Movement->bWantsToDash  = bSavedWantsToDash;
 			Movement->bWantsToSlide = bSavedWantsToSlide;
+
+			// DEMO 19 ITEM 4. Through the setter, so the replayed value is also FRESH — restoring the
+			// raw bit with a stale stamp would hand the replay a "held" that IsJumpHeld() then reads
+			// as released. MoveAutonomous overwrites it from the compressed flags a moment later
+			// anyway; this keeps the snapshot complete rather than nearly complete.
+			Movement->SetJumpHeld(bSavedWantsToJumpHold != 0);
 
 			Movement->DashTimeRemaining     = SavedDashTimeRemaining;
 			Movement->DashRechargeRemaining = SavedDashRechargeRemaining;
