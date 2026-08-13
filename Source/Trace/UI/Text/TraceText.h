@@ -29,6 +29,27 @@
 //     STraceAtlasText::OnPaint()   -> LayoutString() -> one FSlateDrawElement::MakeBox per quad
 //
 // =================================================================================================
+// TWO WEIGHTS, THROUGH THAT SAME ONE PASS (spec v23 §A3)
+// =================================================================================================
+// The owner wants everything light and the character names on the select screen bold. That is a
+// property of the STYLE, not a second renderer: FStyle::Weight picks which sheet the quads sample,
+// and LayoutString() is otherwise unchanged. Both weights are rasterised from the same em with the
+// same advances and the same charset — Scripts/import_font_atlas.py REFUSES to emit the metrics
+// header if they ever stop agreeing.
+//
+// ADVANCES ARE NOT SHARED, though, and that correction is spec v23's integration pass: the two
+// weights are two different font files (Sofachrome W05 ExtraLight and Sofachrome Rg) and 94 of the
+// 95 cells differ in width, bold being roughly half again as wide. Measurement is face-relative, so
+// MeasureWidth() is right — but only if the caller hands it the weight it is going to DRAW in.
+//
+//     TraceText::FStyle Style(25.f, Color);
+//     Style.Weight = ETraceTextWeight::Bold;      // the ONE line a caller adds
+//     TraceCanvasText::Draw(HUD, Name, X, Y, Style);
+//
+// Cap height is the one metric that IS per weight (erosion shortens the light caps by ~10%), so
+// CapHeight() and SizeForCapHeight() take a weight. Everything else takes it only for symmetry.
+//
+// =================================================================================================
 // COORDINATES
 // =================================================================================================
 // A draw takes the TOP-LEFT of the line box, exactly like AHUD::DrawText, so a caller swapping a
@@ -53,6 +74,8 @@
 
 #include "CoreMinimal.h"
 #include "Math/Vector2D.h"
+
+#include "UI/Text/TraceTextWeight.h"
 
 class UTexture2D;
 
@@ -97,12 +120,21 @@ namespace TraceText
 		/** Extra space between glyphs, in pixels at Size. Sofachrome is wide; negative is legal. */
 		float Tracking = 0.f;
 
+		/**
+		 * Which cut of Sofachrome. LIGHT BY DEFAULT — the owner's instruction is that the game is
+		 * light and bold is the exception, so a caller opts IN to bold and never has to opt out.
+		 * Changing this does not change any advance, so it cannot move a layout; see the header.
+		 */
+		ETraceTextWeight Weight = ETraceTextWeight::Light;
+
 		EHAlign HAlign = EHAlign::Left;
 		EVAlign VAlign = EVAlign::Top;
 
 		FStyle() = default;
 		explicit FStyle(float InSize) : Size(InSize) {}
 		FStyle(float InSize, const FLinearColor& InColor) : Size(InSize), Color(InColor) {}
+		FStyle(float InSize, const FLinearColor& InColor, ETraceTextWeight InWeight)
+			: Size(InSize), Color(InColor), Weight(InWeight) {}
 	};
 
 	/** One glyph, positioned relative to the draw's origin. Pixels for Pos/Size, 0..1 for the UVs. */
@@ -133,24 +165,62 @@ namespace TraceText
 	/** One paragraph: the face, the reason if it is the fallback, and how to force the other path. */
 	TRACE_API FString DescribeFace();
 
-	/** The imported sheet, or null when it did not resolve. Only the two renderers need this. */
-	TRACE_API UTexture2D* AtlasTexture();
+	// =============================================================================================
+	// WEIGHTS — asking for bold, including by name
+	// =============================================================================================
+
+	/**
+	 * True when @p Weight's own sheet is what will be drawn for it.
+	 *
+	 * False means that weight is being SUBSTITUTED — either the whole atlas path is down (Lato), or
+	 * that one sheet failed to resolve and it is drawing in the default weight instead. Callers do
+	 * not need to branch on it; it is here so a verifier can state which sheet made the pixels.
+	 */
+	TRACE_API bool IsWeightActive(ETraceTextWeight Weight);
+
+	/** "Light" / "Bold" — the weight as drawn, so a caption can name what is on screen. */
+	TRACE_API const TCHAR* WeightName(ETraceTextWeight Weight);
+
+	/**
+	 * Resolves a weight from a string, for callers that carry one by NAME — a config value, a
+	 * console argument, a data asset column. Case-insensitive; matches the names above.
+	 *
+	 * Unrecognised input returns @p Fallback rather than guessing, so a typo in a knob degrades to
+	 * the default weight instead of silently picking the wrong one. Pass bOutMatched to tell a typo
+	 * apart from a deliberate "Light".
+	 */
+	TRACE_API ETraceTextWeight WeightFromName(const FString& Name,
+		ETraceTextWeight Fallback = ETraceTextWeight::Light, bool* bOutMatched = nullptr);
+
+	/**
+	 * The imported sheet for @p Weight, or null when it did not resolve. Only the two renderers
+	 * need this — and they must pass the weight they are about to lay out, or every glyph samples
+	 * the right cell of the wrong sheet and the text draws in the other weight.
+	 */
+	TRACE_API UTexture2D* AtlasTexture(ETraceTextWeight Weight = ETraceTextWeight::Light);
 
 	// =============================================================================================
 	// METRICS — all in screen pixels at @p Size, and all correct in the fallback too
 	// =============================================================================================
 
-	/** Top of the line box to the next line's top. */
+	/** Top of the line box to the next line's top. Identical in both weights, by construction. */
 	TRACE_API float LineHeight(float Size);
 
-	/** Top of the line box down to the baseline. */
+	/** Top of the line box down to the baseline. Identical in both weights, by construction. */
 	TRACE_API float Ascent(float Size);
 
-	/** Baseline up to the top of a capital. This is what the artist's word sprites are placed by. */
-	TRACE_API float CapHeight(float Size);
+	/**
+	 * Baseline up to the top of a capital. This is what the artist's word sprites are placed by.
+	 *
+	 * *** THE ONE METRIC THAT REALLY DIFFERS BY WEIGHT. *** Synthesising the light cut erodes rows
+	 * off the top of every capital, so light caps are ~10% shorter than bold ones at the same size
+	 * (59 vs 65 atlas px at an em of 96). Pass the weight you are about to draw in.
+	 */
+	TRACE_API float CapHeight(float Size, ETraceTextWeight Weight = ETraceTextWeight::Light);
 
-	/** The Size whose caps come out @p InCapHeight tall. The inverse of CapHeight(). */
-	TRACE_API float SizeForCapHeight(float InCapHeight);
+	/** The Size whose caps come out @p InCapHeight tall, in @p Weight. The inverse of CapHeight(). */
+	TRACE_API float SizeForCapHeight(float InCapHeight,
+		ETraceTextWeight Weight = ETraceTextWeight::Light);
 
 	/** Width the string occupies. Multi-line strings report their widest line. */
 	TRACE_API float MeasureWidth(const FString& Text, const FStyle& Style);

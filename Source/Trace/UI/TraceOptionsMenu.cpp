@@ -3,14 +3,19 @@
 #include "UI/TraceOptionsMenu.h"
 
 #include "Camera/CameraComponent.h"
+#include "CanvasTypes.h"                 // FCanvas - the foreground surface, see FTraceOverSlateCanvas
 #include "Containers/Ticker.h"          // FTSTicker - defer the viewport resize out of DrawHUD
 #include "DynamicRHI.h"                  // RHIGetGPUFrameCycles
+#include "Engine/Canvas.h"               // UCanvas::Canvas, the pointer this file swaps
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
+#include "Engine/GameViewportClient.h"   // GEngine->GameViewport->Viewport->GetDebugCanvas()
 #include "Engine/Texture2D.h"            // the artist's sprites - see the art block below
+#include "TextureResource.h"             // FTextureResource::TextureRHI - see IsDrawable
 #include "GameFramework/HUD.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/IConsoleManager.h"         // Trace.UI.ModalOverSlate - spec v23 §A2's red arm
 #include "HAL/PlatformTime.h"
 #include "Misc/CommandLine.h"            // -TraceMenuActivate, the paused-world capture hook
 #include "Misc/Parse.h"
@@ -19,6 +24,7 @@
 #include "Trace.h"                       // LogTraceGame
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
+#include "UnrealClient.h"                // FViewport::GetDebugCanvas - the foreground surface
 
 // =================================================================================================
 // WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
@@ -81,6 +87,225 @@
 // The fallback needs no branch here. With no atlas, TraceCanvasText types Lato at the same size and
 // TraceText measures Lato, so this page degrades to "the wrong face, laid out correctly".
 // =================================================================================================
+
+// =================================================================================================
+// SPEC v23 §A2 — THE FOREGROUND CANVAS
+//
+// The argument for all of this is in the header, above FTraceOverSlateCanvas. What is worth having
+// next to the code is the list of things that were CHECKED rather than assumed, because every one of
+// them would have shown up as a subtly wrong screen rather than as a failure:
+//
+//  * COORDINATE SPACE. `FSceneViewport::Draw` builds the scene canvas with
+//    `ShouldDPIScaleSceneCanvas() ? GetDPIScale() : 1` and `FDebugCanvasDrawer::InitDebugCanvas`
+//    builds the foreground one with `GetDPIScale()`. `UGameViewportClient` does not override that
+//    predicate, so both carry the same base transform and a pixel is a pixel on either. The panel
+//    therefore lands on the same rectangle it landed on before, which is exactly what the §A2
+//    re-measurement checks.
+//
+//  * THE TWO TRANSFORMS THE HUD PATH PUSHES AND THIS ONE DOES NOT. `UGameViewportClient::Draw`
+//    pushes `FTranslationMatrix(CanvasOrigin)` on the scene canvas and calls
+//    `UCanvas::ApplySafeZoneTransform()`. CanvasOrigin is `View->UnscaledViewRect.Min`, which is
+//    (0,0) for a single full-screen player — this game never splits the screen on a menu — and the
+//    safe-zone call returns immediately when the padding is zero, which it is on desktop. Both are
+//    therefore identity here. A split-screen or console port would have to revisit this.
+//
+//  * FLUSHING. The foreground canvas is created with `SetAllowedModes(Allow_DeleteOnRender)`, i.e.
+//    without Allow_Flush. `FCanvas::Flush_GameThread` returns early rather than asserting when the
+//    mode is absent, and nothing on the drawing path below calls it: every draw here batches, the
+//    same way it batches on the scene canvas.
+//
+//  * WHAT ELSE SHARES THE SURFACE. `DrawStatsHUD` and `UConsole::PostRender_Console` draw into it
+//    AFTER the HUD, so `stat fps` and the console still land on top of the modal rather than under
+//    it. That ordering is the engine's and it is the one we want.
+// =================================================================================================
+
+namespace TraceOptionsMenuOverSlate
+{
+	/**
+	 * `Trace.UI.ModalOverSlate 0|1` — the red arm for spec v23 §A2.
+	 *
+	 * 1 (default): the settings overlay and the JOIN prompt draw on the foreground canvas, so the
+	 * UMG title screen (or the in-match UMG HUD) stays up behind them and the player never sees the
+	 * renderer change.
+	 *
+	 * 0: the pre-v23 behaviour — the modal draws on the scene canvas, and because that is composited
+	 * UNDER Slate, ATraceMenuHUD has to collapse its widget and fall back to the old Canvas title
+	 * screen for as long as the modal is up. That is the defect, reproducible from the shipping
+	 * binary, which is the only way a screenshot of the fix means anything.
+	 */
+	static int32 GOverSlate = 1;
+	static FAutoConsoleVariableRef CVarModalOverSlate(
+		TEXT("Trace.UI.ModalOverSlate"),
+		GOverSlate,
+		TEXT("1 = DEFAULT. Canvas modals (SETTINGS, the pause menu, the JOIN prompt) draw on the\n")
+		TEXT("    engine's foreground canvas, which Slate paints ON TOP of the UMG screens. The title\n")
+		TEXT("    screen stays up behind them.\n")
+		TEXT("0 = pre-v23: modals draw under Slate, so the UMG title screen stands down and the old\n")
+		TEXT("    Canvas one draws instead for those frames. This is the red arm - it reproduces the\n")
+		TEXT("    58.8%-of-the-screen renderer swap that spec v23 A2 was raised for.\n")
+		TEXT("-TraceModalUnderSlate on the command line is the same 0, available before the first frame."),
+		ECVF_Default);
+
+	/**
+	 * `-TraceModalUnderSlate` — the same red arm, on the command line, and it has to exist.
+	 *
+	 * A cvar set with -ExecCmds arrives during engine init, which is after the first title screen has
+	 * already decided which renderer to build; the same reasoning is written out above
+	 * TraceMenuHUDFile::WantsUMG, which reads its switches off FCommandLine for exactly that reason.
+	 * It also keeps the harness free of quoted arguments with spaces in them, which do not survive
+	 * argv -> FCommandLine reconstruction reliably.
+	 *
+	 * Parsed once: this is asked twice a frame, and a linear scan of the command line in front of a
+	 * paused match would be its own small crime.
+	 */
+	static bool WantsOverSlate()
+	{
+		static const bool bForcedUnder = FParse::Param(FCommandLine::Get(), TEXT("TraceModalUnderSlate"));
+		return !bForcedUnder && GOverSlate != 0;
+	}
+
+	/** One line naming the surface and the reason. Read by the log and by the menu's verifier. */
+	static FString GStatus = TEXT("FOREGROUND - not yet decided this session.");
+
+	/**
+	 * The literal GStatus was last built from, or null when it was formatted.
+	 *
+	 * Resolve() runs up to twice a frame — once for the host's decision, once for the modal's own
+	 * scope — and an unconditional FString assignment there is an allocation and an 80-character copy
+	 * 120 times a second for a string nobody reads unless something changed. The literals have stable
+	 * addresses, so a pointer compare answers "same reason as last time?" exactly.
+	 */
+	static const TCHAR* GStatusLiteral = nullptr;
+
+	static void SetStatus(const TCHAR* Text)
+	{
+		if (GStatusLiteral != Text)
+		{
+			GStatusLiteral = Text;
+			GStatus = Text;
+		}
+	}
+
+	/**
+	 * The engine's own canvases, by the names `UGameViewportClient::Draw` gives them.
+	 *
+	 * FindObject and not a member, for the same reason TraceCanvasText::GameCanvas does it: this
+	 * class is not a UObject and must not hold a UObject reference across a frame, and the HUD's own
+	 * `Canvas` / `DebugCanvas` members are PROTECTED, so a plain C++ class holding an AHUD* cannot
+	 * read them. The names are stable engine constants ("CanvasObject", GameViewportClient.cpp:1529;
+	 * "DebugCanvasObject", :1528) and the whole Sofachrome Canvas path already depends on the first
+	 * of them.
+	 */
+	static UCanvas* FindGameCanvas()
+	{
+		return FindObject<UCanvas>(GetTransientPackage(), TEXT("CanvasObject"));
+	}
+
+	/** The FCanvas Slate paints in front of the UI, or null when there is no viewport to ask. */
+	static FCanvas* FindForegroundCanvas()
+	{
+		if (GEngine == nullptr || GEngine->GameViewport == nullptr)
+		{
+			return nullptr;
+		}
+		FViewport* Viewport = GEngine->GameViewport->Viewport;
+		return (Viewport != nullptr) ? Viewport->GetDebugCanvas() : nullptr;
+	}
+
+	/**
+	 * Resolves both surfaces and says whether the swap is on.
+	 *
+	 * @param OutGameCanvas   the UCanvas whose FCanvas would be swapped, when the answer is true.
+	 * @param OutForeground   the FCanvas it would be swapped to.
+	 */
+	static bool Resolve(const AHUD* InHUD, float InViewW, float InViewH,
+		UCanvas*& OutGameCanvas, FCanvas*& OutForeground)
+	{
+		OutGameCanvas = nullptr;
+		OutForeground = nullptr;
+
+		if (InHUD == nullptr || !WantsOverSlate())
+		{
+			SetStatus((InHUD == nullptr)
+				? TEXT("SCENE - no HUD to draw through.")
+				: TEXT("SCENE - Trace.UI.ModalOverSlate 0 / -TraceModalUnderSlate (the v23 A2 red arm)."));
+			return false;
+		}
+
+		UCanvas* GameCanvas = FindGameCanvas();
+		if (GameCanvas == nullptr || GameCanvas->Canvas == nullptr)
+		{
+			// Between frames the UCanvas still exists with no FCanvas behind it. Not an error.
+			SetStatus(TEXT("SCENE - the game canvas is not mid-draw."));
+			return false;
+		}
+
+		// IDENTITY, not availability. A canvas of a different size is not the canvas this frame is
+		// being drawn through — a stale one from a viewport that has since been resized, say — and
+		// swapping it would send AHUD::DrawRect to one surface and TraceCanvasText to another. The
+		// tolerance is a pixel because both numbers come from the same int.
+		if (FMath::Abs(static_cast<float>(GameCanvas->SizeX) - InViewW) > 1.f
+			|| FMath::Abs(static_cast<float>(GameCanvas->SizeY) - InViewH) > 1.f)
+		{
+			GStatusLiteral = nullptr;
+			GStatus = FString::Printf(
+				TEXT("SCENE - the game canvas is %dx%d but this frame is %.0fx%.0f."),
+				GameCanvas->SizeX, GameCanvas->SizeY, InViewW, InViewH);
+			return false;
+		}
+
+		FCanvas* Foreground = FindForegroundCanvas();
+		if (Foreground == nullptr || Foreground == GameCanvas->Canvas)
+		{
+			SetStatus(TEXT("SCENE - this viewport has no foreground canvas."));
+			return false;
+		}
+
+		SetStatus(TEXT("FOREGROUND - the modal draws in front of Slate; UMG screens stay up behind it."));
+		OutGameCanvas = GameCanvas;
+		OutForeground = Foreground;
+		return true;
+	}
+}
+
+FTraceOverSlateCanvas::FTraceOverSlateCanvas(AHUD* InHUD, float InViewW, float InViewH)
+{
+	UCanvas* GameCanvas = nullptr;
+	FCanvas* Foreground = nullptr;
+	if (!TraceOptionsMenuOverSlate::Resolve(InHUD, InViewW, InViewH, GameCanvas, Foreground))
+	{
+		return;
+	}
+
+	Surface = GameCanvas;
+	SavedCanvas = GameCanvas->Canvas;
+	GameCanvas->Canvas = Foreground;
+	bElevated = true;
+}
+
+FTraceOverSlateCanvas::~FTraceOverSlateCanvas()
+{
+	// Unconditional, and it must stay that way: the scene canvas is what every OTHER drawer on this
+	// frame — the in-match HUD, the character select, the engine's own subtitle pass — expects to
+	// find behind that pointer. Leaving the foreground one in place would move the whole game's
+	// drawing in front of Slate the moment somebody opened SETTINGS.
+	if (bElevated && Surface != nullptr)
+	{
+		Surface->Canvas = SavedCanvas;
+	}
+}
+
+bool FTraceOverSlateCanvas::IsAvailable(const AHUD* InHUD, float InViewW, float InViewH)
+{
+	UCanvas* GameCanvas = nullptr;
+	FCanvas* Foreground = nullptr;
+	return TraceOptionsMenuOverSlate::Resolve(InHUD, InViewW, InViewH, GameCanvas, Foreground);
+}
+
+const FString& FTraceOverSlateCanvas::LastStatus()
+{
+	return TraceOptionsMenuOverSlate::GStatus;
+}
 
 namespace TraceOptionsMenuType
 {
@@ -241,6 +466,52 @@ namespace TraceOptionsMenuArt
 	/** Set only on a genuine load failure, so a collected texture is re-fetched but a missing one is not re-hunted every frame. */
 	static bool GFailed[int32(ESprite::Count)] = {};
 
+	/**
+	 * *** A LOADED TEXTURE IS NOT A DRAWABLE ONE, AND DRAWING ONE ANYWAY IS A CRASH. ***
+	 *
+	 * `AHUD::DrawTexture` passes `Texture->GetResource()` STRAIGHT into an FCanvasTileItem and checks
+	 * only the UTexture (Engine HUD.cpp:986). A texture that is LOADED but whose render resource has
+	 * no RHI texture yet therefore becomes a batched element the render thread cannot draw, and it
+	 * dies on it: SIGSEGV in FBatchedElements::Draw at address 0x30, on the render thread, ~130 ms
+	 * after this page first drew.
+	 *
+	 * MEASURED, in this order, because the first two answers were wrong:
+	 *   - `Trace.Menu.Art 0` (no textures at all) ran clean, and so did the JOIN prompt, which draws
+	 *     rects and atlas text and no textures. So it was the sprites, not the surface.
+	 *   - guarding on `GetResource() != nullptr` did NOT fix it: the resource object exists straight
+	 *     away. It is `FTextureResource::TextureRHI` that arrives later, from the render thread.
+	 *   - guarding on that fixed it. Same binary, same arm, six captures, no crash.
+	 *
+	 * THIS IS A LATENT BUG SPEC v23 §A2 EXPOSED, not one it introduced. LoadObject returns the object
+	 * as soon as the package is in memory and the RHI texture lands a frame or two later. Until v23
+	 * this overlay could not be on screen without the CANVAS title screen being on screen underneath
+	 * it — that is the whole defect §A2 fixed — and that screen draws TraceMenuCanvasArt out of the
+	 * same /Game/Trace/UI/Art package, earlier in the same DrawHUD, which happened to warm these ten
+	 * textures before this page ever asked for one. Take the Canvas title screen away and this page
+	 * is the first thing in the process to touch that package.
+	 *
+	 * The guard costs one pointer compare per sprite per frame and fails the way every other sprite
+	 * failure on this page fails: Sprite() returns null, the caller draws the plain rectangle it drew
+	 * before spec v20, for the one or two frames before the RHI texture exists.
+	 */
+	static bool IsDrawable(const UTexture2D* Tex)
+	{
+		if (Tex == nullptr)
+		{
+			return false;
+		}
+		const FTextureResource* Resource = Tex->GetResource();
+		if (Resource == nullptr || !Resource->TextureRHI.IsValid())
+		{
+			// Loud once per sprite: this is the state that used to crash, so a build that starts
+			// hitting it a lot is a build whose art is arriving later than this page draws.
+			UE_LOG(LogTraceGame, Verbose, TEXT("[Options] '%s' is loaded but has no RHI texture yet; ")
+				TEXT("drawing the plain rectangle this frame."), *Tex->GetName());
+			return false;
+		}
+		return true;
+	}
+
 	/** The texture, or null — which every caller treats as "draw the rectangle you drew before". */
 	static UTexture2D* Sprite(ESprite Which)
 	{
@@ -252,7 +523,7 @@ namespace TraceOptionsMenuArt
 		const int32 Index = int32(Which);
 		if (UTexture2D* Cached = GCache[Index].Get())
 		{
-			return Cached;
+			return IsDrawable(Cached) ? Cached : nullptr;
 		}
 		if (GFailed[Index])
 		{
@@ -273,7 +544,7 @@ namespace TraceOptionsMenuArt
 		// See point 3 in the block above: nothing else in a match holds these.
 		Loaded->AddToRoot();
 		GCache[Index] = Loaded;
-		return Loaded;
+		return IsDrawable(Loaded) ? Loaded : nullptr;
 	}
 
 	/** Plain stretch. For alpha masks and for anything whose corners are not being distorted. */
@@ -1017,7 +1288,40 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	}
 #endif
 
+	// ---- SPEC v23 §A2 — IN FRONT OF SLATE, ON BOTH HOSTS -----------------------------------------
+	//
+	// Held for the draw only, never across the input poll above: PollInput can close the page, and a
+	// scope that outlived it would leave the game's canvas pointer swapped on a frame that drew
+	// nothing.
+	//
+	// This one line is what reaches the IN-MATCH pause menu as well, without a line changing in
+	// TraceHUD.cpp. Both hosts call this Tick, so both of them get a panel that draws over their UMG
+	// screens instead of under them — the title screen's over WBP_TitleMenu, the pause menu's over
+	// the in-match corner widgets. The owner asked for the art to reach the in-game menus; this is
+	// the same requirement one layer down, and it would have been wrong to fix it only on the way in.
+	//
+	// Nothing below branches on the answer. When it is false the panel draws precisely where it drew
+	// before, and it is the HOST that adapts (see ATraceMenuHUD::DrawHUD).
+	const FTraceOverSlateCanvas OverSlate(HUD, ViewW, ViewH);
+	LogSurfaceOnce(OverSlate.IsElevated());
+
 	Draw(HUD);
+}
+
+void FTraceOptionsMenu::LogSurfaceOnce(bool bElevated) const
+{
+	// Once per process per answer. This is the line that says whether the fix is live in a session
+	// somebody else is looking at, and it has to be greppable out of a log without a debugger — a
+	// modal that quietly fell back to the scene canvas looks like a modal that works, right up until
+	// somebody notices the title screen behind it changed design.
+	static int32 LastLogged = -1;
+	const int32 Answer = bElevated ? 1 : 0;
+	if (LastLogged != Answer)
+	{
+		LastLogged = Answer;
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Modal surface: %s"),
+			*FTraceOverSlateCanvas::LastStatus());
+	}
 }
 
 #if !UE_BUILD_SHIPPING

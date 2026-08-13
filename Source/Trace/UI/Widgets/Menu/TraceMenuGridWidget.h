@@ -1,43 +1,32 @@
-// ===================================================================================================
-// PARKED BY THE SPEC v22 INTEGRATION PASS — THIS IS NOT A HEADER ANY MORE, ON PURPOSE.
+// Trace — the scrolling grid floor, ported to the UMG title screen and restyled (spec v23 §A1).
 //
-// It was Source/Trace/UI/Widgets/Menu/TraceMenuGridWidget.h. It declares UCLASS UTraceMenuGrid with
-// five virtuals and a constructor and NO .cpp ever landed. UnrealHeaderTool still emits the class's
-// reflection code and vtable for a header nobody includes, so the module failed to LINK — and a
-// failed link DELETES libUnrealEditor-Trace.dylib, which means nothing on the machine could run, for
-// every agent, not just the one who owned this file. Two of the three reports handed to the
-// integrator name this file as the thing that blocked them, for about ninety minutes between them.
+// -------------------------------------------------------------------------------------------------
+// THIS FILE WAS AN ORPHAN AND IS NOT ONE ANY MORE. READ THIS BEFORE EDITING IT.
+// -------------------------------------------------------------------------------------------------
+// A previous pass left this header on disk declaring UCLASS UTraceMenuGrid with six member functions
+// and NO .cpp. UnrealHeaderTool emits the reflection code and the vtable for a UCLASS whether or not
+// anybody includes the header, so the module failed to LINK — and a failed link DELETES
+// libUnrealEditor-Trace.dylib, which stops every agent on the machine, not just the one who owns the
+// file:
 //
 //     Undefined symbols for architecture arm64:
 //       "UTraceMenuGrid::RebuildWidget()", referenced from: vtable for UTraceMenuGrid
-//       ... and four more, all from the generated code, none from any call site.
+//       ... and four more, all from generated code, none from any call site.
 //
-// Renaming it out of *.h is the smallest change that unblocks the build: UBT and UHT scan headers by
-// extension, so this file is now inert, and NOTHING was deleted. The design notes below are the
-// valuable part and they are all still here — the palette derivation, the readability argument, the
-// four grunge decisions, and the FTraceMenuGridParams struct with every number in it.
-//
-// TO FINISH SPEC v22 §A2: write STraceMenuGrid and UTraceMenuGrid's six member functions into a new
-// TraceMenuGridWidget.cpp, add UTraceTitleMenuWidget::InstallGridBackground() (this header's own
-// comment refers to it; it does not exist either), rename this file back to .h, and build. Do NOT
-// rename it back before the .cpp exists — that is exactly the state that stranded the run.
-//
-// The grid itself is not lost meanwhile: ATraceMenuHUD::DrawGridFloor() still draws it on the Canvas
-// renderer, and it is visible behind the JOIN prompt and the settings page in
-// Saved/Screenshots/v22integ_FINAL_06_join_prompt.png.
-// ===================================================================================================
-
-// Trace — the scrolling grid floor, ported to the UMG title screen and restyled (spec v22 §A2).
+// It was renamed to TraceMenuGridWidget.h.orphan-no-cpp to get the build back, which is why the
+// design notes below survived. TraceMenuGridWidget.cpp now exists and implements every one of these
+// declarations. *** If you delete or rename that .cpp, delete or rename this header in the same
+// commit. *** A bare UCLASS header does not fail to compile; it fails to link, for everybody.
 //
 // -------------------------------------------------------------------------------------------------
 // WHERE THIS CAME FROM
 // -------------------------------------------------------------------------------------------------
 // The owner asked for "something like the scrolling background grid that used to be in the main menu
-// ui". It was never lost. ATraceMenuHUD::DrawGridFloor() still draws it on the CANVAS title screen —
-// rails converging on a vanishing point, rungs scrolling toward the viewer at FMath::Pow(T, 2.6f)
-// spacing, a bright horizon, scanlines. What happened is that spec v19 §5 made the artist's UMG
-// screen the default and gave it a flat black backdrop, so the grid simply stopped being on the
-// screen anybody sees. This is the port.
+// ui, just matching the current font/color/grungy style". It was never lost.
+// ATraceMenuHUD::DrawGridFloor() still draws it on the CANVAS title screen — rails converging on a
+// vanishing point, rungs scrolling toward the viewer at FMath::Pow(T, 2.6f) spacing, a bright
+// horizon, scanlines. Spec v19 §5 made the artist's UMG screen the default and gave it a flat black
+// backdrop, so the grid simply stopped being on the screen anybody sees. This is the port.
 //
 // The trick that makes it read as a floor rather than a ladder is the exponent, and it is copied
 // verbatim from the Canvas comment: "evenly spaced rungs read as a ladder, squared spacing reads as
@@ -52,28 +41,35 @@
 // reorganisation must not change how anything looks", and its palette is the original pure cyan
 // FLinearColor(0.16, 0.88, 1.00) with a hard-edged, evenly-lit floor.
 //
-// Spec v22 §A2 asks for the opposite of faithful: "restyle it to the current art direction: the
-// artist's palette rather than the old pure cyan, and grungy — the sheet's look is worn and filmic,
-// not clean neon." Retuning UTraceMenuCanvasArt would have destroyed the one thing it is for. So the
-// old one stays exactly as it is, as the reference rendering, and the restyle lives here.
+// Spec v23 §A1 asks for the opposite of faithful: the artist's palette rather than the old pure
+// cyan, and grungy/worn rather than clean neon. Retuning UTraceMenuCanvasArt would have destroyed
+// the one thing it is for. So the old one stays exactly as it is, as the reference rendering, and
+// the restyle lives here.
 //
 // -------------------------------------------------------------------------------------------------
 // THE RESTYLE, AND WHERE EVERY COLOUR COMES FROM
 // -------------------------------------------------------------------------------------------------
-// Nothing below is invented. Both hues are DERIVED from art already on this screen:
+// Neither hue is invented and neither is typed in as a literal. Both are COMPUTED, at runtime, from
+// a constant that already decides how something else on this screen looks — see SteelLine() and
+// HorizonAmber() in the .cpp:
 //
 //   STEEL   the artist's button plate, TraceMenuArtStyle::PlateFill = RGB(29,41,81), with its
-//           brightness put back. The plate is that hue at ~8% value; the grid is the same hue at
-//           full value. So the floor and the buttons are literally the same colour, which is what
-//           stops the background reading as a second design.
-//   AMBER   TraceMenuArtStyle::Amber / the glow the TRACE wordmark is lifted into
-//           (TraceTitleMenuWidget's WordmarkGlow, RGB(255,140,40)). It appears in exactly one place,
-//           the horizon, so the brightest line in the background is the same colour as the
-//           brightest thing in the title.
+//           brightness put back (divided through by its own largest channel, which is exactly "the
+//           same hue at full value"). Comes out at sRGB(108,142,255). The floor and the buttons are
+//           therefore literally the same colour, which is what stops the background reading as a
+//           second design. The old grid's pure cyan, sRGB(111,241,255), is a different hue from
+//           anything the artist drew.
+//   AMBER   TraceMenuArtStyle::Amber = RGB(116,58,0), the same way: sRGB(255,135,0). Measured
+//           against the wordmark's own glow (TraceTitleMenuWidget's WordmarkGlow, RGB(255,140,40))
+//           that is 5 bytes of green and 40 of blue apart — the same colour to the eye. It appears
+//           in exactly ONE place, the horizon, so the brightest line in the background is the same
+//           colour as the brightest thing in the title.
 //
 // "Grungy" is four specific departures from the clean neon original, all of them cheap:
 //   1. every rung is drawn as nine independently jittered cells with occasional near-dropouts, so no
-//      line in the frame is an unbroken machine-perfect stroke;
+//      line in the frame is an unbroken machine-perfect stroke. The jitter is keyed to a rung's
+//      TRAVELLING identity, not to its slot in the loop, so the broken cells move toward the viewer
+//      with the rung they belong to instead of sitting still in screen space;
 //   2. every rail carries a per-rail alpha jitter, so the fan is uneven;
 //   3. dust marks scroll along the floor on the same perspective curve as the rungs;
 //   4. the scanlines have hashed, slowly-reseeded per-line alpha instead of one constant, which is
@@ -82,32 +78,36 @@
 // -------------------------------------------------------------------------------------------------
 // READABILITY IS A CONSTRAINT, NOT AN AFTERTHOUGHT
 // -------------------------------------------------------------------------------------------------
-// Spec v22 §A2: "Keep it behind everything and quiet enough that the rows stay the most readable
-// thing on screen; measure that rather than eyeball it."
+// Spec v23 §A1: "it must not cost the rows their readability — measure text contrast with and
+// without it."
 //
-// Two structural decisions do that work, and both are visible in the numbers rather than argued:
+// Three structural decisions do that work, and all three are visible in the numbers rather than
+// argued. Note that WBP_TitleMenu's ConsolePanel is a CLEAR border — the rows wear their own plates
+// and nothing else on this screen has anything opaque behind it — so "the grid is behind a panel"
+// is not available as an answer here. It is behind the PLATES, and nothing else:
 //
 //   THE LIGHT IS AT THE HORIZON. The Canvas original brightens its rungs toward the BOTTOM of the
 //   frame (alpha = 0.32 * T), which on the UMG screen would put the grid's strongest pixels directly
-//   under the blurb and the two footer lines — the only two strings on this screen that sit on bare
-//   black. So the floor fades toward the viewer instead. See NearFade().
+//   under the blurb and the two footer lines — the three strings on this screen that sit on bare
+//   black. So the floor fades toward the viewer instead. See FloorFade().
 //
 //   THE HAZE STOPS BELOW THE TAGLINE. The horizon glow's height is chosen so its top edge lands
-//   under the tagline's baseline, and its ramp is quadratic, so the band is already at ~0 alpha
-//   where the tagline is.
+//   under the tagline's baseline (tagline at reference y=359, horizon at 0.66*1080=712.8, haze
+//   0.30*1080=324 tall, so its top edge is y=388.8), and its ramp is quadratic, so the band is
+//   already at ~0 alpha where the address chip is.
 //
-// Everything else on this screen is on an opaque plate (the rows, the address chip) or is the
-// artist's own art (the wordmark, the swoosh), and cannot be reached by anything drawn behind it.
+//   EVERY LEVEL IS A THIRD OF THE CANVAS ORIGINAL'S. Rails 0.085 against 0.34, rungs 0.115 against
+//   0.32. The Canvas screen's grid is a foreground element; this one is wallpaper.
 //
 // -------------------------------------------------------------------------------------------------
 // SWITCHES
 // -------------------------------------------------------------------------------------------------
-//   Trace.UI.MenuGrid 0|1              draw it at all. Default 1.
+//   Trace.UI.MenuGrid 0|1              draw it at all. Default 1. Live: takes effect the next frame.
 //   Trace.UI.MenuGridIntensity <float> master multiplier on every alpha. Default 1.
 //   -TraceNoMenuGrid                   command line, beats the cvar, for the same reason
 //                                      -TraceNoMenuUMG does: a cvar set with -ExecCmds arrives after
-//                                      the first title screen has already been built. This is the
-//                                      arm the contrast measurement is taken against.
+//                                      the first title screen has already been built. THIS IS THE
+//                                      ARM THE CONTRAST MEASUREMENT IS TAKEN AGAINST.
 
 #pragma once
 
@@ -187,7 +187,7 @@ struct FTraceMenuGridParams
  * that, and takes no input.
  *
  * NOT a BindWidget: it is not in WBP_TitleMenu and is not meant to be. UTraceTitleMenuWidget adds it
- * to the root canvas at runtime, between the black Backdrop and the swoosh — see
+ * to the root canvas at runtime, directly above the black Backdrop and below every other layer — see
  * UTraceTitleMenuWidget::InstallGridBackground() for why that is a code decision rather than a
  * generator one.
  */
@@ -213,6 +213,9 @@ public:
 
 	/** Drives the scroll, the dust and the scanline noise. Pushed in once per frame from the view. */
 	void SetAnimationTime(float InSeconds);
+
+	/** One line naming the palette and the levels, for the log and for a verifier. */
+	static FString Describe();
 
 	//~ Begin UWidget interface
 	virtual void SynchronizeProperties() override;

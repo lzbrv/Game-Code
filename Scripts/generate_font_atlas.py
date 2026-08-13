@@ -51,7 +51,31 @@ OUT_DIR = os.path.join(ROOT, "Content", "Trace", "UI", "Fonts", "Source")
 # and the rest are cheap and stop a stray string rendering as blanks.
 CHARSET = "".join(chr(c) for c in range(32, 127))
 
-PAD = 2               # transparent gutter, so bilinear filtering cannot bleed
+# THE GUTTER IS 16 PX BECAUSE THE SHEET NEEDS A MIP CHAIN, and that is the whole
+# reason this number changed from 2 (spec v23, integration pass).
+#
+# The HUD and the menu footers draw this 96 px em at about 10 px, an ~11x
+# minification. Sampling a sheet with NO mips at 11x means each screen pixel takes
+# essentially one arbitrary texel, and in an EXTRA LIGHT face the horizontal bars
+# are one texel tall — so they are the strokes that get skipped. Photographed on
+# the title screen before this change: "MOVE" drew as "MOVC", "ENTER SELECT" as
+# "CNTCR SCLCCT" and "ESC" as "CSC". Every E, F and H lost its crossbars while the
+# stems and diagonals survived, which is exactly the signature of undersampling
+# rather than of a faint face.
+#
+# A mip chain fixes that by pre-averaging, but a mip AVERAGES ACROSS THE GUTTER:
+# mip level N mixes 2^N texels, and a bilinear tap on it reaches ~2^N source texels
+# each side. The importer used to refuse mips for that reason with PAD = 2, where
+# even mip 2 reaches through into the next letter. 16 px covers mip 3 (8x, i.e.
+# down to a 12 px em) with a texel to spare, which is past the smallest size
+# anything in this game draws. Cells are FULL ADVANCE boxes and Sofachrome runs its
+# ink flush to the advance on A, T, V, W and Y, so this gutter is the only
+# separation there is — it cannot be inferred from the glyph's bearings.
+#
+# Cost: the light sheet grows 2048x512 -> 2048x1024, i.e. 8 MB uncompressed. Both
+# sheets must be generated with the SAME value or their cell grids stop matching
+# and one layout pass can no longer serve both weights.
+PAD = 16
 MAX_WIDTH = 2048      # atlas width; height grows in powers of two to fit
 
 
@@ -116,39 +140,75 @@ def build(font_path, px, out_dir, preview, thin, name="T_FontAtlas"):
     # This is a synthesis, not the real thing. If Typodermic sell a genuine
     # ExtraLight, that will always beat this — drop it in Art/Fonts/ and pass
     # --thin 0.
-    atlas = Image.new("RGBA", (atlas_w, atlas_h), (255, 255, 255, 0))
+    # Render the WHOLE SHEET at SS scale, erode it in one pass, then downsample.
+    #
+    # The first version of this did it per glyph — drawing each letter into an
+    # oversized padded cell, eroding that, and pasting it back at a negative
+    # offset. It clipped glyphs at the sheet edges and mangled others: PLAY lost
+    # the A's left diagonal and the Y became a stub. Doing it sheet-wide has no
+    # offsets to get wrong.
+    #
+    # Eroding across the whole sheet cannot bleed between neighbours: a minimum
+    # filter only ever SHRINKS coverage, so a neighbour's ink can never be added
+    # to this glyph — at worst the transparent gutter between them eats a little
+    # more of each edge, which is the thinning we are asking for anyway.
     if thin > 0:
         big = ImageFont.truetype(font_path, px * SS)
-        # `thin` is in FINAL-SIZE pixels per side; at SS supersampling that is
-        # thin*SS erosion passes.
-        kernel = max(1, int(round(thin * SS)))
-    for c in cells:
-        if thin <= 0:
-            # Draw with the default "la" anchor: x is the pen position, y is the
-            # top of the line. The glyph's own bearings are therefore already
-            # inside the cell, which is what makes a bearing table unnecessary.
-            ImageDraw.Draw(atlas).text(
-                (c["x"], c["y"]), c["char"], font=font, fill=(255, 255, 255, 255))
-            continue
+        sheet = Image.new("L", (atlas_w * SS, atlas_h * SS), 0)
+        d = ImageDraw.Draw(sheet)
+        for c in cells:
+            d.text((c["x"] * SS, c["y"] * SS), c["char"], font=big, fill=255)
 
-        pad = px * SS // 2
-        cw, ch = c["w"] * SS + pad * 2, c["h"] * SS + pad * 2
-        cell = Image.new("L", (cw, ch), 0)
-        ImageDraw.Draw(cell).text((pad, pad), c["char"], font=big, fill=255)
-        # k passes of a 3x3 minimum erode by k pixels and cost 9k operations per
-        # pixel; one MinFilter(2k+1) erodes the same amount but costs (2k+1)^2,
-        # which for the amounts needed here is slow enough to time out.
-        for _ in range(kernel):
-            cell = cell.filter(ImageFilter.MinFilter(3))
-        cell = cell.resize((c["w"] + (pad * 2) // SS, c["h"] + (pad * 2) // SS),
-                           Image.LANCZOS)
-        glyph = Image.new("RGBA", cell.size, (255, 255, 255, 0))
-        glyph.putalpha(cell)
-        glyph = Image.composite(
-            Image.new("RGBA", cell.size, (255, 255, 255, 255)),
-            Image.new("RGBA", cell.size, (255, 255, 255, 0)),
-            cell)
-        atlas.alpha_composite(glyph, (c["x"] - pad // SS, c["y"] - pad // SS))
+        # ADAPTIVE, PER GLYPH. Uniform erosion is not safe past about one pixel:
+        # measured on this face, --thin 3 DELETES ( ) [ ] { } / and \\ outright,
+        # and the HUD draws "[E]". Heavy letters can take far more thinning than
+        # already-thin punctuation, so each glyph is eroded on its own and stops
+        # as soon as it has lost too much of itself. Letters reach the requested
+        # weight; brackets keep their shape.
+        #
+        # Each cell is processed IN PLACE at its own coordinates. The first
+        # version of this rendered glyphs into padded cells and pasted them back
+        # at an offset, which clipped them — PLAY lost the A's left diagonal and
+        # the Y became a stub. There are no offsets here to get wrong.
+        passes = max(1, int(round(thin * SS)))
+        floor = 0.45          # never let a glyph fall below this share of its ink
+        thinned = {}
+        for c in cells:
+            box = (c["x"] * SS, c["y"] * SS,
+                   (c["x"] + c["w"]) * SS, (c["y"] + c["h"]) * SS)
+            cell = sheet.crop(box)
+            start_ink = sum(cell.point(lambda v: 255 if v > 110 else 0)
+                            .convert("L").getdata()) / 255.0
+            if start_ink <= 0:
+                continue
+            applied = 0
+            for _ in range(passes):
+                nxt = cell.filter(ImageFilter.MinFilter(3))
+                ink = sum(nxt.point(lambda v: 255 if v > 110 else 0)
+                          .convert("L").getdata()) / 255.0
+                if ink < start_ink * floor:
+                    break
+                cell = nxt
+                applied += 1
+            sheet.paste(cell, box)
+            thinned[c["char"]] = applied
+
+        sheet = sheet.resize((atlas_w, atlas_h), Image.LANCZOS)
+        atlas = Image.composite(Image.new("RGBA", (atlas_w, atlas_h), (255, 255, 255, 255)),
+                                Image.new("RGBA", (atlas_w, atlas_h), (255, 255, 255, 0)),
+                                sheet)
+        held = sorted({ch for ch, n in thinned.items() if n < passes})
+        if held:
+            print("[Trace] protected from over-thinning ({0} of {1} passes not applied): {2}".format(
+                passes, passes, "".join(held)))
+    else:
+        atlas = Image.new("RGBA", (atlas_w, atlas_h), (255, 255, 255, 0))
+        d = ImageDraw.Draw(atlas)
+        for c in cells:
+            # Default "la" anchor: x is the pen position, y the top of the line.
+            # The glyph's own bearings are therefore already inside the cell,
+            # which is what makes a bearing table unnecessary.
+            d.text((c["x"], c["y"]), c["char"], font=font, fill=(255, 255, 255, 255))
 
     os.makedirs(out_dir, exist_ok=True)
     png_path = os.path.join(out_dir, name + ".png")

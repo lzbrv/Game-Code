@@ -44,6 +44,23 @@ namespace TraceTextConsoleFile
 	static const TCHAR* SpecimenB = TEXT("0123456789 .,:;!?-()");
 	static const TCHAR* MenuWords = TEXT("PLAY SETTINGS JOIN PRACTICE QUIT");
 
+	/**
+	 * THE WEIGHT PAIR (spec v23 §A3).
+	 *
+	 * A character name, because that is the one string in the game that is meant to be bold, and it
+	 * is full of flat vertical stems (M, I, T, R) — which is what makes the two weights separable in
+	 * a SCREENSHOT rather than only in a log line. The pair is drawn at the same size, from the same
+	 * X, one line apart, so a vertical slice through both rows measures two stems that differ only
+	 * by weight. "The flag was set" is not evidence; two stroke widths in one image is.
+	 */
+	static const TCHAR* WeightSpecimen = TEXT("MORTIMER");
+
+	/** Size for the weight pair. Big enough that a stem is many pixels wide, so the ratio is robust. */
+	static constexpr float WeightSpecimenSize = 44.f;
+
+	/** Defined below, next to the Slate half's version of the same comparison. */
+	static void DrawWeightPair(UCanvas* Canvas, float X, float Y, float S, const TCHAR* Which);
+
 	static TSharedPtr<SWidget> Overlay;
 	static FDelegateHandle CanvasHandle;
 
@@ -94,24 +111,125 @@ namespace TraceTextConsoleFile
 				*TraceText::FaceName().ToUpper(), Measured,
 				TraceText::CapHeight(Body.Size), TraceText::LineHeight(Body.Size)),
 			X, Y, Caption);
+		Y += TraceText::LineHeight(Caption.Size) * 1.6f;
+
+		DrawWeightPair(Canvas, X, Y, S, TEXT("CANVAS"));
+	}
+
+	/**
+	 * The two weights, same string, same size, same left edge, one line apart.
+	 *
+	 * Drawn through the ORDINARY draw call with nothing but Style.Weight changed between the two —
+	 * so if these two rows have the same stroke width on screen, the weight argument is not reaching
+	 * the renderer, whatever the log says. That is the same comparison-not-assertion trick the Lato
+	 * control line uses above, applied to weight instead of to typeface.
+	 *
+	 * The caption carries each row's width and cap height, which is the other half of the claim: the
+	 * two widths must DIFFER — the weights are two different font files, bold about half again as
+	 * wide, which is exactly why every measurement has to be told its weight. CAP HEIGHT is the
+	 * control: both real cuts of Sofachrome share it (65 px at em 96), so the two CAP numbers should
+	 * MATCH. It used to be the other way round, when the light cut was Regular eroded by --thin and
+	 * the erosion shortened its capitals while leaving the advances alone. Two numbers that would
+	 * both move if the weight table and the sheets ever came apart.
+	 */
+	static void DrawWeightPair(UCanvas* Canvas, float X, float Y, float S, const TCHAR* Which)
+	{
+		const FLinearColor Label(0.55f, 0.62f, 0.72f, 1.f);
+		const FLinearColor LightInk(0.62f, 0.86f, 1.00f, 1.f);
+		const FLinearColor BoldInk(1.00f, 0.78f, 0.36f, 1.f);
+
+		TraceText::FStyle Caption(15.f * S, Label);
+		TraceCanvasText::Draw(Canvas,
+			FString::Printf(TEXT("%s  -  TWO WEIGHTS, ONE LAYOUT PASS, ONLY Style.Weight DIFFERS"), Which),
+			X, Y, Caption);
+		Y += TraceText::LineHeight(Caption.Size) * 1.15f;
+
+		const float Size = WeightSpecimenSize * S;
+		const float Pitch = TraceText::LineHeight(Size) * 1.02f;
+
+		// The label column is measured in the LIGHT weight and reserved for both rows, so the two
+		// specimens start at exactly the same X — the comparison depends on that.
+		const FString LightTag = TEXT("LIGHT (DEFAULT)  ");
+		const FString BoldTag  = TEXT("BOLD  (NAMES)    ");
+		TraceText::FStyle TagStyle(13.f * S, Label);
+		const float TagW = FMath::Max(
+			TraceText::MeasureWidth(LightTag, TagStyle),
+			TraceText::MeasureWidth(BoldTag, TagStyle)) + (8.f * S);
+
+		for (int32 Pass = 0; Pass < 2; ++Pass)
+		{
+			const ETraceTextWeight Weight =
+				(Pass == 0) ? ETraceTextWeight::Light : ETraceTextWeight::Bold;
+
+			TraceText::FStyle Row(Size, (Pass == 0) ? LightInk : BoldInk);
+			Row.Weight = Weight;   // <<< the only difference between the two rows
+
+			const float RowY = Y + Pitch * Pass;
+			TraceCanvasText::Draw(Canvas, (Pass == 0) ? LightTag : BoldTag, X,
+				RowY + (TraceText::Ascent(Size) - TraceText::Ascent(TagStyle.Size)), TagStyle);
+			TraceCanvasText::Draw(Canvas, WeightSpecimen, X + TagW, RowY, Row);
+
+			TraceCanvasText::Draw(Canvas,
+				FString::Printf(TEXT("%s  W %.1f  CAP %.1f  %s"),
+					TraceText::WeightName(Weight),
+					TraceText::MeasureWidth(WeightSpecimen, Row),
+					TraceText::CapHeight(Size, Weight),
+					TraceText::IsWeightActive(Weight)
+						? TEXT("OWN SHEET")
+						: TEXT("SUBSTITUTED - this weight did NOT load")),
+				X + TagW + TraceText::MeasureWidth(WeightSpecimen, Row) + (18.f * S),
+				RowY + (TraceText::Ascent(Size) - TraceText::Ascent(Caption.Size)), Caption);
+		}
 	}
 
 	// ---------------------------------------------------------------------------------------------
 	// The Slate half
 	// ---------------------------------------------------------------------------------------------
 
-	static TSharedRef<SWidget> MakeAtlasLine(const FString& InText, float InSize, const FLinearColor& InColor)
+	static TSharedRef<SWidget> MakeAtlasLine(const FString& InText, float InSize, const FLinearColor& InColor,
+		ETraceTextWeight InWeight = ETraceTextWeight::Light)
 	{
 		FTraceAtlasTextParams Params;
 		Params.Text = InText;
 		Params.Style.Size = InSize;
 		Params.Style.Color = InColor;
+		Params.Style.Weight = InWeight;
 		Params.SlotHAlign = TraceText::EHAlign::Left;
 		Params.SlotVAlign = TraceText::EVAlign::Top;
 
 		TSharedRef<STraceAtlasText> Line = SNew(STraceAtlasText);
 		Line->SetParams(Params);
 		return Line;
+	}
+
+	/** The weight pair again, through the UMG/Slate leaf this time. Same claim, other renderer. */
+	static TSharedRef<SWidget> MakeWeightRow(ETraceTextWeight Weight, const FString& Tag,
+		const FLinearColor& Ink)
+	{
+		const FLinearColor Label(0.55f, 0.62f, 0.72f, 1.f);
+		TraceText::FStyle Row(WeightSpecimenSize, Ink);
+		Row.Weight = Weight;
+
+		return SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+			[
+				MakeAtlasLine(Tag, 13.f, Label)
+			]
+			+ SHorizontalBox::Slot().AutoWidth().Padding(10.f, 0.f, 0.f, 0.f)
+			[
+				MakeAtlasLine(WeightSpecimen, WeightSpecimenSize, Ink, Weight)
+			]
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(18.f, 0.f, 0.f, 0.f)
+			[
+				MakeAtlasLine(FString::Printf(TEXT("%s  W %.1f  CAP %.1f  %s"),
+					TraceText::WeightName(Weight),
+					TraceText::MeasureWidth(WeightSpecimen, Row),
+					TraceText::CapHeight(WeightSpecimenSize, Weight),
+					TraceText::IsWeightActive(Weight)
+						? TEXT("OWN SHEET")
+						: TEXT("SUBSTITUTED - this weight did NOT load")),
+					13.f, Label)
+			];
 	}
 
 	static TSharedRef<SWidget> BuildOverlay()
@@ -157,6 +275,22 @@ namespace TraceTextConsoleFile
 				.Text(FText::FromString(MenuWords))
 				.Font(TraceMenuArtStyle::MenuFont(34.f))
 				.ColorAndOpacity(FSlateColor(Control))
+		];
+
+		// THE WEIGHT PAIR — see DrawWeightPair. Same two rows, through the Slate leaf.
+		Box->AddSlot().AutoHeight().Padding(0.f, 16.f, 0.f, 2.f)
+		[
+			MakeAtlasLine(TEXT("UMG / SLATE  -  TWO WEIGHTS, ONLY Style.Weight DIFFERS"), 15.f, Label)
+		];
+		Box->AddSlot().AutoHeight()
+		[
+			MakeWeightRow(ETraceTextWeight::Light, TEXT("LIGHT (DEFAULT)"),
+				FLinearColor(0.62f, 0.86f, 1.00f, 1.f))
+		];
+		Box->AddSlot().AutoHeight()
+		[
+			MakeWeightRow(ETraceTextWeight::Bold, TEXT("BOLD  (NAMES)  "),
+				FLinearColor(1.00f, 0.78f, 0.36f, 1.f))
 		];
 
 		return SNew(SOverlay)
@@ -228,9 +362,27 @@ namespace TraceTextConsoleFile
 			TEXT("[Text] At size 34: cap %.2f px, ascent %.2f px, line %.2f px, \"%s\" measures %.2f px."),
 			TraceText::CapHeight(34.f), TraceText::Ascent(34.f), TraceText::LineHeight(34.f),
 			SpecimenA, TraceText::MeasureWidth(SpecimenA, Probe));
+		// Per weight, and reporting BOTH the number that must match and the number that must not.
+		// Equal widths are what makes bold safe to swap in without reflowing; different cap heights
+		// are the measurable proof the two sheets are genuinely different ink. If these ever came out
+		// the other way round, the weight argument would not be reaching the layout pass.
+		for (int32 Index = 0; Index < static_cast<int32>(ETraceTextWeight::Count); ++Index)
+		{
+			const ETraceTextWeight Weight = static_cast<ETraceTextWeight>(Index);
+			TraceText::FStyle Row(34.f);
+			Row.Weight = Weight;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Text]   weight %-6s %s  \"%s\" measures %.2f px, cap %.2f px"),
+				TraceText::WeightName(Weight),
+				TraceText::IsWeightActive(Weight) ? TEXT("(own sheet)  ") : TEXT("(SUBSTITUTED)"),
+				SpecimenA, TraceText::MeasureWidth(SpecimenA, Row),
+				TraceText::CapHeight(34.f, Weight));
+		}
+
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[Text] Preview it with `Trace.Text.Preview`; force the fallback with ")
-			TEXT("`Trace.Text.Atlas 0` or -TraceNoFontAtlas."));
+			TEXT("[Text] Preview it with `Trace.Text.Preview` — it now draws both weights of \"%s\" ")
+			TEXT("through both renderers. Force the fallback with `Trace.Text.Atlas 0` or ")
+			TEXT("-TraceNoFontAtlas."), WeightSpecimen);
 
 		if (GEngine != nullptr)
 		{

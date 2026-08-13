@@ -37,9 +37,98 @@
 class AHUD;
 class APawn;
 class APlayerController;
+class FCanvas;
 class UCameraComponent;
+class UCanvas;
 class UFont;
 class UTraceGameUserSettings;
+
+/**
+ * SPEC v23 §A2 — DRAW A CANVAS MODAL IN FRONT OF SLATE, FOR THE LIFETIME OF THE SCOPE.
+ *
+ * THE DEFECT THIS EXISTS FOR. `AHUD`'s Canvas is composited into the viewport texture and every
+ * Slate widget in the game layer manager is then drawn ON TOP OF IT. So a Canvas modal — this
+ * overlay, and the title screen's JOIN prompt — could only be seen if the UMG title screen was
+ * first told to stand down, and the game fell back to the OLD Canvas title screen underneath for
+ * exactly as long as the modal was up. Measured twice at 1920x1080: opening SETTINGS handed 58.8%
+ * of the screen (everything outside this class's 880x972 panel) back to the pre-v20 renderer, with
+ * the retired stroked-vector wordmark legible through the scrim. Pressing one key changed the
+ * game's typeface, its wordmark and its background.
+ *
+ * WHY THIS AND NOT A UMG OPTIONS SCREEN. Rebuilding this panel — twenty-two Slider/Toggle/Choice/
+ * Binding rows, a drag-and-hit-tested track, the artist's three-slice chips and a live perf readout
+ * — as a widget tree is a rewrite of the whole file, and it would have to be done TWICE, because
+ * the JOIN prompt is a second Canvas modal in another file. It would also need a third Sofachrome
+ * text renderer for Slate, which spec v23 §0 explicitly forbids. Everything that was actually wrong
+ * here was COMPOSITING ORDER, so that is what this changes, and not one drawing call moves.
+ *
+ * HOW. The engine already maintains a second Canvas for precisely this, and says so in its own
+ * header — `AHUD::DebugCanvas`, "'Foreground' debug canvas, WILL DRAW IN FRONT OF SLATE UI". It is
+ * an ordinary `FCanvas` whose batches are painted by `SDebugCanvas`, which `SGameLayerManager` puts
+ * in `EGameLayerOrder::Debug` (500) — above `Player` (100), where `UUserWidget::AddToViewport`
+ * puts the UMG title screen. It is the surface `stat fps` and the console use to stay readable over
+ * UMG, it exists in every build configuration, and it is created per frame from the same viewport,
+ * with the same DPI scale as the scene canvas (`ShouldDPIScaleSceneCanvas` is true for both), so
+ * one coordinate space serves both and nothing needs re-laying out.
+ *
+ * This scope swaps the `FCanvas` INSIDE the game's `UCanvas` rather than swapping the `UCanvas` on
+ * the HUD, which is what makes it a four-line change instead of a sweep: `AHUD::DrawRect`,
+ * `DrawLine`, `DrawTexture` and `DrawText` all reach the FCanvas through that one pointer, and so
+ * does `TraceCanvasText` — which resolves the game canvas by name (see TraceCanvasText::GameCanvas)
+ * and would otherwise have kept typing the panel's Sofachrome onto the surface UNDER Slate while
+ * its plates drew above it. The engine performs the identical restore itself at the end of
+ * `UGameViewportClient::Draw` (`CanvasObject->Canvas = SceneCanvas`).
+ *
+ * ORDER IS PRESERVED WITHIN A SCOPE-SET. Everything elevated on one frame lands in one FCanvas in
+ * call order, so the JOIN prompt still draws under the failure banner, which still draws under this
+ * panel, exactly as they did when all three shared the scene canvas.
+ *
+ * FALLBACK, AND THE RED ARM. If the foreground canvas is missing (no viewport, mid-teardown), if
+ * the game canvas is not the one this frame is being drawn through, or if `Trace.UI.ModalOverSlate`
+ * is 0, IsElevated() is false and the caller draws exactly where it drew before — the modal is
+ * still on screen and still correct, the UMG title just stands down for it again. That is the red
+ * arm: one binary produces the defect and the fix, which is what spec v23 §"Red-arm discipline"
+ * requires of a change that can only be judged from a screenshot.
+ *
+ * THE HOST MUST ASK FIRST. A host that keeps a Slate screen up while the modal draws has to agree
+ * with the modal about which surface is in use, or it gets a title screen with an invisible modal
+ * on top of it. IsAvailable() answers the same question with the same inputs, so ATraceMenuHUD can
+ * decide whether to stand its widget down before anything is drawn. See DrawHUD.
+ */
+class TRACE_API FTraceOverSlateCanvas
+{
+public:
+	/**
+	 * @param InHUD    the HUD being drawn. Null is legal and simply declines to elevate.
+	 * @param InViewW  the host's own view width — `Canvas->SizeX` — used as an IDENTITY CHECK on the
+	 * @param InViewH  canvas found by name. A canvas whose size is not the size this frame is being
+	 *                 drawn at is not the canvas this frame is being drawn through, and swapping it
+	 *                 would put the modal's rectangles and its text on two different surfaces.
+	 */
+	FTraceOverSlateCanvas(AHUD* InHUD, float InViewW, float InViewH);
+	~FTraceOverSlateCanvas();
+
+	FTraceOverSlateCanvas(const FTraceOverSlateCanvas&) = delete;
+	FTraceOverSlateCanvas& operator=(const FTraceOverSlateCanvas&) = delete;
+
+	/** True when drawing inside this scope lands in front of Slate. */
+	bool IsElevated() const { return bElevated; }
+
+	/** The answer the constructor would give, without changing anything. */
+	static bool IsAvailable(const AHUD* InHUD, float InViewW, float InViewH);
+
+	/** One line naming the surface and the reason, for the log and for `Trace.UI.VerifyMenu`. */
+	static const FString& LastStatus();
+
+private:
+	/** The game's UCanvas, borrowed for the scope. Never held across a frame. */
+	UCanvas* Surface = nullptr;
+
+	/** Its own FCanvas, put back by the destructor. */
+	FCanvas* SavedCanvas = nullptr;
+
+	bool bElevated = false;
+};
 
 /**
  * The settings / pause overlay.
@@ -421,6 +510,10 @@ private:
 	// ---- Draw -----------------------------------------------------------------------------------
 
 	void Draw(AHUD* HUD);
+
+	/** Says which surface the panel is drawing on, once per answer per process. See §A2. */
+	void LogSurfaceOnce(bool bElevated) const;
+
 	void DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected);
 	void DrawFrame(AHUD* HUD, float X, float Y, float W, float H);
 	void DrawCursor(AHUD* HUD);

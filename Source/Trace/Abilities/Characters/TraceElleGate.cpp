@@ -51,6 +51,31 @@ static TAutoConsoleVariable<int32> CVarElleSnapStepIn(
 	     "reported 'it doesn't work at all'. Never ship 0."),
 	ECVF_Cheat);
 
+// =================================================================================================
+// THE RED ARM FOR DEMO 20 ITEM 4 — "Elle's portal is invisible."
+//
+// It restores the exact shipped defect, which was ONE missing call: the ring component was given its
+// sixty instances and never given a MESH. UInstancedStaticMeshComponent accepts every AddInstance
+// without one and reports them all back, but UStaticMeshComponent::CreateSceneProxy returns nullptr
+// when GetStaticMesh() is null, so the component is never handed to the renderer at all. The gate
+// existed, replicated, paired, expired and teleported perfectly — and nobody could see it.
+//
+// That is also why the bug outlived Demo 17's dedicated "is it drawn?" harness: GetDrawnBeadCount()
+// returned the INSTANCE count, which was a healthy 60 either way, and Trace.Elle.SnapPressTest passed
+// "...and it is actually DRAWN on this machine (60 ring beads)" on every build the player was staring
+// at an empty floor on. The counter now asks whether there is a mesh as well, so this switch makes
+// that assertion — and nothing else in the file — go red.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarElleGateVisible(
+	TEXT("Trace.Elle.GateVisible"),
+	1,
+	TEXT("Dev/red arm for DEMO 20 item 4. 1 (default) = the ring component is given its bead mesh, so "
+	     "the gate is on screen. 0 = the instances are built exactly as before but the mesh is never "
+	     "set, which is precisely the shipped 'Elle's portal is invisible' bug: every rule still works "
+	     "and nothing is drawn. Never ship 0."),
+	ECVF_Cheat);
+
 namespace TraceElleGateFile
 {
 	/** Beads per ring. Twenty reads as a ring without being a mesh budget — the Ripple's number. */
@@ -72,23 +97,64 @@ namespace TraceElleGateFile
 	/** Height of the topmost ring above the mouth, uu. Roughly a standing pawn. */
 	constexpr float ColumnHeightUU = 170.f;
 
-	/** Emissive strength for M_TraceNeon. Above 1 so it clears the bloom threshold, like the arena. */
-	constexpr float RingGlow = 3.5f;
+	/**
+	 * Emissive strength for M_TraceNeon.
+	 *
+	 * *** 1.0, NOT THE 3.5 THE REST OF THIS PROJECT USES, AND THE REASON IS THE ASKED-FOR COLOUR. ***
+	 *
+	 * M_TraceNeon's emissive is Colour x Glow, and the arena is dark enough that auto-exposure lifts
+	 * whatever comes out of that. At 3.5 a purple's RED and BLUE channels both clip and the tonemapper
+	 * hands back a white core with a PINK halo — which is not what was asked for. This was measured off
+	 * the frames rather than argued about, by reading the ring pixels' hue out of the captures:
+	 *
+	 *   Glow 3.5  ->  hue clusters at 282 deg and 301 deg   (v23elle_green_portal_glow3.5.png) — pink
+	 *   Glow 1.4  ->  282 / 290 deg, mean lightness 0.79    — purple, washed out
+	 *   Glow 1.0  ->  280 / 290 deg, mean lightness 0.72    (v23elle_green_portal.png) — SHIPPED
+	 *
+	 * 280-290 deg is squarely purple; 300 is magenta. Lower still would keep saturating and start
+	 * losing the ring against the arena's own neon at range, which is the other half of the job.
+	 */
+	constexpr float RingGlow = 1.0f;
 
 	/**
-	 * The two mouth colours. §2 does not ask for them; a paired portal that does not say which end is
-	 * which is a portal you cannot use deliberately, and Rocco's Ripple already set the precedent
-	 * ("the starting ring in a different colour so it is obvious where to take it").
-	 *
-	 * These are file constants rather than settings properties on purpose: UTraceSettings belongs to
-	 * one agent this pass, Elle's eleven knobs are already on it, and a twelfth added from here would
-	 * be the merge conflict that loses somebody else's.
+	 * ...and what a LONE mouth glows at. Below 1 it cannot clear the bloom threshold, which is the
+	 * point: see the colour note below for why "is this a portal yet?" is answered in brightness.
 	 */
-	const FLinearColor FirstMouthColor(0.15f, 0.95f, 1.00f, 1.f);    // cyan
-	const FLinearColor SecondMouthColor(1.00f, 0.35f, 0.85f, 1.f);   // magenta
+	constexpr float UnpairedGlow = 0.6f;
 
-	/** A lone, unpaired gate is dimmer and whiter: it is not a portal yet and must not look like one. */
-	const FLinearColor UnpairedColor(0.70f, 0.75f, 0.80f, 1.f);
+	// =============================================================================================
+	// DEMO 20 ITEM 4 — "Make a circle placeholder portal, glowing purple."
+	//
+	// PURPLE IS THE ASK, so both mouths are purple; the cyan/magenta pair this shipped with is gone.
+	// What the colours still have to answer is WHICH TWO ARE PAIRED, and the two questions a player
+	// asks are put on DIFFERENT CHANNELS so bloom cannot swallow both at once:
+	//
+	//   "is this a portal yet?"  -> BRIGHTNESS. A lone mouth is dim, desaturated and does not bloom;
+	//                               a paired one blazes. The two blazing circles are the pair.
+	//   "which end am I at?"     -> HUE, inside the purple band. The first mouth is blue-violet, the
+	//                               second red-violet. Both read as purple at a glance; side by side
+	//                               they are plainly not the same mouth.
+	//
+	// *** THE PLACEHOLDER'S KNOWN LIMIT, STATED RATHER THAN DESIGNED AROUND. *** Two Elles with two
+	// live pairs would show four bright purple circles, and nothing here says which two belong
+	// together. Ranking pairs by hue would fix that and it is deliberately not done: the ask was a
+	// placeholder, and one Elle per team is the case the request is about.
+	//
+	// These are file constants rather than settings properties on purpose: UTraceSettings belongs to
+	// one agent this pass, Elle's eleven knobs are already on it, and a twelfth added from here would
+	// be the merge conflict that loses somebody else's.
+	// =============================================================================================
+
+	// BLUE MUST BEAT RED IN THE FINAL PIXEL OR IT IS NOT PURPLE, IT IS PINK, and GREEN must stay near
+	// zero or a clipped magenta turns white. These are multiplied by RingGlow (1.0) and then by the
+	// scene's auto-exposure, which is what does the clipping in a dark arena — so the ratio between
+	// the channels is the only thing under this file's control, and it is the thing that survives.
+	// Measured on the shipped frame: 280 deg for the first mouth, 290 deg for the second.
+	const FLinearColor FirstMouthColor(0.22f, 0.025f, 0.90f, 1.f);   // blue-violet — the FIRST mouth
+	const FLinearColor SecondMouthColor(0.35f, 0.025f, 0.90f, 1.f);  // red-violet — the SECOND mouth
+
+	/** A lone, unpaired gate is dimmer and greyer: it is not a portal yet and must not look like one. */
+	const FLinearColor UnpairedColor(0.26f, 0.16f, 0.36f, 1.f);
 
 	/**
 	 * Vertical lift applied to a teleport destination, uu.
@@ -485,7 +551,23 @@ bool ATraceElleGate::IsInsideMouth(const ATraceCharacter* Candidate) const
 
 int32 ATraceElleGate::GetDrawnBeadCount() const
 {
-	return (RingMesh != nullptr) ? RingMesh->GetInstanceCount() : 0;
+	// *** BUILT IS NOT DRAWN, AND THAT DISTINCTION IS THE WHOLE OF DEMO 20 ITEM 4. ***
+	//
+	// This used to return the raw instance count, and an InstancedStaticMeshComponent with NO MESH
+	// accepts every AddInstance and hands all sixty of them back. So the one number the whole project
+	// used to answer "can the player see the gate?" read 60 on a build where the component never got a
+	// scene proxy at all — and Trace.Elle.SnapPressTest duly reported "...and it is actually DRAWN on
+	// this machine (60 ring beads), so there is something on screen to walk into" while the user was
+	// looking at bare floor. A counter that cannot go red is the failure this project keeps paying for.
+	//
+	// Both halves are now required: instances AND a mesh for the renderer to draw them with. Under
+	// Trace.Elle.GateVisible 0 this returns 0 and that assertion fails, which is what makes the fix
+	// measurable rather than merely asserted.
+	if (RingMesh == nullptr || RingMesh->GetStaticMesh() == nullptr)
+	{
+		return 0;
+	}
+	return RingMesh->GetInstanceCount();
 }
 
 ETraceAbilityEffect ATraceElleGate::ClassifyEntry(const ATraceCharacter* Candidate) const
@@ -620,6 +702,19 @@ void ATraceElleGate::BuildRingsIfNeeded()
 	bRingsBuilt = true;
 	bBuiltAsPaired = bPairedNow;
 
+	// *** DEMO 20 ITEM 4: THE ONE LINE THAT MADE THE PORTAL INVISIBLE. ***
+	//
+	// Without a static mesh an InstancedStaticMeshComponent still accepts, stores and counts every
+	// instance below — it simply never gets a scene proxy (UStaticMeshComponent::CreateSceneProxy
+	// returns nullptr when GetStaticMesh() is null), so the renderer is never told the gate exists.
+	// Every other line of this function ran correctly on the build the user reported: the beads were
+	// placed, the colour was set, the log said "gate rings built". It is set BEFORE the instances are
+	// added, the order ATraceRippleActor::BuildRingsIfNeeded uses for the same bead-ring pattern.
+	if (CVarElleGateVisible.GetValueOnGameThread() != 0)
+	{
+		RingMesh->SetStaticMesh(BeadMesh);
+	}
+
 	const FLinearColor Color = !bPairedNow
 		? TraceElleGateFile::UnpairedColor
 		: (bSecondOfPair ? TraceElleGateFile::SecondMouthColor : TraceElleGateFile::FirstMouthColor);
@@ -644,7 +739,8 @@ void ATraceElleGate::BuildRingsIfNeeded()
 		// not bloom, and that is the cost of not having generated the content pack.
 		RingMID->SetVectorParameterValue(TEXT("Color"), Color);
 		RingMID->SetVectorParameterValue(TEXT("BaseColor"), Color);
-		RingMID->SetScalarParameterValue(TEXT("Glow"), TraceElleGateFile::RingGlow);
+		RingMID->SetScalarParameterValue(TEXT("Glow"),
+			bPairedNow ? TraceElleGateFile::RingGlow : TraceElleGateFile::UnpairedGlow);
 		RingMID->SetScalarParameterValue(TEXT("Roughness"), 0.9f);
 	}
 
@@ -665,9 +761,16 @@ void ATraceElleGate::BuildRingsIfNeeded()
 		AddRing(FVector(MouthLocation) + FVector(0.f, 0.f, ZOffset), RadiusUU);
 	}
 
-	UE_LOG(LogTraceGame, Verbose,
-		TEXT("[Elle] gate rings built: %d rings at radius %.0f uu, colour %s (paired=%d, second=%d)."),
-		TraceElleGateFile::RingCount, RadiusUU, *Color.ToString(), bPairedNow ? 1 : 0, bSecondOfPair ? 1 : 0);
+	// Display, not Verbose, and it says whether there is a MESH. "Rings built" was printed on every
+	// invisible build there has ever been, so the log line that was supposed to be the evidence was
+	// the same on the broken build as on the fixed one. Beads drawn is the honest number.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Elle] gate rings built: %d rings x %d beads at radius %.0f uu, colour %s, glow %.1f "
+		     "(paired=%d, second=%d) — mesh=%s, beads DRAWN=%d."),
+		TraceElleGateFile::RingCount, TraceElleGateFile::BeadsPerRing, RadiusUU, *Color.ToString(),
+		bPairedNow ? TraceElleGateFile::RingGlow : TraceElleGateFile::UnpairedGlow,
+		bPairedNow ? 1 : 0, bSecondOfPair ? 1 : 0,
+		*GetNameSafe(RingMesh->GetStaticMesh()), GetDrawnBeadCount());
 }
 
 void ATraceElleGate::AddRing(const FVector& Center, float Radius) const

@@ -116,6 +116,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Atlas Text")
 	float Tracking = 0.f;
 
+	/**
+	 * Which cut of Sofachrome. LIGHT unless you say otherwise — the owner wants the game light and
+	 * bold reserved for the character names on the select screen. Changing it moves no glyph: both
+	 * weights do NOT share advances (two different font files), so a label that flips weight
+	 * does change its desired size and its slot will re-arrange around it.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Atlas Text")
+	ETraceTextWeight Weight = ETraceTextWeight::Light;
+
 	/** Only meaningful in a slot bigger than the text; an auto-sized slot fits it exactly. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Atlas Text")
 	TEnumAsByte<EHorizontalAlignment> HorizontalAlignment = HAlign_Center;
@@ -131,6 +140,18 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")
 	void SetColor(const FLinearColor& InColor);
+
+	/** Bold is for the character names on the select screen; everything else stays Light. */
+	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")
+	void SetWeight(ETraceTextWeight InWeight);
+
+	/**
+	 * Sets the weight from a string — for a caller that carries one by NAME, out of a data asset,
+	 * a config row or a designer-facing field. "Light" / "Bold", case-insensitive; anything else
+	 * leaves the weight alone and warns, rather than silently picking one.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")
+	void SetWeightByName(const FString& InWeightName);
 
 	/** Width this widget would occupy right now, in local units. Correct in the fallback too. */
 	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")

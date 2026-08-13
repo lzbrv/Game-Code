@@ -19,6 +19,17 @@
 // X and Y mean what they mean in AHUD::DrawText — the top-left of the line box — unless Style says
 // otherwise, so swapping a DrawText call for this one does not move the caller's layout.
 //
+// ASKING FOR BOLD (spec v23 §A3). Everything here draws in the LIGHT cut unless the style says
+// otherwise, which is the owner's instruction. The character names on the select screen are the one
+// exception in the game:
+//
+//     TraceText::FStyle Style(NameSize, Color);
+//     Style.Weight = ETraceTextWeight::Bold;
+//     TraceCanvasText::Draw(HUD, Entry.Name, X, Y, Style);
+//
+// or, for the sugar overloads, DrawBold(...). Bold costs nothing in layout — both weights share
+// every advance width — so a caller can add that line without re-measuring anything.
+//
 // THE FALLBACK IS INSIDE, not the caller's problem: with the atlas off (missing, stale,
 // -TraceNoFontAtlas, or `Trace.Text.Atlas 0`) these functions typeset Lato through the same
 // FCanvasTextItem path the rest of the Canvas menus use, and MEASURE it in Lato too, so a centred
@@ -51,6 +62,17 @@ namespace TraceCanvasText
 
 	/** Centred on @p CenterX. Identical to setting Style.HAlign = Center. */
 	TRACE_API float DrawCentered(AHUD* HUD, const FString& Text, float CenterX, float Y,
+		float Size, const FLinearColor& Color);
+
+	/**
+	 * The same draw in the BOLD cut — Sofachrome as drawn, rather than the eroded light default.
+	 *
+	 * This exists for the character names on the select screen and is not meant to spread: the
+	 * owner asked for the game to be light and for those names to stay bold. Identical to setting
+	 * Style.Weight = ETraceTextWeight::Bold, and it occupies exactly the same width as the light
+	 * draw it replaces, so it can be swapped in without touching a layout.
+	 */
+	TRACE_API float DrawBold(AHUD* HUD, const FString& Text, float X, float Y,
 		float Size, const FLinearColor& Color);
 
 	/**

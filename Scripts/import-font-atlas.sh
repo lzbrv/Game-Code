@@ -4,12 +4,29 @@
 #
 # Puts SOFACHROME on screen. Runs the two halves of Scripts/import_font_atlas.py:
 #
-#   1. metrics  Content/Trace/UI/Fonts/Source/T_FontAtlas.json
+#   1. metrics  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold}.json
 #                 -> Source/Trace/UI/Text/TraceFontAtlasMetrics.h    (plain python)
-#   2. texture  Content/Trace/UI/Fonts/Source/T_FontAtlas.png
-#                 -> Content/Trace/UI/Fonts/T_FontAtlas.uasset       (inside the editor)
+#   2. texture  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold}.png
+#                 -> Content/Trace/UI/Fonts/T_FontAtlas{,Bold}.uasset  (inside the editor)
 #
-# YOU DO NOT NEED TO RUN THIS TO PLAY. Both outputs are committed, exactly like
+# ------------------------------------------------------------------------------
+# TWO WEIGHTS (spec v23 §A3)
+# ------------------------------------------------------------------------------
+# The owner asked for the game to be set in an extra-light cut, with the character
+# names on the selection screen left bold. Each weight comes from ITS OWN REAL
+# FONT FILE — synthesising one by eroding the other was tried twice and damaged
+# the letterforms both times, so --thin is 0 for both and must stay there:
+#
+#   T_FontAtlas      Sofachrome W05 ExtraLight.ttf   the DEFAULT for everything
+#   T_FontAtlasBold  Sofachrome Rg.otf               character NAMES only
+#
+# Both sheets go through this script together and land in ONE generated header as
+# a table of faces, because the runtime picks between them per draw. They must be
+# rasterised at the same --size: import_font_atlas.py refuses to emit the header
+# if their em, vertical metrics or charset ever disagree, since one layout pass
+# serves both weights.
+#
+# YOU DO NOT NEED TO RUN THIS TO PLAY. All outputs are committed, exactly like
 # the railgun's assets. Run it after re-running Scripts/generate_font_atlas.py,
 # then commit what changes under Content/Trace/UI/Fonts and Source/Trace/UI/Text.
 #
@@ -45,20 +62,27 @@ set -euo pipefail
 DO_EDITOR=1
 DO_HEADER=1
 DRY_RUN=0
+ONLY_WEIGHT=""
 
 usage() {
     cat <<EOF
 ${TRACE_PROJECT_NAME} import-font-atlas
 
 Regenerates Source/Trace/UI/Text/TraceFontAtlasMetrics.h and imports
-Content/Trace/UI/Fonts/T_FontAtlas from the sheet under .../Fonts/Source.
+Content/Trace/UI/Fonts/T_FontAtlas and T_FontAtlasBold — the light and bold
+weights — from the sheets under .../Fonts/Source.
 
 USAGE
   Scripts/import-font-atlas.sh [options]
 
 OPTIONS
       --header-only   Only regenerate the metrics header (no editor, instant)
-      --texture-only  Only import the texture (leave the header alone)
+      --texture-only  Only import the textures (leave the header alone)
+      --weight NAME   Import only this weight (Light | Bold). The header still
+                      describes every weight. Use it to add or refresh ONE sheet
+                      without rewriting an .uasset you have not locked — .uasset
+                      is lockable in .gitattributes, so it is read-only until
+                      Scripts/lock.sh says otherwise.
   -n, --dry-run       Print what would run; run nothing
   -h, --help          This text
 
@@ -67,8 +91,8 @@ AFTER RUNNING
   git status Content/Trace/UI/Fonts Source/Trace/UI/Text
 
 IN GAME
-  Trace.Text.Report            names the face that is actually drawing
-  Trace.Text.Preview           puts a specimen on screen through BOTH renderers
+  Trace.Text.Report            names the face and weights that are actually drawing
+  Trace.Text.Preview           specimen through BOTH renderers, in BOTH weights
   -TraceNoFontAtlas            forces the Lato fallback, on purpose
 EOF
 }
@@ -77,6 +101,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --header-only)  DO_EDITOR=0 ;;
         --texture-only) DO_HEADER=0 ;;
+        --weight)       shift; [ $# -gt 0 ] || trace_die "--weight needs a name (Light | Bold)"
+                        ONLY_WEIGHT="$1" ;;
         -n|--dry-run)   DRY_RUN=1 ;;
         -h|--help)      usage; exit 0 ;;
         *) trace_err "Unknown option: $1"; echo; usage; exit 2 ;;
@@ -87,26 +113,39 @@ done
 trace_require_uproject
 
 SRC_DIR="${TRACE_PROJECT_ROOT}/Content/Trace/UI/Fonts/Source"
-PNG="${SRC_DIR}/T_FontAtlas.png"
-JSON="${SRC_DIR}/T_FontAtlas.json"
 
-for F in "$PNG" "$JSON"; do
-    [ -f "$F" ] || trace_die "Missing ${F}
-Generate it first:  python3 Scripts/generate_font_atlas.py --preview
+# The weights and the REAL FONT FILE each one is rasterised from. Keep in step with
+# the WEIGHTS table in Scripts/import_font_atlas.py and ETraceTextWeight in
+# Source/Trace/UI/Text/TraceTextWeight.h.
+#
+# There is deliberately no --thin here. It used to say 4 for the light sheet, from
+# when the light cut was synthesised by eroding Regular; regenerating that way now
+# would put the damaged letterforms back (spec v23 §A3: "Do NOT use --thin").
+ATLASES=("T_FontAtlas" "T_FontAtlasBold")
+WEIGHT_NAMES=("Light" "Bold")
+FONT_FILES=("Sofachrome W05 ExtraLight.ttf" "Sofachrome Rg.otf")
+
+for I in "${!ATLASES[@]}"; do
+    NAME="${ATLASES[$I]}"
+    for F in "${SRC_DIR}/${NAME}.png" "${SRC_DIR}/${NAME}.json"; do
+        [ -f "$F" ] || trace_die "Missing ${F}
+Generate it first:  python3 Scripts/generate_font_atlas.py --name ${NAME} \\
+    --font \"Art/Fonts/${FONT_FILES[$I]}\" --preview
 That needs your own licensed Sofachrome at Art/Fonts/ — see docs/FONTS.md."
-done
+    done
 
-# An LFS pointer is a ~130-byte text file starting with 'version https://'. Handing
-# that to the importer produces a baffling 'not a valid image' instead of a useful error.
-if head -c 16 "$PNG" | grep -q '^version https'; then
-    trace_die "${PNG} is an unfetched Git LFS pointer, not the sheet. Run: git lfs pull"
-fi
+    # An LFS pointer is a ~130-byte text file starting with 'version https://'. Handing
+    # that to the importer produces a baffling 'not a valid image' instead of a useful error.
+    if head -c 16 "${SRC_DIR}/${NAME}.png" | grep -q '^version https'; then
+        trace_die "${SRC_DIR}/${NAME}.png is an unfetched Git LFS pointer, not the sheet. Run: git lfs pull"
+    fi
+done
 
 # ------------------------------------------------------------------------------
 # 1. Metrics -> generated header
 # ------------------------------------------------------------------------------
 if [ "$DO_HEADER" = "1" ]; then
-    trace_msg "Metrics  ${TRACE_C_BOLD}T_FontAtlas.json${TRACE_C_OFF} -> Source/Trace/UI/Text/TraceFontAtlasMetrics.h"
+    trace_msg "Metrics  ${TRACE_C_BOLD}${#ATLASES[@]} weight(s)${TRACE_C_OFF} -> Source/Trace/UI/Text/TraceFontAtlasMetrics.h"
     if [ "$DRY_RUN" = "1" ]; then
         trace_print_cmd python3 "${TRACE_SCRIPT_DIR}/import_font_atlas.py"
     else
@@ -143,7 +182,7 @@ ARGS=("$TRACE_UPROJECT"
       -stdout
       -FullStdOutLogOutput)
 
-trace_msg "Texture  ${TRACE_C_BOLD}T_FontAtlas.png${TRACE_C_OFF} -> /Game/Trace/UI/Fonts/T_FontAtlas"
+trace_msg "Textures ${TRACE_C_BOLD}${ATLASES[*]}${TRACE_C_OFF} -> /Game/Trace/UI/Fonts/"
 
 if [ "$DRY_RUN" = "1" ]; then
     trace_print_cmd "$CMD_BIN" "${ARGS[@]}"
@@ -154,6 +193,12 @@ fi
 # would need Pillow in the editor's interpreter (it does not have it) and would
 # silently downgrade the measured cap height to an estimate.
 export TRACE_SKIP_HEADER=1
+
+# Narrows step 2 only; the header above always describes every weight.
+if [ -n "$ONLY_WEIGHT" ]; then
+    export TRACE_FONT_ATLAS_WEIGHTS="$ONLY_WEIGHT"
+    trace_msg "--weight ${ONLY_WEIGHT}: only that sheet will be imported."
+fi
 
 # THE EXIT CODE OF THE COMMANDLET IS NOT THE RESULT OF THE RUN — it is non-zero if
 # ANY error was logged in the whole session, including engine warnings raised at
@@ -166,10 +211,14 @@ set -e
 # ------------------------------------------------------------------------------
 # 3. Verify what landed
 # ------------------------------------------------------------------------------
-EXPECTED=(
-    "Content/Trace/UI/Fonts/T_FontAtlas.uasset"
-    "Source/Trace/UI/Text/TraceFontAtlasMetrics.h"
-)
+EXPECTED=("Source/Trace/UI/Text/TraceFontAtlasMetrics.h")
+for I in "${!ATLASES[@]}"; do
+    # With --weight, the other sheets were deliberately not touched this run, so
+    # only the one that was asked for is evidence of anything.
+    if [ -z "$ONLY_WEIGHT" ] || [ "$ONLY_WEIGHT" = "${WEIGHT_NAMES[$I]}" ]; then
+        EXPECTED+=("Content/Trace/UI/Fonts/${ATLASES[$I]}.uasset")
+    fi
+done
 
 MISSING=0
 trace_msg "Verifying:"
@@ -189,5 +238,5 @@ if [ "$MISSING" != "0" ]; then
     exit 1
 fi
 
-trace_msg "Sofachrome is imported."
+trace_msg "Sofachrome is imported (${#ATLASES[@]} weights: ${ATLASES[*]})."
 trace_msg "Next: ./Scripts/build.sh, then in game: Trace.Text.Report / Trace.Text.Preview"

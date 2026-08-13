@@ -1201,6 +1201,25 @@ namespace TraceLilyVerifyFile
 		bool bFlew[2] = { false, false };
 	};
 
+	/**
+	 * HOW LONG THE HARNESS WAITS AFTER SWAPPING THE PLAYER TO LILY BEFORE IT PRESSES E — and the
+	 * reason it exists at all, found by the v23 integration pass.
+	 *
+	 * Both key harnesses reported "VERDICT: INVALID — the red arm did not reproduce the complaint",
+	 * twice in a row, with flying(red/green)=0/1: arm 1's E was thrown away, so she never took off
+	 * at all in the red arm, while arm 2's identical E three seconds later worked every time. That
+	 * is not the fix failing and it is not the bug being absent — it is the FIRST press racing the
+	 * character swap. MakePlayerIntoLily() rebuilds the ability component, and a press delivered
+	 * inside that same tick has nothing to activate.
+	 *
+	 * It only started showing up here because this pass killed twelve orphaned editors and the
+	 * machine got fast enough for one tick to be short. The earlier passes' green results were
+	 * bought by a loaded machine, which is not a thing to rely on.
+	 *
+	 * 0.75 s is several frames at any rate this project runs at and costs the run under a second.
+	 */
+	constexpr float KeyTestClaimSettleSeconds = 0.75f;
+
 	constexpr float KeyTestSettleSeconds = 0.40f;   // Zip live, and any fall from the previous arm arrested
 	constexpr float KeyTestHoldSeconds   = 1.00f;   // jump held
 	constexpr float KeyTestCoastSeconds  = 1.00f;   // nothing held — THE COMPLAINT
@@ -1386,6 +1405,9 @@ namespace TraceLilyVerifyFile
 
 					State->Lily = Claimed;
 					State->Phase = -1;
+					// See KeyTestClaimSettleSeconds: arm 1's E used to race the character swap and be
+					// dropped, which read out as "the red arm cannot reproduce the bug".
+					State->PhaseDeadline = Now + KeyTestClaimSettleSeconds;
 					return true;
 				}
 
@@ -1403,11 +1425,43 @@ namespace TraceLilyVerifyFile
 					return false;
 				}
 
+				// *** A PAUSE MID-RUN IS AN INVALID RUN, NOT A FAILING ONE. ***
+				//
+				// IsWorldReadyForKeyPresses() guards the START of the run and nothing guarded the
+				// middle, which cost this pass a full investigation: an editor that loses window
+				// focus takes an Escape, ATraceHUD raises the pause menu, the world pauses and
+				// ATracePlayerController drops every gameplay press on bGameInputSuppressed. The
+				// pawn then does not move at all, so the crouch phase measured +0 uu and the
+				// harness reported *** FAIL: 'pressing control doesn't make her come down' *** —
+				// the user's exact bug, from a frozen game.
+				//
+				// A frozen pawn and an ignored key are indistinguishable by displacement, so the
+				// only honest thing a harness can do is refuse to grade the run.
+				if (TickWorld->IsPaused())
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[LILYKEYS] VERDICT: INVALID — the world PAUSED mid-run (arm=%d phase=%d). The "
+						     "pause menu takes Escape and a window that loses focus can raise one; a paused "
+						     "pawn does not move, which reads exactly like 'the key did nothing'. Nothing is "
+						     "being claimed about the fix — re-run with the game window focused."),
+						State->Arm, State->Phase);
+					Arm->Set(1, ECVF_SetByConsole);
+					delete State;
+					return false;
+				}
+
 				const float ZNow = static_cast<float>(Pawn->GetActorLocation().Z);
 
 				// --- PHASE -1: arm, cast, and let the flight settle -------------------------------
 				if (State->Phase == -1)
 				{
+					// The claim settle. Only arm 1 ever waits here — arm 2 re-enters this phase with
+					// the deadline already behind it.
+					if (Now < State->PhaseDeadline)
+					{
+						return true;
+					}
+
 					Arm->Set(State->Arm, ECVF_SetByConsole);
 
 					if (UTraceAbilityComponent* Comp = TickLily->GetAbilityComponent())
@@ -1512,6 +1566,423 @@ namespace TraceLilyVerifyFile
 		     "the real input pipeline and judges the pawn's world Z. Proves 'she stops when I let go', 'crouch "
 		     "brings her down' and 'she climbs at half a walk'."),
 		FConsoleCommandDelegate::CreateStatic(&RunKeyTest));
+
+	// =============================================================================================
+	// Trace.Lily.TapTest — DEMO 20 ITEM 1, THE OWNER'S SENTENCE WORD FOR WORD
+	//
+	//     "PRESSING SPACE ONCE makes her CONTINUOUSLY move up EVEN AFTER I LET GO."
+	//
+	// Trace.Lily.KeyTest above holds jump for a full second and then watches one second of coast,
+	// and it passes. This one exists because neither of those numbers is the owner's. He said ONCE
+	// — a tap — and he said CONTINUOUSLY, which is a claim about a long time, not about one second.
+	//
+	// THE TWO THINGS THIS MEASURES THAT A ONE-SECOND HOLD AND A ONE-SECOND COAST CANNOT:
+	//
+	//   1. A TAP SHORTER THAN THE POLL. SampleClimbIntent() runs at 20 Hz, so a 100 ms tap is two
+	//      poll intervals: the press is caught by OnJumpPressed() immediately and the release by the
+	//      poll up to 50 ms later. A hold of a full second never exercises that seam at all — it
+	//      gives the poll twenty chances to see the key down and twenty to see it up.
+	//
+	//   2. A RESIDUAL CLIMB TOO SLOW TO SEE IN ONE SECOND. "Continuously" is the whole complaint,
+	//      and a drift of 30 uu/s hides inside KeyTest's ±100 uu tolerance while still carrying her
+	//      75 uu up over the rest of a flight. So the coast here is 2.5 s and the verdict is quoted
+	//      as a RATE, which is the only form of the number that can be compared against "climbing".
+	//
+	// Same two arms, same red-first discipline, same real input pipeline. RED (the latch) must show
+	// her still climbing 2.5 s after a 100 ms tap, or this harness has not reproduced the sentence
+	// it claims to be testing and says INVALID rather than PASS.
+	// =============================================================================================
+
+	struct FLilyTapTestState
+	{
+		int32 Arm = 0;              // 0 = RED (ZipHoldRelease 0), 1 = GREEN
+		int32 Phase = -2;
+		double PhaseDeadline = 0.0;
+		double ReadyGiveUpAt = 0.0;
+
+		TWeakObjectPtr<UTraceAbilitySetLily> Lily;
+		FString JumpKeyName;
+		FString CrouchKeyName;
+
+		float ZAtTap = 0.f;
+		float ZAfterTap = 0.f;
+		float ZAfterCoast = 0.f;
+
+		float Tapped[2]   = { 0.f, 0.f };   // uu moved during the tap itself
+		float Coast[2]    = { 0.f, 0.f };   // uu moved in the 2.5 s AFTER the key came up
+		float Crouched[2] = { 0.f, 0.f };   // uu moved while crouch was held
+		bool bRan[2]      = { false, false };
+		bool bFlew[2]     = { false, false };
+
+		// --- WHY THE CROUCH PHASE DID WHAT IT DID ------------------------------------------------
+		//
+		// A crouch phase that moves the pawn 0 uu has at least four different causes and the verdict
+		// line cannot tell them apart: the key never reached the movement component, the flight had
+		// already expired so nothing was driving her, she was stood on the floor where PhysWalking
+		// discards Z, or the descend branch was reached and produced nothing. These four samples,
+		// taken every tick of the crouch phase, separate all of them — and they are the difference
+		// between reporting a number and reporting a cause.
+		bool bCrouchEverHeld[2]   = { false, false };   // movement component saw the key as a LEVEL
+		bool bZipAliveAtCrouch[2] = { false, false };   // she was still flying while crouch was down
+		bool bGroundedAtCrouch[2] = { false, false };   // stood on the floor: PhysWalking eats Z
+		float MinVelZAtCrouch[2]  = { 0.f, 0.f };       // the most negative Z velocity commanded
+	};
+
+	// 0.35 + 0.10 + 2.50 + 0.80 = 3.75 s, comfortably inside the 5 s flight, so nothing here is
+	// measured against a Zip that has already expired. THAT IS LOAD-BEARING: a coast that outlived
+	// the flight would show her falling and would read as "the release works" for the wrong reason.
+	constexpr float TapTestSettleSeconds = 0.35f;
+	constexpr float TapTestTapSeconds    = 0.10f;   // ONE TAP — the owner's "once"
+	constexpr float TapTestCoastSeconds  = 2.50f;   // *** hold NOTHING and watch ***
+	constexpr float TapTestCrouchSeconds = 0.80f;
+
+	void FinishTapTest(FLilyTapTestState* State)
+	{
+		const TCHAR* const Tag = TEXT("LILYTAP");
+		const UTraceSettings& Settings = UTraceSettings::Get();
+
+		const float WalkSpeed    = FMath::Max(1.f, Settings.WalkSpeed);
+		const float ClimbSpeed   = WalkSpeed * FMath::Clamp(Settings.LilyZipClimbSpeedScale, 0.1f, 4.f);
+		const float DescendSpeed = WalkSpeed * FMath::Clamp(Settings.LilyZipDescendSpeedScale, 0.1f, 4.f);
+
+		// What a still-latched climb would carry her over the coast, and what a real descent is worth.
+		const float LatchedCoastClimb = ClimbSpeed * TapTestCoastSeconds;
+		const float ExpectedDescend   = DescendSpeed * TapTestCrouchSeconds;
+
+		for (int32 Index = 0; Index < 2; ++Index)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] arm=%-22s  TAP %s %.2fs: %+.0f uu  |  then NOTHING for %.1fs: %+.0f uu (%+.0f uu/s)  |  "
+				     "hold crouch %.1fs: %+.0f uu   (flying=%d)"),
+				Tag,
+				(Index == 1) ? TEXT("GREEN (the fix)") : TEXT("RED (shipped v21 bug)"),
+				*State->JumpKeyName, TapTestTapSeconds, State->Tapped[Index],
+				TapTestCoastSeconds, State->Coast[Index], State->Coast[Index] / TapTestCoastSeconds,
+				TapTestCrouchSeconds, State->Crouched[Index],
+				State->bFlew[Index] ? 1 : 0);
+
+			// The four causes, printed whether or not anything failed. A crouch phase that moved
+			// nothing is only diagnosable next to these.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s]     during that crouch: movement saw the key held=%d | still flying=%d | "
+				     "stood on the floor=%d | lowest commanded Z velocity %.0f uu/s"),
+				Tag,
+				State->bCrouchEverHeld[Index] ? 1 : 0,
+				State->bZipAliveAtCrouch[Index] ? 1 : 0,
+				State->bGroundedAtCrouch[Index] ? 1 : 0,
+				State->MinVelZAtCrouch[Index]);
+		}
+
+		// ---- RED MUST REPRODUCE THE OWNER'S SENTENCE ----------------------------------------------
+		// "Continuously move up even after I let go" is a coast that is still most of a full climb,
+		// and "control doesn't make her come down" is a crouch phase that does not descend.
+		const bool bRedKeptClimbing  = State->Coast[0] > LatchedCoastClimb * 0.4f;
+		const bool bRedIgnoredCrouch = State->Crouched[0] > -ExpectedDescend * 0.1f;
+
+		if (!State->bRan[0] || !State->bRan[1] || !State->bFlew[0] || !State->bFlew[1]
+			|| !bRedKeptClimbing || !bRedIgnoredCrouch)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — the red arm did not reproduce 'press once and she keeps going'. "
+				     "redRan=%d greenRan=%d flying(red/green)=%d/%d | after the tap she coasted %+.0f uu (the bug "
+				     "needs more than %+.0f) | on crouch she moved %+.0f uu (the bug needs it no lower than %+.0f)."),
+				Tag, State->bRan[0] ? 1 : 0, State->bRan[1] ? 1 : 0,
+				State->bFlew[0] ? 1 : 0, State->bFlew[1] ? 1 : 0,
+				State->Coast[0], LatchedCoastClimb * 0.4f,
+				State->Crouched[0], -ExpectedDescend * 0.1f);
+			return;
+		}
+
+		int32 Failed = 0;
+
+		// (1) A TAP STILL DOES SOMETHING. The fix must not have cost her the key: a press that the
+		//     poll never sees would leave her hovering, which is a different bug wearing the same
+		//     verdict. She should rise for the tap plus at most one 50 ms poll interval of overshoot.
+		const float TapFloor = ClimbSpeed * TapTestTapSeconds * 0.5f;
+		if (State->Tapped[1] < TapFloor)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: a %.2fs tap of %s moved her only %+.0f uu (expected at least %+.0f). The press "
+				     "is no longer reaching the climb — the release fix must not eat the press."),
+				Tag, TapTestTapSeconds, *State->JumpKeyName, State->Tapped[1], TapFloor);
+		}
+
+		// (2) *** THE SENTENCE. *** "Continuously move up even after I let go."
+		//     10% of a latched climb over 2.5 s — 40 uu/s against a 400 uu/s climb. Anything under
+		//     that is the 20 Hz poll's overshoot and the half-tick gravity correction, not a climb.
+		const float CoastCeiling = LatchedCoastClimb * 0.1f;
+		if (State->Coast[1] > CoastCeiling)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: 'pressing space once makes her continuously move up even after I let go' — "
+				     "%.1fs after a %.2fs tap she was %+.0f uu higher (%+.0f uu/s), over the %+.0f uu the poll "
+				     "and the gravity correction can account for."),
+				Tag, TapTestCoastSeconds, TapTestTapSeconds, State->Coast[1],
+				State->Coast[1] / TapTestCoastSeconds, CoastCeiling);
+		}
+
+		// (3) *** THE OTHER HALF. *** "Pressing control doesn't make her come down."
+		if (State->Crouched[1] > -ExpectedDescend * 0.4f)
+		{
+			++Failed;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] FAIL: 'pressing control doesn't make her come down' — %.1fs of %s moved her %+.0f uu, "
+				     "expected about %+.0f (%.0f uu/s down)."),
+				Tag, TapTestCrouchSeconds, *State->CrouchKeyName, State->Crouched[1],
+				-ExpectedDescend, DescendSpeed);
+		}
+
+		if (Failed == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] VERDICT: PASS — ONE %.2fs tap of %s. WITH THE BUG she was still %+.0f uu/s upward "
+				     "%.1fs later and crouch moved her %+.0f uu (still up). FIXED she coasted %+.0f uu/s — a "
+				     "stop, not a climb — and %s took her DOWN %+.0f uu."),
+				Tag, TapTestTapSeconds, *State->JumpKeyName,
+				State->Coast[0] / TapTestCoastSeconds, TapTestCoastSeconds, State->Crouched[0],
+				State->Coast[1] / TapTestCoastSeconds, *State->CrouchKeyName, State->Crouched[1]);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[%s] VERDICT: *** FAIL *** — %d of 3 checks failed."), Tag, Failed);
+		}
+	}
+
+	void RunTapTest()
+	{
+		const TCHAR* const Tag = TEXT("LILYTAP");
+
+		IConsoleVariable* const Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Lily.ZipHoldRelease"));
+		if (Arm == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — Trace.Lily.ZipHoldRelease is not registered, so there is no red arm."),
+				Tag);
+			return;
+		}
+
+		FLilyTapTestState* State = new FLilyTapTestState();
+		State->ReadyGiveUpAt = FPlatformTime::Seconds() + 30.0;
+
+		const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+		const FKey JumpKey   = UserSettings.GetKey(ETraceInputAction::Jump);
+		const FKey CrouchKey = UserSettings.GetKey(ETraceInputAction::Crouch);
+		if (!JumpKey.IsValid() || !CrouchKey.IsValid())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — jump or crouch is UNBOUND (jump='%s', crouch='%s')."),
+				Tag, *JumpKey.ToString(), *CrouchKey.ToString());
+			delete State;
+			return;
+		}
+		State->JumpKeyName   = JumpKey.ToString();
+		State->CrouchKeyName = CrouchKey.ToString();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] armed. Two arms, RED (the shipped bug) first. Per arm: E, ONE %.2fs tap of %s, then "
+			     "%.1fs holding NOTHING, then %.1fs of %s — judged by the pawn's world Z."),
+			Tag, TapTestTapSeconds, *State->JumpKeyName, TapTestCoastSeconds,
+			TapTestCrouchSeconds, *State->CrouchKeyName);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, Arm](float /*Delta*/) -> bool
+			{
+				const double Now = FPlatformTime::Seconds();
+
+				if (State->Phase == -2)
+				{
+					UWorld* WaitWorld = FindLocalKeyboardWorld();
+					if (!IsWorldReadyForKeyPresses(WaitWorld))
+					{
+						if (Now > State->ReadyGiveUpAt)
+						{
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[LILYTAP] VERDICT: INVALID — 30s went by with no unpaused match and a local "
+								     "pawn. The select screen pauses the world and eats the E."));
+							delete State;
+							return false;
+						}
+						return true;
+					}
+
+					FString Why;
+					UTraceAbilitySetLily* Claimed = MakePlayerIntoLily(WaitWorld, Why);
+					if (Claimed == nullptr || Claimed->GetCharacter() == nullptr)
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[LILYTAP] VERDICT: INVALID — %s."),
+							(Claimed == nullptr) ? *Why : TEXT("Lily has no pawn"));
+						delete State;
+						return false;
+					}
+
+					State->Lily = Claimed;
+					State->Phase = -1;
+					// Same claim settle as Trace.Lily.KeyTest — see KeyTestClaimSettleSeconds. Arm 1's
+					// E was racing the character swap and being dropped, so the red arm never flew.
+					State->PhaseDeadline = Now + KeyTestClaimSettleSeconds;
+					return true;
+				}
+
+				UTraceAbilitySetLily* TickLily = State->Lily.Get();
+				ATraceCharacter* Pawn = (TickLily != nullptr) ? TickLily->GetCharacter() : nullptr;
+				UWorld* TickWorld = (Pawn != nullptr) ? Pawn->GetWorld() : nullptr;
+
+				if (TickLily == nullptr || Pawn == nullptr || TickWorld == nullptr || !Pawn->IsAlive())
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[LILYTAP] VERDICT: INVALID — Lily's pawn went away mid-test."));
+					Arm->Set(1, ECVF_SetByConsole);
+					delete State;
+					return false;
+				}
+
+				// A pause mid-run freezes the pawn, and a frozen pawn is indistinguishable from an
+				// ignored key by displacement alone. See the same guard in RunKeyTest for the run
+				// that made this necessary.
+				if (TickWorld->IsPaused())
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[LILYTAP] VERDICT: INVALID — the world PAUSED mid-run (arm=%d phase=%d). A paused "
+						     "pawn does not move, which reads exactly like 'the key did nothing'. Re-run with "
+						     "the game window focused."),
+						State->Arm, State->Phase);
+					Arm->Set(1, ECVF_SetByConsole);
+					delete State;
+					return false;
+				}
+
+				const float ZNow = static_cast<float>(Pawn->GetActorLocation().Z);
+
+				// --- PHASE -1: arm, cast, settle ---------------------------------------------------
+				if (State->Phase == -1)
+				{
+					// The claim settle. Only arm 1 ever waits here.
+					if (Now < State->PhaseDeadline)
+					{
+						return true;
+					}
+
+					Arm->Set(State->Arm, ECVF_SetByConsole);
+
+					if (UTraceAbilityComponent* Comp = TickLily->GetAbilityComponent())
+					{
+						Comp->OnHalfTime();   // clears the E cooldown so arm 2 can cast
+					}
+
+					GEngine->Exec(TickWorld, TEXT("Trace.SimInput E 0.05"));
+
+					State->Phase = 0;
+					State->PhaseDeadline = Now + TapTestSettleSeconds;
+					return true;
+				}
+
+				// --- PHASE 0: settle, then ONE TAP -------------------------------------------------
+				if (State->Phase == 0)
+				{
+					if (Now < State->PhaseDeadline)
+					{
+						if (TickLily->IsZipping())
+						{
+							State->bFlew[State->Arm] = true;
+						}
+						return true;
+					}
+
+					State->ZAtTap = ZNow;
+					GEngine->Exec(TickWorld, *FString::Printf(TEXT("Trace.SimInput %s %.2f"),
+						*State->JumpKeyName, TapTestTapSeconds));
+
+					State->Phase = 1;
+					State->PhaseDeadline = Now + TapTestTapSeconds;
+					return true;
+				}
+
+				// --- PHASE 1: the key is up. HOLD NOTHING. *** THE OWNER'S SENTENCE *** ------------
+				if (State->Phase == 1)
+				{
+					if (Now < State->PhaseDeadline)
+					{
+						return true;
+					}
+
+					State->ZAfterTap = ZNow;
+					State->Tapped[State->Arm] = State->ZAfterTap - State->ZAtTap;
+
+					State->Phase = 2;
+					State->PhaseDeadline = Now + TapTestCoastSeconds;
+					return true;
+				}
+
+				// --- PHASE 2: HOLD CROUCH ----------------------------------------------------------
+				if (State->Phase == 2)
+				{
+					if (Now < State->PhaseDeadline)
+					{
+						return true;
+					}
+
+					State->ZAfterCoast = ZNow;
+					State->Coast[State->Arm] = State->ZAfterCoast - State->ZAfterTap;
+
+					GEngine->Exec(TickWorld, *FString::Printf(TEXT("Trace.SimInput %s %.2f"),
+						*State->CrouchKeyName, TapTestCrouchSeconds));
+
+					State->Phase = 3;
+					State->PhaseDeadline = Now + TapTestCrouchSeconds;
+					return true;
+				}
+
+				// --- PHASE 3: crouch is down. SAMPLE THE CAUSE, not just the displacement. --------
+				if (Now < State->PhaseDeadline)
+				{
+					if (const UTraceCharacterMovementComponent* CrouchMove = TickLily->GetMovement())
+					{
+						if (CrouchMove->IsCrouchHeld())
+						{
+							State->bCrouchEverHeld[State->Arm] = true;
+						}
+						if (CrouchMove->IsMovingOnGround())
+						{
+							State->bGroundedAtCrouch[State->Arm] = true;
+						}
+						State->MinVelZAtCrouch[State->Arm] =
+							FMath::Min(State->MinVelZAtCrouch[State->Arm], static_cast<float>(CrouchMove->Velocity.Z));
+					}
+					if (TickLily->IsZipping())
+					{
+						State->bZipAliveAtCrouch[State->Arm] = true;
+					}
+					return true;
+				}
+
+				State->Crouched[State->Arm] = ZNow - State->ZAfterCoast;
+				State->bRan[State->Arm] = true;
+
+				if (State->Arm == 0)
+				{
+					State->Arm = 1;
+					State->Phase = -1;
+					return true;
+				}
+
+				Arm->Set(1, ECVF_SetByConsole);
+				TickLily->OnHalfTime();
+				FinishTapTest(State);
+				delete State;
+				return false;
+			}),
+			0.f);
+	}
+
+	FAutoConsoleCommand CmdTapTest(
+		TEXT("Trace.Lily.TapTest"),
+		TEXT("DEMO 20 item 1, the owner's sentence word for word: ONE 0.10s tap of jump, then 2.5s holding "
+		     "NOTHING, then crouch. Two arms, RED first. Where Trace.Lily.KeyTest holds the key for a second, "
+		     "this one presses it ONCE and quotes the coast as a RATE, because 'continuously' is a claim about "
+		     "a rate and not about one second."),
+		FConsoleCommandDelegate::CreateStatic(&RunTapTest));
 
 	// =============================================================================================
 	// Trace.Lily.DashTest — DEMO 19 ITEM 8, MEASURED ON THE POOL THE HUD DRAWS

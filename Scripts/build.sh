@@ -206,12 +206,51 @@ else
 fi
 
 START="$(date +%s)"
-trace_run "$BUILD_SH" "${ARGS[@]}"
+
+# ------------------------------------------------------------------------------
+# EPIC'S EXIT CODE IS NOT ENOUGH ON ITS OWN.
+#
+# Observed on 2026-08-13: UnrealBuildTool died with "ERROR: Segmentation fault"
+# and a 19-frame libcoreclr callstack, ran ZERO compile actions, never printed a
+# "Result:" line at all -- and Build.sh still returned 0, so this script printed
+# "Success" and exited 0. The stale-metadata guard did not catch it either,
+# because the PREVIOUS run's dylib was still on disk under the expected name.
+# That is exactly the run-the-old-binary trap this file's own comments say has
+# cost the project real time twice already.
+#
+# So: keep the exit code as one signal, and require UBT to have actually said it
+# succeeded as another. Output is tee'd rather than captured so the build still
+# streams live.
+# ------------------------------------------------------------------------------
+BUILD_LOG="$(mktemp -t trace-build)"
+set +e
+trace_run "$BUILD_SH" "${ARGS[@]}" 2>&1 | tee "$BUILD_LOG"
+BUILD_STATUS=${PIPESTATUS[0]}
+set -e
 ELAPSED=$(( $(date +%s) - START ))
 
 if [ "$TRACE_DRY_RUN" = "1" ]; then
+    rm -f "$BUILD_LOG"
     exit 0
 fi
+
+if [ "$BUILD_STATUS" != "0" ]; then
+    trace_err "Build failed (exit ${BUILD_STATUS}). See the output above."
+    rm -f "$BUILD_LOG"
+    exit "$BUILD_STATUS"
+fi
+
+# "Result: Succeeded" is UBT's own verdict. Its absence on a zero exit means UBT
+# never got as far as having one -- a crash, a killed process, a segfault.
+if ! grep -q "Result: Succeeded" "$BUILD_LOG"; then
+    trace_err "UnrealBuildTool exited 0 but never printed 'Result: Succeeded'."
+    trace_err "That means it did not finish -- typically a crash or a segfault -- and the"
+    trace_err "binary on disk is the PREVIOUS build. Do not trust anything you run now."
+    grep -nE "Segmentation fault|ERROR:|Fatal|Unhandled exception" "$BUILD_LOG" | head -5 >&2 || true
+    rm -f "$BUILD_LOG"
+    exit 1
+fi
+rm -f "$BUILD_LOG"
 
 trace_msg "Success in ${ELAPSED}s."
 
@@ -230,8 +269,13 @@ trace_msg "Success in ${ELAPSED}s."
 # warning: it is about the gap between the two, not about tidy working trees.
 # ------------------------------------------------------------------------------
 if command -v git >/dev/null 2>&1 && git -C "$TRACE_PROJECT_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    # `|| true` is load-bearing. Under `set -o pipefail` the pipeline takes grep's exit status,
+    # and grep exits 1 when it filters EVERYTHING out — i.e. exactly when Source/ and Config/ are
+    # CLEAN. `set -e` then killed build.sh here, after it had already printed "Success", so the
+    # exit code was inverted: dirty tree = 0, clean tree = 1. Found by the v23 §A4 agent; the
+    # spec's claim that "exit code IS trustworthy" was false in precisely this case.
     DIRTY_SOURCE="$(git -C "$TRACE_PROJECT_ROOT" status --porcelain -- Source Config 2>/dev/null \
-        | grep -vE '^\?\?' | wc -l | tr -d ' ')"
+        | { grep -vE '^\?\?' || true; } | wc -l | tr -d ' ')"
     if [ "${DIRTY_SOURCE:-0}" != "0" ]; then
         trace_warn "This build included ${DIRTY_SOURCE} uncommitted change(s) under Source/ or Config/."
         trace_warn "It therefore proves nothing about what is on the branch. Before you push, commit"
@@ -262,11 +306,17 @@ trace_check_module_metadata() {
     local Modules="${BinDir}/UnrealEditor.modules"
     [ -f "$Modules" ] || return 0
 
+    # The hot-reload SUFFIX IS OPTIONAL. A clean build links the unnumbered
+    # libUnrealEditor-Trace.dylib; only an in-editor hot reload produces -0042. Globbing for the
+    # numbered form ALONE — which this guard did until the v23 integration pass — makes $Newest
+    # empty on every clean build, so the whole check returned early and proved nothing. Match both
+    # spellings so the guard is live on the layout this project actually has.
     local Newest Named
-    Newest="$(ls -t "${BinDir}"/libUnrealEditor-${TRACE_PROJECT_NAME}-*.dylib 2>/dev/null | head -1)"
+    Newest="$(ls -t "${BinDir}"/libUnrealEditor-${TRACE_PROJECT_NAME}-[0-9]*.dylib \
+                     "${BinDir}"/libUnrealEditor-${TRACE_PROJECT_NAME}.dylib 2>/dev/null | head -1)"
     [ -n "$Newest" ] || return 0
     Newest="$(basename "$Newest")"
-    Named="$(tr ',' '\n' < "$Modules" | grep -o "libUnrealEditor-${TRACE_PROJECT_NAME}-[0-9]*\.dylib" | head -1)"
+    Named="$(tr ',' '\n' < "$Modules" | grep -Eo "libUnrealEditor-${TRACE_PROJECT_NAME}(-[0-9]+)?\.dylib" | head -1)"
     [ -n "$Named" ] || return 0
 
     [ "$Named" = "$Newest" ] && return 0

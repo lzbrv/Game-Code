@@ -3,7 +3,9 @@
 #include "UI/Widgets/Menu/TraceTitleMenuWidget.h"
 
 #include "Blueprint/SlateBlueprintLibrary.h"
+#include "Blueprint/WidgetTree.h"
 #include "Components/Border.h"
+#include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Components/Image.h"
 #include "Components/TextBlock.h"
@@ -13,6 +15,7 @@
 #include "Trace.h"   // LogTraceGame
 #include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
+#include "UI/Widgets/Menu/TraceMenuGridWidget.h"
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
 
 // Named after the file, not anonymous: UBT concatenates .cpp files for the unity build and two
@@ -236,6 +239,115 @@ void UTraceTitleMenuWidget::NativeOnInitialized()
 	// Once, here rather than in ApplyView: it reads a texture and builds another one, and the answer
 	// cannot change while the game is running. See the header for why it is done in code at all.
 	LiftWordmarkFromSprite();
+
+	// Spec v23 §A1. Here rather than in ApplyView because NativeOnInitialized runs BEFORE the Slate
+	// tree is built (UUserWidget::Initialize duplicates the tree and binds the widgets, then calls
+	// this; RebuildWidget happens later, on AddToViewport). Adding the child now means the canvas is
+	// arranged once, with the grid already in it, instead of being torn down and re-arranged on the
+	// first frame the title screen is visible.
+	InstallGridBackground();
+}
+
+void UTraceTitleMenuWidget::InstallGridBackground()
+{
+	if (GridFloor != nullptr)
+	{
+		return;
+	}
+
+	if (Backdrop == nullptr || WidgetTree == nullptr)
+	{
+		return;
+	}
+
+	// The grid's parent is BACKDROP'S parent, resolved from the tree rather than assumed to be
+	// "RootCanvas": the one relationship that has to hold is "directly above the black fill", and
+	// asking the black fill where it lives is the only way to state that without naming a widget
+	// this class has no BindWidget contract with.
+	UCanvasPanel* RootCanvas = Cast<UCanvasPanel>(Backdrop->GetParent());
+	UCanvasPanelSlot* BackdropSlot = Cast<UCanvasPanelSlot>(Backdrop->Slot);
+	if (RootCanvas == nullptr || BackdropSlot == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[MenuGrid] Backdrop is not on a canvas panel, so there is no z-order this widget can ")
+			TEXT("prove it is below. The grid is NOT installed; the title screen draws on flat black, ")
+			TEXT("exactly as it did before spec v23."));
+		return;
+	}
+
+	UTraceMenuGrid* Grid = WidgetTree->ConstructWidget<UTraceMenuGrid>(UTraceMenuGrid::StaticClass(), TEXT("GridFloor"));
+	if (Grid == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[MenuGrid] Could not construct the grid widget; drawing flat black."));
+		return;
+	}
+
+	UCanvasPanelSlot* GridSlot = RootCanvas->AddChildToCanvas(Grid);
+	if (GridSlot == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[MenuGrid] Could not slot the grid widget; drawing flat black."));
+		return;
+	}
+
+	// Full bleed. Anchors rather than a size, so this is right at every window size and every DPI
+	// scale without the widget knowing either — the same rule the rest of this class works under.
+	GridSlot->SetAnchors(FAnchors(0.f, 0.f, 1.f, 1.f));
+	GridSlot->SetOffsets(FMargin(0.f, 0.f, 0.f, 0.f));
+	GridSlot->SetAlignment(FVector2D::ZeroVector);
+
+	// *** THE FOUR LINES THAT KEEP THE GRID BEHIND EVERY WORD ON THIS SCREEN. ***
+	//
+	// The obvious version of this — give the grid the Backdrop's own z-order and let it sort in
+	// afterwards — was written first and IS NOT SAFE, for a reason that is only visible in the engine
+	// source. Two ways equal z-orders lose their order:
+	//
+	//   1. SConstraintCanvas::Construct's sort comparator breaks a z-order TIE on the slots' MEMORY
+	//      ADDRESSES (Widgets/Layout/SConstraintCanvas.cpp: "AZOrder == BZOrder ?
+	//      reinterpret_cast<UPTRINT>(&A) < reinterpret_cast<UPTRINT>(&B) : ..."), not on insertion
+	//      order;
+	//   2. with the project setting bExplicitCanvasChildZOrder ON, children sharing a z-order are
+	//      deliberately arranged into ONE Slate layer so the renderer can batch them, and their draw
+	//      order inside it stops being a layout property at all. It is off in this project today —
+	//      Config/ does not set it — which is exactly the kind of fact that changes without anyone
+	//      thinking about this file.
+	//
+	// A tie decided by an allocator is a background that draws over the menu on some launches and not
+	// others. So there are NO TIES: the grid takes one z-order below the lowest sibling it must stay
+	// behind, and the Backdrop is pushed one below THAT. Derived from the siblings rather than typed
+	// in, so re-running Scripts/generate-menu-widgets.py with different numbers cannot break it.
+	int32 LowestSibling = MAX_int32;
+	for (int32 Index = 0; Index < RootCanvas->GetChildrenCount(); ++Index)
+	{
+		// Non-const on purpose: Cast<> through a const UWidget's TObjectPtr member is one of the
+		// resolutions clang takes and MSVC has been fussier about, and this file cannot be compiled
+		// here for Windows (spec v23 Track C). Nothing below writes through it.
+		UWidget* Sibling = RootCanvas->GetChildAt(Index);
+		if (Sibling == nullptr || Sibling == Grid || Sibling == Backdrop)
+		{
+			continue;
+		}
+		if (UCanvasPanelSlot* SiblingSlot = Cast<UCanvasPanelSlot>(Sibling->Slot))
+		{
+			LowestSibling = FMath::Min(LowestSibling, SiblingSlot->GetZOrder());
+		}
+	}
+	if (LowestSibling == MAX_int32)
+	{
+		// Nothing but the Backdrop on this canvas. Cannot happen with the generated asset; if it ever
+		// does, the grid still has to end up above the black fill and below whatever arrives later.
+		LowestSibling = BackdropSlot->GetZOrder() + 2;
+	}
+
+	const int32 GridZ = LowestSibling - 1;
+	GridSlot->SetZOrder(GridZ);
+	BackdropSlot->SetZOrder(GridZ - 1);
+	GridFloor = Grid;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[MenuGrid] Installed: Backdrop z=%d < grid z=%d < lowest other sibling z=%d, %d sibling(s) ")
+		TEXT("on the root canvas. %s"),
+		BackdropSlot->GetZOrder(), GridZ, LowestSibling, RootCanvas->GetChildrenCount(),
+		*UTraceMenuGrid::Describe());
 }
 
 void UTraceTitleMenuWidget::InstallAtlasLabels()
@@ -292,6 +404,27 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 	// spec v20 §0.1-0.2 are both authored rects, and this is the file that can enforce them and be
 	// photographed doing it. See ComposeTitleBlock().
 	ComposeTitleBlock();
+
+	// Spec v23 §A1. THE SCROLL LIVES HERE AND NOWHERE ELSE: the grid owns no clock, exactly as
+	// UTraceMenuCanvasArt owns none, so the only thing that can make it move is this line running
+	// every frame off ATraceMenuHUD's own World time — the same clock DrawGridFloor() scrolls the
+	// Canvas grid on. If a future refactor stops calling ApplyView per frame, the grid freezes, and a
+	// frozen grid is a FAILED grid. Two frames a second apart must not be identical.
+	if (GridFloor != nullptr)
+	{
+		// Re-asked every frame so `Trace.UI.MenuGrid 0` typed into the console takes effect without a
+		// restart. Guarded because SetVisibility invalidates layout on the whole canvas.
+		const ESlateVisibility Wanted = UTraceMenuGrid::WantsGrid()
+			? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed;
+		if (GridFloor->GetVisibility() != Wanted)
+		{
+			GridFloor->SetVisibility(Wanted);
+		}
+		if (Wanted != ESlateVisibility::Collapsed)
+		{
+			GridFloor->SetAnimationTime(InView.Now);
+		}
+	}
 
 	if (MenuCursor != nullptr)
 	{

@@ -5042,18 +5042,33 @@ public:
 	//   ACTIVATED "only while carrying the core AND standing on the ground or the top of an object,
 	//             a blast that knocks nearby enemies away"
 	//
-	// *** THREE OF THESE FIVE KNOBS ARE READ BY CODE THIS PASS DID NOT OWN. *** The dash scale, the
-	// mantle pair and the throw-charge scale are surfaced through TraceAbilityTraits (see
-	// Abilities/TraceAbilityTypes.h) and are INERT until the one-line call sites named there exist in
-	// Movement/ and Gameplay/TraceCore.cpp. That is stated in the report, not hidden here: a knob
-	// nothing reads is worse than a missing knob, because it looks finished.
+	// *** WHICH OF THESE KNOBS IS ACTUALLY READ, AS OF DEMO 20. *** Say it here rather than in a
+	// report, because this comment is what the next person reads:
 	//
-	// NO ini LINES. These take their C++ defaults; nothing in Config/DefaultGame.ini pins them, so
-	// editing the numbers here is enough. (Contrast MaceSuspendCooldownSeconds, which the ini pins.)
+	//     MortimerDashDistanceScale    LIVE. UTraceCharacterMovementComponent::GetDashSpeed()
+	//                                  multiplies by TraceAbilityTraits::GetDashDistanceScale().
+	//     MortimerThrowChargeHoldScale LIVE. ATraceCore::GetThrowChargeScaleForHold() (x2 call sites).
+	//     MortimerDashCooldownScale    *** NOT LIVE. *** Needs one line in GetDashCooldown(); see the
+	//                                  knob's own comment for the exact patch.
+	//     bMortimerCanMantle           *** NOT LIVE. *** There is no mantle in the movement component
+	//     MortimerMantleGenerosity     at all — it was deleted in d2319b2 and never restored.
+	//
+	// Demo 18's version of this block claimed the dash scale and the throw cap were both inert. They
+	// were wired in the same pass and the comment was never corrected, which is how Demo 20 arrived
+	// with an integrator quoting "the dash is not live" as fact. If you wire one of the two remaining
+	// knobs, correct this list in the same edit.
+	//
+	// THE ini PINS THE TWO DEMO 20 MOVED. Config/DefaultGame.ini beats these initialisers, so
+	// MortimerDashDistanceScale and MortimerDashCooldownScale are written in BOTH places and must be
+	// changed in both. The other six are still header-only.
 	// ==========================================================================================
 
 	/**
-	 * MULTIPLIER ON DASH REACH. §3: "his dash is 75% shorter", so 0.25.
+	 * MULTIPLIER ON DASH REACH.
+	 *
+	 * *** DEMO 20 ITEM 2, VERBATIM: "Change mortimer's dash to be 40% of a normal one instead of
+	 * 25%". *** 0.25 -> 0.40. §3's original sentence was "his dash is 75% shorter"; the owner has
+	 * revised that to 60% shorter, and this is the whole of that half of the item.
 	 *
 	 * IT SCALES THE DASH'S SPEED, NOT ITS DURATION, and that is a decision worth stating. Reach is
 	 * DashSpeed x DashDuration (3300 x 0.18 = 594 uu), so either factor would shorten it — but the
@@ -5062,11 +5077,43 @@ public:
 	 * quarter as long would be a quarter as parryable. Scaling the speed leaves every timing in the
 	 * game where it is and moves only the distance, which is the sentence the doc actually wrote.
 	 *
-	 * 594 uu -> 149 uu. That is deliberately close to useless as an escape and still useful as a
-	 * repositioning step, which is the trade the mantle and the Core throw pay him back for.
+	 * 594 uu -> 238 uu, up from 149 uu. Still not an escape; now genuinely a repositioning step.
+	 *
+	 * THE CHARACTER CARD STILL SAYS "A QUARTER". Core/TraceCharacterRoster.cpp's Mortimer row reads
+	 * "HIS DASH COVERS ONLY A QUARTER OF THE NORMAL DISTANCE" and is now false. That file is outside
+	 * this pass's ownership; it is named in the report as a required follow-up.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Dash Reach Scale (0.25 = 75% shorter) [v19 §3]", ClampMin = "0.05", ClampMax = "2.0", UIMin = "0.1", UIMax = "1.0"))
-	float MortimerDashDistanceScale = 0.25f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Dash Reach Scale (0.40 = 60% shorter) [Demo 20 item 2]", ClampMin = "0.05", ClampMax = "2.0", UIMin = "0.1", UIMax = "1.0"))
+	float MortimerDashDistanceScale = 0.40f;
+
+	/**
+	 * MULTIPLIER ON HIS DASH COOLDOWN. Everybody else's is UTraceSettings::DashCooldown (3.5 s).
+	 *
+	 * *** DEMO 20 ITEM 2, VERBATIM: "but increase mortimer's dash cooldown by 25%". *** 1.25, i.e.
+	 * 3.5 s -> 4.375 s for him and 3.5 s for the other nine. Written as a MULTIPLIER and not as the
+	 * number 4.375 for the same reason LilyExtraDashCharges is an addend: a retune of the shared
+	 * DashCooldown must carry him with it instead of leaving him pinned to a stale absolute.
+	 *
+	 * *** THIS KNOB IS NOT LIVE YET, AND THAT IS SAID OUT LOUD RATHER THAN DISCOVERED. *** It is
+	 * surfaced through TraceAbilityTraits::GetDashCooldownScale() and Trace.Mortimer.Verify prints
+	 * NOT LIVE for it, but the one call site it needs is in Source/Trace/Movement/, which another
+	 * agent owns this pass. The entire change is:
+	 *
+	 *     float UTraceCharacterMovementComponent::GetDashCooldown() const
+	 *     {
+	 *         return FMath::Max(0.f, UTraceSettings::Get().DashCooldown
+	 *             * TraceAbilityTraits::GetDashCooldownScale(CharacterOwner));
+	 *     }
+	 *
+	 * The trait is 1.0 for every other character and for any pawn with no ability component, so that
+	 * line is arithmetically identity for everybody but Mortimer — the same shape GetDashSpeed()
+	 * already uses one function above it, and TraceAbilityTypes.h is already included there.
+	 *
+	 * GetDashRechargeWindow() is GetDashDuration() + GetDashCooldown(), so the HUD's dash meter
+	 * follows automatically and no second edit is needed for it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Dash Cooldown Scale (1.25 = 25% longer than everybody) [Demo 20 item 2]", ClampMin = "0.25", ClampMax = "4.0", UIMin = "1.0", UIMax = "2.0"))
+	float MortimerDashCooldownScale = 1.25f;
 
 	/**
 	 * HOW MANY TIMES LONGER HE MAY USEFULLY HOLD A CORE THROW. §3: "up to 2x as long as anyone else".
@@ -5179,6 +5226,46 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Cooldown (s) [v19 §3 ASSUMPTION: 20]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
 	float MortimerBlastCooldownSeconds = 20.f;
+
+	// --- QUAKE'S COSMETIC (Demo 20 item 3) --------------------------------------------------------
+	//
+	// DEMO 20, VERBATIM: "Mortimer's quake isn't working". IT WAS WORKING. It launched every enemy
+	// inside 600 uu and started its 20 s cooldown, and it did so with NO particle, NO Niagara, NO
+	// sound, NO camera shake and NO debug draw anywhere in TraceAbilitySetMortimer — so a press with
+	// nobody standing within 600 uu of him produced literally nothing on screen, and a press that was
+	// REFUSED (not carrying the Core, or airborne) produced nothing either, because
+	// UTraceAbilityComponent::TryActivate() discards the FText reason CanActivate() fills in.
+	//
+	// The three knobs below are the shockwave that makes a cast visible whether or not it hits
+	// anybody. They are cosmetic ONLY: ATraceMortimerQuakeWave has no collision, applies no effect
+	// and is never asked about by any rule. Nothing about the knockback moved.
+
+	/**
+	 * How long the shockwave ring takes to reach MortimerBlastRadiusUU and fade out, in seconds.
+	 *
+	 * 0.90 rather than the ~0.35 an impact effect usually gets. The ability is on a 20 s cooldown and
+	 * is a "get off me" the caster spends their whole aim on; it should read as an event, and a
+	 * third of a second at the far end of a 600 uu radius is a frame and a half of visible ring at
+	 * 60 Hz. It is also the window a screenshot has to land in for anybody to be able to VERIFY this,
+	 * which is exactly how the last three "it does nothing" reports went unanswered.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Shockwave Duration (s) [Demo 20 item 3]", ClampMin = "0.1", ClampMax = "5.0", UIMin = "0.3", UIMax = "2.0"))
+	float MortimerQuakeWaveSeconds = 0.90f;
+
+	/**
+	 * The shockwave's colour. Mortimer's card colour is slate (0.38, 0.52, 0.85); the ring is the
+	 * same hue pushed past 1.0 so it clears the bloom threshold the arena's neon uses.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Shockwave Colour [Demo 20 item 3]"))
+	FLinearColor MortimerQuakeWaveColor = FLinearColor(0.45f, 0.70f, 1.6f, 1.f);
+
+	/**
+	 * Thickness of the ring's beads, uu. The ring is drawn as a circle of overlapping cylinders — the
+	 * same construction as Rocco's Ripple rings, for the same reason: it needs no generated content
+	 * and degrades to /Engine/BasicShapes on an install that never ran Scripts/generate_content.py.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Shockwave Thickness (uu) [Demo 20 item 3]", ClampMin = "2.0", ClampMax = "80.0", UIMin = "8.0", UIMax = "40.0"))
+	float MortimerQuakeWaveThicknessUU = 22.f;
 
 	// ==========================================================================================
 	// LILY  (spec v19 §3, new — roster 8 -> 10)

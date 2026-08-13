@@ -341,12 +341,36 @@ namespace TraceAbilityTraits
 	 * Multiplier on DASH REACH for @p Actor — the dash's speed, so reach scales with it while the
 	 * dash's DURATION (and therefore the trace it leaves, and the parry window) is untouched.
 	 *
-	 * 1.0 for everybody but Mortimer, whose spec v19 §3 passive is "his dash is 75% SHORTER than
-	 * normal", i.e. 0.25 of the reach.
+	 * 1.0 for everybody but Mortimer. Spec v19 §3 said "his dash is 75% SHORTER than normal";
+	 * DEMO 20 ITEM 2 revised that to "40% of a normal one instead of 25%", so the value is 0.40.
 	 *
-	 * CALL SITE NEEDED: UTraceCharacterMovementComponent::GetDashSpeed().
+	 * CALL SITE: *** LIVE. *** UTraceCharacterMovementComponent::GetDashSpeed() multiplies by this.
 	 */
 	TRACE_API float GetDashDistanceScale(const AActor* Actor);
+
+	/**
+	 * Multiplier on @p Actor's DASH COOLDOWN — the gap between charges, not the dash itself.
+	 *
+	 * 1.0 for everybody but Mortimer. DEMO 20 ITEM 2: "increase mortimer's dash cooldown by 25%",
+	 * so 1.25 for him, against the shared UTraceSettings::DashCooldown of 3.5 s.
+	 *
+	 * *** CALL SITE NEEDED, AND IT DOES NOT EXIST YET. ***
+	 * UTraceCharacterMovementComponent::GetDashCooldown() must become
+	 *
+	 *     return FMath::Max(0.f, UTraceSettings::Get().DashCooldown
+	 *         * TraceAbilityTraits::GetDashCooldownScale(CharacterOwner));
+	 *
+	 * and nothing else changes: GetDashRechargeWindow() is defined as duration + cooldown, so the
+	 * HUD's dash meter follows on its own. Source/Trace/Movement/ is owned by another agent in the
+	 * pass that added this trait, which is the only reason the line is not already there.
+	 *
+	 * UNTIL IT IS, THIS FUNCTION IS READ BY NOBODY AND MORTIMER'S DASH RECHARGES LIKE EVERYBODY
+	 * ELSE'S. Trace.Mortimer.Verify says so on every run and Trace.Mortimer.DashTest measures the
+	 * shipped movement component rather than the knob, so it goes red on exactly this gap. Do not
+	 * delete either of those warnings without deleting this paragraph — a knob nothing reads that
+	 * nothing complains about is this project's single most repeated failure.
+	 */
+	TRACE_API float GetDashCooldownScale(const AActor* Actor);
 
 	/**
 	 * EXTRA dash charges @p Actor holds, on top of the pool everybody gets (BaseDashCharges, plus

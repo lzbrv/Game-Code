@@ -452,7 +452,17 @@ void ATraceHUD::DrawHUD()
 			FString::Printf(TEXT("TraceAutoShot_Pause_%s.png"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
 
 		UE_LOG(LogTraceGame, Display, TEXT("[AutoPause] Screenshot requested: %s"), *Path);
-		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/false, /*bAddFilenameSuffix=*/false);
+
+		// bShowUI MUST be true here, and this call site is the whole reason -TraceAutoPause was
+		// photographing an empty match. bShowUI=false excludes the entire Slate layer, and since
+		// spec v23 §A2 the pause menu draws on the engine's FOREGROUND canvas
+		// (FViewport::GetDebugCanvas(), composited by SGameLayerManager at EGameLayerOrder::Debug)
+		// so that it can sit ABOVE the UMG widgets. That surface is inside the Slate layer, so a
+		// UI-less capture is blind to exactly the thing this switch exists to photograph — measured
+		// as Saved/Screenshots/v23modal_07_match_pause_TraceAutoPause_is_blind_noUI.png, a match
+		// with no pause menu on it. TraceAutoShot.cpp made this same change for this same reason
+		// and documents it at length; this call site was missed.
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
 	}
 #endif
 
@@ -1522,7 +1532,40 @@ void ATraceHUD::DrawHealthAndDash()
 	const float HealthH = 26.f * UIScale;
 	const float RowH    = 10.f * UIScale;
 	const float RowGap  = 8.f * UIScale;
-	const float LabelW  = 58.f * UIScale;
+
+	// ---- The label gutter, MEASURED rather than assumed (spec v23 §A4) -------------------------
+	//
+	// This was a flat 58 px, and 58 px was sized for Lato. Sofachrome is a much wider face, so the
+	// moment §A4 moved these labels onto the atlas the number stopped being big enough: off the
+	// atlas's own advance table, "WEAPON" occupies 71-84 px across the range of point sizes
+	// FontSmall resolves to on this HUD, "THROW" 58-68 and "PARRY" 54-64.
+	//
+	// That matters because the meter is drawn AFTER the label and starts at Margin + LabelW, so a
+	// gutter that is too narrow does not overflow harmlessly — the meter's trough paints over the
+	// tail of the word. Converting the face without this would have traded a font bug for a
+	// legibility bug, which is the thing A1's own note warns about: "widths change, because the face
+	// is wider, and every consumer of a width on this HUD measures it rather than assuming it".
+	// This was the one consumer that did not.
+	//
+	// The floor keeps the authored 58 wherever it still fits, so nothing moves at sizes where the
+	// old number was already correct.
+	//
+	// NOT IN THIS LIST: the ability row's own "[KEY]", which shares this gutter but is built from
+	// the player's binding inside DrawAbilityRow. The default "[E]" needs ~18 px and every ordinary
+	// binding is comfortably inside the widest fixed label above. A deliberately long binding could
+	// still overrun it — left as it is rather than letting one pathological key shrink every meter
+	// in the stack.
+	float LabelW = 58.f * UIScale;
+	{
+		static const TCHAR* const GutterLabels[] = {
+			TEXT("WEAPON"), TEXT("THROW"), TEXT("PARRY"), TEXT("DASH"), TEXT("SLIDE")
+		};
+		for (const TCHAR* const GutterLabel : GutterLabels)
+		{
+			LabelW = FMath::Max(LabelW,
+				MeasureWidth(FString(GutterLabel), FontSmall, UIScale) + (8.f * UIScale));
+		}
+	}
 
 	const float HealthY = ViewH - Margin - HealthH;
 
@@ -4288,6 +4331,46 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 			Name += TEXT("  [CORE]");
 		}
 
+		// ---- THE NAME IS CLIPPED TO ITS COLUMN ----------------------------------------------
+		//
+		// Photographed at 1920x1080 during the v23 integration walk (v23integ_35_scoreboard.png):
+		// "GREGORYS-MACBOOK-PRO" printed straight through "ROCCO" and "BOT BLUE 3  [CORE]" through
+		// "SLIMEBALL". Two variable-length strings share this span — the name grows rightward from
+		// NameX and the character label grows LEFTWARD from CharX — and nothing was stopping them
+		// meeting. It went unnoticed while the scoreboard was set in Lato, which is about a third
+		// narrower than Sofachrome at the same point size; converting the HUD to the atlas is what
+		// made a long machine name reach the other column.
+		//
+		// The NAME is the half that gives, because it is the only one that can: MANNEQUIN and
+		// SLIMEBALL are roster data and truncating them would make the column unscannable, while a
+		// player name is the reader's own and is still recognisable from its first characters. Two
+		// dots rather than an ellipsis, because the atlas charset is printable ASCII.
+		//
+		// Measured per row rather than budgeted once: the character label differs per row, so the
+		// room a name has depends on who that player picked.
+		const FString CharacterLabel = bShowCharacters
+			? TraceCharacterRoster::NameFor(Member->GetSelectedCharacter())
+			: FString();
+
+		{
+			const float Gap = 14.f * UIScale;
+			const float CharW = bShowCharacters
+				? MeasureWidth(CharacterLabel, FontSmall, RowTextScale) : 0.f;
+			const float Room = (CharX - CharW - Gap) - NameX;
+
+			if (Room > 1.f && MeasureWidth(Name, FontSmall, RowTextScale) > Room)
+			{
+				// Walk back a character at a time. The strings are short and this runs only on the
+				// rows that actually overflow, so a binary search would be more code for no gain.
+				while (Name.Len() > 1
+					&& MeasureWidth(Name + TEXT(".."), FontSmall, RowTextScale) > Room)
+				{
+					Name.LeftChopInline(1, EAllowShrinking::No);
+				}
+				Name += TEXT("..");
+			}
+		}
+
 		const FLinearColor RowColor = bIsLocal ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim;
 		const float TextY = VCenterTextY(Name, FontSmall, RowTextScale, RowY, RowH);
 
@@ -4299,7 +4382,6 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 			// are. A player the roster could not serve reads MANNEQUIN, which is a real state and
 			// not a fault — see TraceCharacterRoster::NameFor's comment on why it never says "NONE".
 			const uint8 HeldCharacterId = Member->GetSelectedCharacter();
-			const FString CharacterLabel = TraceCharacterRoster::NameFor(HeldCharacterId);
 
 			FLinearColor CharacterColor = RowColor;
 			if (const TraceCharacterRoster::FTraceCharacterEntry* RosterEntry = TraceCharacterRoster::Find(HeldCharacterId))
@@ -4325,20 +4407,15 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 // Helpers
 // -------------------------------------------------------------------------------------------
 
-void ATraceHUD::DrawTextLeft(const FString& Text, const FLinearColor& Color, float X, float Y, UFont* Font, float Scale)
-{
-	DrawText(Text, Color, X, Y, Font, Scale);
-}
-
 // =================================================================================================
-// SPEC v22 §A1 — THE IN-MATCH HUD TYPES IN THE ARTIST'S FACE TOO
+// SPEC v22 §A1 + v23 §A4 — THE IN-MATCH HUD TYPES IN THE ARTIST'S FACE TOO
 // =================================================================================================
 //
 // A1 names three Canvas consumers: "TraceOptionsMenu, TraceCharacterSelect, THE IN-MATCH HUD". The
 // menu could have been done without this file and the result would have been a game whose menus are
 // the artist's and whose match is not — the split moved rather than retired.
 //
-// Every string this class draws goes through the four functions below, so this is the whole change.
+// Every string this class draws goes through the five functions below, so this is the whole change.
 // The (UFont*, Scale) vocabulary is kept and TraceHUDType::SizeFor translates it by MEASURING what
 // the engine draws for that pair and inverting TraceText::LineHeight, exactly as the settings page
 // and the Canvas menu do; the reasoning is written out once at the top of UI/TraceOptionsMenu.cpp.
@@ -4346,6 +4423,41 @@ void ATraceHUD::DrawTextLeft(const FString& Text, const FLinearColor& Color, flo
 // MeasureHeight keeps returning the same number it returned before, so no box, chip, bar or
 // baseline on this HUD moves. Widths change, because the face is wider, and every consumer of a
 // width on this HUD measures it rather than assuming it.
+//
+// -------------------------------------------------------------------------------------------
+// *** v23 §A4: DrawTextLeft WAS STILL ON AHUD::DrawText, AND THAT WAS THE ENTIRE DEFECT. ***
+// -------------------------------------------------------------------------------------------
+// The A1 pass converted Centered and Right and left Left behind, physically ABOVE this banner and
+// outside the section whose own comment claimed "every string goes through the functions below".
+// Everything the owner photographed in the wrong face — [E], DASH, WEAPON, RIPPLE, GUN, PARRY, the
+// cooldown numbers, the scoreboard names — is left-aligned, so one untouched function accounted for
+// all of it, one line apart from Sofachrome siblings drawn by the other two.
+//
+// IT ALSO EXPLAINS THE MIS-SIZED KILL-FEED ROWS, and this is why both halves had to move together.
+// DrawKillFeed measures a row with MeasureWidth (already the ATLAS, since the A1 pass) and then drew
+// the names with DrawTextLeft (Lato). Sofachrome is the wider face, so every row was panelled to a
+// width its own text never filled, and the icon and victim name — both positioned by advancing a
+// cursor over the ATLAS width of the killer name — sat further right than the Lato glyphs they were
+// supposed to follow. Nothing in DrawKillFeed needed to change: making the draw agree with the
+// measurement fixes the sizing, and the measurement was the half that was already right.
+//
+// -------------------------------------------------------------------------------------------
+// WHAT THE ATLAS CANNOT SERVE, SAID OUT LOUD RATHER THAN LEFT AS A SILENT MIX (§A4)
+// -------------------------------------------------------------------------------------------
+// The sheet is printable ASCII only. Every AUTHORED string on this HUD is inside that set, and so
+// is every string this HUD generates — clocks, scores, cooldowns, "%.1f", the roster's ability and
+// character names, and FKey::GetDisplayName for every key a player can bind.
+//
+// The exception is the one class of string the HUD does not author: PLAYER NAMES, in the kill feed
+// and on the scoreboard. A name carrying anything outside printable ASCII has no cell to blit, and
+// TraceText::LayoutString advances the pen by a space for it rather than substituting a face — so
+// it comes out as a gap, and it MEASURES as a gap too, which at least keeps the row's box honest.
+//
+// That is a real limitation and it is not silently absorbed: WarnIfUndrawable names any such string
+// in the log the first time it is drawn. The alternative — keeping names in Lato — is precisely the
+// two-typefaces defect this pass exists to remove, and it would restore the measure/draw split that
+// mis-sized the kill feed. Serving those names properly needs glyphs in the sheet, which lives in
+// Source/Trace/UI/Text and Scripts/generate_font_atlas.py, not here.
 
 namespace TraceHUDType
 {
@@ -4366,10 +4478,116 @@ namespace TraceHUDType
 		}
 		return FMath::Max(1.f, 16.f * Scale);
 	}
+
+	/**
+	 * THE RED ARM FOR §A4 — reproduces the defect this pass fixed, in a running game.
+	 *
+	 * 1 puts the LEFT-ALIGNED labels back on AHUD::DrawText (Lato) while the centred and right-aligned
+	 * ones keep drawing from the atlas, which is precisely the state the owner photographed: two
+	 * typefaces one line apart. It also puts back the kill feed's measure/draw disagreement, because
+	 * DrawKillFeed goes on measuring rows with the atlas either way — so the mis-sized rows and the
+	 * wrong face reproduce together, from one switch, as they were caused together.
+	 *
+	 * This exists because a fix nobody can see fail is not evidence. It is the same device, for the
+	 * same reason, as Trace.Text.Atlas in UI/Text/TraceText.cpp, whose own comment explains that a
+	 * runtime switch "is what makes a red arm / green arm pair possible inside ONE process and one
+	 * screenshot session" — which matters more than usual here, where three agents share one
+	 * Binaries/ directory and a rebuild to reach the other arm is not reliably available.
+	 *
+	 * WHAT IT DOES NOT REVERT, stated so nobody reads the red frame as a photograph of the old HUD:
+	 * the ability stack's label gutter stays MEASURED in both arms (see DrawHealthAndDash), because
+	 * that number is computed long before this variable is declared. So the red arm is the old FACE,
+	 * not the old LAYOUT — which is the right half to isolate here, since the face is what §A4 is
+	 * about and the gutter's own justification is arithmetic off the atlas table rather than a
+	 * before/after picture.
+	 *
+	 * ECVF_Cheat: this is a diagnostic, not a preference. Default 0 is the shipped behaviour.
+	 */
+	static TAutoConsoleVariable<int32> CVarLeftInLato(
+		TEXT("Trace.HUD.Text.LeftInLato"),
+		0,
+		TEXT("0 = the in-match HUD's left-aligned labels type from the Sofachrome atlas (default).\n")
+		TEXT("1 = RED ARM: draw them in Lato through AHUD::DrawText, as they were before spec v23 A4,\n")
+		TEXT("    reproducing both the two-typeface split and the mis-sized kill-feed rows."),
+		ECVF_Cheat);
+
+	/**
+	 * Says so when a string reaches the HUD that the atlas has no glyphs for. See the banner above.
+	 *
+	 * THIS IS A DIAGNOSTIC AND NOTHING ELSE. It cannot change what is drawn or how wide anything is
+	 * measured — TraceText remains the only thing that decides either — so the printable-ASCII range
+	 * repeated here is not a second metrics source, and it is deliberately the CONSERVATIVE test: if
+	 * the sheet ever gains glyphs beyond ASCII this over-reports, which costs a stray log line, while
+	 * the other direction would cost a silent gap on screen. The real charset lives in the generated
+	 * TraceFontAtlasMetrics.h, which by design only TraceText.cpp may include.
+	 *
+	 * Once per distinct string, and capped: a feed of bot names must not turn into a log flood, and
+	 * a name is drawn on every frame it is on screen.
+	 */
+	static void WarnIfUndrawable(const FString& Text)
+	{
+		// The fallback face has these glyphs. Complaining while Lato is live would be a lie.
+		if (Text.IsEmpty() || !TraceText::IsAtlasActive())
+		{
+			return;
+		}
+
+		bool bUndrawable = false;
+		for (int32 Index = 0; Index < Text.Len(); ++Index)
+		{
+			const TCHAR Char = Text[Index];
+			if (Char != TEXT('\n') && (Char < TEXT(' ') || Char > TEXT('~')))
+			{
+				bUndrawable = true;
+				break;
+			}
+		}
+		if (!bUndrawable)
+		{
+			return;
+		}
+
+		static TSet<FString> Reported;
+		constexpr int32 MaxReported = 64;
+		if (Reported.Num() >= MaxReported || Reported.Contains(Text))
+		{
+			return;
+		}
+		Reported.Add(Text);
+
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[HUDType] \"%s\" contains characters the Sofachrome atlas has no cell for; they draw ")
+			TEXT("as blank space (and measure as blank space, so the row's box stays correct). The sheet ")
+			TEXT("is printable ASCII only — see Scripts/generate_font_atlas.py. This is expected for a ")
+			TEXT("player name and is reported once per distinct string."),
+			*Text);
+	}
+}
+
+void ATraceHUD::DrawTextLeft(const FString& Text, const FLinearColor& Color, float X, float Y, UFont* Font, float Scale)
+{
+	TraceHUDType::WarnIfUndrawable(Text);
+
+	// The ONLY surviving AHUD::DrawText call on this HUD, and it is unreachable unless somebody asks
+	// for the defect by name. See CVarLeftInLato.
+	if (TraceHUDType::CVarLeftInLato.GetValueOnGameThread() != 0)
+	{
+		DrawText(Text, Color, X, Y, Font, Scale);
+		return;
+	}
+
+	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
+	Style.HAlign = TraceText::EHAlign::Left;
+	TraceCanvasText::Draw(this, Text, X, Y, Style);
 }
 
 void ATraceHUD::DrawTextCentered(const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale)
 {
+	// On all three draws rather than only on the name sites: the death panel and the parry banner
+	// interpolate a player name into a sentence, and a check that only guarded the two obvious call
+	// sites would go stale the first time somebody adds a fourth.
+	TraceHUDType::WarnIfUndrawable(Text);
+
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
 	Style.HAlign = TraceText::EHAlign::Center;
 	TraceCanvasText::Draw(this, Text, CenterX, Y, Style);
@@ -4377,6 +4595,8 @@ void ATraceHUD::DrawTextCentered(const FString& Text, const FLinearColor& Color,
 
 void ATraceHUD::DrawTextRight(const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale)
 {
+	TraceHUDType::WarnIfUndrawable(Text);
+
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
 	Style.HAlign = TraceText::EHAlign::Right;
 	TraceCanvasText::Draw(this, Text, RightX, Y, Style);

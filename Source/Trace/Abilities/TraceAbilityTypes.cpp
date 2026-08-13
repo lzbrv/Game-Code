@@ -159,6 +159,19 @@ float TraceAbilityTraits::GetDashDistanceScale(const AActor* Actor)
 	return 1.f;
 }
 
+float TraceAbilityTraits::GetDashCooldownScale(const AActor* Actor)
+{
+	// DEMO 20 ITEM 2's second half. Identical shape to GetDashDistanceScale above, and identical
+	// identity behaviour for the other nine characters — see the header for the one line in
+	// UTraceCharacterMovementComponent::GetDashCooldown() that this is still waiting on.
+	if (const UTraceAbilitySetMortimer* Mortimer =
+		Cast<UTraceAbilitySetMortimer>(TraceAbilityTraitsFile::SetFor(Actor)))
+	{
+		return Mortimer->GetDashCooldownScale();
+	}
+	return 1.f;
+}
+
 int32 TraceAbilityTraits::GetExtraDashCharges(const AActor* Actor)
 {
 	if (const UTraceAbilitySetLily* Lily = Cast<UTraceAbilitySetLily>(TraceAbilityTraitsFile::SetFor(Actor)))

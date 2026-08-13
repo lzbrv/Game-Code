@@ -83,7 +83,10 @@ namespace TraceCanvasTextFile
 	static float DrawAtlas(UCanvas* Surface, const FString& Text, float X, float Y,
 		const TraceText::FStyle& Style)
 	{
-		UTexture2D* Atlas = TraceText::AtlasTexture();
+		// The sheet for THIS STYLE'S WEIGHT. The quads below come from a layout pass that used the
+		// same weight, so the cells and the sheet always match; asking for the default sheet here
+		// would address the right cells of the wrong ink and draw the whole string in light.
+		UTexture2D* Atlas = TraceText::AtlasTexture(Style.Weight);
 		if (Surface == nullptr || Atlas == nullptr || Atlas->GetResource() == nullptr)
 		{
 			return 0.f;
@@ -154,4 +157,10 @@ float TraceCanvasText::DrawCentered(AHUD* HUD, const FString& Text, float Center
 	TraceText::FStyle Style(Size, Color);
 	Style.HAlign = TraceText::EHAlign::Center;
 	return Draw(HUD, Text, CenterX, Y, Style);
+}
+
+float TraceCanvasText::DrawBold(AHUD* HUD, const FString& Text, float X, float Y,
+	float Size, const FLinearColor& Color)
+{
+	return Draw(HUD, Text, X, Y, TraceText::FStyle(Size, Color, ETraceTextWeight::Bold));
 }

@@ -44,8 +44,37 @@ namespace TraceTextFile
 		TEXT("Use Trace.Text.Report to see which is live."),
 		ECVF_Default);
 
+	// The weight enum and the generated face table are two halves of one index. If somebody adds a
+	// weight to Scripts/import_font_atlas.py's WEIGHTS table and not to ETraceTextWeight (or the
+	// reverse), every lookup below would be off by one and the menu would draw in the wrong cut with
+	// nothing logged. Break the build instead.
+	static_assert(static_cast<int32>(ETraceTextWeight::Count) == Metrics::NumWeights,
+		"ETraceTextWeight and TraceFontAtlasMetrics::Faces must list the same weights in the same "
+		"order. Add it to Scripts/import_font_atlas.py's WEIGHTS table and to TraceTextWeight.h, "
+		"then re-run Scripts/import-font-atlas.sh.");
+	static_assert(static_cast<int32>(ETraceTextWeight::Light) == Metrics::DefaultWeight,
+		"Light must be the default weight — the owner's instruction is that the game is light and "
+		"bold is the exception, so a caller that says nothing has to get light.");
+
+	static constexpr int32 NumWeights = Metrics::NumWeights;
+
+	static constexpr int32 WeightIndex(ETraceTextWeight Weight)
+	{
+		const int32 Index = static_cast<int32>(Weight);
+		return (Index >= 0 && Index < NumWeights) ? Index : Metrics::DefaultWeight;
+	}
+
+	/** One weight's runtime state: its sheet, and whether it survived the staleness guard. */
+	struct FWeightState
+	{
+		bool bUsable = false;
+		FString FailureReason;
+	};
+
+	static FWeightState WeightStates[NumWeights];
+
 	/**
-	 * Keeps the sheet alive.
+	 * Keeps the sheets alive — one per weight.
 	 *
 	 * A TStrongObjectPtr in a static would work until module shutdown ordering bit somebody; an
 	 * FGCObject is the pattern the engine itself uses for exactly this and it releases cleanly.
@@ -53,11 +82,14 @@ namespace TraceTextFile
 	class FAtlasRef : public FGCObject
 	{
 	public:
-		TObjectPtr<UTexture2D> Texture;
+		TObjectPtr<UTexture2D> Textures[NumWeights];
 
 		virtual void AddReferencedObjects(FReferenceCollector& Collector) override
 		{
-			Collector.AddReferencedObject(Texture);
+			for (TObjectPtr<UTexture2D>& Texture : Textures)
+			{
+				Collector.AddReferencedObject(Texture);
+			}
 		}
 
 		virtual FString GetReferencerName() const override
@@ -73,7 +105,7 @@ namespace TraceTextFile
 	}
 
 	static bool bResolved = false;
-	/** The texture loaded AND passed the staleness guard. Does not account for the two overrides. */
+	/** The DEFAULT weight's texture loaded AND passed the guard. Ignores the two overrides. */
 	static bool bAtlasUsable = false;
 	static FString FailureReason;
 
@@ -126,6 +158,41 @@ namespace TraceTextFile
 	 * *something*, so it survives review. Refusing the atlas outright turns it into a legible log
 	 * line and a menu in Lato.
 	 */
+	/** Loads and guards ONE weight's sheet. Returns true when that weight can draw its own ink. */
+	static bool ResolveWeight(int32 Index)
+	{
+		const Metrics::FFace& Face = Metrics::Face(Index);
+		FWeightState& State = WeightStates[Index];
+
+		UTexture2D* Texture = LoadObject<UTexture2D>(nullptr, Face.TextureAsset);
+		if (Texture == nullptr)
+		{
+			State.FailureReason = FString::Printf(
+				TEXT("%s (the %s weight) did not load. Run Scripts/import-font-atlas.sh to import it."),
+				Face.TextureAsset, Face.Name);
+			return false;
+		}
+
+		// Before ANY question is asked of the texture's dimensions. See the comment on this function.
+		WaitForTextureBuild(Texture);
+
+		const int32 Width = static_cast<int32>(Texture->GetSizeX());
+		const int32 Height = static_cast<int32>(Texture->GetSizeY());
+		if (Width != Face.AtlasWidth || Height != Face.AtlasHeight)
+		{
+			State.FailureReason = FString::Printf(
+				TEXT("%s (the %s weight) is %dx%d but TraceFontAtlasMetrics.h describes a %dx%d sheet ")
+				TEXT("— the metrics and the texture are out of step, so every glyph would sample the ")
+				TEXT("wrong cell. Re-run Scripts/import-font-atlas.sh (it does both halves together)."),
+				Face.TextureAsset, Face.Name, Width, Height, Face.AtlasWidth, Face.AtlasHeight);
+			return false;
+		}
+
+		Refs().Textures[Index] = Texture;
+		State.bUsable = true;
+		return true;
+	}
+
 	static void Resolve()
 	{
 		if (bResolved)
@@ -134,40 +201,75 @@ namespace TraceTextFile
 		}
 		bResolved = true;
 
-		UTexture2D* Texture = LoadObject<UTexture2D>(nullptr, Metrics::TextureAsset);
-		if (Texture == nullptr)
+		// EVERY weight is resolved here, not lazily on first bold draw. The character-select screen
+		// is the first thing that asks for bold and it asks during a draw pass; a synchronous texture
+		// load and an editor-build shader/texture compile on that frame is a visible hitch, and the
+		// failure log would land in the middle of gameplay rather than at menu load.
+		for (int32 Index = 0; Index < NumWeights; ++Index)
 		{
-			FailureReason = FString::Printf(
-				TEXT("%s did not load. Run Scripts/import-font-atlas.sh to import it."),
-				Metrics::TextureAsset);
+			ResolveWeight(Index);
+		}
+
+		bAtlasUsable = WeightStates[Metrics::DefaultWeight].bUsable;
+		FailureReason = WeightStates[Metrics::DefaultWeight].FailureReason;
+
+		if (!bAtlasUsable)
+		{
 			UE_LOG(LogTraceGame, Error, TEXT("[Text] %s Falling back to %s."),
 				*FailureReason, TraceMenuArtStyle::MenuFontSourceFile);
 			return;
 		}
 
-		// Before ANY question is asked of the texture's dimensions. See the comment on this function.
-		WaitForTextureBuild(Texture);
-
-		const int32 Width = static_cast<int32>(Texture->GetSizeX());
-		const int32 Height = static_cast<int32>(Texture->GetSizeY());
-		if (Width != Metrics::AtlasWidth || Height != Metrics::AtlasHeight)
-		{
-			FailureReason = FString::Printf(
-				TEXT("%s is %dx%d but TraceFontAtlasMetrics.h describes a %dx%d sheet — the metrics ")
-				TEXT("and the texture are out of step, so every glyph would sample the wrong cell. ")
-				TEXT("Re-run Scripts/import-font-atlas.sh (it does both halves together)."),
-				Metrics::TextureAsset, Width, Height, Metrics::AtlasWidth, Metrics::AtlasHeight);
-			UE_LOG(LogTraceGame, Error, TEXT("[Text] %s"), *FailureReason);
-			return;
-		}
-
-		Refs().Texture = Texture;
-		bAtlasUsable = true;
-
+		const Metrics::FFace& Default = Metrics::Face(Metrics::DefaultWeight);
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[Text] Sofachrome is live: %s (%dx%d, %d glyphs, em %.0fpx, cap %.0fpx). Menu type ")
-			TEXT("is drawn one quad per glyph — no UFont and no FSlateFontInfo is involved."),
-			Metrics::TextureAsset, Width, Height, Metrics::NumGlyphs, Metrics::EmSize, Metrics::CapHeight);
+			TEXT("[Text] Sofachrome is live: %s (%dx%d, %d glyphs, em %.0fpx, cap %.0fpx, weight %s). ")
+			TEXT("Menu type is drawn one quad per glyph — no UFont and no FSlateFontInfo is involved."),
+			Default.TextureAsset, Default.AtlasWidth, Default.AtlasHeight, Metrics::NumGlyphs,
+			Metrics::EmSize, Default.CapHeight, Default.Name);
+
+		// A weight that failed while the default one worked is NOT a fallback to Lato — it draws in
+		// the default weight, which is still Sofachrome. That is the right degradation (the owner
+		// wants light everywhere; bold is the exception), but it is invisible on screen, so it has to
+		// be loud in the log or a missing bold sheet reads as "the emphasis was never wired up".
+		for (int32 Index = 0; Index < NumWeights; ++Index)
+		{
+			if (Index != Metrics::DefaultWeight && !WeightStates[Index].bUsable)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Text] The %s weight is NOT available, so anything asking for it draws in %s ")
+					TEXT("instead — same typeface, wrong emphasis, and nothing on screen will say so. %s"),
+					Metrics::Face(Index).Name, Default.Name, *WeightStates[Index].FailureReason);
+			}
+		}
+	}
+
+	/**
+	 * The weight that will actually be DRAWN when a caller asks for @p Weight.
+	 *
+	 * One place decides substitution, so the metrics, the layout and both renderers cannot disagree
+	 * about which sheet a string is in — a widget measuring bold while the blitter drew light would
+	 * mis-size every row it centred.
+	 */
+	static int32 EffectiveIndex(ETraceTextWeight Weight)
+	{
+		const int32 Index = WeightIndex(Weight);
+
+		// Deliberately does NOT force Resolve(). CapHeight() and friends are pure metric queries that
+		// used to answer from constexpr data, and making them load a texture would drag a synchronous
+		// load (and, in an editor build, a texture compile) into whatever early frame first asked how
+		// tall a capital is. Before resolution the caller gets the metrics of the weight it ASKED for,
+		// which is the right answer while there is no evidence that weight is broken; after
+		// resolution a weight that failed reports the metrics of the one that will really be drawn.
+		if (!bResolved)
+		{
+			return Index;
+		}
+		return WeightStates[Index].bUsable ? Index : Metrics::DefaultWeight;
+	}
+
+	static const Metrics::FFace& EffectiveFace(ETraceTextWeight Weight)
+	{
+		return Metrics::Face(EffectiveIndex(Weight));
 	}
 
 	/** Atlas pixels -> screen pixels. */
@@ -176,20 +278,20 @@ namespace TraceTextFile
 		return FMath::Max(0.f, Size) / Metrics::EmSize;
 	}
 
-	static const Metrics::FCell* FindCell(TCHAR Char)
+	static const Metrics::FCell* FindCell(const Metrics::FFace& Face, TCHAR Char)
 	{
 		const int32 Code = static_cast<int32>(Char);
 		if (Code < Metrics::FirstCode || Code > Metrics::LastCode)
 		{
 			return nullptr;
 		}
-		return &Metrics::Cells[Code - Metrics::FirstCode];
+		return &Face.Cells[Code - Metrics::FirstCode];
 	}
 
 	/** The cell an unmapped character advances by, so foreign text still occupies sane space. */
-	static const Metrics::FCell& SpaceCell()
+	static const Metrics::FCell& SpaceCell(const Metrics::FFace& Face)
 	{
-		return Metrics::Cells[TEXT(' ') - Metrics::FirstCode];
+		return Face.Cells[TEXT(' ') - Metrics::FirstCode];
 	}
 
 	// ---------------------------------------------------------------------------------------------
@@ -229,15 +331,16 @@ namespace TraceTextFile
 		}
 	}
 
-	static float AtlasLineWidth(const FString& Line, float Size, float Tracking)
+	static float AtlasLineWidth(const FString& Line, float Size, float Tracking, ETraceTextWeight Weight)
 	{
+		const Metrics::FFace& Face = EffectiveFace(Weight);
 		const float Scale = ScaleFor(Size);
 		float Width = 0.f;
 		int32 Drawn = 0;
 		for (int32 Index = 0; Index < Line.Len(); ++Index)
 		{
-			const Metrics::FCell* Cell = FindCell(Line[Index]);
-			Width += (Cell != nullptr ? Cell->USize : SpaceCell().USize) * Scale;
+			const Metrics::FCell* Cell = FindCell(Face, Line[Index]);
+			Width += (Cell != nullptr ? Cell->USize : SpaceCell(Face).USize) * Scale;
 			++Drawn;
 		}
 		// Tracking is between glyphs, not after the last one — otherwise a centred string drifts
@@ -278,10 +381,49 @@ FString TraceText::FaceName()
 	return Fallback;
 }
 
-UTexture2D* TraceText::AtlasTexture()
+bool TraceText::IsWeightActive(ETraceTextWeight Weight)
+{
+	if (!IsAtlasActive())
+	{
+		return false;
+	}
+	return TraceTextFile::WeightStates[TraceTextFile::WeightIndex(Weight)].bUsable;
+}
+
+const TCHAR* TraceText::WeightName(ETraceTextWeight Weight)
+{
+	return TraceFontAtlasMetrics::Face(TraceTextFile::WeightIndex(Weight)).Name;
+}
+
+ETraceTextWeight TraceText::WeightFromName(const FString& Name, ETraceTextWeight Fallback,
+	bool* bOutMatched)
+{
+	for (int32 Index = 0; Index < TraceTextFile::NumWeights; ++Index)
+	{
+		if (Name.Equals(TraceFontAtlasMetrics::Face(Index).Name, ESearchCase::IgnoreCase))
+		{
+			if (bOutMatched != nullptr)
+			{
+				*bOutMatched = true;
+			}
+			return static_cast<ETraceTextWeight>(Index);
+		}
+	}
+
+	if (bOutMatched != nullptr)
+	{
+		*bOutMatched = false;
+	}
+	return Fallback;
+}
+
+UTexture2D* TraceText::AtlasTexture(ETraceTextWeight Weight)
 {
 	TraceTextFile::Resolve();
-	return TraceTextFile::Refs().Texture;
+	// The EFFECTIVE weight, so the texture handed back is always the one the cell table and the
+	// measurement above were taken from. Handing back a null for an unavailable weight would make
+	// each renderer invent its own substitution, and they would not agree.
+	return TraceTextFile::Refs().Textures[TraceTextFile::EffectiveIndex(Weight)];
 }
 
 FString TraceText::DescribeFace()
@@ -290,14 +432,30 @@ FString TraceText::DescribeFace()
 
 	if (IsAtlasActive())
 	{
+		FString Weights;
+		for (int32 Index = 0; Index < TraceTextFile::NumWeights; ++Index)
+		{
+			const TraceFontAtlasMetrics::FFace& Face = TraceFontAtlasMetrics::Face(Index);
+			Weights += FString::Printf(TEXT("%s%s (cap %.0f, thin %.0f)%s"),
+				Weights.IsEmpty() ? TEXT("") : TEXT(", "),
+				Face.Name, Face.CapHeight, Face.Erosion,
+				TraceTextFile::WeightStates[Index].bUsable ? TEXT("") : TEXT(" — UNAVAILABLE"));
+		}
+
+		const TraceFontAtlasMetrics::FFace& Default =
+			TraceFontAtlasMetrics::Face(TraceFontAtlasMetrics::DefaultWeight);
+
 		return FString::Printf(
 			TEXT("SOFACHROME — the artist's face, from the glyph atlas %s (%dx%d, %d glyphs, em %.0f, ")
 			TEXT("cap %.0f). Every letter is one textured quad drawn by Source/Trace/UI/Text; no UFont ")
 			TEXT("and no FSlateFontInfo is involved, which is the whole point — an offline UFont ")
-			TEXT("cannot drive UMG. Force the fallback with -TraceNoFontAtlas or `Trace.Text.Atlas 0`."),
-			TraceFontAtlasMetrics::TextureAsset, TraceFontAtlasMetrics::AtlasWidth,
-			TraceFontAtlasMetrics::AtlasHeight, TraceFontAtlasMetrics::NumGlyphs,
-			TraceFontAtlasMetrics::EmSize, TraceFontAtlasMetrics::CapHeight);
+			TEXT("cannot drive UMG. Weights: %s — %s is the default, and each weight is rasterised ")
+			TEXT("from its OWN font file (thin 0 both), so they do NOT share advances: measure a ")
+			TEXT("string in the weight you will draw it in. Force the fallback with -TraceNoFontAtlas ")
+			TEXT("or `Trace.Text.Atlas 0`."),
+			Default.TextureAsset, Default.AtlasWidth, Default.AtlasHeight,
+			TraceFontAtlasMetrics::NumGlyphs, TraceFontAtlasMetrics::EmSize, Default.CapHeight,
+			*Weights, Default.Name);
 	}
 
 	FString Why;
@@ -336,14 +494,23 @@ float TraceText::Ascent(float Size)
 	return TraceFontAtlasMetrics::Ascent * TraceTextFile::ScaleFor(Size);
 }
 
-float TraceText::CapHeight(float Size)
+float TraceText::CapHeight(float Size, ETraceTextWeight Weight)
 {
-	return TraceFontAtlasMetrics::CapHeight * TraceTextFile::ScaleFor(Size);
+	// Per weight, and this one is NOT a rounding difference: eroding the drawn face to synthesise
+	// the light cut takes rows off the top of every capital, so light caps come out ~10% shorter
+	// than bold ones at the same Size. The EFFECTIVE face, so a caller measuring a weight that
+	// failed to load gets the cap height of the weight that will actually be drawn.
+	return TraceTextFile::EffectiveFace(Weight).CapHeight * TraceTextFile::ScaleFor(Size);
 }
 
-float TraceText::SizeForCapHeight(float InCapHeight)
+float TraceText::SizeForCapHeight(float InCapHeight, ETraceTextWeight Weight)
 {
-	return FMath::Max(0.f, InCapHeight) * (TraceFontAtlasMetrics::EmSize / TraceFontAtlasMetrics::CapHeight);
+	const float FaceCapHeight = TraceTextFile::EffectiveFace(Weight).CapHeight;
+	if (FaceCapHeight <= 0.f)
+	{
+		return 0.f;
+	}
+	return FMath::Max(0.f, InCapHeight) * (TraceFontAtlasMetrics::EmSize / FaceCapHeight);
 }
 
 float TraceText::MeasureWidth(const FString& Text, const FStyle& Style)
@@ -356,7 +523,7 @@ float TraceText::MeasureWidth(const FString& Text, const FStyle& Style)
 	for (const FString& Line : Lines)
 	{
 		const float Width = bAtlas
-			? TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking)
+			? TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight)
 			: TraceTextFile::FallbackLineWidth(Line, Style.Size);
 		Widest = FMath::Max(Widest, Width);
 	}
@@ -397,7 +564,7 @@ FVector2f TraceText::AlignOffset(const FVector2f& BlockSize, const FStyle& Style
 	case EVAlign::Baseline: Y = -Ascent(Size);        break;
 	// A baked word sprite's top edge is the CAP LINE, not the line box, so live text that must sit
 	// where one sat has to be lifted by the gap between them.
-	case EVAlign::CapTop:   Y = -(Ascent(Size) - CapHeight(Size)); break;
+	case EVAlign::CapTop:   Y = -(Ascent(Size) - CapHeight(Size, Style.Weight)); break;
 	default:                                          break;
 	}
 
@@ -421,8 +588,13 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 	const FVector2f Block(MeasureWidth(Text, Style), Height * Lines.Num());
 	const FVector2f Origin = AlignOffset(Block, Style, Style.Size);
 
-	constexpr float AtlasW = static_cast<float>(TraceFontAtlasMetrics::AtlasWidth);
-	constexpr float AtlasH = static_cast<float>(TraceFontAtlasMetrics::AtlasHeight);
+	// THE ONLY THING THE WEIGHT CHANGES. One face is picked here, once, and the loop below is the
+	// same loop it has always been — the pen advances by the same widths, the lines break in the
+	// same places, and only which sheet the UVs address moves. That is what makes this one layout
+	// path with two metric sources rather than two code paths.
+	const TraceFontAtlasMetrics::FFace& Face = TraceTextFile::EffectiveFace(Style.Weight);
+	const float AtlasW = static_cast<float>(Face.AtlasWidth);
+	const float AtlasH = static_cast<float>(Face.AtlasHeight);
 
 	OutQuads.Reserve(Text.Len());
 
@@ -433,7 +605,8 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 		// Every line is aligned inside the BLOCK, so a centred two-line label centres both lines
 		// rather than centring the longest and left-aligning the rest.
 		float PenX = Origin.X;
-		const float LineWidth = TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking);
+		const float LineWidth =
+			TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight);
 		switch (Style.HAlign)
 		{
 		case EHAlign::Center: PenX += (Block.X - LineWidth) * 0.5f; break;
@@ -446,9 +619,9 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 		for (int32 CharIndex = 0; CharIndex < Line.Len(); ++CharIndex)
 		{
 			const TCHAR Char = Line[CharIndex];
-			const TraceFontAtlasMetrics::FCell* Cell = TraceTextFile::FindCell(Char);
+			const TraceFontAtlasMetrics::FCell* Cell = TraceTextFile::FindCell(Face, Char);
 			const TraceFontAtlasMetrics::FCell& Advance =
-				(Cell != nullptr) ? *Cell : TraceTextFile::SpaceCell();
+				(Cell != nullptr) ? *Cell : TraceTextFile::SpaceCell(Face);
 
 			// Whitespace and unmapped characters advance and draw nothing. Emitting a quad for a
 			// space would be a transparent draw call per space, on every frame, for nothing.

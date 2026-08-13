@@ -210,12 +210,18 @@ public:
 	bool IsInsideMouth(const ATraceCharacter* Candidate) const;
 
 	/**
-	 * How many ring beads this machine has actually built, and 0 on a machine that draws nothing.
+	 * How many ring beads this machine actually DRAWS, and 0 on a machine that draws nothing.
 	 *
 	 * "The gate exists" and "the gate is visible" are DIFFERENT FACTS and Demo 17 is what taught us to
 	 * separate them: the user's report was "isn't opening a portal", which is a statement about what
 	 * they SAW, and a harness that only asserts the actor exists cannot tell that apart from a mouth
 	 * nobody can find. Trace.Elle.SnapPressTest prints it for every gate it places.
+	 *
+	 * *** DEMO 20 ITEM 4 SPLIT THAT FACT AGAIN, AND THIS COUNTER WAS ON THE WRONG SIDE OF IT. ***
+	 * It used to return the instance count alone, and an instanced-mesh component with no static mesh
+	 * accepts every instance and reports them all while the renderer is never told it exists. So it
+	 * read a healthy 60 for the whole life of "Elle's portal is invisible". It now requires a mesh as
+	 * well as instances, which is the pair of facts a bead has to satisfy to reach a screen.
 	 */
 	int32 GetDrawnBeadCount() const;
 

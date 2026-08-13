@@ -664,7 +664,20 @@ float UTraceCharacterMovementComponent::GetDashDuration() const
 
 float UTraceCharacterMovementComponent::GetDashCooldown() const
 {
-	return FMath::Max(0.f, UTraceSettings::Get().DashCooldown);
+	// DEMO 20 ITEM 2, SECOND HALF — "increase mortimer's dash cooldown by 25%".
+	//
+	// Landed by the v23 integrator, not by the Mortimer agent, only because Movement/ was owned by
+	// the Lily agent that pass and neither would edit the other's file; the knob, the accessor and
+	// TraceAbilityTraits::GetDashCooldownScale() were all already in place and this was the one
+	// missing call site. Trace.Mortimer.DashTest reported "ITEM 2b: FAIL - NOT ROUTED" against it.
+	//
+	// Same shape and same reasoning as GetDashSpeed() above: the trait returns 1.0 for every other
+	// character and for any pawn with no ability component, so this multiply is arithmetically
+	// identity for the other nine and cannot drift away from them. GetDashRechargeWindow() is
+	// defined as duration + cooldown, so the HUD dash meter follows from this one line with no
+	// second edit.
+	return FMath::Max(0.f, UTraceSettings::Get().DashCooldown
+		* TraceAbilityTraits::GetDashCooldownScale(CharacterOwner));
 }
 
 float UTraceCharacterMovementComponent::GetDashRechargeWindow() const

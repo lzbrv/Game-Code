@@ -48,6 +48,7 @@ class UBorder;
 class UImage;
 class UTextBlock;
 class UTexture2D;
+class UTraceMenuGrid;
 
 /** One frame of the title screen, as ATraceMenuHUD sees it. */
 struct FTraceTitleMenuView
@@ -337,6 +338,39 @@ private:
 	/** The six rows in ETraceMenuRow order, resolved once. Empty before NativeOnInitialized. */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UTraceMenuRow>> OrderedRows;
+
+	// ---- SPEC v23 §A1: THE SCROLLING GRID -----------------------------------------------------------
+	//
+	// The owner asked for "something like the scrolling background grid that used to be in the main
+	// menu ui". It still exists on the Canvas renderer (ATraceMenuHUD::DrawGridFloor); spec v19 §5 gave
+	// THIS screen a flat black backdrop and the grid stopped being on the screen anybody sees.
+
+	/**
+	 * Adds UTraceMenuGrid to the root canvas, directly above Backdrop and below every other layer.
+	 *
+	 * WHY THIS IS CODE AND NOT Scripts/generate-menu-widgets.py. Every other widget on this screen is
+	 * authored by the generator, and the obvious thing would have been to author this one too. Three
+	 * reasons not to, and the third is the one that decides it:
+	 *
+	 *   1. the generator needs the editor to run, so a grid that only exists once somebody re-runs it
+	 *      is a grid that is missing from every checkout until they do;
+	 *   2. it would put a UWidget subclass in the .uasset with no BindWidget contract behind it, so a
+	 *      rename in C++ would fail silently in the asset rather than loudly at compile time — the
+	 *      exact failure the BindWidget discipline at the top of this header exists to prevent;
+	 *   3. THE Z-ORDER IS A CORRECTNESS PROPERTY, not a styling one. This screen's only opaque layers
+	 *      are the row plates; ConsolePanel is a CLEAR border, so the blurb, both footer lines and the
+	 *      tagline sit on bare black with nothing between them and whatever is behind. The grid must
+	 *      therefore be provably BELOW all of them, and "provably" means a slot z-order set next to
+	 *      the Backdrop's own, in one place, in a file that fails to compile if Backdrop is renamed —
+	 *      not a number typed into a Python script that nobody re-runs.
+	 *
+	 * Idempotent, and a no-op if the asset ever gains a Backdrop that is not on a canvas panel.
+	 */
+	void InstallGridBackground();
+
+	/** The grid, once installed. Null if the install found no canvas to put it on; never fatal. */
+	UPROPERTY(Transient)
+	TObjectPtr<UTraceMenuGrid> GridFloor;
 
 	// ---- SPEC v22 §A1: THE WHOLE SCREEN IS ONE TYPEFACE ---------------------------------------------
 	//

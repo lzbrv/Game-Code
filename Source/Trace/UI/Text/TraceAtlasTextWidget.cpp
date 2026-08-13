@@ -6,6 +6,7 @@
 #include "Rendering/DrawElements.h"
 #include "Styling/SlateBrush.h"
 
+#include "Trace.h"                                // LogTraceGame
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 
 #define LOCTEXT_NAMESPACE "TraceAtlasText"
@@ -96,7 +97,9 @@ int32 STraceAtlasText::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 	// THE ATLAS PATH — one MakeBox per glyph, which is what bypasses FSlateFontInfo entirely.
 	// ---------------------------------------------------------------------------------------------
 	TArray<TraceText::FGlyphQuad> Quads;
-	UTexture2D* Atlas = TraceText::AtlasTexture();
+	// The sheet for THIS STYLE'S WEIGHT — see the same line in TraceCanvasText.cpp. The layout pass
+	// below uses the same Style, so the cells it returns and this texture are always the same cut.
+	UTexture2D* Atlas = TraceText::AtlasTexture(Params.Style.Weight);
 
 	if (Atlas != nullptr && TraceText::LayoutString(Params.Text, Params.Style, Quads))
 	{
@@ -169,6 +172,7 @@ FTraceAtlasTextParams UTraceAtlasText::BuildParams() const
 	Out.Style.Size = Size;
 	Out.Style.Color = Color;
 	Out.Style.Tracking = Tracking;
+	Out.Style.Weight = Weight;
 
 	// The block is laid out from its own top-left; where that block lands inside the slot is the
 	// SlotH/VAlign question, handled in OnPaint. Keeping them separate is what makes a
@@ -219,6 +223,32 @@ void UTraceAtlasText::SetColor(const FLinearColor& InColor)
 {
 	Color = InColor;
 	SynchronizeProperties();
+}
+
+void UTraceAtlasText::SetWeight(ETraceTextWeight InWeight)
+{
+	Weight = InWeight;
+	SynchronizeProperties();
+}
+
+void UTraceAtlasText::SetWeightByName(const FString& InWeightName)
+{
+	bool bMatched = false;
+	const ETraceTextWeight Resolved = TraceText::WeightFromName(InWeightName, Weight, &bMatched);
+	if (!bMatched)
+	{
+		// Not silent: a misspelled weight would otherwise draw light and look exactly like a screen
+		// that was never asked to be bold, which is the failure this whole module is built to avoid.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Text] SetWeightByName(\"%s\") on '%s' matched no weight; leaving it %s. "
+				 "Valid names: %s, %s."),
+			*InWeightName, *GetName(), TraceText::WeightName(Weight),
+			TraceText::WeightName(ETraceTextWeight::Light),
+			TraceText::WeightName(ETraceTextWeight::Bold));
+		return;
+	}
+
+	SetWeight(Resolved);
 }
 
 float UTraceAtlasText::MeasureWidth() const

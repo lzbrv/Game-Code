@@ -551,7 +551,13 @@ namespace TraceCharacterSelectType
 		}
 	}
 
-	float Width(AHUD* HUD, const FString& Text, UFont* Font, float Scale, float Tracking)
+	/**
+	 * @param Weight  MUST match the weight the string will be DRAWN in. It defaults to Light like
+	 *                every other entry point here, so the ~30 call sites that draw light need no
+	 *                edit; the two that draw the character NAMES bold pass it explicitly.
+	 */
+	float Width(AHUD* HUD, const FString& Text, UFont* Font, float Scale, float Tracking,
+		ETraceTextWeight Weight = ETraceTextWeight::Light)
 	{
 		if (HUD == nullptr || Text.IsEmpty())
 		{
@@ -566,6 +572,15 @@ namespace TraceCharacterSelectType
 		{
 			TraceText::FStyle Style(FMath::Max(1.f, Scale));
 			Style.Tracking = Tracking;
+			// THE WEIGHT HAS TO REACH THE MEASUREMENT, and this is the correction the v23 integration
+			// pass had to make. §A3 landed on the assumption that "both weights share every advance",
+			// which was true while the light cut was Regular ERODED — same font, same metrics. It
+			// stopped being true the moment the real Sofachrome W05 ExtraLight arrived: 94 of the 95
+			// cells now differ, and Bold is roughly half again as wide (compare '!' at 19 px light
+			// against 40 px bold in TraceFontAtlasMetrics.h). Measuring a bold name with light
+			// advances under-reports it by a third, so the shrink-to-fit clamps below let it through
+			// and "MORTIMER" printed through the MOVEMENT paragraph — photographed at 1920x1080.
+			Style.Weight = Weight;
 			return TraceText::MeasureWidth(Text, Style);
 		}
 
@@ -631,7 +646,8 @@ namespace TraceCharacterSelectType
 	}
 
 	void Draw(AHUD* HUD, const FString& Text, const FLinearColor& Color,
-		float X, float Y, UFont* Font, float Scale, float Tracking)
+		float X, float Y, UFont* Font, float Scale, float Tracking,
+		ETraceTextWeight Weight = ETraceTextWeight::Light)
 	{
 		if (HUD == nullptr || Text.IsEmpty())
 		{
@@ -642,6 +658,12 @@ namespace TraceCharacterSelectType
 		{
 			TraceText::FStyle Style(FMath::Max(1.f, Scale), Color);
 			Style.Tracking = Tracking;
+			// spec v23 A3 — the character NAMES are the one thing on this screen the owner wants
+			// left bold; every other string keeps the light default, which is why this argument
+			// defaults rather than being passed at each of the call sites. The two weights do NOT
+			// share advances (they are two different font files), so every fit-to-tile measurement
+			// of a name passes this same weight to Width().
+			Style.Weight = Weight;
 			TraceCanvasText::Draw(HUD, Text, X, Y, Style);
 			return;
 		}
@@ -1830,7 +1852,10 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		{
 			const float NameTrack = TraceSelectLayout::TrackName * S;
 			float NameSize = TraceSelectLayout::SizeDisplay * S;
-			const float NameW = TraceCharacterSelectType::Width(HUD, Entry.Name, nullptr, NameSize, NameTrack);
+			// Measured in the weight it is DRAWN in — see the note in Width(). Bold is ~1.5x the
+			// light advance, so measuring light here let MORTIMER overrun the identity column.
+			const float NameW = TraceCharacterSelectType::Width(HUD, Entry.Name, nullptr, NameSize, NameTrack,
+				ETraceTextWeight::Bold);
 			if (NameW > IdentityW && NameW > 1.f)
 			{
 				NameSize = FMath::Max(NameSize * (IdentityW / NameW),
@@ -1839,7 +1864,7 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 
 			TraceCharacterSelectType::Draw(HUD, Entry.Name,
 				bTaken ? TraceSelectStyle::Dimmed(Entry.Accent, 0.45f) : Entry.Accent,
-				IdentityX, IdentityY, nullptr, NameSize, NameTrack);
+				IdentityX, IdentityY, nullptr, NameSize, NameTrack, ETraceTextWeight::Bold);
 			IdentityY += TraceCharacterSelectType::LineHeight(HUD, nullptr, NameSize) + (10.f * S);
 		}
 
@@ -2243,7 +2268,8 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 		float NameTrack = TraceSelectLayout::TrackName * S;
 		{
 			const float Room = (W - Pad * 2.f) - CapW;
-			const float Natural = TraceCharacterSelectType::Width(HUD, Entry.Name, nullptr, NameSize, NameTrack);
+			const float Natural = TraceCharacterSelectType::Width(HUD, Entry.Name, nullptr, NameSize, NameTrack,
+				ETraceTextWeight::Bold);
 			if (Natural > Room && Natural > 1.f)
 			{
 				const float Fit = FMath::Max(0.72f, Room / Natural);
@@ -2255,7 +2281,8 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 		const float NameH = TraceCharacterSelectType::LineHeight(HUD, nullptr, NameSize);
 		TraceCharacterSelectType::Draw(HUD, Entry.Name,
 			bTaken ? TraceSelectStyle::InkDim : Entry.Accent,
-			X + Pad + CapW, PenY + (CapH - NameH) * 0.5f, nullptr, NameSize, NameTrack);
+			X + Pad + CapW, PenY + (CapH - NameH) * 0.5f, nullptr, NameSize, NameTrack,
+			ETraceTextWeight::Bold);
 
 		PenY += CapH + (10.f * S);
 	}

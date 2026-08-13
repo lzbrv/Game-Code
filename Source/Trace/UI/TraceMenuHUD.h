@@ -26,6 +26,14 @@
 //
 // ATraceMenuPlayerController owns nothing but the key bindings and forwards them here; that split
 // keeps the layout maths and the hit testing in one file instead of two copies that drift.
+//
+// THE MODALS DO NOT SWAP THE RENDERER ANY MORE (spec v23 §A2). The settings overlay and the JOIN
+// prompt are still Canvas, and Canvas is still composited under Slate — but they now draw on the
+// engine's FOREGROUND canvas, which Slate paints in front of the UI, so the UMG title screen stays
+// up behind them instead of being collapsed for their frames. What the player sees when a modal
+// opens is the screen they were already looking at, dimmed. See FTraceOverSlateCanvas in
+// UI/TraceOptionsMenu.h for the mechanism, its fallback and its red arm; see DrawHUD for the one
+// decision both halves read.
 
 #pragma once
 
@@ -513,17 +521,34 @@ private:
 	bool bMenuUmgActive = false;
 
 	/**
-	 * True when the UMG title screen is AVAILABLE this frame, which is not the same as bMenuUmgActive
-	 * — the widget is available and yet stands down for every frame a Canvas modal is up.
+	 * True when the UMG title screen is AVAILABLE this frame, which is not quite the same as
+	 * bMenuUmgActive: the widget can be available and still stand down — but, as of spec v23 §A2,
+	 * ONLY when a modal is up AND the foreground canvas is unavailable (see bModalOverSlate).
 	 *
-	 * Read by DrawJoinPrompt, and the reason it exists: the JOIN prompt (and the settings overlay)
-	 * force the Canvas renderer for their frames, so the title screen BEHIND the modal is the old
-	 * stroked-vector one even when the player's actual title screen is the artist's. That was
-	 * invisible while GUseUMG defaulted to 0, because both states looked the same. It became a
-	 * visible wart the moment spec v20 flipped the default: press JOIN and the game's own name
-	 * changes design behind the prompt. See DrawJoinPrompt for what is done about it.
+	 * HISTORY, because the difference between these two flags used to be the §A2 defect. Until v23
+	 * the widget stood down for EVERY frame a Canvas modal was up: the JOIN prompt and the settings
+	 * overlay forced the Canvas renderer for their frames, so the title screen behind the modal was
+	 * the retired stroked-vector one even when the player's actual title screen was the artist's.
+	 * That was invisible while GUseUMG defaulted to 0, because both states looked the same, and it
+	 * became the most visible defect on the screen the moment spec v20 flipped the default: press
+	 * JOIN, or SETTINGS, and the game's own name changed design. The modals now draw in FRONT of
+	 * Slate instead, so there is nothing to stand down for.
 	 */
 	bool bMenuUmgAvailable = false;
+
+	/**
+	 * SPEC v23 §A2 — true when a modal drawn this frame lands in front of Slate.
+	 *
+	 * Sampled once per DrawHUD, before anything is drawn, because two decisions have to agree on it:
+	 * whether the widget keeps the screen (here) and which surface the modal draws on (inside the
+	 * modal). Disagreement in one direction is a title screen with an invisible settings panel
+	 * behind it. See FTraceOverSlateCanvas in UI/TraceOptionsMenu.h.
+	 */
+	bool bModalOverSlate = false;
+
+	/** Last logged answer, so a change of surface is reported and a stale claim cannot outlive it. */
+	bool bModalOverSlateLastDecision = false;
+	bool bModalSurfaceLogged = false;
 
 	/** Set once, so the adoption decision is logged exactly once per title screen rather than 60x/s. */
 	bool bMenuUmgDecisionLogged = false;

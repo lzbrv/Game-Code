@@ -4,6 +4,7 @@
 
 #include "Abilities/Characters/TraceAbilitySetElle.h"
 
+#include "Camera/PlayerCameraManager.h"   // Trace.Elle.PortalShot frames the two mouths against the FOV
 #include "Components/MeshComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -1210,6 +1211,19 @@ namespace TraceAbilitySetElleFile
 				if (!State->bWalkStarted)
 				{
 					State->bWalkStarted = true;
+
+					// *** THE CLOCK RESTARTS HERE, AND UNTIL v23 IT DID NOT. ***
+					//
+					// PhaseStartReal was still the start of phase 2, so the wait below expired
+					// SettleSeconds early and cut the walk short — the key was still held down when
+					// the second press went in. Measured on this build: 238 uu and 252 uu of
+					// separation across two runs, either side of the 260 uu minimum, so the second
+					// mouth was refused BY DESIGN and the command reported "*** FAIL *** the two
+					// mouths are 238 uu apart" for a product that was working perfectly. A harness
+					// that cries wolf costs exactly as much as one that cannot go red. With the
+					// restart she covers ~450 uu and the assertion measures the ability again.
+					State->PhaseStartReal = NowReal;
+
 					if (APlayerController* LocalPC = TickWorld->GetFirstPlayerController())
 					{
 						// HALF the gap, so the second half is deceleration: she has to be STOOD STILL
@@ -1415,6 +1429,318 @@ namespace TraceAbilitySetElleFile
 		     "on this machine and whether the second press paired it. Runs on a host OR a client — the client "
 		     "half is the one Trace.Elle.Verify structurally cannot cover. Red arm: Trace.Elle.SnapEnabled 0."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RunElleSnapPressTest));
+
+	// =============================================================================================
+	// Trace.Elle.PortalShot — DEMO 20 ITEM 4's EVIDENCE, POSED FOR THE CAMERA
+	//
+	// "Elle's portal is invisible" is a report about a SCREEN, so the only thing that can close it is
+	// a picture taken from where the player sits. Trace.Elle.SnapPressTest already presses the real
+	// key twice and pairs a portal, but it deliberately leaves Elle standing INSIDE the second mouth
+	// (that is the assertion it exists to make), and from in there the first mouth is exactly 90° off
+	// her nose and out of frame. A photograph of one mouth cannot answer "BOTH mouths visible".
+	//
+	// So this does the same two presses and then does the one thing the press test must not: it backs
+	// her straight out of the mouth she is standing in, which puts the mouth she left ahead of her and
+	// the first mouth ahead and to one side. Then it prints, for each of her own gates, the beads it
+	// DRAWS, its colour, and its angle off the camera's forward vector against the camera's own FOV —
+	// so the claim "both mouths are in this frame" is checkable against the log rather than being an
+	// opinion about a JPEG. It asserts nothing and passes nothing; it poses and it reports.
+	//
+	// Everything it does happens inside the shipped 8 s pair lifetime, on the shipped knobs. Red arm:
+	// Trace.Elle.GateVisible 0 — same run, same log, beads drawn falls to 0 and the photograph of the
+	// same two mouths is of an empty floor.
+	// =============================================================================================
+
+	struct FPortalShotState
+	{
+		int32 Phase = 0;
+		double PhaseStartReal = 0.0;
+		double AcquireDeadline = 0.0;
+
+		/**
+		 * How long to hold the strafe key that separates the two mouths.
+		 *
+		 * 0.6 s at the shipped 800 uu/s walk clears the 260 uu minimum separation with room to
+		 * spare. Too short and Snap REFUSES the second mouth for being on top of the first — a
+		 * correct refusal that photographs identically to a broken ability.
+		 */
+		float WalkSeconds = 0.6f;
+		/**
+		 * How long to hold the back-up key that gets her OUT of the second mouth and looking at both.
+		 *
+		 * The camera has to end up further back than the mouths are apart, or the first mouth sits
+		 * outside a 90 deg FOV and the frame answers half the question. 1.3 s is roughly 800 uu.
+		 */
+		float BackUpSeconds = 1.3f;
+
+		TWeakObjectPtr<UTraceAbilityComponent> Elle;
+		TWeakObjectPtr<APlayerState> ElleState;
+	};
+
+	/** Every gate this player owns, described from the camera. The log the screenshot is judged with. */
+	/**
+	 * TURN AND LOOK AT THE PORTAL, which is what a player does and what the fixture kept forgetting.
+	 *
+	 * Where the practice range drops Elle, and which way she is facing when it does, varies run to
+	 * run: three consecutive runs of this command put the two mouths at 8 deg, 41 deg and 45 deg off
+	 * the camera's nose, and the last of those is a photograph of a floor pad with the portal off the
+	 * edge of the frame. The gates were identical in all three. Evidence that depends on where the
+	 * spawn happened to point is not evidence, so the camera is aimed at the midpoint of the two
+	 * mouths before the frame is taken — the same mouse movement a player would make, on the same
+	 * camera, from the same chair. Nothing about the gates is touched.
+	 */
+	void AimAtOwnPortal(UWorld* WorldPtr, const APlayerState* Placer)
+	{
+		APlayerController* PC = (WorldPtr != nullptr) ? WorldPtr->GetFirstPlayerController() : nullptr;
+		const APlayerCameraManager* Cam = (PC != nullptr) ? PC->PlayerCameraManager : nullptr;
+		if (Cam == nullptr)
+		{
+			return;
+		}
+
+		FVector Sum = FVector::ZeroVector;
+		int32 Count = 0;
+		for (TActorIterator<ATraceElleGate> It(WorldPtr); It; ++It)
+		{
+			const ATraceElleGate* Gate = *It;
+			if (Gate != nullptr && IsValid(Gate)
+				&& (Placer == nullptr || Gate->GetSourcePlayerState() == Placer))
+			{
+				Sum += Gate->GetMouthLocation();
+				++Count;
+			}
+		}
+		if (Count == 0)
+		{
+			return;
+		}
+
+		const FVector Midpoint = Sum / static_cast<double>(Count);
+		const FRotator Look = (Midpoint - Cam->GetCameraLocation()).Rotation();
+
+		// Yaw only, and roll zeroed. Pitching to the mouths would tip the horizon and make the frame
+		// look staged; the mouths are on the floor and a level look already holds them.
+		PC->SetControlRotation(FRotator(0.f, Look.Yaw, 0.f));
+	}
+
+	void LogPortalShotFraming(UWorld* WorldPtr, const APlayerState* Placer)
+	{
+		const APlayerController* PC = (WorldPtr != nullptr) ? WorldPtr->GetFirstPlayerController() : nullptr;
+		const APlayerCameraManager* Cam = (PC != nullptr) ? PC->PlayerCameraManager : nullptr;
+		if (Cam == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ELLESHOT] no camera on this machine — nothing to frame."));
+			return;
+		}
+
+		const FVector CamLocation = Cam->GetCameraLocation();
+		const FVector CamForward = Cam->GetCameraRotation().Vector();
+		const float HalfFOV = Cam->GetFOVAngle() * 0.5f;
+
+		int32 Mine = 0;
+		int32 Paired = 0;
+		int32 DrawnBeads = 0;
+		int32 InFrame = 0;
+
+		for (TActorIterator<ATraceElleGate> It(WorldPtr); It; ++It)
+		{
+			const ATraceElleGate* Gate = *It;
+			if (Gate == nullptr || !IsValid(Gate)
+				|| (Placer != nullptr && Gate->GetSourcePlayerState() != Placer))
+			{
+				continue;
+			}
+
+			const FVector Mouth = Gate->GetMouthLocation();
+			const FVector ToMouth = Mouth - CamLocation;
+			const float Distance = static_cast<float>(ToMouth.Size());
+			// A literal rather than KINDA_SMALL_NUMBER: the legacy math macros were re-spelled
+			// UE_KINDA_SMALL_NUMBER during the 5.x line and the old names are a deprecation shim,
+			// which is a C4996 waiting to happen on Windows. A uu is a centimetre; 1 is plenty.
+			const float OffAxisDeg = (Distance > 1.f)
+				? FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(
+					static_cast<float>(FVector::DotProduct(ToMouth / Distance, CamForward)), -1.f, 1.f)))
+				: 0.f;
+
+			// Against the HORIZONTAL half-FOV, which is the generous axis and the one the two mouths
+			// are separated along. A mouth is a 130 uu radius ring, so its EDGE is in frame a good way
+			// past the point its centre leaves — this stays the conservative test and says so.
+			const bool bInFrame = (OffAxisDeg <= HalfFOV);
+
+			++Mine;
+			Paired += Gate->IsPaired() ? 1 : 0;
+			DrawnBeads += Gate->GetDrawnBeadCount();
+			InFrame += bInFrame ? 1 : 0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ELLESHOT]   mouth at (%s): paired=%d beads DRAWN=%d | %.0f uu from the camera, "
+				     "%.1f deg off centre (half-FOV %.1f) -> %s"),
+				*Mouth.ToCompactString(), Gate->IsPaired() ? 1 : 0, Gate->GetDrawnBeadCount(),
+				Distance, OffAxisDeg, HalfFOV, bInFrame ? TEXT("IN FRAME") : TEXT("out of frame"));
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ELLESHOT] READY: %d of her own mouths standing, %d paired, %d in frame, %d beads drawn in "
+			     "total. Camera at (%s) looking (%s). A screenshot taken now is the answer to 'Elle's portal "
+			     "is invisible'; with Trace.Elle.GateVisible 0 the same run draws 0 beads."),
+			Mine, Paired, InFrame, DrawnBeads,
+			*CamLocation.ToCompactString(), *CamForward.ToCompactString());
+	}
+
+	void RunEllePortalShot(const TArray<FString>& Args)
+	{
+		UWorld* WorldPtr = FindLocalGameWorldForPressTest();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ELLESHOT] no local game world with a player in it — this poses a CAMERA, so it needs a "
+				     "machine somebody is sitting at."));
+			return;
+		}
+		if (WorldPtr->IsPaused())
+		{
+			if (APlayerController* FirstPC = WorldPtr->GetFirstPlayerController())
+			{
+				FirstPC->SetPause(false);
+			}
+		}
+
+		TSharedPtr<FPortalShotState> State = MakeShared<FPortalShotState>();
+		State->WalkSeconds = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 0.1f, 3.f) : State->WalkSeconds;
+		State->BackUpSeconds = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 0.f, 3.f) : State->BackUpSeconds;
+		State->PhaseStartReal = FPlatformTime::Seconds();
+		State->AcquireDeadline = State->PhaseStartReal + 90.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ELLESHOT] ===== DEMO 20 item 4. Two presses of the real E key, then back out of the second "
+			     "mouth so BOTH are in one frame. walk=%.2fs backUp=%.2fs. ====="),
+			State->WalkSeconds, State->BackUpSeconds);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				return false;
+			}
+			const double NowReal = FPlatformTime::Seconds();
+
+			// ---- Phase 0: stage, exactly as the press test stages ------------------------------
+			if (State->Phase == 0)
+			{
+				UTraceAbilityComponent* Local = FindLocalAbilityComponent(TickWorld);
+				if (Local != nullptr && Local->GetCharacterId() != ETraceCharacterId::Elle)
+				{
+					if (Local->GetOwner() != nullptr && Local->GetOwner()->HasAuthority())
+					{
+						Local->ServerSetCharacter(ETraceCharacterId::Elle);
+					}
+					else
+					{
+						Local->ServerRequestSetCharacter(ETraceCharacterId::Elle);
+					}
+				}
+
+				UTraceAbilitySetElle* ElleSet = (Local != nullptr)
+					? Local->GetAbilitySetAs<UTraceAbilitySetElle>() : nullptr;
+				const ATraceCharacter* EllePawn = (Local != nullptr) ? Local->GetOwningCharacter() : nullptr;
+				const ATracePlayerController* LocalTracePC =
+					Cast<ATracePlayerController>(TickWorld->GetFirstPlayerController());
+				const bool bInputLive = (LocalTracePC != nullptr) && !LocalTracePC->IsGameInputSuppressed()
+					&& !TickWorld->IsPaused();
+
+				if (ElleSet == nullptr || EllePawn == nullptr || !EllePawn->IsAlive() || !bInputLive)
+				{
+					if (NowReal > State->AcquireDeadline)
+					{
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[ELLESHOT] ABORTED: could not stage Elle (set=%d livingPawn=%d inputLive=%d)."),
+							(ElleSet != nullptr) ? 1 : 0, (EllePawn != nullptr && EllePawn->IsAlive()) ? 1 : 0,
+							bInputLive ? 1 : 0);
+						return false;
+					}
+					return true;
+				}
+
+				State->Elle = Local;
+				State->ElleState = Local->GetOwningPlayerState();
+				State->Phase = 1;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 1: press 1, then start the strafe that separates the mouths ---------------
+			if (State->Phase == 1)
+			{
+				PressAbilityKey(TickWorld);
+				if (APlayerController* LocalPC = TickWorld->GetFirstPlayerController())
+				{
+					LocalPC->ConsoleCommand(FString::Printf(TEXT("Trace.SimInput D %.2f"), State->WalkSeconds),
+						/*bWriteToLog=*/false);
+				}
+				State->Phase = 2;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 2: press 2 once she has stopped, which pairs them -------------------------
+			//
+			// The wait is the walk plus a beat of deceleration: the second mouth is placed where she
+			// COMES TO REST, and a mouth placed mid-slide is one she has already coasted out of.
+			if (State->Phase == 2)
+			{
+				if ((NowReal - State->PhaseStartReal) < static_cast<double>(State->WalkSeconds) + 0.55)
+				{
+					return true;
+				}
+				PressAbilityKey(TickWorld);
+				State->Phase = 3;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 3: BACK OUT OF THE MOUTH SHE IS STANDING IN --------------------------------
+			//
+			// Backwards, not forwards or sideways, and that is the whole trick: it leaves the mouth she
+			// just placed dead ahead and the first mouth ahead and to the side she walked from, so one
+			// frame holds both. It is also a free demonstration of the Demo 17 step-in edge — she walks
+			// OUT of a live gate and is not teleported, because leaving is not entering.
+			if (State->Phase == 3)
+			{
+				if ((NowReal - State->PhaseStartReal) < 0.35)
+				{
+					return true;   // let the pair form and replicate before moving her
+				}
+				if (APlayerController* LocalPC = TickWorld->GetFirstPlayerController())
+				{
+					LocalPC->ConsoleCommand(FString::Printf(TEXT("Trace.SimInput S %.2f"), State->BackUpSeconds),
+						/*bWriteToLog=*/false);
+				}
+				State->Phase = 4;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 4: hold still and describe the shot ----------------------------------------
+			if ((NowReal - State->PhaseStartReal) < static_cast<double>(State->BackUpSeconds) + 0.4)
+			{
+				return true;
+			}
+
+			AimAtOwnPortal(TickWorld, State->ElleState.Get());
+			LogPortalShotFraming(TickWorld, State->ElleState.Get());
+			return false;
+		}));
+	}
+
+	FAutoConsoleCommand CmdEllePortalShot(
+		TEXT("Trace.Elle.PortalShot"),
+		TEXT("DEMO 20 item 4. Trace.Elle.PortalShot [WalkSeconds] [BackUpSeconds] — presses the real E key twice "
+		     "to open a portal, then backs out of the second mouth so BOTH mouths are in one frame, and logs each "
+		     "mouth's drawn-bead count and angle off camera so a screenshot can be checked against the log. Pair "
+		     "up ~1.5 s after it starts; shoot within the 8 s pair lifetime. Red arm: Trace.Elle.GateVisible 0."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RunEllePortalShot));
 }
 
 #endif   // !UE_BUILD_SHIPPING

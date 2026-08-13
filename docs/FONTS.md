@@ -1,38 +1,48 @@
 # Fonts in Trace
 
-## What is actually on screen today
+## What is on screen
 
-**The menu typeface is Lato Regular**, imported as an ordinary runtime `UFont` at
-`/Game/Trace/UI/Fonts/F_TraceMenu`. It is the *interim* face chosen by spec v20
-§1: of the twelve candidates the owner supplied it measured closest to the
-artist's lettering, and it is SIL Open Font Licence, so the `.ttf` itself is
-committed at `Art/Fonts/Lato-Regular.ttf` (see the negation rule in
-`.gitignore`). Swapping it is one line — `MenuFontSourceFile` in
-`Source/Trace/UI/Widgets/Menu/TraceMenuArtStyle.h`.
+**The menu and HUD typeface is Sofachrome**, in two real weights — no synthesis:
 
-The rest of this document describes **Sofachrome**, the artist's real face, and a
-bitmap-atlas route for shipping it without embedding it. That route is **designed
-but not wired up**, and the section below records the engine fact that has to be
-solved before it can be:
+| Atlas | Font file | Used for |
+|---|---|---|
+| `T_FontAtlas` | `Sofachrome W05 ExtraLight.ttf` (weight 250) | everything by default |
+| `T_FontAtlasBold` | `Sofachrome Rg.otf` (weight 400) | character names on the select screen |
 
-> **An "offline" (bitmap-atlas) `UFont` cannot drive the UMG title screen.**
-> `UFont::GetCompositeFont` returns `nullptr` unless `FontCacheType == Runtime`
-> (`Engine/Private/Font.cpp`), and `FSlateFontInfo` then silently substitutes
-> Slate's last-resort face. So an atlas font can work for the Canvas screens and
-> will quietly do nothing for every text block in `WBP_TitleMenu`. Measured
-> during the spec v20 pass, not assumed.
+Measured against the artist's own baked lettering, whose strokes are **10.3% of
+cap height**: ExtraLight is **16.9%**, Regular is **66.2%**. ExtraLight is the
+face the menu art was designed in.
 
-Status of the atlas pipeline, so nobody follows a dead path:
+Text is drawn from a **bitmap glyph atlas** — a texture of every letter plus a
+metrics file — by two renderers in `Source/Trace/UI/Text/`: a Canvas blitter and
+a UMG widget. Neither constructs an `FSlateFontInfo`, deliberately (see below).
 
-| Piece | State |
-|---|---|
-| `Scripts/generate_font_atlas.py` | exists; writes the PNG + JSON described below |
-| `Content/Trace/UI/Fonts/Source/T_FontAtlas.{png,json}` | generated, committed |
-| `Scripts/import-font-atlas.sh` | **does not exist** |
-| Any C++ referencing the atlas | **none** — `grep -rn FontAtlas Source/` is empty |
+**The font files are NOT in this repository and must never be committed.** They
+are gitignored. To work on the UI, put your own licensed copies in `Art/Fonts/`
+and run:
 
-So the atlas is currently art on disk, not a font the game uses. Reconcile it
-with the runtime-`UFont` route before calling either one done.
+    python3 Scripts/generate_font_atlas.py --font "Art/Fonts/Sofachrome W05 ExtraLight.ttf" --name T_FontAtlas --preview
+    python3 Scripts/generate_font_atlas.py --font "Art/Fonts/Sofachrome Rg.otf"            --name T_FontAtlasBold
+    Scripts/import-font-atlas.sh
+
+Skip it and the menu falls back to Lato. Nothing breaks; it just looks wrong.
+
+## Do not try to synthesise a weight
+
+`generate_font_atlas.py` has a `--thin` option that erodes glyphs to fake a
+lighter cut. **It defaults to 0 and should stay there.** Two attempts to use it
+damaged the letterforms: the first clipped glyphs outright (PLAY lost the A's
+left diagonal and the Y became a stub), and even once that was fixed, uniform
+erosion past one pixel DELETED `( ) [ ] { } /` and `\` entirely — and the HUD
+draws `[E]`. Use a real weight instead. That is what ExtraLight is for.
+
+## An engine fact that shaped the design
+
+An "offline" (bitmap) `UFont` **cannot drive UMG**. `UFont::GetCompositeFont`
+returns `nullptr` unless `FontCacheType == Runtime` (`Engine/Private/Font.cpp`),
+and `FSlateFontInfo` then silently substitutes Slate's last-resort face — so an
+atlas font would look correct on the Canvas screens and be quietly wrong on the
+UMG title screen. That is why the glyphs are drawn directly instead.
 
 ## Why the atlas route was designed this way
 
@@ -87,6 +97,23 @@ Every cell is a **full advance width by a full line height**, so the engine can
 advance the pen by the cell width and sit every glyph on a shared baseline with
 no per-glyph bearing table. That is deliberate: it is exactly what Unreal's
 offline font format can express.
+
+Cells are packed with a **16 px transparent gutter** (`PAD` in
+`generate_font_atlas.py`) and imported **with a mip chain**
+(`TMGS_SIMPLE_AVERAGE`). Both halves of that are load-bearing and they must move
+together. The HUD draws this 96 px em at ~10 px; with no mips each screen pixel
+took roughly one arbitrary texel, and in an extra-light face the horizontal bars
+are one texel tall — so the title screen drew "MOVE" as "MOVC" and "ESC" as
+"CSC". Mips fix it, but a mip averages **across** the gutter, so the old 2 px
+one would have pulled the next letter into this one. 16 px covers mip 3, i.e.
+down to a 12 px em.
+
+**The two weights do not share advances.** They are two different font files, so
+94 of the 95 cells differ and bold is roughly half again as wide. Layout and
+`TraceText::MeasureWidth()` are both face-relative and answer correctly — but
+only if you hand them the weight you are going to **draw** in. Measuring light
+and drawing bold is how the character name overran its column on the select
+screen.
 
 Regenerate at a different size with `--size` (default 96 px em — menu text is
 20-32 px at 1080p, so there is room to downscale cleanly). `--preview` writes a
