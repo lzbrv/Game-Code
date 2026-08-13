@@ -1110,7 +1110,9 @@ ROW_BIND_NAMES = [
 TITLE_BIND_NAMES = [
     "Backdrop", "SwooshImage", "Wordmark", "TaglineText", "AddressChip",
     "AddressCaptionText", "AddressValueText", "PortWarningText", "ConsolePanel",
-    "RowPlay", "RowJoin", "RowDifficulty", "RowMode", "RowSettings", "RowQuit",
+    # Must stay in step with the BindWidget properties on UTraceTitleMenuWidget AND with
+    # ETraceMenuRow. RowPractice is spec v19 section 2.
+    "RowPlay", "RowJoin", "RowPractice", "RowDifficulty", "RowMode", "RowSettings", "RowQuit",
     "BlurbText", "FooterKeysText", "FooterHintText", "MenuCursor",
     "TravelOverlay", "TravelWordmark", "TravelCaptionText", "TravelHintText",
     "FailureBanner", "FailureHeadlineText", "FailureDetailText",

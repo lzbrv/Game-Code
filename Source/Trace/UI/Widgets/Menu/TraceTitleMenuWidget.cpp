@@ -15,12 +15,18 @@ void UTraceTitleMenuWidget::NativeOnInitialized()
 {
 	Super::NativeOnInitialized();
 
-	// Resolved once, in ETraceMenuRow order. The HUD checks the count against its own enum and
-	// refuses to adopt the widget if they disagree — a seventh row in the asset with no C++ behind
-	// it would otherwise be a row that draws and does nothing.
+	// Resolved once, IN ETraceMenuRow ORDER — this list is the enum's mirror and the two are indexed
+	// against each other, so a row inserted in the middle of the enum must be inserted here too. The
+	// HUD checks the COUNT against its own enum and refuses to adopt the widget if they disagree, so
+	// a row in the asset with no C++ behind it cannot become a row that draws and does nothing.
+	//
+	// That guard did its job when spec v19 §2 added PRACTICE: the regenerated asset carried seven
+	// rows while this list still had six, and the menu fell back to the Canvas renderer with
+	// "WBP_TitleMenu offers 6 row widget(s), C++ has 7" rather than drawing a broken screen.
 	OrderedRows.Reset();
 	OrderedRows.Add(RowPlay);
 	OrderedRows.Add(RowJoin);
+	OrderedRows.Add(RowPractice);
 	OrderedRows.Add(RowDifficulty);
 	OrderedRows.Add(RowMode);
 	OrderedRows.Add(RowSettings);

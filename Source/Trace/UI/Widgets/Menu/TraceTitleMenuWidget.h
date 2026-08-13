@@ -184,6 +184,10 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTraceMenuRow> RowJoin;
 
+	/** Spec v19 §2, the practice range. Third, with PLAY and JOIN — see ETraceMenuRow::Practice. */
+	UPROPERTY(meta = (BindWidget))
+	TObjectPtr<UTraceMenuRow> RowPractice;
+
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTraceMenuRow> RowDifficulty;
 

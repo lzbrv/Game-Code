@@ -1088,9 +1088,10 @@ namespace TraceCharacterSelectCommands
 
 	FAutoConsoleCommand CmdTraceCharacterSelectClickTest(
 		TEXT("Trace.Characters.ClickTest"),
-		TEXT("Dev only. Spec v15 s4. Parks the cursor on card 1..N (N = the roster size, 8 since spec "
-		     "v18 s2) and clicks it through the real input pipeline, then reports how many complete "
-		     "clicks the card needed. No effect unless the select screen is open on this machine."),
+		TEXT("Dev only. Spec v15 s4. Parks the cursor on card 1..N (N = the roster size, 10 since spec "
+		     "v19 s3 added Mortimer and Lily) and clicks it through the real input pipeline, then "
+		     "reports how many complete clicks the card needed. Card 10 is the one the 0 key selects. "
+		     "No effect unless the select screen is open on this machine."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&TraceCharacterSelectClickTestCommand));
 
 	FAutoConsoleCommand CmdTraceCharacterSelect(
