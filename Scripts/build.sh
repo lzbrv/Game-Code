@@ -216,6 +216,31 @@ fi
 trace_msg "Success in ${ELAPSED}s."
 
 # ------------------------------------------------------------------------------
+# A GREEN BUILD HERE DOES NOT MEAN A GREEN BUILD FOR ANYBODY ELSE.
+#
+# On 2026-08-13 a commit shipped TraceAbilitySetLily.cpp — which calls
+# SetJumpHeld() / IsJumpHeld() — while leaving Source/Trace/Movement out of the
+# staging list. This machine stayed green because the working tree still had the
+# uncommitted header. Every Windows developer got five copies of
+#     error C2039: 'SetJumpHeld': is not a member of UTraceCharacterMovementComponent
+# and could not build the game at all.
+#
+# The build cannot tell you what you forgot to commit, but it CAN tell you that
+# what it just proved is not what your collaborators will pull. That is the whole
+# warning: it is about the gap between the two, not about tidy working trees.
+# ------------------------------------------------------------------------------
+if command -v git >/dev/null 2>&1 && git -C "$TRACE_PROJECT_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    DIRTY_SOURCE="$(git -C "$TRACE_PROJECT_ROOT" status --porcelain -- Source Config 2>/dev/null \
+        | grep -vE '^\?\?' | wc -l | tr -d ' ')"
+    if [ "${DIRTY_SOURCE:-0}" != "0" ]; then
+        trace_warn "This build included ${DIRTY_SOURCE} uncommitted change(s) under Source/ or Config/."
+        trace_warn "It therefore proves nothing about what is on the branch. Before you push, commit"
+        trace_warn "them and build again — a caller committed without its declaration compiles here"
+        trace_warn "and fails for everyone else (see the comment above this check in build.sh)."
+    fi
+fi
+
+# ------------------------------------------------------------------------------
 # Guard against the stale-metadata trap
 #
 # UnrealEditor.modules tells the engine WHICH dylib to load. Writing it is a
