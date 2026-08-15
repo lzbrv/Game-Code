@@ -5,7 +5,10 @@
 #include "Abilities/Characters/TraceAbilitySetMortimer.h"
 
 #include "CollisionQueryParams.h"
+#include "Components/CapsuleComponent.h"                   // the mantle probe's own dimensions
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Components/StaticMeshComponent.h"                // Trace.Mortimer.MantleTest's test ledge
+#include "Engine/StaticMeshActor.h"                        // Trace.Mortimer.MantleTest's test ledge
 #include "Containers/Ticker.h"                            // FTSTicker — Trace.Mortimer.QuakeTest
 #include "Engine/Engine.h"
 #include "Engine/StaticMesh.h"
@@ -80,6 +83,38 @@ static TAutoConsoleVariable<int32> CVarMortimerQuakeWave(
 	TEXT("Dev/red arm. 1 (default) = a Quake spawns its shockwave (Demo 20 item 3). 0 = it does not, "
 	     "which is exactly the invisible ability the owner reported. The knockback is identical either "
 	     "way — this switch touches nothing but the cosmetic."),
+	ECVF_Cheat);
+
+/**
+ * *** DEMO 21 ITEM 6'S RED ARM. *** 0 removes the mantle and NOTHING else — the probe never runs, so
+ * OnJumpPressed() declines and Mortimer's jump key is the ordinary jump key again, exactly the build
+ * the owner has asked three times for a mantle on.
+ *
+ * It is a CVar as well as bMortimerCanMantle so that Trace.Mortimer.MantleTest can flip it between
+ * two arms of one run without writing to UTraceSettings (which is config-backed and would be a real
+ * settings change if a run died halfway). The knob and the arm mean the same thing; the arm is the
+ * one a harness should touch.
+ */
+static TAutoConsoleVariable<int32> CVarMortimerMantle(
+	TEXT("Trace.Mortimer.Mantle"),
+	1,
+	TEXT("Dev/red arm. 1 (default) = Demo 21 item 6's mantle is live for Mortimer alone. 0 = it is not, "
+	     "which is the build the owner reported a missing mantle in. Nothing else changes."),
+	ECVF_Cheat);
+
+/**
+ * *** DEMO 21 ITEM 7'S RED ARM. *** 0 forces UTraceAbilitySetMortimer::GetThrowChargePastFullScale()
+ * to 1.0, i.e. the straight line the game had before Demo 21, and changes NOTHING else — the hold cap
+ * still stretches by MortimerThrowChargeHoldScale, the floor is the same, the shared curve is the
+ * same. So Trace.Mortimer.ThrowTest can throw the same four Cores on both sides of the item and the
+ * only difference in the world is the rule under test.
+ */
+static TAutoConsoleVariable<int32> CVarMortimerThrowPastFull(
+	TEXT("Trace.Mortimer.ThrowPastFull"),
+	1,
+	TEXT("Dev/red arm. 1 (default) = Demo 21 item 7: charge past the ORIGINAL 100% point counts at "
+	     "MortimerThrowChargePastFullScale (0.6). 0 = it counts in full, which is the pre-Demo-21 "
+	     "straight line. Only Mortimer has any charge past 100% to scale."),
 	ECVF_Cheat);
 
 const TCHAR* TraceMortimerBlastRefusalToString(ETraceMortimerBlastRefusal Reason)
@@ -364,6 +399,21 @@ float UTraceAbilitySetMortimer::GetThrowChargeHoldScale() const
 	return FMath::Clamp(UTraceSettings::Get().MortimerThrowChargeHoldScale, 1.f, 8.f);
 }
 
+float UTraceAbilitySetMortimer::GetThrowChargePastFullScale() const
+{
+	// DEMO 21 ITEM 7. The red arm returns the IDENTITY (1.0) rather than 0, because "no modifier" is
+	// what the pre-Demo-21 game did — a 0 here would mean "extra charge is worth nothing", which is a
+	// third behaviour that never shipped and would make the arm prove the wrong thing.
+	if (CVarMortimerThrowPastFull.GetValueOnAnyThread() == 0)
+	{
+		return 1.f;
+	}
+
+	// Clamped to [0,1] rather than trusted: above 1 this would make his extra charge worth MORE than
+	// the base line's, which is the opposite of the item and would read as the sign being flipped.
+	return FMath::Clamp(UTraceSettings::Get().MortimerThrowChargePastFullScale, 0.f, 1.f);
+}
+
 bool UTraceAbilitySetMortimer::AllowsMantle() const
 {
 	return UTraceSettings::Get().bMortimerCanMantle;
@@ -372,6 +422,460 @@ bool UTraceAbilitySetMortimer::AllowsMantle() const
 float UTraceAbilitySetMortimer::GetMantleGenerosityScale() const
 {
 	return FMath::Clamp(UTraceSettings::Get().MortimerMantleGenerosity, 1.f, 4.f);
+}
+
+// =================================================================================================
+// DEMO 21 ITEM 6 — THE MANTLE
+//
+// Read the header block first: it says what this is (two impulses on the jump key), what it is not
+// (a per-frame MOVE_Flying pull-up inside the movement component) and what the prediction caveat is.
+// This block is only about the arithmetic.
+//
+// THE THREE MARGINS BELOW ARE FILE CONSTANTS AND NOT KNOBS, ON PURPOSE. Every one of them is a
+// property of the CAPSULE or of the probe's own geometry rather than a design dial: a designer
+// retuning the mantle wants the reach, the ceiling and the generosity, and four more sliders that do
+// nothing legible is how this file ended up with three knobs nobody called. They are all expressed
+// against the capsule radius so they follow it (spec v24 §0) — none of them is a raw uu count.
+// =================================================================================================
+
+namespace TraceMortimerMantleFile
+{
+	/** How far ABOVE the lip his feet are aimed, in capsule radii. The margin the forward push spends. */
+	constexpr float ClearanceRadii = 1.0f;
+
+	/** How far past the lip the landing point sits, in capsule radii. Legacy used the same half-radius. */
+	constexpr float LandingInsetRadii = 0.5f;
+
+	/** Seconds the forward push is budgeted to cross the gap in. Sets its speed; see BeginMantle. */
+	constexpr float PushSeconds = 0.40f;
+
+	/** The three heights the face is probed at, as fractions of the capsule HALF-height. */
+	constexpr float ProbeFractions[] = { 0.02f, 0.5f, 1.0f };
+}
+
+void UTraceAbilitySetMortimer::ClearMantle()
+{
+	MantlePushDeadline = 0.f;
+	MantlePushAboveZ = 0.f;
+	MantlePushDirection = FVector::ZeroVector;
+	MantlePushSpeed = 0.f;
+}
+
+void UTraceAbilitySetMortimer::OnPawnDied()
+{
+	ClearMantle();
+}
+
+void UTraceAbilitySetMortimer::OnUnequipped()
+{
+	ClearMantle();
+}
+
+bool UTraceAbilitySetMortimer::ProbeLedge(FTraceMortimerLedge& Out, bool bFromGround) const
+{
+	Out = FTraceMortimerLedge();
+
+	const ATraceCharacter* MyPawn = GetCharacter();
+	const UTraceCharacterMovementComponent* Move = GetMovement();
+	const UCapsuleComponent* Capsule = (MyPawn != nullptr) ? MyPawn->GetCapsuleComponent() : nullptr;
+	UWorld* const World = (MyPawn != nullptr) ? MyPawn->GetWorld() : nullptr;
+
+	if (MyPawn == nullptr || Move == nullptr || Capsule == nullptr || World == nullptr)
+	{
+		Out.Why = TEXT("no pawn, no movement component or no world");
+		return false;
+	}
+
+	const float Radius = Capsule->GetScaledCapsuleRadius();
+	const float HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+	const FVector Here = MyPawn->GetActorLocation();
+	const float FeetZ = static_cast<float>(Here.Z) - HalfHeight;
+
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	const float Generosity = FMath::Clamp(TraceAbilityTraits::GetMantleGenerosityScale(MyPawn), 1.f, 4.f);
+
+	// --- THE WINDOW, DERIVED (spec v24 §0) -------------------------------------------------------
+	//
+	// NOT ONE uu LITERAL IN HERE. The ceiling is a multiple of HIS OWN JUMP APEX and the floor is his
+	// own step height, both read off the live movement component, so a retune of JumpZVelocity, of
+	// MovementGravityScale or of MaxStepHeight moves the mantle with them. The legacy mantle stored
+	// 230 uu and 55 uu flat and would have silently stopped meaning "the ledges he cannot jump" the
+	// first time anybody touched the jump.
+	const float GravityDown = FMath::Max(1.f, -Move->GetGravityZ());
+	const float JumpApex = (Move->JumpZVelocity * Move->JumpZVelocity) / (2.f * GravityDown);
+
+	Out.JumpApexUU = JumpApex;
+	Out.CeilingUU  = JumpApex * FMath::Max(0.1f, Settings.MortimerMantleApexReach) * Generosity;
+	Out.FloorUU    = FMath::Max(1.f, Move->MaxStepHeight) / Generosity;
+	Out.ReachUU    = Radius * FMath::Max(1.f, Settings.MortimerMantleReachRadii) * Generosity;
+
+	if (Out.CeilingUU <= Out.FloorUU)
+	{
+		Out.Why = FString::Printf(TEXT("the window is inverted (floor %.0f >= ceiling %.0f) — check "
+			"MortimerMantleApexReach and MortimerMantleGenerosity"), Out.FloorUU, Out.CeilingUU);
+		return false;
+	}
+
+	// --- WHICH WAY IS "AT THE LEDGE" -------------------------------------------------------------
+	//
+	// The movement INPUT when he is giving one, his facing when he is not. That is the whole of "a
+	// ledge he is holding against": the probe only reaches 124 uu, so a face has to be right there in
+	// the direction he is driving, and a player who is walking away from a wall is probing away from
+	// it and gets an ordinary jump. No separate speed gate — the legacy mantle needed one because it
+	// fired by itself, and this one fires because he pressed a key.
+	FVector Forward = Move->GetCurrentAcceleration().GetSafeNormal2D();
+	if (Forward.IsNearlyZero())
+	{
+		Forward = MyPawn->GetActorForwardVector().GetSafeNormal2D();
+	}
+	if (Forward.IsNearlyZero())
+	{
+		Out.Why = TEXT("no forward direction (no input and a degenerate facing)");
+		return false;
+	}
+	Out.Forward = Forward;
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceMortimerMantle), /*bTraceComplex*/ false, MyPawn);
+	// The probing pawn is ignored via the constructor above — the ONE line that took the legacy
+	// mantle from 0/8 successful attempts to 7/8, because these are raw line traces starting on the
+	// capsule's own axis and MoveComponent's self-exclusion does not apply to them.
+	Params.bFindInitialOverlaps = false;
+	const FCollisionResponseParams Response = FCollisionResponseParams::DefaultResponseParam;
+	const ECollisionChannel Channel = Capsule->GetCollisionObjectType();
+
+	// --- 1. THE FACE ------------------------------------------------------------------------------
+	//
+	// THREE HEIGHTS, AND AN UNUSABLE HIT DOES NOT END THE SEARCH. Mined verbatim from dffea7c, where
+	// keeping the FIRST probe that hit anything and breaking produced 6825 refusals reading
+	// "penetrating=1 dist=0.00" against 39 real mantles: the low probe sits inside the floor slab the
+	// pawn is pressed against on almost every frame of a real approach, and masked the two above it.
+	FHitResult WallHit;
+	bool bFoundWall = false;
+	FString WallWhy = FString::Printf(TEXT("no face within %.0f uu ahead along %s"),
+		Out.ReachUU, *Forward.ToCompactString());
+
+	for (const float Fraction : TraceMortimerMantleFile::ProbeFractions)
+	{
+		const FVector ProbeStart(Here.X, Here.Y, FeetZ + HalfHeight * Fraction);
+		FHitResult ProbeHit;
+		if (!World->LineTraceSingleByChannel(ProbeHit, ProbeStart, ProbeStart + Forward * Out.ReachUU,
+			Channel, Params, Response))
+		{
+			continue;
+		}
+
+		// THE LADDER-TO-THE-SKY GUARD, and it is measured rather than precautionary: without it a
+		// headless match produced 289 mantles in 25 s and carried a bot team from Z=313 to Z=4097.
+		// A penetrating hit reports ImpactPoint = the trace's own start and ImpactNormal =
+		// -TraceDirection, which is horizontal and therefore passes for a wall, so the pawn mantles
+		// onto itself, ends up embedded slightly higher, and does it again forever.
+		if (ProbeHit.bStartPenetrating || ProbeHit.Distance < 1.f)
+		{
+			WallWhy = FString::Printf(
+				TEXT("face at +%.0f uu is degenerate (penetrating=%d dist=%.2f actor=%s)"),
+				HalfHeight * Fraction, ProbeHit.bStartPenetrating ? 1 : 0, ProbeHit.Distance,
+				*GetNameSafe(ProbeHit.GetActor()));
+			continue;
+		}
+
+		// Near-vertical. 0.3 is about 17 degrees of lean either way; anything flatter is a ramp he
+		// should be running up rather than climbing.
+		if (FMath::Abs(ProbeHit.ImpactNormal.Z) > 0.3f)
+		{
+			WallWhy = FString::Printf(TEXT("face at +%.0f uu is not vertical (normal.Z=%.2f, actor %s)"),
+				HalfHeight * Fraction, ProbeHit.ImpactNormal.Z, *GetNameSafe(ProbeHit.GetActor()));
+			continue;
+		}
+
+		// YOU MAY NOT CLIMB PEOPLE, and the reason is prediction rather than taste: this whole feature
+		// is safe to run on two machines because it is derived from STATIC arena geometry, which is
+		// byte-identical on both. Another pawn's position is replicated, so a mantle keyed off one
+		// would put the client and the server on different ledges. (It is also a stack-of-pawns ladder
+		// onto any roof in the arena, which the legacy mantle was measured doing.)
+		if (Cast<APawn>(ProbeHit.GetActor()) != nullptr)
+		{
+			WallWhy = FString::Printf(TEXT("face at +%.0f uu belongs to a pawn (%s) — people are not ledges"),
+				HalfHeight * Fraction, *GetNameSafe(ProbeHit.GetActor()));
+			continue;
+		}
+
+		WallHit = ProbeHit;
+		bFoundWall = true;
+		break;
+	}
+
+	if (!bFoundWall)
+	{
+		Out.Why = WallWhy;
+		return false;
+	}
+
+	// --- 2. THE TOP -------------------------------------------------------------------------------
+	//
+	// Dropped from above, just BEYOND the face, so it lands on the ledge's top surface and not on the
+	// face itself. The overshoot is half a capsule radius: far enough in to clear the lip's bevel,
+	// near enough to the edge that a narrow ledge still registers.
+	const FVector TopProbeXY = WallHit.ImpactPoint
+		+ Forward * (Radius * TraceMortimerMantleFile::LandingInsetRadii);
+	const FVector TopStart(TopProbeXY.X, TopProbeXY.Y, FeetZ + Out.CeilingUU + HalfHeight);
+	const FVector TopEnd(TopProbeXY.X, TopProbeXY.Y, FeetZ - 1.f);
+
+	FHitResult TopHit;
+	if (!World->LineTraceSingleByChannel(TopHit, TopStart, TopEnd, Channel, Params, Response))
+	{
+		Out.Why = FString::Printf(TEXT("no top above the face (probed z %.0f down to %.0f) — it is taller "
+			"than the %.0f uu ceiling, or it is a pillar with nothing on it"),
+			TopStart.Z, TopEnd.Z, Out.CeilingUU);
+		return false;
+	}
+	if (TopHit.bStartPenetrating)
+	{
+		Out.Why = TEXT("the top probe started inside geometry, so its 'surface' does not exist");
+		return false;
+	}
+	if (!Move->IsWalkable(TopHit))
+	{
+		Out.Why = FString::Printf(TEXT("the top is not walkable (normal.Z=%.2f) — an underside or a slope "
+			"he would slide straight back off"), TopHit.ImpactNormal.Z);
+		return false;
+	}
+	if (Cast<APawn>(TopHit.GetActor()) != nullptr)
+	{
+		Out.Why = FString::Printf(TEXT("the top belongs to a pawn (%s)"), *GetNameSafe(TopHit.GetActor()));
+		return false;
+	}
+
+	Out.TopZ = static_cast<float>(TopHit.ImpactPoint.Z);
+	Out.LedgeHeightUU = Out.TopZ - FeetZ;
+
+	if (Out.LedgeHeightUU < Out.FloorUU || Out.LedgeHeightUU > Out.CeilingUU)
+	{
+		Out.Why = FString::Printf(TEXT("ledge height %.0f uu is outside the window [%.0f, %.0f] "
+			"(apex %.0f x %.2f x generosity %.2f)"),
+			Out.LedgeHeightUU, Out.FloorUU, Out.CeilingUU, JumpApex,
+			Settings.MortimerMantleApexReach, Generosity);
+		return false;
+	}
+
+	// *** THE GROUND RULE. *** Standing on the floor, a ledge he can already JUMP onto is not a
+	// mantle — and consuming the jump key for it would take his ordinary jump away everywhere near a
+	// crate, which reads as the character being broken rather than as an ability firing. So on the
+	// ground the live window is (apex, ceiling]; in the air it is [floor, ceiling], which is the
+	// "came up short at the lip" save the mantle was originally asked for.
+	if (bFromGround && Out.LedgeHeightUU <= JumpApex)
+	{
+		Out.Why = FString::Printf(TEXT("standing still at a %.0f uu ledge and his own jump apex is %.0f uu "
+			"— a plain jump gets him there, so the jump key stays the jump key"),
+			Out.LedgeHeightUU, JumpApex);
+		return false;
+	}
+
+	// --- 3. ROOM TO STAND, PROVED BEFORE ANYTHING MOVES -------------------------------------------
+	//
+	// A mantle that starts and then finds the destination occupied has to either stop dead in mid-air
+	// or push the pawn into geometry, and both of those are corrections waiting to happen — which is
+	// the entire class of bug this feature's history is about.
+	Out.Destination = FVector(TopHit.ImpactPoint.X, TopHit.ImpactPoint.Y, Out.TopZ + HalfHeight + 2.f);
+
+	// AND IT HAS TO BE SOMEWHERE ELSE. A "ledge" directly overhead is him mantling his own column —
+	// the last guard against the climbing loop, and the one that still holds if some future geometry
+	// finds a way past the two penetration tests.
+	if (FVector::DistSquared2D(Out.Destination, Here) < FMath::Square(Radius * 0.5f))
+	{
+		Out.Why = FString::Printf(TEXT("the destination is directly overhead (%.0f uu ahead)"),
+			static_cast<float>(FVector::Dist2D(Out.Destination, Here)));
+		return false;
+	}
+
+	// Shrunk by 1 uu so a destination flush against a wall is not rejected by its own floor.
+	const FCollisionShape StandShape = FCollisionShape::MakeCapsule(Radius - 1.f, HalfHeight - 1.f);
+	if (World->OverlapBlockingTestByChannel(Out.Destination, FQuat::Identity, Channel, StandShape,
+		Params, Response))
+	{
+		Out.Why = FString::Printf(TEXT("no room to stand at %s"), *Out.Destination.ToCompactString());
+		return false;
+	}
+
+	Out.bFound = true;
+	return true;
+}
+
+bool UTraceAbilitySetMortimer::TryMantle()
+{
+	// --- THE GATE, IN ORDER. Every early return costs at most two int compares before any trace. ---
+
+	ATraceCharacter* MyPawn = GetCharacter();
+	UTraceCharacterMovementComponent* Move = GetMovement();
+	const UCapsuleComponent* Capsule = (MyPawn != nullptr) ? MyPawn->GetCapsuleComponent() : nullptr;
+	if (MyPawn == nullptr || Move == nullptr || Capsule == nullptr || !MyPawn->IsAlive())
+	{
+		return false;
+	}
+
+	// *** FIRST QUESTION, AND IT IS THE ONE THE WHOLE FEATURE'S SAFETY RESTS ON. *** False for every
+	// character but Mortimer, so nine tenths of the roster never reach a single line trace below.
+	if (!TraceAbilityTraits::IsMantleAllowed(MyPawn))
+	{
+		return false;
+	}
+
+	if (CVarMortimerMantle.GetValueOnAnyThread() == 0)
+	{
+		return false;   // RED ARM: the mantle is removed and nothing else is.
+	}
+
+	const float Now = MatchTimeNow();
+
+	// Already climbing, or still inside the rate limit. Declines rather than consuming the key, so a
+	// second press during a mantle is still a normal jump press for whatever else wants it.
+	if (IsMantling() || Now < MantleReadyTime)
+	{
+		return false;
+	}
+
+	// A SLIDE JUMP OUTRANKS A MANTLE. It is a deliberate, timed, high-value momentum play that the
+	// player has already spent a slide setting up, it lives inside the movement component's saved-move
+	// pipeline (so it is the better-predicted move), and there is no way to give it back once the
+	// window has closed. The mantle can wait a third of a second; that cannot.
+	//
+	// *** THE WALL JUMP DELIBERATELY DOES NOT. *** The legacy mantle's rule was the other way round —
+	// "a wall jump outranks a mantle", with a 0.30 s lockout — and it was right FOR THAT MANTLE,
+	// because that one fired by itself and would otherwise steal wall jumps the player never asked to
+	// give up. This one only fires when the player presses jump, and a player pressing jump while
+	// airborne against a ledge he can climb wants to be on top of it. The inversion is safe precisely
+	// because the probe is narrow: a tall wall has no walkable top inside the height ceiling, the probe
+	// finds nothing, and the press falls through to the wall jump exactly as it does today.
+	if (Move->IsSlideJumpAvailable())
+	{
+		return false;
+	}
+
+	const bool bFromGround = Move->IsGroundedForAbilities();
+
+	FTraceMortimerLedge Ledge;
+	if (!ProbeLedge(Ledge, bFromGround))
+	{
+		UE_LOG(LogTraceGame, Verbose, TEXT("[Mortimer] mantle refused: %s"), *Ledge.Why);
+		return false;
+	}
+
+	// --- THE LAUNCH. TWO IMPULSES; THIS IS THE FIRST. ---------------------------------------------
+	//
+	// Aimed so his FEET arrive one capsule radius above the lip. Solved rather than tuned: under
+	// constant gravity the launch speed that just reaches a height h is sqrt(2 g h), so this is the
+	// smallest rise that clears the ledge and it moves automatically with gravity and with the ledge.
+	// A flat "mantle jump velocity" knob would be too weak for a tall ledge and a trampoline off a
+	// short one.
+	const float Radius = Capsule->GetScaledCapsuleRadius();
+	const float HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+	const float FeetZ = static_cast<float>(MyPawn->GetActorLocation().Z) - HalfHeight;
+	const float GravityDown = FMath::Max(1.f, -Move->GetGravityZ());
+
+	const float Clearance = Radius * TraceMortimerMantleFile::ClearanceRadii;
+	const float NeededRise = FMath::Max(1.f, (Ledge.TopZ + Clearance) - FeetZ);
+	const float RiseSpeed = FMath::Min(FMath::Sqrt(2.f * GravityDown * NeededRise),
+		Move->JumpZVelocity * 3.f);
+
+	// bXYOverride AND bZOverride. A mantle is a COMMIT: zeroing the planar velocity stops a Mortimer
+	// who was running along the wall from sliding off the side of the ledge he just asked to climb,
+	// and assigning Z (rather than taking a max with it) makes the rise the same whether he pressed
+	// while falling fast, while rising, or from a standstill. Determinism here is what lets the
+	// server's copy of this press land in the same place as the client's.
+	MyPawn->LaunchCharacter(FVector(0.f, 0.f, RiseSpeed), /*bXYOverride*/ true, /*bZOverride*/ true);
+
+	// --- AND THE SECOND ONE IS ARMED, NOT FIRED ---------------------------------------------------
+	//
+	// It waits for his feet to clear the lip because firing it NOW would push him straight into the
+	// face he is climbing, where the engine's SlideAlongSurface would eat the whole forward component
+	// and he would rise, stall and drop back down exactly as if nothing had happened. That is the one
+	// non-obvious thing about this implementation and it is why there are two impulses instead of one.
+	const float Distance2D = static_cast<float>(FVector::Dist2D(Ledge.Destination, MyPawn->GetActorLocation()));
+
+	MantlePushDirection = Ledge.Forward;
+	MantlePushAboveZ    = Ledge.TopZ + 4.f;
+	MantlePushSpeed     = FMath::Clamp(Distance2D / TraceMortimerMantleFile::PushSeconds,
+		0.25f * Move->GetMaxSpeed(), 1.5f * Move->GetMaxSpeed());
+
+	// The give-up clock: twice the ballistic rise time, floored at half a second. If he never gets
+	// there — a lift moved, a Quake threw him, the ledge was destroyed — the mantle is abandoned and
+	// he simply falls, rather than being shoved sideways a second later by a stale impulse.
+	const float RiseSeconds = RiseSpeed / GravityDown;
+	MantlePushDeadline = Now + FMath::Max(0.5f, RiseSeconds * 2.f);
+	MantleReadyTime    = Now + FMath::Max(0.f, UTraceSettings::Get().MortimerMantleCooldownSeconds);
+	++MantleCount;
+
+	UE_LOG(LogTraceGame, Verbose,
+		TEXT("[Mortimer] MANTLE #%d from %s: ledge %.0f uu (window %.0f..%.0f, apex %.0f, reach %.0f), "
+		     "rise %.0f uu/s, push %.0f uu/s over %.0f uu when feet pass z=%.0f."),
+		MantleCount, bFromGround ? TEXT("the ground") : TEXT("the air"), Ledge.LedgeHeightUU,
+		Ledge.FloorUU, Ledge.CeilingUU, Ledge.JumpApexUU, Ledge.ReachUU, RiseSpeed, MantlePushSpeed,
+		Distance2D, MantlePushAboveZ);
+
+	return true;
+}
+
+bool UTraceAbilitySetMortimer::OnJumpPressed()
+{
+	// TRUE CONSUMES THE JUMP (ATracePlayerController::OnJumpStarted), so this returns true only when a
+	// mantle actually started. A press that finds no ledge has to fall through to ACharacter::Jump or
+	// Mortimer would stop being able to jump anywhere near a wall — which is a much worse bug than a
+	// missing mantle, and is the failure mode every other character on this hook guards against too.
+	return TryMantle();
+}
+
+void UTraceAbilitySetMortimer::TickAbilities(float /*DeltaSeconds*/)
+{
+	if (!IsMantling())
+	{
+		return;   // Every machine, every tick, for every Mortimer who is not mid-mantle. One compare.
+	}
+
+	ATraceCharacter* MyPawn = GetCharacter();
+	UTraceCharacterMovementComponent* Move = GetMovement();
+	const UCapsuleComponent* Capsule = (MyPawn != nullptr) ? MyPawn->GetCapsuleComponent() : nullptr;
+	const float Now = MatchTimeNow();
+
+	if (MyPawn == nullptr || Move == nullptr || Capsule == nullptr || !MyPawn->IsAlive())
+	{
+		ClearMantle();
+		return;
+	}
+
+	const float FeetZ = static_cast<float>(MyPawn->GetActorLocation().Z)
+		- Capsule->GetScaledCapsuleHalfHeight();
+
+	if (Now > MantlePushDeadline)
+	{
+		// He never got there. Say so at Verbose rather than silently: "the mantle sometimes does
+		// nothing" is exactly the report this branch explains, and the deadline is the only thing in
+		// the feature that can produce it.
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Mortimer] mantle abandoned: feet reached z=%.0f, needed z=%.0f before the deadline."),
+			FeetZ, MantlePushAboveZ);
+		ClearMantle();
+		return;
+	}
+
+	// Landed again without ever clearing the lip — he was blocked, or the ledge moved. Same abandon.
+	if (Move->IsMovingOnGround() && FeetZ < MantlePushAboveZ)
+	{
+		ClearMantle();
+		return;
+	}
+
+	if (FeetZ < MantlePushAboveZ)
+	{
+		return;   // Still climbing.
+	}
+
+	// *** THE SECOND AND LAST IMPULSE. *** bXYOverride so the planar velocity IS the push (he has none
+	// of his own: the first impulse zeroed it), and NOT bZOverride so whatever the climb has left —
+	// usually a few tens of uu/s — is kept and he arcs over the lip instead of stopping dead above it.
+	MyPawn->LaunchCharacter(FVector(MantlePushDirection.X * MantlePushSpeed,
+		MantlePushDirection.Y * MantlePushSpeed, 0.f), /*bXYOverride*/ true, /*bZOverride*/ false);
+
+	++MantlePushCount;
+	ClearMantle();
 }
 
 // =================================================================================================
@@ -1086,26 +1590,55 @@ namespace TraceMortimerVerifyFile
 			FString::Printf(TEXT("§3 says the mantle is 30%% more generous, i.e. 1.30; the knob is %.3f"),
 				Settings.MortimerMantleGenerosity));
 
+		Check(FMath::IsNearlyEqual(Settings.MortimerThrowChargePastFullScale, 0.6f, 0.001f),
+			FString::Printf(TEXT("Demo 21 item 7 asks for a .6x modifier past the original 100%% charge; "
+			                     "the knob is %.3f. Config/DefaultGame.ini beats TraceSettings.h — check "
+			                     "BOTH."), Settings.MortimerThrowChargePastFullScale));
+
+		// *** THE GATE, ASSERTED RATHER THAN ASSUMED. *** A null actor stands in for "any pawn with no
+		// ability component" — a Mannequin, a bot mid-spawn, a client pawn whose PlayerState has not
+		// arrived. If this ever returns true, every character in the game has just been given a mantle.
+		Check(!TraceAbilityTraits::IsMantleAllowed(nullptr),
+			TEXT("TraceAbilityTraits::IsMantleAllowed(nullptr) must be FALSE — it is the gate that keeps "
+			     "the mantle off the other nine characters and off every Mannequin"));
+		Check(FMath::IsNearlyEqual(TraceAbilityTraits::GetThrowChargePastFullScale(nullptr), 1.f, 0.001f),
+			TEXT("TraceAbilityTraits::GetThrowChargePastFullScale(nullptr) must be 1.0 — Demo 21 item 7 "
+			     "must be arithmetically absent for everybody but Mortimer"));
+
 		// --- and the derived numbers a designer actually reads ------------------------------------
 		const float DashReach = FMath::Max(0.f, Settings.DashSpeed) * FMath::Max(0.f, Settings.DashDuration);
 		const float HisReach  = DashReach * Settings.MortimerDashDistanceScale;
 		const float FullHold  = FMath::Max(0.01f, Settings.CoreThrowChargeSeconds);
 		const float HisHold   = FullHold * Settings.MortimerThrowChargeHoldScale;
 		const float Floor     = FMath::Clamp(Settings.CoreThrowChargeFloorFraction, 0.f, 1.f);
-		const float HisPower  = Floor + (1.f - Floor) * Settings.MortimerThrowChargeHoldScale;
 
 		const float HisCooldown = FMath::Max(0.f, Settings.DashCooldown) * Settings.MortimerDashCooldownScale;
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[%s] DASH   everybody %.0f uu (%.0f uu/s x %.2fs) -> Mortimer %.0f uu. "
-			     "COOLDOWN everybody %.2fs -> Mortimer %.2fs (x%.2f) ON PAPER — see the NOT LIVE line below."),
+			     "COOLDOWN everybody %.2fs -> Mortimer %.2fs (x%.2f). Both LIVE; Trace.Mortimer.DashTest "
+			     "measures them on a live pawn rather than printing the knobs back."),
 			Tag, DashReach, Settings.DashSpeed, Settings.DashDuration, HisReach,
 			Settings.DashCooldown, HisCooldown, Settings.MortimerDashCooldownScale);
+		// DEMO 21 ITEM 7. Both numbers, from the SHIPPED function rather than from a second copy of the
+		// arithmetic — the whole point of ATraceCore::GetThrowChargeScaleForHold being one expression.
+		const float LegacyPower = Floor + (1.f - Floor) * Settings.MortimerThrowChargeHoldScale;
+		const float BentPower   = Floor + (1.f - Floor)
+			* (1.f + FMath::Clamp(Settings.MortimerThrowChargePastFullScale, 0.f, 1.f)
+				* (Settings.MortimerThrowChargeHoldScale - 1.f));
+
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[%s] THROW  everybody may hold %.2fs for x1.00 launch speed -> Mortimer may hold %.2fs for "
-			     "x%.2f, ON THE SAME LINE (Power = %.2f + %.2f x t). NOTE: x%.2f SPEED is not x2 DISTANCE — "
-			     "flat-ground range goes as speed squared, so this is nearer 3.4x the range. Flagged."),
-			Tag, FullHold, HisHold, HisPower, Floor, 1.f - Floor, HisPower);
+			TEXT("[%s] THROW  everybody may hold %.2fs for x1.00 launch speed -> Mortimer may hold %.2fs. "
+			     "ON THE SAME LINE (Power = %.2f + %.2f x t) that used to be x%.2f; DEMO 21 ITEM 7 bends it "
+			     "past the original 100%% point at x%.2f, so his full extended charge is now x%.3f."),
+			Tag, FullHold, HisHold, Floor, 1.f - Floor, LegacyPower,
+			Settings.MortimerThrowChargePastFullScale, BentPower);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] THROW  SPEED IS NOT DISTANCE. Flat range goes as speed SQUARED (the loose Core is "
+			     "integrated under gravity with no drag), so his ceiling moves from about %.2fx a "
+			     "full-charge throw's range to about %.2fx it. Trace.Mortimer.ThrowTest throws four real "
+			     "Cores and MEASURES this; %.2f/%.2f here is arithmetic, not a measurement."),
+			Tag, LegacyPower * LegacyPower, BentPower * BentPower, LegacyPower, BentPower);
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[%s] QUAKE  radius %.0f uu, %.0f uu/s at the centre falling to %.0f%% at the rim, up bias %.2f, "
 			     "line of sight %s, cooldown %.0fs."),
@@ -1128,31 +1661,25 @@ namespace TraceMortimerVerifyFile
 		// of believing a sentence. If you wire one of the two remaining knobs, delete its line here in
 		// the same edit — a stale "NOT LIVE" costs exactly as much as a stale "LIVE".
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[%s] LIVE: the dash REACH (Movement/TraceCharacterMovementComponent.cpp, GetDashSpeed "
-			     "multiplies by TraceAbilityTraits::GetDashDistanceScale) and the Core-throw CAP "
-			     "(Gameplay/TraceCore.cpp, GetThrowChargeScaleForHold, two call sites). QUAKE IS LIVE and "
-			     "as of Demo 20 it also draws a shockwave, so a cast with nobody in range is visible."),
+			TEXT("[%s] LIVE: the dash REACH and the dash COOLDOWN (Movement/TraceCharacterMovementComponent"
+			     ".cpp, GetDashSpeed / GetDashCooldown multiply by TraceAbilityTraits::GetDash*Scale), and "
+			     "the Core-throw CAP plus Demo 21 item 7's 0.6x bend (Gameplay/TraceCore.cpp, "
+			     "GetThrowChargeScaleForHold). QUAKE IS LIVE and draws a shockwave. Measured by "
+			     "Trace.Mortimer.DashTest and Trace.Mortimer.ThrowTest — believe those, not this line."),
 			Tag);
 
-		UE_LOG(LogTraceGame, Warning,
-			TEXT("[%s] NOT LIVE (1/2): the dash COOLDOWN scale. UTraceCharacterMovementComponent::"
-			     "GetDashCooldown() still returns UTraceSettings::DashCooldown flat and never consults "
-			     "TraceAbilityTraits::GetDashCooldownScale(), so Mortimer's dash recharges in %.2fs like "
-			     "everybody's and NOT in the %.2fs printed above. The whole fix is one multiplication in "
-			     "that one function; it is written out verbatim in MortimerDashCooldownScale's comment in "
-			     "TraceSettings.h. Trace.Mortimer.DashTest MEASURES this rather than trusting the knob."),
-			Tag, Settings.DashCooldown, HisCooldown);
-
-		UE_LOG(LogTraceGame, Warning,
-			TEXT("[%s] NOT LIVE (2/2): the MANTLE, and the word is MISSING rather than unwired. There is no "
-			     "CanAttemptMantle() to gate: IsMantling(), CanAttemptMantle(), TryBeginMantle(), "
-			     "ApplyMantleVelocity() and EndMantle() were DELETED from the movement component in d2319b2 "
-			     "with six pieces of saved-move state, eight tuning knobs and one CVar. bMortimerCanMantle "
-			     "and MortimerMantleGenerosity are the gate on a feature with no body, and "
-			     "TraceAbilityTraits::IsMantleAllowed() has zero callers. Restoring it is ~500 lines inside "
-			     "Source/Trace/Movement/ (see `git show dffea7c`), not a one-liner — budget for it and do "
-			     "not let this line be read as 'nearly done'."),
-			Tag);
+		// *** THIS BLOCK SHIPPED A FALSE 'NOT LIVE' FOR THE DASH COOLDOWN FOR A WHOLE DEMO after the
+		// call site landed, which is the same failure the paragraph above it warns about, made twice.
+		// It is deleted rather than reworded. The mantle's 'NOT LIVE' is deleted too, because Demo 21
+		// item 6 gives it a body — in THIS file, not in Movement/.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] MANTLE (Demo 21 item 6) LIVE: UTraceAbilitySetMortimer::OnJumpPressed() -> "
+			     "TryMantle(), first question TraceAbilityTraits::IsMantleAllowed(). Window is DERIVED, "
+			     "not typed: ceiling = jump apex x %.2f x generosity %.2f, floor = MaxStepHeight / "
+			     "generosity, reach = capsule radius x %.2f x generosity. Red arm Trace.Mortimer.Mantle 0; "
+			     "measured by Trace.Mortimer.MantleTest, which builds its own ledge."),
+			Tag, Settings.MortimerMantleApexReach, Settings.MortimerMantleGenerosity,
+			Settings.MortimerMantleReachRadii);
 
 		if (Failed == 0)
 		{
@@ -1846,6 +2373,742 @@ namespace TraceMortimerVerifyFile
 				return true;
 			}), 0.f);
 	}
+
+	// =============================================================================================
+	// Trace.Mortimer.MantleTest — DEMO 21 ITEM 6, MEASURED THROUGH THE SHIPPED JUMP KEY
+	//
+	// THREE ARMS ON ONE FIXTURE, RED FIRST.
+	//
+	//   0  RED    Trace.Mortimer.Mantle 0. The identical press at the identical ledge. He must NOT get
+	//             up, and the press must NOT be consumed — this is the build the owner has reported a
+	//             missing mantle in three times, reproduced on the instrument that is about to say it
+	//             is fixed.
+	//   1  GREEN  the shipped build. He must get up ONTO the ledge and the press must be consumed.
+	//   2  GUARD  the same green build against a ledge BELOW his own jump apex. The press must NOT be
+	//             consumed, because a plain jump already reaches it. This arm is the reason the ground
+	//             rule exists: without it Mortimer would lose his ordinary jump everywhere near a
+	//             crate, which is a far worse regression than a missing mantle and is exactly the kind
+	//             of thing a two-arm harness would have shipped without noticing.
+	//
+	// IT BUILDS ITS OWN LEDGE. A fixture that depends on finding a suitable block in whatever arena
+	// happens to be loaded is a fixture that reports INVALID for map reasons; a 200 uu cube spawned in
+	// front of him, sized so its top is at a chosen height above his feet, is the same geometry every
+	// run. It is destroyed on every exit path.
+	//
+	// AND IT PRESSES THE REAL KEY. UTraceAbilityComponent::HandleJumpPressed() is the function
+	// ATracePlayerController::OnJumpStarted calls; nothing here reaches into TryMantle() behind it, so
+	// a mantle that works only when called directly cannot pass.
+	// =============================================================================================
+
+	struct FMortimerMantleArm
+	{
+		bool  bPressConsumed = false;
+		bool  bEndedOnLedge = false;
+		float StartFeetZ = 0.f;
+		float PeakFeetZ = 0.f;
+		float EndFeetZ = 0.f;
+		float LedgeTopZ = 0.f;
+		float LedgeHeight = 0.f;
+		bool  bProbeFound = false;
+		FString ProbeWhy;
+	};
+
+	struct FMortimerMantleRun
+	{
+		TWeakObjectPtr<ATraceCharacter> Pawn;
+		TWeakObjectPtr<UTraceAbilitySetMortimer> Set;
+		TWeakObjectPtr<AStaticMeshActor> Block;
+
+		/** 0 = place and settle, 1 = press, 2 = watch, 3 = report. */
+		int32 Phase = 0;
+		int32 ArmIndex = 0;
+		double PhaseDeadline = 0.0;
+		double WatchUntil = 0.0;
+
+		FVector Anchor = FVector::ZeroVector;
+		FRotator AnchorRotation = FRotator::ZeroRotator;
+		float JumpApexUU = 0.f;
+
+		FMortimerMantleArm Arms[3];
+		int32 SavedMantleArm = 1;
+	};
+
+	/** The three ledge heights, as multiples of his own jump apex. Derived, so a jump retune follows. */
+	constexpr float MantleTestTallApexes = 1.28f;   // above the apex: only a mantle reaches it
+	constexpr float MantleTestLowApexes  = 0.55f;   // well below it: a plain jump reaches it
+
+	void EndMortimerMantleRun(FMortimerMantleRun* Run)
+	{
+		if (IConsoleVariable* const Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Mortimer.Mantle")))
+		{
+			Arm->Set(Run->SavedMantleArm, ECVF_SetByConsole);
+		}
+		if (AStaticMeshActor* Block = Run->Block.Get())
+		{
+			Block->Destroy();
+		}
+		delete Run;
+	}
+
+	/** Moves and resizes the test ledge so its TOP sits @p HeightAboveFeet above the anchor's feet. */
+	void PlaceMortimerTestLedge(FMortimerMantleRun* Run, float HeightAboveFeet, float FeetZ, float Radius)
+	{
+		AStaticMeshActor* Block = Run->Block.Get();
+		UStaticMeshComponent* Mesh = (Block != nullptr) ? Block->GetStaticMeshComponent() : nullptr;
+		if (Mesh == nullptr)
+		{
+			return;
+		}
+
+		// Tall enough to reach 200 uu BELOW his feet, so the low face probe has something to hit even
+		// when he is stood on a floor slab — the legacy mantle's 6825 degenerate refusals were exactly
+		// a low probe with nothing usable in front of it.
+		const float TopZ = FeetZ + HeightAboveFeet;
+		const float BlockHeight = HeightAboveFeet + 200.f;
+		const FVector Forward = Run->AnchorRotation.Vector().GetSafeNormal2D();
+
+		Mesh->SetWorldScale3D(FVector(2.f, 2.f, BlockHeight / 100.f));
+		Block->SetActorLocation(
+			FVector(Run->Anchor.X, Run->Anchor.Y, 0.f) + Forward * (Radius + 100.f + 25.f)
+				+ FVector(0.f, 0.f, TopZ - BlockHeight * 0.5f),
+			/*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+	}
+
+	void ReportMortimerMantleRun(const FMortimerMantleRun* Run)
+	{
+		const TCHAR* const Tag = TEXT("MORTIMERMANTLE");
+
+		const FMortimerMantleArm& Red   = Run->Arms[0];
+		const FMortimerMantleArm& Green = Run->Arms[1];
+		const FMortimerMantleArm& Guard = Run->Arms[2];
+
+		for (int32 Index = 0; Index < 3; ++Index)
+		{
+			static const TCHAR* const Names[3] = { TEXT("RED   (Trace.Mortimer.Mantle 0)"),
+			                                       TEXT("GREEN (shipped)"),
+			                                       TEXT("GUARD (ledge below his jump apex)") };
+			const FMortimerMantleArm& Arm = Run->Arms[Index];
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] arm=%s  ledge %.0f uu (top z=%.0f)  press consumed=%d  feet %.0f -> peak %.0f -> "
+				     "end %.0f  onLedge=%d | probe found=%d %s"),
+				Tag, Names[Index], Arm.LedgeHeight, Arm.LedgeTopZ, Arm.bPressConsumed ? 1 : 0,
+				Arm.StartFeetZ, Arm.PeakFeetZ, Arm.EndFeetZ, Arm.bEndedOnLedge ? 1 : 0,
+				Arm.bProbeFound ? 1 : 0, *Arm.ProbeWhy);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] his own jump apex is %.0f uu, so the tall ledge (%.0f uu) is one a plain jump "
+			     "CANNOT reach and the low ledge (%.0f uu) is one it can."),
+			Tag, Run->JumpApexUU, Red.LedgeHeight, Guard.LedgeHeight);
+
+		// THE FIXTURE PROVES ITSELF FIRST. If the red arm ALSO got him onto the ledge, then something
+		// other than the mantle is lifting him and every number here is meaningless.
+		if (Red.bEndedOnLedge || Red.bPressConsumed)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — the RED arm (mantle removed) still consumed the press (%d) or "
+				     "still ended on the ledge (%d). Something other than Demo 21 item 6 is lifting him, so "
+				     "the green arm proves nothing."),
+				Tag, Red.bPressConsumed ? 1 : 0, Red.bEndedOnLedge ? 1 : 0);
+			return;
+		}
+
+		if (!Green.bEndedOnLedge || !Green.bPressConsumed)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] VERDICT: *** FAIL *** — the shipped build did not mantle a %.0f uu ledge: press "
+				     "consumed=%d, ended on the ledge=%d (feet peaked at %.0f, the lip is at %.0f). The probe "
+				     "said: found=%d %s"),
+				Tag, Green.LedgeHeight, Green.bPressConsumed ? 1 : 0, Green.bEndedOnLedge ? 1 : 0,
+				Green.PeakFeetZ, Green.LedgeTopZ, Green.bProbeFound ? 1 : 0, *Green.ProbeWhy);
+			return;
+		}
+
+		if (Guard.bPressConsumed)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] VERDICT: *** FAIL *** — the mantle STOLE THE ORDINARY JUMP at a %.0f uu ledge, "
+				     "which is below his own %.0f uu apex. The ground rule in ProbeLedge() is not firing, and "
+				     "Mortimer has just lost his jump near every crate in the arena."),
+				Tag, Guard.LedgeHeight, Run->JumpApexUU);
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] VERDICT: PASS — with the mantle REMOVED the identical press was declined and his feet "
+			     "finished %.0f uu SHORT of a lip at z=%.0f; with it in place the press was consumed, his feet "
+			     "peaked at z=%.0f and he ended STOOD ON that lip at z=%.0f. A %.0f uu ledge (under his %.0f uu "
+			     "apex) still leaves the jump key alone."),
+			Tag, Red.LedgeTopZ - Red.PeakFeetZ, Red.LedgeTopZ, Green.PeakFeetZ, Green.EndFeetZ,
+			Guard.LedgeHeight, Run->JumpApexUU);
+	}
+
+	void RunMortimerMantleTest()
+	{
+		const TCHAR* const Tag = TEXT("MORTIMERMANTLE");
+
+		UWorld* TestWorld = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->IsGameWorld()
+					&& Context.World()->GetAuthGameMode() != nullptr)
+				{
+					TestWorld = Context.World();
+					break;
+				}
+			}
+		}
+		if (TestWorld == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — no authoritative game world. Run this on the server/host."), Tag);
+			return;
+		}
+
+		FString Why;
+		UTraceAbilitySetMortimer* Mortimer = MakePlayerIntoMortimer(TestWorld, Why);
+		ATraceCharacter* MyPawn = (Mortimer != nullptr) ? Mortimer->GetCharacter() : nullptr;
+		UTraceCharacterMovementComponent* Move = (MyPawn != nullptr)
+			? Cast<UTraceCharacterMovementComponent>(MyPawn->GetCharacterMovement()) : nullptr;
+		UCapsuleComponent* Capsule = (MyPawn != nullptr) ? MyPawn->GetCapsuleComponent() : nullptr;
+		IConsoleVariable* const Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Mortimer.Mantle"));
+		if (Mortimer == nullptr || MyPawn == nullptr || Move == nullptr || Capsule == nullptr || Arm == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[%s] VERDICT: INVALID — %s."), Tag,
+				(Mortimer == nullptr) ? *Why
+				                      : TEXT("Mortimer has no pawn / movement component / capsule, or "
+				                             "Trace.Mortimer.Mantle is not registered"));
+			return;
+		}
+
+		UStaticMesh* const Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		if (Cube == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — /Engine/BasicShapes/Cube is not available, so no test ledge can "
+				     "be built."), Tag);
+			return;
+		}
+
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		AStaticMeshActor* Block = TestWorld->SpawnActor<AStaticMeshActor>(
+			MyPawn->GetActorLocation() + FVector(0.f, 0.f, 5000.f), FRotator::ZeroRotator, SpawnParams);
+		if (Block == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[%s] VERDICT: INVALID — could not spawn the test ledge."), Tag);
+			return;
+		}
+		// Movable or SetActorLocation is refused: this block is repositioned between arms.
+		Block->SetMobility(EComponentMobility::Movable);
+		if (UStaticMeshComponent* Mesh = Block->GetStaticMeshComponent())
+		{
+			Mesh->SetStaticMesh(Cube);
+			Mesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+			Mesh->SetCollisionProfileName(TEXT("BlockAll"));
+		}
+
+		FMortimerMantleRun* Run = new FMortimerMantleRun();
+		Run->Pawn = MyPawn;
+		Run->Set = Mortimer;
+		Run->Block = Block;
+		Run->Anchor = MyPawn->GetActorLocation();
+		Run->AnchorRotation = FRotator(0.f, MyPawn->GetActorRotation().Yaw, 0.f);
+		Run->SavedMantleArm = Arm->GetInt();
+		Run->PhaseDeadline = FPlatformTime::Seconds() + 6.0;
+
+		const float GravityDown = FMath::Max(1.f, -Move->GetGravityZ());
+		Run->JumpApexUU = (Move->JumpZVelocity * Move->JumpZVelocity) / (2.f * GravityDown);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] begin: three arms on one built ledge, RED first. %s, jump apex %.0f uu, capsule "
+			     "r=%.0f h=%.0f. The ledge is %.0f uu tall for arms 0 and 1 and %.0f uu for arm 2."),
+			Tag, *GetNameSafe(MyPawn), Run->JumpApexUU, Capsule->GetScaledCapsuleRadius(),
+			Capsule->GetScaledCapsuleHalfHeight(), Run->JumpApexUU * MantleTestTallApexes,
+			Run->JumpApexUU * MantleTestLowApexes);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run, Tag](float /*Delta*/) -> bool
+			{
+				ATraceCharacter* Pawn = Run->Pawn.Get();
+				UTraceAbilitySetMortimer* Set = Run->Set.Get();
+				UTraceCharacterMovementComponent* Component = (Pawn != nullptr)
+					? Cast<UTraceCharacterMovementComponent>(Pawn->GetCharacterMovement()) : nullptr;
+				UCapsuleComponent* PawnCapsule = (Pawn != nullptr) ? Pawn->GetCapsuleComponent() : nullptr;
+				IConsoleVariable* const MantleArm =
+					IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Mortimer.Mantle"));
+				const double Now = FPlatformTime::Seconds();
+
+				if (Pawn == nullptr || Set == nullptr || Component == nullptr || PawnCapsule == nullptr
+					|| MantleArm == nullptr || Run->Block.Get() == nullptr)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[%s] VERDICT: INVALID — the pawn or the test ledge went away mid-run."), Tag);
+					EndMortimerMantleRun(Run);
+					return false;
+				}
+
+				if (Now > Run->PhaseDeadline)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[%s] VERDICT: INVALID — arm %d stalled in phase %d."), Tag, Run->ArmIndex, Run->Phase);
+					EndMortimerMantleRun(Run);
+					return false;
+				}
+
+				const float HalfHeight = PawnCapsule->GetScaledCapsuleHalfHeight();
+				const float Radius = PawnCapsule->GetScaledCapsuleRadius();
+				const float FeetZ = static_cast<float>(Pawn->GetActorLocation().Z) - HalfHeight;
+				FMortimerMantleArm& CurrentArm = Run->Arms[Run->ArmIndex];
+
+				switch (Run->Phase)
+				{
+				case 0:
+				{
+					// RED FIRST. Arm 0 removes the mantle; arms 1 and 2 restore it.
+					MantleArm->Set(Run->ArmIndex == 0 ? 0 : 1, ECVF_SetByConsole);
+
+					// Back to the anchor every arm, with no velocity, so the three presses start from
+					// the identical state and arm 1's success cannot set arm 2 up on top of a block.
+					Pawn->SetActorLocation(Run->Anchor, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+					Pawn->SetActorRotation(Run->AnchorRotation);
+					Component->StopMovementImmediately();
+					Component->Velocity = FVector::ZeroVector;
+
+					const float Height = Run->JumpApexUU
+						* ((Run->ArmIndex == 2) ? MantleTestLowApexes : MantleTestTallApexes);
+					const float AnchorFeetZ = static_cast<float>(Run->Anchor.Z) - HalfHeight;
+					PlaceMortimerTestLedge(Run, Height, AnchorFeetZ, Radius);
+
+					CurrentArm.LedgeHeight = Height;
+					CurrentArm.LedgeTopZ = AnchorFeetZ + Height;
+					CurrentArm.StartFeetZ = AnchorFeetZ;
+					CurrentArm.PeakFeetZ = AnchorFeetZ;
+
+					Run->PhaseDeadline = Now + 3.0;
+					Run->WatchUntil = Now + 0.35;   // let the teleport settle before pressing
+					Run->Phase = 1;
+					return true;
+				}
+
+				case 1:
+				{
+					if (Now < Run->WatchUntil)
+					{
+						return true;
+					}
+
+					// WHAT THE PROBE SAW, recorded BEFORE the press, so a refusal has a sentence attached
+					// to it rather than being an absence. This is a pure read; it moves nothing.
+					FTraceMortimerLedge Ledge;
+					CurrentArm.bProbeFound = Set->ProbeLedge(Ledge, Component->IsGroundedForAbilities());
+					CurrentArm.ProbeWhy = CurrentArm.bProbeFound
+						? FString::Printf(TEXT("(ledge %.0f uu, window %.0f..%.0f, reach %.0f)"),
+							Ledge.LedgeHeightUU, Ledge.FloorUU, Ledge.CeilingUU, Ledge.ReachUU)
+						: Ledge.Why;
+
+					// *** THE REAL KEY, THROUGH THE REAL PIPELINE. *** This is the function
+					// ATracePlayerController::OnJumpStarted calls, so a mantle that only works when
+					// TryMantle() is called directly cannot pass this harness.
+					UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Pawn);
+					CurrentArm.bPressConsumed = (Abilities != nullptr) && Abilities->HandleJumpPressed();
+
+					Run->WatchUntil = Now + 1.8;
+					Run->PhaseDeadline = Now + 4.0;
+					Run->Phase = 2;
+					return true;
+				}
+
+				case 2:
+				{
+					CurrentArm.PeakFeetZ = FMath::Max(CurrentArm.PeakFeetZ, FeetZ);
+					if (Now < Run->WatchUntil)
+					{
+						return true;
+					}
+
+					CurrentArm.EndFeetZ = FeetZ;
+					// ON the lip, not merely level with it: he must also be standing, or a Mortimer
+					// still arcing through the right height would count as a successful mantle.
+					CurrentArm.bEndedOnLedge = Component->IsMovingOnGround()
+						&& FeetZ > (CurrentArm.LedgeTopZ - 8.f);
+
+					++Run->ArmIndex;
+					Run->Phase = (Run->ArmIndex >= 3) ? 3 : 0;
+					Run->PhaseDeadline = Now + 6.0;
+					return true;
+				}
+
+				default:
+					break;
+				}
+
+				ReportMortimerMantleRun(Run);
+
+				// Put him back where he was found, so a test does not leave him on a block that is about
+				// to be destroyed underneath him.
+				Pawn->SetActorLocation(Run->Anchor, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+				EndMortimerMantleRun(Run);
+				return false;
+			}), 0.f);
+	}
+
+	FAutoConsoleCommand CmdMortimerMantleTest(
+		TEXT("Trace.Mortimer.MantleTest"),
+		TEXT("DEMO 21 item 6. Builds a ledge in front of Mortimer and presses the SHIPPED jump key three times: "
+		     "with the mantle removed (must decline and must not get up), with it in place (must consume the "
+		     "press and end STOOD on the lip), and at a ledge below his own jump apex (must leave the ordinary "
+		     "jump alone). Destroys its ledge on every exit path."),
+		FConsoleCommandDelegate::CreateStatic(&RunMortimerMantleTest));
+
+	// =============================================================================================
+	// Trace.Mortimer.ThrowTest — DEMO 21 ITEM 7, MEASURED AS DISTANCE AND NOT AS A MULTIPLIER
+	//
+	// FOUR REAL THROWS: {100% charge, full extended charge} x {item 7 removed, item 7 in place}.
+	//
+	// *** WHY DISTANCE HAS TO BE MEASURED SEPARATELY FROM SPEED. *** The charge scales the IMPULSE, so
+	// it scales launch SPEED — and a flat-ground throw's range goes as the SQUARE of speed. Reporting
+	// "x1.85 -> x1.51" as though it answered "how much further does he throw it" is the same class of
+	// error this project already shipped twice (Roxie's "+15% jump HEIGHT" applied to velocity, and
+	// Chut's "+25% distance" applied to speed for +65.8% distance). So both are printed, and the one
+	// the item is about is the range.
+	//
+	// *** THE RANGE IS SOLVED FROM THE MEASURED LAUNCH, NOT STEPPED, AND HERE IS WHY THAT IS HONEST. ***
+	// The loose Core is integrated in ATraceCore::ServerTickLooseCore as LooseVelocity += gravity x dt
+	// and nothing else — no drag, no air resistance, no terminal velocity. So the flat-ground range of
+	// a launch is exactly 2 x Vz x Vxy / |g|, and using it re-derives NOTHING about the rule under
+	// test: the launch velocity is read off the Core AFTER the shipped ThrowFromHolder() has thrown it,
+	// and |g| is ATraceCore::GetThrowGravityZ(), the same accessor the integrator uses.
+	//
+	// The alternative — flying each Core until it comes down — cannot be done in an arena: at x1.85 a
+	// full extended throw's flat range is tens of thousands of uu and every arm would report the
+	// distance to the same wall. The distance actually travelled IS still measured and printed, as
+	// corroboration that a real Core really left his hand in each arm.
+	// =============================================================================================
+
+	struct FMortimerThrowArm
+	{
+		float HoldSeconds = 0.f;
+		bool  bPastFullLive = false;
+		float ChargeScale = -1.f;
+		float LaunchSpeed = -1.f;
+		float LaunchVxy = 0.f;
+		float LaunchVz = 0.f;
+		float FlatRangeUU = -1.f;
+		float TravelledUU = 0.f;
+		bool  bThrown = false;
+	};
+
+	struct FMortimerThrowRun
+	{
+		TWeakObjectPtr<ATraceCharacter> Pawn;
+		TWeakObjectPtr<ATraceCore> CoreActor;
+
+		int32 Phase = 0;
+		int32 ArmIndex = 0;
+		double PhaseDeadline = 0.0;
+		double WatchUntil = 0.0;
+
+		FVector Anchor = FVector::ZeroVector;
+		FVector LaunchPoint = FVector::ZeroVector;
+		float GravityDown = 539.f;
+
+		FMortimerThrowArm Arms[4];
+		int32 SavedThrowArm = 1;
+	};
+
+	void EndMortimerThrowRun(FMortimerThrowRun* Run)
+	{
+		if (IConsoleVariable* const Arm =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Mortimer.ThrowPastFull")))
+		{
+			Arm->Set(Run->SavedThrowArm, ECVF_SetByConsole);
+		}
+		delete Run;
+	}
+
+	void ReportMortimerThrowRun(const FMortimerThrowRun* Run)
+	{
+		const TCHAR* const Tag = TEXT("MORTIMERTHROW");
+
+		static const TCHAR* const Names[4] = {
+			TEXT("RED   100%  (item 7 removed)"),
+			TEXT("RED   FULL  (item 7 removed)"),
+			TEXT("GREEN 100%  (shipped)"),
+			TEXT("GREEN FULL  (shipped)") };
+
+		for (int32 Index = 0; Index < 4; ++Index)
+		{
+			const FMortimerThrowArm& Arm = Run->Arms[Index];
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] arm=%s  held %.3fs -> charge x%.3f  launch %.0f uu/s (xy %.0f, z %+.0f)  "
+				     "FLAT RANGE %.0f uu  | travelled %.0f uu before it met the arena"),
+				Tag, Names[Index], Arm.HoldSeconds, Arm.ChargeScale, Arm.LaunchSpeed, Arm.LaunchVxy,
+				Arm.LaunchVz, Arm.FlatRangeUU, Arm.TravelledUU);
+		}
+
+		const FMortimerThrowArm& RedHundred   = Run->Arms[0];
+		const FMortimerThrowArm& RedFull      = Run->Arms[1];
+		const FMortimerThrowArm& GreenHundred = Run->Arms[2];
+		const FMortimerThrowArm& GreenFull    = Run->Arms[3];
+
+		if (!RedHundred.bThrown || !RedFull.bThrown || !GreenHundred.bThrown || !GreenFull.bThrown)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — not every arm produced a throw (%d %d %d %d). The Core was "
+				     "probably caught, or the throw cooldown swallowed a press."),
+				Tag, RedHundred.bThrown ? 1 : 0, RedFull.bThrown ? 1 : 0, GreenHundred.bThrown ? 1 : 0,
+				GreenFull.bThrown ? 1 : 0);
+			return;
+		}
+
+		// 1. "Up to 100% he scales like everyone else." The two 100% arms differ only in the rule under
+		//    test, so if the rule leaked into the first half of the curve they would separate.
+		const bool bHundredUnchanged = FMath::IsNearlyEqual(RedHundred.FlatRangeUU, GreenHundred.FlatRangeUU,
+			FMath::Max(1.f, RedHundred.FlatRangeUU * 0.01f));
+
+		// 2. THE HARNESS MUST BE ABLE TO GO RED. If the two FULL arms do not separate, item 7 is not
+		//    routed and every other number here is a coincidence.
+		const bool bRedSeparated = RedFull.FlatRangeUU > GreenFull.FlatRangeUU * 1.05f;
+
+		if (!bHundredUnchanged)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] VERDICT: *** FAIL *** — the 100%% charge MOVED (%.0f uu red, %.0f uu green). Demo 21 "
+				     "item 7 is only allowed to touch charge PAST the original 100%% point, and it has reached "
+				     "into the half of the curve every other character shares."),
+				Tag, RedHundred.FlatRangeUU, GreenHundred.FlatRangeUU);
+			return;
+		}
+
+		if (!bRedSeparated)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — the two FULL-charge arms did not separate (%.0f uu vs %.0f uu). "
+				     "Either item 7 is not routed through ATraceCore::GetThrowChargeScaleForHold, or "
+				     "Trace.Mortimer.ThrowPastFull is not reaching it. A harness that cannot go red has proved "
+				     "nothing."),
+				Tag, RedFull.FlatRangeUU, GreenFull.FlatRangeUU);
+			return;
+		}
+
+		const float RangeRatioBefore = RedFull.FlatRangeUU / FMath::Max(1.f, RedHundred.FlatRangeUU);
+		const float RangeRatioAfter  = GreenFull.FlatRangeUU / FMath::Max(1.f, GreenHundred.FlatRangeUU);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] VERDICT: PASS — 100%% charge is UNCHANGED (%.0f uu before, %.0f uu after). His FULL "
+			     "extended charge goes %.0f uu -> %.0f uu, i.e. from %.2fx a full-charge throw's range to "
+			     "%.2fx it. Launch speed went x%.3f -> x%.3f; the range moved by the SQUARE of that, which is "
+			     "the whole reason this command measures distance."),
+			Tag, RedHundred.FlatRangeUU, GreenHundred.FlatRangeUU, RedFull.FlatRangeUU, GreenFull.FlatRangeUU,
+			RangeRatioBefore, RangeRatioAfter, RedFull.ChargeScale, GreenFull.ChargeScale);
+	}
+
+	void RunMortimerThrowTest()
+	{
+		const TCHAR* const Tag = TEXT("MORTIMERTHROW");
+
+		UWorld* TestWorld = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->IsGameWorld()
+					&& Context.World()->GetAuthGameMode() != nullptr)
+				{
+					TestWorld = Context.World();
+					break;
+				}
+			}
+		}
+		if (TestWorld == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — no authoritative game world. The throw is resolved on the "
+				     "server; run this on the host."), Tag);
+			return;
+		}
+
+		FString Why;
+		UTraceAbilitySetMortimer* Mortimer = MakePlayerIntoMortimer(TestWorld, Why);
+		ATraceCharacter* MyPawn = (Mortimer != nullptr) ? Mortimer->GetCharacter() : nullptr;
+		ATraceCore* CoreActor = ATraceCore::Get(TestWorld);
+		IConsoleVariable* const Arm =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Mortimer.ThrowPastFull"));
+		if (Mortimer == nullptr || MyPawn == nullptr || CoreActor == nullptr || Arm == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[%s] VERDICT: INVALID — %s."), Tag,
+				(Mortimer == nullptr) ? *Why
+				                      : TEXT("Mortimer has no pawn, there is no Core in this world (run in "
+				                             "mode B), or Trace.Mortimer.ThrowPastFull is not registered"));
+			return;
+		}
+
+		const float FullHold = FMath::Max(0.01f, ATraceCore::GetThrowChargeSeconds());
+		const float ExtendedHold = FullHold * FMath::Max(1.f, Mortimer->GetThrowChargeHoldScale());
+
+		FMortimerThrowRun* Run = new FMortimerThrowRun();
+		Run->Pawn = MyPawn;
+		Run->CoreActor = CoreActor;
+		Run->Anchor = MyPawn->GetActorLocation();
+		Run->SavedThrowArm = Arm->GetInt();
+		Run->GravityDown = FMath::Max(1.f, -ATraceCore::GetThrowGravityZ(TestWorld));
+		Run->PhaseDeadline = FPlatformTime::Seconds() + 10.0;
+
+		// RED FIRST, and within each arm the 100% throw before the extended one.
+		Run->Arms[0] = { FullHold,     false };
+		Run->Arms[1] = { ExtendedHold, false };
+		Run->Arms[2] = { FullHold,     true  };
+		Run->Arms[3] = { ExtendedHold, true  };
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] begin: four real throws by %s. A full charge is %.3fs, his extended ceiling is %.3fs. "
+			     "Loose-Core gravity is %.0f uu/s^2 and the integrator has NO drag, so the flat range of a "
+			     "launch is 2 x Vz x Vxy / g."),
+			Tag, *GetNameSafe(MyPawn), FullHold, ExtendedHold, Run->GravityDown);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run, Tag](float /*Delta*/) -> bool
+			{
+				ATraceCharacter* Pawn = Run->Pawn.Get();
+				ATraceCore* Core = Run->CoreActor.Get();
+				IConsoleVariable* const ThrowArm =
+					IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Mortimer.ThrowPastFull"));
+				const double Now = FPlatformTime::Seconds();
+
+				if (Pawn == nullptr || Core == nullptr || ThrowArm == nullptr)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[%s] VERDICT: INVALID — the pawn or the Core went away mid-run."), Tag);
+					EndMortimerThrowRun(Run);
+					return false;
+				}
+				if (Now > Run->PhaseDeadline)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[%s] VERDICT: INVALID — arm %d stalled in phase %d."), Tag, Run->ArmIndex, Run->Phase);
+					EndMortimerThrowRun(Run);
+					return false;
+				}
+
+				FMortimerThrowArm& CurrentArm = Run->Arms[Run->ArmIndex];
+
+				switch (Run->Phase)
+				{
+				case 0:
+				{
+					ThrowArm->Set(CurrentArm.bPastFullLive ? 1 : 0, ECVF_SetByConsole);
+
+					// STOOD STILL AND AIMED LEVEL, so spec v8 §4's inherited velocity is zero in every
+					// arm and the only thing that differs between them is the charge. A moving thrower
+					// would add his own motion to the launch and the four numbers would stop being
+					// comparable.
+					Pawn->SetActorLocation(Run->Anchor, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+					if (UCharacterMovementComponent* Move = Pawn->GetCharacterMovement())
+					{
+						Move->StopMovementImmediately();
+						Move->Velocity = FVector::ZeroVector;
+					}
+					if (AController* Controller = Pawn->GetController())
+					{
+						Controller->SetControlRotation(FRotator(0.f, Pawn->GetActorRotation().Yaw, 0.f));
+					}
+					Core->TryPickup(Pawn);
+
+					Run->WatchUntil = Now + 0.25;
+					Run->PhaseDeadline = Now + 3.0;
+					Run->Phase = 1;
+					return true;
+				}
+
+				case 1:
+				{
+					if (Now < Run->WatchUntil)
+					{
+						return true;
+					}
+
+					// THE SHIPPED THROW, on the server, with the server's own hold. Nothing here
+					// reimplements the launch: ThrowFromHolder calls GetThrowChargeScaleForHold with the
+					// THROWER, which is the one call site item 7 lives at.
+					if (!Core->ThrowFromHolder(Pawn, CurrentArm.HoldSeconds))
+					{
+						// Usually the per-throw cooldown (CoreThrowCooldownSeconds, 0.35 s after any
+						// grant). Wait it out rather than failing the arm — but say WHY every second, or
+						// a stall here reads as "the throw is broken" when it is a fixture problem.
+						if (Now > Run->WatchUntil)
+						{
+							Run->WatchUntil = Now + 1.0;
+							UE_LOG(LogTraceGame, Display,
+								TEXT("[%s] arm %d: ThrowFromHolder refused. modeB=%d loose=%d carrier=%s "
+								     "(wanted %s)."),
+								Tag, Run->ArmIndex, Core->IsModeB() ? 1 : 0, Core->IsLoose() ? 1 : 0,
+								*GetNameSafe(Core->GetCarrier()), *GetNameSafe(Pawn));
+							Core->TryPickup(Pawn);
+						}
+						return true;
+					}
+
+					const FVector LaunchVelocity = Core->GetLooseVelocity();
+					Run->LaunchPoint = Core->GetLooseLocation();
+
+					CurrentArm.bThrown = true;
+					CurrentArm.ChargeScale = ATraceCore::LastThrow.ChargeScale;
+					CurrentArm.LaunchSpeed = static_cast<float>(LaunchVelocity.Size());
+					CurrentArm.LaunchVxy = static_cast<float>(LaunchVelocity.Size2D());
+					CurrentArm.LaunchVz = static_cast<float>(LaunchVelocity.Z);
+
+					// Flat-ground range: the time to rise and fall back to the launch height is
+					// 2 Vz / g, and the horizontal speed is constant because there is no drag.
+					CurrentArm.FlatRangeUU = (CurrentArm.LaunchVz > 0.f)
+						? (2.f * CurrentArm.LaunchVz * CurrentArm.LaunchVxy / Run->GravityDown)
+						: 0.f;
+
+					Run->WatchUntil = Now + 1.5;
+					Run->PhaseDeadline = Now + 4.0;
+					Run->Phase = 2;
+					return true;
+				}
+
+				case 2:
+				{
+					// Corroboration only: proof that a real Core really left his hand and flew. It is
+					// cut short by arena geometry, which is why the verdict rests on the flat range.
+					if (Core->IsLoose())
+					{
+						CurrentArm.TravelledUU = FMath::Max(CurrentArm.TravelledUU,
+							static_cast<float>(FVector::Dist2D(Core->GetLooseLocation(), Run->LaunchPoint)));
+					}
+					if (Now < Run->WatchUntil)
+					{
+						return true;
+					}
+
+					++Run->ArmIndex;
+					Run->Phase = (Run->ArmIndex >= 4) ? 3 : 0;
+					Run->PhaseDeadline = Now + 10.0;
+					return true;
+				}
+
+				default:
+					break;
+				}
+
+				ReportMortimerThrowRun(Run);
+				EndMortimerThrowRun(Run);
+				return false;
+			}), 0.f);
+	}
+
+	FAutoConsoleCommand CmdMortimerThrowTest(
+		TEXT("Trace.Mortimer.ThrowTest"),
+		TEXT("DEMO 21 item 7. Throws four real Cores through the shipped ATraceCore::ThrowFromHolder — 100% and "
+		     "full extended charge, with the 0.6x modifier removed and then in place — and reports the thrown "
+		     "DISTANCE, not the speed multiplier. Asserts the 100% charge did not move and that the two "
+		     "full-charge arms separate."),
+		FConsoleCommandDelegate::CreateStatic(&RunMortimerThrowTest));
 
 	FAutoConsoleCommand CmdMortimerQuakeTest(
 		TEXT("Trace.Mortimer.QuakeTest"),

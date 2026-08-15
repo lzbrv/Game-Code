@@ -26,10 +26,14 @@
 // fills bSelected / bPressed / bEnabled from the actual mouse and the actual activation gate, and the
 // row draws whichever one is true.
 //
-// THE WORD ON THE HOVER STATE IS NOT THE SHEET'S. The artist's hover word is a muted gold that
-// measured 1.9:1 against the plate it sits on, which made the SELECTED row the hardest row on the
-// screen to read — see the argument at the top of TraceMenuRowWidget.cpp (spec v20 §0.5). The plate,
-// the amber ring and the chevron are still theirs; the word is white.
+// THE WORD ON THE HOVER STATE IS THE SHEET'S GREEN — sRGB(85,107,47), spec v24 §3.
+// It was white for two specs. That was spec v20 §0.5 reacting to a MIS-SAMPLED palette entry: what
+// TraceMenuArtStyle called "the artist's hover word" was the amber halo around it, sRGB(115,82,50),
+// which measured 1.9:1 against its plate and was rightly replaced. The three plates on the sheet
+// that carry a real button label in the hover state all draw the word a flat green, to the byte; the
+// re-measurement is in TraceMenuArtStyle.h. The plate, the ring, the rail and the word are now
+// driven by ONE state through ONE switch (TraceMenuRowWidgetLocal::VisualsFor), which is §3's actual
+// requirement: the outline and the label cannot disagree about being hovered.
 //
 // PRESSED IS THE ONE STATE THE SHEET DOES NOT CONTAIN. There are three plates on it and a press is
 // not one of them, so pressed is the HOVER plate at 72% brightness. That is a stand-in and it is

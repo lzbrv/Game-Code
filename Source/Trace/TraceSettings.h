@@ -289,15 +289,16 @@ struct TRACE_API FTraceBotProfile
 	// ----------------------------------------------------------------------------------------
 	// Burst fire
 	//
-	// FireInterval is 0.40s AS OF SPEC v5 §5 (150 RPM, up from 0.16s) and a body shot is 40, so a
-	// held trigger on target kills in 0.80s — and a single head shot still kills instantly.
+	// FireInterval is 0.315789s AS OF SPEC v24 §4 (190 RPM, up from 150 = 0.40s) and a body shot is
+	// 40, so a held trigger on target kills in 0.63s — and a single head shot still kills instantly.
 	// Nothing about reaction time or aim error survives that. Bursting is the DPS dial, and it is
 	// the one that makes a fight readable: you can hear the gap and move in it.
 	//
-	// READ THIS BEFORE TUNING A BURST NUMBER. At 0.40s between rounds a burst of 0.20-0.38s contains
-	// exactly ONE shot, where at 0.16s it contained two or three. The duty cycle no longer describes
-	// bot DPS — the ROUND COUNT does — so on Easy a bot now lands at most one round per
-	// (burst + rest) ~= 1.29s, which is roughly half the damage per engaged second it used to do.
+	// READ THIS BEFORE TUNING A BURST NUMBER. At 0.3158s between rounds a burst of 0.20-0.38s holds
+	// ONE round at the short end and TWO at the long end (0.38 / 0.3158 = 1.2), where at the 0.40s
+	// gun every burst held exactly one and at the old 0.16s gun they held two or three. So the 190
+	// RPM pass hands the bots a little of their lost DPS back at the top of the roll, and the duty
+	// cycle still does not describe bot DPS on its own — the ROUND COUNT does.
 	// These profiles are deliberately left alone in the fire-rate pass: the Easy baseline (~0.72
 	// human deaths per minute while engaged) was MEASURED, and moving the rate and the profiles in
 	// the same pass would make the next measurement uninterpretable. If bots read as harmless after
@@ -770,26 +771,36 @@ public:
 	 * SECONDS BETWEEN SHOTS — this is the inverse of the fire RATE, so a BIGGER number is a SLOWER
 	 * gun. The server validates a client's claimed fire rate against this with a tolerance.
 	 *
-	 * 0.16 -> 0.40 THIS PASS. Spec v5 §5, verbatim: "Change the gun's firerate to be 150 rounds per
-	 * minute, or whatever the equivalent is for this framework". 60/150 = 0.40 s between shots, i.e.
-	 * 2.5 shots/second, down from 6.25 (375 RPM).
+	 * *** 0.40 -> 0.315789 THIS PASS (spec v24 §4). *** "Gun fire rate 150 -> 190 RPM."
+	 * 60/190 = 0.315789 s between shots, i.e. 3.17 shots/second, up from 2.5 (150 RPM).
+	 * The pass before this one took it 0.16 -> 0.40 for spec v5 §5's 150 RPM.
 	 *
-	 * WHAT IT COSTS, STATED HERE BECAUSE IT IS THE BIGGEST SINGLE COMBAT CHANGE IN THE PASS:
-	 *   * three body shots (40 each) now take 0.80 s of sustained fire on target, up from 0.32 s;
-	 *   * a head shot (100) still kills in one, so the head/body gap widens from 3:1 in rounds to
-	 *     3:1 in rounds AND 0.80 s in wall-clock — aiming high is now most of the gun;
-	 *   * bot bursts (BurstDurationMin/Max, 0.20-0.38 s) now contain exactly ONE round each, where
-	 *     they used to contain two or three. Bot DPS falls with the burst, not just with the rate.
-	 *     Those profiles are deliberately NOT retuned here; see the note in the Burst block above.
+	 * *** THIS IS THE BASE EVERY FIRE-RATE ABILITY IS RELATIVE TO (spec v24 §0). *** Nothing else in
+	 * the project stores an RPM or an interval for the gun: Roxie's MODDED and Slimeball's stuck
+	 * passive are stored as RATE MULTIPLIERS (RoxieModdedFireRateMultiplier,
+	 * SlimeballStuckFireRateBonus) and reach the gun through
+	 * UTraceAbilityComponent::GetFireIntervalScaleFor(), which returns a scale ON this number. Move
+	 * this line and both characters move with it, automatically and in the same proportion — that is
+	 * the §0 rule, and it is why this pass re-tuned nothing on either character.
+	 *
+	 * WHAT IT COSTS:
+	 *   * three body shots (40 each) now take 0.63 s of sustained fire on target, down from 0.80 s;
+	 *   * a head shot (100) still kills in one, so the head/body gap is 3:1 in rounds and 0.63 s in
+	 *     wall-clock — aiming high is still most of the gun, by slightly less;
+	 *   * a 30-round clip is now 9.16 s of continuous fire instead of 11.6 s (both measured from the
+	 *     FIRST shot, which is free), so reloads come round ~21% sooner. See ClipSize.
+	 *   * bot bursts (BurstDurationMin/Max, 0.20-0.38 s) still contain one round at the short end and
+	 *     now two at the long end. Those profiles are deliberately NOT retuned here; see the note in
+	 *     the Burst block above.
 	 *
 	 * Sane range 0.08 (twice as fast as the old gun, very lethal) to 0.60 (a bolt-action feel).
 	 * Below ~0.05 the server's rate validation starts rejecting legitimate client shots.
 	 *
 	 * ALSO SET IN Config/DefaultGame.ini, AND THE INI WINS. Both were moved; verify from a running
-	 * game with Trace.DumpSettings rather than from this line.
+	 * game with Trace.DumpSettings or Trace.FireRate.Measure rather than from this line.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Fire Interval (s between shots)", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.05", UIMax = "0.8"))
-	float FireInterval = 0.40f;
+	float FireInterval = 0.315789f;
 
 	// ==========================================================================================
 	// COMBAT — UPWARDS RECOIL  (spec v5 §6, new)
@@ -874,13 +885,17 @@ public:
 	/**
 	 * Seconds after the LAST shot before recovery starts pulling the view back down.
 	 *
-	 * KEEP THIS AT OR JUST ABOVE FireInterval (0.40) OR THE GUN NEVER CLIMBS. Recovery that starts
-	 * between two shots of a held burst undoes each kick before the next one lands, which produces a
-	 * muzzle that twitches and returns instead of a pattern the player can learn and pre-aim
-	 * against. 0.45 s is one fire interval plus a beat, so a burst accumulates and the recovery is
-	 * something that happens when you stop shooting — which is exactly what the spec asks for.
+	 * KEEP THIS AT OR ABOVE FireInterval (now 0.3158, spec v24 §4) OR THE GUN NEVER CLIMBS. Recovery
+	 * that starts between two shots of a held burst undoes each kick before the next one lands, which
+	 * produces a muzzle that twitches and returns instead of a pattern the player can learn and
+	 * pre-aim against. 0.45 s was "one fire interval plus a beat" at the old 0.40 s gun; at 0.3158 it
+	 * is 1.43 intervals, so the constraint is satisfied with MORE room than before and the recoil is
+	 * still something that happens when you stop shooting.
 	 *
-	 * If FireInterval is retuned, retune this with it.
+	 * *** DELIBERATELY NOT MOVED IN THE 150 -> 190 RPM PASS. *** Its rule is a FLOOR ("at or above
+	 * FireInterval"), not a proportion, and the faster gun only moves it further inside that floor.
+	 * Re-deriving it as FireInterval x 1.125 would have shortened it to 0.355 s and changed the feel
+	 * of a knob nobody asked to change. If FireInterval ever goes ABOVE 0.45 this must move with it.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Recovery Delay (s after last shot)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
 	float RecoilRecoveryDelaySeconds = 0.45f;
@@ -912,8 +927,9 @@ public:
 	 * kick. It does not touch the climb already accumulated, which recovers on its own schedule.
 	 *
 	 * Without it, ten single aimed shots spread over a minute would each kick harder than the last.
-	 * Keep it above FireInterval (0.40) or a held burst resets its own growth every shot and the
-	 * growth term does nothing. Sane range 1.5x to 3x FireInterval.
+	 * Keep it above FireInterval (now 0.3158, spec v24 §4) or a held burst resets its own growth
+	 * every shot and the growth term does nothing. Sane range 1.5x to 3x FireInterval, which at the
+	 * new gun is 0.474 to 0.947 — 0.75 sits inside it, so this was left alone in the 190 RPM pass.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Burst Reset Gap (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.1", UIMax = "2.0"))
 	float RecoilBurstResetSeconds = 0.75f;
@@ -1541,9 +1557,15 @@ public:
 	 * With the gentle deceleration below, this is what actually ends most slides — so this is THE
 	 * "max slide length" dial. Sane range 0.8 to 2.5.
 	 *
-	 * THE BASE, NOT THE SHIPPED LENGTH. Spec v9 §6's "-30%" lives in SlideMaxLengthScale below and is
-	 * applied on top by the movement component: effective duration = this x 0.7 = 1.26 s. Do not cut
-	 * this to 1.26 as well — that ships 0.88 s, a 51% cut, and nothing on either side says so.
+	 * THE BASE, NOT THE SHIPPED LENGTH. Spec v9 §6's "-30%" lives in SlideMaxLengthScale below and
+	 * spec v24 §8's "-0.4 s" lives in SlideDurationTrimSeconds below that; both are applied on top by
+	 * the movement component:
+	 *
+	 *     effective duration = this x 0.7 - 0.4 = 1.26 - 0.4 = 0.86 s
+	 *
+	 * Do not fold either of them into this number — cutting this to 1.26 ships 0.88 s, a 51% cut, and
+	 * nothing on either side says so; cutting it by v24's 0.4 ships 0.98 s, which is 0.28 s of the
+	 * 0.4 s the owner asked for because the x0.7 lands on the cut as well.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Duration BASE (s, x max length scale)", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.3", UIMax = "3.0"))
 	float SlideDuration = 1.8f;
@@ -1564,13 +1586,42 @@ public:
 	 *
 	 * Knock-on: SlideJumpWindowSeconds (0.20 s) is measured from the slide's END and does not move,
 	 * so the well-timed window is now 16% of the slide rather than 11% — the slide-jump got slightly
-	 * EASIER to time, not harder.
+	 * EASIER to time, not harder. (Spec v24 §8's SlideDurationTrimSeconds takes another 0.4 s off the
+	 * product and takes that further: 0.20 s of a 0.86 s slide is 23%.)
 	 *
 	 * NAME IS LOAD-BEARING: bound BY NAME as "SlideMaxLengthScale" by
 	 * UTraceCharacterMovementComponent::GetSlideDuration(), clamped there to 0.05..4.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Max Length Scale (x duration)", ClampMin = "0.05", ClampMax = "4.0", UIMin = "0.4", UIMax = "1.5"))
 	float SlideMaxLengthScale = 0.7f;
+
+	/**
+	 * SPEC v24 §8 — "shorten the duration of the slide by .4seconds as well". Seconds taken off the
+	 * SHIPPED slide, AFTER SlideMaxLengthScale.
+	 *
+	 *     shipped duration = SlideDuration x SlideMaxLengthScale - this
+	 *                      = 1.80 x 0.70 - 0.40 = 0.86 s      (was 1.26 s)
+	 *
+	 * A SEPARATE KNOB RATHER THAN AN EDIT TO SlideDuration, AND THAT IS SPEC v24 §0, NOT TIDINESS.
+	 * The owner's 0.4 s is 0.4 s of the slide he plays — the 1.26 s product — not of the 1.80 s base.
+	 * Cutting the base by 0.4 ships 1.40 x 0.70 = 0.98 s, i.e. 0.28 s of the 0.4 s he asked for.
+	 * Re-typing the base as 1.2286 (0.86 / 0.70) delivers 0.86 s today and quietly becomes a 0.514 s
+	 * cut the first time anybody re-tunes the v9 §6 scale, because an absolute buried under a
+	 * multiplier stops meaning what it was written to mean. As a trim over the finished length it
+	 * stays "0.4 s shorter than the slide would otherwise be" whatever the base and the scale do next.
+	 *
+	 * THE BONUS WINDOW MOVES WITH IT, WHICH IS THE OTHER HALF OF §8. SlideJumpWindowSeconds is
+	 * anchored to the slide's END (IsSlideJumpWellTimed() is `time LEFT <= window`), so a 0.4 s
+	 * shorter slide opens the window 0.4 s earlier — 1.06 s into the slide becomes 0.66 s — which is
+	 * exactly "the bonus window needs to happen .4 seconds earlier in the slide". SlideJumpWindowSeconds
+	 * is therefore NOT also cut by 0.4: doing both would open the window 0.26 s into a 0.86 s slide and
+	 * make 70% of every slide well-timed, which is not a window.
+	 *
+	 * Set to 0 for the pre-v24 slide. `Trace.V24LegacySlide 1` / -TraceV24LegacySlide does exactly
+	 * that at runtime and is the A/B arm for this item.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Duration Trim (s, off the scaled length)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
+	float SlideDurationTrimSeconds = 0.4f;
 
 	/**
 	 * uu/s bled off the slide every second. THIS IS THE MOMENTUM DIAL — lower preserves more.
@@ -1718,6 +1769,15 @@ public:
 	 *
 	 * Sane range 0.15 to 0.30. Below ~0.1 it is unhittable at real latency; above ~0.5 against a 1.8s
 	 * slide it covers so much of the slide that it stops being a window at all.
+	 *
+	 * SPEC v24 §8 DELIBERATELY DID NOT MOVE THIS, and the reasoning belongs next to the number so the
+	 * next pass does not "finish the job". §8 asks for the bonus window to happen 0.4 s earlier in the
+	 * slide AND for the slide to be 0.4 s shorter. Because this window is anchored to the slide's END,
+	 * the second delivers the first: shortening the slide from 1.26 s to 0.86 s moves the moment the
+	 * window opens from 1.06 s to 0.66 s, which is 0.4 s earlier, measured on a live pawn (grep
+	 * V24WINDOW under -TraceSlideDebug). Adding 0.4 s HERE as well would open the window 0.26 s into a
+	 * 0.86 s slide — 70% of the slide, three times the window relative to the end — which is the
+	 * double-application this file's SlideDuration note warns about, wearing the window's hat.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Timing Window (s before slide end)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.6"))
 	float SlideJumpWindowSeconds = 0.20f;
@@ -3827,11 +3887,19 @@ public:
 	float BotSlideMinSpeed = 480.f;
 
 	/**
-	 * How long a bot holds the crouch input once it decides to slide. Keep at or under SlideDuration.
+	 * How long a bot holds the crouch input once it decides to slide, as an UPPER BOUND.
 	 *
-	 * MUST TRACK SlideDuration. Bots release crouch after exactly this long, so at the old 0.70
-	 * against a 1.8s slide every bot slide ended in the commit window and the longer slide was
-	 * invisible in bot play. 1.60 lets a bot slide run essentially to its duration.
+	 * *** THE "MUST TRACK SlideDuration" RULE IS NOW ENFORCED IN CODE, NOT IN THIS COMMENT
+	 * (spec v24 §0). *** This used to say "keep at or under SlideDuration" and nothing checked it,
+	 * so when spec v24 §8 cut the effective slide from 1.26 s to 0.86 s a bot carried on holding
+	 * crouch for the full 1.60 s and crouch-walked for 0.74 s after its slide had ended.
+	 *
+	 * Its only reader (TraceBotController.cpp, the slide branch) now clamps this against the live
+	 * UTraceCharacterMovementComponent::GetSlideDuration(), so the effective hold is
+	 * min(this, the real slide) and re-tuning SlideDuration / SlideMaxLengthScale /
+	 * SlideDurationTrimSeconds moves the bots automatically. Deliberately NOT re-typed to 0.86:
+	 * re-tuning an absolute is exactly what §0 forbids, and leaving it high keeps its meaning as
+	 * "a bot rides its slide to the end" whatever the slide's length becomes.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Slide Hold (s)", ClampMin = "0.05", ClampMax = "6.0", UIMin = "0.1", UIMax = "3.0"))
 	float BotSlideHoldSeconds = 1.60f;
@@ -3954,7 +4022,11 @@ public:
 	// ROCCO — spec §6
 	//
 	// Passive: "3% speed boost from headshot kills for 1 second, stacking, each kill extends the
-	// timer on the entire boost."  Movement: "a very small second jump, which allows Rocco to change
+	// timer on the entire boost."  *** SPEC v24 §11 MADE THAT ONE SECOND THREE. *** Verbatim:
+	// "Change Rocco's passive to last for 3s rather than 1s, keep everything else intact" — so
+	// RoccoHeadshotSpeedDurationSeconds moved and NOTHING else did: still +3% a stack, still capped
+	// at 10, still ONE shared timer that each kill refreshes for the whole boost.
+	//                    Movement: "a very small second jump, which allows Rocco to change
 	// direction midair, instantly."  Activated (Ripple): a dash on its own cooldown leaving rings
 	// any character of either team — INCLUDING THE CORE CARRIER — may ride, for 4 s, 20 s cooldown.
 	// ------------------------------------------------------------------------------------------
@@ -3971,9 +4043,23 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Headshot Speed Stack Cap [v14 §6 ASSUMPTION]", ClampMin = "1", ClampMax = "50", UIMin = "1", UIMax = "20"))
 	int32 RoccoHeadshotSpeedStackMax = 10;
 
-	/** The single timer covering the whole stack. Each headshot kill refreshes it — it never splits. */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Headshot Speed Duration (s)", ClampMin = "0.05", ClampMax = "30.0", UIMin = "0.5", UIMax = "5.0"))
-	float RoccoHeadshotSpeedDurationSeconds = 1.f;
+	/**
+	 * The single timer covering the whole stack. Each headshot kill refreshes it — it never splits.
+	 *
+	 * *** SPEC v24 §11: 3 s, was 1 s. THE ONLY THING §11 CHANGES. *** The stacking behaviour and the
+	 * "each kill extends the timer on the entire boost" rule are untouched — they live in
+	 * UTraceAbilitySetRocco::OnKill, which reads this knob and assigns (never adds) the new deadline,
+	 * so a longer window is genuinely a longer window and not a window that now accumulates.
+	 *
+	 * WHAT IT COSTS IN PRACTICE: at 1 s a second headshot had to land inside one second to keep a
+	 * stack alive, which in a 150 uu/s duel is most of a magazine's worth of luck. At 3 s the stack
+	 * survives a reload, so the cap (10 = +30%) is now reachable in an ordinary fight rather than in
+	 * theory — which is why the cap is a knob and why it did NOT move with this.
+	 *
+	 * Mirrored in Config/DefaultGame.ini, and the ini is the one that decides.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Headshot Speed Duration (s) [v24 §11: 3, was 1]", ClampMin = "0.05", ClampMax = "30.0", UIMin = "0.5", UIMax = "5.0"))
+	float RoccoHeadshotSpeedDurationSeconds = 3.f;
 
 	/**
 	 * The second jump's upward speed. "A VERY SMALL second jump" — this is deliberately a fraction
@@ -4378,14 +4464,24 @@ public:
 	float XVulnerableDurationSeconds = 2.f;
 
 	/**
-	 * §6: "+25% damage from ALL sources."
+	 * v14 §6 said "+25% damage from ALL sources". *** SPEC v24 §9 RAISED THE FIRST STACK TO +35%. ***
+	 * Verbatim: "Increase X's base vulnerable to 35% extra damage, keeping the 5% extra per stack
+	 * after one intact, and all other aspects intact." So this knob — and ONLY this knob — moved:
+	 * XVulnerableStackBonus is still 0.05, XVulnerableMaxStacks is still 5, XVulnerableDurationSeconds
+	 * is still 2, and the refresh rule is untouched. At the cap the multiplier is now x1.55 (0.35 +
+	 * 4 x 0.05), where it used to be x1.45.
+	 *
+	 * RELATIVE BY CONSTRUCTION (spec v24 §0). This is a FRACTION added to 1, never an absolute damage
+	 * number — TraceVulnerable::GetDamageMultiplier() returns 1 + this, and every damage source in the
+	 * project is multiplied by it. Retune the gun, the knife or an ability and the mark keeps meaning
+	 * "+35% of whatever that hit was worth", with nothing to re-derive.
 	 *
 	 * NOTE FOR WHOEVER BUILDS X: this is an amplifier on damage, and spec §4 says the vulnerable
 	 * mark "must not become a damage path". Applying the mark is a CONTROL effect and is refused on
 	 * a carrier; the amplifier itself is harmless because nothing can damage a carrier anyway.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable Damage Bonus (fraction)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
-	float XVulnerableDamageBonus = 0.25f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable Damage Bonus (fraction) [v24 §9: 0.35, was 0.25]", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
+	float XVulnerableDamageBonus = 0.35f;
 
 	/** Movement passive: speed while ANY enemy is vulnerable — any, not the one he marked.
 	    v14 §6 specified 10%; Demo 18 raised it to 15%. */
@@ -4553,9 +4649,14 @@ public:
 	/**
 	 * §2: Modded makes the gun fire "x1.65".
 	 *
-	 * IT IS A RATE, AND FireInterval IS A PERIOD, so this DIVIDES: 0.40 s / 1.65 = 0.242 s, i.e. 150
-	 * RPM becomes 248. Multiplying FireInterval by 1.65 would make her fire SLOWER, which is the kind
-	 * of inversion that reads as "the ability does nothing" in a playtest rather than as a bug.
+	 * IT IS A RATE, AND FireInterval IS A PERIOD, so this DIVIDES: 0.3158 s / 1.65 = 0.1914 s, i.e.
+	 * 190 RPM becomes 314. Multiplying FireInterval by 1.65 would make her fire SLOWER, which is the
+	 * kind of inversion that reads as "the ability does nothing" in a playtest rather than as a bug.
+	 *
+	 * *** THIS KNOB IS THE §0 EXAMPLE THE OWNER GAVE, AND IT IS ALREADY RELATIVE. *** It is a
+	 * MULTIPLIER on the base and holds no RPM of its own, so the 150 -> 190 pass moved her from
+	 * 248 to 314 RPM without this line changing: 1.65x the base, whatever the base is. Never replace
+	 * it with an absolute interval or an absolute RPM — that is the bug §0 was written to prevent.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Modded Fire Rate (x; DIVIDES Fire Interval) [v18 §2: 1.65]", ClampMin = "0.1", ClampMax = "5.0", UIMin = "1.0", UIMax = "3.0"))
 	float RoxieModdedFireRateMultiplier = 1.65f;
@@ -4793,8 +4894,13 @@ public:
 	/**
 	 * §2: "+30% fire rate" WHILE STUCK ONLY.
 	 *
-	 * A RATE bonus over a PERIOD knob, like Roxie's: FireInterval is divided by (1 + this), so 0.40 s
-	 * becomes 0.308 s. Multiplying instead would slow him down while claiming to speed him up.
+	 * A RATE bonus over a PERIOD knob, like Roxie's: FireInterval is divided by (1 + this), so
+	 * 0.3158 s becomes 0.2429 s — 190 RPM becomes 247. Multiplying instead would slow him down while
+	 * claiming to speed him up.
+	 *
+	 * RELATIVE BY CONSTRUCTION (spec v24 §0), exactly like RoxieModdedFireRateMultiplier: it is a
+	 * FRACTION of the base, never an interval or an RPM, so the 150 -> 190 pass carried him from
+	 * 195 to 247 RPM with this line untouched.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Stuck: Fire Rate Bonus (fraction; DIVIDES Fire Interval) [v18 §2: 0.30]", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
 	float SlimeballStuckFireRateBonus = 0.3f;
@@ -4966,9 +5072,14 @@ public:
 	 * bigger design change than the line asks for. Only the clip is finite, and a reload always
 	 * refills it completely.
 	 *
-	 * Worth reading in the units of the gun that spends it: FireInterval is 0.40 s, so a full clip
-	 * is 12.0 s of continuous fire, and at 40 damage a body shot that is 750 potential damage
-	 * between reloads. Lowering this is the single strongest lever on how often a fight is
+	 * Worth reading in the units of the gun that spends it: FireInterval is 0.315789 s as of spec
+	 * v24 §4, so a held trigger empties a full clip in 29 x 0.3158 = 9.16 s (the first round is
+	 * free), down from 11.6 s at the old 150 RPM gun — reloads come round about 21% sooner and that
+	 * is the whole ammo-side consequence of the faster gun. At 40 damage a body shot it is still 750
+	 * potential damage between reloads: the CLIP did not change, only how fast it is spent.
+	 * Characters that modify the fire rate spend it faster still, in the same proportion — a stuck
+	 * Slimeball empties it in 7.04 s and Roxie under MODDED would need 5.55 s, except that MODDED
+	 * ends after one clip. Lowering this is the single strongest lever on how often a fight is
 	 * interrupted; it is not a cosmetic number.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Clip Size (rounds) [v16 §1]", ClampMin = "1", ClampMax = "999", UIMin = "5", UIMax = "60"))
@@ -4996,8 +5107,11 @@ public:
 	// extra damage, but each additional stack only adds 5%. Whenever the timer runs out, all stacks
 	// disappear."
 	//
-	// The FIRST stack is still XVulnerableDamageBonus (0.25) above; the two knobs below are the
-	// per-extra-stack term and the ceiling. N stacks resolve to 1 + 0.25 + (N-1) * 0.05.
+	// The FIRST stack is still XVulnerableDamageBonus above; the two knobs below are the
+	// per-extra-stack term and the ceiling. N stacks resolve to 1 + XVulnerableDamageBonus +
+	// (N-1) * XVulnerableStackBonus — written that way, and not as literals, because spec v24 §9
+	// has just moved the first term from 0.25 to 0.35 and left the other two alone. Today that is
+	// 1 + 0.35 + (N-1) * 0.05.
 	//
 	// Mirrored in Config/DefaultGame.ini beside XVulnerableDamageBonus, and the ini is the one that
 	// decides — see the AMMO note above. `Trace.Health.DumpSettings` prints what this process
@@ -5007,7 +5121,9 @@ public:
 	/**
 	 * What each stack after the first adds. §4: "each additional stack only adds 5%".
 	 *
-	 * So 1 stack = +25%, 2 = +30%, 3 = +35%, and so on up to the cap below.
+	 * UNCHANGED BY SPEC v24 §9, which says "keeping the 5% extra per stack after one intact".
+	 * With the first stack now at +35% (XVulnerableDamageBonus), 1 stack = +35%, 2 = +40%,
+	 * 3 = +45%, and so on up to the cap below. (It used to read +25/+30/+35.)
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable: Bonus Per Extra Stack (fraction) [v16 §4]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.2"))
 	float XVulnerableStackBonus = 0.05f;
@@ -5023,11 +5139,13 @@ public:
 	 * target standing inside the orbiting swarm, which is not a case worth designing a damage cliff
 	 * around.
 	 *
-	 * WHAT IT BUYS THE TARGET, in the units of the gun: at the cap the multiplier is x1.45, so a
-	 * 25-damage leg shot becomes 36.25 and kills in three instead of four. (The 40-damage body shot
-	 * already dropped from three rounds to two at ONE stack — 40 x 1.25 = 50 — so the body cliff is
-	 * not what this cap is protecting.) Unbounded stacking would put a headshot-equivalent on the
-	 * fourth leg shot, which is the bug this exists to prevent.
+	 * WHAT IT BUYS THE TARGET, in the units of the gun, RESTATED FOR SPEC v24 §9's +35% first stack:
+	 * at the cap the multiplier is now x1.55 (was x1.45), so a 25-damage leg shot becomes 38.75 and
+	 * kills in three instead of four. (The 40-damage body shot already dropped from three rounds to
+	 * two at ONE stack — 40 x 1.35 = 54 — so the body cliff is not what this cap is protecting.)
+	 * Unbounded stacking would put a headshot-equivalent on the fourth leg shot, which is the bug
+	 * this exists to prevent. §9 raised the FIRST stack only; the cap is one of the "all other
+	 * aspects" it says to leave intact.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|X", meta = (DisplayName = "Vulnerable: Max Stacks [v16 §4, capped at 5]", ClampMin = "1", ClampMax = "50", UIMin = "1", UIMax = "10"))
 	int32 XVulnerableMaxStacks = 5;
@@ -5042,25 +5160,39 @@ public:
 	//   ACTIVATED "only while carrying the core AND standing on the ground or the top of an object,
 	//             a blast that knocks nearby enemies away"
 	//
-	// *** WHICH OF THESE KNOBS IS ACTUALLY READ, AS OF DEMO 20. *** Say it here rather than in a
-	// report, because this comment is what the next person reads:
+	// DEMO 21 amends the passive again and finally delivers the movement line:
 	//
-	//     MortimerDashDistanceScale    LIVE. UTraceCharacterMovementComponent::GetDashSpeed()
-	//                                  multiplies by TraceAbilityTraits::GetDashDistanceScale().
-	//     MortimerThrowChargeHoldScale LIVE. ATraceCore::GetThrowChargeScaleForHold() (x2 call sites).
-	//     MortimerDashCooldownScale    *** NOT LIVE. *** Needs one line in GetDashCooldown(); see the
-	//                                  knob's own comment for the exact patch.
-	//     bMortimerCanMantle           *** NOT LIVE. *** There is no mantle in the movement component
-	//     MortimerMantleGenerosity     at all — it was deleted in d2319b2 and never restored.
+	//   ITEM 6   "Add a mantle for Mortimer, as the original instructions requested. It doesn't have
+	//            to be the old mantle — make a new one which acts the same, but for just him."
+	//   ITEM 7   "after the original 100% charge window has passed, add a .6x modifier to the linear
+	//            scaling of his throw charge"
+	//
+	// *** WHICH OF THESE KNOBS IS ACTUALLY READ, AS OF DEMO 21. *** Say it here rather than in a
+	// report, because this comment is what the next person reads. EVERY LINE NAMES A CALL SITE:
+	//
+	//     MortimerDashDistanceScale     LIVE. UTraceCharacterMovementComponent::GetDashSpeed()
+	//                                   multiplies by TraceAbilityTraits::GetDashDistanceScale().
+	//     MortimerDashCooldownScale     LIVE since v23. GetDashCooldown() multiplies by
+	//                                   TraceAbilityTraits::GetDashCooldownScale(). (This list said
+	//                                   NOT LIVE for a whole demo after the line landed. Fixed.)
+	//     MortimerThrowChargeHoldScale  LIVE. ATraceCore::GetThrowChargeScaleForHold() (x2 call sites).
+	//     MortimerThrowChargePastFull-  LIVE. Same function — DEMO 21 ITEM 7.
+	//       Scale
+	//     bMortimerCanMantle            LIVE as of DEMO 21 ITEM 6. UTraceAbilitySetMortimer::
+	//     MortimerMantleGenerosity      OnJumpPressed() -> TryMantle(), gated on
+	//     MortimerMantleReachRadii      TraceAbilityTraits::IsMantleAllowed(). Measured by
+	//     MortimerMantleApexReach       Trace.Mortimer.MantleTest, red arm Trace.Mortimer.Mantle 0.
+	//     MortimerMantleCooldownSeconds
 	//
 	// Demo 18's version of this block claimed the dash scale and the throw cap were both inert. They
 	// were wired in the same pass and the comment was never corrected, which is how Demo 20 arrived
-	// with an integrator quoting "the dash is not live" as fact. If you wire one of the two remaining
-	// knobs, correct this list in the same edit.
+	// with an integrator quoting "the dash is not live" as fact. If you wire a knob, correct this list
+	// in the same edit — and if you find a line here that is stale, fix it before you write anything
+	// else, because somebody is about to quote it.
 	//
-	// THE ini PINS THE TWO DEMO 20 MOVED. Config/DefaultGame.ini beats these initialisers, so
-	// MortimerDashDistanceScale and MortimerDashCooldownScale are written in BOTH places and must be
-	// changed in both. The other six are still header-only.
+	// THE ini PINS EVERY KNOB DEMO 20 AND DEMO 21 MOVED. Config/DefaultGame.ini beats these
+	// initialisers, so MortimerDashDistanceScale, MortimerDashCooldownScale, the four mantle numbers
+	// and MortimerThrowChargePastFullScale are written in BOTH places and must be changed in both.
 	// ==========================================================================================
 
 	/**
@@ -5094,20 +5226,17 @@ public:
 	 * number 4.375 for the same reason LilyExtraDashCharges is an addend: a retune of the shared
 	 * DashCooldown must carry him with it instead of leaving him pinned to a stale absolute.
 	 *
-	 * *** THIS KNOB IS NOT LIVE YET, AND THAT IS SAID OUT LOUD RATHER THAN DISCOVERED. *** It is
-	 * surfaced through TraceAbilityTraits::GetDashCooldownScale() and Trace.Mortimer.Verify prints
-	 * NOT LIVE for it, but the one call site it needs is in Source/Trace/Movement/, which another
-	 * agent owns this pass. The entire change is:
+	 * *** THIS KNOB IS LIVE. *** It was not when this paragraph was first written, and the paragraph
+	 * went on claiming otherwise for a whole demo after the call site landed. The line is in
+	 * UTraceCharacterMovementComponent::GetDashCooldown():
 	 *
-	 *     float UTraceCharacterMovementComponent::GetDashCooldown() const
-	 *     {
-	 *         return FMath::Max(0.f, UTraceSettings::Get().DashCooldown
-	 *             * TraceAbilityTraits::GetDashCooldownScale(CharacterOwner));
-	 *     }
+	 *     return FMath::Max(0.f, UTraceSettings::Get().DashCooldown
+	 *         * TraceAbilityTraits::GetDashCooldownScale(CharacterOwner));
 	 *
 	 * The trait is 1.0 for every other character and for any pawn with no ability component, so that
 	 * line is arithmetically identity for everybody but Mortimer — the same shape GetDashSpeed()
-	 * already uses one function above it, and TraceAbilityTypes.h is already included there.
+	 * already uses one function above it. Trace.Mortimer.DashTest MEASURES it on a live pawn rather
+	 * than trusting this sentence; believe the command, not the comment.
 	 *
 	 * GetDashRechargeWindow() is GetDashDuration() + GetDashCooldown(), so the HUD's dash meter
 	 * follows automatically and no second edit is needed for it.
@@ -5135,6 +5264,34 @@ public:
 	float MortimerThrowChargeHoldScale = 2.f;
 
 	/**
+	 * *** DEMO 21 ITEM 7, VERBATIM: "after the original 100% charge window has passed, add a .6x
+	 * modifier to the linear scaling of his throw charge". ***
+	 *
+	 * WHAT IT MULTIPLIES, PRECISELY: the charge t accumulated PAST the original 100% point, and
+	 * nothing before it. Up to t = 1 Mortimer is byte-identical to the other nine — this knob cannot
+	 * touch that half of the line, because the term it scales is zero there.
+	 *
+	 *     EffectiveT = min(t, 1)  +  0.6 x clamp(t - 1, 0, MortimerThrowChargeHoldScale - 1)
+	 *     Power      = CoreThrowChargeFloorFraction + (1 - Floor) x EffectiveT
+	 *
+	 * A FRACTION OF THE SHARED LINE'S OWN SLOPE, NEVER A SECOND SLOPE OF HIS OWN (spec v24 §0). It is
+	 * written as 0.6 against "whatever the base curve does past 100%" rather than as a Mortimer-only
+	 * uu/s or a Mortimer-only gradient, so a retune of CoreThrowChargeFloorFraction, of
+	 * CoreThrowChargeSeconds or of the hold cap moves his extended half with everybody's base half,
+	 * automatically. 1.0 here reproduces the pre-Demo-21 behaviour exactly and is the arithmetic red
+	 * arm; the CVar red arm is Trace.Mortimer.ThrowPastFull 0.
+	 *
+	 * WHAT IT DOES TO THE NUMBERS: at hold scale 2 and floor 0.15 his full extended charge was
+	 * 0.15 + 0.85 x 2.00 = x1.85 launch speed and is now 0.15 + 0.85 x 1.60 = x1.51. Range goes as
+	 * the SQUARE of launch speed (the loose Core is integrated under gravity with no drag — see
+	 * ATraceCore::ServerTickLooseCore), so his ceiling drops from about 3.42x a full-charge throw to
+	 * about 2.28x it. He still out-throws everybody, which is the item's own wording, and the card's
+	 * "about twice as far" becomes nearly true instead of a 70% overstatement.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Core Throw: Past-100% Charge Scale (0.6 = extra charge counts 60%) [Demo 21 item 7]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.2", UIMax = "1.0"))
+	float MortimerThrowChargePastFullScale = 0.6f;
+
+	/**
 	 * *** THE MANTLE GATE, AND IT IS OFF FOR EVERY OTHER CHARACTER BY CONSTRUCTION. ***
 	 *
 	 * The mantle was added in `dffea7c` and deleted in `d2319b2`; the deletion commit MEASURES why
@@ -5146,25 +5303,85 @@ public:
 	 *
 	 * Setting this false disables Mortimer's mantle and restores today's shipped movement for all ten
 	 * characters — i.e. it is also the red arm and the panic switch.
+	 *
+	 * *** DEMO 21 ITEM 6: THIS IS NO LONGER A GATE ON NOTHING. *** It is read by
+	 * TraceAbilityTraits::IsMantleAllowed(), which UTraceAbilitySetMortimer::TryMantle() asks FIRST.
+	 * The mantle itself lives in his own ability set (not in Source/Trace/Movement/): it is driven by
+	 * the JUMP key through the existing UTraceCharacterAbilitySet::OnJumpPressed hook, which
+	 * ATracePlayerController runs locally AND re-runs on the server, and it is two LaunchCharacter
+	 * impulses rather than a per-frame MOVE_Flying pull-up. See the header block in
+	 * Abilities/Characters/TraceAbilitySetMortimer.h for why that shape and not the old one.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Mantle Enabled (MORTIMER ONLY - nobody else can ever mantle) [v19 §3]"))
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Mantle Enabled (MORTIMER ONLY - nobody else can ever mantle) [v19 §3 / Demo 21 item 6]"))
 	bool bMortimerCanMantle = true;
 
 	/**
-	 * HOW MUCH MORE GENEROUS HIS MANTLE IS THAN THE RECOVERED ONE. §3: "30% more generous".
+	 * HOW MUCH MORE GENEROUS HIS MANTLE IS THAN THE OLD IN-GAME ONE. §3: "30% more generous".
 	 *
-	 * Applied to the four numbers that decide whether a ledge is climbable at all, from the values
-	 * `git show dffea7c` restores:
-	 *     reach          70   -> 91 uu       (x this)
-	 *     min height     55   -> 42.3 uu     (/ this — a LOWER floor is more generous)
-	 *     max height     230  -> 299 uu      (x this)
-	 *     min approach   120  -> 92.3 uu/s   (/ this — asking for LESS speed is more generous)
-	 * Duration, the up-phase fraction and the cooldown are NOT scaled: they are the feel of the
-	 * pull-up, not the size of the window, and "more generous" is a statement about what counts as a
-	 * ledge.
+	 * Applied to the three numbers that decide whether a ledge is climbable at all:
+	 *     reach            x this   (MortimerMantleReachRadii, below)
+	 *     height ceiling   x this   (MortimerMantleApexReach, below)
+	 *     floor            / this   (a LOWER floor is more generous)
+	 *     facing cone      x this   (a WIDER cone is more generous)
+	 * The pull-up's own feel — how high he arrives, how hard he is pushed over the lip — is NOT
+	 * scaled: "more generous" is a statement about what counts as a ledge, not about the climb.
+	 *
+	 * AGAINST THE LEGACY NUMBERS `git show dffea7c` restores (reach 70 + capsule, floor 55, ceiling
+	 * 230), 1.30 lands within a few uu of the old 91 / 42.3 / 299 at today's capsule, jump and
+	 * gravity — but the two companion knobs below are now MULTIPLES OF A LIVE BASE rather than uu, so
+	 * they follow the capsule and the jump instead of pinning him to a stale absolute (spec v24 §0).
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Mantle Generosity (1.30 = 30% more generous than the old one) [v19 §3]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
 	float MortimerMantleGenerosity = 1.3f;
+
+	/**
+	 * HOW FAR AHEAD HE REACHES FOR A LEDGE FACE, IN CAPSULE RADII, BEFORE GENEROSITY.
+	 *
+	 * *** A MULTIPLE OF THE CAPSULE, NOT A NUMBER OF uu (spec v24 §0). *** The legacy mantle stored
+	 * `MantleReachUU = 70` and traced `CapsuleRadius + 70`, which meant a capsule retune silently
+	 * changed how far past his own shoulder Mortimer could grab. Reach is a fact about how far in
+	 * front of the BODY the hands are, so it is expressed against the body: the probe runs
+	 *
+	 *     CapsuleRadius x MortimerMantleReachRadii x MortimerMantleGenerosity
+	 *
+	 * from the capsule axis. At today's 34 uu radius that is 34 x 2.8 x 1.30 = 124 uu, against the
+	 * legacy 34 + 70 x 1.30 = 125 uu — the same reach, now derived.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Mantle Reach (CAPSULE RADII, before generosity) [Demo 21 item 6]", ClampMin = "1.0", ClampMax = "8.0", UIMin = "1.5", UIMax = "4.0"))
+	float MortimerMantleReachRadii = 2.8f;
+
+	/**
+	 * THE TALLEST LEDGE HE MAY MANTLE, AS A MULTIPLE OF HIS OWN JUMP APEX, BEFORE GENEROSITY.
+	 *
+	 * *** A MULTIPLE OF THE JUMP, NOT A NUMBER OF uu (spec v24 §0), AND THIS IS THE ONE THAT MATTERS
+	 * MOST. *** The mantle's whole meaning is "a ledge he could not otherwise get onto", so the thing
+	 * it modifies is the JUMP, and the jump is JumpZVelocity under the pawn's own gravity:
+	 *
+	 *     apex    = JumpZVelocity^2 / (2 x |GravityZ|)
+	 *     ceiling = apex x MortimerMantleApexReach x MortimerMantleGenerosity
+	 *
+	 * The legacy knob was the flat number 230 uu. Had anybody retuned JumpZVelocity or
+	 * MovementGravityScale — both of which this project has moved more than once — the mantle window
+	 * would have stayed at 230 while the jump moved underneath it, and "he mantles what he cannot
+	 * jump" would have quietly become false in one direction or the other. At today's 640 uu/s jump
+	 * and 1.12 gravity scale the apex is ~187 uu, so 1.23 x 1.30 x 187 = ~298 uu — the legacy
+	 * 230 x 1.30 = 299 uu, now derived. The GROUND press additionally refuses any ledge at or below
+	 * the apex, because a jump already gets him there and stealing the jump key for it would be a
+	 * regression, so on the ground the live window is (apex, ceiling].
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Mantle Ceiling (JUMP APEXES, before generosity) [Demo 21 item 6]", ClampMin = "0.5", ClampMax = "4.0", UIMin = "1.0", UIMax = "2.0"))
+	float MortimerMantleApexReach = 1.23f;
+
+	/**
+	 * SECONDS BEFORE HE MAY MANTLE AGAIN. 0.35, the legacy MantleCooldownSeconds.
+	 *
+	 * NOT SCALED BY GENEROSITY — see that knob. It is a rate limit, not a window: it exists so a held
+	 * jump key cannot re-fire the probe every frame, and so the "ladder to the sky" the legacy mantle
+	 * measured (289 mantles in 25 s, a bot team carried from Z=313 to Z=4097) cannot come back by a
+	 * route the geometry guards missed.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Mantle Cooldown (s) [Demo 21 item 6]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.0"))
+	float MortimerMantleCooldownSeconds = 0.35f;
 
 	/**
 	 * QUAKE'S REACH, in uu, measured centre to centre.

@@ -235,6 +235,37 @@ static bool IsV10LegacyWallJump()
 }
 
 // =================================================================================================
+// SPEC v24 §8 — THE A/B ARM FOR THE SHORTER SLIDE AND THE EARLIER BONUS WINDOW.
+//
+// v24 §8, verbatim: "The 'bonus window' for getting a boost while sliding needs to happen .4 seconds
+// earlier in the slide, shorten the duration of the slide by .4seconds as well."
+//
+// ONE CHANGE DELIVERS BOTH SENTENCES, and that is a property of this component rather than a
+// shortcut. The bonus window is anchored to the slide's END — IsSlideJumpWellTimed() is
+// `GetSlideTimeLeft() <= GetSlideJumpWindowSeconds()`, not "t >= some offset from the start" — so
+// cutting 0.4 s off the slide moves the moment the window OPENS 0.4 s earlier in the slide, exactly
+// as asked, and moves its close with it. Applying 0.4 s a second time to SlideJumpWindowSeconds
+// (0.20 -> 0.60) would open the window 0.26 s into a 0.86 s slide, i.e. 70% of every slide would be
+// "well timed" — that is not a window, and it is not what §8 describes ("the window's position
+// relative to the END of the slide is roughly preserved while the slide itself is tighter").
+//
+// So the shipped change is SlideDurationTrimSeconds = 0.4, subtracted from the slide length AFTER
+// SlideMaxLengthScale, and this switch forces that trim back to its identity (0) — the same "one
+// binary, one harness, both arms" rule GTraceV9LegacyTuning above is built on. Nothing else moves:
+// unlike -TraceLegacyTuning this arm does not revert gravity, the air caps or the wall jump, so a
+// window time measured against it is a measurement of §8 and of nothing else.
+//
+// Defined outside every build guard for the Shipping-link reason spelled out on GTraceV9LegacyTuning:
+// GetSlideDuration() reads it and GetSlideDuration() ships. Registration lives in the dev block.
+int32 GTraceV24LegacySlide = 0;
+
+static bool IsV24LegacySlide()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceV24LegacySlide"));
+	return GTraceV24LegacySlide != 0 || bFromCommandLine;
+}
+
+// =================================================================================================
 // SPEC v18 §1a — THE A/B ARM FOR THE AIR REVERSAL BRAKE.
 //
 // Same argument as the two arms above, and the same shape. "Reversing in the air does nothing" is a
@@ -764,7 +795,30 @@ float UTraceCharacterMovementComponent::GetSlideDuration() const
 	const float Scale = IsV9LegacyTuning()
 		? 1.f
 		: FMath::Clamp(TraceMoveKnob::Float(TEXT("SlideMaxLengthScale"), 0.7f), 0.05f, 4.f);
-	return FMath::Max(0.05f, Base * Scale);
+
+	// =============================================================================================
+	// SPEC v24 §8 — "shorten the duration of the slide by .4seconds as well".
+	// =============================================================================================
+	//
+	// SUBTRACTED FROM THE SHIPPED LENGTH, NOT FROM THE BASE, and that is the whole reason this is a
+	// separate knob instead of an edit to SlideDuration. The owner's 0.4 s is 0.4 s of the slide he
+	// plays, which is Base x Scale (1.80 x 0.70 = 1.26 s), not 0.4 s of the 1.80 s base — cutting the
+	// base by 0.4 would ship 1.40 x 0.70 = 0.98 s, a 0.28 s cut, and the player would feel 70% of
+	// what he asked for. Re-typing the base as 1.2286 (0.86 / 0.7) would deliver the right number
+	// today and silently become a 0.514 s cut the moment anybody re-tunes SlideMaxLengthScale, which
+	// is precisely the absolute-instead-of-relative failure spec v24 §0 is about. As a trim over the
+	// finished length it stays "0.4 s shorter than the slide would otherwise be" whatever the base
+	// and the v9 §6 scale do next.
+	//
+	// It is also what makes the A/B honest: IsV24LegacySlide() zeroes ONLY this, so the before-arm
+	// is the exact v23 slide (1.26 s) in the same binary. See the arm at the top of this file.
+	const float Trim = IsV24LegacySlide()
+		? 0.f
+		: FMath::Max(0.f, UTraceSettings::Get().SlideDurationTrimSeconds);
+
+	// Floored at 0.05 s like every other path out of here: a trim larger than the slide must not be
+	// able to produce a zero-length (or negative) slide that still spends the slide cooldown.
+	return FMath::Max(0.05f, Base * Scale - Trim);
 }
 
 float UTraceCharacterMovementComponent::GetSlideDeceleration() const
@@ -2380,6 +2434,12 @@ void UTraceCharacterMovementComponent::BeginSlide()
 			? UpdatedComponent->GetComponentLocation()
 			: FVector::ZeroVector;
 		SlideDebugStartTime = (GetWorld() != nullptr) ? static_cast<float>(GetWorld()->GetTimeSeconds()) : 0.f;
+
+		// SPEC v24 §8. Cleared per slide, exactly as SlideJumpGraceRemaining is above: a fresh slide
+		// must not inherit the previous slide's window, or the FIRST measurement after a hop would
+		// report a window that opened before this slide began.
+		SlideWindowOpenTime = -1.f;
+		bSlideWindowWasOpen = false;
 	}
 #endif
 }
@@ -2426,6 +2486,13 @@ void UTraceCharacterMovementComponent::EndSlide()
 	const float WellTimedWindow = GetSlideJumpWindowSeconds();
 	bSlideJumpGraceWellTimed = (WellTimedWindow > 0.f && GetSlideTimeLeft() <= WellTimedWindow) ? 1 : 0;
 	SlideJumpGraceRemaining = WellTimedWindow;
+
+#if !UE_BUILD_SHIPPING
+	// SPEC v24 §8. Captured before the clock is zeroed: "did this slide end on its duration clock or
+	// by decaying out" is the difference between a measurement of §8 and a measurement of friction,
+	// and once SlideTimeRemaining is 0 the two are indistinguishable. Observation only.
+	const float SlideTimeRemainingAtEnd = SlideTimeRemaining;
+#endif
 
 	SlideTimeRemaining = 0.f;
 	const float ExitedSpeed = SlideSpeed;
@@ -2496,6 +2563,32 @@ void UTraceCharacterMovementComponent::EndSlide()
 			GTraceSlideDebugCount,
 			GTraceSlideDebugTotalDuration / FMath::Max(1, GTraceSlideDebugCount),
 			GTraceSlideDebugTotalDistance / FMath::Max(1, GTraceSlideDebugCount));
+
+		// SPEC v24 §8 — THE MEASUREMENT THE ITEM ACTUALLY ASKS FOR, on its own line and its own tag so
+		// it can be grepped out of a match log without the rest of the slide block.
+		//
+		// open  = seconds into THIS slide at the first frame IsSlideJumpWellTimed() went true
+		// close = the slide's measured length, because the window is anchored to the slide's end and
+		//         the slide ending is what closes it
+		// grace = the coyote tail EndSlide() has just charged (SlideJumpGraceRemaining), during which
+		//         a hop still counts as well timed — so the window a PLAYER can hit runs from `open`
+		//         to `close + grace`, and printing only the first two would understate it.
+		// endedBy is printed because a decay-ended slide is not a measurement of the duration clock.
+		//
+		// Every number here is read off the running simulation. None of them is GetSlideDuration() or
+		// GetSlideJumpWindowSeconds() restated: `expected` is printed LAST and separately, precisely
+		// so the measured pair can disagree with the constants and be seen to.
+		const float MeasuredOpen = SlideWindowOpenTime;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("V24WINDOW %-16s slide=%5.3fs  window open=%s close=%5.3fs (+%4.3fs coyote grace) "
+			     "len=%s  endedBy=%s  arm=%s  [expected: slide %5.3fs, window %4.3fs]"),
+			*GetNameSafe(CharacterOwner), Duration,
+			(MeasuredOpen >= 0.f) ? *FString::Printf(TEXT("%5.3fs"), MeasuredOpen) : TEXT("NEVER"),
+			Duration, SlideJumpGraceRemaining,
+			(MeasuredOpen >= 0.f) ? *FString::Printf(TEXT("%5.3fs"), Duration - MeasuredOpen) : TEXT("  n/a"),
+			(SlideTimeRemainingAtEnd <= 0.f) ? TEXT("clock") : TEXT("decay/exit"),
+			IsV24LegacySlide() ? TEXT("LEGACY (pre-v24)") : TEXT("V24 (shipped)"),
+			GetSlideDuration(), GetSlideJumpWindowSeconds());
 	}
 #endif
 }
@@ -3296,6 +3389,33 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 	}
 
+#if !UE_BUILD_SHIPPING
+	// 1d-ii. SPEC v24 §8 — WHEN DOES THE BONUS WINDOW ACTUALLY OPEN?
+	//
+	// Sampled HERE, after every clock has advanced and before any of this frame's three EndSlide()
+	// routes (the expiry immediately below, the airborne exit and the decay exit further down), so
+	// the last live frame of the slide is included and the answer is a runtime transition rather
+	// than "duration minus window" restated. Observation only: nothing below writes simulation state
+	// and it is on the same switch, the same authority test and the same "never on a replayed move"
+	// footing as the slide measurement in EndSlide().
+	//
+	// SlideSpeed is this frame's clock against LAST frame's speed (the decay step runs later in this
+	// same function), which matters only for a slide that ends by DECAY rather than by the clock —
+	// there the open time can read one frame (~16 ms) late. Every slide in the shipped tuning ends on
+	// the clock; the log line says which, so a decay-ended sample can be discarded.
+	if (bWasSliding && IsSliding() && IsSlideDebugEnabled() && SlideDebugStartTime > 0.f
+		&& CharacterOwner != nullptr && CharacterOwner->HasAuthority() && GetWorld() != nullptr)
+	{
+		const bool bOpenNow = IsSlideJumpWellTimed();
+		if (bOpenNow && !bSlideWindowWasOpen)
+		{
+			SlideWindowOpenTime = FMath::Max(0.f,
+				static_cast<float>(GetWorld()->GetTimeSeconds()) - SlideDebugStartTime);
+		}
+		bSlideWindowWasOpen = bOpenNow;
+	}
+#endif
+
 	// 1e. A slide whose duration has just run out exits through EndSlide() like every other slide
 	//     exit, so it KEEPS its momentum instead of being clamped. Routing the timer expiry through
 	//     the same function as the key release is what makes "hold the slide out" and "cancel it
@@ -3854,6 +3974,21 @@ static FAutoConsoleVariableRef CVarTraceV9LegacyTuning(
  */
 // Defined at the top of the file, outside this dev block — GetWallJumpSpeedRetention() reads it and
 // ships. Registration only, here.
+/**
+ * SPEC v24 §8 — the A/B arm for the shorter slide and the earlier bonus window. See IsV24LegacySlide()
+ * at the top of the file for why the trim is a knob rather than an edit to SlideDuration.
+ */
+// Defined at the top of the file, outside this dev block — GetSlideDuration() reads it and that
+// ships. Registration only, here, for the Shipping-link reason on GTraceV9LegacyTuning.
+static FAutoConsoleVariableRef CVarTraceV24LegacySlide(
+	TEXT("Trace.V24LegacySlide"),
+	GTraceV24LegacySlide,
+	TEXT("Dev only. 1 restores the pre-v24 slide length (SlideDurationTrimSeconds back to 0, i.e. the "
+	     "full 1.26s slide) and NOTHING else, so the v24 sec 8 window-open time and slide duration can "
+	     "be measured as a BEFORE/AFTER in one binary. Run -TraceSlideDebug in both arms and diff the "
+	     "V24WINDOW lines."),
+	ECVF_Cheat);
+
 static FAutoConsoleVariableRef CVarTraceV10LegacyWallJump(
 	TEXT("Trace.V10LegacyWallJump"),
 	GTraceV10LegacyWallJump,
@@ -6822,6 +6957,26 @@ void UTraceCharacterMovementComponent::LogV9TuningReport() const
 		     "endSpeed=%7.1f endedBy=%s)"),
 		GetSlideDuration(), SlideLength, SlideRefEntry, SlideDecel, SlideEndSpeed,
 		(SlideDecayTime <= GetSlideDuration()) ? TEXT("decay") : TEXT("clock"));
+
+	// SPEC v24 §8 — the config side of the shorter slide and the earlier window, printed as the
+	// ARITHMETIC so a reader can see where the 0.4 s went. This is deliberately NOT the evidence:
+	// the item asks for the window's real open and close times, and those come from the V24WINDOW
+	// line that -TraceSlideDebug prints off live slides. This block is what that line is checked
+	// against, and the two disagreeing is the whole reason both exist.
+	{
+		const float TrimKnob = FMath::Max(0.f, Settings.SlideDurationTrimSeconds);
+		const float TrimApplied = IsV24LegacySlide() ? 0.f : TrimKnob;
+		const float ShippedDuration = GetSlideDuration();
+		const float Window = GetSlideJumpWindowSeconds();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("V24TUNING §8 slide     base=%.4f x lengthScale=%.4f - trim=%.4f = %.4fs   "
+			     "bonus window opens at %.4fs, closes at %.4fs (+%.4fs coyote), arm=%s"),
+			Settings.SlideDuration,
+			IsV9LegacyTuning() ? 1.f : TraceMoveKnob::Float(TEXT("SlideMaxLengthScale"), 0.7f),
+			TrimApplied, ShippedDuration,
+			FMath::Max(0.f, ShippedDuration - Window), ShippedDuration, Window,
+			IsV24LegacySlide() ? TEXT("LEGACY (pre-v24)") : TEXT("V24 (shipped)"));
+	}
 
 	UE_LOG(LogTraceGame, Display,
 		TEXT("V9TUNING §7 slideJump multiplier=%.5f (base=%.5f gainOnly=%d)  missed=%7.1f -> timed=%7.1f "

@@ -231,3 +231,17 @@ float TraceAbilityTraits::GetThrowChargeHoldScale(const AActor* Actor)
 	}
 	return 1.f;
 }
+
+float TraceAbilityTraits::GetThrowChargePastFullScale(const AActor* Actor)
+{
+	// DEMO 21 ITEM 7. 1.0 is the identity in the strongest possible sense here: for anybody but
+	// Mortimer the quantity this multiplies is the charge accumulated PAST the original 100% point,
+	// and their hold cap IS the original 100% point, so that quantity is identically zero. This
+	// branch cannot change another character's throw even if the knob were set to 0.
+	if (const UTraceAbilitySetMortimer* Mortimer =
+		Cast<UTraceAbilitySetMortimer>(TraceAbilityTraitsFile::SetFor(Actor)))
+	{
+		return Mortimer->GetThrowChargePastFullScale();
+	}
+	return 1.f;
+}

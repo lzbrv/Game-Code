@@ -1205,6 +1205,21 @@ public:
 	/** Seconds of slide left, the same number the well-timed window is measured against. */
 	float GetSlideTimeLeftForAudit() const { return GetSlideTimeLeft(); }
 
+	/**
+	 * How long a slide lasts in total, with every modifier applied — SlideDuration x
+	 * SlideMaxLengthScale - SlideDurationTrimSeconds (spec v24 §8).
+	 *
+	 * Published so that code which must not OUTLIVE a slide can ask how long one is instead of
+	 * mirroring the arithmetic in a knob of its own (spec v24 §0). The bots are the live caller:
+	 * TraceBotController's slide branch clamps its crouch hold to this, because BotSlideHoldSeconds
+	 * was an absolute whose documentation claimed it tracked the slide and did not — when §8 cut the
+	 * slide to 0.86 s the bots went on holding crouch for 1.60 s and crouch-walked the difference.
+	 *
+	 * Unlike the members above this is a pure config read, not live state, so it is meaningful
+	 * BEFORE a slide starts — which is exactly when a caller deciding how long to hold needs it.
+	 */
+	float GetSlideDurationForAudit() const { return GetSlideDuration(); }
+
 	/** The well-timed multiplier actually in force, both readings of spec v9 §7 resolved. */
 	float GetSlideJumpWindowSpeedBonusForAudit() const { return GetSlideJumpWindowSpeedBonus(); }
 
@@ -1929,6 +1944,20 @@ protected:
 	float SlideDebugStartTime = 0.f;
 	FVector SlideDebugStartLocation = FVector::ZeroVector;
 	float SlideDebugEntrySpeed = 0.f;
+
+	// --- SPEC v24 §8: the bonus window, MEASURED (same switch as the slide measurement above) -----
+	//
+	// v24 §8 asks for the window to open 0.4 s earlier and the slide to be 0.4 s shorter, and asks
+	// for the OPEN and CLOSE times to be measured from the game rather than read off the constants.
+	// GetSlideJumpWindowSeconds() is anchored to the slide's END and GetSlideTimeLeft() also folds in
+	// the decay exit, so the moment the window actually opens is NOT "duration - window" in general —
+	// it is a runtime transition, and this is the only honest way to name it.
+	//
+	// SlideWindowOpenTime is seconds since the slide began at the FIRST frame IsSlideJumpWellTimed()
+	// returned true; -1 means the window never opened during that slide. Observation only, never
+	// saved-move state, never read by the simulation.
+	float SlideWindowOpenTime = -1.f;
+	bool bSlideWindowWasOpen = false;
 #endif
 
 #if !UE_BUILD_SHIPPING

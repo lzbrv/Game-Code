@@ -95,12 +95,15 @@
 // next to the code is the list of things that were CHECKED rather than assumed, because every one of
 // them would have shown up as a subtly wrong screen rather than as a failure:
 //
-//  * COORDINATE SPACE. `FSceneViewport::Draw` builds the scene canvas with
-//    `ShouldDPIScaleSceneCanvas() ? GetDPIScale() : 1` and `FDebugCanvasDrawer::InitDebugCanvas`
-//    builds the foreground one with `GetDPIScale()`. `UGameViewportClient` does not override that
-//    predicate, so both carry the same base transform and a pixel is a pixel on either. The panel
-//    therefore lands on the same rectangle it landed on before, which is exactly what the §A2
-//    re-measurement checks.
+//  * COORDINATE SPACE. *** THIS ENTRY WAS WRONG, AND SPEC v24 §1 IS THE CRASH IT CAUSED. ***
+//    `FViewport::Draw` builds the scene canvas with `ShouldDPIScaleSceneCanvas() ? GetDPIScale() : 1`
+//    and `FDebugCanvasDrawer::InitDebugCanvas` builds the foreground one with `GetDPIScale()`. This
+//    entry used to claim "`UGameViewportClient` does not override that predicate, so both carry the
+//    same base transform and a pixel is a pixel on either". It does not override it because it
+//    INHERITS an override — `FGameplayViewportClient::ShouldDPIScaleSceneCanvas()` returns false —
+//    so the two canvases carry DIFFERENT transforms whenever the window's DPI scale is not 1.
+//    Invisible in a shipped game window at 100%; a hard crash in PIE on a Retina display. The
+//    premise is now CHECKED rather than asserted, in Resolve(), where the argument is written out.
 //
 //  * THE TWO TRANSFORMS THE HUD PATH PUSHES AND THIS ONE DOES NOT. `UGameViewportClient::Draw`
 //    pushes `FTranslationMatrix(CanvasOrigin)` on the scene canvas and calls
@@ -144,6 +147,37 @@ namespace TraceOptionsMenuOverSlate
 		TEXT("    Canvas one draws instead for those frames. This is the red arm - it reproduces the\n")
 		TEXT("    58.8%-of-the-screen renderer swap that spec v23 A2 was raised for.\n")
 		TEXT("-TraceModalUnderSlate on the command line is the same 0, available before the first frame."),
+		ECVF_Default);
+
+	/**
+	 * `Trace.UI.ModalDPIGuard 0|1` — THE RED ARM FOR THE SPEC v24 §1 FIX ITSELF.
+	 *
+	 * Trace.UI.ModalOverSlate is the red arm for the v23 ELEVATION; it cannot be the red arm for this
+	 * fix, because setting it to 0 removes the elevation and therefore removes the crash — it proves
+	 * the surface was involved and says nothing about whether the DPI check is what is holding the
+	 * crash off now.
+	 *
+	 * This one keeps the elevation and skips ONLY the DPI comparison, so a single shipping binary
+	 * produces both arms of the v24 §1 evidence on the same harness:
+	 *
+	 *     PIE, default                        -> declines to elevate, SETTINGS opens, no crash
+	 *     PIE, Trace.UI.ModalDPIGuard 0       -> elevates at 1.00-vs-2.00, SIGSEGV on the render
+	 *                                            thread, ~80 ms after the panel first draws
+	 *
+	 * It exists because this project has shipped a harness that could not fail, and a fix whose only
+	 * evidence is "the crash stopped happening" is indistinguishable from a fix that merely moved the
+	 * timing. Leave it at 1 anywhere a player can reach.
+	 */
+	static int32 GDPIGuard = 1;
+	static FAutoConsoleVariableRef CVarModalDPIGuard(
+		TEXT("Trace.UI.ModalDPIGuard"),
+		GDPIGuard,
+		TEXT("1 = DEFAULT. A Canvas modal refuses to elevate onto the foreground canvas when that\n")
+		TEXT("    canvas's DPI scale differs from the scale this frame was laid out at. This is the\n")
+		TEXT("    spec v24 1 fix: in PIE the engine builds the two canvases at 1.00 and 2.00 and\n")
+		TEXT("    drawing across the gap crashes the render thread.\n")
+		TEXT("0 = skip the comparison and elevate anyway. THE RED ARM - it reproduces the PIE settings\n")
+		TEXT("    crash from this same binary. Not for players."),
 		ECVF_Default);
 
 	/**
@@ -213,6 +247,51 @@ namespace TraceOptionsMenuOverSlate
 	}
 
 	/**
+	 * SPEC v24 §1 — one line of forensics about the two surfaces, printed once per distinct answer.
+	 *
+	 * This exists because the v23 §A2 status string says only WHICH surface was chosen, and the
+	 * PIE crash is not about the choice — it is about what the chosen surface is made of. The two
+	 * numbers that matter are the two render-target sizes: the scene canvas draws into the viewport
+	 * this frame is being composited for, and the foreground canvas draws into whatever
+	 * FDebugCanvasDrawer last handed Slate. In a standalone game those are the same rectangle. Under
+	 * PIE they need not be, and a mismatch is the difference between "in front of Slate" and "into a
+	 * target of a different size that somebody else owns".
+	 */
+	static void LogSurfaceDetail(const UCanvas* GameCanvas, const FCanvas* Scene, const FCanvas* Foreground)
+	{
+		auto TargetSize = [](const FCanvas* C) -> FIntPoint
+		{
+			if (C == nullptr)
+			{
+				return FIntPoint(-1, -1);
+			}
+			const FRenderTarget* RT = C->GetRenderTarget();
+			return (RT != nullptr) ? RT->GetSizeXY() : FIntPoint(-2, -2);
+		};
+
+		const FIntPoint SceneSize = TargetSize(Scene);
+		const FIntPoint ForeSize = TargetSize(Foreground);
+
+		FIntPoint ViewportSize(-1, -1);
+		if (GEngine != nullptr && GEngine->GameViewport != nullptr && GEngine->GameViewport->Viewport != nullptr)
+		{
+			ViewportSize = GEngine->GameViewport->Viewport->GetSizeXY();
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Options] Surface detail: editor=%d | UCanvas %dx%d | scene FCanvas=%p rt=%dx%d dpi=%.2f ")
+			TEXT("| foreground FCanvas=%p rt=%dx%d dpi=%.2f modes=0x%x | viewport %dx%d"),
+			GIsEditor ? 1 : 0,
+			(GameCanvas != nullptr) ? GameCanvas->SizeX : -1,
+			(GameCanvas != nullptr) ? GameCanvas->SizeY : -1,
+			Scene, SceneSize.X, SceneSize.Y, (Scene != nullptr) ? Scene->GetDPIScale() : -1.f,
+			Foreground, ForeSize.X, ForeSize.Y,
+			(Foreground != nullptr) ? Foreground->GetDPIScale() : -1.f,
+			(Foreground != nullptr) ? Foreground->GetAllowedModes() : 0u,
+			ViewportSize.X, ViewportSize.Y);
+	}
+
+	/**
 	 * Resolves both surfaces and says whether the swap is on.
 	 *
 	 * @param OutGameCanvas   the UCanvas whose FCanvas would be swapped, when the answer is true.
@@ -258,6 +337,73 @@ namespace TraceOptionsMenuOverSlate
 		if (Foreground == nullptr || Foreground == GameCanvas->Canvas)
 		{
 			SetStatus(TEXT("SCENE - this viewport has no foreground canvas."));
+			return false;
+		}
+
+		// Once per process, and HERE rather than on the success path below, because the answer this
+		// line exists to explain is the one where elevation is DECLINED. Printed before the check it
+		// informs, so a log from a machine nobody can attach a debugger to still carries both DPI
+		// scales and both render-target sizes.
+		static bool bDetailLogged = false;
+		if (!bDetailLogged)
+		{
+			bDetailLogged = true;
+			LogSurfaceDetail(GameCanvas, GameCanvas->Canvas, Foreground);
+		}
+
+		// =========================================================================================
+		// SPEC v24 §1 — THE TWO SURFACES MUST AGREE ABOUT WHAT A PIXEL IS. *** THE PIE CRASH. ***
+		//
+		// This check is the whole of the v24 §1 fix, and the sentence it replaces was the whole of
+		// the bug. Spec v23 §A2 argued the elevation was safe because "`UGameViewportClient` does
+		// not override [ShouldDPIScaleSceneCanvas], so both carry the same base transform and a
+		// pixel is a pixel on either". **That is false.** UGameViewportClient does not need to
+		// override it: it INHERITS an override.
+		//
+		//     UGameViewportClient : UScriptViewportClient : UObject, FGameplayViewportClient
+		//     bool FGameplayViewportClient::ShouldDPIScaleSceneCanvas() const { return false; }
+		//         // "Scene View Family does its own DPI scaling"
+		//
+		// So the engine builds the two canvases with DELIBERATELY DIFFERENT DPI scales, from the
+		// same viewport client, on the same frame:
+		//
+		//     scene       FViewport::Draw          ShouldDPIScaleSceneCanvas() ? GetDPIScale() : 1
+		//                                          -> always 1 for a game viewport
+		//     foreground  FDebugCanvasDrawer::     GetDPIScale()
+		//                 InitDebugCanvas          -> the window's real DPI scale
+		//
+		// On a display at 100% those are both 1 and nothing shows. MEASURED on this machine, same
+		// binary, same overlay, one switch apart:
+		//
+		//     standalone -game   scene dpi=1.00  foreground dpi=1.00   -> opens, no crash
+		//     PIE (editor)       scene dpi=1.00  foreground dpi=2.00   -> SIGSEGV, ~80 ms later,
+		//                                                                on the render thread
+		//
+		// That is exactly why eleven standalone runs could not catch this and why the owner sees it
+		// every time: the editor window is high-DPI aware and a shipped game window on this machine
+		// is not. Elevated, every rectangle this page lays out for a 2744x1706 surface is handed to
+		// a canvas that multiplies it by two before it reaches a 2744x1706 render target.
+		//
+		// The test is RELATIVE — the foreground canvas is compared against the canvas THIS FRAME IS
+		// BEING DRAWN THROUGH, not against 1.0, not against "is this the editor". A hardcoded 1.0
+		// would break the moment a game window became DPI-aware; an `if (GIsEditor)` would refuse to
+		// elevate in a PIE session on a 100% display where the premise holds perfectly well. Compare
+		// the two surfaces and the answer stays correct wherever the engine moves either of them.
+		//
+		// Failing this is not a degraded mode: IsAvailable() answers the same, so ATraceMenuHUD
+		// stands its widget down on the same frame and the modal draws on the scene canvas exactly
+		// where it drew before v23 — correct, visible, and on the surface it was laid out for.
+		// =========================================================================================
+		const float SceneDPI = GameCanvas->Canvas->GetDPIScale();
+		const float ForegroundDPI = Foreground->GetDPIScale();
+		if (GDPIGuard != 0 && !FMath::IsNearlyEqual(SceneDPI, ForegroundDPI, 0.01f))
+		{
+			GStatusLiteral = nullptr;
+			GStatus = FString::Printf(
+				TEXT("SCENE - the foreground canvas is DPI %.2f but this frame is laid out at DPI ")
+				TEXT("%.2f; one pixel is not one pixel on both, so the modal stays on the surface it ")
+				TEXT("was measured for (spec v24 1)."),
+				ForegroundDPI, SceneDPI);
 			return false;
 		}
 
@@ -673,6 +819,54 @@ namespace TraceOptionsMenuArt
 		}
 		HUD->DrawTexture(Tex, X + W - Cap, Y, Cap, H, 1.f - CapU, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
 	}
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * SPEC v24 §1 — EVERY TEXTURE THIS PAGE CAN HAND THE CANVAS, AND WHETHER IT IS RENDERABLE YET.
+	 *
+	 * The v23 crash was a canvas batch holding a texture whose RHI resource did not exist, and it was
+	 * closed by guarding the ten SPRITES. This page hands the canvas an eleventh and twelfth texture
+	 * that no guard on this side covers: the Sofachrome GLYPH SHEETS, one per weight, drawn one tile
+	 * per glyph by TraceCanvasText. They are read here, never written — the text renderer is not this
+	 * agent's file — because a log line naming which of the twelve was unready on the frame before a
+	 * SIGSEGV is the difference between fixing this bug and guessing at it again.
+	 *
+	 * Logged for the first few DRAWN frames of the overlay rather than once: the failure window is
+	 * one or two frames wide, and a once-per-process line lands before the window opens.
+	 */
+	static void LogReadiness(int32 DrawsSinceOpen)
+	{
+		if (DrawsSinceOpen > 4)
+		{
+			return;
+		}
+
+		auto State = [](const UTexture2D* Tex) -> const TCHAR*
+		{
+			if (Tex == nullptr)                       { return TEXT("absent"); }
+			const FTextureResource* Res = Tex->GetResource();
+			if (Res == nullptr)                       { return TEXT("NO-RESOURCE"); }
+			if (!Res->TextureRHI.IsValid())           { return TEXT("NO-RHI"); }
+			return TEXT("ready");
+		};
+
+		FString Line;
+		for (int32 Index = 0; Index < int32(ESprite::Count); ++Index)
+		{
+			// GCache directly, NOT Sprite(): Sprite() would LoadObject and flush async loading from
+			// inside a draw pass, which is a thing this diagnostic must observe and not cause.
+			Line += FString::Printf(TEXT("%d=%s "), Index, State(GCache[Index].Get()));
+		}
+
+		const UTexture2D* AtlasLight = TraceText::AtlasTexture(ETraceTextWeight::Light);
+		const UTexture2D* AtlasBold  = TraceText::AtlasTexture(ETraceTextWeight::Bold);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Options] Readiness draw#%d: sprites %s| atlas(active=%d) light=%s bold=%s"),
+			DrawsSinceOpen, *Line, TraceText::IsAtlasActive() ? 1 : 0,
+			State(AtlasLight), State(AtlasBold));
+	}
+#endif
 
 	/**
 	 * Resolves every sprite once and says out loud what landed.
@@ -2474,6 +2668,11 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	// the ten UI textures resident before the player can move a selection, and it puts a line in the
 	// log that says whether this screen is wearing the art or its fallbacks.
 	TraceOptionsMenuArt::LogOnce();
+
+#if !UE_BUILD_SHIPPING
+	// Spec v24 §1. After LogOnce, so the first line reports the state LogOnce's loads left behind.
+	TraceOptionsMenuArt::LogReadiness(DrawsSinceOpen);
+#endif
 
 	// Dim whatever is behind us. In a match that is the arena; on the title screen it is the grid.
 	// Either way the panel has to be the only thing the eye can land on, and the arena in particular

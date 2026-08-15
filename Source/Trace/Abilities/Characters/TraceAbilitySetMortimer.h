@@ -18,6 +18,13 @@
 //            mortimer's dash cooldown by 25%"
 //   ITEM 3   "Mortimer's quake isn't working, Mortimer's mantle isn't working"
 //
+// DEMO 21 finally delivers the movement line and bends the passive:
+//
+//   ITEM 6   "Add a mantle for Mortimer, as the original instructions requested. It doesn't have to
+//            be the old mantle - make a new one which acts the same, but for just him."
+//   ITEM 7   "after the original 100% charge window has passed, add a .6x modifier to the linear
+//            scaling of his throw charge"
+//
 // ===================================================================================================
 // WHAT IS LIVE IN THIS FILE, AND WHAT IS A KNOB WAITING FOR SOMEBODY ELSE'S ONE-LINER
 // ===================================================================================================
@@ -32,22 +39,17 @@
 //          Trace.Mortimer.QuakeTest drives the SHIPPED E-key path and photographs the result.
 //   LIVE   the dash REACH. UTraceCharacterMovementComponent::GetDashSpeed() multiplies by
 //          TraceAbilityTraits::GetDashDistanceScale(). Demo 20 item 2 moves it 0.25 -> 0.40.
+//   LIVE   the dash COOLDOWN. GetDashCooldown() multiplies by GetDashCooldownScale(). This list said
+//          NOT LIVE for a whole demo after the call site landed in v23. Measured by
+//          Trace.Mortimer.DashTest, which is the thing to believe.
 //   LIVE   the Core THROW cap. ATraceCore::GetThrowChargeScaleForHold(), two call sites.
-//
-//   NOT    the dash COOLDOWN (Demo 20 item 2's second half). GetDashCooldownScale() below returns
-//   LIVE   1.25 and NOTHING CALLS IT: UTraceCharacterMovementComponent::GetDashCooldown() still
-//          reads the shared UTraceSettings::DashCooldown flat. The whole fix is one multiplication
-//          in that function; it is written out verbatim in the knob's comment in TraceSettings.h and
-//          in TraceAbilityTraits::GetDashCooldownScale's. Source/Trace/Movement/ was owned by
-//          another agent in the pass that added this, which is the only reason it is not done.
-//   NOT    the MANTLE. Not "unwired" — ABSENT. IsMantling(), CanAttemptMantle(), TryBeginMantle(),
-//   LIVE   ApplyMantleVelocity() and EndMantle() were deleted from the movement component in
-//          d2319b2 along with six pieces of saved-move state, eight tuning knobs and one CVar.
-//          AllowsMantle() and GetMantleGenerosityScale() below are the GATE for a feature that has
-//          no body. See the next block.
+//   LIVE   DEMO 21 ITEM 7, the 0.6x past the original 100% point. Same one function.
+//          Trace.Mortimer.ThrowTest throws four real Cores and measures the RANGE.
+//   LIVE   DEMO 21 ITEM 6, THE MANTLE. OnJumpPressed() -> TryMantle(), gated on
+//          TraceAbilityTraits::IsMantleAllowed(). Trace.Mortimer.MantleTest, red arm first.
 //
 // ===================================================================================================
-// THE MANTLE, AND WHY IT CANNOT COME BACK FOR EVERYBODY
+// THE MANTLE: WHY IT WENT, WHAT CAME BACK, AND WHY THIS ONE IS NOT THE OLD ONE
 // ===================================================================================================
 //
 // It was added in `dffea7c` (Demo 5) and DELETED in `d2319b2` (Demo 11). The deletion commit is not a
@@ -59,31 +61,43 @@
 //     legacy:  1.00 corrections per contact, worst error 88.11 uu, speed kept as low as 0.521
 //
 // The mantle itself was ALSO broken when it was written (0/8 successful mantles, because the ledge
-// probes hit the probing pawn — one AddIgnoredActor took it to 7/8) and the fixed version is what
-// `git show dffea7c` restores.
+// probes hit the probing pawn — one AddIgnoredActor took it to 7/8).
 //
 // SO THE RECOVERY IS GATED, NOT GLOBAL. TraceAbilityTraits::IsMantleAllowed() is false for every
-// character but Mortimer and is meant to be the FIRST question CanAttemptMantle() asks, so for the
-// other nine there is no probe, no MOVE_Flying, no pull-up, and therefore no new way for a client and
-// a server to disagree about a ledge. "Do not bring the ledge bug back for everyone" becomes a
-// property of the control flow rather than a promise.
+// character but Mortimer and is the FIRST question TryMantle() asks, so for the other nine there is
+// no probe, no launch, no pull-up, and therefore no new way for a client and a server to disagree
+// about a ledge. "Do not bring the ledge bug back for everyone" is a property of the control flow.
 //
-// *** DEMO 20 STATUS: STILL ABSENT, AND DELIBERATELY NOT FAKED. ***
+// *** WHAT THIS ONE IS, IN FOUR SENTENCES. ***
 //
-// There is no CanAttemptMantle() to put that first question in. Restoring the mantle means restoring
-// five functions, six pieces of FSavedMove_Trace state, the CanCombineWith() bar and the Clear /
-// SetMoveFor / PrepMoveFor round trip — ALL of it inside
-// Source/Trace/Movement/TraceCharacterMovementComponent.{h,cpp}, which this pass does not own.
+//   1. IT IS ON THE JUMP KEY, NOT AUTOMATIC. UTraceCharacterAbilitySet::OnJumpPressed() is an
+//      existing hook that ATracePlayerController runs LOCALLY and then re-runs on the SERVER through
+//      UTraceAbilityComponent::ServerHandleJumpPressed. So both ends execute the same code from the
+//      same press. The legacy mantle was attempted every frame from OnMovementUpdated, which is the
+//      thing that had to be inside the saved-move pipeline to be safe.
+//   2. IT IS TWO IMPULSES, NOT A PER-FRAME POSITION. ACharacter::LaunchCharacter, once to rise past
+//      the lip and once — when his feet clear it — to carry him over. Nothing writes Velocity every
+//      frame, nothing sets MOVE_Flying, nothing adds saved-move state, and the movement component is
+//      not edited at all. It is exactly the shape Rocco's second jump and Oyster's jar jump already
+//      have, and it inherits their honesty about prediction (see 4).
+//   3. THE GEOMETRY IS MINED FROM dffea7c, because that part was right: three probe heights rather
+//      than one, the ladder-to-the-sky guards (a degenerate hit, a non-vertical face, a destination
+//      directly overhead), "you may not climb people", a walkable top, and a capsule-shaped clearance
+//      test at the destination BEFORE anything moves.
+//   3b. THE SLIDE JUMP STILL OUTRANKS IT; THE WALL JUMP DELIBERATELY NO LONGER DOES. The legacy rule
+//      was "a wall jump outranks a mantle", and it was right for a mantle that fired BY ITSELF. This
+//      one fires because the player pressed jump, and a player pressing jump while airborne against a
+//      ledge he can climb wants to be on top of it. A tall wall has no walkable top inside the height
+//      ceiling, so the probe finds nothing and the press falls through to the wall jump untouched.
+//   4. THE PREDICTION CAVEAT IS STATED, NOT CLAIMED AWAY. PendingLaunchVelocity is not saved-move
+//      state, so a correction that replays the press will not replay the launch — the identical,
+//      documented limitation ATracePlayerController's own comment records for the two jump abilities
+//      that shipped before this one. Running the same hook on both ends is what makes it survive in
+//      practice. This is a smaller exposure than the legacy mantle's (two impulses versus a whole
+//      flight's worth of positions) and it is not zero.
 //
-// The tempting shortcut is to drive the pull-up from HERE — this class can reach the movement
-// component, set MOVE_Flying and write Velocity every tick without touching Movement/ at all. THAT
-// SHORTCUT IS THE BUG THE DELETION FIXED. A pull-up outside the saved-move pipeline is a position the
-// client computes and the server never replays, which is a correction on every frame of every mantle:
-// exactly the 1.00 corrections per contact and 88.11 uu of error measured above, re-introduced by the
-// feature that was supposed to hide them. Running it server-only instead just moves the corrections
-// onto the joined client. So it is NOT implemented, rather than implemented wrongly and reported as
-// done, and Trace.Mortimer.Verify says MISSING for it rather than NOT WIRED — the two words mean
-// different amounts of work and the last report used the wrong one.
+// The owner explicitly relaxed the requirement for Demo 21: "It doesn't have to be the old mantle —
+// make a new one which acts the same, but for just him." This is that.
 //
 // ===================================================================================================
 // QUAKE AND THE CARRIER CHOKE POINT — THE IRONY, STATED PRECISELY
@@ -240,6 +254,47 @@ private:
 	TObjectPtr<UMaterialInstanceDynamic> RingMID = nullptr;
 };
 
+/**
+ * *** DEMO 21 ITEM 6. Everything TryMantle() worked out about the ledge in front of Mortimer. ***
+ *
+ * A plain struct, not a USTRUCT: nothing replicates it and nothing reflects it. It exists so the
+ * probe and the launch are two readable halves instead of one 300-line function (the legacy
+ * TryBeginMantle was 323 lines and is the reason this file's spec entry says "smaller"), and so
+ * Trace.Mortimer.MantleTest can ask "what did the probe SEE" separately from "did he get up".
+ *
+ * @c Why is filled in on every refusal and is the whole diagnostic surface: "the mantle did nothing"
+ * is the single most useless bug report this feature can generate, and the legacy implementation
+ * spent an entire pass being debugged from a log line that only said "degenerate".
+ */
+struct FTraceMortimerLedge
+{
+	/** True only when every test passed and Destination is a place he can stand. */
+	bool bFound = false;
+
+	/** Where his CAPSULE CENTRE ends up, i.e. the ledge top plus a half-height and a hair. */
+	FVector Destination = FVector::ZeroVector;
+
+	/** Horizontal, normalised, pointing into the ledge. The direction the probe ran. */
+	FVector Forward = FVector::ZeroVector;
+
+	/** Top of the ledge, in world Z. */
+	float TopZ = 0.f;
+
+	/** Top of the ledge above his FEET, uu. The number the height window is applied to. */
+	float LedgeHeightUU = 0.f;
+
+	/** The window that was applied, after generosity. Printed on refusal so the knob is visible. */
+	float FloorUU = 0.f;
+	float CeilingUU = 0.f;
+	float ReachUU = 0.f;
+
+	/** His own jump apex, uu — the base CeilingUU is derived from. See MortimerMantleApexReach. */
+	float JumpApexUU = 0.f;
+
+	/** Why it was refused. Empty when bFound. */
+	FString Why;
+};
+
 UCLASS()
 class TRACE_API UTraceAbilitySetMortimer : public UTraceCharacterAbilitySet
 {
@@ -284,8 +339,21 @@ public:
 	 */
 	float GetThrowChargeHoldScale() const;
 
+	/**
+	 * DEMO 21 ITEM 7: "after the original 100% charge window has passed, add a .6x modifier to the
+	 * linear scaling of his throw charge". 0.6, from UTraceSettings::MortimerThrowChargePastFullScale.
+	 *
+	 * It multiplies ONLY the charge accumulated past the original 100% point, so the first 100% of his
+	 * wind-up is byte-identical to everybody else's — the term this scales is zero there, for him and
+	 * for them. LIVE: ATraceCore::GetThrowChargeScaleForHold().
+	 *
+	 * Trace.Mortimer.ThrowPastFull 0 is the red arm and forces this to 1.0, i.e. the pre-Demo-21
+	 * straight line.
+	 */
+	float GetThrowChargePastFullScale() const;
+
 	// =============================================================================================
-	// MOVEMENT — the mantle, recovered from dffea7c and gated to him alone
+	// MOVEMENT — THE MANTLE. DEMO 21 ITEM 6. See the header block for the shape and its caveat.
 	// =============================================================================================
 
 	/** True unless UTraceSettings::bMortimerCanMantle has been switched off. See the header. */
@@ -293,6 +361,60 @@ public:
 
 	/** §3: "30% more generous". 1.30, from UTraceSettings::MortimerMantleGenerosity. */
 	float GetMantleGenerosityScale() const;
+
+	/**
+	 * *** THE MANTLE'S FIRST HALF, ON THE JUMP KEY. ***
+	 *
+	 * Runs on the owning client AND on the server (ATracePlayerController::OnJumpStarted, then
+	 * UTraceAbilityComponent::ServerHandleJumpPressed). Returns TRUE only when a mantle actually
+	 * started, because a true return CONSUMES the jump: a press that finds no ledge must fall through
+	 * to the ordinary jump, or Mortimer would simply stop being able to jump near walls.
+	 */
+	virtual bool OnJumpPressed() override;
+
+	/**
+	 * *** THE MANTLE'S SECOND HALF. *** 20 Hz on every machine, but it does nothing at all unless a
+	 * mantle is in flight on THIS machine — and only the owning client and the server ever start one,
+	 * so a simulated proxy's copy of this set never enters the body.
+	 *
+	 * It waits for his feet to clear the lip and then applies the ONE forward impulse that carries him
+	 * over it. Two impulses, not a per-frame position: see the header.
+	 */
+	virtual void TickAbilities(float DeltaSeconds) override;
+
+	/** Cancels a mantle in flight. */
+	virtual void OnPawnDied() override;
+	virtual void OnUnequipped() override;
+
+	/**
+	 * THE PROBE, PURE AND PUBLIC. Reads the world, writes nothing, and answers "is there a ledge in
+	 * front of him that he may climb". Public because Trace.Mortimer.MantleTest has to be able to ask
+	 * what the probe SAW on a run where the pull-up did not happen — "it did nothing" and "it found no
+	 * ledge because the window is 40 uu too short" are different bugs.
+	 *
+	 * @param bFromGround  apply the ground rule: on the ground a ledge at or below his own jump apex
+	 *                     is refused, because a plain jump already reaches it and stealing the jump
+	 *                     key for it would be a regression. Ignored while airborne.
+	 */
+	bool ProbeLedge(FTraceMortimerLedge& Out, bool bFromGround) const;
+
+	/**
+	 * Starts a mantle if one is available. THE WHOLE GATE, IN ORDER: the character gate, the red arm,
+	 * the rate limit, "a wall jump outranks a mantle", then the probe, then the launch.
+	 *
+	 * Public so the harness can drive the rule without synthesising an input; the SHIPPED path into it
+	 * is OnJumpPressed() and that is what Trace.Mortimer.MantleTest presses.
+	 */
+	bool TryMantle();
+
+	/** True while a mantle's forward push is still pending. */
+	bool IsMantling() const { return MantlePushDeadline > 0.f; }
+
+	/** Mantles started since this set was equipped. Dev instrumentation, exactly like BlastCount. */
+	int32 GetMantleCount() const { return MantleCount; }
+
+	/** Forward pushes actually delivered. A start with no push is a mantle that stalled below the lip. */
+	int32 GetMantlePushCount() const { return MantlePushCount; }
 
 	// =============================================================================================
 	// ACTIVATED — QUAKE
@@ -368,4 +490,33 @@ private:
 
 	/** Shockwaves spawned since it was equipped. Authority only — the client never spawns one. */
 	int32 WaveCount = 0;
+
+	// --- THE MANTLE'S ONLY STATE. Five plain members, none replicated. --------------------------
+	//
+	// NOT REPLICATED, AND THAT IS THE DESIGN. Both machines that matter compute this from the same
+	// press against the same STATIC arena geometry, so there is nothing to agree about over the wire;
+	// a simulated proxy never sets it because it never receives a jump press. Replicating it would be
+	// inventing exactly the shared mutable ledge state the v12 §5 removal was about.
+
+	/** Absolute MatchTimeNow() the pending forward push gives up at. 0 = no mantle in flight. */
+	float MantlePushDeadline = 0.f;
+
+	/** World Z his FEET must reach before the forward push fires — the lip, plus a hair. */
+	float MantlePushAboveZ = 0.f;
+
+	/** Horizontal, normalised. The direction he goes when the lip is cleared. */
+	FVector MantlePushDirection = FVector::ZeroVector;
+
+	/** uu/s of that push, derived from how far he still has to travel. */
+	float MantlePushSpeed = 0.f;
+
+	/** Absolute MatchTimeNow() before which no new mantle may start. MortimerMantleCooldownSeconds. */
+	float MantleReadyTime = 0.f;
+
+	/** Mantles STARTED and forward pushes DELIVERED. The difference is mantles that stalled. */
+	int32 MantleCount = 0;
+	int32 MantlePushCount = 0;
+
+	/** Clears the five members above. One place, so an abandon and a completion cannot diverge. */
+	void ClearMantle();
 };

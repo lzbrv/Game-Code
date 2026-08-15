@@ -126,6 +126,25 @@ namespace TraceMenuArtStyleFile
 	}
 }
 
+FLinearColor TraceMenuArtStyle::AmberLifted()
+{
+	// Round-trips through the sheet's own byte values, so the ratio being preserved is the one that
+	// was measured off the art rather than its linear-light cousin. See the header.
+	const FColor Bytes = TraceMenuArtStyle::Amber.ToFColor(/*bSRGB=*/true);
+	const uint8 Peak = FMath::Max3(Bytes.R, Bytes.G, Bytes.B);
+	if (Peak == 0)
+	{
+		return TraceMenuArtStyle::Amber;
+	}
+
+	const float Scale = 255.f / static_cast<float>(Peak);
+	const auto Lift = [Scale](uint8 InChannel)
+	{
+		return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(InChannel * Scale), 0, 255));
+	};
+	return FLinearColor::FromSRGBColor(FColor(Lift(Bytes.R), Lift(Bytes.G), Lift(Bytes.B), Bytes.A));
+}
+
 FSlateFontInfo TraceMenuArtStyle::MenuFont(float InSize)
 {
 	TraceMenuArtStyleFile::Resolve();

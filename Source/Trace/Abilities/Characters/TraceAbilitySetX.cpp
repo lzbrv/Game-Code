@@ -551,7 +551,8 @@ void UTraceAbilitySetX::OnHalfTime()
 	// The framework has already cleared the cooldown and Reset() the net state, so the bees are
 	// unloaded by the time this runs. What is left is world state X put on OTHER players: any live
 	// marks. Half time is a reset of the whole match state, and a player walking out of the tunnel
-	// still taking +25% would be a 2 s mystery nobody could explain.
+	// still taking the mark's extra damage (+35% since spec v24 §9) would be a 2 s mystery nobody
+	// could explain.
 	if (HasAuthority())
 	{
 		if (UWorld* CurrentWorld = GetWorld())

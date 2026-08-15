@@ -24,6 +24,7 @@
 #include "Trace.h"                    // LogTraceGame
 #include "UI/Text/TraceCanvasText.h"   // spec v22 §A1 — this renderer types from the atlas
 #include "UI/TraceAutoShot.h"
+#include "UI/TraceHardwareCursor.h"    // spec v24 §2 — one pointer on screen, not two
 #include "UI/TraceMatchOptions.h"
 #include "UI/TraceNetworking.h"
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
@@ -2628,6 +2629,22 @@ void ATraceMenuHUD::DrawCursor()
 	{
 		return;
 	}
+
+	// ---- HIDE THE OS POINTER WHILE WE DRAW OUR OWN (spec v24 §2, integration) --------------------
+	//
+	// Past this point this function IS drawing a pointer — the cyan cross below — so the hardware
+	// arrow must go, exactly as it does on the UMG title screen, the settings modal and character
+	// select. This is the Canvas fallback path: Trace.UI.UseUMG 0, a missing WBP asset, or a modal
+	// that declined to elevate over Slate. UTraceTitleMenuWidget::ApplyView never runs there, so
+	// nothing else renews the lease and the player got the system arrow on top of the cross.
+	//
+	// Placed AFTER both early-outs on purpose. The lease is a statement that a pointer is being
+	// drawn THIS FRAME, so it must not be renewed on the frames this function returns without
+	// drawing one (travelling, no cursor, or the options overlay owning the screen — that last case
+	// renews through FTraceOptionsMenu's own surface instead). The lease expires two frames after
+	// the last renewal, so leaving this screen hands the arrow back with no exit path to forget.
+	TraceHardwareCursor::EnsureRunning();
+	TraceHardwareCursor::RenewSuppression(GetOwningPlayerController(), TEXT("title screen (Canvas)"));
 
 	const float S = 9.f * UIScale;
 	const float T = FMath::Max(1.f, 1.5f * UIScale);

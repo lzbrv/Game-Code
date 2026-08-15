@@ -4132,7 +4132,36 @@ float ATraceCore::GetThrowChargeScaleForHold(float HeldSeconds, const AActor* Th
 	// Mortimer, and for a null thrower, so this is identity on every pre-v19 path). It is the CAP that
 	// moves, not the curve: he walks further along the same line rather than up a steeper one.
 	const float HoldScale = FMath::Max(1.f, TraceAbilityTraits::GetThrowChargeHoldScale(Thrower));
-	const float TCapped = FMath::Clamp(HeldSeconds / ChargeSeconds, 0.f, TraceModeBChargeTCap() * HoldScale);
+
+	// THE ORIGINAL 100% CHARGE POINT. Not "his cap", not "1.0" — whatever the shared knobs say a full
+	// charge is (1 with the clamp on, CoreThrowChargeMaxFraction with it off). DEMO 21 ITEM 7 is
+	// phrased against this point, so it has to be read from the same place the other nine read it.
+	const float OriginalTCap = TraceModeBChargeTCap();
+
+	const float RawT = FMath::Max(0.f, HeldSeconds / ChargeSeconds);
+
+	// --- DEMO 21 ITEM 7 ---------------------------------------------------------------------------
+	//
+	//   "after the original 100% charge window has passed, add a .6x modifier to the linear scaling
+	//    of his throw charge"
+	//
+	// TWO SEGMENTS OF ONE LINE, NOT TWO LINES. Up to the original 100% point every character walks
+	// the shipped gradient (1 - Floor) per unit of t. Past it, the extra t is worth PastFull of that
+	// same gradient — so the curve bends, it does not restart, and there is still exactly one
+	// definition of "what a second of charge is worth" in this game.
+	//
+	// WHY THE SPLIT IS WRITTEN THIS WAY RATHER THAN AS A SECOND FORMULA FOR MORTIMER: for everybody
+	// else HoldScale is 1, ExtraRoom is 0, Extra is 0 and PastFull is 1, so the whole of the second
+	// term vanishes arithmetically and the expression collapses to the shipped
+	// Floor + (1 - Floor) * min(t, TCap). The other nine cannot be moved by this block by
+	// construction, which is what makes "his passive changed and nobody else's did" true without a
+	// test having to prove it.
+	const float PastFull  = FMath::Clamp(TraceAbilityTraits::GetThrowChargePastFullScale(Thrower), 0.f, 1.f);
+	const float ExtraRoom = OriginalTCap * (HoldScale - 1.f);            // 0 for the other nine.
+	const float WithinOriginal = FMath::Min(RawT, OriginalTCap);
+	const float Extra          = FMath::Clamp(RawT - OriginalTCap, 0.f, ExtraRoom);
+
+	const float TCapped = WithinOriginal + Extra * PastFull;
 
 	// THE LINEAR CORRELATION THE NOTE ASKS FOR, in one line: the floor at zero hold, exactly 1.0 (the
 	// current throw momentum) at a full one.

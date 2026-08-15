@@ -13,6 +13,7 @@
 #include "TextureResource.h"
 
 #include "Trace.h"   // LogTraceGame
+#include "UI/TraceHardwareCursor.h"
 #include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 #include "UI/Widgets/Menu/TraceMenuGridWidget.h"
@@ -85,8 +86,28 @@ namespace TraceTitleMenuWidgetLocal
 	/** The glyph body. Near-white, very slightly cool, matching the tagline's ink. */
 	static const FColor WordmarkInk(242, 246, 255, 255);
 
-	/** The glow the artist drew the mark with. TraceMenuArtStyle::Amber, at a strength that shows. */
-	static const FColor WordmarkGlow(255, 140, 40, 255);
+	/**
+	 * The glow the artist drew the mark with: TraceMenuArtStyle::Amber, at a strength that shows.
+	 *
+	 * SPEC v24 §0, applied here, and this one was not merely a stale literal — it was a WRONG one
+	 * wearing a correct comment. The line read `FColor(255, 140, 40)` and claimed to be the artist's
+	 * amber lifted, but sRGB(116,58,0) does not normalise to 255:140:40; it normalises to 255:128:0.
+	 * The mark's halo had drifted a visible step toward yellow and no diff could ever have shown it,
+	 * because the number and the sentence beside it were independent.
+	 *
+	 * It is now the derivation itself, shared with the menu row's selection rail — one expression of
+	 * "the artist's amber, lifted", in TraceMenuArtStyle, so both follow if the sheet's amber is ever
+	 * re-sampled. THE VISIBLE CHANGE IS SMALL AND IT IS REAL: the TRACE wordmark's outer glow moves
+	 * from sRGB(255,140,40) to sRGB(255,128,0), i.e. back onto the artist's own hue.
+	 *
+	 * Function-local static for the static-initialisation-order reason spelled out at
+	 * TraceMenuRowWidgetLocal::SelectionMarkColor: losing that race would be silent.
+	 */
+	static const FColor& WordmarkGlow()
+	{
+		static const FColor Color = TraceMenuArtStyle::AmberLifted().ToFColor(/*bSRGB=*/true);
+		return Color;
+	}
 
 	/** Rec. 709 luminance of an sRGB byte triple, 0..1. Perceptual weighting, not an average. */
 	static float ByteLuminance(const FColor& InColor)
@@ -431,6 +452,32 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 		MenuCursor->SetVisibility(InView.bCursorVisible
 			? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
 
+		// ---- SPEC v24 §2 — AND THE OS ONE STOPS BEING DRAWN ON TOP OF IT --------------------------
+		//
+		//     "The new cursor ui is working, but my cursor shows on top of it"
+		//
+		// The line above is the ONLY thing on this screen that knows whether the artist's arrow is on
+		// the glass this frame, so it is the right place to say so. Renewed rather than switched: the
+		// lease expires two frames after this stops being called, which is what makes a travel, a
+		// keyboard-only modal, a collapsed widget or a destroyed HUD hand the pointer back without
+		// any of them having to remember to. UI/TraceHardwareCursor.h has the argument in full.
+		//
+		// This does not break the "reads no game state, calls no gameplay code, makes no decision"
+		// rule at the top of this class's header, and the distinction is worth stating because it is
+		// load-bearing. bCursorVisible is a fact about the VIEW it was handed — the same bool that
+		// decides the image's visibility one line up — not a question asked of the game. The widget
+		// still decides nothing; it reports what it drew.
+		//
+		// EnsureRunning() is unconditional and the renewal is not. On the frames this screen is NOT
+		// drawing a pointer — a travel, or a modal in front of it — the arbiter still has to be
+		// ticking, because it is the ticker that expires the lease and the ticker that covers the
+		// SETTINGS modal, whose own file belongs to another slice this pass.
+		TraceHardwareCursor::EnsureRunning();
+		if (InView.bCursorVisible)
+		{
+			TraceHardwareCursor::RenewSuppression(GetOwningPlayer(), TEXT("title screen"));
+		}
+
 		// Re-ANCHORED, not offset. The view hands over a 0..1 fraction of the viewport, so setting the
 		// anchor to it puts the sprite in the right place at any DPI scale and any window size without
 		// this widget having to know either. Offsets would have needed both.
@@ -625,7 +672,7 @@ void UTraceTitleMenuWidget::LiftWordmarkFromSprite()
 			continue;
 		}
 		const bool bGlyphBody = Pixel.B > Pixel.R;
-		const FColor Replacement = bGlyphBody ? WordmarkInk : WordmarkGlow;
+		const FColor Replacement = bGlyphBody ? WordmarkInk : WordmarkGlow();
 		Pixel.R = Replacement.R;
 		Pixel.G = Replacement.G;
 		Pixel.B = Replacement.B;

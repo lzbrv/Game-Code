@@ -197,8 +197,45 @@ namespace TraceMenuArtStyle
 	/** Default state: white lettering. RGB(255,255,255). */
 	static const FLinearColor WordDefault = FLinearColor::White;
 
-	/** Hover state: the sheet's muted gold, RGB(115,82,50). Dimmer than you would guess; measured. */
-	static const FLinearColor WordHover = FLinearColor::FromSRGBColor(FColor(115, 82, 50));
+	/**
+	 * Hover state: the sheet's GREEN, sRGB(85,107,47).
+	 *
+	 * ---------------------------------------------------------------------------------------------
+	 * THIS CONSTANT WAS WRONG, AND HOW IT GOT WRONG IS WORTH THE PARAGRAPH (spec v24 §3)
+	 * ---------------------------------------------------------------------------------------------
+	 *     "The button's hover state doesn't fully work — the orange outline shows up while hovering,
+	 *      but not the green text from my assets"
+	 *
+	 * It used to read RGB(115,82,50) and call itself "the sheet's muted gold". That is not a colour
+	 * the artist ever put on a word. It is the AMBER HALO that bleeds off the hover ring and pools
+	 * around the lettering, and it got in here because whoever sampled it took the brightest pixel
+	 * inside the plate — on the one plate whose baked word is a dim state ANNOTATION rather than a
+	 * button label. Everything downstream then inherited a bad measurement, including spec v20 §0.5,
+	 * which correctly found the resulting colour illegible and replaced it with white. The word came
+	 * out white, the ring stayed amber, and the artist's green was never on the screen at all.
+	 *
+	 * RE-MEASURED, on the three plates of "UI Test Export_2.png" that carry a real BUTTON label in
+	 * the hover state. Their words are a flat, unshaded fill and all three agree to the byte:
+	 *
+	 *     SETTINGS hover  (sheet x 2000..7200,  y 1300..2600)   sRGB(85,107,47)  331,550 px
+	 *     KEYBIND  hover  (sheet x 18800..23200, y 8300..9600)  sRGB(85,107,47)  325,901 px
+	 *     KEY      hover  (sheet x 23900..25600, y 8300..9600)  sRGB(85,107,47)  102,267 px
+	 *
+	 * The odd one out is the generic state-swatch plate the slicer cuts T_MenuBtn_Hover from, whose
+	 * word is the literal string "HOVER" at sRGB(68,76,56) — a legend, drawn dimmer than the buttons
+	 * it labels. Sampling that plate is how this went wrong the first time, so it is named here.
+	 *
+	 * ---------------------------------------------------------------------------------------------
+	 * WHAT IT MEASURES AGAINST THE PLATE, STATED RATHER THAN DISCOVERED LATER
+	 * ---------------------------------------------------------------------------------------------
+	 * On PlateFill, sRGB(29,41,81), this green is a WCAG contrast ratio of 2.34:1. That is low, and
+	 * it is the artist's own composition — the same 2.34:1 their own sheet shows. It is deliberately
+	 * NOT "corrected" here: this file is the artist's palette sampled to the byte, and the moment a
+	 * value in it stops being what the sheet says, the file stops being worth reading. The selection
+	 * is carried by three signals besides the word anyway — the amber ring on T_MenuBtn_Hover, the
+	 * amber rail on the row's leading edge, and the plate's pulse — none of which changed.
+	 */
+	static const FLinearColor WordHover = FLinearColor::FromSRGBColor(FColor(85, 107, 47));
 
 	/**
 	 * Disabled state: the sheet draws the word WHITE on a near-black plate with a grey ring, so the
@@ -213,6 +250,29 @@ namespace TraceMenuArtStyle
 
 	/** The amber the sheet outlines a hover button and the TRACE mark with. RGB(116,58,0). */
 	static const FLinearColor Amber = FLinearColor::FromSRGBColor(FColor(116, 58, 0));
+
+	/**
+	 * Amber's HUE at full brightness: sRGB(116,58,0) -> sRGB(255,128,0). The ratio is exactly the
+	 * artist's; only the level is not.
+	 *
+	 * WHY THIS IS NEEDED AT ALL. The sheet's amber is a GLOW. It gets its apparent brightness from the
+	 * bloom around it rather than from the value itself, so anything that draws a FLAT shape in it —
+	 * a 9 px selection rail, the wordmark's rebuilt outer glow — ships as a dim brown smear at the
+	 * sampled value. Both of those places therefore want the same hue at a level that reads on black.
+	 *
+	 * WHY IT IS A FUNCTION IN THE PALETTE FILE, when the file's own rule is that it contains only what
+	 * the sheet says. Because this is not a second, invented COLOUR — it is a stated TRANSFORMATION of
+	 * the artist's one, and it moves when Amber does. That is exactly spec v24 §0's distinction. The
+	 * two callers used to carry the answer as pasted literals instead: the row's selection rail as
+	 * FColor(255,127,0) with a comment deriving it, and the title screen's wordmark glow as
+	 * FColor(255,140,40) with a comment CLAIMING to derive it and in fact not — 116:58:0 does not
+	 * normalise to 255:140:40, so the mark's halo had drifted off the artist's hue without anybody
+	 * being able to see it in a diff. Deriving it here makes the claim true and keeps it true.
+	 *
+	 * Normalised in sRGB BYTES, not in linear: the ratio the eye and the sheet agree on is the byte
+	 * one. Doing it in linear would produce a visibly different, more saturated colour.
+	 */
+	TRACE_API FLinearColor AmberLifted();
 
 	// =============================================================================================
 	// 9-slice geometry, in SHEET pixels. Mirrored in Scripts/slice-ui-assets.py.
@@ -268,4 +328,41 @@ namespace TraceMenuArtStyle
 
 	/** The chip beside a slider. Ring 1034 x 538 inside a 1154 x 656 crop, corner open by 60 rows. */
 	static const FSpriteFrame ValueFrame = { 1034.f, 538.f, 60.f, 150.f };
+
+	// =============================================================================================
+	// THE POINTER'S OWN GEOMETRY — named ONCE (spec v24 §0, applied to this area)
+	// =============================================================================================
+	//
+	// T_MenuCursor is drawn by three screens, and until this pass each carried its own copy of the
+	// sprite's proportions as bare numbers: FTraceOptionsMenu had `64.f / 87.f` with a tip of
+	// (0.180, 0.075), FTraceCharacterSelect had `64.f / 87.f` again with a DIFFERENT tip,
+	// (12/64, 6/87) = (0.1875, 0.0690). Two screens, two answers, for one picture — and a re-slice
+	// that changed the sprite would have moved neither.
+	//
+	// §0's rule is that a value derived from a base must be expressed RELATIVE to that base so it
+	// follows when the base moves. Here the base is the sprite's own pixel size, so that is what is
+	// stated and everything else is arithmetic on it. A future re-cut edits the two sizes below and
+	// every screen follows with no other edit.
+	//
+	// Measured off Content/Trace/UI/Art/Source/T_MenuCursor.png's ALPHA, not eyeballed: ink begins on
+	// row 6 spanning columns 9..15, and the first fully-opaque pixel is (11, 10). The arrow's point
+	// is therefore at about (11.5, 6.5) in the sprite's own 64 x 87.
+
+	static constexpr float CursorSpriteW = 64.f;
+	static constexpr float CursorSpriteH = 87.f;
+	static constexpr float CursorTipX = 11.5f;
+	static constexpr float CursorTipY = 6.5f;
+
+	/** Width per unit of height. A pointer drawn H tall is this wide, and is never stretched. */
+	static constexpr float CursorAspect = CursorSpriteW / CursorSpriteH;
+
+	/**
+	 * Where the arrow's POINT sits inside the sprite, as a fraction of it.
+	 *
+	 * Load-bearing rather than decorative: every screen hit-tests at the cursor position, so an arrow
+	 * anchored anywhere but its point draws about eleven pixels from the pixel it is about to click,
+	 * and every click in every screenshot looks like it landed on the wrong row.
+	 */
+	static constexpr float CursorTipU = CursorTipX / CursorSpriteW;
+	static constexpr float CursorTipV = CursorTipY / CursorSpriteH;
 }

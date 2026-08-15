@@ -221,8 +221,14 @@ public:
 	/**
 	 * *** THE SEAM, READ SIDE. MULTIPLY UTraceSettings::FireInterval BY THIS. ***
 	 *
-	 * 1.0 normally; 1 / RoxieModdedFireRateMultiplier while MODDED is up — 0.606 at the shipped 1.65,
-	 * turning a 0.40 s interval into 0.242 s, i.e. 150 RPM into 248.
+	 * 1.0 normally; 1 / RoxieModdedFireRateMultiplier while MODDED is up — 0.606 at the shipped 1.65.
+	 *
+	 * *** STATED AS A RATIO, NEVER AS AN INTERVAL OR AN RPM (spec v24 §0). *** This used to read
+	 * "turning a 0.40 s interval into 0.242 s, i.e. 150 RPM into 248". Spec v24 §4 moved the base gun
+	 * to 0.3158 s (190 RPM) and every one of those four numbers went stale in the same instant, while
+	 * the CODE was already correct — it multiplies the base, so Roxie moved to ~313 RPM on her own.
+	 * The rule is the ratio: MODDED is always exactly RoxieModdedFireRateMultiplier times the base
+	 * fire rate, whatever the base becomes. Run Trace.FireRate.Measure for the live figure.
 	 *
 	 * IT RETURNS AN INTERVAL SCALE, NOT A RATE MULTIPLIER, AND THE INVERSION IS THE WHOLE REASON IT IS
 	 * NAMED THIS WAY. §2 asks for "fire rate x1.65" and FireInterval is a PERIOD, so a call site that

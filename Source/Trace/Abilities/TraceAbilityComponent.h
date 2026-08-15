@@ -501,9 +501,18 @@ public:
 	 * SPEC v18 §2. Multiplier the gun must apply to UTraceSettings::FireInterval for @p Actor.
 	 *
 	 * *** MULTIPLY THE INTERVAL BY THIS. DO NOT ALSO DIVIDE. *** It is already the reciprocal of the
-	 * rate: Roxie's Modded ×1.65 comes back as 0.606 and Slimeball's stuck +30% as 0.769, so a 0.40 s
-	 * interval becomes 0.242 s and 0.308 s respectively. See
-	 * UTraceCharacterAbilitySet::GetFireIntervalScale for why the gun asks this instead of casting.
+	 * rate: Roxie's Modded ×1.65 comes back as 0.606 and Slimeball's stuck +30% as 0.769, so the
+	 * shipped 0.3158 s interval (190 RPM, spec v24 §4) becomes 0.1914 s and 0.2429 s respectively —
+	 * 314 and 247 RPM. See UTraceCharacterAbilitySet::GetFireIntervalScale for why the gun asks this
+	 * instead of casting.
+	 *
+	 * *** THIS FUNCTION IS WHAT MAKES SPEC v24 §0 TRUE OF THE GUN. *** Because every character's
+	 * answer is a SCALE and never an interval, moving UTraceSettings::FireInterval moves every
+	 * character's real fire rate in the same proportion, with no per-character re-tune. The 150 -> 190
+	 * RPM pass is the proof: nothing on either character changed, and Trace.FireRate.Measure timed
+	 * Roxie from 238 to 309 RPM and a stuck Slimeball from 189 to 239 while the base went 148 to 186
+	 * (measured at 60 Hz, where the frame boundary costs every arm the same ~2%). Anything that ever
+	 * needs to return an absolute RPM belongs somewhere else, not here.
 	 *
 	 * Static and null-safe: the two callers are the local fire gate and the server's rate validation,
 	 * and both run for Mannequins and bots that have no ability component at all. 1.0 in every one of

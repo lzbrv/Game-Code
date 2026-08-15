@@ -489,6 +489,19 @@ public:
 	 * a separate curve — there is still exactly one curve in this game, which is the whole point of
 	 * this function existing.
 	 *
+	 * DEMO 21 ITEM 7 — AND PAST THE ORIGINAL 100% POINT THAT EXTRAPOLATION IS WORTH 0.6x.
+	 *
+	 *     EffectiveT = min(t, tCap) + PastFull * clamp(t - tCap, 0, tCap * (HoldScale - 1))
+	 *     Power      = Floor + (1 - Floor) * EffectiveT
+	 *
+	 * where tCap is still the ORIGINAL 100% point (1, or GetThrowChargeMaxFraction() with the clamp
+	 * off) and PastFull is TraceAbilityTraits::GetThrowChargePastFullScale(). ONE LINE WITH A BEND IN
+	 * IT, not two curves: the gradient past the bend is a FRACTION of the shared gradient, so a
+	 * retune of the floor or the charge time still moves both halves together (spec v24 §0).
+	 *
+	 * For every character but Mortimer HoldScale is 1, so the second term's own clamp is [0, 0] and
+	 * the whole of Demo 21 item 7 is arithmetically absent — not "defaulted away", absent.
+	 *
 	 * Defaults to nullptr = "no character opinion", which reproduces the shipped clamp exactly, so
 	 * every existing caller (the meter's floor probe, the diagnostics that measure the curve itself)
 	 * keeps measuring what it always did.

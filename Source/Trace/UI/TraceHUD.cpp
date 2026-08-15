@@ -4907,7 +4907,9 @@ namespace TraceHUDV16Shots
 	 * Re-applied on a threshold rather than every tick: vulnerable refreshes one shared 2 s deadline
 	 * and adds a stack each time, so a per-frame re-application would race to the cap of five and the
 	 * screenshot would show a number nobody asked for. Topping up only below three keeps the frame
-	 * reading "x3 +35%", which is the arithmetic spec v16 4 spells out by name.
+	 * pinned at exactly THREE STACKS, which is what this scene is about; the percentage beside it is
+	 * whatever TraceVulnerable::GetMultiplierForStacks(3) currently resolves to and is deliberately
+	 * not restated here (spec v24 §9 moved it from +35% to +45% and every literal copy went stale).
 	 *
 	 * *** THE POISON IS APPLIED BY AN ENEMY, AND THAT IS NOT COSMETIC. *** The first run of this
 	 * harness attributed it to the victim's own ability component; the poison attached and the
@@ -4933,8 +4935,8 @@ namespace TraceHUDV16Shots
 		// legitimately end.
 		//
 		// Rebuilt rather than topped up: ApplyVulnerable ADDS a stack as well as resetting the
-		// deadline, so refreshing early would walk the count to the cap of five and the frame would
-		// read "x5 +45%" instead of the "x3 +35%" this scene is meant to show. Clearing first pins it
+		// deadline, so refreshing early would walk the count to the cap of FIVE and the frame would
+		// show the capped stack instead of the THREE this scene is meant to show. Clearing first pins it
 		// at exactly three, and the 0.75 s threshold keeps the deadline more than a second away from
 		// any frame the camera might catch.
 		if (UTraceHealthComponent* HealthComp = Target->Health.Get())
@@ -5112,8 +5114,25 @@ namespace TraceHUDV16Shots
 			Expect(*Run, !Record.bBeeClip, TEXT("GREEN: an ordinary clip is NOT flagged as bee rounds"));
 			Expect(*Run, Record.ChipCount >= 3,
 				TEXT("GREEN: at least three status chips drew (vulnerable + poisoned + slowed)"));
-			Expect(*Run, Record.ChipText.Contains(TEXT("VULNERABLE  x3  +35%")),
-				TEXT("GREEN: the vulnerable chip shows the STACK COUNT and spec v16 4's arithmetic (x3 = +35%)"));
+			// *** DERIVED, NOT TYPED (spec v24 §0). ***
+			//
+			// This assertion used to hold the literal "VULNERABLE  x3  +35%". That was correct only
+			// while XVulnerableDamageBonus was 0.25 — spec v24 §9 raised the base to 0.35, three
+			// stacks became +45%, and this line went red against a HUD that was printing exactly the
+			// right number. The chip TEXT was never the bug: it is built from
+			// TraceVulnerable::GetMultiplierForStacks (see the chip producer in BuildStatusChips),
+			// so this harness was the last place in the project still holding that arithmetic as a
+			// constant, and the only thing it could ever catch was a knob change.
+			//
+			// It now builds its expectation through the same pure function the HUD prints from, so a
+			// re-tune of either knob moves the test WITH the game instead of against it. The
+			// STRUCTURE is still asserted literally — the "x3" stack count and the two-space
+			// layout — because that part is this harness's actual subject.
+			const FString ExpectedVulnChip = FString::Printf(TEXT("VULNERABLE  x3  +%.0f%%"),
+				100.f * (TraceVulnerable::GetMultiplierForStacks(3) - 1.f));
+			Expect(*Run, Record.ChipText.Contains(ExpectedVulnChip),
+				FString::Printf(TEXT("GREEN: the vulnerable chip shows the STACK COUNT and the live vulnerable arithmetic (%s)"),
+					*ExpectedVulnChip));
 			Expect(*Run, Record.ChipText.Contains(TEXT("POISONED")), TEXT("GREEN: the poisoned chip drew"));
 			Expect(*Run, Record.ChipText.Contains(TEXT("SLOWED")), TEXT("GREEN: the slowed chip drew"));
 			Expect(*Run, !Record.ChipText.Contains(TEXT("drain=0.00")),

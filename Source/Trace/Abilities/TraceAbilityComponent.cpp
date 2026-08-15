@@ -21,7 +21,9 @@
 
 #include "Abilities/TraceCharacterAbilitySet.h"
 #include "Abilities/TraceAbilityWorldSubsystem.h"
+#include "Abilities/Characters/TraceAbilitySetSlimeball.h"   // v24 §4: Trace.FireRate.Measure arms the stuck passive
 #include "Core/TraceCharacter.h"
+#include "Gameplay/TraceWeaponComponent.h"                   // v24 §4: Trace.FireRate.Measure holds the real trigger
 #include "Movement/TraceCharacterMovementComponent.h"   // Demo 17 item 7: RefundDashCharge on a kill
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerState.h"
@@ -1604,6 +1606,711 @@ namespace TraceAbilityDeathWipeVerify
 				}),
 				0.f);
 		}));
+}
+
+// =================================================================================================
+// SPEC v24 §4 + §0 — Trace.FireRate.Measure
+//
+// "Report the resulting real RPM for every character that modifies fire rate, before and after."
+//
+// THIS COMMAND EXISTS BECAUSE THE ANSWER WAS NOT ALLOWED TO BE ARITHMETIC. 60 / (FireInterval x
+// scale) is trivially computable and would have been evidence of nothing: the whole risk in a
+// fire-rate change is that some other number in the firing path — a validation tolerance, a
+// hard-coded interval, a frame-quantised gate — does not move with the knob. So this holds the REAL
+// trigger (UTraceWeaponComponent::StartFire, the same call the mouse makes), watches the clip, and
+// times the rounds that actually leave it.
+//
+// WHAT MAKES IT A BEFORE/AFTER RATHER THAN A READING. Every stage is measured TWICE: once with
+// FireInterval forced back to the 0.40 s (150 RPM) gun this patch replaced, and once at the shipped
+// value. The 0.40 arm is the RED arm — it is the build the owner had — and the two arms differing
+// by the expected ratio is what proves the measurement is measuring the knob at all. A harness whose
+// two arms print the same number is measuring something else, and this one says so out loud.
+//
+// AND IT IS THE §0 PROOF. Roxie's MODDED and Slimeball's stuck passive are stored as RATE
+// MULTIPLIERS, never as intervals, so if §0 holds their measured RPM must move by the SAME RATIO as
+// the base gun's between the two arms — with neither ability knob touched. That ratio check is the
+// last line of the table, and it is the claim the owner asked to have stated in the commit.
+//
+// The interval is derived from the time between the FIRST and LAST round of a window, not from
+// shots/duration: the trigger's first round is free (StartFire fires immediately), so dividing by
+// the window length would report a rate the gun cannot sustain.
+// =================================================================================================
+
+namespace TraceAbilityFireRateMeasure
+{
+	/** Seconds of held trigger per measured window. Long enough for ~6-11 rounds at every arm. */
+	constexpr double WindowSeconds = 1.8;
+
+	/** The gun this patch replaced: 60/150. The RED arm, and the "before" column of the table. */
+	constexpr float OldFireInterval = 0.40f;
+
+	/** Give up rather than hang if the match never becomes drivable. */
+	constexpr double StageTimeoutSeconds = 30.0;
+
+	/** One measured window. */
+	struct FSample
+	{
+		int32   Shots = 0;
+		double  FirstShotWorld = 0.0;
+		double  LastShotWorld = 0.0;
+		double  FirstShotReal = 0.0;
+		double  LastShotReal = 0.0;
+		float   Scale = 1.f;
+		float   BaseInterval = 0.f;
+		bool    bValid = false;
+		int32   MaxDropInOneFrame = 0;
+		FString Invalid;
+
+		/**
+		 * The seam's answer sampled on EVERY frame of the window, not just at the start.
+		 *
+		 * An ability that quietly lapsed halfway through would otherwise be reported as a slow one.
+		 * If these two disagree, the window straddled two different guns and the number below is a
+		 * blend of them — which the report says out loud rather than averaging away.
+		 */
+		float   MinScaleSeen = TNumericLimits<float>::Max();
+		float   MaxScaleSeen = 0.f;
+
+		/** Seconds between rounds, measured. -1 when fewer than two rounds left the clip. */
+		double MeasuredInterval() const
+		{
+			return (Shots >= 2) ? (LastShotWorld - FirstShotWorld) / static_cast<double>(Shots - 1) : -1.0;
+		}
+		double MeasuredRPM() const
+		{
+			const double Interval = MeasuredInterval();
+			return (Interval > 0.0) ? (60.0 / Interval) : -1.0;
+		}
+		/** The same span on the WALL clock. Diverges from the world span only under time dilation. */
+		double MeasuredIntervalReal() const
+		{
+			return (Shots >= 2) ? (LastShotReal - FirstShotReal) / static_cast<double>(Shots - 1) : -1.0;
+		}
+		double ExpectedInterval() const { return static_cast<double>(BaseInterval) * static_cast<double>(Scale); }
+	};
+
+	/** A character stage, measured once per arm. */
+	struct FStage
+	{
+		const TCHAR*      Label;
+		ETraceCharacterId Character;   // None = keep whoever the player already is
+		bool              bActivate;   // press E through TryActivate()
+		bool              bStick;      // Slimeball only: force the wall-stick passive on
+	};
+
+	static const FStage Stages[] =
+	{
+		{ TEXT("BASE GUN (no fire-rate ability)"), ETraceCharacterId::None,      false, false },
+		{ TEXT("ROXIE, MODDED UP"),                ETraceCharacterId::Roxie,     true,  false },
+		{ TEXT("SLIMEBALL, STUCK TO A WALL"),      ETraceCharacterId::Slimeball, false, true  },
+	};
+
+	constexpr int32 StageCount = static_cast<int32>(UE_ARRAY_COUNT(Stages));
+
+	struct FRun
+	{
+		int32  StageIndex = 0;
+		int32  ArmIndex = 0;          // 0 = RED (0.40 s), 1 = shipped
+		int32  Phase = 0;             // 0 stage, 1 arm, 2 sample, 3 close
+		double PhaseDeadlineReal = 0.0;
+		double StageStartedReal = 0.0;
+		double WindowEndWorld = 0.0;
+		int32  LastClip = 0;
+		float  RestoreFireInterval = 0.f;
+		bool   bRestored = false;
+		bool   bWallStaged = false;   // phase 0 repeats while a reload runs; the teleport must not
+		FSample Samples[StageCount][2];
+		TWeakObjectPtr<ATraceCharacter> Subject;
+	};
+
+	static UWorld* FindAuthoritativeWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* Candidate = Context.World();
+			if (Candidate != nullptr && Candidate->IsGameWorld() && Candidate->GetAuthGameMode() != nullptr)
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * The first HUMAN player's pawn, alive, holding the gun and not carrying the Core.
+	 *
+	 * A HUMAN for the same reason every other fixture in this file insists on one: the game mode
+	 * re-fills BOTS' characters four times a second, so a bot subject would be fighting the fill for
+	 * ownership of the very field this harness sets.
+	 */
+	static ATraceCharacter* FindSubject(UWorld* WorldPtr, FString& OutWhyNot)
+	{
+		OutWhyNot = TEXT("no human player controller with a pawn");
+		if (WorldPtr == nullptr)
+		{
+			OutWhyNot = TEXT("no world");
+			return nullptr;
+		}
+		for (FConstPlayerControllerIterator It = WorldPtr->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = Cast<APlayerController>(It->Get());
+			ATraceCharacter* Pawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+			if (Pawn == nullptr || Pawn->Weapon == nullptr)
+			{
+				continue;
+			}
+			if (!Pawn->IsAlive() || Pawn->IsCarrier() || Pawn->Weapon->IsKnifeEquipped())
+			{
+				// WHICH of the three, by name. "No drivable subject" cost this harness a whole run
+				// once because it did not say that the subject had picked up the Core.
+				OutWhyNot = FString::Printf(TEXT("%s is present but alive=%d carrying=%d knife=%d"),
+					*GetNameSafe(Pawn), Pawn->IsAlive() ? 1 : 0, Pawn->IsCarrier() ? 1 : 0,
+					Pawn->Weapon->IsKnifeEquipped() ? 1 : 0);
+				continue;
+			}
+			return Pawn;
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Puts @p Pawn against the nearest real wall and returns false if there is not one.
+	 *
+	 * *** WHY THE STICK CANNOT SIMPLY BE FORCED ON. *** UTraceAbilitySetSlimeball::DebugSetStuck()
+	 * sets the flag, and UTraceAbilitySetSlimeball::ApplyStick() takes it straight back off on the
+	 * next ability tick unless V is held AND its own 90 uu fan still finds a wall. The existing
+	 * Slimeball fixture gets away with forcing the flag because it reads its numbers in the same
+	 * frame; a fire-rate window is 1.8 s long and would spend most of it un-stuck, measuring the base
+	 * gun and calling it the passive.
+	 *
+	 * So the harness satisfies the real conditions instead of defeating them: find a wall, stand him
+	 * next to it, hold V through the shipping input path, and let the ability's own probe keep the
+	 * stick alive for the whole window. Nothing about the passive is faked — only where he is.
+	 */
+	static bool PlaceAgainstNearestWall(ATraceCharacter* Pawn, FString& OutWhy)
+	{
+		UWorld* WorldPtr = (Pawn != nullptr) ? Pawn->GetWorld() : nullptr;
+		if (WorldPtr == nullptr)
+		{
+			OutWhy = TEXT("no world");
+			return false;
+		}
+
+		// The same question the ability's own probe asks, at arena scale: a WorldStatic OBJECT query
+		// (not a channel trace, which every pawn capsule would block) for a surface too steep to stand
+		// on, judged by the ability's own knob so the two cannot disagree about what a wall is.
+		const float MaxNormalZ = FMath::Clamp(UTraceSettings::Get().SlimeballWallStickMaxSurfaceNormalZ, 0.f, 1.f);
+		const float SearchRange = 30000.f;   // the arena's 34944 uu diagonal, near enough
+		const FVector Centre = Pawn->GetActorLocation();
+
+		FCollisionObjectQueryParams ObjectParams;
+		ObjectParams.AddObjectTypesToQuery(ECC_WorldStatic);
+		FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(TraceFireRateWallSearch), /*bTraceComplex*/ false);
+		QueryParams.AddIgnoredActor(Pawn);
+
+		// *** NOT THE CENTRE PEDESTAL. *** The first run of this harness parked him against the practice
+		// range's central pillar, which put him on the Core rack pad; he picked the Core up, and a
+		// carrier has no gun — so the stage that was about to measure his fire rate reported "no
+		// drivable subject" for thirty seconds instead. Any wall whose landing spot is inside this
+		// radius of the Core is skipped, and the arena has plenty of others.
+		constexpr float CoreKeepOutUU = 1500.f;
+		const ATraceCore* CoreActor = ATraceCore::Get(WorldPtr);
+		const FVector CoreLocation = (CoreActor != nullptr) ? CoreActor->GetActorLocation() : FVector::ZeroVector;
+
+		float BestDistance = TNumericLimits<float>::Max();
+		FVector BestPoint = FVector::ZeroVector;
+		FVector BestNormal = FVector::ZeroVector;
+		bool bFound = false;
+		int32 RejectedNearCore = 0;
+
+		constexpr int32 ProbeCount = 16;
+		for (int32 Index = 0; Index < ProbeCount; ++Index)
+		{
+			const float Angle = (2.f * PI * static_cast<float>(Index)) / static_cast<float>(ProbeCount);
+			const FVector Direction(FMath::Cos(Angle), FMath::Sin(Angle), 0.f);
+
+			FHitResult Hit;
+			if (!WorldPtr->LineTraceSingleByObjectType(Hit, Centre, Centre + Direction * SearchRange,
+				ObjectParams, QueryParams))
+			{
+				continue;
+			}
+			if (FMath::Abs(Hit.ImpactNormal.Z) > MaxNormalZ)
+			{
+				continue;
+			}
+			if (CoreActor != nullptr
+				&& FVector::DistSquaredXY(Hit.ImpactPoint, CoreLocation) < (CoreKeepOutUU * CoreKeepOutUU))
+			{
+				++RejectedNearCore;
+				continue;
+			}
+			if (Hit.Distance < BestDistance)
+			{
+				BestDistance = static_cast<float>(Hit.Distance);
+				BestPoint = Hit.ImpactPoint;
+				BestNormal = Hit.ImpactNormal;
+				bFound = true;
+			}
+		}
+
+		if (!bFound)
+		{
+			OutWhy = FString::Printf(
+				TEXT("no wall within %.0f uu in any of %d directions (%d were too close to the Core to use)"),
+				SearchRange, ProbeCount, RejectedNearCore);
+			return false;
+		}
+
+		// 60 uu off the face: inside the ability's own 90 uu reach, and outside the capsule's radius so
+		// the teleport does not bury him in the geometry he is about to stick to.
+		const FVector Target(BestPoint.X + BestNormal.X * 60.f, BestPoint.Y + BestNormal.Y * 60.f, Centre.Z);
+		if (!Pawn->SetActorLocation(Target, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics))
+		{
+			OutWhy = TEXT("the teleport to the wall was refused");
+			return false;
+		}
+
+		OutWhy = FString::Printf(TEXT("wall found %.0f uu away, standing 60 uu off its face"), BestDistance);
+		return true;
+	}
+
+	static void RestoreArm(FRun& Run)
+	{
+		if (Run.bRestored)
+		{
+			return;
+		}
+		if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+		{
+			Mutable->FireInterval = Run.RestoreFireInterval;
+		}
+		Run.bRestored = true;
+	}
+
+	static float ArmInterval(const FRun& Run, int32 ArmIndex)
+	{
+		return (ArmIndex == 0) ? OldFireInterval : Run.RestoreFireInterval;
+	}
+
+	/** One line per measured window, printed as it is taken so a run that dies has still said something. */
+	static void LogSample(const FSample& Sample, const TCHAR* StageLabel, int32 ArmIndex)
+	{
+		const TCHAR* ArmLabel = (ArmIndex == 0) ? TEXT("BEFORE/RED") : TEXT("AFTER/SHIPPED");
+		if (!Sample.bValid)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[FIRERATE] %-13s %-34s  NOT MEASURED — %s"),
+				ArmLabel, StageLabel, *Sample.Invalid);
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[FIRERATE] %-13s %-34s  base %.4fs x scale %.4f (held x%.4f every frame) = %.4fs expected  |  "
+			     "MEASURED %.4fs = %.1f RPM from %d rounds over %.3fs of world time (%.3fs of wall clock)"),
+			ArmLabel, StageLabel, Sample.BaseInterval, Sample.Scale, Sample.MinScaleSeen,
+			Sample.ExpectedInterval(), Sample.MeasuredInterval(), Sample.MeasuredRPM(), Sample.Shots,
+			Sample.LastShotWorld - Sample.FirstShotWorld, Sample.LastShotReal - Sample.FirstShotReal);
+	}
+
+	static void Report(FRun& Run)
+	{
+		RestoreArm(Run);
+
+		UE_LOG(LogTraceGame, Display, TEXT("[FIRERATE] ================ spec v24 §4 + §0: MEASURED RPM ================"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[FIRERATE] %-34s %14s %14s %8s"), TEXT("stage"), TEXT("BEFORE (150)"), TEXT("AFTER (190)"), TEXT("ratio"));
+
+		int32 Failures = 0;
+		double BaseRatio = -1.0;
+
+		for (int32 Index = 0; Index < StageCount; ++Index)
+		{
+			const FSample& Before = Run.Samples[Index][0];
+			const FSample& After  = Run.Samples[Index][1];
+
+			if (!Before.bValid || !After.bValid)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[FIRERATE] %-34s %14s %14s %8s  (%s)"),
+					Stages[Index].Label,
+					Before.bValid ? *FString::Printf(TEXT("%.1f"), Before.MeasuredRPM()) : TEXT("--"),
+					After.bValid  ? *FString::Printf(TEXT("%.1f"), After.MeasuredRPM())  : TEXT("--"),
+					TEXT("--"),
+					Before.bValid ? *After.Invalid : *Before.Invalid);
+				++Failures;
+				continue;
+			}
+
+			const double Ratio = After.MeasuredRPM() / Before.MeasuredRPM();
+			if (Index == 0)
+			{
+				BaseRatio = Ratio;
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[FIRERATE] %-34s %14.1f %14.1f %8.4f"),
+				Stages[Index].Label, Before.MeasuredRPM(), After.MeasuredRPM(), Ratio);
+
+			// Each window must land on the interval the gun was asked for. 12% covers the frame
+			// quantisation at both ends of a ~7-round window; anything wider is a real disagreement
+			// between the knob and the gun.
+			const bool bMatchesKnob =
+				FMath::IsNearlyEqual(After.MeasuredInterval(), After.ExpectedInterval(), After.ExpectedInterval() * 0.12);
+			if (!bMatchesKnob)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[FIRERATE] *** FAIL *** %s fires at %.4fs but the knob x scale says %.4fs — the gun is "
+					     "NOT reading the knob this harness is setting."),
+					Stages[Index].Label, After.MeasuredInterval(), After.ExpectedInterval());
+				++Failures;
+			}
+
+			// *** THE §0 CHECK. *** An ability stored as a MULTIPLIER moves with the base by the same
+			// ratio as the base itself. An ability stored as an ABSOLUTE would print a ratio of ~1.0
+			// here — it would not have moved at all — and that is exactly the bug §0 forbids.
+			if (Index > 0 && BaseRatio > 0.0)
+			{
+				const bool bTracksBase = FMath::IsNearlyEqual(Ratio, BaseRatio, 0.10);
+				const FString Line = FString::Printf(
+					TEXT("[FIRERATE] %s §0: %s scaled x%.4f while the base gun scaled x%.4f — the ability is %s "
+					     "the base."),
+					bTracksBase ? TEXT("PASS") : TEXT("*** FAIL ***"),
+					Stages[Index].Label, Ratio, BaseRatio,
+					bTracksBase ? TEXT("RELATIVE to") : TEXT("*** NOT TRACKING ***"));
+
+				if (bTracksBase)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("%s"), *Line);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Error, TEXT("%s"), *Line);
+					++Failures;
+				}
+			}
+		}
+
+		// The wall clock against the world clock, printed because a harness elsewhere in this project
+		// predicts shot counts from FPlatformTime while the gun gates on World::GetTimeSeconds().
+		const FSample& BaseAfter = Run.Samples[0][1];
+		if (BaseAfter.bValid && BaseAfter.MeasuredIntervalReal() > 0.0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FIRERATE] clocks: the base gun measured %.4fs on the WORLD clock and %.4fs on the WALL "
+				     "clock (x%.4f). UTraceWeaponComponent::CanFire gates on the world clock; any harness that "
+				     "predicts a shot count from wall time is only right while these agree."),
+				BaseAfter.MeasuredInterval(), BaseAfter.MeasuredIntervalReal(),
+				BaseAfter.MeasuredIntervalReal() / BaseAfter.MeasuredInterval());
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[FIRERATE] FireInterval restored to %.6f. A %d-round clip is %.2fs of held trigger at the "
+			     "base gun. WHAT THIS RUN LEAVES BEHIND, so nobody reads it as a bug: the subject is still "
+			     "whichever character the last stage made them, and still standing where the stuck stage "
+			     "parked them. Only the knob is put back."),
+			Run.RestoreFireInterval, FMath::Max(1, UTraceSettings::Get().ClipSize),
+			static_cast<double>(FMath::Max(1, UTraceSettings::Get().ClipSize) - 1) * Run.RestoreFireInterval);
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[FIRERATE] VERDICT: PASS — every stage measured, and every "
+				"ability moved with the base."));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[FIRERATE] VERDICT: *** %d PROBLEM(S) *** — see the lines above."), Failures);
+		}
+	}
+
+	static void RunMeasure()
+	{
+		UWorld* WorldPtr = FindAuthoritativeWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[FIRERATE] no authoritative game world — the clip and the fire gate are server state, so "
+				     "this must run on the server."));
+			return;
+		}
+
+		TSharedPtr<FRun> Run = MakeShared<FRun>();
+		Run->RestoreFireInterval = UTraceSettings::Get().FireInterval;
+		Run->StageStartedReal = FPlatformTime::Seconds();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[FIRERATE] ===== spec v24 §4: the gun goes 150 -> 190 RPM, and §0: an ability that modifies "
+			     "the base must move WITH it. Shipped FireInterval is %.6fs (= %.1f RPM); the RED arm forces "
+			     "the %.3fs (= %.1f RPM) gun this patch replaced. Every window is %.1fs of the REAL trigger. ====="),
+			Run->RestoreFireInterval, 60.f / FMath::Max(0.01f, Run->RestoreFireInterval),
+			OldFireInterval, 60.f / OldFireInterval, WindowSeconds);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				RestoreArm(*Run);
+				return false;
+			}
+
+			const double NowReal = FPlatformTime::Seconds();
+			const double NowWorld = TickWorld->GetTimeSeconds();
+
+			if (Run->StageIndex >= StageCount)
+			{
+				Report(*Run);
+				return false;
+			}
+
+			const FStage& Stage = Stages[Run->StageIndex];
+			FSample& Sample = Run->Samples[Run->StageIndex][Run->ArmIndex];
+
+			FString WhyNoSubject;
+			ATraceCharacter* Subject = FindSubject(TickWorld, WhyNoSubject);
+			UTraceWeaponComponent* Weapon = (Subject != nullptr) ? Subject->Weapon : nullptr;
+			UTraceAbilityComponent* Abilities = (Subject != nullptr) ? UTraceAbilityComponent::Get(Subject) : nullptr;
+
+			if (Subject == nullptr || Weapon == nullptr || Abilities == nullptr)
+			{
+				// STILL STAGING is a legitimate state for the first seconds of a match, and this command
+				// has to survive being launched from -TraceExec on frame one.
+				if ((NowReal - Run->StageStartedReal) < StageTimeoutSeconds)
+				{
+					return true;
+				}
+				Sample.Invalid = FString::Printf(
+					TEXT("no drivable subject (needs a living, locally controlled human holding the gun and not "
+					     "carrying the Core): %s"), *WhyNoSubject);
+				LogSample(Sample, Stage.Label, Run->ArmIndex);
+				RestoreArm(*Run);
+				Report(*Run);
+				return false;
+			}
+
+			// ---- phase 0: put the subject in the state this stage measures -------------------------
+			if (Run->Phase == 0)
+			{
+				if (Stage.bStick && !Run->bWallStaged)
+				{
+					FString Why;
+					Run->bWallStaged = true;
+					if (!PlaceAgainstNearestWall(Subject, Why))
+					{
+						Sample.Invalid = FString::Printf(TEXT("could not stage the wall stick: %s"), *Why);
+						LogSample(Sample, Stage.Label, Run->ArmIndex);
+						Run->Samples[Run->StageIndex][1 - Run->ArmIndex].Invalid = Sample.Invalid;
+						Run->StageIndex++;
+						Run->ArmIndex = 0;
+						Run->StageStartedReal = NowReal;
+						return true;
+					}
+					UE_LOG(LogTraceGame, Display, TEXT("[FIRERATE] staging the stuck passive: %s"), *Why);
+				}
+
+				if (Stage.Character != ETraceCharacterId::None && Abilities->GetCharacterId() != Stage.Character)
+				{
+					Abilities->ServerSetCharacter(Stage.Character);
+					if (Abilities->GetCharacterId() != Stage.Character)
+					{
+						Sample.Invalid = FString::Printf(
+							TEXT("the roster refused %s — most likely a living team-mate already holds them "
+							     "(per-team uniqueness). Run this early, before the bots have filled"),
+							TraceCharacterIdToString(Stage.Character));
+						LogSample(Sample, Stage.Label, Run->ArmIndex);
+						Run->Samples[Run->StageIndex][1 - Run->ArmIndex].Invalid = Sample.Invalid;
+						Run->StageIndex++;
+						Run->ArmIndex = 0;
+						Run->StageStartedReal = NowReal;
+						return true;
+					}
+				}
+
+				// A FULL CLIP BEFORE EVERY WINDOW. Roxie's MODDED ends on a reload, so the reload has to
+				// happen before the cast rather than during the window it would silently truncate.
+				if (Weapon->GetClipAmmo() < Weapon->GetClipSize() && !Weapon->IsReloading())
+				{
+					Weapon->RequestReload();
+				}
+				if (Weapon->IsReloading())
+				{
+					return true;
+				}
+
+				Run->Phase = 1;
+				return true;
+			}
+
+			// ---- phase 1: arm the interval, arm the ability, hold the trigger ----------------------
+			if (Run->Phase == 1)
+			{
+				if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+				{
+					Mutable->FireInterval = ArmInterval(*Run, Run->ArmIndex);
+				}
+
+				if (Stage.bActivate)
+				{
+					// The cooldown is not under test here and would otherwise refuse the second arm
+					// (MODDED is on 25 s). Cleared through the component's own debug seam.
+					Abilities->DebugSetActivatedCooldown(0.f);
+					if (!Abilities->TryActivate())
+					{
+						Sample.Invalid = TEXT("TryActivate() refused — the ability never came up, so the window "
+						                      "would have measured the base gun and called it the ability");
+						LogSample(Sample, Stage.Label, Run->ArmIndex);
+						Run->Phase = 3;
+						return true;
+					}
+				}
+
+				if (Stage.bStick)
+				{
+					if (UTraceAbilitySetSlimeball* Slime = Abilities->GetAbilitySetAs<UTraceAbilitySetSlimeball>())
+					{
+						// V THROUGH THE SHIPPING INPUT PATH FIRST, then the flag. ApplyStick() drops the
+						// stick on its next tick if the key is not held, so forcing the flag alone would
+						// last about one frame. See PlaceAgainstNearestWall.
+						Abilities->HandleSecondaryPressed();
+						Slime->DebugSetStuck(true);
+					}
+					else
+					{
+						Sample.Invalid = TEXT("the Slimeball ability set was not built, so the stuck passive could "
+						                      "not be armed");
+						LogSample(Sample, Stage.Label, Run->ArmIndex);
+						Run->Phase = 3;
+						return true;
+					}
+				}
+
+				// THE SEAM, READ FROM THE SAME STATIC THE GUN CALLS. Not the ability's member: the gun
+				// reaches the scale through this function, and a wiring mistake lives in the lookup.
+				Sample.Scale = UTraceAbilityComponent::GetFireIntervalScaleFor(Subject);
+				Sample.BaseInterval = UTraceSettings::Get().FireInterval;
+
+				if (Stage.Character != ETraceCharacterId::None
+					&& FMath::IsNearlyEqual(Sample.Scale, 1.f, KINDA_SMALL_NUMBER))
+				{
+					Sample.Invalid = TEXT("the ability is up but the seam still reports x1.0000 — the character "
+					                      "is not modifying the fire rate at all");
+					LogSample(Sample, Stage.Label, Run->ArmIndex);
+					Run->Phase = 3;
+					return true;
+				}
+
+				Run->LastClip = Weapon->GetClipAmmo();
+				Run->WindowEndWorld = NowWorld + WindowSeconds;
+				Weapon->StartFire();
+				Run->Phase = 2;
+				return true;
+			}
+
+			// ---- phase 2: watch the clip. Every round that leaves it is stamped --------------------
+			if (Run->Phase == 2)
+			{
+				// The seam, every frame. See FSample::MinScaleSeen.
+				const float ScaleNow = UTraceAbilityComponent::GetFireIntervalScaleFor(Subject);
+				Sample.MinScaleSeen = FMath::Min(Sample.MinScaleSeen, ScaleNow);
+				Sample.MaxScaleSeen = FMath::Max(Sample.MaxScaleSeen, ScaleNow);
+
+				const int32 Clip = Weapon->GetClipAmmo();
+				if (Clip < Run->LastClip)
+				{
+					const int32 Dropped = Run->LastClip - Clip;
+					Sample.MaxDropInOneFrame = FMath::Max(Sample.MaxDropInOneFrame, Dropped);
+					if (Sample.Shots == 0)
+					{
+						Sample.FirstShotWorld = NowWorld;
+						Sample.FirstShotReal = NowReal;
+					}
+					Sample.LastShotWorld = NowWorld;
+					Sample.LastShotReal = NowReal;
+					Sample.Shots += Dropped;
+				}
+				Run->LastClip = Clip;
+
+				// Stop before the clip runs dry: an automatic reload inside the window would time the
+				// reload rather than the gun, and would end MODDED early on top of that.
+				const bool bNearlyDry = (Clip <= 3);
+				if (NowWorld < Run->WindowEndWorld && !bNearlyDry)
+				{
+					return true;
+				}
+
+				Weapon->StopFire();
+
+				if (Sample.Shots < 2)
+				{
+					Sample.Invalid = FString::Printf(
+						TEXT("only %d round(s) left the clip in %.2fs — nothing to time"),
+						Sample.Shots, WindowSeconds);
+				}
+				else if (!FMath::IsNearlyEqual(Sample.MinScaleSeen, Sample.MaxScaleSeen, 0.001f))
+				{
+					// THE WINDOW STRADDLED TWO GUNS. Refusing the number is the whole point: an ability
+					// that lapsed mid-window would otherwise be published as a slower ability.
+					Sample.Invalid = FString::Printf(
+						TEXT("the fire-rate scale MOVED during the window (x%.4f to x%.4f) — the ability did not "
+						     "hold for the whole measurement, so this cadence belongs to no single gun"),
+						Sample.MinScaleSeen, Sample.MaxScaleSeen);
+				}
+				else
+				{
+					Sample.bValid = true;
+				}
+				LogSample(Sample, Stage.Label, Run->ArmIndex);
+
+				if (Sample.bValid && Sample.MaxDropInOneFrame > 1)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[FIRERATE] %s: %d rounds left the clip in a single frame. The cadence below is "
+						     "still the gun's, but something is spending more than one round per shot."),
+						Stage.Label, Sample.MaxDropInOneFrame);
+				}
+
+				Run->Phase = 3;
+				return true;
+			}
+
+			// ---- phase 3: put everything back, then move to the next arm/stage ---------------------
+			if (Stage.bStick)
+			{
+				Abilities->HandleSecondaryReleased();
+				if (UTraceAbilitySetSlimeball* Slime = Abilities->GetAbilitySetAs<UTraceAbilitySetSlimeball>())
+				{
+					Slime->DebugSetStuck(false);
+				}
+			}
+			Weapon->StopFire();
+			Weapon->RequestReload();
+
+			Run->bWallStaged = false;   // the next arm stages its own placement
+			if (Run->ArmIndex == 0)
+			{
+				Run->ArmIndex = 1;
+			}
+			else
+			{
+				Run->ArmIndex = 0;
+				Run->StageIndex++;
+			}
+			Run->Phase = 0;
+			Run->StageStartedReal = NowReal;
+			return true;
+		}));
+	}
+
+	FAutoConsoleCommand CmdFireRateMeasure(
+		TEXT("Trace.FireRate.Measure"),
+		TEXT("Dev only, SERVER. Spec v24 §4/§0. Holds the REAL trigger and TIMES the rounds for every "
+		     "character that modifies the fire rate, twice: once with FireInterval forced back to the "
+		     "0.40s/150 RPM gun (the RED arm, i.e. the 'before' column) and once at the shipped value. "
+		     "Prints measured RPM, and asserts that each ability's RPM moved by the SAME RATIO as the base "
+		     "— which is what proves the ability is stored RELATIVE to the base and not as an absolute."),
+		FConsoleCommandDelegate::CreateStatic(&RunMeasure));
 }
 
 #endif // !UE_BUILD_SHIPPING

@@ -70,14 +70,92 @@ namespace TracePracticeRangeLocal
 	//
 	// Total furnished footprint, rack to far targets: 3100 x 1240 uu, against ~21600 uu before.
 
-	/** Distance from the player's spawn line to the target row, in uu. */
-	constexpr float TargetStandbackUU = 2200.f;
+	// =============================================================================================
+	// *** SPEC v24 §0 — THE TWO NUMBERS BELOW USED TO BE ABSOLUTES AND ARE NOW DERIVED ***
+	// =============================================================================================
+	//
+	// The standing rule is about a value that MODIFIES a base having to move when the base moves. The
+	// range's footprint is exactly that shape: both of these numbers were written as absolutes whose
+	// only justification, in the comment block above, is a RATIO to something else —
+	//
+	//   "2200 ... is also inside the 2400 uu the arena's own endzone is deep, so the whole range is
+	//    smaller than one end of the field"
+	//   "260 uu between targets ... the outermost target is 13 degrees off the crosshair"
+	//
+	// — and neither claim survived the base moving. ATraceArenaBuilder::EndzoneDepth is an editable
+	// UPROPERTY: drop it to 1200 and the "smaller than one end of the field" sentence quietly becomes
+	// false while the code keeps saying 2200. Move the standback and the "13 degrees" sentence
+	// quietly becomes false while the code keeps saying 260. Both are now computed FROM their base,
+	// so both sentences stay true by construction, and on the shipped arena both resolve to the same
+	// geometry as before (2200.1 uu and 260.0 uu) — which is what a §0 fix should look like.
 
-	/** How far FORWARD of the field centre (and so of the Core rack) the spawn line sits, in uu. */
+	/**
+	 * The firing distance, as a fraction of the arena's own endzone depth.
+	 *
+	 * 0.9167 x 2400 = 2200.1 uu on the shipped arena, i.e. the number this used to be. Under 1.0 is
+	 * the whole claim: the range is shallower than one end of the field, whatever that end is.
+	 */
+	constexpr float TargetStandbackFractionOfEndzone = 0.9167f;
+
+	/** Floor and ceiling, so a pathological EndzoneDepth cannot put the targets in your face or a
+	 *  kilometre away. Wide enough never to bind on a sane arena. */
+	constexpr float MinTargetStandbackUU = 600.f;
+	constexpr float MaxTargetStandbackUU = 6000.f;
+
+	/**
+	 * Fallback firing distance, for the one case the arena cannot be asked (it is null, or its bounds
+	 * are invalid). Same number the shipped arena resolves to.
+	 */
+	constexpr float FallbackTargetStandbackUU = 2200.f;
+
+	/**
+	 * How far FORWARD of the field centre (and so of the Core rack) the spawn line sits, in uu.
+	 *
+	 * Left absolute deliberately: it is a clearance from the rack, not a claim about the arena's size,
+	 * and the rack is a point rather than a dimension.
+	 */
 	constexpr float PlayerSpawnForwardUU = 900.f;
 
-	/** Lateral spacing between the targets, in uu. */
-	constexpr float DummySpacingY = 260.f;
+	/**
+	 * Half the angular width of the target row, in degrees, measured from the spawn line.
+	 *
+	 * THIS is the number the design comment is actually about — "one glance takes in the whole row".
+	 * The lateral spacing is derived from it and from the firing distance, so the row keeps the same
+	 * apparent width when the standback moves. atan(520 / 2200) = 13.30 degrees, which is the row the
+	 * range shipped with.
+	 */
+	constexpr float DummyRowHalfAngleDegrees = 13.30f;
+
+	/** The lateral spacing that puts the OUTERMOST target DummyRowHalfAngleDegrees off the crosshair. */
+	float DummySpacingForStandback(float StandbackUU)
+	{
+		if (DummyCount < 2)
+		{
+			return 0.f;
+		}
+
+		const float OutermostOffsetY =
+			StandbackUU * FMath::Tan(FMath::DegreesToRadians(DummyRowHalfAngleDegrees));
+		return (OutermostOffsetY * 2.f) / static_cast<float>(DummyCount - 1);
+	}
+
+	/**
+	 * The firing distance for @p Arena, derived from ITS endzone depth rather than from a constant.
+	 *
+	 * ClampedEndzoneDepth() rather than the raw EndzoneDepth on purpose: the arena's own header says
+	 * to call it instead of re-clamping, and it is the depth the endzone trigger is actually built
+	 * with, which is the thing the "smaller than one end of the field" claim is about.
+	 */
+	float TargetStandbackFor(const ATraceArenaBuilder* Arena)
+	{
+		if (Arena == nullptr)
+		{
+			return FallbackTargetStandbackUU;
+		}
+
+		const float FromEndzone = Arena->ClampedEndzoneDepth() * TargetStandbackFractionOfEndzone;
+		return FMath::Clamp(FromEndzone, MinTargetStandbackUU, MaxTargetStandbackUU);
+	}
 
 	/** How far ahead of the spawn line, and how far out to the sides, the two toggle pads sit. */
 	constexpr float TogglePadForwardUU = 450.f;
@@ -152,6 +230,22 @@ namespace TracePracticeRangeLocal
 		     "FAIL. 0 (default) is the shipped gate: the range is active only under "
 		     "ATracePracticeGameMode."),
 		ECVF_Cheat);
+
+	/**
+	 * *** SPEC v24 §5's RED ARM. *** 1 restores the pre-v24 driver for the infinite-abilities toggle
+	 * exactly: only the 5 Hz furniture poll re-applies the cheat, and the per-frame tick does not.
+	 * That is the shipped-before build the owner reported — the cooldown really does start on every
+	 * press and TryActivate() really does refuse — so Trace.Practice.InfiniteVerify, unchanged,
+	 * reports FAIL with the arm on and PASS with it off, from one binary.
+	 */
+	TAutoConsoleVariable<int32> CVarPracticePollOnlyInfinite(
+		TEXT("Trace.Practice.PollOnlyInfinite"),
+		0,
+		TEXT("DEV ONLY. RED ARM for spec v24 §5. 1 drives the range's infinite-abilities toggle from "
+		     "the 5 Hz furniture poll ONLY, which is the build in which the toggle 'does nothing': "
+		     "every press starts a real cooldown and the ability is refused until the next poll. "
+		     "0 (default) also refreshes it every frame, after input, so it is never refused."),
+		ECVF_Cheat);
 #endif
 }
 
@@ -181,6 +275,11 @@ namespace TracePracticeRange
 	bool IsLeakArmed()
 	{
 		return TracePracticeRangeLocal::CVarPracticeLeakArm.GetValueOnAnyThread() != 0;
+	}
+
+	bool IsInfinitePollOnlyArmed()
+	{
+		return TracePracticeRangeLocal::CVarPracticePollOnlyInfinite.GetValueOnAnyThread() != 0;
 	}
 #endif
 }
@@ -229,6 +328,59 @@ void UTracePracticeRangeSubsystem::Deinitialize()
 UTracePracticeRangeSubsystem* UTracePracticeRangeSubsystem::Get(const UWorld* WorldPtr)
 {
 	return (WorldPtr != nullptr) ? WorldPtr->GetSubsystem<UTracePracticeRangeSubsystem>() : nullptr;
+}
+
+// =================================================================================================
+// *** THE INFINITE-ABILITIES TOGGLE'S REAL DRIVER — SPEC v24 §5 ***
+//
+// See the block above the FTickableGameObject overrides in the header for the diagnosis and for why
+// a tick beats a faster timer. In one line: the press writes the cooldown in TG_PrePhysics and this
+// erases it later in the SAME frame, so no reader downstream of the press ever sees one.
+// =================================================================================================
+
+bool UTracePracticeRangeSubsystem::IsTickable() const
+{
+	// The single cheapest question this class can be asked, and the answer is false in every world
+	// that is not a range with the toggle deliberately on. SetInfiniteAbilities refuses outside the
+	// gate, BuildRange opens with it off, and TearDownRange clears it — so a real match never ticks
+	// this at all, and the leak argument in the header is untouched by the class gaining a tick.
+	return bInfiniteAbilities;
+}
+
+TStatId UTracePracticeRangeSubsystem::GetStatId() const
+{
+	RETURN_QUICK_DECLARE_CYCLE_STAT(UTracePracticeRangeSubsystem, STATGROUP_Tickables);
+}
+
+void UTracePracticeRangeSubsystem::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	if (!bInfiniteAbilities)
+	{
+		return;
+	}
+
+#if !UE_BUILD_SHIPPING
+	if (TracePracticeRange::IsInfinitePollOnlyArmed())
+	{
+		// THE RED ARM. The toggle is on, the poll still sweeps at 5 Hz, and this frame does nothing —
+		// which is precisely the build the owner reported. Trace.Practice.InfiniteVerify then fails on
+		// the same assertions it passes with the arm off.
+		return;
+	}
+#endif
+
+	// GATED AGAIN HERE, not only by IsTickable(). bInfiniteAbilities cannot be true outside the range
+	// today, and a rule whose only enforcement is "that bool cannot be set" is one future setter away
+	// from being no rule at all. Same argument as HandlePadTouched's second gate.
+	if (!TracePracticeRange::IsActive(GetWorld()))
+	{
+		return;
+	}
+
+	ApplyInfiniteAbilities();
+	++InfiniteTickApplyCount;
 }
 
 // =================================================================================================
@@ -335,13 +487,20 @@ void UTracePracticeRangeSubsystem::BuildRange()
 
 	// ---- the stationary targets ------------------------------------------------------------------
 	//
-	// A row across the range, TargetStandbackUU in front of the spawn line, facing back down it.
+	// A row across the range, StandbackUU in front of the spawn line, facing back down it.
+	//
+	// SPEC v24 §0: the standback and the spacing are DERIVED (from the arena's own endzone depth, and
+	// from the row's stated 13.3-degree half angle) rather than typed in. See the block at the top of
+	// TracePracticeRangeLocal. The OLD-SIZE arm keeps its literals — an arm's whole job is to be the
+	// number that shipped before, and deriving it would make it track the thing it is measuring.
+	const float StandbackUU = TracePracticeRangeLocal::TargetStandbackFor(Arena);
+
 	const float RowX = bOldSize
 		? (FieldCentre.X + FieldSize.X * TracePracticeRangeLocal::OldDummyRowFraction)
-		: (SpawnLineX + TracePracticeRangeLocal::TargetStandbackUU);
+		: (SpawnLineX + StandbackUU);
 	const float SpacingY = bOldSize
 		? TracePracticeRangeLocal::OldDummySpacingY
-		: TracePracticeRangeLocal::DummySpacingY;
+		: TracePracticeRangeLocal::DummySpacingForStandback(StandbackUU);
 	const float FirstY = FieldCentre.Y - SpacingY * (TracePracticeRangeLocal::DummyCount - 1) * 0.5f;
 
 	int32 SpawnedDummies = 0;
@@ -395,6 +554,12 @@ void UTracePracticeRangeSubsystem::BuildRange()
 	bBuilt = true;
 	bBuiltOldSize = bOldSize;     // so PollRange can notice the arm flipping and rebuild
 	bInfiniteAbilities = false;   // a range always opens with the cheat OFF
+	InfiniteApplyCount = 0;
+	InfiniteTickApplyCount = 0;
+
+	// The RESOLVED standback, so LogStatus and the harnesses report the distance that was actually
+	// built rather than the constant somebody hopes it still equals (v24 §0).
+	BuiltTargetStandbackUU = bOldSize ? (RowX - FieldCentre.X) : StandbackUU;
 
 	// ---- *** THE CORE STARTS ON THE RACK — DEMO 19 ITEM 3 *** -------------------------------------
 	//
@@ -429,8 +594,10 @@ void UTracePracticeRangeSubsystem::BuildRange()
 		SpawnedDummies, TracePracticeRangeLocal::DummyCount, RowX, SpacingY, GetPadCount(),
 		bOldSize
 			? TEXT("NONE - the player takes the shipped endzone spawn")
-			: *FString::Printf(TEXT("X=%.0f, %.0fuu behind the targets"),
-				SpawnLineX, TracePracticeRangeLocal::TargetStandbackUU),
+			: *FString::Printf(TEXT("X=%.0f, %.1fuu behind the targets (%.2f x the arena's own %.0fuu "
+			                        "endzone depth - v24 §0, derived rather than typed)"),
+				SpawnLineX, StandbackUU,
+				TracePracticeRangeLocal::TargetStandbackFractionOfEndzone, Arena->ClampedEndzoneDepth()),
 		*RackPoint.ToCompactString());
 }
 
@@ -554,6 +721,9 @@ void UTracePracticeRangeSubsystem::TearDownRange()
 	bBuilt = false;
 	bInfiniteAbilities = false;
 	bCoreOnRack = false;
+	InfiniteApplyCount = 0;
+	InfiniteTickApplyCount = 0;
+	BuiltTargetStandbackUU = 0.f;
 }
 
 bool UTracePracticeRangeSubsystem::TraceToFloor(const FVector& Point, FVector& OutFloorPoint) const
@@ -879,6 +1049,8 @@ void UTracePracticeRangeSubsystem::ApplyInfiniteAbilities()
 		return;
 	}
 
+	++InfiniteApplyCount;
+
 	for (APlayerState* const EachState : BaseState->PlayerArray)
 	{
 		if (EachState == nullptr || EachState->IsABot())
@@ -896,6 +1068,10 @@ void UTracePracticeRangeSubsystem::ApplyInfiniteAbilities()
 			// IT CLEARS the framework's activated (E) cooldown — the ring on the HUD, and the timer
 			// UTraceAbilityComponent::TryActivate actually refuses on. That is the whole cooldown for
 			// Chut, Rocco, X, Slimeball and Oyster.
+			//
+			// SINCE v24 §5 THIS RUNS EVERY FRAME (see Tick), and that is the fix rather than a tuning
+			// change: on the 200 ms timer alone, the deadline TryActivate() writes on the press
+			// survived for up to a fifth of a second and the ability was genuinely refused for it.
 			//
 			// IT DOES NOT CLEAR a character's OWN second timer (FTraceAbilityNetState::AuxEndMatchTime
 			// — Elle's Snap window and 35 s pair, Roxie's rocket, Mace's hidden V). That field is
@@ -1116,6 +1292,21 @@ void UTracePracticeRangeSubsystem::LogStatus() const
 		bInfiniteAbilities ? TEXT("ON") : TEXT("OFF"),
 		bCoreOnRack ? TEXT("yes") : TEXT("no"));
 
+	// WHICH DRIVER IS REFRESHING THE CHEAT (spec v24 §5). A toggle reported as "does nothing" is a
+	// question about the driver, so the driver is a printed fact rather than something to read the
+	// source for: applies=<total>, of which <ticked> came from the per-frame tick. Poll-only means
+	// every press really does start a cooldown for up to one poll — which was the bug.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Practice] infinite-abilities driver: applies=%d ticked=%d polled=%d%s"),
+		InfiniteApplyCount, InfiniteTickApplyCount, InfiniteApplyCount - InfiniteTickApplyCount,
+#if !UE_BUILD_SHIPPING
+		TracePracticeRange::IsInfinitePollOnlyArmed()
+			? TEXT("   *** Trace.Practice.PollOnlyInfinite IS ON — this is the RED ARM ***") : TEXT("")
+#else
+		TEXT("")
+#endif
+		);
+
 	// DEMO 19 ITEM 1's measurement, printed rather than described. "Make it smaller" is a claim about
 	// how far the player has to walk, so this is the number that has to move.
 	const double ToTargets = GetPlayerDistanceToTargets();
@@ -1126,7 +1317,7 @@ void UTracePracticeRangeSubsystem::LogStatus() const
 		     "footprint is %.0f uu deep)."),
 		(PlayerPawn != nullptr) ? *PlayerPawn->GetActorLocation().ToCompactString() : TEXT("<no pawn>"),
 		ToTargets,
-		TracePracticeRangeLocal::PlayerSpawnForwardUU + TracePracticeRangeLocal::TargetStandbackUU);
+		TracePracticeRangeLocal::PlayerSpawnForwardUU + BuiltTargetStandbackUU);
 
 #if !UE_BUILD_SHIPPING
 	if (TracePracticeRange::IsLeakArmed())

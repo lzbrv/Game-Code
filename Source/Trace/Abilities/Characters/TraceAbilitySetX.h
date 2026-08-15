@@ -11,10 +11,15 @@
 //        the swarm             ATraceBeeSwarm, below. Cosmetic, local to each machine.
 //        the contact test      UTraceAbilitySetX::SweepBeeContacts, server only, in TickAbilities.
 //        the mark              UTraceHealthComponent::ApplyVulnerable.
-//        +25% from ALL sources UTraceHealthComponent::ApplyDamage — ONE multiplication, in the one
+//        +N% from ALL sources  UTraceHealthComponent::ApplyDamage — ONE multiplication, in the one
 //                              function every damage source in the project already funnels through.
+//                              *** SPEC v24 §9 RAISED THE FIRST STACK FROM +25% TO +35%. *** Nothing
+//                              in this file moved for it either: the number is
+//                              UTraceSettings::XVulnerableDamageBonus and the multiplier is derived
+//                              as 1 + that, so the mark means "+35% of whatever the hit was worth"
+//                              without a second copy of the arithmetic anywhere.
 //                              *** Read the block comment at the top of TraceHealthComponent.h. ***
-//        "does not stack"      *** SUPERSEDED BY SPEC v16 §4. *** It stacks now: +25% for the first
+//        "does not stack"      *** SUPERSEDED BY SPEC v16 §4. *** It stacks now: +35% for the first
 //                              hit and +5% for each after, all of them expiring together on the ONE
 //                              timer. Nothing in THIS file changed for it — the mark is still one
 //                              ApplyVulnerable call and the count lives on the victim's health
@@ -77,11 +82,14 @@
 // ===================================================================================================
 //
 // It does NOT override UTraceCharacterAbilitySet::GetIncomingDamageMultiplier(). That hook looks like
-// the natural home for "+25% incoming" and it is the wrong one, and THE DECIDING REASON IS THE DOUBLE
-// AMPLIFICATION: the ability damage path (UTraceAbilityComponent::ModifyDamageThroughPassives) runs
-// that hook and THEN calls UTraceHealthComponent::ApplyDamage, so implementing it in both places
-// would amplify ability damage twice — 1.5625x instead of 1.25x. Leaving the hook at its 1.0 default
-// is what makes the health component the single site, and it is load-bearing.
+// the natural home for "vulnerable's +N% incoming" and it is the wrong one, and THE DECIDING REASON
+// IS THE DOUBLE AMPLIFICATION: the ability damage path
+// (UTraceAbilityComponent::ModifyDamageThroughPassives) runs that hook and THEN calls
+// UTraceHealthComponent::ApplyDamage, so implementing it in both places would amplify ability damage
+// TWICE — the square of the mark's multiplier instead of the multiplier (at spec v24 §9's +35% that
+// is 1.8225x where 1.35x is meant; it was 1.5625x against 1.25x before §9, and the shape of the bug
+// is the same whatever the knob says). Leaving the hook at its 1.0 default is what makes the health
+// component the single site, and it is load-bearing.
 //
 // The secondary reason still stands but no longer reads the way it used to. The hook is consulted
 // only when the TARGET has an ability set, and this comment used to justify that with spec v14 §3's

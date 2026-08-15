@@ -89,7 +89,10 @@ namespace TraceCharacterRosterFile
 			{
 				1, TEXT("ROCCO"),
 				TEXT("A VERY SMALL SECOND JUMP. THE POINT IS THE INSTANT MIDAIR DIRECTION CHANGE, NOT THE HEIGHT."),
-				TEXT("HEADSHOT KILLS GIVE +3% SPEED FOR 1S. STACKS, AND EACH KILL EXTENDS THE WHOLE BOOST."),
+				// SPEC v24 §11 MADE "1S" UNTRUE — RoccoHeadshotSpeedDurationSeconds is 3 now
+				// (TraceSettings.h + Config/DefaultGame.ini). Only the number moved: the stacking and
+				// the "each kill extends the whole boost" rule are the same sentence they were.
+				TEXT("HEADSHOT KILLS GIVE +3% SPEED FOR 3S. STACKS, AND EACH KILL EXTENDS THE WHOLE BOOST."),
 				TEXT("RIPPLE"),
 				TEXT("DASH ON ITS OWN COOLDOWN, LEAVING A RIPPLE FOR 4S. ANYONE ON EITHER TEAM CAN RIDE IT, "
 				     "INCLUDING THE CORE CARRIER, AND YOU CAN SHOOT WHILE RIDING."),
@@ -131,9 +134,20 @@ namespace TraceCharacterRosterFile
 			},
 			{
 				5, TEXT("X"),
-				TEXT("+10% SPEED WHILE ANY ENEMY IS VULNERABLE."),
+				// XVulnerableSpeedBonus went 0.10 -> 0.15 back in Demo 18 and this line was never
+				// updated; the game's own knob dump has been printing "+15.0%" beside it since.
+				// Caught by the spec v24 verifier, fixed here rather than left to rot next to the
+				// vulnerable numbers this patch DID correct.
+				TEXT("+15% SPEED WHILE ANY ENEMY IS VULNERABLE."),
+				// SPEC v24 §9 MADE "+25%" UNTRUE — XVulnerableDamageBonus is 0.35 now (TraceSettings.h
+				// + Config/DefaultGame.ini). "DOES NOT STACK" was ALREADY untrue and is fixed in the
+				// same breath rather than left standing next to a corrected number: spec v16 §4 made
+				// the mark stack at +5% a hit (XVulnerableStackBonus) up to five (XVulnerableMaxStacks),
+				// and the HUD chip has been printing the stack count since. The "a new hit resets the
+				// timer" half of v14 §6 did survive, so it stays.
 				TEXT("FIVE MECHANICAL BEES ORBIT YOU. AN ENEMY THEY TOUCH IS VULNERABLE FOR 2S AND TAKES "
-				     "+25% DAMAGE FROM EVERYTHING. DOES NOT STACK; A NEW HIT RESETS THE TIMER."),
+				     "+35% DAMAGE FROM EVERYTHING, +5% MORE PER EXTRA HIT UP TO FIVE. A NEW HIT RESETS "
+				     "THE TIMER."),
 				TEXT("STING"),
 				TEXT("LOAD THE 5 BEES INTO YOUR GUN. YOUR NEXT FIVE BULLETS APPLY VULNERABLE AT NORMAL "
 				     "DAMAGE. THE BEES RESUME ORBITING ONCE ALL FIVE ARE FIRED."),
@@ -214,9 +228,15 @@ namespace TraceCharacterRosterFile
 				// is 1.25 (TraceSettings.h + Config/DefaultGame.ini); measured live by
 				// Trace.Mortimer.DashTest. Same precedent as commit c060875, which fixed Lily's card
 				// after Demo 19 changed her kit — a card that lies about the kit is worse than no card.
+				// SPEC v24 §7 MADE "ON THE SAME SCALE ... ABOUT TWICE AS FAR" UNTRUE the moment it
+				// landed: charge past the ordinary full point now counts at 0.6x
+				// (MortimerThrowChargePastFullScale). Deliberately no multiplier in the new wording —
+				// the old line went stale because it hardcoded one, and the honest statement of the
+				// mechanic ("further than anyone, not double") survives a re-tune of that 0.6.
 				TEXT("HIS DASH COVERS ONLY TWO FIFTHS OF THE NORMAL DISTANCE AND RECHARGES A QUARTER "
-				     "SLOWER. IN EXCHANGE HE MAY CHARGE A CORE THROW FOR TWICE AS LONG AS ANYONE ELSE, "
-				     "ON THE SAME SCALE, SO HE THROWS IT ABOUT TWICE AS FAR."),
+				     "SLOWER. IN EXCHANGE HE MAY CHARGE A CORE THROW FOR TWICE AS LONG AS ANYONE "
+				     "ELSE, THOUGH CHARGE BEYOND A NORMAL FULL ONE COUNTS FOR LESS - SO HE STILL "
+				     "THROWS IT FURTHER THAN ANYONE, JUST NOT DOUBLE."),
 				TEXT("QUAKE"),
 				TEXT("ONLY WHILE CARRYING THE CORE AND STOOD ON THE GROUND OR ON TOP OF AN OBJECT: A "
 				     "BLAST THAT KNOCKS EVERY NEARBY ENEMY AWAY FROM HIM. IT CANNOT MOVE A CORE "

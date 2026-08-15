@@ -67,9 +67,15 @@ class UTraceGameUserSettings;
  * an ordinary `FCanvas` whose batches are painted by `SDebugCanvas`, which `SGameLayerManager` puts
  * in `EGameLayerOrder::Debug` (500) — above `Player` (100), where `UUserWidget::AddToViewport`
  * puts the UMG title screen. It is the surface `stat fps` and the console use to stay readable over
- * UMG, it exists in every build configuration, and it is created per frame from the same viewport,
- * with the same DPI scale as the scene canvas (`ShouldDPIScaleSceneCanvas` is true for both), so
- * one coordinate space serves both and nothing needs re-laying out.
+ * UMG, it exists in every build configuration, and it is created per frame from the same viewport.
+ *
+ * IT DOES NOT ALWAYS SHARE THE SCENE CANVAS'S COORDINATE SPACE, and spec v23 said it did. This
+ * header used to read "with the same DPI scale as the scene canvas (`ShouldDPIScaleSceneCanvas` is
+ * true for both)". `FGameplayViewportClient` — which `UGameViewportClient` inherits from — overrides
+ * that predicate to return FALSE, so the scene canvas is built at DPI 1 while the foreground canvas
+ * is built at the window's real DPI scale. Equal at 100%, two-to-one on a Retina editor window, and
+ * the difference crashed PIE every time SETTINGS was opened (spec v24 §1). Resolve() now MEASURES
+ * the two scales and declines to elevate when they disagree; see the block above that check.
  *
  * This scope swaps the `FCanvas` INSIDE the game's `UCanvas` rather than swapping the `UCanvas` on
  * the HUD, which is what makes it a four-line change instead of a sweep: `AHUD::DrawRect`,
@@ -84,7 +90,8 @@ class UTraceGameUserSettings;
  * panel, exactly as they did when all three shared the scene canvas.
  *
  * FALLBACK, AND THE RED ARM. If the foreground canvas is missing (no viewport, mid-teardown), if
- * the game canvas is not the one this frame is being drawn through, or if `Trace.UI.ModalOverSlate`
+ * the game canvas is not the one this frame is being drawn through, if the two surfaces disagree
+ * about DPI scale (spec v24 §1 — this is the PIE case), or if `Trace.UI.ModalOverSlate`
  * is 0, IsElevated() is false and the caller draws exactly where it drew before — the modal is
  * still on screen and still correct, the UMG title just stands down for it again. That is the red
  * arm: one binary produces the defect and the fix, which is what spec v23 §"Red-arm discipline"

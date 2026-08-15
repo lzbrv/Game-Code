@@ -1067,7 +1067,10 @@ namespace
 		static const FKnobSpec Knobs[] =
 		{
 			// --- spec v5 §5, fire rate ---------------------------------------------------------
-			{ TEXT("FireInterval"),                    EKnobType::Float, TEXT("150 RPM = 0.40s") },
+			// The DESCRIPTION deliberately no longer restates the number: Trace.VerifyKnobs prints
+			// this string immediately beside the LIVE value, so the old "150 RPM = 0.40s" was a
+			// contradiction on screen the moment spec v24 §4 moved the gun to 190 RPM (0.3158 s).
+			{ TEXT("FireInterval"),                    EKnobType::Float, TEXT("seconds between rounds; RPM = 60 / this. Per-character abilities SCALE it via GetFireIntervalScaleFor()") },
 
 			// --- spec v16 §1, ammo (a system that did not exist before that pass) ---------------
 			// There is deliberately NO reserve/carried-ammo row: the reserve is infinite and has no
@@ -1426,7 +1429,7 @@ namespace
 			// --- v14 §6: Rocco ------------------------------------------------------------------------
 			{ TEXT("RoccoHeadshotSpeedBonusPerStack"), EKnobType::Float, TEXT("v14 §6: 3% per headshot kill") },
 			{ TEXT("RoccoHeadshotSpeedStackMax"),      EKnobType::Int,   TEXT("v14 §6 ASSUMPTION: cap the stack (10 = +30%)") },
-			{ TEXT("RoccoHeadshotSpeedDurationSeconds"), EKnobType::Float, TEXT("v14 §6: ONE 1s timer for the whole stack, refreshed per kill") },
+			{ TEXT("RoccoHeadshotSpeedDurationSeconds"), EKnobType::Float, TEXT("v24 §11: ONE 3s timer (was 1s) for the whole stack, refreshed per kill") },
 			{ TEXT("RoccoSecondJumpZVelocity"),        EKnobType::Float, TEXT("v14 §6: 'a very small second jump'") },
 			{ TEXT("RoccoSecondJumpRedirectFraction"), EKnobType::Float, TEXT("v14 §6: change direction midair, INSTANTLY (1 = instant)") },
 			{ TEXT("RoccoRippleLifetimeSeconds"),      EKnobType::Float, TEXT("v14 §6: 4s, then all effects and visuals vanish") },
@@ -1491,7 +1494,7 @@ namespace
 			{ TEXT("XBeeOrbitSpeedDegPerSecond"),      EKnobType::Float, TEXT("v14 §6: orbit rate") },
 			{ TEXT("XBeeHitRadiusUU"),                 EKnobType::Float, TEXT("v14 §6: a bee's own touch radius") },
 			{ TEXT("XVulnerableDurationSeconds"),      EKnobType::Float, TEXT("v14 §6: 2s, and a new application RESETS it. 'Does not stack' is SUPERSEDED by v16 §4 — one deadline, N stacks") },
-			{ TEXT("XVulnerableDamageBonus"),          EKnobType::Float, TEXT("v14 §6: +25% from all sources — since v16 §4 this is the FIRST stack only") },
+			{ TEXT("XVulnerableDamageBonus"),          EKnobType::Float, TEXT("v24 §9: +35% from all sources (was +25%) — since v16 §4 this is the FIRST stack only") },
 			{ TEXT("XVulnerableStackBonus"),           EKnobType::Float, TEXT("v16 §4: 'each additional stack only adds 5%'") },
 			{ TEXT("XVulnerableMaxStacks"),            EKnobType::Int,   TEXT("v16 §4 ASSUMPTION: cap the stacks. 5 = XBeeCount = XStingBulletCount, so x1.45 is the ceiling") },
 			{ TEXT("XVulnerableSpeedBonus"),           EKnobType::Float, TEXT("v14 §6: +10% while ANY enemy is vulnerable") },
@@ -1555,7 +1558,7 @@ namespace
 			{ TEXT("RoxieRocketSelfLaunchImpulse"),    EKnobType::Float, TEXT("v18 §2: 'launches her backwards, fast and far'. Applied to ROXIE, opposite her aim") },
 			{ TEXT("RoxieRocketSelfLaunchUpBias"),     EKnobType::Float, TEXT("v18 §2: fraction of the impulse sent upward - 'far' needs air time, same shape as ChutBashUpBias") },
 			{ TEXT("RoxieRocketCooldownSeconds"),      EKnobType::Float, TEXT("v18 §2: 35s, stated. SEPARATE from the E cooldown - this is the V ability") },
-			{ TEXT("RoxieModdedFireRateMultiplier"),   EKnobType::Float, TEXT("v18 §2: x1.65 fire rate. DIVIDES FireInterval; it is a RATE, so 0.40s becomes 0.242s") },
+			{ TEXT("RoxieModdedFireRateMultiplier"),   EKnobType::Float, TEXT("v18 §2: x1.65 fire rate. DIVIDES FireInterval; it is a RATE MULTIPLIER ON THE BASE (spec v24 §0), never an interval or an RPM") },
 			{ TEXT("bRoxieModdedFullAuto"),            EKnobType::Bool,  TEXT("v18 §2: 'the gun becomes full auto' for the duration") },
 			{ TEXT("RoxieModdedDurationSeconds"),      EKnobType::Float, TEXT("v18 §2: 5s, 'one clip OR 5 seconds, whichever comes first'") },
 			{ TEXT("bRoxieModdedEndsOnReload"),        EKnobType::Bool,  TEXT("v18 §2 ASSUMPTION: 'one clip' = the clip loaded when Modded started, so reloading ends it") },

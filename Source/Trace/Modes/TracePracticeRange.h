@@ -91,6 +91,18 @@ namespace TracePracticeRange
 	 * Absent from shipping builds entirely. Never set by any code path — only by the console.
 	 */
 	TRACE_API bool IsLeakArmed();
+
+	/**
+	 * *** SPEC v24 §5's RED ARM (Trace.Practice.PollOnlyInfinite 1). ***
+	 *
+	 * Restores the pre-v24 driver for the infinite-abilities toggle EXACTLY: the cheat is re-applied
+	 * only by the range's 5 Hz furniture poll and never by the per-frame tick. That is the build the
+	 * owner reported as "the toggle doesn't do anything", and it is what lets the BEFORE and AFTER
+	 * numbers in Trace.Practice.InfiniteVerify come out of ONE binary minutes apart.
+	 *
+	 * Absent from shipping builds. Never set by any code path — only by the console.
+	 */
+	TRACE_API bool IsInfinitePollOnlyArmed();
 #endif
 }
 
@@ -102,7 +114,7 @@ namespace TracePracticeRange
  * game mode.
  */
 UCLASS()
-class TRACE_API UTracePracticeRangeSubsystem : public UWorldSubsystem
+class TRACE_API UTracePracticeRangeSubsystem : public UTickableWorldSubsystem
 {
 	GENERATED_BODY()
 
@@ -112,6 +124,40 @@ public:
 	virtual void OnWorldBeginPlay(UWorld& InWorld) override;
 	virtual void Deinitialize() override;
 	//~ End USubsystem / UWorldSubsystem
+
+	// ---------------------------------------------------------------------------------------------
+	// *** SPEC v24 §5 — WHY THIS CLASS TICKS, AND WHY THE 5 Hz POLL WAS THE BUG ***
+	// ---------------------------------------------------------------------------------------------
+	//
+	// The infinite-abilities toggle WAS read — PollRange consulted bInfiniteAbilities and called
+	// ApplyInfiniteAbilities() — and it was read on the right side (the subsystem only exists
+	// authoritatively, and UTraceAbilityComponent::DebugSetActivatedCooldown refuses without
+	// authority). It was the THIRD case: read, applied, and then immediately overwritten by the
+	// ordinary cooldown path.
+	//
+	// UTraceAbilityComponent::TryActivate() writes ActivatedCooldownEndMatchTime the instant the
+	// ability fires, and refuses on it from that instant. The toggle's only enforcement was a sweep
+	// on a 200 ms timer, so EVERY press was followed by up to 200 ms in which the ability was on a
+	// full cooldown and TryActivate() said no — the cooldown genuinely started, the HUD ring
+	// genuinely lit, and the toggle was worth at most five activations a second. "No cooldowns" was
+	// never true for a single frame that anybody looked at.
+	//
+	// A tick, not a faster timer, and the ORDER is the whole reason it works:
+	// UWorld::Tick runs TG_PrePhysics (where APlayerController delivers the E press and TryActivate
+	// writes the deadline) at LevelTick.cpp:1750, and FTickableGameObject::TickObjects at :1821 —
+	// AFTER it, in the SAME frame. So the deadline this class erases is the one written by the press
+	// that just happened, and nothing downstream of the press (TG_PostUpdateWork, the HUD draw, the
+	// next frame's input) ever observes a live cooldown. That is what "immediately reusable" means
+	// here, and it is measured rather than asserted — see Trace.Practice.InfiniteVerify.
+	//
+	// COSTS NOTHING WHERE IT IS NOT WANTED. IsTickable() is bInfiniteAbilities, which is false in
+	// every world that is not a range with the toggle on — SetInfiniteAbilities refuses outside the
+	// gate, BuildRange opens with it off, and TearDownRange clears it.
+	//~ Begin FTickableGameObject
+	virtual void Tick(float DeltaTime) override;
+	virtual bool IsTickable() const override;
+	virtual TStatId GetStatId() const override;
+	//~ End FTickableGameObject
 
 	/** The subsystem for @p WorldPtr, or null. Null-safe on the world. */
 	static UTracePracticeRangeSubsystem* Get(const UWorld* WorldPtr);
@@ -169,13 +215,39 @@ public:
 	int32 GetDummyCount() const;
 	int32 GetPadCount() const;
 
+	/**
+	 * How many times the infinite-abilities cheat has been re-applied, and by which driver.
+	 *
+	 * Exists so Trace.Practice.InfiniteVerify can tell "the toggle is on and the tick is running" from
+	 * "the toggle is on and only the 5 Hz poll is running" — which is the difference between the two
+	 * arms, and the difference the reported bug is made of.
+	 */
+	int32 GetInfiniteApplyCount() const { return InfiniteApplyCount; }
+	int32 GetInfiniteTickApplyCount() const { return InfiniteTickApplyCount; }
+
+	/**
+	 * The firing distance the CURRENT furniture was built with, in uu.
+	 *
+	 * A RESOLVED number rather than a constant since v24 §0 — see TargetStandbackFor() in the .cpp.
+	 * Zero before BuildRange has run.
+	 */
+	float GetBuiltTargetStandbackUU() const { return BuiltTargetStandbackUU; }
+
 	/** True while the Core is parked on the rack rather than in play. */
 	bool IsCoreOnRack() const { return bCoreOnRack; }
 
 	/** One line per fact, to the log. Behind Trace.Practice.Status. */
 	void LogStatus() const;
 
-	/** Seconds between polls. Also the granularity of the infinite-abilities refresh. */
+	/**
+	 * Seconds between polls of the range's FURNITURE — building it, gathering the player onto the
+	 * spawn line, holding the Core on the rack, wiping the scoreboard.
+	 *
+	 * *** IT IS NO LONGER THE GRANULARITY OF THE INFINITE-ABILITIES REFRESH, AND THAT SENTENCE WAS
+	 * THE BUG (spec v24 §5). *** That refresh is now driven by Tick(), every frame. See the block
+	 * above the FTickableGameObject overrides. The poll still applies the cheat as well, so the two
+	 * agree and so the red arm has something to fall back to.
+	 */
 	static constexpr float PollIntervalSeconds = 0.2f;
 
 	/**
@@ -186,6 +258,17 @@ public:
 	 * completely correct one for a real match. Re-asserting the park well inside that window is how
 	 * the range keeps its "leave it here" state without reaching into ATraceCore, which this pass
 	 * does not own and must not fork.
+	 *
+	 * *** SPEC v24 §0: THIS IS AN ABSOLUTE THAT WANTS TO BE RELATIVE, AND IT COULD NOT BE FIXED HERE.
+	 * ***
+	 * 7 s is not a tuning value, it is "comfortably less than half of 15", i.e. a RATIO to
+	 * TraceCoreTuning::OutOfPlayRecoverySeconds. Halve that base to 5 s tomorrow and this silently
+	 * becomes a re-park that arrives two seconds after the Core has already been taken away, which is
+	 * exactly the failure §0 exists to prevent. It cannot be expressed as the ratio it is because the
+	 * base is a .cpp-local constant inside Gameplay/TraceCore.cpp, invisible from here and in a file
+	 * this pass does not own. THE ONE-LINE FIX FOR WHOEVER OWNS ATraceCore: promote
+	 * TraceCoreTuning::OutOfPlayRecoverySeconds into TraceCore.h, and this becomes
+	 * `OutOfPlayRecoverySeconds * 0.47f` and tracks it for ever. Called out rather than quietly left.
 	 */
 	static constexpr float CoreReparkSeconds = 7.f;
 
@@ -290,6 +373,16 @@ private:
 
 	/** The spec's toggle. Deliberately not config and not saved: a range opens with it OFF. */
 	bool bInfiniteAbilities = false;
+
+	/** Times ApplyInfiniteAbilities() has run since the range opened, and how many of those ticked. */
+	int32 InfiniteApplyCount = 0;
+	int32 InfiniteTickApplyCount = 0;
+
+	/**
+	 * The firing distance the standing furniture was built with (v24 §0). Resolved from the arena's
+	 * own endzone depth rather than hard-coded — see TargetStandbackFor().
+	 */
+	float BuiltTargetStandbackUU = 0.f;
 
 	/** True while the Core is deliberately parked on the rack. See KeepCoreParked. */
 	bool bCoreOnRack = false;

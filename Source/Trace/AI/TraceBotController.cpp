@@ -4784,7 +4784,31 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 		{
 			ApplyCrouchInput(BotCharacter, true);
 			bCrouchHeld = true;
-			SlideEndTime = Now + FMath::Max(0.1f, Settings.BotSlideHoldSeconds);
+
+			// *** THE HOLD IS CLAMPED TO THE LIVE SLIDE, NOT JUST TO A KNOB (spec v24 §0). ***
+			//
+			// BotSlideHoldSeconds is an ABSOLUTE (1.60) whose own documentation says it "MUST TRACK
+			// SlideDuration" and "Keep at or under SlideDuration" — a rule that lived only in prose,
+			// so nothing enforced it. Spec v24 §8 then cut the slide to 0.86 s and the rule silently
+			// broke: a bot went on holding crouch for 1.60 s, i.e. 0.74 s past the end of its own
+			// slide, and crouch-WALKED the remainder in front of everybody.
+			//
+			// Re-typing the absolute to 0.86 would have been the §0 mistake a second time. Instead
+			// the knob is now clamped by the duration the movement component actually reports, so
+			// the documented invariant holds by construction and any future re-tune of SlideDuration,
+			// SlideMaxLengthScale or SlideDurationTrimSeconds carries the bots with it. The knob
+			// keeps its meaning as "hold for at most this long"; it simply can no longer outlive the
+			// slide. Falls back to the knob alone if the cast fails, which is the old behaviour.
+			float HoldSeconds = FMath::Max(0.1f, Settings.BotSlideHoldSeconds);
+			if (const UTraceCharacterMovementComponent* SlideMovement = Cast<UTraceCharacterMovementComponent>(Movement))
+			{
+				const float LiveSlideDuration = SlideMovement->GetSlideDurationForAudit();
+				if (LiveSlideDuration > 0.f)
+				{
+					HoldSeconds = FMath::Min(HoldSeconds, LiveSlideDuration);
+				}
+			}
+			SlideEndTime = Now + HoldSeconds;
 			TRACE_BOT_KIT(Slides);
 		}
 	}

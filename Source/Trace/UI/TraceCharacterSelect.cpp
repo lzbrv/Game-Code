@@ -22,6 +22,7 @@
 #include "Core/TracePlayerState.h"
 #include "Trace.h"                      // LogTraceGame
 #include "TraceTypes.h"                 // TraceTeamColor / TraceTeamName
+#include "UI/TraceHardwareCursor.h"     // spec v24 §2 — one pointer on screen, not two
 #include "UI/Text/TraceCanvasText.h"       // spec v22 §A1 — the cards type from the glyph atlas
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"   // the artist's sprites, colours and 9-slice numbers
 
@@ -1161,6 +1162,41 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 			{
 				OnClosed();
 			}
+		}
+	}
+
+	// ---- SPEC v24 §2 — THE OS POINTER STOPS BEING DRAWN OVER OURS -------------------------------
+	//
+	//     "The new cursor ui is working, but my cursor shows on top of it"
+	//
+	// ABOVE the `if (!bOpen) return` on purpose, because this call is the one place in a match that
+	// runs every single frame whether or not this screen is up (ATraceHUD::DrawHUD calls it outside
+	// every gate — see the comment at that call site), and the pause / settings overlay in front of
+	// it draws the artist's arrow too.
+	//
+	// TWO SURFACES, ONE ANSWER:
+	//   * this screen, while it is open and has a pointer — DrawCursor() below draws T_MenuCursor at
+	//     CursorPos, and bHasCursor is exactly "PollInput has had a mouse position", i.e. the same
+	//     condition DrawCursor itself returns on;
+	//   * whatever is in FRONT of it, which is what bInputAllowed already means. Its own header
+	//     defines the parameter as "false while something in front of this owns the keyboard (the
+	//     pause menu)", and ATraceHUD passes literally `!PauseMenu.IsOpen()`. That overlay is an
+	//     FTraceOptionsMenu and FTraceOptionsMenu::DrawCursor draws the same artist's arrow — so the
+	//     flag this screen is already given answers the question for the screen on top of it, with no
+	//     reach into a class this slice does not own.
+	//
+	// Renewed, never latched: the lease expires two frames after this stops being called, so a match
+	// that ends, a HUD that is destroyed or a screen that closes hands the hardware pointer straight
+	// back. See UI/TraceHardwareCursor.h.
+	{
+		TraceHardwareCursor::EnsureRunning();
+
+		const bool bOwnPointerDrawn = bOpen && bHasCursor;
+		const bool bOverlayInFront = !bInputAllowed;
+		if (bOwnPointerDrawn || bOverlayInFront)
+		{
+			TraceHardwareCursor::RenewSuppression(PC,
+				bOverlayInFront ? TEXT("pause / settings overlay") : TEXT("character select"));
 		}
 	}
 
@@ -2416,17 +2452,24 @@ void FTraceCharacterSelect::DrawCursor(AHUD* HUD)
 		return;
 	}
 
-	// SPEC v20 §6.7 and §0.8 — the artist's cursor, which until now existed only on the UMG title
+	// SPEC v20 §6.7 and §0.8 — the artist's cursor, which until then existed only on the UMG title
 	// screen. It is TIP-ANCHORED, not centre-anchored: PollInput hit-tests at CursorPos, and a
 	// centre-anchored arrow would draw its point about eleven pixels away from the pixel that is
-	// actually being clicked. The tip sits at (12, 6) in the sprite's own 64 x 87.
+	// actually being clicked.
+	//
+	// SPEC v24 §0, applied here: the aspect ratio and the tip used to be four bare numbers typed into
+	// this function — `64.f / 87.f`, `12.f / 64.f`, `6.f / 87.f` — a second, slightly different copy
+	// of what UI/TraceOptionsMenu.cpp already carried for the same sprite. They are now DERIVED from
+	// the sprite's own dimensions in one place, so a re-slice moves every screen at once. See
+	// TraceMenuArtStyle::CursorSpriteW.
 	if (UTexture2D* Arrow = TraceCharacterSelectArt::Sprite(TraceCharacterSelectArt::ESprite::Cursor))
 	{
 		const float ArrowH = 30.f * UIScale;
-		const float ArrowW = ArrowH * (64.f / 87.f);
+		const float ArrowW = ArrowH * TraceMenuArtStyle::CursorAspect;
 
 		TraceCharacterSelectArt::DrawSprite(HUD, Arrow,
-			CursorPos.X - ArrowW * (12.f / 64.f), CursorPos.Y - ArrowH * (6.f / 87.f),
+			CursorPos.X - ArrowW * TraceMenuArtStyle::CursorTipU,
+			CursorPos.Y - ArrowH * TraceMenuArtStyle::CursorTipV,
 			ArrowW, ArrowH, FLinearColor::White);
 		return;
 	}

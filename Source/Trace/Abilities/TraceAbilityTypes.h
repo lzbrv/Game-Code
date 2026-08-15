@@ -416,23 +416,30 @@ namespace TraceAbilityTraits
 	 * corrections per contact and 88.11 uu).
 	 *
 	 * Spec v19 §3 asks for it back FOR ONE CHARACTER. The only way to do that without putting the
-	 * ledge bug back in front of the other nine is for the very first question CanAttemptMantle() asks
-	 * to be this one — so that for anybody who is not Mortimer there is no probe, no MOVE_Flying, no
-	 * pull-up and no new way to disagree with the server. Not a tuning value, a gate.
+	 * ledge bug back in front of the other nine is for the very first question the mantle asks to be
+	 * this one — so that for anybody who is not Mortimer there is no probe, no launch, no pull-up and
+	 * no new way to disagree with the server. Not a tuning value, a gate.
 	 *
-	 * CALL SITE NEEDED: the FIRST line of UTraceCharacterMovementComponent::CanAttemptMantle().
+	 * *** CALL SITE: LIVE as of DEMO 21 ITEM 6. *** The first line of
+	 * UTraceAbilitySetMortimer::TryMantle(), which the shared OnJumpPressed hook reaches. It is NOT
+	 * in Source/Trace/Movement/ and there is no CanAttemptMantle() any more: the new mantle is two
+	 * LaunchCharacter impulses driven by an input the server re-runs, not a per-frame MOVE_Flying
+	 * pull-up outside the saved-move pipeline. See TraceAbilitySetMortimer.h for the argument.
+	 *
+	 * The gate is still worth keeping even though only Mortimer's own file calls it: it is the one
+	 * question a future second mantler has to answer, and it keeps the answer out of a cast.
 	 */
 	TRACE_API bool IsMantleAllowed(const AActor* Actor);
 
 	/**
-	 * How much more GENEROUS @p Actor's mantle is than the recovered one: reach, the height window and
-	 * the minimum approach speed all scale by this (the last one INVERSELY — a more generous mantle
-	 * asks for less speed, not more).
+	 * How much more GENEROUS @p Actor's mantle is than the old in-game one: the reach, the height
+	 * ceiling and the facing cone scale by this, and the height FLOOR scales inversely (a more
+	 * generous mantle accepts a lower ledge, not a higher one).
 	 *
 	 * 1.30 for Mortimer — spec v19 §3's "30% more generous than the old in-game mantle" — and 1.0 for
 	 * everybody else, which is moot because IsMantleAllowed() has already said no for them.
 	 *
-	 * CALL SITE NEEDED: the six GetMantle*() accessors in UTraceCharacterMovementComponent.
+	 * *** CALL SITE: LIVE as of DEMO 21 ITEM 6. *** UTraceAbilitySetMortimer::TryMantle().
 	 */
 	TRACE_API float GetMantleGenerosityScale(const AActor* Actor);
 
@@ -445,8 +452,27 @@ namespace TraceAbilityTraits
 	 * Power = Floor + (1 - Floor) * t is simply extrapolated to t = 2 rather than given a separate
 	 * multiplier. 1.0 for everybody else, which reproduces today's clamp exactly.
 	 *
-	 * CALL SITE NEEDED: ATraceCore::GetThrowChargeScaleForHold / GetThrowChargeAlpha, which both
-	 * already have the thrower to hand.
+	 * *** CALL SITE: LIVE. *** ATraceCore::GetThrowChargeScaleForHold / GetThrowChargeAlpha, which
+	 * both already have the thrower to hand.
 	 */
 	TRACE_API float GetThrowChargeHoldScale(const AActor* Actor);
+
+	/**
+	 * DEMO 21 ITEM 7. What a second of hold PAST the original 100% charge point is worth to @p Actor,
+	 * as a fraction of what a second of hold BEFORE it is worth.
+	 *
+	 * 0.6 for Mortimer — "after the original 100% charge window has passed, add a .6x modifier to the
+	 * linear scaling of his throw charge" — and 1.0 for everybody else, for whom it is doubly moot:
+	 * their GetThrowChargeHoldScale() is 1.0, so there is no charge past 100% for this to scale and
+	 * the term it multiplies is identically zero.
+	 *
+	 * *** IT SCALES A SLOPE THE BASE CURVE OWNS, NOT A NUMBER OF ITS OWN (spec v24 §0). *** The value
+	 * it multiplies is (1 - CoreThrowChargeFloorFraction) per unit of t, i.e. the shared line's own
+	 * gradient — so retuning the floor or the charge time moves Mortimer's extended half exactly as
+	 * much as it moves everybody's base half. Nothing anywhere stores "Mortimer's throw power".
+	 *
+	 * *** CALL SITE: LIVE. *** ATraceCore::GetThrowChargeScaleForHold, the same one expression the
+	 * HUD meter, the bot solver and the launch all read.
+	 */
+	TRACE_API float GetThrowChargePastFullScale(const AActor* Actor);
 }

@@ -4,42 +4,78 @@
 
 #include "Components/Image.h"
 #include "Components/TextBlock.h"
+#include "HAL/IConsoleManager.h"
 
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
+#include "UI/Widgets/Menu/TraceMenuPalette.h"   // TraceMenuStyle::RowHeight / RowPadX / PanelMaxWidth
 
 // Named after the file, not anonymous — Scripts/check-jumbo-build-collisions.py, and the unity build
 // it exists to protect.
 namespace TraceMenuRowWidgetLocal
 {
 	// =============================================================================================
-	// SPEC v20 §0.5 — THE SELECTED ROW MUST BE THE EASIEST THING ON THE SCREEN TO READ
+	// SPEC v24 §3 — THE HOVERED WORD IS THE ARTIST'S GREEN, AND IT IS THE SAME STATE AS THE OUTLINE
 	// =============================================================================================
 	//
-	// It was the hardest. Hover and selection are the same thing on this menu, so the artist's HOVER
-	// word colour — TraceMenuArtStyle::WordHover, RGB(115,82,50), a muted gold they drew for a word
-	// sitting on a lit plate — was carrying the SELECTION signal. Measured off the 1920x1080 capture:
-	// the selected PLAY word rendered at RGB(114,83,53) on a plate at RGB(34,45,82), a contrast ratio
-	// of 1.9:1, while every unselected row rendered pure white at 13.4:1. The row the player is about
-	// to press was seven times harder to read than the six rows around it.
+	//     "The button's hover state doesn't fully work — the orange outline shows up while hovering,
+	//      but not the green text from my assets"
 	//
-	// This is a DELIBERATE DEPARTURE FROM THE SHEET, in the same spirit as WordDisabled's — which is
-	// documented in TraceMenuArtStyle.h as exactly that. It is kept here, local to the row, rather
-	// than changed there, because TraceMenuArtStyle is the ARTIST'S palette, sampled off their art to
-	// the byte; the moment a value in it stops being what the sheet says, that file stops being
-	// trustworthy. The artist's amber has not been thrown away either — it is still on the selected
-	// row, in the ring of T_MenuBtn_Hover, which is where the sheet puts it.
+	// Both halves of that sentence were true, and they had different causes.
 	//
-	// The three colours below are one system and have to be read together:
-	//   * a selected row is pure white, the brightest text on the screen;
-	//   * an unselected row is 85% white — plainly legible at 9.6:1, and quiet enough that the
+	// WHY THE GREEN WAS NOT ON THE SCREEN. TraceMenuArtStyle::WordHover did not contain the artist's
+	// hover colour. It contained sRGB(115,82,50) — the amber halo that pools around the lettering,
+	// mis-sampled off the one plate on the sheet whose baked word is a dim state LEGEND rather than a
+	// button label. Re-measured on the three plates that carry a real button label in the hover
+	// state, the artist's word is a flat sRGB(85,107,47) on all three, to the byte; the full
+	// measurement is in TraceMenuArtStyle.h. So spec v20 §0.5 — which found the value here illegible
+	// at 1.9:1 and replaced it with white — was reacting to a bad number, and the row has drawn a
+	// white word ever since. That departure is now retired: §0.5's reasoning was sound and its input
+	// was wrong.
+	//
+	// WHY IT COULD DRIFT FROM THE OUTLINE AT ALL. The plate brush and the word colour used to be two
+	// separate expressions over the same three booleans, a dozen lines apart. Nothing forced them to
+	// agree; they simply happened to, until one of them was edited. §3 asks for the label to be
+	// "driven from the same hover state that already drives the outline, so the two cannot disagree",
+	// so there is now ONE function, VisualsFor(), with ONE switch, that returns the plate and the
+	// word together. Disagreeing would take deleting a case.
+	//
+	// WHAT IS *NOT* THE ARTIST'S GREEN, AND WHY. The word is the label. Everything else on this row
+	// is Trace's own furniture that the sheet has no opinion about — the address readout under PLAY
+	// and JOIN, the DIFFICULTY / SCORING MODE value, the two arrows — and those keep the neutral
+	// treatment they have today. That is a deliberate line, not an oversight: "HOST 192.168.1.185:7777"
+	// is a string of digits a host reads out loud to somebody on the other end of a call, and putting
+	// it at the green's 2.34:1 against the plate would cost real legibility for no instruction. §3
+	// asks for the label's colour and it gets exactly that.
+	//
+	// THE ROW'S OWN NEUTRALS, for the furniture above. Unchanged from spec v20 §0.5:
+	//   * on a selected row, full white;
+	//   * on an unselected row, 85% white — plainly legible at 9.6:1 and quiet enough that the
 	//     selected row is the one the eye lands on;
-	//   * a disabled row is unchanged, still TraceMenuArtStyle::WordDisabled.
+	//   * on a disabled row, TraceMenuArtStyle::WordDisabled.
 
-	/** Selected / pressed. Full white, and nothing else on this screen is brighter. */
-	static const FLinearColor WordSelected = FLinearColor::White;
+	/** Furniture on a selected / pressed row. Full white. */
+	static const FLinearColor FurnitureSelected = FLinearColor::White;
 
-	/** Unselected. Dimmed just enough to lose the brightness contest with the selected row. */
-	static const FLinearColor WordUnselected = FLinearColor(0.85f, 0.85f, 0.85f, 1.f);
+	/** Furniture on an unselected row. */
+	static const FLinearColor FurnitureUnselected = FLinearColor(0.85f, 0.85f, 0.85f, 1.f);
+
+	/**
+	 * THE RED ARM for spec v24 §3. Non-zero puts the pre-v24 white word back on the hover state,
+	 * leaving the plate, the ring and the rail exactly as they are — so ONE binary produces a "the
+	 * outline lights but the word does not change" frame and a fixed one, and the pixel sample that
+	 * says the label is green can be shown to be capable of saying it is white.
+	 *
+	 * File-scope and distinctively named rather than an anonymous-namespace static: UBT compiles this
+	 * module as a unity build. Same reasoning as the namespace this sits in.
+	 */
+	static int32 GRowHoverWordRedArm = 0;
+
+	static FAutoConsoleVariableRef CVarRowHoverWordRedArm(
+		TEXT("Trace.UI.RowHoverWordRedArm"),
+		GRowHoverWordRedArm,
+		TEXT("Dev only. Spec v24 s3 RED ARM. 1 restores the pre-v24 white hover label, so the ")
+		TEXT("artist's green can be measured against the defect it replaced from one build."),
+		ECVF_Cheat);
 
 	/**
 	 * The plate's breathing tint on the selected row.
@@ -106,15 +142,29 @@ namespace TraceMenuRowWidgetLocal
 	 * The artist's amber is RGB(116,58,0) — the ring colour sampled off their sheet, where it is a
 	 * GLOW and gets its brightness from the bloom around it rather than from the value itself. A flat
 	 * 9 px bar has no bloom, so at the sampled value it would ship as a dim brown smear. Normalising
-	 * to full brightness keeps the ratio exactly (116:58:0 -> 255:127:0), so this is the artist's hue
-	 * and only the level is this file's. It is the same move Scripts/slice-ui-assets.py's
-	 * build_wordmark() makes with the artist's rim amber, and for the same reason.
+	 * to full brightness keeps the ratio exactly, so this is the artist's hue and only the level is
+	 * not. It is the same move Scripts/slice-ui-assets.py's build_wordmark() makes with the artist's
+	 * rim amber, and for the same reason.
 	 *
-	 * Not put in TraceMenuArtStyle: that file is the artist's palette sampled to the byte, and the
-	 * moment a value in it stops being what the sheet says it stops being trustworthy. Same argument
-	 * as WordSelected above.
+	 * SPEC v24 §0, applied here: this used to be the literal FColor(255,127,0) with the derivation
+	 * written out beside it in prose, i.e. an absolute standing in for a function of Amber, which
+	 * would not have followed if Amber ever moved. It is now the function —
+	 * TraceMenuArtStyle::AmberLifted() — and the title screen's wordmark glow, which carried a second
+	 * and quietly WRONG copy of the same idea, now shares it.
+	 *
+	 * A FUNCTION-LOCAL static rather than a namespace-scope one, and that is not style. TraceMenuArtStyle
+	 * ::Amber is a `static const FLinearColor` in a header, so every translation unit has its own
+	 * dynamically-initialised copy, and AmberLifted() reads the one in TraceMenuArtStyle.cpp. A
+	 * namespace-scope initialiser here would therefore be racing that TU's static init — and losing
+	 * that race is SILENT: Amber would still be all-zero, AmberLifted's zero-peak guard would return
+	 * it unchanged, and the selection rail would ship black on black. Deferring to first use puts the
+	 * call after all static initialisation, where the answer cannot be wrong.
 	 */
-	static const FLinearColor SelectionMarkColor = FLinearColor::FromSRGBColor(FColor(255, 127, 0));
+	static const FLinearColor& SelectionMarkColor()
+	{
+		static const FLinearColor Color = TraceMenuArtStyle::AmberLifted();
+		return Color;
+	}
 
 	/**
 	 * Rail size in the menu's 1080-tall reference space, so a 1080p window draws it 1:1 and every
@@ -124,12 +174,123 @@ namespace TraceMenuRowWidgetLocal
 	 * competing with the plate, and thick enough that it can never be mistaken for a text caret. The
 	 * crescent it replaces was 20 x 26 of mostly empty box — this is roughly 3.5x the actual lit area
 	 * in a shape that stays itself at any scale.
+	 *
+	 * SPEC v24 §0, applied here. Those two sentences describe the rail as a PROPORTION of the row —
+	 * "two thirds of the row's height" — and then it was written down as the absolute 40, which stops
+	 * being two thirds the moment TraceMenuStyle::RowHeight moves and quietly becomes a rail that is
+	 * the wrong size for its row. Both dimensions are now expressed against RowHeight, so the mark
+	 * follows the row instead of having to be re-tuned after it. At today's RowHeight of 60 these
+	 * evaluate to exactly the 9 and 40 they replace, so nothing on screen moves in this pass.
 	 */
-	static constexpr float MarkWidth = 9.f;
-	static constexpr float MarkHeight = 40.f;
+	static constexpr float MarkHeightOfRow = 2.f / 3.f;
+	static constexpr float MarkWidthOfRow = 0.15f;
+
+	static constexpr float MarkWidth = TraceMenuStyle::RowHeight * MarkWidthOfRow;
+	static constexpr float MarkHeight = TraceMenuStyle::RowHeight * MarkHeightOfRow;
 
 	/** Fully rounded ends: a radius of half the width turns the bar's caps into semicircles. */
 	static constexpr float MarkRadius = MarkWidth * 0.5f;
+
+	// =============================================================================================
+	// ONE STATE, ONE SWITCH — spec v24 §3's "so the two cannot disagree"
+	// =============================================================================================
+
+	/**
+	 * The four states a row can be in, in the order a player would rank them.
+	 *
+	 * Disabled outranks everything: a row that cannot be pressed must not look pressable even while
+	 * the cursor is on it. Pressed outranks hovered, because a press IS the hover plus a finger down.
+	 * Hover and keyboard selection are the same thing on this menu — see ATraceMenuHUD::DrawHUD.
+	 */
+	enum class ERowState : uint8
+	{
+		Normal,
+		Hovered,
+		Pressed,
+		Disabled,
+	};
+
+	static ERowState StateFor(const FTraceMenuRowView& InView)
+	{
+		if (!InView.bEnabled)          { return ERowState::Disabled; }
+		if (InView.bPressed)           { return ERowState::Pressed; }
+		if (InView.bSelected)          { return ERowState::Hovered; }
+		return ERowState::Normal;
+	}
+
+	/**
+	 * Everything one state decides, decided together.
+	 *
+	 * This struct is the whole of §3's guarantee. The orange outline is a property of @c Plate (it is
+	 * baked into T_MenuBtn_Hover) and the green word is @c Label; they are produced by ONE switch
+	 * over ONE value, so the only way to light the ring without turning the word green — the exact
+	 * defect reported — is to delete a line from a single case.
+	 */
+	struct FRowVisuals
+	{
+		/** Which of the three plates the artist drew. The hover plate is the one with the ring. */
+		enum class EPlate : uint8 { Default, Hover, Disabled } Plate = EPlate::Default;
+
+		/** The label's colour, from the artist's palette. */
+		FLinearColor Label = TraceMenuArtStyle::WordDefault;
+
+		/** Neutral for the row's own furniture: the address readout, the value, the arrows. */
+		FLinearColor Furniture = FurnitureUnselected;
+
+		/** true while this state should breathe. Pressed does not; it is held. */
+		bool bPulses = false;
+
+		/** Flat multiplier applied to the plate and the rail when the state does not breathe. */
+		float FlatTint = 1.f;
+	};
+
+	static FRowVisuals VisualsFor(ERowState InState)
+	{
+		FRowVisuals Out;
+		switch (InState)
+		{
+		case ERowState::Disabled:
+			Out.Plate = FRowVisuals::EPlate::Disabled;
+			Out.Label = TraceMenuArtStyle::WordDisabled;
+			Out.Furniture = TraceMenuArtStyle::WordDisabled;
+			break;
+
+		case ERowState::Pressed:
+			// The sheet has three plates and a press is not one of them, so pressed is the HOVER
+			// plate — ring and all — knocked down. Marked as the stand-in it is; a fourth sprite
+			// would replace this case and nothing else.
+			Out.Plate = FRowVisuals::EPlate::Hover;
+			Out.Label = TraceMenuArtStyle::WordHover;
+			Out.Furniture = FurnitureSelected;
+			Out.FlatTint = TraceMenuArtStyle::PressedTint;
+			break;
+
+		case ERowState::Hovered:
+			// THE TWO HALVES OF §3, ON ADJACENT LINES. The ring comes from the plate; the green comes
+			// from the artist's palette; neither can be true without the other.
+			Out.Plate = FRowVisuals::EPlate::Hover;
+			Out.Label = TraceMenuArtStyle::WordHover;
+			Out.Furniture = FurnitureSelected;
+			Out.bPulses = true;
+			break;
+
+		case ERowState::Normal:
+		default:
+			Out.Plate = FRowVisuals::EPlate::Default;
+			Out.Label = TraceMenuArtStyle::WordDefault;
+			Out.Furniture = FurnitureUnselected;
+			break;
+		}
+
+		// The red arm sits AFTER the switch, deliberately: it must be able to break the pairing the
+		// switch guarantees, because a red arm that cannot reproduce the defect proves nothing.
+		if (GRowHoverWordRedArm != 0 && (InState == ERowState::Hovered || InState == ERowState::Pressed))
+		{
+			Out.Label = FurnitureSelected;
+		}
+
+		return Out;
+	}
 
 	/** The rail, as a brush. Textureless: Slate fills the rounded box from TintColor. */
 	static FSlateBrush MakeSelectionMarkBrush()
@@ -137,7 +298,7 @@ namespace TraceMenuRowWidgetLocal
 		FSlateBrush Brush;
 		Brush.DrawAs = ESlateBrushDrawType::RoundedBox;
 		Brush.OutlineSettings = FSlateBrushOutlineSettings(MarkRadius);
-		Brush.TintColor = FSlateColor(SelectionMarkColor);
+		Brush.TintColor = FSlateColor(SelectionMarkColor());
 		// The canvas slot that holds this image is AUTO-SIZED, so the brush's ImageSize IS the mark's
 		// size on screen. Nothing else has to be told the rail got bigger.
 		Brush.SetImageSize(FVector2f(MarkWidth, MarkHeight));
@@ -201,14 +362,21 @@ void UTraceMenuRow::InstallAtlasLabels()
 
 	// MaxWidth on the word only. It is the one string on this row whose length is not under this
 	// project's control in the way the others are — "SCORING MODE" in a face a third wider than the
-	// one the slot was measured for is the string that reaches the value chip first. The numbers are
-	// the generator's own: WBP_MenuRow is authored 720 local units wide with ROW_PAD_X = 30, and the
-	// value chip on a row that has one starts around 60% of the way across.
+	// one the slot was measured for is the string that reaches the value chip first.
 	//
 	// The readout, the value and the arrows are left unbounded on purpose: they are right-aligned and
 	// short, and a shrink-to-fit on a right-aligned string that never overflows is a size that
 	// wobbles for no reason.
-	constexpr float LabelMaxWidth = 400.f;
+	//
+	// SPEC v24 §0, applied here. This was the absolute 400, with a comment explaining that it came
+	// from the row being 720 local units wide, its padding being 30, and the value chip starting
+	// around 60% across — i.e. a number DERIVED from three constants that live in TraceMenuStyle and
+	// then written down as a literal, which stops being true the moment any of the three moves. It is
+	// now the arithmetic itself: 720 * 0.6 - 30 = 402, two pixels from the literal it replaces and
+	// now attached to the things it was always a function of.
+	constexpr float ValueChipStartFraction = 0.60f;
+	constexpr float LabelMaxWidth =
+		TraceMenuStyle::PanelMaxWidth * ValueChipStartFraction - TraceMenuStyle::RowPadX;
 
 	AtlasLabels.Reset();
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, LabelText, LabelMaxWidth));
@@ -232,51 +400,46 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 	// menu wants this row on screen. Latched, so it costs one branch a frame afterwards.
 	InstallAtlasLabels();
 
-	// ---- The plate: which of the artist's three states is true right now ---------------------------
+	// ---- ONE STATE, AND EVERYTHING THIS ROW LOOKS LIKE COMES OUT OF IT (spec v24 §3) --------------
 	//
-	// Order matters, and it is the order a player would name them. Disabled outranks everything —
-	// a row that cannot be pressed must not look pressable even while the cursor is on it. Pressed
-	// outranks hover, because the press IS the hover plus a finger down.
-	const bool bDisabled = !InView.bEnabled;
-	const bool bPressed  = InView.bEnabled && InView.bPressed;
-	const bool bHovered  = InView.bEnabled && !bPressed && InView.bSelected;
+	// These two lines are the fix for "the orange outline shows up while hovering, but not the green
+	// text". The ring lives in the plate and the green lives in the label, and both of them are now
+	// fields of one struct returned by one switch over one value — so a frame where the outline is
+	// lit and the word is not green is no longer expressible. See VisualsFor().
+	const TraceMenuRowWidgetLocal::ERowState RowState = TraceMenuRowWidgetLocal::StateFor(InView);
+	const TraceMenuRowWidgetLocal::FRowVisuals Visuals = TraceMenuRowWidgetLocal::VisualsFor(RowState);
+
+	// Kept as a named boolean because several call sites below read better for it; it is now DERIVED
+	// from the state rather than being a second, parallel decision.
+	const bool bDisabled = RowState == TraceMenuRowWidgetLocal::ERowState::Disabled;
+
+	// The plate's tint: the breathing that has always marked a hovered row, or the flat knock-down a
+	// press and a disabled row use. One expression, so the rail below can share it and the two can
+	// never fall out of phase.
+	const float PlateTint = Visuals.bPulses
+		? (TraceMenuRowWidgetLocal::SelectedPlateBase
+			+ TraceMenuRowWidgetLocal::SelectedPlateSwing * FMath::Sin(InNow * PulseSpeed))
+		: Visuals.FlatTint;
 
 	if (PlateSprite != nullptr)
 	{
-		const FSlateBrush& Chosen = bDisabled ? PlateDisabledBrush
-			: (bPressed || bHovered) ? PlateHoverBrush
-			: PlateDefaultBrush;
+		using EPlate = TraceMenuRowWidgetLocal::FRowVisuals::EPlate;
+		const FSlateBrush& Chosen =
+			  (Visuals.Plate == EPlate::Disabled) ? PlateDisabledBrush
+			: (Visuals.Plate == EPlate::Hover)    ? PlateHoverBrush
+			:                                       PlateDefaultBrush;
 		PlateSprite->SetBrush(Chosen);
-
-		// The sheet has three plates and a press is not one of them, so pressed is the hover plate
-		// dimmed. Marked as the stand-in it is; a fourth sprite would replace this line.
-		//
-		// The hover plate also breathes, at the same rate the Canvas row's selection bar always did,
-		// so a selected row is alive on either renderer.
-		float Tint = 1.f;
-		if (bPressed)
-		{
-			Tint = TraceMenuArtStyle::PressedTint;
-		}
-		else if (bHovered)
-		{
-			// Breathes UPWARDS from parity. See TraceMenuRowWidgetLocal::SelectedPlateBase.
-			Tint = TraceMenuRowWidgetLocal::SelectedPlateBase
-				+ TraceMenuRowWidgetLocal::SelectedPlateSwing * FMath::Sin(InNow * PulseSpeed);
-		}
-		PlateSprite->SetColorAndOpacity(FLinearColor(Tint, Tint, Tint, 1.f));
+		PlateSprite->SetColorAndOpacity(FLinearColor(PlateTint, PlateTint, PlateTint, 1.f));
 	}
 
-	// The word's colour is the whole difference between the artist's three states, which is why one
-	// white sprite can serve all three and why the typed labels use the same three colours.
-	//
-	// Spec v20 §0.5: the selected state is the artist's PLATE with a white word rather than their
-	// hover word colour, which measured 1.9:1 against the plate it sits on. The whole argument, and
-	// what was kept of the sheet, is at the top of this file.
-	const bool bSelectedNow = bPressed || bHovered;
-	const FLinearColor WordColor = bDisabled ? TraceMenuArtStyle::WordDisabled
-		: bSelectedNow ? TraceMenuRowWidgetLocal::WordSelected
-		: TraceMenuRowWidgetLocal::WordUnselected;
+	// The label's colour. THE SAME FRAME'S Visuals as the plate above — that identity is the whole of
+	// §3, and it is why this is a field read rather than a second conditional.
+	const FLinearColor WordColor = Visuals.Label;
+
+	// The row's own furniture — the address readout, the value, the two arrows — keeps the neutral
+	// treatment it has today rather than following the word into the artist's green. The reason is at
+	// the top of this file, under "WHAT IS *NOT* THE ARTIST'S GREEN".
+	const FLinearColor FurnitureColor = Visuals.Furniture;
 
 	if (ChevronSprite != nullptr)
 	{
@@ -296,11 +459,9 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 			}
 
 			// The rail breathes with the plate it marks, off the same clock, so the two read as one
-			// object rather than a bar parked beside a pulsing button.
-			const float MarkTint = bPressed ? TraceMenuArtStyle::PressedTint
-				: TraceMenuRowWidgetLocal::SelectedPlateBase
-					+ TraceMenuRowWidgetLocal::SelectedPlateSwing * FMath::Sin(InNow * PulseSpeed);
-			ChevronSprite->SetColorAndOpacity(FLinearColor(MarkTint, MarkTint, MarkTint, 1.f));
+			// object rather than a bar parked beside a pulsing button. Literally the same value now,
+			// rather than a second copy of the same expression — see PlateTint above.
+			ChevronSprite->SetColorAndOpacity(FLinearColor(PlateTint, PlateTint, PlateTint, 1.f));
 		}
 	}
 
@@ -337,14 +498,17 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 		StatusText->SetVisibility(bShowStatus ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
 		if (bShowStatus)
 		{
-			// Dimmer than the label on purpose: it is a readout, not the thing you press. But it
-			// followed WordHover down with the label — "HOST 192.168.1.185:7777" on the selected PLAY
-			// row was dim brown on blue — so the selected row's readout is lifted with its word.
-			const float StatusAlpha = bDisabled ? TraceMenuRowWidgetLocal::StatusAlphaDisabled
-				: bSelectedNow ? TraceMenuRowWidgetLocal::StatusAlphaSelected
-				: TraceMenuRowWidgetLocal::StatusAlphaNormal;
+			// Dimmer than the label on purpose: it is a readout, not the thing you press. It draws in
+			// the row's FURNITURE colour rather than the label's, which is what keeps
+			// "HOST 192.168.1.185:7777" legible on the hovered row now that the label is the artist's
+			// green — an address a host reads out loud is the last string on this screen that should
+			// be sitting at 2.34:1.
+			const float StatusAlpha =
+				  (RowState == TraceMenuRowWidgetLocal::ERowState::Disabled) ? TraceMenuRowWidgetLocal::StatusAlphaDisabled
+				: (RowState == TraceMenuRowWidgetLocal::ERowState::Normal)   ? TraceMenuRowWidgetLocal::StatusAlphaNormal
+				:                                                             TraceMenuRowWidgetLocal::StatusAlphaSelected;
 			StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(
-				WordColor.R, WordColor.G, WordColor.B, StatusAlpha)));
+				FurnitureColor.R, FurnitureColor.G, FurnitureColor.B, StatusAlpha)));
 			StatusText->SetText(FText::FromString(InView.Status));
 		}
 	}
@@ -371,7 +535,9 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 		}
 	}
 
-	const auto ApplyArrow = [this, &InView, &WordColor, bDisabled](UTextBlock* InArrow, bool bLive)
+	// Furniture, like the readout above: the arrows say which way the value can move and are not part
+	// of the artist's three word states.
+	const auto ApplyArrow = [this, &InView, &FurnitureColor, bDisabled](UTextBlock* InArrow, bool bLive)
 	{
 		if (InArrow == nullptr)
 		{
@@ -380,7 +546,8 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 		InArrow->SetVisibility(InView.bShowArrows ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
 		if (InView.bShowArrows)
 		{
-			InArrow->SetColorAndOpacity(FSlateColor(FLinearColor(WordColor.R, WordColor.G, WordColor.B,
+			InArrow->SetColorAndOpacity(FSlateColor(FLinearColor(
+				FurnitureColor.R, FurnitureColor.G, FurnitureColor.B,
 				(bLive && !bDisabled) ? 0.95f : DisabledArrowAlpha)));
 		}
 	};

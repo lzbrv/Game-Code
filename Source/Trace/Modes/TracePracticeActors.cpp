@@ -138,8 +138,17 @@ void ATracePracticePad::SetPadLabel(const FString& InLabel)
 	}
 }
 
+FString ATracePracticePad::GetPadLabel() const
+{
+	return (Label != nullptr) ? Label->Text.ToString() : FString();
+}
+
 void ATracePracticePad::SetPadLit(bool bLit)
 {
+	// Mirrored before the early-out: the pad's LIT state is a fact about the pad whether or not it has
+	// a disc to paint, and IsPadLit() must answer the same thing in a -nullrhi run as in a windowed one.
+	bPadLit = bLit;
+
 	if (Disc == nullptr)
 	{
 		return;

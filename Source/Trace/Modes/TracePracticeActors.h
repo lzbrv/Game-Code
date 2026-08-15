@@ -113,6 +113,17 @@ public:
 	/** Amber while armed, dim while idle. Purely cosmetic; never read by a rule. */
 	void SetPadLit(bool bLit);
 
+	/**
+	 * What the pad currently SAYS, and whether it is lit.
+	 *
+	 * Read by Trace.Practice.InfiniteVerify and by nothing else. The label is the only thing that
+	 * tells a player which way the infinite-abilities toggle is currently set, so "the toggle flipped"
+	 * and "the pad says it flipped" are two separate claims and the second one needs a reader. Never
+	 * consulted by a rule — see SetPadLit.
+	 */
+	FString GetPadLabel() const;
+	bool IsPadLit() const { return bPadLit; }
+
 protected:
 	virtual void BeginPlay() override;
 
@@ -145,6 +156,9 @@ private:
 	 * immediately take it back, which reads to a player as "the pad did nothing".
 	 */
 	float LastAcceptedWorldTime = -1000.f;
+
+	/** What SetPadLit was last told. Cosmetic state, mirrored only so IsPadLit() can report it. */
+	bool bPadLit = false;
 };
 
 /**
