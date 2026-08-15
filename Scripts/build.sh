@@ -190,6 +190,24 @@ renaming the individual symbol."
     fi
 fi
 
+# ------------------------------------------------------------------------------
+# The SECOND Windows-only trap this build gates on: a preprocessor directive
+# inside a function-like macro's argument list. The standard says undefined;
+# clang does the friendly thing, MSVC emits C5101 and then fails the file with
+# C2760/C3553/C2059. So it builds clean here and breaks every Windows developer —
+# which is how a collaborator found it, not us.
+#
+# Skip with TRACE_SKIP_PREPROCESSOR_CHECK=1.
+# ------------------------------------------------------------------------------
+PREPROC_PY="${TRACE_SCRIPT_DIR}/check-preprocessor-in-macro-args.py"
+if [ "${TRACE_SKIP_PREPROCESSOR_CHECK:-0}" != "1" ] && [ -f "$PREPROC_PY" ]; then
+    if ! python3 "$PREPROC_PY"; then
+        trace_die "A preprocessor directive sits inside a macro argument list (see above).
+MSVC rejects this and macOS does not, so it would break the Windows build.
+Hoist the conditional value into a variable above the call and pass the variable."
+    fi
+fi
+
 ARGS=("$TARGET" "$PLATFORM" "$CONFIG" "$TRACE_UPROJECT" -waitmutex)
 # Note: `[ x = y ] && ARGS+=(...)` would return 1 on the false branch and `set -e`
 # would kill the script. Always use a full `if` for conditional appends.

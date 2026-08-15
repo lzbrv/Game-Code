@@ -1296,16 +1296,22 @@ void UTracePracticeRangeSubsystem::LogStatus() const
 	// question about the driver, so the driver is a printed fact rather than something to read the
 	// source for: applies=<total>, of which <ticked> came from the per-frame tick. Poll-only means
 	// every press really does start a cooldown for up to one poll — which was the bug.
+	// The red-arm note is resolved BEFORE the log call, not inside its argument list. A #if between
+	// a function-like macro's parentheses is undefined behaviour: clang accepts it silently, MSVC
+	// rejects it (C5101, then C2760/C3553/C2059), so it compiles here and breaks every Windows
+	// developer. Scripts/check-preprocessor-in-macro-args.py now fails the build on this pattern.
+#if !UE_BUILD_SHIPPING
+	const TCHAR* const RedArmNote = TracePracticeRange::IsInfinitePollOnlyArmed()
+		? TEXT("   *** Trace.Practice.PollOnlyInfinite IS ON — this is the RED ARM ***")
+		: TEXT("");
+#else
+	const TCHAR* const RedArmNote = TEXT("");
+#endif
+
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[Practice] infinite-abilities driver: applies=%d ticked=%d polled=%d%s"),
 		InfiniteApplyCount, InfiniteTickApplyCount, InfiniteApplyCount - InfiniteTickApplyCount,
-#if !UE_BUILD_SHIPPING
-		TracePracticeRange::IsInfinitePollOnlyArmed()
-			? TEXT("   *** Trace.Practice.PollOnlyInfinite IS ON — this is the RED ARM ***") : TEXT("")
-#else
-		TEXT("")
-#endif
-		);
+		RedArmNote);
 
 	// DEMO 19 ITEM 1's measurement, printed rather than described. "Make it smaller" is a claim about
 	// how far the player has to walk, so this is the number that has to move.
