@@ -208,6 +208,23 @@ Hoist the conditional value into a variable above the call and pass the variable
     fi
 fi
 
+# ------------------------------------------------------------------------------
+# The THIRD Windows-only trap this build gates on: a local named after an AActor
+# member. MSVC makes it an error (C4458: declaration of 'Owner' hides class
+# member); macOS structurally CANNOT warn, because UBT hard-disables shadow
+# warnings across clang 17-18.1.3 and Apple clang reports 17.0.0 — so the
+# ShadowVariableWarningLevel in Trace.Build.cs is a documented no-op here.
+#
+# Skip with TRACE_SKIP_SHADOW_CHECK=1.
+# ------------------------------------------------------------------------------
+SHADOW_PY="${TRACE_SCRIPT_DIR}/check-engine-member-shadowing.py"
+if [ "${TRACE_SKIP_SHADOW_CHECK:-0}" != "1" ] && [ -f "$SHADOW_PY" ]; then
+    if ! python3 "$SHADOW_PY"; then
+        trace_die "A local shadows an engine member (see above). MSVC rejects this and macOS
+cannot even warn about it, so it would break the Windows build. Rename the local."
+    fi
+fi
+
 ARGS=("$TARGET" "$PLATFORM" "$CONFIG" "$TRACE_UPROJECT" -waitmutex)
 # Note: `[ x = y ] && ARGS+=(...)` would return 1 on the false branch and `set -e`
 # would kill the script. Always use a full `if` for conditional appends.
