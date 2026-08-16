@@ -2,29 +2,32 @@
 # ==============================================================================
 # Trace — import-font-atlas.sh
 #
-# Puts SOFACHROME on screen. Runs the two halves of Scripts/import_font_atlas.py:
+# Puts the game's TYPE on screen. Runs the two halves of Scripts/import_font_atlas.py:
 #
-#   1. metrics  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold}.json
+#   1. metrics  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold,Hud}.json
 #                 -> Source/Trace/UI/Text/TraceFontAtlasMetrics.h    (plain python)
-#   2. texture  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold}.png
-#                 -> Content/Trace/UI/Fonts/T_FontAtlas{,Bold}.uasset  (inside the editor)
+#   2. texture  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold,Hud}.png
+#                 -> Content/Trace/UI/Fonts/T_FontAtlas{,Bold,Hud}.uasset  (in the editor)
 #
 # ------------------------------------------------------------------------------
-# TWO WEIGHTS (spec v23 §A3)
+# THREE FACES (spec v23 §A3, third face by v25 §4)
 # ------------------------------------------------------------------------------
 # The owner asked for the game to be set in an extra-light cut, with the character
-# names on the selection screen left bold. Each weight comes from ITS OWN REAL
-# FONT FILE — synthesising one by eroding the other was tried twice and damaged
-# the letterforms both times, so --thin is 0 for both and must stay there:
+# NAMES on the selection screen left bold, and — v25 — for the in-match HUD and the
+# character ability DESCRIPTIONS to be Erbaum Bold. Each face comes from ITS OWN
+# REAL FONT FILE — synthesising one by eroding another was tried twice and damaged
+# the letterforms both times, so --thin is 0 for all of them and must stay there:
 #
-#   T_FontAtlas      Sofachrome W05 ExtraLight.ttf   the DEFAULT for everything
+#   T_FontAtlas      Sofachrome W05 ExtraLight.ttf   the DEFAULT: menus, everything
 #   T_FontAtlasBold  Sofachrome Rg.otf               character NAMES only
+#   T_FontAtlasHud   Erbaum-Bold.otf                 match HUD + ability DESCRIPTIONS
 #
-# Both sheets go through this script together and land in ONE generated header as
-# a table of faces, because the runtime picks between them per draw. They must be
-# rasterised at the same --size: import_font_atlas.py refuses to emit the header
-# if their em, vertical metrics or charset ever disagree, since one layout pass
-# serves both weights.
+# All three sheets go through this script together and land in ONE generated header
+# as a table of faces, because the runtime picks between them per draw. They must be
+# rasterised at the same --size: import_font_atlas.py refuses to emit the header if
+# their em, LINE HEIGHT or charset ever disagree, since one layout pass serves all
+# three. Ascent, descent, cap height and advances are per face and may differ —
+# Erbaum splits the shared 116 px line box 93/23 where Sofachrome splits it 95/21.
 #
 # YOU DO NOT NEED TO RUN THIS TO PLAY. All outputs are committed, exactly like
 # the railgun's assets. Run it after re-running Scripts/generate_font_atlas.py,
@@ -48,9 +51,9 @@
 # ------------------------------------------------------------------------------
 # THE FONT FILE IS NOT IN THIS REPOSITORY, BY DESIGN
 # ------------------------------------------------------------------------------
-# Sofachrome is licensed to the owner for desktop use, not for embedding, and
-# this repo is public. Only the rasterised sheet is committed. Regenerating it
-# needs your own licensed copy at Art/Fonts/Sofachrome Rg.otf (gitignored) —
+# Sofachrome and Erbaum are licensed to the owner for desktop use, not for
+# embedding, and this repo is public. Only the rasterised sheets are committed.
+# Regenerating one needs your own licensed copy at Art/Fonts/ (gitignored) —
 # see docs/FONTS.md and the header of Scripts/generate_font_atlas.py, which also
 # records that a whole-charset atlas is a GREY position that a commercial
 # release should replace with a bought app licence.
@@ -69,8 +72,8 @@ usage() {
 ${TRACE_PROJECT_NAME} import-font-atlas
 
 Regenerates Source/Trace/UI/Text/TraceFontAtlasMetrics.h and imports
-Content/Trace/UI/Fonts/T_FontAtlas and T_FontAtlasBold — the light and bold
-weights — from the sheets under .../Fonts/Source.
+Content/Trace/UI/Fonts/T_FontAtlas, T_FontAtlasBold and T_FontAtlasHud — the
+light, bold and HUD faces — from the sheets under .../Fonts/Source.
 
 USAGE
   Scripts/import-font-atlas.sh [options]
@@ -78,7 +81,7 @@ USAGE
 OPTIONS
       --header-only   Only regenerate the metrics header (no editor, instant)
       --texture-only  Only import the textures (leave the header alone)
-      --weight NAME   Import only this weight (Light | Bold). The header still
+      --weight NAME   Import only this weight (Light | Bold | Hud). The header still
                       describes every weight. Use it to add or refresh ONE sheet
                       without rewriting an .uasset you have not locked — .uasset
                       is lockable in .gitattributes, so it is read-only until
@@ -92,7 +95,7 @@ AFTER RUNNING
 
 IN GAME
   Trace.Text.Report            names the face and weights that are actually drawing
-  Trace.Text.Preview           specimen through BOTH renderers, in BOTH weights
+  Trace.Text.Preview           specimen through BOTH renderers, in EVERY face
   -TraceNoFontAtlas            forces the Lato fallback, on purpose
 EOF
 }
@@ -101,7 +104,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --header-only)  DO_EDITOR=0 ;;
         --texture-only) DO_HEADER=0 ;;
-        --weight)       shift; [ $# -gt 0 ] || trace_die "--weight needs a name (Light | Bold)"
+        --weight)       shift; [ $# -gt 0 ] || trace_die "--weight needs a name (Light | Bold | Hud)"
                         ONLY_WEIGHT="$1" ;;
         -n|--dry-run)   DRY_RUN=1 ;;
         -h|--help)      usage; exit 0 ;;
@@ -120,10 +123,13 @@ SRC_DIR="${TRACE_PROJECT_ROOT}/Content/Trace/UI/Fonts/Source"
 #
 # There is deliberately no --thin here. It used to say 4 for the light sheet, from
 # when the light cut was synthesised by eroding Regular; regenerating that way now
-# would put the damaged letterforms back (spec v23 §A3: "Do NOT use --thin").
-ATLASES=("T_FontAtlas" "T_FontAtlasBold")
-WEIGHT_NAMES=("Light" "Bold")
-FONT_FILES=("Sofachrome W05 ExtraLight.ttf" "Sofachrome Rg.otf")
+# would put the damaged letterforms back (spec v23 §A3 and v25 §4: "Do NOT use
+# --thin" — the second attempt deleted ( ) [ ] { } and / while the HUD draws "[E]").
+#
+# APPEND to these arrays, never insert: the index is the ETraceTextWeight value.
+ATLASES=("T_FontAtlas" "T_FontAtlasBold" "T_FontAtlasHud")
+WEIGHT_NAMES=("Light" "Bold" "Hud")
+FONT_FILES=("Sofachrome W05 ExtraLight.ttf" "Sofachrome Rg.otf" "Erbaum-Bold.otf")
 
 for I in "${!ATLASES[@]}"; do
     NAME="${ATLASES[$I]}"
@@ -131,7 +137,7 @@ for I in "${!ATLASES[@]}"; do
         [ -f "$F" ] || trace_die "Missing ${F}
 Generate it first:  python3 Scripts/generate_font_atlas.py --name ${NAME} \\
     --font \"Art/Fonts/${FONT_FILES[$I]}\" --preview
-That needs your own licensed Sofachrome at Art/Fonts/ — see docs/FONTS.md."
+That needs your own licensed copy of the face at Art/Fonts/ — see docs/FONTS.md."
     done
 
     # An LFS pointer is a ~130-byte text file starting with 'version https://'. Handing
@@ -238,5 +244,5 @@ if [ "$MISSING" != "0" ]; then
     exit 1
 fi
 
-trace_msg "Sofachrome is imported (${#ATLASES[@]} weights: ${ATLASES[*]})."
+trace_msg "The atlas is imported (${#ATLASES[@]} faces: ${ATLASES[*]})."
 trace_msg "Next: ./Scripts/build.sh, then in game: Trace.Text.Report / Trace.Text.Preview"

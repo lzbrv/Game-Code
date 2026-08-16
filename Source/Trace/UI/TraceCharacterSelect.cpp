@@ -708,10 +708,16 @@ namespace TraceCharacterSelectType
 	}
 
 	/**
-	 * How many lines @p Text would wrap to at @p Scale in @p MaxWidth. Same greedy walk as DrawWrapped,
+	 * How many lines @p Text would wrap to at @p Scale in @p MaxWidth. Same greedy walk as WrapDraw,
 	 * so the count and the draw cannot disagree.
+	 *
+	 * @param Weight  MUST be the weight the paragraph will be DRAWN in. The faces do not share
+	 *                advances, so a count taken in one face is a count of a different paragraph:
+	 *                Erbaum is about 30% narrower than the light cut, and a fit-to-column search
+	 *                that measured light would step the body size down further than it needs to.
 	 */
-	int32 WrapLines(AHUD* HUD, const FString& Text, float MaxWidth, UFont* Font, float Scale)
+	int32 WrapLines(AHUD* HUD, const FString& Text, float MaxWidth, UFont* Font, float Scale,
+		ETraceTextWeight Weight = ETraceTextWeight::Light)
 	{
 		TArray<FString> Words;
 		Text.ParseIntoArray(Words, TEXT(" "), /*InCullEmpty=*/true);
@@ -722,7 +728,7 @@ namespace TraceCharacterSelectType
 		for (const FString& Word : Words)
 		{
 			const FString Candidate = Line.IsEmpty() ? Word : (Line + TEXT(" ") + Word);
-			if (!Line.IsEmpty() && Width(HUD, Candidate, Font, Scale, 0.f) > MaxWidth)
+			if (!Line.IsEmpty() && Width(HUD, Candidate, Font, Scale, 0.f, Weight) > MaxWidth)
 			{
 				++Lines;
 				Line = Word;
@@ -734,6 +740,88 @@ namespace TraceCharacterSelectType
 		}
 
 		return Lines + (Line.IsEmpty() ? 0 : 1);
+	}
+
+	/**
+	 * THE ONE WORD-WRAP ON THIS SCREEN. FTraceCharacterSelect::DrawWrapped is a thin call into it.
+	 *
+	 * It moved here from that member function for one reason: spec v25 §4 puts the ability
+	 * DESCRIPTIONS in a different face from everything around them, and the member's signature is
+	 * declared in TraceCharacterSelect.h, which this pass does not own. Rather than grow a second
+	 * greedy walk beside the first — two wrap algorithms that would drift the first time either was
+	 * touched — the algorithm lives here with a weight on the end and both callers reach it.
+	 *
+	 * @param Weight  the face to measure AND draw in. Both, from the same argument, because a wrap
+	 *                that measured one face and drew another would break its lines in the wrong
+	 *                places and overflow the column — silently, since a wrapped paragraph has no
+	 *                obvious right edge to overrun.
+	 */
+	float WrapDraw(AHUD* HUD, const FString& Text, const FLinearColor& Color,
+		float X, float Y, float MaxWidth, UFont* Font, float Scale, float LineGap,
+		ETraceTextWeight Weight = ETraceTextWeight::Light)
+	{
+		// Greedy word wrap: measure a candidate line and back off one word. Exact rather than
+		// approximate for the engine's bitmap fonts (no shaping, no kerning), and near enough for a
+		// proportional face — there is no script here where adding a word makes a line narrower.
+		//
+		// See the parameter-convention block above: Font == nullptr means the menu typeface and Scale
+		// is a POINT SIZE.
+		TArray<FString> Words;
+		Text.ParseIntoArray(Words, TEXT(" "), /*InCullEmpty=*/true);
+
+		const float LineH = LineHeight(HUD, Font, Scale);
+		float CursorY = Y;
+		FString Line;
+
+		for (const FString& Word : Words)
+		{
+			const FString Candidate = Line.IsEmpty() ? Word : (Line + TEXT(" ") + Word);
+			if (!Line.IsEmpty() && Width(HUD, Candidate, Font, Scale, 0.f, Weight) > MaxWidth)
+			{
+				Draw(HUD, Line, Color, X, CursorY, Font, Scale, 0.f, Weight);
+				CursorY += LineH + LineGap;
+				Line = Word;
+			}
+			else
+			{
+				Line = Candidate;
+			}
+		}
+
+		if (!Line.IsEmpty())
+		{
+			Draw(HUD, Line, Color, X, CursorY, Font, Scale, 0.f, Weight);
+			CursorY += LineH + LineGap;
+		}
+
+		return CursorY;
+	}
+
+	/**
+	 * THE FACE THE ABILITY DESCRIPTIONS ARE SET IN (spec v25 §4).
+	 *
+	 *     "Use Erbaum Bold for in game hud and character ability descriptions"
+	 *
+	 * The three prose paragraphs — MOVEMENT, PASSIVE, ACTIVATED — and nothing else on this screen.
+	 * The character NAME stays Sofachrome Regular (v23 §A3, restated by v25 §4), the headings, the
+	 * keycaps, the cooldown chip, the status line and the footer stay in the light default. That is
+	 * the owner's instruction read literally: the DESCRIPTION text changes, the screen does not.
+	 *
+	 * Shares Trace.HUD.Text.Erbaum with the in-match HUD deliberately — one switch puts both halves
+	 * of the §4 change back to the pre-v25 face for a same-binary before/after, and two switches
+	 * would let a capture show one half changed and read as the whole thing.
+	 */
+	static ETraceTextWeight DescriptionWeight()
+	{
+		// Looked up rather than cached in a static. The arm is declared in UI/TraceHUD.cpp and this is
+		// a different translation unit, so a cached pointer would bake in whatever the answer was on
+		// the first frame this screen ever drew — including "not registered yet" — and the red arm
+		// would then be dead for the rest of the process. Called once per card per frame; a console
+		// lookup is a hash probe.
+		const IConsoleVariable* Arm =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.HUD.Text.Erbaum"));
+		const bool bErbaum = (Arm == nullptr) || (Arm->GetInt() != 0);
+		return bErbaum ? ETraceTextWeight::Hud : ETraceTextWeight::Light;
 	}
 }
 
@@ -1984,6 +2072,12 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		const float AbilityRowH = (30.f * S) + (14.f * S);
 		const float PanelBottom = PanelY + PanelH - Pad;
 
+		// SPEC v25 §4 — the ability DESCRIPTIONS, and only they, are set in Erbaum Bold. Resolved ONCE
+		// for the card so the fit-to-column search below and the three draws underneath it cannot
+		// disagree about the face: they do not share advances, and a search that measured one face
+		// while the draws used another would pick a size for a paragraph nobody is going to see.
+		const ETraceTextWeight BodyWeight = TraceCharacterSelectType::DescriptionWeight();
+
 		float BodySize = TraceSelectLayout::SizeBody * S;
 		float BodyGap = 7.f * S;
 		{
@@ -1998,9 +2092,9 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 				const float ActivatedRoom = PlainRoom - AbilityRowH;
 
 				const bool bFits =
-					TraceCharacterSelectType::WrapLines(HUD, MovementText, ColumnW, nullptr, TrySize) * TryLineH <= PlainRoom &&
-					TraceCharacterSelectType::WrapLines(HUD, PassiveText, ColumnW, nullptr, TrySize) * TryLineH <= PlainRoom &&
-					TraceCharacterSelectType::WrapLines(HUD, ActivatedText, ColumnW, nullptr, TrySize) * TryLineH <= ActivatedRoom;
+					TraceCharacterSelectType::WrapLines(HUD, MovementText, ColumnW, nullptr, TrySize, BodyWeight) * TryLineH <= PlainRoom &&
+					TraceCharacterSelectType::WrapLines(HUD, PassiveText, ColumnW, nullptr, TrySize, BodyWeight) * TryLineH <= PlainRoom &&
+					TraceCharacterSelectType::WrapLines(HUD, ActivatedText, ColumnW, nullptr, TrySize, BodyWeight) * TryLineH <= ActivatedRoom;
 
 				BodySize = TrySize;
 				BodyGap = TryGap;
@@ -2013,13 +2107,15 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 
 		{
 			float Y = DrawHeading(TEXT("MOVEMENT"), TraceSelectStyle::Cyan, ColumnsX, ColumnsY);
-			DrawWrapped(HUD, MovementText, BodyColor, ColumnsX, Y, ColumnW, nullptr, BodySize, BodyGap);
+			TraceCharacterSelectType::WrapDraw(HUD, MovementText, BodyColor, ColumnsX, Y, ColumnW,
+				nullptr, BodySize, BodyGap, BodyWeight);
 		}
 
 		{
 			const float X = ColumnsX + ColumnW + ColumnGap;
 			float Y = DrawHeading(TEXT("PASSIVE"), TraceSelectStyle::Cyan, X, ColumnsY);
-			DrawWrapped(HUD, PassiveText, BodyColor, X, Y, ColumnW, nullptr, BodySize, BodyGap);
+			TraceCharacterSelectType::WrapDraw(HUD, PassiveText, BodyColor, X, Y, ColumnW,
+				nullptr, BodySize, BodyGap, BodyWeight);
 		}
 
 		// ---- ACTIVATED — spec v20 §6.5 -----------------------------------------------------------
@@ -2051,7 +2147,8 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 				TraceSelectLayout::SizeLead * S, TraceSelectLayout::TrackName * S);
 
 			Y += RowH + (14.f * S);
-			DrawWrapped(HUD, ActivatedText, BodyColor, X, Y, ColumnW, nullptr, BodySize, BodyGap);
+			TraceCharacterSelectType::WrapDraw(HUD, ActivatedText, BodyColor, X, Y, ColumnW,
+				nullptr, BodySize, BodyGap, BodyWeight);
 		}
 	}
 
@@ -2401,41 +2498,11 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 float FTraceCharacterSelect::DrawWrapped(AHUD* HUD, const FString& Text, const FLinearColor& Color,
 	float X, float Y, float MaxWidth, UFont* Font, float Scale, float LineGap)
 {
-	// Greedy word wrap: measure a candidate line and back off one word. Exact rather than approximate
-	// for the engine's bitmap fonts (no shaping, no kerning), and near enough for a proportional face —
-	// there is no script here where adding a word makes a line narrower.
-	//
-	// See the parameter-convention block above TraceCharacterSelectType: Font == nullptr means the menu
-	// typeface and Scale is a POINT SIZE.
-	TArray<FString> Words;
-	Text.ParseIntoArray(Words, TEXT(" "), /*InCullEmpty=*/true);
-
-	const float LineH = TraceCharacterSelectType::LineHeight(HUD, Font, Scale);
-	float CursorY = Y;
-	FString Line;
-
-	for (const FString& Word : Words)
-	{
-		const FString Candidate = Line.IsEmpty() ? Word : (Line + TEXT(" ") + Word);
-		if (!Line.IsEmpty() && TraceCharacterSelectType::Width(HUD, Candidate, Font, Scale, 0.f) > MaxWidth)
-		{
-			TraceCharacterSelectType::Draw(HUD, Line, Color, X, CursorY, Font, Scale, 0.f);
-			CursorY += LineH + LineGap;
-			Line = Word;
-		}
-		else
-		{
-			Line = Candidate;
-		}
-	}
-
-	if (!Line.IsEmpty())
-	{
-		TraceCharacterSelectType::Draw(HUD, Line, Color, X, CursorY, Font, Scale, 0.f);
-		CursorY += LineH + LineGap;
-	}
-
-	return CursorY;
+	// The algorithm lives in TraceCharacterSelectType::WrapDraw so that the ability descriptions can
+	// run the SAME greedy walk in a different face — see the note there. This overload keeps meaning
+	// exactly what it meant: the light default, for the status line and anything else the header's
+	// signature reaches.
+	return TraceCharacterSelectType::WrapDraw(HUD, Text, Color, X, Y, MaxWidth, Font, Scale, LineGap);
 }
 
 void FTraceCharacterSelect::DrawFrame(AHUD* HUD, float X, float Y, float W, float H, const FLinearColor& Color)

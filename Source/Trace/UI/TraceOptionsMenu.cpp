@@ -3,19 +3,16 @@
 #include "UI/TraceOptionsMenu.h"
 
 #include "Camera/CameraComponent.h"
-#include "CanvasTypes.h"                 // FCanvas - the foreground surface, see FTraceOverSlateCanvas
 #include "Containers/Ticker.h"          // FTSTicker - defer the viewport resize out of DrawHUD
 #include "DynamicRHI.h"                  // RHIGetGPUFrameCycles
-#include "Engine/Canvas.h"               // UCanvas::Canvas, the pointer this file swaps
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
-#include "Engine/GameViewportClient.h"   // GEngine->GameViewport->Viewport->GetDebugCanvas()
 #include "Engine/Texture2D.h"            // the artist's sprites - see the art block below
 #include "TextureResource.h"             // FTextureResource::TextureRHI - see IsDrawable
 #include "GameFramework/HUD.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
-#include "HAL/IConsoleManager.h"         // Trace.UI.ModalOverSlate - spec v23 §A2's red arm
+#include "HAL/IConsoleManager.h"         // Trace.Menu.Settings / Trace.Menu.Video, the capture hooks
 #include "HAL/PlatformTime.h"
 #include "Misc/CommandLine.h"            // -TraceMenuActivate, the paused-world capture hook
 #include "Misc/Parse.h"
@@ -24,7 +21,6 @@
 #include "Trace.h"                       // LogTraceGame
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
-#include "UnrealClient.h"                // FViewport::GetDebugCanvas - the foreground surface
 
 // =================================================================================================
 // WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
@@ -89,369 +85,14 @@
 // =================================================================================================
 
 // =================================================================================================
-// SPEC v23 §A2 — THE FOREGROUND CANVAS
+// SPEC v25 §1 — THE FOREGROUND-CANVAS ELEVATION IS REMOVED.
 //
-// The argument for all of this is in the header, above FTraceOverSlateCanvas. What is worth having
-// next to the code is the list of things that were CHECKED rather than assumed, because every one of
-// them would have shown up as a subtly wrong screen rather than as a failure:
-//
-//  * COORDINATE SPACE. *** THIS ENTRY WAS WRONG, AND SPEC v24 §1 IS THE CRASH IT CAUSED. ***
-//    `FViewport::Draw` builds the scene canvas with `ShouldDPIScaleSceneCanvas() ? GetDPIScale() : 1`
-//    and `FDebugCanvasDrawer::InitDebugCanvas` builds the foreground one with `GetDPIScale()`. This
-//    entry used to claim "`UGameViewportClient` does not override that predicate, so both carry the
-//    same base transform and a pixel is a pixel on either". It does not override it because it
-//    INHERITS an override — `FGameplayViewportClient::ShouldDPIScaleSceneCanvas()` returns false —
-//    so the two canvases carry DIFFERENT transforms whenever the window's DPI scale is not 1.
-//    Invisible in a shipped game window at 100%; a hard crash in PIE on a Retina display. The
-//    premise is now CHECKED rather than asserted, in Resolve(), where the argument is written out.
-//
-//  * THE TWO TRANSFORMS THE HUD PATH PUSHES AND THIS ONE DOES NOT. `UGameViewportClient::Draw`
-//    pushes `FTranslationMatrix(CanvasOrigin)` on the scene canvas and calls
-//    `UCanvas::ApplySafeZoneTransform()`. CanvasOrigin is `View->UnscaledViewRect.Min`, which is
-//    (0,0) for a single full-screen player — this game never splits the screen on a menu — and the
-//    safe-zone call returns immediately when the padding is zero, which it is on desktop. Both are
-//    therefore identity here. A split-screen or console port would have to revisit this.
-//
-//  * FLUSHING. The foreground canvas is created with `SetAllowedModes(Allow_DeleteOnRender)`, i.e.
-//    without Allow_Flush. `FCanvas::Flush_GameThread` returns early rather than asserting when the
-//    mode is absent, and nothing on the drawing path below calls it: every draw here batches, the
-//    same way it batches on the scene canvas.
-//
-//  * WHAT ELSE SHARES THE SURFACE. `DrawStatsHUD` and `UConsole::PostRender_Console` draw into it
-//    AFTER the HUD, so `stat fps` and the console still land on top of the modal rather than under
-//    it. That ordering is the engine's and it is the one we want.
+// `FTraceOverSlateCanvas`, `TraceOptionsMenuOverSlate`, `Trace.UI.ModalOverSlate` and
+// `Trace.UI.ModalDPIGuard` all lived here. The whole argument — what the elevation was, what it
+// crashed, the two arms that proved it, and what removing it costs — is written out in the header,
+// above FTraceOptionsMenu. It is not repeated here because there is no longer any code here for it
+// to explain: the panel draws on the canvas the host handed it, the way it did before spec v23 §A2.
 // =================================================================================================
-
-namespace TraceOptionsMenuOverSlate
-{
-	/**
-	 * `Trace.UI.ModalOverSlate 0|1` — the red arm for spec v23 §A2.
-	 *
-	 * 1 (default): the settings overlay and the JOIN prompt draw on the foreground canvas, so the
-	 * UMG title screen (or the in-match UMG HUD) stays up behind them and the player never sees the
-	 * renderer change.
-	 *
-	 * 0: the pre-v23 behaviour — the modal draws on the scene canvas, and because that is composited
-	 * UNDER Slate, ATraceMenuHUD has to collapse its widget and fall back to the old Canvas title
-	 * screen for as long as the modal is up. That is the defect, reproducible from the shipping
-	 * binary, which is the only way a screenshot of the fix means anything.
-	 */
-	static int32 GOverSlate = 1;
-	static FAutoConsoleVariableRef CVarModalOverSlate(
-		TEXT("Trace.UI.ModalOverSlate"),
-		GOverSlate,
-		TEXT("1 = DEFAULT. Canvas modals (SETTINGS, the pause menu, the JOIN prompt) draw on the\n")
-		TEXT("    engine's foreground canvas, which Slate paints ON TOP of the UMG screens. The title\n")
-		TEXT("    screen stays up behind them.\n")
-		TEXT("0 = pre-v23: modals draw under Slate, so the UMG title screen stands down and the old\n")
-		TEXT("    Canvas one draws instead for those frames. This is the red arm - it reproduces the\n")
-		TEXT("    58.8%-of-the-screen renderer swap that spec v23 A2 was raised for.\n")
-		TEXT("-TraceModalUnderSlate on the command line is the same 0, available before the first frame."),
-		ECVF_Default);
-
-	/**
-	 * `Trace.UI.ModalDPIGuard 0|1` — THE RED ARM FOR THE SPEC v24 §1 FIX ITSELF.
-	 *
-	 * Trace.UI.ModalOverSlate is the red arm for the v23 ELEVATION; it cannot be the red arm for this
-	 * fix, because setting it to 0 removes the elevation and therefore removes the crash — it proves
-	 * the surface was involved and says nothing about whether the DPI check is what is holding the
-	 * crash off now.
-	 *
-	 * This one keeps the elevation and skips ONLY the DPI comparison, so a single shipping binary
-	 * produces both arms of the v24 §1 evidence on the same harness:
-	 *
-	 *     PIE, default                        -> declines to elevate, SETTINGS opens, no crash
-	 *     PIE, Trace.UI.ModalDPIGuard 0       -> elevates at 1.00-vs-2.00, SIGSEGV on the render
-	 *                                            thread, ~80 ms after the panel first draws
-	 *
-	 * It exists because this project has shipped a harness that could not fail, and a fix whose only
-	 * evidence is "the crash stopped happening" is indistinguishable from a fix that merely moved the
-	 * timing. Leave it at 1 anywhere a player can reach.
-	 */
-	static int32 GDPIGuard = 1;
-	static FAutoConsoleVariableRef CVarModalDPIGuard(
-		TEXT("Trace.UI.ModalDPIGuard"),
-		GDPIGuard,
-		TEXT("1 = DEFAULT. A Canvas modal refuses to elevate onto the foreground canvas when that\n")
-		TEXT("    canvas's DPI scale differs from the scale this frame was laid out at. This is the\n")
-		TEXT("    spec v24 1 fix: in PIE the engine builds the two canvases at 1.00 and 2.00 and\n")
-		TEXT("    drawing across the gap crashes the render thread.\n")
-		TEXT("0 = skip the comparison and elevate anyway. THE RED ARM - it reproduces the PIE settings\n")
-		TEXT("    crash from this same binary. Not for players."),
-		ECVF_Default);
-
-	/**
-	 * `-TraceModalUnderSlate` — the same red arm, on the command line, and it has to exist.
-	 *
-	 * A cvar set with -ExecCmds arrives during engine init, which is after the first title screen has
-	 * already decided which renderer to build; the same reasoning is written out above
-	 * TraceMenuHUDFile::WantsUMG, which reads its switches off FCommandLine for exactly that reason.
-	 * It also keeps the harness free of quoted arguments with spaces in them, which do not survive
-	 * argv -> FCommandLine reconstruction reliably.
-	 *
-	 * Parsed once: this is asked twice a frame, and a linear scan of the command line in front of a
-	 * paused match would be its own small crime.
-	 */
-	static bool WantsOverSlate()
-	{
-		static const bool bForcedUnder = FParse::Param(FCommandLine::Get(), TEXT("TraceModalUnderSlate"));
-		return !bForcedUnder && GOverSlate != 0;
-	}
-
-	/** One line naming the surface and the reason. Read by the log and by the menu's verifier. */
-	static FString GStatus = TEXT("FOREGROUND - not yet decided this session.");
-
-	/**
-	 * The literal GStatus was last built from, or null when it was formatted.
-	 *
-	 * Resolve() runs up to twice a frame — once for the host's decision, once for the modal's own
-	 * scope — and an unconditional FString assignment there is an allocation and an 80-character copy
-	 * 120 times a second for a string nobody reads unless something changed. The literals have stable
-	 * addresses, so a pointer compare answers "same reason as last time?" exactly.
-	 */
-	static const TCHAR* GStatusLiteral = nullptr;
-
-	static void SetStatus(const TCHAR* Text)
-	{
-		if (GStatusLiteral != Text)
-		{
-			GStatusLiteral = Text;
-			GStatus = Text;
-		}
-	}
-
-	/**
-	 * The engine's own canvases, by the names `UGameViewportClient::Draw` gives them.
-	 *
-	 * FindObject and not a member, for the same reason TraceCanvasText::GameCanvas does it: this
-	 * class is not a UObject and must not hold a UObject reference across a frame, and the HUD's own
-	 * `Canvas` / `DebugCanvas` members are PROTECTED, so a plain C++ class holding an AHUD* cannot
-	 * read them. The names are stable engine constants ("CanvasObject", GameViewportClient.cpp:1529;
-	 * "DebugCanvasObject", :1528) and the whole Sofachrome Canvas path already depends on the first
-	 * of them.
-	 */
-	static UCanvas* FindGameCanvas()
-	{
-		return FindObject<UCanvas>(GetTransientPackage(), TEXT("CanvasObject"));
-	}
-
-	/** The FCanvas Slate paints in front of the UI, or null when there is no viewport to ask. */
-	static FCanvas* FindForegroundCanvas()
-	{
-		if (GEngine == nullptr || GEngine->GameViewport == nullptr)
-		{
-			return nullptr;
-		}
-		FViewport* Viewport = GEngine->GameViewport->Viewport;
-		return (Viewport != nullptr) ? Viewport->GetDebugCanvas() : nullptr;
-	}
-
-	/**
-	 * SPEC v24 §1 — one line of forensics about the two surfaces, printed once per distinct answer.
-	 *
-	 * This exists because the v23 §A2 status string says only WHICH surface was chosen, and the
-	 * PIE crash is not about the choice — it is about what the chosen surface is made of. The two
-	 * numbers that matter are the two render-target sizes: the scene canvas draws into the viewport
-	 * this frame is being composited for, and the foreground canvas draws into whatever
-	 * FDebugCanvasDrawer last handed Slate. In a standalone game those are the same rectangle. Under
-	 * PIE they need not be, and a mismatch is the difference between "in front of Slate" and "into a
-	 * target of a different size that somebody else owns".
-	 */
-	static void LogSurfaceDetail(const UCanvas* GameCanvas, const FCanvas* Scene, const FCanvas* Foreground)
-	{
-		auto TargetSize = [](const FCanvas* C) -> FIntPoint
-		{
-			if (C == nullptr)
-			{
-				return FIntPoint(-1, -1);
-			}
-			const FRenderTarget* RT = C->GetRenderTarget();
-			return (RT != nullptr) ? RT->GetSizeXY() : FIntPoint(-2, -2);
-		};
-
-		const FIntPoint SceneSize = TargetSize(Scene);
-		const FIntPoint ForeSize = TargetSize(Foreground);
-
-		FIntPoint ViewportSize(-1, -1);
-		if (GEngine != nullptr && GEngine->GameViewport != nullptr && GEngine->GameViewport->Viewport != nullptr)
-		{
-			ViewportSize = GEngine->GameViewport->Viewport->GetSizeXY();
-		}
-
-		UE_LOG(LogTraceGame, Display,
-			TEXT("[Options] Surface detail: editor=%d | UCanvas %dx%d | scene FCanvas=%p rt=%dx%d dpi=%.2f ")
-			TEXT("| foreground FCanvas=%p rt=%dx%d dpi=%.2f modes=0x%x | viewport %dx%d"),
-			GIsEditor ? 1 : 0,
-			(GameCanvas != nullptr) ? GameCanvas->SizeX : -1,
-			(GameCanvas != nullptr) ? GameCanvas->SizeY : -1,
-			Scene, SceneSize.X, SceneSize.Y, (Scene != nullptr) ? Scene->GetDPIScale() : -1.f,
-			Foreground, ForeSize.X, ForeSize.Y,
-			(Foreground != nullptr) ? Foreground->GetDPIScale() : -1.f,
-			(Foreground != nullptr) ? Foreground->GetAllowedModes() : 0u,
-			ViewportSize.X, ViewportSize.Y);
-	}
-
-	/**
-	 * Resolves both surfaces and says whether the swap is on.
-	 *
-	 * @param OutGameCanvas   the UCanvas whose FCanvas would be swapped, when the answer is true.
-	 * @param OutForeground   the FCanvas it would be swapped to.
-	 */
-	static bool Resolve(const AHUD* InHUD, float InViewW, float InViewH,
-		UCanvas*& OutGameCanvas, FCanvas*& OutForeground)
-	{
-		OutGameCanvas = nullptr;
-		OutForeground = nullptr;
-
-		if (InHUD == nullptr || !WantsOverSlate())
-		{
-			SetStatus((InHUD == nullptr)
-				? TEXT("SCENE - no HUD to draw through.")
-				: TEXT("SCENE - Trace.UI.ModalOverSlate 0 / -TraceModalUnderSlate (the v23 A2 red arm)."));
-			return false;
-		}
-
-		UCanvas* GameCanvas = FindGameCanvas();
-		if (GameCanvas == nullptr || GameCanvas->Canvas == nullptr)
-		{
-			// Between frames the UCanvas still exists with no FCanvas behind it. Not an error.
-			SetStatus(TEXT("SCENE - the game canvas is not mid-draw."));
-			return false;
-		}
-
-		// IDENTITY, not availability. A canvas of a different size is not the canvas this frame is
-		// being drawn through — a stale one from a viewport that has since been resized, say — and
-		// swapping it would send AHUD::DrawRect to one surface and TraceCanvasText to another. The
-		// tolerance is a pixel because both numbers come from the same int.
-		if (FMath::Abs(static_cast<float>(GameCanvas->SizeX) - InViewW) > 1.f
-			|| FMath::Abs(static_cast<float>(GameCanvas->SizeY) - InViewH) > 1.f)
-		{
-			GStatusLiteral = nullptr;
-			GStatus = FString::Printf(
-				TEXT("SCENE - the game canvas is %dx%d but this frame is %.0fx%.0f."),
-				GameCanvas->SizeX, GameCanvas->SizeY, InViewW, InViewH);
-			return false;
-		}
-
-		FCanvas* Foreground = FindForegroundCanvas();
-		if (Foreground == nullptr || Foreground == GameCanvas->Canvas)
-		{
-			SetStatus(TEXT("SCENE - this viewport has no foreground canvas."));
-			return false;
-		}
-
-		// Once per process, and HERE rather than on the success path below, because the answer this
-		// line exists to explain is the one where elevation is DECLINED. Printed before the check it
-		// informs, so a log from a machine nobody can attach a debugger to still carries both DPI
-		// scales and both render-target sizes.
-		static bool bDetailLogged = false;
-		if (!bDetailLogged)
-		{
-			bDetailLogged = true;
-			LogSurfaceDetail(GameCanvas, GameCanvas->Canvas, Foreground);
-		}
-
-		// =========================================================================================
-		// SPEC v24 §1 — THE TWO SURFACES MUST AGREE ABOUT WHAT A PIXEL IS. *** THE PIE CRASH. ***
-		//
-		// This check is the whole of the v24 §1 fix, and the sentence it replaces was the whole of
-		// the bug. Spec v23 §A2 argued the elevation was safe because "`UGameViewportClient` does
-		// not override [ShouldDPIScaleSceneCanvas], so both carry the same base transform and a
-		// pixel is a pixel on either". **That is false.** UGameViewportClient does not need to
-		// override it: it INHERITS an override.
-		//
-		//     UGameViewportClient : UScriptViewportClient : UObject, FGameplayViewportClient
-		//     bool FGameplayViewportClient::ShouldDPIScaleSceneCanvas() const { return false; }
-		//         // "Scene View Family does its own DPI scaling"
-		//
-		// So the engine builds the two canvases with DELIBERATELY DIFFERENT DPI scales, from the
-		// same viewport client, on the same frame:
-		//
-		//     scene       FViewport::Draw          ShouldDPIScaleSceneCanvas() ? GetDPIScale() : 1
-		//                                          -> always 1 for a game viewport
-		//     foreground  FDebugCanvasDrawer::     GetDPIScale()
-		//                 InitDebugCanvas          -> the window's real DPI scale
-		//
-		// On a display at 100% those are both 1 and nothing shows. MEASURED on this machine, same
-		// binary, same overlay, one switch apart:
-		//
-		//     standalone -game   scene dpi=1.00  foreground dpi=1.00   -> opens, no crash
-		//     PIE (editor)       scene dpi=1.00  foreground dpi=2.00   -> SIGSEGV, ~80 ms later,
-		//                                                                on the render thread
-		//
-		// That is exactly why eleven standalone runs could not catch this and why the owner sees it
-		// every time: the editor window is high-DPI aware and a shipped game window on this machine
-		// is not. Elevated, every rectangle this page lays out for a 2744x1706 surface is handed to
-		// a canvas that multiplies it by two before it reaches a 2744x1706 render target.
-		//
-		// The test is RELATIVE — the foreground canvas is compared against the canvas THIS FRAME IS
-		// BEING DRAWN THROUGH, not against 1.0, not against "is this the editor". A hardcoded 1.0
-		// would break the moment a game window became DPI-aware; an `if (GIsEditor)` would refuse to
-		// elevate in a PIE session on a 100% display where the premise holds perfectly well. Compare
-		// the two surfaces and the answer stays correct wherever the engine moves either of them.
-		//
-		// Failing this is not a degraded mode: IsAvailable() answers the same, so ATraceMenuHUD
-		// stands its widget down on the same frame and the modal draws on the scene canvas exactly
-		// where it drew before v23 — correct, visible, and on the surface it was laid out for.
-		// =========================================================================================
-		const float SceneDPI = GameCanvas->Canvas->GetDPIScale();
-		const float ForegroundDPI = Foreground->GetDPIScale();
-		if (GDPIGuard != 0 && !FMath::IsNearlyEqual(SceneDPI, ForegroundDPI, 0.01f))
-		{
-			GStatusLiteral = nullptr;
-			GStatus = FString::Printf(
-				TEXT("SCENE - the foreground canvas is DPI %.2f but this frame is laid out at DPI ")
-				TEXT("%.2f; one pixel is not one pixel on both, so the modal stays on the surface it ")
-				TEXT("was measured for (spec v24 1)."),
-				ForegroundDPI, SceneDPI);
-			return false;
-		}
-
-		SetStatus(TEXT("FOREGROUND - the modal draws in front of Slate; UMG screens stay up behind it."));
-		OutGameCanvas = GameCanvas;
-		OutForeground = Foreground;
-		return true;
-	}
-}
-
-FTraceOverSlateCanvas::FTraceOverSlateCanvas(AHUD* InHUD, float InViewW, float InViewH)
-{
-	UCanvas* GameCanvas = nullptr;
-	FCanvas* Foreground = nullptr;
-	if (!TraceOptionsMenuOverSlate::Resolve(InHUD, InViewW, InViewH, GameCanvas, Foreground))
-	{
-		return;
-	}
-
-	Surface = GameCanvas;
-	SavedCanvas = GameCanvas->Canvas;
-	GameCanvas->Canvas = Foreground;
-	bElevated = true;
-}
-
-FTraceOverSlateCanvas::~FTraceOverSlateCanvas()
-{
-	// Unconditional, and it must stay that way: the scene canvas is what every OTHER drawer on this
-	// frame — the in-match HUD, the character select, the engine's own subtitle pass — expects to
-	// find behind that pointer. Leaving the foreground one in place would move the whole game's
-	// drawing in front of Slate the moment somebody opened SETTINGS.
-	if (bElevated && Surface != nullptr)
-	{
-		Surface->Canvas = SavedCanvas;
-	}
-}
-
-bool FTraceOverSlateCanvas::IsAvailable(const AHUD* InHUD, float InViewW, float InViewH)
-{
-	UCanvas* GameCanvas = nullptr;
-	FCanvas* Foreground = nullptr;
-	return TraceOptionsMenuOverSlate::Resolve(InHUD, InViewW, InViewH, GameCanvas, Foreground);
-}
-
-const FString& FTraceOverSlateCanvas::LastStatus()
-{
-	return TraceOptionsMenuOverSlate::GStatus;
-}
 
 namespace TraceOptionsMenuType
 {
@@ -1496,26 +1137,7 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	//
 	// Nothing below branches on the answer. When it is false the panel draws precisely where it drew
 	// before, and it is the HOST that adapts (see ATraceMenuHUD::DrawHUD).
-	const FTraceOverSlateCanvas OverSlate(HUD, ViewW, ViewH);
-	LogSurfaceOnce(OverSlate.IsElevated());
-
 	Draw(HUD);
-}
-
-void FTraceOptionsMenu::LogSurfaceOnce(bool bElevated) const
-{
-	// Once per process per answer. This is the line that says whether the fix is live in a session
-	// somebody else is looking at, and it has to be greppable out of a log without a debugger — a
-	// modal that quietly fell back to the scene canvas looks like a modal that works, right up until
-	// somebody notices the title screen behind it changed design.
-	static int32 LastLogged = -1;
-	const int32 Answer = bElevated ? 1 : 0;
-	if (LastLogged != Answer)
-	{
-		LastLogged = Answer;
-		UE_LOG(LogTraceGame, Display, TEXT("[Options] Modal surface: %s"),
-			*FTraceOverSlateCanvas::LastStatus());
-	}
 }
 
 #if !UE_BUILD_SHIPPING

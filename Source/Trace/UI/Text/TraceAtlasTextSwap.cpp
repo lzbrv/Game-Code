@@ -93,7 +93,7 @@ namespace TraceAtlasTextSwapFile
 }
 
 FTraceAtlasLabel TraceAtlasTextSwap::Install(UUserWidget* Owner, UTextBlock* Source,
-	float InMaxWidth, float SizeScale)
+	float InMaxWidth, float SizeScale, ETraceTextWeight InWeight)
 {
 	FTraceAtlasLabel Label;
 
@@ -120,15 +120,19 @@ FTraceAtlasLabel TraceAtlasTextSwap::Install(UUserWidget* Owner, UTextBlock* Sou
 	const FSlateFontInfo SourceFont = Source->GetFont();
 	const float BaseSize = FMath::Max(1.f, SourceFont.Size * FMath::Max(0.01f, SizeScale));
 
+	// "_Atlas", not "_Sofachrome": since spec v25 §4 the face depends on InWeight and the HUD corner
+	// asks for Erbaum, so a name asserting the family would be wrong on exactly the widgets this pass
+	// added. The name shows up in widget-reflector captures, which is where a wrong one misleads.
 	UTraceAtlasText* Atlas = Owner->WidgetTree->ConstructWidget<UTraceAtlasText>(
 		UTraceAtlasText::StaticClass(),
-		FName(*(Source->GetName() + TEXT("_Sofachrome"))));
+		FName(*(Source->GetName() + TEXT("_Atlas"))));
 	if (Atlas == nullptr)
 	{
 		return Label;
 	}
 
 	Atlas->SetSize(BaseSize);
+	Atlas->SetWeight(InWeight);
 	Atlas->SetColor(Source->GetColorAndOpacity().GetSpecifiedColor());
 	Atlas->SetText(Source->GetText().ToString());
 	Atlas->HorizontalAlignment = TraceAtlasTextSwapFile::AlignFromJustification(Source);

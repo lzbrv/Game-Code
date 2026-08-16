@@ -239,12 +239,20 @@ void UTraceAtlasText::SetWeightByName(const FString& InWeightName)
 	{
 		// Not silent: a misspelled weight would otherwise draw light and look exactly like a screen
 		// that was never asked to be bold, which is the failure this whole module is built to avoid.
+		//
+		// The valid names are built from the face table rather than listed, so a fourth face cannot
+		// be added and leave this message quietly recommending three.
+		FString Valid;
+		for (int32 Index = 0; Index < static_cast<int32>(ETraceTextWeight::Count); ++Index)
+		{
+			Valid += FString::Printf(TEXT("%s%s"), Valid.IsEmpty() ? TEXT("") : TEXT(", "),
+				TraceText::WeightName(static_cast<ETraceTextWeight>(Index)));
+		}
+
 		UE_LOG(LogTraceGame, Warning,
 			TEXT("[Text] SetWeightByName(\"%s\") on '%s' matched no weight; leaving it %s. "
-				 "Valid names: %s, %s."),
-			*InWeightName, *GetName(), TraceText::WeightName(Weight),
-			TraceText::WeightName(ETraceTextWeight::Light),
-			TraceText::WeightName(ETraceTextWeight::Bold));
+				 "Valid names: %s."),
+			*InWeightName, *GetName(), TraceText::WeightName(Weight), *Valid);
 		return;
 	}
 

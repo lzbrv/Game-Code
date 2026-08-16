@@ -203,11 +203,16 @@ void UTraceHudCornerWidget::InstallAtlasLabels()
 	}
 	bAtlasLabelsInstalled = true;
 
+	// ETraceTextWeight::Hud — Erbaum Bold, spec v25 §4. This corner IS the in-match HUD; it is only
+	// UMG rather than Canvas because spec v17 §4 moved it, and a player reading "24 / 30" here and a
+	// clock two hundred pixels away in a different typeface would be the exact "two typefaces one
+	// line apart" complaint spec v23 §A4 already answered once. ATraceHUD::DrawTextLeft and friends
+	// take the same face from TraceHUDType::HudWeight().
 	AtlasLabels.Reset();
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CountText));
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CapacityText));
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AmmoLabelText));
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReloadLabelText));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CountText, 0.f, 1.f, ETraceTextWeight::Hud));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CapacityText, 0.f, 1.f, ETraceTextWeight::Hud));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AmmoLabelText, 0.f, 1.f, ETraceTextWeight::Hud));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReloadLabelText, 0.f, 1.f, ETraceTextWeight::Hud));
 	AtlasLabels.RemoveAll([](const FTraceAtlasLabel& Label) { return !Label.IsValid(); });
 }
 

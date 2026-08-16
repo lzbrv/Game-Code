@@ -202,6 +202,16 @@ public:
 	 */
 	bool CheckEndzoneScoreForCarrier(ATraceCharacter* InCharacter, const TCHAR* Reason);
 
+	/**
+	 * SPEC v25 §2. Gives @p NewPlayer the one-actor channel their pull button travels on.
+	 *
+	 * Called from PostLogin and destroyed in Logout. See ATraceCorePullRelay for why the message
+	 * cannot go on ATraceCore itself: that actor is owned by the Core's HOLDER, and a pull is by
+	 * definition sent by somebody who is not holding it. Idempotent — a reconnect that keeps its
+	 * controller keeps its relay.
+	 */
+	void SpawnPullRelayFor(APlayerController* NewPlayer);
+
 	void RegisterCharacter(ATraceCharacter* InCharacter);
 	void UnregisterCharacter(ATraceCharacter* InCharacter);
 

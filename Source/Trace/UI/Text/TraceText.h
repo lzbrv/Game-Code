@@ -162,6 +162,18 @@ namespace TraceText
 	/** "Sofachrome" or "Lato". Short enough to put on screen next to the specimen it labels. */
 	TRACE_API FString FaceName();
 
+	/**
+	 * The TYPEFACE that @p Weight will actually draw in — "Sofachrome", "Erbaum", or "Lato" when the
+	 * atlas is down. Spec v25 §4 asks for the face to be IDENTIFIED in a screenshot rather than
+	 * asserted from a flag, and a caption that can only say "Sofachrome" cannot do that once one of
+	 * the faces is a different family. Reports the EFFECTIVE face, so a weight that failed to load
+	 * names the face that replaced it rather than the one that was asked for.
+	 */
+	TRACE_API FString FaceName(ETraceTextWeight Weight);
+
+	/** The font FILE behind @p Weight ("Erbaum-Bold.otf"). The unambiguous form, for a log line. */
+	TRACE_API const TCHAR* FaceSourceFile(ETraceTextWeight Weight);
+
 	/** One paragraph: the face, the reason if it is the fallback, and how to force the other path. */
 	TRACE_API FString DescribeFace();
 
@@ -203,18 +215,32 @@ namespace TraceText
 	// METRICS — all in screen pixels at @p Size, and all correct in the fallback too
 	// =============================================================================================
 
-	/** Top of the line box to the next line's top. Identical in both weights, by construction. */
+	/**
+	 * Top of the line box to the next line's top. Identical in EVERY face, by construction —
+	 * Scripts/import_font_atlas.py refuses to emit a metrics header whose sheets disagree about it,
+	 * because this is the number one layout pass advances a multi-line string by.
+	 */
 	TRACE_API float LineHeight(float Size);
 
-	/** Top of the line box down to the baseline. Identical in both weights, by construction. */
-	TRACE_API float Ascent(float Size);
+	/**
+	 * Top of the line box down to the baseline.
+	 *
+	 * *** PER FACE SINCE v25. *** The line box is shared; how a face SPLITS it is not. Erbaum-Bold
+	 * (the Hud face) splits the 116 px box as 93/23 where both Sofachrome cuts split it 95/21, so a
+	 * caller lining a HUD row up by its baseline must pass Hud or sit 2 atlas px out. The default
+	 * argument keeps every existing call site meaning exactly what it meant.
+	 */
+	TRACE_API float Ascent(float Size, ETraceTextWeight Weight = ETraceTextWeight::Light);
+
+	/** Baseline down to the bottom of the line box. Per face, for the same reason as Ascent(). */
+	TRACE_API float Descent(float Size, ETraceTextWeight Weight = ETraceTextWeight::Light);
 
 	/**
 	 * Baseline up to the top of a capital. This is what the artist's word sprites are placed by.
 	 *
-	 * *** THE ONE METRIC THAT REALLY DIFFERS BY WEIGHT. *** Synthesising the light cut erodes rows
-	 * off the top of every capital, so light caps are ~10% shorter than bold ones at the same size
-	 * (59 vs 65 atlas px at an em of 96). Pass the weight you are about to draw in.
+	 * *** DIFFERS BY FACE. *** The two Sofachrome cuts agree at 65 atlas px (em 96); Erbaum's caps
+	 * are 70, because it is a different family and nothing makes families agree. Pass the weight you
+	 * are about to draw in — at HUD sizes that is a whole pixel of cap height.
 	 */
 	TRACE_API float CapHeight(float Size, ETraceTextWeight Weight = ETraceTextWeight::Light);
 

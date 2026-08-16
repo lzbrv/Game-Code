@@ -127,10 +127,21 @@ ACTIONS = [
     ("IA_Crouch", BOOL, HIGHEST, "Crouch. Held: slide on the ground, fast-fall in the air."),
     ("IA_Fire", BOOL, HIGHEST,
      "Fire. Also swings the knife (the weapon component branches on which weapon "
-     "is out) and doubles as 'put me back in' while dead."),
-    ("IA_Pass", BOOL, HIGHEST, "Pass the Core. HELD for 0.5 s while hovering a teammate."),
+     "is out) and doubles as 'put me back in' while dead. While CARRYING the Core "
+     "this is the throw (goals) or the hover-pass (endzones) - spec v25 s7 leaves "
+     "that untouched, which is why the throw needs no default key of its own."),
+    ("IA_Pass", BOOL, HIGHEST,
+     "Throw / pass the Core. SPEC v25 s7: NO DEFAULT KEY - it used to be the right "
+     "mouse button and that bind is removed. It has no row in MAPPINGS below for "
+     "exactly that reason. Mouse 1 throws while carrying; this action is the "
+     "optional second route and stays on the rebind list so a player can bind one."),
     ("IA_Dash", BOOL, HIGHEST, "Dash."),
-    ("IA_Parry", BOOL, HIGHEST, "Parry. Carrier only; a 0.175 s window of trace invulnerability."),
+    ("IA_Parry", BOOL, HIGHEST,
+     "Parry. Carrier only; a 0.175 s window of trace invulnerability. SPEC v25 s7 "
+     "moves it to the RIGHT MOUSE BUTTON. The same press also carries spec v25 s2's "
+     "turnover core-pull, which has no action asset of its own - it is dispatched "
+     "from ATracePlayerController::OnParryStarted, because parry needs you to be "
+     "carrying and the pull needs you not to be, so the two can never both fire."),
     ("IA_Scoreboard", BOOL, HIGHEST, "Scoreboard. Shown while held."),
     ("IA_EquipKnife", BOOL, HIGHEST, "Equip the knife. DIRECT SELECT and idempotent - not a toggle."),
     ("IA_EquipGun", BOOL, HIGHEST, "Equip the gun. DIRECT SELECT and idempotent - not a toggle."),
@@ -152,6 +163,11 @@ ACTIONS = [
 # has rebound something gets THEIR key at runtime; this table is what a fresh
 # install starts from, which is exactly what "generated from the current action
 # table so the defaults are unchanged" means.
+#
+# AN ACTION WITH NO DEFAULT KEY HAS NO ROW HERE, and since spec v25 s7 there is
+# one: IA_Pass. There are therefore FEWER MAPPINGS THAN ACTIONS, which is a
+# supported shape and not a missing line - the count is asserted against
+# ATracePlayerController's own ExpectedMappings table by Trace.Input.VerifyAssets.
 # -----------------------------------------------------------------------------
 SWIZZLE_XY = "swizzle"   # 1D X -> Y, so a single key becomes the forward axis
 NEGATE = "negate"
@@ -174,9 +190,15 @@ MAPPINGS = [
     ("IA_Jump", "SpaceBar", [], ""),
     ("IA_Crouch", "LeftControl", [], ""),
     ("IA_Fire", "LeftMouseButton", [], ""),
-    ("IA_Pass", "RightMouseButton", [], ""),
+    # SPEC v25 s7: IA_Pass HAS NO ROW. It sat here on RightMouseButton until v25
+    # removed that bind; the throw now ships UNBOUND (Default_Pass() returns an
+    # invalid FKey) and an unbound action gets no mapping anywhere - not in
+    # ApplyControlSettings, which skips invalid keys, and not here, because there
+    # is no key name to write. ATracePlayerController's ExpectedMappings table
+    # has had the matching row removed, so Trace.Input.VerifyAssets agrees.
     ("IA_Dash", "LeftShift", [], ""),
-    ("IA_Parry", "Q", [], ""),
+    # SPEC v25 s7: parry moves from Q to the right mouse button. Q is now unclaimed.
+    ("IA_Parry", "RightMouseButton", [], "parry, and spec v25 s2's core-pull"),
     ("IA_Scoreboard", "Tab", [], ""),
     ("IA_EquipKnife", "One", [], ""),
     ("IA_EquipGun", "Two", [], ""),

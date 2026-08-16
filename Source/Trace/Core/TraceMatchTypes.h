@@ -21,8 +21,12 @@
 // ETraceScoringMode : uint8;`, legal because the underlying type is fixed), as TraceCore.h does.
 //
 // What is DEFINED here is everything needed to TALK about that enum — the letter, the name, the
-// blurb, the carry verb, the "?mode=" token. One spelling of "MODE B - GOALS" for the title screen,
-// the HUD and the logs, instead of three that drift.
+// blurb, the carry verb, the "?mode=" token. One spelling of "GOALS" for the title screen, the HUD
+// and the logs, instead of three that drift.
+//
+// SPEC v25 §8 — "goals is just goals, not game mode B" — is a one-line edit in TraceMatchTypes.cpp
+// precisely BECAUSE of that centralisation. The scoreboard footer, the results subtitle and the
+// title screen all read TraceScoringModeLabel(); none of them spells the mode itself.
 
 #pragma once
 
@@ -89,13 +93,24 @@ inline const TCHAR* TraceScoringModeUrlOption = TEXT("mode");
 /** True in mode B — narrow goals, and a Core that is thrown and intercepted. */
 TRACE_API bool TraceIsGoalMode(ETraceScoringMode Mode);
 
-/** "A" / "B" — how the design owner refers to the two modes. */
+/**
+ * "A" / "B" — how the design owner refers to the two modes IN THE NOTES.
+ *
+ * SPEC v25 §8 TOOK THIS OFF THE SCREEN. It is no longer part of any player-visible string; it is
+ * kept because the letters are still what the design notes, the run scripts and the Trace.ModeB.*
+ * console variables are named after, and a future log line has every right to print one.
+ */
 TRACE_API const TCHAR* TraceScoringModeLetter(ETraceScoringMode Mode);
 
 /** "ENDZONES" / "GOALS" — what the mode does, for anyone who has not read the notes. */
 TRACE_API const TCHAR* TraceScoringModeName(ETraceScoringMode Mode);
 
-/** "MODE A - ENDZONES" / "MODE B - GOALS". The full label the menu, the HUD and the logs show. */
+/**
+ * "ENDZONES" / "GOALS". The full label the menu, the HUD and the logs show.
+ *
+ * SPEC v25 §8: this used to read "MODE A - ENDZONES" / "MODE B - GOALS", and the prefix was
+ * manufactured in exactly one place (TraceScoringModeLabel's body). "Goals is just goals."
+ */
 TRACE_API FString TraceScoringModeLabel(ETraceScoringMode Mode);
 
 /** One line of plain English, so the toggle means something before it is committed to. */

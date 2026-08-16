@@ -46,6 +46,9 @@
 #include "Math/UnrealMathUtility.h"             // FMath::SegmentDistToSegmentSafe
 #include "Misc/CommandLine.h"                   // spec v13 §8: -TraceTurnoverRepro= / -TraceLegacyLanding
 #include "Misc/Parse.h"
+#include "Containers/Ticker.h"                  // FTSTicker (Trace.Integ.TurnoverDemo)
+#include "Misc/Paths.h"                         // FPaths::Combine  (Trace.Integ.TurnoverDemo)
+#include "UnrealClient.h"                       // FScreenshotRequest (Trace.Integ.TurnoverDemo)
 #include "UObject/ConstructorHelpers.h"
 #include "UObject/UnrealType.h"                 // FindFProperty / FFloatProperty (mode B settings bridge)
 
@@ -1181,6 +1184,96 @@ static TAutoConsoleVariable<float> CVarModeBCoreMassScale(
 	TEXT("UTraceSettings::CoreMassScale."),
 	ECVF_Default);
 
+// =================================================================================================
+// SPEC v25 §2 — THE TURNOVER WINDOW, THE PULL, AND THE BEAM
+//
+// Verbatim: "Players from the team who dropped the core are locked out of picking it up for 5
+// seconds" / "Pulling the core requires holding down right click while hovering mouse over it (with
+// line of sight) for .3seconds" / "the beam of light coming from the core should change colors to
+// the opposite team and be larger for the 5 seconds".
+//
+// FOUR NUMBERS, and the note names three of them. The fourth (how much larger) is an [ASSUMPTION]
+// and is deliberately a MULTIPLIER rather than a width — Demo 21's standing rule: "larger" is a
+// statement ABOUT THE NORMAL BEAM, so it has to move when the normal beam moves. TraceCoreTuning::
+// BeaconWidth is the base; this scales it.
+//
+// THERE IS NO PULL-SPEED KNOB, and that absence is the point. "Once the core is pulled, it travels
+// towards the player who completed the pull first at full core thrown velocity" names an existing
+// constant, so the delivery reads ATraceCore::GetThrowSpeed() — the same accessor ThrowFromHolder
+// launches with, weight model included. A second "pull speed" here would be a duplicate that stops
+// agreeing with the throw the first time either is retuned.
+//
+// THE HOVER TEST'S TWO KNOBS mirror the pass's (UTraceSettings::PassAimConeDegrees / PassAimSlack)
+// for the same reason those exist: a 20 uu orb subtends under a fifth of a degree at 8000 uu, so a
+// pure ray test would be unusable at range, and a pure cone test collapses to nothing point-blank.
+// Either one passing is a hover.
+// =================================================================================================
+
+static TAutoConsoleVariable<float> CVarModeBTurnoverLockout(
+	TEXT("Trace.ModeB.TurnoverLockoutSeconds"),
+	5.f,
+	TEXT("SPEC v25 §2, GOALS MODE. Seconds the team that DROPPED the Core is locked out of it after a ")
+	TEXT("turnover. For that window only the opposing team may pull or pick up; afterwards nobody pulls ")
+	TEXT("and either team may take it by touch. 0 disables the whole window (the pre-v25 rule is a ")
+	TEXT("different thing and is NOT restored by this - see Trace.ModeB.TurnoverPull). ")
+	TEXT("UTraceSettings::CoreTurnoverLockoutSeconds."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBPullHold(
+	TEXT("Trace.ModeB.PullHoldSeconds"),
+	0.3f,
+	TEXT("SPEC v25 §2, GOALS MODE. Seconds of CONTINUOUS right-mouse-plus-hover-plus-line-of-sight that ")
+	TEXT("complete a pull. Losing any of the three cancels the fill outright; it does not pause. ")
+	TEXT("UTraceSettings::CorePullHoldSeconds."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBPullAimCone(
+	TEXT("Trace.ModeB.PullAimConeDegrees"),
+	4.f,
+	TEXT("SPEC v25 §2. Half-angle of the cone that counts as 'hovering the mouse over the core' at ")
+	TEXT("range. Either this OR the slack below is enough. UTraceSettings::CorePullAimConeDegrees."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBPullAimSlack(
+	TEXT("Trace.ModeB.PullAimSlackUU"),
+	60.f,
+	TEXT("SPEC v25 §2. How far, in uu, the aim ray may miss the orb's SURFACE and still count as a ")
+	TEXT("hover. Added to the orb's drawn radius, so it is forgiveness rather than a second radius. ")
+	TEXT("UTraceSettings::CorePullAimSlackUU."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBPullMaxRange(
+	TEXT("Trace.ModeB.PullMaxRangeUU"),
+	0.f,
+	TEXT("SPEC v25 §2. Optional ceiling on how far away a pull may be started, uu. 0 = no limit, which ")
+	TEXT("is the shipped value because the note states no range: a 20 uu orb under a crosshair WITH ")
+	TEXT("line of sight is already its own range limit. UTraceSettings::CorePullMaxRangeUU."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarModeBTurnoverBeamScale(
+	TEXT("Trace.ModeB.TurnoverBeamScale"),
+	2.2f,
+	TEXT("SPEC v25 §2/§3. How much LARGER the Core's beam is during the turnover window, as a ")
+	TEXT("MULTIPLIER of its normal width - not a width, so a retune of the normal beam carries. ")
+	TEXT("1 = no change. UTraceSettings::CoreTurnoverBeamScale."),
+	ECVF_Default);
+
+/**
+ * SPEC v25 §2's A/B ARM. 0 restores the pre-v25 turnover EXACTLY: the landing hands the Core straight
+ * to the nearest enemy, with no window, no pull and no beam change.
+ *
+ * It exists for the same reason Trace.ModeB.LandingRule and Trace.ModeB.GroundedTurnover do — a rule
+ * that cannot be switched off cannot be shown to be the thing that changed, and every one of this
+ * pass's red arms is measured against it.
+ */
+static TAutoConsoleVariable<int32> CVarModeBTurnoverPull(
+	TEXT("Trace.ModeB.TurnoverPull"),
+	1,
+	TEXT("SPEC v25 §2. 1 (default): a turnover REGISTERS and the Core stays where it landed, with the ")
+	TEXT("5 s lockout and the opposing team's pull. 0: the pre-v25 rule - the landing grants the Core ")
+	TEXT("straight to the nearest enemy. The A/B arm for every red arm in this section."),
+	ECVF_Default);
+
 namespace TraceModeBTuning
 {
 	/** Mode B only. The weight multiplier the five accessors below are derived from. See the block above. */
@@ -1252,6 +1345,21 @@ namespace TraceModeBTuning
 	float LandingMinDescentSin() { return FMath::Sin(FMath::DegreesToRadians(LandingMinDescentDegrees())); }
 
 	float LandingMinFlightSeconds() { return FMath::Clamp(CVarModeBLandingMinFlight.GetValueOnAnyThread(), 0.f, 2.f); }
+
+	// --- Spec v25 §2, the turnover window and the pull. Upper bounds are sanity rails, not design:
+	// a 60 s lockout would be a dead match and a 10 s hold is not a mechanic anybody would use, but
+	// both are reachable so a playtest can find the edge of the range rather than the edge of a clamp.
+	float TurnoverLockoutSeconds() { return Resolve(TEXT("CoreTurnoverLockoutSeconds"), CVarModeBTurnoverLockout,   0.f, 60.f); }
+	float PullHoldSeconds()        { return Resolve(TEXT("CorePullHoldSeconds"),        CVarModeBPullHold,          0.f, 10.f); }
+	float PullAimConeDegrees()     { return Resolve(TEXT("CorePullAimConeDegrees"),     CVarModeBPullAimCone,       0.f, 45.f); }
+	float PullAimSlackUU()         { return Resolve(TEXT("CorePullAimSlackUU"),         CVarModeBPullAimSlack,      0.f, 400.f); }
+	float PullMaxRangeUU()         { return Resolve(TEXT("CorePullMaxRangeUU"),         CVarModeBPullMaxRange,      0.f, 60000.f); }
+
+	/** Spec v25 §2/§3. A MULTIPLIER of TraceCoreTuning::BeaconWidth, never a width. See the block above. */
+	float TurnoverBeamScale()      { return Resolve(TEXT("CoreTurnoverBeamScale"),      CVarModeBTurnoverBeamScale, 0.1f, 10.f); }
+
+	/** Spec v25 §2. False restores the pre-v25 "landing hands it straight to the nearest enemy" rule. */
+	bool  TurnoverPullEnabled()    { return CVarModeBTurnoverPull.GetValueOnAnyThread() != 0; }
 
 	// --- Spec v7 §4, the surface rule. Kept in DEGREES because that is the unit the spec states it in
 	// ("a normal within ~45 degrees of straight up") and the unit a designer can picture; the cosine
@@ -1472,6 +1580,15 @@ namespace TraceModeBTuning
 			// it - this list is how that was found - and integration declared it on UTraceSettings with
 			// a value in Config/DefaultGame.ini. Trace.ModeB.LandingMinDescentDegrees still overrides.
 			TEXT("CoreLandingMinDescentDegrees"),
+			// Spec v25 §2's six. Declared on UTraceSettings and shipped in Config/DefaultGame.ini; the
+			// entries are the standing check that the names still match, which is the only thing that
+			// stops a live slider on the settings page from driving nothing at all.
+			TEXT("CoreTurnoverLockoutSeconds"),
+			TEXT("CorePullHoldSeconds"),
+			TEXT("CorePullAimConeDegrees"),
+			TEXT("CorePullAimSlackUU"),
+			TEXT("CorePullMaxRangeUU"),
+			TEXT("CoreTurnoverBeamScale"),
 		};
 
 		int32 BoundCount = 0;
@@ -1824,6 +1941,14 @@ void ATraceCore::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifeti
 	// TeleportLocation — and Carrier, and bLoose — are already the new values.
 	DOREPLIFETIME(ATraceCore, TeleportLocation);
 	DOREPLIFETIME(ATraceCore, TeleportSerial);
+
+	// SPEC v25 §2. The turnover is server truth and the client only ever SHOWS it, so all four facts
+	// are plain replicated properties with no client-side counterpart to disagree with. PullHolds is
+	// the one the ring reads (spec §3: "real server-side progress, not a local guess").
+	DOREPLIFETIME(ATraceCore, TurnoverLockoutTeam);
+	DOREPLIFETIME(ATraceCore, TurnoverStartServerTime);
+	DOREPLIFETIME(ATraceCore, PullHolds);
+	DOREPLIFETIME(ATraceCore, PullWinner);
 }
 
 void ATraceCore::BeginPlay()
@@ -1891,8 +2016,13 @@ void ATraceCore::Tick(float DeltaSeconds)
 
 	// Carrier / State / bPassActive are independent properties and can land in any order, so every
 	// machine reconciles from Tick as well as from the OnReps.
+	//
+	// SPEC v25 §2 joins the same reconciliation, and it is the one member of it that can change with
+	// NO packet arriving at all: the turnover window ends when its clock runs out, on every machine
+	// independently. A client that only reacted to OnReps would keep drawing an enlarged, wrong-colour
+	// beam until the next possession event.
 	if (!bAppliedEver || AppliedHolder.Get() != Carrier || bAppliedPassActive != bPassActive
-		|| bAppliedLoose != bLoose)
+		|| bAppliedLoose != bLoose || bAppliedTurnoverActive != IsTurnoverActive())
 	{
 		ApplyAttachment();
 		UpdateVisuals();
@@ -2034,6 +2164,12 @@ void ATraceCore::Tick(float DeltaSeconds)
 	// SPEC v13 §8's reproduction, same placement and the same reason: it has to watch a Core that is
 	// in the air to know when the previous shot has resolved. One bool compare when disarmed.
 	TickTurnoverRepro();
+
+	// SPEC v25 §2's red arm. Ahead of the loose branch's early return for the same reason: most of
+	// what it watches happens while the Core is lying on the ground with a window open, and the last
+	// step of it watches the frame a locked-out player finally gets to pick it up. One int compare
+	// when disarmed.
+	TickTurnoverVerify();
 
 	if (bLoose)
 	{
@@ -5412,6 +5548,11 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	bCatchZoneContested = false;
 	LastContactServerTime = -1.f;
 	ClearPendingTurnover();   // Spec v19 §1.5: this throw is awarded on its own landing, not the last one's.
+	// Spec v25 §2, for the same reason and set in the same breath: this throw earns its own turnover.
+	// ClearLooseState() clears the latch on every path that ENDS a flight; the two paths that START
+	// one set the loose fields by hand and must clear it themselves, or a throw taken straight out of
+	// a turnover would be refused a landing of its own.
+	bTurnoverRegisteredThisFlight = false;
 	LooseFromTeam = ThrowerTeam;
 	LooseThrower = Thrower;
 	LooseStartServerTime = Now;
@@ -5466,6 +5607,17 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 
 	const float Now = GetServerTimeSeconds();
 	const float Step = FMath::Clamp(DeltaSeconds, 0.f, 0.1f);   // A hitch must not teleport the Core.
+
+	// --- SPEC v25 §2. A COMPLETED PULL OWNS THE TICK, AND EVERYTHING BELOW IS SKIPPED. ------------
+	//
+	// A Core being magnetically delivered is not falling: it has no gravity, no bounce, no landing, no
+	// catch magnet and no first-contact pickup, because all five of those would fight the delivery for
+	// the same two fields. Ahead of the integration rather than beside it, so the reader cannot miss
+	// that this is a different mode of motion and not a modifier on the ordinary one.
+	if (ServerTickPullTravel(Step))
+	{
+		return;
+	}
 
 	const FVector StartLocation = LooseLocation;
 
@@ -5851,7 +6003,13 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	// pending. Latching a landing the rule was always going to decline would therefore hold the Core
 	// unpickupable until the reset timer expired. Asking the same question one line earlier means the
 	// latch is only ever taken for a throw the rule actually has an opinion about.
+	// SPEC v25 §2 ADDS ONE CLAUSE, bTurnoverRegisteredThisFlight, AND IT IS NOT DEFENSIVE. Under the
+	// new rule the Core stays lying on the surface it landed on, so this test - which is a question
+	// about the geometry, not about the event - is true on every following frame too. Without the
+	// latch a resting Core would re-register its turnover once per tick and the 5 s window would never
+	// end. The latch is cleared by ClearLooseState(), i.e. by every path that ends a flight.
 	const bool bTurnoverRuleArmed = bLooseFromThrow
+		&& !bTurnoverRegisteredThisFlight
 		&& (LooseFromTeam != ETraceTeam::None)
 		&& (CVarModeBGroundTurnover.GetValueOnAnyThread() != 0);
 
@@ -6012,6 +6170,19 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 		}
 	}
 
+	// --- 2c. SPEC v25 §2: the turnover window, the pull race and the lockout clock. ----------------
+	//
+	// AHEAD OF THE PICKUP POLL, and that ordering is the rule the same way §2b's is: a completed pull
+	// and a first-contact pickup are two answers to "who gets it", and the pull is the one a player
+	// spent 0.3 s earning. Below §2b, because a landing that fires this frame must open the window
+	// before anybody is allowed to race for it.
+	ServerTickTurnover(Step);
+
+	if (PullWinner != nullptr)
+	{
+		return;   // A pull completed on this frame. The delivery owns the Core from the next one.
+	}
+
 	// --- 3. First contact takes it. ---------------------------------------------------------------
 	//
 	// NOT WHILE A LANDING IS PENDING. "A throw that comes down is a turnover, full stop" is the rule
@@ -6019,6 +6190,11 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	// have opened a window in which the throwing team could jog over and reclaim their own bad throw,
 	// which is the v4 behaviour spec v6 §4.2 deleted. The settle moves WHEN possession changes, and it
 	// must not change WHO it changes to.
+	//
+	// SPEC v25 §2 did not change this ordering; it changed WHO the poll accepts. ServerTryLoosePickup
+	// now refuses the locked-out team for the length of the window, which is the second half of row 2
+	// of the table ("only they may pick up") and, once the window closes, is row 3 ("either team, by
+	// touch") with no further code.
 	if (PendingTurnoverLandedServerTime < 0.f && ServerTryLoosePickup())
 	{
 		return;
@@ -6052,8 +6228,13 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	// 0 disables the timer outright (UTraceSettings::CoreLooseResetSeconds, "0 = never"). The
 	// out-of-world rescue above still runs, so even with the timer off the Core cannot be lost
 	// permanently — it can only be left lying somewhere a player can still reach it.
+	// SPEC v25 §2 HOLDS THIS TIMER OFF FOR THE LENGTH OF THE WINDOW. A turned-over Core is SUPPOSED to
+	// be lying there - that is the mechanic - and the reset timer counts from the THROW, so a long
+	// throw plus a 5 s lockout could expire it out from under the pull it was waiting for. The rescue
+	// this timer exists for (a Core nobody can reach) is unaffected: the window is 5 s and then the
+	// timer resumes with the whole of the "either team may take it" period still to run.
 	const float ResetAfter = TraceModeBTuning::LooseResetSeconds();
-	if (ResetAfter > 0.f && (Now - LooseStartServerTime) >= ResetAfter)
+	if (ResetAfter > 0.f && !IsTurnoverActive() && (Now - LooseStartServerTime) >= ResetAfter)
 	{
 		ResetLooseCore(TEXT("untouched past the reset timer"));
 	}
@@ -6426,6 +6607,46 @@ bool ATraceCore::ServerSurfaceTurnover(const FVector& SurfacePoint, const FVecto
 		return false;
 	}
 
+	// =============================================================================================
+	// *** SPEC v25 §2. THE TURNOVER IS REGISTERED; THE CORE STAYS ON THE GROUND WHERE IT LANDED. ***
+	//
+	// Verbatim: "Instead of automatically going to the other team, a turnover is registered and the
+	// core stays on the ground where it landed."
+	//
+	// EVERYTHING ABOVE THIS POINT IS UNTOUCHED, and that is the spec's own instruction: "Turnover
+	// criteria remain the same". The surface test, the arrival angle, the visible-support gap and the
+	// settle all still decide WHETHER this is a turnover and WHEN it fires; the only thing that has
+	// changed is what the answer does. So this branch sits at the very end of the criteria and
+	// replaces the transfer, rather than being a second rule bolted on beside it.
+	//
+	// Trace.ModeB.TurnoverPull 0 falls through to the pre-v25 grant below, unchanged, which is the A/B
+	// arm every red arm in this section is measured against.
+	// =============================================================================================
+	const FVector LandedAt = LooseLocation;
+
+	if (TraceModeBTuning::TurnoverPullEnabled())
+	{
+		(bElevated ? SurfaceStats.TopTurnovers : SurfaceStats.GroundTurnovers)++;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] TURNOVER REGISTERED (spec v25 §2): the %s throw settled on %s at %s (normal %s, ")
+			TEXT("%.0f deg from up) - the Core STAYS THERE. %s is locked out for %.1fs; %s may pull it ")
+			TEXT("(right mouse + hover + line of sight for %.2fs) or run over it."),
+			*TraceTeamName(ThrowingTeam).ToString(), SurfaceKind, *LandedAt.ToCompactString(),
+			*SurfaceNormal.ToCompactString(),
+			FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(SurfaceNormal.Z, -1.0, 1.0))),
+			*TraceTeamName(ThrowingTeam).ToString(), GetTurnoverLockoutSeconds(),
+			*TraceTeamName(ReceivingTeam).ToString(), GetPullHoldSeconds());
+
+		RegisterTurnover(ThrowingTeam, LandedAt, SurfaceKind);
+
+		// TRUE, and the contract behind it has not changed: "the caller must touch no member state
+		// afterwards". The Core is still loose, but this frame's landing latch has been consumed and
+		// the turnover window now owns what happens next, so the caller returning here is what stops
+		// the same frame also running the pickup poll against the team that just lost it.
+		return true;
+	}
+
 	TArray<ATraceCharacter*> Candidates;
 	GatherCharacters(Candidates);
 
@@ -6486,6 +6707,632 @@ bool ATraceCore::ServerSurfaceTurnover(const FVector& SurfacePoint, const FVecto
 	return true;
 }
 
+// =================================================================================================
+// SPEC v25 §2 — THE TURNOVER STATE MACHINE
+//
+// Read the table in TraceCore.h before changing anything here. Three rows, and the third is the
+// first: once the lockout expires the turnover is CLEARED, because "nobody pulls, either team picks
+// up, normal beam" is exactly what a Core that was never turned over already does.
+//
+// EVERY DECISION IS THE SERVER'S. The four replicated facts (TurnoverLockoutTeam,
+// TurnoverStartServerTime, PullHolds, PullWinner) are written here and nowhere else, and no client
+// runs a clock of its own — spec v25: "Do not let a client decide it won a race."
+// =================================================================================================
+
+float ATraceCore::GetPullHoldSeconds()        { return TraceModeBTuning::PullHoldSeconds(); }
+float ATraceCore::GetTurnoverLockoutSeconds() { return TraceModeBTuning::TurnoverLockoutSeconds(); }
+float ATraceCore::GetTurnoverBeamScale()      { return TraceModeBTuning::TurnoverBeamScale(); }
+
+bool ATraceCore::IsTurnoverActive() const
+{
+	if (TurnoverLockoutTeam == ETraceTeam::None)
+	{
+		return false;
+	}
+
+	// The clock is asked here rather than trusted to have been cleared, so a client whose
+	// TurnoverLockoutTeam = None has not yet arrived still stops showing the window on time. The
+	// server clears it in ServerTickTurnover; this is what makes the two agree in between.
+	return GetTurnoverSecondsRemaining() > 0.f;
+}
+
+float ATraceCore::GetTurnoverSecondsRemaining() const
+{
+	if (TurnoverLockoutTeam == ETraceTeam::None)
+	{
+		return 0.f;
+	}
+
+	const float Lockout = GetTurnoverLockoutSeconds();
+	return FMath::Max(0.f, (TurnoverStartServerTime + Lockout) - GetServerTimeSeconds());
+}
+
+float ATraceCore::GetTurnoverAlpha() const
+{
+	if (TurnoverLockoutTeam == ETraceTeam::None)
+	{
+		return -1.f;
+	}
+
+	const float Lockout = GetTurnoverLockoutSeconds();
+	if (Lockout <= 0.f)
+	{
+		return 1.f;
+	}
+
+	return FMath::Clamp((GetServerTimeSeconds() - TurnoverStartServerTime) / Lockout, 0.f, 1.f);
+}
+
+float ATraceCore::GetPullProgressFor(const AActor* Player) const
+{
+	if (Player == nullptr)
+	{
+		return -1.f;
+	}
+
+	const float Hold = GetPullHoldSeconds();
+	const float Now = GetServerTimeSeconds();
+
+	for (const FTraceCorePullHold& Entry : PullHolds)
+	{
+		if (Entry.Puller != Player)
+		{
+			continue;
+		}
+
+		// A zero hold time is "instant", not "divide by zero". It is reachable from the console and
+		// from a misconfigured ini, and a NaN ring would be the loudest possible way to find out.
+		if (Hold <= 0.f)
+		{
+			return 1.f;
+		}
+
+		return FMath::Clamp((Now - Entry.StartServerTime) / Hold, 0.f, 1.f);
+	}
+
+	return -1.f;
+}
+
+float ATraceCore::GetLocalPullProgress() const
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr || PullHolds.Num() == 0)
+	{
+		return -1.f;   // The common case, and it costs nothing.
+	}
+
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		const APlayerController* Controller = It->Get();
+		if (Controller == nullptr || !Controller->IsLocalController())
+		{
+			continue;
+		}
+
+		const float Progress = GetPullProgressFor(Controller->GetPawn());
+		if (Progress >= 0.f)
+		{
+			return Progress;
+		}
+	}
+
+	return -1.f;
+}
+
+bool ATraceCore::CanPullNow(const ATraceCharacter* Puller, const TCHAR** OutReason) const
+{
+	// Every refusal names itself, for the same reason IsLegalPassTarget's do: "the ring never
+	// appeared" is what a player experiences, and it has eight possible causes.
+	const auto Refuse = [OutReason](const TCHAR* Why) -> bool
+	{
+		if (OutReason != nullptr)
+		{
+			*OutReason = Why;
+		}
+		return false;
+	};
+
+	if (OutReason != nullptr)
+	{
+		*OutReason = TEXT("legal");
+	}
+
+	if (!IsModeB())
+	{
+		return Refuse(TEXT("not goals mode"));                     // Spec v25: goals mode only.
+	}
+	if (!IsValid(Puller) || !Puller->IsAlive())
+	{
+		return Refuse(TEXT("no living puller"));
+	}
+	if (!bLoose)
+	{
+		return Refuse(TEXT("the Core is not loose"));
+	}
+	if (Puller == Carrier)
+	{
+		return Refuse(TEXT("the puller is holding the Core"));     // §7's precedence: carriers parry.
+	}
+	if (!IsTurnoverActive())
+	{
+		return Refuse(TEXT("no turnover window is open"));         // Row 1 and row 3: nobody pulls.
+	}
+	if (PullWinner != nullptr)
+	{
+		return Refuse(TEXT("a pull has already completed"));
+	}
+
+	// *** THE LOCKOUT IS ON THE TEAM THAT DROPPED IT, NOT ON THE INDIVIDUAL. *** Spec v25 is explicit,
+	// and it is the whole difference between "the player who threw it away" and "their side": a
+	// teammate of the thrower is refused here exactly as the thrower is.
+	const ETraceTeam PullingTeam = GetTurnoverPullingTeam();
+	if (PullingTeam == ETraceTeam::None)
+	{
+		return Refuse(TEXT("the turnover has no opposing team"));
+	}
+	if (Puller->GetTeam() != PullingTeam)
+	{
+		return Refuse(TEXT("on the team that dropped it - locked out"));
+	}
+
+	const FVector ViewLocation = Puller->GetPawnViewLocation();
+	const FVector CoreCentre = LooseLocation;
+
+	FVector ToCore = CoreCentre - ViewLocation;
+	const double Distance = ToCore.Size();
+
+	const float MaxRange = TraceModeBTuning::PullMaxRangeUU();
+	if (MaxRange > 0.f && Distance > static_cast<double>(MaxRange))
+	{
+		return Refuse(TEXT("out of pull range"));
+	}
+
+	// LINE OF SIGHT, and deliberately the SAME channel and the same argument as the pass's
+	// (IsLegalPassTarget): ECC_Visibility, because an object-type query matches the endzone trigger -
+	// a QueryOnly box that responds to nothing but ECC_Pawn - and would make a Core lying inside a
+	// zone unpullable for a reason nobody could see. Single ray, unlike the pass's three: the pass
+	// probes a 176 uu pawn that ducks behind cover, this probes a 20 uu ball on the floor, and there
+	// is no second point on it worth asking about.
+	const UWorld* World = GetWorld();
+	if (World != nullptr)
+	{
+		FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(TraceCorePullLos), /*bTraceComplex=*/false);
+		QueryParams.AddIgnoredActor(this);
+		QueryParams.AddIgnoredActor(Puller);
+
+		if (World->LineTraceTestByChannel(ViewLocation, CoreCentre, ECC_Visibility, QueryParams))
+		{
+			return Refuse(TEXT("no line of sight"));
+		}
+	}
+
+	if (Distance <= CoreGeometryEpsilon)
+	{
+		return true;   // Standing on top of it. Nothing sensible to measure; accept.
+	}
+
+	ToCore /= Distance;
+
+	const FVector AimDirection = Puller->GetAimDirection();
+	const double Cosine = FVector::DotProduct(ToCore, AimDirection);
+	if (Cosine <= 0.0)
+	{
+		return Refuse(TEXT("the Core is behind them"));
+	}
+
+	// (a) THE CONE - what makes a Core acquirable at all at range. A 20 uu orb subtends 0.14 deg at
+	//     8000 uu, so a pure ray-through-the-ball test is unusable across this pitch.
+	const double ConeDegrees = static_cast<double>(TraceModeBTuning::PullAimConeDegrees());
+	if (Cosine >= FMath::Cos(FMath::DegreesToRadians(ConeDegrees)))
+	{
+		return true;
+	}
+
+	// (b) THE RAY THROUGH THE ORB - what makes it acquirable point-blank, where the cone has
+	//     collapsed to a few uu. Perpendicular distance from the Core to the aim ray, against the
+	//     DRAWN orb radius plus the slack, so the forgiveness is measured off the ball a player can
+	//     actually see rather than off the larger sphere the flight sweeps with.
+	const double PerpendicularDistance = Distance * FMath::Sqrt(FMath::Max(0.0, 1.0 - Cosine * Cosine));
+	const double Threshold = TraceModeBVisibleOrbRadius + static_cast<double>(TraceModeBTuning::PullAimSlackUU());
+	if (PerpendicularDistance <= Threshold)
+	{
+		return true;
+	}
+
+	return Refuse(TEXT("not hovering the Core"));
+}
+
+void ATraceCore::RegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where, const TCHAR* Why)
+{
+	if (!HasAuthority() || DroppingTeam == ETraceTeam::None)
+	{
+		return;
+	}
+
+	TurnoverLockoutTeam = DroppingTeam;
+	TurnoverStartServerTime = GetServerTimeSeconds();
+	bTurnoverRegisteredThisFlight = true;
+
+	// Captured HERE, by the rule itself, for the same reason TakeLooseCore captures its take: by the
+	// time Trace.ModeB.Verify's step 6/7/8 gets to judge, an enemy may already have pulled the Core
+	// and cleared the window, and a scenario that polled for it would report a rule that had fired
+	// as one that had not.
+	if (bVerifyAwaitingTurnover)
+	{
+		bVerifyAwaitingTurnover = false;
+		bVerifyTurnoverSeen = true;
+		VerifyTurnoverLockedTeam = DroppingTeam;
+	}
+
+	// The Core is at rest on the surface it landed on and STAYS there. Zeroing the velocity is what
+	// makes that true on the clients too: their dead reckoning is gated on a non-zero velocity, so a
+	// Core left with the last frame's residual would keep drifting on every machine but this one.
+	LooseVelocity = FVector::ZeroVector;
+	LooseLocation = Where;
+	bLooseAtRest = true;
+	SetActorLocation(LooseLocation, false, nullptr, ETeleportType::TeleportPhysics);
+
+	// THE LANDING LATCH IS CONSUMED HERE. It has done its job (spec v19 §1.5's settle, which is what
+	// held possession until the ball had actually been drawn touching something) and it also gates the
+	// pickup poll - leaving it set would make the Core unpickupable by ANYBODY for the rest of the
+	// window, which is the opposite of what the turnover is for.
+	ClearPendingTurnover();
+
+	// A fresh window starts with a clean race: no holds carried over from before the landing, and no
+	// stale winner. The latch (PullInputHeld) is deliberately NOT cleared - a player who was already
+	// holding right mouse when it landed has their finger down, and the next tick will start their
+	// 0.3 s honestly rather than demanding they let go and press again.
+	PullHolds.Reset();
+	PullWinner = nullptr;
+
+	UE_LOG(LogTraceGame, Verbose,
+		TEXT("[ModeB] spec v25 §2: turnover window OPEN at %s (%s). Locked out: %s. Pull: %s, %.2fs hold."),
+		*Where.ToCompactString(), Why, *TraceTeamName(DroppingTeam).ToString(),
+		*TraceTeamName(TraceOpposingTeam(DroppingTeam)).ToString(), GetPullHoldSeconds());
+
+	// The beam is the field-wide read of this whole mechanic, so it changes on the same frame the
+	// window opens rather than on the next reconciliation tick.
+	ApplyAttachment();
+	UpdateVisuals();
+}
+
+void ATraceCore::ClearTurnover(const TCHAR* Why)
+{
+	if (TurnoverLockoutTeam == ETraceTeam::None && PullHolds.Num() == 0 && PullWinner == nullptr)
+	{
+		return;
+	}
+
+	if (TurnoverLockoutTeam != ETraceTeam::None)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] spec v25 §2: turnover window CLOSED (%s) after %.2fs - %s is no longer locked ")
+			TEXT("out and nobody may pull."),
+			Why, GetServerTimeSeconds() - TurnoverStartServerTime,
+			*TraceTeamName(TurnoverLockoutTeam).ToString());
+	}
+
+	TurnoverLockoutTeam = ETraceTeam::None;
+	TurnoverStartServerTime = 0.f;
+	PullHolds.Reset();
+	PullWinner = nullptr;
+
+	ApplyAttachment();
+	UpdateVisuals();
+}
+
+void ATraceCore::RequestPullInput(bool bPressed, ATraceCharacter* Requester)
+{
+	if (!IsValid(Requester) || !IsModeB())
+	{
+		return;   // Goals mode only. Mode A never sees this function do anything.
+	}
+
+	if (Requester->HasAuthority())
+	{
+		// The listen host's own player, and every bot. No round trip, and no prediction either: the
+		// hold this starts is the server's, which is the only one there is.
+		ServerApplyPullInput(Requester, bPressed);
+		return;
+	}
+
+	// A CLIENT. It sends the BUTTON and nothing else - not a hold length, not a completion, not a
+	// winner. See ATraceCorePullRelay for why the message cannot go on this actor.
+	if (!Requester->IsLocallyControlled())
+	{
+		return;   // One machine speaks for one pawn.
+	}
+
+	if (ATraceCorePullRelay* Relay = ATraceCorePullRelay::Find(Requester->GetController()))
+	{
+		Relay->ServerSetPullInput(bPressed);
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[ModeB] spec v25 §2: %s pressed pull but has no ATraceCorePullRelay yet (it replicates ")
+			TEXT("shortly after PostLogin); the press is dropped rather than predicted."),
+			*GetNameSafe(Requester));
+	}
+}
+
+void ATraceCore::ServerApplyPullInput(ATraceCharacter* Requester, bool bPressed)
+{
+	if (!HasAuthority() || !IsValid(Requester))
+	{
+		return;
+	}
+
+	PullInputHeld.RemoveAll([](const TWeakObjectPtr<ATraceCharacter>& Entry)
+	{
+		return !Entry.IsValid();
+	});
+
+	const int32 Existing = PullInputHeld.IndexOfByPredicate([Requester](const TWeakObjectPtr<ATraceCharacter>& Entry)
+	{
+		return Entry.Get() == Requester;
+	});
+
+	if (bPressed)
+	{
+		if (Existing == INDEX_NONE)
+		{
+			PullInputHeld.Add(Requester);
+		}
+		return;
+	}
+
+	if (Existing != INDEX_NONE)
+	{
+		PullInputHeld.RemoveAt(Existing);
+	}
+
+	// *** RELEASING CANCELS. IT DOES NOT PAUSE. *** Spec v25 states it outright, and it is the rule a
+	// 0.29 s release has to fail on: the entry is removed, so the next press starts a new hold at zero
+	// rather than resuming 0.29 s of credit.
+	CancelPullFor(Requester, TEXT("the button was released"), /*bAlsoClearLatch=*/false);
+}
+
+void ATraceCore::CancelPullFor(const ATraceCharacter* Puller, const TCHAR* Why, bool bAlsoClearLatch)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	const int32 Index = PullHolds.IndexOfByPredicate([Puller](const FTraceCorePullHold& Entry)
+	{
+		return Entry.Puller == Puller;
+	});
+
+	if (Index != INDEX_NONE)
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[ModeB] spec v25 §2: %s's pull CANCELLED at %.0f%% - %s."),
+			*GetNameSafe(Puller),
+			100.f * FMath::Clamp((GetServerTimeSeconds() - PullHolds[Index].StartServerTime)
+				/ FMath::Max(KINDA_SMALL_NUMBER, GetPullHoldSeconds()), 0.f, 1.f),
+			Why);
+
+		PullHolds.RemoveAt(Index);
+	}
+
+	if (bAlsoClearLatch)
+	{
+		PullInputHeld.RemoveAll([Puller](const TWeakObjectPtr<ATraceCharacter>& Entry)
+		{
+			return !Entry.IsValid() || Entry.Get() == Puller;
+		});
+	}
+}
+
+void ATraceCore::ServerTickTurnover(float /*DeltaSeconds*/)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	const float Now = GetServerTimeSeconds();
+
+	// --- 1. THE WINDOW EXPIRES ON THE TEAM'S CLOCK, NOT ON ANY PLAYER'S. -------------------------
+	//
+	// Row 3 of the table. Clearing it is the whole of "after the 5 seconds are up, the opposite team
+	// loses the pull ability and either team can pick up the core by running over it": no pull,
+	// because CanPullNow refuses without a window; either team, because ServerTryLoosePickup's
+	// lockout test is written against the same window; normal beam, because UpdateVisuals is.
+	if (TurnoverLockoutTeam != ETraceTeam::None && GetTurnoverSecondsRemaining() <= 0.f)
+	{
+		ClearTurnover(TEXT("the lockout expired"));
+	}
+
+	// --- 2. Forget anybody who has left the match, so a dead pawn cannot hold a fill open. -------
+	PullInputHeld.RemoveAll([](const TWeakObjectPtr<ATraceCharacter>& Entry)
+	{
+		const ATraceCharacter* Character = Entry.Get();
+		return Character == nullptr || !IsValid(Character) || !Character->IsAlive();
+	});
+
+	// --- 3. Validate every live hold. CANCELS, never pauses. ------------------------------------
+	for (int32 Index = PullHolds.Num() - 1; Index >= 0; --Index)
+	{
+		ATraceCharacter* Puller = PullHolds[Index].Puller;
+
+		const bool bStillHolding = PullInputHeld.ContainsByPredicate(
+			[Puller](const TWeakObjectPtr<ATraceCharacter>& Entry) { return Entry.Get() == Puller; });
+
+		const TCHAR* Reason = TEXT("unknown");
+		if (!bStillHolding)
+		{
+			CancelPullFor(Puller, TEXT("the button is no longer held"), /*bAlsoClearLatch=*/false);
+		}
+		else if (!CanPullNow(Puller, &Reason))
+		{
+			// Losing hover and losing line of sight arrive here identically, which is what the spec
+			// asks for: "Losing either cancels the fill; it does not pause it."
+			CancelPullFor(Puller, Reason, /*bAlsoClearLatch=*/false);
+		}
+	}
+
+	// --- 4. Start a hold for anybody who is eligible and has not got one. ------------------------
+	for (const TWeakObjectPtr<ATraceCharacter>& Entry : PullInputHeld)
+	{
+		ATraceCharacter* Puller = Entry.Get();
+		if (Puller == nullptr)
+		{
+			continue;
+		}
+
+		const bool bAlreadyPulling = PullHolds.ContainsByPredicate(
+			[Puller](const FTraceCorePullHold& Hold) { return Hold.Puller == Puller; });
+
+		if (bAlreadyPulling || !CanPullNow(Puller))
+		{
+			continue;
+		}
+
+		FTraceCorePullHold& Added = PullHolds.AddDefaulted_GetRef();
+		Added.Puller = Puller;
+		Added.StartServerTime = Now;
+
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[ModeB] spec v25 §2: %s (%s) started a pull on the turned-over Core."),
+			*GetNameSafe(Puller), *TraceTeamName(Puller->GetTeam()).ToString());
+	}
+
+	// --- 5. FIRST TO COMPLETE WINS. -------------------------------------------------------------
+	//
+	// "Two opponents pulling at once: the one who finishes first gets it, and the other's fill is
+	// cancelled." Every hold has the same length, so the first to finish is the one that STARTED
+	// first, and the winner is picked by earliest StartServerTime rather than by array order. An
+	// exact tie - two presses inside one server tick - breaks on the engine's unique object id, which
+	// is stable for the lifetime of the pawn, for the same reason the catch contest's tie-break is:
+	// resolving it by roster order would make the answer depend on the order actors happened to be
+	// gathered in, which is not a fact about the game.
+	const float Hold = GetPullHoldSeconds();
+
+	ATraceCharacter* Winner = nullptr;
+	float WinnerStart = 0.f;
+	uint32 WinnerKey = 0;
+
+	for (const FTraceCorePullHold& Entry : PullHolds)
+	{
+		if (!IsValid(Entry.Puller) || (Now - Entry.StartServerTime) < Hold)
+		{
+			continue;
+		}
+
+		const uint32 Key = Entry.Puller->GetUniqueID();
+		if (Winner == nullptr || Entry.StartServerTime < WinnerStart
+			|| (Entry.StartServerTime == WinnerStart && Key < WinnerKey))
+		{
+			Winner = Entry.Puller;
+			WinnerStart = Entry.StartServerTime;
+			WinnerKey = Key;
+		}
+	}
+
+	if (Winner != nullptr)
+	{
+		ServerCompletePull(Winner);
+	}
+}
+
+void ATraceCore::ServerCompletePull(ATraceCharacter* Winner)
+{
+	if (!HasAuthority() || !IsValid(Winner) || !bLoose)
+	{
+		return;
+	}
+
+	const int32 Losers = FMath::Max(0, PullHolds.Num() - 1);
+
+	// THE LOSER'S FILL CANCELS. Clearing the array is that sentence; their LATCH is left alone,
+	// because their finger really is still on the button and if this delivery is voided (the winner
+	// dies mid-flight) the next tick should let them start a fresh 0.3 s rather than making them
+	// re-press a button they never let go of.
+	PullHolds.Reset();
+
+	PullWinner = Winner;
+	bLooseAtRest = false;
+
+	// *** THE FULL CORE-THROWN VELOCITY, ASKED OF THE THROW ITSELF. ***
+	//
+	// Spec v25: "it travels towards the player who completed the pull first at full core thrown
+	// velocity ... the same speed constant a thrown Core uses, not a new number." GetThrowSpeed() is
+	// that constant AFTER the weight model (base / sqrt(mass)), which is the speed a thrown Core
+	// actually leaves at, so retuning CoreThrowSpeed or CoreMassScale moves the pull with it. This is
+	// the standing rule from Demo 21 applied to a speed instead of an ability: derived, not duplicated.
+	const float Speed = GetThrowSpeed();
+	const FVector ToWinner = (Winner->GetActorLocation() - FVector(LooseLocation)).GetSafeNormal();
+	LooseVelocity = ToWinner * Speed;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] spec v25 §2: PULL COMPLETE - %s (%s) held for %.2fs and the Core is travelling to ")
+		TEXT("them at %.0f uu/s (the full thrown speed). %d other fill(s) cancelled."),
+		*GetNameSafe(Winner), *TraceTeamName(Winner->GetTeam()).ToString(), GetPullHoldSeconds(),
+		Speed, Losers);
+}
+
+bool ATraceCore::ServerTickPullTravel(float DeltaSeconds)
+{
+	if (!HasAuthority() || PullWinner == nullptr)
+	{
+		return false;
+	}
+
+	ATraceCharacter* Winner = PullWinner;
+
+	if (!IsValid(Winner) || !Winner->IsAlive() || !bLoose)
+	{
+		// The delivery has nobody to deliver to. The Core stops where it is and the window - if any of
+		// it is left - carries on, so a team-mate can still earn it. It is deliberately NOT handed to
+		// them by default: a pull is something a player completes, not something a death awards.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] spec v25 §2: the pull's winner is gone; the Core stops at %s and the window ")
+			TEXT("(%.1fs left) continues."),
+			*FVector(LooseLocation).ToCompactString(), GetTurnoverSecondsRemaining());
+
+		PullWinner = nullptr;
+		LooseVelocity = FVector::ZeroVector;
+		bLooseAtRest = true;
+		return false;
+	}
+
+	// The SAME speed constant the completion stamped, asked again rather than stored, so a live
+	// retune reaches a delivery already in the air.
+	const double Speed = static_cast<double>(GetThrowSpeed());
+	const double Step = static_cast<double>(FMath::Clamp(DeltaSeconds, 0.f, 0.1f));
+
+	// Aimed at the capsule CENTRE, which is the same point the pickup poll measures its radius from,
+	// so the flight ends exactly where the take happens instead of a capsule-height away from it.
+	const FVector Target = Winner->GetActorLocation();
+	FVector ToTarget = Target - FVector(LooseLocation);
+	const double Distance = ToTarget.Size();
+
+	const double StepLength = Speed * Step;
+	const double ArriveWithin = StepLength + static_cast<double>(TraceModeBTuning::PickupRadius());
+
+	if (Distance <= ArriveWithin)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] spec v25 §2: the pulled Core reached %s."), *GetNameSafe(Winner));
+
+		// Through TakeLooseCore like every other loose -> held transition, so the grace rule, the log
+		// and Trace.ModeB.Verify all see a pull exactly as they see an interception. It clears the
+		// loose state, which clears the turnover and this delivery with it.
+		TakeLooseCore(Winner);
+		return true;
+	}
+
+	const FVector Direction = ToTarget / Distance;
+	LooseVelocity = Direction * Speed;
+	LooseLocation = FVector(LooseLocation) + Direction * StepLength;
+	SetActorLocation(LooseLocation, false, nullptr, ETeleportType::TeleportPhysics);
+
+	return true;
+}
+
 bool ATraceCore::ServerTryLoosePickup()
 {
 	if (!HasAuthority() || !bLoose || bCoreStateLocked)
@@ -6497,6 +7344,11 @@ bool ATraceCore::ServerTryLoosePickup()
 	const float Radius = TraceModeBTuning::PickupRadius();
 	const float SelfLockoutEnd = LooseStartServerTime + TraceModeBTuning::SelfPickupLockout();
 	const ATraceCharacter* Thrower = LooseThrower.Get();
+
+	// SPEC v25 §2. Sampled once, outside the loop: the window cannot open or close between two
+	// candidates within a single poll, and asking per candidate would make that look possible.
+	const bool bLockoutActive = IsTurnoverActive();
+	const ETraceTeam PullingTeam = GetTurnoverPullingTeam();
 
 	TArray<ATraceCharacter*> Candidates;
 	GatherCharacters(Candidates);
@@ -6518,6 +7370,21 @@ bool ATraceCore::ServerTryLoosePickup()
 		// player who threw it on the very next tick and the mechanic would not exist. Everybody else -
 		// teammate or enemy - is eligible from frame one, which is what makes interception the point.
 		if (Candidate == Thrower && Now < SelfLockoutEnd)
+		{
+			continue;
+		}
+
+		// *** SPEC v25 §2. THE 5 s LOCKOUT IS ON THE TEAM THAT DROPPED IT. ***
+		//
+		// Row 2 of the table: during the window only the opposing team may pick the Core up, and this
+		// is the whole of that half of it. Row 3 needs no code - IsTurnoverActive() goes false when the
+		// window expires and the loop is back to "first contact, anyone", which is exactly "either team
+		// can pick up the core by running over it".
+		//
+		// Written against the TEAM and not against LooseThrower on purpose: the thrower's own
+		// lockout above is a 0.35 s anti-self-catch on ONE pawn, and this is a 5 s rule about a SIDE.
+		// Conflating them would let a team-mate of the thrower jog over and reclaim the turnover.
+		if (bLockoutActive && Candidate->GetTeam() != PullingTeam)
 		{
 			continue;
 		}
@@ -6625,6 +7492,16 @@ void ATraceCore::ClearLooseState()
 	bCatchZoneContested = false;   // Spec v13 §5: a new flight starts its own contest.
 	LastContactServerTime = -1.f;  // Spec v13 §8: and its own contact history.
 	ClearPendingTurnover();        // Spec v19 §1.5: and its own landing.
+
+	// SPEC v25 §2. And its own turnover. Every path that ends a flight comes through here, so this is
+	// what guarantees the window, the pull race and the delivery cannot outlive the Core being loose -
+	// a turnover left set on a Core somebody is now carrying would lock a whole team out of a Core
+	// that is not even on the ground. The LATCH (bTurnoverRegisteredThisFlight) clears with it, so the
+	// next throw is judged on its own landing.
+	ClearTurnover(TEXT("the Core is no longer loose"));
+	bTurnoverRegisteredThisFlight = false;
+	PullInputHeld.Reset();
+
 	LooseVelocity = FVector::ZeroVector;
 	LooseThrower = nullptr;
 	LooseStartServerTime = 0.f;
@@ -6727,6 +7604,7 @@ bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelo
 	CatchZoneTarget = nullptr;
 	LastContactServerTime = -1.f;
 	ClearPendingTurnover();   // Spec v19 §1.5: as the real throw above.
+	bTurnoverRegisteredThisFlight = false;   // Spec v25 §2: as the real throw above.
 	LooseFromTeam = FromTeam;
 	LooseThrower = nullptr;
 	LooseStartServerTime = GetServerTimeSeconds();
@@ -6806,6 +7684,23 @@ void ATraceCore::TickModeBVerification()
 		// step 7 already covers.
 		if (VerifyStep == 8 && !bVerifyRestArmed && !bTimedOut)
 		{
+			// SPEC v25 §2 SIDE EFFECT, and it is a change in the WORLD rather than in this step. Step 7
+			// now leaves its Core lying on the crate for the whole lockout window, so the bots gather
+			// there — and step 8's parked Core is then taken on its first frame, before it can settle,
+			// and the at-rest probe this step exists to exercise never runs. Take the subject back
+			// rather than reporting a rule that was never given a chance.
+			if (!bLoose && VerifyRestParkRetriesLeft > 0)
+			{
+				--VerifyRestParkRetriesLeft;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[ModeBVerify] step 8: the parked Core was taken before it could settle (%s has it) ")
+					TEXT("- re-parking, %d retries left."),
+					*GetNameSafe(Carrier), VerifyRestParkRetriesLeft);
+
+				VerifyStepDeadline = 0.f;   // Re-enters case 8 below, which parks it again.
+				return;
+			}
+
 			if (!bLoose || !bLooseAtRest)
 			{
 				return;   // Still falling. Nothing to arm yet.
@@ -6814,6 +7709,8 @@ void ATraceCore::TickModeBVerification()
 			bVerifyRestArmed = true;
 			bVerifyAwaitingTake = true;
 			bVerifyTakeSeen = false;
+			bVerifyAwaitingTurnover = true;   // Spec v25 §2: the registration is what this now judges.
+			bVerifyTurnoverSeen = false;
 			bLooseFromThrow = true;
 			VerifyTurnoversAtStart = SurfaceStats.TopTurnovers;
 			VerifyRescuesAtStart = SurfaceStats.RestProbeRescues;
@@ -6823,6 +7720,69 @@ void ATraceCore::TickModeBVerification()
 				TEXT("arming the throw flag. Only the at-rest probe can turn it over from here."),
 				*FVector(LooseLocation).ToCompactString());
 			return;
+		}
+
+		// =========================================================================================
+		// SPEC v25 §2 CHANGED WHAT STEPS 6-8 ARE WAITING FOR, AND THIS IS WHERE THAT LANDS.
+		//
+		// Those three steps have always asserted "a throw settled on a surface and the enemy ended up
+		// with it". Under v25 the second half is no longer what the rule does: the Core STAYS on the
+		// ground and the enemy gets a window in which they alone may pull it or run over it. So the
+		// assertion moves one step earlier, onto the REGISTRATION - the throwing team is locked out,
+		// its opponent is the side that may take it - and the surface tallies and the at-rest-probe
+		// clause, which are the parts that actually prove which geometry fired, are unchanged.
+		//
+		// The pre-v25 arm (Trace.ModeB.TurnoverPull 0) still falls through to the take-based judgement
+		// below, so ONE scenario measures whichever rule is armed rather than two that could drift.
+		if (VerifyStep >= 6 && VerifyStep <= 8 && TraceModeBTuning::TurnoverPullEnabled())
+		{
+			if (bVerifyTurnoverSeen)
+			{
+				bVerifyTurnoverSeen = false;
+				bVerifyAwaitingTurnover = false;
+				bVerifyAwaitingTake = false;
+
+				const bool bLockedTheThrower = (VerifyTurnoverLockedTeam != ETraceTeam::None)
+					&& (TraceOpposingTeam(VerifyTurnoverLockedTeam) == VerifyExpectTeam);
+				const bool bSurfaceOk = (VerifyStep == 6)
+					|| (SurfaceStats.TopTurnovers > VerifyTurnoversAtStart);
+				const bool bProbeOk = (VerifyStep != 8)
+					|| (SurfaceStats.RestProbeRescues > VerifyRescuesAtStart);
+				const bool bStepOk = bLockedTheThrower && bSurfaceOk && bProbeOk && bLoose;
+
+				(bStepOk ? VerifyPassCount : VerifyFailCount)++;
+
+				const FString StepDetail = FString::Printf(
+					TEXT("a throw settled on %s and REGISTERED a turnover: %s locked out for %.1fs, %s may ")
+					TEXT("pull or run over it, Core still loose=%d | top-of-object turnovers %d -> %d | ")
+					TEXT("at-rest probe catches %d -> %d%s%s"),
+					(VerifyStep == 6) ? TEXT("the ground") : TEXT("THE TOP OF AN OBJECT"),
+					*TraceTeamName(VerifyTurnoverLockedTeam).ToString(), GetTurnoverLockoutSeconds(),
+					*TraceTeamName(TraceOpposingTeam(VerifyTurnoverLockedTeam)).ToString(),
+					bLoose ? 1 : 0,
+					VerifyTurnoversAtStart, SurfaceStats.TopTurnovers,
+					VerifyRescuesAtStart, SurfaceStats.RestProbeRescues,
+					bSurfaceOk ? TEXT("") : TEXT(" *** it did not land on a raised surface ***"),
+					bProbeOk ? TEXT("") : TEXT(" *** the at-rest probe is not what caught it ***"));
+
+				if (bStepOk)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[ModeBVerify] step %d PASS: %s"), VerifyStep, *StepDetail);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] step %d FAIL: %s"), VerifyStep, *StepDetail);
+				}
+
+				VerifyStepDeadline = 0.f;
+				++VerifyStep;
+				return;
+			}
+
+			if (!bTimedOut)
+			{
+				return;   // Still falling, or still settling. The timeout below is the only way out.
+			}
 		}
 
 		// Steps 0, 1, 6, 7 and 8 are waiting for a taker; steps 2 and 3 are waiting for the Core to
@@ -7468,6 +8428,8 @@ void ATraceCore::TickModeBVerification()
 		VerifyExpectGrace = true;
 		bVerifyAwaitingTake = true;
 		bVerifyTakeSeen = false;
+		bVerifyAwaitingTurnover = true;   // Spec v25 §2: the registration is what this now judges.
+		bVerifyTurnoverSeen = false;
 
 		if (!DebugLaunchLoose(Start, FVector(0.0, 0.0, -2000.0), FromTeam, /*bAsThrow=*/true))
 		{
@@ -7554,6 +8516,8 @@ void ATraceCore::TickModeBVerification()
 		VerifyExpectGrace = true;
 		bVerifyAwaitingTake = true;
 		bVerifyTakeSeen = false;
+		bVerifyAwaitingTurnover = true;   // Spec v25 §2: the registration is what this now judges.
+		bVerifyTurnoverSeen = false;
 		VerifyTurnoversAtStart = SurfaceStats.TopTurnovers;
 
 		if (!DebugLaunchLoose(Start, FVector(0.0, 0.0, -1400.0), FromTeam, /*bAsThrow=*/true))
@@ -8355,6 +9319,8 @@ void ATraceCore::ApplyAttachment()
 		}
 	}
 
+	bAppliedTurnoverActive = IsTurnoverActive();
+
 	// The beacon is placed in the actor's own space, once, from its two end heights.
 	if (Beacon != nullptr && Beacon->GetStaticMesh() != nullptr)
 	{
@@ -8366,10 +9332,17 @@ void ATraceCore::ApplyAttachment()
 		const double Centre = (TraceCoreTuning::BeaconTop + TraceCoreTuning::BeaconBottom) * 0.5
 			- TraceCoreTuning::OrbHeight;   // Relative to the actor, which sits at OrbHeight.
 
+		// SPEC v25 §2/§3: "the beam ... should change colors to the opposite team and be LARGER for the
+		// 5 seconds". A MULTIPLIER of the normal width, never a width of its own — Demo 21's standing
+		// rule, because "larger" is a claim about the beam beside it and an absolute would stop being
+		// larger the day TraceCoreTuning::BeaconWidth moved. The colour half is in UpdateVisuals().
+		const double Width = TraceCoreTuning::BeaconWidth
+			* (bAppliedTurnoverActive ? static_cast<double>(GetTurnoverBeamScale()) : 1.0);
+
 		Beacon->SetRelativeLocation(FVector(0.0, 0.0, Centre));
 		Beacon->SetRelativeScale3D(FVector(
-			TraceCoreTuning::BeaconWidth / MeshWidth,
-			TraceCoreTuning::BeaconWidth / MeshWidth,
+			Width / MeshWidth,
+			Width / MeshWidth,
 			Height / MeshHeight));
 
 		// Shown while somebody is holding it - a holderless Core is a kickoff, not a target - and, in
@@ -8395,7 +9368,14 @@ void ATraceCore::ApplyAttachment()
 
 void ATraceCore::UpdateVisuals()
 {
-	FLinearColor Color = TraceTeamColor(GetHolderTeam());
+	// SPEC v25 §2/§3. "When a turnover happens ... the beam of light coming from the core should
+	// change colors to the OPPOSITE TEAM." A turned-over Core has no holder, so GetHolderTeam() is
+	// None and the beam would otherwise be the neutral grey a kickoff uses. For the length of the
+	// window it becomes the colour of the side that may now take it, which is the read the note asks
+	// for: a player sees, from across the field, whose Core it currently is.
+	const ETraceTeam BeamTeam = IsTurnoverActive() ? GetTurnoverPullingTeam() : GetHolderTeam();
+
+	FLinearColor Color = TraceTeamColor(BeamTeam);
 	Color.A = 1.f;
 
 	const bool bColorChanged = !bColorApplied || !Color.Equals(AppliedColor, 0.001f);
@@ -8500,6 +9480,22 @@ void ATraceCore::OnRep_Loose()
 	if (!bLoose)
 	{
 		PlaceHolderlessCore();
+	}
+}
+
+void ATraceCore::OnRep_Turnover()
+{
+	// SPEC v25 §2/§3. The beam is how a player twenty thousand units away learns a turnover happened,
+	// so it changes on the frame the news arrives rather than on the next reconciliation tick.
+	ApplyAttachment();
+	UpdateVisuals();
+
+	if (TurnoverLockoutTeam != ETraceTeam::None)
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[ModeB] spec v25 §2 (client): turnover window open - %s is locked out, %s may pull."),
+			*TraceTeamName(TurnoverLockoutTeam).ToString(),
+			*TraceTeamName(GetTurnoverPullingTeam()).ToString());
 	}
 }
 
@@ -8892,4 +9888,1292 @@ void ATraceCore::TickTeleportAudit()
 	AuditLastLocation = Now;
 	bAuditHasLast = true;
 	bAuditWasHeld = bHeld;
+}
+
+
+// =================================================================================================
+// SPEC v25 §2 — THE RED ARM
+//
+// Four negative claims, and a negative claim is worthless until the positive one beside it has been
+// watched to fire on the same pawns, in the same window, through the same functions:
+//
+//   1. A SAME-TEAM PLAYER MUST FAIL TO PULL      (green: the opposing player, standing there, passes)
+//   2. A PLAYER WITH NO LINE OF SIGHT MUST FAIL  (green: the same player, same frame, unblocked)
+//   3. RELEASING AT 0.29 s MUST FAIL             (green: the same player holding past 0.30 s wins it)
+//   4. THE LOCKOUT MUST EXPIRE                   (red:   the locked-out player standing ON the Core
+//                                                        is refused for the whole window)
+//
+// It drives the SHIPPING functions — CanPullNow, RequestPullInput, ServerTickTurnover, the pickup
+// poll — and the only thing it fakes is the throw that would otherwise have to be arranged on cue.
+// Armed from -ExecCmds as well as the console, because this project's testing policy forbids typing
+// into a window.
+//
+// It needs BOTS to drive: a human's crosshair is theirs and this harness will not move it. On a
+// bot-free session every step reports SKIP rather than passing on an empty room.
+// =================================================================================================
+
+static TAutoConsoleVariable<int32> CVarModeBTurnoverVerify(
+	TEXT("Trace.ModeB.TurnoverVerify"),
+	0,
+	TEXT("SPEC v25 §2. 1: run the turnover red arm once - same-team pull refused, no-line-of-sight ")
+	TEXT("pull refused, a 0.29s release refused, a full hold completing and delivering at the thrown ")
+	TEXT("speed, and the 5s lockout refusing then releasing the team that dropped it."),
+	ECVF_Default);
+
+namespace TraceCoreTurnoverVerify
+{
+	/** How long any one step may take before it is declared inconclusive rather than hanging the run. */
+	constexpr float StepTimeoutSeconds = 6.0f;
+
+	/** Times step 5 will re-arm if somebody legally takes the Core out from under it. */
+	constexpr int32 LockoutRetries = 2;
+
+	/**
+	 * A bot on @p Team the harness may drive.
+	 *
+	 * BOTS ONLY, and deliberately: driving a human's control rotation from a test would be moving the
+	 * player's own mouse, and the hover rule under test is precisely "where is this player looking".
+	 */
+	ATraceCharacter* FindDrivableBot(const TArray<ATraceCharacter*>& All, ETraceTeam Team)
+	{
+		for (ATraceCharacter* Candidate : All)
+		{
+			if (!IsValid(Candidate) || !Candidate->IsAlive() || Candidate->GetTeam() != Team)
+			{
+				continue;
+			}
+
+			const AController* Controller = Candidate->GetController();
+			if (Controller == nullptr || Controller->IsPlayerController())
+			{
+				continue;
+			}
+
+			return Candidate;
+		}
+
+		return nullptr;
+	}
+
+	/**
+	 * A place to park the Core that @p Puller can actually SEE.
+	 *
+	 * THIS IS NOT CONVENIENCE, IT IS WHAT MAKES THE GREEN ARMS MEAN ANYTHING. The first version of
+	 * this harness dropped the Core at the locked-out bot's feet, wherever that bot happened to be on
+	 * a 33600 uu pitch full of cover, and the green arm of steps 1 and 2 then failed with "no line of
+	 * sight" — reporting a broken rule when what was broken was the test's own geometry. A red arm
+	 * whose green half cannot fire proves nothing, so the point is CHOSEN: eight compass directions
+	 * at arm's length, dropped onto whatever is underneath, and the first one the puller has a clear
+	 * ray to wins.
+	 *
+	 * @return false when the puller can see none of the eight, which is reported as a SKIP.
+	 */
+	bool FindPullablePoint(const ATraceCharacter* Puller, double OrbRadius, FVector& OutPoint)
+	{
+		const UWorld* World = (Puller != nullptr) ? Puller->GetWorld() : nullptr;
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		const FVector Eye = Puller->GetPawnViewLocation();
+		const FVector Origin = Puller->GetActorLocation();
+		// FAR ENOUGH THAT THE PULLER CANNOT SIMPLY WALK TO IT. At 600 uu a bot chasing the loose Core
+		// arrived on foot inside the 0.3 s hold and step 4 measured the pickup radius instead of the
+		// pull; at 1400 uu it needs ~2 s to cover ground the delivery crosses in 0.6.
+		const double Reach = 1400.0;
+
+		for (int32 Step = 0; Step < 8; ++Step)
+		{
+			const double Angle = static_cast<double>(Step) * (PI / 4.0);
+			const FVector Offset(FMath::Cos(Angle) * Reach, FMath::Sin(Angle) * Reach, 0.0);
+
+			FCollisionQueryParams DropParams(SCENE_QUERY_STAT(TraceCoreVerifyDrop), /*bTraceComplex=*/false);
+			DropParams.AddIgnoredActor(Puller);
+
+			FHitResult Ground;
+			FVector Candidate = Origin + Offset;
+
+			if (World->LineTraceSingleByChannel(Ground, Candidate + FVector(0.0, 0.0, 300.0),
+				Candidate - FVector(0.0, 0.0, 2000.0), ECC_WorldStatic, DropParams))
+			{
+				Candidate = Ground.ImpactPoint + FVector(0.0, 0.0, OrbRadius + 2.0);
+			}
+			else
+			{
+				continue;   // Nothing underneath: a hole, or off the edge of the field.
+			}
+
+			FCollisionQueryParams LosParams(SCENE_QUERY_STAT(TraceCoreVerifyLos), /*bTraceComplex=*/false);
+			LosParams.AddIgnoredActor(Puller);
+
+			if (!World->LineTraceTestByChannel(Eye, Candidate, ECC_Visibility, LosParams))
+			{
+				OutPoint = Candidate;
+				return true;
+			}
+		}
+
+		return false;
+	}
+}
+
+bool ATraceCore::DebugRegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where)
+{
+	if (!HasAuthority() || !IsModeB() || DroppingTeam == ETraceTeam::None)
+	{
+		return false;
+	}
+
+	// Loose, as if DroppingTeam had thrown it, with no launch velocity: this harness is about the
+	// WINDOW, and a flight would only add a landing the shipping rule has already been proven on.
+	if (!DebugLaunchLoose(Where, FVector::ZeroVector, DroppingTeam, /*bAsThrow=*/true))
+	{
+		return false;
+	}
+
+	RegisterTurnover(DroppingTeam, Where, TEXT("armed by Trace.ModeB.TurnoverVerify"));
+	return IsTurnoverActive();
+}
+
+#if !UE_BUILD_SHIPPING
+bool ATraceCore::DebugStageTurnoverAtLocalCrosshair(UWorld* World, float DistanceUU, bool bLockLocalTeam,
+	FString& OutReport)
+{
+	if (World == nullptr)
+	{
+		OutReport = TEXT("no world");
+		return false;
+	}
+
+	ATraceCore* Core = ATraceCore::Get(World);
+	if (Core == nullptr)
+	{
+		OutReport = TEXT("no Core in this world");
+		return false;
+	}
+	if (!Core->HasAuthority())
+	{
+		OutReport = TEXT("this machine is not the server; stage the turnover on the listen host");
+		return false;
+	}
+	if (!Core->IsModeB())
+	{
+		OutReport = TEXT("this match is not in goals mode; spec v25 §2 is goals mode only");
+		return false;
+	}
+
+	APlayerController* PC = World->GetFirstPlayerController();
+	ATraceCharacter* Local = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+	if (!IsValid(Local) || Local->GetTeam() == ETraceTeam::None)
+	{
+		OutReport = TEXT("no local pawn with a team");
+		return false;
+	}
+
+	// THE AIM IS NOT TOUCHED HERE, BY ANYTHING. The Core goes on the FLOOR in front of the player,
+	// which is where a thrown Core comes to rest; whether the player's crosshair happens to be on it
+	// is then a real question for the shipping CanPullNow, and this fixture has recorded it answering
+	// "not hovering the Core" more than once. (The demo below aims at the Core afterwards, in its own
+	// clearly-logged step, which is the one thing a mouse does.)
+	//
+	// GROUND, NOT A VIEW RAY. Two earlier versions of this got the geometry wrong in opposite
+	// directions and both were caught by the shipping rules rather than by me:
+	//   * offset-then-drop put the Core metres below the ray, outside the 4-degree aim cone;
+	//   * the view ray itself hit scenery the CORE's own downward probe does not see, so the Core was
+	//     left "134 uu clear" of anything, RESUMED FLIGHT, fell, re-landed, fired a second genuine
+	//     turnover that restarted the window, and cancelled a pull that had reached 0.777 of its hold.
+	// A point on the floor is the only one that is both real and still there a second later.
+	const FVector Eye = Local->GetPawnViewLocation();
+	const FRotator ViewRot = PC->GetControlRotation();
+	const FVector Forward = FRotator(0.f, ViewRot.Yaw, 0.f).Vector();   // Yaw only: along the ground.
+	const float Reach = (DistanceUU > 1.f) ? DistanceUU : 450.f;
+
+	FCollisionQueryParams DropParams(SCENE_QUERY_STAT(TraceCoreIntegStageDrop), /*bTraceComplex=*/false);
+	DropParams.AddIgnoredActor(Local);
+	DropParams.AddIgnoredActor(Core);
+
+	FVector Where;
+
+	if (DistanceUU <= 0.f)
+	{
+		// AT MY FEET, deliberately: the arm where this player's own team is locked out wants the pickup
+		// poll offered to them on every tick, so the refusal that follows is a measured refusal rather
+		// than an absence of opportunity.
+		Where = Local->GetActorLocation();
+
+		FHitResult Floor;
+		if (World->LineTraceSingleByChannel(Floor, Where, Where - FVector(0.0, 0.0, 500.0),
+			ECC_WorldStatic, DropParams))
+		{
+			Where = Floor.ImpactPoint + FVector(0.0, 0.0, TraceModeBVisibleOrbRadius + 2.0);
+		}
+	}
+	else
+	{
+		// Walk out along the ground, not along the view, and take the floor under that point. If the
+		// player is facing a wall the sweep shortens until it finds open floor, so the Core never ends
+		// up inside geometry the pull would then have no line of sight to.
+		FVector Base = FVector(Local->GetActorLocation().X, Local->GetActorLocation().Y, Eye.Z) + Forward * Reach;
+
+		FHitResult Blocked;
+		if (World->LineTraceSingleByChannel(Blocked, Eye, Base, ECC_WorldStatic, DropParams))
+		{
+			Base = Blocked.ImpactPoint - Forward * (TraceModeBVisibleOrbRadius * 3.0);
+		}
+
+		FHitResult Floor;
+		if (World->LineTraceSingleByChannel(Floor, Base + FVector(0.0, 0.0, 100.0),
+			Base - FVector(0.0, 0.0, 4000.0), ECC_WorldStatic, DropParams))
+		{
+			Where = Floor.ImpactPoint + Floor.ImpactNormal * (TraceModeBVisibleOrbRadius + 2.0);
+		}
+		else
+		{
+			Where = Local->GetActorLocation() + Forward * Reach;
+		}
+	}
+
+	const ETraceTeam LocalTeam = Local->GetTeam();
+	const ETraceTeam DroppingTeam = bLockLocalTeam ? LocalTeam : TraceOpposingTeam(LocalTeam);
+
+	if (!Core->DebugRegisterTurnover(DroppingTeam, Where))
+	{
+		OutReport = TEXT("DebugRegisterTurnover refused (already held, or not loose-able right now)");
+		return false;
+	}
+
+	const TCHAR* Reason = nullptr;
+	const bool bLocalMayPull = Core->CanPullNow(Local, &Reason);
+
+	OutReport = FString::Printf(
+		TEXT("staged at %s, %.0f uu down the local player's own view. %s dropped it and is locked out ")
+		TEXT("for %.2fs; %s may pull. The local pawn (%s, %s) %s — CanPullNow says \"%s\"."),
+		*Where.ToCompactString(), Reach,
+		*TraceTeamName(DroppingTeam).ToString(), Core->GetTurnoverSecondsRemaining(),
+		*TraceTeamName(TraceOpposingTeam(DroppingTeam)).ToString(),
+		*GetNameSafe(Local), *TraceTeamName(LocalTeam).ToString(),
+		bLocalMayPull ? TEXT("MAY PULL") : TEXT("may NOT pull"),
+		(Reason != nullptr) ? Reason : TEXT("legal"));
+
+	return true;
+}
+
+namespace TraceCoreIntegStage
+{
+	/**
+	 * `Trace.Integ.StageTurnover [DistanceUU] [1 = lock MY team out]`
+	 *
+	 * The integrator's camera rig for spec v25 §2/§3. Default (0) puts the turnover on the OTHER team,
+	 * so this machine's player is the one who may pull and the ring is on screen to be photographed;
+	 * `1` locks THIS player's team out, which is the arm where the ring must NOT appear and standing
+	 * on the Core must do nothing for five seconds.
+	 */
+	static void Cmd(const TArray<FString>& Args, UWorld* World)
+	{
+		const float Distance = (Args.Num() > 0) ? FCString::Atof(*Args[0]) : 450.f;
+		const bool bLockLocal = (Args.Num() > 1) && (FCString::Atoi(*Args[1]) != 0);
+
+		FString Report;
+		const bool bOk = ATraceCore::DebugStageTurnoverAtLocalCrosshair(World, Distance, bLockLocal, Report);
+
+		if (bOk)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[v25Integ] StageTurnover: %s"), *Report);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[v25Integ] StageTurnover REFUSED: %s"), *Report);
+		}
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs CmdReg(
+		TEXT("Trace.Integ.StageTurnover"),
+		TEXT("SPEC v25 INTEGRATION. Stage a turnover on the ground the local player is already looking ")
+		TEXT("at, so the window can be photographed. Args: [DistanceUU=450] [LockMyTeam=0]. It moves ")
+		TEXT("the CORE, never the crosshair, and goes through the shipping RegisterTurnover()."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Cmd));
+
+	// ---------------------------------------------------------------------------------------------
+	// `Trace.Integ.TurnoverDemo` — THE WHOLE OF SPEC v25 §2 AS ONE SCRIPTED, PHOTOGRAPHED SEQUENCE.
+	//
+	// The §2 red arm proves the RULES on bots; this proves the PLAYER'S EXPERIENCE of them, on the
+	// human-controlled pawn, in one run, with a screenshot at each claim:
+	//
+	//   A  the opposing team drops it -> the Core STAYS where it landed, beam recoloured and larger
+	//   B  a ring appears around it for this player, empty
+	//   C  holding the pull FILLS the ring, off the server's own number
+	//   D  past 0.3 s the Core travels to this player and they hold it
+	//   E  this player's OWN team drops it -> no ring, and standing on it does nothing
+	//   F  five seconds later the same touch, through the same poll, hands it over
+	//
+	// Every verb is the shipping one. Nothing here writes a pull progress, a lockout, or a pickup.
+	// ---------------------------------------------------------------------------------------------
+	static void Shot(const TCHAR* Which)
+	{
+		const FString Path = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"),
+			FString::Printf(TEXT("v25integ_%s_%s.png"), Which,
+				*FDateTime::Now().ToString(TEXT("%H%M%S"))));
+
+		// bShowUI = true: the beam is world geometry but the RING is Canvas HUD, and a UI-less capture
+		// photographs an arena with no evidence in it.
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+		UE_LOG(LogTraceGame, Display, TEXT("[v25Integ] shot %s -> %s"), Which, *Path);
+	}
+
+	static void Demo(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[v25Integ] TurnoverDemo: no world."));
+			return;
+		}
+
+		const float Distance = (Args.Num() > 0) ? FCString::Atof(*Args[0]) : 450.f;
+
+		TWeakObjectPtr<UWorld> WeakWorld(World);
+		// Every phase boundary is a GAME-TIME deadline, not a wall-clock one, because this machine has
+		// run these captures at 0.1 fps under contention and a wall clock would step past the 0.30 s
+		// hold between two frames without ever drawing the filling ring it is here to photograph.
+		TSharedRef<int32> Phase = MakeShared<int32>(0);
+		TSharedRef<double> PhaseStart = MakeShared<double>(World->GetTimeSeconds());
+		TSharedRef<bool> ShotFilling = MakeShared<bool>(false);
+		TSharedRef<double> LockoutOpened = MakeShared<double>(0.0);
+		TSharedRef<int32> BeamRetries = MakeShared<int32>(0);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[WeakWorld, Distance, Phase, PhaseStart, ShotFilling, LockoutOpened, BeamRetries](float) -> bool
+			{
+				UWorld* Live = WeakWorld.Get();
+				if (Live == nullptr)
+				{
+					return false;
+				}
+
+				ATraceCore* Core = ATraceCore::Get(Live);
+				APlayerController* PC = Live->GetFirstPlayerController();
+				ATraceCharacter* Me = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+				if (Core == nullptr || !IsValid(Me))
+				{
+					// Between pawns (the select screen, a respawn). WAIT, and hold the settle clock at
+					// zero so the first phase's delay is measured from the first frame this player
+					// actually exists — armed from -TraceExec, this ticker starts before they do.
+					*PhaseStart = Live->GetTimeSeconds();
+					return true;
+				}
+
+				const double Now = Live->GetTimeSeconds();
+				const double InPhase = Now - *PhaseStart;
+				const auto Advance = [&Phase, &PhaseStart, Now](int32 Next)
+				{
+					*Phase = Next;
+					*PhaseStart = Now;
+				};
+
+				const TCHAR* Reason = nullptr;
+				const float Progress = Core->GetPullProgressFor(Me);
+				const bool bMayPull = Core->CanPullNow(Me, &Reason);
+
+				switch (*Phase)
+				{
+				case 0:
+				{
+					// Three seconds of live pawn before anything is staged: a spawn still has the camera
+					// settling, and a turnover placed down a view that is mid-blend is placed nowhere.
+					if (InPhase < 3.0)
+					{
+						break;
+					}
+
+					FString Report;
+					if (!ATraceCore::DebugStageTurnoverAtLocalCrosshair(Live, Distance, /*bLockLocalTeam=*/false, Report))
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[v25Integ] A REFUSED: %s"), *Report);
+						return false;
+					}
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[v25Integ] A — THE OPPOSING TEAM DROPPED IT. %s Beam scale x%.2f for the window."),
+						*Report, ATraceCore::GetTurnoverBeamScale());
+					Shot(TEXT("A_turnover_beam"));
+					Advance(1);
+					break;
+				}
+
+				case 1:
+					// One frame of settle, then photograph the EMPTY ring before any button is pressed:
+					// a ring that is only ever seen full proves nothing about where its number came from.
+					// 0.8 s, not one frame: a staged Core still has to touch down and be judged by the
+					// shipping landing rule, and photographing the ring before that is over photographs
+					// a state the player never sees.
+					if (InPhase >= 0.8)
+					{
+						// *** THE RED HALF, TAKEN BEFORE THE GREEN ONE AND FROM THE SAME WINDOW. ***
+						// The Core is on the floor and NOTHING has touched this player's aim, so their
+						// crosshair is wherever they left it. Whatever CanPullNow answers here, it
+						// answers on its own.
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] B(red) — turnover open, aim UNTOUCHED: server progress %.3f ")
+							TEXT("(-1 = no hold), this player %s (\"%s\"), %.2fs left."),
+							Progress, bMayPull ? TEXT("MAY pull") : TEXT("may NOT pull"),
+							(Reason != nullptr) ? Reason : TEXT("legal"),
+							Core->GetTurnoverSecondsRemaining());
+
+						// THE ONE THING A MOUSE DOES, done explicitly and logged as such: point the
+						// camera at the Core. Nothing else is faked — the aim cone, the line of sight,
+						// the 0.30 s clock and the race stay the server's, and the line above is this
+						// same player being refused a moment earlier for want of exactly this.
+						const FVector ToCore = Core->GetLooseLocation() - Me->GetPawnViewLocation();
+						const FRotator Before = PC->GetControlRotation();
+						const FRotator After = ToCore.Rotation();
+						PC->SetControlRotation(After);
+
+						const TCHAR* AimedReason = nullptr;
+						const bool bAimedMayPull = Core->CanPullNow(Me, &AimedReason);
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] B(green) — aimed at the Core (pitch %.1f -> %.1f, yaw %.1f -> ")
+							TEXT("%.1f): this player %s (\"%s\"). Progress is still %.3f — looking at it ")
+							TEXT("does not start a pull; the button does."),
+							Before.Pitch, After.Pitch, Before.Yaw, After.Yaw,
+							bAimedMayPull ? TEXT("MAY pull") : TEXT("may NOT pull"),
+							(AimedReason != nullptr) ? AimedReason : TEXT("legal"),
+							Core->GetPullProgressFor(Me));
+
+						Shot(TEXT("B_ring_empty"));
+						Advance(2);
+					}
+					break;
+
+				case 2:
+					// THE REAL BUTTON, re-asserted every frame exactly as a held mouse button is. The
+					// server runs its own hover test, its own line of sight and its own 0.30 s clock.
+					Core->RequestPullInput(true, Me);
+
+					if (!*ShotFilling && Progress > 0.15f && Progress < 0.95f)
+					{
+						*ShotFilling = true;
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] C — the ring is FILLING: SERVER progress %.3f of the %.2fs hold."),
+							Progress, ATraceCore::GetPullHoldSeconds());
+						Shot(TEXT("C_ring_filling"));
+					}
+
+					if (Core->GetHolder() == Me || Core->GetPullWinner() == Me)
+					{
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] D — THE PULL COMPLETED for %s after %.2fs. Delivery speed %.0f uu/s ")
+							TEXT("(= ATraceCore::GetThrowSpeed(), not a number of its own). Holding now: %d"),
+							*GetNameSafe(Me), InPhase, ATraceCore::GetThrowSpeed(),
+							Core->GetHolder() == Me ? 1 : 0);
+						Shot(TEXT("D_pull_won"));
+						Core->RequestPullInput(false, Me);
+						Advance(3);
+					}
+					else if (InPhase > 8.0)
+					{
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[v25Integ] C/D INCONCLUSIVE after %.1fs: progress %.3f, CanPullNow says \"%s\". ")
+							TEXT("The player was probably not looking at the staged point."),
+							InPhase, Progress, (Reason != nullptr) ? Reason : TEXT("legal"));
+						Core->RequestPullInput(false, Me);
+						Advance(3);
+					}
+					break;
+
+				case 3:
+					if (InPhase >= 1.5)
+					{
+						// THE OTHER HALF OF THE TABLE. Staged AT THIS PLAYER'S FEET so the pickup poll is
+						// offered to them on every single tick of the window — the refusal below is a
+						// measured refusal, not an absence of opportunity.
+						FString Report;
+						if (!ATraceCore::DebugStageTurnoverAtLocalCrosshair(Live, /*DistanceUU=*/0.f,
+							/*bLockLocalTeam=*/true, Report))
+						{
+							UE_LOG(LogTraceGame, Warning, TEXT("[v25Integ] E REFUSED: %s"), *Report);
+							return false;
+						}
+						*LockoutOpened = Now;
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] E — MY OWN TEAM DROPPED IT, and the Core is at my feet. %s"), *Report);
+						Shot(TEXT("E_locked_out"));
+						Advance(4);
+					}
+					break;
+
+				case 4:
+				{
+					const bool bHolding = (Core->GetHolder() == Me);
+					const float Left = Core->GetTurnoverSecondsRemaining();
+
+					if (bHolding)
+					{
+						const double Held = Now - *LockoutOpened;
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] F — the locked-out player TOOK IT at t+%.2fs (lockout was %.2fs). ")
+							TEXT("%s"), Held, ATraceCore::GetTurnoverLockoutSeconds(),
+							(Held + 0.35 >= static_cast<double>(ATraceCore::GetTurnoverLockoutSeconds()))
+								? TEXT("That is AFTER the window, which is the rule.")
+								: TEXT("*** THAT IS INSIDE THE WINDOW — THE LOCKOUT LEAKED. ***"));
+						Shot(TEXT("F_after_lockout"));
+						Advance(5);
+						break;
+					}
+
+					// One line per half second for the whole window: standing on it, refused, by name.
+					if (FMath::Fmod(static_cast<float>(Now - *LockoutOpened), 0.5f) < 0.05f)
+					{
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] E+%.2fs standing on the Core: holding=%d, ring=%s, %.2fs left."),
+							Now - *LockoutOpened, bHolding ? 1 : 0,
+							bMayPull ? TEXT("SHOWN") : TEXT("hidden (correct: locked out)"), Left);
+					}
+
+					if (Now - *LockoutOpened > static_cast<double>(ATraceCore::GetTurnoverLockoutSeconds()) + 6.0)
+					{
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[v25Integ] F INCONCLUSIVE: %.1fs after the lockout expired the player still ")
+							TEXT("has not taken it — they are probably not standing close enough to it."),
+							Now - *LockoutOpened - static_cast<double>(ATraceCore::GetTurnoverLockoutSeconds()));
+						Advance(5);
+					}
+					break;
+				}
+
+				case 5:
+				{
+					// ---- THE BEAM A/B, arm 1: the shipped multiplier -------------------------------
+					//
+					// "LARGER" AND "THE OTHER TEAM'S COLOUR" ARE BOTH CLAIMS ABOUT THE NORMAL BEAM, so
+					// neither can be photographed once. Arm 1 is a turnover beam at the shipped
+					// CoreTurnoverBeamScale; arm 2 is the SAME turnover, at the SAME staged point, with
+					// that one multiplier forced to 1.0 and nothing else touched. The pair isolates the
+					// multiplier itself, which a "wait for the window to close" pair could not: this arena
+					// is full of bots who may legally take the Core the moment it opens, and four
+					// consecutive attempts at that version were stolen before the window ended.
+					//
+					// MY OWN TEAM drops it here, so the beam is the OPPOSING colour — the mirror of arm A,
+					// which photographed it in my own colour when the opposition dropped it.
+					if (InPhase >= 1.0)
+					{
+						if (IConsoleVariable* BeamCVar = CVarModeBTurnoverBeamScale.AsVariable())
+						{
+							// SetByCode outranks the ini, which is how TraceModeBTuning::Resolve decides
+							// who wins — so this really does move the shipped multiplier for these frames.
+							BeamCVar->Set(2.2f, ECVF_SetByCode);
+						}
+
+						FString Report;
+						if (!ATraceCore::DebugStageTurnoverAtLocalCrosshair(Live, Distance,
+							/*bLockLocalTeam=*/true, Report))
+						{
+							UE_LOG(LogTraceGame, Warning, TEXT("[v25Integ] G REFUSED: %s"), *Report);
+							return false;
+						}
+
+						const FVector ToCore = Core->GetLooseLocation() - Me->GetPawnViewLocation();
+						PC->SetControlRotation(ToCore.Rotation());
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] G — BEAM A/B arm 1 of 2: window OPEN, beam x%.2f, colour = the ")
+							TEXT("team that did NOT drop it. %s"), ATraceCore::GetTurnoverBeamScale(), *Report);
+						Advance(6);
+					}
+					break;
+				}
+
+				case 6:
+					// The screenshot is deferred one phase so the beam has a frame to be rebuilt at the
+					// new width before it is photographed.
+					if (InPhase >= 0.3)
+					{
+						Shot(TEXT("G_beam_turnover_x2.2"));
+						Advance(7);
+					}
+					break;
+
+				case 7:
+					// ---- Arm 2: the identical staging, the multiplier forced to 1.0 ----------------
+					if (InPhase >= 1.0)
+					{
+						if (IConsoleVariable* BeamCVar = CVarModeBTurnoverBeamScale.AsVariable())
+						{
+							// SetByCode outranks the ini, which is how TraceModeBTuning::Resolve decides
+							// who wins — so this really does move the shipped multiplier for these frames.
+							BeamCVar->Set(1.0f, ECVF_SetByCode);
+						}
+
+						FString Report;
+						if (!ATraceCore::DebugStageTurnoverAtLocalCrosshair(Live, Distance,
+							/*bLockLocalTeam=*/true, Report))
+						{
+							UE_LOG(LogTraceGame, Warning, TEXT("[v25Integ] H REFUSED: %s"), *Report);
+							return false;
+						}
+
+						const FVector ToCore = Core->GetLooseLocation() - Me->GetPawnViewLocation();
+						PC->SetControlRotation(ToCore.Rotation());
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] H — BEAM A/B arm 2 of 2: the same turnover at the same point with ")
+							TEXT("CoreTurnoverBeamScale forced to x%.2f. One number changed between these two ")
+							TEXT("frames."), ATraceCore::GetTurnoverBeamScale());
+						Advance(8);
+					}
+					break;
+
+				case 8:
+					if (InPhase >= 0.3)
+					{
+						Shot(TEXT("H_beam_turnover_x1.0"));
+						Advance(9);
+					}
+					break;
+
+				case 9:
+					// Put the shipped value back so nothing after this run reads a harness number, then
+					// stop. (*BeamRetries is kept only so the capture ends on a named phase.)
+					if (InPhase >= 1.0)
+					{
+						if (IConsoleVariable* BeamCVar = CVarModeBTurnoverBeamScale.AsVariable())
+						{
+							// SetByCode outranks the ini, which is how TraceModeBTuning::Resolve decides
+							// who wins — so this really does move the shipped multiplier for these frames.
+							BeamCVar->Set(2.2f, ECVF_SetByCode);
+						}
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[v25Integ] DONE. CoreTurnoverBeamScale restored to x%.2f. (%d)"),
+							ATraceCore::GetTurnoverBeamScale(), *BeamRetries);
+						return false;
+					}
+					break;
+
+				default:
+					return false;
+				}
+
+				return true;
+			}), 0.f);
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs CmdDemoReg(
+		TEXT("Trace.Integ.TurnoverDemo"),
+		TEXT("SPEC v25 INTEGRATION. Runs the whole §2 table on the LOCAL player and photographs each ")
+		TEXT("claim: turnover registered and the Core stays, beam recoloured/larger, ring empty, ring ")
+		TEXT("filling off the server number, pull completing at the thrown speed, then the same player ")
+		TEXT("locked out of their own team's drop for the full window and taking it after. Args: ")
+		TEXT("[DistanceUU=450]."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Demo));
+}
+#endif // !UE_BUILD_SHIPPING
+
+bool ATraceCore::DriveAimAtLooseCore(ATraceCharacter* Puller)
+{
+	if (!IsValid(Puller) || !bLoose)
+	{
+		return false;
+	}
+
+	AController* Controller = Puller->GetController();
+	if (Controller == nullptr || Controller->IsPlayerController())
+	{
+		return false;
+	}
+
+	const FVector ToCore = FVector(LooseLocation) - Puller->GetPawnViewLocation();
+	if (ToCore.IsNearlyZero())
+	{
+		return false;
+	}
+
+	Controller->SetControlRotation(ToCore.Rotation());
+	return true;
+}
+
+void ATraceCore::TickTurnoverVerify()
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority())
+	{
+		return;
+	}
+
+	if (!bTurnoverVerifyArmed)
+	{
+		if (bTurnoverVerifyDone || CVarModeBTurnoverVerify.GetValueOnGameThread() == 0)
+		{
+			return;   // One bool and one int compare in the steady state.
+		}
+
+		// A LATCH, not a re-read of the CVar. -ExecCmds arms at console priority and a code-priority
+		// Set(0) is silently dropped, which is how a previous harness in this file re-fired 48 times -
+		// and how the first version of THIS one ran three times in forty seconds.
+		bTurnoverVerifyArmed = true;
+		bTurnoverVerifySawWinner = false;
+		TurnoverVerifyStep = 0;
+		TurnoverVerifyPassCount = 0;
+		TurnoverVerifyFailCount = 0;
+		TurnoverVerifySkipCount = 0;
+		TurnoverVerifyRetriesLeft = TraceCoreTurnoverVerify::LockoutRetries;
+	}
+
+	const float Now = GetServerTimeSeconds();
+
+	const auto Pass = [this](const TCHAR* What)
+	{
+		++TurnoverVerifyPassCount;
+		UE_LOG(LogTraceGame, Display, TEXT("[v25Turnover] PASS - %s"), What);
+	};
+	const auto Fail = [this](const TCHAR* What)
+	{
+		++TurnoverVerifyFailCount;
+		UE_LOG(LogTraceGame, Error, TEXT("[v25Turnover] *** FAIL *** - %s"), What);
+	};
+	const auto Skip = [this](const TCHAR* What)
+	{
+		++TurnoverVerifySkipCount;
+		UE_LOG(LogTraceGame, Warning, TEXT("[v25Turnover] SKIP - %s"), What);
+	};
+
+	// A step that stops making progress is reported as inconclusive rather than left to hang a run.
+	if (TurnoverVerifyStep > 0 && TurnoverVerifyDeadline > 0.f && Now > TurnoverVerifyDeadline)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[v25Turnover] step %d timed out after %.1fs - inconclusive, moving on."),
+			TurnoverVerifyStep, TraceCoreTurnoverVerify::StepTimeoutSeconds);
+		++TurnoverVerifySkipCount;
+
+		// A timeout in steps 1-4 skips to the LOCKOUT step, which is independent of them and is worth
+		// measuring on its own; a timeout in step 5 goes to the report, because sending it back to
+		// itself with a deadline already in the past is an infinite loop rather than a retry.
+		TurnoverVerifyStep = (TurnoverVerifyStep >= 5) ? 6 : 5;
+		TurnoverVerifyMark = -1.f;
+		TurnoverVerifyDeadline = 0.f;
+	}
+
+	ATraceCharacter* Puller = TurnoverVerifyPuller.Get();
+	ATraceCharacter* Locked = TurnoverVerifyLocked.Get();
+
+	switch (TurnoverVerifyStep)
+	{
+	case 0:
+	{
+		if (!IsModeB())
+		{
+			Skip(TEXT("this match is not in goals mode; spec v25 §2 is goals mode only."));
+			TurnoverVerifyStep = 5;
+			break;
+		}
+
+		TArray<ATraceCharacter*> All;
+		GatherCharacters(All);
+
+		ATraceCharacter* Blue = TraceCoreTurnoverVerify::FindDrivableBot(All, ETraceTeam::Blue);
+		ATraceCharacter* Orange = TraceCoreTurnoverVerify::FindDrivableBot(All, ETraceTeam::Orange);
+
+		if (Blue == nullptr || Orange == nullptr)
+		{
+			Skip(TEXT("no drivable bot on one of the teams; the harness will not move a human's crosshair."));
+			TurnoverVerifyStep = 5;
+			break;
+		}
+
+		// ORANGE DROPS IT, BLUE PULLS. The Core is parked at Orange's own feet, which is what makes
+		// step 4 a real test of the pickup lockout rather than an argument about it: the locked-out
+		// player is standing inside the pickup radius for the whole window.
+		TurnoverVerifyPuller = Blue;
+		TurnoverVerifyLocked = Orange;
+
+		// Placed where BLUE can see it, not where Orange happens to be standing: steps 1-3 all turn on
+		// the puller having line of sight, and step 5 - the only one that needs the Core at the
+		// locked-out player's feet - re-arms it there itself.
+		FVector Where = FVector::ZeroVector;
+		if (!TraceCoreTurnoverVerify::FindPullablePoint(Blue, TraceModeBVisibleOrbRadius, Where))
+		{
+			Skip(TEXT("the puller has clear sight of nowhere nearby; the green arms could not fire."));
+			TurnoverVerifyStep = 5;
+			break;
+		}
+
+		if (!DebugRegisterTurnover(ETraceTeam::Orange, Where))
+		{
+			Skip(TEXT("could not arm a turnover (the Core is locked, or the mode changed under us)."));
+			TurnoverVerifyStep = 5;
+			break;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[v25Turnover] armed: Orange dropped it at %s, Blue may pull. Lockout %.2fs, hold %.2fs, ")
+			TEXT("delivery speed %.0f uu/s (= the thrown speed)."),
+			*Where.ToCompactString(), GetTurnoverLockoutSeconds(), GetPullHoldSeconds(), GetThrowSpeed());
+
+		TurnoverVerifyStep = 1;
+		TurnoverVerifyMark = Now;
+		TurnoverVerifyDeadline = Now + TraceCoreTurnoverVerify::StepTimeoutSeconds;
+		break;
+	}
+
+	case 1:
+	{
+		// --- RED ARM 1: A SAME-TEAM PLAYER MUST FAIL TO PULL. ------------------------------------
+		//
+		// Orange dropped it, so Orange is locked out - and the test is run on a player who is NOT the
+		// thrower, because spec v25 puts the lockout on the TEAM. Their aim is driven onto the Core and
+		// their button is pressed, so every other condition in CanPullNow is satisfied and the only
+		// thing that can refuse them is the team rule.
+		if (!IsValid(Locked) || !IsValid(Puller) || !IsTurnoverActive())
+		{
+			Skip(TEXT("step 1: the window or a pawn went away before it could be measured."));
+			TurnoverVerifyStep = 4;
+			break;
+		}
+
+		DriveAimAtLooseCore(Locked);
+		RequestPullInput(true, Locked);
+
+		const TCHAR* Reason = TEXT("(none)");
+		const bool bAllowed = CanPullNow(Locked, &Reason);
+
+		// One frame later the state machine has run, so PullHolds is the authoritative answer to
+		// "did a fill actually start" - CanPullNow alone would only prove the query agrees with itself.
+		if (Now - TurnoverVerifyMark >= 0.05f)
+		{
+			const bool bHasHold = GetPullProgressFor(Locked) >= 0.f;
+
+			if (!bAllowed && !bHasHold)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[v25Turnover] red arm 1: %s (Orange, the side that dropped it) was refused - \"%s\", ")
+					TEXT("and no fill started."),
+					*GetNameSafe(Locked), Reason);
+				Pass(TEXT("a same-team player cannot pull."));
+			}
+			else
+			{
+				Fail(TEXT("a player on the team that DROPPED the Core was allowed to pull it."));
+			}
+
+			RequestPullInput(false, Locked);
+
+			// GREEN ARM: the same instant, the same Core, the opposing player. Without this the red arm
+			// above would also pass on a build where nobody can pull at all.
+			DriveAimAtLooseCore(Puller);
+			const TCHAR* GreenReason = TEXT("(none)");
+			if (CanPullNow(Puller, &GreenReason))
+			{
+				Pass(TEXT("the OPPOSING player, on the same frame, is allowed to pull (green arm)."));
+			}
+			else
+			{
+				Fail(TEXT("the opposing player could not pull either - the red arm above proves nothing."));
+				UE_LOG(LogTraceGame, Error, TEXT("[v25Turnover]   refusal was: %s"), GreenReason);
+			}
+
+			TurnoverVerifyStep = 2;
+			TurnoverVerifyMark = Now;
+			TurnoverVerifyDeadline = Now + TraceCoreTurnoverVerify::StepTimeoutSeconds;
+		}
+		break;
+	}
+
+	case 2:
+	{
+		// --- RED ARM 2: NO LINE OF SIGHT MUST FAIL. ----------------------------------------------
+		//
+		// Measured by moving the Core, for one query and with no tick in between, to a point 5000 uu
+		// BELOW where it is lying - so the ray from the puller's eye crosses the arena floor slab and
+		// is genuinely blocked by real world geometry. The alternative was to wait for a bot to
+		// happen to stand behind a crate, which is not a test, and to hope the crate was the reason.
+		if (!IsValid(Puller) || !IsTurnoverActive())
+		{
+			Skip(TEXT("step 2: the window or the puller went away before it could be measured."));
+			TurnoverVerifyStep = 4;
+			break;
+		}
+
+		DriveAimAtLooseCore(Puller);
+
+		const TCHAR* ClearReason = TEXT("(none)");
+		const bool bClear = CanPullNow(Puller, &ClearReason);
+
+		const FVector Restore = LooseLocation;
+		LooseLocation = Restore - FVector(0.0, 0.0, 5000.0);
+
+		const TCHAR* BlockedReason = TEXT("(none)");
+		const bool bBlocked = !CanPullNow(Puller, &BlockedReason);
+
+		LooseLocation = Restore;
+
+		if (bBlocked && FCString::Strstr(BlockedReason, TEXT("line of sight")) != nullptr)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[v25Turnover] red arm 2: with the floor slab between them the pull was refused - \"%s\"."),
+				BlockedReason);
+			Pass(TEXT("a player with no line of sight cannot pull."));
+		}
+		else
+		{
+			Fail(TEXT("a pull was allowed through solid geometry."));
+		}
+
+		if (bClear)
+		{
+			Pass(TEXT("the same player with a clear view CAN pull (green arm)."));
+		}
+		else
+		{
+			Fail(TEXT("the puller had no clear view either - the red arm above proves nothing."));
+			UE_LOG(LogTraceGame, Error, TEXT("[v25Turnover]   refusal was: %s"), ClearReason);
+		}
+
+		TurnoverVerifyStep = 3;
+		TurnoverVerifyMark = -1.f;   // "not pressed yet"
+		TurnoverVerifyDeadline = Now + TraceCoreTurnoverVerify::StepTimeoutSeconds;
+		break;
+	}
+
+	case 3:
+	{
+		// --- RED ARM 3: RELEASING AT 0.29 s MUST FAIL, AND HOLDING PAST 0.30 s MUST WIN. ---------
+		if (!IsValid(Puller) || !IsTurnoverActive())
+		{
+			Skip(TEXT("step 3: the window or the puller went away before it could be measured."));
+			TurnoverVerifyStep = 4;
+			break;
+		}
+
+		DriveAimAtLooseCore(Puller);
+
+		const float Hold = GetPullHoldSeconds();
+
+		if (TurnoverVerifyMark < 0.f)
+		{
+			RequestPullInput(true, Puller);
+			TurnoverVerifyMark = Now;
+			break;
+		}
+
+		const float Held = Now - TurnoverVerifyMark;
+
+		// Released on the last tick that is still SHORT of the hold time. Two frames of margin rather
+		// than one, because the completion is decided by ServerTickTurnover LATER in this same frame -
+		// so a release computed against a threshold this tick could otherwise be beaten by a
+		// completion the previous tick had already earned. The measured hold is printed, so a harness
+		// that overshoots says so instead of passing quietly.
+		const float Margin = 2.f * FMath::Max(0.001f, static_cast<float>(World->GetDeltaSeconds()));
+
+		if (Held + Margin >= Hold)
+		{
+			RequestPullInput(false, Puller);
+
+			const bool bNoWinner = (PullWinner == nullptr);
+			const bool bNoHold = (GetPullProgressFor(Puller) < 0.f);
+
+			if (Held < Hold && bNoWinner)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[v25Turnover] red arm 3: released after %.3fs of a %.3fs hold - no pull completed, ")
+					TEXT("and the fill was CANCELLED (progress now %s)."),
+					Held, Hold, bNoHold ? TEXT("gone") : TEXT("STILL RUNNING"));
+				Pass(TEXT("a release short of the hold time does not pull, and does not pause."));
+			}
+			else if (Held >= Hold)
+			{
+				Skip(TEXT("step 3: the harness overshot the hold time; the release was not short. "
+					"Re-run with a slower tick or a longer CorePullHoldSeconds."));
+			}
+			else
+			{
+				Fail(TEXT("a release short of the hold time still completed a pull."));
+			}
+
+			TurnoverVerifyStep = 4;
+			TurnoverVerifyMark = -1.f;
+			TurnoverVerifyDeadline = Now + TraceCoreTurnoverVerify::StepTimeoutSeconds;
+		}
+		break;
+	}
+
+	case 4:
+	{
+		// --- GREEN ARM 3: A FULL HOLD COMPLETES AND DELIVERS AT THE THROWN SPEED. ----------------
+		if (!IsValid(Puller))
+		{
+			Skip(TEXT("step 4: the puller went away."));
+			TurnoverVerifyStep = 5;
+			break;
+		}
+
+		if (TurnoverVerifyMark < 0.f)
+		{
+			if (!IsTurnoverActive())
+			{
+				// The window ran out while steps 1-3 were being measured. Re-arm it rather than
+				// reporting a failure of a rule that was never given a chance.
+				FVector Where = FVector::ZeroVector;
+				if (!TraceCoreTurnoverVerify::FindPullablePoint(Puller, TraceModeBVisibleOrbRadius, Where)
+					|| !DebugRegisterTurnover(ETraceTeam::Orange, Where))
+				{
+					Skip(TEXT("step 4: could not re-arm the window."));
+					TurnoverVerifyStep = 5;
+					break;
+				}
+			}
+
+			bTurnoverVerifySawWinner = false;
+			DriveAimAtLooseCore(Puller);
+			RequestPullInput(true, Puller);
+			TurnoverVerifyMark = Now;
+			break;
+		}
+
+		DriveAimAtLooseCore(Puller);
+
+		if (IsValid(Carrier) && Carrier == Puller)
+		{
+			// bTurnoverVerifySawWinner is what stops this passing on a puller who simply WALKED OVER
+			// the Core: the ordinary pickup poll would hand it to them too, and the step would then be
+			// reporting the pickup radius rather than the pull.
+			if (bTurnoverVerifySawWinner)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[v25Turnover] green arm 3: %s held past %.2fs, the Core travelled to them at the full ")
+					TEXT("thrown speed (%.0f uu/s) and they now hold it."),
+					*GetNameSafe(Puller), GetPullHoldSeconds(), GetThrowSpeed());
+				Pass(TEXT("a completed pull delivers the Core to the puller."));
+			}
+			else
+			{
+				Skip(TEXT("step 4: the puller reached the Core on foot before the hold completed; "
+					"the delivery itself was not observed."));
+			}
+
+			RequestPullInput(false, Puller);
+			TurnoverVerifyStep = 5;
+			TurnoverVerifyMark = -1.f;
+			TurnoverVerifyDeadline = Now + TraceCoreTurnoverVerify::StepTimeoutSeconds;
+			break;
+		}
+
+		if (PullWinner == Puller)
+		{
+			bTurnoverVerifySawWinner = true;
+
+			// In flight. The one number worth asserting here is the speed, because it is the one spec
+			// v25 names and the one a re-implementation would get wrong.
+			const double Speed = FVector(LooseVelocity).Size();
+			const double Expected = static_cast<double>(GetThrowSpeed());
+
+			if (FMath::Abs(Speed - Expected) <= 1.0)
+			{
+				UE_LOG(LogTraceGame, Verbose,
+					TEXT("[v25Turnover] delivery in flight at %.0f uu/s (thrown speed %.0f)."), Speed, Expected);
+			}
+			else
+			{
+				Fail(TEXT("the pulled Core is not travelling at the Core's thrown speed."));
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[v25Turnover]   measured %.0f uu/s, ATraceCore::GetThrowSpeed() says %.0f."),
+					Speed, Expected);
+				TurnoverVerifyStep = 5;
+			}
+		}
+		break;
+	}
+
+	case 5:
+	{
+		// --- RED ARM 4: THE LOCKED-OUT TEAM CANNOT PICK IT UP, AND THE LOCKOUT MUST EXPIRE. ------
+		//
+		// The Core is pinned to the locked-out player's feet for the whole window, so the pickup poll
+		// is being offered them on every single tick. It must refuse for the length of the window and
+		// take it within a tick or two of the window closing. Both halves come out of the SAME poll -
+		// there is no second code path for "after the lockout", which is the point of row 3 of the
+		// table being row 1.
+		if (!IsValid(Locked))
+		{
+			Skip(TEXT("step 5: the locked-out player went away."));
+			TurnoverVerifyStep = 6;
+			break;
+		}
+
+		if (TurnoverVerifyMark < 0.f)
+		{
+			double FeetDrop = 88.0;
+			if (const UCapsuleComponent* Capsule = Locked->GetCapsuleComponent())
+			{
+				FeetDrop = Capsule->GetScaledCapsuleHalfHeight();
+			}
+
+			const FVector Where = Locked->GetActorLocation()
+				- FVector(0.0, 0.0, FeetDrop - TraceModeBVisibleOrbRadius);
+
+			if (!DebugRegisterTurnover(ETraceTeam::Orange, Where))
+			{
+				Skip(TEXT("step 5: could not arm the lockout window."));
+				TurnoverVerifyStep = 6;
+				break;
+			}
+
+			TurnoverVerifyMark = Now;
+			TurnoverVerifyDeadline = Now + GetTurnoverLockoutSeconds()
+				+ TraceCoreTurnoverVerify::StepTimeoutSeconds;
+			break;
+		}
+
+		// Pinned to their feet every frame, so a wandering bot cannot quietly turn this into a test of
+		// nothing. The Core is at rest and the turnover is already latched, so no landing re-fires.
+		if (bLoose)
+		{
+			double FeetDrop = 88.0;
+			if (const UCapsuleComponent* Capsule = Locked->GetCapsuleComponent())
+			{
+				FeetDrop = Capsule->GetScaledCapsuleHalfHeight();
+			}
+
+			LooseLocation = Locked->GetActorLocation() - FVector(0.0, 0.0, FeetDrop - TraceModeBVisibleOrbRadius);
+			LooseVelocity = FVector::ZeroVector;
+			bLooseAtRest = true;
+		}
+
+		const float Elapsed = Now - TurnoverVerifyMark;
+
+		if (IsValid(Carrier))
+		{
+			if (Carrier == Locked && IsTurnoverActive())
+			{
+				Fail(TEXT("a player on the LOCKED-OUT team picked the Core up during the window."));
+				TurnoverVerifyStep = 6;
+			}
+			else if (Carrier == Locked)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[v25Turnover] red arm 4: %s (Orange, locked out) stood on the Core for the whole ")
+					TEXT("%.2fs window and could not take it, then took it %.2fs after it expired."),
+					*GetNameSafe(Locked), GetTurnoverLockoutSeconds(),
+					Elapsed - GetTurnoverLockoutSeconds());
+				Pass(TEXT("the lockout refuses the dropping team, and expires."));
+				TurnoverVerifyStep = 6;
+			}
+			else
+			{
+				// Legal: an opposing player is allowed to take it at any point in the window. It just
+				// means this step measured nothing, so re-arm rather than report a result it did not get.
+				if (TurnoverVerifyRetriesLeft-- > 0)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[v25Turnover] step 5: %s took the Core legally; re-arming (%d retries left)."),
+						*GetNameSafe(Carrier), TurnoverVerifyRetriesLeft);
+					TurnoverVerifyMark = -1.f;
+				}
+				else
+				{
+					Skip(TEXT("step 5: the Core kept being taken legally by the opposing team."));
+					TurnoverVerifyStep = 6;
+				}
+			}
+			break;
+		}
+
+		if (Elapsed > GetTurnoverLockoutSeconds() + 1.0f)
+		{
+			Fail(TEXT("the lockout expired but the player standing on the Core still did not get it."));
+			TurnoverVerifyStep = 6;
+		}
+		break;
+	}
+
+	default:
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[v25Turnover] ===== SPEC v25 §2 RED ARM: %d passed, %d FAILED, %d skipped ====="),
+			TurnoverVerifyPassCount, TurnoverVerifyFailCount, TurnoverVerifySkipCount);
+
+		if (TurnoverVerifyFailCount > 0)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[v25Turnover] the turnover rules above did not hold. Trace.ModeB.TurnoverPull 0 ")
+				TEXT("restores the pre-v25 behaviour if a comparison is wanted."));
+		}
+
+		bTurnoverVerifyArmed = false;
+		bTurnoverVerifyDone = true;   // See the field: the CVar cannot be written back down.
+		TurnoverVerifyStep = -1;
+		TurnoverVerifyPuller = nullptr;
+		TurnoverVerifyLocked = nullptr;
+		break;
+	}
+	}
+}
+
+// =================================================================================================
+// SPEC v25 §2 — ATraceCorePullRelay
+//
+// See the class comment in TraceCore.h. In one sentence: a client may only send a Server RPC on an
+// actor its own connection owns, ATraceCore is owned by its HOLDER, and a pull comes from somebody
+// who is not the holder — so the button needs a carrier of its own.
+//
+// It is deliberately the smallest thing that can do that. No state, no tick, no replicated property,
+// one function, one bool. Everything it forwards is re-decided by ATraceCore on the server.
+// =================================================================================================
+
+ATraceCorePullRelay::ATraceCorePullRelay()
+{
+	PrimaryActorTick.bCanEverTick = false;
+	PrimaryActorTick.bStartWithTickEnabled = false;
+
+	bReplicates = true;
+	SetReplicateMovement(false);
+	SetCanBeDamaged(false);
+
+	// ONLY ITS OWNER EVER SEES IT. Nine other clients being told that a tenth player's input relay
+	// exists is nine channels' worth of nothing; more importantly, an actor that is relevant to
+	// everybody is an actor whose ownership a reader has to think about, and this one's whole purpose
+	// is that its owner is exactly one connection.
+	bOnlyRelevantToOwner = true;
+	bAlwaysRelevant = false;
+	bNetLoadOnClient = false;
+}
+
+ATraceCorePullRelay* ATraceCorePullRelay::Find(const AController* Controller)
+{
+	if (Controller == nullptr)
+	{
+		return nullptr;
+	}
+
+	UWorld* World = Controller->GetWorld();
+	if (World == nullptr)
+	{
+		return nullptr;
+	}
+
+	for (TActorIterator<ATraceCorePullRelay> It(World); It; ++It)
+	{
+		ATraceCorePullRelay* Relay = *It;
+		if (IsValid(Relay) && Relay->GetOwner() == Controller)
+		{
+			return Relay;
+		}
+	}
+
+	return nullptr;
+}
+
+void ATraceCorePullRelay::ServerSetPullInput_Implementation(bool bPressed)
+{
+	// The pawn is read from the OWNING CONTROLLER on the server, never sent by the client. A client
+	// that could name the pawn its press applies to could press for somebody else's character, which
+	// on a mechanic that hands out the Core is the single most valuable thing in the game to lie
+	// about — the same policy the throw's aim direction and its hold length already have.
+	const AController* Owner = Cast<AController>(GetOwner());
+	ATraceCharacter* Pawn = (Owner != nullptr) ? Cast<ATraceCharacter>(Owner->GetPawn()) : nullptr;
+
+	ATraceCore* Core = ATraceCore::Get(GetWorld());
+	if (Core == nullptr || Pawn == nullptr)
+	{
+		return;
+	}
+
+	Core->RequestPullInput(bPressed, Pawn);
 }

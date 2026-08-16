@@ -34,9 +34,10 @@
  * Look is deliberately absent: it is the mouse, it has no discrete key, and everything a player
  * could want to change about it is a sensitivity or an inversion rather than a binding.
  *
- * Fire and Pass are BOTH listed even though the spec has mouse1 double as "pass" while carrying the
- * Core. That overload is a gameplay rule inside the weapon/character slice, not an input rule: the
- * player still deserves an explicit pass bind, and the two are free to be the same key.
+ * Fire and Pass are BOTH listed even though the spec has mouse1 double as "pass"/"throw" while
+ * carrying the Core. That overload is a gameplay rule inside the weapon/character slice, not an
+ * input rule: the player still deserves an explicit throw bind, and the two are free to be the same
+ * key. Since spec v25 §7 the Pass row ships UNBOUND — see its own comment; mouse1 is the throw.
  */
 UENUM()
 enum class ETraceInputAction : uint8
@@ -51,13 +52,33 @@ enum class ETraceInputAction : uint8
 	/**
 	 * Spec v3 §3. Took the slot Boost vacated, which is why Count is unchanged.
 	 *
-	 * The ConfigId is new ("Parry", never "Boost"), so a TraceUserSettings.ini written by an older
-	 * build carries a `Boost=E` line that RefreshFromConfig simply does not recognise and drops. That
-	 * is the whole migration: no player inherits a parry bound to the old boost key by accident, and
-	 * nobody has to write an upgrade path.
+	 * *** SPEC v25 §7: THIS IS THE RIGHT MOUSE BUTTON NOW, and its ConfigId is "ParryPull". ***
+	 * The ENUMERATOR keeps its name — internal identifiers are explicitly allowed to — but the id
+	 * that reaches the .ini moved, for the reason the action table spells out at length: a default
+	 * key change is invisible to every player who has ever saved a setting unless the id moves with
+	 * it, because Save() writes a line for every action and RefreshFromConfig honours them all.
+	 *
+	 * The id has now done this twice: "Boost" -> "Parry" (spec v3, when the boost was deleted and
+	 * nobody was to inherit a parry on the old boost key) and "Parry" -> "ParryPull" here. Both
+	 * times the migration is the same one line of existing behaviour — RefreshFromConfig drops a
+	 * line naming an id the table does not have — and both times there is no upgrade path to write.
+	 *
+	 * "ParryPull" and not "Parry2" because the button genuinely gained a second verb: spec v25 §2's
+	 * Core pull is dispatched from the same press. See ATracePlayerController::OnParryStarted for
+	 * why the two can never collide (parry needs you carrying, the pull needs you not carrying).
 	 */
 	Parry,
 	Fire,
+	/**
+	 * The Core throw / pass.
+	 *
+	 * *** SPEC v25 §7: NO DEFAULT KEY. *** It was right mouse; the note removes that bind, parry
+	 * takes the button, and nothing replaces it here — mouse 1 already throws (goals) or passes
+	 * (endzones) while carrying, so the verb keeps the button the HUD has always taught and this row
+	 * is the optional second route. Its ConfigId moved to "ThrowCore" for the same migration reason
+	 * Parry's did: without the move, a returning player's `Pass=RightMouseButton` line would put the
+	 * throw straight back onto the button the note just cleared.
+	 */
 	Pass,
 	Scoreboard,
 

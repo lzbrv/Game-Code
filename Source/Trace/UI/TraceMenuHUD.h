@@ -27,13 +27,14 @@
 // ATraceMenuPlayerController owns nothing but the key bindings and forwards them here; that split
 // keeps the layout maths and the hit testing in one file instead of two copies that drift.
 //
-// THE MODALS DO NOT SWAP THE RENDERER ANY MORE (spec v23 §A2). The settings overlay and the JOIN
-// prompt are still Canvas, and Canvas is still composited under Slate — but they now draw on the
-// engine's FOREGROUND canvas, which Slate paints in front of the UI, so the UMG title screen stays
-// up behind them instead of being collapsed for their frames. What the player sees when a modal
-// opens is the screen they were already looking at, dimmed. See FTraceOverSlateCanvas in
-// UI/TraceOptionsMenu.h for the mechanism, its fallback and its red arm; see DrawHUD for the one
-// decision both halves read.
+// THE MODALS DO SWAP THE RENDERER AGAIN, DELIBERATELY (spec v25 §1 reverts spec v23 §A2). The
+// settings overlay and the JOIN prompt are Canvas, Canvas is composited under Slate, so the UMG
+// title screen is collapsed for as long as one of them is up and the Canvas title screen draws
+// behind it instead. v23 §A2 avoided that by drawing the modals on the engine's FOREGROUND canvas;
+// that surface is deferred to the render thread on the engine's own schedule, and it is what made
+// "opening settings crashes the entire game" — reported three times, captured as a callstack the
+// third. The elevation is gone. See the header of UI/TraceOptionsMenu.h for the evidence and the
+// cost, and DrawHUD for the one decision this turns on.
 
 #pragma once
 
@@ -521,33 +522,21 @@ private:
 	bool bMenuUmgActive = false;
 
 	/**
-	 * True when the UMG title screen is AVAILABLE this frame, which is not quite the same as
-	 * bMenuUmgActive: the widget can be available and still stand down — but, as of spec v23 §A2,
-	 * ONLY when a modal is up AND the foreground canvas is unavailable (see bModalOverSlate).
+	 * True when the UMG title screen is AVAILABLE this frame, which is not the same as
+	 * bMenuUmgActive: the widget can be available and still stand down, which it does on every frame
+	 * a Canvas modal is up.
 	 *
-	 * HISTORY, because the difference between these two flags used to be the §A2 defect. Until v23
-	 * the widget stood down for EVERY frame a Canvas modal was up: the JOIN prompt and the settings
-	 * overlay forced the Canvas renderer for their frames, so the title screen behind the modal was
-	 * the retired stroked-vector one even when the player's actual title screen was the artist's.
-	 * That was invisible while GUseUMG defaulted to 0, because both states looked the same, and it
-	 * became the most visible defect on the screen the moment spec v20 flipped the default: press
-	 * JOIN, or SETTINGS, and the game's own name changed design. The modals now draw in FRONT of
-	 * Slate instead, so there is nothing to stand down for.
+	 * HISTORY, because the difference between these two flags is a defect this project has now paid
+	 * for in both directions. The widget stands down for a modal because Canvas is composited under
+	 * Slate, so the title screen behind an open SETTINGS or JOIN is the retired stroked-vector one
+	 * rather than the artist's — press one key and the game's own name changes design. Spec v23 §A2
+	 * removed that by drawing the modals on the engine's foreground canvas; that elevation is what
+	 * crashed the game on open, three reports running, and spec v25 §1 removed the elevation. So the
+	 * cosmetic defect is back, knowingly, and this comment is the record of that being a choice.
 	 */
 	bool bMenuUmgAvailable = false;
 
-	/**
-	 * SPEC v23 §A2 — true when a modal drawn this frame lands in front of Slate.
-	 *
-	 * Sampled once per DrawHUD, before anything is drawn, because two decisions have to agree on it:
-	 * whether the widget keeps the screen (here) and which surface the modal draws on (inside the
-	 * modal). Disagreement in one direction is a title screen with an invisible settings panel
-	 * behind it. See FTraceOverSlateCanvas in UI/TraceOptionsMenu.h.
-	 */
-	bool bModalOverSlate = false;
-
-	/** Last logged answer, so a change of surface is reported and a stale claim cannot outlive it. */
-	bool bModalOverSlateLastDecision = false;
+	/** Set once, so the single-surface line is logged once per process rather than 60x/s. */
 	bool bModalSurfaceLogged = false;
 
 	/** Set once, so the adoption decision is logged exactly once per title screen rather than 60x/s. */

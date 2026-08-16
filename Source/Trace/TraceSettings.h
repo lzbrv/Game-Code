@@ -803,9 +803,39 @@ public:
 	float FireInterval = 0.315789f;
 
 	// ==========================================================================================
-	// COMBAT — UPWARDS RECOIL  (spec v5 §6, new)
+	// COMBAT — UPWARDS RECOIL  (spec v5 §6, new — TURNED OFF BY SPEC v25 §5)
 	//
-	// Verbatim: "Add upwards recoil, mimicking 100 upwards recoil from destiny 2".
+	// *** SPEC v25 §5 — "Remove gun recoil, keep the firing rate." bRecoilEnabled IS NOW FALSE. ***
+	//
+	// WHICH RECOIL WENT, AND WHICH DID NOT. There are two separate things on this gun and only one
+	// of them is "recoil" in the sense the notes mean:
+	//
+	//   1. THE VIEW / AIM PUNCH — this block. It writes UPWARD PITCH INTO THE PLAYER'S CONTROL
+	//      ROTATION, so the crosshair, the camera and the next shot's ray all climb. It is the one
+	//      that MOVES YOUR AIM, it is what "recoil" means in every shooter, and it is what §5
+	//      removes. Applied by UTraceWeaponComponent::ApplyRecoilKick().
+	//
+	//   2. THE VIEWMODEL KICK — ATraceCharacter::NotifyWeaponFired() / ViewModelKick, in
+	//      Source/Trace/Core/TraceCharacter.cpp. It jolts the FIRST-PERSON GUN MESH back and up and
+	//      lets it settle. It is a cosmetic animation on the rig: it does not touch the control
+	//      rotation, it does not move the crosshair, and it cannot change where a round goes. It is
+	//      NOT touched by §5 — removing it would take the gun's animation away without removing any
+	//      aim penalty at all, which is the opposite of what was asked for. The muzzle flash and the
+	//      tracer stay for the same reason.
+	//
+	// THE FIRE RATE IS UNTOUCHED. FireInterval stays at 0.315789 s = 190 RPM (spec v24 §4), which is
+	// the line immediately above this block. Nothing in the recoil path reads or scales it.
+	//
+	// WHY A MASTER-SWITCH FLIP AND NOT A DELETION. The kick is applied through exactly one call
+	// (ApplyRecoilKick, which returns immediately on !bRecoilEnabled), so the flag is a real removal
+	// and not a mask: with it off nothing ever adds pitch, RecoilAppliedPitch never leaves 0, and
+	// TickRecoil early-outs on its first line. The tuning knobs below are left at their v5 values on
+	// purpose rather than being zeroed — zeroing them would leave the master switch as a control that
+	// turns nothing back on, which is this file's "dead knob" failure wearing the other hat. One flag
+	// is the whole difference between the two arms, so `Trace.TestRecoil` can measure them both.
+	//
+	// Verbatim (v5 §6, the request this block was built for): "Add upwards recoil, mimicking 100
+	// upwards recoil from destiny 2".
 	//
 	// [ASSUMPTION] A recoil-DIRECTION stat of 100 in Destiny 2 means the muzzle climbs on a perfectly
 	// vertical line: no horizontal drift, no left/right bias, no randomness in the direction. So this
@@ -837,12 +867,18 @@ public:
 	/**
 	 * Master switch for view recoil. OFF restores the perfectly static muzzle the gun shipped with.
 	 *
-	 * Exists so the new gun feel can be A/B'd against its absence from one binary, which matters
-	 * this pass: the fire rate moved at the same time, and "the gun feels worse" needs to be
-	 * attributable to one of the two changes and not to their sum.
+	 * *** FALSE AS OF SPEC v25 §5. This one line is the whole of "remove gun recoil". ***
+	 *
+	 * It was already the A/B switch — it exists so the gun feel could be compared against its
+	 * absence from one binary — so the removal is the arm that was already built and measured, not a
+	 * new code path. `Trace.TestRecoil` reports peak climb, residual pitch and yaw drift; with this
+	 * false every one of them must read 0.000, and that is the acceptance evidence for §5.
+	 *
+	 * Set it back to True (here AND in DefaultGame.ini, which wins) to restore the v5 §6 gun exactly:
+	 * every tuning knob below is still at its shipped value and nothing else was edited.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Combat|Recoil", meta = (DisplayName = "Upwards Recoil Enabled"))
-	bool bRecoilEnabled = true;
+	bool bRecoilEnabled = false;
 
 	/**
 	 * Degrees of UPWARD pitch added to the local player's view by the FIRST shot of a burst.
@@ -1558,14 +1594,14 @@ public:
 	 * "max slide length" dial. Sane range 0.8 to 2.5.
 	 *
 	 * THE BASE, NOT THE SHIPPED LENGTH. Spec v9 §6's "-30%" lives in SlideMaxLengthScale below and
-	 * spec v24 §8's "-0.4 s" lives in SlideDurationTrimSeconds below that; both are applied on top by
-	 * the movement component:
+	 * the accumulated "-0.4 s" (v24 §8) + "-0.2 s" (v25 §6) lives in SlideDurationTrimSeconds below
+	 * that; both are applied on top by the movement component:
 	 *
-	 *     effective duration = this x 0.7 - 0.4 = 1.26 - 0.4 = 0.86 s
+	 *     effective duration = this x 0.7 - 0.6 = 1.26 - 0.6 = 0.66 s      (v24 shipped 0.86 s)
 	 *
 	 * Do not fold either of them into this number — cutting this to 1.26 ships 0.88 s, a 51% cut, and
-	 * nothing on either side says so; cutting it by v24's 0.4 ships 0.98 s, which is 0.28 s of the
-	 * 0.4 s the owner asked for because the x0.7 lands on the cut as well.
+	 * nothing on either side says so; cutting it by the trim's 0.6 ships 0.84 s, which is 0.42 s of
+	 * the 0.6 s the owner asked for because the x0.7 lands on the cut as well.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Duration BASE (s, x max length scale)", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.3", UIMax = "3.0"))
 	float SlideDuration = 1.8f;
@@ -1586,8 +1622,9 @@ public:
 	 *
 	 * Knock-on: SlideJumpWindowSeconds (0.20 s) is measured from the slide's END and does not move,
 	 * so the well-timed window is now 16% of the slide rather than 11% — the slide-jump got slightly
-	 * EASIER to time, not harder. (Spec v24 §8's SlideDurationTrimSeconds takes another 0.4 s off the
-	 * product and takes that further: 0.20 s of a 0.86 s slide is 23%.)
+	 * EASIER to time, not harder. (SlideDurationTrimSeconds takes 0.6 s off the product and takes
+	 * that further still: 0.20 s of the shipped 0.66 s slide is 30%. The window's CLOSE is pinned to
+	 * the slide's end throughout — only the share of the slide it covers moves.)
 	 *
 	 * NAME IS LOAD-BEARING: bound BY NAME as "SlideMaxLengthScale" by
 	 * UTraceCharacterMovementComponent::GetSlideDuration(), clamped there to 0.05..4.
@@ -1596,32 +1633,54 @@ public:
 	float SlideMaxLengthScale = 0.7f;
 
 	/**
-	 * SPEC v24 §8 — "shorten the duration of the slide by .4seconds as well". Seconds taken off the
-	 * SHIPPED slide, AFTER SlideMaxLengthScale.
+	 * Seconds taken off the SHIPPED slide, AFTER SlideMaxLengthScale. The accumulator for every
+	 * "make the slide shorter" request, and the single knob that also moves the slide-jump window.
+	 *
+	 *     spec v24 §8: "shorten the duration of the slide by .4seconds as well"     -> 0.4
+	 *     spec v25 §6: "decrease slide duration by .2seconds"                       -> 0.6
 	 *
 	 *     shipped duration = SlideDuration x SlideMaxLengthScale - this
-	 *                      = 1.80 x 0.70 - 0.40 = 0.86 s      (was 1.26 s)
+	 *                      = 1.80 x 0.70 - 0.60 = 0.66 s      (v24 shipped 0.86 s, v23 1.26 s)
 	 *
 	 * A SEPARATE KNOB RATHER THAN AN EDIT TO SlideDuration, AND THAT IS SPEC v24 §0, NOT TIDINESS.
-	 * The owner's 0.4 s is 0.4 s of the slide he plays — the 1.26 s product — not of the 1.80 s base.
-	 * Cutting the base by 0.4 ships 1.40 x 0.70 = 0.98 s, i.e. 0.28 s of the 0.4 s he asked for.
-	 * Re-typing the base as 1.2286 (0.86 / 0.70) delivers 0.86 s today and quietly becomes a 0.514 s
-	 * cut the first time anybody re-tunes the v9 §6 scale, because an absolute buried under a
-	 * multiplier stops meaning what it was written to mean. As a trim over the finished length it
-	 * stays "0.4 s shorter than the slide would otherwise be" whatever the base and the scale do next.
+	 * The owner's seconds are seconds of the slide he plays — the 1.26 s product — not of the 1.80 s
+	 * base. Cutting the base by 0.6 ships 1.20 x 0.70 = 0.84 s, i.e. 0.42 s of the 0.6 s he asked
+	 * for. Re-typing the base as 0.9429 (0.66 / 0.70) delivers 0.66 s today and quietly becomes a
+	 * different cut the first time anybody re-tunes the v9 §6 scale, because an absolute buried under
+	 * a multiplier stops meaning what it was written to mean. As a trim over the finished length it
+	 * stays "0.6 s shorter than the slide would otherwise be" whatever the base and the scale do next.
 	 *
-	 * THE BONUS WINDOW MOVES WITH IT, WHICH IS THE OTHER HALF OF §8. SlideJumpWindowSeconds is
-	 * anchored to the slide's END (IsSlideJumpWellTimed() is `time LEFT <= window`), so a 0.4 s
-	 * shorter slide opens the window 0.4 s earlier — 1.06 s into the slide becomes 0.66 s — which is
-	 * exactly "the bonus window needs to happen .4 seconds earlier in the slide". SlideJumpWindowSeconds
-	 * is therefore NOT also cut by 0.4: doing both would open the window 0.26 s into a 0.86 s slide and
-	 * make 70% of every slide well-timed, which is not a window.
+	 * =============================================================================================
+	 * THIS KNOB IS ALSO THE WHOLE OF "MAKE THE WINDOW FOR SLIDE JUMPING .2 SECONDS EARLIER".
+	 * =============================================================================================
+	 *
+	 * SlideJumpWindowSeconds is anchored to the slide's END, not to its start —
+	 * IsSlideJumpWellTimed() asks `GetSlideTimeLeft() <= window`, never "t >= some offset". So
+	 * shortening the slide by 0.2 s drags the window's OPEN 0.2 s earlier and its CLOSE 0.2 s earlier
+	 * with it, and both halves of §6 are delivered by this one line:
+	 *
+	 *     v24 shipped   slide 0.860 s   window open 0.660 s   close 0.860 s (= the end)
+	 *     v25 shipped   slide 0.660 s   window open 0.460 s   close 0.660 s (= the end)
+	 *                                   ^^^^^^^^^^^^^^^^^^^   0.200 s earlier, as asked
+	 *
+	 * *** THE §6 ACCEPTANCE CRITERION — "the window should be right at the end of the slide" — IS
+	 * SATISFIED BY CONSTRUCTION, AND THAT IS WHY IT IS SATISFIED. *** The window is DEFINED as the
+	 * last N seconds of the slide, so its close and the slide's end are the same instant: offset
+	 * 0.000 s, not "close to the end". It was at the end before this change and it is at the end
+	 * after it, at every value this knob can take. Verify rather than believe: -TraceSlideDebug
+	 * prints a V24WINDOW line off live slides with the measured open and close.
+	 *
+	 * DO NOT ALSO ADD 0.2 TO SlideJumpWindowSeconds. That is the reading that breaks the acceptance
+	 * criterion instead of meeting it: a 0.40 s window on a 0.66 s slide opens 0.26 s in — 61% of
+	 * every slide is then "well timed", which is not a window and is not "right at the end". The
+	 * same trap was documented and avoided for v24's 0.4 s; the arithmetic is just starker now that
+	 * the slide is shorter.
 	 *
 	 * Set to 0 for the pre-v24 slide. `Trace.V24LegacySlide 1` / -TraceV24LegacySlide does exactly
 	 * that at runtime and is the A/B arm for this item.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide", meta = (DisplayName = "Duration Trim (s, off the scaled length)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
-	float SlideDurationTrimSeconds = 0.4f;
+	float SlideDurationTrimSeconds = 0.6f;
 
 	/**
 	 * uu/s bled off the slide every second. THIS IS THE MOMENTUM DIAL — lower preserves more.
@@ -1770,14 +1829,32 @@ public:
 	 * Sane range 0.15 to 0.30. Below ~0.1 it is unhittable at real latency; above ~0.5 against a 1.8s
 	 * slide it covers so much of the slide that it stops being a window at all.
 	 *
-	 * SPEC v24 §8 DELIBERATELY DID NOT MOVE THIS, and the reasoning belongs next to the number so the
-	 * next pass does not "finish the job". §8 asks for the bonus window to happen 0.4 s earlier in the
-	 * slide AND for the slide to be 0.4 s shorter. Because this window is anchored to the slide's END,
-	 * the second delivers the first: shortening the slide from 1.26 s to 0.86 s moves the moment the
-	 * window opens from 1.06 s to 0.66 s, which is 0.4 s earlier, measured on a live pawn (grep
-	 * V24WINDOW under -TraceSlideDebug). Adding 0.4 s HERE as well would open the window 0.26 s into a
-	 * 0.86 s slide — 70% of the slide, three times the window relative to the end — which is the
-	 * double-application this file's SlideDuration note warns about, wearing the window's hat.
+	 * *** SPEC v24 §8 DELIBERATELY DID NOT MOVE THIS, AND NEITHER DOES SPEC v25 §6. *** The reasoning
+	 * belongs next to the number so that no pass "finishes the job" by adding the seconds twice.
+	 *
+	 * Both specs ask for the same pair: the bonus window earlier in the slide, and the slide shorter,
+	 * by the same amount. BECAUSE THIS WINDOW IS ANCHORED TO THE SLIDE'S END, THE SECOND DELIVERS THE
+	 * FIRST. IsSlideJumpWellTimed() asks `GetSlideTimeLeft() <= this`, so the window is defined as the
+	 * slide's last N seconds and it slides earlier in lockstep with the end it hangs off:
+	 *
+	 *     v23        slide 1.26 s   window opens 1.06 s   closes 1.26 s   (window = 16% of the slide)
+	 *     v24 §8     slide 0.86 s   window opens 0.66 s   closes 0.86 s   (-0.4 s, 23%)
+	 *     v25 §6     slide 0.66 s   window opens 0.460 s  closes 0.660 s  (-0.2 s, 30%)
+	 *
+	 * Measured on a live pawn, not asserted: grep V24WINDOW under -TraceSlideDebug.
+	 *
+	 * ADDING THE SECONDS HERE AS WELL IS THE FAILURE, AND IT GETS WORSE EACH PASS BECAUSE THE SLIDE
+	 * KEEPS SHRINKING. At v24 it would have opened the window 0.26 s into a 0.86 s slide (70% of it);
+	 * at v25 a 0.40 s window opens 0.26 s into a 0.66 s slide — 61% of every slide "well timed". That
+	 * is the double-application this file's SlideDuration note warns about, wearing the window's hat,
+	 * and it also breaks v25 §6's acceptance criterion ("the window should be right at the end of the
+	 * slide") in the act of pretending to satisfy it.
+	 *
+	 * THE ACCEPTANCE CRITERION IS ABOUT THE CLOSE, AND THE CLOSE IS THE SLIDE'S END EXACTLY — the two
+	 * are the same instant by construction, at every value this knob can hold. What this knob does
+	 * control is how WIDE the window is behind that end: 0.20 s of a 0.66 s slide is the final 30%.
+	 * If a future pass wants the window tighter against the end than 30%, THAT is the change this
+	 * number is for, and it is a separate design decision from either §6 sentence.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Timing Window (s before slide end)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.6"))
 	float SlideJumpWindowSeconds = 0.20f;
@@ -2877,6 +2954,117 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Landing Min Descent (deg) [v13 §8]", ClampMin = "0.0", ClampMax = "89.0", UIMin = "0.0", UIMax = "45.0"))
 	float CoreLandingMinDescentDegrees = 20.f;
+
+	// ==========================================================================================
+	// SPEC v25 §2 — THE TURNOVER WINDOW AND THE MAGNET PULL  (goals mode only)
+	//
+	// Verbatim: "Instead of automatically going to the other team, a turnover is registered and the
+	// core stays on the ground where it landed. / Players from the opposite team can hold right
+	// mouse while hovering over the core to pull it to them, like a magnet. / Pulling the core
+	// requires holding down right click while hovering mouse over it (with line of sight) for
+	// .3seconds / Players from the team who dropped the core are locked out of picking it up for 5
+	// seconds / After the 5 seconds are up, the opposite team loses the pull ability and either team
+	// can pick up the core by running over it / the beam of light coming from the core should change
+	// colors to the opposite team and be larger for the 5 seconds".
+	//
+	// NOTE WHAT IS *NOT* HERE: a pull speed. "It travels towards the player who completed the pull
+	// first at full core thrown velocity" names an existing constant, so the delivery reads
+	// ATraceCore::GetThrowSpeed() — CoreThrowSpeed after the weight model — and there is deliberately
+	// no second number to disagree with it. Retune the throw and the pull follows.
+	//
+	// The TURNOVER CRITERIA are also not here and are unchanged (CoreSurfaceMaxSlopeDegrees,
+	// CoreLandingMinDescentDegrees and the settle above still decide WHETHER and WHEN a turnover
+	// fires). This block is only about what happens afterwards.
+	// ==========================================================================================
+
+	/**
+	 * SPEC v25 §2. Seconds the team that DROPPED the Core is locked out of picking it up.
+	 *
+	 * For this window, and only this window: the OPPOSING team alone may pull the Core or run over
+	 * it, and the beam wears their colour at CoreTurnoverBeamScale. When it expires the pull ability
+	 * goes away and either team may take it by touch — which is exactly what a Core that was never
+	 * turned over already does, so the window is cleared rather than kept as a third state.
+	 *
+	 * 5 is the note's own number. 0 turns the window off entirely, which is NOT the pre-v25 rule (a
+	 * turnover would simply become a loose Core anybody may take); the A/B arm for the old behaviour
+	 * is Trace.ModeB.TurnoverPull 0.
+	 *
+	 * THE LOCKOUT IS ON THE TEAM, NOT THE PLAYER. CoreThrowerPickupLockoutSeconds above is the other
+	 * one and is a different thing: 0.35 s on ONE pawn so a throw is not caught by the hand it left.
+	 *
+	 * Trace.ModeB.TurnoverLockoutSeconds overrides it live.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Turnover Lockout (s) [v25 §2]", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "15.0"))
+	float CoreTurnoverLockoutSeconds = 5.f;
+
+	/**
+	 * SPEC v25 §2. Seconds of CONTINUOUS right mouse + hover + line of sight that complete a pull.
+	 *
+	 * CONTINUOUS is the whole of it: losing the hover, losing line of sight or releasing the button
+	 * CANCELS the fill outright and the next attempt starts from zero. It does not pause, and there
+	 * is no credit carried across a blink — a pull that could be accumulated in fragments would let a
+	 * player pull the Core through a wall by flicking across it.
+	 *
+	 * 0.3 is the note's own number. Server-measured: the client sends only the button, so the ring a
+	 * player watches fill is the server's clock rather than their own (spec v25: "Do not let a client
+	 * decide it won a race"). Trace.ModeB.PullHoldSeconds overrides it live.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pull Hold (s) [v25 §2]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.1", UIMax = "1.5"))
+	float CorePullHoldSeconds = 0.3f;
+
+	/**
+	 * SPEC v25 §2. Half-angle of the cone that counts as "hovering the mouse over the core" at range.
+	 *
+	 * The pull's hover test is the same shape as the pass's (PassAimConeDegrees / PassAimSlack) and
+	 * for the same reason: EITHER the aim is inside this cone OR the aim ray passes within
+	 * CorePullAimSlackUU of the orb. A pure ray test is unusable at range — the drawn orb is 20 uu
+	 * across and subtends 0.14 degrees at 8000 uu — and a pure cone is unusable point-blank, where a
+	 * few degrees is several hundred uu of forgiveness.
+	 *
+	 * 4 degrees is tighter than the pass's 9, on purpose: a pass picks a teammate out of a moving
+	 * crowd, and a pull picks the one stationary object on the floor. Trace.ModeB.PullAimConeDegrees
+	 * overrides it live.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pull Aim Cone (deg) [v25 §2]", ClampMin = "0.0", ClampMax = "45.0", UIMin = "1.0", UIMax = "15.0"))
+	float CorePullAimConeDegrees = 4.f;
+
+	/**
+	 * SPEC v25 §2. How far, in uu, the aim ray may miss the ORB'S SURFACE and still count as a hover.
+	 *
+	 * Added to the DRAWN orb radius (20 uu), not to the larger sphere the loose Core sweeps with: the
+	 * player is aiming at a ball they can see, so the forgiveness is measured off that ball.
+	 * Trace.ModeB.PullAimSlackUU overrides it live.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pull Aim Slack (uu) [v25 §2]", ClampMin = "0.0", ClampMax = "400.0", UIMin = "0.0", UIMax = "150.0"))
+	float CorePullAimSlackUU = 60.f;
+
+	/**
+	 * SPEC v25 §2. Optional ceiling on how far away a pull may be STARTED, uu. 0 = no limit.
+	 *
+	 * 0 IS THE SHIPPED VALUE, and that is a decision rather than an oversight: the note states no
+	 * range, and inventing one would be adding a rule. It is not needed to keep the mechanic sane
+	 * either — a pull already requires the crosshair on a 20 uu ball WITH clear line of sight, which
+	 * across a 33600 uu pitch is its own range limit. The knob exists so a playtest that disagrees
+	 * can put a number on it without a rebuild. Trace.ModeB.PullMaxRangeUU overrides it live.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pull Max Range (uu, 0 = none) [v25 §2]", ClampMin = "0.0", ClampMax = "60000.0", UIMin = "0.0", UIMax = "8000.0"))
+	float CorePullMaxRangeUU = 0.f;
+
+	/**
+	 * SPEC v25 §2/§3. How much LARGER the Core's beam is during the turnover window.
+	 *
+	 * *** A MULTIPLIER OF THE NORMAL BEAM WIDTH, NEVER A WIDTH. *** This is Demo 21's standing rule
+	 * applied literally: the note asks for a beam that is "larger", which is a statement ABOUT the
+	 * normal beam, so it has to move when the normal beam moves. A stored width would be "larger"
+	 * today and quietly wrong the first time the base beam was retuned — and nothing would say so.
+	 *
+	 * 1 = no change, which is the A/B for judging whether the size cue is doing any work at all.
+	 * 2.2 is an [ASSUMPTION]: the note says "larger" without a number, and at 2.2 the shaft reads as
+	 * a different object from across the field rather than as the same one slightly closer.
+	 * Trace.ModeB.TurnoverBeamScale overrides it live.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Turnover Beam Scale (x normal) [v25 §2]", ClampMin = "0.1", ClampMax = "10.0", UIMin = "1.0", UIMax = "4.0"))
+	float CoreTurnoverBeamScale = 2.2f;
 
 	// ==========================================================================================
 	// PARRY  (spec v3 §3 — new mechanic)

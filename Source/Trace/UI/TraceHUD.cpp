@@ -2,6 +2,7 @@
 
 #include "UI/TraceHUD.h"
 
+#include "Components/StaticMeshComponent.h"  // v25 §3 — the pull ring measures the drawn orb's bounds
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
@@ -258,6 +259,461 @@ namespace TraceHUDStyle
 	}
 }
 
+// Forward declaration only — the definition, its console arm and the reasoning are all down with the
+// rest of the type helpers in namespace TraceHUDType. It is declared this early because the pull ring
+// (spec v25 §3) draws a caption a thousand lines above them and must type in the same face as every
+// other row, and because a second copy of "which face is the HUD in" is exactly the drift this
+// function exists to prevent.
+namespace TraceHUDType
+{
+	static ETraceTextWeight HudWeight();
+}
+
+// =================================================================================================
+// SPEC v25 §3 — THE PULL RING
+//
+//   "There is a small circle around the core while hovering, which fills with pull progress."
+//   "It must show real server-side progress, not a local guess that can disagree with the outcome."
+//
+// TWO THINGS MAKE THIS DIFFERENT FROM EVERY OTHER RING ON THIS HUD, and both are in the note.
+//
+// 1. IT IS AROUND THE CORE, NOT AROUND THE CROSSHAIR. DrawCrosshairRing below draws the pass and the
+//    throw charge at screen centre, because those are things you do WITH your aim. This one marks an
+//    OBJECT lying on the floor that you may not be aimed exactly at — the pull's hover test is a cone
+//    plus a slack radius (ATraceCore::CanPullNow), so the Core is routinely a few degrees off centre
+//    while the pull is perfectly legal. A ring at the crosshair would sit beside the thing it is
+//    describing. So it is projected onto the Core's own world position, and its RADIUS is derived
+//    from the projected radius of the drawn orb — a multiple of it, never a pixel count — so it hugs
+//    the ball at three metres and at thirty. Demo 21's standing rule, applied to a screen size: the
+//    ring is "a small circle AROUND THE CORE", which is a statement about the orb, so if the orb's
+//    size is ever retuned the ring moves with it instead of quietly becoming the wrong circle.
+//
+// 2. THE NUMBER IS THE SERVER'S. ATraceCore::GetPullProgressFor() reads the replicated
+//    FTraceCorePullHold the SERVER stamped, against the shared clock. There is deliberately NO local
+//    prediction here and no local timer — not even a smoothing filter — because the note's warning is
+//    exactly the failure prediction produces: two opponents pull at once, both clients run their own
+//    0.3 s clocks, both rings fill, and the loser watched a full ring hand the Core to somebody else.
+//    A ring that can disagree with the outcome is worse than a ring that arrives a ping late.
+//
+// WHEN IT IS UP: whenever the server would accept a pull from this player right now (CanPullNow, the
+// same function the server's own state machine asks — so a ring cannot appear for a pull that would
+// be refused), or whenever a hold of theirs is actually running. The second half matters on its own:
+// a fill that vanished the frame the player's aim wobbled off the cone would hide the cancel that
+// just happened to them.
+//
+// It is a file-named namespace of free functions rather than an ATraceHUD method because TraceHUD.h
+// is not this pass's to edit; everything it needs is public (AHUD::DrawLine/DrawRect, the atlas
+// blitter, the Core's replicated accessors) and the rest is passed in.
+// =================================================================================================
+namespace TraceHUDPullRing
+{
+	/**
+	 * The ring's radius, AS A MULTIPLE OF THE DRAWN ORB'S PROJECTED RADIUS.
+	 *
+	 * 2.4 puts the track a little over one orb-width clear of the ball: close enough to read as
+	 * belonging to it, far enough that the ring is not drawn on top of the ink it is about. Relative
+	 * rather than absolute, per the standing rule — see the banner.
+	 */
+	constexpr float RadiusInOrbRadii = 2.4f;
+
+	/**
+	 * Legibility floor and ceiling, in 1080p-reference pixels, scaled by UIScale.
+	 *
+	 * The floor is not a fudge: at the far end of this pitch a 20 uu orb projects to under a pixel,
+	 * and a ring faithfully drawn at 2.4x that would be invisible at exactly the moment a player is
+	 * trying to work out whether their pull is landing. The ceiling stops a Core at arm's length from
+	 * throwing a ring around half the screen. Between them the ring is honestly sized off the orb.
+	 */
+	constexpr float MinRadiusPx = 15.f;
+	constexpr float MaxRadiusPx = 70.f;
+
+	/** Chords, not an arc primitive — Canvas has none. Enough to look round at MaxRadiusPx. */
+	constexpr int32 Segments = 40;
+
+	/**
+	 * Orb radius, in uu, when the Core's mesh cannot be measured.
+	 *
+	 * The mesh is the 100 uu engine sphere at TraceCoreTuning::OrbScale, i.e. 20 uu, and that is what
+	 * Bounds.SphereRadius reports — so this is only reached before the component has bounds. It is a
+	 * fallback and not the source of truth precisely so a re-scaled orb moves the ring without an edit
+	 * here.
+	 */
+	constexpr double FallbackOrbRadiusUU = 20.0;
+
+	/**
+	 * 0 hides the ring: the RED ARM, and it is the pre-v25 screen exactly — a turned-over Core with no
+	 * circle around it and no way to tell a pull that is filling from one that never started. Cheat
+	 * only, so the before/after pair comes out of one binary and one fixture.
+	 */
+	static TAutoConsoleVariable<int32> CVarPullRing(
+		TEXT("Trace.HUD.PullRing"),
+		1,
+		TEXT("1 (default, spec v25 3): draw the pull progress ring around a turned-over Core.\n")
+		TEXT("0 = RED ARM: no ring, which is what the player saw before this pass."),
+		ECVF_Cheat);
+
+	/**
+	 * 1 logs, at 4 Hz, this machine's view of the pull: the SERVER progress the ring is drawing and
+	 * the named reason CanPullNow gave when it refused.
+	 *
+	 * This is the evidence that the ring is not a local guess. A screenshot shows a ring at 60%; only
+	 * this says that 60% came off the replicated hold rather than off a timer started here. It also
+	 * answers "the ring never appeared", which has eight causes and no visible difference between
+	 * them — CanPullNow names the one that fired.
+	 */
+	static TAutoConsoleVariable<int32> CVarPullRingLog(
+		TEXT("Trace.HUD.PullRing.Log"),
+		0,
+		TEXT("1: log the SERVER pull progress the ring is drawing and CanPullNow's refusal reason, at "
+		     "4 Hz. Diagnostic for spec v25 3 - proves the ring's number is replicated, not local."),
+		ECVF_Cheat);
+
+	/** Screen-space distance, in pixels, between two projected points. */
+	static float ScreenDistance(const FVector& A, const FVector& B)
+	{
+		return static_cast<float>(FVector2D(A.X - B.X, A.Y - B.Y).Size());
+	}
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * `Trace.HUD.PullRing.Shot 1` — PHOTOGRAPH THE RING WHEN IT IS ACTUALLY ON SCREEN.
+	 *
+	 * -TraceAutoShotRepeat cannot photograph this. Measured on this pass: over a 95 s run of
+	 * Trace.ModeB.TurnoverVerify the local player satisfied CanPullNow — turnover open, on the
+	 * pulling team, line of sight, aim on the orb — on about half a second of it, because the harness
+	 * parks the Core at a BOT's feet across the arena and will not move a human's crosshair. A blind
+	 * 3 Hz burst caught 144 frames and none of them was the one that mattered.
+	 *
+	 * So the trigger is the DRAW ITSELF: this fires the moment the ring first appears, and again the
+	 * moment it first shows a non-zero server fill, which are precisely the two claims §3 makes. The
+	 * screenshot is requested from the same FScreenshotRequest path -TraceAutoShot uses, with
+	 * bShowUI=true, because the ring is Canvas HUD and a UI-less capture is blind to it.
+	 *
+	 * Two shots per session and no more: this is evidence, not a filming mode.
+	 */
+	static TAutoConsoleVariable<int32> CVarPullRingShot(
+		TEXT("Trace.HUD.PullRing.Shot"),
+		0,
+		TEXT("1: request a screenshot the first frame the pull ring is drawn, and again the first "
+		     "frame it shows a non-zero SERVER fill. Capture device for spec v25 3 - a blind burst "
+		     "cannot catch a window this narrow."),
+		ECVF_Cheat);
+
+	/** Fires at most once per @p bAlreadyShot flag. Named so the file it lands in is self-describing. */
+	static void CaptureRingFrame(const TCHAR* Which, float Progress, float Radius, float CX, float CY)
+	{
+		const FString Path = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"),
+			FString::Printf(TEXT("v25pullring_%s_%s.png"), Which,
+				*FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[PullRing] CAPTURE (%s): the ring is on screen at (%.0f, %.0f), radius %.1f px, ")
+			TEXT("SERVER progress %.3f. Screenshot -> %s"),
+			Which, CX, CY, Radius, Progress, *Path);
+
+		// bShowUI = true. The ring is drawn on the HUD's Canvas, inside the Slate layer; a capture
+		// with bShowUI=false excludes that whole layer and would photograph an empty arena. This HUD
+		// has already shipped one blind capture for exactly that reason (see the -TraceAutoPause call
+		// site in DrawHUD).
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+	}
+#endif
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * `Trace.HUD.PullRing.Hold 1` / `0` — HOLDS THE PULL BUTTON FOR THE LOCAL PLAYER, so the filling
+	 * ring can be PHOTOGRAPHED.
+	 *
+	 * *** WHAT IT FAKES IS THE BUTTON AND NOTHING ELSE, AND THAT DISTINCTION IS THE WHOLE POINT. ***
+	 * It calls the shipping ATraceCore::RequestPullInput — the same function §7's right mouse calls —
+	 * so the server runs the real latch, the real hover test, the real 0.3 s clock and the real race,
+	 * and the ring above goes on reading GetPullProgressFor(). Nothing here writes a progress value,
+	 * and there is deliberately no way for this command to make the ring show a number the server did
+	 * not produce; if §2 refuses the hold, the ring stays empty and the .Log line says which test
+	 * refused it. That is the only kind of capture harness worth having for a claim like "this is
+	 * server progress" — one that can still fail.
+	 *
+	 * It exists because this project's testing policy forbids typing into a window, and there is no
+	 * other way to hold a mouse button in a scripted -TraceExec capture. Dev builds only.
+	 */
+	static void HoldPull(const TArray<FString>& Args, UWorld* World)
+	{
+		// STICKY, and that is what makes it usable in a scripted run. -TraceExec fires its whole list
+		// at ONE instant, so a bare press lands before the turnover it is meant to pull and is refused
+		// ("the Core is not loose", measured). The real button is held down by a hand for a second or
+		// two across changing conditions, so this one is too: it re-asserts the press every frame for
+		// @p Args[0] seconds and releases at the end. Re-asserting is free — ServerApplyPullInput
+		// early-outs on a latch that is already set.
+		float Seconds = 8.f;
+		if (Args.Num() > 0)
+		{
+			Seconds = FCString::Atof(*Args[0]);
+			if (Seconds <= 0.f)
+			{
+				Seconds = 8.f;
+			}
+		}
+
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[PullRing] Trace.HUD.PullRing.Hold: no world."));
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[PullRing] Trace.HUD.PullRing.Hold: holding the pull for the local pawn for %.1fs, ")
+			TEXT("re-asserted every frame, through the shipping ATraceCore::RequestPullInput. This ")
+			TEXT("presses a button; the ring goes on drawing only what the SERVER replicates back."),
+			Seconds);
+
+		TWeakObjectPtr<UWorld> WeakWorld(World);
+		const double EndTime = FPlatformTime::Seconds() + static_cast<double>(Seconds);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[WeakWorld, EndTime](float /*Delta*/) -> bool
+			{
+				UWorld* Live = WeakWorld.Get();
+				if (Live == nullptr)
+				{
+					return false;
+				}
+
+				ATraceCore* Core = ATraceCore::Get(Live);
+				APlayerController* PC = Live->GetFirstPlayerController();
+				ATraceCharacter* Pawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+
+				const bool bExpired = FPlatformTime::Seconds() >= EndTime;
+
+				if (Core != nullptr && IsValid(Pawn))
+				{
+					Core->RequestPullInput(!bExpired, Pawn);
+				}
+
+				if (bExpired)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[PullRing] Trace.HUD.PullRing.Hold: released."));
+					return false;
+				}
+				return true;
+			}), 0.f);
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs CmdHoldPull(
+		TEXT("Trace.HUD.PullRing.Hold"),
+		TEXT("Spec v25 3, CAPTURE ONLY. Holds the Core pull for the local pawn for <seconds> (default "
+		     "8), re-asserted every frame through the shipping ATraceCore::RequestPullInput, so a "
+		     "scripted -TraceExec run can photograph a FILLING ring. It fakes the button, never the "
+		     "progress - if the server refuses the hold the ring stays empty."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&HoldPull));
+#endif
+
+	/**
+	 * Draws the ring for @p LocalChar, or nothing.
+	 *
+	 * @param Core       the match Core. Null, mode A, or not turned over all end in nothing drawn.
+	 * @param LocalChar  this machine's pawn — the player DOING the pulling, which is the only one the
+	 *                   note asks to show a ring to.
+	 */
+	static void Draw(AHUD* HUD, const ATraceCore* Core, const ATraceCharacter* LocalChar,
+		const APlayerController* PC, ETraceTeam LocalTeam, float UIScale, float Now)
+	{
+		if (HUD == nullptr || Core == nullptr || !IsValid(LocalChar) || PC == nullptr)
+		{
+			return;
+		}
+
+		// SERVER PROGRESS. -1 means this player has no hold running. Read first, and read ONCE, so
+		// everything below — whether to draw at all, how far round to fill, what the log says — is one
+		// sample of one replicated fact rather than three reads that can straddle a replication.
+		const float Progress = Core->GetPullProgressFor(LocalChar);
+
+		const TCHAR* Reason = TEXT("legal");
+		const bool bEligible = Core->CanPullNow(LocalChar, &Reason);
+
+		if (CVarPullRingLog.GetValueOnGameThread() != 0)
+		{
+			static float NextLogTime = 0.f;
+			if (Now >= NextLogTime)
+			{
+				NextLogTime = Now + 0.25f;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[PullRing] server progress %.3f (-1 = no hold), eligible %s (%s), turnover %s ")
+					TEXT("with %.2fs left. The ring draws the first number and nothing else."),
+					Progress, bEligible ? TEXT("YES") : TEXT("no"), Reason,
+					Core->IsTurnoverActive() ? TEXT("ACTIVE") : TEXT("none"),
+					Core->GetTurnoverSecondsRemaining());
+			}
+		}
+
+		if (CVarPullRing.GetValueOnGameThread() == 0)
+		{
+			return;
+		}
+
+		// Eligible OR already filling. The second half is not redundant: the fill CANCELS rather than
+		// pauses, and a ring that disappeared on the same frame as the cancel would leave the player
+		// with no idea their hold had been dropped.
+		if (!bEligible && Progress < 0.f)
+		{
+			return;
+		}
+
+		UCanvas* Canvas = TraceCanvasText::GameCanvas();
+		if (Canvas == nullptr)
+		{
+			return;
+		}
+
+		// The Core's own authoritative position, not the actor transform: a loose Core is moved by the
+		// server's flight model and GetLooseLocation() is the replicated fact both machines agree on.
+		const FVector Centre = Core->GetLooseLocation();
+
+		// bClampToZeroPlane = false, so a Core BEHIND the camera reports a negative depth instead of
+		// being folded onto the near plane — which would draw a ring at a plausible-looking screen
+		// position for a ball nobody can see.
+		const FVector Projected = Canvas->Project(Centre, /*bClampToZeroPlane=*/false);
+		if (Projected.Z <= 0.f)
+		{
+			return;
+		}
+
+		// ---- The radius, off the orb the player is looking at ---------------------------------------
+		//
+		// Measured by projecting a point one orb-radius to the camera's RIGHT of the centre and taking
+		// the pixel distance. That is the correct perspective answer at any distance and any FOV, and
+		// it needs no field-of-view arithmetic here that could drift from the camera's.
+		FVector ViewLocation = FVector::ZeroVector;
+		FRotator ViewRotation = FRotator::ZeroRotator;
+		PC->GetPlayerViewPoint(ViewLocation, ViewRotation);
+		const FVector CameraRight = FRotationMatrix(ViewRotation).GetUnitAxis(EAxis::Y);
+
+		double OrbRadiusUU = FallbackOrbRadiusUU;
+		if (Core->Mesh != nullptr)
+		{
+			const double MeshRadius = Core->Mesh->Bounds.SphereRadius;
+			if (MeshRadius > 1.0)
+			{
+				OrbRadiusUU = MeshRadius;
+			}
+		}
+
+		const FVector Edge = Canvas->Project(Centre + CameraRight * OrbRadiusUU,
+			/*bClampToZeroPlane=*/false);
+		const float OrbPixels = ScreenDistance(Projected, Edge);
+
+		const float Radius = FMath::Clamp(OrbPixels * RadiusInOrbRadii,
+			MinRadiusPx * UIScale, MaxRadiusPx * UIScale);
+		const float Thickness = FMath::Max(2.f, 3.f * UIScale);
+
+		const float CX = static_cast<float>(Projected.X);
+		const float CY = static_cast<float>(Projected.Y);
+
+		auto PointAt = [CX, CY, Radius](float T)
+		{
+			// Twelve o'clock, closing clockwise — the same sweep DrawCrosshairRing uses, because a
+			// player who has learned one progress ring in this game has learned all of them.
+			const float Angle = -UE_HALF_PI + T * UE_TWO_PI;
+			return FVector2D(CX + Radius * FMath::Cos(Angle), CY + Radius * FMath::Sin(Angle));
+		};
+
+		// The unfilled track. DIMMED IN RGB AND NOT IN ALPHA: AHUD::DrawLine builds an FCanvasLineItem
+		// and FCanvasItem's constructor sets SE_BLEND_Opaque, so the alpha handed to DrawLine is
+		// DISCARDED — a "faint" track written as alpha 0.18 renders as pure white and reads backwards.
+		// This HUD has already been caught by that once; see DrawCrosshairRing.
+		const FLinearColor Track(0.20f, 0.20f, 0.20f, 1.f);
+		for (int32 Index = 0; Index < Segments; ++Index)
+		{
+			const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
+			const FVector2D B = PointAt(static_cast<float>(Index + 1) / Segments);
+			HUD->DrawLine(A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
+		}
+
+		const float Filled = FMath::Clamp(Progress, 0.f, 1.f);
+		const bool bComplete = (Progress >= 1.f);
+
+		// Filling wears the PULLING team's colour, which is this player's — CanPullNow has already
+		// refused everybody else, so LocalTeam is the turnover's opposing team by construction. It
+		// snaps to Good and pulses the instant the hold is complete, for the same reason the throw
+		// charge does: past full there is nothing left to hold for.
+		const FLinearColor FillColor = bComplete
+			? TraceHUDStyle::Shade(TraceHUDStyle::Good, 0.7f + 0.3f * FMath::Sin(Now * 12.f), 0.f)
+			: TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.30f);
+
+		const int32 Chords = FMath::CeilToInt(Filled * Segments);
+		for (int32 Index = 0; Index < Chords; ++Index)
+		{
+			const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
+			const FVector2D B = PointAt(FMath::Min(Filled, static_cast<float>(Index + 1) / Segments));
+			HUD->DrawLine(A.X, A.Y, B.X, B.Y, FillColor, Thickness);
+		}
+
+		// ---- The prompt, while the ring is empty ----------------------------------------------------
+		//
+		// Only while nothing is filling: once the arc is moving it says everything the caption did, and
+		// a label that stayed up would sit on top of a Core the player is trying to watch.
+		//
+		// THE KEY IS READ FROM THE PLAYER'S OWN BINDINGS, by the same stable-ConfigId lookup the
+		// ability row uses. "ParryPull" is §7's id for the right mouse button — the button gained the
+		// pull as a second verb — so a player who rebinds it is told what they actually bound. A HUD
+		// that hardcoded "RMB" would be lying to the first person who changed it.
+		if (Progress < 0.f)
+		{
+			FString KeyLabel(TEXT("RIGHT MOUSE"));
+			for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+			{
+				if (FCString::Stricmp(Info.ConfigId, TEXT("ParryPull")) == 0)
+				{
+					const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
+					if (BoundKey.IsValid())
+					{
+						KeyLabel = BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
+					}
+					break;
+				}
+			}
+
+			TraceText::FStyle Style(14.f * UIScale,
+				TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f));
+			Style.HAlign = TraceText::EHAlign::Center;
+			Style.Weight = TraceHUDType::HudWeight();   // spec v25 §4 — the HUD's face, like every other row
+			TraceCanvasText::Draw(HUD, FString::Printf(TEXT("HOLD [%s]"), *KeyLabel),
+				CX, CY + Radius + (8.f * UIScale), Style);
+		}
+
+#if !UE_BUILD_SHIPPING
+		// After the ring is on the canvas, never before: a capture armed on the DECISION to draw
+		// rather than on the draw is how a harness ends up reporting PASS while striking a corpse.
+		if (CVarPullRingShot.GetValueOnGameThread() != 0)
+		{
+			// A SMALL BURST, NOT ONE SHOT, and the first version of this taught me why: it fired on
+			// the very first eligible frame of the session, which was one where the character-select
+			// overlay was still up and drawing straight over the ring. One capture of a window this
+			// rare is one chance to have something else in front of it.
+			//
+			// A FILLING frame always beats an empty one, so it is allowed to pre-empt the spacing:
+			// the empty ring proves placement, the filling ring proves the number.
+			constexpr int32 MaxShots = 6;
+			constexpr float MinSpacingSeconds = 2.5f;
+
+			static int32 ShotsTaken = 0;
+			static float NextShotTime = 0.f;
+			static bool bShotFilling = false;
+
+			const bool bFillingShot = (Progress > 0.f) && !bShotFilling;
+			if (ShotsTaken < MaxShots && (bFillingShot || Now >= NextShotTime))
+			{
+				++ShotsTaken;
+				NextShotTime = Now + MinSpacingSeconds;
+				bShotFilling = bShotFilling || bFillingShot;
+				CaptureRingFrame(bFillingShot ? TEXT("filling") : TEXT("appeared"),
+					Progress, Radius, CX, CY);
+			}
+		}
+#endif
+	}
+}
+
 void ATraceHUD::BeginPlay()
 {
 	Super::BeginPlay();
@@ -481,6 +937,16 @@ void ATraceHUD::DrawHUD()
 		// Spec v16 §2 — the throw charge, on the ring the pass hold has always used. Immediately
 		// after the pass so the two are unmistakably the same element drawn from two sources.
 		DrawThrowChargeRing();
+
+		// SPEC v25 §3 — the pull ring, around the CORE rather than the crosshair, filled from the
+		// server's own replicated hold. Drawn with the other two rings so the three are read in one
+		// place, and after them so a Core lying under the crosshair is not drawn over by them.
+		//
+		// bLocalCarrying is deliberately NOT tested here: ATraceCore::CanPullNow already refuses a
+		// carrier (that is §7's precedence — a carrier's right mouse parries), and a second copy of
+		// that rule on this side is a second thing that can disagree with the server.
+		TraceHUDPullRing::Draw(this, (TraceGS != nullptr) ? TraceGS->Core : nullptr, LocalChar.Get(),
+			TracePC.Get(), LocalTeam, UIScale, Now);
 
 		DrawHitMarker();
 		DrawHealthAndDash();
@@ -4512,6 +4978,25 @@ namespace TraceHUDType
 		ECVF_Cheat);
 
 	/**
+	 * THE FACE THE IN-MATCH HUD TYPES IN (spec v25 §4).
+	 *
+	 *     "Use Erbaum Bold for in game hud and character ability descriptions"
+	 *
+	 * ONE function, and every string ATraceHUD draws during a match reaches the atlas through it —
+	 * DrawTextLeft/Centered/Right and MeasureWidth below are the only text calls in this 5.8k-line
+	 * file, so "the HUD is Erbaum" is a fact about this function rather than a claim about 40 call
+	 * sites that somebody has to keep true. It is also why the switch cannot half-apply: a row drawn
+	 * in one face and MEASURED in another would centre wrong, and both paths ask here.
+	 *
+	 * NOT the pause menu and NOT the character-select screen, even though this HUD hosts both. They
+	 * draw through their own modules (FTraceOptionsMenu, FTraceCharacterSelect) and the owner's
+	 * instruction leaves the MENU in Sofachrome; the select screen's ability DESCRIPTIONS take Erbaum
+	 * on their own, in TraceCharacterSelect.cpp, and its character NAMES stay Sofachrome Regular.
+	 *
+	 * (Declared once more near the top of this file, so the pull ring's caption can reach it.)
+	 */
+
+	/**
 	 * Says so when a string reaches the HUD that the atlas has no glyphs for. See the banner above.
 	 *
 	 * THIS IS A DIAGNOSTIC AND NOTHING ELSE. It cannot change what is drawn or how wide anything is
@@ -4556,11 +5041,39 @@ namespace TraceHUDType
 		Reported.Add(Text);
 
 		UE_LOG(LogTraceGame, Warning,
-			TEXT("[HUDType] \"%s\" contains characters the Sofachrome atlas has no cell for; they draw ")
-			TEXT("as blank space (and measure as blank space, so the row's box stays correct). The sheet ")
-			TEXT("is printable ASCII only — see Scripts/generate_font_atlas.py. This is expected for a ")
+			TEXT("[HUDType] \"%s\" contains characters the %s atlas has no cell for; they draw as blank ")
+			TEXT("space (and measure as blank space, so the row's box stays correct). The sheet is ")
+			TEXT("printable ASCII only — see Scripts/generate_font_atlas.py. This is expected for a ")
 			TEXT("player name and is reported once per distinct string."),
-			*Text);
+			*Text, *TraceText::FaceName(HudWeight()));
+	}
+
+	/**
+	 * THE RED ARM FOR §4 — puts the HUD back in the face it had before this pass, in a running game.
+	 *
+	 * The v23 arm above (CVarLeftInLato) reproduces a DIFFERENT defect and is about the Lato fallback;
+	 * this one is about which atlas face the HUD asks for, and the two are independent. 1 (default) is
+	 * Erbaum Bold, which is what the owner asked for. 0 draws the whole in-match HUD in the Sofachrome
+	 * ExtraLight it had before, against the same fixture, seconds apart, IN THE SAME BINARY — which is
+	 * the only way a face change can be photographed as a before/after rather than as an assertion
+	 * that a flag was set.
+	 *
+	 * ECVF_Cheat and no ini override: this is a capture device, not a preference. A player must not be
+	 * able to put their HUD back in the menu face and then report the change as not having landed.
+	 */
+	static TAutoConsoleVariable<int32> CVarHudErbaum(
+		TEXT("Trace.HUD.Text.Erbaum"),
+		1,
+		TEXT("1 (default, spec v25 4): the in-match HUD types in Erbaum Bold (T_FontAtlasHud).\n")
+		TEXT("0 = RED ARM: the pre-v25 face, Sofachrome ExtraLight, for a same-binary before/after.\n")
+		TEXT("Neither arm touches the pause menu or the character NAMES, which stay Sofachrome."),
+		ECVF_Cheat);
+
+	static ETraceTextWeight HudWeight()
+	{
+		return (CVarHudErbaum.GetValueOnGameThread() != 0)
+			? ETraceTextWeight::Hud
+			: ETraceTextWeight::Light;
 	}
 }
 
@@ -4578,6 +5091,7 @@ void ATraceHUD::DrawTextLeft(const FString& Text, const FLinearColor& Color, flo
 
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
 	Style.HAlign = TraceText::EHAlign::Left;
+	Style.Weight = TraceHUDType::HudWeight();   // spec v25 §4 — Erbaum Bold for the in-match HUD
 	TraceCanvasText::Draw(this, Text, X, Y, Style);
 }
 
@@ -4590,6 +5104,7 @@ void ATraceHUD::DrawTextCentered(const FString& Text, const FLinearColor& Color,
 
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
 	Style.HAlign = TraceText::EHAlign::Center;
+	Style.Weight = TraceHUDType::HudWeight();
 	TraceCanvasText::Draw(this, Text, CenterX, Y, Style);
 }
 
@@ -4599,12 +5114,20 @@ void ATraceHUD::DrawTextRight(const FString& Text, const FLinearColor& Color, fl
 
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
 	Style.HAlign = TraceText::EHAlign::Right;
+	Style.Weight = TraceHUDType::HudWeight();
 	TraceCanvasText::Draw(this, Text, RightX, Y, Style);
 }
 
 float ATraceHUD::MeasureWidth(const FString& Text, UFont* Font, float Scale)
 {
-	return TraceText::MeasureWidth(Text, TraceHUDType::SizeFor(this, Font, Scale));
+	// THE SAME FACE THE THREE DRAWS ABOVE USE, and this line is load-bearing rather than tidy: the
+	// three faces do NOT share advances (Erbaum's alphabet measures 1823 atlas px against Sofachrome
+	// ExtraLight's 2634), so a HUD that measured in one face and drew in another would mis-centre the
+	// score panel, over-run the ammo block's gutter and size every kill-feed row wrong. That exact
+	// disagreement is what spec v23 §A4's red arm reproduces, one face-change earlier.
+	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale));
+	Style.Weight = TraceHUDType::HudWeight();
+	return TraceText::MeasureWidth(Text, Style);
 }
 
 float ATraceHUD::MeasureHeight(const FString& Text, UFont* Font, float Scale)

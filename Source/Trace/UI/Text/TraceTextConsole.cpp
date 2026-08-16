@@ -45,18 +45,45 @@ namespace TraceTextConsoleFile
 	static const TCHAR* MenuWords = TEXT("PLAY SETTINGS JOIN PRACTICE QUIT");
 
 	/**
-	 * THE WEIGHT PAIR (spec v23 §A3).
+	 * THE FACE STACK (spec v23 §A3, third row added by v25 §4).
 	 *
 	 * A character name, because that is the one string in the game that is meant to be bold, and it
-	 * is full of flat vertical stems (M, I, T, R) — which is what makes the two weights separable in
-	 * a SCREENSHOT rather than only in a log line. The pair is drawn at the same size, from the same
-	 * X, one line apart, so a vertical slice through both rows measures two stems that differ only
-	 * by weight. "The flag was set" is not evidence; two stroke widths in one image is.
+	 * is full of flat vertical stems (M, I, T, R) — which is what makes the faces separable in a
+	 * SCREENSHOT rather than only in a log line. The rows are drawn at the same size, from the same
+	 * X, one line apart, so a vertical slice through them measures stems that differ only by face.
+	 * "The flag was set" is not evidence; three sets of letterforms in one image is.
+	 *
+	 * The 'R' carries the v25 row on its own: Sofachrome's has a straight splayed leg and a squared
+	 * bowl that runs flush to the advance; Erbaum's bowl is a flat-sided rectangle and its leg is a
+	 * short vertical. Anyone comparing the two rows can name the face without reading the caption —
+	 * which is the point, because the caption is exactly the assertion the photograph must replace.
 	 */
 	static const TCHAR* WeightSpecimen = TEXT("MORTIMER");
 
-	/** Size for the weight pair. Big enough that a stem is many pixels wide, so the ratio is robust. */
+	/** Size for the face rows. Big enough that a stem is many pixels wide, so the ratio is robust. */
 	static constexpr float WeightSpecimenSize = 44.f;
+
+	/** Row colours, indexed by weight. Distinct so a row can be pointed at in a screenshot. */
+	static FLinearColor WeightInk(ETraceTextWeight Weight)
+	{
+		switch (Weight)
+		{
+		case ETraceTextWeight::Bold: return FLinearColor(1.00f, 0.78f, 0.36f, 1.f);
+		case ETraceTextWeight::Hud:  return FLinearColor(0.55f, 1.00f, 0.62f, 1.f);
+		default:                     return FLinearColor(0.62f, 0.86f, 1.00f, 1.f);
+		}
+	}
+
+	/** What each face is FOR, so the specimen says where on screen the reviewer should go looking. */
+	static const TCHAR* WeightUse(ETraceTextWeight Weight)
+	{
+		switch (Weight)
+		{
+		case ETraceTextWeight::Bold: return TEXT("BOLD  (SELECT NAMES) ");
+		case ETraceTextWeight::Hud:  return TEXT("HUD   (MATCH + ABIL) ");
+		default:                     return TEXT("LIGHT (DEFAULT)      ");
+		}
+	}
 
 	/** Defined below, next to the Slate half's version of the same comparison. */
 	static void DrawWeightPair(UCanvas* Canvas, float X, float Y, float S, const TCHAR* Which);
@@ -117,68 +144,74 @@ namespace TraceTextConsoleFile
 	}
 
 	/**
-	 * The two weights, same string, same size, same left edge, one line apart.
+	 * Every face, same string, same size, same left edge, one line apart.
 	 *
-	 * Drawn through the ORDINARY draw call with nothing but Style.Weight changed between the two —
-	 * so if these two rows have the same stroke width on screen, the weight argument is not reaching
-	 * the renderer, whatever the log says. That is the same comparison-not-assertion trick the Lato
-	 * control line uses above, applied to weight instead of to typeface.
+	 * Drawn through the ORDINARY draw call with nothing but Style.Weight changed between the rows —
+	 * so if these rows have the same letterforms on screen, the weight argument is not reaching the
+	 * renderer, whatever the log says. That is the same comparison-not-assertion trick the Lato
+	 * control line uses above, applied to face instead of to typeface.
 	 *
-	 * The caption carries each row's width and cap height, which is the other half of the claim: the
-	 * two widths must DIFFER — the weights are two different font files, bold about half again as
-	 * wide, which is exactly why every measurement has to be told its weight. CAP HEIGHT is the
-	 * control: both real cuts of Sofachrome share it (65 px at em 96), so the two CAP numbers should
-	 * MATCH. It used to be the other way round, when the light cut was Regular eroded by --thin and
-	 * the erosion shortened its capitals while leaving the advances alone. Two numbers that would
-	 * both move if the weight table and the sheets ever came apart.
+	 * The caption carries each row's width, cap height and the FONT FILE it came from. Spec v25 §4
+	 * says to verify by identifying the FACE in a screenshot rather than by asserting a flag; a
+	 * caption that only said "Hud" would be an assertion, so it prints "Erbaum-Bold.otf" — and prints
+	 * it from the EFFECTIVE face, so a sheet that failed to load names Sofachrome and gives the game
+	 * away instead of covering for itself.
+	 *
+	 * The numbers are the other half of the claim. WIDTHS must all DIFFER: three different font files,
+	 * bold about half again as wide as light and Erbaum narrower than either, which is exactly why
+	 * every measurement has to be told its weight. CAP must MATCH between Light and Bold (65 px at
+	 * em 96 — two real cuts of one family) and must NOT match for Hud (70 px — a different family).
+	 * Numbers that would all move if the face table and the sheets ever came apart.
 	 */
 	static void DrawWeightPair(UCanvas* Canvas, float X, float Y, float S, const TCHAR* Which)
 	{
 		const FLinearColor Label(0.55f, 0.62f, 0.72f, 1.f);
-		const FLinearColor LightInk(0.62f, 0.86f, 1.00f, 1.f);
-		const FLinearColor BoldInk(1.00f, 0.78f, 0.36f, 1.f);
 
 		TraceText::FStyle Caption(15.f * S, Label);
 		TraceCanvasText::Draw(Canvas,
-			FString::Printf(TEXT("%s  -  TWO WEIGHTS, ONE LAYOUT PASS, ONLY Style.Weight DIFFERS"), Which),
+			FString::Printf(TEXT("%s  -  EVERY FACE, ONE LAYOUT PASS, ONLY Style.Weight DIFFERS"), Which),
 			X, Y, Caption);
 		Y += TraceText::LineHeight(Caption.Size) * 1.15f;
 
 		const float Size = WeightSpecimenSize * S;
 		const float Pitch = TraceText::LineHeight(Size) * 1.02f;
 
-		// The label column is measured in the LIGHT weight and reserved for both rows, so the two
-		// specimens start at exactly the same X — the comparison depends on that.
-		const FString LightTag = TEXT("LIGHT (DEFAULT)  ");
-		const FString BoldTag  = TEXT("BOLD  (NAMES)    ");
+		// The label column is measured in the LIGHT weight and reserved for every row, so the
+		// specimens all start at exactly the same X — the comparison depends on that.
 		TraceText::FStyle TagStyle(13.f * S, Label);
-		const float TagW = FMath::Max(
-			TraceText::MeasureWidth(LightTag, TagStyle),
-			TraceText::MeasureWidth(BoldTag, TagStyle)) + (8.f * S);
-
-		for (int32 Pass = 0; Pass < 2; ++Pass)
+		float TagW = 0.f;
+		for (int32 Pass = 0; Pass < static_cast<int32>(ETraceTextWeight::Count); ++Pass)
 		{
-			const ETraceTextWeight Weight =
-				(Pass == 0) ? ETraceTextWeight::Light : ETraceTextWeight::Bold;
+			TagW = FMath::Max(TagW,
+				TraceText::MeasureWidth(WeightUse(static_cast<ETraceTextWeight>(Pass)), TagStyle));
+		}
+		TagW += 8.f * S;
 
-			TraceText::FStyle Row(Size, (Pass == 0) ? LightInk : BoldInk);
-			Row.Weight = Weight;   // <<< the only difference between the two rows
+		for (int32 Pass = 0; Pass < static_cast<int32>(ETraceTextWeight::Count); ++Pass)
+		{
+			const ETraceTextWeight Weight = static_cast<ETraceTextWeight>(Pass);
+
+			TraceText::FStyle Row(Size, WeightInk(Weight));
+			Row.Weight = Weight;   // <<< the only difference between the rows
 
 			const float RowY = Y + Pitch * Pass;
-			TraceCanvasText::Draw(Canvas, (Pass == 0) ? LightTag : BoldTag, X,
-				RowY + (TraceText::Ascent(Size) - TraceText::Ascent(TagStyle.Size)), TagStyle);
+			// The tag sits on the SPECIMEN'S baseline, so the ascent it is shifted by has to be the
+			// specimen's face and not the tag's — the faces no longer share one.
+			TraceCanvasText::Draw(Canvas, WeightUse(Weight), X,
+				RowY + (TraceText::Ascent(Size, Weight) - TraceText::Ascent(TagStyle.Size)), TagStyle);
 			TraceCanvasText::Draw(Canvas, WeightSpecimen, X + TagW, RowY, Row);
 
 			TraceCanvasText::Draw(Canvas,
-				FString::Printf(TEXT("%s  W %.1f  CAP %.1f  %s"),
+				FString::Printf(TEXT("%s = %s  W %.1f  CAP %.1f  %s"),
 					TraceText::WeightName(Weight),
+					TraceText::FaceSourceFile(Weight),
 					TraceText::MeasureWidth(WeightSpecimen, Row),
 					TraceText::CapHeight(Size, Weight),
 					TraceText::IsWeightActive(Weight)
 						? TEXT("OWN SHEET")
 						: TEXT("SUBSTITUTED - this weight did NOT load")),
 				X + TagW + TraceText::MeasureWidth(WeightSpecimen, Row) + (18.f * S),
-				RowY + (TraceText::Ascent(Size) - TraceText::Ascent(Caption.Size)), Caption);
+				RowY + (TraceText::Ascent(Size, Weight) - TraceText::Ascent(Caption.Size)), Caption);
 		}
 	}
 
@@ -202,18 +235,18 @@ namespace TraceTextConsoleFile
 		return Line;
 	}
 
-	/** The weight pair again, through the UMG/Slate leaf this time. Same claim, other renderer. */
-	static TSharedRef<SWidget> MakeWeightRow(ETraceTextWeight Weight, const FString& Tag,
-		const FLinearColor& Ink)
+	/** One face row again, through the UMG/Slate leaf this time. Same claim, other renderer. */
+	static TSharedRef<SWidget> MakeWeightRow(ETraceTextWeight Weight)
 	{
 		const FLinearColor Label(0.55f, 0.62f, 0.72f, 1.f);
+		const FLinearColor Ink = WeightInk(Weight);
 		TraceText::FStyle Row(WeightSpecimenSize, Ink);
 		Row.Weight = Weight;
 
 		return SNew(SHorizontalBox)
 			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
 			[
-				MakeAtlasLine(Tag, 13.f, Label)
+				MakeAtlasLine(WeightUse(Weight), 13.f, Label)
 			]
 			+ SHorizontalBox::Slot().AutoWidth().Padding(10.f, 0.f, 0.f, 0.f)
 			[
@@ -221,8 +254,9 @@ namespace TraceTextConsoleFile
 			]
 			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(18.f, 0.f, 0.f, 0.f)
 			[
-				MakeAtlasLine(FString::Printf(TEXT("%s  W %.1f  CAP %.1f  %s"),
+				MakeAtlasLine(FString::Printf(TEXT("%s = %s  W %.1f  CAP %.1f  %s"),
 					TraceText::WeightName(Weight),
+					TraceText::FaceSourceFile(Weight),
 					TraceText::MeasureWidth(WeightSpecimen, Row),
 					TraceText::CapHeight(WeightSpecimenSize, Weight),
 					TraceText::IsWeightActive(Weight)
@@ -277,21 +311,18 @@ namespace TraceTextConsoleFile
 				.ColorAndOpacity(FSlateColor(Control))
 		];
 
-		// THE WEIGHT PAIR — see DrawWeightPair. Same two rows, through the Slate leaf.
+		// THE FACE STACK — see DrawWeightPair. Same rows, through the Slate leaf.
 		Box->AddSlot().AutoHeight().Padding(0.f, 16.f, 0.f, 2.f)
 		[
-			MakeAtlasLine(TEXT("UMG / SLATE  -  TWO WEIGHTS, ONLY Style.Weight DIFFERS"), 15.f, Label)
+			MakeAtlasLine(TEXT("UMG / SLATE  -  EVERY FACE, ONLY Style.Weight DIFFERS"), 15.f, Label)
 		];
-		Box->AddSlot().AutoHeight()
-		[
-			MakeWeightRow(ETraceTextWeight::Light, TEXT("LIGHT (DEFAULT)"),
-				FLinearColor(0.62f, 0.86f, 1.00f, 1.f))
-		];
-		Box->AddSlot().AutoHeight()
-		[
-			MakeWeightRow(ETraceTextWeight::Bold, TEXT("BOLD  (NAMES)  "),
-				FLinearColor(1.00f, 0.78f, 0.36f, 1.f))
-		];
+		for (int32 Index = 0; Index < static_cast<int32>(ETraceTextWeight::Count); ++Index)
+		{
+			Box->AddSlot().AutoHeight()
+			[
+				MakeWeightRow(static_cast<ETraceTextWeight>(Index))
+			];
+		}
 
 		return SNew(SOverlay)
 			+ SOverlay::Slot()
@@ -352,7 +383,7 @@ namespace TraceTextConsoleFile
 
 		UE_LOG(LogTraceGame, Display, TEXT("=== Trace.Text.Report ==="));
 		UE_LOG(LogTraceGame, Display, TEXT("[Text] PATH: %s"),
-			TraceText::IsAtlasActive() ? TEXT("GLYPH ATLAS (Sofachrome)") : TEXT("FALLBACK FONT"));
+			TraceText::IsAtlasActive() ? TEXT("GLYPH ATLAS") : TEXT("FALLBACK FONT"));
 		UE_LOG(LogTraceGame, Display, TEXT("[Text] %s"), *Description);
 
 		// A width from each renderer's shared layout pass, so the report carries a number that would
@@ -372,11 +403,12 @@ namespace TraceTextConsoleFile
 			TraceText::FStyle Row(34.f);
 			Row.Weight = Weight;
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[Text]   weight %-6s %s  \"%s\" measures %.2f px, cap %.2f px"),
+				TEXT("[Text]   weight %-6s = %-30s %s  \"%s\" measures %.2f px, cap %.2f px, ascent %.2f px"),
 				TraceText::WeightName(Weight),
+				TraceText::FaceSourceFile(Weight),
 				TraceText::IsWeightActive(Weight) ? TEXT("(own sheet)  ") : TEXT("(SUBSTITUTED)"),
 				SpecimenA, TraceText::MeasureWidth(SpecimenA, Row),
-				TraceText::CapHeight(34.f, Weight));
+				TraceText::CapHeight(34.f, Weight), TraceText::Ascent(34.f, Weight));
 		}
 
 		UE_LOG(LogTraceGame, Display,

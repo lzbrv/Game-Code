@@ -21,34 +21,50 @@
 # no `unreal` module importable it does step 1 and says why it stopped.
 #
 # -----------------------------------------------------------------------------
-# TWO WEIGHTS, ONE LAYOUT PASS (spec v23 §A3)
+# THREE FACES, ONE LAYOUT PASS (spec v23 §A3, third face added by v25 §4)
 # -----------------------------------------------------------------------------
-# The owner asked for "extra light, not regular/bold" everywhere, and for the
-# character names on the select screen to stay bold. Each weight is rasterised
-# from ITS OWN REAL FONT FILE:
+# The owner asked for "extra light, not regular/bold" everywhere, for the
+# character NAMES on the select screen to stay bold, and — spec v25 §4 — for the
+# in-match HUD and the character ability DESCRIPTIONS to be Erbaum Bold. Each
+# face is rasterised from ITS OWN REAL FONT FILE:
 #
-#   Light  Sofachrome W05 ExtraLight.ttf   the DEFAULT for everything
+#   Light  Sofachrome W05 ExtraLight.ttf   the DEFAULT: menus and everything else
 #   Bold   Sofachrome Rg.otf               character NAMES only
+#   Hud    Erbaum-Bold.otf                 the in-match HUD + ability descriptions
 #
-# `--thin` (eroding Regular to fake a light cut) is 0 for both and must stay
+# "Weight" is now a slight misnomer — Hud is a different FAMILY, not a heavier cut
+# of Sofachrome — but it is the axis the runtime already selects on and splitting
+# it into family+weight would double every signature for one caller. The enum is
+# ETraceTextWeight and Hud is a member of it.
+#
+# `--thin` (eroding a face to fake a lighter cut) is 0 for all three and must stay
 # there. Two attempts to synthesise a weight that way damaged the letterforms —
 # the second deleted ( ) [ ] { } / and \ outright while the HUD draws '[E]'.
 #
-# This script emits ONE header describing BOTH, as a table of FFace records —
-# each with its own texture, its own measured cap height and its own cell table.
-# The runtime indexes that table by weight. What it must NOT do is let the two
-# weights disagree about anything ONE LAYOUT PASS depends on, so it refuses to
-# emit a header unless the em, the vertical metrics and the charset match exactly
-# (see check_weights_agree).
+# This script emits ONE header describing ALL of them, as a table of FFace records
+# — each with its own texture, its own source file, its own vertical metrics, its
+# own measured cap height and its own cell table. The runtime indexes that table
+# by weight. What it must NOT do is let the faces disagree about anything ONE
+# LAYOUT PASS depends on, so it refuses to emit a header unless the em, the LINE
+# HEIGHT and the charset match exactly (see check_weights_agree).
 #
-# *** WHAT IS NOT SHARED: THE ADVANCES. *** Two different font files have two
-# different sets of widths — measured here, 94 of the 95 cells differ and bold is
-# roughly half again as wide. While the light cut was eroded Regular they WERE
-# identical, and code was written on that assumption; it is false now. Layout and
-# measurement are both face-relative, so the rule for callers is simply that
-# anything MEASURING a string must pass the weight it will DRAW it in.
+# *** WHAT IS NOT SHARED: THE ADVANCES. *** Three different font files have three
+# different sets of widths — measured here, 94 of the 95 cells differ between the
+# two Sofachrome cuts and Erbaum is narrower than either. While the light cut was
+# eroded Regular they WERE identical, and code was written on that assumption; it
+# is false now. Layout and measurement are both face-relative, so the rule for
+# callers is simply that anything MEASURING a string must pass the weight it will
+# DRAW it in.
 #
-# CAP HEIGHT is likewise per weight and measured off each sheet's own 'H'. It is
+# *** ALSO NOT SHARED, AND THIS IS NEW IN v25: ASCENT AND DESCENT. *** Erbaum-Bold
+# splits the same 116 px line box as 93/23 where both Sofachrome cuts split it
+# 95/21. The LINE HEIGHT is what multi-line layout advances by and it still has to
+# agree — it does, exactly — but the baseline inside that box is a property of the
+# face, so it is emitted per face and TraceText::Ascent() takes a weight. A single
+# shared ascent would sit an EVAlign::Baseline draw 2 atlas px (0.6 px at size 28)
+# off in the HUD face, and every CapTop alignment with it.
+#
+# CAP HEIGHT is likewise per face and measured off each sheet's own 'H'. It is
 # the number a caller aligning to a baked word sprite must ask for by weight.
 #
 # -----------------------------------------------------------------------------
@@ -100,9 +116,14 @@ TEXTURE_DIR = os.environ.get("TRACE_FONT_ATLAS_DIR", "/Game/Trace/UI/Fonts")
 # THE WEIGHT TABLE — the order here is the order of ETraceTextWeight in C++, and
 # index 0 is the DEFAULT. Light first is the owner's instruction ("the font type
 # should be extra light"), so a caller that says nothing gets light.
+#
+# APPEND, never insert. The index is the enum value and the enum value is what a
+# saved knob, a data-asset column and Blueprint all carry; putting Hud in the
+# middle would silently re-point every one of them at a different sheet.
 WEIGHTS = [
     ("Light", "T_FontAtlas"),
     ("Bold", "T_FontAtlasBold"),
+    ("Hud", "T_FontAtlasHud"),
 ]
 
 DEFAULT_WEIGHT = WEIGHTS[0][0]
@@ -240,10 +261,14 @@ def load_weight(name, basename):
     """One weight's JSON, validated on its own terms. Returns a dict or None."""
     path = json_path(basename)
     if not os.path.isfile(path):
+        # NO --thin in this message, deliberately. It used to suggest `--thin 4` for
+        # anything that was not Bold, which is the exact flag that ate ( ) [ ] { }
+        # and / off a sheet while the HUD draws '[E]'. Every face here is rendered
+        # as drawn, from its own real font file.
         fail("{0} is missing (the {1} weight). Run `python3 Scripts/generate_font_atlas.py "
-             "--name {2}{3}` first — it needs a licensed copy of the .otf at Art/Fonts/ "
-             "(gitignored, per-developer)."
-             .format(path, name, basename, "" if name == "Bold" else " --thin 4"))
+             "--font \"Art/Fonts/<the face>\" --name {2}` first — it needs a licensed copy of "
+             "the font at Art/Fonts/ (gitignored, per-developer). Do NOT pass --thin."
+             .format(path, name, basename))
         return None
 
     with open(path) as handle:
@@ -285,13 +310,27 @@ def check_weights_agree(weights):
     """
     THE GUARD THAT KEEPS ONE LAYOUT PASS HONEST.
 
-    Two weights are allowed to differ in ink and in cap height. They are NOT
-    allowed to differ in anything the layout pass consumes — the em, the
-    vertical metrics or the charset — because TraceText lays a string out once
-    and only swaps which sheet the quads sample. If a future regeneration made
-    the weights metrically different, a bold label would silently occupy a
-    different box than the light one it replaced, every centred row would drift,
-    and nothing would log. Refusing here turns that into a build-time diff.
+    A face may differ from the others in ink, in advances, in cap height and — as
+    of v25 — in where its baseline sits inside the line box. It may NOT differ in
+    anything the layout PASS consumes, which is exactly two numbers and a charset:
+
+        pixelSize    the em every cell is expressed in. Everything on screen is
+                     (Size / EmSize) x these pixels, so two ems means two scales
+                     for one string and the second face draws at the wrong size.
+        lineHeight   what LayoutString advances by between lines of one string.
+                     Two line heights means a two-line label in the wrong face
+                     overlaps itself, and nothing logs.
+        the charset  the runtime indexes cells by (code - FirstCode) against ONE
+                     pair of bounds, so a face covering a different range would
+                     read the wrong cell — or off the end — for every character.
+
+    ASCENT AND DESCENT ARE NO LONGER IN THAT LIST, and that is the v25 change.
+    They are how the shared line box is SPLIT, not how big it is: Erbaum-Bold
+    splits 116 px as 93/23 where both Sofachrome cuts split it 95/21. Only
+    EVAlign::Baseline and EVAlign::CapTop read them, per draw, and both are
+    per-face questions — "where is this face's baseline" has no shared answer.
+    They are emitted per face and TraceText::Ascent() takes a weight. Requiring
+    them to match would have refused a face whose layout is perfectly compatible.
 
     Cell geometry may differ: the emitter handles that by writing a second table
     rather than aliasing. Advances differing is legal but WORTH KNOWING, so it
@@ -300,15 +339,25 @@ def check_weights_agree(weights):
     base = weights[0]
     ok = True
     for other in weights[1:]:
-        for key in ("pixelSize", "ascent", "descent", "lineHeight"):
+        for key in ("pixelSize", "lineHeight"):
             if base["meta"][key] != other["meta"][key]:
-                fail("the {0} and {1} atlases disagree about {2} ({3} vs {4}). The two weights "
-                     "share ONE layout pass in TraceText::LayoutString, so they must agree on "
-                     "every vertical metric and on the em; only ink and cap height may differ. "
-                     "Re-generate both at the same --size."
+                fail("the {0} and {1} atlases disagree about {2} ({3} vs {4}). Every face "
+                     "shares ONE layout pass in TraceText::LayoutString, so they must agree on "
+                     "the em and on the line height; ink, advances, cap height and the "
+                     "ascent/descent SPLIT of that line box may differ. Re-generate both at the "
+                     "same --size."
                      .format(base["name"], other["name"], key,
                              base["meta"][key], other["meta"][key]))
                 ok = False
+
+        for key in ("ascent", "descent"):
+            if base["meta"][key] != other["meta"][key]:
+                log("note: {0} and {1} split the {2} px line box differently ({3} {4} vs {5} {4}). "
+                    "That is legal and per-face from v25 on — TraceText::Ascent() takes a weight — "
+                    "but a caller drawing with EVAlign::Baseline or CapTop MUST pass the weight it "
+                    "is drawing in, or the row sits off by the difference."
+                    .format(base["name"], other["name"], int(base["meta"]["lineHeight"]),
+                            base["meta"][key], key, other["meta"][key]))
 
         if (base["first"], base["last"]) != (other["first"], other["last"]):
             fail("the {0} atlas covers {1}..{2} but {3} covers {4}..{5}. Both weights must carry "
@@ -369,41 +418,51 @@ def write_header():
         add("//   Content/Trace/UI/Fonts/Source/{0}.json   ({1}, sha1 {2})".format(
             w["basename"], w["name"], w["sha1"]))
     add("//")
-    add("// THE ONE METRICS SOURCE (spec v22 §A1, extended to two weights by v23 §A3). Both")
+    add("// THE ONE METRICS SOURCE (spec v22 §A1, two weights by v23 §A3, a third face by v25 §4). Both")
     add("// renderers — the Canvas blitter in TraceCanvasText.cpp and the Slate leaf in")
     add("// TraceAtlasTextWidget.cpp — lay text out through TraceText::LayoutString(), and")
     add("// TraceText.cpp is the ONLY file in the project that includes this header. That is what")
     add("// makes \"one source\" structural rather than a promise in a comment: the two paths cannot")
     add("// drift because there is only one layout pass.")
     add("//")
-    add("// TWO WEIGHTS, AND WHAT IS AND IS NOT ALLOWED TO DIFFER BETWEEN THEM")
-    add("//   Each weight is rasterised from ITS OWN REAL FONT FILE — the 'source' recorded in each")
-    add("//   sheet's .json, printed per face in the table below. --thin (glyph erosion) is 0 and must")
-    add("//   stay 0: two attempts to SYNTHESISE a light cut by eroding Regular damaged the")
-    add("//   letterforms, the second deleting ( ) [ ] { } / and \\ outright while the HUD draws '[E]'.")
-    add("//   \"Light\" is the default everywhere; \"Bold\" is used for the character names on the")
-    add("//   selection screen and nowhere else.")
+    add("// THE FACES, AND WHAT IS AND IS NOT ALLOWED TO DIFFER BETWEEN THEM")
+    add("//   Each face is rasterised from ITS OWN REAL FONT FILE — the 'source' recorded in each")
+    add("//   sheet's .json, carried per face in the table below. --thin (glyph erosion) is 0 for every")
+    add("//   one of them and must stay 0: two attempts to SYNTHESISE a light cut by eroding Regular")
+    add("//   damaged the letterforms, the second deleting ( ) [ ] { } / and \\ outright while the HUD")
+    add("//   draws '[E]'. \"Light\" is the default everywhere; \"Bold\" is the character NAMES on the")
+    add("//   selection screen; \"Hud\" (spec v25 §4) is the in-match HUD and the ability DESCRIPTIONS,")
+    add("//   and it is a different FAMILY rather than a heavier cut — the enum axis is called weight")
+    add("//   because that is what the runtime already selected on.")
     add("//")
-    add("//   The em, the vertical metrics and the charset are SHARED — emitted once, below, and")
-    add("//   enforced by import_font_atlas.py's check_weights_agree(), which refuses to write this")
-    add("//   file if the sheets ever disagree. That is what lets ONE LAYOUT PASS serve both.")
+    add("//   *** WHAT ONE LAYOUT PASS ACTUALLY REQUIRES, and it is only this: *** the em, the LINE")
+    add("//   HEIGHT and the charset. Those three are emitted once, below, and enforced by")
+    add("//   import_font_atlas.py's check_weights_agree(), which refuses to write this file if the")
+    add("//   sheets ever disagree about them.")
     add("//")
-    add("//   *** ADVANCES ARE NOT SHARED. *** Each weight has its own cell table below and its own")
+    add("//   *** ADVANCES ARE NOT SHARED. *** Each face has its own cell table below and its own")
     add("//   widths, because each is rasterised from its own font file. An earlier pass synthesised")
     add("//   the light cut by eroding Regular, where the advances WERE identical, and code was")
     add("//   written on that assumption; it is false now and it made a bold name overrun its")
     add("//   column. Anything that MEASURES a string must pass the weight it will DRAW it in.")
     add("//")
-    add("//   CAP HEIGHT is per weight and is measured off each sheet's own 'H', because two real")
-    add("//   cuts of a family need not agree on it. A caller aligning live type to one of the")
-    add("//   artist's baked word sprites must ask for the cap height OF THE WEIGHT IT IS DRAWING.")
+    add("//   *** ASCENT AND DESCENT ARE NOT SHARED EITHER (v25). *** They are how the shared line box")
+    add("//   is SPLIT, not how tall it is: Erbaum-Bold splits 116 px as 93/23 where both Sofachrome")
+    add("//   cuts split it 95/21. Only EVAlign::Baseline and EVAlign::CapTop read them. The module")
+    add("//   constants below are the DEFAULT face's, kept so code with no opinion reads what it always")
+    add("//   read; TraceText::Ascent() takes a weight and answers per face.")
+    add("//")
+    add("//   CAP HEIGHT is per face and is measured off each sheet's own 'H'. A caller aligning live")
+    add("//   type to one of the artist's baked word sprites must ask for the cap height OF THE WEIGHT")
+    add("//   IT IS DRAWING.")
     add("//")
     add("// THE CELL MODEL, because it is what makes this table so small:")
     add("//   Every cell is one FULL ADVANCE WIDTH by one FULL LINE HEIGHT, and the glyph is drawn")
     add("//   inside it with its own bearings already applied. So the pen advances by uSize and every")
     add("//   glyph sits on a shared baseline — there is no bearing table and there is no kerning.")
     add("//   Sofachrome is a wide squared face whose ink runs flush to the advance on A, T, V, W and")
-    add("//   Y; that is the typeface, not clipping.")
+    add("//   Y; that is the typeface, not clipping. Erbaum is a narrower squared grotesque and does")
+    add("//   the same on its own diagonals.")
     add("//")
     add("// Units are ATLAS PIXELS at an em of {0}. On screen everything is multiplied by".format(int(meta["pixelSize"])))
     add("// (Size / EmSize), where Size means the same thing it means in FSlateFontInfo::Size.")
@@ -413,7 +472,8 @@ def write_header():
     add("")
     add("namespace TraceFontAtlasMetrics")
     add("{")
-    add("\t/** The typeface this was rasterised from. NOT in the repository — see docs/FONTS.md. */")
+    add("\t/** The DEFAULT face's typeface. NOT in the repository — see docs/FONTS.md. Per-face")
+    add("\t  * sources are in FFace::Source below; this one is what names the family in a caption. */")
     add("\tinline constexpr const TCHAR* SourceFont = TEXT(\"{0}\");".format(meta["source"]))
     add("")
     add("\t/** Indexed by ETraceTextWeight, in the same order; index 0 ({0}) is the DEFAULT.".format(base["name"]))
@@ -422,14 +482,19 @@ def write_header():
     add("\tinline constexpr int32 DefaultWeight = {0};   // {1}".format(0, base["name"]))
     add("")
     add("\t// =============================================================================")
-    add("\t// SHARED BY EVERY WEIGHT — enforced by the generator, so layout can rely on it")
+    add("\t// SHARED BY EVERY FACE — enforced by the generator, so layout can rely on it")
     add("\t// =============================================================================")
     add("")
     add("\t/** Em size the sheets were rasterised at. Everything below is in these pixels. */")
     add("\tinline constexpr float EmSize     = {0}.f;".format(int(meta["pixelSize"])))
+    add("\t/** What one line of a multi-line string advances by. THE shared vertical number. */")
+    add("\tinline constexpr float LineHeight  = {0}.f;".format(int(meta["lineHeight"])))
+    add("")
+    add("\t/** The DEFAULT face's split of that line box. PER FACE from v25 — see FFace::Ascent.")
+    add("\t  * Kept at module scope so callers with no opinion about weight read what they always")
+    add("\t  * read; anything aligning to a baseline in a NON-default face must ask FFace. */")
     add("\tinline constexpr float Ascent     = {0}.f;".format(int(meta["ascent"])))
     add("\tinline constexpr float Descent    = {0}.f;".format(int(meta["descent"])))
-    add("\tinline constexpr float LineHeight  = {0}.f;".format(int(meta["lineHeight"])))
     add("")
     add("\tinline constexpr int32 FirstCode = {0};".format(first))
     add("\tinline constexpr int32 LastCode  = {0};".format(last))
@@ -484,8 +549,12 @@ def write_header():
     add("")
     add("\tstruct FFace")
     add("\t{")
-    add("\t\t/** \"Light\" / \"Bold\". This is the name TraceText::WeightFromName() matches. */")
+    add("\t\t/** \"Light\" / \"Bold\" / \"Hud\". The name TraceText::WeightFromName() matches. */")
     add("\t\tconst TCHAR* Name;")
+    add("")
+    add("\t\t/** The font file this face was rasterised from. This is what a screenshot caption has to")
+    add("\t\t  * print to IDENTIFY the face rather than assert a flag — see spec v25 §4. */")
+    add("\t\tconst TCHAR* Source;")
     add("")
     add("\t\t/** The imported sheet. Written by Scripts/import_font_atlas.py; loaded once at runtime. */")
     add("\t\tconst TCHAR* TextureAsset;")
@@ -498,7 +567,12 @@ def write_header():
     add("\t\tint32 AtlasWidth;")
     add("\t\tint32 AtlasHeight;")
     add("")
-    add("\t\t/** Cap height for THIS weight. Align to it to sit type where a baked word sprite sat. */")
+    add("\t\t/** THIS face's split of the shared line box. Baseline and CapTop alignment read these;")
+    add("\t\t  * Ascent + Descent == LineHeight for every face, which is what the guard enforces. */")
+    add("\t\tfloat Ascent;")
+    add("\t\tfloat Descent;")
+    add("")
+    add("\t\t/** Cap height for THIS face. Align to it to sit type where a baked word sprite sat. */")
     add("\t\tfloat CapHeight;")
     add("")
     add("\t\tconst FCell* Cells;")
@@ -508,11 +582,13 @@ def write_header():
     add("\t{")
     for w in weights:
         wm = w["meta"]
-        add("\t\t// {0} — thin {1}, cap {2} px {3}".format(
-            w["name"], wm.get("thin", 0.0), int(w["cap_height"]), w["cap_note"]))
-        add("\t\t{{ TEXT(\"{0}\"), TEXT(\"{1}/{2}.{2}\"), {3}f, {4}, {5}, {6}.f, {7} }},".format(
-            w["name"], TEXTURE_DIR, w["basename"], wm.get("thin", 0.0),
-            wm["atlas"]["width"], wm["atlas"]["height"], int(w["cap_height"]),
+        add("\t\t// {0} — {1}, thin {2}, ascent {3}/descent {4}, cap {5} px {6}".format(
+            w["name"], wm["source"], wm.get("thin", 0.0),
+            int(wm["ascent"]), int(wm["descent"]), int(w["cap_height"]), w["cap_note"]))
+        add("\t\t{{ TEXT(\"{0}\"), TEXT(\"{1}\"), TEXT(\"{2}/{3}.{3}\"), {4}f, {5}, {6}, {7}.f, {8}.f, {9}.f, {10} }},".format(
+            w["name"], wm["source"], TEXTURE_DIR, w["basename"], wm.get("thin", 0.0),
+            wm["atlas"]["width"], wm["atlas"]["height"],
+            int(wm["ascent"]), int(wm["descent"]), int(w["cap_height"]),
             cell_symbol[w["name"]]))
     add("\t};")
     add("")

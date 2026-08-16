@@ -557,11 +557,68 @@ void ATraceGameMode::PostLogin(APlayerController* NewPlayer)
 		}
 	}
 
+	// SPEC v25 §2. Every human gets a pull-input relay, and they get it here because this is the one
+	// hook that runs once per arriving player with a controller that already exists.
+	SpawnPullRelayFor(NewPlayer);
+
 	// A human arriving on a listen server takes a slot back off the AI. Deferred by a tick because
 	// PlayerArray is only truthful once Login/PostLogin have finished.
 	ScheduleBotFill();
 
 	CheckMatchStartConditions();
+}
+
+void ATraceGameMode::SpawnPullRelayFor(APlayerController* NewPlayer)
+{
+	// SPEC v25 §2. WHY THE PULL BUTTON NEEDS AN ACTOR OF ITS OWN.
+	//
+	// A client may only send a Server RPC on an actor its own connection OWNS. ATraceCore SetOwner()s
+	// itself to its HOLDER — that is what makes the holder's pass RPC legal at all — and a pull is by
+	// definition sent by somebody who is NOT holding it, and by up to five of them at once. One actor
+	// has one owner, so the button cannot travel on the Core. See ATraceCorePullRelay.
+	//
+	// BOTS GET NOTHING, and need nothing: an AI controller is already on the server, so its pull
+	// applies through ATraceCore::RequestPullInput directly with no round trip.
+	if (!HasAuthority() || NewPlayer == nullptr)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	if (ATraceCorePullRelay::Find(NewPlayer) != nullptr)
+	{
+		return;   // A reconnect that kept its controller. Idempotent by design.
+	}
+
+	FActorSpawnParameters Params;
+	Params.Owner = NewPlayer;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	Params.ObjectFlags |= RF_Transient;
+
+	ATraceCorePullRelay* Relay = World->SpawnActor<ATraceCorePullRelay>(
+		ATraceCorePullRelay::StaticClass(), FTransform::Identity, Params);
+
+	if (Relay == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ModeB] spec v25 §2: could not spawn a pull relay for %s - that client's right mouse ")
+			TEXT("will not be able to pull a turned-over Core."),
+			*GetNameSafe(NewPlayer));
+		return;
+	}
+
+	// SetOwner again after the spawn: the spawn parameter sets it, but this is the property the RPC
+	// routing walks and it is worth being explicit about, because a relay with no owner is a relay
+	// whose whole reason for existing is gone and which would fail silently.
+	Relay->SetOwner(NewPlayer);
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("[ModeB] spec v25 §2: pull relay ready for %s."),
+		*GetNameSafe(NewPlayer));
 }
 
 void ATraceGameMode::AssignTeamIfNeeded(APlayerController* NewPlayer)
@@ -618,6 +675,13 @@ void ATraceGameMode::Logout(AController* Exiting)
 			}
 
 			UnregisterCharacter(TraceCharacter);
+		}
+
+		// SPEC v25 §2. The relay is owned by the leaving controller and would otherwise outlive it as
+		// an ownerless actor nobody can ever send on again.
+		if (ATraceCorePullRelay* Relay = ATraceCorePullRelay::Find(Exiting))
+		{
+			Relay->Destroy();
 		}
 	}
 

@@ -26,7 +26,28 @@ const TCHAR* TraceScoringModeName(ETraceScoringMode Mode)
 
 FString TraceScoringModeLabel(ETraceScoringMode Mode)
 {
-	return FString::Printf(TEXT("MODE %s - %s"), TraceScoringModeLetter(Mode), TraceScoringModeName(Mode));
+	// *** SPEC v25 §8 — "Change the name in the UI so goals is just goals not game mode B." ***
+	//
+	// This ONE line is the whole item. Every player-visible spelling of the mode in the game comes
+	// through here: the scoreboard footer ("1ST HALF   -   MODE B - GOALS" until now), the results
+	// screen's subtitle, and the title screen's own confirmation lines. The "MODE B - " prefix was
+	// manufactured here and nowhere else, so deleting it here deletes it everywhere at once — which
+	// is exactly why the label was centralised in the first place (see this file's header).
+	//
+	// BOTH MODES LOSE THE PREFIX, not just B. The note is about GOALS, but this function is the
+	// shared one and a stepper that reads "MODE A - ENDZONES" on the left and "GOALS" on the right
+	// would look like a bug in the menu rather than a rename. "ENDZONES" and "GOALS" are each
+	// already unambiguous — the letters only ever existed as the design owner's shorthand.
+	//
+	// WHAT DELIBERATELY DID NOT CHANGE, per the note's own carve-out ("internal enum names and
+	// console commands may keep their identifiers"):
+	//   * ETraceScoringMode::ThrownCoreAndGoals / ::EndzoneStatusCore — serialised into
+	//     Config/DefaultGame.ini, so renaming them would silently reset every host's mode;
+	//   * every Trace.ModeB.* console variable and its help text;
+	//   * the "?mode=a" / "?mode=b" URL token, which is typed by hand into run scripts;
+	//   * TraceScoringModeLetter(), kept because the letter is still how the notes and the logs
+	//     refer to the two rulesets. It simply no longer reaches the player's eyes.
+	return FString(TraceScoringModeName(Mode));
 }
 
 const TCHAR* TraceScoringModeBlurb(ETraceScoringMode Mode)

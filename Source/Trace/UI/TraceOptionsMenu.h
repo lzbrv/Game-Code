@@ -37,105 +37,59 @@
 class AHUD;
 class APawn;
 class APlayerController;
-class FCanvas;
 class UCameraComponent;
-class UCanvas;
 class UFont;
 class UTraceGameUserSettings;
 
-/**
- * SPEC v23 §A2 — DRAW A CANVAS MODAL IN FRONT OF SLATE, FOR THE LIFETIME OF THE SCOPE.
- *
- * THE DEFECT THIS EXISTS FOR. `AHUD`'s Canvas is composited into the viewport texture and every
- * Slate widget in the game layer manager is then drawn ON TOP OF IT. So a Canvas modal — this
- * overlay, and the title screen's JOIN prompt — could only be seen if the UMG title screen was
- * first told to stand down, and the game fell back to the OLD Canvas title screen underneath for
- * exactly as long as the modal was up. Measured twice at 1920x1080: opening SETTINGS handed 58.8%
- * of the screen (everything outside this class's 880x972 panel) back to the pre-v20 renderer, with
- * the retired stroked-vector wordmark legible through the scrim. Pressing one key changed the
- * game's typeface, its wordmark and its background.
- *
- * WHY THIS AND NOT A UMG OPTIONS SCREEN. Rebuilding this panel — twenty-two Slider/Toggle/Choice/
- * Binding rows, a drag-and-hit-tested track, the artist's three-slice chips and a live perf readout
- * — as a widget tree is a rewrite of the whole file, and it would have to be done TWICE, because
- * the JOIN prompt is a second Canvas modal in another file. It would also need a third Sofachrome
- * text renderer for Slate, which spec v23 §0 explicitly forbids. Everything that was actually wrong
- * here was COMPOSITING ORDER, so that is what this changes, and not one drawing call moves.
- *
- * HOW. The engine already maintains a second Canvas for precisely this, and says so in its own
- * header — `AHUD::DebugCanvas`, "'Foreground' debug canvas, WILL DRAW IN FRONT OF SLATE UI". It is
- * an ordinary `FCanvas` whose batches are painted by `SDebugCanvas`, which `SGameLayerManager` puts
- * in `EGameLayerOrder::Debug` (500) — above `Player` (100), where `UUserWidget::AddToViewport`
- * puts the UMG title screen. It is the surface `stat fps` and the console use to stay readable over
- * UMG, it exists in every build configuration, and it is created per frame from the same viewport.
- *
- * IT DOES NOT ALWAYS SHARE THE SCENE CANVAS'S COORDINATE SPACE, and spec v23 said it did. This
- * header used to read "with the same DPI scale as the scene canvas (`ShouldDPIScaleSceneCanvas` is
- * true for both)". `FGameplayViewportClient` — which `UGameViewportClient` inherits from — overrides
- * that predicate to return FALSE, so the scene canvas is built at DPI 1 while the foreground canvas
- * is built at the window's real DPI scale. Equal at 100%, two-to-one on a Retina editor window, and
- * the difference crashed PIE every time SETTINGS was opened (spec v24 §1). Resolve() now MEASURES
- * the two scales and declines to elevate when they disagree; see the block above that check.
- *
- * This scope swaps the `FCanvas` INSIDE the game's `UCanvas` rather than swapping the `UCanvas` on
- * the HUD, which is what makes it a four-line change instead of a sweep: `AHUD::DrawRect`,
- * `DrawLine`, `DrawTexture` and `DrawText` all reach the FCanvas through that one pointer, and so
- * does `TraceCanvasText` — which resolves the game canvas by name (see TraceCanvasText::GameCanvas)
- * and would otherwise have kept typing the panel's Sofachrome onto the surface UNDER Slate while
- * its plates drew above it. The engine performs the identical restore itself at the end of
- * `UGameViewportClient::Draw` (`CanvasObject->Canvas = SceneCanvas`).
- *
- * ORDER IS PRESERVED WITHIN A SCOPE-SET. Everything elevated on one frame lands in one FCanvas in
- * call order, so the JOIN prompt still draws under the failure banner, which still draws under this
- * panel, exactly as they did when all three shared the scene canvas.
- *
- * FALLBACK, AND THE RED ARM. If the foreground canvas is missing (no viewport, mid-teardown), if
- * the game canvas is not the one this frame is being drawn through, if the two surfaces disagree
- * about DPI scale (spec v24 §1 — this is the PIE case), or if `Trace.UI.ModalOverSlate`
- * is 0, IsElevated() is false and the caller draws exactly where it drew before — the modal is
- * still on screen and still correct, the UMG title just stands down for it again. That is the red
- * arm: one binary produces the defect and the fix, which is what spec v23 §"Red-arm discipline"
- * requires of a change that can only be judged from a screenshot.
- *
- * THE HOST MUST ASK FIRST. A host that keeps a Slate screen up while the modal draws has to agree
- * with the modal about which surface is in use, or it gets a title screen with an invisible modal
- * on top of it. IsAvailable() answers the same question with the same inputs, so ATraceMenuHUD can
- * decide whether to stand its widget down before anything is drawn. See DrawHUD.
- */
-class TRACE_API FTraceOverSlateCanvas
-{
-public:
-	/**
-	 * @param InHUD    the HUD being drawn. Null is legal and simply declines to elevate.
-	 * @param InViewW  the host's own view width — `Canvas->SizeX` — used as an IDENTITY CHECK on the
-	 * @param InViewH  canvas found by name. A canvas whose size is not the size this frame is being
-	 *                 drawn at is not the canvas this frame is being drawn through, and swapping it
-	 *                 would put the modal's rectangles and its text on two different surfaces.
-	 */
-	FTraceOverSlateCanvas(AHUD* InHUD, float InViewW, float InViewH);
-	~FTraceOverSlateCanvas();
-
-	FTraceOverSlateCanvas(const FTraceOverSlateCanvas&) = delete;
-	FTraceOverSlateCanvas& operator=(const FTraceOverSlateCanvas&) = delete;
-
-	/** True when drawing inside this scope lands in front of Slate. */
-	bool IsElevated() const { return bElevated; }
-
-	/** The answer the constructor would give, without changing anything. */
-	static bool IsAvailable(const AHUD* InHUD, float InViewW, float InViewH);
-
-	/** One line naming the surface and the reason, for the log and for `Trace.UI.VerifyMenu`. */
-	static const FString& LastStatus();
-
-private:
-	/** The game's UCanvas, borrowed for the scope. Never held across a frame. */
-	UCanvas* Surface = nullptr;
-
-	/** Its own FCanvas, put back by the destructor. */
-	FCanvas* SavedCanvas = nullptr;
-
-	bool bElevated = false;
-};
+// =================================================================================================
+// SPEC v25 §1 — THE FOREGROUND-CANVAS ELEVATION IS GONE. *** THIS IS THE SETTINGS CRASH. ***
+//
+// There used to be an `FTraceOverSlateCanvas` here: a scope that swapped the FCanvas inside the
+// game's UCanvas for `FViewport::GetDebugCanvas()` — the engine's FOREGROUND canvas, which Slate
+// paints on top of the UMG screens — so that opening SETTINGS did not make the UMG title screen
+// stand down (spec v23 §A2). It shipped, it was reported as a crash, it was "fixed" twice, and both
+// fixes were wrong because both of them accepted the elevation and argued about its arguments.
+//
+// IT WAS THE ELEVATION ITSELF. The foreground canvas is not a surface you may borrow. The engine
+// builds it per frame in `FDebugCanvasDrawer::InitDebugCanvas` as a DEFERRED canvas
+// (`CDM_DeferDrawing`, `Allow_DeleteOnRender`) and hands it to the RENDER thread later, from Slate's
+// paint pass, via `FSceneViewport::PaintDebugCanvas` -> `BeginRenderingCanvas` ->
+// `FSlateDrawElement::MakeCustom`. Everything drawn into it therefore outlives the frame that
+// recorded it, holding raw resource pointers — textures, and a shared reference to the viewport —
+// until somebody else decides to flush it. The engine knows this is sharp: it is the whole reason
+// `FDebugCanvasDrawer::HandleReleaseFontResources` exists, and that hook only rescues the engine's
+// OWN font atlas, not this project's sprites, its Sofachrome atlas, or the panel's tiles.
+//
+// MEASURED, spec v25 §1, one binary and one PIE harness, one switch apart:
+//
+//     elevation ON  (Trace.UI.ModalDPIGuard 0)  -> SETTINGS draws, then at PIE teardown
+//                                                  "Assertion failed: GameViewport.IsUnique()"
+//                                                  (SLevelViewport.cpp:5196) -> SIGSEGV. The EDITOR
+//                                                  dies, which is what "crashes the entire game"
+//                                                  looks like from the outside.
+//     elevation OFF (-TraceModalUnderSlate)     -> SETTINGS draws, PIE-End, Test Completed Success.
+//
+// Two more captured stacks from the same defect, both on the render thread, both while the settings
+// panel was up, are in the crash reports this fix was written from:
+//     FBatchedElements::Draw <- FCanvasBatchedElementRenderItem::Render_RenderThread
+//     GetMetalSurfaceFromRHITexture(FRHITexture*) <- SetShaderParameters   (a dead texture)
+// Neither is editor-specific; both are what a deferred canvas does with pointers whose owner has
+// moved on. The DPI comparison the previous fix added was never treating any of this — it only
+// happened to switch the elevation OFF in PIE on a Retina display, which is why the PIE runs went
+// green while the owner, whose two canvases agree about DPI, kept crashing.
+//
+// WHAT THIS COSTS, STATED PLAINLY. A Canvas modal is composited UNDER Slate again, so while SETTINGS
+// or the JOIN prompt is up, ATraceMenuHUD stands its UMG title screen down and draws the Canvas one
+// (see DrawHUD). That is the v23 §A2 defect coming back: the screen behind the panel changes
+// renderer for as long as the panel is open. It is a cosmetic regression on one screen, and it is
+// the trade spec v25 §1 asks for — a game that cannot open its settings is worse than a title screen
+// that dims differently while they are open.
+//
+// DO NOT PUT THIS BACK by borrowing an engine canvas. If the modals must survive over UMG, the
+// answer is to draw them AS Slate — a real widget, or a custom SWidget that owns its own FCanvas and
+// its own resource lifetimes — not to write into a surface whose flush schedule belongs to somebody
+// else.
+// =================================================================================================
 
 /**
  * The settings / pause overlay.
@@ -517,9 +471,6 @@ private:
 	// ---- Draw -----------------------------------------------------------------------------------
 
 	void Draw(AHUD* HUD);
-
-	/** Says which surface the panel is drawing on, once per answer per process. See §A2. */
-	void LogSurfaceOnce(bool bElevated) const;
 
 	void DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected);
 	void DrawFrame(AHUD* HUD, float X, float Y, float W, float H);

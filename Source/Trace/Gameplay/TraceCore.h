@@ -177,6 +177,60 @@ inline bool IsTransientPassRejection(ETracePassRejectReason Reason)
 		|| Reason == ETracePassRejectReason::NotUnderCrosshair;
 }
 
+// =================================================================================================
+// SPEC v25 §2 — THE TURNOVER IS A PLACE THE CORE CAN BE, NOT A TRANSFER
+//
+// Verbatim: "Instead of automatically going to the other team, a turnover is registered and the core
+// stays on the ground where it landed." Everything mode B already had about a turnover — WHEN one
+// fires, which surfaces count, the settle — is untouched (spec v25: "Turnover criteria remain the
+// same"). What changed is only what happens next, and it is a three-row state table:
+//
+//   Loose, no turnover  | nobody pulls | anybody picks up            | normal beam
+//   Turnover, 0-5 s     | OPPOSING team only, RMB + hover + line of  | opposing team's colour,
+//                       | sight, 0.3 s continuous                    | LARGER
+//                       | opposing team only picks up                |
+//   After 5 s           | nobody pulls | either team, by touch       | normal beam
+//
+// THE THIRD ROW IS THE FIRST ROW. Once the lockout expires nothing distinguishes the two — nobody
+// pulls, anybody may take it, the beam is normal — so the turnover is simply CLEARED at 5 s rather
+// than kept alive as a third state that would have to be shown to behave identically. One latch,
+// bTurnoverRegisteredThisFlight, stops the landing rule from noticing the still-resting Core a frame
+// later and registering a second turnover, which would restart the clock forever.
+//
+// SERVER-AUTHORITATIVE, and the race is the reason. Two opponents can be filling at once and "first
+// to complete wins"; a client that ran its own 0.3 s clock would sometimes disagree with the server
+// about who that was, and the losing client would have watched a full ring hand the Core to somebody
+// else. So the hold is measured ONLY on the server (FTraceCorePullHold::StartServerTime is written by
+// the server and replicated down) and the ring the HUD draws is that number — see GetPullProgressFor.
+// =================================================================================================
+
+/**
+ * SPEC v25 §2. One player's in-progress pull, as the SERVER sees it.
+ *
+ * Replicated as an array rather than as a single "who is pulling" pointer because the spec makes the
+ * contested case explicit ("Two opponents pulling at once"), and a single pointer cannot show two
+ * players their own ring. Five entries is the practical ceiling (one team), 8 bytes each.
+ */
+USTRUCT()
+struct FTraceCorePullHold
+{
+	GENERATED_BODY()
+
+	/** The player holding the button. Never null in a replicated entry. */
+	UPROPERTY()
+	TObjectPtr<ATraceCharacter> Puller = nullptr;
+
+	/**
+	 * Shared-clock time the CURRENT continuous hold began.
+	 *
+	 * Re-stamped on every fresh hold, because the fill CANCELS rather than pauses: losing hover,
+	 * losing line of sight or releasing the button removes the entry outright, and re-satisfying the
+	 * conditions starts a new one from zero.
+	 */
+	UPROPERTY()
+	float StartServerTime = 0.f;
+};
+
 /**
  * The single contested objective, modelled as replicated status.
  *
@@ -300,6 +354,46 @@ public:
 	UPROPERTY(Replicated)
 	FVector_NetQuantize LooseVelocity = FVector::ZeroVector;
 
+	// --- SPEC v25 §2. The turnover window. Inert (None / empty) outside it and in mode A. ----------
+
+	/**
+	 * THE TEAM THAT DROPPED IT, i.e. the team that is LOCKED OUT. None = no turnover is running.
+	 *
+	 * Stored as the losing team rather than as the winning one because that is what the sentence
+	 * says ("Players from the team who dropped the core are locked out") and because it is the fact
+	 * every rule here is phrased against: who may not pick up, and — by TraceOpposingTeam — who may
+	 * pull and what colour the beam becomes. Storing the opponent instead would make the lockout a
+	 * derived fact and the pull the stored one, which is the wrong way round for reading the code
+	 * against the note.
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_Turnover)
+	ETraceTeam TurnoverLockoutTeam = ETraceTeam::None;
+
+	/** Shared-clock time the turnover was registered. Only meaningful while TurnoverLockoutTeam != None. */
+	UPROPERTY(Replicated)
+	float TurnoverStartServerTime = 0.f;
+
+	/**
+	 * Every pull currently being held, as the SERVER measures it. The HUD's ring reads this.
+	 *
+	 * Replicated to everybody rather than to the puller alone: this actor is bAlwaysRelevant and has
+	 * no COND_OwnerOnly anywhere (see the file header), the payload is a handful of bytes, and a
+	 * spectator or a teammate being able to see that somebody is pulling is information the note's
+	 * own "small circle around the core" is already showing on screen.
+	 */
+	UPROPERTY(Replicated)
+	TArray<FTraceCorePullHold> PullHolds;
+
+	/**
+	 * The player a COMPLETED pull is delivering the Core to, or null.
+	 *
+	 * Replicated because it is the difference between a Core falling and a Core being pulled, and a
+	 * client that could not tell them apart would draw the wrong thing at the one moment the mechanic
+	 * is happening. Cleared the instant they take it.
+	 */
+	UPROPERTY(Replicated)
+	TObjectPtr<ATraceCharacter> PullWinner = nullptr;
+
 	// =============================================================================================
 	// Contract surface - new API
 	// =============================================================================================
@@ -382,7 +476,126 @@ public:
 	/** MODE B. Authoritative position of the loose Core. Only meaningful while IsLoose(). */
 	FVector GetLooseLocation() const { return LooseLocation; }
 
+	// =============================================================================================
+	// SPEC v25 §2 — THE TURNOVER STATE MACHINE. Everything below is GOALS MODE ONLY.
+	//
+	// Every query here answers correctly on every machine: the four facts it is built from
+	// (TurnoverLockoutTeam, TurnoverStartServerTime, PullHolds, PullWinner) are all replicated, and
+	// the clock is the shared one (AGameStateBase::GetServerWorldTimeSeconds), so a client reading
+	// these is reading the server's answer late rather than a guess of its own.
+	// =============================================================================================
+
+	/** True while a registered turnover's lockout window is still running. False in mode A. */
+	bool IsTurnoverActive() const;
+
+	/** The team that DROPPED the Core and is locked out of it. None when no turnover is running. */
+	ETraceTeam GetTurnoverLockoutTeam() const { return TurnoverLockoutTeam; }
+
+	/**
+	 * The team the turnover belongs TO: the only side that may pull or pick up during the window, and
+	 * the colour the beam becomes. None when no turnover is running.
+	 *
+	 * DERIVED, never stored, so it cannot drift from the lockout it is the opposite of.
+	 */
+	ETraceTeam GetTurnoverPullingTeam() const { return TraceOpposingTeam(TurnoverLockoutTeam); }
+
+	/** Seconds left on the lockout window. 0 when no turnover is running. */
+	float GetTurnoverSecondsRemaining() const;
+
+	/** 0..1 of the way through the lockout window. -1 when no turnover is running. */
+	float GetTurnoverAlpha() const;
+
+	/**
+	 * *** THE HUD'S RING. SPEC v25 §3 asks for "real server-side progress, not a local guess". ***
+	 *
+	 * 0..1 of @p Player's current pull hold, or -1 when they are not pulling. Read straight off the
+	 * replicated PullHolds entry the SERVER stamped, so the ring a player watches fill is the same
+	 * number that decides the race — there is deliberately no local prediction to disagree with it.
+	 *
+	 * Safe on any actor, on any machine, including null and a non-character.
+	 */
+	float GetPullProgressFor(const AActor* Player) const;
+
+	/** Convenience for the HUD: GetPullProgressFor() of this machine's own locally-controlled pawn. */
+	float GetLocalPullProgress() const;
+
+	/** The player a completed pull is delivering the Core to, or null. */
+	ATraceCharacter* GetPullWinner() const { return PullWinner; }
+
+	/** True while the Core is flying to the winner of a pull. */
+	bool IsPullTravelling() const { return PullWinner != nullptr; }
+
+	/**
+	 * Would @p Puller be allowed to start (or continue) a pull on this frame?
+	 *
+	 * The WHOLE rule, in one place, asked by the server's state machine, by the HUD's "should I draw
+	 * a ring" test and by the red-arm harness — so a ring can never appear for a pull the server
+	 * would refuse. @p OutReason names the test that failed, for the log and the harness.
+	 */
+	bool CanPullNow(const ATraceCharacter* Puller, const TCHAR** OutReason = nullptr) const;
+
+	/**
+	 * THE PULL BUTTON. Call on the machine that owns the input; safe from any machine.
+	 *
+	 * *** §7's right mouse routes here. *** Precedence is the caller's to apply and this function
+	 * does not assume it: it refuses anybody who is carrying the Core, so a carrier's right mouse is
+	 * free to mean parry, and it refuses anybody CanPullNow() refuses, so a press that is not over a
+	 * turned-over Core costs one refused latch and nothing else.
+	 *
+	 * On the server the latch is applied directly. On a client it is forwarded through that client's
+	 * own ATraceCorePullRelay — this actor is owned by its HOLDER, so a non-holding client cannot RPC
+	 * it at all, which is the whole reason the relay exists.
+	 */
+	void RequestPullInput(bool bPressed, ATraceCharacter* Requester);
+
+	/** SPEC v25 §2. Seconds of continuous hold that complete a pull. UTraceSettings::CorePullHoldSeconds. */
+	static float GetPullHoldSeconds();
+
+	/** SPEC v25 §2. Length of the lockout window. UTraceSettings::CoreTurnoverLockoutSeconds. */
+	static float GetTurnoverLockoutSeconds();
+
+	/**
+	 * SPEC v25 §2/§3. How much LARGER the beam is during the turnover window, as a MULTIPLIER of the
+	 * normal beam width.
+	 *
+	 * RELATIVE, per Demo 21's standing rule: the note asks for a beam that is "larger", which is a
+	 * statement about the normal beam, so a retune of the normal beam has to move this with it. An
+	 * absolute width stored here would silently stop being "larger" the day the base changed.
+	 */
+	static float GetTurnoverBeamScale();
+
 #if !UE_BUILD_SHIPPING
+	/**
+	 * DEV ONLY — SPEC v25 INTEGRATION SCAFFOLDING. Stage a turnover in front of the LOCAL PLAYER.
+	 *
+	 * WHY THIS EXISTS. Every §2 harness in this file drives BOTS, deliberately: the hover rule under
+	 * test is "where is this player looking", and moving a human's control rotation from a test would
+	 * be faking the very input being measured. That is right for the red arm and useless for the
+	 * integrator, whose job is to PHOTOGRAPH the window — the beam in the other team's colour, the
+	 * ring filling, the locked-out team walking over the Core and getting nothing. Over five runs the
+	 * §3 agent's local pawn satisfied CanPullNow on 6 frames out of ~1600 for exactly this reason.
+	 *
+	 * So this moves the CORE ONLY, and never the aim: it puts the Core on the FLOOR @p DistanceUU in
+	 * front of the player, resting, where a thrown Core would have come to a stop. Whether the player
+	 * is then hovering it is left entirely to them and to the shipping CanPullNow — which is why the
+	 * demo below gets its own red arm for free, and has repeatedly recorded "not hovering the Core"
+	 * from this exact staging. Everything after that is the shipping path: DebugLaunchLoose + the
+	 * shipping RegisterTurnover(), then the real ServerTickTurnover, the real CanPullNow, the real
+	 * 0.3 s clock.
+	 *
+	 * RESTING, NOT HANGING, and that is load-bearing rather than cosmetic: a Core staged in mid-air
+	 * "resumes flight" (measured: "nothing at all under it (orb 134 uu clear) - resuming flight"),
+	 * falls, re-lands, fires a SECOND genuine turnover that restarts the window, and lands somewhere
+	 * the player is no longer looking — which cancelled a pull at 0.777 of its hold.
+	 *
+	 * @param bLockLocalTeam  true  = the LOCAL player's team dropped it. They are locked out; the ring
+	 *                                must NOT appear for them and touch must be refused for 5 s.
+	 *                        false = the OPPOSING team dropped it. The local player may pull it, which
+	 *                                is the arm `Trace.HUD.PullRing.Hold` can then complete.
+	 */
+	static bool DebugStageTurnoverAtLocalCrosshair(UWorld* World, float DistanceUU, bool bLockLocalTeam,
+		FString& OutReport);
+
 	/**
 	 * DEV ONLY. The catcher ServerApplyCatchZone last chose, or null.
 	 *
@@ -1079,6 +1292,16 @@ public:
 	void OnRep_Loose();
 
 	/**
+	 * SPEC v25 §2. The turnover started or ended: recolour and resize the beam on this machine now.
+	 *
+	 * The beam is the one part of the turnover a player reads from across the field, so it must not
+	 * wait for the next Tick reconciliation — a 5 s window that spends its first frame the wrong
+	 * colour is 20% of the read gone at 60 Hz on the very frame the player is looking for it.
+	 */
+	UFUNCTION()
+	void OnRep_Turnover();
+
+	/**
 	 * SPEC v10 §10. The server teleported the Core; put it there NOW, this frame, with no
 	 * dead reckoning and no waiting for the next possession event to place it.
 	 */
@@ -1312,6 +1535,51 @@ private:
 	 */
 	double MeasureVisibleSupportGap(FVector& OutSupportPoint) const;
 
+	// --- SPEC v25 §2 internals. Server only unless marked. ----------------------------------------
+
+	/**
+	 * SERVER. Registers a turnover: the Core STAYS where it landed and the window opens.
+	 *
+	 * The one writer of TurnoverLockoutTeam / TurnoverStartServerTime, called from exactly one place
+	 * (ServerSurfaceTurnover), so "when does a turnover start" has one answer and one log line.
+	 */
+	void RegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where, const TCHAR* Why);
+
+	/** SERVER. Ends the window (expiry, the pull completing, the Core leaving the world). */
+	void ClearTurnover(const TCHAR* Why);
+
+	/**
+	 * SERVER. One frame of the pull state machine: validate every hold, cancel the ones that no
+	 * longer qualify, complete the OLDEST one that has reached the hold time, expire the window.
+	 *
+	 * Runs from ServerTickLooseCore, ahead of the pickup poll, because a completed pull and a
+	 * first-contact pickup are two answers to "who gets it" and the pull is the one the player earned.
+	 */
+	void ServerTickTurnover(float DeltaSeconds);
+
+	/** SERVER. Applies one press/release to the latch. The only writer of PullInputHeld. */
+	void ServerApplyPullInput(ATraceCharacter* Requester, bool bPressed);
+
+	/** SERVER. Drops @p Puller's hold and their latch entry, if any. CANCELS; never pauses. */
+	void CancelPullFor(const ATraceCharacter* Puller, const TCHAR* Why, bool bAlsoClearLatch);
+
+	/**
+	 * SERVER. A pull reached the hold time: the Core starts travelling to @p Winner and every other
+	 * fill is cancelled ("first to complete wins; the loser's fill cancels").
+	 */
+	void ServerCompletePull(ATraceCharacter* Winner);
+
+	/**
+	 * SERVER. One frame of the delivery flight. Returns true when it consumed the tick (the Core is
+	 * still travelling, or has just been taken and the caller must touch no member state).
+	 *
+	 * THE SPEED IS ATraceCore::GetThrowSpeed(), NOT A NUMBER OF ITS OWN — spec v25: "at full core
+	 * thrown velocity ... the same speed constant a thrown Core uses, not a new number". So a retune
+	 * of the throw, or of the Core's weight (which divides the throw speed by sqrt(mass)), moves the
+	 * pull with it. See the standing rule in the module notes.
+	 */
+	bool ServerTickPullTravel(float DeltaSeconds);
+
 	/** Server, mode B. The guarded loose -> held transition. Sets the grace override, then grants. */
 	void TakeLooseCore(ATraceCharacter* Taker);
 
@@ -1358,6 +1626,61 @@ private:
 
 	/** Server. Runs the Trace.ModeB.Verify scenario, one step at a time. See the .cpp. */
 	void TickModeBVerification();
+
+	/**
+	 * Server, diagnostics only. SPEC v25 §2's red arm: park the Core loose at @p Where and register a
+	 * turnover against @p DroppingTeam, exactly as a landed throw would.
+	 *
+	 * It goes through DebugLaunchLoose and then the SHIPPING RegisterTurnover(), so the window it
+	 * opens is the window the game plays; the only thing it fakes is the throw, which is the part a
+	 * live match cannot be asked to arrange on cue. Every check the harness makes afterwards goes
+	 * through CanPullNow / RequestPullInput / ServerTickTurnover — the real ones.
+	 *
+	 * @return false when the Core could not be put loose (mode A, a locked state, no team).
+	 */
+	bool DebugRegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where);
+
+	/**
+	 * Server. Runs the Trace.ModeB.TurnoverVerify scenario, one step per tick. See the .cpp.
+	 *
+	 * SPEC v25 §2 asks for four rules to be RED-ARMED: a same-team player must fail to pull, a player
+	 * with no line of sight must fail, a release at 0.29 s must fail, and the lockout must expire.
+	 * Each of those is a NEGATIVE claim, and a negative claim about a rule nobody has watched fire is
+	 * worth nothing — so every red step here is paired with the green one beside it, on the same
+	 * pawns, in the same window, through the same functions.
+	 */
+	void TickTurnoverVerify();
+
+	/** Server, harness only. Points a BOT's controller at the loose Core so it satisfies the hover test. */
+	bool DriveAimAtLooseCore(ATraceCharacter* Puller);
+
+	// --- Trace.ModeB.TurnoverVerify scenario state (diagnostics only) ------------------------------
+
+	int32 TurnoverVerifyStep = -1;
+	float TurnoverVerifyDeadline = 0.f;
+	float TurnoverVerifyMark = 0.f;
+	int32 TurnoverVerifyPassCount = 0;
+	int32 TurnoverVerifyFailCount = 0;
+	int32 TurnoverVerifySkipCount = 0;
+	int32 TurnoverVerifyRetriesLeft = 0;
+	bool bTurnoverVerifyArmed = false;
+
+	/**
+	 * The red arm has already run once in this session.
+	 *
+	 * A LATCH THAT IS NEVER RESET, and it is not belt and braces: -ExecCmds and -TraceExec set the
+	 * arming CVar at ECVF_SetByConsole, and a later Set(0, ECVF_SetByCode) from inside the game is
+	 * SILENTLY IGNORED because console priority beats code priority. The first version of this
+	 * harness re-armed on the tick after it reported and ran three times in forty seconds - the same
+	 * defect the momentum test's own comment in this file warns about. Anything that disarms itself
+	 * has to do it with state it owns.
+	 */
+	bool bTurnoverVerifyDone = false;
+
+	/** Step 4 only: the delivery was actually SEEN, so a puller who merely walked over it cannot pass. */
+	bool bTurnoverVerifySawWinner = false;
+	TWeakObjectPtr<ATraceCharacter> TurnoverVerifyPuller;
+	TWeakObjectPtr<ATraceCharacter> TurnoverVerifyLocked;
 
 	/**
 	 * EVERY MACHINE, diagnostics only (Trace.ModeB.FlightLog). Logs this machine's own view of the
@@ -1605,6 +1928,29 @@ private:
 	/** Ends any charge in progress WITHOUT throwing. Death, a possession change, a mode switch. */
 	void ClearThrowCharge(const TCHAR* Reason);
 
+	// --- SPEC v25 §2 server state. Nothing here is replicated; the four facts above are. ----------
+
+	/**
+	 * Whose pull button is DOWN, as last reported by that player's own machine.
+	 *
+	 * Separate from PullHolds on purpose, and the separation is the "cancels, does not pause" rule:
+	 * the latch survives a lost hover, the HOLD does not. A player who keeps the button down through
+	 * a blink of cover therefore starts a FRESH 0.3 s the moment the crosshair comes back, rather
+	 * than resuming a hold that would let them pull through a wall by looking away.
+	 */
+	TArray<TWeakObjectPtr<ATraceCharacter>> PullInputHeld;
+
+	/**
+	 * A turnover has already been registered for THIS loose period.
+	 *
+	 * Load-bearing rather than tidy. The Core now stays lying on the surface it landed on, so the
+	 * landing rule sees the same at-rest, supported Core on every following frame — without this
+	 * latch it would register a second turnover a frame later, and a third after that, restarting the
+	 * 5 s clock for as long as the Core sat there. Cleared by ClearLooseState(), i.e. by every path
+	 * that ends a flight.
+	 */
+	bool bTurnoverRegisteredThisFlight = false;
+
 	/** True once the loose Core has come to rest, so the log says "thrown" or "loose" correctly. */
 	bool bLooseAtRest = false;
 
@@ -1784,6 +2130,20 @@ private:
 	 */
 	bool bVerifyAwaitingTake = false;
 	bool bVerifyTakeSeen = false;
+
+	/**
+	 * SPEC v25 §2. The same pattern one event earlier: the TURNOVER REGISTRATION, captured by
+	 * RegisterTurnover at the moment it happens.
+	 *
+	 * Steps 6, 7 and 8 used to assert "and then the enemy had it". Under v25 the rule stops at "the
+	 * Core stays there and the thrower's team is locked out", and what happens next belongs to
+	 * whoever earns it — so those steps judge this instead. Not polled, for the reason
+	 * bVerifyAwaitingTake is not: an enemy can pull the Core and close the window inside the same
+	 * few frames, and a poll would report a rule that fired as one that did not.
+	 */
+	bool bVerifyAwaitingTurnover = false;
+	bool bVerifyTurnoverSeen = false;
+	ETraceTeam VerifyTurnoverLockedTeam = ETraceTeam::None;
 	ETraceTeam VerifyTookTeam = ETraceTeam::None;
 
 	/**
@@ -1844,6 +2204,21 @@ private:
 	bool bVerifyRestArmed = false;
 
 	/**
+	 * Step 8 only: re-parks left if somebody takes the Core before it has settled.
+	 *
+	 * SPEC v25 §2 IS WHY THIS IS NEEDED, and the reason is worth stating because it is a change in
+	 * the world rather than in the step. Step 7 now leaves the Core lying on the crate for the whole
+	 * lockout window, so the bots converge on it and are still standing there when step 8 parks its
+	 * own Core on the same surface — which is then taken on the first frame, before it can ever come
+	 * to rest, and the at-rest probe under test never runs. Re-parking is the harness getting its own
+	 * subject back; it still fails when the retries run out, and says that is what happened.
+	 *
+	 * Never reset: the scenario runs once per session, and a counter that topped itself back up would
+	 * retry forever against a situation that is not going to change.
+	 */
+	int32 VerifyRestParkRetriesLeft = 3;
+
+	/**
 	 * Server, diagnostics. Finds a raised, horizontal-ish surface in the arena — the TOP of a piece of
 	 * cover — and, on its side, a vertical face to bounce off.
 	 *
@@ -1900,6 +2275,14 @@ private:
 	/** Mode B: bLoose replicates independently of Carrier, so it joins the same reconciliation. */
 	bool bAppliedLoose = false;
 
+	/**
+	 * SPEC v25 §2: and so does the turnover window, which additionally ENDS ON A CLOCK rather than on
+	 * a replicated write — the last packet a client gets says "open", and five seconds later it is
+	 * simply not open any more. So the reconciliation has to compare against IsTurnoverActive(), not
+	 * against an OnRep, or the beam would stay big and the wrong colour until the next possession.
+	 */
+	bool bAppliedTurnoverActive = false;
+
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> BaseMaterial = nullptr;
 
@@ -1912,4 +2295,44 @@ private:
 	bool bMaterialIsNeon = false;
 	FLinearColor AppliedColor = FLinearColor::White;
 	bool bColorApplied = false;
+};
+
+
+/**
+ * SPEC v25 §2 — THE PULL BUTTON'S RETURN PATH, AND WHY IT NEEDS AN ACTOR OF ITS OWN.
+ *
+ * A client may only send a Server RPC on an actor its own connection OWNS: the engine resolves
+ * AActor::GetNetConnection() up the owner chain and drops anything else. ATraceCore SetOwner()s
+ * itself to its HOLDER — that is what makes the holder's pass RPC legal — and a pull is by definition
+ * sent by somebody who is NOT holding it, and by up to five of them at once. So there is no way to
+ * put ServerSetPullInput on the Core: one actor has one owner.
+ *
+ * This is the smallest thing that fixes that. One per player controller, owned by it, relevant to
+ * nobody else, carrying one bool. ATraceGameMode spawns it in PostLogin and destroys it in Logout;
+ * bots never need one, because a bot's controller is already on the server and its pull applies
+ * directly.
+ *
+ * IT DECIDES NOTHING. The whole payload is "my button is down / up". Eligibility, the 0.3 s clock,
+ * the race and the completion are all ATraceCore's, on the server, exactly as spec v25 requires.
+ */
+UCLASS(NotPlaceable, Transient)
+class TRACE_API ATraceCorePullRelay : public AActor
+{
+	GENERATED_BODY()
+
+public:
+	ATraceCorePullRelay();
+
+	/** The owning client's pull button. Server applies it to the Core's latch. */
+	UFUNCTION(Server, Reliable)
+	void ServerSetPullInput(bool bPressed);
+
+	/**
+	 * The relay owned by @p Controller ON THIS MACHINE, or null.
+	 *
+	 * An iteration rather than a cached pointer on the controller, because the controller is not this
+	 * agent's file to add a member to and because there is exactly one press and one release per
+	 * pull — a linear scan over a handful of actors twice per pull is not a cost worth a coupling.
+	 */
+	static ATraceCorePullRelay* Find(const AController* Controller);
 };

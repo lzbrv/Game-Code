@@ -215,3 +215,16 @@ Art/Fonts/*.pdf
 # Lato is SIL OFL — safe to commit, unlike the licensed faces above.
 !Art/Fonts/Lato-Regular.ttf
 !Art/Fonts/README*
+
+# *** THE SAME LICENCE RULE, AT THE REPO ROOT. Spec v25 integration pass. ***
+# The rules above only ever matched Art/Fonts/. Working copies of the licensed faces and the
+# archives they arrive in have repeatedly been dropped at the repo ROOT instead — at the time this
+# was written that was Erbaum-Bold.otf, sofachrome.zip and "font files test.zip", all untracked,
+# none ignored. The house rule is that everything is staged with `git add -A`, and this repo is
+# PUBLIC, so the next commit would have redistributed commercially-licensed type.
+#
+# Root only (the leading slash): Content/ and Art/ keep their own explicit rules above, and a
+# blanket *.otf would silently swallow a font somebody deliberately vendored elsewhere.
+/*.otf
+/*.ttf
+/*.zip

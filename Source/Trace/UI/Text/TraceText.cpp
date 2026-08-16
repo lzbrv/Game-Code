@@ -222,10 +222,24 @@ namespace TraceTextFile
 
 		const Metrics::FFace& Default = Metrics::Face(Metrics::DefaultWeight);
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[Text] Sofachrome is live: %s (%dx%d, %d glyphs, em %.0fpx, cap %.0fpx, weight %s). ")
-			TEXT("Menu type is drawn one quad per glyph — no UFont and no FSlateFontInfo is involved."),
-			Default.TextureAsset, Default.AtlasWidth, Default.AtlasHeight, Metrics::NumGlyphs,
-			Metrics::EmSize, Default.CapHeight, Default.Name);
+			TEXT("[Text] The glyph atlas is live. Default face %s = %s: %s (%dx%d, %d glyphs, ")
+			TEXT("em %.0fpx, cap %.0fpx). Type is drawn one quad per glyph — no UFont and no ")
+			TEXT("FSlateFontInfo is involved."),
+			Default.Name, Default.Source, Default.TextureAsset, Default.AtlasWidth,
+			Default.AtlasHeight, Metrics::NumGlyphs, Metrics::EmSize, Default.CapHeight);
+
+		// One line per face, naming the FILE each one is rasterised from. This is the line that
+		// answers "is the HUD really in Erbaum" in a log, and its screenshot counterpart is the
+		// per-weight caption in Trace.Text.Preview.
+		for (int32 Index = 0; Index < NumWeights; ++Index)
+		{
+			const Metrics::FFace& Face = Metrics::Face(Index);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Text]   %-5s -> %-30s %s  (cap %.0f, ascent %.0f/descent %.0f)"),
+				Face.Name, Face.Source,
+				WeightStates[Index].bUsable ? TEXT("own sheet") : TEXT("SUBSTITUTED"),
+				Face.CapHeight, Face.Ascent, Face.Descent);
+		}
 
 		// A weight that failed while the default one worked is NOT a fallback to Lato — it draws in
 		// the default weight, which is still Sofachrome. That is the right degradation (the owner
@@ -361,24 +375,57 @@ bool TraceText::IsAtlasActive()
 		&& TraceTextFile::CVarAtlas.GetValueOnAnyThread() != 0;
 }
 
+namespace TraceTextFile
+{
+	/** "Sofachrome W05 ExtraLight.ttf" -> "Sofachrome". Family only; the cut is the weight's job. */
+	static FString FamilyFromFile(const TCHAR* File)
+	{
+		FString Source(File);
+		Source.RemoveFromEnd(TEXT(".otf"));
+		Source.RemoveFromEnd(TEXT(".ttf"));
+		// One per family, in the order a name is built: the licensed files are named
+		// "Sofachrome W05 ExtraLight", "Sofachrome Rg", "Erbaum-Bold", "Lato-Regular".
+		Source.RemoveFromEnd(TEXT(" W05 ExtraLight"));
+		Source.RemoveFromEnd(TEXT(" Rg"));
+		Source.RemoveFromEnd(TEXT("-Bold"));
+		Source.RemoveFromEnd(TEXT("-Regular"));
+		return Source;
+	}
+}
+
 FString TraceText::FaceName()
 {
 	if (IsAtlasActive())
 	{
 		// The name of the typeface, not of the asset: this string is what a screenshot is captioned
 		// with, and "T_FontAtlas" would not tell a reviewer which letterforms they are looking at.
-		FString Source(TraceFontAtlasMetrics::SourceFont);
-		Source.RemoveFromEnd(TEXT(".otf"));
-		Source.RemoveFromEnd(TEXT(".ttf"));
-		Source.RemoveFromEnd(TEXT(" Rg"));
-		return Source;
+		return TraceTextFile::FamilyFromFile(TraceFontAtlasMetrics::SourceFont);
 	}
 
-	FString Fallback(TraceMenuArtStyle::MenuFontSourceFile);
-	Fallback.RemoveFromEnd(TEXT(".ttf"));
-	Fallback.RemoveFromEnd(TEXT(".otf"));
-	Fallback.RemoveFromEnd(TEXT("-Regular"));
-	return Fallback;
+	return TraceTextFile::FamilyFromFile(TraceMenuArtStyle::MenuFontSourceFile);
+}
+
+FString TraceText::FaceName(ETraceTextWeight Weight)
+{
+	if (!IsAtlasActive())
+	{
+		return TraceTextFile::FamilyFromFile(TraceMenuArtStyle::MenuFontSourceFile);
+	}
+
+	// The EFFECTIVE face. Spec v25 §4 asks for the face to be identified in a photograph rather than
+	// asserted, and a caption naming the face that was REQUESTED would be exactly the assertion it is
+	// meant to replace: if T_FontAtlasHud failed the staleness guard the HUD draws in Sofachrome and
+	// this has to say Sofachrome.
+	return TraceTextFile::FamilyFromFile(TraceTextFile::EffectiveFace(Weight).Source);
+}
+
+const TCHAR* TraceText::FaceSourceFile(ETraceTextWeight Weight)
+{
+	if (!IsAtlasActive())
+	{
+		return TraceMenuArtStyle::MenuFontSourceFile;
+	}
+	return TraceTextFile::EffectiveFace(Weight).Source;
 }
 
 bool TraceText::IsWeightActive(ETraceTextWeight Weight)
@@ -436,9 +483,9 @@ FString TraceText::DescribeFace()
 		for (int32 Index = 0; Index < TraceTextFile::NumWeights; ++Index)
 		{
 			const TraceFontAtlasMetrics::FFace& Face = TraceFontAtlasMetrics::Face(Index);
-			Weights += FString::Printf(TEXT("%s%s (cap %.0f, thin %.0f)%s"),
+			Weights += FString::Printf(TEXT("%s%s = %s (cap %.0f, ascent %.0f, thin %.0f)%s"),
 				Weights.IsEmpty() ? TEXT("") : TEXT(", "),
-				Face.Name, Face.CapHeight, Face.Erosion,
+				Face.Name, Face.Source, Face.CapHeight, Face.Ascent, Face.Erosion,
 				TraceTextFile::WeightStates[Index].bUsable ? TEXT("") : TEXT(" — UNAVAILABLE"));
 		}
 
@@ -446,16 +493,17 @@ FString TraceText::DescribeFace()
 			TraceFontAtlasMetrics::Face(TraceFontAtlasMetrics::DefaultWeight);
 
 		return FString::Printf(
-			TEXT("SOFACHROME — the artist's face, from the glyph atlas %s (%dx%d, %d glyphs, em %.0f, ")
-			TEXT("cap %.0f). Every letter is one textured quad drawn by Source/Trace/UI/Text; no UFont ")
-			TEXT("and no FSlateFontInfo is involved, which is the whole point — an offline UFont ")
-			TEXT("cannot drive UMG. Weights: %s — %s is the default, and each weight is rasterised ")
-			TEXT("from its OWN font file (thin 0 both), so they do NOT share advances: measure a ")
-			TEXT("string in the weight you will draw it in. Force the fallback with -TraceNoFontAtlas ")
-			TEXT("or `Trace.Text.Atlas 0`."),
-			Default.TextureAsset, Default.AtlasWidth, Default.AtlasHeight,
+			TEXT("GLYPH ATLAS — %s is the default face, from %s (%dx%d, %d glyphs, em %.0f, cap %.0f). ")
+			TEXT("Every letter is one textured quad drawn by Source/Trace/UI/Text; no UFont and no ")
+			TEXT("FSlateFontInfo is involved, which is the whole point — an offline UFont cannot drive ")
+			TEXT("UMG. Faces: %s. Each is rasterised from its OWN font file (thin 0 for all of them), ")
+			TEXT("so they share NEITHER advances NOR baselines — measure and baseline-align a string in ")
+			TEXT("the weight you will draw it in. They DO share the %.0f px line box, which is what one ")
+			TEXT("layout pass needs and what the importer enforces. Force the fallback with ")
+			TEXT("-TraceNoFontAtlas or `Trace.Text.Atlas 0`."),
+			Default.Source, Default.TextureAsset, Default.AtlasWidth, Default.AtlasHeight,
 			TraceFontAtlasMetrics::NumGlyphs, TraceFontAtlasMetrics::EmSize, Default.CapHeight,
-			*Weights, Default.Name);
+			*Weights, TraceFontAtlasMetrics::LineHeight);
 	}
 
 	FString Why;
@@ -489,9 +537,17 @@ float TraceText::LineHeight(float Size)
 	return TraceFontAtlasMetrics::LineHeight * TraceTextFile::ScaleFor(Size);
 }
 
-float TraceText::Ascent(float Size)
+float TraceText::Ascent(float Size, ETraceTextWeight Weight)
 {
-	return TraceFontAtlasMetrics::Ascent * TraceTextFile::ScaleFor(Size);
+	// PER FACE since v25. The line box is shared and enforced; the baseline inside it is not — Erbaum
+	// splits 116 px as 93/23 against Sofachrome's 95/21. The EFFECTIVE face, so a weight that failed
+	// the staleness guard reports the baseline of the face that will really be drawn.
+	return TraceTextFile::EffectiveFace(Weight).Ascent * TraceTextFile::ScaleFor(Size);
+}
+
+float TraceText::Descent(float Size, ETraceTextWeight Weight)
+{
+	return TraceTextFile::EffectiveFace(Weight).Descent * TraceTextFile::ScaleFor(Size);
 }
 
 float TraceText::CapHeight(float Size, ETraceTextWeight Weight)
@@ -561,10 +617,13 @@ FVector2f TraceText::AlignOffset(const FVector2f& BlockSize, const FStyle& Style
 	{
 	case EVAlign::Center:   Y = -BlockSize.Y * 0.5f;  break;
 	case EVAlign::Bottom:   Y = -BlockSize.Y;         break;
-	case EVAlign::Baseline: Y = -Ascent(Size);        break;
+	// Both of these ask the STYLE'S OWN face where its baseline is. They used to read one shared
+	// ascent, which was true while every face split the line box the same way and stopped being true
+	// when Erbaum arrived splitting it 93/23 against Sofachrome's 95/21.
+	case EVAlign::Baseline: Y = -Ascent(Size, Style.Weight); break;
 	// A baked word sprite's top edge is the CAP LINE, not the line box, so live text that must sit
 	// where one sat has to be lifted by the gap between them.
-	case EVAlign::CapTop:   Y = -(Ascent(Size) - CapHeight(Size, Style.Weight)); break;
+	case EVAlign::CapTop:   Y = -(Ascent(Size, Style.Weight) - CapHeight(Size, Style.Weight)); break;
 	default:                                          break;
 	}
 

@@ -1314,6 +1314,25 @@ void UTraceWeaponComponent::AddRecoilPitch(APlayerController* RecoilController, 
 
 void UTraceWeaponComponent::ApplyRecoilKick()
 {
+	// =============================================================================================
+	// SPEC v25 §5 — "Remove gun recoil, keep the firing rate."
+	// =============================================================================================
+	//
+	// THIS EARLY RETURN IS THE REMOVAL, and bRecoilEnabled is now false in both the header default
+	// and DefaultGame.ini. It is the only door into the aim punch: this function is called from
+	// exactly one place (FireOnce, after the shot has been sampled and sent) and it is the only
+	// caller of AddRecoilPitch that ever ADDS pitch. With the flag off nothing ever writes to the
+	// control rotation from this component, RecoilAppliedPitch never leaves 0.0, and TickRecoil
+	// returns on its first line. Measure it with Trace.TestRecoil: peak climb, residual and yaw
+	// drift must all read 0.000.
+	//
+	// THE VIEWMODEL KICK IS A DIFFERENT MECHANISM AND IS DELIBERATELY STILL RUNNING. FireOnce calls
+	// Character->NotifyWeaponFired() a few lines before it calls this; that jolts the first-person
+	// gun MESH (ATraceCharacter::ViewModelKick) and settles it. It never touches the control
+	// rotation, so it cannot move the crosshair or the round. §5 asks for the thing that moves your
+	// AIM, which is this function, not that one. The muzzle flash and the tracer likewise stay.
+	//
+	// FireInterval (190 RPM) is not read anywhere in this file's recoil path and did not change.
 	const UTraceSettings& Settings = UTraceSettings::Get();
 	if (!Settings.bRecoilEnabled)
 	{
@@ -1526,11 +1545,25 @@ void UTraceWeaponComponent::FireOnce()
 	// Viewmodel recoil, once per ROUND. This is the only place that knows a round actually left the
 	// gun, so a held burst kicks per shot instead of once on the trigger press. Cosmetic only,
 	// rate-limited inside, and a no-op on any machine that is not looking out of this pawn.
+	//
+	// SPEC v25 §5 KEEPS THIS. It moves the first-person gun MESH, not the control rotation — the
+	// crosshair does not move, the camera does not move, and the round has already been sampled and
+	// sent above regardless. "Remove recoil" means the aim punch (ApplyRecoilKick, at the bottom of
+	// this function, now disabled); removing the mesh animation as well would delete the gun's only
+	// feedback that it fired while removing no aim penalty at all. Same reasoning keeps the muzzle
+	// flash and the tracer (PlayLocalTracer, just above), which the spec names as out of scope.
 	Character->NotifyWeaponFired();
 
 	ServerFire(FVector_NetQuantize(Origin), FVector_NetQuantizeNormal(Dir), static_cast<float>(FireServerTime));
 
 	// UPWARDS RECOIL, LAST — AND THE ORDER IS THE WHOLE DESIGN (spec v5 section 6).
+	//
+	// *** SPEC v25 SECTION 5 DISABLES THIS. *** ApplyRecoilKick() returns on its first line while
+	// bRecoilEnabled is false (header default AND DefaultGame.ini, both now false), so the call
+	// below is inert and no pitch is ever written to the control rotation. The call is left in
+	// place, not deleted, because the flag is the A/B arm the recoil was built with and the ordering
+	// note below is what has to stay true if it is ever switched back on. THE FIRE RATE ABOVE IS
+	// UNCHANGED: FireInterval is still 0.315789 s = 190 RPM.
 	//
 	// Origin and Dir were sampled at the top of this function and have already gone to the server,
 	// so the round that causes this kick flies exactly where the crosshair was when the trigger

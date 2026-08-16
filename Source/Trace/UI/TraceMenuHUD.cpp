@@ -154,10 +154,11 @@ namespace TraceMenuHUDFile
 	 * degraded mode: it is the shipped renderer, still compiled, still tested, and still what draws
 	 * whenever the widget asset is missing or the wrong shape.
 	 *
-	 * IT IS NO LONGER WHAT DRAWS BEHIND A MODAL (spec v23 §A2). The settings overlay and the JOIN
-	 * prompt used to force this path for their frames — a Canvas modal is composited under Slate, so
-	 * the widget had to stand down to be seen past. They draw on the engine's foreground canvas now
-	 * and the widget stays up. `Trace.UI.ModalOverSlate 0` puts the old behaviour back.
+	 * IT IS WHAT DRAWS BEHIND A MODAL, AGAIN (spec v25 §1 reverts spec v23 §A2). The settings overlay
+	 * and the JOIN prompt force this path for their frames: a Canvas modal is composited under Slate,
+	 * so the widget has to stand down to be seen past. v23 §A2 avoided that by elevating the modals
+	 * onto the engine's foreground canvas, and that elevation is what crashed the game on open. See
+	 * the header of UI/TraceOptionsMenu.h.
 	 */
 	/**
 	 * DEFAULT 1 — UMG. FLIPPED BY THE SPEC v20 INTEGRATION PASS. It was 0 from v17 to v19.
@@ -362,11 +363,16 @@ bool ATraceMenuHUD::TryAdoptMenuWidget()
 
 void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 {
-	// ---- SPEC v23 §A2 — WHAT THE WIDGET STOPS DRAWING WHILE A MODAL IS IN FRONT OF IT -------------
+	// ---- WHAT THE WIDGET STOPS DRAWING WHILE A MODAL OWNS THE SCREEN -----------------------------
 	//
-	// This view is now built on frames a modal owns the screen, which it never was before: the widget
-	// used to be collapsed for exactly those frames. Two of the things on it are drawn a second time,
-	// better, by the modal itself, and the widget's copies are the stale ones — so they come off.
+	// KEPT, BUT NO LONGER REACHABLE ON THE MODAL FRAMES IT WAS WRITTEN FOR. Spec v23 §A2 built this
+	// view while a modal was up, because the modal drew in front of Slate and the widget stayed put;
+	// spec v25 §1 removed that elevation, so DrawHUD collapses the widget again for exactly those
+	// frames and never calls this with bModalOwnsScreen true.
+	//
+	// It stays because it is the correct answer to the question either way — a frozen pointer and a
+	// dimmable banner are stale on any frame a modal owns, whichever surface the modal is on — and
+	// because deleting it would leave the next person to try a Slate options screen to rediscover it:
 	//
 	//   THE POINTER, because the widget's is FROZEN. DrawHUD deliberately stops sampling the mouse
 	//   while a modal is open (a pointer resting over QUIT would otherwise re-select rows behind the
@@ -374,11 +380,8 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	//   draws the artist's arrow at the live position. This is the same "one pointer, one owner"
 	//   argument DrawCursor makes for the Canvas path, arriving at the same answer for the widget.
 	//
-	//   THE FAILURE BANNER, because a Slate banner is the one element on this screen the modal's own
-	//   scrim can now dim — everything in front of Slate outranks it. DrawHUD redraws it on the
-	//   foreground canvas for these frames instead; see the call site.
-	//
-	// Both are restored the frame the modal closes. Nothing here is a permanent removal.
+	//   THE FAILURE BANNER, because a Slate banner is the one element on this screen a modal's scrim
+	//   could dim from in front. On the Canvas path the banner is drawn by DrawHUD; see the call site.
 	const bool bModalOwnsScreen = OptionsMenu.IsOpen() || IsJoinPromptOpen();
 
 	OutView.Now = Now;
@@ -1856,42 +1859,41 @@ void ATraceMenuHUD::DrawHUD()
 		}
 	}
 
-	// ---- Which renderer draws this frame (spec v17 §4, rewritten by spec v23 §A2) ------------------
+	// ---- Which renderer draws this frame (spec v17 §4; spec v23 §A2 REVERTED by spec v25 §1) -------
 	//
-	// IT USED TO READ: `bWidgetAvailable && !OptionsMenu.IsOpen() && !IsJoinPromptOpen()`.
+	// This is back to what it read before spec v23 §A2, and the revert is the settings-crash fix.
 	//
-	// That line was the whole of the §A2 defect. The JOIN prompt and the settings overlay are Canvas
-	// modals; the HUD's Canvas is composited UNDER every Slate widget in the viewport; so the only
-	// way to see a modal was to collapse the widget — and the screen the player had been looking at
-	// was replaced, for as long as the modal was up, by the pre-v20 Canvas title screen underneath.
-	// Measured twice at 1920x1080: 58.8% of the screen, everything outside the overlay's 880x972
-	// panel, changed renderer on one keypress, wordmark and typeface included.
+	// v23 §A2 kept the UMG title screen up behind an open modal by drawing the modal on the engine's
+	// FOREGROUND canvas (`FViewport::GetDebugCanvas()`), which Slate paints over the UI. That surface
+	// is DEFERRED — the engine hands it to the render thread from its own paint pass — so everything
+	// drawn into it outlived the frame that recorded it, still holding raw texture pointers and a
+	// shared reference to the viewport. Opening SETTINGS crashed, three reports running. The full
+	// argument, both arms of the measurement and all three captured callstacks are in the header of
+	// UI/TraceOptionsMenu.h.
 	//
-	// The modals now draw on the engine's FOREGROUND canvas, which Slate paints in front of the UI
-	// (FTraceOverSlateCanvas, UI/TraceOptionsMenu.h — where the mechanism and its fallbacks are
-	// argued out). So the widget no longer has to stand down for them, and it does not.
+	// So a Canvas modal is under Slate again, and the widget has to stand down for one. The cost is
+	// the §A2 defect returning: for as long as SETTINGS or the JOIN prompt is open, the screen behind
+	// it is the Canvas title screen rather than the artist's UMG one — measured at 1920x1080 as 58.8%
+	// of the frame changing renderer on one keypress. That is a cosmetic regression on one screen and
+	// it is the trade spec v25 §1 asks for.
 	//
-	// THE TWO DECISIONS MUST AGREE, WHICH IS WHY THIS ONE IS TAKEN HERE AND NOT INSIDE EACH MODAL.
-	// If this class kept its widget up while a modal failed to elevate, the player would get a title
-	// screen with an INVISIBLE settings panel behind it — a hard lock, on a screen with no way out.
-	// IsAvailable() answers exactly what the modal's own scope will answer, from the same inputs, on
-	// the same frame, so the two cannot disagree.
+	// STILL TAKEN HERE, NOT INSIDE EACH MODAL, and that has not stopped mattering: a frame that kept
+	// the widget up while a modal drew underneath it would be a title screen with an INVISIBLE
+	// settings panel behind it — a hard lock on a screen with no way out. One bool, one decision.
 	const bool bWidgetAvailable = TryAdoptMenuWidget();
 	const bool bModalOpen = OptionsMenu.IsOpen() || IsJoinPromptOpen();
-	bModalOverSlate = FTraceOverSlateCanvas::IsAvailable(this, ViewW, ViewH);
-	const bool bUseWidgetThisFrame = bWidgetAvailable && (!bModalOpen || bModalOverSlate);
+	const bool bUseWidgetThisFrame = bWidgetAvailable && !bModalOpen;
 	bMenuUmgActive = bUseWidgetThisFrame;
 	bMenuUmgAvailable = bWidgetAvailable;
 
-	// Logged when the ANSWER changes, not once: `Trace.UI.ModalOverSlate 0` typed mid-session is the
-	// red arm, and a status line that still claimed the foreground surface while the Canvas title
-	// screen was drawing behind a modal is the kind of stale report this file has been bitten by.
-	if (!bModalSurfaceLogged || bModalOverSlateLastDecision != bModalOverSlate)
+	// Once per process. There is only one surface now, and saying so in the log is what stops the
+	// next reader assuming the elevation is still there and re-deriving its removal from scratch.
+	if (!bModalSurfaceLogged)
 	{
 		bModalSurfaceLogged = true;
-		bModalOverSlateLastDecision = bModalOverSlate;
-		UE_LOG(LogTraceGame, Display, TEXT("[MenuUI] Modal surface: %s"),
-			*FTraceOverSlateCanvas::LastStatus());
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MenuUI] Modal surface: SCENE — Canvas modals draw under Slate (spec v25 §1 removed "
+			     "the foreground-canvas elevation; the UMG title screen stands down while one is up)."));
 	}
 
 	if (bUseWidgetThisFrame)
@@ -1928,7 +1930,7 @@ void ATraceMenuHUD::DrawHUD()
 	}
 
 	// Over everything except the settings overlay, which cannot be open at the same time. A no-op
-	// while the field is inactive. It raises its own foreground scope; see DrawJoinPrompt.
+	// while the field is inactive.
 	DrawJoinPrompt();
 
 	// AFTER the join prompt, not before. Measured from a screenshot: drawn earlier, the prompt's
@@ -1936,19 +1938,12 @@ void ATraceMenuHUD::DrawHUD()
 	// read into a dim brown smudge. The failure has to outrank every modal on this screen — the
 	// commonest moment to see it is the moment you are about to retype the address that just failed.
 	//
-	// On the widget path the banner is normally a widget, at the top of the tree, for the same
-	// reason — but a WIDGET banner is Slate, and spec v23 §A2 just moved the modals in front of
-	// Slate, so behind an open modal that widget would be the one thing on the screen the scrim can
-	// still swallow. BuildMenuView therefore takes the banner off the widget for exactly those
-	// frames and it is drawn here instead, on the same foreground canvas the modal uses, in the
-	// order it has always been drawn in: over the JOIN prompt, under the settings panel.
+	// ONE BRANCH AGAIN (spec v25 §1). There used to be a second arm here that drew the banner inside
+	// a foreground-canvas scope for the case "widget up AND a modal open". With the elevation removed
+	// that case cannot occur — bUseWidgetThisFrame is false whenever bModalOpen is true, three lines
+	// of decision above — so the arm was unreachable code holding the mechanism alive.
 	if (!bUseWidgetThisFrame)
 	{
-		DrawFailureBanner();
-	}
-	else if (bModalOpen)
-	{
-		const FTraceOverSlateCanvas OverSlate(this, ViewW, ViewH);
 		DrawFailureBanner();
 	}
 
@@ -2195,31 +2190,26 @@ void ATraceMenuHUD::DrawJoinPrompt()
 		return;
 	}
 
-	// SPEC v23 §A2. In front of Slate for the rest of this function, so the title screen behind the
-	// prompt is the one the player was already looking at. Held for the whole prompt rather than per
-	// element: the scrim, the panel and the field have to land on ONE surface in one order.
-	const FTraceOverSlateCanvas OverSlate(this, ViewW, ViewH);
+	// This drew inside a foreground-canvas scope from spec v23 §A2 until spec v25 §1 removed the
+	// elevation — see the header of UI/TraceOptionsMenu.h. The prompt now draws where every other
+	// Canvas element on this screen draws, on the surface the host handed it.
 
 	// Dim everything behind it. The prompt has swallowed the keyboard — including the W/A/S/D that
 	// normally move the selection — so the screen has to say plainly that the menu is not listening.
 	//
-	// ---- ONE SCRIM STRENGTH AGAIN (spec v23 §A2 retires the second) -----------------------------
+	// ---- ONE SCRIM STRENGTH, AND IT STAYS ONE ----------------------------------------------------
 	//
-	// This used to be `bMenuUmgAvailable ? 0.94f : 0.78f`, and that second number was containment,
-	// not design. The prompt could only be seen if the UMG title screen stood down, so the screen
-	// behind it was the RETIRED stroked-vector title — a different wordmark in a different typeface,
-	// plainly legible at 0.78 — and the mitigation was to crush the scrim to 0.94 until the stand-in
-	// read as unlit background. It cost the screen its depth to hide a screen that should not have
-	// been there.
+	// This was `bMenuUmgAvailable ? 0.94f : 0.78f` before v23: the prompt could only be seen if the
+	// UMG title screen stood down, so what sat behind it was the RETIRED stroked-vector title — a
+	// different wordmark in a different typeface, plainly legible at 0.78 — and the mitigation was to
+	// crush the scrim to 0.94 until the stand-in read as unlit background. It cost the screen its
+	// depth to hide a screen that should not have been there.
 	//
-	// It should not be there now: the title behind this prompt is the artist's, because the prompt
-	// draws in front of it rather than under it. So the scrim goes back to the one value this screen
-	// was designed at, and what shows through 22% of it is the same wordmark, the same rows and the
-	// same swoosh the player pressed JOIN from — dimmed, which is what a modal scrim is for.
-	//
-	// The 0.78 is kept, not raised, on the fallback path too: a session with no widget (GUseUMG 0, a
-	// missing asset, or Trace.UI.ModalOverSlate 0) is a genuine Canvas session, and 0.78 is exactly
-	// what that screen was tuned for before any of this.
+	// The stand-in IS behind the prompt again now that the elevation is gone, so the 0.94 case has
+	// come back with it — and it is still not being restored. 0.78 is the value this screen was
+	// designed at, a scrim that hides the screen behind it entirely is not a scrim, and the honest
+	// reading of the v25 §1 trade is that the Canvas title screen shows through a modal. Raising the
+	// number here would be hiding the cost rather than paying it.
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.78f), 0.f, 0.f, ViewW, ViewH);
 
 	const float CX = ViewW * 0.5f;
@@ -2439,10 +2429,16 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	{
 		const bool bIsModeRow = (Row == ETraceMenuRow::Mode);
 
-		// "A - ENDZONES" rather than the full "MODE A - ENDZONES": the row already says SCORING MODE
-		// on its left, and repeating the word inside the value pushes it into the label at 720p.
+		// *** SPEC v25 §8 — "goals is just goals, not game mode B." ***
+		//
+		// This row is the ONE player-visible mode string in the game that did not already come from
+		// TraceScoringModeLabel(): it built its own "B - GOALS" out of the letter and the name,
+		// because the label used to carry a "MODE " prefix that would have read as a repeat of the
+		// row's own "SCORING MODE" caption at 720p. §8 deletes that prefix at the source, so the
+		// shared label is now exactly what this row wanted all along — and using it means the menu
+		// and the in-match scoreboard can no longer disagree about what the mode is called.
 		OutView.Value = bIsModeRow
-			? FString::Printf(TEXT("%s - %s"), TraceScoringModeLetter(ScoringMode), TraceScoringModeName(ScoringMode))
+			? TraceScoringModeLabel(ScoringMode)
 			: TraceDifficulty::ToDisplayName(Difficulty);
 
 		// Mode B wears the amber that this screen reserves for "this is not the default" — the same

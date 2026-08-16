@@ -62,9 +62,12 @@ void UTraceHudStatusChipWidget::InstallAtlasLabels()
 	}
 	bAtlasLabelsInstalled = true;
 
+	// Erbaum Bold, spec v25 §4 — the same face the rest of the in-match HUD takes. A chip sits in the
+	// bottom-right stack directly under the ammo plate, so this and UTraceHudCornerWidget have to
+	// agree or the corner reads as two screens.
 	AtlasLabels.Reset();
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, LabelText));
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReadoutText));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, LabelText, 0.f, 1.f, ETraceTextWeight::Hud));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReadoutText, 0.f, 1.f, ETraceTextWeight::Hud));
 	AtlasLabels.RemoveAll([](const FTraceAtlasLabel& Label) { return !Label.IsValid(); });
 }
 

@@ -275,12 +275,17 @@ def main():
                          "so 96 leaves room to downscale cleanly (default: 96)")
     ap.add_argument("--out", default=OUT_DIR)
     ap.add_argument("--thin", type=float, default=0.0,
-                    help="synthesise a lighter weight by eroding each glyph by this many "
-                         "FINAL-SIZE pixels per side (strokes narrow by 2x this). Sofachrome "
-                         "ships Regular only; the artist's lettering is hairline. 0 = as drawn.")
+                    help="DO NOT USE. Synthesises a lighter weight by eroding each glyph by this "
+                         "many FINAL-SIZE pixels per side. It exists only because Sofachrome once "
+                         "shipped here as Regular alone; every face in this project now comes from "
+                         "its own real font file and this MUST stay 0. Two attempts to synthesise a "
+                         "weight damaged the letterforms — the second deleted ( ) [ ] { } and / "
+                         "outright while the HUD draws '[E]'. 0 = as drawn.")
     ap.add_argument("--name", default="T_FontAtlas",
-                    help="output basename (default T_FontAtlas). The menu uses two weights: "
-                         "T_FontAtlas (light, general UI) and T_FontAtlasBold (character names).")
+                    help="output basename (default T_FontAtlas). The game uses three faces: "
+                         "T_FontAtlas (Sofachrome ExtraLight, the default), T_FontAtlasBold "
+                         "(Sofachrome Regular, character names) and T_FontAtlasHud (Erbaum Bold, "
+                         "the in-match HUD and the ability descriptions).")
     ap.add_argument("--preview", action="store_true",
                     help="also write a sheet of real strings composed from the atlas")
     a = ap.parse_args()

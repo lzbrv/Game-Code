@@ -53,6 +53,8 @@
 #include "CoreMinimal.h"
 #include "UObject/ObjectPtr.h"
 
+#include "UI/Text/TraceTextWeight.h"
+
 #include "TraceAtlasTextSwap.generated.h"
 
 class UTextBlock;
@@ -107,14 +109,20 @@ namespace TraceAtlasTextSwap
 	 * @param Source     the authored text block. Detached from its panel; NOT destroyed.
 	 * @param InMaxWidth see FTraceAtlasLabel::MaxWidth. 0 for "never shrink".
 	 * @param SizeScale  multiplies the authored point size. 1 keeps the size the generator chose.
+	 * @param InWeight   which FACE to draw in. Light by default, which is every menu on the title
+	 *                   screen; the in-match HUD's corner passes Hud (Erbaum Bold, spec v25 §4).
+	 *                   It is a parameter rather than something read off @p Source because a
+	 *                   UTextBlock has no way to express it — the authored asset knows a point size
+	 *                   and a colour, and the face is the caller's decision.
 	 *
-	 * Everything about the new widget — size, colour, justification — is READ OFF @p Source, so a
+	 * Everything else about the new widget — size, colour, justification — is READ OFF @p Source, so a
 	 * change to the generator's type scale still lands on the screen without an edit here.
 	 *
 	 * Safe to call more than once: a source that has already been swapped returns the same record.
 	 */
 	TRACE_API FTraceAtlasLabel Install(UUserWidget* Owner, UTextBlock* Source,
-		float InMaxWidth = 0.f, float SizeScale = 1.f);
+		float InMaxWidth = 0.f, float SizeScale = 1.f,
+		ETraceTextWeight InWeight = ETraceTextWeight::Light);
 
 	/** Copies text, colour and visibility from the model to the atlas widget. Call once per frame. */
 	TRACE_API void Mirror(const FTraceAtlasLabel& Label);

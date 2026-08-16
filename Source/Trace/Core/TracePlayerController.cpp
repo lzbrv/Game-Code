@@ -31,7 +31,9 @@
 #include "Misc/CommandLine.h"              // -TraceNoInputAssets (spec v17 §6)
 #include "Misc/Parse.h"                    // FParse::Param
 #include "UObject/Package.h"               // LoadObject / DuplicateObject for the input assets
+#include "Gameplay/TraceCore.h"            // spec v25 §7 — the right-mouse pull probe's second rung
 #include "Gameplay/TraceMelee.h"           // TraceMelee::RequestEquipIfDifferent (spec v13 §2)
+#include "Gameplay/TraceParry.h"           // spec v25 §7 — Trace.Input.VerifyRightMouse's carrier-only proof
 #include "Gameplay/TraceWeaponComponent.h" // RequestReload (spec v16 §1 — the R bind)
 #include "Movement/TraceCharacterMovementComponent.h"   // dash charges, for the HUD accessors
 #include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
@@ -153,6 +155,163 @@ namespace TracePlayerControllerInput
 			FParse::Param(FCommandLine::Get(), TEXT("TraceNoInputAssets"));
 
 		return !bForcedOffByCommandLine && (CVarTraceInputUseAssets.GetValueOnGameThread() != 0);
+	}
+
+	// =============================================================================================
+	// SPEC v25 §7 + §2 — ONE BUTTON, TWO VERBS: PARRY AND THE TURNOVER CORE-PULL
+	// =============================================================================================
+	//
+	// §7 puts PARRY on the right mouse button. §2 puts the turnover CORE-PULL on the right mouse
+	// button as well ("players from the opposite team can hold right mouse while hovering over the
+	// core to pull it to them"). Both notes are in the same demo, neither yields, so this file has
+	// to say how they share the button.
+	//
+	// *** THE PRECEDENCE, STATED ONCE, HERE: THERE IS NONE, BY CONSTRUCTION. ***
+	//
+	// The press is delivered to BOTH verbs and each is refused by its own authority. They cannot
+	// both accept, because their preconditions are exact opposites on one boolean:
+	//
+	//     PARRY  TraceParry::RequestParry refuses with ETraceParryRefusal::NotCarrying — parry has
+	//            been carrier-only since spec v3 §3, "a parry mechanic for the core carrier".
+	//     PULL   spec v25 §2 requires you to be NOT carrying, hovering the Core with line of sight,
+	//            on the team that did NOT drop it, inside the 5 s turnover window. The first clause
+	//            alone excludes every carrier.
+	//
+	// So "pulling happens when you are NOT carrying and are hovering a turned-over core; parry is
+	// everything else" is not a rule this layer enforces — it FALLS OUT of the two gates, and the
+	// input layer's only job is to not swallow either press on the way. A parry that eats the pull
+	// and a pull that eats the parry are the same bug in two directions: an input handler deciding,
+	// on a client, which of two server-authoritative verbs a press was for. This one decides
+	// nothing, so it cannot decide wrong.
+	//
+	// NO LOCAL bIsCarrier GATE, deliberately rather than lazily. ATraceCharacter::DoPassPressed
+	// already makes the argument for the pass — "a second copy of the rule here could only ever
+	// disagree with the first" — and the replicated carrier flag is precisely the value that is
+	// stale for a frame or two around a turnover, which is the only moment a pull is legal at all.
+	//
+	// ---------------------------------------------------------------------------------------------
+	// WHY THIS IS A PROBE AND NOT A CALL
+	// ---------------------------------------------------------------------------------------------
+	// §2's gameplay half (ATraceCore / ATraceGameMode) is owned by another slice and lands in
+	// parallel with this one. A hard call to an entry point that does not exist yet would make this
+	// file's build depend on which slice lands first, and "the build is red because the other half
+	// is not in yet" has cost this project real time before.
+	//
+	// So the rungs below are probed at COMPILE time, exactly as TraceBotPawnAPI in
+	// AI/TraceBotController.cpp probes the pass: the same pattern, the same overload-ranking trick
+	// (called with the literal 0, `int` beats `long` beats `...`), and the same hazard — a PROTECTED
+	// entry point, or one under a different name, fails detection and falls through to the no-op
+	// rung. Two things keep that visible instead of silent:
+	//
+	//   1. GetPullBinding() reports which rung compiled, and LogLiveInputMappings prints it by name
+	//      at the end of its dump — which is what Trace.Input.VerifyAssets calls, so every asset
+	//      verification run carries the answer whether or not anybody asked for it;
+	//   2. Trace.Input.VerifyRightMouse FAILS LOUDLY when the rung is None, so a build where §2
+	//      landed under a third name cannot pass its own verification.
+	//
+	// *** THE CONTRACT §2 HAS TO MEET *** — in preference order, either is fine, both must be PUBLIC:
+	//
+	//     void ATraceCharacter::DoPullPressed();                                    // preferred
+	//     void ATraceCharacter::DoPullReleased();
+	//
+	//     void ATraceCore::RequestPullInput(bool bPressed, ATraceCharacter* Requester);
+	//
+	// The second is the exact shape of the existing RequestPassInput, which is why it is offered: the
+	// pull is a held, cancellable hover with a server-side timer, i.e. the same shape as the pass, so
+	// a §2 that mirrors the pass lands on that signature without being asked.
+
+	/** Which entry point the right-mouse PULL actually bound to. Reported, never guessed at. */
+	enum class EPullBinding : uint8
+	{
+		/** §2 has not landed, or landed under a third name. Right mouse is parry only. */
+		None = 0,
+
+		/** ATraceCharacter::DoPullPressed / DoPullReleased — the pawn-level verb. */
+		Pawn = 1,
+
+		/** ATraceCore::RequestPullInput(bool, ATraceCharacter*) — the Core-level verb. */
+		Core = 2,
+	};
+
+	const TCHAR* LexPullBinding(EPullBinding Binding)
+	{
+		switch (Binding)
+		{
+		case EPullBinding::Pawn: return TEXT("ATraceCharacter::DoPullPressed/DoPullReleased");
+		case EPullBinding::Core: return TEXT("ATraceCore::RequestPullInput");
+		default:                 return TEXT("NONE - spec v25 s2 has not landed; RMB is parry only");
+		}
+	}
+
+	// --- press ----------------------------------------------------------------------------------
+	template <typename P> auto PullPressed(P* Pawn, int) -> decltype(Pawn->DoPullPressed(), EPullBinding())
+	{
+		Pawn->DoPullPressed();
+		return EPullBinding::Pawn;
+	}
+	template <typename P> auto PullPressed(P* Pawn, long)
+		-> decltype(ATraceCore::Get(Pawn->GetWorld())->RequestPullInput(true, Pawn), EPullBinding())
+	{
+		if (ATraceCore* TheCore = ATraceCore::Get(Pawn->GetWorld()))
+		{
+			TheCore->RequestPullInput(true, Pawn);
+		}
+		return EPullBinding::Core;
+	}
+	template <typename P> EPullBinding PullPressed(P*, ...)
+	{
+		return EPullBinding::None;
+	}
+
+	// --- release --------------------------------------------------------------------------------
+	//
+	// Delivered UNCONDITIONALLY at the call site, for the reason OnPassCompleted documents at length:
+	// a release that is dropped leaves a held-input latch armed on the server, and here that would be
+	// a pull ring that fills forever behind a pause menu. Suppressed input and death are exactly the
+	// two cases where the release must still arrive.
+	template <typename P> auto PullReleased(P* Pawn, int) -> decltype(Pawn->DoPullReleased(), EPullBinding())
+	{
+		Pawn->DoPullReleased();
+		return EPullBinding::Pawn;
+	}
+	template <typename P> auto PullReleased(P* Pawn, long)
+		-> decltype(ATraceCore::Get(Pawn->GetWorld())->RequestPullInput(false, Pawn), EPullBinding())
+	{
+		if (ATraceCore* TheCore = ATraceCore::Get(Pawn->GetWorld()))
+		{
+			TheCore->RequestPullInput(false, Pawn);
+		}
+		return EPullBinding::Core;
+	}
+	template <typename P> EPullBinding PullReleased(P*, ...)
+	{
+		return EPullBinding::None;
+	}
+
+	// --- which rung compiled, asked without pressing anything -------------------------------------
+	//
+	// A THIRD overload set rather than a trait, so the answer comes from the same overload-ranking
+	// rules the two live sets use and cannot drift from them. The pawn pointer is never dereferenced:
+	// every `decltype(...)` here is an UNEVALUATED operand, and the bodies only return a constant.
+	template <typename P> auto ProbePullBinding(P* Pawn, int) -> decltype(Pawn->DoPullPressed(), EPullBinding())
+	{
+		return EPullBinding::Pawn;
+	}
+	template <typename P> auto ProbePullBinding(P* Pawn, long)
+		-> decltype(ATraceCore::Get(Pawn->GetWorld())->RequestPullInput(true, Pawn), EPullBinding())
+	{
+		return EPullBinding::Core;
+	}
+	template <typename P> EPullBinding ProbePullBinding(P*, ...)
+	{
+		return EPullBinding::None;
+	}
+
+	/** Which rung this build compiled. Safe to call anywhere, at any time, on any machine. */
+	EPullBinding GetPullBinding()
+	{
+		ATraceCharacter* const NeverDereferenced = nullptr;
+		return ProbePullBinding(NeverDereferenced, 0);
 	}
 }
 
@@ -1472,16 +1631,35 @@ void ATracePlayerController::OnParryStarted()
 	if (ATraceCharacter* TraceChar = GetLivingCharacter())
 	{
 		TraceChar->DoParryPressed();
+
+		// *** SPEC v25 §7 + §2 — THE SAME PRESS IS ALSO THE TURNOVER CORE-PULL. ***
+		//
+		// Both verbs, every time, in one order that is NOT a priority: see the long note on
+		// EPullBinding in TracePlayerControllerInput above. Parry refuses unless you are carrying,
+		// the pull refuses unless you are not, so at most one of these two lines can do anything and
+		// swapping them changes nothing. Writing the parry first only preserves the older path's
+		// exact timing for the case that has shipped for twenty demos.
+		//
+		// The dispatch is a no-op until §2's gameplay half lands; Trace.Input.VerifyRightMouse says
+		// so out loud rather than letting it be discovered in a playtest.
+		TracePlayerControllerInput::PullPressed(TraceChar, 0);
 	}
 }
 
 void ATracePlayerController::OnParryCompleted()
 {
-	// Intentionally not gated on bGameInputSuppressed, and intentionally empty. See the header: the
-	// window is a fixed duration owned by the trail component, so there is no held state to release.
+	// Intentionally not gated on bGameInputSuppressed. The PARRY half has no held state to release —
+	// the window is a fixed duration owned by the trail component — but spec v25 §2's CORE-PULL,
+	// which shares this button, is a hold, and "releasing RMB cancels" is one of its stated rules.
+	//
+	// GetPawn rather than GetLivingCharacter, and no suppression gate, for the reason OnPassCompleted
+	// spells out: a release that is dropped leaves the server-side hold latched. Opening the pause
+	// menu mid-pull suppresses input; dying mid-pull makes the pawn non-living. Those are exactly the
+	// two cases where the cancel must still be delivered.
 	if (ATraceCharacter* TraceChar = GetPawn<ATraceCharacter>())
 	{
 		TraceChar->DoParryReleased();
+		TracePlayerControllerInput::PullReleased(TraceChar, 0);
 	}
 }
 
@@ -1916,6 +2094,22 @@ void ATracePlayerController::LogLiveInputMappings(const TCHAR* Context) const
 			Modifiers.IsEmpty() ? TEXT("-") : *Modifiers);
 		++Index;
 	}
+
+	// SPEC v25 §7 + §2. The right mouse button carries TWO verbs and only one of them appears in the
+	// list above: the pull is dispatched from the parry handler and has no mapping of its own. So the
+	// dump would otherwise be a complete and completely misleading picture of that button. Printed
+	// every time this dump runs, including when the answer is NONE, because "the pull is not wired
+	// yet" and "the pull is wired and quiet" are different facts and a line that only appeared on
+	// success could not tell them apart.
+	const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+	UE_LOG(LogTraceGame, Display,
+		TEXT("INPUTMAP [%s]   right-mouse verbs: PARRY on '%s' (bind '%s'), and the spec v25 s2 CORE-PULL ")
+		TEXT("rides the same press -> %s. THROW is on '%s' (mouse 1 throws while carrying regardless)."),
+		Context,
+		*UTraceUserSettings::DescribeKey(UserSettings.GetKey(ETraceInputAction::Parry)),
+		TraceInputActions::Info(ETraceInputAction::Parry).ConfigId,
+		TracePlayerControllerInput::LexPullBinding(TracePlayerControllerInput::GetPullBinding()),
+		*UTraceUserSettings::DescribeKey(UserSettings.GetKey(ETraceInputAction::Pass)));
 }
 
 void ATracePlayerController::GetLiveMappedActions(TArray<const UInputAction*>& OutActions) const
@@ -2095,8 +2289,17 @@ namespace TracePlayerControllerInput
 			{ TEXT("IA_Jump"),             ETraceInputAction::Jump,             FKey(),         0 },
 			{ TEXT("IA_Crouch"),           ETraceInputAction::Crouch,           FKey(),         0 },
 			{ TEXT("IA_Fire"),             ETraceInputAction::Fire,             FKey(),         0 },
-			{ TEXT("IA_Pass"),             ETraceInputAction::Pass,             FKey(),         0 },
+			// *** SPEC v25 §7: THERE IS NO IA_Pass ROW ANY MORE. ***  It used to sit here, on the
+			// right mouse button. The throw now ships UNBOUND (TraceInputActions::All()), and an
+			// unbound action produces no mapping at all — ApplyControlSettings' MapButton skips an
+			// invalid key, and generate-input-assets.py cannot write a mapping to a key that does not
+			// exist. So the asset must not contain one either, and this table is what says so.
+			// IA_Pass itself is untouched and still in ExpectedActions above: the ACTION exists and is
+			// still bound to its handlers, it simply starts with no key on it.
 			{ TEXT("IA_Dash"),             ETraceInputAction::Dash,             FKey(),         0 },
+			// SPEC v25 §7: this row's key is now the RIGHT MOUSE BUTTON. Nothing here says so, and
+			// that is the design — the expected key is read live from TraceInputActions::Info(Parry)
+			// .DefaultKey() below, so moving a default is one edit in the action table and never two.
 			{ TEXT("IA_Parry"),            ETraceInputAction::Parry,            FKey(),         0 },
 			{ TEXT("IA_Scoreboard"),       ETraceInputAction::Scoreboard,       FKey(),         0 },
 			{ TEXT("IA_EquipKnife"),       ETraceInputAction::EquipKnife,       FKey(),         0 },
@@ -2211,6 +2414,209 @@ namespace TracePlayerControllerInput
 #undef TRACE_INPUTASSETS_VERDICT_ARGS
 #undef TRACE_INPUTASSETS_VERDICT_TEXT
 	}
+
+	// =============================================================================================
+	// Trace.Input.VerifyRightMouse — SPEC v25 §7, the evidence half.
+	//
+	// §7's two claims are "right mouse is parry" and "right mouse no longer throws the Core", and
+	// §7's warning is that the button now also carries §2's pull, so "a parry that eats the pull, or
+	// a pull that eats the parry, is a real bug". Three separate things to be shown, and a passing
+	// build has to show all three:
+	//
+	//   1. WHERE THE BUTTON POINTS. The resolved bind for PARRY is the right mouse button, the
+	//      resolved bind for the THROW is not (it is UNBOUND by default), and no OTHER action holds
+	//      the button either. Read out of the live UTraceUserSettings — the same table
+	//      ApplyControlSettings maps from — not out of the defaults table, so a stale
+	//      TraceUserSettings.ini that still says `Pass=RightMouseButton` FAILS here instead of being
+	//      discovered in a playtest. That is the failure mode this whole item is exposed to.
+	//
+	//   2. THAT THE PULL IS WIRED AT ALL. §2 lands in parallel and the dispatch is a compile-time
+	//      probe, so the one thing that must never pass quietly is "the probe found nothing".
+	//
+	//   3. THAT THE TWO VERBS CANNOT BOTH FIRE. Stated as an argument in the code, but ARGUED FROM A
+	//      MEASUREMENT here: with a live local pawn that is NOT carrying, TraceParry::RequestParry is
+	//      asked for real and must refuse with NotCarrying. That call is side-effect free precisely
+	//      BECAUSE it refuses — no window opens, no RPC is sent — which is why it is safe to make
+	//      from a console command mid-match, and why the carrying case is reported rather than
+	//      exercised (asking it there WOULD open a real parry window and that is not a diagnostic's
+	//      business).
+	//
+	// What this command does NOT cover: a human physically holding the right button over a
+	// turned-over Core. That is delivery plus §2's gameplay, and it belongs to a match, not a
+	// console.
+	// =============================================================================================
+	void VerifyRightMouse()
+	{
+		UTraceUserSettings& Settings = UTraceUserSettings::Get();
+		const FKey RMB = EKeys::RightMouseButton;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[RightMouse] ===== spec v25 s7: right mouse is PARRY (and s2's pull), never the throw ====="));
+
+		int32 Failures = 0;
+
+		// ---- 1. where the button points ---------------------------------------------------------
+		const FKey ParryKey = Settings.GetKey(ETraceInputAction::Parry);
+		const FKey ThrowKey = Settings.GetKey(ETraceInputAction::Pass);
+
+		const bool bParryOnRMB = (ParryKey == RMB);
+		const bool bThrowOffRMB = (ThrowKey != RMB);
+
+		Failures += bParryOnRMB ? 0 : 1;
+		Failures += bThrowOffRMB ? 0 : 1;
+
+		// Display and Error are separate calls, not a ternary verbosity: UE_LOG's verbosity is a token
+		// the macro pastes into a compile-time category check, not a value.
+		if (bParryOnRMB)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[RightMouse]   ok       PARRY ('%s') is on %s"),
+				TraceInputActions::Info(ETraceInputAction::Parry).ConfigId, *UTraceUserSettings::DescribeKey(ParryKey));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RightMouse]   WRONG    PARRY resolved to '%s', not the right mouse button. If this is a ")
+				TEXT("returning player's TraceUserSettings.ini, the ConfigId migration ('Parry' -> 'ParryPull') ")
+				TEXT("did not take."),
+				*UTraceUserSettings::DescribeKey(ParryKey));
+		}
+
+		if (bThrowOffRMB)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RightMouse]   ok       THROW ('%s') is on '%s' - NOT the right mouse button. Mouse 1 still ")
+				TEXT("throws while carrying; that path is ATraceCharacter::DoFirePressed and is untouched."),
+				TraceInputActions::Info(ETraceInputAction::Pass).ConfigId, *UTraceUserSettings::DescribeKey(ThrowKey));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RightMouse]   WRONG    THROW is STILL on the right mouse button. Spec v25 s7 removes exactly ")
+				TEXT("this bind, and a stale 'Pass=RightMouseButton' line in TraceUserSettings.ini is how it survives."));
+		}
+
+		// Nothing ELSE may hold the button. SetKey's stealing rule makes this true by construction for
+		// anything set through the UI, but a hand-edited .ini goes through RefreshFromConfig, which
+		// does not steal — so two actions really can end up sharing a key on disk, and if one of them
+		// is the right button the parry and whatever else it is would both fire on one press.
+		int32 OtherHolders = 0;
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			if (Info.Action == ETraceInputAction::Parry || Settings.GetKey(Info.Action) != RMB)
+			{
+				continue;
+			}
+			++OtherHolders;
+			++Failures;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RightMouse]   WRONG    '%s' (%s) ALSO holds the right mouse button. One press, two verbs, ")
+				TEXT("and neither of them is the pull."),
+				Info.ConfigId, Info.DisplayName);
+		}
+		if (OtherHolders == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RightMouse]   ok       no other action holds the right mouse button (%d checked)."),
+				TraceInputActions::All().Num());
+		}
+
+		// ---- 2. is the s2 pull actually wired? --------------------------------------------------
+		const EPullBinding Binding = GetPullBinding();
+		if (Binding == EPullBinding::None)
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RightMouse]   NOT WIRED  the spec v25 s2 CORE-PULL found no entry point. The input half is ")
+				TEXT("in and the press is being dispatched, but it lands nowhere. ATraceCharacter must expose a ")
+				TEXT("PUBLIC DoPullPressed()/DoPullReleased(), or ATraceCore a PUBLIC ")
+				TEXT("RequestPullInput(bool, ATraceCharacter*). See EPullBinding in TracePlayerController.cpp."));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[RightMouse]   ok       the CORE-PULL is dispatched to %s"),
+				LexPullBinding(Binding));
+		}
+
+		// ---- 3. the two verbs cannot both fire --------------------------------------------------
+		const ATracePlayerController* Live = FindLocalTraceController();
+		ATraceCharacter* LocalPawn = (Live != nullptr) ? Live->GetPawn<ATraceCharacter>() : nullptr;
+
+		if (LocalPawn == nullptr)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RightMouse]   no local pawn - the mutual-exclusion half was NOT measured this run. Run it ")
+				TEXT("again in a live match."));
+		}
+		else
+		{
+			const ATraceCore* TheCore = ATraceCore::Get(LocalPawn->GetWorld());
+			const bool bCarrying = (TheCore != nullptr) && (TheCore->GetCarrier() == LocalPawn);
+
+			if (bCarrying)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[RightMouse]   local pawn IS CARRYING: PARRY is the legal verb and the PULL is refused ")
+					TEXT("(s2 requires you not to be carrying). NOT exercised - asking RequestParry here would ")
+					TEXT("open a real parry window, which a diagnostic may not do. Run this again without the Core."));
+			}
+			else
+			{
+				// The real gate, asked for real. A refusal is side-effect free by construction: no
+				// window is opened and no RPC is sent, which is exactly why this is the case that can
+				// be measured rather than asserted.
+				ETraceParryRefusal Refusal = ETraceParryRefusal::None;
+				const bool bParried = TraceParry::RequestParry(LocalPawn, &Refusal);
+				const bool bRefusedForCarrying = !bParried && (Refusal == ETraceParryRefusal::NotCarrying);
+
+				if (bRefusedForCarrying)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[RightMouse]   ok       local pawn is NOT carrying: TraceParry refused with '%s', so ")
+						TEXT("this press cannot become a parry and is free for the pull. That is the whole ")
+						TEXT("precedence - the two gates are opposites on 'am I the carrier', so at most one can ")
+						TEXT("ever accept and neither can eat the other."),
+						LexToString(Refusal));
+				}
+				else
+				{
+					++Failures;
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[RightMouse]   WRONG    local pawn is NOT carrying, yet TraceParry returned %d with ")
+						TEXT("refusal '%s'. Parry is supposed to be carrier-only (spec v3 s3) - if it is not, the ")
+						TEXT("parry and the pull CAN both be legal on one press and s7's precedence argument is void."),
+						bParried ? 1 : 0, LexToString(Refusal));
+				}
+			}
+		}
+
+#define TRACE_RIGHTMOUSE_VERDICT_ARGS \
+	(Failures == 0) ? TEXT("RIGHT MOUSE IS PARRY + PULL AND NOTHING ELSE") : TEXT("THE RIGHT MOUSE BUTTON IS WRONG"), \
+	*UTraceUserSettings::DescribeKey(ParryKey), *UTraceUserSettings::DescribeKey(ThrowKey), \
+	LexPullBinding(Binding), Failures
+
+#define TRACE_RIGHTMOUSE_VERDICT_TEXT \
+	TEXT("[RightMouse] VERDICT: %s. parry='%s' throw='%s' pull=%s, %d failure(s).")
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display, TRACE_RIGHTMOUSE_VERDICT_TEXT, TRACE_RIGHTMOUSE_VERDICT_ARGS);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TRACE_RIGHTMOUSE_VERDICT_TEXT, TRACE_RIGHTMOUSE_VERDICT_ARGS);
+		}
+
+#undef TRACE_RIGHTMOUSE_VERDICT_ARGS
+#undef TRACE_RIGHTMOUSE_VERDICT_TEXT
+	}
+
+	FAutoConsoleCommand CmdVerifyRightMouse(
+		TEXT("Trace.Input.VerifyRightMouse"),
+		TEXT("Spec v25 s7. Proves the right mouse button resolves to PARRY and NOT to the Core throw, that ")
+		TEXT("no third action holds it, that spec v25 s2's core-pull found an entry point, and - with a live ")
+		TEXT("non-carrying pawn - that the parry gate really does refuse a non-carrier, which is what makes ")
+		TEXT("the parry and the pull mutually exclusive on one press."),
+		FConsoleCommandDelegate::CreateStatic(&VerifyRightMouse));
 
 	FAutoConsoleCommand CmdVerifyInputAssets(
 		TEXT("Trace.Input.VerifyAssets"),

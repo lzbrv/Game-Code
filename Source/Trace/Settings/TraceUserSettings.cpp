@@ -25,14 +25,58 @@ namespace
 	FKey Default_Crouch()      { return EKeys::LeftControl; }
 	FKey Default_Dash()        { return EKeys::LeftShift; }
 	/**
-	 * Parry (spec v3 §3). The spec suggested "right mouse or Q"; RIGHT MOUSE IS ALREADY PASS, and
-	 * parry is a carrier-only ability, so overloading it onto the carrier's own pass button would
-	 * make the two mechanics unusable together — exactly the pair a carrier needs most. Q it is:
-	 * unclaimed, under the movement hand, reachable without leaving WASD.
+	 * *** SPEC v25 §7 — PARRY IS THE RIGHT MOUSE BUTTON. *** Verbatim: "Remove the default bind of
+	 * right clicking to throw the core while carrying it. Make the default key bind for parrying
+	 * right click mouse."
+	 *
+	 * This reverses the v3 §3 reasoning that put parry on Q, and the reversal is sound because the
+	 * premise has gone: v3 refused right mouse because "RIGHT MOUSE IS ALREADY PASS, and overloading
+	 * it onto the carrier's own pass button would make the two mechanics unusable together". The
+	 * same note that moves parry here takes the throw off this button (see Default_Pass below), so
+	 * the collision v3 was avoiding no longer exists.
+	 *
+	 * WHAT ELSE THIS BUTTON NOW DOES, AND WHY IT IS NOT A SECOND COLLISION. Spec v25 §2 makes right
+	 * mouse the Core-PULL input during a turnover. Parry and pull are the same physical button and
+	 * are dispatched from the same handler (ATracePlayerController::OnParryStarted), because they
+	 * can never both be legal at the same instant:
+	 *
+	 *     PARRY requires you to BE CARRYING the Core   (ETraceParryRefusal::NotCarrying)
+	 *     PULL  requires you to NOT be carrying it, and to be hovering a turned-over Core with line
+	 *           of sight, on the team that did NOT drop it, inside the 5 s window
+	 *
+	 * Those two predicates are mutually exclusive on `is this pawn the carrier`, so the press is
+	 * delivered to both verbs and at most one authoritative gate can accept it. Neither eats the
+	 * other; there is no priority to get wrong. See OnParryStarted for the full argument.
 	 */
-	FKey Default_Parry()       { return EKeys::Q; }
+	FKey Default_Parry()       { return EKeys::RightMouseButton; }
 	FKey Default_Fire()        { return EKeys::LeftMouseButton; }
-	FKey Default_Pass()        { return EKeys::RightMouseButton; }
+	/**
+	 * *** SPEC v25 §7 — THE THROW HAS NO DEFAULT KEY OF ITS OWN. *** It used to be right mouse; the
+	 * note removes that bind and does not name a replacement, so this returns an INVALID FKey and
+	 * the row ships UNBOUND.
+	 *
+	 * THE THROW IS NOT LOST, WHICH IS THE WHOLE REASON "NONE" IS THE RIGHT ANSWER RATHER THAN A
+	 * CONSOLATION KEY. Mouse 1 already throws/passes the Core while carrying, in BOTH modes and
+	 * from before this note:
+	 *
+	 *     goals mode     ATraceCharacter::DoFirePressed -> DoPassPressed -> the charged throw
+	 *                    (the HUD's own carry caption is "LMB  -  THROW")
+	 *     endzones mode  the same call, driving the 0.5 s hover-hold pass
+	 *
+	 * So the carrier's throw button is unchanged and is the one the HUD has always taught. This row
+	 * is a SECOND, optional route to the same verb, and inventing a default for it — Q, freed by
+	 * parry moving off it, was the obvious candidate — would have added a control nobody asked for,
+	 * put a live key on a row the player has never needed, and made the freed key unavailable for
+	 * the next thing. The row stays on the options screen so anyone who wants a dedicated throw key
+	 * can bind one; it simply starts empty.
+	 *
+	 * AN INVALID DEFAULT IS A SUPPORTED STATE, not a special case. RefreshFromConfig seeds the table
+	 * with it, ApplyControlSettings' MapButton skips invalid keys so no mapping is created,
+	 * IsAtDefaults compares FKey() to FKey() and agrees, RedeliverHeldPressEdges' IsHeld already
+	 * tests Key.IsValid() first, and DescribeKey prints "UNBOUND". Every one of those paths existed
+	 * for ClearKey; this default only reaches them one step earlier.
+	 */
+	FKey Default_Pass()        { return FKey(); }
 	FKey Default_Scoreboard()  { return EKeys::Tab; }
 	/**
 	 * Spec v13 §2, verbatim: "Change default keybinds for switching weapons to be: 1 (switch to
@@ -88,9 +132,39 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		{ ETraceInputAction::Jump,        TEXT("Jump"),        TEXT("JUMP"),         &Default_Jump        },
 		{ ETraceInputAction::Crouch,      TEXT("Crouch"),      TEXT("CROUCH / SLIDE"), &Default_Crouch    },
 		{ ETraceInputAction::Dash,        TEXT("Dash"),        TEXT("DASH"),         &Default_Dash        },
-		{ ETraceInputAction::Parry,       TEXT("Parry"),       TEXT("PARRY"),        &Default_Parry       },
+		// *** SPEC v25 §7. BOTH ConfigIds ON THESE TWO ROWS ARE DELIBERATELY NEW STRINGS. ***
+		//
+		// Read this before "tidying" them back. Changing a DEFAULT key does nothing at all for anyone
+		// who has ever saved a setting, because Save() -> FlattenToConfig() writes a line for EVERY
+		// action, so a returning player's TraceUserSettings.ini already contains
+		//
+		//     KeyBindings=Parry=Q
+		//     KeyBindings=Pass=RightMouseButton
+		//
+		// and RefreshFromConfig honours both, over the top of whatever this table says. The owner's
+		// own machine has exactly that file. Ship the new defaults under the old ids and right mouse
+		// still throws the Core, parry is still on Q, and the note reads as un-done.
+		//
+		// So the ids move with the meaning, which is this codebase's established migration and not a
+		// new idea: ETraceInputAction::Parry's own comment records "Boost" -> "Parry" doing precisely
+		// this in spec v3, and spec v15's "SwapWeapon" removal relies on the same drop rule. A line
+		// naming a ConfigId the table no longer has is DISCARDED by RefreshFromConfig (see the parse
+		// loop) and the action falls back to its shipped default. Trace.Settings.VerifyBinds prints
+		// every dropped line by name, so this is checkable rather than assertable.
+		//
+		// WHAT A RETURNING PLAYER LOSES: a hand-rebound parry or throw key, once. That is the price
+		// of the note landing at all, it is paid a single time, and it is loud in the log.
+		//
+		// The new ids also say what the buttons now DO. "ParryPull" is one button with two verbs
+		// (spec v25 §2's Core pull rides the parry bind); "ThrowCore" is the mode-neutral name for
+		// the verb mouse 1 already performs while carrying.
+		//
+		// NOT SAFE TO RENAME, for contrast, and this is why the rule is per-row rather than blanket:
+		// "Ability", "AbilitySecondary" and "Reload" are looked up BY STRING outside this file
+		// (UTraceAbilityInputRelay, ATraceHUD's ability and reload rows). Neither of these two is.
+		{ ETraceInputAction::Parry,       TEXT("ParryPull"),   TEXT("PARRY / PULL CORE"), &Default_Parry },
 		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire        },
-		{ ETraceInputAction::Pass,        TEXT("Pass"),        TEXT("PASS CORE"),    &Default_Pass        },
+		{ ETraceInputAction::Pass,        TEXT("ThrowCore"),   TEXT("THROW / PASS CORE"), &Default_Pass  },
 		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard  },
 		// SPEC v13 §2. These two rows exist for the options screen as much as for the game: the
 		// rebind list IS this table, walked in order, so an action that is not here is an action the
@@ -196,10 +270,11 @@ bool UTraceUserSettings::IsBindableKey(const FKey& Key)
 	//
 	// MOUSE BUTTONS ARE BINDABLE AND ALWAYS HAVE BEEN, and this comment exists so the next person to
 	// read the note does not "fix" it here a second time. The shipped defaults are LeftMouseButton
-	// for FIRE and RightMouseButton for PASS (see the table at the top of this file), so a rule that
-	// rejected mouse buttons would have refused to load the game's own default bindings on the first
-	// run — which is not what happens. Trace.VerifyBindableKeys prints the verdict for every mouse
-	// button in the build so this can be checked rather than argued about.
+	// for FIRE and — since spec v25 §7 — RightMouseButton for PARRY (see the table at the top of
+	// this file; it was PASS until v25 moved the throw off the button), so a rule that rejected
+	// mouse buttons would have refused to load the game's own default bindings on the first run —
+	// which is not what happens. Trace.VerifyBindableKeys prints the verdict for every mouse button
+	// in the build so this can be checked rather than argued about.
 	//
 	// AXES ARE THE ONLY MOUSE INPUT REFUSED, and that is a different thing entirely. MouseX / MouseY
 	// / Mouse2D / MouseWheelAxis are what the Look mapping consumes; binding Dash to "MouseX" would
@@ -512,9 +587,18 @@ namespace
 		//
 		// Dash is the victim on purpose: it is not one of the two actions that already OWN a mouse
 		// button, so a pass here cannot be an accident of the defaults.
+		//
+		// SPEC v25 §7 MOVED WHICH ACTION THE RIGHT BUTTON BELONGS TO — it was PASS, it is now PARRY —
+		// so the snapshot below is taken over the WHOLE table rather than over a hand-written list of
+		// the two victims. A list of names is exactly what went stale here, and a restore that misses
+		// an action leaves the player's controls damaged by a diagnostic (Trace.V10.RebindFire learned
+		// the same lesson the same way; see its comment).
+		TMap<ETraceInputAction, FKey> Before;
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			Before.Add(Info.Action, Settings.GetKey(Info.Action));
+		}
 		const FKey Saved = Settings.GetKey(ETraceInputAction::Dash);
-		const FKey SavedFire = Settings.GetKey(ETraceInputAction::Fire);
-		const FKey SavedPass = Settings.GetKey(ETraceInputAction::Pass);
 
 		int32 RoundTripsOk = 0;
 		for (const FKey& Key : { EKeys::LeftMouseButton, EKeys::RightMouseButton })
@@ -536,10 +620,36 @@ namespace
 				*Reparsed.GetFName().ToString(), bOk ? TEXT("ROUND TRIP OK") : TEXT("FAILED"));
 		}
 
-		// Put everything back, including the two actions SetKey may have stolen the button from.
+		// Put everything back, including whichever actions SetKey stole the two buttons from. Dash
+		// last, so restoring a displaced action cannot take the button back off it.
+		//
+		// ClearKey for the invalid case rather than SetKey: SetKey REFUSES an invalid key by design
+		// (an unparseable .ini line must never be able to wipe a binding), so an action that was
+		// legitimately UNBOUND before this ran — which since spec v25 §7 is the shipped state of the
+		// throw row — could not be restored through SetKey at all.
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			if (Info.Action == ETraceInputAction::Dash)
+			{
+				continue;
+			}
+
+			const FKey Was = Before[Info.Action];
+			if (Settings.GetKey(Info.Action) == Was)
+			{
+				continue;
+			}
+
+			if (Was.IsValid())
+			{
+				Settings.SetKey(Info.Action, Was);
+			}
+			else
+			{
+				Settings.ClearKey(Info.Action);
+			}
+		}
 		Settings.SetKey(ETraceInputAction::Dash, Saved);
-		Settings.SetKey(ETraceInputAction::Fire, SavedFire);
-		Settings.SetKey(ETraceInputAction::Pass, SavedPass);
 
 		// Two calls rather than a ternary verbosity: UE_LOG's verbosity argument is a token the macro
 		// pastes into a compile-time category check, not a value, so it cannot be an expression.

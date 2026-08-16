@@ -2,42 +2,53 @@
 // Produced by Scripts/import_font_atlas.py from
 //   Content/Trace/UI/Fonts/Source/T_FontAtlas.json   (Light, sha1 2c02bf95f91e4c71efce5a3e684d8d7b03f17af1)
 //   Content/Trace/UI/Fonts/Source/T_FontAtlasBold.json   (Bold, sha1 33bc4c364550c974efe6132585f37947cb1c24ee)
+//   Content/Trace/UI/Fonts/Source/T_FontAtlasHud.json   (Hud, sha1 d84c43da61a35c2590988dfc35c7811065df739c)
 //
-// THE ONE METRICS SOURCE (spec v22 §A1, extended to two weights by v23 §A3). Both
+// THE ONE METRICS SOURCE (spec v22 §A1, two weights by v23 §A3, a third face by v25 §4). Both
 // renderers — the Canvas blitter in TraceCanvasText.cpp and the Slate leaf in
 // TraceAtlasTextWidget.cpp — lay text out through TraceText::LayoutString(), and
 // TraceText.cpp is the ONLY file in the project that includes this header. That is what
 // makes "one source" structural rather than a promise in a comment: the two paths cannot
 // drift because there is only one layout pass.
 //
-// TWO WEIGHTS, AND WHAT IS AND IS NOT ALLOWED TO DIFFER BETWEEN THEM
-//   Each weight is rasterised from ITS OWN REAL FONT FILE — the 'source' recorded in each
-//   sheet's .json, printed per face in the table below. --thin (glyph erosion) is 0 and must
-//   stay 0: two attempts to SYNTHESISE a light cut by eroding Regular damaged the
-//   letterforms, the second deleting ( ) [ ] { } / and \ outright while the HUD draws '[E]'.
-//   "Light" is the default everywhere; "Bold" is used for the character names on the
-//   selection screen and nowhere else.
+// THE FACES, AND WHAT IS AND IS NOT ALLOWED TO DIFFER BETWEEN THEM
+//   Each face is rasterised from ITS OWN REAL FONT FILE — the 'source' recorded in each
+//   sheet's .json, carried per face in the table below. --thin (glyph erosion) is 0 for every
+//   one of them and must stay 0: two attempts to SYNTHESISE a light cut by eroding Regular
+//   damaged the letterforms, the second deleting ( ) [ ] { } / and \ outright while the HUD
+//   draws '[E]'. "Light" is the default everywhere; "Bold" is the character NAMES on the
+//   selection screen; "Hud" (spec v25 §4) is the in-match HUD and the ability DESCRIPTIONS,
+//   and it is a different FAMILY rather than a heavier cut — the enum axis is called weight
+//   because that is what the runtime already selected on.
 //
-//   The em, the vertical metrics and the charset are SHARED — emitted once, below, and
-//   enforced by import_font_atlas.py's check_weights_agree(), which refuses to write this
-//   file if the sheets ever disagree. That is what lets ONE LAYOUT PASS serve both.
+//   *** WHAT ONE LAYOUT PASS ACTUALLY REQUIRES, and it is only this: *** the em, the LINE
+//   HEIGHT and the charset. Those three are emitted once, below, and enforced by
+//   import_font_atlas.py's check_weights_agree(), which refuses to write this file if the
+//   sheets ever disagree about them.
 //
-//   *** ADVANCES ARE NOT SHARED. *** Each weight has its own cell table below and its own
+//   *** ADVANCES ARE NOT SHARED. *** Each face has its own cell table below and its own
 //   widths, because each is rasterised from its own font file. An earlier pass synthesised
 //   the light cut by eroding Regular, where the advances WERE identical, and code was
 //   written on that assumption; it is false now and it made a bold name overrun its
 //   column. Anything that MEASURES a string must pass the weight it will DRAW it in.
 //
-//   CAP HEIGHT is per weight and is measured off each sheet's own 'H', because two real
-//   cuts of a family need not agree on it. A caller aligning live type to one of the
-//   artist's baked word sprites must ask for the cap height OF THE WEIGHT IT IS DRAWING.
+//   *** ASCENT AND DESCENT ARE NOT SHARED EITHER (v25). *** They are how the shared line box
+//   is SPLIT, not how tall it is: Erbaum-Bold splits 116 px as 93/23 where both Sofachrome
+//   cuts split it 95/21. Only EVAlign::Baseline and EVAlign::CapTop read them. The module
+//   constants below are the DEFAULT face's, kept so code with no opinion reads what it always
+//   read; TraceText::Ascent() takes a weight and answers per face.
+//
+//   CAP HEIGHT is per face and is measured off each sheet's own 'H'. A caller aligning live
+//   type to one of the artist's baked word sprites must ask for the cap height OF THE WEIGHT
+//   IT IS DRAWING.
 //
 // THE CELL MODEL, because it is what makes this table so small:
 //   Every cell is one FULL ADVANCE WIDTH by one FULL LINE HEIGHT, and the glyph is drawn
 //   inside it with its own bearings already applied. So the pen advances by uSize and every
 //   glyph sits on a shared baseline — there is no bearing table and there is no kerning.
 //   Sofachrome is a wide squared face whose ink runs flush to the advance on A, T, V, W and
-//   Y; that is the typeface, not clipping.
+//   Y; that is the typeface, not clipping. Erbaum is a narrower squared grotesque and does
+//   the same on its own diagonals.
 //
 // Units are ATLAS PIXELS at an em of 96. On screen everything is multiplied by
 // (Size / EmSize), where Size means the same thing it means in FSlateFontInfo::Size.
@@ -47,23 +58,29 @@
 
 namespace TraceFontAtlasMetrics
 {
-	/** The typeface this was rasterised from. NOT in the repository — see docs/FONTS.md. */
+	/** The DEFAULT face's typeface. NOT in the repository — see docs/FONTS.md. Per-face
+	  * sources are in FFace::Source below; this one is what names the family in a caption. */
 	inline constexpr const TCHAR* SourceFont = TEXT("Sofachrome W05 ExtraLight.ttf");
 
 	/** Indexed by ETraceTextWeight, in the same order; index 0 (Light) is the DEFAULT.
 	  * Keep in step with ETraceTextWeight in TraceTextWeight.h — TraceText.cpp static_asserts it. */
-	inline constexpr int32 NumWeights    = 2;
+	inline constexpr int32 NumWeights    = 3;
 	inline constexpr int32 DefaultWeight = 0;   // Light
 
 	// =============================================================================
-	// SHARED BY EVERY WEIGHT — enforced by the generator, so layout can rely on it
+	// SHARED BY EVERY FACE — enforced by the generator, so layout can rely on it
 	// =============================================================================
 
 	/** Em size the sheets were rasterised at. Everything below is in these pixels. */
 	inline constexpr float EmSize     = 96.f;
+	/** What one line of a multi-line string advances by. THE shared vertical number. */
+	inline constexpr float LineHeight  = 116.f;
+
+	/** The DEFAULT face's split of that line box. PER FACE from v25 — see FFace::Ascent.
+	  * Kept at module scope so callers with no opinion about weight read what they always
+	  * read; anything aligning to a baseline in a NON-default face must ask FFace. */
 	inline constexpr float Ascent     = 95.f;
 	inline constexpr float Descent    = 21.f;
-	inline constexpr float LineHeight  = 116.f;
 
 	inline constexpr int32 FirstCode = 32;
 	inline constexpr int32 LastCode  = 126;
@@ -276,14 +293,117 @@ namespace TraceFontAtlasMetrics
 		{ 1746,  756,   50,  116 },   // 126  ~
 	};
 
+	inline constexpr FCell HudCells[NumGlyphs] =
+	{
+		{   16,   16,   25,  116 },   //  32  space
+		{   73,   16,   32,  116 },   //  33  !
+		{  137,   16,   51,  116 },   //  34  "
+		{  220,   16,   85,  116 },   //  35  #
+		{  337,   16,   70,  116 },   //  36  $
+		{  439,   16,  120,  116 },   //  37  %
+		{  591,   16,   76,  116 },   //  38  &
+		{  699,   16,   28,  116 },   //  39  '
+		{  759,   16,   43,  116 },   //  40  (
+		{  834,   16,   43,  116 },   //  41  )
+		{  909,   16,   57,  116 },   //  42  *
+		{  998,   16,   59,  116 },   //  43  +
+		{ 1089,   16,   32,  116 },   //  44  ,
+		{ 1153,   16,   59,  116 },   //  45  -
+		{ 1244,   16,   32,  116 },   //  46  .
+		{ 1308,   16,   54,  116 },   //  47  /
+		{ 1394,   16,   72,  116 },   //  48  0
+		{ 1498,   16,   65,  116 },   //  49  1
+		{ 1595,   16,   67,  116 },   //  50  2
+		{ 1694,   16,   67,  116 },   //  51  3
+		{ 1793,   16,   70,  116 },   //  52  4
+		{ 1895,   16,   70,  116 },   //  53  5
+		{   16,  164,   72,  116 },   //  54  6
+		{  120,  164,   61,  116 },   //  55  7
+		{  213,  164,   65,  116 },   //  56  8
+		{  310,  164,   72,  116 },   //  57  9
+		{  414,  164,   32,  116 },   //  58  :
+		{  478,  164,   32,  116 },   //  59  ;
+		{  542,  164,   54,  116 },   //  60  <
+		{  628,  164,   59,  116 },   //  61  =
+		{  719,  164,   54,  116 },   //  62  >
+		{  805,  164,   63,  116 },   //  63  ?
+		{  900,  164,  120,  116 },   //  64  @
+		{ 1052,  164,   76,  116 },   //  65  A
+		{ 1160,  164,   67,  116 },   //  66  B
+		{ 1259,  164,   70,  116 },   //  67  C
+		{ 1361,  164,   70,  116 },   //  68  D
+		{ 1463,  164,   62,  116 },   //  69  E
+		{ 1557,  164,   62,  116 },   //  70  F
+		{ 1651,  164,   71,  116 },   //  71  G
+		{ 1754,  164,   74,  116 },   //  72  H
+		{ 1860,  164,   34,  116 },   //  73  I
+		{ 1926,  164,   60,  116 },   //  74  J
+		{   16,  312,   74,  116 },   //  75  K
+		{  122,  312,   60,  116 },   //  76  L
+		{  214,  312,   87,  116 },   //  77  M
+		{  333,  312,   75,  116 },   //  78  N
+		{  440,  312,   71,  116 },   //  79  O
+		{  543,  312,   67,  116 },   //  80  P
+		{  642,  312,   71,  116 },   //  81  Q
+		{  745,  312,   74,  116 },   //  82  R
+		{  851,  312,   70,  116 },   //  83  S
+		{  953,  312,   63,  116 },   //  84  T
+		{ 1048,  312,   72,  116 },   //  85  U
+		{ 1152,  312,   73,  116 },   //  86  V
+		{ 1257,  312,  108,  116 },   //  87  W
+		{ 1397,  312,   75,  116 },   //  88  X
+		{ 1504,  312,   74,  116 },   //  89  Y
+		{ 1610,  312,   64,  116 },   //  90  Z
+		{ 1706,  312,   43,  116 },   //  91  [
+		{ 1781,  312,   54,  116 },   //  92  backslash
+		{ 1867,  312,   43,  116 },   //  93  ]
+		{ 1942,  312,   56,  116 },   //  94  ^
+		{   16,  460,   59,  116 },   //  95  _
+		{  107,  460,   58,  116 },   //  96  `
+		{  197,  460,   66,  116 },   //  97  a
+		{  295,  460,   67,  116 },   //  98  b
+		{  394,  460,   63,  116 },   //  99  c
+		{  489,  460,   67,  116 },   // 100  d
+		{  588,  460,   65,  116 },   // 101  e
+		{  685,  460,   52,  116 },   // 102  f
+		{  769,  460,   67,  116 },   // 103  g
+		{  868,  460,   65,  116 },   // 104  h
+		{  965,  460,   50,  116 },   // 105  i
+		{ 1047,  460,   38,  116 },   // 106  j
+		{ 1117,  460,   65,  116 },   // 107  k
+		{ 1214,  460,   35,  116 },   // 108  l
+		{ 1281,  460,   94,  116 },   // 109  m
+		{ 1407,  460,   66,  116 },   // 110  n
+		{ 1505,  460,   66,  116 },   // 111  o
+		{ 1603,  460,   67,  116 },   // 112  p
+		{ 1702,  460,   67,  116 },   // 113  q
+		{ 1801,  460,   64,  116 },   // 114  r
+		{ 1897,  460,   63,  116 },   // 115  s
+		{   16,  608,   51,  116 },   // 116  t
+		{   99,  608,   65,  116 },   // 117  u
+		{  196,  608,   61,  116 },   // 118  v
+		{  289,  608,   94,  116 },   // 119  w
+		{  415,  608,   66,  116 },   // 120  x
+		{  513,  608,   61,  116 },   // 121  y
+		{  606,  608,   57,  116 },   // 122  z
+		{  695,  608,   55,  116 },   // 123  {
+		{  782,  608,   28,  116 },   // 124  |
+		{  842,  608,   55,  116 },   // 125  }
+		{  929,  608,   58,  116 },   // 126  ~
+	};
+
 	// =============================================================================
 	// PER WEIGHT — the sheet, its dimensions, its measured cap height, its grid
 	// =============================================================================
 
 	struct FFace
 	{
-		/** "Light" / "Bold". This is the name TraceText::WeightFromName() matches. */
+		/** "Light" / "Bold" / "Hud". The name TraceText::WeightFromName() matches. */
 		const TCHAR* Name;
+
+		/** The font file this face was rasterised from. This is what a screenshot caption has to
+		  * print to IDENTIFY the face rather than assert a flag — see spec v25 §4. */
+		const TCHAR* Source;
 
 		/** The imported sheet. Written by Scripts/import_font_atlas.py; loaded once at runtime. */
 		const TCHAR* TextureAsset;
@@ -296,7 +416,12 @@ namespace TraceFontAtlasMetrics
 		int32 AtlasWidth;
 		int32 AtlasHeight;
 
-		/** Cap height for THIS weight. Align to it to sit type where a baked word sprite sat. */
+		/** THIS face's split of the shared line box. Baseline and CapTop alignment read these;
+		  * Ascent + Descent == LineHeight for every face, which is what the guard enforces. */
+		float Ascent;
+		float Descent;
+
+		/** Cap height for THIS face. Align to it to sit type where a baked word sprite sat. */
 		float CapHeight;
 
 		const FCell* Cells;
@@ -304,10 +429,12 @@ namespace TraceFontAtlasMetrics
 
 	inline constexpr FFace Faces[NumWeights] =
 	{
-		// Light — thin 0.0, cap 65 px MEASURED off the 'H' cell's ink rows
-		{ TEXT("Light"), TEXT("/Game/Trace/UI/Fonts/T_FontAtlas.T_FontAtlas"), 0.0f, 2048, 1024, 65.f, LightCells },
-		// Bold — thin 0.0, cap 65 px MEASURED off the 'H' cell's ink rows
-		{ TEXT("Bold"), TEXT("/Game/Trace/UI/Fonts/T_FontAtlasBold.T_FontAtlasBold"), 0.0f, 2048, 1024, 65.f, BoldCells },
+		// Light — Sofachrome W05 ExtraLight.ttf, thin 0.0, ascent 95/descent 21, cap 65 px MEASURED off the 'H' cell's ink rows
+		{ TEXT("Light"), TEXT("Sofachrome W05 ExtraLight.ttf"), TEXT("/Game/Trace/UI/Fonts/T_FontAtlas.T_FontAtlas"), 0.0f, 2048, 1024, 95.f, 21.f, 65.f, LightCells },
+		// Bold — Sofachrome Rg.otf, thin 0.0, ascent 95/descent 21, cap 65 px MEASURED off the 'H' cell's ink rows
+		{ TEXT("Bold"), TEXT("Sofachrome Rg.otf"), TEXT("/Game/Trace/UI/Fonts/T_FontAtlasBold.T_FontAtlasBold"), 0.0f, 2048, 1024, 95.f, 21.f, 65.f, BoldCells },
+		// Hud — Erbaum-Bold.otf, thin 0.0, ascent 93/descent 23, cap 70 px MEASURED off the 'H' cell's ink rows
+		{ TEXT("Hud"), TEXT("Erbaum-Bold.otf"), TEXT("/Game/Trace/UI/Fonts/T_FontAtlasHud.T_FontAtlasHud"), 0.0f, 2048, 1024, 93.f, 23.f, 70.f, HudCells },
 	};
 
 	/** Clamped, so a weight index that came in off a knob or a save game cannot walk off

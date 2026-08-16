@@ -235,25 +235,48 @@ static bool IsV10LegacyWallJump()
 }
 
 // =================================================================================================
-// SPEC v24 §8 — THE A/B ARM FOR THE SHORTER SLIDE AND THE EARLIER BONUS WINDOW.
+// SPEC v24 §8 / SPEC v25 §6 — THE A/B ARM FOR THE SHORTER SLIDE AND THE EARLIER BONUS WINDOW.
 //
 // v24 §8, verbatim: "The 'bonus window' for getting a boost while sliding needs to happen .4 seconds
 // earlier in the slide, shorten the duration of the slide by .4seconds as well."
 //
+// v25 §6, verbatim: "Make the window for slide jumping .2seconds earlier, and decrease slide
+// duration by .2seconds. The window should be right at the end of the slide"
+//
+// THE SAME REQUEST TWICE, AND THE SAME ONE-LINE ANSWER: SlideDurationTrimSeconds accumulates
+// (0.4 -> 0.6) and this arm still zeroes it.
+//
 // ONE CHANGE DELIVERS BOTH SENTENCES, and that is a property of this component rather than a
 // shortcut. The bonus window is anchored to the slide's END — IsSlideJumpWellTimed() is
 // `GetSlideTimeLeft() <= GetSlideJumpWindowSeconds()`, not "t >= some offset from the start" — so
-// cutting 0.4 s off the slide moves the moment the window OPENS 0.4 s earlier in the slide, exactly
-// as asked, and moves its close with it. Applying 0.4 s a second time to SlideJumpWindowSeconds
-// (0.20 -> 0.60) would open the window 0.26 s into a 0.86 s slide, i.e. 70% of every slide would be
-// "well timed" — that is not a window, and it is not what §8 describes ("the window's position
-// relative to the END of the slide is roughly preserved while the slide itself is tighter").
+// cutting 0.2 s off the slide moves the moment the window OPENS 0.2 s earlier in the slide, exactly
+// as asked, and moves its close with it. Applying the same 0.2 s a second time to
+// SlideJumpWindowSeconds (0.20 -> 0.40) would open the window 0.26 s into a 0.66 s slide, i.e. 61%
+// of every slide would be "well timed" — that is not a window, and it is not what either spec
+// describes ("the window's position relative to the END of the slide is roughly preserved while the
+// slide itself is tighter").
 //
-// So the shipped change is SlideDurationTrimSeconds = 0.4, subtracted from the slide length AFTER
+// v25 §6's THIRD sentence is an acceptance criterion — "the window should be right at the end of the
+// slide" — and it is satisfied EXACTLY rather than approximately, for the same structural reason.
+// The window is the slide's LAST GetSlideJumpWindowSeconds() seconds, so its close and the slide's
+// end are the same instant (offset 0.000 s) at every value of either knob. What moved is where that
+// pair sits in absolute time, and how much of the slide the window covers:
+//
+//     arm            slide      window opens   window closes   window as % of slide
+//     v23 (legacy)   1.260 s    1.060 s        1.260 s         16%
+//     v24 §8         0.860 s    0.660 s        0.860 s         23%
+//     v25 §6         0.660 s    0.460 s        0.660 s         30%
+//
+// Nothing was retuned to make the criterion land; it lands on the arithmetic. Measured off live
+// slides by the V24WINDOW line below (-TraceSlideDebug), which prints the open and close this
+// component actually produced rather than restating these numbers.
+//
+// So the shipped change is SlideDurationTrimSeconds = 0.6, subtracted from the slide length AFTER
 // SlideMaxLengthScale, and this switch forces that trim back to its identity (0) — the same "one
 // binary, one harness, both arms" rule GTraceV9LegacyTuning above is built on. Nothing else moves:
 // unlike -TraceLegacyTuning this arm does not revert gravity, the air caps or the wall jump, so a
-// window time measured against it is a measurement of §8 and of nothing else.
+// window time measured against it is a measurement of §8/§6 and of nothing else. Note the arm is
+// now a 0.6 s A/B rather than a 0.4 s one: it reverts the ACCUMULATED trim, not just v25's share.
 //
 // Defined outside every build guard for the Shipping-link reason spelled out on GTraceV9LegacyTuning:
 // GetSlideDuration() reads it and GetSlideDuration() ships. Registration lives in the dev block.
@@ -797,18 +820,28 @@ float UTraceCharacterMovementComponent::GetSlideDuration() const
 		: FMath::Clamp(TraceMoveKnob::Float(TEXT("SlideMaxLengthScale"), 0.7f), 0.05f, 4.f);
 
 	// =============================================================================================
-	// SPEC v24 §8 — "shorten the duration of the slide by .4seconds as well".
+	// SPEC v24 §8 ("shorten the duration of the slide by .4seconds as well")
+	//   + SPEC v25 §6 ("decrease slide duration by .2seconds")  =  0.6 s off the shipped slide.
 	// =============================================================================================
 	//
+	// ONE ACCUMULATING KNOB, NOT ONE KNOB PER SPEC. Two passes asked for the same thing and the trim
+	// is the running total (0.4 + 0.2), so the shipped slide is 1.80 x 0.70 - 0.60 = 0.66 s.
+	//
 	// SUBTRACTED FROM THE SHIPPED LENGTH, NOT FROM THE BASE, and that is the whole reason this is a
-	// separate knob instead of an edit to SlideDuration. The owner's 0.4 s is 0.4 s of the slide he
-	// plays, which is Base x Scale (1.80 x 0.70 = 1.26 s), not 0.4 s of the 1.80 s base — cutting the
-	// base by 0.4 would ship 1.40 x 0.70 = 0.98 s, a 0.28 s cut, and the player would feel 70% of
-	// what he asked for. Re-typing the base as 1.2286 (0.86 / 0.7) would deliver the right number
-	// today and silently become a 0.514 s cut the moment anybody re-tunes SlideMaxLengthScale, which
-	// is precisely the absolute-instead-of-relative failure spec v24 §0 is about. As a trim over the
-	// finished length it stays "0.4 s shorter than the slide would otherwise be" whatever the base
-	// and the v9 §6 scale do next.
+	// separate knob instead of an edit to SlideDuration. The owner's seconds are seconds of the slide
+	// he plays, which is Base x Scale (1.80 x 0.70 = 1.26 s), not seconds of the 1.80 s base —
+	// cutting the base by 0.6 would ship 1.20 x 0.70 = 0.84 s, a 0.42 s cut, and the player would
+	// feel 70% of what he asked for. Re-typing the base as 0.9429 (0.66 / 0.7) would deliver the
+	// right number today and silently become a different cut the moment anybody re-tunes
+	// SlideMaxLengthScale, which is precisely the absolute-instead-of-relative failure spec v24 §0 is
+	// about. As a trim over the finished length it stays "0.6 s shorter than the slide would
+	// otherwise be" whatever the base and the v9 §6 scale do next.
+	//
+	// AND IT IS ALSO WHERE "the window for slide jumping .2seconds earlier" LIVES. The slide-jump
+	// window is the slide's last GetSlideJumpWindowSeconds() seconds, so shortening the slide here
+	// drags the window's open AND close 0.2 s earlier and leaves the close sitting exactly on the
+	// slide's end — which is v25 §6's third sentence, its acceptance criterion. SlideJumpWindowSeconds
+	// is therefore NOT also moved; see the table at the top of this file for the measured numbers.
 	//
 	// It is also what makes the A/B honest: IsV24LegacySlide() zeroes ONLY this, so the before-arm
 	// is the exact v23 slide (1.26 s) in the same binary. See the arm at the top of this file.
