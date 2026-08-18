@@ -21,6 +21,7 @@
 #include "Trace.h"                       // LogTraceGame
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
+#include "Audio/TraceAudio.h"           // spec v26 §9 - ButtonPress on the submenu rows too
 
 // =================================================================================================
 // WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
@@ -94,8 +95,85 @@
 // to explain: the panel draws on the canvas the host handed it, the way it did before spec v23 §A2.
 // =================================================================================================
 
+// =================================================================================================
+// SPEC v26 §2 — THIS PAGE IS *TWO* TYPEFACES NOW, AND WHICH ONE IS A PROPERTY OF THE ROW
+// =================================================================================================
+//
+//     "Make submenus (e.g. settings) use Erbaum bold rather than Sofachrome. Keep sofachrome for
+//      main menu, headers, character names"
+//
+// v22 §A1 (the block above) made this page ONE typeface after it had shipped with two. That was the
+// right fix for the defect it was aimed at — the artist's baked word sprites sitting four pixels from
+// engine-font rows — and the owner is now asking for a different split, along a different seam:
+//
+//     the page's own TITLE and its section HEADERS  ->  Sofachrome     (ETraceTextWeight::Light)
+//     everything a player reads, adjusts or binds   ->  Erbaum Bold    (ETraceTextWeight::Hud)
+//
+// The seam runs between OBJECTS, never inside one. A header owns its whole row and the rule beside
+// it; a body row owns its label, its value, its arrows and its key chip. Nothing on this page mixes
+// the two faces within a string or within a control, which is the thing that made the OLD two-face
+// screen read as broken — SETTINGS and PLAY as baked sprites with their neighbours in Lato, one row
+// apart in the same column.
+//
+// There is exactly ONE line where both faces appear, and it is deliberate: the VIDEO page's title
+// line carries the word VIDEO (a header, centred, Sofachrome) and the live frame-time readout (body,
+// right-aligned, Erbaum). Photographed at 1920x1080 — they sit at opposite ends of a 1020-wide panel
+// and read as the two different things they are, a heading and an instrument.
+//
+// ---- WHAT WAS DECIDED PER SURFACE, AND WHY ------------------------------------------------------
+//
+//   SETTINGS / PAUSED / VIDEO (the panel title)   SOFACHROME. The spec calls this out by name: "the
+//                                                 word SETTINGS at the top of the settings page stays
+//                                                 Sofachrome while the rows under it become Erbaum".
+//   CONTROLS / DISPLAY / MOUSE (section captions) SOFACHROME. Same object as the title, one level
+//                                                 down — a caption with a rule through it, not a
+//                                                 control. It is what "HEADERS anywhere" means.
+//   KEYBIND / KEY (the two column captions)       SOFACHROME. They are drawn INSTEAD of the word
+//                                                 CONTROLS, on the header row, and they are headers
+//                                                 for the two columns of every Binding row below.
+//   Row labels, values, key names, ON/OFF, the    ERBAUM BOLD. "settings / submenu body text, keybind
+//   < > arrows, the resolution-scale note, the    rows, values" — this is the body of the page, and
+//   footer key hints, the video perf readout      the arrows and the readout are furniture attached
+//                                                 to it rather than headings of their own.
+//   Action rows on the SETTINGS and VIDEO pages   ERBAUM BOLD. BACK, RESET DEFAULTS and AUTO-DETECT
+//                                                 are controls on a submenu page, in the same column
+//                                                 as the rows they sit under.
+//   Action rows on the PAUSE ROOT page            SOFACHROME. *** THE ONE JUDGEMENT CALL. *** RESUME
+//                                                 / SETTINGS / VIDEO / RETURN TO TITLE / QUIT are not
+//                                                 settings; they are the in-match MAIN MENU, the same
+//                                                 list of destinations the title screen draws in
+//                                                 Sofachrome through UTraceMenuRow. Setting them in
+//                                                 Erbaum would put the game's two top-level menus in
+//                                                 two different faces. The rule that produces this is
+//                                                 one line — FaceForAction() below — so an owner who
+//                                                 disagrees changes it there and nowhere else.
+//
+// ---- THE UNITS DID NOT MOVE, AND THAT IS LOAD-BEARING --------------------------------------------
+//
+// Every face shares the 116 px line box (Scripts/import_font_atlas.py refuses to emit a metrics
+// header whose sheets disagree about it), so SizeFor() and Height() are face-INDEPENDENT and the
+// vertical rhythm of nineteen rows, their plates and their hit rects are all exactly what they were.
+// WIDTHS are not: Erbaum measures the alphabet at 1823 px against Sofachrome's 2634 at em 96, so
+// anything that measures a string MUST be handed the face it will be drawn in. That is why Width()
+// and MeasureWidth() below take a weight and why it has no default — the four call sites that measure
+// (the two header rules, the key chip's width, the arrow gutter) each state their face, and the
+// compiler will not let a fifth forget.
+// =================================================================================================
+
 namespace TraceOptionsMenuType
 {
+	/**
+	 * The face a HEADER is set in: Sofachrome ExtraLight, the same sheet the title screen uses.
+	 *
+	 * Named rather than written as ETraceTextWeight::Light at eleven call sites, because the reason a
+	 * call passes it is "this is a header", not "this is the light weight". Re-pointing every header
+	 * on this page at another sheet is then one edit here.
+	 */
+	static constexpr ETraceTextWeight HeaderFace = ETraceTextWeight::Light;
+
+	/** The face BODY is set in: Erbaum Bold, the face the in-match HUD already uses (spec v25 §4). */
+	static constexpr ETraceTextWeight BodyFace = ETraceTextWeight::Hud;
+
 	/** The point size whose line height equals what @p Font at @p Scale draws. See the block above. */
 	static float SizeFor(AHUD* HUD, UFont* Font, float Scale)
 	{
@@ -117,21 +195,39 @@ namespace TraceOptionsMenuType
 		return FMath::Max(1.f, 16.f * Scale);
 	}
 
-	static float Width(AHUD* HUD, const FString& Text, UFont* Font, float Scale)
+	/**
+	 * Width @p Text occupies IN @p Weight.
+	 *
+	 * The weight is not optional and must be the one the caller is about to DRAW in: the three faces
+	 * share no advances at all (see the §2 block above), so measuring in one and drawing in another
+	 * puts a rule through a word or leaves a chip a third too wide.
+	 */
+	static float Width(AHUD* HUD, const FString& Text, UFont* Font, float Scale, ETraceTextWeight Weight)
 	{
-		return TraceText::MeasureWidth(Text, SizeFor(HUD, Font, Scale));
+		TraceText::FStyle Style(SizeFor(HUD, Font, Scale));
+		Style.Weight = Weight;
+		return TraceText::MeasureWidth(Text, Style);
 	}
 
-	/** The LINE BOX, which is what every caller on this page uses it for. */
+	/**
+	 * The LINE BOX, which is what every caller on this page uses it for.
+	 *
+	 * NO WEIGHT, deliberately, and it is not an oversight: the line box is identical in all three
+	 * faces by construction — Scripts/import_font_atlas.py refuses to emit a metrics header whose
+	 * sheets disagree about it — so this answer cannot depend on the face. That is exactly why §2's
+	 * face split moves no row on this page.
+	 */
 	static float Height(AHUD* HUD, UFont* Font, float Scale)
 	{
 		return TraceText::LineHeight(SizeFor(HUD, Font, Scale));
 	}
 
 	static void Draw(AHUD* HUD, const FString& Text, const FLinearColor& Color,
-		float X, float Y, UFont* Font, float Scale, TraceText::EHAlign HAlign = TraceText::EHAlign::Left)
+		float X, float Y, UFont* Font, float Scale, ETraceTextWeight Weight,
+		TraceText::EHAlign HAlign = TraceText::EHAlign::Left)
 	{
 		TraceText::FStyle Style(SizeFor(HUD, Font, Scale), Color);
+		Style.Weight = Weight;
 		Style.HAlign = HAlign;
 		TraceCanvasText::Draw(HUD, Text, X, Y, Style);
 	}
@@ -502,10 +598,16 @@ namespace TraceOptionsMenuArt
 		const UTexture2D* AtlasLight = TraceText::AtlasTexture(ETraceTextWeight::Light);
 		const UTexture2D* AtlasBold  = TraceText::AtlasTexture(ETraceTextWeight::Bold);
 
+		// HUD (Erbaum Bold) JOINED THIS LIST IN SPEC v26 §2, because this page now draws its whole
+		// body out of that sheet. A readiness line that named only the two Sofachrome sheets would
+		// have gone on reporting "ready" through exactly the frame where the settings rows came out
+		// blank, which is the failure this diagnostic exists to catch.
+		const UTexture2D* AtlasHud   = TraceText::AtlasTexture(ETraceTextWeight::Hud);
+
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[Options] Readiness draw#%d: sprites %s| atlas(active=%d) light=%s bold=%s"),
+			TEXT("[Options] Readiness draw#%d: sprites %s| atlas(active=%d) light=%s bold=%s hud=%s"),
 			DrawsSinceOpen, *Line, TraceText::IsAtlasActive() ? 1 : 0,
-			State(AtlasLight), State(AtlasBold));
+			State(AtlasLight), State(AtlasBold), State(AtlasHud));
 	}
 #endif
 
@@ -1880,6 +1982,24 @@ void FTraceOptionsMenu::ActivateSelected()
 
 	FRow& Row = Rows[Selected];
 
+	// SPEC v26 §9 - ButtonPress, client-side. This is the settings/pause/video page's equivalent of
+	// ATraceMenuHUD::ActivateSelection, and it is the ONE choke point every activation of a row on
+	// these pages passes through: Enter, the gamepad face button and the mouse-release path all
+	// funnel here (three call sites above), so one line covers all of them.
+	//
+	// A SLIDER IS EXCLUDED, and that is the same rule the main menu's grace-window gate encodes: Enter
+	// on a continuous value deliberately does nothing (see ERowKind::Slider below), so a click that
+	// made a noise while changing nothing would teach the player the sound means less than it does.
+	//
+	// PlayLocal2D rather than Play(Actor): this page has no actor and no world member - the HUD is a
+	// draw-time parameter - and a menu click has no world position to be attenuated from anyway. The
+	// call is silent-safe against a null world.
+	if (Row.Kind != ERowKind::Slider)
+	{
+		TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
+			TraceSoundEvents::ButtonPress);
+	}
+
 	switch (Row.Kind)
 	{
 	case ERowKind::Toggle:
@@ -2277,7 +2397,10 @@ void FTraceOptionsMenu::DrawPerfReadout(AHUD* HUD, float RightX, float Y)
 		? FString::Printf(TEXT("%.0f FPS    %.2f MS    GPU %.2f MS"), PerfFps, PerfFrameMs, PerfGpuMs)
 		: FString::Printf(TEXT("%.0f FPS    %.2f MS"), PerfFps, PerfFrameMs);
 
-	DrawTextRight(HUD, Line, Color, RightX, Y, FontSmall, 1.1f * UIScale);
+	// BODY, not a header (spec v26 §2): this is a live READOUT of the page's own effect — the same
+	// class of thing as a row's value, and it is set in the same face the in-match HUD reports numbers
+	// in, which is the face a player is already reading frame times in during a match.
+	DrawTextRight(HUD, Line, Color, RightX, Y, FontSmall, 1.1f * UIScale, TraceOptionsMenuType::BodyFace);
 }
 
 // =================================================================================================
@@ -2352,8 +2475,12 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	if (Page == EPage::Root)       { Title = TEXT("PAUSED"); }
 	else if (Page == EPage::Video) { Title = TEXT("VIDEO"); }
 
+	// SOFACHROME, and the spec names this string: "the word SETTINGS at the top of the settings page
+	// stays Sofachrome while the rows beneath it become Erbaum" (v26 §2). PAUSED and VIDEO are the
+	// same object on the other two pages.
 	const float TitleY = PanelY + (22.f * UIScale);
-	DrawTextCentered(HUD, Title, TraceOptionsStyle::Cyan, CX, TitleY, FontLarge, 1.9f * UIScale);
+	DrawTextCentered(HUD, Title, TraceOptionsStyle::Cyan, CX, TitleY, FontLarge, 1.9f * UIScale,
+		TraceOptionsMenuType::HeaderFace);
 
 	// The live readout, on the title line and only on the video page. Spec v11 §2: the collaborator
 	// could tell the build was slow and had no way to measure it, so every row on this page is a
@@ -2400,8 +2527,10 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 		Hint = TEXT("ARROWS  MOVE / ADJUST      ENTER  SELECT      BKSP  UNBIND      ESC  BACK");
 	}
 
+	// BODY (spec v26 §2). The footer is a key legend — "BKSP UNBIND" is the same kind of string as the
+	// key names in the rows above it, and it is read at a glance rather than scanned as a heading.
 	DrawTextCentered(HUD, Hint, TraceOptionsStyle::InkDim, CX,
-		PanelY + PanelH - (30.f * UIScale), FontSmall, 1.0f * UIScale);
+		PanelY + PanelH - (30.f * UIScale), FontSmall, 1.0f * UIScale, TraceOptionsMenuType::BodyFace);
 
 	DrawCursor(HUD);
 }
@@ -2449,23 +2578,35 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			const FLinearColor WordTint = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.80f);
 			const float ValueRightHdr = X + W - PadX;
 
-			TraceOptionsMenuType::Draw(HUD, TEXT("KEYBIND"), WordTint, X, TextY, FontSmall, 1.0f * UIScale);
+			// SOFACHROME (spec v26 §2). These two are HEADERS in the strongest sense available on this
+			// page: they are drawn instead of the word CONTROLS, and they name the two COLUMNS that
+			// every Binding row below them is laid out in. The key names under KEY are Erbaum; the
+			// word KEY is not.
+			TraceOptionsMenuType::Draw(HUD, TEXT("KEYBIND"), WordTint, X, TextY, FontSmall, 1.0f * UIScale,
+				TraceOptionsMenuType::HeaderFace);
 			TraceOptionsMenuType::Draw(HUD, TEXT("KEY"), WordTint, ValueRightHdr, TextY, FontSmall,
-				1.0f * UIScale, TraceText::EHAlign::Right);
+				1.0f * UIScale, TraceOptionsMenuType::HeaderFace, TraceText::EHAlign::Right);
 
-			// The rule has to stop short at BOTH ends, or it strikes straight through KEY.
-			RuleLeft = X + MeasureWidth(HUD, TEXT("KEYBIND"), FontSmall, 1.0f * UIScale) + Gap;
-			RuleRight = ValueRightHdr - MeasureWidth(HUD, TEXT("KEY"), FontSmall, 1.0f * UIScale) - Gap;
+			// The rule has to stop short at BOTH ends, or it strikes straight through KEY. Measured in
+			// the face the words were just DRAWN in — Erbaum is a third narrower than Sofachrome, so
+			// measuring in the wrong one is exactly the strike-through this line exists to avoid.
+			RuleLeft = X + MeasureWidth(HUD, TEXT("KEYBIND"), FontSmall, 1.0f * UIScale,
+				TraceOptionsMenuType::HeaderFace) + Gap;
+			RuleRight = ValueRightHdr - MeasureWidth(HUD, TEXT("KEY"), FontSmall, 1.0f * UIScale,
+				TraceOptionsMenuType::HeaderFace) - Gap;
 			bWordsDrawn = true;
 		}
 
 		if (!bWordsDrawn)
 		{
+			// DISPLAY, MOUSE, GAMEPLAY... — "HEADERS anywhere" (spec v26 §2). Same treatment as the
+			// panel title one level up, and measured in the same face for the same reason.
 			TraceOptionsMenuType::Draw(HUD, Row.Label,
 				TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.75f),
-				X, TextY, FontSmall, 1.0f * UIScale);
+				X, TextY, FontSmall, 1.0f * UIScale, TraceOptionsMenuType::HeaderFace);
 
-			RuleLeft = X + MeasureWidth(HUD, Row.Label, FontSmall, 1.0f * UIScale) + Gap;
+			RuleLeft = X + MeasureWidth(HUD, Row.Label, FontSmall, 1.0f * UIScale,
+				TraceOptionsMenuType::HeaderFace) + Gap;
 		}
 
 		if (RuleRight > RuleLeft)
@@ -2483,9 +2624,11 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	// the eye needs to be told which one is worth more than the other eighteen.
 	if (Row.Kind == ERowKind::Note)
 	{
+		// BODY (spec v26 §2). A Note is a SENTENCE about the control above it — prose, indented under
+		// its row, the least heading-like string on the page.
 		TraceOptionsMenuType::Draw(HUD, Row.Label,
 			TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.78f),
-			X + PadX, TextY, FontSmall, 1.0f * UIScale);
+			X + PadX, TextY, FontSmall, 1.0f * UIScale, TraceOptionsMenuType::BodyFace);
 		return;
 	}
 
@@ -2560,6 +2703,9 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	// Action rows are buttons; centring their label is what makes them read as one.
 	if (Row.Kind == ERowKind::Action)
 	{
+		// Sofachrome on the pause ROOT, Erbaum on the settings and video pages. See FaceForAction().
+		const ETraceTextWeight ActionFace = FaceForAction();
+
 		// AUTO-DETECT is the row a confused player on a weak machine should press, so it is the only
 		// button on the page drawn in amber with a plate behind it — everything else here is a list.
 		if (Row.Action == EAction::AutoDetectQuality)
@@ -2569,15 +2715,19 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 			const FString Text = bMeasuring ? TEXT("MEASURING THIS MACHINE...") : Row.Label;
 			DrawTextCentered(HUD, Text, bMeasuring ? FLinearColor::White : TraceOptionsStyle::Amber,
-				X + W * 0.5f, TextY, FontMedium, LabelScale);
+				X + W * 0.5f, TextY, FontMedium, LabelScale, ActionFace);
 			return;
 		}
 
-		DrawTextCentered(HUD, Row.Label, LabelColor, X + W * 0.5f, TextY, FontMedium, LabelScale);
+		DrawTextCentered(HUD, Row.Label, LabelColor, X + W * 0.5f, TextY, FontMedium, LabelScale, ActionFace);
 		return;
 	}
 
-	TraceOptionsMenuType::Draw(HUD, Row.Label, LabelColor, X + PadX, TextY, FontMedium, LabelScale);
+	// THE ROW LABEL — MOUSE SENSITIVITY, MOVE FORWARD, RESOLUTION SCALE. Erbaum Bold: this is the
+	// "settings / submenu body text, keybind rows" the owner asked for, and it is the string that
+	// makes the change visible (spec v26 §2).
+	TraceOptionsMenuType::Draw(HUD, Row.Label, LabelColor, X + PadX, TextY, FontMedium, LabelScale,
+		TraceOptionsMenuType::BodyFace);
 
 	// ---- Value ---------------------------------------------------------------------------------
 	const float ValueRight = X + W - PadX;
@@ -2604,7 +2754,12 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 		// UNCHANGED ARITHMETIC. The chip rect this screen has always drawn is exactly the shape of
 		// T_MenuValueBox, so the sprite is a one-for-one swap onto a rectangle that already existed.
-		const float PlateW = FMath::Max(MeasureWidth(HUD, ValueText, FontMedium, LabelScale) + (16.f * UIScale), 120.f * UIScale);
+		//
+		// MEASURED IN THE FACE IT IS DRAWN IN (spec v26 §2): the chip is sized to its key name, so
+		// measuring "LEFT SHIFT" in Sofachrome and setting it in Erbaum would leave a chip a third
+		// wider than the word inside it on every keybind row on the page.
+		const float PlateW = FMath::Max(MeasureWidth(HUD, ValueText, FontMedium, LabelScale,
+			TraceOptionsMenuType::BodyFace) + (16.f * UIScale), 120.f * UIScale);
 		const float ChipX = ValueRight - PlateW;
 		const float ChipY = Y + H * 0.14f;
 		const float ChipH = H * 0.72f;
@@ -2617,7 +2772,10 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan,
 			bWaiting ? 0.22f : (bChipDrawn ? 0.05f : 0.10f)), ChipX, ChipY, PlateW, ChipH);
 
-		DrawTextCentered(HUD, ValueText, ValueColor, ValueRight - PlateW * 0.5f, TextY, FontMedium, LabelScale);
+		// THE KEYBIND ROW'S KEY NAME. Erbaum Bold — "keybind rows" is one of the three surfaces §2
+		// names, and this is the string on them a player actually reads.
+		DrawTextCentered(HUD, ValueText, ValueColor, ValueRight - PlateW * 0.5f, TextY, FontMedium, LabelScale,
+			TraceOptionsMenuType::BodyFace);
 		return;
 	}
 
@@ -2634,7 +2792,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		const bool bOn = (Value >= 0.5f);
 		DrawTextRight(HUD, FormatSettingValue(Row.Setting, Value),
 			bOn ? TraceOptionsStyle::Amber : TraceOptionsStyle::InkDim,
-			ValueRight, TextY, FontMedium, LabelScale);
+			ValueRight, TextY, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
 		return;
 	}
 
@@ -2652,11 +2810,16 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		// The arrow columns are reserved WHETHER OR NOT an arrow is drawn in them. If the value moved
 		// right every time it hit the end of its range, every list on the page would twitch sideways
 		// as the player walked it, which reads as a layout bug rather than as an end stop.
+		// The value and both arrows are BODY (spec v26 §2), and ValueW is measured in that same face —
+		// it is what positions the '<', so a measurement in the wrong face parks the left arrow inside
+		// the word it is supposed to sit outside.
 		const float ArrowColW = 20.f * UIScale;
-		const float ValueW = MeasureWidth(HUD, ValueText, FontMedium, LabelScale);
+		const float ValueW = MeasureWidth(HUD, ValueText, FontMedium, LabelScale,
+			TraceOptionsMenuType::BodyFace);
 		const float ValueTextRight = ValueRight - ArrowColW;
 
-		DrawTextRight(HUD, ValueText, ValueColor, ValueTextRight, TextY, FontMedium, LabelScale);
+		DrawTextRight(HUD, ValueText, ValueColor, ValueTextRight, TextY, FontMedium, LabelScale,
+			TraceOptionsMenuType::BodyFace);
 
 		if (bSelected && Row.bEnabled)
 		{
@@ -2664,11 +2827,12 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			if (Value > Min + UE_KINDA_SMALL_NUMBER)
 			{
 				DrawTextRight(HUD, TEXT("<"), ArrowColor, ValueTextRight - ValueW - (6.f * UIScale),
-					TextY, FontMedium, LabelScale);
+					TextY, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
 			}
 			if (Value < Max - UE_KINDA_SMALL_NUMBER)
 			{
-				DrawTextRight(HUD, TEXT(">"), ArrowColor, ValueRight, TextY, FontMedium, LabelScale);
+				DrawTextRight(HUD, TEXT(">"), ArrowColor, ValueRight, TextY, FontMedium, LabelScale,
+					TraceOptionsMenuType::BodyFace);
 			}
 		}
 		return;
@@ -2687,11 +2851,13 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	{
 		// Centred in the chip rather than right-aligned to the panel, because it now sits inside a
 		// box and a number pinned to one wall of its box looks like a mistake.
-		DrawTextCentered(HUD, ValueText, SliderValueColor, ValueRight - ValueColW * 0.5f, TextY, FontMedium, LabelScale);
+		DrawTextCentered(HUD, ValueText, SliderValueColor, ValueRight - ValueColW * 0.5f, TextY, FontMedium, LabelScale,
+			TraceOptionsMenuType::BodyFace);
 	}
 	else
 	{
-		DrawTextRight(HUD, ValueText, SliderValueColor, ValueRight, TextY, FontMedium, LabelScale);
+		DrawTextRight(HUD, ValueText, SliderValueColor, ValueRight, TextY, FontMedium, LabelScale,
+			TraceOptionsMenuType::BodyFace);
 	}
 
 	const float TrackRight = ValueRight - ValueColW;
@@ -2841,9 +3007,36 @@ void FTraceOptionsMenu::DrawCursor(AHUD* HUD)
 // are this page's layout vocabulary and forty call sites speak it; TraceOptionsMenuType::SizeFor
 // translates. See the block at the top of this file for why the translation is a measurement.
 
-float FTraceOptionsMenu::MeasureWidth(AHUD* HUD, const FString& Text, UFont* Font, float Scale)
+// SPEC v26 §2 added the FACE to three of the four. It is a required argument rather than a defaulted
+// one on purpose: a default would let a new call site measure Sofachrome and draw Erbaum — a third
+// narrower — and the symptom of that is a rule struck through a header or a key chip that no longer
+// fits its key, which is a bug you find in a screenshot rather than in a compile.
+
+ETraceTextWeight FTraceOptionsMenu::FaceForAction() const
 {
-	return TraceOptionsMenuType::Width(HUD, Text, Font, Scale);
+	// THE ONE JUDGEMENT CALL IN SPEC v26 §2's SPLIT, ISOLATED TO ONE EXPRESSION.
+	//
+	// An Action row is a button, and this class draws buttons on two very different pages:
+	//
+	//   * the PAUSE ROOT — RESUME / SETTINGS / VIDEO / RETURN TO TITLE / QUIT. That is not a settings
+	//     page; it is the in-match MAIN MENU, the same list of destinations the title screen puts on
+	//     screen through UTraceMenuRow. §2 keeps "main menu rows" in Sofachrome, so these stay in it:
+	//     setting them in Erbaum would give the game's two top-level menus two different faces, and a
+	//     player who opened the pause menu would see a screen that did not match the one they had
+	//     launched from thirty seconds earlier;
+	//
+	//   * SETTINGS and VIDEO — BACK, RESET DEFAULTS, AUTO-DETECT. These are controls on a submenu, in
+	//     the same column and the same rhythm as the rows above them, and they get the body face like
+	//     everything else on those pages.
+	//
+	// An owner who reads it the other way changes this one return.
+	return (Page == EPage::Root) ? TraceOptionsMenuType::HeaderFace : TraceOptionsMenuType::BodyFace;
+}
+
+float FTraceOptionsMenu::MeasureWidth(AHUD* HUD, const FString& Text, UFont* Font, float Scale,
+	ETraceTextWeight Weight)
+{
+	return TraceOptionsMenuType::Width(HUD, Text, Font, Scale, Weight);
 }
 
 float FTraceOptionsMenu::MeasureHeight(AHUD* HUD, const FString& Text, UFont* Font, float Scale)
@@ -2856,12 +3049,14 @@ float FTraceOptionsMenu::MeasureHeight(AHUD* HUD, const FString& Text, UFont* Fo
 	return TraceOptionsMenuType::Height(HUD, Font, Scale);
 }
 
-void FTraceOptionsMenu::DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale)
+void FTraceOptionsMenu::DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale,
+	ETraceTextWeight Weight)
 {
-	TraceOptionsMenuType::Draw(HUD, Text, Color, CenterX, Y, Font, Scale, TraceText::EHAlign::Center);
+	TraceOptionsMenuType::Draw(HUD, Text, Color, CenterX, Y, Font, Scale, Weight, TraceText::EHAlign::Center);
 }
 
-void FTraceOptionsMenu::DrawTextRight(AHUD* HUD, const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale)
+void FTraceOptionsMenu::DrawTextRight(AHUD* HUD, const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale,
+	ETraceTextWeight Weight)
 {
-	TraceOptionsMenuType::Draw(HUD, Text, Color, RightX, Y, Font, Scale, TraceText::EHAlign::Right);
+	TraceOptionsMenuType::Draw(HUD, Text, Color, RightX, Y, Font, Scale, Weight, TraceText::EHAlign::Right);
 }

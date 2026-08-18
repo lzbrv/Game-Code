@@ -124,11 +124,22 @@ namespace TraceCharacterRosterFile
 			{
 				4, TEXT("OYSTER"),
 				TEXT("JUMPING WHILE STOOD ON ONE OF YOUR OWN JARS BREAKS IT AND BOOSTS YOU UPWARD."),
+				// SPEC v26 §6a. The refund is a POISON rule, not a Pickler rule — a dash jar an enemy
+				// walks into pays it too — so it is stated on the line that describes the poison and
+				// only cross-referenced from the Pickler line below. A card that hid it under PICKLER
+				// would have players believing only the lob refunds.
 				TEXT("EVERY DASH LEAVES A POISON JAR, EVEN CARRYING THE CORE. AN ENEMY WHO TOUCHES ONE "
-				     "BREAKS IT: 3 DAMAGE EVERY 0.5S FOR 4S AND -30% SPEED. JARS LAST 4S, MAX 3."),
+				     "BREAKS IT: 3 DAMAGE EVERY 0.5S FOR 4S AND -30% SPEED. JARS LAST 4S, MAX 3. "
+				     "POISONING AN ENEMY RESETS YOUR E, EVERY TIME."),
 				TEXT("PICKLER"),
-				TEXT("LOB A JAR. ON LANDING IT DEALS 30 IN AN AREA AND PULLS NEARBY ENEMIES IN - THEN STAYS "
-				     "ON THE GROUND AS A NORMAL JAR."),
+				// SPEC v26 §6b MADE THE OLD SENTENCE UNTRUE. It read "...THEN STAYS ON THE GROUND AS A
+				// NORMAL JAR", which was the doc's own v14 clarification and is now the opposite of
+				// what the jar does. The 20 S below is still the charged cooldown and still what the
+				// HUD ring counts down, so it stays — but it is a ceiling now, which is why the second
+				// sentence is here rather than left for a player to discover.
+				TEXT("LOB A JAR. ON LANDING IT DEALS 30 IN AN AREA AND PULLS NEARBY ENEMIES IN, THEN "
+				     "EXPLODES INTO POISON THE MOMENT THE PULL ENDS. ANY POISON YOU LAND HANDS E STRAIGHT "
+				     "BACK, SO THE 20S IS A CEILING, NOT A WAIT."),
 				20.f,
 				FLinearColor(0.30f, 0.85f, 0.95f, 1.f)    // cyan
 			},

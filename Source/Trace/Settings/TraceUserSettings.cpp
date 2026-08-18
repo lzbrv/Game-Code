@@ -118,6 +118,31 @@ namespace
 	 * it is the genre convention besides.
 	 */
 	FKey Default_Reload()           { return EKeys::R; }
+	/**
+	 * SPEC v26 §1, verbatim: "Make parry and pull core two separate binds in the settings menu."
+	 *
+	 * NO KEY IS NAMED BY THE NOTE, so this one is a choice and it is argued rather than asserted.
+	 * Claimed already: WASD, Space, LeftControl, LeftShift, mouse1, mouse2, Tab, 1, 2, E, V, R.
+	 *
+	 * F WINS ON TWO COUNTS. It is unclaimed — spec v15 §5 vacated it when it deleted the SwapWeapon
+	 * toggle — and "F is the key you press to grab the thing you are looking at" is the single
+	 * strongest convention this genre has, which matters for a verb whose whole interaction is
+	 * "hover the turned-over Core and hold".
+	 *
+	 * Q WAS THE OTHER CANDIDATE and was passed over on purpose. Spec v25 §7 freed it when parry moved
+	 * to right mouse, so it is available and it is close to WASD. But the pull is a HOLD taken while
+	 * still steering, and Q asks the ring finger to leave A; F is under an index finger that is
+	 * already resting on D. Q also carries a decade of "that is the ability key" muscle memory from
+	 * other games in this genre, and this action is not an ability.
+	 *
+	 * RIGHT MOUSE IS DELIBERATELY NOT THE DEFAULT, even though that is where v25 §2 put the pull.
+	 * The note asks for TWO binds; shipping both on one key would satisfy the letter (two rows on the
+	 * page) and none of the intent. Parry keeps the button v25 §7 explicitly named for it.
+	 *
+	 * SetKey's stealing rule would log it if this default took a key from another action on a first
+	 * run. It does not.
+	 */
+	FKey Default_PullCore()         { return EKeys::F; }
 }
 
 const TArray<FTraceInputActionInfo>& TraceInputActions::All()
@@ -162,7 +187,16 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// NOT SAFE TO RENAME, for contrast, and this is why the rule is per-row rather than blanket:
 		// "Ability", "AbilitySecondary" and "Reload" are looked up BY STRING outside this file
 		// (UTraceAbilityInputRelay, ATraceHUD's ability and reload rows). Neither of these two is.
-		{ ETraceInputAction::Parry,       TEXT("ParryPull"),   TEXT("PARRY / PULL CORE"), &Default_Parry },
+		// *** SPEC v26 §1 RENAMES THE LABEL AND NOT THE ID. *** "Make parry and pull core two separate
+		// binds in the settings menu": the pull moved out to its own row at the bottom of this table,
+		// so this row is the parry alone and the "/ PULL CORE" half of its label is now a lie.
+		//
+		// The ConfigId stays "ParryPull". Every id migration costs a returning player their hand-rebound
+		// key exactly once (RefreshFromConfig drops any line naming an id this table no longer has), v25
+		// §7 already spent that cost to put parry on this button, and spending it again to make the
+		// string prettier would silently un-rebind everybody who has touched their parry since — for no
+		// behaviour change at all. DisplayName is persisted nowhere and is therefore free to correct.
+		{ ETraceInputAction::Parry,       TEXT("ParryPull"),   TEXT("PARRY"),        &Default_Parry       },
 		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire        },
 		{ ETraceInputAction::Pass,        TEXT("ThrowCore"),   TEXT("THROW / PASS CORE"), &Default_Pass  },
 		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard  },
@@ -186,9 +220,22 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// list IS this table walked in order, so an action missing from here is an action the player
 		// cannot see or rebind however well it is wired up in the controller.
 		{ ETraceInputAction::Reload,           TEXT("Reload"),           TEXT("RELOAD"),            &Default_Reload           },
+		// SPEC v26 §1 — "Make parry and pull core two separate binds in the settings menu."
+		//
+		// THIS LINE IS WHAT PUTS THE PULL ON THE KEYBIND PAGE, and nothing else does. The options
+		// screen's rebind list IS this table walked in order (FTraceOptionsMenu::RebuildRows), so an
+		// action that is not here is an action the player cannot see or rebind however well it is
+		// wired up in the controller. That is the same sentence the EquipKnife, Ability and Reload
+		// rows above already carry, and it is the whole reason each of them exists.
+		//
+		// LAST IN THE LIST, hence last on the page, because ETraceInputAction is append-only (see the
+		// enumerator's comment). PULL CORE sitting under RELOAD rather than next to PARRY is the price
+		// of never renumbering the runtime table, and it is the right trade: the ordering is cosmetic,
+		// a renumber is a live bug.
+		{ ETraceInputAction::PullCore,         TEXT("PullCore"),         TEXT("PULL CORE"),         &Default_PullCore         },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 16,
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 17,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 
@@ -825,13 +872,20 @@ namespace
 			}
 		}
 
+		// A WARNING RATHER THAN A FAILURE SINCE SPEC v26 §1, and only because the fixture arm below now
+		// supplies the discrimination this file could not. Before v26 there was no other source of it,
+		// so "your file cannot tell the two loaders apart" was correctly fatal; now it is a statement
+		// about the machine the command was run on, and failing a verification because the person
+		// running it never rebound anything would be noise. If the fixture arm does not run or is
+		// itself vacuous, this becomes a failure again — see the flag's use below.
+		bool bFileCannotDiscriminate = false;
 		if (PositionalWouldDiffer == 0)
 		{
-			++Failures;
-			UE_LOG(LogTraceGame, Error,
-				TEXT("[VerifyBinds]   VACUOUS: reading this file BY POSITION would have produced the same ")
-				TEXT("bindings as reading it by ConfigId, so it cannot tell a correct loader from a ")
-				TEXT("renumbered one. Use a file whose binds are non-default and out of table order."));
+			bFileCannotDiscriminate = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[VerifyBinds]   this FILE cannot discriminate: reading it BY POSITION would have ")
+				TEXT("produced the same bindings as reading it by ConfigId, because its lines happen to sit ")
+				TEXT("in table order. The v26 s1 fixture arm below supplies the discrimination instead."));
 		}
 		else
 		{
@@ -839,6 +893,136 @@ namespace
 				TEXT("[VerifyBinds]   discriminating: a by-POSITION read of this file would have put %d of %d ")
 				TEXT("action(s) on the wrong key. It did not, which is the claim."),
 				PositionalWouldDiffer, Table.Num());
+		}
+
+		// ---- SPEC v26 §1 — THE APPEND-ONLY PROOF, ON A FIXTURE THIS COMMAND BUILDS ITSELF ----------
+		//
+		// §1 adds ETraceInputAction::PullCore. Appending an enumerator is safe ONLY because the file is
+		// keyed by ConfigId string and never by position, and the guard above can only test that claim
+		// as well as whoever is running it happens to have rebound their keys. On the machine this was
+		// written on it reported VACUOUS — every line sat in table order — so the strongest check in
+		// the command proved nothing about the very change that most needed it.
+		//
+		// So this arm stops depending on the player's file. It writes a fixture whose lines are
+		// deliberately OUT OF TABLE ORDER, onto distinctive keys, including one line for the brand-new
+		// PullCore and one naming an action that no longer exists, then runs the REAL loader
+		// (RefreshFromConfig, the same call Get() makes on first use) over it.
+		//
+		// IN MEMORY ONLY, AND RESTORED. The fixture is written into UTraceUserSettings::KeyBindings —
+		// the member RefreshFromConfig actually parses — and NOT into GConfig. That is a correction,
+		// not a shortcut: the first version of this arm called GConfig->SetArray and every fixture line
+		// came back as the shipped default, because RefreshFromConfig re-parses the MEMBER array that
+		// LoadConfig populated at class load and never re-reads the config cache. Writing the member is
+		// both the thing that works and the thing that cannot touch disk: nothing here calls Save(),
+		// and the original array is put back and re-loaded before the command returns. That matters
+		// more than usual — this can be run mid-match from the console.
+		int32 FixtureDiscriminates = 0;
+		{
+			struct FFixtureLine { const TCHAR* ConfigId; const TCHAR* KeyName; };
+
+			// REVERSED relative to the table, and every key non-default, so a positional loader cannot
+			// accidentally agree. "SwapWeapon" is the dead id spec v15 §5 removed and is here to prove
+			// the drop path still drops rather than shifting everything after it by one.
+			const FFixtureLine Fixture[] =
+			{
+				{ TEXT("PullCore"),         TEXT("Nine")  },   // the new row — LAST in the table, FIRST here
+				{ TEXT("SwapWeapon"),       TEXT("Seven") },   // dead id: must be DROPPED, not shifted
+				{ TEXT("Reload"),           TEXT("Eight") },
+				{ TEXT("AbilitySecondary"), TEXT("Six")   },
+				{ TEXT("ParryPull"),        TEXT("Five")  },
+				{ TEXT("MoveForward"),      TEXT("Four")  },   // row 0 of the table — LAST here
+			};
+
+			TArray<FString> FixtureLines;
+			for (const FFixtureLine& Line : Fixture)
+			{
+				FixtureLines.Add(FString::Printf(TEXT("%s=%s"), Line.ConfigId, Line.KeyName));
+			}
+
+			const TArray<FString> SavedKeyBindings = Settings.KeyBindings;
+			Settings.KeyBindings = FixtureLines;
+			Settings.RefreshFromConfig();
+
+			int32 FixtureFailures = 0;
+
+			for (int32 Line = 0; Line < UE_ARRAY_COUNT(Fixture); ++Line)
+			{
+				const FString Id(Fixture[Line].ConfigId);
+				const FKey Wanted(Fixture[Line].KeyName);
+
+				const int32 Index = Table.IndexOfByPredicate(
+					[&Id](const FTraceInputActionInfo& Info) { return Id.Equals(Info.ConfigId, ESearchCase::IgnoreCase); });
+
+				if (Index == INDEX_NONE)
+				{
+					// The dead id. Nobody may be holding its key — that is what "dropped" means, as
+					// opposed to "shifted onto the neighbour".
+					const bool bNobodyHasIt = Table.IndexOfByPredicate(
+						[&Settings, &Wanted](const FTraceInputActionInfo& Info)
+						{ return Settings.GetKey(Info.Action) == Wanted; }) == INDEX_NONE;
+					if (!bNobodyHasIt)
+					{
+						++FixtureFailures;
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[VerifyBinds]   v26 s1 FIXTURE: the dead id '%s' was not dropped — something ")
+							TEXT("inherited '%s'."), *Id, Fixture[Line].KeyName);
+					}
+					continue;
+				}
+
+				const FKey Actual = Settings.GetKey(static_cast<ETraceInputAction>(Index));
+				if (Actual != Wanted)
+				{
+					++FixtureFailures;
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[VerifyBinds]   v26 s1 FIXTURE: '%s' (%s) asked for '%s' and resolved to '%s'. ")
+						TEXT("Appending PullCore RENUMBERED the table."),
+						*Id, Table[Index].DisplayName, Fixture[Line].KeyName, *Actual.GetFName().ToString());
+				}
+
+				// Would a positional loader have got this line wrong? It must, for at least one line,
+				// or the fixture is as vacuous as the file was.
+				if (Table.IsValidIndex(Line) && Index != Line)
+				{
+					++FixtureDiscriminates;
+				}
+			}
+
+			if (FixtureDiscriminates == 0)
+			{
+				++FixtureFailures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[VerifyBinds]   v26 s1 FIXTURE is VACUOUS: its lines are in table order after all."));
+			}
+
+			Failures += FixtureFailures;
+
+			if (FixtureFailures == 0)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[VerifyBinds]   ok       v26 s1 APPEND-ONLY PROOF: a %d-line out-of-order fixture "
+					     "(PullCore first, MoveForward last, one dead id) loaded through the real "
+					     "RefreshFromConfig and every line landed on the action it NAMES. %d of them would "
+					     "have landed on the wrong action under a by-position read, so this fixture can tell "
+					     "the two loaders apart. The player's file on disk was not touched."),
+					static_cast<int32>(UE_ARRAY_COUNT(Fixture)), FixtureDiscriminates);
+			}
+
+			// Put the player's own lines back and re-load them, so nothing after this command — and in
+			// particular no later Save() by the options screen — can see the fixture.
+			Settings.KeyBindings = SavedKeyBindings;
+			Settings.RefreshFromConfig();
+		}
+
+		// The vacuity guard's verdict, decided once BOTH sources of discrimination have been tried.
+		// Neither one on its own is enough: a file in table order proves nothing, and a fixture that
+		// failed to run leaves the renumber claim untested.
+		if (bFileCannotDiscriminate && FixtureDiscriminates == 0)
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[VerifyBinds]   VACUOUS: neither the player's file nor the v26 s1 fixture could tell a ")
+				TEXT("by-ConfigId loader from a by-position one, so this run says nothing about renumbering."));
 		}
 
 		// The removed action, by name. Stated separately because "SwapWeapon is gone" is the actual

@@ -534,7 +534,9 @@ void UTraceAbilityComponent::OnHalfTime()
 		return;
 	}
 
-	// SPEC §5's ONE AUTOMATIC RESET. Nothing else in the framework writes these two lines.
+	// SPEC §5's AUTOMATIC RESET. The only OTHER writer of these two lines is
+	// ServerResetActivatedCooldown() below, added for spec v26 §6a (Oyster's poison refunds his E);
+	// nothing else in the framework touches them.
 	ActivatedCooldownEndMatchTime = 0.f;
 	PredictedCooldownEndMatchTime = 0.f;
 	AbilityState.Reset();
@@ -547,6 +549,43 @@ void UTraceAbilityComponent::OnHalfTime()
 
 	UE_LOG(LogTraceGame, Log, TEXT("[Ability] HALF TIME reset: %s (%s) — cooldown and transient state cleared."),
 		*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(CharacterId));
+}
+
+void UTraceAbilityComponent::ServerResetActivatedCooldown(const TCHAR* Why)
+{
+	if (!HasAuthorityOwner())
+	{
+		return;
+	}
+
+	// Already ready. Returning early is not just a micro-optimisation: spec v26 §6a fires this once
+	// per poisoned enemy, so one Pickler landing in a crowd calls it four or five times in a frame,
+	// and without this the log line below and the client RPC would go out once per victim.
+	if (ActivatedCooldownEndMatchTime <= 0.f && PredictedCooldownEndMatchTime <= 0.f)
+	{
+		return;
+	}
+
+	const float WasRemaining = FMath::Max(0.f,
+		FMath::Max(ActivatedCooldownEndMatchTime, PredictedCooldownEndMatchTime) - MatchTimeNow());
+
+	ActivatedCooldownEndMatchTime = 0.f;
+	PredictedCooldownEndMatchTime = 0.f;   // the listen server's own HUD, which reads this directly
+
+	// ...and the OWNING CLIENT's copy, which the replicated zero cannot reach: see the header. On a
+	// listen server the owner is local and this executes in place; when the owner is a bot there is
+	// no connection and it is dropped, which is correct — a bot has no HUD to correct.
+	ClientCooldownWasReset(0.f);
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Ability] Cooldown RESET for %s (%s): %s. %.1fs of E were cancelled."),
+		*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(CharacterId),
+		(Why != nullptr) ? Why : TEXT("no reason given"), WasRemaining);
+}
+
+void UTraceAbilityComponent::ClientCooldownWasReset_Implementation(float AuthoritativeCooldownEndMatchTime)
+{
+	PredictedCooldownEndMatchTime = AuthoritativeCooldownEndMatchTime;
 }
 
 // =================================================================================================
@@ -1070,6 +1109,14 @@ void UTraceAbilityComponent::HandleJumpReleased()
 
 void UTraceAbilityComponent::NotifyDashStarted(const FVector& DashDirection)
 {
+	// SPEC v26 §9 — the Dash sound WAS here and is deliberately NOT here any more.
+	//
+	// It moved one level down to UTraceCharacterMovementComponent::BeginDash, the function that calls
+	// this one. Two conditions guard the call to this hook that do not guard the dash itself: the
+	// pawn must own a UTraceAbilityComponent (a characterless practice-range pawn does not) and
+	// TraceAbilityIntegration::IsEnabled() must be true. Both of those are questions about the
+	// ability layer, and "a dash started" is not. Leaving a second call here would double every
+	// dash for the pawns that do reach it, so there is exactly one, and it is at the event.
 	if (AbilitySet != nullptr)
 	{
 		AbilitySet->OnDashStarted(DashDirection);

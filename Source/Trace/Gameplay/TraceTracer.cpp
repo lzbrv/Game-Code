@@ -15,8 +15,10 @@
 #include "Math/UnrealMathUtility.h"
 #include "UObject/ConstructorHelpers.h"
 
+#include "Core/TraceCharacter.h"               // GetViewModelMuzzleViewPoint (spec v26 §4)
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "TraceTypes.h"                        // TraceTeamColor — spec v26 §5, the ONE team palette
 
 namespace
 {
@@ -47,6 +49,38 @@ namespace
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * SPEC v26 §4. The pawn the local viewer is looking OUT OF, if it is one of ours.
+	 *
+	 * GetViewTarget() rather than GetPawn(): the beam is being aligned to what is on this screen, and
+	 * the view target is by definition the thing the screen is drawn from. They are the same object in
+	 * every normal frame; they differ during a spectator or death-cam takeover, which is exactly when
+	 * "my own viewmodel" is the wrong thing to align to.
+	 *
+	 * Named for this file. The jumbo/unity build concatenates translation units, so an anonymous
+	 * namespace here shares a scope with every other .cpp in the same blob and a plain
+	 * GetLocalCharacter() would be a collision waiting to happen (Scripts/check-jumbo-build-collisions.py
+	 * gates on precisely that).
+	 */
+	const ATraceCharacter* GetTracerLocalViewCharacter(const UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			const APlayerController* PC = It->Get();
+			if (PC == nullptr || !PC->IsLocalController())
+			{
+				continue;
+			}
+			return Cast<ATraceCharacter>(PC->GetViewTarget());
+		}
+		return nullptr;
 	}
 } // namespace
 
@@ -201,7 +235,18 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	}
 	const FVector Dir = Delta / Length;
 
-	// --- first person treatment (see the class comment) -----------------------------------------
+	// --- first person start: OUT OF THE BARREL (spec v26 §4, see the class comment) --------------
+	//
+	// Two conditions, in this order, and both are needed:
+	//
+	//   1. IS THIS MY OWN SHOT? Every machine spawns a tracer for every shot in the match. Only the
+	//      one whose origin is essentially at my eye is mine, and only mine may be moved onto my
+	//      viewmodel — relocating somebody else's beam onto my barrel would draw their shot leaving
+	//      my gun.
+	//   2. WHERE IS MY BARREL? Asked of the pawn, which owns the rig and the camera and is the only
+	//      thing that can answer. It says no when there is no viewmodel drawn (third person while
+	//      carrying, dead, a fresh clone with no art), and then the beam simply starts at the true
+	//      origin, exactly as it does on every remote machine.
 	//
 	// The point-blank impact-pop dimming that used to live here is gone with the impact sphere it
 	// protected against. Nothing else in this effect is large, unlit and drawn at the far end of the
@@ -209,24 +254,22 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	FVector BeamStart = From;
 	FVector ViewLocation = FVector::ZeroVector;
 	FRotator ViewRotation = FRotator::ZeroRotator;
-	if (GetLocalView(GetWorld(), ViewLocation, ViewRotation))
+	if (GetLocalView(GetWorld(), ViewLocation, ViewRotation)
+		&& FVector::Dist(ViewLocation, From) < FirstPersonProximityUU)
 	{
-		const double ToEye = FVector::Dist(ViewLocation, From);
-		if (ToEye < FirstPersonProximityUU)
+		const ATraceCharacter* Shooter = GetTracerLocalViewCharacter(GetWorld());
+		FVector MuzzleViewPoint = FVector::ZeroVector;
+		if (Shooter != nullptr && Shooter->GetViewModelMuzzleViewPoint(MuzzleViewPoint))
 		{
-			// Never push the start past the impact: on a shot into a wall 30 uu away the beam would
-			// otherwise invert. Leave at least a quarter of the shot to draw.
-			const double Standoff = FMath::Min(static_cast<double>(FirstPersonStandoffUU), Length * 0.75);
-
-			// Out of the near field, then across into the viewmodel's corner of the screen. The
-			// offset is scaled by how much standoff we actually got, so a short shot into a nearby
-			// wall does not fling the beam sideways past its own impact point.
-			const double OffsetScale = Standoff / static_cast<double>(FirstPersonStandoffUU);
-			const FRotationMatrix ViewAxes(ViewRotation);
-			BeamStart = From
-				+ Dir * Standoff
-				+ ViewAxes.GetScaledAxis(EAxis::Y) * (FirstPersonRightOffsetUU * OffsetScale)
-				- ViewAxes.GetScaledAxis(EAxis::Z) * (FirstPersonDownOffsetUU * OffsetScale);
+			// Measured ALONG THE SHOT, not as a straight distance: a muzzle that is off to one side of
+			// the ray still has plenty of beam left in front of it, and a straight-line test would
+			// reject those. What must not happen is starting at or past the impact, which draws the
+			// beam backwards through the player's own face.
+			const double Remaining = FVector::DotProduct(To - MuzzleViewPoint, Dir);
+			if (Remaining >= MinBeamBeyondMuzzleUU)
+			{
+				BeamStart = MuzzleViewPoint;
+			}
 		}
 	}
 
@@ -435,11 +478,16 @@ namespace
 		const FVector Centre = ViewLocation + Forward * 600.0 + Up * -40.0;
 		const FVector BroadsideA = Centre - Right * 700.0;
 		const FVector BroadsideB = Centre + Right * 700.0;
-		ATraceTracer::Spawn(World, BroadsideA, BroadsideB, FLinearColor(0.05f, 0.75f, 1.00f, 1.f), /*bImpacted=*/true);
+		// SPEC v26 §5 — DERIVED, NOT RETYPED. These two were pasted copies of the pre-v26 team
+		// literals, so the moment TraceTeamColor moved they became the only tracers in the build
+		// still drawn in the old cyan/orange — a test beam that no longer looks like the thing it
+		// exists to test. They now read the one palette function every other consumer reads, and
+		// they follow it wherever it goes next.
+		ATraceTracer::Spawn(World, BroadsideA, BroadsideB, TraceTeamColor(ETraceTeam::Blue), /*bImpacted=*/true);
 
 		// Down the barrel: the real first-person case, including the viewmodel offset.
 		ATraceTracer::Spawn(World, ViewLocation + Forward * 22.0, ViewLocation + Forward * 1400.0,
-			FLinearColor(1.00f, 0.42f, 0.05f, 1.f), /*bImpacted=*/true);
+			TraceTeamColor(ETraceTeam::Orange), /*bImpacted=*/true);
 	}
 
 	void ArmTestBeam(float DurationSeconds)

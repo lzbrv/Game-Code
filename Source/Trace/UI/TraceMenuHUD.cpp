@@ -2,6 +2,7 @@
 
 #include "UI/TraceMenuHUD.h"
 
+#include "Audio/TraceAudio.h"         // spec v26 §9 — ButtonPress, client-side
 #include "Blueprint/UserWidget.h"
 #include "Engine/Canvas.h"
 #include "Engine/Engine.h"
@@ -1315,6 +1316,15 @@ void ATraceMenuHUD::ActivateSelection()
 			TraceMenuStyle::ActivationGraceSeconds);
 		return;
 	}
+
+	// SPEC v26 §9 — "ButtonPress: a menu row is activated", CLIENT SIDE. A menu is by definition
+	// local: there is no server, no pawn and no world position, so this is the 2D call and it never
+	// sends anything.
+	//
+	// AFTER both refusals above, deliberately. A click swallowed by the open-overlay test or by the
+	// title screen's grace window did NOT activate a row, and a click sound on a press that did
+	// nothing is how a player learns to distrust the menu.
+	TraceAudio::PlayLocal2D(this, TraceSoundEvents::ButtonPress);
 
 	switch (Selected)
 	{

@@ -654,15 +654,20 @@ namespace TraceHUDPullRing
 		// a label that stayed up would sit on top of a Core the player is trying to watch.
 		//
 		// THE KEY IS READ FROM THE PLAYER'S OWN BINDINGS, by the same stable-ConfigId lookup the
-		// ability row uses. "ParryPull" is §7's id for the right mouse button — the button gained the
-		// pull as a second verb — so a player who rebinds it is told what they actually bound. A HUD
-		// that hardcoded "RMB" would be lying to the first person who changed it.
+		// ability row uses, so a player who rebinds it is told what they actually bound. A HUD that
+		// hardcoded "RMB" would be lying to the first person who changed it.
+		//
+		// SPEC v26 §1 — THIS RING IS THE PULL, SO IT LOOKS UP THE PULL. It read "ParryPull" until
+		// now, which was correct only while one button carried both verbs. §1 split them: "ParryPull"
+		// is the PARRY's id (kept so a returning player's rebind survives) and the pull is its own
+		// action, "PullCore", defaulting to F. Left alone, the ring said HOLD [RIGHT MOUSE] while the
+		// key that actually pulls was F — the HUD naming a different button from the one that works.
 		if (Progress < 0.f)
 		{
-			FString KeyLabel(TEXT("RIGHT MOUSE"));
+			FString KeyLabel(TEXT("F"));
 			for (const FTraceInputActionInfo& Info : TraceInputActions::All())
 			{
-				if (FCString::Stricmp(Info.ConfigId, TEXT("ParryPull")) == 0)
+				if (FCString::Stricmp(Info.ConfigId, TEXT("PullCore")) == 0)
 				{
 					const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
 					if (BoundKey.IsValid())

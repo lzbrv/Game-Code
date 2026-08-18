@@ -1229,6 +1229,27 @@ public:
 	/** Length of the well-timed window, in seconds, at the end of a slide. */
 	float GetSlideJumpWindowSecondsForAudit() const { return GetSlideJumpWindowSeconds(); }
 
+	/** SPEC v26 §3. Slide-jumps taken in the CURRENT chain. 0 when no chain is running. */
+	int32 GetSlideJumpChainBoostsForAudit() const { return SlideJumpChainBoosts; }
+
+	/**
+	 * SPEC v26 §3. The chain's measured ceiling in uu/s, or 0 while it has not been reached yet.
+	 *
+	 * Published rather than recomputed in the harness for the reason the note above
+	 * GetSlideJumpWindowSpeedBonusForAudit's neighbours gives: an expected value re-derived in a test
+	 * file is a SECOND OPINION about the rule, and this project has had two of those disagree.
+	 */
+	float GetSlideJumpChainCeilingForAudit() const { return SlideJumpChainCeiling; }
+
+	/** SPEC v26 §3. The speed at which a chain is considered spent, for the pawn as it stands now. */
+	float GetSlideJumpChainResetSpeedForAudit() const { return GetSlideJumpChainResetSpeed(); }
+
+	/** SPEC v26 §3. Whether the ceiling is in force, dev A/B arm and designer switch both folded in. */
+	bool IsSlideJumpChainCapEnabledForAudit() const { return IsSlideJumpChainCapEnabled(); }
+
+	/** SPEC v26 §3. Boosts a chain may compound before the ceiling closes, clamped as shipped. */
+	int32 GetSlideJumpChainCapBoostsForAudit() const { return GetSlideJumpChainCapBoosts(); }
+
 	/** Server movement corrections this client has received. Always 0 on an authority. */
 	int32 GetCorrectionCountForAudit() const { return CorrectionCount; }
 
@@ -1419,6 +1440,37 @@ protected:
 	 * never be worth less than missing it.
 	 */
 	float GetSlideJumpWindowZBonus() const;
+
+	// --- SPEC v26 §3 — the chain ceiling ---------------------------------------------------------
+	//
+	// "Add a ceiling to slide jump momentum boosts, so that you can't chain them over and over to go
+	// faster and faster [...] cap it at what the momentum is after you do two consecutive slide
+	// boosts."
+	//
+	// The -20% half of §3 needs no accessor of its own: it is a factor inside
+	// GetSlideJumpWindowSpeedBonus(), so every existing reader (the audit, the V9TUNING report,
+	// Elle's seam, the SLIDEJUMP debug line) reports the shipped number without being told.
+
+	/** False turns the ceiling off entirely and restores v25's uncapped compounding. */
+	bool IsSlideJumpChainCapEnabled() const;
+
+	/**
+	 * How many boosts of a chain are allowed to compound before the ceiling closes. The note's TWO.
+	 *
+	 * Clamped to at least 1 here: a zero would cap a chain at the speed it started with, which is not
+	 * a ceiling on the boost, it is the deletion of the move.
+	 */
+	int32 GetSlideJumpChainCapBoosts() const;
+
+	/**
+	 * The planar speed at or below which the pawn is deemed to have GIVEN THE MOMENTUM BACK, ending
+	 * the current chain. Derived from the pawn's own live GetMaxSpeed(), never from a typed number,
+	 * so a carrier, a knife and every ability speed passive move it with them.
+	 *
+	 * Meaningless while sliding or dashing (the planar speed is then that ability's, not the
+	 * player's), which is why the only caller checks those first.
+	 */
+	float GetSlideJumpChainResetSpeed() const;
 
 	/**
 	 * Seconds until the running slide will end, BY EITHER ROUTE. 0 when no slide is running.
@@ -1745,6 +1797,35 @@ protected:
 	 * Saved-move state for the same reason as the clock beside it.
 	 */
 	uint8 bSlideJumpGraceWellTimed : 1;
+
+	/**
+	 * SPEC v26 §3 — how many slide-jumps the CURRENT CHAIN has taken. 0 means no chain is running.
+	 *
+	 * A chain is a run of slide-jumps taken without ever giving the momentum back. It is ended in
+	 * OnMovementUpdated the moment the pawn is back on its feet at or below
+	 * GetSlideJumpChainResetSpeed(), which is what "consecutive" means: the boosts stop being
+	 * consecutive when there is nothing left to compound.
+	 *
+	 * SAVED-MOVE STATE, for exactly the reason SlideJumpGraceRemaining above is. This counter decides
+	 * whether the ceiling clamps, so a correction that lost it would replay a clamped hop as an
+	 * unclamped one and the two ends would disagree about several hundred uu/s on the most visible
+	 * frame in the kit — the same failure the grace window's capture exists to prevent.
+	 */
+	int32 SlideJumpChainBoosts;
+
+	/**
+	 * SPEC v26 §3 — the ceiling itself, in uu/s: the highest planar launch speed this chain reached
+	 * during its first GetSlideJumpChainCapBoosts() boosts. 0 while no chain is running.
+	 *
+	 * MEASURED, NOT COMPUTED. It is one of the chain's own launches, which is what makes it relative:
+	 * it already contains the boost knobs, the character's passive and the speed the player brought
+	 * into the chain, and it moves when any of those move. A formula (entry x multiplier^2) would be
+	 * wrong here because a slide DECAYS while the player waits for the well-timed window, so the
+	 * speed actually reached after two boosts depends on how long each of their slides ran.
+	 *
+	 * Saved-move state alongside the counter, and for the same reason.
+	 */
+	float SlideJumpChainCeiling;
 
 	/**
 	 * bWantsToSlide as it stood at the END of the previous move, so the air fast-fall can fire on the
@@ -2503,6 +2584,17 @@ public:
 	/** The slide-jump's coyote window and its "this hop is worth the bonus" bit. */
 	float SavedSlideJumpGraceRemaining;
 	uint8 bSavedSlideJumpGraceWellTimed : 1;
+
+	/**
+	 * SPEC v26 §3. The chain counter and the ceiling it measured.
+	 *
+	 * Same argument as the coyote window directly above: these two decide whether DoJump CLAMPS the
+	 * launch speed, so a correction that landed mid-chain and lost them would replay a clamped hop as
+	 * an unclamped one. The disagreement would be several hundred uu/s on the most visible frame in
+	 * the kit — which is precisely the class of rubber-band the rest of this block exists to prevent.
+	 */
+	int32 SavedSlideJumpChainBoosts;
+	float SavedSlideJumpChainCeiling;
 
 	/**
 	 * The ledge grace (spec v5 §7). The six Mantle* companions that used to sit here went with the

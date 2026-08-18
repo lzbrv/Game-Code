@@ -70,13 +70,16 @@ void UTraceAbilitySetOyster::OnEquipped()
 	UE_LOG(LogTraceGame, Log,
 		TEXT("[Oyster] Equipped. jars %.1fs x%d, break %.0f uu | poison %.0f/%.2fs for %.1fs (-%.0f%% speed) in %.0f uu "
 		     "| jar-jump %.0f uu/s within %.0f uu | Pickler %.0f dmg in %.0f uu, pull %.0f uu/s in %.0f uu, cooldown %.0fs "
-		     "[ASSUMPTION: §6 unspecified]"),
+		     "[ASSUMPTION: §6 unspecified] | SPEC v26 §6: the Pickler jar detonates %.2fs after it lands (x%.2f of the "
+		     "pull's own travel time), and ANY poison landing on an enemy resets that %.0fs cooldown to zero."),
 		Settings.OysterJarLifetimeSeconds, Settings.OysterMaxJars, Settings.OysterJarBreakRadiusUU,
 		Settings.OysterPoisonDamagePerTick, Settings.OysterPoisonTickIntervalSeconds,
 		Settings.OysterPoisonDurationSeconds, Settings.OysterPoisonSlowFraction * 100.f, Settings.OysterPoisonRadiusUU,
 		Settings.OysterJarJumpZVelocity, Settings.OysterJarJumpRadiusUU,
 		Settings.OysterPicklerDamage, Settings.OysterPicklerDamageRadiusUU,
 		Settings.OysterPicklerPullSpeed, Settings.OysterPicklerPullRadiusUU,
+		GetActivatedCooldownSeconds(),
+		ATraceOysterJar::GetPicklerDetonateDelaySeconds(), Settings.OysterPicklerDetonateDelayScale,
 		GetActivatedCooldownSeconds());
 }
 
@@ -403,6 +406,12 @@ bool UTraceAbilitySetOyster::DoJarJump(const FVector& FromLocation)
 float UTraceAbilitySetOyster::GetActivatedCooldownSeconds() const
 {
 	// [ASSUMPTION] §6 leaves it unspecified; 20 s to match the others, as a knob.
+	//
+	// SPEC v26 §6a MADE THIS A CEILING RATHER THAN A WAIT. It is still what the framework charges on
+	// activation and still what the card prints — but poisoning any enemy clears it outright, from
+	// UTraceOysterPoisonComponent::ApplyTo. Nothing changes here, and that is deliberate: the refund
+	// is an event that happens to a running cooldown, not a different cooldown length, so the one
+	// number the HUD ring and the card share stays the one number the framework charges.
 	return FMath::Max(0.f, UTraceSettings::Get().OysterPicklerCooldownSeconds);
 }
 
@@ -1948,6 +1957,392 @@ namespace TraceAbilitySetOysterHarness
 		     "260 uu and at the shipped radius, with an enemy standing in the ring between them, and measures how "
 		     "hard each enemy is actually thrown."),
 		FConsoleCommandDelegate::CreateStatic(&RunPicklerPullTest));
+
+	// =============================================================================================
+	// Trace.Oyster.ETest — SPEC v26 §6, BOTH HALVES, RED ARM FIRST
+	// =============================================================================================
+	//
+	//   "Change Oyster's E cooldown to reset everytime he poisons someone. The E jar's should explode
+	//    once the pull animation finishes, rather than waiting for a jump to trigger them."
+	//
+	// TWO FIXTURES, run back to back on each arm, and they are deliberately kept APART because the
+	// obvious single fixture measures neither cleanly:
+	//
+	//   FIXTURE 1 (§6b, the fuse)    A Pickler jar landed with NOBODY within reach of it. That
+	//                                isolation is the whole point. Land a Pickler on top of an enemy
+	//                                and the pre-v26 jar breaks anyway — the victim is dragged inside
+	//                                the 100 uu break radius by the pull — so both arms would go bang
+	//                                and the harness would be measuring the pull, not the fuse. Alone,
+	//                                the old jar has no reason to break at all and the difference is
+	//                                the entire behaviour: does the actor still exist a second later.
+	//
+	//   FIXTURE 2 (§6a, the refund)  E put on its full cooldown, then a DASH jar dropped on an enemy's
+	//                                feet so he breaks it himself. A dash jar rather than a Pickler,
+	//                                because §6a says "everytime he POISONS someone" and not "every
+	//                                time he lands an E" — proving it on the passive jar proves the
+	//                                rule was put where the poison is rather than where the ability is.
+	//
+	// THE FIXTURES PROVE THEMSELVES: fixture 1 refuses to read anything into an arm whose jar never
+	// landed, and fixture 2 refuses to read anything into an arm where the victim was never actually
+	// poisoned. A cooldown that reads zero because no poison ever happened is not a refund.
+
+	struct FEArmResult
+	{
+		bool  bJarLanded = false;
+		bool  bJarAliveAfterFuse = false;
+		float FuseSeconds = 0.f;
+
+		bool  bPoisonLanded = false;
+		float CooldownBefore = 0.f;
+		float CooldownAfter = 0.f;
+	};
+
+	struct FEState
+	{
+		int32 Phase = 0;
+		int32 Arm = 0;                 // 0 = LEGACY (pre-v26), 1 = SHIPPED
+		int32 SettleFrames = 0;
+		double PhaseStartReal = 0.0;
+
+		TWeakObjectPtr<UTraceAbilityComponent> Subject;
+		TWeakObjectPtr<ATraceCharacter> Victim;
+		TWeakObjectPtr<ATraceOysterJar> WatchedJar;
+
+		FVector Anchor = FVector::ZeroVector;
+		FVector FarAnchor = FVector::ZeroVector;    // fixture 1 parks the victim out here
+		FVector NearAnchor = FVector::ZeroVector;   // fixture 2 brings him back in
+		FRotator Facing = FRotator::ZeroRotator;
+
+		FEArmResult Arms[2];
+
+		int32 Passed = 0;
+		int32 Failed = 0;
+
+		void Check(bool bCondition, const FString& What)
+		{
+			if (bCondition) { ++Passed; } else { ++Failed; }
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTERE]   %s  %s"),
+				bCondition ? TEXT("PASS") : TEXT("*** FAIL ***"), *What);
+		}
+	};
+
+	/** However this run ends, the shipped arm is what is left switched on. */
+	void RestoreEArm()
+	{
+		SetIntCVar(TEXT("Trace.Oyster.LegacyE"), 0);
+	}
+
+	void RunETest()
+	{
+		UWorld* WorldPtr = FindAuthoritativeWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[OYSTERE] no authoritative game world — run this on the server."));
+			return;
+		}
+		UnpauseAndReport(WorldPtr, TEXT("OYSTERE"));
+
+		TSharedPtr<FEState> State = MakeShared<FEState>();
+		State->PhaseStartReal = FPlatformTime::Seconds();
+
+		const UTraceSettings& Settings = UTraceSettings::Get();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[OYSTERE] ===== spec v26 §6. Arm 0 = LEGACY (pre-v26: no fuse, no refund) — it MUST fail. "
+			     "Arm 1 = SHIPPED. Pull %.0f uu at %.0f uu/s => %.2fs of travel; fuse x%.2f = %.2fs; jar lifetime "
+			     "%.1fs; break radius %.0f uu; E cooldown %.0fs. ====="),
+			Settings.OysterPicklerPullRadiusUU, Settings.OysterPicklerPullSpeed,
+			(Settings.OysterPicklerPullSpeed > UE_SMALL_NUMBER)
+				? Settings.OysterPicklerPullRadiusUU / Settings.OysterPicklerPullSpeed : 0.f,
+			Settings.OysterPicklerDetonateDelayScale, ATraceOysterJar::GetPicklerDetonateDelaySeconds(),
+			Settings.OysterJarLifetimeSeconds, Settings.OysterJarBreakRadiusUU,
+			Settings.OysterPicklerCooldownSeconds);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[OYSTERE] ABORTED: the world went away."));
+				RestoreEArm();
+				return false;
+			}
+			const double NowReal = FPlatformTime::Seconds();
+
+			// ---- Phase 0: become Oyster ---------------------------------------------------------
+			if (State->Phase == 0)
+			{
+				UTraceAbilityComponent* Human = FindHumanAbilityComponent(TickWorld);
+				if (Human != nullptr && Human->GetCharacterId() != ETraceCharacterId::Oyster)
+				{
+					Human->ServerSetCharacter(ETraceCharacterId::Oyster);
+				}
+				UTraceAbilitySetOyster* Set = (Human != nullptr)
+					? Human->GetAbilitySetAs<UTraceAbilitySetOyster>() : nullptr;
+
+				if (Set == nullptr || Human->GetOwningCharacter() == nullptr)
+				{
+					if ((NowReal - State->PhaseStartReal) > 60.0)
+					{
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[OYSTERE] VERDICT: INVALID — no human player could be made Oyster. Needs a "
+							     "mode-B match with characters enabled, run EARLY before bots claim characters."));
+						RestoreEArm();
+						return false;
+					}
+					return true;
+				}
+
+				State->Subject = Human;
+				State->Phase = 1;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			UTraceAbilityComponent* Comp = State->Subject.Get();
+			UTraceAbilitySetOyster* OysterSet = (Comp != nullptr) ? Comp->GetAbilitySetAs<UTraceAbilitySetOyster>() : nullptr;
+			ATraceCharacter* MyPawn = (Comp != nullptr) ? Comp->GetOwningCharacter() : nullptr;
+			if (OysterSet == nullptr || MyPawn == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[OYSTERE] ABORTED: Oyster went away mid-test."));
+				RestoreEArm();
+				return false;
+			}
+
+			// ---- Phase 1: ground, one enemy, two standing spots ---------------------------------
+			if (State->Phase == 1)
+			{
+				const UTraceCharacterMovementComponent* MoveComp = MyPawn->GetTraceMovement();
+				if (MoveComp == nullptr || !MoveComp->IsMovingOnGround())
+				{
+					if ((NowReal - State->PhaseStartReal) > 12.0)
+					{
+						UE_LOG(LogTraceGame, Error, TEXT("[OYSTERE] VERDICT: INVALID — Oyster never reached the ground."));
+						RestoreEArm();
+						return false;
+					}
+					return true;
+				}
+
+				ATraceCharacter* Found = nullptr;
+				for (TActorIterator<ATraceCharacter> It(TickWorld); It; ++It)
+				{
+					ATraceCharacter* Candidate = *It;
+					if (Candidate == nullptr || Candidate == MyPawn || !Candidate->IsAlive()
+						|| Candidate->IsCarrier() || Candidate->GetTeam() == MyPawn->GetTeam())
+					{
+						continue;   // a carrier is refused by the choke point by design; that is §4, not §6
+					}
+					Found = Candidate;
+					break;
+				}
+
+				if (Found == nullptr)
+				{
+					if ((NowReal - State->PhaseStartReal) > 25.0)
+					{
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[OYSTERE] VERDICT: INVALID — no living non-carrier enemy to poison. Run with bots "
+							     "on the other team."));
+						RestoreEArm();
+						return false;
+					}
+					return true;
+				}
+
+				const FRotator Open = FindOpenFacing(TickWorld, MyPawn);
+				const FVector Out = FRotator(0.f, Open.Yaw, 0.f).Vector();
+
+				State->Victim = Found;
+				State->Anchor = MyPawn->GetActorLocation();
+				State->Facing = Open;
+				// FAR: clear of the poison burst (380 uu) AND of the Pickler's damage radius (420 uu),
+				// so fixture 1's jar genuinely has nobody to interact with. NEAR: well inside the
+				// 100 uu break radius, so fixture 2's victim breaks the dash jar by standing on it.
+				State->FarAnchor  = State->Anchor + Out * 1400.f;
+				State->NearAnchor = State->Anchor + Out * 40.f;
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[OYSTERE] Oyster at %s; victim %s. Fixture 1 parks him 1400 uu out (nothing can reach the "
+					     "jar); fixture 2 stands him 40 uu away, on the jar."),
+					*State->Anchor.ToCompactString(), *GetNameSafe(Found));
+
+				State->Phase = 2;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			ATraceCharacter* VictimPawn = State->Victim.Get();
+			if (VictimPawn == nullptr || !VictimPawn->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[OYSTERE] ABORTED: the victim died or went away mid-test."));
+				RestoreEArm();
+				return false;
+			}
+
+			// ---- Phase 2: arm the switch, stage fixture 1 ---------------------------------------
+			if (State->Phase == 2)
+			{
+				SetIntCVar(TEXT("Trace.Oyster.LegacyE"), (State->Arm == 0) ? 1 : 0);
+				OysterSet->DebugDestroyAllJars();
+				PosePawn(MyPawn, State->Anchor, State->Facing);
+				PosePawn(VictimPawn, State->FarAnchor, State->Facing);
+
+				if (++State->SettleFrames < 6)
+				{
+					return true;   // a bot walks; the pose is re-applied until it stops mattering
+				}
+				State->SettleFrames = 0;
+
+				FEArmResult& Result = State->Arms[State->Arm];
+				Result.FuseSeconds = ATraceOysterJar::GetPicklerDetonateDelaySeconds();
+
+				ATraceOysterJar* JarActor = OysterSet->DebugSpawnJarAt(State->Anchor, /*bPickler*/ true);
+				State->WatchedJar = JarActor;
+				Result.bJarLanded = (JarActor != nullptr) && JarActor->IsGrounded()
+					&& JarActor->HasFiredLandingEffect();
+
+				State->Phase = 3;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 3: wait out the fuse with a wide margin, then look ------------------------
+			if (State->Phase == 3)
+			{
+				PosePawn(VictimPawn, State->FarAnchor, State->Facing);   // he must not wander into it
+
+				FEArmResult& Result = State->Arms[State->Arm];
+				const double Margin = FMath::Max(1.0, static_cast<double>(Result.FuseSeconds) * 3.0);
+				if ((NowReal - State->PhaseStartReal) < Margin)
+				{
+					return true;
+				}
+
+				Result.bJarAliveAfterFuse = State->WatchedJar.IsValid();
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[OYSTERE] arm=%d FIXTURE 1 (the fuse): jar landed and fired its impact %d; %.2fs fuse; "
+					     "%.1fs later the jar actor still exists %d."),
+					State->Arm, Result.bJarLanded ? 1 : 0, Result.FuseSeconds, Margin,
+					Result.bJarAliveAfterFuse ? 1 : 0);
+
+				OysterSet->DebugDestroyAllJars();
+				State->Phase = 4;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 4: stage fixture 2 -------------------------------------------------------
+			if (State->Phase == 4)
+			{
+				PosePawn(MyPawn, State->Anchor, State->Facing);
+				PosePawn(VictimPawn, State->NearAnchor, State->Facing);
+
+				if (++State->SettleFrames < 6)
+				{
+					return true;
+				}
+				State->SettleFrames = 0;
+
+				FEArmResult& Result = State->Arms[State->Arm];
+
+				// The full cooldown, put on directly rather than by pressing E: pressing E would also
+				// throw a jar, and this fixture is about the poison paying the cooldown back, not about
+				// what put it on.
+				Comp->DebugSetActivatedCooldown(FMath::Max(1.f, UTraceSettings::Get().OysterPicklerCooldownSeconds));
+				Result.CooldownBefore = Comp->GetActivatedCooldownRemaining();
+
+				// A DASH jar at the victim's feet. He is an enemy inside the break radius, so his own
+				// next tick breaks it and the poison lands on him.
+				OysterSet->DebugSpawnJarAt(State->NearAnchor, /*bPickler*/ false);
+
+				State->Phase = 5;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 5: measure the refund ----------------------------------------------------
+			if (State->Phase == 5)
+			{
+				PosePawn(VictimPawn, State->NearAnchor, State->Facing);
+
+				if ((NowReal - State->PhaseStartReal) < 0.75)
+				{
+					return true;
+				}
+
+				FEArmResult& Result = State->Arms[State->Arm];
+				Result.bPoisonLanded = (UTraceOysterPoisonComponent::Find(VictimPawn) != nullptr);
+				Result.CooldownAfter = Comp->GetActivatedCooldownRemaining();
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[OYSTERE] arm=%d FIXTURE 2 (the refund): the victim really is poisoned %d; E cooldown "
+					     "%.1fs -> %.1fs."),
+					State->Arm, Result.bPoisonLanded ? 1 : 0, Result.CooldownBefore, Result.CooldownAfter);
+
+				OysterSet->DebugDestroyAllJars();
+				Comp->DebugSetActivatedCooldown(0.f);
+
+				if (State->Arm == 0)
+				{
+					State->Arm = 1;
+					State->Phase = 2;
+					State->PhaseStartReal = NowReal;
+					return true;
+				}
+
+				State->Phase = 6;
+				return true;
+			}
+
+			// ---- Phase 6: verdict ---------------------------------------------------------------
+			RestoreEArm();
+
+			const FEArmResult& Red = State->Arms[0];
+			const FEArmResult& Green = State->Arms[1];
+
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTERE] --- THE FIXTURES PROVING THEMSELVES FIRST"));
+			State->Check(Red.bJarLanded && Green.bJarLanded,
+				TEXT("both arms actually landed a Pickler jar and fired its impact — without that, "
+				     "'the jar is gone' would just mean the throw failed"));
+			State->Check(Red.bPoisonLanded && Green.bPoisonLanded,
+				TEXT("both arms actually poisoned the victim — a cooldown at zero because nothing was "
+				     "poisoned is not a refund"));
+			State->Check(Red.CooldownBefore > 1.f && Green.CooldownBefore > 1.f,
+				FString::Printf(TEXT("both arms started fixture 2 with E genuinely on cooldown (%.1fs, %.1fs)"),
+					Red.CooldownBefore, Green.CooldownBefore));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTERE] --- THE REPRODUCTION: the pre-v26 E"));
+			State->Check(Red.bJarAliveAfterFuse,
+				TEXT("§6b RED: the old Pickler jar was still lying there long after its pull had finished, "
+				     "waiting for a touch or a jump — which is exactly what the section says to stop"));
+			State->Check(Red.CooldownAfter > 1.f,
+				FString::Printf(TEXT("§6a RED: poisoning an enemy refunded the old E nothing (%.1fs still to run)"),
+					Red.CooldownAfter));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTERE] --- THE CHANGE"));
+			State->Check(!Green.bJarAliveAfterFuse,
+				FString::Printf(TEXT("§6b: the same jar in the same spot detonated on its own %.2fs after landing "
+					"and no longer exists"), Green.FuseSeconds));
+			State->Check(Green.CooldownAfter <= 0.f,
+				FString::Printf(TEXT("§6a: the same poison on the same victim reset E from %.1fs to %.1fs"),
+					Green.CooldownBefore, Green.CooldownAfter));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTERE] ===== %d passed, %d failed. ====="),
+				State->Passed, State->Failed);
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTERE] VERDICT: %s"),
+				(State->Failed == 0 && State->Passed > 0) ? TEXT("PASS") : TEXT("*** FAIL ***"));
+			return false;
+		}));
+	}
+
+	FAutoConsoleCommand CmdETest(
+		TEXT("Trace.Oyster.ETest"),
+		TEXT("Dev only, server only. SPEC v26 §6, both halves, red arm first: does the Pickler jar detonate when "
+		     "its pull finishes, and does poisoning an enemy reset E? Runs the pre-v26 behaviour first via "
+		     "Trace.Oyster.LegacyE so the green has something to be green against."),
+		FConsoleCommandDelegate::CreateStatic(&RunETest));
 }
 
 #endif   // !UE_BUILD_SHIPPING

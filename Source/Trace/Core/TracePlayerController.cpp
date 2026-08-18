@@ -4,6 +4,7 @@
 
 #include "Abilities/TraceAbilityComponent.h"                  // spec v14 §5 — the E / V binds
 #include "Abilities/Characters/TraceAbilityInputRelay.h"      // ... and Mace's reactivation routing
+#include "Audio/TraceAudio.h"              // spec v26 §9 — the hitmarker sounds, client-side
 #include "Containers/Ticker.h"             // FTSTicker — the v13 §2 hotkey probe
 #include "Core/TraceCharacter.h"
 #include "Core/TracePlayerState.h"
@@ -501,6 +502,11 @@ bool ATracePlayerController::TryAdoptInputAssets()
 		{ &IA_Ability,          TEXT("IA_Ability"),          EInputActionValueType::Boolean, Highest },
 		{ &IA_AbilitySecondary, TEXT("IA_AbilitySecondary"), EInputActionValueType::Boolean, Highest },
 		{ &IA_Reload,           TEXT("IA_Reload"),           EInputActionValueType::Boolean, Highest },
+		// SPEC v26 §1 — the Core pull's own action. Scripts/generate-input-assets.py writes it; a
+		// checkout whose /Game/Trace/Input predates v26 is MISSING it, and that is handled the way
+		// every other incomplete set is: TryAdoptInputAssets rejects the whole set and the C++
+		// fallback runs, so the game plays identically until the assets are regenerated.
+		{ &IA_PullCore,         TEXT("IA_PullCore"),         EInputActionValueType::Boolean, Highest },
 	};
 
 	// Resolve everything into a scratch list FIRST. Nothing is written to a member until the whole
@@ -630,6 +636,9 @@ void ATracePlayerController::ConstructInputDataInCode()
 		IA_AbilitySecondary = MakeAction(TEXT("IA_AbilitySecondary"), EInputActionValueType::Boolean);
 		// SPEC v16 §1 — "R to reload". Boolean like every other button here.
 		IA_Reload           = MakeAction(TEXT("IA_Reload"),           EInputActionValueType::Boolean);
+		// SPEC v26 §1 — the Core pull, now its own bind. Boolean like every other button here, and a
+		// SEPARATE action from IA_Parry on purpose: two actions is what produces two rebindable rows.
+		IA_PullCore         = MakeAction(TEXT("IA_PullCore"),         EInputActionValueType::Boolean);
 
 		// Cumulative accumulation is REQUIRED for opposing keys to cancel. UInputAction defaults to
 		// TakeHighestAbsoluteValue, and UEnhancedPlayerInput::ProcessActionMappingEvent merges with
@@ -643,7 +652,7 @@ void ATracePlayerController::ConstructInputDataInCode()
 	bUsingInputAssets = false;
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[%s] Enhanced Input CONSTRUCTED IN C++ (14 actions + IMC_Trace). This is the fallback ")
+		TEXT("[%s] Enhanced Input CONSTRUCTED IN C++ (15 actions + IMC_Trace). This is the fallback ")
 		TEXT("path and it is fully supported — behaviour is identical to the asset path."),
 		*GetName());
 }
@@ -763,6 +772,16 @@ void ATracePlayerController::ApplyControlSettings()
 	// deliberately UNBOUND gets no mapping at all rather than a dead one. The clip still reloads
 	// itself when it empties; unbinding R costs the manual reload only.
 	MapButton(IA_Reload,           KeyFor(ETraceInputAction::Reload));
+	// SPEC v26 §1 — "Make parry and pull core two separate binds in the settings menu." Its own row in
+	// the action table, its own key (default F), its own mapping. Two mappings on ONE action would
+	// have been the shortcut and it is not the item: the keybind page lists ACTIONS, so a second key
+	// on IA_Parry would be a bind the player could neither see nor change independently.
+	//
+	// NOTHING HERE FORBIDS THE TWO SHARING A KEY. UTraceUserSettings::SetKey steals a key from
+	// whoever else held it, so the options screen cannot produce that state — but a hand-edited
+	// TraceUserSettings.ini can, and this maps whatever the table says either way. The tiebreak for
+	// that case lives in OnParryStarted; see the note there.
+	MapButton(IA_PullCore,         KeyFor(ETraceInputAction::PullCore));
 
 	// The context is already registered by the time a settings change arrives, and Enhanced Input
 	// caches the resolved key->action table. Without this the new bindings sit in the context and
@@ -907,6 +926,14 @@ void ATracePlayerController::SetupInputComponent()
 	EIC->BindAction(IA_Parry, ETriggerEvent::Started,   this, &ATracePlayerController::OnParryStarted);
 	EIC->BindAction(IA_Parry, ETriggerEvent::Completed, this, &ATracePlayerController::OnParryCompleted);
 	EIC->BindAction(IA_Parry, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnParryCompleted);
+
+	// SPEC v26 §1 — the Core pull, on its own bind at last. A HOLD, so it gets the full
+	// Started/Completed/Canceled shape for the reason IA_Pass documents: spec v25 §2's rule is
+	// "releasing cancels", and a release edge that never arrives leaves a pull ring filling on the
+	// server behind a pause menu or a lost window focus.
+	EIC->BindAction(IA_PullCore, ETriggerEvent::Started,   this, &ATracePlayerController::OnPullCoreStarted);
+	EIC->BindAction(IA_PullCore, ETriggerEvent::Completed, this, &ATracePlayerController::OnPullCoreCompleted);
+	EIC->BindAction(IA_PullCore, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnPullCoreCompleted);
 
 	// Spec v13 §2, direct select — and, since spec v15 §5 deleted IA_SwapWeapon, the only weapon
 	// binds there are. PRESS EDGE ONLY. Every other button in this class binds Completed and
@@ -1265,6 +1292,12 @@ void ATracePlayerController::RedeliverHeldPressEdges()
 	if (IsHeld(ETraceInputAction::Fire))            { OnFireStarted();             ++Redelivered; }
 	if (IsHeld(ETraceInputAction::Pass))            { OnPassStarted();             ++Redelivered; }
 	if (IsHeld(ETraceInputAction::Parry))           { OnParryStarted();            ++Redelivered; }
+	// SPEC v26 §1. THE PULL IS HOLD-SHAPED AND THEREFORE BELONGS IN THIS LIST — it is the clearest
+	// case of the whole mechanism: the player is holding a key over a turned-over Core, opens the
+	// pause menu, closes it, and without this their finger is on the button while the server thinks
+	// they let go. (Before v26 it rode the Parry row above; splitting the actions splits the
+	// re-delivery too, or the new bind would be the one control a menu could silently eat.)
+	if (IsHeld(ETraceInputAction::PullCore))        { OnPullCoreStarted();         ++Redelivered; }
 	if (IsHeld(ETraceInputAction::AbilitySecondary)){ OnAbilitySecondaryStarted(); ++Redelivered; }
 	if (IsHeld(ETraceInputAction::Scoreboard))      { OnScoreboardStarted();       ++Redelivered; }
 
@@ -1632,35 +1665,129 @@ void ATracePlayerController::OnParryStarted()
 	{
 		TraceChar->DoParryPressed();
 
-		// *** SPEC v25 §7 + §2 — THE SAME PRESS IS ALSO THE TURNOVER CORE-PULL. ***
+		// =========================================================================================
+		// SPEC v26 §1 — THE PRECEDENCE RULE, DEMOTED TO A TIEBREAK.
+		// =========================================================================================
 		//
-		// Both verbs, every time, in one order that is NOT a priority: see the long note on
-		// EPullBinding in TracePlayerControllerInput above. Parry refuses unless you are carrying,
-		// the pull refuses unless you are not, so at most one of these two lines can do anything and
-		// swapping them changes nothing. Writing the parry first only preserves the older path's
-		// exact timing for the case that has shipped for twenty demos.
+		// "Make parry and pull core two separate binds in the settings menu [...] keep the precedence
+		// rule only as a tiebreak if a player binds them to the same key on purpose."
 		//
-		// The dispatch is a no-op until §2's gameplay half lands; Trace.Input.VerifyRightMouse says
-		// so out loud rather than letting it be discovered in a playtest.
-		TracePlayerControllerInput::PullPressed(TraceChar, 0);
+		// v25 §7 + §2 put both verbs on right mouse and dispatched BOTH from this handler, every
+		// press, on the argument that their gates are exact opposites on "am I carrying the Core" and
+		// so at most one could ever accept. That argument has not stopped being true — it is just no
+		// longer needed, because the pull has its own action and its own handler
+		// (OnPullCoreStarted) and its own default key.
+		//
+		// SO THIS LINE IS NOW CONDITIONAL, AND THE CONDITION IS THE ONLY THING v26 CHANGES HERE. When
+		// the two actions resolve to DIFFERENT keys — the shipped state — the parry handler does the
+		// parry and nothing else. When a player has deliberately put both on one key, the old
+		// behaviour is restored exactly: one press, both verbs, the gates decide.
+		//
+		// WHY THE CONDITION IS NEEDED AT ALL, given that Enhanced Input maps the two actions
+		// independently and would fire both handlers off one shared key anyway. Because relying on
+		// that would be relying on UInputAction::bConsumeInput's cross-context consumption semantics
+		// to stay the way they are, for a case that only exists because a player hand-edited an .ini.
+		// The explicit test is three lines, is a local fact this file owns, and cannot be changed by
+		// an engine upgrade. DispatchCorePull de-duplicates by frame, so a build where BOTH the
+		// shared-key handlers fire still sends exactly one press.
+		if (DoParryAndPullShareAKey())
+		{
+			DispatchCorePull(/*bPressed=*/true);
+		}
 	}
 }
 
 void ATracePlayerController::OnParryCompleted()
 {
-	// Intentionally not gated on bGameInputSuppressed. The PARRY half has no held state to release —
-	// the window is a fixed duration owned by the trail component — but spec v25 §2's CORE-PULL,
-	// which shares this button, is a hold, and "releasing RMB cancels" is one of its stated rules.
-	//
-	// GetPawn rather than GetLivingCharacter, and no suppression gate, for the reason OnPassCompleted
-	// spells out: a release that is dropped leaves the server-side hold latched. Opening the pause
-	// menu mid-pull suppresses input; dying mid-pull makes the pawn non-living. Those are exactly the
-	// two cases where the cancel must still be delivered.
+	// Intentionally not gated on bGameInputSuppressed, and GetPawn rather than GetLivingCharacter, for
+	// the reason OnPassCompleted spells out: a release that is dropped leaves the server-side hold
+	// latched. The PARRY half has no held state to release — the window is a fixed duration owned by
+	// the trail component — but the shared-key case below is a hold and must still be cancelled.
 	if (ATraceCharacter* TraceChar = GetPawn<ATraceCharacter>())
 	{
 		TraceChar->DoParryReleased();
+
+		// SPEC v26 §1. The tiebreak's release half. Same condition as the press, and it MUST be the
+		// same condition: a release delivered on a key the press was never delivered on is harmless,
+		// but a press delivered without its release is a latched hold, so the asymmetry that matters
+		// is the one this avoids.
+		if (DoParryAndPullShareAKey())
+		{
+			DispatchCorePull(/*bPressed=*/false);
+		}
+	}
+}
+
+// =================================================================================================
+// SPEC v26 §1 — THE CORE PULL'S OWN BIND
+// =================================================================================================
+
+bool ATracePlayerController::DoParryAndPullShareAKey() const
+{
+	const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+	const FKey ParryKey = UserSettings.GetKey(ETraceInputAction::Parry);
+	const FKey PullKey  = UserSettings.GetKey(ETraceInputAction::PullCore);
+
+	// Both must be REAL keys. Two unbound actions are both FKey() and would compare equal, which
+	// would silently turn the parry handler into a pull dispatcher for a player who had unbound both.
+	return ParryKey.IsValid() && PullKey.IsValid() && ParryKey == PullKey;
+}
+
+void ATracePlayerController::DispatchCorePull(bool bPressed)
+{
+	// ONE DISPATCH PER FRAME PER EDGE. Two call sites can reach this on the same frame — IA_PullCore's
+	// own handler, and OnParryStarted's shared-key tiebreak — and on a client each dispatch is a
+	// separate ServerSetPullInput RPC. The server's latch is a set-membership test and would absorb
+	// the duplicate, but "it works because something downstream ignores it" is exactly the shape of
+	// binding this file refuses elsewhere (see the equip binds' press-edge-only note).
+	//
+	// GFrameCounter and not a world time: this is a de-duplication of two synchronous calls inside one
+	// frame's input processing, so the frame IS the right unit, and it needs no world.
+	uint64& Stamp = bPressed ? LastPullPressFrame : LastPullReleaseFrame;
+	if (Stamp == GFrameCounter && GFrameCounter != 0)
+	{
+		return;
+	}
+	Stamp = GFrameCounter;
+
+	// The PRESS is a request and is refused while gameplay input is suppressed. The RELEASE is a
+	// cancel and is delivered unconditionally, through GetPawn rather than GetLivingCharacter — the
+	// asymmetry OnPassCompleted argues for at length, and it bites hardest here: opening the pause
+	// menu mid-pull suppresses input, dying mid-pull makes the pawn non-living, and both are cases
+	// where a dropped release leaves a ring filling on the server with nobody holding the button.
+	if (bPressed)
+	{
+		if (bGameInputSuppressed)
+		{
+			return;
+		}
+
+		if (ATraceCharacter* TraceChar = GetLivingCharacter())
+		{
+			++DebugPullPressCount;
+			if (InputLogLevel() >= 1)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("INPUT Pull Core pressed #%d"), DebugPullPressCount);
+			}
+			TracePlayerControllerInput::PullPressed(TraceChar, 0);
+		}
+		return;
+	}
+
+	if (ATraceCharacter* TraceChar = GetPawn<ATraceCharacter>())
+	{
 		TracePlayerControllerInput::PullReleased(TraceChar, 0);
 	}
+}
+
+void ATracePlayerController::OnPullCoreStarted()
+{
+	DispatchCorePull(/*bPressed=*/true);
+}
+
+void ATracePlayerController::OnPullCoreCompleted()
+{
+	DispatchCorePull(/*bPressed=*/false);
 }
 
 void ATracePlayerController::OnEquipKnifeStarted()
@@ -2008,6 +2135,7 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 	LogAction(TEXT("IA_EquipKnife"), IA_EquipKnife);
 	LogAction(TEXT("IA_EquipGun  "), IA_EquipGun);
 	LogAction(TEXT("IA_Reload    "), IA_Reload);
+	LogAction(TEXT("IA_PullCore  "), IA_PullCore);
 
 	// The player's own settings are now part of "why does input feel wrong", so they belong in the
 	// same dump. A hand-edited or half-migrated TraceUserSettings.ini is otherwise invisible.
@@ -2228,6 +2356,11 @@ namespace TracePlayerControllerInput
 			{ TEXT("IA_Ability"),          EInputActionValueType::Boolean, Highest },
 			{ TEXT("IA_AbilitySecondary"), EInputActionValueType::Boolean, Highest },
 			{ TEXT("IA_Reload"),           EInputActionValueType::Boolean, Highest },
+			// SPEC v26 §1 — the Core pull's own action. A checkout whose /Game/Trace/Input predates
+			// v26 fails this row, which is the whole point: it says "re-run
+			// Scripts/generate-input-assets.py" rather than letting the new bind be silently absent
+			// from the assets while the C++ fallback quietly carries it.
+			{ TEXT("IA_PullCore"),         EInputActionValueType::Boolean, Highest },
 		};
 
 		int32 Failures = 0;
@@ -2307,6 +2440,10 @@ namespace TracePlayerControllerInput
 			{ TEXT("IA_Ability"),          ETraceInputAction::Ability,          FKey(),         0 },
 			{ TEXT("IA_AbilitySecondary"), ETraceInputAction::AbilitySecondary, FKey(),         0 },
 			{ TEXT("IA_Reload"),           ETraceInputAction::Reload,           FKey(),         0 },
+			// SPEC v26 §1 — the Core pull's own mapping. Its expected key is read live from
+			// TraceInputActions::Info(PullCore).DefaultKey() like every row above, so changing the
+			// default is one edit in the action table and never two.
+			{ TEXT("IA_PullCore"),         ETraceInputAction::PullCore,         FKey(),         0 },
 		};
 
 		const int32 ExpectedMappingCount = static_cast<int32>(UE_ARRAY_COUNT(ExpectedMappings));
@@ -2451,7 +2588,8 @@ namespace TracePlayerControllerInput
 		const FKey RMB = EKeys::RightMouseButton;
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[RightMouse] ===== spec v25 s7: right mouse is PARRY (and s2's pull), never the throw ====="));
+			TEXT("[RightMouse] ===== spec v25 s7 + v26 s1: right mouse is the PARRY, never the throw, and the ")
+			TEXT("CORE-PULL is now its own separate bind ====="));
 
 		int32 Failures = 0;
 
@@ -2502,7 +2640,13 @@ namespace TracePlayerControllerInput
 		int32 OtherHolders = 0;
 		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
 		{
-			if (Info.Action == ETraceInputAction::Parry || Settings.GetKey(Info.Action) != RMB)
+			// PullCore is exempt, and only because the block above already reported it. Spec v26 §1
+			// makes sharing the button a supported (if non-default) state with a stated tiebreak, so
+			// counting it here as well would print the same fact twice — once as a warning and once as
+			// an error — and would fail a build for a configuration the design explicitly allows.
+			if (Info.Action == ETraceInputAction::Parry
+				|| Info.Action == ETraceInputAction::PullCore
+				|| Settings.GetKey(Info.Action) != RMB)
 			{
 				continue;
 			}
@@ -2518,6 +2662,65 @@ namespace TracePlayerControllerInput
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[RightMouse]   ok       no other action holds the right mouse button (%d checked)."),
 				TraceInputActions::All().Num());
+		}
+
+		// ---- 1b. SPEC v26 §1 — ARE PARRY AND PULL ACTUALLY TWO BINDS? ---------------------------
+		//
+		// "Make parry and pull core two separate binds in the settings menu." Three things have to be
+		// true for that sentence to have landed, and all three are read out of the LIVE settings —
+		// the same table ApplyControlSettings maps from — rather than out of the defaults, so a
+		// hand-edited .ini that has re-merged them FAILS here instead of being discovered in a match.
+		{
+			const FKey PullKey = Settings.GetKey(ETraceInputAction::PullCore);
+			const int32 PullRow = TraceInputActions::All().IndexOfByPredicate(
+				[](const FTraceInputActionInfo& Info) { return Info.Action == ETraceInputAction::PullCore; });
+
+			// (i) the pull has a row at all — which is also what puts it on the keybind page, since
+			//     the options screen's rebind list IS this table walked in order.
+			if (PullRow == INDEX_NONE)
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[RightMouse]   WRONG    there is no PULL CORE row in the action table, so spec v26 s1's ")
+					TEXT("second bind cannot appear on the keybind page at all."));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[RightMouse]   ok       PULL CORE ('%s', row %d of %d) is on the keybind page and resolves to %s"),
+					TraceInputActions::Info(ETraceInputAction::PullCore).ConfigId, PullRow + 1,
+					TraceInputActions::All().Num(), *UTraceUserSettings::DescribeKey(PullKey));
+			}
+
+			// (ii) it is BOUND. An unbound pull is a legal state a player may choose, but it is not the
+			//      shipped one, and shipping it unbound would be the item silently not landing.
+			if (!PullKey.IsValid())
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[RightMouse]   WRONG    PULL CORE is UNBOUND. Spec v26 s1 asks for a distinct action AND a ")
+					TEXT("default; F is the shipped one."));
+			}
+
+			// (iii) the two are on DIFFERENT keys. Sharing one is legal and handled — OnParryStarted
+			//       keeps v25's precedence rule as a tiebreak for exactly that — but it is not two
+			//       binds, so it is reported as the deliberate act it must have been rather than
+			//       passed over in silence.
+			if (PullKey.IsValid() && PullKey == ParryKey)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[RightMouse]   SHARED   PARRY and PULL CORE are both on %s. This is a supported state and ")
+					TEXT("the v25 s2 precedence rule is applied as a TIEBREAK (one press, both verbs, the ")
+					TEXT("authoritative gates decide) - but it is NOT the shipped two-bind default, so it can only ")
+					TEXT("have come from a hand-edited TraceUserSettings.ini."),
+					*UTraceUserSettings::DescribeKey(PullKey));
+			}
+			else if (PullKey.IsValid())
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[RightMouse]   ok       PARRY (%s) and PULL CORE (%s) are TWO SEPARATE BINDS - spec v26 s1."),
+					*UTraceUserSettings::DescribeKey(ParryKey), *UTraceUserSettings::DescribeKey(PullKey));
+			}
 		}
 
 		// ---- 2. is the s2 pull actually wired? --------------------------------------------------
@@ -2589,13 +2792,18 @@ namespace TracePlayerControllerInput
 			}
 		}
 
+// SPEC v26 §1 CHANGED WHAT A PASS MEANS HERE. It used to be "right mouse is parry AND the pull";
+// the pull now has its own bind, so the claim is that right mouse is the PARRY ALONE, the throw is
+// still off it, and the pull is somewhere else and wired. The pull's key is printed rather than
+// asserted to be F, because the player is allowed to rebind it and this command reads the live table.
 #define TRACE_RIGHTMOUSE_VERDICT_ARGS \
-	(Failures == 0) ? TEXT("RIGHT MOUSE IS PARRY + PULL AND NOTHING ELSE") : TEXT("THE RIGHT MOUSE BUTTON IS WRONG"), \
+	(Failures == 0) ? TEXT("RIGHT MOUSE IS THE PARRY, AND THE PULL IS ITS OWN BIND") : TEXT("THE RIGHT MOUSE BUTTON IS WRONG"), \
 	*UTraceUserSettings::DescribeKey(ParryKey), *UTraceUserSettings::DescribeKey(ThrowKey), \
+	*UTraceUserSettings::DescribeKey(Settings.GetKey(ETraceInputAction::PullCore)), \
 	LexPullBinding(Binding), Failures
 
 #define TRACE_RIGHTMOUSE_VERDICT_TEXT \
-	TEXT("[RightMouse] VERDICT: %s. parry='%s' throw='%s' pull=%s, %d failure(s).")
+	TEXT("[RightMouse] VERDICT: %s. parry='%s' throw='%s' pullKey='%s' pull=%s, %d failure(s).")
 
 		if (Failures == 0)
 		{
@@ -2638,6 +2846,18 @@ void ATracePlayerController::ClientNotifyHit_Implementation(bool bKilled, ETrace
 	}
 	bLastHitMarkerWasKill = bKilled;
 	LastHitMarkerZone = Zone;
+
+	// SPEC v26 §9 — Bodyshot / Headshot, client-side, and this is the one place they can be.
+	//
+	// NO NEW RPC IS ADDED. ClientNotifyHit is the EXISTING server->shooter confirmation and it runs
+	// only on the shooter's own machine, which is exactly what "played locally, no RPC" means: the
+	// wire traffic that carries the fact already exists and the sound rides the same frame as the
+	// hitmarker the player sees. Putting it on the server's resolver instead would either be silent
+	// for the shooter or need a second RPC.
+	//
+	// TraceAudio::Play's client-side gate still runs: `this` is a local APlayerController on the
+	// shooter's machine and nowhere else, so a listen-server host does not hear its bots' hits.
+	TraceAudio::Play(this, (Zone == ETraceHitZone::Head) ? TraceSoundEvents::Headshot : TraceSoundEvents::Bodyshot);
 
 	// End-to-end proof for the harness: the server only ever sends this after ServerFire ran the
 	// lag-compensated resolver and found one of our bullets on somebody. It cannot be produced by

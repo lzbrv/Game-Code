@@ -41,6 +41,39 @@
 //      1D blend space cannot show a strafe.
 //
 //
+// --- WHY THE HANDS ARE NOT EPIC'S MANNEQUIN (Demo 23 / spec v26 §8) --------------------------
+//
+// Asked for verbatim: "Change the hands used in the first person view to the default unreal engine
+// mannequin hands and animations, and socket the gun we modeled in". It was NOT done, deliberately,
+// and this is the record so nobody re-attempts it blind.
+//
+// THERE IS NO FIRST-PERSON ARMS MESH IN UE 5.8. Searched the imported set AND the whole engine:
+// /Game/Characters/Mannequins carries exactly three skeletal meshes — SK_Mannequin,
+// SKM_Manny_Simple, SKM_Quinn_Simple — and all three are FULL BODIES. The only hand-shaped meshes
+// Epic ships are SK_Hand (a CollaborativeViewer VR pointer) and SKM_MannyXR_left/right (motion
+// controller hands, different skeleton, no FPS animations, not imported).
+//
+// The SOCKET half is easy and available: SK_Mannequin carries hand_l/hand_r, weapon_l/weapon_r,
+// weapon_r_muzzle and ik_hand_gun, all attachable by name. It is the ARMS that do not exist.
+//
+// EPIC'S OWN ANSWER NEEDS ASSETS WE DO NOT IMPORT. The UE 5.8 First Person template re-uses the
+// FULL SKM_Manny_Simple as a second "FirstPersonMesh" component driven by ABP_FP_Copy +
+// CtrlRig_FPWarp, which copy the pose off the third-person mesh and warp it toward the camera.
+// Those live in /Game/FirstPerson/Anims/, which Scripts/import-mannequin.sh does not fetch, and the
+// shooter variant's ABP_FP_Weapon additionally hard-references the template's Blueprint pawn
+// classes (BP_FirstPersonCharacter, BP_ShooterCharacter) rather than just a mesh.
+//
+// ABP_Unarmed CANNOT STAND IN. It swings the arms at the sides, so a railgun socketed to weapon_r
+// rides at the hip with no hand in frame — the broken rig that is worse than not doing it.
+//
+// SO THE REAL CHOICE IS ONE OF THESE, and all three are bigger than one patch:
+//   1. Extend Scripts/import-mannequin.sh to fetch the FirstPerson template too. Note its /Game/Input
+//      assets would collide with this project's own input assets, so that import needs filtering.
+//   2. Hand-author a first-person arm rig and anim graph in C++.
+//   3. Buy or model an arms mesh.
+//
+// The procedural cube rig below remains the first-person view until one of those happens.
+//
 // --- THE FIRST-PERSON VIEWMODEL --------------------------------------------------------------
 //
 // A first-person shooter with no gun in frame is the single most visible thing this build was
@@ -497,6 +530,36 @@ public:
 	/** Unit aim direction, corrected so the shot converges on what the crosshair covers. */
 	FVector GetAimDirection() const;
 
+	/**
+	 * SPEC v26 §4 — where the VIEWMODEL's muzzle is DRAWN, in world space, for the local viewer.
+	 *
+	 * NOT GetMuzzleLocation(), AND IT MUST NEVER BE CONFUSED WITH IT. GetMuzzleLocation() is the shot
+	 * ORIGIN for hit resolution: camera-derived, on the aim ray, evaluated on the server as well as the
+	 * client, and deliberately unaffected by anything in this file's rig. This function is purely
+	 * cosmetic and exists for one caller — ATraceTracer, which needs the beam to start at the barrel
+	 * the player can see instead of at a hand-tuned screen offset.
+	 *
+	 * WHY IT IS NOT SIMPLY ViewModelMuzzle->GetComponentLocation(). The viewmodel is tagged
+	 * EFirstPersonPrimitiveType::FirstPerson, so the renderer does NOT draw it at its own world
+	 * transform: it re-projects it through the camera's FirstPersonFieldOfView and squashes its depth
+	 * by FirstPersonScale. A world-space beam started at the component's raw location would therefore
+	 * land roughly 30% too close to the crosshair — visibly beside the barrel rather than out of it.
+	 * FMinimalViewInfo::TransformWorldToFirstPerson() is the engine's own mirror of that GPU morph and
+	 * is what this applies, so the answer tracks the camera's live FOV (the VIDEO page's slider moves
+	 * it) with no constant of ours in the arithmetic.
+	 *
+	 * @return false whenever there is nothing meaningful to answer — no viewmodel built, the rig
+	 *         hidden (third person, dead), no camera, or a dedicated server. Callers must fall back.
+	 */
+	bool GetViewModelMuzzleViewPoint(FVector& OutWorldLocation) const;
+
+	/**
+	 * Verification only. The raw, un-morphed world transform of the muzzle marker — i.e. where the
+	 * component actually is, before the first-person re-projection above. Trace.DebugViewProbe prints
+	 * both so the two can be told apart when the beam looks wrong.
+	 */
+	bool DebugGetViewModelMuzzleRaw(FVector& OutWorldLocation) const;
+
 	UFUNCTION()
 	void OnRep_IsCarrier();
 
@@ -844,6 +907,22 @@ private:
 	/** Every part of the viewmodel, so visibility is one loop and the parts cannot be orphaned. */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UStaticMeshComponent>> ViewModelParts;
+
+	/**
+	 * SPEC v26 §4. An empty scene component parked ON the barrel's exit, so "where does the beam start"
+	 * has an ANSWER IN THE SCENE GRAPH rather than a constant somewhere that has to be re-tuned every
+	 * time the gun moves.
+	 *
+	 * It is a CHILD OF THE GUN, not of the rig: attached to RailgunBodyPart at the mesh's own
+	 * (107.4, 0, 4.5) cm muzzle landmark when the railgun art resolved, and to ViewModelRoot at the
+	 * fallback cube gun's muzzle otherwise. Being a child of the body mesh is the whole point — the
+	 * body carries the per-shot recoil (UpdateRailgunFire moves it back and pitches it up), the rig
+	 * carries the sway/bob/crouch dip, and a marker underneath both inherits every one of them for
+	 * free. Nothing here needs updating when any of those are retuned, and if the gun is ever socketed
+	 * onto an animated hand the marker rides that too.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<USceneComponent> ViewModelMuzzle;
 
 	bool bViewModelBuilt = false;
 	bool bViewModelVisible = false;

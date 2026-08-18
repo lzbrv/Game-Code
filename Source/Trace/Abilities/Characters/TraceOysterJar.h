@@ -21,6 +21,24 @@
 // the way to becoming an ordinary jar, and it fires exactly once.
 //
 // ===================================================================================================
+// *** SPEC v26 §6b OVERTURNS THE CLARIFICATION ABOVE, FOR THE PICKLER JAR AND ONLY THE PICKLER JAR ***
+// ===================================================================================================
+//
+//   "The E jar's should explode once the pull animation finishes, rather than waiting for a jump to
+//    trigger them."
+//
+// The older sentence — "the jar does not explode upon landing, it is the same as his other jars" — is
+// left standing above rather than deleted, because it is still the reason THIS CLASS is one actor with
+// a flag instead of two classes, and because a reader who finds the v14 doc needs to know it was
+// considered and superseded. What changed is only how a Pickler jar ENDS: it now lands, fires its
+// impact, waits out the pull (GetPicklerDetonateDelaySeconds — derived from the pull, not typed), and
+// then breaks itself, which fires the same Burst() an enemy's touch would have. It is still a normal
+// jar for that window: touchable, breakable, jumpable, counted against the max of 3.
+//
+// HIS DASH JARS ARE COMPLETELY UNTOUCHED. They still lie there for their 4 s waiting for an enemy or a
+// jump. §6b says "the E jar", singular, and the passive jars are the whole of his passive.
+//
+// ===================================================================================================
 // EVERY EFFECT IN THIS FILE GOES THROUGH THE CHOKE POINT
 // ===================================================================================================
 //
@@ -71,6 +89,19 @@ namespace TraceOysterJar
 	 * NEVER SHIP 1.
 	 */
 	TRACE_API bool IsLegacyThrow();
+
+	/**
+	 * SPEC v26 §6 TEST ARM. True while Trace.Oyster.LegacyE is 1, which restores BOTH of the
+	 * pre-v26 behaviours §6 replaces: the Pickler jar gets no fuse and lies there waiting to be
+	 * broken, and poisoning an enemy refunds nothing. It exists so Trace.Oyster.ETest can be shown
+	 * FAILING in the same process, in the same match, on the same fixtures it later passes on — a
+	 * green that never saw the old behaviour is not evidence. NEVER SHIP 1.
+	 *
+	 * Read by ATraceOysterJar::Land (the fuse) and by TraceOysterPoisonFile::RefundPicklerForPoisoning
+	 * (the refund). Those are the only two places §6 changed anything, which is why one switch covers
+	 * both halves of it.
+	 */
+	TRACE_API bool IsLegacyE();
 }
 
 UCLASS()
@@ -102,6 +133,23 @@ public:
 
 	/** The sphere the flight is swept with, and the radius a release point has to be clear by. */
 	static float GetJarCollisionRadiusUU() { return 18.f; }
+
+	/**
+	 * SPEC v26 §6b — HOW LONG "UNTIL THE PULL ANIMATION FINISHES" IS, IN SECONDS.
+	 *
+	 * DERIVED, never typed. The pull is the thing being waited for, so the pull is the base: an enemy
+	 * caught at the very edge of OysterPicklerPullRadiusUU and launched at OysterPicklerPullSpeed
+	 * covers that gap in radius/speed seconds — 380/1300 = 0.29 s at the shipped values — and that is
+	 * the moment the yank is over. OysterPicklerDetonateDelayScale then scales it (1.0 = detonate as
+	 * the last of them arrives). Retune the pull and this moves with it, which a hard-coded 0.29 would
+	 * not; that is Demo 21's standing rule applied to a duration rather than to an offset.
+	 *
+	 * CLAMPED at both ends, and both clamps are relative too:
+	 *   floor  one tick of the jar's own tick group, so the jar is always SEEN to land before it goes;
+	 *   ceiling OysterJarLifetimeSeconds, so no scale can produce a Pickler jar that quietly expires
+	 *           instead of exploding — the failure this whole section exists to remove.
+	 */
+	static float GetPicklerDetonateDelaySeconds();
 
 	/**
 	 * SPEC v19 §4.4 — WHERE A LOBBED JAR MAY BE LET GO OF.
@@ -137,6 +185,12 @@ public:
 
 	/** Absolute match time it came to rest. 0 while it is still in the air. */
 	float GetLandedMatchTime() const { return LandedMatchTime; }
+
+	/**
+	 * SPEC v26 §6b. Absolute match time this jar detonates on its own. 0 on a dash jar and on a
+	 * Pickler jar that has not landed yet — a dash jar has no fuse at all and still waits to be broken.
+	 */
+	float GetDetonateMatchTime() const { return DetonateMatchTime; }
 
 	/** How many swept steps the flight took. The frame-rate independence measurement reads it. */
 	int32 GetFlightSweepCount() const { return FlightSweepCount; }
@@ -189,6 +243,15 @@ private:
 
 	/** A landing effect fires exactly once, however the jar came to rest. */
 	bool bLandingEffectFired = false;
+
+	/**
+	 * SPEC v26 §6b. Absolute match time the Pickler jar blows itself up, 0 when it has no fuse.
+	 *
+	 * Stored as LandedMatchTime + GetPicklerDetonateDelaySeconds() at the moment of landing, i.e. as a
+	 * deadline on the same match clock every other timer in this actor uses (ExpiryMatchTime,
+	 * LandedMatchTime). A countdown here would drift against a clock the server is already smoothing.
+	 */
+	float DetonateMatchTime = 0.f;
 
 	/** MEASUREMENT ONLY. The state a throw was launched with, and what the flight cost. */
 	FVector LaunchLocation = FVector::ZeroVector;

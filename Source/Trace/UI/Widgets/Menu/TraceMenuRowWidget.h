@@ -153,6 +153,41 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Menu Row|Art")
 	bool bLabelIsSprite = false;
 
+	// ---- SPEC v26 §7: A 2 PX WHITE OUTLINE ON THE DEFAULT (NON-HOVER) STATE -------------------------
+	//
+	//     "Add a 2pixel white outline to the default button state (non-hover)"
+	//
+	// THE WIDTH IS IN *DEVICE* PIXELS, AND THAT IS THE WHOLE OF THE INTERESTING PART.
+	//
+	// This widget is authored in a 1080-tall reference space and UMG scales it by the viewport's DPI
+	// factor before it reaches the screen — the engine's default curve (BaseEngine.ini's
+	// UIScaleCurve, keyed on the shortest side) is 0.666 at 720p, 1.0 at 1080p, 1.333 at 1440p and
+	// 2.0 at 2160p. A Slate rounded box's outline Width is in LOCAL units, so a constant 2 written
+	// here would draw 1.3 px at 720p, 2 px at 1080p and 4 px on a 4K display: precisely the "collapses
+	// to 1 px / bloats on 4K" failure §7 asks to be avoided, and precisely the kind of thing that
+	// looks right on the machine it was authored on.
+	//
+	// So the number below is what the OWNER asked for — a width in the pixels they can count in a
+	// screenshot — and the local width is derived from it at draw time by dividing by the live layout
+	// scale. Spec v24 §0's standing rule, applied to a unit rather than to a colour: the value that
+	// modifies the base is stored RELATIVE to the base (here: relative to the DPI scale), so it
+	// follows when the base moves rather than having to be re-tuned per resolution.
+	//
+	// The CORNER RADIUS goes the other way on purpose and is not a knob: it is a fraction of the row's
+	// height derived from the artist's own plate geometry (TraceMenuArtStyle::ButtonFrame), because
+	// the corner is part of the button's SHAPE and must scale with it, while the stroke is part of the
+	// button's finish and must not. See OutlineCornerRadius() in the .cpp.
+
+	/**
+	 * The outline's width in DEVICE pixels, at every resolution. §7 asks for 2.
+	 *
+	 * EditAnywhere so it can be A/B'd in the editor without a rebuild; 0 switches the outline off,
+	 * which is also the red arm for this feature.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Menu Row|Art",
+		meta = (ClampMin = "0.0", UIMax = "8.0"))
+	float DefaultOutlineWidthPx = 2.f;
+
 	/** Breaths per second of the hover glow. 0 freezes it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Menu Row")
 	float PulseSpeed = 4.5f;
@@ -239,4 +274,44 @@ private:
 
 	/** Install the five swaps. Idempotent; a failure leaves the authored text blocks drawing. */
 	void InstallAtlasLabels();
+
+	// ---- SPEC v26 §7 -------------------------------------------------------------------------------
+	//
+	// NOT a BindWidget, and it cannot be one: BindWidget properties are bound BY NAME to widgets that
+	// exist in WBP_MenuRow, and that asset is authored by Scripts/generate-menu-widgets.py, which this
+	// agent does not own — adding a required binding here would fail the Blueprint's compile and take
+	// the whole title screen down until somebody re-ran the generator in an editor. So the outline is
+	// CONSTRUCTED at runtime into the same canvas panel the plate lives in, the same way
+	// TraceAtlasTextSwap inserts the atlas labels, and a row whose tree is not what this expects
+	// simply keeps the screen it had.
+
+	/** The stroke. A textureless RoundedBox: transparent fill, white outline. */
+	UPROPERTY(Transient)
+	TObjectPtr<UImage> DefaultOutline = nullptr;
+
+	/** Latched, like the atlas labels: one branch a frame after the first. */
+	bool bDefaultOutlineInstalled = false;
+
+	/** The local-unit width the brush currently carries, so the brush is rebuilt only when it moves. */
+	float DefaultOutlineLocalWidth = -1.f;
+
+	/** Build the outline image and put it over the plate. Idempotent; failure is silent and harmless. */
+	void InstallDefaultOutline();
+
+	/**
+	 * Show / hide the outline and keep it 2 DEVICE pixels wide.
+	 *
+	 * @param bWanted true only in the state §7 names — the default, non-hover, enabled row.
+	 */
+	void ApplyDefaultOutline(bool bWanted);
+
+	/**
+	 * The layout scale between this row's local units and screen pixels.
+	 *
+	 * The row's OWN cached geometry first, so the answer stays right if this widget is ever put inside
+	 * a scale box or a retainer as well as the viewport's DPI scaler; the viewport scale as the
+	 * fallback for the frames before this row has been painted, where the cached geometry is still the
+	 * identity and would claim 1.0 at every resolution.
+	 */
+	float LayoutScale() const;
 };

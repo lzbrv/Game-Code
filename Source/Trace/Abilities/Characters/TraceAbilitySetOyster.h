@@ -21,6 +21,21 @@
 //             explode upon landing, it is the same as his other jars, which stay behind for a short
 //             period until broken."   [ASSUMPTION] 20 s cooldown; §6 leaves it unspecified. FLAGGED.
 //
+//             *** SPEC v26 §6 CHANGES BOTH HALVES OF HIS E. *** Verbatim: "Change Oyster's E
+//             cooldown to reset everytime he poisons someone. The E jar's should explode once the
+//             pull animation finishes, rather than waiting for a jump to trigger them."
+//
+//             (a) THE REFUND is not implemented in this file, and that is the point: it lives in
+//                 UTraceOysterPoisonComponent::ApplyTo, the one place a poison begins, so that the
+//                 dash jar's burst and the Pickler's detonation both pay it without either knowing
+//                 about the other. It calls UTraceAbilityComponent::ServerResetActivatedCooldown.
+//                 What it means HERE is that GetActivatedCooldownSeconds() below is now a CEILING
+//                 — the longest he ever waits — rather than the wait itself.
+//             (b) THE FUSE lives in ATraceOysterJar (GetPicklerDetonateDelaySeconds / Land), because
+//                 it is a property of the jar's life and not of the press. His DASH jars are
+//                 untouched: they still lie in wait to be broken, and the doc's clarification above
+//                 still describes them exactly.
+//
 // ===================================================================================================
 // *** OYSTER IS THE PASS'S BIGGEST CARRIER-RULE RISK. THIS IS THE LIST. ***
 // ===================================================================================================

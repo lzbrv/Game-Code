@@ -358,6 +358,16 @@ namespace TraceMovementAuditV16
 		ReportKnob(TEXT("DashDuration"),                  TEXT("DashDuration"),                  S.DashDuration);
 		ReportKnob(TEXT("SlideJumpWindowSpeedBonus"),     TEXT("SlideJumpWindowSpeedBonus"),     S.SlideJumpWindowSpeedBonus);
 		ReportKnob(TEXT("SlideJumpBonusScale"),           TEXT("SlideJumpBonusScale"),           S.SlideJumpBonusScale);
+		// SPEC v26 §3. In this table for one specific reason: "Let me change this in project settings"
+		// is a REQUIREMENT of the note, and this is the row that proves the ini key and the UPROPERTY
+		// are the same name. A knob that is header-only ("NOT IN DefaultGame.ini") reads as tunable and
+		// is not — DefaultGame.ini wins, so a designer's edit in Project Settings would be overwritten
+		// by the shipped file on the next load and the setting would appear to do nothing.
+		ReportKnob(TEXT("SlideJumpMomentumScale (v26 §3a)"),
+		                                                  TEXT("SlideJumpMomentumScale"),         S.SlideJumpMomentumScale);
+		ReportKnob(TEXT("SlideJumpChainCapBoosts (v26 §3b)"),
+		                                                  TEXT("SlideJumpChainCapBoosts"),        static_cast<float>(S.SlideJumpChainCapBoosts));
+		ReportKnob(TEXT("SlideJumpChainResetSpeedMult"),  TEXT("SlideJumpChainResetSpeedMultiplier"), S.SlideJumpChainResetSpeedMultiplier);
 		ReportKnob(TEXT("WallJumpOutwardImpulse"),        TEXT("WallJumpOutwardImpulse"),        S.WallJumpOutwardImpulse);
 		ReportKnob(TEXT("RoccoRippleDashSpeedMultiplier"),TEXT("RoccoRippleDashSpeedMultiplier"),S.RoccoRippleDashSpeedMultiplier);
 		ReportKnob(TEXT("RoccoRippleRideSpeedMultiplier"),TEXT("RoccoRippleRideSpeedMultiplier"),S.RoccoRippleRideSpeedMultiplier);
@@ -2346,6 +2356,490 @@ namespace TraceMovementAuditV16
 	}
 
 	// =============================================================================================
+	// SPEC v26 §3 — FOUR CHAINED SLIDE-JUMPS, MEASURED
+	//
+	// v26 §3, verbatim: "Reduce slide jump momentum boost by 20%. Add a ceiling to slide jump
+	// momentum boosts, so that you can't chain them over and over to go faster and faster. Right now,
+	// if you do three slide jump boosts in a row you can zip down the whole field. For now, lets cap
+	// it at what the momentum is after you do two consecutive slide boosts."
+	//
+	// WHY THIS CANNOT BE A CONFIG READ, WHICH IS WHY IT IS A WHOLE NEW HARNESS. Every other number in
+	// §3 is arithmetic and the V26TUNING lines in the movement component already print it. The number
+	// the owner's complaint is ABOUT is not: "if you do three slide jump boosts in a row you can zip
+	// down the whole field" is a claim about the speed reached at the END of a real chain, and that
+	// depends on how far each slide decayed before its hop, how much of the landing survived the
+	// ground friction, and whether the chain was still alive when the next slide started. No
+	// expression on any settings page knows those. So this drives a live pawn through four ACTUAL
+	// chained slide-jumps and prints the launch speed of each.
+	//
+	// THE RED ARM IS Trace.V26LegacySlideJump 1, and it is the point of the exercise. It reverts the
+	// -20% and turns the ceiling off in the SAME BINARY, so "before" and "after" are the same four
+	// phases on the same lane of the same arena rather than two builds an afternoon apart.
+	//
+	//     Trace.V26LegacySlideJump 1 ; Trace.Move.AuditV16.SlideChain     <- boosts 3 and 4 climb
+	//     Trace.V26LegacySlideJump 0 ; Trace.Move.AuditV16.SlideChain     <- boost 3 pinned to 2
+	//
+	// If the two arms print the same four numbers, the harness is not measuring its rule and the run
+	// is worth nothing — say so rather than reporting the green arm on its own.
+	//
+	// THE FIXTURE CHECKS, because a chain is easy to measure wrong:
+	//   * every hop must be WELL TIMED. A mistimed hop has no boost at all (retention is 1.0), so a
+	//     chain containing one is measuring the player, not the mechanic. Recorded, never assumed.
+	//   * the chain must still be ALIVE at each press. If the pawn gave the momentum back between
+	//     hops — walked into cover, ran out of lane — the next hop is a FIRST hop and the row is a
+	//     measurement of a fresh chain wearing hop 3's label. The component's own chain counter is
+	//     read at the press and printed, so this is visible rather than assumed.
+	//   * the lane is swept before the run starts. Four chained hops cover thousands of uu, and a
+	//     pawn that puts its face into midfield cover on hop 2 reports a beautifully capped hop 3.
+	// =============================================================================================
+
+	struct FSlideChainState
+	{
+		static constexpr int32 MaxHops = 4;
+
+		int32 Phase = 0;
+		float PhaseTime = 0.f;
+		double Deadline = 0.0;
+
+		TWeakObjectPtr<ATraceCharacter> Pawn;
+		FVector RunDirection = FVector::ForwardVector;
+		FVector Home = FVector::ZeroVector;
+		float LaneLength = 0.f;
+
+		int32 HopIndex = 0;   // hops completed so far; also the index being filled
+
+		/** Slide speed at the instant the jump was pressed — what the launch is a multiple OF. */
+		float Carry[MaxHops] = {};
+		/** Planar speed on the first airborne frame. THE HEADLINE NUMBER. */
+		float Launch[MaxHops] = {};
+		/** Highest planar speed reached during the airborne arc, for context. */
+		float AirTop[MaxHops] = {};
+		/** The component's own chain counter, read at the press (0-based: 0 means "this is hop 1"). */
+		int32 ChainAtPress[MaxHops] = {};
+		/** The chain's measured ceiling after the hop, or 0 if none is recorded yet. */
+		float Ceiling[MaxHops] = {};
+		bool  bWellTimed[MaxHops] = {};
+		bool  bValid[MaxHops] = {};
+
+		float RunUpTop = 0.f;
+		int32 ChainBreaks = 0;
+	};
+
+	void ReportSlideChain(const FSlideChainState& State)
+	{
+		ATraceCharacter* Pawn = State.Pawn.Get();
+		UTraceCharacterMovementComponent* Move = MovementOf(Pawn);
+		if (Move == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("AUDITV16 slide chain: the pawn went away before the report."));
+			return;
+		}
+
+		const UTraceSettings& S = UTraceSettings::Get();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("AUDITV16 ===== SPEC v26 §3: FOUR CHAINED SLIDE-JUMPS (netMode=%d role=%d) ====="),
+			static_cast<int32>(Move->GetNetMode()),
+			(Pawn != nullptr) ? static_cast<int32>(Pawn->GetLocalRole()) : -1);
+
+		// The ARM, printed first and derived from the live component rather than from the cvar, so a
+		// run whose arm did not take cannot be read as the arm it was asked for. The well-timed
+		// multiplier IS the arm: 1.446875 is pre-v26, 1.3575 is shipped.
+		const float Multiplier = Move->GetSlideJumpWindowSpeedBonusForAudit()
+			* Move->GetSlideJumpHorizontalRetentionForAudit();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("AUDITV16 arm: well-timed multiplier %.5f  (base %.5f x scale %.3f, then v26 gain scale "
+			     "%.3f)   ceiling %s, cap after %d boost(s), chain reset at %5.0f uu/s"),
+			Multiplier, S.SlideJumpWindowSpeedBonus, S.SlideJumpBonusScale, S.SlideJumpMomentumScale,
+			Move->IsSlideJumpChainCapEnabledForAudit() ? TEXT("ON") : TEXT("OFF"),
+			Move->GetSlideJumpChainCapBoostsForAudit(), Move->GetSlideJumpChainResetSpeedForAudit());
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("AUDITV16 run-up top speed %.0f uu/s over a %.0f uu swept lane; %d chain break(s) between hops."),
+			State.RunUpTop, State.LaneLength, State.ChainBreaks);
+
+		float PreviousLaunch = 0.f;
+		for (int32 Hop = 0; Hop < FSlideChainState::MaxHops; ++Hop)
+		{
+			if (!State.bValid[Hop])
+			{
+				RowInvalid(*FString::Printf(TEXT("SLIDEJUMP chain hop %d"), Hop + 1),
+					TEXT("the hop was never taken — see the warnings above for which phase gave up"));
+				continue;
+			}
+
+			// The chain counter read AT THE PRESS is the fixture check. It must equal the number of
+			// hops already taken; anything less means the chain reset and this row is a fresh chain
+			// mislabelled. With the ceiling OFF there is no chain to keep, so the check is not run
+			// rather than run and failed — see the note where ChainBreaks is counted.
+			const bool bChainIntact = !Move->IsSlideJumpChainCapEnabledForAudit()
+				|| (State.ChainAtPress[Hop] == Hop);
+			const float Ratio = (State.Carry[Hop] > 1.f) ? (State.Launch[Hop] / State.Carry[Hop]) : 0.f;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("AUDITV16 | hop %d | carry %7.1f -> LAUNCH %7.1f uu/s (x%.4f) | air top %7.1f | "
+				     "chain depth at press %d %s | ceiling after %7.1f | %s%s"),
+				Hop + 1, State.Carry[Hop], State.Launch[Hop], Ratio, State.AirTop[Hop],
+				State.ChainAtPress[Hop],
+				!Move->IsSlideJumpChainCapEnabledForAudit() ? TEXT("(n/a, ceiling off)")
+					: (bChainIntact ? TEXT("(intact)") : TEXT("(*** BROKEN ***)")),
+				State.Ceiling[Hop],
+				State.bWellTimed[Hop] ? TEXT("well timed") : TEXT("*** MISTIMED - row is not comparable ***"),
+				(PreviousLaunch > 0.f)
+					? *FString::Printf(TEXT(" | vs previous hop %+.1f uu/s (%+.1f%%)"),
+						State.Launch[Hop] - PreviousLaunch,
+						100.f * (State.Launch[Hop] - PreviousLaunch) / FMath::Max(1.f, PreviousLaunch))
+					: TEXT(""));
+
+			PreviousLaunch = State.Launch[Hop];
+		}
+
+		// --- THE ONE VERDICT THE NOTE ASKS FOR --------------------------------------------------
+		//
+		// "if you do three slide jump boosts in a row you can zip down the whole field [...] cap it at
+		// what the momentum is after you do two consecutive slide boosts."
+		//
+		// So: hop 3 must not be faster than hop 2. Expressed as a comparison of two MEASURED numbers
+		// rather than against a derived expectation, because that is exactly what the sentence says
+		// and because both sides of it come off the same run.
+		const bool bHaveThree = State.bValid[1] && State.bValid[2];
+		if (!bHaveThree)
+		{
+			RowInvalid(TEXT("v26 §3b third hop <= second"),
+				TEXT("fewer than three hops completed — nothing to compare"));
+		}
+		else
+		{
+			// A percent of slack, not zero: the launch is sampled on the first airborne frame, so at
+			// 60 Hz two hops of an identical chain can differ by the fraction of a frame the physics
+			// step landed on.
+			const float Slack = 0.01f;
+			const bool bCapped = State.Launch[2] <= State.Launch[1] * (1.f + Slack);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("AUDITV16 | %-34s | hop2 %8.1f  hop3 %8.1f uu/s | %-4s | %s"),
+				TEXT("v26 §3b third hop <= second"), State.Launch[1], State.Launch[2],
+				bCapped ? TEXT("PASS") : TEXT("FAIL"),
+				Move->IsSlideJumpChainCapEnabledForAudit()
+					? TEXT("ceiling ON — a FAIL here is the ceiling not working")
+					: TEXT("ceiling OFF (RED arm) — a PASS here means the harness measured nothing"));
+		}
+
+		if (State.bValid[1] && State.bValid[3])
+		{
+			const float Slack = 0.01f;
+			const bool bCapped = State.Launch[3] <= State.Launch[1] * (1.f + Slack);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("AUDITV16 | %-34s | hop2 %8.1f  hop4 %8.1f uu/s | %-4s |"),
+				TEXT("v26 §3b fourth hop <= second"), State.Launch[1], State.Launch[3],
+				bCapped ? TEXT("PASS") : TEXT("FAIL"));
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("AUDITV16 ===== slide chain done. Run the other arm (Trace.V26LegacySlideJump) and diff "
+			     "these four numbers; identical arms mean the harness is not measuring its rule. ====="));
+	}
+
+	void RunSlideChain()
+	{
+		UWorld* World = LocalGameWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("AUDITV16 slide chain: no game world."));
+			return;
+		}
+
+		TSharedPtr<FSlideChainState> State = MakeShared<FSlideChainState>();
+		State->Deadline = FPlatformTime::Seconds() + 120.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("AUDITV16 ===== slide chain starting: four consecutive well-timed slide-jumps, no "
+			     "teleports, no velocity writes. ====="));
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float Delta) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("AUDITV16 slide chain ABORTED: the world went away."));
+				return false;
+			}
+			if (FPlatformTime::Seconds() > State->Deadline)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("AUDITV16 slide chain ABORTED at phase %d, hop %d: ran out of time. Reporting "
+					     "what was measured."), State->Phase, State->HopIndex + 1);
+				ReportSlideChain(*State);
+				return false;
+			}
+
+			ATraceCharacter* Pawn = State->Pawn.Get();
+			if (Pawn == nullptr)
+			{
+				Pawn = LocalPawn(TickWorld);
+				if (Pawn == nullptr || !Pawn->IsAlive())
+				{
+					return true;
+				}
+				State->Pawn = Pawn;
+			}
+
+			UTraceCharacterMovementComponent* Move = MovementOf(Pawn);
+			if (Move == nullptr)
+			{
+				return true;
+			}
+
+			if (!Pawn->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("AUDITV16 slide chain ABORTED: the pawn died mid-run. Everything after the last "
+					     "completed hop is INVALID, not zero."));
+				ReportSlideChain(*State);
+				return false;
+			}
+
+			State->PhaseTime += Delta;
+			const float Planar = PlanarSpeedOf(Move);
+			const int32 Hop = State->HopIndex;
+
+			auto Advance = [&State](int32 Next)
+			{
+				State->Phase = Next;
+				State->PhaseTime = 0.f;
+			};
+
+			switch (State->Phase)
+			{
+			// --- 0. stage, and SWEEP THE LANE ------------------------------------------------------
+			//
+			// Four chained hops cover thousands of uu. A pawn that puts its face into midfield cover on
+			// hop 2 reports a beautifully capped hop 3 that is really a measurement of a wall, which is
+			// the exact failure mode FindClearLaneFrom exists for — so the longest clear lane is found
+			// FIRST and the whole chain runs down it.
+			case 0:
+			{
+				if (!Move->IsMovingOnGround())
+				{
+					return true;
+				}
+
+				State->Home = Pawn->GetActorLocation();
+
+				const float Wanted[] = { 16000.f, 12000.f, 9000.f, 6000.f, 4000.f };
+				for (const float Length : Wanted)
+				{
+					FVector Lane;
+					if (FindClearLaneFrom(TickWorld, Pawn, Length, Lane))
+					{
+						State->RunDirection = Lane;
+						State->LaneLength = Length;
+						break;
+					}
+				}
+
+				if (State->LaneLength <= 0.f)
+				{
+					// Shuffle toward midfield and try again — the same recovery the dash phase uses.
+					if (State->PhaseTime > 8.f)
+					{
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("AUDITV16 slide chain: no clear lane of even 4000 uu from %s. A chain "
+							     "cannot be measured here."), *State->Home.ToCompactString());
+						ReportSlideChain(*State);
+						return false;
+					}
+					FVector Toward = -Pawn->GetActorLocation();
+					Toward.Z = 0.f;
+					if (Pawn->HasAuthority() && Toward.Normalize())
+					{
+						Pawn->SetActorLocation(Pawn->GetActorLocation() + Toward * 1200.f,
+							false, nullptr, ETeleportType::TeleportPhysics);
+					}
+					return true;
+				}
+
+				if (APlayerController* PC = Cast<APlayerController>(Pawn->GetController()))
+				{
+					PC->SetControlRotation(State->RunDirection.Rotation());
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("AUDITV16 slide chain staged at %s, running %s down a %.0f uu clear lane."),
+					*State->Home.ToCompactString(), *State->RunDirection.ToCompactString(),
+					State->LaneLength);
+				Advance(1);
+				break;
+			}
+
+			// --- 1. arm the next slide -------------------------------------------------------------
+			//
+			// Held input the whole way, for the reason the core kit's phase 13 gives: without it ground
+			// friction stops the pawn dead and the hop is measured from a standstill, which measures the
+			// harness rather than the mechanic.
+			//
+			// The slide intent is released for the WHOLE airborne arc in phase 3, so the press here is
+			// always a fresh EDGE (bSlideHeldLastMove). Re-asserting a still-held intent would never
+			// start a second slide and the chain would silently be one hop long.
+			//
+			// *** THE FIRST HOP MUST START FROM A FULL RUN AND THE REST MUST NOT WAIT AT ALL. ***
+			// Both halves of that were learned from a run:
+			//
+			//   HOP 1. CanStartSlide only needs SlideEntrySpeedFraction x WalkSpeed (440 uu/s), and the
+			//     first version slid the moment it crossed that. The slide then decayed to 442 and
+			//     launched at 600 — BELOW the pawn's own 800 uu/s ground speed — so the chain was
+			//     correctly declared spent on the very next landing and hop 2 was a FIRST hop wearing
+			//     hop 2's label. The whole four-hop run measured two chains of two. Requiring a real
+			//     run-up is not cosmetic: a chain that starts below walking pace has nothing to
+			//     compound and is not the thing §3 is about.
+			//
+			//   HOPS 2-4. Every frame spent on the ground before the next slide is a frame of ground
+			//     friction eating the carry, which is precisely how a chain ends. So these press crouch
+			//     on the first frame the slide is legal — no settle time, no speed gate beyond the one
+			//     CanStartSlide itself applies. That is also what a player chaining hops actually does.
+			case 1:
+			{
+				Pawn->AddMovementInput(State->RunDirection, 1.f);
+				State->RunUpTop = FMath::Max(State->RunUpTop, Planar);
+
+				const float EntryMinimum = FMath::Max(1.f, UTraceSettings::Get().WalkSpeed)
+					* UTraceSettings::Get().SlideEntrySpeedFraction;
+
+				// 0.98 rather than 1.0: ground acceleration approaches the ceiling asymptotically and
+				// the last hundredth never arrives. 1.6 s is the same settle time the core-kit audit's
+				// slide phases use, and it is what makes the two harnesses' entry speeds comparable.
+				const bool bRunUpDone = (Hop > 0)
+					|| (State->PhaseTime > 1.6f && Planar >= 0.98f * FMath::Max(1.f, Move->GetMaxSpeed()));
+
+				if (Move->IsMovingOnGround()
+					&& Move->GetSlideCooldownRemaining() <= 0.f
+					&& Planar > EntryMinimum
+					&& bRunUpDone)
+				{
+					Move->SetWantsToSlide(true);
+					Advance(2);
+					break;
+				}
+
+				if (State->PhaseTime > 6.f)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("AUDITV16 slide chain: hop %d never got a slide started (grounded=%d, "
+						     "cooldown %.2fs, planar %.0f, entry minimum %.0f). Reporting what was measured."),
+						Hop + 1, Move->IsMovingOnGround() ? 1 : 0, Move->GetSlideCooldownRemaining(),
+						Planar, EntryMinimum);
+					ReportSlideChain(*State);
+					return false;
+				}
+				break;
+			}
+
+			// --- 2. sliding: wait for the window, then hop -----------------------------------------
+			case 2:
+				Pawn->AddMovementInput(State->RunDirection, 1.f);
+				Move->SetWantsToSlide(true);
+
+				if (Move->IsSlideJumpWellTimed())
+				{
+					// Recorded, never assumed: the chain depth AT THE PRESS is the fixture check that
+					// says whether this really is hop N of one chain or hop 1 of a new one.
+					State->bWellTimed[Hop] = true;
+					State->Carry[Hop] = Move->GetSlideSpeedForAudit();
+					State->ChainAtPress[Hop] = Move->GetSlideJumpChainBoostsForAudit();
+
+					// ONLY MEANINGFUL WITH THE CEILING ON. With it off the component does not keep a
+					// chain at all — DoJump zeroes the counter on every hop — so counting "breaks" in
+					// the RED arm would report a fixture failure that is really the arm doing its job,
+					// and a reader would discount the very numbers the arm exists to produce.
+					if (Move->IsSlideJumpChainCapEnabledForAudit() && State->ChainAtPress[Hop] != Hop)
+					{
+						++State->ChainBreaks;
+					}
+					Pawn->Jump();
+					Advance(3);
+					break;
+				}
+
+				if (!Move->IsSlideJumpAvailable() || State->PhaseTime > 4.f)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("AUDITV16 slide chain: hop %d's window never opened (available=%d, %.2fs of "
+						     "slide left)."),
+						Hop + 1, Move->IsSlideJumpAvailable() ? 1 : 0, Move->GetSlideTimeLeftForAudit());
+					ReportSlideChain(*State);
+					return false;
+				}
+				break;
+
+			// --- 3. airborne: record the launch, then track the arc ---------------------------------
+			//
+			// THE LAUNCH IS THE FIRST AIRBORNE FRAME and nothing later. That is the speed DoJump wrote,
+			// which is the number §3 caps; the air top is printed beside it only so a reader can see
+			// that the strafe model did not quietly add to it.
+			case 3:
+				// Released for the WHOLE arc, not just its first frame: the next slide has to start on
+				// a press EDGE, and one stray frame of held intent on the way up is enough to make the
+				// landing press a no-op and turn a four-hop chain into a one-hop one.
+				Move->SetWantsToSlide(false);
+
+				if (!Move->IsMovingOnGround())
+				{
+					if (!State->bValid[Hop])
+					{
+						State->Launch[Hop] = Planar;
+						State->Ceiling[Hop] = Move->GetSlideJumpChainCeilingForAudit();
+						State->bValid[Hop] = true;
+						Pawn->StopJumping();
+						UE_LOG(LogTraceGame, Display,
+							TEXT("AUDITV16 slide chain hop %d: carry %.0f -> launch %.0f uu/s "
+							     "(chain depth was %d, ceiling now %.0f)"),
+							Hop + 1, State->Carry[Hop], State->Launch[Hop], State->ChainAtPress[Hop],
+							State->Ceiling[Hop]);
+					}
+
+					State->AirTop[Hop] = FMath::Max(State->AirTop[Hop], Planar);
+
+					// Straight-ahead input only. In this component's Source air model an input aligned
+					// with the velocity adds nothing once the projection is saturated, so holding
+					// forward keeps the pawn steered without contaminating the number — and it is what
+					// a player chaining hops actually does.
+					Pawn->AddMovementInput(State->RunDirection, 1.f);
+					break;
+				}
+
+				if (State->bValid[Hop])
+				{
+					// Back on the ground. Next hop, or the report.
+					++State->HopIndex;
+					if (State->HopIndex >= FSlideChainState::MaxHops)
+					{
+						Move->SetWantsToSlide(false);
+						ReportSlideChain(*State);
+						return false;
+					}
+					Advance(1);
+					break;
+				}
+
+				if (State->PhaseTime > 1.5f)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("AUDITV16 slide chain: hop %d never left the ground."), Hop + 1);
+					ReportSlideChain(*State);
+					return false;
+				}
+				break;
+
+			default:
+				ReportSlideChain(*State);
+				return false;
+			}
+
+			return true;
+		}));
+	}
+
+	// =============================================================================================
 	// Registration
 	// =============================================================================================
 
@@ -2376,6 +2870,13 @@ namespace TraceMovementAuditV16
 		TEXT("Trace.Move.AuditV16.Abilities"),
 		TEXT("Dev only, server only. Measure Rocco's second jump, Mace's suspend and Oyster's jar-jump."),
 		FConsoleCommandDelegate::CreateStatic(&RunAbilityMoves));
+
+	FAutoConsoleCommand CmdAuditSlideChain(
+		TEXT("Trace.Move.AuditV16.SlideChain"),
+		TEXT("Dev only. SPEC v26 sec 3. Drive the local pawn through FOUR consecutive well-timed "
+		     "slide-jumps down a swept lane and print the launch speed of each, so the ceiling can be "
+		     "seen rather than asserted. Run it in both arms of Trace.V26LegacySlideJump and diff."),
+		FConsoleCommandDelegate::CreateStatic(&RunSlideChain));
 
 	FAutoConsoleCommand CmdAuditRed(
 		TEXT("Trace.Move.AuditV16.Red"),

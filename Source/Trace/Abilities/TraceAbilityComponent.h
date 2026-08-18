@@ -225,6 +225,28 @@ public:
 	void OnHalfTime();
 
 	/**
+	 * SPEC v26 §6a. SERVER ONLY. Clears the activated cooldown so E is ready right now.
+	 *
+	 * *** THE SECOND WRITER OF THE COOLDOWN DEADLINE. *** OnHalfTime() above was the only one, and
+	 * its comment said so; both comments now name the other. Spec v26 §6a — "change Oyster's E
+	 * cooldown to reset everytime he poisons someone" — is a rule about state this component owns
+	 * privately, and the alternatives were worse than one named method: a character reaching into
+	 * protected members, or the poison reusing DebugSetActivatedCooldown(), which is
+	 * `#if !UE_BUILD_SHIPPING` and would have made the ability work everywhere except in a shipping
+	 * build.
+	 *
+	 * IT ALSO CLEARS THE OWNING CLIENT'S PREDICTION, and that is not optional.
+	 * GetActivatedCooldownRemaining() returns max(replicated, predicted) so that a local prediction
+	 * cannot flash back to READY while the server's answer is in flight. The replicated zero alone
+	 * would therefore be out-voted on exactly the machine that has to press the button, and the
+	 * player would watch a cooldown they no longer have.
+	 *
+	 * @param Why  a short reason, logged. Cheap to pass and it is what makes a refunded cooldown
+	 *             legible in a log full of them.
+	 */
+	void ServerResetActivatedCooldown(const TCHAR* Why);
+
+	/**
 	 * *** THE CHOKE POINT. SPEC §4. THE MOST IMPORTANT FUNCTION IN THE ABILITY FRAMEWORK. ***
 	 *
 	 * Verbatim: "NO abilities damage carriers, carriers can still only be killed when an enemy
@@ -566,6 +588,17 @@ public:
 	/** Server -> owning client. The prediction was wrong; snap the cooldown back. */
 	UFUNCTION(Client, Reliable)
 	void ClientActivateRejected(float AuthoritativeCooldownEndMatchTime);
+
+	/**
+	 * Server -> owning client. The server SHORTENED the cooldown; drop the local prediction to match.
+	 *
+	 * Body-identical to ClientActivateRejected and deliberately not merged with it: that one means
+	 * "you predicted an activation I refused", this one means "you predicted a wait I have just
+	 * cancelled". They are opposite events that happen to need the same assignment, and a shared name
+	 * would have to lie about one of them. Only ServerResetActivatedCooldown sends it.
+	 */
+	UFUNCTION(Client, Reliable)
+	void ClientCooldownWasReset(float AuthoritativeCooldownEndMatchTime);
 
 	/**
 	 * Client -> server. The authoritative half of the jump hook (Rocco's second jump, Oyster's jar

@@ -36,11 +36,32 @@ static TAutoConsoleVariable<int32> CVarOysterLegacyThrow(
 	     "Trace.Oyster.PicklerThrowTest can be shown failing. Never ship 1."),
 	ECVF_Cheat);
 
+// =================================================================================================
+// SPEC v26 §6 — THE TEST ARM FOR BOTH HALVES OF OYSTER'S E
+//
+// 0 (shipped): the Pickler jar detonates when the pull finishes (§6b), and any poison landing on an
+//              enemy resets the E cooldown (§6a).
+// 1:           restores the pre-v26 behaviour of both — the jar lies there waiting for a touch or a
+//              jump, and a poison refunds nothing — so Trace.Oyster.ETest can be shown failing in the
+//              same process, in the same match, on the same fixtures. NEVER SHIP 1.
+// =================================================================================================
+static TAutoConsoleVariable<int32> CVarOysterLegacyE(
+	TEXT("Trace.Oyster.LegacyE"), 0,
+	TEXT("TEST ARM ONLY. 0 (shipped, spec v26 §6): the Pickler jar explodes when its pull finishes, "
+	     "and poisoning an enemy resets Oyster's E cooldown. 1: restores the pre-v26 behaviour of "
+	     "both, so Trace.Oyster.ETest can be shown failing. Never ship 1."),
+	ECVF_Cheat);
+
 namespace TraceOysterJar
 {
 	bool IsLegacyThrow()
 	{
 		return CVarOysterLegacyThrow.GetValueOnAnyThread() != 0;
+	}
+
+	bool IsLegacyE()
+	{
+		return CVarOysterLegacyE.GetValueOnAnyThread() != 0;
 	}
 
 	/**
@@ -61,6 +82,17 @@ namespace TraceOysterJar
 
 	/** Safety valve. A clamped 0.1 s frame at the fastest throw needs 6; 32 can never be reached. */
 	constexpr int32 MaxSubStepsPerFrame = 32;
+
+	/**
+	 * SPEC v26 §6b. The shortest fuse a Pickler jar may be given, in seconds.
+	 *
+	 * One 60 Hz frame. Not a design number — a visibility floor. The jar has to be on the ground for
+	 * at least one rendered frame or the "lands, then explodes" the section describes would read as
+	 * "vanished in mid-air", and OysterPicklerPullSpeed being tuned to something enormous (or the
+	 * pull being switched off entirely with speed 0, which makes the derived travel time zero) must
+	 * not be able to produce that.
+	 */
+	constexpr float MinDetonateDelaySeconds = 1.f / 60.f;
 }
 
 ATraceOysterJar::ATraceOysterJar()
@@ -241,8 +273,22 @@ void ATraceOysterJar::TickGrounded()
 		return;
 	}
 
+	// SPEC v26 §6b — THE PICKLER JAR'S FUSE. Second, deliberately: an enemy who walks into it during
+	// the pull still breaks it early, which is the ordinary jar rule and is what "it is still a normal
+	// jar for that window" means. This is the path that fires when nobody does.
+	//
+	// ServerBreakNow, NOT Destroy: "explode" is the poison burst plus the v16 §3 cloud, the same event
+	// a touch or a jar-jump produces. There is one break in this class and this is another way in, not
+	// another kind of ending.
+	if (DetonateMatchTime > 0.f && MatchTimeNow() >= DetonateMatchTime)
+	{
+		ServerBreakNow(TEXT("Pickler's pull finished — spec v26 §6b"));
+		return;
+	}
+
 	// "Jars last 4 s on the ground." Expiring untouched is NOT a break: nothing bursts, it is simply
-	// gone. §6 ties the poison to being broken, not to the jar existing.
+	// gone. §6 ties the poison to being broken, not to the jar existing. A Pickler jar can no longer
+	// reach this line — its fuse is clamped below the lifetime — and that is on purpose.
 	if (ExpiryMatchTime > 0.f && MatchTimeNow() >= ExpiryMatchTime)
 	{
 		Destroy();
@@ -252,6 +298,29 @@ void ATraceOysterJar::TickGrounded()
 // =================================================================================================
 // Landing
 // =================================================================================================
+
+float ATraceOysterJar::GetPicklerDetonateDelaySeconds()
+{
+	const UTraceSettings& Settings = UTraceSettings::Get();
+
+	const float PullRadius = FMath::Max(0.f, Settings.OysterPicklerPullRadiusUU);
+	const float PullSpeed  = FMath::Max(0.f, Settings.OysterPicklerPullSpeed);
+	const float Scale      = FMath::Max(0.f, Settings.OysterPicklerDetonateDelayScale);
+
+	// THE BASE: how long the pull itself takes. Someone standing at the very edge of the pull radius,
+	// launched straight at the jar at the pull speed, closes that gap in exactly this. A pull with no
+	// speed has no travel time, and then there is nothing to wait for and the floor below takes over.
+	const float PullTravelSeconds = (PullSpeed > UE_SMALL_NUMBER) ? (PullRadius / PullSpeed) : 0.f;
+
+	// The ceiling is the jar's own ground lifetime, so a big scale cannot produce a Pickler jar that
+	// EXPIRES instead of exploding — expiring is silent (TickGrounded destroys it without a burst) and
+	// would look exactly like the feature not working. Both ends move with the knobs they are cut from.
+	const float LifetimeSeconds = FMath::Max(0.25f, Settings.OysterJarLifetimeSeconds);
+
+	return FMath::Clamp(PullTravelSeconds * Scale,
+		TraceOysterJar::MinDetonateDelaySeconds,
+		FMath::Max(TraceOysterJar::MinDetonateDelaySeconds, LifetimeSeconds));
+}
 
 void ATraceOysterJar::Land()
 {
@@ -269,6 +338,21 @@ void ATraceOysterJar::Land()
 	{
 		bLandingEffectFired = true;
 		FireLandingEffect();
+
+		// SPEC v26 §6b: "the E jar's should explode once the pull animation finishes, rather than
+		// waiting for a jump to trigger them."
+		//
+		// Armed HERE, in the same branch as the impact, so the fuse and the pull cannot come apart:
+		// the only jar that pulls is the only jar that detonates, and it is lit at the instant the
+		// pull starts. Stored RELATIVE to the landing, exactly like ExpiryMatchTime on the line above
+		// — the delay is a property of the pull, and the landing is when the pull happened.
+		//
+		// The red arm leaves DetonateMatchTime at 0, which is exactly the pre-v26 jar: no fuse, and
+		// TickGrounded's detonation branch never fires.
+		if (!TraceOysterJar::IsLegacyE())
+		{
+			DetonateMatchTime = LandedMatchTime + GetPicklerDetonateDelaySeconds();
+		}
 	}
 }
 
@@ -402,11 +486,14 @@ void ATraceOysterJar::FireLandingEffect()
 		}
 	}
 
+	// The fuse is REPORTED with the pull it is cut from, so a log line is enough to tell whether a
+	// retune moved them together: "pulled 2 in 380 uu (0.29s of travel)" beside "detonates in 0.29s".
+	const float PullTravelSeconds = (PullSpeed > UE_SMALL_NUMBER) ? (PullRadius / PullSpeed) : 0.f;
 	UE_LOG(LogTraceGame, Log,
-		TEXT("[Oyster] Pickler landed at %s: %.0f damage to %d in %.0f uu, pulled %d in %.0f uu. The jar now stays "
-		     "as a normal jar for %.1fs (the doc's own clarification)."),
+		TEXT("[Oyster] Pickler landed at %s: %.0f damage to %d in %.0f uu, pulled %d in %.0f uu (%.2fs of pull at "
+		     "%.0f uu/s). SPEC v26 §6b: it detonates in %.2fs rather than waiting to be broken."),
 		*Origin.ToCompactString(), ImpactDamage, DamagedCount, DamageRadius, PulledCount, PullRadius,
-		UTraceSettings::Get().OysterJarLifetimeSeconds);
+		PullTravelSeconds, PullSpeed, GetPicklerDetonateDelaySeconds());
 }
 
 // =================================================================================================

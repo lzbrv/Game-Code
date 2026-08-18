@@ -15,6 +15,7 @@
 #include "UObject/ConstructorHelpers.h"
 
 #include "Abilities/TraceAbilityComponent.h"
+#include "Abilities/Characters/TraceOysterJar.h"   // TraceOysterJar::IsLegacyE — spec v26 §6's red arm
 #include "Core/TraceCharacter.h"
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
@@ -35,7 +36,8 @@
 
 #include "Camera/CameraActor.h"
 #include "Abilities/Characters/TraceAbilitySetOyster.h"
-#include "Abilities/Characters/TraceOysterJar.h"
+// TraceOysterJar.h is now included unconditionally above — spec v26 §6's red arm needs it in every
+// configuration, not only in the harness ones.
 #endif
 
 // =================================================================================================
@@ -82,6 +84,68 @@ namespace TraceOyster
 		{
 			++(GOtherTally.*Field);
 		}
+	}
+}
+
+// =================================================================================================
+// SPEC v26 §6a — "CHANGE OYSTER'S E COOLDOWN TO RESET EVERYTIME HE POISONS SOMEONE"
+// =================================================================================================
+//
+// Named after the file rather than anonymous: two anonymous namespaces merged into one unity
+// translation unit is MSVC C2084 on Windows only, and Scripts/check-jumbo-build-collisions.py gates
+// on the name being here.
+namespace TraceOysterPoisonFile
+{
+	/**
+	 * The refund, applied at THE ONE PLACE A POISON BEGINS.
+	 *
+	 * WHY IT LIVES IN ApplyTo AND NOT IN THE JAR. §6a says "everytime he poisons someone", and
+	 * ApplyTo is the only function in the project that can make that true of every route at once:
+	 * the dash jar's burst, the Pickler jar's detonation, and the harness all arrive here. Putting it
+	 * in ATraceOysterJar::Burst() would have covered two of the three and read as if it did cover all
+	 * of them.
+	 *
+	 * "EVERYTIME", INCLUDING A REFRESH. ApplyTo is called once per victim per burst whether or not
+	 * that victim was already poisoned, and the refund is unconditional here for the same reason —
+	 * re-poisoning somebody who is already green is still poisoning them. What it is NOT is once per
+	 * poison TICK: a tick is the poison working, not Oyster poisoning anybody, and paying per tick
+	 * would mean E was never on cooldown at all while anything was alive and poisoned.
+	 *
+	 * "SOMEONE" IS AN ENEMY. Read narrowly on purpose. The choke point already refuses self and
+	 * refuses team-mates while friendly fire is off, but friendly fire is a knob, and a build with it
+	 * on must not turn "dash past your own team" into an infinite E. The team test is here rather
+	 * than left to the choke point because it is a DIFFERENT question from "may I poison them".
+	 *
+	 * AND IT IS OYSTER'S COOLDOWN, checked rather than assumed: the source component is asked what
+	 * character it is running. A poison that outlives its Oyster — he died, left, or swapped
+	 * character — must not hand whoever holds that component a free ability of a different name.
+	 */
+	static void RefundPicklerForPoisoning(const ATraceCharacter* Victim, UTraceAbilityComponent* SourceComp)
+	{
+		if (Victim == nullptr || SourceComp == nullptr)
+		{
+			return;
+		}
+
+		// The pre-v26 arm: no refund at all. See TraceOysterJar::IsLegacyE.
+		if (TraceOysterJar::IsLegacyE())
+		{
+			return;
+		}
+
+		if (SourceComp->GetCharacterId() != ETraceCharacterId::Oyster)
+		{
+			return;
+		}
+
+		const ETraceTeam SourceTeam = SourceComp->GetTeam();
+		const ETraceTeam VictimTeam = Victim->GetTeam();
+		if (SourceTeam == ETraceTeam::None || VictimTeam == ETraceTeam::None || VictimTeam == SourceTeam)
+		{
+			return;
+		}
+
+		SourceComp->ServerResetActivatedCooldown(TEXT("Oyster poisoned an enemy — spec v26 §6a"));
 	}
 }
 
@@ -170,6 +234,10 @@ UTraceOysterPoisonComponent* UTraceOysterPoisonComponent::ApplyTo(ATraceCharacte
 	}
 
 	TraceOyster::RecordEffect(Target, TEXT("poison applied"), &TraceOyster::FEffectTally::PoisonApplications);
+
+	// SPEC v26 §6a. LAST, and only on the success path: everything above can still bail out, and a
+	// refund for a poison that was never applied would be a free E for missing.
+	TraceOysterPoisonFile::RefundPicklerForPoisoning(Target, SourceComp);
 
 	return Poison;
 }

@@ -33,6 +33,7 @@
 #include "UObject/WeakObjectPtr.h"
 
 #include "Settings/TraceUserSettings.h"   // ETraceInputAction
+#include "UI/Text/TraceTextWeight.h"      // ETraceTextWeight - which FACE a string is set in (v26 §2)
 
 class AHUD;
 class APawn;
@@ -489,10 +490,33 @@ private:
 	 */
 	bool DrawValueChip(AHUD* HUD, float X, float Y, float W, float H) const;
 
+	// ---- Text ------------------------------------------------------------------------------------
+	//
+	// SPEC v26 §2 — @p Weight is which FACE the string is set in, and it has NO DEFAULT.
+	//
+	// This page draws headers in Sofachrome and its body in Erbaum Bold, and the three faces share no
+	// advances (Erbaum measures the alphabet a third narrower than Sofachrome ExtraLight). A defaulted
+	// face would therefore let a future call site measure in one face and draw in another and produce a
+	// layout that is wrong by a third — silently, in a screenshot, rather than in a compile. Making it
+	// explicit costs one argument per call and makes that class of mistake unexpressible. The names to
+	// pass are TraceOptionsMenuType::HeaderFace / ::BodyFace, in the .cpp beside the reasoning.
+
+	/**
+	 * Which face an ACTION row's label is set in — the one place §2's split needed a judgement.
+	 *
+	 * Sofachrome on the pause root (it is the in-match main menu), Erbaum on the settings and video
+	 * pages (they are submenus). The whole argument is at the definition in the .cpp.
+	 */
+	ETraceTextWeight FaceForAction() const;
+
 	/** Centred text helper; AHUD::DrawText is top-left anchored and has no measure-and-centre form. */
-	void DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale);
-	void DrawTextRight(AHUD* HUD, const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale);
-	float MeasureWidth(AHUD* HUD, const FString& Text, UFont* Font, float Scale);
+	void DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale,
+		ETraceTextWeight Weight);
+	void DrawTextRight(AHUD* HUD, const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale,
+		ETraceTextWeight Weight);
+	float MeasureWidth(AHUD* HUD, const FString& Text, UFont* Font, float Scale, ETraceTextWeight Weight);
+
+	/** The line box. Face-independent by construction — every atlas shares it — so it takes no weight. */
 	float MeasureHeight(AHUD* HUD, const FString& Text, UFont* Font, float Scale);
 
 	// ---- State ----------------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 
 #include "Abilities/TraceAbilityComponent.h"   // spec v14 §6: Mace's per-player magnet radius
 #include "Abilities/TraceAbilityTypes.h"       // spec v19 §3: TraceAbilityTraits — Mortimer's longer charge hold
+#include "Audio/TraceAudio.h"                  // spec v26 §9: CoreTurnover (game-side), CorePickup (client-side)
 #include "Net/UnrealNetwork.h"
 
 #include "Trace.h"
@@ -6953,6 +6954,13 @@ void ATraceCore::RegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where,
 	TurnoverStartServerTime = GetServerTimeSeconds();
 	bTurnoverRegisteredThisFlight = true;
 
+	// SPEC v26 §9 — "Core Turnover ... should be game-side", i.e. everyone nearby hears it. One line,
+	// on the authority, at the point the rule fires; TraceAudio::Play reads the event's declared side
+	// (Audio/TraceSoundEvents.h) and multicasts it. Note `Where`, not GetActorLocation(): the actor is
+	// moved to `Where` a few lines below, so taking the sound's position from the rule's own argument
+	// keeps the two in step if that ordering ever changes.
+	TraceAudio::PlayAt(this, TraceSoundEvents::CoreTurnover, Where);
+
 	// Captured HERE, by the rule itself, for the same reason TakeLooseCore captures its take: by the
 	// time Trace.ModeB.Verify's step 6/7/8 gets to judge, an enemy may already have pulled the Core
 	// and cleared the window, and a scenario that polled for it would report a rule that had fired
@@ -9430,6 +9438,19 @@ void ATraceCore::OnRep_Carrier()
 {
 	ApplyAttachment();
 	UpdateVisuals();
+
+	// SPEC v26 §9 — "CorePickup ... you pick up the Core", CLIENT SIDE: only the player who now holds
+	// it hears it, and no RPC is sent for it.
+	//
+	// THIS IS THE ONE CALL SITE AND IT COVERS EVERY TOPOLOGY, which is why it is here and not in
+	// GrantTo: GrantTo ends by calling OnRep_Carrier() explicitly (so a listen-server host and a
+	// standalone session reach it), and replication calls it on every remote client. Putting it in
+	// both would give the host the sound twice.
+	//
+	// TraceAudio::Play's own gate does the rest: it plays only when Carrier is the pawn of a PLAYER on
+	// THIS machine, so a bot picking the Core up is silent, a teammate picking it up is silent for you,
+	// and a null Carrier (the kickoff path, which also calls this) is silent for everybody.
+	TraceAudio::Play(Carrier, TraceSoundEvents::CorePickup);
 
 	// Server truth about who holds it supersedes any local pass prediction.
 	bLocalPassPredicted = false;

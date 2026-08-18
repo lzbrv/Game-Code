@@ -1484,9 +1484,10 @@ namespace
 			{ TEXT("OysterPicklerDamageRadiusUU"),     EKnobType::Float, TEXT("v14 §6: the area the 30 covers") },
 			{ TEXT("OysterPicklerPullRadiusUU"),       EKnobType::Float, TEXT("v14 §6: 'a small radius'. CONTROL") },
 			{ TEXT("OysterPicklerPullSpeed"),          EKnobType::Float, TEXT("v14 §6: pulls enemies toward it. CONTROL") },
-			{ TEXT("OysterPicklerThrowSpeed"),         EKnobType::Float, TEXT("v14 §6: it is LOBBED, and it does NOT explode — it persists as a jar") },
+			{ TEXT("OysterPicklerDetonateDelayScale"), EKnobType::Float, TEXT("v26 §6b: the fuse, as a MULTIPLE of the pull's own travel time (PullRadius/PullSpeed)") },
+			{ TEXT("OysterPicklerThrowSpeed"),         EKnobType::Float, TEXT("v14 §6: it is LOBBED. v26 §6b: it now DOES explode, when the pull finishes") },
 			{ TEXT("OysterPicklerThrowUpBias"),        EKnobType::Float, TEXT("v14 §6: the arc on the lob") },
-			{ TEXT("OysterPicklerCooldownSeconds"),    EKnobType::Float, TEXT("v14 §6 ASSUMPTION: 20s, unspecified in the doc") },
+			{ TEXT("OysterPicklerCooldownSeconds"),    EKnobType::Float, TEXT("v14 §6 ASSUMPTION: 20s, unspecified. v26 §6a: a CEILING — poisoning an enemy clears it") },
 
 			// --- v14 §6: X ----------------------------------------------------------------------------
 			{ TEXT("XBeeCount"),                       EKnobType::Int,   TEXT("v14 §6: five mechanical bees") },

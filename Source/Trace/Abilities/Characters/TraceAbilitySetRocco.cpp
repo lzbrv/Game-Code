@@ -8,6 +8,7 @@
 
 #include "Abilities/Characters/TraceRippleActor.h"
 #include "Abilities/TraceAbilityComponent.h"
+#include "Audio/TraceAudio.h"                  // spec v26 §9 - the second jump IS a jump, and was silent
 #include "Core/TraceCharacter.h"
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
@@ -316,6 +317,20 @@ bool UTraceAbilitySetRocco::OnJumpPressed()
 		TEXT("[Rocco] second jump: redirect fraction %.2f, planar (%.0f,%.0f) -> (%.0f,%.0f), Z %.0f -> %.0f."),
 		Settings.RoccoSecondJumpRedirectFraction, VelocityBefore.X, VelocityBefore.Y,
 		NewVelocity.X, NewVelocity.Y, VelocityBefore.Z, NewVelocity.Z);
+
+	// SPEC v26 §9 — Jump, client-side, and it has to be HERE because of the line below.
+	//
+	// FOUND BY THE INTEGRATION HARNESS, not by reading. Returning true consumes the press, so
+	// ACharacter::Jump is never called and UTraceCharacterMovementComponent::DoJump — where the Jump
+	// sound lives for everybody else — never runs. Rocco's second jump was therefore the one jump in
+	// the game that made no sound at all: the player presses the jump key, leaves the ground, and
+	// hears nothing. (The same press next to a wall also becomes a second jump rather than a wall
+	// jump, which is why the harness picks MACE for the wall-jump step.)
+	//
+	// Exactly one play, by construction: DoJump is unreachable on this path, so this cannot double
+	// with the movement layer's call. Same client-side gate as every other Jump — only the machine
+	// whose player pressed the key hears it.
+	TraceAudio::Play(MyPawn, TraceSoundEvents::Jump);
 
 	// TRUE CONSUMES THE JUMP. The normal jump must not also run — that would be a double launch.
 	return true;

@@ -62,25 +62,40 @@ class UWorld;
  * scaled down rather than replaced with a constant - see the comment on that block in
  * TraceSettings.h for why a constant radius cannot work across a 24000+ uu arena.
  *
- * --- THE FIRST PERSON OFFSET, AND WHY THE OLD TRACER WAS INVISIBLE ----------------------------
+ * --- THE FIRST PERSON START, AND WHY IT IS ASKED FOR RATHER THAN GUESSED ----------------------
  *
  * ATraceCharacter::GetMuzzleLocation() sits 22 uu in front of the eye, ON the aim ray, and
  * GetAimDirection() is that same ray. So to the shooter's own camera the beam is a line pointing
  * directly away from the viewer: it projects to a single point behind the crosshair and is, in the
  * strict geometric sense, invisible. That is a large part of why the old tracer "looked odd" - in
- * first person there was nothing to see but the impact.
+ * first person there was nothing to see but the impact. The near end therefore has to be moved to
+ * where the gun VISIBLY is, for the local shooter only.
  *
- * So for the LOCAL shooter only, the near end of the beam is moved to where the gun visibly is:
- * pushed FirstPersonStandoffUU down the shot and offset right and down into the viewmodel's
- * corner of the screen. The beam then runs diagonally from the weapon to the crosshair, which is
- * what every first-person shooter does and what makes the shot legible. Nothing about the
- * gameplay ray changes - this is the last 80 uu of a cosmetic actor, applied on one machine.
+ * IT USED TO BE MOVED BY HAND, AND SPEC v26 §4 IS THE BILL FOR THAT. Three constants lived here -
+ * FirstPersonStandoffUU 120, FirstPersonRightOffsetUU 42, FirstPersonDownOffsetUU 17 - which pushed
+ * the start down the shot and then across into "the viewmodel's corner of the screen". They were
+ * eyeballed against the small procedural cube gun. When the 185 cm railgun replaced it the gun moved
+ * and the constants did not, and the beam started roughly 140 px too far right and 60 px too high:
+ * "above or behind it", verbatim, which is the report.
  *
- * The standoff is also a SAFETY feature. An unlit emissive sphere 22 uu from the eye subtends
- * about 30 degrees of screen, and unlit emissive is distance-invariant, so it arrives at full
- * intensity however close it is - the exact recipe for the point-blank whiteout this project has
- * already been bitten by once. Everything drawn near the muzzle is pushed out of the near field
- * first, and the impact pop is dimmed and shrunk when it lands close to the camera.
+ * THE START IS NOW DERIVED FROM THE BARREL. ATraceCharacter::GetViewModelMuzzleViewPoint() returns
+ * the world point at which the viewmodel's muzzle marker - a scene component parented to the railgun
+ * body at the mesh's own (107.4, 0, 4.5) cm muzzle landmark - is actually DRAWN, having been put
+ * through the same first-person re-projection the GPU applies to it. So the beam leaves the barrel by
+ * construction: it tracks the recoil, the sway, the walk bob and the slide dip, it is correct for the
+ * fallback cube gun as well as for the railgun, and it follows the player's own field-of-view slider.
+ * There is no number here to re-tune when the gun moves again.
+ *
+ * Nothing about the gameplay ray changes. The shot ORIGIN is camera-derived on purpose - it is what
+ * makes the crosshair honest, it is evaluated on the server too, and it is not this actor's business.
+ * This is the near end of a cosmetic beam, on one machine.
+ *
+ * The old standoff was also doing a SAFETY job, and that survives the change for free. An unlit
+ * emissive sphere 22 uu from the eye subtends about 30 degrees of screen, and unlit emissive is
+ * distance-invariant, so it arrives at full intensity however close it is - the recipe for a
+ * point-blank whiteout. The muzzle marker sits ~85 uu out, a couple of uu further than the 120 uu
+ * standoff put the start once its lateral offset is counted, so the flash and the sheath subtend no
+ * more of the frame than they did before.
  *
  * --- NETWORKING -------------------------------------------------------------------------------
  *
@@ -281,20 +296,33 @@ private:
 	 */
 	static constexpr float HotColorWhiteMix = 0.50f;
 
-	/** See "THE FIRST PERSON OFFSET" in the class comment. */
-	static constexpr float FirstPersonStandoffUU = 120.0f;
+	// FirstPersonStandoffUU / FirstPersonRightOffsetUU / FirstPersonDownOffsetUU ARE GONE (spec v26
+	// §4). They were the hand-tuned screen offset that put the beam beside the barrel; the start now
+	// comes from ATraceCharacter::GetViewModelMuzzleViewPoint(). See the class comment. They are
+	// deleted rather than defaulted to zero, so nothing can quietly start using them again.
 
 	/**
-	 * Sideways/downward offset of the beam's near end, in camera space, at the standoff distance.
-	 * Chosen so the beam appears to leave the viewmodel in the lower right of the screen: at 120 uu
-	 * these subtend about 19 degrees right and 8 degrees down, which lands on the gun at a 95
-	 * degree field of view.
+	 * Camera-to-shot-origin distance under which the first person treatment is applied at all.
+	 *
+	 * A GATE, not an offset, which is why it survived the deletion above. Every machine spawns a
+	 * tracer for every shot in the match; this is what distinguishes "the beam I just fired, whose
+	 * origin is 22 uu from my eye" from "someone else's beam, 3000 uu away", so that only my own shot
+	 * is moved onto my own barrel. Comfortably larger than MuzzleForward (22) and comfortably smaller
+	 * than any distance another player can be at.
 	 */
-	static constexpr float FirstPersonRightOffsetUU = 42.0f;
-	static constexpr float FirstPersonDownOffsetUU = 17.0f;
-
-	/** Camera-to-muzzle distance under which the first person treatment is applied. */
 	static constexpr float FirstPersonProximityUU = 160.0f;
+
+	/**
+	 * How much beam must remain BEYOND the muzzle for the move to be worth making, in uu.
+	 *
+	 * The muzzle is ~85 uu down the shot, so a point-blank hit on a wall closer than that would put
+	 * the start past the impact and draw the beam backwards. The old standoff had the same hazard and
+	 * handled it by shrinking the standoff; there is nothing to shrink now that the start is a place
+	 * rather than a distance, so the answer is simply to leave the beam at the true origin for shots
+	 * too short to relocate. Those are pressed-against-a-wall shots where the beam is a few pixels
+	 * long and unreadable either way.
+	 */
+	static constexpr float MinBeamBeyondMuzzleUU = 40.0f;
 
 	/** /Engine/BasicShapes primitives are 100 uu across, centred on their own origin. */
 	static constexpr float BasicShapeExtentUU = 100.0f;

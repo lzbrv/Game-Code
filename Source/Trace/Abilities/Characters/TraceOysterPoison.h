@@ -138,6 +138,12 @@ public:
 	 * at all is the caller's decision (a carrier is never poisoned in the first place). Every tick
 	 * AFTER this re-checks, which is where the "picked the Core up mid-poison" case is caught.
 	 *
+	 * *** SPEC v26 §6a: THIS IS ALSO WHERE OYSTER'S E COOLDOWN IS REFUNDED. *** "Change Oyster's E
+	 * cooldown to reset everytime he poisons someone", and this function is the one place in the
+	 * project where "he poisons someone" happens — every jar, every route, and the harness. The rule,
+	 * the enemy-only reading of "someone" and the once-per-application (not once-per-tick) reading of
+	 * "everytime" are all in TraceOysterPoisonFile::RefundPicklerForPoisoning in the .cpp.
+	 *
 	 * @return the live component, or null when nothing could be attached.
 	 */
 	static UTraceOysterPoisonComponent* ApplyTo(ATraceCharacter* Target, UTraceAbilityComponent* SourceComp);

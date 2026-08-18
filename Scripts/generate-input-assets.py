@@ -6,7 +6,7 @@
 #
 #     IA_Move IA_Look IA_Jump IA_Crouch IA_Fire IA_Pass IA_Dash IA_Parry
 #     IA_Scoreboard IA_EquipKnife IA_EquipGun IA_Ability IA_AbilitySecondary
-#     IA_Reload                                        (14 UInputAction assets)
+#     IA_Reload IA_PullCore                            (15 UInputAction assets)
 #     IMC_Trace                                        (1 UInputMappingContext)
 #
 # -----------------------------------------------------------------------------
@@ -29,7 +29,7 @@
 # WHAT IS AND IS NOT AUTHORITATIVE  (read this before editing an asset by hand)
 # -----------------------------------------------------------------------------
 # AUTHORITATIVE, and genuinely used by the running game:
-#   * the 14 IA_* assets themselves - the controller binds its handlers to THESE
+#   * the 15 IA_* assets themselves - the controller binds its handlers to THESE
 #     objects when they exist, and takes ValueType and AccumulationBehavior from
 #     them. Get one of those wrong and input silently reads as zeroes, which is
 #     why the controller validates them and falls back to C++ if they disagree.
@@ -148,6 +148,14 @@ ACTIONS = [
     ("IA_Ability", BOOL, HIGHEST, "Activated ability. A press."),
     ("IA_AbilitySecondary", BOOL, HIGHEST, "Secondary ability. A HOLD - Mace suspends only while it is down."),
     ("IA_Reload", BOOL, HIGHEST, "Reload. The clip also reloads itself when it empties."),
+    # SPEC v26 s1 - "Make parry and pull core two separate binds in the settings
+    # menu." Its OWN action, not a second key on IA_Parry: the keybind page lists
+    # ACTIONS, so a second key on the parry would be a bind nobody could see or
+    # change on its own. A HOLD - the controller binds Started, Completed AND
+    # Canceled, because spec v25 s2's rule is that releasing cancels the pull.
+    ("IA_PullCore", BOOL, HIGHEST,
+     "Pull the Core during a turnover (spec v25 s2). HELD - releasing cancels. "
+     "Spec v26 s1 split this off the parry's button into a bind of its own."),
 ]
 
 # -----------------------------------------------------------------------------
@@ -198,13 +206,23 @@ MAPPINGS = [
     # has had the matching row removed, so Trace.Input.VerifyAssets agrees.
     ("IA_Dash", "LeftShift", [], ""),
     # SPEC v25 s7: parry moves from Q to the right mouse button. Q is now unclaimed.
-    ("IA_Parry", "RightMouseButton", [], "parry, and spec v25 s2's core-pull"),
+    # SPEC v26 s1 splits the two verbs apart: this row is the PARRY alone now, and
+    # the pull has its own row at the bottom of this table.
+    ("IA_Parry", "RightMouseButton", [], "parry (spec v25 s7)"),
     ("IA_Scoreboard", "Tab", [], ""),
     ("IA_EquipKnife", "One", [], ""),
     ("IA_EquipGun", "Two", [], ""),
     ("IA_Ability", "E", [], ""),
     ("IA_AbilitySecondary", "V", [], ""),
     ("IA_Reload", "R", [], ""),
+    # SPEC v26 s1. F, and the collision check is the only decision there was:
+    # WASD, Space, LeftControl, LeftShift, both mouse buttons, Tab, 1, 2, E, V and
+    # R are claimed; F was vacated by spec v15 s5 when the SwapWeapon toggle was
+    # deleted, and "F to grab the thing you are looking at" is this genre's
+    # strongest convention. Q (freed when parry moved to the mouse) was the other
+    # candidate - passed over because the pull is a HOLD taken while still
+    # steering, and F is under an index finger already resting on D.
+    ("IA_PullCore", "F", [], "spec v26 s1 - the turnover core-pull, its own bind"),
 ]
 
 CONTEXT_NAME = "IMC_Trace"

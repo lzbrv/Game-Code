@@ -16,6 +16,7 @@
 
 #include "Abilities/TraceAbilityComponent.h"    // spec v14 §6: the speed passives and the dash hooks
 #include "Abilities/TraceAbilityTypes.h"        // spec v14 §6: TraceAbilityDebuff — Oyster's poison slow
+#include "Audio/TraceAudio.h"                   // spec v26 §9: Jump / WallJump, both client-side
 #include "Components/CapsuleComponent.h"        // mantle: capsule dimensions and the clearance sweep
 #include "Components/SceneComponent.h"
 #include "CollisionQueryParams.h"
@@ -289,6 +290,41 @@ static bool IsV24LegacySlide()
 }
 
 // =================================================================================================
+// SPEC v26 §3 — THE A/B ARM FOR THE 20% CUT AND THE CHAIN CEILING.
+//
+// v26 §3, verbatim: "Reduce slide jump momentum boost by 20%. Add a ceiling to slide jump momentum
+// boosts, so that you can't chain them over and over to go faster and faster. Right now, if you do
+// three slide jump boosts in a row you can zip down the whole field. For now, lets cap it at what
+// the momentum is after you do two consecutive slide boosts."
+//
+// THE CLAIM THIS ARM EXISTS TO FALSIFY IS A CLAIM ABOUT THE THIRD HOP, and a claim about a
+// DIFFERENCE cannot be settled by one number measured after the change. Same argument, same shape
+// and the same one-binary rule as the three arms above: non-zero (or -TraceV26LegacySlideJump)
+// forces BOTH halves of §3 back to their identities —
+//
+//   §3a SlideJumpMomentumScale        0.80 -> 1.00   (the well-timed multiplier back to 1.446875)
+//   §3b bSlideJumpChainCapEnabled     ON   -> OFF    (chaining compounds without limit again)
+//
+// so Trace.Move.AuditV16.SlideChain can run four chained hops in the RED arm, show the third and
+// fourth still climbing, and then run the identical phases in the GREEN arm and show the third
+// pinned to the second. One binary, one harness, one lane of arena, both arms.
+//
+// bSlideJumpChainCapEnabled in Project Settings reverts the CEILING ONLY and is the designer-facing
+// switch; this one reverts the whole item and is dev-only, which is the same division of labour as
+// bSlideJumpEnabled vs Trace.V9LegacyTuning.
+//
+// Defined outside every build guard for the Shipping-link reason spelled out on GTraceV9LegacyTuning:
+// GetSlideJumpWindowSpeedBonus() and DoJump() read it, and both ship. Registration lives in the dev
+// block with the others.
+int32 GTraceV26LegacySlideJump = 0;
+
+static bool IsV26LegacySlideJump()
+{
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceV26LegacySlideJump"));
+	return GTraceV26LegacySlideJump != 0 || bFromCommandLine || IsV9LegacyTuning();
+}
+
+// =================================================================================================
 // SPEC v18 §1a — THE A/B ARM FOR THE AIR REVERSAL BRAKE.
 //
 // Same argument as the two arms above, and the same shape. "Reversing in the air does nothing" is a
@@ -452,6 +488,9 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	SlideBufferRemaining = 0.f;
 	SlideJumpGraceRemaining = 0.f;
 	bSlideJumpGraceWellTimed = 0;
+	// Spec v26 §3b. Saved-move state like everything above it: a fresh pawn is not mid-chain.
+	SlideJumpChainBoosts = 0;
+	SlideJumpChainCeiling = 0.f;
 	bSlideHeldLastMove = 0;
 	bWasAirborneLastMove = 0;
 
@@ -968,7 +1007,44 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
 		: FMath::Clamp(TraceMoveKnob::Float(TEXT("SlideJumpBonusScale"), 1.43f), 0.1f, 4.f);
 	const bool bGainOnly = TraceMoveKnob::Bool(TEXT("bSlideJumpBonusScalesGainOnly"), true);
 
-	const float Global = FMath::Max(1.f, bGainOnly ? (1.f + (Base - 1.f) * Scale) : (Base * Scale));
+	float Global = FMath::Max(1.f, bGainOnly ? (1.f + (Base - 1.f) * Scale) : (Base * Scale));
+
+	// =============================================================================================
+	// SPEC v26 §3a — "Reduce slide jump momentum boost by 20%." ONE FACTOR, APPLIED LAST.
+	// =============================================================================================
+	//
+	// THE GAIN, NOT THE MULTIPLIER, and that reading is not a new judgement call — it is the one this
+	// function already ships for v9 §7 (bSlideJumpBonusScalesGainOnly, see the block above). "The
+	// boost" is the part of the multiplier above 1.0: at SlideJumpHorizontalRetention 1.0 the value
+	// 1.0 is pure momentum PRESERVATION, which is what escaping the ground friction is worth and is
+	// not something §3 asks to cut. So:
+	//
+	//     1 + (1.446875 - 1) x 0.80 = 1.357500
+	//
+	// THE ALTERNATIVE READING, stated so it can be chosen rather than rediscovered: -20% of the WHOLE
+	// multiplier is 1.446875 x 0.80 = 1.1575. That takes the gain from 0.446875 to 0.1575 — a 65% cut
+	// of the only thing timing the hop buys — for a note that says 20%, and it would leave the
+	// well-timed hop worth less than the v5 §3 bonus it replaced. If the owner meant that one, set
+	// SlideJumpMomentumScale to 0.3524 (= 0.1575 / 0.446875) and nothing else moves.
+	//
+	// A MISTIMED HOP IS UNTOUCHED BY ARITHMETIC, NOT BY A CARVE-OUT: DoJump only multiplies by this
+	// value when bWellTimed, and the retention it multiplies is 1.0, which has no gain to scale.
+	//
+	// WHY IT IS ITS OWN KNOB AND NOT AN EDIT TO THE TWO ABOVE. SlideJumpWindowSpeedBonus is v8 §8's
+	// base and SlideJumpBonusScale is v9 §7's increase as re-raised by v16 §0. Folding v26's cut into
+	// either would put three specs' decisions in one number, and the next person to retune that
+	// decision would silently delete or double this one. That failure has happened in this file
+	// before — see SlideJumpWindowSeconds' note on the 0.2 s that must not be applied twice.
+	//
+	// BEFORE THE CHARACTER SEAM, deliberately. Elle's +40% scales the reduced gain rather than being
+	// computed against a number the game no longer ships, which is the same ordering rule the seam's
+	// own comment states: every global knob, every legacy arm and both readings of "the bonus" are
+	// resolved first, and the ability layer only ever gets to scale the finished number.
+	if (!IsV26LegacySlideJump())
+	{
+		const float MomentumScale = FMath::Clamp(UTraceSettings::Get().SlideJumpMomentumScale, 0.f, 2.f);
+		Global = FMath::Max(1.f, 1.f + (Global - 1.f) * MomentumScale);
+	}
 
 	// SPEC v18 §2 — Elle's second passive, "+40% on well-timed slide-jump momentum boosts", and the
 	// ONE place a character is allowed to change this number.
@@ -990,6 +1066,45 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowZBonus() const
 	// New in spec v5 §3. Height is the channel a player can actually SEE — 25% more planar speed is
 	// deniable, clearing a box you could not clear a second ago is not.
 	return FMath::Max(1.f, TraceMoveKnob::Float(TEXT("SlideJumpWindowZBonus"), 1.12f));
+}
+
+// --- SPEC v26 §3b — the chain ceiling's three reads ---------------------------------------------
+//
+// DIRECT MEMBER ACCESS, NOT TraceMoveKnob, AND THAT IS THE SAFE CHOICE HERE. The by-name path exists
+// so this component can read a knob that may not have landed yet; its cost is that a typo binds to
+// nothing and falls back to the default in silence, which is a documented trap in this project's
+// house rules. These three properties land in the same change as their readers, so a direct
+// UTraceSettings::Get().X is compile-checked and cannot fail quietly. Do not "tidy" them onto the
+// name-bound path.
+
+bool UTraceCharacterMovementComponent::IsSlideJumpChainCapEnabled() const
+{
+	// The dev A/B arm wins over the designer switch, not the other way round: the arm's whole job is
+	// to reproduce v25 exactly, and a Project Settings value that could veto it would make the RED
+	// run silently green.
+	return !IsV26LegacySlideJump() && UTraceSettings::Get().bSlideJumpChainCapEnabled;
+}
+
+int32 UTraceCharacterMovementComponent::GetSlideJumpChainCapBoosts() const
+{
+	// Floored at 1. Zero would mean "cap the chain at the speed it started with", which is not a
+	// ceiling on the boost — it is the deletion of the move — and a knob whose bottom value silently
+	// removes a mechanic is exactly the sort of setting this file keeps deleting.
+	return FMath::Max(1, UTraceSettings::Get().SlideJumpChainCapBoosts);
+}
+
+float UTraceCharacterMovementComponent::GetSlideJumpChainResetSpeed() const
+{
+	// GetMaxSpeed() and not Settings.WalkSpeed: the pawn's ground ceiling already folds in the
+	// carrier multiplier (1.22), the knife profile (1.30) and every ability speed passive, so a
+	// threshold written as a MULTIPLE of it follows all of them without this function learning any of
+	// their names — and retuning WalkSpeed cannot make the chain immortal by accident.
+	//
+	// The caller is responsible for only asking while the pawn is on its feet. GetMaxSpeed() folds
+	// SlideSpeed in while sliding and returns DashSpeed while dashing, so asked at the wrong moment
+	// this would compare the slide against itself and never end a chain.
+	const float OnFoot = FMath::Max(1.f, GetMaxSpeed());
+	return OnFoot * FMath::Clamp(UTraceSettings::Get().SlideJumpChainResetSpeedMultiplier, 0.f, 3.f);
 }
 
 // --- The air-strafe accumulation ceiling (spec v5 §1) -------------------------------------------
@@ -2261,6 +2376,22 @@ void UTraceCharacterMovementComponent::BeginDash()
 	// IsDashing() as a backstop and shares bDashJarSpawnedThisDash with OnDashStarted, and Chut's
 	// TryBash is idempotent against its own poll. That is belt and braces on purpose — this project
 	// has shipped a "wired" hook that fired twice.
+	// SPEC v26 §9 — Dash, GAME-SIDE, and it lives HERE rather than on the ability hook below.
+	//
+	// The audio pass wired it to UTraceAbilityComponent::NotifyDashStarted, which is one dash per
+	// dash and correct for every pawn that HAS an ability component and an enabled ability layer.
+	// Integrating it, that turned out to be two conditions the dash itself does not have: a
+	// characterless practice-range pawn has no UTraceAbilityComponent, and
+	// TraceAbilityIntegration::IsEnabled() is a switch that can be off — in both cases the pawn still
+	// dashes and used to do it in silence. BeginDash is the dash; the ability hook is a listener.
+	//
+	// The line moved here and was DELETED there in the same change, which is the only way it does not
+	// become two plays per dash. Same guard as the hook below (never on a replayed move), one call.
+	if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating)
+	{
+		TraceAudio::Play(CharacterOwner, TraceSoundEvents::Dash);
+	}
+
 	if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating && TraceAbilityIntegration::IsEnabled())
 	{
 		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(CharacterOwner))
@@ -2924,6 +3055,19 @@ bool UTraceCharacterMovementComponent::TryWallJump()
 	}
 #endif
 
+	// SPEC v26 §9 — WallJump, client-side. INSIDE TryWallJump rather than at DoJump's
+	// `if (TryWallJump()) return true;`, because TryWallJump is ALSO reached from OnMovementUpdated's
+	// buffered-press path (spec v10 §5) and both of those are real wall jumps to the player. This is
+	// the single point every successful wall jump passes through, and it is past every refusal.
+	//
+	// The bClientUpdating guard is the double-play guard: a server correction re-runs the move on the
+	// owning client — the only machine that hears this — and would otherwise fire it twice. There is
+	// no bReplayingMoves parameter here; bClientUpdating covers the same window for this entry point.
+	if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating)
+	{
+		TraceAudio::Play(CharacterOwner, TraceSoundEvents::WallJump);
+	}
+
 	return true;
 }
 
@@ -3059,6 +3203,20 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 			return false;
 		}
 
+		// SPEC v26 §9 — Jump, client-side. THE ORDINARY / AIR-JUMP EXIT.
+		//
+		// Deliberately NOT immediately after Super::DoJump: a wall jump leaves through the
+		// `if (TryWallJump()) return true;` above, which already played WallJump, and layering the two
+		// would make every wall jump a chord. The two exits that reach a sound are this one and the
+		// slide-jump exit at the bottom of the function.
+		//
+		// bReplayingMoves is the double-play guard: a client correction re-runs DoJump on the owning
+		// client, which is the only machine this sound plays on.
+		if (!bReplayingMoves && CharacterOwner != nullptr && !CharacterOwner->bClientUpdating)
+		{
+			TraceAudio::Play(CharacterOwner, TraceSoundEvents::Jump);
+		}
+
 		return true;
 	}
 
@@ -3070,7 +3228,84 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 	// doing.
 	const float Retention = GetSlideJumpHorizontalRetention()
 		* (bWellTimed ? GetSlideJumpWindowSpeedBonus() : 1.f);
-	const float LaunchSpeed = CarrySpeed * Retention;
+
+	// The boost is already 20% weaker at this point: spec v26 §3a lives inside
+	// GetSlideJumpWindowSpeedBonus(), one factor on the gain, so every reader of that function — this
+	// line, the audit, the V9TUNING report, Elle's seam — sees the shipped number without being told.
+	const float UncappedLaunchSpeed = CarrySpeed * Retention;
+
+	// =============================================================================================
+	// SPEC v26 §3b — THE CHAIN CEILING.
+	//
+	// "Add a ceiling to slide jump momentum boosts, so that you can't chain them over and over to go
+	// faster and faster. Right now, if you do three slide jump boosts in a row you can zip down the
+	// whole field. For now, lets cap it at what the momentum is after you do two consecutive slide
+	// boosts."
+	//
+	// WHY IT COMPOUNDS AT ALL, since the block above insists retention 1.0 is not a boost. Because
+	// StartSlide takes the speed you ARRIVE with (spec v4 §1, "entry speed determines slide
+	// velocity", with an outer max() that deliberately refuses to brake a fast arrival) and the
+	// well-timed hop multiplies it. So a landed hop feeds the next slide, which feeds the next hop,
+	// and the whole loop is geometric. With the shipped 0.66 s slide bleeding 260 uu/s² the recurrence
+	// is v -> (v - 172) x 1.3575, whose fixed point is 652 uu/s: above that — and WalkSpeed is 800 —
+	// every chained hop is faster than the last, forever. That is the "zip down the whole field".
+	//
+	// *** THE CEILING IS ONE OF THE CHAIN'S OWN LAUNCHES, RECORDED. NOT A FORMULA. ***
+	// The formula version (entry x multiplier^N) is wrong here and quietly so: a slide DECAYS while
+	// the player waits for the well-timed window, so the momentum actually reached after two boosts
+	// depends on how long each of their two slides ran — information no expression on this line has.
+	// Keeping the chain's own highest launch answers the note's sentence literally, and it is
+	// RELATIVE for free: it already contains the boost knobs, the character's passive and whatever
+	// speed the player brought in, so it moves when any of those move. There is no absolute uu/s
+	// anywhere in this mechanic.
+	//
+	// WHAT A CAPPED HOP STILL GETS, because "a third and fourth may still be performed" is a
+	// requirement and not a courtesy: it still ENDS the slide through the one exit, still leaves the
+	// ground with the launch direction it earned, still escapes the ground friction that would have
+	// eaten the carry, and still collects the well-timed VERTICAL bonus below. Only the planar
+	// MAGNITUDE is clamped. A player chaining a fourth hop goes exactly as far as their second did.
+	//
+	// The counter and the ceiling are saved-move state (see FSavedMove_Trace) and the chain is ended
+	// in OnMovementUpdated the moment the pawn is back on its feet at or below
+	// GetSlideJumpChainResetSpeed() — i.e. the moment they have given the momentum back.
+	// =============================================================================================
+	float LaunchSpeed = UncappedLaunchSpeed;
+	const bool bChainCapOn = IsSlideJumpChainCapEnabled();
+
+	if (bChainCapOn)
+	{
+		const int32 CapBoosts = GetSlideJumpChainCapBoosts();
+
+		if (SlideJumpChainBoosts >= CapBoosts && SlideJumpChainCeiling > 0.f)
+		{
+			// Past the cap. Min, never Clamp against the ceiling: a hop that was ALREADY slower than
+			// the ceiling is left exactly where it was. The ceiling removes speed a chain has not
+			// earned; it never hands any back, or a mistimed fourth hop would be worth more than a
+			// mistimed first one.
+			LaunchSpeed = FMath::Min(LaunchSpeed, SlideJumpChainCeiling);
+
+			// *** AND IT MAY NEVER BRAKE. *** The note is "a third and fourth may still be performed,
+			// they just must not go FASTER" — not "they must be slowed down". Without this floor the
+			// ceiling would confiscate momentum the CHAIN never created: a player who dashes mid-chain
+			// (or is launched by Rocco's Ripple, or arrives off a wall jump) can be carrying more than
+			// their own two-boost ceiling, and the clamp above would take the difference off them for
+			// the crime of pressing crouch. That is a brake with no sentence in the note behind it, and
+			// it is exactly the failure spec v4 §1 removed from the slide's exit rule (see EndSlide's
+			// "THE OUTER max() IS NOT A BOOST" note — same shape, same argument, same fix).
+			//
+			// With the floor, a capped hop is PURE PRESERVATION: you keep what you brought, the
+			// slide-jump adds nothing, and nothing compounds — the launch can only track a speed some
+			// other mechanic already gave you, never multiply it.
+			LaunchSpeed = FMath::Max(LaunchSpeed, CarrySpeed);
+		}
+	}
+	else
+	{
+		// The A/B arm, or the designer's switch. Nothing accumulates while the ceiling is off, so
+		// turning it back on mid-session starts from a clean chain rather than from a stale ceiling.
+		SlideJumpChainBoosts = 0;
+		SlideJumpChainCeiling = 0.f;
+	}
 
 	FVector LaunchDirection(Velocity.X, Velocity.Y, 0.f);
 	if (!LaunchDirection.Normalize())
@@ -3109,6 +3344,27 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 	SlideJumpGraceRemaining = 0.f;
 	bSlideJumpGraceWellTimed = 0;
 
+	// SPEC v26 §3b — book the hop into the chain, AFTER the launch is applied.
+	//
+	// The order matters and is the reason this is not folded into the clamp above: the ceiling is
+	// recorded from the speed the pawn ACTUALLY LEFT AT, which for the capped hops is the ceiling
+	// itself. Recording the uncapped value instead would let the ceiling drift upward on every extra
+	// hop — the very compounding this whole block removes, wearing the cap's hat.
+	//
+	// THE HIGHEST OF THE FIRST N, not the Nth. In the intended case they are the same number (each
+	// well-timed hop is faster than the last, so the highest IS the last). They differ only when a
+	// player MISTIMES one of the first N, and taking the highest is the kinder and the more honest
+	// answer there: a fumbled second hop then cannot pin the rest of the chain below what the first
+	// one already achieved.
+	if (bChainCapOn)
+	{
+		++SlideJumpChainBoosts;
+		if (SlideJumpChainBoosts <= GetSlideJumpChainCapBoosts())
+		{
+			SlideJumpChainCeiling = FMath::Max(SlideJumpChainCeiling, LaunchSpeed);
+		}
+	}
+
 #if !UE_BUILD_SHIPPING
 	// Observation only, and on the authority alone so a client replaying corrections cannot count the
 	// same hop several times. At Display, behind the same switch as the slide measurement.
@@ -3122,8 +3378,27 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 			bWellTimed ? TEXT(", WELL TIMED") : TEXT(""),
 			Velocity.Z, JumpZVelocity, GetSlideJumpZMultiplier(),
 			bWellTimed ? GetSlideJumpWindowZBonus() : 1.f);
+
+		// SPEC v26 §3b, its own line rather than more columns on the one above: this is the number the
+		// owner's complaint is about, and "boost 3 of this chain was cut from X to Y" has to be
+		// readable on its own in a log full of hops. Printed for EVERY hop, capped or not, because
+		// "the cap did not fire" and "there was no third hop" are different facts.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SLIDEJUMPCAP %-16s boost #%d of chain  uncapped=%6.0f -> launched=%6.0f uu/s  "
+			     "ceiling=%6.0f (cap at %d boosts, reset at %5.0f uu/s) %s"),
+			*GetNameSafe(CharacterOwner), SlideJumpChainBoosts, UncappedLaunchSpeed, LaunchSpeed,
+			SlideJumpChainCeiling, GetSlideJumpChainCapBoosts(), GetSlideJumpChainResetSpeed(),
+			!bChainCapOn ? TEXT("CAP OFF (v26 legacy arm)")
+			             : (LaunchSpeed < UncappedLaunchSpeed - 1.f ? TEXT("*** CAPPED ***") : TEXT("")));
 	}
 #endif
+
+	// SPEC v26 §9 — Jump, client-side. THE SLIDE-JUMP EXIT, the second of DoJump's two sounded exits.
+	// Same guard, same reason as the ordinary exit above.
+	if (!bReplayingMoves && CharacterOwner != nullptr && !CharacterOwner->bClientUpdating)
+	{
+		TraceAudio::Play(CharacterOwner, TraceSoundEvents::Jump);
+	}
 
 	return true;
 }
@@ -3226,6 +3501,48 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		{
 			bSlideJumpGraceWellTimed = 0;
 		}
+	}
+
+	// 1a-0. SPEC v26 §3b — DOES THE SLIDE-JUMP CHAIN END THIS FRAME?
+	//
+	//       "Consecutive" is the word the note uses, and this is where it is defined: boosts are
+	//       consecutive while the player never gives the momentum back. The instant they are on their
+	//       feet at running pace again there is nothing left to compound, so the next slide-jump
+	//       starts a fresh chain and gets its full boost.
+	//
+	//       A SPEED AND NOT A TIMER, and the second reason is the load-bearing one. (1) It is what
+	//       "consecutive" means — a player who sprints on for three seconds at 1400 uu/s and then
+	//       hops is still cashing in the same momentum. (2) A timer inside a client-predicted move is
+	//       a prediction hazard: this function runs again, frame by frame, when the server corrects
+	//       the client, and a rule keyed on world time would resolve differently on the replay than it
+	//       did live. Planar speed is a pure function of state the saved move already carries, so both
+	//       passes reach the same verdict.
+	//
+	//       ON ITS FEET means grounded, NOT sliding and NOT dashing, and all three tests are
+	//       load-bearing rather than defensive. GetSlideJumpChainResetSpeed() reads GetMaxSpeed(),
+	//       which folds SlideSpeed in while sliding and returns DashSpeed while dashing — asked at
+	//       either of those moments it would compare an ability against itself. Worse, mid-slide the
+	//       planar speed has decayed BELOW walking pace by design (0.66 s at 260 uu/s² off an 800 uu/s
+	//       entry ends at 628), so a check that ran during the slide would end every chain one frame
+	//       before the hop that is supposed to be capped.
+	if (SlideJumpChainBoosts > 0
+		&& IsMovingOnGround()
+		&& !IsSliding()
+		&& !IsDashing()
+		&& GetPlanarSpeed() <= GetSlideJumpChainResetSpeed())
+	{
+#if !UE_BUILD_SHIPPING
+		if (IsSlideDebugEnabled() && CharacterOwner != nullptr && CharacterOwner->HasAuthority())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SLIDEJUMPCAP %-16s chain ENDED after %d boost(s) — back on foot at %5.0f uu/s "
+				     "(reset threshold %5.0f). The next slide-jump starts fresh."),
+				*GetNameSafe(CharacterOwner), SlideJumpChainBoosts, GetPlanarSpeed(),
+				GetSlideJumpChainResetSpeed());
+		}
+#endif
+		SlideJumpChainBoosts = 0;
+		SlideJumpChainCeiling = 0.f;
 	}
 
 	// 1a-i. THE LEDGE GRACE (spec v5 §7). Refilled while grounded, bled while not, so
@@ -4020,6 +4337,22 @@ static FAutoConsoleVariableRef CVarTraceV24LegacySlide(
 	     "full 1.26s slide) and NOTHING else, so the v24 sec 8 window-open time and slide duration can "
 	     "be measured as a BEFORE/AFTER in one binary. Run -TraceSlideDebug in both arms and diff the "
 	     "V24WINDOW lines."),
+	ECVF_Cheat);
+
+/**
+ * SPEC v26 §3 — the A/B arm for the 20% cut and the chain ceiling. See IsV26LegacySlideJump() at the
+ * top of the file for why both halves are named scalars rather than edits to the shipped numbers.
+ */
+// Defined at the top of the file, outside this dev block — GetSlideJumpWindowSpeedBonus() and
+// DoJump() read it and both ship. Registration only, here, for the Shipping-link reason on
+// GTraceV9LegacyTuning.
+static FAutoConsoleVariableRef CVarTraceV26LegacySlideJump(
+	TEXT("Trace.V26LegacySlideJump"),
+	GTraceV26LegacySlideJump,
+	TEXT("Dev only. 1 restores the pre-v26 slide-jump exactly: SlideJumpMomentumScale back to 1.0 (the "
+	     "well-timed multiplier back to 1.446875) AND the chain ceiling off, so chaining compounds "
+	     "without limit again. The RED arm for spec v26 sec 3 -- run Trace.Move.AuditV16.SlideChain "
+	     "with and without it in ONE binary and diff the four launch speeds."),
 	ECVF_Cheat);
 
 static FAutoConsoleVariableRef CVarTraceV10LegacyWallJump(
@@ -7017,6 +7350,42 @@ void UTraceCharacterMovementComponent::LogV9TuningReport() const
 		GetSlideJumpWindowSpeedBonus(), Settings.SlideJumpWindowSpeedBonus,
 		TraceMoveKnob::Bool(TEXT("bSlideJumpBonusScalesGainOnly"), true) ? 1 : 0,
 		SlideJumpMissed, SlideJumpTimed, SlideJumpTimed - SlideJumpMissed);
+
+	// --- SPEC v26 §3, the config side ------------------------------------------------------------
+	//
+	// Printed as the ARITHMETIC, exactly like the v24 block above and for the same reason: this is
+	// what the LIVE measurement (Trace.Move.AuditV16.SlideChain, and the SLIDEJUMPCAP lines under
+	// -TraceSlideDebug) is checked AGAINST. The two disagreeing is the whole reason both exist. It is
+	// deliberately NOT the evidence for §3 — §3 asks for the speed after one, two, three and four
+	// CHAINED hops, and no config read can produce those.
+	{
+		const float MomentumScale = IsV26LegacySlideJump()
+			? 1.f
+			: FMath::Clamp(Settings.SlideJumpMomentumScale, 0.f, 2.f);
+
+		// The pre-scale multiplier, recovered rather than re-derived: whatever the base, the v9 scale
+		// and both readings resolved to, undoing one known factor is safe and cannot drift from the
+		// shipped expression.
+		const float Shipped = GetSlideJumpWindowSpeedBonus();
+		const float BeforeV26 = (MomentumScale > KINDA_SMALL_NUMBER)
+			? (1.f + (Shipped - 1.f) / MomentumScale)
+			: Shipped;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("V26TUNING §3a slideJump gain %.5f -> %.5f (x%.3f on the GAIN)  multiplier %.5f -> %.5f  "
+			     "arm=%s"),
+			BeforeV26 - 1.f, Shipped - 1.f, MomentumScale, BeforeV26, Shipped,
+			IsV26LegacySlideJump() ? TEXT("LEGACY (pre-v26)") : TEXT("V26 (shipped)"));
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("V26TUNING §3b chain    ceiling=%s  capAfter=%d boost(s)  resetAt=%.2f x maxGroundSpeed  "
+			     "(this pawn: %5.0f uu/s)"),
+			IsSlideJumpChainCapEnabled() ? TEXT("ON") : TEXT("OFF"),
+			GetSlideJumpChainCapBoosts(),
+			FMath::Clamp(Settings.SlideJumpChainResetSpeedMultiplier, 0.f, 3.f),
+			GetSlideJumpChainResetSpeed());
+	}
+
 	UE_LOG(LogTraceGame, Display, TEXT("V9TUNING ============================================================"));
 }
 
@@ -7183,6 +7552,8 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, bSavedWasAirborneLastMove(0)
 	, SavedSlideJumpGraceRemaining(0.f)
 	, bSavedSlideJumpGraceWellTimed(0)
+	, SavedSlideJumpChainBoosts(0)
+	, SavedSlideJumpChainCeiling(0.f)
 	, SavedGroundGraceRemaining(0.f)
 	, SavedWallJumpLaunchNormal(FVector::ZeroVector)
 	, SavedWallJumpControlLockoutRemaining(0.f)
@@ -7217,6 +7588,11 @@ void FSavedMove_Trace::Clear()
 	bSavedWasAirborneLastMove = 0;
 	SavedSlideJumpGraceRemaining = 0.f;
 	bSavedSlideJumpGraceWellTimed = 0;
+
+	// Spec v26 §3b. Same pooling argument: a stale chain counter left in a recycled move would tell a
+	// replay it was three hops deep and clamp a launch the player was entitled to in full.
+	SavedSlideJumpChainBoosts = 0;
+	SavedSlideJumpChainCeiling = 0.f;
 
 	// Spec v5 §7. Moves are pooled, so this is reset like everything else: a stale ledge grace left
 	// in a recycled move would tell a mid-air replay it was standing on something. The six Mantle*
@@ -7336,9 +7712,21 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// the expiry is not the two moves of length dt it replaced. The buffered press is stronger still:
 	// it decides whether a wall jump happens at all, and on which frame, and a merged move would
 	// resolve it against a wall contact that landed somewhere else inside the merged interval.
+	//
+	// SPEC v26 §3b ADDS ONE MORE, and it is in this list for the same reason the buffered press is.
+	// While a chain is live, OnMovementUpdated is running a THRESHOLD test on planar speed every frame
+	// ("is the pawn back on its feet at running pace?"), and the answer decides whether the next
+	// slide-jump is clamped. A merged move evaluates that threshold once, at the far end of the merged
+	// interval, instead of at each frame inside it — so a chain could end on the server and survive on
+	// the client, and the two would disagree about several hundred uu/s on the next hop.
+	//
+	// It costs very close to nothing: every AIRBORNE move in a chain is already refused by
+	// bSavedMomentumActive below, so the only moves this newly refuses are the handful of grounded
+	// ones between a landing and the next slide — which is exactly the window the threshold lives in.
 	if (SavedDashTimeRemaining > 0.f || Other->SavedDashTimeRemaining > 0.f
 		|| SavedSlideTimeRemaining > 0.f || Other->SavedSlideTimeRemaining > 0.f
 		|| SavedSlideJumpGraceRemaining > 0.f || Other->SavedSlideJumpGraceRemaining > 0.f
+		|| SavedSlideJumpChainBoosts > 0 || Other->SavedSlideJumpChainBoosts > 0
 		|| SavedWallJumpControlLockoutRemaining > 0.f || Other->SavedWallJumpControlLockoutRemaining > 0.f
 		|| SavedWallJumpInputBufferRemaining > 0.f || Other->SavedWallJumpInputBufferRemaining > 0.f)
 	{
@@ -7505,6 +7893,12 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedSlideJumpGraceRemaining  = Movement->SlideJumpGraceRemaining;
 			bSavedSlideJumpGraceWellTimed = Movement->bSlideJumpGraceWellTimed;
 
+			// SPEC v26 §3b. Captured with the window beside it and for the same reason: these two
+			// decide whether DoJump CLAMPS the launch, and nothing in a replay can re-derive how many
+			// hops deep the chain already was.
+			SavedSlideJumpChainBoosts  = Movement->SlideJumpChainBoosts;
+			SavedSlideJumpChainCeiling = Movement->SlideJumpChainCeiling;
+
 			// Spec v5 §7. The mantle's target and its up-phase Z are snapshotted with the clocks:
 			// they are recomputed identically on the server from the same geometry, but the CLIENT's
 			// replay must restart from the target the original move actually used, or a correction
@@ -7628,6 +8022,12 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			// hundred uu/s of horizontal velocity on the most visible frame in the kit.
 			Movement->SlideJumpGraceRemaining  = SavedSlideJumpGraceRemaining;
 			Movement->bSlideJumpGraceWellTimed = bSavedSlideJumpGraceWellTimed;
+
+			// SPEC v26 §3b. Rewind the chain to where it stood before this move ran. Without this a
+			// correction landing mid-chain replays the third hop as a first one — uncapped — and the
+			// client and the server end the launch several hundred uu/s apart.
+			Movement->SlideJumpChainBoosts  = SavedSlideJumpChainBoosts;
+			Movement->SlideJumpChainCeiling = SavedSlideJumpChainCeiling;
 
 			// The mantle and the ledge grace (spec v5 §7). Without these a correction landing
 			// mid-pull-up replays it as a plain fall: the pawn ends up on top of the ledge on one

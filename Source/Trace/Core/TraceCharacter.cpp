@@ -6,6 +6,7 @@
 
 #include "Animation/AnimInstance.h"
 #include "Camera/CameraComponent.h"
+#include "Camera/CameraTypes.h"                // FMinimalViewInfo (GetViewModelMuzzleViewPoint)
 #include "Components/CapsuleComponent.h"
 #include "Containers/Ticker.h"                 // FTSTicker (debug console command below)
 #include "Engine/Engine.h"                     // GEngine (debug console command below)
@@ -300,6 +301,16 @@ namespace TraceCharacterLayout
 
 	/** Engine basic shapes are 100 uu; every Size below is a world size and divides by this. */
 	constexpr float ViewModelShapeUnit = 100.f;
+
+	/**
+	 * Where the FALLBACK cube gun's shot leaves, in rig space — the centre of the VMMuzzle ring.
+	 *
+	 * Named rather than typed twice: the parts table below places VMMuzzle here, and the muzzle marker
+	 * ATraceTracer reads is parked here too. Two literals would be two things to remember to move
+	 * together, and the failure mode of forgetting is a beam that leaves from beside the barrel — which
+	 * is precisely the defect spec v26 §4 is about.
+	 */
+	const FVector CubeGunMuzzle(19.6f, 0.f, 2.4f);
 
 	// Sway / bob / recoil. All small: this is texture, not animation, and anything big enough to
 	// notice as movement is big enough to read as the crosshair drifting.
@@ -2312,7 +2323,7 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		// Light channels. The muzzle ring is a cylinder turned to point down the barrel (pitch 90
 		// swings the shape's own +Z axis onto +X), and it is the piece that makes the gun read as a
 		// weapon at a glance: a lit circle where the shot comes out.
-		{ TEXT("VMMuzzle"),     true,  FVector(19.6f, 0.f, 2.4f),   FRotator(90.f, 0.f, 0.f),     FVector(5.8f, 5.8f, 2.2f),   true,  true  },
+		{ TEXT("VMMuzzle"),     true,  TraceCharacterLayout::CubeGunMuzzle, FRotator(90.f, 0.f, 0.f), FVector(5.8f, 5.8f, 2.2f), true,  true  },
 		{ TEXT("VMSlideNeon"),  false, FVector(8.4f, 0.f, 5.3f),    FRotator::ZeroRotator,        FVector(16.5f, 1.8f, 1.5f),  true,  true  },
 		{ TEXT("VMSight"),      false, FVector(17.6f, 0.f, 5.6f),   FRotator::ZeroRotator,        FVector(1.4f, 1.4f, 2.0f),   true,  true  },
 		{ TEXT("VMSideNeonL"),  false, FVector(7.6f, -2.4f, 0.4f),  FRotator::ZeroRotator,        FVector(12.5f, 0.9f, 1.6f),  true,  true  },
@@ -2408,6 +2419,43 @@ void ATraceCharacter::EnsureViewModelBuilt()
 			FVector(Arm.Diameter + 0.8f, Arm.Diameter + 0.8f, 1.8f), ViewModelNeonMID);
 	}
 
+	// --- The muzzle marker (spec v26 §4) ---------------------------------------------------------
+	//
+	// "The bullet tracer animation needs to come from the gun barrel, not above or behind it."
+	//
+	// The reason it did not is that ATraceTracer had no way to ASK where the barrel was: it carried
+	// three hand-tuned camera-space constants (a standoff plus a right/down screen offset) that had
+	// been eyeballed against the small cube gun and were never revisited when the 185 cm railgun
+	// replaced it. This is the fix at its root — the barrel now says where it is.
+	//
+	// Parented to the GUN, at the gun's own muzzle landmark, in the gun's own units:
+	//   * railgun    -> a child of RailgunBodyPart at RailgunMuzzleLocal, the (107.4, 0, 4.5) cm point
+	//                   recorded in railgun_manifest.json. The parent's 0.22 scale is applied by the
+	//                   scene graph, so this stays the mesh's real muzzle vertex whatever the rig
+	//                   scale becomes.
+	//   * cube gun   -> a child of ViewModelRoot at CubeGunMuzzle, the same constant the VMMuzzle ring
+	//                   above is placed with.
+	//
+	// It is deliberately NOT a constant in ATraceTracer, and deliberately NOT the rig root: every
+	// motion the gun has — recoil, sway, bob, the slide dip — is a transform on one of its ancestors,
+	// and a marker under them inherits all of it with no code that has to remember to.
+	if (ViewModelMuzzle == nullptr)
+	{
+		USceneComponent* MuzzleParent = (RailgunBodyPart != nullptr)
+			? static_cast<USceneComponent*>(RailgunBodyPart) : static_cast<USceneComponent*>(ViewModelRoot);
+		const FVector MuzzleLocal = (RailgunBodyPart != nullptr)
+			? TraceCharacterLayout::RailgunMuzzleLocal : TraceCharacterLayout::CubeGunMuzzle;
+
+		ViewModelMuzzle = NewObject<USceneComponent>(this, TEXT("ViewModelMuzzle"));
+		if (ViewModelMuzzle != nullptr)
+		{
+			ViewModelMuzzle->SetMobility(EComponentMobility::Movable);
+			ViewModelMuzzle->SetupAttachment(MuzzleParent);
+			ViewModelMuzzle->SetRelativeLocation(MuzzleLocal);
+			ViewModelMuzzle->RegisterComponent();
+		}
+	}
+
 	// Hidden until UpdateViewBlend says first person; ApplyTeamColors paints the light channels.
 	for (UStaticMeshComponent* Part : ViewModelParts)
 	{
@@ -2420,8 +2468,9 @@ void ATraceCharacter::EnsureViewModelBuilt()
 
 	ApplyTeamColors();
 
-	UE_LOG(LogTraceGame, Verbose, TEXT("%s built a first-person viewmodel (%d parts)."),
-		*GetName(), ViewModelParts.Num());
+	UE_LOG(LogTraceGame, Verbose, TEXT("%s built a first-person viewmodel (%d parts, muzzle marker on %s)."),
+		*GetName(), ViewModelParts.Num(),
+		(RailgunBodyPart != nullptr) ? TEXT("the railgun body") : TEXT("the fallback rig"));
 }
 
 bool ATraceCharacter::BuildRailgunViewModel()
@@ -2631,6 +2680,66 @@ bool ATraceCharacter::DebugGetRailgunEmissive(float& OutCyan, float& OutAmber) c
 bool ATraceCharacter::UsesRailgunViewModel() const
 {
 	return RailgunBodyPart != nullptr;
+}
+
+bool ATraceCharacter::DebugGetViewModelMuzzleRaw(FVector& OutWorldLocation) const
+{
+	if (ViewModelMuzzle == nullptr)
+	{
+		return false;
+	}
+	OutWorldLocation = ViewModelMuzzle->GetComponentLocation();
+	return true;
+}
+
+bool ATraceCharacter::GetViewModelMuzzleViewPoint(FVector& OutWorldLocation) const
+{
+	// Nothing drawn, nothing to answer. bViewModelVisible rather than bViewModelBuilt: a carrier in
+	// third person and a corpse both still HAVE a rig, they just are not looking at it, and a beam
+	// started at a hidden gun would come out of thin air beside the camera.
+	if (ViewModelMuzzle == nullptr || Camera == nullptr || !bViewModelVisible)
+	{
+		return false;
+	}
+
+	// The camera component, not the player camera manager. The marker hangs off this component, so its
+	// position RELATIVE to this transform is exact by construction; asking the manager instead would
+	// mix two transforms that agree today (arm length 0, no lag, no modifiers) but need not tomorrow.
+	//
+	// GetCameraView() is not const and is not purely a getter: it WRITES the component's world rotation
+	// when bUsePawnControlRotation is set. It is safe from a const query here only because this camera
+	// hangs off a spring arm that has already applied the control rotation, so bUsePawnControlRotation
+	// is false (see the constructor). Turn that flag on and this call starts moving the camera from
+	// inside a tracer spawn — read the constructor before changing it.
+	FMinimalViewInfo POV;
+	Camera->GetCameraView(0.f, POV);
+
+	// Not an optimisation — a correctness gate. TransformWorldToFirstPerson() uses FirstPersonFOV and
+	// FirstPersonScale unconditionally, and GetCameraView fills them with neutral values (scene FOV,
+	// scale 1) when the feature is off; that is a no-op, but saying so explicitly means a future
+	// "turn the first-person rendering off" cannot silently start shifting the beam.
+	if (!POV.bUseFirstPersonParameters)
+	{
+		OutWorldLocation = ViewModelMuzzle->GetComponentLocation();
+		return true;
+	}
+
+	// bIgnoreFirstPersonScale=TRUE, and the engine's own comment on the parameter is the argument:
+	// "useful for cases where a full size projectile is spawned in front of the first person weapon.
+	// By ignoring the first person scale for the spawn location, the spawned full-size projectile will
+	// be spawned a bit further away from the camera, but its on-screen size will look correct."
+	//
+	// The tracer is exactly that — a world-space beam, drawn at world depth, spawned in front of a
+	// first-person weapon. The two flags put the start at the SAME PIXEL either way (the morph scales
+	// depth and offset together, so the projected point does not move); what changes is how far from
+	// the eye the near end of a 20 uu-wide sheath sits. Taking the full squash would park it ~34 uu
+	// out, where that sheath subtends a third of the frame and the muzzle flash becomes the near-field
+	// whiteout the class comment in TraceTracer.h was written about. Ignoring the scale leaves it at
+	// the gun's true ~85 uu, which is also within a couple of uu of the standoff this replaces — so
+	// the beam's THICKNESS at the muzzle is unchanged and only its POSITION moves onto the barrel.
+	OutWorldLocation = POV.TransformWorldToFirstPerson(
+		ViewModelMuzzle->GetComponentLocation(), /*bIgnoreFirstPersonScale=*/true);
+	return !OutWorldLocation.ContainsNaN();
 }
 
 UMaterialInstanceDynamic* ATraceCharacter::GetViewModelBodyMID() const
@@ -3411,6 +3520,33 @@ namespace
 					const ATraceCore* ProbeCore = ATraceCore::Get(TraceChar->GetWorld());
 					const ATraceCharacter* ProbeHolder = (ProbeCore != nullptr) ? ProbeCore->GetCarrier() : nullptr;
 
+					// SPEC v26 §4 — the beam's start, as an ANGLE OFF THE CROSSHAIR, because that is
+					// the thing the report was about and the thing a screenshot can be checked against:
+					// "muzDeg=(19.2r, 11.6d)" says the tracer leaves 19.2 degrees right and 11.6 degrees
+					// below the centre of the frame, which is where the barrel is drawn.
+					//
+					// RAW and DRAWN are both printed and they are DELIBERATELY DIFFERENT. Raw is where
+					// the muzzle component sits; drawn is where the first-person re-projection puts it
+					// on screen. If those two ever print the same numbers, the morph is not being
+					// applied and the beam is back to leaving from beside the barrel — a green-looking
+					// probe that cannot see the thing it is checking, which this project has been
+					// bitten by before.
+					auto ProbeMuzzleAngles = [TraceChar](const FVector& World, double& OutRight, double& OutDown)
+					{
+						const FVector Local = TraceChar->Camera->GetComponentTransform().InverseTransformPosition(World);
+						OutRight = FMath::RadiansToDegrees(FMath::Atan2(Local.Y, FMath::Max(Local.X, 1.0)));
+						OutDown = FMath::RadiansToDegrees(FMath::Atan2(-Local.Z, FMath::Max(Local.X, 1.0)));
+					};
+
+					FVector MuzzleRaw = FVector::ZeroVector;
+					FVector MuzzleDrawn = FVector::ZeroVector;
+					const bool bHasRaw = TraceChar->DebugGetViewModelMuzzleRaw(MuzzleRaw);
+					const bool bHasDrawn = TraceChar->GetViewModelMuzzleViewPoint(MuzzleDrawn);
+
+					double RawRight = 0.0, RawDown = 0.0, DrawnRight = 0.0, DrawnDown = 0.0;
+					if (bHasRaw)   { ProbeMuzzleAngles(MuzzleRaw, RawRight, RawDown); }
+					if (bHasDrawn) { ProbeMuzzleAngles(MuzzleDrawn, DrawnRight, DrawnDown); }
+
 					// crouch / eye / viewmodel are logged alongside because they are the three things
 					// that can silently break the aim guarantee or the new viewmodel and that a
 					// screenshot cannot distinguish: a crouch that never engaged looks exactly like
@@ -3420,7 +3556,8 @@ namespace
 						TEXT("[ViewProbe] mode=%s carrier=%d coreHolder=%s holderIsMe=%d passActive=%d passHeld=%d predicted=%d ")
 						TEXT("blend=%.2f arm=%.1f eyeErr=%.2fuu aimErr=%.4fdeg ")
 						TEXT("bodyHiddenFromOwner=%d ctrlYaw=%d orientToMove=%d ")
-						TEXT("crouched=%d sliding=%d halfHeight=%.1f baseEye=%.1f vmParts=%d vmVisible=%d"),
+						TEXT("crouched=%d sliding=%d halfHeight=%.1f baseEye=%.1f vmParts=%d vmVisible=%d ")
+						TEXT("muzRawDeg=(%.1fr,%.1fd) muzDrawnDeg=(%.1fr,%.1fd) muzDepth=%.1fuu"),
 						TraceChar->GetViewBlendAlpha() < 0.5f ? TEXT("FIRST") : TEXT("THIRD"),
 						TraceChar->IsCarrier() ? 1 : 0,
 						*GetNameSafe(ProbeHolder),
@@ -3440,7 +3577,9 @@ namespace
 						TraceChar->GetCapsuleComponent() != nullptr ? TraceChar->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : -1.f,
 						TraceChar->BaseEyeHeight,
 						TraceChar->GetViewModelPartCount(),
-						TraceChar->IsViewModelVisible() ? 1 : 0);
+						TraceChar->IsViewModelVisible() ? 1 : 0,
+						RawRight, RawDown, DrawnRight, DrawnDown,
+						bHasDrawn ? FVector::Dist(CameraLoc, MuzzleDrawn) : -1.0);
 
 					return (++Emitted < Samples);
 				}),

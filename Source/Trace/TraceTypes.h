@@ -72,6 +72,15 @@ enum class ETraceMatchState : uint8
 // inline function the module API macro is legal on every toolchain we target: on Windows the
 // macro resolves to __declspec(dllexport) inside this module (exporting an inline definition is
 // fine) and is a no-op in monolithic builds; on Apple Silicon it is a visibility attribute.
+//
+// *** TWO OF THE THREE. TraceTeamColor IS NOT ONE OF THEM ANY MORE (spec v26 §5). *** Its two
+// colours are now DERIVED from the artist's menu palette, TraceMenuArtStyle, rather than typed
+// here as literals — and TraceMenuArtStyle.h pulls in Fonts/SlateFontInfo.h, which this header
+// must never hand to the ~every-file-in-the-module list that includes it ("Keep this header
+// dependency-light", top of file). So it is DECLARED here and DEFINED in TraceTypes.cpp, which
+// is the only new cost: a link dependency inside this one module, which every caller already
+// has. Nothing outside the module calls it. See TraceTypes.cpp for the derivation and for the
+// two candidate palettes §5 asked to be reported.
 // ---------------------------------------------------------------------------------------------
 
 /** Returns the team that opposes @p Team. None maps to None (no opponent). */
@@ -85,16 +94,22 @@ TRACE_API inline ETraceTeam TraceOpposingTeam(ETraceTeam Team)
 	}
 }
 
-/** Canonical team colour. Used for meshes, tracers, trail and HUD so everything matches. */
-TRACE_API inline FLinearColor TraceTeamColor(ETraceTeam Team)
-{
-	switch (Team)
-	{
-	case ETraceTeam::Blue:   return FLinearColor(0.05f, 0.75f, 1.00f, 1.0f);
-	case ETraceTeam::Orange: return FLinearColor(1.00f, 0.42f, 0.05f, 1.0f);
-	default:                 return FLinearColor(0.50f, 0.50f, 0.50f, 1.0f);
-	}
-}
+/**
+ * Canonical team colour. Used for meshes, tracers, trail and HUD so everything matches — and
+ * that list is exhaustive on purpose: this one function is the only place any of the four asks
+ * what a team looks like, so §5's "check all four" is one edit rather than four.
+ *
+ * SPEC v26 §5. NOT A LITERAL ANY MORE. Defined in TraceTypes.cpp, derived from the artist's
+ * menu palette (TraceMenuArtStyle::PlateFill and ::Amber). The reasoning, the two candidate
+ * palettes, and the console switch that shows the other one, are all there.
+ */
+TRACE_API FLinearColor TraceTeamColor(ETraceTeam Team);
+
+/**
+ * One line naming the live team palette and where it came from, for the log and `Trace.Team.Report`.
+ * A colour that is derived rather than typed is invisible in a diff, so the running game says it.
+ */
+TRACE_API FString TraceDescribeTeamColors();
 
 /** Display name for HUD / scoreboard / banners. */
 TRACE_API inline FText TraceTeamName(ETraceTeam Team)

@@ -2,6 +2,7 @@
 
 #include "Net/UnrealNetwork.h"
 
+#include "Audio/TraceAudio.h"                  // spec v26 §9 — the parry is a GAME-SIDE sound
 #include "Camera/CameraActor.h"                // spec v12 §6 — the capture camera for Trace.Trail.WallClip
 #include "Camera/PlayerCameraManager.h"        // local camera location (proximity glow fade)
 #include "CollisionQueryParams.h"              // spec v12 §6 — the wall-fit world queries
@@ -2671,6 +2672,15 @@ bool UTraceTrailComponent::ServerTryBeginParry(ETraceParryRefusal& OutRefusal, f
 
 	ParryEndServerTime = WindowEnd;
 	ParryCooldownEndServerTime = CooldownEnd;
+
+	// SPEC v26 §9 — "parry should be game-side": everyone nearby hears it, at the parrier.
+	//
+	// HERE, AND NOT AT THE KEY PRESS. This is the point the window ACTUALLY OPENS: every refusal
+	// above (no pawn, dead, not carrying, on cooldown) has already returned, and the server has
+	// resolved the rewind. A sound on the press would fire on a refused parry, which would teach
+	// players that the cooldown is not real. Authority-only by construction — the function returns
+	// early without it — so TraceAudio::Play multicasts exactly once per granted parry.
+	TraceAudio::Play(OwnerActor, TraceSoundEvents::Parry);
 
 	// A listen server is also a viewer: it will not get OnRep, so dirty the visuals here.
 	bVisualsDirty = true;

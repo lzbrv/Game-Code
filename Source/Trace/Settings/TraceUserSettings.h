@@ -66,6 +66,20 @@ enum class ETraceInputAction : uint8
 	 * "ParryPull" and not "Parry2" because the button genuinely gained a second verb: spec v25 §2's
 	 * Core pull is dispatched from the same press. See ATracePlayerController::OnParryStarted for
 	 * why the two can never collide (parry needs you carrying, the pull needs you not carrying).
+	 *
+	 * *** SPEC v26 §1 SPLITS THE TWO VERBS APART AGAIN, AND THIS ROW KEEPS THE BUTTON. *** Verbatim:
+	 * "Make parry and pull core two separate binds in the settings menu". The pull now has its own
+	 * action (ETraceInputAction::PullCore, appended at the bottom of this list) with its own default
+	 * and its own row on the keybind page; parry keeps right mouse, which is what spec v25 §7 asked
+	 * for in as many words and which v26 does not touch.
+	 *
+	 * THE ConfigId STAYS "ParryPull" AND THAT IS DELIBERATE. Every id migration in this table costs a
+	 * returning player their hand-rebound key once (RefreshFromConfig drops a line naming an id the
+	 * table no longer has). v25 §7 already spent that cost to move parry onto this button; renaming
+	 * back to "Parry" now would spend it a second time, for a cosmetic gain, and would silently
+	 * un-rebind everybody who has rebound their parry since. The DISPLAY NAME is what a player reads
+	 * and it does move — "PARRY / PULL CORE" becomes "PARRY" — because that string is not persisted
+	 * anywhere and can be corrected for free.
 	 */
 	Parry,
 	Fire,
@@ -155,6 +169,39 @@ enum class ETraceInputAction : uint8
 	 * way to reload and deliberately so: spec v16 §1 asks for both.
 	 */
 	Reload,
+
+	/**
+	 * SPEC v26 §1 — "Make parry and pull core two separate binds in the settings menu."
+	 *
+	 * THE TURNOVER CORE-PULL, AS ITS OWN ACTION. Spec v25 §2 put it on right mouse alongside the
+	 * parry and resolved the overlap by an argument rather than a bind: the two gates are exact
+	 * opposites on "am I carrying the Core", so one press could be delivered to both verbs and at
+	 * most one could accept. That reasoning is still true and is still in
+	 * ATracePlayerController::OnParryStarted — but it is now only a TIEBREAK, used when a player has
+	 * deliberately put both actions on one key. By default they are two keys and neither knows about
+	 * the other.
+	 *
+	 * DEFAULT F, and the collision check is the only decision there was. Claimed already: WASD,
+	 * Space, LeftCtrl, LeftShift, mouse1, mouse2, Tab, 1, 2, E, V, R. F is free — spec v15 §5 vacated
+	 * it when it deleted the SwapWeapon toggle — and "F to grab the thing you are looking at" is the
+	 * strongest convention this genre has. Q was the other candidate (parry vacated it in v25 §7) and
+	 * was passed over because the pull is a HOLD performed while hovering the Core, and F sits under
+	 * the index finger that is already on D.
+	 *
+	 * APPENDED, never inserted, for the reason EquipKnife's comment gives at length: ETraceInputAction
+	 * is the index into UTraceUserSettings::Bindings, so anything placed higher renumbers every action
+	 * below it. The saved .ini survives a renumber anyway (it is matched by ConfigId STRING), but the
+	 * in-memory table is what would tear if two builds disagreed about it mid-session.
+	 *
+	 * NOTHING OUTSIDE THIS FILE LOOKS THE ConfigId UP BY STRING, unlike "Ability", "AbilitySecondary"
+	 * and "Reload" — so "PullCore" is free to be renamed later if a better name appears. It is
+	 * documented here so the next reader does not have to prove it again.
+	 *
+	 * A RETURNING PLAYER GETS THIS ROW FOR FREE AND LOSES NOTHING. There has never been a "PullCore"
+	 * line in anybody's TraceUserSettings.ini, so RefreshFromConfig finds no override and seeds the
+	 * shipped default. Their existing ParryPull line still lands on the parry, exactly as before.
+	 */
+	PullCore,
 
 	Count UMETA(Hidden)
 };

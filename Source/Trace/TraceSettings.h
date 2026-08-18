@@ -1939,6 +1939,124 @@ public:
 	float SlideJumpWindowZBonus = 1.12f;
 
 	// ==========================================================================================
+	// SPEC v26 §3 — THE SLIDE-JUMP IS 20% WEAKER, AND CHAINING IT HAS A CEILING
+	//
+	// Verbatim: "Reduce slide jump momentum boost by 20%. Add a ceiling to slide jump momentum
+	// boosts, so that you can't chain them over and over to go faster and faster. Right now, if you
+	// do three slide jump boosts in a row you can zip down the whole field. For now, lets cap it at
+	// what the momentum is after you do two consecutive slide boosts. Let me change this in project
+	// settings"
+	//
+	// FOUR KNOBS, AND THE LAST SENTENCE IS WHY THEY ARE KNOBS AT ALL. "Let me change this in project
+	// settings" is a requirement, not a preference: the ceiling has to be editable HERE, in the
+	// Project Settings UI, with no rebuild. Everything below is `config, EditAnywhere` and has a
+	// matching line in Config/DefaultGame.ini (which wins over these header defaults — this project
+	// has shipped a header-only retune that did nothing at least once).
+	// ==========================================================================================
+
+	/**
+	 * SPEC v26 §3a — "Reduce slide jump momentum boost by 20%." x0.80 ON THE GAIN.
+	 *
+	 * *** RELATIVE, NOT REWRITTEN, AND THAT IS THE WHOLE POINT OF IT BEING A SEPARATE NUMBER. ***
+	 * The obvious edit was to retype SlideJumpWindowSpeedBonus from 1.3125 to something 20% smaller,
+	 * or SlideJumpBonusScale from 1.43 to 1.144. Both would have baked v26's cut into a number that
+	 * belongs to a different decision (v8 §8's base, v9 §7's +30% as re-raised by v16 §0), so the
+	 * next person to retune EITHER of those would silently delete or double this one. This file has
+	 * been bitten by exactly that (see SlideJumpWindowSeconds' long note on the double-applied 0.2 s),
+	 * so v26's cut is its own named factor, applied last, and it stays -20% whatever the base becomes.
+	 *
+	 * WHAT "THE BOOST" IS. The slide-jump multiplies your planar speed by
+	 *
+	 *     SlideJumpHorizontalRetention (1.0)  x  the well-timed bonus (1.446875)
+	 *
+	 * and only the part ABOVE 1.0 is a boost — 1.0 is pure preservation, which is what escaping
+	 * ground friction is worth and is not something the note asks to cut. So the 20% comes off the
+	 * GAIN, which is the same reading bSlideJumpBonusScalesGainOnly already ships for v9 §7:
+	 *
+	 *     1 + (1.446875 - 1) x 0.80 = 1.3575
+	 *
+	 * A MISTIMED SLIDE-JUMP IS UNCHANGED, and that follows rather than being a carve-out: at
+	 * retention 1.0 it has no gain, so 80% of nothing is nothing. The 20% is paid entirely by the
+	 * well-timed hop, which is the only place the slide-jump manufactures speed at all.
+	 *
+	 * Applied by UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus(), BEFORE the
+	 * character seam — so Elle's +40% passive scales the reduced gain rather than fighting it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Momentum Boost Scale (v26 §3, x the GAIN)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.5", UIMax = "1.5"))
+	float SlideJumpMomentumScale = 0.80f;
+
+	/**
+	 * SPEC v26 §3b — the master switch for the chain ceiling. OFF restores the uncapped compounding.
+	 *
+	 * Exists for the same reason bSlideJumpEnabled does: "is chaining still a traversal exploit"
+	 * has to be answerable from one binary without a rebuild. It is ALSO the designer-facing half of
+	 * the A/B arm — the dev-only console arm is Trace.V26LegacySlideJump, which reverts the -20% as
+	 * well, whereas this reverts the ceiling alone.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Chain Ceiling Enabled (v26 §3)"))
+	bool bSlideJumpChainCapEnabled = true;
+
+	/**
+	 * *** THE KNOB THE NOTE ASKS FOR. *** "For now, lets cap it at what the momentum is after you do
+	 * two consecutive slide boosts." This is the TWO.
+	 *
+	 * HOW IT IS SPENT. A CHAIN is a run of slide-jumps taken without ever giving the momentum back
+	 * (see the reset multiplier below for what "giving it back" means). The component watches the
+	 * launch speed of the chain's first N boosts, keeps the highest, and every boost after that is
+	 * clamped to it. So at 2:
+	 *
+	 *     boost 1   launches normally
+	 *     boost 2   launches normally; the chain's ceiling is now the faster of the two
+	 *     boost 3   still fires — still ends the slide, still escapes ground friction, still pays the
+	 *               well-timed HEIGHT bonus — but its planar speed may not exceed that ceiling
+	 *     boost 4+  the same
+	 *
+	 * which is the note's "a third and fourth may still be performed, they just must not go faster",
+	 * exactly.
+	 *
+	 * *** THE CEILING IS MEASURED, NOT COMPUTED, AND THAT IS DELIBERATE. *** The tempting version is
+	 * a formula — entry speed x multiplier^2 — and it is WRONG here, because a slide DECAYS while
+	 * you wait for the well-timed window (SlideDeceleration, 260 uu/s²). The speed you actually have
+	 * after two boosts is therefore a function of how long each of your slides ran, which no formula
+	 * on this page knows. Recording the chain's own launch speed answers the note's sentence
+	 * literally instead of approximating it, and it is RELATIVE by construction: it moves with the
+	 * boost knobs, with a character's passive, and with whatever speed you brought into the chain,
+	 * because it IS one of those launches.
+	 *
+	 * 1 caps a chain at its first boost. Raise it to 3 to allow one more compounding step.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Chain Ceiling (consecutive boosts before the cap)", ClampMin = "1", ClampMax = "8", UIMin = "1", UIMax = "4"))
+	int32 SlideJumpChainCapBoosts = 2;
+
+	/**
+	 * When a chain ENDS, as a multiple of the pawn's own live max ground speed.
+	 *
+	 * *** RELATIVE TO A BASE THAT MOVES. *** Not "reset below 800 uu/s". The pawn's ground speed
+	 * ceiling is WalkSpeed folded through CarrierSpeedMultiplier (1.22), the knife profile (1.30) and
+	 * every ability speed passive, so a carrier's baseline is 976 and a knife-carrier's is higher
+	 * still. Written as a multiple, this threshold follows every one of those without being told, and
+	 * retuning WalkSpeed cannot silently make the chain immortal (or unstartable).
+	 *
+	 * WHY THE RESET IS A SPEED AND NOT A TIMER. Two reasons, and the second is the load-bearing one:
+	 *
+	 *   1. It is what "consecutive" MEANS. Boosts are consecutive while you never gave the momentum
+	 *      back; the instant you are back to running pace the next slide-jump starts from scratch and
+	 *      has nothing to compound.
+	 *   2. A timer inside a client-predicted move is a prediction hazard. The movement component's
+	 *      state is replayed frame-by-frame after a server correction, and a rule keyed on world time
+	 *      would resolve differently on the replay than it did live. A rule keyed on the pawn's own
+	 *      planar speed is a pure function of state the saved move already carries.
+	 *
+	 * The check is only made while the pawn is ON ITS FEET — grounded, not sliding, not dashing —
+	 * because during a slide or a dash the planar speed is that ability's number and not the player's.
+	 *
+	 * Above 1.0 makes the chain harder to break (it survives a slower jog); below 1.0 makes it
+	 * easier, and at 0 the chain only ever ends at a dead stop.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Chain Reset Speed (x the pawn's max ground speed)", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.5", UIMax = "1.5"))
+	float SlideJumpChainResetSpeedMultiplier = 1.0f;
+
+	// ==========================================================================================
 	// MOVEMENT — LEDGES  (spec v12 §5. WAS "MANTLE", spec v5 §7 — THE MANTLE IS GONE)
 	//
 	// v12 verbatim: "Remove mantling from the game, keep wall jumping. Make sure there's no bug when
@@ -4609,7 +4727,27 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Pull Speed (uu/s) [CONTROL]", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
 	float OysterPicklerPullSpeed = 1300.f;
 
-	/** How fast the jar is lobbed. It is a LOB — it arcs, lands, and then behaves as a normal jar. */
+	/**
+	 * SPEC v26 §6b: "the E jar should EXPLODE once the pull animation finishes, rather than waiting
+	 * for a jump to trigger them."
+	 *
+	 * How long the Pickler jar lies there after its impact before it detonates, expressed as a
+	 * MULTIPLE OF THE PULL'S OWN TRAVEL TIME rather than as a number of seconds. The pull is what
+	 * this delay is waiting for, so the pull is the base it is stored against: someone caught at the
+	 * very edge of OysterPicklerPullRadiusUU and launched at OysterPicklerPullSpeed arrives in
+	 * radius/speed seconds, which at the shipped 380 uu and 1300 uu/s is 0.29 s. Retune either of
+	 * those and the fuse follows on its own — a fuse typed here as "0.29" would not, and the jar
+	 * would start going off before or after the thing it is named for.
+	 *
+	 * 1.0 = detonate exactly as the last pulled enemy arrives. Below 1 it goes off under them on the
+	 * way in; above 1 it gives them a moment to stand in it. ATraceOysterJar::GetPicklerDetonateDelaySeconds()
+	 * does the arithmetic and clamps the result into (one frame .. the jar's own ground lifetime), so
+	 * no setting of this can produce a Pickler jar that expires before it explodes.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Detonate Delay (x pull travel time)", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.5", UIMax = "3.0"))
+	float OysterPicklerDetonateDelayScale = 1.f;
+
+	/** How fast the jar is lobbed. It is a LOB — it arcs, lands, fires its impact, then detonates. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Pickler Throw Speed (uu/s)", ClampMin = "100.0", ClampMax = "10000.0", UIMin = "800.0", UIMax = "3000.0"))
 	float OysterPicklerThrowSpeed = 1900.f;
 

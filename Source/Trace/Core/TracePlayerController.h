@@ -89,7 +89,12 @@ struct FTraceDashHudState
  *   Fire        bool     LMB           (doubles as "put me back in" while dead)
  *   Pass        bool     RMB
  *   Dash        bool     Left Shift
- *   Parry       bool     Q             (carrier only — 0.175s of trace invulnerability, spec v3 §3 / v8 §3 / v10 §4)
+ *   Parry       bool     RMB           (carrier only — 0.175s of trace invulnerability, spec v3 §3 / v8 §3 / v10 §4;
+ *                                       moved from Q to right mouse by spec v25 §7)
+ *   PullCore    bool     F             (spec v26 §1 — the turnover Core-pull, its OWN bind. Held.
+ *                                       It rode the parry's button in v25 §2; §1 splits them, and the
+ *                                       old precedence rule survives only as a tiebreak for a player
+ *                                       who deliberately puts both actions on one key)
  *   Scoreboard  bool     Tab           (held)
  *   EquipKnife  bool     1             (spec v13 §2 — DIRECT SELECT, idempotent; the SWING rides IA_Fire)
  *   EquipGun    bool     2             (spec v13 §2 — DIRECT SELECT, idempotent)
@@ -263,6 +268,15 @@ public:
 	int32 DebugScoreboardCount = 0;
 	int32 DebugCrouchCount = 0;
 	int32 DebugParryCount = 0;
+	/**
+	 * SPEC v26 §1. Presses that reached ATracePlayerController::DispatchCorePull and were dispatched,
+	 * i.e. AFTER the per-frame de-duplication and the suppression gate.
+	 *
+	 * Counted where it is dispatched rather than in OnPullCoreStarted so that the shared-key tiebreak
+	 * path is counted too — the question this number answers is "did the pull verb leave this
+	 * machine", and it must not depend on which of the two handlers delivered it.
+	 */
+	int32 DebugPullPressCount = 0;
 	/** Bumped by ClientNotifyHit — a server-confirmed hitscan resolution credited to us. */
 	int32 DebugHitConfirmCount = 0;
 
@@ -499,6 +513,21 @@ protected:
 	TObjectPtr<UInputAction> IA_Reload;
 
 	/**
+	 * SPEC v26 §1 — "Make parry and pull core two separate binds in the settings menu." Default F.
+	 *
+	 * Its own UInputAction and not a second mapping on IA_Parry, which is the whole point of the item:
+	 * two actions is what makes two rows on the keybind page, two rebindable keys, and two independent
+	 * handlers. One action with two keys would be one bind wearing a second key.
+	 *
+	 * Bound on Started AND Completed AND Canceled, because the pull is a HOLD — "releasing right mouse
+	 * cancels" was spec v25 §2's rule and it is unchanged by moving the verb to its own key. A dropped
+	 * release edge here leaves a pull ring filling on the server behind a pause menu, which is the
+	 * exact failure OnPassCompleted's comment documents.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_PullCore;
+
+	/**
 	 * Resolves InputMapping and every IA_* exactly once, then lays down the key mappings.
 	 *
 	 * The two halves are separate on purpose. The ACTIONS must be resolved exactly once and never
@@ -524,7 +553,7 @@ protected:
 	 */
 	bool TryAdoptInputAssets();
 
-	/** The original path, unchanged: NewObject for the context and all fourteen actions. */
+	/** The original path, unchanged: NewObject for the context and all fifteen actions. */
 	void ConstructInputDataInCode();
 
 	/** Registers InputMapping with the local player's Enhanced Input subsystem. Idempotent. */
@@ -560,6 +589,41 @@ protected:
 	 * held-key bug gets reintroduced the day somebody makes the window hold-to-extend.
 	 */
 	void OnParryCompleted();
+
+	/**
+	 * SPEC v26 §1. Press and release edges of the CORE PULL, which is now its own bind (default F).
+	 *
+	 * Makes no decision of its own, exactly like OnParryStarted: every refusal (not a turnover, wrong
+	 * team, not hovering, no line of sight, already carrying, window expired) lives behind
+	 * ATraceCore's own authoritative gate. An input handler that second-guessed any of those would be
+	 * a client deciding the outcome of a server-authoritative verb.
+	 *
+	 * The RELEASE is deliberately not gated on bGameInputSuppressed and uses GetPawn rather than
+	 * GetLivingCharacter — see OnParryCompleted for the argument. Opening the pause menu mid-pull
+	 * suppresses input; dying mid-pull makes the pawn non-living. Those are the two cases where the
+	 * cancel must still be delivered.
+	 */
+	void OnPullCoreStarted();
+	void OnPullCoreCompleted();
+
+	/**
+	 * SPEC v26 §1. The one place the pull is dispatched, and the reason it is a function.
+	 *
+	 * Two handlers can reach the pull on one frame — its own bind, and (only when the player has put
+	 * both actions on the SAME key) the parry's tiebreak path. This collapses that into exactly one
+	 * dispatch per frame per edge, so a deliberately shared key sends one RPC rather than two.
+	 *
+	 * @param bPressed  true for the press edge, false for the release.
+	 */
+	void DispatchCorePull(bool bPressed);
+
+	/** True when the player has deliberately bound PARRY and PULL CORE to the same key. */
+	bool DoParryAndPullShareAKey() const;
+
+	/** Frame number of the last DispatchCorePull, per edge, so the two callers cannot double-fire. */
+	uint64 LastPullPressFrame = 0;
+	uint64 LastPullReleaseFrame = 0;
+
 	/**
 	 * Spec v13 §2. Press edge of the two DIRECT-SELECT weapon binds. Press-only, and that asymmetry
 	 * is deliberate: there is no held state here, so a release binding would fire a second request
