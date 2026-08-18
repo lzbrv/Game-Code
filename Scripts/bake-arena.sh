@@ -127,13 +127,58 @@ if [ "$ADD_CORE_SPAWN" = "1" ] && [ ! -f "$MAP_FILE" ]; then
 fi
 
 if [ "$FORCE" = "1" ] && [ "$TRACE_DRY_RUN" != "1" ]; then
-    # The .umap is deleted by the Python side (it has to go through the asset
-    # registry), but the per-actor packages are just files and the editor will
-    # happily load a stale one into the new level — that is how a "clean" re-bake
-    # ends up with two floors. Remove them here, where the filesystem is visible.
+    # ------------------------------------------------------------------------
+    # CLEAR THE LFS READ-ONLY BIT FIRST. .gitattributes marks *.uasset and *.umap
+    # `lockable`, so git-lfs checks them out MODE 444 until somebody takes a lock.
+    # The editor's own delete goes through the asset registry, hits that, and pops
+    # a modal — which under -unattended is auto-answered "No":
+    #
+    #   Message dialog closed, result: No, title: Message, text: This file is
+    #   read-only on disk: .../MI_Surface_Wall_North.uasset  Delete it anyway?
+    #   LevelEditorSubsystem: Error: NewLevel. Failed to validate the destination.
+    #   An asset already exists at this location.
+    #
+    # MEASURED, and it cost a bake: the delete silently failed, new_level refused
+    # because the old .umap was still there, and the run aborted AFTER this script
+    # had already removed the external actor packages below — i.e. it left the map
+    # on disk pointing at 570 actors that no longer existed. A --force re-bake has
+    # to be able to finish, so the writable bit is part of --force.
+    #
+    # Only the two things a bake rewrites are touched (this level and the material
+    # instances it authors), never the parents, never anything else in Content/.
+    for LOCKED_PATH in "$MAP_FILE" "${TRACE_PROJECT_ROOT}/Content/${MATERIALS#/Game/}/Instances"; do
+        if [ -e "$LOCKED_PATH" ]; then
+            trace_msg "Clearing the read-only bit on $(basename "$LOCKED_PATH") so the editor can replace it"
+            chmod -R u+w "$LOCKED_PATH"
+        fi
+    done
+
+    # The per-actor packages are just files and the editor will happily load a
+    # stale one into the new level — that is how a "clean" re-bake ends up with
+    # two floors. Remove them here, where the filesystem is visible.
     if [ -d "$EXTERNAL_DIR" ]; then
         trace_msg "Removing stale external actor packages: Content/__ExternalActors__/${REL_MAP}"
+        chmod -R u+w "$EXTERNAL_DIR" 2>/dev/null || true
         rm -rf "$EXTERNAL_DIR"
+    fi
+
+    # AND THE .umap ITSELF, HERE RATHER THAN THROUGH THE ASSET REGISTRY.
+    #
+    # bake-arena.py calls EditorAssetLibrary.delete_asset() first and that is still
+    # the tidy path — it unregisters the asset. MEASURED on this pass: with the
+    # read-only bit cleared it reports SUCCESS and leaves the file on disk
+    # untouched (same size, same mtime), and new_level then refuses with "Failed
+    # to validate the destination. An asset already exists at this location."
+    # Two bakes died there.
+    #
+    # A --force re-bake replaces this file wholesale, so removing it outright is
+    # both safe and the only step that is actually guaranteed to work: the editor
+    # process that follows scans the content directory at startup and simply never
+    # sees it. Deliberately after the external-actor sweep, so a failure between
+    # the two cannot leave a map pointing at actors that are already gone.
+    if [ -f "$MAP_FILE" ]; then
+        trace_msg "Removing the existing Content/${REL_MAP}.umap so the bake can write a new one"
+        rm -f "$MAP_FILE"
     fi
 fi
 

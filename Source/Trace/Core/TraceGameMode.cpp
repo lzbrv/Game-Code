@@ -163,11 +163,25 @@ namespace TraceGameModeConstants
 	static constexpr float SpawnProbeRadius = 34.f;
 	static constexpr float SpawnProbeHalfHeight = 88.f;
 
-	/** How many times a blocked endzone pad steps back towards the goal line before giving up. */
+	/** How many times a blocked endzone pad steps back along the spawn band before giving up. */
 	static constexpr int32 SpawnProbeSteps = 4;
 
-	/** Fraction of the endzone depth each of those steps covers. */
+	/** How much of ATraceArenaBuilder::GetSpawnLineX()'s band each of those steps covers. */
 	static constexpr float SpawnProbeStepFraction = 0.18f;
+
+	/**
+	 * Where these pads sit in the pocket behind the goal, as an alpha along the arena's spawn band
+	 * (spec v28 §8: "Set the spawns back behind the goals").
+	 *
+	 * 0.85 is against the wall end of the band, against the arena's own fan at 0.35, so the two sets
+	 * are a real choice apart rather than five pairs of pads in the same place. A blocked pad walks
+	 * DOWN from here toward the goal - SpawnProbeSteps x SpawnProbeStepFraction = 0.72 of the band,
+	 * bottoming at 0.13 - and it can do that without any bounds thinking at all, because alpha 0 is
+	 * already defined as clear of the goal's rear ramp. That is the point of the band: both of its
+	 * ends are derived, so anywhere inside it is a legal place to stand however the pocket, the ramp
+	 * or the capsule is retuned.
+	 */
+	static constexpr float EndzonePadPocketAlpha = 0.85f;
 
 	/**
 	 * Minimum seconds between two accepted scores. See NotifyScored: the endzone volume and the
@@ -750,9 +764,11 @@ AActor* ATraceGameMode::ChoosePlayerStart_Implementation(AController* Player)
 	const ETraceTeam Team = GetTeamForController(Player);
 
 	// Three pools, most specific first:
-	//   EndzoneStarts - the pads this class builds INSIDE each endzone. Spec §1 puts respawns here.
-	//   TeamStarts    - the arena builder's pads in front of the endzone. The fallback if a pad
-	//                   could not be placed (blocked by geometry) or the feature is switched off.
+	//   EndzoneStarts - the pads this class builds inside each endzone, i.e. deep in the pocket
+	//                   behind that team's own goal. Spec §1 puts respawns here; spec v28 §8 is what
+	//                   moved the whole region behind the goal.
+	//   TeamStarts    - the arena builder's own pads, nearer the goal in the same pocket. The
+	//                   fallback if a pad could not be placed (blocked) or the feature is off.
 	//   AnyStarts     - anything at all, for a teamless player or a hand-built level.
 	//
 	// Membership in all three is keyed off Start->Team, which ApplyTeamSides() rewrites at half
@@ -1722,13 +1738,21 @@ bool ATraceGameMode::CheckEndzoneScoreForCarrier(ATraceCharacter* InCharacter, c
 			continue;
 		}
 
-		// Point-in-box in the trigger's own space, against the UNSCALED extent (InverseTransform
-		// has already undone the scale). Identical to the test the zone itself polls with, and it
-		// takes the zone's live dimensions — widen the endzones and this widens with them.
-		const FVector Local = Zone->Trigger->GetComponentTransform().InverseTransformPosition(CarrierLocation);
-		const FVector Extent = Zone->Trigger->GetUnscaledBoxExtent();
-
-		if (FMath::Abs(Local.X) > Extent.X || FMath::Abs(Local.Y) > Extent.Y || FMath::Abs(Local.Z) > Extent.Z)
+		// ASKED OF THE ZONE, NOT REBUILT HERE (spec v28 §8). This used to be a hand-rolled
+		// point-in-box against the trigger's unscaled extent, which was the same test the zone polls
+		// with in mode A and a DIFFERENT one in mode B: a mode-B goal is a disc inscribed in its
+		// bounding slab (ATraceEndzone::ConfigureRing), and the corners of that slab are not goal.
+		// So a possession change inside the slab but outside the hoop could award a point the poll
+		// and ATraceCore's swept test would both have refused.
+		//
+		// That mattered little while the slab was buried in a wall and half of it was unreachable.
+		// It matters now: v28 §8 centres the slab ON the ring plane so the goal can be scored through
+		// from either side, which puts the whole of it in the open with players standing in it. One
+		// authority for "is this location inside this scoring volume", and it is the volume's own.
+		//
+		// IsInsideZone() is also side-agnostic for free - it works in the trigger's local space and
+		// tests |X| against the half extent - so "scored from behind" needs no case here.
+		if (!Zone->IsInsideZone(CarrierLocation))
 		{
 			continue;
 		}
@@ -2767,16 +2791,6 @@ void ATraceGameMode::BuildEndzoneSpawnPads()
 
 	const FBox Bounds = ArenaBuilder->GetFieldBounds();
 	const FVector Centre = Bounds.GetCenter();
-	const float HalfX = FMath::Max(1.f, static_cast<float>(Bounds.Max.X - Bounds.Min.X) * 0.5f);
-
-	// Ask the builder for the depth rather than re-clamping EndzoneDepth here. This was the third
-	// independent copy of that clamp, and when the copies disagreed the pads landed on the dais.
-	const float Depth = ArenaBuilder->ClampedEndzoneDepth();
-
-	// Mid-endzone: half a depth in from the end wall, half a depth behind the goal line. The gate
-	// towers and the goal line itself stand ON the line, so the middle of the box is the one part of
-	// an endzone with nothing built in it.
-	const float PadInsetFromCentre = HalfX - Depth * 0.5f;
 
 	// The arena builder's own pads are the source of lateral spread, height and facing. Reusing them
 	// means a pad line that has already been checked against every cover block in the arena, and it
@@ -2809,17 +2823,30 @@ void ATraceGameMode::BuildEndzoneSpawnPads()
 		const FVector TemplateLocation = Template->GetActorLocation();
 		const float Sign = (TemplateLocation.X - Centre.X < 0.f) ? -1.f : 1.f;
 
-		// Walk from mid-endzone back towards the goal line until the capsule fits. In the shipped
-		// arena the first candidate is always clear; the walk exists so that changing EndzoneDepth
-		// or adding endzone furniture degrades into a slightly shallower pad instead of spawning a
-		// pawn inside a wall.
-		FVector Candidate(Centre.X + Sign * PadInsetFromCentre, TemplateLocation.Y, TemplateLocation.Z);
+		// ASKED OF THE BUILDER (spec v28 §8). This used to be "mid-endzone", HalfX - EndzoneDepth/2,
+		// computed here from the field bounds — the third independent copy of the endzone clamp, and
+		// when the copies disagreed the pads landed on the centre dais. It is now one call into
+		// ATraceArenaBuilder::GetSpawnLineX(), which owns the band between the foot of the goal's back
+		// approach ramp and the end wall's pawn standoff.
+		//
+		// THESE ARE THE DEEP PADS, so they sit at the far end of that band (0.85): the arena's own fan
+		// is at 0.35, nearer the goal, and two sets of pads on top of each other would give a
+		// respawning player no more choice than one. Behind the goal, both of them — which is the
+		// whole of what §8 asks spawning to change.
+		//
+		// A blocked pad walks back down the band toward the goal. It cannot walk onto the goal's rear
+		// ramp doing that, because alpha 0 is defined as the far side of the ramp's foot. In the
+		// shipped arena the first candidate is always clear; the walk exists so that retuning the
+		// pocket degrades into a slightly shallower pad instead of spawning a pawn inside geometry.
 		bool bPlaced = false;
+		FVector Candidate(ArenaBuilder->GetSpawnLineX(Sign, TraceGameModeConstants::EndzonePadPocketAlpha),
+			TemplateLocation.Y, TemplateLocation.Z);
 
 		for (int32 Step = 0; Step <= TraceGameModeConstants::SpawnProbeSteps; ++Step)
 		{
-			Candidate.X = Centre.X + Sign * (PadInsetFromCentre
-				- Depth * TraceGameModeConstants::SpawnProbeStepFraction * static_cast<float>(Step));
+			const float Alpha = FMath::Max(0.f, TraceGameModeConstants::EndzonePadPocketAlpha
+				- TraceGameModeConstants::SpawnProbeStepFraction * static_cast<float>(Step));
+			Candidate.X = ArenaBuilder->GetSpawnLineX(Sign, Alpha);
 
 			if (!IsSpawnLocationBlocked(Candidate))
 			{
@@ -2849,7 +2876,16 @@ void ATraceGameMode::BuildEndzoneSpawnPads()
 		++Placed;
 	}
 
-	UE_LOG(LogTraceGame, Log, TEXT("Endzone respawn pads: %d placed, %d skipped (blocked)."), Placed, Skipped);
+	// The X is in the line for the reason the arena's own pad log carries it (spec v28 §8): a count
+	// alone would read identically whether these landed behind the goal or in front of it, and
+	// "behind the goals" is the whole of what this pass changed about spawning.
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Endzone respawn pads: %d placed, %d skipped (blocked), at |X| %.0f - %.0f uu behind the ")
+		TEXT("goal plane at |X| %.0f."),
+		Placed, Skipped, FMath::Abs(ArenaBuilder->GetSpawnLineX(1.f, TraceGameModeConstants::EndzonePadPocketAlpha)),
+		FMath::Abs(ArenaBuilder->GetSpawnLineX(1.f, TraceGameModeConstants::EndzonePadPocketAlpha))
+			- ArenaBuilder->GetGoalPlaneX(),
+		ArenaBuilder->GetGoalPlaneX());
 }
 
 void ATraceGameMode::BeginHalf(int32 HalfIndex)
@@ -3527,11 +3563,17 @@ ETraceCharacterPickResult ATraceGameMode::RequestCharacter(ATracePlayerState* Re
 
 	// THE RULE. Spec v14 §3, verbatim: "Do not allow players to select a character who has already
 	// been chosen by a player on their team". Enemies mirroring the pick are explicitly fine, which
-	// is why this asks IsCharacterAvailableFor (per-TEAM) rather than "is anybody holding it".
+	// is why this asks a per-TEAM question rather than "is anybody holding it".
+	//
+	// *** IsCharacterTakeableBy, NOT IsCharacterAvailableFor, SINCE SPEC v28 §9b. *** The two differ
+	// in exactly one case and it is the case §9b is about: a character a BOT team-mate holds is not
+	// "available", but a human may TAKE it, and the bot yields. Left as the older question this
+	// pre-flight would refuse the request with TakenByTeammate before ServerSetCharacter ever got the
+	// chance to preempt — the human would be told a bot outranked them, which is the bug.
 	//
 	// Asked here as a PRE-FLIGHT so the refusal can be reported with a reason. The authoritative
 	// enforcement is ServerSetCharacter's own, checked immediately below — see the post-verify.
-	bool bAvailable = UTraceAbilityComponent::IsCharacterAvailableFor(Requester, Wanted);
+	bool bAvailable = UTraceAbilityComponent::IsCharacterTakeableBy(Requester, Wanted);
 
 	// THE RED ARM. See GTraceEnforceSelectRules at the top of this file for exactly what it reaches
 	// and what it deliberately does not.
@@ -3659,6 +3701,32 @@ void ATraceGameMode::PollCharacterSelect()
 			bEnforceBotRules = (GTraceEnforceBotSelectRules != 0);
 #endif
 
+			// ---- SPEC v28 §9b(a): NOT UNTIL THE MATCH IS UNDER WAY -------------------------------
+			//
+			// THIS IS THE FIX FOR THE MULTIPLAYER BUG, and this poll is where the bug lived: it is
+			// armed in BeginPlay, so its first fill lands a quarter of a second into the level, when
+			// a listen server's host is the only human in PlayerArray and the far team — having no
+			// humans at all — is trivially settled and fills at once. Every remote player is still
+			// travelling. See UTraceAbilityComponent::IsBotFillHeldForWarmup.
+			//
+			// A DUPLICATE, ON PURPOSE, AND NOT THE ENFORCEMENT. ServerSetCharacter refuses these
+			// requests anyway, and it has to, because ATraceBotController::UpdateAutoCharacter is a
+			// second way in that never comes through here. What this early exit buys is silence: ten
+			// bots × 4 Hz × a five second warm-up is two hundred refusals that would bury the log
+			// line the fix is actually read from. It shares bEnforceBotRules with the rest of the
+			// arm so a red run reaches both copies.
+			if (bEnforceBotRules && UTraceAbilityComponent::IsBotFillHeldForWarmup(this))
+			{
+				if (!bLoggedBotFillHeldForWarmup)
+				{
+					bLoggedBotFillHeldForWarmup = true;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[CharSelect] Bot fill HELD until the match starts (spec v28 §9b) so everyone "
+						     "who joins during warm-up picks from a full roster. Said once per match."));
+				}
+				continue;
+			}
+
 			// THE ORDERING. Asked of the framework rather than answered here, because the AI slice's
 			// own ATraceBotController::UpdateAutoCharacter assigns characters too and the two must not
 			// be able to disagree about whose turn it is. The predicate is deliberately "has every
@@ -3765,9 +3833,38 @@ void ATraceGameMode::PollCharacterSelect()
 
 			Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/true, Deadline);
 
-			UE_LOG(LogTraceGame, Log, TEXT("[CharSelect] Select screen opened for '%s' (%s)%s."),
+			// ---- THE ONE NUMBER SPEC v28 §9b IS ABOUT ------------------------------------------
+			//
+			// "Only the host is guaranteed their pick of hero." What that means, precisely, is how
+			// much of the roster is ALREADY GONE at the moment this player's screen opens — and it
+			// was never measured, which is why the bug survived. It is zero for the host (their
+			// screen opens on the opening frames) and it used to be four or five for anybody who
+			// arrived through PostLogin, because the far team's bots had filled at 0.25 s.
+			//
+			// Counted here rather than inferred from a screenshot, and split, because the two halves
+			// mean opposite things: a character a HUMAN team-mate locked in is correctly gone (spec
+			// v14 §3), and a character a BOT is sitting on is the thing §9b hands back — either by
+			// never having let the bot take it (the warm-up hold) or by taking it off them (the
+			// preemption). Read the BOT number: 0 is the fix, non-zero on a fresh join is the bug.
+			int32 HeldByBots = 0;
+			int32 HeldByHumans = 0;
+			for (APlayerState* const OtherState : BaseGameState->PlayerArray)
+			{
+				const ATracePlayerState* Mate = Cast<ATracePlayerState>(OtherState);
+				if (Mate == nullptr || Mate == Candidate || Mate->Team != Candidate->Team || !Mate->HasCharacter())
+				{
+					continue;
+				}
+				(Mate->IsABot() ? HeldByBots : HeldByHumans) += 1;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CharSelect] Select screen opened for '%s' (%s)%s. Roster gone on this team at "
+				     "open: %d to BOTS (spec v28 §9b wants 0), %d to humans, %d of %d still free."),
 				*Candidate->GetPlayerName(), *TraceTeamName(Candidate->Team).ToString(),
-				(Deadline > 0.f) ? *FString::Printf(TEXT("; auto-pick in %.0fs"), CharacterSelectTimeout) : TEXT("; no timeout"));
+				(Deadline > 0.f) ? *FString::Printf(TEXT("; auto-pick in %.0fs"), CharacterSelectTimeout) : TEXT("; no timeout"),
+				HeldByBots, HeldByHumans,
+				TraceCharacterRoster::Count - HeldByBots - HeldByHumans, TraceCharacterRoster::Count);
 			continue;
 		}
 
@@ -4829,6 +4926,42 @@ void ATraceGameMode::StartBotCharacterVerify(bool bRedArm)
 		UTraceAbilityComponent::SetRosterEnforcementOn(bRosterEnforcementWas);
 	};
 
+	// ---- THE MATCH PHASE IS BORROWED FOR THE RUN (spec v28 §9b) --------------------------------
+	//
+	// §9b(a) makes the bot fill wait for the whistle, so from this pass onward WHEN this command is
+	// typed changes what it measures: run it during the five second warm-up and sections 2, 4 and 5
+	// would all correctly report that no bot has filled, and the harness would be reporting the new
+	// rule as a failure of the old ones.
+	//
+	// So the phase is pinned to InProgress for the duration and put back on every exit path — the
+	// same borrowing this harness already does with APlayerState::bIsABot and with the settings
+	// CDO's bCharactersEnabled, and the same clock-cheat section 5 does to the select deadline. It
+	// is not hiding the new rule: section 3c below puts the phase BACK into warm-up on purpose and
+	// asserts the hold, which is the only place in this file the phase is what is being measured.
+	ETraceMatchState PhaseToRestore = ETraceMatchState::InProgress;
+	float PhaseDeadlineToRestore = 0.f;
+	bool bPhaseBorrowed = false;
+
+	if (ATraceGameState* MutableGameState = GetTraceGameState())
+	{
+		PhaseToRestore = MutableGameState->TraceMatchState;
+		PhaseDeadlineToRestore = MutableGameState->MatchEndServerTime;
+		bPhaseBorrowed = true;
+		MutableGameState->TraceMatchState = ETraceMatchState::InProgress;
+	}
+
+	ON_SCOPE_EXIT
+	{
+		if (bPhaseBorrowed)
+		{
+			if (ATraceGameState* MutableGameState = GetTraceGameState())
+			{
+				MutableGameState->TraceMatchState = PhaseToRestore;
+				MutableGameState->MatchEndServerTime = PhaseDeadlineToRestore;
+			}
+		}
+	};
+
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[BotCharVerify] ===== START: characters %s, fill rules %s, framework roster rules %s ====="),
 		AreCharactersEnabled() ? TEXT("ON") : TEXT("OFF"),
@@ -5045,6 +5178,139 @@ void ATraceGameMode::StartBotCharacterVerify(bool bRedArm)
 	{
 		UE_LOG(LogTraceGame, Display, TEXT("[BotCharVerify]   %-22s -> %s"),
 			*Bot->GetPlayerName(), *TraceCharacterRoster::NameFor(Bot->GetSelectedCharacter()));
+	}
+
+	// ---- 3b. SPEC v28 §9b(b): A HUMAN PREEMPTS A BOT -------------------------------------------
+	//
+	// THE LATE JOIN, WHICH IS THE CASE THAT ACTUALLY BIT THE OWNER. The state above is already the
+	// right one: the bots hold characters. All that is missing is a human on their team who does
+	// NOT — so the borrowed human is stripped and re-opened, which is exactly what PostLogin plus
+	// PollCharacterSelect produce for somebody whose client finished loading after the whistle.
+	//
+	// The human then asks for the character a BOT is holding. Before §9b that came back
+	// TakenByTeammate and the player was simply told a computer outranked them.
+	//
+	// WHAT THE RED ARM DOES TO THIS. With the roster rules off, ServerSetCharacter's uniqueness
+	// block is skipped whole, so nothing yields and nothing refuses: the human and the bot both end
+	// up holding the same character. The "granted" line therefore stays GREEN in a red run and the
+	// two starred lines below go RED — which is the right way round, because a grant is not the rule
+	// here, the roster staying conflict-free is.
+	if (TeamBots.Num() > 0)
+	{
+		ATracePlayerState* const TargetBot = TeamBots[0];
+		const uint8 ContestedId = TargetBot->GetSelectedCharacter();
+
+		if (!TraceCharacterRoster::IsValidId(ContestedId))
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[BotCharVerify] Skipping the preemption case: '%s' holds nothing to preempt."),
+				*TargetBot->GetPlayerName());
+		}
+		else
+		{
+			// The human arrives characterless and UNLOCKED, with a screen open. Unlocking first
+			// matters: RequestCharacter tests bCharacterLocked before anything else, so a locked
+			// player would be refused AlreadyLocked and the run would measure that instead.
+			if (UTraceAbilityComponent* HumanAbilities = UTraceAbilityComponent::Get(BorrowedHuman))
+			{
+				HumanAbilities->ServerSetCharacter(ETraceCharacterId::None);
+			}
+			BorrowedHuman->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+			BorrowedHuman->ServerSetCharacterSelectOpen(/*bOpen=*/true, /*DeadlineServerTime=*/0.f);
+
+			const ETraceCharacterPickResult PreemptResult = RequestCharacter(BorrowedHuman, ContestedId);
+
+			ReportCharacterVerify(PreemptResult == ETraceCharacterPickResult::Granted,
+				TEXT("a human asking for a character a BOT holds is GRANTED, not TakenByTeammate"));
+			ReportCharacterVerify(BorrowedHuman->GetSelectedCharacter() == ContestedId,
+				TEXT("*** the human ends up holding the character the bot was on (spec v28 s9b preemption) ***"));
+			ReportCharacterVerify(TargetBot->GetSelectedCharacter() != ContestedId,
+				TEXT("*** the preempted bot GAVE IT UP rather than both holding it ***"));
+			ReportCharacterVerify(CountClashes() == 0,
+				TEXT("the roster is still conflict-free the instant the preemption lands"));
+
+			// AND IT MUST NOT STRAND THE BOT. The one outcome worse than the bug is a bot left on the
+			// Mannequin for the rest of the match, so the assertion is not "it yielded" but "it
+			// yielded and then picked again", driven by the ordinary 4 Hz fill with nothing special
+			// done to it.
+			RunPoll();
+
+			ReportCharacterVerify(TargetBot->HasCharacter(),
+				TEXT("*** the preempted bot RE-PICKS on the next fill pass - no bot is stranded ***"));
+			ReportCharacterVerify(CountBotsHolding() == TeamBots.Num() && CountClashes() == 0,
+				TEXT("every bot still holds something and the team is still conflict-free"));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[BotCharVerify]   preempted: '%s' %s -> %s, human took %s"),
+				*TargetBot->GetPlayerName(), *TraceCharacterRoster::NameFor(ContestedId),
+				*TraceCharacterRoster::NameFor(TargetBot->GetSelectedCharacter()),
+				*TraceCharacterRoster::NameFor(ContestedId));
+		}
+	}
+
+	// ---- 3c. SPEC v28 §9b(a): NO BOT FILLS BEFORE THE MATCH IS UNDER WAY -----------------------
+	//
+	// The half that fixes the ORIGINAL multiplayer report, and it needs the phase machine put back
+	// into warm-up to be visible at all. The clock is cheated in the one place waiting would cost
+	// real seconds — the warm-up deadline — exactly as section 5 below cheats the select deadline.
+	//
+	// THE HUMAN IS SETTLED FIRST, and that is what makes this measure the NEW rule rather than the
+	// old one. If the borrowed human were left characterless, AreHumansOnTeamSettled would refuse
+	// every bot on its own and the assertion would pass on a build with §9b(a) deleted.
+	if (ATraceGameState* MutableGameState = GetTraceGameState(); MutableGameState != nullptr && TeamBots.Num() > 0)
+	{
+		ClearTeam();
+		BorrowedHuman->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+		if (UTraceAbilityComponent* HumanAbilities = UTraceAbilityComponent::Get(BorrowedHuman))
+		{
+			HumanAbilities->ServerSetCharacter(static_cast<ETraceCharacterId>(TraceCharacterRoster::FirstId));
+		}
+		BorrowedHuman->ServerMarkCharacterResolved(/*bLocked=*/true, /*bWasChosen=*/true);
+
+		const bool bHumanIsSettled = BorrowedHuman->HasCharacter();
+
+		// Warm-up, with a deadline ten seconds out so the poll passes below all land inside it.
+		MutableGameState->TraceMatchState = ETraceMatchState::WaitingForPlayers;
+		MutableGameState->MatchEndServerTime =
+			static_cast<float>(MutableGameState->GetServerWorldTimeSeconds() + 10.0);
+
+		RunPoll();
+
+		ReportCharacterVerify(bHumanIsSettled && CountBotsHolding() == 0,
+			TEXT("*** no bot picks while the match is still in WARM-UP, even with every human on its "
+			     "team already settled (spec v28 s9b: joiners get a full roster) ***"));
+
+		// AND THE HOLD ENDS. Only the phase moves — no extra poke, no second code path — so what is
+		// being shown is that the whistle alone releases the fill.
+		MutableGameState->TraceMatchState = ETraceMatchState::InProgress;
+
+		RunPoll();
+
+		ReportCharacterVerify(CountBotsHolding() == TeamBots.Num(),
+			TEXT("*** the held bots fill the moment the match goes InProgress - the hold is not a "
+			     "deadlock ***"));
+		ReportCharacterVerify(CountClashes() == 0,
+			TEXT("the post-whistle fill is unique across the team"));
+
+		// A LOBBY THAT IS NOT COUNTING DOWN IS NOT HELD, which is the escape hatch that makes the
+		// rule impossible to wedge: no warm-up deadline means no imminent match, and a bot with
+		// nothing scheduled to release it would be the one failure worse than the bug.
+		ClearTeam();
+		if (UTraceAbilityComponent* HumanAbilities = UTraceAbilityComponent::Get(BorrowedHuman))
+		{
+			HumanAbilities->ServerSetCharacter(static_cast<ETraceCharacterId>(TraceCharacterRoster::FirstId));
+		}
+		MutableGameState->TraceMatchState = ETraceMatchState::WaitingForPlayers;
+		MutableGameState->MatchEndServerTime = 0.f;
+
+		RunPoll();
+
+		ReportCharacterVerify(CountBotsHolding() == TeamBots.Num(),
+			TEXT("a WaitingForPlayers lobby with no warm-up countdown running does not hold the fill"));
+
+		// Back to the borrowed phase for sections 4 onwards; the ON_SCOPE_EXIT at the top of the run
+		// is what puts the REAL phase back when the whole harness ends.
+		MutableGameState->TraceMatchState = ETraceMatchState::InProgress;
+		MutableGameState->MatchEndServerTime = 0.f;
 	}
 
 	// ---- 4. THE FILL IS RANDOM, NOT A FIXED ORDER ----------------------------------------------

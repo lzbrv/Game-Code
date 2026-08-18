@@ -442,6 +442,25 @@ public:
 	UMaterialInstanceDynamic* GetViewModelBodyMID() const;
 	UMaterialInstanceDynamic* GetViewModelNeonMID() const;
 
+	/**
+	 * [DUALWIELD] SPEC v28 §10 — WHERE THE OFF HAND IS, IN VIEWMODEL RIG SPACE.
+	 *
+	 * @param OutLocation  the left hand's position, whatever pose it is in.
+	 * @return             true when that hand is FREE, i.e. it has come off the weapon and is
+	 *                     available to hold something. False on both v27 poses, where it is a support
+	 *                     hand on the cube gun's frame or the railgun's foregrip.
+	 *
+	 * UTraceWeaponComponent hangs the first-person knife rig on this point rather than keeping its
+	 * own copy of the coordinates. Two objects agreeing about one fact is the failure this codebase
+	 * logs by name, and the failure mode here would be silent and ugly: the blade floating a
+	 * centimetre off the fist after somebody retuned the pose.
+	 *
+	 * Answered from state written by EnsureViewModelBuilt, so it is only meaningful once the rig
+	 * exists — it returns false with a zero location before then, which is the same "not ready yet"
+	 * answer every other viewmodel accessor on this class gives.
+	 */
+	bool GetViewModelOffHand(FVector& OutLocation) const;
+
 	UTraceCharacterMovementComponent* GetTraceMovement() const;
 
 	// --- Server-authoritative state changes -------------------------------------------------------
@@ -926,6 +945,18 @@ private:
 
 	bool bViewModelBuilt = false;
 	bool bViewModelVisible = false;
+
+	/**
+	 * [DUALWIELD] Where EnsureViewModelBuilt actually put the left hand, in rig space, and whether it
+	 * was placed as a FREE off hand (spec v28 §10) rather than as a support hand on the weapon.
+	 *
+	 * Recorded rather than re-derived because the answer depends on three things this class resolves
+	 * at build time — the dual-wield switch, whether the railgun art imported, and the cube gun's own
+	 * table — and UTraceWeaponComponent needs the same point to hang the knife on. See
+	 * GetViewModelOffHand().
+	 */
+	FVector ViewModelOffHandLocation = FVector::ZeroVector;
+	bool bViewModelOffHandFree = false;
 
 	/** Sway/bob/recoil state. Cosmetic, local, never replicated, never read by the shot path. */
 	FRotator ViewModelLastControlRotation = FRotator::ZeroRotator;

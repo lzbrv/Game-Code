@@ -245,6 +245,15 @@ public:
 	 */
 	bool HasLineOfSight(const AActor* Target) const;
 
+	/**
+	 * SPEC v28 §6. How far a LOCKED-OUT bot keeps clear of a turned-over Core, in uu.
+	 *
+	 * PUBLIC because Trace.Bots.LockoutTest judges the before-and-after against it, and a harness
+	 * that re-typed the number would be measuring itself rather than the game. Relative to
+	 * UTraceSettings::CorePickupRadius — see the definition.
+	 */
+	static float GetLockoutKeepOutRadius();
+
 protected:
 	// ------------------------------------------------------------------------------------------
 	// Per-tick pipeline
@@ -317,6 +326,47 @@ protected:
 
 	/** MODE B. Hold a station between the current threat and the goal this bot's team defends. */
 	void BehaviourDefendGoal(float DeltaSeconds);
+
+	// ------------------------------------------------------------------------------------------
+	// SPEC v28 §6 — THE TURNOVER LOCKOUT. "The bots just stand on top of a locked out core."
+	//
+	// During the 5 s window a turnover opens (ATraceCore::IsTurnoverActive) the Core is loose but
+	// only ONE side may have it: the team that dropped it is locked out of the pickup entirely, and
+	// the other side may either walk onto it or PULL it from range. Before this pass the bots knew
+	// none of that — bCoreLoose was the whole of their model — so a locked-out bot ran the ordinary
+	// chase, arrived, found ServerTryLoosePickup refusing it, and stood on the ball for five
+	// seconds because "run at LooseCorePoint" is satisfied the instant you are on top of it.
+	//
+	// Two behaviours, and they are opposite sides of the same fact:
+	//   * LOCKED OUT — do not contest something you cannot have. Back off out of the keep-out
+	//     radius, defend the mouth (or fight), and be goal-side when the window expires.
+	//   * MAY PULL   — go for the pull. Aim at the Core and hold the pull input, which is the input
+	//     a human's right mouse produces, so the bot races through the same CanPullNow /
+	//     ServerTickTurnover rules a player does.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Server. Holds or releases this bot's Core-pull input, mirroring bPullInputHeld so the edge is
+	 * only ever sent once — the same shape as ApplyPassInput / ApplySecondaryInput.
+	 *
+	 * Routed through ATraceCore::RequestPullInput, i.e. the entry point §7's right mouse reaches on
+	 * a human. Nothing here writes pull state directly: the hold, its 0.3 s clock, the aim cone, the
+	 * line of sight and the race between two pullers all stay the server's.
+	 */
+	void ApplyPullInput(bool bHeld);
+
+	/**
+	 * SPEC v28 §6. THE LOCKED-OUT TEAM'S RETREAT, applied after the behaviours have steered.
+	 *
+	 * One place rather than a branch in each behaviour: whichever state a locked-out bot ends up in
+	 * (DefendGoal, Fight, Regroup, EscortCarrier...), the rule is the same sentence — do not be
+	 * stood on a ball you are not allowed to touch — and a rule spread across five behaviours is a
+	 * rule that will be missing from the sixth.
+	 *
+	 * Inside the keep-out radius it REPLACES the steering with a push directly away from the Core;
+	 * outside it, it does nothing at all.
+	 */
+	void ApplyLockoutKeepOut();
 
 	/**
 	 * MODE B. True when this bot is one of the players whose job is the goal mouth right now.
@@ -661,6 +711,52 @@ private:
 
 	/** 2D distance from this bot to LooseCorePoint, for the chase ranking. */
 	float LooseCoreDistSq = 0.f;
+
+	// --- SPEC v28 §6: the turnover lockout, as this bot sees it ----------------------------------
+	//
+	// Gathered once per tick in GatherWorldState from the replicated turnover state, so every
+	// decision below asks the same three questions the Core's own CanPullNow / ServerTryLoosePickup
+	// ask, rather than each behaviour re-deriving "am I allowed to have this".
+
+	/** True while a turnover's lockout window is open. Always false in mode A. */
+	bool bTurnoverActive = false;
+
+	/** True when MY team dropped it: I may not pick it up and I may not pull. Back off. */
+	bool bLockedOutOfCore = false;
+
+	/** True when the OTHER team dropped it: I may pull it, and I may walk onto it. */
+	bool bMayPullCore = false;
+
+	/** Seconds left on the window. 0 when no turnover is running. Logged, never used as a threshold. */
+	float TurnoverSecondsLeft = 0.f;
+
+	/**
+	 * The Core's ACTUAL resting position this tick — not LooseCorePoint, which is led by velocity.
+	 *
+	 * The pull's aim cone is 4 degrees wide and is measured against where the Core IS, so aiming a
+	 * pull at the lead point would miss the cone at exactly the moment the ball is moving. A turned
+	 * over Core is at rest (RegisterTurnover zeroes its velocity), so the two agree today — this is
+	 * a guard against the day they stop agreeing, not a correction to anything visible now.
+	 */
+	FVector TurnoverCoreLocation = FVector::ZeroVector;
+
+	/**
+	 * Last tick's bLockedOutOfCore, so the WINDOW'S EDGES can force an immediate re-decision.
+	 *
+	 * DecideState runs on the profile's decision cadence (~0.3 s), and both edges of a 5 s window are
+	 * exactly the moments where a stale decision looks worst: at the opening edge a bot would keep
+	 * running at a ball it may not touch for another third of a second, and at the closing edge it
+	 * would stand off a ball that is live again. The keep-out push already covers the first case
+	 * physically; this covers both of them in the plan.
+	 */
+	bool bWasLockedOutOfCore = false;
+
+	/** Mirror of the pull button, so the press/release edges are only sent once. */
+	bool bPullInputHeld = false;
+
+	/** Aim override while going for a pull: the crosshair has one job and it is not shooting. */
+	bool bPullOwnsAim = false;
+	FVector PullAimPoint = FVector::ZeroVector;
 
 	/** Centre of the goal this team DEFENDS, in mode B. Only meaningful while bDefendGoalValid. */
 	FVector DefendGoalCentre = FVector::ZeroVector;

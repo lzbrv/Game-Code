@@ -394,6 +394,44 @@ public:
 	UPROPERTY(Replicated)
 	TObjectPtr<ATraceCharacter> PullWinner = nullptr;
 
+	// --- SPEC v28 §7. The full-charge deadline. Inert (-1) in mode A and whenever nobody is charging.
+	/**
+	 * SERVER TRUTH. Shared-clock instant this holder's charge reached FULL, or < 0 when it has not.
+	 *
+	 * The ONE writer is ServerTickThrowAutoRelease() (plus ClearThrowCharge, which zeroes it with the
+	 * rest of the charge). It is set to `press time + CoreThrowChargeSeconds`, i.e. the exact moment
+	 * the rule fired, NOT the time of the tick that noticed — a tick-quantised start would make the
+	 * red ring's 0.6 s a 0.6 s plus up to a frame, and the deadline and the drawing would then be
+	 * measuring two different windows.
+	 *
+	 * Replicated to everybody rather than COND_OwnerOnly, which is this actor's standing policy (see
+	 * PullHolds): it is bAlwaysRelevant, this is four bytes that change at most twice per throw, and
+	 * an owner-only condition on an actor whose owner changes with possession is a way to lose the
+	 * value on exactly the frame a possession change races a charge.
+	 */
+	UPROPERTY(Replicated)
+	float ThrowFullChargeServerTime = -1.f;
+
+	// --- SPEC v28 §7's CLIENT-SIDE EVIDENCE. Never replicated; each machine's own record. ----------
+	//
+	// "The ring shows the SERVER'S OWN progress" is a claim about the wire, and it cannot be checked
+	// on the server: the host writes the stamp and reads it back out of its own memory, so a listen
+	// host would report a green ring for a property that was never registered for replication at all.
+	// These two are what a SECOND PROCESS reads back through Trace.ModeB.ThrowAutoRelease.Report, and
+	// on a client a non-zero count is the wire itself answering.
+	//
+	// Updated in Tick on EVERY machine, ahead of the authority split, for the same reason TickFlightLog
+	// is: the machine the question is about is the one that is not the server.
+
+	/** The last full-charge instant this machine has SEEN, however it arrived. < 0 = never. */
+	float LastSeenFullChargeStamp = -1.f;
+
+	/** How many DISTINCT full-charge instants this machine has seen. On a client, packets received. */
+	int32 FullChargeStampsSeen = 0;
+
+	/** The largest auto-release alpha this machine has ever computed from those stamps. */
+	float PeakSeenAutoReleaseAlpha = -1.f;
+
 	// =============================================================================================
 	// Contract surface - new API
 	// =============================================================================================
@@ -744,6 +782,65 @@ public:
 
 	/** Floor..Max — the momentum fraction a release right now would throw with. -1 when not charging. */
 	float GetThrowChargeScaleNow() const;
+
+	// --- SPEC v28 §7 — A FULL CHARGE CANNOT BE HELD FOREVER -----------------------------------------
+	//
+	// Verbatim: "A player can hold a core at full throw charge indefinitely. Make a second little red
+	// ring which fills on the inside of the green one on a .6seconds timer. This timer should start
+	// right when throw charge reaches full. When the second timer completes, the core is released at
+	// full charge automatically, if a player doesn't throw it before then."
+	//
+	// *** THE SERVER DECIDES, AND THE RING DRAWS THE SERVER'S OWN CLOCK. *** This is the one thing
+	// about §7 that is a networking requirement rather than a feature. Everything about the GREEN ring
+	// is deliberately PREDICTED (see IsThrowCharging above): it shows the player their own finger, it
+	// can be a round trip ahead of the server, and the worst that costs is a meter that read 3% high
+	// at the release. A red ring predicted the same way would be a different thing entirely — it does
+	// not report a hold, it reports a DEADLINE, and a locally-run deadline finishes at a different
+	// instant on every machine. A player would watch their ring complete and keep holding for another
+	// 80 ms, or watch the Core leave with the ring at 92%. So:
+	//
+	//   * ThrowFullChargeServerTime is written ONLY on the authority, at the exact instant the
+	//     server's own hold crossed CoreThrowChargeSeconds (start + charge time, NOT "the tick we
+	//     noticed"), and it is replicated.
+	//   * GetThrowAutoReleaseAlpha() below is that instant measured against the SHARED clock
+	//     (AGameStateBase::GetServerWorldTimeSeconds), so the number the HUD draws is arithmetic on
+	//     the server's own decision rather than a second opinion about it.
+	//   * The auto-release itself is ServerTickThrowAutoRelease(), fired off the identical deadline.
+	//
+	// The ring can therefore only ever be LATE by the client's downstream latency — never early, and
+	// never finished while the Core is still in the hand.
+	//
+	// A MANUAL THROW IS COMPLETELY UNCHANGED. Nothing here touches RequestPassInput's release path:
+	// releasing before the deadline runs the same line it always has, with the same server-measured
+	// hold. §7 only adds an upper bound to how long the press may sit there.
+
+	/**
+	 * SPEC v28 §7. Seconds from FULL CHARGE to the automatic release. 0.6 s, as asked.
+	 *
+	 * Bound BY NAME to UTraceSettings::CoreThrowFullChargeAutoReleaseSeconds if that property exists,
+	 * exactly like the other four charge knobs, so a shipped ini value wins the moment one is added;
+	 * until then Trace.ModeB.ThrowAutoReleaseSeconds is the knob and 0.6 is its default. 0 disables
+	 * the auto-release (and the red ring with it), which is the RED ARM for this section.
+	 */
+	static float GetThrowAutoReleaseSeconds();
+
+	/**
+	 * SPEC v28 §7. 0..1 fill of the RED ring, or -1 when there is no full charge being held.
+	 *
+	 * SERVER TRUTH, on every machine: it is (shared clock now - the server's own full-charge instant)
+	 * over the window. -1 means "the server has not seen this charge reach full", which is also what a
+	 * client sees for the fraction of a round trip between the two — the ring simply has not appeared
+	 * yet, rather than appearing with a number nobody authored.
+	 */
+	float GetThrowAutoReleaseAlpha() const;
+
+	// SPEC v28 §7's wire record, read by Trace.ModeB.ThrowAutoRelease.Report. See the members.
+	int32 GetFullChargeStampsSeen() const     { return FullChargeStampsSeen; }
+	float GetLastSeenFullChargeStamp() const  { return LastSeenFullChargeStamp; }
+	float GetPeakSeenAutoReleaseAlpha() const { return PeakSeenAutoReleaseAlpha; }
+
+	/** The raw replicated instant, for that same report. Prefer GetThrowAutoReleaseAlpha() to draw with. */
+	float GetThrowFullChargeServerTimeForTest() const { return ThrowFullChargeServerTime; }
 
 	// --- Goals -----------------------------------------------------------------------------------
 
@@ -1545,6 +1642,48 @@ private:
 	 */
 	void RegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where, const TCHAR* Why);
 
+	// --- SPEC v28 §2 — THE TURNOVER SOUND FIRES ON THE WRONG EVENT --------------------------------
+	//
+	// Verbatim: "The core turnover sound should play globally when the core is dropped by a team or a
+	// carrier is killed (a turnover), NOT when a team picks up a core which was locked out."
+	//
+	// WHAT IT USED TO DO, measured rather than assumed: there was exactly one CoreTurnover call site
+	// in the whole module and it sat inside RegisterTurnover(), which is reached from exactly one
+	// shipping place — ServerSurfaceTurnover, i.e. the instant a THROWN Core has finished bouncing,
+	// come to rest and stayed still for Trace.ModeB.TurnoverSettleSeconds. That is not the drop; it is
+	// seconds later, it is the frame the five-second lockout OPENS and the other side may take the
+	// Core, and a carrier who is shot dead produced no turnover sound at all because a kill never
+	// reaches that function.
+	//
+	// WHAT IT DOES NOW: the sound is announced at the two moments the owner names, both of which are
+	// the moment a team STOPS HOLDING THE CORE —
+	//
+	//   * the carrier throws it and the Core goes loose  (ThrowFromHolder — "dropped by a team")
+	//   * the carrier is killed, or leaves               (OnHolderDeath / DropAt — "a carrier is killed")
+	//
+	// and NOWHERE else. RegisterTurnover is silent, so the landing is silent, the lockout expiring is
+	// silent (it never made a sound), and every pickup path — ServerTryLoosePickup -> TakeLooseCore,
+	// ServerCompletePull, GrantTo — is silent, which is the half of the sentence with "NOT" in it.
+	//
+	// ONE ANNOUNCEMENT PER LOSS, and the de-dup below is not defensive padding: a carrier's death
+	// legitimately reaches this twice. ATraceGameMode::NotifyCharacterDied calls DropAt() from inside
+	// the health component's OnDeath broadcast, and ATraceCore::OnHolderDeath is a listener on that
+	// SAME broadcast — two handlers, one death. Keyed on the pawn that lost it as well as the time, so
+	// two genuinely different losses in the same quarter second (a kill, then the killer immediately
+	// throwing) still make two sounds.
+
+	/**
+	 * SERVER. Plays CoreTurnover, game-side, at @p Where — once per possession loss.
+	 *
+	 * @param Loser  the pawn that just lost the Core. Used only as the de-dup key.
+	 * @param Why    for the log line.
+	 */
+	void AnnounceTurnoverSound(const FVector& Where, const ATraceCharacter* Loser, const TCHAR* Why);
+
+	/** De-dup key for AnnounceTurnoverSound: who lost it, and on the shared clock, when. */
+	TWeakObjectPtr<const ATraceCharacter> LastTurnoverSoundLoser;
+	float LastTurnoverSoundServerTime = -1000.f;
+
 	/** SERVER. Ends the window (expiry, the pull completing, the Core leaving the world). */
 	void ClearTurnover(const TCHAR* Why);
 
@@ -1927,6 +2066,24 @@ private:
 
 	/** Ends any charge in progress WITHOUT throwing. Death, a possession change, a mode switch. */
 	void ClearThrowCharge(const TCHAR* Reason);
+
+	/**
+	 * SPEC v28 §7. SERVER. Publishes the full-charge instant and fires the automatic release.
+	 *
+	 * Called once per tick from the HELD branch of Tick(), which is the only state a charge can exist
+	 * in. Two jobs, in this order and deliberately in one function:
+	 *   1. maintain ThrowFullChargeServerTime — set it the tick the server's own hold crosses the
+	 *      charge time, clear it if a re-press restarted the clock below full;
+	 *   2. when the shared clock passes that instant + GetThrowAutoReleaseSeconds(), throw.
+	 *
+	 * Keeping them together is what makes "the ring shows the server's own progress" true by
+	 * construction: the number the HUD draws and the deadline the throw fires on are the SAME
+	 * expression, not two copies of it that a retune could separate.
+	 *
+	 * @return true when it threw. The caller must touch no member state afterwards — the Core is
+	 *         loose and this tick is over.
+	 */
+	bool ServerTickThrowAutoRelease();
 
 	// --- SPEC v25 §2 server state. Nothing here is replicated; the four facts above are. ----------
 

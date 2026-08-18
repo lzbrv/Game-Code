@@ -170,16 +170,40 @@ class UWorld;
  * Gun is 0 so a default-constructed pawn, a freshly replicated proxy and a pawn whose weapon
  * component has not begun play all agree on "the gun", which is what every other system in the
  * build assumes when it asks whether somebody can shoot.
+ *
+ * *** SPEC v28 §9 APPENDS Smg AND DOES NOT RENUMBER. *** This enumerator travels on the wire
+ * (UTraceWeaponComponent::EquippedWeapon is replicated) and is what
+ * ServerRequestEquip_Validate range-checks, so inserting anything above Knife would make two
+ * builds disagree about what a byte on the wire means. Appended, never inserted — the same rule
+ * ETraceInputAction states at length for its own table.
+ *
+ * "Gun" IS THE PISTOL, and it keeps the name rather than being renamed to Pistol. Every existing
+ * caller that asks for ETraceEquippedWeapon::Gun means "the ordinary firearm", and a rename would
+ * be a repo-wide edit across four ownership slices for no behavioural gain. Use
+ * UTraceWeaponComponent::IsFirearmEquipped() when the question is "any gun at all", which is what
+ * almost every gate actually wants.
  */
 UENUM()
 enum class ETraceEquippedWeapon : uint8
 {
+	/** The pistol. 100 / 40 / 25, 190 RPM, 30-round clip, 0.5 s reload. */
 	Gun   = 0,
-	Knife = 1
+
+	/** The knife. Under dual-wield (spec v28 §10) NO pawn is ever in this state — see UTraceMeleeSettings::bDualWieldKnife. */
+	Knife = 1,
+
+	/** SPEC v28 §9. Full-auto SMG: 33 / 18 / 12, 600 RPM, 40-round clip, 0.8 s reload. */
+	Smg   = 2
 };
 
-/** "GUN" / "KNIFE". Logs and HUD only. */
+/** "GUN" / "KNIFE" / "SMG". Logs and HUD only. */
 TRACE_API const TCHAR* LexToString(ETraceEquippedWeapon Weapon);
+
+/** True for a weapon that fires bullets, i.e. everything except the knife. One definition. */
+inline bool TraceIsFirearm(ETraceEquippedWeapon Weapon)
+{
+	return Weapon == ETraceEquippedWeapon::Gun || Weapon == ETraceEquippedWeapon::Smg;
+}
 
 /** Why a swap or a swing was turned down. Reported to the log, and available to the HUD and bots. */
 enum class ETraceMeleeRefusal : uint8
@@ -474,6 +498,87 @@ public:
 	/** Fraction of SwingRangeUU a bot must be inside before it swings. Under 1 so it does not flail. */
 	UPROPERTY(config, EditAnywhere, Category = "Bots", meta = (ClampMin = "0.1", ClampMax = "1.0"))
 	float BotSwingRangeFraction = 0.85f;
+
+	// =============================================================================================
+	// ***                      T H E   O N E   S W I T C H   (spec v28 §10)                      ***
+	// =============================================================================================
+	//
+	// Spec v28 §10, verbatim: "Knives are being changed so that you can dual wield them with a gun.
+	// Gun in one hand, knife in the other. [...] But you no longer have to swap between knife and
+	// gun, just the different guns. Make these knife changes easy to revert with one prompt."
+	//
+	// *** THIS BOOL IS THAT ONE PROMPT. *** Set it false — here, in Config/DefaultGame.ini, with
+	// `Trace.Knife.DualWield 0`, or by launching with `-TraceLegacyKnife` — and the build is byte for
+	// byte the knife-as-a-separate-weapon game that shipped in v27. Nothing else has to be touched
+	// and nothing has to be found: every site that behaves differently is marked with the literal
+	// tag  [DUALWIELD]  in a comment, so
+	//
+	//     grep -rln '\[DUALWIELD\]' Source/Trace Config
+	//
+	// is the complete inventory of the change. It lands in SIX source files and one .ini, and all
+	// seven are inside this pass's own ownership slice — TraceMelee.{h,cpp},
+	// TraceWeaponComponent.{h,cpp}, TraceCharacter.{h,cpp} (viewmodel only) and
+	// Config/DefaultGame.ini. Nothing outside that set changes behaviour on this flag, which is what
+	// makes the revert a read of one list rather than an archaeology dig.
+	//
+	// ---------------------------------------------------------------------------------------------
+	// EXACTLY WHAT FLIPPING IT DOES. TRUE (shipped) on the left, FALSE (the v27 revert) on the right.
+	// ---------------------------------------------------------------------------------------------
+	//
+	//   THE SELECTOR
+	//     true   ETraceEquippedWeapon::Knife is never entered by any path. RequestEquip(Knife)
+	//            succeeds as a no-op (the blade is already in hand) and costs no pullout. The
+	//            selector only ever holds Gun (pistol) or Smg.
+	//     false  the selector holds Gun or Knife exactly as it did in v27, with the 0.2 s pullout
+	//            between them. (Smg is still reachable — §9 is a separate feature and does NOT
+	//            depend on this switch.)
+	//
+	//   THE 1 AND 2 KEYS  (TraceMelee::RequestEquipIfDifferent)
+	//     true   1 = pistol, 2 = SMG. Weapon switching is between GUNS only.
+	//     false  1 = knife, 2 = gun, exactly as spec v13 §2 specified.
+	//
+	//   MELEE
+	//     true   TraceMelee::HandleMeleeInput is the melee verb, on its own bind (right mouse by
+	//            default — see the hand-off note on that function). Mouse 1 always SHOOTS.
+	//            CanSwing() no longer requires the knife to be the selected weapon.
+	//     false  mouse 1 is "attack" and dispatches to a swing when the knife is selected, which is
+	//            the v10 §1 design. HandleMeleeInput refuses with WrongWeapon unless the knife is
+	//            actually equipped, so a stray right-mouse bind cannot melee with the gun out.
+	//
+	//   SHOOTING LOCKOUT
+	//     true   CanFire() is false for SwingAnimSeconds after a swing starts (spec v28 §10:
+	//            "Meleeing should lock the player out of shooting for the length of the animation").
+	//     false  no lockout exists, because with the knife out you could not shoot anyway.
+	//
+	//   MOVEMENT
+	//     true   TraceMelee::ShouldUseKnifeMovementProfile() is ALWAYS false. This is the single most
+	//            important consequence of the switch and it is deliberate: the +22% ground speed and
+	//            the two air-cap multipliers (spec v12 §3) were the PRICE of holding a weapon that
+	//            cannot shoot. A knife that is always in your off hand would hand every player that
+	//            bonus permanently and for free, which is a movement rebalance nobody asked for.
+	//     false  the v12 §3 profile applies whenever the knife is the selected weapon.
+	//
+	//   PRESENTATION
+	//     true   the knife rig is drawn in the OFF hand alongside the gun, always, and the gun is
+	//            never hidden. ATraceCharacter's left hand comes off the foregrip.
+	//     false  the knife replaces the gun on screen, one weapon at a time (v12 §7's rule).
+	//
+	//   BOTS
+	//     true   bots never swap weapons for melee; they keep the gun and swing when a target walks
+	//            into blade range.
+	//     false  the v10 §1 range band: swap to the knife inside BotEngageRangeUU, back out at
+	//            BotDisengageRangeUU.
+	//
+	// ---------------------------------------------------------------------------------------------
+	// WHAT IT DOES NOT TOUCH, so a revert is not mistaken for a wider undo: §9's SMG, the damage
+	// model, the back/front cone, the swing cooldown, the wind-up, the reach, carrier immunity, and
+	// every number in this class above this line. Reverting the knife does not revert the SMG.
+	// ---------------------------------------------------------------------------------------------
+	//
+	// THE .INI WINS over this initialiser, as it does for every property in this class — see the
+	// class comment. Read the live value back with `Trace.Knife.DumpSettings`, never from this line.
+	UPROPERTY(config, EditAnywhere, Category = "Dual wield", meta = (DisplayName = "Dual-wield the knife with a gun [v28 §10 — THE REVERT SWITCH]"))
+	bool bDualWieldKnife = true;
 };
 
 /**
@@ -520,6 +625,21 @@ namespace TraceMelee
 	TRACE_API float GetBotSwingRangeFraction();
 	TRACE_API bool  IsBotAutoKnifeEnabled();
 	TRACE_API bool  IsDebugLoggingEnabled();
+
+	/**
+	 * *** THE SPEC v28 §10 REVERT SWITCH, RESOLVED. The only reader of bDualWieldKnife. ***
+	 *
+	 * Three inputs, in this order of precedence, so a headless run and a designer can both reach it:
+	 *
+	 *   1. `-TraceLegacyKnife` on the command line forces FALSE (the v27 behaviour). Sampled once.
+	 *   2. `Trace.Knife.DualWield` — 0 or 1 forces that answer; the shipped -1 defers.
+	 *   3. UTraceMeleeSettings::bDualWieldKnife, which Config/DefaultGame.ini sets.
+	 *
+	 * Read UTraceMeleeSettings::bDualWieldKnife's comment for the complete list of what flipping it
+	 * changes. Every call site of this function carries the tag [DUALWIELD] so the whole change is
+	 * one grep.
+	 */
+	TRACE_API bool IsDualWieldEnabled();
 
 	/**
 	 * Kill-feed causes. Two, not one, so the feed can tell a back-stab from a front swipe — the same
@@ -623,8 +743,90 @@ namespace TraceMelee
 	// for UTraceSettings::CarrierSpeedMultiplier).
 	// ---------------------------------------------------------------------------------------------
 
-	/** True when @p Character currently has the knife out. False for null, a corpse, or the gun. */
+	/**
+	 * True when the knife is the SELECTED weapon, i.e. the gun is stowed and cannot fire.
+	 *
+	 * *** UNDER DUAL-WIELD THIS IS ALWAYS FALSE, AND THAT IS THE CORRECT ANSWER. *** Every caller of
+	 * this predicate outside the melee slice uses it to mean "this pawn cannot shoot right now" —
+	 * X's Sting, Roxie's Modded, the ability component's reload hook, ShouldShowAmmo, the HUD's
+	 * weapon row. With the knife in the off hand a pawn CAN always shoot, so answering true would
+	 * switch every one of those off for the whole match.
+	 *
+	 * Use IsKnifeInHand() below when the question is "is there a blade available to swing".
+	 */
 	TRACE_API bool IsKnifeEquipped(const AActor* Character);
+
+	/**
+	 * "Is there a blade in this pawn's hands at all?" — the question the SWING gate asks.
+	 *
+	 * [DUALWIELD] true for any living pawn when the switch is on (the knife is always held), and
+	 * identical to IsKnifeEquipped() when it is off. This is the split that keeps the revert honest:
+	 * one predicate means "the gun is stowed" and the other means "the knife is available", and
+	 * before v28 they were the same sentence so one name did for both.
+	 */
+	TRACE_API bool IsKnifeInHand(const AActor* Character);
+
+	/**
+	 * Seconds of shooting lockout still owed by a swing. 0 when the gun is free.
+	 *
+	 * Spec v28 §10: "Meleeing should lock the player out of shooting for the length of the
+	 * animation." The length IS UTraceMeleeSettings::SwingAnimSeconds — it is not a second number
+	 * that happens to equal it, so retuning the animation moves the lockout with it.
+	 */
+	TRACE_API float GetShootLockoutRemaining(const AActor* Character);
+
+	// ---------------------------------------------------------------------------------------------
+	// THE MELEE BIND  (spec v28 §10)
+	// ---------------------------------------------------------------------------------------------
+
+	/** What one press of the melee bind actually did. Returned so the caller can log it honestly. */
+	enum class EMeleeInputResult : uint8
+	{
+		/** A swing started. */
+		Swing,
+
+		/**
+		 * The press went to the CORE PULL instead, because the player was being shown the pull
+		 * circle at that instant. Spec v28 §10, verbatim: "If and only if a player is looking at a
+		 * pullable core, and being shown the circle icon to pull, this keybind should override the
+		 * melee keybind."
+		 */
+		CorePull,
+
+		/** Neither. @p OutRefusal says which melee rule turned it down. */
+		Refused
+	};
+
+	/**
+	 * *** THE WHOLE RIGHT-MOUSE VERB, IN ONE CALL. Bind the melee key to this and nothing else. ***
+	 *
+	 * @param Pawn      the pressing player's pawn.
+	 * @param bPressed  true on the press edge, false on the release edge. BOTH MUST BE DELIVERED —
+	 *                  the Core pull is a HOLD, so a press that never gets its release leaves a ring
+	 *                  filling on the server behind a pause menu. The release is always forwarded to
+	 *                  the Core (a release on a latch that was never set is a documented no-op), so
+	 *                  the caller does not have to remember which verb the press went to.
+	 *
+	 * THE PRECEDENCE IS A STATE TEST, NOT A BLANKET RULE, and that is the exact wording of the
+	 * request. The pull wins if and only if ATraceCore::CanPullNow() is true for this pawn on this
+	 * frame — which is the SAME predicate ATraceHUD uses to decide whether to draw the circle
+	 * (TraceHUD.cpp, "const bool bEligible = Core->CanPullNow(LocalChar, &Reason)"). Asking the same
+	 * function is what makes "being shown the circle icon" and "the button pulls" one fact instead of
+	 * two that can drift. In every other state — no turnover, wrong team, out of range, no line of
+	 * sight, looking away, already carrying — the circle is not on screen and the press melees.
+	 *
+	 * Safe on null, safe on any machine, and it dispatches the pull itself
+	 * (ATraceCore::RequestPullInput, which handles the client relay), so there is nothing left for
+	 * the caller to do.
+	 */
+	TRACE_API EMeleeInputResult HandleMeleeInput(ATraceCharacter* Pawn, bool bPressed,
+		ETraceMeleeRefusal* OutRefusal = nullptr);
+
+	/**
+	 * The precedence test on its own, exported so the keybind slice and the HUD can ask it without
+	 * pressing anything — e.g. to label the right-mouse prompt "PULL" rather than "MELEE".
+	 */
+	TRACE_API bool ShouldCorePullOverrideMelee(const ATraceCharacter* Pawn);
 
 	/**
 	 * "Should this pawn be running the knife's movement profile right now?"
@@ -689,6 +891,25 @@ namespace TraceMelee
 	 * Use this for a key that names a weapon; use RequestEquip above for a bot deciding what it
 	 * needs. The difference is documented in full on UTraceWeaponComponent::RequestEquipIfDifferent,
 	 * which is where the gate lives.
+	 *
+	 * *** [DUALWIELD] THIS IS WHERE THE 1 AND 2 KEYS ARE REMAPPED, AND IT IS THE ONLY PLACE. ***
+	 * Spec v28 §10: "you no longer have to swap between knife and gun, just the different guns." The
+	 * two direct-select binds still exist and still name a slot; with the switch on, the SLOT they
+	 * name changes:
+	 *
+	 *     key      action id           v27 meaning     v28 dual-wield meaning
+	 *     1        EquipKnife          the knife       slot 1 = the PISTOL
+	 *     2        EquipGun            the gun         slot 2 = the SMG
+	 *
+	 * The remap lives on THIS function — the verb documented as "for a key that names a weapon" —
+	 * and deliberately not on RequestEquip, which is the bots' and the console's verb and must keep
+	 * meaning exactly what it says. It is one switch statement; see the definition.
+	 *
+	 * HAND-OFF, STATED PLAINLY: the two rows on the keybind page still READ "SWITCH TO KNIFE" and
+	 * "SWITCH TO GUN". Those display strings live in FTraceInputActionInfo (Settings/
+	 * TraceUserSettings.cpp), which is spec v28 §3's ownership slice, not this one. The binds work;
+	 * the labels are stale. Renaming them to "WEAPON 1 (PISTOL)" / "WEAPON 2 (SMG)" is a two-string
+	 * edit there and must NOT change either ConfigId, or every returning player loses the bind.
 	 */
 	TRACE_API bool RequestEquipIfDifferent(ATraceCharacter* Pawn, ETraceEquippedWeapon Desired,
 		ETraceMeleeRefusal* OutRefusal = nullptr);

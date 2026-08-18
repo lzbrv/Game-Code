@@ -7,6 +7,11 @@
 #include "DynamicRHI.h"                  // RHIGetGPUFrameCycles
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
+#include "Engine/GameViewportClient.h"  // spec v28 §3a - the harness injects where FSceneViewport does
+#include "InputKeyEventArgs.h"           // spec v28 §3a - a real FInputKeyEventArgs, not a call into the menu
+#include "Framework/Application/SlateApplication.h"  // spec v28 §3a - inject ABOVE the viewport gate
+#include "Widgets/SViewport.h"           // spec v28 §3a - the widget the synthetic click is aimed at
+#include "UnrealClient.h"                // FViewport::GetMouseCaptureMode, the gate being measured
 #include "Engine/Texture2D.h"            // the artist's sprites - see the art block below
 #include "TextureResource.h"             // FTextureResource::TextureRHI - see IsDrawable
 #include "GameFramework/HUD.h"
@@ -22,6 +27,7 @@
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
 #include "Audio/TraceAudio.h"           // spec v26 §9 - ButtonPress on the submenu rows too
+#include "Gameplay/TraceMelee.h"       // spec v28 §10 - the dual-wield switch renames the two weapon rows
 
 // =================================================================================================
 // WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
@@ -774,11 +780,37 @@ namespace
 			}
 			GActiveOptionsMenu->DebugNudge(FCString::Atoi(*Args[0]), FCString::Atoi(*Args[1]));
 		}));
+
+	FAutoConsoleCommand CmdRebindProof(
+		TEXT("Trace.Keys.RebindProof"),
+		TEXT("Spec v28 s3a. Counts how many complete mouse clicks it takes to open a rebind capture and ")
+		TEXT("how many complete key presses it takes to land the key, by parking the real cursor on a real ")
+		TEXT("key chip and injecting real edges through UGameViewportClient::InputKey. One and one is the ")
+		TEXT("requirement. Runs on whichever overlay is up - title screen or in-match pause menu - and ")
+		TEXT("restores every binding it touches."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->DebugBeginRebindProof();
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[RebindProof] No HUD is drawing an overlay yet, so there is nothing to drive."));
+			}
+		}));
 }
 #endif
 
 FTraceOptionsMenu::~FTraceOptionsMenu()
 {
+	// SPEC v28 §3a — a last-resort restore. Close() is the ordinary path and every exit goes through
+	// it, but an overlay destroyed WITH the panel still up (a HUD taken down by a travel) would
+	// otherwise leave the viewport in CaptureDuringMouseDown for the rest of the process. It is a
+	// no-op unless this instance is the one that raised the mode.
+	SetPressDeliveryOverride(false);
+
 #if !UE_BUILD_SHIPPING
 	if (GActiveOptionsMenu == this)
 	{
@@ -822,6 +854,500 @@ void FTraceOptionsMenu::DebugNudge(int32 RowsFromTop, int32 Delta)
 		*Rows[Selected].Label, *FormatSettingValue(Rows[Selected].Setting, Value));
 }
 
+// =================================================================================================
+// SPEC v28 §3a — Trace.Keys.RebindProof: HOW MANY PRESSES DOES A REBIND ACTUALLY TAKE?
+//
+// The report is "when I click to rebind a key in settings, it's not working", restated by the note as
+// "rebinding currently needs the button pressed twice before it registers". That is a COUNT, so the
+// only honest answer is a count, taken the way a player produces it:
+//
+//   1. park the real OS cursor on a real key chip on a real row (PC->SetMouseLocation),
+//   2. inject complete LEFT MOUSE down/up pairs through UGameViewportClient::InputKey — the exact
+//      call FSceneViewport::OnMouseButtonDown makes for a physical mouse — until the row opens its
+//      capture, counting the pairs,
+//   3. inject complete pairs for the key being bound, the same way, until UTraceUserSettings says the
+//      binding changed, counting those too.
+//
+// NOTHING HERE REACHES PAST THE INPUT PATH. It never sets bCapturingKey, never calls SetKey and never
+// calls ActivateSelected; if it did, it would pass on a build whose input path is exactly what is
+// broken, which is the failure mode this project has been caught by before (see the ClickTest's note
+// about judging a click before it had been delivered).
+//
+// EVERY EDGE GETS ITS OWN DRAWN FRAME, AND THE JUDGEMENT COMES A FRAME AFTER THE RELEASE.
+// APlayerController::InputKey does not run anything; it queues the event for the next
+// ProcessInputStack, and this overlay then polls that state from the NEXT DrawHUD. Judging on the
+// same frame as the release asks "did that work?" before the click has been delivered and manufactures
+// the very bug it is measuring.
+//
+// It runs off DRAWN FRAMES rather than a timer because the in-match pause menu stops the world, so
+// every world timer freezes the instant the overlay opens — the same reason TickAutoActivate counts
+// draws.
+//
+// The bindings it moves are snapshotted, every slot, and put back in the Report stage.
+// =================================================================================================
+
+namespace TraceOptionsRebindProof
+{
+	/** Complete down/up pairs one stage is allowed before it is declared dead. */
+	constexpr int32 MaxPairs = 5;
+
+	/** The row the proof drives. PARRY, because spec v28 §3d ships it with BOTH slots occupied, so
+	 *  the second chip is on screen and clickable without the harness having to arrange it first. */
+	constexpr ETraceInputAction TargetAction = ETraceInputAction::Parry;
+
+	/**
+	 * Keys with no default bind anywhere in the table, so a pass cannot be an accident.
+	 *
+	 * J and H rather than the obvious J and K: the owner's own TraceUserSettings.ini has EQUIP GUN
+	 * rebound to K, and a harness that stole a real player's real bind — even for four frames, even
+	 * with a restore afterwards — would be writing noise into the log it is asking somebody to read.
+	 */
+	FKey KeyForPass(int32 Pass) { return (Pass == 0) ? EKeys::J : EKeys::H; }
+
+	/**
+	 * *** THE GATE THIS HARNESS EXISTS TO GET ABOVE. ***
+	 *
+	 * FSceneViewport::OnMouseButtonDown does NOT forward every press to the game. Its own rule is
+	 *
+	 *     bTemporaryCapture    = captureMode == CaptureDuringMouseDown (or the RMB variant)
+	 *     bProcessInputPrimary = !IsCurrentlyGameViewport() || HasMouseCapture()
+	 *                            || captureMode == CapturePermanently_IncludingInitialMouseDown
+	 *     if (bTemporaryCapture || bProcessInputPrimary)  -> ViewportClient->InputKey(IE_Pressed)
+	 *
+	 * and the RELEASE is forwarded unconditionally. So under EMouseCaptureMode::NoCapture — which the
+	 * title screen sets on purpose (ATraceMenuPlayerController::BeginPlay, to stop the stray "initial
+	 * mouse down" replay) — a real mouse-down never reaches APlayerController at all until something
+	 * else has given the viewport Slate mouse capture.
+	 *
+	 * Reproduced here rather than called, because FSceneViewport does not expose it. Printing it beside
+	 * every click is the difference between "the click did nothing" and knowing WHY.
+	 */
+	bool WouldViewportForwardAPress(FString& OutWhy)
+	{
+		FViewport* Viewport = (GEngine != nullptr && GEngine->GameViewport != nullptr)
+			? GEngine->GameViewport->Viewport : nullptr;
+		if (GEngine == nullptr || GEngine->GameViewport == nullptr || Viewport == nullptr)
+		{
+			OutWhy = TEXT("no game viewport");
+			return false;
+		}
+
+		const EMouseCaptureMode Mode = GEngine->GameViewport->GetMouseCaptureMode();
+		const bool bTemporaryCapture = (Mode == EMouseCaptureMode::CaptureDuringMouseDown)
+			|| (Mode == EMouseCaptureMode::CaptureDuringRightMouseDown);
+		const bool bHasCapture = Viewport->HasMouseCapture();
+		const bool bInitialDown = (Mode == EMouseCaptureMode::CapturePermanently_IncludingInitialMouseDown);
+		const bool bWould = bTemporaryCapture || bHasCapture || bInitialDown;
+
+		OutWhy = FString::Printf(TEXT("captureMode=%d temporaryCapture=%d hasMouseCapture=%d initialDown=%d"),
+			static_cast<int32>(Mode), bTemporaryCapture ? 1 : 0, bHasCapture ? 1 : 0, bInitialDown ? 1 : 0);
+		return bWould;
+	}
+
+	/**
+	 * One key or mouse edge, injected at the TOP of the chain — FSlateApplication — so it travels the
+	 * whole route a physical device does, the viewport's own press gate included.
+	 *
+	 * The previous version of this went in at UGameViewportClient::InputKey, one level BELOW that gate,
+	 * and that is precisely the "harness that reports a deleted asset as working" mistake this project
+	 * has already paid for once: it measured the menu's logic on a build where the menu's logic was
+	 * never the problem, and it would have reported a green pass on a title screen no click can reach.
+	 */
+	void InjectKey(const FKey& Key, bool bPressed)
+	{
+		if (!FSlateApplication::IsInitialized() || GEngine == nullptr || GEngine->GameViewport == nullptr)
+		{
+			return;
+		}
+
+		FSlateApplication& Slate = FSlateApplication::Get();
+
+		// Slate refuses to route a key event to a widget with no focus, and an automated run very often
+		// has no OS window focus at all. Forcing focus is the difference between "input is broken" and
+		// "this process was in the background".
+		if (TSharedPtr<SViewport> ViewportWidget = GEngine->GameViewport->GetGameViewportWidget())
+		{
+			Slate.SetAllUserFocus(ViewportWidget, EFocusCause::SetDirectly);
+		}
+
+		const FInputDeviceId Device = FInputDeviceId::CreateFromInternalId(0);
+
+		if (Key.IsMouseButton())
+		{
+			const FVector2D Cursor = Slate.GetCursorPos();
+			TSet<FKey> PressedButtons;
+			if (bPressed)
+			{
+				PressedButtons.Add(Key);
+			}
+
+			const FPointerEvent MouseEvent(
+				Device, /*PointerIndex*/ 0, Cursor, Cursor,
+				PressedButtons, Key, /*WheelDelta*/ 0.f, FModifierKeysState());
+
+			if (bPressed)
+			{
+				Slate.ProcessMouseButtonDownEvent(nullptr, MouseEvent);
+			}
+			else
+			{
+				Slate.ProcessMouseButtonUpEvent(MouseEvent);
+			}
+			return;
+		}
+
+		const FKeyEvent KeyEvent(Key, FModifierKeysState(), Device,
+			/*bIsRepeat*/ false, /*CharacterCode*/ 0, /*KeyCode*/ 0);
+
+		if (bPressed)
+		{
+			Slate.ProcessKeyDownEvent(KeyEvent);
+		}
+		else
+		{
+			Slate.ProcessKeyUpEvent(KeyEvent);
+		}
+	}
+}
+
+void FTraceOptionsMenu::DebugBeginRebindProof()
+{
+	if (RebindProofStage != ERebindProofStage::Idle)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[RebindProof] Already running."));
+		return;
+	}
+
+	// Snapshot BEFORE the first injected edge: the very first pair already writes a binding.
+	UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	RebindProofBefore.Reset();
+	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+	{
+		for (int32 Slot = 0; Slot < UTraceUserSettings::MaxKeysPerAction; ++Slot)
+		{
+			RebindProofBefore.Add(Settings.GetKey(Info.Action, Slot));
+		}
+	}
+
+	RebindProofStage = ERebindProofStage::WaitForPage;
+	RebindProofWait = 0;
+	RebindProofSubStep = 0;
+	RebindProofClicks = 0;
+	RebindProofPresses = 0;
+	RebindProofClicksNeeded = 0;
+	RebindProofPressesNeeded = 0;
+	RebindProofAction = TraceOptionsRebindProof::TargetAction;
+	RebindProofSlot = 0;
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[RebindProof] ===== spec v28 s3a: counting the presses a rebind takes ====="));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[RebindProof] Target row '%s'. Pass 1 clicks CHIP 1 and binds '%s'; pass 2 clicks CHIP 2 ")
+		TEXT("and binds '%s'. One click and one press each is the requirement."),
+		TraceInputActions::Info(RebindProofAction).DisplayName,
+		*UTraceUserSettings::DescribeKey(TraceOptionsRebindProof::KeyForPass(0)),
+		*UTraceUserSettings::DescribeKey(TraceOptionsRebindProof::KeyForPass(1)));
+}
+
+void FTraceOptionsMenu::TickRebindProof(APlayerController* PC)
+{
+	// ---- `-TraceRebindProof=<drawn frames>` ------------------------------------------------------
+	//
+	// A LAUNCH FLAG AS WELL AS A CONSOLE COMMAND, and the reason is the in-match pause menu: it stops
+	// the world, so -TraceExec and Trace.V10.After — both scheduled on WORLD timers — can never fire
+	// once the overlay is up. Drawn frames are the only clock still running, which is the same
+	// discovery TickAutoActivate and ATraceHUD's auto-pause capture each had to make.
+	//
+	//     -TraceAutoPause=6 -TraceRebindProof=40
+	//
+	// arms the pause menu the normal way (gameplay input suppressed, world paused, cursor back) and
+	// then counts the presses a rebind takes ON THAT HOST — which is where a player actually rebinds
+	// mid-match, and is a different input regime from the title screen in every respect that matters.
+	{
+		static bool bParsed = false;
+		static int32 WantedDraws = -1;
+		if (!bParsed)
+		{
+			bParsed = true;
+			int32 Parsed = 0;
+			if (FParse::Value(FCommandLine::Get(), TEXT("TraceRebindProof="), Parsed))
+			{
+				WantedDraws = FMath::Max(1, Parsed);
+			}
+		}
+
+		if (WantedDraws > 0 && !bRebindProofArmedFromCommandLine && Page != EPage::Closed
+			&& DrawsSinceOpen >= WantedDraws)
+		{
+			bRebindProofArmedFromCommandLine = true;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RebindProof] -TraceRebindProof=%d: arming after %d drawn frames on the %s host."),
+				WantedDraws, DrawsSinceOpen,
+				(Page == EPage::Root) ? TEXT("in-match pause") : TEXT("settings"));
+			DebugBeginRebindProof();
+		}
+	}
+
+	if (RebindProofStage == ERebindProofStage::Idle)
+	{
+		return;
+	}
+
+	if (PC == nullptr)
+	{
+		return;
+	}
+
+	if (RebindProofWait > 0)
+	{
+		--RebindProofWait;
+		return;
+	}
+
+	// The row, found by the ACTION rather than by a label string, so a DisplayName edit cannot
+	// silently turn this harness into a no-op that reports nothing.
+	int32 RowIndex = INDEX_NONE;
+	for (int32 Index = 0; Index < Rows.Num(); ++Index)
+	{
+		if (Rows[Index].Kind == ERowKind::Binding && Rows[Index].Binding == RebindProofAction)
+		{
+			RowIndex = Index;
+			break;
+		}
+	}
+
+	switch (RebindProofStage)
+	{
+	case ERebindProofStage::WaitForPage:
+	{
+		if (Page != EPage::Settings)
+		{
+			OpenSettings();
+			RebindProofWait = 3;
+			return;
+		}
+
+		// A rect is only written by DrawRow, so an un-drawn page would have the harness clicking at
+		// (0,0) and reporting a failure that is its own.
+		if (RowIndex == INDEX_NONE || !Rows[RowIndex].KeyChip[RebindProofSlot].bIsValid)
+		{
+			RebindProofWait = 1;
+			return;
+		}
+
+		const FVector2D Point = Rows[RowIndex].KeyChip[RebindProofSlot].GetCenter();
+		PC->SetMouseLocation(FMath::RoundToInt(Point.X), FMath::RoundToInt(Point.Y));
+
+		float ReadX = 0.f;
+		float ReadY = 0.f;
+		const bool bReadBack = PC->GetMousePosition(ReadX, ReadY);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[RebindProof] pass %d: cursor -> chip %d at (%.0f, %.0f); the menu reads it back as (%.0f, %.0f) valid=%d."),
+			RebindProofSlot + 1, RebindProofSlot + 1, Point.X, Point.Y, ReadX, ReadY, bReadBack ? 1 : 0);
+
+		if (!bReadBack)
+		{
+			// The one failure that would make every number below a lie. Say it; do not measure it.
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RebindProof] The viewport will not report a cursor position in this run, so no click ")
+				TEXT("can be aimed. This is a HARNESS failure, not a menu failure."));
+			RebindProofStage = ERebindProofStage::Report;
+			return;
+		}
+
+		RebindProofStage = ERebindProofStage::ClickRow;
+		RebindProofSubStep = 0;
+		RebindProofWait = 1;   // a frame with the cursor parked before anything is pressed
+		return;
+	}
+
+	case ERebindProofStage::ClickRow:
+	{
+		if (RebindProofSubStep == 0)
+		{
+			++RebindProofClicks;
+
+			FString Why;
+			const bool bWouldForward = TraceOptionsRebindProof::WouldViewportForwardAPress(Why);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RebindProof] pass %d, click %d: LMB down (capturing=%d). The viewport %s forward this ")
+				TEXT("PRESS to the game: %s."),
+				RebindProofSlot + 1, RebindProofClicks, bCapturingKey ? 1 : 0,
+				bWouldForward ? TEXT("WILL") : TEXT("will NOT"), *Why);
+			TraceOptionsRebindProof::InjectKey(EKeys::LeftMouseButton, /*bPressed=*/true);
+			RebindProofSubStep = 1;
+			RebindProofWait = 1;
+			return;
+		}
+
+		if (RebindProofSubStep == 1)
+		{
+			TraceOptionsRebindProof::InjectKey(EKeys::LeftMouseButton, /*bPressed=*/false);
+			RebindProofSubStep = 2;
+			RebindProofWait = 1;   // JUDGE a whole frame after the release. See the block comment.
+			return;
+		}
+
+		// Judge.
+		if (bCapturingKey && CapturingAction == RebindProofAction && CapturingSlot == RebindProofSlot)
+		{
+			RebindProofClicksNeeded = RebindProofClicks;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RebindProof] pass %d: the capture OPENED on chip %d after %d click(s)."),
+				RebindProofSlot + 1, CapturingSlot + 1, RebindProofClicks);
+			RebindProofStage = ERebindProofStage::PressKey;
+			RebindProofSubStep = 0;
+			RebindProofWait = 1;
+			return;
+		}
+
+		if (RebindProofClicks >= TraceOptionsRebindProof::MaxPairs)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RebindProof] pass %d: %d complete clicks on chip %d and the capture never opened ")
+				TEXT("(capturing=%d, capturedSlot=%d)."),
+				RebindProofSlot + 1, RebindProofClicks, RebindProofSlot + 1,
+				bCapturingKey ? 1 : 0, CapturingSlot);
+			RebindProofClicksNeeded = 0;
+			RebindProofStage = ERebindProofStage::Report;
+			return;
+		}
+
+		// Same chip, same cursor, another complete click. Back to the press and NOT to the cursor
+		// move: re-parking every attempt would hide a bug that only bites the first click.
+		RebindProofSubStep = 0;
+		return;
+	}
+
+	case ERebindProofStage::PressKey:
+	{
+		const FKey Wanted = TraceOptionsRebindProof::KeyForPass(RebindProofSlot);
+
+		if (RebindProofSubStep == 0)
+		{
+			++RebindProofPresses;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RebindProof] pass %d, key press %d: '%s' down (capturing=%d, frame=%llu, ignoreBefore=%llu)."),
+				RebindProofSlot + 1, RebindProofPresses, *Wanted.GetFName().ToString(),
+				bCapturingKey ? 1 : 0, static_cast<uint64>(GFrameCounter), IgnoreInputBeforeFrame);
+			TraceOptionsRebindProof::InjectKey(Wanted, /*bPressed=*/true);
+			RebindProofSubStep = 1;
+			RebindProofWait = 1;
+			return;
+		}
+
+		if (RebindProofSubStep == 1)
+		{
+			TraceOptionsRebindProof::InjectKey(Wanted, /*bPressed=*/false);
+			RebindProofSubStep = 2;
+			RebindProofWait = 1;
+			return;
+		}
+
+		if (UTraceUserSettings::Get().GetKey(RebindProofAction, RebindProofSlot) == Wanted)
+		{
+			RebindProofPressesNeeded = RebindProofPresses;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RebindProof] pass %d: '%s' LANDED on %s slot %d after %d press(es). The action now holds %s."),
+				RebindProofSlot + 1, *Wanted.GetFName().ToString(),
+				TraceInputActions::Info(RebindProofAction).DisplayName, RebindProofSlot + 1,
+				RebindProofPresses, *UTraceUserSettings::Get().DescribeBinding(RebindProofAction));
+
+			// Pass 1 proves §3a on the primary chip; pass 2 proves §3c — that the SECOND chip is
+			// editable by the same one click and one press.
+			if (RebindProofSlot + 1 < UTraceUserSettings::MaxKeysPerAction)
+			{
+				RebindProofSlot = 1;
+				RebindProofClicks = 0;
+				RebindProofPresses = 0;
+				RebindProofStage = ERebindProofStage::WaitForPage;
+				RebindProofSubStep = 0;
+				RebindProofWait = 2;
+				return;
+			}
+
+			RebindProofStage = ERebindProofStage::Report;
+			return;
+		}
+
+		if (RebindProofPresses >= TraceOptionsRebindProof::MaxPairs)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RebindProof] pass %d: %d complete presses of '%s' and %s slot %d is still '%s'."),
+				RebindProofSlot + 1, RebindProofPresses, *Wanted.GetFName().ToString(),
+				TraceInputActions::Info(RebindProofAction).DisplayName, RebindProofSlot + 1,
+				*UTraceUserSettings::DescribeKey(UTraceUserSettings::Get().GetKey(RebindProofAction, RebindProofSlot)));
+			RebindProofPressesNeeded = 0;
+			RebindProofStage = ERebindProofStage::Report;
+			return;
+		}
+
+		RebindProofSubStep = 0;
+		return;
+	}
+
+	case ERebindProofStage::Report:
+	default:
+		break;
+	}
+
+	// ---- Report, restore, stop --------------------------------------------------------------
+	RebindProofStage = ERebindProofStage::Idle;
+
+	const bool bPass = (RebindProofClicksNeeded == 1) && (RebindProofPressesNeeded == 1);
+
+	// Two calls rather than a ternary verbosity: UE_LOG's verbosity is a token the macro pastes into
+	// a compile-time category check, not a value, so it cannot be an expression.
+#define TRACE_REBINDPROOF_ARGS \
+	bPass ? TEXT("ONE CLICK ARMS IT AND ONE PRESS BINDS IT") : TEXT("A REBIND STILL NEEDS MORE THAN ONE PRESS"), \
+	RebindProofClicksNeeded, RebindProofPressesNeeded
+
+#define TRACE_REBINDPROOF_TEXT \
+	TEXT("[RebindProof] VERDICT: %s. Clicks to open the capture=%d, presses to land the key=%d ") \
+	TEXT("(1 and 1 is the requirement; 0 means that stage never completed at all). Counts are from ") \
+	TEXT("the LAST pass; every pass logged its own line above.")
+
+	if (bPass)
+	{
+		UE_LOG(LogTraceGame, Display, TRACE_REBINDPROOF_TEXT, TRACE_REBINDPROOF_ARGS);
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Error, TRACE_REBINDPROOF_TEXT, TRACE_REBINDPROOF_ARGS);
+	}
+
+#undef TRACE_REBINDPROOF_ARGS
+#undef TRACE_REBINDPROOF_TEXT
+
+	// Strictly AFTER the verdict — restoring first would erase the state the run exists to report.
+	// Every action, every slot, cleared before written: see the same argument in
+	// TraceUserSettingsVerify::Restore.
+	{
+		UTraceUserSettings& Settings = UTraceUserSettings::Get();
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			Settings.ClearKey(Info.Action);
+		}
+
+		int32 Flat = 0;
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			for (int32 Slot = 0; Slot < UTraceUserSettings::MaxKeysPerAction; ++Slot, ++Flat)
+			{
+				if (RebindProofBefore.IsValidIndex(Flat) && RebindProofBefore[Flat].IsValid())
+				{
+					Settings.SetKey(Info.Action, Slot, RebindProofBefore[Flat]);
+				}
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[RebindProof] RESTORED. %s is %s again — the run left no trace in the player's config."),
+			TraceInputActions::Info(RebindProofAction).DisplayName,
+			*Settings.DescribeBinding(RebindProofAction));
+	}
+}
+
 bool FTraceOptionsMenu::DebugGetRowRect(const TCHAR* Label, FBox2D& OutRect) const
 {
 	for (const FRow& Row : Rows)
@@ -843,6 +1369,80 @@ bool FTraceOptionsMenu::DebugGetRowRect(const TCHAR* Label, FBox2D& OutRect) con
 // Lifecycle
 // =================================================================================================
 
+/**
+ * SPEC v28 §3a — the A/B arm for the swallowed-press fix.
+ *
+ * 0 restores the behaviour exactly as it shipped before v28: the overlay leaves the viewport's
+ * capture mode alone, so on the title screen (EMouseCaptureMode::NoCapture) FSceneViewport drops the
+ * mouse PRESS and forwards only the release — which is the reported "rebinding needs the button
+ * pressed twice". That is the RED arm, and it exists because this project's standing rule is that a
+ * harness which cannot go red is not evidence. Trace.Keys.RebindProof prints the viewport's verdict
+ * beside every click, so the two arms are distinguishable in one line of log.
+ *
+ * Not ECVF_Cheat: it changes no gameplay rule, only whether a menu click is delivered.
+ */
+static int32 GTraceMenuPressDelivery = 1;
+static FAutoConsoleVariableRef CVarTraceMenuPressDelivery(
+	TEXT("Trace.Menu.PressDelivery"),
+	GTraceMenuPressDelivery,
+	TEXT("Spec v28 sec 3a. 1 (default): while the settings/pause overlay is open the game viewport is "
+	     "put in CaptureDuringMouseDown so a mouse PRESS reaches the game, and the previous mode is "
+	     "restored on close. 0 is the RED arm - the pre-v28 behaviour, where the title screen's "
+	     "NoCapture mode swallows the first press of every click."),
+	ECVF_Default);
+
+void FTraceOptionsMenu::SetPressDeliveryOverride(bool bEnable)
+{
+	if (GEngine == nullptr || GEngine->GameViewport == nullptr)
+	{
+		return;
+	}
+
+	UGameViewportClient& Viewport = *GEngine->GameViewport;
+
+	if (!bEnable)
+	{
+		// Only ever undo what this class did. A host that was already forwarding presses never had
+		// its mode touched, and one that changed the mode underneath us (a travel, another overlay)
+		// gets to keep its own answer rather than ours.
+		if (bMouseCaptureModeOverridden)
+		{
+			bMouseCaptureModeOverridden = false;
+			Viewport.SetMouseCaptureMode(static_cast<EMouseCaptureMode>(PreviousMouseCaptureMode));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Options] Mouse capture mode put back to %d on close."), PreviousMouseCaptureMode);
+		}
+		return;
+	}
+
+	if (GTraceMenuPressDelivery == 0 || bMouseCaptureModeOverridden)
+	{
+		return;
+	}
+
+	const EMouseCaptureMode Current = Viewport.GetMouseCaptureMode();
+
+	// The three modes FSceneViewport::OnMouseButtonDown already forwards a press under. Touching the
+	// mode there would be picking a fight with FInputModeGameAndUI for no gain — and the in-match
+	// pause menu, which is one of those, is measured at one click already.
+	if (Current == EMouseCaptureMode::CaptureDuringMouseDown
+		|| Current == EMouseCaptureMode::CaptureDuringRightMouseDown
+		|| Current == EMouseCaptureMode::CapturePermanently_IncludingInitialMouseDown)
+	{
+		return;
+	}
+
+	bMouseCaptureModeOverridden = true;
+	PreviousMouseCaptureMode = static_cast<uint8>(Current);
+	Viewport.SetMouseCaptureMode(EMouseCaptureMode::CaptureDuringMouseDown);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Options] Mouse capture mode was %d, which makes FSceneViewport SWALLOW the press half of "
+		     "every click (spec v28 s3a). Raised to CaptureDuringMouseDown for as long as this overlay is "
+		     "open; it goes back on close."),
+		static_cast<int32>(Current));
+}
+
 void FTraceOptionsMenu::OpenRoot()
 {
 	Page = EPage::Root;
@@ -858,6 +1458,9 @@ void FTraceOptionsMenu::OpenRoot()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
+	SetPressDeliveryOverride(true);
+
 	RebuildRows();
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Pause menu opened."));
 }
@@ -874,6 +1477,9 @@ void FTraceOptionsMenu::OpenSettings()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
+	SetPressDeliveryOverride(true);
+
 	RebuildRows();
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Settings opened."));
 }
@@ -893,6 +1499,9 @@ void FTraceOptionsMenu::OpenVideo()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
+	SetPressDeliveryOverride(true);
+
 	RebuildRows();
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Video settings opened."));
 }
@@ -915,11 +1524,19 @@ void FTraceOptionsMenu::Close()
 	Page = EPage::Closed;
 	bCapturingKey = false;
 	CapturingAction = ETraceInputAction::Count;
+	// SPEC v28 §3c — the chip column is part of "where the player was", so it resets with everything
+	// else. Re-opening the page on the second chip of a row nobody is looking at would be a surprise.
+	CapturingSlot = 0;
+	SelectedBindingSlot = 0;
 	PressedRow = INDEX_NONE;
 	bDraggingSlider = false;
 	bAutoDetectPending = false;
 	LastAdjustDir = 0;
 	LastNavDir = 0;
+
+	// SPEC v28 §3a — the viewport goes back exactly as it was, BEFORE OnClosed fires. The host's own
+	// callback can put a whole new input mode on (ATraceHUD's does), and it must be the one that wins.
+	SetPressDeliveryOverride(false);
 
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Closed."));
 
@@ -932,6 +1549,39 @@ void FTraceOptionsMenu::Close()
 // =================================================================================================
 // Rows
 // =================================================================================================
+
+namespace
+{
+	/**
+	 * *** THE TWO WEAPON ROWS ARE LABELLED FROM THE LIVE SWITCH, NOT FROM THE TABLE. ***
+	 *
+	 * Spec v28 §10 remaps the 1 and 2 keys (TraceMelee::RequestEquipIfDifferent — "the only place it
+	 * happens"): with dual wield ON they select the PISTOL and the SMG, with it OFF they are v27's
+	 * knife and gun. The ConfigIds "EquipKnife"/"EquipGun" are frozen — renaming either costs every
+	 * returning player that bind — and FTraceInputActionInfo::DisplayName is a static string in a
+	 * table that cannot see a runtime cvar. So the SLICE THAT DRAWS THE LABEL asks the switch, which
+	 * is also the only place the answer is needed: everything else that prints DisplayName is a log
+	 * line for a developer, and those correctly name the action rather than the weapon.
+	 *
+	 * This is the last thing spec v28 §10's "revertible in one prompt" was missing. Flip
+	 * bDualWieldKnife (or Trace.Knife.DualWield, or -TraceLegacyKnife) and the keybind page renames
+	 * these two rows with the behaviour, in the same frame, with no rebuild and no ini edit.
+	 */
+	const TCHAR* TraceOptionsBindingRowLabel(const FTraceInputActionInfo& Info)
+	{
+		const bool bDualWield = TraceMelee::IsDualWieldEnabled();
+
+		if (Info.Action == ETraceInputAction::EquipKnife)
+		{
+			return bDualWield ? TEXT("WEAPON 1 (PISTOL)") : TEXT("EQUIP KNIFE");
+		}
+		if (Info.Action == ETraceInputAction::EquipGun)
+		{
+			return bDualWield ? TEXT("WEAPON 2 (SMG)") : TEXT("EQUIP GUN");
+		}
+		return Info.DisplayName;
+	}
+}
 
 void FTraceOptionsMenu::RebuildRows()
 {
@@ -1076,7 +1726,7 @@ void FTraceOptionsMenu::RebuildRows()
 		{
 			FRow Row;
 			Row.Kind = ERowKind::Binding;
-			Row.Label = Info.DisplayName;
+			Row.Label = TraceOptionsBindingRowLabel(Info);
 			Row.Binding = Info.Action;
 			Rows.Add(MoveTemp(Row));
 		}
@@ -1094,6 +1744,7 @@ void FTraceOptionsMenu::RebuildRows()
 	// Land on the first thing that can actually be selected, so a page never opens with the
 	// highlight sitting on a caption.
 	Selected = 0;
+	SelectedBindingSlot = 0;   // spec v28 §3c — and on its first chip
 	for (int32 Index = 0; Index < Rows.Num(); ++Index)
 	{
 		if (Rows[Index].IsSelectable())
@@ -1158,6 +1809,13 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	// float compare per frame, and it is the difference between the row persisting and the row
 	// appearing to persist until the player next dies.
 	MaintainFieldOfView(PC);
+
+#if !UE_BUILD_SHIPPING
+	// SPEC v28 §3a. BEFORE the closed-page early-out, because its first job is to OPEN the settings
+	// page, and before PollInput below, because an edge it injects must not be read by the same frame
+	// that queued it — see the block comment on TickRebindProof. Inert until armed.
+	TickRebindProof(PC);
+#endif
 
 	if (Page == EPage::Closed || HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
 	{
@@ -1340,6 +1998,11 @@ void FTraceOptionsMenu::PollInput(APlayerController* PC)
 	PollMouse(PC);
 }
 
+int32 FTraceOptionsMenu::ActiveBindingSlot() const
+{
+	return FMath::Clamp(SelectedBindingSlot, 0, UTraceUserSettings::MaxKeysPerAction - 1);
+}
+
 void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 {
 	// Escape is filtered out of BindableKeys precisely so it can mean "cancel" here and nothing else.
@@ -1351,6 +2014,30 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 		return;
 	}
 
+	// First poll of a fresh capture: record what was already down. A key that was held before the
+	// capture existed was never a choice made inside it.
+	if (bCaptureNeedsHeldSnapshot)
+	{
+		bCaptureNeedsHeldSnapshot = false;
+		KeysHeldWhenCaptureOpened.Reset();
+		for (const FKey& Held : BindableKeys())
+		{
+			if (PC->IsInputKeyDown(Held))
+			{
+				KeysHeldWhenCaptureOpened.Add(Held);
+			}
+		}
+	}
+
+	// Retire held-at-open keys as they come up, so the player's NEXT real press counts.
+	for (int32 Index = KeysHeldWhenCaptureOpened.Num() - 1; Index >= 0; --Index)
+	{
+		if (!PC->IsInputKeyDown(KeysHeldWhenCaptureOpened[Index]))
+		{
+			KeysHeldWhenCaptureOpened.RemoveAtSwap(Index);
+		}
+	}
+
 	for (const FKey& Key : BindableKeys())
 	{
 		if (!PC->WasInputKeyJustPressed(Key))
@@ -1358,12 +2045,33 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 			continue;
 		}
 
-		UTraceUserSettings::Get().SetKey(CapturingAction, Key);
-		UE_LOG(LogTraceGame, Display, TEXT("[Options] Bound %s to '%s'."),
-			TraceInputActions::Info(CapturingAction).DisplayName, *UTraceUserSettings::DescribeKey(Key));
+		// Was down before this capture existed, and has not been released since. Not a choice.
+		if (KeysHeldWhenCaptureOpened.Contains(Key))
+		{
+			continue;
+		}
 
+		// SPEC v28 §3c — into the SLOT the player was pointing at, not always the first one.
+		const ETraceInputAction Action = CapturingAction;
+		const int32 Slot = FMath::Clamp(CapturingSlot, 0, UTraceUserSettings::MaxKeysPerAction - 1);
+
+		// *** SPEC v28 §3a — CLOSE THE CAPTURE BEFORE THE WRITE, NOT AFTER IT. ***
+		//
+		// SetKey below calls Save(), Save() broadcasts UTraceUserSettings::OnChanged, and
+		// ATracePlayerController::ApplyControlSettings runs on that broadcast — SYNCHRONOUSLY, inside
+		// this call. That is a lot of code to run while this object still says "I am waiting for a key",
+		// and every line of it is a line that could re-enter the menu. Clearing the flags first makes
+		// the capture over at the moment the key is decided, which is also what the player is told by
+		// the row: the chip stops flashing PRESS A KEY on the same frame their key lands in it.
 		bCapturingKey = false;
 		CapturingAction = ETraceInputAction::Count;
+		KeysHeldWhenCaptureOpened.Reset();
+		bCaptureNeedsHeldSnapshot = false;
+
+		UTraceUserSettings::Get().SetKey(Action, Slot, Key);
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Bound %s slot %d to '%s'. The action now holds %s."),
+			TraceInputActions::Info(Action).DisplayName, Slot + 1, *UTraceUserSettings::DescribeKey(Key),
+			*UTraceUserSettings::Get().DescribeBinding(Action));
 
 		// One more frame of quiet: the key that was just bound is still down, and if it happens to be
 		// Enter or a mouse button the very next poll would read it as "activate this row again".
@@ -1437,7 +2145,11 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 			// ClearKey, not SetKey: SetKey refuses an invalid key on purpose, because "invalid" is
 			// what an unparseable .ini entry looks like and it must never be able to wipe a binding.
 			// Unbinding is a separate, explicit intent.
-			UTraceUserSettings::Get().ClearKey(Rows[Selected].Binding);
+			//
+			// SPEC v28 §3c — ONE SLOT, the one the highlight is on. Clearing both from a single
+			// Backspace would make the second bind impossible to remove on its own, and would delete a
+			// key the player could not see themselves selecting.
+			UTraceUserSettings::Get().ClearKey(Rows[Selected].Binding, ActiveBindingSlot());
 		}
 	}
 }
@@ -1497,6 +2209,26 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 	{
 		PressedRow = HoverRow;
 		bDraggingSlider = false;
+
+		// SPEC v28 §3c — WHICH CHIP DID THE PLAYER CLICK? "Both editable in the settings page" is a
+		// hit test as much as a data model. The rects come from the last DrawRow, which is the right
+		// frame to use: they are where the chips were when the player aimed at them.
+		//
+		// A click anywhere else on the row (the label, the gap) leaves the column alone rather than
+		// resetting it to 0. Clicking the row you are already editing must not silently move you back
+		// to its first bind — that would be a click that changed something invisible.
+		if (HoverRow != INDEX_NONE && Rows[HoverRow].Kind == ERowKind::Binding)
+		{
+			for (int32 Slot = 0; Slot < UTraceUserSettings::MaxKeysPerAction; ++Slot)
+			{
+				const FBox2D& Chip = Rows[HoverRow].KeyChip[Slot];
+				if (Chip.bIsValid && Chip.IsInside(CursorPos))
+				{
+					SelectedBindingSlot = Slot;
+					break;
+				}
+			}
+		}
 
 		// Grabbing the track is a drag, not a click: the value follows the pointer from this frame on
 		// and no activation happens on release. This is the single most useful interaction on the
@@ -1572,6 +2304,9 @@ void FTraceOptionsMenu::MoveSelection(int32 Delta)
 		if (Rows[Index].IsSelectable())
 		{
 			Selected = Index;
+			// SPEC v28 §3c — the chip column is the CURSOR's, not the row's. Landing on a keybind row
+			// always starts on its first chip, so "down, enter" means the same thing on every row.
+			SelectedBindingSlot = 0;
 			return;
 		}
 	}
@@ -1939,6 +2674,20 @@ void FTraceOptionsMenu::AdjustSelected(int32 Delta)
 	}
 
 	FRow& Row = Rows[Selected];
+
+	// SPEC v28 §3c — ON A BINDING ROW, LEFT AND RIGHT PICK THE CHIP.
+	//
+	// The horizontal axis had no meaning at all on these rows before (this function returned), so the
+	// second bind costs the page no control it was already using and needs no new key to learn. The
+	// move CLAMPS rather than wraps, like every other list on this page: holding right must arrive
+	// somewhere and stay there.
+	if (Row.Kind == ERowKind::Binding)
+	{
+		SelectedBindingSlot = FMath::Clamp(ActiveBindingSlot() + FMath::Clamp(Delta, -1, 1),
+			0, UTraceUserSettings::MaxKeysPerAction - 1);
+		return;
+	}
+
 	if (Row.Kind != ERowKind::Slider && Row.Kind != ERowKind::Toggle && Row.Kind != ERowKind::Choice)
 	{
 		return;
@@ -2048,11 +2797,22 @@ void FTraceOptionsMenu::ActivateSelected()
 	case ERowKind::Binding:
 		bCapturingKey = true;
 		CapturingAction = Row.Binding;
+		// SPEC v28 §3c — the chip the player is pointing at. LEFT/RIGHT moved it, or the click that
+		// got here set it from the chip it actually landed on (see PollMouse).
+		CapturingSlot = ActiveBindingSlot();
 		// The Enter (or click) that started the capture is still live this frame; without this it
 		// would immediately become the new binding.
 		IgnoreInputBeforeFrame = GFrameCounter + 1;
-		UE_LOG(LogTraceGame, Display, TEXT("[Options] Waiting for a key to bind to %s."),
-			TraceInputActions::Info(Row.Binding).DisplayName);
+
+		// AND one frame is not enough on its own — see KeysHeldWhenCaptureOpened in the header.
+		// The snapshot is taken by the first poll that HAS a PlayerController: this function is
+		// reached from both Enter and the mouse and has none, and inventing one here would be a
+		// second way to find the local player that could disagree with the one the polls use.
+		KeysHeldWhenCaptureOpened.Reset();
+		bCaptureNeedsHeldSnapshot = true;
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Waiting for a key to bind to %s (slot %d of %d)."),
+			TraceInputActions::Info(Row.Binding).DisplayName, CapturingSlot + 1,
+			UTraceUserSettings::MaxKeysPerAction);
 		return;
 
 	default:
@@ -2735,47 +3495,103 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 	if (Row.Kind == ERowKind::Binding)
 	{
-		const bool bWaiting = bCapturingKey && CapturingAction == Row.Binding;
-		const FKey Key = UTraceUserSettings::Get().GetKey(Row.Binding);
-
-		FString ValueText;
-		FLinearColor ValueColor;
-		if (bWaiting)
-		{
-			ValueText = TEXT("PRESS A KEY");
-			ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.6f + 0.4f * FMath::Sin(Now * 9.f));
-		}
-		else
-		{
-			ValueText = UTraceUserSettings::DescribeKey(Key);
-			// Amber for UNBOUND: it is not an error, but the player should not be able to miss it.
-			ValueColor = Key.IsValid() ? TraceOptionsStyle::Ink : TraceOptionsStyle::Amber;
-		}
-
-		// UNCHANGED ARITHMETIC. The chip rect this screen has always drawn is exactly the shape of
-		// T_MenuValueBox, so the sprite is a one-for-one swap onto a rectangle that already existed.
+		// ---- SPEC v28 §3c — TWO CHIPS, LAID OUT RIGHT TO LEFT ------------------------------------
 		//
-		// MEASURED IN THE FACE IT IS DRAWN IN (spec v26 §2): the chip is sized to its key name, so
-		// measuring "LEFT SHIFT" in Sofachrome and setting it in Erbaum would leave a chip a third
-		// wider than the word inside it on every keybind row on the page.
-		const float PlateW = FMath::Max(MeasureWidth(HUD, ValueText, FontMedium, LabelScale,
-			TraceOptionsMenuType::BodyFace) + (16.f * UIScale), 120.f * UIScale);
-		const float ChipX = ValueRight - PlateW;
+		// "Up to TWO keybinds per action, both editable in the settings page." Two chips is what makes
+		// the second bind a thing the player can SEE; without it a slot they cannot point at is a slot
+		// that does not exist as far as the page is concerned.
+		//
+		// SLOT 1 IS DRAWN ONLY WHEN IT HAS SOMETHING TO SAY: it holds a key, or the row is selected (so
+		// the player can see where a second bind would go and aim at it), or it is the slot being
+		// captured right now. Seventeen rows each carrying a permanent empty box would make the page read
+		// as half-broken, and sixteen of the seventeen ship with one key.
+		const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+		const int32 ActiveSlot = bSelected ? ActiveBindingSlot() : 0;
+
+		const float ChipGap = 6.f * UIScale;
 		const float ChipY = Y + H * 0.14f;
 		const float ChipH = H * 0.72f;
 
-		const bool bChipDrawn = DrawValueChip(HUD, ChipX, ChipY, PlateW, ChipH);
+		// Right to left, so slot 1 keeps the position the single chip has always had when there is no
+		// second bind — nothing on this page moves for a player who never uses the feature.
+		float NextRight = ValueRight;
 
-		// The cyan wash the chip used to BE, kept on top of the sprite at a whisper. The artist's chip
-		// is the same navy as the plate it sits on — its amber ring is what separates them, and a
-		// little light inside it is what stops the key name reading as a hole in the row.
-		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan,
-			bWaiting ? 0.22f : (bChipDrawn ? 0.05f : 0.10f)), ChipX, ChipY, PlateW, ChipH);
+		for (int32 Slot = UTraceUserSettings::MaxKeysPerAction - 1; Slot >= 0; --Slot)
+		{
+			Row.KeyChip[Slot] = FBox2D(ForceInit);
 
-		// THE KEYBIND ROW'S KEY NAME. Erbaum Bold — "keybind rows" is one of the three surfaces §2
-		// names, and this is the string on them a player actually reads.
-		DrawTextCentered(HUD, ValueText, ValueColor, ValueRight - PlateW * 0.5f, TextY, FontMedium, LabelScale,
-			TraceOptionsMenuType::BodyFace);
+			const bool bWaiting = bCapturingKey && CapturingAction == Row.Binding && CapturingSlot == Slot;
+			const FKey Key = UserSettings.GetKey(Row.Binding, Slot);
+
+			const bool bShow = (Slot == 0) || bWaiting || Key.IsValid() || bSelected;
+			if (!bShow)
+			{
+				continue;
+			}
+
+			FString ValueText;
+			FLinearColor ValueColor;
+			if (bWaiting)
+			{
+				ValueText = TEXT("PRESS A KEY");
+				ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.6f + 0.4f * FMath::Sin(Now * 9.f));
+			}
+			else if (Key.IsValid())
+			{
+				ValueText = UTraceUserSettings::DescribeKey(Key);
+				ValueColor = TraceOptionsStyle::Ink;
+			}
+			else if (Slot == 0)
+			{
+				// Amber for UNBOUND: it is not an error, but the player should not be able to miss it.
+				ValueText = UTraceUserSettings::DescribeKey(Key);
+				ValueColor = TraceOptionsStyle::Amber;
+			}
+			else
+			{
+				// An empty SECOND slot on the selected row. "+" and not "UNBOUND": the first chip already
+				// says whether the action works at all, and this one is an invitation rather than a state.
+				ValueText = TEXT("+");
+				ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.55f);
+			}
+
+			// UNCHANGED ARITHMETIC for the primary chip when it is alone. The chip rect this screen has
+			// always drawn is exactly the shape of T_MenuValueBox, so the sprite is a one-for-one swap onto
+			// a rectangle that already existed. The minimum width is the only number that moved: 120px was
+			// chosen for one chip in the column, and two of those would not fit the column at 720p, so the
+			// FLOOR drops to 84 and the text still sizes the box whenever it needs more.
+			//
+			// MEASURED IN THE FACE IT IS DRAWN IN (spec v26 §2): the chip is sized to its key name, so
+			// measuring "LEFT SHIFT" in Sofachrome and setting it in Erbaum would leave a chip a third
+			// wider than the word inside it on every keybind row on the page.
+			const float MinChipW = (Slot == 0 && !Row.KeyChip[1].bIsValid) ? (120.f * UIScale) : (84.f * UIScale);
+			const float PlateW = FMath::Max(MeasureWidth(HUD, ValueText, FontMedium, LabelScale,
+				TraceOptionsMenuType::BodyFace) + (16.f * UIScale), MinChipW);
+			const float ChipX = NextRight - PlateW;
+
+			const bool bChipDrawn = DrawValueChip(HUD, ChipX, ChipY, PlateW, ChipH);
+
+			// The cyan wash the chip used to BE, kept on top of the sprite at a whisper. The artist's chip
+			// is the same navy as the plate it sits on — its amber ring is what separates them, and a
+			// little light inside it is what stops the key name reading as a hole in the row.
+			//
+			// SPEC v28 §3c: the ACTIVE chip on a selected row is washed harder than its neighbour. That
+			// difference is the only thing telling the player which of the two Enter and Backspace are
+			// about, so it is not decoration.
+			const bool bActiveChip = bSelected && (Slot == ActiveSlot);
+			const float Wash = bWaiting ? 0.22f : (bActiveChip ? 0.16f : (bChipDrawn ? 0.05f : 0.10f));
+			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Wash), ChipX, ChipY, PlateW, ChipH);
+
+			// THE KEYBIND ROW'S KEY NAME. Erbaum Bold — "keybind rows" is one of the three surfaces §2
+			// names, and this is the string on them a player actually reads.
+			DrawTextCentered(HUD, ValueText, ValueColor, ChipX + PlateW * 0.5f, TextY, FontMedium, LabelScale,
+				TraceOptionsMenuType::BodyFace);
+
+			// The rect PollMouse hit-tests against. Written after the draw so it is exactly what was drawn.
+			Row.KeyChip[Slot] = FBox2D(FVector2D(ChipX, ChipY), FVector2D(ChipX + PlateW, ChipY + ChipH));
+
+			NextRight = ChipX - ChipGap;
+		}
 		return;
 	}
 

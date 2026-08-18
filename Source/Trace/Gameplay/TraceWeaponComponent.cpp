@@ -198,6 +198,71 @@ namespace TraceAmmo
 		return FMath::Clamp(UTraceSettings::Get().ReloadSeconds, 0.05f, 10.f);
 	}
 
+	// =============================================================================================
+	// SPEC v28 §9 — THE SAME KNOBS, PER WEAPON.
+	//
+	// Four one-line switches rather than four copies of the arithmetic, and they all clamp with the
+	// SAME limits the pistol's forms use, so the SMG cannot be configured into a state the pistol
+	// could not reach.
+	//
+	// THE KNIFE FALLS THROUGH TO THE PISTOL'S NUMBERS deliberately. It has no clip and no reload, so
+	// there is no correct answer; returning zero would make a HUD denominator zero and a reload
+	// deadline instantaneous, both of which are worse failures than an unused number being 30.
+	// Nothing gates on it: ShouldShowAmmo() is already false with a knife out, and the automatic
+	// reload in TickReload skips a knife-holding pawn outright.
+	// =============================================================================================
+
+	int32 GetClipSize(ETraceEquippedWeapon Weapon)
+	{
+		if (Weapon == ETraceEquippedWeapon::Smg)
+		{
+			return FMath::Clamp(UTraceSettings::Get().SmgClipSize, 1, 999);
+		}
+		return GetClipSize();
+	}
+
+	float GetReloadSeconds(ETraceEquippedWeapon Weapon)
+	{
+		if (Weapon == ETraceEquippedWeapon::Smg)
+		{
+			return FMath::Clamp(UTraceSettings::Get().SmgReloadSeconds, 0.05f, 10.f);
+		}
+		return GetReloadSeconds();
+	}
+
+	float GetBaseFireInterval(ETraceEquippedWeapon Weapon)
+	{
+		// The 0.01 floor is the pistol's, unchanged: it is what stops a mistyped ini from producing a
+		// divide-by-nothing gun. 600 RPM is 0.1, a full order of magnitude above it.
+		if (Weapon == ETraceEquippedWeapon::Smg)
+		{
+			return FMath::Max(0.01f, UTraceSettings::Get().SmgFireInterval);
+		}
+		return FMath::Max(0.01f, UTraceSettings::Get().FireInterval);
+	}
+
+	float GetZoneDamage(ETraceEquippedWeapon Weapon, ETraceHitZone Zone)
+	{
+		// THE PISTOL STILL GOES THROUGH FTraceHitZoneModel AND MUST. That is the shared zone model
+		// spec section 6 insists the predicted and authoritative traces both use, it is what
+		// UTraceDamageSettings feeds, and it is what the Trace.ShotStats histogram is calibrated
+		// against. This function adds a SECOND TABLE for a second weapon; it does not replace the
+		// first, and a build with no SMG in it resolves exactly the numbers it always did.
+		if (Weapon != ETraceEquippedWeapon::Smg)
+		{
+			return FTraceHitZoneModel::DamageForZone(Zone);
+		}
+
+		const UTraceSettings& Settings = UTraceSettings::Get();
+		switch (Zone)
+		{
+		case ETraceHitZone::Head: return FMath::Max(0.f, Settings.SmgHeadDamage);
+		case ETraceHitZone::Body: return FMath::Max(0.f, Settings.SmgBodyDamage);
+		case ETraceHitZone::Legs: return FMath::Max(0.f, Settings.SmgLegDamage);
+		default:                  return 0.f;    // ETraceHitZone::None — a miss pays nothing.
+		}
+	}
+
 	bool IsEnabled()             { return CVarAmmoEnabled.GetValueOnAnyThread() != 0; }
 	bool DoesReloadBlockFire()   { return CVarAmmoReloadBlocksFire.GetValueOnAnyThread() != 0; }
 	bool IsCarrierGuardArmed()   { return CVarAmmoCarrierGuard.GetValueOnAnyThread() != 0; }
@@ -412,6 +477,13 @@ void UTraceWeaponComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, ClipSerial,          COND_OwnerOnly);
 	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, AbilityRoundsInClip, COND_OwnerOnly);
 	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, ReloadEndServerTime, COND_OwnerOnly);
+
+	// SPEC v28 §9 — the other gun's magazine. COND_OwnerOnly for exactly the reason the four above
+	// are: nobody draws another player's ammo, and this is two more bytes per pawn that no client
+	// could put on screen. NO OnRep of its own — ClipSerial moves on every swap, so OnRep_Ammo (which
+	// ClipAmmo and ClipSerial already trigger) is where the reconcile happens, once.
+	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, StowedGunClipAmmo,     COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, StowedGunAbilityRounds, COND_OwnerOnly);
 }
 
 void UTraceWeaponComponent::BeginPlay()
@@ -430,7 +502,18 @@ void UTraceWeaponComponent::BeginPlay()
 	// be a number it briefly believed in before the server told it otherwise.
 	if (const AActor* AmmoOwner = GetOwner(); AmmoOwner != nullptr && AmmoOwner->HasAuthority())
 	{
-		RefillClip(TraceAmmo::GetClipSize(), 0);
+		// The weapon actually in hand (the pistol, for every pawn that has not pressed 2 yet)...
+		RefillClip(TraceAmmo::GetClipSize(EquippedWeapon), 0);
+
+		// ...AND THE OTHER GUN, which is the half that is easy to forget and which fails LOUDLY when
+		// it is: StowedGunClipAmmo's class default is 0, so a pawn that pressed 2 for the first time
+		// would draw an SMG with an empty magazine and immediately go into an 0.8 s automatic reload.
+		// Seeded here, beside the live clip, so the two cannot get out of step.
+		const ETraceEquippedWeapon OtherGun = (EquippedWeapon == ETraceEquippedWeapon::Smg)
+			? ETraceEquippedWeapon::Gun
+			: ETraceEquippedWeapon::Smg;
+		StowedGunClipAmmo = static_cast<uint8>(FMath::Clamp(TraceAmmo::GetClipSize(OtherGun), 0, 255));
+		StowedGunAbilityRounds = 0;
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -522,13 +605,36 @@ bool UTraceWeaponComponent::CanFire() const
 	}
 
 	// --- SPEC v10 §1: the knife is out, so the gun is not ---------------------------------------
-	if (IsKnifeEquipped())
+	//
+	// [DUALWIELD] IsFirearmEquipped() rather than !IsKnifeEquipped(), and the change is not cosmetic:
+	// spec v28 §9 added a third selector value, so "not the knife" and "a gun" stopped being the same
+	// sentence the moment the SMG existed. Under the v28 §10 switch no pawn is ever in the Knife
+	// state at all and this gate never fires; with the switch off it behaves exactly as it always
+	// did, because Knife is the only non-firearm there is.
+	if (!IsFirearmEquipped())
 	{
 		return false;
 	}
 
 	// --- SPEC v10 §1: 0.2s of pullout, during which NEITHER weapon works -------------------------
 	if (IsDeploying())
+	{
+		return false;
+	}
+
+	// --- SPEC v28 §10: "Meleeing should lock the player out of shooting for the length of the
+	//     animation." -----------------------------------------------------------------------------
+	//
+	// [DUALWIELD] A GATE, NOT A COOLDOWN, exactly like the dash gate above it: it is a pure function
+	// of the swing stamp and the animation length, so it opens on the frame the animation ends and
+	// there is nothing to expire, reset or leak. GetShootLockoutRemaining() returns 0 outright when
+	// the switch is off — with the knife selected the gun could not fire anyway, so the rule has
+	// nothing to do in the v27 build and adds no behaviour to a revert.
+	//
+	// SITED HERE, ABOVE THE AMMO COUNTERS, ON PURPOSE. A shot refused because the player is mid-swing
+	// is not a dry fire and must not move GAmmoDryFireRefusals, or the ammo harness's headline number
+	// would start counting melee.
+	if (GetShootLockoutRemaining() > 0.f)
 	{
 		return false;
 	}
@@ -584,9 +690,58 @@ bool UTraceWeaponComponent::CanFire() const
 	// must not learn the name of a character, or the third character that needs a fire-rate change
 	// adds a third cast next to the first two. 1.0 for everybody else, including every Mannequin and
 	// every bot, so nothing about the base gun's cadence moves.
-	const double FireInterval = FMath::Max(0.01f, UTraceSettings::Get().FireInterval)
-		* UTraceAbilityComponent::GetFireIntervalScaleFor(Character);
-	return (GetLocalTimeSeconds() - LastLocalFireTime) >= FireInterval;
+	//
+	// SPEC v28 §9 — and this line is the whole of "the modifiers must apply to the SMG the same way
+	// they apply to the pistol". GetFireInterval() is base-of-the-weapon-in-hand TIMES the same
+	// scale, so the SMG inherited Roxie and Slimeball without either ability changing.
+	return (GetLocalTimeSeconds() - LastLocalFireTime) >= GetFireInterval();
+}
+
+double UTraceWeaponComponent::GetFireInterval() const
+{
+	// *** THE ONE PLACE THE BASE AND THE MODIFIER MEET, AND THERE ARE EXACTLY TWO CALLERS: the
+	// client's CanFire() and the server's ServerFire(). *** Spec v18 §2 shipped with only the client
+	// half scaled, and the server then rate-limited every second round of a Roxie burst — which reads
+	// in game as the gun eating bullets, i.e. strictly worse than the ability doing nothing. One
+	// function with two callers is what makes that class of bug unavailable.
+	//
+	// The scale is a RATE expressed against a PERIOD, so it MULTIPLIES: x1.65 fire rate arrives here
+	// as 1/1.65 = 0.606. Dividing would make a faster character fire slower.
+	return static_cast<double>(TraceAmmo::GetBaseFireInterval(EquippedWeapon))
+		* static_cast<double>(UTraceAbilityComponent::GetFireIntervalScaleFor(GetTraceCharacter()));
+}
+
+float UTraceWeaponComponent::GetShootLockoutRemaining() const
+{
+	// [DUALWIELD] The rule exists only under the spec v28 §10 switch. With the knife as a separate
+	// weapon there is no state in which a player is mid-swing AND holding a gun, so returning 0 here
+	// is not a disabled feature — it is a feature with no reachable state, and saying so in one line
+	// keeps the revert from having to reason about a lockout that can never fire.
+	if (!TraceMelee::IsDualWieldEnabled())
+	{
+		return 0.f;
+	}
+
+	const double AnimSeconds = static_cast<double>(TraceMelee::GetSwingAnimSeconds());
+	const double Now = GetLocalTimeSeconds();
+
+	// THE SWINGING MACHINE'S OWN STAMP, taken at the PRESS. This is the one the player feels.
+	double Remaining = (SwingAnimStartLocalTime + AnimSeconds) - Now;
+
+	// THE SERVER'S, when this is the authority. ServerSwing arrives at the RESOLVE instant, which is
+	// SwingWindupSeconds after the press, so the server's view of "the animation ends" is that much
+	// later in its own local clock. Derived from the same two knobs rather than being a third number:
+	// retune the wind-up and this moves with it. Clamped at zero so a wind-up longer than the whole
+	// animation (impossible through the clamps, but the arithmetic should not care) cannot produce a
+	// negative allowance that shortens the lockout.
+	const AActor* OwnerActor = GetOwner();
+	if (OwnerActor != nullptr && OwnerActor->HasAuthority())
+	{
+		const double PostResolve = FMath::Max(0.0, AnimSeconds - static_cast<double>(TraceMelee::GetSwingWindupSeconds()));
+		Remaining = FMath::Max(Remaining, (LastAcceptedSwingTime + PostResolve) - Now);
+	}
+
+	return static_cast<float>(FMath::Max(0.0, Remaining));
 }
 
 void UTraceWeaponComponent::StartFire()
@@ -608,6 +763,13 @@ void UTraceWeaponComponent::StartFire()
 	// here, so the knife inherits the human bind, the bot burst logic and the dead-player "put me
 	// back in" path unchanged. The trigger stays HELD either way, so the tick below repeats a swing
 	// at the 0.5 s cadence exactly as it repeats a shot at the fire interval.
+	//
+	// [DUALWIELD] SPEC v28 §10 TAKES THE DISPATCH BACK OUT, and the condition is the whole of it.
+	// "Melee should be bound to right click by default" means mouse 1 is a TRIGGER again and nothing
+	// else — the branch below is unreachable under the switch, because no pawn is ever in the Knife
+	// state. Melee arrives instead through TraceMelee::HandleMeleeInput, which is a different bind.
+	// The line is left as a condition rather than deleted so that flipping the switch restores the
+	// v10 §1 input model with no code to put back.
 	if (IsKnifeEquipped())
 	{
 		ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
@@ -712,7 +874,12 @@ bool UTraceWeaponComponent::ShouldShowAmmo() const
 	}
 
 	// The knife has no magazine. Drawing "30" beside a blade would be worse than drawing nothing.
-	return !IsKnifeEquipped();
+	//
+	// SPEC v28 §9: asked as "is a firearm in hand" rather than "is the knife not in hand", because
+	// those stopped being the same question when a third selector value appeared. [DUALWIELD] Under
+	// the v28 §10 switch this is simply always true for a living non-carrier — the blade is in the
+	// off hand and the gun is still up, so the count belongs on screen the whole time.
+	return IsFirearmEquipped();
 }
 
 void UTraceWeaponComponent::ConsumeRound()
@@ -847,7 +1014,10 @@ void UTraceWeaponComponent::BeginReload(double AnchorSharedTime)
 	const double MaxRewind = FMath::Max(0.f, UTraceSettings::Get().MaxRewindTime);
 	const double Anchor = FMath::Clamp(AnchorSharedTime, Now - MaxRewind, Now);
 
-	ReloadEndServerTime = static_cast<float>(Anchor + static_cast<double>(TraceAmmo::GetReloadSeconds()));
+	// SPEC v28 §9 — the weapon in hand decides: 0.5 s for the pistol, 0.8 s for the SMG. Both ends
+	// anchor at the same stamped instant AND read the same selector (EquippedWeapon is replicated),
+	// so the client's predicted deadline and the server's are still one number rather than two.
+	ReloadEndServerTime = static_cast<float>(Anchor + static_cast<double>(GetReloadSeconds()));
 	bPredictedRefillPending = false;
 }
 
@@ -904,10 +1074,30 @@ void UTraceWeaponComponent::TickReload()
 		// another ownership slice. Refilling while dead is equivalent and needs nothing from anyone
 		// else. The guard is what keeps it from bumping the serial (and therefore replicating) sixty
 		// times a second for the whole respawn countdown.
-		if (bAuthority && bDead
-			&& (static_cast<int32>(ClipAmmo) != TraceAmmo::GetClipSize() || AbilityRoundsInClip != 0))
+		//
+		// SPEC v28 §9: BOTH magazines. A player who died with a spent SMG in their pocket must not
+		// respawn and find it still spent — the sentence is "a new life starts with a full clip", and
+		// a loadout of two guns has two of them. The stowed pair is written directly rather than
+		// through RefillClip (which by definition acts on the live clip) and does not need its own
+		// serial bump: the live refill below already moves ClipSerial in the same frame, and the
+		// client's reconcile reads the whole set.
+		if (bAuthority && bDead)
 		{
-			RefillClip(TraceAmmo::GetClipSize(), 0);
+			const ETraceEquippedWeapon OtherGun = (EquippedWeapon == ETraceEquippedWeapon::Smg)
+				? ETraceEquippedWeapon::Gun
+				: ETraceEquippedWeapon::Smg;
+			const uint8 OtherFull = static_cast<uint8>(FMath::Clamp(TraceAmmo::GetClipSize(OtherGun), 0, 255));
+			if (StowedGunClipAmmo != OtherFull || StowedGunAbilityRounds != 0)
+			{
+				StowedGunClipAmmo = OtherFull;
+				StowedGunAbilityRounds = 0;
+			}
+		}
+
+		if (bAuthority && bDead
+			&& (static_cast<int32>(ClipAmmo) != GetClipSize() || AbilityRoundsInClip != 0))
+		{
+			RefillClip(GetClipSize(), 0);
 		}
 		return;
 	}
@@ -917,19 +1107,19 @@ void UTraceWeaponComponent::TickReload()
 	{
 		if (bAuthority)
 		{
-			RefillClip(TraceAmmo::GetClipSize(), 0);
+			RefillClip(GetClipSize(), 0);
 			++TotalReloadsCompleted;
 			++GAmmoReloadsCompleted;
 
-			UE_LOG(LogTraceGame, Verbose, TEXT("[Ammo] %s reloaded: %d rounds."),
-				*GetNameSafe(GetOwner()), TraceAmmo::GetClipSize());
+			UE_LOG(LogTraceGame, Verbose, TEXT("[Ammo] %s reloaded: %d rounds of %s."),
+				*GetNameSafe(GetOwner()), GetClipSize(), LexToString(EquippedWeapon));
 		}
 		else
 		{
 			// THE PREDICTED REFILL. The client's gun comes back up on ITS deadline rather than a ping
 			// later, and bPredictedRefillPending is what stops the server's last pre-refill packet
 			// from yanking the count back to empty for that ping — see OnRep_Ammo.
-			PredictedClipAmmo = TraceAmmo::GetClipSize();
+			PredictedClipAmmo = GetClipSize();
 			bPredictedRefillPending = true;
 			ReloadEndServerTime = -1.f;
 			++GAmmoReloadsCompleted;
@@ -947,7 +1137,7 @@ void UTraceWeaponComponent::TickReload()
 	// controlled in the same process, so it runs this identical branch. There is not one line of AI
 	// code in the ammo feature, and a bot that dry-fires forever is impossible by construction rather
 	// than by a rule somebody remembered to add to the bot controller.
-	if (GetClipAmmo() <= 0 && !IsReloading() && !IsKnifeEquipped())
+	if (GetClipAmmo() <= 0 && !IsReloading() && IsFirearmEquipped())
 	{
 		BeginReload(GetServerTimeSeconds());
 	}
@@ -967,7 +1157,7 @@ bool UTraceWeaponComponent::RequestReload()
 	{
 		return false;
 	}
-	if (IsKnifeEquipped() || IsDeploying())
+	if (!IsFirearmEquipped() || IsDeploying())
 	{
 		return false;
 	}
@@ -975,7 +1165,7 @@ bool UTraceWeaponComponent::RequestReload()
 	{
 		return false;
 	}
-	if (GetClipAmmo() >= TraceAmmo::GetClipSize())
+	if (GetClipAmmo() >= GetClipSize())
 	{
 		// A FULL CLIP: NOTHING AT ALL. [ASSUMPTION], spec v16 §1. Restarting the timer instead would
 		// let a player weld their own gun shut for half a second by leaning on R, which no shooter
@@ -1041,11 +1231,11 @@ void UTraceWeaponComponent::ServerRequestReload_Implementation(float ClientPress
 	// RE-GATED FROM SCRATCH, never trusted. The client gated on its own copy of all of this before it
 	// sent the RPC; that gate is for FEEL, this one is the rule. A client that has been corrected
 	// into a state where the reload is illegal simply gets nothing.
-	if (!Character->IsAlive() || Character->IsCarrier() || IsKnifeEquipped() || IsDeploying())
+	if (!Character->IsAlive() || Character->IsCarrier() || !IsFirearmEquipped() || IsDeploying())
 	{
 		return;
 	}
-	if (IsReloading() || ClipAmmo >= static_cast<uint8>(TraceAmmo::GetClipSize()) || AbilityRoundsInClip > 0)
+	if (IsReloading() || ClipAmmo >= static_cast<uint8>(GetClipSize()) || AbilityRoundsInClip > 0)
 	{
 		return;
 	}
@@ -1065,7 +1255,9 @@ void UTraceWeaponComponent::LoadAbilityClip(int32 RoundCount)
 	// in the clip (20 rounds left -> 5 bee rounds)". RefillClip clears any running reload too, so an
 	// ability cast during a reload puts the gun up immediately instead of stranding the player behind
 	// a timer they can no longer see the point of.
-	const int32 Rounds = FMath::Clamp(RoundCount, 0, TraceAmmo::GetClipSize());
+	// SPEC v28 §9: clamped to the clip of the weapon X is actually holding, so a Sting cast with the
+	// SMG out cannot load more bee rounds than the magazine has room for.
+	const int32 Rounds = FMath::Clamp(RoundCount, 0, GetClipSize());
 	RefillClip(Rounds, Rounds);
 
 	UE_LOG(LogTraceGame, Log, TEXT("[Ammo] %s: the clip is now %d ability round(s)."),
@@ -1205,6 +1397,13 @@ void UTraceWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 	// means a player who is still physically holding the button gets nothing after passing the Core
 	// away or after respawning — they would have to release and press again for no reason they can
 	// see. Keep ticking, skip attacking, and resume the instant the gate reopens.
+	//
+	// *** THIS IS WHERE "FULL AUTO" LIVES, AND IT ALWAYS DID (spec v28 §9). *** A held trigger fires
+	// once per CanFire()-legal frame, and CanFire()'s last test is the fire-rate gate, so the cadence
+	// is exactly GetFireInterval() for whichever weapon is in hand — 0.3158 s for the pistol,
+	// 0.1 s for the SMG. There is no semi-automatic path in this codebase to opt out of and no
+	// per-weapon fire-MODE flag was needed: "full auto" is the behaviour this loop already had, and
+	// the SMG's 600 RPM is the fire interval and nothing else.
 	if (bTriggerHeld && Character->IsAlive() && !Character->IsCarrier())
 	{
 		if (IsKnifeEquipped())
@@ -1746,6 +1945,38 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 		return;
 	}
 
+	// ---- SPEC v28 §10: the melee lockout, RE-ASKED HERE ------------------------------------
+	//
+	// [DUALWIELD] The client refused this shot for the length of its swing animation; that gate is
+	// for feel, and a modified client simply would not run it. This is the copy that makes
+	// "meleeing locks the player out of shooting" a rule rather than a client-side suggestion — the
+	// same argument the ammo, rate and dash gates below and above already make for themselves.
+	//
+	// *** THE GRACE IS FOR HONEST LATENCY, NOT FOR CHEATS, and it is the reload gate's grace
+	// unchanged. *** The two ends measure the window from different instants: the client from its
+	// own PRESS, the server from the arrival of ServerSwing, which is one upstream lag plus
+	// SwingWindupSeconds later. The server's window therefore CLOSES later than the client's by
+	// roughly that much, so a player who legitimately fires the frame their animation ends would
+	// have the first round of every post-melee burst eaten. 50 ms covers a normal connection's
+	// share of that; what it buys a liar is 50 ms of a 320 ms lockout, which is a sixth of one
+	// melee's worth of downtime and nothing like an exploit.
+	//
+	// GetShootLockoutRemaining() returns 0 outright when the v28 §10 switch is off, so this is inert
+	// in the reverted build rather than being a second thing a revert has to remember.
+	{
+		constexpr double MeleeLockoutGraceSeconds = 0.05;
+		if (GetShootLockoutRemaining() > MeleeLockoutGraceSeconds)
+		{
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("ServerFire: %s fired %.3fs into a melee animation (spec v28 s10 locks the trigger for %.3fs)"),
+				*GetNameSafe(OwnerActor),
+				TraceMelee::GetSwingAnimSeconds() - GetShootLockoutRemaining(),
+				TraceMelee::GetSwingAnimSeconds());
+			if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedState; }
+			return;
+		}
+	}
+
 	// ---- AMMO (spec v16 §1): the SERVER's copy of the gate the client fired through ---------
 	//
 	// The client gated on its own predicted clip before it sent this; that gate is for feel, and a
@@ -1772,7 +2003,7 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			&& GetServerTimeSeconds() < static_cast<double>(ReloadEndServerTime) - ReloadGateGraceSeconds)
 		{
 			UE_LOG(LogTraceGame, Verbose, TEXT("ServerFire: %s fired %.3fs into a reload"),
-				*GetNameSafe(OwnerActor), TraceAmmo::GetReloadSeconds() - GetReloadRemaining());
+				*GetNameSafe(OwnerActor), GetReloadSeconds() - GetReloadRemaining());
 			if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedState; }
 			return;
 		}
@@ -1788,8 +2019,11 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	// worse than the ability not working at all. The server re-derives the scale from its own
 	// authoritative ability state rather than trusting anything in the RPC payload, so a client that
 	// lied about being Roxie gains nothing.
-	const double FireInterval = FMath::Max(0.01f, Settings.FireInterval)
-		* UTraceAbilityComponent::GetFireIntervalScaleFor(Character);
+	// SPEC v28 §9: GetFireInterval() is the base of the weapon IN HAND times the same scale, so the
+	// server's idea of a legal cadence follows the client onto the SMG's 0.1 s automatically. Both
+	// gates call one function; see its comment for why two copies of this arithmetic was a shipped
+	// bug once already.
+	const double FireInterval = GetFireInterval();
 	const double LocalNow = GetLocalTimeSeconds();
 	if ((LocalNow - LastAcceptedFireTime) < FireInterval * (1.0 - FireRateTolerance))
 	{
@@ -1876,7 +2110,12 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			// NOT const: the ability passives below may modify it (spec v14 §6). The ZONE is still
 			// the only thing that decides the base number — see spec section 6, head 100 / body 40 /
 			// legs 25 — and a character with no passives leaves it exactly as it was.
-			float Damage = FTraceHitZoneModel::DamageForZone(Zone);
+			// SPEC v28 §9 — THE ZONE STILL IS THE DAMAGE; THE WEAPON NOW CHOOSES WHICH TABLE. The
+			// pistol's 100/40/25 still come from FTraceHitZoneModel and UTraceDamageSettings,
+			// untouched; the SMG's 33/18/12 come from the three knobs beside SmgFireInterval. One
+			// call, resolved on the replicated selector, so the shooter's predicted zone and the
+			// server's authoritative one are still being priced by the same rule.
+			float Damage = TraceAmmo::GetZoneDamage(EquippedWeapon, Zone);
 
 			// SPEC v8 §6, the kill feed's headshot icon. The zone is known EXACTLY here and nowhere
 			// after: ApplyDamage takes a cause and the health component clamps at zero, so a head
@@ -1950,7 +2189,7 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			*GetNameSafe(Character),
 			TraceHitZoneToString(LastPredictedZone), *GetNameSafe(LastPredictedVictim.Get()),
 			TraceHitZoneToString(Zone), *GetNameSafe(Victim),
-			FTraceHitZoneModel::DamageForZone(Zone),
+			TraceAmmo::GetZoneDamage(EquippedWeapon, Zone),
 			ServerNow - RewindTime);
 	}
 
@@ -2052,12 +2291,21 @@ bool UTraceWeaponComponent::CanSwing(ETraceMeleeRefusal* OutRefusal) const
 		// defending half (the knife cannot HURT a carrier either) lives in TraceMelee::ResolveSwing.
 		return Refuse(ETraceMeleeRefusal::Carrying);
 	}
-	if (!IsKnifeEquipped())
+	// [DUALWIELD] TraceMelee::IsKnifeInHand asks "is a blade available", where IsKnifeEquipped() asks
+	// "is the gun stowed". Those were the same sentence until spec v28 §10 and this is the one gate
+	// that wanted the first meaning all along. With the switch off it collapses back to
+	// IsKnifeEquipped() exactly, so the v27 refusal is unchanged — including for a stray melee bind,
+	// which is why HandleMeleeInput needs no legacy branch of its own.
+	if (!TraceMelee::IsKnifeInHand(Character))
 	{
 		return Refuse(ETraceMeleeRefusal::WrongWeapon);
 	}
 	if (IsDeploying())
 	{
+		// The pullout locks the BLADE too, under either switch position. Under dual-wield that is a
+		// deliberate keep rather than an oversight: a player who has just tapped 2 for the SMG is
+		// mid-swap for 0.2 s, and letting them melee out of it would make the swap a free animation
+		// cancel. It costs at most 0.2 s of melee, and only to somebody who chose to swap.
 		return Refuse(ETraceMeleeRefusal::Deploying);
 	}
 	if (Character->AreWeaponActionsBlocked())
@@ -2241,6 +2489,39 @@ bool UTraceWeaponComponent::RequestEquip(ETraceEquippedWeapon Desired, ETraceMel
 	{
 		return Refuse(ETraceMeleeRefusal::NoPawn);
 	}
+
+	// =============================================================================================
+	// [DUALWIELD] SPEC v28 §10: THERE IS NO SUCH THING AS EQUIPPING THE KNIFE ANY MORE.
+	// =============================================================================================
+	//
+	// The blade is permanently in the off hand, so a request for it is a request for something the
+	// pawn already has. It SUCCEEDS AS A NO-OP — true, no pullout, no state change — and the choice
+	// of "true" rather than "false, WrongWeapon" is deliberate and load-bearing:
+	//
+	//   * Chut's E (TraceAbilitySetChut.cpp) equips the knife as part of its verification path and
+	//     asserts the return value. Refusing would report a broken ability that is not broken.
+	//   * "Give me the knife" is SATISFIED. Returning false would mean "you do not have a knife",
+	//     which is the opposite of what dual-wield guarantees.
+	//
+	// It is checked BEFORE the legality gates for the same reason RequestEquipIfDifferent checks its
+	// own early-out first: nothing was asked for, so there is no refusal reason worth logging.
+	//
+	// *** KNOWN, REPORTED CONSEQUENCE: *** a caller that asks for the knife and then asserts
+	// IsKnifeEquipped() will now see false. Exactly one place does that —
+	// Modes/TracePracticeVerify.cpp's KNIFEBACK step — and it is another ownership slice. The one-line
+	// fix there is to assert TraceMelee::IsKnifeInHand() instead, which is true under both switch
+	// positions.
+	if (Desired == ETraceEquippedWeapon::Knife && TraceMelee::IsDualWieldEnabled())
+	{
+		if (TraceMelee::IsDebugLoggingEnabled())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Knife] %s asked for the knife under dual-wield: already in the off hand, no pullout."),
+				*GetNameSafe(Character));
+		}
+		return true;
+	}
+
 	if (!Character->IsAlive())
 	{
 		return Refuse(ETraceMeleeRefusal::Dead);
@@ -2308,6 +2589,43 @@ bool UTraceWeaponComponent::RequestEquip(ETraceEquippedWeapon Desired, ETraceMel
 	return true;
 }
 
+void UTraceWeaponComponent::SwapStowedClip()
+{
+	const AActor* OwnerActor = GetOwner();
+	const bool bAuthority = (OwnerActor != nullptr && OwnerActor->HasAuthority());
+
+	if (bAuthority)
+	{
+		Swap(ClipAmmo, StowedGunClipAmmo);
+		Swap(AbilityRoundsInClip, StowedGunAbilityRounds);
+
+		// *** THE SERIAL BUMP IS WHAT MAKES THIS PREDICTION-SAFE, AND IT IS THE EXISTING MACHINERY. ***
+		// RefillClip's comment already states the contract: a moved serial tells an owning client
+		// "this is a NEW magazine, throw your prediction away". A swap is a new magazine by the
+		// plainest possible reading, so OnRep_Ammo's second branch handles it with no new rule. It is
+		// also why a mispredicted swap self-heals within one packet instead of drifting.
+		++ClipSerial;
+		return;
+	}
+
+	// A PREDICTING CLIENT. Seed both mirrors from the replicated truth on the first swap of the
+	// connection — the same -1 sentinel ConsumeRound seeds from, for the same reason.
+	if (PredictedClipAmmo < 0)
+	{
+		PredictedClipAmmo = static_cast<int32>(ClipAmmo);
+	}
+	if (PredictedStowedClipAmmo < 0)
+	{
+		PredictedStowedClipAmmo = static_cast<int32>(StowedGunClipAmmo);
+	}
+	Swap(PredictedClipAmmo, PredictedStowedClipAmmo);
+
+	// A predicted refill that has not been confirmed belongs to the magazine that just went in the
+	// pocket, so it must not go on protecting the one that came out. Clearing it is what stops the
+	// "wait for the serial" branch in OnRep_Ammo from holding a stale prediction across a swap.
+	bPredictedRefillPending = false;
+}
+
 void UTraceWeaponComponent::ApplyEquip(ETraceEquippedWeapon Desired, double DeployEndSharedTime)
 {
 	const ETraceEquippedWeapon Previous = EquippedWeapon;
@@ -2315,11 +2633,35 @@ void UTraceWeaponComponent::ApplyEquip(ETraceEquippedWeapon Desired, double Depl
 	EquippedWeapon = Desired;
 	DeployEndServerTime = static_cast<float>(DeployEndSharedTime);
 
+	// --- SPEC v28 §9: each gun keeps its own magazine ---------------------------------------------
+	//
+	// GUN-TO-GUN ONLY, AND THE CONDITION IS THE COMPATIBILITY GUARANTEE. A knife swap in the legacy
+	// build must leave the gun's clip exactly where it was — that is spec v16 §1's behaviour and 20
+	// rounds must still be 20 rounds when the blade goes away — so a transition involving the knife
+	// touches neither pair. A no-op request (RequestEquip is unguarded and a repeat press costs a
+	// pullout) is excluded by the inequality, or leaning on the key would shuffle two magazines back
+	// and forth and bump the serial sixty times a second.
+	if (Previous != Desired && TraceIsFirearm(Previous) && TraceIsFirearm(Desired))
+	{
+		// A RELOAD DOES NOT SURVIVE THE SWAP, and it is cancelled BEFORE the exchange so the deadline
+		// dies with the magazine it belonged to rather than following it into the pocket. Putting a
+		// gun away mid-reload therefore costs the reload — which is the reading every shooter uses,
+		// and which is what stops "swap out, swap in" from being a way to shorten one.
+		CancelReload();
+		SwapStowedClip();
+	}
+
 	// A swap cancels a swing that has not resolved yet. The alternative — letting the blade land
 	// after the knife has been put away — is a hit from a weapon that is visibly not in the
 	// player's hands, which is the least defensible thing a melee can do.
 	bSwingPendingResolve = false;
 	SwingAnimStartLocalTime = -1000.0;
+
+	// SPEC v28 §9. What THIS machine believes it just selected, remembered before the OnRep body
+	// runs. On a predicting client it is what lets the next replicated update be classified as a
+	// CONFIRMATION (same weapon — keep the predicted magazines) or a CORRECTION (the server refused
+	// the swap — throw them away). See OnRep_EquippedWeapon.
+	LocallyAppliedWeapon = Desired;
 
 	// The server does not receive its own OnRep, and on a listen host the presentation must still
 	// follow. Calling it directly is what keeps the two paths identical.
@@ -2339,6 +2681,37 @@ void UTraceWeaponComponent::OnRep_EquippedWeapon()
 	// (UpdateKnifeVisuals), so all this has to do about presentation is make sure a swap cannot
 	// leave a half-swung blade frozen mid-arc on the machine that just learned about it.
 	SwingAnimStartLocalTime = -1000.0;
+
+	// --- SPEC v28 §9: THE ONE PREDICTION HOLE A PER-WEAPON MAGAZINE OPENS -------------------------
+	//
+	// An owning client predicts its swap and exchanges its predicted pair (SwapStowedClip). If the
+	// server then REFUSES that swap — the client died or picked the Core up in the same instant — the
+	// selector replicates back to the weapon it never left, but ClipSerial did NOT move, so
+	// OnRep_Ammo's "a new clip, throw the prediction away" branch never fires and the client would go
+	// on displaying the OTHER gun's count for the rest of the magazine.
+	//
+	// Dropping the mirrors on any selector update closes it in two lines. The cost is that the client
+	// re-seeds from the replicated truth after every swap, losing per-shot prediction for ~RTT/2 —
+	// which lands entirely inside the 0.2 s pullout, where the gun cannot fire anyway. Being briefly
+	// authoritative is the right direction to be wrong in; being persistently wrong about which
+	// magazine is loaded is not.
+	//
+	// ONLY ON A CONTRADICTION, WHICH IS THE WHOLE SUBTLETY. ApplyEquip calls this function directly
+	// so that a listen host and a predicting client run one code path — so an unconditional reset
+	// here would also fire on the client's OWN predicted swap and discard the prediction it had just
+	// made, one statement after making it. LocallyAppliedWeapon is what tells the two apart: equal
+	// means the server agreed (or this IS the server), and the mirrors are already right.
+	//
+	// The order of the two OnReps does not matter in the correction case. If this runs first,
+	// OnRep_Ammo takes its first-update branch and adopts the truth; if it runs second, GetClipAmmo()
+	// falls through to the replicated count, which is the same number.
+	if (EquippedWeapon != LocallyAppliedWeapon)
+	{
+		PredictedClipAmmo = -1;
+		PredictedStowedClipAmmo = -1;
+		bPredictedRefillPending = false;
+		LocallyAppliedWeapon = EquippedWeapon;
+	}
 
 	// The movement profile, on the very frame the selector changed rather than on the next tick. On
 	// a simulated proxy that is what keeps the pawn's simulated speed matching the one the server
@@ -2383,7 +2756,12 @@ bool UTraceWeaponComponent::ServerRequestEquip_Validate(ETraceEquippedWeapon Des
 	{
 		return false;
 	}
-	return Desired == ETraceEquippedWeapon::Gun || Desired == ETraceEquippedWeapon::Knife;
+	// SPEC v28 §9 adds Smg. This list is the reason ETraceEquippedWeapon is append-only: a value the
+	// server does not recognise DISCONNECTS the sender, so a client built against a newer enum than
+	// the server would be kicked for pressing 2. Appending keeps every old value meaning what it did.
+	return Desired == ETraceEquippedWeapon::Gun
+		|| Desired == ETraceEquippedWeapon::Knife
+		|| Desired == ETraceEquippedWeapon::Smg;
 }
 
 void UTraceWeaponComponent::ServerRequestEquip_Implementation(ETraceEquippedWeapon Desired, float ClientPressServerTime)
@@ -2392,6 +2770,19 @@ void UTraceWeaponComponent::ServerRequestEquip_Implementation(ETraceEquippedWeap
 	ATraceCharacter* Character = GetTraceCharacter();
 	if (OwnerActor == nullptr || Character == nullptr || !OwnerActor->HasAuthority())
 	{
+		return;
+	}
+
+	// [DUALWIELD] The client's own RequestEquip turns a knife request into a no-op and never sends
+	// this RPC for one — so reaching here with Knife means a modified client. Refused rather than
+	// applied: letting it through would put the SERVER's copy of that pawn into a state no honest
+	// client can be in, and the selector is replicated to everyone, so it would strand the pawn
+	// weaponless on every machine in the match.
+	if (Desired == ETraceEquippedWeapon::Knife && TraceMelee::IsDualWieldEnabled())
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("ServerRequestEquip: refusing a KNIFE equip for %s — dual-wield is on, the blade is always held."),
+			*GetNameSafe(OwnerActor));
 		return;
 	}
 
@@ -2480,11 +2871,16 @@ void UTraceWeaponComponent::ServerSwing_Implementation(FVector_NetQuantize Origi
 	// AreWeaponActionsBlocked, not IsDashing, for the same one-definition reason CanSwing uses it —
 	// and note this copy is the one that matters: the server's dash clock is authoritative, so a
 	// modified client that skipped its own gate is refused here.
-	if (!Character->IsAlive() || Character->IsCarrier() || !IsKnifeEquipped() || Character->AreWeaponActionsBlocked())
+	// [DUALWIELD] IsKnifeInHand, not IsKnifeEquipped — the same substitution CanSwing makes, and this
+	// is the copy that matters: the server's is the gate a modified client cannot skip. It collapses
+	// back to IsKnifeEquipped() when the v28 §10 switch is off, so a v27 revert re-tightens the
+	// server-side rule at the same moment it re-tightens the client's.
+	if (!Character->IsAlive() || Character->IsCarrier() || !TraceMelee::IsKnifeInHand(Character)
+		|| Character->AreWeaponActionsBlocked())
 	{
 		UE_LOG(LogTraceGame, Verbose, TEXT("ServerSwing: state gate refused %s (alive=%d carrier=%d knife=%d dashing=%d)"),
 			*GetNameSafe(OwnerActor), Character->IsAlive() ? 1 : 0, Character->IsCarrier() ? 1 : 0,
-			IsKnifeEquipped() ? 1 : 0, Character->AreWeaponActionsBlocked() ? 1 : 0);
+			TraceMelee::IsKnifeInHand(Character) ? 1 : 0, Character->AreWeaponActionsBlocked() ? 1 : 0);
 		return;
 	}
 
@@ -2842,6 +3238,36 @@ void UTraceWeaponComponent::TickBotKnife()
 	const double Engage = TraceMelee::GetBotEngageRangeUU();
 	const double Disengage = TraceMelee::GetBotDisengageRangeUU();
 
+	// =============================================================================================
+	// [DUALWIELD] SPEC v28 §10 — A BOT NO LONGER TRADES ITS GUN FOR A KNIFE, BECAUSE IT DOES NOT
+	// HAVE TO.
+	// =============================================================================================
+	//
+	// The whole of the v10 §1 range band below exists to answer one question: is it worth being
+	// unarmed for a moment in exchange for the knife's +22% and its 100-damage back-stab? Under the
+	// switch that trade does not exist — the blade is always in the off hand, the speed bonus is
+	// deliberately not paid (see ShouldUseKnifeMovementProfile), and putting the gun away would be a
+	// pure loss. So the rule collapses to its second half: keep shooting, and stab whatever walks
+	// into reach.
+	//
+	// THIS IS ALSO WHAT KEEPS THE BOTS PLAYTESTING THE FEATURE, which is the standing requirement on
+	// this function ("Bots must use it, or it will not be playtested"). It runs on the same
+	// four-times-a-second authority tick and the same IsInSwingRange predicate, so the melee half of
+	// dual-wield is exercised by every bot match without one line of ATraceBotController changing.
+	// Trace.Knife.BotAuto 0 still switches it off, and Trace.Knife.DualWield 0 restores the band.
+	if (TraceMelee::IsDualWieldEnabled())
+	{
+		if (Nearest != nullptr && TraceMelee::IsInSwingRange(Character, Nearest))
+		{
+			// StartSwing re-checks every gate, so this is a request rather than an assertion — and the
+			// 0.5 s cooldown paces it with no timer here. Note the shooting lockout in CanFire() means
+			// a bot that swings genuinely stops shooting for the animation, exactly as a player does,
+			// so the rule is measured on bots too rather than only on the local human.
+			StartSwing();
+		}
+		return;
+	}
+
 	// The band IS the rule: inside Engage the +22% makes the knife the correct chase tool, outside
 	// Disengage it is not, and the gap between them is what stops a bot at the boundary thrashing.
 	if (!IsKnifeEquipped())
@@ -2942,6 +3368,53 @@ namespace TraceKnifeLayout
 	/** Where the blade sits in the hand. Rotated so it runs along the fingers, edge outward. */
 	const FVector HandOffset(-2.f, 4.f, 0.f);
 	const FRotator HandRotation(0.f, 0.f, 0.f);
+
+	// ---------------------------------------------------------------------------------------------
+	// [DUALWIELD] THE OFF-HAND REST POSE  (spec v28 §10)
+	// ---------------------------------------------------------------------------------------------
+	//
+	// The parts table above is authored around KnifeViewRoot's ORIGIN, which in the v27 build sits at
+	// the rig root — i.e. exactly where the gun hangs, because the knife was replacing it. Under
+	// dual-wield the gun is still there, so the whole rig has to move into the off hand instead.
+	//
+	// It is expressed as a DELTA ONTO ATraceCharacter's own off-hand anchor rather than as a second
+	// set of absolute coordinates, which is the standing rule: retune
+	// TraceCharacterLayout::DualWieldLeftHand and the blade follows the fist instead of being left
+	// behind in mid-air. The delta only has to say where the grip sits relative to the knuckles.
+	//
+	//   -3.2 back    the table's grip centre is +0.4 ahead of the root and the pommel is -3.6 behind
+	//                it, so pulling the rig back by ~3 puts the FIST around the grip rather than
+	//                around the guard.
+	//   +0.6 out     a fraction outboard, so the blade clears the outside of the hand block.
+	//   +4.6 up      the parts table hangs everything 2.7-5.0 below its root (it was authored to sit
+	//                under the gun's grip line); lifting the root by that much puts the blade back
+	//                level with the fist it is now being held in.
+	//
+	// THE CANT, AND THE ONE NUMBER THAT HAD TO BE MEASURED RATHER THAN REASONED ABOUT.
+	//
+	// A first-person primitive is rendered with its DEPTH COMPRESSED (EFirstPersonPrimitiveType::
+	// FirstPerson halves it — the same scaling the file header's depth arithmetic is built around),
+	// so a blade lying mostly along +X has its X extent squashed while its Z extent does not. An
+	// angle authored in rig space therefore reads STEEPER on screen than the number says.
+	//
+	// MEASURED: this first shipped at pitch 22 / yaw -14 / roll 10, which was chosen as a modest
+	// raised guard and photographed as a near-vertical obelisk — the blade stood up past the horizon
+	// like a fence post rather than being held. 22 degrees of authored pitch rendered at roughly 60.
+	// Roughly a third of the authored value survives to the screen, so the pose is authored at a
+	// third of what it should look like:
+	//
+	//   pitch  +7    reads as ~20 on screen: the tip leads, slightly up, the way a held blade does.
+	//   yaw   -10    the point crosses inboard toward the crosshair. Yaw is NOT compressed (it is a
+	//                rotation in the screen plane at this pitch), so this one is close to literal.
+	//   roll   +4    just enough to turn the lit edge (the only neon part of the knife) toward the
+	//                camera instead of hiding it under the blade. Small, because roll is what made
+	//                the old swipe animation read as a slash and too much of it here would fight the
+	//                stab.
+	//
+	// The Z lift comes down with the pitch: less nose-up means the parts table's own -2.7..-5.0 sag
+	// needs less correcting, and a tip that no longer rides high does not need the extra clearance.
+	const FVector OffHandOffset(-3.2f, 0.6f, 3.4f);
+	const FRotator OffHandRotation(7.f, -10.f, 4.f);
 
 	// ---------------------------------------------------------------------------------------------
 	// THE STAB  (spec v12 §2: "Can you make the knife animation a stab instead of a swipe?")
@@ -3446,6 +3919,45 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 	const bool bKnife = IsKnifeEquipped();
 	const bool bAlive = Character->IsAlive();
 
+	// =============================================================================================
+	// [DUALWIELD] SPEC v28 §10 — "Gun in one hand, knife in the other."
+	// =============================================================================================
+	//
+	// TWO LINES CARRY THE WHOLE PRESENTATION CHANGE, and everything below reads them instead of
+	// reading the selector, so flipping the switch restores the v12 §7 one-weapon-at-a-time rule with
+	// nothing to put back:
+	//
+	//   bBladeVisible   the knife is on screen whenever the pawn is ALIVE, rather than whenever the
+	//                   knife is the selected weapon. Under the switch it is always in the off hand.
+	//   bHideGun        the gun is hidden only in the legacy build. This is the ONE thing that would
+	//                   otherwise still make dual-wield impossible to see: SetGunViewModelHidden is
+	//                   re-asserted every tick by design (that re-assert IS the v12 §7 fix), so a
+	//                   single stale `true` here would erase the gun sixty times a second no matter
+	//                   what anything else did.
+	const bool bDualWield = TraceMelee::IsDualWieldEnabled();
+	const bool bBladeVisible = bDualWield ? bAlive : (bKnife && bAlive);
+	const bool bHideGun = !bDualWield && bKnife && bAlive;
+
+	// WHERE THE BLADE RESTS. Under the switch it hangs in ATraceCharacter's off hand (asked for, never
+	// copied — see GetViewModelOffHand); in the legacy build it sits at the rig root, exactly where
+	// the gun it replaced was, which is what the parts table is authored around. The stab animation
+	// below is a DELTA onto whichever of the two this is, so one motion curve serves both poses.
+	FVector KnifeRestLocation = FVector::ZeroVector;
+	FRotator KnifeRestRotation = FRotator::ZeroRotator;
+	if (bDualWield)
+	{
+		FVector OffHand = FVector::ZeroVector;
+		if (Character->GetViewModelOffHand(OffHand))
+		{
+			KnifeRestLocation = OffHand + TraceKnifeLayout::OffHandOffset;
+			KnifeRestRotation = TraceKnifeLayout::OffHandRotation;
+		}
+		// else: the rig has not been built yet (or the hand is not free, which cannot happen while
+		// the switch is on). Falling through with a zero rest is the same "not ready" state the rig
+		// itself is in for those frames, and the next tick corrects it — the knife is not visible
+		// then either, because bWantView also requires IsViewModelVisible().
+	}
+
 	// --- First person ---------------------------------------------------------------------------
 	//
 	// ATraceCharacter::SetViewModelVisible drives its OWN parts list and never touches ours, so the
@@ -3458,7 +3970,7 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 		// IsViewModelVisible() is the character's own settled answer to "is the first-person rig on
 		// screen", which folds in the third-person carry blend and the corpse hiding. Asking it is
 		// what keeps the knife from appearing over the carrier's shoulder camera.
-		const bool bWantView = bKnife && bAlive && Character->IsLocallyControlled() && Character->IsViewModelVisible();
+		const bool bWantView = bBladeVisible && Character->IsLocallyControlled() && Character->IsViewModelVisible();
 
 		if (bWantView != bKnifeViewVisible)
 		{
@@ -3479,7 +3991,7 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 		// carry blend, a respawn); an edge-triggered call would miss that and leave a gun on screen
 		// beside the knife. See SetGunViewModelHidden, which now states the rule instead of
 		// remembering an edge.
-		SetGunViewModelHidden(bKnife && bAlive);
+		SetGunViewModelHidden(bHideGun);
 
 		if (bWantView && KnifeViewRoot != nullptr)
 		{
@@ -3526,7 +4038,12 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 					Offset, Rotation);
 			}
 
-			KnifeViewRoot->SetRelativeLocationAndRotation(Offset, Rotation);
+			// [DUALWIELD] The stab is a DELTA onto the rest pose rather than an absolute transform, so
+			// the identical curve reads correctly from the off hand and from the gun's old slot. The
+			// rotations COMPOSE (FRotator addition is not rotation composition in general, but both
+			// terms here are small and the rest cant is fixed, so the sum is what the eye expects and
+			// what the v27 build already did with a zero rest).
+			KnifeViewRoot->SetRelativeLocationAndRotation(KnifeRestLocation + Offset, KnifeRestRotation + Rotation);
 		}
 	}
 
@@ -3546,7 +4063,13 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 	// remembered.
 	if (bKnifeHandBuilt)
 	{
-		const bool bWantHand = bKnife && bAlive;
+		// [DUALWIELD] Third person: the blade is on the body whenever the pawn is alive. Note what
+		// this tell now MEANS has changed and that is honest rather than a regression — in v27 a
+		// visible blade said "that player is 22% faster and cannot shoot back", and under the switch
+		// nobody is either of those things, so it says only "that player has a knife", which is true
+		// of everybody. There is still no third-person GUN mesh anywhere in this project, so this
+		// remains the whole of what another player can see in your hands.
+		const bool bWantHand = bBladeVisible;
 		if (bWantHand != bKnifeHandVisible)
 		{
 			bKnifeHandVisible = bWantHand;
@@ -4148,6 +4671,32 @@ static FAutoConsoleCommand GTraceDualWeaponTestCmd(
 	     "each step. Any census with a gun part and a knife part both drawn is the bug."),
 	FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
 	{
+		// =========================================================================================
+		// [DUALWIELD] SPEC v28 §10 DELETES THE RULE THIS HARNESS MEASURES, SO IT REFUSES TO RUN
+		// RATHER THAN REPORTING A FAILURE.
+		// =========================================================================================
+		//
+		// v12 §7's rule is "a gun part and a knife part must never be drawn at the same time". Under
+		// dual-wield that is the SPECIFIED state, on every frame, for every living pawn — so this
+		// harness would count every census point as a failure and print a red verdict for a build
+		// that is behaving exactly as the owner asked. A harness that reports a deliberate feature as
+		// a bug is worse than no harness: the next reader has to work out which of the two documents
+		// is stale before they can trust anything else it says.
+		//
+		// It is not deleted, because the rule it protects comes straight back the moment the switch
+		// is flipped. Run it the way the verdict line says and it measures exactly what it always
+		// did. The v28 invariant has its OWN harness: Trace.Weapons.V28.
+		if (TraceMelee::IsDualWieldEnabled())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[DualWeapon] VERDICT: *** NOT APPLICABLE *** — spec v28 s10 dual-wield is ON, so the gun "
+				     "and the knife are SUPPOSED to be drawn together and v12 s7's rule does not exist. Run "
+				     "with `-TraceLegacyKnife`, or set `Trace.Knife.DualWield 0` first, to measure it. For the "
+				     "v28 invariant (both weapons drawn, selector never KNIFE, melee locks out fire) run "
+				     "Trace.Weapons.V28."));
+			return;
+		}
+
 		const float Delay = (Args.Num() > 0) ? FMath::Max(0.f, FCString::Atof(*Args[0])) : 8.f;
 		TraceDualWeaponTest::Run(Delay, /*Arm=*/0, /*RedFailures=*/-1, /*RedWorst=*/0);
 	}));
@@ -5979,5 +6528,464 @@ namespace TraceAmmoTest
 		     "spend rounds, complete reloads, and are never caught dry with no reload running."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RunBotWatch));
 }
+
+// =================================================================================================
+// Trace.Smg.Dump  and  Trace.Weapons.V28 — the unattended proof for spec v28 §§9 and 10.
+//
+// WHY THESE TWO AND NOT A SCREENSHOT. The dual-wield viewmodel photographs fine and is screenshotted
+// separately, but nothing in a photograph can show that the SMG's fire rate is 600 RPM rather than
+// 190, that a per-character modifier still multiplies it, that each gun keeps its own magazine
+// across a swap, or that a swing shuts the trigger for exactly the animation's length. Those are
+// numbers, so they get a harness that prints numbers.
+//
+// EVERY ARM GOES RED FIRST WHERE A RED ARM EXISTS. The melee lockout's red arm is the v28 §10 switch
+// itself — with Trace.Knife.DualWield 0 the lockout must measure 0.000 s, because the rule does not
+// exist in the v27 build. A lockout test that has only ever been run with the feature on cannot tell
+// "the lockout works" from "CanFire happened to be false for some other reason".
+//
+// WHAT IS **NOT** PROVEN HERE, said plainly rather than implied: the POSITIVE half of the
+// melee-vs-pull precedence. Making CanPullNow() true needs a live turnover — a carrier, a drop, the
+// 5 s lockout window and the puller on the opposing team — which is another slice's fixture
+// (Trace.ModeB.TurnoverVerify). What IS proven is the thing that makes the positive half follow: the
+// precedence and the HUD's circle are THE SAME CALL on the same actor, sampled every frame of the
+// run, plus the negative arm (no turnover on screen ⇒ right mouse swings) measured directly.
+// =================================================================================================
+
+namespace TraceWeaponsV28
+{
+	/** The pawn the local player is looking out of. Its own copy, like every other harness here. */
+	ATraceCharacter* FindLocalPawn()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* TestWorld = Context.World();
+			if (TestWorld == nullptr || !TestWorld->IsGameWorld())
+			{
+				continue;
+			}
+			if (APlayerController* PC = TestWorld->GetFirstPlayerController())
+			{
+				if (ATraceCharacter* Pawn = Cast<ATraceCharacter>(PC->GetPawn()))
+				{
+					return Pawn;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	/** One assertion, printed the moment it is made so a run that aborts still leaves its evidence. */
+	struct FChecklist
+	{
+		int32 Passed = 0;
+		int32 Failed = 0;
+
+		void Check(const TCHAR* What, bool bOk, const FString& Detail)
+		{
+			if (bOk) { ++Passed; } else { ++Failed; }
+			UE_LOG(LogTraceGame, Display, TEXT("[V28] %s  %s  (%s)"),
+				bOk ? TEXT("PASS") : TEXT("**FAIL**"), What, *Detail);
+		}
+	};
+
+	/** Prints every resolved SMG number beside the spec's, and returns the failure count. */
+	int32 DumpAndCheckNumbers(FChecklist& List)
+	{
+		const UTraceSettings& S = UTraceSettings::Get();
+
+		const float SmgInterval = TraceAmmo::GetBaseFireInterval(ETraceEquippedWeapon::Smg);
+		const float PistolInterval = TraceAmmo::GetBaseFireInterval(ETraceEquippedWeapon::Gun);
+
+		UE_LOG(LogTraceGame, Display, TEXT("========== TRACE SMG (spec v28 s9) =========="));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SMG    : %.0f head / %.0f body / %.0f leg | %.4fs = %.0f RPM | clip %d | reload %.3fs"),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Head),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Body),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Legs),
+			SmgInterval, 60.f / FMath::Max(0.0001f, SmgInterval),
+			TraceAmmo::GetClipSize(ETraceEquippedWeapon::Smg),
+			TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Smg));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("PISTOL : %.0f head / %.0f body / %.0f leg | %.4fs = %.0f RPM | clip %d | reload %.3fs   [MUST BE UNCHANGED]"),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Head),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Body),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs),
+			PistolInterval, 60.f / FMath::Max(0.0001f, PistolInterval),
+			TraceAmmo::GetClipSize(ETraceEquippedWeapon::Gun),
+			TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Gun));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("PULLOUT: %.3fs for EVERY weapon — UTraceMeleeSettings::SwapSeconds, the number that already "
+			     "existed. There is no SMG pullout knob and there must never be one (spec v28 s9)."),
+			TraceMelee::GetSwapSeconds());
+		UE_LOG(LogTraceGame, Display,
+			TEXT("TABLE  : SmgFireInterval=%.4f SmgClipSize=%d SmgReloadSeconds=%.3f Smg%s=%.0f/%.0f/%.0f "
+			     "(the ini wins over the header; this is the live value)"),
+			S.SmgFireInterval, S.SmgClipSize, S.SmgReloadSeconds, TEXT("HBL"),
+			S.SmgHeadDamage, S.SmgBodyDamage, S.SmgLegDamage);
+
+		// The owner's six numbers, asserted rather than printed and hoped over.
+		List.Check(TEXT("s9: SMG head damage is 33"),
+			FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Head), 33.f, 0.01f),
+			FString::Printf(TEXT("resolved %.2f"), TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Head)));
+		List.Check(TEXT("s9: SMG body damage is 18"),
+			FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Body), 18.f, 0.01f),
+			FString::Printf(TEXT("resolved %.2f"), TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Body)));
+		List.Check(TEXT("s9: SMG leg damage is 12"),
+			FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Legs), 12.f, 0.01f),
+			FString::Printf(TEXT("resolved %.2f"), TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Legs)));
+		List.Check(TEXT("s9: SMG fire rate is 600 RPM (0.1s between rounds)"),
+			FMath::IsNearlyEqual(SmgInterval, 0.1f, 0.0005f),
+			FString::Printf(TEXT("resolved %.4fs = %.1f RPM"), SmgInterval, 60.f / FMath::Max(0.0001f, SmgInterval)));
+		List.Check(TEXT("s9: SMG clip is 40"),
+			TraceAmmo::GetClipSize(ETraceEquippedWeapon::Smg) == 40,
+			FString::Printf(TEXT("resolved %d"), TraceAmmo::GetClipSize(ETraceEquippedWeapon::Smg)));
+		List.Check(TEXT("s9: SMG reload is 0.8s"),
+			FMath::IsNearlyEqual(TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Smg), 0.8f, 0.001f),
+			FString::Printf(TEXT("resolved %.3fs"), TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Smg)));
+
+		// THE PISTOL MUST NOT HAVE MOVED. A second weapon that quietly retunes the first is the most
+		// likely way this item could ship wrong, and it is invisible without this check.
+		//
+		// *** THE LEG NUMBER IS DELIBERATELY NOT ASSERTED, AND THE REASON IS A FINDING RATHER THAN AN
+		// OMISSION. *** Spec v28 §9's comparison table prints the pistol as 100/40/25, and so does
+		// every comment in this file — but the running game resolves LEG = 30
+		// (UTraceDamageSettings::LegDamage, and the matching key in Config/DefaultGame.ini). That
+		// predates this pass by several specs and belongs to the damage-model slice, so it is
+		// REPORTED, not silently "corrected" here: asserting 25 would fail a build that is behaving
+		// as its own config says, and asserting 30 would bake a number the spec contradicts into a
+		// test. The value is printed on the PISTOL line above so it cannot go unnoticed again.
+		List.Check(TEXT("s9: the PISTOL is untouched — 100 head, 40 body, 0.315789s, 30 rounds, 0.5s"),
+			FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Head), 100.f, 0.01f)
+			&& FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Body), 40.f, 0.01f)
+			&& FMath::IsNearlyEqual(PistolInterval, 0.315789f, 0.0005f)
+			&& TraceAmmo::GetClipSize(ETraceEquippedWeapon::Gun) == 30
+			&& FMath::IsNearlyEqual(TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Gun), 0.5f, 0.001f),
+			FString::Printf(TEXT("%.0f/%.0f/%.0f, %.6fs, %d, %.3fs"),
+				TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Head),
+				TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Body),
+				TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs),
+				PistolInterval, TraceAmmo::GetClipSize(ETraceEquippedWeapon::Gun),
+				TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Gun)));
+
+		return List.Failed;
+	}
+
+	/**
+	 * *** THE STANDING RULE, MEASURED ON A LIVE PAWN. ***
+	 *
+	 * "Per-character fire-rate modifiers must apply to the SMG exactly as they do to the pistol."
+	 * The claim is that UTraceWeaponComponent::GetFireInterval() is (the weapon's base) x (this
+	 * pawn's ability scale) for BOTH weapons — so the check equips each in turn and compares the
+	 * shipped accessor against the two factors multiplied independently.
+	 *
+	 * ON AN ORDINARY PAWN THE SCALE IS 1.0 and the products are trivially equal, which would be a
+	 * test that proves nothing. So it also RE-DERIVES what a Roxie and a stuck Slimeball would get
+	 * from the same seam and prints the resulting RPM: if the SMG's base were ever hardcoded past the
+	 * scale, these two lines are where it would show up as "990 RPM" turning into "600".
+	 */
+	void CheckFireRateSeam(FChecklist& List, const UTraceWeaponComponent& Weapon, ATraceCharacter* Pawn)
+	{
+		const float Scale = UTraceAbilityComponent::GetFireIntervalScaleFor(Pawn);
+		const ETraceEquippedWeapon Now = Weapon.GetEquippedWeapon();
+		const double Expected = static_cast<double>(TraceAmmo::GetBaseFireInterval(Now)) * static_cast<double>(Scale);
+
+		List.Check(TEXT("s9 STANDING RULE: GetFireInterval() == base(weapon in hand) x GetFireIntervalScaleFor(pawn)"),
+			FMath::IsNearlyEqual(Weapon.GetFireInterval(), Expected, 1.0e-6),
+			FString::Printf(TEXT("%s: shipped %.6fs vs base %.6f x scale %.4f = %.6fs"),
+				LexToString(Now), Weapon.GetFireInterval(),
+				TraceAmmo::GetBaseFireInterval(Now), Scale, Expected));
+
+		const float SmgBase = TraceAmmo::GetBaseFireInterval(ETraceEquippedWeapon::Smg);
+		const float RoxieScale = 1.f / FMath::Max(0.01f, UTraceSettings::Get().RoxieModdedFireRateMultiplier);
+		const float SlimeScale = 1.f / (1.f + FMath::Max(0.f, UTraceSettings::Get().SlimeballStuckFireRateBonus));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[V28] the SMG through the SAME seam the pistol uses: base %.0f RPM | Roxie MODDED x%.2f -> %.0f RPM "
+			     "| stuck Slimeball +%.0f%% -> %.0f RPM   (no ability knows a second gun exists)"),
+			60.f / FMath::Max(0.0001f, SmgBase),
+			UTraceSettings::Get().RoxieModdedFireRateMultiplier,
+			60.f / FMath::Max(0.0001f, SmgBase * RoxieScale),
+			100.f * UTraceSettings::Get().SlimeballStuckFireRateBonus,
+			60.f / FMath::Max(0.0001f, SmgBase * SlimeScale));
+	}
+
+	/** State for the staged half — the parts that need a pullout to elapse. */
+	struct FState
+	{
+		int32 Step = 0;
+		double NextStepRealTime = 0.0;
+		FChecklist List;
+
+		/** Rounds deliberately spent out of the SMG's magazine, so the stow can be checked against it. */
+		int32 SmgSpent = 0;
+		int32 PistolBefore = 0;
+
+		/** Sampled every tick: does the melee precedence agree with the HUD's own circle test? */
+		int32 PrecedenceSamples = 0;
+		int32 PrecedenceDisagreements = 0;
+		int32 PullEligibleSamples = 0;
+
+		float MeasuredLockout = -1.f;
+		float LegacyLockout = -1.f;
+
+		FTSTicker::FDelegateHandle Handle;
+
+		void Advance(double NowReal, double Seconds) { NextStepRealTime = NowReal + Seconds; ++Step; }
+	};
+
+	void Report(const TSharedRef<FState>& State)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("========== TRACE WEAPONS v28 — VERDICT =========="));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[V28] melee-vs-pull precedence: %d frames sampled, %d disagreements with ATraceCore::CanPullNow "
+			     "(the HUD's own circle test), %d of them with the circle ELIGIBLE."),
+			State->PrecedenceSamples, State->PrecedenceDisagreements, State->PullEligibleSamples);
+		if (State->PullEligibleSamples == 0)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[V28] NOTE: the pull circle was never eligible during this run, so only the NEGATIVE arm of "
+				     "the precedence (no circle => right mouse melees) was exercised. The positive arm needs a live "
+				     "turnover; stage one with the mode-B fixture and re-run."));
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[V28] %d passed, %d FAILED."), State->List.Passed, State->List.Failed);
+		UE_LOG(LogTraceGame, Display, TEXT("[V28] RESULT: %s"),
+			State->List.Failed == 0 ? TEXT("PASS") : TEXT("*** FAIL ***"));
+		UE_LOG(LogTraceGame, Display, TEXT("================================================"));
+	}
+
+	void Run()
+	{
+		ATraceCharacter* Pawn = FindLocalPawn();
+		UTraceWeaponComponent* Weapon = (Pawn != nullptr) ? Pawn->Weapon.Get() : nullptr;
+		if (Pawn == nullptr || Weapon == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[V28] No local pawn with a weapon component yet. Run this from a live match (the character "
+				     "select screen holds the pawn back for the first few seconds)."));
+			return;
+		}
+		if (!Pawn->HasAuthority())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[V28] SERVER ONLY (a listen host's own pawn counts). The magazine and lockout checks read "
+				     "authoritative state that a client does not own."));
+			return;
+		}
+
+		TSharedRef<FState> State = MakeShared<FState>();
+
+		// --- The half that needs no ticking: every number, plus the switch's own state -------------
+		DumpAndCheckNumbers(State->List);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[V28] dual-wield switch: %s. Selector is %s."),
+			TraceMelee::IsDualWieldEnabled() ? TEXT("ON") : TEXT("OFF (v27 revert)"),
+			LexToString(Weapon->GetEquippedWeapon()));
+
+		State->List.Check(TEXT("s10: the switch is ON in the shipped configuration"),
+			TraceMelee::IsDualWieldEnabled(),
+			TEXT("UTraceMeleeSettings::bDualWieldKnife, via Config/DefaultGame.ini"));
+		State->List.Check(TEXT("s10: the knife pays NO movement bonus while dual-wielded"),
+			!TraceMelee::ShouldUseKnifeMovementProfile(Pawn),
+			TEXT("ShouldUseKnifeMovementProfile(local pawn)"));
+		State->List.Check(TEXT("s10: a blade IS in hand (so right mouse can swing) while a GUN is selected"),
+			TraceMelee::IsKnifeInHand(Pawn) && Weapon->IsFirearmEquipped() && !Weapon->IsKnifeEquipped(),
+			FString::Printf(TEXT("inHand=%d firearm=%d knifeSelected=%d"),
+				TraceMelee::IsKnifeInHand(Pawn) ? 1 : 0, Weapon->IsFirearmEquipped() ? 1 : 0,
+				Weapon->IsKnifeEquipped() ? 1 : 0));
+
+		CheckFireRateSeam(State->List, *Weapon, Pawn);
+
+		State->PistolBefore = Weapon->DebugGetAuthoritativeClipAmmo();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[V28] staged half starting: equip the SMG, spend rounds, swap to the pistol and back, then "
+			     "swing and measure the shooting lockout (green), then again with the switch off (RED)."));
+
+		State->Handle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float /*Delta*/) -> bool
+		{
+			ATraceCharacter* TickPawn = FindLocalPawn();
+			UTraceWeaponComponent* W = (TickPawn != nullptr) ? TickPawn->Weapon.Get() : nullptr;
+			if (TickPawn == nullptr || W == nullptr || !TickPawn->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[V28] ABORTED: the local pawn stopped being usable mid-run."));
+				Report(State);
+				return false;
+			}
+
+			// EVERY FRAME, WHATEVER STEP WE ARE ON: the precedence and the HUD's circle test must be
+			// the same answer. This is the strongest statement available about the "if and only if
+			// they are being shown the circle" rule without staging a turnover — the two are one call
+			// and this samples that they stay one call for the whole run.
+			if (const ATraceCore* Core = ATraceCore::Get(TickPawn->GetWorld()))
+			{
+				const bool bCircle = Core->CanPullNow(TickPawn);
+				const bool bPrecedence = TraceMelee::ShouldCorePullOverrideMelee(TickPawn);
+				++State->PrecedenceSamples;
+				if (bCircle != bPrecedence) { ++State->PrecedenceDisagreements; }
+				if (bCircle) { ++State->PullEligibleSamples; }
+			}
+
+			const double NowReal = FPlatformTime::Seconds();
+			if (NowReal < State->NextStepRealTime)
+			{
+				return true;
+			}
+
+			switch (State->Step)
+			{
+			case 0:
+			{
+				// Through the SHIPPED direct-select verb the "2" key calls, not a poke at the member.
+				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+				const bool bAsked = TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Gun, &Refusal);
+				State->List.Check(TEXT("s10: the \"2\" key (EquipGun) selects the SMG under dual-wield"),
+					bAsked || W->IsSmgEquipped(),
+					FString::Printf(TEXT("asked=%d refusal=%s"), bAsked ? 1 : 0, LexToString(Refusal)));
+				State->Advance(NowReal, TraceMelee::GetSwapSeconds() + 0.25);
+				break;
+			}
+
+			case 1:
+			{
+				State->List.Check(TEXT("s9: the SMG is in hand, with a full 40-round magazine"),
+					W->IsSmgEquipped() && W->DebugGetAuthoritativeClipAmmo() == 40 && W->GetClipSize() == 40,
+					FString::Printf(TEXT("weapon=%s clip=%d/%d reload=%.2fs"),
+						LexToString(W->GetEquippedWeapon()), W->DebugGetAuthoritativeClipAmmo(),
+						W->GetClipSize(), W->GetReloadSeconds()));
+
+				CheckFireRateSeam(State->List, *W, TickPawn);
+
+				// Spend seven rounds through the real consumption path, so the stow has something
+				// distinctive to remember. Seven because it is neither the clip size nor a round
+				// number that could match the pistol's by accident.
+				for (int32 i = 0; i < 7; ++i)
+				{
+					W->DebugConsumeRound();
+				}
+				State->SmgSpent = 7;
+				State->List.Check(TEXT("s9: rounds come out of the SMG's own magazine"),
+					W->DebugGetAuthoritativeClipAmmo() == 33,
+					FString::Printf(TEXT("40 - 7 = %d"), W->DebugGetAuthoritativeClipAmmo()));
+
+				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+				TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Knife, &Refusal);   // the "1" key
+				State->Advance(NowReal, TraceMelee::GetSwapSeconds() + 0.25);
+				break;
+			}
+
+			case 2:
+			{
+				State->List.Check(TEXT("s10: the \"1\" key (EquipKnife) selects the PISTOL under dual-wield"),
+					W->GetEquippedWeapon() == ETraceEquippedWeapon::Gun,
+					FString::Printf(TEXT("weapon=%s"), LexToString(W->GetEquippedWeapon())));
+				State->List.Check(TEXT("s9: the pistol came back with ITS OWN full 30, not the SMG's count"),
+					W->DebugGetAuthoritativeClipAmmo() == 30 && W->GetClipSize() == 30,
+					FString::Printf(TEXT("clip=%d/%d"), W->DebugGetAuthoritativeClipAmmo(), W->GetClipSize()));
+
+				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+				TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Gun, &Refusal);     // back to the SMG
+				State->Advance(NowReal, TraceMelee::GetSwapSeconds() + 0.25);
+				break;
+			}
+
+			case 3:
+			{
+				State->List.Check(TEXT("s9: the SMG remembered the seven rounds it had spent"),
+					W->IsSmgEquipped() && W->DebugGetAuthoritativeClipAmmo() == 40 - State->SmgSpent,
+					FString::Printf(TEXT("expected %d, clip=%d"), 40 - State->SmgSpent,
+						W->DebugGetAuthoritativeClipAmmo()));
+
+				// --- THE MELEE LOCKOUT, GREEN ARM ---------------------------------------------------
+				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+				const bool bSwung = (TraceMelee::HandleMeleeInput(TickPawn, /*bPressed=*/true, &Refusal)
+					== TraceMelee::EMeleeInputResult::Swing);
+				State->List.Check(TEXT("s10: right mouse MELEES when the pull circle is not on screen"),
+					bSwung, FString::Printf(TEXT("refusal=%s"), LexToString(Refusal)));
+
+				State->MeasuredLockout = W->GetShootLockoutRemaining();
+				State->List.Check(TEXT("s10: swinging locks out shooting for the ANIMATION's length"),
+					FMath::IsNearlyEqual(State->MeasuredLockout, TraceMelee::GetSwingAnimSeconds(), 0.06f)
+					&& !W->CanFire(),
+					FString::Printf(TEXT("lockout %.3fs vs SwingAnimSeconds %.3fs, CanFire=%d"),
+						State->MeasuredLockout, TraceMelee::GetSwingAnimSeconds(), W->CanFire() ? 1 : 0));
+
+				// Wait out the animation and a little more, then prove the gate REOPENS. A lockout
+				// that never lifts would pass the check above and be a far worse bug.
+				State->Advance(NowReal, TraceMelee::GetSwingAnimSeconds() + 0.15);
+				break;
+			}
+
+			case 4:
+			{
+				State->List.Check(TEXT("s10: ...and the trigger comes back the moment the animation ends"),
+					W->GetShootLockoutRemaining() <= 0.f,
+					FString::Printf(TEXT("lockout %.3fs after waiting %.3fs"),
+						W->GetShootLockoutRemaining(), TraceMelee::GetSwingAnimSeconds() + 0.15f));
+
+				// --- THE RED ARM. The switch itself. ------------------------------------------------
+				//
+				// With dual-wield off the lockout must measure 0.000s, because the rule does not exist
+				// in the v27 build. If it still measured 0.32 here, the "lockout" would be something
+				// other than the feature under test and the green arm above would prove nothing.
+				if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Knife.DualWield")))
+				{
+					Var->Set(0, ECVF_SetByConsole);
+				}
+				TraceMelee::RequestSwing(TickPawn);   // refused under the legacy rules — a gun is out
+				State->LegacyLockout = W->GetShootLockoutRemaining();
+				State->Advance(NowReal, 0.05);
+				break;
+			}
+
+			default:
+			{
+				State->List.Check(TEXT("s10 RED ARM: with Trace.Knife.DualWield 0 the lockout does not exist"),
+					FMath::IsNearlyZero(State->LegacyLockout, 0.001f) && State->MeasuredLockout > 0.05f,
+					FString::Printf(TEXT("green %.3fs vs red %.3fs"), State->MeasuredLockout, State->LegacyLockout));
+				State->List.Check(TEXT("s10 RED ARM: ...and the knife movement profile comes back with it"),
+					!TraceMelee::IsDualWieldEnabled(),
+					TEXT("the switch really did flip for the red arm"));
+
+				// PUT IT BACK. Every exit path from here restores the shipped value; a harness that
+				// leaves a cvar set is a harness that silently reverts the feature for the rest of
+				// the session.
+				if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Knife.DualWield")))
+				{
+					Var->Set(-1, ECVF_SetByConsole);
+				}
+
+				Report(State);
+				return false;
+			}
+			}
+
+			return true;
+		}), 0.f);
+	}
+}
+
+static FAutoConsoleCommand GTraceSmgDumpCmd(
+	TEXT("Trace.Smg.Dump"),
+	TEXT("Dev only. Spec v28 s9: print the SMG's resolved damage, fire rate (interval AND RPM), clip and "
+	     "reload beside the pistol's, plus the shared pullout time. Reads the running game, not the headers."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		TraceWeaponsV28::FChecklist Ignored;
+		TraceWeaponsV28::DumpAndCheckNumbers(Ignored);
+	}));
+
+static FAutoConsoleCommand GTraceWeaponsV28Cmd(
+	TEXT("Trace.Weapons.V28"),
+	TEXT("Dev only, SERVER. Spec v28 s9+s10: assert every SMG number, prove the per-character fire-rate seam "
+	     "applies to it, swap pistol<->SMG through the shipped 1/2 verbs and prove each gun keeps its own "
+	     "magazine, then swing and measure the shooting lockout against SwingAnimSeconds — with the v28 switch "
+	     "itself as the RED arm."),
+	FConsoleCommandDelegate::CreateStatic(&TraceWeaponsV28::Run));
 
 #endif // !UE_BUILD_SHIPPING

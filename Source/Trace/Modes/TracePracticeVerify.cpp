@@ -1333,9 +1333,22 @@ namespace TracePracticeVerify
 				return true;
 			}
 
-			Run->bKnifeEquipped = Weapon->IsKnifeEquipped();
+			// *** SPEC v28 §10 INTEGRATION — ASK "IS THERE A BLADE IN HAND", NOT "IS THE SELECTOR ON
+			// THE KNIFE". *** This read Weapon->IsKnifeEquipped(), i.e. the weapon SELECTOR. Under
+			// §10's dual wield the knife is permanently in the off hand and the selector never sits
+			// on it at all, so RequestEquip(Knife) above is a successful no-op and IsKnifeEquipped()
+			// is correctly false - this assertion would have failed a build behaving exactly as §10
+			// specifies. TraceMelee::IsKnifeInHand() is the question this step actually means ("is
+			// there a blade available to swing") and it is TRUE under BOTH positions of the
+			// bDualWieldKnife switch, so this harness measures the backstab under either.
+			//
+			// The §10 owner found this and reported it rather than reaching into another slice's
+			// harness; this is that one line. The stab itself, and every assertion below it, is
+			// untouched - the swing path does not care which hand holds the blade.
+			Run->bKnifeEquipped = TraceMelee::IsKnifeInHand(PlayerPawn);
 			Run->Tally.Report(Run->bKnifeEquipped, TEXT("KNIFEBACK"),
-				TEXT("the player is holding the KNIFE (the swap is the shipped RequestEquip)."));
+				TEXT("the player has the KNIFE IN HAND and can swing it (true whether the knife is the "
+				     "selected weapon, as before spec v28 §10, or permanently in the off hand, as after)."));
 
 			// *** THE RED ARM. *** Armed, the "back" stab is delivered from the victim's FACE while
 			// every assertion below still asks for a back-stab.

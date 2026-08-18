@@ -199,6 +199,14 @@ public:
 	 *         the current page carries that label.
 	 */
 	bool DebugGetRowRect(const TCHAR* Label, FBox2D& OutRect) const;
+
+	/**
+	 * SPEC v28 §3a — starts the press-counting proof on this overlay. See TickRebindProof.
+	 *
+	 * Public only so the Trace.Keys.RebindProof console command and the -TraceRebindProof launch flag
+	 * can reach it, exactly as DebugNudge is public for Trace.Menu.Nudge.
+	 */
+	void DebugBeginRebindProof();
 #endif
 
 private:
@@ -224,6 +232,40 @@ private:
 	/** Drawn frames since the overlay opened. Reset by every Open*(). */
 	int32 DrawsSinceOpen = 0;
 	bool bAutoActivateDone = false;
+
+	// ---- SPEC v28 §3a — the press-counting harness ----------------------------------------------
+	//
+	// See TickRebindProof. All of this is dev-only and inert until the console command or the launch
+	// flag arms it.
+
+	enum class ERebindProofStage : uint8
+	{
+		Idle = 0,
+		/** Waiting for the settings page to exist and to have been DRAWN at least once. */
+		WaitForPage,
+		/** Injecting complete LMB down/up pairs on the row until the capture opens. */
+		ClickRow,
+		/** Injecting complete key down/up pairs until the binding actually changes. */
+		PressKey,
+		Report,
+	};
+
+	ERebindProofStage RebindProofStage = ERebindProofStage::Idle;
+	/** Drawn frames left before the harness takes its next action. Every edge gets its own frame. */
+	int32 RebindProofWait = 0;
+	int32 RebindProofSubStep = 0;
+	int32 RebindProofClicks = 0;
+	int32 RebindProofPresses = 0;
+	int32 RebindProofClicksNeeded = 0;
+	int32 RebindProofPressesNeeded = 0;
+	/** Which action and slot the run is rebinding, and what it is putting there. */
+	ETraceInputAction RebindProofAction = ETraceInputAction::Count;
+	int32 RebindProofSlot = 0;
+	/** Every slot of every action as it was before the run, put back by the Report stage. */
+	TArray<FKey> RebindProofBefore;
+
+	/** `-TraceRebindProof=<draws>` arms once per process, never once per page opening. */
+	bool bRebindProofArmedFromCommandLine = false;
 #endif
 
 private:
@@ -377,6 +419,15 @@ private:
 		/** Screen rect of a slider's track. Click and drag map the cursor's X across this. */
 		FBox2D Track = FBox2D(ForceInit);
 
+		/**
+		 * SPEC v28 §3c — screen rect of each key chip on a Binding row, as of the last draw.
+		 *
+		 * "Both editable in the settings page" is a HIT TEST as much as it is a data model: with two
+		 * chips on one row, a click has to be able to say WHICH of them the player meant. Written by
+		 * DrawRow, read by PollMouse, invalid on every row that is not a Binding.
+		 */
+		FBox2D KeyChip[UTraceUserSettings::MaxKeysPerAction] = { FBox2D(ForceInit), FBox2D(ForceInit) };
+
 		bool IsSelectable() const
 		{
 			return Kind != ERowKind::Header && Kind != ERowKind::Note && bEnabled;
@@ -404,6 +455,27 @@ private:
 	void PollNavigation(APlayerController* PC);
 	void PollMouse(APlayerController* PC);
 	void PollKeyCapture(APlayerController* PC);
+
+	/** The slot a Binding row is currently editing, clamped to the row and to MaxKeysPerAction. */
+	int32 ActiveBindingSlot() const;
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * SPEC v28 §3a — `Trace.Keys.RebindProof`, and the reason it drives the menu from Tick().
+	 *
+	 * The claim is "ONE press binds a key", and the only honest way to count presses is to make them
+	 * REAL: this parks the OS cursor on a real row, injects mouse and key edges through
+	 * UGameViewportClient::InputKey — the same call FSceneViewport makes for a physical device — and
+	 * then asks the SETTINGS OBJECT what it holds. It never touches bCapturingKey, SetKey or
+	 * ActivateSelected directly, because a harness that reached past the input path would pass on a
+	 * build where the input path is exactly what is broken.
+	 *
+	 * DRIVEN FROM Tick AND NOT FROM A TIMER, which is the part the pause menu forces: the in-match
+	 * overlay stops the world, so every world timer freezes the instant it opens. Drawn frames are
+	 * the only clock that still runs, and they are also the clock the menu's own polling runs on.
+	 */
+	void TickRebindProof(APlayerController* PC);
+#endif
 
 	/** Moves the selection by @p Delta, skipping headers and clamping at both ends. */
 	void MoveSelection(int32 Delta);
@@ -535,9 +607,66 @@ private:
 	 */
 	EPage VideoReturnPage = EPage::Settings;
 
+	// ---- SPEC v28 §3a — THE SWALLOWED FIRST PRESS -----------------------------------------------
+	//
+	// *** THIS IS THE "REBINDING NEEDS TWO PRESSES" BUG, AND IT IS NOT IN THIS CLASS'S LOGIC. ***
+	//
+	// FSceneViewport::OnMouseButtonDown does not forward every press to the game. Its rule is
+	//
+	//     bTemporaryCapture    = captureMode == CaptureDuringMouseDown (or the RMB variant)
+	//     bProcessInputPrimary = !IsCurrentlyGameViewport() || HasMouseCapture()
+	//                            || captureMode == CapturePermanently_IncludingInitialMouseDown
+	//     if (bTemporaryCapture || bProcessInputPrimary) -> ViewportClient->InputKey(IE_Pressed)
+	//
+	// while the RELEASE is forwarded unconditionally. The TITLE SCREEN sets
+	// EMouseCaptureMode::NoCapture on purpose (ATraceMenuPlayerController::BeginPlay, to kill the
+	// stray "initial mouse down" the old CapturePermanently_IncludingInitialMouseDown replayed), so
+	// none of those three terms is true and the FIRST press a player makes is dropped on the floor.
+	//
+	// MEASURED, Trace.Keys.RebindProof, one binary, two hosts:
+	//     title screen      click 1: "will NOT forward ... captureMode=0 hasMouseCapture=0"
+	//                       -> five complete clicks on a keybind chip, capture never opened
+	//     in-match pause    click 1: "WILL forward ... captureMode=3" -> 1 click, 1 press, bound
+	// The in-match host differs by exactly one thing: FInputModeGameAndUI sets CaptureDuringMouseDown
+	// there, so the press survives. That is the whole defect.
+	//
+	// THE FIX IS TO STOP SWALLOWING PRESSES WHILE THE OVERLAY IS UP, and to put the viewport back
+	// exactly as it was when it closes. CaptureDuringMouseDown is the mode the in-match host already
+	// proves correct and is NOT the mode whose exit replayed the stray click, so nothing spec v15 §4
+	// fixed comes back. Restoring the previous value rather than assuming NoCapture is what keeps this
+	// honest on a host that never had the problem.
+
+	/** Set while this overlay has raised the viewport's capture mode. Drives the restore on close. */
+	bool bMouseCaptureModeOverridden = false;
+
+	/** Whatever the viewport was in before the overlay raised it. Put back verbatim by Close(). */
+	uint8 PreviousMouseCaptureMode = 0;
+
+	/**
+	 * Raises the viewport's capture mode so a press is delivered, or puts it back.
+	 *
+	 * A no-op when the viewport would already forward a press — which is every in-match opening — so
+	 * the pause menu's input mode is never fought over.
+	 */
+	void SetPressDeliveryOverride(bool bEnable);
+
 	/** Waiting for the next key press to become a binding. */
 	bool bCapturingKey = false;
 	ETraceInputAction CapturingAction = ETraceInputAction::Count;
+
+	/** SPEC v28 §3c — which of the action's two slots the pending capture will write. */
+	int32 CapturingSlot = 0;
+
+	/**
+	 * SPEC v28 §3c — which key chip the selection is on, for the Binding row under `Selected`.
+	 *
+	 * Kept as ONE member rather than per-row state, and reset by MoveSelection, because it is the
+	 * cursor's column and not a property of the row: walking away from a row and back must not
+	 * remember that the player was editing its second bind three rows ago. LEFT/RIGHT move it (a
+	 * Binding row has no other use for the horizontal axis) and a click sets it from the chip that
+	 * was actually hit.
+	 */
+	int32 SelectedBindingSlot = 0;
 
 	/**
 	 * Frame number before which no input is read.
@@ -548,6 +677,20 @@ private:
 	 * close the menu, and Enter would bind itself to whatever row the player was on.
 	 */
 	uint64 IgnoreInputBeforeFrame = 0;
+
+	/**
+	 * Bindable keys that were ALREADY HELD when the rebind capture opened.
+	 *
+	 * A single-frame IgnoreInputBeforeFrame is not enough on its own. In the in-match pause menu the
+	 * viewport runs a different mouse-capture mode, so the click that opens a capture can still be
+	 * physically down several frames later — and a key that was down before the capture existed was
+	 * never a choice the player made inside it. Anything in here is refused until it is seen RELEASED
+	 * at least once, which turns "whatever happened to be down" into "the next key you actually press".
+	 */
+	TArray<FKey> KeysHeldWhenCaptureOpened;
+
+	/** Set when a capture opens; the first poll that has a PlayerController fills the list above. */
+	bool bCaptureNeedsHeldSnapshot = false;
 
 	/** Cached per-frame view metrics, set at the top of Tick. */
 	float ViewW = 0.f;

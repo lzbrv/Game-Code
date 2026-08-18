@@ -44,7 +44,13 @@
 #include "Audio/TraceAudio.h"
 #include "Audio/TraceSoundBank.h"
 #include "Audio/TraceSoundEvents.h"
+// SPEC v28 §2 — Trace.Audio.TurnoverArm drives the SHIPPING rules, not the audio API: the Core's own
+// drop, the Core's own grant, and the health component's own death. See the block by CmdTurnoverArm.
+#include "Core/TraceCharacter.h"
+#include "Gameplay/TraceCore.h"
+#include "Gameplay/TraceHealthComponent.h"
 #include "Trace.h"
+#include "TraceTypes.h"
 
 // Named after the file. Two anonymous namespaces in one unity translation unit are one namespace —
 // see Scripts/check-jumbo-build-collisions.py and the four Windows-only breaks it exists to stop.
@@ -476,4 +482,345 @@ namespace TraceAudioVerify
 		TEXT("Spec v26 s9. Drops the resolved-sound cache so a freshly re-imported WAV is picked up ")
 		TEXT("without relaunching the game."),
 		FConsoleCommandDelegate::CreateStatic(&Reload));
+
+	// =============================================================================================
+	// Trace.Audio.TurnoverArm — SPEC v28 §2's RED ARM, AND IT MEASURES ITS OWN RULE
+	// =============================================================================================
+	//
+	//   "The core turnover sound should play globally when the core is dropped by a team or a carrier
+	//    is killed (a turnover), NOT when a team picks up a core which was locked out."
+	//
+	// The spec's instruction is "force a turnover and hear it once; then pick the Core up and hear
+	// nothing", and a harness that only counted the first half would pass on a build that played the
+	// sound on every event in the game. So this drives FOUR moments and asserts a count for each:
+	//
+	//   A  the carrier DROPS it (throws)                  CoreTurnover must go up by exactly 1
+	//   B  the thrown Core lands and the lockout opens     ... by exactly 0   <- the OLD trigger
+	//   C  somebody PICKS THE CORE UP afterwards           ... by exactly 0   <- the owner's "NOT"
+	//   D  the carrier is KILLED                           ... by exactly 1   <- new in v28
+	//
+	// THE ARM IS Trace.Audio.TurnoverEdge, AND THE TWO ARMS DISAGREE ON THREE OF THE FOUR ROWS. At
+	// edge 0 (pre-v28) A is 0, B is 1 and D is 0, so this harness goes red — which is what makes a
+	// green run at edge 1 evidence rather than an assertion. C is 0 in both arms, and that is stated
+	// rather than hidden: the pickup never made a sound, so the "NOT" half of the sentence is a
+	// regression guard, not a fix.
+	//
+	// It reads UTraceAudioSubsystem::GetPlaysByEvent(), which is bumped inside PlayLocalNow /
+	// PlayWorldNow — i.e. AFTER the side gate, the settings gate, the device test and the resolve. A
+	// row that moves means a real trigger handed a real sound to the engine on this machine.
+	//
+	// RUN IT WITHOUT -nosound. With -nosound nothing reaches the engine, every row reads 0, and the
+	// verdict is a FAIL that says so.
+	//
+	//     "$UE" "$PWD/Trace.uproject" \
+	//         "/Game/Maps/Arena_Baked?game=/Script/Trace.TracePracticeGameMode" \
+	//         -game -windowed -ResX=1280 -ResY=720 -LogCmds="LogTraceGame Verbose" \
+	//         -TraceExec="Trace.Audio.TurnoverArm" -TraceExecAt=10 -TraceExecOn=Match
+
+	/**
+	 * Which arm is live, read off the console rather than from a copy.
+	 *
+	 * Trace.Audio.TurnoverEdge is declared in Gameplay/TraceCore.cpp, next to the rule it switches. It
+	 * is looked up by NAME here instead of being re-declared: two TAutoConsoleVariables with the same
+	 * name is a registration warning and, worse, a second default that can silently disagree with the
+	 * first. -1 means "the CVar is not registered", which would mean the Core slice is not in this
+	 * build at all.
+	 */
+	static int32 TraceAudioTurnoverEdgeValue()
+	{
+		if (const IConsoleVariable* CVar =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Audio.TurnoverEdge")))
+		{
+			return CVar->GetInt();
+		}
+		return -1;
+	}
+
+	/** One asserted moment. */
+	struct FTurnoverArmStep
+	{
+		const TCHAR* Label = TEXT("");
+		int32 Expected = 0;
+		int32 Observed = -1;
+		bool  bRun = false;
+	};
+
+	struct FTurnoverArmRun
+	{
+		TWeakObjectPtr<UWorld> World;
+		FTSTicker::FDelegateHandle Handle;
+		double StartTime = 0.0;
+		int32 Stage = 0;
+		int32 Baseline = 0;
+		bool bFinished = false;
+		bool bAborted = false;
+		FTurnoverArmStep Steps[4];
+	};
+
+	static TSharedPtr<FTurnoverArmRun> GTurnoverArm;
+
+	/** How many CoreTurnover plays have reached the engine on this machine so far. */
+	static int32 TurnoverPlays(UWorld* World)
+	{
+		if (const UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(World))
+		{
+			if (const int32* Found = Audio->GetPlaysByEvent().Find(TraceSoundEvents::CoreTurnover))
+			{
+				return *Found;
+			}
+		}
+		return 0;
+	}
+
+	static ATraceCharacter* ArmPawn(UWorld* World)
+	{
+		APlayerController* PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+		return (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+	}
+
+	/** Closes the step that was open, recording what actually happened between then and now. */
+	static void CloseStep(FTurnoverArmRun& Run, int32 Index, int32 NowCount)
+	{
+		if (Index >= 0 && Index < UE_ARRAY_COUNT(Run.Steps))
+		{
+			Run.Steps[Index].Observed = NowCount - Run.Baseline;
+			Run.Steps[Index].bRun = true;
+
+			const FTurnoverArmStep& Step = Run.Steps[Index];
+			if (Step.Observed == Step.Expected)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[TurnoverArm]   OK    %-46s expected %d, heard %d"),
+					Step.Label, Step.Expected, Step.Observed);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[TurnoverArm]   WRONG %-46s expected %d, heard %d"),
+					Step.Label, Step.Expected, Step.Observed);
+			}
+		}
+		Run.Baseline = NowCount;
+	}
+
+	static bool TurnoverArmTick(float /*Delta*/)
+	{
+		TSharedPtr<FTurnoverArmRun> Run = GTurnoverArm;
+		if (!Run.IsValid() || Run->bFinished)
+		{
+			return false;
+		}
+
+		UWorld* World = Run->World.Get();
+		ATraceCore* Core = (World != nullptr) ? ATraceCore::Get(World) : nullptr;
+		ATraceCharacter* Pawn = ArmPawn(World);
+
+		if (World == nullptr || Core == nullptr || !IsValid(Pawn) || !Core->HasAuthority())
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[TurnoverArm] ABORTED: world/core/pawn/authority went away mid-run. Nothing is "
+				     "claimed about the rule."));
+			Run->bFinished = true;
+			Run->bAborted = true;
+			GTurnoverArm.Reset();
+			return false;
+		}
+
+		const double Elapsed = FPlatformTime::Seconds() - Run->StartTime;
+		const int32 Now = TurnoverPlays(World);
+
+		switch (Run->Stage)
+		{
+		case 0:
+			// SETUP. Put the Core in the local pawn's hands. This plays CorePickup, never CoreTurnover.
+			if (Elapsed < 0.2) { return true; }
+			Core->GrantTo(Pawn, ETraceCoreGrantReason::Debug);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TurnoverArm] setup: Core granted to %s. edge=%d (1 = spec v28 §2, 0 = the pre-v28 "
+				     "red arm). CoreTurnover plays so far: %d."),
+				*GetNameSafe(Pawn), TraceAudioTurnoverEdgeValue(), Now);
+			Run->Baseline = TurnoverPlays(World);
+			++Run->Stage;
+			return true;
+
+		case 1:
+			// A — THE DROP. ThrowFromHolder is the shipping drop: it is the exact function
+			// RequestPassInput's release branch calls one line further in, so this is the player's own
+			// path minus the key and the RPC. -1 means "full charge", which keeps the throw comparable
+			// with every other diagnostic in the project.
+			if (Elapsed < 1.2) { return true; }
+			if (!IsValid(Core->GetCarrier()))
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[TurnoverArm] the grant did not stick (the practice range's Core RACK takes it "
+					     "back). Re-granting and waiting."));
+				Core->GrantTo(Pawn, ETraceCoreGrantReason::Debug);
+				return true;
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[TurnoverArm] A: the carrier DROPS the Core (throws it)."));
+			Core->ThrowFromHolder(Pawn, -1.f);
+			++Run->Stage;
+			return true;
+
+		case 2:
+			// Close A a beat after the throw so the multicast has been dispatched and counted.
+			if (Elapsed < 1.6) { return true; }
+			CloseStep(*Run, 0, Now);
+			++Run->Stage;
+			return true;
+
+		case 3:
+			// B — THE LANDING. Long enough for the Core to fly, land, settle and register the turnover.
+			// This is the edge the sound used to be on, and it must now be silent.
+			if (Elapsed < 5.2) { return true; }
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TurnoverArm] B: the throw has landed. turnover window active=%d, %.2fs left - the "
+				     "lockout HAS opened, so a sound here would be the pre-v28 edge."),
+				Core->IsTurnoverActive() ? 1 : 0, Core->GetTurnoverSecondsRemaining());
+			CloseStep(*Run, 1, Now);
+			++Run->Stage;
+			return true;
+
+		case 4:
+			// C — THE PICKUP. "NOT when a team picks up a core which was locked out."
+			if (Elapsed < 5.6) { return true; }
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TurnoverArm] C: somebody PICKS THE CORE UP off the ground."));
+			Core->GrantTo(Pawn, ETraceCoreGrantReason::Debug);
+			++Run->Stage;
+			return true;
+
+		case 5:
+			if (Elapsed < 6.4) { return true; }
+			CloseStep(*Run, 2, Now);
+			++Run->Stage;
+			return true;
+
+		case 6:
+		{
+			// D — THE KILL. The real death path: UTraceHealthComponent::Kill fires OnDeath, which is
+			// what ATraceGameMode::NotifyCharacterDied (-> DropAt) and ATraceCore::OnHolderDeath both
+			// listen to. Two handlers, one death, and the de-dup in AnnounceTurnoverSound is what makes
+			// the expected answer 1 rather than 2 — so this row also tests the de-dup.
+			if (Elapsed < 6.8) { return true; }
+			if (!IsValid(Core->GetCarrier()))
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[TurnoverArm] nobody is carrying the Core before the kill step; re-granting."));
+				Core->GrantTo(Pawn, ETraceCoreGrantReason::Debug);
+				return true;
+			}
+			ATraceCharacter* Victim = Core->GetCarrier();
+			UE_LOG(LogTraceGame, Display, TEXT("[TurnoverArm] D: the CARRIER (%s) is KILLED."),
+				*GetNameSafe(Victim));
+			if (UTraceHealthComponent* Health = Victim->Health)
+			{
+				Health->Kill(nullptr, TEXT("Trace.Audio.TurnoverArm"));
+			}
+			++Run->Stage;
+			return true;
+		}
+
+		case 7:
+			if (Elapsed < 7.6) { return true; }
+			CloseStep(*Run, 3, Now);
+			++Run->Stage;
+			return true;
+
+		default:
+			break;
+		}
+
+		// ---- VERDICT --------------------------------------------------------------------------
+		int32 Correct = 0;
+		for (const FTurnoverArmStep& Step : Run->Steps)
+		{
+			Correct += (Step.bRun && Step.Observed == Step.Expected) ? 1 : 0;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TurnoverArm] ---- spec v28 §2: which EVENT the CoreTurnover sound belongs to ----"));
+		for (const FTurnoverArmStep& Step : Run->Steps)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[TurnoverArm]   %-46s expected %d  heard %d"),
+				Step.Label, Step.Expected, Step.bRun ? Step.Observed : -1);
+		}
+
+		if (Correct == UE_ARRAY_COUNT(Run->Steps))
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("TRACE TURNOVER ARM VERDICT: PASS - %d of %d moments sounded exactly as spec v28 §2 "
+				     "asks (edge=%d)."),
+				Correct, static_cast<int32>(UE_ARRAY_COUNT(Run->Steps)), TraceAudioTurnoverEdgeValue());
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("TRACE TURNOVER ARM VERDICT: FAIL - %d of %d moments sounded as spec v28 §2 asks "
+				     "(edge=%d). At edge 0 this SHOULD fail; that is the red arm."),
+				Correct, static_cast<int32>(UE_ARRAY_COUNT(Run->Steps)), TraceAudioTurnoverEdgeValue());
+		}
+
+		Run->bFinished = true;
+		GTurnoverArm.Reset();
+		return false;
+	}
+
+	static void TurnoverArm()
+	{
+		UWorld* World = PlayableWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[TurnoverArm] no game world."));
+			return;
+		}
+
+		ATraceCore* Core = ATraceCore::Get(World);
+		if (Core == nullptr || !Core->HasAuthority())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[TurnoverArm] no Core, or this machine is not the server. Run it on the host: the "
+				     "sound is game-side and only the authority may announce it."));
+			return;
+		}
+		if (!Core->IsModeB())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[TurnoverArm] this match is not in goals mode. There is no drop and no turnover in "
+				     "mode A, so there is nothing here to measure."));
+			return;
+		}
+		if (GTurnoverArm.IsValid() && !GTurnoverArm->bFinished)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[TurnoverArm] a run is already in progress."));
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("================ Trace.Audio.TurnoverArm (spec v28 s2) ================"));
+		if (World->GetAudioDeviceRaw() == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[TurnoverArm] NO AUDIO DEVICE (-nosound, or a dedicated server). Every row will "
+				     "read 0 and the verdict will FAIL - that is the harness's own red arm, not a "
+				     "statement about the rule. Relaunch without -nosound."));
+		}
+
+		TSharedPtr<FTurnoverArmRun> Run = MakeShared<FTurnoverArmRun>();
+		Run->World = World;
+		Run->StartTime = FPlatformTime::Seconds();
+		Run->Steps[0] = { TEXT("A  the carrier DROPS the Core (throws it)"),      1, -1, false };
+		Run->Steps[1] = { TEXT("B  the throw LANDS and the lockout opens"),       0, -1, false };
+		Run->Steps[2] = { TEXT("C  somebody PICKS THE CORE UP afterwards"),       0, -1, false };
+		Run->Steps[3] = { TEXT("D  the CARRIER IS KILLED"),                       1, -1, false };
+		GTurnoverArm = Run;
+
+		Run->Handle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateStatic(&TurnoverArmTick), 0.f);
+	}
+
+	FAutoConsoleCommand CmdTurnoverArm(
+		TEXT("Trace.Audio.TurnoverArm"),
+		TEXT("SPEC v28 s2. Drives four moments - the drop, the landing, the pickup and a carrier's ")
+		TEXT("death - and asserts how many times the CoreTurnover sound reached the engine at each. ")
+		TEXT("Set Trace.Audio.TurnoverEdge 0 first for the RED arm, which must FAIL."),
+		FConsoleCommandDelegate::CreateStatic(&TurnoverArm));
 }

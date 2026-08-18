@@ -11,6 +11,8 @@
 #include "HAL/IConsoleManager.h"
 #include "Math/NumericLimits.h"                  // TNumericLimits<double>
 #include "Math/UnrealMathUtility.h"
+#include "Misc/CommandLine.h"                    // spec v28 §10: -TraceLegacyKnife
+#include "Misc/Parse.h"
 
 #include "Core/TraceCharacter.h"
 #include "Gameplay/TraceCore.h"                  // IsCoreHolder — the carrier immunity
@@ -64,6 +66,21 @@ static TAutoConsoleVariable<int32> CVarKnifeBotAuto(
 static TAutoConsoleVariable<int32> CVarKnifeDebug(
 	TEXT("Trace.Knife.Debug"), 0,
 	TEXT("1: log every swap, every swing and every resolution (attacker, victim, approach angle, damage)."),
+	ECVF_Default);
+
+/**
+ * [DUALWIELD] THE CVAR HALF OF THE SPEC v28 §10 REVERT SWITCH. -1 defers to the setting.
+ *
+ * Not a bare 0/1 default like Trace.Knife.BotAuto, because a cvar with a real default is a SECOND
+ * definition of the shipped value: whoever changed UTraceMeleeSettings::bDualWieldKnife and not this
+ * line would have changed nothing. The negative sentinel is the same "defer to the setting" contract
+ * every other override in this file uses, so there is exactly one place the shipped answer lives.
+ */
+static TAutoConsoleVariable<int32> CVarKnifeDualWield(
+	TEXT("Trace.Knife.DualWield"), -1,
+	TEXT("Spec v28 §10. -1 (shipped): defer to UTraceMeleeSettings::bDualWieldKnife. 1: knife always in "
+	     "the off hand, melee on its own bind, guns-only weapon switching. 0: the v27 knife-as-a-separate-"
+	     "weapon behaviour. See the switch's full contract on UTraceMeleeSettings::bDualWieldKnife."),
 	ECVF_Default);
 
 /**
@@ -130,7 +147,13 @@ FName UTraceMeleeSettings::GetCategoryName() const
 
 const TCHAR* LexToString(ETraceEquippedWeapon Weapon)
 {
-	return (Weapon == ETraceEquippedWeapon::Knife) ? TEXT("KNIFE") : TEXT("GUN");
+	switch (Weapon)
+	{
+	case ETraceEquippedWeapon::Knife: return TEXT("KNIFE");
+	case ETraceEquippedWeapon::Smg:   return TEXT("SMG");
+	case ETraceEquippedWeapon::Gun:
+	default:                          return TEXT("PISTOL");
+	}
 }
 
 const TCHAR* LexToString(ETraceMeleeRefusal Refusal)
@@ -270,6 +293,35 @@ bool TraceMelee::IsBotAutoKnifeEnabled()
 bool TraceMelee::IsDebugLoggingEnabled()
 {
 	return CVarKnifeDebug.GetValueOnAnyThread() != 0;
+}
+
+// =================================================================================================
+// [DUALWIELD] THE SPEC v28 §10 SWITCH, RESOLVED ONCE. Everything else in this pass reads this.
+// =================================================================================================
+
+bool TraceMelee::IsDualWieldEnabled()
+{
+	// THE LAUNCH FLAG, SAMPLED ONCE. FParse::Param walks the whole command line, and this is asked
+	// from CanFire()/CanSwing() — i.e. potentially several times per pawn per frame across ten bots.
+	// A function-local static is initialised exactly once and is thread-safe by the standard; the
+	// command line cannot change after launch, so caching it loses nothing.
+	//
+	// `-TraceLegacyKnife` and not `-TraceDualWield=0`, because a bare param is what every other
+	// harness switch in this project uses and it cannot be typo'd into a silent no-op the way a
+	// `=value` form can.
+	static const bool bLegacyFlag = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyKnife"));
+	if (bLegacyFlag)
+	{
+		return false;
+	}
+
+	const int32 Override = CVarKnifeDualWield.GetValueOnAnyThread();
+	if (Override >= 0)
+	{
+		return Override != 0;
+	}
+
+	return UTraceMeleeSettings::Get().bDualWieldKnife;
 }
 
 FName TraceMelee::GetBackstabKillCause()
@@ -509,8 +561,50 @@ bool TraceMelee::IsKnifeEquipped(const AActor* Character)
 	return (Weapon != nullptr) && Weapon->GetEquippedWeapon() == ETraceEquippedWeapon::Knife;
 }
 
+bool TraceMelee::IsKnifeInHand(const AActor* Character)
+{
+	// [DUALWIELD] The blade is in the off hand of every living pawn, so "is a blade available" stops
+	// being a question about the SELECTOR and becomes a question about being alive. The weapon
+	// component still owns the rest of the answer (dead, carrying, deploying, on cooldown) — this is
+	// only the "do you have one" half, which is what CanSwing() was using IsKnifeEquipped() for.
+	if (IsDualWieldEnabled())
+	{
+		const ATraceCharacter* TraceChar = Cast<ATraceCharacter>(Character);
+		return TraceChar != nullptr && TraceChar->IsAlive();
+	}
+
+	return IsKnifeEquipped(Character);
+}
+
+float TraceMelee::GetShootLockoutRemaining(const AActor* Character)
+{
+	const UTraceWeaponComponent* Weapon = WeaponOf(Character);
+	return (Weapon != nullptr) ? Weapon->GetShootLockoutRemaining() : 0.f;
+}
+
 bool TraceMelee::ShouldUseKnifeMovementProfile(const AActor* Character)
 {
+	// =============================================================================================
+	// [DUALWIELD] *** THE SINGLE MOST IMPORTANT CONSEQUENCE OF THE v28 §10 SWITCH. ***
+	// =============================================================================================
+	//
+	// The knife's +22% ground speed and its two raised air-strafe ceilings (spec v12 §3) were the
+	// reward for holding a weapon that CANNOT SHOOT. That trade is the whole design of the mechanic:
+	// you give up your gun to move like that.
+	//
+	// Under dual-wield nobody gives up anything — the blade is simply always there — so paying the
+	// bonus would hand every player in the match a permanent free 22% and silently retire
+	// CarrierSpeedMultiplier (1.30), the trail-dash geometry, and every movement number that was
+	// measured against a 1.0 baseline. Spec v28 §10 asks for a weapon change, not a movement
+	// rebalance, so the profile is OFF for the whole of dual-wield.
+	//
+	// Flipping bDualWieldKnife back to false restores the v12 §3 behaviour exactly, because the two
+	// lines below this one are untouched.
+	if (IsDualWieldEnabled())
+	{
+		return false;
+	}
+
 	if (!IsKnifeEquipped(Character))
 	{
 		return false;
@@ -549,9 +643,22 @@ bool TraceMelee::RequestSwapWeapon(ATraceCharacter* Pawn, ETraceMeleeRefusal* Ou
 		return false;
 	}
 
-	const ETraceEquippedWeapon Desired = (Weapon->GetEquippedWeapon() == ETraceEquippedWeapon::Gun)
-		? ETraceEquippedWeapon::Knife
-		: ETraceEquippedWeapon::Gun;
+	// [DUALWIELD] "the other one" means the other GUN now (spec v28 §10: "you no longer have to swap
+	// between knife and gun, just the different guns"). The knife is not a member of the cycle.
+	const ETraceEquippedWeapon Current = Weapon->GetEquippedWeapon();
+	ETraceEquippedWeapon Desired;
+	if (TraceMelee::IsDualWieldEnabled())
+	{
+		Desired = (Current == ETraceEquippedWeapon::Smg)
+			? ETraceEquippedWeapon::Gun
+			: ETraceEquippedWeapon::Smg;
+	}
+	else
+	{
+		Desired = (Current == ETraceEquippedWeapon::Gun)
+			? ETraceEquippedWeapon::Knife
+			: ETraceEquippedWeapon::Gun;
+	}
 
 	return Weapon->RequestEquip(Desired, OutRefusal);
 }
@@ -575,6 +682,25 @@ bool TraceMelee::RequestEquipIfDifferent(ATraceCharacter* Pawn, ETraceEquippedWe
 		if (OutRefusal != nullptr) { *OutRefusal = ETraceMeleeRefusal::NoPawn; }
 		return false;
 	}
+
+	// [DUALWIELD] THE 1/2 SLOT REMAP — the only place it happens. See the header for the table and
+	// for the stale-label hand-off to spec v28 §3. The keys keep their action ids so nobody loses a
+	// saved bind; only what the slot NAMES moves.
+	if (TraceMelee::IsDualWieldEnabled())
+	{
+		switch (Desired)
+		{
+		case ETraceEquippedWeapon::Knife:                  // key 1
+			Desired = ETraceEquippedWeapon::Gun;           //   -> the pistol
+			break;
+		case ETraceEquippedWeapon::Gun:                    // key 2
+			Desired = ETraceEquippedWeapon::Smg;           //   -> the SMG
+			break;
+		default:
+			break;                                          // an explicit Smg request is already a slot
+		}
+	}
+
 	return Weapon->RequestEquipIfDifferent(Desired, OutRefusal);
 }
 
@@ -587,6 +713,115 @@ bool TraceMelee::RequestSwing(ATraceCharacter* Pawn, ETraceMeleeRefusal* OutRefu
 		return false;
 	}
 	return Weapon->StartSwing(OutRefusal);
+}
+
+// =================================================================================================
+// THE MELEE BIND  (spec v28 §10)
+//
+// *** THE PRECEDENCE RULE IS A STATE TEST AND NOT A BLANKET PRECEDENCE, WHICH IS THE OWNER'S OWN
+// WORDING: "If and only if a player is looking at a pullable core, AND BEING SHOWN THE CIRCLE ICON
+// to pull, this keybind should override the melee keybind." ***
+//
+// So the question is not "does a pullable Core exist" and not "is this player on the pulling team".
+// It is the single question the HUD asks before it draws the ring, and it is asked by calling the
+// same function the HUD calls — ATraceCore::CanPullNow. That function already folds in all eight
+// refusals (mode, alive, loose, not the carrier, a turnover window is open, no winner yet, the right
+// team, range, line of sight, the aim cone / the ray through the orb) and NAMES the one that fired.
+//
+// Sharing the predicate is the whole design. Re-deriving "are they being shown the circle" here
+// would be a second opinion able to drift from the first, and the drift would be invisible: the
+// player would see a circle and get a knife swing, or see no circle and get a pull. There is one
+// definition, in another slice's file, and this asks it.
+// =================================================================================================
+
+bool TraceMelee::ShouldCorePullOverrideMelee(const ATraceCharacter* Pawn)
+{
+	if (!IsValid(Pawn))
+	{
+		return false;
+	}
+
+	const ATraceCore* Core = ATraceCore::Get(Pawn->GetWorld());
+	if (Core == nullptr)
+	{
+		return false;
+	}
+
+	// THE HUD'S OWN TEST, unchanged. TraceHUD.cpp: `const bool bEligible = Core->CanPullNow(LocalChar,
+	// &Reason);` is what puts the circle on screen, and this is that line.
+	return Core->CanPullNow(Pawn);
+}
+
+TraceMelee::EMeleeInputResult TraceMelee::HandleMeleeInput(ATraceCharacter* Pawn, bool bPressed,
+	ETraceMeleeRefusal* OutRefusal)
+{
+	if (OutRefusal != nullptr)
+	{
+		*OutRefusal = ETraceMeleeRefusal::None;
+	}
+
+	if (!IsValid(Pawn))
+	{
+		if (OutRefusal != nullptr) { *OutRefusal = ETraceMeleeRefusal::NoPawn; }
+		return EMeleeInputResult::Refused;
+	}
+
+	// --- THE RELEASE EDGE -------------------------------------------------------------------------
+	//
+	// ALWAYS forwarded to the Core, whichever verb the press went to, and that asymmetry is
+	// deliberate. A swing has no held state — it is a press-edge action with its own cooldown — so a
+	// release means nothing to it. The pull is a HOLD, and a press whose release is dropped leaves a
+	// ring filling on the server behind a pause menu or a lost window focus. ATraceCore's latch
+	// removes an entry that is not there without complaint, so forwarding an unmatched release costs
+	// one array scan and is strictly safer than remembering which verb ran ~200 ms ago. This is the
+	// same argument ATracePlayerController::OnParryCompleted already makes for its own tiebreak.
+	if (!bPressed)
+	{
+		if (ATraceCore* Core = ATraceCore::Get(Pawn->GetWorld()))
+		{
+			Core->RequestPullInput(/*bPressed=*/false, Pawn);
+		}
+		return EMeleeInputResult::Refused;   // nothing was started; there is no third result to report
+	}
+
+	// --- THE PRECEDENCE, ON THE PRESS -------------------------------------------------------------
+	if (ShouldCorePullOverrideMelee(Pawn))
+	{
+		if (ATraceCore* Core = ATraceCore::Get(Pawn->GetWorld()))
+		{
+			Core->RequestPullInput(/*bPressed=*/true, Pawn);
+		}
+
+		if (IsDebugLoggingEnabled())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Knife] %s: melee press went to the CORE PULL (the pull circle is on screen)."),
+				*GetNameSafe(Pawn));
+		}
+		return EMeleeInputResult::CorePull;
+	}
+
+	// --- OTHERWISE, RIGHT MOUSE MELEES ------------------------------------------------------------
+	//
+	// With the switch OFF this bind must not become a way to swing with the gun in your hands, which
+	// would be a v28 behaviour surviving a v28 revert. UTraceWeaponComponent::CanSwing refuses that
+	// on its own (its knife test is IsKnifeInHand, which collapses back to IsKnifeEquipped when the
+	// switch is off), so this needs no legacy branch of its own — stated here because its ABSENCE is
+	// the kind of thing a reader would otherwise go looking for.
+	ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+	const bool bSwung = RequestSwing(Pawn, &Refusal);
+	if (OutRefusal != nullptr)
+	{
+		*OutRefusal = Refusal;
+	}
+
+	if (!bSwung && IsDebugLoggingEnabled())
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[Knife] %s: melee press refused: %s"),
+			*GetNameSafe(Pawn), LexToString(Refusal));
+	}
+
+	return bSwung ? EMeleeInputResult::Swing : EMeleeInputResult::Refused;
 }
 
 bool TraceMelee::IsInSwingRange(const ATraceCharacter* Attacker, const AActor* Target)
@@ -1769,7 +2004,317 @@ namespace TraceMeleeConsole
 				TraceMelee::GetBotEngageRangeUU(), TraceMelee::GetBotDisengageRangeUU(),
 				100.f * TraceMelee::GetBotSwingRangeFraction());
 			UE_LOG(LogTraceGame, Display, TEXT("KNIFE carrier     : IMMUNE, always. The trace is the only way to kill a carrier (spec v10 s1, USER-CONFIRMED)."));
+
+			// [DUALWIELD] The switch, printed from the resolver rather than from the table, and with
+			// the table value beside it — so "somebody left Trace.Knife.DualWield 0 set" is
+			// distinguishable from "the ini says false", which is the whole reason every other line
+			// in this command prints both.
+			const int32 DualWieldOverride = CVarKnifeDualWield.GetValueOnAnyThread();
+			UE_LOG(LogTraceGame, Display,
+				TEXT("DUAL WIELD (v28 s10) : %s  [table=%d, Trace.Knife.DualWield=%d (%s), -TraceLegacyKnife=%d]"),
+				TraceMelee::IsDualWieldEnabled() ? TEXT("ON  — knife always in the off hand, melee on its own bind, guns-only switching")
+				                                 : TEXT("OFF — v27 knife-as-a-separate-weapon"),
+				Table.bDualWieldKnife ? 1 : 0,
+				DualWieldOverride,
+				(DualWieldOverride < 0) ? TEXT("deferring to the table") : TEXT("OVERRIDING the table"),
+				FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyKnife")) ? 1 : 0);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("  movement profile : %s  (dual wield deliberately pays NO knife speed bonus — see ShouldUseKnifeMovementProfile)"),
+				TraceMelee::IsDualWieldEnabled() ? TEXT("disabled") : TEXT("v12 s3, +22 percent ground while the knife is out"));
 			UE_LOG(LogTraceGame, Display, TEXT("=========================================="));
+		}));
+}
+
+
+// =================================================================================================
+// SPEC v28 §10 — THE RIGHT-MOUSE PRECEDENCE, BOTH ARMS, IN A LIVE MATCH.
+//
+// "If and only if a player is looking at a pullable core, and being shown the circle icon to pull,
+// this keybind should override the melee keybind."
+//
+// *** WHY THIS EXISTS: THE POSITIVE ARM HAD NEVER BEEN MEASURED. *** Every previous run of
+// Trace.Weapons.V28 reported the same thing and said so honestly - "the pull circle was never
+// eligible during this run, so only the NEGATIVE arm of the precedence (no circle => right mouse
+// melees) was exercised". Sampling frames in an ordinary match cannot fix that: making
+// ATraceCore::CanPullNow() true needs a real turnover, the dropping team locked out, and this pawn
+// on the OTHER team, and none of that happens on demand. The rule was therefore resting on a shared
+// predicate rather than on a measurement of the thing the owner asked for.
+//
+// This command stages the missing state and presses the button in it:
+//
+//   ARM 1  NEGATIVE - no turnover window is open, so no circle. One press must SWING.
+//   ARM 2  POSITIVE - stage a turnover in front of the pawn through the SHIPPING RegisterTurnover(),
+//                     wait until ATraceCore::CanPullNow() (the EXACT call ATraceHUD makes to decide
+//                     whether to draw the circle) says the circle is up, then press the same button
+//                     again. It must go to the CORE PULL and NOT swing.
+//
+// THE TWO ARMS MUST DISAGREE OR THE COMMAND FAILS ITSELF. If one press swings in both states the
+// precedence is not being measured at all - that is the "red and green arms agreeing" failure this
+// project keeps writing down - so a run where both arms return the same verb is reported as a
+// FAILURE OF THE HARNESS, not as a pass.
+//
+// WHAT IT DOES AND DOES NOT PROVE. It drives TraceMelee::HandleMeleeInput, which is the whole verb
+// the bind calls. That the BIND reaches this verb from a real right mouse button is proven
+// separately and does not belong here: press the button through Trace.SimInput with Trace.LogInput 1
+// and the controller prints "INPUT Melee pressed -> SWING" / "-> CORE PULL (the circle is on
+// screen)". Two measurements, deliberately, because they fail for different reasons - a broken bind
+// and a broken precedence look nothing alike and should not hide behind one green tick.
+// =================================================================================================
+namespace
+{
+	struct FTraceRmbPrecedenceRun
+	{
+		TWeakObjectPtr<UWorld>          WorldPtr;
+		TWeakObjectPtr<ATraceCharacter> Pawn;
+		int32   Step            = 0;
+		int32   Passed          = 0;
+		int32   Failed          = 0;
+		double  StepStart       = 0.0;
+		int32   EligibleFrames  = 0;
+		bool    bNegativeSwung  = false;
+		bool    bPositivePulled = false;
+	};
+
+	void TraceRmbReport(FTraceRmbPrecedenceRun& Run, bool bOk, const TCHAR* What)
+	{
+		(bOk ? ++Run.Passed : ++Run.Failed);
+		if (bOk)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[RMBPrec]   PASS  %s"), What);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,  TEXT("[RMBPrec]   FAIL  %s"), What);
+		}
+	}
+
+	const TCHAR* TraceRmbResultName(TraceMelee::EMeleeInputResult Result)
+	{
+		switch (Result)
+		{
+		case TraceMelee::EMeleeInputResult::Swing:    return TEXT("SWING");
+		case TraceMelee::EMeleeInputResult::CorePull: return TEXT("CORE PULL");
+		default:                                      return TEXT("REFUSED");
+		}
+	}
+
+	void TraceRmbStep(TSharedRef<FTraceRmbPrecedenceRun> Run);
+
+	void TraceRmbArm(TSharedRef<FTraceRmbPrecedenceRun> Run, float Delay)
+	{
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run](float) -> bool { TraceRmbStep(Run); return false; }), FMath::Max(0.01f, Delay));
+	}
+
+	void TraceRmbStep(TSharedRef<FTraceRmbPrecedenceRun> Run)
+	{
+		UWorld* World = Run->WorldPtr.Get();
+		ATraceCharacter* Pawn = Run->Pawn.Get();
+		ATraceCore* Core = (World != nullptr) ? ATraceCore::Get(World) : nullptr;
+
+		if (World == nullptr || !IsValid(Pawn) || Core == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RMBPrec] the world, the pawn or the Core went away mid-run; nothing measured."));
+			return;
+		}
+
+		switch (Run->Step)
+		{
+		case 0:
+		{
+			// ---- ARM 1, NEGATIVE: no circle, so the press must swing. ---------------------------
+			const bool bCircle = Core->CanPullNow(Pawn);
+			TraceRmbReport(*Run, !bCircle,
+				TEXT("ARM 1 starts with NO pull circle on screen (ATraceCore::CanPullNow is false) - "
+				     "otherwise the negative arm is not negative"));
+
+			ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+			const TraceMelee::EMeleeInputResult Result =
+				TraceMelee::HandleMeleeInput(Pawn, /*bPressed=*/true, &Refusal);
+			TraceMelee::HandleMeleeInput(Pawn, /*bPressed=*/false);
+
+			Run->bNegativeSwung = (Result == TraceMelee::EMeleeInputResult::Swing);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RMBPrec] ARM 1 (no circle): one press of the melee bind -> %s."),
+				TraceRmbResultName(Result));
+			TraceRmbReport(*Run, Run->bNegativeSwung,
+				TEXT("s10 NEGATIVE: with no pull circle, right mouse MELEES"));
+
+			Run->Step      = 1;
+			Run->StepStart = FPlatformTime::Seconds();
+			TraceRmbArm(Run, 0.6f);   // let the swing animation finish before staging anything
+			return;
+		}
+
+		case 1:
+		{
+			// ---- stage the turnover through the SHIPPING path ------------------------------------
+			// Trace.Integ.StageTurnover moves the CORE, never the crosshair, and goes through
+			// ATraceCore::RegisterTurnover - the same function a real thrown-and-settled Core uses.
+			// LockMyTeam=0 so the pawn's own team is NOT the locked-out one, which is the only way
+			// this pawn is allowed to pull at all.
+			if (APlayerController* PC = World->GetFirstPlayerController())
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[RMBPrec] staging a real turnover 450 uu down the pawn's own view, with this pawn's "
+					     "team NOT locked out, so the pull circle can legitimately come up."));
+				PC->ConsoleCommand(TEXT("Trace.Integ.StageTurnover 450 0"), /*bWriteToLog=*/false);
+			}
+
+			Run->Step      = 2;
+			Run->StepStart = FPlatformTime::Seconds();
+			TraceRmbArm(Run, 0.1f);
+			return;
+		}
+
+		case 2:
+		{
+			// ---- LOOK AT THE CORE, then wait for the CIRCLE ---------------------------------------
+			//
+			// *** THE FIRST VERSION OF THIS HARNESS FAILED HERE, AND THE REASON IS THE RULE ITSELF. ***
+			// Trace.Integ.StageTurnover deliberately "moves the CORE, never the crosshair", so a pawn
+			// that happened to be looking elsewhere got a perfectly good turnover it was not aiming at,
+			// and CanPullNow refused with "not hovering the Core" for the whole window. That is the
+			// pull's 4-degree aim cone doing its job - the owner's sentence is "if and only if a player
+			// is LOOKING AT a pullable core" - so the fixture has to supply the looking.
+			//
+			// Aiming is STAGING, not cheating: CanPullNow is still the only thing that decides, and
+			// every other condition it tests (a live turnover window, the right team, line of sight,
+			// the Core actually loose) is untouched and unfaked. What this removes is the one variable
+			// a headless run cannot otherwise control - where an unattended pawn happens to be facing
+			// while bots shove it around.
+			if (APlayerController* AimPC = Cast<APlayerController>(Pawn->GetController()))
+			{
+				const FVector EyeLoc = Pawn->GetPawnViewLocation();
+				const FVector ToCore = Core->GetActorLocation() - EyeLoc;
+				if (!ToCore.IsNearlyZero())
+				{
+					AimPC->SetControlRotation(ToCore.Rotation());
+				}
+			}
+
+			const bool bCircle = Core->CanPullNow(Pawn);
+			if (bCircle)
+			{
+				++Run->EligibleFrames;
+			}
+
+			const double Waited = FPlatformTime::Seconds() - Run->StepStart;
+
+			// Two eligible samples rather than one: a single frame could be a transient during the
+			// settle, and the press below has to land in a state that is genuinely stable.
+			if (Run->EligibleFrames >= 2)
+			{
+				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+				const TraceMelee::EMeleeInputResult Result =
+					TraceMelee::HandleMeleeInput(Pawn, /*bPressed=*/true, &Refusal);
+				TraceMelee::HandleMeleeInput(Pawn, /*bPressed=*/false);
+
+				Run->bPositivePulled = (Result == TraceMelee::EMeleeInputResult::CorePull);
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[RMBPrec] ARM 2 (circle UP, confirmed on %d frame(s) after %.2fs): one press of the "
+					     "SAME bind -> %s."),
+					Run->EligibleFrames, Waited, TraceRmbResultName(Result));
+
+				TraceRmbReport(*Run, Run->bPositivePulled,
+					TEXT("*** s10 POSITIVE: while the pull circle IS being shown, right mouse PULLS THE CORE "
+					     "instead of swinging - the arm no previous run had ever reached ***"));
+				TraceRmbReport(*Run, Result != TraceMelee::EMeleeInputResult::Swing,
+					TEXT("s10: ...and it specifically does NOT swing, which is the override the owner asked for"));
+
+				Run->Step = 3;
+				TraceRmbArm(Run, 0.05f);
+				return;
+			}
+
+			if (Waited > 8.0)
+			{
+				TraceRmbReport(*Run, false,
+					TEXT("the pull circle NEVER came up within 8s of a staged turnover, so the POSITIVE arm "
+					     "could not be pressed. This is a failure of the FIXTURE, not of the precedence: check "
+					     "that the local pawn is alive, not carrying, on the team that did NOT drop the Core, "
+					     "and looking at it"));
+				Run->Step = 3;
+				TraceRmbArm(Run, 0.05f);
+				return;
+			}
+
+			TraceRmbArm(Run, 0.05f);
+			return;
+		}
+
+		default:
+		{
+			// ---- the harness proving it measured its own rule -------------------------------------
+			const bool bArmsDisagree = (Run->bNegativeSwung && Run->bPositivePulled);
+			TraceRmbReport(*Run, bArmsDisagree,
+				TEXT("THE TWO ARMS DISAGREED: the same button swung with no circle and pulled with one. If it "
+				     "had done the same thing in both states this command would be measuring nothing"));
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RMBPrec] ===== %d passed, %d FAILED. ====="), Run->Passed, Run->Failed);
+
+			// Two statements rather than one with a computed verbosity: UE_LOG's verbosity argument is
+			// a TOKEN that the macro pastes, not an expression it evaluates, so a ternary there does
+			// not compile. Worth the four extra lines - a FAIL that only ever printed at Display is a
+			// FAIL nobody greps for.
+			if (Run->Failed == 0)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[RMBPrec] VERDICT: PASS"));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[RMBPrec] VERDICT: *** FAIL ***"));
+			}
+			return;
+		}
+		}
+	}
+
+	FAutoConsoleCommand CmdTraceRmbPrecedence(
+		TEXT("Trace.Integ.RightMousePrecedence"),
+		TEXT("Trace (spec v28 s10): press the melee bind's verb with NO pull circle (must swing), then stage a "
+		     "real turnover, wait for ATraceCore::CanPullNow to put the circle up, and press it again (must "
+		     "pull). Fails if the two arms agree. Server, mode B, match in progress."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			UWorld* World = nullptr;
+			if (GEngine != nullptr)
+			{
+				for (const FWorldContext& Context : GEngine->GetWorldContexts())
+				{
+					if (Context.World() != nullptr
+						&& (Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE))
+					{
+						World = Context.World();
+						break;
+					}
+				}
+			}
+
+			APlayerController* PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+			ATraceCharacter* Pawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+
+			if (World == nullptr || Pawn == nullptr || ATraceCore::Get(World) == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[RMBPrec] need a live local pawn and a Core in a mode-B match. Nothing measured."));
+				return;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("================================================================================"));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RMBPrec] spec v28 s10: does the Core pull override the melee, and ONLY while the pull "
+				     "circle is on screen? Pawn=%s."), *GetNameSafe(Pawn));
+
+			TSharedRef<FTraceRmbPrecedenceRun> Run = MakeShared<FTraceRmbPrecedenceRun>();
+			Run->WorldPtr = World;
+			Run->Pawn     = Pawn;
+			TraceRmbStep(Run);
 		}));
 }
 

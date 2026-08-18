@@ -6,7 +6,7 @@
 #
 #     IA_Move IA_Look IA_Jump IA_Crouch IA_Fire IA_Pass IA_Dash IA_Parry
 #     IA_Scoreboard IA_EquipKnife IA_EquipGun IA_Ability IA_AbilitySecondary
-#     IA_Reload IA_PullCore                            (15 UInputAction assets)
+#     IA_Reload IA_PullCore IA_Melee                   (16 UInputAction assets)
 #     IMC_Trace                                        (1 UInputMappingContext)
 #
 # -----------------------------------------------------------------------------
@@ -137,11 +137,11 @@ ACTIONS = [
      "optional second route and stays on the rebind list so a player can bind one."),
     ("IA_Dash", BOOL, HIGHEST, "Dash."),
     ("IA_Parry", BOOL, HIGHEST,
-     "Parry. Carrier only; a 0.175 s window of trace invulnerability. SPEC v25 s7 "
-     "moves it to the RIGHT MOUSE BUTTON. The same press also carries spec v25 s2's "
-     "turnover core-pull, which has no action asset of its own - it is dispatched "
-     "from ATracePlayerController::OnParryStarted, because parry needs you to be "
-     "carrying and the pull needs you not to be, so the two can never both fire."),
+     "Parry. Carrier only; a 0.175 s window of trace invulnerability. SPEC v28 s3d "
+     "gives it TWO default keys - Q and the thumb mouse button - and takes it OFF "
+     "right click, which spec v28 s10 needs for the melee. Two mappings on one "
+     "Boolean action is a supported shape: Enhanced Input merges them by highest "
+     "absolute value, so the action is down while EITHER key is."),
     ("IA_Scoreboard", BOOL, HIGHEST, "Scoreboard. Shown while held."),
     ("IA_EquipKnife", BOOL, HIGHEST, "Equip the knife. DIRECT SELECT and idempotent - not a toggle."),
     ("IA_EquipGun", BOOL, HIGHEST, "Equip the gun. DIRECT SELECT and idempotent - not a toggle."),
@@ -156,6 +156,17 @@ ACTIONS = [
     ("IA_PullCore", BOOL, HIGHEST,
      "Pull the Core during a turnover (spec v25 s2). HELD - releasing cancels. "
      "Spec v26 s1 split this off the parry's button into a bind of its own."),
+    # SPEC v28 s10 - "Melee should be bound to right click by default." The whole
+    # verb is TraceMelee::HandleMeleeInput; this action only delivers edges to it.
+    # Bound Started AND Completed AND Canceled, because the press may go to the
+    # Core PULL, which is a HOLD - a dropped release leaves a ring filling on the
+    # server. The precedence between the swing and the pull is a state test inside
+    # the verb (ATraceCore::CanPullNow, the same predicate the HUD asks to decide
+    # whether to draw the circle), never a second mapping here.
+    ("IA_Melee", BOOL, HIGHEST,
+     "Melee swing (spec v28 s10). Right mouse by default. If and only if the pull "
+     "circle is on screen this press pulls the Core instead - that precedence "
+     "lives in TraceMelee::HandleMeleeInput, not in the mapping."),
 ]
 
 # -----------------------------------------------------------------------------
@@ -173,8 +184,9 @@ ACTIONS = [
 # table so the defaults are unchanged" means.
 #
 # AN ACTION WITH NO DEFAULT KEY HAS NO ROW HERE, and since spec v25 s7 there is
-# one: IA_Pass. There are therefore FEWER MAPPINGS THAN ACTIONS, which is a
-# supported shape and not a missing line - the count is asserted against
+# one: IA_Pass. An action with TWO default keys has TWO rows, and since spec v28
+# s3d there is one of those too: IA_Parry. So the mapping count is neither the
+# action count nor anything derivable from it - it is asserted against
 # ATracePlayerController's own ExpectedMappings table by Trace.Input.VerifyAssets.
 # -----------------------------------------------------------------------------
 SWIZZLE_XY = "swizzle"   # 1D X -> Y, so a single key becomes the forward axis
@@ -205,10 +217,23 @@ MAPPINGS = [
     # is no key name to write. ATracePlayerController's ExpectedMappings table
     # has had the matching row removed, so Trace.Input.VerifyAssets agrees.
     ("IA_Dash", "LeftShift", [], ""),
-    # SPEC v25 s7: parry moves from Q to the right mouse button. Q is now unclaimed.
-    # SPEC v26 s1 splits the two verbs apart: this row is the PARRY alone now, and
-    # the pull has its own row at the bottom of this table.
-    ("IA_Parry", "RightMouseButton", [], "parry (spec v25 s7)"),
+    # SPEC v25 s7 moved parry from Q to the right mouse button; SPEC v26 s1 split the
+    # pull off it; SPEC v28 s3d moves it BACK to Q and gives it a SECOND key on the
+    # thumb mouse button - "Parry defaults to BOTH Q and the thumb mouse button".
+    #
+    # TWO ROWS FOR ONE ACTION, and this is the first time this table has had that.
+    # It is the picture of an action with two slots (UTraceUserSettings holds up to
+    # MaxKeysPerAction=2 per action since v28 s3c), and ApplyControlSettings lays
+    # them down in the same order from the player's own binds.
+    #
+    # THE RIGHT MOUSE BUTTON BELONGS TO THE MELEE, and to exactly one row. Spec v28
+    # s3d took it off the parry (see the two IA_Parry rows below) so that spec v28
+    # s10 could have it. Melee IS a rebindable action - ETraceInputAction::Melee,
+    # added when the two slices were integrated - so its row is at the bottom of
+    # this table. Nothing else here may sit on the button, or one press would do
+    # two things.
+    ("IA_Parry", "Q", [], "parry, slot 1 (spec v28 s3d)"),
+    ("IA_Parry", "ThumbMouseButton", [], "parry, slot 2 - mouse 4 (spec v28 s3d)"),
     ("IA_Scoreboard", "Tab", [], ""),
     ("IA_EquipKnife", "One", [], ""),
     ("IA_EquipGun", "Two", [], ""),
@@ -223,6 +248,11 @@ MAPPINGS = [
     # candidate - passed over because the pull is a HOLD taken while still
     # steering, and F is under an index finger already resting on D.
     ("IA_PullCore", "F", [], "spec v26 s1 - the turnover core-pull, its own bind"),
+    # SPEC v28 s10 - the melee, on the button spec v28 s3d vacated for it. LAST in
+    # this table because ATracePlayerController::ApplyControlSettings lays it down
+    # last, and this table is a copy of that order rather than a sort - see the
+    # note at the top of the section.
+    ("IA_Melee", "RightMouseButton", [], "spec v28 s10 - melee, on the button s3d vacated"),
 ]
 
 CONTEXT_NAME = "IMC_Trace"

@@ -760,12 +760,32 @@ public:
 	 * expired in mid-air short of a target the player could plainly see. If ATraceArenaBuilder::
 	 * FieldLength or FieldWidth changes again, recompute sqrt(L^2 + W^2) and raise this with it.
 	 *
+	 * *** 36000 -> 39600 THIS PASS, AND IT IS SPEC v28 §8's BILL, NOT A RETUNE. *** §8 put a 2400 uu
+	 * hockey pocket behind each goal, so ATraceArenaBuilder::FieldLength went 33600 -> 38400 and the
+	 * wall-to-wall diagonal went 34944 -> sqrt(38400^2 + 9600^2) = 39581 uu. The shipped 36000 was
+	 * 3581 uu SHORT of that — a shot from one back pocket down the long diagonal to the other would
+	 * have died in mid-air short of a target the player could plainly see, which is the exact failure
+	 * the 28000 -> 36000 move already fixed once. 39600 covers 39581 with 19 uu of margin, and the
+	 * margin is deliberately thin: this number is a REACH, not a range budget, and every uu of it is
+	 * paid for by the trace. The §8 owner found this and could not fix it — this file is not theirs.
+	 *
+	 * THE PAIRING RULE, restated because it has now been missed twice: this value is DERIVED from
+	 * ATraceArenaBuilder::FieldLength and FieldWidth. It is not independent of them and it must move
+	 * whenever they do. Trace.Arena.VerifyHitscanReach asserts exactly that against the running
+	 * builder, so the next lengthening fails a harness instead of silently shortening the guns.
+	 *
+	 * Raising it does NOT make the bots deadlier (see below) and does NOT change any damage. There is
+	 * no distance falloff anywhere in UTraceWeaponComponent's hitscan — damage is chosen by HIT ZONE
+	 * alone (head / body / leg) and the trace length never enters the number — so a 39600 uu trace
+	 * hits for exactly what a 36000 uu one did. The only difference is that shots stop expiring in
+	 * the air short of a target that is on screen.
+	 *
 	 * Raising it does NOT make the bots deadlier: they are limited by FTraceBotProfile::
 	 * MaxEngagementRange (4200 Easy / 4800 Normal / 6000 Hard), far below either value. This only
 	 * restores the human's ability to shoot what they can see.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Hitscan Range (uu)", ClampMin = "100.0", ClampMax = "200000.0", UIMin = "5000.0", UIMax = "50000.0"))
-	float HitscanRange = 36000.f;
+	float HitscanRange = 39600.f;
 
 	/**
 	 * SECONDS BETWEEN SHOTS — this is the inverse of the fire RATE, so a BIGGER number is a SLOWER
@@ -1882,8 +1902,8 @@ public:
 	 * traversal exploit.
 	 *
 	 * THE BASE, NOT THE SHIPPED MULTIPLIER. Spec v9 §7's "+30% on the bonus" is applied on top by
-	 * SlideJumpBonusScale below — effective 1 + (1.3125 - 1) x 1.43 = 1.446875 (v16: the bonus, i.e.
-	 * the GAIN, raised 10%) — so this line stays
+	 * SlideJumpBonusScale below — effective 1 + (1.3125 - 1) x 1.50 = 1.46875 (v16: the bonus, i.e.
+	 * the GAIN, raised 10%; v28 §5 takes the scale to 1.50) — so this line stays
 	 * the designer's v8 number and the two re-tunings never fight.
 	 *
 	 * 1.0 turns the window into a no-op without disabling the move.
@@ -1898,9 +1918,19 @@ public:
 	 * Applied to SlideJumpWindowSpeedBonus by
 	 * UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus(), bound BY NAME as
 	 * "SlideJumpBonusScale" and clamped there to 0.1..4.
+	 *
+	 * *** SPEC v28 §5 — 1.43 -> 1.50. *** Verbatim: "change well timed bonus scale to 1.5". This is
+	 * the knob that carries that name (Project Settings > Movement|Slide Jump > "Well-Timed Bonus
+	 * Scale"), so the number is typed here and in Config/DefaultGame.ini and NOWHERE ELSE — in
+	 * particular NOT folded into SlideJumpWindowSpeedBonus (v8 §8's base) or SlideJumpMomentumScale
+	 * (v26 §3a's -20%), which carry different decisions and would silently double or delete this one.
+	 *
+	 * What it ships, with every other knob where it already was:
+	 *     well-timed multiplier = 1 + ((1 + (1.3125 - 1) x 1.50) - 1) x 0.80 = 1.375   (was 1.3575)
+	 * i.e. the gain a perfectly timed hop buys goes from +35.75% to +37.5% of the speed carried in.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Well-Timed Bonus Scale (v9 §7, x)", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.8", UIMax = "2.0"))
-	float SlideJumpBonusScale = 1.43f;
+	float SlideJumpBonusScale = 1.5f;
 
 	/**
 	 * WHICH READING OF §7 IS SHIPPED. The spec asks for both to be flagged and for the choice to be
@@ -2024,9 +2054,22 @@ public:
 	 * because it IS one of those launches.
 	 *
 	 * 1 caps a chain at its first boost. Raise it to 3 to allow one more compounding step.
+	 *
+	 * *** SPEC v28 §5 TOOK EXACTLY THAT STEP: 2 -> 3. *** Verbatim: "Change consecutive chain ceiling
+	 * slide boosts to 3". So the ceiling is now the highest of the chain's FIRST THREE launches, and
+	 * it is boost 4 — not boost 3 — that is the first one clamped:
+	 *
+	 *     boost 1, 2, 3   launch normally; the ceiling is the fastest of the three
+	 *     boost 4+        still fires, still ends the slide, still pays the well-timed HEIGHT bonus,
+	 *                     but its planar speed may not exceed that ceiling
+	 *
+	 * NOTHING ELSE MOVES WITH IT, and that is the point of the cap being a count rather than a speed:
+	 * the ceiling is still one of the chain's own measured launches, so raising the count changes WHICH
+	 * launch it is and never what a launch is worth. Anything that compares hops (the audit's verdict
+	 * rows in TraceMovementAuditV16.cpp) reads this knob rather than a typed 2 — see the note there.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Chain Ceiling (consecutive boosts before the cap)", ClampMin = "1", ClampMax = "8", UIMin = "1", UIMax = "4"))
-	int32 SlideJumpChainCapBoosts = 2;
+	int32 SlideJumpChainCapBoosts = 3;
 
 	/**
 	 * When a chain ENDS, as a multiple of the pawn's own live max ground speed.
@@ -2820,6 +2863,39 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Max (x full, clamp off) [v13 §6]", ClampMin = "1.0", ClampMax = "4.0", UIMin = "1.0", UIMax = "2.0"))
 	float CoreThrowChargeMaxFraction = 1.0f;
+
+	/**
+	 * *** SPEC v28 §7 — HOW LONG A FULL CHARGE MAY BE SAT ON BEFORE THE SERVER THROWS IT. ***
+	 *
+	 * Verbatim: "A player can hold a core at full throw charge indefinitely. Make a second little red
+	 * ring which fills on the inside of the green one on a .6seconds timer. This timer should start
+	 * right when throw charge reaches full. When the second timer completes, the core is released at
+	 * full charge automatically, if a player doesn't throw it before then."
+	 *
+	 * THE RED RING IS THIS NUMBER. ATraceHUD draws its fill as arithmetic on the SERVER's stamp of
+	 * the instant the charge reached full, against this window, so the ring and the throw are the
+	 * same subtraction and cannot disagree. Move this and the ring moves with it — there is no second
+	 * place to edit.
+	 *
+	 * 0 SWITCHES THE WHOLE OF §7 OFF: no red ring, no auto-release, a full charge held forever. That
+	 * is the pre-v28 game and it is the section's red arm.
+	 *
+	 * *** WHY THIS PROPERTY WAS MISSING UNTIL THE INTEGRATION PASS, AND WHY THAT MATTERED LITTLE BUT
+	 * NOT NOTHING. *** The §7 owner shipped the whole feature bound BY NAME to this exact string
+	 * through ATraceCore's Resolve(), and could not add the property: TraceSettings.h was being
+	 * edited by three other agents in the same pass and they refused to risk a clobber. Resolve()
+	 * answers with the CVar when the name is missing, so the shipped behaviour was already 0.6 s and
+	 * correct. What was missing is everything a property buys: the Project Settings row, the ini key
+	 * a designer can retune without a console, and the fact that a knob bound by name to nothing is
+	 * indistinguishable from a MISSPELLED one. This project has been caught by exactly that before —
+	 * see the HitscanRange note at the top of Config/DefaultGame.ini.
+	 *
+	 * 0.6 s IS THE OWNER'S NUMBER, quoted above, and it is deliberately shorter than
+	 * CoreThrowChargeSeconds (also 0.6): the whole point is that sitting on a full charge is not a
+	 * free option, so the grace period must not exceed the work it took to earn it.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Full-Charge Auto-Release Window (s, 0 = off) [v28 §7]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "2.0"))
+	float CoreThrowFullChargeAutoReleaseSeconds = 0.6f;
 
 	/**
 	 * World gravity multiplier applied to a Core in flight and rolling loose, BEFORE weight.
@@ -5927,4 +6003,83 @@ public:
 	/** §3: "Zip (30 s)". The card prints this too — Trace.VerifyCharacterData compares the pair. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Zip Cooldown (s) [v19 §3: 30]", ClampMin = "0.0", ClampMax = "180.0", UIMin = "5.0", UIMax = "60.0"))
 	float LilyZipCooldownSeconds = 30.f;
+
+	// ==========================================================================================
+	// THE SMG  (spec v28 §9, new)
+	//
+	// Verbatim: "Add a full auto smg which does 33 to the head, 18 to the body, 12 to the leg. Make
+	// the fire rate 600rpm, and give the gun 40 ammo. The reload time for the smg should be
+	// .8seconds. Allow players to swap between the pistol and smg with the current weapon pullout
+	// time."
+	//
+	//                     SMG          pistol (the six knobs above / UTraceDamageSettings)
+	//   head/body/leg     33/18/12     100/40/25
+	//   fire interval     0.100 s      0.315789 s
+	//   RPM               600          190
+	//   clip              40           30
+	//   reload            0.8 s        0.5 s
+	//
+	// *** SIX ABSOLUTE NUMBERS AND NOT ONE RELATIVE ONE, AND THAT IS THE CORRECT READING OF THE
+	// STANDING RULE. *** "A value that MODIFIES a base must be stored RELATIVE to that base." None of
+	// these modifies the pistol: the owner gave six independent numbers for a second weapon, and
+	// storing 33 as "0.33 x HeadDamage" would mean retuning the pistol's head shot silently retuned
+	// the SMG's, which is the opposite of what a second weapon is for. They are siblings, not
+	// derivatives.
+	//
+	// *** THE TWO NUMBERS THAT *ARE* RELATIVE ARE THE ONES THAT ARE NOT HERE, AND THAT IS THE POINT:
+	//
+	//   THE PULLOUT. "swap [...] with the current weapon pullout time" — so the SMG has NO pullout
+	//   knob. UTraceWeaponComponent::RequestEquip reads UTraceMeleeSettings::SwapSeconds for every
+	//   weapon, pistol, SMG and knife alike, exactly as it did before this pass. Retune that one
+	//   number and all three move together. A SmgSwapSeconds duplicate is precisely what the standing
+	//   rule forbids and is the single easiest mistake this item could have shipped.
+	//
+	//   THE PER-CHARACTER FIRE RATE. Roxie's Modded (x1.65) and a stuck Slimeball (+30%) reach the gun
+	//   as a SCALE on the interval through UTraceAbilityComponent::GetFireIntervalScaleFor(), and the
+	//   SMG multiplies by the identical call in the identical two places the pistol does (CanFire and
+	//   ServerFire). So Roxie's SMG is 0.100 / 1.65 = 0.0606 s = 990 RPM and nothing had to know that
+	//   in advance. Read it back from a running game with Trace.Smg.Dump.
+	//
+	// MIRRORED IN Config/DefaultGame.ini under [/Script/Trace.TraceSettings], beside FireInterval and
+	// ClipSize, and *** THE INI IS THE ONE THAT DECIDES ***. Change both or change nothing, and read
+	// the live numbers back with Trace.Smg.Dump rather than trusting either file.
+	// ==========================================================================================
+
+	/**
+	 * SECONDS BETWEEN SMG ROUNDS. 600 RPM = 60/600 = 0.1 s exactly.
+	 *
+	 * A PERIOD, like FireInterval, so a SMALLER number is a FASTER gun — the same trap the pistol's
+	 * ini block warns about. The ability scales DIVIDE into this through GetFireIntervalScaleFor().
+	 *
+	 * Worth reading against the clip beside it: 40 rounds at 0.1 s empties in 39 x 0.1 = 3.9 s (the
+	 * first round is free), then 0.8 s of reload — an 83% duty cycle against the pistol's 95%. At 18
+	 * a body shot that is 720 potential damage per magazine and 3 s of continuous fire to spend it,
+	 * versus the pistol's 750 over 9.2 s. The SMG's whole identity is that it front-loads the same
+	 * magazine into a third of the time.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|SMG", meta = (DisplayName = "SMG Fire Interval (s) [v28 §9: 0.1 = 600 RPM]", ClampMin = "0.02", ClampMax = "2.0", UIMin = "0.05", UIMax = "0.5"))
+	float SmgFireInterval = 0.1f;
+
+	/** "give the gun 40 ammo". Rounds per SMG clip; the reserve is infinite, exactly as the pistol's is. */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|SMG", meta = (DisplayName = "SMG Clip Size (rounds) [v28 §9: 40]", ClampMin = "1", ClampMax = "999", UIMin = "10", UIMax = "80"))
+	int32 SmgClipSize = 40;
+
+	/** "The reload time for the smg should be .8seconds." A deadline on the shared clock at runtime. */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|SMG", meta = (DisplayName = "SMG Reload Time (s) [v28 §9: 0.8]", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.2", UIMax = "3.0"))
+	float SmgReloadSeconds = 0.8f;
+
+	/**
+	 * "33 to the head". THREE HEAD SHOTS TO KILL against 100 health, where the pistol's one does.
+	 * That is the trade the owner's numbers describe and it is worth stating: the SMG never one-shots.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|SMG", meta = (DisplayName = "SMG Head Damage [v28 §9: 33]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "5.0", UIMax = "120.0"))
+	float SmgHeadDamage = 33.f;
+
+	/** "18 to the body". Six body shots to kill = 0.5 s of held trigger on target. */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|SMG", meta = (DisplayName = "SMG Body Damage [v28 §9: 18]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "5.0", UIMax = "120.0"))
+	float SmgBodyDamage = 18.f;
+
+	/** "12 to the leg". Nine leg shots to kill = 0.8 s. */
+	UPROPERTY(config, EditAnywhere, Category = "Combat|SMG", meta = (DisplayName = "SMG Leg Damage [v28 §9: 12]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "5.0", UIMax = "120.0"))
+	float SmgLegDamage = 12.f;
 };

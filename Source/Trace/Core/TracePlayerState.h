@@ -168,6 +168,22 @@ public:
 	 */
 	uint8 GetSelectedCharacter() const;
 
+	/**
+	 * SPEC v28 §9b(b). Does a BOT team-mate's hold on a character YIELD to a human who asks for it?
+	 *
+	 * TRUE IN EVERY SHIPPED BUILD, and a FORWARDER for the same reason GetSelectedCharacter() is one:
+	 * the answer belongs to UTraceAbilityComponent, which owns the rule and the red arm that turns it
+	 * off, and the character-select screen is in the UI slice and must not take the ability
+	 * framework's reflected header to draw a menu (see the note at the top of TraceCharacterRoster.h).
+	 *
+	 * WHY THE SCREEN HAS TO ASK AT ALL. The select screen keeps a local belief about which cards a
+	 * team-mate holds, and refuses to even send a request for one of them. Since §9b a card a BOT
+	 * holds is takeable — the server hands it over and the bot re-picks — so a screen that kept
+	 * greying it out would leave the rule correct, enforced, and impossible for a player to reach.
+	 * This is the one question that keeps the two sides in step, red arm included.
+	 */
+	static bool DoBotsYieldToHumans();
+
 	bool  HasCharacter() const { return TraceCharacterRoster::IsValidId(GetSelectedCharacter()); }
 	bool  IsCharacterSelectOpen() const { return bCharacterSelectOpen; }
 	bool  WasCharacterChosen() const { return bCharacterWasChosen; }

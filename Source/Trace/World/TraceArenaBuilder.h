@@ -42,7 +42,8 @@ class UStaticMeshComponent;
  * WHAT IT MAKES  (spec v3 section 7 - rebuilt from the collaborator's overhead sketch,
  *                 lengthened to 3.5 : 1 for spec v4 section 3)
  * -------------
- * A 33600 x 9600 uu Tron arena - LENGTH : WIDTH = 3.5 : 1. Inside it:
+ * A 38400 x 9600 uu Tron arena - 33600 of it goal to goal, plus a 2400 uu HOCKEY POCKET behind each
+ * goal (spec v28 §8). Inside it:
  *
  *  - a near-black glossy floor carrying a team-tinted neon grid, and four 2600 uu perimeter walls
  *    with lit trim, a kick rail and vertical ribs;
@@ -55,13 +56,13 @@ class UStaticMeshComponent;
  *  - a TALL 3.5x-player-height tower at top centre, standing on the dividing line;
  *  - a scatter of cover boxes and long low bars at exactly 1x / 2x / 3.5x player height (176 / 352
  *    / 616 uu), keyed to the character capsule via PlayerHeightUU();
- *  - a lit gate spanning the full width of each endzone; the endzones themselves run sideline to
- *    sideline - see EndzoneHalfWidth;
+ *  - a lit gate spanning the full width of the field just in FRONT of each goal line (it used to
+ *    stand on the line; the hoop hangs there now - see BuildEndzones); the endzones themselves run
+ *    sideline to sideline - see EndzoneHalfWidth;
  *  - and, for MODE B, a GOAL at each end: since spec v6 section 4.3 that is a 2000 uu CIRCULAR hoop
- *    (GoalHalfWidth is its radius) set INTO the back wall, its bottom raised 1.5 player heights off
- *    the floor, with a lit alcove behind it and a run-up ramp in front of it. The end wall itself is
- *    mode-tagged because of it: mode A gets the solid slab, mode B gets a perforated replacement.
- *    See BuildGoalWall and the two-modes note below.
+ *    (GoalHalfWidth is its radius) with its bottom raised 1.5 player heights off the floor, and
+ *    since spec v28 section 8 it FLOATS on the goal line rather than sitting in the back wall, with
+ *    a run-up ramp on each face and 2400 uu of playable pocket behind it. See BuildGoalRing.
  *
  * TWO SCORING SHAPES, BOTH BUILT (spec v4 section 7)
  * -------------------------------------------------
@@ -209,6 +210,25 @@ public:
 	FBox GetFieldBounds() const;
 
 	/**
+	 * ONE PLAYER HEIGHT, in uu, and the single source of every structure height in the arena.
+	 *
+	 * Spec v3 section 7 keys the sketch's three structure classes to the player: a green outline is
+	 * 1x, orange 2x and red 3.5x. Those are 176 / 352 / 616 uu today, but they are only correct
+	 * while the capsule is 88 uu half height - so this READS THE CAPSULE rather than hard-coding
+	 * 176. ATraceCharacter's class default object is asked for its capsule half height and doubled;
+	 * if the CDO cannot be reached (it always can, but the arena must never crash over art) it
+	 * falls back to the documented 176 and says so in the log.
+	 *
+	 * Consequence worth knowing: shrink the capsule and every cover block in the arena shrinks with
+	 * it, which is what "1x player height" is supposed to mean.
+	 *
+	 * PUBLIC since spec v28 §8: it is the arena's answer to "how big is a person", and the goal-side
+	 * harness places a pawn at ramp height + half a capsule. A second copy of 88 in a test is a test
+	 * that keeps passing after somebody resizes the pawn.
+	 */
+	float PlayerHeightUU() const;
+
+	/**
 	 * EndzoneDepth clamped to something that can actually be built: at least 100 uu, never more than
 	 * the half length (a deeper zone than that would swallow the centre of the field).
 	 *
@@ -238,6 +258,63 @@ public:
 	 * than reconstructing it from EndzoneDepth and getting the width wrong.
 	 */
 	FBox GetEndzoneBounds(float EndSign) const;
+
+	// --- THE POCKET BEHIND THE GOAL (spec v28 §8) -------------------------------------------------
+	//
+	// "Set the spawns back behind the goals ... just move the wall further back and put the spawn
+	// area there."
+	//
+	// The three functions below are the ONE answer to "where is behind the goal", and they exist as a
+	// public surface because ATraceGameMode builds a second, deeper set of respawn pads out of the
+	// same band (BuildEndzoneSpawnPads) and the two must not derive it independently. That is not a
+	// hypothetical: the endzone-depth clamp used to live in three copies, and when one of them
+	// disagreed the pads landed on the centre dais. Same shape of bug, same cure - one function.
+
+	/**
+	 * |X| of the goal plane, i.e. the goal line the hoop hangs on. HalfLength() minus the pocket.
+	 *
+	 * THE anchor for the whole end of the field: the hoop, its two ramps, the scoring slab, the goal
+	 * line paint, the approach lane and the spawn band are all measured from here, so moving the end
+	 * wall (EndzoneDepth / FieldLength) moves the pocket and leaves the goal exactly where it plays.
+	 */
+	float GetGoalPlaneX() const;
+
+	/**
+	 * *** THE STANDING RULE, CHECKED AT STARTUP: does the gun still reach across this arena? ***
+	 *
+	 * UTraceSettings::HitscanRange is DERIVED from FieldLength and FieldWidth - it must span the
+	 * diagonal or shots expire in mid-air short of a visible target - and it has been left behind by
+	 * a field lengthening TWICE (spec v4 §3 and spec v28 §8), both times with the pairing rule
+	 * written in a comment beside the value. This runs from EnsureBuilt() on BOTH the procedural and
+	 * the baked path, so the mismatch reaches the log of every match instead of waiting for somebody
+	 * to think of running a console command.
+	 *
+	 * It WARNS and does not clamp: quietly raising a designer's ini value would make
+	 * Config/DefaultGame.ini stop being the authority it is documented to be. See the .cpp.
+	 */
+	void WarnIfHitscanRangeIsShort() const;
+
+	/**
+	 * World-space box of the playable pocket behind the goal at @p EndSign: goal plane to end wall,
+	 * sideline to sideline, floor to wall top.
+	 *
+	 * Identical to GetEndzoneBounds() by construction, because in a hockey end they ARE the same
+	 * region - see EndzoneDepth. It has its own name because "the endzone" and "behind the goal" are
+	 * different questions to a reader even when they have the same answer.
+	 */
+	FBox GetSpawnPocketBounds(float EndSign) const;
+
+	/**
+	 * Signed X of a spawn line inside the pocket at @p EndSign. @p Alpha 0 puts it just behind the
+	 * foot of the back approach ramp, 1 just short of the end wall's pawn standoff; it is clamped.
+	 *
+	 * WHY A BAND AND NOT A NUMBER. Both ends of it are derived - the ramp foot from GoalRampRun(),
+	 * the wall from the standoff and the capsule - so a pad placed at an Alpha stays out of the ramp
+	 * and out of the wall however the goal, the pocket or the pawn is retuned. A fraction of the
+	 * POCKET would not: at a shallower pocket the ramp would eat the near half of it and 0.35 would
+	 * be inside the slope.
+	 */
+	float GetSpawnLineX(float EndSign, float Alpha) const;
 
 	// --- MODE B: goals (spec v4 section 7) --------------------------------------------------------
 
@@ -278,10 +355,37 @@ public:
 	 */
 	FBox GetGoalBounds(float EndSign) const;
 
-	// --- MODE B, SPEC v6 §4.3: the goal is a RING SET INTO THE BACK WALL ---------------------------
+	// --- MODE B, SPEC v6 §4.3 + SPEC v28 §8: the goal is a FREE-STANDING RING ----------------------
 	//
-	// Verbatim: "Raise the goals 1.5x player height from the ground, place them into the back walls,
-	// and make them circular."
+	// v6 verbatim: "Raise the goals 1.5x player height from the ground, place them into the back
+	// walls, and make them circular."
+	//
+	// v28 §8 verbatim: "Set the spawns back behind the goals. Structure the ends of the field kind of
+	// like a hockey field, where you can play behind the goals. Keep the goals the same, raised in
+	// the air floating, just move the wall further back and put the spawn area there. Allow goals to
+	// be scored through either side of the goal."
+	//
+	// WHAT v28 CHANGED, AND WHAT IT DELIBERATELY DID NOT. The mouth is IDENTICAL: same 2000 uu
+	// diameter, same 1.5-player-height clearance under it, same centre height, same scoring disc.
+	// What moved is the wall behind it - out by ClampedEndzoneDepth() - so the hoop no longer sits in
+	// a hole in the wall. It hangs unsupported on the goal line with playable floor on BOTH sides,
+	// which is what "raised in the air floating" now literally means, and it is why:
+	//
+	//   * the four wall panels and the alcove that used to frame it are GONE. There is no wall there
+	//     any more. The end wall is a plain slab again, in both scoring modes, and is no longer
+	//     mode-tagged (it was only tagged because mode B had to replace it with a perforated copy).
+	//   * the annulus that closes the square opening down to a circle is now clamped so the whole
+	//     hoop CLEARS THE FLOOR - see GoalRingOuterRadius(). Left at its old 1.55x the bottom of the
+	//     ring would have been 286 uu underground, which is not floating, it is planted.
+	//   * the run-up ramp is built on BOTH faces (see GoalRampRun), and the neon rim on both faces,
+	//     because either side is now an approach.
+	//   * the scoring slab STRADDLES the ring plane instead of sitting in front of it, which is the
+	//     whole of "goals count from either side": every test that scores - ATraceEndzone's disc
+	//     test, its 10 Hz poll, ATraceCore's swept crossing test, ATraceGameMode's possession-change
+	//     test - already worked off the plane and the disc without caring about direction. They were
+	//     never one-directional in ARITHMETIC; the GEOMETRY was, because half of the volume was
+	//     buried in a wall. Moving the box is the fix, and it is why there is no second case
+	//     anywhere for "scored from behind".
 	//
 	// WHAT REPLACED WHAT. The v4/v5 goal was a box standing on the floor between the goal line and
 	// the end wall, framed by two posts and a crossbar. All of that is gone. In its place each end
@@ -311,28 +415,74 @@ public:
 	float GoalRingRaisePlayerHeights = 1.5f;
 
 	/**
-	 * Depth of the scoring slab in front of the wall plane, uu. The volume a carrier has to be
-	 * INSIDE to have "carried it through the ring".
+	 * TOTAL depth of the scoring slab, uu, CENTRED ON THE RING PLANE (spec v28 §8). The volume a
+	 * carrier has to be INSIDE to have "carried it through the ring".
 	 *
-	 * Not zero, because a plane cannot contain a pawn: at 320 uu a carrier standing at the top of
-	 * the approach ramp with their capsule against the wall is inside it, and a Core crossing the
-	 * plane is caught by the swept test in ATraceCore whatever the frame rate.
+	 * 320 -> 640, and the number doubled because its MEANING changed rather than its reach: it used
+	 * to be measured from the wall plane inward, so 320 uu bought 320 uu of field-side slab and
+	 * nothing behind (there was nothing behind - it was wall). It is now half either side, so each
+	 * side keeps exactly the 320 uu it always had and the far side gains the same. Halve it and you
+	 * halve BOTH approaches.
+	 *
+	 * Not zero, because a plane cannot contain a pawn: at 320 uu a side a carrier standing at the top
+	 * of either approach ramp with their capsule against the hoop is inside it, and a Core crossing
+	 * the plane is caught by the swept test in ATraceCore whatever the frame rate. GoalSlabHalfDepth()
+	 * applies a floor to it for exactly that reason - see there.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
-	float GoalRingDepth = 320.f;
+	float GoalRingDepth = 640.f;
 
 	/**
-	 * Run-up ramp in front of each ring, as a fraction of the ring's floor clearance -> how long the
-	 * slope is. The ramp is what makes "carrying the core through the goal" reachable at all now that
-	 * the mouth is 264 uu off the ground: a pawn's own jump apex leaves its origin ~50 uu short of
-	 * the bottom of the hoop, so without a ramp the carry-in path would be dead and only throwing
-	 * would score. Set to 0 to remove the ramp (and with it, in practice, the carry-in goal).
+	 * Run-up ramp at each ring, as a fraction of the ring's floor clearance -> how long the slope is.
+	 * The ramp is what makes "carrying the core through the goal" reachable at all now that the mouth
+	 * is 264 uu off the ground: a pawn's own jump apex leaves its origin ~50 uu short of the bottom
+	 * of the hoop, so without a ramp the carry-in path would be dead and only throwing would score.
+	 * Set to 0 to remove the ramps (and with them, in practice, the carry-in goal).
+	 *
+	 * SPEC v28 §8: there are TWO of them now, one on each face, because the pocket behind the goal is
+	 * playable and a carrier coming round the back has to be able to reach the mouth on the same
+	 * terms as one coming up the pitch. They are the same ramp mirrored, not a special case - one
+	 * loop over the two face signs in BuildGoalRing.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float GoalRampRunPerRise = 4.2f;
 
+	/**
+	 * How far the BOTTOM OF THE ANNULUS clears the floor, in player heights (spec v28 §8).
+	 *
+	 * The hoop is now free-standing, so the ring structure has a bottom that a player can see, and
+	 * "raised in the air floating" is a claim about THAT edge rather than about the mouth. The
+	 * annulus is therefore no longer 1.55 x the mouth radius unconditionally: it is whatever fits
+	 * between the mouth and this clearance. See GoalRingOuterRadius() for the arithmetic and for what
+	 * it costs (a thinner ring band at the shipped numbers: 204 uu instead of 550).
+	 *
+	 * In player heights, like every other vertical number in this arena, so shrinking the capsule
+	 * lowers the hoop AND the gap under it together instead of pushing the ring into the floor.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Arena", meta = (ClampMin = "0.0"))
+	float GoalRingFloatPlayerHeights = 0.34f;
+
 	/** Radius of the ring mouth, uu. Half of GoalHalfWidth()'s mouth, i.e. 1000 by default. */
 	float GoalRingRadius() const;
+
+	/**
+	 * Outer radius of the ring's structural annulus, uu - the outside edge of the hoop you can see.
+	 *
+	 * SPEC v28 §8. The annulus wants to be GoalRingOuterScale x the mouth (1550 uu), which was free
+	 * while the ring was set into a wall: everything below the floor line was simply buried in the
+	 * wall panel under the opening. A FREE-STANDING hoop has no such licence - at 1550 its bottom
+	 * would be 286 uu UNDERGROUND, and a ring growing out of the floor is not the floating goal the
+	 * spec asks for. So the band is clamped to whatever fits above
+	 * GoalRingFloatPlayerHeights x a player height, which on the shipped numbers is 204 uu of band
+	 * (outer radius 1204) with the bottom of the hoop 60 uu off the deck.
+	 *
+	 * The MOUTH is untouched by this - only the frame around it gets thinner - which is what keeps
+	 * "keep the goals the same" true where it counts: what scores is GoalRingRadius().
+	 */
+	float GoalRingOuterRadius() const;
+
+	/** Half the ring's depth along the field axis, uu. The hoop keeps the thickness of the wall it used to live in. */
+	float GoalRingHalfThickness() const;
 
 	/** Height of the BOTTOM of the hoop above the floor, uu. GoalRingRaisePlayerHeights x a player. */
 	float GoalRingClearanceZ() const;
@@ -340,8 +490,22 @@ public:
 	/** Height of the CENTRE of the hoop above the floor, uu. Clearance + radius, clamped to the wall. */
 	float GoalRingCentreZ() const;
 
-	/** Top of the approach ramp in front of the ring, uu. One step below the hoop, or 0 with no ramp. */
+	/** Top of the approach ramps at the ring, uu. One step below the hoop, or 0 with no ramp. */
 	float GoalRampTopZ() const;
+
+	/** Horizontal run of ONE approach ramp, uu, from the ring's face out to where it meets the floor. */
+	float GoalRampRun() const;
+
+	/**
+	 * Half the depth of the scoring slab, uu, measured out from the ring plane along the field axis.
+	 *
+	 * GoalRingDepth halved, with a FLOOR under it, and the floor is the part worth reading: a carrier
+	 * standing at the top of a ramp is held off the ring plane by the hoop's own half thickness plus
+	 * their capsule radius, so a slab shallower than that could be stood in front of and never
+	 * entered. Anything below that is a goal that cannot be carried into, which is a silent rule
+	 * change dressed up as a tuning value.
+	 */
+	float GoalSlabHalfDepth() const;
 
 	/** World-space centre of the ring mouth at @p EndSign. */
 	FVector GetGoalRingCentre(float EndSign) const;
@@ -638,25 +802,40 @@ public:
 	// ---------------------------------------------------------------------------------------------
 
 	/**
-	 * Length of the field along X (goal to goal).
+	 * Length of the field along X, WALL TO WALL. Since spec v28 §8 that is NOT goal to goal - see
+	 * below.
 	 *
 	 * 24000 -> 33600 for spec v4 section 3, verbatim: "Lengthen the map to a 3.5:1 ratio, adjusting
 	 * the structures to match." 33600 : 9600 is exactly 3.5 : 1, and [ASSUMPTION] "lengthen" grows
 	 * the long axis rather than narrowing the short one.
 	 *
+	 * SPEC v28 §8 - HOCKEY ENDS. 33600 -> 38400, and the whole of the extra 4800 is the two POCKETS
+	 * behind the goals: "just move the wall further back and put the spawn area there. You can
+	 * slightly lengthen the map for this." The goal plane did not move. It is still at |X| = 16800,
+	 * exactly where the end wall used to stand, so GOAL TO GOAL IS STILL 33600 uu and every tuned
+	 * distance on the pitch - the cover scatter, the run from the centre diamond to a hoop, the
+	 * 42-second full-field run - is unchanged. What changed is that there is now
+	 * ClampedEndzoneDepth() (2400 uu) of playable floor BEHIND each hoop, with the spawn fan in it.
+	 *
+	 * So: FieldLength = 33600 (goal to goal) + 2 x EndzoneDepth (the two pockets). Change either and
+	 * the other has to follow or the goals stop being 33600 apart; that pairing is the one thing in
+	 * this file that is not self-deriving, and it is stated here because there is nowhere else to
+	 * state it - the goal plane is HalfLength() - ClampedEndzoneDepth() by construction.
+	 *
 	 * The layout scales with this: the cover scatter, the corner banks, the pylons and the endzone
-	 * gates are all placed at fractions of the half length, so 33600 is a tuning value rather than a
+	 * gates are all placed at fractions of the half length, so 38400 is a tuning value rather than a
 	 * load-bearing constant. Do not drop it below ~12000 or the centre diamond and the two spawn
 	 * lines start to overlap.
 	 *
-	 * THE COST, STATED PLAINLY: at WalkSpeed 800 a full-field run is 42 seconds. If that plays badly
-	 * the alternative reading of the same note is to NARROW instead - set this to 24000 and FieldWidth
-	 * to 6857 and the arena rebuilds itself at 3.5 : 1 with a 30-second field. Nothing else needs
-	 * touching; that is what the "everything is a fraction" rule is for. (Check HitscanRange either
-	 * way - see FieldWidth.)
+	 * THE COST, STATED PLAINLY: at WalkSpeed 800 a wall-to-wall run is now 48 seconds (42 of them
+	 * goal to goal, 3 in each pocket). UTraceSettings::HitscanRange has to clear the field DIAGONAL
+	 * and no longer does: 38400 x 9600 is 39581 uu against a shipped 36000, so a shot down the long
+	 * diagonal now dies 3581 uu short of a target the player can see. That property lives in
+	 * UTraceSettings and in Config/DefaultGame.ini, neither of which this pass owns; it is called out
+	 * in the report and it wants 39600.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
-	float FieldLength = 33600.f;
+	float FieldLength = 38400.f;
 
 	/**
 	 * Width of the field along Y (sideline to sideline). Layout scales with this too.
@@ -671,11 +850,12 @@ public:
 	 * what the half-time side switch measures against), the grid, the flanks and the corner banks.
 	 *
 	 * THE ONE NUMBER THAT DOES NOT LIVE HERE and must be re-checked by hand is
-	 * UTraceSettings::HitscanRange, which has to clear the field diagonal. 33600 x 9600 is a 34944 uu
-	 * diagonal, so the 28000 that covered the old 24000 x 9600 field NO LONGER REACHES: a shot down
-	 * the long diagonal now dies 6944 uu short of a target the player can plainly see. That property
-	 * lives in UTraceSettings (and, because the ini wins, in Config/DefaultGame.ini as well) and it
-	 * needs to go to 36000. It is called out in this pass's report.
+	 * UTraceSettings::HitscanRange, which has to clear the field diagonal. Spec v28 §8 lengthened the
+	 * field to 38400 x 9600 for the two hockey pockets, i.e. a 39581 uu diagonal, so the 36000 that
+	 * covered the 33600 field NO LONGER REACHES: a shot down the long diagonal dies 3581 uu short of
+	 * a target the player can plainly see. That property lives in UTraceSettings (and, because the
+	 * ini wins, in Config/DefaultGame.ini as well), neither of which the map pass owns; it needs to
+	 * go to 39600 and it is called out in that pass's report.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FieldWidth = 9600.f;
@@ -696,11 +876,22 @@ public:
 	/**
 	 * How far each endzone reaches in from its end wall, i.e. its size along X.
 	 *
+	 * SINCE SPEC v28 §8 THIS IS THE POCKET BEHIND THE GOAL - the hockey rink's end zone. The goal
+	 * plane and the goal line are the same thing (GoalLineX()), the hoop hangs on it, and everything
+	 * from there back to the end wall is playable floor with the spawn fan in it. One number, one
+	 * region, and the mode-A endzone volume, the mode-A floor paint, the spawn band and "behind the
+	 * goal" are all literally the same box - which is why this is the dial for how much room there is
+	 * back there rather than a second "PocketDepth" property that could disagree with it.
+	 *
 	 * THERE IS NO WIDTH DIAL, and that is deliberate: an endzone spans the ENTIRE width of the field,
 	 * sideline to sideline, exactly like a real football endzone. See EndzoneHalfWidth().
 	 *
 	 * Read it through ClampedEndzoneDepth(), never raw - three separate places used to re-clamp this
 	 * by hand and one of them getting it wrong is what put both teams' spawn lines on the centre dais.
+	 *
+	 * Growing it moves the WALL outward, not the goal, as long as FieldLength is grown by twice as
+	 * much with it (see FieldLength). At 2400 the pocket holds the 941 uu back ramp, a 1257 uu spawn
+	 * band behind it and the corner pylons, with room to run round the hoop on either side.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float EndzoneDepth = 2400.f;
@@ -1016,23 +1207,25 @@ protected:
 	void BuildEndzones(bool bBuildVisuals);
 
 	/**
-	 * The MODE B goals (spec v6 §4.3): a circular neon ring set into each back wall, the perforated
-	 * end wall that carries it, the alcove behind it, the approach ramp in front of it and the
-	 * scoring volume across its mouth. Built unconditionally and then hidden if mode A is the one
-	 * armed - see the two-modes note in the class comment.
+	 * The MODE B goals (spec v6 §4.3, rehung by spec v28 §8): a circular neon ring floating on each
+	 * goal line, an approach ramp on each of its faces, the floor lane that leads to it from both
+	 * directions and the scoring volume straddling its mouth. Built unconditionally and then hidden
+	 * if mode A is the one armed - see the two-modes note in the class comment.
 	 */
 	void BuildGoals(bool bBuildVisuals);
 
 	/**
-	 * One end's worth of mode-B wall: the four panels that leave a square opening, the annulus that
-	 * closes that opening down to a circle, the neon hoop on its inner rim, the alcove behind and the
-	 * pawn standoffs that used to run across the whole wall face.
+	 * One end's worth of mode-B goal: the annulus that closes a square hole in nothing down to a
+	 * circle, the neon hoop on each of its faces, and the two run-up ramps.
 	 *
-	 * Split out of BuildGoals because it is the piece that has to agree with BuildFloorAndWalls: the
-	 * solid end wall it replaces is tagged into EndzoneModePieces there, and these are tagged into
-	 * GoalModePieces, so exactly one of the two exists at a time.
+	 * WAS BuildGoalWall, AND THE RENAME IS THE CHANGE. Until spec v28 §8 this built a perforated
+	 * REPLACEMENT for the end wall, which is why it had to agree with BuildFloorAndWalls about wall
+	 * thickness, panels and standoffs, and why the solid slab it replaced was mode-tagged there. The
+	 * wall is now 2400 uu further back and is nobody's business but its own: this builds a hoop
+	 * hanging in the air and nothing else, and BuildFloorAndWalls builds one plain end wall for both
+	 * modes.
 	 */
-	void BuildGoalWall(float Sign, bool bBuildVisuals);
+	void BuildGoalRing(float Sign, bool bBuildVisuals);
 
 	void BuildPlayerStarts();
 	void BuildLighting();
@@ -1391,20 +1584,9 @@ protected:
 	float HalfLength() const { return FieldLength * 0.5f; }
 	float HalfWidth() const { return FieldWidth * 0.5f; }
 
-	/**
-	 * ONE PLAYER HEIGHT, in uu, and the single source of every structure height in the arena.
-	 *
-	 * Spec v3 section 7 keys the sketch's three structure classes to the player: a green outline is
-	 * 1x, orange 2x and red 3.5x. Those are 176 / 352 / 616 uu today, but they are only correct
-	 * while the capsule is 88 uu half height - so this READS THE CAPSULE rather than hard-coding
-	 * 176. ATraceCharacter's class default object is asked for its capsule half height and doubled;
-	 * if the CDO cannot be reached (it always can, but the arena must never crash over art) it
-	 * falls back to the documented 176 and says so in the log.
-	 *
-	 * Consequence worth knowing: shrink the capsule and every cover block in the arena shrinks with
-	 * it, which is what "1x player height" is supposed to mean.
-	 */
-	float PlayerHeightUU() const;
+	// PlayerHeightUU() is declared PUBLIC, with the rest of the arena's oracle surface. It used to
+	// live here, among the protected derived-layout helpers; spec v28 §8's goal-side harness needs it
+	// and so does anything else that wants to know how big a person is.
 
 	/**
 	 * |Y| at which the corner banks start, i.e. the half width of the FLAT central playfield.

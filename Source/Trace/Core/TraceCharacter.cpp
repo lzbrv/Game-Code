@@ -40,6 +40,7 @@
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceRailgunFireCurve.h"
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceMelee.h"                // spec v28 §10: TraceMelee::IsDualWieldEnabled()
 #include "Gameplay/TraceParry.h"                // the parry entry point and its queries (spec §3)
 #include "Gameplay/TraceTrailComponent.h"
 #include "Gameplay/TraceWeaponComponent.h"
@@ -356,6 +357,36 @@ namespace TraceCharacterLayout
 	 */
 	const FVector RailgunLeftHand(12.4f, -2.6f, -5.5f);
 	const FVector RailgunLeftKnuckle(14.5f, -2.6f, -4.5f);
+
+	// ---------------------------------------------------------------------------------------------
+	// [DUALWIELD] THE OFF HAND  (spec v28 §10: "Gun in one hand, knife in the other")
+	// ---------------------------------------------------------------------------------------------
+	//
+	// The owner's sentence is literal, so the left hand has to LEAVE the weapon. On both rigs it is
+	// currently a support hand — the cube gun's frame, or the railgun's foregrip — and leaving it
+	// there while a blade grew out of it would read as a knife taped to the gun rather than as a
+	// second weapon.
+	//
+	// WHERE IT GOES, AND WHY THESE THREE NUMBERS. Down and out to the left, forward of the frame:
+	//   x  +6.0   ahead of the right hand (-0.8) so the blade is not hidden behind the gun body, and
+	//             far short of the muzzle (19.6 cube / 29.4 railgun) so it never crosses the barrel.
+	//   y  -9.6   nearly three times the -3.4 support pose. The rig itself hangs at y = +14.5 (the
+	//             lower RIGHT of frame), so this pulls the off hand back toward the screen centre —
+	//             which is where a low guard actually sits — without reaching the crosshair.
+	//   z  -9.5   5.5 uu below the support pose. A low, relaxed guard: the blade angles up and inward
+	//             from it, which is the pose the stab animation already thrusts out of.
+	//
+	// The SAME pose for the cube gun and the railgun, deliberately. The support hand differed between
+	// them because it had to touch each weapon's geometry; an off hand touches neither, so one pose is
+	// correct for both and a second constant would only be a second thing to keep in step.
+	//
+	// FRAMING AND DEPTH, the two rules the file header requires every viewmodel constant to keep:
+	// x = 6.0 is a third of the cube gun's muzzle depth and a fifth of the railgun's, and the knife
+	// rig hung off it reaches ~23 uu at rest and ~39 uu fully extended (see TraceKnifeLayout) — still
+	// well inside the 76 uu the muzzle already clears the capsule at. Nothing here can touch world
+	// geometry or the near plane.
+	const FVector DualWieldLeftHand(6.0f, -9.6f, -9.5f);
+	const FVector DualWieldLeftKnuckle(8.1f, -9.6f, -8.5f);
 
 	// Fire animation. The artist's clip is 1.90 s: 1.05 s of charge, a 0.10 s discharge, then 0.75 s
 	// of decay. Trace's gun has NO windup — it is a 150 RPM hitscan — so the charge segment is not
@@ -2351,8 +2382,29 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		TEXT("The viewmodel part table was reordered; the left-hand indices below no longer point "
 			 "at the left hand, so the railgun would be held by nothing."));
 
-	const FVector LeftHand = bRailgun ? TraceCharacterLayout::RailgunLeftHand : Parts[LeftHandIndex].Location;
-	const FVector LeftKnuckle = bRailgun ? TraceCharacterLayout::RailgunLeftKnuckle : Parts[LeftKnuckleIndex].Location;
+	// [DUALWIELD] SPEC v28 §10 — the off hand comes off the weapon entirely and takes the knife.
+	//
+	// ONE `if`, ABOVE THE EXISTING TERNARIES RATHER THAN INSIDE THEM, so the railgun/cube choice below
+	// is exactly the code that shipped in v27 and a revert has nothing to unpick. The anchor is
+	// remembered on the actor (ViewModelOffHandLocation) because UTraceWeaponComponent needs to hang
+	// KnifeViewRoot at the same point and must not carry a second copy of these numbers — that is the
+	// duplicate-constant failure this codebase logs by name.
+	//
+	// READ AT BUILD TIME, WHICH IS ONCE PER PAWN. Flipping Trace.Knife.DualWield mid-session changes
+	// every rule immediately but re-poses the hand on the next respawn; the .ini and the launch flag,
+	// which are how the switch is actually meant to be thrown, are both set before any pawn exists.
+	// Stated so nobody spends time on a "the hand did not move" that is not a bug.
+	const bool bDualWieldPose = TraceMelee::IsDualWieldEnabled();
+
+	const FVector LeftHand = bDualWieldPose
+		? TraceCharacterLayout::DualWieldLeftHand
+		: (bRailgun ? TraceCharacterLayout::RailgunLeftHand : Parts[LeftHandIndex].Location);
+	const FVector LeftKnuckle = bDualWieldPose
+		? TraceCharacterLayout::DualWieldLeftKnuckle
+		: (bRailgun ? TraceCharacterLayout::RailgunLeftKnuckle : Parts[LeftKnuckleIndex].Location);
+
+	ViewModelOffHandLocation = LeftHand;
+	bViewModelOffHandFree = bDualWieldPose;
 
 	for (int32 Index = 0; Index < UE_ARRAY_COUNT(Parts); ++Index)
 	{
@@ -2750,6 +2802,16 @@ UMaterialInstanceDynamic* ATraceCharacter::GetViewModelBodyMID() const
 UMaterialInstanceDynamic* ATraceCharacter::GetViewModelNeonMID() const
 {
 	return ViewModelNeonMID;
+}
+
+bool ATraceCharacter::GetViewModelOffHand(FVector& OutLocation) const
+{
+	// [DUALWIELD] Both facts come out of EnsureViewModelBuilt, which is the only writer. Reporting
+	// the location even when the hand is NOT free is deliberate: a caller that wants to know where
+	// the support hand is (a future two-handed prop, a debug draw) gets a real answer, and the bool
+	// is the only thing that says whether the hand is available to hold something.
+	OutLocation = ViewModelOffHandLocation;
+	return bViewModelBuilt && bViewModelOffHandFree;
 }
 
 void ATraceCharacter::SetViewModelVisible(bool bVisible)

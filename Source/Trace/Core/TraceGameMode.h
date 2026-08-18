@@ -876,6 +876,13 @@ private:
 	 */
 	bool bWarnedBotFillHasNoTimeout = false;
 
+	/**
+	 * One-shot latch for spec v28 §9b's "the bot fill is waiting for the whistle" line. Same 4 Hz
+	 * reasoning again — the warm-up is a few seconds of poll passes and every one of them would
+	 * otherwise say it. Server-only, never replicated.
+	 */
+	bool bLoggedBotFillHeldForWarmup = false;
+
 #if !UE_BUILD_SHIPPING
 	FTimerHandle BotDebugTimerHandle;
 

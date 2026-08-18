@@ -5,6 +5,8 @@
 #include "CollisionQueryParams.h"
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Containers/Ticker.h"           // spec v28 §6: Trace.Bots.LockoutTest samples per frame
+#include "Engine/Engine.h"               // ...and finds the authoritative world through GEngine
 #include "Engine/EngineTypes.h"
 #include "Engine/HitResult.h"
 #include "Engine/World.h"
@@ -99,6 +101,33 @@ namespace TraceBotConstants
 	 * in the air. Three of five still leaves two goal-side.
 	 */
 	static constexpr int32 LooseCoreChasers = 3;
+
+	// --- SPEC v28 §6: "the bots just stand on top of a locked out core" -----------------------------
+
+	/**
+	 * How far a LOCKED-OUT bot keeps clear of a turned-over Core, as a MULTIPLE OF THE PICKUP RADIUS.
+	 *
+	 * *** RELATIVE, because the thing it is keeping clear of is a rule and not a distance. *** The
+	 * behaviour being fixed is "standing on top of it", and "on top of it" means inside
+	 * UTraceSettings::CorePickupRadius — the radius at which walking over the Core takes it. Written
+	 * as a multiple, this backs off proportionally the day that radius is retuned; written as a typed
+	 * 480 it would quietly stop meaning "clear of the ball" the first time somebody moved the base.
+	 *
+	 * 4x the shipped 120 uu is 480 uu — about four capsule widths, far enough that the bot is
+	 * visibly NOT contesting and near enough that it is back on the ball within a second of the
+	 * window expiring, which is the whole point of backing off rather than leaving the area.
+	 */
+	static constexpr float LockoutKeepOutPickupRadii = 4.f;
+
+	/**
+	 * How hard the retreat blends against whatever the bot was already doing, 0..1.
+	 *
+	 * 1.0 (a pure "run away from the ball") looked like a rout and threw defenders off their
+	 * stations. This is a WEIGHT on the away-vector added to the behaviour's own steering, so a
+	 * defender backing out of the keep-out radius still drifts toward its goal-side station while
+	 * it does it — the same blend shape ApplySteering already uses for wall repulsion.
+	 */
+	static constexpr float LockoutKeepOutWeight = 1.6f;
 
 	/**
 	 * How many bots per team hold a station in front of their own goal. The rest play normally.
@@ -671,6 +700,38 @@ static TAutoConsoleVariable<int32> CVarTraceBotAutoCharacter(
 	TEXT("   ability decision short-circuits at 'no character', which is an independent red arm."),
 	ECVF_Default);
 
+/**
+ * SPEC v28 §6's RED ARM — "the bots just stand on top of a locked out core".
+ *
+ * 0 (shipped): a bot knows what the turnover window means for it. The locked-out side backs off out
+ *              of the keep-out radius and defends; the other side goes for the pull.
+ * 1:           the pre-v28 behaviour — every bot treats a turned-over Core as an ordinary loose one
+ *              and runs at it, which reproduces the reported symptom in the same process, in the same
+ *              match, on the same fixture. NEVER SHIP 1.
+ *
+ * It is deliberately ONE switch over both halves. The two behaviours are the same fact read from the
+ * two sides ("this ball has an owner for five seconds"), so an arm that reverted one and not the
+ * other would not be a before-and-after of anything a player described.
+ */
+static TAutoConsoleVariable<int32> CVarTraceBotLegacyLockout(
+	TEXT("Trace.Bots.LegacyLockout"),
+	0,
+	TEXT("TEST ARM ONLY. 0 (shipped, spec v28 §6): during a turnover lockout the locked-out team's\n")
+	TEXT("   bots back off and defend, and the opposing team's bots go for the pull.\n")
+	TEXT("1: the pre-v28 behaviour - every bot chases the Core it cannot pick up and stands on it.\n")
+	TEXT("   The reported symptom, for the before-and-after. Never ship 1."),
+	ECVF_Cheat);
+
+/** SPEC v28 §6. True while the pre-v28 "chase it anyway" behaviour is armed. */
+static bool BotLegacyLockoutArmed()
+{
+#if !UE_BUILD_SHIPPING
+	return CVarTraceBotLegacyLockout.GetValueOnAnyThread() != 0;
+#else
+	return false;
+#endif
+}
+
 /** Which rung of the ladder above is in force. Always the top rung in a shipping build. */
 static int32 BotInterceptFixLevel()
 {
@@ -759,6 +820,17 @@ namespace TraceBotTelemetry
 		int32 ThrowGiveUps      = 0;   // lined up on a throw and abandoned it
 		int32 LooseChaseTicks   = 0;   // bot-ticks spent running at a loose Core
 		int32 GoalDefenceTicks  = 0;   // bot-ticks spent holding a station in front of our own goal
+
+		// --- SPEC v28 §6. The turnover lockout, counted from both sides of it.
+		//
+		// These four exist because the reported bug is INVISIBLE in every other counter: a bot
+		// standing on a Core it cannot pick up still reads as "chasing", which is what LooseChaseTicks
+		// happily recorded for five seconds a turnover. Split out, "backoff" and "stand-on" are the
+		// before-and-after of the note in one line.
+		int32 LockoutBackOffs   = 0;   // decisions where a LOCKED-OUT bot declined the chase
+		int32 LockoutPullTicks  = 0;   // bot-ticks a PULLING-team bot spent holding the pull input
+		int32 LockoutPullStarts = 0;   // times a bot pressed the pull (the rising edge)
+		int32 LockoutStandOns   = 0;   // bot-ticks a LOCKED-OUT bot spent inside the keep-out radius
 
 		// --- MODE B, spec v5 §4. Why a shot at goal did or did not happen.
 		//
@@ -1280,10 +1352,12 @@ namespace TraceBotTelemetry
 		{
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[BotKitB] t=%.0fs | throw: attempt=%d at-goal=%d to-mate=%d giveup=%d ")
-				TEXT("| loose: chaseticks=%d | defend: ticks=%d"),
+				TEXT("| loose: chaseticks=%d | defend: ticks=%d ")
+				TEXT("| v28 §6 lockout: back-offs=%d pull-presses=%d pull-ticks=%d stand-on-ticks=%d"),
 				Elapsed,
 				K.ThrowAttempts, K.ThrowsAtGoal, K.ThrowsToTeammate, K.ThrowGiveUps,
-				K.LooseChaseTicks, K.GoalDefenceTicks);
+				K.LooseChaseTicks, K.GoalDefenceTicks,
+				K.LockoutBackOffs, K.LockoutPullStarts, K.LockoutPullTicks, K.LockoutStandOns);
 
 			// Spec v5 §4. The line that says WHY a shot at goal did or did not happen, because
 			// "at-goal=0" on its own is a symptom with four possible causes and no way to tell them
@@ -1424,6 +1498,11 @@ void ATraceBotController::OnPossess(APawn* InPawn)
 	bPassInputHeld = false;
 	bCommitCarryIn = false;
 	bPassOwnsAim = false;
+	// SPEC v28 §6. The pull latch is body state as well: the Core drops a dead puller's hold itself,
+	// but the mirror here has to be cleared or the new pawn's first tick believes it is already
+	// holding the button and never sends the press that would start a hold.
+	bPullInputHeld = false;
+	bPullOwnsAim = false;
 	PassCooldownUntilTime = 0.f;
 	NextPassEvalTime = 0.f;
 	// Spec v13 §6: a wind-up is body state too, and a fresh pawn has not wound anything up.
@@ -1648,12 +1727,22 @@ void ATraceBotController::Tick(float DeltaSeconds)
 			{
 				ApplySecondaryInput(BotCharacter, false);
 			}
+
+			// SPEC v28 §6. A dead pawn's pull is already dropped by ServerTickTurnover (it prunes
+			// dead pullers every frame), but the LATCH is ours and has to come up here or the
+			// respawned bot starts life holding a button nobody pressed.
+			if (bPullInputHeld)
+			{
+				ApplyPullInput(false);
+			}
 		}
 
 		bTriggerHeld = false;
 		bPassInputHeld = false;
 		bCrouchHeld = false;
 		bSecondaryInputHeld = false;
+		bPullInputHeld = false;
+		bPullOwnsAim = false;
 		PassPhase = ETraceBotPassPhase::None;
 		PassReceiver = nullptr;
 		bCommitCarryIn = false;
@@ -1669,6 +1758,7 @@ void ATraceBotController::Tick(float DeltaSeconds)
 	DesiredMoveDirection = FVector::ZeroVector;
 	bWantsToAim = false;
 	bPassOwnsAim = false;
+	bPullOwnsAim = false;          // SPEC v28 §6: re-earned every tick, exactly like the pass's
 	bWantsDashThisTick = false;
 	bWantsJumpThisTick = false;
 	ShootTarget = nullptr;
@@ -1751,6 +1841,22 @@ void ATraceBotController::Tick(float DeltaSeconds)
 	}
 
 	UpdateMovementIntent(DeltaSeconds);
+
+	// SPEC v28 §6 — the two halves of the lockout rule that must hold whatever state the bot chose.
+	//
+	// AFTER the behaviours, on purpose. The keep-out is a correction to steering that has already
+	// happened, exactly like the wall repulsion in ApplySteering, and putting it here means it
+	// applies to every behaviour a locked-out bot can end up in — including the ones added after
+	// this was written, which is the failure mode of writing it as a branch inside DefendGoal.
+	ApplyLockoutKeepOut();
+
+	// ...and the pull latch comes back up the moment nothing asked for it this tick: the window
+	// closed, somebody else won the race, the bot died, it is now the carrier, or it simply changed
+	// its mind. ONE release, in one place, keyed on the one fact that means "no pull is wanted".
+	if (!bPullOwnsAim && bPullInputHeld)
+	{
+		ApplyPullInput(false);
+	}
 
 	// The pass runs EVERY tick, not on the decision cadence. A 0.5 s dwell steered from a 0.3 s
 	// decision tick loses whole attempts to phase alignment, and the abort path has to be able to
@@ -1979,11 +2085,50 @@ void ATraceBotController::GatherWorldState()
 	LooseCorePoint = FVector::ZeroVector;
 	LooseCoreDistSq = 0.f;
 
+	// SPEC v28 §6. Cleared every tick beside the loose-Core facts they qualify, so a stale window can
+	// never outlive the frame that saw it — the lockout expires on the Core's clock, not on ours.
+	bTurnoverActive = false;
+	bLockedOutOfCore = false;
+	bMayPullCore = false;
+	TurnoverSecondsLeft = 0.f;
+	TurnoverCoreLocation = FVector::ZeroVector;
+
 	if (const ATraceCore* TheCore = ATraceCore::Get(GetWorld()))
 	{
 		bModeB = TheCore->IsModeB();
 		if (bModeB)
 		{
+			// SPEC v28 §6 — "the bots just stand on top of a locked out core".
+			//
+			// ASKED OF THE CORE, not re-derived: IsTurnoverActive() and GetTurnoverLockoutTeam() are
+			// the same two facts ServerTryLoosePickup refuses a pickup on and CanPullNow refuses a
+			// pull on, so a bot cannot end up believing it may have a ball the server will not give
+			// it (or, worse, backing off from one it was allowed to take).
+			//
+			// The legacy arm reads the window and then ignores it, deliberately: everything below
+			// still LOGS correctly under Trace.Bots.LegacyLockout 1, so the red run reports the same
+			// numbers about the same window as the green one and the two are comparable.
+			if (TheCore->IsTurnoverActive() && MyTeam != ETraceTeam::None)
+			{
+				bTurnoverActive = true;
+				TurnoverSecondsLeft = TheCore->GetTurnoverSecondsRemaining();
+				TurnoverCoreLocation = TheCore->GetLooseLocation();
+
+				const ETraceTeam LockedOut = TheCore->GetTurnoverLockoutTeam();
+				bLockedOutOfCore = (LockedOut == MyTeam);
+				bMayPullCore = (TheCore->GetTurnoverPullingTeam() == MyTeam);
+			}
+
+			// BOTH EDGES OF THE WINDOW RE-PLAN IMMEDIATELY. See bWasLockedOutOfCore: a decision
+			// cadence of ~0.3 s is invisible in ordinary play and glaring against a 5 s rule, at the
+			// start ("it kept running at it") and at the end ("it stood there while the ball went
+			// live") alike.
+			if (bLockedOutOfCore != bWasLockedOutOfCore)
+			{
+				bWasLockedOutOfCore = bLockedOutOfCore;
+				TimeUntilNextDecision = 0.f;
+			}
+
 			// LEAD BY HOW LONG IT WILL ACTUALLY TAKE ME TO GET THERE, not by a fixed 0.25 s.
 			//
 			// The fixed lead was sized for "the Core is 40 uu further on by the time my movement input
@@ -2169,9 +2314,43 @@ void ATraceBotController::DecideState()
 			}
 		}
 
-		State = (CloserTeammates < TraceBotConstants::LooseCoreChasers)
-			? ETraceBotState::ChaseLooseCore
-			: (ShouldHoldGoalDefence() ? ETraceBotState::DefendGoal : ETraceBotState::Fight);
+		// *** SPEC v28 §6 — I AM NOT ALLOWED TO HAVE THIS BALL. *** "The bots just stand on top of a
+		// locked out core, fix that behavior."
+		//
+		// The chase above is right for a loose Core and wrong for a locked one, and the difference is
+		// not a matter of degree: for these five seconds the pickup is refused outright
+		// (ATraceCore::ServerTryLoosePickup, "on the team that dropped it") and the pull is refused
+		// outright (CanPullNow, same sentence). Contesting is not merely a poor play, it is a play
+		// that cannot succeed — the bot arrives, the rule says no, and because "run at the Core" is
+		// SATISFIED once you are standing on it, it stands there. That is the report, exactly.
+		//
+		// So the locked-out side leaves the chase ranking entirely and takes the job it CAN do: get
+		// goal-side and cover the mouth (the pulling team is about to have the ball) or fight, which
+		// is the same fallback pair the ranking's losers already take. The keep-out push in
+		// ApplyLockoutKeepOut() is what makes "back off" physical rather than notional; this line is
+		// what stops it being re-chosen next tick.
+		//
+		// It expires by itself: bLockedOutOfCore is re-derived from the Core's own window every tick,
+		// so the frame the lockout lapses this bot is back in the ordinary chase with everyone else.
+		if (bLockedOutOfCore && !BotLegacyLockoutArmed())
+		{
+			TRACE_BOT_KIT(LockoutBackOffs);
+
+			// The note's own three words, in order of how much they are worth here: DEFEND (the
+			// nearest couple of bots hold the mouth the other side is about to attack), FIGHT (kill
+			// the puller — the one thing that CAN still take the possession back during the window),
+			// REPOSITION (nothing in reach: push up to the staging line so the side is not caught
+			// flat when the lockout lapses and the ball is live for everybody again).
+			State = ShouldHoldGoalDefence()
+				? ETraceBotState::DefendGoal
+				: (NearestEnemy.IsValid() ? ETraceBotState::Fight : ETraceBotState::Regroup);
+		}
+		else
+		{
+			State = (CloserTeammates < TraceBotConstants::LooseCoreChasers)
+				? ETraceBotState::ChaseLooseCore
+				: (ShouldHoldGoalDefence() ? ETraceBotState::DefendGoal : ETraceBotState::Fight);
+		}
 	}
 	else if (bEnemyIsCarrier)
 	{
@@ -3080,6 +3259,41 @@ void ATraceBotController::BehaviourChaseLooseCore(float DeltaSeconds)
 	ToCore.Z = 0.f;
 	DesiredMoveDirection = ToCore.GetSafeNormal();
 
+	// =============================================================================================
+	// SPEC v28 §6, THE OTHER HALF — "the opposing team's bots go for the pull."
+	//
+	// This branch only ever runs for the side the turnover BELONGS to: the locked-out side does not
+	// reach ChaseLooseCore at all any more (DecideState sends it to the mouth), and outside a
+	// turnover bMayPullCore is false, so an ordinary loose ball is chased exactly as it was.
+	//
+	// THE BOT PRESSES THE BUTTON; IT DOES NOT AWARD ITSELF THE CORE. Everything below produces two
+	// inputs — where the crosshair points, and whether the pull button is down — and hands them to
+	// ATraceCore::RequestPullInput, the same entry a human's right mouse reaches. The 0.3 s hold, the
+	// 4 degree cone, the line of sight, "releasing cancels rather than pauses" and the race between two
+	// pullers all stay in ServerTickTurnover where they already are. A bot therefore cannot pull
+	// anything a player in its position could not, which is the only version of this worth shipping.
+	//
+	// AND IT KEEPS RUNNING. The movement above is untouched: if the pull is refused (no line of
+	// sight, somebody else finishes first) the bot is still closing on the ball and can simply pick
+	// it up, which is legal for this side during the window. The pull is a shortcut, not a plan.
+	if (bTurnoverActive && bMayPullCore && !bIAmCarrier && !BotLegacyLockoutArmed())
+	{
+		// AT THE CORE ITSELF, not at the lead point the feet are steering for. The cone is measured
+		// against where the ball IS; aiming a pull at where it is going would fail the very test the
+		// press exists to satisfy.
+		bPullOwnsAim = true;
+		PullAimPoint = TurnoverCoreLocation;
+
+		ApplyPullInput(true);
+		TRACE_BOT_KIT(LockoutPullTicks);
+		return;   // the crosshair has one job this tick; UpdateCombat honours bPullOwnsAim
+	}
+
+	// Not (or no longer) a pull candidate. The button is put back up centrally in Tick(), on the one
+	// rule "nothing asked for the pull this tick" — a release scattered through the behaviours is a
+	// release that will be missing from whichever behaviour is added next, and a latch left down
+	// after the window is a pull the bot never meant to make.
+
 	// The chase is a race and it is the one moment in mode B where losing by half a metre loses the
 	// possession, so a dash is well spent here — and unlike the carrier's dash there is no second
 	// charge to hold in reserve, because there is nothing to escape from yet.
@@ -3185,6 +3399,107 @@ void ATraceBotController::BehaviourDefendGoal(float DeltaSeconds)
 		bWantsToAim = true;
 		DesiredAimPoint = GetAimPointOn(Target);
 	}
+}
+
+// =================================================================================================
+// SPEC v28 §6 — the turnover lockout
+//
+// "The bots just stand on top of a locked out core, fix that behavior."
+// =================================================================================================
+
+float ATraceBotController::GetLockoutKeepOutRadius()
+{
+	// *** RELATIVE TO THE RULE, NOT A TYPED DISTANCE. *** "Standing on top of it" is not a poetic
+	// description — it is being inside UTraceSettings::CorePickupRadius, the radius at which walking
+	// over a loose Core takes it (ATraceCore::ServerTryLoosePickup). So the distance a locked-out bot
+	// keeps is written as a MULTIPLE of that radius and moves with it: retune the pickup radius and
+	// the bots back off proportionally, with nothing here to remember to update.
+	const float PickupRadius = FMath::Max(1.f, UTraceSettings::Get().CorePickupRadius);
+	return PickupRadius * TraceBotConstants::LockoutKeepOutPickupRadii;
+}
+
+void ATraceBotController::ApplyPullInput(bool bHeld)
+{
+	ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (BotCharacter == nullptr)
+	{
+		bPullInputHeld = false;
+		return;
+	}
+
+	if (bHeld == bPullInputHeld)
+	{
+		return;   // Level, not edge. The Core wants one press and one release, not one per tick.
+	}
+
+	bPullInputHeld = bHeld;
+
+	if (ATraceCore* TheCore = ATraceCore::Get(BotCharacter->GetWorld()))
+	{
+		// The bot is server-side, so RequestPullInput lands straight on ServerApplyPullInput — the
+		// same function a listen host's own right mouse reaches, and the same one a remote client
+		// reaches one relay hop later.
+		TheCore->RequestPullInput(bHeld, BotCharacter);
+
+		if (bHeld)
+		{
+			TRACE_BOT_KIT(LockoutPullStarts);
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[BotLockout] %s is pulling the turned-over Core (%.1fs left on the window)."),
+				*GetNameSafe(GetPlayerState<APlayerState>()), TurnoverSecondsLeft);
+		}
+	}
+}
+
+void ATraceBotController::ApplyLockoutKeepOut()
+{
+	if (!bTurnoverActive || !bLockedOutOfCore || BotLegacyLockoutArmed())
+	{
+		return;
+	}
+
+	ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (BotCharacter == nullptr)
+	{
+		return;
+	}
+
+	FVector Away = BotCharacter->GetActorLocation() - TurnoverCoreLocation;
+	Away.Z = 0.f;
+
+	const float KeepOut = GetLockoutKeepOutRadius();
+	const float Distance = static_cast<float>(Away.Size());
+	if (Distance >= KeepOut)
+	{
+		return;   // Already clear. This rule has nothing to say about where else the bot goes.
+	}
+
+	// COUNTED BEFORE IT IS CORRECTED, and that is the whole measurement: this counter is "bot-ticks
+	// spent stood on a ball it may not touch", which is the reported bug in one number. Under the
+	// red arm (Trace.Bots.LegacyLockout 1) this function returns above and the counter stays at zero
+	// while the bots pile onto the Core — so the two arms are told apart by the STAND-ON count in
+	// [BotLockout], which samples position rather than by this one. See RunLockoutTest().
+	TRACE_BOT_KIT(LockoutStandOns);
+
+	if (Distance <= KINDA_SMALL_NUMBER)
+	{
+		// Dead centre. Any direction is "away"; take the one the bot is already facing so the retreat
+		// does not look like a flinch, and so two bots stacked on the ball do not pick the same one.
+		Away = BotCharacter->GetActorForwardVector();
+		Away.Z = 0.f;
+	}
+
+	// A WEIGHTED PUSH, not a replacement. The same shape as the wall repulsion in ApplySteering: the
+	// bot keeps the intent it had (a defender still drifts toward its station, a fighter still tracks
+	// its enemy) and has "and not that way" added to it. At LockoutKeepOutWeight = 1.6 the push wins
+	// while it is inside the radius, which is what makes the retreat immediate, and stops mattering
+	// the moment the bot is outside it, which is what stops it being a rout.
+	//
+	// Scaled by how far INSIDE the radius the bot is, so the correction fades out at the boundary
+	// rather than switching off at it — a hard edge here reads as a bot bouncing off an invisible wall.
+	const float Urgency = FMath::Clamp(1.f - (Distance / KeepOut), 0.f, 1.f);
+	DesiredMoveDirection = (DesiredMoveDirection
+		+ Away.GetSafeNormal() * TraceBotConstants::LockoutKeepOutWeight * Urgency).GetSafeNormal();
 }
 
 
@@ -5193,6 +5508,36 @@ void ATraceBotController::UpdateCombat(float DeltaSeconds)
 		return;
 	}
 
+	// --- ...and so does a CORE PULL (spec v28 §6) --------------------------------------------------
+	//
+	// Same argument as the pass, one rule along: the pull's 4 degree cone is measured against where
+	// this pawn is looking, so while a bot is going for a pull the crosshair belongs to the Core and
+	// to nothing else. A combat aim blended in here would drift the bot out of the cone and cancel
+	// its own pull — the rule's own failure mode arriving by accident, which is exactly what the
+	// pass's note above warns about.
+	//
+	// The trigger comes off for the duration for the same reason it does during a pass: the aim point
+	// is a ball on the floor, and a held trigger would empty a magazine into the ground beside it.
+	//
+	// RANKED BELOW THE PASS and ABOVE the aimed ability: a bot cannot be passing and pulling at once
+	// (RequestPullInput refuses a carrier outright), while a spike or a jar lobbed at a wall during
+	// the two frames of a pull is a real conflict and the pull is the more valuable of the two.
+	if (bPullOwnsAim)
+	{
+		if (bTriggerHeld)
+		{
+			BotCharacter->DoFireReleased();
+			bTriggerHeld = false;
+		}
+
+		const FRotator DesiredRotation = (PullAimPoint - BotCharacter->GetPawnViewLocation()).Rotation();
+		const float TurnRate = FMath::Max(10.f, Profile.AimTurnRateDegrees);
+		FRotator NewRotation = FMath::RInterpConstantTo(GetControlRotation(), DesiredRotation, DeltaSeconds, TurnRate);
+		NewRotation.Roll = 0.f;
+		SetControlRotation(NewRotation);
+		return;
+	}
+
 	// --- ...and so does an AIMED ability (spec v15 §3) ---------------------------------------------
 	//
 	// Mace's spike goes where she is LOOKING and Oyster's jar is lobbed along the aim direction, so
@@ -6354,3 +6699,544 @@ FVector ATraceBotController::GetAttackGoalLocation() const
 
 	return FVector(AttackX, GoalY, Centre.Z);
 }
+
+#if !UE_BUILD_SHIPPING
+
+// =================================================================================================
+// Trace.Bots.LockoutTest — SPEC v28 §6, THE BEFORE AND THE AFTER, IN ONE PROCESS
+// =================================================================================================
+//
+//   "The bots just stand on top of a locked out core, fix that behavior."
+//
+// The claim being tested is a claim about DISTANCE, so this measures distance: it stages a real
+// turnover through the shipping path, then samples every living bot's distance to the Core on every
+// frame the window is open, split by side.
+//
+// THE RED ARM IS Trace.Bots.LegacyLockout 1 and it is the point of the exercise. It restores the
+// pre-v28 behaviour — every bot treats a locked Core as an ordinary loose one — in the SAME BINARY,
+// on the same fixture, so "before" and "after" are two runs of one command rather than two builds.
+// If the two arms print the same numbers the harness is not measuring its rule, and the run is worth
+// nothing; the verdict says so in those words rather than reporting the green arm on its own.
+//
+// WHAT EACH COLUMN IS FOR
+//   stand-on%    share of samples a bot of that side spent INSIDE ATraceBotController::
+//                GetLockoutKeepOutRadius() of the Core. This is the reported bug as a number: the
+//                LOCKED-OUT side's figure is what has to collapse between the arms.
+//   on-ball%     share of samples inside UTraceSettings::CorePickupRadius — literally stood on it,
+//                the thing the owner watched happen. A stricter subset of the column above.
+//   min uu       the closest any bot of that side ever got. A mean can hide one bot standing on the
+//                ball while four hang back; this cannot.
+//   pull ticks   frames a bot of that side spent with a pull genuinely FILLING (asked of the Core's
+//                own replicated hold, not of the bot's intent), which is the other half of the note:
+//                the opposing side is supposed to be going for the pull.
+//
+// THE FIXTURE PROVES ITSELF: an arm whose turnover never opened, or which saw no bots at all, is
+// reported INVALID rather than as a pass, because "no bot stood on the Core" is trivially true of a
+// run with no bots in it.
+//
+// Named namespace, per Scripts/check-jumbo-build-collisions.py: two anonymous namespaces merged into
+// one unity translation unit is MSVC C2084 on Windows only.
+namespace TraceBotLockoutTest
+{
+	/** How far in front of the local player the Core is staged, once he has been put among the bots. */
+	static constexpr float StageDistanceUU = 400.f;
+
+	/** Bots posed per side. Two is enough to see a side back off and still leave the match playing. */
+	static constexpr int32 BotsPerSide = 2;
+
+	/**
+	 * Radius of the ring the fixture's bots start on, in uu.
+	 *
+	 * 1200 is deliberately outside ATraceBotController::GetLockoutKeepOutRadius() (480) and inside
+	 * what a bot covers in the 5 s window (~4000 at walk speed), so both arms start at 0% stand-on
+	 * and both are physically able to reach the ball. Anything below the keep-out radius would hand
+	 * the shipped arm a stand-on score for bots that merely have not finished walking out yet.
+	 */
+	static constexpr float BotRingRadiusUU = 1200.f;
+
+	/** Hard stop, in case a window somehow never closes. The shipped window is 5 s. */
+	static constexpr double MaxArmSeconds = 12.0;
+
+	struct FSideStats
+	{
+		int32 Samples = 0;          // bot-frames observed
+		int32 InsideKeepOut = 0;    // ...spent inside the keep-out radius
+		int32 OnBall = 0;           // ...spent inside the pickup radius
+		int32 PullFrames = 0;       // ...spent with a pull actually filling
+		double SumDistance = 0.0;
+		float MinDistance = TNumericLimits<float>::Max();
+		int32 BotsSeen = 0;         // distinct bots, sampled on the first frame
+	};
+
+	struct FArmResult
+	{
+		bool bStaged = false;
+		bool bWindowSeen = false;
+		float WindowSeconds = 0.f;
+		FSideStats LockedOut;
+		FSideStats Pulling;
+		FString Ending = TEXT("(not reached)");
+	};
+
+	struct FState
+	{
+		int32 Phase = 0;
+		int32 Arm = 0;               // 0 = LEGACY (pre-v28), 1 = SHIPPED
+		double ArmStartReal = 0.0;
+		double SampleStartReal = 0.0;
+		ETraceTeam LockedTeam = ETraceTeam::None;
+		float NearestLockedAtStage = -1.f;
+		float NearestPullingAtStage = -1.f;
+
+		/** Where the local pawn stood for arm 0. Arm 1 is put back on exactly the same spot. */
+		bool bStandPointCaptured = false;
+		FVector StandPoint = FVector::ZeroVector;
+		FRotator StandFacing = FRotator::ZeroRotator;
+
+		FArmResult Arms[2];
+
+		int32 Passed = 0;
+		int32 Failed = 0;
+
+		void Check(bool bCondition, const FString& What)
+		{
+			if (bCondition) { ++Passed; } else { ++Failed; }
+			UE_LOG(LogTraceGame, Display, TEXT("[BotLockout]   %s  %s"),
+				bCondition ? TEXT("PASS") : TEXT("*** FAIL ***"), *What);
+		}
+	};
+
+	static void SetArm(int32 Arm)
+	{
+		if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Bots.LegacyLockout")))
+		{
+			Var->Set((Arm == 0) ? 1 : 0, ECVF_SetByConsole);
+		}
+	}
+
+	/** However this ends, the SHIPPED arm is what is left switched on. */
+	static void RestoreArm()
+	{
+		SetArm(1);
+	}
+
+	static UWorld* AuthoritativeWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* Candidate = Context.World();
+			if (Candidate != nullptr && Candidate->IsGameWorld()
+				&& Candidate->GetNetMode() != NM_Client)
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	}
+
+	static void SampleFrame(UWorld* World, const ATraceCore* Core, FArmResult& Result, ETraceTeam LockedTeam,
+		bool bFirstFrame)
+	{
+		const FVector CoreLocation = Core->GetLooseLocation();
+		const float KeepOut = ATraceBotController::GetLockoutKeepOutRadius();
+		const float PickupRadius = FMath::Max(1.f, UTraceSettings::Get().CorePickupRadius);
+
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Bot = *It;
+			if (!IsValid(Bot) || !Bot->IsAlive())
+			{
+				continue;
+			}
+
+			const APlayerState* BotState = Bot->GetPlayerState<APlayerState>();
+			if (BotState == nullptr || !BotState->IsABot())
+			{
+				continue;   // Humans are not what this note is about.
+			}
+
+			const ETraceTeam Team = Bot->GetTeam();
+			if (Team == ETraceTeam::None)
+			{
+				continue;
+			}
+
+			FSideStats& Side = (Team == LockedTeam) ? Result.LockedOut : Result.Pulling;
+
+			const float Distance =
+				static_cast<float>(FVector::Dist2D(Bot->GetActorLocation(), CoreLocation));
+
+			++Side.Samples;
+			Side.SumDistance += static_cast<double>(Distance);
+			Side.MinDistance = FMath::Min(Side.MinDistance, Distance);
+			if (Distance < KeepOut)     { ++Side.InsideKeepOut; }
+			if (Distance < PickupRadius) { ++Side.OnBall; }
+			if (Core->GetPullProgressFor(Bot) >= 0.f) { ++Side.PullFrames; }
+			if (bFirstFrame)             { ++Side.BotsSeen; }
+		}
+	}
+
+	/**
+	 * *** THE FIXTURE IS STAGED, IDENTICALLY, FOR BOTH ARMS. ***
+	 *
+	 * The first two versions of this harness let the world decide where the Core and the bots were,
+	 * and both were worthless for different reasons:
+	 *
+	 *   v1 staged in front of the local player wherever he stood: the nearest bot was 7937 uu away
+	 *      and no bot could reach the ball inside a 5 s window at all. Both arms printed 0.0%, which
+	 *      reads as a pass and measures nothing.
+	 *   v2 staged between the closest cross-team pair of bots, which fixed the reach — and then the
+	 *      two arms ran a minute apart on a live match, so arm 0 got a locked-out bot at 3264 uu and
+	 *      arm 1 got one at 289 uu. The percentages moved because the GEOMETRY moved, and a
+	 *      comparison between them says nothing about the behaviour.
+	 *
+	 * So this puts the local pawn on a fixed spot, and then puts two bots of each side on a ring of
+	 * a fixed radius around where the Core is about to be staged. Both arms then begin from the same
+	 * distances, on the same ground, and the only thing that differs between them is the rule under
+	 * test — which is the whole point of having two arms.
+	 *
+	 * The ring is OUTSIDE the keep-out radius on purpose: every arm starts at 0% "stand-on", so the
+	 * legacy arm has to walk in to earn its number and the shipped arm has to decline to.
+	 */
+	static void PoseFixture(UWorld* World, const FVector& Stand, const FRotator& Facing,
+		float& OutNearestLocked, float& OutNearestPulling)
+	{
+		OutNearestLocked = -1.f;
+		OutNearestPulling = -1.f;
+
+		APlayerController* PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+		ATraceCharacter* Local = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+		if (Local == nullptr || Local->GetTeam() == ETraceTeam::None)
+		{
+			return;
+		}
+
+		Local->SetActorLocation(Stand, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+		if (UTraceCharacterMovementComponent* Move = Local->GetTraceMovement())
+		{
+			Move->Velocity = FVector::ZeroVector;
+			Move->StopMovementImmediately();
+		}
+		Local->SetActorRotation(FRotator(0.f, Facing.Yaw, 0.f));
+		PC->SetControlRotation(FRotator(0.f, Facing.Yaw, 0.f));
+
+		// Where the Core is about to come to rest: StageDistanceUU down the view from the stand point.
+		const FVector CoreSpot = Stand + FRotator(0.f, Facing.Yaw, 0.f).Vector() * StageDistanceUU;
+		const ETraceTeam LocalTeam = Local->GetTeam();   // the side that will be locked out
+
+		int32 PlacedMine = 0;
+		int32 PlacedTheirs = 0;
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Bot = *It;
+			const APlayerState* BotState = IsValid(Bot) ? Bot->GetPlayerState<APlayerState>() : nullptr;
+			if (Bot == nullptr || Bot == Local || !Bot->IsAlive() || BotState == nullptr || !BotState->IsABot()
+				|| Bot->GetTeam() == ETraceTeam::None)
+			{
+				continue;
+			}
+
+			const bool bMine = (Bot->GetTeam() == LocalTeam);
+			int32& Placed = bMine ? PlacedMine : PlacedTheirs;
+			if (Placed >= BotsPerSide)
+			{
+				continue;
+			}
+
+			// The two sides face each other across the ball, which is the shape a real turnover has:
+			// the side that dropped it is on one side, the side that may have it is on the other.
+			const float BaseDegrees = bMine ? 40.f : 220.f;
+			const float Degrees = BaseDegrees + 40.f * static_cast<float>(Placed);
+			const float Radians = FMath::DegreesToRadians(Degrees);
+			const FVector Spot = CoreSpot
+				+ FVector(FMath::Cos(Radians), FMath::Sin(Radians), 0.f) * BotRingRadiusUU;
+
+			Bot->SetActorLocation(FVector(Spot.X, Spot.Y, Stand.Z), /*bSweep=*/false, nullptr,
+				ETeleportType::TeleportPhysics);
+			if (UTraceCharacterMovementComponent* BotMove = Bot->GetTraceMovement())
+			{
+				BotMove->Velocity = FVector::ZeroVector;
+				BotMove->StopMovementImmediately();
+			}
+			// Facing the ball, so neither side is handed a head start by having to turn round first.
+			FVector Look = CoreSpot - Spot;
+			Look.Z = 0.f;
+			Bot->SetActorRotation(FRotator(0.f, Look.Rotation().Yaw, 0.f));
+			if (AController* Ctrl = Bot->GetController())
+			{
+				Ctrl->SetControlRotation(FRotator(0.f, Look.Rotation().Yaw, 0.f));
+			}
+
+			++Placed;
+		}
+
+		OutNearestLocked = (PlacedMine > 0) ? BotRingRadiusUU : -1.f;
+		OutNearestPulling = (PlacedTheirs > 0) ? BotRingRadiusUU : -1.f;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotLockout] fixture posed: %d locked-out and %d pulling bot(s) on a %.0f uu ring around the "
+			     "staged Core, all facing it. Keep-out radius is %.0f uu, so both arms start at 0%% stand-on."),
+			PlacedMine, PlacedTheirs, BotRingRadiusUU, ATraceBotController::GetLockoutKeepOutRadius());
+	}
+
+	static void ReportSide(const TCHAR* ArmName, const TCHAR* SideName, const FSideStats& Side)
+	{
+		if (Side.Samples <= 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BotLockout] %-8s %-11s | NO SAMPLES — no living bot of this side was in the match"),
+				ArmName, SideName);
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotLockout] %-8s %-11s | bots %d | mean %6.0f uu | min %6.0f uu | stand-on %5.1f%% | ")
+			TEXT("on-ball %5.1f%% | pull ticks %d"),
+			ArmName, SideName, Side.BotsSeen,
+			Side.SumDistance / FMath::Max(1, Side.Samples),
+			(Side.MinDistance < TNumericLimits<float>::Max()) ? Side.MinDistance : -1.f,
+			100.f * Side.InsideKeepOut / FMath::Max(1, Side.Samples),
+			100.f * Side.OnBall / FMath::Max(1, Side.Samples),
+			Side.PullFrames);
+	}
+
+	static void RunLockoutTest()
+	{
+		UWorld* World = AuthoritativeWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[BotLockout] server only, and there is no authoritative game world yet."));
+			return;
+		}
+
+		TSharedPtr<FState> State = MakeShared<FState>();
+		State->ArmStartReal = FPlatformTime::Seconds();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotLockout] ===== SPEC v28 §6. Arm 0 = LEGACY (pre-v28: every bot chases a Core it may not ")
+			TEXT("touch) — it MUST show the locked-out side stood on the ball. Arm 1 = SHIPPED. Keep-out radius ")
+			TEXT("%.0f uu (= %.0f uu pickup radius x %.1f), window %.1fs, pull hold %.2fs. ====="),
+			ATraceBotController::GetLockoutKeepOutRadius(), UTraceSettings::Get().CorePickupRadius,
+			TraceBotConstants::LockoutKeepOutPickupRadii, ATraceCore::GetTurnoverLockoutSeconds(),
+			ATraceCore::GetPullHoldSeconds());
+
+		SetArm(0);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[BotLockout] ABORTED: the world went away."));
+				RestoreArm();
+				return false;
+			}
+
+			ATraceCore* Core = ATraceCore::Get(TickWorld);
+			if (Core == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[BotLockout] ABORTED: no Core in this world."));
+				RestoreArm();
+				return false;
+			}
+
+			const double NowReal = FPlatformTime::Seconds();
+			FArmResult& Result = State->Arms[State->Arm];
+
+			// ---- Phase 0: stage a real turnover against the LOCAL player's team ------------------
+			if (State->Phase == 0)
+			{
+				// *** THE CORE IS STAGED WHERE THE BOTS ARE, AND THE FIRST RUN OF THIS HARNESS IS WHY.
+				//
+				// The shipping staging helper puts the Core in front of the LOCAL PLAYER, which is
+				// right for photographing the window and useless for measuring bots: on this arena
+				// the nearest locked-out bot was 7937 uu away and the nearest opponent 20641 uu, so
+				// across the whole 5 s window not one bot could physically reach the ball. Both arms
+				// then printed a beautiful 0.0% "stand-on" — a green that means "nobody was ever
+				// near it", which is exactly the kind of harness this project has been burned by.
+				//
+				// So the local pawn is moved to the tightest CROSS-TEAM PAIR of bots on the field —
+				// two players already contesting something — and the Core is staged between them.
+				// The measurement then asks a question a bot can actually answer: it is standing next
+				// to a ball it may not touch, what does it do?
+				// THE SAME SPOT FOR BOTH ARMS. Captured once, on arm 0, from wherever the local pawn
+				// happened to be standing when the command was run — that part is arbitrary and does
+				// not matter. What matters is that arm 1 is put back on it exactly, so the two arms
+				// differ by the rule and by nothing else.
+				if (!State->bStandPointCaptured)
+				{
+					const APlayerController* PC = TickWorld->GetFirstPlayerController();
+					const ATraceCharacter* Local = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+					if (Local == nullptr)
+					{
+						Result.Ending = TEXT("no local pawn to stage from");
+						State->Phase = 3;
+						return true;
+					}
+					State->StandPoint = Local->GetActorLocation();
+					State->StandFacing = FRotator(0.f, Local->GetActorRotation().Yaw, 0.f);
+					State->bStandPointCaptured = true;
+				}
+
+				PoseFixture(TickWorld, State->StandPoint, State->StandFacing,
+					State->NearestLockedAtStage, State->NearestPullingAtStage);
+
+				FString Report;
+				Result.bStaged = ATraceCore::DebugStageTurnoverAtLocalCrosshair(
+					TickWorld, StageDistanceUU, /*bLockLocalTeam=*/true, Report);
+
+				UE_LOG(LogTraceGame, Display, TEXT("[BotLockout] arm=%d staging: %s"),
+					State->Arm, *Report);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BotLockout] arm=%d at staging the nearest bot of each side was: locked-out %.0f uu, "
+					     "pulling %.0f uu (keep-out radius %.0f uu)."),
+					State->Arm, State->NearestLockedAtStage, State->NearestPullingAtStage,
+					ATraceBotController::GetLockoutKeepOutRadius());
+
+				if (!Result.bStaged)
+				{
+					Result.Ending = TEXT("the turnover could not be staged");
+					State->Phase = 3;
+					return true;
+				}
+
+				State->LockedTeam = Core->GetTurnoverLockoutTeam();
+				Result.WindowSeconds = Core->GetTurnoverSecondsRemaining();
+				State->SampleStartReal = NowReal;
+				State->Phase = 1;
+				return true;
+			}
+
+			// ---- Phase 1: sample every frame the window is open -----------------------------------
+			if (State->Phase == 1)
+			{
+				const bool bFirstFrame = !Result.bWindowSeen;
+
+				if (Core->IsTurnoverActive())
+				{
+					Result.bWindowSeen = true;
+					SampleFrame(TickWorld, Core, Result, State->LockedTeam, bFirstFrame);
+
+					if ((NowReal - State->SampleStartReal) < MaxArmSeconds)
+					{
+						return true;
+					}
+					Result.Ending = TEXT("the harness timed out with the window still open");
+				}
+				else if (Result.bWindowSeen)
+				{
+					// The window ended. WHICH WAY it ended is a result in its own right: a pulling-team
+					// bot taking the Core is the behaviour the note asks for, and an expiry is the
+					// neutral outcome. Reported, never asserted — a pull is not required to pass.
+					Result.Ending = Core->IsLoose()
+						? TEXT("the lockout expired with the Core still loose")
+						: TEXT("a player took the Core before the window expired");
+				}
+				else if ((NowReal - State->SampleStartReal) < 1.0)
+				{
+					return true;   // Give the staged window a frame or two to appear.
+				}
+				else
+				{
+					Result.Ending = TEXT("no turnover window was ever open — nothing was measured");
+				}
+
+				State->Phase = 2;
+				return true;
+			}
+
+			// ---- Phase 2: this arm's report -------------------------------------------------------
+			if (State->Phase == 2)
+			{
+				const TCHAR* ArmName = (State->Arm == 0) ? TEXT("LEGACY") : TEXT("SHIPPED");
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BotLockout] --- arm=%d %s: window %.1fs, locked-out team %s. Ended: %s"),
+					State->Arm, ArmName, Result.WindowSeconds,
+					*TraceTeamName(State->LockedTeam).ToString(), *Result.Ending);
+				ReportSide(ArmName, TEXT("LOCKED-OUT"), Result.LockedOut);
+				ReportSide(ArmName, TEXT("PULLING"), Result.Pulling);
+
+				State->Phase = 3;
+				return true;
+			}
+
+			// ---- Phase 3: next arm, or the verdict ------------------------------------------------
+			if (State->Arm == 0)
+			{
+				State->Arm = 1;
+				State->Phase = 0;
+				SetArm(1);
+				State->ArmStartReal = NowReal;
+				return true;
+			}
+
+			RestoreArm();
+
+			const FArmResult& Red = State->Arms[0];
+			const FArmResult& Green = State->Arms[1];
+
+			const float RedStand = (Red.LockedOut.Samples > 0)
+				? 100.f * Red.LockedOut.InsideKeepOut / Red.LockedOut.Samples : -1.f;
+			const float GreenStand = (Green.LockedOut.Samples > 0)
+				? 100.f * Green.LockedOut.InsideKeepOut / Green.LockedOut.Samples : -1.f;
+
+			UE_LOG(LogTraceGame, Display, TEXT("[BotLockout] --- THE FIXTURE PROVING ITSELF FIRST"));
+			State->Check(Red.bWindowSeen && Green.bWindowSeen,
+				TEXT("both arms actually opened a turnover window — without one, 'no bot stood on the "
+				     "Core' is a statement about a Core that was never locked"));
+			State->Check(Red.LockedOut.Samples > 0 && Green.LockedOut.Samples > 0,
+				TEXT("both arms had living bots of the LOCKED-OUT side on the field to observe"));
+
+			// *** AND THE ONE THAT MAKES THE ZEROES MEAN ANYTHING. *** A 5 s window and a walk speed
+			// of ~800 uu/s buys a bot about 4000 uu. If the nearest locked-out bot started further
+			// away than that, "it never stood on the Core" is a fact about the arena, not about the
+			// behaviour — which is exactly the false green the first run of this harness produced
+			// (nearest bot 7937 uu, both arms 0.0%).
+			const float ReachableUU = 4000.f;
+			State->Check(State->NearestLockedAtStage >= 0.f && State->NearestLockedAtStage < ReachableUU,
+				FString::Printf(TEXT("a locked-out bot was actually within reach of the staged Core "
+					"(%.0f uu, and a bot covers about %.0f uu in the %.1fs window) — otherwise every "
+					"number below is about the geometry, not about the bots"),
+					State->NearestLockedAtStage, ReachableUU, ATraceCore::GetTurnoverLockoutSeconds()));
+			State->Check(State->NearestLockedAtStage > ATraceBotController::GetLockoutKeepOutRadius(),
+				FString::Printf(TEXT("both arms started with every bot OUTSIDE the keep-out radius "
+					"(ring %.0f uu vs keep-out %.0f uu), so a stand-on score has to be earned by walking "
+					"in rather than by being posed on top of the ball"),
+					State->NearestLockedAtStage, ATraceBotController::GetLockoutKeepOutRadius()));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[BotLockout] --- THE REPRODUCTION: the pre-v28 bots"));
+			State->Check(RedStand > 0.f,
+				FString::Printf(TEXT("§6 RED: the locked-out side spent %.1f%% of the window inside the "
+					"keep-out radius of a Core it may not touch — the reported behaviour"), RedStand));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[BotLockout] --- THE CHANGE"));
+			State->Check(GreenStand >= 0.f && GreenStand < RedStand,
+				FString::Printf(TEXT("§6: the same side on the same fixture now spends %.1f%% there, down "
+					"from %.1f%%"), GreenStand, RedStand));
+			State->Check(Green.Pulling.PullFrames > 0,
+				FString::Printf(TEXT("§6: the opposing side went for the PULL — %d frames of a pull actually "
+					"filling (legacy arm: %d)"), Green.Pulling.PullFrames, Red.Pulling.PullFrames));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[BotLockout] ===== %d passed, %d failed. ====="),
+				State->Passed, State->Failed);
+			UE_LOG(LogTraceGame, Display, TEXT("[BotLockout] VERDICT: %s"),
+				(State->Failed == 0 && State->Passed > 0) ? TEXT("PASS") : TEXT("*** FAIL ***"));
+			return false;
+		}));
+	}
+
+	static FAutoConsoleCommand CmdLockoutTest(
+		TEXT("Trace.Bots.LockoutTest"),
+		TEXT("Dev only, server only. SPEC v28 §6: stages a real turnover and measures how close each side's "
+		     "bots get to a Core they may not touch, red arm (pre-v28) first, then shipped."),
+		FConsoleCommandDelegate::CreateStatic(&RunLockoutTest));
+}
+
+#endif   // !UE_BUILD_SHIPPING

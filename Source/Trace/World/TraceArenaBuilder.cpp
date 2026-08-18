@@ -7,6 +7,7 @@
 #include "TraceSettings.h"              // GoalWidthFieldFraction / GoalHeightUU (spec v4 section 7, resized v5 section 4)
 #include "Core/TraceCharacter.h"        // PlayerHeightUU() reads the capsule off the CDO
 #include "Core/TraceGameState.h"        // GetScoringModeFor - the one authority on which mode runs
+#include "Gameplay/TraceCore.h"        // Trace.Arena.GoalSides grants the Core and reads the tally
 #include "Gameplay/TraceEndzone.h"
 #include "World/TraceCoreSpawn.h"       // spec v17 §2 - the placed Core spawn marker
 #include "World/TraceTeamPlayerStart.h"
@@ -324,8 +325,22 @@ namespace TraceArenaConstants
 	 */
 	static constexpr float PlayerStartZ = 140.f;
 
-	/** How far the spawn line sits in front of a team's own goal line, as a fraction of half length. */
-	static constexpr float StartInsetFraction = 0.10f;
+	/**
+	 * Where in the POCKET the arena's own spawn fan sits, as an alpha along GetSpawnLineX()'s band
+	 * (0 = just behind the foot of the back approach ramp, 1 = just short of the end wall).
+	 *
+	 * SPEC v28 §8 REPLACED StartInsetFraction WITH THIS, and it is not a rename. The old constant was
+	 * 0.10 of the HALF LENGTH, subtracted from the goal line, i.e. the spawn line sat in front of the
+	 * goal and moved with the length of the field. Spawns are behind the goal now, and what they have
+	 * to stay clear of back there is the back ramp and the wall - neither of which is a fraction of
+	 * the field length. An alpha along a band whose two ends are both derived is the form that keeps
+	 * the pads correct when the goal, the pocket, the ramp or the capsule is retuned.
+	 *
+	 * 0.35 leans the fan toward the goal rather than the wall: a spawning player wants to be looking
+	 * at the pitch through their own hoop, not at 1200 uu of end wall dressing, and ATraceGameMode's
+	 * deeper respawn pads (alpha 0.85) are the ones that want the wall at their back.
+	 */
+	static constexpr float StartPocketAlpha = 0.35f;
 
 	/**
 	 * Fraction of the half width the spawn fan covers.
@@ -591,16 +606,10 @@ namespace TraceArenaConstants
 	 */
 	static constexpr float FilletMinInner = WallNeonStandoff;
 
-	/**
-	 * Clearance kept between the top of a cove step and the mode-B carry-in ramp above it.
-	 *
-	 * The end-wall cove and the ramp occupy the same 940 uu of floor in front of each hoop. The
-	 * union is walkable either way (see BuildWallFillets), but a step poking through the ramp's
-	 * surface would put a lip across the run-up to the goal - and "the only way in on foot" is not a
-	 * place to discover a bump. Steps that would break it are dropped, which on the shipped numbers
-	 * costs the end walls exactly one step against the side walls' six.
-	 */
-	static constexpr float FilletRampClearance = 12.f;
+	// FilletRampClearance (12 uu) lived here until spec v28 §8. It was the gap kept between the top
+	// of an end-wall cove step and the mode-B carry-in ramp that used to climb the same 940 uu of
+	// floor in front of each hoop. The hoop and its ramps moved to the goal line, 2400 uu clear of
+	// the wall, so there is nothing above the end cove to keep clear of - see BuildWallFillets.
 
 	// --- Interior layout -------------------------------------------------------------------------
 	//
@@ -767,11 +776,20 @@ namespace TraceArenaConstants
 	 * diamond is a 1900 uu square yawed 45, i.e. |x| + |y| <= 1344, and a pylon at (2200, 1100)
 	 * sums to 3300.
 	 */
-	// 0.1833 -> 0.1310, i.e. the SAME 2200 uu on the longer field. These ring the centre diamond, and
-	// the diamond did not get bigger when the field did; left as a fraction of the half length they
-	// would have marched out to 3080 and stopped reading as its ring.
-	static constexpr float DaisPylonXFrac = 0.1310f;   // 2200
-	static constexpr float DaisPylonYFrac = 0.2292f;   // 1100
+	// MEASURED IN DAIS WIDTHS, NOT IN HALF LENGTHS (spec v28 §8's standing rule: a value that
+	// modifies a base is stored relative to THAT base).
+	//
+	// These four pylons ring the centre diamond. They were 0.1833 of the half length, then 0.1310 -
+	// re-derived by hand each time the field was lengthened so that they kept landing on the 2200 uu
+	// the diamond wants. That is the shape of a bug: the diamond's size has nothing to do with the
+	// length of the field, so every future lengthening silently marches its ring outward until it
+	// stops reading as a ring. v28 lengthened the field again and 0.1310 would have put them at 2515.
+	//
+	// The base of the diamond is DaisTopTierSide + DaisTierSideStep x (DaisTiers - 1) = 1900 uu
+	// across, so these are that, times the ratios the tuned 2200/1100 came out at. Change the dais
+	// and the ring follows it; change the field and nothing moves.
+	static constexpr float DaisPylonXPerDaisSide = 1.1579f;   // 2200 / 1900
+	static constexpr float DaisPylonYPerDaisSide = 0.5789f;   // 1100 / 1900
 	static constexpr float DaisPylonSide = 240.f;
 	static constexpr float DaisPylonHeight = 1400.f;
 
@@ -948,6 +966,16 @@ namespace TraceArenaConstants
 	static constexpr float GateTowerHeight = 2300.f;
 	static constexpr float GateBeamSize = 300.f;
 
+	/**
+	 * Gap between the outer edge of the mode-B hoop and the plane the gate stands on (spec v28 §8).
+	 *
+	 * The gate used to stand ON the goal line, which was free while the goal was a hole in a wall
+	 * 2400 uu further back. It is not free now - see the note in BuildEndzones - so the gate is set
+	 * this far up the pitch from the ring's outer edge. Small on purpose: the gate is still meant to
+	 * read as the frame around the goal, not as a separate landmark in the middle of the field.
+	 */
+	static constexpr float GateGoalClearance = 300.f;
+
 	// --- MODE B: the goal (spec v4 section 7) ------------------------------------------------------
 	//
 	// Verbatim: "scoring should happen when the core is thrown into the goal or a player carries the
@@ -993,27 +1021,25 @@ namespace TraceArenaConstants
 	static constexpr float MaxGoalWidthFraction = 0.90f;
 	static constexpr float MinGoalHeight = 120.f;
 
-	// --- MODE B, SPEC v6 section 4.3: the ring in the back wall -------------------------------------
+	// --- MODE B, SPEC v6 §4.3 + SPEC v28 §8: the free-standing ring ---------------------------------
 	//
-	// The goal is no longer furniture standing in front of a wall - it is a HOLE THROUGH the wall
-	// with a lit hoop around it. Which means the end wall itself is now mode-tagged: the solid slab
-	// BuildFloorAndWalls makes belongs to mode A, and BuildGoalWall makes a perforated replacement
-	// that belongs to mode B. Exactly one of them is presented at a time, so mode A's end wall is the
-	// same single block it has always been and cannot acquire a hole.
+	// The goal is a lit HOOP. v6 made it a hole through the back wall; v28 §8 moved the wall
+	// ClampedEndzoneDepth() further back and left the hoop hanging on the goal line with playable
+	// floor on both sides, so there is no hole and no square opening any longer - just the annulus,
+	// floating.
 	//
-	// HOW THE HOLE IS MADE, since "subtract a cylinder from a box" is not something a box collider
-	// can do. Four panels leave a SQUARE opening of half side RingSquareScale x radius, and a thick
-	// annulus of RingSegments spokes closes that square down to a circle. Each spoke is a box whose
+	// HOW THE CIRCLE IS MADE, since "a cylinder" is not something a box collider can be. An annulus
+	// of RingSegments spokes closes a square of nothing down to a circle. Each spoke is a box whose
 	// inner face is a chord at exactly the ring radius, so the union of their inner faces is a
 	// regular polygon CIRCUMSCRIBING the scoring disc - the physical hole is never smaller than the
 	// disc that scores, which is the direction the error has to lean: a hole a hair too small would
 	// bounce Cores off a goal the rule says went in.
 	//
-	// The square must be wide enough to clear the disc and narrow enough that its corners stay inside
-	// the annulus: radius <= S <= outer/sqrt(2). At 1.05 and 1.55 there is room at both ends.
+	// GoalRingOuterScale is now what the annulus WANTS to be rather than what it is: a free-standing
+	// ring has to clear the floor, so the band is clamped by GoalRingOuterRadius(). At 1.55 on the
+	// shipped mouth it would reach 286 uu underground.
 	static constexpr int32 GoalRingSegments = 16;
-	static constexpr float GoalRingOuterScale = 1.55f;   // annulus outer radius / mouth radius
-	static constexpr float GoalRingSquareScale = 1.05f;  // half side of the square opening / radius
+	static constexpr float GoalRingOuterScale = 1.55f;   // annulus outer radius / mouth radius, before the float clamp
 	static constexpr float GoalRingSpokeOverlap = 1.12f; // tangential slop so adjacent spokes meet
 
 	/** Radial depth and forward proudness of the glowing hoop laid on the annulus's inner rim. */
@@ -1022,18 +1048,19 @@ namespace TraceArenaConstants
 
 	/**
 	 * Glow for the hoop. The brightest thing in the arena on purpose: spec v6 asks to "make it
-	 * visually obvious what and where the goal is", the ring is set into a near-black wall 16800 uu
-	 * from the far spawn, and it is the thing every throw in mode B is aimed at.
+	 * visually obvious what and where the goal is", it hangs 33600 uu from the other hoop with
+	 * near-black everything behind it, and it is the thing every throw in mode B is aimed at.
 	 */
 	static constexpr float GlowGoalRing = 7.5f;
 
-	/** Depth of the lit alcove behind the ring, so the hoop frames a room and not the empty sky. */
-	static constexpr float GoalAlcoveDepth = 700.f;
+	// The lit alcove behind the ring (GoalAlcoveDepth, 700 uu) went with the wall in spec v28 §8. It
+	// existed so the hoop framed a room instead of the void outside the level; what it frames now is
+	// the pocket, the end wall's own dressing and, most of the time, somebody's spawn.
 
-	/** Thickness of the approach ramp slab. */
+	/** Thickness of the approach ramp slabs. */
 	static constexpr float GoalRampThickness = 140.f;
 
-	/** Headroom left between the top of the hoop and the top of the wall. */
+	/** Headroom left between the top of the hoop and the top of the perimeter wall. */
 	static constexpr float GoalRingWallHeadroom = 120.f;
 }
 
@@ -1575,7 +1602,48 @@ float ATraceArenaBuilder::ClampedEndzoneDepth() const
 float ATraceArenaBuilder::GoalLineX() const
 {
 	// |X| of a goal line. ClampedEndzoneDepth(), never the raw property - see that function.
+	//
+	// SPEC v28 §8: this is also THE GOAL PLANE - the hoop hangs on it - and everything from here back
+	// to the end wall is the playable pocket. One line, one meaning, in both scoring modes.
 	return HalfLength() - ClampedEndzoneDepth();
+}
+
+float ATraceArenaBuilder::GetGoalPlaneX() const
+{
+	return GoalLineX();
+}
+
+FBox ATraceArenaBuilder::GetSpawnPocketBounds(float EndSign) const
+{
+	// Goal plane to end wall. Identical to GetEndzoneBounds by construction - see the header.
+	return GetEndzoneBounds(EndSign);
+}
+
+float ATraceArenaBuilder::GetSpawnLineX(float EndSign, float Alpha) const
+{
+	const float Sign = (EndSign < 0.f) ? -1.f : 1.f;
+
+	// NEAR EDGE: behind the foot of the back ramp, plus a capsule diameter so a pawn standing on the
+	// pad is clear of the slope rather than balanced on its toe. The ramp starts at the HOOP'S FACE,
+	// not at the goal plane, so its half thickness is part of the reach - miss that and alpha 0 lands
+	// a few uu up the slope, which is exactly the sort of "nearly right" a spawn pad cannot be.
+	const float NearX = GoalLineX() + GoalRingHalfThickness() + GoalRampRun()
+		+ TraceArenaConstants::PawnCapsuleRadius * 2.f;
+
+	// FAR EDGE: off the end wall by its pawn standoff plus a capsule radius plus a little, so a pad
+	// is never inside the shell that holds bodies off the wall (which would spawn a pawn intersecting
+	// invisible collision and let the engine push it somewhere unpredictable).
+	const float FarX = HalfLength() - TraceArenaConstants::WallNeonStandoff
+		- TraceArenaConstants::PawnCapsuleRadius - 60.f;
+
+	// A pocket too shallow to hold a band at all: put everything in the middle of what there is and
+	// say so. Better a crowded spawn line than one inside the ramp or inside the wall.
+	if (FarX <= NearX)
+	{
+		return Sign * FMath::Max(0.f, (GoalLineX() + HalfLength()) * 0.5f);
+	}
+
+	return Sign * FMath::Lerp(NearX, FarX, FMath::Clamp(Alpha, 0.f, 1.f));
 }
 
 FBox ATraceArenaBuilder::GetEndzoneBounds(float EndSign) const
@@ -1633,9 +1701,47 @@ float ATraceArenaBuilder::GoalRingRadius() const
 	return FMath::Clamp(GoalHalfWidth(), 120.f, FMath::Max(120.f, FMath::Min(Room, HalfWidth() * 0.9f)));
 }
 
+float ATraceArenaBuilder::GoalRingOuterRadius() const
+{
+	const float Radius = GoalRingRadius();
+
+	// What the annulus WANTS to be: the same 1.55x band the ring has always been drawn with.
+	const float WantedBand = FMath::Max(40.f, Radius * (TraceArenaConstants::GoalRingOuterScale - 1.f));
+
+	// SPEC v28 §8. What it may be, now that there is no wall to bury the bottom half in: the hoop has
+	// to hold itself off the floor by GoalRingFloatPlayerHeights. The band is measured DOWN from the
+	// bottom of the mouth, which is GoalRingClearanceZ() off the deck, so the room available is that
+	// clearance minus the float gap.
+	const float FloatGap = FMath::Max(0.f, GoalRingFloatPlayerHeights) * PlayerHeightUU();
+	const float RoomBelowMouth = FMath::Max(20.f, GoalRingClearanceZ() - FloatGap);
+
+	return Radius + FMath::Min(WantedBand, RoomBelowMouth);
+}
+
+float ATraceArenaBuilder::GoalRingHalfThickness() const
+{
+	// The hoop keeps EXACTLY the depth it had while it was set into the end wall, so its silhouette
+	// from the halfway line is the one that shipped. Relative to WallThickness rather than a fresh
+	// constant for that reason - "as deep as the wall it used to live in" is the whole rule.
+	return FMath::Max(20.f, WallThickness * 0.5f);
+}
+
 float ATraceArenaBuilder::GoalRingCentreZ() const
 {
 	return GoalRingClearanceZ() + GoalRingRadius();
+}
+
+float ATraceArenaBuilder::GoalSlabHalfDepth() const
+{
+	// The floor: a carrier at the top of a ramp is stopped by the hoop's own face, so their origin
+	// can get no closer to the plane than half the ring's thickness plus their capsule radius. A slab
+	// shallower than that could be pressed against and never entered - a goal that cannot be carried
+	// into. 60 uu of margin on top so the case is comfortably inside rather than exactly on the edge.
+	const float Reachable = GoalRingHalfThickness() + TraceArenaConstants::PawnCapsuleRadius + 60.f;
+
+	// Never deeper than the pocket, or the slab would reach past the end wall at one end and into the
+	// approach cover at the other.
+	return FMath::Clamp(GoalRingDepth * 0.5f, Reachable, FMath::Max(Reachable, ClampedEndzoneDepth()));
 }
 
 float ATraceArenaBuilder::GoalRampTopZ() const
@@ -1661,31 +1767,48 @@ float ATraceArenaBuilder::GoalRampTopZ() const
 		FMath::Max(0.f, GoalRingClearanceZ() - TraceArenaConstants::StepRise));
 }
 
+float ATraceArenaBuilder::GoalRampRun() const
+{
+	const float RampTop = GoalRampTopZ();
+	if (RampTop <= 1.f)
+	{
+		return 0.f;
+	}
+
+	// ONE function, because the ramp's run is now read in three places - the two ramps themselves and
+	// the near edge of the spawn band, which must start behind the foot of the back one.
+	return FMath::Max(200.f, RampTop * FMath::Max(0.5f, GoalRampRunPerRise));
+}
+
 FVector ATraceArenaBuilder::GetGoalRingCentre(float EndSign) const
 {
 	const float Sign = (EndSign < 0.f) ? -1.f : 1.f;
-	return GetActorTransform().TransformPosition(FVector(Sign * HalfLength(), 0.f, GoalRingCentreZ()));
+
+	// SPEC v28 §8: the GOAL PLANE, not the end wall. They were the same point until the wall moved
+	// ClampedEndzoneDepth() further back to open the pocket behind the hoop.
+	return GetActorTransform().TransformPosition(FVector(Sign * GoalLineX(), 0.f, GoalRingCentreZ()));
 }
 
 FBox ATraceArenaBuilder::GetGoalBounds(float EndSign) const
 {
 	const float Sign = (EndSign < 0.f) ? -1.f : 1.f;
-	const float HalfX = HalfLength();
+	const float PlaneX = Sign * GoalLineX();
 	const float Radius = GoalRingRadius();
 	const float CentreZ = GoalRingCentreZ();
-	const float Depth = FMath::Clamp(GoalRingDepth, 60.f, ClampedEndzoneDepth());
+	const float HalfDepth = GoalSlabHalfDepth();
 
-	// SPEC v6 section 4.3. The goal is no longer the endzone-deep box it was in v4/v5: it is a shallow
-	// SLAB across the mouth of the ring in the back wall, and the disc inscribed in that slab is what
-	// actually scores (ATraceEndzone::ConfigureRing). This box is the slab, i.e. the ring's bounding
-	// volume - it is what bot targeting and debug draw read, and it is deliberately conservative, so
-	// anything that treats it as the goal aims at the middle of the hoop rather than past it.
-	const float NearX = Sign * (HalfX - Depth);
-	const float FarX = Sign * HalfX;
-
+	// SPEC v6 §4.3 made the goal a shallow SLAB across the mouth of the ring, with the disc inscribed
+	// in that slab as what actually scores (ATraceEndzone::ConfigureRing). SPEC v28 §8 CENTRES that
+	// slab ON THE RING PLANE instead of hanging it off the field side of a wall, and that one change
+	// is the whole of "allow goals to be scored through either side of the goal": the disc test and
+	// the swept crossing test never cared which way the Core was travelling, but half the volume they
+	// test inside used to be buried in masonry.
+	//
+	// It is what bot targeting and debug draw read, and it is deliberately conservative, so anything
+	// that treats it as the goal aims at the middle of the hoop rather than past it.
 	const FBox Local(
-		FVector(FMath::Min(NearX, FarX), -Radius, CentreZ - Radius),
-		FVector(FMath::Max(NearX, FarX), Radius, CentreZ + Radius));
+		FVector(PlaneX - HalfDepth, -Radius, CentreZ - Radius),
+		FVector(PlaneX + HalfDepth, Radius, CentreZ + Radius));
 
 	return Local.TransformBy(GetActorTransform());
 }
@@ -1723,10 +1846,57 @@ void ATraceArenaBuilder::EnsureBuilt()
 	if (IsLevelPreBaked())
 	{
 		AdoptBakedArena();
+		WarnIfHitscanRangeIsShort();
 		return;
 	}
 
 	BuildArena();
+	WarnIfHitscanRangeIsShort();
+}
+
+// =================================================================================================
+// THE STANDING RULE, ENFORCED AT STARTUP RATHER THAN IN A COMMENT.
+//
+// UTraceSettings::HitscanRange is DERIVED from this actor's FieldLength and FieldWidth: it has to
+// span the arena's diagonal or a shot down the long axis expires in mid-air short of a target the
+// player can plainly see. It has now been left behind TWICE by a pass that lengthened the field -
+// spec v4 §3 (24000 -> 33600, range left at 28000) and spec v28 §8 (33600 -> 38400, range left at
+// 36000). BOTH TIMES THE PAIRING WAS WRITTEN DOWN IN A COMMENT NEXT TO THE VALUE, in this header and
+// in Config/DefaultGame.ini, and both times the comment was not enough.
+//
+// So the check runs on EVERY startup, on both paths (the procedural build and the baked adopt),
+// costs one sqrt, and prints at Error when it fails. Trace.Arena.VerifyHitscanReach measures the
+// same thing far more thoroughly - it walks the real ray and finds the true sight line - but it only
+// helps somebody who thinks to run it, and nobody who lengthens a field thinks to run a gun command.
+// This one cannot be missed: it is in the log of every match anybody plays.
+//
+// IT WARNS, IT DOES NOT CLAMP. Silently raising a designer's number would make Config/DefaultGame.ini
+// stop being the authority it is documented to be, and a knob that quietly disagrees with its own
+// file is the failure this project already keeps a house rule about. The fix is one line in each of
+// two files and the message says so.
+// =================================================================================================
+void ATraceArenaBuilder::WarnIfHitscanRangeIsShort() const
+{
+	const float DiagonalUU = FMath::Sqrt(FieldLength * FieldLength + FieldWidth * FieldWidth);
+	const float RangeUU    = UTraceSettings::Get().HitscanRange;
+
+	if (RangeUU >= DiagonalUU)
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Arena] HitscanRange %.0f uu spans the %.0f x %.0f arena's %.0f uu diagonal (%.0f uu spare)."),
+			RangeUU, FieldLength, FieldWidth, DiagonalUU, RangeUU - DiagonalUU);
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Error,
+		TEXT("[Arena] *** THE GUN CANNOT CROSS THIS ARENA. *** UTraceSettings::HitscanRange is %.0f uu and the "
+		     "%.0f x %.0f field's diagonal is %.0f uu, so a shot down the long axis dies %.0f uu SHORT of a "
+		     "target the player can see, with nothing on screen saying why. HitscanRange is DERIVED from "
+		     "FieldLength/FieldWidth and must move with them: set it to at least %.0f in BOTH "
+		     "Source/Trace/TraceSettings.h AND Config/DefaultGame.ini (the ini wins). "
+		     "Trace.Arena.VerifyHitscanReach measures it properly, against the real geometry."),
+		RangeUU, FieldLength, FieldWidth, DiagonalUU, DiagonalUU - RangeUU,
+		FMath::CeilToFloat(DiagonalUU / 100.f) * 100.f);
 }
 
 void ATraceArenaBuilder::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -1994,28 +2164,23 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		? MakeSurfaceMID(TraceArenaConstants::WallColor, 0.55f, 0.f, TraceArenaConstants::NeonNeutral, 0.022f)
 		: nullptr;
 
+	// NO WALL IS MODE-TAGGED ANY MORE (spec v28 §8), and deleting that tagging is a load-bearing part
+	// of this pass rather than tidying. From spec v6 §4.3 until now, mode B needed a 2000 uu hole
+	// through each end wall for the ring goal - which cannot be done by subtracting from a box - so
+	// mode B built a perforated REPLACEMENT and this solid slab was presented only in mode A. The hoop
+	// now floats on the goal line with ClampedEndzoneDepth() of playable pocket between it and the
+	// wall, so the wall has no hole in it in either mode and there is exactly one end wall again.
+	//
+	// Leaving the tag in place would have been the worst kind of leftover: SetPiecesPresented would
+	// have hidden and DE-COLLIDED both end walls for the whole of a mode B match, and the first thing
+	// anybody did in the new pocket would have been to walk out of the world.
 	for (const FWallSpec& Wall : Walls)
 	{
-		// THE TWO END WALLS ARE MODE-TAGGED FROM SPEC v6 SECTION 4.3 ONWARDS, and the side walls are
-		// not. Mode B puts a 2000 uu hole through each end wall for the ring goal, which cannot be
-		// done by subtracting from a box - so mode B builds its own perforated replacement
-		// (BuildGoalWall) and this solid slab is presented only while mode A is armed.
-		//
-		// Marked around the pair of components rather than around the loop, so the collision box and
-		// the mesh for one wall are tagged together and the SIDE walls stay untagged and permanent.
-		const bool bEndWall = (Wall.Size.X <= WallThickness * 1.01f);
-		const FTraceBuildMark WallMark = bEndWall ? MarkBuiltComponents() : FTraceBuildMark();
-
 		AddCollisionBlock(Wall.Center, Wall.Size, Wall.Name);
 
 		if (bBuildVisuals)
 		{
 			AddMeshBlock(CubeMesh, Wall.Center, Wall.Size, WallMID, /*bCastShadow=*/true, Wall.Name);
-		}
-
-		if (bEndWall)
-		{
-			CollectPiecesSince(WallMark, EndzoneModePieces);
 		}
 	}
 
@@ -2044,18 +2209,15 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 	}
 	for (const float XSign : { 1.f, -1.f })
 	{
-		// Mode-tagged with the end wall it belongs to. A full-face pawn shell across an end wall would
-		// hold a mode-B carrier 74 uu OFF the goal they are trying to run through - an invisible wall
-		// standing in the mouth, which is exactly the failure SetPiecesPresented was written to stop.
-		// BuildGoalWall builds the four shells that go around the ring instead.
-		const FTraceBuildMark StandoffMark = MarkBuiltComponents();
-
+		// UNTAGGED AND PERMANENT since spec v28 §8, with the end wall it belongs to. It used to be
+		// mode-tagged because a full-face pawn shell across an end wall would have held a mode-B
+		// carrier 74 uu OFF the goal they were trying to run through. The goal is 2400 uu away from
+		// this wall now; the shell it would have blocked no longer touches it, and the pocket behind
+		// the hoop is exactly where a body most wants a wall it cannot press into.
 		AddPawnStandoff(
 			FVector(XSign * (HalfX - TraceArenaConstants::WallNeonStandoff * 0.5f), 0.f, StandoffZ),
 			FVector(TraceArenaConstants::WallNeonStandoff, FieldWidth, WallHeight),
 			TEXT("WallStandoffX"));
-
-		CollectPiecesSince(StandoffMark, EndzoneModePieces);
 	}
 
 	if (!bBuildVisuals)
@@ -2120,19 +2282,19 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		RegisterSideMID(Sign, TeamTrimMID, /*bNeon=*/true, TraceArenaConstants::GlowTrim);
 		RegisterSideMID(Sign, TeamRibMID, /*bNeon=*/true, TraceArenaConstants::GlowRib);
 
-		// The top strip is untagged and permanent: at WallHeight - 23 uu it sits well clear of the
-		// mode-B ring aperture, and it is the line that reads the end of the field from midfield in
-		// both modes.
+		// The top strip: the line that reads the end of the field from midfield in both modes. It was
+		// the only piece of end-wall dressing that was permanent while the wall had a hole in it; the
+		// three below it join it now (spec v28 §8).
 		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TrimInset), 0.f, TrimZ),
 			FVector(TraceArenaConstants::WallTrimSize, FieldWidth, TraceArenaConstants::WallTrimSize),
 			TeamTrimMID, false, TEXT("EndTrim"));
 
-		// EVERYTHING BELOW IT IS MODE A ONLY. The band, the kick band and the vertical ribs all cross
-		// the height and the width the mode-B hoop occupies, so in mode B they would be three glowing
-		// bars drawn straight across the goal - the strongest lines on the wall, contradicting the
-		// thing the wall is now for. In mode B the ring and its alcove are the dressing at this end.
-		const FTraceBuildMark TrimMark = MarkBuiltComponents();
-
+		// THE BAND, THE KICK BAND AND THE RIBS ARE NOW PERMANENT TOO (spec v28 §8). They used to be
+		// mode A only, because they crossed the height and the width the mode-B hoop occupied and
+		// would have been three glowing bars drawn straight across the goal. The hoop hangs on the
+		// goal line now, a whole pocket in front of this wall, and nothing on the wall is behind it -
+		// so the end wall gets its full dressing in both modes, which is what the pocket needs: it is
+		// the only structure a player standing at their own spawn is looking at.
 		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TraceArenaConstants::WallBandSize * 0.5f), 0.f, BandZ),
 			FVector(TraceArenaConstants::WallBandSize, FieldWidth, TraceArenaConstants::WallBandSize),
 			TeamRibMID, false, TEXT("EndBand"));
@@ -2149,8 +2311,6 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 				FVector(TraceArenaConstants::WallRibDepth, TraceArenaConstants::WallRibWidth, RibHeight),
 				TeamRibMID, false, TEXT("EndRib"));
 		}
-
-		CollectPiecesSince(TrimMark, EndzoneModePieces);
 	}
 }
 
@@ -2362,12 +2522,18 @@ void ATraceArenaBuilder::BuildCentreDais(bool bBuildVisuals)
 		TraceArenaConstants::NeonNeutral, 0.026f);
 	UMaterialInstanceDynamic* PylonNeonMID = MakeNeonMID(TraceArenaConstants::NeonNeutral, TraceArenaConstants::GlowPylon);
 
+	// The ring is measured off THE DAIS, which is what it rings - see the note on
+	// DaisPylonXPerDaisSide. It used to be a fraction of the half length and of the half width, which
+	// meant the diamond's own ring drifted outward every time the field was resized.
+	const float DaisSide = TraceArenaConstants::DaisTopTierSide
+		+ TraceArenaConstants::DaisTierSideStep * static_cast<float>(TraceArenaConstants::DaisTiers - 1);
+
 	for (const float XSign : { -1.f, 1.f })
 	{
 		for (const float YSign : { -1.f, 1.f })
 		{
-			AddPylon(FVector2D(XSign * HalfLength() * TraceArenaConstants::DaisPylonXFrac,
-					YSign * HalfY * TraceArenaConstants::DaisPylonYFrac),
+			AddPylon(FVector2D(XSign * DaisSide * TraceArenaConstants::DaisPylonXPerDaisSide,
+					YSign * DaisSide * TraceArenaConstants::DaisPylonYPerDaisSide),
 				TraceArenaConstants::DaisPylonSide, TraceArenaConstants::DaisPylonHeight,
 				PylonBodyMID, PylonNeonMID, TEXT("DaisPylon"));
 		}
@@ -2718,50 +2884,21 @@ void ATraceArenaBuilder::BuildWallFillets(bool bBuildVisuals)
 		return;
 	}
 
-	// --- How far up an END wall a step is allowed to reach ----------------------------------------
+	// --- The END walls take the FULL cove again (spec v28 §8) --------------------------------------
 	//
-	// The ramp's top surface runs from (Run uu out from the wall, Z = 0) to (the wall, RampTop). A
-	// cove step spanning d in [inner, outer] at height TopZ has to stay under the LOWEST point of the
-	// ramp over that span, which is at its OUTER edge. Computed from the same GoalRampTopZ() and
-	// GoalRampRunPerRise the ramp itself is built from, so re-tuning the ramp re-tunes this and a
-	// zero ramp (the dial is allowed to remove it) falls back to the hoop's own floor clearance.
-	const float RampTop = GoalRampTopZ();
-	const float RampRun = (RampTop > 1.f)
-		? FMath::Max(200.f, RampTop * FMath::Max(0.5f, GoalRampRunPerRise))
-		: 0.f;
-
-	auto EndWallCeilingAt = [this, RampTop, RampRun](float OuterDepth) -> float
-	{
-		// No ramp: nothing between the floor and the hoop except the hoop's own clearance, so keep a
-		// step below it by one riser exactly as GoalRampTopZ() would have.
-		if (RampTop <= 1.f || RampRun <= 1.f)
-		{
-			return FMath::Max(0.f, GoalRingClearanceZ() - TraceArenaConstants::StepRise);
-		}
-
-		const float RampZ = RampTop * (1.f - FMath::Clamp(OuterDepth / RampRun, 0.f, 1.f));
-		return RampZ - TraceArenaConstants::FilletRampClearance;
-	};
-
-	// Applied to BOTH profiles, and it has to be: clamping only the colliders would leave the drawn
-	// cove sweeping up through the goal ramp with nothing under it, and clamping only the skin would
-	// leave an invisible lip across the run-up. Same predicate, two lists.
-	auto CountUnderRamp = [&EndWallCeilingAt](const TArray<FTraceCoveStep>& Profile) -> int32
-	{
-		int32 Count = 0;
-		for (const FTraceCoveStep& Step : Profile)
-		{
-			if (Step.TopZ > EndWallCeilingAt(Step.OuterDepth))
-			{
-				break;   // And every step above it, or the end cove would stop being monotone.
-			}
-			++Count;
-		}
-		return Count;
-	};
-
-	const int32 EndSteps = CountUnderRamp(Steps);
-	const int32 EndSkin = CountUnderRamp(Skin);
+	// There used to be a clamp here, and deleting it is part of this pass rather than a tidy-up. The
+	// mode-B carry-in ramp used to climb the last 940 uu of floor IN FRONT OF EACH END WALL, and this
+	// cove occupies the same 600 uu, so every end-wall step that would have poked up through the
+	// ramp's surface was dropped - a lip across the only way into the goal on foot is not something
+	// to discover mid-run. On the shipped numbers that truncated the end cove at ~69 uu against the
+	// side walls' ~190.
+	//
+	// The ramps are at the GOAL LINE now, 2400 uu clear of the wall, and nothing else stands in the
+	// pocket's last 600 uu. Keeping the clamp would have cost the two end walls two thirds of their
+	// curve to avoid a collision that can no longer happen - and, worse, it would have been a rule
+	// nobody could see the reason for, which is how a stale special case survives a decade.
+	const int32 EndSteps = Steps.Num();
+	const int32 EndSkin = Skin.Num();
 
 	// --- Materials --------------------------------------------------------------------------------
 	//
@@ -3260,6 +3397,19 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 		const float GoalX = Sign * GoalLineX();
 		const FLinearColor TeamColor = TraceTeamColor(Team);
 
+		// THE GATE STANDS JUST IN FRONT OF THE GOAL LINE, NOT ON IT (spec v28 §8), and this is the one
+		// place the hockey ends cost the old layout something. The gate is two 2300 uu towers on the
+		// sidelines carrying a 300 uu beam whose top is flush with the wall tops; the mode-B hoop now
+		// hangs ON the goal line and its outer edge reaches Z 2468, i.e. straight through that beam.
+		// A hoop with a bar buried across the top of it is not "floating", and the beam is the arena's
+		// biggest piece of "you are attacking THAT way" signage, so neither could give way.
+		//
+		// Moving the gate one ring-outer-radius up the pitch resolves it and reads better than the
+		// coincidence did: you run under the gate, then at the goal, then round behind it. Measured
+		// FROM THE RING rather than as a fraction of anything, so a bigger hoop pushes the gate off
+		// itself instead of growing into it.
+		const float GateX = GoalX - Sign * (GoalRingOuterRadius() + TraceArenaConstants::GateGoalClearance);
+
 		if (bBuildVisuals)
 		{
 			// --- Mode-A-only paint ---------------------------------------------------------------
@@ -3336,7 +3486,7 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 				HalfY - TraceArenaConstants::GateTowerWallGap - TraceArenaConstants::GateTowerSide * 0.5f);
 			for (const float YSign : { -1.f, 1.f })
 			{
-				AddPylon(FVector2D(GoalX, YSign * TowerY),
+				AddPylon(FVector2D(GateX, YSign * TowerY),
 					TraceArenaConstants::GateTowerSide, TraceArenaConstants::GateTowerHeight,
 					GateBodyMID, GateNeonMID, TEXT("GateTower"));
 			}
@@ -3348,7 +3498,7 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 			const float BeamZ = TraceArenaConstants::GateTowerHeight + TraceArenaConstants::GateBeamSize * 0.5f;
 			UMaterialInstanceDynamic* GateFaceMID = MakeNeonMID(TeamColor, TraceArenaConstants::GlowFace);
 			RegisterSideMID(Sign, GateFaceMID, /*bNeon=*/true, TraceArenaConstants::GlowFace);
-			AddNeonBlock(FVector(GoalX, 0.f, BeamZ),
+			AddNeonBlock(FVector(GateX, 0.f, BeamZ),
 				FVector(TraceArenaConstants::GateBeamSize, ZoneWidth, TraceArenaConstants::GateBeamSize),
 				0.f, GateBodyMID, GateNeonMID, /*bCollide=*/false, TEXT("GateBeam"),
 				GateFaceMID, /*bVerticalTrim=*/false);   // a horizontal beam has no vertical corners worth lighting
@@ -3424,102 +3574,52 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 	}
 }
 
-void ATraceArenaBuilder::BuildGoalWall(float Sign, bool bBuildVisuals)
+void ATraceArenaBuilder::BuildGoalRing(float Sign, bool bBuildVisuals)
 {
 	// ---------------------------------------------------------------------------------------------
-	// ONE END WALL, MODE B: the same slab BuildFloorAndWalls makes, with a circular hole through it.
+	// ONE FREE-STANDING HOOP. Spec v6 §4.3's shape, hung where spec v28 §8 asks for it.
 	//
-	// Four panels leave a square opening; RingSegments spokes close that square down to a circle;
-	// a neon rim on the spokes' inner faces is the hoop you aim at; an alcove behind it gives the
-	// hoop a room to frame instead of the empty sky; and four pawn shells replace the full-face one
-	// that would otherwise hold a carrier 74 uu short of the mouth.
+	// GoalRingSegments spokes form an annulus whose inner faces circumscribe the scoring disc; one
+	// bright neon band wrapped round the whole thickness of that annulus is the hoop you aim at, and
+	// it stands proud on BOTH faces so the goal reads identically from in front of it and from behind
+	// it; and a run-up ramp on each face is the way in on foot from either direction.
 	//
-	// Everything built here is collected into GoalModePieces by the caller, and the solid slab it
-	// replaces is collected into EndzoneModePieces in BuildFloorAndWalls. Exactly one of the two is
-	// presented, so mode A's end wall is untouched and cannot acquire a hole.
+	// WHAT WENT AWAY WITH THE WALL. Until spec v28 §8 this function was BuildGoalWall and it built a
+	// perforated REPLACEMENT end wall: four panels around a square opening, an alcove behind the hole
+	// so the hoop framed a lit room rather than the void outside the level, and four pawn shells
+	// around the aperture. The wall is 2400 uu further back now and has no hole in it, so all of that
+	// is deleted rather than disabled - the hoop frames the pocket, which is real playable floor with
+	// the spawn fan and the end wall's own dressing in it.
+	//
+	// Everything built here is collected into GoalModePieces by the caller and hidden (and
+	// de-collided) while mode A is armed.
 	// ---------------------------------------------------------------------------------------------
 
-	const float HalfX = HalfLength();
-	const float HalfY = HalfWidth();
+	const float PlaneX = Sign * GoalLineX();
 	const float Radius = GoalRingRadius();
+	const float OuterRadius = GoalRingOuterRadius();
 	const float CentreZ = GoalRingCentreZ();
-
-	// Half side of the square opening. Must clear the disc (>= Radius) and its corners must stay
-	// inside the annulus (S * sqrt(2) <= outer radius), which is what the two scale constants buy.
-	const float Square = Radius * TraceArenaConstants::GoalRingSquareScale;
-	const float OuterRadius = Radius * TraceArenaConstants::GoalRingOuterScale;
-
-	// The wall slab's own footprint, copied from BuildFloorAndWalls so the replacement occupies
-	// exactly the volume the original did.
-	const float WallCentreX = Sign * (HalfX + WallThickness * 0.5f);
-	const float BottomZ = FMath::Max(0.f, CentreZ - Square);
-	const float TopZ = FMath::Min(WallHeight, CentreZ + Square);
+	const float HalfThickness = GoalRingHalfThickness();
 
 	// Which team defends THIS end, asked of the one function that answers it, so a half-time side
 	// switch (which flips TeamEndSign's answer) cannot leave the hoop tinted for the wrong side.
 	const ETraceTeam DefendingTeam = (TeamEndSign(ETraceTeam::Blue) == Sign) ? ETraceTeam::Blue : ETraceTeam::Orange;
 	const FLinearColor TeamColor = TraceTeamColor(DefendingTeam);
 
-	// The wall body keeps the neutral wall material; the hoop, the alcove and the rim take the colour
-	// of the team that DEFENDS this end, exactly as the endzone patch does, and are registered for
-	// the half-time repaint so the sides swap with everything else.
-	UMaterialInstanceDynamic* WallMID = bBuildVisuals
-		? MakeSurfaceMID(TraceArenaConstants::WallColor, 0.55f, 0.f, TraceArenaConstants::NeonNeutral, 0.022f)
-		: nullptr;
+	// The ring body and its rim take the colour of the team that DEFENDS this end, exactly as the
+	// endzone patch does, and are registered for the half-time repaint so the sides swap with
+	// everything else.
 	UMaterialInstanceDynamic* RingBodyMID = bBuildVisuals
 		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f, TeamColor, 0.035f)
 		: nullptr;
 	UMaterialInstanceDynamic* RingNeonMID = bBuildVisuals
 		? MakeNeonMID(TeamColor, TraceArenaConstants::GlowGoalRing)
 		: nullptr;
-	// 0.20 -> 0.11 emissive after the first capture: at 0.20 the alcove was brighter than the hoop
-	// around it and the goal photographed as a lit portal you look INTO rather than as a ring you
-	// throw THROUGH. It has to be lit enough to say "there is a room back there" and dim enough that
-	// the brightest thing at this end of the field is still the rim.
-	UMaterialInstanceDynamic* AlcoveMID = bBuildVisuals
-		? MakeSurfaceMID(TraceArenaConstants::Dim(TeamColor, 0.020f), 0.35f, 0.f, TeamColor, 0.11f)
-		: nullptr;
 
 	RegisterSideMID(Sign, RingBodyMID, /*bNeon=*/false, /*Intensity=*/0.035f, /*BaseDim=*/-1.f);
 	RegisterSideMID(Sign, RingNeonMID, /*bNeon=*/true, TraceArenaConstants::GlowGoalRing);
-	RegisterSideMID(Sign, AlcoveMID, /*bNeon=*/false, /*Intensity=*/0.11f, /*BaseDim=*/0.020f);
 
-	// --- 1. The four panels around the square opening --------------------------------------------
-	//
-	// Full field width below and above, and the two side columns between them. Built through
-	// AddCollisionBlock + AddMeshBlock rather than AddNeonBlock: this is WALL, and a lip and face trim
-	// on each of four fragments would draw four bright rectangles around a hole that already has the
-	// brightest object in the arena around it.
-	struct FPanel
-	{
-		FVector Centre;
-		FVector Size;
-	};
-
-	const FPanel Panels[] =
-	{
-		// Below the opening, and above it: the full width of the wall.
-		{ FVector(WallCentreX, 0.f, BottomZ * 0.5f),
-		  FVector(WallThickness, FieldWidth + 2.f * WallThickness, FMath::Max(1.f, BottomZ)) },
-		{ FVector(WallCentreX, 0.f, (TopZ + WallHeight) * 0.5f),
-		  FVector(WallThickness, FieldWidth + 2.f * WallThickness, FMath::Max(1.f, WallHeight - TopZ)) },
-		// The two columns either side of the opening, spanning only its height.
-		{ FVector(WallCentreX, (Square + HalfY + WallThickness) * 0.5f, CentreZ),
-		  FVector(WallThickness, FMath::Max(1.f, HalfY + WallThickness - Square), TopZ - BottomZ) },
-		{ FVector(WallCentreX, -(Square + HalfY + WallThickness) * 0.5f, CentreZ),
-		  FVector(WallThickness, FMath::Max(1.f, HalfY + WallThickness - Square), TopZ - BottomZ) }
-	};
-
-	for (const FPanel& Panel : Panels)
-	{
-		AddCollisionBlock(Panel.Centre, Panel.Size, TEXT("GoalWallPanel"));
-		if (bBuildVisuals)
-		{
-			AddMeshBlock(CubeMesh, Panel.Centre, Panel.Size, WallMID, /*bCastShadow=*/true, TEXT("GoalWallPanel"));
-		}
-	}
-
-	// --- 2. The annulus: square opening -> circular hole ------------------------------------------
+	// --- 1. The annulus --------------------------------------------------------------------------
 	//
 	// Each spoke is a box rolled about the field axis, with its LOCAL Y radial and its LOCAL Z
 	// tangential. Its inner face is therefore a chord at exactly Radius from the centre, so the union
@@ -3539,10 +3639,10 @@ void ATraceArenaBuilder::BuildGoalWall(float Sign, bool bBuildVisuals)
 		const float SinA = FMath::Sin(Angle);
 
 		// Roll about local X. Roll takes local +Y to (0, cos, sin), which is the radial direction, and
-		// local +Z to the tangent - so Size is (through the wall, radial, tangential).
+		// local +Z to the tangent - so Size is (through the ring, radial, tangential).
 		const FRotator SpokeRotation(0.f, 0.f, FMath::RadiansToDegrees(Angle));
-		const FVector SpokeCentre(WallCentreX, MidRadius * CosA, CentreZ + MidRadius * SinA);
-		const FVector SpokeSize(WallThickness, RadialDepth, SpokeWidth);
+		const FVector SpokeCentre(PlaneX, MidRadius * CosA, CentreZ + MidRadius * SinA);
+		const FVector SpokeSize(HalfThickness * 2.f, RadialDepth, SpokeWidth);
 
 		AddCollisionBlockRotated(SpokeCentre, SpokeSize, TEXT("GoalRingSpoke"), SpokeRotation);
 
@@ -3551,18 +3651,22 @@ void ATraceArenaBuilder::BuildGoalWall(float Sign, bool bBuildVisuals)
 			continue;
 		}
 
-		// bCastShadow=false (spec v7 §8 shadow audit). A spoke is one sector of the annulus that closes
-		// the wall's square opening down to a circle: it is exactly WallThickness deep and it lies IN
-		// THE PLANE of the four wall panels around it, which do cast. Its shadow is therefore always
-		// inside the wall's own, and there are GoalRingSegments of them at each end. Nothing on screen
-		// changes; the shadow pass stops being handed the ring.
+		// bCastShadow=false, and the reason CHANGED with spec v28 §8 even though the answer did not.
+		// It used to be that a spoke lay in the plane of the wall panels around it, so its shadow was
+		// always inside theirs. There is no wall now - but a hoop 2400 uu from the end wall, lit by
+		// three high directional lights, would throw a 2000 uu ellipse across the goalmouth floor and
+		// across the ramp a carrier has to read, for GoalRingSegments x 2 extra shadow casters. The
+		// ring is the brightest object at this end of the field; it does not also need to be the
+		// darkest.
 		AddMeshBlockRotated(CubeMesh, SpokeCentre, SpokeSize, RingBodyMID, /*bCastShadow=*/false,
 			TEXT("GoalRingSpoke"), SpokeRotation);
 
-		// THE HOOP. A thin bright band on the spoke's inner face, standing proud of the wall on the
-		// field side so it is visible edge-on from the halfway line as well as head on. This is the
-		// entire answer to "make it visually obvious what and where the goal is": a ring set into a
-		// near-black wall is invisible without it.
+		// THE HOOP. A thin bright band wrapped round the annulus's inner rim, standing GoalRingRimProud
+		// past EACH face so the ring is visible edge-on from the halfway line and from the pocket
+		// alike. This is the entire answer to "make it visually obvious what and where the goal is",
+		// and since spec v28 §8 it is ONE band through the whole thickness rather than one strip on the
+		// field-facing side - a goal you can score through from either side may not be brighter from
+		// one of them.
 		const float RimRadius = Radius + TraceArenaConstants::GoalRingRimDepth * 0.5f;
 
 		// SIZED AT THE RIM'S OWN RADIUS, not at the spoke's. MEASURED: reusing SpokeWidth here (which
@@ -3572,11 +3676,9 @@ void ATraceArenaBuilder::BuildGoalWall(float Sign, bool bBuildVisuals)
 		// 1.06 is the seam overlap and nothing more.
 		const float RimWidth = 2.f * RimRadius * FMath::Tan(SectorHalfAngle) * 1.06f;
 
-		const FVector RimCentre(
-			WallCentreX - Sign * (WallThickness * 0.5f + TraceArenaConstants::GoalRingRimProud * 0.5f),
-			RimRadius * CosA, CentreZ + RimRadius * SinA);
+		const FVector RimCentre(PlaneX, RimRadius * CosA, CentreZ + RimRadius * SinA);
 		const FVector RimSize(
-			WallThickness + TraceArenaConstants::GoalRingRimProud,
+			HalfThickness * 2.f + TraceArenaConstants::GoalRingRimProud * 2.f,
 			TraceArenaConstants::GoalRingRimDepth,
 			RimWidth);
 
@@ -3584,105 +3686,61 @@ void ATraceArenaBuilder::BuildGoalWall(float Sign, bool bBuildVisuals)
 			TEXT("GoalRingRim"), SpokeRotation);
 	}
 
-	// --- 3. The alcove behind the hoop ------------------------------------------------------------
+	// --- 2. The approach ramps, ONE ON EACH FACE ---------------------------------------------------
 	//
-	// A short lit tube and a back panel. Without it the hoop frames the void outside the arena, which
-	// reads as a hole in the level rather than as a goal; with it the mouth glows from the inside and
-	// a Core (or a carrier) that goes through lands somewhere real instead of falling out of the
-	// world. It sits OUTSIDE the field box, so nothing on the pitch can reach it except through the
-	// ring - and by then the goal has already been awarded.
-	const float AlcoveNearX = Sign * (HalfX + WallThickness);
-	const float AlcoveDepth = TraceArenaConstants::GoalAlcoveDepth;
-	const float AlcoveCentreX = AlcoveNearX + Sign * AlcoveDepth * 0.5f;
-	const float AlcoveHalf = Square;
-	const float AlcoveWall = 60.f;
-
-	const FPanel Alcove[] =
-	{
-		{ FVector(AlcoveCentreX, 0.f, CentreZ - AlcoveHalf - AlcoveWall * 0.5f),
-		  FVector(AlcoveDepth, AlcoveHalf * 2.f + AlcoveWall * 2.f, AlcoveWall) },
-		{ FVector(AlcoveCentreX, 0.f, CentreZ + AlcoveHalf + AlcoveWall * 0.5f),
-		  FVector(AlcoveDepth, AlcoveHalf * 2.f + AlcoveWall * 2.f, AlcoveWall) },
-		{ FVector(AlcoveCentreX, AlcoveHalf + AlcoveWall * 0.5f, CentreZ),
-		  FVector(AlcoveDepth, AlcoveWall, AlcoveHalf * 2.f) },
-		{ FVector(AlcoveCentreX, -(AlcoveHalf + AlcoveWall * 0.5f), CentreZ),
-		  FVector(AlcoveDepth, AlcoveWall, AlcoveHalf * 2.f) },
-		{ FVector(AlcoveNearX + Sign * (AlcoveDepth + AlcoveWall * 0.5f), 0.f, CentreZ),
-		  FVector(AlcoveWall, AlcoveHalf * 2.f + AlcoveWall * 2.f, AlcoveHalf * 2.f + AlcoveWall * 2.f) }
-	};
-
-	for (const FPanel& Piece : Alcove)
-	{
-		AddCollisionBlock(Piece.Centre, Piece.Size, TEXT("GoalAlcove"));
-		if (bBuildVisuals)
-		{
-			AddMeshBlock(CubeMesh, Piece.Centre, Piece.Size, AlcoveMID, /*bCastShadow=*/false, TEXT("GoalAlcove"));
-		}
-	}
-
-	// --- 4. Pawn standoffs, everywhere except the mouth -------------------------------------------
-	//
-	// The same WallNeonStandoff shell BuildFloorAndWalls runs across the whole end wall, cut into
-	// four pieces around the opening. Pawn-only, like every other standoff: shots, sightlines, the
-	// Core and the camera probe still see the real wall.
-	const float StandoffX = Sign * (HalfX - TraceArenaConstants::WallNeonStandoff * 0.5f);
-	const FPanel Shells[] =
-	{
-		{ FVector(StandoffX, 0.f, BottomZ * 0.5f),
-		  FVector(TraceArenaConstants::WallNeonStandoff, FieldWidth, FMath::Max(1.f, BottomZ)) },
-		{ FVector(StandoffX, 0.f, (TopZ + WallHeight) * 0.5f),
-		  FVector(TraceArenaConstants::WallNeonStandoff, FieldWidth, FMath::Max(1.f, WallHeight - TopZ)) },
-		{ FVector(StandoffX, (Square + HalfY) * 0.5f, CentreZ),
-		  FVector(TraceArenaConstants::WallNeonStandoff, FMath::Max(1.f, HalfY - Square), TopZ - BottomZ) },
-		{ FVector(StandoffX, -(Square + HalfY) * 0.5f, CentreZ),
-		  FVector(TraceArenaConstants::WallNeonStandoff, FMath::Max(1.f, HalfY - Square), TopZ - BottomZ) }
-	};
-
-	for (const FPanel& Shell : Shells)
-	{
-		AddPawnStandoff(Shell.Centre, Shell.Size, TEXT("GoalWallStandoff"));
-	}
-
-	// --- 5. The approach ramp ---------------------------------------------------------------------
-	//
-	// WITHOUT THIS THERE IS NO CARRY-IN GOAL, and that is worth stating plainly because it is a
+	// WITHOUT THESE THERE IS NO CARRY-IN GOAL, and that is worth stating plainly because it is a
 	// gameplay consequence of a purely visual-sounding instruction. Raising the mouth 1.5 player
 	// heights puts the bottom of the hoop at 264 uu; a pawn's origin sits at 88 uu standing and
-	// reaches roughly 208 uu at the top of a jump, so a carrier on the flat can never get their
-	// origin inside the disc and "scoring by carrying through it" would be dead on arrival. A shallow
-	// slope (13 degrees at the default, well inside the walkable angle) up to one step BELOW the hoop
-	// puts a standing carrier's origin 952 uu from the ring centre - inside a 1000 uu mouth.
+	// reaches roughly 208 uu at the top of a jump, so a carrier on the flat can never get their origin
+	// inside the disc and "scoring by carrying through it" would be dead on arrival. A shallow slope
+	// (13 degrees at the default, well inside the walkable angle) up to one step BELOW the hoop puts a
+	// standing carrier's origin 952 uu from the ring centre - inside a 1000 uu mouth.
 	//
-	// It also gives the defence something: the ramp is the only way in on foot, it is 2000 uu wide,
-	// and it is the obvious place to hold.
+	// SPEC v28 §8 BUILDS IT TWICE, mirrored through the ring plane, because the pocket behind the goal
+	// is playable and "allow goals to be scored through either side" has to mean on foot as well as
+	// through the air. This is a loop over the two face signs and not a second special case: the ramp
+	// is the same object, and the only thing that differs is which way it falls away from the hoop.
+	//
+	// It also gives the defence something: a ramp is the only way in on foot, each is 2000 uu wide,
+	// and they are the obvious places to hold.
 	const float RampTop = GoalRampTopZ();
-	if (RampTop > 1.f)
+	const float Run = GoalRampRun();
+	if (RampTop > 1.f && Run > 1.f)
 	{
-		const float Run = FMath::Max(200.f, RampTop * FMath::Max(0.5f, GoalRampRunPerRise));
 		const float SlopeLength = FMath::Sqrt(Run * Run + RampTop * RampTop);
 		const float SlopeRadians = FMath::Atan2(RampTop, Run);
 		const float SlopeDegrees = FMath::RadiansToDegrees(SlopeRadians);
 
-		// Positive pitch tilts the block's local +X upward, so the ramp rises toward the wall at the
-		// +X end and away from it at the -X end: Pitch = Sign * slope.
-		const FRotator RampRotation(Sign * SlopeDegrees, 0.f, 0.f);
+		UMaterialInstanceDynamic* RampMID = bBuildVisuals
+			? MakeSurfaceMID(TraceArenaConstants::Dim(TeamColor, 0.035f), 0.30f, 0.f, TeamColor, 0.10f)
+			: nullptr;
+		RegisterSideMID(Sign, RampMID, /*bNeon=*/false, /*Intensity=*/0.10f, /*BaseDim=*/0.035f);
 
-		// Centre of the sloped slab, dropped half a thickness along its own normal so the TOP surface
-		// is the line from (wall - Run, 0) to (wall, RampTop) rather than the middle of the slab.
-		const FVector RampCentre(
-			Sign * (HalfX - Run * 0.5f) + Sign * FMath::Sin(SlopeRadians) * TraceArenaConstants::GoalRampThickness * 0.5f,
-			0.f,
-			RampTop * 0.5f - FMath::Cos(SlopeRadians) * TraceArenaConstants::GoalRampThickness * 0.5f);
-
-		const FVector RampSize(SlopeLength, Radius * 2.f, TraceArenaConstants::GoalRampThickness);
-
-		AddCollisionBlockRotated(RampCentre, RampSize, TEXT("GoalRamp"), RampRotation);
-
-		if (bBuildVisuals)
+		// FaceSign is the direction the ramp FALLS AWAY from the ring, in world X: -Sign runs back down
+		// the pitch, +Sign runs back into the pocket.
+		for (const float FaceSign : { -1.f, 1.f })
 		{
-			UMaterialInstanceDynamic* RampMID = MakeSurfaceMID(
-				TraceArenaConstants::Dim(TeamColor, 0.035f), 0.30f, 0.f, TeamColor, 0.10f);
-			RegisterSideMID(Sign, RampMID, /*bNeon=*/false, /*Intensity=*/0.10f, /*BaseDim=*/0.035f);
+			// Positive pitch tilts the block's local +X upward, so a ramp that rises in the -FaceSign
+			// direction wants Pitch = -FaceSign * slope.
+			const FRotator RampRotation(-FaceSign * SlopeDegrees, 0.f, 0.f);
+
+			// The high end meets the ring's own face; the foot is Run further out. Centre of the sloped
+			// slab, dropped half a thickness along its own normal so the TOP surface is the line from
+			// the foot to the hoop rather than the middle of the slab.
+			const float HighX = PlaneX + FaceSign * HalfThickness;
+			const FVector RampCentre(
+				HighX + FaceSign * Run * 0.5f - FaceSign * FMath::Sin(SlopeRadians) * TraceArenaConstants::GoalRampThickness * 0.5f,
+				0.f,
+				RampTop * 0.5f - FMath::Cos(SlopeRadians) * TraceArenaConstants::GoalRampThickness * 0.5f);
+
+			const FVector RampSize(SlopeLength, Radius * 2.f, TraceArenaConstants::GoalRampThickness);
+
+			AddCollisionBlockRotated(RampCentre, RampSize, TEXT("GoalRamp"), RampRotation);
+
+			if (!bBuildVisuals)
+			{
+				continue;
+			}
 
 			AddMeshBlockRotated(CubeMesh, RampCentre, RampSize, RampMID, /*bCastShadow=*/false,
 				TEXT("GoalRamp"), RampRotation);
@@ -3699,66 +3757,70 @@ void ATraceArenaBuilder::BuildGoalWall(float Sign, bool bBuildVisuals)
 	}
 
 	UE_LOG(LogTraceGame, Log,
-		TEXT("Goal wall (%s end): opening +/-%.0f uu square at Z %.0f, hoop radius %.0f (%.0f uu across), ")
-		TEXT("bottom of the hoop %.0f uu up, %d spokes, ramp to %.0f uu."),
-		*TraceTeamName(DefendingTeam).ToString(), Square, CentreZ, Radius, Radius * 2.f,
-		CentreZ - Radius, Segments, RampTop);
+		TEXT("Goal ring (%s end): FLOATING on the goal line at X %.0f, mouth radius %.0f (%.0f uu across), ")
+		TEXT("bottom of the mouth %.0f uu up, ring band %.0f uu (outer edge %.0f uu off the floor), %d spokes, ")
+		TEXT("two ramps to %.0f uu over %.0f uu of run, %.0f uu of playable pocket behind it."),
+		*TraceTeamName(DefendingTeam).ToString(), PlaneX, Radius, Radius * 2.f,
+		CentreZ - Radius, OuterRadius - Radius, CentreZ - OuterRadius, Segments, RampTop, Run,
+		ClampedEndzoneDepth());
 }
 
 void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 {
 	// ---------------------------------------------------------------------------------------------
-	// MODE B - the goals. Spec v6 section 4.3, verbatim: "Raise the goals 1.5x player height from the
-	// ground, place them into the back walls, and make them circular."
+	// MODE B - the goals. Spec v6 section 4.3 made them circular and raised them 1.5 player heights;
+	// spec v28 section 8 took the wall out from behind them:
 	//
-	// WHAT THIS REPLACED. Until v6 a goal was furniture standing on the floor between the goal line
-	// and the end wall - two posts, a crossbar, a lit sill and a tinted mouth patch - and the scoring
-	// volume was the endzone-deep box behind it. All of that is gone. The goal is now a HOLE THROUGH
-	// THE BACK WALL with a neon hoop around it (BuildGoalWall), and the scoring volume is a shallow
-	// slab across its mouth which scores on the DISC inscribed in it, not on the slab's corners.
+	//   "Structure the ends of the field kind of like a hockey field, where you can play behind the
+	//    goals. Keep the goals the same, raised in the air floating, just move the wall further back
+	//    and put the spawn area there. Allow goals to be scored through either side of the goal."
 	//
-	// The floor dressing that survives is the approach lane: the goal line sill and the two rails
-	// running back from it still mark the 2000 uu corridor that leads to the ramp, which is what tells
-	// a carrier at midfield which lane the goal is in. Everything here is tagged into GoalModePieces
-	// and hidden (and de-collided) while mode A is being played.
+	// So the goal is a FREE-STANDING HOOP hanging on the goal line (BuildGoalRing), with a run-up ramp
+	// on each of its faces, and the scoring volume is a shallow slab STRADDLING its mouth which scores
+	// on the DISC inscribed in it, not on the slab's corners. The mouth itself is untouched: same
+	// diameter, same height, same disc.
+	//
+	// The floor dressing is the approach lane, and since v28 it is drawn on BOTH sides of the goal
+	// line - the sill on the line, a tinted patch and two rails running away from it up the pitch AND
+	// back into the pocket - because "which lane is the goal in" is now a question a carrier asks from
+	// behind the goal as well as in front of it. Everything here is tagged into GoalModePieces and
+	// hidden (and de-collided) while mode A is being played.
 	// ---------------------------------------------------------------------------------------------
 
 	UWorld* World = GetWorld();
-	const float HalfX = HalfLength();
 	const float MouthHalfY = GoalHalfWidth();
 	const float Depth = ClampedEndzoneDepth();
 	const float Radius = GoalRingRadius();
 	const float CentreZ = GoalRingCentreZ();
-	const float SlabDepth = FMath::Clamp(GoalRingDepth, 60.f, Depth);
+	const float SlabHalfDepth = GoalSlabHalfDepth();
 
-	// Mark BEFORE anything is built, collision included: the perforated wall BLOCKS, and on a
-	// dedicated server (which builds collision and no visuals at all) an untagged panel would be a
-	// second wall standing inside the first one through the whole of mode A.
+	// Mark BEFORE anything is built, collision included: the ring BLOCKS, and on a dedicated server
+	// (which builds collision and no visuals at all) an untagged hoop would be a solid obstacle
+	// hanging over the goal line through the whole of mode A.
 	const FTraceBuildMark GoalMark = MarkBuiltComponents();
 
-	// Say the finished shape out loud, in uu, at Display. This is the line a playtest of spec v6 is
-	// judged against, and none of it - the height off the floor, the diameter, the fact that it is a
-	// circle in a wall rather than a box on the grass - is readable from a screenshot. It also states
-	// the resolution of the spec's own internal contradiction (see the header), so nobody has to
-	// re-derive it from the numbers.
+	// Say the finished shape out loud, in uu, at Display. This is the line a playtest of spec v6 and
+	// v28 is judged against, and none of it - the height off the floor, the diameter, the fact that it
+	// is a circle floating clear of a wall that is now 2400 uu behind it, the fact that the slab
+	// reaches equally far both ways - is readable from a screenshot.
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[Arena] MODE B goal (spec v6): CIRCULAR, %.0f uu across, set into the back wall, ")
-		TEXT("centre Z %.0f, bottom of the hoop %.0f uu off the floor (= %.2f x the %.0f uu player height), ")
-		TEXT("scoring slab %.0f uu deep."),
-		Radius * 2.f, CentreZ, CentreZ - Radius,
+		TEXT("[Arena] MODE B goal (spec v6 + v28 §8): CIRCULAR, %.0f uu across, FLOATING on the goal ")
+		TEXT("line at |X| %.0f with %.0f uu of playable pocket behind it, centre Z %.0f, bottom of the ")
+		TEXT("mouth %.0f uu off the floor (= %.2f x the %.0f uu player height), bottom of the ring band ")
+		TEXT("%.0f uu off the floor, scoring slab %.0f uu deep EITHER SIDE of the ring plane."),
+		Radius * 2.f, GoalLineX(), Depth, CentreZ, CentreZ - Radius,
 		(PlayerHeightUU() > 0.f) ? ((CentreZ - Radius) / PlayerHeightUU()) : 0.f, PlayerHeightUU(),
-		SlabDepth);
+		CentreZ - GoalRingOuterRadius(), SlabHalfDepth);
 
 	const ETraceTeam Teams[] = { ETraceTeam::Blue, ETraceTeam::Orange };
 	for (const ETraceTeam Team : Teams)
 	{
 		const float Sign = TeamEndSign(Team);
 		const float GoalX = Sign * GoalLineX();
-		const float CenterX = Sign * (HalfX - Depth * 0.5f);
 		const FLinearColor TeamColor = TraceTeamColor(Team);
 
-		// The wall, the hoop, the alcove and the ramp.
-		BuildGoalWall(Sign, bBuildVisuals);
+		// The hoop and its two ramps.
+		BuildGoalRing(Sign, bBuildVisuals);
 
 		if (!bBuildVisuals)
 		{
@@ -3768,31 +3830,41 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 		UMaterialInstanceDynamic* FrameMID = MakeNeonMID(TeamColor, TraceArenaConstants::GlowGoalFrame);
 		RegisterSideMID(Sign, FrameMID, /*bNeon=*/true, TraceArenaConstants::GlowGoalFrame);
 
-		// --- The approach lane on the floor -------------------------------------------------------
+		UMaterialInstanceDynamic* MouthMID = MakeSurfaceMID(
+			TraceArenaConstants::Dim(TeamColor, 0.030f), 0.20f, 0.f, TeamColor, 0.16f);
+		RegisterSideMID(Sign, MouthMID, /*bNeon=*/false, /*Intensity=*/0.16f, /*BaseDim=*/0.030f);
+
+		// --- The approach lane on the floor, ON BOTH SIDES OF THE GOAL LINE -----------------------
 		//
-		// A goal 264 uu up a wall is not visible on the FLOOR, and the floor is where a carrier's eye
-		// spends the run-in. The sill on the goal line and the two rails running back from it draw the
-		// 2000 uu corridor that ends at the ramp, so "the goal is down this lane" is legible from
-		// ground level at midfield - the same job the mouth patch did before v6.
+		// A mouth 264 uu up in the air is not visible on the FLOOR, and the floor is where a carrier's
+		// eye spends the run-in. The sill ON the line and the lane running away from it draw the
+		// 2000 uu corridor that ends at a ramp, so "the goal is down this lane" is legible from ground
+		// level - and since spec v28 §8 that has to be true from the pocket too, so the lane is one
+		// loop over the two lane signs rather than one strip pointing up the pitch.
+		//
+		// The lane is one pocket deep on each side, which is what makes the pair symmetric about the
+		// goal line whatever the pocket is set to.
 		AddMeshBlock(CubeMesh,
 			FVector(GoalX, 0.f, TraceArenaConstants::GoalLineZ + 4.f),
 			FVector(TraceArenaConstants::GoalSillWidth, MouthHalfY * 2.f, TraceArenaConstants::GoalLineThickness),
 			FrameMID, /*bCastShadow=*/false, TEXT("GoalSill"));
 
-		UMaterialInstanceDynamic* MouthMID = MakeSurfaceMID(
-			TraceArenaConstants::Dim(TeamColor, 0.030f), 0.20f, 0.f, TeamColor, 0.16f);
-		RegisterSideMID(Sign, MouthMID, /*bNeon=*/false, /*Intensity=*/0.16f, /*BaseDim=*/0.030f);
-		AddMeshBlock(CubeMesh,
-			FVector(CenterX, 0.f, TraceArenaConstants::GoalPatchZ),
-			FVector(Depth, MouthHalfY * 2.f, TraceArenaConstants::PatchThickness),
-			MouthMID, /*bCastShadow=*/false, TEXT("GoalMouthPatch"));
-
-		for (const float YSign : { -1.f, 1.f })
+		for (const float LaneSign : { -1.f, 1.f })
 		{
+			const float LaneCentreX = GoalX + Sign * LaneSign * Depth * 0.5f;
+
 			AddMeshBlock(CubeMesh,
-				FVector(CenterX, YSign * MouthHalfY, TraceArenaConstants::GoalLineZ + 4.f),
-				FVector(Depth, TraceArenaConstants::GoalSillWidth * 0.6f, TraceArenaConstants::GoalLineThickness),
-				FrameMID, /*bCastShadow=*/false, TEXT("GoalSideRail"));
+				FVector(LaneCentreX, 0.f, TraceArenaConstants::GoalPatchZ),
+				FVector(Depth, MouthHalfY * 2.f, TraceArenaConstants::PatchThickness),
+				MouthMID, /*bCastShadow=*/false, TEXT("GoalMouthPatch"));
+
+			for (const float YSign : { -1.f, 1.f })
+			{
+				AddMeshBlock(CubeMesh,
+					FVector(LaneCentreX, YSign * MouthHalfY, TraceArenaConstants::GoalLineZ + 4.f),
+					FVector(Depth, TraceArenaConstants::GoalSillWidth * 0.6f, TraceArenaConstants::GoalLineThickness),
+					FrameMID, /*bCastShadow=*/false, TEXT("GoalSideRail"));
+			}
 		}
 	}
 
@@ -3812,12 +3884,14 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 	{
 		const float Sign = TeamEndSign(Team);
 
-		// CENTRED ON THE HOOP, not on the endzone footprint: the volume is the ring's bounding slab,
-		// sitting just inside the wall plane, and ConfigureRing turns it into a disc. That is the whole
-		// of "the goal is circular and it is in the wall" as far as the scoring rule is concerned.
+		// CENTRED ON THE HOOP - and since spec v28 §8 that means centred ON THE RING PLANE rather than
+		// tucked into the wall in front of it. The volume is the ring's bounding slab and ConfigureRing
+		// turns it into a disc; putting the slab's own centre on the mouth is the entire mechanism
+		// behind "allow goals to be scored through either side of the goal", because every test that
+		// scores works in this box's local space and is symmetric in X once the box is.
 		const FTransform ZoneTransform(
 			GetActorRotation(),
-			GetActorTransform().TransformPosition(FVector(Sign * (HalfX - SlabDepth * 0.5f), 0.f, CentreZ)));
+			GetActorTransform().TransformPosition(FVector(Sign * GoalLineX(), 0.f, CentreZ)));
 
 		FActorSpawnParameters ZoneParams;
 		ZoneParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
@@ -3833,7 +3907,7 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 			continue;
 		}
 
-		Goal->ConfigureZone(Team, FVector(SlabDepth * 0.5f, Radius, Radius), /*bInGoalVolume=*/true);
+		Goal->ConfigureZone(Team, FVector(SlabHalfDepth, Radius, Radius), /*bInGoalVolume=*/true);
 		Goal->ConfigureRing(Radius);
 		Goal->SetZoneActive(TraceIsGoalMode(ScoringMode));   // see the matching note in BuildEndzones
 		Goal->FinishSpawning(ZoneTransform);
@@ -3841,11 +3915,11 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 
 		UE_LOG(LogTraceGame, Log,
 			TEXT("Goal (%s defends) is a RING of radius %.0f uu centred at X %.0f, Y 0, Z %.0f, ")
-			TEXT("slab X %.0f..%.0f (%.0f uu across = %.0f%% of the %.0f uu field width)."),
+			TEXT("slab X %.0f..%.0f - %.0f uu of it on each side of the ring plane, so it scores from ")
+			TEXT("either direction (%.0f uu across = %.0f%% of the %.0f uu field width)."),
 			*TraceTeamName(Team).ToString(), Radius,
-			Sign * (HalfX - SlabDepth * 0.5f), CentreZ,
-			FMath::Min(Sign * (HalfX - SlabDepth), Sign * HalfX),
-			FMath::Max(Sign * (HalfX - SlabDepth), Sign * HalfX),
+			Sign * GoalLineX(), CentreZ,
+			Sign * GoalLineX() - SlabHalfDepth, Sign * GoalLineX() + SlabHalfDepth, SlabHalfDepth,
 			Radius * 2.f, (FieldWidth > 0.f) ? (Radius * 200.f / FieldWidth) : 0.f, FieldWidth);
 
 		if (!bBuildingEditorPreview && !Goal->HasActorBegunPlay())
@@ -3866,7 +3940,6 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 	}
 
 	const int32 PerTeam = FMath::Clamp(StartsPerTeam, 1, 16);
-	const float HalfX = HalfLength();
 	const float Spread = HalfWidth() * TraceArenaConstants::StartSpreadFraction;
 
 	FActorSpawnParameters SpawnParams;
@@ -3878,34 +3951,33 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 	{
 		const float Sign = TeamEndSign(Team);
 
-		// A team spawns in front of the endzone it defends and faces the centre of the field.
+		// SPEC v28 §8: "Set the spawns back behind the goals." A team now spawns in the POCKET behind
+		// the goal it defends, and faces up the field - which means facing straight through its own
+		// hoop, the single most legible "that way" a spawn can point at.
 		//
-		// Depth comes from the SAME function BuildEndzones uses (ClampedEndzoneDepth), not from a
-		// second hand-written clamp, so the pads cannot end up inside (or on the far side of) the
-		// endzone they are supposed to sit in front of. Widening the endzone to the full field width
-		// changed nothing here - the line is a function of depth alone - but the lateral spread is
-		// worth a thought: it is StartSpreadFraction (0.6) of the half width, i.e. +/-2880 on the
-		// 9600 uu field, which clears the corner banks by 420 uu. The lower bound is the centre
-		// diamond rather than 0: with a large EndzoneDepth the old Max(0.f, ...) put BOTH teams'
-		// spawn lines at X = 0, i.e. on top of it — silently reproducing the exact "spawned inside
-		// geometry" failure this build was shipped with.
+		// THE LINE IS ASKED FOR, NOT DERIVED HERE. GetSpawnLineX() owns the band between the foot of
+		// the back approach ramp and the end wall's pawn standoff, and ATraceGameMode's deeper respawn
+		// pads come out of the same function at a different alpha. That is deliberate and it is the
+		// lesson ClampedEndzoneDepth already taught this file: the moment two places compute "where is
+		// it safe to stand back there" independently, one of them is eventually wrong and the symptom
+		// is a pawn spawned inside geometry, which nothing logs.
 		//
-		// THE RESULTING FAN, on the 33600 x 9600 field: X = +/-12720 (i.e. 1680 uu in front of the
-		// goal line at 14400), Y = 0 / +/-1440 / +/-2880. Every one of those five points was
-		// re-checked against every entry in ApproachCover and MidfieldCover and against the corner
-		// banks. The tightest is the 3.5x goal-approach tower E at (13800, 2100), whose 45-degree
-		// footprint reaches X = 13305 — 585 uu clear in X — and whose Y span deliberately falls
-		// BETWEEN two pad rows; then block D at (11000, 1300), 890 uu clear.
+		// WHAT THE OLD LINE WAS, for the record: HalfX * (1 - StartInsetFraction) - EndzoneDepth, i.e.
+		// 1680 uu IN FRONT of the goal line. StartInsetFraction is now unused by this file and the
+		// pairing note it carried - pads are goal-relative, so length-relative cover slides through
+		// them - is preserved by ApproachCover still being measured back from the goal line.
 		//
-		// THIS IS THE PAIRING THAT BROKE WHEN THE FIELD WAS LENGTHENED, and it is worth knowing why:
-		// the pad line is GOAL-RELATIVE (goal line minus 0.1 * half length) while the cover used to
-		// be LENGTH-RELATIVE, so growing the field slid them through each other and put a pad inside
-		// block E's footprint. ApproachCover is now measured back from the goal line for exactly
-		// that reason. If you move the interior layout, re-check it: a start pad inside a solid block
-		// is a pawn that spawns embedded in the world, and nothing logs it.
-		const float Depth = ClampedEndzoneDepth();
-		const float MinLineX = TraceArenaConstants::DaisTopTierSide + TraceArenaConstants::DaisTierSideStep * TraceArenaConstants::DaisTiers;
-		const float LineX = Sign * FMath::Max(MinLineX, HalfX * (1.f - TraceArenaConstants::StartInsetFraction) - Depth);
+		// The lateral spread is unchanged: StartSpreadFraction (0.6) of the half width, i.e. +/-2880
+		// on the 9600 uu field, which clears the corner banks by 420 uu.
+		//
+		// THE RESULTING FAN, on the 38400 x 9600 field: X = +/-18314, Y = 0 / +/-1440 / +/-2880, in a
+		// pocket that runs from the goal line at 16800 to the end wall at 19200. Re-checked against
+		// everything that stands back there: the back ramp's foot is at 17841, so the nearest pad is
+		// 473 uu clear of the slope; the corner pylons sit at (18000, +/-4080) with a 300 uu side, so
+		// the outermost pad row is 1050 uu clear of them in Y and could sit on top of them in X
+		// without touching; the hoop is 1514 uu away in X and 264 uu up. Nothing else is built there.
+		// ATraceGameMode's deeper respawn pads come out of the same band at alpha 0.85 (X = 18892).
+		const float LineX = GetSpawnLineX(Sign, TraceArenaConstants::StartPocketAlpha);
 		const float FacingYaw = (Sign < 0.f) ? 0.f : 180.f;
 
 		for (int32 Index = 0; Index < PerTeam; ++Index)
@@ -3931,7 +4003,16 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 		}
 	}
 
-	UE_LOG(LogTraceGame, Verbose, TEXT("Arena spawned %d player starts per team."), PerTeam);
+	// SAID OUT LOUD, AT Log, AND WITH THE GOAL PLANE NEXT TO IT. "Are the spawns actually behind the
+	// goals?" is spec v28 §8's headline question and it is not answerable from a count - the old line
+	// printed the count alone and would have read exactly the same with the pads still in front of the
+	// hoop. Both X values on one line is the whole check: |pad| > |goal plane| means behind it.
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Arena spawned %d player starts per team at |X| %.0f, which is %.0f uu BEHIND the goal ")
+		TEXT("plane at |X| %.0f, in a %.0f uu pocket that ends at the wall at |X| %.0f. Lateral fan +/-%.0f."),
+		PerTeam, FMath::Abs(GetSpawnLineX(1.f, TraceArenaConstants::StartPocketAlpha)),
+		FMath::Abs(GetSpawnLineX(1.f, TraceArenaConstants::StartPocketAlpha)) - GoalLineX(),
+		GoalLineX(), ClampedEndzoneDepth(), HalfLength(), Spread);
 }
 
 void ATraceArenaBuilder::BuildLighting()
@@ -7757,5 +7838,692 @@ namespace
 			{
 				UE_LOG(LogTraceGame, Warning, TEXT("[QUALITY] no ATraceArenaBuilder in this world."));
 			}
+		}));
+
+	// =============================================================================================
+	// SPEC v28 §8 — "ALLOW GOALS TO BE SCORED THROUGH EITHER SIDE OF THE GOAL", MEASURED.
+	//
+	// Trace.Arena.GoalSides drives the REAL scoring path four times per end and reads the SCOREBOARD:
+	//
+	//   FRONT   a carrier standing in the mouth from the pitch side          -> must score
+	//   BACK    a carrier standing in the mouth from the POCKET side         -> must score
+	//   WIDE    a carrier the same distance off the plane but 0.75 radii out -> must NOT score
+	//
+	// THE WIDE ARM IS THE POINT OF THE HARNESS, not decoration. A test that only ever teleports a
+	// carrier next to a goal and watches the score go up cannot tell "the goal scores from either
+	// side" apart from "anything near the goal scores", and this project has shipped a green harness
+	// that measured nothing at least twice.
+	//
+	// 0.90 radii is chosen to be the DISCRIMINATING case rather than merely a distant one. A carrier
+	// standing on a ramp is 952 uu below the mouth centre, so at 900 uu out laterally they are 1310
+	// uu from it - outside the 1000 uu disc - while still inside the slab's bounding BOX, which is
+	// only +/-1000 in Y. It therefore fails on the ring test specifically. Put it at 1.4 radii and it
+	// would fail the box test first and prove nothing about the circle.
+	//
+	// IT WAS 0.75, AND THAT MEASURED THE ENGINE RATHER THAN THE RULE. At 750 uu out the pawn's origin
+	// is 1211 uu from the mouth centre - 7 uu OUTSIDE the ring band's outer radius of 1204, i.e. with
+	// its 34 uu capsule buried in the hoop. Teleporting into solid geometry hands the answer to
+	// depenetration, which pushed it radially INWARD through the mouth: the arm scored, and reported a
+	// failure of a rule that was working. 0.90 clears the band by 106 uu, more than a capsule radius,
+	// so the pawn stands in free air on the ramp and the only thing deciding the arm is the disc test.
+	//
+	// It grants the Core, FREEZES the pawn where it puts it (see SetGoalSideRunnerFrozen - a bot
+	// holding the Core steers at the goal, and it will happily walk the red arm into the hoop) and
+	// teleports it; everything after that is untouched production code -
+	// ATraceCore's swept carry test, ATraceEndzone's 10 Hz poll and its overlap, ATraceGameMode's
+	// possession-change test, NotifyScored's debounce. The measurement is the scoreboard delta across
+	// the arm, so an arm only passes if a point was actually AWARDED.
+	//
+	// The pawn is staged on the SAME SIDE of the ring plane it will score from, and given the Core
+	// only once it is there, so no arm can be scored by the teleport itself sweeping through the
+	// hoop. That is not paranoia: the carry test is a swept segment test, and it would have counted
+	// the trip from midfield to the pocket as a goal through the front of the ring.
+	// =============================================================================================
+
+	struct FTraceGoalSideArm
+	{
+		float EndSign = 1.f;        // which end's goal
+		float FaceSign = 1.f;       // which side of the ring plane the carrier stands on, in world X
+		float LateralRadii = 0.f;   // Y offset from the mouth centre, in mouth radii
+		bool bExpectScore = true;
+		const TCHAR* Label = TEXT("");
+	};
+
+	struct FTraceGoalSideState
+	{
+		TArray<FTraceGoalSideArm> Arms;
+		int32 ArmIndex = 0;
+		int32 Phase = 0;
+		double PhaseSeconds = 0.0;
+		double WaitSeconds = 0.0;
+
+		ETraceTeam Attacker = ETraceTeam::None;
+		int32 ScoreBefore = 0;
+		TWeakObjectPtr<ATraceCharacter> Runner;
+
+		int32 Passed = 0;
+		int32 Failed = 0;
+		int32 Skipped = 0;
+
+		/**
+		 * How many times this arm has re-granted the Core after the field reset took it back.
+		 *
+		 * MEASURED: the arm before this one scores, and a score is a whole field reset - kickoff delay,
+		 * ten pawns teleported, the Core released and re-granted to the receiving team. The settle
+		 * below is generous but the kickoff can still land between this arm's grant and its check, and
+		 * the first run of this harness reported "the runner is not the carrier ... SKIPPED" for
+		 * exactly that. Re-granting is correct rather than a workaround: what the arm is measuring
+		 * starts when the carrier is placed, not when the Core changes hands.
+		 */
+		int32 Regrants = 0;
+	};
+
+	/** How many times an arm may re-take the Core from a post-goal kickoff before giving up. */
+	constexpr int32 GoalSideMaxRegrants = 8;
+
+	/** A live pawn on @p Team, preferring one that is not already carrying, or null. */
+	ATraceCharacter* FindGoalSideRunner(UWorld* World, ETraceTeam Team)
+	{
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Character = *It;
+			if (IsValid(Character) && Character->IsAlive() && Character->GetTeam() == Team)
+			{
+				return Character;
+			}
+		}
+		return nullptr;
+	}
+
+	/** World-space point for one arm: on the ring plane's @p FaceSign side, at standing height. */
+	FVector GoalSidePoint(const ATraceArenaBuilder& Arena, const FTraceGoalSideArm& Arm, float AxisDistance)
+	{
+		const FTransform& Frame = Arena.GetActorTransform();
+		const FVector Axis = Frame.GetUnitAxis(EAxis::X);
+		const FVector Side = Frame.GetUnitAxis(EAxis::Y);
+		const FVector Up = Frame.GetUnitAxis(EAxis::Z);
+
+		// The mouth centre, then back along the field axis to the requested distance, then out
+		// laterally, then DOWN to where a pawn's origin actually is at the top of the ramp: the ramp
+		// top plus a capsule half height. That is the geometry the shipped carry-in relies on (952 uu
+		// below the mouth centre, inside a 1000 uu mouth), so the arm measures the real case and not
+		// a pawn floating in the middle of the hoop.
+		const FVector Centre = Arena.GetGoalRingCentre(Arm.EndSign);
+		const float StandingZ = Arena.GoalRampTopZ() + Arena.PlayerHeightUU() * 0.5f;
+		const float DropToStanding = Arena.GoalRingCentreZ() - StandingZ;
+
+		return Centre
+			+ Axis * (Arm.FaceSign * AxisDistance)
+			+ Side * (Arm.LateralRadii * Arena.GoalRingRadius())
+			- Up * DropToStanding;
+	}
+
+	/**
+	 * Freezes (or releases) the arm's runner where it stands.
+	 *
+	 * WHY AN ARM HAS TO DO THIS, and it is the second thing this harness measured about itself rather
+	 * than about the goal. The runner is usually a BOT, and a bot holding the Core steers at the goal
+	 * it is attacking - which is the goal the arm has just parked it 146 uu from. The WIDE arm, whose
+	 * whole job is to stand somewhere that must NOT score, was therefore being walked into the hoop by
+	 * its own AI inside the measurement window and reported a FAIL against a rule that was working.
+	 *
+	 * MOVE_None holds the pawn exactly where it was put - no falling, no steering, no sliding on the
+	 * ramp - so what the arm measures is the geometry at a known point. Released again at the end of
+	 * the arm so the bot goes back to playing.
+	 */
+	void SetGoalSideRunnerFrozen(ATraceCharacter* Runner, bool bFrozen)
+	{
+		if (!IsValid(Runner))
+		{
+			return;
+		}
+
+		if (UCharacterMovementComponent* Movement = Runner->GetCharacterMovement())
+		{
+			Movement->StopMovementImmediately();
+			Movement->SetMovementMode(bFrozen ? MOVE_None : MOVE_Falling);
+		}
+
+		if (AController* Controller = Runner->GetController())
+		{
+			Controller->StopMovement();
+		}
+	}
+
+	void TickGoalSideTest(const TSharedRef<FTraceGoalSideState>& State, float DeltaTime);
+
+	void StartGoalSideTest(const TSharedRef<FTraceGoalSideState>& State)
+	{
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State](float DeltaTime) -> bool
+			{
+				TickGoalSideTest(State, DeltaTime);
+				return State->ArmIndex < State->Arms.Num();
+			}), 0.f);
+	}
+
+	void TickGoalSideTest(const TSharedRef<FTraceGoalSideState>& State, float DeltaTime)
+	{
+		State->PhaseSeconds += DeltaTime;
+		if (State->PhaseSeconds < State->WaitSeconds)
+		{
+			return;
+		}
+
+		UWorld* World = FindArenaPerfWorld();
+		ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
+		ATraceCore* Core = ATraceCore::Get(World);
+		ATraceGameState* GameState = (World != nullptr) ? World->GetGameState<ATraceGameState>() : nullptr;
+
+		if (World == nullptr || Arena == nullptr || Core == nullptr || GameState == nullptr
+			|| World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[GOALSIDES] no arena / Core / game state in this world, or this is a client. ")
+				TEXT("Scoring is a server decision; nothing was measured."));
+			State->ArmIndex = State->Arms.Num();
+			return;
+		}
+
+		if (!State->Arms.IsValidIndex(State->ArmIndex))
+		{
+			return;
+		}
+
+		const FTraceGoalSideArm& Arm = State->Arms[State->ArmIndex];
+
+		auto NextArm = [&State](double Settle)
+		{
+			++State->ArmIndex;
+			State->Phase = 0;
+			State->PhaseSeconds = 0.0;
+			State->WaitSeconds = Settle;
+			State->Runner = nullptr;
+
+			if (State->ArmIndex >= State->Arms.Num())
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[GOALSIDES] DONE: %d passed, %d FAILED, %d skipped. A pass means the SCOREBOARD ")
+					TEXT("moved (or, on the WIDE arm, did not)."),
+					State->Passed, State->Failed, State->Skipped);
+			}
+		};
+
+		switch (State->Phase)
+		{
+		case 0:
+		{
+			// The scoring rule is only armed in a match that is actually running - warm-up and the
+			// half-time interval reset the field without counting (ATraceGameMode::NotifyScored). A
+			// harness that ran anyway would report every arm as a failure and the failure would be
+			// about the clock, not about the geometry. Wait for it, then say what we are measuring.
+			if (GameState->TraceMatchState != ETraceMatchState::InProgress || GameState->IsHalfTimeBreak())
+			{
+				State->PhaseSeconds = 0.0;
+				State->WaitSeconds = 1.0;
+				UE_LOG(LogTraceGame, Verbose, TEXT("[GOALSIDES] waiting for the match to be in progress."));
+				return;
+			}
+
+			// The team that ATTACKS this end is the opponent of the team defending it.
+			const ETraceTeam Defender = GameState->GetTeamDefendingEnd(Arm.EndSign);
+			State->Attacker = TraceOpposingTeam(Defender);
+
+			ATraceCharacter* Runner = FindGoalSideRunner(World, State->Attacker);
+			if (Runner == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[GOALSIDES] %s: no live %s pawn to carry it. SKIPPED."),
+					Arm.Label, *TraceTeamName(State->Attacker).ToString());
+				++State->Skipped;
+				NextArm(0.5);
+				return;
+			}
+
+			// STAGED ON THE SAME SIDE it will score from, and 1200 uu clear of the plane so the
+			// staging move itself cannot cross the mouth. See the block comment.
+			State->Runner = Runner;
+			State->Regrants = 0;
+			Runner->SetActorLocation(GoalSidePoint(*Arena, Arm, 1200.f), /*bSweep=*/false,
+				nullptr, ETeleportType::TeleportPhysics);
+			SetGoalSideRunnerFrozen(Runner, /*bFrozen=*/true);
+
+			State->Phase = 1;
+			State->PhaseSeconds = 0.0;
+			State->WaitSeconds = 0.35;
+			return;
+		}
+
+		case 1:
+		{
+			ATraceCharacter* Runner = State->Runner.Get();
+			if (!IsValid(Runner) || !Runner->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[GOALSIDES] %s: the runner died while staging. SKIPPED."), Arm.Label);
+				++State->Skipped;
+				NextArm(0.5);
+				return;
+			}
+
+			// The Core is granted HERE, with the pawn already parked on its own side of the plane, so
+			// the carry test's first sample is taken from a legal place.
+			Core->GrantTo(Runner, ETraceCoreGrantReason::Debug);
+			State->ScoreBefore = GameState->GetScore(State->Attacker);
+
+			State->Phase = 2;
+			State->PhaseSeconds = 0.0;
+			State->WaitSeconds = 0.35;
+			return;
+		}
+
+		case 2:
+		{
+			ATraceCharacter* Runner = State->Runner.Get();
+			if (!IsValid(Runner) || !Runner->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[GOALSIDES] %s: the runner is gone. SKIPPED."), Arm.Label);
+				++State->Skipped;
+				NextArm(0.5);
+				return;
+			}
+
+			// The previous arm's goal reset the field and the kickoff may have taken the Core back
+			// between the grant and here. Take it again and re-stage rather than skipping - see
+			// FTraceGoalSideState::Regrants.
+			if (Core->GetCarrier() != Runner)
+			{
+				if (State->Regrants >= GoalSideMaxRegrants)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[GOALSIDES] %s: could not keep the Core after %d attempts. SKIPPED."),
+						Arm.Label, State->Regrants);
+					++State->Skipped;
+					NextArm(0.5);
+					return;
+				}
+
+				++State->Regrants;
+				Runner->SetActorLocation(GoalSidePoint(*Arena, Arm, 1200.f), /*bSweep=*/false,
+					nullptr, ETeleportType::TeleportPhysics);
+				SetGoalSideRunnerFrozen(Runner, /*bFrozen=*/true);
+				Core->GrantTo(Runner, ETraceCoreGrantReason::Debug);
+				State->ScoreBefore = GameState->GetScore(State->Attacker);
+				State->PhaseSeconds = 0.0;
+				State->WaitSeconds = 0.6;
+				return;
+			}
+
+			// Into the mouth (or, on the WIDE arm, alongside it). The distance off the plane is what a
+			// carrier at the top of a ramp actually gets to: the hoop's own half thickness plus a
+			// capsule radius plus a little.
+			const float StandOff = Arena->GoalRingHalfThickness() + TraceArenaConstants::PawnCapsuleRadius + 12.f;
+			const FVector Target = GoalSidePoint(*Arena, Arm, StandOff);
+			Runner->SetActorLocation(Target, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+			SetGoalSideRunnerFrozen(Runner, /*bFrozen=*/true);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GOALSIDES] %s: %s carrying, placed at %s (%.0f uu off the ring plane on the %s side, ")
+				TEXT("%.2f radii out). Score before: %d."),
+				Arm.Label, *TraceTeamName(State->Attacker).ToString(), *Target.ToCompactString(),
+				StandOff, (Arm.FaceSign * Arm.EndSign > 0.f) ? TEXT("POCKET") : TEXT("PITCH"),
+				Arm.LateralRadii, State->ScoreBefore);
+
+			State->Phase = 3;
+			State->PhaseSeconds = 0.0;
+			State->WaitSeconds = 0.9;
+			return;
+		}
+
+		default:
+		{
+			SetGoalSideRunnerFrozen(State->Runner.Get(), /*bFrozen=*/false);
+
+			const int32 ScoreNow = GameState->GetScore(State->Attacker);
+			const bool bScored = (ScoreNow > State->ScoreBefore);
+			const bool bPass = (bScored == Arm.bExpectScore);
+
+			if (bPass)
+			{
+				++State->Passed;
+			}
+			else
+			{
+				++State->Failed;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GOALSIDES] %s: %s. Expected a goal: %s. Got one: %s. %s %d -> %d. (Blue %d - Orange %d)"),
+				Arm.Label, bPass ? TEXT("PASS") : TEXT("*** FAIL ***"),
+				Arm.bExpectScore ? TEXT("yes") : TEXT("no"),
+				bScored ? TEXT("yes") : TEXT("no"),
+				*TraceTeamName(State->Attacker).ToString(), State->ScoreBefore, ScoreNow,
+				GameState->BlueScore, GameState->OrangeScore);
+
+			// Long enough for NotifyScored's whole reset - kickoff delay included - to finish before
+			// the next arm stages a pawn, or the next arm would be teleporting a pawn the reset is
+			// still moving.
+			NextArm(bScored ? 6.0 : 1.0);
+			return;
+		}
+		}
+	}
+
+	FAutoConsoleCommand CmdArenaGoalSides(
+		TEXT("Trace.Arena.GoalSides"),
+		TEXT("Trace (spec v28 section 8): carry the Core into each goal from the PITCH side and from the "
+		     "POCKET side behind it, plus a deliberately off-target arm that must NOT score, and report "
+		     "the scoreboard delta for each. Server, mode B, match in progress."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			TSharedRef<FTraceGoalSideState> State = MakeShared<FTraceGoalSideState>();
+
+			// Both ends, both faces, and one off-target arm per end. The face sign is expressed
+			// against the END so that "pocket" and "pitch" mean the same thing at either end: the
+			// pocket is always further from the centre line.
+			for (const float EndSign : { -1.f, 1.f })
+			{
+				const TCHAR* EndName = (EndSign < 0.f) ? TEXT("-X end") : TEXT("+X end");
+
+				State->Arms.Add({ EndSign, -EndSign, 0.f, true,
+					(EndSign < 0.f) ? TEXT("-X goal, from the PITCH") : TEXT("+X goal, from the PITCH") });
+				State->Arms.Add({ EndSign, EndSign, 0.f, true,
+					(EndSign < 0.f) ? TEXT("-X goal, from BEHIND (the pocket)") : TEXT("+X goal, from BEHIND (the pocket)") });
+				State->Arms.Add({ EndSign, EndSign, 0.90f, false,
+					(EndSign < 0.f) ? TEXT("-X goal, from BEHIND but WIDE (red arm)") : TEXT("+X goal, from BEHIND but WIDE (red arm)") });
+
+				UE_LOG(LogTraceGame, Verbose, TEXT("[GOALSIDES] queued three arms at the %s."), EndName);
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GOALSIDES] starting: %d arms. Each one grants the Core to a live attacker, parks it "
+				     "on one side of the hoop and reads the scoreboard."), State->Arms.Num());
+
+			StartGoalSideTest(State);
+		}));
+
+}
+
+// =================================================================================================
+// SPEC v28 INTEGRATION — THE GUN'S REACH IS DERIVED FROM THE ARENA'S SIZE, AND NOTHING CHECKED IT.
+//
+// UTraceSettings::HitscanRange is not an independent knob. It has to span the arena's diagonal or a
+// shot down the long axis expires in mid-air short of a target the player can plainly see. It has
+// been left behind TWICE now:
+//
+//   spec v4 §3   lengthened the field 24000 -> 33600 and left the range at 28000 (6944 uu short);
+//   spec v28 §8  lengthened it 33600 -> 38400 for the hockey pockets and left it at 36000
+//                (3581 uu short). The §8 owner found this and could not fix it - TraceSettings.h is
+//                not their file - and said so in their hand-off. This pass raised it to 39600.
+//
+// A NUMBER THAT MUST TRACK ANOTHER NUMBER NEEDS A HARNESS, NOT A COMMENT. Both comments were there
+// and both were missed, which is the whole argument for this command existing.
+//
+// It measures two different things and reports both:
+//
+//   THE ARITHMETIC  sqrt(FieldLength^2 + FieldWidth^2) read off the LIVE ATraceArenaBuilder in the
+//                   world, against the LIVE UTraceSettings::HitscanRange (which is the .ini's value,
+//                   not the header's - the ini wins and that is the layer that has been wrong).
+//
+//   THE REAL TRACE  a genuine world line trace from just inside one back pocket at the far diagonal
+//                   corner, run at exactly HitscanRange. A pass means it reached blocking geometry;
+//                   a fail means it died in the air. This is what the PLAYER experiences, and it is
+//                   the half that cannot be fooled by getting the arithmetic right against a field
+//                   size the builder does not actually use.
+//
+// RED ARM: Trace.Arena.HitscanReachArm <uu> runs the whole thing again at a forced range, so
+// `Trace.Arena.HitscanReachArm 36000` reproduces the shipped-before-this-pass defect in this same
+// binary and must FAIL. Set it to 0 to go back to the real setting.
+// =================================================================================================
+namespace
+{
+	float GTraceHitscanReachArmUU = 0.f;
+
+	FAutoConsoleVariableRef CVarTraceHitscanReachArm(
+		TEXT("Trace.Arena.HitscanReachArm"),
+		GTraceHitscanReachArmUU,
+		TEXT("Trace: force Trace.Arena.VerifyHitscanReach to measure a given range in uu instead of the "
+		     "shipped UTraceSettings::HitscanRange. 36000 reproduces the pre-v28-integration defect. 0 = off."),
+		ECVF_Default);
+
+	ATraceArenaBuilder* FindHitscanReachArena(UWorld*& OutWorld)
+	{
+		OutWorld = nullptr;
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Context.World();
+			if (World == nullptr || (Context.WorldType != EWorldType::Game && Context.WorldType != EWorldType::PIE))
+			{
+				continue;
+			}
+
+			for (TActorIterator<ATraceArenaBuilder> It(World); It; ++It)
+			{
+				if (IsValid(*It))
+				{
+					OutWorld = World;
+					return *It;
+				}
+			}
+		}
+
+		return nullptr;
+	}
+
+	FAutoConsoleCommand CmdTraceVerifyHitscanReach(
+		TEXT("Trace.Arena.VerifyHitscanReach"),
+		TEXT("Trace: assert UTraceSettings::HitscanRange spans the LIVE arena's diagonal, and fire a real "
+		     "world trace down that diagonal to prove it reaches. Red arm: Trace.Arena.HitscanReachArm 36000."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			UWorld* World = nullptr;
+			ATraceArenaBuilder* Arena = FindHitscanReachArena(World);
+
+			if (Arena == nullptr || World == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[HITSCANREACH] no ATraceArenaBuilder in any game world - nothing to measure. Run this "
+					     "on a loaded arena map (/Game/Maps/Arena_Baked or the procedural one)."));
+				return;
+			}
+
+			const float ArmUU     = GTraceHitscanReachArmUU;
+			const bool  bArmed    = (ArmUU > 0.f);
+			const float ShippedUU = FMath::Max(1.f, UTraceSettings::Get().HitscanRange);
+			const float RangeUU   = bArmed ? ArmUU : ShippedUU;
+
+			// The requirement is the WALL-TO-WALL diagonal, not the goal-to-goal one. A player standing
+			// in one back pocket can see - and must be able to shoot - a player in the far one.
+			const float LengthUU   = Arena->FieldLength;
+			const float WidthUU    = Arena->FieldWidth;
+			const float DiagonalUU = FMath::Sqrt(LengthUU * LengthUU + WidthUU * WidthUU);
+
+			int32 Failures = 0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("================================================================================"));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HITSCANREACH] the gun's reach against the arena it has to cross.%s"),
+				bArmed ? TEXT("  *** RED ARM: Trace.Arena.HitscanReachArm is ON ***") : TEXT(""));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HITSCANREACH] arena %.0f x %.0f uu (read off the live builder) -> diagonal %.0f uu."),
+				LengthUU, WidthUU, DiagonalUU);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HITSCANREACH] HitscanRange in force %.0f uu%s."),
+				RangeUU,
+				bArmed ? *FString::Printf(TEXT(" (FORCED by the red arm; the shipped setting is %.0f)"), ShippedUU)
+				       : TEXT(" (UTraceSettings, i.e. Config/DefaultGame.ini layered over the header)"));
+
+			// ---- 1. the arithmetic ----------------------------------------------------------------
+			const bool bSpansDiagonal = (RangeUU >= DiagonalUU);
+			Failures += bSpansDiagonal ? 0 : 1;
+
+			if (bSpansDiagonal)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[HITSCANREACH] OK    the range SPANS the diagonal with %.0f uu of margin."),
+					RangeUU - DiagonalUU);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[HITSCANREACH] FAIL  the range is %.0f uu SHORT of the diagonal. A shot down the long "
+					     "axis expires in mid-air short of a target on screen. Raise HitscanRange in BOTH "
+					     "Source/Trace/TraceSettings.h AND Config/DefaultGame.ini (the ini wins) to at least %.0f."),
+					DiagonalUU - RangeUU, FMath::CeilToFloat(DiagonalUU / 100.f) * 100.f);
+			}
+
+			// ---- 2. the real trace -----------------------------------------------------------------
+			// WHAT THIS ARM MEASURES, precisely, because two earlier versions of it did NOT measure what
+			// they printed and both are worth recording:
+			//
+			//   v1  LineTraceSingle down the diagonal. It stops at the FIRST blocker, which on a real
+			//       arena is a piece of cover ~7000 uu away, and the code then announced that the
+			//       39098 uu sight line was shootable. That does not follow at all.
+			//   v2  LineTraceMULTI, taking the furthest hit. Same number. A multi trace collects TOUCH
+			//       hits along the way and then STOPS at the first BLOCKING hit - it does not continue
+			//       past solid geometry - so "the furthest hit" was still the first blocker.
+			//
+			// A harness that reports something it did not measure is worse than no harness, and this
+			// project has shipped one before, so the fix is a real walk down the ray: trace, ignore the
+			// actor that stopped it, trace again from the SAME origin along the SAME direction. Each
+			// pass reveals the next piece of geometry further out; the LAST one found is the far end
+			// wall, because there is nothing behind it. That distance is the true length of the sight
+			// line from one back pocket to the opposite one, measured on the baked collision rather
+			// than computed from two numbers in a header.
+			//
+			// The probe is deliberately run LONGER than the range under test, so that the measurement
+			// of the ARENA does not depend on the SETTING being measured; the assertion is then made
+			// against the range.
+			const float InsetUU  = 200.f;
+			const float EyeZUU   = 160.f;
+			const float HalfLen  = LengthUU * 0.5f - InsetUU;
+			const float HalfWide = WidthUU  * 0.5f - InsetUU;
+
+			const FVector ArenaOrigin = Arena->GetActorLocation();
+			const FVector Start = ArenaOrigin + FVector(-HalfLen, -HalfWide, EyeZUU);
+			const FVector Far   = ArenaOrigin + FVector(+HalfLen, +HalfWide, EyeZUU);
+			const FVector Dir   = (Far - Start).GetSafeNormal();
+			const float   ProbeUU = static_cast<float>(FVector::Dist(Start, Far)) + 4000.f;
+
+			FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceHitscanReach), /*bTraceComplex=*/false);
+			Params.bReturnPhysicalMaterial = false;
+
+			// 256 is a ceiling, not an expectation: the arena is ~1295 instanced blocks in 64 pools and
+			// only the handful actually on this one ray can be hit. If the walk ever runs out of steps
+			// the result is reported as INCOMPLETE rather than as a measurement, below.
+			const int32 MaxSteps = 256;
+
+			float   SightLineUU  = 0.f;
+			FString FurthestName = TEXT("nothing");
+			int32   Blockers     = 0;
+			int32   Steps        = 0;
+
+			for (; Steps < MaxSteps; ++Steps)
+			{
+				FHitResult Hit;
+				if (!World->LineTraceSingleByChannel(Hit, Start, Start + Dir * ProbeUU, ECC_Visibility, Params))
+				{
+					break;   // nothing left along this ray - the previous hit was the far wall
+				}
+
+				++Blockers;
+				if (Hit.Distance > SightLineUU)
+				{
+					SightLineUU  = Hit.Distance;
+					FurthestName = GetNameSafe(Hit.GetActor());
+				}
+
+				AActor* Blocker = Hit.GetActor();
+				if (Blocker == nullptr)
+				{
+					break;   // a hit with no actor cannot be ignored, so the walk cannot continue
+				}
+				Params.AddIgnoredActor(Blocker);
+			}
+
+			const bool bWalkComplete = (Steps < MaxSteps);
+
+			if (Blockers == 0)
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[HITSCANREACH] FAIL  a %.0f uu probe down the corner-to-corner line hit NOTHING AT ALL, not "
+					     "even the far wall. That is not a range problem - the arena's collision is missing, or this "
+					     "is not an arena map - and nothing below can be trusted."),
+					ProbeUU);
+			}
+			else if (!bWalkComplete)
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[HITSCANREACH] FAIL  the ray walk ran out of steps after %d blockers without reaching open "
+					     "space, so %.0f uu is a LOWER BOUND on the sight line and not a measurement. Raise MaxSteps."),
+					Blockers, SightLineUU);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[HITSCANREACH] walked the ray in %d step(s): %d blocker(s) between the two back pockets, and "
+					     "the FURTHEST - the far end wall, with nothing behind it - is %s at %.0f uu. That distance IS "
+					     "the corner-to-corner sight line, measured on the baked collision."),
+					Steps + 1, Blockers, *FurthestName, SightLineUU);
+
+				const bool bReaches = (RangeUU >= SightLineUU);
+				Failures += bReaches ? 0 : 1;
+
+				if (bReaches)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[HITSCANREACH] OK    a %.0f uu shot COVERS that %.0f uu sight line with %.0f uu to spare. "
+						     "A player standing in one back pocket can shoot one standing in the other."),
+						RangeUU, SightLineUU, RangeUU - SightLineUU);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[HITSCANREACH] FAIL  a %.0f uu shot dies %.0f uu SHORT of that %.0f uu sight line. This is "
+						     "what the player sees: a target on screen that cannot be hit, with nothing saying why."),
+						RangeUU, SightLineUU - RangeUU, SightLineUU);
+				}
+			}
+
+			// The 3D box diagonal is REPORTED and deliberately NOT asserted. sqrt(L^2 + W^2 + H^2)
+			// includes the roof, and it is not a distance two PLAYERS can be apart: they stand on the
+			// floor and on 352 uu banks, so the elevation difference between a shooter and a target is
+			// a few hundred uu, not the wall's full height. Asserting it would demand ~39670 uu of
+			// reach to cover a shot from a corner of the floor to the opposite corner of the CEILING,
+			// which nothing in this game can take.
+			const float BoxDiagonalUU = FMath::Sqrt(LengthUU * LengthUU + WidthUU * WidthUU
+				+ Arena->WallHeight * Arena->WallHeight);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[HITSCANREACH] for reference, the full 3D box diagonal (floor corner to opposite ROOF corner) "
+				     "is %.0f uu. Not asserted: two players cannot be that far apart - the roof is %.0f uu up and "
+				     "they are on the floor and on %.0f uu banks."),
+				BoxDiagonalUU, Arena->WallHeight, 352.f);
+
+			// ---- verdict ----------------------------------------------------------------------------
+			if (Failures == 0)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[HITSCANREACH] VERDICT: PASS - 2 checks, 0 failed. The gun reaches across the whole arena.%s"),
+					bArmed ? TEXT("  (RED ARM PASSED - the forced range is long enough, so this arm proves nothing.)")
+					       : TEXT(""));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[HITSCANREACH] VERDICT: FAIL - %d of 2 checks failed.%s"),
+					Failures,
+					bArmed ? TEXT("  This is the RED ARM and a failure here is the point: it is the defect reproduced.")
+					       : TEXT(""));
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("================================================================================"));
 		}));
 }

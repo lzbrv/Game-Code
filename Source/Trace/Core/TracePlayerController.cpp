@@ -507,6 +507,10 @@ bool ATracePlayerController::TryAdoptInputAssets()
 		// every other incomplete set is: TryAdoptInputAssets rejects the whole set and the C++
 		// fallback runs, so the game plays identically until the assets are regenerated.
 		{ &IA_PullCore,         TEXT("IA_PullCore"),         EInputActionValueType::Boolean, Highest },
+		// SPEC v28 §10 — the melee bind. Same story as IA_PullCore above: a checkout whose
+		// /Game/Trace/Input predates v28 is MISSING it, TryAdoptInputAssets rejects the whole set, and
+		// the C++ fallback below builds an identical action, so the game plays the same either way.
+		{ &IA_Melee,            TEXT("IA_Melee"),            EInputActionValueType::Boolean, Highest },
 	};
 
 	// Resolve everything into a scratch list FIRST. Nothing is written to a member until the whole
@@ -639,6 +643,8 @@ void ATracePlayerController::ConstructInputDataInCode()
 		// SPEC v26 §1 — the Core pull, now its own bind. Boolean like every other button here, and a
 		// SEPARATE action from IA_Parry on purpose: two actions is what produces two rebindable rows.
 		IA_PullCore         = MakeAction(TEXT("IA_PullCore"),         EInputActionValueType::Boolean);
+		// SPEC v28 §10 — the melee bind (right mouse by default). Boolean like every other button.
+		IA_Melee            = MakeAction(TEXT("IA_Melee"),            EInputActionValueType::Boolean);
 
 		// Cumulative accumulation is REQUIRED for opposing keys to cancel. UInputAction defaults to
 		// TakeHighestAbsoluteValue, and UEnhancedPlayerInput::ProcessActionMappingEvent merges with
@@ -652,7 +658,7 @@ void ATracePlayerController::ConstructInputDataInCode()
 	bUsingInputAssets = false;
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[%s] Enhanced Input CONSTRUCTED IN C++ (15 actions + IMC_Trace). This is the fallback ")
+		TEXT("[%s] Enhanced Input CONSTRUCTED IN C++ (16 actions + IMC_Trace). This is the fallback ")
 		TEXT("path and it is fully supported — behaviour is identical to the asset path."),
 		*GetName());
 }
@@ -674,15 +680,33 @@ void ATracePlayerController::ApplyControlSettings()
 	// nothing to rebuild and the result cannot be half-applied.
 	InputMapping->UnmapAll();
 
-	auto KeyFor = [&UserSettings](ETraceInputAction Action) { return UserSettings.GetKey(Action); };
-
-	/** Maps @p Key to @p Action, skipping the mapping entirely when the player has unbound it. */
-	auto MapButton = [this](UInputAction* Action, const FKey& Key)
+	/**
+	 * Maps EVERY key the player has on @p Bind to @p Action, skipping slots they have left empty.
+	 *
+	 * *** SPEC v28 §3c — THIS IS WHERE THE SECOND BIND BECOMES REAL. *** A slot the settings page can
+	 * edit but the mapping context never sees is a bind that draws and does nothing, so this loop is
+	 * the whole of the runtime half.
+	 *
+	 * TWO MAPPINGS ON ONE BOOLEAN ACTION IS A SUPPORTED SHAPE, not a trick. UEnhancedPlayerInput
+	 * merges an action's mappings with "take the highest absolute value", so the action is down when
+	 * EITHER key is down and comes up when the last of them is released — which is what a player who
+	 * has bound parry to Q and to mouse 4 means. Started still fires once, on the first key down,
+	 * because the trigger is evaluated on the merged value and not per mapping.
+	 *
+	 * No explicit triggers: an action with no trigger uses the implicit "down" trigger, which gives us
+	 * Started on press, Triggered while held and Completed on release. That is exactly the shape the
+	 * handlers below expect.
+	 */
+	auto MapButton = [this, &UserSettings](UInputAction* Action, ETraceInputAction Bind)
 	{
-		// No explicit triggers: an action with no trigger uses the implicit "down" trigger, which
-		// gives us Started on press, Triggered while held and Completed on release. That is exactly
-		// the shape the handlers below expect.
-		if (Action != nullptr && Key.IsValid())
+		if (Action == nullptr)
+		{
+			return;
+		}
+
+		TArray<FKey> Keys;
+		UserSettings.GetKeys(Bind, Keys);
+		for (const FKey& Key : Keys)
 		{
 			InputMapping->MapKey(Action, Key);
 		}
@@ -693,29 +717,44 @@ void ATracePlayerController::ApplyControlSettings()
 	// MapKey returns a reference *into* the context's mapping array, so it is invalidated by the
 	// next MapKey call. Each binding therefore gets its own scope and uses the reference
 	// immediately — never cache one.
-	if (const FKey Key = KeyFor(ETraceInputAction::MoveForward); Key.IsValid())
+	//
+	// SPEC v28 §3c: each direction walks ITS OWN SLOT LIST, so a player who puts strafe-left on both A
+	// and the left arrow gets two mappings with the same modifier stack — which is the same thing two
+	// keys on a Boolean action means one block down, expressed on an axis.
 	{
-		// Forward. 1D X -> Y.
-		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
-		Mapping.Modifiers.Add(MakeSwizzleXToY(InputMapping));
-	}
-	if (const FKey Key = KeyFor(ETraceInputAction::MoveBack); Key.IsValid())
-	{
-		// Backward. 1D X -> Y, then inverted.
-		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
-		Mapping.Modifiers.Add(MakeSwizzleXToY(InputMapping));
-		Mapping.Modifiers.Add(MakeNegate(InputMapping));
-	}
-	if (const FKey Key = KeyFor(ETraceInputAction::MoveLeft); Key.IsValid())
-	{
-		// Strafe left — X, inverted.
-		FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
-		Mapping.Modifiers.Add(MakeNegate(InputMapping));
-	}
-	if (const FKey Key = KeyFor(ETraceInputAction::MoveRight); Key.IsValid())
-	{
-		// Strafe right — raw X, no modifiers at all.
-		InputMapping->MapKey(IA_Move, Key);
+		TArray<FKey> Keys;
+
+		UserSettings.GetKeys(ETraceInputAction::MoveForward, Keys);
+		for (const FKey& Key : Keys)
+		{
+			// Forward. 1D X -> Y.
+			FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
+			Mapping.Modifiers.Add(MakeSwizzleXToY(InputMapping));
+		}
+
+		UserSettings.GetKeys(ETraceInputAction::MoveBack, Keys);
+		for (const FKey& Key : Keys)
+		{
+			// Backward. 1D X -> Y, then inverted.
+			FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
+			Mapping.Modifiers.Add(MakeSwizzleXToY(InputMapping));
+			Mapping.Modifiers.Add(MakeNegate(InputMapping));
+		}
+
+		UserSettings.GetKeys(ETraceInputAction::MoveLeft, Keys);
+		for (const FKey& Key : Keys)
+		{
+			// Strafe left — X, inverted.
+			FEnhancedActionKeyMapping& Mapping = InputMapping->MapKey(IA_Move, Key);
+			Mapping.Modifiers.Add(MakeNegate(InputMapping));
+		}
+
+		UserSettings.GetKeys(ETraceInputAction::MoveRight, Keys);
+		for (const FKey& Key : Keys)
+		{
+			// Strafe right — raw X, no modifiers at all.
+			InputMapping->MapKey(IA_Move, Key);
+		}
 	}
 
 	// --- Look: mouse -> (X = yaw delta, Y = pitch delta) ---------------------------------------
@@ -750,28 +789,28 @@ void ATracePlayerController::ApplyControlSettings()
 	}
 
 	// --- Buttons -------------------------------------------------------------------------------
-	MapButton(IA_Jump,       KeyFor(ETraceInputAction::Jump));
-	MapButton(IA_Crouch,     KeyFor(ETraceInputAction::Crouch));
-	MapButton(IA_Fire,       KeyFor(ETraceInputAction::Fire));
-	MapButton(IA_Pass,       KeyFor(ETraceInputAction::Pass));
-	MapButton(IA_Dash,       KeyFor(ETraceInputAction::Dash));
-	MapButton(IA_Parry,      KeyFor(ETraceInputAction::Parry));
-	MapButton(IA_Scoreboard, KeyFor(ETraceInputAction::Scoreboard));
+	MapButton(IA_Jump,       ETraceInputAction::Jump);
+	MapButton(IA_Crouch,     ETraceInputAction::Crouch);
+	MapButton(IA_Fire,       ETraceInputAction::Fire);
+	MapButton(IA_Pass,       ETraceInputAction::Pass);
+	MapButton(IA_Dash,       ETraceInputAction::Dash);
+	MapButton(IA_Parry,      ETraceInputAction::Parry);
+	MapButton(IA_Scoreboard, ETraceInputAction::Scoreboard);
 	// Spec v13 §2. Mapped through the same KeyFor/MapButton path as everything else, so the player's
 	// rebind of "1" is honoured on the next settings change without a restart — and so an action the
 	// player has deliberately UNBOUND gets no mapping at all rather than a dead one.
-	MapButton(IA_EquipKnife, KeyFor(ETraceInputAction::EquipKnife));
-	MapButton(IA_EquipGun,   KeyFor(ETraceInputAction::EquipGun));
+	MapButton(IA_EquipKnife, ETraceInputAction::EquipKnife);
+	MapButton(IA_EquipGun,   ETraceInputAction::EquipGun);
 	// SPEC v14 §5. Through the same KeyFor/MapButton path as everything else, so a player who
 	// rebinds E in the options screen is rebinding the ability and not just the label — and so
 	// UTraceAbilityInputRelay's ConfigId lookup and this mapping can never disagree about the key.
-	MapButton(IA_Ability,          KeyFor(ETraceInputAction::Ability));
-	MapButton(IA_AbilitySecondary, KeyFor(ETraceInputAction::AbilitySecondary));
+	MapButton(IA_Ability,          ETraceInputAction::Ability);
+	MapButton(IA_AbilitySecondary, ETraceInputAction::AbilitySecondary);
 	// SPEC v16 §1. Through the same KeyFor/MapButton path as everything else, so a player who rebinds
 	// R in the options screen is rebinding the reload and not just its label — and so an action they
 	// deliberately UNBOUND gets no mapping at all rather than a dead one. The clip still reloads
 	// itself when it empties; unbinding R costs the manual reload only.
-	MapButton(IA_Reload,           KeyFor(ETraceInputAction::Reload));
+	MapButton(IA_Reload,           ETraceInputAction::Reload);
 	// SPEC v26 §1 — "Make parry and pull core two separate binds in the settings menu." Its own row in
 	// the action table, its own key (default F), its own mapping. Two mappings on ONE action would
 	// have been the shortcut and it is not the item: the keybind page lists ACTIONS, so a second key
@@ -781,7 +820,21 @@ void ATracePlayerController::ApplyControlSettings()
 	// whoever else held it, so the options screen cannot produce that state — but a hand-edited
 	// TraceUserSettings.ini can, and this maps whatever the table says either way. The tiebreak for
 	// that case lives in OnParryStarted; see the note there.
-	MapButton(IA_PullCore,         KeyFor(ETraceInputAction::PullCore));
+	MapButton(IA_PullCore,         ETraceInputAction::PullCore);
+	// *** SPEC v28 §10 — "Melee should be bound to right click by default." ***
+	//
+	// Through the same KeyFor/MapButton path as every other button, which is the whole reason melee
+	// is a table row rather than a hardcoded EKeys::RightMouseButton somewhere in this file: it is
+	// on the settings page, it is rebindable, and an action the player deliberately UNBINDS gets no
+	// mapping at all rather than a dead one.
+	//
+	// THE THREE-WAY CONTENTION ON THIS BUTTON IS RESOLVED, AND NOT HERE. Melee, the Core pull and
+	// the parry all wanted right mouse across §3, §10 and v25 §7. The parry LEFT (v28 §3d: Q + the
+	// thumb mouse button, with the "ParryPull" -> "ParryKeys" migration that stops a returning
+	// player putting it back). The pull keeps its own bind (F) AND rides this one under §10's
+	// precedence rule, which is a state test inside TraceMelee::HandleMeleeInput, not a mapping.
+	// So exactly one action maps the button. Trace.Input.VerifyRightMouse asserts that.
+	MapButton(IA_Melee,            ETraceInputAction::Melee);
 
 	// The context is already registered by the time a settings change arrives, and Enhanced Input
 	// caches the resolved key->action table. Without this the new bindings sit in the context and
@@ -934,6 +987,14 @@ void ATracePlayerController::SetupInputComponent()
 	EIC->BindAction(IA_PullCore, ETriggerEvent::Started,   this, &ATracePlayerController::OnPullCoreStarted);
 	EIC->BindAction(IA_PullCore, ETriggerEvent::Completed, this, &ATracePlayerController::OnPullCoreCompleted);
 	EIC->BindAction(IA_PullCore, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnPullCoreCompleted);
+
+	// SPEC v28 §10 — the melee bind. Started AND Completed AND Canceled, and both edges are required:
+	// the press may have gone to the Core PULL, which is a HOLD, so a dropped release leaves a ring
+	// filling on the server. TraceMelee::HandleMeleeInput forwards every release to the Core whichever
+	// verb the press took, so there is no state to remember here.
+	EIC->BindAction(IA_Melee, ETriggerEvent::Started,   this, &ATracePlayerController::OnMeleeStarted);
+	EIC->BindAction(IA_Melee, ETriggerEvent::Completed, this, &ATracePlayerController::OnMeleeCompleted);
+	EIC->BindAction(IA_Melee, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnMeleeCompleted);
 
 	// Spec v13 §2, direct select — and, since spec v15 §5 deleted IA_SwapWeapon, the only weapon
 	// binds there are. PRESS EDGE ONLY. Every other button in this class binds Completed and
@@ -1276,10 +1337,23 @@ void ATracePlayerController::RedeliverHeldPressEdges()
 	// The key is asked of the SAME table ApplyControlSettings maps from, so a rebound key is honoured
 	// here without this function knowing anything about defaults. An unbound action has an invalid
 	// key, which IsInputKeyDown would answer nonsense for, hence the validity test.
+	//
+	// SPEC v28 §3c — ANY of the action's keys. A player holding parry on the thumb button while the
+	// pause menu is up would otherwise come back with the press swallowed, because the primary slot
+	// (Q) is not the key their finger is on. GetKeys returns only the VALID slots, so an unbound
+	// action asks IsInputKeyDown nothing at all.
 	auto IsHeld = [this, &UserSettings](ETraceInputAction Action)
 	{
-		const FKey Key = UserSettings.GetKey(Action);
-		return Key.IsValid() && IsInputKeyDown(Key);
+		TArray<FKey> Keys;
+		UserSettings.GetKeys(Action, Keys);
+		for (const FKey& Key : Keys)
+		{
+			if (IsInputKeyDown(Key))
+			{
+				return true;
+			}
+		}
+		return false;
 	};
 
 	int32 Redelivered = 0;
@@ -1298,6 +1372,12 @@ void ATracePlayerController::RedeliverHeldPressEdges()
 	// they let go. (Before v26 it rode the Parry row above; splitting the actions splits the
 	// re-delivery too, or the new bind would be the one control a menu could silently eat.)
 	if (IsHeld(ETraceInputAction::PullCore))        { OnPullCoreStarted();         ++Redelivered; }
+	// SPEC v28 §10. THE MELEE BIND IS HOLD-SHAPED FOR EXACTLY ONE REASON and it is the one that
+	// matters: its press may go to the Core PULL. A player holding right mouse over a turned-over
+	// Core, opening the pause menu and closing it again is the same failure the PullCore row above
+	// describes, reached through a different button. The swing half is press-edge only and simply
+	// re-swings if it is off cooldown, which is what a held melee button means anyway.
+	if (IsHeld(ETraceInputAction::Melee))           { OnMeleeStarted();            ++Redelivered; }
 	if (IsHeld(ETraceInputAction::AbilitySecondary)){ OnAbilitySecondaryStarted(); ++Redelivered; }
 	if (IsHeld(ETraceInputAction::Scoreboard))      { OnScoreboardStarted();       ++Redelivered; }
 
@@ -1725,12 +1805,26 @@ void ATracePlayerController::OnParryCompleted()
 bool ATracePlayerController::DoParryAndPullShareAKey() const
 {
 	const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
-	const FKey ParryKey = UserSettings.GetKey(ETraceInputAction::Parry);
-	const FKey PullKey  = UserSettings.GetKey(ETraceInputAction::PullCore);
 
-	// Both must be REAL keys. Two unbound actions are both FKey() and would compare equal, which
-	// would silently turn the parry handler into a pull dispatcher for a player who had unbound both.
-	return ParryKey.IsValid() && PullKey.IsValid() && ParryKey == PullKey;
+	// SPEC v28 §3b/§3c — ANY key of the parry against ANY key of the pull. With two slots each, "do
+	// they share a key" is an intersection and no longer a comparison, and it is now a state a player
+	// can reach from the options page rather than only by hand-editing the .ini: the two actions'
+	// exclusion groups are disjoint (Carrying vs NotCarrying), so UTraceUserSettings::SetKey lets
+	// them keep one key between them on purpose. That makes this tiebreak load-bearing again.
+	//
+	// ActionUsesKey ignores invalid keys, so two unbound actions cannot compare equal here — which
+	// they would under a plain FKey == FKey, silently turning the parry handler into a pull
+	// dispatcher for a player who had unbound both.
+	TArray<FKey> ParryKeys;
+	UserSettings.GetKeys(ETraceInputAction::Parry, ParryKeys);
+	for (const FKey& Key : ParryKeys)
+	{
+		if (UserSettings.ActionUsesKey(ETraceInputAction::PullCore, Key))
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 void ATracePlayerController::DispatchCorePull(bool bPressed)
@@ -1788,6 +1882,53 @@ void ATracePlayerController::OnPullCoreStarted()
 void ATracePlayerController::OnPullCoreCompleted()
 {
 	DispatchCorePull(/*bPressed=*/false);
+}
+
+// -------------------------------------------------------------------------------------------
+// SPEC v28 §10 — THE MELEE BIND (right mouse by default)
+//
+// The two handlers below are deliberately three lines each. Everything interesting is in
+// TraceMelee::HandleMeleeInput: the precedence against the Core pull, the pull dispatch (including
+// the client relay), the swing's refusals and the debug logging. Duplicating any of it here would
+// give the input slice a second opinion about a server-authoritative verb, which is the mistake
+// OnParryStarted's comment spends a paragraph refusing to make.
+// -------------------------------------------------------------------------------------------
+
+void ATracePlayerController::OnMeleeStarted()
+{
+	// The PRESS is a request, and is refused while a menu owns input — same gate as every other
+	// press in this file.
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
+	{
+		const TraceMelee::EMeleeInputResult Result = TraceMelee::HandleMeleeInput(TraceChar, /*bPressed=*/true);
+
+		if (InputLogLevel() >= 1)
+		{
+			const TCHAR* What =
+				(Result == TraceMelee::EMeleeInputResult::Swing)    ? TEXT("SWING") :
+				(Result == TraceMelee::EMeleeInputResult::CorePull) ? TEXT("CORE PULL (the circle is on screen)") :
+				                                                      TEXT("refused");
+			UE_LOG(LogTraceGame, Display, TEXT("INPUT Melee pressed -> %s"), What);
+		}
+	}
+}
+
+void ATracePlayerController::OnMeleeCompleted()
+{
+	// The RELEASE is a cancel and is delivered unconditionally, through GetPawn rather than
+	// GetLivingCharacter. Opening the pause menu mid-pull suppresses input; dying mid-pull makes the
+	// pawn non-living. Those are the two cases where a dropped release leaves a pull ring filling on
+	// the server with nobody holding the button — the exact asymmetry OnPassCompleted and
+	// DispatchCorePull both argue for.
+	if (ATraceCharacter* TraceChar = GetPawn<ATraceCharacter>())
+	{
+		TraceMelee::HandleMeleeInput(TraceChar, /*bPressed=*/false);
+	}
 }
 
 void ATracePlayerController::OnEquipKnifeStarted()
@@ -2136,6 +2277,7 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 	LogAction(TEXT("IA_EquipGun  "), IA_EquipGun);
 	LogAction(TEXT("IA_Reload    "), IA_Reload);
 	LogAction(TEXT("IA_PullCore  "), IA_PullCore);
+	LogAction(TEXT("IA_Melee     "), IA_Melee);
 
 	// The player's own settings are now part of "why does input feel wrong", so they belong in the
 	// same dump. A hand-edited or half-migrated TraceUserSettings.ini is otherwise invisible.
@@ -2148,8 +2290,12 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 
 	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
 	{
-		UE_LOG(LogTraceGame, Display, TEXT("INPUTDIAG [%s]   bind %-16s -> %s"),
-			Context, Info.ConfigId, *UTraceUserSettings::DescribeKey(UserSettings.GetKey(Info.Action)));
+		// SPEC v28 §3c — the WHOLE binding, both slots. A diagnostic that printed only the primary
+		// would show a parry on "Q" while the player was pressing the thumb button and getting a parry,
+		// which is precisely the kind of half-truth this dump exists to prevent.
+		UE_LOG(LogTraceGame, Display, TEXT("INPUTDIAG [%s]   bind %-16s -> %-30s [%s]"),
+			Context, Info.ConfigId, *UserSettings.DescribeBinding(Info.Action),
+			*LexTraceInputStates(Info.States));
 	}
 
 	// The mouse-capture mode is the one part of this that is not ours and can change behind our
@@ -2230,14 +2376,20 @@ void ATracePlayerController::LogLiveInputMappings(const TCHAR* Context) const
 	// yet" and "the pull is wired and quiet" are different facts and a line that only appeared on
 	// success could not tell them apart.
 	const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+	// SPEC v28 §3d: this line used to be about the right mouse button, and the right mouse button is
+	// no longer where any of these verbs live — parry moved to Q + the thumb button so §10's melee
+	// could have it. What the line is FOR is unchanged: naming, in one place, which physical buttons
+	// the three overlapping Core verbs are on, because that is the question every report about them
+	// turns out to be.
 	UE_LOG(LogTraceGame, Display,
-		TEXT("INPUTMAP [%s]   right-mouse verbs: PARRY on '%s' (bind '%s'), and the spec v25 s2 CORE-PULL ")
-		TEXT("rides the same press -> %s. THROW is on '%s' (mouse 1 throws while carrying regardless)."),
+		TEXT("INPUTMAP [%s]   Core verbs: PARRY on %s (bind '%s'), PULL CORE on %s -> %s, THROW on %s ")
+		TEXT("(mouse 1 throws while carrying regardless)."),
 		Context,
-		*UTraceUserSettings::DescribeKey(UserSettings.GetKey(ETraceInputAction::Parry)),
+		*UserSettings.DescribeBinding(ETraceInputAction::Parry),
 		TraceInputActions::Info(ETraceInputAction::Parry).ConfigId,
+		*UserSettings.DescribeBinding(ETraceInputAction::PullCore),
 		TracePlayerControllerInput::LexPullBinding(TracePlayerControllerInput::GetPullBinding()),
-		*UTraceUserSettings::DescribeKey(UserSettings.GetKey(ETraceInputAction::Pass)));
+		*UserSettings.DescribeBinding(ETraceInputAction::Pass));
 }
 
 void ATracePlayerController::GetLiveMappedActions(TArray<const UInputAction*>& OutActions) const
@@ -2361,6 +2513,7 @@ namespace TracePlayerControllerInput
 			// Scripts/generate-input-assets.py" rather than letting the new bind be silently absent
 			// from the assets while the C++ fallback quietly carries it.
 			{ TEXT("IA_PullCore"),         EInputActionValueType::Boolean, Highest },
+			{ TEXT("IA_Melee"),            EInputActionValueType::Boolean, Highest },
 		};
 
 		int32 Failures = 0;
@@ -2409,19 +2562,24 @@ namespace TracePlayerControllerInput
 			ETraceInputAction Bind;
 			FKey FixedKey;
 			int32 ModifierCount;
+			/**
+			 * SPEC v28 §3c — which of the action's shipped slots this mapping is. 0 for every row that
+			 * ships with one key; §3d's parry is the only action with a row for slot 1.
+			 */
+			int32 Slot;
 		};
 
 		const FExpectedMapping ExpectedMappings[] =
 		{
-			{ TEXT("IA_Move"),             ETraceInputAction::MoveForward,      FKey(),         1 },
-			{ TEXT("IA_Move"),             ETraceInputAction::MoveBack,         FKey(),         2 },
-			{ TEXT("IA_Move"),             ETraceInputAction::MoveLeft,         FKey(),         1 },
-			{ TEXT("IA_Move"),             ETraceInputAction::MoveRight,        FKey(),         0 },
-			{ TEXT("IA_Look"),             ETraceInputAction::Count,            EKeys::MouseX,  1 },
-			{ TEXT("IA_Look"),             ETraceInputAction::Count,            EKeys::MouseY,  2 },
-			{ TEXT("IA_Jump"),             ETraceInputAction::Jump,             FKey(),         0 },
-			{ TEXT("IA_Crouch"),           ETraceInputAction::Crouch,           FKey(),         0 },
-			{ TEXT("IA_Fire"),             ETraceInputAction::Fire,             FKey(),         0 },
+			{ TEXT("IA_Move"),             ETraceInputAction::MoveForward,      FKey(),         1, 0 },
+			{ TEXT("IA_Move"),             ETraceInputAction::MoveBack,         FKey(),         2, 0 },
+			{ TEXT("IA_Move"),             ETraceInputAction::MoveLeft,         FKey(),         1, 0 },
+			{ TEXT("IA_Move"),             ETraceInputAction::MoveRight,        FKey(),         0, 0 },
+			{ TEXT("IA_Look"),             ETraceInputAction::Count,            EKeys::MouseX,  1, 0 },
+			{ TEXT("IA_Look"),             ETraceInputAction::Count,            EKeys::MouseY,  2, 0 },
+			{ TEXT("IA_Jump"),             ETraceInputAction::Jump,             FKey(),         0, 0 },
+			{ TEXT("IA_Crouch"),           ETraceInputAction::Crouch,           FKey(),         0, 0 },
+			{ TEXT("IA_Fire"),             ETraceInputAction::Fire,             FKey(),         0, 0 },
 			// *** SPEC v25 §7: THERE IS NO IA_Pass ROW ANY MORE. ***  It used to sit here, on the
 			// right mouse button. The throw now ships UNBOUND (TraceInputActions::All()), and an
 			// unbound action produces no mapping at all — ApplyControlSettings' MapButton skips an
@@ -2429,21 +2587,26 @@ namespace TracePlayerControllerInput
 			// exist. So the asset must not contain one either, and this table is what says so.
 			// IA_Pass itself is untouched and still in ExpectedActions above: the ACTION exists and is
 			// still bound to its handlers, it simply starts with no key on it.
-			{ TEXT("IA_Dash"),             ETraceInputAction::Dash,             FKey(),         0 },
-			// SPEC v25 §7: this row's key is now the RIGHT MOUSE BUTTON. Nothing here says so, and
-			// that is the design — the expected key is read live from TraceInputActions::Info(Parry)
-			// .DefaultKey() below, so moving a default is one edit in the action table and never two.
-			{ TEXT("IA_Parry"),            ETraceInputAction::Parry,            FKey(),         0 },
-			{ TEXT("IA_Scoreboard"),       ETraceInputAction::Scoreboard,       FKey(),         0 },
-			{ TEXT("IA_EquipKnife"),       ETraceInputAction::EquipKnife,       FKey(),         0 },
-			{ TEXT("IA_EquipGun"),         ETraceInputAction::EquipGun,         FKey(),         0 },
-			{ TEXT("IA_Ability"),          ETraceInputAction::Ability,          FKey(),         0 },
-			{ TEXT("IA_AbilitySecondary"), ETraceInputAction::AbilitySecondary, FKey(),         0 },
-			{ TEXT("IA_Reload"),           ETraceInputAction::Reload,           FKey(),         0 },
+			{ TEXT("IA_Dash"),             ETraceInputAction::Dash,             FKey(),         0, 0 },
+			// SPEC v25 §7 put this row on the RIGHT MOUSE BUTTON; SPEC v28 §3d moves it to Q and gives
+			// it a SECOND mapping on the thumb mouse button. Nothing here says either key, and that is
+			// the design — the expected key is read live from TraceInputActions::Info(Parry) below, so
+			// moving a default is one edit in the action table and never two. What DOES have to be
+			// stated is that there are now two rows for this action, because the count is the thing
+			// that catches an asset regenerated by an older script.
+			{ TEXT("IA_Parry"),            ETraceInputAction::Parry,            FKey(),         0, 0 },
+			{ TEXT("IA_Parry"),            ETraceInputAction::Parry,            FKey(),         0, 1 },
+			{ TEXT("IA_Scoreboard"),       ETraceInputAction::Scoreboard,       FKey(),         0, 0 },
+			{ TEXT("IA_EquipKnife"),       ETraceInputAction::EquipKnife,       FKey(),         0, 0 },
+			{ TEXT("IA_EquipGun"),         ETraceInputAction::EquipGun,         FKey(),         0, 0 },
+			{ TEXT("IA_Ability"),          ETraceInputAction::Ability,          FKey(),         0, 0 },
+			{ TEXT("IA_AbilitySecondary"), ETraceInputAction::AbilitySecondary, FKey(),         0, 0 },
+			{ TEXT("IA_Reload"),           ETraceInputAction::Reload,           FKey(),         0, 0 },
 			// SPEC v26 §1 — the Core pull's own mapping. Its expected key is read live from
 			// TraceInputActions::Info(PullCore).DefaultKey() like every row above, so changing the
 			// default is one edit in the action table and never two.
-			{ TEXT("IA_PullCore"),         ETraceInputAction::PullCore,         FKey(),         0 },
+			{ TEXT("IA_PullCore"),         ETraceInputAction::PullCore,         FKey(),         0, 0 },
+			{ TEXT("IA_Melee"),            ETraceInputAction::Melee,            FKey(),         0, 0 },
 		};
 
 		const int32 ExpectedMappingCount = static_cast<int32>(UE_ARRAY_COUNT(ExpectedMappings));
@@ -2466,9 +2629,16 @@ namespace TracePlayerControllerInput
 				// The DEFAULT key from the action table — deliberately not the player's current bind.
 				// The asset is the shipped default; a player who rebinds Dash has not made the asset
 				// wrong, and a check that used their live bind would fail for every rebinding player.
-				const FKey WantKey = (Expected.Bind == ETraceInputAction::Count)
-					? Expected.FixedKey
-					: TraceInputActions::Info(Expected.Bind).DefaultKey();
+				// SPEC v28 §3c — the shipped key for THIS SLOT. DefaultKeyAlt is null-checked because
+				// sixteen of the seventeen rows ship with one key and say so with &Default_None.
+				FKey WantKey = Expected.FixedKey;
+				if (Expected.Bind != ETraceInputAction::Count)
+				{
+					const FTraceInputActionInfo& BindInfo = TraceInputActions::Info(Expected.Bind);
+					WantKey = (Expected.Slot == 0)
+						? BindInfo.DefaultKey()
+						: ((BindInfo.DefaultKeyAlt != nullptr) ? BindInfo.DefaultKeyAlt() : FKey());
+				}
 
 				const bool bActionOk = (Actual.Action != nullptr) && Actual.Action->GetName().Equals(Expected.ActionName);
 				const bool bKeyOk = (Actual.Key == WantKey);
@@ -2594,74 +2764,116 @@ namespace TracePlayerControllerInput
 		int32 Failures = 0;
 
 		// ---- 1. where the button points ---------------------------------------------------------
-		const FKey ParryKey = Settings.GetKey(ETraceInputAction::Parry);
-		const FKey ThrowKey = Settings.GetKey(ETraceInputAction::Pass);
+		//
+		// *** SPEC v28 §3d REVERSES HALF OF v25 §7 AND THIS BLOCK REVERSES WITH IT. ***
+		//
+		// v25 §7 asked for "parry on right click" and this command proved it. v28 §3d asks for parry on
+		// "BOTH Q and the thumb mouse button" — and it asks for that BECAUSE v28 §10 is putting MELEE on
+		// right click, which parry cannot share (both are live while carrying nothing in the melee's case
+		// and while carrying in the parry's, and melee is not even in the rebind table, so there is no
+		// exclusion group to appeal to). Leaving the old assertion here would have failed the build for
+		// doing exactly what the new note says.
+		//
+		// WHAT SURVIVES UNCHANGED is the half that was never about which button: the THROW must not be on
+		// right mouse, and no rebindable action may quietly be sitting on it.
+		const bool bParryOnQ = Settings.ActionUsesKey(ETraceInputAction::Parry, EKeys::Q);
+		const bool bParryOnThumb = Settings.ActionUsesKey(ETraceInputAction::Parry, EKeys::ThumbMouseButton);
+		const bool bThrowOffRMB = !Settings.ActionUsesKey(ETraceInputAction::Pass, RMB);
 
-		const bool bParryOnRMB = (ParryKey == RMB);
-		const bool bThrowOffRMB = (ThrowKey != RMB);
-
-		Failures += bParryOnRMB ? 0 : 1;
 		Failures += bThrowOffRMB ? 0 : 1;
 
 		// Display and Error are separate calls, not a ternary verbosity: UE_LOG's verbosity is a token
 		// the macro pastes into a compile-time category check, not a value.
-		if (bParryOnRMB)
+		//
+		// The parry's own keys are REPORTED and not failed on, because a player is allowed to rebind
+		// their parry and this command has to stay useful on a real machine. The shipped-default check
+		// that CAN fail lives in Trace.Keys.VerifyV28, where it reads the table rather than the player.
+		if (bParryOnQ && bParryOnThumb)
 		{
-			UE_LOG(LogTraceGame, Display, TEXT("[RightMouse]   ok       PARRY ('%s') is on %s"),
-				TraceInputActions::Info(ETraceInputAction::Parry).ConfigId, *UTraceUserSettings::DescribeKey(ParryKey));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RightMouse]   ok       PARRY (\'%s\') is on %s - spec v28 s3d\'s Q + thumb pair."),
+				TraceInputActions::Info(ETraceInputAction::Parry).ConfigId,
+				*Settings.DescribeBinding(ETraceInputAction::Parry));
 		}
 		else
 		{
-			UE_LOG(LogTraceGame, Error,
-				TEXT("[RightMouse]   WRONG    PARRY resolved to '%s', not the right mouse button. If this is a ")
-				TEXT("returning player's TraceUserSettings.ini, the ConfigId migration ('Parry' -> 'ParryPull') ")
-				TEXT("did not take."),
-				*UTraceUserSettings::DescribeKey(ParryKey));
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[RightMouse]   note     PARRY is on %s, not spec v28 s3d\'s Q + thumb mouse pair. That is a ")
+				TEXT("rebind on this machine, not a failure - the shipped defaults are checked by ")
+				TEXT("Trace.Keys.VerifyV28."),
+				*Settings.DescribeBinding(ETraceInputAction::Parry));
 		}
 
 		if (bThrowOffRMB)
 		{
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[RightMouse]   ok       THROW ('%s') is on '%s' - NOT the right mouse button. Mouse 1 still ")
+				TEXT("[RightMouse]   ok       THROW (\'%s\') is on \'%s\' - NOT the right mouse button. Mouse 1 still ")
 				TEXT("throws while carrying; that path is ATraceCharacter::DoFirePressed and is untouched."),
-				TraceInputActions::Info(ETraceInputAction::Pass).ConfigId, *UTraceUserSettings::DescribeKey(ThrowKey));
+				TraceInputActions::Info(ETraceInputAction::Pass).ConfigId, *Settings.DescribeBinding(ETraceInputAction::Pass));
 		}
 		else
 		{
 			UE_LOG(LogTraceGame, Error,
 				TEXT("[RightMouse]   WRONG    THROW is STILL on the right mouse button. Spec v25 s7 removes exactly ")
-				TEXT("this bind, and a stale 'Pass=RightMouseButton' line in TraceUserSettings.ini is how it survives."));
+				TEXT("this bind, and a stale \'Pass=RightMouseButton\' line in TraceUserSettings.ini is how it survives."));
 		}
 
-		// Nothing ELSE may hold the button. SetKey's stealing rule makes this true by construction for
-		// anything set through the UI, but a hand-edited .ini goes through RefreshFromConfig, which
-		// does not steal — so two actions really can end up sharing a key on disk, and if one of them
-		// is the right button the parry and whatever else it is would both fire on one press.
+		// *** SPEC v28 §10 — MELEE NOW HOLDS THE BUTTON, AND EXACTLY ONE ACTION MAY. ***
+		//
+		// This block used to assert that the button was EMPTY. That was the correct assertion for as
+		// long as the melee verb had no row in the action table, which is the state the §3 and §10
+		// slices each left it in — §3 vacated the button and could not add the row (the verb was §10's
+		// file), §10 built the verb and could not bind it (the table is §3's file). The integrator added
+		// ETraceInputAction::Melee, so the assertion inverts: MELEE must hold it, and nothing else may.
+		//
+		// Both halves are failures, not notes, and for the same reason as before: a second holder means
+		// one press does two things, and that is found in a playtest rather than in a build. The parry
+		// is the specific one being guarded against — a hand-edited .ini goes through RefreshFromConfig,
+		// which does not steal, so a file that still says the parry is on right mouse would produce
+		// exactly the collision §3d's "ParryPull" -> "ParryKeys" migration exists to prevent.
+		const bool bMeleeOnRMB = Settings.ActionUsesKey(ETraceInputAction::Melee, RMB);
+		Failures += bMeleeOnRMB ? 0 : 1;
+
+		if (bMeleeOnRMB)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RightMouse]   ok       MELEE (\'%s\') is on %s - spec v28 s10\'s default. The verb is ")
+				TEXT("TraceMelee::HandleMeleeInput, and the Core-pull precedence inside it is ATraceCore::CanPullNow, ")
+				TEXT("which is the SAME call ATraceHUD makes to decide whether to draw the circle."),
+				TraceInputActions::Info(ETraceInputAction::Melee).ConfigId,
+				*Settings.DescribeBinding(ETraceInputAction::Melee));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[RightMouse]   WRONG    MELEE is on %s, NOT the right mouse button. Spec v28 s10 says \"Melee ")
+				TEXT("should be bound to right click by default\"; a stale TraceUserSettings.ini line ")
+				TEXT("\'Melee=<something>\' is how that survives a correct table."),
+				*Settings.DescribeBinding(ETraceInputAction::Melee));
+		}
+
 		int32 OtherHolders = 0;
 		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
 		{
-			// PullCore is exempt, and only because the block above already reported it. Spec v26 §1
-			// makes sharing the button a supported (if non-default) state with a stated tiebreak, so
-			// counting it here as well would print the same fact twice — once as a warning and once as
-			// an error — and would fail a build for a configuration the design explicitly allows.
-			if (Info.Action == ETraceInputAction::Parry
-				|| Info.Action == ETraceInputAction::PullCore
-				|| Settings.GetKey(Info.Action) != RMB)
+			if (Info.Action == ETraceInputAction::Melee || !Settings.ActionUsesKey(Info.Action, RMB))
 			{
 				continue;
 			}
 			++OtherHolders;
 			++Failures;
 			UE_LOG(LogTraceGame, Error,
-				TEXT("[RightMouse]   WRONG    '%s' (%s) ALSO holds the right mouse button. One press, two verbs, ")
-				TEXT("and neither of them is the pull."),
+				TEXT("[RightMouse]   WRONG    \'%s\' (%s) ALSO holds the RIGHT MOUSE BUTTON, which spec v28 s10 gives ")
+				TEXT("to the MELEE. One press would run two verbs. Note this is a collision no exclusion group can ")
+				TEXT("resolve on its own: melee\'s group is NOT CARRYING, so the check would refuse a NotCarrying ")
+				TEXT("action but permits a Carrying one - and the parry is Carrying."),
 				Info.ConfigId, Info.DisplayName);
 		}
 		if (OtherHolders == 0)
 		{
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[RightMouse]   ok       no other action holds the right mouse button (%d checked)."),
-				TraceInputActions::All().Num());
+				TEXT("[RightMouse]   ok       the RIGHT MOUSE BUTTON is held by MELEE ALONE: none of the other %d ")
+				TEXT("rebindable actions holds it in either slot."),
+				TraceInputActions::All().Num() - 1);
 		}
 
 		// ---- 1b. SPEC v26 §1 — ARE PARRY AND PULL ACTUALLY TWO BINDS? ---------------------------
@@ -2681,15 +2893,15 @@ namespace TracePlayerControllerInput
 			{
 				++Failures;
 				UE_LOG(LogTraceGame, Error,
-					TEXT("[RightMouse]   WRONG    there is no PULL CORE row in the action table, so spec v26 s1's ")
+					TEXT("[RightMouse]   WRONG    there is no PULL CORE row in the action table, so spec v26 s1\'s ")
 					TEXT("second bind cannot appear on the keybind page at all."));
 			}
 			else
 			{
 				UE_LOG(LogTraceGame, Display,
-					TEXT("[RightMouse]   ok       PULL CORE ('%s', row %d of %d) is on the keybind page and resolves to %s"),
+					TEXT("[RightMouse]   ok       PULL CORE (\'%s\', row %d of %d) is on the keybind page and resolves to %s"),
 					TraceInputActions::Info(ETraceInputAction::PullCore).ConfigId, PullRow + 1,
-					TraceInputActions::All().Num(), *UTraceUserSettings::DescribeKey(PullKey));
+					TraceInputActions::All().Num(), *Settings.DescribeBinding(ETraceInputAction::PullCore));
 			}
 
 			// (ii) it is BOUND. An unbound pull is a legal state a player may choose, but it is not the
@@ -2703,23 +2915,43 @@ namespace TracePlayerControllerInput
 			}
 
 			// (iii) the two are on DIFFERENT keys. Sharing one is legal and handled — OnParryStarted
-			//       keeps v25's precedence rule as a tiebreak for exactly that — but it is not two
-			//       binds, so it is reported as the deliberate act it must have been rather than
-			//       passed over in silence.
-			if (PullKey.IsValid() && PullKey == ParryKey)
+			//       keeps v25's precedence rule as a tiebreak for exactly that, and since spec v28 §3b the
+			//       options page will now PRODUCE that state on request (their exclusion groups are
+			//       disjoint) instead of it only being reachable by hand-editing the .ini. Still reported,
+			//       because it is not the shipped two-bind default.
+			// The same intersection ATracePlayerController::DoParryAndPullShareAKey computes at runtime,
+			// recomputed here rather than called, because that method is private and this is a
+			// file-scope diagnostic — and because a diagnostic that asked the code under test whether it
+			// agreed with itself would be worth nothing.
+			bool bShared = false;
+			{
+				TArray<FKey> ParryKeys;
+				Settings.GetKeys(ETraceInputAction::Parry, ParryKeys);
+				for (const FKey& Key : ParryKeys)
+				{
+					if (Settings.ActionUsesKey(ETraceInputAction::PullCore, Key))
+					{
+						bShared = true;
+						break;
+					}
+				}
+			}
+			if (bShared)
 			{
 				UE_LOG(LogTraceGame, Warning,
-					TEXT("[RightMouse]   SHARED   PARRY and PULL CORE are both on %s. This is a supported state and ")
-					TEXT("the v25 s2 precedence rule is applied as a TIEBREAK (one press, both verbs, the ")
-					TEXT("authoritative gates decide) - but it is NOT the shipped two-bind default, so it can only ")
-					TEXT("have come from a hand-edited TraceUserSettings.ini."),
-					*UTraceUserSettings::DescribeKey(PullKey));
+					TEXT("[RightMouse]   SHARED   PARRY (%s) and PULL CORE (%s) have a key in common. Supported: the ")
+					TEXT("v25 s2 precedence rule is applied as a TIEBREAK (one press, both verbs, the authoritative ")
+					TEXT("gates decide), and spec v28 s3b allows it because parry needs the Core and the pull needs ")
+					TEXT("not to have it. It is not the shipped default."),
+					*Settings.DescribeBinding(ETraceInputAction::Parry),
+					*Settings.DescribeBinding(ETraceInputAction::PullCore));
 			}
 			else if (PullKey.IsValid())
 			{
 				UE_LOG(LogTraceGame, Display,
 					TEXT("[RightMouse]   ok       PARRY (%s) and PULL CORE (%s) are TWO SEPARATE BINDS - spec v26 s1."),
-					*UTraceUserSettings::DescribeKey(ParryKey), *UTraceUserSettings::DescribeKey(PullKey));
+					*Settings.DescribeBinding(ETraceInputAction::Parry),
+					*Settings.DescribeBinding(ETraceInputAction::PullCore));
 			}
 		}
 
@@ -2792,14 +3024,19 @@ namespace TracePlayerControllerInput
 			}
 		}
 
-// SPEC v26 §1 CHANGED WHAT A PASS MEANS HERE. It used to be "right mouse is parry AND the pull";
-// the pull now has its own bind, so the claim is that right mouse is the PARRY ALONE, the throw is
-// still off it, and the pull is somewhere else and wired. The pull's key is printed rather than
-// asserted to be F, because the player is allowed to rebind it and this command reads the live table.
+// SPEC v28 §3d CHANGED WHAT A PASS MEANS HERE, AGAIN. v25 §7's claim was "right mouse is parry";
+// v26 §1's was "right mouse is the parry ALONE and the pull is its own bind"; v28 §3d's is that the
+// button is EMPTY — parry has moved to Q + the thumb mouse button so §10's melee can have it — while
+// the throw is still off it and the pull is still wired somewhere. Every key is PRINTED rather than
+// asserted, because the player is allowed to rebind all of them and this command reads the live
+// table; the assertions are the two things no rebind may produce (a throw on right mouse, anything
+// at all on right mouse) plus the pull being wired at all.
 #define TRACE_RIGHTMOUSE_VERDICT_ARGS \
-	(Failures == 0) ? TEXT("RIGHT MOUSE IS THE PARRY, AND THE PULL IS ITS OWN BIND") : TEXT("THE RIGHT MOUSE BUTTON IS WRONG"), \
-	*UTraceUserSettings::DescribeKey(ParryKey), *UTraceUserSettings::DescribeKey(ThrowKey), \
-	*UTraceUserSettings::DescribeKey(Settings.GetKey(ETraceInputAction::PullCore)), \
+	(Failures == 0) ? TEXT("RIGHT MOUSE IS FREE FOR THE MELEE, AND THE CORE VERBS ARE WHERE THEY BELONG") \
+	                : TEXT("THE RIGHT MOUSE BUTTON IS WRONG"), \
+	*Settings.DescribeBinding(ETraceInputAction::Parry), \
+	*Settings.DescribeBinding(ETraceInputAction::Pass), \
+	*Settings.DescribeBinding(ETraceInputAction::PullCore), \
 	LexPullBinding(Binding), Failures
 
 #define TRACE_RIGHTMOUSE_VERDICT_TEXT \
@@ -2820,7 +3057,8 @@ namespace TracePlayerControllerInput
 
 	FAutoConsoleCommand CmdVerifyRightMouse(
 		TEXT("Trace.Input.VerifyRightMouse"),
-		TEXT("Spec v25 s7. Proves the right mouse button resolves to PARRY and NOT to the Core throw, that ")
+		TEXT("Spec v25 s7 + v26 s1 + v28 s3d. Proves the right mouse button is held by NO rebindable action ")
+		TEXT("(so s10's melee may take it), that the Core throw is not on it, that ")
 		TEXT("no third action holds it, that spec v25 s2's core-pull found an entry point, and - with a live ")
 		TEXT("non-carrying pawn - that the parry gate really does refuse a non-carrier, which is what makes ")
 		TEXT("the parry and the pull mutually exclusive on one press."),

@@ -37,11 +37,45 @@ class UStaticMeshComponent;
  */
 namespace TraceAmmo
 {
-	/** Rounds per clip: UTraceSettings::ClipSize, clamped. Shipped 30. */
+	/**
+	 * Rounds per clip for the PISTOL: UTraceSettings::ClipSize, clamped. Shipped 30.
+	 *
+	 * *** THE NO-ARGUMENT FORM IS THE PISTOL'S AND ALWAYS WAS. *** Spec v28 §9 added a second gun
+	 * with its own 40-round clip, so every reader that has a WEAPON in hand should call the overload
+	 * below (or, better, UTraceWeaponComponent::GetClipSize(), which asks the pawn's own selector).
+	 * This form is kept, unchanged, because five call sites outside this slice pass no weapon and
+	 * mean the pistol: X's Sting harness, Roxie's, the reload probe in TracePlayerController and the
+	 * HUD's reload arc. Changing its meaning would have silently retuned all of them.
+	 */
 	TRACE_API int32 GetClipSize();
 
-	/** Seconds a reload takes: UTraceSettings::ReloadSeconds, clamped. Shipped 0.5. */
+	/** Seconds a PISTOL reload takes: UTraceSettings::ReloadSeconds, clamped. Shipped 0.5. */
 	TRACE_API float GetReloadSeconds();
+
+	/**
+	 * SPEC v28 §9. The same two numbers, for whichever weapon is being asked about.
+	 *
+	 * The knife has neither a clip nor a reload; it resolves to the pistol's values so that a caller
+	 * which asks about a knife-holding pawn gets a sane denominator rather than a zero. Nothing gates
+	 * on that — ShouldShowAmmo() is already false with a knife out.
+	 */
+	TRACE_API int32 GetClipSize(ETraceEquippedWeapon Weapon);
+	TRACE_API float GetReloadSeconds(ETraceEquippedWeapon Weapon);
+
+	/**
+	 * SPEC v28 §9. Seconds between rounds for @p Weapon, BEFORE the per-character scale.
+	 *
+	 * *** THE SCALE IS DELIBERATELY NOT APPLIED HERE. *** UTraceAbilityComponent::GetFireIntervalScaleFor()
+	 * needs the shooting ACTOR, which this namespace does not have, and folding it in would have
+	 * meant two functions that both look like "the fire interval" with only one of them honouring
+	 * Roxie. The two call sites that gate a shot (CanFire and ServerFire) both multiply by the scale
+	 * on the very next line; see UTraceWeaponComponent::GetFireInterval(), which is the form with the
+	 * pawn and is what everything else should use.
+	 */
+	TRACE_API float GetBaseFireInterval(ETraceEquippedWeapon Weapon);
+
+	/** SPEC v28 §9. Positional damage for @p Weapon: the pistol's 100/40/25, the SMG's 33/18/12. */
+	TRACE_API float GetZoneDamage(ETraceEquippedWeapon Weapon, ETraceHitZone Zone);
 
 	/** True when the mechanic is armed (Trace.Ammo.Enabled). 0 is the RED arm: the clip never falls. */
 	TRACE_API bool IsEnabled();
@@ -178,8 +212,53 @@ public:
 	 */
 	int32 GetClipAmmo() const;
 
-	/** Rounds a full clip holds. Resolved from UTraceSettings; shipped 30. */
-	int32 GetClipSize() const { return TraceAmmo::GetClipSize(); }
+	/**
+	 * Rounds a full clip of THE WEAPON THIS PAWN IS HOLDING holds. Pistol 30, SMG 40 (spec v28 §9).
+	 *
+	 * This is the accessor the HUD already calls for its denominator, so the "/40" beside an SMG
+	 * needed no HUD change at all — which is the whole reason the weapon-aware answer was put on the
+	 * component rather than only on the TraceAmmo overload.
+	 */
+	int32 GetClipSize() const { return TraceAmmo::GetClipSize(EquippedWeapon); }
+
+	/** Seconds a reload of the weapon in hand takes. Pistol 0.5, SMG 0.8 (spec v28 §9). */
+	float GetReloadSeconds() const { return TraceAmmo::GetReloadSeconds(EquippedWeapon); }
+
+	/**
+	 * SECONDS BETWEEN ROUNDS FOR THIS PAWN, RIGHT NOW — the base interval of the weapon in hand,
+	 * multiplied by this pawn's per-character scale.
+	 *
+	 * *** THIS IS THE STANDING RULE, IN ONE FUNCTION, AND IT IS WHY THE SMG INHERITED ROXIE AND
+	 * SLIMEBALL FOR FREE. *** Spec v28 §9: "The existing per-character fire-rate modifiers must apply
+	 * to the SMG the same way they apply to the pistol." Those modifiers are stored as RATE
+	 * MULTIPLIERS and reach the gun as a SCALE ON THE INTERVAL through
+	 * UTraceAbilityComponent::GetFireIntervalScaleFor() — a number below 1 for a faster gun. Because
+	 * the scale multiplies whatever base it is given, pointing the base at SmgFireInterval was the
+	 * entire change: Roxie's SMG is 0.1 / 1.65 = 0.0606 s = 990 RPM, and a stuck Slimeball's is
+	 * 0.1 / 1.3 = 0.0769 s = 780 RPM, without either ability learning that a second gun exists.
+	 *
+	 * Both gates call this — the client's CanFire() and the server's ServerFire() — so a scaled
+	 * client and an unscaled server can never disagree about what a legal cadence is. That exact
+	 * disagreement was the spec v18 §2 bug: it read in game as the gun eating every second bullet.
+	 */
+	double GetFireInterval() const;
+
+	/**
+	 * SPEC v28 §10. Seconds of shooting lockout still owed by a swing; 0 when the gun is free.
+	 *
+	 * "Meleeing should lock the player out of shooting for the length of the animation." The length
+	 * IS UTraceMeleeSettings::SwingAnimSeconds — not a copy of it — so retuning the animation moves
+	 * the lockout with it and the two can never disagree about how long a swing looks like it lasts.
+	 *
+	 * TWO CLOCKS, MAXED, BECAUSE TWO MACHINES OWN TWO DIFFERENT FACTS. The swinging machine stamps
+	 * SwingAnimStartLocalTime at the PRESS. The server only learns about the swing when ServerSwing
+	 * arrives, which is at the RESOLVE — press + SwingWindupSeconds — so its own deadline is
+	 * LastAcceptedSwingTime + (anim - windup). Both are derived from the same two knobs and land on
+	 * the same instant in the absence of lag; taking the max means a client can never shorten its own
+	 * lockout by lying about when it swung. On a listen host and on a bot both stamps are set in the
+	 * same process and the max is simply the same number twice.
+	 */
+	float GetShootLockoutRemaining() const;
 
 	/**
 	 * True while the 0.5 s reload is running. Shared clock, so the client that predicted the reload
@@ -294,7 +373,23 @@ public:
 	 *  movement component, which multiplies the ground speed limit by 1.22 off the back of it (spec v12 s3). */
 	ETraceEquippedWeapon GetEquippedWeapon() const { return EquippedWeapon; }
 
+	/**
+	 * "Is the knife the SELECTED weapon" — i.e. is the gun stowed and unable to fire.
+	 *
+	 * *** [DUALWIELD] ALWAYS FALSE WHEN THE SPEC v28 §10 SWITCH IS ON, BY CONSTRUCTION RATHER THAN BY
+	 * A TEST: *** no path can put ETraceEquippedWeapon::Knife in the selector then. Every caller of
+	 * this outside the melee slice means "cannot shoot right now" (X's Sting, Roxie's Modded, the
+	 * ability reload hook, ShouldShowAmmo, the HUD), and under dual-wield a pawn can always shoot, so
+	 * false is the right answer for all of them. Use TraceMelee::IsKnifeInHand() when the question is
+	 * whether a blade is available to swing.
+	 */
 	bool IsKnifeEquipped() const { return EquippedWeapon == ETraceEquippedWeapon::Knife; }
+
+	/** SPEC v28 §9. True while the SMG is the selected weapon. */
+	bool IsSmgEquipped() const { return EquippedWeapon == ETraceEquippedWeapon::Smg; }
+
+	/** True for any weapon that fires bullets. This is what almost every gate actually wants. */
+	bool IsFirearmEquipped() const { return TraceIsFirearm(EquippedWeapon); }
 
 	/** True inside the 0.2 s pullout, during which neither weapon works. Shared clock, so it is the
 	 *  same answer on the client that predicted the swap and on the server that validates it. */
@@ -645,6 +740,51 @@ private:
 	UPROPERTY(Replicated)
 	float ReloadEndServerTime = -1.f;
 
+	// --- THE STOWED GUN'S CLIP  (spec v28 §9) -----------------------------------------------------
+	//
+	// *** EACH GUN REMEMBERS ITS OWN MAGAZINE, AND THE ALTERNATIVES ARE BOTH VISIBLY WRONG. ***
+	//
+	// One shared counter would print "40/30" the moment a full SMG was swapped for the pistol, and
+	// clamping it down to 30 would eat ten rounds every time a player touched the other key — a gun
+	// that silently confiscates ammunition is the kind of thing that gets reported as "the SMG is
+	// bugged". Refilling on every draw would be worse still: the swap costs 0.2 s and a reload costs
+	// 0.5-0.8 s, so tapping 1-2 would be a reload that is two to four times faster than reloading.
+	//
+	// ONE STOW SLOT IS ENOUGH BECAUSE THERE ARE EXACTLY TWO GUNS. ApplyEquip exchanges the live pair
+	// with this pair on any gun-to-gun transition and leaves both alone otherwise — a knife swap in
+	// the legacy build must NOT disturb the gun's magazine, which is the v16 §1 behaviour and is
+	// preserved by that condition. Adding a third gun means turning this into a small array; the
+	// exchange is a single named function (SwapStowedClip) so that is a local change.
+	//
+	// COND_OwnerOnly, like the four fields above it and for the identical reason: nothing in this
+	// game draws another player's ammo, and this is two more bytes nobody can see.
+	//
+	// THE SERIAL DOES THE RECONCILING. ApplyEquip bumps ClipSerial on the authority, so an owning
+	// client's OnRep_Ammo takes the "a NEW clip — throw the prediction away" branch it already had.
+	// That is why the swap needed no new reconciliation rule.
+
+	/** SERVER TRUTH. Rounds in the OTHER gun's magazine. Meaningless while the knife is selected. */
+	UPROPERTY(Replicated)
+	uint8 StowedGunClipAmmo = 0;
+
+	/** How many of StowedGunClipAmmo are ability-loaded (X's Sting, put away mid-clip). */
+	UPROPERTY(Replicated)
+	uint8 StowedGunAbilityRounds = 0;
+
+	/** OWNING CLIENT ONLY. Prediction mirror of StowedGunClipAmmo. -1 until first seeded. */
+	int32 PredictedStowedClipAmmo = -1;
+
+	/**
+	 * The selector THIS machine last applied locally, so OnRep_EquippedWeapon can tell a replicated
+	 * CONFIRMATION of a predicted swap from a CORRECTION of one the server refused.
+	 *
+	 * Not replicated and deliberately not a UPROPERTY: it is a fact about this process's own last
+	 * write, and replicating it would make it a copy of EquippedWeapon rather than a witness to it.
+	 * Seeded to the same default EquippedWeapon has, so a pawn that never swaps never sees a
+	 * spurious correction.
+	 */
+	ETraceEquippedWeapon LocallyAppliedWeapon = ETraceEquippedWeapon::Gun;
+
 	/** OWNING CLIENT ONLY. -1 until the first OnRep seeds it; see GetClipAmmo(). */
 	int32 PredictedClipAmmo = -1;
 
@@ -749,6 +889,17 @@ private:
 
 	/** Applies a swap locally (both the state and the deadline). Server and predicting client. */
 	void ApplyEquip(ETraceEquippedWeapon Desired, double DeployEndSharedTime);
+
+	/**
+	 * SPEC v28 §9. Exchanges the live magazine with the stowed one. Called by ApplyEquip and by
+	 * nothing else, on a GUN-TO-GUN transition only.
+	 *
+	 * Runs on the authority (the replicated pair) and on a predicting client (the predicted pair),
+	 * which is the same "each machine owns one side of the decision" split ConsumeRound documents.
+	 * A running reload is cancelled by the caller before this: a magazine that was half-loaded when
+	 * it went in the pocket is not half-loaded when it comes out, it is exactly as empty as it was.
+	 */
+	void SwapStowedClip();
 
 	// --- The victim-facing ring (see GetFacingYawAtTime) ------------------------------------------
 

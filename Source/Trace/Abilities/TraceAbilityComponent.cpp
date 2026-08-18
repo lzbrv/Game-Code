@@ -17,6 +17,8 @@
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/CommandLine.h"             // -TraceNoWarmupHold / -TraceNoBotPreempt (spec v28 §9b red arms)
+#include "Misc/Parse.h"                   // FParse::Param, same
 #include "Net/UnrealNetwork.h"
 
 #include "Abilities/TraceCharacterAbilitySet.h"
@@ -119,6 +121,68 @@ static FAutoConsoleVariableRef CVarTraceEnforceRosterRules(
 	     "spec v15 s2's rule that a bot waits for every human on its team. 0 removes both so "
 	     "Trace.Characters.BotVerifyRed can be shown to FAIL. Dev only; absent from shipping."),
 	ECVF_Cheat);
+
+// =================================================================================================
+// THE SPEC v28 §9b RED ARMS — ONE PER RULE, AND THAT IS THE POINT
+//
+// EnforceRosterRules above is a sledgehammer: it removes per-team uniqueness as well, so a run with
+// it off does not reproduce ANY previously shipped behaviour — bots ask for the same character, the
+// framework stops refusing, and the roster goes to pieces in a way it never did in the field. That
+// is fine for a scripted harness, which only needs the assertion to be able to go red, and useless
+// for the thing §9b actually has to prove: that a SECOND PROCESS full of real players used to lose
+// its heroes and now does not.
+//
+// Each of these two switches restores EXACTLY the pre-v28 behaviour of one rule and touches nothing
+// else, so a listen server launched with one of them off is a faithful reproduction of the bug the
+// owner reported — not an approximation of it. Both halves matter separately:
+//
+//   Trace.Characters.WarmupHold 0   the bot fill happens a quarter second into the level again, so
+//                                   the far team's five bots eat five characters before any remote
+//                                   client has finished travelling. THE ORIGINAL REPORT.
+//   Trace.Characters.BotPreempt 0   a bot's hold beats a human's request again, so a player who
+//                                   joins after the whistle is told a computer already has it.
+//
+// THE COMMAND-LINE TWINS EXIST BECAUSE OF WHEN THE BUG HAPPENS. The first fill lands 0.25 s after
+// BeginPlay; there is no reliable way to get a console command in front of that, and a red arm that
+// arrives late would photograph the fixed build and call it broken. -TraceNoWarmupHold and
+// -TraceNoBotPreempt are read straight off the command line, so they are true from the process's
+// first instruction. Latched in a function-local static: FCommandLine cannot change mid-run, and
+// this is read on the 4 Hz poll.
+// =================================================================================================
+static int32 GTraceHoldBotFillForWarmup = 1;
+
+static FAutoConsoleVariableRef CVarTraceHoldBotFillForWarmup(
+	TEXT("Trace.Characters.WarmupHold"),
+	GTraceHoldBotFillForWarmup,
+	TEXT("1 (default, spec v28 s9b): no bot takes a character until the match is under way, so every "
+	     "human who joins during warm-up picks from a full roster. 0 restores the pre-v28 timing - the "
+	     "fill runs a quarter second into the level and a listen server's remote players arrive to an "
+	     "eaten roster. Also settable as -TraceNoWarmupHold, which is the only form that is true "
+	     "before the first fill. Dev only; absent from shipping."),
+	ECVF_Cheat);
+
+static int32 GTraceBotPreempt = 1;
+
+static FAutoConsoleVariableRef CVarTraceBotPreempt(
+	TEXT("Trace.Characters.BotPreempt"),
+	GTraceBotPreempt,
+	TEXT("1 (default, spec v28 s9b): a human asking for a character a BOT team-mate holds takes it, "
+	     "and the bot picks another. 0 restores the pre-v28 answer, where the bot keeps it and the "
+	     "player is refused with TakenByTeammate. Also settable as -TraceNoBotPreempt. Dev only; "
+	     "absent from shipping."),
+	ECVF_Cheat);
+
+static bool IsWarmupHoldArmedOff()
+{
+	static const bool bArmedOff = FParse::Param(FCommandLine::Get(), TEXT("TraceNoWarmupHold"));
+	return bArmedOff;
+}
+
+static bool IsBotPreemptArmedOff()
+{
+	static const bool bArmedOff = FParse::Param(FCommandLine::Get(), TEXT("TraceNoBotPreempt"));
+	return bArmedOff;
+}
 #endif
 
 // A scratch instance handed out by GetMutableNetState() on a machine with no authority, so a
@@ -285,6 +349,30 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 		return;
 	}
 
+	// ---- SPEC v28 §9b(a): AND NOT UNTIL THE MATCH IS UNDER WAY ----------------------------------
+	//
+	// The rule above is per TEAM, and that is why it never caught the multiplayer bug: on a listen
+	// server the far team has NO humans, so it is settled from the opening frame and its bots take
+	// five characters a quarter of a second into the level — before any remote client has finished
+	// travelling. See IsBotFillHeldForWarmup for the full diagnosis and for why the hold is bounded
+	// by ATraceGameState's own warm-up deadline rather than by a timer of its own.
+	//
+	// ON THE SAME FUNCTION AS THE ORDERING RULE, for the same reason the ordering rule is here: the
+	// AI slice's ATraceBotController::UpdateAutoCharacter is a second, independent way a bot gets a
+	// character, and a rule written only into ATraceGameMode::PollCharacterSelect is a rule the other
+	// path walks straight past. Both go through this function. (PollCharacterSelect checks it too,
+	// but only to keep 4 Hz × ten bots of refusals out of the log — not as the enforcement.)
+	//
+	// VERBOSE, not Log: during a five second warm-up this is re-entered a few hundred times.
+	if (bEnforceRoster && IsBot() && IsBotFillHeldForWarmup(this))
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Ability] %s (bot) asked for %s — HELD, the match has not started yet (spec v28 §9b: "
+			     "everyone who joins during warm-up picks from a full roster)."),
+			*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(NewCharacter));
+		return;
+	}
+
 	// PER-TEAM UNIQUENESS. Spec v14 §3: "Do not allow players to select a character who has already
 	// been chosen by a player on their team", and spec v15 §2 extends it verbatim to bots: "no two
 	// should be able to pick the same characters". FIRST REQUEST WINS — this runs on the server, so
@@ -296,7 +384,58 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 	// player state on the team, and a bot is a player state.
 	if (bEnforceRoster)
 	{
-		if (const APlayerState* Holder = FindTeammateHolding(this, GetTeam(), NewCharacter))
+		APlayerState* Holder = FindTeammateHolding(this, GetTeam(), NewCharacter);
+
+		// ---- SPEC v28 §9b(b): A HUMAN PREEMPTS A BOT --------------------------------------------
+		//
+		// "When a human takes a character a bot holds, the bot gives it up and picks another." THIS
+		// IS THE DURABLE HALF OF §9b — the warm-up hold only covers people who are already connected
+		// when the whistle goes, and a client that finishes loading mid-match is past it. Uniqueness
+		// is not weakened: the roster is still conflict-free after this runs, because the bot is set
+		// to None BEFORE the human is recorded, so the character is held by exactly one player at
+		// every point in between.
+		//
+		// The yield is a plain ServerSetCharacter(None) on the bot's own component — the documented
+		// always-allowed clear — so it goes through the same single writer everything else does and
+		// cannot be refused halfway. The bot then has no character, which is precisely the state
+		// ATraceGameMode::PollCharacterSelect fills, and it re-picks on the next 4 Hz pass under the
+		// ordering rule (i.e. after any human on the team who is STILL choosing has settled).
+		//
+		// TERMINATION. A human locks in exactly once (ATraceGameMode::RequestCharacter refuses a
+		// second request with AlreadyLocked), so each human can cause at most one yield; bots never
+		// preempt; and a bot that yields always has somewhere to go, because ten characters against
+		// PlayersPerTeam of five leaves at least five free. There is no cycle to get stuck in.
+		if (Holder != nullptr)
+		{
+			if (APlayerState* Yielding = FindYieldingBotHolding(GetOwningPlayerState(), NewCharacter))
+			{
+				if (UTraceAbilityComponent* BotAbilities = Get(Yielding))
+				{
+					BotAbilities->ServerSetCharacter(ETraceCharacterId::None);
+				}
+
+				// The bot's SELECT SESSION is reset alongside its character (not opened — a bot
+				// never gets a screen). Without this it would stay flagged LOCKED to a character it
+				// no longer holds, and the scoreboard reads that flag.
+				if (ATracePlayerState* YieldingTraceState = Cast<ATracePlayerState>(Yielding))
+				{
+					YieldingTraceState->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Ability] %s (human) PREEMPTS bot %s for %s — spec v28 §9b: every human picks "
+					     "before any bot. The bot re-picks from what is left."),
+					*GetNameSafe(GetOwningPlayerState()), *GetNameSafe(Yielding),
+					TraceCharacterIdToString(NewCharacter));
+
+				// Re-read rather than assume. The clear above is the one call that could in principle
+				// be a no-op (a component that vanished mid-frame), and granting a character a bot is
+				// still holding would be exactly the roster conflict this whole block exists to stop.
+				Holder = FindTeammateHolding(this, GetTeam(), NewCharacter);
+			}
+		}
+
+		if (Holder != nullptr)
 		{
 			UE_LOG(LogTraceGame, Log,
 				TEXT("[Ability] %s asked for %s — REFUSED, teammate %s already holds it (per-team uniqueness, spec §3)."),
@@ -1063,6 +1202,114 @@ bool UTraceAbilityComponent::AreHumansOnTeamSettled(const UObject* WorldContextO
 	}
 
 	return true;
+}
+
+bool UTraceAbilityComponent::IsBotFillHeldForWarmup(const UObject* WorldContextObject)
+{
+#if !UE_BUILD_SHIPPING
+	// THE RED ARM for this rule alone. See the block at the top of this file.
+	if (GTraceHoldBotFillForWarmup == 0 || IsWarmupHoldArmedOff())
+	{
+		return false;
+	}
+#endif
+
+	const UWorld* WorldPtr = (WorldContextObject != nullptr) ? WorldContextObject->GetWorld() : nullptr;
+	const ATraceGameState* TraceState = (WorldPtr != nullptr) ? WorldPtr->GetGameState<ATraceGameState>() : nullptr;
+	if (TraceState == nullptr)
+	{
+		// No GameState to read a phase off. NOT held — the opposite direction from
+		// AreHumansOnTeamSettled's, and deliberately so. That predicate is answering "is there
+		// somebody to wait for", where guessing "yes" costs one quarter-second poll. This one is
+		// answering "is there a match to wait for", where guessing "yes" against a world that has no
+		// GameState at all is how a bot ends up a Mannequin with nothing left to release it. The
+		// practice range and any future mode that never leaves WaitingForPlayers rely on this.
+		return false;
+	}
+
+	if (TraceState->TraceMatchState != ETraceMatchState::WaitingForPlayers)
+	{
+		return false;   // the whistle has gone (or the match is over). Nothing left to hold a roster for.
+	}
+
+	// *** THE BOUND, AND WHY IT IS NOT A NEW NUMBER. ***
+	//
+	// While WaitingForPlayers, MatchEndServerTime IS the warm-up deadline — ATraceGameMode::
+	// StartWarmup writes GetServerWorldTimeSeconds() + UTraceSettings::WarmupDuration into it, and
+	// the HUD already draws the countdown from it. Reading it here rather than storing a duration of
+	// our own is what makes this hold RELATIVE to the warm-up: change WarmupDuration in
+	// Config/DefaultGame.ini and the pick window moves with it, with nothing to keep in step.
+	//
+	// Zero means no countdown is running: MinPlayersToStart has not been met, or CancelWarmup zeroed
+	// it when somebody left. NOT held — there is no imminent match whose roster is worth protecting,
+	// and holding on "the lobby might fill up eventually" is the one shape of this rule that could
+	// leave a bot a Mannequin with nothing scheduled to release it.
+	const float WarmupDeadline = TraceState->MatchEndServerTime;
+	if (WarmupDeadline <= 0.f)
+	{
+		return false;
+	}
+
+	// The comparison, not a timer: even if BeginMatch never fires — its timer cleared, the phase
+	// machine wedged, a mode that overrides it — the deadline still passes and the hold still ends.
+	return TraceState->GetServerWorldTimeSeconds() < static_cast<double>(WarmupDeadline);
+}
+
+APlayerState* UTraceAbilityComponent::FindYieldingBotHolding(const APlayerState* ForPlayerState,
+                                                             ETraceCharacterId Candidate)
+{
+	if (Candidate == ETraceCharacterId::None || ForPlayerState == nullptr)
+	{
+		return nullptr;
+	}
+
+#if !UE_BUILD_SHIPPING
+	// THE RED ARM for this rule alone. Null here is exactly the pre-v28 world: nothing yields, so
+	// ATraceGameMode::RequestCharacter's pre-flight refuses the human with TakenByTeammate.
+	if (GTraceBotPreempt == 0 || IsBotPreemptArmedOff())
+	{
+		return nullptr;
+	}
+#endif
+
+	const ATracePlayerState* AsTraceState = Cast<ATracePlayerState>(ForPlayerState);
+	if (AsTraceState == nullptr || AsTraceState->Team == ETraceTeam::None)
+	{
+		return nullptr;
+	}
+
+	// ONLY A HUMAN PREEMPTS. Spec v28 §9b(b) is "every human picks before any bot"; a bot taking a
+	// character off another bot is churn with no rule behind it, and — because the fill runs at 4 Hz
+	// — churn that would never settle.
+	if (AsTraceState->IsABot())
+	{
+		return nullptr;
+	}
+
+	APlayerState* Holder = FindTeammateHolding(ForPlayerState, AsTraceState->Team, Candidate);
+	if (Holder == nullptr || Holder == ForPlayerState)
+	{
+		return nullptr;
+	}
+
+	// A HUMAN TEAM-MATE KEEPS IT. Spec v14 §3's "first request wins" is untouched by §9b: the loser
+	// of a race between two people is still told, and still re-picks.
+	return Holder->IsABot() ? Holder : nullptr;
+}
+
+bool UTraceAbilityComponent::IsCharacterTakeableBy(const APlayerState* ForPlayerState, ETraceCharacterId Candidate)
+{
+	return IsCharacterAvailableFor(ForPlayerState, Candidate)
+	    || (FindYieldingBotHolding(ForPlayerState, Candidate) != nullptr);
+}
+
+bool UTraceAbilityComponent::DoBotsYieldToHumans()
+{
+#if !UE_BUILD_SHIPPING
+	return (GTraceBotPreempt != 0) && !IsBotPreemptArmedOff();
+#else
+	return true;
+#endif
 }
 
 #if !UE_BUILD_SHIPPING

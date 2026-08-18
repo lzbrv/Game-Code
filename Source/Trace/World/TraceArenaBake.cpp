@@ -393,7 +393,13 @@ void ATraceArenaBuilder::AdoptBakedArena()
 		const float HalfY = HalfWidth();
 		const float Depth = ClampedEndzoneDepth();
 		const float Radius = GoalRingRadius();
-		const float SlabDepth = FMath::Clamp(GoalRingDepth, 60.f, Depth);
+
+		// Spec v28 §8: the goal slab straddles the ring plane, so its half extent along X is
+		// GoalSlabHalfDepth() and not "half of GoalRingDepth clamped to the endzone". Asked of the same
+		// function BuildGoals sizes the live volume with, because the whole point of this block is to
+		// tell a placed shape apart from the one this builder would make - and a second copy of the
+		// arithmetic would report every correctly baked goal as an edit somebody made by hand.
+		const float SlabHalfDepth = GoalSlabHalfDepth();
 
 		// 1 uu. Big enough to swallow float round-tripping through a package, far smaller than any
 		// edit a person makes by dragging a box handle.
@@ -413,7 +419,7 @@ void ATraceArenaBuilder::AdoptBakedArena()
 			if (bTaggedGoal || bTaggedEndzone)
 			{
 				const FVector Expected = bTaggedGoal
-					? FVector(SlabDepth * 0.5f, Radius, Radius)
+					? FVector(SlabHalfDepth, Radius, Radius)
 					: FVector(Depth * 0.5f, HalfY, WallHeight * 0.5f);
 				const float ExpectedRadius = bTaggedGoal ? Radius : 0.f;
 

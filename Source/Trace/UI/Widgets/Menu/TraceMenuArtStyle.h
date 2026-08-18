@@ -53,14 +53,28 @@
 // rounded corner into an oval, so the frame is drawn as a Slate Box brush: the four corners are drawn
 // at a fixed size and only the flat middle stretches.
 //
-// A Box brush's corner size is Margin * Brush.ImageSize, so ImageSize is not decoration — it is what
-// decides how big the corner comes out. FrameImageSize() derives it from the height the plate is
-// asked to be, at the sheet's own aspect ratio, which is the only way the corner stays the shape the
-// artist drew at every row size.
+// *** CORRECTED IN SPEC v28 §1, AFTER MEASURING IT: A BOX BRUSH'S CORNER SIZE IS NOT Margin *
+// ImageSize. *** It is Margin * the TEXTURE'S OWN PIXEL SIZE — SlateCore's ElementBatcher.cpp,
+// AddBoxElement, `LeftMarginX = TextureWidth * Margin.Left`. ImageSize decides the brush's DESIRED
+// size and takes no part in the slicing at all. Everything below that derives an ImageSize from the
+// row height is therefore doing nothing to the corner; it is left in place because it is still the
+// brush's desired size and removing it is a change to widget layout, not to this measurement.
 //
-// All four measurements below were taken off the sheet, row by row, not eyeballed. They are mirrored
-// in Scripts/slice-ui-assets.py (which cuts to them) and in Scripts/generate-menu-widgets.py (which
-// authors the brushes from them). Change one and change all three.
+// The consequence is real and is on screen. This plate's texture is 512 x 153, so its slices are
+// 44 x 44 local units at every row height and every DPI scale, while the plate image at RowHeight 60
+// is only 72.5 units tall. 44 + 44 does not fit, Slate's own overlap guard squashes both vertical
+// slices to 36.24, and the artist's circular corner is drawn as an ellipse — 28 wide by 23.03 tall,
+// a vertical squash of 0.8226. ResolvePlateSilhouette() below is the arithmetic that says so, and
+// what would remove it is a smaller SOURCE TEXTURE (about 256 x 77 for this plate, same art), whose
+// 22 px slices fit in the 36.24 available.
+//
+// The first four measurements below were taken off the sheet, row by row, not eyeballed. They are
+// mirrored in Scripts/slice-ui-assets.py (which cuts to them) and in Scripts/generate-menu-widgets.py
+// (which authors the brushes from them). Change one and change all three.
+//
+// Edge and Corner, added by spec v28 §1, are NOT mirrored anywhere and must not be: they are measured
+// off the IMPORTED SPRITE's alpha rather than authored into it, so nothing downstream consumes them.
+// They describe the art; the first four decide it.
 
 #pragma once
 
@@ -288,8 +302,50 @@ namespace TraceMenuArtStyle
 		/** Sheet pixels from the sprite's edge to where the corner curve is fully open. */
 		float Cap = 0.f;
 
+		/**
+		 * Sheet pixels from the sprite's edge to the plate's own 50%-ALPHA edge — i.e. to the line a
+		 * viewer would point at and call the edge of the button.
+		 *
+		 * NOT the same number as Glow, and the difference is why it is measured rather than assumed.
+		 * Glow is the CROP: how much halo Scripts/slice-ui-assets.py kept outside the nominal plate
+		 * rectangle, and it is the number the widget generator offsets the plate image by. The artist's
+		 * plate edge is soft over about ten sheet pixels, so the half-coverage contour — where the
+		 * silhouette visually is — sits a little inside the nominal edge.
+		 *
+		 * MEASURED off Content/Trace/UI/Art/Source/T_MenuBtn_Default.png (512 x 153, the imported
+		 * sprite), by taking the alpha's 0.5 crossing along the flat middle of each side and scaling by
+		 * the sheet/sprite ratio: left 122.7, right 122.0, top 122.6, bottom 122.9 sheet px. The same
+		 * pass recovers the plate as 4724.6 x 1230.8 sheet px, which is the 4723 x 1230 above to within
+		 * a fifth of a sprite pixel — so the two measurements agree and only this one is new.
+		 *
+		 * Zero means "not measured for this frame"; ResolvePlateSilhouette() falls back to Glow.
+		 */
+		float Edge = 0.f;
+
+		/**
+		 * The plate's CORNER RADIUS, in sheet pixels. Not Cap: Cap is the 9-slice margin, deliberately
+		 * cut wider than the corner so the arc is safely inside the slice.
+		 *
+		 * MEASURED, and it is a genuine circular arc rather than a squircle — which is worth knowing,
+		 * because a Slate rounded box can only draw circular corners and could not have followed a
+		 * superellipse at any radius. Fitting the 0.5-alpha contour of all four corners of
+		 * T_MenuBtn_Default.png gives 28.04 / 27.96 / 28.04 / 27.98 sprite px at an RMS residual of
+		 * 0.05 px, and a free superellipse exponent lands on 2.00. 28.0 sprite px is 272.4 sheet px,
+		 * which is 0.2211 of the plate's height.
+		 *
+		 * Zero means "not measured"; ResolvePlateSilhouette() falls back to Cap - Glow, which is what
+		 * this file used to assume the corner was (300 sheet px — 10% too round).
+		 */
+		float Corner = 0.f;
+
 		float SpriteW() const { return PlateW + Glow * 2.f; }
 		float SpriteH() const { return PlateH + Glow * 2.f; }
+
+		/** Edge, or Glow when nobody has measured this frame's silhouette. */
+		float EdgeOrGlow() const { return (Edge > 0.f) ? Edge : Glow; }
+
+		/** Corner, or the pre-measurement assumption, when nobody has measured this frame. */
+		float CornerOrCap() const { return (Corner > 0.f) ? Corner : FMath::Max(0.f, Cap - Glow); }
 
 		/** Slate Box-brush margin, normalised, which is what Slate wants. */
 		FMargin BrushMargin() const
@@ -309,9 +365,11 @@ namespace TraceMenuArtStyle
 		/**
 		 * Brush ImageSize for a plate drawn @p InPlateHeightOnScreen tall.
 		 *
-		 * This is the number that decides the corner's on-screen size (Slate draws each corner at
-		 * Margin * ImageSize). Deriving it from the sheet's aspect ratio is what keeps the corner
-		 * circular instead of oval at every row width.
+		 * *** THIS DOES NOT DECIDE THE CORNER'S SIZE. *** It used to say it did; spec v28 §1 measured
+		 * it and it does not. Slate slices a Box brush against the TEXTURE's pixel size, not against
+		 * ImageSize — see the block at the top of this file. What ImageSize still does is give the
+		 * brush a desired size, which is what an auto-sized slot would lay out to, so it is derived at
+		 * the sheet's own aspect ratio and kept.
 		 */
 		FVector2D ImageSize(float InPlateHeightOnScreen) const
 		{
@@ -323,11 +381,107 @@ namespace TraceMenuArtStyle
 	/**
 	 * The wide button. Plate 4723 x 1230; the corner is fully open 300 rows down; the amber hover ring
 	 * sits 34 px out and its halo is gone by ~108, so 128 px of glow keeps all of it.
+	 *
+	 * The last two are spec v28 §1's measurement of the DEFAULT plate's actual silhouette — see Edge
+	 * and Corner above. They are the numbers a stroke has to follow to hug this button.
 	 */
-	static const FSpriteFrame ButtonFrame = { 4723.f, 1230.f, 128.f, 428.f };
+	static const FSpriteFrame ButtonFrame = { 4723.f, 1230.f, 128.f, 428.f, 122.6f, 272.4f };
 
-	/** The chip beside a slider. Ring 1034 x 538 inside a 1154 x 656 crop, corner open by 60 rows. */
+	/**
+	 * The chip beside a slider. Ring 1034 x 538 inside a 1154 x 656 crop, corner open by 60 rows.
+	 *
+	 * Edge and Corner are deliberately UNMEASURED: nothing draws a stroke against this frame, and a
+	 * number nobody has checked is worse than an honest fallback. Measure them the way ButtonFrame's
+	 * were if a chip ever needs an outline.
+	 */
 	static const FSpriteFrame ValueFrame = { 1034.f, 538.f, 60.f, 150.f };
+
+	// =============================================================================================
+	// SPEC v28 §1 — WHERE A 9-SLICED PLATE'S SILHOUETTE ACTUALLY LANDS
+	// =============================================================================================
+	//
+	//     "Change the white outline to 1px and make sure it hugs the buttons, right now it looks
+	//      terrible."
+	//
+	// IT DID NOT HUG BECAUSE THE ROW RECTANGLE IS NOT THE PLATE. Spec v26 §7 anchored the stroke to
+	// the row's own rect, on the reasoning that WBP_MenuRow pushes the plate image outward by exactly
+	// the glow overhang so the plate lands back on that rect. That reasoning has one wrong step in it,
+	// and the gap it leaves is measurable: on the shipped 1920x1080 capture the stroke runs down
+	// x = 600..601 and the navy plate does not begin until x = 607 — five pixels of pure background
+	// between the line and the button it is supposed to be drawn around, with the same thing 4 px deep
+	// at the top and bottom.
+	//
+	// THE WRONG STEP IS THAT SLATE DOES NOT SIZE A BOX BRUSH'S CORNERS FROM ImageSize. It sizes them
+	// from the TEXTURE'S OWN PIXEL SIZE (SlateCore's ElementBatcher.cpp, AddBoxElement:
+	// `LeftMarginX = TextureWidth * Margin.Left`). ImageSize decides the widget's DESIRED size and
+	// nothing else here. So the plate's 9-slice corners are drawn 44 x 44 LOCAL UNITS — 512 x 0.0860
+	// and 153 x 0.2880 — no matter how tall the row is or what DPI scale it is being drawn at.
+	//
+	// AND AT A 60-UNIT ROW THAT DOES NOT FIT. The plate image is RowHeight plus two glow insets tall,
+	// i.e. 72.5 local units, and the top and bottom slices want 44 each. Slate's own overlap guard
+	// then fires — `if (BottomMarginY < TopMarginY) { TopMarginY = LocalSize.Y / 2; ... }` — and
+	// squashes both slices to 36.24. Two things follow, and both are visible:
+	//
+	//   * the plate's edges move INWARD from the row rect: 6.92 local units on the left and right,
+	//     4.60 on the top and bottom. That is the gap above;
+	//   * the artist's circular 28-px corner is drawn as an ELLIPSE, 28 wide by 23.03 tall, because
+	//     the vertical slice is compressed by 36.24/44.06 = 0.8226 and the horizontal one is not.
+	//
+	// Neither number moves with the resolution — they are local units, and the DPI scale multiplies
+	// the row and the plate together — so this is one shape to follow, not one per screen.
+	//
+	// THIS FUNCTION IS THAT ARITHMETIC, restated from Slate's own source so a stroke can be laid on
+	// the answer instead of on a guess. It is deliberately not a table of the numbers above: feed it
+	// the live brush and the live slot and it follows a re-slice, a different row height, or a fixed
+	// generator with no edit here. If the squash ever stops happening, Squash() returns 1 and the
+	// caller's ellipse quietly becomes the circle it should always have been.
+
+	/** Where a plate's own silhouette lands, in the local units of the rectangle it was measured in. */
+	struct FPlateSilhouette
+	{
+		/** False when the inputs could not describe a plate; the caller must draw nothing. */
+		bool bValid = false;
+
+		FVector2D Min = FVector2D::ZeroVector;
+		FVector2D Max = FVector2D::ZeroVector;
+
+		/** The drawn corner, which is an ellipse whenever Slate has squashed one of the slices. */
+		double RadiusX = 0.0;
+		double RadiusY = 0.0;
+
+		/**
+		 * False when the corner arc runs past the end of its 9-slice and into the stretched middle. The
+		 * corner is then not an ellipse either and no rounded box can follow it — worth saying out loud
+		 * rather than drawing a shape that is wrong in a way nobody can name.
+		 */
+		bool bCornerInsideSlice = true;
+
+		FVector2D Size() const { return Max - Min; }
+		FVector2D Center() const { return (Min + Max) * 0.5; }
+
+		/** RadiusY / RadiusX. 1.0 when the artist's circular corner is being drawn as a circle. */
+		double Squash() const
+		{
+			return (RadiusX > UE_DOUBLE_KINDA_SMALL_NUMBER) ? (RadiusY / RadiusX) : 1.0;
+		}
+	};
+
+	/**
+	 * Resolve @p InFrame's silhouette inside the rectangle its sprite is drawn in.
+	 *
+	 * @param InFrame        the sheet geometry of the plate being drawn.
+	 * @param InImageMin     top-left of the IMAGE WIDGET's rect (not the plate's), in any one space.
+	 * @param InImageMax     bottom-right of the same rect, in the same space.
+	 * @param InTextureSize  the imported texture's pixel size. This is what Slate slices with.
+	 * @param InBrushMargin  the brush's normalised Box margin, straight off the brush.
+	 * @return the plate's rect and drawn corner radii, in the space @p InImageMin was given in.
+	 */
+	TRACE_API FPlateSilhouette ResolvePlateSilhouette(
+		const FSpriteFrame& InFrame,
+		const FVector2D& InImageMin,
+		const FVector2D& InImageMax,
+		const FVector2D& InTextureSize,
+		const FMargin& InBrushMargin);
 
 	// =============================================================================================
 	// THE POINTER'S OWN GEOMETRY — named ONCE (spec v24 §0, applied to this area)

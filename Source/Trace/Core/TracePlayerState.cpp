@@ -182,6 +182,11 @@ uint8 ATracePlayerState::GetSelectedCharacter() const
 	return TraceCharacterRoster::NoneId;
 }
 
+bool ATracePlayerState::DoBotsYieldToHumans()
+{
+	return UTraceAbilityComponent::DoBotsYieldToHumans();
+}
+
 float ATracePlayerState::GetActivatedCooldownRemaining() const
 {
 	if (const UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(this))

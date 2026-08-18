@@ -2496,42 +2496,71 @@ namespace TraceMovementAuditV16
 
 		// --- THE ONE VERDICT THE NOTE ASKS FOR --------------------------------------------------
 		//
-		// "if you do three slide jump boosts in a row you can zip down the whole field [...] cap it at
-		// what the momentum is after you do two consecutive slide boosts."
+		// v26 §3b: "if you do three slide jump boosts in a row you can zip down the whole field [...]
+		// cap it at what the momentum is after you do two consecutive slide boosts."
 		//
-		// So: hop 3 must not be faster than hop 2. Expressed as a comparison of two MEASURED numbers
-		// rather than against a derived expectation, because that is exactly what the sentence says
-		// and because both sides of it come off the same run.
-		const bool bHaveThree = State.bValid[1] && State.bValid[2];
-		if (!bHaveThree)
+		// *** THE VERDICT IS DERIVED FROM THE CEILING KNOB, NOT FROM A TYPED 2. ***
+		// v26 shipped SlideJumpChainCapBoosts = 2, so this row read "hop 3 <= hop 2" as a pair of
+		// literals. SPEC v28 §5 moves the knob to 3 — "Change consecutive chain ceiling slide boosts
+		// to 3" — and a literal 2 here would have turned a correct game into a FAILING harness on the
+		// day the designer moved a slider, which is the "the slider moves nothing / the harness
+		// measures nothing" failure this project has shipped before wearing the other hat.
+		//
+		// So the rule is stated once, in the knob's own terms: with a ceiling of N boosts, hops 1..N
+		// launch freely and every hop after them must not exceed the FASTEST of those first N. The
+		// ceiling row therefore names which hop it is comparing on every run, and the same code is
+		// correct at N = 1, 2, 3 or 8.
+		const int32 CapBoosts = FMath::Max(1, Move->GetSlideJumpChainCapBoostsForAudit());
+
+		// The fastest of the chain's first N, measured — the same quantity the movement component
+		// records as SlideJumpChainCeiling, recomputed here from this run's own rows so the harness
+		// never has to trust the number it is auditing.
+		float CeilingFromFirstN = 0.f;
+		int32 CeilingHop = INDEX_NONE;
+		for (int32 Hop = 0; Hop < FMath::Min(CapBoosts, FSlideChainState::MaxHops); ++Hop)
 		{
-			RowInvalid(TEXT("v26 §3b third hop <= second"),
-				TEXT("fewer than three hops completed — nothing to compare"));
+			if (State.bValid[Hop] && State.Launch[Hop] > CeilingFromFirstN)
+			{
+				CeilingFromFirstN = State.Launch[Hop];
+				CeilingHop = Hop;
+			}
 		}
-		else
+
+		// A percent of slack, not zero: the launch is sampled on the first airborne frame, so at
+		// 60 Hz two hops of an identical chain can differ by the fraction of a frame the physics
+		// step landed on.
+		const float Slack = 0.01f;
+		int32 CappedRowsPrinted = 0;
+
+		for (int32 Hop = CapBoosts; Hop < FSlideChainState::MaxHops; ++Hop)
 		{
-			// A percent of slack, not zero: the launch is sampled on the first airborne frame, so at
-			// 60 Hz two hops of an identical chain can differ by the fraction of a frame the physics
-			// step landed on.
-			const float Slack = 0.01f;
-			const bool bCapped = State.Launch[2] <= State.Launch[1] * (1.f + Slack);
+			const FString RowName = FString::Printf(TEXT("v26 §3b hop %d <= ceiling (cap %d)"), Hop + 1, CapBoosts);
+
+			if (!State.bValid[Hop] || CeilingHop == INDEX_NONE)
+			{
+				RowInvalid(*RowName, TEXT("that hop, or the ceiling hop it is compared against, was never taken"));
+				continue;
+			}
+
+			++CappedRowsPrinted;
+			const bool bCapped = State.Launch[Hop] <= CeilingFromFirstN * (1.f + Slack);
 			UE_LOG(LogTraceGame, Display,
-				TEXT("AUDITV16 | %-34s | hop2 %8.1f  hop3 %8.1f uu/s | %-4s | %s"),
-				TEXT("v26 §3b third hop <= second"), State.Launch[1], State.Launch[2],
+				TEXT("AUDITV16 | %-34s | ceiling (hop %d) %8.1f  hop%d %8.1f uu/s | %-4s | %s"),
+				*RowName, CeilingHop + 1, CeilingFromFirstN, Hop + 1, State.Launch[Hop],
 				bCapped ? TEXT("PASS") : TEXT("FAIL"),
 				Move->IsSlideJumpChainCapEnabledForAudit()
 					? TEXT("ceiling ON — a FAIL here is the ceiling not working")
 					: TEXT("ceiling OFF (RED arm) — a PASS here means the harness measured nothing"));
 		}
 
-		if (State.bValid[1] && State.bValid[3])
+		if (CappedRowsPrinted == 0)
 		{
-			const float Slack = 0.01f;
-			const bool bCapped = State.Launch[3] <= State.Launch[1] * (1.f + Slack);
-			UE_LOG(LogTraceGame, Display,
-				TEXT("AUDITV16 | %-34s | hop2 %8.1f  hop4 %8.1f uu/s | %-4s |"),
-				TEXT("v26 §3b fourth hop <= second"), State.Launch[1], State.Launch[3],
-				bCapped ? TEXT("PASS") : TEXT("FAIL"));
+			// N >= MaxHops. Four hops cannot demonstrate a ceiling that only bites on the fifth, and
+			// saying so is the honest report — a run with no capped hop in it is not a green run.
+			RowInvalid(*FString::Printf(TEXT("v26 §3b ceiling (cap %d)"), CapBoosts),
+				TEXT("the ceiling allows at least as many boosts as this harness takes — no hop in this "
+				     "run is past the cap, so nothing here tests the ceiling. Lower the knob or extend "
+				     "FSlideChainState::MaxHops."));
 		}
 
 		UE_LOG(LogTraceGame, Display,

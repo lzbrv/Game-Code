@@ -130,7 +130,12 @@ public:
 	//
 	// Authored by Scripts/generate-menu-widgets.py, editable in the editor afterwards. They are
 	// Box-draw brushes with the margin and image size TraceMenuArtStyle::ButtonFrame derives, which is
-	// what lets one 512 px texture be a 720-wide row without the corner going oval.
+	// what lets one 512 px texture be a 720-wide row without the corner stretching with the width.
+	//
+	// It is NOT what keeps the corner circular, and this comment used to claim it was. Spec v28 §1
+	// measured the drawn plate: Slate slices a Box brush against the texture's own pixel size rather
+	// than against the brush's ImageSize, the slices do not fit in a 60-unit row, and the corner is
+	// drawn as an ellipse 28 x 23.03. TraceMenuArtStyle.h has the derivation and what would fix it.
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Menu Row|Art")
 	FSlateBrush PlateDefaultBrush;
@@ -153,40 +158,54 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Menu Row|Art")
 	bool bLabelIsSprite = false;
 
-	// ---- SPEC v26 §7: A 2 PX WHITE OUTLINE ON THE DEFAULT (NON-HOVER) STATE -------------------------
+	// ---- SPEC v28 §1: A 1 PX WHITE OUTLINE THAT HUGS THE PLATE --------------------------------------
 	//
-	//     "Add a 2pixel white outline to the default button state (non-hover)"
+	//     "Change the white outline to 1px and make sure it hugs the buttons, right now it looks
+	//      terrible. If you can't do just say it and I'll make new assets"
 	//
-	// THE WIDTH IS IN *DEVICE* PIXELS, AND THAT IS THE WHOLE OF THE INTERESTING PART.
+	// Spec v26 §7 added this stroke at 2 px and anchored it to the ROW's rectangle. Both halves of the
+	// complaint are real and they have different causes; the full derivation of each is in the .cpp,
+	// above MakeDefaultOutlineBrush, and the geometry half is in TraceMenuArtStyle.h.
 	//
-	// This widget is authored in a 1080-tall reference space and UMG scales it by the viewport's DPI
-	// factor before it reaches the screen — the engine's default curve (BaseEngine.ini's
-	// UIScaleCurve, keyed on the shortest side) is 0.666 at 720p, 1.0 at 1080p, 1.333 at 1440p and
-	// 2.0 at 2160p. A Slate rounded box's outline Width is in LOCAL units, so a constant 2 written
-	// here would draw 1.3 px at 720p, 2 px at 1080p and 4 px on a 4K display: precisely the "collapses
-	// to 1 px / bloats on 4K" failure §7 asks to be avoided, and precisely the kind of thing that
-	// looks right on the machine it was authored on.
+	// THE WIDTH IS IN *DEVICE* PIXELS. This widget is authored in a 1080-tall reference space and UMG
+	// scales it by the viewport's DPI factor before it reaches the screen — the engine's default curve
+	// (BaseEngine.ini's UIScaleCurve, keyed on the shortest side) is 0.666 at 720p, 1.0 at 1080p,
+	// 1.333 at 1440p and 2.0 at 2160p. A Slate rounded box's outline Width is in LOCAL units, so a
+	// constant 1 written here would draw 0.67 px at 720p and 2 px on a 4K display.
 	//
-	// So the number below is what the OWNER asked for — a width in the pixels they can count in a
-	// screenshot — and the local width is derived from it at draw time by dividing by the live layout
-	// scale. Spec v24 §0's standing rule, applied to a unit rather than to a colour: the value that
-	// modifies the base is stored RELATIVE to the base (here: relative to the DPI scale), so it
-	// follows when the base moves rather than having to be re-tuned per resolution.
+	// DIVIDING BY THE DPI SCALE IS NOT ENOUGH, and that is what v26 did. It holds the WIDTH but not
+	// the OPACITY: a rounded box's edge is antialiased over a fixed ±1 unit of its OWN local space
+	// (SlateShaderCommon.ush, GetRoundedBoxElementColorInternal: `bi_spread = 1.0`), so shrinking the
+	// local width to hold the device width constant shrinks the stroke against a ramp that does not
+	// shrink with it. Measured at 1080p, where both approaches put the same ~1 device px on screen,
+	// this one peaks at 234/255 and v26's at 215/255; at 4K v26's local width would be half again.
 	//
-	// The CORNER RADIUS goes the other way on purpose and is not a knob: it is a fraction of the row's
-	// height derived from the artist's own plate geometry (TraceMenuArtStyle::ButtonFrame), because
-	// the corner is part of the button's SHAPE and must scale with it, while the stroke is part of the
-	// button's finish and must not. See OutlineCornerRadius() in the .cpp.
+	// So the stroke is drawn in a widget whose LOCAL SPACE IS DEVICE PIXELS — a slot sized by the
+	// layout scale and a render transform of its inverse — and then the width below is literally the
+	// brush's width and the antialiasing ramp is one pixel wide at every resolution. Measured peak:
+	// 232 / 234 / 229 at 720p / 1080p / 4K. Spec v24 §0's standing rule, applied to a unit: the value
+	// that modifies the base is stored RELATIVE to the base (here: relative to the DPI scale) rather
+	// than re-tuned per resolution.
+	//
+	// The CORNER RADIUS is not a knob at all. It is whatever the artist's plate is actually being
+	// drawn with this frame — see TraceMenuArtStyle::ResolvePlateSilhouette, which restates Slate's
+	// own 9-slice arithmetic so the stroke can follow the plate instead of a number typed beside it.
 
 	/**
-	 * The outline's width in DEVICE pixels, at every resolution. §7 asks for 2.
+	 * The outline's width in DEVICE pixels, at every resolution. §1 asks for 1.
 	 *
 	 * EditAnywhere so it can be A/B'd in the editor without a rebuild; 0 switches the outline off,
-	 * which is also the red arm for this feature.
+	 * which is also the simplest red arm for this feature.
+	 *
+	 * NOT quite uniform around the shape, and the .cpp says why in full: the plate's drawn corner is
+	 * an ellipse, so the stroke that follows it is this width times sqrt(RadiusY/RadiusX) on the two
+	 * long horizontal edges and this width divided by the same factor on the two short vertical ones —
+	 * 0.91 px and 1.10 px for a 1 px request at today's geometry. The moment the plate's corner is
+	 * drawn round, both collapse to exactly this number.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Menu Row|Art",
 		meta = (ClampMin = "0.0", UIMax = "8.0"))
-	float DefaultOutlineWidthPx = 2.f;
+	float DefaultOutlineWidthPx = 1.f;
 
 	/** Breaths per second of the hover glow. 0 freezes it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Menu Row")
@@ -275,7 +294,7 @@ private:
 	/** Install the five swaps. Idempotent; a failure leaves the authored text blocks drawing. */
 	void InstallAtlasLabels();
 
-	// ---- SPEC v26 §7 -------------------------------------------------------------------------------
+	// ---- SPEC v26 §7 / v28 §1 ----------------------------------------------------------------------
 	//
 	// NOT a BindWidget, and it cannot be one: BindWidget properties are bound BY NAME to widgets that
 	// exist in WBP_MenuRow, and that asset is authored by Scripts/generate-menu-widgets.py, which this
@@ -292,16 +311,28 @@ private:
 	/** Latched, like the atlas labels: one branch a frame after the first. */
 	bool bDefaultOutlineInstalled = false;
 
-	/** The local-unit width the brush currently carries, so the brush is rebuilt only when it moves. */
-	float DefaultOutlineLocalWidth = -1.f;
+	/**
+	 * The last shape actually pushed at the outline, so the slot, the transform and the brush are
+	 * rewritten only when one of them moves.
+	 *
+	 * This matters more than it looks: all three of SetBrush, SetSize and SetRenderTransform
+	 * invalidate the widget, and this runs on six rows every frame of a screen that is otherwise
+	 * completely static. Every field is in the outline's OWN local space — device pixels — so
+	 * comparing them is comparing what will be drawn rather than what was asked for.
+	 */
+	FVector2D DefaultOutlineSlotSize = FVector2D::ZeroVector;
+	FVector2D DefaultOutlineSlotPos = FVector2D::ZeroVector;
+	FVector2D DefaultOutlineRenderScale = FVector2D::ZeroVector;
+	float DefaultOutlineBrushRadius = -1.f;
+	float DefaultOutlineBrushWidth = -1.f;
 
 	/** Build the outline image and put it over the plate. Idempotent; failure is silent and harmless. */
 	void InstallDefaultOutline();
 
 	/**
-	 * Show / hide the outline and keep it 2 DEVICE pixels wide.
+	 * Show / hide the outline and lay it on the plate's own silhouette, one DEVICE pixel wide.
 	 *
-	 * @param bWanted true only in the state §7 names — the default, non-hover, enabled row.
+	 * @param bWanted true only in the state §1 names — the default, non-hover, enabled row.
 	 */
 	void ApplyDefaultOutline(bool bWanted);
 

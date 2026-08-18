@@ -97,6 +97,32 @@ namespace TraceOyster
 namespace TraceOysterPoisonFile
 {
 	/**
+	 * SPEC v28 §4's RED ARM — the v26 "someone must be on an enemy TEAM" test, restorable live.
+	 *
+	 * 0 (shipped): "someone" is anybody this poison landed on who is not Oyster himself and not his
+	 *              team-mate. A practice-range dummy (ETraceTeam::None) therefore refunds the E, and
+	 *              so does any other teamless pawn a mode might add.
+	 * 1:           the v26 test — both sides must have a team and they must differ. On the practice
+	 *              range this refuses EVERY target in the mode, which is the reported bug, and it is
+	 *              here so Trace.Oyster.EPressRepro can show it failing and then passing in one run.
+	 *
+	 * NEVER SHIP 1.
+	 */
+	static TAutoConsoleVariable<int32> CVarOysterLegacyRefundTeamTest(
+		TEXT("Trace.Oyster.LegacyRefundTeamTest"),
+		0,
+		TEXT("TEST ARM ONLY. 0 (shipped, spec v28 §4): poisoning anybody who is not Oyster and not his\n")
+		TEXT("   team-mate resets his E — including a teamless pawn such as a practice-range dummy.\n")
+		TEXT("1: the v26 test, which required the victim to be on an opposing TEAM and therefore never\n")
+		TEXT("   refunded anything in the practice range. The reported bug. Never ship 1."),
+		ECVF_Cheat);
+
+	static bool IsLegacyRefundTeamTest()
+	{
+		return CVarOysterLegacyRefundTeamTest.GetValueOnAnyThread() != 0;
+	}
+
+	/**
 	 * The refund, applied at THE ONE PLACE A POISON BEGINS.
 	 *
 	 * WHY IT LIVES IN ApplyTo AND NOT IN THE JAR. §6a says "everytime he poisons someone", and
@@ -120,32 +146,114 @@ namespace TraceOysterPoisonFile
 	 * character it is running. A poison that outlives its Oyster — he died, left, or swapped
 	 * character — must not hand whoever holds that component a free ability of a different name.
 	 */
+	/**
+	 * *** SPEC v28 §4 — EVERY REFUSAL NAMES ITSELF, OUT LOUD, AT Log. ***
+	 *
+	 * v26 shipped this function silent. When the owner reported the refund still not working there
+	 * was therefore no way to tell the three possible answers apart from a log — absent (never
+	 * called), wrong path (called and refused by one of the four guards), or fired and overwritten
+	 * (called, accepted, and the cooldown re-armed afterwards) — and those three have completely
+	 * different fixes. One line per poison is not spam: a poison is a discrete event, and the line
+	 * only exists on the authority.
+	 *
+	 * The line prints the cooldown BEFORE and AFTER the call, which is what separates "fired" from
+	 * "fired and something else undid it": if before is 20.0 and after is 0.0 and the player still
+	 * sees a running ring, the fault is downstream of here and not in this file.
+	 */
 	static void RefundPicklerForPoisoning(const ATraceCharacter* Victim, UTraceAbilityComponent* SourceComp)
 	{
+		const auto Refuse = [Victim, SourceComp](const TCHAR* Why)
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[Oyster] §6a REFUND REFUSED (%s): victim=%s source=%s"),
+				Why, *GetNameSafe(Victim), *GetNameSafe(SourceComp));
+		};
+
 		if (Victim == nullptr || SourceComp == nullptr)
 		{
+			Refuse(TEXT("no victim, or the poison has no source component"));
 			return;
 		}
 
 		// The pre-v26 arm: no refund at all. See TraceOysterJar::IsLegacyE.
 		if (TraceOysterJar::IsLegacyE())
 		{
+			Refuse(TEXT("Trace.Oyster.LegacyE is 1 — the pre-v26 arm is armed"));
 			return;
 		}
 
 		if (SourceComp->GetCharacterId() != ETraceCharacterId::Oyster)
 		{
+			Refuse(TEXT("the source component is not running Oyster"));
+			return;
+		}
+
+		// =========================================================================================
+		// *** SPEC v28 §4 — THIS TEST IS THE BUG. "Oyster's E is not resetting when he poisons
+		//     someone", reported delivered in Demo 23 and still true from the player's side. ***
+		//
+		// v26 shipped:
+		//
+		//     if (SourceTeam == None || VictimTeam == None || VictimTeam == SourceTeam) return;
+		//
+		// The middle clause is the one that fails, and it fails on the ONE fixture a player actually
+		// uses to check an ability. The practice range's five dummies are deliberately
+		// ETraceTeam::None (see TracePracticeActors.h, "WHY THE DUMMIES ARE ON ETraceTeam::None"),
+		// and the ability choke point only ever refuses a MATCHING team — so a dummy is a perfectly
+		// legal poison victim: it turns green, it takes the 3-per-half-second, it is slowed 30%.
+		// Every visible sign says "I poisoned someone". And then this line threw the refund away
+		// because the someone had no team, so the E ring kept counting down. The rule was never
+		// absent and never on the wrong path: it fired, reached here, and refused.
+		//
+		// It also explains why it was reported delivered and why Trace.Oyster.ETest is green: that
+		// harness poisons a BOT on the opposing team, which is the one victim shape the old test
+		// accepts. A harness that only ever staged the passing case could not see this.
+		//
+		// THE RULE NOW, and it keeps the whole of v26's reasoning: "someone" is ANYBODY THIS POISON
+		// ACTUALLY LANDED ON WHO IS NOT ME AND NOT MY TEAM-MATE. Written as two refusals rather than
+		// as one positive test, because the thing being guarded against is specific and stays
+		// guarded:
+		//   * SELF — poisoning yourself is not poisoning someone;
+		//   * A TEAM-MATE — this is v26's friendly-fire guard, unchanged and still the reason the
+		//     test exists at all: with bFriendlyFire on, "dash past your own team" must not become an
+		//     infinite E.
+		// Everything else — an enemy, a practice dummy, any teamless pawn a future mode adds — is
+		// somebody Oyster poisoned, because ApplyTo only reaches this line for a victim the choke
+		// point already allowed him to poison.
+		//
+		// Trace.Oyster.LegacyRefundTeamTest 1 restores the v26 test in the same binary, which is what
+		// Trace.Oyster.EPressRepro's red arm runs.
+		// =========================================================================================
+		if (Victim == SourceComp->GetOwningCharacter())
+		{
+			Refuse(TEXT("the victim is the source's own pawn"));
 			return;
 		}
 
 		const ETraceTeam SourceTeam = SourceComp->GetTeam();
 		const ETraceTeam VictimTeam = Victim->GetTeam();
-		if (SourceTeam == ETraceTeam::None || VictimTeam == ETraceTeam::None || VictimTeam == SourceTeam)
+
+		if (SourceTeam != ETraceTeam::None && VictimTeam == SourceTeam)
 		{
+			Refuse(TEXT("the victim is a team-mate (friendly fire is on) — v26's guard, unchanged"));
 			return;
 		}
 
+		if (TraceOysterPoisonFile::IsLegacyRefundTeamTest()
+			&& (SourceTeam == ETraceTeam::None || VictimTeam == ETraceTeam::None))
+		{
+			Refuse(TEXT("Trace.Oyster.LegacyRefundTeamTest is 1 — the v26 test refuses a teamless victim, "
+			            "which is every practice-range dummy. THIS IS THE REPORTED BUG."));
+			return;
+		}
+
+		const float Before = SourceComp->GetActivatedCooldownRemaining();
 		SourceComp->ServerResetActivatedCooldown(TEXT("Oyster poisoned an enemy — spec v26 §6a"));
+		const float After = SourceComp->GetActivatedCooldownRemaining();
+
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Oyster] §6a REFUND APPLIED: %s poisoned %s; E cooldown %.1fs -> %.1fs."),
+			*GetNameSafe(SourceComp->GetOwner()), *GetNameSafe(Victim), Before, After);
 	}
 }
 

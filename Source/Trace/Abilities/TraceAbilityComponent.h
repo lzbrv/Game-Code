@@ -433,12 +433,80 @@ public:
 	 */
 	static bool AreHumansOnTeamSettled(const UObject* WorldContextObject, ETraceTeam Team);
 
+	/**
+	 * AUTHORITY ONLY. SPEC v28 §9b(a) — is the bot fill still WAITING FOR THE MATCH TO START?
+	 *
+	 * THE MULTIPLAYER BUG THIS ANSWERS. AreHumansOnTeamSettled above is correct and always was; the
+	 * bug was WHEN it got asked. ATraceGameMode arms PollCharacterSelect in BeginPlay, so the first
+	 * fill happens a quarter of a second into the level — at which point a listen server's host is
+	 * the ONLY human in PlayerArray. The far team has no humans at all, so it is trivially "settled"
+	 * and its five bots take five characters immediately. Every remote player arrives through
+	 * PostLogin seconds later (map load + travel) and finds a roster the bots have already eaten,
+	 * which is exactly the owner's report: "only the host is guaranteed their pick of hero".
+	 *
+	 * So the ordering rule needs a second half: bots do not pick until the match is actually under
+	 * way, which gives everyone who joins during warm-up a full roster to pick from.
+	 *
+	 * *** IT CANNOT DEADLOCK, AND THE BOUND IS NOT A NEW KNOB. *** The hold is exactly the warm-up
+	 * countdown ATraceGameState ALREADY publishes in MatchEndServerTime — the same deadline the HUD
+	 * renders — so it releases when that deadline passes whether or not BeginMatch ever runs, and it
+	 * is never held once TraceMatchState has left WaitingForPlayers. A lobby with no countdown
+	 * running (nobody has met MinPlayersToStart, or CancelWarmup zeroed it) is not held either: there
+	 * is no imminent match to protect a roster for, and holding there is the one shape of this rule
+	 * that could strand a bot on the Mannequin. Being RELATIVE to the warm-up deadline rather than a
+	 * duration of its own also means moving UTraceSettings::WarmupDuration moves this with it.
+	 *
+	 * The DURABLE half of §9b is the preemption below, not this: a client that finishes loading
+	 * after the whistle is past this gate, and takes its pick off a bot instead.
+	 */
+	static bool IsBotFillHeldForWarmup(const UObject* WorldContextObject);
+
+	/**
+	 * AUTHORITY ONLY. SPEC v28 §9b(b) — the BOT team-mate that must give @p Candidate up so the
+	 * player owning @p ForPlayerState can have it, or null.
+	 *
+	 * Null unless every one of these is true, and each exclusion matters:
+	 *   * the asker is a HUMAN — bots never preempt, or the fill would churn the roster forever;
+	 *   * the holder is a BOT — a human team-mate who locked it in keeps it, spec v14 §3 unchanged;
+	 *   * the holder is on the asker's own team — enemies mirroring a pick is legal and blocks
+	 *     nothing, so there is nothing there to take.
+	 *
+	 * A yield can never strand the bot: the roster is ten characters and PlayersPerTeam is five, so
+	 * a team that has just released one has at least five free for the bot's next pick.
+	 */
+	static APlayerState* FindYieldingBotHolding(const APlayerState* ForPlayerState, ETraceCharacterId Candidate);
+
+	/**
+	 * AUTHORITY ONLY. May the player owning @p ForPlayerState TAKE @p Candidate?
+	 *
+	 * IsCharacterAvailableFor asks whether the character is FREE. This asks the question the select
+	 * screen and ATraceGameMode::RequestCharacter actually want after spec v28 §9b: free, OR held by
+	 * a bot team-mate that yields it. The two are deliberately separate functions — the bot fill must
+	 * keep asking "free", because a bot taking a character off another bot is churn, not a rule.
+	 */
+	static bool IsCharacterTakeableBy(const APlayerState* ForPlayerState, ETraceCharacterId Candidate);
+
+	/**
+	 * SPEC v28 §9b(b) as a bare question: does a BOT team-mate's hold yield to a human's pick?
+	 *
+	 * TRUE IN EVERY SHIPPED BUILD. It is not a gameplay setting, it is the red arm's one honest read,
+	 * and it exists because the select SCREEN has to agree with the server about this: a card the
+	 * server would hand over must not be drawn greyed out with the bot's name on it, or the rule is
+	 * enforced and unreachable. See ATracePlayerState::DoBotsYieldToHumans, which is how the UI slice
+	 * asks without taking a dependency on this header.
+	 *
+	 * READS NO WORLD STATE, which is what makes it safe to call on a client: it is a CVar and a
+	 * command-line switch, both of which a red run sets on both processes.
+	 */
+	static bool DoBotsYieldToHumans();
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * THE FRAMEWORK'S HALF OF THE SPEC v15 §2 RED ARM. Dev only, cheat-gated, absent from shipping.
 	 *
-	 * False removes the two roster rules ServerSetCharacter enforces — per-team uniqueness and the
-	 * bot ordering gate above — so ATraceGameMode's bot harness can be shown to FAIL.
+	 * False removes ALL FOUR roster rules ServerSetCharacter enforces — per-team uniqueness, the bot
+	 * ordering gate above, spec v28 §9b's warm-up hold and spec v28 §9b's human-preempts-a-bot yield
+	 * — so ATraceGameMode's bot harness can be shown to FAIL on each of them.
 	 *
 	 * IT EXISTS BECAUSE THE RULE IS ENFORCED TWICE. The v14 red arm learned this the expensive way
 	 * (see GTraceEnforceSelectRules in TraceGameMode.cpp): an arm that switched off only the game

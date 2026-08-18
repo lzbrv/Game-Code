@@ -27,7 +27,7 @@
 //   WallJump    a real fall into a real wall, then SpaceBar -> TryWallJump               (client)
 //   Bodyshot    control rotation onto an enemy's chest, then Fire -> ClientNotifyHit     (client)
 //   Headshot    control rotation onto the head SPHERE the damage model itself defines    (client)
-//   CoreTurnover  Trace.Integ.StageTurnover -> ATraceCore::RegisterTurnover              (game-side)
+//   CoreTurnover  mouse 1 while carrying -> ThrowFromHolder -> AnnounceTurnoverSound    (game-side)
 //   CorePickup  Trace.Verif.GrantCore -> ATraceCore::GrantTo -> OnRep_Carrier            (client)
 //   Parry       RightMouseButton while carrying -> ServerTryBeginParry                   (game-side)
 //   ButtonPress Escape, then Enter on a pause-menu row -> ActivateSelected               (client)
@@ -107,9 +107,13 @@ namespace TraceAudioIntegFile
 		static constexpr float FireHead       =  9.60f;
 		static constexpr float WallSetup      = 11.60f;
 		static constexpr float WallJumpPress  = 11.75f;
-		static constexpr float Turnover       = 13.60f;
-		static constexpr float Pickup         = 15.60f;
-		static constexpr float Parry          = 17.00f;
+		// SPEC v28 §2 SWAPPED THESE THREE ROUND. The turnover sound is no longer staged onto the
+		// ground; it is a real throw by a real carrier, so the Core has to be in the pawn's hands
+		// first (Pickup) and the parry — which refuses a non-carrier — has to happen while it is still
+		// there. The throw goes last and empties the hands, which nothing after it needs.
+		static constexpr float Pickup         = 13.60f;
+		static constexpr float Parry          = 15.60f;
+		static constexpr float Turnover       = 17.00f;
 		static constexpr float MenuOpen       = 18.80f;
 		static constexpr float MenuTop        = 19.60f;
 		static constexpr float MenuActivate   = 21.40f;
@@ -437,7 +441,7 @@ namespace TraceAudioIntegFile
 			{ TraceSoundEvents::WallJump,     TEXT("SpaceBar on a wall -> TryWallJump") },
 			{ TraceSoundEvents::Bodyshot,     TEXT("Fire at a chest -> ClientNotifyHit") },
 			{ TraceSoundEvents::Headshot,     TEXT("Fire at a head -> ClientNotifyHit") },
-			{ TraceSoundEvents::CoreTurnover, TEXT("StageTurnover -> RegisterTurnover") },
+			{ TraceSoundEvents::CoreTurnover, TEXT("mouse 1 while carrying -> ThrowFromHolder (v28 s2: the DROP)") },
 			{ TraceSoundEvents::CorePickup,   TEXT("GrantCore -> OnRep_Carrier") },
 			{ TraceSoundEvents::Parry,        TEXT("RightMouse while carrying -> ServerTryBeginParry") },
 			{ TraceSoundEvents::ButtonPress,  TEXT("Enter on a menu row -> ActivateSelected") },
@@ -652,23 +656,37 @@ namespace TraceAudioIntegFile
 			}), 0.f);
 		});
 
-		At(BaseOffset + FSchedule::Turnover, [W]()
-		{
-			UE_LOG(LogTraceGame, Display, TEXT("[AudioInteg] step 7/9: CORETURNOVER (through RegisterTurnover)."));
-			Exec(W(), TEXT("Trace.Integ.StageTurnover 450"));
-		});
-
 		At(BaseOffset + FSchedule::Pickup, [W]()
 		{
-			UE_LOG(LogTraceGame, Display, TEXT("[AudioInteg] step 8/9: COREPICKUP (through GrantTo/OnRep_Carrier)."));
+			UE_LOG(LogTraceGame, Display, TEXT("[AudioInteg] step 7/9: COREPICKUP (through GrantTo/OnRep_Carrier)."));
 			Exec(W(), TEXT("Trace.Verif.GrantCore"));
 		});
 
 		At(BaseOffset + FSchedule::Parry, [W]()
 		{
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[AudioInteg] step 9a: PARRY (right mouse, now that the pawn is carrying)."));
+				TEXT("[AudioInteg] step 8/9: PARRY (right mouse, now that the pawn is carrying)."));
 			Press(W(), TEXT("RightMouseButton"), 0.15f, TEXT("controller"));
+		});
+
+		// SPEC v28 §2 MOVED THIS STEP, AND MOVED IT LAST OF THE THREE ON PURPOSE.
+		//
+		// It used to be `Trace.Integ.StageTurnover`, which teleports a Core onto the floor and calls
+		// RegisterTurnover — the LANDING. That is exactly the edge v28 §2 takes the sound off, so a
+		// harness left pointing at it would report the fix as a missing call site.
+		//
+		// The new trigger is the owner's own: the carrier DROPS the Core. Mouse 1 while carrying is a
+		// THROW (ATraceCharacter::DoFirePressed), so this is a real key, on the real player path, into
+		// ThrowFromHolder -> AnnounceTurnoverSound.
+		//
+		// ORDER IS LOAD-BEARING, as it already was for the shots: the parry refuses a non-carrier, so
+		// the throw has to come after it or the pawn would be empty-handed when the parry step fires.
+		At(BaseOffset + FSchedule::Turnover, [W]()
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[AudioInteg] step 9/9: CORETURNOVER (mouse 1 while carrying -> the carrier DROPS ")
+				TEXT("the Core -> AnnounceTurnoverSound, spec v28 §2)."));
+			Press(W(), TEXT("LeftMouseButton"), 0.12f, TEXT("controller"));
 		});
 
 		At(BaseOffset + FSchedule::MenuOpen, [W]()

@@ -126,6 +126,110 @@ namespace TraceMenuArtStyleFile
 	}
 }
 
+TraceMenuArtStyle::FPlateSilhouette TraceMenuArtStyle::ResolvePlateSilhouette(
+	const FSpriteFrame& InFrame,
+	const FVector2D& InImageMin,
+	const FVector2D& InImageMax,
+	const FVector2D& InTextureSize,
+	const FMargin& InBrushMargin)
+{
+	FPlateSilhouette Out;
+
+	const FVector2D ImageSize = InImageMax - InImageMin;
+	if (ImageSize.X <= 1.0 || ImageSize.Y <= 1.0
+		|| InTextureSize.X <= 1.0 || InTextureSize.Y <= 1.0
+		|| InFrame.SpriteW() <= 0.f || InFrame.SpriteH() <= 0.f)
+	{
+		return Out;
+	}
+
+	// ---- Slate's own 9-slice arithmetic, and nothing else ------------------------------------------
+	//
+	// SlateCore's ElementBatcher.cpp, AddBoxElement. Kept in these variable names on purpose: the whole
+	// value of this function is that a reader can put it side by side with the engine and see that it
+	// is the same four lines plus the same two guards, rather than a plausible-looking reimplementation
+	// that drifts the first time Epic changes one of them.
+	double LeftMarginX = InTextureSize.X * InBrushMargin.Left;
+	double RightMarginX = ImageSize.X - InTextureSize.X * InBrushMargin.Right;
+	if (RightMarginX < LeftMarginX)
+	{
+		LeftMarginX = ImageSize.X * 0.5;
+		RightMarginX = LeftMarginX;
+	}
+
+	double TopMarginY = InTextureSize.Y * InBrushMargin.Top;
+	double BottomMarginY = ImageSize.Y - InTextureSize.Y * InBrushMargin.Bottom;
+	if (BottomMarginY < TopMarginY)
+	{
+		TopMarginY = ImageSize.Y * 0.5;
+		BottomMarginY = TopMarginY;
+	}
+
+	// How many LOCAL units one TEXTURE pixel of each corner slice comes out as. One when the slice was
+	// left alone — which is the interesting case, because it means Slate is drawing the sprite's corner
+	// texel-for-unit and the artist's radius reaches the screen unchanged.
+	//
+	// A zero margin means the brush is not sliced at all (DrawAs Image, or a margin nobody set): the
+	// whole sprite is then stretched across the rect, and that IS a uniform scale, so the same
+	// expressions with the whole texture in place of the slice give the right answer.
+	const auto SliceScale = [](double InDrawn, double InTexels, double InWholeDrawn, double InWholeTexels)
+	{
+		return (InTexels > UE_DOUBLE_KINDA_SMALL_NUMBER)
+			? (InDrawn / InTexels)
+			: (InWholeDrawn / FMath::Max(UE_DOUBLE_KINDA_SMALL_NUMBER, InWholeTexels));
+	};
+
+	const double LeftTexels = InTextureSize.X * InBrushMargin.Left;
+	const double RightTexels = InTextureSize.X * InBrushMargin.Right;
+	const double TopTexels = InTextureSize.Y * InBrushMargin.Top;
+	const double BottomTexels = InTextureSize.Y * InBrushMargin.Bottom;
+
+	const double ScaleLeft = SliceScale(LeftMarginX, LeftTexels, ImageSize.X, InTextureSize.X);
+	const double ScaleRight = SliceScale(ImageSize.X - RightMarginX, RightTexels, ImageSize.X, InTextureSize.X);
+	const double ScaleTop = SliceScale(TopMarginY, TopTexels, ImageSize.Y, InTextureSize.Y);
+	const double ScaleBottom = SliceScale(ImageSize.Y - BottomMarginY, BottomTexels, ImageSize.Y, InTextureSize.Y);
+
+	// ---- The sheet's measurements, in this texture's pixels ----------------------------------------
+	//
+	// Edge and Corner are stated in SHEET pixels because that is the space every other number in this
+	// file is stated in and the space the slicer cuts in. The imported texture is a scaled copy of that
+	// crop, so both convert by the same ratio — and doing it here rather than baking texture pixels
+	// into the header is what lets a re-import at a different size need no edit anywhere.
+	const double ToTexelsX = InTextureSize.X / static_cast<double>(InFrame.SpriteW());
+	const double ToTexelsY = InTextureSize.Y / static_cast<double>(InFrame.SpriteH());
+
+	const double EdgeTexelsX = InFrame.EdgeOrGlow() * ToTexelsX;
+	const double EdgeTexelsY = InFrame.EdgeOrGlow() * ToTexelsY;
+	const double CornerTexelsX = InFrame.CornerOrCap() * ToTexelsX;
+	const double CornerTexelsY = InFrame.CornerOrCap() * ToTexelsY;
+
+	Out.Min.X = InImageMin.X + EdgeTexelsX * ScaleLeft;
+	Out.Min.Y = InImageMin.Y + EdgeTexelsY * ScaleTop;
+	Out.Max.X = InImageMax.X - EdgeTexelsX * ScaleRight;
+	Out.Max.Y = InImageMax.Y - EdgeTexelsY * ScaleBottom;
+
+	if (Out.Max.X - Out.Min.X <= 1.0 || Out.Max.Y - Out.Min.Y <= 1.0)
+	{
+		return Out;
+	}
+
+	// The corner is measured off the top-left of the sprite, so it is drawn through the top and left
+	// slices' scales. Clamped to half the plate, which is the same clamp Slate applies to a rounded
+	// box's radius and keeps the two shapes agreeing at a degenerate row height.
+	Out.RadiusX = FMath::Min(CornerTexelsX * ScaleLeft, (Out.Max.X - Out.Min.X) * 0.5);
+	Out.RadiusY = FMath::Min(CornerTexelsY * ScaleTop, (Out.Max.Y - Out.Min.Y) * 0.5);
+
+	// Does the arc finish before the slice does? If it does not, part of the curve is in the stretched
+	// middle section and its shape depends on the row's width, which is not an ellipse and not
+	// followable. The caller decides what to do about it; this only refuses to lie about it.
+	Out.bCornerInsideSlice =
+		(EdgeTexelsX + CornerTexelsX <= LeftTexels + UE_DOUBLE_KINDA_SMALL_NUMBER || LeftTexels <= 0.0)
+		&& (EdgeTexelsY + CornerTexelsY <= TopTexels + UE_DOUBLE_KINDA_SMALL_NUMBER || TopTexels <= 0.0);
+
+	Out.bValid = true;
+	return Out;
+}
+
 FLinearColor TraceMenuArtStyle::AmberLifted()
 {
 	// Round-trips through the sheet's own byte values, so the ratio being preserved is the one that

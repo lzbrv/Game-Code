@@ -652,6 +652,51 @@ static TAutoConsoleVariable<int32> CVarModeBThrowChargeClamp(
 	ECVF_Default);
 
 /**
+ * SPEC v28 §7. The window between FULL CHARGE and the automatic release, in seconds.
+ *
+ * 0.6, which is the number the owner gave. It is a SECOND, INDEPENDENT clock and not a re-spelling of
+ * the charge time: CoreThrowChargeSeconds also ships at 0.6 today and the two are equal by
+ * coincidence, so they are deliberately separate knobs. Retuning the wind-up must not silently retune
+ * how long a full charge may be sat on, and vice versa.
+ *
+ * 0 SWITCHES THE WHOLE OF §7 OFF — no auto-release and no red ring — which is the RED ARM: the
+ * pre-v28 game, in the same binary, one console line away.
+ *
+ * Bound by name to UTraceSettings::CoreThrowFullChargeAutoReleaseSeconds through Resolve(), like the
+ * other four charge knobs. That property does not exist yet (UTraceSettings is another agent's file
+ * this pass), and Resolve() answers with this CVar when a name is missing — so the shipped value is
+ * 0.6 today and an ini value takes over automatically the moment the property is added, with no edit
+ * here. See the note in TraceCore.h.
+ */
+static TAutoConsoleVariable<float> CVarModeBThrowAutoReleaseSeconds(
+	TEXT("Trace.ModeB.ThrowAutoReleaseSeconds"),
+	0.6f,
+	TEXT("MODE B, spec v28 §7. Seconds a FULL throw charge may be held before the server throws it ")
+	TEXT("automatically at full charge. The red ring inside the green one draws exactly this window, ")
+	TEXT("off the server's own clock. 0 = off (the pre-v28 behaviour: a full charge can be held ")
+	TEXT("forever). UTraceSettings::CoreThrowFullChargeAutoReleaseSeconds."),
+	ECVF_Default);
+
+/**
+ * SPEC v28 §2. WHICH EVENT THE CoreTurnover SOUND HANGS OFF. The A/B arm for the whole section.
+ *
+ * 1 (default, v28 §2): the moment a team STOPS HOLDING THE CORE — the carrier throws it, or the
+ *                      carrier is killed / leaves. Nothing else makes the sound.
+ * 0 (the RED ARM, pre-v28): the moment ATraceCore::RegisterTurnover fires, i.e. once a thrown Core
+ *                      has settled on the ground and the five-second lockout OPENS. A kill is silent.
+ *
+ * Two values and no "both": the whole complaint is that one sound was on two different edges in the
+ * player's ear, and an arm that could play it twice would be unable to demonstrate the fix.
+ */
+static TAutoConsoleVariable<int32> CVarAudioTurnoverEdge(
+	TEXT("Trace.Audio.TurnoverEdge"),
+	1,
+	TEXT("SPEC v28 §2. 1 (default): the CoreTurnover sound plays when the carrier DROPS the Core or is ")
+	TEXT("KILLED. 0 = RED ARM: the pre-v28 edge, on the landing that opens the lockout, with no sound ")
+	TEXT("at all on a kill."),
+	ECVF_Default);
+
+/**
  * Armed from the command line as well as the console, and polled, for the reason Trace.ModeB.Verify
  * is: -ExecCmds runs at engine init, long before there is a match, a Core or anybody holding it. A
  * plain console command can only be typed into a window, and spec v8's testing policy forbids one.
@@ -1332,6 +1377,19 @@ namespace TraceModeBTuning
 
 	bool  ThrowChargeClamps()  { return ResolveBool(TEXT("bCoreThrowChargeClampsAtFull"), CVarModeBThrowChargeClamp); }
 
+	/**
+	 * SPEC v28 §2's RED ARM. True restores the pre-v28 edge: the sound on the LANDING, and silence
+	 * on a kill. Console only — there is no settings property, because which EVENT a sound belongs to
+	 * is a design decision in code, exactly as ETraceSoundSide is (Audio/TraceSoundEvents.h).
+	 */
+	bool LegacyTurnoverSoundEdge() { return CVarAudioTurnoverEdge.GetValueOnAnyThread() == 0; }
+
+	// --- SPEC v28 §7. The full-charge auto-release window. Lower bound 0 and not 0.01: zero is a
+	// MEANING here ("no auto-release, the pre-v28 game") and clamping it up to a hundredth of a second
+	// would turn the red arm into the fastest possible auto-release, which is the exact mistake
+	// LooseResetSeconds' comment above records having made once already.
+	float ThrowAutoReleaseSeconds() { return Resolve(TEXT("CoreThrowFullChargeAutoReleaseSeconds"), CVarModeBThrowAutoReleaseSeconds, 0.f, 10.f); }
+
 	// --- Spec v13 §5, the contested magnet. UTraceSettings::CoreCatchContestHysteresisUU, 50 uu in
 	// Config/DefaultGame.ini - and the CVar default below is moved to 50 in step with it, because a
 	// fallback that disagrees with the shipped value is a trap for whoever reads one and not the other.
@@ -1950,6 +2008,10 @@ void ATraceCore::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifeti
 	DOREPLIFETIME(ATraceCore, TurnoverStartServerTime);
 	DOREPLIFETIME(ATraceCore, PullHolds);
 	DOREPLIFETIME(ATraceCore, PullWinner);
+
+	// SPEC v28 §7. The instant the server's own charge reached full. The red ring is arithmetic on
+	// this and the shared clock, so the ring cannot show a deadline the server is not going to act on.
+	DOREPLIFETIME(ATraceCore, ThrowFullChargeServerTime);
 }
 
 void ATraceCore::BeginPlay()
@@ -2036,6 +2098,20 @@ void ATraceCore::Tick(float DeltaSeconds)
 	// Spec v10 §10, same reasoning and the same placement: ahead of the authority split, because the
 	// machine the bug is ON is the one that is not the server. Costs one int compare when disarmed.
 	TickTeleportAudit();
+
+	// SPEC v28 §7's WIRE RECORD, and it is ahead of the authority split for exactly that reason: on a
+	// listen host this measures nothing a direct read would not, and on a CLIENT a non-zero count is
+	// the only proof that the full-charge instant the red ring draws actually crossed the network
+	// rather than being invented locally. Two compares and a float per tick.
+	if (ThrowFullChargeServerTime >= 0.f)
+	{
+		if (ThrowFullChargeServerTime != LastSeenFullChargeStamp)
+		{
+			LastSeenFullChargeStamp = ThrowFullChargeServerTime;
+			++FullChargeStampsSeen;
+		}
+		PeakSeenAutoReleaseAlpha = FMath::Max(PeakSeenAutoReleaseAlpha, GetThrowAutoReleaseAlpha());
+	}
 
 	// SPEC v13 §6. THE LOCAL CHARGE METER IS CLEARED WHEN THE CORE IS NOT IN LOCAL HANDS, ON EVERY
 	// MACHINE, AND THIS IS THE CLIENT'S ONLY WAY OUT.
@@ -2263,6 +2339,17 @@ void ATraceCore::Tick(float DeltaSeconds)
 	}
 
 	// ---- 4. Held: run the pass state machine and keep the trace alive. -------------------------
+
+	// SPEC v28 §7, and it runs FIRST inside the held branch because it is the one thing here that can
+	// end the possession this branch is about. It publishes the full-charge instant the red ring
+	// draws, and past the 0.6 s window it throws — at which point the Core is loose, this tick is
+	// over, and everything below it (the trail enforcement, the carried-goal sweep) is talking about a
+	// carrier who no longer exists.
+	if (ServerTickThrowAutoRelease())
+	{
+		return;
+	}
+
 	ServerTickPass(DeltaSeconds);
 	EnforceHolderTrailState();
 	SamplePassAvailabilityStats();
@@ -2988,6 +3075,17 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 				// weaker throw than the player asked for, never a stronger one.
 				ThrowChargeStartServerTime = GetServerTimeSeconds();
 				ThrowChargeHolder = Requester;
+
+				// SPEC v28 §7. A fresh press is a fresh deadline. Stated here as well as in
+				// ServerTickThrowAutoRelease's `Now < FullAt` branch, so a re-press cannot leave the
+				// previous hold's full-charge instant on the wire for even one tick — that stale value
+				// is a red ring that starts already part-full, and (worse) a deadline measured from a
+				// charge the player no longer has.
+				if (ThrowFullChargeServerTime >= 0.f)
+				{
+					ThrowFullChargeServerTime = -1.f;
+					ForceNetUpdate();
+				}
 				return;
 			}
 
@@ -3772,6 +3870,14 @@ void ATraceCore::OnHolderDeath(AActor* Victim, AController* Killer, FName Cause)
 
 	const ETraceTeam LostTeam = VictimCharacter->GetTeam();
 
+	// *** SPEC v28 §2, EDGE TWO: "a carrier is killed". ***
+	//
+	// Announced BEFORE the transfer, at the body, because that is the moment the sentence names — not
+	// when the killer's grant lands, and emphatically not when somebody later picks the Core up.
+	// AnnounceTurnoverSound de-duplicates against ATraceGameMode's DropAt(), which fires on the same
+	// OnDeath broadcast a few microseconds earlier for the same death; see that function.
+	AnnounceTurnoverSound(VictimCharacter->GetActorLocation(), VictimCharacter, TEXT("the carrier was killed"));
+
 	// Whoever killed the holder takes the Core. This one branch covers all three §2 cases:
 	//   - "breaks your trace":   UTraceTrailComponent kills through the tripper's controller.
 	//   - "kills the carrier":   any legal bullet, once the shield is down.
@@ -4369,11 +4475,216 @@ void ATraceCore::ClearThrowCharge(const TCHAR* Reason)
 	ThrowChargeHolder = nullptr;
 	bLocalThrowCharging = false;
 
+	// SPEC v28 §7. The deadline dies with the charge it belonged to, on every one of the six paths
+	// that reach here — a death, an interception, half time, a mode switch, a manual release, the
+	// auto-release itself. Cleared HERE for the identical reason the charge is: one exit, not six.
+	// ForceNetUpdate so the red ring on the owning client goes out on the same news as the throw,
+	// rather than sitting full for the rest of that client's net update interval.
+	if (ThrowFullChargeServerTime >= 0.f)
+	{
+		ThrowFullChargeServerTime = -1.f;
+		if (HasAuthority())
+		{
+			ForceNetUpdate();
+		}
+	}
+
 	if (bWasCharging && Reason != nullptr)
 	{
 		UE_LOG(LogTraceGame, Verbose, TEXT("[ModeB] throw charge cancelled (%s)."), Reason);
 	}
 }
+
+// =================================================================================================
+// SPEC v28 §7 — A FULL-CHARGE THROW CANNOT BE HELD FOREVER
+// =================================================================================================
+
+float ATraceCore::GetThrowAutoReleaseSeconds()
+{
+	return TraceModeBTuning::ThrowAutoReleaseSeconds();
+}
+
+float ATraceCore::GetThrowAutoReleaseAlpha() const
+{
+	// < 0 is "the SERVER has not seen a full charge". On a client that also covers the sliver of a
+	// round trip between the server deciding and this machine hearing about it: the ring has not
+	// appeared yet, which is honest, rather than appearing at a locally-guessed fraction.
+	if (ThrowFullChargeServerTime < 0.f)
+	{
+		return -1.f;
+	}
+
+	const float Window = GetThrowAutoReleaseSeconds();
+	if (Window <= 0.f)
+	{
+		return -1.f;   // §7 switched off. No deadline exists, so there is nothing to draw.
+	}
+
+	// THE SHARED CLOCK ON BOTH ENDS. ThrowFullChargeServerTime was stamped by the server against
+	// AGameStateBase::GetServerWorldTimeSeconds, and that is what GetServerTimeSeconds() reads here —
+	// so this subtraction is the same subtraction ServerTickThrowAutoRelease does, evaluated on a
+	// different machine. That is the whole of "what the player watches cannot disagree with what
+	// happens".
+	return FMath::Clamp((GetServerTimeSeconds() - ThrowFullChargeServerTime) / Window, 0.f, 1.f);
+}
+
+bool ATraceCore::ServerTickThrowAutoRelease()
+{
+	if (!HasAuthority() || !IsModeB())
+	{
+		return false;
+	}
+
+	// Nobody is winding up. ClearThrowCharge has already retired the deadline on every path that
+	// ends a charge, so there is nothing to tidy here.
+	if (ThrowChargeStartServerTime < 0.f)
+	{
+		return false;
+	}
+
+	// The presser must still be the living holder. Every route that breaks that (death, an
+	// interception, half time) funnels through ReleaseHolder -> ClearThrowCharge, so this is a
+	// same-frame ordering guard rather than a second rule: it stops one tick of a charge whose owner
+	// changed between the possession write and the clear.
+	ATraceCharacter* const Holder = ThrowChargeHolder.Get();
+	if (!IsValid(Holder) || Holder != Carrier || !Holder->IsAlive())
+	{
+		return false;
+	}
+
+	const float Now = GetServerTimeSeconds();
+
+	// *** THE INSTANT FULL CHARGE IS REACHED, DERIVED FROM THE CHARGE-TIME KNOB. *** Not a literal and
+	// not "the tick we noticed": press time + CoreThrowChargeSeconds is the exact moment the green
+	// ring completes, so retuning the wind-up moves the red ring's start with it and the two rings can
+	// never describe different moments. Asked of the same accessor the meter and the throw curve use.
+	const float FullAt = ThrowChargeStartServerTime + FMath::Max(0.01f, GetThrowChargeSeconds());
+
+	if (Now < FullAt)
+	{
+		// Not full yet — and this also covers a RE-PRESS, which RequestPassInput handles by restarting
+		// ThrowChargeStartServerTime. A deadline left over from the previous, longer hold would fire
+		// early on the new one.
+		if (ThrowFullChargeServerTime >= 0.f)
+		{
+			ThrowFullChargeServerTime = -1.f;
+			ForceNetUpdate();
+		}
+		return false;
+	}
+
+	if (ThrowFullChargeServerTime != FullAt)
+	{
+		ThrowFullChargeServerTime = FullAt;
+		ForceNetUpdate();   // The red ring must start on the frame the rule fired, not on the next update.
+
+		// The disabled case gets its OWN sentence rather than printing "leaves automatically at
+		// <FullAt + 0>", which is the same instant it just said the charge became full and reads as a
+		// release that already happened. The red arm has to be legible in the log too.
+		if (GetThrowAutoReleaseSeconds() > 0.f)
+		{
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[ModeB] spec v28 §7: %s reached FULL throw charge at %.3f (server clock). The red ")
+				TEXT("ring is now filling; the Core leaves automatically at %.3f unless they throw first."),
+				*GetNameSafe(Holder), FullAt, FullAt + GetThrowAutoReleaseSeconds());
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[ModeB] spec v28 §7 is OFF (Trace.ModeB.ThrowAutoReleaseSeconds 0): %s reached FULL ")
+				TEXT("throw charge at %.3f and may hold it indefinitely. No red ring, no auto-release."),
+				*GetNameSafe(Holder), FullAt);
+		}
+	}
+
+	const float Window = GetThrowAutoReleaseSeconds();
+	if (Window <= 0.f)
+	{
+		return false;   // §7 disabled (the red arm). A full charge may be held indefinitely, as before.
+	}
+
+	if (Now < FullAt + Window)
+	{
+		return false;   // The red ring is still filling.
+	}
+
+	// *** THE AUTOMATIC RELEASE. *** The SERVER's own call, from the SERVER's own hold, through the
+	// same ThrowFromHolder every manual release goes through — so the launch, the cooldown, the trail,
+	// the loose state and the log line are byte-for-byte what a player releasing at this instant would
+	// have produced. There is deliberately no "auto" argument: a second throw path is a second set of
+	// rules to keep in step.
+	//
+	// The hold handed over is the REAL elapsed hold rather than a hard-coded "full", so a character
+	// whose charge is still legally growing past 100% (Mortimer, spec v19 §3 / Demo 21 item 7) gets
+	// exactly what their own meter was showing at the deadline. For everybody else the curve has
+	// clamped and this is precisely full charge, which is what §7 asks for.
+	const float Held = FMath::Max(0.f, Now - ThrowChargeStartServerTime);
+	const float ReleasedAtScale = GetThrowChargeScaleForHold(Held, Holder);
+	const FString HolderName = GetNameSafe(Holder);
+
+	// *** THE CHARGE IS NOT CLEARED FIRST HERE, AND THAT IS THE ONE DELIBERATE DIFFERENCE FROM THE
+	// *** MANUAL RELEASE. RequestPassInput clears before it throws because the BUTTON IS UP by then:
+	// a released button has no charge, whether or not the throw was allowed. On this path the finger
+	// is still down, so a refusal (ThrowFromHolder rejects a throw still on ThrowCooldownEndServerTime,
+	// a Core that went loose in the same frame, a state lock) must leave the wind-up alone and be
+	// retried on the next tick — clearing it would silently eat a player's full charge and give them
+	// nothing for it. ThrowFromHolder clears the charge itself on the path that succeeds, which is
+	// where the clear belongs.
+	if (!ThrowFromHolder(Holder, Held))
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[ModeB] spec v28 §7: the automatic release was refused this tick (cooldown ends in ")
+			TEXT("%.2fs, loose=%d). The charge is kept and it will be retried."),
+			ThrowCooldownEndServerTime - Now, bLoose ? 1 : 0);
+		return false;
+	}
+
+	// LOGGED AFTER THE THROW, NOT BEFORE IT. An earlier draft announced "AUTOMATIC RELEASE" on the
+	// line above the attempt, so a refusal would have printed that claim once per tick for as long as
+	// the cooldown lasted — a log line saying the Core had left while it was still in a hand.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeB] spec v28 §7: AUTOMATIC RELEASE. %s sat on a full charge for %.2fs (window %.2fs); ")
+		TEXT("the server threw it at charge x%.2f from a %.2fs hold."),
+		*HolderName, Now - FullAt, Window, ReleasedAtScale, Held);
+
+	return true;
+}
+
+/**
+ * `Trace.ModeB.ThrowAutoRelease.Report` — SPEC v28 §7 ON WHICHEVER MACHINE YOU TYPE IT.
+ *
+ * Run it on the LISTEN HOST and it tells you what the rule did. Run it on a SECOND PROCESS (a joined
+ * client) and it answers the only question a single process cannot: did the server's full-charge
+ * instant actually reach this machine? A client that reports stamps=0 while the host reports stamps=1
+ * has a red ring that could only ever have been a local guess — which is precisely the failure §7's
+ * "the ring shows the server's own progress" clause exists to forbid.
+ */
+static FAutoConsoleCommandWithWorldAndArgs GTraceModeBAutoReleaseReportCmd(
+	TEXT("Trace.ModeB.ThrowAutoRelease.Report"),
+	TEXT("SPEC v28 §7. What THIS machine knows about the full-charge auto-release: the window, the "
+	     "last full-charge instant it has seen, how many distinct ones have arrived, and the largest "
+	     "ring fill it has computed from them. On a client, a non-zero count is the wire answering."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& /*Args*/, UWorld* World)
+	{
+		const ATraceCore* Core = ATraceCore::Get(World);
+		if (Core == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ModeB] spec v28 §7 report: no Core in this world."));
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB] spec v28 §7 REPORT on this machine: netmode=%d authority=%d | window %.2fs | ")
+			TEXT("full-charge stamps SEEN %d, last %.3f | peak ring fill computed here %.3f | live ")
+			TEXT("stamp %.3f, live fill %.3f"),
+			World != nullptr ? static_cast<int32>(World->GetNetMode()) : -1,
+			Core->HasAuthority() ? 1 : 0,
+			ATraceCore::GetThrowAutoReleaseSeconds(),
+			Core->GetFullChargeStampsSeen(), Core->GetLastSeenFullChargeStamp(),
+			Core->GetPeakSeenAutoReleaseAlpha(),
+			Core->GetThrowFullChargeServerTimeForTest(), Core->GetThrowAutoReleaseAlpha());
+	}));
 
 ATraceCore::FThrowMomentumSample ATraceCore::LastThrow;
 
@@ -5573,6 +5884,17 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	UpdateVisuals();
 	ForceNetUpdate();
 
+	// *** NO TURNOVER SOUND HERE, AND THE FIRST VERSION OF THIS GOT IT WRONG. ***
+	//
+	// This line used to announce a turnover at the LAUNCH of every throw, on the reading that a throw
+	// is "the core is dropped by a team". It is not: a throw is a PASS, the most ordinary offensive
+	// act in the game, and announcing it made the turnover sound fire on every single one — which is
+	// louder and more misleading than the bug it replaced.
+	//
+	// A thrown Core becomes a turnover when it LANDS UNCAUGHT, which is the game's own existing rule
+	// and is where RegisterTurnover() fires (see the landing path above). The sound belongs on that
+	// edge and on the carrier's death, and it is announced from both of those places.
+
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[ModeB] THROW by %s (%s) at %.0f uu/s from %s | v13 §6: held %.2fs -> charge x%.2f (floor ")
 		TEXT("%.2f, full at %.2fs) | v8 §4: charged impulse %.0f + inherited %.0f (thrower %.0f uu/s ")
@@ -6641,6 +6963,13 @@ bool ATraceCore::ServerSurfaceTurnover(const FVector& SurfacePoint, const FVecto
 
 		RegisterTurnover(ThrowingTeam, LandedAt, SurfaceKind);
 
+		// *** SPEC v28 §2, THE REAL EDGE. *** This is where a thrown Core actually becomes a
+		// TURNOVER — it settled on a surface uncaught, the throwing team is locked out, and the
+		// other team may pull it. Announcing here rather than at the throw's LAUNCH is what stops
+		// every ordinary pass from sounding like a turnover. AnnounceTurnoverSound de-duplicates,
+		// so a landing that coincides with a carrier death still costs exactly one sound.
+		AnnounceTurnoverSound(LandedAt, nullptr, TEXT("a thrown Core landed uncaught"));
+
 		// TRUE, and the contract behind it has not changed: "the caller must touch no member state
 		// afterwards". The Core is still loose, but this frame's landing latch has been consumed and
 		// the turnover window now owns what happens next, so the caller returning here is what stops
@@ -6954,12 +7283,22 @@ void ATraceCore::RegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where,
 	TurnoverStartServerTime = GetServerTimeSeconds();
 	bTurnoverRegisteredThisFlight = true;
 
-	// SPEC v26 §9 — "Core Turnover ... should be game-side", i.e. everyone nearby hears it. One line,
-	// on the authority, at the point the rule fires; TraceAudio::Play reads the event's declared side
-	// (Audio/TraceSoundEvents.h) and multicasts it. Note `Where`, not GetActorLocation(): the actor is
-	// moved to `Where` a few lines below, so taking the sound's position from the rule's own argument
-	// keeps the two in step if that ordering ever changes.
-	TraceAudio::PlayAt(this, TraceSoundEvents::CoreTurnover, Where);
+	// *** SPEC v28 §2. THE CoreTurnover SOUND USED TO BE PLAYED FROM HERE, AND THAT WAS THE BUG. ***
+	//
+	// v26 §9 put it on this line because this function is called "RegisterTurnover". But this function
+	// runs at the end of a LANDING: ServerSurfaceTurnover is its only shipping caller, and it fires
+	// once a thrown Core has stopped bouncing, come to rest and stayed still for the settle. So the
+	// sound announced the frame the five-second lockout OPENED and the other side became free to take
+	// the Core — "when a team picks up a core which was locked out", in the owner's words — and it
+	// announced nothing at all when a carrier was shot dead, because a kill never reaches here.
+	//
+	// It now fires from AnnounceTurnoverSound(), at the moment a team STOPS HOLDING THE CORE: the
+	// throw that drops it, and the death that takes it. Trace.Audio.TurnoverEdge 0 puts it back on
+	// this line, unchanged, which is the red arm. See AnnounceTurnoverSound.
+	if (TraceModeBTuning::LegacyTurnoverSoundEdge())
+	{
+		TraceAudio::PlayAt(this, TraceSoundEvents::CoreTurnover, Where);
+	}
 
 	// Captured HERE, by the rule itself, for the same reason TakeLooseCore captures its take: by the
 	// time Trace.ModeB.Verify's step 6/7/8 gets to judge, an enemy may already have pulled the Core
@@ -7002,6 +7341,58 @@ void ATraceCore::RegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where,
 	// window opens rather than on the next reconciliation tick.
 	ApplyAttachment();
 	UpdateVisuals();
+}
+
+void ATraceCore::AnnounceTurnoverSound(const FVector& Where, const ATraceCharacter* Loser, const TCHAR* Why)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	if (TraceModeBTuning::LegacyTurnoverSoundEdge())
+	{
+		return;   // RED ARM: the sound lives on RegisterTurnover's landing instead. See that function.
+	}
+
+	// ONE ANNOUNCEMENT PER LOSS. A carrier's death reaches this twice by design, not by accident:
+	// ATraceGameMode::NotifyCharacterDied calls DropAt() from inside the health component's OnDeath
+	// broadcast, and ATraceCore::OnHolderDeath is a second listener on the SAME broadcast. Both are
+	// correct places to announce from — DropAt is the only one a disconnect reaches, OnHolderDeath is
+	// the only one that knows about a killer — so the de-dup is here rather than a decision about
+	// which of them "really" owns the event.
+	//
+	// KEYED ON THE PAWN AS WELL AS THE TIME. A window alone would swallow a genuine second turnover:
+	// kill the carrier (sound), the killer takes the Core and throws it away 0.1 s later (a second,
+	// different loss, by a different pawn) — that must be two sounds, and with the pawn in the key it
+	// is. The window only ever collapses the two handlers of ONE pawn's ONE loss.
+	const float Now = GetServerTimeSeconds();
+	constexpr float SameEventWindow = 0.25f;
+
+	if (Loser != nullptr
+		&& LastTurnoverSoundLoser.Get() == Loser
+		&& (Now - LastTurnoverSoundServerTime) < SameEventWindow
+		&& (Now - LastTurnoverSoundServerTime) >= 0.f)
+	{
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Audio] spec v28 §2: CoreTurnover already announced %.3fs ago for %s (%s); not doubling it."),
+			Now - LastTurnoverSoundServerTime, *GetNameSafe(Loser), Why);
+		return;
+	}
+
+	LastTurnoverSoundLoser = Loser;
+	LastTurnoverSoundServerTime = Now;
+
+	// GAME-SIDE, and the call site cannot choose otherwise: TraceSoundEvents' table declares
+	// CoreTurnover as ETraceSoundSide::World and TraceAudio::PlayAt multicasts it from the authority.
+	// `Where` is passed explicitly because a turnover happens at a POINT — the hand the Core left, or
+	// the spot the carrier died on — and by the time this returns the Core may already be somewhere
+	// else entirely.
+	TraceAudio::PlayAt(this, TraceSoundEvents::CoreTurnover, Where);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Audio] spec v28 §2: TURNOVER SOUND (game-side) at %s - %s lost the Core (%s)."),
+		*Where.ToCompactString(), *GetNameSafe(Loser), Why);
 }
 
 void ATraceCore::ClearTurnover(const TCHAR* Why)
@@ -9288,6 +9679,15 @@ void ATraceCore::DropAt(const FVector& /*Location*/, const FVector& /*Impulse*/)
 	// clears this flag, so the death produces exactly one transfer.
 	FallbackTeam = Carrier->GetTeam();
 	bFallbackQueued = true;
+
+	// *** SPEC v28 §2, EDGE TWO, THE OTHER HALF. *** This is the GameMode's death path (it runs before
+	// OnHolderDeath knows who the killer was) and it is also the disconnect path — both are "the team
+	// holding the Core stopped holding it, and it is going to the other side", which is the turnover
+	// the sentence describes. Announced from BOTH here and OnHolderDeath rather than from whichever
+	// one happens to run first, because neither is reached by every route: a Logout never touches
+	// OnHolderDeath, and a death whose GameMode path is bypassed never touches this. The de-dup inside
+	// AnnounceTurnoverSound is what makes covering both cost one sound rather than two.
+	AnnounceTurnoverSound(Carrier->GetActorLocation(), Carrier, TEXT("the carrier lost it (death or disconnect)"));
 
 	ReleaseHolder();
 	ForceNetUpdate();

@@ -23,6 +23,7 @@
 #include "CoreMinimal.h"
 #include "Delegates/DelegateCombinations.h"
 #include "InputCoreTypes.h"             // FKey / EKeys
+#include "Misc/EnumClassFlags.h"        // ENUM_CLASS_FLAGS, for ETraceInputStates
 #include "UObject/Object.h"
 #include "UObject/ObjectMacros.h"
 
@@ -203,8 +204,78 @@ enum class ETraceInputAction : uint8
 	 */
 	PullCore,
 
+	/**
+	 * *** SPEC v28 §10 — THE MELEE BIND. "Melee should be bound to right click by default." ***
+	 *
+	 * THIS ROW IS THE INTEGRATION SEAM BETWEEN §3 AND §10 AND IT DID NOT EXIST IN EITHER SLICE.
+	 * §10 shipped the whole verb (TraceMelee::HandleMeleeInput) and could not bind it, because this
+	 * table is §3's file. §3 VACATED the right mouse button for it (see Default_Parry's note — the
+	 * "ParryPull" -> "ParryKeys" migration is what takes the button off the parry) and did not add
+	 * the row, because the verb was §10's file. Both slices said so plainly in their hand-off notes.
+	 * Without this enumerator the button is bound to nothing at all and melee is reachable only from
+	 * the console — which is exactly the state the integrator found, and this is the fix.
+	 *
+	 * APPENDED, never inserted, for the reason EquipKnife's comment gives at length: ETraceInputAction
+	 * is the index into UTraceUserSettings::Bindings, so anything placed higher renumbers every action
+	 * below it. A returning player has never had a "Melee" line, so RefreshFromConfig finds no
+	 * override and seeds the shipped default; nothing they have bound moves.
+	 *
+	 * ITS EXCLUSION GROUP IS NotCarrying, AND THAT IS MEASURED RATHER THAN ASSUMED. The bind carries
+	 * two verbs and BOTH refuse while this pawn is the carrier:
+	 *   - the swing, at UTraceWeaponComponent::CanSwing's `if (Character->IsCarrier())` gate, which
+	 *     refuses with ETraceMeleeRefusal::Carrying — the attacking half of the carrier's bargain;
+	 *   - the Core pull, at ATraceCore::CanPullNow, which requires an empty-handed puller.
+	 * So a melee key is dead while carrying, exactly as fire is, and it may legally share a key with
+	 * a Carrying-only action (the parry, the throw). It may NOT share with FIRE or PULL CORE, which
+	 * is the answer we want: the pull already rides this button under §10's precedence rule, so
+	 * putting PullCore on it as well would be two dispatches of one verb.
+	 */
+	Melee,
+
 	Count UMETA(Hidden)
 };
+
+/**
+ * *** SPEC v28 §3b — WHEN TWO ACTIONS ARE ALLOWED TO SHARE ONE KEY. ***
+ *
+ * Verbatim: "it will not let me bind throw core to the same button as fire but I should be able to do
+ * so [...] Throwing the Core only happens while carrying; firing only happens while NOT carrying —
+ * they are mutually exclusive, so the conflict check must reason about STATE, not just about the key.
+ * Define the exclusion groups explicitly."
+ *
+ * THIS ENUM IS THAT DEFINITION. Every action in the table above carries a mask of the states it can
+ * actually DO something in, and UTraceUserSettings::ActionsMayShareAKey is one bitwise AND: two
+ * actions conflict if and only if their masks INTERSECT. Disjoint masks mean the two verbs can never
+ * both be legal at the same instant, so one key can carry both and the authoritative gates decide
+ * which one accepts — which is not a new idea here, it is exactly the argument
+ * ATracePlayerController::OnParryStarted has made about parry and the Core-pull since spec v25 §2.
+ *
+ * WHY "MENU" IS A BIT AND HOLDS NOTHING TODAY. The spec names two axes — "carrying vs not carrying,
+ * menu vs match" — and the second one has a real answer: NO action in this table is live while the
+ * settings/pause overlay is up. FTraceOptionsMenu polls its own keys (Escape, Enter, the arrows,
+ * Backspace), none of which are rebindable, and ATracePlayerController::SetGameInputSuppressed makes
+ * every gameplay handler early-return for as long as the overlay is open. So a match action and the
+ * menu can never contend, the bit is unoccupied, and that is the finding rather than an omission. It
+ * exists so that a menu action added later (a chat key, say) states its context in the same place as
+ * everything else and gets the correct answer without anybody rewriting the check.
+ */
+enum class ETraceInputStates : uint8
+{
+	None        = 0,
+	/** Live while this pawn is the Core carrier: the throw, the parry. */
+	Carrying    = 1 << 0,
+	/** Live while this pawn is NOT the carrier: shooting, the turnover pull. */
+	NotCarrying = 1 << 1,
+	/** Live while a menu/overlay owns input. See the note above: nothing holds this today. */
+	Menu        = 1 << 2,
+
+	/** Everything a player can do in a match regardless of who is holding the Core. */
+	Match       = Carrying | NotCarrying,
+};
+ENUM_CLASS_FLAGS(ETraceInputStates);
+
+/** "CARRYING", "NOT CARRYING", "CARRYING+NOT CARRYING", "NONE". For logs and the options page. */
+TRACE_API FString LexTraceInputStates(ETraceInputStates States);
 
 /** Static description of one action: its stable config id and the label the options screen shows. */
 struct FTraceInputActionInfo
@@ -213,7 +284,19 @@ struct FTraceInputActionInfo
 	/** Stable, never localised, never renamed — this is what ends up in the .ini. */
 	const TCHAR* ConfigId;
 	const TCHAR* DisplayName;
+	/** The shipped PRIMARY key (slot 0). May return an invalid FKey: "ships unbound" is supported. */
 	FKey (*DefaultKey)();
+	/**
+	 * SPEC v28 §3c — the shipped SECOND key (slot 1), or an invalid FKey for "only one by default".
+	 *
+	 * A separate function pointer rather than an array for the same reason DefaultKey is a function at
+	 * all: EKeys' statics are built during module startup, so a namespace-scope FKey cannot be trusted
+	 * to exist yet. Only one row uses it today — §3d's parry, which ships on Q AND the thumb mouse
+	 * button — and every other row names Default_None, which is honest and greppable.
+	 */
+	FKey (*DefaultKeyAlt)();
+	/** SPEC v28 §3b — the exclusion group. See ETraceInputStates. */
+	ETraceInputStates States;
 };
 
 namespace TraceInputActions
@@ -330,6 +413,18 @@ public:
 	// ---------------------------------------------------------------------------------------------
 
 	/**
+	 * SPEC v28 §3c — HOW MANY KEYS ONE ACTION MAY CARRY. "Up to TWO keybinds per action, both
+	 * editable in the settings page."
+	 *
+	 * TWO AND NOT N. The number is in the note, and it is also the number the options row can draw
+	 * legibly: the keybind row has one label and a value column, and two chips fit that column at
+	 * 720p where three do not. Every loop below is written over this constant rather than over a
+	 * literal 2, so raising it is one edit here plus one wider value column — but nothing in the
+	 * save format, the loader or the conflict check would have to change.
+	 */
+	static constexpr int32 MaxKeysPerAction = 2;
+
+	/**
 	 * Serialised bindings, one "ConfigId=KeyName" string per entry.
 	 *
 	 * A TArray<FString> rather than a TMap<FName, FKey> on purpose. Config TMaps of USTRUCT values
@@ -337,32 +432,87 @@ public:
 	 * ExportText adds a second failure mode on top. A flat list of "Jump=SpaceBar" is legible in the
 	 * .ini, hand-editable, and cannot half-load.
 	 *
+	 * *** SPEC v28 §3c: THE VALUE IS NOW A COMMA-SEPARATED LIST OF UP TO MaxKeysPerAction KEYS. ***
+	 *
+	 *     Parry=Q,ThumbMouseButton
+	 *     Jump=SpaceBar
+	 *     Fire=LeftMouseButton,None
+	 *
+	 * THIS FORMAT IS BACKWARD COMPATIBLE BY CONSTRUCTION, which is why the two-key feature costs no
+	 * ConfigId migration of its own. A line written by any previous build has no comma, so it parses
+	 * as "slot 0 = this key, slot 1 = empty" — exactly what that build meant. Nothing has to detect a
+	 * version, and a hand-edited file with three keys on a line is truncated with a warning rather
+	 * than rejected.
+	 *
 	 * Not the runtime source of truth — Bindings below is. This is only what hits the disk.
 	 */
 	UPROPERTY(config)
 	TArray<FString> KeyBindings;
 
-	/** Current key for @p Action. Returns an invalid FKey if the action is deliberately unbound. */
+	/**
+	 * The PRIMARY key for @p Action (slot 0). Returns an invalid FKey if that slot is unbound.
+	 *
+	 * Deliberately still the whole answer for every caller that only wants something to PRINT — the
+	 * HUD's ability chip, the pull ring's "HOLD [F]" caption, the movement tutorial. A row with two
+	 * binds shows its first one there, which is what those captions have always meant.
+	 */
 	FKey GetKey(ETraceInputAction Action) const;
 
+	/** The key in @p Slot (0 .. MaxKeysPerAction-1). Invalid FKey for an empty slot or a bad index. */
+	FKey GetKey(ETraceInputAction Action, int32 Slot) const;
+
+	/** Every VALID key bound to @p Action, in slot order. Empty when the action is fully unbound. */
+	void GetKeys(ETraceInputAction Action, TArray<FKey>& OutKeys) const;
+
+	/** True when @p Key is in ANY of @p Action's slots. The "is this action's button down" question. */
+	bool ActionUsesKey(ETraceInputAction Action, const FKey& Key) const;
+
 	/**
-	 * Binds @p Key to @p Action, unbinding whatever else held that key.
+	 * SPEC v28 §3b — may these two actions hold the same key?
+	 *
+	 * TRUE when their ETraceInputStates masks are disjoint, i.e. there is no single instant at which
+	 * both verbs could be legal. Throw-core (Carrying) and fire (NotCarrying) are the note's own
+	 * example and answer TRUE; fire and the Core-pull are both NotCarrying and answer FALSE.
+	 *
+	 * An action is never in conflict with itself (the caller wants "may B keep this key while A takes
+	 * it", and A == B is the slot logic's business, not the conflict check's).
+	 */
+	static bool ActionsMayShareAKey(ETraceInputAction A, ETraceInputAction B);
+
+	/**
+	 * Binds @p Key to @p Action's primary slot, taking it only from actions that GENUINELY conflict.
 	 *
 	 * Stealing rather than refusing is the behaviour every shooter has: a player who binds Dash to
 	 * Shift while Shift is already Crouch means "Dash is Shift now", and being told "that key is
 	 * taken" with no way to proceed is the single most annoying thing an options screen can do. The
 	 * stolen action is left visibly UNBOUND so nothing is lost silently.
+	 *
+	 * *** SPEC v28 §3b LIMITS WHO GETS STOLEN FROM, AND THAT IS THE ITEM. *** The owner's report is
+	 * "it will not let me bind throw core to the same button as fire" — and from the player's side
+	 * that is precisely what unconditional stealing looks like: they put the throw on mouse 1 and
+	 * FIRE went blank, so the bind "did not work". Now a key is only taken from an action whose
+	 * exclusion group overlaps this one's; two actions that can never be legal at the same instant
+	 * simply both keep it. See ActionsMayShareAKey.
 	 */
 	void SetKey(ETraceInputAction Action, const FKey& Key);
 
+	/** As above, into an explicit slot. Slot 1 is spec v28 §3c's second bind. */
+	void SetKey(ETraceInputAction Action, int32 Slot, const FKey& Key);
+
 	/**
-	 * Explicitly unbinds @p Action.
+	 * Explicitly unbinds @p Action — every slot.
 	 *
 	 * Separate from SetKey(Action, FKey()) on purpose. SetKey REFUSES an invalid key, because an
 	 * invalid key is also what an unparseable .ini line produces, and a load path must never be able
 	 * to silently wipe a binding. Unbinding is a deliberate act and gets its own entry point.
 	 */
 	void ClearKey(ETraceInputAction Action);
+
+	/** Unbinds ONE slot. What Backspace on the options page does to the chip the player has selected. */
+	void ClearKey(ETraceInputAction Action, int32 Slot);
+
+	/** "Q  /  THUMB MOUSE BUTTON", or "UNBOUND". The whole binding, for a log line or a caption. */
+	FString DescribeBinding(ETraceInputAction Action) const;
 
 	/** Restores the shipped default for every action AND for the mouse. */
 	void ResetToDefaults();
@@ -393,8 +543,18 @@ public:
 	static FString DescribeKey(const FKey& Key);
 
 private:
-	/** Runtime table, indexed by ETraceInputAction. Never serialised; KeyBindings is. */
+	/**
+	 * Runtime table. Never serialised; KeyBindings is.
+	 *
+	 * FLAT, indexed by (action * MaxKeysPerAction + slot), rather than an array of a two-key struct.
+	 * A struct would have to be a USTRUCT to be worth the name and would then drag UHT into a table
+	 * that is deliberately not reflected; a flat array keeps SlotIndex() as the single place that
+	 * knows the layout, and every loop below goes through it.
+	 */
 	TArray<FKey> Bindings;
+
+	/** The one place that knows the Bindings layout. INDEX_NONE for an out-of-range action or slot. */
+	static int32 SlotIndex(ETraceInputAction Action, int32 Slot);
 
 	/** Mirrors Bindings back into KeyBindings before a save. */
 	void FlattenToConfig();

@@ -528,6 +528,24 @@ protected:
 	TObjectPtr<UInputAction> IA_PullCore;
 
 	/**
+	 * *** SPEC v28 §10 — THE MELEE BIND. Default RIGHT MOUSE, rebindable like everything else. ***
+	 *
+	 * The whole verb is TraceMelee::HandleMeleeInput and this action does nothing but deliver edges to
+	 * it. In particular the PRECEDENCE — "if and only if a player is looking at a pullable core, and
+	 * being shown the circle icon to pull, this keybind should override the melee keybind" — is not
+	 * decided here: HandleMeleeInput asks ATraceCore::CanPullNow, which is the same predicate ATraceHUD
+	 * asks to decide whether to DRAW the circle. One fact, not two that can drift.
+	 *
+	 * Bound on Started AND Completed AND Canceled, and BOTH edges are load-bearing. The swing is a
+	 * press-edge action and does not care, but the press may have gone to the Core PULL, which is a
+	 * HOLD — a dropped release leaves a pull ring filling on the server behind a pause menu or a lost
+	 * window focus. HandleMeleeInput forwards every release to the Core unconditionally so the caller
+	 * never has to remember which verb the press went to; see its comment.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_Melee;
+
+	/**
 	 * Resolves InputMapping and every IA_* exactly once, then lays down the key mappings.
 	 *
 	 * The two halves are separate on purpose. The ACTIONS must be resolved exactly once and never
@@ -605,6 +623,23 @@ protected:
 	 */
 	void OnPullCoreStarted();
 	void OnPullCoreCompleted();
+
+	/**
+	 * SPEC v28 §10 — press and release edges of the MELEE bind (right mouse by default).
+	 *
+	 * Makes NO decision of its own, exactly like OnParryStarted and OnPullCoreStarted: the swing's
+	 * refusals (dead, carrying, mid-pullout, dashing, on cooldown) live behind
+	 * UTraceWeaponComponent::CanSwing and the pull's live behind ATraceCore, and the choice between
+	 * the two is TraceMelee::ShouldCorePullOverrideMelee. A second opinion here is how a predicted
+	 * state and an authoritative one come to disagree.
+	 *
+	 * The RELEASE is deliberately NOT gated on bGameInputSuppressed and uses GetPawn rather than
+	 * GetLivingCharacter, for the reason OnParryCompleted and OnPullCoreCompleted both document:
+	 * opening the pause menu mid-pull suppresses input and dying mid-pull makes the pawn non-living,
+	 * and those are exactly the two cases where the cancel MUST still be delivered.
+	 */
+	void OnMeleeStarted();
+	void OnMeleeCompleted();
 
 	/**
 	 * SPEC v26 §1. The one place the pull is dispatched, and the reason it is a function.

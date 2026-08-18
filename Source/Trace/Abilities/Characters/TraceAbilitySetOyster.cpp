@@ -621,6 +621,9 @@ void UTraceAbilitySetOyster::PublishState()
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerController.h"
 
+#include "Core/TracePlayerController.h"   // spec v28 §4: IsGameInputSuppressed, for the real key press
+#include "Gameplay/TraceHealthComponent.h" // ...and ResetHealth, so a victim survives four fixtures
+
 namespace TraceAbilitySetOysterHarness
 {
 	UWorld* FindAuthoritativeWorld()
@@ -2336,6 +2339,546 @@ namespace TraceAbilitySetOysterHarness
 			return false;
 		}));
 	}
+
+	// =============================================================================================
+	// Trace.Oyster.EPressRepro — SPEC v28 §4, THE PLAYER'S SIDE OF "E STILL DOES NOT RESET"
+	// =============================================================================================
+	//
+	//   "Oyster's E is not resetting when he poisons someone. Demo 23 asked for this and it was
+	//    REPORTED DELIVERED. It does not work."
+	//
+	// WHY A SECOND HARNESS WHEN Trace.Oyster.ETest ALREADY COVERS §6a — AND WHY THAT ONE'S GREEN IS
+	// THE REASON THIS BUG SHIPPED. ETest poisons a BOT ON THE OPPOSING TEAM. That is the one victim
+	// shape v26's refund test accepts, so ETest could only ever come back green. A player checking an
+	// ability checks it in the PRACTICE RANGE, whose five dummies are deliberately ETraceTeam::None,
+	// and v26's test threw the refund away for anybody without a team. Same ability, same key, same
+	// poison, opposite outcome — and no harness in the project stood where the player was standing.
+	//
+	// So this one stands there. TWO ARMS x TWO FIXTURES, all four in one process:
+	//
+	//   ARM 0  Trace.Oyster.LegacyRefundTeamTest 1 — the v26 test. On a teamless victim it must FAIL
+	//          to refund, and that failure IS the reported bug, reproduced before anything is fixed.
+	//   ARM 1  the shipped v28 test. Same fixtures, same victim, and E must come back.
+	//
+	//   FIXTURE A (the E jar)   press E for real -> the thrown Pickler lands, the enemy is stood on
+	//                           it, it bursts and poisons him. The player's own loop, end to end.
+	//   FIXTURE B (a dash jar)  press E for real, then drop a DASH jar on him through the shipping
+	//                           SpawnJar. A second poison ROUTE onto the same rule, so "the refund is
+	//                           on the wrong path" can be told apart from "the refund refuses him".
+	//
+	// THE KEY IS PRESSED FOR REAL, through Trace.SimInput, and that is the other half of why this is
+	// a separate command: ETest puts the cooldown on with Comp->DebugSetActivatedCooldown(), so it
+	// never exercises UTraceAbilityComponent::TryActivate — the function a player's E actually runs,
+	// which throws the jar first and writes the cooldown afterwards. A harness that never presses the
+	// key cannot see anything that goes wrong on the key's path.
+	//
+	// IN A REAL MATCH BOTH ARMS PASS, and the run says so rather than hiding it: with an enemy on a
+	// real team the v26 test is satisfied, which is exactly why this survived Demo 23. Run it in the
+	// practice range (Scripts/run-practice-range.sh) to see the arms disagree.
+
+	struct FEPressFixture
+	{
+		bool  bPressed = false;          // the key injection was actually issued
+		float CooldownAfterPress = 0.f;  // what the press bought. ~20s, or the press did nothing
+		bool  bPoisonLanded = false;     // the victim really has a poison component
+		float CooldownWhenPoisoned = -1.f;
+		float CooldownAfterSettle = -1.f;
+		float SecondsToPoison = -1.f;
+	};
+
+	struct FEPressState
+	{
+		int32 Phase = 0;
+		int32 Arm = 0;                   // 0 = LEGACY team test (v26), 1 = SHIPPED (v28 §4)
+		int32 Fixture = 0;               // 0 = the E jar's own poison, 1 = a dash jar's
+		int32 SettleFrames = 0;
+		double PhaseStartReal = 0.0;
+
+		TWeakObjectPtr<UTraceAbilityComponent> Subject;
+		TWeakObjectPtr<ATraceCharacter> Victim;
+		ETraceTeam VictimTeam = ETraceTeam::None;
+		ETraceTeam MyTeam = ETraceTeam::None;
+
+		FVector Anchor = FVector::ZeroVector;
+		FVector VictimAnchor = FVector::ZeroVector;
+		FVector VictimHome = FVector::ZeroVector;
+		FRotator Facing = FRotator::ZeroRotator;
+
+		FEPressFixture Results[2][2];    // [arm][fixture]
+
+		int32 Passed = 0;
+		int32 Failed = 0;
+
+		void Check(bool bCondition, const FString& What)
+		{
+			if (bCondition) { ++Passed; } else { ++Failed; }
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTEREPRESS]   %s  %s"),
+				bCondition ? TEXT("PASS") : TEXT("*** FAIL ***"), *What);
+		}
+	};
+
+	/** However this run ends, the SHIPPED refund test is what is left switched on. */
+	void RestoreRefundArm()
+	{
+		SetIntCVar(TEXT("Trace.Oyster.LegacyRefundTeamTest"), 0);
+	}
+
+	/** The E key, through the real input pipeline. Returns false when there is no controller to press it on. */
+	bool PressAbilityKeyForReal(UWorld* WorldPtr)
+	{
+		if (WorldPtr == nullptr || GEngine == nullptr)
+		{
+			return false;
+		}
+
+		APlayerController* PC = WorldPtr->GetFirstPlayerController();
+		if (PC == nullptr)
+		{
+			return false;
+		}
+
+		// SAY IT OUT LOUD RATHER THAN LET IT LOOK LIKE THE ABILITY IGNORED THE KEY. A select screen
+		// or an options overlay swallows game input, and a press that never reached the ability at
+		// all would otherwise be reported here as "E did not fire" — a different bug entirely, and
+		// one this project has chased before.
+		if (const ATracePlayerController* TracePC = Cast<ATracePlayerController>(PC))
+		{
+			if (TracePC->IsGameInputSuppressed())
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[OYSTEREPRESS] game input is SUPPRESSED (a menu or the select screen is up). The E "
+					     "press below will not reach the ability; close it and re-run."));
+			}
+		}
+
+		// Trace.SimInput injects at the input subsystem, so a bind that does not exist, is not mapped
+		// or is not routed produces nothing at all — which is itself a result worth having.
+		GEngine->Exec(WorldPtr, TEXT("Trace.SimInput E 0.10"));
+		return true;
+	}
+
+	void RunEPressRepro()
+	{
+		UWorld* WorldPtr = FindAuthoritativeWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[OYSTEREPRESS] no authoritative game world — run this on the server."));
+			return;
+		}
+		UnpauseAndReport(WorldPtr, TEXT("OYSTEREPRESS"));
+
+		// §6b stays SHIPPED throughout. This command reproduces a report about §6a's refund, and a
+		// stale Trace.Oyster.LegacyE left at 1 by an aborted ETest run would make it "reproduce" a bug
+		// that is only that arm doing its job.
+		SetIntCVar(TEXT("Trace.Oyster.LegacyE"), 0);
+		SetIntCVar(TEXT("Trace.Oyster.LegacyRefundTeamTest"), 1);   // arm 0 first: the v26 test
+
+		TSharedPtr<FEPressState> State = MakeShared<FEPressState>();
+		State->PhaseStartReal = FPlatformTime::Seconds();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[OYSTEREPRESS] ===== spec v28 §4. Arm 0 = the v26 refund test (must FAIL to refund on a "
+			     "teamless victim), arm 1 = SHIPPED. E is PRESSED FOR REAL (Trace.SimInput E) in every "
+			     "fixture. E cooldown %.0fs; Pickler fuse %.2fs; poison radius %.0f uu. ====="),
+			UTraceSettings::Get().OysterPicklerCooldownSeconds,
+			ATraceOysterJar::GetPicklerDetonateDelaySeconds(),
+			UTraceSettings::Get().OysterPoisonRadiusUU);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[OYSTEREPRESS] ABORTED: the world went away."));
+				RestoreRefundArm();
+				return false;
+			}
+			const double NowReal = FPlatformTime::Seconds();
+
+			// ---- Phase 0: become Oyster, find somebody to poison --------------------------------
+			if (State->Phase == 0)
+			{
+				UTraceAbilityComponent* Human = FindHumanAbilityComponent(TickWorld);
+				if (Human != nullptr && Human->GetCharacterId() != ETraceCharacterId::Oyster)
+				{
+					Human->ServerSetCharacter(ETraceCharacterId::Oyster);
+				}
+
+				UTraceAbilitySetOyster* Set = (Human != nullptr)
+					? Human->GetAbilitySetAs<UTraceAbilitySetOyster>() : nullptr;
+				ATraceCharacter* MyPawn = (Human != nullptr) ? Human->GetOwningCharacter() : nullptr;
+
+				if (Set == nullptr || MyPawn == nullptr)
+				{
+					if ((NowReal - State->PhaseStartReal) > 60.0)
+					{
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[OYSTEREPRESS] VERDICT: INVALID — no human player could be made Oyster."));
+						RestoreRefundArm();
+						return false;
+					}
+					return true;
+				}
+
+				// *** A TEAMLESS VICTIM IS PREFERRED, AND THAT IS THE WHOLE POINT OF THE FIXTURE. ***
+				// The practice range's dummies are ETraceTeam::None and are the targets a player
+				// tests an ability on; they are also the ones v26's refund test refuses. In a real
+				// match there are none, and this falls through to an ordinary enemy — where, as the
+				// note above says, BOTH arms pass and always did.
+				ATraceCharacter* Victim = nullptr;
+				ATraceCharacter* Fallback = nullptr;
+				for (TActorIterator<ATraceCharacter> It(TickWorld); It; ++It)
+				{
+					ATraceCharacter* Candidate = *It;
+					if (Candidate == nullptr || Candidate == MyPawn || !Candidate->IsAlive())
+					{
+						continue;
+					}
+					if (Candidate->GetTeam() == ETraceTeam::None)
+					{
+						Victim = Candidate;   // the practice dummy. Take it and stop looking.
+						break;
+					}
+					if (Candidate->GetTeam() != MyPawn->GetTeam() && Fallback == nullptr)
+					{
+						Fallback = Candidate;
+					}
+				}
+				if (Victim == nullptr)
+				{
+					Victim = Fallback;
+				}
+
+				if (Victim == nullptr)
+				{
+					if ((NowReal - State->PhaseStartReal) > 60.0)
+					{
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[OYSTEREPRESS] VERDICT: INVALID — nobody to poison. Needs the practice range "
+							     "(five dummies) or a match with bots on the other side."));
+						RestoreRefundArm();
+						return false;
+					}
+					return true;
+				}
+
+				State->Subject = Human;
+				State->Victim = Victim;
+				State->MyTeam = MyPawn->GetTeam();
+				State->VictimTeam = Victim->GetTeam();
+				State->Anchor = MyPawn->GetActorLocation();
+				State->Facing = FRotator(0.f, MyPawn->GetActorRotation().Yaw, 0.f);
+				State->VictimHome = State->Anchor + State->Facing.Vector() * 600.f;
+				State->VictimAnchor = State->VictimHome;
+				State->Phase = 1;
+				State->PhaseStartReal = NowReal;
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[OYSTEREPRESS] subject %s (team %s) vs victim %s (team %s)%s."),
+					*GetNameSafe(Human->GetOwner()), *TraceTeamName(State->MyTeam).ToString(),
+					*GetNameSafe(Victim), *TraceTeamName(State->VictimTeam).ToString(),
+					(State->VictimTeam == ETraceTeam::None)
+						? TEXT(" — a TEAMLESS victim: this is the fixture the report is about")
+						: TEXT(" — an ordinary enemy: both arms are expected to pass here"));
+				return true;
+			}
+
+			UTraceAbilityComponent* Comp = State->Subject.Get();
+			ATraceCharacter* MyPawn = (Comp != nullptr) ? Comp->GetOwningCharacter() : nullptr;
+			ATraceCharacter* VictimPawn = State->Victim.Get();
+			UTraceAbilitySetOyster* OysterSet = (Comp != nullptr)
+				? Comp->GetAbilitySetAs<UTraceAbilitySetOyster>() : nullptr;
+
+			// A DEAD OR RESPAWNED VICTIM IS RE-ACQUIRED, NOT AN ABORT. The practice range's dummies
+			// die and come back as NEW pawns ("they take damage and come back where they fell"), so a
+			// run that insisted on the same pointer would abort halfway through for a fixture that is
+			// working exactly as intended.
+			if (VictimPawn == nullptr || !VictimPawn->IsAlive())
+			{
+				for (TActorIterator<ATraceCharacter> It(TickWorld); It; ++It)
+				{
+					ATraceCharacter* Candidate = *It;
+					if (Candidate != nullptr && Candidate != MyPawn && Candidate->IsAlive()
+						&& Candidate->GetTeam() == State->VictimTeam)
+					{
+						VictimPawn = Candidate;
+						State->Victim = Candidate;
+						break;
+					}
+				}
+			}
+
+			if (Comp == nullptr || MyPawn == nullptr || VictimPawn == nullptr || OysterSet == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[OYSTEREPRESS] VERDICT: INVALID — a pawn went away mid-run."));
+				RestoreRefundArm();
+				return false;
+			}
+
+			FEPressFixture& Fixture = State->Results[State->Arm][State->Fixture];
+
+			// ---- Phase 1: pose both pawns, clear the field --------------------------------------
+			if (State->Phase == 1)
+			{
+				State->VictimAnchor = State->VictimHome;
+				PosePawn(MyPawn, State->Anchor, State->Facing);
+				PosePawn(VictimPawn, State->VictimAnchor, State->Facing);
+				OysterSet->DebugDestroyAllJars();
+
+				// *** THE VICTIM STARTS EACH FIXTURE CLEAN, AND THE FIRST RUN OF THIS HARNESS PROVED
+				//     WHY. *** A poison lasts 4 s and a fixture takes about 2, so fixtures 2, 3 and 4
+				// each opened with the previous fixture's poison still on him. "The victim IS
+				// poisoned" then fired on the first frame — 0.04 s after a throw whose jar was still
+				// in the air — and the fixture finished measuring before the poison it was actually
+				// waiting for had happened. Every number after the first was therefore a reading of
+				// the wrong event, and the shipped arm read as a FAIL for a refund that had not been
+				// asked for yet.
+				//
+				// Removed rather than waited out: waiting 4 s per fixture would make the run four
+				// times longer and would still be a guess about a duration knob.
+				if (UTraceOysterPoisonComponent* Stale = UTraceOysterPoisonComponent::Find(VictimPawn))
+				{
+					Stale->DestroyComponent();
+				}
+
+				// ...and alive, with his health back. Four Pickler impacts plus four poisons is 216
+				// damage against 100 HP, so without this the victim dies mid-run and the harness
+				// reports "a pawn went away" instead of a measurement.
+				if (UTraceHealthComponent* Health = VictimPawn->FindComponentByClass<UTraceHealthComponent>())
+				{
+					Health->ResetHealth();
+				}
+
+				if (++State->SettleFrames < 6)
+				{
+					return true;
+				}
+				State->SettleFrames = 0;
+
+				// Start every fixture from READY, so "the cooldown after the press" is a measurement
+				// of the press and not of whatever was left over.
+				Comp->DebugSetActivatedCooldown(0.f);
+				State->Phase = 2;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 2: PRESS E, FOR REAL -----------------------------------------------------
+			if (State->Phase == 2)
+			{
+				Fixture.bPressed = PressAbilityKeyForReal(TickWorld);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[OYSTEREPRESS] arm %d fixture %s: pressed E through the real input pipeline (%s)."),
+					State->Arm, (State->Fixture == 0) ? TEXT("A/E-jar") : TEXT("B/dash-jar"),
+					Fixture.bPressed ? TEXT("injected") : TEXT("*** NO LOCAL CONTROLLER ***"));
+
+				State->Phase = 3;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 3: what did the press buy? ------------------------------------------------
+			if (State->Phase == 3)
+			{
+				if ((NowReal - State->PhaseStartReal) < 0.35)
+				{
+					return true;
+				}
+
+				Fixture.CooldownAfterPress = Comp->GetActivatedCooldownRemaining();
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[OYSTEREPRESS] arm %d fixture %d: E cooldown after the press = %.1fs."),
+					State->Arm, State->Fixture, Fixture.CooldownAfterPress);
+
+				// Fixture B poisons by a DASH jar instead of by the thrown one, so the jar the press
+				// put in the air is removed first — otherwise both routes fire and the log cannot say
+				// which one paid.
+				if (State->Fixture == 1)
+				{
+					OysterSet->DebugDestroyAllJars();
+					ATraceOysterJar* DashJar =
+						OysterSet->DebugSpawnJarAt(VictimPawn->GetActorLocation(), /*bPickler*/ false);
+
+					// *** A DASH JAR CANNOT BE BROKEN BY A TEAMLESS PAWN, AND THAT IS A REAL FINDING
+					//     RATHER THAN A HARNESS DETAIL. *** ATraceOysterJar::FindToucher only accepts
+					//     an IsEnemyOfOwner candidate, which requires BOTH teams to be set and
+					//     different — so in the practice range, where every dummy is ETraceTeam::None,
+					//     a dash jar lies at a dummy's feet untouched until it expires. (The Pickler
+					//     jar is unaffected: §6b's fuse breaks it with nobody involved, which is why
+					//     fixture A works there and this one needs help.)
+					//
+					// So the break is forced through ServerBreakNow — the SAME function the touch
+					// test, the jar-jump and every other break call — rather than by faking a poison.
+					// The burst, the cloud, the choke point and the refund are all the shipping ones;
+					// only the trigger is the harness's.
+					if (DashJar != nullptr && State->VictimTeam == ETraceTeam::None)
+					{
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[OYSTEREPRESS] the victim is TEAMLESS, so ATraceOysterJar::FindToucher will "
+							     "never break this dash jar (it needs an enemy with a team). Forcing the break "
+							     "through the shipping ServerBreakNow so the poison ROUTE is still measured."));
+						DashJar->ServerBreakNow(TEXT("harness: a teamless victim cannot trigger the touch test"));
+					}
+				}
+
+				State->Phase = 4;
+				State->PhaseStartReal = NowReal;
+				return true;
+			}
+
+			// ---- Phase 4: watch for the poison, and watch the cooldown across it ------------------
+			if (State->Phase == 4)
+			{
+				// *** THE VICTIM IS BROUGHT TO WHERE THE THROW ACTUALLY LANDED. ***
+				//
+				// Fixture A throws with the SHIPPING lob (OysterPicklerThrowSpeed 1900 uu/s, up bias
+				// 0.35) and that arc carries far further than any sane staging distance. Standing the
+				// victim at a guessed range would produce a fixture that reliably measures nothing,
+				// which is worse than no fixture at all — so the staging follows the jar rather than
+				// predicting it: the moment the E jar is on the ground, the victim is stood on it.
+				//
+				// NOTHING ABOUT THE POISON IS FAKED BY THIS. The jar is the one the key press threw
+				// and it bursts through its own shipping path (its §6b fuse, or his touch).
+				if (State->Fixture == 0)
+				{
+					for (TActorIterator<ATraceOysterJar> JarIt(TickWorld); JarIt; ++JarIt)
+					{
+						const ATraceOysterJar* Jar = *JarIt;
+						if (IsValid(Jar) && Jar->IsGrounded())
+						{
+							FVector Landed = Jar->GetActorLocation();
+							Landed.Z = State->VictimHome.Z;
+							State->VictimAnchor = Landed;
+							break;
+						}
+					}
+				}
+
+				PosePawn(VictimPawn, State->VictimAnchor, State->Facing);   // he must stay in the blast
+
+				const bool bPoisonedNow = (UTraceOysterPoisonComponent::Find(VictimPawn) != nullptr);
+				if (bPoisonedNow && !Fixture.bPoisonLanded)
+				{
+					Fixture.bPoisonLanded = true;
+					Fixture.SecondsToPoison = static_cast<float>(NowReal - State->PhaseStartReal);
+					Fixture.CooldownWhenPoisoned = Comp->GetActivatedCooldownRemaining();
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[OYSTEREPRESS] arm %d fixture %d: the victim IS poisoned (%.2fs after the throw); "
+						     "E reads %.1fs on that very frame."),
+						State->Arm, State->Fixture, Fixture.SecondsToPoison, Fixture.CooldownWhenPoisoned);
+				}
+
+				// A whole second past the poison, because "fired and then overwritten" and "never
+				// fired" look identical on the frame itself.
+				const double Deadline = Fixture.bPoisonLanded
+					? (1.0 + static_cast<double>(Fixture.SecondsToPoison))
+					: 4.0;
+				if ((NowReal - State->PhaseStartReal) < Deadline)
+				{
+					return true;
+				}
+
+				Fixture.CooldownAfterSettle = Comp->GetActivatedCooldownRemaining();
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[OYSTEREPRESS] arm %d fixture %d: poisoned=%d | E after the press %.1fs -> at the "
+					     "poison %.1fs -> a second later %.1fs."),
+					State->Arm, State->Fixture, Fixture.bPoisonLanded ? 1 : 0, Fixture.CooldownAfterPress,
+					Fixture.CooldownWhenPoisoned, Fixture.CooldownAfterSettle);
+
+				OysterSet->DebugDestroyAllJars();
+				Comp->DebugSetActivatedCooldown(0.f);
+
+				if (State->Fixture == 0)
+				{
+					State->Fixture = 1;
+					State->Phase = 1;
+					State->PhaseStartReal = NowReal;
+					return true;
+				}
+
+				if (State->Arm == 0)
+				{
+					State->Arm = 1;
+					State->Fixture = 0;
+					State->Phase = 1;
+					State->PhaseStartReal = NowReal;
+					SetIntCVar(TEXT("Trace.Oyster.LegacyRefundTeamTest"), 0);
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[OYSTEREPRESS] --- switching to the SHIPPED refund test (arm 1)"));
+					return true;
+				}
+
+				State->Phase = 5;
+				return true;
+			}
+
+			// ---- Phase 5: the verdict, in the words of the report --------------------------------
+			RestoreRefundArm();
+
+			const FEPressFixture& RedA = State->Results[0][0];
+			const FEPressFixture& RedB = State->Results[0][1];
+			const FEPressFixture& GreenA = State->Results[1][0];
+			const FEPressFixture& GreenB = State->Results[1][1];
+			const bool bTeamlessVictim = (State->VictimTeam == ETraceTeam::None);
+
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTEREPRESS] --- THE FIXTURES PROVING THEMSELVES FIRST"));
+			State->Check(RedA.CooldownAfterPress > 1.f && RedB.CooldownAfterPress > 1.f
+				&& GreenA.CooldownAfterPress > 1.f && GreenB.CooldownAfterPress > 1.f,
+				FString::Printf(TEXT("all four fixtures really did put E on cooldown BY PRESSING THE KEY "
+					"(%.1f, %.1f, %.1f, %.1f) — a zero here means the press never reached the ability"),
+					RedA.CooldownAfterPress, RedB.CooldownAfterPress,
+					GreenA.CooldownAfterPress, GreenB.CooldownAfterPress));
+			State->Check(RedA.bPoisonLanded && RedB.bPoisonLanded && GreenA.bPoisonLanded && GreenB.bPoisonLanded,
+				TEXT("all four fixtures really did poison the victim — an E at zero because nothing was "
+				     "poisoned is not a refund"));
+
+			if (bTeamlessVictim)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[OYSTEREPRESS] --- THE REPRODUCTION: the v26 refund test, on the victim a player uses"));
+				State->Check(RedA.bPoisonLanded && RedA.CooldownAfterSettle > 1.f,
+					FString::Printf(TEXT("§4 RED, fixture A: the E jar poisoned a teamless victim and E kept "
+						"counting down (%.1fs -> %.1fs). THE REPORTED BUG."),
+						RedA.CooldownAfterPress, RedA.CooldownAfterSettle));
+				State->Check(RedB.bPoisonLanded && RedB.CooldownAfterSettle > 1.f,
+					FString::Printf(TEXT("§4 RED, fixture B: a dash jar did the same (%.1fs -> %.1fs) — so it "
+						"is the RULE refusing him, not one poison route missing the refund"),
+						RedB.CooldownAfterPress, RedB.CooldownAfterSettle));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[OYSTEREPRESS] --- NO TEAMLESS VICTIM IN THIS WORLD. The red arm cannot reproduce the "
+					     "report here: against an ordinary enemy the v26 test passes, which is exactly why the "
+					     "bug survived Demo 23. Run this in the practice range for the red arm."));
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTEREPRESS] --- THE CHANGE"));
+			State->Check(GreenA.bPoisonLanded && GreenA.CooldownAfterSettle <= 0.f,
+				FString::Printf(TEXT("§4 fixture A (the E jar's own poison): E went %.1fs -> %.1fs"),
+					GreenA.CooldownAfterPress, GreenA.CooldownAfterSettle));
+			State->Check(GreenB.bPoisonLanded && GreenB.CooldownAfterSettle <= 0.f,
+				FString::Printf(TEXT("§4 fixture B (a dash jar's poison): E went %.1fs -> %.1fs"),
+					GreenB.CooldownAfterPress, GreenB.CooldownAfterSettle));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTEREPRESS] ===== %d passed, %d failed. ====="),
+				State->Passed, State->Failed);
+			UE_LOG(LogTraceGame, Display, TEXT("[OYSTEREPRESS] VERDICT: %s"),
+				(State->Failed == 0 && State->Passed > 0)
+					? TEXT("PASS — E resets on a poison, after a real key press, on the victim the player uses")
+					: TEXT("*** FAIL ***"));
+			return false;
+		}));
+	}
+
+	FAutoConsoleCommand CmdEPressRepro(
+		TEXT("Trace.Oyster.EPressRepro"),
+		TEXT("Dev only, server only. SPEC v28 §4: presses E through the REAL input pipeline, then poisons a "
+		     "victim twice (the E jar's own burst, and a dash jar), on the v26 refund test and then on the "
+		     "shipped one. The player's side of 'Oyster's E is not resetting when he poisons someone'."),
+		FConsoleCommandDelegate::CreateStatic(&RunEPressRepro));
 
 	FAutoConsoleCommand CmdETest(
 		TEXT("Trace.Oyster.ETest"),

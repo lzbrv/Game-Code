@@ -1760,6 +1760,362 @@ void ATraceHUD::DrawPassProgress()
 		TEXT("PASSING"), TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.85f));
 }
 
+// =================================================================================================
+// SPEC v28 §7 — THE SECOND, SMALLER RED RING INSIDE THE GREEN ONE
+// =================================================================================================
+//
+//   "Make a second little red ring which fills on the inside of the green one on a .6seconds timer.
+//    This timer should start right when throw charge reaches full. When the second timer completes,
+//    the core is released at full charge automatically, if a player doesn't throw it before then."
+//
+// THREE THINGS ABOUT IT, AND ALL THREE ARE THE REASON IT IS ITS OWN BLOCK RATHER THAN AN ARGUMENT TO
+// DrawCrosshairRing():
+//
+// 1. ITS RADIUS IS DERIVED FROM THE GREEN RING'S, NOT AUTHORED BESIDE IT. The green ring's radius is
+//    already a derived number (the crosshair's arm reach, which moves with UIScale and with the live
+//    ThirdPersonCrosshairScale setting), so a red ring pinned to a literal number of pixels would
+//    drift out of the green one the first time anybody touched that slider. RingRadius() below is
+//    now the ONE definition of where the green ring is — DrawCrosshairRing() asks it too — and the
+//    red one is a FRACTION of the answer, floored so it can never land on the crosshair's own arms
+//    (whose share of that radius is itself not constant; see InnerClearanceUU). Both rings therefore
+//    move together at every resolution and every crosshair scale.
+//
+// 2. IT DRAWS SERVER TRUTH. Every other number on this crosshair is predicted (see
+//    DrawThrowChargeRing): they describe the player's own finger and may legitimately run ahead of
+//    the server. This one describes a DEADLINE THE SERVER WILL ACT ON, and a locally-run deadline
+//    would finish at a different instant on every machine — the player would watch it complete and
+//    keep holding, or watch the Core leave at 92%. ATraceCore::GetThrowAutoReleaseAlpha() is the
+//    server's own stamped instant measured against the shared clock, so this ring is arithmetic on
+//    the server's decision. It can be late by the client's downstream latency; it cannot be wrong.
+//
+// 3. IT IS RED AND IT IS THINNER. The green ring says "you have full power"; this one says "you are
+//    about to lose the choice", which is the opposite kind of news, so it does not share a colour
+//    with the ring it sits inside. TraceHUDStyle::Danger, the same red the low-health and
+//    match-clock-urgent readouts use.
+namespace TraceHUDThrowRings
+{
+	/**
+	 * The OUTER TIP OF THE CROSSHAIR'S ARMS, in pixels. DrawAimReticle's own geometry, not a guess:
+	 * its arms run from Gap = 5 * UIScale * S to Gap + Arm = (5 + 11) * UIScale * S.
+	 *
+	 * S is ThirdPersonCrosshairScaleSetting() rather than the camera-blended scale because everything
+	 * on this crosshair that involves the Core is a THIRD-PERSON state — carrying is the third-person
+	 * view (contract §3) — so the ring is sized for the crosshair the thrower is actually looking at.
+	 */
+	static float ArmReach(float UIScale)
+	{
+		return (5.f + 11.f) * UIScale * TraceHUDStyle::ThirdPersonCrosshairScaleSetting();
+	}
+
+	/**
+	 * THE CROSSHAIR PROGRESS RING'S RADIUS IN PIXELS — the GREEN ring. One definition, two callers.
+	 *
+	 * Outside the open bracket radius, so the ring frames the brackets rather than cutting through
+	 * them. This is DrawCrosshairRing()'s own expression, moved here unchanged by spec v28 §7 so the
+	 * red ring can be a fraction OF it rather than a second literal beside it.
+	 */
+	static float RingRadius(float UIScale)
+	{
+		return ArmReach(UIScale) + (22.f * UIScale);
+	}
+
+	/**
+	 * How far inside the green ring the red one sits, AS A FRACTION OF THE GREEN RING'S RADIUS.
+	 *
+	 * 0.72, so the inset is 28% of whatever the green ring currently is. NOT a gap in pixels: the
+	 * green ring's own radius moves with UIScale AND with the live ThirdPersonCrosshairScale setting,
+	 * so a fixed pixel inset would be a different visual relationship at every resolution and every
+	 * slider position — which is precisely the "stored a value that modifies a base as an absolute"
+	 * trap this project has a standing rule about.
+	 */
+	static constexpr float InnerRadiusFraction = 0.72f;
+
+	/**
+	 * A FLOOR ON THAT, ALSO DERIVED: the red ring may never be drawn on top of the crosshair's arms.
+	 *
+	 * The arm tips are at ArmReach() and the green ring at ArmReach() + 22 * UIScale, so the FRACTION
+	 * the arms occupy is not constant — it is 0.42 of the green radius at crosshair scale 1.0 and
+	 * 0.69 at the maximum of 3.0. A flat 0.72 would therefore be a clean ring for most players and a
+	 * ring sitting on the crosshair's own arms for anyone who raised that slider. So the fraction is
+	 * the intent and this is the guarantee: never closer to centre than the arm tips plus a scaled
+	 * clearance, so the two shapes cannot touch at any setting.
+	 */
+	static constexpr float InnerClearanceUU = 4.f;
+
+	/** Thickness, relative to the green ring's. Thinner: "little", and it must not read as the louder ring. */
+	static constexpr float InnerThicknessFraction = 0.75f;
+
+	/** Where the red ring goes: a fraction of the green ring, pushed out clear of the crosshair arms. */
+	static float InnerRingRadius(float UIScale)
+	{
+		const float Green = RingRadius(UIScale);
+		return FMath::Max(Green * InnerRadiusFraction, ArmReach(UIScale) + InnerClearanceUU * UIScale);
+	}
+
+	/** Segment count. The same 48 the green ring uses, so the two arcs quantise identically. */
+	static constexpr int32 Segments = 48;
+
+	/**
+	 * `Trace.HUD.ThrowRings.Shot 1` — PHOTOGRAPH THE TWO RINGS WHEN THEY ARE ACTUALLY ON SCREEN.
+	 *
+	 * The same argument as Trace.HUD.PullRing.Shot: the window is 0.6 s long, it exists only while a
+	 * player is holding a full charge, and a screenshot on a wall-clock timer catches an empty
+	 * crosshair. The trigger is the DRAW ITSELF, so the frame captured is a frame that contained both
+	 * rings by construction. Two captures: the first frame the red ring appears, and the first frame
+	 * it is past a third full, which is the one that proves it is FILLING rather than merely present.
+	 */
+	static TAutoConsoleVariable<int32> CVarShot(
+		TEXT("Trace.HUD.ThrowRings.Shot"),
+		0,
+		TEXT("SPEC v28 §7. 1: screenshot the first frame the red auto-release ring is drawn, and again "
+		     "the first frame it is past a third full. bShowUI, because both rings are Canvas HUD."),
+		ECVF_Default);
+
+	/** 1 logs, at 4 Hz, the two rings' numbers side by side. Evidence that the red one is not local. */
+	static TAutoConsoleVariable<int32> CVarLog(
+		TEXT("Trace.HUD.ThrowRings.Log"),
+		0,
+		TEXT("SPEC v28 §7. 1: log the green ring's PREDICTED charge alpha and the red ring's REPLICATED "
+		     "auto-release alpha together, at 4 Hz. A red ring that moves while the server's stamp is "
+		     "absent would show up here as alpha with no stamp."),
+		ECVF_Default);
+
+	/** Draw-record: the CHORDS emitted, not the alpha requested. Read by Trace.HUD.ThrowRings.Report. */
+	static int32 LastChords = 0;
+	static float LastAlpha = -1.f;
+	static int32 EverDrawnFrames = 0;
+
+	/**
+	 * `Trace.HUD.ThrowRings.Report` — what the red ring has ACTUALLY put on the canvas this session.
+	 *
+	 * The alpha is what was asked for; the CHORD COUNT is what was emitted. This project has already
+	 * shipped a geometry helper that returned a healthy number and drew nothing, so a report that only
+	 * printed the alpha would be the same evidence that failure passed.
+	 */
+	static FAutoConsoleCommand CmdReport(
+		TEXT("Trace.HUD.ThrowRings.Report"),
+		TEXT("SPEC v28 §7. Print the red auto-release ring's last drawn alpha, the CHORDS it emitted "
+		     "for it, and how many frames it has been drawn on this machine."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ThrowRings] spec v28 §7: drawn on %d frame(s) this session. Last alpha %.3f, last ")
+				TEXT("chords emitted %d of %d. Window %.2fs (Trace.ModeB.ThrowAutoReleaseSeconds; 0 = off)."),
+				EverDrawnFrames, LastAlpha, LastChords, Segments,
+				ATraceCore::GetThrowAutoReleaseSeconds());
+		}));
+
+	static bool bShotAppeared = false;
+	static bool bShotFilling = false;
+	static float NextLogTime = 0.f;
+
+	/**
+	 * `Trace.HUD.ThrowRings.Demo [HoldSeconds]` — PUT BOTH RINGS ON SCREEN SO THEY CAN BE PHOTOGRAPHED.
+	 *
+	 * The window this section is about is 0.6 s long and only exists while a player is holding a full
+	 * charge, so there is no way to catch it by hand in a scripted run. This drives the REAL player
+	 * path — the select screen hands input back, the Core is granted, and then a real LEFT MOUSE
+	 * BUTTON is held through Trace.SimInput — and arms the draw-triggered capture above. It fakes no
+	 * ring and no number: if the grant is refused or the press does not land, nothing is captured and
+	 * the report says the ring was drawn on 0 frames.
+	 *
+	 * The default hold is long enough to run past the auto-release, so one run shows the whole of §7:
+	 * the green ring filling, the red ring filling inside it, and the Core leaving on its own.
+	 */
+	static void Demo(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ThrowRings] Demo: no world."));
+			return;
+		}
+
+		// Long enough that the auto-release fires while the button is still down, which is the case
+		// §7 is actually about: charge time + window + a margin.
+		const float Hold = (Args.Num() > 0)
+			? FCString::Atof(*Args[0])
+			: (ATraceCore::GetThrowChargeSeconds() + ATraceCore::GetThrowAutoReleaseSeconds() + 0.6f);
+
+		// ECVF_SetByConsole, not a code-priority Set: a run that armed this from -ExecCmds set it at
+		// console priority, and a lower-priority write would be silently dropped. This project has
+		// already lost a diagnostic to exactly that (see Trace.ModeB.MomentumTest's latch).
+		if (IConsoleVariable* ShotVar = CVarShot.AsVariable())
+		{
+			ShotVar->Set(1, ECVF_SetByConsole);
+		}
+		bShotAppeared = false;
+		bShotFilling = false;
+		EverDrawnFrames = 0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ThrowRings] DEMO: charge %.2fs, auto-release window %.2fs, holding the throw for ")
+			TEXT("%.2fs. Captures are armed on the DRAW, so a frame that reaches the disk contained ")
+			TEXT("both rings."),
+			ATraceCore::GetThrowChargeSeconds(), ATraceCore::GetThrowAutoReleaseSeconds(), Hold);
+
+		TWeakObjectPtr<UWorld> WeakWorld(World);
+		auto Run = [WeakWorld](const FString& Command, float AtSeconds)
+		{
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+				[WeakWorld, Command](float) -> bool
+			{
+				UWorld* W = WeakWorld.Get();
+				APlayerController* PC = (W != nullptr) ? W->GetFirstPlayerController() : nullptr;
+				if (PC != nullptr)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[ThrowRings] > %s"), *Command);
+					PC->ConsoleCommand(Command, /*bWriteToLog=*/false);
+				}
+				return false;
+			}), FMath::Max(0.01f, AtSeconds));
+		};
+
+		// The select screen SUPPRESSES GAMEPLAY INPUT while it is up, and a run that pressed into that
+		// suppression would report an unfilled ring for a press that never happened — the failure
+		// Trace.Audio.Integ's warm-up step records having made once already.
+		Run(TEXT("Trace.Characters.Select 3"), 0.10f);
+		Run(TEXT("Trace.Verif.GrantCore"), 1.60f);
+		Run(FString::Printf(TEXT("Trace.SimInput LeftMouseButton %.2f controller"), Hold), 2.40f);
+		Run(TEXT("Trace.HUD.ThrowRings.Report"), 2.60f + Hold + 1.20f);
+		// The SECOND half of the evidence, and the half a listen host cannot supply on its own: what
+		// this machine SAW of the server's full-charge instant. Run the identical command on a joined
+		// client afterwards and compare the "stamps SEEN" counts — that comparison is the whole of
+		// "the ring shows the server's own progress".
+		Run(TEXT("Trace.ModeB.ThrowAutoRelease.Report"), 2.60f + Hold + 1.40f);
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs CmdDemo(
+		TEXT("Trace.HUD.ThrowRings.Demo"),
+		TEXT("SPEC v28 §7. Grant the Core to the local pawn and HOLD the throw past full charge, with "
+		     "the two-ring capture armed, so the green and red rings can be photographed and the "
+		     "automatic release watched. Args: [HoldSeconds]."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Demo));
+
+	static void Capture(const TCHAR* Which, float Alpha, float GreenRadius, float RedRadius)
+	{
+		const FString Path = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"),
+			FString::Printf(TEXT("v28throwrings_%s_%s.png"), Which,
+				*FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ThrowRings] CAPTURE (%s): the RED auto-release ring is on screen at %.1f px inside the ")
+			TEXT("GREEN charge ring at %.1f px, filled %.0f%% off the SERVER's stamp -> %s"),
+			Which, RedRadius, GreenRadius, 100.f * Alpha, *Path);
+
+		FScreenshotRequest::RequestScreenshot(Path, /*bInShowUI=*/true, /*bAddFilenameSuffix=*/false);
+	}
+
+	/**
+	 * Draws the red ring, or nothing.
+	 *
+	 * A free function taking the HUD rather than a member, so §7 adds no declaration to TraceHUD.h —
+	 * that header is being edited by other sections this pass and this one does not need it.
+	 * AHUD::DrawLine is public, and every number it needs is passed in from the one caller.
+	 */
+	static void Draw(AHUD* HUD, const ATraceCore* Core, float CX, float CY, float UIScale, float Now)
+	{
+		LastChords = 0;
+		LastAlpha = -1.f;
+
+		if (HUD == nullptr || Core == nullptr)
+		{
+			return;
+		}
+
+		// SERVER TRUTH OR NOTHING. Negative means the server has not stamped a full charge for this
+		// hold — either the green ring is not full yet, or (on a client) the stamp is still in flight,
+		// or §7 is switched off at Trace.ModeB.ThrowAutoReleaseSeconds 0, which is the red arm. In all
+		// three cases the honest drawing is no ring at all.
+		const float Alpha = Core->GetThrowAutoReleaseAlpha();
+
+		if (CVarLog.GetValueOnGameThread() != 0 && Now >= NextLogTime)
+		{
+			NextLogTime = Now + 0.25f;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ThrowRings] green (predicted) %.3f | red (server) %.3f | window %.2fs. The red ring ")
+				TEXT("draws the second number and nothing else."),
+				Core->GetThrowChargeAlpha(), Alpha, ATraceCore::GetThrowAutoReleaseSeconds());
+		}
+
+		if (Alpha < 0.f)
+		{
+			return;
+		}
+
+		const float GreenRadius = RingRadius(UIScale);
+		const float Radius = InnerRingRadius(UIScale);
+		const float GreenThickness = FMath::Max(2.f, 3.f * UIScale);
+		const float Thickness = FMath::Max(1.f, GreenThickness * InnerThicknessFraction);
+
+		auto PointAt = [CX, CY, Radius](float T)
+		{
+			// Twelve o'clock, closing clockwise — the same sweep the green ring and the pull ring use.
+			// A player who has learned one progress ring in this game has learned all of them.
+			const float Angle = -UE_HALF_PI + T * UE_TWO_PI;
+			return FVector2D(CX + Radius * FMath::Cos(Angle), CY + Radius * FMath::Sin(Angle));
+		};
+
+		// The unfilled track, DIMMED IN RGB AND NOT IN ALPHA. AHUD::DrawLine builds an FCanvasLineItem
+		// whose blend mode is SE_BLEND_Opaque, so the alpha handed to it is DISCARDED — this HUD has
+		// already shipped a "faint" track that rendered as the brightest thing on screen. A dark red,
+		// so the empty ring still reads as the same object as the filled one.
+		// 0.15, MEASURED OFF THE CAPTURE RATHER THAN CHOSEN BY EYE. Sampling the ring's own pixels out
+		// of v28throwrings_filling: at 0.28 the track came back (140,72,66) against a filled arc of
+		// (210,108,99), which is only a 1.5x step and reads as one continuous circle at 720p. At 0.15
+		// the track is ~(105,55,50) and the boundary between "filled" and "still to go" is obvious.
+		const FLinearColor Track = TraceHUDStyle::Shade(TraceHUDStyle::Danger, 0.15f, 0.f);
+		for (int32 Index = 0; Index < Segments; ++Index)
+		{
+			const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
+			const FVector2D B = PointAt(static_cast<float>(Index + 1) / Segments);
+			HUD->DrawLine(A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
+		}
+
+		// The fill PULSES IN BRIGHTNESS, at the same 12 rad/s every "act now" state on this HUD uses,
+		// and it pulses harder the closer the deadline is. Brightness and not alpha, for the reason
+		// above; the previous pass shipped a pulse that never once happened because it was written in
+		// alpha and three captured frames came back bit-identical.
+		// MEASURED, NOT GUESSED: the first capture of this ring came back a muted brown over the bright
+		// arena floor, because the brightness floor was 0.55 * 0.75 = 0.41 of Danger. It starts at 0.8
+		// and reaches the full palette red at the deadline, and the pulse only ever takes 15% off the
+		// top — so the ring is unambiguously RED on the frame it appears and brightest on the frame the
+		// Core leaves.
+		const float Urgency = 0.80f + 0.20f * Alpha;
+		const FLinearColor Fill = TraceHUDStyle::Shade(
+			TraceHUDStyle::Danger, Urgency * (0.85f + 0.15f * FMath::Sin(Now * 12.f)), 0.f);
+
+		const int32 Filled = FMath::CeilToInt(FMath::Clamp(Alpha, 0.f, 1.f) * Segments);
+		for (int32 Index = 0; Index < Filled; ++Index)
+		{
+			const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
+			const FVector2D B = PointAt(FMath::Min(Alpha, static_cast<float>(Index + 1) / Segments));
+			HUD->DrawLine(A.X, A.Y, B.X, B.Y, Fill, Thickness);
+		}
+
+		// THE CHORDS, not the alpha. A ring that computed a healthy 0.62 and emitted nothing would
+		// otherwise report itself as drawn — the failure shape this project has already been caught by.
+		LastChords = Filled;
+		LastAlpha = Alpha;
+		++EverDrawnFrames;
+
+		// After the ring is on the canvas, never before: a capture armed on the DECISION to draw
+		// photographs the frame before the pixels exist.
+		if (CVarShot.GetValueOnGameThread() != 0)
+		{
+			if (!bShotAppeared)
+			{
+				bShotAppeared = true;
+				Capture(TEXT("appeared"), Alpha, GreenRadius, Radius);
+			}
+			else if (!bShotFilling && Alpha >= 0.34f)
+			{
+				bShotFilling = true;
+				Capture(TEXT("filling"), Alpha, GreenRadius, Radius);
+			}
+		}
+	}
+}
+
 void ATraceHUD::DrawCrosshairRing(float FillAlpha, const FLinearColor& FillColor,
 	const FString& Caption, const FLinearColor& CaptionColor)
 {
@@ -1771,12 +2127,11 @@ void ATraceHUD::DrawCrosshairRing(float FillAlpha, const FLinearColor& FillColor
 	const float CX = FMath::RoundToFloat(ViewW * 0.5f);
 	const float CY = FMath::RoundToFloat(ViewH * 0.5f);
 
-	// Outside the open bracket radius, so the ring frames the brackets rather than cutting through
-	// them. Derived from the same crosshair arm reach DrawPassReticle() uses, for the same reason:
-	// ThirdPersonCrosshairScale is a live setting, and a ring pinned to a literal would be sliced by
-	// the brackets as soon as anyone raised it. Clearance is 8 px beyond the open bracket radius.
-	const float ArmReach = (5.f + 11.f) * UIScale * TraceHUDStyle::ThirdPersonCrosshairScaleSetting();
-	const float Radius = ArmReach + (22.f * UIScale);
+	// SPEC v28 §7 moved this expression into TraceHUDThrowRings::RingRadius(), unchanged, so that the
+	// red auto-release ring can be sized as a FRACTION OF THIS RING rather than authored beside it.
+	// One definition of where the crosshair's progress ring is; the inner ring is derived from it and
+	// therefore moves with UIScale and with the live ThirdPersonCrosshairScale setting.
+	const float Radius = TraceHUDThrowRings::RingRadius(UIScale);
 	const float Thickness = FMath::Max(2.f, 3.f * UIScale);
 
 	// Canvas has no arc primitive, so the ring is a fan of short chords. 48 segments is smooth at any
@@ -1908,6 +2263,16 @@ void ATraceHUD::DrawThrowChargeRing()
 
 	DrawCrosshairRing(ChargeAlpha, RingColor, RingCaption,
 		bFull ? TraceHUDStyle::Good : TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.85f));
+
+	// SPEC v28 §7 — THE SECOND, SMALLER RED RING, INSIDE THE ONE JUST DRAWN.
+	//
+	// Immediately after the green one and from the same function, so the two are laid down in the
+	// order they are read and can never be gated apart: if the green ring is on screen this line has
+	// run. It draws itself only once the SERVER has stamped a full charge (see the block above
+	// DrawCrosshairRing), so before full it is silently nothing, and the caption below still belongs
+	// to the green ring.
+	TraceHUDThrowRings::Draw(this, ChargeCore,
+		FMath::RoundToFloat(ViewW * 0.5f), FMath::RoundToFloat(ViewH * 0.5f), UIScale, Now);
 
 #if !UE_BUILD_SHIPPING
 	bDrewChargeRing = true;
@@ -2734,7 +3099,19 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 
 		if (OutState.bReloading)
 		{
-			const float ReloadTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceAmmo::GetReloadSeconds());
+			// *** SPEC v28 §9 INTEGRATION — THE ARC MUST ASK THE WEAPON, NOT THE PISTOL. ***
+			// This read TraceAmmo::GetReloadSeconds(), which is the PISTOL's 0.5 s and knows nothing
+			// about which gun is in hand. §9 added an SMG that reloads in 0.8 s, so during an SMG
+			// reload the arc sat at zero for the first 0.300 s and then filled over the remaining
+			// 0.5 s - the bar lied about a third of every SMG reload. The §9 owner found this,
+			// added UTraceWeaponComponent::GetReloadSeconds() for exactly this call site, and could
+			// not make the change: TraceHUD.cpp is not their file.
+			//
+			// GetReloadSeconds() is the SAME number the component counts its own reload down from,
+			// so the arc and the reload can no longer disagree for any weapon - including whatever
+			// third gun is added next, which is the real reason to ask the component rather than to
+			// add an `if (IsSmgEquipped())` here.
+			const float ReloadTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, WeaponComp->GetReloadSeconds());
 			OutState.ReloadRemaining = WeaponComp->GetReloadRemaining();
 			OutState.ReloadFraction =
 				FMath::Clamp(ReloadTotal - OutState.ReloadRemaining, 0.f, ReloadTotal) / ReloadTotal;

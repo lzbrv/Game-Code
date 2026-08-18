@@ -17,6 +17,12 @@
 
 namespace
 {
+	/**
+	 * "This row ships with only one key." Named rather than a null pointer so the table reads as a
+	 * table — every row states its second bind, and sixteen of them state that there isn't one.
+	 */
+	FKey Default_None()        { return FKey(); }
+
 	FKey Default_MoveForward() { return EKeys::W; }
 	FKey Default_MoveBack()    { return EKeys::S; }
 	FKey Default_MoveLeft()    { return EKeys::A; }
@@ -47,8 +53,41 @@ namespace
 	 * Those two predicates are mutually exclusive on `is this pawn the carrier`, so the press is
 	 * delivered to both verbs and at most one authoritative gate can accept it. Neither eats the
 	 * other; there is no priority to get wrong. See OnParryStarted for the full argument.
+	 *
+	 * =============================================================================================
+	 * *** SPEC v28 §3d — PARRY IS Q **AND** THE THUMB MOUSE BUTTON, AND IT IS OFF RIGHT MOUSE. ***
+	 * =============================================================================================
+	 *
+	 * Verbatim: "Parry defaults to BOTH Q and the thumb mouse button."
+	 *
+	 * TWO DEFAULTS IS WHAT §3c's SECOND SLOT IS FOR, and this is the only row in the table that uses
+	 * it. Q is where parry lived before v25 §7 moved it to the mouse, so returning muscle memory is
+	 * being handed back rather than invented; ThumbMouseButton is EKeys' name for mouse 4, the
+	 * button an FPS player's thumb is already resting on.
+	 *
+	 * IT ALSO VACATES THE RIGHT MOUSE BUTTON, WHICH IS THE POINT OF THE TIMING. Spec v28 §10 puts
+	 * MELEE on right click by default. Parry has held that button since v25 §7, and two verbs on one
+	 * button with no exclusion between them (you can parry and you can melee while carrying nothing)
+	 * is a genuine conflict, not a shareable one — see ETraceInputStates. So §3d and §10 are the same
+	 * change seen from two ends: this line is what makes right mouse free for the melee to take.
+	 *
+	 * *** THE ConfigId MOVES WITH IT: "ParryPull" -> "ParryKeys". *** This table's own history says a
+	 * default key change is INVISIBLE to anybody who has ever saved a setting, because Save() writes a
+	 * line for every action and RefreshFromConfig honours them all — the owner's machine has
+	 * `ParryPull=RightMouseButton` in it right now. Shipping §3d under the old id would leave every
+	 * existing player parrying on right mouse, i.e. sharing a button with the new melee, which is the
+	 * exact collision this note exists to avoid. The id has done this twice before ("Boost" -> "Parry"
+	 * in v3, "Parry" -> "ParryPull" in v25 §7) and the migration is the same one line of existing
+	 * behaviour both times: a line naming an id the table does not have is DROPPED and the row falls
+	 * back to its shipped default. Cost: one hand-rebound parry key, once, loudly, in the log.
+	 *
+	 * "ParryKeys" and not back to "Parry", which was free again, because a pre-v25 file still contains
+	 * `Parry=Q` — reusing the string would resurrect a five-versions-old line, put parry on Q ALONE and
+	 * silently drop the thumb button this note asks for.
 	 */
-	FKey Default_Parry()       { return EKeys::RightMouseButton; }
+	FKey Default_Parry()       { return EKeys::Q; }
+	/** SPEC v28 §3d — the second half of "BOTH Q and the thumb mouse button". Mouse 4. */
+	FKey Default_ParryAlt()    { return EKeys::ThumbMouseButton; }
 	FKey Default_Fire()        { return EKeys::LeftMouseButton; }
 	/**
 	 * *** SPEC v25 §7 — THE THROW HAS NO DEFAULT KEY OF ITS OWN. *** It used to be right mouse; the
@@ -143,6 +182,21 @@ namespace
 	 * run. It does not.
 	 */
 	FKey Default_PullCore()         { return EKeys::F; }
+
+	/**
+	 * *** SPEC v28 §10 — "Melee should be bound to right click by default." ***
+	 *
+	 * THE RIGHT MOUSE BUTTON, AND IT IS FREE BY CONSTRUCTION RATHER THAN BY LUCK. Spec v25 §7 put the
+	 * parry here; spec v28 §3d moved the parry to Q + the thumb mouse button precisely so this row
+	 * could have the button, and paid the "ParryPull" -> "ParryKeys" id migration to make sure a
+	 * RETURNING player's saved file could not put their old parry back on it. Trace.Input.VerifyRightMouse
+	 * asserts the whole arrangement — melee holds the button, nothing else does — so a regression here
+	 * fails a console command instead of a playtest.
+	 *
+	 * SetKey's stealing rule would log it if this default took a key from another action on a first run.
+	 * It does not: the table above leaves the button unclaimed.
+	 */
+	FKey Default_Melee()            { return EKeys::RightMouseButton; }
 }
 
 const TArray<FTraceInputActionInfo>& TraceInputActions::All()
@@ -150,13 +204,17 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 	// Function-local static: built on first use, after EKeys is up, and never rebuilt.
 	static const TArray<FTraceInputActionInfo> Table =
 	{
-		{ ETraceInputAction::MoveForward, TEXT("MoveForward"), TEXT("MOVE FORWARD"), &Default_MoveForward },
-		{ ETraceInputAction::MoveBack,    TEXT("MoveBack"),    TEXT("MOVE BACK"),    &Default_MoveBack    },
-		{ ETraceInputAction::MoveLeft,    TEXT("MoveLeft"),    TEXT("STRAFE LEFT"),  &Default_MoveLeft    },
-		{ ETraceInputAction::MoveRight,   TEXT("MoveRight"),   TEXT("STRAFE RIGHT"), &Default_MoveRight   },
-		{ ETraceInputAction::Jump,        TEXT("Jump"),        TEXT("JUMP"),         &Default_Jump        },
-		{ ETraceInputAction::Crouch,      TEXT("Crouch"),      TEXT("CROUCH / SLIDE"), &Default_Crouch    },
-		{ ETraceInputAction::Dash,        TEXT("Dash"),        TEXT("DASH"),         &Default_Dash        },
+		// SPEC v28 §3b — THE FOURTH COLUMN IS THE EXCLUSION GROUP, and it is the whole conflict rule.
+		// ETraceInputStates::Match means "live whether or not this pawn is carrying the Core", which is
+		// true of everything a player does with their feet, their weapon slots and their abilities. The
+		// four rows that are NOT Match are the four the note is about; each one argues for itself below.
+		{ ETraceInputAction::MoveForward, TEXT("MoveForward"), TEXT("MOVE FORWARD"), &Default_MoveForward, &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::MoveBack,    TEXT("MoveBack"),    TEXT("MOVE BACK"),    &Default_MoveBack,    &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::MoveLeft,    TEXT("MoveLeft"),    TEXT("STRAFE LEFT"),  &Default_MoveLeft,    &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::MoveRight,   TEXT("MoveRight"),   TEXT("STRAFE RIGHT"), &Default_MoveRight,   &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::Jump,        TEXT("Jump"),        TEXT("JUMP"),         &Default_Jump,        &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::Crouch,      TEXT("Crouch"),      TEXT("CROUCH / SLIDE"), &Default_Crouch,    &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::Dash,        TEXT("Dash"),        TEXT("DASH"),         &Default_Dash,        &Default_None, ETraceInputStates::Match },
 		// *** SPEC v25 §7. BOTH ConfigIds ON THESE TWO ROWS ARE DELIBERATELY NEW STRINGS. ***
 		//
 		// Read this before "tidying" them back. Changing a DEFAULT key does nothing at all for anyone
@@ -180,26 +238,29 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// WHAT A RETURNING PLAYER LOSES: a hand-rebound parry or throw key, once. That is the price
 		// of the note landing at all, it is paid a single time, and it is loud in the log.
 		//
-		// The new ids also say what the buttons now DO. "ParryPull" is one button with two verbs
-		// (spec v25 §2's Core pull rides the parry bind); "ThrowCore" is the mode-neutral name for
-		// the verb mouse 1 already performs while carrying.
+		// *** SPEC v28 §3d SPENDS THAT COST A THIRD TIME: "ParryPull" -> "ParryKeys". *** §3d moves the
+		// parry onto Q AND the thumb mouse button, which is a DEFAULT CHANGE and therefore invisible to
+		// every returning player unless the id moves with it — and this time leaving them behind would
+		// not be cosmetic, because §10 is putting MELEE on the right mouse button they would still be
+		// parrying with. The full argument is at Default_Parry(). The DisplayName also gains its second
+		// chip on the options page; that string is persisted nowhere and is free to change.
 		//
-		// NOT SAFE TO RENAME, for contrast, and this is why the rule is per-row rather than blanket:
-		// "Ability", "AbilitySecondary" and "Reload" are looked up BY STRING outside this file
-		// (UTraceAbilityInputRelay, ATraceHUD's ability and reload rows). Neither of these two is.
-		// *** SPEC v26 §1 RENAMES THE LABEL AND NOT THE ID. *** "Make parry and pull core two separate
-		// binds in the settings menu": the pull moved out to its own row at the bottom of this table,
-		// so this row is the parry alone and the "/ PULL CORE" half of its label is now a lie.
-		//
-		// The ConfigId stays "ParryPull". Every id migration costs a returning player their hand-rebound
-		// key exactly once (RefreshFromConfig drops any line naming an id this table no longer has), v25
-		// §7 already spent that cost to put parry on this button, and spending it again to make the
-		// string prettier would silently un-rebind everybody who has touched their parry since — for no
-		// behaviour change at all. DisplayName is persisted nowhere and is therefore free to correct.
-		{ ETraceInputAction::Parry,       TEXT("ParryPull"),   TEXT("PARRY"),        &Default_Parry       },
-		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire        },
-		{ ETraceInputAction::Pass,        TEXT("ThrowCore"),   TEXT("THROW / PASS CORE"), &Default_Pass  },
-		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard  },
+		// PARRY IS `Carrying` AND NOTHING ELSE: TraceParry::RequestParry refuses with
+		// ETraceParryRefusal::NotCarrying, so a parry key is dead weight for a player who is not holding
+		// the Core — which is exactly what makes it shareable with the pull and with fire.
+		{ ETraceInputAction::Parry,       TEXT("ParryKeys"),   TEXT("PARRY"),        &Default_Parry,       &Default_ParryAlt, ETraceInputStates::Carrying },
+		// FIRE IS `NotCarrying`, WHICH IS THE OWNER'S OWN SENTENCE: "firing only while NOT carrying".
+		// ATraceCharacter::DoFirePressed returns early into DoPassPressed the moment bIsCarrier is true,
+		// so the gun genuinely cannot be fired while holding the Core. That overload is why the note can
+		// ask for the throw on this very button and be right: on a shared key the carrier's press reaches
+		// the throw twice (once through fire's overload, once through the throw's own handler) and
+		// ATraceCore::RequestPassInput is a latch, so the second arrival is absorbed.
+		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire,        &Default_None, ETraceInputStates::NotCarrying },
+		// THE THROW IS `Carrying`: ATraceCore::RequestPassInput only arms for the pawn that is holding
+		// the Core. Fire's NotCarrying and this row's Carrying are disjoint, so ActionsMayShareAKey says
+		// yes and spec v28 §3b's example — throw core on the same button as fire — is legal.
+		{ ETraceInputAction::Pass,        TEXT("ThrowCore"),   TEXT("THROW / PASS CORE"), &Default_Pass, &Default_None, ETraceInputStates::Carrying },
+		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard,  &Default_None, ETraceInputStates::Match },
 		// SPEC v13 §2. These two rows exist for the options screen as much as for the game: the
 		// rebind list IS this table, walked in order, so an action that is not here is an action the
 		// player cannot see or rebind however well it is wired up in the controller. "Both new binds
@@ -208,18 +269,18 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// SPEC v15 §5 DELETED THE `SwapWeapon` ROW that used to sit directly above these two. That is
 		// also what removes "SWAP WEAPON" from the options screen's rebind list — the list is this
 		// table walked in order and nothing else, so there is no second place to go and delete it.
-		{ ETraceInputAction::EquipKnife,  TEXT("EquipKnife"),  TEXT("EQUIP KNIFE"),  &Default_EquipKnife  },
-		{ ETraceInputAction::EquipGun,    TEXT("EquipGun"),    TEXT("EQUIP GUN"),    &Default_EquipGun    },
+		{ ETraceInputAction::EquipKnife,  TEXT("EquipKnife"),  TEXT("EQUIP KNIFE"),  &Default_EquipKnife,  &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::EquipGun,    TEXT("EquipGun"),    TEXT("EQUIP GUN"),    &Default_EquipGun,    &Default_None, ETraceInputStates::Match },
 		// SPEC v14 §5. Same reasoning as the two rows above: the rebind list IS this table, so an
 		// ability the player cannot see here is an ability they cannot rebind however well it is
 		// wired in the controller. The ConfigIds are the two strings ATraceHUD and
 		// UTraceAbilityInputRelay already search for by name — do not rename them.
-		{ ETraceInputAction::Ability,          TEXT("Ability"),          TEXT("ABILITY"),           &Default_Ability          },
-		{ ETraceInputAction::AbilitySecondary, TEXT("AbilitySecondary"), TEXT("ABILITY (SECONDARY)"), &Default_AbilitySecondary },
+		{ ETraceInputAction::Ability,          TEXT("Ability"),          TEXT("ABILITY"),           &Default_Ability,          &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::AbilitySecondary, TEXT("AbilitySecondary"), TEXT("ABILITY (SECONDARY)"), &Default_AbilitySecondary, &Default_None, ETraceInputStates::Match },
 		// SPEC v16 §1, "R to reload". Same reasoning as every row above: the options screen's rebind
 		// list IS this table walked in order, so an action missing from here is an action the player
 		// cannot see or rebind however well it is wired up in the controller.
-		{ ETraceInputAction::Reload,           TEXT("Reload"),           TEXT("RELOAD"),            &Default_Reload           },
+		{ ETraceInputAction::Reload,           TEXT("Reload"),           TEXT("RELOAD"),            &Default_Reload,           &Default_None, ETraceInputStates::Match },
 		// SPEC v26 §1 — "Make parry and pull core two separate binds in the settings menu."
 		//
 		// THIS LINE IS WHAT PUTS THE PULL ON THE KEYBIND PAGE, and nothing else does. The options
@@ -232,14 +293,51 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// enumerator's comment). PULL CORE sitting under RELOAD rather than next to PARRY is the price
 		// of never renumbering the runtime table, and it is the right trade: the ordering is cosmetic,
 		// a renumber is a live bug.
-		{ ETraceInputAction::PullCore,         TEXT("PullCore"),         TEXT("PULL CORE"),         &Default_PullCore         },
+		//
+		// `NotCarrying`, and spec v25 §2 is where that comes from: the pull is refused to the team that
+		// dropped the Core and to the carrier by definition — you cannot pull what you are holding. That
+		// is what lets it share a key with the PARRY (Carrying) and refuses to let it share one with FIRE
+		// (also NotCarrying), which is the conflict check earning its keep in both directions.
+		{ ETraceInputAction::PullCore,         TEXT("PullCore"),         TEXT("PULL CORE"),         &Default_PullCore,         &Default_None, ETraceInputStates::NotCarrying },
+
+		// *** SPEC v28 §10 — THE MELEE BIND, AND THE ONE THING NEITHER §3 NOR §10 COULD SHIP ALONE. ***
+		//
+		// §10 built the verb and could not bind it (this file is §3's); §3 vacated right mouse and could
+		// not add the row (the verb is §10's). Both said so in their hand-off notes and both were right.
+		// The integrator owns the seam, so the row lands here. Everything else was already in place: the
+		// button is unclaimed, TraceMelee::HandleMeleeInput is the whole verb including §10's Core-pull
+		// precedence, and ATracePlayerController now maps IA_Melee through the same KeyFor/MapButton path
+		// as every other button, so it is rebindable on the settings page like anything else.
+		//
+		// `NotCarrying`, MEASURED AND NOT ASSUMED — see the enumerator's comment for the two gates
+		// (UTraceWeaponComponent::CanSwing's IsCarrier() refusal and ATraceCore::CanPullNow). The
+		// consequence that matters: melee may NOT share a key with FIRE or PULL CORE, and PULL CORE is the
+		// one that would actually have hurt — the pull already rides this button under §10's precedence,
+		// so a second PullCore bind on it would dispatch the same verb twice from one press.
+		{ ETraceInputAction::Melee,            TEXT("Melee"),            TEXT("MELEE"),             &Default_Melee,            &Default_None, ETraceInputStates::NotCarrying },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 17,
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 18,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 
 	return Table;
+}
+
+FString LexTraceInputStates(ETraceInputStates States)
+{
+	// Spelled out rather than printed as a number: every message this appears in is an explanation of
+	// WHY two actions may or may not share a key, and "3" explains nothing to the person reading it.
+	if (States == ETraceInputStates::None)
+	{
+		return TEXT("NONE");
+	}
+
+	TArray<FString> Parts;
+	if (EnumHasAnyFlags(States, ETraceInputStates::Carrying))    { Parts.Add(TEXT("CARRYING")); }
+	if (EnumHasAnyFlags(States, ETraceInputStates::NotCarrying)) { Parts.Add(TEXT("NOT CARRYING")); }
+	if (EnumHasAnyFlags(States, ETraceInputStates::Menu))        { Parts.Add(TEXT("MENU")); }
+	return FString::Join(Parts, TEXT("+"));
 }
 
 const FTraceInputActionInfo& TraceInputActions::Info(ETraceInputAction Action)
@@ -255,7 +353,8 @@ const FTraceInputActionInfo& TraceInputActions::Info(ETraceInputAction Action)
 
 UTraceUserSettings::UTraceUserSettings()
 {
-	Bindings.SetNum(static_cast<int32>(ETraceInputAction::Count));
+	// SPEC v28 §3c — MaxKeysPerAction slots per action, flat. See the Bindings declaration.
+	Bindings.SetNum(static_cast<int32>(ETraceInputAction::Count) * MaxKeysPerAction);
 }
 
 UTraceUserSettings& UTraceUserSettings::Get()
@@ -367,30 +466,191 @@ FString UTraceUserSettings::DescribeKey(const FKey& Key)
 	return Key.GetDisplayName().ToString().ToUpper();
 }
 
+int32 UTraceUserSettings::SlotIndex(ETraceInputAction Action, int32 Slot)
+{
+	const int32 ActionIndex = static_cast<int32>(Action);
+	if (ActionIndex < 0 || ActionIndex >= static_cast<int32>(ETraceInputAction::Count)
+		|| Slot < 0 || Slot >= MaxKeysPerAction)
+	{
+		return INDEX_NONE;
+	}
+	return ActionIndex * MaxKeysPerAction + Slot;
+}
+
+bool UTraceUserSettings::ActionsMayShareAKey(ETraceInputAction A, ETraceInputAction B)
+{
+	// SPEC v28 §3b. The whole conflict rule, in one bitwise AND. See ETraceInputStates for why this is
+	// a STATE question and not a key question, and for the owner's own example (throw core vs fire).
+	//
+	// An action never "shares" with itself: the caller is asking "may B keep this key while A takes
+	// it", and A == B is the slot logic's business (SetKey clears a duplicate in the other slot).
+	if (A == B)
+	{
+		return false;
+	}
+
+	const ETraceInputStates StatesA = TraceInputActions::Info(A).States;
+	const ETraceInputStates StatesB = TraceInputActions::Info(B).States;
+
+	// EnumHasAnyFlags on the intersection: no overlap means no instant at which both are legal.
+	return !EnumHasAnyFlags(StatesA, StatesB);
+}
+
 FKey UTraceUserSettings::GetKey(ETraceInputAction Action) const
 {
-	const int32 Index = static_cast<int32>(Action);
+	return GetKey(Action, 0);
+}
+
+FKey UTraceUserSettings::GetKey(ETraceInputAction Action, int32 Slot) const
+{
+	const int32 Index = SlotIndex(Action, Slot);
 	return Bindings.IsValidIndex(Index) ? Bindings[Index] : FKey();
 }
 
+void UTraceUserSettings::GetKeys(ETraceInputAction Action, TArray<FKey>& OutKeys) const
+{
+	OutKeys.Reset();
+	for (int32 Slot = 0; Slot < MaxKeysPerAction; ++Slot)
+	{
+		const FKey Key = GetKey(Action, Slot);
+		if (Key.IsValid())
+		{
+			OutKeys.Add(Key);
+		}
+	}
+}
+
+bool UTraceUserSettings::ActionUsesKey(ETraceInputAction Action, const FKey& Key) const
+{
+	// An invalid key matches nothing, on purpose: two UNBOUND slots would otherwise compare equal and
+	// every "is this action's button down" caller would answer yes for a player who unbound it.
+	if (!Key.IsValid())
+	{
+		return false;
+	}
+
+	for (int32 Slot = 0; Slot < MaxKeysPerAction; ++Slot)
+	{
+		if (GetKey(Action, Slot) == Key)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+FString UTraceUserSettings::DescribeBinding(ETraceInputAction Action) const
+{
+	TArray<FKey> Keys;
+	GetKeys(Action, Keys);
+	if (Keys.Num() == 0)
+	{
+		return TEXT("UNBOUND");
+	}
+
+	FString Out;
+	for (const FKey& Key : Keys)
+	{
+		if (!Out.IsEmpty())
+		{
+			Out += TEXT("  /  ");
+		}
+		Out += DescribeKey(Key);
+	}
+	return Out;
+}
+
+/**
+ * SPEC v28 §3b — the A/B arm for the state-aware conflict check.
+ *
+ * 1 restores the behaviour exactly as it shipped before v28: EVERY other action loses the key,
+ * whether or not the two could ever be legal at the same instant. That is the RED arm — it is the
+ * reproduction of "it will not let me bind throw core to the same button as fire" — and it exists
+ * because this project's standing rule is that a harness which cannot go red is not evidence.
+ *
+ * Not ECVF_Cheat: it changes no gameplay rule, only which of the player's own binds survive an
+ * edit, and a playtester who preferred the old behaviour should be able to have it back.
+ */
+static int32 GTraceKeysLegacySteal = 0;
+static FAutoConsoleVariableRef CVarTraceKeysLegacySteal(
+	TEXT("Trace.Keys.LegacySteal"),
+	GTraceKeysLegacySteal,
+	TEXT("Spec v28 sec 3b. 0 (default): a key is taken from another action ONLY when the two can both "
+	     "be legal at the same instant, so throw-core and fire may share a button. 1 is the RED arm - "
+	     "the pre-v28 rule where any other action holding the key loses it unconditionally."),
+	ECVF_Default);
+
 void UTraceUserSettings::SetKey(ETraceInputAction Action, const FKey& Key)
 {
-	const int32 Index = static_cast<int32>(Action);
+	SetKey(Action, 0, Key);
+}
+
+void UTraceUserSettings::SetKey(ETraceInputAction Action, int32 Slot, const FKey& Key)
+{
+	const int32 Index = SlotIndex(Action, Slot);
 	if (!Bindings.IsValidIndex(Index) || !IsBindableKey(Key))
 	{
 		return;
 	}
 
-	// Steal the key from whoever else had it. See the header for why this beats refusing.
-	for (int32 Other = 0; Other < Bindings.Num(); ++Other)
+	// ---- The same action's OTHER slot ----------------------------------------------------------
+	//
+	// One action holding one key twice is not a second bind, it is a wasted row: the options page would
+	// draw the same chip in both columns and Enhanced Input would map the key to the action twice. So a
+	// duplicate inside this action is always cleared, whatever the exclusion groups say.
+	for (int32 Other = 0; Other < MaxKeysPerAction; ++Other)
 	{
-		if (Other != Index && Bindings[Other] == Key)
+		const int32 OtherIndex = SlotIndex(Action, Other);
+		if (Other != Slot && Bindings.IsValidIndex(OtherIndex) && Bindings[OtherIndex] == Key)
 		{
-			UE_LOG(LogTraceGame, Display, TEXT("[Settings] '%s' taken from %s and given to %s."),
-				*DescribeKey(Key),
-				TraceInputActions::Info(static_cast<ETraceInputAction>(Other)).DisplayName,
-				TraceInputActions::Info(Action).DisplayName);
-			Bindings[Other] = FKey();
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Settings] %s already had '%s' in slot %d; moving it to slot %d rather than holding it twice."),
+				TraceInputActions::Info(Action).DisplayName, *DescribeKey(Key), Other + 1, Slot + 1);
+			Bindings[OtherIndex] = FKey();
+		}
+	}
+
+	// ---- SPEC v28 §3b — take the key ONLY from an action that genuinely conflicts ----------------
+	//
+	// This loop used to be unconditional, and unconditional stealing IS the reported defect: a player
+	// who put THROW CORE on mouse 1 watched FIRE go blank, which reads exactly as "it will not let me
+	// bind throw core to the same button as fire". Now the exclusion groups decide, and two verbs that
+	// can never both be legal keep the button between them.
+	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+	{
+		if (Info.Action == Action)
+		{
+			continue;
+		}
+
+		for (int32 OtherSlot = 0; OtherSlot < MaxKeysPerAction; ++OtherSlot)
+		{
+			const int32 OtherIndex = SlotIndex(Info.Action, OtherSlot);
+			if (!Bindings.IsValidIndex(OtherIndex) || Bindings[OtherIndex] != Key)
+			{
+				continue;
+			}
+
+			if (GTraceKeysLegacySteal == 0 && ActionsMayShareAKey(Action, Info.Action))
+			{
+				// Logged at Display and not silently, because "two actions are on one key" is a thing a
+				// player should be able to confirm from the log when they meant to do it — and the thing
+				// somebody debugging a double-fire will look for first.
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Settings] '%s' is now SHARED by %s and %s. Allowed: their states are exclusive ")
+					TEXT("(%s vs %s), so at most one of them can ever accept the press."),
+					*DescribeKey(Key), TraceInputActions::Info(Action).DisplayName, Info.DisplayName,
+					*LexTraceInputStates(TraceInputActions::Info(Action).States),
+					*LexTraceInputStates(Info.States));
+				continue;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Settings] '%s' taken from %s and given to %s — they can both be legal at once (%s vs %s)."),
+				*DescribeKey(Key), Info.DisplayName, TraceInputActions::Info(Action).DisplayName,
+				*LexTraceInputStates(Info.States),
+				*LexTraceInputStates(TraceInputActions::Info(Action).States));
+			Bindings[OtherIndex] = FKey();
 		}
 	}
 
@@ -400,13 +660,37 @@ void UTraceUserSettings::SetKey(ETraceInputAction Action, const FKey& Key)
 
 void UTraceUserSettings::ClearKey(ETraceInputAction Action)
 {
-	const int32 Index = static_cast<int32>(Action);
+	bool bChanged = false;
+	for (int32 Slot = 0; Slot < MaxKeysPerAction; ++Slot)
+	{
+		const int32 Index = SlotIndex(Action, Slot);
+		if (Bindings.IsValidIndex(Index) && Bindings[Index].IsValid())
+		{
+			Bindings[Index] = FKey();
+			bChanged = true;
+		}
+	}
+
+	if (!bChanged)
+	{
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Settings] %s unbound (every slot)."),
+		TraceInputActions::Info(Action).DisplayName);
+	Save();
+}
+
+void UTraceUserSettings::ClearKey(ETraceInputAction Action, int32 Slot)
+{
+	const int32 Index = SlotIndex(Action, Slot);
 	if (!Bindings.IsValidIndex(Index) || !Bindings[Index].IsValid())
 	{
 		return;
 	}
 
-	UE_LOG(LogTraceGame, Display, TEXT("[Settings] %s unbound."), TraceInputActions::Info(Action).DisplayName);
+	UE_LOG(LogTraceGame, Display, TEXT("[Settings] %s slot %d unbound (was '%s')."),
+		TraceInputActions::Info(Action).DisplayName, Slot + 1, *DescribeKey(Bindings[Index]));
 	Bindings[Index] = FKey();
 	Save();
 }
@@ -416,26 +700,30 @@ void UTraceUserSettings::RefreshFromConfig()
 	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
 
 	Bindings.Reset();
-	Bindings.SetNum(Table.Num());
+	Bindings.SetNum(Table.Num() * MaxKeysPerAction);
 
 	// Start from the shipped defaults, then let the .ini override entry by entry. A truncated or
 	// partially corrupt file therefore degrades to "some defaults" rather than to "no controls".
 	for (int32 Index = 0; Index < Table.Num(); ++Index)
 	{
-		Bindings[Index] = Table[Index].DefaultKey();
+		const ETraceInputAction Action = static_cast<ETraceInputAction>(Index);
+		Bindings[SlotIndex(Action, 0)] = Table[Index].DefaultKey();
+		// SPEC v28 §3c/§3d — the shipped SECOND bind. Only the parry row has one today.
+		Bindings[SlotIndex(Action, 1)] = (Table[Index].DefaultKeyAlt != nullptr)
+			? Table[Index].DefaultKeyAlt() : FKey();
 	}
 
 	for (const FString& Entry : KeyBindings)
 	{
 		FString ConfigId;
-		FString KeyName;
-		if (!Entry.Split(TEXT("="), &ConfigId, &KeyName))
+		FString KeyList;
+		if (!Entry.Split(TEXT("="), &ConfigId, &KeyList))
 		{
 			continue;
 		}
 
 		ConfigId.TrimStartAndEndInline();
-		KeyName.TrimStartAndEndInline();
+		KeyList.TrimStartAndEndInline();
 
 		const int32 Index = Table.IndexOfByPredicate(
 			[&ConfigId](const FTraceInputActionInfo& Info) { return ConfigId.Equals(Info.ConfigId, ESearchCase::IgnoreCase); });
@@ -447,23 +735,58 @@ void UTraceUserSettings::RefreshFromConfig()
 			continue;
 		}
 
-		// The explicit unbound marker, which is what a stolen key leaves behind.
-		if (KeyName.IsEmpty() || KeyName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
-		{
-			Bindings[Index] = FKey();
-			continue;
-		}
+		const ETraceInputAction Action = static_cast<ETraceInputAction>(Index);
 
-		const FKey Key(*KeyName);
-		if (IsBindableKey(Key))
-		{
-			Bindings[Index] = Key;
-		}
-		else
+		// SPEC v28 §3c — the value is a comma-separated slot list now. A line from ANY older build has
+		// no comma and therefore produces exactly one element, which lands in slot 0 — which is what
+		// that build meant — and slot 1 is then cleared below, because the FILE is authoritative for
+		// every slot of an action it names. That last clause is what stops a returning player picking up
+		// a brand-new second default on a key they had deliberately changed.
+		TArray<FString> KeyNames;
+		KeyList.ParseIntoArray(KeyNames, TEXT(","), /*InCullEmpty=*/false);
+
+		if (KeyNames.Num() > MaxKeysPerAction)
 		{
 			UE_LOG(LogTraceGame, Warning,
-				TEXT("[Settings] Ignoring '%s' for action '%s': not a bindable key on this platform. Keeping the default."),
-				*KeyName, *ConfigId);
+				TEXT("[Settings] '%s' names %d keys; this build binds at most %d per action. The extras are ignored."),
+				*ConfigId, KeyNames.Num(), MaxKeysPerAction);
+			KeyNames.SetNum(MaxKeysPerAction);
+		}
+
+		for (int32 Slot = 0; Slot < MaxKeysPerAction; ++Slot)
+		{
+			const int32 Flat = SlotIndex(Action, Slot);
+
+			if (!KeyNames.IsValidIndex(Slot))
+			{
+				// The file names this action but not this slot: an older one-key line, or a two-key line
+				// this build shortened. Either way the player has no key there.
+				Bindings[Flat] = FKey();
+				continue;
+			}
+
+			FString KeyName = KeyNames[Slot];
+			KeyName.TrimStartAndEndInline();
+
+			// The explicit unbound marker, which is what a stolen key leaves behind.
+			if (KeyName.IsEmpty() || KeyName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+			{
+				Bindings[Flat] = FKey();
+				continue;
+			}
+
+			const FKey Key(*KeyName);
+			if (IsBindableKey(Key))
+			{
+				Bindings[Flat] = Key;
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Settings] Ignoring '%s' for action '%s' slot %d: not a bindable key on this platform. ")
+					TEXT("Keeping the default."),
+					*KeyName, *ConfigId, Slot + 1);
+			}
 		}
 	}
 
@@ -475,14 +798,29 @@ void UTraceUserSettings::FlattenToConfig()
 	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
 
 	KeyBindings.Reset(Table.Num());
-	for (int32 Index = 0; Index < Table.Num() && Index < Bindings.Num(); ++Index)
+	for (int32 Index = 0; Index < Table.Num(); ++Index)
 	{
+		const ETraceInputAction Action = static_cast<ETraceInputAction>(Index);
+
 		// FKey::GetFName() is the stable serialisation name ("SpaceBar"), NOT the display name.
 		// Writing the display name would produce a file that cannot be read back.
-		const FKey& Key = Bindings[Index];
-		KeyBindings.Add(FString::Printf(TEXT("%s=%s"),
-			Table[Index].ConfigId,
-			Key.IsValid() ? *Key.GetFName().ToString() : TEXT("None")));
+		//
+		// SPEC v28 §3c: every slot is written, "None" included, so the file is a complete statement of
+		// the player's intent. Writing only the occupied slots would make "I deliberately cleared my
+		// second parry key" indistinguishable from "this build did not know about slot 2", and the next
+		// launch would hand the thumb button back.
+		FString Value;
+		for (int32 Slot = 0; Slot < MaxKeysPerAction; ++Slot)
+		{
+			const FKey Key = GetKey(Action, Slot);
+			if (Slot > 0)
+			{
+				Value += TEXT(",");
+			}
+			Value += Key.IsValid() ? Key.GetFName().ToString() : FString(TEXT("None"));
+		}
+
+		KeyBindings.Add(FString::Printf(TEXT("%s=%s"), Table[Index].ConfigId, *Value));
 	}
 }
 
@@ -507,9 +845,19 @@ bool UTraceUserSettings::IsAtDefaults() const
 	}
 
 	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
-	for (int32 Index = 0; Index < Table.Num() && Index < Bindings.Num(); ++Index)
+	for (int32 Index = 0; Index < Table.Num(); ++Index)
 	{
-		if (Bindings[Index] != Table[Index].DefaultKey())
+		const ETraceInputAction Action = static_cast<ETraceInputAction>(Index);
+
+		// BOTH slots, or the RESET row would dim itself for a player who had only changed their second
+		// parry key — the one row on this page whose whole job is to say "you have changed something".
+		if (GetKey(Action, 0) != Table[Index].DefaultKey())
+		{
+			return false;
+		}
+
+		const FKey DefaultAlt = (Table[Index].DefaultKeyAlt != nullptr) ? Table[Index].DefaultKeyAlt() : FKey();
+		if (GetKey(Action, 1) != DefaultAlt)
 		{
 			return false;
 		}
@@ -539,6 +887,80 @@ void UTraceUserSettings::Save()
 		TEXT("[Settings] Saved. sensitivity=%.2f yScale=%.2f invertY=%d -> %s"),
 		MouseSensitivity, MouseSensitivityYScale, bInvertMouseY ? 1 : 0,
 		*GetClass()->GetConfigName());
+}
+
+// =================================================================================================
+// Shared verification plumbing
+//
+// NAMED namespace, not anonymous: this module is compiled as a unity/jumbo build and two files that
+// each open an anonymous namespace become one namespace with two definitions.
+// Scripts/check-jumbo-build-collisions.py gates the build on exactly that.
+// =================================================================================================
+
+namespace TraceUserSettingsVerify
+{
+	/**
+	 * SPEC v28 §3c — splits an .ini VALUE ("Q,ThumbMouseButton", "SpaceBar", "None") into slot names.
+	 *
+	 * One place, used by the loader's twin below and by both verification commands, so a check can
+	 * never disagree with RefreshFromConfig about what a line MEANS. Empties are kept, because
+	 * "LeftMouseButton," is a real two-slot statement whose second slot is empty.
+	 */
+	void SplitSlots(const FString& Value, TArray<FString>& OutNames)
+	{
+		OutNames.Reset();
+		Value.ParseIntoArray(OutNames, TEXT(","), /*InCullEmpty=*/false);
+		for (FString& Name : OutNames)
+		{
+			Name.TrimStartAndEndInline();
+		}
+	}
+
+	/** Every slot of every action, flat, exactly as UTraceUserSettings stores them. */
+	void Snapshot(const UTraceUserSettings& Settings, TArray<FKey>& OutKeys)
+	{
+		OutKeys.Reset();
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			for (int32 Slot = 0; Slot < UTraceUserSettings::MaxKeysPerAction; ++Slot)
+			{
+				OutKeys.Add(Settings.GetKey(Info.Action, Slot));
+			}
+		}
+	}
+
+	/**
+	 * Puts a Snapshot back, EVERY SLOT, and clears the whole table first.
+	 *
+	 * The clear is not tidiness. Restoring slot by slot on top of whatever the diagnostic left behind
+	 * means SetKey can be asked to give action A a key that action B is still holding from the test,
+	 * and if those two genuinely conflict it will take it back off B — undoing a restore that had
+	 * already happened. Clearing first makes the restore order irrelevant.
+	 *
+	 * ClearKey rather than SetKey for the empty slots, because SetKey REFUSES an invalid key by design
+	 * (an unparseable .ini line must never be able to wipe a binding), so a legitimately UNBOUND slot
+	 * — the shipped state of the throw row, and of slot 2 on sixteen of the seventeen actions — could
+	 * not be restored through SetKey at all.
+	 */
+	void Restore(UTraceUserSettings& Settings, const TArray<FKey>& Keys)
+	{
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			Settings.ClearKey(Info.Action);
+		}
+
+		int32 Flat = 0;
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			for (int32 Slot = 0; Slot < UTraceUserSettings::MaxKeysPerAction; ++Slot, ++Flat)
+			{
+				if (Keys.IsValidIndex(Flat) && Keys[Flat].IsValid())
+				{
+					Settings.SetKey(Info.Action, Slot, Keys[Flat]);
+				}
+			}
+		}
+	}
 }
 
 // =================================================================================================
@@ -640,12 +1062,13 @@ namespace
 		// the two victims. A list of names is exactly what went stale here, and a restore that misses
 		// an action leaves the player's controls damaged by a diagnostic (Trace.V10.RebindFire learned
 		// the same lesson the same way; see its comment).
-		TMap<ETraceInputAction, FKey> Before;
-		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
-		{
-			Before.Add(Info.Action, Settings.GetKey(Info.Action));
-		}
-		const FKey Saved = Settings.GetKey(ETraceInputAction::Dash);
+		//
+		// SPEC v28 §3c: the snapshot covers EVERY SLOT, not just the primary. An action now has two, and a
+		// restore that put back only the first would have quietly deleted the player's second parry key
+		// every time somebody ran a diagnostic — which is the same class of damage the paragraph above is
+		// about, one feature later.
+		TArray<FKey> Before;
+		TraceUserSettingsVerify::Snapshot(Settings, Before);
 
 		int32 RoundTripsOk = 0;
 		for (const FKey& Key : { EKeys::LeftMouseButton, EKeys::RightMouseButton })
@@ -667,36 +1090,9 @@ namespace
 				*Reparsed.GetFName().ToString(), bOk ? TEXT("ROUND TRIP OK") : TEXT("FAILED"));
 		}
 
-		// Put everything back, including whichever actions SetKey stole the two buttons from. Dash
-		// last, so restoring a displaced action cannot take the button back off it.
-		//
-		// ClearKey for the invalid case rather than SetKey: SetKey REFUSES an invalid key by design
-		// (an unparseable .ini line must never be able to wipe a binding), so an action that was
-		// legitimately UNBOUND before this ran — which since spec v25 §7 is the shipped state of the
-		// throw row — could not be restored through SetKey at all.
-		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
-		{
-			if (Info.Action == ETraceInputAction::Dash)
-			{
-				continue;
-			}
-
-			const FKey Was = Before[Info.Action];
-			if (Settings.GetKey(Info.Action) == Was)
-			{
-				continue;
-			}
-
-			if (Was.IsValid())
-			{
-				Settings.SetKey(Info.Action, Was);
-			}
-			else
-			{
-				Settings.ClearKey(Info.Action);
-			}
-		}
-		Settings.SetKey(ETraceInputAction::Dash, Saved);
+		// Put everything back — every action, every slot, including whichever action SetKey took the two
+		// buttons from. Restore() clears the whole table before it writes, so the order cannot matter.
+		TraceUserSettingsVerify::Restore(Settings, Before);
 
 		// Two calls rather than a ternary verbosity: UE_LOG's verbosity argument is a token the macro
 		// pastes into a compile-time category check, not a value, so it cannot be an expression.
@@ -777,14 +1173,14 @@ namespace
 		for (const FString& Line : RawLines)
 		{
 			FString ConfigId;
-			FString KeyName;
-			if (!Line.Split(TEXT("="), &ConfigId, &KeyName))
+			FString KeyList;
+			if (!Line.Split(TEXT("="), &ConfigId, &KeyList))
 			{
 				UE_LOG(LogTraceGame, Warning, TEXT("[VerifyBinds]   '%s' is not 'Id=Key'; skipped."), *Line);
 				continue;
 			}
 			ConfigId.TrimStartAndEndInline();
-			KeyName.TrimStartAndEndInline();
+			KeyList.TrimStartAndEndInline();
 			NamedIds.Add(ConfigId.ToLower());
 
 			const int32 Index = Table.IndexOfByPredicate(
@@ -795,29 +1191,46 @@ namespace
 				++Dropped;
 				UE_LOG(LogTraceGame, Display,
 					TEXT("[VerifyBinds]   DROPPED  '%s' — no action by that ConfigId any more. This is the case ")
-					TEXT("spec v15 s5 is about; a 'SwapWeapon=F' line from a pre-v15 build lands here."),
+					TEXT("spec v15 s5 is about; a 'SwapWeapon=F' line from a pre-v15 build lands here, and since ")
+					TEXT("spec v28 s3d so does 'ParryPull=RightMouseButton'."),
 					*Line);
 				continue;
 			}
 
-			const FKey Wanted(*KeyName);
-			const FKey Actual = Settings.GetKey(static_cast<ETraceInputAction>(Index));
-			const bool bWantsUnbound = KeyName.IsEmpty() || KeyName.Equals(TEXT("None"), ESearchCase::IgnoreCase);
-			const bool bOk = bWantsUnbound ? !Actual.IsValid() : (Actual == Wanted);
+			// SPEC v28 §3c — EVERY SLOT THE LINE NAMES, and every slot it does not. A one-key line from an
+			// older build says slot 1 = that key AND slot 2 = nothing, so both halves are asserted; checking
+			// only the first would pass a loader that quietly left a stale second bind in place.
+			TArray<FString> SlotNames;
+			TraceUserSettingsVerify::SplitSlots(KeyList, SlotNames);
 
-			if (bOk)
+			const ETraceInputAction LineAction = static_cast<ETraceInputAction>(Index);
+			bool bLineOk = true;
+			for (int32 Slot = 0; Slot < UTraceUserSettings::MaxKeysPerAction; ++Slot)
 			{
-				++Honoured;
-				UE_LOG(LogTraceGame, Display, TEXT("[VerifyBinds]   ok       %-18s -> %-16s (%s)"),
-					*ConfigId, *KeyName, Table[Index].DisplayName);
-			}
-			else
-			{
+				const FString SlotName = SlotNames.IsValidIndex(Slot) ? SlotNames[Slot] : FString();
+				const bool bWantsUnbound = SlotName.IsEmpty() || SlotName.Equals(TEXT("None"), ESearchCase::IgnoreCase);
+				const FKey Wanted(*SlotName);
+				const FKey Actual = Settings.GetKey(LineAction, Slot);
+
+				if (bWantsUnbound ? !Actual.IsValid() : (Actual == Wanted))
+				{
+					continue;
+				}
+
+				bLineOk = false;
 				++Failures;
 				UE_LOG(LogTraceGame, Error,
-					TEXT("[VerifyBinds]   WRONG    %-18s asked for '%s' but %s resolved to '%s' — the file has been ")
-					TEXT("read BY POSITION somewhere."),
-					*ConfigId, *KeyName, Table[Index].DisplayName, *Actual.GetFName().ToString());
+					TEXT("[VerifyBinds]   WRONG    %-18s slot %d asked for '%s' but %s resolved to '%s' — the file has ")
+					TEXT("been read BY POSITION somewhere, or a slot was dropped."),
+					*ConfigId, Slot + 1, SlotName.IsEmpty() ? TEXT("None") : *SlotName,
+					Table[Index].DisplayName, *Actual.GetFName().ToString());
+			}
+
+			if (bLineOk)
+			{
+				++Honoured;
+				UE_LOG(LogTraceGame, Display, TEXT("[VerifyBinds]   ok       %-18s -> %-28s (%s)"),
+					*ConfigId, *KeyList, Table[Index].DisplayName);
 			}
 		}
 
@@ -830,19 +1243,25 @@ namespace
 				continue;
 			}
 
-			const FKey Actual = Settings.GetKey(static_cast<ETraceInputAction>(Index));
-			const FKey Default = Table[Index].DefaultKey();
-			if (Actual == Default)
+			const ETraceInputAction Unnamed = static_cast<ETraceInputAction>(Index);
+			const FKey DefaultPrimary = Table[Index].DefaultKey();
+			const FKey DefaultAlt = (Table[Index].DefaultKeyAlt != nullptr) ? Table[Index].DefaultKeyAlt() : FKey();
+
+			// SPEC v28 §3c — BOTH shipped slots. §3d ships PARRY with two, so an action that is not in the
+			// file has to come back with both of them or the second default is silently not landing.
+			if (Settings.GetKey(Unnamed, 0) == DefaultPrimary && Settings.GetKey(Unnamed, 1) == DefaultAlt)
 			{
 				UE_LOG(LogTraceGame, Display, TEXT("[VerifyBinds]   default  %-18s -> %s"),
-					Table[Index].ConfigId, *Actual.GetFName().ToString());
+					Table[Index].ConfigId, *Settings.DescribeBinding(Unnamed));
 			}
 			else
 			{
 				++Failures;
 				UE_LOG(LogTraceGame, Error,
-					TEXT("[VerifyBinds]   WRONG    %s is not named in the file, so it should be its default '%s', but it is '%s'."),
-					Table[Index].ConfigId, *Default.GetFName().ToString(), *Actual.GetFName().ToString());
+					TEXT("[VerifyBinds]   WRONG    %s is not named in the file, so it should be its shipped default ")
+					TEXT("'%s' + '%s', but it is '%s'."),
+					Table[Index].ConfigId, *DefaultPrimary.GetFName().ToString(), *DefaultAlt.GetFName().ToString(),
+					*Settings.DescribeBinding(Unnamed));
 			}
 		}
 
@@ -858,12 +1277,17 @@ namespace
 		for (int32 Line = 0; Line < RawLines.Num() && Line < Table.Num(); ++Line)
 		{
 			FString ConfigId;
-			FString KeyName;
-			if (!RawLines[Line].Split(TEXT("="), &ConfigId, &KeyName))
+			FString KeyList;
+			if (!RawLines[Line].Split(TEXT("="), &ConfigId, &KeyList))
 			{
 				continue;
 			}
-			KeyName.TrimStartAndEndInline();
+
+			// The PRIMARY slot only: this arm asks "would a by-position loader have put a different key on
+			// this action", and slot 1 is the same question a second time.
+			TArray<FString> SlotNames;
+			TraceUserSettingsVerify::SplitSlots(KeyList, SlotNames);
+			const FString KeyName = SlotNames.Num() > 0 ? SlotNames[0] : FString();
 
 			const FKey AsPositional(*KeyName);
 			if (Settings.GetKey(static_cast<ETraceInputAction>(Line)) != AsPositional)
@@ -918,25 +1342,34 @@ namespace
 		// more than usual — this can be run mid-match from the console.
 		int32 FixtureDiscriminates = 0;
 		{
-			struct FFixtureLine { const TCHAR* ConfigId; const TCHAR* KeyName; };
+			struct FFixtureLine { const TCHAR* ConfigId; const TCHAR* KeyList; };
 
 			// REVERSED relative to the table, and every key non-default, so a positional loader cannot
 			// accidentally agree. "SwapWeapon" is the dead id spec v15 §5 removed and is here to prove
 			// the drop path still drops rather than shifting everything after it by one.
+			//
+			// SPEC v28 §3c ADDS TWO MORE JOBS TO THIS FIXTURE, both on lines that already existed:
+			//   * "ParryKeys" carries TWO keys, so the comma format is proved through the REAL loader
+			//     rather than asserted — and its id is the v28 §3d one, so the row also proves the new id
+			//     resolves at all.
+			//   * "Reload" carries a one-key line with NO comma, which is what every previously-written
+			//     TraceUserSettings.ini on every machine looks like. Its second slot must come back EMPTY:
+			//     that is the backward-compatibility claim, and it is the one a two-slot loader is most
+			//     likely to get wrong by leaving the shipped default in place.
 			const FFixtureLine Fixture[] =
 			{
-				{ TEXT("PullCore"),         TEXT("Nine")  },   // the new row — LAST in the table, FIRST here
-				{ TEXT("SwapWeapon"),       TEXT("Seven") },   // dead id: must be DROPPED, not shifted
-				{ TEXT("Reload"),           TEXT("Eight") },
-				{ TEXT("AbilitySecondary"), TEXT("Six")   },
-				{ TEXT("ParryPull"),        TEXT("Five")  },
-				{ TEXT("MoveForward"),      TEXT("Four")  },   // row 0 of the table — LAST here
+				{ TEXT("PullCore"),         TEXT("Nine")                    },   // the new row — LAST in the table, FIRST here
+				{ TEXT("SwapWeapon"),       TEXT("Seven")                   },   // dead id: must be DROPPED, not shifted
+				{ TEXT("Reload"),           TEXT("Eight")                   },   // v28: one key, no comma — a pre-v28 line
+				{ TEXT("AbilitySecondary"), TEXT("Six")                     },
+				{ TEXT("ParryKeys"),        TEXT("Five,ThumbMouseButton2")  },   // v28 §3c: TWO keys on one line
+				{ TEXT("MoveForward"),      TEXT("Four")                    },   // row 0 of the table — LAST here
 			};
 
 			TArray<FString> FixtureLines;
 			for (const FFixtureLine& Line : Fixture)
 			{
-				FixtureLines.Add(FString::Printf(TEXT("%s=%s"), Line.ConfigId, Line.KeyName));
+				FixtureLines.Add(FString::Printf(TEXT("%s=%s"), Line.ConfigId, Line.KeyList));
 			}
 
 			const TArray<FString> SavedKeyBindings = Settings.KeyBindings;
@@ -944,40 +1377,57 @@ namespace
 			Settings.RefreshFromConfig();
 
 			int32 FixtureFailures = 0;
+			int32 FixtureSlotsChecked = 0;
 
 			for (int32 Line = 0; Line < UE_ARRAY_COUNT(Fixture); ++Line)
 			{
 				const FString Id(Fixture[Line].ConfigId);
-				const FKey Wanted(Fixture[Line].KeyName);
+
+				TArray<FString> SlotNames;
+				TraceUserSettingsVerify::SplitSlots(Fixture[Line].KeyList, SlotNames);
 
 				const int32 Index = Table.IndexOfByPredicate(
 					[&Id](const FTraceInputActionInfo& Info) { return Id.Equals(Info.ConfigId, ESearchCase::IgnoreCase); });
 
 				if (Index == INDEX_NONE)
 				{
-					// The dead id. Nobody may be holding its key — that is what "dropped" means, as
-					// opposed to "shifted onto the neighbour".
+					// The dead id. Nobody may be holding its key, in ANY slot — that is what "dropped" means,
+					// as opposed to "shifted onto the neighbour".
+					const FKey Wanted(*SlotNames[0]);
 					const bool bNobodyHasIt = Table.IndexOfByPredicate(
 						[&Settings, &Wanted](const FTraceInputActionInfo& Info)
-						{ return Settings.GetKey(Info.Action) == Wanted; }) == INDEX_NONE;
+						{ return Settings.ActionUsesKey(Info.Action, Wanted); }) == INDEX_NONE;
 					if (!bNobodyHasIt)
 					{
 						++FixtureFailures;
 						UE_LOG(LogTraceGame, Error,
 							TEXT("[VerifyBinds]   v26 s1 FIXTURE: the dead id '%s' was not dropped — something ")
-							TEXT("inherited '%s'."), *Id, Fixture[Line].KeyName);
+							TEXT("inherited '%s'."), *Id, Fixture[Line].KeyList);
 					}
 					continue;
 				}
 
-				const FKey Actual = Settings.GetKey(static_cast<ETraceInputAction>(Index));
-				if (Actual != Wanted)
+				const ETraceInputAction FixtureAction = static_cast<ETraceInputAction>(Index);
+				for (int32 Slot = 0; Slot < UTraceUserSettings::MaxKeysPerAction; ++Slot)
 				{
+					++FixtureSlotsChecked;
+
+					const FString SlotName = SlotNames.IsValidIndex(Slot) ? SlotNames[Slot] : FString();
+					const FKey Wanted(*SlotName);
+					const FKey Actual = Settings.GetKey(FixtureAction, Slot);
+					const bool bWantsUnbound = SlotName.IsEmpty() || SlotName.Equals(TEXT("None"), ESearchCase::IgnoreCase);
+
+					if (bWantsUnbound ? !Actual.IsValid() : (Actual == Wanted))
+					{
+						continue;
+					}
+
 					++FixtureFailures;
 					UE_LOG(LogTraceGame, Error,
-						TEXT("[VerifyBinds]   v26 s1 FIXTURE: '%s' (%s) asked for '%s' and resolved to '%s'. ")
-						TEXT("Appending PullCore RENUMBERED the table."),
-						*Id, Table[Index].DisplayName, Fixture[Line].KeyName, *Actual.GetFName().ToString());
+						TEXT("[VerifyBinds]   FIXTURE: '%s' (%s) slot %d asked for '%s' and resolved to '%s'. Either ")
+						TEXT("appending an action RENUMBERED the table, or the v28 s3c slot list did not load."),
+						*Id, Table[Index].DisplayName, Slot + 1,
+						SlotName.IsEmpty() ? TEXT("None") : *SlotName, *Actual.GetFName().ToString());
 				}
 
 				// Would a positional loader have got this line wrong? It must, for at least one line,
@@ -1000,12 +1450,13 @@ namespace
 			if (FixtureFailures == 0)
 			{
 				UE_LOG(LogTraceGame, Display,
-					TEXT("[VerifyBinds]   ok       v26 s1 APPEND-ONLY PROOF: a %d-line out-of-order fixture "
-					     "(PullCore first, MoveForward last, one dead id) loaded through the real "
-					     "RefreshFromConfig and every line landed on the action it NAMES. %d of them would "
-					     "have landed on the wrong action under a by-position read, so this fixture can tell "
-					     "the two loaders apart. The player's file on disk was not touched."),
-					static_cast<int32>(UE_ARRAY_COUNT(Fixture)), FixtureDiscriminates);
+					TEXT("[VerifyBinds]   ok       APPEND-ONLY + v28 s3c SLOT PROOF: a %d-line out-of-order fixture "
+					     "(PullCore first, MoveForward last, one dead id, one TWO-KEY line and one legacy "
+					     "one-key line) loaded through the real RefreshFromConfig; all %d slots landed on the "
+					     "action AND the slot they NAME. %d line(s) would have landed on the wrong action under "
+					     "a by-position read, so this fixture can tell the two loaders apart. The player's file "
+					     "on disk was not touched."),
+					static_cast<int32>(UE_ARRAY_COUNT(Fixture)), FixtureSlotsChecked, FixtureDiscriminates);
 			}
 
 			// Put the player's own lines back and re-load them, so nothing after this command — and in
@@ -1055,6 +1506,389 @@ namespace
 #undef TRACE_VERIFYBINDS_ARGS
 #undef TRACE_VERIFYBINDS_TEXT
 	}
+
+	// =============================================================================================
+	// Trace.Keys.VerifyV28 — SPEC v28 §3b, §3c and §3d, the evidence half.
+	//
+	// Three separate claims, and none of them can be shown by reading the defaults table back to
+	// itself, so all three are exercised through the SHIPPING write path (UTraceUserSettings::SetKey,
+	// the same call the options page makes) and read back through the live table:
+	//
+	//   §3b  Two actions whose states are exclusive KEEP one key between them; two whose states
+	//        overlap do not. The owner's own example is the first arm — throw-core onto the fire key,
+	//        and FIRE must still be on it afterwards. The second arm is the guard against a "fix" that
+	//        just stopped stealing altogether: the Core-pull onto the fire key must still take it.
+	//   §3c  A second key set on slot 2 survives the .ini round trip (flatten -> parse), which is the
+	//        step that would silently drop it.
+	//   §3d  PARRY ships on Q AND the thumb mouse button, and NOTHING holds the right mouse button any
+	//        more — the half §10's melee is waiting on.
+	//
+	// EVERY BINDING IS PUT BACK, all slots, through TraceUserSettingsVerify::Restore. This can be run
+	// mid-match from the console and must not cost the player their controls.
+	//
+	// RED ARM: `Trace.Keys.LegacySteal 1` restores the pre-v28 unconditional steal, and the §3b arm
+	// then FAILS. A run of this command in each arm is what makes it evidence rather than assertion.
+	// =============================================================================================
+	void VerifyV28Keys()
+	{
+		UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[KeysV28] ===== spec v28 s3: two binds per action, state-aware sharing, parry on Q + thumb ====="));
+
+		int32 Failures = 0;
+
+		// ---- §3d: the shipped parry, and the right mouse button ---------------------------------
+		{
+			const FTraceInputActionInfo& ParryInfo = TraceInputActions::Info(ETraceInputAction::Parry);
+			const FKey ShippedPrimary = ParryInfo.DefaultKey();
+			const FKey ShippedAlt = (ParryInfo.DefaultKeyAlt != nullptr) ? ParryInfo.DefaultKeyAlt() : FKey();
+
+			const bool bDefaultsOk = (ShippedPrimary == EKeys::Q) && (ShippedAlt == EKeys::ThumbMouseButton);
+			Failures += bDefaultsOk ? 0 : 1;
+
+			if (bDefaultsOk)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[KeysV28]   ok       s3d SHIPPED PARRY = '%s' + '%s' (ConfigId '%s'). Live binding: %s"),
+					*UTraceUserSettings::DescribeKey(ShippedPrimary), *UTraceUserSettings::DescribeKey(ShippedAlt),
+					ParryInfo.ConfigId, *Settings.DescribeBinding(ETraceInputAction::Parry));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[KeysV28]   WRONG    s3d asks for parry on BOTH Q and the thumb mouse button; the table ")
+					TEXT("ships '%s' + '%s'."),
+					*UTraceUserSettings::DescribeKey(ShippedPrimary), *UTraceUserSettings::DescribeKey(ShippedAlt));
+			}
+
+			// The LIVE binding is reported separately and NOT failed on: a player is allowed to rebind
+			// their parry, and failing this command for them would make it useless on a real machine.
+			if (!Settings.ActionUsesKey(ETraceInputAction::Parry, EKeys::Q)
+				|| !Settings.ActionUsesKey(ETraceInputAction::Parry, EKeys::ThumbMouseButton))
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[KeysV28]   note     the LIVE parry is %s, not the shipped pair. That is a rebind (or a ")
+					TEXT("TraceUserSettings.ini that already names 'ParryKeys'), not a failure."),
+					*Settings.DescribeBinding(ETraceInputAction::Parry));
+			}
+
+			// =========================================================================================
+			// RIGHT MOUSE MUST BE HELD BY MELEE, AND BY NOTHING ELSE.
+			//
+			// *** THIS ASSERTION WAS INVERTED BY THE INTEGRATION PASS, AND THE OLD ONE WAS RIGHT WHEN IT
+			// WAS WRITTEN. *** §3 shipped before §10's melee had a row in this table at all: the only
+			// thing this file could prove then was the half it owned - that §3d had VACATED the button -
+			// so it asserted "nothing holds right mouse". The integrator then added
+			// ETraceInputAction::Melee on exactly that button, which is what §10 asked for, and this
+			// command began failing a build that was finally correct. Worth naming, because it is the
+			// classic stale-harness failure: the assertion did not become wrong, its PREMISE did.
+			//
+			// IT IS ASSERTED ON THE SHIPPED DEFAULTS, NOT ON THE LIVE BINDINGS, which is the same choice
+			// the §3d parry check twenty lines above makes and for the same reason: a player is allowed
+			// to rebind their melee, and a command that fails on a machine whose TraceUserSettings.ini
+			// has been touched is a command nobody can use on a real machine. (This very run found
+			// 'EquipGun -> K' in the local .ini, so that is not a hypothetical.) The LIVE state is
+			// reported underneath as a note.
+			//
+			// The rule has two halves and both matter:
+			//   MELEE SHIPS ON IT    - otherwise §10's "melee should be bound to right click by default"
+			//                          never reaches a player, which is exactly the state the integrator
+			//                          found: §3 vacated the button and §10 could not claim it;
+			//   NOTHING ELSE DOES    - the ORIGINAL check, unchanged in substance. A parry shipping on
+			//                          right mouse is what a returning player gets if the 'ParryPull' ->
+			//                          'ParryKeys' migration did not take, and it would now be a genuine
+			//                          double-bind rather than merely a stale default.
+			//
+			// THE CORE PULL IS NOT A COUNTER-EXAMPLE. It rides this button too, but not as a BINDING:
+			// TraceMelee::HandleMeleeInput consults ATraceCore::CanPullNow and dispatches the pull
+			// instead of the swing while the pull circle is on screen. One key, one action, one press,
+			// two verbs chosen by state - so PullCore correctly does not appear here, and if it ever
+			// does, that is one press dispatching the same verb twice.
+			// =========================================================================================
+			{
+				int32 RmbDefaultHolders = 0;
+				bool  bMeleeShipsOnRmb  = false;
+
+				for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+				{
+					const FKey Primary = (Info.DefaultKey != nullptr) ? Info.DefaultKey() : FKey();
+					const FKey Alt     = (Info.DefaultKeyAlt != nullptr) ? Info.DefaultKeyAlt() : FKey();
+
+					if (Primary != EKeys::RightMouseButton && Alt != EKeys::RightMouseButton)
+					{
+						continue;
+					}
+
+					++RmbDefaultHolders;
+
+					if (Info.Action == ETraceInputAction::Melee)
+					{
+						bMeleeShipsOnRmb = true;
+						continue;
+					}
+
+					++Failures;
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[KeysV28]   WRONG    '%s' (%s) SHIPS on the right mouse button as well as MELEE. Spec ")
+						TEXT("v28 s3d vacates that button for s10's melee and nothing else may share it. If this is ")
+						TEXT("the parry, the 'ParryPull' -> 'ParryKeys' migration did not take."),
+						Info.ConfigId, Info.DisplayName);
+				}
+
+				if (bMeleeShipsOnRmb)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[KeysV28]   ok       s10 MELEE SHIPS on the RIGHT MOUSE BUTTON and is the only one of ")
+						TEXT("the %d rebindable actions that does. The Core pull rides the same press through ")
+						TEXT("TraceMelee::HandleMeleeInput's precedence, not through a second binding."),
+						TraceInputActions::All().Num());
+				}
+				else
+				{
+					++Failures;
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[KeysV28]   WRONG    MELEE does not ship on the right mouse button. Spec v28 s10: ")
+						TEXT("\"Melee should be bound to right click by default.\" %s"),
+						(RmbDefaultHolders == 0)
+							? TEXT("Nothing at all ships on the button - the pre-integration state, where s3d vacated "
+							       "it and no row claimed it.")
+							: TEXT("Something else ships on it, which is worse: the button is claimed by the wrong verb."));
+				}
+
+				// The LIVE table, reported and NOT failed on - see the block comment above.
+				int32 LiveRmbHolders = 0;
+				FString LiveRmbNames;
+				for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+				{
+					if (Settings.ActionUsesKey(Info.Action, EKeys::RightMouseButton))
+					{
+						++LiveRmbHolders;
+						LiveRmbNames += (LiveRmbNames.IsEmpty() ? TEXT("") : TEXT(", "));
+						LiveRmbNames += Info.DisplayName;
+					}
+				}
+
+				if (LiveRmbHolders == 1 && Settings.ActionUsesKey(ETraceInputAction::Melee, EKeys::RightMouseButton))
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[KeysV28]   ok       and on THIS machine's live bindings the right mouse button is "
+						     "MELEE alone, so the shipped default is what is actually being played."));
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[KeysV28]   note     this machine's LIVE right mouse button is held by %d action(s) "
+						     "[%s] and melee resolves to %s. That is a rebind in "
+						     "Saved/Config/<Platform>/TraceUserSettings.ini, not a failure."),
+						LiveRmbHolders,
+						LiveRmbHolders == 0 ? TEXT("nothing") : *LiveRmbNames,
+						*Settings.DescribeBinding(ETraceInputAction::Melee));
+				}
+			}
+		}
+
+		// ---- §3b: the exclusion groups, as a table ------------------------------------------------
+		{
+			struct FPairExpectation
+			{
+				ETraceInputAction A;
+				ETraceInputAction B;
+				bool bMayShare;
+				const TCHAR* Why;
+			};
+
+			const FPairExpectation Pairs[] =
+			{
+				{ ETraceInputAction::Pass,  ETraceInputAction::Fire,     true,
+				  TEXT("the owner's own example: throwing needs the Core, firing needs not to have it") },
+				{ ETraceInputAction::Parry, ETraceInputAction::PullCore, true,
+				  TEXT("v25 s2's argument, now expressed as data rather than a comment") },
+				{ ETraceInputAction::Parry, ETraceInputAction::Fire,     true,
+				  TEXT("parry is carrier-only, fire is non-carrier-only") },
+				{ ETraceInputAction::Fire,  ETraceInputAction::PullCore, false,
+				  TEXT("both live while NOT carrying - a genuine conflict") },
+				{ ETraceInputAction::Parry, ETraceInputAction::Pass,     false,
+				  TEXT("both live while carrying - a genuine conflict") },
+				{ ETraceInputAction::Jump,  ETraceInputAction::Dash,     false,
+				  TEXT("both live in every state - the ordinary case, and it must still refuse") },
+			};
+
+			for (const FPairExpectation& Pair : Pairs)
+			{
+				const bool bActual = UTraceUserSettings::ActionsMayShareAKey(Pair.A, Pair.B);
+				if (bActual == Pair.bMayShare)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[KeysV28]   ok       s3b %-22s + %-22s may share=%d  (%s / %s) - %s"),
+						TraceInputActions::Info(Pair.A).DisplayName, TraceInputActions::Info(Pair.B).DisplayName,
+						bActual ? 1 : 0,
+						*LexTraceInputStates(TraceInputActions::Info(Pair.A).States),
+						*LexTraceInputStates(TraceInputActions::Info(Pair.B).States), Pair.Why);
+				}
+				else
+				{
+					++Failures;
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[KeysV28]   WRONG    s3b %s + %s: may share=%d, expected %d (%s)."),
+						TraceInputActions::Info(Pair.A).DisplayName, TraceInputActions::Info(Pair.B).DisplayName,
+						bActual ? 1 : 0, Pair.bMayShare ? 1 : 0, Pair.Why);
+				}
+			}
+		}
+
+		// ---- §3b end to end, and §3c's round trip, through the real write path ---------------------
+		//
+		// Snapshot FIRST. Everything below writes real bindings and saves them.
+		TArray<FKey> Before;
+		TraceUserSettingsVerify::Snapshot(Settings, Before);
+
+		{
+			const FKey FireKey = Settings.GetKey(ETraceInputAction::Fire);
+			if (!FireKey.IsValid())
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[KeysV28]   WRONG    FIRE is unbound on this machine, so the s3b sharing arm cannot be ")
+					TEXT("measured. Bind fire and run again."));
+			}
+			else
+			{
+				// --- ALLOWED: throw core onto the fire button ----------------------------------------
+				Settings.SetKey(ETraceInputAction::Pass, 0, FireKey);
+
+				const bool bThrowTook  = Settings.ActionUsesKey(ETraceInputAction::Pass, FireKey);
+				const bool bFireKeptIt = Settings.ActionUsesKey(ETraceInputAction::Fire, FireKey);
+
+				if (bThrowTook && bFireKeptIt)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[KeysV28]   ok       s3b THE ITEM: THROW / PASS CORE was bound to '%s' and FIRE STILL HAS IT. ")
+						TEXT("One button, two verbs, and the carrier test decides which one runs."),
+						*UTraceUserSettings::DescribeKey(FireKey));
+				}
+				else
+				{
+					++Failures;
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[KeysV28]   WRONG    s3b THE ITEM FAILED: after binding the throw to '%s', throwHasIt=%d ")
+						TEXT("fireHasIt=%d. This is the reported bug (fire went blank) - or Trace.Keys.LegacySteal is 1, ")
+						TEXT("which is the RED arm and is expected to print exactly this."),
+						*UTraceUserSettings::DescribeKey(FireKey), bThrowTook ? 1 : 0, bFireKeptIt ? 1 : 0);
+				}
+
+				// --- REFUSED: the Core-pull onto the same button --------------------------------------
+				//
+				// The guard against "we fixed it by never stealing". Fire and the pull are both
+				// NotCarrying, so this one MUST take the key away from fire.
+				Settings.SetKey(ETraceInputAction::PullCore, 0, FireKey);
+				const bool bPullTook = Settings.ActionUsesKey(ETraceInputAction::PullCore, FireKey);
+				const bool bFireLost = !Settings.ActionUsesKey(ETraceInputAction::Fire, FireKey);
+
+				if (bPullTook && bFireLost)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[KeysV28]   ok       s3b THE OTHER HALF: PULL CORE took '%s' AWAY from FIRE, because both ")
+						TEXT("are live while not carrying. Sharing is allowed, not universal."),
+						*UTraceUserSettings::DescribeKey(FireKey));
+				}
+				else
+				{
+					++Failures;
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[KeysV28]   WRONG    s3b a GENUINE conflict was allowed: pullHasIt=%d fireStillHasIt=%d on ")
+						TEXT("'%s'. The check has stopped refusing anything."),
+						bPullTook ? 1 : 0, bFireLost ? 0 : 1, *UTraceUserSettings::DescribeKey(FireKey));
+				}
+			}
+
+			// --- §3c: a SECOND key, through the .ini round trip -----------------------------------
+			//
+			// DASH is the victim: ETraceInputStates::Match, so nothing about it is special-cased by the
+			// conflict rule, and it is not one of the four actions the arms above are moving around.
+			Settings.SetKey(ETraceInputAction::Dash, 0, EKeys::Nine);
+			Settings.SetKey(ETraceInputAction::Dash, 1, EKeys::Eight);
+
+			const bool bBothSet = (Settings.GetKey(ETraceInputAction::Dash, 0) == EKeys::Nine)
+				&& (Settings.GetKey(ETraceInputAction::Dash, 1) == EKeys::Eight);
+
+			// Through the exact strings the .ini holds and back, which is where a second slot that
+			// validates but does not SERIALISE would be lost. Save() has already flattened; re-parsing
+			// the member array is what the loader does on the next launch.
+			Settings.RefreshFromConfig();
+			const bool bSurvived = (Settings.GetKey(ETraceInputAction::Dash, 0) == EKeys::Nine)
+				&& (Settings.GetKey(ETraceInputAction::Dash, 1) == EKeys::Eight);
+
+			if (bBothSet && bSurvived)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[KeysV28]   ok       s3c DASH held TWO keys (%s) and both survived a flatten and re-parse of ")
+					TEXT("the ini's own string form."),
+					*Settings.DescribeBinding(ETraceInputAction::Dash));
+			}
+			else
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[KeysV28]   WRONG    s3c set=%d survivedRoundTrip=%d; DASH is '%s'. The second slot does not ")
+					TEXT("persist."),
+					bBothSet ? 1 : 0, bSurvived ? 1 : 0, *Settings.DescribeBinding(ETraceInputAction::Dash));
+			}
+		}
+
+		// Everything the arms above wrote, put back — all seventeen actions, both slots.
+		TraceUserSettingsVerify::Restore(Settings, Before);
+
+		int32 RestoreFailures = 0;
+		{
+			TArray<FKey> After;
+			TraceUserSettingsVerify::Snapshot(Settings, After);
+			for (int32 Index = 0; Index < Before.Num() && Index < After.Num(); ++Index)
+			{
+				RestoreFailures += (Before[Index] == After[Index]) ? 0 : 1;
+			}
+		}
+		if (RestoreFailures > 0)
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KeysV28]   WRONG    %d slot(s) were not restored. This command has DAMAGED the player's ")
+				TEXT("bindings - that is worse than the bug it measures."), RestoreFailures);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KeysV28]   ok       every binding restored (%d slots)."), Before.Num());
+		}
+
+#define TRACE_KEYSV28_ARGS \
+	(Failures == 0) ? TEXT("SPEC v28 s3b/s3c/s3d HOLD") : TEXT("SOMETHING IN SPEC v28 s3 IS NOT TRUE"), \
+	GTraceKeysLegacySteal, Failures
+
+#define TRACE_KEYSV28_TEXT \
+	TEXT("[KeysV28] VERDICT: %s. Trace.Keys.LegacySteal=%d (1 is the RED arm and MUST fail the s3b item), ") \
+	TEXT("%d failure(s).")
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display, TRACE_KEYSV28_TEXT, TRACE_KEYSV28_ARGS);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TRACE_KEYSV28_TEXT, TRACE_KEYSV28_ARGS);
+		}
+
+#undef TRACE_KEYSV28_ARGS
+#undef TRACE_KEYSV28_TEXT
+	}
+
+	FAutoConsoleCommand CmdVerifyV28Keys(
+		TEXT("Trace.Keys.VerifyV28"),
+		TEXT("Spec v28 s3. Proves two actions with exclusive states KEEP one key between them (throw core ")
+		TEXT("on the fire button) while two that overlap do not, that a second bind survives the ini round ")
+		TEXT("trip, and that parry ships on Q + the thumb mouse button with nothing left on right mouse. ")
+		TEXT("Restores every binding it touches. Trace.Keys.LegacySteal 1 is the red arm."),
+		FConsoleCommandDelegate::CreateStatic(&VerifyV28Keys));
 
 	FAutoConsoleCommand CmdVerifyBinds(
 		TEXT("Trace.Settings.VerifyBinds"),

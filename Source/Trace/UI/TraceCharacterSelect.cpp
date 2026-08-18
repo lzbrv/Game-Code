@@ -1512,20 +1512,43 @@ const ATracePlayerState* FTraceCharacterSelect::FindTeammateHolding(const ATrace
 			continue;
 		}
 
-		// BOTS ARE CONSULTED NOW. Spec v14 §3 made them permanently characterless and this test used to
-		// skip them for that reason; spec v15 §2 reverses it, and a bot team-mate holding MACE greys
-		// MACE out exactly as a human team-mate would. Leaving the skip in would have been a card that
-		// looked free, was sent, and came back refused — the one outcome this local belief exists to
-		// avoid.
-		//
-		// WHEN THIS ACTUALLY SHOWS SOMETHING. Under §2's ordering the bots on your team hold nothing
-		// while your screen is open, so on a fresh match every card is free. The case it is for is the
-		// player who joins a match ALREADY IN PROGRESS: the bots filled long ago, and their picks are
-		// the only reason a card would be grey.
-		//
-		// Enemies are still skipped: mirroring the pick is legal (§3), so an enemy holding a character
+		// Enemies are skipped: mirroring the pick is legal (§3), so an enemy holding a character
 		// blocks nothing.
 		if (Candidate->Team != LocalState->Team)
+		{
+			continue;
+		}
+
+		// *** BOTS DO NOT BLOCK A PERSON ANY MORE — SPEC v28 §9b(b). ***
+		//
+		// The history in three lines, because this test has now been all three ways round. Spec v14
+		// §3 made bots permanently characterless, so it skipped them. Spec v15 §2 gave bots
+		// characters, so it stopped skipping them and a bot team-mate holding MACE greyed MACE out
+		// exactly as a human team-mate would. Spec v28 §9b makes a bot's hold YIELD to a human, so it
+		// skips them again — and this time the reason is not that the bot holds nothing, it is that
+		// what the bot holds is available to you.
+		//
+		// THE CASE THIS DECIDES IS THE OWNER'S. Verbatim: "it should be all the players first before
+		// the bots". A player whose client finished loading after the whistle finds the bots already
+		// filled; without this, every character a computer team-mate took would draw greyed with
+		// "TAKEN BY BOT BLUE 3" and this courtesy check would refuse to even send the request. The
+		// server would happily have preempted the bot — ATraceGameMode::RequestCharacter and
+		// UTraceAbilityComponent::ServerSetCharacter both do — so the rule would have been correct,
+		// enforced, and completely unreachable from the only screen that can ask for it.
+		//
+		// STILL A COURTESY, NOT A RULE. Everything this function is allowed to do is save a round
+		// trip; the server is what enforces §3's uniqueness and §9b's yield, and it refuses (or
+		// preempts) whatever local belief happens to be stale. Being wrong in THIS direction costs a
+		// refused RPC. Being wrong in the other direction cost the player their hero.
+		//
+		// Human team-mates are untouched: they hold what they locked in, and §3's "first request
+		// wins, the loser is told and re-picks" is exactly as it was.
+		//
+		// ASKED, NOT ASSUMED — ATracePlayerState::DoBotsYieldToHumans is true in every shipped build
+		// and false only under §9b's red arm, so a run launched with -TraceNoBotPreempt draws this
+		// screen exactly as the pre-v28 build drew it. That is what makes the red capture from a real
+		// second client a comparison rather than an assertion.
+		if (Candidate->IsABot() && ATracePlayerState::DoBotsYieldToHumans())
 		{
 			continue;
 		}

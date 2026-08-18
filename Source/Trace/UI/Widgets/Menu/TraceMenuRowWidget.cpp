@@ -2,13 +2,14 @@
 
 #include "UI/Widgets/Menu/TraceMenuRowWidget.h"
 
-#include "Blueprint/WidgetLayoutLibrary.h"      // GetViewportScale - the DPI factor, for the 2 px stroke
+#include "Blueprint/WidgetLayoutLibrary.h"      // GetViewportScale - the DPI factor, for the 1 px stroke
 #include "Blueprint/WidgetTree.h"
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Components/Image.h"
 #include "Components/PanelWidget.h"
 #include "Components/TextBlock.h"
+#include "Engine/Texture.h"                     // GetSurfaceWidth - what Slate 9-slices with
 #include "HAL/IConsoleManager.h"
 
 #include "Trace.h"                              // LogTraceGame
@@ -250,7 +251,7 @@ namespace TraceMenuRowWidgetLocal
 		float FlatTint = 1.f;
 
 		/**
-		 * SPEC v26 §7 — the white outline, on the DEFAULT state and nowhere else.
+		 * SPEC v26 §7 / v28 §1 — the white outline, on the DEFAULT state and nowhere else.
 		 *
 		 * A FIELD OF THIS STRUCT, not a separate `if (!bSelected)` twenty lines away, and that is the
 		 * same argument §3 made for the label: "Hover keeps its amber ring; do not stack both" is a
@@ -331,32 +332,86 @@ namespace TraceMenuRowWidgetLocal
 	}
 
 	// =============================================================================================
-	// SPEC v26 §7 — THE DEFAULT STATE'S 2 PX WHITE OUTLINE
+	// SPEC v28 §1 — 1 DEVICE PIXEL, AND IT HAS TO HUG THE PLATE
 	// =============================================================================================
 	//
-	//     "Add a 2pixel white outline to the default button state (non-hover)"
+	//     "Change the white outline to 1px and make sure it hugs the buttons, right now it looks
+	//      terrible. If you can't do just say it and I'll make new assets"
 	//
-	// It is drawn as a textureless Slate RoundedBox laid exactly over the row rect, for the same
-	// reason §A4's selection rail is one: a stroke is the shape with the worst small-size failure
-	// mode there is, and a vector one has none. A 2 px sprite border would be resampled by the DPI
-	// scale and turn into a grey smear at 720p and a soft 4 px band at 4K.
+	// Two complaints, two different causes. Neither of them is the stroke's colour or its z-order, and
+	// both are measurable off the build the owner was looking at.
 	//
-	// THE ROW RECT IS WHERE THE ARTIST'S PLATE IS FITTED, which is why the outline needs no offsets of
-	// its own. The plate sprite carries 128 sheet pixels of glow outside the plate and WBP_MenuRow's
-	// slot pushes the image out by exactly that overhang (Scripts/generate-menu-widgets.py:
-	// frame_glow_inset), so the plate lands on the row rectangle the mouse hit-tests. The stroke is
-	// anchored to that same rectangle rather than to a copy of its numbers, so it follows if the row
-	// is ever resized instead of being two values that happen to agree today.
+	// ---------------------------------------------------------------------------------------------
+	// 1. IT DID NOT HUG, BECAUSE THE ROW RECTANGLE IS NOT THE PLATE
+	// ---------------------------------------------------------------------------------------------
+	// Spec v26 §7 anchored the stroke to the row's own rect with zero offsets, on the reasoning that
+	// WBP_MenuRow pushes the plate IMAGE outward by exactly the glow overhang so that the plate itself
+	// lands back on that rect. One step of that is wrong, and the gap is not subtle. Profiling a row's
+	// left edge on the shipped 1920x1080 capture:
 	//
-	// MEASURED, because "lands on" is not quite "coincides with": the sprite's own plate edge is soft,
-	// and a column through a row's top edge shows the white stroke, then 1 px (720p) / 2 px (1080p) /
-	// 4 px (1440p) of the sprite's near-black rim, then the navy fill. So the stroke sits on the
-	// plate's outermost rim with a hairline of the artist's own dark edge inside it. That reads as a
-	// keyline and is left alone deliberately — closing it would mean hand-tuning an inset against one
-	// sprite's antialiasing, which is exactly the kind of number that stops being true after a
-	// re-slice.
+	//     x = 600, 601   the stroke                        (217,216,215) (255,255,255)
+	//     x = 602..606   NOTHING. Background.              (14,8,0) x 5
+	//     x = 607        the plate at last                 (35,44,80)
+	//
+	// The same profile top and bottom shows 3 px of background instead of 5. So the "outline" was a
+	// box hanging 6.9 local units off the sides of the button and 4.6 off its top and bottom, with its
+	// own corner radius — 14.6 — bearing no relation to the corner the plate is drawn with. That is
+	// exactly the "loose box around its bounding rectangle" the spec names.
+	//
+	// WHY THE PLATE IS INSIDE ITS OWN IMAGE. Slate does NOT size a Box brush's corner slices from
+	// FSlateBrush::ImageSize. It sizes them from the TEXTURE'S pixel size (ElementBatcher.cpp,
+	// AddBoxElement: `LeftMarginX = TextureWidth * Margin.Left`), so this plate's slices are 44 x 44
+	// LOCAL UNITS at every row height and every DPI scale. The plate image is only 72.5 local units
+	// tall, 44 + 44 does not fit in it, and Slate's overlap guard squashes both vertical slices to
+	// 36.24 — which moves the plate's edges inward and draws the artist's circular 28-unit corner as
+	// an ELLIPSE, 28 wide by 23.03 tall. TraceMenuArtStyle::ResolvePlateSilhouette is that arithmetic,
+	// restated from the engine's own source; the numbers it produces are checked against a screenshot
+	// in the header there. The stroke is laid on ITS answer, so it follows a re-slice, a different row
+	// height, or a fixed generator with no edit here.
+	//
+	// ---------------------------------------------------------------------------------------------
+	// 2. "1 PX AT EVERY RESOLUTION" IS NOT QUITE "DIVIDE THE WIDTH BY THE DPI SCALE"
+	// ---------------------------------------------------------------------------------------------
+	// Dividing does hold the WIDTH constant, and v26 did that much. What it does not hold constant is
+	// the stroke's OPACITY, because a rounded box is an SDF evaluated in the widget's LOCAL space and
+	// its antialiasing ramp is a fixed ±1 LOCAL UNIT wide (SlateShaderCommon.ush,
+	// GetRoundedBoxElementColorInternal: `bi_spread = 1.0`). The ramp does not shrink when the local
+	// width does, so a stroke thinner than about a local unit is being eaten by its own edge.
+	//
+	// MEASURED, from one binary, at 1920x1080, where both approaches put the same ~1 device px on the
+	// screen: this file's stroke peaks at 234/255 and v26's peaks at 215/255. That 8% is the ramp
+	// taking its bite out of a line that is only as wide as the ramp is. It gets worse in exactly the
+	// direction that matters: "1 device px" at 4K means a local width of 0.5 against the same ±1 ramp,
+	// half of what already cost 8%. The line does not collapse to nothing — it dissolves, which is
+	// worse, because it still looks like an outline in a thumbnail.
+	//
+	// THE FIX IS TO GIVE THE STROKE A LOCAL SPACE THAT *IS* DEVICE PIXELS. The outline's slot is sized
+	// by the layout scale and it carries a render transform of the inverse, so its rect on screen is
+	// unchanged while one unit of its own space is one screen pixel. The brush width is then literally
+	// the number the owner asked for, the ±1 unit ramp is ±1 screen pixel, and the measured peak is
+	// 232 / 234 / 229 at 720p / 1080p / 4K — flat. Nothing else here has to know the resolution.
+	//
+	// ---------------------------------------------------------------------------------------------
+	// WHAT THIS STILL CANNOT DO, STATED PLAINLY
+	// ---------------------------------------------------------------------------------------------
+	// A Slate rounded box has ONE radius per corner. It cannot draw an ellipse, and the plate's drawn
+	// corner is one. The way out is that a non-uniform render transform turns a circle into exactly
+	// the ellipse required — but the same transform is what carries the stroke width to the screen, so
+	// the width comes out anisotropic in the same ratio. The two cannot both be uniform, and this file
+	// chooses the geometry: the shape is followed exactly and the width is split about the requested
+	// number by its geometric mean, which puts a 1 px request at 0.91 px along the two long horizontal
+	// edges and 1.10 px up the two short vertical ones. Both read as one pixel; a corner that misses
+	// by 0.9 local units does not read as hugging.
+	//
+	// THE ASSET THAT WOULD REMOVE EVEN THAT. The ellipse exists only because the plate's 9-slice does
+	// not fit in the height it is drawn at: 44 texture px of vertical slice into 36.24 local units.
+	// A default plate re-imported at roughly half its present size — 256 x 77 rather than 512 x 153,
+	// same art — would put the slice at 22 px, inside the 36.24 that is available, and Slate would
+	// then draw the artist's corner as the circle they drew. Squash() becomes 1, this file's ellipse
+	// handling collapses to a no-op, and the stroke is a uniform 1.00 px everywhere with no code
+	// change. It is a re-import, not new art.
 
-	/** White. §7 says white, and the label's default state is the same white (WordDefault). */
+	/** White. §1 says white, and the label's default state is the same white (WordDefault). */
 	static const FLinearColor& OutlineColor()
 	{
 		// Function-local, for the static-initialisation-order reason spelled out at
@@ -368,21 +423,15 @@ namespace TraceMenuRowWidgetLocal
 	}
 
 	/**
-	 * The stroke's corner radius, in the row's LOCAL units.
+	 * The corner radius spec v26 §7 used, kept for ONE purpose: the red arm below draws with it.
 	 *
-	 * Derived, not chosen. TraceMenuArtStyle::ButtonFrame records the artist's plate as 4723 x 1230
-	 * sheet px inside a crop with 128 px of glow on every side, with the corner curve fully open 428
-	 * px in from the SPRITE's edge — i.e. 300 px in from the PLATE's edge, which for a circular corner
-	 * is the radius. As a fraction of the plate's height that is 300/1230, and the row is
-	 * TraceMenuStyle::RowHeight tall, so the radius is that fraction of the row. At today's 60 px row
-	 * it evaluates to 14.6, and if either the artist re-cuts the sprite or the row changes height the
-	 * outline's corner follows instead of having to be re-tuned to match a plate it no longer fits.
-	 *
-	 * IT SCALES WITH THE ROW AND THE WIDTH DOES NOT, and that asymmetry is deliberate: a corner is
-	 * part of the button's SHAPE, so it must scale with the button, while the stroke is part of its
-	 * FINISH and the owner asked for that in pixels.
+	 * It is what this file believed the plate's corner was before §1 measured it — the 9-slice margin
+	 * minus the glow, i.e. 300 sheet px, on the assumption that the slice is cut exactly at the end of
+	 * the curve. The slicer cuts it wider than that on purpose, so the number is 10% too round even
+	 * before Slate squashes the corner into an ellipse. Retired as the shipping value; retained so
+	 * that one binary can photograph the defect and the fix.
 	 */
-	static float OutlineCornerRadius()
+	static float LegacyOutlineCornerRadius()
 	{
 		const TraceMenuArtStyle::FSpriteFrame& Frame = TraceMenuArtStyle::ButtonFrame;
 		const float RadiusInPlatePixels = FMath::Max(0.f, Frame.Cap - Frame.Glow);
@@ -396,84 +445,100 @@ namespace TraceMenuRowWidgetLocal
 	}
 
 	/**
-	 * THE RED ARM for spec v26 §7. Non-zero takes DefaultOutlineWidthPx as LOCAL units instead of
-	 * device pixels — i.e. it puts back the naive implementation, the one that writes 2 into a Slate
-	 * brush and calls it two pixels.
+	 * THE RED ARM for spec v28 §1. Non-zero breaks BOTH halves of the fix, from the same binary:
 	 *
-	 * It exists because §7's requirement is not "draw an outline", it is "draw an outline that is
-	 * still 2 px at 720p and at 4K", and a capture of the FIXED build alone cannot show that the
-	 * measurement is capable of saying anything else. With this at 1 the same binary draws the defect
-	 * — 1 px at 720p, 3 px at 1440p, 4 px on a 4K display — so the pixel counts either side of the
-	 * fix come off one build, one harness and one measuring script.
+	 *   * the stroke goes back on the ROW's bounding rectangle with LegacyOutlineCornerRadius() above,
+	 *     which is spec v26 §7's geometry — the loose box, on screen next to the fix, same window,
+	 *     same crop, same zoom;
+	 *   * its width goes back into LOCAL units, so it rides the DPI curve instead of the screen. For a
+	 *     1 px request that is 0.55 px measured at 720p, 0.84 at 1080p and 1.84 at 4K.
+	 *
+	 * The second one is not what v26 SHIPPED — v26 divided by the scale and did hold the width roughly
+	 * constant. It is here because a capture of the fix alone cannot show that the pixel ruler is
+	 * capable of reporting a stroke that is NOT 1 px, and §1's first requirement is exactly that: not
+	 * 0 at 720p, not 3 at 4K. An arm that cannot produce those numbers proves nothing about the ruler.
 	 *
 	 * File-scope and distinctively named rather than an anonymous-namespace static, for the unity
 	 * build. Same reasoning as GRowHoverWordRedArm above.
 	 */
-	static int32 GRowOutlineLocalUnitsRedArm = 0;
+	static int32 GRowOutlineRedArm = 0;
 
-	static FAutoConsoleVariableRef CVarRowOutlineLocalUnitsRedArm(
-		TEXT("Trace.UI.RowOutlineLocalUnitsRedArm"),
-		GRowOutlineLocalUnitsRedArm,
-		TEXT("Dev only. Spec v26 s7 RED ARM. 1 makes the default row outline's width LOCAL units ")
-		TEXT("instead of device pixels, which is the resolution-dependent stroke the fix replaces. ")
-		TEXT("MEASURED off this arm: 1 px at 1280x720 and 3 px at 2560x1440 against the fix's 2 px at ")
-		TEXT("both; 4 px at 4K follows from the same DPI curve. Photograph both arms from one run."),
+	static FAutoConsoleVariableRef CVarRowOutlineRedArm(
+		TEXT("Trace.UI.RowOutlineRedArm"),
+		GRowOutlineRedArm,
+		TEXT("Dev only. Spec v28 s1 RED ARM. 1 puts the stroke back on the ROW's bounding rect with ")
+		TEXT("spec v26 s7's assumed corner radius - the loose box - AND puts its width back into LOCAL ")
+		TEXT("units, so a 1 px request measures 0.55 px at 720p, 0.84 at 1080p and 1.84 at 4K. Both ")
+		TEXT("halves of the fix broken at once, from one binary. Photograph both arms from one run."),
 		ECVF_Cheat);
 
 	/**
-	 * The last LOCAL WIDTH a row reported, so the line below is printed once per distinct stroke
-	 * rather than once per row. Six rows resolve the same width on the same frame; six identical
-	 * lines would be noise, and noise in a log is how the one line that mattered gets skipped.
+	 * The last stroke a row reported, so the line below is printed once per distinct stroke rather
+	 * than once per row. Six rows resolve the same geometry on the same frame; six identical lines
+	 * would be noise, and noise in a log is how the one line that mattered gets skipped.
 	 *
-	 * Keyed on the width and NOT on the layout scale, and that is a correction rather than a
+	 * Keyed on the DEVICE width and not on the layout scale, and that is a correction rather than a
 	 * preference: keying on the scale suppressed the red arm's own line, because flipping the arm
 	 * changes the stroke without changing the resolution — so the one build that could photograph both
 	 * arms could only log one of them.
 	 */
-	static float GLastLoggedOutlineLocalWidth = -1.f;
+	static float GLastLoggedOutlineWidth = -1.f;
+	static float GLastLoggedOutlineSquash = -1.f;
 
 	/**
-	 * Says, in one line, what §7's stroke actually came out as — the requested device width, the
-	 * layout scale it was divided by, and the local width that produces it.
+	 * Says, in one line, what §1's stroke actually came out as: the two device widths, the plate rect
+	 * the stroke was laid on, the corner it was given, and the scale all of it was resolved at.
 	 *
-	 * It exists because "2 px" is a claim about PIXELS and everything in this file is in local units:
-	 * without this, a log can only report the number somebody typed. With it, a capture at any
-	 * resolution can be checked against the line the same run printed.
+	 * It exists because "1 px" and "it hugs" are claims about PIXELS and everything in this file is in
+	 * local units. Without this a log can only report the number somebody typed; with it, a capture at
+	 * any resolution can be checked against the line the same run printed.
 	 */
-	static void LogOutlineWidthOnce(float RequestedWidth, float Scale, float LocalWidth)
+	static void LogOutlineOnce(float RequestedPx, float Scale,
+		const TraceMenuArtStyle::FPlateSilhouette& Plate, const FVector2D& RowSize,
+		float WidthAcross, float WidthUp)
 	{
-		if (FMath::IsNearlyEqual(GLastLoggedOutlineLocalWidth, LocalWidth, 0.001f))
+		const float Squash = static_cast<float>(Plate.Squash());
+		if (FMath::IsNearlyEqual(GLastLoggedOutlineWidth, WidthAcross, 0.001f)
+			&& FMath::IsNearlyEqual(GLastLoggedOutlineSquash, Squash, 0.001f))
 		{
 			return;
 		}
-		GLastLoggedOutlineLocalWidth = LocalWidth;
+		GLastLoggedOutlineWidth = WidthAcross;
+		GLastLoggedOutlineSquash = Squash;
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[MenuRow] Spec v26 s7 outline: asked for %.2f, layout scale %.4f -> %.3f local units ")
-			TEXT("= %.2f device px%s. Corner radius %.2f local units, from the artist's plate ")
-			TEXT("(ButtonFrame) and RowHeight %.0f."),
-			RequestedWidth, Scale, LocalWidth, LocalWidth * Scale,
-			(GRowOutlineLocalUnitsRedArm != 0) ? TEXT("  [RED ARM: width is LOCAL units]") : TEXT(""),
-			OutlineCornerRadius(), TraceMenuStyle::RowHeight);
+			TEXT("[MenuRow] Spec v28 s1 outline: asked for %.2f device px, layout scale %.4f -> %.2f px ")
+			TEXT("along the top and bottom, %.2f px up the sides. Drawn on %s: row %.1f x %.1f local, ")
+			TEXT("shape %.2f x %.2f inset (%.2f, %.2f), corner %.2f x %.2f (squash %.4f)%s."),
+			RequestedPx, Scale, WidthUp, WidthAcross,
+			(GRowOutlineRedArm != 0)
+				? TEXT("the ROW's bounding box  [RED ARM: spec v26, width in LOCAL units]")
+				: TEXT("the PLATE's own silhouette"),
+			RowSize.X, RowSize.Y, Plate.Size().X, Plate.Size().Y, Plate.Min.X, Plate.Min.Y,
+			Plate.RadiusX, Plate.RadiusY, Squash,
+			Plate.bCornerInsideSlice ? TEXT("")
+				: TEXT("  WARNING: the plate's corner arc runs past its 9-slice, so its drawn shape is "
+					"not an ellipse and no rounded box can follow it"));
 	}
 
 	/**
-	 * The outline brush for a stroke @p LocalWidth local units wide.
+	 * The outline brush: a stroke @p Width units wide on a rounded box of radius @p Radius, both in
+	 * the OUTLINE WIDGET's own local space — which ApplyDefaultOutline arranges to be device pixels.
 	 *
-	 * The FILL is transparent — this is an outline, not a plate, and the artist's plate is already
-	 * underneath it. Slate draws a rounded box's outline INSIDE the rectangle, so the stroke sits on
-	 * the plate rather than in the gap between rows, and it never widens the row's footprint.
+	 * The FILL is transparent. This is an outline, not a plate, and the artist's plate is already
+	 * underneath it. Slate draws a rounded box's outline INSIDE the rectangle, which is what puts the
+	 * stroke on the plate's own outermost pixels rather than in the gap between rows.
 	 *
 	 * Note that a rounded box's outline colour is taken from the brush and is NOT multiplied by the
 	 * widget's ColorAndOpacity (SlateCore's DrawElementTypes.cpp, ET_RoundedBox), so this white is
 	 * the white that reaches the screen and cannot be dimmed by a tint set somewhere else.
 	 */
-	static FSlateBrush MakeDefaultOutlineBrush(float LocalWidth)
+	static FSlateBrush MakeDefaultOutlineBrush(float Width, float Radius)
 	{
 		FSlateBrush Brush;
 		Brush.DrawAs = ESlateBrushDrawType::RoundedBox;
 		Brush.OutlineSettings = FSlateBrushOutlineSettings(
-			OutlineCornerRadius(), FSlateColor(OutlineColor()), LocalWidth);
+			Radius, FSlateColor(OutlineColor()), Width);
 		Brush.TintColor = FSlateColor(FLinearColor(0.f, 0.f, 0.f, 0.f));
 		Brush.SetResourceObject(nullptr);
 		return Brush;
@@ -589,7 +654,7 @@ void UTraceMenuRow::InstallDefaultOutline()
 
 	// Everything here is optional in the way the whole UMG migration is optional: if the tree is not
 	// what this expects, DefaultOutline stays null, ApplyDefaultOutline becomes a no-op and the row
-	// draws exactly what it drew before §7. A missing outline is a cosmetic regression; a crash on
+	// draws exactly what it drew before §1. A missing outline is a cosmetic regression; a crash on
 	// the title screen is not recoverable.
 	if (WidgetTree == nullptr || PlateSprite == nullptr)
 	{
@@ -616,7 +681,7 @@ void UTraceMenuRow::InstallDefaultOutline()
 	// swallowed a click over a row would break selection in a way that looks like the menu ignoring
 	// the player — the same rule every label on this row follows.
 	Outline->SetVisibility(ESlateVisibility::Collapsed);
-	Outline->SetBrush(TraceMenuRowWidgetLocal::MakeDefaultOutlineBrush(0.f));
+	Outline->SetBrush(TraceMenuRowWidgetLocal::MakeDefaultOutlineBrush(0.f, 0.f));
 
 	UCanvasPanelSlot* OutlineSlot = Canvas->AddChildToCanvas(Outline);
 	if (OutlineSlot == nullptr)
@@ -624,64 +689,178 @@ void UTraceMenuRow::InstallDefaultOutline()
 		return;
 	}
 
-	// THE ROW RECT, exactly: anchored to all four corners with zero offsets. The plate sprite's own
-	// slot is pushed OUTWARD by its glow overhang so that the artist's plate is fitted to this same
-	// rectangle — see the block above MakeDefaultOutlineBrush, including what a column through the
-	// edge actually measures.
-	OutlineSlot->SetAnchors(FAnchors(0.f, 0.f, 1.f, 1.f));
-	OutlineSlot->SetOffsets(FMargin(0.f, 0.f, 0.f, 0.f));
-	OutlineSlot->SetAlignment(FVector2D(0.f, 0.f));
+	// A POINT anchor at the row's centre, with the widget centred on it, and NOT the stretched
+	// four-corner anchor spec v26 §7 used. The whole of §1 is that this widget's rect is no longer the
+	// row's rect — it is the plate's, and it is sized in device pixels and scaled back down by a
+	// render transform. None of that is expressible as offsets from the row's four edges; all of it is
+	// a position and a size about a centre, which ApplyDefaultOutline writes every time the layout
+	// moves.
+	OutlineSlot->SetAnchors(FAnchors(0.5f, 0.5f));
+	OutlineSlot->SetAlignment(FVector2D(0.5, 0.5));
 	OutlineSlot->SetAutoSize(false);
+	OutlineSlot->SetPosition(FVector2D::ZeroVector);
+	OutlineSlot->SetSize(FVector2D::ZeroVector);
 
 	// Above the plate (z 0), below the value chip (z 3) and the words (z 4). The stroke belongs to
 	// the button, so it goes on the button; it must not be able to cross a label.
 	OutlineSlot->SetZOrder(1);
+
+	// The render transform has to scale about the widget's own CENTRE, because that centre is the one
+	// point of the outline whose position ApplyDefaultOutline pins. 0.5, 0.5 is UMG's default and is
+	// set anyway: it is load-bearing here, and a default that is load-bearing should be written down.
+	Outline->SetRenderTransformPivot(FVector2D(0.5, 0.5));
 
 	DefaultOutline = Outline;
 }
 
 void UTraceMenuRow::ApplyDefaultOutline(bool bWanted)
 {
+	using namespace TraceMenuRowWidgetLocal;
+
 	if (DefaultOutline == nullptr)
 	{
 		return;
 	}
 
-	DefaultOutline->SetVisibility(bWanted
-		? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
-	if (!bWanted)
+	UCanvasPanelSlot* OutlineSlot = Cast<UCanvasPanelSlot>(DefaultOutline->Slot);
+	const float Requested = FMath::Max(0.f, DefaultOutlineWidthPx);
+
+	// The row's own rect, and the plate image's, both in the ROW's local units. Taken from the two
+	// CACHED GEOMETRIES rather than from the plate slot's authored offsets, and that is deliberate:
+	// geometry is what Slate actually did, offsets are what the generator asked for, and this file
+	// does not own the generator. It also means the stroke follows a plate that is ever moved,
+	// resized or re-anchored in the asset with no edit here.
+	const FGeometry& RowGeometry = GetCachedGeometry();
+	const FGeometry& PlateGeometry = (PlateSprite != nullptr)
+		? PlateSprite->GetCachedGeometry() : RowGeometry;
+
+	const FVector2D RowSize = RowGeometry.GetLocalSize();
+	const FVector2D ImageSize = PlateGeometry.GetLocalSize();
+
+	// A row that has not been painted yet has an IDENTITY cached geometry, whose size is zero. There
+	// is no plate to hug on such a frame and no honest way to guess one, so the stroke waits — one
+	// frame, before the menu's first paint, and never again.
+	const bool bLaidOut = RowSize.X > 1.0 && RowSize.Y > 1.0 && ImageSize.X > 1.0 && ImageSize.Y > 1.0;
+
+	const UTexture* PlateTexture = Cast<UTexture>(PlateDefaultBrush.GetResourceObject());
+
+	if (!bWanted || OutlineSlot == nullptr || Requested <= 0.f || !bLaidOut || PlateTexture == nullptr)
 	{
+		DefaultOutline->SetVisibility(ESlateVisibility::Collapsed);
 		return;
 	}
 
-	// ---- 2 DEVICE PIXELS, AT EVERY RESOLUTION (spec v26 §7) ---------------------------------------
-	//
-	// A Slate rounded box's outline Width is in LOCAL units and is scaled to the screen with the rest
-	// of the widget, so the local width that produces a constant device width is the requested pixel
-	// count DIVIDED BY the layout scale. The engine's default DPI curve makes that scale 0.666 at
-	// 720p, 1.0 at 1080p, 1.333 at 1440p and 2.0 at 4K, which is exactly the ladder §7 says the
-	// stroke must not ride: a hard-coded 2 here would be 1.3 px, 2 px, 2.7 px and 4 px.
-	//
-	// Stored as the device width and divided by the live scale, rather than stored per resolution: the
-	// value that modifies the base follows the base.
-	const float Scale = FMath::Max(KINDA_SMALL_NUMBER, LayoutScale());
-	const float Requested = FMath::Max(0.f, DefaultOutlineWidthPx);
+	const FVector2D ImageMin(RowGeometry.AbsoluteToLocal(PlateGeometry.GetAbsolutePosition()));
 
-	// The red arm SKIPS the division, which is precisely the bug: it makes the brush's local width
-	// equal to the requested number and lets the DPI scale multiply it on the way to the screen.
-	const float LocalWidth = (TraceMenuRowWidgetLocal::GRowOutlineLocalUnitsRedArm != 0)
-		? Requested
-		: Requested / Scale;
+	// ---- WHERE THE PLATE ACTUALLY IS ---------------------------------------------------------------
+	//
+	// Not "the row rect", which is what spec v26 §7 assumed and what put five pixels of background
+	// between the stroke and the button. The texture's pixel size and the brush's margin are what
+	// Slate slices with, so they are what this is asked with; the derivation, and the screenshot it
+	// was checked against, are in TraceMenuArtStyle.h.
+	const TraceMenuArtStyle::FPlateSilhouette Plate = TraceMenuArtStyle::ResolvePlateSilhouette(
+		TraceMenuArtStyle::ButtonFrame,
+		ImageMin, ImageMin + ImageSize,
+		FVector2D(PlateTexture->GetSurfaceWidth(), PlateTexture->GetSurfaceHeight()),
+		PlateDefaultBrush.GetMargin());
 
-	// Rebuilt only when it actually moves. SetBrush invalidates this widget's paint, and doing that
-	// every frame for a value that changes only when the window is resized would put a needless
-	// invalidation on all six rows of a screen that is otherwise almost entirely static.
-	if (!FMath::IsNearlyEqual(DefaultOutlineLocalWidth, LocalWidth, 0.01f))
+	if (!Plate.bValid)
 	{
-		DefaultOutlineLocalWidth = LocalWidth;
-		DefaultOutline->SetBrush(TraceMenuRowWidgetLocal::MakeDefaultOutlineBrush(LocalWidth));
-		TraceMenuRowWidgetLocal::LogOutlineWidthOnce(Requested, Scale, LocalWidth);
+		DefaultOutline->SetVisibility(ESlateVisibility::Collapsed);
+		return;
 	}
+
+	// THE RED ARM, and it sits here rather than at the end because the shape is what it has to break:
+	// the ROW's rectangle, the corner radius this file used to assume, and a width in local units.
+	// One binary, both screens. See the block above MakeDefaultOutlineBrush for what it is and is not
+	// claiming to reproduce.
+	TraceMenuArtStyle::FPlateSilhouette Shape = Plate;
+	const float Scale = FMath::Max(KINDA_SMALL_NUMBER, LayoutScale());
+	float DeviceWidth = Requested;
+	if (GRowOutlineRedArm != 0)
+	{
+		Shape.Min = FVector2D::ZeroVector;
+		Shape.Max = RowSize;
+		Shape.RadiusX = LegacyOutlineCornerRadius();
+		Shape.RadiusY = Shape.RadiusX;
+		DeviceWidth = Requested * Scale;
+	}
+
+	// ---- ONE DEVICE PIXEL, AT EVERY RESOLUTION -----------------------------------------------------
+	//
+	// The outline is drawn in a space of its own where ONE UNIT IS ONE SCREEN PIXEL across the row: the
+	// slot is sized in device pixels and the render transform is the inverse of the layout scale, so
+	// the rect on screen is unchanged and the brush's width is in the units the owner counts in.
+	//
+	// That is not a convenience. A rounded box's antialiasing ramp is a fixed ±1 unit of the widget's
+	// own local space, so a stroke thinner than a unit cannot reach full opacity, and dividing the
+	// width by the DPI scale makes it thinner in exactly that space as the screen gets bigger. In this
+	// space the ramp is one screen pixel wide at every resolution, and 1 px is a pixel of white.
+	//
+	// The SQUASH is the second axis of the same idea. The plate's drawn corner is an ellipse (Slate
+	// squashed the 9-slice; see the block above MakeDefaultOutlineBrush) and a rounded box only has
+	// circular corners — but a NON-UNIFORM render transform turns its circle into exactly that
+	// ellipse. The cost is that the same transform carries the stroke width, so the width comes out
+	// anisotropic in the same ratio; splitting it about the request by the geometric mean keeps both
+	// halves within 10% of the number asked for. When the plate's corner is round, Squash is 1, the
+	// root is 1, and every line below is the plain uniform case.
+	const double Squash = FMath::Clamp(Shape.Squash(), 0.05, 20.0);
+	const double SquashRoot = FMath::Sqrt(Squash);
+
+	const FVector2D DrawSize = Shape.Size();
+	const FVector2D SlotSize(DrawSize.X * Scale, DrawSize.Y * Scale / Squash);
+	const FVector2D SlotPosition(Shape.Center() - RowSize * 0.5);
+	const FVector2D RenderScale(1.0 / Scale, Squash / Scale);
+
+	if (SlotSize.X <= 1.0 || SlotSize.Y <= 1.0)
+	{
+		DefaultOutline->SetVisibility(ESlateVisibility::Collapsed);
+		return;
+	}
+
+	// Clamped the way Slate clamps a rounded box's own radius, so the two shapes cannot disagree at a
+	// degenerate row height.
+	const float BrushRadius = static_cast<float>(FMath::Min(
+		Shape.RadiusX * Scale, FMath::Min(SlotSize.X, SlotSize.Y) * 0.5));
+
+	// The width in the SDF's units. It reaches the screen multiplied by the render scale, so it is
+	// DeviceWidth / sqrt(Squash) up the two short vertical edges and DeviceWidth * sqrt(Squash) along
+	// the two long horizontal ones.
+	const float BrushWidth = static_cast<float>(DeviceWidth / SquashRoot);
+
+	// ---- Written only when it moves ----------------------------------------------------------------
+	//
+	// SetSize, SetPosition, SetRenderScale and SetBrush all invalidate the widget, and this runs on six
+	// rows every frame of a screen that is otherwise completely static. Everything compared here is in
+	// the outline's own device-pixel space, so this compares what will be DRAWN rather than what was
+	// asked for.
+	if (!DefaultOutlineSlotSize.Equals(SlotSize, 0.01))
+	{
+		DefaultOutlineSlotSize = SlotSize;
+		OutlineSlot->SetSize(SlotSize);
+	}
+	if (!DefaultOutlineSlotPos.Equals(SlotPosition, 0.01))
+	{
+		DefaultOutlineSlotPos = SlotPosition;
+		OutlineSlot->SetPosition(SlotPosition);
+	}
+	if (!DefaultOutlineRenderScale.Equals(RenderScale, 0.0001))
+	{
+		DefaultOutlineRenderScale = RenderScale;
+		DefaultOutline->SetRenderScale(RenderScale);
+	}
+	if (!FMath::IsNearlyEqual(DefaultOutlineBrushWidth, BrushWidth, 0.005f)
+		|| !FMath::IsNearlyEqual(DefaultOutlineBrushRadius, BrushRadius, 0.01f))
+	{
+		DefaultOutlineBrushWidth = BrushWidth;
+		DefaultOutlineBrushRadius = BrushRadius;
+		DefaultOutline->SetBrush(MakeDefaultOutlineBrush(BrushWidth, BrushRadius));
+		LogOutlineOnce(Requested, Scale, Shape, RowSize,
+			static_cast<float>(DeviceWidth / SquashRoot),
+			static_cast<float>(DeviceWidth * SquashRoot));
+	}
+
+	DefaultOutline->SetVisibility(ESlateVisibility::HitTestInvisible);
 }
 
 void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
@@ -696,7 +875,7 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 	// menu wants this row on screen. Latched, so it costs one branch a frame afterwards.
 	InstallAtlasLabels();
 
-	// Spec v26 §7, and here for the same reason: the widget tree is certain to exist by the time the
+	// Spec v26 §7 / v28 §1, and here for the same reason: the widget tree is certain to exist by the
 	// menu asks this row to draw, and nowhere earlier is.
 	InstallDefaultOutline();
 
@@ -732,7 +911,7 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 		PlateSprite->SetColorAndOpacity(FLinearColor(PlateTint, PlateTint, PlateTint, 1.f));
 	}
 
-	// SPEC v26 §7 — the white stroke, from THE SAME FRAME'S Visuals as the plate above. The hover
+	// SPEC v26 §7 / v28 §1 — the white stroke, from THE SAME FRAME'S Visuals as the plate above. The hover
 	// plate carries the artist's amber ring and Visuals.bOutline is false in every state that uses it,
 	// so "do not stack both" is a property of the switch rather than of this call site.
 	ApplyDefaultOutline(Visuals.bOutline);
