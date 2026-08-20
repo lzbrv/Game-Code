@@ -29,7 +29,7 @@
 //   Headshot    control rotation onto the head SPHERE the damage model itself defines    (client)
 //   CoreTurnover  mouse 1 while carrying -> ThrowFromHolder -> AnnounceTurnoverSound    (game-side)
 //   CorePickup  Trace.Verif.GrantCore -> ATraceCore::GrantTo -> OnRep_Carrier            (client)
-//   Parry       RightMouseButton while carrying -> ServerTryBeginParry                   (game-side)
+//   Parry       Q while carrying -> ServerTryBeginParry   (v28 §3d moved it off right mouse) (game-side)
 //   ButtonPress Escape, then Enter on a pause-menu row -> ActivateSelected               (client)
 //
 // ORDER IS LOAD-BEARING. The shots come BEFORE the Core is granted, because mouse 1 THROWS while
@@ -214,24 +214,58 @@ namespace TraceAudioIntegFile
 			return nullptr;
 		}
 
-		// THE CAMERA'S OWN RAY, asked of the camera rather than rebuilt from control rotation - the
-		// same view point the shot is resolved from.
-		FVector ViewLocation = FVector::ZeroVector;
-		FRotator ViewRotation = FRotator::ZeroRotator;
-		PC->GetPlayerViewPoint(ViewLocation, ViewRotation);
+		// =========================================================================================
+		// *** SPEC v29 §1: THIS FIXTURE WAS PUTTING THE TARGET WHERE IT COULD NOT STAY. ***
+		//
+		// The version above this one teleported the enemy ONTO the ray — for the chest that meant the
+		// actor origin, and for the head that meant the actor origin MINUS the head offset, i.e. about
+		// 60 uu below the ray. A WALKING character does not stay where a teleport puts it: the movement
+		// component snaps it back to the floor on its next update. The chest case survived that by
+		// luck (a capsule is 34 uu of radius and 90 of half-height, so the ray still clipped it); the
+		// HEAD case did not, and Trace.Audio.Integ has been reporting "SILENT Headshot" for a call site
+		// that is the SAME LINE as the Bodyshot it reports as heard.
+		//
+		// The v29 §1f harness hit this and measured it — "584.1 uu along the ray and 66.0 uu OFF it
+		// (capsule radius 34.0)" — so the fix here is the one that measurement implies: put the target
+		// somewhere it can STAND, and aim the shooter at the point that must be hit. GetMuzzleLocation
+		// and GetAimDirection are arithmetic on the actor transform and the control rotation rather
+		// than on the camera's interpolated pose, and the caller re-runs this every frame, so the aim
+		// has converged long before the fire key lands.
+		//
+		// The SHOT is still untouched: real fire key, real server resolve, real zone classification,
+		// real ClientNotifyHit. Only where the target stands, and where the shooter looks, are staged.
+		// =========================================================================================
+		const FVector Forward = Me->GetActorForwardVector().GetSafeNormal2D();
+		if (Forward.IsNearlyZero())
+		{
+			return nullptr;
+		}
 
-		const FVector Spot = ViewLocation + ViewRotation.Vector() * Distance;
-		Nearest->TeleportTo(Spot - HitOffsetFromActor, (-ViewRotation.Vector()).Rotation(),
-			/*bIsATest=*/false, /*bNoCheck=*/true);
+		FVector Spot = Me->GetActorLocation() + Forward * Distance;
+		Spot.Z = Me->GetActorLocation().Z;   // the same floor the shooter is on, so nothing snaps
+		Nearest->TeleportTo(Spot, (-Forward).Rotation(), /*bIsATest=*/false, /*bNoCheck=*/true);
+
+		// AIM AT THE POINT THAT HAS TO BE HIT: the actor origin for a chest, the head sphere's centre
+		// for a head. HitOffsetFromActor is measured off the damage model by the caller, so the head
+		// this aims at is the head the classifier will name.
+		const FVector AimPoint = Nearest->GetActorLocation() + HitOffsetFromActor;
+		if (APlayerController* Shooter = Cast<APlayerController>(Me->GetController()))
+		{
+			const FVector ToAimPoint = AimPoint - Me->GetMuzzleLocation();
+			if (!ToAimPoint.IsNearlyZero())
+			{
+				Shooter->SetControlRotation(ToAimPoint.Rotation());
+			}
+		}
 
 		if (bLog)
 		{
 			UE_LOG(LogTraceGame, Warning,
-				TEXT("[AudioInteg] FIXTURE MOVE (%s): %s held on the camera's own ray with its %s at %s, ")
-				TEXT("%.0f uu out, until the server's lag-compensation history has recorded it there. The ")
-				TEXT("SHOT is untouched - real fire key, real server resolve, real zone classification, ")
-				TEXT("real ClientNotifyHit."),
-				What, *GetNameSafe(Nearest), What, *Spot.ToCompactString(), Distance);
+				TEXT("[AudioInteg] FIXTURE MOVE (%s): %s stood on the floor %.0f uu ahead and the shooter ")
+				TEXT("aimed at its %s (%s), held there until the server's lag-compensation history has ")
+				TEXT("recorded it. The SHOT is untouched - real fire key, real server resolve, real zone ")
+				TEXT("classification, real ClientNotifyHit."),
+				What, *GetNameSafe(Nearest), Distance, What, *AimPoint.ToCompactString());
 		}
 		return Nearest;
 	}
@@ -443,7 +477,7 @@ namespace TraceAudioIntegFile
 			{ TraceSoundEvents::Headshot,     TEXT("Fire at a head -> ClientNotifyHit") },
 			{ TraceSoundEvents::CoreTurnover, TEXT("mouse 1 while carrying -> ThrowFromHolder (v28 s2: the DROP)") },
 			{ TraceSoundEvents::CorePickup,   TEXT("GrantCore -> OnRep_Carrier") },
-			{ TraceSoundEvents::Parry,        TEXT("RightMouse while carrying -> ServerTryBeginParry") },
+			{ TraceSoundEvents::Parry,        TEXT("Q while carrying -> ServerTryBeginParry (v28 §3d)") },
 			{ TraceSoundEvents::ButtonPress,  TEXT("Enter on a menu row -> ActivateSelected") },
 		};
 
@@ -664,9 +698,17 @@ namespace TraceAudioIntegFile
 
 		At(BaseOffset + FSchedule::Parry, [W]()
 		{
+			// *** Q, NOT RIGHT MOUSE. *** This step pressed RightMouseButton from v26 until spec v29,
+			// and it was reporting "SILENT Parry" for a call site that was fine: spec v28 §3d MOVED the
+			// parry off right mouse (to Q and the thumb mouse button, with a "ParryPull" -> "ParryKeys"
+			// migration so a returning player cannot put it back), and spec v28 §10 gave the button to
+			// MELEE. So every run since Demo 28 has been swinging the knife and calling the parry
+			// unwired. The lesson is the project's own: a harness that cannot be pressed any more is
+			// indistinguishable from a feature that does not work.
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[AudioInteg] step 8/9: PARRY (right mouse, now that the pawn is carrying)."));
-			Press(W(), TEXT("RightMouseButton"), 0.15f, TEXT("controller"));
+				TEXT("[AudioInteg] step 8/9: PARRY (Q - v28 §3d took it off right mouse, which is now "
+				     "melee - now that the pawn is carrying)."));
+			Press(W(), TEXT("Q"), 0.15f, TEXT("controller"));
 		});
 
 		// SPEC v28 §2 MOVED THIS STEP, AND MOVED IT LAST OF THE THREE ON PURPOSE.

@@ -134,8 +134,24 @@ namespace
 	 * player's saved `SwapWeapon=F` line is dropped on load like any other line naming an action
 	 * that no longer exists. See the ETraceInputAction::EquipKnife comment for the full argument.
 	 */
-	FKey Default_EquipKnife()  { return EKeys::One; }
-	FKey Default_EquipGun()    { return EKeys::Two; }
+	/**
+	 * *** SPEC v29 §5 — 1 STOWS THE GUNS, 2 IS THE PISTOL, 3 IS THE SMG. ***
+	 *
+	 * The KEYS are unchanged for the first two rows and the third is the obvious next digit, so
+	 * there is no collision to argue about: nothing else in this table claims a digit, and
+	 * SetKey's stealing rule would log it on a first run if it did. EKeys::Three is the NUMBER ROW,
+	 * not the numpad (that is EKeys::NumPadThree), for the reason the two above give.
+	 *
+	 * WHAT MOVED IS THE MEANING AND THE CONFIG ID, NOT THE KEY. See the ETraceInputAction::EquipKnife
+	 * comment for the migration ("EquipKnife" -> "StowGuns", "EquipGun" -> "EquipPistol"); the short
+	 * version is that a returning player's saved `EquipKnife=1` line names an id this table no longer
+	 * has, is dropped on load like `SwapWeapon=F` before it, and the new default is seeded. Without
+	 * that a returning player would keep a bind whose label and behaviour had both changed underneath
+	 * it and would never see the SMG row at all, because their file has no line for it either.
+	 */
+	FKey Default_StowGuns()    { return EKeys::One; }
+	FKey Default_EquipPistol() { return EKeys::Two; }
+	FKey Default_EquipSmg()    { return EKeys::Three; }
 	/**
 	 * SPEC v14 §5. E and V are NAMED BY THE DOC, so there is no key to choose here — only a collision
 	 * to check. Taken already: WASD, Space, LeftCtrl, LeftShift, Q, mouse1, mouse2, Tab, 1, 2.
@@ -269,8 +285,39 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// SPEC v15 §5 DELETED THE `SwapWeapon` ROW that used to sit directly above these two. That is
 		// also what removes "SWAP WEAPON" from the options screen's rebind list — the list is this
 		// table walked in order and nothing else, so there is no second place to go and delete it.
-		{ ETraceInputAction::EquipKnife,  TEXT("EquipKnife"),  TEXT("EQUIP KNIFE"),  &Default_EquipKnife,  &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::EquipGun,    TEXT("EquipGun"),    TEXT("EQUIP GUN"),    &Default_EquipGun,    &Default_None, ETraceInputStates::Match },
+		//
+		// *** SPEC v29 §5 — THREE WEAPON STATES, AND THE KNIFE IS IN ALL OF THEM. ***
+		//
+		//     1  STOW GUNS   guns away, knife only     -> the knife speed boost
+		//     2  PISTOL      pistol out, knife out     -> normal speed
+		//     3  SMG         SMG out, knife out        -> normal speed
+		//
+		// THE TWO ConfigIds ON THE FIRST TWO ROWS ARE NEW STRINGS, AND THAT IS THE POINT. This is the
+		// third time this file has paid that price ("Boost" -> "Parry" in v3, "Parry"/"Pass" ->
+		// "ParryKeys"/"ThrowCore" in v28 §3d) and the argument is unchanged: Save() ->
+		// FlattenToConfig() writes a line for EVERY action, so a returning player's
+		// TraceUserSettings.ini already contains
+		//
+		//     KeyBindings=EquipKnife=One
+		//     KeyBindings=EquipGun=Two
+		//
+		// and RefreshFromConfig honours both over whatever this table says. Ship the new 1/2/3 layout
+		// under the old ids and a returning player's 1 key still means "the pistol", their 3 key means
+		// nothing at all, and the note reads as un-done on the one machine that matters. Under the NEW
+		// ids their two lines name actions the table does not have, are DISCARDED by the parse loop
+		// exactly as `SwapWeapon=F` is, and all three rows seed their shipped defaults.
+		//
+		// WHAT A RETURNING PLAYER LOSES: a hand-rebound weapon-select key, once, loudly
+		// (Trace.Settings.VerifyBinds prints every dropped line by name).
+		//
+		// HAND-OFF, STATED PLAINLY: Source/Trace/UI/TraceOptionsMenu.cpp has a
+		// `TraceOptionsBindingRowLabel` helper that OVERRIDES the DisplayName of these two rows with
+		// "WEAPON 1 (PISTOL)" / "WEAPON 2 (SMG)" (spec v28 §10's dual-wield remap, which v29 §5
+		// replaces). That file is the crosshair slice's this pass. Until that helper is deleted the
+		// keybind page will mislabel rows 12 and 13; the DisplayNames here are already correct and
+		// deleting the helper is the whole fix.
+		{ ETraceInputAction::EquipKnife,  TEXT("StowGuns"),    TEXT("STOW GUNS (KNIFE ONLY)"), &Default_StowGuns,    &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::EquipGun,    TEXT("EquipPistol"), TEXT("PISTOL"),                 &Default_EquipPistol, &Default_None, ETraceInputStates::Match },
 		// SPEC v14 §5. Same reasoning as the two rows above: the rebind list IS this table, so an
 		// ability the player cannot see here is an ability they cannot rebind however well it is
 		// wired in the controller. The ConfigIds are the two strings ATraceHUD and
@@ -315,9 +362,16 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// one that would actually have hurt — the pull already rides this button under §10's precedence,
 		// so a second PullCore bind on it would dispatch the same verb twice from one press.
 		{ ETraceInputAction::Melee,            TEXT("Melee"),            TEXT("MELEE"),             &Default_Melee,            &Default_None, ETraceInputStates::NotCarrying },
+		// *** SPEC v29 §5 — "Pressing 2 pulls out pistol, 3 pulls out smg." THE THIRD WEAPON ROW. ***
+		//
+		// LAST IN THE LIST, hence last on the page, for the reason the PULL CORE row above gives:
+		// ETraceInputAction is append-only, and SMG sitting under MELEE rather than next to PISTOL is
+		// the cosmetic price of never renumbering the runtime table. Its ConfigId has never appeared
+		// in anybody's .ini, so RefreshFromConfig finds no override and seeds the 3 key.
+		{ ETraceInputAction::EquipSmg,         TEXT("EquipSmg"),         TEXT("SMG"),               &Default_EquipSmg,         &Default_None, ETraceInputStates::Match },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 18,
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 19,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 
@@ -400,6 +454,280 @@ float UTraceUserSettings::GetLookScaleY() const
 	// changes numbers.
 	return bInvertMouseY ? -Scale : Scale;
 }
+
+// =================================================================================================
+// SPEC v29 §3 — Crosshair
+//
+// NAMED namespace, not anonymous: this module is a unity/jumbo build and two files that each open an
+// anonymous namespace become one namespace with two definitions.
+// Scripts/check-jumbo-build-collisions.py gates the build on exactly that.
+// =================================================================================================
+
+namespace TraceCrosshairPalette
+{
+	struct FEntry
+	{
+		const TCHAR* Name;
+		FLinearColor Color;
+	};
+
+	/**
+	 * EIGHT HUES, and the list is an argument rather than a colour wheel sampled at random.
+	 *
+	 * WHITE first because it is the shipped default and because it is the only entry that is legible
+	 * against every surface in this arena without help. CYAN and ORANGE are the two team colours the
+	 * HUD already uses (TraceOptionsStyle::Cyan / ::Amber) — a player who wants their crosshair to
+	 * match the chrome should not have to eyeball it. LIME and MAGENTA are here for the case the
+	 * arena is worst at: both sit far from the floor's black and far from the neon's cyan/amber, so
+	 * they stay findable over a lit strip. RED is the convention and is kept even though it is the
+	 * worst choice against this arena's amber, because a player who wants red wants red.
+	 *
+	 * NO TEAM-COLOUR ENTRY. The crosshair already lifts toward the team colour when a pass target is
+	 * under it (ATraceHUD::DrawCrosshair), and a base colour that also moved with the team would make
+	 * that state change unreadable — the one thing on this reticle that MEANS something by its colour.
+	 *
+	 * Appending is free; INSERTING renumbers everybody's saved CrosshairColorIndex, so new entries go
+	 * on the end. Same discipline as the action table above, for the same reason.
+	 */
+	static const FEntry* Table(int32& OutCount)
+	{
+		static const FEntry Entries[] =
+		{
+			{ TEXT("WHITE"),   FLinearColor(1.00f, 1.00f, 1.00f) },
+			{ TEXT("CYAN"),    FLinearColor(0.16f, 0.88f, 1.00f) },
+			{ TEXT("LIME"),    FLinearColor(0.55f, 1.00f, 0.15f) },
+			{ TEXT("GREEN"),   FLinearColor(0.10f, 1.00f, 0.35f) },
+			{ TEXT("AMBER"),   FLinearColor(1.00f, 0.72f, 0.10f) },
+			{ TEXT("ORANGE"),  FLinearColor(1.00f, 0.46f, 0.08f) },
+			{ TEXT("RED"),     FLinearColor(1.00f, 0.16f, 0.16f) },
+			{ TEXT("MAGENTA"), FLinearColor(1.00f, 0.20f, 0.90f) },
+		};
+
+		OutCount = UE_ARRAY_COUNT(Entries);
+		return Entries;
+	}
+
+	/**
+	 * ONE definition of how many stops the COLOUR row has, asked of the same array Entry() clamps
+	 * against. A row whose range outran its palette would print the last colour twice and read as a
+	 * stuck control; one that fell short would make an entry unreachable.
+	 */
+	static int32 Count()
+	{
+		int32 N = 0;
+		Table(N);
+		return N;
+	}
+
+	static const FEntry& Entry(int32 Index)
+	{
+		int32 N = 0;
+		const FEntry* Entries = Table(N);
+		return Entries[FMath::Clamp(Index, 0, N - 1)];
+	}
+
+	/**
+	 * *** THE OUTLINE'S ALPHA, AS A FRACTION OF THE CROSSHAIR'S OWN. ***
+	 *
+	 * 0.80 / 0.94 = 0.851, which is exactly the pair ATraceHUD::DrawAimReticle shipped before the
+	 * crosshair was a setting — so a player on the defaults gets the identical surround they had.
+	 *
+	 * A FRACTION AND NOT THE 0.80 LITERAL, and this is the standing rule rather than a preference: the
+	 * outline exists to separate the crosshair from the background, so its strength is a statement
+	 * ABOUT the crosshair's strength. Pinned at 0.80, a player who slid opacity down to 25% would get
+	 * a ghost of a cross wrapped in a fully present black box — the surround louder than the mark it
+	 * surrounds, at the exact setting a player chooses because they want the crosshair to intrude
+	 * less. Relative, it fades with the thing it outlines.
+	 */
+	static constexpr float OutlineAlphaFraction = 0.80f / 0.94f;
+}
+
+int32 UTraceUserSettings::NumCrosshairColors()
+{
+	return TraceCrosshairPalette::Count();
+}
+
+FLinearColor UTraceUserSettings::CrosshairPaletteColor(int32 Index)
+{
+	return TraceCrosshairPalette::Entry(Index).Color;
+}
+
+FString UTraceUserSettings::DescribeCrosshairColor(int32 Index)
+{
+	return FString(TraceCrosshairPalette::Entry(Index).Name);
+}
+
+float UTraceUserSettings::GetCrosshairSize() const
+{
+	return FMath::Clamp(CrosshairSize, MinCrosshairSize, MaxCrosshairSize);
+}
+
+float UTraceUserSettings::GetCrosshairThickness() const
+{
+	return FMath::Clamp(CrosshairThickness, MinCrosshairThickness, MaxCrosshairThickness);
+}
+
+float UTraceUserSettings::GetCrosshairGap() const
+{
+	return FMath::Clamp(CrosshairGap, MinCrosshairGap, MaxCrosshairGap);
+}
+
+float UTraceUserSettings::GetCrosshairOpacity() const
+{
+	return FMath::Clamp(CrosshairOpacity, MinCrosshairOpacity, MaxCrosshairOpacity);
+}
+
+FLinearColor UTraceUserSettings::GetCrosshairColor() const
+{
+	FLinearColor Color = CrosshairPaletteColor(CrosshairColorIndex);
+	Color.A = GetCrosshairOpacity();
+	return Color;
+}
+
+FLinearColor UTraceUserSettings::GetCrosshairOutlineColor() const
+{
+	if (!bCrosshairOutline)
+	{
+		// Fully transparent rather than "do not call me". The caller then has ONE code path that draws
+		// a surround whose alpha happens to be zero, instead of two paths whose geometry could drift.
+		return FLinearColor(0.f, 0.f, 0.f, 0.f);
+	}
+
+	return FLinearColor(0.f, 0.f, 0.f,
+		GetCrosshairOpacity() * TraceCrosshairPalette::OutlineAlphaFraction);
+}
+
+float UTraceUserSettings::GetCrosshairArmReach() const
+{
+	return GetCrosshairGap() + GetCrosshairSize();
+}
+
+int32 UTraceUserSettings::BuildCrosshairBars(float CX, float CY, float PixelScale,
+	FTraceCrosshairBar OutBars[TraceCrosshairMaxBars]) const
+{
+	// ---- Pixel snapping ------------------------------------------------------------------------
+	//
+	// Moved here verbatim from ATraceHUD::DrawAimReticle, whose note explains why every one of these
+	// is an integer: at 1280x720 UIScale is 0.667, so an unsnapped arm is 1.33 px wide sitting on a
+	// half-pixel boundary and Canvas anti-aliases it into a grey smudge. Integer rects at integer
+	// coordinates land on exact pixels and receive no anti-aliasing at all.
+	const float Scale = FMath::Max(0.01f, PixelScale);
+
+	// *** THE FLOORS ARE 1 PX, NOT THE OLD 2 / 6 / 3, AND THAT IS NOT A REGRESSION. ***
+	//
+	// Those three numbers were written when the sizes were literals, to stop UIScale rounding from
+	// reducing a fixed 11/2.5/5 reticle to a single invisible pixel on a small window. MEASURED at
+	// every resolution the engine can produce — UIScale is clamped to 0.6..2.0 in ATraceHUD::DrawHUD
+	// — none of them ever bit at the defaults: at UIScale 0.6 the three expressions give 2 / 7 / 3,
+	// and the floors are 2 / 6 / 3. So keeping them would change nothing for a default player and
+	// would silently overrule a player who deliberately asked for the minimum. A GAP row that reads
+	// 0 and still draws three pixels of gap is the same class of defect as the toggle that could
+	// only be turned on.
+	//
+	// What the floor still has to do is stop ROUNDING from destroying a shape the player asked for,
+	// so it is 1 px on anything the player set above zero, and 0 only where they set 0.
+	const float T   = FMath::Max(1.f, FMath::RoundToFloat(GetCrosshairThickness() * Scale));
+	const float Arm = FMath::Max(1.f, FMath::RoundToFloat(GetCrosshairSize() * Scale));
+
+	const float GapSetting = GetCrosshairGap();
+	const float Gap = (GapSetting <= 0.f)
+		? 0.f
+		: FMath::Max(1.f, FMath::RoundToFloat(GapSetting * Scale));
+
+	// Half a bar, floored, so the bar's own pixels straddle the centre symmetrically for odd T and
+	// sit flush against it for even T. Both are exact; neither is a half-pixel.
+	const float Half = FMath::FloorToFloat(T * 0.5f);
+
+	const float X = FMath::RoundToFloat(CX);
+	const float Y = FMath::RoundToFloat(CY);
+
+	int32 Num = 0;
+	OutBars[Num++] = { X - Gap - Arm, Y - Half,       Arm, T   };   // left
+	OutBars[Num++] = { X + Gap,       Y - Half,       Arm, T   };   // right
+	OutBars[Num++] = { X - Half,      Y - Gap - Arm,  T,   Arm };   // up
+	OutBars[Num++] = { X - Half,      Y + Gap,        T,   Arm };   // down
+
+	if (bCrosshairCenterDot)
+	{
+		// The exact aim point. Same bar width as the arms by construction — it is the same bar seen
+		// end-on, and giving it its own size is how a centre dot ends up looking bolted on.
+		OutBars[Num++] = { X - Half, Y - Half, T, T };
+	}
+
+	return Num;
+}
+
+void UTraceUserSettings::ResetCrosshairToDefaults()
+{
+	// DELIBERATELY NOT PART OF ResetToDefaults(), which is the CONTROLS page's reset. The video page
+	// makes the same separation for the same reason (see EAction::ResetVideoDefaults): a player who
+	// pressed a reset on the page about their crosshair did not ask to lose their key bindings, and
+	// one row that quietly did both would be the most destructive control in this menu.
+	CrosshairSize        = DefaultCrosshairSize;
+	CrosshairThickness   = DefaultCrosshairThickness;
+	CrosshairGap         = DefaultCrosshairGap;
+	CrosshairColorIndex  = DefaultCrosshairColor;
+	CrosshairOpacity     = DefaultCrosshairOpacity;
+	bCrosshairCenterDot  = bDefaultCrosshairCenterDot;
+	bCrosshairOutline    = bDefaultCrosshairOutline;
+
+	Save();
+}
+
+bool UTraceUserSettings::IsCrosshairAtDefaults() const
+{
+	return FMath::IsNearlyEqual(CrosshairSize, DefaultCrosshairSize)
+		&& FMath::IsNearlyEqual(CrosshairThickness, DefaultCrosshairThickness)
+		&& FMath::IsNearlyEqual(CrosshairGap, DefaultCrosshairGap)
+		&& FMath::IsNearlyEqual(CrosshairOpacity, DefaultCrosshairOpacity)
+		&& CrosshairColorIndex == DefaultCrosshairColor
+		&& bCrosshairCenterDot == bDefaultCrosshairCenterDot
+		&& bCrosshairOutline == bDefaultCrosshairOutline;
+}
+
+#if !UE_BUILD_SHIPPING
+namespace TraceCrosshairConsole
+{
+	/**
+	 * `Trace.Crosshair.Status` — prints what the crosshair actually IS, not what the .ini says.
+	 *
+	 * It reads through the clamped accessors and prints the derived arm reach, which is the number
+	 * four other things in ATraceHUD are laid out against. That makes it the check for two claims a
+	 * screenshot cannot make on its own: that the shipped defaults still produce the pre-v29 geometry
+	 * (11 arm / 2.5 bar / 5 gap / 16 reach / 94% / dot on / outline on), and that a value which
+	 * arrived from a hand-edited .ini was clamped rather than obeyed.
+	 */
+	void Status()
+	{
+		const UTraceUserSettings& S = UTraceUserSettings::Get();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Crosshair] size=%.2f thickness=%.2f gap=%.2f reach=%.2f (1080p-reference px) ")
+			TEXT("colour=%s(%d) opacity=%.2f dot=%s outline=%s(alpha %.3f) atDefaults=%s"),
+			S.GetCrosshairSize(), S.GetCrosshairThickness(), S.GetCrosshairGap(), S.GetCrosshairArmReach(),
+			*UTraceUserSettings::DescribeCrosshairColor(S.CrosshairColorIndex), S.CrosshairColorIndex,
+			S.GetCrosshairOpacity(),
+			S.bCrosshairCenterDot ? TEXT("ON") : TEXT("OFF"),
+			S.bCrosshairOutline ? TEXT("ON") : TEXT("OFF"),
+			S.GetCrosshairOutlineColor().A,
+			S.IsCrosshairAtDefaults() ? TEXT("yes") : TEXT("no"));
+
+		// RAW as well as clamped, because "the setting did nothing" and "the setting was out of range
+		// and got clamped" look identical from a screenshot and need different fixes.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Crosshair]   raw ini values: size=%.2f thickness=%.2f gap=%.2f opacity=%.2f -> %s"),
+			S.CrosshairSize, S.CrosshairThickness, S.CrosshairGap, S.CrosshairOpacity,
+			*S.GetClass()->GetConfigName());
+	}
+
+	FAutoConsoleCommand CmdCrosshairStatus(
+		TEXT("Trace.Crosshair.Status"),
+		TEXT("Spec v29 s3. Prints the live crosshair geometry through the clamped accessors, plus the raw ")
+		TEXT("values that came out of TraceUserSettings.ini and the derived arm reach the pass brackets ")
+		TEXT("and both throw rings are laid out against."),
+		FConsoleCommandDelegate::CreateStatic(&Status));
+}
+#endif
 
 // =================================================================================================
 // Bindings

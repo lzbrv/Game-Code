@@ -18,7 +18,9 @@
 #include "Gameplay/TraceCore.h"                  // IsCoreHolder — the carrier immunity
 #include "Gameplay/TraceHealthComponent.h"       // the health the staged test actually reads
 #include "Gameplay/TraceWeaponComponent.h"       // the state this namespace is a facade over
+#include "Movement/TraceCharacterMovementComponent.h" // spec v29 §5: the boost is READ BACK, not assumed
 #include "Net/TraceLagCompensationComponent.h"   // ResolveHitscan — ONE resolver, shared with the gun
+#include "Settings/TraceUserSettings.h"          // spec v29 §5: the 1/2/3 keybind table
 #include "Trace.h"
 #include "TraceSettings.h"
 
@@ -561,6 +563,17 @@ bool TraceMelee::IsKnifeEquipped(const AActor* Character)
 	return (Weapon != nullptr) && Weapon->GetEquippedWeapon() == ETraceEquippedWeapon::Knife;
 }
 
+bool TraceMelee::IsWeaponEquipped(const AActor* Character, ETraceEquippedWeapon Weapon)
+{
+	// SPEC v29 §5. "Is THIS the selected state?" — the three-state question the 1/2/3 keys ask.
+	// IsKnifeEquipped() below is the two-state form and could not answer it: it reports "not the
+	// knife" for both guns, so a 2-then-3 press looked like a repeat and the direct-select guard
+	// swallowed it. Asked of the SAME replicated selector on every machine, so the client's answer
+	// and the server's are the same answer.
+	const UTraceWeaponComponent* const Component = WeaponOf(Character);
+	return (Component != nullptr) && Component->GetEquippedWeapon() == Weapon;
+}
+
 bool TraceMelee::IsKnifeInHand(const AActor* Character)
 {
 	// [DUALWIELD] The blade is in the off hand of every living pawn, so "is a blade available" stops
@@ -585,27 +598,40 @@ float TraceMelee::GetShootLockoutRemaining(const AActor* Character)
 bool TraceMelee::ShouldUseKnifeMovementProfile(const AActor* Character)
 {
 	// =============================================================================================
-	// [DUALWIELD] *** THE SINGLE MOST IMPORTANT CONSEQUENCE OF THE v28 §10 SWITCH. ***
+	// *** SPEC v29 §5 — THE BOOST IS BACK, AND IT IS NOW "NO GUN IS OUT" RATHER THAN "THE KNIFE IS
+	// *** THE EQUIPPED WEAPON". ONE RULE, BOTH SWITCH POSITIONS.
 	// =============================================================================================
 	//
-	// The knife's +22% ground speed and its two raised air-strafe ceilings (spec v12 §3) were the
-	// reward for holding a weapon that CANNOT SHOOT. That trade is the whole design of the mechanic:
-	// you give up your gun to move like that.
+	// The owner's words: "Pressing one stows guns, and then you get the knife boost speed from
+	// before. If you have a gun out, you do not get the knife boost speed."
 	//
-	// Under dual-wield nobody gives up anything — the blade is simply always there — so paying the
-	// bonus would hand every player in the match a permanent free 22% and silently retire
-	// CarrierSpeedMultiplier (1.30), the trail-dash geometry, and every movement number that was
-	// measured against a 1.0 baseline. Spec v28 §10 asks for a weapon change, not a movement
-	// rebalance, so the profile is OFF for the whole of dual-wield.
+	// THE HISTORY MATTERS, BECAUSE THIS FUNCTION HAS NOW SAID THREE DIFFERENT THINGS.
+	//   v12 §3   the knife was ONE of two weapons; holding it cost you your gun, and the +22% ground
+	//            speed plus the two raised air-strafe ceilings were the price of being unarmed.
+	//   v28 §10  dual-wield made the blade permanent, so nobody gave anything up any more. Paying the
+	//            bonus would have handed every player in the match a free permanent 22% and silently
+	//            retired CarrierSpeedMultiplier and every movement number measured against a 1.0
+	//            baseline — so this returned false for the whole of dual-wield.
+	//   v29 §5   THE TRADE IS BACK, and it is now an explicit choice instead of a side effect of the
+	//            weapon selector: press 1 and your guns go away, and THAT is what buys the speed.
 	//
-	// Flipping bDualWieldKnife back to false restores the v12 §3 behaviour exactly, because the two
-	// lines below this one are untouched.
-	if (IsDualWieldEnabled())
-	{
-		return false;
-	}
-
-	if (!IsKnifeEquipped(Character))
+	// So the test is "is a FIREARM out", not "is the knife the selector value". Those were the same
+	// sentence before the SMG existed and have not been the same sentence since spec v28 §9 added a
+	// third selector value — TraceIsFirearm is the one definition of the difference and is asked
+	// here rather than re-derived, exactly as UTraceWeaponComponent::CanFire asks it.
+	//
+	// *** THIS IS ALSO WHY THE BONUS IS STILL A TRADE UNDER DUAL-WIELD. *** A stowed player has the
+	// blade and the speed and NO GUN: CanFire()'s `if (!IsFirearmEquipped()) return false;` gate is
+	// the same gate that made the v12 knife a trade, and it is untouched. Melee still works in all
+	// three states because IsKnifeInHand() answers "are you alive" under dual-wield, which is spec
+	// v29 §5's "melee still works in every state — stowing is about the GUNS".
+	//
+	// ONE RULE FOR BOTH SWITCH POSITIONS, and that is a simplification rather than a risk. With
+	// bDualWieldKnife OFF the only non-firearm the selector can hold IS the knife, so this expression
+	// collapses to the v12 §3 test character for character. There is no arm of the switch that needs
+	// its own copy of the rule any more.
+	const UTraceWeaponComponent* const Weapon = WeaponOf(Character);
+	if (Weapon == nullptr || TraceIsFirearm(Weapon->GetEquippedWeapon()))
 	{
 		return false;
 	}
@@ -683,24 +709,21 @@ bool TraceMelee::RequestEquipIfDifferent(ATraceCharacter* Pawn, ETraceEquippedWe
 		return false;
 	}
 
-	// [DUALWIELD] THE 1/2 SLOT REMAP — the only place it happens. See the header for the table and
-	// for the stale-label hand-off to spec v28 §3. The keys keep their action ids so nobody loses a
-	// saved bind; only what the slot NAMES moves.
-	if (TraceMelee::IsDualWieldEnabled())
-	{
-		switch (Desired)
-		{
-		case ETraceEquippedWeapon::Knife:                  // key 1
-			Desired = ETraceEquippedWeapon::Gun;           //   -> the pistol
-			break;
-		case ETraceEquippedWeapon::Gun:                    // key 2
-			Desired = ETraceEquippedWeapon::Smg;           //   -> the SMG
-			break;
-		default:
-			break;                                          // an explicit Smg request is already a slot
-		}
-	}
-
+	// *** SPEC v29 §5 DELETED THE [DUALWIELD] 1/2 SLOT REMAP THAT USED TO SIT HERE. ***
+	//
+	// v28 §10 had two weapon keys and three weapons, so key 1 (whose action id said "knife") had to
+	// be silently rewritten into "the pistol" and key 2 into "the SMG". That remap was the whole
+	// reason this function could not be a straight pass-through, and it is gone: v29 §5 gives the
+	// player THREE keys for THREE states, so every caller now names the state it wants and this verb
+	// simply forwards it.
+	//
+	//     key 1  ->  ETraceEquippedWeapon::Knife   guns stowed, knife only  (the speed boost)
+	//     key 2  ->  ETraceEquippedWeapon::Gun     the pistol
+	//     key 3  ->  ETraceEquippedWeapon::Smg     the SMG
+	//
+	// ATracePlayerController::HandleDirectEquip now takes the weapon rather than a bool and passes it
+	// through unchanged, so there is exactly one translation from key to weapon in the game and it is
+	// the three OnEquip*Started handlers. A remap here would be a second one, able to disagree.
 	return Weapon->RequestEquipIfDifferent(Desired, OutRefusal);
 }
 
@@ -2018,12 +2041,226 @@ namespace TraceMeleeConsole
 				DualWieldOverride,
 				(DualWieldOverride < 0) ? TEXT("deferring to the table") : TEXT("OVERRIDING the table"),
 				FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyKnife")) ? 1 : 0);
+			// SPEC v29 §5. The line used to say "dual wield deliberately pays NO knife speed bonus",
+			// which stopped being true the moment stowing existed. ONE rule now, both switch
+			// positions: no firearm out = the boost. Printed as the rule rather than as the switch,
+			// because the switch no longer decides it.
 			UE_LOG(LogTraceGame, Display,
-				TEXT("  movement profile : %s  (dual wield deliberately pays NO knife speed bonus — see ShouldUseKnifeMovementProfile)"),
-				TraceMelee::IsDualWieldEnabled() ? TEXT("disabled") : TEXT("v12 s3, +22 percent ground while the knife is out"));
+				TEXT("  movement profile : v12 s3 (+%.0f percent ground, %.0f uu/s -> %.0f uu/s) WHILE NO GUN IS OUT. ")
+				TEXT("Key 1 stows the guns and buys it; keys 2 and 3 take it away (spec v29 s5)."),
+				100.f * (Move.KnifeMoveSpeedMultiplier - 1.f), Move.WalkSpeed,
+				Move.WalkSpeed * Move.KnifeMoveSpeedMultiplier);
 			UE_LOG(LogTraceGame, Display, TEXT("=========================================="));
 		}));
 }
+
+
+// =================================================================================================
+// *** SPEC v29 §5 — `Trace.Stow.Verify`. THREE WEAPON STATES, AND THE KNIFE IS IN ALL OF THEM. ***
+// =================================================================================================
+//
+// The owner's words, verbatim: "Pressing one stows guns, and then you get the knife boost speed from
+// before. If you have a gun out, you do not get the knife boost speed. Pressing 2 pulls out pistol, 3
+// pulls out smg. Both of these actions keep the knife out."
+//
+// FOUR CLAIMS, AND EACH ONE IS A LINE BELOW:
+//   1. the KEYBINDS are 1 / 2 / 3, on three separate rebindable actions, under the NEW ConfigIds
+//      (which is the migration — a returning player's `EquipKnife=One` line has to be dropped, or the
+//      layout lands for nobody who has ever opened the options screen);
+//   2. each state is REACHABLE — pressing the verb actually puts the selector where it says;
+//   3. the SPEED BOOST is paid in the stowed state and in neither gun state, and it is paid as a
+//      MULTIPLIER on the base walk speed rather than as an absolute (the standing rule: a value that
+//      modifies a base moves when the base moves);
+//   4. MELEE STILL WORKS IN ALL THREE. Demo 24 made the knife permanent and v29 §5 does not change
+//      that — stowing is about the GUNS.
+//
+// SYNCHRONOUS, and that is a property of the thing under test rather than a shortcut: on the
+// authority UTraceWeaponComponent::RequestEquip calls ApplyEquip inline, and ApplyEquip calls
+// RefreshMovementProfile inline, so the selector, the movement bit and GetMaxSpeed() are all correct
+// before this function's next line. The 0.2 s pullout runs on its own clock afterwards and gates
+// FIRING, not the selector — so a harness that waited for it would be waiting for something it does
+// not assert.
+//
+// IT IS EXPECTED TO FAIL LOUDLY, TODAY, ON CLAIM 2 AND THEREFORE ON 3. Two guards in
+// UTraceWeaponComponent (another slice's file this pass) still refuse ETraceEquippedWeapon::Knife
+// outright while dual-wield is on — RequestEquip's "SUCCEEDS AS A NO-OP" early-out and
+// ServerRequestEquip_Implementation's matching refusal. Both were right when no pawn could ever be in
+// the Knife state; under v29 §5 the Knife state IS the stowed state. This command is the red arm for
+// that hand-off: it goes green the moment those two blocks are removed, and until then it names them.
+static void TraceRunStowVerify(UWorld* World)
+{
+	int32 Failures = 0;
+	int32 Checks = 0;
+	auto Check = [&Failures, &Checks](bool bOk, const FString& What)
+	{
+		++Checks;
+		if (bOk)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[Stow]   ok    %s"), *What);
+		}
+		else
+		{
+			++Failures;
+			UE_LOG(LogTraceGame, Error, TEXT("[Stow]   FAIL  %s"), *What);
+		}
+	};
+
+	UE_LOG(LogTraceGame, Display, TEXT("========== [Stow] SPEC v29 s5 — THREE WEAPON STATES =========="));
+
+	// ---- 1. THE KEYBINDS -------------------------------------------------------------------------
+	//
+	// Asked of the SHIPPED TABLE, which is what a fresh install starts from, and printed alongside
+	// the player's LIVE bind so a rebinding tester can tell "the default moved" from "I moved it".
+	{
+		const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+		struct FWant { ETraceInputAction Action; const TCHAR* ConfigId; FKey Key; const TCHAR* What; };
+		const FWant Wants[] =
+		{
+			{ ETraceInputAction::EquipKnife, TEXT("StowGuns"),    EKeys::One,   TEXT("1 = STOW GUNS") },
+			{ ETraceInputAction::EquipGun,   TEXT("EquipPistol"), EKeys::Two,   TEXT("2 = PISTOL") },
+			{ ETraceInputAction::EquipSmg,   TEXT("EquipSmg"),    EKeys::Three, TEXT("3 = SMG") },
+		};
+		for (const FWant& Want : Wants)
+		{
+			const FTraceInputActionInfo& Info = TraceInputActions::Info(Want.Action);
+			Check(FCString::Strcmp(Info.ConfigId, Want.ConfigId) == 0,
+				FString::Printf(TEXT("%s: ConfigId is \"%s\" (want \"%s\" — the v29 s5 migration)"),
+					Want.What, Info.ConfigId, Want.ConfigId));
+			Check(Info.DefaultKey() == Want.Key,
+				FString::Printf(TEXT("%s: shipped default is %s (want %s); this player's live bind is %s"),
+					Want.What, *UTraceUserSettings::DescribeKey(Info.DefaultKey()),
+					*UTraceUserSettings::DescribeKey(Want.Key),
+					*Settings.DescribeBinding(Want.Action)));
+		}
+	}
+
+	// ---- 2..4. THE STATES, ON A REAL PAWN --------------------------------------------------------
+	ATraceCharacter* Pawn = nullptr;
+	if (World != nullptr)
+	{
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Candidate = *It;
+			if (IsValid(Candidate) && Candidate->IsAlive() && Candidate->HasAuthority() && !Candidate->IsCarrier())
+			{
+				Pawn = Candidate;
+				break;
+			}
+		}
+	}
+
+	if (Pawn == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Stow] no living, non-carrying, server-side pawn — the keybind claims above are ")
+			TEXT("checked, the four STATE claims are NOT. Run this in a match on the host."));
+		UE_LOG(LogTraceGame, Display, TEXT("[Stow] %d of %d checks passed."), Checks - Failures, Checks);
+		return;
+	}
+
+	const UTraceCharacterMovementComponent* const Movement =
+		Cast<UTraceCharacterMovementComponent>(Pawn->GetCharacterMovement());
+	const float BaseWalk = FMath::Max(1.f, UTraceSettings::Get().WalkSpeed);
+	const float WantMultiplier = FMath::Clamp(UTraceSettings::Get().KnifeMoveSpeedMultiplier, 1.f, 3.f);
+
+	struct FState { ETraceEquippedWeapon Weapon; const TCHAR* Key; bool bWantBoost; };
+	const FState States[] =
+	{
+		{ ETraceEquippedWeapon::Gun,   TEXT("2 (PISTOL)"),    false },
+		{ ETraceEquippedWeapon::Knife, TEXT("1 (STOW GUNS)"), true  },
+		{ ETraceEquippedWeapon::Smg,   TEXT("3 (SMG)"),       false },
+		// PISTOL AGAIN, LAST, and it is not padding: it is the only step that proves the boost is
+		// TAKEN AWAY again rather than merely never granted. A one-way test would pass on a build
+		// that latched the profile on at the first stow.
+		{ ETraceEquippedWeapon::Gun,   TEXT("2 (PISTOL) again"), false },
+	};
+
+	for (const FState& Want : States)
+	{
+		// The UNGUARDED verb on purpose: this asks "can the pawn be put in this state", and the
+		// idempotence guard would turn a repeat into a no-op and hide a failure as a pass.
+		TraceMelee::RequestEquip(Pawn, Want.Weapon);
+
+		const bool bInState = TraceMelee::IsWeaponEquipped(Pawn, Want.Weapon);
+		Check(bInState, FString::Printf(TEXT("key %s reaches %s (selector reads %s)"),
+			Want.Key, LexToString(Want.Weapon),
+			LexToString(TraceMelee::IsWeaponEquipped(Pawn, ETraceEquippedWeapon::Knife)
+				? ETraceEquippedWeapon::Knife
+				: (TraceMelee::IsWeaponEquipped(Pawn, ETraceEquippedWeapon::Smg)
+					? ETraceEquippedWeapon::Smg : ETraceEquippedWeapon::Gun))));
+
+		if (!bInState)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Stow]         ^ if this is the STOW key, the cause is UTraceWeaponComponent's two ")
+				TEXT("dual-wield KNIFE refusals (RequestEquip's no-op early-out and ")
+				TEXT("ServerRequestEquip_Implementation's). Removing them is the whole fix; see TraceMelee.h."));
+			continue;
+		}
+
+		const bool bBoost = TraceMelee::ShouldUseKnifeMovementProfile(Pawn);
+		Check(bBoost == Want.bWantBoost,
+			FString::Printf(TEXT("key %s: speed boost %s (spec v29 s5: the boost applies ONLY when no gun is out)"),
+				Want.Key, bBoost ? TEXT("PAID") : TEXT("not paid")));
+
+		if (Movement != nullptr)
+		{
+			Check(Movement->IsKnifeMovementProfileActive() == Want.bWantBoost,
+				FString::Printf(TEXT("key %s: the movement component's own bit agrees (%d)"),
+					Want.Key, Movement->IsKnifeMovementProfileActive() ? 1 : 0));
+
+			// *** THE STANDING RULE, MEASURED. *** The boost has to be a MULTIPLIER on the base walk
+			// speed, not an absolute, so retuning WalkSpeed moves it. This divides the live ceiling by
+			// the live base and asserts the RATIO — which is a test a hard-coded 976 uu/s cannot pass
+			// and a correctly-relative one cannot fail.
+			const float Speed = Movement->GetMaxSpeed();
+			const float Ratio = Speed / BaseWalk;
+			const float WantRatio = Want.bWantBoost ? WantMultiplier : 1.f;
+			Check(FMath::IsNearlyEqual(Ratio, WantRatio, 0.02f),
+				FString::Printf(TEXT("key %s: maxSpeed %.0f uu/s = %.3f x WalkSpeed %.0f (want %.3f x)"),
+					Want.Key, Speed, Ratio, BaseWalk, WantRatio));
+		}
+
+		// MELEE IN EVERY STATE. Demo 24 made the knife permanent and v29 s5 does not touch that.
+		//
+		// *** Deploying IS ACCEPTED, AND THAT IS A CORRECTION TO THIS HARNESS RATHER THAN A LOOSENED
+		// *** ASSERTION. *** The first version asserted a bare CanSwing() and failed all three states
+		// with refusal=5 — which is Deploying, i.e. the 0.2 s pullout THIS FUNCTION started one line
+		// earlier by equipping. It was measuring its own fixture. The claim under test is "the blade
+		// is in hand whatever the gun state", and the pullout is a rule about how soon you may swing
+		// AFTER a swap, which is spec v10 §1 and is the same in all three states by construction. So
+		// the knife-in-hand half is asserted outright and the swing half accepts None or Deploying and
+		// REFUSES everything else — WrongWeapon in particular, which is the refusal a broken
+		// permanent-knife would produce.
+		ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+		const UTraceWeaponComponent* const SwingComponent = Pawn->FindComponentByClass<UTraceWeaponComponent>();
+		const bool bBladeInHand = TraceMelee::IsKnifeInHand(Pawn);
+		const bool bSwingOk = (SwingComponent == nullptr)
+			|| SwingComponent->CanSwing(&Refusal)
+			|| Refusal == ETraceMeleeRefusal::Deploying;
+		Check(bBladeInHand && bSwingOk, FString::Printf(
+			TEXT("key %s: the knife is still in hand (%d) and the swing is not refused for the WEAPON ")
+			TEXT("(refusal=%d, %s) — stowing is about the GUNS"),
+			Want.Key, bBladeInHand ? 1 : 0, static_cast<int32>(Refusal),
+			(Refusal == ETraceMeleeRefusal::Deploying)
+				? TEXT("the pullout this harness just started")
+				: TEXT("live")));
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Stow] %d of %d checks passed."), Checks - Failures, Checks);
+	UE_LOG(LogTraceGame, Display, TEXT("=============================================================="));
+}
+
+static FAutoConsoleCommandWithWorldAndArgs GTraceStowVerifyCmd(
+	TEXT("Trace.Stow.Verify"),
+	TEXT("SPEC v29 s5. Server. Checks the 1/2/3 weapon binds, that each of the three states is ")
+	TEXT("reachable, that the knife speed boost is paid ONLY while no gun is out (as a ratio of the ")
+	TEXT("base walk speed, not an absolute), and that melee works in all three."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& /*Args*/, UWorld* World)
+	{
+		TraceRunStowVerify(World);
+	}));
 
 
 // =================================================================================================

@@ -1596,6 +1596,49 @@ namespace
 			{ TEXT("SlimewallOpacity"),                EKnobType::Float, TEXT("v18 §2: 'obstructs vision'. This is the LOOK only - it must never be given blocking collision, bullets pass through") },
 			{ TEXT("bSlimewallSlowsOwnTeam"),          EKnobType::Bool,  TEXT("v18 §2 ASSUMPTION: false - it does not slow Slimeball or his team") },
 			{ TEXT("SlimewallCooldownSeconds"),        EKnobType::Float, TEXT("v18 §2: 25s. THE ENFORCED number; the card prints 25 too") },
+
+			// =========================================================================================
+			// SPEC v29 — EVERY KNOB THIS PASS INTRODUCED, INCLUDING THE ONES ON OTHER PAGES
+			// =========================================================================================
+			//
+			// Added during integration rather than by the slices that wrote the knobs: this file is
+			// not in any of their ownership lists, so eleven working knobs would otherwise have shipped
+			// invisible to the one command whose entire job is proving a knob is reachable. They bind
+			// (the §2 slice red-armed the new ini section by setting LegDamage=26 and watching the game
+			// print 26), but "it binds today" and "a rename will be caught tomorrow" are different
+			// guarantees, and this table is the second one.
+			//
+			// *** THE THREE DAMAGE ROWS HAVE NEVER BEEN ON THIS LIST AT ALL. *** UTraceDamageSettings
+			// is the page the pistol's 100/40/25 lives on and it shipped with header literals and no
+			// ini section until this pass — the same "a slider that silently does nothing" failure
+			// spec v10 added OwnerPath for, one class over, sitting on the most-read numbers in the
+			// game. LegDamage in particular is what v29 §2a moved (30 -> 25), which is exactly the
+			// kind of edit that must not be able to go quiet.
+
+			// --- v29 §2a: the damage page (a SEPARATE settings class — see FKnobSpec::OwnerPath) -----
+			{ TEXT("HeadDamage"),                      EKnobType::Float, TEXT("v29 §2a: pistol headshot. 100 = a one-shot kill on a full-health pawn"), TEXT("/Script/Trace.TraceDamageSettings") },
+			{ TEXT("BodyDamage"),                      EKnobType::Float, TEXT("v29 §2a: pistol body"),                                                  TEXT("/Script/Trace.TraceDamageSettings") },
+			{ TEXT("LegDamage"),                       EKnobType::Float, TEXT("v29 §2a: 30 -> 25, MUST read 25. 4 x 25 = 100 = MaxHealth, so four leg shots still kill with nothing to spare"), TEXT("/Script/Trace.TraceDamageSettings") },
+
+			// --- v29 §2b/2c/2d/2e/2f: the weapon knobs ------------------------------------------------
+			{ TEXT("bPistolFullAuto"),                 EKnobType::Bool,  TEXT("v29 §2b: FALSE. True is the RED arm - the same held trigger fires 4 rounds instead of 1") },
+			{ TEXT("bSmgFullAuto"),                    EKnobType::Bool,  TEXT("v29 §2b: TRUE. 'The SMG stays full auto'") },
+			{ TEXT("SmgReloadSeconds"),                EKnobType::Float, TEXT("v29 §2c: 0.8 -> 1.3, MUST read 1.3. The pistol's own ReloadSeconds is untouched at 0.5") },
+			{ TEXT("bSmgDamageFalloff"),               EKnobType::Bool,  TEXT("v29 §2d master switch: false makes the SMG pay 33/18/12 at every range = the RED arm") },
+			{ TEXT("SmgFalloffStartUU"),               EKnobType::Float, TEXT("v29 §2d: 800uu, INCLUSIVE - 800 still pays close damage, 801 pays far") },
+			{ TEXT("SmgFalloffRampUU"),                EKnobType::Float, TEXT("v29 §2d: 0 = a CLIFF (the shipped choice). Raise it to turn the drop into a ramp of this many uu; stored as a LENGTH from the start, not an end point, so it moves when the start moves") },
+			{ TEXT("SmgFarHeadDamage"),                EKnobType::Float, TEXT("v29 §2d: 24 past the line (from 33)") },
+			{ TEXT("SmgFarBodyDamage"),                EKnobType::Float, TEXT("v29 §2d: 15 past the line (from 18)") },
+			{ TEXT("SmgFarLegDamage"),                 EKnobType::Float, TEXT("v29 §2d: 10 past the line (from 12)") },
+			{ TEXT("RoxieModdedRecoilScale"),          EKnobType::Float, TEXT("v29 §2e: MULTIPLIES the base recoil numbers above (RecoilPitchPerShot etc), so it tracks them if they are ever retuned. 0 = no kick = the RED arm. Nobody but a MODDED Roxie has any recoil - bRecoilEnabled is still false") },
+			{ TEXT("FireIntervalCarryFraction"),       EKnobType::Float, TEXT("v29 §2f THE 537-RPM FIX: fraction of one interval of overshoot the fire clock may CARRY to the next round instead of discarding at the frame boundary. 0 = the shipped bug, measured at 540.0 RPM against a specified 600; 0.2 measures 600.0. Clamped in code to FireRateTolerance so a client can never ask for a round the server rejects") },
+
+			// --- v29 §1b/§1c: the audio page (another separate settings class) ------------------------
+			{ TEXT("FootstepVolumeScale"),             EKnobType::Float, TEXT("v29 §1b: MULTIPLIES MasterVolume, so footsteps track the master rather than fighting it. 0.15 measures 9.33 dB under the quietest other sound; 1.0 measures footsteps 7.15 dB LOUDER = the RED arm"), TEXT("/Script/Trace.TraceAudioSettings") },
+			{ TEXT("FootstepStrideUU"),                EKnobType::Float, TEXT("v29 §1b: uu of travel between steps, integrated from ground speed - there is no animation notify to hang one on"), TEXT("/Script/Trace.TraceAudioSettings") },
+			{ TEXT("FootstepMinSpeedUU"),              EKnobType::Float, TEXT("v29 §1b: below this the pawn is shuffling, not walking, and makes no sound"), TEXT("/Script/Trace.TraceAudioSettings") },
+			{ TEXT("PistolLadderResetSeconds"),        EKnobType::Float, TEXT("v29 §1c: the owner's 0.3s. READ THE FLOOR BELOW - 0.3 is SHORTER than the pistol's own 0.3158s interval, so taken literally the ladder resets on every shot and PistolShoot2/3/4 are unreachable"), TEXT("/Script/Trace.TraceAudioSettings") },
+			{ TEXT("PistolLadderResetIntervalFloor"),  EKnobType::Float, TEXT("v29 §1c: MULTIPLE of the gun's OWN fire interval that the reset may not fall below (1.25x -> 0.395s effective). Relative, so it tracks FireInterval. Trace.Audio.PistolResetFloor 0 sets it aside and the literal 0.3s reading fails on demand"), TEXT("/Script/Trace.TraceAudioSettings") },
 		};
 
 		const UTraceSettings& Table = UTraceSettings::Get();

@@ -128,6 +128,35 @@ enum class ETraceInputAction : uint8
 	 *
 	 * STILL APPEND-ONLY BELOW THIS POINT. The .ini survives a renumber; the in-memory table is what
 	 * would tear if two builds disagreed about it mid-session, and there is no reason to find out.
+	 *
+	 * =============================================================================================
+	 * *** SPEC v29 §5 — THESE TWO ENUMERATORS NOW MEAN "STOW GUNS" AND "PISTOL". ***
+	 * =============================================================================================
+	 *
+	 * The owner's words: "Pressing one stows guns, and then you get the knife boost speed from
+	 * before. [...] Pressing 2 pulls out pistol, 3 pulls out smg." So there are THREE weapon states
+	 * and the knife is in all of them:
+	 *
+	 *     key 1   EquipKnife  ->  guns STOWED, knife only     -> the knife speed boost
+	 *     key 2   EquipGun    ->  pistol out, knife still out -> normal speed
+	 *     key 3   EquipSmg    ->  SMG out, knife still out    -> normal speed  (NEW, appended below)
+	 *
+	 * THE TWO SPELLINGS ABOVE ARE NOW HISTORICAL and are kept for one reason only: this enum is the
+	 * INDEX into UTraceUserSettings::Bindings and into TraceInputActions::All(), which are matched
+	 * 1:1 by a static_assert, so renaming an enumerator is free but MOVING or REMOVING one is not.
+	 * Renaming them would also break Source/Trace/UI/TraceOptionsMenu.cpp, which is another slice's
+	 * file this pass and names both by hand. The MEANING moved; the C++ spelling did not. Read the
+	 * ConfigId and the DisplayName in TraceInputActions::All() — those did move, and they are the
+	 * two strings that actually reach a player.
+	 *
+	 * THE CONFIG IDS CHANGED, WHICH IS THE MIGRATION AND IS DELIBERATE. "EquipKnife" -> "StowGuns"
+	 * and "EquipGun" -> "EquipPistol", exactly as spec v28 §3d spent "ParryPull" -> "ParryKeys":
+	 * Save() writes a line for EVERY action, so a returning player's TraceUserSettings.ini already
+	 * contains `KeyBindings=EquipKnife=1` and RefreshFromConfig would honour it over anything this
+	 * table says. Their old line now names an id the table does not have, is DISCARDED by the parse
+	 * loop exactly as `SwapWeapon=F` and `Boost=E` are, and the action falls back to the shipped
+	 * default. Without that the 1/2/3 layout would land for nobody who has ever opened the options
+	 * screen. Trace.Settings.VerifyBinds prints every dropped line by name.
 	 */
 	EquipKnife,
 	EquipGun,
@@ -232,6 +261,28 @@ enum class ETraceInputAction : uint8
 	 */
 	Melee,
 
+	/**
+	 * *** SPEC v29 §5 — THE THIRD WEAPON KEY. "Pressing 2 pulls out pistol, 3 pulls out smg." ***
+	 *
+	 * Until this row existed there were exactly TWO weapon binds and the SMG was reachable only by
+	 * the console or by a swap toggle nothing binds. The keybind page's rebind list IS
+	 * TraceInputActions::All() walked in order, so an action that is not in this enum is an action
+	 * the player can neither press nor rebind however well it is wired up in the controller — the
+	 * same sentence the EquipKnife, Ability, Reload, PullCore and Melee rows all carry.
+	 *
+	 * APPENDED, never inserted, for the reason EquipKnife's comment gives at length: this enum is
+	 * the index into UTraceUserSettings::Bindings, so anything placed higher renumbers every action
+	 * below it. A returning player has never had an "EquipSmg" line, so RefreshFromConfig finds no
+	 * override and seeds the shipped default (the 3 key); nothing they have bound moves.
+	 *
+	 * `Match`, not `NotCarrying`, and that is the same answer the other two weapon rows give. The
+	 * weapon SELECTOR is legal while carrying — UTraceWeaponComponent::RequestEquip refuses a
+	 * carrier's swap with ETraceMeleeRefusal::Carrying, but that is a refusal at the verb, not a
+	 * state in which the key means something else. Marking it NotCarrying would let it share a key
+	 * with the throw, and "3 throws the Core sometimes" is not a bind anybody wants.
+	 */
+	EquipSmg,
+
 	Count UMETA(Hidden)
 };
 
@@ -306,6 +357,26 @@ namespace TraceInputActions
 
 	TRACE_API const FTraceInputActionInfo& Info(ETraceInputAction Action);
 }
+
+/**
+ * SPEC v29 §3 — one axis-aligned bar of the crosshair, in SCREEN pixels: (X, Y, W, H).
+ *
+ * A plain struct at file scope and NOT a USTRUCT: it is never replicated, never serialised and never
+ * seen by Blueprint, and dragging UHT into it would buy nothing. It exists so that the two things
+ * that draw this crosshair — ATraceHUD::DrawAimReticle in a match, and the live preview on the
+ * settings page — share ONE definition of the shape instead of two that agree until somebody edits
+ * one of them. A preview that can disagree with the thing it previews is worse than no preview.
+ */
+struct FTraceCrosshairBar
+{
+	float X = 0.f;
+	float Y = 0.f;
+	float W = 0.f;
+	float H = 0.f;
+};
+
+/** Bars a crosshair can have: four arms plus the centre dot. */
+static constexpr int32 TraceCrosshairMaxBars = 5;
 
 /**
  * Fires whenever any control setting changes.
@@ -541,6 +612,198 @@ public:
 
 	/** "SPACE BAR" / "LEFT SHIFT" / "UNBOUND". Upper case, for the options screen. */
 	static FString DescribeKey(const FKey& Key);
+
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v29 §3 — THE CROSSHAIR
+	//
+	// "Add a page in settings to customize the crosshair."
+	//
+	// WHY THESE LIVE HERE AND NOT IN UTraceSettings. Same argument the file header makes about mouse
+	// sensitivity: a crosshair is per-machine taste, written at runtime by the player, and must never
+	// appear in a diff. UTraceSettings is the designer's checked-in table and is exactly the wrong
+	// home. The one crosshair number that IS a designer's decision — ThirdPersonCrosshairScale, how
+	// much bigger the cross gets in the carrying view — stays over there, because it is a statement
+	// about the third-person camera rather than about a player's eyesight, and the two MULTIPLY (see
+	// ATraceHUD::DrawAimReticle).
+	//
+	// *** THE SHIPPED DEFAULTS ARE THE EXACT NUMBERS DrawAimReticle ALREADY DREW. *** 11 px of arm,
+	// 2.5 px of bar, a 5 px gap, 94% opaque white, dot on, outline on. A player who never opens this
+	// page must get a pixel-identical crosshair to the one they had before it existed, and that is
+	// checkable: Trace.Crosshair.Status prints the live geometry, and at defaults it prints what the
+	// literals used to produce.
+	//
+	// EVERY NUMBER IS IN 1080p-REFERENCE PIXELS, exactly like the literals it replaced — the HUD
+	// multiplies by UIScale (ViewH / 1080) and by the third-person scale at draw time. Storing screen
+	// pixels instead would give a player who changes resolution a different crosshair.
+
+	/** Shipped defaults, in one place, so the property, the reset and the at-defaults test cannot drift. */
+	static constexpr float DefaultCrosshairSize      = 11.00f;
+	static constexpr float DefaultCrosshairThickness = 2.50f;
+	static constexpr float DefaultCrosshairGap       = 5.00f;
+	static constexpr float DefaultCrosshairOpacity   = 0.94f;
+	static constexpr int32 DefaultCrosshairColor     = 0;      // WHITE — see CrosshairPaletteColor
+	static constexpr bool  bDefaultCrosshairCenterDot = true;
+	static constexpr bool  bDefaultCrosshairOutline   = true;
+
+	/**
+	 * Clamps, used by the settings rows AND by the accessors below.
+	 *
+	 * The accessors clamp too, and that is not belt-and-braces: this file is a hand-editable .ini, and
+	 * a CrosshairThickness of 4000 there would otherwise paint the whole viewport white with no way to
+	 * get back except by finding the file. The floor matters as much as the ceiling — a size of 0
+	 * would be a crosshair that does not exist, which reads as the game being broken rather than as a
+	 * setting being at its minimum. That is what the CENTRE DOT toggle is for.
+	 */
+	static constexpr float MinCrosshairSize      = 2.00f;
+	static constexpr float MaxCrosshairSize      = 24.00f;
+	static constexpr float MinCrosshairThickness = 1.00f;
+	static constexpr float MaxCrosshairThickness = 8.00f;
+	static constexpr float MinCrosshairGap       = 0.00f;
+	static constexpr float MaxCrosshairGap       = 20.00f;
+	static constexpr float MinCrosshairOpacity   = 0.20f;
+	static constexpr float MaxCrosshairOpacity   = 1.00f;
+
+	/** Length of ONE arm, in 1080p-reference pixels. The four arms are drawn from the gap outwards. */
+	UPROPERTY(config)
+	float CrosshairSize = DefaultCrosshairSize;
+
+	/** Bar width, in 1080p-reference pixels. Also the side of the centre dot — they are one bar. */
+	UPROPERTY(config)
+	float CrosshairThickness = DefaultCrosshairThickness;
+
+	/** Empty space between the exact aim point and the inner end of each arm, reference pixels. */
+	UPROPERTY(config)
+	float CrosshairGap = DefaultCrosshairGap;
+
+	/**
+	 * Index into the named palette below.
+	 *
+	 * AN INDEX AND NOT AN FLinearColor, deliberately, and it is the one place this page is less than a
+	 * full colour picker. Three reasons, in order: the options overlay is drawn through
+	 * AHUD::DrawRect from inside DrawHUD and has no colour-picker widget to offer (there is no Slate
+	 * here — see the header of UI/TraceOptionsMenu.h); every row on that page is driven by arrow keys
+	 * and a drag across a track, which is a one-dimensional control and therefore wants a
+	 * one-dimensional value; and an index round-trips through the .ini exactly, where a struct
+	 * property is one more thing that can half-load.
+	 *
+	 * The cost is real and is stated rather than hidden: a player cannot dial in an arbitrary RGB.
+	 * If that is wanted later, the honest upgrade is three sliders (R, G, B) writing an FLinearColor,
+	 * not a text field.
+	 */
+	UPROPERTY(config)
+	int32 CrosshairColorIndex = DefaultCrosshairColor;
+
+	/**
+	 * 0..1, multiplied into the ink's alpha.
+	 *
+	 * SEPARATE FROM THE COLOUR, not folded into the palette entry's A. The palette is eight fixed
+	 * hues and the opacity is a continuous slider; one field carrying both would mean picking a new
+	 * colour silently threw away the opacity the player had set.
+	 *
+	 * *** THE OUTLINE'S ALPHA IS DERIVED FROM THIS, NOT PINNED. *** See GetCrosshairOutlineColor.
+	 */
+	UPROPERTY(config)
+	float CrosshairOpacity = DefaultCrosshairOpacity;
+
+	/**
+	 * The square at the exact aim point.
+	 *
+	 * Worth a toggle rather than being implied by the gap: a player who wants a wide gap for target
+	 * visibility usually still wants the dot (it is the pixel the bullet goes to), and a player who
+	 * finds the dot noisy over a busy floor wants it gone without giving up the arms.
+	 */
+	UPROPERTY(config)
+	bool bCrosshairCenterDot = bDefaultCrosshairCenterDot;
+
+	/**
+	 * The one-pixel dark surround.
+	 *
+	 * ON by default and it should stay on for almost everybody — the arena is a black floor under
+	 * saturated cyan and amber neon, and an unoutlined white cross vanishes the moment it crosses a
+	 * lit edge. It is a toggle because it is the one thing on this page a player might turn OFF for a
+	 * reason (a hard-edged single-colour cross is easier to see against a flat background, and some
+	 * players genuinely track it better), and because a setting nobody can turn off is not a setting.
+	 */
+	UPROPERTY(config)
+	bool bCrosshairOutline = bDefaultCrosshairOutline;
+
+	/** How many entries the colour palette has. The COLOUR row's range is 0 .. this - 1. */
+	static int32 NumCrosshairColors();
+
+	/** Palette entry @p Index, opaque. Out-of-range clamps rather than returning black. */
+	static FLinearColor CrosshairPaletteColor(int32 Index);
+
+	/** "WHITE", "CYAN", "RED"... Upper case, for the options row. */
+	static FString DescribeCrosshairColor(int32 Index);
+
+	// ---- The accessors the HUD reads. Nothing outside this class touches the raw fields. --------
+	//
+	// Every one of them clamps. A hand-edited .ini is a supported way to configure this game (the
+	// whole KeyBindings format above is designed for it) and it is therefore also a supported way to
+	// arrive here with nonsense.
+
+	float GetCrosshairSize() const;
+	float GetCrosshairThickness() const;
+	float GetCrosshairGap() const;
+	float GetCrosshairOpacity() const;
+
+	/** The palette colour with the opacity already folded into A. The fill the HUD draws with. */
+	FLinearColor GetCrosshairColor() const;
+
+	/**
+	 * The surround's colour, or a fully transparent one when the outline is off.
+	 *
+	 * *** ITS ALPHA IS RELATIVE TO THE CROSSHAIR'S OWN. *** The shipped pair was ink alpha 0.94 and
+	 * shadow alpha 0.80; the shadow is therefore 0.851 of the ink, and that RATIO is what is stored.
+	 * Pinning the shadow at a literal 0.80 would mean a player who dropped the crosshair to 25%
+	 * opacity got a near-invisible cross inside a fully-present black outline — the outline louder
+	 * than the thing it exists to outline. Standing rule: a value that MODIFIES a base is stored
+	 * relative to that base.
+	 */
+	FLinearColor GetCrosshairOutlineColor() const;
+
+	/**
+	 * *** THE OUTER TIP OF THE ARMS, IN 1080p-REFERENCE PIXELS: gap + arm. ***
+	 *
+	 * ONE DEFINITION, because four separate things in ATraceHUD are laid out AROUND the crosshair and
+	 * every one of them used to carry its own copy of the literal `(5 + 11)`:
+	 *   - the third-person pass brackets, which must frame the cross rather than cut through it;
+	 *   - the green throw-charge / pass-hold ring;
+	 *   - the red auto-release ring inside it;
+	 *   - and the crosshair itself.
+	 * Those literals were correct for exactly as long as the crosshair was not a setting. The moment
+	 * a player can widen the gap or lengthen the arms, a ring pinned to 16 reference pixels is a ring
+	 * drawn straight through the arms — which is the same defect spec v28 §7 already fixed once for
+	 * the ThirdPersonCrosshairScale knob (see TraceHUDThrowRings). Standing rule again: everything
+	 * that is positioned relative to the crosshair asks the crosshair how big it is.
+	 */
+	float GetCrosshairArmReach() const;
+
+	/**
+	 * The crosshair's bars, in SCREEN pixels, centred on (@p CX, @p CY).
+	 *
+	 * THE ONE DEFINITION OF THE SHAPE. Two things draw this crosshair — the HUD in a match and the
+	 * live preview on the settings page — and a preview built from its own copy of the arithmetic is
+	 * a preview that will one day lie about the setting it is previewing.
+	 *
+	 * PIXEL SNAPPING LIVES HERE, for the reason ATraceHUD::DrawAimReticle spells out at length: at
+	 * 720p a fractional rect on a half-pixel boundary is anti-aliased into a grey smudge, which is
+	 * what "the crosshair looks out of focus" actually was. Integer thickness, integer lengths,
+	 * integer origin, axis-aligned — and therefore no anti-aliasing at all.
+	 *
+	 * @param PixelScale  UIScale times any per-view scale (the third-person crosshair scale). This is
+	 *                    what turns the stored 1080p-reference numbers into this frame's pixels.
+	 * @param OutBars     receives up to TraceCrosshairMaxBars entries.
+	 * @return how many were written: 4, or 5 when the centre dot is on.
+	 */
+	int32 BuildCrosshairBars(float CX, float CY, float PixelScale,
+		FTraceCrosshairBar OutBars[TraceCrosshairMaxBars]) const;
+
+	/** Puts ONLY the crosshair back to its shipped defaults, and saves. Deliberately not ResetToDefaults. */
+	void ResetCrosshairToDefaults();
+
+	/** True when every crosshair field is on its shipped default. Drives the crosshair page's reset row. */
+	bool IsCrosshairAtDefaults() const;
 
 private:
 	/**

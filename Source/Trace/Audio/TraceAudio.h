@@ -154,9 +154,20 @@ public:
 	/** The bank asset, resolving it on first use. Null when there is none, which is survivable. */
 	UTraceSoundBank* GetBank();
 
-private:
-	/** Volume for @p Event: the master volume times the bank's per-event trim. Never negative. */
+	/**
+	 * THE GAIN this system would hand the engine for @p Event, right now.
+	 *
+	 * Public since spec v29 §1b, and only because that section says MEASURE rather than trust. The
+	 * footstep knob is worth nothing as a number in an ini; what matters is the gain that actually
+	 * reaches a play call, and Trace.Audio.Loudness reads it from here — the same function
+	 * PlayLocalNow and PlayWorldNow call — rather than recomputing master x scale and grading its own
+	 * arithmetic. A harness that re-derives the value it is checking cannot fail.
+	 *
+	 * It is const and has no side effects: asking does not play anything.
+	 */
 	float VolumeFor(FName Event) const;
+
+private:
 
 	/** Logs @p Message for @p Event exactly once per process. Returns true the first time. */
 	bool LogOnceFor(FName Event);

@@ -5,8 +5,9 @@
 # /Game/Trace/Input:
 #
 #     IA_Move IA_Look IA_Jump IA_Crouch IA_Fire IA_Pass IA_Dash IA_Parry
-#     IA_Scoreboard IA_EquipKnife IA_EquipGun IA_Ability IA_AbilitySecondary
-#     IA_Reload IA_PullCore IA_Melee                   (16 UInputAction assets)
+#     IA_Scoreboard IA_EquipKnife IA_EquipGun IA_EquipSmg IA_Ability
+#     IA_AbilitySecondary IA_Reload IA_PullCore IA_Melee
+#                                                      (17 UInputAction assets)
 #     IMC_Trace                                        (1 UInputMappingContext)
 #
 # -----------------------------------------------------------------------------
@@ -143,8 +144,23 @@ ACTIONS = [
      "Boolean action is a supported shape: Enhanced Input merges them by highest "
      "absolute value, so the action is down while EITHER key is."),
     ("IA_Scoreboard", BOOL, HIGHEST, "Scoreboard. Shown while held."),
-    ("IA_EquipKnife", BOOL, HIGHEST, "Equip the knife. DIRECT SELECT and idempotent - not a toggle."),
-    ("IA_EquipGun", BOOL, HIGHEST, "Equip the gun. DIRECT SELECT and idempotent - not a toggle."),
+    # SPEC v29 s5 - THREE weapon states and the knife is in all of them:
+    #   1 stows the GUNS (knife only, and the only state that pays the v12 s3
+    #     speed boost), 2 is the pistol, 3 is the SMG.
+    # The two older ASSET NAMES keep their v13 spellings because
+    # ETraceInputAction does - renaming the enumerator would break another
+    # slice's file. The meaning moved; the spelling did not. The DisplayName
+    # and the ConfigId in TraceInputActions::All() are the strings that reach a
+    # player, and both of those DID move ("StowGuns", "EquipPistol").
+    ("IA_EquipKnife", BOOL, HIGHEST,
+     "SPEC v29 s5: STOW THE GUNS - knife only, and the only state that pays the "
+     "v12 s3 movement boost. DIRECT SELECT and idempotent - not a toggle."),
+    ("IA_EquipGun", BOOL, HIGHEST,
+     "SPEC v29 s5: pull out the PISTOL. The knife stays in the off hand. DIRECT "
+     "SELECT and idempotent - not a toggle."),
+    ("IA_EquipSmg", BOOL, HIGHEST,
+     "SPEC v29 s5: pull out the SMG. The knife stays in the off hand. DIRECT "
+     "SELECT and idempotent - not a toggle."),
     ("IA_Ability", BOOL, HIGHEST, "Activated ability. A press."),
     ("IA_AbilitySecondary", BOOL, HIGHEST, "Secondary ability. A HOLD - Mace suspends only while it is down."),
     ("IA_Reload", BOOL, HIGHEST, "Reload. The clip also reloads itself when it empties."),
@@ -235,8 +251,8 @@ MAPPINGS = [
     ("IA_Parry", "Q", [], "parry, slot 1 (spec v28 s3d)"),
     ("IA_Parry", "ThumbMouseButton", [], "parry, slot 2 - mouse 4 (spec v28 s3d)"),
     ("IA_Scoreboard", "Tab", [], ""),
-    ("IA_EquipKnife", "One", [], ""),
-    ("IA_EquipGun", "Two", [], ""),
+    ("IA_EquipKnife", "One", [], "spec v29 s5 - STOW GUNS (knife only, +22% speed)"),
+    ("IA_EquipGun", "Two", [], "spec v29 s5 - the pistol"),
     ("IA_Ability", "E", [], ""),
     ("IA_AbilitySecondary", "V", [], ""),
     ("IA_Reload", "R", [], ""),
@@ -253,6 +269,12 @@ MAPPINGS = [
     # last, and this table is a copy of that order rather than a sort - see the
     # note at the top of the section.
     ("IA_Melee", "RightMouseButton", [], "spec v28 s10 - melee, on the button s3d vacated"),
+    # SPEC v29 s5 - "3 pulls out smg". LAST in this table because
+    # ATracePlayerController::ApplyControlSettings lays it down last, and this
+    # table is a copy of that order rather than a sort - see the note at the top
+    # of the section. Nothing else in the action table claims a digit, so this
+    # default steals no key on a first run.
+    ("IA_EquipSmg", "Three", [], "spec v29 s5 - the SMG"),
 ]
 
 CONTEXT_NAME = "IMC_Trace"

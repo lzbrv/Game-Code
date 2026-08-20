@@ -5738,12 +5738,56 @@ void ATraceBotController::UpdateCombat(float DeltaSeconds)
 		}
 	}
 
+	// =============================================================================================
+	// *** SPEC v29 §5 INTEGRATION — A SEMI-AUTOMATIC GUN NEEDS THE TRIGGER PULSED, NOT HELD. ***
+	// =============================================================================================
+	//
+	// Spec v29 §2b made the pistol fire once per trigger press. Every line above and below assumes
+	// the v5 gun: press once, hold for the whole burst, release. Under §2b that press yields exactly
+	// ONE round no matter how long the hold is, and BurstDurationMin/Max — the dial the comment above
+	// calls "the dial that actually sets bot DPS" — stops doing anything at all on the pistol.
+	//
+	// THE SIZE OF IT, BEFORE THE FIX: the rolled burst is 0.20-0.38 s (FTraceBotProfile) against a
+	// 0.3158 s pistol interval, so a burst used to contain one round or two depending on the roll.
+	// Losing the second round on the long rolls is the ~15% of pistol DPS the §2 slice reported and
+	// could not fix from its own file. Raising BurstDuration cannot buy it back, because hold length
+	// is not a quantity a semi-automatic weapon reads.
+	//
+	// SO THE BURST IS RE-EXPRESSED AS WHAT IT ALWAYS MEANT: "keep shooting until BurstEndTime".
+	// On a full-auto weapon that is still one held press and NOTHING BELOW CHANGES. On a
+	// semi-automatic one it becomes a release-and-re-press each tick, which is the same one-line
+	// shape the audio slice already applied to Trace.Audio.GunLadder's fixture.
+	//
+	// *** THIS IS PARITY, NOT AN AIMBOT BUFF. *** The re-press is refused by the gun's own CanFire()
+	// rate limit exactly as a held trigger was, so the cadence is the weapon's fire interval and not
+	// the frame rate — a bot ends a burst with the same number of rounds it fired before §2b, and no
+	// more. The burst REST between bursts (BurstRestMin/Max) is untouched and still the window a
+	// player uses to break line of sight.
+	const UTraceWeaponComponent* const BotWeapon = BotCharacter->FindComponentByClass<UTraceWeaponComponent>();
+	const bool bSemiAutoNow = (BotWeapon != nullptr)
+		&& BotWeapon->IsFirearmEquipped()
+		&& !BotWeapon->IsFullAutoNow();
+
+	bool bSemiAutoRePress = false;
+	if (bShouldFire && bTriggerHeld && bSemiAutoNow)
+	{
+		// Release, so the latch clears; the press on the same tick re-arms and fires the moment the
+		// interval is up. Both calls go through the shipped input path, so nothing here knows more
+		// about the weapon than a player's finger does.
+		BotCharacter->DoFireReleased();
+		bTriggerHeld = false;
+		bSemiAutoRePress = true;
+	}
+
 	if (bShouldFire && !bTriggerHeld)
 	{
 		BotCharacter->DoFirePressed();
 		bTriggerHeld = true;
 
-		if (State == ETraceBotState::PunishPasser)
+		// COUNTED ONCE PER BURST, NOT ONCE PER PRESS. The re-press above is the same burst continuing,
+		// so counting it would silently multiply this kit number by the rounds-per-burst the instant
+		// §2b landed — a metric that changed meaning without changing name is worse than no metric.
+		if (State == ETraceBotState::PunishPasser && !bSemiAutoRePress)
 		{
 			TRACE_BOT_KIT(PunisherShots);
 		}

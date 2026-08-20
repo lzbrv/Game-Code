@@ -678,6 +678,56 @@ static TAutoConsoleVariable<float> CVarModeBThrowAutoReleaseSeconds(
 	ECVF_Default);
 
 /**
+ * *** SPEC v29 §6 — THE FIX FOR "A FULL THROW CHARGE SOMETIMES DOES NOT GO FULL DISTANCE", AND ITS
+ * *** RED ARM.
+ *
+ * 1 (default, v29 §6): the server anchors the charge clock at the CLIENT'S STAMPED PRESS INSTANT,
+ *                      clamped into [ServerNow - MaxRewindTime, ServerNow]. The hold the launch is
+ *                      computed from is then (server's release arrival - the player's own press),
+ *                      so upstream jitter can only ever make a hold LONGER, and longer clamps at
+ *                      full. A player who watches the ring fill and lets go gets a full throw.
+ * 0 (the RED ARM, pre-v29): anchor at the instant the PRESS RPC ARRIVED, which is what shipped. The
+ *                      hold is then (true hold + release lag - press lag) and the jitter term is
+ *                      signed. This is the arm that reproduces the bug; Trace.ModeB.ThrowSpread run
+ *                      with a jitter argument prints the distribution under each.
+ *
+ * NOT `ECVF_Cheat`: it changes no rule a player can see, only which of two clocks one subtraction is
+ * done on, and a playtester must be able to A/B it without a cheat-enabled build. The security is in
+ * the CLAMP, not in this switch — see ATraceCore::ServerSetPassInput.
+ */
+static TAutoConsoleVariable<int32> CVarModeBThrowChargeAnchorAtPress(
+	TEXT("Trace.ModeB.ThrowChargeAnchorAtPress"),
+	1,
+	TEXT("SPEC v29 s6. 1 (default): the throw charge is measured from the CLIENT'S STAMPED PRESS ")
+	TEXT("(clamped into the gun's rewind window), so upstream jitter cannot shorten a full charge. ")
+	TEXT("0 = RED ARM: anchor at the press RPC's ARRIVAL, the pre-v29 behaviour that produced the ")
+	TEXT("intermittent short throw."),
+	ECVF_Default);
+
+/**
+ * *** SPEC v29 §6, SECOND HALF — A SECOND PRESS EDGE MUST NOT RESTART A RUNNING THROW CHARGE. ***
+ *
+ * 1 (default, v29 §6): a press that arrives while this holder is already winding up is ABSORBED.
+ *                      The charge keeps the anchor its FIRST press gave it, because the finger has
+ *                      not left the button — only a release ends a charge, and a release clears it.
+ * 0 (the RED ARM, pre-v29): the second press restarts the clock. Measured on the auto-release arm of
+ *                      Trace.ModeB.ThrowSpread: three of thirty throws left with 0.38-0.44 s of hold
+ *                      against a 1.20 s wind-up nobody interrupted, i.e. x0.69-x0.78 instead of
+ *                      x1.00 — visibly and intermittently short, which is the owner's report.
+ *
+ * SEPARATE FROM Trace.ModeB.ThrowChargeAnchorAtPress ON PURPOSE. They are two different mechanisms
+ * that produce the same symptom, and one switch covering both could not tell a tester which one
+ * their build is suffering from.
+ */
+static TAutoConsoleVariable<int32> CVarModeBThrowChargeKeepOnRepress(
+	TEXT("Trace.ModeB.ThrowChargeKeepOnRepress"),
+	1,
+	TEXT("SPEC v29 s6. 1 (default): a second press edge during a wind-up is ABSORBED and the charge ")
+	TEXT("keeps its original anchor. 0 = RED ARM: the pre-v29 behaviour, where the second press ")
+	TEXT("restarts the clock and silently shortens the throw."),
+	ECVF_Default);
+
+/**
  * SPEC v28 §2. WHICH EVENT THE CoreTurnover SOUND HANGS OFF. The A/B arm for the whole section.
  *
  * 1 (default, v28 §2): the moment a team STOPS HOLDING THE CORE — the carrier throws it, or the
@@ -1389,6 +1439,15 @@ namespace TraceModeBTuning
 	// would turn the red arm into the fastest possible auto-release, which is the exact mistake
 	// LooseResetSeconds' comment above records having made once already.
 	float ThrowAutoReleaseSeconds() { return Resolve(TEXT("CoreThrowFullChargeAutoReleaseSeconds"), CVarModeBThrowAutoReleaseSeconds, 0.f, 10.f); }
+
+	// --- SPEC v29 §6. A pure switch with no ini twin, deliberately: it is not a tuning value, it is
+	// which of two clocks the charge is measured on, and there is exactly one right answer. It exists
+	// so the bug can be reproduced in the shipping binary rather than only in a git revert.
+	bool ThrowChargeAnchorsAtPress() { return CVarModeBThrowChargeAnchorAtPress.GetValueOnAnyThread() != 0; }
+
+	// --- SPEC v29 §6, the second half. Same shape and the same reason: not a tuning value, and the
+	// red arm has to exist in the shipping binary or "reproduce first" is a git revert.
+	bool ThrowChargeKeepsOnRepress() { return CVarModeBThrowChargeKeepOnRepress.GetValueOnAnyThread() != 0; }
 
 	// --- Spec v13 §5, the contested magnet. UTraceSettings::CoreCatchContestHysteresisUU, 50 uu in
 	// Config/DefaultGame.ini - and the CVar default below is moved to 50 in step with it, because a
@@ -2973,7 +3032,7 @@ ATraceCharacter* ATraceCore::FindPassTargetFor(const ATraceCharacter* Holder) co
 // Pass: input and state machine
 // =================================================================================================
 
-void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
+void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester, float ClientPressServerTime)
 {
 	if (!IsValid(Requester))
 	{
@@ -3038,8 +3097,17 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 	{
 		if (bPressed)
 		{
-			bLocalThrowCharging = true;
-			LocalThrowChargeStartTime = GetServerTimeSeconds();
+			// SPEC v29 §6. THE METER ABSORBS A RE-PRESS FOR THE SAME REASON THE SERVER'S CLOCK DOES,
+			// and it has to be said here as well or the fix would put the two ends OUT of step rather
+			// than in it: the server keeps its original anchor, so a meter that restarted would show a
+			// ring emptying while the charge behind it kept filling. bLocalThrowCharging is this
+			// machine's own latch and is cleared by every release and by ClearThrowCharge, so "already
+			// true" means exactly what the server's "already >= 0" means — the button never came up.
+			if (!bLocalThrowCharging)
+			{
+				bLocalThrowCharging = true;
+				LocalThrowChargeStartTime = GetServerTimeSeconds();
+			}
 		}
 		else
 		{
@@ -3069,11 +3137,69 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 		{
 			if (bPressed)
 			{
-				// A press from anyone but the living holder was already refused above. Re-arming on a
-				// second press without a release (a lost release packet, a rebind pressed twice) simply
+				// =========================================================================
+				// *** SPEC v29 §6, THE SECOND AND LARGER HALF: A RE-PRESS NO LONGER RESTARTS
+				// *** THE CLOCK.
+				// =========================================================================
+				//
+				// This block used to say: "Re-arming on a second press without a release simply
 				// restarts the clock, which is the conservative answer: it can only ever produce a
-				// weaker throw than the player asked for, never a stronger one.
-				ThrowChargeStartServerTime = GetServerTimeSeconds();
+				// weaker throw than the player asked for, never a stronger one." Both halves of that
+				// are true and the conclusion was wrong — "a weaker throw than the player asked for"
+				// IS the bug. Measured with Trace.ModeB.ThrowSpread's auto-release arm: 27 of 30
+				// throws held the full 1.20 s and launched at x1.000, and THREE held 0.382 s, 0.425 s
+				// and 0.444 s and launched at x0.691, x0.752 and x0.779 — from a hold nobody
+				// interrupted. A second press edge had landed mid-wind-up and moved the anchor.
+				//
+				// SECOND PRESS EDGES ARE REAL AND THERE ARE AT LEAST THREE SOURCES OF THEM:
+				//   * ATraceCharacter::DoFirePressed routes a CARRIER's fire straight into
+				//     DoPassPressed, so anything that presses fire — a bot's trigger, a human with
+				//     FIRE and THROW on different keys — is a second press on the same charge;
+				//   * ATracePlayerController::RedeliverHeldPressEdges re-delivers BOTH the held Fire
+				//     edge and the held Pass edge when a menu hands input back, which is two presses;
+				//   * a duplicated or reordered packet.
+				//
+				// WHAT A SECOND PRESS MEANS IS "THE BUTTON IS STILL DOWN", and the instant the finger
+				// went down has not moved — the release that would end this charge has not arrived,
+				// and a release is the only thing that ends one. So the EARLIEST press wins and the
+				// later edge is absorbed, which is the same latch-shaped reasoning RequestPassInput
+				// already applies to a non-holder's release. A genuinely new wind-up is still possible
+				// and still starts from zero, because it must be preceded by a release, and a release
+				// clears the charge on every path.
+				//
+				// The red arm is `Trace.ModeB.ThrowChargeKeepOnRepress 0`.
+				if (ThrowChargeStartServerTime >= 0.f
+					&& ThrowChargeHolder.Get() == Requester
+					&& TraceModeBTuning::ThrowChargeKeepsOnRepress())
+				{
+					UE_LOG(LogTraceGame, Verbose,
+						TEXT("[ModeB] spec v29 s6: a second press arrived %.3fs into %s's wind-up and was ")
+						TEXT("ABSORBED. The charge keeps its original anchor."),
+						GetServerTimeSeconds() - ThrowChargeStartServerTime, *GetNameSafe(Requester));
+					return;
+				}
+
+				//
+				// *** SPEC v29 §6 — ANCHOR THE CHARGE AT THE STAMPED PRESS, NOT AT ARRIVAL. ***
+				//
+				// This one line is the whole of "sometimes a full charge does not go full distance".
+				// Anchoring here meant the hold was (true hold) + (release lag − press lag); that
+				// difference is jitter, it is signed, and a negative one is a charge the player
+				// watched fill and did not get. Measured with Trace.ModeB.ThrowSpread — see
+				// ServerSetPassInput's comment for the numbers, the security argument and the red arm.
+				//
+				// The clamp is the gun's, character for character (UTraceWeaponComponent::
+				// ServerRequestEquip): never in the future, never further back than a bullet may be
+				// rewound. A stamp of < 0 means "no stamp" — every server-side, bot and console caller
+				// — and lands on GetServerTimeSeconds() exactly as before.
+				const float ServerNow = GetServerTimeSeconds();
+				float PressAt = ServerNow;
+				if (TraceModeBTuning::ThrowChargeAnchorsAtPress() && ClientPressServerTime > 0.f)
+				{
+					const float MaxRewind = FMath::Max(0.f, UTraceSettings::Get().MaxRewindTime);
+					PressAt = FMath::Clamp(ClientPressServerTime, ServerNow - MaxRewind, ServerNow);
+				}
+				ThrowChargeStartServerTime = PressAt;
 				ThrowChargeHolder = Requester;
 
 				// SPEC v28 §7. A fresh press is a fresh deadline. Stated here as well as in
@@ -3146,17 +3272,32 @@ void ATraceCore::RequestPassInput(bool bPressed, ATraceCharacter* Requester)
 		}
 	}
 
-	ServerSetPassInput(bPressed, Requester);
+	// SPEC v29 §6. The PRESS carries the instant the button actually went down on this machine, read
+	// off the SAME shared clock the server anchors against (LocalThrowChargeStartTime above is that
+	// instant, and using it rather than a second GetServerTimeSeconds() call is what makes the meter
+	// the player watches and the charge the server measures the same measurement rather than two).
+	// A RELEASE carries no stamp at all — it is stamped by the server on arrival, exactly as before,
+	// which is what keeps the hold from ever being a number a client chose.
+	const float PressStamp = (bPressed && bLocalPlayerInput && IsModeB())
+		? LocalThrowChargeStartTime
+		: -1.f;
+
+	ServerSetPassInput(bPressed, Requester, PressStamp);
 }
 
-void ATraceCore::ServerSetPassInput_Implementation(bool bPressed, ATraceCharacter* Requester)
+void ATraceCore::ServerSetPassInput_Implementation(bool bPressed, ATraceCharacter* Requester, float ClientPressServerTime)
 {
 	// Network input: this RPC is routed by ownership (SetOwner(Carrier) in GrantTo), so only the
 	// holding connection can reach it at all. It is re-validated anyway, by running the SAME
 	// function the client ran - on the server HasAuthority() is true, so this lands in the branch
 	// above and applies the identical press/release ownership rules. One copy of the rules, and a
 	// client that lies about Requester is refused by them exactly as a local call would be.
-	RequestPassInput(bPressed, Requester);
+	//
+	// SPEC v29 §6. The stamp travels with it and is clamped there, in the one place the charge clock
+	// is written. A non-finite value from a modified client is dropped rather than trusted — it would
+	// otherwise reach FMath::Clamp and poison ThrowChargeStartServerTime for the rest of the match.
+	const float Stamp = FMath::IsFinite(ClientPressServerTime) ? ClientPressServerTime : -1.f;
+	RequestPassInput(bPressed, Requester, Stamp);
 }
 
 void ATraceCore::ServerTickPass(float /*DeltaSeconds*/)
@@ -4713,6 +4854,383 @@ static FAutoConsoleCommand GTraceModeBThrowMomentumCmd(
 			S.ImpulseSpeed, S.InheritedSpeed, S.Inheritance, S.LaunchSpeed, S.LaunchVelocityZ);
 	}));
 
+// =================================================================================================
+// *** SPEC v29 §6 — "SOMETIMES I CHARGE UP A THROW AND LET GO AND IT DOESN'T GO THE FULL DISTANCE."
+// ***
+// *** `Trace.ModeB.ThrowSpread <throws> [holdSeconds] [jitterMs] [auto|manual]`
+// =================================================================================================
+//
+// AN INTERMITTENT BUG IS PROVEN BY A SPREAD, NOT BY ONE GOOD THROW, so this runs a whole population
+// of throws through the REAL door — ATraceCore::RequestPassInput, the same function mouse 1 reaches
+// — and prints the DISTRIBUTION of the launch speed that came out. One throw cannot distinguish
+// "this is correct" from "this one happened to be correct".
+//
+// WHAT EACH ARGUMENT IS FOR, AND WHY THE JITTER ONE IS THE WHOLE INSTRUMENT
+//
+//   throws        population size. 40 is enough to see a 5% tail.
+//   holdSeconds   how long the player MEANT to hold. Defaults to exactly one full charge
+//                 (CoreThrowChargeSeconds), which is the case the owner described: watch the ring
+//                 fill, let go.
+//   jitterMs      *** THE VARIABLE UNDER TEST. *** The server never sees the player's hold. It sees
+//                 two RPC ARRIVALS, and each one is late by that packet's own upstream lag. So with
+//                 a true press at Tp and a true release at Tp+H, and lags up1 and up2:
+//
+//                     RED  (anchor at arrival) Held = (Tp+H+up2) - (Tp+up1) = H + up2 - up1
+//                     GREEN(anchor at press)   Held = (Tp+H+up2) - (Tp)     = H + up2
+//
+//                 The red term is SIGNED and is negative half the time — that is the bug, and it is
+//                 worst exactly when the player releases on the instant the ring completes. This
+//                 argument draws up1 and up2 independently from U(0, jitterMs) per throw and drives
+//                 the real code with them: the press is delivered `up1` after the modelled button-down
+//                 and CARRIES that button-down instant as its stamp (which is precisely what a client
+//                 sends), and the release is delivered `up2` after the modelled button-up. 0 is a
+//                 single-process control with no lag at all, on which the two arms MUST agree.
+//   auto          hold PAST the full-charge deadline so spec v28 §7's 0.6 s auto-release is what
+//                 fires. This is the arm that answers the spec's own prime suspect: does the
+//                 automatic release throw at a stale charge? Every sample in this arm should be
+//                 identical and full, because the server derives the hold from its own two stamps.
+//
+// WHAT IT MEASURES, STATED PLAINLY SO THE NUMBER CANNOT BE OVER-READ: this is a SINGLE PROCESS, so
+// there is no wire and no real jitter. `jitterMs` is a MODEL of the wire, applied at the one place
+// the wire actually bites. That makes this instrument honest about the MECHANISM (which subtraction
+// the launch depends on) and silent about the MAGNITUDE on any particular network. Run it with
+// jitter 0 against the red arm and the green arm and they agree — as they must, because with no skew
+// there is nothing for the fix to fix, and a harness whose arms cannot agree when the bug is absent
+// is not measuring its rule. The evidence is the jitter > 0 pair.
+//
+// THE RED ARM IS `Trace.ModeB.ThrowChargeAnchorAtPress 0`.
+//
+static void TraceModeBRunThrowSpread(UWorld* World, int32 Throws, float HoldSeconds, float JitterSeconds, bool bAutoArm)
+{
+	ATraceCore* const Core = ATraceCore::Get(World);
+	if (Core == nullptr || !Core->HasAuthority())
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ThrowSpread] server only — a throw is resolved on the authority, and the launch ")
+			TEXT("speed this measures exists nowhere else."));
+		return;
+	}
+	if (!Core->IsModeB())
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[ThrowSpread] mode A has no throw. Launch with ?mode=b."));
+		return;
+	}
+
+	// Shared with the ticker below by value; it outlives this scope by design, exactly as
+	// DebugTakeCore's does.
+	struct FSpreadState
+	{
+		TWeakObjectPtr<ATraceCore> Core;
+		TWeakObjectPtr<ATraceCharacter> Thrower;
+		TArray<float> Speeds;
+		TArray<float> Scales;
+		TArray<float> Holds;
+		int32 Remaining = 0;
+		int32 Refusals = 0;
+		int32 Foreign = 0;
+		int32 LastSerial = 0;
+		int32 Phase = 0;
+		double NextActionTime = 0.0;
+		double PressedAt = 0.0;
+		double ReleaseAt = 0.0;
+		float Hold = 0.f;
+		float Jitter = 0.f;
+		bool bAuto = false;
+		FRandomStream Rng;
+	};
+
+	TSharedRef<FSpreadState> State = MakeShared<FSpreadState>();
+	State->Core = Core;
+	State->Remaining = FMath::Clamp(Throws, 1, 500);
+	State->Hold = HoldSeconds;
+	State->Jitter = FMath::Max(0.f, JitterSeconds);
+	State->bAuto = bAutoArm;
+	State->LastSerial = ATraceCore::LastThrow.Serial;
+	// SEEDED, so two runs of the same arm draw the SAME release skews. A/B-ing a fix against a
+	// different random sequence measures the sequence as much as the fix.
+	State->Rng.Initialize(20290605);
+
+	const float FullScale = ATraceCore::GetThrowChargeScaleForHold(ATraceCore::GetThrowChargeSeconds());
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ThrowSpread] %d throws | intended hold %.3fs (a full charge is %.3fs) | release skew ")
+		TEXT("U(0,%.0fms) | arm=%s | anchorAtPress=%d | full charge = x%.3f"),
+		State->Remaining, State->Hold, ATraceCore::GetThrowChargeSeconds(), 1000.f * State->Jitter,
+		State->bAuto ? TEXT("AUTO-RELEASE (spec v28 s7)") : TEXT("manual release"),
+		TraceModeBTuning::ThrowChargeAnchorsAtPress() ? 1 : 0, FullScale);
+
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[State](float /*Delta*/) -> bool
+	{
+		ATraceCore* const TheCore = State->Core.Get();
+		if (!IsValid(TheCore))
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ThrowSpread] the Core went away; aborting."));
+			return false;
+		}
+		UWorld* const World = TheCore->GetWorld();
+		if (!IsValid(World))
+		{
+			return false;
+		}
+		const double Now = World->GetTimeSeconds();
+
+		switch (State->Phase)
+		{
+		case 0:
+		{
+			// ---- ARRANGE. A living pawn, holding the Core, with the pickup cooldown spent. --------
+			if (Now < State->NextActionTime)
+			{
+				return true;
+			}
+
+			ATraceCharacter* Thrower = State->Thrower.Get();
+			if (!IsValid(Thrower) || !Thrower->IsAlive())
+			{
+				TArray<ATraceCharacter*> Characters;
+				TheCore->GatherCharacters(Characters);
+				Thrower = nullptr;
+				for (ATraceCharacter* Candidate : Characters)
+				{
+					if (IsValid(Candidate) && Candidate->IsAlive())
+					{
+						Thrower = Candidate;
+						break;
+					}
+				}
+				if (Thrower == nullptr)
+				{
+					UE_LOG(LogTraceGame, Warning, TEXT("[ThrowSpread] nobody alive to throw it."));
+					return false;
+				}
+				State->Thrower = Thrower;
+			}
+
+			if (TheCore->GetCarrier() != Thrower)
+			{
+				TheCore->GrantTo(Thrower, ETraceCoreGrantReason::Debug);
+			}
+
+			// THE TWO UPSTREAM LAGS, drawn independently — see the header comment for the algebra.
+			// Independent is the point: a single shared lag cancels in the red arm's subtraction and
+			// the bug disappears, which is how this could have been "measured" and called fixed.
+			const float Up1 = (State->Jitter > 0.f) ? State->Rng.FRandRange(0.f, State->Jitter) : 0.f;
+			const float Up2 = (State->Jitter > 0.f) ? State->Rng.FRandRange(0.f, State->Jitter) : 0.f;
+
+			// THE PRESS, through the real door. Not ThrowFromHolder: the bug under test is entirely
+			// in how the hold BETWEEN the two input edges is measured, so a harness that called the
+			// launch directly would be measuring the one part of the path that was never in doubt.
+			//
+			// `Now - Up1` IS THE STAMP A CLIENT SENDS. RequestPassInput's client half passes
+			// LocalThrowChargeStartTime — the shared-clock instant its own button went down — and
+			// this frame is that press ARRIVING Up1 later. Passing it here is standing in for a
+			// client, not reaching around the code under test: the server's clamp-and-anchor runs on
+			// the authority path exactly as it does for a real RPC.
+			State->PressedAt = Now - static_cast<double>(Up1);
+			TheCore->RequestPassInput(true, Thrower, static_cast<float>(State->PressedAt));
+
+			if (State->bAuto)
+			{
+				// Past full charge AND past the §7 window, so the SERVER releases it. Nothing is sent
+				// on this arm's release edge at all until the throw has already happened.
+				State->ReleaseAt = Now + ATraceCore::GetThrowChargeSeconds()
+					+ ATraceCore::GetThrowAutoReleaseSeconds() + 0.30;
+			}
+			else
+			{
+				// The player's button goes up at (their press + the hold they meant); the server hears
+				// about it Up2 later. Both terms are on the same clock as the press above.
+				State->ReleaseAt = State->PressedAt + static_cast<double>(State->Hold) + static_cast<double>(Up2);
+			}
+			State->Phase = 1;
+			return true;
+		}
+
+		case 1:
+		{
+			// ---- HOLD, then release on the first frame at or after the deadline. -----------------
+			//
+			// "First frame at or after" is not an approximation of a player's release, it IS one: a
+			// button that goes up between two frames is delivered on the next one. The residual
+			// quantisation is therefore part of what is being measured, not noise added by the rig.
+			if (State->bAuto && ATraceCore::LastThrow.Serial != State->LastSerial)
+			{
+				// The auto-release already fired. Send the matching release anyway so no latch is
+				// left set, then score it.
+				if (ATraceCharacter* Thrower = State->Thrower.Get())
+				{
+					TheCore->RequestPassInput(false, Thrower);
+				}
+				State->Phase = 2;
+				return true;
+			}
+			if (Now >= State->ReleaseAt)
+			{
+				if (ATraceCharacter* Thrower = State->Thrower.Get())
+				{
+					TheCore->RequestPassInput(false, Thrower);
+				}
+				State->Phase = 2;
+			}
+			return true;
+		}
+
+		default:
+		{
+			// ---- SCORE. --------------------------------------------------------------------------
+			if (ATraceCore::LastThrow.Serial == State->LastSerial)
+			{
+				// No throw came out of that press/release pair. Counted rather than retried: a run
+				// that silently re-rolled its refusals would report a population it did not sample.
+				++State->Refusals;
+			}
+			else if (ATraceCore::LastThrow.ThrowerName != GetNameSafe(State->Thrower.Get()))
+			{
+				// *** SOMEBODY ELSE'S THROW. *** This runs in a LIVE MATCH with bots in it, and a bot
+				// that intercepts the loose Core and throws it moves the same serial. Without this
+				// test that throw is scored as ours — which is exactly how a harness talks itself into
+				// a spread it did not cause. It cost one measured outlier at x0.701 to find, an order
+				// of magnitude outside the ±60 ms this rig injects, which is what made it obvious the
+				// sample did not belong to the population.
+				State->LastSerial = ATraceCore::LastThrow.Serial;
+				++State->Foreign;
+				UE_LOG(LogTraceGame, Verbose,
+					TEXT("[ThrowSpread] discarding a throw by %s (this run's thrower is %s)."),
+					*ATraceCore::LastThrow.ThrowerName, *GetNameSafe(State->Thrower.Get()));
+			}
+			else
+			{
+				State->LastSerial = ATraceCore::LastThrow.Serial;
+				State->Speeds.Add(ATraceCore::LastThrow.LaunchSpeed);
+				State->Scales.Add(ATraceCore::LastThrow.ChargeScale);
+				State->Holds.Add(ATraceCore::LastThrow.HeldSeconds);
+			}
+
+			if (--State->Remaining > 0)
+			{
+				State->Phase = 0;
+				// Clear of Trace.ModeB.ThrowCooldown (0.35 s from the pickup) with margin, so a
+				// refusal in the sample can never be this rig's own impatience.
+				State->NextActionTime = Now + 0.50;
+				return true;
+			}
+
+			// ---- REPORT. -------------------------------------------------------------------------
+			const int32 N = State->Speeds.Num();
+			if (N == 0)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[ThrowSpread] NO THROWS LANDED (%d refusals, %d foreign). Nothing measured."),
+					State->Refusals, State->Foreign);
+				return false;
+			}
+
+			const float FullScale = ATraceCore::GetThrowChargeScaleForHold(ATraceCore::GetThrowChargeSeconds());
+
+			float MinSpeed = TNumericLimits<float>::Max();
+			float MaxSpeed = 0.f;
+			double SumSpeed = 0.0;
+			int32 ShortThrows = 0;
+			for (int32 Index = 0; Index < N; ++Index)
+			{
+				MinSpeed = FMath::Min(MinSpeed, State->Speeds[Index]);
+				MaxSpeed = FMath::Max(MaxSpeed, State->Speeds[Index]);
+				SumSpeed += State->Speeds[Index];
+				// SHORT means "the charge curve gave this throw less than a full charge", which is the
+				// owner's sentence. Judged on the CHARGE SCALE and not on the speed, because the speed
+				// also carries the thrower's inherited velocity (spec v8 §4) and a standing pawn's
+				// 0 uu/s would otherwise be indistinguishable from a nerfed impulse.
+				if (State->Scales[Index] < FullScale - 1e-4f)
+				{
+					++ShortThrows;
+				}
+			}
+			const double Mean = SumSpeed / N;
+			double SumSq = 0.0;
+			for (float Speed : State->Speeds)
+			{
+				SumSq += (Speed - Mean) * (Speed - Mean);
+			}
+			const double StdDev = (N > 1) ? FMath::Sqrt(SumSq / (N - 1)) : 0.0;
+
+			UE_LOG(LogTraceGame, Display, TEXT("================ [ThrowSpread] SPEC v29 s6 ================"));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("arm=%s  anchorAtPress=%d  intendedHold=%.3fs  releaseSkew=U(0,%.0fms)  n=%d (%d refused, ")
+				TEXT("%d discarded as another pawn's throw)"),
+				State->bAuto ? TEXT("AUTO-RELEASE") : TEXT("manual"),
+				TraceModeBTuning::ThrowChargeAnchorsAtPress() ? 1 : 0,
+				State->Hold, 1000.f * State->Jitter, N, State->Refusals, State->Foreign);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("LAUNCH SPEED  min %.1f  mean %.1f  max %.1f  stddev %.2f  spread %.1f uu/s (%.2f%% of mean)"),
+				MinSpeed, Mean, MaxSpeed, StdDev, MaxSpeed - MinSpeed,
+				100.0 * (MaxSpeed - MinSpeed) / FMath::Max(1.0, Mean));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("CHARGE SCALE  full charge is x%.3f; %d of %d throws (%.0f%%) came out BELOW it"),
+				FullScale, ShortThrows, N, 100.f * ShortThrows / N);
+
+			// Per-throw, so the distribution can be read rather than believed. Eight to a line.
+			FString Line;
+			for (int32 Index = 0; Index < N; ++Index)
+			{
+				// HELD IS PRINTED, and it is the column that attributes a short throw. A launch speed
+				// carries the thrower's inherited velocity and a charge scale carries their character's
+				// curve; only the HOLD says whether the server measured the wind-up the player
+				// performed, which is the entire claim of spec v29 §6.
+				Line += FString::Printf(TEXT("%6.0f/x%.3f/%.3fs "),
+					State->Speeds[Index], State->Scales[Index], State->Holds[Index]);
+				if (((Index + 1) % 5) == 0 || Index == N - 1)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("  speed/scale: %s"), *Line);
+					Line.Reset();
+				}
+			}
+
+			// THE VERDICT IS PRINTED, not left to the reader, because this is the line a later pass
+			// will grep for.
+			if (ShortThrows == 0)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ThrowSpread] PASS: every throw at a nominally full charge launched at full charge."));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[ThrowSpread] FAIL: %d of %d nominally-full throws launched SHORT (worst x%.3f ")
+					TEXT("against x%.3f). This is spec v29 s6's bug reproduced."),
+					ShortThrows, N, FMath::Min(State->Scales), FullScale);
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("==========================================================="));
+			return false;
+		}
+		}
+	}));
+}
+
+static FAutoConsoleCommandWithWorldAndArgs GTraceModeBThrowSpreadCmd(
+	TEXT("Trace.ModeB.ThrowSpread"),
+	TEXT("SPEC v29 s6. Server. Runs N throws at a nominally FULL charge through the real press/release ")
+	TEXT("door and prints the DISTRIBUTION of the launch speed. Args: <throws> [holdSeconds] [jitterMs] ")
+	TEXT("[auto]. 'auto' holds past the spec v28 s7 deadline so the AUTOMATIC release is what fires. ")
+	TEXT("Red arm: Trace.ModeB.ThrowChargeAnchorAtPress 0."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& Args, UWorld* World)
+	{
+		const int32 Throws = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 40;
+		const float Hold = (Args.Num() > 1)
+			? FCString::Atof(*Args[1])
+			: ATraceCore::GetThrowChargeSeconds();
+		const float JitterSeconds = (Args.Num() > 2) ? (FCString::Atof(*Args[2]) * 0.001f) : 0.f;
+		bool bAuto = false;
+		for (const FString& Arg : Args)
+		{
+			if (Arg.Equals(TEXT("auto"), ESearchCase::IgnoreCase))
+			{
+				bAuto = true;
+			}
+		}
+		TraceModeBRunThrowSpread(World, Throws, Hold, JitterSeconds, bAuto);
+	}));
+
 bool ATraceCore::HasRemoteClientPawn() const
 {
 	if (!HasAuthority())
@@ -5838,6 +6356,8 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	LastThrow.HeldSeconds = FMath::Max(0.f, HeldSeconds);
 	LastThrow.ChargeScale = ChargeScale;
 	LastThrow.ThrowerName = GetNameSafe(Thrower);
+	// SPEC v29 §6. See the member: a throw is detected by this moving, never by the values changing.
+	++LastThrow.Serial;
 
 	const ETraceTeam ThrowerTeam = Thrower->GetTeam();
 

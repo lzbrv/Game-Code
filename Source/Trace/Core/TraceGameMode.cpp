@@ -20,7 +20,8 @@
 #include "TimerManager.h"
 
 #include "AI/TraceBotController.h"
-#include "Abilities/TraceAbilityComponent.h"   // v14 §3 — the roster rules this class defers to
+#include "Abilities/TraceAbilityComponent.h"
+#include "Audio/TraceAudio.h"                 // spec v29 §1f — Goal, game-side   // v14 §3 — the roster rules this class defers to
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
@@ -1628,6 +1629,27 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 		UE_LOG(LogTraceGame, Log, TEXT("%s scored (%s). Blue %d - Orange %d"),
 			*TraceTeamName(ScoringTeam).ToString(), *TraceGameState->GetHalfLabel(),
 			TraceGameState->BlueScore, TraceGameState->OrangeScore);
+
+		// SPEC v29 §1f — GOAL. The owner sent the WAV with no stated trigger; "a goal being scored"
+		// is the only reading of the name, and §1f says a goal is surely global. Game-side, so the
+		// whole arena hears it once.
+		//
+		// INSIDE the bCounts branch and after AddScore, deliberately. A warm-up carry, a carry during
+		// the half-time interval and a carry after the whistle all run this function and all reset the
+		// field, and none of them is a goal — the score does not move for them, so the sound must not
+		// either. This is also downstream of the debounce above, which is what stops the endzone's two
+		// independent detectors from sounding one capture twice.
+		//
+		// AT THE CORE, not at the game mode: the game mode is an actor at the origin and a goal that
+		// sounds from the middle of the map tells nobody which end it happened at. The Core is where
+		// the capture physically was. PlayAt falls back to the given point safely if the Core has
+		// already been released by the reset below — it has not, this runs first.
+		FVector Where = FVector::ZeroVector;
+		if (const ATraceCore* ScoredCore = ATraceCore::Get(World))
+		{
+			Where = ScoredCore->GetActorLocation();
+		}
+		TraceAudio::PlayAt(this, TraceSoundEvents::Goal, Where);
 	}
 
 	// THE MERCY RULE IS DECIDED BEFORE ANYTHING IS RESTARTED (spec v4 §6). There is no point kicking

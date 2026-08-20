@@ -23,10 +23,12 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "Math/NumericLimits.h"                 // TNumericLimits<double>
+#include "Misc/App.h"                          // spec v29 §2f: FApp::UseFixedTimeStep, for the harness
 #include "Math/UnrealMathUtility.h"
 #include "Net/UnrealNetwork.h"                  // DOREPLIFETIME
 
 #include "Abilities/Characters/TraceAbilityWeaponHooks.h"   // spec v14 §6: X's Sting bullets
+#include "Abilities/Characters/TraceAbilitySetRoxie.h"       // spec v29 §2e: MODDED's recoil, §2b: its full auto
 #include "Abilities/TraceAbilityComponent.h"                 // spec v14 §6: the damage passives
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameState.h"
@@ -99,6 +101,24 @@ static TAutoConsoleVariable<int32> CVarTraceShotStats(
 	TEXT("Trace.ShotStats"),
 	0,
 	TEXT("1: accumulate the hit-zone / impact-height distribution for every server-accepted shot. Trace.ShotStats.Dump prints it."),
+	ECVF_Default);
+
+/**
+ * SPEC v29 §2f. Records the local-clock instant of every round this machine fires.
+ *
+ * The 537-RPM report was a MEAN over 42 rounds, and a mean is the one statistic that cannot tell a
+ * gun that is uniformly 12% slow from one that stutters every sixth round — which are different bugs
+ * with different fixes. This exists so the verdict is a distribution: n, mean, min, max, stddev and
+ * the modal gap, over 40+ consecutive rounds, at each arm.
+ *
+ * Stamped inside FireOnce rather than sampled by a ticker, deliberately. A ticker can only observe
+ * frame boundaries, and frame boundaries are exactly what is under suspicion here; a harness that
+ * measured them would be unable to distinguish the bug from its own instrument.
+ */
+static TAutoConsoleVariable<int32> CVarTraceRecordShots(
+	TEXT("Trace.Weapons.RecordShots"),
+	0,
+	TEXT("1: record the local-clock instant of every round fired, for Trace.Weapons.V29. Off in normal play."),
 	ECVF_Default);
 
 // =================================================================================================
@@ -241,25 +261,101 @@ namespace TraceAmmo
 		return FMath::Max(0.01f, UTraceSettings::Get().FireInterval);
 	}
 
-	float GetZoneDamage(ETraceEquippedWeapon Weapon, ETraceHitZone Zone)
+	float GetFalloffAlpha(ETraceEquippedWeapon Weapon, double DistanceUU)
+	{
+		// =========================================================================================
+		// SPEC v29 §2d — "The values should drop to 24, 15, 10 after a certain range. 800 uu falloff"
+		//
+		// *** A CLIFF, NOT A RAMP, AND THE CHOICE IS STATED RATHER THAN IMPLIED. *** SmgFalloffRampUU
+		// is 0 in the shipped config, which makes this function a step: 0 at or inside the start,
+		// 1 past it. Give the knob a positive length and the same function becomes a linear ramp of
+		// that length, with no other code changing. The reasoning for picking the cliff is on the
+		// knob in TraceSettings.h and in DefaultGame.ini; the short version is that the owner gave
+		// two tables and ONE distance, and a ramp would need a second distance nobody specified.
+		//
+		// SMG ONLY. §2d: "Only the SMG; the pistol is unchanged." The pistol never reaches the branch
+		// below, so a pistol shot at 30000 uu pays exactly what it always did.
+		// =========================================================================================
+		if (Weapon != ETraceEquippedWeapon::Smg)
+		{
+			return 0.f;
+		}
+
+		const UTraceSettings& Settings = UTraceSettings::Get();
+		if (!Settings.bSmgDamageFalloff)
+		{
+			// THE RED ARM: the flat v28 SMG, one table at every range.
+			return 0.f;
+		}
+
+		const double Start = FMath::Max(0.f, Settings.SmgFalloffStartUU);
+		if (DistanceUU <= Start)
+		{
+			return 0.f;
+		}
+
+		// THE RAMP LENGTH IS MEASURED FROM THE START, WHICH IS WHY THE END IS DERIVED HERE AND NOT
+		// STORED (standing rule): move SmgFalloffStartUU and the ramp moves with it, keeping its
+		// length, instead of being silently stretched, squashed or inverted by a stale end distance.
+		const double Ramp = FMath::Max(0.f, Settings.SmgFalloffRampUU);
+		if (Ramp <= UE_KINDA_SMALL_NUMBER)
+		{
+			return 1.f;   // the cliff
+		}
+
+		return static_cast<float>(FMath::Clamp((DistanceUU - Start) / Ramp, 0.0, 1.0));
+	}
+
+	float GetZoneDamage(ETraceEquippedWeapon Weapon, ETraceHitZone Zone, double DistanceUU)
 	{
 		// THE PISTOL STILL GOES THROUGH FTraceHitZoneModel AND MUST. That is the shared zone model
 		// spec section 6 insists the predicted and authoritative traces both use, it is what
 		// UTraceDamageSettings feeds, and it is what the Trace.ShotStats histogram is calibrated
 		// against. This function adds a SECOND TABLE for a second weapon; it does not replace the
 		// first, and a build with no SMG in it resolves exactly the numbers it always did.
+		//
+		// SPEC v29 §2a: that table's leg number is now 25 rather than 30, which happens entirely
+		// inside UTraceDamageSettings and changes nothing here.
 		if (Weapon != ETraceEquippedWeapon::Smg)
 		{
 			return FTraceHitZoneModel::DamageForZone(Zone);
 		}
 
 		const UTraceSettings& Settings = UTraceSettings::Get();
+
+		float Near = 0.f;
+		float Far = 0.f;
 		switch (Zone)
 		{
-		case ETraceHitZone::Head: return FMath::Max(0.f, Settings.SmgHeadDamage);
-		case ETraceHitZone::Body: return FMath::Max(0.f, Settings.SmgBodyDamage);
-		case ETraceHitZone::Legs: return FMath::Max(0.f, Settings.SmgLegDamage);
+		case ETraceHitZone::Head: Near = Settings.SmgHeadDamage; Far = Settings.SmgFarHeadDamage; break;
+		case ETraceHitZone::Body: Near = Settings.SmgBodyDamage; Far = Settings.SmgFarBodyDamage; break;
+		case ETraceHitZone::Legs: Near = Settings.SmgLegDamage;  Far = Settings.SmgFarLegDamage;  break;
 		default:                  return 0.f;    // ETraceHitZone::None — a miss pays nothing.
+		}
+
+		// SPEC v29 §2d. Lerp rather than a branch so the cliff and the ramp are ONE expression: with
+		// Alpha pinned to 0 or 1 by the cliff this is exactly "pick a table", and there is no second
+		// code path for a designer's ramp to be missing from.
+		const float Alpha = GetFalloffAlpha(Weapon, DistanceUU);
+		return FMath::Max(0.f, FMath::Lerp(FMath::Max(0.f, Near), FMath::Max(0.f, Far), Alpha));
+	}
+
+	float GetZoneDamage(ETraceEquippedWeapon Weapon, ETraceHitZone Zone)
+	{
+		// Point blank. See the header for why this form still exists and what it is for.
+		return GetZoneDamage(Weapon, Zone, 0.0);
+	}
+
+	bool IsFullAuto(ETraceEquippedWeapon Weapon)
+	{
+		// SPEC v29 §2b. The knife falls through to false: it has no trigger, and its repeat is
+		// CanSwing()'s own 0.5 s cadence, which fire mode must not touch.
+		const UTraceSettings& Settings = UTraceSettings::Get();
+		switch (Weapon)
+		{
+		case ETraceEquippedWeapon::Gun: return Settings.bPistolFullAuto;
+		case ETraceEquippedWeapon::Smg: return Settings.bSmgFullAuto;
+		default:                        return false;
 		}
 	}
 
@@ -709,6 +805,70 @@ double UTraceWeaponComponent::GetFireInterval() const
 	// as 1/1.65 = 0.606. Dividing would make a faster character fire slower.
 	return static_cast<double>(TraceAmmo::GetBaseFireInterval(EquippedWeapon))
 		* static_cast<double>(UTraceAbilityComponent::GetFireIntervalScaleFor(GetTraceCharacter()));
+}
+
+bool UTraceWeaponComponent::IsFullAutoNow() const
+{
+	// SPEC v29 §2b. The weapon's own mode, OR'd with the abilities that force full auto.
+	//
+	// *** AND THIS IS THE LINE THAT FINALLY MAKES ROXIE'S §2 "the gun becomes full auto" A MECHANIC.
+	// *** UTraceAbilitySetRoxie::IsFullAutoForced() has existed since spec v18 §2 reading nothing at
+	// all, because the base gun was already automatic and the clause had no state to change. With the
+	// pistol semi-automatic there is finally something for it to switch, and MODDED now buys her a
+	// held trigger on a PISTOL as well as a faster one.
+	//
+	// OR, not override, and in this direction on purpose: an ability may add full auto to a gun that
+	// lacks it, and can never take it away from a gun that has it. A "MODDED makes the SMG single
+	// shot" reading is not available, which is the correct outcome for a buff.
+	return TraceAmmo::IsFullAuto(EquippedWeapon) || TraceRoxie::IsFullAutoForcedFor(GetOwner());
+}
+
+void UTraceWeaponComponent::AdvanceFireClock()
+{
+	// *** SPEC v29 §2f. THE 537 RPM FIX. The full reasoning is on the declaration in the header. ***
+	const double Now = GetLocalTimeSeconds();
+	const double Interval = GetFireInterval();
+
+	// The instant this round was DUE, and how late this frame is in delivering it.
+	const double Due = LastLocalFireTime + Interval;
+	const double Overshoot = Now - Due;
+
+	// CLAMPED TO FireRateTolerance IN CODE, NOT TRUSTED FROM THE INI. That constant is the fraction
+	// of an interval the server forgives an early round; carrying more than it would let the client
+	// ask for a round the server rejects as rate-limited — the gun eating bullets, which is strictly
+	// worse than the 10% it would be curing. One rule, one number, and the ini cannot widen it.
+	const double CarryFraction = FMath::Clamp(
+		static_cast<double>(UTraceSettings::Get().FireIntervalCarryFraction), 0.0, FireRateTolerance);
+	const double CarryCap = Interval * CarryFraction;
+
+	// =============================================================================================
+	// *** THE COLD-START GUARD. FOUND BY MEASUREMENT DURING INTEGRATION; THE COMMENT HERE USED TO
+	// *** CLAIM THE OPPOSITE. ***
+	// =============================================================================================
+	//
+	// This read `Now - FMath::Clamp(Overshoot, 0.0, CarryCap)` and the comment above it said "the
+	// first round of a session, of a life or of a burst has a Due far in the past and falls through
+	// to stamp now — there is no cold-start credit to bank". IT DID NOT FALL THROUGH. A Due far in
+	// the past makes Overshoot enormous, the clamp pins it to CarryCap, and the round is stamped a
+	// FULL CARRY CAP IN THE PAST — so the round AFTER it becomes due CarryCap early. At the shipped
+	// 0.2 that is 20% early: 0.2526 s on the pistol instead of 0.3158 s, and 0.0800 s on the SMG
+	// instead of 0.1000 s, which is exactly the server's FireRateTolerance floor. Every pause longer
+	// than one interval re-banked the credit, so any deliberate double-tap collected it.
+	//
+	// HOW IT WAS FOUND, because it is a good example of why two instruments beat one: Trace.Weapons.V29
+	// measures ONE long held burst and reports the mean of 56 gaps, in which a single early round is
+	// worth 0.4% and vanishes. Trace.FireRate.Measure uses five-gap windows that each START from an
+	// idle gun, and read 0.3000 s against a 0.3158 s knob (-5.0%) and 0.3796 s against 0.4000 s
+	// (-5.1%) — the same defect twice, at two different intervals, at the size this predicts:
+	// (4 x Interval + (Interval - CarryCap)) / 5.
+	//
+	// THE RULE NOW: a round may only inherit overshoot that a RUNNING clock produced. An overshoot
+	// larger than one whole interval means the gun was idle rather than running late, and idleness
+	// earns nothing. Continuous fire is untouched — its overshoot is one frame, far below Interval —
+	// so the 600 RPM the §2f fix bought is unchanged, and CarryFraction 0 is still exactly the
+	// shipped 537 RPM red arm.
+	const double Carry = (Overshoot <= Interval) ? FMath::Clamp(Overshoot, 0.0, CarryCap) : 0.0;
+	LastLocalFireTime = Now - Carry;
 }
 
 float UTraceWeaponComponent::GetShootLockoutRemaining() const
@@ -1313,6 +1473,12 @@ void UTraceWeaponComponent::StopFire()
 	// release; the facing ring, the swing wind-up and the knife rigs' visibility need it to tick on
 	// machines that never pressed anything.
 	bTriggerHeld = false;
+
+	// SPEC v29 §2b — THE RELEASE IS THE ONLY THING THAT REARMS A SEMI-AUTOMATIC WEAPON, and this is
+	// the only line that clears the latch. "It must fire once per trigger press" is therefore a fact
+	// about the press itself rather than a timer, so it cannot drift out of step with the fire rate,
+	// cannot be shortened by a low frame rate, and needs nothing to expire.
+	bTriggerConsumedThisPress = false;
 }
 
 void UTraceWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -1401,9 +1567,18 @@ void UTraceWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 	// *** THIS IS WHERE "FULL AUTO" LIVES, AND IT ALWAYS DID (spec v28 §9). *** A held trigger fires
 	// once per CanFire()-legal frame, and CanFire()'s last test is the fire-rate gate, so the cadence
 	// is exactly GetFireInterval() for whichever weapon is in hand — 0.3158 s for the pistol,
-	// 0.1 s for the SMG. There is no semi-automatic path in this codebase to opt out of and no
-	// per-weapon fire-MODE flag was needed: "full auto" is the behaviour this loop already had, and
-	// the SMG's 600 RPM is the fire interval and nothing else.
+	// 0.1 s for the SMG.
+	//
+	// *** SPEC v29 §2b PUTS A FIRE MODE IN FRONT OF IT. *** "The pistol is NOT full auto. It must
+	// fire once per trigger press. The SMG stays full auto." Until this pass there was no fire mode
+	// anywhere in the codebase and the sentence above was the whole truth — which is exactly why BOTH
+	// guns were automatic, including the one the owner has now said must not be.
+	//
+	// THE REPEAT IS WHAT THE MODE GATES, NOT THE SHOT. StartFire() still fires the first round of
+	// every press unconditionally; this loop is the only thing a semi-automatic weapon refuses. That
+	// is what makes a pistol press feel identical to an SMG press and only the SECOND round differ,
+	// and it means the fire-rate gate below is untouched: a press inside the interval is still
+	// refused by CanFire(), semi-automatic or not.
 	if (bTriggerHeld && Character->IsAlive() && !Character->IsCarrier())
 	{
 		if (IsKnifeEquipped())
@@ -1413,9 +1588,12 @@ void UTraceWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 				StartSwing();
 			}
 		}
-		else if (CanFire())
+		else if (!bTriggerConsumedThisPress || IsFullAutoNow())
 		{
-			FireOnce();
+			if (CanFire())
+			{
+				FireOnce();
+			}
 		}
 	}
 }
@@ -1511,6 +1689,19 @@ void UTraceWeaponComponent::AddRecoilPitch(APlayerController* RecoilController, 
 	bRecoilTrackingValid = true;
 }
 
+double UTraceWeaponComponent::GetRecoilPitchScale() const
+{
+	// SPEC v29 §2e. See the header for the whole argument. Two terms, added:
+	//
+	//   the GLOBAL switch   1 while bRecoilEnabled, which spec v25 §5 set to false and this pass
+	//                       leaves false. Every pawn in the shipped build scores 0 here.
+	//   ROXIE'S TRADE       RoxieModdedRecoilScale while MODDED is up, 0 otherwise, resolved through
+	//                       TraceRoxie::GetAddedRecoilScaleFor() so this function does no casting.
+	const double GlobalTerm = UTraceSettings::Get().bRecoilEnabled ? 1.0 : 0.0;
+	const double AbilityTerm = static_cast<double>(TraceRoxie::GetAddedRecoilScaleFor(GetOwner()));
+	return FMath::Max(0.0, GlobalTerm + AbilityTerm);
+}
+
 void UTraceWeaponComponent::ApplyRecoilKick()
 {
 	// =============================================================================================
@@ -1532,8 +1723,25 @@ void UTraceWeaponComponent::ApplyRecoilKick()
 	// AIM, which is this function, not that one. The muzzle flash and the tracer likewise stay.
 	//
 	// FireInterval (190 RPM) is not read anywhere in this file's recoil path and did not change.
+	//
+	// =============================================================================================
+	// SPEC v29 §2e — "Roxie's modded should add recoil now"
+	// =============================================================================================
+	//
+	// THE EARLY RETURN IS NOW A SCALE, AND bRecoilEnabled IS STILL FALSE. Demo 22's removal stands
+	// for everybody: GetRecoilPitchScale() answers 0 for every pawn in the game, and this function
+	// still returns on its first test for all of them, so nothing about §5 has been walked back.
+	// What changed is that the scale is no longer forced to be a bool — a Roxie with MODDED up adds
+	// RoxieModdedRecoilScale to it, so she and only she kicks, and only while it is up.
+	//
+	// EVERYTHING BELOW THIS POINT IS UNCHANGED AND SHARED. The growth per consecutive shot, the
+	// climb ceiling, the burst reset, the recovery and the player-compensation rule are the same
+	// eight knobs and the same code they always were; Roxie scales the KICK and does not get her own
+	// recoil model. That is what makes her trade tunable from one place and what keeps the v5 gun
+	// exactly recoverable by setting bRecoilEnabled back to true.
 	const UTraceSettings& Settings = UTraceSettings::Get();
-	if (!Settings.bRecoilEnabled)
+	const double RecoilScale = GetRecoilPitchScale();
+	if (RecoilScale <= 0.0)
 	{
 		return;
 	}
@@ -1565,7 +1773,14 @@ void UTraceWeaponComponent::ApplyRecoilKick()
 
 	// Truncated at the ceiling rather than clamped after the fact, so the view never overshoots and
 	// visibly snaps back down.
-	const double Kick = FMath::Min(FMath::Max(0.f, Settings.RecoilPitchPerShot) * Growth, Headroom);
+	//
+	// SPEC v29 §2e: RecoilScale is Roxie's trade, and it multiplies the BASE PER-SHOT KICK — which is
+	// what makes RoxieModdedRecoilScale a multiple of RecoilPitchPerShot rather than a number of
+	// degrees, and what makes retuning the base move her with it (the standing rule). The ceiling is
+	// deliberately NOT scaled: MaxPitchDegrees is how far the view is allowed to travel, which is a
+	// statement about the screen and not about the gun, so a bigger kick reaches the same ceiling
+	// sooner rather than climbing past it.
+	const double Kick = FMath::Min(FMath::Max(0.f, Settings.RecoilPitchPerShot) * Growth * RecoilScale, Headroom);
 	++RecoilBurstShotIndex;
 
 	const double PitchBefore = RecoilTrackedPitch;
@@ -1577,8 +1792,10 @@ void UTraceWeaponComponent::ApplyRecoilKick()
 	if (CVarTraceDebugRecoil.GetValueOnGameThread() != 0)
 	{
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[Recoil] shot %d of burst: kick %+.3fdeg (growth x%.2f, headroom %.3f) | pitch %+.3f -> %+.3f | climb %.3fdeg | yaw untouched"),
-			RecoilBurstShotIndex, Kick, Growth, Headroom, PitchBefore, RecoilTrackedPitch, RecoilAppliedPitch);
+			TEXT("[Recoil] shot %d of burst: kick %+.3fdeg (base %.3f x growth %.2f x scale %.2f, headroom %.3f) | "
+			     "pitch %+.3f -> %+.3f | climb %.3fdeg | yaw untouched"),
+			RecoilBurstShotIndex, Kick, Settings.RecoilPitchPerShot, Growth, RecoilScale, Headroom,
+			PitchBefore, RecoilTrackedPitch, RecoilAppliedPitch);
 	}
 }
 
@@ -1656,7 +1873,19 @@ void UTraceWeaponComponent::FireOnce()
 	// Timestamp first: this is the instant the player believes they fired, and it is what the server
 	// rewinds to. Taking it before any of the work below keeps it honest.
 	const double FireServerTime = GetServerTimeSeconds();
-	LastLocalFireTime = GetLocalTimeSeconds();
+	AdvanceFireClock();
+
+	// SPEC v29 §2b. One round per press until the trigger is released; the tick's repeat reads this.
+	bTriggerConsumedThisPress = true;
+
+	// SPEC v29 §2f. The measurement surface, off unless a harness turned it on. Recorded HERE rather
+	// than in the harness's own ticker because a ticker samples frames, and frames are precisely the
+	// thing under suspicion — a measurement that can only see frame boundaries cannot prove a fix
+	// whose entire content is not landing on them.
+	if (CVarTraceRecordShots.GetValueOnGameThread() != 0 && RecordedShotTimes.Num() < 4096)
+	{
+		RecordedShotTimes.Add(LastLocalFireTime);
+	}
 
 	if (CVarTraceShotStats.GetValueOnGameThread() != 0)
 	{
@@ -2115,7 +2344,14 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			// untouched; the SMG's 33/18/12 come from the three knobs beside SmgFireInterval. One
 			// call, resolved on the replicated selector, so the shooter's predicted zone and the
 			// server's authoritative one are still being priced by the same rule.
-			float Damage = TraceAmmo::GetZoneDamage(EquippedWeapon, Zone);
+			//
+			// SPEC v29 §2d — AND NOW THE RANGE, FOR THE SMG ONLY. The distance is measured from the
+			// muzzle the server accepted (ShotOrigin, already snapped to the shooter's rewound pose if
+			// the client's was implausible) to the impact the server resolved — so the range that is
+			// priced is the range the SERVER agrees the bullet flew, never a client-supplied number.
+			// Beyond 800 uu the SMG pays 24/15/10; the pistol reaches none of this.
+			const double ShotDistanceUU = FVector::Dist(ShotOrigin, ImpactPoint);
+			float Damage = TraceAmmo::GetZoneDamage(EquippedWeapon, Zone, ShotDistanceUU);
 
 			// SPEC v8 §6, the kill feed's headshot icon. The zone is known EXACTLY here and nowhere
 			// after: ApplyDamage takes a cause and the health component clamps at zero, so a head
@@ -2183,13 +2419,17 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	{
 		const bool bSameVictim = (LastPredictedVictim.Get() == Victim);
 		const bool bSameZone = (LastPredictedZone == Zone);
+		// SPEC v29 §2d: the RANGE and the falloff alpha ride along, because "the damage was wrong" and
+		// "the damage was right for a range I did not expect" are the two readings of the same line.
+		const double LoggedDistance = FVector::Dist(ShotOrigin, ImpactPoint);
 		UE_LOG(LogTraceGame, Display,
-			TEXT("HITZONE %s  %s: predicted %s on %s | server %s on %s (damage %.0f, rewind %.3fs)"),
+			TEXT("HITZONE %s  %s: predicted %s on %s | server %s on %s (damage %.0f at %.0fuu, falloff %.2f, rewind %.3fs)"),
 			(bSameVictim && bSameZone) ? TEXT("AGREE   ") : TEXT("DISAGREE"),
 			*GetNameSafe(Character),
 			TraceHitZoneToString(LastPredictedZone), *GetNameSafe(LastPredictedVictim.Get()),
 			TraceHitZoneToString(Zone), *GetNameSafe(Victim),
-			TraceAmmo::GetZoneDamage(EquippedWeapon, Zone),
+			TraceAmmo::GetZoneDamage(EquippedWeapon, Zone, LoggedDistance),
+			LoggedDistance, TraceAmmo::GetFalloffAlpha(EquippedWeapon, LoggedDistance),
 			ServerNow - RewindTime);
 	}
 
@@ -2491,36 +2731,32 @@ bool UTraceWeaponComponent::RequestEquip(ETraceEquippedWeapon Desired, ETraceMel
 	}
 
 	// =============================================================================================
-	// [DUALWIELD] SPEC v28 §10: THERE IS NO SUCH THING AS EQUIPPING THE KNIFE ANY MORE.
+	// *** SPEC v29 §5 — THE KNIFE SELECTOR VALUE IS THE *STOWED* STATE. THE v28 §10 NO-OP IS GONE. ***
 	// =============================================================================================
 	//
-	// The blade is permanently in the off hand, so a request for it is a request for something the
-	// pawn already has. It SUCCEEDS AS A NO-OP — true, no pullout, no state change — and the choice
-	// of "true" rather than "false, WrongWeapon" is deliberate and load-bearing:
+	// v28 §10 made the blade permanent in the off hand, so "equip the knife" asked for something the
+	// pawn already had, and this function answered it with `return true` and no state change. That
+	// was correct for exactly one pass. v29 §5 gives ETraceEquippedWeapon::Knife a NEW meaning —
+	// "no firearm is out" — and the early-out was therefore refusing the only thing the 1 key now
+	// does. It was MEASURED refusing it: Trace.Stow.Verify read "key 1 (STOW GUNS) reaches KNIFE
+	// (selector reads PISTOL)" with everything else on that path already in place.
 	//
-	//   * Chut's E (TraceAbilitySetChut.cpp) equips the knife as part of its verification path and
-	//     asserts the return value. Refusing would report a broken ability that is not broken.
-	//   * "Give me the knife" is SATISFIED. Returning false would mean "you do not have a knife",
-	//     which is the opposite of what dual-wield guarantees.
+	// So a knife request now falls through to the SAME legality gates and the SAME pullout as a gun
+	// request, because it is the same kind of request: put one thing away and bring another up.
+	// TraceMelee::ShouldUseKnifeMovementProfile reads the selector for "is a FIREARM out", which is
+	// what pays the +22%; ApplyEquip's magazine swap is firearm-to-firearm only, so stowing still
+	// leaves both clips exactly where they were.
 	//
-	// It is checked BEFORE the legality gates for the same reason RequestEquipIfDifferent checks its
-	// own early-out first: nothing was asked for, so there is no refusal reason worth logging.
+	// THE TWO CALLERS THAT ASKED FOR THE KNIFE AND ASSERTED THE RETURN VALUE STILL PASS, and both
+	// were checked rather than assumed:
+	//   * Chut's E (TraceAbilitySetChut.cpp) wants a blade to swing. It gets one — and now also
+	//     stows the gun for the 0.2 s it takes to swing, which is what a knife ability should do.
+	//     RequestEquip returns true through the normal path for a live, non-carrying pawn.
+	//   * Modes/TracePracticeVerify.cpp's KNIFEBACK step already asserts TraceMelee::IsKnifeInHand()
+	//     rather than the selector (the v28 §10 owner fixed it), which is true in all three states.
 	//
-	// *** KNOWN, REPORTED CONSEQUENCE: *** a caller that asks for the knife and then asserts
-	// IsKnifeEquipped() will now see false. Exactly one place does that —
-	// Modes/TracePracticeVerify.cpp's KNIFEBACK step — and it is another ownership slice. The one-line
-	// fix there is to assert TraceMelee::IsKnifeInHand() instead, which is true under both switch
-	// positions.
-	if (Desired == ETraceEquippedWeapon::Knife && TraceMelee::IsDualWieldEnabled())
-	{
-		if (TraceMelee::IsDebugLoggingEnabled())
-		{
-			UE_LOG(LogTraceGame, Display,
-				TEXT("[Knife] %s asked for the knife under dual-wield: already in the off hand, no pullout."),
-				*GetNameSafe(Character));
-		}
-		return true;
-	}
+	// The old comment's "a caller that asserts IsKnifeEquipped() will see false" hazard is retired:
+	// under v29 §5 IsKnifeEquipped() means "guns stowed" and is TRUE after this call.
 
 	if (!Character->IsAlive())
 	{
@@ -2773,18 +3009,19 @@ void UTraceWeaponComponent::ServerRequestEquip_Implementation(ETraceEquippedWeap
 		return;
 	}
 
-	// [DUALWIELD] The client's own RequestEquip turns a knife request into a no-op and never sends
-	// this RPC for one — so reaching here with Knife means a modified client. Refused rather than
-	// applied: letting it through would put the SERVER's copy of that pawn into a state no honest
-	// client can be in, and the selector is replicated to everyone, so it would strand the pawn
-	// weaponless on every machine in the match.
-	if (Desired == ETraceEquippedWeapon::Knife && TraceMelee::IsDualWieldEnabled())
-	{
-		UE_LOG(LogTraceGame, Verbose,
-			TEXT("ServerRequestEquip: refusing a KNIFE equip for %s — dual-wield is on, the blade is always held."),
-			*GetNameSafe(OwnerActor));
-		return;
-	}
+	// *** SPEC v29 §5 — THE MATCHING REFUSAL IS GONE, FOR THE SAME REASON THE CLIENT'S NO-OP IS. ***
+	//
+	// This refused a Knife equip on the grounds that no honest client could ask for one (the client's
+	// RequestEquip turned it into a no-op and never sent the RPC). Under v29 §5 the 1 key sends
+	// exactly this RPC for exactly this value, so the guard was rejecting the honest case: the
+	// client predicted "stowed", the server refused, and the replicated selector snapped the guns
+	// back out. Nothing about it was a security gate — ValidateEquipRequest already lists Knife as a
+	// value this build recognises (it must, or a modified client sending it would be DISCONNECTED),
+	// and the real gates (alive, not carrying, clamped press stamp) are below and untouched.
+	//
+	// "Weaponless" was the old worry and it is not reachable: the blade is permanent under
+	// dual-wield, so the stowed state is knife-only, not empty-handed, and CanFire's
+	// `if (!IsFirearmEquipped()) return false;` is what makes it a trade rather than a bug.
 
 	// The SAME gates the client applied, re-asked here. The client's claim is only ever "I pressed
 	// swap"; whether that is legal is decided once, here.
@@ -3929,14 +4166,21 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 	//
 	//   bBladeVisible   the knife is on screen whenever the pawn is ALIVE, rather than whenever the
 	//                   knife is the selected weapon. Under the switch it is always in the off hand.
-	//   bHideGun        the gun is hidden only in the legacy build. This is the ONE thing that would
-	//                   otherwise still make dual-wield impossible to see: SetGunViewModelHidden is
-	//                   re-asserted every tick by design (that re-assert IS the v12 §7 fix), so a
-	//                   single stale `true` here would erase the gun sixty times a second no matter
-	//                   what anything else did.
+	//   bHideGun        the gun is hidden whenever the selector is on the knife. This is the ONE
+	//                   thing that would otherwise still make dual-wield impossible to see:
+	//                   SetGunViewModelHidden is re-asserted every tick by design (that re-assert IS
+	//                   the v12 §7 fix), so a single stale `true` here would erase the gun sixty
+	//                   times a second no matter what anything else did.
+	//
+	// *** SPEC v29 §5: THE `!bDualWield` QUALIFIER IS GONE. *** It read "the gun is hidden only in
+	// the legacy build", which was right while the selector could never hold Knife under dual-wield.
+	// Now the 1 key puts it there deliberately and the state MUST be visible — a player who stows
+	// their guns and still sees a pistol on screen has no way to tell whether the press registered,
+	// and the +22% they are being paid is invisible. bKnife is now the whole test in both switch
+	// positions, which also collapses the two arms of this line into one rule.
 	const bool bDualWield = TraceMelee::IsDualWieldEnabled();
 	const bool bBladeVisible = bDualWield ? bAlive : (bKnife && bAlive);
-	const bool bHideGun = !bDualWield && bKnife && bAlive;
+	const bool bHideGun = bKnife && bAlive;
 
 	// WHERE THE BLADE RESTS. Under the switch it hangs in ATraceCharacter's off hand (asked for, never
 	// copied — see GetViewModelOffHand); in the legacy build it sits at the rig root, exactly where
@@ -6627,6 +6871,34 @@ namespace TraceWeaponsV28
 			S.SmgFireInterval, S.SmgClipSize, S.SmgReloadSeconds, TEXT("HBL"),
 			S.SmgHeadDamage, S.SmgBodyDamage, S.SmgLegDamage);
 
+		// --- SPEC v29: everything this pass moved, printed beside what it used to be ---------------
+		UE_LOG(LogTraceGame, Display,
+			TEXT("v29 2d : SMG past %.0fuu pays %.0f/%.0f/%.0f (was %.0f/%.0f/%.0f) | %s | falloff=%s   [SMG ONLY]"),
+			S.SmgFalloffStartUU,
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Head, S.SmgFalloffStartUU + 1.0),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Body, S.SmgFalloffStartUU + 1.0),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Legs, S.SmgFalloffStartUU + 1.0),
+			S.SmgHeadDamage, S.SmgBodyDamage, S.SmgLegDamage,
+			(S.SmgFalloffRampUU <= UE_KINDA_SMALL_NUMBER)
+				? TEXT("CLIFF (SmgFalloffRampUU=0 — the shipped choice)")
+				: TEXT("RAMP (SmgFalloffRampUU > 0)"),
+			S.bSmgDamageFalloff ? TEXT("ON") : TEXT("OFF (RED ARM)"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("v29 2b : fire mode — pistol %s, SMG %s. Roxie MODDED forces full auto: %s"),
+			S.bPistolFullAuto ? TEXT("FULL AUTO (RED ARM)") : TEXT("SEMI (one shot per press)"),
+			S.bSmgFullAuto ? TEXT("FULL AUTO") : TEXT("SEMI (RED ARM)"),
+			S.bRoxieModdedFullAuto ? TEXT("yes") : TEXT("no"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("v29 2f : fire-clock carry %.2f of an interval (%.4fs for the SMG, %.4fs for the pistol). "
+			     "0 = the 537 RPM bug. Measure it with Trace.Weapons.V29 under -UseFixedTimeStep -FPS=54."),
+			S.FireIntervalCarryFraction, S.FireIntervalCarryFraction * SmgInterval,
+			S.FireIntervalCarryFraction * PistolInterval);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("v29 2e : recoil master switch %s; Roxie MODDED adds x%.2f of RecoilPitchPerShot (%.3f deg) "
+			     "= %.3f deg on the first round of her burst"),
+			S.bRecoilEnabled ? TEXT("ON") : TEXT("OFF (Demo 22, unchanged)"),
+			S.RoxieModdedRecoilScale, S.RecoilPitchPerShot, S.RoxieModdedRecoilScale * S.RecoilPitchPerShot);
+
 		// The owner's six numbers, asserted rather than printed and hoped over.
 		List.Check(TEXT("s9: SMG head damage is 33"),
 			FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Head), 33.f, 0.01f),
@@ -6643,24 +6915,66 @@ namespace TraceWeaponsV28
 		List.Check(TEXT("s9: SMG clip is 40"),
 			TraceAmmo::GetClipSize(ETraceEquippedWeapon::Smg) == 40,
 			FString::Printf(TEXT("resolved %d"), TraceAmmo::GetClipSize(ETraceEquippedWeapon::Smg)));
-		List.Check(TEXT("s9: SMG reload is 0.8s"),
-			FMath::IsNearlyEqual(TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Smg), 0.8f, 0.001f),
+		// *** 0.8 -> 1.3 THIS PASS. SPEC v29 §2c. *** The assertion moved with the knob rather than
+		// being loosened: a test that stops naming a number stops being able to catch the ini and the
+		// header drifting apart, which is the whole reason this row exists.
+		List.Check(TEXT("v29 2c: SMG reload is 1.3s (was 0.8)"),
+			FMath::IsNearlyEqual(TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Smg), 1.3f, 0.001f),
 			FString::Printf(TEXT("resolved %.3fs"), TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Smg)));
+
+		// --- SPEC v29 §2d, ASSERTED EITHER SIDE OF THE LINE ---------------------------------------
+		//
+		// One uu inside and one uu outside, which is the only test that can tell a cliff at 800 from a
+		// cliff at 700, from a ramp, and from a falloff that never fires. The near table is re-checked
+		// AT the boundary and not just at zero, because "<= Start" versus "< Start" is exactly the kind
+		// of off-by-one that a point-blank-only test cannot see.
+		{
+			const float Start = S.SmgFalloffStartUU;
+			const float NearHead = TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Head, Start);
+			const float FarHead  = TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Head, Start + 1.0);
+			const float FarBody  = TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Body, Start + 1.0);
+			const float FarLegs  = TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Smg, ETraceHitZone::Legs, Start + 1.0);
+
+			List.Check(TEXT("v29 2d: the falloff starts at 800uu, and 800 itself still pays the NEAR table"),
+				FMath::IsNearlyEqual(Start, 800.f, 0.01f) && FMath::IsNearlyEqual(NearHead, 33.f, 0.01f),
+				FString::Printf(TEXT("start %.1fuu, head at exactly the start %.2f"), Start, NearHead));
+			List.Check(TEXT("v29 2d: past 800uu the SMG pays 24 / 15 / 10"),
+				FMath::IsNearlyEqual(FarHead, 24.f, 0.01f)
+				&& FMath::IsNearlyEqual(FarBody, 15.f, 0.01f)
+				&& FMath::IsNearlyEqual(FarLegs, 10.f, 0.01f),
+				FString::Printf(TEXT("at %.0fuu: %.2f / %.2f / %.2f"), Start + 1.f, FarHead, FarBody, FarLegs));
+			List.Check(TEXT("v29 2d: it is a CLIFF — the drop is complete one uu past the line"),
+				FMath::IsNearlyZero(S.SmgFalloffRampUU, 0.001f)
+				&& FMath::IsNearlyEqual(TraceAmmo::GetFalloffAlpha(ETraceEquippedWeapon::Smg, Start + 1.0), 1.f, 0.001f),
+				FString::Printf(TEXT("SmgFalloffRampUU=%.1f, alpha one uu past the line = %.3f"),
+					S.SmgFalloffRampUU, TraceAmmo::GetFalloffAlpha(ETraceEquippedWeapon::Smg, Start + 1.0)));
+
+			// *** SMG ONLY, MEASURED AT A RANGE NO ARENA CONTAINS. *** §2d: "Only the SMG; the pistol
+			// is unchanged." A pistol priced at 30000 uu must still pay its close-range table.
+			List.Check(TEXT("v29 2d: the PISTOL has no falloff at any range"),
+				FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Head, 30000.0), 100.f, 0.01f)
+				&& FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Body, 30000.0), 40.f, 0.01f)
+				&& FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs, 30000.0), 25.f, 0.01f)
+				&& FMath::IsNearlyZero(TraceAmmo::GetFalloffAlpha(ETraceEquippedWeapon::Gun, 30000.0), 0.001f),
+				FString::Printf(TEXT("pistol at 30000uu: %.0f / %.0f / %.0f"),
+					TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Head, 30000.0),
+					TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Body, 30000.0),
+					TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs, 30000.0)));
+		}
 
 		// THE PISTOL MUST NOT HAVE MOVED. A second weapon that quietly retunes the first is the most
 		// likely way this item could ship wrong, and it is invisible without this check.
 		//
-		// *** THE LEG NUMBER IS DELIBERATELY NOT ASSERTED, AND THE REASON IS A FINDING RATHER THAN AN
-		// OMISSION. *** Spec v28 §9's comparison table prints the pistol as 100/40/25, and so does
-		// every comment in this file — but the running game resolves LEG = 30
-		// (UTraceDamageSettings::LegDamage, and the matching key in Config/DefaultGame.ini). That
-		// predates this pass by several specs and belongs to the damage-model slice, so it is
-		// REPORTED, not silently "corrected" here: asserting 25 would fail a build that is behaving
-		// as its own config says, and asserting 30 would bake a number the spec contradicts into a
-		// test. The value is printed on the PISTOL line above so it cannot go unnoticed again.
-		List.Check(TEXT("s9: the PISTOL is untouched — 100 head, 40 body, 0.315789s, 30 rounds, 0.5s"),
+		// *** THE LEG NUMBER IS NOW ASSERTED, AND THAT IS SPEC v29 §2a. *** This row used to carry a
+		// note explaining why it could not: every spec table printed the pistol as 100/40/25 while the
+		// running game resolved LEG = 30, and asserting either number would have baked a guess into a
+		// test. The owner has answered — 25 — so UTraceDamageSettings::LegDamage is 25 in the header
+		// AND in the new [/Script/Trace.TraceDamageSettings] block in DefaultGame.ini, and the
+		// contradiction is closed rather than annotated.
+		List.Check(TEXT("v29 2a: the PISTOL is 100 head, 40 body, 25 LEG, 0.315789s, 30 rounds, 0.5s"),
 			FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Head), 100.f, 0.01f)
 			&& FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Body), 40.f, 0.01f)
+			&& FMath::IsNearlyEqual(TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs), 25.f, 0.01f)
 			&& FMath::IsNearlyEqual(PistolInterval, 0.315789f, 0.0005f)
 			&& TraceAmmo::GetClipSize(ETraceEquippedWeapon::Gun) == 30
 			&& FMath::IsNearlyEqual(TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Gun), 0.5f, 0.001f),
@@ -6670,6 +6984,18 @@ namespace TraceWeaponsV28
 				TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs),
 				PistolInterval, TraceAmmo::GetClipSize(ETraceEquippedWeapon::Gun),
 				TraceAmmo::GetReloadSeconds(ETraceEquippedWeapon::Gun)));
+
+		// *** THE FOUR-SHOT LEG KILL, ASSERTED RATHER THAN ASSUMED. *** 25 x 4 = 100 and MaxHealth is
+		// 100, so the fourth round is still fatal — but with nothing to spare, where 30 had 20 uu of
+		// slack. If MaxHealth ever moves up without this number moving, this is the row that says so
+		// before a playtest does.
+		List.Check(TEXT("v29 2a: four pistol leg shots still kill a full-health player"),
+			TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs) * 4.f
+				>= UTraceSettings::Get().MaxHealth - 0.01f,
+			FString::Printf(TEXT("4 x %.0f = %.0f vs MaxHealth %.0f"),
+				TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs),
+				TraceAmmo::GetZoneDamage(ETraceEquippedWeapon::Gun, ETraceHitZone::Legs) * 4.f,
+				UTraceSettings::Get().MaxHealth));
 
 		return List.Failed;
 	}
@@ -6841,10 +7167,34 @@ namespace TraceWeaponsV28
 			{
 			case 0:
 			{
-				// Through the SHIPPED direct-select verb the "2" key calls, not a poke at the member.
+				// =====================================================================================
+				// *** SPEC v29 §5 SHIFTED THE KEYS UNDER THIS BLOCK. THE FIXTURE IS REPAIRED, NOT THE
+				// *** GAME. ***
+				// =====================================================================================
+				//
+				// v28 §10 remapped 1 and 2 onto PISTOL and SMG. v29 §5 replaces that with 1 = STOW
+				// GUNS, 2 = PISTOL, 3 = SMG, so this block asked for ETraceEquippedWeapon::Gun and
+				// called the answer "the SMG", then asked for ::Knife and called the answer "the
+				// PISTOL". Both are now wrong by one key, and every §9 MAGAZINE assertion downstream
+				// inherited the error: the run reported 6 failures, all of them the harness reading
+				// the previous pass's keyboard. Measured before touching anything —
+				// "s10: the \"1\" key (EquipKnife) selects the PISTOL (weapon=KNIFE)" is a harness
+				// failing a build that is behaving exactly as v29 §5 specifies.
+				//
+				// WHAT IS KEPT IS THE PART WORTH KEEPING. Spec v28 §9's "each gun keeps its own
+				// magazine" is a real invariant and this is the only staged test of it, so the walk
+				// still spends rounds from one gun, swaps away and swaps back — it just does it
+				// between the two FIREARMS (2 and 3) instead of between a firearm and the stowed
+				// state, which is what those two keys now mean. ApplyEquip's magazine exchange is
+				// firearm-to-firearm by construction, so this is also the only pair that ever
+				// exercised it.
+				//
+				// The 1 key is deliberately NOT re-tested here: Trace.Stow.Verify covers all three
+				// states, the boost, the movement bit and the knife, and a second half-copy of that
+				// is how two harnesses end up disagreeing about the same rule.
 				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
-				const bool bAsked = TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Gun, &Refusal);
-				State->List.Check(TEXT("s10: the \"2\" key (EquipGun) selects the SMG under dual-wield"),
+				const bool bAsked = TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Smg, &Refusal);
+				State->List.Check(TEXT("v29 s5: the \"3\" key (EquipSmg) selects the SMG"),
 					bAsked || W->IsSmgEquipped(),
 					FString::Printf(TEXT("asked=%d refusal=%s"), bAsked ? 1 : 0, LexToString(Refusal)));
 				State->Advance(NowReal, TraceMelee::GetSwapSeconds() + 0.25);
@@ -6874,14 +7224,14 @@ namespace TraceWeaponsV28
 					FString::Printf(TEXT("40 - 7 = %d"), W->DebugGetAuthoritativeClipAmmo()));
 
 				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
-				TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Knife, &Refusal);   // the "1" key
+				TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Gun, &Refusal);     // the "2" key (v29 s5: PISTOL)
 				State->Advance(NowReal, TraceMelee::GetSwapSeconds() + 0.25);
 				break;
 			}
 
 			case 2:
 			{
-				State->List.Check(TEXT("s10: the \"1\" key (EquipKnife) selects the PISTOL under dual-wield"),
+				State->List.Check(TEXT("v29 s5: the \"2\" key (EquipPistol) selects the PISTOL"),
 					W->GetEquippedWeapon() == ETraceEquippedWeapon::Gun,
 					FString::Printf(TEXT("weapon=%s"), LexToString(W->GetEquippedWeapon())));
 				State->List.Check(TEXT("s9: the pistol came back with ITS OWN full 30, not the SMG's count"),
@@ -6889,7 +7239,7 @@ namespace TraceWeaponsV28
 					FString::Printf(TEXT("clip=%d/%d"), W->DebugGetAuthoritativeClipAmmo(), W->GetClipSize()));
 
 				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
-				TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Gun, &Refusal);     // back to the SMG
+				TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Smg, &Refusal);     // the "3" key, back to the SMG
 				State->Advance(NowReal, TraceMelee::GetSwapSeconds() + 0.25);
 				break;
 			}
@@ -6987,5 +7337,759 @@ static FAutoConsoleCommand GTraceWeaponsV28Cmd(
 	     "magazine, then swing and measure the shooting lockout against SwingAnimSeconds — with the v28 switch "
 	     "itself as the RED arm."),
 	FConsoleCommandDelegate::CreateStatic(&TraceWeaponsV28::Run));
+
+
+// =================================================================================================
+// Trace.Weapons.V29 — the unattended proof for spec v29 §2.
+//
+// FIVE ITEMS, AND FOUR OF THEM ARE MEASURED RATHER THAN READ BACK.
+//
+//   2a  the pistol's leg shot is 25            asserted in TraceWeaponsV28::DumpAndCheckNumbers,
+//                                              which now names the number instead of explaining why
+//                                              it could not.
+//   2b  the pistol is NOT full auto            MEASURED: hold the trigger for four pistol intervals
+//                                              and count the rounds that left. RED ARM:
+//                                              bPistolFullAuto=True, same hold, same count.
+//   2c  the SMG reloads in 1.3 s               asserted in the same table.
+//   2d  the SMG falls off past 800 uu          asserted one uu either side of the line, plus the
+//                                              pistol at 30000 uu as the "SMG only" control.
+//   2e  Roxie's MODDED adds recoil             MEASURED: the actual CONTROL PITCH climb over a live
+//                                              burst on a live Roxie with MODDED up. RED ARM:
+//                                              RoxieModdedRecoilScale=0, same burst.
+//   2f  the SMG fires at 600 RPM, not 537      MEASURED over 40+ consecutive rounds of ONE held
+//                                              trigger, at a PINNED FRAME RATE, with the shipped
+//                                              build's own behaviour (carry 0) as the RED ARM.
+//
+// *** WHY THE FRAME RATE IS PINNED, AND WHY THAT IS THE OPPOSITE OF CHEATING. *** §2f is a frame
+// quantisation bug: the old code stamped the FRAME a round left on, not the instant it was due, so
+// the cadence was dt * ceil(Interval / dt). That expression is exactly 0.1 s whenever dt divides
+// 0.1 s — at 60 fps (6 frames), at 100, at 50, at 20 — so on a machine sitting at 60 fps the bug is
+// INVISIBLE and a harness run there would report a clean 600 RPM before the fix and after it. The
+// owner measured 0.1117 s, which is 6 x 1/53.7: their machine was at ~54 fps. So the harness pins
+// t.MaxFPS to a rate whose frame time does NOT divide the interval, reproduces the reported number
+// first, and only then measures the fix. Un-pinning it is what would make the run meaningless.
+//
+// *** AND IT IS WHY THE EXISTING HARNESS NEVER CAUGHT THIS. *** Trace.FireRate.Measure asserts the
+// measured interval to within 12%, with a comment saying the tolerance "covers the frame
+// quantisation at both ends of a ~7-round window". 537 RPM is 10.5% off 600. The bug fitted inside
+// the tolerance that was written to accommodate it, on a 7-round window. This one measures 40+
+// rounds and asserts 1.5%, which is what makes it able to fail.
+// =================================================================================================
+
+namespace TraceWeaponsV29
+{
+	using TraceWeaponsV28::FindLocalPawn;
+
+	/** One assertion, printed the moment it is made, exactly as the v28 list does. */
+	struct FChecklist
+	{
+		int32 Passed = 0;
+		int32 Failed = 0;
+
+		void Check(const TCHAR* What, bool bOk, const FString& Detail)
+		{
+			if (bOk) { ++Passed; } else { ++Failed; }
+			UE_LOG(LogTraceGame, Display, TEXT("[V29] %s  %s  (%s)"),
+				bOk ? TEXT("PASS") : TEXT("**FAIL**"), What, *Detail);
+		}
+	};
+
+	/** Seconds of held trigger per fire-rate window. 8 s of SMG is ~62 rounds, ~2 magazines. */
+	constexpr double RateWindowSeconds = 8.0;
+
+	/** At least this many usable gaps or the window is not evidence. §2f: "at least 40 rounds". */
+	constexpr int32 MinIntervalSamples = 40;
+
+	/**
+	 * The frame rate the fire-rate window is pinned to.
+	 *
+	 * 53.7 fps is the owner's machine, recovered from their own number: 0.1117 / 6 = 0.018617 s. The
+	 * harness uses 54, whose frame time (0.018519 s) also fails to divide 0.1 s — 6 frames = 0.1111 s
+	 * = 540 RPM — so the RED arm reproduces the report to within 3 RPM and the GREEN arm has somewhere
+	 * to move to. Any rate whose period does not divide the interval would do; this one is the
+	 * reported one.
+	 */
+	constexpr float RateWindowFPS = 54.f;
+
+	/** One measured distribution. A mean alone cannot tell a slow gun from a stuttering one. */
+	struct FStats
+	{
+		int32  Samples = 0;
+		int32  Dropped = 0;        // gaps discarded as reload-spanning
+		double Mean = 0.0;
+		double Min = 0.0;
+		double Max = 0.0;
+		double StdDev = 0.0;
+		double MeanFrameSeconds = 0.0;
+
+		double RPM() const { return (Mean > 0.0) ? (60.0 / Mean) : -1.0; }
+		bool IsUsable() const { return Samples >= MinIntervalSamples; }
+	};
+
+	/**
+	 * Turns a list of shot stamps into a distribution.
+	 *
+	 * @param DropAbove  gaps longer than this are RELOADS, not cadence, and are counted separately
+	 *                   rather than averaged in. Passing 0 keeps every gap.
+	 *
+	 * The exclusion is stated in the report as a number, never silently: "39 gaps, 1 dropped" is a
+	 * full magazine and a reload, and any other pattern of drops is itself the finding.
+	 */
+	FStats Summarise(const TArray<double>& Stamps, double DropAbove)
+	{
+		FStats Out;
+		TArray<double> Gaps;
+		Gaps.Reserve(FMath::Max(0, Stamps.Num() - 1));
+		for (int32 Index = 1; Index < Stamps.Num(); ++Index)
+		{
+			const double Gap = Stamps[Index] - Stamps[Index - 1];
+			if (DropAbove > 0.0 && Gap > DropAbove)
+			{
+				++Out.Dropped;
+				continue;
+			}
+			Gaps.Add(Gap);
+		}
+
+		Out.Samples = Gaps.Num();
+		if (Out.Samples == 0)
+		{
+			return Out;
+		}
+
+		Out.Min = TNumericLimits<double>::Max();
+		Out.Max = 0.0;
+		double Sum = 0.0;
+		for (const double Gap : Gaps)
+		{
+			Sum += Gap;
+			Out.Min = FMath::Min(Out.Min, Gap);
+			Out.Max = FMath::Max(Out.Max, Gap);
+		}
+		Out.Mean = Sum / static_cast<double>(Out.Samples);
+
+		double SumSq = 0.0;
+		for (const double Gap : Gaps)
+		{
+			SumSq += (Gap - Out.Mean) * (Gap - Out.Mean);
+		}
+		Out.StdDev = FMath::Sqrt(SumSq / static_cast<double>(Out.Samples));
+		return Out;
+	}
+
+	void LogStats(const TCHAR* Arm, const FStats& S, double ExpectedInterval)
+	{
+		if (!S.IsUsable())
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[V29] %-24s NOT EVIDENCE — only %d usable gaps (needed %d). Was the trigger held? Was the "
+				     "pawn alive, un-stowed and not carrying the Core?"),
+				Arm, S.Samples, MinIntervalSamples);
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[V29] %-24s %d gaps (%d dropped as reloads) | mean %.5fs = %.1f RPM | min %.5f max %.5f "
+			     "sd %.5f | expected %.5fs = %.1f RPM | error %+.2f%% | frame %.5fs = %.1f fps"),
+			Arm, S.Samples, S.Dropped, S.Mean, S.RPM(), S.Min, S.Max, S.StdDev,
+			ExpectedInterval, 60.0 / FMath::Max(1.0e-6, ExpectedInterval),
+			100.0 * (S.Mean - ExpectedInterval) / FMath::Max(1.0e-6, ExpectedInterval),
+			S.MeanFrameSeconds, 1.0 / FMath::Max(1.0e-6, S.MeanFrameSeconds));
+	}
+
+	/** Everything the run has to put back, however it exits. */
+	struct FRestore
+	{
+		float CarryFraction = 0.2f;
+		bool  bPistolFullAuto = false;
+		float RoxieRecoil = 1.f;
+		int32 RecordShots = 0;
+		float MaxFPS = 0.f;
+		ETraceCharacterId Character = ETraceCharacterId::None;
+		bool  bCharacterChanged = false;
+	};
+
+	void SetCVarInt(const TCHAR* Name, int32 Value)
+	{
+		if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name))
+		{
+			Var->Set(Value, ECVF_SetByConsole);
+		}
+	}
+
+	float GetCVarFloat(const TCHAR* Name, float Fallback)
+	{
+		const IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name);
+		return (Var != nullptr) ? Var->GetFloat() : Fallback;
+	}
+
+	void SetCVarFloat(const TCHAR* Name, float Value)
+	{
+		if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name))
+		{
+			Var->Set(Value, ECVF_SetByConsole);
+		}
+	}
+
+	struct FState
+	{
+		int32  Step = 0;
+
+		/**
+		 * *** THE WORLD CLOCK, NOT THE WALL CLOCK, AND THAT IS LOAD-BEARING. *** Every gate this
+		 * harness measures — the fire rate, MODDED's 5 s, the reload — is on UWorld::GetTimeSeconds,
+		 * and under -UseFixedTimeStep (which is how the fire-rate windows are meant to be run) the
+		 * two clocks diverge by whatever the machine's real frame rate happens to be. A wall-clock
+		 * schedule would then hold the trigger for 5 s of MODDED and call it 0.7.
+		 */
+		double NextStepWorldTime = 0.0;
+		double WindowStartWorld = 0.0;
+		int32  WindowStartFrame = 0;
+		FChecklist List;
+		FRestore Restore;
+
+		FStats RedRate;      // §2f, carry 0 — the shipped 537 RPM behaviour
+		FStats GreenRate;    // §2f, carry as shipped
+		double ExpectedSmgInterval = 0.1;
+
+		int32  SemiRounds = -1;    // §2b, pistol, one held trigger
+		int32  AutoRounds = -1;    // §2b RED ARM, same hold with bPistolFullAuto on
+		int32  RearmRounds = -1;   // §2b, release and press again
+
+		double RoxieClimbGreen = -1.0;   // §2e, degrees of control pitch gained over a burst
+		double RoxieClimbRed = -1.0;     // §2e RED ARM, RoxieModdedRecoilScale 0
+		double RoxieScaleSeen = -1.0;
+		bool   bRoxieStaged = false;
+		bool   bRoxieFullAutoOnPistol = false;
+
+		FTSTicker::FDelegateHandle Handle;
+
+		void Advance(double NowWorld, double Seconds) { NextStepWorldTime = NowWorld + Seconds; ++Step; }
+	};
+
+	/** Puts every knob and cvar back, whatever happened. Called from every exit. */
+	void RestoreAll(const TSharedRef<FState>& State)
+	{
+		if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+		{
+			Mutable->FireIntervalCarryFraction = State->Restore.CarryFraction;
+			Mutable->bPistolFullAuto           = State->Restore.bPistolFullAuto;
+			Mutable->RoxieModdedRecoilScale    = State->Restore.RoxieRecoil;
+		}
+		SetCVarInt(TEXT("Trace.Weapons.RecordShots"), State->Restore.RecordShots);
+		SetCVarFloat(TEXT("t.MaxFPS"), State->Restore.MaxFPS);
+
+		// The CHARACTER is deliberately NOT put back. ServerSetCharacter enforces per-team uniqueness
+		// and a bot may have taken the original in the seconds this run took; failing to restore is
+		// visible and harmless, while a refused restore that went unreported would look like the
+		// harness had corrupted the roster. Said here rather than attempted and hoped over.
+	}
+
+	void Report(const TSharedRef<FState>& State)
+	{
+		RestoreAll(State);
+
+		UE_LOG(LogTraceGame, Display, TEXT("========== TRACE WEAPONS v29 — VERDICT =========="));
+		LogStats(TEXT("2f RED (carry 0)"), State->RedRate, State->ExpectedSmgInterval);
+		LogStats(TEXT("2f GREEN (shipped)"), State->GreenRate, State->ExpectedSmgInterval);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[V29] 2b: one held trigger on the PISTOL fired %d round(s) [expect 1]; the same hold with "
+			     "bPistolFullAuto=True fired %d [expect 3+]; releasing and pressing again fired %d more [expect 1]."),
+			State->SemiRounds, State->AutoRounds, State->RearmRounds);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[V29] 2e: Roxie MODDED climbed %.3f deg of control pitch over a burst; with "
+			     "RoxieModdedRecoilScale=0 the same burst climbed %.3f deg. Seam read x%.3f."),
+			State->RoxieClimbGreen, State->RoxieClimbRed, State->RoxieScaleSeen);
+
+		UE_LOG(LogTraceGame, Display, TEXT("[V29] %d passed, %d FAILED."), State->List.Passed, State->List.Failed);
+		UE_LOG(LogTraceGame, Display, TEXT("[V29] RESULT: %s"),
+			State->List.Failed == 0 ? TEXT("PASS") : TEXT("*** FAIL ***"));
+		UE_LOG(LogTraceGame, Display, TEXT("================================================"));
+	}
+
+	/** Begins a held-trigger window: pins the frame rate, clears the ring, holds the trigger. */
+	void BeginWindow(const TSharedRef<FState>& State, UTraceWeaponComponent* W, UWorld* WorldPtr)
+	{
+		SetCVarFloat(TEXT("t.MaxFPS"), RateWindowFPS);
+		SetCVarInt(TEXT("Trace.Weapons.RecordShots"), 1);
+		W->ClearRecordedShotTimes();
+		State->WindowStartWorld = WorldPtr->GetTimeSeconds();
+		State->WindowStartFrame = static_cast<int32>(GFrameCounter);
+		W->StartFire();
+	}
+
+	/** Ends it and summarises, folding in the frame time the window actually ran at. */
+	FStats EndWindow(const TSharedRef<FState>& State, UTraceWeaponComponent* W, UWorld* WorldPtr, double DropAbove)
+	{
+		W->StopFire();
+		FStats Out = Summarise(W->GetRecordedShotTimes(), DropAbove);
+
+		const int32 Frames = FMath::Max(1, static_cast<int32>(GFrameCounter) - State->WindowStartFrame);
+		Out.MeanFrameSeconds = (WorldPtr->GetTimeSeconds() - State->WindowStartWorld) / static_cast<double>(Frames);
+		return Out;
+	}
+
+	void Run()
+	{
+		ATraceCharacter* Pawn = FindLocalPawn();
+		UTraceWeaponComponent* Weapon = (Pawn != nullptr) ? Pawn->Weapon.Get() : nullptr;
+		if (Pawn == nullptr || Weapon == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[V29] No local pawn with a weapon component yet. Run this from a live match; the character "
+				     "select screen holds the pawn back for the first few seconds."));
+			return;
+		}
+		if (!Pawn->HasAuthority())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[V29] SERVER ONLY (a listen host's own pawn counts). The magazine, the ability seam and the "
+				     "recoil arm all read authoritative state a client does not own."));
+			return;
+		}
+
+		TSharedRef<FState> State = MakeShared<FState>();
+
+		const UTraceSettings& Live = UTraceSettings::Get();
+		State->Restore.CarryFraction   = Live.FireIntervalCarryFraction;
+		State->Restore.bPistolFullAuto = Live.bPistolFullAuto;
+		State->Restore.RoxieRecoil     = Live.RoxieModdedRecoilScale;
+		State->Restore.MaxFPS = GetCVarFloat(TEXT("t.MaxFPS"), 0.f);
+		if (const IConsoleVariable* Rec = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Weapons.RecordShots")))
+		{
+			State->Restore.RecordShots = Rec->GetInt();
+		}
+
+		// --- the half that needs no ticking: every number this pass moved --------------------------
+		TraceWeaponsV28::FChecklist Table;
+		TraceWeaponsV28::DumpAndCheckNumbers(Table);
+		State->List.Check(TEXT("v29 2a/2c/2d: every table number resolves to the spec's value"),
+			Table.Failed == 0,
+			FString::Printf(TEXT("%d passed, %d failed in the table above"), Table.Passed, Table.Failed));
+
+		// THE SEAM, WITHOUT FIRING A ROUND. On an ordinary pawn the recoil scale must be exactly the
+		// global switch's contribution — which is 0, because Demo 22 removed recoil. If this reads
+		// anything else, §2e has leaked out of Roxie and onto everybody.
+		State->List.Check(TEXT("v29 2e: an ordinary pawn still has NO recoil (Demo 22 stands)"),
+			FMath::IsNearlyZero(Weapon->GetRecoilPitchScale(), 0.0001)
+			&& !UTraceSettings::Get().bRecoilEnabled,
+			FString::Printf(TEXT("scale %.4f, bRecoilEnabled=%d"),
+				Weapon->GetRecoilPitchScale(), UTraceSettings::Get().bRecoilEnabled ? 1 : 0));
+
+		State->ExpectedSmgInterval = static_cast<double>(TraceAmmo::GetBaseFireInterval(ETraceEquippedWeapon::Smg));
+
+		// *** SAY WHICH INSTRUMENT IS IN USE, BECAUSE THEY ARE NOT EQUALLY GOOD. ***
+		//
+		//   -UseFixedTimeStep -FPS=54   every frame advances the world by exactly 1/54 s whatever the
+		//                               machine is doing, so the measurement is immune to whatever
+		//                               else is running. THIS IS THE ONE TO USE. The gun gates on
+		//                               UWorld::GetTimeSeconds, which is exactly what this pins.
+		//   t.MaxFPS 54                 a CEILING on the real frame rate, and a busy machine simply
+		//                               fails to reach it. A first run of this harness measured
+		//                               49.5 fps against a 54 pin because another process had the CPU
+		//                               — and 49.5 is below the floor at which 600 RPM is reachable
+		//                               at all, so the run could not answer the question it asked.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[V29] staged half starting. Fixed timestep: %s (%.4fs/frame). Also pinning t.MaxFPS to %.1f — "
+			     "the frame rate recovered from the owner's own 0.1117s measurement (0.1117/6 = 1/53.7) — because "
+			     "the bug is INVISIBLE at any frame rate whose period divides the fire interval, 60 fps included. "
+			     "*** RUN THIS WITH -UseFixedTimeStep -FPS=54 ***; without it a busy machine can miss the pin and "
+			     "the fire-rate windows will say so rather than answer."),
+			FApp::UseFixedTimeStep() ? TEXT("ON") : TEXT("off"),
+			FApp::UseFixedTimeStep() ? FApp::GetFixedDeltaTime() : 0.0,
+			RateWindowFPS);
+
+		State->Handle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float /*Delta*/) -> bool
+		{
+			ATraceCharacter* TickPawn = FindLocalPawn();
+			UTraceWeaponComponent* W = (TickPawn != nullptr) ? TickPawn->Weapon.Get() : nullptr;
+			UWorld* WorldPtr = (TickPawn != nullptr) ? TickPawn->GetWorld() : nullptr;
+			if (TickPawn == nullptr || W == nullptr || WorldPtr == nullptr || !TickPawn->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[V29] ABORTED: the local pawn stopped being usable mid-run."));
+				if (W != nullptr) { W->StopFire(); }
+				Report(State);
+				return false;
+			}
+
+			const double NowWorld = WorldPtr->GetTimeSeconds();
+			if (NowWorld < State->NextStepWorldTime)
+			{
+				return true;
+			}
+
+			switch (State->Step)
+			{
+			case 0:
+			{
+				// The SMG, through the shipped verb.
+				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+				TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Smg, &Refusal);
+				State->Advance(NowWorld, TraceMelee::GetSwapSeconds() + 0.35);
+				break;
+			}
+
+			case 1:
+			{
+				State->List.Check(TEXT("v29 2f: the SMG is in hand for the fire-rate windows"),
+					W->IsSmgEquipped(),
+					FString::Printf(TEXT("weapon=%s"), LexToString(W->GetEquippedWeapon())));
+
+				// --- THE RED ARM FIRST. Reproduce before fixing, on the same harness. --------------
+				if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+				{
+					Mutable->FireIntervalCarryFraction = 0.f;
+				}
+				BeginWindow(State, W, WorldPtr);
+				State->Advance(NowWorld, RateWindowSeconds);
+				break;
+			}
+
+			case 2:
+			{
+				// Gaps longer than twice the interval are the 1.3 s reload, not cadence. Counted and
+				// reported, never averaged in — and the count is itself a check, because a window that
+				// dropped ten gaps was not one held trigger.
+				State->RedRate = EndWindow(State, W, WorldPtr, State->ExpectedSmgInterval * 2.0);
+				LogStats(TEXT("2f RED (carry 0)"), State->RedRate, State->ExpectedSmgInterval);
+
+				if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+				{
+					Mutable->FireIntervalCarryFraction = State->Restore.CarryFraction;
+				}
+				// A beat for the automatic reload to finish before the next window starts, so the
+				// green arm is not measuring a magazine change it did not ask for.
+				State->Advance(NowWorld, 2.0);
+				break;
+			}
+
+			case 3:
+			{
+				BeginWindow(State, W, WorldPtr);
+				State->Advance(NowWorld, RateWindowSeconds);
+				break;
+			}
+
+			case 4:
+			{
+				State->GreenRate = EndWindow(State, W, WorldPtr, State->ExpectedSmgInterval * 2.0);
+				LogStats(TEXT("2f GREEN (shipped)"), State->GreenRate, State->ExpectedSmgInterval);
+				SetCVarInt(TEXT("Trace.Weapons.RecordShots"), 0);
+				SetCVarFloat(TEXT("t.MaxFPS"), State->Restore.MaxFPS);
+
+				State->List.Check(TEXT("v29 2f: the window is at least 40 consecutive rounds, both arms"),
+					State->RedRate.IsUsable() && State->GreenRate.IsUsable(),
+					FString::Printf(TEXT("red %d gaps, green %d gaps (needed %d each)"),
+						State->RedRate.Samples, State->GreenRate.Samples, MinIntervalSamples));
+
+				if (State->RedRate.IsUsable() && State->GreenRate.IsUsable())
+				{
+					const double Expected = State->ExpectedSmgInterval;
+					const double GreenErr = FMath::Abs(State->GreenRate.Mean - Expected) / Expected;
+					const double RedErr = FMath::Abs(State->RedRate.Mean - Expected) / Expected;
+
+					// *** THE PRECONDITION, AND IT IS DERIVED RATHER THAN GUESSED. ***
+					//
+					// A per-frame poll can only put a round on a frame boundary, and the carry can pull
+					// back at most CarryCap of the overshoot per round. So the quantisation is fully
+					// absorbed exactly while the FRAME TIME is no longer than the CAP, and beyond that
+					// the gun is frame-rate bound however the code is written:
+					//
+					//     cap = Interval x FireIntervalCarryFraction = 0.1 x 0.2 = 0.020 s  ->  50 fps
+					//
+					// Simulated 20-240 fps with and without frame jitter: at or above 50 fps the mean
+					// lands within 0.13% of the knob; at 28 fps it is 4-7% slow, which is exactly what
+					// this harness measured on its first (CPU-contended) run. So a run below the floor
+					// CANNOT distinguish a broken fix from a busy machine, and it says so as a FAILURE
+					// of the run rather than quietly passing or quietly failing the build.
+					//
+					// AND THE FLOOR IS A REAL GAMEPLAY FACT, NOT A HARNESS ARTEFACT: below ~50 fps the
+					// SMG cannot sustain 600 RPM at all, because the only faster arrangement of rounds
+					// on frame boundaries has gaps under the server's 0.08 s floor and would be
+					// rejected as rate-limited. Curing that needs more than one round per frame AND a
+					// wider FireRateTolerance — a change to the anti-cheat gate, deliberately not made
+					// here. It is in the report.
+					const double CarryCap = Expected
+						* FMath::Clamp(static_cast<double>(UTraceSettings::Get().FireIntervalCarryFraction),
+							0.0, UTraceWeaponComponent::FireRateTolerance);
+					const bool bFastEnough = State->GreenRate.MeanFrameSeconds <= CarryCap + 1.0e-5;
+
+					State->List.Check(TEXT("v29 2f PRECONDITION: the machine ran fast enough for 600 RPM to be reachable"),
+						bFastEnough,
+						FString::Printf(TEXT("frame time %.5fs (%.1f fps) against the %.5fs (%.1f fps) floor that "
+						                     "Interval x carry sets. Below it the poll is frame-rate bound and no "
+						                     "measurement here can mean anything — re-run on an idle machine."),
+							State->GreenRate.MeanFrameSeconds, 1.0 / FMath::Max(1.0e-6, State->GreenRate.MeanFrameSeconds),
+							CarryCap, 1.0 / FMath::Max(1.0e-6, CarryCap)));
+
+					if (bFastEnough)
+					{
+						State->List.Check(TEXT("v29 2f: the SMG now fires at the knob — within 1.5% over 40+ rounds"),
+							GreenErr <= 0.015,
+							FString::Printf(TEXT("measured %.5fs = %.1f RPM against %.5fs = %.1f RPM (%+.2f%%)"),
+								State->GreenRate.Mean, State->GreenRate.RPM(), Expected, 60.0 / Expected,
+								100.0 * (State->GreenRate.Mean - Expected) / Expected));
+					}
+					else
+					{
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[V29] 2f NOT MEASURED: green read %.5fs (%.1f RPM), which is what a %.1f fps poll "
+							     "can achieve and NOT a statement about the fix. The frame-quantised ceiling at this "
+							     "frame time is %.5fs. Re-run with nothing else on the machine."),
+							State->GreenRate.Mean, State->GreenRate.RPM(),
+							1.0 / FMath::Max(1.0e-6, State->GreenRate.MeanFrameSeconds),
+							State->GreenRate.MeanFrameSeconds
+								* FMath::CeilToDouble((Expected - CarryCap) / FMath::Max(1.0e-6, State->GreenRate.MeanFrameSeconds)));
+					}
+
+					// *** THE RED ARM HAS TO HAVE REPRODUCED, OR THIS PROVES NOTHING. *** The house
+					// rule is explicit: two arms agreeing means the harness is not measuring its rule.
+					// It is reported as a WARNING rather than a failure when the frame rate refuses to
+					// cooperate, because that is a fact about the machine and not about the fix — but
+					// it is never silent, and the run says which of the two it was.
+					if (RedErr <= 0.015)
+					{
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[V29] *** THE RED ARM DID NOT REPRODUCE. *** carry 0 measured %.5fs (%.1f RPM), "
+							     "which is already correct, so this run does NOT prove the fix — it proves the "
+							     "machine's frame time (%.5fs) divides the fire interval (%.5fs) and the bug is "
+							     "invisible here. Re-run with t.MaxFPS at a rate whose period does not divide it."),
+							State->RedRate.Mean, State->RedRate.RPM(), State->RedRate.MeanFrameSeconds, Expected);
+					}
+					State->List.Check(TEXT("v29 2f RED ARM: carry 0 reproduces the shipped 537-RPM shortfall"),
+						RedErr > 0.015 && State->RedRate.Mean > State->GreenRate.Mean,
+						FString::Printf(TEXT("red %.5fs = %.1f RPM (%+.2f%%) vs green %.5fs = %.1f RPM (%+.2f%%), "
+						                     "at a frame time of %.5fs"),
+							State->RedRate.Mean, State->RedRate.RPM(), 100.0 * (State->RedRate.Mean - Expected) / Expected,
+							State->GreenRate.Mean, State->GreenRate.RPM(), 100.0 * (State->GreenRate.Mean - Expected) / Expected,
+							State->RedRate.MeanFrameSeconds));
+
+					// The distribution, not just the mean: a gun that is right on average and wrong
+					// every sixth round is a different bug, and only the spread can tell them apart.
+					State->List.Check(TEXT("v29 2f: no round is early enough for the server to reject it"),
+						State->GreenRate.Min >= Expected * (1.0 - 0.2) - 1.0e-6,
+						FString::Printf(TEXT("shortest gap %.5fs against the server's %.5fs floor "
+						                     "(FireRateTolerance 20%%)"),
+							State->GreenRate.Min, Expected * 0.8));
+				}
+
+				// --- 2b. The pistol. ---------------------------------------------------------------
+				ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+				TraceMelee::RequestEquipIfDifferent(TickPawn, ETraceEquippedWeapon::Gun, &Refusal);
+				State->Advance(NowWorld, TraceMelee::GetSwapSeconds() + 0.35);
+				break;
+			}
+
+			case 5:
+			{
+				State->List.Check(TEXT("v29 2b: the pistol is in hand and reports SEMI-AUTO"),
+					W->IsFirearmEquipped() && !W->IsSmgEquipped() && !W->IsFullAutoNow(),
+					FString::Printf(TEXT("weapon=%s fullAutoNow=%d bPistolFullAuto=%d"),
+						LexToString(W->GetEquippedWeapon()), W->IsFullAutoNow() ? 1 : 0,
+						UTraceSettings::Get().bPistolFullAuto ? 1 : 0));
+
+				SetCVarInt(TEXT("Trace.Weapons.RecordShots"), 1);
+				W->ClearRecordedShotTimes();
+				W->StartFire();
+				// FOUR pistol intervals of held trigger. Long enough that an automatic pistol could
+				// not possibly fire only once, short enough to stay inside one magazine.
+				State->Advance(NowWorld, 4.0 * W->GetFireInterval());
+				break;
+			}
+
+			case 6:
+			{
+				W->StopFire();
+				State->SemiRounds = W->GetRecordedShotTimes().Num();
+				State->List.Check(TEXT("v29 2b: ONE round per trigger press — four intervals of held trigger fired 1"),
+					State->SemiRounds == 1,
+					FString::Printf(TEXT("%d round(s) over %.3fs of held trigger at a %.4fs interval"),
+						State->SemiRounds, 4.0 * W->GetFireInterval(), W->GetFireInterval()));
+
+				// ...and the RELEASE rearms it. A latch that never cleared would pass the check above
+				// and leave the pistol able to fire exactly once per life.
+				W->ClearRecordedShotTimes();
+				W->StartFire();
+				State->Advance(NowWorld, 0.2);
+				break;
+			}
+
+			case 7:
+			{
+				W->StopFire();
+				State->RearmRounds = W->GetRecordedShotTimes().Num();
+				State->List.Check(TEXT("v29 2b: releasing and pressing again fires the next round"),
+					State->RearmRounds == 1,
+					FString::Printf(TEXT("%d round(s) on the second press"), State->RearmRounds));
+
+				// --- THE RED ARM: the v28 pistol. --------------------------------------------------
+				if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+				{
+					Mutable->bPistolFullAuto = true;
+				}
+				W->ClearRecordedShotTimes();
+				W->StartFire();
+				State->Advance(NowWorld, 4.0 * W->GetFireInterval());
+				break;
+			}
+
+			case 8:
+			{
+				W->StopFire();
+				State->AutoRounds = W->GetRecordedShotTimes().Num();
+				if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+				{
+					Mutable->bPistolFullAuto = State->Restore.bPistolFullAuto;
+				}
+
+				State->List.Check(TEXT("v29 2b RED ARM: with bPistolFullAuto=True the same hold empties rounds"),
+					State->AutoRounds >= 3 && State->SemiRounds == 1,
+					FString::Printf(TEXT("full auto fired %d, semi fired %d, over the same %.3fs hold"),
+						State->AutoRounds, State->SemiRounds, 4.0 * W->GetFireInterval()));
+
+				// --- 2e. Roxie. ---------------------------------------------------------------------
+				UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(TickPawn);
+				if (Abilities == nullptr)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[V29] no ability component on the local pawn — §2e cannot be measured on a live "
+						     "Roxie here. The seam is still asserted below."));
+					State->Step = 12;
+					State->NextStepWorldTime = NowWorld;
+					break;
+				}
+
+				State->Restore.Character = Abilities->GetCharacterId();
+				if (Abilities->GetCharacterId() != ETraceCharacterId::Roxie)
+				{
+					Abilities->ServerSetCharacter(ETraceCharacterId::Roxie);
+					State->Restore.bCharacterChanged = true;
+				}
+				State->bRoxieStaged = (Abilities->GetCharacterId() == ETraceCharacterId::Roxie);
+				State->Advance(NowWorld, 0.6);
+				break;
+			}
+
+			case 9:
+			{
+				UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(TickPawn);
+				if (Abilities == nullptr || !State->bRoxieStaged)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[V29] the roster refused Roxie (per-team uniqueness — a team-mate holds her). §2e's "
+						     "LIVE arm is skipped and SAYS SO; the seam is still asserted."));
+					State->Step = 12;
+					State->NextStepWorldTime = NowWorld;
+					break;
+				}
+
+				Abilities->DebugSetActivatedCooldown(0.f);
+				const bool bUp = Abilities->TryActivate();
+				State->RoxieScaleSeen = W->GetRecoilPitchScale();
+
+				State->List.Check(TEXT("v29 2e: MODDED up puts recoil on Roxie's gun and on nobody else's"),
+					bUp && FMath::IsNearlyEqual(State->RoxieScaleSeen,
+						static_cast<double>(UTraceSettings::Get().RoxieModdedRecoilScale), 0.001),
+					FString::Printf(TEXT("activated=%d, scale %.4f vs knob %.4f (global switch contributes %d)"),
+						bUp ? 1 : 0, State->RoxieScaleSeen, UTraceSettings::Get().RoxieModdedRecoilScale,
+						UTraceSettings::Get().bRecoilEnabled ? 1 : 0));
+
+				// §2b x §18 §2: MODDED's "the gun becomes full auto" clause, now that there is a
+				// semi-automatic gun for it to act on.
+				State->bRoxieFullAutoOnPistol = W->IsFullAutoNow() && !W->IsSmgEquipped();
+				State->List.Check(TEXT("v29 2b: MODDED makes even the SEMI-AUTO pistol full auto (spec v18 §2)"),
+					State->bRoxieFullAutoOnPistol,
+					FString::Printf(TEXT("weapon=%s fullAutoNow=%d bRoxieModdedFullAuto=%d"),
+						LexToString(W->GetEquippedWeapon()), W->IsFullAutoNow() ? 1 : 0,
+						UTraceSettings::Get().bRoxieModdedFullAuto ? 1 : 0));
+
+				// Measure the CLIMB, not the knob: hold the trigger and read the control pitch the
+				// player's own view actually ended up at.
+				if (APlayerController* PC = Cast<APlayerController>(TickPawn->GetController()))
+				{
+					State->RoxieClimbGreen = -FRotator::NormalizeAxis(PC->GetControlRotation().Pitch);
+				}
+				W->ClearRecordedShotTimes();
+				W->StartFire();
+				State->Advance(NowWorld, 0.7);
+				break;
+			}
+
+			case 10:
+			{
+				W->StopFire();
+				const int32 Rounds = W->GetRecordedShotTimes().Num();
+				if (APlayerController* PC = Cast<APlayerController>(TickPawn->GetController()))
+				{
+					State->RoxieClimbGreen += FRotator::NormalizeAxis(PC->GetControlRotation().Pitch);
+				}
+
+				State->List.Check(TEXT("v29 2e: a MODDED burst actually CLIMBS the view"),
+					State->RoxieClimbGreen > 0.3 && Rounds >= 2,
+					FString::Printf(TEXT("%.3f deg over %d rounds (RecoilPitchPerShot %.3f x scale %.2f)"),
+						State->RoxieClimbGreen, Rounds, UTraceSettings::Get().RecoilPitchPerShot,
+						UTraceSettings::Get().RoxieModdedRecoilScale));
+
+				// --- THE RED ARM: MODDED with the trade removed. -----------------------------------
+				if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+				{
+					Mutable->RoxieModdedRecoilScale = 0.f;
+				}
+				if (APlayerController* PC = Cast<APlayerController>(TickPawn->GetController()))
+				{
+					State->RoxieClimbRed = -FRotator::NormalizeAxis(PC->GetControlRotation().Pitch);
+				}
+				W->ClearRecordedShotTimes();
+				W->StartFire();
+				State->Advance(NowWorld, 0.7);
+				break;
+			}
+
+			case 11:
+			{
+				W->StopFire();
+				const int32 Rounds = W->GetRecordedShotTimes().Num();
+				if (APlayerController* PC = Cast<APlayerController>(TickPawn->GetController()))
+				{
+					State->RoxieClimbRed += FRotator::NormalizeAxis(PC->GetControlRotation().Pitch);
+				}
+				if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+				{
+					Mutable->RoxieModdedRecoilScale = State->Restore.RoxieRecoil;
+				}
+
+				// The red arm's climb is allowed to be slightly NEGATIVE: the recovery from the green
+				// arm's burst is still running underneath it. What it must not be is upward.
+				State->List.Check(TEXT("v29 2e RED ARM: RoxieModdedRecoilScale=0 and the same burst does not climb"),
+					State->RoxieClimbRed < 0.05 && Rounds >= 2 && State->RoxieClimbGreen > State->RoxieClimbRed,
+					FString::Printf(TEXT("red %.3f deg over %d rounds vs green %.3f deg"),
+						State->RoxieClimbRed, Rounds, State->RoxieClimbGreen));
+
+				State->Advance(NowWorld, 0.05);
+				break;
+			}
+
+			default:
+			{
+				SetCVarInt(TEXT("Trace.Weapons.RecordShots"), 0);
+				Report(State);
+				return false;
+			}
+			}
+
+			return true;
+		}), 0.f);
+	}
+}
+
+static FAutoConsoleCommand GTraceWeaponsV29Cmd(
+	TEXT("Trace.Weapons.V29"),
+	TEXT("Dev only, SERVER. Spec v29 s2: assert the pistol's 25 leg / the SMG's 1.3s reload / the 800uu "
+	     "falloff either side of the line, MEASURE the SMG's real cadence over 40+ consecutive rounds at a "
+	     "pinned frame rate with the shipped 537-RPM behaviour as the RED arm, MEASURE that a held trigger "
+	     "fires the pistol once (RED arm: bPistolFullAuto), and MEASURE the view climb of a live Roxie under "
+	     "MODDED (RED arm: RoxieModdedRecoilScale 0)."),
+	FConsoleCommandDelegate::CreateStatic(&TraceWeaponsV29::Run));
 
 #endif // !UE_BUILD_SHIPPING

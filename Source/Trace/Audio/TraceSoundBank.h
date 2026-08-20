@@ -175,4 +175,114 @@ public:
 
 	/** The audible edge of a game-side sound. Derived, never stored. */
 	float GetWorldFalloffDistanceUU() const;
+
+	// =============================================================================================
+	// SPEC v29 §1b — FOOTSTEPS GET THEIR OWN VOLUME KNOB, AND IT IS RELATIVE
+	// =============================================================================================
+	//
+	//     "ensure they are quieter than other sounds ... give footsteps their own volume knob and set
+	//      it well below the bank default, then MEASURE it rather than trusting the number."
+	//
+	// A MULTIPLIER ON THE MASTER, never an absolute level — this project's standing rule, the same
+	// one that makes UTraceSoundBank::VolumeTrim a multiplier and WorldFalloffScale a multiple of the
+	// inner radius. Turning the master down turns the footsteps down with it; an absolute
+	// "FootstepVolume = 0.15" would have quietly become the LOUDEST thing in the game the first time
+	// somebody set the master to 0.1.
+	//
+	// *** WHY 0.15 AND NOT "SOMETHING SMALL". *** The eleven WAVs are not quiet files. Measured from
+	// the samples themselves (Scripts/import_sounds.py prints this, and Trace.Audio.Loudness asserts
+	// it from the imported asset):
+	//
+	//     loudest footstep   Step2         -20.06 dBFS peak
+	//     quietest other     ButtonPress   -27.21 dBFS peak
+	//
+	// So at equal gain the FOOTSTEPS ARE THE LOUDER OF THE TWO by 7.15 dB, and any knob that only
+	// "sounds small" would have shipped §1b broken. 0.15 is -16.48 dB, which puts the loudest footstep
+	// 9.33 dB under the quietest other sound — comfortably past the 6 dB (half the amplitude) that
+	// Trace.Audio.Loudness requires before it will call the difference audible.
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Footstep Volume (x Master)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
+	float FootstepVolumeScale = 0.15f;
+
+	/**
+	 * SPEC v29 §1c — how long without firing resets the pistol ladder to PistolShoot1.
+	 *
+	 *     "After a .3second break from shooting, reset the sounds back to pistol 1."
+	 *
+	 * The owner's literal number, kept literally. MEASURED FROM THE LAST SHOT, not from the trigger
+	 * release: FTracePistolLadder stamps the clock inside NextShot() and nowhere else, so a held
+	 * trigger that stops producing rounds (a reload, a dry clip) resets on exactly the same rule as
+	 * letting go.
+	 *
+	 * *** READ PistolLadderResetIntervalFloor BEFORE YOU TRUST THIS NUMBER ON ITS OWN. *** 0.3 s is
+	 * SHORTER than the pistol's own fire interval, so on its own it would make the ladder unreachable.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Pistol Ladder Reset (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.05", UIMax = "1.0"))
+	float PistolLadderResetSeconds = 0.3f;
+
+	/**
+	 * ============================================================================================
+	 * THE §1c / §2f COLLISION, AND THE ONE HONEST WAY OUT OF IT
+	 * ============================================================================================
+	 *
+	 * *** THE PISTOL CANNOT FIRE FASTER THAN 0.315789 s PER ROUND (190 RPM, spec v24 §4). THE SPEC
+	 * ASKS FOR A 0.3 s RESET. 0.3 IS SMALLER THAN 0.3158. ***
+	 *
+	 * Taken literally, therefore, EVERY pistol shot is more than 0.3 s after the previous one even
+	 * when the trigger is held flat out — so the ladder resets on every shot, PistolShoot2, 3 and 4
+	 * are never heard, and §1c ships as dead code that every report would describe as done. The owner
+	 * asked for "the consecutive sounds when the pistol is shot fast"; there is no rate at which this
+	 * pistol is fast enough for a 0.3 s window.
+	 *
+	 * So the reset gets a FLOOR EXPRESSED AS A MULTIPLE OF THE PISTOL'S OWN FIRE INTERVAL, which is
+	 * this project's standing rule applied to exactly the situation it exists for: "a break from
+	 * shooting" is only meaningful in units of how often the gun shoots, so the value MODIFIES that
+	 * base and is stored relative to it. Raise the pistol to 300 RPM tomorrow and the window follows
+	 * it down; drop it to 100 RPM and the window follows it up. An absolute second figure would have
+	 * silently broken again on the next fire-rate change, which is how it broke this time.
+	 *
+	 *     effective reset = max(PistolLadderResetSeconds, base fire interval x this)
+	 *                     = max(0.300, 0.315789 x 1.25) = 0.395 s
+	 *
+	 * WHY 1.25 AND NOT 1.05. The window has to clear the fire interval plus the jitter in when a shot
+	 * is OBSERVED — up to a frame, and a frame under load in this project has been measured at 75 ms.
+	 * 1.05 would leave 16 ms of headroom and the ladder would break up at low frame rates in a way
+	 * nobody could reproduce. 1.25 leaves 79 ms, and it is still short enough that a deliberate pause
+	 * — a reload, a reposition, anything a player would call "a break" — resets the ladder.
+	 *
+	 * *** SET THIS TO 0 FOR THE LITERAL SPEC. *** Then the effective reset is exactly 0.3 s, the
+	 * ladder never climbs above PistolShoot1 at the shipped fire rate, and Trace.Audio.GunLadder goes
+	 * red — which is precisely how that harness demonstrates the collision is real rather than a story
+	 * told in a comment.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Pistol Ladder Reset Floor (x pistol fire interval)", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "3.0"))
+	float PistolLadderResetIntervalFloor = 1.25f;
+
+	/**
+	 * THE RESET THE LADDER ACTUALLY USES: max(PistolLadderResetSeconds, fire interval x floor).
+	 *
+	 * Derived, never stored, and asked for by both the ladder and the harness that checks the ladder,
+	 * so the two cannot disagree about the rule.
+	 */
+	float GetPistolLadderResetSeconds() const;
+
+	/**
+	 * SPEC v29 §1b — how far a pawn walks between footsteps, at the pawn's own full running speed.
+	 *
+	 * A STRIDE IS A DISTANCE, NOT A TIMER. A timer would step at the same rate whether you were
+	 * sprinting or shuffling out of cover, which is precisely the information a footstep is supposed
+	 * to carry. Distance-driven means a slow walk steps slowly and a dash covers ground in fewer,
+	 * further-apart steps.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Footstep Stride (uu)", ClampMin = "20.0", ClampMax = "1000.0", UIMin = "80.0", UIMax = "400.0"))
+	float FootstepStrideUU = 175.f;
+
+	/**
+	 * Below this ground speed nothing steps at all, so a pawn creeping against a wall or being nudged
+	 * by a physics settle does not tick out footsteps.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Footstep Minimum Speed (uu/s)", ClampMin = "0.0", ClampMax = "600.0", UIMin = "0.0", UIMax = "300.0"))
+	float FootstepMinSpeedUU = 60.f;
+
+	/** THE FOOTSTEP VOLUME, ALREADY MULTIPLIED THROUGH THE MASTER. Derived, never stored. */
+	float GetFootstepVolume() const;
 };

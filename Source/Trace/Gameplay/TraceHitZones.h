@@ -134,9 +134,29 @@ public:
 	float BodyDamage = 40.f;
 
 	/**
-	 * Below the hips. Still four leg shots to kill (30 x 4 = 120 >= 100).
+	 * Below the hips. STILL FOUR LEG SHOTS TO KILL (25 x 4 = 100 >= 100).
 	 *
-	 * 25 -> 30 THIS PASS, and it is the fix for a reported bug, not a balance whim. The user said
+	 * *** 30 -> 25 THIS PASS. SPEC v29 §2a: THE OWNER HAS ANSWERED THE OPEN QUESTION AND THE ANSWER
+	 * IS 25. *** Every spec table since §6 printed the pistol as 100/40/25 while this knob shipped 30
+	 * — the v28 §9 harness noticed the contradiction and deliberately refused to assert either number
+	 * rather than bake a guess into a test (see Trace.Weapons.V28's comment on the pistol line). That
+	 * is now resolved in favour of the tables, and the harness asserts 25.
+	 *
+	 * WHAT RELIED ON 30, CHECKED RATHER THAN ASSUMED. Nothing. The only readers of these three numbers
+	 * are FTraceHitZoneModel::DamageForZone (which is the shot), the kill feed's head-shot inference
+	 * (UI/TraceKillFeed.cpp, which reads BodyDamage ONLY — the skull is drawn when the victim had more
+	 * than 40 health left, and the leg number never enters it), and the dumps. The four-shot leg kill
+	 * survives exactly: 4 x 25 = 100 and MaxHealth is 100, so the fourth round is still fatal — but it
+	 * is now fatal with nothing to spare, which is a real change and is stated here rather than
+	 * discovered. A victim on 100 health takes four leg shots either way; a victim who has healed
+	 * above 100, if that is ever added, would take five.
+	 *
+	 * THE 25 -> 30 REASONING FROM THE PREVIOUS PASS IS KEPT BELOW because it is the argument the owner
+	 * has now overruled, and the next reader should see what is being traded away: the body-versus-leg
+	 * payout swing widens from 25% back to 38%.
+	 *
+	 * ------------------------------------------------------------------------------------------
+	 * 25 -> 30 IN THE PREVIOUS PASS, and it is the fix for a reported bug, not a balance whim. The user said
 	 * "shooting feels WAY more inconsistent on this latest version". It was measured over 313
 	 * server-accepted shots and the hit registration was found to be exactly right — 313/313 client
 	 * and server agreed on the zone, zero rejects, zero shots lost at the muzzle. What actually
@@ -152,9 +172,16 @@ public:
 	 * The other two levers, if this is not enough: lower HipHeightFraction to ~0.40 (moves the
 	 * boundary out from under where shots actually land, at the cost of anatomical accuracy), or
 	 * accept the 4x spread as the design. Both are live knobs; try them in that order.
+	 * ------------------------------------------------------------------------------------------
+	 *
+	 * MIRRORED IN Config/DefaultGame.ini under [/Script/Trace.TraceDamageSettings], WHICH IS NEW THIS
+	 * PASS AND WHICH WINS. This class is `config = Game, defaultconfig` and had no ini section at all,
+	 * so these three header literals were the live values — the exact "a knob that lives in only one
+	 * of the two files" drift the house rule warns about, sitting on the game's three most-read
+	 * numbers. Change both or change nothing, and read them back with Trace.Smg.Dump.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Damage")
-	float LegDamage = 30.f;
+	float LegDamage = 25.f;
 
 	// --- Zone geometry -----------------------------------------------------------------------
 	//

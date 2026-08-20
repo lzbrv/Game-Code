@@ -4,8 +4,9 @@
 #
 # Puts the game's SOUND on the wire. Runs the two halves of Scripts/import_sounds.py:
 #
-#   1. manifest  Art/Sounds/*.wav
-#                  -> validated and printed (rate, channels, seconds, side)   (plain python)
+#   1. manifest  Art/Sounds/**/*.wav  (recursive: the footsteps are in Footsteps/)
+#                  -> validated and printed (rate, channels, seconds, side,
+#                     and the MEASURED peak/RMS dBFS of the actual samples)    (plain python)
 #   2. assets    Art/Sounds/<Event>.wav
 #                  -> Content/Trace/Audio/S_<Event>.uasset                    (in the editor)
 #                  -> Content/Trace/Audio/DA_TraceSoundBank.uasset            (in the editor)
@@ -26,8 +27,10 @@
 # either. Its event name is its file stem, and that is the key C++ asks for.
 #
 # WHAT IS *NOT* DATA: WHICH MACHINES HEAR IT. Game-side (CoreTurnover, Dash,
-# Parry — everyone nearby) versus client-side (the other six — only you) is a
-# networking behaviour and lives in Source/Trace/Audio/TraceSoundEvents.cpp. See
+# Parry, every gunshot, every footstep, Goal, RoccoRipple — everyone nearby)
+# versus client-side (Bodyshot, Headshot, CorePickup, Jump, WallJump, ButtonPress,
+# Kill — only you) is a networking behaviour and lives in
+# Source/Trace/Audio/TraceSoundEvents.cpp. See
 # the long comment at the top of TraceSoundEvents.h: an asset that could silently
 # turn a multicast into a local play is a way to break the owner's explicit design
 # without touching any code.
@@ -36,7 +39,7 @@
 # THESE WAVS *ARE* IN THIS REPOSITORY, UNLIKE THE FONTS
 # ------------------------------------------------------------------------------
 # Sofachrome and Erbaum are licensed to the owner for desktop use and are
-# gitignored (docs/FONTS.md). These nine sounds are ours: Art/Sounds/*.wav and
+# gitignored (docs/FONTS.md). These sounds are ours: Art/Sounds/**/*.wav and
 # the imported Content/Trace/Audio/*.uasset are BOTH tracked, both through Git
 # LFS per .gitattributes.
 #
@@ -60,8 +63,10 @@ usage() {
     cat <<EOF
 ${TRACE_PROJECT_NAME} import-sounds
 
-Imports Art/Sounds/*.wav into Content/Trace/Audio as USoundWave assets and writes
-the one asset that maps an event name to a sound: DA_TraceSoundBank.
+Imports Art/Sounds/**/*.wav (recursively - the footsteps live in Footsteps/) into
+Content/Trace/Audio as USoundWave assets and writes the one asset that maps an
+event name to a sound: DA_TraceSoundBank. An event name is the file's STEM; the
+folder is filing, not naming.
 
 USAGE
   Scripts/import-sounds.sh [options]
@@ -86,6 +91,17 @@ IN GAME (drop -nosound, or none of this is audible)
   Trace.Audio.Test Dash   fire one event through the real API
   Trace.Audio.Probe       THE evidence: reads the mixer's source count back
   Trace.Audio.Reload      pick up a re-import without relaunching
+
+  spec v29 §1:
+  Trace.Audio.Sides       §1a: the nine v26 events still route as v26 shipped them
+  Trace.Audio.Loudness    §1b: MEASURES every clip and proves footsteps are quieter
+                          (red arm: Trace.Audio.FootstepVolume 1)
+  Trace.Audio.Footsteps   §1b: the randomiser and the stride, driven
+                          (red arm: Trace.Audio.FootstepRepeatGuard 0)
+  Trace.Audio.GunLadder   §1c/§1d/§1e: the clip name per shot, fast and gapped
+                          (red arms: Trace.Audio.PistolResetFloor 0, Trace.Audio.ShotWatch 0)
+  Trace.Audio.V29Integ    §1f: Goal, Kill and RoccoRipple from their real triggers
+  Trace.Audio.Integ       §9: the nine v26 call sites (run it in a MATCH, not the range)
 EOF
 }
 
@@ -107,21 +123,30 @@ SRC_DIR="${TRACE_PROJECT_ROOT}/Art/Sounds"
 OUT_DIR="${TRACE_PROJECT_ROOT}/Content/Trace/Audio"
 
 [ -d "$SRC_DIR" ] || trace_die "Missing ${SRC_DIR}
-That is where the WAVs live. Spec v26 §9 stages nine there:
-    Bodyshot ButtonPress CorePickup CoreTurnover Dash Headshot Jump Parry WallJump"
+That is where the WAVs live. Spec v29 §1 stages twenty-eight there:
+    Bodyshot ButtonPress CorePickup CoreTurnover Dash Headshot Jump Parry WallJump
+    Goal Kill RoccoRipple PistolShoot1..4 SmgShoot1
+    Footsteps/Step1..Step11"
 
+# THE FOOTSTEPS LIVE IN A SUBFOLDER (spec v29 §1b), so every scan below is recursive. The event name
+# is still the STEM and never the folder: Art/Sounds/Footsteps/Step7.wav is the event Step7 and the
+# asset S_Step7. `find`, not a glob, because bash 3.2 (the macOS system shell this script has to run
+# under) has no globstar.
+#
 # An LFS pointer is a ~130-byte text file starting with 'version https://'. Handing that to the
 # importer produces a baffling 'not a valid sound' instead of a useful error. Same guard as
 # Scripts/import-font-atlas.sh, which learned it the hard way.
 WAV_COUNT=0
-for WAV in "$SRC_DIR"/*.wav; do
+while IFS= read -r WAV; do
     [ -e "$WAV" ] || continue
     WAV_COUNT=$((WAV_COUNT + 1))
     if head -c 16 "$WAV" | grep -q '^version https'; then
         trace_die "${WAV} is an unfetched Git LFS pointer, not audio. Run: git lfs pull"
     fi
-done
-[ "$WAV_COUNT" -gt 0 ] || trace_die "No .wav files in ${SRC_DIR}."
+done <<EOF
+$(find "$SRC_DIR" -type f -name '*.wav' | sort)
+EOF
+[ "$WAV_COUNT" -gt 0 ] || trace_die "No .wav files under ${SRC_DIR}."
 
 # ------------------------------------------------------------------------------
 # 1. The manifest — plain python, and it is a real validation pass: it reads each
@@ -198,7 +223,7 @@ set -e
 # 3. Verify what landed
 # ------------------------------------------------------------------------------
 EXPECTED=("Content/Trace/Audio/DA_TraceSoundBank.uasset")
-for WAV in "$SRC_DIR"/*.wav; do
+while IFS= read -r WAV; do
     [ -e "$WAV" ] || continue
     STEM="$(basename "$WAV" .wav)"
     # With --only, the other sounds were deliberately not touched this run, so only
@@ -206,7 +231,9 @@ for WAV in "$SRC_DIR"/*.wav; do
     if [ -z "$ONLY_SOUNDS" ] || printf '%s' ",${ONLY_SOUNDS}," | grep -q ",${STEM},"; then
         EXPECTED+=("Content/Trace/Audio/S_${STEM}.uasset")
     fi
-done
+done <<EOF
+$(find "$SRC_DIR" -type f -name '*.wav' | sort)
+EOF
 
 MISSING=0
 trace_msg "Verifying:"

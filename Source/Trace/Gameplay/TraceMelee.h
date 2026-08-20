@@ -189,7 +189,18 @@ enum class ETraceEquippedWeapon : uint8
 	/** The pistol. 100 / 40 / 25, 190 RPM, 30-round clip, 0.5 s reload. */
 	Gun   = 0,
 
-	/** The knife. Under dual-wield (spec v28 §10) NO pawn is ever in this state — see UTraceMeleeSettings::bDualWieldKnife. */
+	/**
+	 * THE KNIFE, AND SINCE SPEC v29 §5 THIS VALUE MEANS "GUNS STOWED".
+	 *
+	 * v28 §10 made the blade permanent and this selector value unreachable — no pawn was ever in it.
+	 * v29 §5 gives it back its job and a better name for it: "Pressing one stows guns, and then you
+	 * get the knife boost speed from before." A pawn in this state has the blade (as it does in every
+	 * state under dual-wield), has NO gun out, cannot fire, and is paid the v12 §3 movement profile.
+	 * That is exactly what this value meant pre-dual-wield, which is why it is reused rather than a
+	 * fourth enumerator being appended: a new value would have to be taught to every switch, every
+	 * TraceIsFirearm caller and the equip RPC's validation whitelist, all to describe a state the
+	 * enum already had.
+	 */
 	Knife = 1,
 
 	/** SPEC v28 §9. Full-auto SMG: 33 / 18 / 12, 600 RPM, 40-round clip, 0.8 s reload. */
@@ -550,13 +561,15 @@ public:
 	//            "Meleeing should lock the player out of shooting for the length of the animation").
 	//     false  no lockout exists, because with the knife out you could not shoot anyway.
 	//
-	//   MOVEMENT
-	//     true   TraceMelee::ShouldUseKnifeMovementProfile() is ALWAYS false. This is the single most
-	//            important consequence of the switch and it is deliberate: the +22% ground speed and
-	//            the two air-cap multipliers (spec v12 §3) were the PRICE of holding a weapon that
-	//            cannot shoot. A knife that is always in your off hand would hand every player that
-	//            bonus permanently and for free, which is a movement rebalance nobody asked for.
-	//     false  the v12 §3 profile applies whenever the knife is the selected weapon.
+	//   MOVEMENT   *** REWRITTEN BY SPEC v29 §5. THE SWITCH NO LONGER DECIDES THIS. ***
+	//     both   TraceMelee::ShouldUseKnifeMovementProfile() is true whenever NO FIREARM is out and
+	//            the pawn is not the carrier. v28 §10 returned false for the whole of dual-wield,
+	//            because the blade was free and paying the +22% would have been a movement rebalance
+	//            nobody asked for. v29 §5 restores the TRADE by making it explicit: key 1 STOWS the
+	//            guns — you cannot shoot at all while stowed (CanFire's IsFirearmEquipped gate) — and
+	//            that is what buys the speed. Keys 2 and 3 take a gun and take the speed back.
+	//            With the switch OFF the only non-firearm the selector can hold is the knife, so the
+	//            expression collapses to the v12 §3 test character for character.
 	//
 	//   PRESENTATION
 	//     true   the knife rig is drawn in the OFF hand alongside the gun, always, and the gun is
@@ -836,6 +849,12 @@ namespace TraceMelee
 	 * SetKnifeMovementProfileActive(), and it is exported so the movement slice, the HUD or a test
 	 * can ask the same question and get the same answer.
 	 *
+	 * *** SPEC v29 §5 — "NO GUN IS OUT", NOT "THE KNIFE IS SELECTED". *** Pressing 1 stows the guns
+	 * and buys the v12 §3 boost; keys 2 and 3 pull a gun and take it away. One rule, both positions
+	 * of the dual-wield switch — see the definition, which argues the whole history. The paragraph
+	 * below is the v12 §3 wording and is still exactly right with "knife equipped" read as "no
+	 * firearm equipped", which is what it meant before the SMG existed.
+	 *
 	 * Knife equipped AND not carrying the Core. The carrier clause is defence in depth: a swap is
 	 * already refused while carrying, so a carrier only ever reaches this by picking the Core up
 	 * with the knife already out — and at that moment the knife is STOWED, not active. They cannot
@@ -884,38 +903,53 @@ namespace TraceMelee
 		ETraceMeleeRefusal* OutRefusal = nullptr);
 
 	/**
-	 * DIRECT SELECT (spec v13 §2) — the 1 and 2 binds, and as of spec v15 §5 the only weapon input
-	 * there is. Asking for the weapon already in hand does nothing at all and, crucially, does NOT
+	 * DIRECT SELECT (spec v13 §2) — the 1, 2 and 3 binds (spec v29 §5 added the third), and as of
+	 * spec v15 §5 the only weapon input there is. Asking for the weapon already in hand does nothing at all and, crucially, does NOT
 	 * restart the 0.2 s pullout.
 	 *
 	 * Use this for a key that names a weapon; use RequestEquip above for a bot deciding what it
 	 * needs. The difference is documented in full on UTraceWeaponComponent::RequestEquipIfDifferent,
 	 * which is where the gate lives.
 	 *
-	 * *** [DUALWIELD] THIS IS WHERE THE 1 AND 2 KEYS ARE REMAPPED, AND IT IS THE ONLY PLACE. ***
-	 * Spec v28 §10: "you no longer have to swap between knife and gun, just the different guns." The
-	 * two direct-select binds still exist and still name a slot; with the switch on, the SLOT they
-	 * name changes:
+	 * *** SPEC v29 §5 — THREE KEYS, THREE STATES, AND NO REMAP ANY MORE. ***
 	 *
-	 *     key      action id           v27 meaning     v28 dual-wield meaning
-	 *     1        EquipKnife          the knife       slot 1 = the PISTOL
-	 *     2        EquipGun            the gun         slot 2 = the SMG
+	 * v28 §10 had two weapon keys and three weapons, so this function carried a switch statement that
+	 * silently rewrote key 1 ("the knife") into the pistol and key 2 into the SMG. v29 §5 gives the
+	 * player a third key and that remap is DELETED — every caller now names the state it wants:
 	 *
-	 * The remap lives on THIS function — the verb documented as "for a key that names a weapon" —
-	 * and deliberately not on RequestEquip, which is the bots' and the console's verb and must keep
-	 * meaning exactly what it says. It is one switch statement; see the definition.
+	 *     key   action id      weapon asked for              speed
+	 *     1     StowGuns       ETraceEquippedWeapon::Knife   the v12 §3 knife boost (no gun out)
+	 *     2     EquipPistol    ETraceEquippedWeapon::Gun     normal
+	 *     3     EquipSmg       ETraceEquippedWeapon::Smg     normal
 	 *
-	 * HAND-OFF, STATED PLAINLY: the two rows on the keybind page still READ "SWITCH TO KNIFE" and
-	 * "SWITCH TO GUN". Those display strings live in FTraceInputActionInfo (Settings/
-	 * TraceUserSettings.cpp), which is spec v28 §3's ownership slice, not this one. The binds work;
-	 * the labels are stale. Renaming them to "WEAPON 1 (PISTOL)" / "WEAPON 2 (SMG)" is a two-string
-	 * edit there and must NOT change either ConfigId, or every returning player loses the bind.
+	 * The knife is in hand in ALL THREE (spec v28 §10's dual wield is untouched — melee still works
+	 * while a gun is out). "Stowing" is about the GUNS, and the only thing it changes besides the
+	 * silhouette is that CanFire() refuses and ShouldUseKnifeMovementProfile() starts paying.
+	 *
+	 * *** BLOCKED ON UTraceWeaponComponent, WHICH IS ANOTHER SLICE'S FILE THIS PASS. ***
+	 * Two guards there still refuse ETraceEquippedWeapon::Knife outright while dual-wield is on —
+	 * UTraceWeaponComponent::RequestEquip's "a request for the knife SUCCEEDS AS A NO-OP" early-out
+	 * and ServerRequestEquip_Implementation's matching refusal. Both were correct when no pawn could
+	 * ever be in the Knife state; under v29 §5 the Knife state IS the stowed state, and until those
+	 * two blocks are removed key 1 is accepted, logged and does nothing. Everything else on this path
+	 * — the keybind, the input action, the handler, the movement rule, the HUD — is in place and
+	 * waiting for them.
 	 */
 	TRACE_API bool RequestEquipIfDifferent(ATraceCharacter* Pawn, ETraceEquippedWeapon Desired,
 		ETraceMeleeRefusal* OutRefusal = nullptr);
 
 	/** THE SWING. Starts one if the rules allow; the blade resolves SwingWindupSeconds later. */
 	TRACE_API bool RequestSwing(ATraceCharacter* Pawn, ETraceMeleeRefusal* OutRefusal = nullptr);
+
+	/**
+	 * SPEC v29 §5. "Is @p Weapon the state this pawn is in right now?" — the THREE-state question the
+	 * 1 / 2 / 3 keys ask, and the one the direct-select idempotence guard has to ask.
+	 *
+	 * IsKnifeEquipped() is the two-state form and cannot answer it: it reports "not the knife" for
+	 * both the pistol and the SMG, so a 2-then-3 press read as a repeat press of the same slot. Safe
+	 * on any actor including null, like everything else in this namespace.
+	 */
+	TRACE_API bool IsWeaponEquipped(const AActor* Character, ETraceEquippedWeapon Weapon);
 
 	/**
 	 * "Is @p Target close enough to be worth swinging at?" — BotSwingRangeFraction of the reach,

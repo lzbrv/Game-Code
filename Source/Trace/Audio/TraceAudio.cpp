@@ -185,13 +185,23 @@ bool UTraceAudioSubsystem::LogOnceFor(FName Event)
 
 float UTraceAudioSubsystem::VolumeFor(FName Event) const
 {
-	const float Master = FMath::Max(0.f, UTraceAudioSettings::Get().MasterVolume);
+	const UTraceAudioSettings& Settings = UTraceAudioSettings::Get();
 
-	// The per-event trim MULTIPLIES the master (this project's standing rule: a value that modifies a
+	// SPEC v29 §1b — FOOTSTEPS CARRY THEIR OWN KNOB, and it is asked for by FAMILY rather than by
+	// name matching. GetFootstepVolume() is Master x FootstepVolumeScale, derived in one place, so
+	// this line cannot drift from the number Trace.Audio.Loudness reports.
+	//
+	// Reading the family from the event TABLE and not from the string "Step" is the difference
+	// between a rule and a coincidence: Step12 added tomorrow gets the knob by being declared a
+	// footstep, and an event called "Steppe" never gets it by accident.
+	const bool bFootstep = (TraceSoundEvents::FamilyOf(Event) == ETraceSoundFamily::Footstep);
+	const float Base = bFootstep ? Settings.GetFootstepVolume() : FMath::Max(0.f, Settings.MasterVolume);
+
+	// The per-event trim MULTIPLIES the base (this project's standing rule: a value that modifies a
 	// base is stored relative to it), so turning the master down turns everything down and no event
 	// can escape it by carrying an absolute level of its own.
 	const float Trim = (Bank != nullptr) ? Bank->VolumeFor(Event) : 1.f;
-	return Master * Trim;
+	return Base * Trim;
 }
 
 USoundAttenuation* UTraceAudioSubsystem::GetWorldAttenuation()

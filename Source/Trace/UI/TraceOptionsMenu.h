@@ -124,7 +124,24 @@ public:
 		 * be entered independently — the pause root gets a VIDEO row straight to here, because a player
 		 * whose frame rate has collapsed should not walk through a page about mouse sensitivity first.
 		 */
-		Video
+		Video,
+
+		/**
+		 * SPEC v29 §3 — "Add a page in settings to customize the crosshair."
+		 *
+		 * ITS OWN PAGE, for the same reason VIDEO is: the settings page is already nineteen rows of
+		 * mouse and bindings, and seven more would push the pitch further into its 18px floor at 720p.
+		 * It is also the only page here that wants LAYOUT of its own — a live preview needs a rectangle
+		 * beside the list, which a section of a scrolling list cannot have.
+		 *
+		 * REACHED FROM THE SETTINGS PAGE AND NOT FROM THE PAUSE ROOT, which is the one place it differs
+		 * from VIDEO. Video earned its root row by an argument spec v11 §0 measured: the player it
+		 * exists for has a collapsed frame rate and must not be made to walk past mouse sensitivity
+		 * first. A crosshair has no such emergency, and a five-row pause root is worth more than a
+		 * sixth destination on it. It IS on the settings page, which is the only route the title screen
+		 * has to anything.
+		 */
+		Crosshair
 	};
 
 	// ---- Host callbacks -------------------------------------------------------------------------
@@ -154,6 +171,15 @@ public:
 
 	/** Opens straight on the video page, with BACK closing the overlay. */
 	void OpenVideo();
+
+	/**
+	 * SPEC v29 §3 — opens straight on the crosshair page, with BACK closing the overlay.
+	 *
+	 * Twin of OpenVideo, and it exists for the same headless reason: `Trace.Menu.Crosshair` is the
+	 * only way a run with no keyboard can photograph this page, and a page nobody can photograph is a
+	 * page nobody can be shown to have checked.
+	 */
+	void OpenCrosshair();
 
 	/** Closes, fires OnClosed, and abandons any rebind that was in progress. */
 	void Close();
@@ -304,6 +330,8 @@ private:
 		Resume,
 		OpenSettings,
 		OpenVideo,
+		/** SPEC v29 §3 — the CROSSHAIR row on the settings page. */
+		OpenCrosshair,
 		ReturnToTitle,
 		Quit,
 		ResetDefaults,
@@ -316,6 +344,16 @@ private:
 		 * the most destructive control in this menu.
 		 */
 		ResetVideoDefaults,
+		/**
+		 * SPEC v29 §3 — puts the CROSSHAIR page back to its shipped defaults, and NOTHING ELSE.
+		 *
+		 * A third separate reset, for the reason ResetVideoDefaults gives above and which is now a
+		 * pattern rather than a one-off: a reset row belongs to the page it is drawn on. A player who
+		 * pressed reset on a page about their crosshair did not ask to lose their key bindings or their
+		 * resolution, and it goes through UTraceUserSettings::ResetCrosshairToDefaults, which touches
+		 * the seven crosshair fields and no others.
+		 */
+		ResetCrosshairDefaults,
 		Back
 	};
 
@@ -346,6 +384,26 @@ private:
 		 * TraceCharacters in UI/TraceMatchOptions.h for where it persists and why.
 		 */
 		CharactersEnabled,
+
+		/**
+		 * SPEC v29 §3 — the seven crosshair rows.
+		 *
+		 * *** ABOVE THE VIDEO BLOCK, AND THAT IS LOAD-BEARING, NOT TIDINESS. *** IsVideoSetting() is
+		 * `>= ResolutionScale`, so anything placed below that line is read and written through
+		 * UTraceGameUserSettings — which knows nothing about a crosshair. The rows would draw 0.00 and
+		 * adjusting them would do nothing at all: a settings page whose controls are silently
+		 * disconnected. CharactersEnabled's comment above says the same thing for the same reason.
+		 *
+		 * All seven live on UTraceUserSettings, which is where the player's own taste belongs (see the
+		 * header of Settings/TraceUserSettings.h).
+		 */
+		CrosshairSize,
+		CrosshairThickness,
+		CrosshairGap,
+		CrosshairColor,
+		CrosshairOpacity,
+		CrosshairDot,
+		CrosshairOutline,
 
 		// ---- Video. IsVideoSetting() is the boundary and depends on this ordering. ----
 		ResolutionScale,
@@ -524,6 +582,34 @@ private:
 	void RunAutoDetect();
 	void ResetVideoToDefaults();
 
+	// ---- Crosshair (spec v29 §3) ----------------------------------------------------------------
+	//
+	// THIS PAGE OWNS NO CROSSHAIR STATE EITHER. Every row reads UTraceUserSettings live on the frame
+	// it is drawn and writes straight back on the frame it changes, exactly as the video page does
+	// with UTraceGameUserSettings — so there is no cached copy here to go stale, and the preview below
+	// cannot be showing a value the game is not using.
+
+	/**
+	 * The live preview: the real crosshair, at its real size, over the two backgrounds it has to
+	 * survive.
+	 *
+	 * THE SHAPE COMES FROM UTraceUserSettings::BuildCrosshairBars — the SAME function
+	 * ATraceHUD::DrawAimReticle calls — rather than from a copy of the arithmetic here. A preview with
+	 * its own geometry is a preview that agrees with the game until somebody edits one of the two,
+	 * and then lies about the setting it exists to show.
+	 *
+	 * TWO BACKGROUNDS, SPLIT DOWN THE MIDDLE, and that is the whole point of previewing a crosshair in
+	 * a menu rather than just printing the numbers. This arena is a black floor under saturated cyan
+	 * neon, and the failure mode that produced "there is no crosshair" was a reticle that was legible
+	 * over one and invisible over the other. The cross sits on the seam, so a colour or an opacity
+	 * that only works over half the arena is visibly wrong here instead of in a firefight.
+	 *
+	 * DRAWN AT ACTUAL SIZE (PixelScale = UIScale, first-person scale 1.0), not magnified. The player
+	 * is choosing how big their crosshair should be on THIS screen, and a preview at 3x would answer a
+	 * question nobody asked. The caption says so, because a small preview otherwise reads as a bug.
+	 */
+	void DrawCrosshairPreview(AHUD* HUD, float X, float Y, float W, float H);
+
 	// ---- Field of view --------------------------------------------------------------------------
 	//
 	// The VALUE lives in UTraceGameUserSettings, which persists it and pushes it onto live cameras.
@@ -606,6 +692,15 @@ private:
 	 * Closed means "this page was the entry point, so BACK closes the overlay".
 	 */
 	EPage VideoReturnPage = EPage::Settings;
+
+	/**
+	 * SPEC v29 §3 — where BACK goes from the CROSSHAIR page. Same contract as VideoReturnPage.
+	 *
+	 * Settings by default because that is the only row that reaches it; Closed when the page was
+	 * entered directly (OpenCrosshair, or the Trace.Menu.Crosshair console command), so BACK closes
+	 * the overlay instead of dropping the player onto a page they never opened.
+	 */
+	EPage CrosshairReturnPage = EPage::Settings;
 
 	// ---- SPEC v28 §3a — THE SWALLOWED FIRST PRESS -----------------------------------------------
 	//

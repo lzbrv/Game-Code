@@ -48,6 +48,41 @@ static TAutoConsoleVariable<int32> CVarRoxieSelfLaunch(
 	ECVF_Cheat);
 
 // =================================================================================================
+// THE SEAMS THE WEAPON READS  (spec v29 §2e and §2b)
+//
+// Two free functions, taking the shooting ACTOR, mirroring TraceSlimeball::GetFireIntervalScaleFor()
+// so that UTraceWeaponComponent asks one question and does no casting of its own. Both are safe with
+// a null actor, with an actor that has no ability component, and with every character who is not
+// Roxie — they are a no-op for a Mannequin, for every bot and for Roxie herself with MODDED down.
+//
+// The header says where these BELONG (a virtual on UTraceCharacterAbilitySet with a static in front
+// of it, exactly as the fire-rate scale has) and why they are here instead this pass. Two lines to
+// migrate, and nothing else reads them.
+// =================================================================================================
+
+namespace TraceRoxie
+{
+	/** The Roxie set driving @p Shooter, or null. One place, so the two functions cannot diverge. */
+	static const UTraceAbilitySetRoxie* FindRoxieSet(const AActor* Shooter)
+	{
+		UTraceCharacterAbilitySet* Set = UTraceAbilityComponent::GetAbilitySetFor(Shooter);
+		return (Set != nullptr) ? Cast<UTraceAbilitySetRoxie>(Set) : nullptr;
+	}
+
+	float GetAddedRecoilScaleFor(const AActor* Shooter)
+	{
+		const UTraceAbilitySetRoxie* Roxie = FindRoxieSet(Shooter);
+		return (Roxie != nullptr) ? Roxie->GetAddedRecoilScale() : 0.f;
+	}
+
+	bool IsFullAutoForcedFor(const AActor* Shooter)
+	{
+		const UTraceAbilitySetRoxie* Roxie = FindRoxieSet(Shooter);
+		return (Roxie != nullptr) && Roxie->IsFullAutoForced();
+	}
+}
+
+// =================================================================================================
 // PASSIVE — "jumps 15% higher"
 // =================================================================================================
 
@@ -411,6 +446,22 @@ float UTraceAbilitySetRoxie::GetFireIntervalScale() const
 bool UTraceAbilitySetRoxie::IsFullAutoForced() const
 {
 	return IsModdedActive() && UTraceSettings::Get().bRoxieModdedFullAuto;
+}
+
+float UTraceAbilitySetRoxie::GetAddedRecoilScale() const
+{
+	// SPEC v29 §2e — "Roxie's modded should add recoil now."
+	//
+	// A MULTIPLE OF UTraceSettings::RecoilPitchPerShot, never a number of degrees: the weapon
+	// multiplies the base kick by it, so retuning the base retunes her trade in proportion. This is
+	// the same rule spec v24 §0 imposed on GetFireIntervalScale() above, applied to the second thing
+	// MODDED now modifies. Clamped for the same reason every other seam in this file is: a mistyped
+	// ini must degrade to a hard gun, never to a view that leaves the screen.
+	if (!IsModdedActive())
+	{
+		return 0.f;
+	}
+	return FMath::Clamp(UTraceSettings::Get().RoxieModdedRecoilScale, 0.f, 8.f);
 }
 
 bool UTraceAbilitySetRoxie::CanActivate(FText& OutReason) const

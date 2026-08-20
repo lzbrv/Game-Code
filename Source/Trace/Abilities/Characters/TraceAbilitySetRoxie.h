@@ -58,12 +58,19 @@
 //
 //        *** TWO HONEST NOTES ON MODDED, BOTH OF WHICH BELONG IN THE PLAYTEST BRIEF. ***
 //
-//        1. THE GUN IS ALREADY FULL AUTO. UTraceWeaponComponent::TickComponent re-fires every frame
-//           the trigger is held and CanFire() allows, so holding mouse1 already empties a clip at
-//           FireInterval. "The gun becomes full auto" is therefore already true of the base gun and
-//           bRoxieModdedFullAuto ON matches shipped behaviour. What actually makes a 0.40 s gun FEEL
-//           semi-automatic is the 150 RPM cadence — so the whole felt content of that clause is the
-//           x1.65, which is note 2.
+//        1. *** THE FULL-AUTO CLAUSE IS A MECHANIC AS OF SPEC v29 §2b. THIS NOTE USED TO SAY THE
+//           OPPOSITE AND IS KEPT AS THE RECORD OF WHY. *** It read: "THE GUN IS ALREADY FULL AUTO —
+//           UTraceWeaponComponent::TickComponent re-fires every frame the trigger is held and
+//           CanFire() allows, so 'the gun becomes full auto' is already true of the base gun and
+//           bRoxieModdedFullAuto ON matches shipped behaviour."
+//
+//           That was true for eleven specs and stopped being true this pass. §2b: "The pistol is NOT
+//           full auto. It must fire once per trigger press. The SMG stays full auto." So there is now
+//           a gun the clause can act on, IsFullAutoForced() is read for the first time (by
+//           UTraceWeaponComponent::IsFullAutoNow, through TraceRoxie::IsFullAutoForcedFor), and a
+//           Roxie with MODDED up can HOLD the trigger on a PISTOL where nobody else can. The felt
+//           content of MODDED is therefore now the x1.65 AND the held trigger — and, since §2e, the
+//           recoil she pays for both. Note 3.
 //        2. THE x1.65 IS NOW WIRED, AND THIS NOTE RECORDS HOW. It used to say the fire gate read
 //           UTraceSettings::FireInterval directly in two places inside
 //           Gameplay/TraceWeaponComponent.cpp (CanFire() and ServerFire's rate validation) with no
@@ -74,6 +81,15 @@
 //           multiply by it. BOTH had to move — scaling only the local gate would have let the client
 //           fire faster than the server's validation accepts, which reads as the gun eating bullets.
 //           Trace.Roxie.ModdedTest is the acceptance test and it went from 9/1 to 10/0 on that line.
+//        3. *** MODDED NOW COSTS HER RECOIL. SPEC v29 §2e: "Roxie's modded should add recoil now." ***
+//           GetAddedRecoilScale() is the seam, TraceRoxie::GetAddedRecoilScaleFor() is the weapon's
+//           door to it, and UTraceWeaponComponent::GetRecoilPitchScale() is where it lands. Demo 22
+//           (spec v25 §5) removed the aim punch for everybody and bRecoilEnabled is STILL FALSE — this
+//           ADDS to that switch rather than overriding it, so the shipped build has recoil for exactly
+//           one pawn in one state: a Roxie with MODDED up. It is stored as a MULTIPLE of
+//           UTraceSettings::RecoilPitchPerShot and never as degrees, for the same reason §0 forced the
+//           fire rate to be a ratio. Trace.Weapons.V29 measures the actual view climb over a live
+//           burst, with RoxieModdedRecoilScale=0 as the red arm.
 //
 // ===================================================================================================
 // WHAT THIS FILE DELIBERATELY DOES NOT DO
@@ -99,6 +115,49 @@
 
 class ATraceCharacter;
 class ATraceRoxieRocket;
+
+/**
+ * *** THE TWO SEAMS THE WEAPON NEEDS FROM MODDED (spec v29 §2e and §2b). ***
+ *
+ * Free functions, taking the shooting ACTOR, exactly as TraceSlimeball::GetFireIntervalScaleFor()
+ * does and for the same reason: UTraceWeaponComponent asks one question and does no casting.
+ *
+ * *** SAID PLAINLY: THIS IS THE SECOND-BEST SHAPE, AND THE BEST ONE IS ONE FILE AWAY. *** The right
+ * home for both is the character-agnostic aggregator the ability layer already has —
+ * UTraceAbilityComponent::GetFireIntervalScaleFor() is the model, a static on the component
+ * dispatching to a virtual on UTraceCharacterAbilitySet, so the gun learns no character's name.
+ * Abilities/TraceAbilityComponent.{h,cpp} and Abilities/TraceCharacterAbilitySet.h belong to another
+ * slice this pass, so the seam lives here instead and the weapon includes this header. MIGRATING IT
+ * IS TWO LINES: add `virtual float GetAddedRecoilScale() const { return 0.f; }` and
+ * `virtual bool IsFullAutoForced() const { return false; }` to UTraceCharacterAbilitySet, add the
+ * two `...For(Actor)` statics beside GetFireIntervalScaleFor, and repoint the two call sites in
+ * UTraceWeaponComponent (GetRecoilPitchScale and IsFullAutoNow). Nothing else reads these.
+ */
+namespace TraceRoxie
+{
+	/**
+	 * SPEC v29 §2e: "Roxie's modded should add recoil now."
+	 *
+	 * Added recoil for @p Shooter AS A MULTIPLE OF UTraceSettings::RecoilPitchPerShot —
+	 * RoxieModdedRecoilScale while MODDED is up, and 0.0 for everybody else, every bot, every
+	 * Mannequin and for Roxie herself the instant MODDED ends.
+	 *
+	 * *** A MULTIPLE AND NOT A NUMBER OF DEGREES (standing rule). *** The value modifies the base
+	 * per-shot kick, so it is stored and returned relative to it; the weapon multiplies. Retune the
+	 * base and Roxie moves with it. See UTraceWeaponComponent::GetRecoilPitchScale for the sum it
+	 * lands in and for why it ADDS to the global bRecoilEnabled term rather than overriding it.
+	 */
+	TRACE_API float GetAddedRecoilScaleFor(const AActor* Shooter);
+
+	/**
+	 * SPEC v18 §2's "the gun becomes full auto", which spec v29 §2b finally gives something to do.
+	 *
+	 * True while MODDED is up (and bRoxieModdedFullAuto is set), false for everybody else. The weapon
+	 * ORs it with the weapon's own mode, so MODDED can ADD full auto to the now-semi-automatic pistol
+	 * and can never take it away from the SMG.
+	 */
+	TRACE_API bool IsFullAutoForcedFor(const AActor* Shooter);
+}
 
 /**
  * Roxie's bits in FTraceAbilityNetState::Flags. Only one character is live on a component at a time,
@@ -247,11 +306,35 @@ public:
 	/**
 	 * §2: "the gun becomes FULL AUTO". True while MODDED is up and bRoxieModdedFullAuto is set.
 	 *
-	 * The base gun is ALREADY full auto (see the file header, note 1), so this is currently a
-	 * statement of intent rather than a switch anything reads. It exists so the clause has a single
-	 * named answer if the gun is ever made semi-automatic.
+	 * *** WIRED AT LAST, SPEC v29 §2b. *** This used to say "a statement of intent rather than a
+	 * switch anything reads… it exists so the clause has a single named answer if the gun is ever
+	 * made semi-automatic". The gun has now been made semi-automatic: §2b says "The pistol is NOT
+	 * full auto. It must fire once per trigger press." So MODDED's full-auto clause is a mechanic
+	 * from this pass on — a Roxie with MODDED up can HOLD the trigger on a pistol, which nobody else
+	 * can — and it is read by UTraceWeaponComponent::IsFullAutoNow() through
+	 * TraceRoxie::IsFullAutoForcedFor(), the seam at the top of this header.
+	 *
+	 * The SMG is unaffected: it is full auto for everybody, and the weapon ORs the two answers, so an
+	 * ability can only ever ADD full auto and never remove it.
 	 */
 	bool IsFullAutoForced() const;
+
+	/**
+	 * *** SPEC v29 §2e — "Roxie's modded should add recoil now". HER TRADE FOR THE FIRE RATE. ***
+	 *
+	 * Added per-shot kick AS A MULTIPLE OF UTraceSettings::RecoilPitchPerShot: RoxieModdedRecoilScale
+	 * while MODDED is up, 0 otherwise.
+	 *
+	 * *** A MULTIPLE, NEVER DEGREES (standing rule) *** — the same shape as GetFireIntervalScale()
+	 * above and for the same reason spec v24 §0 forced that one to be a ratio: an absolute stored
+	 * here would go stale the first time the base recoil moved, silently, with the card and the HUD
+	 * still claiming the old trade. The weapon multiplies; nothing here knows what a degree is.
+	 *
+	 * Demo 22 removed recoil globally and that removal STANDS — bRecoilEnabled is still false. This
+	 * ADDS to it rather than overriding it, so recoil is off for everybody and on for her while
+	 * MODDED runs; see UTraceWeaponComponent::GetRecoilPitchScale() for the sum.
+	 */
+	float GetAddedRecoilScale() const;
 
 	// =============================================================================================
 	// HARNESS ENTRY POINTS — dev only in effect, but plain functions so the shipping path is identical

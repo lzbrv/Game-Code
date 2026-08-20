@@ -1187,6 +1187,15 @@ public:
 		float HeldSeconds = 0.f;
 		float ChargeScale = 1.f;
 		FString ThrowerName;
+		/**
+		 * SPEC v29 §6. Bumped once per accepted throw, and never reset.
+		 *
+		 * A HARNESS CANNOT DETECT A THROW BY WATCHING THE VALUES: two throws at the same charge from
+		 * the same standing pawn produce a byte-identical sample, so Trace.ModeB.ThrowSpread would
+		 * silently record one of forty and call the spread zero. Watching a counter is the only
+		 * honest "did it happen" — this is the same reason ClipSerial exists on the weapon.
+		 */
+		int32 Serial = 0;
 	};
 
 	static FThrowMomentumSample LastThrow;
@@ -1222,8 +1231,13 @@ public:
 	 *           load-bearing: a completed pass moves the Core to the receiver BEFORE the player's
 	 *           finger leaves the button, so the passer is no longer the holder when their release
 	 *           arrives, and dropping it there is what leaves the latch set into the next possession.
+	 *
+	 * @param ClientPressServerTime  SPEC v29 §6. The shared-clock instant the owning machine's button
+	 *        actually went down, or < 0 for "no stamp, use now" — which is what every server-side and
+	 *        bot caller passes and is why it is defaulted. See ServerSetPassInput for the clamp and
+	 *        for the whole argument; it is the gun's rewind budget, unchanged.
 	 */
-	void RequestPassInput(bool bPressed, ATraceCharacter* Requester);
+	void RequestPassInput(bool bPressed, ATraceCharacter* Requester, float ClientPressServerTime = -1.f);
 
 	/**
 	 * Server RPC half of RequestPassInput. Routed via this actor's Owner (= the holder).
@@ -1231,9 +1245,39 @@ public:
 	 * Requester travels with the call rather than being inferred from the Owner: ownership moves the
 	 * instant the Core does, so a release sent a frame before a transfer would otherwise be applied
 	 * to the pawn that just RECEIVED the Core.
+	 *
+	 * ===============================================================================================
+	 * *** SPEC v29 §6 — ClientPressServerTime, AND WHY A "CLIENT-SUPPLIED HOLD" ARGUMENT DOES NOT
+	 * *** APPLY TO IT.
+	 * ===============================================================================================
+	 *
+	 * The bug: "Sometimes I charge up a throw and let go and it doesn't go the full distance."
+	 * MEASURED CAUSE (see Trace.ModeB.ThrowSpread): the hold was measured from the instant the PRESS
+	 * RPC ARRIVED to the instant the RELEASE RPC ARRIVED, so it was the player's true hold plus
+	 * (upstream lag at the release − upstream lag at the press). That difference is jitter, it is
+	 * signed, and when it is negative the server's number is SHORTER than the hold the player's own
+	 * charge ring showed them. Intermittent by construction, and worse the closer the player releases
+	 * to the instant the ring completes — which is exactly when a player releases.
+	 *
+	 * THIS IS THE SAME BUG THIS REPO ALREADY FOUND AND FIXED ONCE, on the weapon pullout:
+	 * UTraceWeaponComponent::ServerRequestEquip's own comment records "a client's measured pullout
+	 * 0.294 s against a specified 0.2 s", with the identical cause and the identical fix. The throw
+	 * simply never got it.
+	 *
+	 * WHAT IS SENT IS AN INSTANT, NOT A DURATION, AND THE DIFFERENCE IS THE WHOLE SECURITY ARGUMENT.
+	 * A client-supplied HOLD would be a client-supplied launch speed — the single most valuable number
+	 * in this game to lie about, which is what RequestPassInput's own comment has always said. A
+	 * client-supplied PRESS INSTANT is pinned by the server into [ServerNow − MaxRewindTime,
+	 * ServerNow]: never in the future, so a throw cannot be pre-booked, and never further back than a
+	 * bullet may be rewound. The RELEASE is still stamped by the server on arrival and is never taken
+	 * from the client at all. So the worst a liar buys is MaxRewindTime of extra charge, which is the
+	 * same budget the gun already grants every shot and is bounded by the same setting.
+	 *
+	 * THE RED ARM IS `Trace.ModeB.ThrowChargeAnchorAtPress 0`, which restores the pre-v29 behaviour
+	 * (anchor at arrival) in the same binary.
 	 */
 	UFUNCTION(Server, Reliable)
-	void ServerSetPassInput(bool bPressed, ATraceCharacter* Requester);
+	void ServerSetPassInput(bool bPressed, ATraceCharacter* Requester, float ClientPressServerTime);
 
 	/** 0..1 progress of the pass hold, from replicated state, or from local prediction if newer. */
 	float GetPassProgress() const;

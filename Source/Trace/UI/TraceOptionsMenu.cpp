@@ -27,7 +27,7 @@
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
 #include "Audio/TraceAudio.h"           // spec v26 §9 - ButtonPress on the submenu rows too
-#include "Gameplay/TraceMelee.h"       // spec v28 §10 - the dual-wield switch renames the two weapon rows
+#include "Gameplay/TraceMelee.h"       // kept for the transitive gameplay types; the v28 §10 row-label override it fed is deleted (v29 §5)
 
 // =================================================================================================
 // WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
@@ -761,6 +761,24 @@ namespace
 			else
 			{
 				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Settings: no HUD is drawing an overlay yet."));
+			}
+		}));
+
+	FAutoConsoleCommand CmdMenuCrosshair(
+		TEXT("Trace.Menu.Crosshair"),
+		TEXT("Spec v29 s3. Opens the CROSSHAIR settings page on whichever HUD is up. Works on the title ")
+		TEXT("screen and in a match. Twin of Trace.Menu.Video and Trace.Menu.Settings, and it exists for ")
+		TEXT("the same reason: a headless run has no keyboard, so without it there is no way to photograph ")
+		TEXT("this page at all. -TraceExec=\"Trace.Menu.Crosshair\"."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->OpenCrosshair();
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Crosshair: no HUD is drawing an overlay yet."));
 			}
 		}));
 
@@ -1506,6 +1524,28 @@ void FTraceOptionsMenu::OpenVideo()
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Video settings opened."));
 }
 
+void FTraceOptionsMenu::OpenCrosshair()
+{
+	Page = EPage::Crosshair;
+	bCapturingKey = false;
+
+	// Closed, not Settings: this entry point IS the top of the stack, so BACK has to close rather than
+	// drop the player onto a settings page they never asked for. Same contract as OpenVideo.
+	CrosshairReturnPage = EPage::Closed;
+	IgnoreInputBeforeFrame = GFrameCounter + 1;
+
+#if !UE_BUILD_SHIPPING
+	// See TickAutoActivate: the capture hook is armed per opening, not per process.
+	DrawsSinceOpen = 0;
+	bAutoActivateDone = false;
+#endif
+	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
+	SetPressDeliveryOverride(true);
+
+	RebuildRows();
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Crosshair settings opened."));
+}
+
 void FTraceOptionsMenu::Close()
 {
 	if (Page == EPage::Closed)
@@ -1550,38 +1590,23 @@ void FTraceOptionsMenu::Close()
 // Rows
 // =================================================================================================
 
-namespace
-{
-	/**
-	 * *** THE TWO WEAPON ROWS ARE LABELLED FROM THE LIVE SWITCH, NOT FROM THE TABLE. ***
-	 *
-	 * Spec v28 §10 remaps the 1 and 2 keys (TraceMelee::RequestEquipIfDifferent — "the only place it
-	 * happens"): with dual wield ON they select the PISTOL and the SMG, with it OFF they are v27's
-	 * knife and gun. The ConfigIds "EquipKnife"/"EquipGun" are frozen — renaming either costs every
-	 * returning player that bind — and FTraceInputActionInfo::DisplayName is a static string in a
-	 * table that cannot see a runtime cvar. So the SLICE THAT DRAWS THE LABEL asks the switch, which
-	 * is also the only place the answer is needed: everything else that prints DisplayName is a log
-	 * line for a developer, and those correctly name the action rather than the weapon.
-	 *
-	 * This is the last thing spec v28 §10's "revertible in one prompt" was missing. Flip
-	 * bDualWieldKnife (or Trace.Knife.DualWield, or -TraceLegacyKnife) and the keybind page renames
-	 * these two rows with the behaviour, in the same frame, with no rebuild and no ini edit.
-	 */
-	const TCHAR* TraceOptionsBindingRowLabel(const FTraceInputActionInfo& Info)
-	{
-		const bool bDualWield = TraceMelee::IsDualWieldEnabled();
-
-		if (Info.Action == ETraceInputAction::EquipKnife)
-		{
-			return bDualWield ? TEXT("WEAPON 1 (PISTOL)") : TEXT("EQUIP KNIFE");
-		}
-		if (Info.Action == ETraceInputAction::EquipGun)
-		{
-			return bDualWield ? TEXT("WEAPON 2 (SMG)") : TEXT("EQUIP GUN");
-		}
-		return Info.DisplayName;
-	}
-}
+// *** SPEC v29 §5 — THE `TraceOptionsBindingRowLabel` OVERRIDE IS DELETED. THE TABLE IS THE LABEL. ***
+//
+// It existed for one pass. Spec v28 §10 remapped 1 and 2 onto PISTOL and SMG behind two ConfigIds
+// still named "EquipKnife"/"EquipGun", and rather than rename them (which costs every returning
+// player that bind) the page overrode their DisplayName with "WEAPON 1 (PISTOL)" / "WEAPON 2 (SMG)"
+// from the live dual-wield cvar.
+//
+// v29 §5 shifts the layout to 1 = STOW GUNS, 2 = PISTOL, 3 = SMG, and the §5 slice has already
+// migrated the ConfigIds ("StowGuns"/"EquipPistol"/"EquipSmg") and written the correct DisplayNames
+// into TraceInputActions::All(). The override was therefore printing the PREVIOUS pass's layout over
+// the top of the current one: row 12 read "WEAPON 1 (PISTOL)" for what is now STOW GUNS, and row 13
+// read "WEAPON 2 (SMG)" for what is now PISTOL — i.e. every weapon row on the keybind page named the
+// wrong key. Deleting it is the entire fix; the strings below come straight from the table, which is
+// the one place they are maintained.
+//
+// The legacy arm loses nothing worth keeping: with bDualWieldKnife OFF the 1 key still selects the
+// blade, and "STOW GUNS (KNIFE ONLY)" describes that correctly.
 
 void FTraceOptionsMenu::RebuildRows()
 {
@@ -1674,6 +1699,39 @@ void FTraceOptionsMenu::RebuildRows()
 		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetVideoDefaults);
 		AddAction(TEXT("BACK"), EAction::Back);
 	}
+	else if (Page == EPage::Crosshair)
+	{
+		// ---- SPEC v29 §3 — SHAPE FIRST, THEN INK ------------------------------------------------
+		//
+		// The order is the order a player actually decides in, and it is not the order the fields are
+		// declared in. Size, thickness and gap are the SHAPE — they are what the player is here to
+		// change, they are the three that interact with each other (a big gap with short arms is a
+		// different instrument from a small gap with long ones), and every one of them is visible in
+		// the preview the moment it moves. Colour, opacity, dot and outline are then decisions about
+		// the shape you have already settled on.
+		//
+		// The two toggles go LAST and together, because they are the two rows that answer "is there
+		// LESS of it" rather than "how much".
+		AddHeader(TEXT("SHAPE"));
+		AddValue(ERowKind::Slider, TEXT("SIZE"), ESetting::CrosshairSize);
+		AddValue(ERowKind::Slider, TEXT("THICKNESS"), ESetting::CrosshairThickness);
+		AddValue(ERowKind::Slider, TEXT("GAP"), ESetting::CrosshairGap);
+
+		AddHeader(TEXT("APPEARANCE"));
+		AddValue(ERowKind::Choice, TEXT("COLOUR"), ESetting::CrosshairColor);
+		AddValue(ERowKind::Slider, TEXT("OPACITY"), ESetting::CrosshairOpacity);
+		AddValue(ERowKind::Toggle, TEXT("CENTRE DOT"), ESetting::CrosshairDot);
+		AddValue(ERowKind::Toggle, TEXT("OUTLINE"), ESetting::CrosshairOutline);
+
+		// Not decoration. The preview beside this list draws at ACTUAL SIZE, which at 1080p is a cross
+		// about twenty pixels across sitting in a box ten times that — and a player who does not know
+		// it is 1:1 reads that as the preview being broken. The note is how they are told.
+		AddNote(TEXT("PREVIEW IS ACTUAL SIZE, OVER THE TWO SURFACES THE ARENA IS MADE OF."));
+
+		AddHeader(TEXT(""));
+		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetCrosshairDefaults);
+		AddAction(TEXT("BACK"), EAction::Back);
+	}
 	else if (Page == EPage::Settings)
 	{
 		// First row on the page, above the mouse. Same reasoning as the pause root's VIDEO entry —
@@ -1681,6 +1739,11 @@ void FTraceOptionsMenu::RebuildRows()
 		// pause root at all, so it cannot be buried at the bottom next to RESET.
 		AddHeader(TEXT("DISPLAY"));
 		AddAction(TEXT("VIDEO SETTINGS"), EAction::OpenVideo);
+
+		// SPEC v29 §3. Beside VIDEO SETTINGS rather than in a section of its own: both rows are doors
+		// to a page about how the game LOOKS, and this is the only route the title screen has to
+		// either of them — there is no pause root there to hang a shortcut on.
+		AddAction(TEXT("CROSSHAIR"), EAction::OpenCrosshair);
 
 		// ---- Match rules (spec v14 §3) ----------------------------------------------------------
 		//
@@ -1726,7 +1789,7 @@ void FTraceOptionsMenu::RebuildRows()
 		{
 			FRow Row;
 			Row.Kind = ERowKind::Binding;
-			Row.Label = TraceOptionsBindingRowLabel(Info);
+			Row.Label = Info.DisplayName;   // spec v29 §5: straight from the table, no override
 			Row.Binding = Info.Action;
 			Rows.Add(MoveTemp(Row));
 		}
@@ -2357,6 +2420,77 @@ void FTraceOptionsMenu::GetSettingValue(ESetting Setting, float& OutValue, float
 		OutStep = 1.f;
 		break;
 
+	// ---- SPEC v29 §3 — the crosshair --------------------------------------------------------
+	//
+	// RANGES COME FROM UTraceUserSettings' OWN CONSTANTS, never from numbers written down again
+	// here — the same rule the video block below states. A menu that clamped a slider to a range
+	// the settings class does not share is a menu that will one day refuse to reach a value the
+	// settings class allows, or offer one it silently clamps away.
+	//
+	// The values are read through the CLAMPED accessors rather than off the raw fields, so a hand
+	// edited .ini shows the row the value the game is actually using. Showing the raw number would
+	// make the row disagree with the preview sitting next to it.
+
+	case ESetting::CrosshairSize:
+		OutValue = Settings.GetCrosshairSize();
+		OutMin = UTraceUserSettings::MinCrosshairSize;
+		OutMax = UTraceUserSettings::MaxCrosshairSize;
+		// Whole reference pixels. The crosshair is snapped to integer pixels when it is drawn
+		// (BuildCrosshairBars), so a step finer than 1 would give two slider positions that produce
+		// the identical crosshair — a control that visibly does nothing on half its presses.
+		OutStep = 1.f;
+		break;
+
+	case ESetting::CrosshairThickness:
+		OutValue = Settings.GetCrosshairThickness();
+		OutMin = UTraceUserSettings::MinCrosshairThickness;
+		OutMax = UTraceUserSettings::MaxCrosshairThickness;
+		// HALF pixels here, unlike SIZE, and the shipped default is why: it is 2.5, which a whole
+		// pixel step could not express — the row would refuse to show a player the value they are on.
+		OutStep = 0.5f;
+		break;
+
+	case ESetting::CrosshairGap:
+		OutValue = Settings.GetCrosshairGap();
+		OutMin = UTraceUserSettings::MinCrosshairGap;
+		OutMax = UTraceUserSettings::MaxCrosshairGap;
+		OutStep = 1.f;
+		break;
+
+	case ESetting::CrosshairColor:
+		OutValue = float(FMath::Clamp(Settings.CrosshairColorIndex, 0,
+			UTraceUserSettings::NumCrosshairColors() - 1));
+		OutMin = 0.f;
+		OutMax = float(FMath::Max(0, UTraceUserSettings::NumCrosshairColors() - 1));
+		OutStep = 1.f;
+		break;
+
+	case ESetting::CrosshairOpacity:
+		// *** IN PERCENT, NOT IN THE 0..1 THE SETTING STORES. *** A slider that stepped 0.05 through
+		// 0.20..1.00 prints "0.85" and lands on values a player cannot report back or reproduce. The
+		// conversion is one multiply here and one divide in SetSettingNormalised, and it is the only
+		// row on any of these pages whose display unit differs from its storage unit — which is why
+		// it is said twice, loudly, in both places.
+		OutValue = Settings.GetCrosshairOpacity() * 100.f;
+		OutMin = UTraceUserSettings::MinCrosshairOpacity * 100.f;
+		OutMax = UTraceUserSettings::MaxCrosshairOpacity * 100.f;
+		OutStep = 5.f;
+		break;
+
+	case ESetting::CrosshairDot:
+		OutValue = Settings.bCrosshairCenterDot ? 1.f : 0.f;
+		OutMin = 0.f;
+		OutMax = 1.f;
+		OutStep = 1.f;
+		break;
+
+	case ESetting::CrosshairOutline:
+		OutValue = Settings.bCrosshairOutline ? 1.f : 0.f;
+		OutMin = 0.f;
+		OutMax = 1.f;
+		OutStep = 1.f;
+		break;
+
 	default:
 		break;
 	}
@@ -2532,7 +2666,37 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 	case ESetting::VSync:
 	case ESetting::InvertY:
 	case ESetting::CharactersEnabled:
+	// SPEC v29 §3 — the two crosshair toggles read like every other toggle on these pages. Sharing
+	// this case rather than writing "ON"/"OFF" again is what stops one page's toggles from one day
+	// saying ENABLED while another's say ON.
+	case ESetting::CrosshairDot:
+	case ESetting::CrosshairOutline:
 		return (Value >= 0.5f) ? TEXT("ON") : TEXT("OFF");
+
+	// ---- SPEC v29 §3 --------------------------------------------------------------------------
+	//
+	// "PX" and not "PIXELS": these are 1080p-REFERENCE pixels, which is what every layout number in
+	// this project is in, and at 1920x1080 they are literal screen pixels. Spelling it out in the row
+	// would be a claim that is exactly true at one resolution, so the unit is short and the honest
+	// version lives in the header of Settings/TraceUserSettings.h.
+	case ESetting::CrosshairSize:
+	case ESetting::CrosshairGap:
+		return FString::Printf(TEXT("%d PX"), FMath::RoundToInt(Value));
+
+	case ESetting::CrosshairThickness:
+		// One decimal, because the shipped default is 2.5 and rounding it to "2" or "3" on the row
+		// would make the RESET row's result look like it had missed.
+		return FString::Printf(TEXT("%.1f PX"), Value);
+
+	case ESetting::CrosshairColor:
+		// The palette's own names, from the settings class, for the same reason the video rows take
+		// their labels from UTraceGameUserSettings: one spelling of "MAGENTA" in the game and in the
+		// log that a bug report will be lined up against.
+		return UTraceUserSettings::DescribeCrosshairColor(FMath::RoundToInt(Value));
+
+	case ESetting::CrosshairOpacity:
+		// Already in percent — see GetSettingValue, which is the only place the conversion happens.
+		return FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Value));
 
 	case ESetting::FrameRateLimit:
 	{
@@ -2658,6 +2822,32 @@ void FTraceOptionsMenu::SetSettingNormalised(ESetting Setting, float Alpha)
 	case ESetting::Sensitivity:  Settings.MouseSensitivity = Snapped; break;
 	case ESetting::SensitivityY: Settings.MouseSensitivityYScale = Snapped; break;
 	case ESetting::InvertY:      Settings.bInvertMouseY = (Snapped >= 0.5f); break;
+
+	// ---- SPEC v29 §3 --------------------------------------------------------------------------
+	//
+	// *** EVERY CROSSHAIR ROW MUST APPEAR HERE OR IT SILENTLY DOES NOTHING. *** The `default: return`
+	// below is a real trapdoor and this page has fallen through it before: spec v14 §3's CHARACTERS
+	// row is handled above precisely because landing here would have made it a control that took
+	// input and changed no state. A row that draws a value, highlights, accepts arrow keys and
+	// changes nothing is the worst failure an options screen has, because it looks like it worked.
+	//
+	// THESE ARE PLAIN ASSIGNMENTS OF Snapped, NOT INCREMENTS, and that is the other trapdoor. A
+	// toggle written as a clamping increment can be turned on and never off — see the note in
+	// ActivateSelected, which is where that shipped once and was reported as "the button to uninvert
+	// it didn't work". Both toggles below take a value that came from the caller's full range, so
+	// LEFT, RIGHT, ENTER and a click all reach both states.
+	case ESetting::CrosshairSize:      Settings.CrosshairSize = Snapped; break;
+	case ESetting::CrosshairThickness: Settings.CrosshairThickness = Snapped; break;
+	case ESetting::CrosshairGap:       Settings.CrosshairGap = Snapped; break;
+	case ESetting::CrosshairColor:     Settings.CrosshairColorIndex = FMath::RoundToInt(Snapped); break;
+
+	// Back out of the row's percent into the 0..1 the setting stores. The ONE unit conversion on
+	// these pages; its twin is in GetSettingValue and neither may move without the other.
+	case ESetting::CrosshairOpacity:   Settings.CrosshairOpacity = Snapped * 0.01f; break;
+
+	case ESetting::CrosshairDot:       Settings.bCrosshairCenterDot = (Snapped >= 0.5f); break;
+	case ESetting::CrosshairOutline:   Settings.bCrosshairOutline = (Snapped >= 0.5f); break;
+
 	default: return;
 	}
 
@@ -2842,6 +3032,23 @@ void FTraceOptionsMenu::ActivateSelected()
 		RebuildRows();
 		break;
 
+	case EAction::OpenCrosshair:
+		// Remember where we came from, exactly as OpenVideo does. Only the settings page carries this
+		// row today, but "back" must mean the place the player actually came from rather than one
+		// hardcoded parent — Trace.Menu.Crosshair can also land them here from nowhere.
+		CrosshairReturnPage = Page;
+		Page = EPage::Crosshair;
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		RebuildRows();
+		break;
+
+	case EAction::ResetCrosshairDefaults:
+		// The crosshair's SEVEN fields and nothing else — not the mouse, not the bindings, not the
+		// resolution. See EAction::ResetCrosshairDefaults in the header.
+		UTraceUserSettings::Get().ResetCrosshairToDefaults();
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Crosshair reset to defaults."));
+		break;
+
 	case EAction::AutoDetectQuality:
 		// Deferred one frame so the "MEASURING…" state is drawn before the benchmark blocks. Cleared
 		// and run at the top of the next Tick.
@@ -2892,6 +3099,22 @@ void FTraceOptionsMenu::GoBack()
 		if (VideoReturnPage == EPage::Root || VideoReturnPage == EPage::Settings)
 		{
 			Page = VideoReturnPage;
+			IgnoreInputBeforeFrame = GFrameCounter + 1;
+			RebuildRows();
+			return;
+		}
+
+		Close();
+		return;
+	}
+
+	if (Page == EPage::Crosshair)
+	{
+		// No queued apply to flush, unlike the video page: every crosshair row is written and saved on
+		// the press or the mouse-up that made it, because none of them re-creates a swap chain.
+		if (CrosshairReturnPage == EPage::Root || CrosshairReturnPage == EPage::Settings)
+		{
+			Page = CrosshairReturnPage;
 			IgnoreInputBeforeFrame = GFrameCounter + 1;
 			RebuildRows();
 			return;
@@ -3222,18 +3445,60 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	{
 		PanelW = FMath::Min(ViewW * 0.86f, 1020.f * UIScale);
 	}
+	else if (Page == EPage::Crosshair)
+	{
+		// NARROWER THAN THE SETTINGS PAGE, to buy the room the preview sits in. Nine rows of short
+		// labels and short values ("SIZE  11 PX") do not need 880 px, and the preview is worth more
+		// than the whitespace it costs.
+		PanelW = FMath::Min(ViewW * 0.50f, 560.f * UIScale);
+	}
 
-	const float PanelX = (ViewW - PanelW) * 0.5f;
+	// ---- SPEC v29 §3 — the live preview, BESIDE the panel ---------------------------------------
+	//
+	// Beside and not inside, because the panel is sized to its ROWS: its height is RowCount * Pitch,
+	// and there is no row shape that can be four times its neighbours' height without breaking the
+	// pitch every hit rect on the page is computed from. A box to the right of the list needs none of
+	// that machinery and gets a preview big enough to judge a crosshair in.
+	//
+	// THE PAIR IS CENTRED, NOT THE PANEL. Otherwise the list stays put and the preview hangs off one
+	// side, which reads as an element that escaped its layout rather than as a two-column page.
+	//
+	// AND IT IS CONDITIONAL. At a small window the pair does not fit, and a preview that overlapped
+	// the panel would be worse than none — so the fit is tested and the page falls back to exactly
+	// the single centred panel every other page draws. Measured: it fits at 1280x720 (UIScale 0.667:
+	// 373 + 13 + 213 = 599 of 1229 available) and at 1920x1080 (560 + 20 + 320 = 900 of 1843).
+	const bool bWantPreview = (Page == EPage::Crosshair);
+	const float PreviewGap = 20.f * UIScale;
+	const float PreviewW = FMath::Min(ViewW * 0.28f, 320.f * UIScale);
+	const float PreviewH = FMath::Min(PreviewW, PanelH);
+
+	const bool bDrawPreview = bWantPreview
+		&& (PanelW + PreviewGap + PreviewW) <= (ViewW * 0.96f);
+
+	const float GroupW = bDrawPreview ? (PanelW + PreviewGap + PreviewW) : PanelW;
+	const float PanelX = (ViewW - GroupW) * 0.5f;
 	const float PanelY = (ViewH - PanelH) * 0.5f;
-	const float CX = ViewW * 0.5f;
+
+	// The panel's own centre, not the screen's. Everything centred below — the title, the footer hint
+	// — belongs to the PANEL, and on the crosshair page the two are no longer the same pixel.
+	const float CX = PanelX + PanelW * 0.5f;
 
 	HUD->DrawRect(TraceOptionsStyle::Panel, PanelX, PanelY, PanelW, PanelH);
 	DrawFrame(HUD, PanelX, PanelY, PanelW, PanelH);
 
+	if (bDrawPreview)
+	{
+		// After the panel, so the preview's own frame is never drawn under it, and before the rows so
+		// nothing about it can move a row rect. See DrawCrosshairPreview.
+		DrawCrosshairPreview(HUD, PanelX + PanelW + PreviewGap,
+			PanelY + (PanelH - PreviewH) * 0.5f, PreviewW, PreviewH);
+	}
+
 	// ---- Title ---------------------------------------------------------------------------------
 	FString Title = TEXT("SETTINGS");
-	if (Page == EPage::Root)       { Title = TEXT("PAUSED"); }
-	else if (Page == EPage::Video) { Title = TEXT("VIDEO"); }
+	if (Page == EPage::Root)            { Title = TEXT("PAUSED"); }
+	else if (Page == EPage::Video)      { Title = TEXT("VIDEO"); }
+	else if (Page == EPage::Crosshair)  { Title = TEXT("CROSSHAIR"); }
 
 	// SOFACHROME, and the spec names this string: "the word SETTINGS at the top of the settings page
 	// stays Sofachrome while the rows beneath it become Erbaum" (v26 §2). PAUSED and VIDEO are the
@@ -3276,9 +3541,9 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	{
 		Hint = TEXT("W / S  OR  ARROWS   MOVE          ENTER   SELECT          ESC   RESUME");
 	}
-	else if (Page == EPage::Video)
+	else if (Page == EPage::Video || Page == EPage::Crosshair)
 	{
-		// No BKSP/UNBIND on this page — there is nothing to unbind — and the hint says so rather
+		// No BKSP/UNBIND on either page — there is nothing to unbind — and the hint says so rather
 		// than offering a key that does nothing.
 		Hint = TEXT("ARROWS  MOVE / ADJUST          ENTER  SELECT          ESC  BACK");
 	}
@@ -3739,6 +4004,105 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	// UNCHANGED BY SPEC v20: the sprite above is fitted to TrackLeft/TrackW, never the other way
 	// round, so this is the same rectangle it has always been and a drag lands where it always did.
 	Row.Track = FBox2D(FVector2D(TrackLeft, TrackY - H * 0.4f), FVector2D(TrackLeft + TrackW, TrackY + H * 0.4f));
+}
+
+void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float W, float H)
+{
+	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+	// ---- The two surfaces ----------------------------------------------------------------------
+	//
+	// Split down the middle, and both colours are taken from the thing they stand for rather than
+	// invented: the left is the arena's black floor and the right is (193, 252, 253) — the lit cyan
+	// surface named in ATraceHUD::DrawAimReticle's own note as the one a white reticle disappeared
+	// against. That failure is the reason the outline exists at all, so it is the exact case a
+	// crosshair preview has to be able to show.
+	//
+	// Integer-snapped like everything else that has to be pixel-crisp; a half-pixel seam under the
+	// crosshair would be a grey band that looks like part of the crosshair.
+	const float BoxX = FMath::RoundToFloat(X);
+	const float BoxY = FMath::RoundToFloat(Y);
+	const float BoxW = FMath::RoundToFloat(W);
+	const float BoxH = FMath::RoundToFloat(H);
+	const float HalfW = FMath::RoundToFloat(BoxW * 0.5f);
+
+	HUD->DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 1.f), BoxX, BoxY, HalfW, BoxH);
+	HUD->DrawRect(FLinearColor(0.757f, 0.988f, 0.992f, 1.f), BoxX + HalfW, BoxY, BoxW - HalfW, BoxH);
+
+	// The same instrument-panel bezel the settings panel wears, so the preview reads as part of the
+	// page rather than as a texture dropped onto it.
+	DrawFrame(HUD, BoxX, BoxY, BoxW, BoxH);
+
+	// ---- The crosshair, from the SAME geometry the HUD draws -----------------------------------
+	//
+	// UTraceUserSettings::BuildCrosshairBars, not a copy of it. PixelScale is UIScale and nothing
+	// else: scale 1.0 is the FIRST-PERSON crosshair, which is the one the player is aiming a gun
+	// with and therefore the one this page is about. The third-person carry view multiplies it by
+	// UTraceSettings::ThirdPersonCrosshairScale, which is a designer's knob and not on this page.
+	const float CenterX = BoxX + HalfW;
+	const float CenterY = BoxY + FMath::RoundToFloat(BoxH * 0.5f);
+
+	FTraceCrosshairBar Bars[TraceCrosshairMaxBars];
+	const int32 NumBars = Settings.BuildCrosshairBars(CenterX, CenterY, UIScale, Bars);
+
+	const FLinearColor Ink = Settings.GetCrosshairColor();
+	const FLinearColor Outline = Settings.GetCrosshairOutlineColor();
+
+	// *** DrawRect AND NEVER DrawLine. *** AHUD::DrawLine goes through the batched-element path,
+	// which DISCARDS the alpha it is handed — every line comes out fully opaque. The OPACITY row on
+	// this very page would then be a control whose effect could not be seen in the preview beside it,
+	// and the OUTLINE row's "off" (an alpha of zero) would draw a solid black box. Rects carry alpha.
+	if (Outline.A > UE_KINDA_SMALL_NUMBER)
+	{
+		for (int32 Index = 0; Index < NumBars; ++Index)
+		{
+			const FTraceCrosshairBar& B = Bars[Index];
+			HUD->DrawRect(Outline, B.X - 1.f, B.Y - 1.f, B.W + 2.f, B.H + 2.f);
+		}
+	}
+	for (int32 Index = 0; Index < NumBars; ++Index)
+	{
+		const FTraceCrosshairBar& B = Bars[Index];
+		HUD->DrawRect(Ink, B.X, B.Y, B.W, B.H);
+	}
+
+	// ---- Caption -------------------------------------------------------------------------------
+	//
+	// BODY (spec v26 §2): this is a label on a control, on a submenu, in the same rhythm as the rows
+	// to its left. Erbaum Bold, like every other string on this page that is not a heading.
+	//
+	// Drawn on the DARK half so it is legible whatever the preview's own colours are doing, and
+	// pinned to the bottom of the box rather than under it, because it belongs to the box.
+	const float CaptionScale = 0.95f * UIScale;
+	TraceOptionsMenuType::Draw(HUD, TEXT("PREVIEW"),
+		TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.85f),
+		BoxX + (10.f * UIScale), BoxY + (8.f * UIScale), FontSmall, CaptionScale,
+		TraceOptionsMenuType::BodyFace);
+
+	// The live numbers, so the preview is readable as evidence in a screenshot and not only by eye.
+	// One line, in the same face, derived from the same accessors the crosshair above was built from.
+	//
+	// ON ITS OWN DARK STRIP, spanning the full width. The line is longer than the dark half of the
+	// box, so without the strip its tail would be near-white ink on the lit cyan surface — invisible,
+	// which is the exact defect the cyan half is here to demonstrate. A caption that fell into it
+	// would be an unintentional demonstration.
+	const FString Readout = FString::Printf(TEXT("%d / %.1f / %d  %s  %d%%"),
+		FMath::RoundToInt(Settings.GetCrosshairSize()),
+		Settings.GetCrosshairThickness(),
+		FMath::RoundToInt(Settings.GetCrosshairGap()),
+		*UTraceUserSettings::DescribeCrosshairColor(Settings.CrosshairColorIndex),
+		FMath::RoundToInt(Settings.GetCrosshairOpacity() * 100.f));
+
+	const float ReadoutH = TraceOptionsMenuType::Height(HUD, FontSmall, CaptionScale);
+	const float StripH = ReadoutH + (10.f * UIScale);
+	const float StripY = BoxY + BoxH - StripH;
+
+	HUD->DrawRect(FLinearColor(0.f, 0.02f, 0.04f, 0.88f), BoxX, StripY, BoxW, StripH);
+
+	TraceOptionsMenuType::Draw(HUD, Readout,
+		TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Ink, 0.90f),
+		BoxX + (10.f * UIScale), StripY + (5.f * UIScale),
+		FontSmall, CaptionScale, TraceOptionsMenuType::BodyFace);
 }
 
 bool FTraceOptionsMenu::DrawValueChip(AHUD* HUD, float X, float Y, float W, float H) const

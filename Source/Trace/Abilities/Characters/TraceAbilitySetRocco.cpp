@@ -233,6 +233,17 @@ bool UTraceAbilitySetRocco::ActivateAbility()
 
 	ActiveRipple = Ripple;
 
+	// SPEC v29 §1f — RoccoRipple. The third WAV with no stated trigger, and the name settles it:
+	// "Rocco's Ripple ability firing". This is the moment it fires — authority only (the early return
+	// above means a client never reaches here), once per cast, after the path actually exists so a
+	// fizzle is silent.
+	//
+	// GAME-SIDE, and that is the judgement §1f asks for. A Ripple is a thing OTHER players ride and
+	// other players have to react to; it belongs in the same class as Dash and Parry, which spec v26
+	// §9 already made game-side. At the START RING rather than at Rocco, because the start ring is
+	// where the path begins and where a team-mate has to go to get on it.
+	TraceAudio::PlayAt(MyPawn, TraceSoundEvents::RoccoRipple, Start);
+
 	FTraceAbilityNetState& Writable = MutableState();
 	Writable.Flags |= TraceAbilityFlags::AuxActive;
 	Writable.AuxEndMatchTime = Expiry;

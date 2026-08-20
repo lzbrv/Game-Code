@@ -1965,6 +1965,19 @@ namespace TraceAbilityFireRateMeasure
 		float   MinScaleSeen = TNumericLimits<float>::Max();
 		float   MaxScaleSeen = 0.f;
 
+		/**
+		 * THE LONGEST FRAME INSIDE THE WINDOW, and it is a PRECONDITION rather than a curiosity.
+		 *
+		 * The fire poll runs on a tick, so a round can only be placed on a frame boundary. Spec v29
+		 * §2f's carry lets the clock keep the overshoot, but only up to FireIntervalCarryFraction of
+		 * one interval — so a frame LONGER than that cannot be caught up and the gun physically
+		 * cannot hit the knob. Measured here rather than assumed, because the report below used to
+		 * blame the GUN for it: on a machine at 17.5 fps a Roxie MODDED window read 0.2196s against a
+		 * 0.1914s knob and printed "the gun is NOT reading the knob", which is a harness accusing a
+		 * correct build. See the precondition in Report().
+		 */
+		double  MaxFrameSeconds = 0.0;
+
 		/** Seconds between rounds, measured. -1 when fewer than two rounds left the clip. */
 		double MeasuredInterval() const
 		{
@@ -2247,6 +2260,35 @@ namespace TraceAbilityFireRateMeasure
 			UE_LOG(LogTraceGame, Display, TEXT("[FIRERATE] %-34s %14.1f %14.1f %8.4f"),
 				Stages[Index].Label, Before.MeasuredRPM(), After.MeasuredRPM(), Ratio);
 
+			// *** THE PRECONDITION COMES FIRST, BECAUSE A HARNESS MUST NOT BLAME THE GUN FOR THE
+			// *** MACHINE. *** The fire poll can only place a round on a frame boundary, and spec v29
+			// §2f's carry can absorb at most FireIntervalCarryFraction of one interval of overshoot.
+			// A frame longer than that makes the asked-for interval UNREACHABLE, whatever the gun
+			// does. This was found the honest way: a run with eight editors on the CPU measured 17.5
+			// fps (0.0572 s a frame) and reported "the gun is NOT reading the knob" for Roxie's
+			// 0.1914 s window — a correct build failed by an instrument that could not tell a slow
+			// gun from a slow computer. Spec v29 §2's own Trace.Weapons.V29 already derives this
+			// precondition and fails loudly on it; this harness now does the same rather than
+			// producing a number that means nothing.
+			const double CarryFraction = static_cast<double>(
+				FMath::Clamp(UTraceSettings::Get().FireIntervalCarryFraction, 0.f, 1.f));
+			const double FrameBudget = After.ExpectedInterval() * FMath::Max(CarryFraction, 0.0);
+			const bool bFastEnough = (After.MaxFrameSeconds <= FrameBudget) || (FrameBudget <= 0.0);
+
+			if (!bFastEnough)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[FIRERATE] NOT MEASURED  %s — the longest frame in the window was %.4fs (%.1f fps) "
+					     "against the %.4fs budget that Interval x carry allows. At this frame rate the poll "
+					     "CANNOT place a round every %.4fs, so the %.4fs measured here is the machine, not the "
+					     "gun. Re-run with -UseFixedTimeStep -FPS=54 or on an idle machine."),
+					Stages[Index].Label, After.MaxFrameSeconds,
+					(After.MaxFrameSeconds > 0.0) ? (1.0 / After.MaxFrameSeconds) : 0.0,
+					FrameBudget, After.ExpectedInterval(), After.MeasuredInterval());
+				++Failures;
+				continue;
+			}
+
 			// Each window must land on the interval the gun was asked for. 12% covers the frame
 			// quantisation at both ends of a ~7-round window; anything wider is a real disagreement
 			// between the knob and the gun.
@@ -2256,8 +2298,10 @@ namespace TraceAbilityFireRateMeasure
 			{
 				UE_LOG(LogTraceGame, Error,
 					TEXT("[FIRERATE] *** FAIL *** %s fires at %.4fs but the knob x scale says %.4fs — the gun is "
-					     "NOT reading the knob this harness is setting."),
-					Stages[Index].Label, After.MeasuredInterval(), After.ExpectedInterval());
+					     "NOT reading the knob this harness is setting. (Longest frame %.4fs against the %.4fs "
+					     "budget, so this is NOT frame-rate bound.)"),
+					Stages[Index].Label, After.MeasuredInterval(), After.ExpectedInterval(),
+					After.MaxFrameSeconds, FrameBudget);
 				++Failures;
 			}
 
@@ -2510,6 +2554,11 @@ namespace TraceAbilityFireRateMeasure
 				Sample.MinScaleSeen = FMath::Min(Sample.MinScaleSeen, ScaleNow);
 				Sample.MaxScaleSeen = FMath::Max(Sample.MaxScaleSeen, ScaleNow);
 
+				// The longest frame in the window. See FSample::MaxFrameSeconds — this is what decides
+				// whether the number below is a measurement of the gun or of the machine.
+				Sample.MaxFrameSeconds = FMath::Max(Sample.MaxFrameSeconds,
+					static_cast<double>(TickWorld->GetDeltaSeconds()));
+
 				const int32 Clip = Weapon->GetClipAmmo();
 				if (Clip < Run->LastClip)
 				{
@@ -2525,6 +2574,29 @@ namespace TraceAbilityFireRateMeasure
 					Sample.Shots += Dropped;
 				}
 				Run->LastClip = Clip;
+
+				// =====================================================================================
+				// *** SPEC v29 §2b INTEGRATION — PULSE THE TRIGGER, DO NOT HOLD IT. ***
+				// =====================================================================================
+				//
+				// This harness held one press for the whole 1.8 s window, which was the right fixture
+				// for every pass up to v28: both guns were automatic and a held trigger emptied the
+				// clip. §2b made the pistol fire ONCE PER PRESS, so the held trigger collects exactly
+				// one round and every pistol stage reports "only 1 round(s) left the clip in 1.80s —
+				// nothing to time". It degrades loudly rather than lying, which is the good failure
+				// mode, but a harness that cannot measure is a harness that has stopped guarding the
+				// thing it was written for — and §2f's whole finding is a fire-rate bug.
+				//
+				// The release-and-re-press is refused by the gun's own CanFire() rate limit exactly as
+				// the hold was, so the CADENCE THIS MEASURES IS UNCHANGED on an automatic weapon: the
+				// SMG and the v24 §4 MODDED/stuck stages time the same intervals they timed before. It
+				// simply also works on a semi-automatic one. Same one-line shape the audio slice
+				// applied to Trace.Audio.GunLadder's fixture.
+				if (!Weapon->IsFullAutoNow())
+				{
+					Weapon->StopFire();
+					Weapon->StartFire();
+				}
 
 				// Stop before the clip runs dry: an automatic reload inside the window would time the
 				// reload rather than the gun, and would end MODDED early on top of that.

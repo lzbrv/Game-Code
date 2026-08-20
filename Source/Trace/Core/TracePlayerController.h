@@ -40,6 +40,12 @@
 #include "UObject/ObjectMacros.h"
 #include "UObject/ObjectPtr.h"
 
+// SPEC v29 §5. HandleDirectEquip now takes the WEAPON rather than a bool, so the enum has to be
+// visible here. Forward-declared with its underlying type rather than pulling in the whole of
+// Gameplay/TraceMelee.h: nothing in this header needs the knife's policy, only the name of the
+// selector, and this file is included by most of the UI slice.
+enum class ETraceEquippedWeapon : uint8;
+
 #include "TracePlayerController.generated.h"
 
 class APawn;
@@ -96,8 +102,12 @@ struct FTraceDashHudState
  *                                       old precedence rule survives only as a tiebreak for a player
  *                                       who deliberately puts both actions on one key)
  *   Scoreboard  bool     Tab           (held)
- *   EquipKnife  bool     1             (spec v13 §2 — DIRECT SELECT, idempotent; the SWING rides IA_Fire)
- *   EquipGun    bool     2             (spec v13 §2 — DIRECT SELECT, idempotent)
+ *   EquipKnife  bool     1             (spec v29 §5 — STOW THE GUNS. Knife only, and the only state that
+ *                                       pays the v12 §3 speed boost. DIRECT SELECT, idempotent.
+ *                                       The enumerator keeps its v13 spelling; the MEANING moved.)
+ *   EquipGun    bool     2             (spec v29 §5 — the PISTOL. DIRECT SELECT, idempotent)
+ *   EquipSmg    bool     3             (spec v29 §5 — the SMG. The knife stays out in all three states;
+ *                                       stowing is about the GUNS. The SWING rides IA_Melee since v28 §10.)
  *   Reload      bool     R             (spec v16 §1 — the clip also reloads itself when it empties)
  *
  * SPEC v15 §5: TWO WEAPON KEYS, AND NO TOGGLE. Verbatim: "Switch weapon keybind so that it's only
@@ -488,6 +498,20 @@ protected:
 	TObjectPtr<UInputAction> IA_EquipGun;
 
 	/**
+	 * *** SPEC v29 §5 — THE THIRD WEAPON BIND. "Pressing 2 pulls out pistol, 3 pulls out smg." ***
+	 *
+	 * A THIRD ACTION, not a modifier on IA_EquipGun, for the reason the two above already give: an
+	 * Enhanced Input Boolean action carries no payload that could say WHICH weapon, so a shared
+	 * action would put the weapon identity inside the MAPPING, where the rebind screen cannot see it.
+	 * The keybind page lists ACTIONS; an SMG that is only a second key on the pistol's action is an
+	 * SMG the player cannot rebind on its own.
+	 *
+	 * Bound on Started only, exactly like its two neighbours: there is no held state to release.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_EquipSmg;
+
+	/**
 	 * SPEC v14 §5 — the two ability binds, default E and V.
 	 *
 	 * IA_Ability is bound on Started only: the activated ability is a press. IA_AbilitySecondary is
@@ -660,19 +684,32 @@ protected:
 	uint64 LastPullReleaseFrame = 0;
 
 	/**
-	 * Spec v13 §2. Press edge of the two DIRECT-SELECT weapon binds. Press-only, and that asymmetry
-	 * is deliberate: there is no held state here, so a release binding would fire a second request
-	 * on key-up.
+	 * Spec v13 §2, as rewritten by SPEC v29 §5. Press edge of the THREE DIRECT-SELECT weapon binds.
+	 * Press-only, and that asymmetry is deliberate: there is no held state here, so a release binding
+	 * would fire a second request on key-up.
 	 *
-	 * @param bWantKnife  true for the 1 key, false for the 2 key.
+	 *     1  OnEquipKnifeStarted  ETraceEquippedWeapon::Knife  guns STOWED, knife only, +22% speed
+	 *     2  OnEquipGunStarted    ETraceEquippedWeapon::Gun     the pistol
+	 *     3  OnEquipSmgStarted    ETraceEquippedWeapon::Smg     the SMG
 	 *
-	 * ONE implementation behind two handlers rather than two copies: the only difference between
+	 * *** THE PARAMETER IS THE WEAPON, NOT A BOOL, AND THAT IS THE WHOLE v29 §5 CHANGE HERE. *** It
+	 * used to be `bool bWantKnife`, which could only ever name two of three states — so v28 §10 had
+	 * to bolt a remap onto TraceMelee::RequestEquipIfDifferent to turn "knife" into "pistol" behind
+	 * this function's back. Passing the weapon deletes that remap and leaves exactly ONE translation
+	 * from a key to a weapon in the game: these three handlers.
+	 *
+	 * The two handler names keep their v13 spellings because ETraceInputAction does (see that enum's
+	 * comment — renaming it would break another slice's file this pass). OnEquipKnifeStarted is the
+	 * STOW key.
+	 *
+	 * ONE implementation behind three handlers rather than three copies: the only difference between
 	 * them is the destination weapon, and the idempotence guard is the part that must not be allowed
-	 * to drift between the knife path and the gun path.
+	 * to drift between them.
 	 */
 	void OnEquipKnifeStarted();
 	void OnEquipGunStarted();
-	void HandleDirectEquip(bool bWantKnife, const TCHAR* ActionLabel);
+	void OnEquipSmgStarted();
+	void HandleDirectEquip(ETraceEquippedWeapon Desired, const TCHAR* ActionLabel);
 
 	/**
 	 * SPEC v16 §1. Press edge of the reload bind (R).

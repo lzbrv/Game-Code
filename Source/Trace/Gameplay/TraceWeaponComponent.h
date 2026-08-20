@@ -74,8 +74,46 @@ namespace TraceAmmo
 	 */
 	TRACE_API float GetBaseFireInterval(ETraceEquippedWeapon Weapon);
 
-	/** SPEC v28 §9. Positional damage for @p Weapon: the pistol's 100/40/25, the SMG's 33/18/12. */
+	/**
+	 * SPEC v28 §9. Positional damage for @p Weapon: the pistol's 100/40/25, the SMG's 33/18/12.
+	 *
+	 * THE NO-DISTANCE FORM IS POINT BLANK and is what the dumps and the harness's table checks use.
+	 * Since spec v29 §2d the SMG's payout depends on range, so the SHOT must call the overload below;
+	 * this form deliberately answers for range 0 rather than silently picking a table.
+	 */
 	TRACE_API float GetZoneDamage(ETraceEquippedWeapon Weapon, ETraceHitZone Zone);
+
+	/**
+	 * SPEC v29 §2d. The same number, priced at the range the bullet actually travelled.
+	 *
+	 * @param DistanceUU  muzzle-to-impact, in uu, as the SERVER resolved it.
+	 *
+	 * Identical to the form above for the pistol and the knife at every range — §2d is SMG-only. For
+	 * the SMG it is the near table at or inside UTraceSettings::SmgFalloffStartUU and the far table
+	 * past it, with SmgFalloffRampUU deciding whether the change is a cliff (0, which is what ships)
+	 * or a linear ramp of that length.
+	 */
+	TRACE_API float GetZoneDamage(ETraceEquippedWeapon Weapon, ETraceHitZone Zone, double DistanceUU);
+
+	/**
+	 * SPEC v29 §2d. 0 at point blank, 1 past the falloff, and the blend in between when a ramp is
+	 * configured. Exposed so the harness and the dumps can print the resolved CURVE rather than two
+	 * numbers and a hope. Always 0 for the pistol and the knife, and always 0 when the falloff is off.
+	 */
+	TRACE_API float GetFalloffAlpha(ETraceEquippedWeapon Weapon, double DistanceUU);
+
+	/**
+	 * SPEC v29 §2b. True when a HELD trigger keeps feeding @p Weapon.
+	 *
+	 * False for the pistol as of §2b ("It must fire once per trigger press"), true for the SMG, and
+	 * false for the knife, which has no trigger — the knife's repeat is CanSwing()'s own cadence and
+	 * is deliberately untouched by fire mode.
+	 *
+	 * *** THIS IS THE BASE ANSWER AND NOT THE FINAL ONE. *** Roxie's MODDED forces full auto on
+	 * whatever is in her hands (spec v18 §2, "the gun becomes full auto"); the pawn-aware form is
+	 * UTraceWeaponComponent::IsFullAutoNow(), which is what the trigger loop actually asks.
+	 */
+	TRACE_API bool IsFullAuto(ETraceEquippedWeapon Weapon);
 
 	/** True when the mechanic is armed (Trace.Ammo.Enabled). 0 is the RED arm: the clip never falls. */
 	TRACE_API bool IsEnabled();
@@ -242,6 +280,33 @@ public:
 	 * disagreement was the spec v18 §2 bug: it read in game as the gun eating every second bullet.
 	 */
 	double GetFireInterval() const;
+
+	/**
+	 * SPEC v29 §2b. Does a HELD trigger keep feeding the weapon in this pawn's hands right now?
+	 *
+	 * TraceAmmo::IsFullAuto() is the weapon's own answer (pistol no, SMG yes) and this is that answer
+	 * OR'd with the abilities that force full auto — which today is Roxie's MODDED, whose §2 clause
+	 * "the gun becomes full auto" finally has something to switch now that a gun exists which is not.
+	 *
+	 * Asked once per frame by TickComponent, and by the harness. It does NOT gate the first round of
+	 * a press: StartFire() always fires one, whatever the mode says. Semi-automatic is a rule about
+	 * the REPEAT, and writing it that way is what keeps a semi-automatic gun's first shot identical to
+	 * an automatic one's.
+	 */
+	bool IsFullAutoNow() const;
+
+	/**
+	 * SPEC v29 §2f. Local-clock instants of the last rounds this machine fired, oldest first.
+	 *
+	 * The measurement surface for the 537-RPM bug and nothing else: FireOnce appends one double per
+	 * round while Trace.Weapons.RecordShots is on, so a harness can report a real distribution over
+	 * 40+ rounds instead of the two-sample "interval" a before/after pair of timestamps would give.
+	 * Empty (and never written) with the cvar off, which is the shipping state.
+	 */
+	const TArray<double>& GetRecordedShotTimes() const { return RecordedShotTimes; }
+
+	/** SPEC v29 §2f. Drops every recorded stamp. The harness calls it between arms. */
+	void ClearRecordedShotTimes() { RecordedShotTimes.Reset(); }
 
 	/**
 	 * SPEC v28 §10. Seconds of shooting lockout still owed by a swing; 0 when the gun is free.
@@ -557,6 +622,45 @@ private:
 	/** Runs the whole predicted client-side shot and sends ServerFire. */
 	void FireOnce();
 
+	/**
+	 * *** SPEC v29 §2f — THE 537 RPM FIX, IN ONE FUNCTION. ***
+	 *
+	 * Moves LastLocalFireTime on for the round that is being fired right now, and it is the ONLY
+	 * writer of that field.
+	 *
+	 * WHAT WAS WRONG. It used to be `LastLocalFireTime = GetLocalTimeSeconds()` — the FRAME's time,
+	 * not the time the round was DUE. The fire poll is a tick, so a round can only leave on a frame
+	 * boundary; stamping the frame throws away however far past due it already was, and the next
+	 * round starts its wait from there. The cadence is then dt * ceil(Interval / dt), not Interval,
+	 * and the error is one frame per round rather than one frame per burst:
+	 *
+	 *     dt = 1/53.7 s : 0.018617 * ceil(0.1 / 0.018617) = 0.11170 s = 537 RPM against a 600 RPM knob
+	 *     dt = 1/53.7 s : 0.018617 * ceil(0.315789 / 0.018617) = 0.31649 s = 189.6 RPM against 190
+	 *
+	 * i.e. exactly the measured 0.1117 s, and exactly why the pistol never looked broken. THE FASTER
+	 * THE GUN, THE WORSE IT IS, so a 600 RPM weapon is what made a bug that has been in this file
+	 * since v5 finally visible.
+	 *
+	 * WHAT IT DOES INSTEAD. It keeps the overshoot — the amount by which this frame is LATE for the
+	 * round it is delivering — up to a cap, so the next round is due one exact interval after the
+	 * round that was DUE rather than after the frame that happened to carry it. Over a burst the mean
+	 * converges on the knob at any frame rate; the individual gaps still land on frames, because they
+	 * have to.
+	 *
+	 * WHY THERE IS A CAP AT ALL, AND WHY IT IS THE ONE IT IS. Uncapped, a burst that resumed after a
+	 * stall would bank credit and pay it out as a machine-gun catch-up, and — worse — could ask for a
+	 * gap the SERVER rejects as rate-limited, which reads in game as the gun eating bullets. The cap
+	 * is UTraceSettings::FireIntervalCarryFraction of the interval, clamped in the implementation to
+	 * FireRateTolerance, which is the fraction the server itself forgives. The client can therefore
+	 * never carry more than the server already tolerates: the two numbers are one rule.
+	 *
+	 * NOT A SECOND CLOCK. There is no accumulator to reset, no state to leak and nothing to
+	 * re-initialise on a respawn, a swap or a reload: the carry lives entirely in the one field the
+	 * gate already read, and a gap longer than one interval plus the cap collapses back to "stamp
+	 * now" on its own.
+	 */
+	void AdvanceFireClock();
+
 	void PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted) const;
 
 	// --- Upwards recoil (spec v5 section 6) ------------------------------------------------------
@@ -575,6 +679,34 @@ private:
 
 	/** One shot's worth of upward kick, with the growth term and the accumulation ceiling applied. */
 	void ApplyRecoilKick();
+
+public:
+	/**
+	 * *** SPEC v29 §2e — HOW HARD THIS PAWN'S GUN KICKS, AS A MULTIPLE OF RecoilPitchPerShot. ***
+	 *
+	 * "Roxie's modded should add recoil now." Demo 22 (spec v25 §5) removed the aim punch globally
+	 * and bRecoilEnabled is still FALSE; this is not a partial revert of that. It is a SUM:
+	 *
+	 *     scale = (bRecoilEnabled ? 1 : 0) + (MODDED up ? RoxieModdedRecoilScale : 0)
+	 *
+	 * so with recoil off the answer is 0 for every pawn in the game and ApplyRecoilKick still returns
+	 * on its first test — except for a Roxie with MODDED up, who gets exactly one base kick's worth,
+	 * and only while it is up. Set bRecoilEnabled back to true and everybody kicks while she kicks
+	 * (1 + scale) times as hard, so the sentence "MODDED costs you recoil" stays true in both worlds.
+	 * An OVERRIDE would have deleted her trade at the exact moment a designer turned recoil back on.
+	 *
+	 * *** RELATIVE, NOT ABSOLUTE (the standing rule). *** It is a MULTIPLE of the base per-shot kick,
+	 * never a number of degrees, so retuning RecoilPitchPerShot moves Roxie in proportion with
+	 * nothing to re-derive. Everything else about the model — growth, ceiling, recovery, burst reset,
+	 * compensation — is shared and is deliberately not duplicated per character.
+	 *
+	 * Public so Trace.Weapons.V29 can assert the seam without firing a round, and so the HUD could
+	 * show the trade if it ever wants to. Correct on any machine that has the pawn: the MODDED flag
+	 * is replicated.
+	 */
+	double GetRecoilPitchScale() const;
+
+private:
 
 	/** Runs the recovery, and the player-compensation cancellation, once per tick. */
 	void TickRecoil(float DeltaTime);
@@ -631,19 +763,49 @@ private:
 	/** Trigger state. Only meaningful on the machine that owns the input (client, or listen host). */
 	bool bTriggerHeld = false;
 
+	/**
+	 * SPEC v29 §2b. Has the trigger already spent its one round for this press?
+	 *
+	 * Set by FireOnce, cleared by StopFire — i.e. by the RELEASE and by nothing else. A semi-automatic
+	 * weapon refuses the tick's repeat while this is true, so "one shot per trigger press" is a fact
+	 * about the press rather than a second cooldown that could drift out of step with the fire rate.
+	 *
+	 * Deliberately NOT cleared on a weapon swap, a death or a Core pickup: all three go through a
+	 * state the trigger cannot fire from anyway, and clearing it would hand a player holding the
+	 * button a free extra round on the frame the gate reopened.
+	 */
+	bool bTriggerConsumedThisPress = false;
+
 	/** Local-clock time of the last shot this machine predicted. */
 	double LastLocalFireTime = -1000.0;
+
+	/**
+	 * SPEC v29 §2f. Local-clock instants of rounds fired, while Trace.Weapons.RecordShots is on.
+	 *
+	 * Off by default and never allocated in a shipping run. Capped at 4096 stamps (32 KB) so a
+	 * harness that forgets to turn it off cannot grow it without bound over a match.
+	 */
+	TArray<double> RecordedShotTimes;
 
 	/** Local-clock time of the last shot the server accepted. Authority only. */
 	double LastAcceptedFireTime = -1000.0;
 
+public:
 	/**
 	 * Fraction of FireInterval the server forgives. Honest clients time their shots against their
 	 * own smoothed copy of the server clock and their packets arrive jittered and occasionally
 	 * bunched, so a strict >= FireInterval test on arrival times punishes exactly the players we
 	 * are trying to serve. Cheating past this buys ~20% more DPS, not an aimbot.
+	 *
+	 * PUBLIC AS OF SPEC v29 §2f, and for one reason: it is now a SECOND rule as well as a gate. The
+	 * client's fire-clock carry (AdvanceFireClock) is clamped to it, because a client that carried
+	 * more than the server forgives would ask for rounds the server rejects. Two places rely on one
+	 * number, so the number has to be readable from both — including from Trace.Weapons.V29, which
+	 * asserts that no measured gap ever falls under it.
 	 */
 	static constexpr double FireRateTolerance = 0.2;
+
+private:
 
 	/**
 	 * How far the client-supplied muzzle may sit from the shooter's own rewound capsule centre

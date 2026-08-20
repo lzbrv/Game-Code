@@ -31,10 +31,16 @@
 #
 # No C++ edit. No rebuild. Nothing to remember about which file references it.
 #
-# THE SET OF SOUNDS IS DISCOVERED, NOT LISTED. This script globs Art/Sounds/*.wav
-# rather than carrying a table of nine names, so a TENTH wav is a tenth bank row
-# with no edit here either. The event name is simply the file's stem, and it is
-# also the key C++ asks for (Source/Trace/Audio/TraceSoundEvents.h).
+# THE SET OF SOUNDS IS DISCOVERED, NOT LISTED. This script globs Art/Sounds
+# RECURSIVELY rather than carrying a table of names, so a new wav is a new bank
+# row with no edit here either. The event name is simply the file's stem, and it
+# is also the key C++ asks for (Source/Trace/Audio/TraceSoundEvents.h).
+#
+# RECURSIVELY, since spec v29 §1b: the eleven footsteps ship in
+# Art/Sounds/Footsteps/ and their events are Step1..Step11 — the STEM, never the
+# folder. The folder is how a human keeps eleven near-identical files tidy; it is
+# not part of the name, and two files with the same stem in different folders is
+# an ERROR rather than a silent last-one-wins.
 #
 # WHAT IS NOT DATA: WHICH MACHINES HEAR A SOUND. Game-side vs client-side is a
 # networking behaviour and lives in TraceSoundEvents.cpp — see the long comment
@@ -53,7 +59,9 @@
 # sound needs Scripts/lock.sh first. Creating one for the first time does not.
 # =============================================================================
 import glob
+import math
 import os
+import struct
 import sys
 import wave
 
@@ -73,6 +81,9 @@ BANK_NAME = "DA_TraceSoundBank"
 # A MIRROR of TraceSoundEvents.cpp, for the printed manifest ONLY. If these ever
 # disagree the manifest is what is wrong, not the game: C++ is the authority.
 SIDES = {
+    # --- spec v26 §9, UNCHANGED by v29 §1a: "keeping the same sounds client side
+    #     vs global". Six of these got a NEW WAV this patch; not one of them
+    #     changed side.
     "CoreTurnover": "game-side",
     "Dash": "game-side",
     "Parry": "game-side",
@@ -82,7 +93,37 @@ SIDES = {
     "Jump": "client-side",
     "WallJump": "client-side",
     "ButtonPress": "client-side",
+
+    # --- spec v29 §1e: "gunshots should be global".
+    "PistolShoot1": "game-side",
+    "PistolShoot2": "game-side",
+    "PistolShoot3": "game-side",
+    "PistolShoot4": "game-side",
+    "SmgShoot1": "game-side",
+
+    # --- spec v29 §1b: footsteps are a world sound, so other players hear yours.
+    "Step1": "game-side",
+    "Step2": "game-side",
+    "Step3": "game-side",
+    "Step4": "game-side",
+    "Step5": "game-side",
+    "Step6": "game-side",
+    "Step7": "game-side",
+    "Step8": "game-side",
+    "Step9": "game-side",
+    "Step10": "game-side",
+    "Step11": "game-side",
+
+    # --- spec v29 §1f. Inferred triggers; the reasoning is in TraceSoundEvents.cpp.
+    "Goal": "game-side",       # a goal is the whole room's event
+    "Kill": "client-side",     # the killer's own confirmation, like the hitmarker
+    "RoccoRipple": "game-side",  # an ability going off in the world, like Dash
 }
+
+# The FOOTSTEP family, spelled once. §1b gives footsteps their own volume knob,
+# well below the bank default; this is the manifest's mirror of the C++ family
+# table so the printed loudness column can flag which rows that knob applies to.
+FOOTSTEP_STEMS = ["Step{0}".format(i) for i in range(1, 12)]
 
 _failures = []
 
@@ -126,27 +167,83 @@ def wanted_stems():
 
 def discover():
     """
-    Every Art/Sounds/*.wav, as (event_name, absolute_path), sorted.
+    Every Art/Sounds/**/*.wav, as (event_name, absolute_path), sorted by event.
 
-    DISCOVERED, NOT LISTED — see the header. The event name is the stem, exactly.
+    DISCOVERED, NOT LISTED — see the header. The event name is the stem, exactly,
+    and the SUBFOLDER IS NOT PART OF IT: Art/Sounds/Footsteps/Step7.wav is the
+    event `Step7`, which is the key C++ asks the bank for and the asset name
+    S_Step7. A folder is filing, not naming.
+
+    Two files with the same stem in different folders is a hard error. Silently
+    letting the last one win is how a project ends up with a bank row nobody can
+    explain, and the sort order that decided it is an implementation detail.
     """
     if not os.path.isdir(SOURCE_DIR):
-        fail("{0} does not exist. The nine WAVs from the prompt live there.".format(SOURCE_DIR))
+        fail("{0} does not exist. The WAVs from the prompt live there.".format(SOURCE_DIR))
         return []
 
-    found = []
-    for path in sorted(glob.glob(os.path.join(SOURCE_DIR, "*.wav"))):
+    by_stem = {}
+    for path in sorted(glob.glob(os.path.join(SOURCE_DIR, "**", "*.wav"), recursive=True)):
         stem = os.path.splitext(os.path.basename(path))[0]
-        found.append((stem, path))
+        if stem in by_stem:
+            fail("two files both claim the event '{0}': {1} and {2}. An event name is a stem and "
+                 "must be unique across Art/Sounds/ and every folder under it.".format(
+                     stem, os.path.relpath(by_stem[stem], ROOT), os.path.relpath(path, ROOT)))
+            continue
+        by_stem[stem] = path
 
+    found = sorted(by_stem.items())
     if not found:
-        fail("no .wav files in {0}.".format(SOURCE_DIR))
+        fail("no .wav files under {0}.".format(SOURCE_DIR))
     return found
+
+
+def _dbfs(linear):
+    """Full-scale decibels for a 0..1 amplitude. -inf floors at -120 so it prints."""
+    if linear <= 0.0:
+        return -120.0
+    return 20.0 * math.log10(linear)
+
+
+def loudness(path):
+    """
+    (peak_dBFS, rms_dBFS) of the actual samples, or (None, None).
+
+    *** THIS IS THE HALF OF §1b THAT CANNOT BE TAKEN ON TRUST. *** "Ensure they
+    are quieter than other sounds" is a claim about the AUDIBLE result, and a
+    volume knob alone does not settle it: the loudest footstep here peaks at
+    -20.1 dBFS while ButtonPress peaks at -27.2, so at equal gain the footsteps
+    would be the LOUDER of the two. The knob has to beat that gap, and the only
+    way to know it does is to measure the files.
+
+    The game measures the same thing from the imported asset — see
+    Trace.Audio.Loudness in Source/Trace/Audio/TraceAudioLoudness.cpp — so the
+    two numbers can be compared and a bad import shows up as a disagreement
+    rather than as a quiet mystery.
+    """
+    try:
+        with wave.open(path, "rb") as handle:
+            width = handle.getsampwidth()
+            frames = handle.readframes(handle.getnframes())
+    except Exception:                                   # pylint: disable=broad-except
+        return (None, None)
+
+    if width != 2 or not frames:
+        # 8/24/32-bit is legal and imports fine; it is only the MEASUREMENT that
+        # this function declines to guess at. Everything the game does still works.
+        return (None, None)
+
+    count = len(frames) // 2
+    samples = struct.unpack("<{0}h".format(count), frames[:count * 2])
+    peak = max(abs(sample) for sample in samples) / 32768.0
+    mean_square = sum(float(sample) * sample for sample in samples) / float(count)
+    rms = math.sqrt(mean_square) / 32768.0
+    return (_dbfs(peak), _dbfs(rms))
 
 
 def describe(path):
     """
-    (rate, channels, seconds) read from the WAV header itself, or None.
+    (rate, channels, seconds, peak_dBFS, rms_dBFS) read from the file itself, or None.
 
     Reading the header rather than trusting the file name catches the one import
     failure that is otherwise invisible: an .mp3 or an LFS pointer renamed to
@@ -170,7 +267,8 @@ def describe(path):
         if seconds <= 0.0:
             fail("{0} is zero-length.".format(path))
             return None
-        return (rate, channels, seconds)
+        peak_db, rms_db = loudness(path)
+        return (rate, channels, seconds, peak_db, rms_db)
     except Exception as error:                          # pylint: disable=broad-except
         fail("could not read {0}: {1}".format(path, error))
         return None
@@ -181,27 +279,55 @@ def manifest(entries, selected):
     log("=== import_sounds: step 1, the manifest ===")
     log("source: {0}".format(SOURCE_DIR))
     log("")
-    log("  {0:<16}{1:<12}{2:>8}{3:>6}{4:>9}   {5}".format(
-        "EVENT", "SIDE", "RATE", "CH", "SECONDS", "FILE"))
+    log("  {0:<14}{1:<12}{2:>7}{3:>4}{4:>8}{5:>10}{6:>10}   {7}".format(
+        "EVENT", "SIDE", "RATE", "CH", "SECONDS", "PEAK dB", "RMS dB", "FILE"))
 
     ok = True
+    loudest_step = (-999.0, "")
+    quietest_other = (999.0, "")
+
     for stem, path in entries:
         info = describe(path)
         if info is None:
             ok = False
             continue
-        rate, channels, seconds = info
+        rate, channels, seconds, peak_db, rms_db = info
 
         side = SIDES.get(stem)
         if side is None:
-            # NOT an error. A tenth WAV is a supported thing to add; it simply
+            # NOT an error. A new WAV is a supported thing to add; it simply
             # defaults to client-side until somebody declares otherwise in
             # Source/Trace/Audio/TraceSoundEvents.cpp.
             side = "client-side*"
 
+        if peak_db is not None:
+            if stem in FOOTSTEP_STEMS:
+                if peak_db > loudest_step[0]:
+                    loudest_step = (peak_db, stem)
+            elif peak_db < quietest_other[0]:
+                quietest_other = (peak_db, stem)
+
         mark = "" if (selected is None or stem in selected) else "   (skipped this run)"
-        log("  {0:<16}{1:<12}{2:>8}{3:>6}{4:>9.2f}   {5}{6}".format(
-            stem, side, rate, channels, seconds, os.path.basename(path), mark))
+        rel = os.path.relpath(path, SOURCE_DIR)
+        log("  {0:<14}{1:<12}{2:>7}{3:>4}{4:>8.2f}{5:>10}{6:>10}   {7}{8}".format(
+            stem, side, rate, channels, seconds,
+            "n/a" if peak_db is None else "{0:.2f}".format(peak_db),
+            "n/a" if rms_db is None else "{0:.2f}".format(rms_db),
+            rel, mark))
+
+    # ---------------------------------------------------------------------
+    # §1b, stated in numbers rather than in adjectives.
+    # ---------------------------------------------------------------------
+    if loudest_step[1] and quietest_other[1]:
+        gap = loudest_step[0] - quietest_other[0]
+        log("")
+        log("  footsteps at UNITY gain: the loudest ({0}, {1:.2f} dBFS peak) sits {2:+.2f} dB against "
+            "the quietest other sound ({3}, {4:.2f} dBFS).".format(
+                loudest_step[1], loudest_step[0], gap, quietest_other[1], quietest_other[0]))
+        if gap > 0.0:
+            log("  so the FILES ALONE DO NOT SATISFY §1b — the footstep volume knob "
+                "(Trace Audio > Footstep Volume) has to buy at least {0:.2f} dB, and the game "
+                "asserts the result with Trace.Audio.Loudness.".format(gap))
 
     declared = set(SIDES.keys())
     present = set(stem for stem, _ in entries)

@@ -1449,7 +1449,12 @@ void ATraceHUD::DrawCrosshair()
 	// takes the team colour once a receiver is under it.
 	const float Scale = FMath::Lerp(1.f, TraceHUDStyle::ThirdPersonCrosshairScaleSetting(), ViewBlend);
 
-	FLinearColor CrosshairInk = FLinearColor(1.f, 1.f, 1.f, 0.94f);
+	// SPEC v29 §3 — THE PLAYER'S COLOUR AND OPACITY, not a literal white.
+	//
+	// This used to be FLinearColor(1, 1, 1, 0.94f), and the shipped default of the two settings behind
+	// GetCrosshairColor() is exactly that colour and exactly that alpha — so a player who has never
+	// opened the crosshair page gets the identical pixels they had before the page existed.
+	FLinearColor CrosshairInk = UTraceUserSettings::Get().GetCrosshairColor();
 	if (ViewBlend > 0.02f && PassLockAlpha > 0.f)
 	{
 		// Only ever a LIFT toward the team colour, never a fade to it: a colour-blind player, or one
@@ -1475,61 +1480,61 @@ void ATraceHUD::DrawAimReticle(float CX, float CY, float Visibility, float Scale
 	// Two consequences, both handled below: it has to be PIXEL-CRISP, and it has to stay legible
 	// over the arena's bright neon as well as over its black floor.
 
-	// --- Pixel snapping -------------------------------------------------------------------------
+	// --- SPEC v29 §3 — THE SHAPE IS THE PLAYER'S NOW, AND IT IS BUILT IN ONE PLACE ----------------
 	//
-	// The old reticle was built from DrawLine at fractional coordinates and a fractional thickness.
-	// At 1280x720 UIScale is 0.667, so every arm was 1.33px wide sitting on a half-pixel boundary
-	// and the "centre dot" was a 1.33px square straddling four pixels — Canvas anti-aliases that
-	// into a grey smudge. That is a crosshair that looks out of focus no matter how sharp the rest
-	// of the frame is, and it is the part of "everything is blurry" that belongs to the HUD.
+	// Size, thickness, gap and the centre dot used to be the four literals 11 / 2.5 / 5 / always-on
+	// sitting right here. They are settings now, and the arithmetic that turns them into integer
+	// rects moved to UTraceUserSettings::BuildCrosshairBars — NOT to keep this function short, but
+	// because the settings page draws a LIVE PREVIEW of this crosshair and a preview built from a
+	// second copy of the same arithmetic is a preview that will eventually lie about the setting it
+	// is previewing. One definition, two drawers.
 	//
-	// So: integer thickness, integer lengths, integer origin, and axis-aligned DrawRect instead of
-	// DrawLine. Rects at integer coordinates land on exact pixels and receive no anti-aliasing at
-	// all, which is the whole point.
-	//
-	// FLOORS, not just scales. At 1280x720 UIScale is 0.667, and the reference sizes below rounded
-	// down to a ONE-PIXEL-wide reticle. It was pixel-exact and unblurred — and invisible: a captured
-	// in-match frame had to be checked by sampling individual pixels at screen centre to confirm the
-	// crosshair had been drawn at all, because against a lit cyan surface (193, 252, 253) a single
-	// white pixel with a single 55%-black neighbour is nothing. In first person this reticle is the
-	// aim point, so the minimums below are what it may never shrink past, whatever the resolution.
+	// The pixel-snapping argument, the floors and their measurement all moved with it; read the note
+	// there before changing any of them.
 	//
 	// @param Scale     1.0 in first person; larger in third person, where this is the pass pointer
 	//                  rather than the gun's aim point and has to hold its own in a busier frame.
-	// @param InkColor  the fill; alpha is multiplied by Visibility, so callers pass an opaque colour.
-	const float S   = FMath::Max(0.5f, Scale);
-	const float T   = FMath::Max(2.f, FMath::RoundToFloat(2.5f * UIScale * S));
-	const float Arm = FMath::Max(6.f, FMath::RoundToFloat(11.f * UIScale * S));
-	const float Gap = FMath::Max(3.f, FMath::RoundToFloat(5.f  * UIScale * S));
+	// @param InkColor  the fill; alpha is multiplied by Visibility, so callers pass the colour they
+	//                  want, opacity included (DrawCrosshair passes GetCrosshairColor()).
+	const UTraceUserSettings& CrosshairSettings = UTraceUserSettings::Get();
 
-	// Half a bar, floored, so the bar's own pixels straddle the centre symmetrically for odd T and
-	// sit flush against it for even T. Both are exact; neither is a half-pixel.
-	const float Half = FMath::FloorToFloat(T * 0.5f);
+	const float S = FMath::Max(0.5f, Scale);
 
-	const FLinearColor Ink    = TraceHUDStyle::WithAlpha(InkColor, InkColor.A * Visibility);
+	FTraceCrosshairBar Bars[TraceCrosshairMaxBars];
+	const int32 NumBars = CrosshairSettings.BuildCrosshairBars(CX, CY, UIScale * S, Bars);
+
+	const FLinearColor Ink = TraceHUDStyle::WithAlpha(InkColor, InkColor.A * Visibility);
+
 	// A one-pixel dark surround. The arena is black floor plus saturated cyan and amber neon, and a
-	// plain white reticle disappears the moment it crosses a lit edge or a bright trail. The
-	// outline costs nothing and makes the aim point unconditionally readable — but only if it is
-	// actually opaque enough to separate white from cyan, which at 0.55 it was not.
-	const FLinearColor Shadow = FLinearColor(0.f, 0.f, 0.f, 0.80f * Visibility);
+	// plain white reticle disappears the moment it crosses a lit edge or a bright trail. The outline
+	// costs nothing and makes the aim point unconditionally readable — but only if it is actually
+	// opaque enough to separate white from cyan, which at 0.55 it was not.
+	//
+	// SPEC v29 §3 MAKES IT A TOGGLE, AND ITS ALPHA RELATIVE TO THE CROSSHAIR'S. Off returns a fully
+	// transparent colour rather than a "do not call me", so there is still one geometry path; and the
+	// alpha is a FRACTION of the player's opacity, so a crosshair dialled down to 25% does not end up
+	// wearing a fully-present black box. See GetCrosshairOutlineColor.
+	const FLinearColor OutlineBase = CrosshairSettings.GetCrosshairOutlineColor();
+	const FLinearColor Shadow = FLinearColor(OutlineBase.R, OutlineBase.G, OutlineBase.B,
+		OutlineBase.A * Visibility);
 
-	// Each arm and the centre dot as an integer rect: (left, top, width, height).
-	const float Bars[5][4] =
+	// DrawRect and never DrawLine. AHUD::DrawLine goes through FCanvasLineItem's batched-element
+	// path, which DISCARDS THE ALPHA it is handed — a translucent line comes out fully opaque — so
+	// every fade on this HUD is expressed as a rect whose colour carries the alpha. Both loops below
+	// depend on that: an outline at alpha 0 has to draw nothing, and with DrawLine it would draw a
+	// solid black box around the crosshair.
+	if (Shadow.A > UE_KINDA_SMALL_NUMBER)
 	{
-		{ CX - Gap - Arm,  CY - Half,        Arm,  T   },   // left
-		{ CX + Gap,        CY - Half,        Arm,  T   },   // right
-		{ CX - Half,       CY - Gap - Arm,   T,    Arm },   // up
-		{ CX - Half,       CY + Gap,         T,    Arm },   // down
-		{ CX - Half,       CY - Half,        T,    T   },   // centre dot: the exact aim point
-	};
-
-	for (const float* B : Bars)
-	{
-		DrawRect(Shadow, B[0] - 1.f, B[1] - 1.f, B[2] + 2.f, B[3] + 2.f);
+		for (int32 Index = 0; Index < NumBars; ++Index)
+		{
+			const FTraceCrosshairBar& B = Bars[Index];
+			DrawRect(Shadow, B.X - 1.f, B.Y - 1.f, B.W + 2.f, B.H + 2.f);
+		}
 	}
-	for (const float* B : Bars)
+	for (int32 Index = 0; Index < NumBars; ++Index)
 	{
-		DrawRect(Ink, B[0], B[1], B[2], B[3]);
+		const FTraceCrosshairBar& B = Bars[Index];
+		DrawRect(Ink, B.X, B.Y, B.W, B.H);
 	}
 }
 
@@ -1556,8 +1561,17 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 	// live setting now (UTraceSettings::ThirdPersonCrosshairScale, 1.0-3.0), and hardcoded 40/30
 	// against a 1.6 crosshair would have the brackets drawn straight through the cross the moment
 	// anyone raised it — a knob that visibly breaks the UI at the top of its own clamp is not a knob.
-	// The cross's arms reach (5 + 11) * UIScale * Scale; the constants below are the clearances.
-	const float ArmReach = (5.f + 11.f) * UIScale * TraceHUDStyle::ThirdPersonCrosshairScaleSetting();
+	// The constants below are the clearances.
+	//
+	// *** SPEC v29 §3 — THE ARM REACH IS NOW THE PLAYER'S, SO IT IS ASKED FOR RATHER THAN WRITTEN. ***
+	// This line read `(5.f + 11.f) * UIScale * ...`, which was DrawAimReticle's gap and arm copied in
+	// as literals. Correct for exactly as long as those were literals: the crosshair page lets a
+	// player take the gap to 20 and the arms to 24, and against that a bracket sized for 16 reference
+	// pixels is a bracket drawn straight through the cross — the identical defect this comment was
+	// already written about, arriving through the other knob. GetCrosshairArmReach() is the one
+	// definition of gap + arm; a value that modifies a base must move with the base.
+	const float ArmReach = UTraceUserSettings::Get().GetCrosshairArmReach()
+		* UIScale * TraceHUDStyle::ThirdPersonCrosshairScaleSetting();
 	const float OpenRadius = ArmReach + (14.f * UIScale);
 	const float ClosedRadius = ArmReach + (4.f * UIScale);
 	const float Radius = FMath::RoundToFloat(FMath::Lerp(OpenRadius, ClosedRadius, PassLockAlpha));
@@ -1796,7 +1810,14 @@ namespace TraceHUDThrowRings
 {
 	/**
 	 * The OUTER TIP OF THE CROSSHAIR'S ARMS, in pixels. DrawAimReticle's own geometry, not a guess:
-	 * its arms run from Gap = 5 * UIScale * S to Gap + Arm = (5 + 11) * UIScale * S.
+	 * its arms run from the gap out to gap + arm.
+	 *
+	 * *** SPEC v29 §3 — ASKED OF THE SETTINGS, NOT WRITTEN DOWN AGAIN. *** This was
+	 * `(5.f + 11.f) * UIScale * ...`, the crosshair's shipped gap and arm as literals. Both are
+	 * player settings now (gap 0-20, arm 2-24), so a ring sized for 16 reference pixels would be a
+	 * ring sitting on the crosshair's own arms for anybody who widened it — which is precisely the
+	 * failure InnerClearanceUU below was written to prevent for the OTHER knob. Everything on this
+	 * crosshair that is positioned relative to the crosshair now asks the crosshair how big it is.
 	 *
 	 * S is ThirdPersonCrosshairScaleSetting() rather than the camera-blended scale because everything
 	 * on this crosshair that involves the Core is a THIRD-PERSON state — carrying is the third-person
@@ -1804,7 +1825,8 @@ namespace TraceHUDThrowRings
 	 */
 	static float ArmReach(float UIScale)
 	{
-		return (5.f + 11.f) * UIScale * TraceHUDStyle::ThirdPersonCrosshairScaleSetting();
+		return UTraceUserSettings::Get().GetCrosshairArmReach()
+			* UIScale * TraceHUDStyle::ThirdPersonCrosshairScaleSetting();
 	}
 
 	/**
@@ -2434,9 +2456,16 @@ void ATraceHUD::DrawHealthAndDash()
 		// The CARRIER's weapon is stowed, not held: they cannot shoot and cannot swing, and saying
 		// "KNIFE" to somebody whose knife does nothing is the same lie the SHIELD DOWN callout exists
 		// to avoid. They get the row, but it says what is actually true.
+		// *** SPEC v29 §5 — THERE ARE THREE WEAPON STATES NOW, SO THIS ROW NAMES THREE. ***
+		// It said KNIFE or GUN, which was a complete answer while the selector had two reachable
+		// values. v28 §9 added the SMG (so "GUN" covered two different weapons with different damage,
+		// falloff and reload) and v29 §5 made the knife state reachable on purpose via the 1 key. A
+		// player who presses 1 for the speed boost has to be able to see that it took — the guns
+		// leaving the screen says it, and this row is the second, unambiguous confirmation.
+		const bool bSmgOut = TraceMelee::IsWeaponEquipped(LocalChar, ETraceEquippedWeapon::Smg);
 		const FString WeaponText = bLocalCarrying
 			? FString(TEXT("STOWED"))
-			: (bKnife ? FString(TEXT("KNIFE")) : FString(TEXT("GUN")));
+			: (bKnife ? FString(TEXT("KNIFE")) : (bSmgOut ? FString(TEXT("SMG")) : FString(TEXT("PISTOL"))));
 
 		DrawTextLeft(TEXT("WEAPON"), bLocalCarrying ? TraceHUDStyle::InkDim : TraceHUDStyle::Ink,
 			Margin, VCenterTextY(FString(TEXT("WEAPON")), FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);

@@ -499,6 +499,11 @@ bool ATracePlayerController::TryAdoptInputAssets()
 		{ &IA_Scoreboard,       TEXT("IA_Scoreboard"),       EInputActionValueType::Boolean, Highest },
 		{ &IA_EquipKnife,       TEXT("IA_EquipKnife"),       EInputActionValueType::Boolean, Highest },
 		{ &IA_EquipGun,         TEXT("IA_EquipGun"),         EInputActionValueType::Boolean, Highest },
+		// SPEC v29 §5 — the third weapon bind ("3 pulls out smg"). Same story as IA_PullCore below: a
+		// checkout whose /Game/Trace/Input predates v29 is MISSING this asset, TryAdoptInputAssets
+		// rejects the whole set, and the C++ fallback builds all of them — so the 3 key works whether
+		// or not Scripts/generate-input-assets.py has been re-run.
+		{ &IA_EquipSmg,         TEXT("IA_EquipSmg"),         EInputActionValueType::Boolean, Highest },
 		{ &IA_Ability,          TEXT("IA_Ability"),          EInputActionValueType::Boolean, Highest },
 		{ &IA_AbilitySecondary, TEXT("IA_AbilitySecondary"), EInputActionValueType::Boolean, Highest },
 		{ &IA_Reload,           TEXT("IA_Reload"),           EInputActionValueType::Boolean, Highest },
@@ -635,6 +640,8 @@ void ATracePlayerController::ConstructInputDataInCode()
 		// which deleted IA_SwapWeapon. Boolean like every other button here.
 		IA_EquipKnife = MakeAction(TEXT("IA_EquipKnife"), EInputActionValueType::Boolean);
 		IA_EquipGun   = MakeAction(TEXT("IA_EquipGun"),   EInputActionValueType::Boolean);
+		// SPEC v29 §5 — the third weapon bind. 1 stows the guns, 2 is the pistol, 3 is the SMG.
+		IA_EquipSmg   = MakeAction(TEXT("IA_EquipSmg"),   EInputActionValueType::Boolean);
 		// SPEC v14 §5 — the ability binds.
 		IA_Ability          = MakeAction(TEXT("IA_Ability"),          EInputActionValueType::Boolean);
 		IA_AbilitySecondary = MakeAction(TEXT("IA_AbilitySecondary"), EInputActionValueType::Boolean);
@@ -801,6 +808,9 @@ void ATracePlayerController::ApplyControlSettings()
 	// player has deliberately UNBOUND gets no mapping at all rather than a dead one.
 	MapButton(IA_EquipKnife, ETraceInputAction::EquipKnife);
 	MapButton(IA_EquipGun,   ETraceInputAction::EquipGun);
+	// SPEC v29 §5. The third weapon key, through the identical path — so it is rebindable on the
+	// options page like the other two and an unbound SMG row gets no mapping rather than a dead one.
+	MapButton(IA_EquipSmg,   ETraceInputAction::EquipSmg);
 	// SPEC v14 §5. Through the same KeyFor/MapButton path as everything else, so a player who
 	// rebinds E in the options screen is rebinding the ability and not just the label — and so
 	// UTraceAbilityInputRelay's ConfigId lookup and this mapping can never disagree about the key.
@@ -1004,6 +1014,8 @@ void ATracePlayerController::SetupInputComponent()
 	// something downstream ignores it is a binding waiting to be a bug.
 	EIC->BindAction(IA_EquipKnife, ETriggerEvent::Started, this, &ATracePlayerController::OnEquipKnifeStarted);
 	EIC->BindAction(IA_EquipGun,   ETriggerEvent::Started, this, &ATracePlayerController::OnEquipGunStarted);
+	// SPEC v29 §5 — the third weapon key. Started only, for the reason the two above give.
+	EIC->BindAction(IA_EquipSmg,   ETriggerEvent::Started, this, &ATracePlayerController::OnEquipSmgStarted);
 
 	// SPEC v16 §1, the reload bind. PRESS EDGE ONLY, for the same reason the two above are: there is
 	// no held state to release, and a Completed binding would fire a second request on key-up that
@@ -1931,14 +1943,35 @@ void ATracePlayerController::OnMeleeCompleted()
 	}
 }
 
+// =================================================================================================
+// SPEC v29 §5 — THE THREE WEAPON KEYS. ONE TRANSLATION FROM A KEY TO A WEAPON, AND IT IS HERE.
+//
+//     1  STOW GUNS  -> ETraceEquippedWeapon::Knife  guns away, knife only, the v12 §3 speed boost
+//     2  PISTOL     -> ETraceEquippedWeapon::Gun
+//     3  SMG        -> ETraceEquippedWeapon::Smg
+//
+// The knife is in hand in all three (spec v28 §10's dual wield is untouched); stowing is about the
+// GUNS. v28 §10 could only reach three weapons with two keys by remapping them inside
+// TraceMelee::RequestEquipIfDifferent — that remap is DELETED, because a second translation able to
+// disagree with this one is exactly how "pressing 1 does the wrong thing" happens.
+//
+// The two older handler names keep their v13 spellings because ETraceInputAction does; see that
+// enum's comment. OnEquipKnifeStarted IS the stow key.
+// =================================================================================================
+
 void ATracePlayerController::OnEquipKnifeStarted()
 {
-	HandleDirectEquip(/*bWantKnife=*/true, TEXT("EquipKnife"));
+	HandleDirectEquip(ETraceEquippedWeapon::Knife, TEXT("StowGuns"));
 }
 
 void ATracePlayerController::OnEquipGunStarted()
 {
-	HandleDirectEquip(/*bWantKnife=*/false, TEXT("EquipGun"));
+	HandleDirectEquip(ETraceEquippedWeapon::Gun, TEXT("EquipPistol"));
+}
+
+void ATracePlayerController::OnEquipSmgStarted()
+{
+	HandleDirectEquip(ETraceEquippedWeapon::Smg, TEXT("EquipSmg"));
 }
 
 void ATracePlayerController::OnReloadStarted()
@@ -1987,7 +2020,7 @@ void ATracePlayerController::OnReloadStarted()
 static bool GTraceForceUnguardedEquip = false;
 #endif
 
-void ATracePlayerController::HandleDirectEquip(bool bWantKnife, const TCHAR* ActionLabel)
+void ATracePlayerController::HandleDirectEquip(ETraceEquippedWeapon Desired, const TCHAR* ActionLabel)
 {
 	// FIRST LINE, before any gate: this counts "the key reached a bound delegate", which is a
 	// different question from "the weapon changed" and is the one the v13 §2 harness must be able
@@ -2028,11 +2061,11 @@ void ATracePlayerController::HandleDirectEquip(bool bWantKnife, const TCHAR* Act
 	// false/None, which is distinguishable from a genuine refusal (Dead, Carrying, NoPawn) and is
 	// what the log line below prints.
 	// =============================================================================================
-	const ETraceEquippedWeapon Desired = bWantKnife
-		? ETraceEquippedWeapon::Knife
-		: ETraceEquippedWeapon::Gun;
-
-	const bool bAlready = (TraceMelee::IsKnifeEquipped(TraceChar) == bWantKnife);
+	// SPEC v29 §5. The caller names the weapon, so there is nothing to derive here any more — see the
+	// three handlers above. "Already holding it" is asked of the SELECTOR rather than of
+	// IsKnifeEquipped(), which could only ever answer a two-state question and would have reported
+	// "already" for a 2-then-3 press.
+	const bool bAlready = TraceMelee::IsWeaponEquipped(TraceChar, Desired);
 
 	ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
 #if !UE_BUILD_SHIPPING
@@ -2055,7 +2088,7 @@ void ATracePlayerController::HandleDirectEquip(bool bWantKnife, const TCHAR* Act
 		{
 			UE_LOG(LogTraceGame, Display,
 				TEXT("INPUT %s pressed -> ignored, %s already equipped (deployRemaining=%.3f, NOT restarted)"),
-				ActionLabel, bWantKnife ? TEXT("knife") : TEXT("gun"),
+				ActionLabel, LexToString(Desired),
 				TraceMelee::GetDeployRemaining(TraceChar));
 		}
 		else
@@ -2275,6 +2308,7 @@ void ATracePlayerController::LogInputDiagnostics(const TCHAR* Context) const
 	LogAction(TEXT("IA_Scoreboard"), IA_Scoreboard);
 	LogAction(TEXT("IA_EquipKnife"), IA_EquipKnife);
 	LogAction(TEXT("IA_EquipGun  "), IA_EquipGun);
+	LogAction(TEXT("IA_EquipSmg  "), IA_EquipSmg);
 	LogAction(TEXT("IA_Reload    "), IA_Reload);
 	LogAction(TEXT("IA_PullCore  "), IA_PullCore);
 	LogAction(TEXT("IA_Melee     "), IA_Melee);
@@ -2514,6 +2548,11 @@ namespace TracePlayerControllerInput
 			// from the assets while the C++ fallback quietly carries it.
 			{ TEXT("IA_PullCore"),         EInputActionValueType::Boolean, Highest },
 			{ TEXT("IA_Melee"),            EInputActionValueType::Boolean, Highest },
+			// SPEC v29 §5 — the third weapon bind. A checkout whose /Game/Trace/Input predates v29
+			// fails this row, which is the whole point: it says "re-run
+			// Scripts/generate-input-assets.py" out loud rather than letting the 3 key be silently
+			// absent from the assets while the C++ fallback quietly carries it.
+			{ TEXT("IA_EquipSmg"),         EInputActionValueType::Boolean, Highest },
 		};
 
 		int32 Failures = 0;
@@ -2607,6 +2646,10 @@ namespace TracePlayerControllerInput
 			// default is one edit in the action table and never two.
 			{ TEXT("IA_PullCore"),         ETraceInputAction::PullCore,         FKey(),         0, 0 },
 			{ TEXT("IA_Melee"),            ETraceInputAction::Melee,            FKey(),         0, 0 },
+			// SPEC v29 §5 — the SMG key. LAST, because ApplyControlSettings lays it down last (this
+			// table is a copy of that order rather than a sort, and Enhanced Input merges two
+			// mappings of one action with `>=`, so on a tie the last one added wins).
+			{ TEXT("IA_EquipSmg"),         ETraceInputAction::EquipSmg,         FKey(),         0, 0 },
 		};
 
 		const int32 ExpectedMappingCount = static_cast<int32>(UE_ARRAY_COUNT(ExpectedMappings));
@@ -3096,6 +3139,22 @@ void ATracePlayerController::ClientNotifyHit_Implementation(bool bKilled, ETrace
 	// TraceAudio::Play's client-side gate still runs: `this` is a local APlayerController on the
 	// shooter's machine and nowhere else, so a listen-server host does not hear its bots' hits.
 	TraceAudio::Play(this, (Zone == ETraceHitZone::Head) ? TraceSoundEvents::Headshot : TraceSoundEvents::Bodyshot);
+
+	// SPEC v29 §1f — Kill. The sound the owner sent with no stated trigger, and this is where it
+	// belongs: `bKilled` is ALREADY on this RPC (the kill hitmarker two lines above is drawn from it),
+	// so registering a kill costs no new wire traffic and no new call site — one branch on a fact the
+	// shooter's machine is already being told.
+	//
+	// CLIENT-SIDE, DELIBERATELY, and this is the §1f judgement call. A kill sound is the killer's
+	// confirmation: it is the same class of feedback as the Bodyshot/Headshot line above it, which
+	// spec v26 §9 already put client-side. Game-side would announce every kill in the arena to
+	// everybody — that is a kill feed's job, it would mean the victim hears their own killer's
+	// reward, and in a six-a-side fight it would be constant. If the owner wants the room to hear it,
+	// the change is ONE WORD in Audio/TraceSoundEvents.cpp (Client -> World) and no edit here.
+	if (bKilled)
+	{
+		TraceAudio::Play(this, TraceSoundEvents::Kill);
+	}
 
 	// End-to-end proof for the harness: the server only ever sends this after ServerFire ran the
 	// lag-compensated resolver and found one of our bullets on somebody. It cannot be produced by
