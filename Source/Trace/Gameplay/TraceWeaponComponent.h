@@ -925,6 +925,22 @@ private:
 	// client's OnRep_Ammo takes the "a NEW clip — throw the prediction away" branch it already had.
 	// That is why the swap needed no new reconciliation rule.
 
+	/**
+	 * WHICH FIREARM THE LIVE MAGAZINE BELONGS TO.
+	 *
+	 * *** THIS EXISTS BECAUSE "SWAP WHEN THE PREVIOUS AND DESIRED ARE BOTH GUNS" IS WRONG SINCE
+	 * SPEC v29 §5 GAVE THE PLAYER A STOW STATE. *** Pistol -> stow -> SMG is two transitions and
+	 * NEITHER of them is gun-to-gun, so no swap fired and the SMG came out holding the pistol's
+	 * magazine. Ammo counts were being shuffled between weapons by a route the old condition could
+	 * not see.
+	 *
+	 * The question that actually decides a swap is not "where did we come from" but "does the
+	 * magazine in the gun belong to the gun being drawn". This answers that directly, so any route
+	 * between two firearms — however many stows are in the middle — swaps exactly once.
+	 */
+	UPROPERTY(Replicated)
+	ETraceEquippedWeapon LiveClipOwner = ETraceEquippedWeapon::Gun;
+
 	/** SERVER TRUTH. Rounds in the OTHER gun's magazine. Meaningless while the knife is selected. */
 	UPROPERTY(Replicated)
 	uint8 StowedGunClipAmmo = 0;

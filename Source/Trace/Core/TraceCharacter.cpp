@@ -404,6 +404,215 @@ namespace TraceCharacterLayout
 	  * on top of ViewModelKick, which recoils the whole rig (hands included) and is not replaced. */
 	constexpr float RailgunRecoilBackUU = 4.5f;
 	constexpr float RailgunRecoilPitchDegrees = 5.73f;
+
+	// --- THE SMG  (spec v30 §2/§3/§4) --------------------------------------------------------------
+	//
+	// Demo 24 shipped the SMG with NO viewmodel of its own: pressing `3` changed the damage, the fire
+	// rate and the magazine, and left the same pistol on screen. A verifier flagged exactly that. The
+	// rig below is what closes it, and everything about its placement is arithmetic for the same
+	// reason the pistol's is — a gun placed by eye has to be re-placed by eye every time anything
+	// around it moves.
+	//
+	// SCALE, AND WHY 0.30 RATHER THAN THE PISTOL'S 0.22. The two models are authored at 1:1 in metres
+	// and are DIFFERENT LENGTHS — the railgun measures 185.1 cm nose to tail, the SMG 128.5 cm. Using
+	// one scale for both would draw the SMG at three quarters the pistol's on-screen size, which reads
+	// as a toy rather than as the other half of the same armoury. Matching the DRAWN LENGTH is what
+	// makes them siblings: 185.1 x 0.22 = 40.7 uu of camera depth against 128.5 x 0.30 = 38.5 uu.
+	//
+	// MEASURED, against the two checks the file header requires of every viewmodel constant, by
+	// walking all 1993 vertices of the four imported meshes through the rig transform:
+	//
+	//   DEPTH    deepest vertex at 82.9 uu -> 33.2 uu drawn at FirstPersonScale 0.40, inside the 34 uu
+	//            capsule radius, so no part of it can reach a surface the body cannot already stand
+	//            against. (The shipped RAILGUN measures 34.1 uu on the same walk, i.e. it is 0.1 uu
+	//            over the rule it documents. The SMG is the first rig in this project to keep it.)
+	//            Shallowest vertex 44.4 uu -> 17.8 uu, clear of the 10 uu near plane.
+	//   FRAMING  the highest point of the gun sits 31.5% of the frame's half-height BELOW the
+	//            crosshair (the pistol's is 35.8%); the requirement is a quarter. The nearest the
+	//            silhouette comes to the centre line is 13.2% of the half-width right of it, so no
+	//            part of the weapon ever touches the reticle.
+	//   AND IT LANDS WHERE THE PISTOL LANDS. The muzzle projects to 19% right of centre and 40% below
+	//            it; the railgun's is 18% / 41%. Two different guns, the same hold.
+	//
+	// PLACEMENT IS DERIVED, NOT CHOSEN. SmgOrigin = (right hand) - SmgScale * (grip landmark), the
+	// identical construction RailgunOrigin uses, so the mesh's own grip lands in the hand that is
+	// already there and the right hand does not move between the two weapons:
+	//
+	//   grip     mesh-local (-30.0, 0, -8.5) uu  ->  rig (-0.8, 0, -4.6), the right hand
+	//   muzzle   mesh-local ( 58.8, 0, +4.5) uu  ->  rig 25.8 uu out, vs the railgun's 29.4
+	//
+	// The grip and muzzle landmarks are the ones spec §2 names (+0.300 m and -0.588 m along the
+	// source's -Z), read out of railgun_smg_manifest.json rather than out of the prose: the kit's own
+	// README says the aperture is at -0.59 m, and the mesh says -0.588. 2 mm, but the measured one
+	// wins, which is the rule §1 states.
+	constexpr float SmgScale = 0.30f;
+	const FVector SmgGripLocal(-30.0f, 0.f, -8.5f);
+	const FVector SmgMuzzleLocal(58.8f, 0.f, 4.5f);
+	const FVector SmgOrigin(8.2f, 0.f, -2.05f);
+
+	// THE SUPPORT HAND NEEDS NO SMG CONSTANT OF ITS OWN, AND THAT IS A MEASUREMENT RATHER THAN
+	// LAZINESS. It only exists at all in the legacy build — under the v28 dual-wield switch the left
+	// hand holds the knife and touches neither gun — and RailgunLeftHand's rig point (12.4, -2.6,
+	// -5.5) maps back into SMG mesh space at (14.0, -8.7, -11.5) cm. The SMG body's underside runs
+	// dead flat at z = -8.46 cm across the whole span x = 10..30 cm, so that pose puts the fist 3.0 cm
+	// (0.9 uu) under a real handguard and 8.7 cm off the barrel axis, on a body that is 13.2 cm
+	// half-wide there. That is the same "closed around the guard, not resting on top of it"
+	// relationship RailgunLeftHand has with the railgun's own foregrip. One pose, correct for both
+	// guns; a second constant would only be a second thing to keep in step, which is exactly the
+	// argument the DualWield block below makes for its own single pose.
+
+	// --- Fire: 0.100 s, LOOPING  (spec v30 §3) -----------------------------------------------------
+	//
+	// One shot at 600 RPM, and the kit is explicit that the first and last keys match so it cycles
+	// without a hitch. Every curve below therefore returns EXACTLY ZERO at phase 1.0 — a cycle that
+	// ended anywhere else would step on the next shot at 0.1 s intervals and read as a stutter.
+	//
+	// NOTE THE UNITS. The kit quotes millimetres of MESH motion ("+/-42 mm", "20 mm back"), which
+	// after the x100 import are mesh centimetres, which is what these constants are. They are
+	// multiplied by SmgScale wherever they are applied, exactly as RailgunRailThrowUU is, so
+	// retuning the rig's size cannot silently change how far the walls travel relative to the gun.
+	/**
+	 * The clip as authored. Used ONLY as the fallback length when there is no weapon component to ask
+	 * — NotifyWeaponFired takes the real cadence off UTraceWeaponComponent::GetFireInterval(), so a
+	 * character whose ability makes this gun fire at 990 RPM gets a cycle that finishes in time.
+	 */
+	constexpr float SmgFireClipSeconds = 0.100f;
+
+	/**
+	 * The cycle is the WHOLE interval, unlike the railgun's 0.9. The railgun shortens its tail so the
+	 * rails are provably shut before the next round; this clip was authored to loop, its first and
+	 * last keys match, and every curve above lands on exactly zero — so ending the cycle early would
+	 * introduce the very discontinuity the fraction exists to avoid.
+	 */
+	constexpr float SmgFireIntervalFraction = 1.0f;
+
+	/** Floor, so a pathological ini or an ability stack cannot ask for a zero-length cycle. */
+	constexpr float SmgFireMinSeconds = 0.03f;
+	constexpr float SmgWallThrowUU = 4.2f;            // ±42 mm apart on the shot frame
+	constexpr float SmgRecoilBackUU = 2.0f;           // 20 mm back
+	constexpr float SmgRecoilPitchDegrees = 2.58f;    // -0.045 rad, converted once and written down
+
+	/**
+	 * The elastic settle, as an envelope and a ringing frequency.
+	 *
+	 * "Snap apart on the shot frame, then elastic-settle" is a decaying oscillation, and the two
+	 * numbers that describe one are how fast it dies and how many times it crosses zero on the way.
+	 * Damping 3.2 leaves the second overshoot at ~4% of the first; ringing 1.25 puts one full swing
+	 * and a quarter inside the cycle, so the walls visibly come back THROUGH the closed position
+	 * rather than easing onto it. The (1 - phase) factor is what forces the exact zero at the end.
+	 */
+	constexpr float SmgSettleDamping = 3.2f;
+	constexpr float SmgSettleRinging = 1.25f;
+
+	// --- Reload  (spec v30 §3) ---------------------------------------------------------------------
+	//
+	// *** THE CONFLICT, RESOLVED AND STATED: THE MOTION IS TIME-STRETCHED TO THE GAMEPLAY RELOAD. ***
+	//
+	// The kit authored a 0.800 s reload. Demo 25 set the SMG's gameplay reload to 1.300 s
+	// (SmgReloadSeconds, Config/DefaultGame.ini), which is newer and explicit, so 1.3 s wins and the
+	// gameplay number is NOT touched here. That leaves the two choices §3 names, and this is the one
+	// taken and why:
+	//
+	//   TIME-STRETCH (chosen). The three beats keep their PROPORTIONS — 32.5% out, 50% up, 17.5%
+	//   seating — and the whole motion is played across whatever the weapon's own reload actually is.
+	//   The magazine is therefore moving for exactly as long as the player is waiting, and the seat
+	//   lands on the frame the trigger comes back.
+	//
+	//   PLAY IT AUTHORED AND HOLD (rejected). The cell would seat at 0.80 s and the gun would then
+	//   sit visibly finished for half a second while the trigger was still dead. That is a viewmodel
+	//   disagreeing with the weapon, which is the one thing §3 says must not happen — and it is worse
+	//   than a slow reload, because the player would read the seat as "ready" and pull.
+	//
+	// The fractions are the authored beats divided by the authored length, so if the art is ever
+	// re-timed these follow it: 0.26/0.80 and 0.66/0.80.
+	constexpr float SmgReloadAuthoredSeconds = 0.800f;
+	constexpr float SmgReloadOutFraction = 0.26f / 0.80f;    // cell drops away
+	constexpr float SmgReloadUpFraction = 0.66f / 0.80f;     // new cell rides up
+	constexpr float SmgMagDropUU = 30.f;                     // 300 mm, in mesh centimetres
+
+	/** How far the cell is still short when the ride-up ends, i.e. the size of the seating bump. */
+	constexpr float SmgMagSeatBumpUU = 2.4f;
+
+	// --- Emissive  (spec v30 §4) -------------------------------------------------------------------
+	//
+	// Multipliers on the material's own authored emissive, which is what the EmissiveIntensity scalar
+	// on M_TraceRailgun means and what the pistol's fire curve already feeds it. Rest is NOT 1.0 here:
+	// the SMG idles hot at 1.8x, so these have to be written at build time as well as per frame, or
+	// a gun that is never fired sits at the material's 1.0 default.
+	constexpr float SmgCyanRest = 1.8f;
+	constexpr float SmgCyanPeak = 4.8f;
+
+	/**
+	 * The ammo readout. 1.4x at a full 40, 0.35x at empty, linear between — driven by the CLIP, not
+	 * by the fire clip, so the cell drains as you shoot and refills when the magazine seats.
+	 */
+	constexpr float SmgAmberFull = 1.4f;
+	constexpr float SmgAmberEmpty = 0.35f;
+
+	// --- The three motion curves, written down as functions --------------------------------------
+	//
+	// EVERY ONE OF THEM IS EXACTLY 1.0 AT PHASE 0 AND EXACTLY 0.0 AT PHASE 1, and that is not
+	// tidiness — it is what "first and last keys match, so it cycles without a hitch" means when the
+	// clip is code. A curve that ended at 0.03 would leave the walls 0.13 mm open at 600 RPM forever.
+
+	/**
+	 * The elastic settle, for the rail walls. 1.0 on the shot frame, ringing through zero on the way
+	 * back to a hard 0.0 at the end of the cycle.
+	 *
+	 * Three factors, each doing one job: (1 - T) forces the exact zero at the end, the exponential is
+	 * the decay envelope, and the cosine is the ring. Multiplying rather than adding them is what
+	 * keeps the overshoots shrinking instead of the tail wagging.
+	 */
+	inline float SmgElasticSettle(float Phase)
+	{
+		const float T = FMath::Clamp(Phase, 0.f, 1.f);
+		return (1.f - T) * FMath::Exp(-SmgSettleDamping * T)
+			* FMath::Cos(2.f * PI * SmgSettleRinging * T);
+	}
+
+	/**
+	 * The flash fall, for circuit_cyan and for the receiver's recoil. 1.0 on the shot frame, 0.0 at
+	 * the end, and MONOTONE — a glow that rang would strobe, and a receiver that rang would buzz.
+	 * Quadratic rather than linear: most of the drop happens in the first third of the cycle, which
+	 * is what a discharge looks like.
+	 */
+	inline float SmgFlashFall(float Phase)
+	{
+		const float T = FMath::Clamp(Phase, 0.f, 1.f);
+		return (1.f - T) * (1.f - T);
+	}
+
+	/**
+	 * The magazine's height, in MESH centimetres below seated, for a reload phase in 0..1. Three
+	 * beats, as authored, at the authored proportions:
+	 *
+	 *   0.000 .. 0.325   the spent cell falls away, eased IN — a magazine released under gravity
+	 *                    accelerates, it does not slide out at a constant rate.
+	 *   0.325 .. 0.825   the new cell rides up, eased OUT, stopping SmgMagSeatBumpUU short.
+	 *   0.825 .. 1.000   IT SEATS WITH A BUMP: that last 2.4 cm closes, overshoots 1.2 cm into the
+	 *                    well and rebounds to exactly zero. The overshoot is the bump; without it
+	 *                    the third beat is just a slower second beat and the kit calls for three.
+	 */
+	inline float SmgMagDrop(float Phase)
+	{
+		const float T = FMath::Clamp(Phase, 0.f, 1.f);
+
+		if (T <= SmgReloadOutFraction)
+		{
+			const float A = T / SmgReloadOutFraction;
+			return SmgMagDropUU * A * A;
+		}
+		if (T <= SmgReloadUpFraction)
+		{
+			const float A = (T - SmgReloadOutFraction) / (SmgReloadUpFraction - SmgReloadOutFraction);
+			const float Eased = 1.f - (1.f - A) * (1.f - A);
+			return FMath::Lerp(SmgMagDropUU, SmgMagSeatBumpUU, Eased);
+		}
+
+		const float A = (T - SmgReloadUpFraction)
+			/ FMath::Max(1.f - SmgReloadUpFraction, KINDA_SMALL_NUMBER);
+		return SmgMagSeatBumpUU * (1.f - A) * FMath::Cos(2.f * PI * A);
+	}
 }
 
 namespace TraceCharacterAssets
@@ -467,7 +676,28 @@ namespace TraceCharacterAssets
 	const TCHAR* const RailgunRailLeftMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_Railgun_RailL.SM_Railgun_RailL");
 	const TCHAR* const RailgunRailRightMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_Railgun_RailR.SM_Railgun_RailR");
 
-	/** Material slot names baked into the meshes, used to find the two glowing slots to animate. */
+	/**
+	 * The SMG. Same contract, same folder, same import script (`Scripts/import-railgun.sh --rig smg`),
+	 * authored in Art/Smg/railgun_smg.glb.
+	 *
+	 * FOUR meshes rather than three because this export carries authored pivot nodes — the railgun's
+	 * did not, and its walls had to be inferred by name. The split here is exact:
+	 * wall_pivot_left/right own the two rail walls, mag_pivot owns the 40-round cell, and everything
+	 * else is the body. All three pivots sit at (0,0,0) relative to the weapon root, so unlike the
+	 * railgun there are no hinge offsets to carry: every part's rest position is SmgOrigin itself.
+	 *
+	 * All four optional, exactly like the railgun's three: a miss on any one leaves the SMG slot
+	 * showing the pistol rig and says why. -TraceNoSmg forces that path deliberately, and
+	 * -TraceNoRailgun (which already forced it for the pistol) suppresses both.
+	 */
+	const TCHAR* const SmgBodyMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_RailgunSmg_Body.SM_RailgunSmg_Body");
+	const TCHAR* const SmgWallLeftMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_RailgunSmg_WallLeft.SM_RailgunSmg_WallLeft");
+	const TCHAR* const SmgWallRightMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_RailgunSmg_WallRight.SM_RailgunSmg_WallRight");
+	const TCHAR* const SmgMagMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_RailgunSmg_Mag.SM_RailgunSmg_Mag");
+
+	/** Material slot names baked into the meshes, used to find the two glowing slots to animate.
+	  * The SMG's are the same two FNames — the import writes the raw glTF material names undecorated
+	  * on both weapons, which is why one pair of constants serves both. */
 	const FName RailgunCyanSlot(TEXT("circuit_cyan"));
 	const FName RailgunAmberSlot(TEXT("core_amber"));
 
@@ -1044,6 +1274,32 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 		if (RailgunRailRightFinder.Succeeded())
 		{
 			RailgunRailRightMesh = RailgunRailRightFinder.Object;
+		}
+	}
+
+	// The SMG's four meshes, on the identical contract: a CDO reference so the cooker packages them,
+	// and a miss on any one is a fallback rather than an error. See BuildSmgViewModel().
+	{
+		static ConstructorHelpers::FObjectFinder<UStaticMesh> SmgBodyFinder(TraceCharacterAssets::SmgBodyMeshPath);
+		static ConstructorHelpers::FObjectFinder<UStaticMesh> SmgWallLeftFinder(TraceCharacterAssets::SmgWallLeftMeshPath);
+		static ConstructorHelpers::FObjectFinder<UStaticMesh> SmgWallRightFinder(TraceCharacterAssets::SmgWallRightMeshPath);
+		static ConstructorHelpers::FObjectFinder<UStaticMesh> SmgMagFinder(TraceCharacterAssets::SmgMagMeshPath);
+
+		if (SmgBodyFinder.Succeeded())
+		{
+			SmgBodyMesh = SmgBodyFinder.Object;
+		}
+		if (SmgWallLeftFinder.Succeeded())
+		{
+			SmgWallLeftMesh = SmgWallLeftFinder.Object;
+		}
+		if (SmgWallRightFinder.Succeeded())
+		{
+			SmgWallRightMesh = SmgWallRightFinder.Object;
+		}
+		if (SmgMagFinder.Succeeded())
+		{
+			SmgMagMesh = SmgMagFinder.Object;
 		}
 	}
 
@@ -2342,6 +2598,12 @@ void ATraceCharacter::EnsureViewModelBuilt()
 	// built either way — they are what holds whichever weapon won.
 	const bool bRailgun = BuildRailgunViewModel();
 
+	// SPEC v30 §2 — and the SMG is built BESIDE the pistol, not instead of it. Both rigs exist from
+	// this moment on and UpdateWeaponSelection() decides which one is drawn; see the declaration for
+	// why a swap must not be allowed to construct geometry. A false here is not an error: the `3`
+	// slot then shows whichever pistol rig this pawn got, and says so once.
+	BuildSmgViewModel();
+
 	const FViewModelPart Parts[] =
 	{
 		// The gun. A slide over a frame over a raked grip: three masses, which is what makes a
@@ -2424,9 +2686,18 @@ void ATraceCharacter::EnsureViewModelBuilt()
 			Location = LeftKnuckle;
 		}
 
-		AddViewModelPart(Part.bCylinder ? CylinderMesh : CubeMesh, Part.Name,
+		UStaticMeshComponent* Built = AddViewModelPart(Part.bCylinder ? CylinderMesh : CubeMesh, Part.Name,
 			Location, Part.Rotation, Part.Size,
 			Part.bNeon ? ViewModelNeonMID : ViewModelBodyMID);
+
+		// [SPEC v30 §2] The cube gun's own twelve pieces ARE the pistol rig when the railgun art is
+		// missing, so the selector has to be able to hide them for the `1` and `3` states just as it
+		// hides the railgun's. Only reached when !bRailgun — the `continue` above skipped them
+		// otherwise — so this can never double-add.
+		if (Part.bWeapon && Built != nullptr)
+		{
+			PistolWeaponParts.Add(Built);
+		}
 	}
 
 	// --- Forearms --------------------------------------------------------------------------------
@@ -2508,6 +2779,21 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		}
 	}
 
+	// [SPEC v30 §5] The SMG's own marker, on the SMG's own body, at the SMG's own aperture. Same
+	// arrangement, second gun — GetActiveMuzzleMarker() picks between them by what is DRAWN, so the
+	// beam leaves whichever barrel the player is actually looking at with no change in ATraceTracer.
+	if (ViewModelSmgMuzzle == nullptr && SmgBodyPart != nullptr)
+	{
+		ViewModelSmgMuzzle = NewObject<USceneComponent>(this, TEXT("ViewModelSmgMuzzle"));
+		if (ViewModelSmgMuzzle != nullptr)
+		{
+			ViewModelSmgMuzzle->SetMobility(EComponentMobility::Movable);
+			ViewModelSmgMuzzle->SetupAttachment(SmgBodyPart);
+			ViewModelSmgMuzzle->SetRelativeLocation(TraceCharacterLayout::SmgMuzzleLocal);
+			ViewModelSmgMuzzle->RegisterComponent();
+		}
+	}
+
 	// Hidden until UpdateViewBlend says first person; ApplyTeamColors paints the light channels.
 	for (UStaticMeshComponent* Part : ViewModelParts)
 	{
@@ -2518,11 +2804,18 @@ void ATraceCharacter::EnsureViewModelBuilt()
 	}
 	bViewModelVisible = false;
 
+	// [SPEC v30 §2] Two guns are now on the rig and only one of them may be drawn. Settle that here,
+	// before the first frame, so a pawn that spawns holding the SMG never shows a pistol — not even
+	// for the one tick it would take Tick() to get around to it.
+	UpdateWeaponSelection();
+
 	ApplyTeamColors();
 
-	UE_LOG(LogTraceGame, Verbose, TEXT("%s built a first-person viewmodel (%d parts, muzzle marker on %s)."),
+	UE_LOG(LogTraceGame, Verbose,
+		TEXT("%s built a first-person viewmodel (%d parts, pistol muzzle on %s, SMG rig %s)."),
 		*GetName(), ViewModelParts.Num(),
-		(RailgunBodyPart != nullptr) ? TEXT("the railgun body") : TEXT("the fallback rig"));
+		(RailgunBodyPart != nullptr) ? TEXT("the railgun body") : TEXT("the fallback rig"),
+		(SmgBodyPart != nullptr) ? TEXT("built") : TEXT("ABSENT - the `3` slot falls back"));
 }
 
 bool ATraceCharacter::BuildRailgunViewModel()
@@ -2597,9 +2890,176 @@ bool ATraceCharacter::BuildRailgunViewModel()
 			*TraceCharacterAssets::RailgunAmberSlot.ToString(), AmberSlot);
 	}
 
+	// [SPEC v30 §2] The three railgun parts are the PISTOL rig, and the selector has to be able to
+	// take them off screen for the `1` (stowed) and `3` (SMG) states.
+	PistolWeaponParts.Add(RailgunBodyPart);
+	PistolWeaponParts.Add(RailgunRailLeftPart);
+	PistolWeaponParts.Add(RailgunRailRightPart);
+
 	UE_LOG(LogTraceGame, Log, TEXT("%s built the railgun viewmodel (muzzle at rig x=%.1f)."),
 		*GetName(),
 		TraceCharacterLayout::RailgunOrigin.X + TraceCharacterLayout::RailgunMuzzleLocal.X * S);
+	return true;
+}
+
+// =================================================================================================
+// THE SMG RIG  —  spec v30 §2, §3, §4
+// =================================================================================================
+//
+// "Demo 24 added the SMG with no viewmodel of its own — a verifier flagged that nothing on screen
+// tells the player which gun they are holding."
+//
+// THE SHAPE OF THE FIX. Three weapon states exist (1 stows, 2 pistol, 3 SMG) and the knife is in the
+// off hand in all three, so the rig has to answer three questions, not two, and the answer has to be
+// visible at a glance rather than in an ammo counter:
+//
+//     1  ->  neither gun. Both weapon rigs off screen, hands and knife only.
+//     2  ->  the pistol rig  (the railgun, or the procedural cube gun if the art is missing)
+//     3  ->  THE SMG RIG     (or, if THAT art is missing, the pistol rig and a line in the log)
+//
+// WHY THE MOTION IS CODE AND NOT AN ANIMATION. The GLB is the mesh-only export: `animations: []`.
+// The kit's README promises `Fire` and `Reload` clips and warns, in the same paragraph, that the
+// stage's bottom-right toolbar exports without them — which is the export we have. Waiting for the
+// clips is not an option and is not necessary: §3 states the whole motion in numbers, and the
+// pistol's Fire was reproduced from numbers the same way in spec v20. What is reproduced here is
+// driven off the WEAPON'S REAL STATE — the fire cycle by NotifyWeaponFired, the reload by the
+// component's own replicated deadline — so the picture cannot disagree with the gun.
+
+bool ATraceCharacter::BuildSmgViewModel()
+{
+	if (SmgBodyMesh == nullptr || SmgWallLeftMesh == nullptr
+		|| SmgWallRightMesh == nullptr || SmgMagMesh == nullptr)
+	{
+		// *** THE FALLBACK MUST SURVIVE. *** A fresh clone that has not run `git lfs pull` has the
+		// .uasset files as LFS pointer stubs, so this is the NORMAL first-run state and not an
+		// error — it must leave a playable game and a log line that says the one command that fixes
+		// it. Warning rather than Error for the same reason the railgun's is: this is a missing
+		// optional asset, and the pawn behind it is fully functional.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("SMG art did not resolve (body=%s wallL=%s wallR=%s mag=%s); the `3` weapon slot will ")
+			TEXT("show the pistol rig instead. Run `Scripts/import-railgun.sh --rig smg`, or ")
+			TEXT("`git lfs pull` if this is a fresh clone."),
+			SmgBodyMesh != nullptr ? TEXT("ok") : TEXT("MISSING"),
+			SmgWallLeftMesh != nullptr ? TEXT("ok") : TEXT("MISSING"),
+			SmgWallRightMesh != nullptr ? TEXT("ok") : TEXT("MISSING"),
+			SmgMagMesh != nullptr ? TEXT("ok") : TEXT("MISSING"));
+		return false;
+	}
+
+	// The same escape hatch the railgun has, and -TraceNoRailgun suppresses BOTH: "show me the
+	// fallback" is one intention, and having to remember two switches to express it is how a
+	// half-forced state gets photographed and reported as a bug.
+	if (FParse::Param(FCommandLine::Get(), TEXT("TraceNoSmg"))
+		|| FParse::Param(FCommandLine::Get(), TEXT("TraceNoRailgun")))
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("-TraceNoSmg/-TraceNoRailgun: the `3` slot will show the pistol rig on purpose."));
+		return false;
+	}
+
+	const float S = TraceCharacterLayout::SmgScale;
+	const FVector Size(TraceCharacterLayout::ViewModelShapeUnit * S);   // AddViewModelPart divides by the unit
+
+	// ALL FOUR PARTS SIT AT THE SAME ORIGIN, and that is a property of the export rather than a
+	// simplification. The railgun's walls had to be baked around inferred hinges and placed at a
+	// mirrored offset; this GLB carries authored pivot nodes (wall_pivot_left/right, mag_pivot) and
+	// every one of them is at (0,0,0) relative to the weapon root, so each group's rest transform is
+	// SmgOrigin exactly and its motion is a pure delta on top. railgun_smg_manifest.json records
+	// `attach_to_body_cm: [0,0,0]` for all three, which is where that claim is checked.
+	//
+	// No MID is passed on any of them: these meshes carry their own imported material instances on
+	// four, two, two and three slots respectively, and AddViewModelPart's override only reaches
+	// slot 0.
+	SmgBodyPart = AddViewModelPart(SmgBodyMesh, TEXT("VMSmgBody"),
+		TraceCharacterLayout::SmgOrigin, FRotator::ZeroRotator, Size, nullptr);
+	SmgWallLeftPart = AddViewModelPart(SmgWallLeftMesh, TEXT("VMSmgWallL"),
+		TraceCharacterLayout::SmgOrigin, FRotator::ZeroRotator, Size, nullptr);
+	SmgWallRightPart = AddViewModelPart(SmgWallRightMesh, TEXT("VMSmgWallR"),
+		TraceCharacterLayout::SmgOrigin, FRotator::ZeroRotator, Size, nullptr);
+	SmgMagPart = AddViewModelPart(SmgMagMesh, TEXT("VMSmgMag"),
+		TraceCharacterLayout::SmgOrigin, FRotator::ZeroRotator, Size, nullptr);
+
+	if (SmgBodyPart == nullptr || SmgWallLeftPart == nullptr
+		|| SmgWallRightPart == nullptr || SmgMagPart == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("SMG parts failed to attach; the `3` slot falls back."));
+		SmgBodyPart = nullptr;
+		SmgWallLeftPart = nullptr;
+		SmgWallRightPart = nullptr;
+		SmgMagPart = nullptr;
+		return false;
+	}
+
+	SmgWeaponParts.Add(SmgBodyPart);
+	SmgWeaponParts.Add(SmgWallLeftPart);
+	SmgWeaponParts.Add(SmgWallRightPart);
+	SmgWeaponParts.Add(SmgMagPart);
+
+	// --- The two glowing slots, and the one trap in this whole section ---------------------------
+	//
+	// *** THE SMG'S GLOW IS SPLIT ACROSS MESHES; THE PISTOL'S IS NOT. *** On the railgun both glowing
+	// materials are on the single body mesh, so "two MIDs off the body part" was the whole pattern.
+	// Here:
+	//
+	//     circuit_cyan  ->  Body (slot 2), WallLeft (slot 1), WallRight (slot 1).  NOT on the Mag.
+	//     core_amber    ->  Mag (slot 1).                                          NOT on the Body.
+	//
+	// Copying the pistol's pattern verbatim therefore asks the BODY for core_amber, gets INDEX_NONE,
+	// and produces an ammo readout that silently never lights — the failure mode this project keeps
+	// having to find after the fact. Found BY SLOT NAME on each component that actually has it, for
+	// the same reason the pistol's are: slot ORDER is an artefact of the OBJ writer, not a contract.
+	const auto AddGlowMID = [this](UStaticMeshComponent* Part, const FName& Slot) -> UMaterialInstanceDynamic*
+	{
+		if (Part == nullptr)
+		{
+			return nullptr;
+		}
+		const int32 Index = Part->GetMaterialIndex(Slot);
+		return (Index != INDEX_NONE) ? Part->CreateDynamicMaterialInstance(Index) : nullptr;
+	};
+
+	SmgCyanMIDs.Reset();
+	for (UStaticMeshComponent* Part : { SmgBodyPart.Get(), SmgWallLeftPart.Get(), SmgWallRightPart.Get() })
+	{
+		if (UMaterialInstanceDynamic* MID = AddGlowMID(Part, TraceCharacterAssets::RailgunCyanSlot))
+		{
+			SmgCyanMIDs.Add(MID);
+		}
+	}
+	SmgAmberMID = AddGlowMID(SmgMagPart, TraceCharacterAssets::RailgunAmberSlot);
+
+	if (SmgCyanMIDs.Num() != 3 || SmgAmberMID == nullptr)
+	{
+		// Not fatal — the gun renders, it just will not flare or report ammo. Loud, and it names the
+		// count rather than just "failed", because 2-of-3 cyan (a wall that stays dark through every
+		// shot) is a real and much less obvious failure than 0-of-3.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("SMG built, but its glow is incomplete: circuit_cyan MIDs %d/3 (body+both walls), ")
+			TEXT("core_amber on the magazine %s."),
+			SmgCyanMIDs.Num(), SmgAmberMID != nullptr ? TEXT("ok") : TEXT("MISSING"));
+	}
+
+	// THE REST POSE HAS TO BE WRITTEN NOW, not on the first shot. circuit_cyan idles at 1.8x and the
+	// imported material instance's own EmissiveIntensity default is 1.0, so a gun that is drawn but
+	// never fired would sit visibly dull — and UpdateSmgAnimation only runs while the rig is on
+	// screen, so there is no later moment that is guaranteed to happen first.
+	for (UMaterialInstanceDynamic* MID : SmgCyanMIDs)
+	{
+		if (MID != nullptr)
+		{
+			MID->SetScalarParameterValue(TEXT("EmissiveIntensity"), TraceCharacterLayout::SmgCyanRest);
+		}
+	}
+	if (SmgAmberMID != nullptr)
+	{
+		SmgAmberMID->SetScalarParameterValue(TEXT("EmissiveIntensity"), TraceCharacterLayout::SmgAmberFull);
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("%s built the SMG viewmodel (4 parts at scale %.2f, muzzle at rig x=%.1f, cyan MIDs %d, amber %s)."),
+		*GetName(), S,
+		TraceCharacterLayout::SmgOrigin.X + TraceCharacterLayout::SmgMuzzleLocal.X * S,
+		SmgCyanMIDs.Num(), SmgAmberMID != nullptr ? TEXT("ok") : TEXT("MISSING"));
 	return true;
 }
 
@@ -2700,6 +3160,305 @@ void ATraceCharacter::UpdateRailgunFire(float DeltaSeconds)
 	}
 }
 
+// -------------------------------------------------------------------------------------------------
+// SPEC v30 §2 — WHICH GUN IS ON SCREEN
+// -------------------------------------------------------------------------------------------------
+//
+// *** THE TWO VISIBILITY LAYERS, AND WHY THIS USES THE SECOND ONE. ***
+//
+// A first-person weapon part is drawn only when BOTH `bVisible` and `!bHiddenInGame` say so, and the
+// two flags have separate setters that never touch each other. That is exactly one flag more than
+// this project had owners for, and the extra one is what makes a three-state selector safe:
+//
+//   bVisible        "is the rig on screen at all". TWO writers already: ATraceCharacter::
+//                   SetViewModelVisible (the carry blend, the corpse, respawns) and
+//                   UTraceWeaponComponent::SetGunViewModelHidden (the knife). The latter deliberately
+//                   RE-ASSERTS ITSELF EVERY TICK — that re-assert is the spec v12 §7 fix — and it
+//                   sets every non-hand part it can find under ViewModelRoot.
+//   bHiddenInGame   "which of the two guns is selected". Written HERE AND NOWHERE ELSE.
+//
+// Had the selector been written in bVisible it would have been in a fight it could not win: the
+// knife's per-tick re-assert shows every gun part whenever the knife is not out, so a pistol hidden
+// for the SMG would come back sixty times a second, and which one you saw would depend on component
+// tick order. Splitting the layers means the two rules COMPOSE instead of racing — the knife decides
+// whether any gun is drawn, this decides which one, and neither has to know the other exists.
+//
+// It also keeps UTraceWeaponComponent::GetViewModelCensus honest for free: it counts with
+// IsVisible(), which already folds in bHiddenInGame, so the SMG-hidden pistol is correctly NOT
+// counted as a gun on screen and Trace.Knife.DualWeaponTest keeps measuring what it measures.
+
+void ATraceCharacter::UpdateWeaponSelection()
+{
+	if (!bViewModelBuilt || ViewModelRoot == nullptr)
+	{
+		return;
+	}
+
+	// THE REPLICATED SELECTOR IS THE SOURCE OF TRUTH, not a local guess and not an input event. It is
+	// the same value the damage table, the fire rate and the ammo counter read, so the gun on screen
+	// and the gun being simulated cannot disagree — which is the entire complaint spec §2 opens with.
+	//
+	// *** IT ANSWERS "WHICH GUN", AND DELIBERATELY NOT "ANY GUN AT ALL". *** The `1` state — guns
+	// stowed — is UTraceWeaponComponent's rule, enforced by SetGunViewModelHidden and re-asserted
+	// every tick, and it works on this rig unchanged because both gun rigs are ordinary children of
+	// ViewModelRoot. So the Knife case below moves NOTHING: it records that nothing is drawn and
+	// leaves the holstered firearm's flags exactly where they were.
+	//
+	// THAT RESTRAINT IS NOT TIDINESS, IT IS A MEASURED FIX. The first version of this function also
+	// hid both rigs on Knife — harmless-looking, and the same rule enforced twice. Running
+	// Trace.Knife.DualWeaponTest with -TraceLegacyKnife then reported
+	//     RESULT: *** NOT PROVEN *** — the RED arm did not reproduce the bug
+	// because that harness's red arm restores the v12 §7 latch defect in SetGunViewModelHidden and
+	// counts the gun parts left on screen beside the knife — and this function was quietly hiding
+	// them for it. A second owner for one rule had taken an existing verifier's red arm away. With
+	// the Knife case inert the red arm reproduces again, and the `1` state is still exactly as
+	// correct as it was before this pass, through the path that is actually tested.
+	bool bStowed = false;
+	if (Weapon != nullptr)
+	{
+		switch (Weapon->GetEquippedWeapon())
+		{
+		case ETraceEquippedWeapon::Knife:
+			// SPEC v29 §5 gave this value back its old meaning: guns stowed. The holstered firearm
+			// does not change when you put it away, so SelectedFirearm is left alone and comes back
+			// unchanged on the next `2` or `3`.
+			bStowed = true;
+			break;
+
+		case ETraceEquippedWeapon::Smg:
+			// THE FALLBACK. No SMG art (a fresh clone without `git lfs pull`, or -TraceNoSmg) means
+			// the SMG slot shows the pistol rig rather than an empty pair of hands. A player who can
+			// see a gun and shoot it has a playable game; a player holding nothing has a bug report.
+			SelectedFirearm = (SmgBodyPart != nullptr) ? EShownGun::Smg : EShownGun::Pistol;
+			if (SmgBodyPart == nullptr && !bSmgFallbackLogged)
+			{
+				bSmgFallbackLogged = true;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("%s selected the SMG but has no SMG rig; showing the pistol rig instead. ")
+					TEXT("The weapon's damage, fire rate, clip and reload are unaffected — this is a ")
+					TEXT("MISSING-ART fallback, not a gameplay change. See the build log above for which ")
+					TEXT("mesh was absent."), *GetName());
+			}
+			break;
+
+		default:
+			SelectedFirearm = EShownGun::Pistol;
+			break;
+		}
+	}
+
+	// What is actually on screen, which is what GetShownGun() promises to report: nothing while the
+	// guns are stowed, otherwise the firearm this rig is holding.
+	ShownGun = bStowed ? EShownGun::None : SelectedFirearm;
+
+	const bool bShowPistol = (SelectedFirearm == EShownGun::Pistol);
+
+	for (const TObjectPtr<UStaticMeshComponent>& Part : PistolWeaponParts)
+	{
+		if (Part != nullptr)
+		{
+			Part->SetHiddenInGame(!bShowPistol);
+		}
+	}
+	for (const TObjectPtr<UStaticMeshComponent>& Part : SmgWeaponParts)
+	{
+		if (Part != nullptr)
+		{
+			Part->SetHiddenInGame(bShowPistol);
+		}
+	}
+}
+
+USceneComponent* ATraceCharacter::GetActiveMuzzleMarker() const
+{
+	// [SPEC v30 §5] The beam must leave whichever gun is actually on screen. Asked of what is DRAWN
+	// rather than of the selector, so the missing-art fallback — SMG selected, pistol rig up — puts
+	// the beam on the barrel the player can see rather than on one that is hidden.
+	if (SelectedFirearm == EShownGun::Smg && ViewModelSmgMuzzle != nullptr)
+	{
+		return ViewModelSmgMuzzle;
+	}
+	return ViewModelMuzzle;
+}
+
+// -------------------------------------------------------------------------------------------------
+// SPEC v30 §3 and §4 — the SMG's motion and glow
+// -------------------------------------------------------------------------------------------------
+
+void ATraceCharacter::UpdateSmgAnimation(float DeltaSeconds)
+{
+	if (SmgBodyPart == nullptr)
+	{
+		return;
+	}
+
+	// Trace.Smg.Hold pins a pose so a screenshot can catch it, and it is checked FIRST for the same
+	// reason the railgun's is: a held pose has no shot and no reload behind it. The whole fire cycle
+	// is 0.100 s — three frames at 30 fps — so without this there is no way to photograph the shot
+	// frame at all, and "the walls move" would be a claim rather than a picture.
+	bool bHeld = false;
+	if (SmgDebugHoldAlpha >= 0.f || SmgDebugHoldReloadAlpha >= 0.f)
+	{
+		const UWorld* World = GetWorld();
+		if (World != nullptr && World->GetTimeSeconds() < SmgDebugHoldUntil)
+		{
+			bHeld = true;
+		}
+		else
+		{
+			SmgDebugHoldAlpha = -1.f;
+			SmgDebugHoldReloadAlpha = -1.f;
+			SmgFireElapsed = -1.f;
+		}
+	}
+
+	// --- Where in the 0.100 s fire cycle are we? -------------------------------------------------
+	//
+	// DRIVEN BY REAL SHOTS. SmgFireElapsed is armed by NotifyWeaponFired, which UTraceWeaponComponent
+	// calls at the moment a round is committed. Nothing here free-runs: with the trigger up the phase
+	// sits at 1.0, every curve returns zero, and the gun is at rest by construction rather than by a
+	// timer happening to be in the right place.
+	// *** SAMPLE FIRST, THEN ADVANCE — AND THE ORDER IS THE WHOLE POINT. ***
+	//
+	// NotifyWeaponFired arms this at 0, which IS the shot frame: full +/-42 mm wall snap, full 4.8x
+	// cyan, full recoil. Advancing before sampling meant phase 0 was never once evaluated — the
+	// first sample after a shot landed a whole frame in, and on a 0.100 s cycle at 50 fps that is
+	// 20% of the way down the decay. Measured before this change: peak cyan 4.058 instead of 4.8,
+	// recoil at 55-75% of its authored amplitude, and the wall snap essentially never rendered.
+	//
+	// It is the same shape as the fire-rate bug in spec v29 §2f: a per-frame reader sampling a
+	// quantity that changes faster than the frame does, and losing the part that falls between.
+	float FirePhase = 1.f;   // 1.0 == settled
+	if (bHeld && SmgDebugHoldAlpha >= 0.f)
+	{
+		FirePhase = FMath::Clamp(SmgDebugHoldAlpha, 0.f, 1.f);
+	}
+	else if (SmgFireElapsed >= 0.f)
+	{
+		FirePhase = (SmgFireDuration > KINDA_SMALL_NUMBER)
+			? FMath::Clamp(SmgFireElapsed / SmgFireDuration, 0.f, 1.f) : 1.f;
+	}
+
+	// Advanced AFTER the sample above, so the frame that follows a shot draws the shot frame.
+	if (!bHeld && SmgFireElapsed >= 0.f)
+	{
+		SmgFireElapsed += DeltaSeconds;
+	}
+
+	// --- Where in the reload are we? -------------------------------------------------------------
+	//
+	// READ OFF THE WEAPON'S OWN REPLICATED DEADLINE, every frame, rather than started by an event and
+	// counted locally. That is what makes the picture unable to lie: a reload that is cancelled, that
+	// arrives late over the network, or that runs at a length nobody told this file about still puts
+	// the magazine exactly where the gun's remaining time says it should be.
+	//
+	// AND IT IS WHERE THE 0.8 s / 1.3 s CONFLICT IS RESOLVED. GetReloadSeconds() is the GAMEPLAY
+	// number (1.3 s for the SMG, from Config/DefaultGame.ini), so dividing by it time-stretches the
+	// authored 0.8 s motion onto it. See the constants block for why stretching beats holding.
+	float ReloadPhase = -1.f;   // negative == not reloading, magazine seated
+	if (bHeld && SmgDebugHoldReloadAlpha >= 0.f)
+	{
+		ReloadPhase = FMath::Clamp(SmgDebugHoldReloadAlpha, 0.f, 1.f);
+	}
+	else if (Weapon != nullptr && Weapon->IsReloading())
+	{
+		const float Total = FMath::Max(Weapon->GetReloadSeconds(), KINDA_SMALL_NUMBER);
+		ReloadPhase = FMath::Clamp(1.f - (Weapon->GetReloadRemaining() / Total), 0.f, 1.f);
+	}
+
+	// --- §4: the emissive ------------------------------------------------------------------------
+	//
+	// circuit_cyan idles at 1.8x and spikes to 4.8x on the shot frame. Written to ALL THREE MIDs
+	// together — body and both walls — because the channel light runs down the rails, and lighting
+	// only the body would leave the two brightest strips on the weapon dead through every shot.
+	const float Cyan = TraceCharacterLayout::SmgCyanRest
+		+ (TraceCharacterLayout::SmgCyanPeak - TraceCharacterLayout::SmgCyanRest)
+			* TraceCharacterLayout::SmgFlashFall(FirePhase);
+
+	for (const TObjectPtr<UMaterialInstanceDynamic>& MID : SmgCyanMIDs)
+	{
+		if (MID != nullptr)
+		{
+			MID->SetScalarParameterValue(TEXT("EmissiveIntensity"), Cyan);
+		}
+	}
+
+	// core_amber is THE AMMO READOUT — 1.4x at a full 40, 0.35x at empty, interpolating. Driven by
+	// the clip and not by the fire clip, which is the point: the cell visibly drains as the magazine
+	// empties, so a player can read how much they have left off the gun in their hands instead of off
+	// a number in the corner. It refills on the frame the reload lands, which is the same frame the
+	// magazine seats — one event, two things on screen agreeing about it.
+	//
+	// The clip is asked for even when the weapon is not the SMG, because a swap can happen at any
+	// time and a stale amber value would be a lit cell on a gun that is empty.
+	if (SmgAmberMID != nullptr)
+	{
+		float Fill = 1.f;
+		if (Weapon != nullptr)
+		{
+			const int32 ClipSize = FMath::Max(1, Weapon->GetClipSize());
+			Fill = FMath::Clamp(static_cast<float>(Weapon->GetClipAmmo()) / static_cast<float>(ClipSize), 0.f, 1.f);
+		}
+		SmgAmberMID->SetScalarParameterValue(TEXT("EmissiveIntensity"),
+			FMath::Lerp(TraceCharacterLayout::SmgAmberEmpty, TraceCharacterLayout::SmgAmberFull, Fill));
+	}
+
+	// --- §3: the motion ---------------------------------------------------------------------------
+	//
+	// UNITS, ONCE, HERE. Every constant below is in the MESH's centimetres (the kit quotes millimetres
+	// and the import is x100), so every one of them is multiplied by SmgScale to reach rig space. A
+	// value that modifies a base must be relative to that base: retuning the rig's size must not
+	// silently change how far the walls travel across the gun.
+	const float S = TraceCharacterLayout::SmgScale;
+
+	// The whole weapon recoils — the root node `railgun_smg` in the kit's table, which is body, walls
+	// and magazine together. Applied to all four components as one rigid transform about SmgOrigin,
+	// which is exact because all four meshes are baked around that same origin.
+	//
+	// The pitch sign follows the kit (-0.045 rad) and the railgun's own convention. This is the
+	// receiver rocking INSIDE the hands; the muzzle rise a player actually reads comes from
+	// ViewModelKick, which pitches the entire rig — hands included — and is not replaced here.
+	const float Recoil = TraceCharacterLayout::SmgFlashFall(FirePhase);
+	const FVector RecoilOffset(-TraceCharacterLayout::SmgRecoilBackUU * S * Recoil, 0.f, 0.f);
+	const FRotator RecoilPitch(-TraceCharacterLayout::SmgRecoilPitchDegrees * Recoil, 0.f, 0.f);
+
+	// The walls snap apart on the shot frame and elastic-settle. LEFT IS -Y: the manifest puts
+	// SM_RailgunSmg_WallLeft entirely at y = -12.7 .. -4.7 cm, so the sign is read off the geometry
+	// rather than assumed from a node name.
+	const float Throw = TraceCharacterLayout::SmgWallThrowUU * S
+		* TraceCharacterLayout::SmgElasticSettle(FirePhase);
+
+	// The magazine. Straight down in the weapon's own frame; the recoil pitch above then carries it
+	// with the rest of the gun, so a reload during a burst does not tear the cell off the well.
+	const float MagDrop = (ReloadPhase >= 0.f) ? TraceCharacterLayout::SmgMagDrop(ReloadPhase) : 0.f;
+
+	SmgBodyPart->SetRelativeLocationAndRotation(
+		TraceCharacterLayout::SmgOrigin + RecoilOffset, RecoilPitch);
+
+	if (SmgWallLeftPart != nullptr)
+	{
+		SmgWallLeftPart->SetRelativeLocationAndRotation(
+			TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, -Throw, 0.f), RecoilPitch);
+	}
+	if (SmgWallRightPart != nullptr)
+	{
+		SmgWallRightPart->SetRelativeLocationAndRotation(
+			TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, Throw, 0.f), RecoilPitch);
+	}
+	if (SmgMagPart != nullptr)
+	{
+		SmgMagPart->SetRelativeLocationAndRotation(
+			TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, 0.f, -MagDrop * S), RecoilPitch);
+	}
+
+	// Finished: park the state so the next round restarts the cycle cleanly. At 600 RPM the next
+	// shot lands on the frame after this, which is exactly what "set it to loop" means.
+	if (FirePhase >= 1.f && !bHeld)
+	{
+		SmgFireElapsed = -1.f;
+	}
+}
+
 void ATraceCharacter::DebugHoldRailgunPhase(float Alpha, float HoldSeconds)
 {
 	const UWorld* World = GetWorld();
@@ -2734,13 +3493,58 @@ bool ATraceCharacter::UsesRailgunViewModel() const
 	return RailgunBodyPart != nullptr;
 }
 
-bool ATraceCharacter::DebugGetViewModelMuzzleRaw(FVector& OutWorldLocation) const
+// --- The SMG's twins of the four accessors above  (spec v30 §2) ----------------------------------
+
+bool ATraceCharacter::UsesSmgViewModel() const
 {
-	if (ViewModelMuzzle == nullptr)
+	return SmgBodyPart != nullptr;
+}
+
+ATraceCharacter::EShownGun ATraceCharacter::GetShownGun() const
+{
+	return ShownGun;
+}
+
+void ATraceCharacter::DebugHoldSmgPhase(float Alpha, float ReloadAlpha, float HoldSeconds)
+{
+	const UWorld* World = GetWorld();
+	SmgDebugHoldAlpha = Alpha;
+	SmgDebugHoldReloadAlpha = ReloadAlpha;
+	SmgDebugHoldUntil = (World != nullptr && (Alpha >= 0.f || ReloadAlpha >= 0.f))
+		? World->GetTimeSeconds() + FMath::Max(0.f, HoldSeconds) : -1.0;
+}
+
+void ATraceCharacter::DebugGetSmgParts(UStaticMeshComponent*& OutBody, UStaticMeshComponent*& OutWallLeft,
+	UStaticMeshComponent*& OutWallRight, UStaticMeshComponent*& OutMag) const
+{
+	OutBody = SmgBodyPart;
+	OutWallLeft = SmgWallLeftPart;
+	OutWallRight = SmgWallRightPart;
+	OutMag = SmgMagPart;
+}
+
+bool ATraceCharacter::DebugGetSmgEmissive(float& OutCyan, float& OutAmber) const
+{
+	OutCyan = -1.f;
+	OutAmber = -1.f;
+	if (SmgCyanMIDs.Num() == 0 || SmgCyanMIDs[0] == nullptr || SmgAmberMID == nullptr)
 	{
 		return false;
 	}
-	OutWorldLocation = ViewModelMuzzle->GetComponentLocation();
+	const bool bCyan = SmgCyanMIDs[0]->GetScalarParameterValue(TEXT("EmissiveIntensity"), OutCyan);
+	const bool bAmber = SmgAmberMID->GetScalarParameterValue(TEXT("EmissiveIntensity"), OutAmber);
+	return bCyan && bAmber;
+}
+
+bool ATraceCharacter::DebugGetViewModelMuzzleRaw(FVector& OutWorldLocation) const
+{
+	// [SPEC v30 §5] The gun that is DRAWN, not the pistol's marker unconditionally.
+	const USceneComponent* Marker = GetActiveMuzzleMarker();
+	if (Marker == nullptr)
+	{
+		return false;
+	}
+	OutWorldLocation = Marker->GetComponentLocation();
 	return true;
 }
 
@@ -2749,7 +3553,12 @@ bool ATraceCharacter::GetViewModelMuzzleViewPoint(FVector& OutWorldLocation) con
 	// Nothing drawn, nothing to answer. bViewModelVisible rather than bViewModelBuilt: a carrier in
 	// third person and a corpse both still HAVE a rig, they just are not looking at it, and a beam
 	// started at a hidden gun would come out of thin air beside the camera.
-	if (ViewModelMuzzle == nullptr || Camera == nullptr || !bViewModelVisible)
+	// [SPEC v30 §5] GetActiveMuzzleMarker(), not ViewModelMuzzle: the beam has to leave whichever of
+	// the two guns is actually being drawn. Everything below is unchanged — the marker is a child of
+	// its own gun's body either way, so the same argument about inheriting recoil, sway and bob holds
+	// for both of them.
+	const USceneComponent* Marker = GetActiveMuzzleMarker();
+	if (Marker == nullptr || Camera == nullptr || !bViewModelVisible)
 	{
 		return false;
 	}
@@ -2772,7 +3581,7 @@ bool ATraceCharacter::GetViewModelMuzzleViewPoint(FVector& OutWorldLocation) con
 	// "turn the first-person rendering off" cannot silently start shifting the beam.
 	if (!POV.bUseFirstPersonParameters)
 	{
-		OutWorldLocation = ViewModelMuzzle->GetComponentLocation();
+		OutWorldLocation = Marker->GetComponentLocation();
 		return true;
 	}
 
@@ -2790,7 +3599,7 @@ bool ATraceCharacter::GetViewModelMuzzleViewPoint(FVector& OutWorldLocation) con
 	// the gun's true ~85 uu, which is also within a couple of uu of the standoff this replaces — so
 	// the beam's THICKNESS at the muzzle is unchanged and only its POSITION moves onto the barrel.
 	OutWorldLocation = POV.TransformWorldToFirstPerson(
-		ViewModelMuzzle->GetComponentLocation(), /*bIgnoreFirstPersonScale=*/true);
+		Marker->GetComponentLocation(), /*bIgnoreFirstPersonScale=*/true);
 	return !OutWorldLocation.ContainsNaN();
 }
 
@@ -2837,6 +3646,13 @@ void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
 	{
 		return;
 	}
+
+	// [SPEC v30 §2] WHICH GUN, decided before anything else and OUTSIDE the bAnimate gate below.
+	// A rig that is hidden — a Core carrier in third person, a corpse — can still have its selector
+	// changed, and settling that here means the correct gun is already on the rig at the moment
+	// SetViewModelVisible brings it back, rather than a frame of the wrong one. It is also cheap:
+	// SetHiddenInGame is a no-op when the flag already matches.
+	UpdateWeaponSelection();
 
 	// A hidden rig still gets its state DECAYED rather than frozen, so a player who takes the Core
 	// mid-burst and hands it back does not come out of third person with a stale recoil kick and a
@@ -2912,6 +3728,13 @@ void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
 	// The railgun's own animation runs on top of the rig transform above: the rig carries the whole
 	// weapon-and-hands assembly, this moves parts of the weapon relative to it.
 	UpdateRailgunFire(DeltaSeconds);
+
+	// [SPEC v30 §3/§4] And the SMG's, on the same terms. BOTH are ticked whichever gun is on screen,
+	// deliberately: the hidden one costs four early-outs or four transforms that nothing renders, and
+	// the alternative — animating only the selected rig — leaves the other one holding whatever pose
+	// it had when it was put away, so a swap back mid-burst would show a gun frozen with its walls
+	// open. Cheap insurance against a class of bug that only appears under a swap.
+	UpdateSmgAnimation(DeltaSeconds);
 }
 
 void ATraceCharacter::NotifyWeaponFired()
@@ -2943,6 +3766,30 @@ void ATraceCharacter::NotifyWeaponFired()
 			TraceCharacterLayout::RailgunFireMinSeconds,
 			TraceRailgunFireCurve::ClipSeconds - TraceRailgunFireCurve::DischargeSeconds);
 		RailgunFireElapsed = 0.f;
+	}
+
+	// [SPEC v30 §3] The SMG's cycle, restarted by the same real shot. THIS IS THE ONLY THING THAT
+	// STARTS IT — there is no free-running timer anywhere in UpdateSmgAnimation — so the walls
+	// cannot snap on a frame no round left on.
+	//
+	// The cycle is the kit's 0.100 s clip, but its LENGTH is taken from the weapon in hand rather
+	// than from that constant, because 0.100 s is only the cadence of a stock SMG: Roxie's Modded
+	// runs the same gun at 990 RPM and Slimeball's stuck passive at 780. Using the authored length
+	// there would leave the walls still ringing when the next round left. GetFireInterval() is the
+	// component's own answer, ability scaling already folded in, so the animation inherits every
+	// per-character fire-rate modifier for free — the same seam spec v28 §9 required of the SMG's
+	// gameplay numbers.
+	if (SmgBodyPart != nullptr)
+	{
+		float Cycle = TraceCharacterLayout::SmgFireClipSeconds;
+		if (Weapon != nullptr)
+		{
+			Cycle = static_cast<float>(Weapon->GetFireInterval());
+		}
+		SmgFireDuration = FMath::Max(
+			Cycle * TraceCharacterLayout::SmgFireIntervalFraction,
+			TraceCharacterLayout::SmgFireMinSeconds);
+		SmgFireElapsed = 0.f;
 	}
 }
 
@@ -4324,6 +5171,273 @@ namespace
 					}
 
 					return (++Emitted < Samples);
+				}),
+				0.f);
+		}));
+
+	// =============================================================================================
+	// Trace.ViewModel.Guns / Trace.ViewModel.Equip  —  SPEC v30 §2
+	// =============================================================================================
+	//
+	// WHAT THEY ARE FOR. The complaint spec §2 opens with is that nothing on screen said which gun
+	// was in hand. The fix is visual, so a screenshot is the primary evidence — but a screenshot
+	// cannot tell you WHY the pistol is on screen when you pressed 3 (missing art? a refused swap? a
+	// mesh that failed to attach?), and those three have different fixes. Guns prints the difference,
+	// and Equip is what lets a headless run reach all three states to photograph them at all.
+	//
+	// *** DELIBERATELY NOT NAMED Trace.Smg.* ***. Core/TraceSmgVerify.cpp registers Trace.Smg.Probe
+	// and Trace.Smg.Hold — the SMG's equivalents of Trace.Railgun.Probe/Hold that spec §5 asks for,
+	// sitting where TraceRailgunVerify.cpp's live, which is the right place for them. Both of those
+	// drive the accessors THIS file owns (GetShownGun, DebugGetSmgParts, DebugGetSmgEmissive,
+	// DebugHoldSmgPhase), so the pawn keeps the state and the verify file keeps the commands. Two
+	// registrations of one console name is a warning at best and a silently lost command at worst,
+	// so these two take names that cannot collide and answer a narrower question: the RIG, not the
+	// weapon.
+
+	/** One SMG part: mesh, transform, and every material slot with what is actually on it. */
+	void ReportViewModelSmgPart(const TCHAR* Label, UStaticMeshComponent* Part)
+	{
+		if (Part == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[Smg] %s : NOT BUILT"), Label);
+			return;
+		}
+
+		const UStaticMesh* Mesh = Part->GetStaticMesh();
+		const FVector Loc = Part->GetRelativeLocation();
+		const FRotator Rot = Part->GetRelativeRotation();
+
+		// bVisible AND bHiddenInGame, separately, because the whole selector rests on them being two
+		// independent layers (see UpdateWeaponSelection). "drawn=0" with "visible=1" is the selector
+		// having hidden this gun on purpose; "visible=0" is the rig being off screen entirely.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Smg] %s mesh=%-24s rel=(%.2f, %.2f, %.2f) pitch=%.2f scale=%.3f visible=%d hiddenInGame=%d drawn=%d"),
+			Label, Mesh != nullptr ? *Mesh->GetName() : TEXT("NONE"),
+			Loc.X, Loc.Y, Loc.Z, Rot.Pitch, Part->GetRelativeScale3D().X,
+			Part->GetVisibleFlag() ? 1 : 0, Part->bHiddenInGame ? 1 : 0, Part->IsVisible() ? 1 : 0);
+
+		const int32 NumSlots = Part->GetNumMaterials();
+		for (int32 Slot = 0; Slot < NumSlots; ++Slot)
+		{
+			const UMaterialInterface* Material = Part->GetMaterial(Slot);
+			const FName SlotName = (Mesh != nullptr && Mesh->GetStaticMaterials().IsValidIndex(Slot))
+				? Mesh->GetStaticMaterials()[Slot].MaterialSlotName : NAME_None;
+			UE_LOG(LogTraceGame, Warning, TEXT("[Smg]       slot %d '%s' -> %s"),
+				Slot, *SlotName.ToString(),
+				Material != nullptr ? *Material->GetName() : TEXT("NONE"));
+		}
+	}
+
+	const TCHAR* ViewModelShownGunName(ATraceCharacter::EShownGun Gun)
+	{
+		switch (Gun)
+		{
+		case ATraceCharacter::EShownGun::None:   return TEXT("NEITHER (guns stowed)");
+		case ATraceCharacter::EShownGun::Pistol: return TEXT("PISTOL");
+		case ATraceCharacter::EShownGun::Smg:    return TEXT("SMG");
+		default:                                 return TEXT("?");
+		}
+	}
+
+	FAutoConsoleCommand CmdViewModelGuns(
+		TEXT("Trace.ViewModel.Guns"),
+		TEXT("Spec v30 §2. Reports which of the THREE weapon states is on screen and whether it agrees "
+		     "with the replicated selector: whether the SMG rig was built or fell back, every SMG "
+		     "part's mesh/transform/visibility layers/slots, the live EmissiveIntensity on both glowing "
+		     "materials, and where the active muzzle marker is. Takes an optional DelaySeconds so a "
+		     "single deferred-exec batch can sample it AFTER an equip or a held pose has landed."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			// DEFERRABLE FOR THE SAME REASON THE EQUIP IS, and it matters more here: the pose is
+			// applied in Tick, so a probe run in the same frame as the command that changed it reports
+			// the state from BEFORE the change. A delay of a frame or more is the difference between
+			// measuring the feature and measuring the frame before it.
+			const float Delay = (Args.Num() > 0) ? FMath::Max(0.f, FCString::Atof(*Args[0])) : 0.f;
+			if (Delay > 0.f)
+			{
+				double Waited = 0.0;
+				FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+					[Waited, Delay](float DeltaTime) mutable -> bool
+				{
+					Waited += DeltaTime;
+					if (Waited < Delay)
+					{
+						return true;
+					}
+					if (GEngine != nullptr)
+					{
+						GEngine->Exec(FindDebugGameWorld(), TEXT("Trace.ViewModel.Guns"));
+					}
+					return false;
+				}), 0.f);
+				return;
+			}
+
+			ATraceCharacter* Character = FindDebugLocalCharacter(FindDebugGameWorld());
+			if (Character == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Smg] No local ATraceCharacter yet - run this once a match has started."));
+				return;
+			}
+
+			UE_LOG(LogTraceGame, Warning, TEXT("[Smg] ===================================================="));
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Smg] ON SCREEN: %s   |   smgRig=%s pistolRig=%s   rigVisible=%d parts=%d"),
+				ViewModelShownGunName(Character->GetShownGun()),
+				Character->UsesSmgViewModel() ? TEXT("IMPORTED ART") : TEXT("NOT BUILT"),
+				Character->UsesRailgunViewModel() ? TEXT("RAILGUN") : TEXT("FALLBACK CUBES"),
+				Character->IsViewModelVisible() ? 1 : 0,
+				Character->GetViewModelPartCount());
+
+			// The selector beside the picture. These two disagreeing is the ONE state worth shouting
+			// about: the gun being simulated is not the gun being drawn, which is spec §2's complaint
+			// restated. It is legal exactly once — the missing-art fallback — and the line says so.
+			if (const UTraceWeaponComponent* W = Character->FindComponentByClass<UTraceWeaponComponent>())
+			{
+				const bool bSmgSelected = W->IsSmgEquipped();
+				const bool bSmgDrawn = (Character->GetShownGun() == ATraceCharacter::EShownGun::Smg);
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Smg] selector=%s clip=%d/%d reloading=%d (%.2fs left of %.2fs)  %s"),
+					LexToString(W->GetEquippedWeapon()), W->GetClipAmmo(), W->GetClipSize(),
+					W->IsReloading() ? 1 : 0, W->GetReloadRemaining(), W->GetReloadSeconds(),
+					(bSmgSelected == bSmgDrawn)
+						? TEXT("-- selector and picture agree")
+						: (Character->UsesSmgViewModel()
+							? TEXT("*** MISMATCH: the gun drawn is not the gun selected ***")
+							: TEXT("-- SMG selected with no SMG art: the documented fallback")));
+			}
+
+			if (!Character->UsesSmgViewModel())
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Smg] The SMG art did not resolve, or -TraceNoSmg/-TraceNoRailgun was passed. "
+					     "Content/Trace/Weapons/Meshes must contain SM_RailgunSmg_Body/WallLeft/WallRight/Mag."));
+				UE_LOG(LogTraceGame, Warning, TEXT("[Smg] ===================================================="));
+				return;
+			}
+
+			UStaticMeshComponent* Body = nullptr;
+			UStaticMeshComponent* WallL = nullptr;
+			UStaticMeshComponent* WallR = nullptr;
+			UStaticMeshComponent* Mag = nullptr;
+			Character->DebugGetSmgParts(Body, WallL, WallR, Mag);
+
+			ReportViewModelSmgPart(TEXT("body  "), Body);
+			ReportViewModelSmgPart(TEXT("wallL "), WallL);
+			ReportViewModelSmgPart(TEXT("wallR "), WallR);
+			ReportViewModelSmgPart(TEXT("mag   "), Mag);
+
+			// The wall SPREAD rather than each wall's Y, because the spread is the thing §3 specifies
+			// (±4.2 uu apart) and it is invariant under any recoil offset applied to both.
+			if (WallL != nullptr && WallR != nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Smg] wall spread = %.3f uu (rig), i.e. %.2f mesh-cm apart; magazine drop = %.3f uu"),
+					WallR->GetRelativeLocation().Y - WallL->GetRelativeLocation().Y,
+					(WallR->GetRelativeLocation().Y - WallL->GetRelativeLocation().Y) / TraceCharacterLayout::SmgScale,
+					(Mag != nullptr && Body != nullptr) ? (Body->GetRelativeLocation().Z - Mag->GetRelativeLocation().Z) : 0.f);
+			}
+
+			float LiveCyan = -1.f;
+			float LiveAmber = -1.f;
+			const bool bReadBack = Character->DebugGetSmgEmissive(LiveCyan, LiveAmber);
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Smg] live EmissiveIntensity: cyan=%.3f (rest %.2f, peak %.2f) amber=%.3f (full %.2f, empty %.2f) -- readback %s"),
+				LiveCyan, TraceCharacterLayout::SmgCyanRest, TraceCharacterLayout::SmgCyanPeak,
+				LiveAmber, TraceCharacterLayout::SmgAmberFull, TraceCharacterLayout::SmgAmberEmpty,
+				bReadBack ? TEXT("OK") : TEXT("FAILED - the parameter is not on the material"));
+
+			FVector MuzzleRaw = FVector::ZeroVector;
+			if (Character->DebugGetViewModelMuzzleRaw(MuzzleRaw))
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Smg] active muzzle marker (world) = (%.1f, %.1f, %.1f); mesh-local landmark (%.1f, %.1f, %.1f) cm"),
+					MuzzleRaw.X, MuzzleRaw.Y, MuzzleRaw.Z,
+					TraceCharacterLayout::SmgMuzzleLocal.X, TraceCharacterLayout::SmgMuzzleLocal.Y,
+					TraceCharacterLayout::SmgMuzzleLocal.Z);
+			}
+			UE_LOG(LogTraceGame, Warning, TEXT("[Smg] ===================================================="));
+		}));
+
+	/**
+	 * Trace.ViewModel.Equip <1|2|3> [DelaySeconds] [TimeoutSeconds]
+	 *
+	 * IT SELF-SCHEDULES, and that is what makes photographing all three states possible at all. The
+	 * deferred-exec harness fires ONE batch of commands at ONE time (see TraceAutoShot::
+	 * ArmDeferredExec, "one timer, not one per command"), and at the moment that batch runs the match
+	 * map has usually not produced a possessed pawn yet — the character-select screen is still open.
+	 * A command that needed a pawn to already exist could therefore only ever capture whichever state
+	 * happened to be selected, which is precisely one third of the evidence spec §2 asks for.
+	 *
+	 * So this waits for a living local pawn, then equips, and each invocation carries its OWN delay:
+	 *
+	 *     -TraceExec="Trace.ViewModel.Equip 2 0|Trace.ViewModel.Equip 3 4|Trace.ViewModel.Equip 1 8"
+	 *     -TraceAutoShot=42 -TraceAutoShotRepeat=4
+	 *
+	 * ...photographs the pistol, the SMG and the stowed state in a single run.
+	 */
+	FAutoConsoleCommand CmdViewModelEquip(
+		TEXT("Trace.ViewModel.Equip"),
+		TEXT("Trace.ViewModel.Equip <1|2|3> [DelaySeconds] [TimeoutSeconds]. Dev only. Puts the local "
+		     "player in one of the three weapon states through the SHIPPED equip path, waiting for a "
+		     "pawn to exist first. 1 stows, 2 pistol, 3 SMG."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const int32 Slot = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 3;
+			const float Delay = (Args.Num() > 1) ? FMath::Max(0.f, FCString::Atof(*Args[1])) : 0.f;
+			const float Timeout = (Args.Num() > 2) ? FMath::Max(1.f, FCString::Atof(*Args[2])) : 90.f;
+
+			ETraceEquippedWeapon Desired = ETraceEquippedWeapon::Smg;
+			if (Slot == 1) { Desired = ETraceEquippedWeapon::Knife; }
+			else if (Slot == 2) { Desired = ETraceEquippedWeapon::Gun; }
+
+			double ElapsedSeconds = 0.0;
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda(
+					[ElapsedSeconds, Slot, Desired, Delay, Timeout](float DeltaTime) mutable -> bool
+				{
+					ElapsedSeconds += DeltaTime;
+					if (ElapsedSeconds < Delay)
+					{
+						return true;
+					}
+
+					ATraceCharacter* Character = FindDebugLocalCharacter(FindDebugGameWorld());
+					if (Character == nullptr || !Character->IsAlive())
+					{
+						if (ElapsedSeconds > Delay + Timeout)
+						{
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[ViewModel.Equip] Gave up after %.1fs: no living local pawn."), Timeout);
+							return false;
+						}
+						return true;
+					}
+
+					// THE SHIPPED VERB, not a write to the selector. A harness that set EquippedWeapon
+					// directly would photograph a state no key can actually reach, which is how a
+					// screenshot ends up proving something the game does not do.
+					ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
+					const bool bOk = TraceMelee::RequestEquip(Character, Desired, &Refusal);
+
+					// A refusal is usually the 0.35s pullout from the PREVIOUS command in the same
+					// batch still running, which is transient — so retry rather than report a failure
+					// that would have succeeded a frame later.
+					if (!bOk && Refusal == ETraceMeleeRefusal::Deploying && ElapsedSeconds < Delay + Timeout)
+					{
+						return true;
+					}
+
+					// Reports the rig drawn BEFORE this frame, and says so: UpdateWeaponSelection runs in
+					// Tick, so the new selector has not reached the rig yet. Printing it as "now" was
+					// off by one frame and read as the equip having failed. Ask Trace.ViewModel.Guns
+					// (which takes a delay for exactly this reason) for the settled answer.
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ViewModel.Equip] slot %d (%s) -> %s (refusal=%d); rig drawn as of the previous frame: %s."),
+						Slot, LexToString(Desired), bOk ? TEXT("accepted") : TEXT("REFUSED"),
+						static_cast<int32>(Refusal), ViewModelShownGunName(Character->GetShownGun()));
+					return false;
 				}),
 				0.f);
 		}));

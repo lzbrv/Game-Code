@@ -4,11 +4,53 @@
 #include "GameFramework/Actor.h"
 #include "TraceTracer.generated.h"
 
+class ATraceCharacter;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
 class USceneComponent;
 class UStaticMeshComponent;
 class UWorld;
+
+/**
+ * SPEC v30 §5 — WHERE THE BEAM'S NEAR END CAME FROM, AND HOW IT WAS DECIDED.
+ *
+ * One shot's worth of muzzle resolution, filled in by ATraceTracer::ResolveViewModelBeamStart().
+ * It exists because the answer is now a CHOICE between two sources, and a choice that is not
+ * reported is a choice nobody can check: Trace.Smg.Probe prints every field of this so that "the
+ * beam leaves the SMG" can be established from numbers rather than from a squint at a screenshot.
+ *
+ * Plain struct, not a USTRUCT: nothing here is replicated, serialised or exposed to Blueprint, and
+ * it is filled several times a second on the client that is shooting.
+ */
+struct FTraceTracerBeamStart
+{
+	/** False when nothing is drawn to leave from (third person, dead, dedicated server, no rig). */
+	bool bValid = false;
+
+	/** The point the beam actually starts at: world space, AFTER the first-person re-projection. */
+	FVector Start = FVector::ZeroVector;
+
+	/** The pawn's own muzzle marker, un-morphed and morphed. Both zero if it has none. */
+	FVector MarkerRaw = FVector::ZeroVector;
+	FVector MarkerDrawn = FVector::ZeroVector;
+	bool bHasMarker = false;
+
+	/** The gun ACTUALLY on screen, found by its mesh, and its own muzzle landmark carried to world. */
+	FName GunMesh = NAME_None;
+	FVector GunMuzzleLocalCm = FVector::ZeroVector;
+	FVector GunMuzzleRaw = FVector::ZeroVector;
+	bool bHasGun = false;
+
+	/**
+	 * Distance between the marker and the on-screen gun's own muzzle, in uu, or -1 when either is
+	 * missing. This is the number that decides which source wins, so it is the number to look at
+	 * first when the beam comes out of the wrong place.
+	 */
+	double MarkerToGunUU = -1.0;
+
+	/** True when Start came from the gun's mesh landmark rather than from the pawn's marker. */
+	bool bFromGunMesh = false;
+};
 
 /**
  * The railgun shot effect. Purely cosmetic, one actor per shot, self-deleting.
@@ -86,6 +128,37 @@ class UWorld;
  * fallback cube gun as well as for the railgun, and it follows the player's own field-of-view slider.
  * There is no number here to re-tune when the gun moves again.
  *
+ * --- AND NOW THERE ARE TWO GUNS (spec v30 §5) -------------------------------------------------
+ *
+ * "The beam must leave whichever gun is actually on screen." Demo 24 added the SMG and Demo 25 gave
+ * it the 3 key, so from this pass onward the pawn can be holding either weapon - and a single muzzle
+ * marker is a single answer to a question that now has two. If the marker is left parented to the
+ * pistol while the SMG is drawn, the beam starts at the pistol's landmark: 14.58 uu of rig space away
+ * from the SMG's own aperture, MEASURED on the shipped rig by Trace.Smg.Probe, which is the same class
+ * of error the three deleted constants caused, just smaller.
+ *
+ * SO THE GUN ON SCREEN IS ASKED DIRECTLY, AND THE MARKER IS ONLY TRUSTED WHEN IT AGREES WITH IT.
+ * ResolveViewModelBeamStart() finds the weapon body the pawn is actually DRAWING (a visible static
+ * mesh component whose asset is one of the known viewmodel guns), carries that mesh's own measured
+ * muzzle landmark through the component's live world transform, and compares the result with the
+ * pawn's marker:
+ *
+ *   * they agree (within MuzzleAgreementUU)  ->  the pawn's own answer is used, byte for byte the
+ *                                                v26 path. This is the pistol today, and it is also
+ *                                                the SMG the moment the marker is parented to it.
+ *   * they disagree                          ->  the gun on screen wins, because it is the thing the
+ *                                                player can see the beam failing to leave.
+ *   * no known gun is drawn (cube gun,       ->  the pawn's marker, exactly as before.
+ *     no art, third person)
+ *
+ * THIS IS A SAFETY NET, NOT A SECOND PLACEMENT SYSTEM. The mesh-local landmarks it carries are
+ * measured properties of the art (the SMG's aperture centre was measured from the GLB and confirms
+ * the spec's -0.588 m), not tuning values, and there is nothing here to re-tune when the rig moves -
+ * the transform is read live off the component. The moment ATraceCharacter parents its marker to the
+ * active gun, every one of these lookups agrees with it and this code stops changing any answer;
+ * Trace.Smg.Probe prints MarkerToGunUU so that "it stopped changing the answer" is a measurement
+ * rather than a hope.
+ *
  * Nothing about the gameplay ray changes. The shot ORIGIN is camera-derived on purpose - it is what
  * makes the crosshair honest, it is evaluated on the server too, and it is not this actor's business.
  * This is the near end of a cosmetic beam, on one machine.
@@ -135,6 +208,33 @@ public:
 	 * when the world is invalid. Callers may ignore the return value.
 	 */
 	static ATraceTracer* Spawn(UWorld* World, const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted = true);
+
+	/**
+	 * SPEC v30 §5 — where a beam fired by @p Shooter would leave the gun that is ON SCREEN.
+	 *
+	 * The whole of the first-person start decision, in one function, so that the beam and every probe
+	 * that checks the beam are reading the SAME code. A verifier that re-implements the thing it is
+	 * verifying can only ever prove that two implementations agree.
+	 *
+	 * Cosmetic and local-only. It answers false whenever there is nothing drawn to leave from, and
+	 * callers must then use the true shot origin, exactly as they did before this existed.
+	 */
+	static bool ResolveViewModelBeamStart(const ATraceCharacter* Shooter, FTraceTracerBeamStart& OutInfo);
+
+	/**
+	 * The same answer for whoever the local viewer is looking out of. For Trace.Smg.Probe: it prints
+	 * where the next beam WOULD start without anybody having to pull a trigger first.
+	 */
+	static bool DescribeLocalBeamStart(const UWorld* World, FTraceTracerBeamStart& OutInfo);
+
+	/**
+	 * The mesh-local muzzle landmark of a known viewmodel gun mesh, in the mesh's own centimetres.
+	 *
+	 * @param StaticMeshName e.g. "SM_RailgunSmg_Body". Returns false for anything not in the table,
+	 *                       which is the honest answer for the procedural cube gun and for any art
+	 *                       that arrives after this file was written.
+	 */
+	static bool GetGunMuzzleLandmark(FName StaticMeshName, FVector& OutMeshLocalCm);
 
 protected:
 	/** Positioned at the beam start and rotated so local +Z runs down the shot. */
@@ -323,6 +423,20 @@ private:
 	 * long and unreadable either way.
 	 */
 	static constexpr float MinBeamBeyondMuzzleUU = 40.0f;
+
+	/**
+	 * SPEC v30 §5. How close the pawn's muzzle marker must be to the on-screen gun's own muzzle
+	 * landmark, in uu, for the marker to be taken as the answer.
+	 *
+	 * A TEST OF IDENTITY, NOT A TOLERANCE. Either the marker hangs off the gun being drawn — in which
+	 * case the two are the same point and the distance is float noise (Trace.Smg.Probe reports
+	 * 0.0000 uu on both guns) — or it hangs off something else, in which case it is wrong by the
+	 * rig-space gap between two guns' landmarks: the pistol's 107.4 cm against the SMG's 58.8 cm is a
+	 * MEASURED 14.58 uu on the shipped rig, and a marker left on the RIG ROOT would be further still.
+	 * 1 uu sits far above the noise and an order below the smallest real disagreement, so nothing
+	 * lands near it: widen it or narrow it by 10x and the decision does not change.
+	 */
+	static constexpr double MuzzleAgreementUU = 1.0;
 
 	/** /Engine/BasicShapes primitives are 100 uu across, centred on their own origin. */
 	static constexpr float BasicShapeExtentUU = 100.0f;

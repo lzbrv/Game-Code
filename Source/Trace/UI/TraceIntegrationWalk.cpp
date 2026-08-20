@@ -61,6 +61,18 @@ namespace TraceIntegrationWalkFile
 		FString Shot;
 
 		/**
+		 * A console command to run at this stop, when the step is neither a key nor a photograph.
+		 *
+		 * ADDED FOR THE v30 GUN WALK, and the reason is that a photograph of a first-person weapon is
+		 * ambiguous evidence on its own: two guns drawn at the same place in the frame look similar at
+		 * a glance, and "the cyan is brighter" is not a number. The reports this fires (Trace.
+		 * ViewModel.Guns, Trace.Smg.Probe) print the rig, the slots and the live EmissiveIntensity
+		 * into the same log, timestamped a fraction of a second from the frame they explain — so a
+		 * frame can be attributed to a measured state rather than to a description of one.
+		 */
+		FString Exec;
+
+		/**
 		 * How long the key is held, in seconds, and WHICH route it takes.
 		 *
 		 * The menu walks all press through "viewport" for 0.12 s, which is where the menu's key
@@ -97,6 +109,15 @@ namespace TraceIntegrationWalkFile
 		FStep Step;
 		Step.At = At;
 		Step.Shot = Name;
+		return Step;
+	}
+
+	/** A console report, scheduled so it lands beside the frame it explains. */
+	static FStep Say(float At, const TCHAR* Command)
+	{
+		FStep Step;
+		Step.At = At;
+		Step.Exec = Command;
 		return Step;
 	}
 
@@ -275,10 +296,103 @@ namespace TraceIntegrationWalkFile
 		return Steps;
 	}
 
-	static void TakeShot(const FString& Name)
+	/**
+	 * THE THREE WEAPON STATES, PRESSED ON THE KEYBOARD — spec v30 §§2-4, integration pass.
+	 *
+	 * WHY THIS IS A WALK AND NOT THREE LAUNCHES. Spec v30's opening complaint is that nothing on
+	 * screen told the player which gun they hold, so the deliverable is a TRANSITION: press 3 and the
+	 * picture must change. One editor launch per state cannot photograph a transition — it can only
+	 * photograph three separate first frames, each of which could have been produced by a gun that
+	 * never changed. This presses 2, then 3, then 1 in ONE match, on the real binds (StowGuns=1,
+	 * EquipPistol=2, EquipSmg=3 — Settings/TraceUserSettings.cpp), and photographs each.
+	 *
+	 * NOTHING HERE CALLS AN EQUIP FUNCTION. Trace.ViewModel.Equip exists and would be easier, but it
+	 * goes in behind the keybinding, so a walk built on it would still pass if the 3 key were unbound,
+	 * stolen by another action, or eaten by a UI focus rule. That is a real failure mode in this
+	 * project — Trace.Keys.LegacySteal exists because a bind was stolen once — so the integration pass
+	 * presses keys.
+	 *
+	 * THE GAPS ARE DELIBERATE, in this order:
+	 *   - 0.60 s after a key before the frame: the selector replicates and the rig is shown or hidden
+	 *     in Tick, so a frame taken in the same frame as the press shows the state BEFORE it.
+	 *   - the burst is 0.50 s = five rounds at 600 RPM, enough that the clip visibly drops.
+	 *   - the shot-frame pose is PINNED with Trace.Smg.Hold rather than caught: the fire cycle is
+	 *     0.100 s and no unattended screenshot can land inside it reliably. The walls thrown apart and
+	 *     the cyan at its peak are photographed from the pinned pose, and Trace.ViewModel.Guns prints
+	 *     the spread and the intensity from the same moment.
+	 *   - the reload frame is 0.45 s after R: the 0.8 s authored motion is time-stretched to the 1.3 s
+	 *     gameplay reload, so the cell is fully out around 0.42 s in.
+	 *   - the last burst is 4.60 s, longer than the 4.00 s it takes to empty a 40-round magazine at
+	 *     600 RPM, so the amber is read at the bottom of its range and not part way down.
+	 */
+	static TArray<FStep> GunsWalk()
+	{
+		TArray<FStep> Steps;
+
+		Steps.Add(Shoot(0.60f, TEXT("40_match_start")));
+
+		// --- 2: THE PISTOL --------------------------------------------------------------------
+		Steps.Add(Press(1.20f, TEXT("Two")));
+		Steps.Add(Say(1.80f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Shoot(2.10f, TEXT("41_key2_pistol")));
+
+		// --- 3: THE SMG -----------------------------------------------------------------------
+		Steps.Add(Press(3.20f, TEXT("Three")));
+		Steps.Add(Say(3.90f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Shoot(4.20f, TEXT("42_key3_smg")));
+
+		// --- FIRING: the tracer leaves ITS barrel, and the clip drops --------------------------
+		Steps.Add(Play(5.20f, TEXT("LeftMouseButton"), 0.50f));
+		Steps.Add(Shoot(5.45f, TEXT("43_smg_firing")));
+		Steps.Add(Say(5.90f, TEXT("Trace.ViewModel.Guns")));
+
+		// --- THE SHOT FRAME, PINNED: walls apart, cyan at 4.8x --------------------------------
+		Steps.Add(Say(6.60f, TEXT("Trace.Smg.Hold 0 -1 2.5")));
+		Steps.Add(Say(7.10f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Shoot(7.40f, TEXT("44_smg_shotframe")));
+		Steps.Add(Say(9.20f, TEXT("Trace.Smg.Hold -1 -1 0")));
+
+		// --- RELOAD: the magazine drops -------------------------------------------------------
+		Steps.Add(Play(10.00f, TEXT("R"), 0.12f));
+		Steps.Add(Shoot(10.45f, TEXT("45_smg_reload_magout")));
+		Steps.Add(Say(10.55f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Shoot(10.90f, TEXT("46_smg_reload_riding")));
+
+		// --- EMPTY IT: the amber has to be at the bottom of its range -------------------------
+		Steps.Add(Play(12.60f, TEXT("LeftMouseButton"), 4.60f));
+		Steps.Add(Say(16.90f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Shoot(17.10f, TEXT("47_smg_empty")));
+
+		// The full spec-typed report, once, with the SMG still up.
+		Steps.Add(Say(18.20f, TEXT("Trace.Smg.Probe")));
+
+		// --- 1: NEITHER GUN -------------------------------------------------------------------
+		Steps.Add(Press(21.00f, TEXT("One")));
+		Steps.Add(Say(21.70f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Shoot(22.00f, TEXT("48_key1_neither")));
+
+		// --- AND BACK TO 2, so the last frame proves the walk can leave state 1 ----------------
+		Steps.Add(Press(23.00f, TEXT("Two")));
+		Steps.Add(Say(23.70f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Shoot(24.00f, TEXT("49_key2_pistol_again")));
+
+		return Steps;
+	}
+
+	/**
+	 * @param Tag  SNAPSHOTTED WHEN THE WALK STARTED, never read from GTag here.
+	 *
+	 * GTag is process-wide and the steps fire seconds later off the core ticker, so reading the
+	 * global at photograph time means the LAST walk to start decides what every in-flight frame is
+	 * called. That became reachable the moment a second alias set the tag (WalkGuns, spec v30):
+	 * WalkGuns then WalkMatch in one process would have filed the match walk's frames under
+	 * v30integ_*, which is precisely the misattribution this file's header warns about. Passing the
+	 * tag down makes each walk's frames immune to what any later walk does.
+	 */
+	static void TakeShot(const FString& Tag, const FString& Name)
 	{
 		const FString Path = FPaths::ConvertRelativePathToFull(
-			FPaths::ProjectSavedDir() / TEXT("Screenshots") / (GTag + TEXT("_") + Name + TEXT(".png")));
+			FPaths::ProjectSavedDir() / TEXT("Screenshots") / (Tag + TEXT("_") + Name + TEXT(".png")));
 
 		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(Path));
 
@@ -291,11 +405,29 @@ namespace TraceIntegrationWalkFile
 	}
 
 	/** Runs one step. Kept off the timer lambda so the two paths log identically. */
-	static void RunStep(APlayerController* PC, const FStep& Step)
+	static void RunStep(APlayerController* PC, const FStep& Step, const FString& Tag)
 	{
 		if (!Step.Shot.IsEmpty())
 		{
-			TakeShot(Step.Shot);
+			TakeShot(Tag, Step.Shot);
+			return;
+		}
+
+		if (!Step.Exec.IsEmpty())
+		{
+			// Through the player controller for the same reason TraceAutoShot's deferred exec does it:
+			// several Trace.* commands resolve "the local pawn" from the executing controller, and
+			// GEngine->Exec with a null player hands them nothing to work with. bWriteToLog so the
+			// command itself is in the log above the report it produced.
+			UE_LOG(LogTraceGame, Display, TEXT("[IntegWalk] EXEC %s"), *Step.Exec);
+			if (PC != nullptr)
+			{
+				PC->ConsoleCommand(Step.Exec, /*bWriteToLog=*/true);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[IntegWalk] EXEC %s skipped — no local controller."), *Step.Exec);
+			}
 			return;
 		}
 
@@ -327,12 +459,14 @@ namespace TraceIntegrationWalkFile
 		const bool bMatch  = Which.Equals(TEXT("Match"),  ESearchCase::IgnoreCase);
 		const bool bSelect = Which.Equals(TEXT("Select"), ESearchCase::IgnoreCase);
 		const bool bPlay   = Which.Equals(TEXT("Play"),   ESearchCase::IgnoreCase);
+		const bool bGuns   = Which.Equals(TEXT("Guns"),   ESearchCase::IgnoreCase);
 		const TArray<FStep> Steps = bMatch ? MatchWalk()
-			: (bSelect ? SelectWalk() : (bPlay ? PlayWalk() : MenuWalk()));
+			: (bSelect ? SelectWalk() : (bPlay ? PlayWalk() : (bGuns ? GunsWalk() : MenuWalk())));
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[IntegWalk] === %s WALK: %d steps, %.1fs, viewport %dx%d ==="),
-			bMatch ? TEXT("MATCH") : (bSelect ? TEXT("SELECT") : (bPlay ? TEXT("PLAY") : TEXT("MENU"))), Steps.Num(),
+			bMatch ? TEXT("MATCH")
+				: (bSelect ? TEXT("SELECT") : (bPlay ? TEXT("PLAY") : (bGuns ? TEXT("GUNS") : TEXT("MENU")))), Steps.Num(),
 			Steps.Num() > 0 ? Steps.Last().At : 0.f,
 			(PC != nullptr && PC->GetLocalPlayer() != nullptr && PC->GetLocalPlayer()->ViewportClient != nullptr
 				&& PC->GetLocalPlayer()->ViewportClient->Viewport != nullptr)
@@ -355,12 +489,13 @@ namespace TraceIntegrationWalkFile
 		// One ticker per step rather than one walking a list: the steps are independent and a per-step
 		// registration means a step that fails cannot strand the ones after it.
 		TWeakObjectPtr<APlayerController> WeakPC(PC);
+		const FString TagAtStart = GTag;   // see TakeShot: the steps outlive whatever GTag becomes next
 		for (int32 Index = 0; Index < Steps.Num(); ++Index)
 		{
 			const FStep Step = Steps[Index];
-			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakPC, Step](float) -> bool
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakPC, Step, TagAtStart](float) -> bool
 			{
-				RunStep(WeakPC.Get(), Step);
+				RunStep(WeakPC.Get(), Step, TagAtStart);
 				return false;
 			}), FMath::Max(0.01f, Step.At));
 		}
@@ -418,6 +553,20 @@ namespace TraceIntegrationWalkFile
 		TEXT("Plays: move, dash, fire, ability, jump, scoreboard — real binds, no arguments."),
 		FConsoleCommandWithWorldDelegate::CreateStatic(
 			[](UWorld* World) { Start(World, TEXT("Play")); }));
+
+	static FAutoConsoleCommandWithWorld GWalkGunsCommand(
+		TEXT("Trace.Integ.WalkGuns"),
+		TEXT("Spec v30 §§2-4: presses 2, 3 and 1 on the real binds in one match, fires and reloads the "
+		     "SMG, empties its magazine, and photographs every state — no arguments."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(
+			[](UWorld* World)
+			{
+				// Its own tag, so a v30 frame can never be quoted as a v22 or v23 one. The v22 walk's
+				// header explains at length why that matters; the same argument applies to a pass whose
+				// whole deliverable is "the picture changed".
+				GTag = TEXT("v30integ");
+				Start(World, TEXT("Guns"));
+			}));
 }
 
 #endif // !UE_BUILD_SHIPPING

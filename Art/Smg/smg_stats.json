@@ -1,0 +1,29 @@
+{
+ "weapon": "railgun_smg",
+ "displayName": "Railgun SMG",
+ "fireMode": "fullAuto",
+ "fireRateRPM": 600,
+ "shotInterval": 0.1,
+ "magazineSize": 40,
+ "reloadTime": 0.8,
+ "equipTime": "inherit:pistol",
+ "damage": { "head": 33, "body": 18, "leg": 12 },
+ "shotsToKill100hp": { "head": 3, "body": 6, "leg": 9 },
+ "timeToKill100hp": { "head": 0.2, "body": 0.5, "leg": 0.8 },
+ "clips": {
+  "Fire": { "length": 0.1, "loop": true },
+  "Reload": { "length": 0.8, "loop": false }
+ },
+ "animatedNodes": {
+  "wall_pivot_left": "rail wall, -42mm per shot",
+  "wall_pivot_right": "rail wall, +42mm per shot",
+  "mag_pivot": "cell, -300mm on reload",
+  "railgun_smg": "recoil 20mm back, -0.045 rad pitch"
+ },
+ "muzzleSocket": { "unit": "metres", "x": 0, "y": 0.045, "z": -0.59, "aimAxis": "-Z" },
+ "emissive": {
+  "circuit_cyan": { "base": "#25E6FF", "rest": 1.8, "shotPeak": 4.8, "drivenBy": "Fire clip curve" },
+  "core_amber": { "base": "#FF8A1F", "full": 1.4, "empty": 0.35, "drivenBy": "ammo count" }
+ },
+ "importScale": 100
+}

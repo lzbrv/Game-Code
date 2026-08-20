@@ -2,20 +2,28 @@
 # Trace — import_railgun.py
 #
 # Runs INSIDE the editor (UnrealEditor-Cmd -run=pythonscript). Turns the OBJ
-# files that Scripts/railgun_glb_to_obj.py derived from Art/Railgun/railgun.glb
-# into committed StaticMesh assets, and builds the five materials the artist's
-# glTF declares.
+# files that Scripts/railgun_glb_to_obj.py derived from the artist's GLB into
+# committed StaticMesh assets, and builds the five materials the glTF declares.
+#
+# Serves both rigs; pick one with TRACE_RIG (default "railgun"):
+#
+#   railgun   Art/Railgun/railgun.glb     -> SM_Railgun_{Body,RailL,RailR}
+#             three meshes, MI_Railgun_*        (the pistol)
+#   smg       Art/Smg/railgun_smg.glb     -> SM_RailgunSmg_{Body,WallLeft,WallRight,Mag}
+#             four meshes, MI_RailgunSmg_*      (the SMG)
 #
 # Driven by Scripts/import-railgun.sh — do not invoke this by hand.
 #
-# WHY THREE MESHES AND NOT ONE
-#   The weapon's fire animation throws the two rail walls apart and cants them
-#   outward. A single static mesh cannot do that, so the source is split into a
-#   body plus a left and right rail wall, each baked around ITS OWN HINGE: the
-#   rear of the rail. Rotating a wall component about its own origin then swings
-#   the muzzle end out, which is the motion the source notes describe. The
-#   attach offsets that put each wall back in the right place are read out of
-#   railgun_manifest.json rather than typed in here.
+# WHY SEVERAL MESHES AND NOT ONE
+#   The weapon's motion moves parts of it relative to the rest, and a single
+#   static mesh cannot do that. So the source is split, and each piece is baked
+#   around the origin it will be rotated or translated about.
+#     - the pistol's two rail walls are baked around THEIR OWN HINGE, the rear of
+#       the rail, so rotating a wall component swings the muzzle end outward;
+#     - the SMG's export authors real pivot nodes, and all three sit on the
+#       weapon root, so its three moving groups are baked around the root and
+#       attach at (0,0,0) — their authored motion is a translation, not a swing.
+#   Either way the attach offsets come out of the manifest, not out of this file.
 #
 # WHY THE MATERIALS ARE BUILT AND NOT IMPORTED
 #   An OBJ carries base colour and nothing else. The glTF's real PBR values
@@ -23,6 +31,11 @@
 #   manifest, and the two glowing materials need a scalar EmissiveIntensity
 #   parameter that gameplay code animates on discharge. So one master material
 #   is authored here and five instances are stamped from the manifest.
+#
+#   BOTH RIGS SHARE THE MASTER M_TraceRailgun — same shading model, same
+#   parameter names, and it is already committed. Only the pistol rig may
+#   rebuild it; the SMG import reuses it and never deletes it, so importing the
+#   SMG cannot disturb art the pistol already ships.
 # =============================================================================
 import json
 import os
@@ -31,9 +44,35 @@ import unreal
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OBJ_DIR = os.environ.get(
-    "TRACE_RAILGUN_OBJ_DIR", os.path.join(PROJECT_ROOT, "Intermediate", "Railgun"))
-MANIFEST = os.path.join(OBJ_DIR, "railgun_manifest.json")
+
+RIGS = {
+    "railgun": {
+        "obj_env": "TRACE_RAILGUN_OBJ_DIR",
+        "obj_dir": ("Intermediate", "Railgun"),
+        "manifest": "railgun_manifest.json",
+        "mesh_prefix": "SM_Railgun_",
+        "mi_prefix": "MI_Railgun_",
+        "owns_master": True,
+    },
+    "smg": {
+        "obj_env": "TRACE_SMG_OBJ_DIR",
+        "obj_dir": ("Intermediate", "Smg"),
+        "manifest": "railgun_smg_manifest.json",
+        "mesh_prefix": "SM_RailgunSmg_",
+        "mi_prefix": "MI_RailgunSmg_",
+        "owns_master": False,
+    },
+}
+
+RIG_NAME = os.environ.get("TRACE_RIG", "railgun")
+RIG = RIGS.get(RIG_NAME)
+if RIG is None:
+    raise SystemExit("[Trace] unknown TRACE_RIG '{0}'".format(RIG_NAME))
+
+OBJ_DIR = os.environ.get(RIG["obj_env"], os.path.join(PROJECT_ROOT, *RIG["obj_dir"]))
+MANIFEST = os.path.join(OBJ_DIR, RIG["manifest"])
+MESH_PREFIX = RIG["mesh_prefix"]
+MI_PREFIX = RIG["mi_prefix"]
 
 MESH_DIR = "/Game/Trace/Weapons/Meshes"
 MATERIAL_DIR = "/Game/Trace/Weapons/Materials"
@@ -71,8 +110,12 @@ def fail(msg):
 def build_master():
     path = "{0}/{1}".format(MATERIAL_DIR, MASTER_NAME)
     if EAL.does_asset_exist(path):
-        if not FORCE:
-            log("{0} exists; keeping it (TRACE_FORCE_RAILGUN=1 rebuilds).".format(path))
+        # Rigs that do not own the master never rebuild it, even under --force:
+        # it is the pistol's committed asset and the SMG only borrows it.
+        if not FORCE or not RIG["owns_master"]:
+            log("{0} exists; keeping it{1}.".format(
+                path,
+                "" if RIG["owns_master"] else " (owned by the railgun rig)"))
             return unreal.load_asset(path)
         EAL.delete_asset(path)
 
@@ -125,14 +168,15 @@ def build_master():
 
 
 def build_instance(master, name, spec):
-    path = "{0}/MI_Railgun_{1}".format(MATERIAL_DIR, name)
+    asset_name = "{0}{1}".format(MI_PREFIX, name)
+    path = "{0}/{1}".format(MATERIAL_DIR, asset_name)
     if EAL.does_asset_exist(path):
         if not FORCE:
             return unreal.load_asset(path)
         EAL.delete_asset(path)
 
     tools = unreal.AssetToolsHelpers.get_asset_tools()
-    inst = tools.create_asset("MI_Railgun_{0}".format(name), MATERIAL_DIR,
+    inst = tools.create_asset(asset_name, MATERIAL_DIR,
                               unreal.MaterialInstanceConstant,
                               unreal.MaterialInstanceConstantFactoryNew())
     if inst is None:
@@ -245,8 +289,10 @@ def assign_materials(mesh, instances):
 
 
 def main():
+    log("rig '{0}': OBJ from {1}".format(RIG_NAME, OBJ_DIR))
     if not os.path.isfile(MANIFEST):
-        fail("manifest not found at {0} — run Scripts/railgun_glb_to_obj.py first".format(MANIFEST))
+        fail("manifest not found at {0} — run Scripts/railgun_glb_to_obj.py {1} first".format(
+            MANIFEST, RIG_NAME))
         return
     manifest = json.load(open(MANIFEST))
 
@@ -262,7 +308,7 @@ def main():
 
     meshes = []
     for mesh_name in sorted(manifest["meshes"]):
-        mesh = import_mesh("SM_Railgun_" + mesh_name)
+        mesh = import_mesh(MESH_PREFIX + mesh_name)
         if mesh is not None:
             assign_materials(mesh, instances)
             meshes.append(mesh)
@@ -286,11 +332,12 @@ def main():
                 fail("{0} slot {1} ended up with no material".format(mesh.get_name(), i))
 
     if _failures:
-        unreal.log_error("[Trace] import_railgun FAILED with {0} problem(s):".format(len(_failures)))
+        unreal.log_error("[Trace] import_railgun[{0}] FAILED with {1} problem(s):".format(
+            RIG_NAME, len(_failures)))
         for f in _failures:
             unreal.log_error("[Trace]   - {0}".format(f))
     else:
-        log("import_railgun: all meshes and materials written.")
+        log("import_railgun[{0}]: all meshes and materials written.".format(RIG_NAME))
 
 
 main()

@@ -430,6 +430,55 @@ public:
 	 */
 	bool DebugGetRailgunEmissive(float& OutCyan, float& OutAmber) const;
 
+	// --- The SMG rig  (spec v30 §2/§3/§4) ---------------------------------------------------------
+
+	/**
+	 * WHICH GUN THE RIG IS ACTUALLY DRAWING RIGHT NOW, which is the whole of what spec v30 §2 is
+	 * about: demo 24 shipped an SMG that looked exactly like the pistol, and nothing on screen could
+	 * tell a player which of them they were holding.
+	 *
+	 * This is the DRAWN answer, not the selector — under a fallback (no SMG art on disk) the `3` slot
+	 * shows the pistol rig and this says Pistol, which is what a probe needs to hear. It reads None
+	 * while the guns are stowed, which is UTraceWeaponComponent's rule rather than this class's; see
+	 * UpdateWeaponSelection for why the two are kept apart.
+	 */
+	enum class EShownGun : uint8
+	{
+		None = 0,    ///< guns stowed: the `1` state, knife only
+		Pistol = 1,  ///< the railgun rig, or the procedural cube gun when the art is missing
+		Smg = 2      ///< the imported SMG rig
+	};
+	EShownGun GetShownGun() const;
+
+	/** True when the imported SMG art resolved and the four-part SMG rig was built. */
+	bool UsesSmgViewModel() const;
+
+	/**
+	 * Verification only (Trace.Smg.Hold), the SMG's twin of DebugHoldRailgunPhase.
+	 *
+	 * @param Alpha  0 is the shot frame — walls thrown fully apart, cyan at its 4.8x peak — and 1 is
+	 *               rest. Negative releases. The whole SMG fire cycle is 0.100 s, so no screenshot
+	 *               can catch the shot frame without this.
+	 * @param ReloadAlpha  0..1 pins the RELOAD pose instead of leaving the magazine seated: 0.33 is
+	 *               the cell fully dropped. Negative leaves the reload driven by the real weapon.
+	 */
+	void DebugHoldSmgPhase(float Alpha, float ReloadAlpha, float HoldSeconds);
+
+	/** Verification only. The four SMG parts, or nulls when the SMG rig was not built. */
+	void DebugGetSmgParts(UStaticMeshComponent*& OutBody, UStaticMeshComponent*& OutWallLeft,
+		UStaticMeshComponent*& OutWallRight, UStaticMeshComponent*& OutMag) const;
+
+	/**
+	 * Verification only. Reads EmissiveIntensity BACK OFF the live SMG material instances, for the
+	 * same reason DebugGetRailgunEmissive does: writing a parameter name that is not on the material
+	 * silently does nothing, and reading it is the only way to catch that.
+	 *
+	 * @param OutCyan   the first circuit_cyan MID's value. The SMG carries THREE (body + both walls)
+	 *                  and they are always written together, so one is representative.
+	 * @param OutAmber  the core_amber MID's value. That slot exists ONLY on the magazine mesh.
+	 */
+	bool DebugGetSmgEmissive(float& OutCyan, float& OutAmber) const;
+
 	/**
 	 * The two shared viewmodel materials, so anything else that wants to be made of the same stuff
 	 * as the gun can ask instead of guessing.
@@ -832,6 +881,49 @@ protected:
 	 */
 	void UpdateRailgunFire(float DeltaSeconds);
 
+	/**
+	 * SPEC v30 §2 — builds the SMG's four parts alongside the pistol's, not instead of them.
+	 *
+	 * BOTH GUNS ARE BUILT ONCE AND THEN SHOWN OR HIDDEN, rather than one being torn down and the
+	 * other constructed on every swap. A swap is a 0.35 s pullout that a player does mid-fight;
+	 * building four static mesh components and five dynamic material instances inside it would be a
+	 * hitch on a frame that already has to be smooth, and the alternative — rebuilding on the first
+	 * swap and caching after — is the same memory with a stutter bolted to the front of it. Ten
+	 * meshes on the one pawn a human is inside is nothing; a hitch in a firefight is not.
+	 *
+	 * Returns false without building anything if the art did not resolve, which is the caller's cue
+	 * to let the `3` slot fall back to whichever pistol rig exists.
+	 */
+	bool BuildSmgViewModel();
+
+	/**
+	 * SPEC v30 §3/§4 — the SMG's motion and glow, reproduced in code from the kit's numbers.
+	 *
+	 * DRIVEN BY THE WEAPON'S REAL STATE, never by a free-running timer: the fire cycle is restarted
+	 * by NotifyWeaponFired (an actual round leaving), and the reload phase is read live off
+	 * UTraceWeaponComponent's replicated reload deadline. What is on screen therefore cannot
+	 * disagree with what the gun is doing, which is the failure §3 names.
+	 */
+	void UpdateSmgAnimation(float DeltaSeconds);
+
+	/**
+	 * SPEC v30 §2 — decides which of the two guns is on screen, from the replicated weapon selector.
+	 *
+	 * Re-asserted every frame rather than hooked to a swap event, for exactly the reason
+	 * UTraceWeaponComponent::SetGunViewModelHidden is: this is not the only writer of these
+	 * components' visibility, and an edge-triggered version goes stale the first time somebody else
+	 * re-shows the rig (a respawn, or handing the Core back).
+	 */
+	void UpdateWeaponSelection();
+
+	/**
+	 * The muzzle marker of the gun THIS RIG IS HOLDING — the SMG's whenever the SMG rig is the one
+	 * selected, including while the guns are momentarily stowed. Follows SelectedFirearm rather than
+	 * ShownGun deliberately: a stowed rig draws no beam at all (GetViewModelMuzzleViewPoint refuses
+	 * on !bViewModelVisible), and the marker must still belong to the gun that comes back out.
+	 */
+	USceneComponent* GetActiveMuzzleMarker() const;
+
 	/** Guarded show/hide for the whole rig. Also stops UpdateViewModel doing arithmetic for nothing. */
 	void SetViewModelVisible(bool bVisible);
 
@@ -923,6 +1015,96 @@ private:
 	float RailgunDebugHoldAlpha = -1.f;
 	double RailgunDebugHoldUntil = -1.0;
 
+	// --- The SMG  (spec v30) ----------------------------------------------------------------------
+	//
+	// FOUR meshes rather than the pistol's three, because this export carries authored pivot nodes:
+	// a body, the two rail walls that snap apart on each shot, and the magazine that drops on a
+	// reload. Committed art, same contract as the railgun's: every one of them optional, and a miss
+	// on any one leaves the `3` slot showing whichever pistol rig exists rather than nothing at all.
+
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> SmgBodyMesh;
+
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> SmgWallLeftMesh;
+
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> SmgWallRightMesh;
+
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> SmgMagMesh;
+
+	/** The four SMG parts, in build order. All null when the SMG rig was not built. */
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> SmgBodyPart;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> SmgWallLeftPart;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> SmgWallRightPart;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> SmgMagPart;
+
+	/**
+	 * *** THE SMG'S GLOW IS SPLIT ACROSS MESHES, WHICH THE PISTOL'S IS NOT. ***
+	 *
+	 * On the railgun both glowing slots sit on the one body mesh, so two MIDs off one component was
+	 * the whole story. On the SMG, `circuit_cyan` is on the body AND on both walls (three components,
+	 * hence an array — writing only the body's would leave the rail channels dead through every
+	 * shot), and `core_amber` exists ONLY on the magazine. Creating the amber MID off the body the
+	 * way the pistol does silently yields INDEX_NONE and an ammo readout that never lights.
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> SmgCyanMIDs;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> SmgAmberMID;
+
+	/** Seconds since the shot that started the 0.100 s fire cycle; negative when nothing is playing. */
+	float SmgFireElapsed = -1.f;
+
+	/** How long that cycle lasts, taken at fire time from the weapon's own interval. */
+	float SmgFireDuration = 0.f;
+
+	/** Trace.Smg.Hold only. Negative means not held; ReloadAlpha < 0 leaves the magazine to the gun. */
+	float SmgDebugHoldAlpha = -1.f;
+	float SmgDebugHoldReloadAlpha = -1.f;
+	double SmgDebugHoldUntil = -1.0;
+
+	/**
+	 * SPEC v30 §2 — the two gun rigs, split out of ViewModelParts so the selector can hide one.
+	 *
+	 * WEAPON PARTS ONLY. The hands, knuckles, forearms and cuffs are in neither list: they hold
+	 * whichever gun won and are never written by the selector, which is the same rule
+	 * UTraceWeaponComponent::IsViewModelHandPart encodes for the knife.
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> PistolWeaponParts;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> SmgWeaponParts;
+
+	/**
+	 * What UpdateWeaponSelection last put on screen, including None while the guns are stowed. This
+	 * is the DRAWN answer that GetShownGun() reports.
+	 */
+	EShownGun ShownGun = EShownGun::Pistol;
+
+	/**
+	 * WHICH OF THE TWO GUNS THIS RIG IS HOLDING — never None, and unchanged by stowing.
+	 *
+	 * Separate from ShownGun because "which gun" and "is any gun out" are different questions with
+	 * different owners: this file answers the first, UTraceWeaponComponent's knife rule answers the
+	 * second. Putting the guns away must not make this file forget which one was in hand, or the
+	 * pistol would come back after every `1` regardless of what the player had out.
+	 */
+	EShownGun SelectedFirearm = EShownGun::Pistol;
+
+	/** The SMG fallback banner is printed once per pawn, not once per frame. */
+	bool bSmgFallbackLogged = false;
+
 	/** Every part of the viewmodel, so visibility is one loop and the parts cannot be orphaned. */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UStaticMeshComponent>> ViewModelParts;
@@ -942,6 +1124,20 @@ private:
 	 */
 	UPROPERTY(Transient)
 	TObjectPtr<USceneComponent> ViewModelMuzzle;
+
+	/**
+	 * SPEC v30 §5, the character's half of it: the SAME arrangement on the SMG's body, at the SMG's
+	 * own measured (58.8, 0, 4.5) cm aperture.
+	 *
+	 * TWO MARKERS, ONE PER GUN, rather than one marker that gets reparented on every swap. Both guns
+	 * are built once and shown or hidden (see BuildSmgViewModel), so their muzzles are static facts
+	 * about static rigs; GetActiveMuzzleMarker() picks the one belonging to the gun actually drawn.
+	 * A single moving marker would have to be detached and reattached inside a swap, and would be
+	 * momentarily attached to a hidden gun on any frame the two disagreed — which is precisely a beam
+	 * leaving from the wrong barrel, the defect §5 exists to prevent.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<USceneComponent> ViewModelSmgMuzzle;
 
 	bool bViewModelBuilt = false;
 	bool bViewModelVisible = false;

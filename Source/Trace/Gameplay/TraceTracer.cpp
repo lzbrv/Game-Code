@@ -1,5 +1,7 @@
 #include "Gameplay/TraceTracer.h"
 
+#include "Camera/CameraComponent.h"           // spec v30 §5 — the first-person morph, applied to a
+#include "Camera/CameraTypes.h"               //   point the pawn's own marker does not cover
 #include "Camera/PlayerCameraManager.h"
 #include "Components/SceneComponent.h"
 #include "Containers/Ticker.h"
@@ -81,6 +83,176 @@ namespace
 			return Cast<ATraceCharacter>(PC->GetViewTarget());
 		}
 		return nullptr;
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// SPEC v30 §5 — THE GUN ON SCREEN, AND ITS OWN MUZZLE
+	//
+	// Named for this file, not because these are pretty names, but because the anonymous namespace
+	// they live in is shared with every other .cpp in the same jumbo blob (see the note on
+	// GetTracerLocalViewCharacter above).
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * One viewmodel gun: the mesh that identifies it, and where its barrel ends in its own space.
+	 *
+	 * THESE TWO NUMBERS ARE MEASUREMENTS, NOT TUNING. The pistol's is the same (107.4, 0, 4.5) cm
+	 * vertex recorded in railgun_manifest.json that TraceCharacterLayout::RailgunMuzzleLocal already
+	 * places its marker at, so the pistol's answer here is identical to the pawn's by construction.
+	 * The SMG's is the aperture centre measured out of railgun_smg.glb — muzzle_aperture's own local
+	 * bounding-box centre carried through the node chain — which confirms spec v30 §1's -0.588 m and
+	 * refutes the kit README's -0.59 m. It is deliberately NOT the forward-most vertex: that is
+	 * X = 63.0 at Y = -4.3, the outer rim of the aperture ring, which is not on the beam axis.
+	 *
+	 * WHY A TABLE HERE RATHER THAN A CONSTANT ON THE PAWN. Only ATraceCharacter can parent a marker
+	 * to a gun, and that file belongs to the viewmodel slice; this file's job is to be right about
+	 * the gun that is on screen whichever way that slice resolves. When the marker follows the active
+	 * weapon, every entry below merely agrees with it and changes no answer — which is a thing
+	 * Trace.Smg.Probe MEASURES (MarkerToGunUU) rather than a thing this comment asserts. If the pawn
+	 * ever grows a per-gun muzzle accessor, delete this table and call it.
+	 */
+	struct FTracerGunMuzzle
+	{
+		const TCHAR* StaticMeshName;
+		FVector MeshLocalCm;
+	};
+
+	const FTracerGunMuzzle GTracerGunMuzzles[] =
+	{
+		{ TEXT("SM_Railgun_Body"),    FVector(107.4, 0.0, 4.5) },
+		{ TEXT("SM_RailgunSmg_Body"), FVector(58.8,  0.0, 4.5) }
+	};
+
+	/**
+	 * Applies the first-person re-projection to a world point on the pawn's viewmodel.
+	 *
+	 * THE SAME MORPH ATraceCharacter::GetViewModelMuzzleViewPoint() APPLIES, and for the same reason:
+	 * the rig is tagged EFirstPersonPrimitiveType::FirstPerson, so the renderer does not draw it at
+	 * its own world transform. A beam started at the un-morphed point lands beside the barrel instead
+	 * of out of it. bIgnoreFirstPersonScale is true for the argument set out in full on that function
+	 * — it keeps the near end at the gun's true depth so a 20 uu sheath does not fill the frame.
+	 *
+	 * Returns @p RawWorld unchanged whenever there is nothing to morph WITH (no camera, first-person
+	 * rendering off), which is exactly what the pawn does in the same situation.
+	 */
+	FVector TracerMorphToFirstPerson(const ATraceCharacter* Shooter, const FVector& RawWorld)
+	{
+		if (Shooter == nullptr)
+		{
+			return RawWorld;
+		}
+
+		// AActor::FindComponentByClass is const and hands back a mutable component, which is what
+		// GetCameraView needs. The pawn has exactly one camera; see the constructor comment there for
+		// why calling GetCameraView from a query is safe on it (bUsePawnControlRotation is false).
+		UCameraComponent* ShooterCamera = Shooter->FindComponentByClass<UCameraComponent>();
+		if (ShooterCamera == nullptr)
+		{
+			return RawWorld;
+		}
+
+		FMinimalViewInfo POV;
+		ShooterCamera->GetCameraView(0.f, POV);
+		if (!POV.bUseFirstPersonParameters)
+		{
+			return RawWorld;
+		}
+
+		const FVector Morphed = POV.TransformWorldToFirstPerson(RawWorld, /*bIgnoreFirstPersonScale=*/true);
+		return Morphed.ContainsNaN() ? RawWorld : Morphed;
+	}
+
+	/**
+	 * Is this part of the rig actually being DRAWN?
+	 *
+	 * USceneComponent::IsVisible() covers BOTH of the ways this project hides a weapon — the
+	 * SetVisibility() that SetViewModelVisible() uses to put the whole rig away in third person, and
+	 * the SetHiddenInGame() that the gun swap uses to put one of the two guns away — because it reads
+	 * both flags. Every gun part is hidden individually by both mechanisms, so a per-component answer
+	 * is the complete answer.
+	 *
+	 * *** AND IT MUST NOT WALK UP THE ATTACHMENT CHAIN, WHICH IS THE OBVIOUS "IMPROVEMENT" HERE. ***
+	 * IsVisible() is deliberately not parent-aware, so a reader who wants to be thorough reaches for a
+	 * loop over GetAttachParent() — and every viewmodel part would immediately test as NOT DRAWN. The
+	 * chain from a gun part runs ViewModelRoot -> Camera -> SpringArm -> the capsule, and
+	 * UShapeComponent's constructor sets bHiddenInGame = true unconditionally, so the pawn's own root
+	 * reports invisible on every frame of every match. The walk would silently switch this whole
+	 * resolver off: no gun would ever be found, the beam would fall back to the pawn's marker, and
+	 * nothing would log a word about it. Do not add the loop.
+	 */
+	bool TracerIsComponentDrawn(const USceneComponent* Component)
+	{
+		return Component != nullptr && Component->IsVisible();
+	}
+
+	/**
+	 * The muzzle of the weapon the pawn is DRAWING, in world space and un-morphed.
+	 *
+	 * "Drawing" is decided by the components themselves — a visible static mesh component whose asset
+	 * is one of the guns in the table — and not by the weapon selector, because the selector says
+	 * what the pawn is HOLDING and those two differ in exactly the case that matters: spec v30 §2
+	 * requires the SMG to fall back to the pistol rig when its art is missing, and a beam that
+	 * believed the selector would then leave a gun that is not on screen.
+	 */
+	bool TracerFindDrawnGunMuzzle(const ATraceCharacter* Shooter, FName& OutMeshName,
+		FVector& OutMeshLocalCm, FVector& OutRawWorld)
+	{
+		if (Shooter == nullptr)
+		{
+			return false;
+		}
+
+		TArray<UStaticMeshComponent*, TInlineAllocator<24>> Parts;
+		Shooter->GetComponents<UStaticMeshComponent>(Parts);
+
+		int32 BestEntry = INDEX_NONE;
+		const UStaticMeshComponent* BestPart = nullptr;
+
+		for (const UStaticMeshComponent* Part : Parts)
+		{
+			if (Part == nullptr || !Part->IsRegistered() || !TracerIsComponentDrawn(Part))
+			{
+				continue;
+			}
+			const UStaticMesh* Mesh = Part->GetStaticMesh();
+			if (Mesh == nullptr)
+			{
+				continue;
+			}
+
+			for (int32 Index = 0; Index < UE_ARRAY_COUNT(GTracerGunMuzzles); ++Index)
+			{
+				if (Mesh->GetFName() != FName(GTracerGunMuzzles[Index].StaticMeshName))
+				{
+					continue;
+				}
+
+				// A tie can only happen if a rig draws two gun bodies at once, which no code path
+				// does today. Resolving it by TABLE ORDER rather than by whichever component happened
+				// to register first makes the answer deterministic and reviewable: the last entry
+				// wins, so adding a gun to the table is what decides it, not the scene graph.
+				if (BestEntry == INDEX_NONE || Index > BestEntry)
+				{
+					BestEntry = Index;
+					BestPart = Part;
+				}
+				break;
+			}
+		}
+
+		if (BestEntry == INDEX_NONE || BestPart == nullptr)
+		{
+			return false;
+		}
+
+		OutMeshName = FName(GTracerGunMuzzles[BestEntry].StaticMeshName);
+		OutMeshLocalCm = GTracerGunMuzzles[BestEntry].MeshLocalCm;
+
+		// The FULL component transform, live: the scale that shrinks a 1.28 m weapon into a viewmodel,
+		// every parent's recoil kick, sway, bob and dip. Nothing here caches, so nothing here can go
+		// stale when the rig moves.
+		OutRawWorld = BestPart->GetComponentTransform().TransformPosition(OutMeshLocalCm);
+		return !OutRawWorld.ContainsNaN();
 	}
 } // namespace
 
@@ -190,6 +362,87 @@ ATraceTracer* ATraceTracer::Spawn(UWorld* World, const FVector& From, const FVec
 	return Tracer;
 }
 
+bool ATraceTracer::GetGunMuzzleLandmark(FName StaticMeshName, FVector& OutMeshLocalCm)
+{
+	for (const FTracerGunMuzzle& Entry : GTracerGunMuzzles)
+	{
+		if (StaticMeshName == FName(Entry.StaticMeshName))
+		{
+			OutMeshLocalCm = Entry.MeshLocalCm;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool ATraceTracer::ResolveViewModelBeamStart(const ATraceCharacter* Shooter, FTraceTracerBeamStart& OutInfo)
+{
+	OutInfo = FTraceTracerBeamStart();
+	if (Shooter == nullptr)
+	{
+		return false;
+	}
+
+	// STEP 1: the pawn's own answer, which is also the VISIBILITY GATE for everything below it.
+	// GetViewModelMuzzleViewPoint() says no when there is no rig, no camera, or the rig is not being
+	// drawn (third person, dead, dedicated server) — and in every one of those cases there is no gun
+	// on screen for a beam to leave, whatever the components say. Asking it first means this function
+	// cannot start relocating beams in situations the shipped v26 path correctly refused to.
+	OutInfo.bHasMarker = Shooter->GetViewModelMuzzleViewPoint(OutInfo.MarkerDrawn);
+	if (!OutInfo.bHasMarker)
+	{
+		return false;
+	}
+	OutInfo.Start = OutInfo.MarkerDrawn;
+	OutInfo.bValid = true;
+
+	// The un-morphed marker, fetched here rather than inside step 3 so that it is populated on EVERY
+	// path. A report that leaves it at the origin when no gun mesh was found would make the
+	// raw-versus-drawn comparison in Trace.Smg.Probe read as an enormous morph on the fallback rig —
+	// a diagnostic that lies in exactly the case somebody is diagnosing.
+	FVector RawMarker = FVector::ZeroVector;
+	const bool bHasRawMarker = Shooter->DebugGetViewModelMuzzleRaw(RawMarker);
+	if (bHasRawMarker)
+	{
+		OutInfo.MarkerRaw = RawMarker;
+	}
+
+	// STEP 2: the gun that is actually drawn, and where its own barrel ends.
+	OutInfo.bHasGun = TracerFindDrawnGunMuzzle(Shooter, OutInfo.GunMesh, OutInfo.GunMuzzleLocalCm, OutInfo.GunMuzzleRaw);
+	if (!OutInfo.bHasGun)
+	{
+		// The procedural cube gun, or art this file has never heard of. The marker is the only thing
+		// that knows where that is, and it is right about it — this is the fallback rig's path and it
+		// is unchanged from v26.
+		return true;
+	}
+
+	// STEP 3: do the two agree? DebugGetViewModelMuzzleRaw is the un-morphed marker, which is the only
+	// thing comparable with a component's world position — comparing a morphed point against a raw one
+	// would report a disagreement on every frame and hand the answer to step 4 permanently.
+	if (bHasRawMarker)
+	{
+		OutInfo.MarkerToGunUU = FVector::Dist(RawMarker, OutInfo.GunMuzzleRaw);
+		if (OutInfo.MarkerToGunUU <= MuzzleAgreementUU)
+		{
+			// The marker IS on the gun being drawn. Use the pawn's own answer, so that the shipped
+			// path stays the shipped path and this function is provably a no-op for the pistol.
+			return true;
+		}
+	}
+
+	// STEP 4: the marker is somewhere else — on the other gun, or on the rig root. The gun on screen
+	// wins, because it is the one the player watches the beam fail to leave.
+	OutInfo.Start = TracerMorphToFirstPerson(Shooter, OutInfo.GunMuzzleRaw);
+	OutInfo.bFromGunMesh = true;
+	return true;
+}
+
+bool ATraceTracer::DescribeLocalBeamStart(const UWorld* World, FTraceTracerBeamStart& OutInfo)
+{
+	return ResolveViewModelBeamStart(GetTracerLocalViewCharacter(World), OutInfo);
+}
+
 UMaterialInstanceDynamic* ATraceTracer::MakeMID(UStaticMeshComponent* Mesh, UMaterialInterface* Material)
 {
 	if (Mesh == nullptr || Material == nullptr)
@@ -246,7 +499,8 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	//   2. WHERE IS MY BARREL? Asked of the pawn, which owns the rig and the camera and is the only
 	//      thing that can answer. It says no when there is no viewmodel drawn (third person while
 	//      carrying, dead, a fresh clone with no art), and then the beam simply starts at the true
-	//      origin, exactly as it does on every remote machine.
+	//      origin, exactly as it does on every remote machine. SPEC v30 §5: "my barrel" is now
+	//      whichever gun is on screen, which is what ResolveViewModelBeamStart() settles.
 	//
 	// The point-blank impact-pop dimming that used to live here is gone with the impact sphere it
 	// protected against. Nothing else in this effect is large, unlit and drawn at the far end of the
@@ -258,18 +512,28 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 		&& FVector::Dist(ViewLocation, From) < FirstPersonProximityUU)
 	{
 		const ATraceCharacter* Shooter = GetTracerLocalViewCharacter(GetWorld());
-		FVector MuzzleViewPoint = FVector::ZeroVector;
-		if (Shooter != nullptr && Shooter->GetViewModelMuzzleViewPoint(MuzzleViewPoint))
+		FTraceTracerBeamStart Muzzle;
+		if (ResolveViewModelBeamStart(Shooter, Muzzle))
 		{
 			// Measured ALONG THE SHOT, not as a straight distance: a muzzle that is off to one side of
 			// the ray still has plenty of beam left in front of it, and a straight-line test would
 			// reject those. What must not happen is starting at or past the impact, which draws the
 			// beam backwards through the player's own face.
-			const double Remaining = FVector::DotProduct(To - MuzzleViewPoint, Dir);
+			const double Remaining = FVector::DotProduct(To - Muzzle.Start, Dir);
 			if (Remaining >= MinBeamBeyondMuzzleUU)
 			{
-				BeamStart = MuzzleViewPoint;
+				BeamStart = Muzzle.Start;
 			}
+
+			// VERBOSE, and it fires per shot: this is the one line that says WHICH GUN the beam was
+			// placed on and whether the pawn's marker had to be overridden to do it. Trace.Smg.Probe
+			// prints the same fields on demand, from the same function, without firing.
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("TRACER MUZZLE: gun=%s source=%s markerToGun=%.3fuu start=%s beamBeyond=%.1fuu"),
+				Muzzle.bHasGun ? *Muzzle.GunMesh.ToString() : TEXT("none (fallback rig)"),
+				Muzzle.bFromGunMesh ? TEXT("GUN MESH (marker overridden)") : TEXT("pawn marker"),
+				Muzzle.MarkerToGunUU, *Muzzle.Start.ToCompactString(),
+				FVector::DotProduct(To - Muzzle.Start, Dir));
 		}
 	}
 

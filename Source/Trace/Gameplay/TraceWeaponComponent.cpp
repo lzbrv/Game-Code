@@ -578,6 +578,7 @@ void UTraceWeaponComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 	// are: nobody draws another player's ammo, and this is two more bytes per pawn that no client
 	// could put on screen. NO OnRep of its own — ClipSerial moves on every swap, so OnRep_Ammo (which
 	// ClipAmmo and ClipSerial already trigger) is where the reconcile happens, once.
+	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, LiveClipOwner,          COND_OwnerOnly);
 	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, StowedGunClipAmmo,     COND_OwnerOnly);
 	DOREPLIFETIME_CONDITION(UTraceWeaponComponent, StowedGunAbilityRounds, COND_OwnerOnly);
 }
@@ -2877,7 +2878,12 @@ void UTraceWeaponComponent::ApplyEquip(ETraceEquippedWeapon Desired, double Depl
 	// touches neither pair. A no-op request (RequestEquip is unguarded and a repeat press costs a
 	// pullout) is excluded by the inequality, or leaning on the key would shuffle two magazines back
 	// and forth and bump the serial sixty times a second.
-	if (Previous != Desired && TraceIsFirearm(Previous) && TraceIsFirearm(Desired))
+	// DECIDED ON THE MAGAZINE, NOT ON THE ROUTE. The old test was
+	// `Previous != Desired && IsFirearm(Previous) && IsFirearm(Desired)`, which spec v29 §5's stow
+	// state defeats: pistol -> stow -> SMG is two non-gun-to-gun transitions, so nothing swapped and
+	// the SMG drew the pistol's magazine. Asking whether the live clip belongs to the gun being
+	// drawn is the same answer for a direct swap and the right answer through a stow.
+	if (TraceIsFirearm(Desired) && LiveClipOwner != Desired)
 	{
 		// A RELOAD DOES NOT SURVIVE THE SWAP, and it is cancelled BEFORE the exchange so the deadline
 		// dies with the magazine it belonged to rather than following it into the pocket. Putting a
@@ -2885,6 +2891,7 @@ void UTraceWeaponComponent::ApplyEquip(ETraceEquippedWeapon Desired, double Depl
 		// and which is what stops "swap out, swap in" from being a way to shorten one.
 		CancelReload();
 		SwapStowedClip();
+		LiveClipOwner = Desired;
 	}
 
 	// A swap cancels a swing that has not resolved yet. The alternative — letting the blade land
