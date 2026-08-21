@@ -135,23 +135,54 @@ namespace
 	 * that no longer exists. See the ETraceInputAction::EquipKnife comment for the full argument.
 	 */
 	/**
-	 * *** SPEC v29 §5 — 1 STOWS THE GUNS, 2 IS THE PISTOL, 3 IS THE SMG. ***
+	 * *** SPEC v31 §1 — "1 is pistol, 2 is smg, 3 is knife". THE STOW LAYOUT IS GONE. ***
 	 *
-	 * The KEYS are unchanged for the first two rows and the third is the obvious next digit, so
-	 * there is no collision to argue about: nothing else in this table claims a digit, and
-	 * SetKey's stealing rule would log it on a first run if it did. EKeys::Three is the NUMBER ROW,
-	 * not the numpad (that is EKeys::NumPadThree), for the reason the two above give.
+	 * v29 §5 shipped 1 = STOW GUNS, 2 = PISTOL, 3 = SMG. v31 §1 reverts the dual-wield knife, which
+	 * takes the stow state with it — the knife is a WEAPON SLOT again, so there are three weapons and
+	 * three keys and the owner has named which is which. Every one of the three keys changes meaning
+	 * and every one of the three DEFAULTS moves:
 	 *
-	 * WHAT MOVED IS THE MEANING AND THE CONFIG ID, NOT THE KEY. See the ETraceInputAction::EquipKnife
-	 * comment for the migration ("EquipKnife" -> "StowGuns", "EquipGun" -> "EquipPistol"); the short
-	 * version is that a returning player's saved `EquipKnife=1` line names an id this table no longer
-	 * has, is dropped on load like `SwapWeapon=F` before it, and the new default is seeded. Without
-	 * that a returning player would keep a bind whose label and behaviour had both changed underneath
-	 * it and would never see the SMG row at all, because their file has no line for it either.
+	 *     key 1   the PISTOL   (was the stow)
+	 *     key 2   the SMG      (was the pistol)
+	 *     key 3   the KNIFE    (was the SMG) — and the knife slot is what pays the v12 §3 speed boost
+	 *
+	 * ALL THREE ARE THE NUMBER ROW, not the numpad (EKeys::NumPadOne and friends), for the reason the
+	 * v13 §2 comment above gives: the number row is what a player reaches for without thinking and
+	 * what a laptop still has. Nothing else in this table claims a digit, so no default steals a key
+	 * from another action on a first run — SetKey's stealing rule would log it if one did.
+	 *
+	 * *** WHY THE ORDER IS PISTOL, SMG, KNIFE AND NOT KNIFE, PISTOL, SMG. *** It is the owner's own
+	 * sentence and it is not arbitrary: the two guns are the weapons a player swaps between under
+	 * pressure and they are now adjacent under the index and middle fingers, with the knife — a
+	 * deliberate commitment that gives up shooting entirely — one key further out. v13 §2's original
+	 * "1 knife, 2 gun" put the commitment first because there were only two weapons; with three, the
+	 * guns take the near keys.
+	 *
+	 * *** THE CONFIG IDS ALL MOVE, AND THAT IS THE MIGRATION. *** See the ETraceInputAction::EquipKnife
+	 * comment for the full argument; the short version is that Save() writes a line for EVERY action,
+	 * so a returning player's TraceUserSettings.ini already says
+	 *
+	 *     KeyBindings=StowGuns=One          (or, for someone who last played v28, EquipKnife=One)
+	 *     KeyBindings=EquipPistol=Two
+	 *     KeyBindings=EquipSmg=Three
+	 *
+	 * and RefreshFromConfig honours all three over anything this table says. Ship the new layout
+	 * under the old ids and a returning player presses 1 and gets nothing at all (there is no stow
+	 * state any more), presses 2 and gets the pistol they were told is on 1, and presses 3 and gets
+	 * the SMG they were told is on 2 — three dead or mislabelled binds, which is precisely what
+	 * "migrate existing configs, or returning players keep dead binds" is about. Under the NEW ids
+	 * all three saved lines name actions the table does not have, are DISCARDED by the parse loop
+	 * exactly as `SwapWeapon=F` and `Boost=E` are, and all three rows seed their v31 defaults.
+	 *
+	 * "PistolSlot" / "SmgSlot" / "KnifeSlot" ARE FRESH STRINGS THAT HAVE NEVER BEEN IN ANYBODY'S
+	 * FILE. Deliberately not a reuse of "EquipKnife" or "EquipGun": those two ARE in the files of
+	 * everyone who last played v28 or earlier, and reusing one would honour a stale line instead of
+	 * dropping it — putting the knife back on 1 for exactly the players this migration exists for.
+	 * Trace.Settings.VerifyBinds prints every dropped line by name, so this is checkable.
 	 */
-	FKey Default_StowGuns()    { return EKeys::One; }
-	FKey Default_EquipPistol() { return EKeys::Two; }
-	FKey Default_EquipSmg()    { return EKeys::Three; }
+	FKey Default_EquipPistol() { return EKeys::One; }
+	FKey Default_EquipSmg()    { return EKeys::Two; }
+	FKey Default_EquipKnife()  { return EKeys::Three; }
 	/**
 	 * SPEC v14 §5. E and V are NAMED BY THE DOC, so there is no key to choose here — only a collision
 	 * to check. Taken already: WASD, Space, LeftCtrl, LeftShift, Q, mouse1, mouse2, Tab, 1, 2.
@@ -197,7 +228,57 @@ namespace
 	 * SetKey's stealing rule would log it if this default took a key from another action on a first
 	 * run. It does not.
 	 */
-	FKey Default_PullCore()         { return EKeys::F; }
+	/**
+	 * =============================================================================================
+	 * *** SPEC v31 §5 TOOK F. THE PULL IS ON G. THE ARGUMENT ABOVE IS STILL RIGHT AND STILL LOST. ***
+	 * =============================================================================================
+	 *
+	 * "Implement the new knife model [...] bind the F key to inspect." The owner has now named F for
+	 * two different verbs across two specs, and only one of them can have it. INSPECT WINS BECAUSE IT
+	 * WAS NAMED; the pull's F was this file's own choice, argued at length directly above, and an
+	 * argued choice loses to an instruction.
+	 *
+	 * THE TWO CANNOT SHARE THE KEY, and that is a mechanical fact rather than a preference. Both rows
+	 * are `NotCarrying`, ActionsMayShareAKey is one bitwise AND, and intersecting masks mean the two
+	 * verbs can both be legal at the same instant — knife in hand, loose Core in front of you. One
+	 * press would fill a pull ring AND start a 3.2 s flourish. See ETraceInputAction::Inspect for the
+	 * full write-up, including the one-line revert.
+	 *
+	 * G, AND NOT Q. Q's objection from the paragraph above has not changed (it asks the ring finger
+	 * to leave A, and it carries a decade of "that is the ability key"). G is the key immediately to
+	 * the right of the one the pull is losing, under the same index finger that is already on D, and
+	 * it is unclaimed: WASD, Space, LeftCtrl, LeftShift, mouse1, mouse2, Q + thumb mouse, Tab, 1, 2,
+	 * 3, E, V, R, F.
+	 *
+	 * *** THE PULL IS NOT LOSING ITS ONLY ROUTE, WHICH IS WHAT MAKES THIS AFFORDABLE. *** Spec v28
+	 * §10's precedence rule already dispatches the pull from the MELEE button — TraceMelee::
+	 * HandleMeleeInput returns EMeleeInputResult::CorePull when the circle is on screen, and
+	 * ATracePlayerController::OnMeleeStarted logs it as such. A player who never notices the G row
+	 * pulls with right mouse exactly as they do today.
+	 *
+	 * THE ConfigId MOVES WITH THE KEY — "PullCore" -> "PullCoreKey" — for the reason this table has
+	 * now spent four times: Save() writes a line for EVERY action and RefreshFromConfig honours a
+	 * saved line over this function, so without the move a returning player keeps `PullCore=F` and
+	 * ends up with the pull and the flourish on one key, which is the exact collision being avoided.
+	 */
+	FKey Default_PullCore()         { return EKeys::G; }
+
+	/**
+	 * *** SPEC v31 §5 — THE KNIFE FLOURISH. "bind the F key to inspect." ***
+	 *
+	 * THE KEY IS NAMED BY THE OWNER, so there is no choice to argue — only a collision to resolve,
+	 * and it is resolved directly above by moving the Core pull to G. This is the first row in this
+	 * table whose default was taken FROM another action on purpose rather than found free; SetKey's
+	 * stealing rule is not involved (that governs a player's rebinds, not the shipped table), so the
+	 * two defaults are simply written to disagree with each other's history and the ConfigId
+	 * migration on the loser's row is what makes it land.
+	 *
+	 * IT IS COSMETIC AND IT STAYS COSMETIC. TraceKnifeView::RequestInspect writes one presentation
+	 * timestamp inside a world subsystem, sends no RPC, takes no cooldown, and is outranked by both
+	 * the stab and the draw in the clip chooser — so a real action interrupts the flourish on the
+	 * frame it is requested. Nothing in the project reads "is inspecting" as a gameplay condition.
+	 */
+	FKey Default_Inspect()          { return EKeys::F; }
 
 	/**
 	 * *** SPEC v28 §10 — "Melee should be bound to right click by default." ***
@@ -286,38 +367,51 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// also what removes "SWAP WEAPON" from the options screen's rebind list — the list is this
 		// table walked in order and nothing else, so there is no second place to go and delete it.
 		//
-		// *** SPEC v29 §5 — THREE WEAPON STATES, AND THE KNIFE IS IN ALL OF THEM. ***
+		// *** SPEC v31 §1 — THREE WEAPONS, THREE KEYS: "1 is pistol, 2 is smg, 3 is knife". ***
 		//
-		//     1  STOW GUNS   guns away, knife only     -> the knife speed boost
-		//     2  PISTOL      pistol out, knife out     -> normal speed
-		//     3  SMG         SMG out, knife out        -> normal speed
+		//     1  PISTOL   -> ETraceEquippedWeapon::Gun     normal speed
+		//     2  SMG      -> ETraceEquippedWeapon::Smg     normal speed
+		//     3  KNIFE    -> ETraceEquippedWeapon::Knife   the v12 §3 speed boost, and a 35% shorter
+		//                                                  pullout (v31 §1, KnifeSwapMultiplier)
 		//
-		// THE TWO ConfigIds ON THE FIRST TWO ROWS ARE NEW STRINGS, AND THAT IS THE POINT. This is the
-		// third time this file has paid that price ("Boost" -> "Parry" in v3, "Parry"/"Pass" ->
-		// "ParryKeys"/"ThrowCore" in v28 §3d) and the argument is unchanged: Save() ->
-		// FlattenToConfig() writes a line for EVERY action, so a returning player's
-		// TraceUserSettings.ini already contains
+		// THIS REPLACES v29 §5's 1 = STOW GUNS / 2 = PISTOL / 3 = SMG. The stow state went away with
+		// the dual-wield revert: with bDualWieldKnife off the knife is a WEAPON you swap to rather
+		// than a permanent off-hand blade, so "put the guns away" and "take the knife out" stopped
+		// being two different sentences. ETraceEquippedWeapon::Knife is the same enumerator it always
+		// was and TraceMelee::ShouldUseKnifeMovementProfile is unchanged — it asks "is a FIREARM out",
+		// which is true of the knife slot for exactly the reason it was true of the stow state.
 		//
-		//     KeyBindings=EquipKnife=One
-		//     KeyBindings=EquipGun=Two
+		// *** ALL THREE ConfigIds ARE NEW STRINGS, AND THAT IS THE MIGRATION. *** This is the fourth
+		// time this file has paid that price ("Boost" -> "Parry" in v3, "Parry"/"Pass" ->
+		// "ParryKeys"/"ThrowCore" in v28 §3d, "EquipKnife"/"EquipGun" -> "StowGuns"/"EquipPistol" in
+		// v29 §5) and the argument is unchanged: Save() -> FlattenToConfig() writes a line for EVERY
+		// action, so a returning player's TraceUserSettings.ini already contains
 		//
-		// and RefreshFromConfig honours both over whatever this table says. Ship the new 1/2/3 layout
-		// under the old ids and a returning player's 1 key still means "the pistol", their 3 key means
-		// nothing at all, and the note reads as un-done on the one machine that matters. Under the NEW
-		// ids their two lines name actions the table does not have, are DISCARDED by the parse loop
-		// exactly as `SwapWeapon=F` is, and all three rows seed their shipped defaults.
+		//     KeyBindings=StowGuns=One          <- or EquipKnife=One, for a v28-or-older file
+		//     KeyBindings=EquipPistol=Two
+		//     KeyBindings=EquipSmg=Three
+		//
+		// and RefreshFromConfig honours all three over whatever this table says. THIS TIME ALL THREE
+		// HAD TO MOVE, not two: every key changes meaning, so leaving any id in place would leave that
+		// row on its v29 key. Ship the new layout under the old ids and a returning player gets three
+		// wrong binds — 1 asks for a stow state that no longer exists, 2 gives the pistol the page
+		// says is on 1, 3 gives the SMG the page says is on 2. Under the new ids all three saved lines
+		// name actions the table does not have, are DISCARDED by the parse loop exactly as
+		// `SwapWeapon=F` is, and all three rows seed their v31 defaults.
 		//
 		// WHAT A RETURNING PLAYER LOSES: a hand-rebound weapon-select key, once, loudly
 		// (Trace.Settings.VerifyBinds prints every dropped line by name).
 		//
-		// HAND-OFF, STATED PLAINLY: Source/Trace/UI/TraceOptionsMenu.cpp has a
-		// `TraceOptionsBindingRowLabel` helper that OVERRIDES the DisplayName of these two rows with
-		// "WEAPON 1 (PISTOL)" / "WEAPON 2 (SMG)" (spec v28 §10's dual-wield remap, which v29 §5
-		// replaces). That file is the crosshair slice's this pass. Until that helper is deleted the
-		// keybind page will mislabel rows 12 and 13; the DisplayNames here are already correct and
-		// deleting the helper is the whole fix.
-		{ ETraceInputAction::EquipKnife,  TEXT("StowGuns"),    TEXT("STOW GUNS (KNIFE ONLY)"), &Default_StowGuns,    &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::EquipGun,    TEXT("EquipPistol"), TEXT("PISTOL"),                 &Default_EquipPistol, &Default_None, ETraceInputStates::Match },
+		// THE ENUMERATOR SPELLINGS STAY. ETraceInputAction is the INDEX into
+		// UTraceUserSettings::Bindings and into this table, matched 1:1 by the static_assert below, so
+		// renaming an enumerator is free but MOVING one is not — and EquipKnife/EquipGun are named by
+		// hand in other slices' files. The MEANING moves; the C++ spelling does not. The ConfigId and
+		// the DisplayName are the two strings that actually reach a player and both are correct here.
+		// The options page takes its label straight from this table (v29 §5 deleted the
+		// `TraceOptionsBindingRowLabel` override that used to sit over it), so these three DisplayName
+		// strings are the whole of what the keybind page shows.
+		{ ETraceInputAction::EquipKnife,  TEXT("KnifeSlot"),  TEXT("KNIFE"),  &Default_EquipKnife,  &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::EquipGun,    TEXT("PistolSlot"), TEXT("PISTOL"), &Default_EquipPistol, &Default_None, ETraceInputStates::Match },
 		// SPEC v14 §5. Same reasoning as the two rows above: the rebind list IS this table, so an
 		// ability the player cannot see here is an ability they cannot rebind however well it is
 		// wired in the controller. The ConfigIds are the two strings ATraceHUD and
@@ -345,7 +439,16 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// dropped the Core and to the carrier by definition — you cannot pull what you are holding. That
 		// is what lets it share a key with the PARRY (Carrying) and refuses to let it share one with FIRE
 		// (also NotCarrying), which is the conflict check earning its keep in both directions.
-		{ ETraceInputAction::PullCore,         TEXT("PullCore"),         TEXT("PULL CORE"),         &Default_PullCore,         &Default_None, ETraceInputStates::NotCarrying },
+		//
+		// *** SPEC v31 §5 MOVED THIS ROW OFF F AND ONTO G, AND MOVED ITS ConfigId WITH IT. ***
+		// "bind the F key to inspect" named the key for the knife flourish, and the two rows cannot
+		// share it (both NotCarrying, so ActionsMayShareAKey says no — one press would fill a pull
+		// ring and start a 3.2 s flourish). "PullCore" -> "PullCoreKey" is the fourth id migration in
+		// this table and it works the way the other three did: a returning player's saved
+		// `PullCore=F` line names an id this table no longer has, is DISCARDED by RefreshFromConfig,
+		// and they land on the shipped G. The full argument, including the one-line revert, is on
+		// Default_PullCore and on ETraceInputAction::Inspect.
+		{ ETraceInputAction::PullCore,         TEXT("PullCoreKey"),      TEXT("PULL CORE"),         &Default_PullCore,         &Default_None, ETraceInputStates::NotCarrying },
 
 		// *** SPEC v28 §10 — THE MELEE BIND, AND THE ONE THING NEITHER §3 NOR §10 COULD SHIP ALONE. ***
 		//
@@ -362,16 +465,44 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// one that would actually have hurt — the pull already rides this button under §10's precedence,
 		// so a second PullCore bind on it would dispatch the same verb twice from one press.
 		{ ETraceInputAction::Melee,            TEXT("Melee"),            TEXT("MELEE"),             &Default_Melee,            &Default_None, ETraceInputStates::NotCarrying },
-		// *** SPEC v29 §5 — "Pressing 2 pulls out pistol, 3 pulls out smg." THE THIRD WEAPON ROW. ***
+		// *** SPEC v31 §1 — "2 is smg." THE THIRD WEAPON ROW, ON THE 2 KEY SINCE v31. ***
 		//
 		// LAST IN THE LIST, hence last on the page, for the reason the PULL CORE row above gives:
 		// ETraceInputAction is append-only, and SMG sitting under MELEE rather than next to PISTOL is
-		// the cosmetic price of never renumbering the runtime table. Its ConfigId has never appeared
-		// in anybody's .ini, so RefreshFromConfig finds no override and seeds the 3 key.
-		{ ETraceInputAction::EquipSmg,         TEXT("EquipSmg"),         TEXT("SMG"),               &Default_EquipSmg,         &Default_None, ETraceInputStates::Match },
+		// the cosmetic price of never renumbering the runtime table.
+		//
+		// ITS ConfigId MOVED TOO ("EquipSmg" -> "SmgSlot"), which v29's version of this comment could
+		// say was unnecessary and v31's cannot. v29 shipped this row on the 3 key under the id
+		// "EquipSmg", so every player who has opened the options screen since now HAS an
+		// `EquipSmg=Three` line and RefreshFromConfig would honour it — leaving the SMG on 3 while the
+		// keybind page, the HUD and this table all said 2. The fresh id drops that line.
+		{ ETraceInputAction::EquipSmg,         TEXT("SmgSlot"),          TEXT("SMG"),               &Default_EquipSmg,         &Default_None, ETraceInputStates::Match },
+
+		// *** SPEC v31 §5 — THE KNIFE FLOURISH, ON F, AS A ROW ON THE KEYBIND PAGE. ***
+		//
+		// "Inspect (3.20 s) is a flourish — bind it to F, as a new rebindable action in the settings
+		// page like every other action." THIS LINE IS THE "like every other action" HALF, and nothing
+		// else is: FTraceOptionsMenu::RebuildRows walks this table in order, so a verb that is not
+		// here is a verb the player can neither see nor rebind, however well it is wired up.
+		//
+		// LAST IN THE LIST, hence last on the page, for the reason every appended row above gives.
+		//
+		// ITS ConfigId HAS NEVER APPEARED IN ANYBODY'S FILE, so — unlike the PULL CORE row directly
+		// above, which had to pay a migration to get OFF F — this one needs none. A new row's id is
+		// safe exactly once, and this is that once.
+		//
+		// `NotCarrying`, and it is enforced at the verb rather than merely declared here:
+		// TraceKnifeView::RequestInspect refuses a carrier outright, because the pack's loadout table
+		// makes the Core a two-hand cradle. So this key is genuinely dead while carrying and may
+		// legally share with a Carrying-only action (the parry, the throw) if a player wants that. It
+		// may NOT share with FIRE, MELEE or PULL CORE, which is the answer we want.
+		{ ETraceInputAction::Inspect,          TEXT("Inspect"),          TEXT("INSPECT KNIFE"),     &Default_Inspect,          &Default_None, ETraceInputStates::NotCarrying },
 	};
 
-	static_assert(static_cast<int32>(ETraceInputAction::Count) == 19,
+	// 19 -> 20 for spec v31 §5's INSPECT row. This assert did exactly the job it was written for: the
+	// enumerator was appended and the table was not, and the build stopped rather than shipping a
+	// table one shorter than the index space that walks it.
+	static_assert(static_cast<int32>(ETraceInputAction::Count) == 20,
 		"ETraceInputAction and TraceInputActions::All() have drifted apart. Add the new action to the "
 		"table above, give it a ConfigId that will never change, and bind it in ATracePlayerController.");
 

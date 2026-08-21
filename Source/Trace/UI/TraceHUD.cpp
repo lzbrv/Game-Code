@@ -2480,7 +2480,22 @@ void ATraceHUD::DrawHealthAndDash()
 
 		if (Deploy > TraceHUDStyle::TimeEpsilon)
 		{
-			const float SwapTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceMelee::GetSwapSeconds());
+			// *** SPEC v31 §1 — ASK FOR THE PULLOUT OF THE WEAPON BEING DRAWN, NOT THE BASE. ***
+			//
+			// The knife's pullout is 35% shorter than every gun's (KnifeSwapMultiplier, spent in
+			// TraceMelee::GetSwapSecondsFor). GetSwapSeconds() is now only the BASE that multiplier
+			// modifies, so dividing by it here made the meter start at 1 - 0.130/0.200 = 0.35 and
+			// fill from 0.35 to 1 on every knife draw — a meter that is already a third full the
+			// instant the draw begins, which reads as "it is nearly done" for the whole 0.13 s.
+			// The gate itself was never wrong; only the picture of it was. Found by the integration
+			// pass, flagged by the §1 slice, whose ownership did not include this file.
+			//
+			// The selector already holds the DESTINATION while the deploy runs — ApplyEquip sets it
+			// and then starts the timer — so bKnife is the weapon being drawn, not the one leaving.
+			const float SwapTotal = FMath::Max(TraceHUDStyle::TimeEpsilon,
+				TraceMelee::GetSwapSecondsFor(bKnife ? ETraceEquippedWeapon::Knife
+				                                     : (bSmgOut ? ETraceEquippedWeapon::Smg
+				                                                : ETraceEquippedWeapon::Gun)));
 			Fraction = FMath::Clamp(1.f - (Deploy / SwapTotal), 0.f, 1.f);
 			WeaponColor = TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
 			StatusText = FString::Printf(TEXT("%s  DRAWING"), *WeaponText);

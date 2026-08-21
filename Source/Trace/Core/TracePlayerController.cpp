@@ -33,6 +33,7 @@
 #include "Misc/Parse.h"                    // FParse::Param
 #include "UObject/Package.h"               // LoadObject / DuplicateObject for the input assets
 #include "Gameplay/TraceCore.h"            // spec v25 §7 — the right-mouse pull probe's second rung
+#include "Gameplay/TraceKnifeView.h"       // TraceKnifeView::RequestInspect (spec v31 §5 — the F bind)
 #include "Gameplay/TraceMelee.h"           // TraceMelee::RequestEquipIfDifferent (spec v13 §2)
 #include "Gameplay/TraceParry.h"           // spec v25 §7 — Trace.Input.VerifyRightMouse's carrier-only proof
 #include "Gameplay/TraceWeaponComponent.h" // RequestReload (spec v16 §1 — the R bind)
@@ -516,6 +517,14 @@ bool ATracePlayerController::TryAdoptInputAssets()
 		// /Game/Trace/Input predates v28 is MISSING it, TryAdoptInputAssets rejects the whole set, and
 		// the C++ fallback below builds an identical action, so the game plays the same either way.
 		{ &IA_Melee,            TEXT("IA_Melee"),            EInputActionValueType::Boolean, Highest },
+		// SPEC v31 §5 — the knife flourish. Same story as IA_PullCore and IA_Melee above: every
+		// checkout in existence is MISSING IA_Inspect.uasset until Scripts/generate-input-assets.py
+		// is re-run, so TryAdoptInputAssets rejects the whole set and ConstructInputDataInCode builds
+		// an identical one. *** THAT IS THE SHIPPED STATE FOR THIS PASS AND IT IS DELIBERATE: ***
+		// Content/Trace/Input/** is the §1 revert slice's ownership and it was being edited during
+		// this pass, so no .uasset was generated here. The game plays identically either way — the
+		// fallback is validated against this very table — and the log says which path it took.
+		{ &IA_Inspect,          TEXT("IA_Inspect"),          EInputActionValueType::Boolean, Highest },
 	};
 
 	// Resolve everything into a scratch list FIRST. Nothing is written to a member until the whole
@@ -640,7 +649,10 @@ void ATracePlayerController::ConstructInputDataInCode()
 		// which deleted IA_SwapWeapon. Boolean like every other button here.
 		IA_EquipKnife = MakeAction(TEXT("IA_EquipKnife"), EInputActionValueType::Boolean);
 		IA_EquipGun   = MakeAction(TEXT("IA_EquipGun"),   EInputActionValueType::Boolean);
-		// SPEC v29 §5 — the third weapon bind. 1 stows the guns, 2 is the pistol, 3 is the SMG.
+		// SPEC v29 §5 added the third weapon bind; SPEC v31 §1 re-lays the three keys as 1 = PISTOL,
+		// 2 = SMG, 3 = KNIFE. The ASSET NAMES keep their v13 spellings because ETraceInputAction does
+		// — IA_EquipKnife is the knife again, IA_EquipGun is the pistol, IA_EquipSmg is the SMG, and
+		// which KEY each sits on comes from TraceInputActions::All(), never from this block.
 		IA_EquipSmg   = MakeAction(TEXT("IA_EquipSmg"),   EInputActionValueType::Boolean);
 		// SPEC v14 §5 — the ability binds.
 		IA_Ability          = MakeAction(TEXT("IA_Ability"),          EInputActionValueType::Boolean);
@@ -652,6 +664,10 @@ void ATracePlayerController::ConstructInputDataInCode()
 		IA_PullCore         = MakeAction(TEXT("IA_PullCore"),         EInputActionValueType::Boolean);
 		// SPEC v28 §10 — the melee bind (right mouse by default). Boolean like every other button.
 		IA_Melee            = MakeAction(TEXT("IA_Melee"),            EInputActionValueType::Boolean);
+		// SPEC v31 §5 — the knife flourish ("bind the F key to inspect"). Boolean like every other
+		// button. A SEPARATE action from IA_Melee on purpose: two actions is what produces two
+		// rebindable rows, and the flourish must be rebindable independently of the swing.
+		IA_Inspect          = MakeAction(TEXT("IA_Inspect"),          EInputActionValueType::Boolean);
 
 		// Cumulative accumulation is REQUIRED for opposing keys to cancel. UInputAction defaults to
 		// TakeHighestAbsoluteValue, and UEnhancedPlayerInput::ProcessActionMappingEvent merges with
@@ -845,6 +861,19 @@ void ATracePlayerController::ApplyControlSettings()
 	// precedence rule, which is a state test inside TraceMelee::HandleMeleeInput, not a mapping.
 	// So exactly one action maps the button. Trace.Input.VerifyRightMouse asserts that.
 	MapButton(IA_Melee,            ETraceInputAction::Melee);
+	// *** SPEC v31 §5 — "bind the F key to inspect", through the same KeyFor/MapButton path. ***
+	//
+	// Which is the whole reason the flourish is a table row rather than a hardcoded EKeys::F in this
+	// file: it is on the settings page, it is rebindable, and an action the player deliberately
+	// UNBINDS gets no mapping at all rather than a dead one.
+	//
+	// F IS FREE HERE BECAUSE THE CORE PULL VACATED IT. Default_PullCore returns EKeys::G as of this
+	// pass, with the "PullCore" -> "PullCoreKey" ConfigId migration that stops a returning player's
+	// saved file putting the pull straight back onto the key the flourish just took. Two actions on
+	// one key would not crash — Enhanced Input maps them independently and both handlers would fire —
+	// it would simply mean one press filling a pull ring AND starting a 3.2 s flourish, which is the
+	// "two dispatches of one press" the Melee row above refuses for the same reason.
+	MapButton(IA_Inspect,          ETraceInputAction::Inspect);
 
 	// The context is already registered by the time a settings change arrives, and Enhanced Input
 	// caches the resolved key->action table. Without this the new bindings sit in the context and
@@ -1005,6 +1034,13 @@ void ATracePlayerController::SetupInputComponent()
 	EIC->BindAction(IA_Melee, ETriggerEvent::Started,   this, &ATracePlayerController::OnMeleeStarted);
 	EIC->BindAction(IA_Melee, ETriggerEvent::Completed, this, &ATracePlayerController::OnMeleeCompleted);
 	EIC->BindAction(IA_Melee, ETriggerEvent::Canceled,  this, &ATracePlayerController::OnMeleeCompleted);
+
+	// SPEC v31 §5 — the knife flourish. STARTED ONLY, and that is a decision rather than an omission:
+	// every other action in this file that binds a release owns HELD state a dropped release would
+	// strand (the pull's ring, fire, the parry's shared-key hold). The flourish owns none — it is a
+	// one-shot 3.20 s sequence that ends because the SEQUENCE ends, and a real action outranks it in
+	// the clip chooser on the frame it happens. There is nothing for a release handler to cancel.
+	EIC->BindAction(IA_Inspect, ETriggerEvent::Started, this, &ATracePlayerController::OnInspectStarted);
 
 	// Spec v13 §2, direct select — and, since spec v15 §5 deleted IA_SwapWeapon, the only weapon
 	// binds there are. PRESS EDGE ONLY. Every other button in this class binds Completed and
@@ -1930,6 +1966,41 @@ void ATracePlayerController::OnMeleeStarted()
 	}
 }
 
+// -------------------------------------------------------------------------------------------
+// SPEC v31 §5 — THE KNIFE FLOURISH (F by default)
+//
+// Three lines, for the same reason OnMeleeStarted is three lines: everything interesting —
+// every refusal, the "already flourishing" case, the interaction with the stab and the draw —
+// is in TraceKnifeView::RequestInspect. A second opinion here about whether a flourish is legal
+// is the mistake OnParryStarted's comment spends a paragraph refusing to make.
+//
+// *** IT IS COSMETIC, AND THE PROOF IS THAT THIS HANDLER TOUCHES NOTHING ELSE. *** No RPC, no
+// weapon component, no movement profile, no replicated state. It is not in the re-delivery list
+// in DeliverHeldInputsAfterMenu either, and deliberately: that list exists for HOLD-shaped
+// actions whose release can be eaten by a menu, and a player closing the pause menu with F down
+// should not be handed a flourish they pressed for a different reason a minute ago.
+// -------------------------------------------------------------------------------------------
+
+void ATracePlayerController::OnInspectStarted()
+{
+	// Refused while a menu owns input — the same gate as every other press in this file.
+	if (bGameInputSuppressed)
+	{
+		return;
+	}
+
+	if (ATraceCharacter* TraceChar = GetLivingCharacter())
+	{
+		const bool bStarted = TraceKnifeView::RequestInspect(TraceChar);
+
+		if (InputLogLevel() >= 1)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("INPUT Inspect pressed -> %s"),
+				bStarted ? TEXT("FLOURISH") : TEXT("refused"));
+		}
+	}
+}
+
 void ATracePlayerController::OnMeleeCompleted()
 {
 	// The RELEASE is a cancel and is delivered unconditionally, through GetPawn rather than
@@ -1944,34 +2015,41 @@ void ATracePlayerController::OnMeleeCompleted()
 }
 
 // =================================================================================================
-// SPEC v29 §5 — THE THREE WEAPON KEYS. ONE TRANSLATION FROM A KEY TO A WEAPON, AND IT IS HERE.
+// SPEC v31 §1 — THE THREE WEAPON KEYS. ONE TRANSLATION FROM A KEY TO A WEAPON, AND IT IS HERE.
 //
-//     1  STOW GUNS  -> ETraceEquippedWeapon::Knife  guns away, knife only, the v12 §3 speed boost
-//     2  PISTOL     -> ETraceEquippedWeapon::Gun
-//     3  SMG        -> ETraceEquippedWeapon::Smg
+//     1  PISTOL  -> ETraceEquippedWeapon::Gun
+//     2  SMG     -> ETraceEquippedWeapon::Smg
+//     3  KNIFE   -> ETraceEquippedWeapon::Knife   guns away, the v12 §3 speed boost, and a pullout
+//                                                 35% shorter than a gun's (KnifeSwapMultiplier)
 //
-// The knife is in hand in all three (spec v28 §10's dual wield is untouched); stowing is about the
-// GUNS. v28 §10 could only reach three weapons with two keys by remapping them inside
-// TraceMelee::RequestEquipIfDifferent — that remap is DELETED, because a second translation able to
-// disagree with this one is exactly how "pressing 1 does the wrong thing" happens.
+// *** THIS REPLACES v29 §5's 1 = STOW GUNS / 2 = PISTOL / 3 = SMG. *** The stow state went away with
+// the dual-wield revert: with UTraceMeleeSettings::bDualWieldKnife off the knife is a weapon you
+// swap to, so "put the guns away" and "take the knife out" are one action again and one key.
 //
-// The two older handler names keep their v13 spellings because ETraceInputAction does; see that
-// enum's comment. OnEquipKnifeStarted IS the stow key.
+// NOTHING IN THIS FUNCTION TRIPLET DECIDES A KEY. Each handler is bound to an IA_ whose key comes
+// from TraceInputActions::All() through ApplyControlSettings, so the LAYOUT lives in one table in
+// Settings/TraceUserSettings.cpp and this file only says which weapon each action means. v28 §10
+// reached three weapons with two keys by remapping inside TraceMelee::RequestEquipIfDifferent; v29
+// §5 deleted that remap and the note is still there, because a second translation able to disagree
+// with this one is exactly how "pressing 1 does the wrong thing" happens. Do not add one back.
+//
+// The handler names keep their v13 spellings because ETraceInputAction does; see that enum's
+// comment. OnEquipKnifeStarted is the KNIFE key again, which it last was in v28.
 // =================================================================================================
 
 void ATracePlayerController::OnEquipKnifeStarted()
 {
-	HandleDirectEquip(ETraceEquippedWeapon::Knife, TEXT("StowGuns"));
+	HandleDirectEquip(ETraceEquippedWeapon::Knife, TEXT("KnifeSlot"));
 }
 
 void ATracePlayerController::OnEquipGunStarted()
 {
-	HandleDirectEquip(ETraceEquippedWeapon::Gun, TEXT("EquipPistol"));
+	HandleDirectEquip(ETraceEquippedWeapon::Gun, TEXT("PistolSlot"));
 }
 
 void ATracePlayerController::OnEquipSmgStarted()
 {
-	HandleDirectEquip(ETraceEquippedWeapon::Smg, TEXT("EquipSmg"));
+	HandleDirectEquip(ETraceEquippedWeapon::Smg, TEXT("SmgSlot"));
 }
 
 void ATracePlayerController::OnReloadStarted()
@@ -2553,6 +2631,14 @@ namespace TracePlayerControllerInput
 			// Scripts/generate-input-assets.py" out loud rather than letting the 3 key be silently
 			// absent from the assets while the C++ fallback quietly carries it.
 			{ TEXT("IA_EquipSmg"),         EInputActionValueType::Boolean, Highest },
+			// SPEC v31 §5 — the knife flourish's own action. A checkout whose /Game/Trace/Input
+			// predates v31 fails this row, which is the whole point: it says "re-run
+			// Scripts/generate-input-assets.py" out loud rather than letting the F bind be silently
+			// absent from the assets while the C++ fallback quietly carries it. The integration pass
+			// added this row: the §5 slice deliberately did NOT regenerate the assets (Content/Trace/
+			// Input was §1's ownership and being rewritten at the time), so for one pass the shipped
+			// asset set was a row short of the table and the whole set was rejected.
+			{ TEXT("IA_Inspect"),          EInputActionValueType::Boolean, Highest },
 		};
 
 		int32 Failures = 0;
@@ -2650,6 +2736,11 @@ namespace TracePlayerControllerInput
 			// table is a copy of that order rather than a sort, and Enhanced Input merges two
 			// mappings of one action with `>=`, so on a tie the last one added wins).
 			{ TEXT("IA_EquipSmg"),         ETraceInputAction::EquipSmg,         FKey(),         0, 0 },
+			// SPEC v31 §5 — the knife flourish, on the F that IA_PullCore vacated for it. LAST,
+			// because generate-input-assets.py writes it last and this table is compared to the ASSET
+			// index by index. Its expected key is read live from TraceInputActions::Info(Inspect)
+			// like every row above, so moving the default is one edit in the action table, never two.
+			{ TEXT("IA_Inspect"),          ETraceInputAction::Inspect,          FKey(),         0, 0 },
 		};
 
 		const int32 ExpectedMappingCount = static_cast<int32>(UE_ARRAY_COUNT(ExpectedMappings));
@@ -3236,10 +3327,17 @@ void ATracePlayerController::ServerRequestRespawn_Implementation()
 //
 // WHY THIS COMMAND EXISTS. §2 is three claims, and only the first is visible in a bind list:
 //
-//   1. 1 equips the knife and 2 equips the gun.
-//   2. They are DIRECT SELECT, not a toggle — 1 pressed twice leaves the knife out, it does not
-//      put it away again.
-//   3. Pressing 1 with the knife already out does NOT re-trigger the 0.2 s pullout.
+//   1. the knife key equips the knife and the gun key equips the gun.
+//   2. They are DIRECT SELECT, not a toggle — the knife key pressed twice leaves the knife out, it
+//      does not put it away again.
+//   3. Pressing the knife key with the knife already out does NOT re-trigger the pullout.
+//
+// *** THE DIGITS MOVED TWICE AND THIS HARNESS NEVER NAMED THEM, WHICH IS WHY IT SURVIVED BOTH. ***
+// v13 §2 shipped 1 = knife / 2 = gun; v29 §5 made 1 the stow and 2 the pistol; v31 §1 makes it
+// 1 = PISTOL, 2 = SMG, 3 = KNIFE. Every press below is addressed by ETraceInputAction and resolved
+// through UTraceUserSettings, so the claims above are about the BINDS rather than about the keys and
+// none of the three layouts required an edit here. The pullout LENGTHS did require one — see the
+// note on the wait constants inside the tick.
 //
 // The third is the one that cannot be seen by looking, and it is the one the shipped weapon
 // component does not give for free: UTraceWeaponComponent::RequestEquip restarts the pullout on a
@@ -3257,7 +3355,7 @@ void ATracePlayerController::ServerRequestRespawn_Implementation()
 //       THE RED ARM. Identical keys, identical sequence, identical assertions — but the handler is
 //       switched to the UNGUARDED equip (UTraceWeaponComponent::RequestEquip, which re-anchors the
 //       pullout on a redundant request BY DESIGN). Steps 3 and 5 fail on it: the redundant press
-//       restarts the 0.2 s pullout, which is precisely the behaviour §2 asked to be rid of.
+//       restarts the pullout, which is precisely the behaviour §2 asked to be rid of.
 //       Same build, same run, same key, same binding, same handler, ONE GATE DIFFERENT.
 //
 //       SPEC v15 §5 IMPROVED THIS ARM BY DELETING SOMETHING. The old red arm sent the presses to
@@ -3416,7 +3514,9 @@ namespace
 		// run cannot leave the build behaving like the bug it was demonstrating.
 		GTraceForceUnguardedEquip = bToggleArm;
 
-		// Both arms press the SAME key: spec v13 §2's "1".
+		// Both arms press the SAME key: the KNIFE bind, which spec v13 §2 put on "1" and spec v31 §1
+		// moves to "3". Named by ACTION and never by key, so a layout change is not a fixture change
+		// — V13PressBoundKey looks the live key up out of UTraceUserSettings.
 		const ETraceInputAction KnifeAction = ETraceInputAction::EquipKnife;
 		const TCHAR* const KnifeLabel = bToggleArm ? TEXT("EquipKnife [RED ARM: unguarded]") : TEXT("EquipKnife");
 
@@ -3486,27 +3586,48 @@ namespace
 				const bool bKnife = TraceMelee::IsKnifeEquipped(Pawn);
 				const float Deploy = TraceMelee::GetDeployRemaining(Pawn);
 
+				// =================================================================================
+				// *** SPEC v31 §1 — EVERY WAIT BELOW IS A FRACTION OF THE PULLOUT IT WAITS ON. ***
+				// =================================================================================
+				//
+				// They used to be absolute seconds chosen against a single 0.2 s pullout that every
+				// weapon shared: 0.35, 0.10, 0.08, 0.20. v31 §1 makes the KNIFE's pullout 0.65 of the
+				// base — 0.130 s at the shipped tuning — and three of those four constants stop
+				// meaning what their comments claim the moment it does. Step 1's 0.10 s "far short of
+				// the pullout" would land 0.030 s from the end of a 0.130 s window, and step 2's
+				// 0.08 s on top would land PAST it, so the probe would be asserting "a pullout is
+				// running" against one that had already finished — flaky at this tuning and a
+				// permanent failure the moment anybody shortens the knife further.
+				//
+				// Derived rather than re-chosen, so the same fractions hold at any tuning. THIS IS
+				// THE SPEC'S "BEWARE PER-FRAME READERS OF FAST QUANTITIES" WARNING IN ITS SCHEDULING
+				// FORM: a fixture whose sample instants are constants and whose subject is a knob
+				// will eventually sample the wrong side of the event it is trying to see.
+				const double GunPullout   = static_cast<double>(TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Gun));
+				const double KnifePullout = static_cast<double>(TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Knife));
+
 				switch (Probe->Step)
 				{
 				case 0:
-					// Baseline: put the GUN in hand with the "2" key, so the run starts from a known
-					// weapon whatever the pawn spawned with.
+					// Baseline: put the PISTOL in hand with the "1" key (v31 §1 moved it there), so
+					// the run starts from a known weapon whatever the pawn spawned with.
 					V13PressBoundKey(World, ETraceInputAction::EquipGun, TEXT("EquipGun"));
-					// 0.35 s: comfortably clear of the 0.2 s pullout the baseline press costs.
-					Probe->Advance(Now, 0.35);
+					// 1.75x the gun pullout: comfortably clear of the pullout this press costs.
+					Probe->Advance(Now, GunPullout * 1.75);
 					break;
 
 				case 1:
 					if (Now >= Probe->NextStepTime)
 					{
-						Probe->Check(!bKnife, TEXT("step 1: '2' put the GUN in hand"));
+						Probe->Check(!bKnife, TEXT("step 1: '1' put the PISTOL in hand"));
 						Probe->Check(FMath::IsNearlyZero(Deploy, 1e-3f),
 							FString::Printf(TEXT("step 1: baseline pullout finished (remaining=%.3f)"), Deploy));
 						Probe->CountAtPress = PressCount;
 						V13PressBoundKey(World, KnifeAction, KnifeLabel);
-						// 0.10 s: long enough for the press to be delivered and the equip applied, far
-						// short of the 0.2 s pullout it starts — step 2 must land MID-pullout.
-						Probe->Advance(Now, 0.10);
+						// HALF the KNIFE's pullout: long enough for the press to be delivered and the
+						// equip applied, and half a window short of the end, so step 2 lands
+						// MID-pullout at any value of KnifeSwapMultiplier.
+						Probe->Advance(Now, KnifePullout * 0.5);
 					}
 					break;
 
@@ -3516,17 +3637,20 @@ namespace
 						Probe->Check(PressCount > Probe->CountAtPress,
 							FString::Printf(TEXT("step 2: the press REACHED the handler (count %d -> %d) — without this the rest of this test would be vacuous"),
 								Probe->CountAtPress, PressCount));
-						Probe->Check(bKnife, TEXT("step 2: '1' put the KNIFE in hand"));
+						Probe->Check(bKnife, TEXT("step 2: '3' put the KNIFE in hand"));
 						Probe->Check(Deploy > 0.f,
-							FString::Printf(TEXT("step 2: a real pullout started (remaining=%.3f)"), Deploy));
+							FString::Printf(TEXT("step 2: a real pullout started (remaining=%.3f, the v31 s1 knife pullout is %.3fs)"),
+								Deploy, KnifePullout));
 						Probe->DeployBeforeRedundant = Deploy;
 						// THE MEASUREMENT. Press again while the knife's own pullout is still
 						// running. If the request goes through, DeployEndServerTime is re-anchored to
-						// now and the remaining time JUMPS BACK UP to the full 0.2 s.
+						// now and the remaining time JUMPS BACK UP to the full knife pullout.
 						Probe->CountAtPress = PressCount;
 						V13PressBoundKey(World, KnifeAction, KnifeLabel);
-						// 0.08 s: still inside the pullout, and enough decay to be measurable.
-						Probe->Advance(Now, 0.08);
+						// A THIRD of the knife's pullout: this lands at ~0.83 of the window, still
+						// inside it, with measurable decay since step 2's sample. An absolute 0.08 s
+						// used to mean the same thing against a 0.2 s pullout and no longer does.
+						Probe->Advance(Now, KnifePullout / 3.0);
 					}
 					break;
 
@@ -3540,11 +3664,11 @@ namespace
 						Probe->Check(Deploy < Probe->DeployBeforeRedundant,
 							FString::Printf(TEXT("step 3: pullout NOT restarted — remaining fell %.3f -> %.3f"),
 								Probe->DeployBeforeRedundant, Deploy));
-						// 0.20 s, up from the 0.12 the absolute schedule allowed: step 4 asserts the
-						// pullout has RUN OUT, and the pullout is 0.2 s from the step-2 press, so 0.12
-						// only ever cleared it because the old deadlines were measured from a common
-						// origin. From here it has to be a full pullout plus slack.
-						Probe->Advance(Now, 0.20);
+						// A WHOLE KNIFE PULLOUT PLUS SLACK, because step 4 asserts the pullout has RUN
+						// OUT and the clock it must outlast started at the step-2 press, not at a
+						// common origin — which is what the old absolute 0.12 got wrong and 0.20 only
+						// papered over. Expressed relative for the reason at the top of this switch.
+						Probe->Advance(Now, KnifePullout + 0.07);
 					}
 					break;
 
@@ -3554,9 +3678,14 @@ namespace
 						Probe->Check(FMath::IsNearlyZero(Deploy, 1e-3f),
 							FString::Printf(TEXT("step 4: pullout ran to completion (remaining=%.3f)"), Deploy));
 						// And again with the weapon fully up: still nothing.
+						//
+						// HALF THE KNIFE PULLOUT, not a flat 0.10 s. Step 5 asserts that a redundant
+						// press starts NO pullout; the wait must therefore be SHORTER than the
+						// pullout a bug would start, or the bug's pullout would have expired before
+						// the assertion looked and the check would pass vacuously.
 						Probe->CountAtPress = PressCount;
 						V13PressBoundKey(World, KnifeAction, KnifeLabel);
-						Probe->Advance(Now, 0.10);
+						Probe->Advance(Now, KnifePullout * 0.5);
 					}
 					break;
 
@@ -3570,16 +3699,18 @@ namespace
 						Probe->Check(FMath::IsNearlyZero(Deploy, 1e-3f),
 							FString::Printf(TEXT("step 5: NO new pullout from the redundant press (remaining=%.3f)"), Deploy));
 						V13PressBoundKey(World, ETraceInputAction::EquipGun, TEXT("EquipGun"));
-						Probe->Advance(Now, 0.10);
+						// HALF the GUN pullout — step 6 must land inside it to see it at all.
+						Probe->Advance(Now, GunPullout * 0.5);
 					}
 					break;
 
 				case 6:
 					if (Now >= Probe->NextStepTime)
 					{
-						Probe->Check(!bKnife, TEXT("step 6: '2' switched back to the GUN"));
+						Probe->Check(!bKnife, TEXT("step 6: '1' switched back to the PISTOL"));
 						Probe->Check(Deploy > 0.f,
-							FString::Printf(TEXT("step 6: a genuine change DOES cost a pullout (remaining=%.3f)"), Deploy));
+							FString::Printf(TEXT("step 6: a genuine change DOES cost a pullout (remaining=%.3f, the unchanged gun pullout is %.3fs)"),
+								Deploy, GunPullout));
 						Probe->Advance(Now, 0.0);
 					}
 					break;
@@ -3593,8 +3724,9 @@ namespace
 					if (Probe->Failures == 0)
 					{
 						UE_LOG(LogTraceGame, Display,
-							TEXT("[V13.Hotkeys] RESULT: PASS — %d checks (arm=%s). 1 = knife, 2 = gun, direct select, "
-							     "every press verified to have reached the handler, and a redundant press costs no pullout."),
+							TEXT("[V13.Hotkeys] RESULT: PASS — %d checks (arm=%s). The weapon binds are DIRECT SELECT "
+							     "(v31 s1 layout: 1 pistol, 2 SMG, 3 knife), every press verified to have reached the "
+							     "handler, and a redundant press costs no pullout."),
 							Probe->Passes, Probe->bToggleArm ? TEXT("unguarded") : TEXT("direct select"));
 					}
 					else

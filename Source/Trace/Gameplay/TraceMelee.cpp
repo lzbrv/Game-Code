@@ -49,7 +49,21 @@ static TAutoConsoleVariable<float> CVarKnifeCooldown(
 
 static TAutoConsoleVariable<float> CVarKnifeSwapSeconds(
 	TEXT("Trace.Knife.SwapSeconds"), -1.f,
-	TEXT("Override for the pullout time, both directions. Negative defers to UTraceMeleeSettings."), ECVF_Default);
+	TEXT("Override for the BASE pullout time — a gun's, and the number the knife's is relative to. "
+	     "Negative defers to UTraceMeleeSettings."), ECVF_Default);
+
+/**
+ * SPEC v31 §1. The knife's share of the base pullout. Negative defers to the setting.
+ *
+ * A MULTIPLIER AND NOT A SECOND SECONDS VALUE, for the reason UTraceMeleeSettings::KnifeSwapMultiplier
+ * gives at length: the standing rule is that a value modifying a base is stored relative to it. Set
+ * this to 1 to feel the pre-v31 pullout live without editing anything, which is the A/B this knob is
+ * really for — `Trace.Knife.SwapMultiplier 1` then `Trace.Knife.SwapMultiplier -1` to give it back.
+ */
+static TAutoConsoleVariable<float> CVarKnifeSwapMultiplier(
+	TEXT("Trace.Knife.SwapMultiplier"), -1.f,
+	TEXT("Spec v31 §1. Override for the KNIFE's share of the base pullout (0.65 ships = 35% shorter; "
+	     "1 = the pre-v31 single number). Negative defers to UTraceMeleeSettings."), ECVF_Default);
 
 static TAutoConsoleVariable<float> CVarKnifeRange(
 	TEXT("Trace.Knife.Range"), -1.f,
@@ -237,6 +251,26 @@ float TraceMelee::GetSwingCooldownSeconds()
 float TraceMelee::GetSwapSeconds()
 {
 	return ResolveFloat(CVarKnifeSwapSeconds, UTraceMeleeSettings::Get().SwapSeconds, 0.f, 2.f);
+}
+
+float TraceMelee::GetKnifeSwapMultiplier()
+{
+	// Clamped to the property's own [0.05, 1.0]. The upper bound of 1 is deliberate: this knob may
+	// make the knife FASTER than the base and never slower, so "keep the pullout time for the guns
+	// the same" cannot be undone by a typo that lengthens one weapon past the number every other
+	// weapon shares. The lower bound keeps a pullout that a player can still see.
+	return ResolveFloat(CVarKnifeSwapMultiplier, UTraceMeleeSettings::Get().KnifeSwapMultiplier, 0.05f, 1.f);
+}
+
+float TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon Desired)
+{
+	// SPEC v31 §1. THE ONE PLACE THE 35% IS SPENT.
+	//
+	// Asked on the DESTINATION. TraceIsFirearm is the existing one definition of "is this a gun", the
+	// same predicate CanFire and ApplyEquip's magazine exchange ask, so a fourth weapon added later
+	// inherits the right answer here without a second list to update.
+	const float Base = GetSwapSeconds();
+	return TraceIsFirearm(Desired) ? Base : (Base * GetKnifeSwapMultiplier());
 }
 
 float TraceMelee::GetSwingWindupSeconds()
@@ -1994,10 +2028,18 @@ namespace TraceMeleeConsole
 				TraceMelee::GetBackstabDamage(), Table.BackstabDamage,
 				TraceMelee::GetFrontDamage(), Table.FrontDamage,
 				TraceMelee::GetBackstabHalfAngleDegrees(), Table.BackstabHalfAngleDegrees);
-			UE_LOG(LogTraceGame, Display, TEXT("KNIFE timing      : swing every %.3fs (table %.3f) | pullout %.3fs (table %.3f) | windup %.3fs | anim %.3fs"),
+			UE_LOG(LogTraceGame, Display, TEXT("KNIFE timing      : swing every %.3fs (table %.3f) | windup %.3fs | anim %.3fs"),
 				TraceMelee::GetSwingCooldownSeconds(), Table.SwingCooldownSeconds,
-				TraceMelee::GetSwapSeconds(), Table.SwapSeconds,
 				TraceMelee::GetSwingWindupSeconds(), TraceMelee::GetSwingAnimSeconds());
+			// SPEC v31 §1. THE TWO PULLOUTS AND THE RELATIONSHIP BETWEEN THEM, ON ONE LINE, because the
+			// whole point of storing the knife's as a multiplier is that the relationship is the design
+			// and the seconds are a consequence. Printing 0.130 on its own would invite somebody to
+			// "fix" it back to 0.2.
+			UE_LOG(LogTraceGame, Display, TEXT("PULLOUT (v31 s1)  : gun %.3fs (table SwapSeconds %.3f) | knife %.3fs = base x %.3f (table KnifeSwapMultiplier %.3f) -> %.0f%% shorter"),
+				TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Gun), Table.SwapSeconds,
+				TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Knife),
+				TraceMelee::GetKnifeSwapMultiplier(), Table.KnifeSwapMultiplier,
+				100.f * (1.f - TraceMelee::GetKnifeSwapMultiplier()));
 			UE_LOG(LogTraceGame, Display, TEXT("KNIFE reach       : %.0fuu over %.0fdeg in %d samples"),
 				TraceMelee::GetSwingRangeUU(), TraceMelee::GetSwingArcDegrees(), TraceMelee::GetSwingSamples());
 			// The movement numbers are read back out of UTraceSettings, where the movement component
@@ -2047,7 +2089,7 @@ namespace TraceMeleeConsole
 			// because the switch no longer decides it.
 			UE_LOG(LogTraceGame, Display,
 				TEXT("  movement profile : v12 s3 (+%.0f percent ground, %.0f uu/s -> %.0f uu/s) WHILE NO GUN IS OUT. ")
-				TEXT("Key 1 stows the guns and buys it; keys 2 and 3 take it away (spec v29 s5)."),
+				TEXT("v31 s1: key 3 takes the KNIFE and buys it; keys 1 and 2 take a gun and take it away."),
 				100.f * (Move.KnifeMoveSpeedMultiplier - 1.f), Move.WalkSpeed,
 				Move.WalkSpeed * Move.KnifeMoveSpeedMultiplier);
 			UE_LOG(LogTraceGame, Display, TEXT("=========================================="));
@@ -2056,37 +2098,42 @@ namespace TraceMeleeConsole
 
 
 // =================================================================================================
-// *** SPEC v29 §5 — `Trace.Stow.Verify`. THREE WEAPON STATES, AND THE KNIFE IS IN ALL OF THEM. ***
+// *** SPEC v31 §1 — `Trace.Weapon.Verify`. THREE WEAPON SLOTS: 1 PISTOL, 2 SMG, 3 KNIFE. ***
 // =================================================================================================
 //
-// The owner's words, verbatim: "Pressing one stows guns, and then you get the knife boost speed from
-// before. If you have a gun out, you do not get the knife boost speed. Pressing 2 pulls out pistol, 3
-// pulls out smg. Both of these actions keep the knife out."
+// The owner's words, verbatim: "Revert the knife changes (no dual wielding). Reduce the pullout time
+// when swapping to knife by 35%. Keep the pullout time for the guns the same. 1 is pistol, 2 is smg,
+// 3 is knife."
 //
-// FOUR CLAIMS, AND EACH ONE IS A LINE BELOW:
-//   1. the KEYBINDS are 1 / 2 / 3, on three separate rebindable actions, under the NEW ConfigIds
-//      (which is the migration — a returning player's `EquipKnife=One` line has to be dropped, or the
-//      layout lands for nobody who has ever opened the options screen);
-//   2. each state is REACHABLE — pressing the verb actually puts the selector where it says;
-//   3. the SPEED BOOST is paid in the stowed state and in neither gun state, and it is paid as a
+// IT WAS `Trace.Stow.Verify` AND THE OLD NAME STILL WORKS — see the second registration at the
+// bottom. v29 §5's stow state is gone with the dual-wield revert, so the name was a lie, but scripts
+// and habits are not worth breaking over a noun.
+//
+// FIVE CLAIMS, AND EACH ONE IS A LINE BELOW:
+//   1. the KEYBINDS are 1 = PISTOL, 2 = SMG, 3 = KNIFE, on three separate rebindable actions, under
+//      the NEW ConfigIds — which IS the migration. A returning player's `StowGuns=One` /
+//      `EquipPistol=Two` / `EquipSmg=Three` lines all have to be dropped, or the layout lands for
+//      nobody who has ever opened the options screen and they keep three dead binds;
+//   2. each slot is REACHABLE — pressing the verb actually puts the selector where it says;
+//   3. the SPEED BOOST is paid in the KNIFE slot and in neither gun slot, and it is paid as a
 //      MULTIPLIER on the base walk speed rather than as an absolute (the standing rule: a value that
 //      modifies a base moves when the base moves);
-//   4. MELEE STILL WORKS IN ALL THREE. Demo 24 made the knife permanent and v29 §5 does not change
-//      that — stowing is about the GUNS.
+//   4. the PULLOUT is 35% shorter for the knife and UNCHANGED for both guns, and it is likewise
+//      measured as a RATIO of the base rather than against a hard-coded 0.130 s;
+//   5. MELEE follows the switch. With bDualWieldKnife OFF (the v31 shipped position) the blade is in
+//      hand only in the knife slot, which is the v10 §1 model; with it ON the blade is in hand in all
+//      three. Asserted against TraceMelee::IsDualWieldEnabled() rather than against one of the two,
+//      so this harness stays honest in both positions instead of going red on the arm nobody is
+//      running.
 //
 // SYNCHRONOUS, and that is a property of the thing under test rather than a shortcut: on the
 // authority UTraceWeaponComponent::RequestEquip calls ApplyEquip inline, and ApplyEquip calls
 // RefreshMovementProfile inline, so the selector, the movement bit and GetMaxSpeed() are all correct
-// before this function's next line. The 0.2 s pullout runs on its own clock afterwards and gates
-// FIRING, not the selector — so a harness that waited for it would be waiting for something it does
-// not assert.
-//
-// IT IS EXPECTED TO FAIL LOUDLY, TODAY, ON CLAIM 2 AND THEREFORE ON 3. Two guards in
-// UTraceWeaponComponent (another slice's file this pass) still refuse ETraceEquippedWeapon::Knife
-// outright while dual-wield is on — RequestEquip's "SUCCEEDS AS A NO-OP" early-out and
-// ServerRequestEquip_Implementation's matching refusal. Both were right when no pawn could ever be in
-// the Knife state; under v29 §5 the Knife state IS the stowed state. This command is the red arm for
-// that hand-off: it goes green the moment those two blocks are removed, and until then it names them.
+// before this function's next line. The pullout runs on its own clock afterwards and gates FIRING,
+// not the selector — which is exactly why claim 4 reads GetDeployRemaining() IMMEDIATELY after the
+// equip and never from a later tick. *** THAT IS THE SPEC'S "SAMPLE BEFORE YOU ADVANCE" RULE. *** The
+// knife's window is 0.130 s, or eight frames at 60 fps; a harness that let a frame pass before
+// reading would measure the decay rather than the length.
 static void TraceRunStowVerify(UWorld* World)
 {
 	int32 Failures = 0;
@@ -2096,16 +2143,16 @@ static void TraceRunStowVerify(UWorld* World)
 		++Checks;
 		if (bOk)
 		{
-			UE_LOG(LogTraceGame, Display, TEXT("[Stow]   ok    %s"), *What);
+			UE_LOG(LogTraceGame, Display, TEXT("[Weapon]   ok    %s"), *What);
 		}
 		else
 		{
 			++Failures;
-			UE_LOG(LogTraceGame, Error, TEXT("[Stow]   FAIL  %s"), *What);
+			UE_LOG(LogTraceGame, Error, TEXT("[Weapon]   FAIL  %s"), *What);
 		}
 	};
 
-	UE_LOG(LogTraceGame, Display, TEXT("========== [Stow] SPEC v29 s5 — THREE WEAPON STATES =========="));
+	UE_LOG(LogTraceGame, Display, TEXT("========== [Weapon] SPEC v31 s1 — 1 PISTOL / 2 SMG / 3 KNIFE =========="));
 
 	// ---- 1. THE KEYBINDS -------------------------------------------------------------------------
 	//
@@ -2114,17 +2161,20 @@ static void TraceRunStowVerify(UWorld* World)
 	{
 		const UTraceUserSettings& Settings = UTraceUserSettings::Get();
 		struct FWant { ETraceInputAction Action; const TCHAR* ConfigId; FKey Key; const TCHAR* What; };
+		// SPEC v31 §1. THE ConfigIds ARE ASSERTED, NOT JUST THE KEYS, and that is the whole migration
+		// under test: shipping the new layout under v29's ids would leave every returning player's
+		// saved line in force and the keys below would be right in this table and wrong in the game.
 		const FWant Wants[] =
 		{
-			{ ETraceInputAction::EquipKnife, TEXT("StowGuns"),    EKeys::One,   TEXT("1 = STOW GUNS") },
-			{ ETraceInputAction::EquipGun,   TEXT("EquipPistol"), EKeys::Two,   TEXT("2 = PISTOL") },
-			{ ETraceInputAction::EquipSmg,   TEXT("EquipSmg"),    EKeys::Three, TEXT("3 = SMG") },
+			{ ETraceInputAction::EquipGun,   TEXT("PistolSlot"), EKeys::One,   TEXT("1 = PISTOL") },
+			{ ETraceInputAction::EquipSmg,   TEXT("SmgSlot"),    EKeys::Two,   TEXT("2 = SMG") },
+			{ ETraceInputAction::EquipKnife, TEXT("KnifeSlot"),  EKeys::Three, TEXT("3 = KNIFE") },
 		};
 		for (const FWant& Want : Wants)
 		{
 			const FTraceInputActionInfo& Info = TraceInputActions::Info(Want.Action);
 			Check(FCString::Strcmp(Info.ConfigId, Want.ConfigId) == 0,
-				FString::Printf(TEXT("%s: ConfigId is \"%s\" (want \"%s\" — the v29 s5 migration)"),
+				FString::Printf(TEXT("%s: ConfigId is \"%s\" (want \"%s\" — the v31 s1 migration, which drops the v29 line)"),
 					Want.What, Info.ConfigId, Want.ConfigId));
 			Check(Info.DefaultKey() == Want.Key,
 				FString::Printf(TEXT("%s: shipped default is %s (want %s); this player's live bind is %s"),
@@ -2152,9 +2202,9 @@ static void TraceRunStowVerify(UWorld* World)
 	if (Pawn == nullptr)
 	{
 		UE_LOG(LogTraceGame, Warning,
-			TEXT("[Stow] no living, non-carrying, server-side pawn — the keybind claims above are ")
-			TEXT("checked, the four STATE claims are NOT. Run this in a match on the host."));
-		UE_LOG(LogTraceGame, Display, TEXT("[Stow] %d of %d checks passed."), Checks - Failures, Checks);
+			TEXT("[Weapon] no living, non-carrying, server-side pawn — the keybind claims above are ")
+			TEXT("checked, the per-slot claims are NOT. Run this in a match on the host."));
+		UE_LOG(LogTraceGame, Display, TEXT("[Weapon] %d of %d checks passed."), Checks - Failures, Checks);
 		return;
 	}
 
@@ -2163,16 +2213,22 @@ static void TraceRunStowVerify(UWorld* World)
 	const float BaseWalk = FMath::Max(1.f, UTraceSettings::Get().WalkSpeed);
 	const float WantMultiplier = FMath::Clamp(UTraceSettings::Get().KnifeMoveSpeedMultiplier, 1.f, 3.f);
 
+	// SPEC v31 §1. The pullout each slot is supposed to cost, derived rather than written down: the
+	// knife's is base x KnifeSwapMultiplier and a gun's is the base. Read once, before the loop, so
+	// every step is compared against the same resolved pair.
+	const float BasePullout  = TraceMelee::GetSwapSeconds();
+	const float KnifeFactor  = TraceMelee::GetKnifeSwapMultiplier();
+
 	struct FState { ETraceEquippedWeapon Weapon; const TCHAR* Key; bool bWantBoost; };
 	const FState States[] =
 	{
-		{ ETraceEquippedWeapon::Gun,   TEXT("2 (PISTOL)"),    false },
-		{ ETraceEquippedWeapon::Knife, TEXT("1 (STOW GUNS)"), true  },
-		{ ETraceEquippedWeapon::Smg,   TEXT("3 (SMG)"),       false },
+		{ ETraceEquippedWeapon::Gun,   TEXT("1 (PISTOL)"), false },
+		{ ETraceEquippedWeapon::Knife, TEXT("3 (KNIFE)"),  true  },
+		{ ETraceEquippedWeapon::Smg,   TEXT("2 (SMG)"),    false },
 		// PISTOL AGAIN, LAST, and it is not padding: it is the only step that proves the boost is
 		// TAKEN AWAY again rather than merely never granted. A one-way test would pass on a build
-		// that latched the profile on at the first stow.
-		{ ETraceEquippedWeapon::Gun,   TEXT("2 (PISTOL) again"), false },
+		// that latched the profile on at the first knife draw.
+		{ ETraceEquippedWeapon::Gun,   TEXT("1 (PISTOL) again"), false },
 	};
 
 	for (const FState& Want : States)
@@ -2192,15 +2248,38 @@ static void TraceRunStowVerify(UWorld* World)
 		if (!bInState)
 		{
 			UE_LOG(LogTraceGame, Error,
-				TEXT("[Stow]         ^ if this is the STOW key, the cause is UTraceWeaponComponent's two ")
-				TEXT("dual-wield KNIFE refusals (RequestEquip's no-op early-out and ")
-				TEXT("ServerRequestEquip_Implementation's). Removing them is the whole fix; see TraceMelee.h."));
+				TEXT("[Weapon]       ^ if this is the KNIFE key, look first at UTraceWeaponComponent's two ")
+				TEXT("historical dual-wield KNIFE refusals (RequestEquip's no-op early-out and ")
+				TEXT("ServerRequestEquip_Implementation's). Both were removed in v29 s5; see TraceMelee.h."));
 			continue;
+		}
+
+		// ---- CLAIM 4: THE PULLOUT, SAMPLED IMMEDIATELY AND COMPARED AS A RATIO ---------------------
+		//
+		// *** READ BEFORE ANYTHING ELSE IN THIS ITERATION. *** RequestEquip stamped the deadline one
+		// line ago, so GetDeployRemaining() is at its maximum RIGHT NOW and falls from here. The knife
+		// window is 0.130 s; anything that let a frame elapse first would be measuring decay. This is
+		// the spec's "sample before you advance" rule applied to the shortest clock in the file.
+		//
+		// THE RATIO, NOT THE SECONDS. Dividing by the live base is what makes this a test of "35%
+		// shorter" rather than of "0.130", so retuning SwapSeconds cannot make it fail and hard-coding
+		// KnifeSwapSeconds=0.13 as an absolute cannot make it pass.
+		{
+			const float Remaining = TraceMelee::GetDeployRemaining(Pawn);
+			const float WantSeconds = TraceMelee::GetSwapSecondsFor(Want.Weapon);
+			const float WantFactor = TraceIsFirearm(Want.Weapon) ? 1.f : KnifeFactor;
+			const float Ratio = Remaining / FMath::Max(UE_KINDA_SMALL_NUMBER, BasePullout);
+			Check(FMath::IsNearlyEqual(Remaining, WantSeconds, 0.02f),
+				FString::Printf(TEXT("key %s: pullout %.4fs = %.3f x base %.3fs (want %.3f x = %.4fs) — v31 s1: %s"),
+					Want.Key, Remaining, Ratio, BasePullout, WantFactor, WantSeconds,
+					TraceIsFirearm(Want.Weapon)
+						? TEXT("the GUN pullout, which must be UNCHANGED")
+						: TEXT("the KNIFE pullout, 35% shorter")));
 		}
 
 		const bool bBoost = TraceMelee::ShouldUseKnifeMovementProfile(Pawn);
 		Check(bBoost == Want.bWantBoost,
-			FString::Printf(TEXT("key %s: speed boost %s (spec v29 s5: the boost applies ONLY when no gun is out)"),
+			FString::Printf(TEXT("key %s: speed boost %s (v31 s1: the KNIFE SLOT carries it, as it did before Demo 24)"),
 				Want.Key, bBoost ? TEXT("PAID") : TEXT("not paid")));
 
 		if (Movement != nullptr)
@@ -2221,41 +2300,123 @@ static void TraceRunStowVerify(UWorld* World)
 					Want.Key, Speed, Ratio, BaseWalk, WantRatio));
 		}
 
-		// MELEE IN EVERY STATE. Demo 24 made the knife permanent and v29 s5 does not touch that.
+		// ---- CLAIM 5: MELEE, ASSERTED AGAINST THE SWITCH RATHER THAN AGAINST ONE OF ITS ARMS -------
+		//
+		// *** THIS IS THE CHECK v31 §1 HAD TO CHANGE, AND CHANGING IT IS THE POINT OF THE REVERT. ***
+		// The v29 version asserted "the blade is in hand in ALL THREE states", which was Demo 24's
+		// permanent off-hand knife. With bDualWieldKnife OFF that is exactly what stops being true —
+		// IsKnifeInHand() collapses back to IsKnifeEquipped(), so the blade is available in the knife
+		// slot and nowhere else, which is the v10 §1 model the owner asked to have back. Asserting the
+		// old sentence would have made this harness go red on a correct build.
+		//
+		// So the EXPECTATION is derived from IsDualWieldEnabled() and both arms are real: flip the
+		// switch back and this command still passes, which is what keeps it a test of the switch
+		// rather than a test of one of its positions.
 		//
 		// *** Deploying IS ACCEPTED, AND THAT IS A CORRECTION TO THIS HARNESS RATHER THAN A LOOSENED
-		// *** ASSERTION. *** The first version asserted a bare CanSwing() and failed all three states
-		// with refusal=5 — which is Deploying, i.e. the 0.2 s pullout THIS FUNCTION started one line
-		// earlier by equipping. It was measuring its own fixture. The claim under test is "the blade
-		// is in hand whatever the gun state", and the pullout is a rule about how soon you may swing
-		// AFTER a swap, which is spec v10 §1 and is the same in all three states by construction. So
-		// the knife-in-hand half is asserted outright and the swing half accepts None or Deploying and
-		// REFUSES everything else — WrongWeapon in particular, which is the refusal a broken
-		// permanent-knife would produce.
+		// *** ASSERTION. *** The first version asserted a bare CanSwing() and failed every state with
+		// refusal=5 — which is Deploying, i.e. the pullout THIS FUNCTION started one line earlier by
+		// equipping. It was measuring its own fixture. The pullout is a rule about how soon you may
+		// swing AFTER a swap (spec v10 §1) and is not what this claim is about.
 		ETraceMeleeRefusal Refusal = ETraceMeleeRefusal::None;
 		const UTraceWeaponComponent* const SwingComponent = Pawn->FindComponentByClass<UTraceWeaponComponent>();
 		const bool bBladeInHand = TraceMelee::IsKnifeInHand(Pawn);
+		const bool bWantBladeInHand = TraceMelee::IsDualWieldEnabled() || (Want.Weapon == ETraceEquippedWeapon::Knife);
 		const bool bSwingOk = (SwingComponent == nullptr)
 			|| SwingComponent->CanSwing(&Refusal)
 			|| Refusal == ETraceMeleeRefusal::Deploying;
-		Check(bBladeInHand && bSwingOk, FString::Printf(
-			TEXT("key %s: the knife is still in hand (%d) and the swing is not refused for the WEAPON ")
-			TEXT("(refusal=%d, %s) — stowing is about the GUNS"),
-			Want.Key, bBladeInHand ? 1 : 0, static_cast<int32>(Refusal),
+		Check(bBladeInHand == bWantBladeInHand && (!bWantBladeInHand || bSwingOk), FString::Printf(
+			TEXT("key %s: blade in hand = %d (want %d) %s (refusal=%d, %s)"),
+			Want.Key, bBladeInHand ? 1 : 0, bWantBladeInHand ? 1 : 0,
+			TraceMelee::IsDualWieldEnabled()
+				? TEXT("[dual wield ON: the blade is permanent, so every slot]")
+				: TEXT("[v31 s1, dual wield OFF: the knife is a WEAPON, so its slot only]"),
+			static_cast<int32>(Refusal),
 			(Refusal == ETraceMeleeRefusal::Deploying)
 				? TEXT("the pullout this harness just started")
 				: TEXT("live")));
 	}
 
-	UE_LOG(LogTraceGame, Display, TEXT("[Stow] %d of %d checks passed."), Checks - Failures, Checks);
+	// =============================================================================================
+	// *** CLAIM 6 — THE MAGAZINES SURVIVE A ROUTE THROUGH THE KNIFE SLOT. (spec v28 §9 / v29 §5) ***
+	// =============================================================================================
+	//
+	// THIS IS HERE BECAUSE REMOVING THE STOW STATE COULD HAVE PUT A KNOWN BUG BACK, and "it didn't"
+	// is a claim that has to be measured rather than reasoned. The bug: before v29 §5, ApplyEquip
+	// decided the magazine exchange on the ROUTE — `IsFirearm(Previous) && IsFirearm(Desired)` — so
+	// pistol -> (third state) -> SMG was two non-gun-to-gun transitions, nothing swapped, and the SMG
+	// came out holding the pistol's magazine. v29 §5 fixed it by deciding on LiveClipOwner instead:
+	// "does the magazine in this gun belong to the gun being drawn".
+	//
+	// v31 §1 deletes the stow state but NOT the third selector value — the knife is a weapon slot
+	// again and ETraceEquippedWeapon::Knife is the same enumerator it always was, so
+	// pistol -> KNIFE -> SMG is the identical two-transition route the bug travelled. Nothing in the
+	// revert touched LiveClipOwner, and this is what proves that was the right call.
+	//
+	// Trace.Weapons.V28's staged walk exercises SMG -> pistol -> SMG, which is gun-to-gun and would
+	// pass under the OLD condition too. Only a route with the knife in the middle can tell the two
+	// implementations apart, so only this check can fail if somebody "simplifies" LiveClipOwner away.
+	//
+	// SYNCHRONOUS for the reason the header gives: on the authority RequestEquip -> ApplyEquip runs
+	// inline, so each equip below is complete before the next line reads the clip.
+	if (UTraceWeaponComponent* const Mag = Pawn->FindComponentByClass<UTraceWeaponComponent>())
+	{
+		TraceMelee::RequestEquip(Pawn, ETraceEquippedWeapon::Gun);
+		const int32 PistolFull = Mag->DebugGetAuthoritativeClipAmmo();
+
+		// Five rounds, through the real consumption path. Five because it is neither clip size nor a
+		// number that could match the SMG's by accident.
+		constexpr int32 Spend = 5;
+		for (int32 i = 0; i < Spend; ++i) { Mag->DebugConsumeRound(); }
+		const int32 PistolAfterSpend = Mag->DebugGetAuthoritativeClipAmmo();
+		Check(PistolAfterSpend == PistolFull - Spend,
+			FString::Printf(TEXT("mags: %d rounds came out of the PISTOL's own magazine (%d -> %d)"),
+				Spend, PistolFull, PistolAfterSpend));
+
+		// THE ROUTE. Pistol -> knife -> SMG: two transitions, neither of them gun-to-gun.
+		TraceMelee::RequestEquip(Pawn, ETraceEquippedWeapon::Knife);
+		TraceMelee::RequestEquip(Pawn, ETraceEquippedWeapon::Smg);
+		const int32 SmgClip = Mag->DebugGetAuthoritativeClipAmmo();
+		const int32 SmgSize = Mag->GetClipSize();
+		Check(SmgClip == SmgSize,
+			FString::Printf(TEXT("mags: pistol -> KNIFE -> SMG and the SMG drew ITS OWN full magazine ")
+				TEXT("(%d/%d, not the pistol's %d) — LiveClipOwner decides on the MAGAZINE, not the route"),
+				SmgClip, SmgSize, PistolAfterSpend));
+
+		// And back the same way, which is the half that proves the pistol's rounds went somewhere
+		// rather than merely that the SMG's were correct.
+		TraceMelee::RequestEquip(Pawn, ETraceEquippedWeapon::Knife);
+		TraceMelee::RequestEquip(Pawn, ETraceEquippedWeapon::Gun);
+		const int32 PistolBack = Mag->DebugGetAuthoritativeClipAmmo();
+		Check(PistolBack == PistolAfterSpend,
+			FString::Printf(TEXT("mags: SMG -> KNIFE -> pistol and the pistol remembered the %d rounds ")
+				TEXT("it had spent (expected %d, got %d)"), Spend, PistolAfterSpend, PistolBack));
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Weapon] %d of %d checks passed."), Checks - Failures, Checks);
 	UE_LOG(LogTraceGame, Display, TEXT("=============================================================="));
 }
 
+static FAutoConsoleCommandWithWorldAndArgs GTraceWeaponVerifyCmd(
+	TEXT("Trace.Weapon.Verify"),
+	TEXT("SPEC v31 s1. Server. Checks the 1 = PISTOL / 2 = SMG / 3 = KNIFE binds and their migrated ")
+	TEXT("ConfigIds, that each of the three slots is reachable, that the knife speed boost is paid ")
+	TEXT("ONLY in the knife slot (as a ratio of the base walk speed, not an absolute), that the knife ")
+	TEXT("pullout is 35%% shorter and both guns' are unchanged (again as a ratio of the base), and ")
+	TEXT("that melee is available exactly where the dual-wield switch says it should be."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& /*Args*/, UWorld* World)
+	{
+		TraceRunStowVerify(World);
+	}));
+
+// THE OLD NAME, KEPT AS AN ALIAS RATHER THAN BROKEN. v29 §5 called this Trace.Stow.Verify because
+// the 1 key stowed the guns; v31 §1 deleted the stow state, so the noun is wrong — but two other
+// files' comments name it, and a console command is muscle memory. One extra registration is cheaper
+// than a stale instruction in somebody's notes.
 static FAutoConsoleCommandWithWorldAndArgs GTraceStowVerifyCmd(
 	TEXT("Trace.Stow.Verify"),
-	TEXT("SPEC v29 s5. Server. Checks the 1/2/3 weapon binds, that each of the three states is ")
-	TEXT("reachable, that the knife speed boost is paid ONLY while no gun is out (as a ratio of the ")
-	TEXT("base walk speed, not an absolute), and that melee works in all three."),
+	TEXT("Deprecated alias for Trace.Weapon.Verify — the stow state was removed by spec v31 s1."),
 	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 		[](const TArray<FString>& /*Args*/, UWorld* World)
 	{

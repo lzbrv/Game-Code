@@ -190,16 +190,22 @@ enum class ETraceEquippedWeapon : uint8
 	Gun   = 0,
 
 	/**
-	 * THE KNIFE, AND SINCE SPEC v29 §5 THIS VALUE MEANS "GUNS STOWED".
+	 * THE KNIFE. SINCE SPEC v31 §1 THIS MEANS WHAT IT SAYS AGAIN — the blade is the weapon in hand.
 	 *
-	 * v28 §10 made the blade permanent and this selector value unreachable — no pawn was ever in it.
-	 * v29 §5 gives it back its job and a better name for it: "Pressing one stows guns, and then you
-	 * get the knife boost speed from before." A pawn in this state has the blade (as it does in every
-	 * state under dual-wield), has NO gun out, cannot fire, and is paid the v12 §3 movement profile.
-	 * That is exactly what this value meant pre-dual-wield, which is why it is reused rather than a
-	 * fourth enumerator being appended: a new value would have to be taught to every switch, every
-	 * TraceIsFirearm caller and the equip RPC's validation whitelist, all to describe a state the
-	 * enum already had.
+	 * THREE MEANINGS, IN ORDER, BECAUSE THE HISTORY EXPLAINS THE CODE AROUND IT.
+	 *   v10-v27  the knife as one of two weapons. Holding it cost you your gun and bought the v12 §3
+	 *            movement profile.
+	 *   v28 §10  dual-wield made the blade permanent and this value UNREACHABLE — no pawn was ever
+	 *            in it.
+	 *   v29 §5   it came back as "guns stowed": no gun out, blade still permanently in the off hand.
+	 *   v31 §1   the dual-wield revert takes the permanent blade away, so "guns stowed" and "knife
+	 *            out" are one state again and this value is the v10 meaning, unchanged.
+	 *
+	 * WHICH IS WHY THE VALUE WAS REUSED RATHER THAN A FOURTH ENUMERATOR APPENDED, twice now: a new
+	 * value would have to be taught to every switch, every TraceIsFirearm caller and the equip RPC's
+	 * validation whitelist, all to describe a state the enum already had. A pawn in this state has
+	 * the blade, has NO gun out, cannot fire, is paid the v12 §3 movement profile, and since v31 §1
+	 * reaches it through a pullout 35% shorter than a gun's (UTraceMeleeSettings::KnifeSwapMultiplier).
 	 */
 	Knife = 1,
 
@@ -381,6 +387,33 @@ public:
 	float SwapSeconds = 0.2f;
 
 	/**
+	 * *** SPEC v31 §1 — "Reduce the pullout time when swapping to knife by 35%. Keep the pullout time
+	 * *** for the guns the same." ***
+	 *
+	 * A MULTIPLIER ON SwapSeconds, NOT A SECOND ABSOLUTE, because the standing project rule is that a
+	 * value which MODIFIES a base is stored RELATIVE to that base. 0.65 is "35% shorter" spelled the
+	 * way the owner asked for it, and it stays 35% shorter if SwapSeconds is ever retuned — which is
+	 * precisely what a duplicated `KnifeSwapSeconds=0.13` would silently stop doing. It is also the
+	 * same argument Config/DefaultGame.ini already makes for refusing a SmgSwapSeconds key.
+	 *
+	 * ONLY THE DRAW IS SHORTENED, AND THAT IS THE ASYMMETRY THE v10 §1 COMMENT ABOVE WARNED ABOUT.
+	 * SwapSeconds' own comment argues for one number in both directions ("a knife that comes up
+	 * faster than it goes away is a second mechanic nobody asked for"). v31 §1 asks for exactly that
+	 * mechanic, in the owner's own words — "the pullout time when swapping TO knife" — so the
+	 * reduction is applied on the transition whose DESTINATION is the knife and nowhere else.
+	 * Knife -> gun is a gun pullout and pays the full SwapSeconds, which is what "keep the pullout
+	 * time for the guns the same" means.
+	 *
+	 * 1.0 disables the feature outright and restores the v29 single-number behaviour, which is the
+	 * revert for this line if the faster draw plays badly.
+	 *
+	 * THE .INI WINS over this initialiser. Read the resolved pair back with Trace.Knife.DumpSettings,
+	 * which prints the gun pullout, the knife pullout and this multiplier side by side.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Timing", meta = (ClampMin = "0.05", ClampMax = "1.0", DisplayName = "Knife pullout multiplier [v31 §1 — 0.65 = 35% shorter]"))
+	float KnifeSwapMultiplier = 0.65f;
+
+	/**
 	 * Delay from the press to the instant the blade is resolved, i.e. how far into the animation the
 	 * edge passes through the target.
 	 *
@@ -512,7 +545,26 @@ public:
 
 	// =============================================================================================
 	// ***                      T H E   O N E   S W I T C H   (spec v28 §10)                      ***
+	// ***                  *** FLIPPED TO false BY SPEC v31 §1. IT WORKED. ***                   ***
 	// =============================================================================================
+	//
+	// v31 §1, verbatim: "Revert the knife changes (no dual wielding)." This is the moment the switch
+	// was built for and the flip below is the whole of the gameplay revert — no [DUALWIELD] site was
+	// edited, nothing was re-engineered by hand, and every row of the true/false table below now
+	// reads down its RIGHT-HAND column. The tag stays, and so does the true arm: a switch that has
+	// been used once is not a switch that has been spent.
+	//
+	// *** WHAT THE SWITCH DID NOT COVER, STATED HERE BECAUSE IT IS THE ONE HONEST DEFECT. ***
+	// The "THE 1 AND 2 KEYS" row below is STALE, and had been since v29 §5. v28 §10 reached three
+	// weapons with two keys by remapping them inside TraceMelee::RequestEquipIfDifferent, and the
+	// switch chose the remap; v29 §5 gave the player three real keys and DELETED that remap (the
+	// note is still at RequestEquipIfDifferent). From that moment the switch had no opinion about
+	// keys at all, and flipping it in v31 restored the knife as a weapon slot while leaving the
+	// keyboard reading 1 = STOW GUNS / 2 = PISTOL / 3 = SMG. The v31 §1 layout — 1 pistol, 2 SMG,
+	// 3 knife — is NEW (it is not v27's 1 = knife, 2 = gun either), so it was laid out by hand in
+	// Settings/TraceUserSettings.cpp with the usual ConfigId migration. THE LESSON, for whoever
+	// builds the next one-prompt switch: a switch can only own what it still reads, and a later pass
+	// that deletes one of its arms must delete the claim in this table at the same time.
 	//
 	// Spec v28 §10, verbatim: "Knives are being changed so that you can dual wield them with a gun.
 	// Gun in one hand, knife in the other. [...] But you no longer have to swap between knife and
@@ -540,13 +592,18 @@ public:
 	//     true   ETraceEquippedWeapon::Knife is never entered by any path. RequestEquip(Knife)
 	//            succeeds as a no-op (the blade is already in hand) and costs no pullout. The
 	//            selector only ever holds Gun (pistol) or Smg.
-	//     false  the selector holds Gun or Knife exactly as it did in v27, with the 0.2 s pullout
+	//     false  the selector holds Gun, Smg or Knife exactly as it did in v27, with a pullout
 	//            between them. (Smg is still reachable — §9 is a separate feature and does NOT
-	//            depend on this switch.)
+	//            depend on this switch.) *** v31 §1: the knife's pullout is now 35% of a gun's
+	//            shorter — KnifeSwapMultiplier, resolved by TraceMelee::GetSwapSecondsFor(). ***
 	//
-	//   THE 1 AND 2 KEYS  (TraceMelee::RequestEquipIfDifferent)
-	//     true   1 = pistol, 2 = SMG. Weapon switching is between GUNS only.
-	//     false  1 = knife, 2 = gun, exactly as spec v13 §2 specified.
+	//   THE WEAPON KEYS   *** THIS ROW IS DEAD. THE SWITCH STOPPED OWNING IT IN v29 §5. ***
+	//     both   The switch has no opinion about keys. v28 §10's 1/2 remap inside
+	//            TraceMelee::RequestEquipIfDifferent was DELETED by v29 §5, which gave the player
+	//            three real binds; the shipped layout is whatever TraceInputActions::All() says and
+	//            since v31 §1 that is 1 = PISTOL, 2 = SMG, 3 = KNIFE. Do not restore a remap here —
+	//            a second key-to-weapon translation able to disagree with the controller's is
+	//            exactly the bug RequestEquipIfDifferent's comment refuses.
 	//
 	//   MELEE
 	//     true   TraceMelee::HandleMeleeInput is the melee verb, on its own bind (right mouse by
@@ -565,9 +622,10 @@ public:
 	//     both   TraceMelee::ShouldUseKnifeMovementProfile() is true whenever NO FIREARM is out and
 	//            the pawn is not the carrier. v28 §10 returned false for the whole of dual-wield,
 	//            because the blade was free and paying the +22% would have been a movement rebalance
-	//            nobody asked for. v29 §5 restores the TRADE by making it explicit: key 1 STOWS the
-	//            guns — you cannot shoot at all while stowed (CanFire's IsFirearmEquipped gate) — and
-	//            that is what buys the speed. Keys 2 and 3 take a gun and take the speed back.
+	//            nobody asked for. v29 §5 restored the TRADE by making it explicit and v31 §1 gives
+	//            it back to the knife slot, which is where v12 §3 had it: key 3 takes the KNIFE, you
+	//            cannot shoot at all with it out (CanFire's IsFirearmEquipped gate), and that is what
+	//            buys the speed. Keys 1 and 2 take a gun and take the speed back.
 	//            With the switch OFF the only non-firearm the selector can hold is the knife, so the
 	//            expression collapses to the v12 §3 test character for character.
 	//
@@ -590,8 +648,13 @@ public:
 	//
 	// THE .INI WINS over this initialiser, as it does for every property in this class — see the
 	// class comment. Read the live value back with `Trace.Knife.DumpSettings`, never from this line.
-	UPROPERTY(config, EditAnywhere, Category = "Dual wield", meta = (DisplayName = "Dual-wield the knife with a gun [v28 §10 — THE REVERT SWITCH]"))
-	bool bDualWieldKnife = true;
+	//
+	// *** false SINCE SPEC v31 §1. *** Config/DefaultGame.ini's bDualWieldKnife was flipped in the
+	// same edit, because the .ini beats this line and changing only one of the two changes nothing.
+	// Setting it back to true here AND there restores the v28-v30 dual-wield build in full; the true
+	// arm of every [DUALWIELD] site is intact and was not deleted.
+	UPROPERTY(config, EditAnywhere, Category = "Dual wield", meta = (DisplayName = "Dual-wield the knife with a gun [v28 §10 — THE REVERT SWITCH, OFF SINCE v31 §1]"))
+	bool bDualWieldKnife = false;
 };
 
 /**
@@ -616,7 +679,8 @@ namespace TraceMelee
 	//     Trace.Knife.FrontDamage       -1
 	//     Trace.Knife.BackstabAngle     -1     HALF-angle in degrees; the cone the user quotes is 2x it
 	//     Trace.Knife.Cooldown          -1     seconds between swings
-	//     Trace.Knife.SwapSeconds       -1     pullout time, both directions
+	//     Trace.Knife.SwapSeconds       -1     the BASE pullout — a gun's, and the knife's before v31 §1
+	//     Trace.Knife.SwapMultiplier    -1     v31 §1: the knife's share of it (0.65 = 35% shorter)
 	//     Trace.Knife.Range             -1     uu
 	//     Trace.Knife.SpeedMultiplier   -1     ground speed while the knife is out
 	//     Trace.Knife.BotAuto            1     bots swap to the knife to close and swing in range
@@ -627,7 +691,38 @@ namespace TraceMelee
 	TRACE_API float GetFrontDamage();
 	TRACE_API float GetBackstabHalfAngleDegrees();
 	TRACE_API float GetSwingCooldownSeconds();
+
+	/**
+	 * THE BASE PULLOUT, IN SECONDS. A GUN'S PULLOUT, AND THE NUMBER EVERY OTHER ONE IS RELATIVE TO.
+	 *
+	 * *** SPEC v31 §1 MADE THIS THE BASE RATHER THAN THE ANSWER. *** Before v31 there was one pullout
+	 * for every weapon in both directions and this function was it. The knife now draws faster, so a
+	 * caller that wants "how long does THIS swap take" must ask GetSwapSecondsFor() and name the
+	 * weapon; this overload still answers for the pistol, the SMG and any knife -> gun transition,
+	 * which is every case it was ever right about.
+	 *
+	 * Left as the base rather than renamed because it is exactly what a caller reaching for "the
+	 * pullout knob" wants — the HUD's meter denominator, the harness wait budgets, and the SMG's
+	 * deliberate lack of a pullout knob of its own all mean THIS number.
+	 */
 	TRACE_API float GetSwapSeconds();
+
+	/** v31 §1. The knife's share of the base pullout. 0.65 ships; 1.0 disables the feature. */
+	TRACE_API float GetKnifeSwapMultiplier();
+
+	/**
+	 * *** SPEC v31 §1 — HOW LONG IT TAKES TO BRING @p Desired UP. THE ONE ANSWER, DERIVED. ***
+	 *
+	 * GetSwapSeconds() x GetKnifeSwapMultiplier() for the knife, GetSwapSeconds() for a firearm. The
+	 * multiply lives here and in no caller, so "the knife draws 35% faster" is one line rather than a
+	 * rule three call sites have to remember — which is the same argument RequestEquipIfDifferent's
+	 * comment makes for refusing a second key-to-weapon translation.
+	 *
+	 * ASKED ON THE DESTINATION, NEVER ON THE SOURCE. The owner asked for "the pullout time when
+	 * swapping TO knife"; a knife -> pistol swap is a PISTOL being pulled out and pays the full base.
+	 */
+	TRACE_API float GetSwapSecondsFor(ETraceEquippedWeapon Desired);
+
 	TRACE_API float GetSwingWindupSeconds();
 	TRACE_API float GetSwingAnimSeconds();
 	TRACE_API float GetSwingRangeUU();
@@ -757,9 +852,11 @@ namespace TraceMelee
 	// ---------------------------------------------------------------------------------------------
 
 	/**
-	 * True when the knife is the SELECTED weapon, i.e. the gun is stowed and cannot fire.
+	 * True when the knife is the SELECTED weapon, i.e. no gun is out and this pawn cannot fire.
 	 *
-	 * *** UNDER DUAL-WIELD THIS IS ALWAYS FALSE, AND THAT IS THE CORRECT ANSWER. *** Every caller of
+	 * *** SINCE SPEC v31 §1 THIS IS THE KNIFE SLOT, KEY 3 — a state a player enters deliberately. ***
+	 *
+	 * *** UNDER DUAL-WIELD IT IS ALWAYS FALSE, AND THAT IS THE CORRECT ANSWER. *** Every caller of
 	 * this predicate outside the melee slice uses it to mean "this pawn cannot shoot right now" —
 	 * X's Sting, Roxie's Modded, the ability component's reload hook, ShouldShowAmmo, the HUD's
 	 * weapon row. With the knife in the off hand a pawn CAN always shoot, so answering true would
@@ -774,8 +871,13 @@ namespace TraceMelee
 	 *
 	 * [DUALWIELD] true for any living pawn when the switch is on (the knife is always held), and
 	 * identical to IsKnifeEquipped() when it is off. This is the split that keeps the revert honest:
-	 * one predicate means "the gun is stowed" and the other means "the knife is available", and
-	 * before v28 they were the same sentence so one name did for both.
+	 * one predicate means "no gun is out" and the other means "a blade is available", and before v28
+	 * they were the same sentence so one name did for both.
+	 *
+	 * *** v31 §1 FLIPPED THE SWITCH OFF, SO THE TWO ARE THE SAME ANSWER AGAIN TODAY. *** The split is
+	 * kept rather than collapsed for two reasons: the switch's true arm is intact and needs it back
+	 * the moment anybody flips it, and the two names say different things to a reader even when they
+	 * happen to agree. Collapsing them would be the kind of tidy-up that costs a revert its meaning.
 	 */
 	TRACE_API bool IsKnifeInHand(const AActor* Character);
 
@@ -849,15 +951,17 @@ namespace TraceMelee
 	 * SetKnifeMovementProfileActive(), and it is exported so the movement slice, the HUD or a test
 	 * can ask the same question and get the same answer.
 	 *
-	 * *** SPEC v29 §5 — "NO GUN IS OUT", NOT "THE KNIFE IS SELECTED". *** Pressing 1 stows the guns
-	 * and buys the v12 §3 boost; keys 2 and 3 pull a gun and take it away. One rule, both positions
-	 * of the dual-wield switch — see the definition, which argues the whole history. The paragraph
-	 * below is the v12 §3 wording and is still exactly right with "knife equipped" read as "no
-	 * firearm equipped", which is what it meant before the SMG existed.
+	 * *** "NO GUN IS OUT", NOT "THE KNIFE IS SELECTED", AND ONE RULE FOR BOTH SWITCH POSITIONS. ***
+	 * v29 §5 wrote it that way for the stow state; v31 §1 removes the stow state and the sentence
+	 * does not change, which is the best evidence it was the right sentence. Key 3 takes the KNIFE
+	 * and buys the v12 §3 boost; keys 1 and 2 pull a gun and take it away. See the definition, which
+	 * argues the whole history. The paragraph below is the v12 §3 wording and is still exactly right
+	 * with "knife equipped" read as "no firearm equipped" — which is what it meant before the SMG
+	 * existed, and means again now that the knife slot is the only non-firearm state there is.
 	 *
 	 * Knife equipped AND not carrying the Core. The carrier clause is defence in depth: a swap is
 	 * already refused while carrying, so a carrier only ever reaches this by picking the Core up
-	 * with the knife already out — and at that moment the knife is STOWED, not active. They cannot
+	 * with the knife already out — and at that moment the knife is PUT AWAY, not active. They cannot
 	 * swing with it and cannot shoot at all, so "the knife is the active weapon" is false by the
 	 * plain reading of the movement component's own contract. It also stops 1.30 x 1.22 = 1.59x
 	 * from quietly retiring the one number the carrier's speed was ever tuned with.
@@ -911,29 +1015,26 @@ namespace TraceMelee
 	 * needs. The difference is documented in full on UTraceWeaponComponent::RequestEquipIfDifferent,
 	 * which is where the gate lives.
 	 *
-	 * *** SPEC v29 §5 — THREE KEYS, THREE STATES, AND NO REMAP ANY MORE. ***
+	 * *** SPEC v31 §1 — THREE KEYS, THREE WEAPONS, AND NO REMAP ANY MORE. ***
 	 *
 	 * v28 §10 had two weapon keys and three weapons, so this function carried a switch statement that
-	 * silently rewrote key 1 ("the knife") into the pistol and key 2 into the SMG. v29 §5 gives the
-	 * player a third key and that remap is DELETED — every caller now names the state it wants:
+	 * silently rewrote key 1 ("the knife") into the pistol and key 2 into the SMG. v29 §5 gave the
+	 * player a third key and DELETED that remap — every caller names the weapon it wants, and v31 §1
+	 * only re-lays which digit is which:
 	 *
-	 *     key   action id      weapon asked for              speed
-	 *     1     StowGuns       ETraceEquippedWeapon::Knife   the v12 §3 knife boost (no gun out)
-	 *     2     EquipPistol    ETraceEquippedWeapon::Gun     normal
-	 *     3     EquipSmg       ETraceEquippedWeapon::Smg     normal
+	 *     key   action id     weapon asked for              speed          pullout
+	 *     1     PistolSlot    ETraceEquippedWeapon::Gun     normal         SwapSeconds
+	 *     2     SmgSlot       ETraceEquippedWeapon::Smg     normal         SwapSeconds (no SMG knob)
+	 *     3     KnifeSlot     ETraceEquippedWeapon::Knife   v12 §3 boost   x KnifeSwapMultiplier
 	 *
-	 * The knife is in hand in ALL THREE (spec v28 §10's dual wield is untouched — melee still works
-	 * while a gun is out). "Stowing" is about the GUNS, and the only thing it changes besides the
-	 * silhouette is that CanFire() refuses and ShouldUseKnifeMovementProfile() starts paying.
+	 * *** DO NOT PUT A REMAP BACK HERE. *** ATracePlayerController's three OnEquip*Started handlers
+	 * are the ONE translation from a key to a weapon in the game. A second one in this function would
+	 * be able to disagree with the first, and the symptom is "pressing 1 does the wrong thing" — which
+	 * is precisely what v28 §10's remap produced for Trace.V28.Verify when v29 §5 shifted the keys
+	 * under it. The layout lives in TraceInputActions::All() and nowhere else.
 	 *
-	 * *** BLOCKED ON UTraceWeaponComponent, WHICH IS ANOTHER SLICE'S FILE THIS PASS. ***
-	 * Two guards there still refuse ETraceEquippedWeapon::Knife outright while dual-wield is on —
-	 * UTraceWeaponComponent::RequestEquip's "a request for the knife SUCCEEDS AS A NO-OP" early-out
-	 * and ServerRequestEquip_Implementation's matching refusal. Both were correct when no pawn could
-	 * ever be in the Knife state; under v29 §5 the Knife state IS the stowed state, and until those
-	 * two blocks are removed key 1 is accepted, logged and does nothing. Everything else on this path
-	 * — the keybind, the input action, the handler, the movement rule, the HUD — is in place and
-	 * waiting for them.
+	 * With the dual-wield revert (v31 §1) the knife is a WEAPON again, so key 3 puts the guns away and
+	 * key 1 or 2 puts the blade away — one weapon on screen at a time, which is v12 §7's rule.
 	 */
 	TRACE_API bool RequestEquipIfDifferent(ATraceCharacter* Pawn, ETraceEquippedWeapon Desired,
 		ETraceMeleeRefusal* OutRefusal = nullptr);

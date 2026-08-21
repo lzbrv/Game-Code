@@ -5,6 +5,8 @@
 #include "Net/UnrealNetwork.h"
 
 #include "Animation/AnimInstance.h"
+#include "Animation/AnimSequence.h"            // the pack's twenty hand clips (spec v31 §6)
+#include "Animation/AnimSingleNodeInstance.h"  // ... played without an anim blueprint; see the header
 #include "Camera/CameraComponent.h"
 #include "Camera/CameraTypes.h"                // FMinimalViewInfo (GetViewModelMuzzleViewPoint)
 #include "Components/CapsuleComponent.h"
@@ -40,6 +42,7 @@
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceRailgunFireCurve.h"
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceKnifeView.h"            // spec v31 §5/§6: IsInspecting(), the F-key flourish
 #include "Gameplay/TraceMelee.h"                // spec v28 §10: TraceMelee::IsDualWieldEnabled()
 #include "Gameplay/TraceParry.h"                // the parry entry point and its queries (spec §3)
 #include "Gameplay/TraceTrailComponent.h"
@@ -613,6 +616,149 @@ namespace TraceCharacterLayout
 			/ FMath::Max(1.f - SmgReloadUpFraction, KINDA_SMALL_NUMBER);
 		return SmgMagSeatBumpUU * (1.f - A) * FMath::Cos(2.f * PI * A);
 	}
+
+	// --- THE PACK'S GLOVED HANDS  (spec v31 §6) --------------------------------------------------
+	//
+	// EVERY NUMBER BELOW WAS MEASURED OUT OF gloved_hands.glb, not chosen. The measuring script walked
+	// all 72 mesh nodes of the export through their animated node transforms, converted to Unreal's
+	// axes with the mapping the import run established (UE = (gl.x, gl.z, gl.y) x 100) and checked
+	// itself against the imported asset's own bounding box: 22.90 x 40.09 x 25.23 uu, to the
+	// centimetre. Anything below that looks like taste is arithmetic with its working shown.
+	//
+	// AXES. The pack authors its hands and its weapons with FORWARD along UE -Y and UP along +Z; this
+	// project's viewmodel rig is +X out of the lens, +Y right, +Z up. Those differ by exactly one yaw
+	// of +90 degrees (-Y -> +X, +X -> +Y, +Z -> +Z), which is HandsYaw. The same +90 is what the
+	// import run reported for placing any pack weapon beside the shipped SM_Railgun_*.
+	constexpr float HandsYaw = 90.f;
+
+	/**
+	 * *** SCALE, WHICH THE SPEC WARNED WOULD BITE, AND IT DID. ***
+	 *
+	 * The hands are authored LIFE SIZE — 0.19 m wrist to fingertip, 0.40 m including the forearm —
+	 * and 1.0 is that size. The pack's own first-person preview keeps the hands at 1.0 and shrinks the
+	 * WEAPONS to 0.34 m (pistol) / 0.50 m (SMG) / 0.30 m (Core) to make the proportion read.
+	 *
+	 * THIS RIG CANNOT TAKE THE PACK'S WEAPON SIZES, and that is a measurement rather than a
+	 * preference. The file header's depth rule — nothing in the viewmodel may be drawn deeper than the
+	 * 34 uu capsule radius once FirstPersonScale 0.40 is applied — puts a hard ceiling on how long a
+	 * weapon may be: the SMG already reaches 33.2 uu drawn at SmgScale 0.30, and growing it to the
+	 * pack's 0.50 m (SmgScale 0.389) would put its deepest vertex at ~43 uu, i.e. reaching through
+	 * walls the body cannot touch. So the SHIPPED weapon scales stand and the hand is sized against
+	 * them instead, which is also the smaller change: RailgunScale and SmgScale are load-bearing for
+	 * the muzzle markers, for ATraceTracer's beam origin and for two verifiers, and none of that is
+	 * §6's to retune.
+	 *
+	 * WHAT 1.0 ACTUALLY PRODUCES, measured through the full rig transform at every one of the twenty
+	 * clips:
+	 *   * hand 19.0 uu drawn against the railgun's 40.4 uu and the SMG's 38.6 uu — ratios 0.47 and
+	 *     0.49, against the pack preview's 0.56 and 0.38. The SMG is very slightly LARGER than the
+	 *     pack wants relative to the hand and the pistol slightly smaller, because our "pistol" is a
+	 *     1.84 m carbine rather than the pack's 1.21 m sidearm.
+	 *   * DEPTH, at rest: the shallowest ON-SCREEN point is 10.50 uu drawn (the right forearm in
+	 *     Idle_Smg), clear of the 10 uu near plane; the deepest is 26.10 uu, well inside 34. The
+	 *     forearms' far ends do fall to 7.55 uu, and they are 264% of the frame's half-height BELOW
+	 *     centre while they do — off screen, which is exactly where the procedural rig's forearms
+	 *     were documented to run too.
+	 *   * The one exception, stated rather than hidden: Walljump_* plants the LEFT palm toward the
+	 *     wall, which brings on-screen geometry to 8.03 uu drawn for about a fifth of that 0.85 s
+	 *     clip. It is the authored motion — "left palm plants flat on the wall, shoves off" — and no
+	 *     scale that keeps the hands legible avoids it.
+	 *
+	 * Retuning is this one number: everything else in this section is expressed against it.
+	 */
+	constexpr float HandsScale = 1.0f;
+
+	/**
+	 * THE GRIP, IN THE HANDS' OWN SPACE: the centre of the closed right fist, measured as the
+	 * centroid of the palm, the four fingers' middle phalanges and the thumb's distal joint in
+	 * Idle_Pistol at t=0.
+	 *
+	 * It is measured in the PISTOL idle and used for all four loadouts because the pack authors one
+	 * fist and moves the WRIST: the fist centre relative to wrist_right is (+0.17, -6.08, -3.08) in
+	 * the pistol idle, (+0.30, -6.12, -2.97) in the SMG's and (-0.21, -5.74, -3.58) in the knife's —
+	 * a spread of 0.4 uu across the set. One constant is therefore correct for all of them, and a
+	 * second would only be a second thing to keep in step.
+	 */
+	const FVector HandsFistLocal(4.47f, -8.13f, -4.68f);
+
+	/**
+	 * WHERE THAT FIST GOES IN RIG SPACE — and it is not a new number, it is the one the rig already
+	 * had. (-0.8, 0, -4.6) is where VMHandR sits in the procedural parts table, and it is the point
+	 * RailgunOrigin and SmgOrigin were both DERIVED from ("origin = right hand - scale x grip
+	 * landmark"), so both weapons already put their grips exactly here.
+	 *
+	 * Placing the real fist on it is therefore the whole placement: the shipped guns do not move by
+	 * a millimetre, their muzzle markers do not move, the framing that was tuned and photographed for
+	 * v20 and v30 is untouched, and the hand closes around the grip that was already there. The
+	 * checkf in EnsureViewModelBuilt() is what keeps this equal to the table if anyone edits either.
+	 */
+	const FVector HandsGripRig(-0.8f, 0.f, -4.6f);
+
+	// --- Clip timing.  AUTHORED LENGTHS, MEASURED OFF THE GLB, NOT COPIED FROM THE PROSE ----------
+	//
+	// The pack's README rounds; the files do not, and where they disagree the file wins (which is the
+	// rule the shipped SMG comment already sets). Draw is 0.5167 s and not 0.52; Shoot is 0.1667 s and
+	// not 0.16. Each hand clip still matches its weapon clip EXACTLY, which is what "frame for frame"
+	// actually means.
+	//
+	// TWO OF THEM ARE NOT COSMETIC ROUNDING AND BOTH ARE HANDLED HERE.
+
+	/**
+	 * *** A_Hands_Inspect_Knife IS 5.600 s AND THE KNIFE'S OWN Inspect IS 3.200 s. ***
+	 *
+	 * The hands README's pairing table calls them "frame-for-frame" and they are not — the ratio is
+	 * exactly 1.75. The knife doc carries the authoritative four catch beats and they are laid out
+	 * inside 3.20 s, so the KNIFE is the clock and the hand clip is played at 1.75x to land on it.
+	 * Written as the two lengths rather than as "1.75" so a re-export of either file moves the rate
+	 * with it. The real fix is the artist re-exporting the hand clip at 3.20 s.
+	 */
+	constexpr float HandsInspectAuthoredSeconds = 5.600f;
+	constexpr float KnifeInspectAuthoredSeconds = 3.200f;
+
+	/**
+	 * A_Hands_Throw_Core is 1.050 s where the doc says 0.55 s, and it is NOT a mistake to truncate:
+	 * the Core's own Pickup is 0.550 s and its Throw is 0.500 s, and 0.55 + 0.50 = 1.05, so the hand
+	 * clip is wind-up plus follow-through in one take. It is played whole.
+	 */
+	constexpr float HandsThrowAuthoredSeconds = 1.050f;
+
+	/**
+	 * Stab_Knife, 0.300 s, played at RATE 1.0 — deliberately NOT stretched onto the 0.32 s gameplay
+	 * swing lockout (TraceMelee::GetSwingAnimSeconds).
+	 *
+	 * Stretching would make the hand agree with the LOCKOUT and disagree with the BLADE: §5 plays
+	 * A_Knife_Stab at its own authored 0.300 s, and the two clips are authored to match thrust for
+	 * thrust. The spec is explicit — do not re-time clips that are already paired. What is left over
+	 * is 20 ms of shooting lockout after the hand has finished, against a visibly desynchronised fist
+	 * and blade if it went the other way.
+	 *
+	 * RELOAD IS THE OPPOSITE CASE AND *IS* STRETCHED, and the two are consistent rather than
+	 * contradictory: there the weapon's own magazine is stretched onto the same gameplay clock (see
+	 * UpdateSmgAnimation), so following the pairing means stretching. The rule is "match the weapon
+	 * clip", not "always play at 1.0".
+	 */
+	constexpr float HandsStabAuthoredSeconds = 0.300f;
+
+	/** Reload's position is not rate-driven at all: it is read straight off the weapon's replicated
+	  * deadline every frame, so a cancelled or ability-shortened reload cannot desynchronise it. This
+	  * is only the length that phase is mapped onto. */
+	constexpr float HandsReloadAuthoredSeconds = 0.800f;
+
+	/**
+	 * Draw is played at its AUTHORED rate and allowed to overrun the pullout, which is the one place
+	 * a clip is deliberately not stretched.
+	 *
+	 * The pullout is 0.2 s shipped and §1 makes the knife's 35% shorter still (~0.13 s); the authored
+	 * wrist flip that snaps a balisong open is 0.5167 s. Compressing it 4x would not read as a flip,
+	 * it would read as a glitch. The README's own rule makes the overrun safe: "actions start and end
+	 * on their loadout pose", so the tail lands back on Idle_Knife wherever it is interrupted — the
+	 * same argument the pack makes for Shoot_Smg overrunning one shot at 600 RPM.
+	 */
+	constexpr float HandsDrawAuthoredSeconds = 0.5167f;
+
+	/** Jump 0.70 s, wall jump 0.85 s, both as authored and both one-shots. */
+	constexpr float HandsJumpAuthoredSeconds = 0.700f;
+	constexpr float HandsWalljumpAuthoredSeconds = 0.850f;
 }
 
 namespace TraceCharacterAssets
@@ -694,6 +840,131 @@ namespace TraceCharacterAssets
 	const TCHAR* const SmgWallLeftMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_RailgunSmg_WallLeft.SM_RailgunSmg_WallLeft");
 	const TCHAR* const SmgWallRightMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_RailgunSmg_WallRight.SM_RailgunSmg_WallRight");
 	const TCHAR* const SmgMagMeshPath = TEXT("/Game/Trace/Weapons/Meshes/SM_RailgunSmg_Mag.SM_RailgunSmg_Mag");
+
+	// --- THE PACK'S GLOVED HANDS  (spec v31 §6) ---------------------------------------------------
+	//
+	// COMMITTED ART, like the railgun and unlike the Mannequin: Art/Pack/models/gloved_hands.glb ->
+	// /Game/Trace/Art/Pack/Hands, imported by Scripts/import-pack.sh. Present on a fresh clone once
+	// `git lfs pull` has run, and OPTIONAL until then — a miss builds the procedural cube hands.
+	//
+	// FIVE SKELETONS EXIST IN THE PACK AND THEY DO NOT INTERCHANGE. A_Hands_* play ONLY on
+	// SK_TraceHands_Skeleton; the knife's, the core's and the two weapons' clips are on their own
+	// skeletons and cannot be cross-assigned. This file owns exactly the hand set.
+	const TCHAR* const HandsMeshPath = TEXT("/Game/Trace/Art/Pack/Hands/SK_TraceHands.SK_TraceHands");
+
+	/** The bone the hands README names as the weapon mount. Verified present on the imported skeleton
+	  * (the GLB has no SOCKET_ leaf nodes, so Interchange created no sockets — a bone name resolves
+	  * through the same attachment API). */
+	const FName HandsWeaponBone(TEXT("wrist_right"));
+
+	/** The off hand, reported through GetViewModelOffHand() so the knife rig lands on a real hand. */
+	const FName HandsOffHandBone(TEXT("wrist_left"));
+
+	/**
+	 * THE TWENTY CLIPS, IN THE ORDER ResolveHandsClip() INDEXES THEM. The order is a contract between
+	 * this table, the enum below it and the constructor's finder array; the static_assert in
+	 * BuildPackHandsViewModel() is what stops the three drifting apart.
+	 */
+	const TCHAR* const HandsAnimPaths[] =
+	{
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Idle_Knife.A_Hands_Idle_Knife"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Idle_Pistol.A_Hands_Idle_Pistol"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Idle_Smg.A_Hands_Idle_Smg"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Idle_Core.A_Hands_Idle_Core"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Draw_Knife.A_Hands_Draw_Knife"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Stab_Knife.A_Hands_Stab_Knife"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Inspect_Knife.A_Hands_Inspect_Knife"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Shoot_Pistol.A_Hands_Shoot_Pistol"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Reload_Pistol.A_Hands_Reload_Pistol"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Shoot_Smg.A_Hands_Shoot_Smg"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Reload_Smg.A_Hands_Reload_Smg"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Throw_Core.A_Hands_Throw_Core"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Jump_Knife.A_Hands_Jump_Knife"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Jump_Pistol.A_Hands_Jump_Pistol"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Jump_Smg.A_Hands_Jump_Smg"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Jump_Core.A_Hands_Jump_Core"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Walljump_Knife.A_Hands_Walljump_Knife"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Walljump_Pistol.A_Hands_Walljump_Pistol"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Walljump_Smg.A_Hands_Walljump_Smg"),
+		TEXT("/Game/Trace/Art/Pack/Hands/Anims/A_Hands_Walljump_Core.A_Hands_Walljump_Core")
+	};
+
+	/** Index into HandsAnimPaths. Must stay in step with the table above and with the constructor. */
+	enum EHandsClipIndex : int32
+	{
+		HandsClip_IdleKnife = 0,
+		HandsClip_IdlePistol,
+		HandsClip_IdleSmg,
+		HandsClip_IdleCore,
+		HandsClip_DrawKnife,
+		HandsClip_StabKnife,
+		HandsClip_InspectKnife,
+		HandsClip_ShootPistol,
+		HandsClip_ReloadPistol,
+		HandsClip_ShootSmg,
+		HandsClip_ReloadSmg,
+		HandsClip_ThrowCore,
+		HandsClip_JumpKnife,
+		HandsClip_JumpPistol,
+		HandsClip_JumpSmg,
+		HandsClip_JumpCore,
+		HandsClip_WalljumpKnife,
+		HandsClip_WalljumpPistol,
+		HandsClip_WalljumpSmg,
+		HandsClip_WalljumpCore,
+		HandsClip_Count
+	};
+
+	static_assert(UE_ARRAY_COUNT(HandsAnimPaths) == HandsClip_Count,
+		"The hand clip path table and the index enum have drifted apart.");
+
+	/** Short names for the log and for Trace.Hands.Probe, in the same order. */
+	const TCHAR* const HandsClipNames[] =
+	{
+		TEXT("Idle_Knife"), TEXT("Idle_Pistol"), TEXT("Idle_Smg"), TEXT("Idle_Core"),
+		TEXT("Draw_Knife"), TEXT("Stab_Knife"), TEXT("Inspect_Knife"),
+		TEXT("Shoot_Pistol"), TEXT("Reload_Pistol"), TEXT("Shoot_Smg"), TEXT("Reload_Smg"),
+		TEXT("Throw_Core"),
+		TEXT("Jump_Knife"), TEXT("Jump_Pistol"), TEXT("Jump_Smg"), TEXT("Jump_Core"),
+		TEXT("Walljump_Knife"), TEXT("Walljump_Pistol"), TEXT("Walljump_Smg"), TEXT("Walljump_Core")
+	};
+
+	static_assert(UE_ARRAY_COUNT(HandsClipNames) == HandsClip_Count,
+		"The hand clip name table and the index enum have drifted apart.");
+
+	/**
+	 * WHAT EACH CLIP IS SUPPOSED TO BE, so a re-export that changes a length is CAUGHT rather than
+	 * discovered later as "the reload looks wrong now".
+	 *
+	 * These are the lengths measured out of gloved_hands.glb, not the ones the pack's README quotes —
+	 * the README rounds (0.52 for 0.5167, 0.16 for 0.1667) and where the two disagree the file wins.
+	 * BuildPackHandsViewModel checks every imported sequence against this table and says so on a
+	 * mismatch; that is what makes the constants below load-bearing instead of decorative. Two entries
+	 * are known to disagree with the pack's PROSE and both are deliberate — see
+	 * HandsInspectAuthoredSeconds (5.600 against a documented 3.20) and HandsThrowAuthoredSeconds
+	 * (1.050 against a documented 0.55).
+	 */
+	const float HandsClipAuthoredSeconds[] =
+	{
+		2.4f, 2.4f, 2.4f, 2.4f,                                     // the four idles, all looping
+		TraceCharacterLayout::HandsDrawAuthoredSeconds,
+		TraceCharacterLayout::HandsStabAuthoredSeconds,
+		TraceCharacterLayout::HandsInspectAuthoredSeconds,
+		0.1667f, TraceCharacterLayout::HandsReloadAuthoredSeconds,  // pistol: shoot, reload
+		0.1667f, TraceCharacterLayout::HandsReloadAuthoredSeconds,  // smg: shoot, reload
+		TraceCharacterLayout::HandsThrowAuthoredSeconds,
+		TraceCharacterLayout::HandsJumpAuthoredSeconds,
+		TraceCharacterLayout::HandsJumpAuthoredSeconds,
+		TraceCharacterLayout::HandsJumpAuthoredSeconds,
+		TraceCharacterLayout::HandsJumpAuthoredSeconds,
+		TraceCharacterLayout::HandsWalljumpAuthoredSeconds,
+		TraceCharacterLayout::HandsWalljumpAuthoredSeconds,
+		TraceCharacterLayout::HandsWalljumpAuthoredSeconds,
+		TraceCharacterLayout::HandsWalljumpAuthoredSeconds
+	};
+
+	static_assert(UE_ARRAY_COUNT(HandsClipAuthoredSeconds) == HandsClip_Count,
+		"The hand clip length table and the index enum have drifted apart.");
 
 	/** Material slot names baked into the meshes, used to find the two glowing slots to animate.
 	  * The SMG's are the same two FNames — the import writes the raw glTF material names undecorated
@@ -1300,6 +1571,45 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 		if (SmgMagFinder.Succeeded())
 		{
 			SmgMagMesh = SmgMagFinder.Object;
+		}
+	}
+
+	// [SPEC v31 §6] The pack's gloved hands: one skeletal mesh and twenty sequences, on the identical
+	// contract as the two guns above — CDO references so the cooker packages them, and a miss on any
+	// one of them is a fallback rather than an error (see BuildPackHandsViewModel).
+	//
+	// A STATIC ARRAY OF FINDERS rather than twenty named ones. ConstructorHelpers::FObjectFinder must
+	// be static and may only be constructed inside a constructor; a function-local static ARRAY
+	// satisfies both — it is built exactly once, on the first construction, which is the same
+	// guarantee each individual static above relies on — and it keeps the twenty paths in ONE ordered
+	// table next to the enum that indexes them instead of twenty places to get out of step.
+	{
+		static ConstructorHelpers::FObjectFinder<USkeletalMesh> HandsFinder(TraceCharacterAssets::HandsMeshPath);
+		if (HandsFinder.Succeeded())
+		{
+			HandsMesh = HandsFinder.Object;
+		}
+
+		static ConstructorHelpers::FObjectFinder<UAnimSequence> HandsAnimFinders[] =
+		{
+			TraceCharacterAssets::HandsAnimPaths[0],  TraceCharacterAssets::HandsAnimPaths[1],
+			TraceCharacterAssets::HandsAnimPaths[2],  TraceCharacterAssets::HandsAnimPaths[3],
+			TraceCharacterAssets::HandsAnimPaths[4],  TraceCharacterAssets::HandsAnimPaths[5],
+			TraceCharacterAssets::HandsAnimPaths[6],  TraceCharacterAssets::HandsAnimPaths[7],
+			TraceCharacterAssets::HandsAnimPaths[8],  TraceCharacterAssets::HandsAnimPaths[9],
+			TraceCharacterAssets::HandsAnimPaths[10], TraceCharacterAssets::HandsAnimPaths[11],
+			TraceCharacterAssets::HandsAnimPaths[12], TraceCharacterAssets::HandsAnimPaths[13],
+			TraceCharacterAssets::HandsAnimPaths[14], TraceCharacterAssets::HandsAnimPaths[15],
+			TraceCharacterAssets::HandsAnimPaths[16], TraceCharacterAssets::HandsAnimPaths[17],
+			TraceCharacterAssets::HandsAnimPaths[18], TraceCharacterAssets::HandsAnimPaths[19]
+		};
+		static_assert(UE_ARRAY_COUNT(HandsAnimFinders) == TraceCharacterAssets::HandsClip_Count,
+			"The constructor's hand clip finders and the clip index enum have drifted apart.");
+
+		HandsAnims.SetNum(TraceCharacterAssets::HandsClip_Count);
+		for (int32 Index = 0; Index < TraceCharacterAssets::HandsClip_Count; ++Index)
+		{
+			HandsAnims[Index] = HandsAnimFinders[Index].Succeeded() ? HandsAnimFinders[Index].Object : nullptr;
 		}
 	}
 
@@ -2594,6 +2904,15 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		bool bWeapon;
 	};
 
+	// [SPEC v31 §6] *** THIS IS WHAT REPLACES THE PROCEDURAL CUBE HANDS. ***
+	//
+	// Built FIRST, because the weapons are placed against its wrist bone. A false here is not an
+	// error and is the normal state of a fresh clone: the four hand cubes, the two knuckle bars, the
+	// two forearms and the two cuffs below are then built exactly as they always were. Both halves of
+	// the fallback promise in the file header — a clone with no `git lfs pull`, and
+	// -TraceNoCharacterArt asked for on purpose — go through this one return value.
+	const bool bPackHands = BuildPackHandsViewModel();
+
 	// The railgun replaces the twelve gun parts if its art resolved. The hands and arms below are
 	// built either way — they are what holds whichever weapon won.
 	const bool bRailgun = BuildRailgunViewModel();
@@ -2644,6 +2963,16 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		TEXT("The viewmodel part table was reordered; the left-hand indices below no longer point "
 			 "at the left hand, so the railgun would be held by nothing."));
 
+	// [SPEC v31 §6] TraceCharacterLayout::HandsGripRig is not an independent number — it IS VMHandR's
+	// position, which is the point RailgunOrigin and SmgOrigin were both derived from. The pack hands
+	// put their fist there so the guns do not move. Asserted rather than commented, because the
+	// failure mode of the two drifting apart is a fist closed on empty air next to a floating gun.
+	constexpr int32 RightHandIndex = 12;
+	checkf(FCString::Strcmp(Parts[RightHandIndex].Name, TEXT("VMHandR")) == 0
+		&& Parts[RightHandIndex].Location.Equals(TraceCharacterLayout::HandsGripRig, 0.01f),
+		TEXT("TraceCharacterLayout::HandsGripRig no longer matches VMHandR in the parts table; the "
+			 "pack hands would close on a grip that is not where the weapons put theirs."));
+
 	// [DUALWIELD] SPEC v28 §10 — the off hand comes off the weapon entirely and takes the knife.
 	//
 	// ONE `if`, ABOVE THE EXISTING TERNARIES RATHER THAN INSIDE THEM, so the railgun/cube choice below
@@ -2665,13 +2994,31 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		? TraceCharacterLayout::DualWieldLeftKnuckle
 		: (bRailgun ? TraceCharacterLayout::RailgunLeftKnuckle : Parts[LeftKnuckleIndex].Location);
 
-	ViewModelOffHandLocation = LeftHand;
+	// [SPEC v31 §6] With the pack rig up, the off-hand anchor is the REAL left wrist — already written
+	// by BuildPackHandsViewModel out of the imported skeleton's reference pose — and must not be
+	// overwritten by the cube table's guess at where a hand used to be. UTraceWeaponComponent hangs
+	// the knife on this point, so a stale value would float the blade a hand's width from the fist.
+	if (!bPackHands)
+	{
+		ViewModelOffHandLocation = LeftHand;
+	}
 	bViewModelOffHandFree = bDualWieldPose;
+
+	/** The cube gun's lit muzzle ring, when that rig is the one built. See the muzzle marker below. */
+	UStaticMeshComponent* CubeGunMuzzlePart = nullptr;
 
 	for (int32 Index = 0; Index < UE_ARRAY_COUNT(Parts); ++Index)
 	{
 		const FViewModelPart& Part = Parts[Index];
 		if (bRailgun && Part.bWeapon)
+		{
+			continue;
+		}
+
+		// [SPEC v31 §6] The four hand and knuckle cubes are what SK_TraceHands replaces. The weapon
+		// parts are untouched by this: a machine with the pack hands but no railgun art still gets
+		// the procedural cube gun, held by real fingers.
+		if (bPackHands && !Part.bWeapon)
 		{
 			continue;
 		}
@@ -2698,6 +3045,15 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		{
 			PistolWeaponParts.Add(Built);
 		}
+
+		// [SPEC v31 §6] The cube gun's lit muzzle ring is placed at exactly CubeGunMuzzle, which is
+		// where the fallback rig's muzzle MARKER goes too. Remembering it lets the marker be parented
+		// to the ring instead of to the rig root, so it rides the hand for free — the same argument
+		// that already parents the railgun's marker to the railgun's body.
+		if (Built != nullptr && FCString::Strcmp(Part.Name, TEXT("VMMuzzle")) == 0)
+		{
+			CubeGunMuzzlePart = Built;
+		}
 	}
 
 	// --- Forearms --------------------------------------------------------------------------------
@@ -2722,8 +3078,15 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		{ TEXT("VMForearmL"), TEXT("VMCuffL"), LeftHand,                    FVector(-0.40f, -0.38f, -0.86f), 16.f, 6.7f }
 	};
 
+	// [SPEC v31 §6] The pack's mesh carries its own forearms and cuffs — 23.5 cm of them, which is why
+	// the depth arithmetic on HandsScale had to be redone — so these two cylinders are fallback-only.
 	for (const FForearmSpec& Arm : Forearms)
 	{
+		if (bPackHands)
+		{
+			break;
+		}
+
 		const FVector Dir = Arm.Direction.GetSafeNormal();
 		if (Dir.IsNearlyZero())
 		{
@@ -2740,6 +3103,25 @@ void ATraceCharacter::EnsureViewModelBuilt()
 
 		AddViewModelPart(CylinderMesh, Arm.CuffName, Arm.Hand + Dir * 5.f, ArmRotation,
 			FVector(Arm.Diameter + 0.8f, Arm.Diameter + 0.8f, 1.8f), ViewModelNeonMID);
+	}
+
+	// --- [SPEC v31 §6] The rest transforms the hand-follow is expressed against -------------------
+	//
+	// READ BACK OFF THE COMPONENTS rather than re-derived from RailgunOrigin / SmgOrigin / the parts
+	// table. Three reasons, and the third is the one that matters: the twelve cube-gun parts have no
+	// named constants at all; retuning a scale or an origin then moves this automatically; and a
+	// second hand-typed copy of a placement is the duplicate-constant failure this codebase logs by
+	// name. Captured here, once, while every part is still at its shipped rest pose — before
+	// UpdateWeaponsFollowHands has had a chance to move anything.
+	PistolWeaponRest.Reset(PistolWeaponParts.Num());
+	for (const TObjectPtr<UStaticMeshComponent>& Part : PistolWeaponParts)
+	{
+		PistolWeaponRest.Add(Part != nullptr ? Part->GetRelativeTransform() : FTransform::Identity);
+	}
+	SmgWeaponRest.Reset(SmgWeaponParts.Num());
+	for (const TObjectPtr<UStaticMeshComponent>& Part : SmgWeaponParts)
+	{
+		SmgWeaponRest.Add(Part != nullptr ? Part->GetRelativeTransform() : FTransform::Identity);
 	}
 
 	// --- The muzzle marker (spec v26 §4) ---------------------------------------------------------
@@ -2762,12 +3144,21 @@ void ATraceCharacter::EnsureViewModelBuilt()
 	// It is deliberately NOT a constant in ATraceTracer, and deliberately NOT the rig root: every
 	// motion the gun has — recoil, sway, bob, the slide dip — is a transform on one of its ancestors,
 	// and a marker under them inherits all of it with no code that has to remember to.
+	// [SPEC v31 §6] THIRD CASE, and it exists because the guns now move: with the pack hands up and no
+	// railgun art, a marker parented to the RIG ROOT would sit still while the cube gun rode the hand
+	// away from it — a beam leaving from where the barrel used to be, which is the exact defect v26 §4
+	// closed. Parented to the lit muzzle RING instead, which is placed at CubeGunMuzzle and is itself
+	// carried by the hand-follow pass, so the marker inherits every motion the gun has with no code.
 	if (ViewModelMuzzle == nullptr)
 	{
 		USceneComponent* MuzzleParent = (RailgunBodyPart != nullptr)
-			? static_cast<USceneComponent*>(RailgunBodyPart) : static_cast<USceneComponent*>(ViewModelRoot);
+			? static_cast<USceneComponent*>(RailgunBodyPart)
+			: (CubeGunMuzzlePart != nullptr
+				? static_cast<USceneComponent*>(CubeGunMuzzlePart)
+				: static_cast<USceneComponent*>(ViewModelRoot));
 		const FVector MuzzleLocal = (RailgunBodyPart != nullptr)
-			? TraceCharacterLayout::RailgunMuzzleLocal : TraceCharacterLayout::CubeGunMuzzle;
+			? TraceCharacterLayout::RailgunMuzzleLocal
+			: (CubeGunMuzzlePart != nullptr ? FVector::ZeroVector : TraceCharacterLayout::CubeGunMuzzle);
 
 		ViewModelMuzzle = NewObject<USceneComponent>(this, TEXT("ViewModelMuzzle"));
 		if (ViewModelMuzzle != nullptr)
@@ -2811,9 +3202,10 @@ void ATraceCharacter::EnsureViewModelBuilt()
 
 	ApplyTeamColors();
 
-	UE_LOG(LogTraceGame, Verbose,
-		TEXT("%s built a first-person viewmodel (%d parts, pistol muzzle on %s, SMG rig %s)."),
+	UE_LOG(LogTraceGame, Log,
+		TEXT("%s built a first-person viewmodel (%d parts, hands=%s, pistol muzzle on %s, SMG rig %s)."),
 		*GetName(), ViewModelParts.Num(),
+		bPackHands ? TEXT("SK_TraceHands + 20 clips") : TEXT("PROCEDURAL CUBES (fallback)"),
 		(RailgunBodyPart != nullptr) ? TEXT("the railgun body") : TEXT("the fallback rig"),
 		(SmgBodyPart != nullptr) ? TEXT("built") : TEXT("ABSENT - the `3` slot falls back"));
 }
@@ -3063,6 +3455,783 @@ bool ATraceCharacter::BuildSmgViewModel()
 	return true;
 }
 
+// =================================================================================================
+// THE PACK'S GLOVED HANDS  —  spec v31 §6
+// =================================================================================================
+//
+// "Implement the new hand model and animations with an idle hold for the guns, core, and knife;
+//  reload, stab, shoot, and move on a jump and wall jump"
+//
+// The design rationale, the axis convention, the scale measurements and the reason the guns follow
+// the wrist by transform rather than by attachment are all in TraceCharacter.h. What is here is the
+// build and the state machine.
+
+namespace
+{
+	/**
+	 * A bone's REFERENCE-POSE transform in COMPONENT space.
+	 *
+	 * Written out rather than using USkinnedMeshComponent::GetRefPoseTransform, which returns the
+	 * bone's transform in its PARENT'S space — for `wrist_right`, a 2 cm offset from `hand_right`,
+	 * which is not the number anything here wants. And deliberately NOT read off the live component
+	 * (GetBoneTransform), because at build time the component has not ticked its pose yet and would
+	 * answer with whatever the last evaluation left behind.
+	 */
+	FTransform RefPoseComponentSpace(const FReferenceSkeleton& RefSkeleton, int32 BoneIndex)
+	{
+		FTransform Result = FTransform::Identity;
+		const TArray<FTransform>& BonePose = RefSkeleton.GetRefBonePose();
+
+		for (int32 Index = BoneIndex; Index != INDEX_NONE; Index = RefSkeleton.GetParentIndex(Index))
+		{
+			if (!BonePose.IsValidIndex(Index))
+			{
+				return FTransform::Identity;
+			}
+			Result = Result * BonePose[Index];
+		}
+		return Result;
+	}
+}
+
+bool ATraceCharacter::BuildPackHandsViewModel()
+{
+	if (ViewModelRoot == nullptr)
+	{
+		return false;
+	}
+
+	// *** THE FALLBACK MUST SURVIVE, and this is the gate that keeps it reachable. ***
+	//
+	// -TraceNoCharacterArt is the switch the file header has always promised would reach the
+	// procedural rig, so it has to reach THIS one too — it would be a strange kind of "art disabled"
+	// that still drew imported hands. -TraceNoPackHands is the narrower form, for looking at the cube
+	// rig on a machine where the Mannequin IS wanted.
+	if (FParse::Param(FCommandLine::Get(), TEXT("TraceNoCharacterArt"))
+		|| FParse::Param(FCommandLine::Get(), TEXT("TraceNoPackHands")))
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("-TraceNoCharacterArt/-TraceNoPackHands: building the procedural cube hands on purpose."));
+		return false;
+	}
+
+	if (HandsMesh == nullptr)
+	{
+		// A fresh clone that has not run `git lfs pull` has the .uasset as an LFS pointer stub, so
+		// this is the NORMAL first-run state, not an error. Warning, not Error, for the same reason
+		// the SMG's miss is a warning: the pawn behind it is fully functional.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("Pack hands did not resolve (%s); building the procedural cube hands. Run ")
+			TEXT("./Scripts/import-pack.sh, or `git lfs pull` if this is a fresh clone."),
+			TraceCharacterAssets::HandsMeshPath);
+		return false;
+	}
+
+	// THE FOUR IDLES ARE THE MINIMUM. An action clip that failed to import degrades to its loadout's
+	// idle (ResolveHandsClip's rule), which is a hand that holds still rather than a hand that
+	// vanishes — but with no idle there is nothing to fall back TO, and a skeletal mesh with no
+	// animation playing shows the reference pose, which for this rig is the knife hold.
+	for (int32 Index = TraceCharacterAssets::HandsClip_IdleKnife;
+		Index <= TraceCharacterAssets::HandsClip_IdleCore; ++Index)
+	{
+		if (!HandsAnims.IsValidIndex(Index) || HandsAnims[Index] == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("Pack hands: idle clip '%s' did not resolve; building the procedural cube hands."),
+				TraceCharacterAssets::HandsClipNames[Index]);
+			return false;
+		}
+	}
+
+	const FReferenceSkeleton& RefSkeleton = HandsMesh->GetRefSkeleton();
+	const int32 WristIndex = RefSkeleton.FindBoneIndex(TraceCharacterAssets::HandsWeaponBone);
+	if (WristIndex == INDEX_NONE)
+	{
+		// LOUD. Everything about where the guns sit is expressed against this bone, so a rename in a
+		// re-export would otherwise show up as weapons quietly parked at the rig origin — which looks
+		// like a placement bug in this file rather than like an art change.
+		UE_LOG(LogTraceGame, Error,
+			TEXT("Pack hands: SK_TraceHands has no bone '%s' (the hands README names it as the weapon ")
+			TEXT("mount). Falling back to the procedural cube hands. Bone count on the imported ")
+			TEXT("skeleton: %d."),
+			*TraceCharacterAssets::HandsWeaponBone.ToString(), RefSkeleton.GetNum());
+		return false;
+	}
+
+	HandsPart = NewObject<USkeletalMeshComponent>(this,
+		MakeUniqueObjectName(this, USkeletalMeshComponent::StaticClass(), TEXT("ViewModelHands")));
+	if (HandsPart == nullptr)
+	{
+		return false;
+	}
+
+	HandsPart->SetMobility(EComponentMobility::Movable);
+	HandsPart->SetupAttachment(ViewModelRoot);
+	HandsPart->SetSkeletalMeshAsset(HandsMesh);
+
+	// PLACEMENT, AND IT IS ONE LINE OF ARITHMETIC. The fist goes on the grip the two guns already put
+	// their grip landmarks on, so the hand closes around a weapon that does not move; the yaw turns
+	// the pack's -Y forward onto the rig's +X. Both terms are in TraceCharacterLayout with their
+	// measurements.
+	const FRotator HandsRotation(0.f, TraceCharacterLayout::HandsYaw, 0.f);
+	const FVector HandsLocation = TraceCharacterLayout::HandsGripRig
+		- HandsRotation.RotateVector(TraceCharacterLayout::HandsFistLocal * TraceCharacterLayout::HandsScale);
+
+	HandsPart->SetRelativeLocationAndRotation(HandsLocation, HandsRotation);
+	HandsPart->SetRelativeScale3D(FVector(TraceCharacterLayout::HandsScale));
+
+	// Contract §7, the same rule every other visual on this actor keeps: the capsule is the ONLY
+	// collider. These are 107 rigid bones 50 cm from the eye; a colliding one would be an obstacle
+	// welded to the player's face and would let a bullet stop on "the glove".
+	HandsPart->SetCollisionProfileName(TEXT("NoCollision"));
+	HandsPart->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	HandsPart->SetGenerateOverlapEvents(false);
+	HandsPart->SetCanEverAffectNavigation(false);
+	HandsPart->bReceivesDecals = false;
+
+	// NOBODY ELSE MAY EVER SEE THIS, and no shadow of any kind — the same two flags every viewmodel
+	// part carries, for the same reason: there must be no path by which a pair of floating hands
+	// appears in another player's frame, not even as a silhouette on the floor.
+	HandsPart->SetOnlyOwnerSee(true);
+	HandsPart->SetCastShadow(false);
+	HandsPart->bCastHiddenShadow = false;
+
+	// The whole point of the rig, and set BEFORE RegisterComponent so the scene proxy is created with
+	// it rather than having to be rebuilt. See the depth arithmetic on HandsScale.
+	HandsPart->FirstPersonPrimitiveType = EFirstPersonPrimitiveType::FirstPerson;
+
+	// ALWAYS, not OnlyTickPoseWhenRendered. This file SETS the pose every frame from real state and
+	// then reads the wrist bone back out to place the guns; a pose that skipped a tick would park the
+	// weapon on a stale bone. It is one skeletal mesh on the one pawn a human is inside.
+	HandsPart->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+	HandsPart->bEnableUpdateRateOptimizations = false;
+
+	// NO ANIM BLUEPRINT. Four idles and one action at a time is what single-node mode is for, and an
+	// AnimBP would be a second asset to keep in step with the twenty clips this file already names.
+	HandsPart->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+
+	HandsPart->SetVisibility(false);   // UpdateViewBlend decides; matches every other rig part
+	HandsPart->RegisterComponent();
+
+	// *** THE ACTOR MUST TICK AFTER THE POSE. ***
+	//
+	// UpdateWeaponsFollowHands reads wrist_right off this component and puts the guns there. Component
+	// and actor ticks are in the same tick group with no ordering guarantee, so without this the gun
+	// would be composed against whichever evaluation happened to have run — and half the time that is
+	// last frame's, which at 10 uu of wrist travel through a jump is the gun visibly swimming inside
+	// the fist. With the prerequisite, hand and gun are always the same frame's pose.
+	AddTickPrerequisiteComponent(HandsPart);
+
+	// --- The two facts everything else is expressed against ---------------------------------------
+	//
+	// Both are RIG-space transforms in the mesh's REFERENCE pose. HandsWristRestRig is the base every
+	// weapon offset is stored relative to (the standing rule); the left wrist is what
+	// GetViewModelOffHand() reports from here on, so UTraceWeaponComponent hangs the knife on a hand
+	// that exists instead of on the cube that used to be there.
+	const FTransform HandsRelative(HandsRotation, HandsLocation,
+		FVector(TraceCharacterLayout::HandsScale));
+	HandsWristRestRig = RefPoseComponentSpace(RefSkeleton, WristIndex) * HandsRelative;
+	HandsWristDelta = FTransform::Identity;
+	bHandsRigActive = true;
+
+	const int32 OffHandIndex = RefSkeleton.FindBoneIndex(TraceCharacterAssets::HandsOffHandBone);
+	if (OffHandIndex != INDEX_NONE)
+	{
+		ViewModelOffHandLocation =
+			(RefPoseComponentSpace(RefSkeleton, OffHandIndex) * HandsRelative).GetLocation();
+	}
+
+	// --- Do the imported clips still say what this file believes they say? ------------------------
+	//
+	// EVERY TIMING DECISION ABOVE IS AN ARGUMENT ABOUT A LENGTH — the 1.75x inspect rate, the throw
+	// that must not be truncated to 0.55 s, the draw that is allowed to overrun the pullout. All of
+	// them are silently wrong the day someone re-exports a clip at a different length, and the symptom
+	// would be a hand that looks subtly out of step with a blade: exactly the kind of defect this
+	// project keeps finding weeks late. One frame at 60 Hz is the tolerance, because the 120 Hz SMG
+	// bake and float rounding both live well inside it.
+	{
+		FString Drift;
+		for (int32 Index = 0; Index < TraceCharacterAssets::HandsClip_Count; ++Index)
+		{
+			const UAnimSequence* Clip = HandsAnims.IsValidIndex(Index) ? HandsAnims[Index].Get() : nullptr;
+			if (Clip == nullptr)
+			{
+				continue;
+			}
+			const float Expected = TraceCharacterAssets::HandsClipAuthoredSeconds[Index];
+			const float Actual = Clip->GetPlayLength();
+			if (FMath::Abs(Actual - Expected) > (1.f / 60.f))
+			{
+				Drift += FString::Printf(TEXT("  %s %.4fs (expected %.4fs)"),
+					TraceCharacterAssets::HandsClipNames[Index], Actual, Expected);
+			}
+		}
+		if (!Drift.IsEmpty())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("Pack hands: imported clip lengths have drifted from what TraceCharacter.cpp is ")
+				TEXT("timed against, so a pairing with the weapon clips may now be wrong:%s"), *Drift);
+		}
+	}
+
+	// Seed the pose NOW rather than on the first tick. A skeletal mesh with nothing playing shows its
+	// reference pose, and this rig's reference pose is the KNIFE hold (measured: the GLB's default
+	// node transforms are Idle_Knife's first frame), so a pistol player's first rendered frame would
+	// otherwise be a hand shaped for a blade.
+	HandsClipIndex = INDEX_NONE;
+	HandsClipTime = 0.f;
+	HandsAction = EHandsAction::None;
+	HandsLoadout = EHandsLoadout::Pistol;
+	UpdateHandsAnimation(0.f);
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("%s built the pack hands (%d bones, scale %.2f, rig loc (%.2f, %.2f, %.2f) yaw %.0f, ")
+		TEXT("'%s' rest at rig (%.2f, %.2f, %.2f), %d/%d clips resolved)."),
+		*GetName(), RefSkeleton.GetNum(), TraceCharacterLayout::HandsScale,
+		HandsLocation.X, HandsLocation.Y, HandsLocation.Z, TraceCharacterLayout::HandsYaw,
+		*TraceCharacterAssets::HandsWeaponBone.ToString(),
+		HandsWristRestRig.GetLocation().X, HandsWristRestRig.GetLocation().Y, HandsWristRestRig.GetLocation().Z,
+		[this]() { int32 N = 0; for (const TObjectPtr<UAnimSequence>& A : HandsAnims) { if (A != nullptr) { ++N; } } return N; }(),
+		TraceCharacterAssets::HandsClip_Count);
+	return true;
+}
+
+int32 ATraceCharacter::ResolveHandsClip(EHandsLoadout Loadout, EHandsAction Action) const
+{
+	using namespace TraceCharacterAssets;
+
+	// THE IDLE IS THE FLOOR. Every loadout has one and it is what an impossible pair — shoot with the
+	// knife, reload the Core — resolves to, rather than a wrong clip or an empty hand. The pack
+	// deliberately baked only the pairs that exist in play, so "no clip" is the normal answer to most
+	// of this table and is not an error.
+	int32 Idle = HandsClip_IdlePistol;
+	switch (Loadout)
+	{
+	case EHandsLoadout::Knife: Idle = HandsClip_IdleKnife; break;
+	case EHandsLoadout::Smg:   Idle = HandsClip_IdleSmg;   break;
+	case EHandsLoadout::Core:  Idle = HandsClip_IdleCore;  break;
+	default:                   Idle = HandsClip_IdlePistol; break;
+	}
+
+	int32 Clip = INDEX_NONE;
+	switch (Action)
+	{
+	case EHandsAction::None:
+		Clip = Idle;
+		break;
+
+	case EHandsAction::Draw:
+		Clip = (Loadout == EHandsLoadout::Knife) ? HandsClip_DrawKnife : INDEX_NONE;
+		break;
+
+	case EHandsAction::Stab:
+		Clip = (Loadout == EHandsLoadout::Knife) ? HandsClip_StabKnife : INDEX_NONE;
+		break;
+
+	case EHandsAction::Inspect:
+		Clip = (Loadout == EHandsLoadout::Knife) ? HandsClip_InspectKnife : INDEX_NONE;
+		break;
+
+	case EHandsAction::Shoot:
+		if (Loadout == EHandsLoadout::Pistol) { Clip = HandsClip_ShootPistol; }
+		else if (Loadout == EHandsLoadout::Smg) { Clip = HandsClip_ShootSmg; }
+		break;
+
+	case EHandsAction::Reload:
+		if (Loadout == EHandsLoadout::Pistol) { Clip = HandsClip_ReloadPistol; }
+		else if (Loadout == EHandsLoadout::Smg) { Clip = HandsClip_ReloadSmg; }
+		break;
+
+	case EHandsAction::Throw:
+		Clip = (Loadout == EHandsLoadout::Core) ? HandsClip_ThrowCore : INDEX_NONE;
+		break;
+
+	case EHandsAction::Jump:
+		switch (Loadout)
+		{
+		case EHandsLoadout::Knife: Clip = HandsClip_JumpKnife; break;
+		case EHandsLoadout::Smg:   Clip = HandsClip_JumpSmg;   break;
+		case EHandsLoadout::Core:  Clip = HandsClip_JumpCore;  break;
+		default:                   Clip = HandsClip_JumpPistol; break;
+		}
+		break;
+
+	case EHandsAction::Walljump:
+		switch (Loadout)
+		{
+		case EHandsLoadout::Knife: Clip = HandsClip_WalljumpKnife; break;
+		case EHandsLoadout::Smg:   Clip = HandsClip_WalljumpSmg;   break;
+		case EHandsLoadout::Core:  Clip = HandsClip_WalljumpCore;  break;
+		default:                   Clip = HandsClip_WalljumpPistol; break;
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	// A clip that exists in the table but failed to import degrades to the idle too, so one missing
+	// .uasset costs one action rather than the whole rig.
+	if (Clip == INDEX_NONE || !HandsAnims.IsValidIndex(Clip) || HandsAnims[Clip] == nullptr)
+	{
+		Clip = Idle;
+	}
+	return HandsAnims.IsValidIndex(Clip) && HandsAnims[Clip] != nullptr ? Clip : INDEX_NONE;
+}
+
+void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
+{
+	if (HandsPart == nullptr)
+	{
+		return;
+	}
+
+	const UWorld* World = GetWorld();
+
+	// --- Trace.Hands.Hold, checked FIRST ---------------------------------------------------------
+	//
+	// For the same reason the railgun's and the SMG's holds are checked first: a pinned pose has no
+	// shot, no reload and no jump behind it. And it is not a luxury here — Shoot_{Pistol,Smg} is
+	// 0.1667 s, which is ten frames at 60, so there is no way to photograph the trigger-pull frame
+	// without it. It also forces the loadout, which is the only way to see Idle_Core at all: carrying
+	// the Core is third person and the rig is hidden for the whole of it.
+	if (HandsDebugAlpha >= 0.f && World != nullptr && World->GetTimeSeconds() < HandsDebugUntil)
+	{
+		if (HandsAnims.IsValidIndex(HandsDebugClipIndex) && HandsAnims[HandsDebugClipIndex] != nullptr)
+		{
+			const UAnimSequence* Clip = HandsAnims[HandsDebugClipIndex];
+			const float Held = FMath::Clamp(HandsDebugAlpha, 0.f, 1.f) * Clip->GetPlayLength();
+
+			if (HandsClipIndex != HandsDebugClipIndex)
+			{
+				HandsClipIndex = HandsDebugClipIndex;
+				HandsPart->SetAnimation(HandsAnims[HandsClipIndex]);
+				HandsPart->Stop();
+			}
+			HandsClipTime = Held;
+			HandsLoadout = HandsDebugLoadout;
+			HandsPart->SetPosition(Held, /*bFireNotifies=*/false);
+		}
+		return;
+	}
+	if (HandsDebugAlpha >= 0.f)
+	{
+		HandsDebugAlpha = -1.f;
+		HandsDebugClipIndex = INDEX_NONE;
+	}
+
+	// --- 1. THE LOADOUT, from real state ----------------------------------------------------------
+	//
+	// Carrying the Core outranks the weapon selector, because a carrier's hands are ON the Core
+	// whatever is holstered. Everything else is the REPLICATED selector — the same value the damage
+	// table, the fire rate and the ammo counter read — so the hand shape and the weapon being
+	// simulated cannot disagree.
+	EHandsLoadout DesiredLoadout = EHandsLoadout::Pistol;
+	if (bIsCarrier)
+	{
+		DesiredLoadout = EHandsLoadout::Core;
+	}
+	else if (Weapon != nullptr)
+	{
+		switch (Weapon->GetEquippedWeapon())
+		{
+		case ETraceEquippedWeapon::Knife: DesiredLoadout = EHandsLoadout::Knife; break;
+		case ETraceEquippedWeapon::Smg:   DesiredLoadout = EHandsLoadout::Smg;   break;
+		default:                          DesiredLoadout = EHandsLoadout::Pistol; break;
+		}
+	}
+
+	// --- 2. EDGE-DETECT THE ACTIONS, all of them off state that already exists --------------------
+	//
+	// Priority, highest first. A NEW event replaces a running clip when it ranks at least as high, so
+	// a shot always cuts a jump (the recoil is the more urgent read) and an inspect flourish is
+	// interrupted by anything real — which is exactly what §5 requires of it.
+	//
+	//   5  shoot, stab      the frames a player is actually reading
+	//   4  reload, draw, throw
+	//   3  jump, wall jump
+	//   1  inspect
+	auto Rank = [](EHandsAction Action) -> int32
+	{
+		switch (Action)
+		{
+		case EHandsAction::Shoot:
+		case EHandsAction::Stab:     return 5;
+		case EHandsAction::Reload:
+		case EHandsAction::Draw:
+		case EHandsAction::Throw:    return 4;
+		case EHandsAction::Jump:
+		case EHandsAction::Walljump: return 3;
+		case EHandsAction::Inspect:  return 1;
+		default:                     return 0;
+		}
+	};
+
+	EHandsAction Event = EHandsAction::None;
+
+	const bool bReloading = (Weapon != nullptr) && Weapon->IsReloading();
+	const bool bSwinging = (Weapon != nullptr) && (Weapon->GetShootLockoutRemaining() > 0.f);
+	const bool bDeploying = (Weapon != nullptr) && Weapon->IsDeploying();
+	const bool bInspecting = TraceKnifeView::IsInspecting(this);
+
+	// A WALL JUMP AND A JUMP BOTH ARRIVE THROUGH OnJumped. The counter is what tells them apart, and
+	// it is the movement component's own predicted state rather than a second copy of the rule.
+	int32 WallJumps = HandsLastWallJumpCount;
+	if (const UTraceCharacterMovementComponent* Movement = GetTraceMovement())
+	{
+		WallJumps = Movement->GetWallJumpsSinceGround();
+	}
+	const bool bWallJumped = (HandsLastWallJumpCount >= 0) && (WallJumps > HandsLastWallJumpCount);
+
+	if (bHandsShotPending && (DesiredLoadout == EHandsLoadout::Pistol || DesiredLoadout == EHandsLoadout::Smg))
+	{
+		Event = EHandsAction::Shoot;
+	}
+	else if (bSwinging && !bHandsWasSwinging)
+	{
+		Event = EHandsAction::Stab;
+	}
+	else if (bReloading && !bHandsWasReloading)
+	{
+		Event = EHandsAction::Reload;
+	}
+	else if (bDeploying && !bHandsWasDeploying && DesiredLoadout == EHandsLoadout::Knife)
+	{
+		Event = EHandsAction::Draw;
+	}
+	else if (bHandsWasCarrier && !bIsCarrier)
+	{
+		// THE THROW, caught on the falling edge of the carry. By this frame the loadout has already
+		// stopped being Core, so the clip is played against a FORCED Core loadout below — the hands
+		// have to finish the throw they started. The camera is still blending back out of third
+		// person for the first 0.35 s of it, so what the player sees is the follow-through, which is
+		// the right half to see.
+		Event = EHandsAction::Throw;
+	}
+	else if (bWallJumped)
+	{
+		Event = EHandsAction::Walljump;
+	}
+	else if (bHandsJumpPending)
+	{
+		Event = EHandsAction::Jump;
+	}
+	else if (bInspecting && !bHandsWasInspecting)
+	{
+		// *** INSPECT IS DRIVEN FROM REAL STATE AFTER ALL, and this is the better answer. ***
+		//
+		// §5 owns the F bind and the knife's own 3.20 s flourish, and it publishes
+		// TraceKnifeView::IsInspecting() as a presentation-only query. Reading it means the hand and
+		// the blade start on the SAME FRAME off ONE fact, instead of two files each being told
+		// separately and hoping they agree — which is the two-objects-agreeing-about-one-fact failure
+		// this codebase logs by name. PlayHandsAction() remains for anything that has no such state
+		// to publish. Last in the chain because Inspect is the lowest-ranked action there is: a
+		// flourish must never win a race against a shot or a swap.
+		Event = EHandsAction::Inspect;
+	}
+
+	bHandsShotPending = false;
+	bHandsJumpPending = false;
+	HandsLastWallJumpCount = WallJumps;
+	bHandsWasReloading = bReloading;
+	bHandsWasSwinging = bSwinging;
+	bHandsWasDeploying = bDeploying;
+	bHandsWasCarrier = bIsCarrier;
+	bHandsWasInspecting = bInspecting;
+
+	// --- 3. Settle which clip is playing ----------------------------------------------------------
+
+	// *** THE THROW IS THE ONE ACTION THAT OUTLIVES ITS LOADOUT, and it is why the two lines below are
+	// not simply "loadout = desired". *** bIsCarrier is already FALSE by the frame the throw is
+	// detected — losing the Core is what the throw IS — so by the ordinary rule the hands would snap
+	// to a pistol grip on frame one of a 1.050 s wind-up-and-follow-through. bHandsLoadoutLatched
+	// holds the cradle open for exactly the length of that clip, and ANY other event releases it, so
+	// a player who throws and immediately shoots gets the recoil on the very next frame rather than
+	// waiting out a flourish.
+	if (Event != EHandsAction::None && Event != EHandsAction::Throw)
+	{
+		bHandsLoadoutLatched = false;
+	}
+
+	// A loadout change cancels whatever action was running: the clip belongs to the old hand shape and
+	// finishing it would be a pistol recoil played by a fist closed on a knife. Settled BEFORE the
+	// event is taken, so a swap and its own Draw on the same frame do not cancel each other.
+	if (!bHandsLoadoutLatched && DesiredLoadout != HandsLoadout)
+	{
+		HandsLoadout = DesiredLoadout;
+		HandsAction = EHandsAction::None;
+		HandsClipTime = 0.f;
+	}
+
+	if (Event != EHandsAction::None && Rank(Event) >= Rank(HandsAction))
+	{
+		HandsAction = Event;
+		HandsClipTime = 0.f;
+		if (Event == EHandsAction::Throw)
+		{
+			HandsLoadout = EHandsLoadout::Core;
+			bHandsLoadoutLatched = true;
+		}
+	}
+
+	const int32 DesiredClip = ResolveHandsClip(HandsLoadout, HandsAction);
+	if (DesiredClip == INDEX_NONE)
+	{
+		return;
+	}
+
+	const UAnimSequence* Clip = HandsAnims[DesiredClip];
+	const float ClipLength = FMath::Max(Clip->GetPlayLength(), KINDA_SMALL_NUMBER);
+	const bool bLooping = (HandsAction == EHandsAction::None);
+
+	if (DesiredClip != HandsClipIndex)
+	{
+		HandsClipIndex = DesiredClip;
+		HandsPart->SetAnimation(HandsAnims[HandsClipIndex]);
+
+		// Stop(), so nothing advances but this function. The single node instance's own clock adds
+		// DeltaTime and THEN evaluates, which is precisely the per-frame-reader failure the spec
+		// warns about — on a 0.1667 s shoot clip it means frame 0, the trigger pull, is never drawn.
+		HandsPart->Stop();
+		if (Event == EHandsAction::None && HandsAction != EHandsAction::None)
+		{
+			// A clip that changed without an event is a loadout swap under a running action; restart
+			// rather than resume at a time that belongs to a different clip's length.
+			HandsClipTime = 0.f;
+		}
+	}
+
+	// --- 4. WHERE IN THE CLIP, and this is the half the spec's warning is about --------------------
+	//
+	// TWO KINDS OF CLIP, and neither of them is a free-running timer.
+	//
+	//   READ OFF THE WEAPON. The reload's position is a pure function of UTraceWeaponComponent's own
+	//   replicated deadline, every frame. That is what makes the picture unable to lie: a reload that
+	//   is cancelled, that arrives late over the network, or that an ability shortened still puts the
+	//   left hand exactly where the gun's remaining time says it should be. It is the same
+	//   construction UpdateSmgAnimation uses for the magazine, and it also resolves the 0.800 s
+	//   authored / 1.300 s gameplay conflict the same way — by stretching, not by holding.
+	//
+	//   ADVANCED BY THIS FUNCTION, sampled BEFORE it advances. Everything else. HandsClipTime is
+	//   written to the component first and incremented afterwards, so the frame that follows a shot
+	//   draws t=0.
+	float SampleTime = HandsClipTime;
+	float PlayRate = 1.f;
+
+	if (HandsAction == EHandsAction::Reload && Weapon != nullptr && Weapon->IsReloading())
+	{
+		const float Total = FMath::Max(Weapon->GetReloadSeconds(), KINDA_SMALL_NUMBER);
+		const float Phase = FMath::Clamp(1.f - (Weapon->GetReloadRemaining() / Total), 0.f, 1.f);
+		SampleTime = Phase * ClipLength;
+		HandsClipTime = SampleTime;
+	}
+	else
+	{
+		switch (HandsAction)
+		{
+		case EHandsAction::Inspect:
+			// *** THE ONE REAL DISCREPANCY IN THE PACK. *** A_Hands_Inspect_Knife is 5.600 s and the
+			// knife's own Inspect is 3.200 s, though the README's pairing table calls them
+			// frame-for-frame. The knife carries the authoritative four catch beats inside 3.20 s, so
+			// the knife is the clock and the hand plays at exactly 1.75x to land on it.
+			PlayRate = TraceCharacterLayout::HandsInspectAuthoredSeconds
+				/ FMath::Max(TraceCharacterLayout::KnifeInspectAuthoredSeconds, KINDA_SMALL_NUMBER);
+			break;
+
+		default:
+			// EVERYTHING ELSE AT ITS AUTHORED RATE, and Stab is the one where that is a decision
+			// rather than a default. The pack's Stab_Knife is 0.300 s and the gameplay swing lockout
+			// (TraceMelee::GetSwingAnimSeconds, 0.32 s shipped) is 20 ms longer, so stretching would
+			// have made the hand agree with the LOCKOUT and disagree with the BLADE — and §5 plays
+			// A_Knife_Stab at its authored 0.300 s. The spec's instruction is explicit: the hand and
+			// weapon clips are authored frame-for-frame, do not re-time them. The blade wins; the
+			// 20 ms of lockout left after the thrust lands is not a thing anyone can see.
+			//
+			// Draw is here for the same family of reasons — see HandsDrawAuthoredSeconds for why the
+			// wrist flip is allowed to overrun the pullout instead of being compressed 4x.
+			PlayRate = 1.f;
+			break;
+		}
+	}
+
+	SampleTime = bLooping ? FMath::Fmod(SampleTime, ClipLength) : FMath::Clamp(SampleTime, 0.f, ClipLength);
+	HandsPart->SetPosition(SampleTime, /*bFireNotifies=*/false);
+
+	// ADVANCED AFTER THE SAMPLE. The reload branch above already wrote its own absolute position, so
+	// this only moves the clips that are genuinely time-driven.
+	if (DeltaSeconds > 0.f && !(HandsAction == EHandsAction::Reload && Weapon != nullptr && Weapon->IsReloading()))
+	{
+		HandsClipTime = SampleTime + DeltaSeconds * PlayRate;
+	}
+
+	// A one-shot that has run out drops back to the idle. Non-looping clips hold their last frame,
+	// and the README's own rule makes that safe: "actions start and end on their hold pose".
+	if (!bLooping && HandsClipTime >= ClipLength)
+	{
+		HandsAction = EHandsAction::None;
+		HandsClipTime = 0.f;
+		bHandsLoadoutLatched = false;
+	}
+}
+
+void ATraceCharacter::UpdateWeaponsFollowHands()
+{
+	if (!bHandsRigActive || HandsPart == nullptr)
+	{
+		return;
+	}
+
+	// wrist_right AS OF THIS FRAME'S POSE, in rig space, as a delta from the reference pose the
+	// weapons' rest transforms were captured against. The tick prerequisite in
+	// BuildPackHandsViewModel is what guarantees "this frame's" is true rather than nearly true.
+	const FTransform WristNow = HandsPart->GetSocketTransform(
+		TraceCharacterAssets::HandsWeaponBone, RTS_Component) * HandsPart->GetRelativeTransform();
+
+	HandsWristDelta = HandsWristRestRig.Inverse() * WristNow;
+
+	// EVERY weapon part, not only the ones with an animation. UpdateRailgunFire early-outs when
+	// nothing is firing and the twelve procedural cube-gun parts never move at all, so a pass that
+	// only touched the animated ones would leave the rest hanging in mid-air while the hand walked
+	// away from them. Sixteen transforms on one pawn is nothing; a gun left behind by a jump is not.
+	for (int32 Index = 0; Index < PistolWeaponParts.Num(); ++Index)
+	{
+		if (PistolWeaponParts[Index] != nullptr && PistolWeaponRest.IsValidIndex(Index))
+		{
+			const FTransform Pose = PistolWeaponRest[Index] * HandsWristDelta;
+			PistolWeaponParts[Index]->SetRelativeTransform(Pose);
+		}
+	}
+	for (int32 Index = 0; Index < SmgWeaponParts.Num(); ++Index)
+	{
+		if (SmgWeaponParts[Index] != nullptr && SmgWeaponRest.IsValidIndex(Index))
+		{
+			const FTransform Pose = SmgWeaponRest[Index] * HandsWristDelta;
+			SmgWeaponParts[Index]->SetRelativeTransform(Pose);
+		}
+	}
+}
+
+void ATraceCharacter::SetViewModelWeaponPose(UStaticMeshComponent* Part,
+	const FVector& RigLocation, const FRotator& RigRotation)
+{
+	if (Part == nullptr)
+	{
+		return;
+	}
+
+	// On the fallback rig HandsWristDelta is identity and this is the same write v30 made. With the
+	// pack hands it is the same rig-space pose, carried to wherever the wrist is now.
+	const FTransform Pose = FTransform(RigRotation, RigLocation) * HandsWristDelta;
+	Part->SetRelativeLocationAndRotation(Pose.GetLocation(), Pose.GetRotation());
+}
+
+bool ATraceCharacter::UsesPackHands() const
+{
+	return HandsPart != nullptr;
+}
+
+USkeletalMeshComponent* ATraceCharacter::GetViewModelHandsMesh() const
+{
+	return HandsPart;
+}
+
+FName ATraceCharacter::GetWeaponAttachBoneName()
+{
+	return TraceCharacterAssets::HandsWeaponBone;
+}
+
+void ATraceCharacter::PlayHandsAction(EHandsAction Action)
+{
+	if (HandsPart == nullptr || Action == EHandsAction::None)
+	{
+		return;
+	}
+
+	// Refused rather than mis-played when the pack did not bake this pair — ResolveHandsClip would
+	// silently answer with the idle, and an inspect that quietly did nothing is a better outcome than
+	// an inspect that played a jump.
+	if (ResolveHandsClip(HandsLoadout, Action) == ResolveHandsClip(HandsLoadout, EHandsAction::None))
+	{
+		return;
+	}
+
+	HandsAction = Action;
+	HandsClipTime = 0.f;
+}
+
+void ATraceCharacter::OnJumped_Implementation()
+{
+	Super::OnJumped_Implementation();
+
+	// A LATCH, not a PlayAnimation. The clip's time has to be sampled before it is advanced and that
+	// ordering lives in exactly one place; setting the pose from an event handler would put a second
+	// writer on the same clock.
+	bHandsJumpPending = true;
+}
+
+bool ATraceCharacter::DebugGetHandsState(FString& OutClipName, float& OutTimeSeconds,
+	float& OutLengthSeconds, FString& OutLoadout) const
+{
+	OutClipName = TEXT("NONE");
+	OutTimeSeconds = -1.f;
+	OutLengthSeconds = -1.f;
+	OutLoadout = TEXT("-");
+
+	if (HandsPart == nullptr)
+	{
+		return false;
+	}
+
+	switch (HandsLoadout)
+	{
+	case EHandsLoadout::Knife:  OutLoadout = TEXT("knife");  break;
+	case EHandsLoadout::Pistol: OutLoadout = TEXT("pistol"); break;
+	case EHandsLoadout::Smg:    OutLoadout = TEXT("smg");    break;
+	case EHandsLoadout::Core:   OutLoadout = TEXT("core");   break;
+	default: break;
+	}
+
+	// READ BACK OFF THE COMPONENT, not off HandsClipTime — the same argument DebugGetRailgunEmissive
+	// makes for reading EmissiveIntensity instead of trusting the write. If the single node instance
+	// ever starts advancing on its own again, this is what shows it.
+	if (const UAnimSingleNodeInstance* Instance = HandsPart->GetSingleNodeInstance())
+	{
+		OutTimeSeconds = Instance->GetCurrentTime();
+		if (const UAnimSequenceBase* Playing = Cast<UAnimSequenceBase>(Instance->GetAnimationAsset()))
+		{
+			OutClipName = Playing->GetName();
+			OutLengthSeconds = Playing->GetPlayLength();
+		}
+	}
+	if (HandsAnims.IsValidIndex(HandsClipIndex))
+	{
+		OutClipName = TraceCharacterAssets::HandsClipNames[HandsClipIndex];
+	}
+	return true;
+}
+
+void ATraceCharacter::DebugHoldHandsClip(EHandsLoadout Loadout, EHandsAction Action,
+	float Alpha, float HoldSeconds)
+{
+	const UWorld* World = GetWorld();
+	HandsDebugLoadout = Loadout;
+	HandsDebugClipIndex = (Alpha >= 0.f) ? ResolveHandsClip(Loadout, Action) : INDEX_NONE;
+	HandsDebugAlpha = (HandsDebugClipIndex != INDEX_NONE) ? Alpha : -1.f;
+	HandsDebugUntil = (World != nullptr && HandsDebugAlpha >= 0.f)
+		? World->GetTimeSeconds() + FMath::Max(0.f, HoldSeconds) : -1.0;
+
+	// HOW THIS REACHES THE CORE CRADLE AT ALL, since carrying the Core is third person and hides the
+	// whole rig: it forces the LOADOUT without faking the carry. The pawn is not a carrier, so
+	// UpdateViewBlend keeps it in first person and the rig stays on screen — which is the only way
+	// Idle_Core and Throw_Core can be photographed. This nudge is for the case where a hold IS asked
+	// for mid-carry; UpdateViewBlend re-asserts visibility every frame from the blend, so it is the
+	// first frame only and cannot strand a hidden rig on screen.
+	if (HandsDebugAlpha >= 0.f && !bIsCarrier)
+	{
+		SetViewModelVisible(true);
+	}
+}
+
 void ATraceCharacter::UpdateRailgunFire(float DeltaSeconds)
 {
 	if (RailgunBodyPart == nullptr)
@@ -3129,28 +4298,26 @@ void ATraceCharacter::UpdateRailgunFire(float DeltaSeconds)
 	const FVector Recoil(-TraceCharacterLayout::RailgunRecoilBackUU * S * Mechanical, 0.f, 0.f);
 	const FRotator RecoilPitch(-TraceCharacterLayout::RailgunRecoilPitchDegrees * Mechanical, 0.f, 0.f);
 
-	RailgunBodyPart->SetRelativeLocationAndRotation(
+	// [SPEC v31 §6] The three writes below are UNCHANGED as arithmetic — the same rig-space pose v30
+	// computed — and go out through SetViewModelWeaponPose so the gun rides wrist_right when the pack
+	// hands are up. With no pack hands the delta is identity and this is the same call it always was.
+	SetViewModelWeaponPose(RailgunBodyPart,
 		TraceCharacterLayout::RailgunOrigin + Recoil, RecoilPitch);
 
 	const float Throw = TraceCharacterLayout::RailgunRailThrowUU * S * Mechanical;
 	const float Cant = TraceCharacterLayout::RailgunRailCantDegrees * Mechanical;
 	const FVector HingeOffset(-5.0f, 7.8f, 4.5f);
 
-	if (RailgunRailLeftPart != nullptr)
-	{
-		RailgunRailLeftPart->SetRelativeLocationAndRotation(
-			TraceCharacterLayout::RailgunOrigin
-				+ FVector(HingeOffset.X, -HingeOffset.Y, HingeOffset.Z) * S
-				+ Recoil + FVector(0.f, -Throw, 0.f),
-			RecoilPitch + FRotator(0.f, -Cant, 0.f));
-	}
-	if (RailgunRailRightPart != nullptr)
-	{
-		RailgunRailRightPart->SetRelativeLocationAndRotation(
-			TraceCharacterLayout::RailgunOrigin + HingeOffset * S
-				+ Recoil + FVector(0.f, Throw, 0.f),
-			RecoilPitch + FRotator(0.f, Cant, 0.f));
-	}
+	SetViewModelWeaponPose(RailgunRailLeftPart,
+		TraceCharacterLayout::RailgunOrigin
+			+ FVector(HingeOffset.X, -HingeOffset.Y, HingeOffset.Z) * S
+			+ Recoil + FVector(0.f, -Throw, 0.f),
+		RecoilPitch + FRotator(0.f, -Cant, 0.f));
+
+	SetViewModelWeaponPose(RailgunRailRightPart,
+		TraceCharacterLayout::RailgunOrigin + HingeOffset * S
+			+ Recoil + FVector(0.f, Throw, 0.f),
+		RecoilPitch + FRotator(0.f, Cant, 0.f));
 
 	// Finished: park the state so the next shot restarts cleanly, and so a rig that is never fired
 	// again is not doing this arithmetic forever.
@@ -3432,24 +4599,16 @@ void ATraceCharacter::UpdateSmgAnimation(float DeltaSeconds)
 	// with the rest of the gun, so a reload during a burst does not tear the cell off the well.
 	const float MagDrop = (ReloadPhase >= 0.f) ? TraceCharacterLayout::SmgMagDrop(ReloadPhase) : 0.f;
 
-	SmgBodyPart->SetRelativeLocationAndRotation(
+	// [SPEC v31 §6] Same four poses as v30, routed through SetViewModelWeaponPose so they ride
+	// wrist_right when the pack hands are up. Identity delta on the fallback rig.
+	SetViewModelWeaponPose(SmgBodyPart,
 		TraceCharacterLayout::SmgOrigin + RecoilOffset, RecoilPitch);
-
-	if (SmgWallLeftPart != nullptr)
-	{
-		SmgWallLeftPart->SetRelativeLocationAndRotation(
-			TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, -Throw, 0.f), RecoilPitch);
-	}
-	if (SmgWallRightPart != nullptr)
-	{
-		SmgWallRightPart->SetRelativeLocationAndRotation(
-			TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, Throw, 0.f), RecoilPitch);
-	}
-	if (SmgMagPart != nullptr)
-	{
-		SmgMagPart->SetRelativeLocationAndRotation(
-			TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, 0.f, -MagDrop * S), RecoilPitch);
-	}
+	SetViewModelWeaponPose(SmgWallLeftPart,
+		TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, -Throw, 0.f), RecoilPitch);
+	SetViewModelWeaponPose(SmgWallRightPart,
+		TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, Throw, 0.f), RecoilPitch);
+	SetViewModelWeaponPose(SmgMagPart,
+		TraceCharacterLayout::SmgOrigin + RecoilOffset + FVector(0.f, 0.f, -MagDrop * S), RecoilPitch);
 
 	// Finished: park the state so the next round restarts the cycle cleanly. At 600 RPM the next
 	// shot lands on the frame after this, which is exactly what "set it to loop" means.
@@ -3638,6 +4797,16 @@ void ATraceCharacter::SetViewModelVisible(bool bVisible)
 			Part->SetVisibility(bVisible);
 		}
 	}
+
+	// [SPEC v31 §6] The pack hands are not in ViewModelParts — that array is typed to static meshes,
+	// and UTraceWeaponComponent's knife rule walks it by name looking for gun parts to hide. Kept out
+	// of it deliberately: the hands must NEVER be hidden by the weapon selector, which is the same
+	// rule IsViewModelHandPart already encodes for the cube hands. They follow the RIG's visibility
+	// and nothing else.
+	if (HandsPart != nullptr)
+	{
+		HandsPart->SetVisibility(bVisible);
+	}
 }
 
 void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
@@ -3706,6 +4875,16 @@ void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
 	ViewModelCrouchDip = FMath::FInterpTo(ViewModelCrouchDip, CrouchLeanAlpha, DeltaSeconds,
 		TraceCharacterLayout::CrouchLeanInterpSpeed);
 
+	// [SPEC v31 §6] ABOVE THE bAnimate GATE, on purpose, and for the reason the comment on that gate
+	// already gives about the recoil kick: a hidden rig must keep its state moving or it comes back
+	// wrong. Two of these are not hypothetical. Throw_Core is 1.050 s and STARTS while the rig is
+	// hidden — the throw is what takes the camera out of third person — so a rig that only animated
+	// while visible would snap into the middle of a follow-through it never began. And the wall-jump
+	// edge detector reads a counter that keeps moving while a carrier runs; frozen, it would fire one
+	// spurious wall jump on the frame the hands came back.
+	UpdateHandsAnimation(DeltaSeconds);
+	UpdateWeaponsFollowHands();
+
 	if (!bAnimate)
 	{
 		return;
@@ -3724,6 +4903,12 @@ void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
 			ViewModelSwayYaw, 0.f);
 
 	ViewModelRoot->SetRelativeLocationAndRotation(TraceCharacterLayout::ViewModelRestLocation + Offset, Rotation);
+
+	// [SPEC v31 §6] The two calls above the gate have already picked the hands' frame and carried
+	// EVERY weapon part to wherever wrist_right ended up. What follows writes the guns' own part
+	// motion ON TOP, through SetViewModelWeaponPose, which folds the same wrist delta in — so the
+	// order matters: run the other way round, the recoil would be composed and then immediately
+	// overwritten by the rest pose, i.e. a gun that never recoils on a hand that does.
 
 	// The railgun's own animation runs on top of the rig transform above: the rig carries the whole
 	// weapon-and-hands assembly, this moves parts of the weapon relative to it.
@@ -3753,6 +4938,12 @@ void ATraceCharacter::NotifyWeaponFired()
 	LastFireKickTime = Now;
 
 	ViewModelKick = 1.f;
+
+	// [SPEC v31 §6] The hand's own recoil clip, armed by the SAME real shot that arms the two guns'.
+	// A LATCH rather than a PlayAnimation, because Shoot_{Pistol,Smg} is 0.1667 s — ten frames at 60 —
+	// and the sample-before-advance ordering that makes its frame 0 exist at all lives in exactly one
+	// place. A second writer here would be the per-frame-reader bug in a different costume.
+	bHandsShotPending = true;
 
 	// Restart the railgun's discharge, time-warped so it always finishes before the next round can
 	// leave: at 150 RPM that is 0.36 s for the clip's 0.85 s tail, and it shortens further for the
@@ -5437,6 +6628,144 @@ namespace
 						TEXT("[ViewModel.Equip] slot %d (%s) -> %s (refusal=%d); rig drawn as of the previous frame: %s."),
 						Slot, LexToString(Desired), bOk ? TEXT("accepted") : TEXT("REFUSED"),
 						static_cast<int32>(Refusal), ViewModelShownGunName(Character->GetShownGun()));
+					return false;
+				}),
+				0.f);
+		}));
+
+	// =============================================================================================
+	// SPEC v31 §6 — THE HANDS
+	// =============================================================================================
+	//
+	// Two commands, and between them they answer the two questions a screenshot cannot.
+	//
+	//   Probe  says WHICH clip is playing, at what time, on which loadout, and whether the rig is the
+	//          pack's or the procedural fallback. A photograph of a hand cannot tell you that the
+	//          hand is playing Idle_Pistol rather than sitting in the reference pose because nothing
+	//          ever started a clip — and those look nearly identical for the knife loadout, since the
+	//          GLB's default node transforms ARE Idle_Knife's first frame.
+	//   Hold   pins a pose. Without it, four of the sixteen action clips cannot be photographed at
+	//          all: Shoot_{Pistol,Smg} is 0.1667 s, and the whole `core` loadout is third person by
+	//          the rules of the game, so Idle_Core and Throw_Core are never on screen in normal play.
+
+	ATraceCharacter::EHandsLoadout ParseHandsLoadout(const FString& Text)
+	{
+		if (Text.Equals(TEXT("knife"), ESearchCase::IgnoreCase)) { return ATraceCharacter::EHandsLoadout::Knife; }
+		if (Text.Equals(TEXT("smg"), ESearchCase::IgnoreCase))   { return ATraceCharacter::EHandsLoadout::Smg; }
+		if (Text.Equals(TEXT("core"), ESearchCase::IgnoreCase))  { return ATraceCharacter::EHandsLoadout::Core; }
+		return ATraceCharacter::EHandsLoadout::Pistol;
+	}
+
+	ATraceCharacter::EHandsAction ParseHandsAction(const FString& Text)
+	{
+		if (Text.Equals(TEXT("draw"), ESearchCase::IgnoreCase))     { return ATraceCharacter::EHandsAction::Draw; }
+		if (Text.Equals(TEXT("stab"), ESearchCase::IgnoreCase))     { return ATraceCharacter::EHandsAction::Stab; }
+		if (Text.Equals(TEXT("inspect"), ESearchCase::IgnoreCase))  { return ATraceCharacter::EHandsAction::Inspect; }
+		if (Text.Equals(TEXT("shoot"), ESearchCase::IgnoreCase))    { return ATraceCharacter::EHandsAction::Shoot; }
+		if (Text.Equals(TEXT("reload"), ESearchCase::IgnoreCase))   { return ATraceCharacter::EHandsAction::Reload; }
+		if (Text.Equals(TEXT("throw"), ESearchCase::IgnoreCase))    { return ATraceCharacter::EHandsAction::Throw; }
+		if (Text.Equals(TEXT("jump"), ESearchCase::IgnoreCase))     { return ATraceCharacter::EHandsAction::Jump; }
+		if (Text.Equals(TEXT("walljump"), ESearchCase::IgnoreCase)) { return ATraceCharacter::EHandsAction::Walljump; }
+		return ATraceCharacter::EHandsAction::None;
+	}
+
+	FAutoConsoleCommand CmdHandsProbe(
+		TEXT("Trace.Hands.Probe"),
+		TEXT("Spec v31 §6. Reports the first-person hand rig: pack mesh or procedural fallback, the "
+		     "loadout, the clip actually loaded on the component and its playhead, and where "
+		     "wrist_right is in rig space. Optional DelaySeconds so one deferred-exec batch can sample "
+		     "it after an equip or a hold has landed."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Delay = (Args.Num() > 0) ? FMath::Max(0.f, FCString::Atof(*Args[0])) : 0.f;
+
+			double Elapsed = 0.0;
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([Elapsed, Delay](float DeltaTime) mutable -> bool
+				{
+					Elapsed += DeltaTime;
+					if (Elapsed < Delay)
+					{
+						return true;
+					}
+
+					ATraceCharacter* Character = FindDebugLocalCharacter(FindDebugGameWorld());
+					if (Character == nullptr)
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[Hands] no local pawn."));
+						return false;
+					}
+
+					FString Clip, Loadout;
+					float Time = -1.f, Length = -1.f;
+					const bool bPack = Character->DebugGetHandsState(Clip, Time, Length, Loadout);
+
+					// The wrist in RIG space, which is the number every weapon offset is expressed
+					// against. Printed because "the gun is in the wrong place" and "the hand is in the
+					// wrong place" look identical in a screenshot and have different fixes.
+					FString Wrist = TEXT("-");
+					if (const USkeletalMeshComponent* Hands = Character->GetViewModelHandsMesh())
+					{
+						const FTransform W = Hands->GetSocketTransform(
+							ATraceCharacter::GetWeaponAttachBoneName(), RTS_Component) * Hands->GetRelativeTransform();
+						Wrist = FString::Printf(TEXT("(%.2f, %.2f, %.2f)"),
+							W.GetLocation().X, W.GetLocation().Y, W.GetLocation().Z);
+					}
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[Hands] rig=%s loadout=%s clip=%s t=%.4f/%.4fs wristRig=%s vmVisible=%d shownGun=%s"),
+						bPack ? TEXT("PACK (SK_TraceHands)") : TEXT("PROCEDURAL CUBES (fallback)"),
+						*Loadout, *Clip, Time, Length, *Wrist,
+						Character->IsViewModelVisible() ? 1 : 0,
+						ViewModelShownGunName(Character->GetShownGun()));
+					return false;
+				}),
+				0.f);
+		}));
+
+	FAutoConsoleCommand CmdHandsHold(
+		TEXT("Trace.Hands.Hold"),
+		TEXT("Trace.Hands.Hold <knife|pistol|smg|core> <none|draw|stab|inspect|shoot|reload|throw|jump|walljump> "
+		     "[Alpha] [HoldSeconds] [DelaySeconds]. Dev only. Pins one hand clip at Alpha of its length "
+		     "and forces the rig visible, so a 0.1667 s recoil frame — or the Core cradle, which is "
+		     "third person in real play — can be photographed. Alpha < 0 releases."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const ATraceCharacter::EHandsLoadout Loadout =
+				ParseHandsLoadout(Args.Num() > 0 ? Args[0] : FString());
+			const ATraceCharacter::EHandsAction Action =
+				ParseHandsAction(Args.Num() > 1 ? Args[1] : FString());
+			const float Alpha = (Args.Num() > 2) ? FCString::Atof(*Args[2]) : 0.f;
+			const float Hold = (Args.Num() > 3) ? FMath::Max(0.f, FCString::Atof(*Args[3])) : 6.f;
+			const float Delay = (Args.Num() > 4) ? FMath::Max(0.f, FCString::Atof(*Args[4])) : 0.f;
+
+			double Elapsed = 0.0;
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda(
+					[Elapsed, Loadout, Action, Alpha, Hold, Delay](float DeltaTime) mutable -> bool
+				{
+					Elapsed += DeltaTime;
+					if (Elapsed < Delay)
+					{
+						return true;
+					}
+
+					ATraceCharacter* Character = FindDebugLocalCharacter(FindDebugGameWorld());
+					if (Character == nullptr)
+					{
+						// Retry: a deferred-exec batch usually fires before the first pawn exists.
+						return Elapsed < Delay + 90.f;
+					}
+
+					Character->DebugHoldHandsClip(Loadout, Action, Alpha, Hold);
+
+					FString Clip, Reported;
+					float Time = -1.f, Length = -1.f;
+					Character->DebugGetHandsState(Clip, Time, Length, Reported);
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[Hands.Hold] loadout=%d action=%d alpha=%.3f for %.1fs (rig=%s)."),
+						static_cast<int32>(Loadout), static_cast<int32>(Action), Alpha, Hold,
+						Character->UsesPackHands() ? TEXT("pack") : TEXT("FALLBACK - nothing to hold"));
 					return false;
 				}),
 				0.f);

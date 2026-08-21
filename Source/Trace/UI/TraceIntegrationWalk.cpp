@@ -40,6 +40,7 @@
 #include "UnrealClient.h"
 
 #include "Trace.h"   // LogTraceGame
+#include "Core/TraceCharacter.h"   // UsesPackHands() — the walk names its frames after the rig it sees
 
 #if !UE_BUILD_SHIPPING
 
@@ -297,84 +298,191 @@ namespace TraceIntegrationWalkFile
 	}
 
 	/**
-	 * THE THREE WEAPON STATES, PRESSED ON THE KEYBOARD — spec v30 §§2-4, integration pass.
+	 * THE THREE WEAPON STATES, PRESSED ON THE KEYBOARD — spec v31 §§1, 5 and 6, integration pass.
 	 *
-	 * WHY THIS IS A WALK AND NOT THREE LAUNCHES. Spec v30's opening complaint is that nothing on
-	 * screen told the player which gun they hold, so the deliverable is a TRANSITION: press 3 and the
-	 * picture must change. One editor launch per state cannot photograph a transition — it can only
-	 * photograph three separate first frames, each of which could have been produced by a gun that
-	 * never changed. This presses 2, then 3, then 1 in ONE match, on the real binds (StowGuns=1,
-	 * EquipPistol=2, EquipSmg=3 — Settings/TraceUserSettings.cpp), and photographs each.
+	 * *** RE-AUTHORED FOR v31. THE KEYS MOVED AND THE HANDS ARRIVED. ***
+	 *
+	 * It used to press Two / Three / One under the v30 layout (1 = STOW GUNS, 2 = PISTOL, 3 = SMG)
+	 * and file the frames as `41_key2_pistol`, `42_key3_smg`, `48_key1_neither`. Spec v31 §1 flipped
+	 * UTraceMeleeSettings::bDualWieldKnife OFF, deleted the stow state and re-keyed all three slots to
+	 * **1 = PISTOL, 2 = SMG, 3 = KNIFE**, so every one of those step names named the wrong weapon and
+	 * the middle of the walk — Trace.Smg.Hold, the R reload, the 4.6 s burst — was running with the
+	 * KNIFE out, where none of it means anything. The frames were still honest pictures of the game;
+	 * they were filed under lies. This walk now presses the v31 keys in the v31 order.
+	 *
+	 * WHY THIS IS A WALK AND NOT THREE LAUNCHES. The deliverable is a TRANSITION: press 3 and the
+	 * picture must change. One editor launch per state cannot photograph a transition — only three
+	 * separate first frames, each of which could have been produced by a game that never changed.
 	 *
 	 * NOTHING HERE CALLS AN EQUIP FUNCTION. Trace.ViewModel.Equip exists and would be easier, but it
 	 * goes in behind the keybinding, so a walk built on it would still pass if the 3 key were unbound,
 	 * stolen by another action, or eaten by a UI focus rule. That is a real failure mode in this
 	 * project — Trace.Keys.LegacySteal exists because a bind was stolen once — so the integration pass
-	 * presses keys.
+	 * presses keys. Every press below is the SHIPPED DEFAULT of a rebindable row in
+	 * TraceInputActions::All(): One/Two/Three (PISTOL/SMG/KNIFE), LeftMouseButton (FIRE), R (RELOAD),
+	 * RightMouseButton (MELEE, spec v28 §10), F (INSPECT, spec v31 §5) and SpaceBar (JUMP).
+	 *
+	 * WHAT v31 ADDS BEYOND THE KEYS: every state is sampled with `Trace.Hands.Probe`, which reads the
+	 * rig kind, the loadout, the clip actually loaded on the component and its playhead OFF THE
+	 * COMPONENT rather than off this harness's belief about it. A frame that shows hands is one
+	 * claim; a frame taken 0.1 s after a log line naming `A_Hands_Reload_Smg t=0.31/0.80s` is two
+	 * independent ones. The knife states are sampled with `Trace.Knife.PackStatus` for the same
+	 * reason — it names SK_TraceKnife or the v27 cube blade, the live clip and the emissive.
 	 *
 	 * THE GAPS ARE DELIBERATE, in this order:
-	 *   - 0.60 s after a key before the frame: the selector replicates and the rig is shown or hidden
-	 *     in Tick, so a frame taken in the same frame as the press shows the state BEFORE it.
-	 *   - the burst is 0.50 s = five rounds at 600 RPM, enough that the clip visibly drops.
-	 *   - the shot-frame pose is PINNED with Trace.Smg.Hold rather than caught: the fire cycle is
-	 *     0.100 s and no unattended screenshot can land inside it reliably. The walls thrown apart and
-	 *     the cyan at its peak are photographed from the pinned pose, and Trace.ViewModel.Guns prints
-	 *     the spread and the intensity from the same moment.
-	 *   - the reload frame is 0.45 s after R: the 0.8 s authored motion is time-stretched to the 1.3 s
-	 *     gameplay reload, so the cell is fully out around 0.42 s in.
-	 *   - the last burst is 4.60 s, longer than the 4.00 s it takes to empty a 40-round magazine at
-	 *     600 RPM, so the amber is read at the bottom of its range and not part way down.
+	 *   - 0.70 s after a slot key before the frame: the selector replicates, the pullout runs (0.200 s
+	 *     for a gun, 0.130 s for the knife — spec v31 §1's KnifeSwapMultiplier) and the rig is shown
+	 *     or hidden in Tick, so a frame taken on the press frame shows the state BEFORE it.
+	 *   - the SMG burst is 0.50 s = five rounds at 600 RPM, enough that the clip visibly drops.
+	 *   - the reload frame is ~0.45 s after R: the 0.8 s authored A_Hands_Reload_* is time-stretched
+	 *     to the gameplay reload, so the cell is fully out around 0.42 s in.
+	 *   - the stab frame is 0.18 s after right mouse: A_Knife_Stab and A_Hands_Stab_Knife are both
+	 *     0.300 s, so 0.18 s is past the wind-up and inside the thrust. It is a REAL swing, not a
+	 *     pinned pose — Trace.Hands.Hold photographs the pinned version in the companion run, and the
+	 *     two together are what separate "the clip exists" from "a click plays it".
+	 *   - the flourish is photographed TWICE, 1.4 s apart, because A_Knife_Inspect is 3.20 s of
+	 *     balisong: two frames of a moving clip differ, two frames of a stuck one do not.
 	 */
 	static TArray<FStep> GunsWalk()
 	{
 		TArray<FStep> Steps;
 
 		Steps.Add(Shoot(0.60f, TEXT("40_match_start")));
+		Steps.Add(Say(0.90f, TEXT("Trace.Hands.Probe")));
 
-		// --- 2: THE PISTOL --------------------------------------------------------------------
-		Steps.Add(Press(1.20f, TEXT("Two")));
-		Steps.Add(Say(1.80f, TEXT("Trace.ViewModel.Guns")));
-		Steps.Add(Shoot(2.10f, TEXT("41_key2_pistol")));
+		// --- 1: THE PISTOL --------------------------------------------------------------------
+		Steps.Add(Press(1.20f, TEXT("One")));
+		Steps.Add(Say(1.90f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Say(2.00f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(2.30f, TEXT("41_key1_pistol_idle")));
 
-		// --- 3: THE SMG -----------------------------------------------------------------------
-		Steps.Add(Press(3.20f, TEXT("Three")));
-		Steps.Add(Say(3.90f, TEXT("Trace.ViewModel.Guns")));
-		Steps.Add(Shoot(4.20f, TEXT("42_key3_smg")));
+		// SHOOT IT. A_Hands_Shoot_Pistol is 0.1667 s, so the frame is taken while the burst is still
+		// held rather than after it — a shot frame caught after the release is an idle frame.
+		Steps.Add(Play(3.20f, TEXT("LeftMouseButton"), 0.30f));
+		Steps.Add(Say(3.32f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(3.42f, TEXT("42_pistol_firing")));
 
-		// --- FIRING: the tracer leaves ITS barrel, and the clip drops --------------------------
-		Steps.Add(Play(5.20f, TEXT("LeftMouseButton"), 0.50f));
-		Steps.Add(Shoot(5.45f, TEXT("43_smg_firing")));
-		Steps.Add(Say(5.90f, TEXT("Trace.ViewModel.Guns")));
+		// RELOAD IT.
+		Steps.Add(Play(4.60f, TEXT("R"), 0.12f));
+		Steps.Add(Say(5.00f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(5.10f, TEXT("43_pistol_reload")));
 
-		// --- THE SHOT FRAME, PINNED: walls apart, cyan at 4.8x --------------------------------
-		Steps.Add(Say(6.60f, TEXT("Trace.Smg.Hold 0 -1 2.5")));
-		Steps.Add(Say(7.10f, TEXT("Trace.ViewModel.Guns")));
-		Steps.Add(Shoot(7.40f, TEXT("44_smg_shotframe")));
-		Steps.Add(Say(9.20f, TEXT("Trace.Smg.Hold -1 -1 0")));
+		// --- 2: THE SMG -----------------------------------------------------------------------
+		Steps.Add(Press(6.60f, TEXT("Two")));
+		Steps.Add(Say(7.30f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Say(7.40f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(7.70f, TEXT("44_key2_smg_idle")));
 
-		// --- RELOAD: the magazine drops -------------------------------------------------------
-		Steps.Add(Play(10.00f, TEXT("R"), 0.12f));
-		Steps.Add(Shoot(10.45f, TEXT("45_smg_reload_magout")));
-		Steps.Add(Say(10.55f, TEXT("Trace.ViewModel.Guns")));
-		Steps.Add(Shoot(10.90f, TEXT("46_smg_reload_riding")));
+		// SHOOT IT — a burst, so the muzzle, the recoil and the ammo counter all move.
+		Steps.Add(Play(8.60f, TEXT("LeftMouseButton"), 0.50f));
+		Steps.Add(Say(8.82f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(8.92f, TEXT("45_smg_firing")));
+		Steps.Add(Say(9.40f, TEXT("Trace.ViewModel.Guns")));
 
-		// --- EMPTY IT: the amber has to be at the bottom of its range -------------------------
-		Steps.Add(Play(12.60f, TEXT("LeftMouseButton"), 4.60f));
-		Steps.Add(Say(16.90f, TEXT("Trace.ViewModel.Guns")));
-		Steps.Add(Shoot(17.10f, TEXT("47_smg_empty")));
+		// RELOAD IT.
+		Steps.Add(Play(10.20f, TEXT("R"), 0.12f));
+		Steps.Add(Say(10.60f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(10.70f, TEXT("46_smg_reload")));
 
 		// The full spec-typed report, once, with the SMG still up.
-		Steps.Add(Say(18.20f, TEXT("Trace.Smg.Probe")));
+		Steps.Add(Say(11.40f, TEXT("Trace.Smg.Probe")));
 
-		// --- 1: NEITHER GUN -------------------------------------------------------------------
+		// --- 3: THE KNIFE ---------------------------------------------------------------------
+		//
+		// The knife is a WEAPON SLOT again (spec v31 §1), so this key takes the guns off the screen
+		// rather than adding a blade beside one. Trace.Knife.DualWeaponTest is the harness that
+		// asserts the two are never drawn together; this walk photographs it.
+		Steps.Add(Press(12.20f, TEXT("Three")));
+		Steps.Add(Say(12.90f, TEXT("Trace.ViewModel.Guns")));
+		Steps.Add(Say(12.98f, TEXT("Trace.Knife.PackStatus")));
+		Steps.Add(Say(13.06f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(13.30f, TEXT("47_key3_knife_idle")));
+
+		// STAB IT — right mouse, the spec v28 §10 melee bind, which with dual wield OFF swings only
+		// because the blade is the weapon in hand.
+		Steps.Add(Play(14.20f, TEXT("RightMouseButton"), 0.12f));
+		Steps.Add(Say(14.32f, TEXT("Trace.Knife.PackStatus")));
+		Steps.Add(Shoot(14.38f, TEXT("48_knife_stab")));
+
+		// INSPECT IT — F, the new spec v31 §5 bind, on the key the Core pull vacated for it.
+		Steps.Add(Play(15.60f, TEXT("F"), 0.12f));
+		Steps.Add(Say(15.90f, TEXT("Trace.Knife.PackStatus")));
+		Steps.Add(Say(15.98f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(16.10f, TEXT("49_knife_inspect_early")));
+		Steps.Add(Say(17.40f, TEXT("Trace.Knife.PackStatus")));
+		Steps.Add(Shoot(17.50f, TEXT("50_knife_inspect_late")));
+
+		// --- JUMP, WITH THE BLADE OUT ---------------------------------------------------------
+		//
+		// A_Hands_Jump_Knife is 0.700 s. The frame is 0.25 s in, near the top of the tuck.
+		Steps.Add(Play(19.20f, TEXT("SpaceBar"), 0.10f));
+		Steps.Add(Say(19.42f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(19.50f, TEXT("51_jump_knife")));
+
+		// --- AND BACK TO 1, so the last frame proves the walk can LEAVE the knife --------------
 		Steps.Add(Press(21.00f, TEXT("One")));
 		Steps.Add(Say(21.70f, TEXT("Trace.ViewModel.Guns")));
-		Steps.Add(Shoot(22.00f, TEXT("48_key1_neither")));
+		Steps.Add(Say(21.80f, TEXT("Trace.Hands.Probe")));
+		Steps.Add(Shoot(22.00f, TEXT("52_key1_pistol_again")));
 
-		// --- AND BACK TO 2, so the last frame proves the walk can leave state 1 ----------------
-		Steps.Add(Press(23.00f, TEXT("Two")));
-		Steps.Add(Say(23.70f, TEXT("Trace.ViewModel.Guns")));
-		Steps.Add(Shoot(24.00f, TEXT("49_key2_pistol_again")));
+		return Steps;
+	}
+
+	/**
+	 * *** THE OWNER'S CORE-THROW BUG, THROWN IN PLAY — spec v31 §2, integration pass. ***
+	 *
+	 * Verbatim: "when a player is going down the core just drops instead of going forward when
+	 * thrown. I still want the core to carry the player's velocity but I don't want this drop to
+	 * happen, it completely feels like a bug."
+	 *
+	 * WHY THIS EXISTS ALONGSIDE Trace.ModeB.MomentumTestNow. That command is the better MEASUREMENT —
+	 * it prints the pre-v31 and post-v31 launch of the same throw across five thrower states — but it
+	 * ASSIGNS the thrower's velocity and movement mode before each throw. Everything downstream of
+	 * that assignment is the real code path, and nothing upstream of it is: nobody jumped, nobody
+	 * charged, nobody let go. This walk is the other half. It takes the Core, runs forward, JUMPS,
+	 * and releases a charged throw 0.5 s AFTER THE APEX — the pawn is genuinely descending under its
+	 * own gravity, on its own velocity, through the same left-mouse route the HUD teaches ("LMB -
+	 * THROW"). What it proves is weaker per throw and stronger in kind: the bug the owner reported is
+	 * the one being photographed.
+	 *
+	 * THE TIMING IS ARITHMETIC, NOT TASTE. JumpZVelocity is 640 uu/s against ~980 uu/s of gravity, so
+	 * the apex is ~0.65 s after the press. The throw is pressed 0.30 s into the jump and released
+	 * 0.85 s later — 1.15 s after take-off, i.e. half a second into the DESCENT, with the thrower
+	 * carrying roughly -490 uu/s of vertical velocity. That is the state the note is about. The hold
+	 * is also the charge: v13 §6's throw charges while the button is down.
+	 *
+	 * Trace.ModeB.FlightLog is switched on around the throw so this machine logs the loose Core's own
+	 * position and speed at 10 Hz, and Trace.ModeB.ThrowMomentum prints the launch split into impulse,
+	 * inherited term and the v31 §2 before/after Z. (Trace.ModeB.**Tally** is the goal tally and was
+	 * the first thing this step called by mistake — it printed "0 goals" beside a throw and said
+	 * nothing about it. Named here so the next reader does not repeat it.) A frame showing the Core out in front of the
+	 * player is the picture; those two are the numbers under it.
+	 */
+	static TArray<FStep> CoreWalk()
+	{
+		TArray<FStep> Steps;
+
+		Steps.Add(Say(0.60f, TEXT("Trace.ModeB.FlightLog 1")));
+		Steps.Add(Say(0.80f, TEXT("Trace.DebugTakeCore")));
+		Steps.Add(Shoot(1.60f, TEXT("60_core_taken")));
+
+		// Run, so the throw has a horizontal term to carry — the half of the inheritance the owner
+		// explicitly wants KEPT. A standing falling throw would prove only half the note.
+		Steps.Add(Play(2.40f, TEXT("W"), 2.60f));
+
+		// JUMP, then release the charged throw half a second past the apex.
+		Steps.Add(Play(3.60f, TEXT("SpaceBar"), 0.10f));
+		Steps.Add(Play(3.90f, TEXT("LeftMouseButton"), 0.85f));
+		Steps.Add(Shoot(4.85f, TEXT("61_thrown_while_falling")));
+		Steps.Add(Say(5.00f, TEXT("Trace.ModeB.ThrowMomentum")));
+
+		// The flight itself. Two frames a second apart: a Core that dropped at the thrower's feet and
+		// a Core that went forward look identical in one frame and nothing alike in two.
+		Steps.Add(Shoot(5.60f, TEXT("62_core_in_flight")));
+		Steps.Add(Shoot(6.60f, TEXT("63_core_in_flight_later")));
+		Steps.Add(Say(7.40f, TEXT("Trace.ModeB.CoreProbe")));
+		Steps.Add(Shoot(7.60f, TEXT("64_core_settled")));
+		Steps.Add(Say(7.80f, TEXT("Trace.ModeB.FlightLog 0")));
 
 		return Steps;
 	}
@@ -460,13 +568,18 @@ namespace TraceIntegrationWalkFile
 		const bool bSelect = Which.Equals(TEXT("Select"), ESearchCase::IgnoreCase);
 		const bool bPlay   = Which.Equals(TEXT("Play"),   ESearchCase::IgnoreCase);
 		const bool bGuns   = Which.Equals(TEXT("Guns"),   ESearchCase::IgnoreCase);
+		const bool bCore   = Which.Equals(TEXT("Core"),   ESearchCase::IgnoreCase);
 		const TArray<FStep> Steps = bMatch ? MatchWalk()
-			: (bSelect ? SelectWalk() : (bPlay ? PlayWalk() : (bGuns ? GunsWalk() : MenuWalk())));
+			: (bSelect ? SelectWalk()
+			: (bPlay ? PlayWalk()
+			: (bGuns ? GunsWalk() : (bCore ? CoreWalk() : MenuWalk()))));
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[IntegWalk] === %s WALK: %d steps, %.1fs, viewport %dx%d ==="),
 			bMatch ? TEXT("MATCH")
-				: (bSelect ? TEXT("SELECT") : (bPlay ? TEXT("PLAY") : (bGuns ? TEXT("GUNS") : TEXT("MENU")))), Steps.Num(),
+				: (bSelect ? TEXT("SELECT")
+				: (bPlay ? TEXT("PLAY")
+				: (bGuns ? TEXT("GUNS") : (bCore ? TEXT("CORE") : TEXT("MENU"))))), Steps.Num(),
 			Steps.Num() > 0 ? Steps.Last().At : 0.f,
 			(PC != nullptr && PC->GetLocalPlayer() != nullptr && PC->GetLocalPlayer()->ViewportClient != nullptr
 				&& PC->GetLocalPlayer()->ViewportClient->Viewport != nullptr)
@@ -554,17 +667,55 @@ namespace TraceIntegrationWalkFile
 		FConsoleCommandWithWorldDelegate::CreateStatic(
 			[](UWorld* World) { Start(World, TEXT("Play")); }));
 
-	static FAutoConsoleCommandWithWorld GWalkGunsCommand(
-		TEXT("Trace.Integ.WalkGuns"),
-		TEXT("Spec v30 §§2-4: presses 2, 3 and 1 on the real binds in one match, fires and reloads the "
-		     "SMG, empties its magazine, and photographs every state — no arguments."),
+	static FAutoConsoleCommandWithWorld GWalkCoreCommand(
+		TEXT("Trace.Integ.WalkCore"),
+		TEXT("Spec v31 §2: takes the Core, runs, JUMPS and releases a charged throw half a second "
+		     "after the apex — the owner's \"thrown while going down\" case, through the real left-"
+		     "mouse route — then photographs the flight. Mode B only. No arguments."),
 		FConsoleCommandWithWorldDelegate::CreateStatic(
 			[](UWorld* World)
 			{
-				// Its own tag, so a v30 frame can never be quoted as a v22 or v23 one. The v22 walk's
-				// header explains at length why that matters; the same argument applies to a pass whose
-				// whole deliverable is "the picture changed".
-				GTag = TEXT("v30integ");
+				GTag = TEXT("v31core");
+				Start(World, TEXT("Core"));
+			}));
+
+	static FAutoConsoleCommandWithWorld GWalkGunsCommand(
+		TEXT("Trace.Integ.WalkGuns"),
+		TEXT("Spec v31 §§1/5/6: presses 1, 2 and 3 on the real binds in one match — PISTOL, SMG, "
+		     "KNIFE — fires and reloads both guns, stabs, presses F to inspect the blade and jumps, "
+		     "sampling Trace.Hands.Probe at every state and photographing each. No arguments."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(
+			[](UWorld* World)
+			{
+				// Its own tag, so a v31 frame can never be quoted as a v30, v23 or v22 one. The v22
+				// walk's header explains at length why that matters; the same argument applies to a
+				// pass whose whole deliverable is "the picture changed". THE TAG MOVES WITH THE
+				// LAYOUT: v30's frames are still on disk under v30integ_*, photographing the OLD key
+				// layout, and a reader who found v30integ_41_key2_pistol next to this pass's frames
+				// would have no way to tell which walk produced which.
+				//
+				// *** AND IT MOVES WITH THE RIG, WHICH IS NOT DECORATION — IT IS A BUG THIS WALK HAS
+				// ALREADY CAUSED. *** The v31 integration pass ran this walk twice in one sitting:
+				// once normally, and once with Content/Trace/Art moved aside to prove the no-`git lfs
+				// pull` fallback. Both runs wrote v31integ_41_key1_pistol_idle.png, so the second
+				// silently overwrote the first and the surviving file showed the PROCEDURAL CUBE rig
+				// under a filename the report was about to quote as the pack hands. The frames were
+				// honest; the names were not, which is exactly the failure the header above warns
+				// about and exactly the failure a fixed literal cannot prevent.
+				//
+				// So the tag is READ OFF THE PAWN instead of asserted. A frame taken with the fallback
+				// rig up can no longer land on a pack-rig filename however the fallback was reached —
+				// the switch, a missing asset, or a future third route nobody has thought of yet.
+				const ATraceCharacter* LocalChar = (World != nullptr)
+					? Cast<ATraceCharacter>(World->GetFirstPlayerController() != nullptr
+						? World->GetFirstPlayerController()->GetPawn() : nullptr)
+					: nullptr;
+				const bool bPackRig = (LocalChar != nullptr) && LocalChar->UsesPackHands();
+				GTag = bPackRig ? TEXT("v31integ") : TEXT("v31fallback");
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[IntegWalk] hand rig is %s, so these frames are filed as %s_*."),
+					bPackRig ? TEXT("THE PACK (SK_TraceHands)") : TEXT("THE PROCEDURAL CUBE FALLBACK"),
+					*GTag);
 				Start(World, TEXT("Guns"));
 			}));
 }

@@ -6,7 +6,7 @@
 #
 #     IA_Move IA_Look IA_Jump IA_Crouch IA_Fire IA_Pass IA_Dash IA_Parry
 #     IA_Scoreboard IA_EquipKnife IA_EquipGun IA_EquipSmg IA_Ability
-#     IA_AbilitySecondary IA_Reload IA_PullCore IA_Melee
+#     IA_AbilitySecondary IA_Reload IA_PullCore IA_Melee IA_Inspect
 #                                                      (17 UInputAction assets)
 #     IMC_Trace                                        (1 UInputMappingContext)
 #
@@ -144,23 +144,27 @@ ACTIONS = [
      "Boolean action is a supported shape: Enhanced Input merges them by highest "
      "absolute value, so the action is down while EITHER key is."),
     ("IA_Scoreboard", BOOL, HIGHEST, "Scoreboard. Shown while held."),
-    # SPEC v29 s5 - THREE weapon states and the knife is in all of them:
-    #   1 stows the GUNS (knife only, and the only state that pays the v12 s3
-    #     speed boost), 2 is the pistol, 3 is the SMG.
-    # The two older ASSET NAMES keep their v13 spellings because
-    # ETraceInputAction does - renaming the enumerator would break another
-    # slice's file. The meaning moved; the spelling did not. The DisplayName
-    # and the ConfigId in TraceInputActions::All() are the strings that reach a
-    # player, and both of those DID move ("StowGuns", "EquipPistol").
+    # SPEC v31 s1 - THREE WEAPON SLOTS: 1 is the pistol, 2 is the SMG, 3 is the
+    # knife. This replaces v29 s5's 1 = STOW GUNS / 2 = pistol / 3 = SMG; the
+    # stow state went away with the dual-wield revert, because with the knife a
+    # weapon again "put the guns away" and "take the knife out" are one action.
+    #
+    # The ASSET NAMES keep their v13 spellings because ETraceInputAction does -
+    # renaming the enumerator would break other slices' files. The meaning has
+    # now moved twice and the spelling never has. The DisplayName and the
+    # ConfigId in TraceInputActions::All() are the strings that reach a player,
+    # and all THREE of those moved this time ("KnifeSlot", "PistolSlot",
+    # "SmgSlot") because all three keys changed meaning.
     ("IA_EquipKnife", BOOL, HIGHEST,
-     "SPEC v29 s5: STOW THE GUNS - knife only, and the only state that pays the "
-     "v12 s3 movement boost. DIRECT SELECT and idempotent - not a toggle."),
+     "SPEC v31 s1: pull out the KNIFE (key 3). Guns go away, and this is the "
+     "only state that pays the v12 s3 movement boost. Its pullout is 35% "
+     "shorter than a gun's. DIRECT SELECT and idempotent - not a toggle."),
     ("IA_EquipGun", BOOL, HIGHEST,
-     "SPEC v29 s5: pull out the PISTOL. The knife stays in the off hand. DIRECT "
-     "SELECT and idempotent - not a toggle."),
+     "SPEC v31 s1: pull out the PISTOL (key 1). DIRECT SELECT and idempotent - "
+     "not a toggle."),
     ("IA_EquipSmg", BOOL, HIGHEST,
-     "SPEC v29 s5: pull out the SMG. The knife stays in the off hand. DIRECT "
-     "SELECT and idempotent - not a toggle."),
+     "SPEC v31 s1: pull out the SMG (key 2). DIRECT SELECT and idempotent - not "
+     "a toggle."),
     ("IA_Ability", BOOL, HIGHEST, "Activated ability. A press."),
     ("IA_AbilitySecondary", BOOL, HIGHEST, "Secondary ability. A HOLD - Mace suspends only while it is down."),
     ("IA_Reload", BOOL, HIGHEST, "Reload. The clip also reloads itself when it empties."),
@@ -183,6 +187,16 @@ ACTIONS = [
      "Melee swing (spec v28 s10). Right mouse by default. If and only if the pull "
      "circle is on screen this press pulls the Core instead - that precedence "
      "lives in TraceMelee::HandleMeleeInput, not in the mapping."),
+    # SPEC v31 s5 - "bind the F key to inspect". The knife flourish, as a proper
+    # rebindable action so it gets a row on the keybind page like everything else.
+    # PRESS ONLY in the controller: it owns no held state a dropped release could
+    # strand, unlike the pull or the parry. The verb is
+    # TraceKnifeView::RequestInspect, which is cosmetic by construction - one
+    # presentation timestamp inside a world subsystem, no RPC, no cooldown.
+    ("IA_Inspect", BOOL, HIGHEST,
+     "Inspect the knife (spec v31 s5). The 3.20s butterfly-knife flourish, F by "
+     "default. Cosmetic: it confers nothing, blocks nothing, and any real action "
+     "(a stab, a weapon draw) outranks it on the frame it happens."),
 ]
 
 # -----------------------------------------------------------------------------
@@ -251,8 +265,15 @@ MAPPINGS = [
     ("IA_Parry", "Q", [], "parry, slot 1 (spec v28 s3d)"),
     ("IA_Parry", "ThumbMouseButton", [], "parry, slot 2 - mouse 4 (spec v28 s3d)"),
     ("IA_Scoreboard", "Tab", [], ""),
-    ("IA_EquipKnife", "One", [], "spec v29 s5 - STOW GUNS (knife only, +22% speed)"),
-    ("IA_EquipGun", "Two", [], "spec v29 s5 - the pistol"),
+    # SPEC v31 s1 - "1 is pistol, 2 is smg, 3 is knife". THE ROW ORDER IS NOT THE
+    # KEY ORDER and must not be sorted into it: this list is a copy of the order
+    # ATracePlayerController::ApplyControlSettings lays the mappings down, which
+    # follows the ACTION table (append-only), not the digits. IA_EquipSmg is
+    # still the last row in this file for that reason even though it now owns the
+    # 2 key. ATracePlayerController's ExpectedMappings table has the identical
+    # order and Trace.Input.VerifyAssets compares them index by index.
+    ("IA_EquipKnife", "Three", [], "spec v31 s1 - the KNIFE (+22% speed, 35% shorter pullout)"),
+    ("IA_EquipGun", "One", [], "spec v31 s1 - the pistol"),
     ("IA_Ability", "E", [], ""),
     ("IA_AbilitySecondary", "V", [], ""),
     ("IA_Reload", "R", [], ""),
@@ -263,18 +284,30 @@ MAPPINGS = [
     # strongest convention. Q (freed when parry moved to the mouse) was the other
     # candidate - passed over because the pull is a HOLD taken while still
     # steering, and F is under an index finger already resting on D.
-    ("IA_PullCore", "F", [], "spec v26 s1 - the turnover core-pull, its own bind"),
+    # SPEC v31 s5 MOVED THIS OFF F AND ONTO G. "bind the F key to inspect" named F
+    # for the knife flourish, and the two rows cannot share it: both are
+    # NotCarrying, so UTraceUserSettings::ActionsMayShareAKey refuses, and one
+    # press would fill a pull ring AND start a 3.2s flourish. The pull is not
+    # losing its only route - spec v28 s10's precedence still dispatches it from
+    # the melee button. Its ConfigId moved with the key ("PullCore" ->
+    # "PullCoreKey") so a returning player's saved F line is dropped rather than
+    # putting the two verbs back on one key.
+    ("IA_PullCore", "G", [], "spec v31 s5 - the core-pull, moved off F for the knife inspect"),
     # SPEC v28 s10 - the melee, on the button spec v28 s3d vacated for it. LAST in
     # this table because ATracePlayerController::ApplyControlSettings lays it down
     # last, and this table is a copy of that order rather than a sort - see the
     # note at the top of the section.
     ("IA_Melee", "RightMouseButton", [], "spec v28 s10 - melee, on the button s3d vacated"),
-    # SPEC v29 s5 - "3 pulls out smg". LAST in this table because
+    # SPEC v31 s1 - "2 is smg". LAST in this table because
     # ATracePlayerController::ApplyControlSettings lays it down last, and this
     # table is a copy of that order rather than a sort - see the note at the top
     # of the section. Nothing else in the action table claims a digit, so this
     # default steals no key on a first run.
-    ("IA_EquipSmg", "Three", [], "spec v29 s5 - the SMG"),
+    ("IA_EquipSmg", "Two", [], "spec v31 s1 - the SMG"),
+    # SPEC v31 s5 - the knife flourish, on the F that IA_PullCore just vacated.
+    # LAST in this table because ATracePlayerController::ApplyControlSettings lays
+    # it down last, and this table is a copy of that order rather than a sort.
+    ("IA_Inspect", "F", [], "spec v31 s5 - inspect the knife"),
 ]
 
 CONTEXT_NAME = "IMC_Trace"

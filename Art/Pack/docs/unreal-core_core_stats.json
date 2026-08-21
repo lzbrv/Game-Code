@@ -1,0 +1,29 @@
+{
+ "item": "core",
+ "displayName": "The Core",
+ "role": "carryObjective",
+ "dimensions": { "unit": "metres", "length": 0.37, "diameter": 0.22, "longAxis": "X" },
+ "importScale": 100,
+ "clips": {
+  "Idle": { "length": 3.6, "loop": true, "state": "dropped" },
+  "Pickup": { "length": 0.55, "loop": false, "state": "onGrab" },
+  "Throw": { "length": 0.5, "loop": true, "state": "inFlight", "note": "4 whole rifle spins — tiles for any flight time" }
+ },
+ "animatedNodes": {
+  "shell_pivot_left": "shell half, -30mm on Pickup",
+  "shell_pivot_right": "shell half, +30mm on Pickup",
+  "ring_pivot_a": "cage ring, continuous +X rotation",
+  "ring_pivot_b": "cage ring, continuous -X rotation",
+  "core": "tumble / rifle spin / bob"
+ },
+ "sockets": {
+  "nose": { "x": 0.185, "y": 0, "z": 0, "use": "throw axis (+X)" },
+  "rear": { "x": -0.185, "y": 0, "z": 0, "use": "trail VFX" },
+  "heart": { "x": 0, "y": 0, "z": 0, "use": "point light + score flare" }
+ },
+ "emissive": {
+  "circuit_cyan": { "base": "#25E6FF", "idle": [0.85, 1.2], "carried": [1.7, 2.2], "thrown": 3.4, "teamTintable": true },
+  "core_amber": { "base": "#FF8A1F", "idle": [0.7, 1.2], "carried": [2.4, 3.2], "thrown": 2.6, "teamTintable": false }
+ },
+ "drivenBy": "gameplay state, not clip curves"
+}

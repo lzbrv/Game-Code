@@ -104,11 +104,36 @@ float UTraceAudioSettings::GetPistolLadderResetSeconds() const
 	return FMath::Max(Literal, Floor);
 }
 
+float UTraceAudioSettings::GetFootstepBoostLinear() const
+{
+	// SPEC v31 §3. dB -> amplitude ratio: x = 10^(dB/20). Guarded at exactly 0 so the common case
+	// ("no boost") is bit-exact 1.0 rather than 0.9999999 out of a pow(), which would put a phantom
+	// gain mismatch in Trace.Audio.Loudness's third signal for no reason at all.
+	if (FootstepVolumeBoostDb == 0.f)
+	{
+		return 1.f;
+	}
+	const float Clamped = FMath::Clamp(FootstepVolumeBoostDb, -24.f, 24.f);
+	return FMath::Pow(10.f, Clamped / 20.f);
+}
+
 float UTraceAudioSettings::GetFootstepVolume() const
 {
 	// DERIVED, for exactly the reason above: the footstep knob MODIFIES the master, so it is stored
 	// as a multiple of it and moves when it moves. Nothing in the project multiplies these two by
 	// hand — UTraceAudioSubsystem::VolumeFor asks for this and Trace.Audio.Loudness reports it, so
 	// there is one arithmetic and one place it can be wrong.
-	return FMath::Max(0.f, MasterVolume) * FMath::Clamp(FootstepVolumeScale, 0.f, 1.f);
+	//
+	// *** SPEC v31 §3 ADDS A THIRD TERM AND IT IS APPLIED HERE, IN THE ONE DERIVATION. *** The +5 dB
+	// the owner asked for is a RATIO on top of the v29 §1b base, not a replacement for it — see
+	// FootstepVolumeBoostDb. Folding it in at this single site is what stops the boost from being
+	// half-applied: VolumeFor, the loudness table and the walk harness all read this function, so a
+	// footstep that is measured is a footstep that will be played at the same gain.
+	//
+	// CLAMPED AT 1.0 AFTER the boost, not before. FootstepVolumeScale is clamped to [0,1] because it
+	// is a fraction of the master; the PRODUCT is clamped because the engine's volume multiplier
+	// above 1 is a distortion risk, and at the shipped 0.15 x 1.7783 = 0.2667 the clamp is nowhere
+	// near. It only bites if somebody dials in +17 dB, and then it is doing its job.
+	const float Base = FMath::Max(0.f, MasterVolume) * FMath::Clamp(FootstepVolumeScale, 0.f, 1.f);
+	return FMath::Clamp(Base * GetFootstepBoostLinear(), 0.f, 1.f);
 }

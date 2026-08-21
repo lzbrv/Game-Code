@@ -1,0 +1,41 @@
+{
+ "weapon": "butterfly_knife",
+ "displayName": "Butterfly Knife",
+ "role": "melee",
+ "dimensions": { "unit": "metres", "carriedState": "open", "closedLength": 0.162, "openLength": 0.248, "bladeLength": 0.126, "thickness": 0.02 },
+ "importScale": 100,
+ "clips": {
+  "Idle_Open": { "length": 2.4, "loop": true, "state": "carried", "note": "the knife is carried open" },
+  "Draw": { "length": 0.52, "loop": false, "state": "equip", "startPose": "closed", "endPose": "open" },
+  "Stab": { "length": 0.3, "loop": false, "state": "attack" },
+  "Inspect": {
+   "length": 3.2, "loop": false, "state": "flourish", "endPose": "open",
+   "beats": [
+    { "name": "openFlip", "start": 0.06, "end": 0.51 },
+    { "name": "hold", "start": 0.51, "end": 1.09 },
+    { "name": "aerialClose", "start": 1.09, "end": 1.47, "lift": 0.05 },
+    { "name": "reopen", "start": 1.66, "end": 2.05 },
+    { "name": "doubleTwirl", "start": 2.24, "end": 2.88 },
+    { "name": "settle", "start": 2.88, "end": 3.2 }
+   ],
+   "handleCatchOffset": 0.11
+  }
+ },
+ "animatedNodes": {
+  "handle_pivot_bite": "lead handle, 180deg about X",
+  "handle_pivot_safe": "trailing handle, 180deg about X, 0.16 arc offset",
+  "latch_pivot": "latch, -0.5 rad kick mid-flip",
+  "butterfly_knife": "flip roll (full turn Z), stab thrust -130mm Z, pitch -0.22 rad"
+ },
+ "sockets": {
+  "tip": { "x": 0, "y": 0, "z": -0.126, "use": "melee trace end / slash VFX" },
+  "pivot": { "x": 0, "y": 0, "z": 0, "use": "hand attach" },
+  "pommel": { "x": 0, "y": 0, "z": 0.122, "use": "trailing VFX when open" }
+ },
+ "aimAxis": "-Z",
+ "emissive": {
+  "circuit_cyan": { "base": "#25E6FF", "closedIdle": [0.8, 1.1], "openIdle": [1.5, 1.9], "flipPeak": 3.6, "stabPeak": 4.4 },
+  "core_amber": { "base": "#FF8A1F", "closedIdle": [0.7, 1.0], "openIdle": [1.6, 2.1], "flipPeak": 2.8, "stabPeak": 3.0 }
+ },
+ "notes": "flip has no hitbox; melee trace active only during Stab"
+}

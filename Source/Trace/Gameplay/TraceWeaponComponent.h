@@ -259,6 +259,21 @@ public:
 	 */
 	int32 GetClipSize() const { return TraceAmmo::GetClipSize(EquippedWeapon); }
 
+	/**
+	 * THE SIZE OF THE MAGAZINE THAT IS ACTUALLY IN THE GUN, which is not always the size of the
+	 * magazine for the weapon currently SELECTED.
+	 *
+	 * *** THIS EXISTS BECAUSE THE SMG WAS PERMANENTLY LOSING TEN ROUNDS. *** A reload runs on a
+	 * server-side deadline and completes wherever the player happens to be when it expires. Switch
+	 * to the knife mid-reload and the refill asked GetClipSize(), which answers for the SELECTED
+	 * weapon — so a 40-round SMG magazine was refilled to the pistol's 30 and the missing ten never
+	 * came back.
+	 *
+	 * The live magazine belongs to LiveClipOwner by definition (that is the whole reason it exists,
+	 * from spec v29 §5's stow state), so ask it rather than the selector.
+	 */
+	int32 GetLiveClipSize() const { return TraceAmmo::GetClipSize(LiveClipOwner); }
+
 	/** Seconds a reload of the weapon in hand takes. Pistol 0.5, SMG 0.8 (spec v28 §9). */
 	float GetReloadSeconds() const { return TraceAmmo::GetReloadSeconds(EquippedWeapon); }
 
@@ -439,14 +454,18 @@ public:
 	ETraceEquippedWeapon GetEquippedWeapon() const { return EquippedWeapon; }
 
 	/**
-	 * "Is the knife the SELECTED weapon" — i.e. is the gun stowed and unable to fire.
+	 * "Is the knife the SELECTED weapon" — i.e. is no gun out, and can this pawn therefore not fire.
 	 *
 	 * *** [DUALWIELD] ALWAYS FALSE WHEN THE SPEC v28 §10 SWITCH IS ON, BY CONSTRUCTION RATHER THAN BY
-	 * A TEST: *** no path can put ETraceEquippedWeapon::Knife in the selector then. Every caller of
-	 * this outside the melee slice means "cannot shoot right now" (X's Sting, Roxie's Modded, the
-	 * ability reload hook, ShouldShowAmmo, the HUD), and under dual-wield a pawn can always shoot, so
-	 * false is the right answer for all of them. Use TraceMelee::IsKnifeInHand() when the question is
-	 * whether a blade is available to swing.
+	 * A TEST: *** no path could put ETraceEquippedWeapon::Knife in the selector under v28 §10. Every
+	 * caller of this outside the melee slice means "cannot shoot right now" (X's Sting, Roxie's
+	 * Modded, the ability reload hook, ShouldShowAmmo, the HUD), and under dual-wield a pawn can
+	 * always shoot, so false was the right answer for all of them. Use TraceMelee::IsKnifeInHand()
+	 * when the question is whether a blade is available to swing.
+	 *
+	 * *** SINCE SPEC v31 §1 THE SWITCH IS OFF AND THIS IS TRUE AGAIN — in the knife slot, key 3. ***
+	 * The clause above is kept rather than deleted because the switch's true arm is intact and a
+	 * reader who flips it back needs to know this predicate goes dead again when they do.
 	 */
 	bool IsKnifeEquipped() const { return EquippedWeapon == ETraceEquippedWeapon::Knife; }
 
@@ -928,15 +947,23 @@ private:
 	/**
 	 * WHICH FIREARM THE LIVE MAGAZINE BELONGS TO.
 	 *
-	 * *** THIS EXISTS BECAUSE "SWAP WHEN THE PREVIOUS AND DESIRED ARE BOTH GUNS" IS WRONG SINCE
-	 * SPEC v29 §5 GAVE THE PLAYER A STOW STATE. *** Pistol -> stow -> SMG is two transitions and
-	 * NEITHER of them is gun-to-gun, so no swap fired and the SMG came out holding the pistol's
-	 * magazine. Ammo counts were being shuffled between weapons by a route the old condition could
-	 * not see.
+	 * *** THIS EXISTS BECAUSE "SWAP WHEN THE PREVIOUS AND DESIRED ARE BOTH GUNS" IS WRONG THE MOMENT
+	 * A THIRD SELECTOR VALUE IS REACHABLE. *** Spec v29 §5 made it reachable as the stow state:
+	 * pistol -> stow -> SMG is two transitions and NEITHER of them is gun-to-gun, so no swap fired
+	 * and the SMG came out holding the pistol's magazine. Ammo counts were being shuffled between
+	 * weapons by a route the old condition could not see.
 	 *
 	 * The question that actually decides a swap is not "where did we come from" but "does the
 	 * magazine in the gun belong to the gun being drawn". This answers that directly, so any route
-	 * between two firearms — however many stows are in the middle — swaps exactly once.
+	 * between two firearms — however many intermediate states are in the middle — swaps exactly once.
+	 *
+	 * *** SPEC v31 §1 REMOVED THE STOW STATE AND THIS FIELD IS STILL LOAD-BEARING. CHECKED, NOT
+	 * ASSUMED. *** The stow state is gone as a NAME; the third selector value is not, because the
+	 * knife is a weapon slot again and ETraceEquippedWeapon::Knife is the same enumerator it always
+	 * was. Pistol -> KNIFE -> SMG is the identical two-transition route the v29 bug travelled, and
+	 * reverting to the "both are guns" test would put that bug straight back — a player who tapped 3
+	 * between 1 and 2 would draw the SMG with the pistol's rounds in it. Route-independence is what
+	 * makes this correct in both eras and it is why the revert did not touch it.
 	 */
 	UPROPERTY(Replicated)
 	ETraceEquippedWeapon LiveClipOwner = ETraceEquippedWeapon::Gun;

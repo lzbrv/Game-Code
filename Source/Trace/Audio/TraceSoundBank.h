@@ -204,6 +204,48 @@ public:
 	float FootstepVolumeScale = 0.15f;
 
 	/**
+	 * =============================================================================================
+	 * *** SPEC v31 §3 — "The footsteps don't seem to be in the game - if they are raise the volume
+	 * *** by 5db". THIS IS THAT 5 dB, AND IT IS STORED AS A dB OFFSET ON TOP OF THE KNOB ABOVE. ***
+	 * =============================================================================================
+	 *
+	 * THEY WERE IN THE GAME. Measured before anything was changed, on the practice range with sound
+	 * on: the stride accumulator paid out 12 footsteps for 2132 uu of walking (12.2 were due at the
+	 * 175 uu stride), all eleven clips were declared game-side, and the authority multicast every
+	 * one. What the owner could not hear was a sound that WAS playing at an effective peak of
+	 * -36.5 dBFS for the loudest clip and -43.9 dBFS for the quietest — roughly 29 dB under a pistol
+	 * shot. "Measured quieter" was not the same as "audible", exactly as §3 warned.
+	 *
+	 * *** WHY A SEPARATE dB FIELD AND NOT SIMPLY FootstepVolumeScale = 0.2667. ***
+	 * The standing project rule: a value that MODIFIES a base is stored RELATIVE to that base. 0.15
+	 * is spec v29 §1b's MEASURED base — it is the number Trace.Audio.Loudness's whole argument is
+	 * built on and the number Scripts/import_sounds.py derives from the WAVs. The owner did not ask
+	 * for a new level, they asked for "+5 dB", and +5 dB is a RATIO (x1.7783), not a level. Written
+	 * as a lone 0.2667 the request becomes an unverifiable magic number the moment anybody retunes
+	 * the base; written like this the boost survives a retune, `git log -S FootstepVolumeBoostDb`
+	 * finds it, and setting it to 0 is the exact revert.
+	 *
+	 * It is the same shape as WorldFalloffScale (a multiple of the inner radius),
+	 * PistolLadderResetIntervalFloor (a multiple of the fire interval) and v31 §1's
+	 * KnifeSwapMultiplier — all of them values that modify a base and none of them stored absolute.
+	 *
+	 * *** WHAT +5 dB COSTS, STATED PLAINLY BECAUSE IT MOVES A GATE spec v29 §1b SET. ***
+	 * Before: loudest footstep Step2 at -36.53 dBFS, quietest other ButtonPress at -27.21 dBFS,
+	 * margin 9.33 dB. After: Step2 at -31.53 dBFS, margin 4.32 dB. §1b's "audibly quieter than every
+	 * other sound" still HOLDS — a footstep is still the quietest thing in the game and still ~24 dB
+	 * under a gunshot — but Trace.Audio.Loudness's own threshold was 6.0 dB and 4.32 does not clear
+	 * it. The threshold moved to 4.0 dB, once, with the reasoning written where it lives
+	 * (Audio/TraceAudioLoudness.cpp, RequiredMarginDb). The harness was NOT weakened to "any margin":
+	 * its red arm, Trace.Audio.FootstepVolume 1, still fails, because at unity gain the footsteps are
+	 * 7.15 dB LOUDER than ButtonPress and no threshold in the positive range hides that.
+	 *
+	 * A dB FIELD RATHER THAN A MULTIPLIER because the owner's unit is decibels. Asking a human to
+	 * type 1.7783 for "5 dB louder" is how the wrong number gets typed.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Footstep Volume Boost (dB, on top of the scale above) [v31 §3]", ClampMin = "-24.0", ClampMax = "24.0", UIMin = "0.0", UIMax = "12.0"))
+	float FootstepVolumeBoostDb = 5.0f;
+
+	/**
 	 * SPEC v29 §1c — how long without firing resets the pistol ladder to PistolShoot1.
 	 *
 	 *     "After a .3second break from shooting, reset the sounds back to pistol 1."
@@ -283,6 +325,14 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Footstep Minimum Speed (uu/s)", ClampMin = "0.0", ClampMax = "600.0", UIMin = "0.0", UIMax = "300.0"))
 	float FootstepMinSpeedUU = 60.f;
 
-	/** THE FOOTSTEP VOLUME, ALREADY MULTIPLIED THROUGH THE MASTER. Derived, never stored. */
+	/**
+	 * THE FOOTSTEP VOLUME, ALREADY MULTIPLIED THROUGH THE MASTER **AND** THROUGH v31 §3's +5 dB.
+	 * Derived, never stored, and asked for by every reader — UTraceAudioSubsystem::VolumeFor,
+	 * Trace.Audio.Loudness and Trace.Audio.FootstepWalk all call this rather than re-deriving it, so
+	 * the boost cannot be applied twice in one place and forgotten in another.
+	 */
 	float GetFootstepVolume() const;
+
+	/** Just the boost, as a linear multiplier: 10^(FootstepVolumeBoostDb/20). 1.0 when the boost is 0. */
+	float GetFootstepBoostLinear() const;
 };

@@ -130,33 +130,38 @@ enum class ETraceInputAction : uint8
 	 * would tear if two builds disagreed about it mid-session, and there is no reason to find out.
 	 *
 	 * =============================================================================================
-	 * *** SPEC v29 §5 — THESE TWO ENUMERATORS NOW MEAN "STOW GUNS" AND "PISTOL". ***
+	 * *** SPEC v31 §1 — THE STOW STATE IS GONE. 1 IS PISTOL, 2 IS SMG, 3 IS KNIFE. ***
 	 * =============================================================================================
 	 *
-	 * The owner's words: "Pressing one stows guns, and then you get the knife boost speed from
-	 * before. [...] Pressing 2 pulls out pistol, 3 pulls out smg." So there are THREE weapon states
-	 * and the knife is in all of them:
+	 * The owner's words: "Revert the knife changes (no dual wielding). [...] 1 is pistol, 2 is smg,
+	 * 3 is knife." Reverting dual-wield makes the knife a WEAPON SLOT again rather than a permanent
+	 * off-hand blade, so v29 §5's "stow the guns" state has nothing left to mean — putting the guns
+	 * away and taking the knife out became one action again. Three weapons, three keys:
 	 *
-	 *     key 1   EquipKnife  ->  guns STOWED, knife only     -> the knife speed boost
-	 *     key 2   EquipGun    ->  pistol out, knife still out -> normal speed
-	 *     key 3   EquipSmg    ->  SMG out, knife still out    -> normal speed  (NEW, appended below)
+	 *     key 1   EquipGun    ->  the PISTOL                  -> normal speed
+	 *     key 2   EquipSmg    ->  the SMG                     -> normal speed
+	 *     key 3   EquipKnife  ->  the KNIFE, guns away        -> the v12 §3 speed boost, and a
+	 *                                                            35% shorter pullout (v31 §1)
 	 *
-	 * THE TWO SPELLINGS ABOVE ARE NOW HISTORICAL and are kept for one reason only: this enum is the
+	 * WHICH IS v29 §5's LAYOUT ROTATED, AND THAT IS WHY ALL THREE ConfigIds HAD TO MOVE — see the
+	 * table in TraceInputActions::All() for the full argument. Every key changed meaning, so every
+	 * saved line had to be dropped: "StowGuns" -> "KnifeSlot", "EquipPistol" -> "PistolSlot",
+	 * "EquipSmg" -> "SmgSlot". This is the fourth migration of this kind in this file ("Boost" ->
+	 * "Parry", "Parry"/"Pass" -> "ParryKeys"/"ThrowCore", then v29 §5's pair) and it works the same
+	 * way each time: Save() writes a line for EVERY action, RefreshFromConfig honours a saved line
+	 * over this table, and a line naming an id the table no longer has is DISCARDED by the parse loop
+	 * exactly as `SwapWeapon=F` and `Boost=E` are. Without the moves the new layout would land for
+	 * nobody who has ever opened the options screen — a returning player would press 1 and get a stow
+	 * state that no longer exists. Trace.Settings.VerifyBinds prints every dropped line by name.
+	 *
+	 * THE THREE C++ SPELLINGS ABOVE ARE HISTORICAL and are kept for one reason only: this enum is the
 	 * INDEX into UTraceUserSettings::Bindings and into TraceInputActions::All(), which are matched
 	 * 1:1 by a static_assert, so renaming an enumerator is free but MOVING or REMOVING one is not.
-	 * Renaming them would also break Source/Trace/UI/TraceOptionsMenu.cpp, which is another slice's
-	 * file this pass and names both by hand. The MEANING moved; the C++ spelling did not. Read the
-	 * ConfigId and the DisplayName in TraceInputActions::All() — those did move, and they are the
-	 * two strings that actually reach a player.
-	 *
-	 * THE CONFIG IDS CHANGED, WHICH IS THE MIGRATION AND IS DELIBERATE. "EquipKnife" -> "StowGuns"
-	 * and "EquipGun" -> "EquipPistol", exactly as spec v28 §3d spent "ParryPull" -> "ParryKeys":
-	 * Save() writes a line for EVERY action, so a returning player's TraceUserSettings.ini already
-	 * contains `KeyBindings=EquipKnife=1` and RefreshFromConfig would honour it over anything this
-	 * table says. Their old line now names an id the table does not have, is DISCARDED by the parse
-	 * loop exactly as `SwapWeapon=F` and `Boost=E` are, and the action falls back to the shipped
-	 * default. Without that the 1/2/3 layout would land for nobody who has ever opened the options
-	 * screen. Trace.Settings.VerifyBinds prints every dropped line by name.
+	 * Renaming them would also break Source/Trace/UI/TraceOptionsMenu.cpp, which names them by hand.
+	 * The MEANING has now moved twice and the spelling has never moved; read the ConfigId and the
+	 * DisplayName in TraceInputActions::All(), which are the two strings that reach a player. Note in
+	 * particular that EquipKnife means the knife AGAIN, as it did before v29 §5 — the one enumerator
+	 * in this file whose name has come back into agreement with its job.
 	 */
 	EquipKnife,
 	EquipGun,
@@ -272,8 +277,15 @@ enum class ETraceInputAction : uint8
 	 *
 	 * APPENDED, never inserted, for the reason EquipKnife's comment gives at length: this enum is
 	 * the index into UTraceUserSettings::Bindings, so anything placed higher renumbers every action
-	 * below it. A returning player has never had an "EquipSmg" line, so RefreshFromConfig finds no
-	 * override and seeds the shipped default (the 3 key); nothing they have bound moves.
+	 * below it.
+	 *
+	 * *** SPEC v31 §1 MOVED THIS ROW TO THE 2 KEY AND HAD TO MIGRATE ITS ConfigId TO DO IT. *** The
+	 * paragraph that used to sit here said "a returning player has never had an EquipSmg line, so
+	 * nothing they have bound moves" — true when v29 §5 introduced the row, and false the moment it
+	 * shipped. Everyone who has opened the options screen since now has `EquipSmg=Three` saved, and
+	 * RefreshFromConfig would have honoured it and pinned the SMG to 3 while every label said 2. The
+	 * id is now "SmgSlot", which has never been in anybody's file, so the stale line is dropped and
+	 * the 2 key is seeded. That is the general lesson: a NEW row's id is safe exactly once.
 	 *
 	 * `Match`, not `NotCarrying`, and that is the same answer the other two weapon rows give. The
 	 * weapon SELECTOR is legal while carrying — UTraceWeaponComponent::RequestEquip refuses a
@@ -282,6 +294,63 @@ enum class ETraceInputAction : uint8
 	 * with the throw, and "3 throws the Core sometimes" is not a bind anybody wants.
 	 */
 	EquipSmg,
+
+	/**
+	 * *** SPEC v31 §5 — THE KNIFE FLOURISH. "bind the F key to inspect", as a REBINDABLE ACTION. ***
+	 *
+	 * The spec is explicit that this is "a new rebindable action in the settings page like every
+	 * other action", and that sentence is the whole reason this enumerator exists rather than a
+	 * `case EKeys::F:` in the controller. The keybind page's rebind list IS TraceInputActions::All()
+	 * walked in order, so an action that is not in this enum is an action the player can neither
+	 * press nor rebind however well it is wired up — the same sentence the EquipKnife, Ability,
+	 * Reload, PullCore, Melee and EquipSmg rows all carry.
+	 *
+	 * APPENDED, never inserted, for the reason EquipKnife's comment gives at length: this enum is the
+	 * index into UTraceUserSettings::Bindings, so anything placed higher renumbers every action below
+	 * it. A returning player has never had an "Inspect" line, so RefreshFromConfig finds no override
+	 * and seeds the shipped default; nothing they have bound moves.
+	 *
+	 * =============================================================================================
+	 * *** F WAS ALREADY TAKEN. THE PULL CORE MOVED TO G, AND THAT IS A REAL COST. SAY IT PLAINLY. ***
+	 * =============================================================================================
+	 *
+	 * ETraceInputAction::PullCore has shipped on F since spec v26 §1, on the argument — still a good
+	 * one — that "F to grab the thing you are looking at" is the strongest convention this genre has.
+	 * The owner has now asked for F twice, for two different verbs, and only one of them can have it.
+	 *
+	 * BOTH ARE `NotCarrying`, SO THEY CANNOT SIMPLY SHARE THE KEY. UTraceUserSettings::
+	 * ActionsMayShareAKey is one bitwise AND over the exclusion groups, and two actions may share a
+	 * key only when their masks are DISJOINT — the reasoning spec v28 §3b set up so that FIRE and
+	 * THROW could share mouse 1. Inspect needs a knife in hand; the pull needs empty hands and a
+	 * loose Core in front of you; both of those are states you are in while NOT carrying, and they
+	 * overlap. One press would fill a pull ring AND start a 3.2 s flourish, which is exactly the
+	 * "two dispatches of one press" the Melee row's comment refuses.
+	 *
+	 * SO F GOES TO THE VERB THE OWNER JUST NAMED, and the pull takes G — the nearest free key under
+	 * the same finger (claimed: WASD, Space, LeftCtrl, LeftShift, mouse1, mouse2, Q + thumb mouse,
+	 * Tab, 1, 2, 3, E, V, R, and now F). WHAT SOFTENS THE COST: the pull is NOT losing its only
+	 * route. Spec v28 §10's precedence rule already dispatches it from the MELEE button
+	 * (TraceMelee::HandleMeleeInput -> "CORE PULL (the circle is on screen)"), so a player who never
+	 * finds G can still pull with right mouse exactly as they do today. G is the second route, not
+	 * the only one.
+	 *
+	 * THE MIGRATION IS THE USUAL ONE: "PullCore" -> "PullCoreKey", so a returning player's saved
+	 * `PullCore=F` line names an id this table no longer has and is DISCARDED by RefreshFromConfig's
+	 * parse loop, leaving them on the shipped G. Without the id move the default change would be
+	 * invisible to everyone who has ever opened the options screen and they would keep a PULL and an
+	 * INSPECT on the same key — the precise collision this is avoiding.
+	 *
+	 * THE ONE-LINE REVERT, if the owner would rather keep the pull on F: put Default_PullCore back to
+	 * EKeys::F, put Default_Inspect on EKeys::G, and change the two ConfigIds back. Nothing else in
+	 * the project reads either string.
+	 *
+	 * `NotCarrying`, and it is measured rather than assumed: TraceKnifeView::RequestInspect refuses a
+	 * carrier outright, because the pack's own loadout table makes the Core a TWO-HAND CRADLE and a
+	 * knife flourish with both hands on the objective is not a pose that exists. So the flourish key
+	 * is genuinely dead while carrying, exactly as fire is, and it may legally share a key with a
+	 * Carrying-only action (the parry, the throw) if a player wants that.
+	 */
+	Inspect,
 
 	Count UMETA(Hidden)
 };

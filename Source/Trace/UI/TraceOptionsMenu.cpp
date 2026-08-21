@@ -1605,8 +1605,15 @@ void FTraceOptionsMenu::Close()
 // wrong key. Deleting it is the entire fix; the strings below come straight from the table, which is
 // the one place they are maintained.
 //
-// The legacy arm loses nothing worth keeping: with bDualWieldKnife OFF the 1 key still selects the
-// blade, and "STOW GUNS (KNIFE ONLY)" describes that correctly.
+// *** SPEC v31 §1 MOVED THE LAYOUT AGAIN AND THE DELETION STILL HOLDS — WHICH IS THE POINT. ***
+// bDualWieldKnife is now OFF, the STOW state is gone, and the keys are 1 = PISTOL, 2 = SMG,
+// 3 = KNIFE, with the ConfigIds migrated a second time ("StowGuns" -> "KnifeSlot", "EquipPistol" ->
+// "PistolSlot", "EquipSmg" -> "SmgSlot") and the DisplayNames rewritten to KNIFE / PISTOL / SMG in
+// TraceInputActions::All(). This page read every one of those changes without a line of its own
+// changing, because it reads the table. Had the override survived v29 it would now be printing a
+// THIRD stale layout over the top. (The two sentences that stood here before the v31 integration
+// pass claimed the 1 key still selects the blade and that "STOW GUNS (KNIFE ONLY)" describes it —
+// both were false the moment the switch was flipped, and neither was load-bearing.)
 
 void FTraceOptionsMenu::RebuildRows()
 {

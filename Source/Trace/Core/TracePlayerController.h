@@ -97,17 +97,29 @@ struct FTraceDashHudState
  *   Dash        bool     Left Shift
  *   Parry       bool     RMB           (carrier only — 0.175s of trace invulnerability, spec v3 §3 / v8 §3 / v10 §4;
  *                                       moved from Q to right mouse by spec v25 §7)
- *   PullCore    bool     F             (spec v26 §1 — the turnover Core-pull, its OWN bind. Held.
+ *   PullCore    bool     G             (spec v26 §1 — the turnover Core-pull, its OWN bind. Held.
  *                                       It rode the parry's button in v25 §2; §1 splits them, and the
  *                                       old precedence rule survives only as a tiebreak for a player
- *                                       who deliberately puts both actions on one key)
+ *                                       who deliberately puts both actions on one key.
+ *                                       SPEC v31 §5 MOVED IT F -> G to free F for the knife flourish,
+ *                                       with the "PullCore" -> "PullCoreKey" ConfigId migration. It did
+ *                                       not lose a route: v28 §10's precedence still dispatches the
+ *                                       pull from the melee button.)
  *   Scoreboard  bool     Tab           (held)
- *   EquipKnife  bool     1             (spec v29 §5 — STOW THE GUNS. Knife only, and the only state that
- *                                       pays the v12 §3 speed boost. DIRECT SELECT, idempotent.
- *                                       The enumerator keeps its v13 spelling; the MEANING moved.)
- *   EquipGun    bool     2             (spec v29 §5 — the PISTOL. DIRECT SELECT, idempotent)
- *   EquipSmg    bool     3             (spec v29 §5 — the SMG. The knife stays out in all three states;
- *                                       stowing is about the GUNS. The SWING rides IA_Melee since v28 §10.)
+ *   EquipKnife  bool     3             (*** SPEC v31 §1 — THE KNIFE IS A WEAPON SLOT AGAIN. *** The
+ *                                       dual-wield switch UTraceMeleeSettings::bDualWieldKnife is OFF,
+ *                                       so there is no STOW state: this key draws the blade, one weapon
+ *                                       on screen at a time, and it is the knife that pays the v12 §3
+ *                                       +22% speed boost. Its pullout is 35% shorter than a gun's
+ *                                       (KnifeSwapMultiplier, spent in TraceMelee::GetSwapSecondsFor).
+ *                                       DIRECT SELECT, idempotent. The enumerator keeps its v13
+ *                                       spelling; only the KEY moved, 1 -> 3.)
+ *   EquipGun    bool     1             (spec v31 §1 — the PISTOL, moved 2 -> 1. DIRECT SELECT, idempotent)
+ *   EquipSmg    bool     2             (spec v31 §1 — the SMG, moved 3 -> 2. The SWING rides IA_Melee
+ *                                       since v28 §10.)
+ *   Inspect     bool     F             (spec v31 §5 — the 3.20 s butterfly-knife flourish, on the F that
+ *                                       PullCore vacated. Purely cosmetic: it confers and blocks nothing,
+ *                                       and any real action interrupts it.)
  *   Reload      bool     R             (spec v16 §1 — the clip also reloads itself when it empties)
  *
  * SPEC v15 §5: TWO WEAPON KEYS, AND NO TOGGLE. Verbatim: "Switch weapon keybind so that it's only
@@ -570,6 +582,35 @@ protected:
 	TObjectPtr<UInputAction> IA_Melee;
 
 	/**
+	 * *** SPEC v31 §5 — THE KNIFE FLOURISH. Default F, rebindable like everything else. ***
+	 *
+	 * "Inspect (3.20 s) is a flourish — bind it to F, as a new rebindable action in the settings page
+	 * like every other action." The verb is TraceKnifeView::RequestInspect and this action does
+	 * nothing but deliver the press to it.
+	 *
+	 * *** PRESS ONLY. There is deliberately no Completed/Canceled binding, and that is a decision. ***
+	 * Every other action in this file that binds the release does so because it owns HELD state that
+	 * a dropped release would strand: the Core pull's ring keeps filling, the parry's shared-key
+	 * tiebreak keeps a hold latched, fire keeps firing. The flourish owns none — it is a one-shot
+	 * animation of a fixed 3.20 s that ends because the SEQUENCE ends, and there is nothing a release
+	 * could cancel that a real action does not already outrank. Binding a release here would be a
+	 * handler that exists to do nothing, which is worse than no handler.
+	 *
+	 * ITS KEY WAS TAKEN FROM ETraceInputAction::PullCore, which moved to G. That is written up in
+	 * full on Default_PullCore and on the enumerator; it is mentioned here because a reader of this
+	 * header hunting "why is my F not pulling any more" should not have to find it.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> IA_Inspect;
+
+	/**
+	 * SPEC v31 §5. The F handler: one call, no decision. Every refusal lives at the verb.
+	 *
+	 * Suppressed while a menu owns input, like every other press in this file.
+	 */
+	void OnInspectStarted();
+
+	/**
 	 * Resolves InputMapping and every IA_* exactly once, then lays down the key mappings.
 	 *
 	 * The two halves are separate on purpose. The ACTIONS must be resolved exactly once and never
@@ -688,9 +729,16 @@ protected:
 	 * Press-only, and that asymmetry is deliberate: there is no held state here, so a release binding
 	 * would fire a second request on key-up.
 	 *
-	 *     1  OnEquipKnifeStarted  ETraceEquippedWeapon::Knife  guns STOWED, knife only, +22% speed
-	 *     2  OnEquipGunStarted    ETraceEquippedWeapon::Gun     the pistol
-	 *     3  OnEquipSmgStarted    ETraceEquippedWeapon::Smg     the SMG
+	 *     3  OnEquipKnifeStarted  ETraceEquippedWeapon::Knife  the KNIFE, +22% speed, 0.65x pullout
+	 *     1  OnEquipGunStarted    ETraceEquippedWeapon::Gun     the pistol
+	 *     2  OnEquipSmgStarted    ETraceEquippedWeapon::Smg     the SMG
+	 *
+	 * *** SPEC v31 §1 RE-KEYED ALL THREE AND DELETED THE STOW STATE. *** Verbatim: "1 is pistol, 2 is
+	 * smg, 3 is knife". The digits above are the SHIPPED DEFAULTS and nothing more — each is read live
+	 * from TraceInputActions::Info(), all three are rebindable, and all three ConfigIds were migrated
+	 * ("StowGuns" -> "KnifeSlot", "EquipPistol" -> "PistolSlot", "EquipSmg" -> "SmgSlot") because
+	 * every key changed MEANING, not just position. The knife handler no longer stows anything: with
+	 * bDualWieldKnife OFF it selects the blade as a weapon, which is what it did before v24.
 	 *
 	 * *** THE PARAMETER IS THE WEAPON, NOT A BOOL, AND THAT IS THE WHOLE v29 §5 CHANGE HERE. *** It
 	 * used to be `bool bWantKnife`, which could only ever name two of three states — so v28 §10 had
@@ -700,7 +748,8 @@ protected:
 	 *
 	 * The two handler names keep their v13 spellings because ETraceInputAction does (see that enum's
 	 * comment — renaming it would break another slice's file this pass). OnEquipKnifeStarted is the
-	 * STOW key.
+	 * KNIFE key: v29 §5 made it the stow key and v31 §1 gave it back to the blade, so the spelling is
+	 * once again the plain truth rather than a historical accident.
 	 *
 	 * ONE implementation behind three handlers rather than three copies: the only difference between
 	 * them is the destination weapon, and the idempotence guard is the part that must not be allowed

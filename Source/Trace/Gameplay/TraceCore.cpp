@@ -24,11 +24,16 @@
 
 #include "Gameplay/TraceEndzone.h"
 
+#include "Animation/AnimSequence.h"             // spec v31 §4: the pack's three Core clips
+#include "Animation/AnimSingleNodeInstance.h"   // spec v31 §4: single-node playback, no AnimBlueprint
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/PointLightComponent.h"     // spec v31 §4: the #FF8A1F heart light
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
+#include "Components/SkeletalMeshComponent.h"   // spec v31 §4: SK_TraceCore
 #include "Components/StaticMeshComponent.h"
+#include "Engine/SkeletalMesh.h"                // spec v31 §4: GetImportedBounds() for the art scale
 #include "CollisionQueryParams.h"
 #include "CollisionShape.h"
 #include "Engine/Engine.h"                      // GEngine->GetWorldContexts() (Trace.ModeB.CoreProbe)
@@ -48,7 +53,10 @@
 #include "Misc/CommandLine.h"                   // spec v13 §8: -TraceTurnoverRepro= / -TraceLegacyLanding
 #include "Misc/Parse.h"
 #include "Containers/Ticker.h"                  // FTSTicker (Trace.Integ.TurnoverDemo)
+#include "HAL/PlatformFileManager.h"            // CreateDirectoryTree (Trace.Core.ArtShots)
+#include "Misc/DateTime.h"                      // screenshot filenames (Trace.Core.ArtShots)
 #include "Misc/Paths.h"                         // FPaths::Combine  (Trace.Integ.TurnoverDemo)
+#include "TimerManager.h"                       // spec v31 §4: the art-shot beat schedule
 #include "UnrealClient.h"                       // FScreenshotRequest (Trace.Integ.TurnoverDemo)
 #include "UObject/ConstructorHelpers.h"
 #include "UObject/UnrealType.h"                 // FindFProperty / FFloatProperty (mode B settings bridge)
@@ -585,6 +593,55 @@ static TAutoConsoleVariable<float> CVarModeBThrowInheritance(
 	TEXT("velocity, vertical included, so a jumping throw carries the jump and a sprinting throw ")
 	TEXT("carries the sprint. 1 = full inheritance (the default), 0 = the pre-v8 throw that inherited ")
 	TEXT("nothing. UTraceSettings::CoreThrowVelocityInheritance."),
+	ECVF_Default);
+
+// =================================================================================================
+// *** SPEC v31 §2 — "WHEN A PLAYER IS GOING DOWN THE CORE JUST DROPS INSTEAD OF GOING FORWARD."
+// ***
+// *** THE OWNER DIAGNOSED THIS AND THE DIAGNOSIS IS CORRECT. THE COMMENT DIRECTLY ABOVE IS THE BUG.
+// =================================================================================================
+//
+// Read the block above again: "WHY VERTICAL IS NOT SPECIAL-CASED ... A jumping throw is the one the
+// note names, and its whole character is that the Core leaves with the jump still in it." Every word
+// of that is true about a RISING thrower and none of it is true about a FALLING one. The rule was
+// written from the one case spec v8 §4 named, and the opposite sign of the same term was never
+// considered — so the fix for "a jump is thrown away" quietly created "a fall is thrown INTO the
+// floor". Both are the same line of code; only the sign differs.
+//
+// THE ARITHMETIC, at the shipped values (throw speed 3300 base -> 2236 uu/s after the weight model,
+// up bias 0.12 -> 0.29 after weight, so an impulse of 2236 forward + 649 up):
+//
+//   standing        launch Z = +649                       ... the throw arcs
+//   jump apex       launch Z = +649 + 560 = +1209         ... spec v8 §4's case, and it is right
+//   falling  600    launch Z = +649 -  600 =   +49        ... flat, and it looks like a fumble
+//   falling 1200    launch Z = +649 - 1200 =  -551        ... AIMED AT THE GROUND. "It just drops."
+//
+// AND IT EXPLAINS LAST PATCH'S UNEXPLAINED SPREAD. A full charge was measured leaving between 2561
+// and 3051 uu/s with nothing in the code able to account for a 490 uu/s band. The band IS the
+// thrower's vertical velocity: a 490 uu/s difference in Z, at a launch whose other components are
+// fixed, is exactly what a half-second of fall does to |launch|. Nobody could explain it because
+// everybody was looking at the charge, and the charge was innocent.
+//
+// ONE KNOB, EXPRESSED RELATIVE TO THE INHERITANCE IT MODIFIES (the project's standing rule): it is a
+// multiplier on the DOWNWARD half of the existing inheritance, not a second independent fraction.
+// 0 (default) = a fall contributes nothing vertically and the horizontal term is untouched, which is
+// both halves of what the owner asked for. 1 = the pre-v31 launch, exactly, in the same binary — the
+// RED ARM, and Trace.ModeB.MomentumTestNow prints both arms from ONE throw so the before/after cannot
+// be two different runs of two different builds.
+//
+// NOT `ECVF_Cheat`: it is a feel knob, and a playtester must be able to A/B it.
+// =================================================================================================
+
+static TAutoConsoleVariable<float> CVarModeBThrowInheritanceDown(
+	TEXT("Trace.ModeB.ThrowVelocityInheritanceDown"),
+	0.f,
+	TEXT("MODE B, spec v31 §2. Multiplier applied to Trace.ModeB.ThrowVelocityInheritance for the ")
+	TEXT("DOWNWARD part of the thrower's velocity only. 0 (default): a player who throws while falling ")
+	TEXT("no longer has the fall subtracted from the launch - the Core leaves with the same Z a ")
+	TEXT("standing throw gives it, and still carries the whole horizontal motion. 1: the pre-v31 ")
+	TEXT("behaviour, which is the bug ('the core just drops'). Rising velocity is never touched - ")
+	TEXT("spec v8 §4's jumping throw still carries the jump in full. ")
+	TEXT("UTraceSettings::CoreThrowVelocityInheritanceDown."),
 	ECVF_Default);
 
 // =================================================================================================
@@ -1400,6 +1457,15 @@ namespace TraceModeBTuning
 	// a Rocket League shot" variant is reachable from the console without a rebuild.
 	float ThrowInheritance()  { return Resolve(TEXT("CoreThrowVelocityInheritance"),      CVarModeBThrowInheritance, 0.f,   2.f); }
 
+	// --- Spec v31 §2. The DOWNWARD half of the same term, as a multiplier on it. Clamped to [0,1]:
+	// above 1 a fall would be AMPLIFIED, which is the reported bug made worse and is not a variant
+	// anybody wants reachable by a typo. Bound by name to UTraceSettings::CoreThrowVelocityInheritance-
+	// Down; that property does not exist yet (UTraceSettings is not this pass's file) and Resolve()
+	// answers with the CVar when a name is missing, so the shipped value is 0 today and an ini value
+	// takes over automatically the moment the property is declared, with no edit here. Exactly the
+	// arrangement CoreThrowFullChargeAutoReleaseSeconds shipped under, for the same reason.
+	float ThrowInheritanceDown() { return Resolve(TEXT("CoreThrowVelocityInheritanceDown"), CVarModeBThrowInheritanceDown, 0.f, 1.f); }
+
 	// --- Spec v13 §6, the charge. NOT scaled by the weight model either, and for the same reason: the
 	// weight already reduced the impulse the charge is a fraction OF, so a heavier Core is thrown
 	// slower at every charge level without the charge having to know the Core has a weight at all.
@@ -1678,6 +1744,15 @@ namespace TraceModeBTuning
 			// job of this list is not "to-do" but "these names must keep matching" — the entry is what
 			// would say so out loud if either side were ever renamed.
 			TEXT("CoreThrowVelocityInheritance"),
+			// Spec v31 §2. THE ONE ENTRY IN THIS LIST THAT IS CURRENTLY A TO-DO, and it is here so
+			// that the build says so out loud instead of a designer discovering it. UTraceSettings and
+			// Config/DefaultGame.ini are not this pass's files; until somebody declares
+			// `float CoreThrowVelocityInheritanceDown = 0.f;` on UTraceSettings and ships
+			// `CoreThrowVelocityInheritanceDown=0.000000` beside CoreThrowVelocityInheritance in the
+			// ini, this knob is live only as Trace.ModeB.ThrowVelocityInheritanceDown. The shipped
+			// BEHAVIOUR is correct either way - the CVar default IS the fix - so what is missing is the
+			// settings-page slider, not the fix.
+			TEXT("CoreThrowVelocityInheritanceDown"),
 			// Spec v6 §4.1. All three declared and ini-backed, same standing-check reason as above.
 			TEXT("CoreCatchRadius"),
 			TEXT("CoreCatchCurveStrength"),
@@ -1945,6 +2020,194 @@ static FAutoConsoleCommand GTraceCoreGoalReproCmd(
 
 
 // =================================================================================================
+// *** SPEC v31 §4 — THE NEW CORE MODEL. WHAT THE THREE CLIPS ACTUALLY CONTAIN, MEASURED FROM
+// *** Art/Pack/models/core.glb RATHER THAN READ OFF unreal-core_README.md.
+// =================================================================================================
+//
+// The owner's words: "Implement the new core model with its idle animation. it is football shaped,
+// but should have normal ball physics (just orienting the football to point with its velocity). It
+// should also stand up on its pointy edge and rotate when on the ground."
+//
+// THE PHYSICS IS NOT TOUCHED BY ANY OF THIS. Not one line below changes LooseLocation, LooseVelocity,
+// the 22 uu collision sphere, the bounce, the rest rule or the turnover geometry: the Core still
+// sweeps and bounces as a sphere, which is what "normal ball physics ... do not turn it into a rugby
+// ball that bounces oddly" asks for. Only a COMPONENT-RELATIVE ROTATION and a choice of clip change.
+// The actor's own rotation is left at identity throughout, because the beacon shaft hangs off the
+// same Root and has to stay a true vertical wherever the ball is pointing.
+//
+// --- THE CLIPS, PER-KEY, IN glTF AXES AND THEN IN UE ONES -----------------------------------------
+//
+// Interchange maps UE = (gl.x, gl.z, gl.y), so the mesh's long axis is UE local +X (nose at
+// +18.5 uu, rear at -18.5, heart at the origin) and the authored "up" is UE local +Z.
+//
+//   Idle    3.600 s, loop.  `core` turns ONE FULL REVOLUTION about the authored UP axis (glTF +Y,
+//                           i.e. UE local +Z), plus a +/-1.2 uu vertical bob and a 9 deg wobble; the
+//                           shell halves shiver 4 mm; each cage ring turns once about the long axis.
+//                           *** THIS IS A BALL LYING ON ITS SIDE ON A TURNTABLE. *** The README calls
+//                           it a "slow tumble"; the keys say otherwise, and the keys win.
+//   Pickup  0.550 s, one-shot.  Shell halves crack +/-30 mm apart (UE local +/-Y), the ball rises
+//                           2 cm and turns 51.6 deg about the same up axis, rings turn ~34 deg.
+//   Throw   0.500 s, loop.  `core` rolls EXACTLY FOUR WHOLE TURNS ABOUT THE LONG AXIS (glTF +X = UE
+//                           local +X) - i.e. 8.00 rev/s at play rate 1 - and each cage ring turns
+//                           once. Shell stays shut. This is the rifle spin, and it tiles.
+//
+// (The first read of Throw sampled its first, middle and last key and saw identity at all three -
+// because 0, 2 and 4 whole turns ARE identity. That is this spec's "beware per-frame readers of fast
+// quantities" in its purest form, and the numbers above come from accumulating every key delta
+// instead. If you edit this block, measure the same way.)
+//
+// --- HOW EACH STATE IS POSED, AND THE ONE PLACE THE PACK COULD NOT BE FOLLOWED --------------------
+//
+//   CARRIED  component rotation IDENTITY, so the clip's spin axis lines up with world up and the
+//            authored Idle turntable reads exactly as authored, floating over the holder's head.
+//            Pickup plays once on the possession edge (the shell cracks, the heart is shown), then
+//            Idle loops. That is the pack README's own instruction: "Play on grab, then hold the last
+//            frame (or blend to your carry state)."
+//
+//   FLIGHT   component rotation = MakeFromX(velocity), so mesh +X - the nose, the throw axis and the
+//            socket the pack documents - points along the velocity and keeps pointing along it as
+//            gravity bends the arc. The roll is the authored Throw clip, at a play rate that turns
+//            its authored 8.00 rev/s into the FX notes' "~10 rev/s". RELATIVE, per the standing rule:
+//            the rate is (wanted rev/s) / (the clip's own rev/s), so a re-export at a different key
+//            density still spins at the number the artist's notes ask for.
+//
+//   REST     *** THE ONE CONFLICT, AND IT IS GEOMETRIC, NOT A JUDGEMENT CALL. *** The owner wants the
+//            ball STANDING ON ITS POINT and rotating. Standing it up means mesh +X points at world
+//            +Z. A_Core_Idle's rotation is about the mesh's local +Z - which, once the ball is stood
+//            up, is HORIZONTAL, so playing Idle in that pose does not spin the ball on its point, it
+//            slowly cartwheels it end over end. The two cannot both be honoured.
+//            The owner's sentence is explicit and specific ("a deliberate readable pose, not
+//            physics"), so the pose wins, and the SPIN is taken from the one authored clip whose axis
+//            of rotation IS the long axis - Throw - played at the turn rate A_Core_Idle authors for
+//            the ground state (one revolution per 3.6 s). So the pose is the owner's, the motion is
+//            still the artist's, and nothing here is hand-animated.
+//            THE REAL FIX is an artist re-export of Idle with its spin on the long axis (or an
+//            AnimBlueprint that masks the `core` bone's rotation); either would drop straight in here
+//            and bring the bob and the shell shiver with it.
+//
+// --- SCALE ----------------------------------------------------------------------------------------
+//
+// DERIVED, NOT A LITERAL. The mesh imports life-size at 37.0 x 22.0 x 22.0 uu and the orb it replaces
+// draws at 40 uu across (TraceModeBVisibleOrbRadius x 2), which is the size every mode-B surface,
+// support-gap and turnover rule in this file was tuned against. So the ball is drawn at exactly that
+// length and the factor is (2 x TraceModeBVisibleOrbRadius) / (the mesh's own imported length),
+// measured at BeginPlay - about x1.08 today. Nothing downstream has to be re-measured, a re-export at
+// a different size cannot silently change the physics read, and both halves of the ratio are bases
+// rather than magic numbers.
+//
+// The pack's first-person preview scales the Core to 0.30 m; that number is for a ball held in a
+// hand, and this one is a world objective read across a 24000 uu field. Said out loud rather than
+// silently ignored.
+// =================================================================================================
+
+namespace TraceCoreArt
+{
+	/** The pack's Core, and its three clips. Missing => the fallback sphere; see bPackArtActive. */
+	const TCHAR* const MeshPath   = TEXT("/Game/Trace/Art/Pack/Core/SK_TraceCore.SK_TraceCore");
+	const TCHAR* const IdlePath   = TEXT("/Game/Trace/Art/Pack/Core/Anims/A_Core_Idle.A_Core_Idle");
+	const TCHAR* const PickupPath = TEXT("/Game/Trace/Art/Pack/Core/Anims/A_Core_Pickup.A_Core_Pickup");
+	const TCHAR* const ThrowPath  = TEXT("/Game/Trace/Art/Pack/Core/Anims/A_Core_Throw.A_Core_Throw");
+
+	/** Drawn length of the ball, uu. The orb it replaces, so no other rule in this file moves. */
+	constexpr double TargetLengthUU = TraceModeBVisibleOrbRadius * 2.0;
+
+	/** MEASURED from core.glb: A_Core_Throw turns the ball 4.000 times in 0.500 s. */
+	constexpr float ThrowClipRevPerSecond = 4.f / 0.5f;
+
+	/** MEASURED from core.glb: A_Core_Idle turns the ball once in 3.600 s. The ground turn rate. */
+	constexpr float IdleClipRevPerSecond = 1.f / 3.6f;
+
+	/** unreal-fx_README, "The Core": "The ball spins about its long axis - nose forward, ~10 rev/s." */
+	constexpr float FlightSpinRevPerSecond = 10.f;
+
+	/**
+	 * Material slot names to drive. Matched by SUBSTRING because Interchange decorates slot names
+	 * (`circuit_cyan_Section5` and friends) - Scripts/import_pack.py had to do the same thing when it
+	 * assigned them, and a slot this file cannot find is a slot whose glow silently never moves.
+	 */
+	const TCHAR* const CyanSlot  = TEXT("circuit_cyan");
+	const TCHAR* const AmberSlot = TEXT("core_amber");
+
+	/**
+	 * The KHR emissive strengths the pack folded into EmissiveColor, so that EmissiveIntensity really
+	 * does mean "1.0 = at rest" (Scripts/import_pack.py's MATERIALS table). Only needed when the cyan
+	 * slot is TEAM TINTED, where the authored colour is replaced and its brightness has to be carried
+	 * across with it rather than silently lost.
+	 */
+	constexpr float CyanEmissiveStrength = 1.5f;
+
+	/** The pack's own circuit_cyan emissive, linear, for a Core that belongs to nobody. #25E6FF. */
+	const FLinearColor CyanEmissive(0.018500220f, 0.791297940f, 1.f, 1.f);
+
+	/** unreal-fx_README "The Core": #FF8A1F, the heart light and the amber the objective reads by. */
+	const FLinearColor AmberSRGB(1.f, 0.541f, 0.122f, 1.f);
+
+	// --- EmissiveIntensity bands, verbatim from unreal-core_README.md's table and the FX notes ------
+	constexpr float IdleCyanLo = 0.85f,  IdleCyanHi = 1.2f;
+	constexpr float IdleAmberLo = 0.7f,  IdleAmberHi = 1.2f;
+	constexpr float CarriedCyanLo = 1.7f,  CarriedCyanHi = 2.2f;
+	constexpr float CarriedAmberLo = 2.4f, CarriedAmberHi = 3.2f;
+	constexpr float ThrownCyan = 3.4f, ThrownAmber = 2.6f;
+	constexpr float PickupAmberFlare = 4.6f;
+
+	/** "both breathe on a slow ~2 s cycle" / "pulsing about 2.5 Hz". */
+	constexpr float IdleBreathHz = 0.5f;
+	constexpr float CarriedPulseHz = 2.5f;
+}
+
+/**
+ * SPEC v31 §4. 1 (default): draw SK_TraceCore. 0: the pre-v31 engine sphere.
+ *
+ * The A/B for judging the new model against the old orb without a rebuild, and the switch that says
+ * out loud that the fallback is a supported path rather than dead code. `-TraceNoCharacterArt` forces
+ * the same fallback, so one command-line switch still shows the whole procedural game.
+ */
+static TAutoConsoleVariable<int32> CVarCorePackArt(
+	TEXT("Trace.Core.PackArt"),
+	1,
+	TEXT("SPEC v31 §4. 1 (default): the Core is drawn as the pack's SK_TraceCore with its authored ")
+	TEXT("clips. 0: the pre-v31 engine sphere. Also forced to 0 by -TraceNoCharacterArt and whenever ")
+	TEXT("the pack art is not on disk (a clone with no `git lfs pull`)."),
+	ECVF_Default);
+
+/** SPEC v31 §4. Revolutions per second the Core turns at while standing on its point. */
+static TAutoConsoleVariable<float> CVarCoreRestSpin(
+	TEXT("Trace.Core.RestSpinRevPerSecond"),
+	TraceCoreArt::IdleClipRevPerSecond,
+	TEXT("SPEC v31 §4. How fast the Core turns while standing on its point on the ground. Defaults to ")
+	TEXT("the turn rate A_Core_Idle itself authors for the ground state (one revolution per 3.6 s), ")
+	TEXT("expressed as a play rate on A_Core_Throw - the only authored clip whose spin axis is the ")
+	TEXT("long axis, which is the axis a ball standing on its point has to turn about."),
+	ECVF_Default);
+
+/** SPEC v31 §4 / unreal-fx_README. Revolutions per second of the in-flight rifle spin. */
+static TAutoConsoleVariable<float> CVarCoreFlightSpin(
+	TEXT("Trace.Core.FlightSpinRevPerSecond"),
+	TraceCoreArt::FlightSpinRevPerSecond,
+	TEXT("SPEC v31 §4. In-flight rifle spin about the long axis. 10 is the FX notes' number; the clip ")
+	TEXT("itself authors 8.00 rev/s, so the default runs A_Core_Throw at play rate 1.25. Set 8 to play ")
+	TEXT("the clip exactly as authored."),
+	ECVF_Default);
+
+/** SPEC v31 §4 / unreal-fx_README. The heart light's reach, uu. 0 switches the light off. */
+static TAutoConsoleVariable<float> CVarCoreHeartLightRadius(
+	TEXT("Trace.Core.HeartLightRadius"),
+	900.f,
+	TEXT("SPEC v31 §4. Attenuation radius of the #FF8A1F point light at the Core's heart socket - ")
+	TEXT("\"it's what tells the other team who has the objective\", so the pack asks for it to be a ")
+	TEXT("gameplay-tunable. 0 switches the light off entirely."),
+	ECVF_Default);
+
+/** SPEC v31 §4. Heart light brightness while CARRIED; a loose Core gets a fraction of it. */
+static TAutoConsoleVariable<float> CVarCoreHeartLightIntensity(
+	TEXT("Trace.Core.HeartLightIntensity"),
+	4000.f,
+	TEXT("SPEC v31 §4. Unitless intensity of the heart light while the Core is CARRIED. A loose Core ")
+	TEXT("is lit at a third of it - it is a marker, not a carrier's tell."),
+	ECVF_Default);
+
+
+// =================================================================================================
 // Construction
 // =================================================================================================
 
@@ -1994,6 +2257,34 @@ ATraceCore::ATraceCore()
 	// changes, because the proxy caches that chain when it is built.
 	Mesh->SetOwnerNoSee(true);
 
+	// --- SPEC v31 §4: the pack's Core, beside the fallback rather than instead of it ----------------
+	//
+	// Same collision, shadow, decal and owner-no-see policy as the orb it stands in for, one line at a
+	// time rather than copied wholesale, because "no collision anywhere on this actor" is a rule and
+	// not an accident.
+	PackMesh = CreateDefaultSubobject<USkeletalMeshComponent>(TEXT("PackMesh"));
+	PackMesh->SetupAttachment(Root);
+	PackMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	PackMesh->SetCollisionProfileName(TEXT("NoCollision"));
+	PackMesh->SetGenerateOverlapEvents(false);
+	PackMesh->SetCanEverAffectNavigation(false);
+	PackMesh->SetCastShadow(false);
+	PackMesh->bReceivesDecals = false;
+	PackMesh->SetOwnerNoSee(true);   // Same reason as the orb above: never in its own holder's lens.
+	PackMesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+	// Three clips, one at a time, chosen by a state test - there is nothing for an AnimBlueprint to
+	// blend and nothing for it to decide, so there is no AnimBlueprint and no .uasset to keep in step.
+	PackMesh->SetVisibility(false);   // Until BeginPlay confirms the art actually resolved.
+
+	HeartLight = CreateDefaultSubobject<UPointLightComponent>(TEXT("HeartLight"));
+	HeartLight->SetupAttachment(Root);   // The `heart` socket IS the mesh origin; see the pack notes.
+	HeartLight->SetCastShadows(false);   // See the header: a shadowing light inside the shell is a
+	                                     // light nobody outside the shell can see.
+	HeartLight->SetLightColor(TraceCoreArt::AmberSRGB);
+	HeartLight->SetAttenuationRadius(900.f);
+	HeartLight->SetIntensity(0.f);       // Driven per-state by UpdateCoreArt.
+	HeartLight->SetVisibility(false);
+
 	Beacon = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Beacon"));
 	Beacon->SetupAttachment(Root);
 	Beacon->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -2016,6 +2307,37 @@ ATraceCore::ATraceCore()
 	if (CylinderMeshFinder.Succeeded())
 	{
 		Beacon->SetStaticMesh(CylinderMeshFinder.Object);
+	}
+
+	// SPEC v31 §4. Constructor-time finders for the same reason the engine shapes above use them: a
+	// runtime LoadObject leaves no cook reference and resolves to null in a packaged build. Separate
+	// static finders rather than a loop - ConstructorHelpers::FObjectFinder must be a distinct static
+	// per path, which is the rule TraceCharacter.cpp records having learned the hard way.
+	//
+	// A MISSING ASSET IS NOT AN ERROR HERE. A fresh clone with no `git lfs pull` has no
+	// /Game/Trace/Art/Pack at all; Succeeded() is false, the sphere stays, and the match is playable.
+	static ConstructorHelpers::FObjectFinder<USkeletalMesh> CoreMeshFinder(TraceCoreArt::MeshPath);
+	if (CoreMeshFinder.Succeeded())
+	{
+		PackMesh->SetSkeletalMesh(CoreMeshFinder.Object);
+	}
+
+	static ConstructorHelpers::FObjectFinder<UAnimSequence> CoreIdleFinder(TraceCoreArt::IdlePath);
+	if (CoreIdleFinder.Succeeded())
+	{
+		ArtIdleAnim = CoreIdleFinder.Object;
+	}
+
+	static ConstructorHelpers::FObjectFinder<UAnimSequence> CorePickupFinder(TraceCoreArt::PickupPath);
+	if (CorePickupFinder.Succeeded())
+	{
+		ArtPickupAnim = CorePickupFinder.Object;
+	}
+
+	static ConstructorHelpers::FObjectFinder<UAnimSequence> CoreThrowFinder(TraceCoreArt::ThrowPath);
+	if (CoreThrowFinder.Succeeded())
+	{
+		ArtThrowAnim = CoreThrowFinder.Object;
 	}
 
 	// Same material policy as the trail and the arena: the generated unlit neon material if the
@@ -2081,7 +2403,9 @@ void ATraceCore::BeginPlay()
 
 	// Shader work is pointless (and unreliable - shaders are not cooked for server targets) on a
 	// dedicated server.
-	if (BaseMaterial != nullptr && GetNetMode() != NM_DedicatedServer)
+	const bool bHasRenderer = GetNetMode() != NM_DedicatedServer;
+
+	if (BaseMaterial != nullptr && bHasRenderer)
 	{
 		if (Mesh != nullptr)
 		{
@@ -2090,6 +2414,94 @@ void ATraceCore::BeginPlay()
 		if (Beacon != nullptr)
 		{
 			BeaconMID = Beacon->CreateDynamicMaterialInstance(0, BaseMaterial);
+		}
+	}
+
+	// --- SPEC v31 §4: which Core is on screen, decided once and said out loud ----------------------
+	//
+	// THE FALLBACK IS A SUPPORTED PATH, NOT AN ERROR PATH. Three ways to reach it: the art is not on
+	// disk (a clone with no `git lfs pull`), `-TraceNoCharacterArt` (so the procedural game can be
+	// tested on a machine where the art DID import - the same switch TraceCharacter's own fallback
+	// answers to), or Trace.Core.PackArt 0. All three land on the pre-v31 sphere, and the log says
+	// which one happened, because "the Core looks wrong" is otherwise a five-minute question.
+	const bool bArtOnDisk = PackMesh != nullptr && PackMesh->GetSkeletalMeshAsset() != nullptr
+		&& ArtIdleAnim != nullptr && ArtPickupAnim != nullptr && ArtThrowAnim != nullptr;
+	const bool bArtSwitchedOff = FParse::Param(FCommandLine::Get(), TEXT("TraceNoCharacterArt"));
+
+	// bPackArtActive means AVAILABLE, not "currently drawn". Trace.Core.PackArt is deliberately left
+	// out of it and applied per tick instead, so the A/B is live at the console rather than a restart:
+	// the MIDs and the scale are set up either way and only the two visibilities move.
+	bPackArtActive = bArtOnDisk && !bArtSwitchedOff && bHasRenderer;
+
+	if (bPackArtActive)
+	{
+		// THE SCALE IS DERIVED FROM THE MESH ITSELF. See the ART block: the ball is drawn at exactly
+		// the length the orb it replaces drew at, so every mode-B support-gap and turnover rule keeps
+		// meaning what it meant, and a re-export at a different size cannot change the physics read.
+		const FBoxSphereBounds Imported = PackMesh->GetSkeletalMeshAsset()->GetImportedBounds();
+		PackArtMeshLengthX = static_cast<float>(FMath::Max(1.0, 2.0 * Imported.BoxExtent.X));
+		PackArtScale = static_cast<float>(TraceCoreArt::TargetLengthUU) / PackArtMeshLengthX;
+
+		PackMesh->SetRelativeScale3D(FVector(PackArtScale));
+		PackMesh->SetVisibility(true);
+
+		if (Mesh != nullptr)
+		{
+			Mesh->SetVisibility(false);
+		}
+
+		// The two emissive slots the FX notes drive by STATE. Found by substring: Interchange
+		// decorates slot names, and a slot this loop fails to find is a glow that silently never
+		// moves - so the failure is logged rather than left to be noticed in a screenshot.
+		const TArray<FName> SlotNames = PackMesh->GetMaterialSlotNames();
+		for (int32 Index = 0; Index < SlotNames.Num(); ++Index)
+		{
+			const FString SlotName = SlotNames[Index].ToString();
+			if (CyanMID == nullptr && SlotName.Contains(TraceCoreArt::CyanSlot))
+			{
+				CyanMID = PackMesh->CreateDynamicMaterialInstance(Index, nullptr);
+			}
+			else if (AmberMID == nullptr && SlotName.Contains(TraceCoreArt::AmberSlot))
+			{
+				AmberMID = PackMesh->CreateDynamicMaterialInstance(Index, nullptr);
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Core] spec v31 §4: drawing SK_TraceCore. Mesh is %.1f uu long; drawn at %.1f uu ")
+			TEXT("(x%.4f, = the %.0f uu orb it replaces). Emissive slots: cyan %s, amber %s. Rest spin ")
+			TEXT("%.3f rev/s, flight spin %.2f rev/s (clip authors %.2f)."),
+			PackArtMeshLengthX, TraceCoreArt::TargetLengthUU, PackArtScale,
+			TraceCoreArt::TargetLengthUU,
+			(CyanMID != nullptr) ? TEXT("found") : TEXT("NOT FOUND"),
+			(AmberMID != nullptr) ? TEXT("found") : TEXT("NOT FOUND"),
+			CVarCoreRestSpin.GetValueOnGameThread(), CVarCoreFlightSpin.GetValueOnGameThread(),
+			TraceCoreArt::ThrowClipRevPerSecond);
+	}
+	else
+	{
+		if (PackMesh != nullptr)
+		{
+			PackMesh->SetVisibility(false);
+			PackMesh->SetComponentTickEnabled(false);
+		}
+		if (HeartLight != nullptr)
+		{
+			HeartLight->SetVisibility(false);
+		}
+		if (Mesh != nullptr && bHasRenderer)
+		{
+			Mesh->SetVisibility(true);
+		}
+
+		if (bHasRenderer)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Core] spec v31 §4: FALLBACK SPHERE. art on disk=%s, -TraceNoCharacterArt=%s. ")
+				TEXT("The match is fully playable; only the Core's model is the pre-v31 orb. ")
+				TEXT("`git lfs pull` then Scripts/import-pack.sh brings in the real one."),
+				bArtOnDisk ? TEXT("yes") : TEXT("NO"),
+				bArtSwitchedOff ? TEXT("yes") : TEXT("no"));
 		}
 	}
 
@@ -2149,6 +2561,16 @@ void ATraceCore::Tick(float DeltaSeconds)
 		ApplyAttachment();
 		UpdateVisuals();
 	}
+
+	// SPEC v31 §4. THE MODEL'S POSE AND GLOW, AND IT IS AHEAD OF THE AUTHORITY SPLIT ON PURPOSE.
+	//
+	// Every fact it needs - Carrier, bLoose, LooseVelocity - already replicates, so each machine can
+	// derive the presentation for itself and none of it has to be sent. Below the split it would run
+	// on the listen host only, which is precisely the machine the Core is usually HIDDEN from (the
+	// holder's own camera), i.e. it would be computed exactly where nobody can see it.
+	//
+	// It decides nothing and writes nothing but component transforms, material parameters and a light.
+	UpdateCoreArt();
 
 	// Spec v8 §0/§4. Every machine's own view, so "the Core carries the momentum" is a claim that can
 	// be checked on the CLIENT rather than inferred from the server's copy. Costs one int compare.
@@ -4420,7 +4842,19 @@ float ATraceCore::GetThrowVelocityInheritance()
 	return TraceModeBTuning::ThrowInheritance();
 }
 
-FVector ATraceCore::GetInheritedThrowVelocity(const AActor* Thrower)
+float ATraceCore::GetThrowVelocityInheritanceDown()
+{
+	return TraceModeBTuning::ThrowInheritanceDown();
+}
+
+/**
+ * Shared body for the live rule and its pre-v31 baseline. @p DownScale is the only difference.
+ *
+ * ONE expression, called twice, rather than two expressions that agree today: the whole value of the
+ * A/B print is that the legacy number is what the legacy code WOULD have produced, and two copies of
+ * an arithmetic that drifted apart would make the "before" column quietly fictional.
+ */
+static FVector TraceModeBInheritedThrowVelocity(const AActor* Thrower, float DownScale)
 {
 	if (!IsValid(Thrower))
 	{
@@ -4429,7 +4863,7 @@ FVector ATraceCore::GetInheritedThrowVelocity(const AActor* Thrower)
 
 	// MODE-GATED HERE rather than at every call site, so a caller can add this unconditionally and
 	// still get the mode-A answer (a Core that never moves under its own power) without a mode test.
-	if (!IsModeB(Thrower->GetWorld()))
+	if (!ATraceCore::IsModeB(Thrower->GetWorld()))
 	{
 		return FVector::ZeroVector;
 	}
@@ -4444,7 +4878,29 @@ FVector ATraceCore::GetInheritedThrowVelocity(const AActor* Thrower)
 	// same vector the character's own movement is integrating this frame - vertical included, which is
 	// the entire point of the note. Asking the actor rather than the CMC directly means a thrower with
 	// some other movement model (a spectator, a future vehicle) still contributes what it is doing.
-	return Thrower->GetVelocity() * Fraction;
+	FVector Inherited = Thrower->GetVelocity() * Fraction;
+
+	// SPEC v31 §2. THE ONE LINE THE WHOLE SECTION IS ABOUT. Only a DESCENDING Z is scaled; a rising
+	// one is passed through untouched, because spec v8 §4's jumping throw is a feature and this is a
+	// bug report about the other sign. Horizontal is never touched at all - "I still want the core to
+	// carry the player's velocity" is the first half of the same sentence.
+	if (Inherited.Z < 0.0)
+	{
+		Inherited.Z *= static_cast<double>(DownScale);
+	}
+
+	return Inherited;
+}
+
+FVector ATraceCore::GetInheritedThrowVelocity(const AActor* Thrower)
+{
+	return TraceModeBInheritedThrowVelocity(Thrower, TraceModeBTuning::ThrowInheritanceDown());
+}
+
+FVector ATraceCore::GetLegacyInheritedThrowVelocity(const AActor* Thrower)
+{
+	// 1.0 is the pre-v31 rule by definition: the whole of the thrower's Z, sign included.
+	return TraceModeBInheritedThrowVelocity(Thrower, 1.f);
 }
 
 FVector ATraceCore::ComputeThrowLaunchVelocity(const AActor* Thrower, const FVector& AimDirection,
@@ -4852,6 +5308,19 @@ static FAutoConsoleCommand GTraceModeBThrowMomentumCmd(
 			*S.ThrowerName, S.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("on the ground"),
 			S.ThrowerSpeed2D, S.ThrowerVelocityZ, S.HeldSeconds, S.ChargeScale,
 			S.ImpulseSpeed, S.InheritedSpeed, S.Inheritance, S.LaunchSpeed, S.LaunchVelocityZ);
+
+		// SPEC v31 §2. The vertical term split out, because it is the one the owner reported and the
+		// aggregate above cannot show it: an inherited SPEED of 900 says nothing about whether those
+		// 900 were pointing at the sky or at the floor.
+		const float LegacyLaunchZ = S.LaunchVelocityZ - S.InheritedVelocityZ + S.LegacyInheritedVelocityZ;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeB]   v31 §2: down-scale x%.2f | thrower Z %+.0f -> inherited Z %+.0f (pre-v31 ")
+			TEXT("%+.0f) | launch Z %+.0f, pre-v31 launch Z would have been %+.0f%s"),
+			S.InheritanceDown, S.ThrowerVelocityZ, S.InheritedVelocityZ, S.LegacyInheritedVelocityZ,
+			S.LaunchVelocityZ, LegacyLaunchZ,
+			(LegacyLaunchZ < 0.f && S.LaunchVelocityZ >= 0.f)
+				? TEXT("  <- THIS IS THE REPORTED BUG: the old rule aimed this throw at the floor.")
+				: TEXT(""));
 	}));
 
 // =================================================================================================
@@ -5407,16 +5876,52 @@ void ATraceCore::RunThrowMomentumTest()
 		EMovementMode Mode;
 	};
 
+	// SPEC v31 §2 ADDS THE TWO CASES THE BUG IS ACTUALLY IN. The original three could not have found
+	// it: standing and running have no vertical term at all, and JUMPING is the one sign of the one
+	// that does. RISING is the old JUMPING case under its true name; the two FALLING cases are the
+	// report. -JumpZ is what a player has a moment after the apex of their own jump; -2 x JumpZ is a
+	// drop off arena geometry, which is where the Core is thrown from most often in practice.
 	const FCase Cases[] =
 	{
-		{ TEXT("STANDING"), FVector::ZeroVector,                            MOVE_Walking },
-		{ TEXT("RUNNING"),  Forward * RunSpeed,                             MOVE_Walking },
-		{ TEXT("JUMPING"),  Forward * RunSpeed + FVector(0.f, 0.f, JumpZ),  MOVE_Falling },
+		{ TEXT("STANDING"), FVector::ZeroVector,                                   MOVE_Walking },
+		{ TEXT("RUNNING"),  Forward * RunSpeed,                                    MOVE_Walking },
+		{ TEXT("RISING"),   Forward * RunSpeed + FVector(0.f, 0.f,  JumpZ),        MOVE_Falling },
+		{ TEXT("FALLING"),  Forward * RunSpeed + FVector(0.f, 0.f, -JumpZ),        MOVE_Falling },
+		{ TEXT("PLUMMET"),  Forward * RunSpeed + FVector(0.f, 0.f, -2.f * JumpZ),  MOVE_Falling },
+	};
+
+	const float CoreGravity = FMath::Abs(GetThrowGravityZ(GetWorld()));
+
+	/**
+	 * Ballistic range from the launch back to the plane the thrower's FEET are on, uu.
+	 *
+	 * Not a simulation and does not claim to be: no bounce, no geometry, no catch magnet. It is the
+	 * one number that turns "the launch Z is -551" into something a designer can judge - "the Core
+	 * lands 4 m in front of you instead of 34 m" - and it is computed from the Core's own gravity so
+	 * it moves when the flight model is retuned. The real flight is longer than this whenever the
+	 * Core bounces, and shorter whenever it hits something; both arms are wrong by the same amount,
+	 * which is what makes the COMPARISON honest even though the absolute is an estimate.
+	 */
+	auto BallisticRange = [CoreGravity](float Speed2D, float VelocityZ, float HeightAboveFeet) -> float
+	{
+		if (CoreGravity < 1.f)
+		{
+			return 0.f;
+		}
+		const float Discriminant = VelocityZ * VelocityZ + 2.f * CoreGravity * FMath::Max(0.f, HeightAboveFeet);
+		if (Discriminant <= 0.f)
+		{
+			return 0.f;
+		}
+		const float Flight = (VelocityZ + FMath::Sqrt(Discriminant)) / CoreGravity;
+		return Speed2D * FMath::Max(0.f, Flight);
 	};
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[ModeBMomentum] spec v8 §4, thrower %s, inheritance x%.2f, run speed %.0f, jump Z %.0f"),
-		*GetNameSafe(Thrower), TraceModeBTuning::ThrowInheritance(), RunSpeed, JumpZ);
+		TEXT("[ModeBMomentum] spec v8 §4 + v31 §2, thrower %s, inheritance x%.2f, DOWN-scale x%.2f ")
+		TEXT("(0 = fixed, 1 = the pre-v31 bug), run speed %.0f, jump Z %.0f, core gravity %.0f uu/s2"),
+		*GetNameSafe(Thrower), TraceModeBTuning::ThrowInheritance(),
+		TraceModeBTuning::ThrowInheritanceDown(), RunSpeed, JumpZ, CoreGravity);
 
 	for (const FCase& Case : Cases)
 	{
@@ -5450,9 +5955,40 @@ void ATraceCore::RunThrowMomentumTest()
 			TEXT("(Z %+.0f) -> v8 launch %.0f uu/s (Z %+.0f) | inherited %.0f uu/s, %+.0f%%"),
 			Case.Name, LastThrow.ThrowerSpeed2D, LastThrow.ThrowerVelocityZ,
 			LastThrow.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("grounded"),
-			LastThrow.ImpulseSpeed, LastThrow.LaunchVelocityZ - LastThrow.ThrowerVelocityZ * LastThrow.Inheritance,
+			// THE PRE-v8 Z IS THE LAUNCH WITH THE INHERITED TERM AS ACTUALLY APPLIED TAKEN BACK OFF,
+			// not with (thrower Z x inheritance) taken off. Those were the same number until spec v31
+			// §2 stopped a falling thrower's Z from reaching the launch; afterwards the old expression
+			// over-subtracts and prints a pre-v8 baseline that is HIGHER than the live launch, which
+			// is nonsense (v8 only ever added). Caught in the first measured run of the fix.
+			LastThrow.ImpulseSpeed, LastThrow.LaunchVelocityZ - LastThrow.InheritedVelocityZ,
 			LastThrow.LaunchSpeed, LastThrow.LaunchVelocityZ, LastThrow.InheritedSpeed,
 			100.f * (LastThrow.LaunchSpeed - LastThrow.ImpulseSpeed) / FMath::Max(1.f, LastThrow.ImpulseSpeed));
+
+		// SPEC v31 §2's BEFORE AND AFTER, OFF THIS ONE THROW. The horizontal launch is identical under
+		// both arms by construction (the fix touches Z only), so the legacy launch differs from the
+		// live one in exactly one component and the difference in RANGE is attributable to it and to
+		// nothing else. On the STANDING and RUNNING rows the two columns are equal - a thrower with no
+		// downward velocity has nothing for the fix to change - and that equality is the check that
+		// this did not quietly retune the throws nobody complained about.
+		const float LegacyLaunchZ = LastThrow.LaunchVelocityZ
+			- LastThrow.InheritedVelocityZ + LastThrow.LegacyInheritedVelocityZ;
+		const float LegacyLaunchSpeed = FMath::Sqrt(
+			LastThrow.LaunchSpeed2D * LastThrow.LaunchSpeed2D + LegacyLaunchZ * LegacyLaunchZ);
+		const float LiveRange = BallisticRange(LastThrow.LaunchSpeed2D, LastThrow.LaunchVelocityZ,
+			LastThrow.LaunchHeightAboveFeet);
+		const float LegacyRange = BallisticRange(LastThrow.LaunchSpeed2D, LegacyLaunchZ,
+			LastThrow.LaunchHeightAboveFeet);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBMomentum] %-8s v31 §2  BEFORE (down x1.00): launch %.0f uu/s, Z %+.0f, travels ")
+			TEXT("%.0f uu   ->   AFTER (down x%.2f): launch %.0f uu/s, Z %+.0f, travels %.0f uu   | ")
+			TEXT("%+.0f uu/s, %+.0f uu (%+.0f%% range), launch height %.0f uu"),
+			Case.Name,
+			LegacyLaunchSpeed, LegacyLaunchZ, LegacyRange,
+			LastThrow.InheritanceDown, LastThrow.LaunchSpeed, LastThrow.LaunchVelocityZ, LiveRange,
+			LastThrow.LaunchSpeed - LegacyLaunchSpeed, LiveRange - LegacyRange,
+			100.f * (LiveRange - LegacyRange) / FMath::Max(1.f, LegacyRange),
+			LastThrow.LaunchHeightAboveFeet);
 	}
 
 	if (IsValid(Thrower) && Movement != nullptr)
@@ -6353,6 +6889,21 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	LastThrow.bThrowerFalling = Thrower->GetCharacterMovement() != nullptr
 		&& Thrower->GetCharacterMovement()->IsFalling();
 	LastThrow.Inheritance = TraceModeBTuning::ThrowInheritance();
+
+	// SPEC v31 §2. The three numbers the A/B needs, all read off THIS throw. The legacy term is asked
+	// of the same shared expression with the down-scale forced to 1, so "what the old rule would have
+	// done" cannot drift from what the old rule did.
+	LastThrow.LaunchSpeed2D = static_cast<float>(LaunchVelocity.Size2D());
+	LastThrow.InheritedVelocityZ = static_cast<float>(Inherited.Z);
+	LastThrow.LegacyInheritedVelocityZ = static_cast<float>(GetLegacyInheritedThrowVelocity(Thrower).Z);
+	LastThrow.InheritanceDown = TraceModeBTuning::ThrowInheritanceDown();
+	// Feet, not the capsule centre: the travel report solves back to the plane the thrower is standing
+	// on, and the launch point is an EYE offset, so the two differ by a whole half-capsule.
+	LastThrow.LaunchHeightAboveFeet = static_cast<float>(LaunchLocation.Z
+		- (Thrower->GetActorLocation().Z
+			- ((Thrower->GetCapsuleComponent() != nullptr)
+				? static_cast<double>(Thrower->GetCapsuleComponent()->GetScaledCapsuleHalfHeight())
+				: 88.0)));
 	LastThrow.HeldSeconds = FMath::Max(0.f, HeldSeconds);
 	LastThrow.ChargeScale = ChargeScale;
 	LastThrow.ThrowerName = GetNameSafe(Thrower);
@@ -6418,7 +6969,8 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[ModeB] THROW by %s (%s) at %.0f uu/s from %s | v13 §6: held %.2fs -> charge x%.2f (floor ")
 		TEXT("%.2f, full at %.2fs) | v8 §4: charged impulse %.0f + inherited %.0f (thrower %.0f uu/s ")
-		TEXT("horiz, %+.0f vert, %s, x%.2f), launch Z %+.0f"),
+		TEXT("horiz, %+.0f vert, %s, x%.2f), launch Z %+.0f | v31 §2: down-scale x%.2f, inherited Z ")
+		TEXT("%+.0f (pre-v31 would have been %+.0f, i.e. launch Z %+.0f)"),
 		*GetNameSafe(Thrower), *TraceTeamName(ThrowerTeam).ToString(),
 		LaunchVelocity.Size(), *LaunchLocation.ToCompactString(),
 		LastThrow.HeldSeconds, ChargeScale,
@@ -6426,7 +6978,9 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 		LastThrow.ImpulseSpeed, LastThrow.InheritedSpeed,
 		LastThrow.ThrowerSpeed2D, LastThrow.ThrowerVelocityZ,
 		LastThrow.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("grounded"),
-		LastThrow.Inheritance, LastThrow.LaunchVelocityZ);
+		LastThrow.Inheritance, LastThrow.LaunchVelocityZ,
+		LastThrow.InheritanceDown, LastThrow.InheritedVelocityZ, LastThrow.LegacyInheritedVelocityZ,
+		LastThrow.LaunchVelocityZ - LastThrow.InheritedVelocityZ + LastThrow.LegacyInheritedVelocityZ);
 
 	return true;
 }
@@ -10335,6 +10889,562 @@ void ATraceCore::UpdateVisuals()
 	Push(MeshMID, TraceCoreTuning::OrbGlow);
 	Push(BeaconMID, TraceCoreTuning::BeaconGlow);
 }
+
+// =================================================================================================
+// SPEC v31 §4 — the model. See the ART block above the constructor for the measured clip contents.
+// =================================================================================================
+
+ETraceCoreArtState ATraceCore::ResolveCoreArtState() const
+{
+	if (!bLoose)
+	{
+		// Held, or holderless and parked at home. A parked Core takes the ground pose, which is the
+		// "come and get me" read and is what a kickoff Core is doing.
+		return IsValid(Carrier) ? ETraceCoreArtState::Carried : ETraceCoreArtState::Rest;
+	}
+
+	// LOOSE. THE TEST IS THE REPLICATED VELOCITY, NOT bLooseAtRest, and that is not an oversight:
+	// bLooseAtRest is a server-only member and every client would otherwise have to guess. The server
+	// ZEROES LooseVelocity on the same line it sets bLooseAtRest (twice, in ServerTickLooseCore, and
+	// there is an ensure in that function asserting the pair never come apart), so the replicated
+	// velocity carries the same fact to every machine at no extra cost on the wire.
+	//
+	// Real state, not a timer - the standing warning at the top of this spec. A Core one frame from
+	// landing is still in flight here because it is still moving, which is what a player sees.
+	return FVector(LooseVelocity).IsNearlyZero(1.0) ? ETraceCoreArtState::Rest : ETraceCoreArtState::Flight;
+}
+
+void ATraceCore::SetCoreArtAnim(UAnimSequence* Anim, bool bLooping, float PlayRate)
+{
+	if (PackMesh == nullptr || Anim == nullptr)
+	{
+		return;
+	}
+
+	// IDEMPOTENT, AND THAT IS THE WHOLE JOB. PlayAnimation() rewinds to frame 0, so calling it every
+	// tick would pin A_Core_Throw to its first frame forever and the ball would never appear to spin -
+	// the same class of defect as the SMG's shot frame never being sampled. The clip is started on a
+	// STATE EDGE and left alone; only the play rate may be re-pushed, and only when it has moved.
+	if (AppliedArtAnim != Anim || bAppliedArtAnimLooping != bLooping)
+	{
+		PackMesh->PlayAnimation(Anim, bLooping);
+		AppliedArtAnim = Anim;
+		bAppliedArtAnimLooping = bLooping;
+		AppliedArtPlayRate = 0.f;   // Force the rate push below.
+	}
+
+	if (!FMath::IsNearlyEqual(AppliedArtPlayRate, PlayRate, 0.0005f))
+	{
+		PackMesh->SetPlayRate(PlayRate);
+		AppliedArtPlayRate = PlayRate;
+	}
+}
+
+void ATraceCore::UpdateCoreArtEmissive(ETraceCoreArtState State, float LocalTimeSeconds)
+{
+	if (CyanMID == nullptr && AmberMID == nullptr && HeartLight == nullptr)
+	{
+		return;
+	}
+
+	// unreal-core_README.md's own table, and unreal-fx_README's "The Core". DRIVEN BY STATE, NOT BY
+	// THE CLIP - the pack asks for exactly that in bold ("drive it by state, not by the clip - the
+	// core needs to read differently across the map"), which is also why none of this is baked into a
+	// Curve Float on an AnimSequence.
+	//
+	// The breathing term is sin() of an ABSOLUTE clock rather than an accumulator. That is deliberate
+	// and it is the safe direction of this spec's per-frame-reader warning: a stateless function of
+	// wall time cannot drift, cannot double-advance on a hitch, and gives every machine in the session
+	// the same phase for free.
+	auto Breathe = [LocalTimeSeconds](float Lo, float Hi, float Hz) -> float
+	{
+		const float Phase = 0.5f * (1.f + FMath::Sin(LocalTimeSeconds * Hz * 2.f * PI));
+		return Lo + (Hi - Lo) * Phase;
+	};
+
+	float Cyan = TraceCoreArt::IdleCyanLo;
+	float Amber = TraceCoreArt::IdleAmberLo;
+
+	switch (State)
+	{
+	case ETraceCoreArtState::Carried:
+		Cyan = Breathe(TraceCoreArt::CarriedCyanLo, TraceCoreArt::CarriedCyanHi, TraceCoreArt::CarriedPulseHz);
+		Amber = Breathe(TraceCoreArt::CarriedAmberLo, TraceCoreArt::CarriedAmberHi, TraceCoreArt::CarriedPulseHz);
+		break;
+
+	case ETraceCoreArtState::Flight:
+		// "Thrown: cyan to 3.4x ... amber up to 2.6x peak." Held at the peak for the whole flight
+		// rather than ramped: the flight is the shortest state there is and a ramp across it would
+		// mean the peak the notes specify is never actually reached on a short throw.
+		Cyan = TraceCoreArt::ThrownCyan;
+		Amber = TraceCoreArt::ThrownAmber;
+		break;
+
+	case ETraceCoreArtState::Rest:
+	default:
+		Cyan = Breathe(TraceCoreArt::IdleCyanLo, TraceCoreArt::IdleCyanHi, TraceCoreArt::IdleBreathHz);
+		Amber = Breathe(TraceCoreArt::IdleAmberLo, TraceCoreArt::IdleAmberHi, TraceCoreArt::IdleBreathHz);
+		break;
+	}
+
+	// THE PICKUP FLARE. "amber flares to 4.6x as the shell cracks", over the 0.55 s of A_Core_Pickup.
+	// Driven from the possession EDGE this machine saw, not from the clip's playhead: the clip is
+	// 0.55 s long, which is 33 frames at 60 Hz, and reading a playhead that the animation system may
+	// already have advanced is the exact failure this spec warns about twice. Elapsed-since-an-edge
+	// only ever gets subtracted, so there is nothing to advance and nothing to sample too late.
+	if (State == ETraceCoreArtState::Carried && ArtPickupAnim != nullptr)
+	{
+		const float FlareSeconds = ArtPickupAnim->GetPlayLength();
+		const float Elapsed = LocalTimeSeconds - ArtStateStartTime;
+		// A literal rather than KINDA_SMALL_NUMBER: the legacy math macros were re-spelled during the
+		// 5.x line and this module must still compile on 5.4 - 5.8. Same rule as CoreGeometryEpsilon.
+		if (Elapsed >= 0.f && Elapsed < FlareSeconds && FlareSeconds > 1.e-4f)
+		{
+			const float Alpha = 1.f - (Elapsed / FlareSeconds);
+			Amber = FMath::Max(Amber, FMath::Lerp(Amber, TraceCoreArt::PickupAmberFlare, Alpha));
+		}
+	}
+
+	auto PushIntensity = [](UMaterialInstanceDynamic* Material, float& Applied, float Value)
+	{
+		if (Material != nullptr && !FMath::IsNearlyEqual(Applied, Value, 0.002f))
+		{
+			Material->SetScalarParameterValue(TEXT("EmissiveIntensity"), Value);
+			Applied = Value;
+		}
+	};
+
+	PushIntensity(CyanMID, ArtEmissiveAppliedCyan, Cyan);
+	PushIntensity(AmberMID, ArtEmissiveAppliedAmber, Amber);
+
+	// TEAM TINT ON THE CYAN SLOT ONLY, which is what unreal-core_README asks for: "override
+	// circuit_cyan's base colour per team ... and leave core_amber alone, so the heart always reads as
+	// the objective." It also preserves the read the pre-v31 sphere had, where the orb's colour WAS
+	// the possession. A Core that belongs to nobody goes back to the artist's own #25E6FF.
+	//
+	// The emissive colour is carried across with the tint rather than dropped: the pack folded the
+	// KHR strength (cyan 1.5) into EmissiveColor so that EmissiveIntensity could mean "1.0 = at rest",
+	// so a tint that wrote a bare team colour would quietly darken the ball by a third.
+	if (CyanMID != nullptr)
+	{
+		const ETraceTeam Team = IsTurnoverActive() ? GetTurnoverPullingTeam() : GetHolderTeam();
+		FLinearColor Tint = TraceCoreArt::CyanEmissive;
+		if (Team != ETraceTeam::None)
+		{
+			Tint = TraceTeamColor(Team);
+			Tint.A = 1.f;
+		}
+
+		if (!bArtTintApplied || !Tint.Equals(ArtAppliedTint, 0.001f))
+		{
+			CyanMID->SetVectorParameterValue(TEXT("BaseColor"), Tint);
+			CyanMID->SetVectorParameterValue(TEXT("EmissiveColor"), Tint * TraceCoreArt::CyanEmissiveStrength);
+			ArtAppliedTint = Tint;
+			bArtTintApplied = true;
+		}
+	}
+
+	// The heart light. "A point light at the heart socket tinted #FF8A1F sells the carrier's position
+	// to the other team - worth exposing as a gameplay-tunable radius", so both numbers are CVars.
+	if (HeartLight != nullptr)
+	{
+		const float Radius = FMath::Max(0.f, CVarCoreHeartLightRadius.GetValueOnGameThread());
+		const bool bWanted = bPackArtActive && Radius > 1.f && (IsValid(Carrier) || bLoose);
+
+		if (HeartLight->IsVisible() != bWanted)
+		{
+			HeartLight->SetVisibility(bWanted);
+		}
+
+		if (bWanted)
+		{
+			// A LOOSE Core is a marker; a CARRIED one is the tell. A third, relative to the carried
+			// intensity rather than a second absolute - the standing rule, and it means one slider
+			// still moves both.
+			const float Base = FMath::Max(0.f, CVarCoreHeartLightIntensity.GetValueOnGameThread());
+			const float Wanted = (State == ETraceCoreArtState::Carried)
+				? Base * (Amber / FMath::Max(0.01f, TraceCoreArt::CarriedAmberHi))
+				: Base / 3.f;
+
+			HeartLight->SetAttenuationRadius(Radius);
+			HeartLight->SetIntensity(Wanted);
+		}
+	}
+}
+
+void ATraceCore::UpdateCoreArt()
+{
+	if (!bPackArtActive || PackMesh == nullptr)
+	{
+		return;
+	}
+
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// THE A/B, LIVE. bPackArtActive says the art is AVAILABLE; this says whether it is being drawn, so
+	// `Trace.Core.PackArt 0` swaps the new ball for the pre-v31 sphere with the match still running and
+	// `1` swaps it back. Two visibility compares per tick, and a SetVisibility only on the edge.
+	const bool bDrawPack = CVarCorePackArt.GetValueOnGameThread() != 0;
+	if (PackMesh->IsVisible() != bDrawPack)
+	{
+		PackMesh->SetVisibility(bDrawPack);
+		if (Mesh != nullptr)
+		{
+			Mesh->SetVisibility(!bDrawPack);
+		}
+	}
+	if (!bDrawPack)
+	{
+		if (HeartLight != nullptr && HeartLight->IsVisible())
+		{
+			HeartLight->SetVisibility(false);
+		}
+		return;
+	}
+
+	// THIS MACHINE'S OWN CLOCK, not the shared server clock. Nothing here has to agree between
+	// machines - it is a pose and a glow - and the shared clock is only meaningful once a GameState
+	// has replicated, which a Core drawn during travel cannot assume.
+	const float Now = static_cast<float>(World->GetTimeSeconds());
+
+	const ETraceCoreArtState State = ResolveCoreArtState();
+	if (!bArtStateApplied || State != AppliedArtState)
+	{
+		AppliedArtState = State;
+		bArtStateApplied = true;
+		ArtStateStartTime = Now;
+	}
+
+	switch (State)
+	{
+	case ETraceCoreArtState::Carried:
+	{
+		// Component rotation IDENTITY so the clip's authored spin axis lines up with world up and the
+		// turntable idle reads exactly as the artist made it, floating over the holder's head.
+		PackMesh->SetRelativeRotation(FRotator::ZeroRotator);
+
+		// Pickup, then Idle. The pack README's own instruction, and the switch is elapsed-since-the-
+		// possession-edge rather than a query of the playhead - see the flare note above.
+		const float PickupLength = (ArtPickupAnim != nullptr) ? ArtPickupAnim->GetPlayLength() : 0.f;
+		const bool bStillCracking = (Now - ArtStateStartTime) < PickupLength;
+
+		SetCoreArtAnim(bStillCracking ? ArtPickupAnim : ArtIdleAnim, /*bLooping=*/!bStillCracking, 1.f);
+		break;
+	}
+
+	case ETraceCoreArtState::Flight:
+	{
+		// NOSE ALONG THE VELOCITY. MakeFromX maps the mesh's local +X - the nose socket, the throw
+		// axis, the one axis the pack documents - onto the direction of travel, and re-derives it
+		// every frame so the nose follows the arc down as gravity bends it. The ROLL is left to the
+		// clip; MakeFromX's own choice of roll is irrelevant because the ball is rolling anyway.
+		const FVector Velocity = LooseVelocity;
+		if (!Velocity.IsNearlyZero(1.0))
+		{
+			PackMesh->SetRelativeRotation(FRotationMatrix::MakeFromX(Velocity).Rotator());
+		}
+
+		// The authored 8.00 rev/s scaled to the FX notes' number. RELATIVE to the clip's own rate, so
+		// a re-export cannot silently change the spin.
+		const float Wanted = FMath::Max(0.f, CVarCoreFlightSpin.GetValueOnGameThread());
+		SetCoreArtAnim(ArtThrowAnim, /*bLooping=*/true, Wanted / TraceCoreArt::ThrowClipRevPerSecond);
+		break;
+	}
+
+	case ETraceCoreArtState::Rest:
+	default:
+	{
+		// STANDS UP ON ITS POINT. Pitch +90 takes the mesh's local +X to world +Z, so the long axis is
+		// vertical and the ball is balanced on its rear cap with the nose at the sky. Yaw and roll are
+		// zero: the TURN comes from the clip, about the same axis, so there is no hand-written motion
+		// to fight it and nothing to keep in step.
+		PackMesh->SetRelativeRotation(FRotator(90.f, 0.f, 0.f));
+
+		// See the ART block: A_Core_Idle's spin axis is horizontal once the ball is stood up, so the
+		// clip that spins about the LONG axis is the one that can be used here, played at the turn
+		// rate A_Core_Idle authors for the ground.
+		const float Wanted = FMath::Max(0.f, CVarCoreRestSpin.GetValueOnGameThread());
+		SetCoreArtAnim(ArtThrowAnim, /*bLooping=*/true, Wanted / TraceCoreArt::ThrowClipRevPerSecond);
+		break;
+	}
+	}
+
+	UpdateCoreArtEmissive(State, Now);
+}
+
+// =================================================================================================
+// SPEC v31 §4 — PHOTOGRAPHING THE THREE STATES.
+//
+// `Trace.Core.ArtShots [DistanceUU]` on the listen host stages rest, flight and carried in front of
+// the local camera and requests a screenshot of each. The frames are the deliverable; a log line
+// saying "the nose points along the velocity" is not evidence that it does.
+//
+// It reaches every state through the SHIPPING functions (DebugLaunchLoose, GrantTo) and never touches
+// PackMesh, so what is photographed is the real presentation path. The one thing it stages that a
+// match would not is a SECOND BODY for the carried shot: the Core is bOwnerNoSee, deliberately hidden
+// from the lens of whoever is holding it, so a player can never photograph their own.
+// =================================================================================================
+
+bool ATraceCore::DebugStageCoreArt(UWorld* World, int32 Which, float DistanceUU, FString& OutReport)
+{
+	ATraceCore* Core = ATraceCore::Get(World);
+	if (Core == nullptr)
+	{
+		OutReport = TEXT("no Core in this world");
+		return false;
+	}
+	if (!Core->HasAuthority())
+	{
+		OutReport = TEXT("this machine is not the server; stage on the listen host");
+		return false;
+	}
+	if (!Core->IsModeB())
+	{
+		OutReport = TEXT("mode A: the Core is never loose, so only state 2 (carried) exists. Launch with ?mode=b.");
+		if (Which != 2)
+		{
+			return false;
+		}
+	}
+
+	APlayerController* PC = World->GetFirstPlayerController();
+	ATraceCharacter* Local = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+	if (!IsValid(Local))
+	{
+		OutReport = TEXT("no local pawn");
+		return false;
+	}
+
+	// STAGE IT OUTSIDE THE PICKUP RADIUS, OR IT IS NOT THERE TO PHOTOGRAPH. Measured the hard way: at
+	// 130 uu the first run's "at rest" frame came back showing the local player HOLDING the Core, with
+	// the ball hidden from its own holder - the shipping first-contact poll had taken it on the frame
+	// it landed. The rule is measured from the Core to the CAPSULE SURFACE, so the safe distance is the
+	// radius plus the capsule plus a margin, asked of the same accessors the rule uses.
+	const float CapsuleRadius = (Local->GetCapsuleComponent() != nullptr)
+		? Local->GetCapsuleComponent()->GetScaledCapsuleRadius() : 42.f;
+	const float SafeReach = TraceModeBTuning::PickupRadius() + CapsuleRadius + 80.f;
+
+	float Reach = (DistanceUU > 1.f) ? DistanceUU : 420.f;
+	if (Reach < SafeReach)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[CoreArt] %.0f uu is inside the %.0f uu first-contact radius - the local player would ")
+			TEXT("simply pick the Core up. Staging at %.0f uu instead."),
+			Reach, TraceModeBTuning::PickupRadius(), SafeReach);
+		Reach = SafeReach;
+	}
+
+	const FVector Eye = Local->GetPawnViewLocation();
+	const FRotator ViewRot = PC->GetControlRotation();
+	const FVector Forward = FRotator(0.f, ViewRot.Yaw, 0.f).Vector();   // Along the ground, as §25's staging does.
+	const FVector Right = FRotator(0.f, ViewRot.Yaw + 90.f, 0.f).Vector();
+
+	FCollisionQueryParams DropParams(SCENE_QUERY_STAT(TraceCoreArtStage), /*bTraceComplex=*/false);
+	DropParams.AddIgnoredActor(Local);
+	DropParams.AddIgnoredActor(Core);
+
+	// The floor under a point Reach ahead. Same reasoning as DebugStageTurnoverAtLocalCrosshair: a
+	// point on the FLOOR is the only one that is both real and still there a second later.
+	auto FloorAhead = [&](const FVector& Offset) -> FVector
+	{
+		const FVector Base = FVector(Local->GetActorLocation().X, Local->GetActorLocation().Y, Eye.Z) + Offset;
+		FHitResult Floor;
+		if (World->LineTraceSingleByChannel(Floor, Base + FVector(0.0, 0.0, 100.0),
+			Base - FVector(0.0, 0.0, 4000.0), ECC_WorldStatic, DropParams))
+		{
+			return Floor.ImpactPoint + Floor.ImpactNormal * (TraceModeBVisibleOrbRadius + 2.0);
+		}
+		return Base;
+	};
+
+	const ETraceTeam LocalTeam = Local->GetTeam();
+
+	switch (Which)
+	{
+	case 0:
+	{
+		// AT REST. Zero velocity onto the floor: the shipping rest probe settles it within a frame or
+		// two, exactly as a spent throw does, and the art state follows from the replicated velocity.
+		const FVector Where = FloorAhead(Forward * Reach);
+		if (!Core->DebugLaunchLoose(Where, FVector::ZeroVector, LocalTeam, /*bAsThrow=*/false))
+		{
+			OutReport = TEXT("DebugLaunchLoose refused (state locked?)");
+			return false;
+		}
+		PC->SetControlRotation((Where - Eye).Rotation());
+		OutReport = FString::Printf(TEXT("REST staged at %s, %.0f uu ahead. Expect: standing on its point, turning at %.3f rev/s."),
+			*Where.ToCompactString(), Reach, CVarCoreRestSpin.GetValueOnGameThread());
+		return true;
+	}
+
+	case 1:
+	{
+		// IN FLIGHT, ACROSS THE VIEW. Perpendicular to the camera so the SILHOUETTE is what the frame
+		// shows - a ball flying away from the lens is a ball whose nose you cannot see. The speed is a
+		// real mid-arc speed rather than the launch speed, because a 2236 uu/s Core crosses a 90-degree
+		// field of view in under a tenth of a second and no screenshot request is that punctual.
+		const FVector From = FloorAhead(Forward * Reach - Right * (Reach * 0.9)) + FVector(0.0, 0.0, 160.0);
+		const FVector Velocity = Right * 900.0 + FVector(0.0, 0.0, 240.0);
+		if (!Core->DebugLaunchLoose(From, Velocity, LocalTeam, /*bAsThrow=*/true))
+		{
+			OutReport = TEXT("DebugLaunchLoose refused (state locked?)");
+			return false;
+		}
+		PC->SetControlRotation(((From + Right * 260.0) - Eye).Rotation());
+		OutReport = FString::Printf(TEXT("FLIGHT staged from %s at %.0f uu/s across the view. Expect: nose along the velocity, %.1f rev/s roll."),
+			*From.ToCompactString(), Velocity.Size(), CVarCoreFlightSpin.GetValueOnGameThread());
+		return true;
+	}
+
+	case 2:
+	default:
+	{
+		// CARRIED, ON SOMEBODY ELSE. See the block comment: the holder never sees their own.
+		// PREFER WHOEVER ALREADY HAS IT. Bots run, so a single stage-then-photograph is a race the bot
+		// usually wins: measured, the carried frame came back with the bearer already out of shot.
+		// Re-staging the SAME bearer just before each capture walks them back in front of the lens
+		// without re-granting, so the Pickup clip is not restarted and the second frame really is the
+		// carry pose rather than a second crack.
+		ATraceCharacter* Bearer = nullptr;
+		if (IsValid(Core->Carrier) && Core->Carrier != Local && Core->Carrier->IsAlive())
+		{
+			Bearer = Core->Carrier;
+		}
+		else
+		{
+			TArray<ATraceCharacter*> Characters;
+			Core->GatherCharacters(Characters);
+			for (ATraceCharacter* Candidate : Characters)
+			{
+				if (IsValid(Candidate) && Candidate != Local && Candidate->IsAlive())
+				{
+					Bearer = Candidate;
+					break;
+				}
+			}
+		}
+
+		if (!IsValid(Bearer))
+		{
+			OutReport = TEXT("no second living pawn to carry it - run with bots, or join a client. ")
+				TEXT("Granting it to the local player would photograph nothing: the Core is hidden from its own holder.");
+			return false;
+		}
+
+		const FVector Where = FloorAhead(Forward * Reach);
+		Bearer->SetActorLocation(Where + FVector(0.0, 0.0, 88.0), false, nullptr, ETeleportType::TeleportPhysics);
+		if (Core->Carrier != Bearer)
+		{
+			Core->GrantTo(Bearer, ETraceCoreGrantReason::Debug);
+		}
+
+		// The orb rides OrbHeight above the capsule centre, so that is what the camera is pointed at.
+		PC->SetControlRotation(((Bearer->GetActorLocation() + FVector(0.0, 0.0, TraceCoreTuning::OrbHeight)) - Eye).Rotation());
+		OutReport = FString::Printf(TEXT("CARRIED staged on %s, %.0f uu ahead. Expect: Pickup cracks the shell for %.2fs, then the Idle turntable."),
+			*GetNameSafe(Bearer), Reach,
+			(Core->ArtPickupAnim != nullptr) ? Core->ArtPickupAnim->GetPlayLength() : 0.f);
+		return true;
+	}
+	}
+}
+
+namespace TraceCoreArtShots
+{
+	/** One capture: stage at @p StageAt, photograph at @p ShotAt, both seconds from the command. */
+	struct FBeat
+	{
+		float StageAt;
+		float ShotAt;
+		int32 Which;
+		const TCHAR* Label;
+	};
+
+	/**
+	 * REST first, FLIGHT second, CARRIED last, and the order is not arbitrary: each stage takes the
+	 * Core AWAY from the previous one, so a sequence that ended on a loose Core would leave the match
+	 * with the objective on the floor. Ending on CARRIED puts it back in somebody's hands.
+	 *
+	 * The flight state is photographed FOUR times a tenth of a second apart. A screenshot request is
+	 * serviced at the end of a later frame, not the current one, so a single request at a chosen
+	 * instant is a guess; four of them across the pass are a measurement.
+	 */
+	const FBeat Beats[] =
+	{
+		{ 0.10f, 1.20f, 0, TEXT("rest")    },
+		{ 2.00f, 2.10f, 1, TEXT("flight1") },
+		{ -1.f,  2.25f, 1, TEXT("flight2") },
+		{ -1.f,  2.40f, 1, TEXT("flight3") },
+		{ -1.f,  2.60f, 1, TEXT("flight4") },
+		// Both carried beats re-stage first, a tenth of a second before the shutter, for the reason in
+		// DebugStageCoreArt's case 2: the bearer is a bot and bots do not stand still to be admired.
+		{ 3.60f, 3.75f, 2, TEXT("carried_crack") },
+		{ 4.80f, 4.95f, 2, TEXT("carried_idle")  },
+	};
+
+	void Shoot(const TCHAR* Label)
+	{
+		const FString FileName = FString::Printf(TEXT("TraceCoreArt_%s_%s.png"),
+			Label, *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
+		const FString Path = FPaths::ConvertRelativePathToFull(
+			FPaths::ProjectSavedDir() / TEXT("Screenshots") / FileName);
+
+		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(Path));
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+		UE_LOG(LogTraceGame, Display, TEXT("[CoreArt] screenshot requested: %s"), *Path);
+	}
+
+	void Run(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		float Distance = 420.f;
+		if (Args.Num() >= 1)
+		{
+			Distance = FCString::Atof(*Args[0]);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreArt] spec v31 §4: staging rest, flight and carried at %.0f uu and photographing each."),
+			Distance);
+
+		FTimerManager& Timers = World->GetTimerManager();
+		for (const FBeat& Beat : Beats)
+		{
+			if (Beat.StageAt >= 0.f)
+			{
+				const int32 Which = Beat.Which;
+				FTimerHandle StageHandle;
+				Timers.SetTimer(StageHandle, FTimerDelegate::CreateWeakLambda(World,
+					[World, Which, Distance]()
+					{
+						FString Report;
+						const bool bOk = ATraceCore::DebugStageCoreArt(World, Which, Distance, Report);
+						UE_LOG(LogTraceGame, Display, TEXT("[CoreArt] stage %d: %s | %s"),
+							Which, bOk ? TEXT("ok") : TEXT("REFUSED"), *Report);
+					}), Beat.StageAt, false);
+			}
+
+			const TCHAR* Label = Beat.Label;
+			FTimerHandle ShotHandle;
+			Timers.SetTimer(ShotHandle, FTimerDelegate::CreateWeakLambda(World,
+				[Label]() { Shoot(Label); }), Beat.ShotAt, false);
+		}
+	}
+}
+
+static FAutoConsoleCommandWithWorldAndArgs GTraceCoreArtShotsCmd(
+	TEXT("Trace.Core.ArtShots"),
+	TEXT("SPEC v31 §4. Listen host, mode B. Stages the Core at rest (standing on its point), in "
+	     "flight (nose along the velocity) and carried by another pawn, in front of the local camera, "
+	     "and screenshots each into Saved/Screenshots. Optional argument: distance in uu (default 420)."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TraceCoreArtShots::Run));
 
 void ATraceCore::EnforceHolderTrailState()
 {

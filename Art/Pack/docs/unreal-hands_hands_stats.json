@@ -1,0 +1,59 @@
+{
+ "asset": "gloved_hands",
+ "displayName": "Gloved Hands",
+ "role": "firstPersonHands",
+ "dimensions": { "unit": "metres", "handLength": 0.19, "withForearm": 0.40 },
+ "importScale": 100,
+ "importAsSkeletalMesh": true,
+ "jointCount": 32,
+ "rig": {
+  "roots": ["hand_right", "hand_left"],
+  "perHand": {
+   "wrist": "wrist_<side>",
+   "fingers": { "index": 3, "middle": 3, "ring": 3, "pinky": 3, "thumb": 2 },
+   "curlAxis": "local X (negative = toward palm)",
+   "spreadAxis": "local Y on the _0 joint",
+   "thumbOpposition": "local Y + Z on thumb_<side>_0"
+  },
+  "weaponAttach": "wrist_right"
+ },
+ "loadouts": {
+  "knife": { "right": "knife handle", "left": "open, free" },
+  "pistol": { "right": "pistol grip", "left": "open, free" },
+  "smg": { "right": "smg grip", "left": "open, free" },
+  "core": { "right": "core cradle", "left": "core cradle" }
+ },
+ "clips": {
+  "Idle_Knife": { "length": 2.4, "loop": true },
+  "Idle_Pistol": { "length": 2.4, "loop": true },
+  "Idle_Smg": { "length": 2.4, "loop": true },
+  "Idle_Core": { "length": 2.4, "loop": true },
+  "Shoot_Pistol": { "length": 0.16, "loop": false },
+  "Shoot_Smg": { "length": 0.16, "loop": false, "pairsWith": "smg Fire (600 rpm)" },
+  "Reload_Pistol": { "length": 0.8, "loop": false },
+  "Reload_Smg": { "length": 0.8, "loop": false, "pairsWith": "smg Reload" },
+  "Draw_Knife": { "length": 0.52, "loop": false, "pairsWith": "knife Draw" },
+  "Stab_Knife": { "length": 0.3, "loop": false, "pairsWith": "knife Stab" },
+  "Inspect_Knife": { "length": 3.2, "loop": false, "pairsWith": "knife Inspect" },
+  "Throw_Core": { "length": 0.55, "loop": false },
+  "Jump_Knife": { "length": 0.7, "loop": false },
+  "Jump_Pistol": { "length": 0.7, "loop": false },
+  "Jump_Smg": { "length": 0.7, "loop": false },
+  "Jump_Core": { "length": 0.7, "loop": false },
+  "Walljump_Knife": { "length": 0.85, "loop": false },
+  "Walljump_Pistol": { "length": 0.85, "loop": false },
+  "Walljump_Smg": { "length": 0.85, "loop": false },
+  "Walljump_Core": { "length": 0.85, "loop": false }
+ },
+ "validActions": {
+  "knife": ["draw", "stab", "inspect", "jump", "walljump"],
+  "pistol": ["shoot", "reload", "jump", "walljump"],
+  "smg": ["shoot", "reload", "jump", "walljump"],
+  "core": ["throw", "jump", "walljump"]
+ },
+ "emissive": {
+  "circuit_cyan": { "base": "#25E6FF", "idle": [0.95, 1.15], "actionPeak": 2.7 },
+  "core_amber": { "base": "#FF8A1F", "idle": [0.9, 1.1], "actionPeak": 2.1 }
+ },
+ "notes": "actions start and end on their hold pose, so they layer additively or play straight"
+}
