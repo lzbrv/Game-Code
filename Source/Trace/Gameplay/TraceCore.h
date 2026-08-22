@@ -52,6 +52,7 @@
 #include "Engine/NetSerialization.h"   // FVector_NetQuantizeNormal
 #include "GameFramework/Actor.h"
 #include "TraceTypes.h"
+#include "Gameplay/TraceFxShapes.h"    // SPEC v32 §3: the shared FX shape library, and ETraceFxBlend
 #include "TraceCore.generated.h"
 
 class AController;
@@ -1563,6 +1564,27 @@ public:
 	TObjectPtr<USceneComponent> Root;
 
 	/**
+	 * THE BALL'S PICTURE, AND ONLY ITS PICTURE. One scene component between Root and the four things
+	 * that are the ball itself: Mesh, PackMesh, HeartLight and PickupHalo.
+	 *
+	 * *** THIS EXISTS SO THAT MOVING THE BALL CANNOT MOVE THE GAME. *** The ACTOR stays exactly where
+	 * ApplyAttachment puts it — OrbHeight straight up the holder's capsule axis — because that
+	 * position is what the beacon's own arithmetic is written against ((BeaconTop + BeaconBottom)/2
+	 * - OrbHeight), what Trace.Core.ArtShots aims its camera at, and what TickTeleportAudit's
+	 * per-frame jump detector measures. Nothing that decides a goal, a pass, a turnover or a mode-B
+	 * pull reads this actor's transform while it is carried (they all read the CARRIER's location or
+	 * the replicated LooseLocation), but "nothing reads it" is a fact about today's callers and this
+	 * component is a fact about the diff: with the drawn art on its own node, a placement bug can
+	 * only ever be a bug in a picture.
+	 *
+	 * Beacon and ThrownTrailSegments stay on Root. The beacon is a true vertical authored against the
+	 * actor, and the trail is placed in WORLD space off GetActorLocation() and only while the ball is
+	 * in flight — neither is part of "where the ball is being held".
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Trace|Core")
+	TObjectPtr<USceneComponent> ArtRoot;
+
+	/**
 	 * The FALLBACK orb: an engine sphere. Shown only when the pack's Core model does not resolve.
 	 *
 	 * SPEC v31 §4 replaces it with SK_TraceCore, but it is NOT deleted — a fresh clone with no
@@ -1596,6 +1618,49 @@ public:
 	/** A tall thin emissive shaft above the orb: this is what makes the holder findable at range. */
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Core")
 	TObjectPtr<UStaticMeshComponent> Beacon;
+
+	// =============================================================================================
+	// SPEC v32 §3 — THE TWO MISSING PIECES OF FX GEOMETRY.
+	//
+	// unreal-fx_README, "The Core", verbatim: "Pickup: ... plus a one-shot icosahedron halo (r 0.20)
+	// expanding 0.6 -> 2.1x and fading out over 0.55 s" and "Thrown: ... a tapered trail cylinder
+	// (r 0.055 -> 0.012) streams behind the ball, peaking mid-flight."
+	//
+	// COMPONENTS ON THE CORE, NOT SPAWNED ACTORS. SPEC v32 §1 allows either ("one actor OR one pooled
+	// component set per effect"), and both of these are rigidly parented to the ball for their whole
+	// life: the halo is centred on it and the trail hangs off its back. A spawned actor would have to
+	// chase a moving Core every frame across a network where the ball's position is dead-reckoned,
+	// which is a second copy of a fact this actor already has. Four components that exist for the
+	// life of the match and are hidden 99% of it cost nothing; a throw a second spawning actors does.
+	//
+	// Both are cosmetic to the bone: no collision, no overlap, no replication, no gameplay read.
+	// UTraceFxShapes::ConfigureFxComponent applies that policy in one place so it cannot drift, and
+	// "NO COLLISION ANYWHERE ON THIS ACTOR" (see the constructor) stays true.
+	// =============================================================================================
+
+	/**
+	 * SPEC v32 §3. The one-shot pickup halo: an icosphere at r 20 uu (the FX doc's 0.20 m).
+	 *
+	 * Driven off the SAME possession edge UpdateCoreArtEmissive drives the amber flare from
+	 * (ArtStateStartTime), for the reason §3 gives in bold: one fact, one detector. A second edge
+	 * detector for "the shell just cracked" is two clocks that would disagree on exactly the frame
+	 * that matters.
+	 *
+	 * /Engine/BasicShapes ships no icosphere; UTraceFxShapes::GetIcosphere() degrades to the engine
+	 * sphere and says so once in the log. At r 20 uu that is the documented fallback, not a defect.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Trace|Core")
+	TObjectPtr<UStaticMeshComponent> PickupHalo;
+
+	/**
+	 * SPEC v32 §3. The thrown trail, as a stack of plain cylinders of decreasing radius.
+	 *
+	 * ONE MESH CANNOT TAPER. UTraceFxShapes::TaperBetween is the shared answer to that and this is
+	 * its stacked-segment form — see the long note on that function for why a cone was rejected (the
+	 * doc's taper runs between two NON-ZERO radii, 5.5 -> 1.2 uu, and a cone tapers to a point).
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Trace|Core")
+	TArray<TObjectPtr<UStaticMeshComponent>> ThrownTrailSegments;
 
 protected:
 	virtual void BeginPlay() override;
@@ -1652,6 +1717,100 @@ private:
 
 	/** Server + clients. Applies attachment, collisionless-ness and the beacon transform. */
 	void ApplyAttachment();
+
+	// =============================================================================================
+	// THE CARRIED BALL — SEEN, AND SEEN IN A HAND.
+	//
+	// Two defects, both photographed, both entirely in the picture:
+	//
+	//   (a) Every drawn piece of this actor is bOwnerNoSee, and carrying the Core is the ONLY thing
+	//       that puts a player in third person (ATraceCharacter::WantsFirstPersonView() returns
+	//       !bIsCarrier). So the one moment the camera pulls back to show you holding the objective
+	//       is the exact moment the objective is invisible to you. A captured frame shows the banner
+	//       "YOU HAVE THE CORE - LMB THROWS" over a player holding nothing.
+	//
+	//   (b) The ball sits at OrbHeight = 150 uu straight up the capsule axis. That is above the
+	//       head, not in a hand, and the reason it was hidden in the first place: from the carry
+	//       camera (actor + 172.4 uu, 450 uu arm, 95 deg horizontal FOV) a ball at +150 uu is 22.4 uu
+	//       BELOW the lens and lands 36 px under the crosshair, dead centre. Unhiding it where it
+	//       stands would reinstate the whiteout the orb's own comment records.
+	//
+	// So the fix is one motion: move the ART into the holder's right hand, and only then let the
+	// holder see it. Both halves are needed - either alone is a worse picture than today's.
+	// =============================================================================================
+
+	/**
+	 * Server + clients, every tick, ahead of the authority split for the same reason UpdateCoreArt
+	 * is: this is a picture derived from already-replicated facts, and the machine it matters most
+	 * on is the holder's own.
+	 *
+	 * Writes ONE thing: ArtRoot's relative location. Rotation is left at identity so the Carried
+	 * turntable keeps world up as its spin axis, exactly as UpdateCoreArt's Carried case assumes.
+	 */
+	void UpdateCarriedArtPlacement();
+
+	/**
+	 * Server + clients, every tick. Clears bOwnerNoSee on the three components that make up the ball
+	 * (Mesh, PackMesh, PickupHalo) while it is genuinely in a hand and the holder's own body is
+	 * already drawn - and puts it back the moment either stops being true.
+	 *
+	 * THE BEACON IS NOT IN THAT LIST AND MUST NOT JOIN IT. Its bottom is 205 uu above the actor
+	 * centre, i.e. 32.6 uu ABOVE the carry camera: unhidden it is a 42-px-wide emissive column from
+	 * y=397 px to the top of a 900 px frame, straight through the crosshair and the scoreboard, and
+	 * no bottom height fixes it because pitching up rotates the camera about a pivot the column is
+	 * welded to. The holder is already told by the HUD banner; the beacon exists for everyone else.
+	 */
+	void UpdateCarriedArtVisibility();
+
+	/**
+	 * Rebuilds the scene proxy of every VISIBLE piece of this actor: Mesh, PackMesh, PickupHalo and
+	 * Beacon.
+	 *
+	 * bOwnerNoSee is resolved against an actor owner chain that FPrimitiveSceneProxy caches when it
+	 * is built, and this actor's owner changes on every possession change - so a piece left out of
+	 * this list is a piece that silently keeps the previous holder's answer to "may I see this".
+	 * One list, one function, two callers (ApplyAttachment and OnRep_Owner): PackMesh was missing
+	 * from the two hand-written copies this replaces.
+	 */
+	void MarkDrawnPiecesRenderStateDirty();
+
+	/**
+	 * Half the drawn ball's NARROW axis, in uu, measured off the component that is actually on
+	 * screen this frame rather than off a constant.
+	 *
+	 * The narrow axis and not the long one, deliberately: the pack ball is a 40.0 x 23.8 x 23.8 uu
+	 * football whose Carried turntable leaves its long axis wherever the spin has swung it, so a
+	 * grip sized off the long axis would hold the hand only at the angles that happen to point it
+	 * at the fist. Sizing off the narrow axis holds at every angle. Definition in TraceCore.cpp
+	 * carries the full argument.
+	 */
+	double GetDrawnBallHalfExtentUU() const;
+
+	/**
+	 * How far the holder's fist centroid sits INSIDE the drawn shell this frame, in uu. Positive is
+	 * contact; negative is the air gap that was photographed between an empty fist and a ball
+	 * floating beside it. Diagnostics only - Trace.Core.CarryProbe prints it, nothing reads it to
+	 * make a decision - but it exists because every number the probe printed before said where the
+	 * ball WAS and none said what it was TOUCHING, which is precisely why "visible but not held"
+	 * survived a green verification run.
+	 */
+	double CarryFistDepthUU = 0.0;
+
+	/** How much of the authored cradle the reach clamp had to trim this frame, in uu. 0 when none. */
+	double CarryCradleClampedUU = 0.0;
+
+	/** Where ArtRoot was last put, so an unchanged placement costs a compare instead of a transform. */
+	FVector AppliedArtRootOffset = FVector::ZeroVector;
+	bool bArtRootOffsetApplied = false;
+
+	/** Whether the ball is currently being shown to its own holder. Edge-guards the SetOwnerNoSee. */
+	bool bCarryArtShownToOwner = false;
+
+	/** Diagnostics only (Trace.Core.CarryProbe): did `hand_r` resolve on the holder's mesh last tick? */
+	bool bCarryHandSocketResolved = false;
+
+	/** One warning per Core, not one per frame, when a holder has no `hand_r` to hang the ball on. */
+	bool bCarryHandMissingLogged = false;
 
 	/** Recolours the orb and the beacon for the holding team. No-op on a dedicated server. */
 	void UpdateVisuals();
@@ -2718,6 +2877,94 @@ private:
 
 	/** unreal-fx_README "The Core": the per-state EmissiveIntensity bands and the pickup flare. */
 	void UpdateCoreArtEmissive(ETraceCoreArtState State, float LocalTimeSeconds);
+
+	// =============================================================================================
+	// SPEC v32 §3 — THE GEOMETRY HALF. The emissive half above is unchanged and was already correct.
+	// =============================================================================================
+
+	/** The MID on PickupHalo, and the blend UTraceFxShapes actually ACHIEVED for it (may degrade). */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> PickupHaloMID = nullptr;
+
+	/** One MID per trail segment, index-parallel to ThrownTrailSegments. */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> ThrownTrailMIDs;
+
+	/**
+	 * The blend each effect ACTUALLY got, not the one it asked for.
+	 *
+	 * UTraceFxShapes::MakeGlowMID hands this back because a piece that silently drew itself in the
+	 * wrong blend mode is a bug nobody can see in a log — its own header says every caller stores the
+	 * answer and every probe prints it. SetGlow() must be given THIS value: writing a parameter a
+	 * material does not have is a silent no-op, and the two parents take intensity by different routes.
+	 */
+	ETraceFxBlend PickupHaloBlend = ETraceFxBlend::None;
+	ETraceFxBlend ThrownTrailBlend = ETraceFxBlend::None;
+
+	/** Last opacity pushed to each effect, so an unchanged glow costs a float compare (as the emissive does). */
+	float ArtHaloAppliedOpacity = -1.f;
+	float ArtTrailAppliedOpacity = -1.f;
+
+	/**
+	 * SPEC v32 §3. The pickup halo and the thrown trail, placed and lit from the same state and the
+	 * same clock UpdateCoreArtEmissive uses. Called straight after it, from UpdateCoreArt.
+	 *
+	 * Split out rather than folded into UpdateCoreArtEmissive for one reason: that function was
+	 * already correct and is the FX doc's emissive contract in one readable block. Geometry is a
+	 * different kind of thing (transforms and visibility, not material scalars) and a bug in it must
+	 * not be able to be introduced by an edit to the glow bands.
+	 */
+	void UpdateCoreArtGeometry(ETraceCoreArtState State, float LocalTimeSeconds);
+
+	/** Hides every piece of §3 geometry. One call site's worth of visibility bookkeeping, in one place. */
+	void HideCoreArtGeometry();
+
+public:
+	// =============================================================================================
+	// SPEC v32 §7b — WHAT Trace.Core.ArtShots HAS TO BE ABLE TO ASK.
+	//
+	// NOT behind #if !UE_BUILD_SHIPPING, unlike the staging function these sit beside. All three are
+	// const one-liners over state this class already keeps, and the harness that calls them is itself
+	// compiled unguarded in this file; adding a guard here would make a shipping build fail on a line
+	// that has nothing to do with shipping.
+	//
+	// The v31 harness named each frame by the state it REQUESTED. These let it name the frame by the
+	// state the Core is actually in on the frame the shutter fires, which is the only thing a
+	// screenshot is evidence about.
+	// =============================================================================================
+
+	/** "rest" / "flight" / "carried". Never null; safe for a filename. */
+	static const TCHAR* DebugArtStateName(ETraceCoreArtState State);
+
+	/** The presentation this machine's replicated state implies RIGHT NOW. The shipping rule, unchanged. */
+	ETraceCoreArtState GetDebugArtState() const { return ResolveCoreArtState(); }
+
+	/** True when SK_TraceCore resolved and the pack art is the thing being drawn. */
+	bool IsPackArtActive() const { return bPackArtActive; }
+
+	/**
+	 * Trace.Core.CarryProbe. PRINTS the carried ball's placement and its four owner-visibility flags
+	 * rather than asserting anything about them, because the thing being fixed is a picture and the
+	 * only verdict that counts is a screenshot beside it. Answers, for the local viewer:
+	 * did `hand_r` resolve, where is the ball in the world, how far is that from this machine's
+	 * camera, how far off centre does it land in pixels, and is each drawn piece owner-hidden.
+	 */
+	void DebugLogCarryState() const;
+
+	/** For the ArtShots probe: what the two §3 effects degraded to. UTraceFxShapes::BlendName prints it. */
+	ETraceFxBlend GetDebugPickupHaloBlend() const { return PickupHaloBlend; }
+	ETraceFxBlend GetDebugThrownTrailBlend() const { return ThrownTrailBlend; }
+
+	/**
+	 * The opacity LAST PUSHED to each §3 effect's material, or < 0 when it is not drawing.
+	 *
+	 * The value written, not the value intended: Trace.Core.FxProbe reports its range across a flight,
+	 * which is how "peaking mid-flight, not a constant" stops being a claim in a comment and becomes a
+	 * pair of numbers. Reading the material back instead would only measure the additive blend's own
+	 * colour-folding arithmetic, which is UTraceFxShapes' business and not this effect's.
+	 */
+	float GetDebugPickupHaloOpacity() const { return ArtHaloAppliedOpacity; }
+	float GetDebugThrownTrailOpacity() const { return ArtTrailAppliedOpacity; }
 };
 
 

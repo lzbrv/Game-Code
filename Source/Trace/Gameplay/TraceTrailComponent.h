@@ -79,6 +79,30 @@
 //
 // Clients only ever *read* TrailPoints: they rebuild a pooled set of meshes from it.
 //
+// WHAT THIS COMPONENT IS *NOT*, part 2 (SPEC v32 §3, recorded here so the next reader who arrives
+// from the FX side does not have to work it out again):
+//
+//   THE THROWN CORE'S COSMETIC TRAIL IS NOT DRAWN BY THIS CLASS, AND CANNOT BE.
+//
+// unreal-fx_README asks for "a tapered trail cylinder (r 0.055 -> 0.012) streaming behind the ball,
+// peaking mid-flight", which is the right SHAPE and the wrong owner. Four assumptions above fail,
+// and they fail structurally rather than by configuration:
+//
+//   1. GetOwnerCharacter() is Cast<ATraceCharacter>(GetOwner()), and the trip test, the parry window
+//      and the predicted head all resolve through it. ATraceCore is an AActor with no capsule, no
+//      controller and no team.
+//   2. THE POINTS ARE LETHAL and the invariant this file defends is VISIBLE == LETHAL. A cosmetic
+//      trail routed through here would either kill people a thrown Core flies past, or break that
+//      invariant. SPEC v32 §1 forbids the first outright ("nothing may change a single hit").
+//   3. THE RIBBON'S CROSS-SECTION IS CONSTANT *BECAUSE* IT IS THE LETHAL CROSS-SECTION (see 2). The
+//      FX doc's trail tapers 5.5 -> 1.2 uu. Different shape, by construction.
+//   4. IT IS SCOPED TO POSSESSION and a thrown Core has no holder: "a mode-B throw" is named in this
+//      header as one of the events that WIPES the trace. The instant that trail must start is the
+//      instant this component is required to have nothing left.
+//
+// So it lives on ATraceCore, built out of Gameplay/TraceFxShapes.h. See the §3 block above
+// ATraceCore::UpdateCoreArtGeometry. NOTHING IN THIS FILE WAS CHANGED FOR IT.
+//
 // THE THIRD, OWNER-ONLY LAYER (spec v5 §2): THE PREDICTED HEAD. See UpdatePredictedHead().
 // The replicated point set always ends BEHIND the carrier — by the head-grace stub on every machine,
 // and by a further round trip of travel on a remote client — so the carrier's own trace visibly

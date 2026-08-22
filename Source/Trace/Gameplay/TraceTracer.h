@@ -2,6 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+
+#include "Gameplay/TraceFxShapes.h"                 // SPEC v32 §1 — the shared shape library
+#include "Gameplay/TraceRailgunFireCurve.h"         // SPEC v32 §2 — the decay length, not retyped
+
 #include "TraceTracer.generated.h"
 
 class ATraceCharacter;
@@ -53,6 +57,96 @@ struct FTraceTracerBeamStart
 };
 
 /**
+ * SPEC v32 §2 — ONE LIVE BEAM, MEASURED OFF ITS OWN COMPONENTS.
+ *
+ * Nearly everything a verifier is told to check — "the beam's resolved length, the taper radii in
+ * uu, the halo opacity and the flash scale over time" — read BACK off the transforms that are
+ * actually on screen rather than re-derived from the constants that were meant to produce them.
+ *
+ * That distinction is the whole point. A probe that recomputes `3.0` from the same constant the
+ * effect used proves only that one number is spelled the same way twice; this project has three
+ * harnesses on record that printed a pass over their own failure by doing exactly that, and this
+ * one made it four before a verifier caught it. Every `Measured*` field below comes out of
+ * UTraceFxShapes::RadiusUUFromShapeScale() applied to a live component scale, so if the taper is
+ * silently 100x wrong the probe says 300.0 and not 3.0.
+ *
+ * "NEARLY" IS LOAD-BEARING, and the exceptions are named where they live: HaloOpacityNow is a
+ * recomputation because a MID cannot be read back, and FlashScaleNow is a quotient of a measurement
+ * by a constant and must never be used as a denominator. Trace.Fx.Beam prints the provenance of
+ * every row of its verdict so a reader never has to take this paragraph on trust.
+ *
+ * Plain struct, dev-only in practice, nothing replicated.
+ */
+struct FTraceTracerShotDebug
+{
+	/** Which of the two profiles this shot was built with, and how that was decided. */
+	bool bSmgProfile = false;
+	bool bFirstPersonShot = false;
+	FName GunMesh = NAME_None;
+
+	/** What the FX doc asks for, in uu, after the settings knobs have had their say. */
+	float ProfileMuzzleRadiusUU = 0.f;
+	float ProfileTipRadiusUU = 0.f;
+	float ProfileHaloRadiusUU = 0.f;
+	float ProfileHaloOpacity = 0.f;
+	float ProfileConeRadiusUU = 0.f;
+	float ProfileConeHeightUU = 0.f;
+
+	/** MEASURED off the live components. */
+	float AgeSeconds = 0.f;
+
+	/**
+	 * The age UpdateEffect was LAST CALLED WITH, i.e. the point on the authored curves that the
+	 * transforms below were laid at. Recorded by the effect, not inferred by the probe.
+	 *
+	 * This exists so the muzzle-cone check can be a real one. The cone is the only piece of this
+	 * effect whose SIZE animates — 0.55x to 3.2x in 0.28 s, which is 2.5 uu of radius per 60 Hz
+	 * frame — so grading its measured radius against the doc's curve needs the curve evaluated at
+	 * exactly the age the geometry was written at, not at whatever the clock says when the probe
+	 * happens to look. AgeSeconds and GeometryAgeSeconds are the same number today (the probe
+	 * samples from the core ticker, outside UWorld::Tick, so it cannot land between the world
+	 * clock advancing and the actor tick that reads it) and the probe PRINTS BOTH so that if that
+	 * ever stops being true the log says so instead of the check going quietly, wrongly red.
+	 */
+	float GeometryAgeSeconds = 0.f;
+	float LengthUU = 0.f;
+	float MeasuredMuzzleRadiusUU = 0.f;
+	float MeasuredTipRadiusUU = 0.f;
+	float MeasuredSegmentRadiiUU[3] = { 0.f, 0.f, 0.f };
+	int32 SegmentCount = 0;
+	float MeasuredHaloRadiusUU = 0.f;
+	float MeasuredConeRadiusUU = 0.f;
+	float MeasuredConeHeightUU = 0.f;
+
+	/**
+	 * The instantaneous animated quantities. NEITHER OF THESE IS A READBACK, and the distinction
+	 * matters enough that Trace.Fx.Beam now prints it in the verdict table beside every row.
+	 *
+	 * HaloOpacityNow is RECOMPUTED from the same fade expression UpdateEffect uses, because a
+	 * material instance will not hand back a scalar that was written into it — there is no
+	 * measurement to take. It is still worth checking (a fade that never starts is a real bug) but
+	 * it cannot catch a wrong opacity CONSTANT, and it is labelled "recomputed" for that reason.
+	 *
+	 * FlashScaleNow is DERIVED FROM a readback — MeasuredConeRadiusUU divided by the authored
+	 * radius — which makes it a fine thing to log and a catastrophic thing to grade against.
+	 * Dividing the measurement back by it recovers the authored constant identically, whatever the
+	 * cone's transform actually is; the verdict did exactly that for two of six checks and passed a
+	 * 100x metres/centimetres error. Grade MeasuredConeRadiusUU against the doc's curve evaluated at
+	 * GeometryAgeSeconds instead.
+	 */
+	float HaloOpacityNow = 0.f;
+	float FlashScaleNow = 0.f;
+	bool bHaloVisible = false;
+	bool bFlashVisible = false;
+
+	/** Which blend each piece ended up in, after UTraceFxShapes' degradation ladder. */
+	ETraceFxBlend CoreBlend = ETraceFxBlend::None;
+	ETraceFxBlend HaloBlend = ETraceFxBlend::None;
+	ETraceFxBlend FlashBlend = ETraceFxBlend::None;
+	bool bHaloTwoSided = false;
+};
+
+/**
  * The railgun shot effect. Purely cosmetic, one actor per shot, self-deleting.
  *
  * --- WHAT IT IS MADE OF, AND WHY --------------------------------------------------------------
@@ -65,16 +159,52 @@ struct FTraceTracerBeamStart
  * A railgun shot has three beats, and this actor draws all three out of engine primitives, because
  * Niagara would need .uasset VFX this project cannot author (build contract 2):
  *
- *   1. CORE      a thin, almost white cylinder from muzzle to impact. Near-white rather than team
- *                coloured on purpose - a real energy weapon's centre is hotter than its edges, and
- *                a white core with a coloured sheath is what makes it read as *bright* instead of
+ *   1. CORE      a thin, almost white TAPERED beam from muzzle to impact. Near-white rather than
+ *                team coloured on purpose - a real energy weapon's centre is hotter than its edges,
+ *                and a white core with a coloured halo is what makes it read as *bright* instead of
  *                merely *blue*. It is emissive far past 1.0, so the scene's bloom does the wide
  *                soft halo for free; that is the same trick every neon surface in this arena uses.
- *   2. SHEATH    a fatter, dimmer, fully team-coloured cylinder around the core, drawn additively
- *                so it cannot occlude the core. Optional: if the additive engine material is
+ *   2. HALO      a fatter, dimmer, fully team-coloured sleeve around the core, drawn additively so
+ *                it cannot occlude the core. Optional: if the additive engine material is
  *                unavailable the effect degrades to core-plus-bloom and still looks deliberate.
- *   3. MUZZLE    a short, bright sphere at the near end of the beam. Suppressible from settings
- *                (UTraceSettings::bTracerMuzzleFlash).
+ *   3. MUZZLE    a short, bright CONE at the near end of the beam, pointing down it. Suppressible
+ *                from settings (UTraceSettings::bTracerMuzzleFlash).
+ *
+ * --- SPEC v32 §2 RE-PROFILED ALL THREE AGAINST Art/Pack/docs/unreal-fx_README.md ---------------
+ *
+ * The artist's recipe gives every one of these a NUMBER, and until this pass none of them was on
+ * screen: a v31 verifier grepped the tree and reported "EVERY PIECE OF FX GEOMETRY IN
+ * unreal-fx_README IS ABSENT". The structure below is the one that was already here - it was right,
+ * it solved the hard first-person problem, and it is re-profiled rather than replaced. What changed:
+ *
+ *   * THE CORE TAPERS. r 3.0 -> 1.3 uu (pistol), 2.4 -> 1.3 uu (SMG), which is the doc's
+ *     0.030 -> 0.013 m and 0.024 m in Unreal's centimetres. One mesh cannot taper, so it is three
+ *     stacked cylinders - see UTraceFxShapes::TaperAlongLocalZ for why stacked segments and not a
+ *     cone.
+ *   * THE SHEATH BECAME THE HALO. The doc asks for a double-sided translucent sleeve at r 5.2 uu
+ *     and ~55% opacity. There was already an additive sheath at a different radius, so the two are
+ *     RECONCILED INTO ONE SLEEVE rather than a third cylinder being stacked inside them - which is
+ *     what §2 asks for in as many words, and is also the only version that does not triple the
+ *     overdraw down the middle of the screen.
+ *   * THE MUZZLE SPHERE BECAME A CONE, r 16 uu / h 30 uu (pistol) / r 13 uu (SMG), pointing down
+ *     the beam, for the first 0.28 s, scaling 0.55 -> 3.2x.
+ *   * THE LIFE IS NOW HOLD-THEN-FADE: 0.10 s at full, then a decay whose length is
+ *     TraceRailgunFireCurve's own tail rather than a second copy of "0.75".
+ *
+ * --- LENGTH: THE ONE PLACE THIS DELIBERATELY DEPARTS FROM THE FX DOC ---------------------------
+ *
+ * The doc says the beam is "~2.6 m" long. IT IS NOT, HERE, AND IT MUST NOT BE. That number is an
+ * artefact of the preview viewer the recipe was written against: a turntable with no world in it,
+ * where a beam has nothing to end on, so the artist gave it an arbitrary length so it would be
+ * visible in the frame. In a hitscan shooter the beam's length is the ONLY thing it says - it runs
+ * MUZZLE -> IMPACT and terminating exactly on the hit point is the entire information content of a
+ * tracer. Spec v4 §4 deleted the impact sphere for precisely this reason ("so it's just a bullet
+ * trace, which makes it easier to see where your shots are going"), and a fixed 260 uu stub would
+ * put that information back behind a wall.
+ *
+ * So the length is the shot's own, and THE TAPER RUNS OVER THAT ACTUAL LENGTH, not over 260 uu. The
+ * doc's radii are honoured exactly; only its length is adapted. This is a stated deviation, not an
+ * oversight, and Trace.Fx.Beam prints the resolved length on every sample so it can be checked.
  *
  * --- THE FOURTH BEAT, AND WHY IT IS GONE ------------------------------------------------------
  *
@@ -236,20 +366,177 @@ public:
 	 */
 	static bool GetGunMuzzleLandmark(FName StaticMeshName, FVector& OutMeshLocalCm);
 
+	/**
+	 * SPEC v32 §2 — this beam, as it is RIGHT NOW, measured off its own components.
+	 *
+	 * For Trace.Fx.Beam. Returns false only when the shot never got as far as being drawn (a
+	 * degenerate segment). See FTraceTracerShotDebug for why the numbers are read back rather than
+	 * recomputed.
+	 */
+	bool DescribeShot(FTraceTracerShotDebug& OutInfo) const;
+
+	/**
+	 * The newest live tracer in @p World, or null. Trace.Fx.Beam follows the most recent shot.
+	 *
+	 * @param bFirstPersonOnly  restrict the search to beams that were placed on the LOCAL VIEWER'S
+	 *                          OWN VIEWMODEL, i.e. bFirstPersonShot. THE PROBE PASSES TRUE AND HERE
+	 *                          IS WHY: a match has bots in it, every one of them spawns a tracer for
+	 *                          every shot it takes, and "the newest tracer in the world" is very
+	 *                          often one of theirs. A remote beam is not told who fired it (see the
+	 *                          profile note in InitTracer), so it correctly draws the PISTOL profile
+	 *                          whatever the shooter is holding — and Trace.Fx.BeamSmg was measuring
+	 *                          exactly that and reporting the SMG's beam as a pistol's. Worse, the
+	 *                          pistol arm was PASSING on somebody else's beam for the same reason,
+	 *                          which is a green that proves nothing about the gun in your hands.
+	 *                          False keeps the old "newest of anybody's" behaviour.
+	 */
+	static ATraceTracer* GetNewestTracer(const UWorld* World, bool bFirstPersonOnly = false);
+
+	/**
+	 * *** THE ONE SIZE KNOB: Trace.Fx.BeamScale, read live. ***
+	 *
+	 * A single multiplier applied to EVERY radius and length in the beam's authored profile — core
+	 * muzzle, core tip, halo, and both dimensions of the muzzle-flash cone — at the very end of
+	 * InitTracer's width block, after the legibility floor and after the three shipped UTraceSettings
+	 * knobs have had their say. Because it multiplies all of them by the same number, every
+	 * proportion the FX doc authored (tip/muzzle 0.433, halo/muzzle 1.733, cone 16:30) survives
+	 * untouched and only the absolute size changes. That is the whole design: the doc's shape, at a
+	 * different size.
+	 *
+	 * WHY IT EXISTS. Photographed in Saved/Screenshots/v31integ_42_pistol_firing.png: at 1.0 the shot
+	 * reads as a solid white plank about as wide as the arena's structural rails — architecture, not
+	 * light. The near end of a first-person beam is ~85 uu from the eye, where the halo's 5.2 uu
+	 * radius subtends roughly 100 px of a 1600 px frame before bloom widens it further, and the
+	 * legibility floor makes a long shot FATTER still (up to 6.5 uu, i.e. an 11.3 uu halo).
+	 *
+	 * WHY A CVAR RATHER THAN A UTraceSettings PROPERTY. This file's neighbours already made that
+	 * call for exactly this kind of number — Trace.Core.FxGeometry, Trace.Core.ThrownTrailLengthUU
+	 * and the two heart-light knobs are all CVars. The house rule about UPROPERTY(config) is about
+	 * GAMEPLAY tunables a designer ships; this is the size of a piece of decoration, and being a CVar
+	 * is what lets the next tuning pass photograph three values without a rebuild.
+	 *
+	 * Public and an accessor rather than a raw CVar read because Trace.Fx.Beam's verdict has to grade
+	 * doc x knob on its three ABSOLUTE rows, and a harness with its own copy of the knob is a second
+	 * place for it to live. Note what the split does and does not buy: the knob is an INPUT to the
+	 * effect, exactly like TracerSheathRadiusRatio, so multiplying the expected side by it is honest;
+	 * the two RATIO rows are scale-invariant and keep grading the doc's raw proportions, so they can
+	 * still tell a pistol from an SMG and Trace.Fx.BeamRedArm stays red, at any knob value.
+	 *
+	 * Clamped to 0.05..4.0 on the way out, so no console typo can make the beam invisible (which
+	 * looks exactly like "the tracer stopped rendering") or a wall across the arena.
+	 */
+	static float GetBeamProfileScale();
+
+	/**
+	 * How many stacked cylinders the tapered core is made of.
+	 *
+	 * Public because the probe sizes its own array from it, and because a verifier reading the log
+	 * should be able to find out from the header how many radii it is being shown. THREE: see
+	 * UTraceFxShapes::TaperAlongLocalZ for the arithmetic on why the resulting step is not visible.
+	 */
+	static constexpr int32 BeamTaperSegments = 3;
+
+	// =============================================================================================
+	// TIMING — public because the probe reports the window it sampled
+	//
+	// Trace.Fx.Beam has to say WHICH window its numbers were taken from, and a probe that carries its
+	// own copy of "the hold is 0.10 s" is a second place for that fact to live. These are the effect's
+	// timing contract, so they are stated once, here, and read by anything that needs them.
+	// =============================================================================================
+
+	/** Doc: "Spawn at discharge, hold 0.10 s, fade over the decay." */
+	static constexpr float BeamHoldSeconds = 0.10f;
+
+	/**
+	 * THE DECAY, NOT RETYPED. SPEC v32 §2: "The pistol's decay is 0.75 s (already a constant
+	 * somewhere near the discharge driver — reuse it, do not retype 0.75)."
+	 *
+	 * It is the tail of the authored fire clip: everything from the end of the flash
+	 * (DecayStartSeconds, 1.15) to the end of the clip (ClipSeconds, 1.90). Derived rather than
+	 * copied so that a re-export of Art/Railgun/fire_curves.json — which regenerates
+	 * TraceRailgunFireCurve.h — moves the beam's fade and the weapon's emissive fade together. Two
+	 * copies of one number is how they end up disagreeing.
+	 */
+	static constexpr float BeamDecaySeconds =
+		TraceRailgunFireCurve::ClipSeconds - TraceRailgunFireCurve::DecayStartSeconds;
+
+	/**
+	 * Total life: hold plus decay. 0.85 s, up from the 0.17 s this effect used before v32.
+	 *
+	 * That is a FIVE-FOLD increase in how long a tracer actor lives, and it is worth naming what it
+	 * costs: at 600 RPM a held SMG trigger now keeps ~8.5 of these alive at once per shooter instead
+	 * of ~1.7. They are five collisionless, shadowless, unlit components each and they still expire
+	 * on their own InitialLifeSpan, so the count is bounded by (rate x life) and cannot grow — but it
+	 * is a real change and the two harnesses that COUNT live ATraceTracer actors (the input harness's
+	 * shots-emitted set, Trace.Smg.Verify's before/after delta) both get MORE reliable from it, not
+	 * less, because a longer-lived actor is harder to sample between.
+	 */
+	static constexpr float TracerLifeSeconds = BeamHoldSeconds + BeamDecaySeconds;
+
+	/**
+	 * Doc: the muzzle cone is "visible for the first 0.28 s of decay, scaling 0.55 -> 3.2x".
+	 *
+	 * *** AND THE SMG FIRES EVERY 0.1 s, SO THREE OF THESE OVERLAP. ***
+	 *
+	 * DECIDED: for the shot the local player is looking down — the one on the viewmodel, a hand's
+	 * breadth from the camera — there is exactly ONE cone in the world at a time and each shot
+	 * RESTARTS it. A new first-person tracer retires the previous one's flash before lighting its
+	 * own (see RetireMuzzleFlash and the GFirstPersonFlashOwner note in the .cpp).
+	 *
+	 * Two reasons, and the second is the one that matters. First, it is what a real muzzle does: a
+	 * gun has one muzzle, and three superimposed flashes is not a brighter flash, it is a bug.
+	 * Second, these cones are UNLIT AND ADDITIVE, which does not attenuate with distance and which
+	 * sums literally rather than figuratively, and they grow to 3.2x of a 16 uu radius roughly 85 uu
+	 * from the eye. One of those is a muzzle flash. Three summed is a flashbang — the exact failure
+	 * the TracerMuzzleRadiusUU tooltip records having already been fixed once.
+	 *
+	 * REMOTE beams keep a flash each, deliberately. They are somebody else's gun tens of metres away,
+	 * where overlapping flashes are both correct (two players CAN fire at once) and free, and where
+	 * sharing one cone between shooters would mean one player's shot putting out another's flash.
+	 *
+	 * Neither arm can leak: the cone belongs to the tracer actor and the tracer actor expires on
+	 * InitialLifeSpan whether or not anybody ever retires anything.
+	 */
+	static constexpr float MuzzleFlashSeconds = 0.28f;
+	static constexpr float MuzzleFlashStartScale = 0.55f;
+	static constexpr float MuzzleFlashEndScale = 3.2f;
+
 protected:
 	/** Positioned at the beam start and rotated so local +Z runs down the shot. */
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
 	TObjectPtr<USceneComponent> EffectRoot;
 
-	/** Beat 1: the hot near-white centre of the beam. */
+	/**
+	 * Beat 1: the hot near-white centre of the beam, TAPERED (SPEC v32 §2).
+	 *
+	 * THREE COMPONENTS, ONE BEAM. A static mesh has one scale, so a cylinder cannot narrow along its
+	 * own length; the taper is three stacked cylinders at decreasing radii, each at the radius of its
+	 * own mid-point along the taper. UTraceFxShapes::TaperAlongLocalZ owns that arithmetic and its
+	 * comment carries the argument for stacked segments over a clipped cone.
+	 *
+	 * They are still ONE ACTOR, which matters: Debug/TraceInputHarness.cpp counts live ATraceTracer
+	 * actors to count shots emitted, so splitting the beam into several actors would silently inflate
+	 * a measurement two other harnesses depend on. Hence five components on one actor, as before.
+	 */
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
-	TObjectPtr<UStaticMeshComponent> BeamCore;
+	TObjectPtr<UStaticMeshComponent> BeamSegments[3];
 
-	/** Beat 2: the wider team-coloured additive glow. Hidden if the additive material is missing. */
+	/**
+	 * Beat 2: the team-coloured sleeve around the core. r 5.2 uu, ~55% opacity (FX doc r 0.052 m).
+	 *
+	 * THIS IS THE OLD SHEATH, RE-PROFILED — not a third cylinder added inside it. SPEC v32 §2 asks
+	 * for exactly that reconciliation, and the reason is overdraw: the halo runs the whole length of
+	 * the beam, down the middle of the screen, up to eighty times a second, and a third full-length
+	 * translucent tube would be the most expensive thing in the effect for a difference nobody could
+	 * name. Hidden entirely if no non-occluding material resolved.
+	 */
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
-	TObjectPtr<UStaticMeshComponent> BeamSheath;
+	TObjectPtr<UStaticMeshComponent> BeamHalo;
 
-	/** Beat 3: muzzle flash. Gated on UTraceSettings::bTracerMuzzleFlash. */
+	/**
+	 * Beat 3: muzzle flash — a CONE now, not a sphere, pointing down the beam. Gated on
+	 * UTraceSettings::bTracerMuzzleFlash, which is a shipped setting players use.
+	 */
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
 	TObjectPtr<UStaticMeshComponent> MuzzleFlash;
 
@@ -258,53 +545,44 @@ protected:
 	// and the camera-proximity dimming that existed solely to stop it whiting out the screen at
 	// point-blank range are all gone with it.
 
-	/**
-	 * /Game/Generated/Materials/M_TraceNeon — unlit, opaque, EmissiveColor = Color * Glow. Made by
-	 * Scripts/generate_content.py; see that file for why no engine material will do. Held as a hard
-	 * UPROPERTY on the CDO so the cooker follows it.
-	 */
-	UPROPERTY()
-	TObjectPtr<UMaterialInterface> NeonMaterial;
-
-	/**
-	 * /Engine/EngineMaterials/EmissiveMeshMaterial — unlit and BLEND_Additive, which is the one
-	 * property the sheath actually needs: additive geometry writes no depth, so a fat sheath cannot
-	 * hide the thin core inside it. Its emissive is modulated by a faint grid texture, which is why
-	 * it is used ONLY for the soft outer glow, where a texture is invisible under bloom, and never
-	 * for the core.
-	 */
-	UPROPERTY()
-	TObjectPtr<UMaterialInterface> AdditiveMaterial;
-
-	/** Fallback when M_TraceNeon has not been generated: lit, colour only, no emissive. */
-	UPROPERTY()
-	TObjectPtr<UMaterialInterface> FallbackMaterial;
+	// THE THREE MATERIAL UPROPERTYs MOVED TO UTraceFxShapes (SPEC v32 §1). M_TraceNeon, the engine's
+	// additive material and the BasicShapeMaterial fallback are now found once, on that library's
+	// CDO, with the same constructor-time FObjectFinders that used to be here — so the cooker still
+	// follows them and every effect in the pass degrades through the same ladder instead of each one
+	// re-implementing the fallback rule slightly differently.
 
 private:
 	void InitTracer(const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted);
 
-	/** Applies the intensity/thickness curves for a normalised age in [0,1]. */
-	void ApplyFade(float Alpha);
-
-	/** Creates a MID on Mesh from Material and stores it. Null-safe; returns the MID or nullptr. */
-	UMaterialInstanceDynamic* MakeMID(UStaticMeshComponent* Mesh, UMaterialInterface* Material);
+	/**
+	 * Applies the whole look for an absolute age in seconds.
+	 *
+	 * SECONDS, NOT A NORMALISED ALPHA, and driven from the world clock rather than an accumulator —
+	 * see the note on SpawnTimeSeconds. Half the numbers in this effect are 0.10 / 0.28 / 0.75 s and
+	 * they have to mean those things, not "some fraction of a life that changed the last time
+	 * somebody retuned the decay".
+	 */
+	void UpdateEffect(float AgeSeconds);
 
 	/**
-	 * Pushes colour and brightness into a MID.
-	 *
-	 * @param bGlowScalar true for M_TraceNeon and the BasicShapeMaterial fallback, whose contract is
-	 *                    "Color is a 0..1 hue, Glow is the multiplier" — the same idiom the arena
-	 *                    builder and the trail already use on this material. False for the additive
-	 *                    engine material, which has no Glow scalar, so intensity has to be baked
-	 *                    into the colour instead.
+	 * Hides the muzzle cone for good. Called when its 0.28 s window ends — and by the NEXT shot,
+	 * when this tracer is the one holding the shared first-person flash. See the comment on
+	 * MuzzleFlashSeconds for why a held SMG trigger must not stack three cones on the viewmodel.
 	 */
-	static void SetMIDColor(UMaterialInstanceDynamic* MID, const FLinearColor& Color, float Intensity, bool bGlowScalar);
+	void RetireMuzzleFlash();
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> CoreMID;
 
+	/**
+	 * ONE MID, THREE SEGMENTS. The tapered core's three cylinders share a single dynamic material
+	 * instance — created on the first segment and assigned to the other two — so they cannot
+	 * possibly disagree about colour or brightness, and the per-frame fade is one parameter write
+	 * instead of three. Two objects agreeing about one fact is a failure this codebase logs by name;
+	 * the cheapest way not to have it is not to have two objects.
+	 */
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> SheathMID;
+	TObjectPtr<UMaterialInstanceDynamic> HaloMID;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> MuzzleMID;
@@ -315,24 +593,62 @@ private:
 	/** Near-white version of ShotColor used by the core and the muzzle. */
 	FLinearColor HotColor = FLinearColor::White;
 
-	float Age = 0.f;
+	/**
+	 * The world time this shot was drawn at. AN ABSOLUTE CLOCK, NOT AN ACCUMULATOR.
+	 *
+	 * House rule, and it has bitten this project twice: a per-frame reader of a short quantity that
+	 * adds DeltaSeconds to a counter double-advances on a hitch, drifts, and disagrees between
+	 * machines. Every duration in this effect (0.10 s hold, 0.28 s flash, 0.75 s decay) is short
+	 * enough for that to be visible. Age is therefore a pure function of World->GetTimeSeconds(),
+	 * evaluated fresh, and there is no state to sample before or after advancing because there is no
+	 * advancing.
+	 */
+	double SpawnTimeSeconds = 0.0;
 
 	/**
-	 * Beam DIAMETERS for this particular shot. All three are overwritten by InitTracer from the
-	 * Tracer block in UTraceSettings before anything is drawn; the initialisers here only keep a
-	 * tracer that returned early from InitTracer (a degenerate segment) from holding garbage.
+	 * THE PROFILE FOR THIS SHOT, in uu, resolved once by InitTracer.
 	 *
-	 * DIAMETERS rather than radii because /Engine/BasicShapes/Cylinder and Sphere are 100 uu ACROSS,
-	 * so a diameter is what divides cleanly into a mesh scale. The settings are expressed as RADII
-	 * because that is the word spec v4 §4 uses ("the radius of the cross section"); InitTracer
-	 * doubles them exactly once, at the boundary, so the rest of this file stays in one unit.
+	 * RADII, not diameters. The FX doc speaks in radii ("r 0.030 -> 0.013"), spec v4 §4 speaks in
+	 * radii, and UTraceSettings exposes radii; the old members here were diameters purely so the
+	 * halving into a mesh scale was pre-done, which UTraceFxShapes::ShapeScaleForRadiusUU now owns.
+	 * Carrying one unit end to end is worth more than saving a multiply.
+	 *
+	 * The initialisers are the pistol's authored profile so that a tracer which returned early from
+	 * InitTracer (a degenerate segment, never drawn) holds documented values rather than garbage.
 	 */
-	float CoreDiameter = 4.f;
-	float SheathDiameter = 12.f;
-	float MuzzleDiameter = 5.f;
+	float BeamLengthUU = 0.f;
+	float CoreMuzzleRadiusUU = 3.0f;
+	float CoreTipRadiusUU = 1.3f;
+	float HaloRadiusUU = 5.2f;
+	float HaloOpacityValue = 0.55f;
+	float FlashConeRadiusUU = 16.0f;
+	float FlashConeHeightUU = 30.0f;
+
+	/** Which of the two weapon profiles was used, and how it was decided. For the probe. */
+	bool bSmgProfile = false;
+	bool bFirstPersonShot = false;
+	FName ProfileGunMesh = NAME_None;
+
+	/** The blend each piece actually got, after UTraceFxShapes' degradation ladder. */
+	ETraceFxBlend CoreBlend = ETraceFxBlend::None;
+	ETraceFxBlend HaloBlend = ETraceFxBlend::None;
+	ETraceFxBlend FlashBlend = ETraceFxBlend::None;
+
+	/**
+	 * The age the geometry was last laid at. Written by UpdateEffect, read only by DescribeShot.
+	 *
+	 * NOT a clock and not an accumulator — it is a record of the argument UpdateEffect was handed,
+	 * which is itself a stateless function of the absolute world clock (see SpawnTimeSeconds). The
+	 * probe needs it because the muzzle cone's authored size is a function of age, so "is the live
+	 * cone the right size?" is only a well-posed question once you know which age to ask it at.
+	 */
+	float GeometryAgeSeconds = 0.f;
 
 	/** Set false once the muzzle flash has been retired, so it is only hidden once. */
 	bool bMuzzleVisible = false;
+
+	/** False when no non-occluding material resolved and the halo was dropped entirely. */
+	bool bHaloVisible = false;
 
 	// --- Tuning ---------------------------------------------------------------------------------
 	//
@@ -347,15 +663,59 @@ private:
 	// UTraceSettings (Category "Tracer") as radii, and ImpactStartDiameterUU / ImpactEndDiameterUU /
 	// ImpactIntensity are simply gone with the sphere they described.
 
-	/** Total life. Long enough to read as a beam, short enough that 10 bots firing never smears. */
-	static constexpr float TracerLifeSeconds = 0.17f;
+	// =============================================================================================
+	// SPEC v32 §2 — THE AUTHORED PROFILE
+	//
+	// Straight out of Art/Pack/docs/unreal-fx_README.md, converted ONCE, here, at the boundary:
+	// THE FX DOC IS IN METRES AND UNREAL IS IN CENTIMETRES, so its 0.030 is 3.0 uu. Everything below
+	// is in uu and nothing downstream divides or multiplies by 100 again — the only other conversion
+	// in this effect is uu -> BasicShape scale, which lives in UTraceFxShapes and nowhere else.
+	// =============================================================================================
 
-	/** Fraction of the life over which the muzzle flash exists. */
-	static constexpr float MuzzleFlashLifeFraction = 0.42f;
+	/** Doc: pistol beam "r 0.030 -> 0.013"; SMG "scaled to r 0.024". The tip is shared. */
+	static constexpr float PistolCoreMuzzleRadiusUU = 3.0f;
+	static constexpr float SmgCoreMuzzleRadiusUU = 2.4f;
+	static constexpr float CoreTipRadiusProfileUU = 1.3f;
+
+	/** Doc: "a wider translucent halo (r 0.052, double-sided, ~55% opacity)". */
+	static constexpr float HaloRadiusProfileUU = 5.2f;
+	static constexpr float HaloOpacityProfile = 0.55f;
+
+	/** Doc: "a 6-sided cone (r 0.16, h 0.30) at the muzzle"; SMG "cone r 0.13". */
+	static constexpr float PistolFlashConeRadiusUU = 16.0f;
+	static constexpr float SmgFlashConeRadiusUU = 13.0f;
+	static constexpr float FlashConeHeightProfileUU = 30.0f;
 
 	/**
-	 * M_TraceNeon "Glow" multipliers at t=0 - how far past white the emissive sits, and therefore
-	 * how hard the shot blooms.
+	 * WHAT THE THREE SHIPPED WIDTH KNOBS MEAN NOW, AND WHY THEY WERE NOT SIMPLY IGNORED.
+	 *
+	 * UTraceSettings' Tracer block is a shipped, tooltipped, player-facing panel, and spec v4 §4 put
+	 * it there on purpose. The FX doc, meanwhile, gives absolute radii. Those two are only in tension
+	 * if the knobs are read as absolutes, so they are read as SCALES ON THE AUTHORED PROFILE,
+	 * normalised against the defaults the profile was authored alongside:
+	 *
+	 *     halo radius  = 5.2 uu * (TracerSheathRadiusRatio / 3.2)
+	 *     cone radius  = 16 uu  * (TracerMuzzleRadiusUU    / 2.5)
+	 *
+	 * At the shipped defaults both brackets are exactly 1 and the doc's numbers appear on screen
+	 * unmodified — which is what a verifier measuring the on-screen size will find. Move a slider and
+	 * it still does what its tooltip says (bigger halo, smaller flash); its endpoint behaviour is
+	 * preserved too, because a ratio of 1.0 shrinks the halo inside the core and the halo is then
+	 * dropped, exactly as "1.0 removes the halo entirely" promises.
+	 *
+	 * These two constants are therefore NOT tuning values. They are a record of the defaults this
+	 * profile was calibrated against, and if either default ever moves in TraceSettings.h and
+	 * DefaultGame.ini, the honest fix is to move it here too. Called out in the pass report.
+	 */
+	static constexpr float HaloRatioReferenceDefault = 3.2f;
+	static constexpr float FlashRadiusReferenceDefaultUU = 2.5f;
+
+
+	/**
+	 * The M_TraceNeon "Glow" multiplier at t=0 - how far past white the beam core's emissive sits,
+	 * and therefore how hard the shot blooms. THE CORE ONLY: the muzzle cone used to share this
+	 * block and no longer belongs in it, because it is no longer drawn on M_TraceNeon at all. See
+	 * MuzzleIntensity below.
 	 *
 	 * Calibrated against the rest of the arena rather than picked in the abstract: the neon grid
 	 * runs at 1.5, structural trim at 3.2-4.5, the goal line at 6.0, and the carrier's trail ghost
@@ -377,22 +737,46 @@ private:
 	 * tube with no bloom at all. That failure looks exactly like "the effect is not rendering".
 	 */
 	static constexpr float CoreIntensity = 6.6f;
-	static constexpr float MuzzleIntensity = 3.0f;
 
 	/**
-	 * The additive sheath's engine material has no Glow scalar, so its intensity has to ride in the
-	 * colour - which means it is clamped at 1.0 and cannot be pushed past white. That is fine: the
-	 * sheath's job is a soft coloured halo, not a hot core, and additive blending at full colour is
-	 * already a strong glow. Kept just under 1 so the fade always has somewhere to go.
+	 * The muzzle cone's brightness — and it is 1.0, not the 3.0 it was, because the cone moved off
+	 * the opaque emissive material and onto the ADDITIVE one (see the blend argument in InitTracer).
+	 *
+	 * That move changes what this number can mean. On M_TraceNeon brightness rides a "Glow" SCALAR
+	 * and can be pushed past white to bloom; the engine's additive material has no such scalar, so
+	 * UTraceFxShapes::SetGlow has to fold brightness into the "Color" vector — and a material
+	 * instance clamps vector parameters to [0,1]. Leaving this at 3.0 would therefore not have made
+	 * the flash three times brighter. It would have PINNED IT AT FLAT WHITE for the whole first 42%
+	 * of its life (3 x fade^2 >= 1 while fade >= 0.577) and only then let the fade start, which is
+	 * both a hard-edged white disc and the loss of the hot-to-cool falloff the shockwave reading
+	 * depends on. 1.0 is the largest value the blend can actually carry, so the fade curve is
+	 * expressed in full from the first frame.
+	 *
+	 * Exactly the same constraint the halo has lived under since v32; HaloIntensity's comment below
+	 * carries the same argument for the same reason, and it is 1.0 for the same reason.
 	 */
-	static constexpr float SheathIntensity = 0.85f;
+	static constexpr float MuzzleIntensity = 1.0f;
+
+	/**
+	 * The halo's material has no Glow scalar, so its intensity has to ride in the colour - which
+	 * means it is clamped at 1.0 and cannot be pushed past white. That is fine: the halo's job is a
+	 * soft coloured sleeve, not a hot core, and additive blending at full colour is already a strong
+	 * glow.
+	 *
+	 * FULL 1.0 SINCE v32, where the pre-v32 sheath sat at 0.85 "so the fade always has somewhere to
+	 * go". The fade now rides on OPACITY, which is a separate argument to UTraceFxShapes::SetGlow and
+	 * is the FX doc's own 0.55 — so the brightness no longer has to carry two jobs, and the number a
+	 * verifier is told to measure ("the halo opacity") is a number that exists in the code rather
+	 * than a product of two constants that were never meant to be multiplied.
+	 */
+	static constexpr float HaloIntensity = 1.0f;
 
 	/**
 	 * How far toward white the core and muzzle are pushed from the team colour.
 	 *
 	 * Half and half. A hotter core is more convincing as energy, but at 0.78 the beam came out
 	 * essentially white and a player could no longer tell whose shot had just gone past them -
-	 * which in a team game is information, not decoration. The sheath stays fully team coloured.
+	 * which in a team game is information, not decoration. The halo stays fully team coloured.
 	 */
 	static constexpr float HotColorWhiteMix = 0.50f;
 
@@ -438,8 +822,10 @@ private:
 	 */
 	static constexpr double MuzzleAgreementUU = 1.0;
 
-	/** /Engine/BasicShapes primitives are 100 uu across, centred on their own origin. */
-	static constexpr float BasicShapeExtentUU = 100.0f;
+	// BasicShapeExtentUU IS GONE FROM THIS FILE (SPEC v32 §1: "Write the conversion once, in one
+	// named constant, and use it everywhere"). It now lives as UTraceFxShapes::RadiusUUToShapeScale
+	// and its length twin, which are the only two places in the module that know a BasicShape is
+	// 100 uu across. Deleted rather than left as a synonym, so nothing here can drift from it.
 
 	/** Shorter than this and the shot is not worth drawing (also avoids a zero-length rotation). */
 	static constexpr float MinTracerLengthUU = 1.0f;

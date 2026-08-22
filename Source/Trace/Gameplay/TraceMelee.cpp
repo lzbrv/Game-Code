@@ -2118,8 +2118,12 @@ namespace TraceMeleeConsole
 //   3. the SPEED BOOST is paid in the KNIFE slot and in neither gun slot, and it is paid as a
 //      MULTIPLIER on the base walk speed rather than as an absolute (the standing rule: a value that
 //      modifies a base moves when the base moves);
-//   4. the PULLOUT is 35% shorter for the knife and UNCHANGED for both guns, and it is likewise
-//      measured as a RATIO of the base rather than against a hard-coded 0.130 s;
+//   4. the PULLOUT is 35% shorter for the knife and UNCHANGED for both guns. *** SPEC v32 §7c
+//      REBUILT THIS CLAIM. *** It is now the ratio of the knife's MEASURED pullout to the pistol's
+//      MEASURED pullout, both read off the live deploy clock, asserted against the owner's 0.65.
+//      The old version divided the live clock by GetSwapSecondsFor() — the same knob on both sides —
+//      and so printed a PASS with `Trace.Knife.SwapMultiplier 1` and the knife at a gun's 0.2000 s.
+//      Trace.Weapon.VerifyRedArm at the bottom of this file runs exactly that arm on purpose;
 //   5. MELEE follows the switch. With bDualWieldKnife OFF (the v31 shipped position) the blade is in
 //      hand only in the knife slot, which is the v10 §1 model; with it ON the blade is in hand in all
 //      three. Asserted against TraceMelee::IsDualWieldEnabled() rather than against one of the two,
@@ -2219,16 +2223,63 @@ static void TraceRunStowVerify(UWorld* World)
 	const float BasePullout  = TraceMelee::GetSwapSeconds();
 	const float KnifeFactor  = TraceMelee::GetKnifeSwapMultiplier();
 
-	struct FState { ETraceEquippedWeapon Weapon; const TCHAR* Key; bool bWantBoost; };
+	// =============================================================================================
+	// *** SPEC v32 §7c — THE "35% SHORTER" CLAIM, MEASURED AGAINST A MEASUREMENT. ***
+	// =============================================================================================
+	//
+	// THE BUG THIS REPLACES, because it is the most instructive kind. The per-state check below used
+	// to be the WHOLE of claim 4, and it compared
+	//
+	//     GetDeployRemaining(Pawn)          <- the live clock the equip just stamped
+	// against
+	//     GetSwapSecondsFor(Want.Weapon)    <- Base x GetKnifeSwapMultiplier()
+	//
+	// Both sides read the SAME knob. `Trace.Knife.SwapMultiplier 1` moves the expectation and the
+	// measurement together by exactly the same factor, so the knife measured 0.2000 s — identical to
+	// a gun's, i.e. the pre-v31 pullout the owner asked to have shortened — and the check PASSED. A
+	// v31 verifier ran precisely that arm and reported it. The check was an internal-consistency test
+	// of the resolver wearing claim 4's label; it could not fail its own rule at any knob setting.
+	//
+	// THE FIX IS A SECOND MEASUREMENT, NOT A BETTER EXPECTATION. Every slot's pullout is now sampled
+	// off the live clock and kept; after the walk the KNIFE'S MEASURED SECONDS are divided by the
+	// PISTOL'S MEASURED SECONDS and that ratio is asserted against the owner's sentence. Nothing on
+	// either side of that comparison comes from GetKnifeSwapMultiplier(), so a knob that flattens the
+	// two makes the ratio 1.000 and the check goes red — which is the whole point.
+	//
+	// *** WHY 0.65 IS WRITTEN DOWN HERE AND NOWHERE ELSE. *** The house rule is that a derived value
+	// is stored relative to its base and never as an absolute, and GetSwapSecondsFor() obeys it. But a
+	// HARNESS is not a derived value: it encodes the REQUIREMENT ("reduce the pullout time when
+	// swapping to knife by 35%") so that it can disagree with the implementation. Sourcing this from
+	// UTraceMeleeSettings::KnifeSwapMultiplier — the property, its ini value, or the cvar — is exactly
+	// what made the old check vacuous, because then the requirement and the implementation are one
+	// number and one number cannot contradict itself. This constant is the owner's words; the tree is
+	// what is on trial.
+	//
+	// The tolerance is on the RATIO and is deliberately tight. 0.65 vs 1.00 is a gulf; 0.02 is wide
+	// enough for float noise in a single-precision divide and far too narrow to swallow a knob flip.
+	constexpr float SpecKnifePulloutRatio = 0.65f;      // "35% shorter", spec v31 §1 / v32 §7c
+	constexpr float SpecKnifePulloutTolerance = 0.02f;
+
+	// Filled by the walk below, one entry per state, and read after it. Kept as measurements rather
+	// than as pass/fail bits so the failure line can print the two numbers that produced the ratio.
+	float MeasuredPistolPullout = -1.f;
+	float MeasuredPistolAgainPullout = -1.f;
+	float MeasuredSmgPullout = -1.f;
+	float MeasuredKnifePullout = -1.f;
+
+	// SPEC v32 §7c. `Measured` is where this state's SAMPLED pullout is kept for the cross-comparison
+	// after the loop. A pointer rather than a lookup by weapon because two of the four states are the
+	// same weapon and the second one is not padding (see below) — its number is worth keeping apart.
+	struct FState { ETraceEquippedWeapon Weapon; const TCHAR* Key; bool bWantBoost; float* Measured; };
 	const FState States[] =
 	{
-		{ ETraceEquippedWeapon::Gun,   TEXT("1 (PISTOL)"), false },
-		{ ETraceEquippedWeapon::Knife, TEXT("3 (KNIFE)"),  true  },
-		{ ETraceEquippedWeapon::Smg,   TEXT("2 (SMG)"),    false },
+		{ ETraceEquippedWeapon::Gun,   TEXT("1 (PISTOL)"), false, &MeasuredPistolPullout },
+		{ ETraceEquippedWeapon::Knife, TEXT("3 (KNIFE)"),  true,  &MeasuredKnifePullout  },
+		{ ETraceEquippedWeapon::Smg,   TEXT("2 (SMG)"),    false, &MeasuredSmgPullout    },
 		// PISTOL AGAIN, LAST, and it is not padding: it is the only step that proves the boost is
 		// TAKEN AWAY again rather than merely never granted. A one-way test would pass on a build
 		// that latched the profile on at the first knife draw.
-		{ ETraceEquippedWeapon::Gun,   TEXT("1 (PISTOL) again"), false },
+		{ ETraceEquippedWeapon::Gun,   TEXT("1 (PISTOL) again"), false, &MeasuredPistolAgainPullout },
 	};
 
 	for (const FState& Want : States)
@@ -2254,27 +2305,33 @@ static void TraceRunStowVerify(UWorld* World)
 			continue;
 		}
 
-		// ---- CLAIM 4: THE PULLOUT, SAMPLED IMMEDIATELY AND COMPARED AS A RATIO ---------------------
+		// ---- CLAIM 4, PART ONE: SAMPLE THE PULLOUT AND KEEP IT --------------------------------------
 		//
 		// *** READ BEFORE ANYTHING ELSE IN THIS ITERATION. *** RequestEquip stamped the deadline one
 		// line ago, so GetDeployRemaining() is at its maximum RIGHT NOW and falls from here. The knife
 		// window is 0.130 s; anything that let a frame elapse first would be measuring decay. This is
 		// the spec's "sample before you advance" rule applied to the shortest clock in the file.
 		//
-		// THE RATIO, NOT THE SECONDS. Dividing by the live base is what makes this a test of "35%
-		// shorter" rather than of "0.130", so retuning SwapSeconds cannot make it fail and hard-coding
-		// KnifeSwapSeconds=0.13 as an absolute cannot make it pass.
+		// *** WHAT THIS CHECK IS, AND WHAT IT IS NOT — SPEC v32 §7c. *** Comparing the live clock to
+		// GetSwapSecondsFor() is a test that THE CLOCK AGREES WITH THE RESOLVER: that ApplyEquip spent
+		// the seconds the resolver handed it and did not, say, round them to a frame or reuse the
+		// previous slot's window. That is worth having and it is all this line has ever measured. It
+		// is NOT a test of "35% shorter", because both of its sides are functions of the same knob —
+		// which is why it printed a PASS over a knife pullout of 0.2000 s. The "35% shorter" claim is
+		// asserted after the loop, off two independent MEASUREMENTS. The label here says so.
 		{
 			const float Remaining = TraceMelee::GetDeployRemaining(Pawn);
 			const float WantSeconds = TraceMelee::GetSwapSecondsFor(Want.Weapon);
 			const float WantFactor = TraceIsFirearm(Want.Weapon) ? 1.f : KnifeFactor;
 			const float Ratio = Remaining / FMath::Max(UE_KINDA_SMALL_NUMBER, BasePullout);
+			if (Want.Measured != nullptr)
+			{
+				*Want.Measured = Remaining;
+			}
 			Check(FMath::IsNearlyEqual(Remaining, WantSeconds, 0.02f),
-				FString::Printf(TEXT("key %s: pullout %.4fs = %.3f x base %.3fs (want %.3f x = %.4fs) — v31 s1: %s"),
-					Want.Key, Remaining, Ratio, BasePullout, WantFactor, WantSeconds,
-					TraceIsFirearm(Want.Weapon)
-						? TEXT("the GUN pullout, which must be UNCHANGED")
-						: TEXT("the KNIFE pullout, 35% shorter")));
+				FString::Printf(TEXT("key %s: pullout clock %.4fs = %.3f x base %.3fs matches the resolver's ")
+					TEXT("%.4fs (%.3f x) — CONSISTENCY ONLY; the 35%% claim is checked below, v32 s7c"),
+					Want.Key, Remaining, Ratio, BasePullout, WantSeconds, WantFactor));
 		}
 
 		const bool bBoost = TraceMelee::ShouldUseKnifeMovementProfile(Pawn);
@@ -2335,6 +2392,75 @@ static void TraceRunStowVerify(UWorld* World)
 			(Refusal == ETraceMeleeRefusal::Deploying)
 				? TEXT("the pullout this harness just started")
 				: TEXT("live")));
+	}
+
+	// =============================================================================================
+	// *** CLAIM 4, PART TWO — "35% SHORTER", MEASURED KNIFE AGAINST MEASURED GUN. (v32 §7c) ***
+	// =============================================================================================
+	//
+	// Both numbers came off GetDeployRemaining() on a real pawn, one line after a real equip. Neither
+	// came from GetKnifeSwapMultiplier(), GetSwapSecondsFor() or UTraceMeleeSettings, so this is the
+	// arm that `Trace.Knife.SwapMultiplier 1` is supposed to break — and does.
+	//
+	// THE GUN LEG IS THE PISTOL'S FIRST MEASUREMENT, not an average of the three gun samples. An
+	// average would let one wrong gun be hidden by two right ones; the guns are checked against each
+	// other separately, immediately below, which is the half that carries "keep the pullout time for
+	// the guns the same".
+	if (MeasuredKnifePullout >= 0.f && MeasuredPistolPullout > UE_KINDA_SMALL_NUMBER)
+	{
+		const float MeasuredRatio = MeasuredKnifePullout / MeasuredPistolPullout;
+		Check(FMath::IsNearlyEqual(MeasuredRatio, SpecKnifePulloutRatio, SpecKnifePulloutTolerance),
+			FString::Printf(
+				TEXT("*** 35%% SHORTER: MEASURED knife %.4fs / MEASURED pistol %.4fs = %.4f ")
+				TEXT("(want %.2f +/- %.2f, i.e. %.0f%% shorter; this run is %.0f%% shorter). ")
+				TEXT("Both sides are live clocks — the knob is on neither side, so this is the check ")
+				TEXT("`Trace.Knife.SwapMultiplier 1` must turn red (v32 s7c)."),
+				MeasuredKnifePullout, MeasuredPistolPullout, MeasuredRatio,
+				SpecKnifePulloutRatio, SpecKnifePulloutTolerance,
+				100.f * (1.f - SpecKnifePulloutRatio), 100.f * (1.f - MeasuredRatio)));
+
+		// The diagnosis, printed only when it is wanted, because the most likely cause of a red line
+		// above is not a code change at all — it is somebody's A/B knob left in the pre-v31 position.
+		if (!FMath::IsNearlyEqual(MeasuredRatio, SpecKnifePulloutRatio, SpecKnifePulloutTolerance))
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Weapon]       ^ the LIVE knife share is %.3f (setting %.3f, cvar Trace.Knife.SwapMultiplier ")
+				TEXT("%.3f — negative means the cvar is deferring). If the cvar is 1, this is the A/B arm and the ")
+				TEXT("red line is correct; `Trace.Knife.SwapMultiplier -1` gives the shipped pullout back."),
+				KnifeFactor, UTraceMeleeSettings::Get().KnifeSwapMultiplier,
+				CVarKnifeSwapMultiplier.GetValueOnGameThread());
+		}
+	}
+	else
+	{
+		// NOT SILENT. A missing measurement means a slot was unreachable and the loop skipped it —
+		// the reachability check above has already gone red — but a claim that never ran must not
+		// read as a claim that passed.
+		Check(false, FString::Printf(
+			TEXT("*** 35%% SHORTER: NOT MEASURED — knife sample %.4fs, pistol sample %.4fs. A slot the ")
+			TEXT("walk could not reach leaves this claim untested, and untested is not passed (v32 s7c)."),
+			MeasuredKnifePullout, MeasuredPistolPullout));
+	}
+
+	// "KEEP THE PULLOUT TIME FOR THE GUNS THE SAME" — the other half of the owner's sentence, and it
+	// is a claim about the two guns AGAINST EACH OTHER. Asserted as an equality of two measurements
+	// rather than of each against the base, so a change that lengthened BOTH guns equally (which
+	// comparing each to GetSwapSeconds() would happily wave through) still shows up as the pistol
+	// leg of the ratio above moving. Three samples: pistol, SMG, and the pistol drawn a second time
+	// after a trip through the knife slot.
+	if (MeasuredPistolPullout >= 0.f && MeasuredSmgPullout >= 0.f)
+	{
+		Check(FMath::IsNearlyEqual(MeasuredPistolPullout, MeasuredSmgPullout, 0.02f),
+			FString::Printf(TEXT("both guns cost the same pullout: pistol %.4fs vs SMG %.4fs (v31 s1: ")
+				TEXT("\"keep the pullout time for the guns the same\")"),
+				MeasuredPistolPullout, MeasuredSmgPullout));
+	}
+	if (MeasuredPistolPullout >= 0.f && MeasuredPistolAgainPullout >= 0.f)
+	{
+		Check(FMath::IsNearlyEqual(MeasuredPistolPullout, MeasuredPistolAgainPullout, 0.02f),
+			FString::Printf(TEXT("the pistol costs the same pullout AFTER a trip through the knife slot: ")
+				TEXT("%.4fs then %.4fs (a slot that latched the knife's shorter window would show here)"),
+				MeasuredPistolPullout, MeasuredPistolAgainPullout));
 	}
 
 	// =============================================================================================
@@ -2421,6 +2547,55 @@ static FAutoConsoleCommandWithWorldAndArgs GTraceStowVerifyCmd(
 		[](const TArray<FString>& /*Args*/, UWorld* World)
 	{
 		TraceRunStowVerify(World);
+	}));
+
+// =================================================================================================
+// *** SPEC v32 §7c — THE RED ARM, AS A COMMAND, SO IT IS RUN AND NOT DESCRIBED. ***
+// =================================================================================================
+//
+// A harness whose red and green arms agree is not measuring its rule, and the only way to know which
+// it is, is to run both. This restores the PRE-v31 pullout — `Trace.Knife.SwapMultiplier 1`, the
+// exact A/B the cvar's own help text advertises — runs the identical TraceRunStowVerify, and puts
+// the knob back. The knife then draws in a gun's 0.2000 s, which is the state the owner asked to be
+// rid of, and the "35% SHORTER" line must go red. If it does not, this file is lying again.
+//
+// *** IT IS NOT SELF-MARKING. *** TraceRunStowVerify is not told which arm it is in and has no way
+// to find out: this sets the SHIPPED cvar through the ordinary IConsoleVariable::Set path, which is
+// byte-for-byte what a human typing `Trace.Knife.SwapMultiplier 1` into the console does. The only
+// difference is that a command with NO ARGUMENTS survives -TraceExec=, which FParse::Value truncates
+// at the first space — see UI/TraceIntegrationWalk.cpp's alias block for the full story. Without
+// this, the red arm could not be run headlessly at all, and a red arm nobody can run is a red arm
+// nobody runs.
+//
+// RESTORES WHAT IT FOUND, not a hard-coded -1: if an operator was already mid-A/B, this must not
+// silently end their experiment.
+static FAutoConsoleCommandWithWorldAndArgs GTraceWeaponVerifyRedArmCmd(
+	TEXT("Trace.Weapon.VerifyRedArm"),
+	TEXT("SPEC v32 s7c. Runs Trace.Weapon.Verify with the PRE-v31 pullout restored ")
+	TEXT("(Trace.Knife.SwapMultiplier 1, so the knife draws in a gun's time), then restores the knob. ")
+	TEXT("The \"35%% SHORTER\" check MUST FAIL. If this run passes, the check is vacuous again."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& /*Args*/, UWorld* World)
+	{
+		const float Restore = CVarKnifeSwapMultiplier.GetValueOnGameThread();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("========== [Weapon] RED ARM (v32 s7c): restoring the PRE-v31 pullout =========="));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Weapon] Trace.Knife.SwapMultiplier %.3f -> 1.000. Knife pullout becomes %.4fs, a gun's ")
+			TEXT("%.4fs — the state the owner asked to be rid of. THE \"35%% SHORTER\" CHECK MUST NOW FAIL."),
+			Restore, TraceMelee::GetSwapSeconds(), TraceMelee::GetSwapSeconds());
+
+		CVarKnifeSwapMultiplier->Set(1.f, ECVF_SetByConsole);
+
+		TraceRunStowVerify(World);
+
+		CVarKnifeSwapMultiplier->Set(Restore, ECVF_SetByConsole);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Weapon] RED ARM done. Trace.Knife.SwapMultiplier put back to %.3f; the knife pullout is ")
+			TEXT("%.4fs again. Run Trace.Weapon.Verify now for the GREEN arm."),
+			Restore, TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Knife));
+		UE_LOG(LogTraceGame, Display, TEXT("=============================================================="));
 	}));
 
 

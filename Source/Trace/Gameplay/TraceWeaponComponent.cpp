@@ -4324,7 +4324,54 @@ void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)
 			// rotations COMPOSE (FRotator addition is not rotation composition in general, but both
 			// terms here are small and the rest cant is fixed, so the sum is what the eye expects and
 			// what the v27 build already did with a zero rest).
-			KnifeViewRoot->SetRelativeLocationAndRotation(KnifeRestLocation + Offset, KnifeRestRotation + Rotation);
+			const FTransform KnifeRigPose(KnifeRestRotation + Rotation, KnifeRestLocation + Offset);
+
+			// =====================================================================================
+			// *** AND THEN THE BLADE RIDES THE HAND, WHICH UNTIL v32 §8 IT DID NOT.  (spec v32 §8) ***
+			// =====================================================================================
+			//
+			// THE DEFECT, PHOTOGRAPHED: Saved/Screenshots/v31integ_47_key3_knife_idle.png has the
+			// glove in the middle of the frame and the balisong a clear hand's width to the RIGHT of
+			// it with lit floor visible in between; v31fallback_47_key3_knife_idle.png, the same beat
+			// of the same scripted walk on the cube rig, has the blade coming out of the closed fist.
+			// The same split is in _48_knife_stab and _50_knife_inspect_late.
+			//
+			// THE CAUSE IS THE LINE THIS ONE REPLACES, AND IT IS AN OMISSION RATHER THAN A WRONG
+			// NUMBER. Every other primitive drawn at the hand — both gun rigs, both forearm tubes —
+			// is written as `authored rig pose * ATraceCharacter's wrist delta`, because the pack
+			// rig's wrist MOVES: the base pose all this art is authored against is Idle_Pistol at
+			// t=0, and Idle_Knife is a different clip with a differently canted wrist. The knife rig
+			// alone was written straight to KnifeViewRoot with no delta, so on the pack rig the fist
+			// walks off to the knife pose and the blade stays parked in the pistol pose.
+			//
+			// MEASURED, off Saved/Logs/sizefix.log's own [Hands] probe lines: wrist_right sits at rig
+			// (-6.88, -0.17, -1.53) in the base pose and at (-6.06, -0.43, -0.57) at Idle_Knife
+			// t=0.32 — 1.3 uu of travel, plus the wrist ROTATION the probe does not print, applied
+			// about a wrist that is 7.8 uu from the blade's grip. At the viewmodel's ~32 px/uu that
+			// is the ~100 px of daylight the frames show.
+			//
+			// IT IS ALSO WHY THE CUBE FALLBACK LOOKS RIGHT AND THE PACK RIG DOES NOT, which had been
+			// blamed on the pack art: with no skeleton there is no wrist to move, the delta is
+			// identity by construction, and this multiply writes byte-for-byte what shipped before.
+			// So the fallback frames are the RED ARM for this change — they must not move at all.
+			//
+			// READ LIVE rather than off a cached member: GetViewModelWeaponDelta() re-reads the
+			// socket, because the character fills its cached copy on the ACTOR tick and this is a
+			// COMPONENT tick with no ordering guarantee against it. BuildPackHandsViewModel gives
+			// this component the same tick prerequisite on the hands mesh that the actor has, so the
+			// pose being read is this frame's.
+			//
+			// THE OFF-HAND ARM TAKES THE OTHER WRIST, and it has to: the two wrists are not rigid
+			// with each other (the character's HandsOffWristRestRig comment measures 20+ uu of
+			// divergence through a reload), so a blade in the left hand carried on the right wrist's
+			// delta is left behind on every reload. Note that with the shipped
+			// `bDualWieldKnife=False` this arm is not reached at all — the rest pose is the rig root
+			// and the blade is in the right hand, which is also what the pack's own
+			// unreal-hands_hands_stats.json authors ("knife": right = handle, left = open, free).
+			const FTransform Posed = KnifeRigPose *
+				(bDualWield ? Character->GetViewModelOffHandDelta() : Character->GetViewModelWeaponDelta());
+
+			KnifeViewRoot->SetRelativeLocationAndRotation(Posed.GetLocation(), Posed.GetRotation());
 		}
 	}
 

@@ -50,6 +50,7 @@
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Net/TraceLagCompensationComponent.h"
 #include "Settings/TraceGameUserSettings.h"    // ApplySavedFieldOfView(): the VIDEO page's FOV row
+#include "Settings/TraceUserSettings.h"        // spec v32 §7d: Trace.ViewModel.Equip reads the live binds
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "World/TraceArenaBuilder.h"          // SetBase(): the arena is not a moving platform
@@ -303,8 +304,77 @@ namespace TraceCharacterLayout
 	/** Slight muzzle-up, slight inward yaw, slight cant. A gun held dead square looks like a prop. */
 	const FRotator ViewModelRestRotation(2.f, -4.f, 5.f);
 
+	// --- WHERE A RIG POINT LANDS ON SCREEN, AS ONE EXPRESSION -------------------------------------
+	//
+	// *** THIS EXISTS BECAUSE THE ARITHMETIC ABOVE WAS DONE BY HAND, ONCE, FOR ONE POINT, AND THEN
+	//     GENERALISED TO POINTS IT WAS NOT TRUE OF. *** Twice now. The wedge shipped because one
+	//     forearm's elbow projection was quoted for both forearms (see HandsScale), and the pack
+	//     rig then shipped with a lit cuff band whose centre is 21 px BELOW the bottom edge and a
+	//     whole left forearm whose NEAREST end is 100 px below it — while a census line said both
+	//     were "drawn", because they are: drawn is not the same as in frame.
+	//
+	// So the framing check is a function now, and both the comments below and Trace.Hands.Probe call
+	// it rather than restating it. It is exactly the file header's own rule — "half-width of the
+	// frame at distance d is d * tan(FirstPersonFieldOfView / 2), and half-height is that times
+	// 9/16" — solved for the fraction instead of for the width, so the answer is a number that can
+	// be compared against 1 without knowing the resolution.
+	//
+	// The FIRST-PERSON lens, not the scene's: FirstPersonPrimitives are drawn through
+	// FirstPersonFieldOfView (80) and not CameraFOV (95), so projecting through the pawn camera —
+	// which is what APlayerController::ProjectWorldLocationToScreen would do — answers 16% too near
+	// the centre and would report an off-frame part as comfortably inside. FirstPersonScale does NOT
+	// enter: it scales the rig radially about the view origin, which moves depth and leaves the
+	// direction from the eye, and therefore the screen position, exactly where it was.
+	constexpr float ViewModelFrameAspect = 9.f / 16.f;
+
+	/**
+	 * A camera-space point as a fraction of the half-frame: X right, Y up, both in [-1, 1] when the
+	 * point is on screen. -1 is the bottom edge, +1 the top. Points behind the lens answer with a
+	 * huge magnitude rather than wrapping, so a caller that only tests |v| <= 1 cannot be fooled.
+	 */
+	inline FVector2D ViewModelFrameFraction(const FVector& CameraPoint)
+	{
+		const double Depth = FMath::Max(CameraPoint.X, 0.01);
+		const double HalfWidthPerUU = FMath::Tan(FMath::DegreesToRadians(FirstPersonViewModelFOV * 0.5f));
+		return FVector2D(
+			(CameraPoint.Y / Depth) / HalfWidthPerUU,
+			(CameraPoint.Z / Depth) / (HalfWidthPerUU * ViewModelFrameAspect));
+	}
+
 	/** Engine basic shapes are 100 uu; every Size below is a world size and divides by this. */
 	constexpr float ViewModelShapeUnit = 100.f;
+
+	// --- THE CONSTANT LIGHT THE VIEWMODEL SUPPLIES ITSELF -----------------------------------------
+	//
+	// *** THIS ARENA DOES NOT LIGHT THE INSIDE OF A PLAYER'S FACE, SO ANYTHING HELD THERE HAS TO
+	//     LIGHT ITSELF. *** The three directional lights total under 6 lux and none of them points
+	//     at the rig; a surface at the arena's own albedo held 50 uu from the lens is therefore a
+	//     black hole in the middle of the frame whatever its base colour is. The emissive term is
+	//     the only lighting term that does not depend on an angle of incidence, which is the whole
+	//     reason the procedural rig carries one — and the procedural rig is the one that photographs
+	//     correctly.
+	//
+	// NAMED HERE RATHER THAN TYPED INTO ViewModelBodyMID, because the pack rig needs the SAME number
+	// and did not have it. MI_Pack_shell and MI_Pack_carbon are exported with EmissiveColor (0,0,0)
+	// — read them in Scripts/import_pack.py, MATERIALS — so every non-glowing surface of
+	// SK_TraceHands renders as a silhouette: the palm, the fingers' bodies and the two forearm tubes
+	// bound to the glove's own shell. What survives is `plating` (base 0.254, glossy) and
+	// `circuit_cyan`, which is exactly the photographed complaint — a gun with some detached bright
+	// chips beside it and no hand anywhere. BuildHandsEmissive writes a floor onto the gloves' unlit
+	// slots for that reason.
+	//
+	// THE PACK'S TWO SURFACES ARE NOT BOTH ON THIS NUMBER, and the split is deliberate rather than
+	// drift: the SLEEVE (HandsArmMID) is, because it is the procedural rig's own tube in a different
+	// material and this is the value that tube photographs correctly at; the GLOVE is lifted above it
+	// (TraceCharacterLayout::HandsGloveEmissiveStrength) because it has to read against a weapon that
+	// is at this same near-black and the fallback fist never had one inside it.
+	//
+	// The two masters spell it differently and the product is what matters: M_TraceSurface takes
+	// "Emissive" x "EmissiveStrength", M_TraceRailgun (which every MI_Pack_* instances) takes
+	// "EmissiveColor" x "EmissiveIntensity", and the pack import folds strength into the colour and
+	// leaves intensity at a clean 1.0. So the pack side is written as the PRODUCT of these two.
+	const FLinearColor ViewModelBodyEmissiveColor(0.30f, 0.55f, 0.80f);
+	constexpr float ViewModelBodyEmissiveStrength = 0.030f;
 
 	/**
 	 * Where the FALLBACK cube gun's shot leaves, in rig space — the centre of the VMMuzzle ring.
@@ -333,33 +403,125 @@ namespace TraceCharacterLayout
 	/** One kick per shot however many code paths report the same shot. */
 	constexpr double FireKickRefractorySeconds = 0.02;
 
+	// --- THE ONE POINT EVERY WEAPON IS PLACED AGAINST ---------------------------------------------
+	//
+	/**
+	 * THE RIGHT HAND, IN RIG SPACE.
+	 *
+	 * It is VMHandR's position in the viewmodel parts table, and it is what HandsGripRig repeats for
+	 * the pack rig — EnsureViewModelBuilt() asserts all three equal. It is named HERE, above the
+	 * weapons rather than beside the hands, because every weapon origin below is
+	 * (this) - (that weapon's scale) x (that weapon's own grip landmark): a weapon can only ever be
+	 * placed where the hand already is, and resizing one can never slide it out of the fist.
+	 */
+	const FVector ViewModelRightHand(-0.8f, 0.f, -4.6f);
+
+	/**
+	 * *** THE WEAPON SIZE LAW, AND IT REPLACES TWO NUMBERS THAT WERE SIZED AGAINST EACH OTHER. ***
+	 *
+	 * WHAT WAS WRONG, AND IT IS IN THE FRAMES. RailgunScale 0.22 and SmgScale 0.30 were picked to
+	 * MATCH THE TWO GUNS' DRAWN LENGTHS — 185.1 x 0.22 = 40.7 uu against 128.5 x 0.30 = 38.6 uu — on
+	 * the argument that two guns the same size on screen read as siblings. Photographed, they read as
+	 * ONE gun: Saved/Screenshots/v31size_BEFORE_41_key1_pistol_idle.png and
+	 * v31size_BEFORE_44_key2_smg_idle.png — the two pre-fix frames, kept under a name the capture
+	 * harness cannot overwrite — put the same silhouette in the same corner of the frame at the same
+	 * length, and the SMG comes out 5% SHORTER than the pistol. In a shooter where which weapon you
+	 * are holding has to be legible in a glance, that is a defect and not a style.
+	 *
+	 * WHAT THE PACK SAYS, and it is the only outside authority there is. PACK_README.md: "The weapons
+	 * are authored larger than a human hand (pistol ~1.19 m, SMG ~1.25 m, Core 0.37 m against a
+	 * 0.19 m hand). The first-person preview scales them to 0.34 m / 0.50 m / 0.30 m to read
+	 * correctly." The pack therefore draws the SMG 47% LONGER than the pistol — the order every
+	 * shooter draws them in, and the exact opposite of what shipped.
+	 *
+	 * SO THESE ARE TARGET DRAWN LENGTHS NOW, NOT SCALES, and the scale is arithmetic on top:
+	 *
+	 *     scale = (target drawn length in rig uu) / (the mesh's own measured length in mesh cm)
+	 *
+	 * with the mesh lengths read off Intermediate/Railgun/railgun_manifest.json and
+	 * Intermediate/Smg/railgun_smg_manifest.json rather than off the README — the README's "pistol
+	 * ~1.19 m" disagrees with its own export, whose Body spans x = -77.7 .. +107.4 cm = 185.1 cm, and
+	 * the rule this file already keeps is that the measured number wins over the prose.
+	 *
+	 * THE PISTOL LANDS EXACTLY ON THE PACK'S NUMBER: 34.0 / 185.1 = 0.1837, drawn 0.340 m against the
+	 * pack's 0.190 m hand, a hand-to-weapon ratio of 0.56 — the pack preview's 0.56 to two places,
+	 * where the shipped rig was 0.47.
+	 *
+	 * THE SMG CANNOT, AND WHAT STOPS IT IS THE ONE MEASURED CONSTRAINT IN THIS FILE. The header's
+	 * depth rule — nothing in the viewmodel may be DRAWN deeper than the 34 uu capsule radius,
+	 * because past that it reaches surfaces the body itself cannot stand against — is a hard ceiling
+	 * on grip-to-muzzle length, and the SMG is the rig that hits it, because the SMG is the one being
+	 * GROWN — the pistol, which shrinks, walks away from the ceiling. The drawn depth of the SMG's
+	 * muzzle tip (63.02 cm ahead of the mesh origin, 93.02 cm ahead of the grip) is
+	 *
+	 *     ( ViewModelRestLocation.X 56 + ViewModelRightHand.X -0.8
+	 *       + scale x (muzzle tip 63.02 - grip -30.0) x cos(ViewModelRestRotation yaw 4 deg) )
+	 *     x FirstPersonViewModelScale 0.40
+	 *
+	 * — the same walk that measured 33.2 uu at SmgScale 0.30 — and it passes 34.0 uu at scale 0.3211.
+	 * SmgDrawnLengthUU 41.1 is scale 0.3198, i.e. that ceiling with half a millimetre of air under
+	 * it: the tip lands at 33.95 uu drawn.
+	 *
+	 * WHAT THAT BUYS AND WHAT IT DOES NOT. The SMG is drawn 0.411 m, not the pack's 0.500 m, so it is
+	 * 21% longer than the pistol rather than 47%. The ORDER is right, the two silhouettes are no
+	 * longer interchangeable, and for the first time BOTH weapons are inside the depth rule — the
+	 * shipped pistol measured 34.16 uu, i.e. it was over the rule the comment beside it cited. The
+	 * missing 9 cm is owed to a measured constraint rather than to taste: reaching the full 0.50 m
+	 * means pulling ViewModelRestLocation.X in from 56 to 49.6, which regrades the framing of the
+	 * hands and of all three loadouts at once and is not this fix's to spend.
+	 *
+	 * RETUNING IS THE TWO DRAWN LENGTHS. Everything downstream — the origins, the hinge and foregrip
+	 * offsets, the rail throw, the magazine drop, the muzzle markers and therefore ATraceTracer's
+	 * beam origin — is expressed against them and follows without being touched.
+	 */
+	constexpr float RailgunBodyLengthCm = 185.1f;   // railgun_manifest.json, Body x span
+	constexpr float SmgBodyLengthCm = 128.5f;       // railgun_smg_manifest.json, Body x span
+	constexpr float RailgunDrawnLengthUU = 34.0f;   // the pack preview's 0.34 m, exactly
+	constexpr float SmgDrawnLengthUU = 41.1f;       // the pack wants 50.0; the depth rule caps it here
+
 	// --- The railgun ------------------------------------------------------------------------------
 	//
 	// The blocky procedural gun above is the FALLBACK now. When the imported railgun art resolves,
 	// three static meshes stand in for the twelve gun cubes (the hands, knuckles, forearms and cuffs
 	// are still built from the table — they hold the new weapon, they were never part of it).
 	//
-	// SCALE. The source model is authored 1:1 in metres and measures 185 cm nose to tail, which is a
-	// real railgun and about six times the length of the cube gun it replaces. Everything is placed
-	// against the mesh's own measured landmarks, so these three numbers are the whole placement:
+	// SCALE. The source model is authored 1:1 in metres and measures 185.1 cm nose to tail, which is
+	// a real railgun and about six times the length of the cube gun it replaces. Everything is placed
+	// against the mesh's own measured landmarks, so these numbers are the whole placement:
 	//
-	//   grip     mesh-local (-30.0, 0, -9.0) uu   ->  rig (-0.8, 0, -4.6), the right hand
-	//   foregrip mesh-local (+30.0, 0, -4.5) uu   ->  rig, where the left hand is moved to
-	//   muzzle   mesh-local (107.4, 0, +4.5) uu   ->  rig  29.4 uu out, vs the cube gun's 19.6
+	//   grip     mesh-local (-30.0, 0, -9.0) cm   ->  rig (-0.8, 0, -4.6), the right hand
+	//   foregrip mesh-local (+30.0, 0, -4.5) cm   ->  rig, where the left hand is moved to
+	//   muzzle   mesh-local (107.4, 0, +4.5) cm   ->  rig 24.5 uu out (it was 29.4 at the old 0.22)
 	//
-	// RailgunOrigin is therefore not a taste value: it is (right hand) - RailgunScale * (grip).
-	constexpr float RailgunScale = 0.22f;
-	const FVector RailgunOrigin(5.8f, 0.f, -2.6f);
+	// RailgunOrigin is therefore not a taste value: it is (right hand) - RailgunScale * (grip), and
+	// it is now WRITTEN that way rather than pre-multiplied by hand, because the pre-multiplied
+	// literal is exactly what goes stale the first time the size law above is retuned.
+	constexpr float RailgunScale = RailgunDrawnLengthUU / RailgunBodyLengthCm;   // 0.1837
 
 	/** Mesh-local landmarks, in the mesh's own centimetres. Read out of railgun_manifest.json. */
+	const FVector RailgunGripLocal(-30.0f, 0.f, -9.0f);
 	const FVector RailgunMuzzleLocal(107.4f, 0.f, 4.5f);
+
+	const FVector RailgunOrigin = ViewModelRightHand - RailgunGripLocal * RailgunScale;
 
 	/**
 	 * The left hand moves off the cube gun's frame and onto the railgun's foregrip, dropped half the
 	 * foregrip's depth so the fist closes around it rather than resting on top.
+	 *
+	 * IN THE MESH'S OWN CENTIMETRES, like every other landmark here, so the support hand follows the
+	 * weapon when the weapon is resized. The foregrip is at mesh (+30.0, 0, -4.5); the -11.8 cm of Y
+	 * is the fist standing off the barrel axis and the extra -8.7 cm of Z is that half-depth drop.
+	 * At the old RailgunScale 0.22 this reproduces the hand-tuned rig points (12.4, -2.6, -5.5) and
+	 * (14.5, -2.6, -4.5) it replaces, to the millimetre.
+	 *
+	 * IT IS LIVE ONLY ON THE FALLBACK RIG. With the pack hands up the left glove is posed by the
+	 * animation and this is unused; with -TraceNoPackHands the cube left hand is placed here, and
+	 * that is the frame the railgun's two-hand hold was photographed in.
 	 */
-	const FVector RailgunLeftHand(12.4f, -2.6f, -5.5f);
-	const FVector RailgunLeftKnuckle(14.5f, -2.6f, -4.5f);
+	const FVector RailgunLeftHandLocal(30.0f, -11.8f, -13.2f);
+	const FVector RailgunLeftKnuckleLocal(39.6f, -11.8f, -8.6f);
+	const FVector RailgunLeftHand = RailgunOrigin + RailgunLeftHandLocal * RailgunScale;
+	const FVector RailgunLeftKnuckle = RailgunOrigin + RailgunLeftKnuckleLocal * RailgunScale;
 
 	// ---------------------------------------------------------------------------------------------
 	// [DUALWIELD] THE OFF HAND  (spec v28 §10: "Gun in one hand, knife in the other")
@@ -372,7 +534,7 @@ namespace TraceCharacterLayout
 	//
 	// WHERE IT GOES, AND WHY THESE THREE NUMBERS. Down and out to the left, forward of the frame:
 	//   x  +6.0   ahead of the right hand (-0.8) so the blade is not hidden behind the gun body, and
-	//             far short of the muzzle (19.6 cube / 29.4 railgun) so it never crosses the barrel.
+	//             far short of the muzzle (19.6 cube / 24.5 railgun) so it never crosses the barrel.
 	//   y  -9.6   nearly three times the -3.4 support pose. The rig itself hangs at y = +14.5 (the
 	//             lower RIGHT of frame), so this pulls the off hand back toward the screen centre —
 	//             which is where a low guard actually sits — without reaching the crosshair.
@@ -416,42 +578,51 @@ namespace TraceCharacterLayout
 	// reason the pistol's is — a gun placed by eye has to be re-placed by eye every time anything
 	// around it moves.
 	//
-	// SCALE, AND WHY 0.30 RATHER THAN THE PISTOL'S 0.22. The two models are authored at 1:1 in metres
-	// and are DIFFERENT LENGTHS — the railgun measures 185.1 cm nose to tail, the SMG 128.5 cm. Using
-	// one scale for both would draw the SMG at three quarters the pistol's on-screen size, which reads
-	// as a toy rather than as the other half of the same armoury. Matching the DRAWN LENGTH is what
-	// makes them siblings: 185.1 x 0.22 = 40.7 uu of camera depth against 128.5 x 0.30 = 38.5 uu.
+	// SCALE, AND IT IS THE LARGER OF THE TWO NOW. The two models are authored at 1:1 in metres and are
+	// DIFFERENT LENGTHS — the railgun measures 185.1 cm nose to tail, the SMG 128.5 cm — so a single
+	// scale would draw the SMG at three quarters the pistol's on-screen size. The v30 answer to that
+	// was to pick the two scales so the two DRAWN lengths matched (40.7 uu against 38.5 uu), and a
+	// photograph of the result is what retired it: two guns of the same length in the same corner of
+	// the frame are not siblings, they are the same gun. The size law above replaces both numbers
+	// with a target drawn length each, and the SMG's is 41.1 uu against the pistol's 34.0 — the
+	// pack's own order (its preview draws the SMG 0.50 m against the pistol's 0.34 m), as far toward
+	// the pack's own proportion as the depth rule allows.
 	//
 	// MEASURED, against the two checks the file header requires of every viewmodel constant, by
 	// walking all 1993 vertices of the four imported meshes through the rig transform:
 	//
-	//   DEPTH    deepest vertex at 82.9 uu -> 33.2 uu drawn at FirstPersonScale 0.40, inside the 34 uu
-	//            capsule radius, so no part of it can reach a surface the body cannot already stand
-	//            against. (The shipped RAILGUN measures 34.1 uu on the same walk, i.e. it is 0.1 uu
-	//            over the rule it documents. The SMG is the first rig in this project to keep it.)
-	//            Shallowest vertex 44.4 uu -> 17.8 uu, clear of the 10 uu near plane.
-	//   FRAMING  the highest point of the gun sits 31.5% of the frame's half-height BELOW the
-	//            crosshair (the pistol's is 35.8%); the requirement is a quarter. The nearest the
-	//            silhouette comes to the centre line is 13.2% of the half-width right of it, so no
-	//            part of the weapon ever touches the reticle.
-	//   AND IT LANDS WHERE THE PISTOL LANDS. The muzzle projects to 19% right of centre and 40% below
-	//            it; the railgun's is 18% / 41%. Two different guns, the same hold.
+	//   DEPTH    at the v30 scale 0.30 the deepest vertex sat at 82.9 uu -> 33.2 uu drawn at
+	//            FirstPersonScale 0.40. SmgDrawnLengthUU 41.1 is chosen to keep exactly that bound at
+	//            the new size: the muzzle tip lands at 33.9 uu drawn, inside the 34 uu capsule radius,
+	//            so no part of it can reach a surface the body cannot already stand against. (The
+	//            RAILGUN measured 34.1 uu at the old 0.22 — 0.1 uu OVER the rule it documents — and
+	//            comes back to 32.1 uu at 0.1837, so both rigs keep the rule now.) Shallowest vertex
+	//            44.4 uu -> 17.8 uu at 0.30, and it only recedes as the grip end shrinks toward the
+	//            hand, so the 10 uu near plane is clear by more than it was.
+	//   FRAMING  at 0.30 the highest point of the gun sat 31.5% of the frame's half-height BELOW the
+	//            crosshair (the pistol's was 35.8%); the requirement is a quarter. Growing the gun
+	//            about a grip that does not move raises that edge by the same 7% it grows, which is
+	//            inside the margin — and the pistol, which shrinks, only clears the reticle by more.
+	//   AND IT LANDS WHERE THE PISTOL LANDS. Both weapons hang off the same grip point at the same
+	//            rest pose, so the hold is identical; what differs between them now is length, which
+	//            is the entire point.
 	//
 	// PLACEMENT IS DERIVED, NOT CHOSEN. SmgOrigin = (right hand) - SmgScale * (grip landmark), the
 	// identical construction RailgunOrigin uses, so the mesh's own grip lands in the hand that is
-	// already there and the right hand does not move between the two weapons:
+	// already there and the right hand does not move between the two weapons — nor when either
+	// weapon is resized, which is the property that makes the size law above safe to retune:
 	//
-	//   grip     mesh-local (-30.0, 0, -8.5) uu  ->  rig (-0.8, 0, -4.6), the right hand
-	//   muzzle   mesh-local ( 58.8, 0, +4.5) uu  ->  rig 25.8 uu out, vs the railgun's 29.4
+	//   grip     mesh-local (-30.0, 0, -8.5) cm  ->  rig (-0.8, 0, -4.6), the right hand
+	//   muzzle   mesh-local ( 58.8, 0, +4.5) cm  ->  rig 27.6 uu out, vs the railgun's 24.5
 	//
 	// The grip and muzzle landmarks are the ones spec §2 names (+0.300 m and -0.588 m along the
 	// source's -Z), read out of railgun_smg_manifest.json rather than out of the prose: the kit's own
 	// README says the aperture is at -0.59 m, and the mesh says -0.588. 2 mm, but the measured one
 	// wins, which is the rule §1 states.
-	constexpr float SmgScale = 0.30f;
+	constexpr float SmgScale = SmgDrawnLengthUU / SmgBodyLengthCm;   // 0.3198
 	const FVector SmgGripLocal(-30.0f, 0.f, -8.5f);
 	const FVector SmgMuzzleLocal(58.8f, 0.f, 4.5f);
-	const FVector SmgOrigin(8.2f, 0.f, -2.05f);
+	const FVector SmgOrigin = ViewModelRightHand - SmgGripLocal * SmgScale;
 
 	// THE SUPPORT HAND NEEDS NO SMG CONSTANT OF ITS OWN, AND THAT IS A MEASUREMENT RATHER THAN
 	// LAZINESS. It only exists at all in the legacy build — under the v28 dual-wield switch the left
@@ -638,27 +809,42 @@ namespace TraceCharacterLayout
 	 * and 1.0 is that size. The pack's own first-person preview keeps the hands at 1.0 and shrinks the
 	 * WEAPONS to 0.34 m (pistol) / 0.50 m (SMG) / 0.30 m (Core) to make the proportion read.
 	 *
-	 * THIS RIG CANNOT TAKE THE PACK'S WEAPON SIZES, and that is a measurement rather than a
-	 * preference. The file header's depth rule — nothing in the viewmodel may be drawn deeper than the
-	 * 34 uu capsule radius once FirstPersonScale 0.40 is applied — puts a hard ceiling on how long a
-	 * weapon may be: the SMG already reaches 33.2 uu drawn at SmgScale 0.30, and growing it to the
-	 * pack's 0.50 m (SmgScale 0.389) would put its deepest vertex at ~43 uu, i.e. reaching through
-	 * walls the body cannot touch. So the SHIPPED weapon scales stand and the hand is sized against
-	 * them instead, which is also the smaller change: RailgunScale and SmgScale are load-bearing for
-	 * the muzzle markers, for ATraceTracer's beam origin and for two verifiers, and none of that is
-	 * §6's to retune.
+	 * *** THE PARAGRAPH THAT USED TO STAND HERE DECLINED TO RESIZE THE WEAPONS, AND IT WAS THE
+	 * WRONG HALF OF THE TRADE. *** It argued that the depth rule — nothing in the viewmodel may be
+	 * drawn deeper than the 34 uu capsule radius once FirstPersonScale 0.40 is applied — capped the
+	 * SMG below the pack's 0.50 m, and concluded from that cap that BOTH shipped weapon scales should
+	 * stand and the hand be sized against them. Two things were wrong with it. The cap is real but it
+	 * was overstated: 0.389 puts the SMG's deepest vertex at 36.6 uu drawn, not the ~43 uu claimed,
+	 * because the arithmetic forgot that SmgOrigin slides back toward the hand as the gun grows. And
+	 * a cap on ONE weapon is not a reason to leave the OTHER at a size that made the two guns the
+	 * same length on screen. The weapons are sized now — see the weapon size law beside RailgunScale
+	 * — and the hand keeps the pack's own 1.0.
+	 *
+	 * NOTHING DOWNSTREAM OF THE WEAPON SCALES HAD TO BE RETUNED BY HAND, which is the other half of
+	 * why that paragraph was too cautious: the muzzle markers are children of the weapon bodies at
+	 * their mesh-local landmarks, ATraceTracer reads the marker's world transform, and the origins,
+	 * hinge offsets, rail throw and magazine drop are all expressed in mesh centimetres times the
+	 * scale. Every one of them followed.
 	 *
 	 * WHAT 1.0 ACTUALLY PRODUCES, measured through the full rig transform at every one of the twenty
 	 * clips:
-	 *   * hand 19.0 uu drawn against the railgun's 40.4 uu and the SMG's 38.6 uu — ratios 0.47 and
-	 *     0.49, against the pack preview's 0.56 and 0.38. The SMG is very slightly LARGER than the
-	 *     pack wants relative to the hand and the pistol slightly smaller, because our "pistol" is a
-	 *     1.84 m carbine rather than the pack's 1.21 m sidearm.
+	 *   * hand 19.0 uu drawn against the railgun's 34.0 uu and the SMG's 41.1 uu — ratios 0.56 and
+	 *     0.46, against the pack preview's 0.56 and 0.38. The pistol is now exactly the pack's
+	 *     proportion; the SMG is as close to its 0.38 as the depth rule permits, and it is at last on
+	 *     the correct side of the pistol. (It was 0.47 and 0.49 — a pistol 20% too long and an SMG
+	 *     23% too short, i.e. the two guns in the wrong order.)
 	 *   * DEPTH, at rest: the shallowest ON-SCREEN point is 10.50 uu drawn (the right forearm in
-	 *     Idle_Smg), clear of the 10 uu near plane; the deepest is 26.10 uu, well inside 34. The
-	 *     forearms' far ends do fall to 7.55 uu, and they are 264% of the frame's half-height BELOW
-	 *     centre while they do — off screen, which is exactly where the procedural rig's forearms
-	 *     were documented to run too.
+	 *     Idle_Smg), clear of the 10 uu near plane; the deepest is 26.10 uu, well inside 34.
+	 *
+	 *     *** THE SENTENCE THAT USED TO FOLLOW THIS ONE WAS WRONG, AND IT IS WHY THE WEDGE SHIPPED. ***
+	 *     It read: "the forearms' far ends do fall to 7.55 uu, and they are 264% of the frame's
+	 *     half-height BELOW centre while they do — off screen". That is true of forearm_LEFT, whose
+	 *     elbow corners project to py 1212-1645 on a 900 px frame. It is FALSE of forearm_RIGHT,
+	 *     whose four elbow corners land at py 732, 799, 924 and 996 — two of them on screen — because
+	 *     that arm points BACK AT THE LENS rather than downward. One arm's arithmetic was generalised
+	 *     to both, and the frame nobody took would have said so in a second. The two forearms are now
+	 *     not drawn at all (HandsHiddenBones, where the full measurement is); with them gone the
+	 *     shallowest DRAWN point of the rig is 14.81 uu, so nothing is near-plane clipped either.
 	 *   * The one exception, stated rather than hidden: Walljump_* plants the LEFT palm toward the
 	 *     wall, which brings on-screen geometry to 8.03 uu drawn for about a fifth of that 0.85 s
 	 *     clip. It is the authored motion — "left palm plants flat on the wall, shoves off" — and no
@@ -682,17 +868,238 @@ namespace TraceCharacterLayout
 	const FVector HandsFistLocal(4.47f, -8.13f, -4.68f);
 
 	/**
-	 * WHERE THAT FIST GOES IN RIG SPACE — and it is not a new number, it is the one the rig already
-	 * had. (-0.8, 0, -4.6) is where VMHandR sits in the procedural parts table, and it is the point
-	 * RailgunOrigin and SmgOrigin were both DERIVED from ("origin = right hand - scale x grip
-	 * landmark"), so both weapons already put their grips exactly here.
+	 * WHERE THAT FIST GOES IN RIG SPACE — and it is not a new number, it is ViewModelRightHand, the
+	 * one point the whole viewmodel is built around. (-0.8, 0, -4.6) is where VMHandR sits in the
+	 * procedural parts table, and it is what RailgunOrigin and SmgOrigin are DERIVED from ("origin =
+	 * right hand - scale x grip landmark"), so both weapons put their grips exactly here whatever
+	 * size they are drawn at.
 	 *
-	 * Placing the real fist on it is therefore the whole placement: the shipped guns do not move by
-	 * a millimetre, their muzzle markers do not move, the framing that was tuned and photographed for
-	 * v20 and v30 is untouched, and the hand closes around the grip that was already there. The
-	 * checkf in EnsureViewModelBuilt() is what keeps this equal to the table if anyone edits either.
+	 * IT IS AN ALIAS RATHER THAN A COPY, deliberately: the two used to be the same three literals
+	 * typed twice, and the failure mode of them drifting apart is a fist closed on empty air next to
+	 * a floating gun. Placing the real fist on it is therefore the whole placement — the guns do not
+	 * move when the hands are rebuilt, their muzzle markers do not move, and the hand closes around
+	 * the grip that was already there. The checkf in EnsureViewModelBuilt() is what keeps this equal
+	 * to the parts table if anyone edits either.
 	 */
-	const FVector HandsGripRig(-0.8f, 0.f, -4.6f);
+	const FVector HandsGripRig = ViewModelRightHand;
+
+	/**
+	 * *** THE ARMS THE PACK DOES NOT GIVE US, AIMED THE WAY A VIEWMODEL NEEDS. ***
+	 *
+	 * With forearm_right / forearm_left hidden (HandsHiddenBones) the pack rig is two gloves and
+	 * nothing else, and two gloves with no arms float. The procedural rig already solved this and its
+	 * solution was photographed working: two short tubes leaving the hands DOWNWARD and BACKWARD, off
+	 * the bottom of the frame within a few centimetres. So the same two tubes are drawn under the pack
+	 * hands — re-anchored onto the pack's own rig, and in the pack's own `shell` material so the arm
+	 * and the glove read as one object rather than as a plastic tube pushed into a carbon glove. (The
+	 * same material, at a lower emissive floor than the glove's: see HandsArmMID for why the sleeve
+	 * and the hand had to stop sharing one instance.)
+	 *
+	 * *** THE PACK ARMS USED TO BORROW THE PROCEDURAL RIG'S DIRECTIONS AND THAT PUT THE SLEEVE IN
+	 *     FRONT OF THE FIST. ***
+	 *
+	 * They were (-0.42, 0.36, -0.86) and (-0.40, -0.38, -0.86): 60 degrees below horizontal and, in
+	 * the X term, LEANING BACK TOWARD THE LENS. On the cube rig that is harmless — the cube hand and
+	 * the cube wrist are the same point, so a tube leaving it backwards leaves from the front of the
+	 * hand and nothing of the hand is behind it. On the PACK rig they are not the same point, and the
+	 * difference is the whole defect:
+	 *
+	 *     wrist_right   rig (-6.88, -0.17, -1.19)   camera depth 49.1   screen u +0.36  v -0.66
+	 *     the fist      rig (-0.80,  0.00, -4.60)   camera depth 55.2   screen u +0.31  v -0.71
+	 *
+	 * The fist is 6 uu DEEPER than the wrist it hangs off and slightly LEFT of and BELOW it, and a
+	 * 6.26 uu tube leaving that wrist downward subtends u +0.27..+0.42 at its near cap — which
+	 * contains the fist — while standing 6 uu nearer the lens than the fist does. So the sleeve won
+	 * the depth test over the hand and the hand was drawn INSIDE it: photographed at 5x in
+	 * Saved/Screenshots/v33handsBEFORE_41_key1_pistol_idle.png, where the palm is simply not there and
+	 * the glove's fingers stick out to the left of a black cylinder. That is the "no palm anywhere"
+	 * verdict, and no amount of lighting the glove fixes it, because the palm is not dark — it is
+	 * OCCLUDED. (Round 1 of this fix lit the glove and photographed exactly the same hole.)
+	 *
+	 * TWO CHANGES FOLLOW FROM IT AND THEY ARE BOTH RULES RATHER THAN VALUES.
+	 *
+	 *   1. THE RIGHT ARM ANCHORS ON THE FIST, NOT ON THE WRIST — HandsGripRig, the one point the whole
+	 *      viewmodel is built around, which is also the DEEPEST point of the hand. Anchored there, the
+	 *      tube's near cap is buried inside the closed fist (that is what a fist centroid IS) and
+	 *      every point of the tube is at least as deep as the hand, so the glove draws over the
+	 *      sleeve instead of the sleeve over the glove. It costs nothing to carry: the grip is rigid
+	 *      with wrist_right, so the same HandsWristDelta still moves it.
+	 *
+	 *   2. NEITHER ARM MAY LEAN TOWARD THE LENS AGAIN. X is +0.10 on both now instead of -0.4: the
+	 *      tube recedes very slightly as it falls, so its far end is its DEEPEST point rather than its
+	 *      nearest. That is the same mistake the pack's own forearms made in the extreme
+	 *      (HandsHiddenBones: camera axis (-0.99, -0.01, +0.17), straight at the eye) and it is worth
+	 *      stating as a rule because it is the third time it has been paid for.
+	 *
+	 * WHAT THAT DOES TO THE THREE MEASURED BOUNDS, all recomputed through the same projection the
+	 * numbers below were solved with:
+	 *
+	 *                       band v @ 5.7uu     far end v @ 19/18uu    far end DRAWN depth
+	 *     right, was          -0.92               -1.10  (in frame!)      16.9 uu
+	 *     right, now          -0.91               -1.36                   22.8 uu
+	 *     left,  was          -1.47               -1.67                   13.5 uu
+	 *     left,  now          -1.44               -1.93                   17.4 uu
+	 *
+	 * The band lands where HandsArmCuffAlongUU solved for it either way, both far ends leave the
+	 * frame EARLIER than before, and the near-plane margin roughly doubles. That last column is not a
+	 * bonus: the file records that Walljump_* used to bring on-screen geometry to 8.03 uu drawn, i.e.
+	 * INSIDE the 10 uu near plane, and it did that because the arm was travelling toward the lens
+	 * while the clip threw the hand at the wall. An arm that only ever recedes cannot do it.
+	 *
+	 * LENGTH is 19 / 18 uu, unchanged. From the new right anchor the tube crosses the bottom edge at
+	 * t = 8.3 uu and runs to 19, so more than half of it is out of frame — which is what "the arms run
+	 * off the bottom of the frame" is supposed to mean.
+	 *
+	 * DIAMETER is one number for both arms and it is the pack's, not a taste value: forearm_right is
+	 * authored 7.0 x 5.6 uu in cross-section, and sqrt(7.0 x 5.6) = 6.26 is the round tube of equal
+	 * area. Kept at 6.26 through the re-aim even though the tube reads THINNER now (107 px of a 1600
+	 * px frame against 145 before), because the change is honest perspective — the sleeve is 7 uu
+	 * further from the lens — and not a second, hidden taste value laid on top of a measured one.
+	 *
+	 * THE LIT BAND STAYS, AND IT IS THE GLOVE'S OWN CIRCUIT. The procedural rig puts a neon ring on
+	 * each arm and the frame it produces is the composition this work is measured against — without
+	 * it a shell-material tube is a black silhouette, because `shell` is authored near-black
+	 * (0.041, 0.056, 0.078) and has no detail to catch a light. It is bound to the glove's own
+	 * circuit_cyan dynamic instance rather than to the arena's neon, so it breathes on the idle
+	 * curve and flares on an action with the rest of the glove.
+	 *
+	 * *** AND THE SENTENCE THAT USED TO SIT HERE PUT THAT BAND OFF THE BOTTOM OF THE SCREEN. ***
+	 * It read: "SK_TraceHands' own cuff_right / cuff_light_right sit AT the wrist and reach about
+	 * 6 uu past it, so the band goes 9 uu down the arm, where it reads as a band on a sleeve." The
+	 * clearance is real. 9 uu is not where it puts you. See HandsArmCuffAlongUU: the band's centre
+	 * lands 5% of the half-frame BELOW the bottom edge, so what shipped was a black tube with no
+	 * band on it at all — "a gun floating with some chips beside it", photographed in
+	 * Saved/Screenshots/prefix_41_key1_pistol_idle.png and prefix_44_key2_smg_idle.png.
+	 */
+	constexpr float HandsArmLengthRightUU = 19.f;
+	constexpr float HandsArmLengthLeftUU = 18.f;
+	constexpr float HandsArmDiameterUU = 6.26f;
+
+	/**
+	 * The two re-aimed pack directions, normalised in place by the builder. X is POSITIVE on both and
+	 * that sign is the rule, not the magnitude — see the two numbered changes above. Kept as named
+	 * constants rather than as literals in the Forearms table because the table's other row is the
+	 * cube rig's, which must keep the directions it was photographed with.
+	 */
+	const FVector HandsArmDirectionRight(0.10f, 0.30f, -0.949f);
+	const FVector HandsArmDirectionLeft(0.10f, -0.30f, -0.949f);
+
+	/**
+	 * *** HOW FAR DOWN EACH ARM THE LIT BAND SITS — SOLVED AGAINST THE FRAME, NOT CHOSEN. ***
+	 *
+	 * The band is the whole readability of the arm (the paragraph above says why), so the only
+	 * requirement that matters is that it be IN the frame, and the fallback rig is the worked
+	 * example because its band is the one that photographs correctly.
+	 *
+	 * RUN ViewModelFrameFraction ALONG EACH TUBE — the vertical fraction is the number, -1 being the
+	 * bottom edge:
+	 *
+	 *            anchor         band            frame edge      band height
+	 *   cube R   v -0.66 @ 2    v -0.90 @ 5     v -1 @ ~7.4     36 px of 900   <- ships, reads
+	 *   pack R   v -0.66 @ 0    v -1.05 @ 9     v -1 @ ~8.0     38 px of 900   <- v31, invisible
+	 *   pack R   v -0.66 @ 0    v -0.90 @ 5.7   v -1 @ ~8.0     37 px of 900   <- v32, a puck
+	 *   pack R   v -0.71 @ 0    v -0.99 @ 8.0   v -1 @ ~8.3     36 px of 900   <- this constant
+	 *
+	 * So the pack band was placed at the fallback band's OWN frame fraction, -0.90, solved on the
+	 * pack's anchor instead of copied as a distance: 5.7 uu down a 19 uu tube whose wrist starts
+	 * 6 uu nearer the lens and 3 uu higher than the cube hand's.
+	 *
+	 * *** AND THEN RE-AIMING THE ARM TOOK THE TUBE OUT FROM UNDER IT AND TURNED IT INTO A LAMP. ***
+	 *
+	 * -0.90 was solved for a tube that LEANED TOWARD THE LENS and crossed the frame in front of the
+	 * hand: a black cylinder needing one lit ring to be legible at all, seen edge-on, with tube above
+	 * the ring and tube below it. Anchoring the right arm on the fist and giving both arms a positive
+	 * X (HandsArmLengthRightUU) changed all three of those facts at once. The tube now leaves from
+	 * INSIDE the glove and recedes, so (a) the length of it above the band is hidden behind the hand,
+	 * and (b) it is seen nearly face-on, so the band presents its full disc rather than its edge.
+	 * Photographed at 5.7 the result is a bright ellipse sitting directly under the fist with no
+	 * visible sleeve joining them — a hand standing on a glowing puck, and the second-brightest object
+	 * in the frame after the arena's own strip lights.
+	 *
+	 *            band centre v      what is above it            what the band reads as
+	 *   at 5.7      -0.89           nothing — the glove          a pedestal under the hand
+	 *   at 8.0      -0.99           ~60 px of visible sleeve     a cuff at the frame edge
+	 *
+	 * 8.0 puts the band's CENTRE on the bottom edge instead of a band-height clear of it, so its top
+	 * half lights the last visible inch of sleeve and its bottom half is off screen. That is the
+	 * requirement now — the arm is legible because the hand it grows out of is legible, and the band's
+	 * job has shrunk from "be the whole arm" to "be where the arm leaves the frame".
+	 *
+	 * THE STAND-OFF CAME DOWN WITH IT, 2.0 -> 1.2. The 2.0 was bought to clear a 12 uu glove, because
+	 * the band used to sit only 5.7 uu from a wrist that is buried in one. Eight uu down a receding
+	 * tube there is no glove within reach, and 2.0 uu proud on a 6.26 uu tube is a ring almost a third
+	 * again as wide as the arm it is on — which is the other half of why it read as a disc rather than
+	 * as a cuff. 1.2 is still comfortably clear of the sleeve and no longer out-measures it.
+	 *
+	 * *** THE LEFT ARM CANNOT BE FIXED BY MOVING ITS BAND AND THAT IS NOT A BUG IN THIS CONSTANT. ***
+	 * The pack's left WRIST rests at rig (-14.42, -13.64, -8.64), which is v = -1.22 — the arm's
+	 * NEAREST point is already a fifth of the half-frame below the bottom edge, and every point
+	 * further along it is lower. No band position and no direction puts a left forearm on screen from
+	 * there, because THE LEFT HAND IS NOT ON SCREEN EITHER: the pack authors pistol and SMG as
+	 * one-handed holds ("every weapon is a right-handed one-hand hold" — unreal-hands_README.md) and
+	 * the free hand hangs below the frame. The tube is still built and still rides
+	 * HandsOffWristDelta, so it arrives with the hand for the Core cradle and the wall jump, which
+	 * are the clips that raise it. Trace.Hands.Probe prints this fraction per part so that "the
+	 * census says VMForearmL is drawn" can never again be read as "there is a left forearm in frame".
+	 */
+	constexpr float HandsArmCuffAlongUU = 8.0f;
+	constexpr float CubeArmCuffAlongUU = 5.f;
+	constexpr float HandsArmCuffProudUU = 1.2f;
+	constexpr float CubeArmCuffProudUU = 0.8f;
+
+	/**
+	 * *** HOW BRIGHT THE GLOVE'S OWN BODY IS LIT, AND WHY IT IS NOT ViewModelBodyEmissiveStrength. ***
+	 *
+	 * The unlit floor exists because MI_Pack_shell and MI_Pack_carbon export with EmissiveColor
+	 * (0,0,0) and this arena puts under 6 lux on the inside of a player's face, so the palm, the back
+	 * of the hand and the fingers' bodies render as a silhouette (the full argument is on
+	 * ViewModelBodyEmissiveColor). That floor shipped at ViewModelBodyEmissiveStrength — the
+	 * procedural rig's own number — on the reasoning that "one value, one place, two rigs" was the
+	 * conservative choice.
+	 *
+	 * *** IT IS THE WRONG NUMBER FOR A HAND THAT IS HOLDING SOMETHING, AND THE KNIFE FRAME IS THE
+	 *     PROOF. *** With no gun in it (Saved/Screenshots/v31integ_47_key3_knife_idle.png) the pack
+	 * glove at that floor reads perfectly well: the back of the hand is a solid lit panel and the
+	 * fingers hang off it. Put a weapon in the same hand
+	 * (v31integ_41_key1_pistol_idle.png / _44_key2_smg_idle.png) and the hand disappears — because
+	 * MI_Railgun_shell is NOT given the floor (deliberately: see PackShellSlot) and is therefore at
+	 * almost exactly the same near-black as the glove. Grip and fist become one undifferentiated dark
+	 * mass with the glove's `plating` chips and `circuit_cyan` runs floating on it, which is what an
+	 * adversarial verifier photographed as "5-6 detached white/cyan plates alongside the grip with no
+	 * palm anywhere".
+	 *
+	 * So the requirement is not "bright enough to see against a black arena" — the old number met
+	 * that. It is "bright enough to READ AGAINST THE WEAPON IT IS HOLDING", and the weapon is the
+	 * thing the old number was equal to. The gloves are lifted clear of it and the guns are not, which
+	 * is the whole point: the fist is now the lightest solid mass in the frame and the gun is the
+	 * silhouette it is drawn on, exactly as the fallback rig's fist-over-gun reads.
+	 *
+	 * THE SLEEVE STAYS DOWN AT THE OLD NUMBER (HandsArmMID). The two tubes are the largest objects in
+	 * the viewmodel and they are drawn nearer the lens than anything else in it, so lifting them with
+	 * the glove would simply move the frame's brightest mass from the hand to the arm. The step
+	 * between them lands at the wrist, under the glove's own cuff plate and the lit band, which is
+	 * where a sleeve-to-glove change of material belongs.
+	 *
+	 * *** HOW FAR TO LIFT IT WAS BRACKETED AND NOT GUESSED, AND THE FIRST GUESS WAS 80% TOO HIGH. ***
+	 * Photographed at 0.30x, 0.60x and 1.00x of a first guess of 0.115 through this section's own live
+	 * knob (three walks, no rebuild — that is what the knob is FOR), and measured as the median
+	 * luminance of the 90x90 px block the fist occupies at Idle_Pistol:
+	 *
+	 *     the gun / the shipped floor   33      the state the "no palm" frames were taken in
+	 *     0.30x  (0.035)                34      indistinguishable from it; not worth the change
+	 *     0.60x  (0.069)                57      a hand that is plainly lighter than the gun in it
+	 *     1.00x  (0.115)                84      pale plastic; the glove out-values the weapon
+	 *
+	 * 0.065 is the 0.60x column. The target is not "bright": the procedural fallback's fist medians
+	 * SIXTEEN and reads perfectly, because a big flat cube reads by silhouette. This glove cannot —
+	 * it is thirty small facets with bright chips on them — so it needs enough separation from the
+	 * weapon to read as one object, and no more. Twice the gun is that; four times is a lamp.
+	 *
+	 * LIVE, because this is a taste value in a lighting rig and the shipped idiom for those in this
+	 * module is a CVar (Trace.Core.FxGeometry, Trace.Fx.BeamScale): Trace.Hands.GloveFloor multiplies
+	 * it, so re-tuning is -dpcvars and not a rebuild. See CVarTraceHandsGloveFloor.
+	 */
+	constexpr float HandsGloveEmissiveStrength = 0.065f;
 
 	// --- Clip timing.  AUTHORED LENGTHS, MEASURED OFF THE GLB, NOT COPIED FROM THE PROSE ----------
 	//
@@ -759,6 +1166,90 @@ namespace TraceCharacterLayout
 	/** Jump 0.70 s, wall jump 0.85 s, both as authored and both one-shots. */
 	constexpr float HandsJumpAuthoredSeconds = 0.700f;
 	constexpr float HandsWalljumpAuthoredSeconds = 0.850f;
+
+	// --- The gloves' emissive  (spec v32 §5) ------------------------------------------------------
+	//
+	// unreal-fx_README, "Gloved hands", in full:
+	//
+	//     "Idle 0.95-1.15x, rising to 2.7x cyan / 2.1x amber at the peak of any action. Drive it from
+	//      the same curve as the weapon so hands and weapon pulse together."
+	//
+	// and unreal-hands_README's own table, which is the finer-grained version of the same sentence
+	// and is where amber's idle band comes from — the FX doc quotes only cyan's:
+	//
+	//     | State      | circuit_cyan   | core_amber   |
+	//     | Idle       | 0.95-1.15x     | 0.9-1.1x     |
+	//     | Mid-action | up to 2.7x     | up to 2.1x   |
+	//
+	// 1.0 IS REST ON EVERY MI_Pack_* INSTANCE. The import folded the KHR emissive strengths (cyan
+	// 1.5, amber 1.4) into EmissiveColor precisely so this scalar could mean "multiplier on rest", so
+	// these numbers go into the parameter literally — the same convention TraceKnifeView's constants
+	// block states for the blade, and the reason the gloves and the knife can share a material.
+	constexpr float HandsCyanIdleLow  = 0.95f;
+	constexpr float HandsCyanIdleHigh = 1.15f;
+	constexpr float HandsCyanPeak     = 2.70f;
+
+	constexpr float HandsAmberIdleLow  = 0.90f;
+	constexpr float HandsAmberIdleHigh = 1.10f;
+	constexpr float HandsAmberPeak     = 2.10f;
+
+	/** Midpoints — what a rig writes at BUILD time, before any clock exists to breathe against. */
+	constexpr float HandsCyanIdleMid  = 0.5f * (HandsCyanIdleLow + HandsCyanIdleHigh);
+	constexpr float HandsAmberIdleMid = 0.5f * (HandsAmberIdleLow + HandsAmberIdleHigh);
+
+	/**
+	 * The idle breath, in RADIANS PER SECOND, and it is a function of the world clock rather than an
+	 * accumulator — ATraceCore::UpdateCoreArtEmissive argues this at length and the argument is the
+	 * same here: an accumulator drifts, double-advances across a hitch, and desynchronises between
+	 * machines, while sin(t*w) is the same value everywhere at the same instant and cannot drift
+	 * because it remembers nothing.
+	 *
+	 * 2.0 s per cycle, matching the Core's "slow ~2 s cycle" — the two are the same body's idle and
+	 * beating at visibly different rates in one frame would read as a bug rather than as a choice.
+	 */
+	constexpr float HandsIdleBreathRadPerSecond = 2.f * PI / 2.0f;
+
+	/**
+	 * WHERE A HAND ACTION PEAKS, as a FRACTION of its clip, for the actions that have no weapon curve
+	 * to borrow (see GetHandsActionPulse).
+	 *
+	 * *** IT IS NOT A NUMBER AT ALL ANY MORE: IT IS THE BLADE'S OWN CONSTANT. *** This used to read
+	 * `= 0.35f` with a comment saying it was a knowing duplicate of the knife's StabPeakFraction,
+	 * which lived in TraceKnifeView.cpp's file namespace and could not be reached. The v32
+	 * integration pass published it as TraceKnifeView::StabPeakFraction, so the glove and the blade
+	 * now peak on the same frame of a stab BECAUSE THERE IS ONE NUMBER, not because two files were
+	 * given equal values — and a re-tune of the blade moves the glove with it, which is Demo 21's
+	 * standing rule about derived values applied to a presentation seam.
+	 *
+	 * The hand clip and A_Knife_Stab are both 0.300 s and both played at rate 1.0, which is what
+	 * makes one fraction serve both.
+	 *
+	 * It generalises honestly to the rest: every one of these clips is an impulse and a recovery
+	 * (a thrust snapping back, a magazine dropping, a shove off a wall), so the front third is where
+	 * the energy is in all of them.
+	 */
+	constexpr float HandsActionPeakFraction = TraceKnifeView::StabPeakFraction;
+
+	/**
+	 * The hump itself: 0 at both ends of the clip, 1 at HandsActionPeakFraction. Triangle for
+	 * triangle UTraceKnifeViewSubsystem::StabFlare, off the same peak fraction, which is what lets a
+	 * verifier grade the glove against the blade with one formula.
+	 *
+	 * IT IS A FUNCTION OF AN ALPHA HANDED TO IT, and never of a member. That is deliberate: its two
+	 * callers both live inside UpdateHandsAnimation, at the two places a hand pose is actually
+	 * written to the component, so the value published for a frame is by construction the value of
+	 * the pose that frame DREW. When this shape was a member read from a second function later in the
+	 * tick it was a frame late to be told the clip had moved — see HandsClipPulseNorm.
+	 */
+	inline float HandsActionFlare(float Alpha01)
+	{
+		const float Alpha = FMath::Clamp(Alpha01, 0.f, 1.f);
+		const float Shaped = (Alpha <= HandsActionPeakFraction)
+			? (Alpha / FMath::Max(KINDA_SMALL_NUMBER, HandsActionPeakFraction))
+			: (1.f - (Alpha - HandsActionPeakFraction)
+				/ FMath::Max(KINDA_SMALL_NUMBER, 1.f - HandsActionPeakFraction));
+		return FMath::Clamp(Shaped, 0.f, 1.f);
+	}
 }
 
 namespace TraceCharacterAssets
@@ -859,6 +1350,45 @@ namespace TraceCharacterAssets
 
 	/** The off hand, reported through GetViewModelOffHand() so the knife rig lands on a real hand. */
 	const FName HandsOffHandBone(TEXT("wrist_left"));
+
+	/**
+	 * *** THE TWO BONES THIS RIG DOES NOT DRAW, AND THE FRAME THAT SAYS WHY. ***
+	 *
+	 * The pack's export carries its own forearms: two 8-vertex boxes, 7.0 x 5.6 x 21.5 uu each,
+	 * material `shell`, hanging off hand_right / hand_left as CHILDLESS LEAVES. They were meant to be
+	 * the arm, and in a preview rendered from the side they are. In THIS rig they are not, because
+	 * this rig's camera looks down the arm.
+	 *
+	 * MEASURED, at Idle_Pistol, through the full transform chain (HandsYaw 90 -> HandsLocation ->
+	 * ViewModelRestRotation/Location -> FirstPersonViewModelFOV 80):
+	 *   * forearm_right's long axis in CAMERA space is (-0.99, -0.01, +0.17). It points BACK AT THE
+	 *     EYE with essentially no downward component, so instead of leaving the bottom of the frame
+	 *     it flies at the lens and perspective flares it from 157 px wide at the wrist (48.5 uu real
+	 *     depth) to 273 px at the elbow (27.3 uu). That trapezoid — 59,860 px, 4.16% of a 1600x900
+	 *     frame, 81% of every pixel the whole hand rig draws — is the flat salmon WEDGE that the
+	 *     shipped pack-hands frames have across them. It is not a skinning fault, not a material
+	 *     fault and not a wrong slot: `shell` is bound correctly and its base colour is near-black.
+	 *     It is a big untextured face catching the arena's warm rim light.
+	 *   * forearm_left's elbow corners sit at 7.80-9.05 uu DRAWN depth, i.e. INSIDE the 10 uu near
+	 *     plane, so the renderer cuts them open. That is the hard straight-edged salmon roof at the
+	 *     bottom of the same frames.
+	 *
+	 * Compare the procedural fallback's forearms, which are 60 degrees below horizontal on
+	 * (-0.42, 0.36, -0.86) and run off the bottom of a 900 px frame within 17 uu of the hand. That is
+	 * what a viewmodel arm is supposed to do, and it is why the fallback frame reads as hands holding
+	 * a gun while the pack frame reads as a wedge with a gun behind it.
+	 *
+	 * SO THE FOREARMS ARE HIDDEN AND THE CUFFS ARE KEPT. cuff_right / cuff_light_right are SIBLINGS
+	 * under hand_right, not children, so hiding these two leaves the lit wrist band that gives the
+	 * hand a clean cut-off — the same silhouette the fallback's neon cuff rings draw. Hiding is done
+	 * per BONE and not per SECTION on purpose: Scripts/import_pack.py sets keep_sections_separate =
+	 * False, so slot 0 `shell` is 22 nodes carrying BOTH forearms AND both palms AND ten finger
+	 * segments, and hiding it would take the hands with it.
+	 *
+	 * Neither bone has children and neither is wrist_right, so nothing that places a weapon depends
+	 * on them: UpdateWeaponsFollowHands composes every gun part from wrist_right alone.
+	 */
+	const FName HandsHiddenBones[] = { FName(TEXT("forearm_right")), FName(TEXT("forearm_left")) };
 
 	/**
 	 * THE TWENTY CLIPS, IN THE ORDER ResolveHandsClip() INDEXES THEM. The order is a contract between
@@ -966,11 +1496,111 @@ namespace TraceCharacterAssets
 	static_assert(UE_ARRAY_COUNT(HandsClipAuthoredSeconds) == HandsClip_Count,
 		"The hand clip length table and the index enum have drifted apart.");
 
+	/**
+	 * The two roots of the pack rig. unreal-hands_hands_stats.json, "rig": { "roots": ["hand_right",
+	 * "hand_left"] } — each side hangs off its own root, so one hidden root takes that whole hand
+	 * with it (palm, five digits, cuff, cuff light) and touches nothing on the other side.
+	 */
+	const FName HandsOffHandRootBone(TEXT("hand_left"));
+
+	/**
+	 * *** WHETHER THE PACK'S LEFT HAND IS DOING ANYTHING THE PLAYER CAN SEE, PER CLIP. ***
+	 *
+	 * The pack authors every weapon as a RIGHT-HANDED ONE-HAND HOLD and says so in its own data:
+	 * unreal-hands_hands_stats.json's `loadouts` gives left = "open, free" for knife, pistol and smg,
+	 * and left = "core cradle" for the Core alone. What "open, free" means on screen is that the left
+	 * wrist hangs at rig (-14.42, -13.64, -8.64), which is v = -1.14 through the first-person lens:
+	 * a fifth of the half-frame BELOW the bottom edge.
+	 *
+	 * THAT IS NOT THE SAME AS "OFF SCREEN", AND THAT IS THE WHOLE DEFECT. The wrist is off; the palm
+	 * is 19 uu long and hangs off the wrist toward the lens, so its top edge and its `plating`
+	 * knuckle caps land between v = -0.95 and -0.78 (the handL_top row in Trace.Hands.Probe's framing
+	 * block measures it per frame, and names the bone) — on screen, in the bottom-left corner, as a bright
+	 * salmon-white shard with no hand attached to it, in EVERY one-handed frame we have photographed.
+	 * It is the second-most distracting thing in the viewmodel after the forearm wedge, and it is the
+	 * same class of error: a part that is drawn but not composed.
+	 *
+	 * *** THE RELOAD IS NOT AN EXEMPTION, AND THE FIRST VERSION OF THIS TABLE SAID IT WAS. ***
+	 *
+	 * It shipped with Reload_Pistol and Reload_Smg marked SHOWN, on the reading that those two clips
+	 * "bring the support hand up to the gun". They do raise it. They do not raise it into the frame,
+	 * and the numbers quoted here as the proof — a left wrist reaching v = -1.00 (pistol) and -0.96
+	 * (smg) — were themselves the disproof: -1 IS the bottom edge, so the best frame of the whole
+	 * clip has the wrist between four hundredths of a half-frame above the edge and dead on it.
+	 * Swept at eight playhead positions on each clip (Trace.Hands.Hold + Trace.Hands.Probe, live
+	 * match so the sway and the bob are in the numbers; Saved/Logs/shard-sweep.log), wristL reads
+	 *
+	 *   Reload_Pistol  a=.00 -1.15  .15 -1.04  .30 -0.97  .45 -1.22  .60 -1.18  .75 -1.03  .90 -1.00  .99 -1.14
+	 *   Reload_Smg     a=.00 -1.12  .15 -1.02  .30 -0.96  .45 -1.20  .60 -1.16  .75 -1.01  .90 -0.98  .99 -1.11
+	 *
+	 * — a peak of -0.96 at a = 0.30, eighteen pixels of a 900 px frame, and the ARM below that wrist
+	 * never gets nearer than v = -1.13: VMForearmL and VMCuffL print OFF-FRAME at all sixteen
+	 * samples. What DOES get in is the palm, and the handL_top row says by how much: on the beat this
+	 * walk photographs, wristL = -1.00 / handL_top[index_seg_left] = -0.81 on the pistol and
+	 * wristL = -0.96 / handL_top[index_left] = -0.78 on the SMG. A fifth of the half-frame of glove,
+	 * with its wrist on the edge and its forearm off — the shard of the paragraph above, exempted by
+	 * name. It is in v34knifeFINAL_43_pistol_reload.png and _46_smg_reload.png pixel-for-pixel as it
+	 * is in the pre-fix v33handsBEFORE frames, while the idles beside them came out clean;
+	 * v35shardFIX_43 and _46 are the same two beats with the table corrected.
+	 *
+	 * BOTH RELOADS ARE THEREFORE HIDDEN TOO, and that cannot uncap a bare forearm the way hiding the
+	 * glove does elsewhere, because on these two clips the tube is off the bottom of the frame at
+	 * every sample above — checked in the frame as well as in the log: the bottom strip of
+	 * v35shardFIX_43 and _46 is empty arena, not a floating tube. What survives as a real exemption is the clip that puts the WHOLE hand in
+	 * frame rather than its top edge: the four Core clips cradle it in front of the lens, and
+	 * Walljump_* plants the palm flat on the wall at v = -0.76. So the rule is per CLIP, not per rig
+	 * and not per loadout, and it asks "is this hand COMPOSED into the shot", not "does this hand
+	 * move":
+	 *
+	 *   SHOWN: the four Core clips — idle, throw, jump and walljump, both hands on the Core — and all
+	 *          four Walljumps (the palm plants on the wall).
+	 *   HIDDEN: everything else. The three one-handed idles, both shoots, BOTH RELOADS, the knife's
+	 *          draw/stab/inspect and the three non-Core jumps — every clip where the pack's own data
+	 *          says the hand is "open, free" and every clip where raising it does not reach the frame.
+	 *
+	 * IT FLIPS ONLY ON A CLIP CHANGE, never on a per-frame framing test. A visibility decision taken
+	 * against "is any of it inside the frame this tick" pops the moment a breath cycle crosses the
+	 * threshold — and the reload sweep above, which crosses v = -1 four times in 0.8 s, is exactly
+	 * the clip that would strobe. A clip change is already a re-pose of the whole hand and is the
+	 * only moment where an appearance cannot read as a flicker.
+	 */
+	const bool HandsClipShowsOffHand[] =
+	{
+		false, false, false, true,     // Idle: knife, pistol, smg, CORE (both hands cradle it)
+		false, false, false,           // Draw_Knife, Stab_Knife, Inspect_Knife — right hand only
+		false, false,                  // pistol: Shoot, RELOAD (the reload's peak is v = -0.97: the edge)
+		false, false,                  // smg:    Shoot, RELOAD (peak v = -0.96, likewise the edge)
+		true,                          // Throw_Core — the cradle opens
+		false, false, false, true,     // Jump: knife, pistol, smg, CORE
+		true, true, true, true         // Walljump: all four plant the left palm on the wall
+	};
+
+	static_assert(UE_ARRAY_COUNT(HandsClipShowsOffHand) == HandsClip_Count,
+		"The off-hand visibility table and the index enum have drifted apart.");
+
 	/** Material slot names baked into the meshes, used to find the two glowing slots to animate.
 	  * The SMG's are the same two FNames — the import writes the raw glTF material names undecorated
 	  * on both weapons, which is why one pair of constants serves both. */
 	const FName RailgunCyanSlot(TEXT("circuit_cyan"));
 	const FName RailgunAmberSlot(TEXT("core_amber"));
+
+	/**
+	 * THE GLOVES' UNLIT SLOTS, WHICH ARE THE ONES THE PLAYER CANNOT SEE.
+	 *
+	 * SK_TraceHands carries five: shell, carbon, circuit_cyan, plating, core_amber. Two of those
+	 * glow and are driven above; `plating` is exported at base 0.254 and glossy, which is bright
+	 * enough to read on its own. These two are not — shell is 0.041 and carbon is 0.0086, both with
+	 * EmissiveColor (0, 0, 0) — and between them they are the palm, the back of the hand and the
+	 * fingers' bodies, i.e. the entire shape of the fist. See ViewModelBodyEmissiveColor for the
+	 * lighting argument and BuildHandsEmissive for the write.
+	 *
+	 * NAMED SEPARATELY FROM THE RAILGUN'S PAIR ON PURPOSE. The same FNames appear on the weapons'
+	 * meshes, and the weapons are NOT given this floor: they are lit well enough by their own
+	 * plating and their own circuit runs, and a gun is a silhouette against a bright floor while a
+	 * hand is a shape that has to be read against the gun.
+	 */
+	const FName PackShellSlot(TEXT("shell"));
+	const FName PackCarbonSlot(TEXT("carbon"));
 
 	/** Printed at most once per process, so a missing import is loud but not spam. */
 	const TCHAR* const MissingImportHint =
@@ -2875,8 +3505,10 @@ void ATraceCharacter::EnsureViewModelBuilt()
 				ViewModelBodyMID->SetVectorParameterValue(TEXT("Color"), BodyColor);
 				ViewModelBodyMID->SetScalarParameterValue(TEXT("Roughness"), 0.52f);
 				ViewModelBodyMID->SetScalarParameterValue(TEXT("Metallic"), 0.12f);
-				ViewModelBodyMID->SetVectorParameterValue(TEXT("Emissive"), FLinearColor(0.30f, 0.55f, 0.80f));
-				ViewModelBodyMID->SetScalarParameterValue(TEXT("EmissiveStrength"), 0.030f);
+				ViewModelBodyMID->SetVectorParameterValue(
+					TEXT("Emissive"), TraceCharacterLayout::ViewModelBodyEmissiveColor);
+				ViewModelBodyMID->SetScalarParameterValue(
+					TEXT("EmissiveStrength"), TraceCharacterLayout::ViewModelBodyEmissiveStrength);
 			}
 		}
 
@@ -2955,7 +3587,9 @@ void ATraceCharacter::EnsureViewModelBuilt()
 
 	// The right hand does not move: RailgunOrigin was DERIVED from it, so the railgun's grip lands
 	// in it by construction. The left hand does — it comes off the cube gun's frame and forward onto
-	// the railgun's foregrip, which is 9.6 uu further out.
+	// the railgun's foregrip, which is 7.4 uu further out (it was 9.6 before the weapon size law
+	// brought the railgun down to the pack's 0.34 m; the foregrip is a mesh landmark, so it moved in
+	// with the gun and RailgunLeftHand followed it without being retyped).
 	constexpr int32 LeftHandIndex = 14;
 	constexpr int32 LeftKnuckleIndex = 15;
 	checkf(FCString::Strcmp(Parts[LeftHandIndex].Name, TEXT("VMHandL")) == 0
@@ -3038,7 +3672,7 @@ void ATraceCharacter::EnsureViewModelBuilt()
 			Part.bNeon ? ViewModelNeonMID : ViewModelBodyMID);
 
 		// [SPEC v30 §2] The cube gun's own twelve pieces ARE the pistol rig when the railgun art is
-		// missing, so the selector has to be able to hide them for the `1` and `3` states just as it
+		// missing, so the selector has to be able to hide them for the knife and SMG states just as it
 		// hides the railgun's. Only reached when !bRailgun — the `continue` above skipped them
 		// otherwise — so this can never double-add.
 		if (Part.bWeapon && Built != nullptr)
@@ -3072,21 +3706,86 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		float Diameter;
 	};
 
-	const FForearmSpec Forearms[] =
+	FForearmSpec Forearms[] =
 	{
 		{ TEXT("VMForearmR"), TEXT("VMCuffR"), FVector(-0.8f, 0.f, -4.6f),  FVector(-0.42f, 0.36f, -0.86f),  17.f, 7.0f },
 		{ TEXT("VMForearmL"), TEXT("VMCuffL"), LeftHand,                    FVector(-0.40f, -0.38f, -0.86f), 16.f, 6.7f }
 	};
 
-	// [SPEC v31 §6] The pack's mesh carries its own forearms and cuffs — 23.5 cm of them, which is why
-	// the depth arithmetic on HandsScale had to be redone — so these two cylinders are fallback-only.
+	// *** THE PACK RIG GETS THESE TOO NOW, AND THAT IS THE CHANGE. ***
+	//
+	// It used to `break` here, on the reasoning that "the pack's mesh carries its own forearms and
+	// cuffs — 23.5 cm of them". It does carry them, and they are not drawn any more: they run at the
+	// LENS rather than out of frame, which is the salmon wedge HandsHiddenBones documents. With them
+	// hidden the pack rig is two gloves and no arms, so the tubes the procedural rig already had — and
+	// which were already photographed leaving the bottom of the frame — are re-anchored onto the real
+	// wrists and drawn under the gloves instead. The numbers and the projection are on
+	// HandsArmLengthRightUU.
+	//
+	// THE ANCHORS ARE THE CAPTURED WRIST RESTS, NOT NEW CONSTANTS, and that matters twice over: they
+	// are already measured, and they are the exact transforms UpdateWeaponsFollowHands rebases
+	// against — so the same delta that carries the guns carries the arms, and an arm can never drift
+	// off the hand it belongs to.
+	const bool bPackArms = bPackHands && bHandsRigActive;
+	if (bPackArms)
+	{
+		// *** THE RIGHT ARM ANCHORS ON THE FIST AND NOT ON wrist_right, AND THAT IS THE FIX FOR THE
+		//     MISSING PALM. *** The fist is 6 uu DEEPER than the wrist, so a tube leaving the wrist
+		//     downward stands in FRONT of the hand and wins the depth test against it — the full
+		//     measurement, the photograph and the two rules that follow from it are on
+		//     HandsArmLengthRightUU. Anchored on the fist the near cap is buried inside the closed
+		//     glove and nothing of the sleeve is ever nearer the lens than the hand.
+		//
+		//     IT IS STILL CARRIED BY wrist_right's DELTA, which is what makes this free: HandsGripRig
+		//     is rigid with that bone (it is the fist centroid measured against it), so the rest
+		//     transform captured here rides the same HandsWristDelta the guns do and the arm cannot
+		//     come off the hand.
+		Forearms[0].Hand = TraceCharacterLayout::HandsGripRig;
+		Forearms[0].Direction = TraceCharacterLayout::HandsArmDirectionRight;
+		Forearms[0].Length = TraceCharacterLayout::HandsArmLengthRightUU;
+		Forearms[0].Diameter = TraceCharacterLayout::HandsArmDiameterUU;
+
+		// The left glove holds nothing, so it has no fist centroid to anchor on and keeps its wrist.
+		// It takes the re-aimed direction for the OTHER reason on HandsArmLengthRightUU: an arm that
+		// leans toward the lens is what brought on-screen geometry to 8.03 uu drawn — inside the
+		// 10 uu near plane — for a fifth of every Walljump_* clip.
+		Forearms[1].Hand = HandsOffWristRestRig.GetLocation();
+		Forearms[1].Direction = TraceCharacterLayout::HandsArmDirectionLeft;
+		Forearms[1].Length = TraceCharacterLayout::HandsArmLengthLeftUU;
+		Forearms[1].Diameter = TraceCharacterLayout::HandsArmDiameterUU;
+	}
+
+	// The glove's own shell material, so the arm reads as the same object as the hand. Slot 0 of
+	// SK_TraceHands is `shell`, which is what both hidden forearms were bound to — this is literally
+	// the material the pack's own arm had. Null on the fallback rig, where ViewModelBodyMID is right.
+	//
+	// *** IT IS A SIBLING INSTANCE NOW, NOT THE GLOVE'S OWN. *** Same parent, same base colour, same
+	// roughness — a DIFFERENT emissive floor, because the glove has been lifted clear of the weapon
+	// it holds and these two tubes must not come up with it (HandsGloveEmissiveStrength has the
+	// argument, HandsArmMID the storage). Slot 0 remains the fallback for the case where `shell` is
+	// not on the export, which is exactly what shipped before.
+	UMaterialInterface* PackArmMaterial = (bPackArms && HandsPart != nullptr)
+		? ToRawPtr(HandsArmMID) : nullptr;
+	if (bPackArms && PackArmMaterial == nullptr && HandsPart != nullptr)
+	{
+		PackArmMaterial = HandsPart->GetMaterial(0);
+	}
+
+	// AND THE BAND ON IT IS THE GLOVE'S OWN CIRCUIT, NOT THE ARENA'S NEON. HandsCyanMIDs was filled a
+	// moment ago by BuildHandsEmissive, walking the slot names rather than trusting an index, so this
+	// is the SAME dynamic instance the knuckle rings and the cuff light are driven through — the band
+	// therefore breathes on the idle curve and flares on an action with the rest of the glove, for
+	// free and with no second thing to keep in step. Falls back to the arena neon if the glove's
+	// emissive did not resolve, which is the same degradation BuildHandsEmissive already logs.
+	UMaterialInterface* const PackCuffMaterial =
+		(bPackArms && HandsCyanMIDs.Num() > 0) ? ToRawPtr(HandsCyanMIDs[0]) : nullptr;
+
+	HandsForearmParts.Reset();
+	HandsForearmRest.Reset();
+	HandsForearmRightNum = 0;
+
 	for (const FForearmSpec& Arm : Forearms)
 	{
-		if (bPackHands)
-		{
-			break;
-		}
-
 		const FVector Dir = Arm.Direction.GetSafeNormal();
 		if (Dir.IsNearlyZero())
 		{
@@ -3096,13 +3795,62 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		// MakeFromZ because the basic cylinder's axis is its own +Z; this turns that axis onto the
 		// arm direction without having to hand-derive a rotator.
 		const FRotator ArmRotation = FRotationMatrix::MakeFromZ(Dir).Rotator();
-		const FVector ArmCentre = Arm.Hand + Dir * (2.f + Arm.Length * 0.5f);
 
-		AddViewModelPart(CylinderMesh, Arm.Name, ArmCentre, ArmRotation,
-			FVector(Arm.Diameter, Arm.Diameter, Arm.Length), ViewModelBodyMID);
+		// The procedural rig starts its tube 2 uu clear of the cube hand because a cube hand is
+		// 5 uu across and the tube would otherwise poke out of the knuckles. The pack arms start at
+		// their anchor with no stand-off at all, because both anchors are INSIDE the glove — the
+		// right one is the closed fist's own centroid and the left one is the wrist joint — so the
+		// glove hides the near cap and no seam can open at the cuff.
+		const float Standoff = bPackArms ? 0.f : 2.f;
+		const FVector ArmCentre = Arm.Hand + Dir * (Standoff + Arm.Length * 0.5f);
 
-		AddViewModelPart(CylinderMesh, Arm.CuffName, Arm.Hand + Dir * 5.f, ArmRotation,
-			FVector(Arm.Diameter + 0.8f, Arm.Diameter + 0.8f, 1.8f), ViewModelNeonMID);
+		UStaticMeshComponent* const ArmPart = AddViewModelPart(CylinderMesh, Arm.Name, ArmCentre,
+			ArmRotation, FVector(Arm.Diameter, Arm.Diameter, Arm.Length), ViewModelBodyMID);
+
+		if (ArmPart != nullptr && PackArmMaterial != nullptr)
+		{
+			ArmPart->SetMaterial(0, PackArmMaterial);
+		}
+
+		// THE LIT BAND, AND BOTH OF ITS NUMBERS ARE SOLVED AGAINST THE FRAME RATHER THAN AGAINST THE
+		// GLOVE — see HandsArmCuffAlongUU for the run of vertical frame fractions that fixes them.
+		// The short version: the pack band used to sit 9 uu down, which is 5% of the half-frame BELOW
+		// the bottom edge, so the arm shipped with no band on it and read as more gun body.
+		const float CuffAlong = bPackArms
+			? TraceCharacterLayout::HandsArmCuffAlongUU
+			: TraceCharacterLayout::CubeArmCuffAlongUU;
+		const float CuffProud = bPackArms
+			? TraceCharacterLayout::HandsArmCuffProudUU
+			: TraceCharacterLayout::CubeArmCuffProudUU;
+		UStaticMeshComponent* const CuffPart = (Arm.CuffName != nullptr)
+			? AddViewModelPart(CylinderMesh, Arm.CuffName, Arm.Hand + Dir * CuffAlong, ArmRotation,
+				FVector(Arm.Diameter + CuffProud, Arm.Diameter + CuffProud, 1.8f), ViewModelNeonMID)
+			: nullptr;
+
+		if (CuffPart != nullptr && PackCuffMaterial != nullptr)
+		{
+			CuffPart->SetMaterial(0, PackCuffMaterial);
+		}
+
+		// [pack] Remembered so UpdateWeaponsFollowHands can carry each arm on ITS OWN wrist's delta.
+		// The two hands are not rigid with each other (see HandsOffWristDelta), so one delta for both
+		// would leave the left arm behind on every reload. RIGHT IS BUILT FIRST and the count is
+		// recorded rather than an index being assumed, so a part that failed to build shifts nothing.
+		if (bPackArms)
+		{
+			for (UStaticMeshComponent* const Part : { ArmPart, CuffPart })
+			{
+				if (Part != nullptr)
+				{
+					HandsForearmParts.Add(Part);
+					HandsForearmRest.Add(Part->GetRelativeTransform());
+				}
+			}
+			if (&Arm == &Forearms[0])
+			{
+				HandsForearmRightNum = HandsForearmParts.Num();
+			}
+		}
 	}
 
 	// --- [SPEC v31 §6] The rest transforms the hand-follow is expressed against -------------------
@@ -3135,7 +3883,7 @@ void ATraceCharacter::EnsureViewModelBuilt()
 	//
 	// Parented to the GUN, at the gun's own muzzle landmark, in the gun's own units:
 	//   * railgun    -> a child of RailgunBodyPart at RailgunMuzzleLocal, the (107.4, 0, 4.5) cm point
-	//                   recorded in railgun_manifest.json. The parent's 0.22 scale is applied by the
+	//                   recorded in railgun_manifest.json. The parent's RailgunScale is applied by the
 	//                   scene graph, so this stays the mesh's real muzzle vertex whatever the rig
 	//                   scale becomes.
 	//   * cube gun   -> a child of ViewModelRoot at CubeGunMuzzle, the same constant the VMMuzzle ring
@@ -3207,7 +3955,7 @@ void ATraceCharacter::EnsureViewModelBuilt()
 		*GetName(), ViewModelParts.Num(),
 		bPackHands ? TEXT("SK_TraceHands + 20 clips") : TEXT("PROCEDURAL CUBES (fallback)"),
 		(RailgunBodyPart != nullptr) ? TEXT("the railgun body") : TEXT("the fallback rig"),
-		(SmgBodyPart != nullptr) ? TEXT("built") : TEXT("ABSENT - the `3` slot falls back"));
+		(SmgBodyPart != nullptr) ? TEXT("built") : TEXT("ABSENT - the SMG slot falls back to the pistol"));
 }
 
 bool ATraceCharacter::BuildRailgunViewModel()
@@ -3283,7 +4031,7 @@ bool ATraceCharacter::BuildRailgunViewModel()
 	}
 
 	// [SPEC v30 §2] The three railgun parts are the PISTOL rig, and the selector has to be able to
-	// take them off screen for the `1` (stowed) and `3` (SMG) states.
+	// take them off screen for the knife and SMG states.
 	PistolWeaponParts.Add(RailgunBodyPart);
 	PistolWeaponParts.Add(RailgunRailLeftPart);
 	PistolWeaponParts.Add(RailgunRailRightPart);
@@ -3301,13 +4049,18 @@ bool ATraceCharacter::BuildRailgunViewModel()
 // "Demo 24 added the SMG with no viewmodel of its own — a verifier flagged that nothing on screen
 // tells the player which gun they are holding."
 //
-// THE SHAPE OF THE FIX. Three weapon states exist (1 stows, 2 pistol, 3 SMG) and the knife is in the
-// off hand in all three, so the rig has to answer three questions, not two, and the answer has to be
-// visible at a glance rather than in an ammo counter:
+// THE SHAPE OF THE FIX. Three weapon states exist and the answer has to be visible at a glance
+// rather than in an ammo counter:
 //
-//     1  ->  neither gun. Both weapon rigs off screen, hands and knife only.
-//     2  ->  the pistol rig  (the railgun, or the procedural cube gun if the art is missing)
-//     3  ->  THE SMG RIG     (or, if THAT art is missing, the pistol rig and a line in the log)
+//     no gun  ->  both weapon rigs off screen, hands and knife only
+//     pistol  ->  the pistol rig  (the railgun, or the procedural cube gun if the art is missing)
+//     SMG     ->  THE SMG RIG     (or, if THAT art is missing, the pistol rig and a line in the log)
+//
+// *** THE KEY NUMBERS ARE DELIBERATELY NOT WRITTEN HERE ANY MORE (spec v32 §7d). *** This paragraph
+// used to say "1 stows, 2 pistol, 3 SMG", which was v29 §5's arrangement; Demo 26 reverted the binds
+// to 1 = PISTOL, 2 = SMG, 3 = KNIFE and this comment quietly became a lie that a reader would trust.
+// Which key does what is UTraceUserSettings' business and a player can rebind it anyway, so the rule
+// belongs there and the selector below is stated in WEAPONS, which cannot go stale.
 //
 // WHY THE MOTION IS CODE AND NOT AN ANIMATION. The GLB is the mesh-only export: `animations: []`.
 // The kit's README promises `Fire` and `Reload` clips and warns, in the same paragraph, that the
@@ -3328,7 +4081,7 @@ bool ATraceCharacter::BuildSmgViewModel()
 		// it. Warning rather than Error for the same reason the railgun's is: this is a missing
 		// optional asset, and the pawn behind it is fully functional.
 		UE_LOG(LogTraceGame, Warning,
-			TEXT("SMG art did not resolve (body=%s wallL=%s wallR=%s mag=%s); the `3` weapon slot will ")
+			TEXT("SMG art did not resolve (body=%s wallL=%s wallR=%s mag=%s); the SMG weapon slot will ")
 			TEXT("show the pistol rig instead. Run `Scripts/import-railgun.sh --rig smg`, or ")
 			TEXT("`git lfs pull` if this is a fresh clone."),
 			SmgBodyMesh != nullptr ? TEXT("ok") : TEXT("MISSING"),
@@ -3345,7 +4098,7 @@ bool ATraceCharacter::BuildSmgViewModel()
 		|| FParse::Param(FCommandLine::Get(), TEXT("TraceNoRailgun")))
 	{
 		UE_LOG(LogTraceGame, Log,
-			TEXT("-TraceNoSmg/-TraceNoRailgun: the `3` slot will show the pistol rig on purpose."));
+			TEXT("-TraceNoSmg/-TraceNoRailgun: the SMG slot will show the pistol rig on purpose."));
 		return false;
 	}
 
@@ -3374,7 +4127,7 @@ bool ATraceCharacter::BuildSmgViewModel()
 	if (SmgBodyPart == nullptr || SmgWallLeftPart == nullptr
 		|| SmgWallRightPart == nullptr || SmgMagPart == nullptr)
 	{
-		UE_LOG(LogTraceGame, Warning, TEXT("SMG parts failed to attach; the `3` slot falls back."));
+		UE_LOG(LogTraceGame, Warning, TEXT("SMG parts failed to attach; the SMG slot falls back to the pistol."));
 		SmgBodyPart = nullptr;
 		SmgWallLeftPart = nullptr;
 		SmgWallRightPart = nullptr;
@@ -3613,6 +4366,37 @@ bool ATraceCharacter::BuildPackHandsViewModel()
 	HandsPart->SetVisibility(false);   // UpdateViewBlend decides; matches every other rig part
 	HandsPart->RegisterComponent();
 
+	// *** STOP DRAWING THE PACK'S OWN FOREARMS. *** The argument, the measurements and the reason the
+	// cuffs stay is on HandsHiddenBones. AFTER RegisterComponent because that is what runs InitAnim
+	// and sizes BoneVisibilityStates — called before it, HideBoneByName is silently a no-op, which is
+	// the failure mode this codebase keeps finding weeks late.
+	//
+	// A hidden bone is drawn with its parent's matrix scaled by zero, so the box collapses to a point
+	// at hand_<side>'s origin rather than to the world origin: no stray triangle anywhere.
+	//
+	// RESOLVED INDICES ARE LOGGED, not assumed. HideBoneByName's contract on a name it cannot find is
+	// to do nothing at all, so a re-export that renames a node would otherwise show up as the wedge
+	// silently coming back with no line anywhere saying why.
+	{
+		FString Hidden;
+		for (const FName& BoneName : TraceCharacterAssets::HandsHiddenBones)
+		{
+			const int32 BoneIndex = RefSkeleton.FindBoneIndex(BoneName);
+			if (BoneIndex == INDEX_NONE)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("Pack hands: bone '%s' is not on SK_TraceHands, so it cannot be hidden. If the ")
+					TEXT("export renamed it, the viewmodel will draw a forearm straight at the lens ")
+					TEXT("again — see HandsHiddenBones."), *BoneName.ToString());
+				continue;
+			}
+			HandsPart->HideBoneByName(BoneName, EPhysBodyOp::PBO_None);
+			Hidden += FString::Printf(TEXT(" %s(#%d)"), *BoneName.ToString(), BoneIndex);
+		}
+		UE_LOG(LogTraceGame, Log, TEXT("Pack hands: hidden bones:%s"),
+			Hidden.IsEmpty() ? TEXT(" <none>") : *Hidden);
+	}
+
 	// *** THE ACTOR MUST TICK AFTER THE POSE. ***
 	//
 	// UpdateWeaponsFollowHands reads wrist_right off this component and puts the guns there. Component
@@ -3621,6 +4405,20 @@ bool ATraceCharacter::BuildPackHandsViewModel()
 	// last frame's, which at 10 uu of wrist travel through a jump is the gun visibly swimming inside
 	// the fist. With the prerequisite, hand and gun are always the same frame's pose.
 	AddTickPrerequisiteComponent(HandsPart);
+
+	// *** AND SO MUST THE WEAPON COMPONENT, FOR THE SAME REASON AND ON ITS OWN ACCOUNT. ***
+	//
+	// [v32 §8] The actor's prerequisite above orders the ACTOR against the pose; it says nothing about
+	// this actor's own components, which are separate tick functions in the same group. UpdateKnifeVisuals
+	// now poses the blade through GetViewModelWeaponDelta(), i.e. off exactly the socket the line above
+	// exists to sequence, so without this the blade would be composed against last frame's evaluation
+	// about half the time and swim in the fist on alternate frames — the identical defect, one tick
+	// function over. Costs nothing when the pack rig is absent, because this whole function is not
+	// reached then.
+	if (Weapon != nullptr)
+	{
+		Weapon->AddTickPrerequisiteComponent(HandsPart);
+	}
 
 	// --- The two facts everything else is expressed against ---------------------------------------
 	//
@@ -3632,13 +4430,18 @@ bool ATraceCharacter::BuildPackHandsViewModel()
 		FVector(TraceCharacterLayout::HandsScale));
 	HandsWristRestRig = RefPoseComponentSpace(RefSkeleton, WristIndex) * HandsRelative;
 	HandsWristDelta = FTransform::Identity;
+	HandsOffWristDelta = FTransform::Identity;
 	bHandsRigActive = true;
 
 	const int32 OffHandIndex = RefSkeleton.FindBoneIndex(TraceCharacterAssets::HandsOffHandBone);
 	if (OffHandIndex != INDEX_NONE)
 	{
-		ViewModelOffHandLocation =
-			(RefPoseComponentSpace(RefSkeleton, OffHandIndex) * HandsRelative).GetLocation();
+		HandsOffWristRestRig = RefPoseComponentSpace(RefSkeleton, OffHandIndex) * HandsRelative;
+
+		// The KNIFE's hand, and it deliberately keeps the REFERENCE pose even after the two rests
+		// below are re-based. The reference pose IS Idle_Knife's first frame (measured), so for the
+		// one rig that hangs off this point the reference pose is already the right pose.
+		ViewModelOffHandLocation = HandsOffWristRestRig.GetLocation();
 	}
 
 	// --- Do the imported clips still say what this file believes they say? ------------------------
@@ -3683,6 +4486,127 @@ bool ATraceCharacter::BuildPackHandsViewModel()
 	HandsAction = EHandsAction::None;
 	HandsLoadout = EHandsLoadout::Pistol;
 	UpdateHandsAnimation(0.f);
+
+	// *** THE BASE POSE THE WEAPONS ARE MEASURED AGAINST IS Idle_Pistol AT t=0, NOT THE REFERENCE
+	//     POSE — AND UNTIL NOW IT WAS THE REFERENCE POSE. ***
+	//
+	// HandsWristRestRig is the pose in which HandsWristDelta must be IDENTITY, because the weapons'
+	// rest transforms were placed for exactly one pose: HandsGripRig is the fist centroid measured in
+	// Idle_Pistol at t=0, and RailgunOrigin / SmgOrigin are both derived from it. Captured off the
+	// REFERENCE skeleton instead, the base was Idle_Knife's first frame (the paragraph above says so),
+	// so the delta was never identity where it was supposed to be and every weapon part was drawn
+	// through a constant offset it was never meant to have.
+	//
+	// MEASURED, off gloved_hands.glb through this file's own transform chain:
+	//   wrist_right rig, reference pose (what was stored): (-6.06, -0.43, -0.81)
+	//   wrist_right rig, Idle_Pistol t=0 (what is correct): (-6.88, -0.17, -1.52)
+	//   the resulting always-on offset between hand and weapon: 6.51 deg / 0.96 uu for the pistol,
+	//   7.34 deg / 3.18 uu for the SMG, 6.93 deg / 1.63 uu for the Core, 0.00 for the knife (whose
+	//   idle IS the reference pose, which is why this hid for so long). On screen the railgun's grip
+	//   moves 17 px and its drawn axis untilts 3.5 deg; ViewModelMuzzle is a child of the gun body, so
+	//   the tracer's beam origin was inheriting all of it too.
+	//
+	// READ THE WAY UpdateWeaponsFollowHands READS IT, off the live pose, rather than re-derived: one
+	// expression, one chance to be wrong. TickAnimation then RefreshBoneTransforms because the seed
+	// above only moves the play head — the component-space transforms are not evaluated until
+	// something asks for them, and a socket read before that would return the reference pose again
+	// and silently change nothing.
+	if (WristIndex != INDEX_NONE)
+	{
+		const FTransform RefBaseRight = HandsWristRestRig;
+		const FTransform RefBaseLeft = HandsOffWristRestRig;
+
+		HandsPart->TickAnimation(0.f, /*bNeedsValidRootMotion=*/false);
+		HandsPart->RefreshBoneTransforms();
+
+		const FTransform Relative = HandsPart->GetRelativeTransform();
+		const FTransform SeededRight =
+			HandsPart->GetSocketTransform(TraceCharacterAssets::HandsWeaponBone, RTS_Component) * Relative;
+		const FTransform SeededLeft = (OffHandIndex != INDEX_NONE)
+			? HandsPart->GetSocketTransform(TraceCharacterAssets::HandsOffHandBone, RTS_Component) * Relative
+			: RefBaseLeft;
+
+		// AN UNEVALUATED POSE READS AS THE IDENTITY, AND THE IDENTITY WOULD PARK EVERY GUN AT THE RIG
+		// ORIGIN. The two poses are the same hand a fraction of a second apart, so they cannot be more
+		// than a few uu apart; anything further means the read did not do what this comment claims and
+		// the reference-pose value — today's shipped behaviour — is the safe thing to keep.
+		constexpr double MaxRebaseTravelUU = 15.0;
+		const double MovedRight = FVector::Dist(RefBaseRight.GetLocation(), SeededRight.GetLocation());
+		const double MovedLeft = FVector::Dist(RefBaseLeft.GetLocation(), SeededLeft.GetLocation());
+		if (MovedRight <= MaxRebaseTravelUU && MovedLeft <= MaxRebaseTravelUU)
+		{
+			HandsWristRestRig = SeededRight;
+			HandsOffWristRestRig = SeededLeft;
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("Pack hands: the Idle_Pistol seed pose read %.2f uu (right) / %.2f uu (left) from ")
+				TEXT("the reference pose, which is further than one idle frame can be. Keeping the ")
+				TEXT("reference pose as the weapon base; the guns will carry the constant offset the ")
+				TEXT("comment above describes."), MovedRight, MovedLeft);
+		}
+
+		UE_LOG(LogTraceGame, Log,
+			TEXT("Pack hands: weapon base pose re-based onto Idle_Pistol t=0 — 'wrist_right' rig ")
+			TEXT("(%.2f, %.2f, %.2f) -> (%.2f, %.2f, %.2f), 'wrist_left' rig (%.2f, %.2f, %.2f) -> ")
+			TEXT("(%.2f, %.2f, %.2f)."),
+			RefBaseRight.GetLocation().X, RefBaseRight.GetLocation().Y, RefBaseRight.GetLocation().Z,
+			HandsWristRestRig.GetLocation().X, HandsWristRestRig.GetLocation().Y, HandsWristRestRig.GetLocation().Z,
+			RefBaseLeft.GetLocation().X, RefBaseLeft.GetLocation().Y, RefBaseLeft.GetLocation().Z,
+			HandsOffWristRestRig.GetLocation().X, HandsOffWristRestRig.GetLocation().Y, HandsOffWristRestRig.GetLocation().Z);
+	}
+
+	// =============================================================================================
+	// *** THE GRIP, EXPRESSED IN wrist_right's OWN SPACE — WHICH IS THE ONLY SPACE A THING ATTACHED
+	//     TO THAT BONE CAN BE PLACED IN.  (spec v32 §8) ***
+	// =============================================================================================
+	//
+	// Everything in this file places props by TRANSFORM in RIG space, so "the fist is at HandsGripRig"
+	// is all it has ever needed. UTraceKnifeViewSubsystem does the opposite and does it on the pack's
+	// own instruction — SK_TraceKnife is ATTACHED to wrist_right, "every weapon is a right-handed
+	// one-hand hold" — and an attached component's offset is in the BONE's frame, not the rig's.
+	//
+	// IT WAS GUESSED, AND THE GUESS IS THE PHOTOGRAPHED DEFECT. TraceKnifeView.cpp carried
+	// `WristOffset(7.0, 0, 0)` under the comment "the hand is 19 cm from wrist to fingertip, so ~7 uu
+	// down the fingers is the middle of the grip". The MAGNITUDE is very nearly right — the real
+	// figure is 6.81 uu — but +X is not the direction the fingers run in on this skeleton, and the
+	// pack's own README says so in passing: the finger CURL axis is "local X (negative = toward
+	// palm)", i.e. bone-local X is the curl axis, not the length of the hand. Pushing the blade 7 uu
+	// along it puts the pivot out through the SIDE of the wrist, which is exactly what
+	// Saved/Screenshots/v31integ_47_key3_knife_idle.png shows: a balisong beside the forearm with lit
+	// floor between it and the fingers.
+	//
+	// SO IT IS DERIVED HERE INSTEAD, FROM TWO NUMBERS THAT ARE ALREADY MEASURED, AND FROM NO NEW ONE.
+	// HandsWristRestRig is the wrist in rig space in the base pose; HandsGripRig is the closed fist's
+	// centroid in rig space in the SAME base pose (that is the whole meaning of HandsFistLocal, and
+	// EnsureViewModelBuilt's checkf keeps it equal to the parts table). Asking the first where the
+	// second is, in its own coordinates, is the answer by construction:
+	//
+	//     grip in wrist space = HandsWristRestRig^-1 . HandsGripRig
+	//
+	// InverseTransformPosition divides by the wrist's scale on the way through, so the result is in
+	// the unscaled bone-local units an attached component's relative location is expressed in — it
+	// stays correct if HandsScale is ever retuned, which a hand-typed vector would not.
+	//
+	// CAPTURED ONCE, AT THE BASE POSE, exactly like HandsWristRestRig above and for the same reason:
+	// the fist's offset from its own wrist is a property of the HAND, and the pack authors one fist
+	// and moves the wrist (measured: 0.4 uu of spread across the pistol, SMG and knife idles — see
+	// HandsFistLocal). Re-deriving it per frame would be re-measuring a constant against a moving
+	// pose and would make the blade jitter inside the fist.
+	HandsGripWristLocal = HandsWristRestRig.InverseTransformPosition(TraceCharacterLayout::HandsGripRig);
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Pack hands: grip in 'wrist_right' local space = (%.2f, %.2f, %.2f) uu, |%.2f| uu. ")
+		TEXT("Anything ATTACHED to that bone (the pack blade) belongs here; anything placed by ")
+		TEXT("transform belongs at rig (%.2f, %.2f, %.2f)."),
+		HandsGripWristLocal.X, HandsGripWristLocal.Y, HandsGripWristLocal.Z, HandsGripWristLocal.Size(),
+		TraceCharacterLayout::HandsGripRig.X, TraceCharacterLayout::HandsGripRig.Y,
+		TraceCharacterLayout::HandsGripRig.Z);
+
+	// [SPEC v32 §5] And the glow, which includes writing the idle rest pose — see BuildHandsEmissive
+	// for why that cannot wait for a first action, and for the WorldGridMaterial check it does on the
+	// way past.
+	BuildHandsEmissive();
 
 	UE_LOG(LogTraceGame, Log,
 		TEXT("%s built the pack hands (%d bones, scale %.2f, rig loc (%.2f, %.2f, %.2f) yaw %.0f, ")
@@ -3807,10 +4731,26 @@ void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
 				HandsClipIndex = HandsDebugClipIndex;
 				HandsPart->SetAnimation(HandsAnims[HandsClipIndex]);
 				HandsPart->Stop();
+
+				// *** AND THE OFF HAND, HERE TOO, BECAUSE THIS IS THE SECOND CLIP SWITCH. ***
+				// A harness that photographs a state real play never has is worse than no harness:
+				// the FIRST run of this fix pinned Walljump_Pistol and printed offHand=HIDDEN while
+				// the framing block on the same line said the left forearm was at v = -0.76, i.e. in
+				// frame — the exact combination the per-clip table exists to make impossible. The
+				// live path below carries the identical call; the two must not drift.
+				ApplyHandsOffHandVisibility(HandsClipIndex);
 			}
 			HandsClipTime = Held;
 			HandsLoadout = HandsDebugLoadout;
 			HandsPart->SetPosition(Held, /*bFireNotifies=*/false);
+
+			// PUBLISHED HERE TOO, because this is a DRAW: a pinned pose is still a pose on screen and
+			// the gloves must be lit for the frame that is showing. A held IDLE publishes 0 — the idle
+			// is the breath, not a flare — which is the same answer the loop below gives it.
+			HandsClipPulseNorm =
+				(HandsDebugClipIndex != ResolveHandsClip(HandsDebugLoadout, EHandsAction::None))
+					? TraceCharacterLayout::HandsActionFlare(Held / FMath::Max(Clip->GetPlayLength(), KINDA_SMALL_NUMBER))
+					: 0.f;
 		}
 		return;
 	}
@@ -3870,9 +4810,31 @@ void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
 	EHandsAction Event = EHandsAction::None;
 
 	const bool bReloading = (Weapon != nullptr) && Weapon->IsReloading();
-	const bool bSwinging = (Weapon != nullptr) && (Weapon->GetShootLockoutRemaining() > 0.f);
 	const bool bDeploying = (Weapon != nullptr) && Weapon->IsDeploying();
 	const bool bInspecting = TraceKnifeView::IsInspecting(this);
+
+	// *** SPEC v32 §7a — THE STAB EDGE, AND IT USED TO BE READ OFF THE WRONG NUMBER. ***
+	//
+	// WHAT WAS HERE:  (Weapon->GetShootLockoutRemaining() > 0.f), edge-detected against a boolean.
+	// WHY IT COULD NEVER FIRE:  a knife swing does not set the shoot lockout. It sets the SWING
+	// COOLDOWN. The flag was therefore false on every frame of every swing, EHandsAction::Stab was
+	// never raised, ResolveHandsClip was never asked for A_Hands_Stab_Knife, and the blade thrust
+	// out of a fist that stayed in its idle for the whole 0.300 s.
+	//
+	// WHAT IS HERE NOW IS UTraceKnifeViewSubsystem::ChooseClip'S OWN RULE, character for character,
+	// off the SAME accessor — so the hand clip and the blade clip start on the same frame off one
+	// fact rather than two detectors that agree until one of them is retuned. The cooldown only ever
+	// counts DOWN, so a RISE is unambiguously a swing that has just begun; and unlike "is a swing in
+	// flight", a rise survives two swings back to back inside one clip length instead of rendering
+	// them as one long stab.
+	//
+	// A THIRD DETECTOR WAS THE OTHER OPTION AND IS THE WRONG SHAPE — §7a says so and it is right.
+	// The genuinely better shape, which this pass could not take, is TraceKnifeView publishing the
+	// edge ONCE the way it already publishes IsInspecting(), and both readers consuming it; that
+	// needs a file this pass does not own and is written into the report instead.
+	const float SwingCooldown = TraceMelee::GetSwingCooldownRemaining(this);
+	const bool bSwingSeeded = (HandsSwingCooldownLast >= 0.f);
+	const bool bStabEdge = bSwingSeeded && (SwingCooldown > HandsSwingCooldownLast + KINDA_SMALL_NUMBER);
 
 	// A WALL JUMP AND A JUMP BOTH ARRIVE THROUGH OnJumped. The counter is what tells them apart, and
 	// it is the movement component's own predicted state rather than a second copy of the rule.
@@ -3887,7 +4849,7 @@ void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
 	{
 		Event = EHandsAction::Shoot;
 	}
-	else if (bSwinging && !bHandsWasSwinging)
+	else if (bStabEdge)
 	{
 		Event = EHandsAction::Stab;
 	}
@@ -3934,7 +4896,7 @@ void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
 	bHandsJumpPending = false;
 	HandsLastWallJumpCount = WallJumps;
 	bHandsWasReloading = bReloading;
-	bHandsWasSwinging = bSwinging;
+	HandsSwingCooldownLast = SwingCooldown;
 	bHandsWasDeploying = bDeploying;
 	bHandsWasCarrier = bIsCarrier;
 	bHandsWasInspecting = bInspecting;
@@ -3977,6 +4939,10 @@ void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
 	const int32 DesiredClip = ResolveHandsClip(HandsLoadout, HandsAction);
 	if (DesiredClip == INDEX_NONE)
 	{
+		// Nothing is drawn on this path, so nothing may be left published: a stale flare would weld
+		// the gloves at whatever brightness the last drawn frame had. Same argument UpdateRailgunFire
+		// makes where it zeroes PistolPulseNorm on its own early-out.
+		HandsClipPulseNorm = 0.f;
 		return;
 	}
 
@@ -3988,6 +4954,13 @@ void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
 	{
 		HandsClipIndex = DesiredClip;
 		HandsPart->SetAnimation(HandsAnims[HandsClipIndex]);
+
+		// *** AND WHETHER THE LEFT GLOVE IS IN THIS CLIP AT ALL. *** Settled HERE, on the one frame
+		// the whole hand is being re-posed anyway, and nowhere else: a visibility decision taken
+		// against a per-frame framing test would pop the moment the idle's breath carried the palm
+		// across the threshold. The per-clip table, the sweep behind it and the two families of clip
+		// that are still exempt are on TraceCharacterAssets::HandsClipShowsOffHand.
+		ApplyHandsOffHandVisibility(HandsClipIndex);
 
 		// Stop(), so nothing advances but this function. The single node instance's own clock adds
 		// DeltaTime and THEN evaluates, which is precisely the per-frame-reader failure the spec
@@ -4057,6 +5030,21 @@ void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
 	SampleTime = bLooping ? FMath::Fmod(SampleTime, ClipLength) : FMath::Clamp(SampleTime, 0.f, ClipLength);
 	HandsPart->SetPosition(SampleTime, /*bFireNotifies=*/false);
 
+	// *** THE GLOVES' FLARE FOR THE POSE THAT WAS JUST DRAWN, SETTLED ON THIS LINE. ***
+	//
+	// Between SetPosition and the advance below, which is the only window in the frame where "the
+	// pose on screen" and "the playhead" are the same number. UpdateHandsEmissive runs later in this
+	// same Tick and reads the value from here; when it instead re-derived the triangle from
+	// HandsClipTime it was reading a playhead that had already moved on, and the glove peaked one
+	// frame BEFORE the blade whose streak is driven off ITS sampled playhead. Measured, at a fixed
+	// 60 Hz: drawn t=0.0000 s of a stab lit at 0.159, drawn t=0.0333 s lit at 0.476 — every reading
+	// the value belonging to t + 1/60.
+	//
+	// A LOOPING IDLE PUBLISHES 0 rather than a point on the triangle: the idle's own brightness is
+	// the stateless breath in UpdateHandsEmissive, and lighting it off a 2.4 s loop's phase would put
+	// a slow sawtooth flare under the breath that the FX doc does not ask for.
+	HandsClipPulseNorm = bLooping ? 0.f : TraceCharacterLayout::HandsActionFlare(SampleTime / ClipLength);
+
 	// ADVANCED AFTER THE SAMPLE. The reload branch above already wrote its own absolute position, so
 	// this only moves the clips that are genuinely time-driven.
 	if (DeltaSeconds > 0.f && !(HandsAction == EHandsAction::Reload && Weapon != nullptr && Weapon->IsReloading()))
@@ -4074,6 +5062,514 @@ void ATraceCharacter::UpdateHandsAnimation(float DeltaSeconds)
 	}
 }
 
+// =================================================================================================
+// SPEC v32 §5 — THE GLOVES' EMISSIVE
+// =================================================================================================
+//
+// unreal-fx_README's last section, and it was the last one with no implementation at all: there was
+// no HandsCyanMID, no HandsAmberMID, nothing. The rig was on screen wearing whatever brightness the
+// imported material instance happened to default to.
+//
+//     "Idle 0.95-1.15x, rising to 2.7x cyan / 2.1x amber at the peak of any action. Drive it from
+//      the same curve as the weapon so hands and weapon pulse together."
+//
+// THREE SENTENCES, THREE DECISIONS, and each of them is one this codebase has already paid for:
+//
+//   1. FIND THE SLOTS BY NAME AND COUNT THEM. Not by index, and not by assuming the layout of
+//      another mesh. The SMG's `core_amber` is on the magazine ONLY and its `circuit_cyan` is on
+//      three components; copying the pistol's "two MIDs off the body" there produced an INDEX_NONE
+//      and an ammo cell that silently never lit. See BuildHandsEmissive.
+//   2. WRITE THE REST POSE AT BUILD TIME. Same argument BuildSmgViewModel makes for its 1.8x: the
+//      imported instance defaults to 1.0 and there is no later moment guaranteed to happen first.
+//   3. THE IDLE IS A FUNCTION OF THE CLOCK, NOT AN ACCUMULATOR — ATraceCore::UpdateCoreArtEmissive's
+//      reasoning, unchanged.
+//
+// AND THE FOURTH, WHICH IS THE ONE THE DOC ACTUALLY EMPHASISES: the action spike is the WEAPON'S OWN
+// normalised value remapped, never a parallel timer of the same length. See GetHandsActionPulse.
+
+/**
+ * *** ONE KNOB FOR HOW MUCH LIGHT THE GLOVE CARRIES OF ITS OWN. ***
+ *
+ * Multiplies TraceCharacterLayout::HandsGloveEmissiveStrength, which is where the whole argument for
+ * the number lives. It is a CVar and not a rebuild because the value it is trading off — "is the fist
+ * a lighter mass than the gun inside it, without becoming a lamp" — is a judgement made by LOOKING at
+ * a frame, and this module's shipped idiom for exactly that is a live knob (Trace.Core.FxGeometry,
+ * Trace.Fx.BeamScale, the heart-light pair).
+ *
+ * IT REACHES THE GLOVES ONLY. The two forearm tubes are on their own instance (HandsArmMID) at
+ * ViewModelBodyEmissiveStrength and are deliberately NOT on this knob; the guns are not on it either,
+ * and that separation is the effect being tuned rather than an oversight — see
+ * HandsGloveEmissiveStrength.
+ *
+ * 0 is a legal setting and is the shipped-before-v33 look: the gloves fall back to the same floor the
+ * weapons have, which is the state the "no palm anywhere" frames were photographed in. That makes it
+ * a working A/B rather than only a brightness dial.
+ */
+static TAutoConsoleVariable<float> CVarTraceHandsGloveFloor(
+	TEXT("Trace.Hands.GloveFloor"), 1.0f,
+	TEXT("Spec v33. Multiplies the emissive floor written on the pack gloves' unlit slots (shell, ")
+	TEXT("carbon). 1.0 (shipped) is TraceCharacterLayout::HandsGloveEmissiveStrength; 0 drops the ")
+	TEXT("gloves back to the weapons' own near-black, which is the A/B the fix was made against. ")
+	TEXT("The forearm tubes and the guns are NOT on this knob."),
+	ECVF_Default);
+
+/** The clamp, named once so the write and the log cannot disagree about what was asked for. */
+static constexpr float TraceHandsGloveFloorMin = 0.f;
+static constexpr float TraceHandsGloveFloorMax = 6.f;
+
+void ATraceCharacter::BuildHandsEmissive()
+{
+	HandsCyanMIDs.Reset();
+	HandsAmberMIDs.Reset();
+	HandsUnlitMIDs.Reset();
+	HandsArmMID = nullptr;
+	HandsGloveFloorApplied = -1.f;
+
+	if (HandsPart == nullptr)
+	{
+		return;
+	}
+
+	// *** WALKED, NOT ASSUMED. *** GetMaterialIndex() answers with the FIRST slot of a given name and
+	// would hide a second one; the SMG's three cyan slots are the standing proof that "how many
+	// carry this name" is a property of the export. So every slot is visited and every match gets its
+	// own MID, and the count is logged below so a re-export that renames or merges a slot shows up as
+	// a number in the log rather than as a rig that quietly stops pulsing.
+	const TArray<FName> SlotNames = HandsPart->GetMaterialSlotNames();
+
+	// *** AND WHILE WE ARE HERE: IS THE SLOT WEARING PACK ART OR THE GREY CHECKERBOARD? ***
+	// A v31 verifier found every pack mesh on /Engine/EngineMaterials/WorldGridMaterial because
+	// Interchange imported the meshes and the MI_Pack_* instances and bound NEITHER. That was fixed
+	// by Scripts/bind_pack_materials.py, but "was fixed once" is not a guarantee — a re-import
+	// silently undoes it — so the check is permanent and lives here, where the MID is created.
+	FString Grey;
+
+	for (int32 Index = 0; Index < SlotNames.Num(); ++Index)
+	{
+		const bool bCyan = (SlotNames[Index] == TraceCharacterAssets::RailgunCyanSlot);
+		const bool bAmber = (SlotNames[Index] == TraceCharacterAssets::RailgunAmberSlot);
+
+		// *** THE UNLIT SLOTS GET A CONSTANT FLOOR, AND THAT IS WHAT MAKES THE FIST A FIST. ***
+		//
+		// This branch is the fix for the photographed complaint. `shell` and `carbon` ship with
+		// EmissiveColor (0, 0, 0) (Scripts/import_pack.py, MATERIALS) and base colours of 0.041 and
+		// 0.0086, and this arena puts under 6 lux on the inside of a player's face — so the palm,
+		// the back of the hand and the fingers' bodies rendered as a silhouette, leaving only the
+		// glossy `plating` chips and the cyan circuit runs on screen. That is not a hand holding a
+		// gun; it is what the verifier photographed as "detached plates alongside it with no palm
+		// anywhere", and it is the same defect on the two forearm tubes, which wear slot 0's
+		// material by design so that the sleeve and the glove read as one object.
+		//
+		// THE NUMBER IS NOT A NEW ONE. It is ViewModelBodyMID's own emissive term — the constant the
+		// procedural rig has always carried and the reason the procedural rig photographs correctly
+		// — restated in this master's parameter names, with the strength folded into the colour
+		// because that is the convention the pack import already writes (EmissiveIntensity stays a
+		// clean 1.0 = at rest). One value, one place, two rigs.
+		//
+		// CREATED ON THE COMPONENT, NEVER ON THE ASSET. MI_Pack_shell is also worn by the Core, the
+		// knife and both pack weapon meshes; a MID belongs to HandsPart alone, so nothing outside
+		// this viewmodel can see the change.
+		if (!bCyan && !bAmber)
+		{
+			const bool bUnlit = (SlotNames[Index] == TraceCharacterAssets::PackShellSlot)
+				|| (SlotNames[Index] == TraceCharacterAssets::PackCarbonSlot);
+			if (bUnlit)
+			{
+				if (UMaterialInstanceDynamic* Floor = HandsPart->CreateDynamicMaterialInstance(Index))
+				{
+					HandsUnlitMIDs.Add(Floor);
+
+					// *** AND THE SLEEVE'S OWN COPY OF `shell`, MADE HERE BECAUSE HERE IS WHERE THE
+					//     PARENT IS IN HAND. *** The two forearm tubes wear the same base material as
+					//     the glove and a DIFFERENT emissive floor — the argument is on
+					//     HandsGloveEmissiveStrength, the storage is on HandsArmMID. Created off the
+					//     MID's parent rather than off the MID, so it is a sibling of the glove's
+					//     instance and not a copy of whatever the glove happens to be set to.
+					if (SlotNames[Index] == TraceCharacterAssets::PackShellSlot && HandsArmMID == nullptr)
+					{
+						HandsArmMID = UMaterialInstanceDynamic::Create(Floor->Parent.Get(), this);
+						if (HandsArmMID != nullptr)
+						{
+							const FLinearColor& Tint = TraceCharacterLayout::ViewModelBodyEmissiveColor;
+							constexpr float Sleeve = TraceCharacterLayout::ViewModelBodyEmissiveStrength;
+							HandsArmMID->SetVectorParameterValue(TEXT("EmissiveColor"),
+								FLinearColor(Tint.R * Sleeve, Tint.G * Sleeve, Tint.B * Sleeve, 1.f));
+							HandsArmMID->SetScalarParameterValue(TEXT("EmissiveIntensity"), 1.f);
+						}
+					}
+				}
+			}
+			continue;
+		}
+
+		const UMaterialInterface* Bound = HandsPart->GetMaterial(Index);
+		const FString BoundName = (Bound != nullptr) ? Bound->GetName() : TEXT("NONE");
+		if (Bound == nullptr || BoundName.Contains(TEXT("WorldGrid")))
+		{
+			Grey += FString::Printf(TEXT("  slot %d '%s' = %s"), Index, *SlotNames[Index].ToString(), *BoundName);
+		}
+
+		if (UMaterialInstanceDynamic* MID = HandsPart->CreateDynamicMaterialInstance(Index))
+		{
+			(bCyan ? HandsCyanMIDs : HandsAmberMIDs).Add(MID);
+		}
+	}
+
+	if (!Grey.IsEmpty())
+	{
+		// LOUD, and it names the fix. A grey glove is not a subtle defect once you know to look for
+		// it, but it is invisible in a log and indistinguishable in a screenshot from "the emissive
+		// driver is broken" — which is a completely different investigation.
+		UE_LOG(LogTraceGame, Error,
+			TEXT("Pack hands: a glowing slot is still wearing the engine's grey developer material, ")
+			TEXT("so no EmissiveIntensity written here can be seen. Run ")
+			TEXT("`Scripts/bind_pack_materials.py` through the editor's Python:%s"), *Grey);
+	}
+
+	// THE FLOOR ITSELF, THROUGH THE ONE WRITER, so the build-time value and the live value can never
+	// be two different pieces of arithmetic. See ApplyHandsGloveFloor and CVarTraceHandsGloveFloor.
+	ApplyHandsGloveFloor(FMath::Clamp(CVarTraceHandsGloveFloor.GetValueOnGameThread(),
+		TraceHandsGloveFloorMin, TraceHandsGloveFloorMax));
+
+	// *** THE REST POSE, NOW. *** Not on the first action: a player who draws the gloves and stands
+	// still has no first action, and the imported instance's own EmissiveIntensity default is 1.0
+	// against an idle band centred on 1.05 / 1.00. The gap is small and the principle is not — it is
+	// the same one BuildSmgViewModel states for its much larger 1.0-vs-1.8 gap, and a rig that is
+	// drawn but has not acted must not sit at a brightness no state of the game ever asks for.
+	for (const TObjectPtr<UMaterialInstanceDynamic>& MID : HandsCyanMIDs)
+	{
+		if (MID != nullptr)
+		{
+			MID->SetScalarParameterValue(TEXT("EmissiveIntensity"), TraceCharacterLayout::HandsCyanIdleMid);
+		}
+	}
+	for (const TObjectPtr<UMaterialInstanceDynamic>& MID : HandsAmberMIDs)
+	{
+		if (MID != nullptr)
+		{
+			MID->SetScalarParameterValue(TEXT("EmissiveIntensity"), TraceCharacterLayout::HandsAmberIdleMid);
+		}
+	}
+
+	if (HandsCyanMIDs.Num() == 0 || HandsAmberMIDs.Num() == 0)
+	{
+		// Not fatal — the gloves render, they just will not breathe or flare. Loud, and it names the
+		// COUNT rather than saying "failed", because "cyan found, amber missing" is a real and much
+		// less obvious failure than finding neither: the knuckle rings would pulse and the palm node
+		// would sit dead, which reads as an art bug rather than as a lookup that missed.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("Pack hands built, but their glow is incomplete: '%s' MIDs %d, '%s' MIDs %d, across ")
+			TEXT("%d material slots (%s)."),
+			*TraceCharacterAssets::RailgunCyanSlot.ToString(), HandsCyanMIDs.Num(),
+			*TraceCharacterAssets::RailgunAmberSlot.ToString(), HandsAmberMIDs.Num(),
+			SlotNames.Num(),
+			*FString::JoinBy(SlotNames, TEXT(", "), [](const FName& N) { return N.ToString(); }));
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("%s built the pack hands' emissive (%d '%s' MIDs, %d '%s' MIDs of %d slots; rest pose ")
+		TEXT("written at cyan %.2fx / amber %.2fx; %d unlit slot(s) given the %.4f/%.4f/%.4f ")
+		TEXT("constant floor)."),
+		*GetName(),
+		HandsCyanMIDs.Num(), *TraceCharacterAssets::RailgunCyanSlot.ToString(),
+		HandsAmberMIDs.Num(), *TraceCharacterAssets::RailgunAmberSlot.ToString(),
+		SlotNames.Num(),
+		TraceCharacterLayout::HandsCyanIdleMid, TraceCharacterLayout::HandsAmberIdleMid,
+		HandsUnlitMIDs.Num(),
+		TraceCharacterLayout::ViewModelBodyEmissiveColor.R * HandsGloveFloorApplied,
+		TraceCharacterLayout::ViewModelBodyEmissiveColor.G * HandsGloveFloorApplied,
+		TraceCharacterLayout::ViewModelBodyEmissiveColor.B * HandsGloveFloorApplied);
+}
+
+void ATraceCharacter::ApplyHandsGloveFloor(float Multiplier)
+{
+	// THE STRENGTH, NOT THE COLOUR, IS WHAT THE KNOB MOVES. The tint stays
+	// ViewModelBodyEmissiveColor — it is the arena's own cool cast and the reason the glove reads as
+	// lit by the same light the rest of the viewmodel is lit by rather than as painted a new colour.
+	const float Strength = TraceCharacterLayout::HandsGloveEmissiveStrength * Multiplier;
+
+	for (const TObjectPtr<UMaterialInstanceDynamic>& MID : HandsUnlitMIDs)
+	{
+		if (MID != nullptr)
+		{
+			// Component-wise rather than `Colour * Strength`, so the alpha channel is left at 1
+			// instead of being scaled along with the RGB. Nothing reads it today; a folded alpha is
+			// the kind of thing that reads as a bug the day something does.
+			const FLinearColor& Tint = TraceCharacterLayout::ViewModelBodyEmissiveColor;
+			MID->SetVectorParameterValue(TEXT("EmissiveColor"),
+				FLinearColor(Tint.R * Strength, Tint.G * Strength, Tint.B * Strength, 1.f));
+
+			// The pack folds strength into the colour and leaves intensity at a clean 1.0 — the
+			// convention Scripts/import_pack.py writes and the one every other MI_Pack_* read here
+			// keeps. Written rather than assumed, because the imported instance's default is what
+			// this would otherwise inherit.
+			MID->SetScalarParameterValue(TEXT("EmissiveIntensity"), 1.f);
+		}
+	}
+
+	// REMEMBERED AS THE PRODUCT, not as the multiplier, because that is the number the log prints and
+	// the number a reader wants to compare against ViewModelBodyEmissiveStrength.
+	HandsGloveFloorApplied = Strength;
+}
+
+void ATraceCharacter::ApplyHandsOffHandVisibility(int32 ClipIndex)
+{
+	// Nothing to hide on the procedural cube rig — it has no bones and its left hand is deliberately
+	// ON the weapon (RailgunLeftHand), which is the composition this whole fix is trying to get back.
+	if (HandsPart == nullptr || !bHandsRigActive)
+	{
+		return;
+	}
+
+	// AN UNKNOWN CLIP SHOWS THE HAND. INDEX_NONE is the "no clip resolved" state and a value past the
+	// end of the table can only mean the table and the clip list have drifted (the static_assert
+	// catches that at compile time, so this is the runtime belt); in both cases drawing a hand the
+	// animation may be using beats deleting one it definitely is.
+	const bool bTableSaysShow =
+		(ClipIndex < 0)
+		|| (ClipIndex >= static_cast<int32>(UE_ARRAY_COUNT(TraceCharacterAssets::HandsClipShowsOffHand)))
+		|| TraceCharacterAssets::HandsClipShowsOffHand[ClipIndex];
+
+	// *** AND THE OFF HAND IS NEVER HIDDEN WHILE SOMETHING IS HANGING ON IT. *** Under spec v28 §10's
+	// dual-wield switch the blade is in the off hand on EVERY loadout and for as long as the pawn is
+	// alive (UTraceWeaponComponent's bBladeVisible), resting on GetViewModelOffHand(). Hiding the
+	// glove there would leave a knife floating with nothing holding it — a worse frame than the shard
+	// this is removing, and one that only appears when somebody flips a switch that is off today.
+	const bool bShow = bTableSaysShow || TraceMelee::IsDualWieldEnabled();
+
+	// Already in the state we want. HideBoneByName rebuilds the visibility array and dirties the
+	// render state, so it is worth the compare rather than being re-asserted on every clip change.
+	if (bShow == !bHandsOffHandHidden)
+	{
+		return;
+	}
+
+	bHandsOffHandHidden = !bShow;
+
+	if (bHandsOffHandHidden)
+	{
+		HandsPart->HideBoneByName(TraceCharacterAssets::HandsOffHandRootBone, EPhysBodyOp::PBO_None);
+	}
+	else
+	{
+		HandsPart->UnHideBoneByName(TraceCharacterAssets::HandsOffHandRootBone);
+	}
+
+	// *** forearm_left MUST STILL BE HIDDEN AFTER THIS, AND IT IS. *** The pack's own left forearm box
+	// is a child of hand_left and is hidden for good (HandsHiddenBones — it is half of the salmon
+	// wedge). Cycling its parent's visibility does not lose that: RebuildVisibilityArray only
+	// overwrites states that are not BVS_ExplicitlyHidden, so the child comes back HiddenByParent and
+	// then goes back to ExplicitlyHidden rather than to Visible. Stated here because the failure mode
+	// if it were ever untrue is the wedge silently returning on the first reload of the match.
+}
+
+bool ATraceCharacter::DebugGetHandsOffHandHidden() const
+{
+	return bHandsOffHandHidden;
+}
+
+float ATraceCharacter::GetHandsActionPulse(const TCHAR*& OutSource) const
+{
+	// NOTHING IS COMPUTED HERE ANY MORE — all three of the numbers below are published by the driver
+	// that owns each one, at the point that driver computes it. That is the whole shape of the fix
+	// described in part 2, and it is why this function no longer needs the layout constants.
+
+	// --- 1. THE WEAPON'S OWN NUMBER, when a weapon is in the hand ---------------------------------
+	//
+	// Read, never recomputed. Each gun's driver publishes the identical float its own
+	// EmissiveIntensity write is built from, so "hands and weapon pulse together" is a property of
+	// there being one variable rather than a property of two timers having been given equal lengths.
+	//
+	// ZERO ON THE FALLBACK CUBE GUN, and deliberately: a rig with no imported art has no discharge
+	// curve to share, so the hand falls through to its own clip below rather than flaring off a
+	// number nothing on screen is being driven by.
+	float WeaponPulse = 0.f;
+	const TCHAR* WeaponSource = nullptr;
+	switch (HandsLoadout)
+	{
+	case EHandsLoadout::Pistol:
+		WeaponPulse = PistolPulseNorm;
+		WeaponSource = TEXT("railgun discharge curve");
+		break;
+	case EHandsLoadout::Smg:
+		WeaponPulse = SmgPulseNorm;
+		WeaponSource = TEXT("smg shot curve");
+		break;
+	default:
+		break;
+	}
+	WeaponPulse = FMath::Clamp(WeaponPulse, 0.f, 1.f);
+
+	// --- 2. THE HAND CLIP'S OWN PLAYHEAD, for every action that has no weapon curve ----------------
+	//
+	// *** THIS IS THE ONE DEVIATION IN §5 AND IT IS A DEVIATION THE DOC FORCES. *** "The peak of ANY
+	// action" includes the stab, the reload, the throw and both jumps, and three of those happen with
+	// no firing weapon in the hand at all. The blade DOES have a curve — TraceKnifeView's StabFlare —
+	// but the only accessor that exposes it is documented, in that file, as existing for one harness
+	// and nothing else, and reaching into it from here would make a presentation seam into a
+	// dependency against its author's stated intent.
+	//
+	// So the fall-back reads the clip that IS the action — but it READS it, out of
+	// HandsClipPulseNorm, and does not re-derive it. That distinction was a real, measured bug and
+	// not a style note. This branch used to evaluate the triangle here, out of HandsClipTime, and
+	// HandsClipTime IS ALREADY THE NEXT FRAME'S PLAYHEAD by the time anything downstream can read it:
+	// UpdateHandsAnimation draws the pose at SampleTime and then advances. UpdateHandsEmissive runs
+	// later in the same Tick, so the gloves were lit for a pose that had not been drawn yet — pulse
+	// 0.159 against a drawn playhead of 0.0000 s on a 0.300 s stab, one whole frame of lead — while
+	// the blade's streak, correctly driven off ITS sampled playhead, was still on the drawn frame.
+	// The two peaked one frame apart, which is exactly the disagreement §5 exists to prevent.
+	//
+	// This is the house rule in spec v32 §8, and it is a per-frame reader of a SHORT quantity that
+	// broke it: the whole stab is eighteen frames. The fix is the same one UpdateSmgAnimation already
+	// applies to its fire phase — settle the value at the point of the draw and publish it.
+	//
+	// The shape is UTraceKnifeViewSubsystem::StabFlare's, triangle for triangle, off the SAME
+	// StabPeakFraction (see HandsActionFlare). With the hand's Stab_Knife and the blade's
+	// A_Knife_Stab both 0.300 s and both played at rate 1.0, the glove and the blade now genuinely do
+	// peak on the same frame — which is the outcome §5 is asking for and the one a paired probe line
+	// can check, because pulse must equal that triangle at the playhead printed beside it.
+	const float ClipPulse = FMath::Clamp(HandsClipPulseNorm, 0.f, 1.f);
+
+	// THE HOTTER OF THE TWO WINS, which resolves the one frame where both have something to say. On
+	// a shot the weapon is at 1.0 while the recoil clip is still at 0 (its own triangle starts at
+	// zero), so the discharge takes the frame cleanly — exactly the frame a player reads — and the
+	// clip carries the tail after the flash has fallen away.
+	if (WeaponPulse >= ClipPulse)
+	{
+		OutSource = (WeaponPulse > KINDA_SMALL_NUMBER && WeaponSource != nullptr)
+			? WeaponSource : TEXT("idle");
+		return WeaponPulse;
+	}
+
+	// The clip's NAME is not repeated here: Trace.Hands.Probe already prints it, on the line above
+	// this value, off the component itself. Naming the driver is the job; naming it twice would be a
+	// second copy of one fact and, in a Tick path, a string built sixty times a second to say it.
+	OutSource = TEXT("the hand clip's own playhead");
+	return ClipPulse;
+}
+
+void ATraceCharacter::UpdateHandsEmissive()
+{
+	if (HandsCyanMIDs.Num() == 0 && HandsAmberMIDs.Num() == 0)
+	{
+		// *** THE PROCEDURAL CUBE PATH, AND IT DEGRADES IN SILENCE. *** The fallback rig is
+		// team-coloured engine primitives with no named material slots at all, so there is nothing
+		// here to write and nothing has gone wrong. §5 is explicit that this must not warn, and it is
+		// right to be: this runs sixty times a second on a machine whose only problem is that
+		// `git lfs pull` has not been run, and a per-frame warning would bury the ONE build-time line
+		// that actually tells that player what to do. Which rig is live is reported by
+		// Trace.Hands.Probe, which is where somebody is actually looking when they ask.
+		return;
+	}
+
+	// *** THE CONSTANT FLOOR, FOLLOWED RATHER THAN RE-WRITTEN. ***
+	//
+	// The gloves' body brightness is NOT part of the breath and must not be: a hand that breathed
+	// would be a hand made of light rather than a hand lit well enough to see (HandsUnlitMIDs says
+	// so). What is live here is only the KNOB — one float compare against what is already on the
+	// material, and a write on the frames where somebody has actually moved it. So
+	// -dpcvars=Trace.Hands.GloveFloor=0 is a working A/B against the pre-v33 look with no rebuild,
+	// and a session that never touches it pays a comparison.
+	const float FloorKnob = FMath::Clamp(CVarTraceHandsGloveFloor.GetValueOnGameThread(),
+		TraceHandsGloveFloorMin, TraceHandsGloveFloorMax);
+	if (!FMath::IsNearlyEqual(TraceCharacterLayout::HandsGloveEmissiveStrength * FloorKnob,
+		HandsGloveFloorApplied, KINDA_SMALL_NUMBER))
+	{
+		ApplyHandsGloveFloor(FloorKnob);
+	}
+
+	const UWorld* World = GetWorld();
+	const float Now = (World != nullptr) ? static_cast<float>(World->GetTimeSeconds()) : 0.f;
+
+	// --- THE IDLE BREATH: A STATELESS FUNCTION OF AN ABSOLUTE CLOCK -------------------------------
+	//
+	// sin(t*w) on the world clock, exactly as ATraceCore::UpdateCoreArtEmissive argues for and for
+	// the same three reasons: an accumulator DRIFTS (a thousand additions of a float delta is not the
+	// elapsed time), DOUBLE-ADVANCES across a hitch or a paused-then-resumed frame, and DESYNCHRONISES
+	// between machines, so two players watching the same pair of gloves would see them breathing out
+	// of phase. This function remembers nothing, so none of those can happen to it.
+	const float Breath = 0.5f + 0.5f * FMath::Sin(Now * TraceCharacterLayout::HandsIdleBreathRadPerSecond);
+
+	const TCHAR* Source = nullptr;
+	const float Pulse = FMath::Clamp(GetHandsActionPulse(Source), 0.f, 1.f);
+	HandsPulseLast = Pulse;
+	HandsPulseSourceLast = Source;
+
+	// The action lifts OUT OF the idle band rather than replacing it, which is what "idle 0.95-1.15x,
+	// RISING TO 2.7x" describes: at rest the breath is the whole story, at the peak the breath is
+	// invisible under the flare, and in between the two blend with no seam and no discontinuity on
+	// the frame an action starts or ends.
+	const float Cyan = FMath::Lerp(
+		FMath::Lerp(TraceCharacterLayout::HandsCyanIdleLow, TraceCharacterLayout::HandsCyanIdleHigh, Breath),
+		TraceCharacterLayout::HandsCyanPeak, Pulse);
+	const float Amber = FMath::Lerp(
+		FMath::Lerp(TraceCharacterLayout::HandsAmberIdleLow, TraceCharacterLayout::HandsAmberIdleHigh, Breath),
+		TraceCharacterLayout::HandsAmberPeak, Pulse);
+
+	// Every matching slot written together — the knuckle rings, the palm channel and the wrist cuff
+	// are one circuit in the art and lighting only the first of them would read as a broken glove.
+	for (const TObjectPtr<UMaterialInstanceDynamic>& MID : HandsCyanMIDs)
+	{
+		if (MID != nullptr)
+		{
+			MID->SetScalarParameterValue(TEXT("EmissiveIntensity"), Cyan);
+		}
+	}
+	for (const TObjectPtr<UMaterialInstanceDynamic>& MID : HandsAmberMIDs)
+	{
+		if (MID != nullptr)
+		{
+			MID->SetScalarParameterValue(TEXT("EmissiveIntensity"), Amber);
+		}
+	}
+}
+
+FTransform ATraceCharacter::ComputeHandsWristDelta(const FName& BoneName, const FTransform& RestRig) const
+{
+	if (!bHandsRigActive || HandsPart == nullptr)
+	{
+		return FTransform::Identity;
+	}
+
+	// The bone in RIG space: component space carried out through the mesh component's own relative
+	// transform, which is where HandsScale / HandsYaw / HandsLocation live. Reading it any other way
+	// would mean re-deriving those three, which is the duplicate-constant failure this file logs by
+	// name in half a dozen places.
+	const FTransform WristNow =
+		HandsPart->GetSocketTransform(BoneName, RTS_Component) * HandsPart->GetRelativeTransform();
+
+	// `W0^-1 * W1`, in UE's apply-A-then-B order: take the authored pose out of the base pose's frame
+	// and put it back on the wrist as it stands now. A prop multiplied by this rotates about the
+	// WRIST, not about the rig origin — which is what "held" means and what a naive rig-space offset
+	// gets wrong.
+	return RestRig.Inverse() * WristNow;
+}
+
+FTransform ATraceCharacter::GetViewModelWeaponDelta() const
+{
+	return ComputeHandsWristDelta(TraceCharacterAssets::HandsWeaponBone, HandsWristRestRig);
+}
+
+FTransform ATraceCharacter::GetViewModelOffHandDelta() const
+{
+	return ComputeHandsWristDelta(TraceCharacterAssets::HandsOffHandBone, HandsOffWristRestRig);
+}
+
+bool ATraceCharacter::GetViewModelGripWristLocal(FVector& OutWristLocal) const
+{
+	// FALSE, WITH THE OUTPUT UNTOUCHED, WHEN THERE IS NO PACK RIG. The caller's own fallback is then
+	// the right answer and it must not be overwritten with a zero that would park a blade on a bone
+	// that does not exist. Same contract as GetViewModelOffHand().
+	if (!bHandsRigActive || HandsPart == nullptr)
+	{
+		return false;
+	}
+
+	OutWristLocal = HandsGripWristLocal;
+	return true;
+}
+
 void ATraceCharacter::UpdateWeaponsFollowHands()
 {
 	if (!bHandsRigActive || HandsPart == nullptr)
@@ -4084,10 +5580,29 @@ void ATraceCharacter::UpdateWeaponsFollowHands()
 	// wrist_right AS OF THIS FRAME'S POSE, in rig space, as a delta from the reference pose the
 	// weapons' rest transforms were captured against. The tick prerequisite in
 	// BuildPackHandsViewModel is what guarantees "this frame's" is true rather than nearly true.
-	const FTransform WristNow = HandsPart->GetSocketTransform(
-		TraceCharacterAssets::HandsWeaponBone, RTS_Component) * HandsPart->GetRelativeTransform();
+	HandsWristDelta = ComputeHandsWristDelta(
+		TraceCharacterAssets::HandsWeaponBone, HandsWristRestRig);
 
-	HandsWristDelta = HandsWristRestRig.Inverse() * WristNow;
+	// The off hand gets its OWN delta, and it needs one: the two wrists are not rigid with each other.
+	// At Idle_Pistol the left wrist sits at rig (-14.42, -13.64, -8.64) and by the middle of
+	// Reload_Pistol it has travelled to (0.85, 3.11, -17.07) while the right wrist has barely moved —
+	// so a left forearm carried on the right wrist's delta would be left behind on every reload.
+	// Cheap: one more socket read on a component whose pose has already been evaluated this frame.
+	HandsOffWristDelta = ComputeHandsWristDelta(
+		TraceCharacterAssets::HandsOffHandBone, HandsOffWristRestRig);
+
+	// The forearm tubes and their lit bands: the first HandsForearmRightNum entries belong to the
+	// right wrist and the rest to the left, in the order BuildViewModel added them. Same
+	// rest-times-delta rule as the weapons, so each arm is welded to its own wrist by construction
+	// rather than by a second placement anyone could forget to keep in step.
+	for (int32 Index = 0; Index < HandsForearmParts.Num(); ++Index)
+	{
+		if (HandsForearmParts[Index] != nullptr && HandsForearmRest.IsValidIndex(Index))
+		{
+			const FTransform& Delta = (Index < HandsForearmRightNum) ? HandsWristDelta : HandsOffWristDelta;
+			HandsForearmParts[Index]->SetRelativeTransform(HandsForearmRest[Index] * Delta);
+		}
+	}
 
 	// EVERY weapon part, not only the ones with an animation. UpdateRailgunFire early-outs when
 	// nothing is firing and the twelve procedural cube-gun parts never move at all, so a pass that
@@ -4210,6 +5725,160 @@ bool ATraceCharacter::DebugGetHandsState(FString& OutClipName, float& OutTimeSec
 	return true;
 }
 
+bool ATraceCharacter::DebugGetHandsEmissive(float& OutCyan, float& OutAmber,
+	int32& OutCyanSlots, int32& OutAmberSlots) const
+{
+	OutCyan = -1.f;
+	OutAmber = -1.f;
+	OutCyanSlots = HandsCyanMIDs.Num();
+	OutAmberSlots = HandsAmberMIDs.Num();
+
+	// READ BACK OFF THE LIVE MATERIAL, never off the float we last wrote. Writing a parameter name
+	// that is not on a material is a silent no-op — the exact failure DebugGetRailgunEmissive exists
+	// to catch — and a harness that reported its own intention would pass over precisely that bug.
+	bool bAny = false;
+	if (HandsCyanMIDs.Num() > 0 && HandsCyanMIDs[0] != nullptr)
+	{
+		bAny |= HandsCyanMIDs[0]->GetScalarParameterValue(TEXT("EmissiveIntensity"), OutCyan);
+	}
+	if (HandsAmberMIDs.Num() > 0 && HandsAmberMIDs[0] != nullptr)
+	{
+		bAny |= HandsAmberMIDs[0]->GetScalarParameterValue(TEXT("EmissiveIntensity"), OutAmber);
+	}
+	return bAny;
+}
+
+const TCHAR* ATraceCharacter::DebugGetHandsPulse(float& OutPulse) const
+{
+	// THE VALUE THAT WAS USED, not a fresh call to GetHandsActionPulse. Re-deriving it here would
+	// make the probe agree with itself by construction — the same argument Trace.Audio.Loudness
+	// makes for asking UTraceAudioSubsystem::VolumeFor rather than recomputing master x scale.
+	OutPulse = HandsPulseLast;
+	return (HandsPulseSourceLast != nullptr) ? HandsPulseSourceLast : TEXT("-");
+}
+
+bool ATraceCharacter::DebugGetViewModelFraming(FString& OutLine) const
+{
+	if (Camera == nullptr || ViewModelRoot == nullptr)
+	{
+		return false;
+	}
+
+	// CAMERA SPACE STRAIGHT OFF THE SCENE GRAPH. A UCameraComponent's own frame is +X out of the
+	// lens, +Y right, +Z up — the rig's own axes — so a part's transform relative to the camera IS
+	// the camera-space point ViewModelFrameFraction wants, with every live offset (sway, bob, the
+	// fire kick, the hand-follow) already folded in by the components themselves. Deriving it from
+	// the layout constants instead would only ever describe the rest pose, which is the mistake
+	// this function exists to stop being made a third time.
+	const FTransform CameraWorld = Camera->GetComponentTransform();
+
+	auto Describe = [&CameraWorld](const TCHAR* Label, const FVector& WorldPoint) -> FString
+	{
+		const FVector2D Frame = TraceCharacterLayout::ViewModelFrameFraction(
+			CameraWorld.InverseTransformPosition(WorldPoint));
+
+		// The verdict, not just the numbers. "v=-1.05" and "below the bottom edge" are the same fact,
+		// and only one of them survives being skimmed at two in the morning by the next pass.
+		const TCHAR* Verdict = (FMath::Abs(Frame.Y) <= 1.0 && FMath::Abs(Frame.X) <= 1.0)
+			? TEXT("in") : TEXT("OFF-FRAME");
+		return FString::Printf(TEXT("  %s u=%+.2f v=%+.2f %s"), Label, Frame.X, Frame.Y, Verdict);
+	};
+
+	if (HandsPart != nullptr && bHandsRigActive)
+	{
+		OutLine += Describe(TEXT("wristR"),
+			HandsPart->GetSocketLocation(TraceCharacterAssets::HandsWeaponBone));
+		OutLine += Describe(TEXT("wristL"),
+			HandsPart->GetSocketLocation(TraceCharacterAssets::HandsOffHandBone));
+
+		// *** AND THE TOP OF THE LEFT GLOVE, WHICH IS NOT THE SAME POINT AS ITS WRIST. ***
+		//
+		// The reload exemption in HandsClipShowsOffHand was argued off the wristL row above and was
+		// wrong for precisely that reason. The wrist is the ARM's end of the glove; the palm hangs
+		// off it TOWARD the lens, so a wrist sitting on the bottom edge still rasterises its
+		// `plating` knuckle caps about a tenth of a half-frame INSIDE the picture — which is the
+		// whole margin the decision turns on, and which the wristL row cannot see. That gap is the
+		// detached shard in the bottom-left corner of every one-handed frame this project has
+		// photographed, so the highest point of the hand is now MEASURED beside the wrist instead of
+		// being inferred from it.
+		//
+		// Two details that a reader will otherwise have to re-derive:
+		//   * forearm_left is skipped. It is a child of hand_left, it points back at the lens, and it
+		//     is hidden for good (HandsHiddenBones) — including it would make this row report a bone
+		//     that is never drawn, which is the same class of error as the census saying "drawn".
+		//   * the row keeps reading while the glove is HIDDEN. HideBoneByName only rewrites the
+		//     render-side visibility array; the component-space pose is still there to be asked. That
+		//     is deliberate: a check that went quiet the moment the fix worked could not show the fix
+		//     still working, and "hidden" and "off frame" are two different claims.
+		const USkeletalMesh* HandsAsset = HandsPart->GetSkeletalMeshAsset();
+		const int32 OffRootIndex = (HandsAsset != nullptr)
+			? HandsAsset->GetRefSkeleton().FindBoneIndex(TraceCharacterAssets::HandsOffHandRootBone)
+			: INDEX_NONE;
+
+		if (OffRootIndex != INDEX_NONE)
+		{
+			const FReferenceSkeleton& HandsRefSkeleton = HandsAsset->GetRefSkeleton();
+
+			int32 TopIndex = INDEX_NONE;
+			float TopV = TNumericLimits<float>::Lowest();
+			for (int32 BoneIndex = OffRootIndex; BoneIndex < HandsRefSkeleton.GetNum(); ++BoneIndex)
+			{
+				if (BoneIndex != OffRootIndex && !HandsRefSkeleton.BoneIsChildOf(BoneIndex, OffRootIndex))
+				{
+					continue;
+				}
+
+				const FName BoneName = HandsRefSkeleton.GetBoneName(BoneIndex);
+				bool bHidden = false;
+				for (const FName& Skip : TraceCharacterAssets::HandsHiddenBones)
+				{
+					bHidden |= (Skip == BoneName);
+				}
+				if (bHidden)
+				{
+					continue;
+				}
+
+				const FVector2D Frame = TraceCharacterLayout::ViewModelFrameFraction(
+					CameraWorld.InverseTransformPosition(HandsPart->GetBoneLocation(BoneName)));
+				if (Frame.Y > TopV)
+				{
+					TopV = Frame.Y;
+					TopIndex = BoneIndex;
+				}
+			}
+
+			if (TopIndex != INDEX_NONE)
+			{
+				// The bone's NAME is in the label, because "the glove's top is in frame" and "the
+				// index knuckle is in frame" are different sentences and only the second one tells
+				// the next reader which end of the hand is doing it.
+				const FName TopName = HandsRefSkeleton.GetBoneName(TopIndex);
+				OutLine += Describe(*FString::Printf(TEXT("handL_top[%s]"), *TopName.ToString()),
+					HandsPart->GetBoneLocation(TopName));
+			}
+		}
+	}
+
+	for (const TObjectPtr<UStaticMeshComponent>& Part : ViewModelParts)
+	{
+		if (Part == nullptr || !Part->IsVisible() || Part->bHiddenInGame)
+		{
+			continue;
+		}
+
+		// The arms and their bands only. The gun is measured by its own probes and by the depth rule,
+		// and a line per cube-gun part would bury the four names this is actually about.
+		const FString Name = Part->GetName();
+		if (Name.StartsWith(TEXT("VMForearm")) || Name.StartsWith(TEXT("VMCuff")))
+		{
+			OutLine += Describe(*Name, Part->GetComponentLocation());
+		}
+	}
+
+	return !OutLine.IsEmpty();
+}
+
 void ATraceCharacter::DebugHoldHandsClip(EHandsLoadout Loadout, EHandsAction Action,
 	float Alpha, float HoldSeconds)
 {
@@ -4258,6 +5927,11 @@ void ATraceCharacter::UpdateRailgunFire(float DeltaSeconds)
 
 	if (!bHeld && RailgunFireElapsed < 0.f)
 	{
+		// [SPEC v32 §5] NOTHING IS PLAYING, AND THAT HAS TO BE SAID OUT LOUD rather than left as
+		// whatever the last shot wrote. The gloves read this float every frame; a published value
+		// that went stale when the gun stopped firing would leave them welded at the discharge
+		// brightness until the next trigger pull.
+		PistolPulseNorm = 0.f;
 		return;
 	}
 
@@ -4293,6 +5967,13 @@ void ATraceCharacter::UpdateRailgunFire(float DeltaSeconds)
 	// them drifting apart the way two hand-tuned timelines would.
 	const float Mechanical = FMath::Clamp(
 		(Cyan - 1.f) / FMath::Max(TraceRailgunFireCurve::PeakCyan - 1.f, KINDA_SMALL_NUMBER), 0.f, 1.f);
+
+	// [SPEC v32 §5] AND THE GLOVES RIDE IT TOO — "drive it from the same curve as the weapon so hands
+	// and weapon pulse together", taken literally. Published here, at the point it is computed, so
+	// GetHandsActionPulse reads THIS float rather than re-deriving one of its own from the same
+	// clock: a re-derivation looks identical the day it is written and is the thing that drifts the
+	// first time anyone retunes a fire interval or pins a phase with Trace.Railgun.Hold.
+	PistolPulseNorm = Mechanical;
 
 	const float S = TraceCharacterLayout::RailgunScale;
 	const FVector Recoil(-TraceCharacterLayout::RailgunRecoilBackUU * S * Mechanical, 0.f, 0.f);
@@ -4378,7 +6059,7 @@ void ATraceCharacter::UpdateWeaponSelection()
 	// because that harness's red arm restores the v12 §7 latch defect in SetGunViewModelHidden and
 	// counts the gun parts left on screen beside the knife — and this function was quietly hiding
 	// them for it. A second owner for one rule had taken an existing verifier's red arm away. With
-	// the Knife case inert the red arm reproduces again, and the `1` state is still exactly as
+	// the Knife case inert the red arm reproduces again, and the guns-stowed state is still exactly as
 	// correct as it was before this pass, through the path that is actually tested.
 	bool bStowed = false;
 	if (Weapon != nullptr)
@@ -4538,9 +6219,17 @@ void ATraceCharacter::UpdateSmgAnimation(float DeltaSeconds)
 	// circuit_cyan idles at 1.8x and spikes to 4.8x on the shot frame. Written to ALL THREE MIDs
 	// together — body and both walls — because the channel light runs down the rails, and lighting
 	// only the body would leave the two brightest strips on the weapon dead through every shot.
+	//
+	// [SPEC v32 §5] THE FALL IS EVALUATED ONCE AND PUBLISHED, and both the gun's own glow below and
+	// the GLOVES (GetHandsActionPulse) read that one float. "Drive it from the same curve as the
+	// weapon so hands and weapon pulse together" is only structurally true if it is literally the
+	// same value; two calls to the same function with the same argument would be true today and
+	// would stop being true the moment one of them was retuned. It is written on EVERY frame,
+	// including the settled ones where the answer is 0, so it can never go stale.
+	SmgPulseNorm = TraceCharacterLayout::SmgFlashFall(FirePhase);
+
 	const float Cyan = TraceCharacterLayout::SmgCyanRest
-		+ (TraceCharacterLayout::SmgCyanPeak - TraceCharacterLayout::SmgCyanRest)
-			* TraceCharacterLayout::SmgFlashFall(FirePhase);
+		+ (TraceCharacterLayout::SmgCyanPeak - TraceCharacterLayout::SmgCyanRest) * SmgPulseNorm;
 
 	for (const TObjectPtr<UMaterialInstanceDynamic>& MID : SmgCyanMIDs)
 	{
@@ -4585,7 +6274,9 @@ void ATraceCharacter::UpdateSmgAnimation(float DeltaSeconds)
 	// The pitch sign follows the kit (-0.045 rad) and the railgun's own convention. This is the
 	// receiver rocking INSIDE the hands; the muzzle rise a player actually reads comes from
 	// ViewModelKick, which pitches the entire rig — hands included — and is not replaced here.
-	const float Recoil = TraceCharacterLayout::SmgFlashFall(FirePhase);
+	// The same normalised fall the glow above is built from — read off SmgPulseNorm rather than
+	// recomputed, for the reason stated where it is published.
+	const float Recoil = SmgPulseNorm;
 	const FVector RecoilOffset(-TraceCharacterLayout::SmgRecoilBackUU * S * Recoil, 0.f, 0.f);
 	const FRotator RecoilPitch(-TraceCharacterLayout::SmgRecoilPitchDegrees * Recoil, 0.f, 0.f);
 
@@ -4920,6 +6611,18 @@ void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
 	// it had when it was put away, so a swap back mid-burst would show a gun frozen with its walls
 	// open. Cheap insurance against a class of bug that only appears under a swap.
 	UpdateSmgAnimation(DeltaSeconds);
+
+	// [SPEC v32 §5] *** LAST, AND THE ORDER IS THE WHOLE POINT. *** The gloves' flare is the gun's own
+	// normalised discharge value remapped, and the two lines above are what publish that value for
+	// THIS frame. Run any earlier and the hands would be lit by the previous frame's shot — invisible
+	// at 60 Hz on a 0.75 s decay, and wrong in exactly the way that makes a verifier holding a pinned
+	// phase read two numbers that should be one.
+	//
+	// Below the bAnimate gate rather than above it, unlike UpdateHandsAnimation: the clip's POSITION
+	// has to keep moving while the rig is hidden (a throw starts in third person and must not snap
+	// into its own follow-through), but a hidden rig's BRIGHTNESS is not a state anything can read,
+	// and the first visible frame writes it correctly before it is drawn.
+	UpdateHandsEmissive();
 }
 
 void ATraceCharacter::NotifyWeaponFired()
@@ -5845,6 +7548,202 @@ namespace
 		}));
 
 	/**
+	 * Trace.ViewModel.Census [NearbyRadiusUU]
+	 *
+	 * Names every primitive drawn at the local player's hands, and reports the number that decides
+	 * how big each one is drawn.
+	 *
+	 * WHY THIS EXISTS. A first-person rig that looks wrong cannot be diagnosed from a screenshot: a
+	 * flat slab across the frame is equally consistent with a mis-scaled hand, a leaked one-shot
+	 * effect, and a shape authored in METRES against a component that wanted CENTIMETRES - and this
+	 * project has now shipped all three. Every probe that already exists answers for exactly one rig
+	 * (Trace.Hands.Probe for the hands, Trace.Knife.StreakProbe for the blade), so a part belonging
+	 * to none of them is invisible to all of them, which is precisely the part you are hunting when
+	 * the frame contains something nobody recognises.
+	 *
+	 * TWO PASSES, AND THE SECOND IS THE ONE THAT EARNS ITS KEEP. The first walks the pawn's own
+	 * component tree. The second sweeps every OTHER actor in the world for primitives standing inside
+	 * the viewmodel's depth range, because a leaked cosmetic actor - a tracer, a muzzle flash, a
+	 * halo that never self-deleted - is not a child of ViewModelRoot and a pawn-only walk reports a
+	 * perfectly healthy rig while the frame is full of debris.
+	 *
+	 * SIZE IS REPORTED AS THE DRAWN SIZE: the mesh's own bounds times the component's WORLD scale,
+	 * as a full width rather than a half-extent, in uu. That is the number to hold against the FX
+	 * doc, whose radii are all in metres - so the metres value is printed beside it on every line.
+	 * Doing that conversion here, once, is the whole point: it is the arithmetic the defect hides in.
+	 */
+	FAutoConsoleCommand CmdViewModelCensus(
+		TEXT("Trace.ViewModel.Census"),
+		TEXT("Trace.ViewModel.Census [NearbyRadiusUU] - name and measure every primitive drawn at the local player's hands."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const double NearbyRadius = (Args.Num() > 0)
+				? FMath::Max(1.0, static_cast<double>(FCString::Atof(*Args[0])))
+				: 400.0;
+
+			UWorld* CensusWorld = FindDebugGameWorld();
+			if (CensusWorld == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Census] No playing world."));
+				return;
+			}
+
+			ATraceCharacter* CensusPawn = nullptr;
+			for (FConstPlayerControllerIterator It = CensusWorld->GetPlayerControllerIterator(); It; ++It)
+			{
+				APlayerController* LocalPC = It->Get();
+				if (LocalPC != nullptr && LocalPC->IsLocalController())
+				{
+					CensusPawn = Cast<ATraceCharacter>(LocalPC->GetPawn());
+					if (CensusPawn != nullptr)
+					{
+						break;
+					}
+				}
+			}
+
+			if (CensusPawn == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Census] No locally controlled ATraceCharacter yet."));
+				return;
+			}
+
+			const FVector EyeWorld = CensusPawn->GetPawnViewLocation();
+
+			// One formatter for both passes, so a pawn part and a piece of loose debris are described
+			// in the same units and can be compared without translating between two report formats.
+			auto DescribePrimitive = [](UPrimitiveComponent* Prim) -> FString
+			{
+				FVector LocalExtent = FVector::ZeroVector;
+				FString AssetName = TEXT("<no-mesh>");
+
+				if (const UStaticMeshComponent* AsStatic = Cast<UStaticMeshComponent>(Prim))
+				{
+					if (AsStatic->GetStaticMesh() != nullptr)
+					{
+						LocalExtent = AsStatic->GetStaticMesh()->GetBounds().BoxExtent;
+						AssetName = AsStatic->GetStaticMesh()->GetName();
+					}
+				}
+				else if (const USkeletalMeshComponent* AsSkeletal = Cast<USkeletalMeshComponent>(Prim))
+				{
+					if (AsSkeletal->GetSkeletalMeshAsset() != nullptr)
+					{
+						LocalExtent = AsSkeletal->GetSkeletalMeshAsset()->GetBounds().BoxExtent;
+						AssetName = AsSkeletal->GetSkeletalMeshAsset()->GetName();
+					}
+				}
+
+				const FVector CompScale = Prim->GetComponentScale();
+				const FVector DrawnUU = LocalExtent * 2.0 * CompScale;   // full width, not half-extent
+				const double LongestUU = DrawnUU.GetMax();
+
+				// *** THE REFERENCE SIZE ABOVE CANNOT SEE A BROKEN POSE, AND THAT IS THE WHOLE
+				// REASON THIS SECOND NUMBER EXISTS. *** GetBounds() on the ASSET answers with the
+				// bind pose the mesh was imported at, so a skinned mesh whose bones have been
+				// dragged apart - the classic symptom of a rig posed from the wrong skeleton, or
+				// of a scale applied twice - reports a perfectly healthy 0.40 m while filling the
+				// frame with smeared triangles. Prim->Bounds is what the renderer is actually
+				// culling against THIS FRAME. When LIVE is much larger than the drawn size, the
+				// pose is the defect and no amount of retuning the component's scale will help.
+				const FVector LiveUU = Prim->Bounds.BoxExtent * 2.0;
+
+				// The material on slot 0 is enough to tell a translucent FX shape from a lit prop,
+				// which is the distinction that identifies an unrecognised slab at a glance.
+				FString FirstMaterial = TEXT("<none>");
+				if (Prim->GetNumMaterials() > 0)
+				{
+					if (const UMaterialInterface* SlotZero = Prim->GetMaterial(0))
+					{
+						FirstMaterial = SlotZero->GetName();
+					}
+				}
+
+				return FString::Printf(
+					TEXT("mesh=%-22s drawn=(%.1f, %.1f, %.1f)uu longest=%.1fuu (%.3f m) LIVE=(%.1f, %.1f, %.1f)uu scale=(%.3f, %.3f, %.3f) mats=%d mat0=%s"),
+					*AssetName, DrawnUU.X, DrawnUU.Y, DrawnUU.Z, LongestUU, LongestUU / 100.0,
+					LiveUU.X, LiveUU.Y, LiveUU.Z,
+					CompScale.X, CompScale.Y, CompScale.Z, Prim->GetNumMaterials(), *FirstMaterial);
+			};
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Census] ==== pawn %s, eye at %s, nearby radius %.0fuu ===="),
+				*CensusPawn->GetName(), *EyeWorld.ToCompactString(), NearbyRadius);
+
+			// --- Pass 1: everything the pawn itself owns ---------------------------------------
+			TArray<UPrimitiveComponent*> PawnPrims;
+			CensusPawn->GetComponents<UPrimitiveComponent>(PawnPrims);
+
+			int32 VisibleCount = 0;
+			for (UPrimitiveComponent* Prim : PawnPrims)
+			{
+				if (Prim == nullptr)
+				{
+					continue;
+				}
+
+				const bool bDrawn = Prim->IsVisible() && !Prim->bHiddenInGame;
+				if (bDrawn)
+				{
+					++VisibleCount;
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Census]  %-22s %-3s fp=%d ownerOnly=%d ownerNoSee=%d dist=%6.1fuu  %s"),
+					*Prim->GetName(),
+					bDrawn ? TEXT("ON") : TEXT("off"),
+					static_cast<int32>(Prim->FirstPersonPrimitiveType),
+					Prim->bOnlyOwnerSee ? 1 : 0,
+					Prim->bOwnerNoSee ? 1 : 0,
+					FVector::Dist(Prim->GetComponentLocation(), EyeWorld),
+					*DescribePrimitive(Prim));
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[Census]  -- %d component(s), %d drawn --"),
+				PawnPrims.Num(), VisibleCount);
+
+			// --- Pass 2: anything ELSE standing in the viewmodel's depth range -----------------
+			//
+			// This is the leaked-actor pass. Reported separately and named loudly, because a hit
+			// here is never normal: nothing but the local pawn's own rig has any business being a
+			// few tens of uu from the lens.
+			int32 IntruderCount = 0;
+			for (TActorIterator<AActor> ActorIt(CensusWorld); ActorIt; ++ActorIt)
+			{
+				AActor* Candidate = *ActorIt;
+				if (Candidate == nullptr || Candidate == CensusPawn)
+				{
+					continue;
+				}
+
+				TArray<UPrimitiveComponent*> OtherPrims;
+				Candidate->GetComponents<UPrimitiveComponent>(OtherPrims);
+				for (UPrimitiveComponent* Prim : OtherPrims)
+				{
+					if (Prim == nullptr || !Prim->IsVisible() || Prim->bHiddenInGame)
+					{
+						continue;
+					}
+
+					const double DistUU = FVector::Dist(Prim->GetComponentLocation(), EyeWorld);
+					if (DistUU > NearbyRadius)
+					{
+						continue;
+					}
+
+					++IntruderCount;
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[Census]  NEAR-CAMERA %s.%s dist=%.1fuu  %s"),
+						*Candidate->GetName(), *Prim->GetName(), DistUU, *DescribePrimitive(Prim));
+				}
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Census] ==== %d non-pawn primitive(s) within %.0fuu of the lens ===="),
+				IntruderCount, NearbyRadius);
+		}));
+
+	/**
 	 * Trace.DebugCrouch [HoldSeconds] [DelaySeconds]
 	 *
 	 * Pulses the crouch/slide input on the local player, so the slide presentation can be
@@ -6430,6 +8329,72 @@ namespace
 		}
 	}
 
+	/**
+	 * *** SPEC v32 §7d — WHICH WEAPON IS ON WHICH NUMBER KEY, ASKED RATHER THAN REMEMBERED. ***
+	 *
+	 * Trace.ViewModel.Equip shipped with the PRE-REVERT numbering hard-coded — "1 stows, 2 pistol,
+	 * 3 SMG" — which was true under spec v29 §5 and stopped being true in Demo 26, when the binds
+	 * moved to 1 = PISTOL, 2 = SMG, 3 = KNIFE. A harness that names the wrong state is worse than one
+	 * that fails: every screenshot it took was correctly labelled with the wrong caption.
+	 *
+	 * The fix is not to re-type the new numbering, because that is the same defect with a later date
+	 * on it. UTraceUserSettings IS the live bind table — it is what the player's keyboard actually
+	 * goes through, migrations and rebinds included — so this asks it which of the three equip actions
+	 * owns the number key in question, and only falls back to the shipped default when a player has
+	 * rebound that key away from all three.
+	 *
+	 * That also makes the command follow a REBIND, which is the behaviour a harness wants: "slot 2"
+	 * means "what the 2 key does on this machine", so a screenshot and the keyboard cannot disagree.
+	 *
+	 * @param OutHow  filled with how the answer was reached, so the log line can say so.
+	 */
+	ETraceEquippedWeapon ViewModelEquipSlotWeapon(int32 Slot, FString& OutHow)
+	{
+		// BUILT HERE AND NOT AT NAMESPACE SCOPE. EKeys' statics are constructed during module
+		// startup, so an FKey living in a global would not reliably exist yet — the same trap
+		// FTraceInputActionInfo::DefaultKey is a function pointer to avoid.
+		const FKey Pressed = (Slot == 1) ? EKeys::One : ((Slot == 2) ? EKeys::Two : EKeys::Three);
+
+		const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+		struct FEquipRow
+		{
+			ETraceInputAction Action;
+			ETraceEquippedWeapon Weapon;
+		};
+		const FEquipRow Rows[] =
+		{
+			{ ETraceInputAction::EquipGun,   ETraceEquippedWeapon::Gun },
+			{ ETraceInputAction::EquipSmg,   ETraceEquippedWeapon::Smg },
+			{ ETraceInputAction::EquipKnife, ETraceEquippedWeapon::Knife },
+		};
+
+		for (const FEquipRow& Row : Rows)
+		{
+			// ActionUsesKey, not GetKey — spec v28 §3c gave every action up to two binds and a second
+			// slot holding the number key is just as real a bind as the first.
+			if (Settings.ActionUsesKey(Row.Action, Pressed))
+			{
+				OutHow = FString::Printf(TEXT("live bind table: %s -> %s"),
+					*UTraceUserSettings::DescribeKey(Pressed),
+					TraceInputActions::Info(Row.Action).DisplayName);
+				return Row.Weapon;
+			}
+		}
+
+		// NOBODY OWNS THAT KEY. A player may unbind or re-map it, and a dev command that then refused
+		// to do anything would be a worse tool than one that says what it assumed. Demo 26's shipped
+		// numbering, named as an assumption rather than presented as a fact.
+		OutHow = FString::Printf(TEXT("no action is bound to %s; assuming Demo 26's shipped numbering"),
+			*UTraceUserSettings::DescribeKey(Pressed));
+		switch (Slot)
+		{
+		case 1:  return ETraceEquippedWeapon::Gun;
+		case 2:  return ETraceEquippedWeapon::Smg;
+		default: return ETraceEquippedWeapon::Knife;
+		}
+	}
+
 	FAutoConsoleCommand CmdViewModelGuns(
 		TEXT("Trace.ViewModel.Guns"),
 		TEXT("Spec v30 §2. Reports which of the THREE weapon states is on screen and whether it agrees "
@@ -6563,30 +8528,38 @@ namespace
 	 *
 	 * So this waits for a living local pawn, then equips, and each invocation carries its OWN delay:
 	 *
-	 *     -TraceExec="Trace.ViewModel.Equip 2 0|Trace.ViewModel.Equip 3 4|Trace.ViewModel.Equip 1 8"
+	 *     -TraceExec="Trace.ViewModel.Equip 1 0|Trace.ViewModel.Equip 2 4|Trace.ViewModel.Equip 3 8"
 	 *     -TraceAutoShot=42 -TraceAutoShotRepeat=4
 	 *
-	 * ...photographs the pistol, the SMG and the stowed state in a single run.
+	 * ...photographs the pistol, the SMG and the knife in a single run.
+	 *
+	 * *** SPEC v32 §7d: THE NUMBERING IS NO LONGER WRITTEN DOWN HERE AT ALL. *** It used to say
+	 * "1 stows, 2 pistol, 3 SMG", which was v29 §5's arrangement and was made wrong by Demo 26's
+	 * revert to 1 = PISTOL, 2 = SMG, 3 = KNIFE — so this command spent a whole spec cycle putting the
+	 * pawn in one state and labelling the screenshot with another. Re-typing the new numbering would
+	 * be the identical defect with a later date on it, so the slot is now resolved against
+	 * UTraceUserSettings' live bind table instead; see ViewModelEquipSlotWeapon.
 	 */
 	FAutoConsoleCommand CmdViewModelEquip(
 		TEXT("Trace.ViewModel.Equip"),
 		TEXT("Trace.ViewModel.Equip <1|2|3> [DelaySeconds] [TimeoutSeconds]. Dev only. Puts the local "
-		     "player in one of the three weapon states through the SHIPPED equip path, waiting for a "
-		     "pawn to exist first. 1 stows, 2 pistol, 3 SMG."),
+		     "player in the weapon state that NUMBER KEY is bound to, through the SHIPPED equip path, "
+		     "waiting for a pawn to exist first. The slot is resolved against the live keybind table "
+		     "(spec v32 §7d), so it follows a rebind and cannot go stale the way a hard-coded "
+		     "numbering did; the shipped default is 1 pistol, 2 SMG, 3 knife."),
 		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
 		{
-			const int32 Slot = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 3;
+			const int32 Slot = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 1;
 			const float Delay = (Args.Num() > 1) ? FMath::Max(0.f, FCString::Atof(*Args[1])) : 0.f;
 			const float Timeout = (Args.Num() > 2) ? FMath::Max(1.f, FCString::Atof(*Args[2])) : 90.f;
 
-			ETraceEquippedWeapon Desired = ETraceEquippedWeapon::Smg;
-			if (Slot == 1) { Desired = ETraceEquippedWeapon::Knife; }
-			else if (Slot == 2) { Desired = ETraceEquippedWeapon::Gun; }
+			FString How;
+			const ETraceEquippedWeapon Desired = ViewModelEquipSlotWeapon(Slot, How);
 
 			double ElapsedSeconds = 0.0;
 			FTSTicker::GetCoreTicker().AddTicker(
 				FTickerDelegate::CreateLambda(
-					[ElapsedSeconds, Slot, Desired, Delay, Timeout](float DeltaTime) mutable -> bool
+					[ElapsedSeconds, Slot, Desired, Delay, Timeout, How](float DeltaTime) mutable -> bool
 				{
 					ElapsedSeconds += DeltaTime;
 					if (ElapsedSeconds < Delay)
@@ -6625,8 +8598,8 @@ namespace
 					// off by one frame and read as the equip having failed. Ask Trace.ViewModel.Guns
 					// (which takes a delay for exactly this reason) for the settled answer.
 					UE_LOG(LogTraceGame, Display,
-						TEXT("[ViewModel.Equip] slot %d (%s) -> %s (refusal=%d); rig drawn as of the previous frame: %s."),
-						Slot, LexToString(Desired), bOk ? TEXT("accepted") : TEXT("REFUSED"),
+						TEXT("[ViewModel.Equip] slot %d (%s, via %s) -> %s (refusal=%d); rig drawn as of the previous frame: %s."),
+						Slot, LexToString(Desired), *How, bOk ? TEXT("accepted") : TEXT("REFUSED"),
 						static_cast<int32>(Refusal), ViewModelShownGunName(Character->GetShownGun()));
 					return false;
 				}),
@@ -6712,12 +8685,131 @@ namespace
 							W.GetLocation().X, W.GetLocation().Y, W.GetLocation().Z);
 					}
 
+					// *** [v32 §8] THE DELTA, WHICH IS THE NUMBER THE KNIFE DEFECT WAS INVISIBLE
+					//     WITHOUT. ***
+					//
+					// wristRig above says WHERE the hand is; this says how far the hand has walked
+					// from the base pose every prop's rig-space transform is authored against. It is
+					// the multiplier the guns, the forearms and (since v32 §8) the blade are all
+					// carried by, so a prop that is NOT riding it shows up here as a large number
+					// beside a picture of something lying next to the fist instead of in it.
+					//
+					// Printed as a distance AND an angle because the angle is the half that does the
+					// damage: 1.3 uu of translation is a few pixels, while the same wrist rotated 20
+					// degrees swings a grip 7.8 uu away by nearly 3 uu. A translation-only readout
+					// would have said "the hand barely moved" and been believed.
+					//
+					// It must read ~0.00 uu / ~0.0 deg on Idle_Pistol (that IS the base pose) and on
+					// the cube fallback (no skeleton, so nothing can move) — two standing red arms
+					// for the same line.
+					const FTransform WristDelta = Character->GetViewModelWeaponDelta();
+					const FString Delta = FString::Printf(TEXT("%.2fuu/%.1fdeg"),
+						WristDelta.GetLocation().Size(),
+						FMath::RadiansToDegrees(WristDelta.GetRotation().GetAngle()));
+
+					// *** THE TWO NUMBERS §7a IS ABOUT, PRINTED SIDE BY SIDE AND PERMANENTLY. ***
+					//
+					// The stab clip used to be gated on the SHOOT LOCKOUT, which a knife swing never
+					// touches; it sets the SWING COOLDOWN. Printing both is the standing red arm for
+					// that fix: during a real swing the cooldown is non-zero and the lockout is flat
+					// zero, so the predicate that used to live there is provably, not arguably,
+					// incapable of firing. Anyone who ever wonders why the rule changed can read it
+					// off one probe line instead of re-deriving the argument.
+					// *** offHand IS PRINTED BECAUSE "OFF SCREEN" AND "NOT DRAWN" ARE THE SAME
+					//     SCREENSHOT AND ONLY ONE OF THEM IS THIS FILE'S DOING. *** The framing block
+					//     below already says the left wrist is at v = -1.14; it cannot say whether the
+					//     palm hanging off it is still being rasterised into the bottom-left corner.
+					//     It must read SHOWN on every Core clip and on all four walljumps, and HIDDEN
+					//     on the one-handed idles, on both shoots AND ON BOTH RELOADS — that pairing
+					//     is the standing check on TraceCharacterAssets::HandsClipShowsOffHand. The
+					//     reloads are named because they used to be the exemption and the frame
+					//     disagreed; the handL_top row in the framing block is what settles it now.
 					UE_LOG(LogTraceGame, Display,
-						TEXT("[Hands] rig=%s loadout=%s clip=%s t=%.4f/%.4fs wristRig=%s vmVisible=%d shownGun=%s"),
+						TEXT("[Hands] rig=%s loadout=%s clip=%s t=%.4f/%.4fs wristRig=%s wristDelta=%s vmVisible=%d ")
+						TEXT("offHand=%s shownGun=%s swingCooldown=%.4fs shootLockout=%.4fs"),
 						bPack ? TEXT("PACK (SK_TraceHands)") : TEXT("PROCEDURAL CUBES (fallback)"),
-						*Loadout, *Clip, Time, Length, *Wrist,
+						*Loadout, *Clip, Time, Length, *Wrist, *Delta,
 						Character->IsViewModelVisible() ? 1 : 0,
-						ViewModelShownGunName(Character->GetShownGun()));
+						Character->DebugGetHandsOffHandHidden() ? TEXT("HIDDEN") : TEXT("shown"),
+						ViewModelShownGunName(Character->GetShownGun()),
+						TraceMelee::GetSwingCooldownRemaining(Character),
+						TraceMelee::GetShootLockoutRemaining(Character));
+
+					// [SPEC v32 §5] THE GLOW, ON ITS OWN LINE, AND IT NAMES THE DRIVER.
+					//
+					// Two brightness numbers that happen to move together are not evidence that the
+					// gloves are on the weapon's curve; the SOURCE string is, because it says which
+					// fact answered this frame. And the slot counts are here because "0 slots" and
+					// "the driver is broken" produce the identical screenshot and have completely
+					// different fixes — the SMG's magazine taught that one.
+					float Cyan = -1.f, Amber = -1.f;
+					int32 CyanSlots = 0, AmberSlots = 0;
+					const bool bReadBack = Character->DebugGetHandsEmissive(Cyan, Amber, CyanSlots, AmberSlots);
+
+					float Pulse = 0.f;
+					const TCHAR* PulseSource = Character->DebugGetHandsPulse(Pulse);
+
+					if (!bPack)
+					{
+						// The fallback has no named slots and never will. Said once per probe, not
+						// once per frame — see UpdateHandsEmissive for why the driver itself is mute.
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[Hands] emissive: n/a on PROCEDURAL CUBES (fallback) - that rig has ")
+							TEXT("no circuit_cyan/core_amber slots to drive, which is a degrade and ")
+							TEXT("not a fault."));
+					}
+					else
+					{
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[Hands] emissive: cyan=%.3f (idle %.2f-%.2f, peak %.2f) amber=%.3f ")
+							TEXT("(idle %.2f-%.2f, peak %.2f) slots cyan=%d amber=%d pulse=%.3f from '%s' -- readback %s"),
+							Cyan, TraceCharacterLayout::HandsCyanIdleLow, TraceCharacterLayout::HandsCyanIdleHigh,
+							TraceCharacterLayout::HandsCyanPeak,
+							Amber, TraceCharacterLayout::HandsAmberIdleLow, TraceCharacterLayout::HandsAmberIdleHigh,
+							TraceCharacterLayout::HandsAmberPeak,
+							CyanSlots, AmberSlots, Pulse, PulseSource,
+							bReadBack ? TEXT("OK") : TEXT("FAILED - EmissiveIntensity is not on the material"));
+
+						// *** WHAT THE GLOVES ARE ACTUALLY WEARING. *** A v31 verifier found every
+						// pack mesh on WorldGridMaterial, the grey developer checkerboard, because
+						// Interchange bound none of the MI_Pack_* instances it had just created. That
+						// is fixed, and "fixed once" is not "still fixed" — a re-import undoes it
+						// silently — so the live binding is printed rather than assumed. A MID is
+						// reported by its PARENT, since that is the asset the question is about.
+						if (const USkeletalMeshComponent* Hands = Character->GetViewModelHandsMesh())
+						{
+							const TArray<FName> Slots = Hands->GetMaterialSlotNames();
+							FString Line;
+							for (int32 Index = 0; Index < Slots.Num(); ++Index)
+							{
+								const UMaterialInterface* Bound = Hands->GetMaterial(Index);
+								const UMaterialInstanceDynamic* AsMid = Cast<UMaterialInstanceDynamic>(Bound);
+								const UMaterialInterface* Report =
+									(AsMid != nullptr && AsMid->Parent != nullptr) ? AsMid->Parent.Get() : Bound;
+								Line += FString::Printf(TEXT("  %s=%s%s"),
+									*Slots[Index].ToString(),
+									(Report != nullptr) ? *Report->GetName() : TEXT("NONE"),
+									(AsMid != nullptr) ? TEXT(" (MID)") : TEXT(""));
+							}
+							UE_LOG(LogTraceGame, Display, TEXT("[Hands] live materials:%s"), *Line);
+						}
+					}
+
+					// *** AND WHETHER ANY OF IT IS ACTUALLY IN THE FRAME. ***
+					//
+					// Printed for BOTH rigs, because the comparison is the point: the fallback's two
+					// bands sit at v = -0.90 and photograph correctly, and the shipped pack rig had
+					// its right band at -1.05 and its whole left arm past -1.22. Those are three
+					// numbers that say "off the bottom of the screen" and a census that said
+					// "drawn" — see DebugGetViewModelFraming for how long that cost.
+					FString Framing;
+					if (Character->DebugGetViewModelFraming(Framing))
+					{
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[Hands] framing (fraction of the half-frame through the ")
+							TEXT("FIRST-PERSON lens; |v|<=1 is on screen, -1 is the bottom edge):%s"),
+							*Framing);
+					}
 					return false;
 				}),
 				0.f);

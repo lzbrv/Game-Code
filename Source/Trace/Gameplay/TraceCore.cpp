@@ -18,6 +18,7 @@
 #include "Core/TraceGameState.h"
 #include "Core/TraceMatchTypes.h"      // TraceIsGoalMode (mode B)
 #include "Core/TracePlayerState.h"
+#include "Gameplay/TraceFxShapes.h"           // SPEC v32 §3: the shared FX shape library
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceTrailComponent.h"
 #include "World/TraceArenaBuilder.h"
@@ -55,6 +56,7 @@
 #include "Containers/Ticker.h"                  // FTSTicker (Trace.Integ.TurnoverDemo)
 #include "HAL/PlatformFileManager.h"            // CreateDirectoryTree (Trace.Core.ArtShots)
 #include "Misc/DateTime.h"                      // screenshot filenames (Trace.Core.ArtShots)
+#include "HAL/FileManager.h"                    // IFileManager::Move (Trace.Core.ArtShots renames)
 #include "Misc/Paths.h"                         // FPaths::Combine  (Trace.Integ.TurnoverDemo)
 #include "TimerManager.h"                       // spec v31 §4: the art-shot beat schedule
 #include "UnrealClient.h"                       // FScreenshotRequest (Trace.Integ.TurnoverDemo)
@@ -123,8 +125,92 @@ namespace TraceCoreTuning
 
 	// --- Cosmetics --------------------------------------------------------------------------------
 
-	/** Orb centre above the holder's capsule centre. Capsule half-height is 88, so this clears the head. */
+	/**
+	 * WHERE THE CORE ACTOR SITS ON ITS HOLDER, and it is NOT where the ball is drawn any more.
+	 *
+	 * Still 150 uu straight up the capsule axis, because three separate things are written against
+	 * that number: the beacon's centre ((BeaconTop + BeaconBottom)/2 - OrbHeight), Trace.Core.ArtShots'
+	 * camera aim, and TickTeleportAudit's per-frame jump detector, which would cry wolf on every
+	 * possession change if the actor itself moved into a hand. The BALL moved instead - see ArtRoot
+	 * and CarryCradle* below - so this stayed exactly as it was and no gameplay read had to be
+	 * re-checked one at a time.
+	 */
 	constexpr double OrbHeight = 150.0;
+
+	// --- The carried ball's cradle ------------------------------------------------------------------
+	//
+	// ALL IN UNREAL UNITS (cm), and all in the CARRIER'S ACTOR FRAME: +X forward, +Y right, +Z up.
+	// That frame is safe to author in because ApplyAttachment snaps the Core to its holder and zeroes
+	// the relative rotation, and the character never uses controller pitch or roll - so the Core
+	// actor's axes ARE the carrier's, world up is preserved, and none of this can be tilted by a
+	// look. Taking the offset out of `hand_r`'s own bone axes instead would have put that at risk:
+	// this project's knife rig had to MEASURE its hand-space cant because the axes did not read the
+	// way anyone expected.
+
+	/**
+	 * MEASURED off Saved/Screenshots/TraceAutoShot_Match_20260821_151039_05.png, which is the frame
+	 * that recorded the defect. The Manny is 311 px tall for 180 uu there (1.728 px/uu) and the right
+	 * fist's centroid sits 25 uu outboard of the body centreline at capsule-centre height.
+	 *
+	 * Used ONLY when `hand_r` does not resolve - a machine with no mannequin import draws a 34 uu
+	 * radius cylinder instead, and this keeps the ball at that pawn's right hip rather than at the
+	 * component origin, i.e. lying at its feet. Logged once when it is taken, the way a missing
+	 * mannequin is logged.
+	 */
+	constexpr double CarryHandRestRight = 25.0;
+
+	/**
+	 * `hand_r` IS THE WRIST, NOT THE FIST, and the previous pass hung the ball off the wrist.
+	 *
+	 * MEASURED this pass, off the live rig rather than off a picture: Trace.Core.CarryProbe on a
+	 * standing carrier prints `hand_r` at actor-local (-5.0, 25.8, -1.0) uu - hip height, the arm
+	 * straight down. The closed hand ABP_Unarmed rests in runs on from there down the forearm, and
+	 * its centroid is about 7 uu past the joint. Anchoring the ball to the JOINT put the whole hand
+	 * between the anchor and the ball, which is how a 10 uu "lift" became a visible air gap under an
+	 * empty fist.
+	 *
+	 * Taken along the LIVE `lowerarm_r` -> `hand_r` direction where that bone resolves, so the anchor
+	 * swings with the run cycle instead of assuming the arm hangs; straight down is the fallback.
+	 */
+	constexpr double CarryFistReach = 7.0;
+
+	/**
+	 * The ball's centre RELATIVE TO THE FIST, and it is BOUNDED, not merely authored.
+	 *
+	 * The ball rests ON the closed hand: 6 uu outboard so its inboard shell clears the thigh, 8 uu up
+	 * so the fist is buried in the lower shell rather than dangling beneath it. |(0, 6, 8)| = 10.0 uu
+	 * against the ball's NARROW half-extent of 11.9 uu (see GetDrawnBallHalfExtentUU), so the fist's
+	 * centroid sits 1.9 uu inside the shell at the ball's worst spin angle and deeper at every other.
+	 *
+	 * *** THE BOUND IS THE FIX, NOT THE THREE NUMBERS. *** What shipped before was three hand-authored
+	 * numbers whose comment asserted "the fist 7 uu INSIDE the ball's surface" against a radius of
+	 * 20 uu - the radius of the ENGINE SPHERE the pack ball replaced. The drawn ball is a 40.0 x 23.8
+	 * x 23.8 uu football, so the true cross-radius is 11.9 and the same offset left the hand 10 uu
+	 * clear of the shell with sky behind it. UpdateCarriedArtPlacement now CLAMPS this vector to the
+	 * ball's own drawn half-extent, so no value of the three console knobs - and no re-export at a new
+	 * size - can put the ball back out of the hand. That is the invariant Trace.Core.CarryProbe
+	 * prints, and Trace.Core.CarryOffsetUp 40 is the red arm that makes the clamp fire.
+	 *
+	 * NOT a chest cradle, which is what the pack's README describes and what a first-person hold would
+	 * want: the carry camera is directly BEHIND the holder, so a ball held at the sternum is occluded
+	 * by the holder's own back and the fix would be invisible in the only view it exists for. The pawn
+	 * also has no carry POSE - the third-person mesh runs Epic's ABP_Unarmed, whose arms hang at the
+	 * sides, and Epic ships no carry clip with it - so what is available here is where the ball goes,
+	 * not where the arm goes. Posing the arm needs an animation asset and is ATraceCharacter's
+	 * business, not this actor's.
+	 */
+	constexpr double CarryCradleForward = 0.0;
+	constexpr double CarryCradleRight = 6.0;
+	constexpr double CarryCradleUp = 8.0;
+
+	/**
+	 * How far inside the ball's shell the fist's centroid must end up, uu, once the clamp has run.
+	 *
+	 * Not zero: tangency is not a grip. At exactly the half-extent the fist's centre would be ON the
+	 * silhouette edge and half the hand would still be outside it, which photographs as a ball resting
+	 * against a hand rather than in one. 2 uu of bite puts the near half of the hand under the shell.
+	 */
+	constexpr double CarryGripBite = 2.0;
 
 	/**
 	 * MEASURED. The first pass ran this at 0.55 (a 55uu orb) with a glow of 2.4, and captured frames
@@ -2153,6 +2239,49 @@ namespace TraceCoreArt
 	/** "both breathe on a slow ~2 s cycle" / "pulsing about 2.5 Hz". */
 	constexpr float IdleBreathHz = 0.5f;
 	constexpr float CarriedPulseHz = 2.5f;
+
+	// --- SPEC v32 §3 GEOMETRY ----------------------------------------------------------------------
+	//
+	// *** THE FX DOC IS IN METRES. UNREAL IS IN CENTIMETRES. *** Every number below is the doc's own
+	// figure x100, written out with the metric original beside it so the conversion is checkable by
+	// eye. The uu -> BasicShape-scale half of the conversion is NEVER done here: it is
+	// UTraceFxShapes::ShapeScaleForRadiusUU, the one named constant SPEC v32 §1 asks for, and a
+	// hand-rolled /100 anywhere in this file would be the 100x class of bug that rule exists to stop.
+
+	/** "a one-shot icosahedron halo (r 0.20)" — 0.20 m = 20 uu, i.e. the ball's own drawn radius. */
+	constexpr float PickupHaloRadiusUU = 20.f;
+
+	/** "expanding 0.6 -> 2.1x". Starts INSIDE the 20 uu ball and ends at twice its size. */
+	constexpr float PickupHaloScaleStart = 0.6f;
+	constexpr float PickupHaloScaleEnd = 2.1f;
+
+	/** "a tapered trail cylinder (r 0.055 -> 0.012)" — 5.5 uu at the ball, 1.2 uu at the tail. */
+	constexpr float ThrownTrailHeadRadiusUU = 5.5f;
+	constexpr float ThrownTrailTailRadiusUU = 1.2f;
+
+	/**
+	 * How many stacked cylinders the taper is made of.
+	 *
+	 * THREE, matching the beam's, and the visible cost is the step between segments: 5.5 -> 1.2 uu
+	 * over three segments is a step of 1.4 uu, i.e. under a centimetre and a half, on geometry that
+	 * is moving at 1500-2200 uu/s several metres from the camera. See UTraceFxShapes::TaperAlongLocalZ
+	 * for the full argument, including why this is not a cone.
+	 */
+	constexpr int32 ThrownTrailSegmentCount = 3;
+
+	/**
+	 * The trail's opacity floor and ceiling across the flight. "peaking mid-flight" — see
+	 * ATraceCore::UpdateCoreArtGeometry for how the peak is found without a second clock.
+	 *
+	 * The FLOOR is not zero on purpose: the FX doc asks for a trail that "streams behind the ball",
+	 * and a trail that vanishes on the way up and on the way down would be a trail the player only
+	 * ever catches out of the corner of their eye. The doc's word is "peaking", not "only".
+	 */
+	constexpr float ThrownTrailMinOpacity = 0.35f;
+	constexpr float ThrownTrailMaxOpacity = 0.90f;
+
+	/** The same shape applied to LENGTH: shortest at the ends of the arc, full length at the apex. */
+	constexpr float ThrownTrailMinLengthScale = 0.45f;
 }
 
 /**
@@ -2198,6 +2327,43 @@ static TAutoConsoleVariable<float> CVarCoreHeartLightRadius(
 	TEXT("gameplay-tunable. 0 switches the light off entirely."),
 	ECVF_Default);
 
+/**
+ * SPEC v32 §3. 1 (default): draw the pickup halo and the thrown trail. 0: neither.
+ *
+ * A CONSOLE VARIABLE AND NOT A UTraceSettings CONFIG KNOB, deliberately, and the same call the rest
+ * of this block already made: Trace.Core.PackArt, Trace.Core.RestSpinRevPerSecond,
+ * Trace.Core.FlightSpinRevPerSecond and both heart-light knobs are CVars too. The house rule
+ * ("every new knob is UPROPERTY(config) in TraceSettings.h") is about GAMEPLAY tunables that a
+ * designer sets and ships; this is the A/B switch for a piece of decoration, it changes no rule, and
+ * putting it in the settings panel would advertise it as something a player should have an opinion
+ * about. Said out loud here rather than left as an omission.
+ */
+static TAutoConsoleVariable<int32> CVarCoreFxGeometry(
+	TEXT("Trace.Core.FxGeometry"),
+	1,
+	TEXT("SPEC v32 §3. 1 (default): draw unreal-fx_README's two pieces of Core geometry - the ")
+	TEXT("one-shot pickup halo (icosphere r 20 uu, 0.6 -> 2.1x over the Pickup clip) and the tapered ")
+	TEXT("thrown trail (r 5.5 -> 1.2 uu, peaking mid-flight). 0: neither, for the A/B."),
+	ECVF_Default);
+
+/**
+ * SPEC v32 §3. How long the thrown trail is AT THE APEX, uu. Shorter everywhere else; see §3's
+ * "peaking mid-flight".
+ *
+ * The FX doc gives the trail's two RADII and no length, so this is the one number in §3 that had to
+ * be chosen rather than converted. 240 uu is six ball-lengths (the ball is drawn 40 uu long), which
+ * at the mode-B throw speeds this file already tunes for - 1500-2236 uu/s - is about a tenth of a
+ * second of travel. That is the streak length a real motion blur would give, which is the effect the
+ * doc is describing.
+ */
+static TAutoConsoleVariable<float> CVarCoreThrownTrailLength(
+	TEXT("Trace.Core.ThrownTrailLengthUU"),
+	240.f,
+	TEXT("SPEC v32 §3. Length of the Core's thrown trail AT THE APEX of the arc, in uu; shorter at ")
+	TEXT("the ends of the flight. The FX doc gives the trail's radii (0.055 -> 0.012 m) but no ")
+	TEXT("length, so this is the one figure in §3 that is a choice: 240 uu is six ball-lengths."),
+	ECVF_Default);
+
 /** SPEC v31 §4. Heart light brightness while CARRIED; a loose Core gets a fraction of it. */
 static TAutoConsoleVariable<float> CVarCoreHeartLightIntensity(
 	TEXT("Trace.Core.HeartLightIntensity"),
@@ -2205,6 +2371,80 @@ static TAutoConsoleVariable<float> CVarCoreHeartLightIntensity(
 	TEXT("SPEC v31 §4. Unitless intensity of the heart light while the Core is CARRIED. A loose Core ")
 	TEXT("is lit at a third of it - it is a marker, not a carrier's tell."),
 	ECVF_Default);
+
+/**
+ * THE A/B FOR THE CARRIED BALL, and it exists so that the before and the after come out of ONE
+ * binary with one flag changed - the standing rule this file already follows with Trace.Core.PackArt
+ * and Trace.Core.FxGeometry.
+ *
+ * 0 restores the pre-fix picture EXACTLY: ArtRoot parked at zero, so the ball is back at OrbHeight
+ * over the holder's head, and every drawn piece back to bOwnerNoSee, so the holder cannot see it.
+ * That is the arm that reproduces the defect, and it has to keep working or the comparison frames
+ * are two runs of two different builds rather than an A/B.
+ */
+static TAutoConsoleVariable<int32> CVarCoreCarryInHand(
+	TEXT("Trace.Core.CarryInHand"),
+	1,
+	TEXT("1 (default): a carried Core is drawn in the holder's right hand and is VISIBLE to the ")
+	TEXT("holder, whose camera is in third person for exactly as long as they hold it. 0: the ")
+	TEXT("pre-fix picture - the ball floats at OrbHeight over the head and is hidden from its own ")
+	TEXT("holder. The A/B arm; the beacon is unaffected either way."),
+	ECVF_Default);
+
+/**
+ * The cradle's three numbers, live, so the next pass can photograph and retune without a rebuild -
+ * this file's own idiom (Trace.Core.HeartLightRadius, Trace.Core.FlightSpinRevPerSecond).
+ *
+ * uu, in the CARRIER'S ACTOR FRAME, and RELATIVE TO THE FIST (not to `hand_r`, which is the wrist).
+ * See TraceCoreTuning::CarryCradle* for where the defaults come from.
+ *
+ * *** THESE THREE ARE BOUNDED. *** UpdateCarriedArtPlacement clamps the vector they make to the drawn
+ * ball's own half-extent, so a tuning pass can move the ball AROUND the hand but cannot move it OUT
+ * of the hand - which is exactly the failure the last set of defaults shipped. Setting any of them
+ * past the shell is the red arm that proves the clamp runs: `Trace.Core.CarryOffsetUp 40` asks for a
+ * ball 40 uu over the fist and Trace.Core.CarryProbe still reports contact.
+ */
+static TAutoConsoleVariable<float> CVarCoreCarryOffsetForward(
+	TEXT("Trace.Core.CarryOffsetForward"),
+	static_cast<float>(TraceCoreTuning::CarryCradleForward),
+	TEXT("uu the carried ball sits AHEAD of the holder's closed right fist, in the holder's own ")
+	TEXT("frame. Clamped with the other two to the ball's drawn half-extent."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarCoreCarryOffsetRight(
+	TEXT("Trace.Core.CarryOffsetRight"),
+	static_cast<float>(TraceCoreTuning::CarryCradleRight),
+	TEXT("uu the carried ball sits OUTBOARD of the holder's closed right fist. What this number buys ")
+	TEXT("is thigh clearance: the fist is 25.8 uu outboard and the ball's cross-radius is 11.9 uu, so ")
+	TEXT("6 puts the inboard shell at 19.9 uu, clear of the leg. Clamped."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarCoreCarryOffsetUp(
+	TEXT("Trace.Core.CarryOffsetUp"),
+	static_cast<float>(TraceCoreTuning::CarryCradleUp),
+	TEXT("uu the carried ball sits ABOVE the holder's closed right fist, so the hand is buried in the ")
+	TEXT("lower shell rather than hanging under it. Clamped."),
+	ECVF_Default);
+
+/**
+ * The holder's right-hand socket. The third-person knife rig hangs off the same one, and goes
+ * through the same DoesSocketExist guard for the same reason: asking a mesh for a socket it does not
+ * have returns the COMPONENT ORIGIN rather than failing, so an unguarded read draws the ball lying
+ * at the pawn's feet and nothing in the log says why.
+ *
+ * A TCHAR literal rather than a file-scope `static const FName`: an FName built during static
+ * initialisation runs before the name table is guaranteed to exist, and a name is cheap to build at
+ * the one place that needs it.
+ */
+static const TCHAR* const GCarryHandSocketName = TEXT("hand_r");
+
+/**
+ * The forearm the hand hangs off, used ONLY to point `hand_r` -> fist in the direction the arm is
+ * actually lying this frame. Optional by design: if it is missing the fist falls back to straight
+ * down, which is where ABP_Unarmed's rest arm puts it anyway. Every humanoid rig this project can
+ * load has it, so it is not a guess about one skeleton the way a finger bone would be.
+ */
+static const TCHAR* const GCarryForearmBoneName = TEXT("lowerarm_r");
 
 
 // =================================================================================================
@@ -2231,10 +2471,18 @@ ATraceCore::ATraceCore()
 	SetRootComponent(Root);
 	Root->SetMobility(EComponentMobility::Movable);
 
+	// THE BALL'S OWN NODE. Everything that IS the ball hangs off this and nothing else does, so the
+	// one function that moves it into a hand (UpdateCarriedArtPlacement) writes exactly one
+	// transform and can move nothing the game reads. See the header for the full argument, and note
+	// what deliberately does NOT hang here: Beacon and ThrownTrailSegments.
+	ArtRoot = CreateDefaultSubobject<USceneComponent>(TEXT("ArtRoot"));
+	ArtRoot->SetupAttachment(Root);
+	ArtRoot->SetMobility(EComponentMobility::Movable);
+
 	// NO COLLISION ANYWHERE ON THIS ACTOR. There is nothing to run into, nothing to catch, and
 	// nothing that may ever eat a bullet meant for a player.
 	Mesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Mesh"));
-	Mesh->SetupAttachment(Root);
+	Mesh->SetupAttachment(ArtRoot);
 	Mesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	Mesh->SetCollisionProfileName(TEXT("NoCollision"));
 	Mesh->SetGenerateOverlapEvents(false);
@@ -2243,18 +2491,25 @@ ATraceCore::ATraceCore()
 	Mesh->bReceivesDecals = false;
 	Mesh->SetRelativeScale3D(FVector(TraceCoreTuning::OrbScale));
 
-	// HIDDEN FROM THE HOLDER'S OWN CAMERA, AND ONLY FROM THEIRS.
+	// HIDDEN FROM THE HOLDER'S OWN CAMERA *** WHILE IT FLOATS OVER THEIR HEAD ***, AND ONLY FROM
+	// THEIRS. This is the STARTING state, not the last word: UpdateCarriedArtVisibility clears it
+	// once the ball has been moved into the holder's hand and their own body is already drawn.
 	//
-	// This marker exists so that everyone ELSE can find the holder; the holder already knows, from
-	// the HUD banner, the shield indicator and the third-person pull-back. Left visible to them it
-	// is a bright emissive object suspended a few hundred uu in front of their own lens - the same
-	// class of defect as the arena trim whiteout, and captured frames confirmed it: the orb filled
-	// the centre of the holder's screen.
+	// The original argument still stands for the position this flag defends. A ball at OrbHeight is
+	// 22.4 uu BELOW the carry lens and 450 uu ahead, i.e. 36 px under the crosshair on a 1600x900
+	// frame - a bright emissive object dead centre in its own holder's view, the same class of defect
+	// as the arena trim whiteout, and captured frames confirmed it: the orb filled the centre of the
+	// holder's screen. What was WRONG was concluding from that that the holder must never see the
+	// ball at all. Carrying the Core is the only thing that puts a player in third person, so the
+	// flag made the objective invisible at the exact moment the camera pulled back to show them
+	// holding it - photographed, banner and all, with nothing in the frame. The answer is to move the
+	// ball off the crosshair and into a hand, and only then to show it.
 	//
 	// SetOwnerNoSee resolves through the ACTOR OWNER CHAIN, and GrantTo() SetOwner()s this actor to
-	// its holder, so "the owner" is exactly the one player who should not see it. Every other client
-	// draws the full beacon. ApplyAttachment() re-dirties the render state whenever the holder
-	// changes, because the proxy caches that chain when it is built.
+	// its holder, so "the owner" is exactly the one player this is a decision about. Every other
+	// client draws the full ball and the full beacon regardless. MarkDrawnPiecesRenderStateDirty()
+	// re-dirties the render state whenever the holder changes, because the proxy caches that chain
+	// when it is built.
 	Mesh->SetOwnerNoSee(true);
 
 	// --- SPEC v31 §4: the pack's Core, beside the fallback rather than instead of it ----------------
@@ -2263,21 +2518,31 @@ ATraceCore::ATraceCore()
 	// time rather than copied wholesale, because "no collision anywhere on this actor" is a rule and
 	// not an accident.
 	PackMesh = CreateDefaultSubobject<USkeletalMeshComponent>(TEXT("PackMesh"));
-	PackMesh->SetupAttachment(Root);
+	PackMesh->SetupAttachment(ArtRoot);
 	PackMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	PackMesh->SetCollisionProfileName(TEXT("NoCollision"));
 	PackMesh->SetGenerateOverlapEvents(false);
 	PackMesh->SetCanEverAffectNavigation(false);
 	PackMesh->SetCastShadow(false);
 	PackMesh->bReceivesDecals = false;
-	PackMesh->SetOwnerNoSee(true);   // Same reason as the orb above: never in its own holder's lens.
+	PackMesh->SetOwnerNoSee(true);   // Same starting state, and the same later exception, as the orb
+	                                 // above: hidden while it floats over the head, shown by
+	                                 // UpdateCarriedArtVisibility once it is in a hand. THIS is the
+	                                 // component that actually draws the ball whenever the pack art
+	                                 // resolved, so it is the one the fix is really about.
 	PackMesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);
 	// Three clips, one at a time, chosen by a state test - there is nothing for an AnimBlueprint to
 	// blend and nothing for it to decide, so there is no AnimBlueprint and no .uasset to keep in step.
 	PackMesh->SetVisibility(false);   // Until BeginPlay confirms the art actually resolved.
 
 	HeartLight = CreateDefaultSubobject<UPointLightComponent>(TEXT("HeartLight"));
-	HeartLight->SetupAttachment(Root);   // The `heart` socket IS the mesh origin; see the pack notes.
+	HeartLight->SetupAttachment(ArtRoot);   // The `heart` socket IS the mesh origin; see the pack notes.
+	                                        // On ArtRoot with the ball, not on Root: a ULightComponent
+	                                        // is not a UPrimitiveComponent and has no bOwnerNoSee, so
+	                                        // this light is ALREADY lighting the holder's world. Left
+	                                        // on Root it would keep doing it from 150 uu above their
+	                                        // head while the ball it belongs to sat at their hip - a
+	                                        // dark ball lit from nowhere.
 	HeartLight->SetCastShadows(false);   // See the header: a shadowing light inside the shell is a
 	                                     // light nobody outside the shell can see.
 	HeartLight->SetLightColor(TraceCoreArt::AmberSRGB);
@@ -2293,7 +2558,51 @@ ATraceCore::ATraceCore()
 	Beacon->SetCanEverAffectNavigation(false);
 	Beacon->SetCastShadow(false);
 	Beacon->bReceivesDecals = false;
-	Beacon->SetOwnerNoSee(true);   // Same reason as the orb above.
+	// *** THE BEACON KEEPS THIS FOREVER, AND IT IS THE ONE PIECE THAT DOES. ***
+	//
+	// Its bottom is 205 uu above the actor centre, i.e. 32.6 uu ABOVE the carry camera: unhidden it
+	// draws a 42-px-wide unlit emissive column from y=397 px to the top of a 900 px frame, straight
+	// through the crosshair and the scoreboard. No bottom height fixes that - clearing it at level
+	// pitch would need 449 uu, and the moment the player pitches up the camera rotates about a pivot
+	// the column is welded to. It also tells the holder nothing the HUD banner does not already say.
+	// It exists so that everyone ELSE can find them across a 24000 uu field.
+	Beacon->SetOwnerNoSee(true);
+
+	// --- SPEC v32 §3: the two pieces of FX GEOMETRY the FX doc asks for --------------------------
+	//
+	// Created here and hidden; the MESHES and the MATERIALS are resolved in BeginPlay out of
+	// UTraceFxShapes, which is where the engine primitives are cached and where the ONE unit
+	// conversion lives. Nothing about their size is decided in this constructor, because a size is
+	// exactly the thing that has to come from the shared library rather than be retyped here.
+	//
+	// bOwnerNoSee to start with, and it travels with the ball: the halo is centred on the Core's heart
+	// and fires on the frame a player TAKES it. Blooming out of the middle of the taker's own screen
+	// was the defect the orb's own comment records having been captured doing - but the ball is not in
+	// the middle of that screen any more, it is in a hand, so the halo goes with it and is unhidden on
+	// exactly the same terms (UpdateCarriedArtVisibility). A halo that stayed hidden while the ball it
+	// belongs to was shown would make the pickup read as the ball simply appearing.
+	PickupHalo = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("PickupHalo"));
+	PickupHalo->SetupAttachment(ArtRoot);   // Centred on the ball's heart, so it follows the ball.
+	UTraceFxShapes::ConfigureFxComponent(PickupHalo);
+	PickupHalo->SetOwnerNoSee(true);
+	PickupHalo->SetCanEverAffectNavigation(false);
+	PickupHalo->SetVisibility(false);
+
+	ThrownTrailSegments.Reserve(TraceCoreArt::ThrownTrailSegmentCount);
+	for (int32 Index = 0; Index < TraceCoreArt::ThrownTrailSegmentCount; ++Index)
+	{
+		// NAMED subobjects, one per index, because CreateDefaultSubobject requires a unique name per
+		// object and a duplicate silently returns the FIRST one - which would give three components
+		// that are all the same component and a "taper" that is one cylinder drawn three times.
+		const FName SegmentName(*FString::Printf(TEXT("ThrownTrailSegment%d"), Index));
+		UStaticMeshComponent* Segment = CreateDefaultSubobject<UStaticMeshComponent>(SegmentName);
+		Segment->SetupAttachment(Root);
+		UTraceFxShapes::ConfigureFxComponent(Segment);
+		Segment->SetOwnerNoSee(true);
+		Segment->SetCanEverAffectNavigation(false);
+		Segment->SetVisibility(false);
+		ThrownTrailSegments.Add(Segment);
+	}
 
 	// Constructor-time FObjectFinders are what make these engine assets cook into a packaged build;
 	// a bare runtime LoadObject would resolve to null once cooked.
@@ -2477,6 +2786,72 @@ void ATraceCore::BeginPlay()
 			(AmberMID != nullptr) ? TEXT("found") : TEXT("NOT FOUND"),
 			CVarCoreRestSpin.GetValueOnGameThread(), CVarCoreFlightSpin.GetValueOnGameThread(),
 			TraceCoreArt::ThrowClipRevPerSecond);
+
+		// --- SPEC v32 §3: the geometry the FX doc asks for, built out of the shared library --------
+		//
+		// MESHES AND MATERIALS HERE, NOT IN THE CONSTRUCTOR. UTraceFxShapes resolves its primitives on
+		// its own CDO, and reaching into another class's CDO from a constructor that itself runs during
+		// CDO creation is an ordering question nobody should have to answer. BeginPlay is well past all
+		// of it and is where this actor already decides what it is drawing.
+		//
+		// TRANSLUCENT is what the FX doc asks for and Additive is what it resolves to - see
+		// ETraceFxBlend::Translucent, which spells out why (this project has no translucent parent
+		// material and a MID cannot change its parent's blend mode). That is the RIGHT degradation
+		// here rather than a regrettable one: additive geometry writes NO DEPTH, so a 42 uu halo
+		// cannot hide the 20 uu ball inside it and a trail cannot occlude the thing it trails. An
+		// opaque halo would swallow the Core on the exact frame the pickup is meant to be readable.
+		//
+		// The blend that was ACHIEVED is stored, not the one that was asked for: SetGlow must be given
+		// the achieved value or it writes a parameter the material does not have, which is a silent
+		// no-op. UTraceFxShapes::MakeGlowMID's header is explicit about this and it is why it hands
+		// the answer back.
+		if (PickupHalo != nullptr)
+		{
+			PickupHalo->SetStaticMesh(UTraceFxShapes::GetIcosphere());
+			PickupHaloMID = UTraceFxShapes::MakeGlowMID(PickupHalo, 0, ETraceFxBlend::Translucent, PickupHaloBlend);
+		}
+
+		ThrownTrailMIDs.Reset();
+		for (UStaticMeshComponent* Segment : ThrownTrailSegments)
+		{
+			if (Segment == nullptr)
+			{
+				ThrownTrailMIDs.Add(nullptr);
+				continue;
+			}
+			Segment->SetStaticMesh(UTraceFxShapes::GetCylinder());
+			ETraceFxBlend Achieved = ETraceFxBlend::None;
+			ThrownTrailMIDs.Add(UTraceFxShapes::MakeGlowMID(Segment, 0, ETraceFxBlend::Translucent, Achieved));
+			// Every segment asks for the same blend off the same library, so they cannot honestly
+			// differ; the LAST answer is recorded rather than the first so that a segment which failed
+			// where its neighbours succeeded shows up as None instead of being hidden behind them.
+			ThrownTrailBlend = Achieved;
+		}
+
+		// The taper's segment radii, PRINTED. §3's numbers are 5.5 -> 1.2 uu and a verifier will
+		// measure them on screen; this is what the code believes it built, so the two can be compared
+		// rather than one of them assumed. TaperSegmentRadiusUU is the same function that will place
+		// them, so this cannot drift from the geometry.
+		FString SegmentRadii;
+		for (int32 Index = 0; Index < ThrownTrailSegments.Num(); ++Index)
+		{
+			SegmentRadii += FString::Printf(TEXT("%s%.2f"), (Index > 0) ? TEXT(", ") : TEXT(""),
+				UTraceFxShapes::TaperSegmentRadiusUU(TraceCoreArt::ThrownTrailHeadRadiusUU,
+					TraceCoreArt::ThrownTrailTailRadiusUU, Index, ThrownTrailSegments.Num()));
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Core] SPEC v32 §3 geometry: pickup halo r %.1f uu (%s, mesh %s%s) blend %s; thrown ")
+			TEXT("trail r %.1f -> %.1f uu in %d segments [%s] blend %s, apex length %.0f uu."),
+			TraceCoreArt::PickupHaloRadiusUU,
+			(PickupHaloMID != nullptr) ? TEXT("MID ok") : TEXT("NO MID - halo will stay hidden"),
+			*GetNameSafe((PickupHalo != nullptr) ? PickupHalo->GetStaticMesh() : nullptr),
+			UTraceFxShapes::IsIcosphereDegraded() ? TEXT(", icosphere degraded to the engine sphere") : TEXT(""),
+			UTraceFxShapes::BlendName(PickupHaloBlend),
+			TraceCoreArt::ThrownTrailHeadRadiusUU, TraceCoreArt::ThrownTrailTailRadiusUU,
+			ThrownTrailSegments.Num(), *SegmentRadii,
+			UTraceFxShapes::BlendName(ThrownTrailBlend),
+			CVarCoreThrownTrailLength.GetValueOnGameThread());
 	}
 	else
 	{
@@ -2571,6 +2946,19 @@ void ATraceCore::Tick(float DeltaSeconds)
 	//
 	// It decides nothing and writes nothing but component transforms, material parameters and a light.
 	UpdateCoreArt();
+
+	// THE CARRIED BALL'S PLACE AND THE CARRIED BALL'S AUDIENCE, on the same terms and for the same
+	// reasons: both are derived from Carrier, which already replicates, so every machine can work
+	// them out for itself and neither has to be sent. Below the authority split they would run on the
+	// listen host only - which is exactly the machine whose own holder is the one player this used
+	// to be invisible to.
+	//
+	// AFTER UpdateCoreArt, not before. That function chooses which of Mesh/PackMesh is being drawn
+	// and can toggle their visibility on the A/B edge; placing and unhiding them afterwards means the
+	// ball's position and its audience are decided against the components that are actually on screen
+	// this frame rather than the previous frame's answer.
+	UpdateCarriedArtPlacement();
+	UpdateCarriedArtVisibility();
 
 	// Spec v8 §0/§4. Every machine's own view, so "the Core carries the momentum" is a claim that can
 	// be checked on the CLIENT rather than inferred from the server's copy. Costs one int compare.
@@ -10838,14 +11226,360 @@ void ATraceCore::ApplyAttachment()
 	// calls SetOwner), and SetOwnerNoSee(true) would early-out because the flag itself is unchanged
 	// - so the proxy has to be rebuilt explicitly or the previous holder would keep the Core hidden
 	// from themselves while the new one stared straight at it.
-	if (Mesh != nullptr)
+	//
+	// PackMesh AND PickupHalo JOIN THAT LIST, in MarkDrawnPiecesRenderStateDirty. They were missing,
+	// and it was invisible only because nothing had ever shown the ball to its own holder: PackMesh
+	// is the component that actually draws the Core whenever the pack art resolved (Mesh is only the
+	// fallback sphere), so the one piece whose owner chain most needed re-resolving was the one piece
+	// not being told to. Now that a carried ball is deliberately unhidden for its holder, a stale
+	// proxy would mean the PREVIOUS holder kept seeing a ball they no longer have.
+	MarkDrawnPiecesRenderStateDirty();
+
+	// THE PICTURE FOLLOWS THE POSSESSION ON THE SAME FRAME, not on the next tick. ApplyAttachment is
+	// the funnel every possession change goes through on every machine; placing the art from Tick
+	// alone would leave one frame in which the ball had changed hands and was still being drawn in
+	// the old holder's hand - and one frame is exactly what a screenshot catches.
+	UpdateCarriedArtPlacement();
+	UpdateCarriedArtVisibility();
+}
+
+void ATraceCore::MarkDrawnPiecesRenderStateDirty()
+{
+	// Every VISIBLE piece of this actor, in one list, because bOwnerNoSee is resolved against an
+	// owner chain the scene proxy CACHES when it is built - so a piece left out of this list is a
+	// piece whose owner-visibility silently keeps the previous holder's answer.
+	for (UPrimitiveComponent* Piece : { static_cast<UPrimitiveComponent*>(Mesh.Get()),
+	                                    static_cast<UPrimitiveComponent*>(PackMesh.Get()),
+	                                    static_cast<UPrimitiveComponent*>(PickupHalo.Get()),
+	                                    static_cast<UPrimitiveComponent*>(Beacon.Get()) })
 	{
-		Mesh->MarkRenderStateDirty();
+		if (Piece != nullptr)
+		{
+			Piece->MarkRenderStateDirty();
+		}
 	}
-	if (Beacon != nullptr)
+}
+
+double ATraceCore::GetDrawnBallHalfExtentUU() const
+{
+	// THE NARROW HALF-EXTENT, AND DELIBERATELY SO. The pack ball is a 40.0 x 23.8 x 23.8 uu football
+	// and the Carried state leaves PackMesh's component rotation at identity, so its long axis is
+	// wherever A_Core_Idle's turntable has swung it this instant. Sizing the grip off the LONG axis
+	// would hold the hand only at the spin angles that happen to point it at the fist; sizing it off
+	// the narrow one holds at every angle, and at the other angles it holds deeper. The worst case is
+	// the honest case.
+	const bool bDrawPack = bPackArtActive && CVarCorePackArt.GetValueOnGameThread() != 0;
+	if (bDrawPack && PackMesh != nullptr && PackMesh->GetSkeletalMeshAsset() != nullptr)
 	{
-		Beacon->MarkRenderStateDirty();
+		// Imported bounds x the SAME derived scale the mesh is actually drawn at, so a re-export at a
+		// different size moves the grip with it instead of silently un-holding the ball. That is the
+		// same rule the drawn length itself follows - see the ART block's SCALE note.
+		const FVector Extent = PackMesh->GetSkeletalMeshAsset()->GetImportedBounds().BoxExtent;
+		return FMath::Max(1.0, Extent.GetMin() * static_cast<double>(PackArtScale));
 	}
+
+	// The fallback path draws /Engine/BasicShapes/Sphere at OrbScale, which is the 20 uu radius every
+	// mode-B rule in this file is written against.
+	return TraceModeBVisibleOrbRadius;
+}
+
+void ATraceCore::UpdateCarriedArtPlacement()
+{
+	if (ArtRoot == nullptr)
+	{
+		return;
+	}
+
+	// NOT CARRIED, OR THE A/B ARM IS OFF: dead centre on the actor, which is bit-identical to every
+	// build before this one. A loose, thrown or resting Core is not being held by anybody and there
+	// is no hand to put it in.
+	FVector Wanted = FVector::ZeroVector;
+	bool bHandResolved = false;
+
+	// Cleared here, not only written in the carried branch: a stale "the fist is 1.9 uu inside the
+	// shell" left over from the last holder is a probe line that lies about a ball lying on the floor.
+	CarryFistDepthUU = 0.0;
+	CarryCradleClampedUU = 0.0;
+
+	// The FIST, in the holder's own frame - resolved for anybody who has the Core, whether or not the
+	// A/B arm is going to use it. It is what the grip measurement below is taken against, and a
+	// measurement that only exists on the arm it is meant to defend cannot report that arm failing.
+	FVector FistLocal = FVector::ZeroVector;
+	bool bFistKnown = false;
+
+	ATraceCharacter* const Holder = Carrier;
+	const bool bCarryArm = CVarCoreCarryInHand.GetValueOnGameThread() != 0;
+	if (IsValid(Holder))
+	{
+		// THE HAND, IN THE HOLDER'S OWN FRAME. Read as a WORLD transform and un-rotated back into the
+		// holder's frame rather than taken from the bone's local axes: the offset below is authored in
+		// forward/right/up and that is only true of the actor's axes. This project's knife rig had to
+		// MEASURE its hand-space cant because a bone's axes did not read the way anyone expected, and
+		// a ball is a sphere - it cannot show a reader that its frame is wrong.
+		FVector HandLocal(0.0, TraceCoreTuning::CarryHandRestRight, 0.0);
+
+		// Straight down is the fallback direction for "further along the arm", because that is where
+		// ABP_Unarmed's rest arm points and it is the only answer available without a second bone.
+		FVector AlongArmLocal(0.0, 0.0, -1.0);
+
+		if (const USkeletalMeshComponent* Body = Holder->GetMesh())
+		{
+			const FName HandSocket(GCarryHandSocketName);
+			if (Body->DoesSocketExist(HandSocket))
+			{
+				const FVector HandWorld = Body->GetSocketTransform(HandSocket, RTS_World).GetLocation();
+				HandLocal = Holder->GetActorRotation().UnrotateVector(HandWorld - Holder->GetActorLocation());
+				bHandResolved = true;
+
+				// THE ARM'S OWN DIRECTION, from two joint POSITIONS rather than from a bone's axes -
+				// same reason the hand itself is read as a world position and un-rotated: this file's
+				// knife rig had to MEASURE its hand-space cant because the axes did not read the way
+				// anyone expected, and elbow -> wrist is a direction no convention can flip.
+				const FName ForearmBone(GCarryForearmBoneName);
+				if (Body->DoesSocketExist(ForearmBone))
+				{
+					const FVector ElbowWorld = Body->GetSocketTransform(ForearmBone, RTS_World).GetLocation();
+					const FVector Along = (HandWorld - ElbowWorld).GetSafeNormal();
+					if (!Along.IsNearlyZero())
+					{
+						AlongArmLocal = Holder->GetActorRotation().UnrotateVector(Along);
+					}
+				}
+			}
+		}
+
+		// *** THE ANCHOR IS THE FIST, AND `hand_r` IS THE WRIST. *** Carrying on down the forearm by
+		// CarryFistReach is what the last pass was missing: it hung the ball off the wrist joint, put
+		// the whole closed hand between the anchor and the ball, and photographed as an orb floating
+		// clear of an empty fist. The reach follows the live arm, so this stays true through the run
+		// cycle rather than only while the carrier stands still.
+		FistLocal = HandLocal + AlongArmLocal * TraceCoreTuning::CarryFistReach;
+		bFistKnown = true;
+
+		if (bCarryArm)
+		{
+			// Live, so the next pass can retune from the console against a running match rather than
+			// from a rebuild - and so the three numbers that decide where ON the hand the ball sits
+			// are the three numbers a reviewer can move.
+			FVector Cradle(
+				CVarCoreCarryOffsetForward.GetValueOnGameThread(),
+				CVarCoreCarryOffsetRight.GetValueOnGameThread(),
+				CVarCoreCarryOffsetUp.GetValueOnGameThread());
+
+			// *** WHETHER THE BALL IS HELD IS ARITHMETIC, NOT TASTE, SO IT IS ENFORCED HERE. ***
+			//
+			// The fist has to end up INSIDE the drawn shell. The half-extent is read off the ball that
+			// is actually on screen this frame (GetDrawnBallHalfExtentUU), not off a constant, because
+			// that is precisely the mistake being fixed: the old defaults were reasoned against the
+			// 20 uu engine sphere the pack ball replaced, and the pack ball is only 11.9 uu across its
+			// narrow axis. A clamp rather than a compile-time assert because the three inputs are
+			// console variables and the ball's size is a property of an asset - neither of which is
+			// known at build time.
+			const double MaxReach = FMath::Max(1.0,
+				GetDrawnBallHalfExtentUU() - TraceCoreTuning::CarryGripBite);
+			if (Cradle.SizeSquared() > MaxReach * MaxReach)
+			{
+				CarryCradleClampedUU = Cradle.Size() - MaxReach;
+				Cradle = Cradle.GetSafeNormal() * MaxReach;
+			}
+
+			// *** MINUS OrbHeight, AND THAT SUBTRACTION IS THE WHOLE TRICK. *** The ACTOR is already
+			// 150 uu up the capsule axis and it is staying there, because that is the position the
+			// beacon arithmetic, the ArtShots camera and the teleport audit are all written against.
+			// ArtRoot is a relative offset FROM the actor, so cancelling OrbHeight here is what lets
+			// the picture come down to hand height while the thing the game reads has not moved.
+			Wanted = FistLocal + Cradle - FVector(0.0, 0.0, TraceCoreTuning::OrbHeight);
+
+			// A DEGRADE, NOT AN ERROR, AND IT SAYS SO ONCE. A machine with no mannequin import draws
+			// the fallback capsule and has no `hand_r`; the ball then sits at that pawn's right hip on
+			// the measured rest offset, which is a worse picture and a working one. Silence would be
+			// the bad outcome: DoesSocketExist is what stands between this and GetSocketTransform's
+			// habit of answering a missing socket with the COMPONENT ORIGIN, i.e. a ball at the feet.
+			//
+			// Inside this branch so that turning the A/B arm off (Trace.Core.CarryInHand 0) cannot
+			// produce a warning about a socket nothing asked for.
+			if (!bHandResolved && !bCarryHandMissingLogged)
+			{
+				bCarryHandMissingLogged = true;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Carry] %s has no `%s` socket (no mannequin import?); the carried Core falls back ")
+					TEXT("to the measured right-hip offset (0, %.0f, 0) uu. The ball is drawn, just not in a hand."),
+					*GetNameSafe(Holder), GCarryHandSocketName, TraceCoreTuning::CarryHandRestRight);
+			}
+		}
+	}
+
+	bCarryHandSocketResolved = bHandResolved;
+
+	// *** MEASURED OFF THE ANSWER, NOT OFF THE INPUTS. *** Taking the grip from the cradle vector
+	// would only ever restate what was just asked for; taking it from where the ball ACTUALLY ends up
+	// is what lets the same line report the A/B arm's own picture (Trace.Core.CarryInHand 0 leaves the
+	// ball at OrbHeight and this prints roughly -150 uu, i.e. a ball a metre and a half from the hand)
+	// and would have caught the defect this replaces. Wanted is relative to the ACTOR, which sits at
+	// OrbHeight, so adding it back puts both terms in the holder's own frame.
+	if (bFistKnown)
+	{
+		const FVector BallCentreLocal = Wanted + FVector(0.0, 0.0, TraceCoreTuning::OrbHeight);
+		CarryFistDepthUU = GetDrawnBallHalfExtentUU() - FVector::Dist(BallCentreLocal, FistLocal);
+	}
+
+	// A hand moves every frame, so this really does write a transform most frames while the Core is
+	// held - but it must not write one while it is not, and the compare is what makes a resting Core
+	// cost nothing at all.
+	if (bArtRootOffsetApplied && AppliedArtRootOffset.Equals(Wanted, 0.01))
+	{
+		return;
+	}
+	AppliedArtRootOffset = Wanted;
+	bArtRootOffsetApplied = true;
+
+	// TRANSLATION ONLY. The rotation stays identity so UpdateCoreArt's Carried case keeps world up as
+	// the turntable's spin axis - it says so in as many words, and a rotation here would silently
+	// break a claim made in a different function.
+	ArtRoot->SetRelativeLocation(Wanted);
+}
+
+void ATraceCore::UpdateCarriedArtVisibility()
+{
+	bool bShow = false;
+
+	ATraceCharacter* const Holder = Carrier;
+	if (IsValid(Holder) && CVarCoreCarryInHand.GetValueOnGameThread() != 0)
+	{
+		// *** GATED ON THE HOLDER'S OWN BODY, AND ON THE HOLDER'S OWN FLAG. ***
+		//
+		// The pull-back from first to third person takes 0.35 s and passes the camera THROUGH the
+		// pawn; at the start of it the ball would be 66 uu from the lens. The character already
+		// decides when its own body may be drawn to its own camera - SetOwnBodyHiddenFromOwner, which
+		// tests the SMOOTHSTEPPED blend alpha, not the raw one - and it records that decision by
+		// putting bOwnerNoSee on its mesh. Reading that flag back is the whole rule: the ball and the
+		// body appear on the same frame and can never disagree, and there is no second copy of the
+		// 0.2 threshold here to drift from the one in ATraceCharacter.
+		//
+		// (Comparing GetViewBlendAlpha() against 0.2 directly is the trap: eased 0.2 is raw 0.276, so
+		// the raw comparison would reveal the ball before the body.)
+		const USkeletalMeshComponent* Body = Holder->GetMesh();
+		bShow = (Body == nullptr) || !Body->bOwnerNoSee;
+	}
+
+	if (bShow == bCarryArtShownToOwner)
+	{
+		return;
+	}
+	bCarryArtShownToOwner = bShow;
+
+	// THE BALL, AND ONLY THE BALL. Beacon is not in this list and must not join it - see the header
+	// for the frame arithmetic (a 42 px emissive column through the crosshair and the scoreboard).
+	// ThrownTrailSegments are not in it either: a ball in a hand is not in flight.
+	for (UPrimitiveComponent* Piece : { static_cast<UPrimitiveComponent*>(Mesh.Get()),
+	                                    static_cast<UPrimitiveComponent*>(PackMesh.Get()),
+	                                    static_cast<UPrimitiveComponent*>(PickupHalo.Get()) })
+	{
+		if (Piece != nullptr)
+		{
+			Piece->SetOwnerNoSee(!bShow);
+		}
+	}
+}
+
+void ATraceCore::DebugLogCarryState() const
+{
+	const UWorld* const World = GetWorld();
+	const ATraceCharacter* const Holder = Carrier;
+
+	// The BALL's position, which is now a different thing from the ACTOR's position, and printing
+	// both together is the point: a reviewer has to be able to see at a glance that the picture moved
+	// and the thing every gameplay rule reads did not.
+	const FVector BallWorld = (ArtRoot != nullptr) ? ArtRoot->GetComponentLocation() : GetActorLocation();
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[CarryProbe] CarryInHand=%d  carrier=%s  hand_r=%s  artRoot rel=%s  BALL world=%s  ACTOR world=%s"),
+		CVarCoreCarryInHand.GetValueOnGameThread(),
+		IsValid(Holder) ? *GetNameSafe(Holder) : TEXT("<nobody - the Core is not held>"),
+		bCarryHandSocketResolved ? TEXT("resolved") : TEXT("NOT resolved (hip fallback)"),
+		*AppliedArtRootOffset.ToCompactString(),
+		*BallWorld.ToCompactString(),
+		*GetActorLocation().ToCompactString());
+
+	if (IsValid(Holder))
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CarryProbe] holder at %s; the ball is %.1f uu from the capsule centre, %.1f uu ")
+			TEXT("outboard and %.1f uu up in the holder's own frame."),
+			*Holder->GetActorLocation().ToCompactString(),
+			FVector::Dist(Holder->GetActorLocation(), BallWorld),
+			AppliedArtRootOffset.Y,
+			AppliedArtRootOffset.Z + TraceCoreTuning::OrbHeight);
+
+		// *** THE LINE THAT SETTLES "HELD" RATHER THAN "VISIBLE". *** The v32 verifier's finding was
+		// that the ball was on screen with sky between it and an empty fist, and no number printed
+		// here could have caught that: every existing line said where the ball WAS, none said what it
+		// was touching. This one is the grip, signed, in uu - positive is the fist's centroid inside
+		// the drawn shell, negative is the air gap that was photographed. Its two arms:
+		//   Trace.Core.CarryInHand 0   -> the pre-fix picture, and this prints a large NEGATIVE gap.
+		//   Trace.Core.CarryOffsetUp 40 -> asks for a ball far over the fist; the clamp trims it and
+		//                                 this still prints contact, with the trim shown.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CarryProbe] GRIP: the ball's narrow half-extent is %.1f uu and the fist's centroid ")
+			TEXT("is %+.1f uu inside the shell (%s)%s."),
+			GetDrawnBallHalfExtentUU(),
+			CarryFistDepthUU,
+			(CarryFistDepthUU > 0.0) ? TEXT("HELD - hand under the surface")
+			                         : TEXT("NOT HELD - open air between hand and ball"),
+			(CarryCradleClampedUU > 0.0)
+				? *FString::Printf(TEXT("; the authored cradle was %.1f uu too long and was clamped"),
+					CarryCradleClampedUU)
+				: TEXT(""));
+	}
+
+	// WHERE IT LANDS ON THIS MACHINE'S SCREEN, because the reason the ball was hidden in the first
+	// place was that it landed 36 px under the crosshair. A number here is what says whether the new
+	// position solves that or merely moves it.
+	APlayerController* const PC = (World != nullptr && GEngine != nullptr)
+		? GEngine->GetFirstLocalPlayerController(World) : nullptr;
+	if (PC != nullptr)
+	{
+		FVector ViewLocation = FVector::ZeroVector;
+		FRotator ViewRotation = FRotator::ZeroRotator;
+		PC->GetPlayerViewPoint(ViewLocation, ViewRotation);
+
+		int32 SizeX = 0;
+		int32 SizeY = 0;
+		PC->GetViewportSize(SizeX, SizeY);
+
+		FVector2D Screen = FVector2D::ZeroVector;
+		const bool bOnScreen = PC->ProjectWorldLocationToScreen(BallWorld, Screen);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CarryProbe] local camera at %s: the ball is %.1f uu away and projects to %s ")
+			TEXT("(%.0f, %.0f) px on a %dx%d viewport, i.e. %+.0f, %+.0f px from centre."),
+			*ViewLocation.ToCompactString(),
+			FVector::Dist(ViewLocation, BallWorld),
+			bOnScreen ? TEXT("") : TEXT("OFF SCREEN at"),
+			Screen.X, Screen.Y, SizeX, SizeY,
+			Screen.X - SizeX * 0.5f, Screen.Y - SizeY * 0.5f);
+	}
+
+	// bOwnerNoSee ON EVERY DRAWN PIECE, INCLUDING THE ONES THAT MUST STAY HIDDEN. A probe that only
+	// printed the pieces the fix unhides could not catch the failure that matters most - the beacon
+	// joining them and putting a 42 px emissive column through the holder's crosshair.
+	auto Report = [](const TCHAR* Label, const UPrimitiveComponent* Piece)
+	{
+		if (Piece == nullptr)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[CarryProbe]   %s: <null>"), Label);
+			return;
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("[CarryProbe]   %s: visible=%d ownerNoSee=%d"),
+			Label, Piece->IsVisible() ? 1 : 0, Piece->bOwnerNoSee ? 1 : 0);
+	};
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[CarryProbe] drawn pieces (packArt=%d, so %s is the ball this run):"),
+		bPackArtActive ? 1 : 0, bPackArtActive ? TEXT("PackMesh") : TEXT("Mesh"));
+	Report(TEXT("Mesh"), Mesh);
+	Report(TEXT("PackMesh"), PackMesh);
+	Report(TEXT("PickupHalo"), PickupHalo);
+	Report(TEXT("Beacon"), Beacon);
 }
 
 void ATraceCore::UpdateVisuals()
@@ -11072,6 +11806,275 @@ void ATraceCore::UpdateCoreArtEmissive(ETraceCoreArtState State, float LocalTime
 	}
 }
 
+// =================================================================================================
+// SPEC v32 §3 — THE MISSING GEOMETRY.
+//
+// unreal-fx_README, "The Core", is the authority for both numbers and both shapes:
+//
+//   "Pickup: amber flares to 4.6x as the shell cracks, plus a one-shot icosahedron halo (r 0.20)
+//    expanding 0.6 -> 2.1x and fading out over 0.55 s."
+//   "Thrown: cyan to 3.4x; a tapered trail cylinder (r 0.055 -> 0.012) streams behind the ball,
+//    peaking mid-flight."
+//
+// --- WHY THIS IS NOT UTraceTrailComponent, WHICH SPEC v32 §3 SAYS TO READ FIRST -------------------
+//
+// It was read first. UTraceTrailComponent draws a ribbon behind a moving thing, which is the right
+// SHAPE, and it cannot carry this. Four of its own stated assumptions fail, in the order they bite:
+//
+//  1. ITS OWNER MUST BE A CHARACTER. GetOwnerCharacter() is Cast<ATraceCharacter>(GetOwner()) and
+//     everything downstream - the dash trip test, the parry window, the head-grace stub, the
+//     predicted head that is drawn for the carrier ALONE - resolves through it. The Core is an
+//     AActor and has no capsule, no controller and no team of its own.
+//
+//  2. ITS POINTS ARE LETHAL, AND ITS INVARIANT IS "VISIBLE == LETHAL". The ribbon is drawn at
+//     EXACTLY the lethal cross-section (2 x GetTraceTrailRadius() wide, GetTraceTrailHeight() tall)
+//     and its file header states that as a rule with two shipped-and-fixed bugs behind it. A
+//     COSMETIC trail routed through it would either be lethal - a thrown Core that kills people it
+//     flies past, which §1 forbids outright ("nothing may change a single hit") - or it would break
+//     the one invariant that file exists to defend.
+//
+//  3. IT HAS NO TAPER AND CANNOT HAVE ONE. Its cross-section is constant BECAUSE it is the lethal
+//     cross-section (see 2). The FX doc's trail runs 5.5 -> 1.2 uu, which is a different shape by
+//     construction, not by configuration.
+//
+//  4. IT IS SCOPED TO POSSESSION, AND A THROWN CORE HAS NO HOLDER. SetEmitting(false) WIPES the
+//     trace, and "a mode-B throw" is named in its header as one of the events that funnels through
+//     that wipe. The instant this trail must START is precisely the instant that component is
+//     required to have nothing left.
+//
+// So: new geometry, out of the shared §1 library, and none of the trail component is touched.
+//
+// --- SPIN: ALREADY CORRECT, AND NOTHING HERE CHANGES IT ------------------------------------------
+//
+// §3 also asks whether the flight spins about the long axis at ~10 rev/s. IT ALREADY DOES, and the
+// work was done in v31: UpdateCoreArt's Flight case sets the component rotation to
+// MakeFromX(LooseVelocity) - mesh local +X is the nose and the long axis, so the nose points along
+// the velocity and follows the arc down - and plays A_Core_Throw, whose keys were MEASURED to roll
+// the ball four whole turns about that same local +X in 0.500 s (see the ART block). The play rate
+// is Trace.Core.FlightSpinRevPerSecond / 8.00, defaulting to 10/8 = 1.25. Not a tumble, not the
+// wrong axis, and rate-relative so a re-export cannot silently change it. CHANGED NOTHING.
+// =================================================================================================
+
+void ATraceCore::HideCoreArtGeometry()
+{
+	if (PickupHalo != nullptr && PickupHalo->IsVisible())
+	{
+		PickupHalo->SetVisibility(false);
+	}
+	for (UStaticMeshComponent* Segment : ThrownTrailSegments)
+	{
+		if (Segment != nullptr && Segment->IsVisible())
+		{
+			Segment->SetVisibility(false);
+		}
+	}
+
+	// Forget the last pushed opacities so the next show re-pushes them. Without this a halo that was
+	// hidden at opacity 0.4 and shown again at 0.4 would skip the SetGlow and come back at whatever
+	// the material happened to be left holding.
+	ArtHaloAppliedOpacity = -1.f;
+	ArtTrailAppliedOpacity = -1.f;
+}
+
+void ATraceCore::UpdateCoreArtGeometry(ETraceCoreArtState State, float LocalTimeSeconds)
+{
+	if (CVarCoreFxGeometry.GetValueOnGameThread() == 0)
+	{
+		HideCoreArtGeometry();
+		return;
+	}
+
+	// THE TINT THE BALL IS ALREADY WEARING, read back rather than re-derived. UpdateCoreArtEmissive
+	// ran one line ago and wrote it; deriving the team a second time here would be a second copy of
+	// the rule in ten lines of each other, and the two would drift the first time one was edited. A
+	// Core that belongs to nobody - which a THROWN one does, by definition - keeps the artist's own
+	// #25E6FF, so the common case for the trail is the untinted colour either way.
+	const FLinearColor CyanTint = bArtTintApplied ? ArtAppliedTint : TraceCoreArt::CyanEmissive;
+
+	// ---------------------------------------------------------------------------------------------
+	// THE PICKUP HALO
+	//
+	// THE SAME EDGE THE AMBER FLARE USES, AND THAT IS THE POINT OF §3's "do not add a second,
+	// differently-timed detector for one fact". ArtStateStartTime is stamped by UpdateCoreArt when the
+	// art state changes and is only ever SUBTRACTED from, so there is nothing to advance, nothing to
+	// drift and nothing to sample too late - the standing warning about per-frame readers of short
+	// quantities, of which 0.55 s is one.
+	//
+	// The duration is A_Core_Pickup's own play length, read exactly as UpdateCoreArtEmissive reads it
+	// for the flare, so the halo and the flare cannot end on different frames. (The clip measures
+	// 0.550 s, which is the FX doc's number; if a re-export changes it, both follow together.)
+	// ---------------------------------------------------------------------------------------------
+	bool bHaloVisible = false;
+	if (PickupHalo != nullptr && PickupHaloMID != nullptr && State == ETraceCoreArtState::Carried
+		&& ArtPickupAnim != nullptr)
+	{
+		const float HaloSeconds = ArtPickupAnim->GetPlayLength();
+		const float Elapsed = LocalTimeSeconds - ArtStateStartTime;
+		if (Elapsed >= 0.f && Elapsed < HaloSeconds && HaloSeconds > 1.e-4f)
+		{
+			const float Progress = Elapsed / HaloSeconds;
+
+			// "expanding 0.6 -> 2.1x" of r 20 uu, and the uu -> component-scale conversion is the
+			// library's single named constant. Nothing here divides by 100.
+			const float RadiusUU = TraceCoreArt::PickupHaloRadiusUU
+				* FMath::Lerp(TraceCoreArt::PickupHaloScaleStart, TraceCoreArt::PickupHaloScaleEnd, Progress);
+			const float Scale = UTraceFxShapes::ShapeScaleForRadiusUU(RadiusUU);
+
+			PickupHalo->SetRelativeLocation(FVector::ZeroVector);   // Centred on the ball's heart.
+			PickupHalo->SetRelativeScale3D(FVector(Scale));
+
+			// "fading out over 0.55 s". Linear, which is what the doc says; on an ADDITIVE blend the
+			// opacity IS the weight of the colour being added, so a linear fade really is a linear
+			// fade rather than a gamma-shaped one.
+			const float Opacity = 1.f - Progress;
+			if (!FMath::IsNearlyEqual(ArtHaloAppliedOpacity, Opacity, 0.004f))
+			{
+				// AMBER, not cyan: the FX doc puts the halo in the same sentence as the amber flare
+				// ("amber flares to 4.6x as the shell cracks, PLUS a one-shot icosahedron halo"), and
+				// the shell cracking is an amber event on this ball - the heart light is #FF8A1F too.
+				//
+				// Intensity 1.0 and the fade carried entirely on the opacity, because on the additive
+				// parent the two multiply into the same quantity and that parent has no Glow scalar,
+				// so anything above 1.0 is silently clamped. Pushing the brightness through the knob
+				// that actually exists is the honest use of this blend; see SetGlow's header.
+				UTraceFxShapes::SetGlow(PickupHaloMID, PickupHaloBlend,
+					TraceCoreArt::AmberSRGB, /*Intensity=*/1.f, Opacity);
+				ArtHaloAppliedOpacity = Opacity;
+			}
+
+			bHaloVisible = true;
+		}
+	}
+
+	if (PickupHalo != nullptr && PickupHalo->IsVisible() != bHaloVisible)
+	{
+		PickupHalo->SetVisibility(bHaloVisible);
+		if (!bHaloVisible)
+		{
+			ArtHaloAppliedOpacity = -1.f;
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// THE THROWN TRAIL
+	//
+	// *** "PEAKING MID-FLIGHT" WITHOUT INVENTING A SECOND CLOCK. ***
+	//
+	// The obvious reading - elapsed / total flight time - cannot be computed: no machine knows how
+	// long the flight will last until it has ended, the ball can be caught, intercepted or bounced at
+	// any point, and a client would have to be told the answer. Inventing a duration and ramping
+	// against it would be a timer standing in for a state, which is the thing this file's own
+	// comments refuse to do twice over.
+	//
+	// So the peak is found from the arc's own geometry instead. A thrown Core is a ballistic body:
+	// its vertical speed is largest at the launch and at the landing and passes through ZERO at the
+	// apex. So
+	//
+	//     ApexWeight = horizontal speed / (horizontal speed + |vertical speed|)
+	//
+	// is 1 exactly at the apex and falls off towards both ends of the arc, is a STATELESS function of
+	// LooseVelocity - which already replicates, so every machine computes the same number for free -
+	// and cannot drift, double-advance on a hitch or need an edge to be detected. It is also honest
+	// about the degenerate case: a flat rail-height throw has no apex, its weight sits near 1 for the
+	// whole flight, and "all apex" is the correct answer for an arc with no rise in it.
+	//
+	// The trail is then ALSO clamped to the distance the ball has actually covered since this machine
+	// saw the throw begin, so it grows out of the ball instead of appearing at full length on frame
+	// one - geometry that springs into existence is the tell that reads as a bug rather than a trail.
+	// That uses the same ArtStateStartTime edge, subtracted, for the same reason as the halo.
+	// ---------------------------------------------------------------------------------------------
+	bool bTrailVisible = false;
+	// ThrownTrailBlend None means MakeGlowMID resolved NOTHING, and the library's own instruction for
+	// that case is to hide the component: a bare /Engine/BasicShapes cylinder drawn at its default
+	// material is a grey 100 uu tube, which is far worse than no trail at all.
+	if (State == ETraceCoreArtState::Flight && ThrownTrailSegments.Num() > 0
+		&& ThrownTrailBlend != ETraceFxBlend::None)
+	{
+		const FVector Velocity(LooseVelocity);
+		const double Speed = Velocity.Size();
+		if (Speed > 1.0)
+		{
+			const FVector Direction = Velocity / Speed;
+			const double Horizontal = FVector(Velocity.X, Velocity.Y, 0.0).Size();
+			const double Vertical = FMath::Abs(Velocity.Z);
+
+			// The 1.0 uu/s guard is the same "is it actually moving" threshold ResolveCoreArtState
+			// uses; below it the ratio is noise and 1.0 (treat it as the apex) is the stable answer.
+			const float ApexWeight = (Horizontal + Vertical > 1.0)
+				? static_cast<float>(Horizontal / (Horizontal + Vertical))
+				: 1.f;
+
+			const float ApexLengthUU = FMath::Max(0.f, CVarCoreThrownTrailLength.GetValueOnGameThread());
+			const float WantedLength = ApexLengthUU
+				* FMath::Lerp(TraceCoreArt::ThrownTrailMinLengthScale, 1.f, ApexWeight);
+
+			const float Elapsed = FMath::Max(0.f, LocalTimeSeconds - ArtStateStartTime);
+			const float Flown = static_cast<float>(Speed) * Elapsed;
+			const float LengthUU = FMath::Min(WantedLength, Flown);
+
+			// The head sits at the ball's BACK, not its centre: the doc says the trail "streams behind
+			// the ball", and a trail starting at the heart would be drawn through the front half of a
+			// mesh it is meant to be trailing. Half the DRAWN length, derived from the same constant
+			// the mesh is scaled by, so a re-export moves both together.
+			const FVector Head = GetActorLocation()
+				- Direction * (TraceCoreArt::TargetLengthUU * 0.5);
+			const FVector Tail = Head - Direction * static_cast<double>(LengthUU);
+
+			if (LengthUU > 1.f)
+			{
+				// THE TAPER. Three stacked cylinders, each at the radius of its own mid-point along
+				// the ideal cone, which is UTraceFxShapes' answer to "one mesh cannot taper" and is
+				// shared with §2's beam so the two cannot be built differently.
+				//
+				// The raw pointers are copied onto the stack rather than handed over as the TArray's
+				// own storage: that array holds TObjectPtr<>, whose in-memory layout is NOT a plain
+				// pointer in every build configuration, and reinterpreting it as one would be a bug
+				// that compiles cleanly and only shows up where it was never tested.
+				UStaticMeshComponent* SegmentPtrs[TraceCoreArt::ThrownTrailSegmentCount] = {};
+				const int32 SegmentCount = FMath::Min(ThrownTrailSegments.Num(),
+					TraceCoreArt::ThrownTrailSegmentCount);
+				for (int32 Index = 0; Index < SegmentCount; ++Index)
+				{
+					SegmentPtrs[Index] = ThrownTrailSegments[Index];
+				}
+
+				UTraceFxShapes::TaperBetween(MakeArrayView(SegmentPtrs, SegmentCount),
+					Head, Tail,
+					TraceCoreArt::ThrownTrailHeadRadiusUU, TraceCoreArt::ThrownTrailTailRadiusUU);
+
+				const float Opacity = FMath::Lerp(TraceCoreArt::ThrownTrailMinOpacity,
+					TraceCoreArt::ThrownTrailMaxOpacity, ApexWeight);
+				if (!FMath::IsNearlyEqual(ArtTrailAppliedOpacity, Opacity, 0.004f))
+				{
+					for (UMaterialInstanceDynamic* SegmentMID : ThrownTrailMIDs)
+					{
+						// Same intensity/opacity argument as the halo: the additive parent has no Glow
+						// scalar, so 1.0 and the weight on the opacity is the whole dynamic range there
+						// is, and the ball's own cyan (3.4x) does the brightness in the emissive half.
+						UTraceFxShapes::SetGlow(SegmentMID, ThrownTrailBlend, CyanTint,
+							/*Intensity=*/1.f, Opacity);
+					}
+					ArtTrailAppliedOpacity = Opacity;
+				}
+
+				bTrailVisible = true;
+			}
+		}
+	}
+
+	for (UStaticMeshComponent* Segment : ThrownTrailSegments)
+	{
+		if (Segment != nullptr && Segment->IsVisible() != bTrailVisible)
+		{
+			Segment->SetVisibility(bTrailVisible);
+		}
+	}
+	if (!bTrailVisible)
+	{
+		ArtTrailAppliedOpacity = -1.f;
+	}
+}
+
 void ATraceCore::UpdateCoreArt()
 {
 	if (!bPackArtActive || PackMesh == nullptr)
@@ -11103,6 +12106,11 @@ void ATraceCore::UpdateCoreArt()
 		{
 			HeartLight->SetVisibility(false);
 		}
+		// SPEC v32 §3. The A/B switch turns the whole pack presentation off, and the FX geometry is
+		// part of that presentation: a halo blooming around the pre-v31 engine sphere would be the
+		// new effects photographed against the old ball, which is exactly what this switch exists to
+		// let a reviewer avoid.
+		HideCoreArtGeometry();
 		return;
 	}
 
@@ -11174,6 +12182,11 @@ void ATraceCore::UpdateCoreArt()
 	}
 
 	UpdateCoreArtEmissive(State, Now);
+
+	// SPEC v32 §3, AND IT RUNS AFTER THE EMISSIVE ON PURPOSE: it reads back the team tint that call
+	// just resolved (ArtAppliedTint) rather than deriving the team a second time, so the ball and its
+	// trail can never be two different colours.
+	UpdateCoreArtGeometry(State, Now);
 }
 
 // =================================================================================================
@@ -11331,7 +12344,10 @@ bool ATraceCore::DebugStageCoreArt(UWorld* World, int32 Which, float DistanceUU,
 		if (!IsValid(Bearer))
 		{
 			OutReport = TEXT("no second living pawn to carry it - run with bots, or join a client. ")
-				TEXT("Granting it to the local player would photograph nothing: the Core is hidden from its own holder.");
+				TEXT("Granting it to the LOCAL player photographs something now (the carried ball is drawn ")
+				TEXT("in the holder's hand and is no longer hidden from them), but only from behind at the ")
+				TEXT("450 uu carry arm - use Trace.DebugTakeCore plus Trace.Core.CarryProbe for that view. ")
+				TEXT("This harness stages the ball FACING the camera, which needs somebody else to hold it.");
 			return false;
 		}
 
@@ -11342,8 +12358,22 @@ bool ATraceCore::DebugStageCoreArt(UWorld* World, int32 Which, float DistanceUU,
 			Core->GrantTo(Bearer, ETraceCoreGrantReason::Debug);
 		}
 
-		// The orb rides OrbHeight above the capsule centre, so that is what the camera is pointed at.
-		PC->SetControlRotation(((Bearer->GetActorLocation() + FVector(0.0, 0.0, TraceCoreTuning::OrbHeight)) - Eye).Rotation());
+		// AIMED AT THE BALL ITSELF, WHICH IS NO LONGER THE SAME PLACE AS THE ACTOR. The Core actor
+		// still rides OrbHeight above the capsule centre, but a CARRIED ball is now drawn down in the
+		// holder's right hand (ArtRoot; see UpdateCarriedArtPlacement), so aiming at the actor would
+		// point this harness at empty air above the head and photograph the one thing that is not
+		// there. ArtRoot's world location is the drawn ball on every path, including the not-carried
+		// ones where it sits exactly on the actor.
+		//
+		// Placed before it is aimed at. GrantTo above already ran ApplyAttachment, which places the
+		// art on the same frame possession changes - this repeat is idempotent (it early-outs on an
+		// unchanged offset) and is here so that this harness does not depend on the order of two
+		// functions in a different part of the file to point its camera at the right place.
+		Core->UpdateCarriedArtPlacement();
+		const FVector AimAt = (Core->ArtRoot != nullptr)
+			? Core->ArtRoot->GetComponentLocation()
+			: Bearer->GetActorLocation() + FVector(0.0, 0.0, TraceCoreTuning::OrbHeight);
+		PC->SetControlRotation((AimAt - Eye).Rotation());
 		OutReport = FString::Printf(TEXT("CARRIED staged on %s, %.0f uu ahead. Expect: Pickup cracks the shell for %.2fs, then the Idle turntable."),
 			*GetNameSafe(Bearer), Reach,
 			(Core->ArtPickupAnim != nullptr) ? Core->ArtPickupAnim->GetPlayLength() : 0.f);
@@ -11352,9 +12382,357 @@ bool ATraceCore::DebugStageCoreArt(UWorld* World, int32 Which, float DistanceUU,
 	}
 }
 
+const TCHAR* ATraceCore::DebugArtStateName(ETraceCoreArtState State)
+{
+	// ONE SPELLING OF THESE THREE WORDS, and it lives beside the enum's own consumer rather than in a
+	// harness, because the harness now writes them into FILENAMES: a frame called "flight" is a claim
+	// about ResolveCoreArtState()'s answer and the two must be the same three strings forever.
+	switch (State)
+	{
+	case ETraceCoreArtState::Flight:  return TEXT("flight");
+	case ETraceCoreArtState::Carried: return TEXT("carried");
+	case ETraceCoreArtState::Rest:
+	default:                          return TEXT("rest");
+	}
+}
+
+// =================================================================================================
+// SPEC v32 §3 — MEASURING THE GEOMETRY, RATHER THAN ASSERTING IT.
+//
+// "A verifier will measure the on-screen size." So this reads the numbers back OFF THE LIVE
+// COMPONENTS, through UTraceFxShapes' inverse conversions - which that header says exist for exactly
+// this ("a verifier that re-derives the radius it expects is only checking its own arithmetic").
+// Nothing here recomputes what the code intended; it reports what the transforms on screen are, and
+// prints the FX doc's figure beside each one so the two can be compared by eye.
+//
+// It also FAILS when it never saw an effect at all. A probe that prints "halo: 0 frames" and calls
+// that a result is the §7b defect in a different costume.
+// =================================================================================================
+
+namespace TraceCoreFxProbe
+{
+	struct FProbe
+	{
+		TWeakObjectPtr<UWorld> World;
+		double EndsAt = 0.0;
+		int32 Frames = 0;
+
+		int32 HaloFrames = 0;
+		float HaloMinRadiusUU = TNumericLimits<float>::Max();
+		float HaloMaxRadiusUU = -1.f;
+
+		int32 TrailFrames = 0;
+		int32 TrailSegmentsSeen = 0;
+		float TrailMinLengthUU = TNumericLimits<float>::Max();
+		float TrailMaxLengthUU = -1.f;
+		float TrailHeadRadiusUU = -1.f;
+		float TrailTailRadiusUU = -1.f;
+
+		/** The range of opacity each effect was driven across. A constant here would fail §3's "peaking". */
+		float HaloMinOpacity = TNumericLimits<float>::Max();
+		float HaloMaxOpacity = -1.f;
+		float TrailMinOpacity = TNumericLimits<float>::Max();
+		float TrailMaxOpacity = -1.f;
+	};
+
+	void Execute(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		TSharedRef<FProbe> Probe = MakeShared<FProbe>();
+		Probe->World = World;
+		const double Seconds = (Args.Num() >= 1) ? FMath::Clamp(FCString::Atod(*Args[0]), 1.0, 120.0) : 12.0;
+		Probe->EndsAt = World->GetTimeSeconds() + Seconds;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreFx] SPEC v32 §3: watching the Core's FX geometry for %.0fs. Throw the Core and ")
+			TEXT("let somebody pick it up (or run Trace.Core.ArtShots alongside this)."), Seconds);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Probe](float /*Delta*/) -> bool
+		{
+			UWorld* const TickWorld = Probe->World.Get();
+			ATraceCore* const Core = IsValid(TickWorld) ? ATraceCore::Get(TickWorld) : nullptr;
+			if (Core == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[CoreFx] no Core (or no world); aborting."));
+				return false;
+			}
+
+			++Probe->Frames;
+
+			// THE HALO. GetComponentScale, not the relative scale: the world scale is what the renderer
+			// uses, so it is the only one that is a claim about what is on screen.
+			if (Core->PickupHalo != nullptr && Core->PickupHalo->IsVisible())
+			{
+				const float RadiusUU = UTraceFxShapes::RadiusUUFromShapeScale(
+					static_cast<float>(Core->PickupHalo->GetComponentScale().X));
+				++Probe->HaloFrames;
+				Probe->HaloMinRadiusUU = FMath::Min(Probe->HaloMinRadiusUU, RadiusUU);
+				Probe->HaloMaxRadiusUU = FMath::Max(Probe->HaloMaxRadiusUU, RadiusUU);
+
+				const float Opacity = Core->GetDebugPickupHaloOpacity();
+				if (Opacity >= 0.f)
+				{
+					Probe->HaloMinOpacity = FMath::Min(Probe->HaloMinOpacity, Opacity);
+					Probe->HaloMaxOpacity = FMath::Max(Probe->HaloMaxOpacity, Opacity);
+				}
+			}
+
+			// THE TRAIL. Its length is the sum of the visible segments' own lengths, which is the taper
+			// measured rather than the taper requested: if a segment failed to place, this is short.
+			float TotalLengthUU = 0.f;
+			int32 Visible = 0;
+			float HeadRadiusUU = -1.f;
+			float TailRadiusUU = -1.f;
+			for (UStaticMeshComponent* Segment : Core->ThrownTrailSegments)
+			{
+				if (Segment == nullptr || !Segment->IsVisible())
+				{
+					continue;
+				}
+				const FVector Scale = Segment->GetComponentScale();
+				TotalLengthUU += UTraceFxShapes::LengthUUFromShapeScale(static_cast<float>(Scale.Z));
+				const float RadiusUU = UTraceFxShapes::RadiusUUFromShapeScale(static_cast<float>(Scale.X));
+				if (Visible == 0)
+				{
+					HeadRadiusUU = RadiusUU;
+				}
+				TailRadiusUU = RadiusUU;
+				++Visible;
+			}
+
+			if (Visible > 0)
+			{
+				++Probe->TrailFrames;
+				Probe->TrailSegmentsSeen = FMath::Max(Probe->TrailSegmentsSeen, Visible);
+				Probe->TrailMinLengthUU = FMath::Min(Probe->TrailMinLengthUU, TotalLengthUU);
+				Probe->TrailMaxLengthUU = FMath::Max(Probe->TrailMaxLengthUU, TotalLengthUU);
+				Probe->TrailHeadRadiusUU = HeadRadiusUU;
+				Probe->TrailTailRadiusUU = TailRadiusUU;
+
+				const float Opacity = Core->GetDebugThrownTrailOpacity();
+				if (Opacity >= 0.f)
+				{
+					Probe->TrailMinOpacity = FMath::Min(Probe->TrailMinOpacity, Opacity);
+					Probe->TrailMaxOpacity = FMath::Max(Probe->TrailMaxOpacity, Opacity);
+				}
+			}
+
+			if (TickWorld->GetTimeSeconds() < Probe->EndsAt)
+			{
+				return true;
+			}
+
+			// ---- REPORT --------------------------------------------------------------------------
+			const bool bHaloSeen = Probe->HaloFrames > 0;
+			const bool bTrailSeen = Probe->TrailFrames > 0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CoreFx] %d frames watched. Blends: halo %s, trail %s (the FX doc asks for ")
+				TEXT("translucent; see ETraceFxBlend::Translucent for why additive is the faithful stand-in)."),
+				Probe->Frames,
+				UTraceFxShapes::BlendName(Core->GetDebugPickupHaloBlend()),
+				UTraceFxShapes::BlendName(Core->GetDebugThrownTrailBlend()));
+
+			if (bHaloSeen)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[CoreFx] PICKUP HALO: visible on %d frames, MEASURED radius %.2f -> %.2f uu, ")
+					TEXT("MEASURED opacity %.2f -> %.2f (fades out, per the doc). ")
+					TEXT("FX doc: r 0.20 m = %.1f uu, x0.6 -> x2.1, i.e. %.1f -> %.1f uu."),
+					Probe->HaloFrames, Probe->HaloMinRadiusUU, Probe->HaloMaxRadiusUU,
+					Probe->HaloMinOpacity, Probe->HaloMaxOpacity,
+					TraceCoreArt::PickupHaloRadiusUU,
+					TraceCoreArt::PickupHaloRadiusUU * TraceCoreArt::PickupHaloScaleStart,
+					TraceCoreArt::PickupHaloRadiusUU * TraceCoreArt::PickupHaloScaleEnd);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[CoreFx] PICKUP HALO: NEVER SEEN in %d frames. It fires on the possession edge, ")
+					TEXT("so this window contained no pickup - or the halo is broken."), Probe->Frames);
+			}
+
+			if (bTrailSeen)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[CoreFx] THROWN TRAIL: visible on %d frames, %d/%d segments placed, MEASURED ")
+					TEXT("length %.1f -> %.1f uu (apex knob %.0f uu), MEASURED opacity %.3f -> %.3f ")
+					TEXT("(a RANGE is §3's \"peaking mid-flight\"; a single value would mean it is a ")
+					TEXT("constant), MEASURED segment radii head %.2f uu ")
+					TEXT("tail %.2f uu. FX doc: r 0.055 -> 0.012 m = %.1f -> %.1f uu, so the stacked ")
+					TEXT("mid-point radii are %.2f and %.2f."),
+					Probe->TrailFrames, Probe->TrailSegmentsSeen, Core->ThrownTrailSegments.Num(),
+					Probe->TrailMinLengthUU, Probe->TrailMaxLengthUU,
+					CVarCoreThrownTrailLength.GetValueOnGameThread(),
+					Probe->TrailMinOpacity, Probe->TrailMaxOpacity,
+					Probe->TrailHeadRadiusUU, Probe->TrailTailRadiusUU,
+					TraceCoreArt::ThrownTrailHeadRadiusUU, TraceCoreArt::ThrownTrailTailRadiusUU,
+					UTraceFxShapes::TaperSegmentRadiusUU(TraceCoreArt::ThrownTrailHeadRadiusUU,
+						TraceCoreArt::ThrownTrailTailRadiusUU, 0, TraceCoreArt::ThrownTrailSegmentCount),
+					UTraceFxShapes::TaperSegmentRadiusUU(TraceCoreArt::ThrownTrailHeadRadiusUU,
+						TraceCoreArt::ThrownTrailTailRadiusUU,
+						TraceCoreArt::ThrownTrailSegmentCount - 1, TraceCoreArt::ThrownTrailSegmentCount));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[CoreFx] THROWN TRAIL: NEVER SEEN in %d frames. It draws only while the Core is ")
+					TEXT("LOOSE AND MOVING - so this window contained no throw, or the trail is broken."),
+					Probe->Frames);
+			}
+
+			if (bHaloSeen && bTrailSeen)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[CoreFx] ===== PASS ===== both §3 effects were on screen and measured."));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[CoreFx] ===== FAILED ===== at least one §3 effect never drew."));
+			}
+
+			return false;
+		}), 0.f);
+	}
+}
+
+static FAutoConsoleCommandWithWorldAndArgs GTraceCoreFxProbeCmd(
+	TEXT("Trace.Core.FxProbe"),
+	TEXT("SPEC v32 §3. Watches the Core's two pieces of FX geometry for N seconds (default 12) and "
+	     "reports their radii and lengths MEASURED off the live components, in uu, beside the FX doc's "
+	     "own figures. Fails if either effect never drew. Pair it with Trace.Core.ArtShots, which "
+	     "stages both a throw and a pickup."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TraceCoreFxProbe::Execute));
+
+/**
+ * `Trace.Core.CarryProbe` - THE CARRIED BALL, PRINTED RATHER THAN ASSERTED.
+ *
+ * Deliberately not a pass/fail verifier. What is being fixed here is a PICTURE - "you cannot see the
+ * ball being held" - and the only honest verdict on a picture is a screenshot. What a log CAN settle
+ * is everything a screenshot cannot: whether `hand_r` really resolved or the hip fallback quietly
+ * took over, whether the ACTOR is still at OrbHeight while the BALL is at hand height, where the ball
+ * lands in pixels, and which pieces are owner-hidden. Run it with Trace.Core.CarryInHand at 1 and at
+ * 0 and the two prints are the A/B, out of one binary.
+ */
+static FAutoConsoleCommandWithWorldAndArgs GTraceCoreCarryProbeCmd(
+	TEXT("Trace.Core.CarryProbe"),
+	TEXT("Prints where the carried Core is DRAWN against where its actor is, whether the holder's "
+	     "`hand_r` socket resolved, where the ball lands on this machine's screen in px, and "
+	     "bOwnerNoSee on all four drawn pieces. Takes an optional DELAY in seconds, because the "
+	     "answer changes during the 0.35 s pull-back: -TraceExec runs a whole command list on ONE "
+	     "frame, so `Trace.DebugTakeCore 0 0 90|Trace.Core.CarryProbe 3` is how the settled carry "
+	     "state gets printed from a single unattended run. Trace.Core.CarryInHand 0 restores the "
+	     "pre-fix picture for the other arm."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+	{
+		auto Print = [](UWorld* Where)
+		{
+			ATraceCore* const TheCore = (Where != nullptr) ? ATraceCore::Get(Where) : nullptr;
+			if (TheCore == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[CarryProbe] no Core (or no world)."));
+				return;
+			}
+			TheCore->DebugLogCarryState();
+		};
+
+		const double Delay = (Args.Num() >= 1) ? FMath::Clamp(FCString::Atod(*Args[0]), 0.0, 60.0) : 0.0;
+		if (Delay <= 0.0)
+		{
+			Print(World);
+			return;
+		}
+
+		// A DEADLINE ON THE WORLD'S OWN CLOCK, sampled each tick, rather than a countdown accumulated
+		// per frame: this file's standing rule, and the reason is that a per-frame accumulator is what
+		// shipped two bugs here already.
+		TWeakObjectPtr<UWorld> Weak(World);
+		const double DueAt = (World != nullptr) ? World->GetTimeSeconds() + Delay : 0.0;
+		UE_LOG(LogTraceGame, Display, TEXT("[CarryProbe] will print in %.1fs."), Delay);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Weak, DueAt, Print](float /*Delta*/) -> bool
+		{
+			UWorld* const Live = Weak.Get();
+			if (!IsValid(Live))
+			{
+				return false;
+			}
+			if (Live->GetTimeSeconds() < DueAt)
+			{
+				return true;
+			}
+			Print(Live);
+			return false;
+		}), 0.f);
+	}));
+
+// =================================================================================================
+// SPEC v32 §7b — Trace.Core.ArtShots REPORTED SUCCESS WITHOUT WRITING FILES.
+//
+// The v31 verifier's finding, verbatim: it "reports `stage 0/1/2: ok` and `screenshot requested` for
+// every state WHILE THE GAME IS STILL ON THE CHARACTER-SELECT SCREEN". A harness that cannot fail is
+// worthless, and this one passed over its own failure in three separate ways at once. All three are
+// fixed here, and each one has an arm that makes it fire:
+//
+//   1. IT DID NOT WAIT FOR GAMEPLAY. Two FTimerManager timers per beat, started the instant the
+//      command was typed, firing at fixed offsets. A timer is not a state: the select screen is up
+//      for as long as it takes a human to read five cards, the local pawn EXISTS behind it (this
+//      project does not start players as spectators), and every precondition the old code actually
+//      checked - "is there a Core", "is there a local pawn" - was already true. So it staged, and
+//      photographed a menu. It now WAITS for the game to be live, on a ticker, and gives up loudly
+//      if it never becomes live.
+//
+//      *** RED ARM: Trace.Core.ArtShots.RedArm 1 skips the wait, which is exactly the v31
+//      behaviour. Run it on the select screen with the arm on and the harness stages into a menu;
+//      run it there with the arm OFF and it refuses and FAILS. Two arms, two answers, so the gate
+//      is measuring something. ***
+//
+//   2. IT NEVER LOOKED AT THE DISK. "screenshot requested" was printed by the line that made the
+//      request, which can only ever mean "the request was made". FScreenshotRequest is asynchronous
+//      and can decline outright - if a delegate is bound to UGameViewportClient::OnScreenshotCaptured
+//      the engine fires that INSTEAD of writing a file, which is precisely the failure mode this
+//      section is named after. Every request is now followed to the disk and the byte count printed.
+//
+//      *** RED ARM: Trace.Core.ArtShots.RedArm 2 does everything except press the shutter. The file
+//      cannot appear, and the run must FAIL. ***
+//
+//   3. IT NAMED EACH FRAME BY THE STATE IT ASKED FOR. `TraceCoreArt_flight1_...png` was written by
+//      a beat that had REQUESTED flight; whether the Core was in flight when the shutter fired was
+//      never consulted. So a frame of a resting Core - or of a character-select screen - was filed
+//      under "flight" and would have been read as evidence for it. The frame is now named by
+//      ATraceCore::GetDebugArtState(), the SHIPPING state rule, sampled on the frame the request is
+//      made and again on the frame after it (the capture can be serviced at the end of either), and
+//      a disagreement between the two is stated in the filename rather than resolved by guessing.
+//      A frame whose actual state is not the state the beat asked for FAILS THE RUN.
+//
+// It is still the same seven beats through the same shipping staging function; only the schedule,
+// the verification and the naming changed.
+// =================================================================================================
+
 namespace TraceCoreArtShots
 {
-	/** One capture: stage at @p StageAt, photograph at @p ShotAt, both seconds from the command. */
+	/**
+	 * SPEC v32 §7b. 0 = off. 1 = stage without waiting for gameplay (the v31 bug, reproduced).
+	 * 2 = do everything except request the screenshot (so the on-disk check has something to catch).
+	 *
+	 * A CVar and not an argument because a red arm should be visible in `Trace.Core.ArtShots.RedArm`
+	 * when somebody wonders why a run behaved oddly, and because arming it from -ExecCmds needs a
+	 * value assignment rather than a positional parameter.
+	 */
+	TAutoConsoleVariable<int32> CVarArtShotsRedArm(
+		TEXT("Trace.Core.ArtShots.RedArm"),
+		0,
+		TEXT("SPEC v32 §7b red arm. 0 (default): the fixed harness. 1: SKIP the wait-for-gameplay ")
+		TEXT("gate, reproducing the v31 bug where the Core was staged and photographed on the ")
+		TEXT("character-select screen. 2: run everything but never request the screenshot, so the ")
+		TEXT("on-disk verification has a failure to catch. Both arms must make the run FAIL."),
+		ECVF_Default);
+
+	/** One capture: stage at @p StageAt, photograph at @p ShotAt, both seconds from GAMEPLAY GOING LIVE. */
 	struct FBeat
 	{
 		float StageAt;
@@ -11368,83 +12746,566 @@ namespace TraceCoreArtShots
 	 * Core AWAY from the previous one, so a sequence that ended on a loose Core would leave the match
 	 * with the objective on the floor. Ending on CARRIED puts it back in somebody's hands.
 	 *
-	 * The flight state is photographed FOUR times a tenth of a second apart. A screenshot request is
-	 * serviced at the end of a later frame, not the current one, so a single request at a chosen
-	 * instant is a guess; four of them across the pass are a measurement.
+	 * The flight state is photographed FOUR times, at four different ages of the arc, because a
+	 * screenshot request is serviced at the end of a later frame and not necessarily the current one:
+	 * a single request at a chosen instant is a guess, and four across the arc are a measurement.
+	 *
+	 * THE OFFSETS ARE NOW MEASURED FROM THE MOMENT GAMEPLAY GOES LIVE, not from the moment the
+	 * command was typed. That is the §7b fix for defect 1: the same seven beats, hung off a state
+	 * instead of off a stopwatch that started while a menu was up.
+	 *
+	 * *** AND EVERY FLIGHT BEAT NOW RE-STAGES, WHICH IS A DEFECT THE FIXED HARNESS FOUND IN ITSELF. ***
+	 *
+	 * The first fixed run reported "wanted flight, actual CARRIED" on beats 3 and 4 and failed. That
+	 * was not a false alarm and not a naming bug: a BOT had caught the loose Core 0.39 s after it was
+	 * launched, through the shipping catch zone, which is exactly what mode B's bots are for. One
+	 * staged throw simply does not survive four shutters. Under the v31 harness those two frames were
+	 * still filed as "flight1..4" and would have been read as evidence about a state they do not show.
+	 *
+	 * So each flight beat launches its own throw and photographs it a fixed age later - 0.10, 0.15,
+	 * 0.22 and 0.30 s - which is the same trick, and the same reason, as the two carried beats below.
+	 * DebugLaunchLoose is deterministic (identical From and identical velocity every time), so four
+	 * ages of four identical arcs ARE four points along one arc, and unlike one arc they cannot be
+	 * taken off the field between frames one and four.
 	 */
 	const FBeat Beats[] =
 	{
 		{ 0.10f, 1.20f, 0, TEXT("rest")    },
 		{ 2.00f, 2.10f, 1, TEXT("flight1") },
-		{ -1.f,  2.25f, 1, TEXT("flight2") },
-		{ -1.f,  2.40f, 1, TEXT("flight3") },
-		{ -1.f,  2.60f, 1, TEXT("flight4") },
+		{ 2.30f, 2.45f, 1, TEXT("flight2") },
+		{ 2.70f, 2.92f, 1, TEXT("flight3") },
+		{ 3.20f, 3.50f, 1, TEXT("flight4") },
 		// Both carried beats re-stage first, a tenth of a second before the shutter, for the reason in
 		// DebugStageCoreArt's case 2: the bearer is a bot and bots do not stand still to be admired.
-		{ 3.60f, 3.75f, 2, TEXT("carried_crack") },
-		{ 4.80f, 4.95f, 2, TEXT("carried_idle")  },
+		{ 4.20f, 4.35f, 2, TEXT("carried_crack") },
+		{ 5.40f, 5.55f, 2, TEXT("carried_idle")  },
 	};
 
-	void Shoot(const TCHAR* Label)
-	{
-		const FString FileName = FString::Printf(TEXT("TraceCoreArt_%s_%s.png"),
-			Label, *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
-		const FString Path = FPaths::ConvertRelativePathToFull(
-			FPaths::ProjectSavedDir() / TEXT("Screenshots") / FileName);
+	constexpr int32 BeatCount = UE_ARRAY_COUNT(Beats);
 
-		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(Path));
-		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
-		UE_LOG(LogTraceGame, Display, TEXT("[CoreArt] screenshot requested: %s"), *Path);
+	/** The art state a beat is ASKING for, as a name, so the comparison below is state-to-state. */
+	const TCHAR* WantedStateName(int32 Which)
+	{
+		switch (Which)
+		{
+		case 0:  return ATraceCore::DebugArtStateName(ETraceCoreArtState::Rest);
+		case 1:  return ATraceCore::DebugArtStateName(ETraceCoreArtState::Flight);
+		default: return ATraceCore::DebugArtStateName(ETraceCoreArtState::Carried);
+		}
 	}
 
-	void Run(const TArray<FString>& Args, UWorld* World)
+	/** Everything that became of one requested frame. Every field is printed in the summary. */
+	struct FShot
+	{
+		bool bStaged = false;
+		bool bStageRefused = false;
+		bool bRequested = false;
+		bool bResolved = false;      // the disk answered, one way or the other
+		bool bOnDisk = false;
+		bool bStateAgreed = false;   // actual == what the beat asked for
+
+		FString RequestedPath;
+		FString FinalPath;
+		FString StateAtRequest;
+		FString StateAfterFrame;
+		double RequestedAt = 0.0;
+		int64 Bytes = 0;
+	};
+
+	struct FRun
+	{
+		TWeakObjectPtr<UWorld> World;
+		float Distance = 420.f;
+		float ReadyTimeout = 30.f;
+		int32 RedArm = 0;
+		double StartedAt = 0.0;
+		double ReadyAt = -1.0;
+		double LastWaitLogAt = -1000.0;
+		FString LastNotReadyReason;
+		FString StampSuffix;
+		FShot Shots[BeatCount];
+	};
+
+	/**
+	 * ONE RUN AT A TIME, and it is a weak flag rather than a queue.
+	 *
+	 * Two overlapping runs would fight over the Core: the second run's REST stage launches the ball
+	 * out of the bearer the first run's CARRIED stage just handed it to, and both would then report
+	 * on frames the other one staged. Refusing is the only honest answer.
+	 */
+	bool bRunActive = false;
+
+	/**
+	 * *** THE §7b GATE: IS THIS ACTUALLY GAMEPLAY? ***
+	 *
+	 * Every one of these was true on the character-select screen except the ones marked, which is why
+	 * the v31 harness sailed straight through. The reason string is returned so the log says WHICH
+	 * condition is still unmet rather than "not ready", which is not something anybody can act on.
+	 *
+	 * @param bNeedSecondPawn  the CARRIED beats need a second living body; the Core is bOwnerNoSee and
+	 *                         a player can never photograph their own. Checked here so the run does not
+	 *                         start at all in a session that cannot finish it.
+	 */
+	bool IsGameplayLive(UWorld* World, bool bNeedSecondPawn, FString& OutWhyNot)
+	{
+		if (World == nullptr)
+		{
+			OutWhyNot = TEXT("no world");
+			return false;
+		}
+
+		if (World->GetGameState() == nullptr)
+		{
+			OutWhyNot = TEXT("no GameState yet (the map is still coming up)");
+			return false;
+		}
+
+		ATraceCore* const Core = ATraceCore::Get(World);
+		if (Core == nullptr)
+		{
+			OutWhyNot = TEXT("no Core in this world");
+			return false;
+		}
+		if (!Core->HasAuthority())
+		{
+			OutWhyNot = TEXT("this machine is not the server; stage on the listen host");
+			return false;
+		}
+
+		APlayerController* const PC = World->GetFirstPlayerController();
+		if (PC == nullptr)
+		{
+			OutWhyNot = TEXT("no local player controller");
+			return false;
+		}
+
+		ATraceCharacter* const Local = Cast<ATraceCharacter>(PC->GetPawn());
+		if (!IsValid(Local) || !Local->IsAlive())
+		{
+			OutWhyNot = TEXT("the local player has no living pawn");
+			return false;
+		}
+
+		// *** THE ONE THE v31 RUN WAS SITTING IN. *** This project does not start players as
+		// spectators, so a pawn EXISTS behind the select screen and every pawn test above passes while
+		// a menu fills the frame. Nothing but the screen's own flag answers "is a menu up".
+		ATracePlayerState* const LocalState = Cast<ATracePlayerState>(PC->PlayerState);
+		if (LocalState == nullptr)
+		{
+			OutWhyNot = TEXT("the local player has no PlayerState yet");
+			return false;
+		}
+		if (LocalState->IsCharacterSelectOpen())
+		{
+			OutWhyNot = TEXT("THE CHARACTER-SELECT SCREEN IS OPEN (this is the v31 failure)");
+			return false;
+		}
+		if (LocalState->Team == ETraceTeam::None)
+		{
+			OutWhyNot = TEXT("the local player has not been given a team yet");
+			return false;
+		}
+
+		// AND THE ONE THAT CATCHES THE FRAME BEFORE THE SCREEN OPENS. PollCharacterSelect runs at
+		// 4 Hz and needs a team first, so for the first fraction of a second of a session the screen
+		// is not open YET and the flag above is a false negative. "Locked in" is only false-negative
+		// in the direction that costs a wait. Skipped entirely when characters are switched off for
+		// the session (mode A, or the settings toggle), where nobody is ever locked in and requiring
+		// it would hang forever.
+		if (UTraceAbilityComponent::AreCharactersEnabled(World) && !LocalState->bCharacterLocked)
+		{
+			OutWhyNot = TEXT("the local player has not locked in a character yet");
+			return false;
+		}
+
+		// THE MATCH HAS ACTUALLY KICKED OFF. Until ATraceGameMode calls KickoffTo() the Core belongs
+		// to nobody and is parked at home - a real state, and not one any of these beats is about. It
+		// is also the cheapest possible proof that the match loop is turning rather than initialising.
+		if (!IsValid(Core->Carrier) && !Core->bLoose)
+		{
+			OutWhyNot = TEXT("the match has not kicked off (the Core has no holder and is not loose)");
+			return false;
+		}
+
+		if (!Core->IsPackArtActive())
+		{
+			// Not fatal to a screenshot, but it IS fatal to the evidence: these frames exist to show
+			// SK_TraceCore's three poses, and the fallback sphere has none of them.
+			OutWhyNot = TEXT("the pack Core art did not resolve; these frames would photograph the "
+			                 "fallback sphere (`git lfs pull` then Scripts/import-pack.sh)");
+			return false;
+		}
+
+		if (bNeedSecondPawn)
+		{
+			TArray<ATraceCharacter*> Characters;
+			Core->GatherCharacters(Characters);
+			bool bFound = false;
+			for (ATraceCharacter* Candidate : Characters)
+			{
+				if (IsValid(Candidate) && Candidate != Local && Candidate->IsAlive())
+				{
+					bFound = true;
+					break;
+				}
+			}
+			if (!bFound)
+			{
+				OutWhyNot = TEXT("no second living pawn to carry the Core - run with bots, or join a client");
+				return false;
+			}
+		}
+
+		OutWhyNot.Reset();
+		return true;
+	}
+
+	/** The state the Core is in ON THIS FRAME, by the shipping rule. Never null; safe in a filename. */
+	FString SampleState(UWorld* World)
+	{
+		const ATraceCore* const Core = ATraceCore::Get(World);
+		return (Core != nullptr) ? FString(ATraceCore::DebugArtStateName(Core->GetDebugArtState()))
+		                         : FString(TEXT("nocore"));
+	}
+
+	/** Requests one frame, named by the state the Core is ACTUALLY in. Fills in the FShot. */
+	void Shoot(FRun& Run, int32 Index)
+	{
+		UWorld* const World = Run.World.Get();
+		FShot& Shot = Run.Shots[Index];
+		const FBeat& Beat = Beats[Index];
+
+		Shot.StateAtRequest = SampleState(World);
+		Shot.bStateAgreed = Shot.StateAtRequest.Equals(WantedStateName(Beat.Which));
+
+		// THE ACTUAL STATE LEADS THE FILENAME AND THE REQUESTED LABEL FOLLOWS IT, because the first
+		// token is what somebody sorting a directory of frames reads. The label is kept so a frame can
+		// still be traced back to the beat that asked for it - "flight2" says which of the four passes
+		// this was - but it can no longer be mistaken for a claim about what is in the picture.
+		const FString FileName = FString::Printf(TEXT("TraceCoreArt_%s_asked-%s_%s.png"),
+			*Shot.StateAtRequest, Beat.Label, *Run.StampSuffix);
+
+		Shot.RequestedPath = FPaths::ConvertRelativePathToFull(
+			FPaths::ProjectSavedDir() / TEXT("Screenshots") / FileName);
+		Shot.RequestedAt = (World != nullptr) ? World->GetTimeSeconds() : 0.0;
+		Shot.bRequested = true;
+
+		if (Run.RedArm == 2)
+		{
+			// RED ARM 2. Everything but the shutter. The file cannot appear, so the on-disk check
+			// below has a real failure to catch and the run must go red.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CoreArt] RED ARM 2: shutter suppressed for '%s'. The on-disk check must now fail."),
+				Beat.Label);
+			return;
+		}
+
+		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(Shot.RequestedPath));
+		FScreenshotRequest::RequestScreenshot(Shot.RequestedPath, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreArt] beat '%s' (wants %s): Core is actually %s%s. Screenshot requested -> %s"),
+			Beat.Label, WantedStateName(Beat.Which), *Shot.StateAtRequest,
+			Shot.bStateAgreed ? TEXT("") : TEXT("  *** MISMATCH ***"), *Shot.RequestedPath);
+	}
+
+	/** How long a requested frame is given to appear on disk before it is called missing. */
+	constexpr double FileWaitSeconds = 4.0;
+
+	/**
+	 * Polls the disk for one requested frame.
+	 *
+	 * Also RENAMES it when the state moved between the request frame and the frame after it. The
+	 * filename has to be chosen before the request, and the engine may service the capture at the end
+	 * of either frame, so those two samples bracket the frame that was actually taken: if they agree
+	 * the name is certain, and if they do not, saying so in the name is the only honest option. The
+	 * alternative - keeping the earlier guess - is the v31 defect in miniature.
+	 */
+	void ResolveShot(FRun& Run, int32 Index, double Now)
+	{
+		FShot& Shot = Run.Shots[Index];
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+
+		if (!PlatformFile.FileExists(*Shot.RequestedPath))
+		{
+			if (Now - Shot.RequestedAt >= FileWaitSeconds)
+			{
+				Shot.bResolved = true;
+				Shot.bOnDisk = false;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[CoreArt] NO FILE. %.1fs after the request there is nothing at: %s"),
+					FileWaitSeconds, *Shot.RequestedPath);
+			}
+			return;
+		}
+
+		Shot.bResolved = true;
+		Shot.bOnDisk = true;
+		Shot.Bytes = PlatformFile.FileSize(*Shot.RequestedPath);
+		Shot.FinalPath = Shot.RequestedPath;
+
+		if (!Shot.StateAfterFrame.IsEmpty() && !Shot.StateAfterFrame.Equals(Shot.StateAtRequest))
+		{
+			const FString Ambiguous = Shot.RequestedPath.Replace(
+				*FString::Printf(TEXT("TraceCoreArt_%s_"), *Shot.StateAtRequest),
+				*FString::Printf(TEXT("TraceCoreArt_%s-or-%s_"), *Shot.StateAtRequest, *Shot.StateAfterFrame));
+
+			if (IFileManager::Get().Move(*Ambiguous, *Shot.RequestedPath))
+			{
+				Shot.FinalPath = Ambiguous;
+			}
+
+			// A WARNING and not an error: the frame is real and the file is on disk, and the harness
+			// is telling the truth about not knowing which of two states it caught. A run is not
+			// failed for it, because the four flight beats exist precisely to make one uncertain
+			// frame survivable.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CoreArt] the Core changed state across the capture window (%s -> %s); the frame "
+				     "is named for both: %s"),
+				*Shot.StateAtRequest, *Shot.StateAfterFrame, *Shot.FinalPath);
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[CoreArt] frame ON DISK (%lld bytes): %s"),
+			Shot.Bytes, *Shot.FinalPath);
+	}
+
+	/** The verdict. Loud, and it says which of the four ways it failed. */
+	void Report(FRun& Run)
+	{
+		int32 Requested = 0, OnDisk = 0, Mismatched = 0, Refused = 0;
+		for (const FShot& Shot : Run.Shots)
+		{
+			Requested += Shot.bRequested ? 1 : 0;
+			OnDisk += Shot.bOnDisk ? 1 : 0;
+			Mismatched += (Shot.bRequested && !Shot.bStateAgreed) ? 1 : 0;
+			Refused += Shot.bStageRefused ? 1 : 0;
+		}
+
+		const bool bNeverReady = Run.ReadyAt < 0.0;
+		const bool bPass = !bNeverReady && Refused == 0 && Requested == BeatCount
+			&& OnDisk == BeatCount && Mismatched == 0;
+
+		if (bPass)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CoreArt] ===== PASS ===== %d/%d frames verified ON DISK, every one named for the "
+				     "state the Core was actually in. Saved/Screenshots/TraceCoreArt_*_%s.png"),
+				OnDisk, BeatCount, *Run.StampSuffix);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[CoreArt] ===== FAILED ===== requested %d/%d, on disk %d/%d, stage refusals %d, "
+				     "state mismatches %d%s%s"),
+				Requested, BeatCount, OnDisk, BeatCount, Refused, Mismatched,
+				bNeverReady ? TEXT(" | GAMEPLAY NEVER WENT LIVE: ") : TEXT(""),
+				bNeverReady ? *Run.LastNotReadyReason : TEXT(""));
+		}
+
+		// The per-frame ledger, pass or fail, because a summary line is a claim and this is the
+		// evidence for it. `ls` on the paths below is the check a reviewer can run themselves.
+		for (int32 Index = 0; Index < BeatCount; ++Index)
+		{
+			const FShot& Shot = Run.Shots[Index];
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CoreArt]   beat %d '%s': wanted %-7s actual %-7s %s %s"),
+				Index, Beats[Index].Label, WantedStateName(Beats[Index].Which),
+				Shot.StateAtRequest.IsEmpty() ? TEXT("-") : *Shot.StateAtRequest,
+				Shot.bStateAgreed ? TEXT("  ") : TEXT("!!"),
+				Shot.bOnDisk ? *FString::Printf(TEXT("%lld bytes  %s"), Shot.Bytes, *Shot.FinalPath)
+				             : TEXT("NO FILE"));
+		}
+	}
+
+	void Execute(const TArray<FString>& Args, UWorld* World)
 	{
 		if (World == nullptr)
 		{
 			return;
 		}
 
-		float Distance = 420.f;
+		if (bRunActive)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CoreArt] a run is already in progress; refusing. Two runs would stage over each other."));
+			return;
+		}
+
+		TSharedRef<FRun> State = MakeShared<FRun>();
+		State->World = World;
+		State->StartedAt = World->GetTimeSeconds();
+		State->RedArm = CVarArtShotsRedArm.GetValueOnGameThread();
+		State->StampSuffix = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
+
 		if (Args.Num() >= 1)
 		{
-			Distance = FCString::Atof(*Args[0]);
+			State->Distance = FCString::Atof(*Args[0]);
 		}
+		if (Args.Num() >= 2)
+		{
+			State->ReadyTimeout = FMath::Max(0.f, FCString::Atof(*Args[1]));
+		}
+
+		bRunActive = true;
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[CoreArt] spec v31 §4: staging rest, flight and carried at %.0f uu and photographing each."),
-			Distance);
+			TEXT("[CoreArt] SPEC v32 §7b: %d beats at %.0f uu. Waiting up to %.1fs for real gameplay "
+			     "before staging anything.%s"),
+			BeatCount, State->Distance, State->ReadyTimeout,
+			(State->RedArm != 0)
+				? *FString::Printf(TEXT("  *** RED ARM %d ENGAGED - THIS RUN IS EXPECTED TO FAIL. ***"), State->RedArm)
+				: TEXT(""));
 
-		FTimerManager& Timers = World->GetTimerManager();
-		for (const FBeat& Beat : Beats)
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State](float /*Delta*/) -> bool
 		{
-			if (Beat.StageAt >= 0.f)
+			UWorld* const TickWorld = State->World.Get();
+			if (!IsValid(TickWorld))
 			{
-				const int32 Which = Beat.Which;
-				FTimerHandle StageHandle;
-				Timers.SetTimer(StageHandle, FTimerDelegate::CreateWeakLambda(World,
-					[World, Which, Distance]()
-					{
-						FString Report;
-						const bool bOk = ATraceCore::DebugStageCoreArt(World, Which, Distance, Report);
-						UE_LOG(LogTraceGame, Display, TEXT("[CoreArt] stage %d: %s | %s"),
-							Which, bOk ? TEXT("ok") : TEXT("REFUSED"), *Report);
-					}), Beat.StageAt, false);
+				UE_LOG(LogTraceGame, Error, TEXT("[CoreArt] ===== FAILED ===== the world went away mid-run."));
+				bRunActive = false;
+				return false;
 			}
 
-			const TCHAR* Label = Beat.Label;
-			FTimerHandle ShotHandle;
-			Timers.SetTimer(ShotHandle, FTimerDelegate::CreateWeakLambda(World,
-				[Label]() { Shoot(Label); }), Beat.ShotAt, false);
-		}
+			const double Now = TickWorld->GetTimeSeconds();
+
+			// ---- PHASE 1: WAIT FOR GAMEPLAY ------------------------------------------------------
+			if (State->ReadyAt < 0.0)
+			{
+				if (State->RedArm == 1)
+				{
+					// RED ARM 1. The v31 behaviour exactly: start staging the moment the command is
+					// typed, whatever is on screen. Left as a single branch so the difference between
+					// the arms is one condition and not two code paths.
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[CoreArt] RED ARM 1: skipping the wait-for-gameplay gate. This is the v31 "
+						     "behaviour that photographed the character-select screen."));
+					State->ReadyAt = Now;
+				}
+				else if (IsGameplayLive(TickWorld, /*bNeedSecondPawn=*/true, State->LastNotReadyReason))
+				{
+					State->ReadyAt = Now;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[CoreArt] gameplay is live after %.2fs; staging starts now."),
+						Now - State->StartedAt);
+				}
+				else if (Now - State->StartedAt >= static_cast<double>(State->ReadyTimeout))
+				{
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[CoreArt] gave up after %.1fs waiting for gameplay. Last reason: %s"),
+						Now - State->StartedAt, *State->LastNotReadyReason);
+					Report(*State);
+					bRunActive = false;
+					return false;
+				}
+				else
+				{
+					// Throttled to once a second so a 30 s wait is 30 lines and not 1800. The latch is
+					// on the RUN and not a function-local static: a static would be shared by every run
+					// in the session, so a second run started inside a second of the first would be
+					// silent about why it was waiting.
+					if (Now - State->LastWaitLogAt >= 1.0)
+					{
+						State->LastWaitLogAt = Now;
+						UE_LOG(LogTraceGame, Display, TEXT("[CoreArt] waiting for gameplay (%.0fs left): %s"),
+							static_cast<double>(State->ReadyTimeout) - (Now - State->StartedAt),
+							*State->LastNotReadyReason);
+					}
+					return true;
+				}
+			}
+
+			const double Elapsed = Now - State->ReadyAt;
+
+			// ---- PHASE 2: STAGE, SHOOT, AND FOLLOW EACH FRAME TO THE DISK ------------------------
+			for (int32 Index = 0; Index < BeatCount; ++Index)
+			{
+				const FBeat& Beat = Beats[Index];
+				FShot& Shot = State->Shots[Index];
+
+				if (Beat.StageAt >= 0.f && !Shot.bStaged && Elapsed >= static_cast<double>(Beat.StageAt))
+				{
+					Shot.bStaged = true;
+					FString StageReport;
+					const bool bOk = ATraceCore::DebugStageCoreArt(TickWorld, Beat.Which, State->Distance, StageReport);
+					Shot.bStageRefused = !bOk;
+					// TWO UE_LOGs AND NOT ONE WITH A TERNARY VERBOSITY: UE_LOG needs the verbosity as a
+					// literal token - it builds a type name out of it - so `bOk ? Display : Error` does
+					// not compile. Spelling both out is also the only way a refusal reaches Error, which
+					// is what makes a refused stage visible in a log somebody is grepping for failures.
+					if (bOk)
+					{
+						UE_LOG(LogTraceGame, Display, TEXT("[CoreArt] stage %d for '%s': ok | %s"),
+							Beat.Which, Beat.Label, *StageReport);
+					}
+					else
+					{
+						UE_LOG(LogTraceGame, Error, TEXT("[CoreArt] stage %d for '%s': REFUSED | %s"),
+							Beat.Which, Beat.Label, *StageReport);
+					}
+				}
+
+				if (!Shot.bRequested && Elapsed >= static_cast<double>(Beat.ShotAt))
+				{
+					Shoot(*State, Index);
+					continue;   // The second state sample belongs to the NEXT tick, not this one.
+				}
+
+				if (Shot.bRequested && Shot.StateAfterFrame.IsEmpty())
+				{
+					// The frame after the request. See ResolveShot: these two samples bracket the
+					// frame the engine actually captured.
+					Shot.StateAfterFrame = SampleState(TickWorld);
+				}
+
+				if (Shot.bRequested && !Shot.bResolved)
+				{
+					ResolveShot(*State, Index, Now);
+				}
+			}
+
+			// ---- PHASE 3: DONE WHEN EVERY FRAME HAS ANSWERED -------------------------------------
+			bool bAllResolved = true;
+			for (const FShot& Shot : State->Shots)
+			{
+				bAllResolved = bAllResolved && Shot.bResolved;
+			}
+
+			// A HARD DEADLINE AS WELL, because "every frame has answered" is a condition and a ticker
+			// that waits on a condition which can never arrive is a leak that reports nothing at all.
+			// The last beat's shutter, plus the disk wait, plus a couple of seconds of slack.
+			const double Deadline = static_cast<double>(Beats[BeatCount - 1].ShotAt) + FileWaitSeconds + 3.0;
+			if (!bAllResolved && Elapsed >= Deadline)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[CoreArt] deadline: %.1fs after gameplay went live, not every frame had answered."),
+					Elapsed);
+				Report(*State);
+				bRunActive = false;
+				return false;
+			}
+
+			if (bAllResolved)
+			{
+				Report(*State);
+				bRunActive = false;
+				return false;
+			}
+
+			return true;
+		}), 0.f);
 	}
 }
 
 static FAutoConsoleCommandWithWorldAndArgs GTraceCoreArtShotsCmd(
 	TEXT("Trace.Core.ArtShots"),
-	TEXT("SPEC v31 §4. Listen host, mode B. Stages the Core at rest (standing on its point), in "
-	     "flight (nose along the velocity) and carried by another pawn, in front of the local camera, "
-	     "and screenshots each into Saved/Screenshots. Optional argument: distance in uu (default 420)."),
-	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TraceCoreArtShots::Run));
+	TEXT("SPEC v32 §7b (was v31 §4). Listen host, mode B. WAITS for real gameplay - a living local "
+	     "pawn, the character-select screen closed, a character locked in, the match kicked off - then "
+	     "stages the Core at rest, in flight and carried by another pawn, photographs each, VERIFIES "
+	     "the file landed on disk, and names every frame by the state the Core was actually in. Fails "
+	     "loudly if any of that does not happen. Args: [distance uu = 420] [wait-for-gameplay "
+	     "seconds = 30]. Red arms: Trace.Core.ArtShots.RedArm 1 / 2."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&TraceCoreArtShots::Execute));
 
 void ATraceCore::EnforceHolderTrailState()
 {
@@ -11500,14 +13361,10 @@ void ATraceCore::OnRep_Owner()
 {
 	Super::OnRep_Owner();
 
-	if (Mesh != nullptr)
-	{
-		Mesh->MarkRenderStateDirty();
-	}
-	if (Beacon != nullptr)
-	{
-		Beacon->MarkRenderStateDirty();
-	}
+	// The owner chain IS what bOwnerNoSee resolves against, so this is the one OnRep that has to
+	// rebuild every drawn piece's proxy. Same list as ApplyAttachment's, from the same function, so
+	// the two cannot fall out of step - which is precisely how PackMesh came to be missing from it.
+	MarkDrawnPiecesRenderStateDirty();
 }
 
 void ATraceCore::OnRep_Loose()

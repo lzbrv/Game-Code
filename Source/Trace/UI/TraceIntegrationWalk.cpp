@@ -24,6 +24,18 @@
 //     Trace.Integ.Walk Menu     the title screen tour: title, settings, back, JOIN, back
 //     Trace.Integ.Walk Match    in match: play, escape, the in-match settings page, back
 //
+// The argument-free aliases (safe to pass to -TraceExec=, see the alias block at the bottom):
+//     Trace.Integ.WalkMenu / WalkMatch / WalkSelect / WalkPlay / WalkGuns
+//     Trace.Integ.WalkCore        spec v31 §2 / v32 §7e — the Core thrown while descending. GATED on
+//                                 the measured take-off; it RE-STAGES the jump when the arena's
+//                                 geometry cuts the flight short, and it FAILS rather than mislabels.
+//     Trace.Integ.WalkCoreRedArm  the same walk with every throw aimed AFTER the landing. Must FAIL.
+//     Trace.Integ.WalkCoreRetryArm  the same walk with only the FIRST throw aimed after the landing.
+//                                 Must MISS attempt 1 and then PASS on attempt 2.
+//     Trace.Integ.Bloom           spec v32 §6 — prints the live post-process bloom and says whether
+//                                 the FX doc's 1.5x base emissive crosses the threshold. Measures
+//                                 only; changes nothing.
+//
 // Frames land in Saved/Screenshots as v22integ_<NN>_<what>.png, so the file name says which step of
 // which walk produced it and no frame has to be identified by its timestamp. The log carries the
 // same names, which is what lets a frame be attributed to a run when more than one editor is up.
@@ -32,6 +44,9 @@
 
 #include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"   // TActorIterator — the bloom probe walks the live post-process volumes
+#include "Engine/PostProcessVolume.h"
+#include "GameFramework/CharacterMovementComponent.h"   // IsFalling()/GetGravityZ() — the throw gate
 #include "GameFramework/PlayerController.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
@@ -41,6 +56,7 @@
 
 #include "Trace.h"   // LogTraceGame
 #include "Core/TraceCharacter.h"   // UsesPackHands() — the walk names its frames after the rig it sees
+#include "Gameplay/TraceCore.h"    // ATraceCore::LastThrow — the throw's own record of the thrower's state
 
 #if !UE_BUILD_SHIPPING
 
@@ -84,6 +100,17 @@ namespace TraceIntegrationWalkFile
 		 */
 		float Hold = 0.12f;
 		FString Route = TEXT("viewport");
+
+		/**
+		 * SPEC v32 §7e. When true this step does not press, photograph or report — it hands the rest
+		 * of the walk over to a STATE MACHINE that waits for a measured condition instead of a clock.
+		 *
+		 * The timer list is the right shape for a menu tour, where every step is "press, wait long
+		 * enough for a frame, photograph". It is the WRONG shape for "throw the Core while descending
+		 * under gravity", because the thing being photographed is a PHYSICAL STATE and no fixed offset
+		 * from a jump press is guaranteed to land in it. See ArmCoreThrowGate.
+		 */
+		bool bCoreThrowGate = false;
 	};
 
 	static FStep Press(float At, const TCHAR* Key)
@@ -119,6 +146,15 @@ namespace TraceIntegrationWalkFile
 		FStep Step;
 		Step.At = At;
 		Step.Exec = Command;
+		return Step;
+	}
+
+	/** SPEC v32 §7e. Hands the walk over to the measured throw gate; see ArmCoreThrowGate. */
+	static FStep ThrowGate(float At)
+	{
+		FStep Step;
+		Step.At = At;
+		Step.bCoreThrowGate = true;
 		return Step;
 	}
 
@@ -445,11 +481,49 @@ namespace TraceIntegrationWalkFile
 	 * THROW"). What it proves is weaker per throw and stronger in kind: the bug the owner reported is
 	 * the one being photographed.
 	 *
-	 * THE TIMING IS ARITHMETIC, NOT TASTE. JumpZVelocity is 640 uu/s against ~980 uu/s of gravity, so
-	 * the apex is ~0.65 s after the press. The throw is pressed 0.30 s into the jump and released
-	 * 0.85 s later — 1.15 s after take-off, i.e. half a second into the DESCENT, with the thrower
-	 * carrying roughly -490 uu/s of vertical velocity. That is the state the note is about. The hold
-	 * is also the charge: v13 §6's throw charges while the button is down.
+	 * *** SPEC v32 §7e — THE TIMING USED TO BE ARITHMETIC AND IT WAS NOT ENOUGH. ***
+	 *
+	 * What was here: "JumpZVelocity is 640 uu/s against ~980 uu/s of gravity, so the apex is ~0.65 s
+	 * after the press. The throw is pressed 0.30 s into the jump and released 0.85 s later." The
+	 * arithmetic is right and the harness was still non-deterministic about the one state it exists to
+	 * prove. A v31 verifier ran it three times from an identical command line and got two throws while
+	 * AIRBORNE DESCENDING (-580 and -569 uu/s) and one throw ON THE GROUND — and the ground run still
+	 * filed its frame as `61_thrown_while_falling`, which is a harness passing over its own failure.
+	 *
+	 * WHY OPEN-LOOP ARITHMETIC COULD NOT WORK HERE. The margin is tiny and the schedule is not the
+	 * only clock in the room. A 640/980 jump is airborne for ~1.3 s and the old plan released at
+	 * take-off + 1.15 s, so the whole tolerance for everything that shifts take-off — a frame or two
+	 * of input latency on the SimInput hold, a hitch while a screenshot is encoded, the pawn clipping
+	 * a ramp, the run step ending on a slightly different piece of floor — was 0.15 s. Real-time
+	 * tickers do not narrow that; they measure it. And take-off is the term the schedule cannot see:
+	 * `Trace.SimInput SpaceBar` presses a key, it does not leave the ground.
+	 *
+	 * SO THE JUMP AND THE THROW ARE NOW A CLOSED LOOP, AND THE VERDICT IS A MEASUREMENT.
+	 * `ThrowGate` hands the walk to ArmCoreThrowGate, which
+	 *   1. presses jump and WAITS for the pawn's own movement component to report IsFalling(), rather
+	 *      than assuming a key press became a take-off;
+	 *   2. reads the LIVE vertical velocity and the LIVE gravity on that first airborne frame and
+	 *      solves for the apex from them, so the release is placed a fixed FRACTION OF THE WAY BACK
+	 *      DOWN rather than a fixed number of seconds past a guessed apex — which is what buys the
+	 *      margin back, and which also means a retuned JumpZVelocity moves the schedule with it;
+	 *   3. reads ATraceCore::LastThrow AFTER the release — the throw's own record of the thrower's
+	 *      state at the instant of launch, written by ThrowFromHolder itself — and names the frame and
+	 *      the verdict from THAT. Not from the plan. A throw off the ground is now
+	 *      `61_thrown_ON_GROUND_MISS` and a loud FAIL, which is what the v31 run should have printed.
+	 *
+	 * *** AND, SINCE A v32 VERIFIER MEASURED THE ABOVE AT 7 PASS / 2 FAIL OVER NINE IDENTICAL RUNS,
+	 * IT ALSO RE-STAGES. *** Honest is not the same as deterministic. The two misses were not the
+	 * gate's clock and not the throw: the pawn ran into the goal structure it was jumping at and came
+	 * down on top of it, so its flight was 0.2 s shorter than the symmetric one the take-off predicts
+	 * and the release arrived after touchdown. That is the arena, not the game under test, and it is
+	 * the harness's job to try again rather than to report the arena as a defect. So a miss now takes
+	 * the Core back, waits for the pawn to be standing, runs and jumps again, up to GateMaxAttempts —
+	 * each attempt measured on its own, the verdict naming which attempt made the state and how many
+	 * missed, and the whole run still FAILING if none of them does. GateMaxAttempts carries the
+	 * argument in full, including what keeps a retry loop from becoming a way to hide a failure.
+	 *
+	 * A throw that never registers at all is also a FAIL: LastThrow.Serial is watched, never its
+	 * values, for the reason the member itself gives — two identical throws are byte-identical.
 	 *
 	 * Trace.ModeB.FlightLog is switched on around the throw so this machine logs the loose Core's own
 	 * position and speed at 10 Hz, and Trace.ModeB.ThrowMomentum prints the launch split into impulse,
@@ -470,19 +544,12 @@ namespace TraceIntegrationWalkFile
 		// explicitly wants KEPT. A standing falling throw would prove only half the note.
 		Steps.Add(Play(2.40f, TEXT("W"), 2.60f));
 
-		// JUMP, then release the charged throw half a second past the apex.
-		Steps.Add(Play(3.60f, TEXT("SpaceBar"), 0.10f));
-		Steps.Add(Play(3.90f, TEXT("LeftMouseButton"), 0.85f));
-		Steps.Add(Shoot(4.85f, TEXT("61_thrown_while_falling")));
-		Steps.Add(Say(5.00f, TEXT("Trace.ModeB.ThrowMomentum")));
-
-		// The flight itself. Two frames a second apart: a Core that dropped at the thrower's feet and
-		// a Core that went forward look identical in one frame and nothing alike in two.
-		Steps.Add(Shoot(5.60f, TEXT("62_core_in_flight")));
-		Steps.Add(Shoot(6.60f, TEXT("63_core_in_flight_later")));
-		Steps.Add(Say(7.40f, TEXT("Trace.ModeB.CoreProbe")));
-		Steps.Add(Shoot(7.60f, TEXT("64_core_settled")));
-		Steps.Add(Say(7.80f, TEXT("Trace.ModeB.FlightLog 0")));
+		// *** THE HANDOVER, v32 §7e. *** The jump, the charge, the release, the frame and the whole
+		// flight tail live inside the gate from here, because every one of them is placed relative to
+		// a MEASURED take-off rather than to this list's clock. The "N steps, X s" banner Start()
+		// prints therefore understates a Core walk by about four seconds, and by about three more per
+		// re-staged attempt; that is the gate running.
+		Steps.Add(ThrowGate(3.60f));
 
 		return Steps;
 	}
@@ -512,9 +579,805 @@ namespace TraceIntegrationWalkFile
 		UE_LOG(LogTraceGame, Display, TEXT("[IntegWalk] SHOT %s -> %s"), *Name, *Path);
 	}
 
+	// =============================================================================================
+	// *** SPEC v32 §7e — THE CORE-THROW GATE. WAIT FOR THE STATE; FAIL IF IT IS MISSED. ***
+	// =============================================================================================
+	//
+	// CoreWalk's header carries the argument for why this exists. This is the machine.
+
+	/**
+	 * How long to wait for the jump press to become an actual take-off before calling the run a miss.
+	 *
+	 * Generous: this is not the precision knob, it is the "something is badly wrong" knob. A jump that
+	 * has not left the ground two seconds after the key went down did not happen — the pawn is dead,
+	 * pinned, in a menu, or the bind moved — and none of those should be photographed as a throw.
+	 */
+	static constexpr double GateAirborneTimeoutSeconds = 2.0;
+
+	/**
+	 * WHERE IN THE DESCENT THE RELEASE IS AIMED, as a fraction of the fall from the apex back to
+	 * take-off height. 0 is the apex (not descending at all); 1 is the landing frame.
+	 *
+	 * *** AND HERE IS WHY THE OLD FIXED 0.50 s MISSED, MEASURED RATHER THAN REASONED. *** The old
+	 * comment did the arithmetic against "JumpZVelocity 640 uu/s against ~980 uu/s of gravity", giving
+	 * an apex 0.65 s up and 0.65 s back down — a 1.30 s flight with a release at take-off + 1.15 s,
+	 * i.e. 0.15 s of margin. THE LIVE NUMBERS ARE NOT THOSE. This gate prints them every run, and over
+	 * five runs the pawn left the ground at +614 to +621 uu/s against 1098 uu/s of gravity: an apex
+	 * 0.56 s up and a flight of about 1.12 s. The old plan therefore aimed its release 1.15 s into a
+	 * 1.12 s flight — ABOUT THIRTY MILLISECONDS AFTER TOUCHDOWN. It is not that the margin was thin;
+	 * there was no margin, and the two v31 runs that did catch the pawn airborne caught it in the last
+	 * frames before landing, which is why they read -580 and -569 uu/s instead of the -490 the comment
+	 * predicted. A stale constant in a comment became a schedule, and the schedule was wrong.
+	 *
+	 * SO THIS IS A FRACTION AND NOT A NUMBER OF SECONDS. Because it is solved from the velocity and
+	 * gravity read on the take-off frame, a retuned JumpZVelocity, a retuned gravity or a low-gravity
+	 * volume moves the release with it instead of silently eating the margin the way the old one did.
+	 *
+	 * *** AND HERE IS WHY 0.60 WAS STILL TOO LATE. NINE RUNS, ONE COMMAND LINE, MEASURED. ***
+	 * A v32 verifier ran this gate nine times from a byte-identical command line and got seven PASSes
+	 * and two FAILs. The gate was honest about all nine — that half of §7e works — but 22 % of runs
+	 * still could not reach the state the walk exists to photograph, and a harness that cannot reach
+	 * its own state one run in five is not yet deterministic. The two misses are not load and not
+	 * noise: run 8 measured the SAME take-off as run 3 (+625 uu/s against 1098 uu/s, apex 0.57 s) and
+	 * still threw from the floor. What separates them is WHERE THE PAWN CAME DOWN, which is the one
+	 * term a ballistic solve off the take-off frame cannot see:
+	 *
+	 *     run 3 (PASS): threw at Z 284.6, AIRBORNE at -391 uu/s, 524 uu/s horizontal
+	 *     run 8 (FAIL): threw at Z 371.0, ON THE GROUND,          25 uu/s horizontal
+	 *
+	 * 25 uu/s horizontal out of a 976 uu/s run means the pawn hit something; Z 371 against run 3's
+	 * 284.6 means it came down on top of it. CoreWalk runs blindly forward for 2.6 s before it jumps,
+	 * and what is in front of it is the Blue goal structure at X -16800 and the ramps around it. The
+	 * fall is therefore NOT symmetric — the solve assumes the pawn lands at the height it took off
+	 * from, and sometimes it lands a hundred uu above it, which shortens the flight by 0.2 s and puts
+	 * a release aimed 0.34 s past the apex AFTER TOUCHDOWN.
+	 *
+	 * Two changes answer that, and only the second one makes the harness deterministic:
+	 *   1. 0.60 -> 0.35 buys margin. At the measured take-off the release now lands 0.20 s past the
+	 *      apex at about -219 uu/s — still more than twice GateMinDescentUU, so "unambiguously going
+	 *      down" is untouched — with 0.37 s of airtime behind it instead of 0.23 s. Run 8's miss
+	 *      needed the pawn down about 0.22 s early; this covers that and half again.
+	 *   2. THE GATE RETRIES. Margin is a probability, not a guarantee, and a ledge one jump higher
+	 *      would eat any fixed fraction. See GateMaxAttempts — that is the actual fix; this is the
+	 *      cheap half that makes the retry rarely needed.
+	 */
+	static constexpr float GateDescendFraction = 0.35f;
+
+	/**
+	 * *** THE RED ARM (spec v32 §8's standing rule, applied to this gate). ***
+	 *
+	 * 1.60 is PAST THE LANDING: the fall from the apex back to take-off height is 1.00 by this
+	 * measure, so a release aimed at 1.60 arrives well after the pawn is standing on the floor again.
+	 * That is exactly the state the v31 walk hit by accident on one run in three and filed as
+	 * `61_thrown_while_falling`. Trace.Integ.WalkCoreRedArm aims for it ON PURPOSE, and the gate must
+	 * print `GATE VERDICT: FAIL` and `61_thrown_ON_GROUND_MISS`. A gate that passes both arms is not
+	 * measuring anything, which is the whole complaint §7e is about.
+	 */
+	static constexpr float GateRedArmDescendFraction = 1.60f;
+
+	/**
+	 * THE FLOOR UNDER THE LEFT-MOUSE HOLD — and it is a floor now, not the hold itself.
+	 *
+	 * v13 §6: the hold IS the charge, full at 0.60 s, so a hold shorter than that photographs a
+	 * half-charged throw and every flight number under it means something else. 0.70 keeps 0.10 s of
+	 * headroom over that edge, which is several frames of input latency.
+	 *
+	 * *** WHY THE HOLD IS DERIVED AND IS NO LONGER THE FIXED 0.85 s. *** Trace.SimInput presses,
+	 * waits and releases on its own ticker, so the hold is chosen AT THE PRESS and cannot be recalled
+	 * afterwards — which makes the hold the only handle this gate has on where in the flight the
+	 * release lands. A fixed 0.85 s hold therefore pinned the release at take-off + 0.85 s at the
+	 * very earliest, because the press cannot happen before the take-off it is measured from. On the
+	 * measured numbers (apex 0.57 s) that is 0.49 of the fall, so the old constant made every
+	 * GateDescendFraction below ~0.5 UNREACHABLE: asking for 0.35 would silently have been served as
+	 * 0.49. Solving the release first and deriving the hold from it
+	 * (Hold = ToApex x (1 + Fraction), floored here) is what lets the fraction mean what it says, and
+	 * it still leaves the throw fully charged at every fraction this gate can be pointed at.
+	 */
+	static constexpr float GateMinChargeHoldSeconds = 0.70f;
+
+	/**
+	 * *** THE CEILING OVER THE HOLD, AND IT IS A GAMEPLAY RULE, NOT A TASTE. ***
+	 *
+	 * SPEC v28 §7: a FULL charge may only be sat on for GetThrowAutoReleaseSeconds() before THE SERVER
+	 * THROWS IT ITSELF. So the longest hold this gate can actually spend is
+	 * GetThrowChargeSeconds() + GetThrowAutoReleaseSeconds() — 0.60 + 0.60 = 1.20 s at the shipped
+	 * knobs — and a hold longer than that does not delay the release at all: it hands the release back
+	 * to the server's clock, which is precisely the open-loop timing this whole gate exists to remove.
+	 * The gate would then be measuring the auto-release and reporting it as its own aim.
+	 *
+	 * WHO THIS BITES, MEASURED AGAINST THE ARITHMETIC RATHER THAN GUESSED: the shipped arm holds about
+	 * 0.77 s and never comes near it. THE RED ARM DOES. Aimed at 1.60 of the fall it wants a 1.48 s
+	 * hold, and pressing at take-off would put the server's auto-release at take-off + 1.20 s against
+	 * a flight of about 1.14 s — six hundredths of a second of margin, so a jump off a ledge (a longer
+	 * flight than the take-off predicts, the mirror image of the failure this pass is fixing) would
+	 * have thrown the red arm AIRBORNE AND DESCENDING and printed a PASS over a deliberate failure.
+	 * Capping the hold moves the PRESS later and leaves the aimed release where it is, so the red arm
+	 * stays red and the aim keeps meaning what it says.
+	 *
+	 * The margin is subtracted from the live knobs rather than the constant being written out, because
+	 * both of them are retunable by name and by CVar; 0 in the auto-release knob is v28 §7 switched
+	 * off, and then there is no ceiling at all.
+	 */
+	static constexpr float GateAutoReleaseMarginSeconds = 0.15f;
+
+	/** Below this, "descending" is a rounding error rather than the state the owner's note is about. */
+	static constexpr float GateMinDescentUU = 100.f;
+
+	/** How long past the planned release to keep watching for the throw before calling it a miss. */
+	static constexpr double GateThrowTimeoutSeconds = 3.0;
+
+	/**
+	 * *** HOW MANY TIMES THE GATE STAGES THE THROW BEFORE IT CALLS THE RUN A FAILURE. ***
+	 *
+	 * This is the half of §7e that "fail rather than mislabel" did not buy, and the nine-run
+	 * measurement quoted on GateDescendFraction is the argument for it. A miss is a STAGING accident
+	 * — the pawn came down on top of the goal structure it was running at, so the flight was short
+	 * and the release landed after touchdown — and a staging accident is not a fact about the game
+	 * this walk exists to photograph. Neither of the verifier's two failures said anything about the
+	 * Core, the throw or the owner's bug. They said the pawn was standing on a ledge.
+	 *
+	 * So a miss RE-ARMS instead of ending the run: take the Core back, wait for the pawn to be
+	 * standing, run and jump again. Taking it back cannot deadlock behind the bot who caught the
+	 * throw — Trace.DebugTakeCore goes through ATraceCore::TryPickup, which is documented in
+	 * TraceCore.cpp as "an unconditional debug grant, and it takes the Core off whoever has it".
+	 *
+	 * WHAT KEEPS THIS HONEST, because a retry loop is exactly the shape a harness uses to hide a
+	 * failure:
+	 *   - every attempt is measured and logged on its own, at Warning level, naming what it threw
+	 *     from and (where the pawn landed early) why;
+	 *   - the verdict states WHICH ATTEMPT made the state and how many missed, so the pass rate stays
+	 *     visible in the log instead of being smoothed away by the retry;
+	 *   - if every attempt misses, the last one's frame and verdict are exactly what a single miss
+	 *     used to produce — which is what keeps Trace.Integ.WalkCoreRedArm red;
+	 *   - and Trace.Integ.WalkCoreRetryArm makes attempt 1 miss ON PURPOSE, so the recovery path is
+	 *     run rather than described.
+	 *
+	 * Three, not ten: at 0.35 of the fall a miss needs the pawn to lose a third of its airtime, and
+	 * three attempts from three different pieces of floor is already far below the 22 % one attempt
+	 * measured. Ten would mostly buy a longer log.
+	 */
+	static constexpr int32 GateMaxAttempts = 3;
+
+	/**
+	 * How long a re-arm waits for the Core to come back and the pawn to be standing on the ground
+	 * again before it gives up. The grant itself lands within a frame or two; the wait that can
+	 * actually take time is the pawn's own landing after a RISING miss, or a respawn.
+	 */
+	static constexpr double GateRearmTimeoutSeconds = 6.0;
+
+	/**
+	 * The retry's run-up: W is held for GateRearmRunHoldSeconds and the jump goes in
+	 * GateRearmRunUpSeconds into it.
+	 *
+	 * The first attempt gets its horizontal term from the walk's own 2.6 s W step, which has long
+	 * since ended by the time a retry starts, so a retry has to make its own — the owner's note is
+	 * "I still want the core to carry the player's velocity", and a standing throw would prove only
+	 * half of it. 0.45 s is past the acceleration ramp at 976 uu/s of walk speed. And if the pawn is
+	 * standing against the wall it just hit, W does nothing and the retry becomes a clean vertical
+	 * jump — which is the most deterministic case there is, because a vertical jump lands exactly
+	 * where it took off and the ballistic solve is then exact rather than optimistic.
+	 */
+	static constexpr float GateRearmRunHoldSeconds = 1.60f;
+	static constexpr double GateRearmRunUpSeconds = 0.45;
+
+	/** SPEC v32 §7e. Everything one armed gate carries between polls. */
+	struct FCoreThrowGate
+	{
+		TWeakObjectPtr<APlayerController> PC;
+		FString Tag;
+
+		enum class EPhase : uint8
+		{
+			/** RE-ARM ONLY: the Core has been asked for back; waiting to hold it and be standing. */
+			WaitCarrier,
+			/** RE-ARM ONLY: running forward, so the retry's throw carries a horizontal term too. */
+			WaitRunUp,
+			/** Jump pressed; waiting for the movement component to say the pawn actually left. */
+			WaitAirborne,
+			/** Take-off measured, release solved; waiting for the moment to press. */
+			WaitPress,
+			/** Held; waiting for ATraceCore::LastThrow to record a launch. */
+			WaitThrow,
+		};
+		EPhase Phase = EPhase::WaitAirborne;
+
+		/** All absolute FPlatformTime::Seconds. Real time, for the reason Start() gives about pause. */
+		double ArmedAt = 0.0;
+		double PressAt = 0.0;
+		double ReleaseAt = 0.0;
+
+		/** When the current re-arm began (its timeout) and when its run-up ends in a jump. */
+		double RearmAt = 0.0;
+		double JumpAt = 0.0;
+
+		/**
+		 * DERIVED PER ATTEMPT from the solved release, floored at GateMinChargeHoldSeconds — never a
+		 * constant any more. See GateMinChargeHoldSeconds for why a fixed hold silently overrode
+		 * GateDescendFraction.
+		 */
+		float HoldSeconds = GateMinChargeHoldSeconds;
+
+		/** Which staged attempt this is, and how many have missed. See GateMaxAttempts. */
+		int32 Attempt = 1;
+		int32 Misses = 0;
+
+		/** One clause per missed attempt, so the final verdict can name all of them in one line. */
+		FString MissRecord;
+
+		/**
+		 * Set when the pawn is seen back on the ground BEFORE the release was due — the mechanism
+		 * behind both of the verifier's failures, and worth naming in the log rather than leaving the
+		 * reader to infer it from a velocity of zero. Cleared on every re-arm.
+		 */
+		bool bLandedBeforeRelease = false;
+		double LandedEarlyBySeconds = 0.0;
+
+		/**
+		 * Trace.Integ.WalkCoreRetryArm: attempt 1 aims past the landing on purpose and the re-arm
+		 * puts the aim back where the shipped gate has it. The red arm OF THE RETRY, so the recovery
+		 * path is exercised rather than asserted.
+		 */
+		bool bMissFirstAttemptOnPurpose = false;
+
+		/**
+		 * Where in the fall the release is aimed. Shipped value GateDescendFraction; the red arm
+		 * moves it past the landing. SNAPSHOTTED INTO THE GATE at arm time rather than read from the
+		 * file static on every poll, so two overlapping walks cannot swap arms halfway.
+		 */
+		float DescendFraction = GateDescendFraction;
+
+		/** SPEC v29 §6: a throw is detected by this moving, never by LastThrow's values changing. */
+		int32 SerialBeforeThrow = 0;
+
+		/** The measured take-off, kept so the verdict line can print what the plan was solved from. */
+		float TakeoffVelocityZ = 0.f;
+		float TimeToApexSeconds = 0.f;
+	};
+
+	/** The local pawn, re-resolved every poll: a respawn mid-gate must not be photographed as a throw. */
+	static ATraceCharacter* GateLocalPawn(const FCoreThrowGate& Gate)
+	{
+		APlayerController* const GatePC = Gate.PC.Get();
+		return (GatePC != nullptr) ? Cast<ATraceCharacter>(GatePC->GetPawn()) : nullptr;
+	}
+
+	/**
+	 * One console command from inside the gate, through the local controller and logged the way
+	 * RunStep logs its own — a re-arm has to be readable in the same column as the walk that armed it.
+	 */
+	static void GateExec(const FCoreThrowGate& Gate, const TCHAR* Command)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[IntegWalk] EXEC %s"), Command);
+		if (APlayerController* const ExecPC = Gate.PC.Get())
+		{
+			ExecPC->ConsoleCommand(Command, /*bWriteToLog=*/true);
+		}
+	}
+
+	/**
+	 * One key press from inside the gate, through the SAME Trace.SimInput route every other step of
+	 * this walk uses. A re-arm that reached past the input pipeline would be staging the throw by a
+	 * different road than the run it is retrying, and the two would stop being comparable.
+	 */
+	static void GateKey(const FCoreThrowGate& Gate, const TCHAR* Key, float Hold)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[IntegWalk] KEY %s (%.2fs, controller) — gate re-arm."), Key, Hold);
+		if (APlayerController* const KeyPC = Gate.PC.Get())
+		{
+			KeyPC->ConsoleCommand(FString::Printf(TEXT("Trace.SimInput %s %.2f controller"), Key, Hold),
+				/*bWriteToLog=*/false);
+		}
+	}
+
+	/** One deferred stop on the gate's tail, relative to the measured launch rather than to the walk. */
+	static void GateAfter(double Delay, TFunction<void()> What)
+	{
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[What = MoveTemp(What)](float) -> bool
+			{
+				What();
+				return false;
+			}), static_cast<float>(FMath::Max(0.01, Delay)));
+	}
+
+	/**
+	 * The flight tail, anchored on the launch this gate MEASURED.
+	 *
+	 * The offsets are the ones the timer list used (+0.10 / +0.25 / +0.85 / +1.85 / +2.65 / +2.85 /
+	 * +3.05 from the release), so the frames are directly comparable with every v31 run already on
+	 * disk. What changed is only what they are anchored to. Two flight frames a second apart, because
+	 * a Core that dropped at the thrower's feet and a Core that went forward look identical in one
+	 * frame and nothing alike in two.
+	 */
+	static void GateRunTail(const FCoreThrowGate& Gate, const FString& ThrowFrameName)
+	{
+		const FString Tag = Gate.Tag;
+		TWeakObjectPtr<APlayerController> WeakPC = Gate.PC;
+
+		auto Exec = [WeakPC](const TCHAR* Command)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[IntegWalk] EXEC %s"), Command);
+			if (APlayerController* const ExecPC = WeakPC.Get())
+			{
+				ExecPC->ConsoleCommand(Command, /*bWriteToLog=*/true);
+			}
+		};
+
+		GateAfter(0.10, [Tag, ThrowFrameName]() { TakeShot(Tag, ThrowFrameName); });
+		GateAfter(0.25, [Exec]() { Exec(TEXT("Trace.ModeB.ThrowMomentum")); });
+		GateAfter(0.85, [Tag]() { TakeShot(Tag, TEXT("62_core_in_flight")); });
+		GateAfter(1.85, [Tag]() { TakeShot(Tag, TEXT("63_core_in_flight_later")); });
+		GateAfter(2.65, [Exec]() { Exec(TEXT("Trace.ModeB.CoreProbe")); });
+		GateAfter(2.85, [Tag]() { TakeShot(Tag, TEXT("64_core_settled")); });
+		GateAfter(3.05, [Exec]() { Exec(TEXT("Trace.ModeB.FlightLog 0")); });
+	}
+
+	/**
+	 * THE ONE LINE A SCRIPT GREPS FOR. Error level, so a run that misses cannot be read as a run that
+	 * passed by anyone skimming Display lines — which is exactly how the v31 miss got past a reader.
+	 */
+	static void GateLogFail(const FString& Why)
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("[IntegWalk] GATE VERDICT: FAIL — %s"), *Why);
+	}
+
+	/**
+	 * The gate gave up BEFORE a throw happened, so there is no flight to photograph and no tail to
+	 * run. Says so, takes one frame under a name that ADMITS what it is, and turns the flight log off
+	 * so the run does not leave the machine chattering.
+	 *
+	 * *** THE FRAME IS STILL TAKEN. *** A miss with no picture is a miss nobody can diagnose, and the
+	 * v31 failure this replaces was not "no frame" — it was a frame filed under the wrong sentence.
+	 */
+	static void GateAbort(const FCoreThrowGate& Gate, const FString& FrameName, const FString& Why)
+	{
+		GateLogFail(Why);
+		TakeShot(Gate.Tag, FrameName);
+		const TWeakObjectPtr<APlayerController> WeakPC = Gate.PC;
+		GateAfter(0.40, [WeakPC]()
+		{
+			if (APlayerController* const ExecPC = WeakPC.Get())
+			{
+				ExecPC->ConsoleCommand(TEXT("Trace.ModeB.FlightLog 0"), /*bWriteToLog=*/true);
+			}
+		});
+	}
+
+	/** One poll. Returns true to keep the ticker registered, false when the gate is finished. */
+	static bool TickCoreThrowGate(FCoreThrowGate& Gate)
+	{
+		const double Now = FPlatformTime::Seconds();
+		ATraceCharacter* const Pawn = GateLocalPawn(Gate);
+		UCharacterMovementComponent* const Move = (Pawn != nullptr) ? Pawn->GetCharacterMovement() : nullptr;
+
+		switch (Gate.Phase)
+		{
+		case FCoreThrowGate::EPhase::WaitCarrier:
+		{
+			// THE RE-ARM'S OWN PRECONDITION, ASKED OF THE PAWN. Trace.DebugTakeCore self-schedules on
+			// the core ticker until the grant lands, so this waits for the FACT (IsCarrier) rather
+			// than for the command that asked for it — and it waits for the pawn to be standing as
+			// well, because jumping again out of the tail of the last jump would stage a different
+			// throw from the one the first attempt staged.
+			if (Pawn != nullptr && Pawn->IsCarrier() && Move != nullptr && !Move->IsFalling())
+			{
+				GateKey(Gate, TEXT("W"), GateRearmRunHoldSeconds);
+				Gate.JumpAt = Now + GateRearmRunUpSeconds;
+				Gate.Phase = FCoreThrowGate::EPhase::WaitRunUp;
+				return true;
+			}
+
+			if (Now - Gate.RearmAt > GateRearmTimeoutSeconds)
+			{
+				GateAbort(Gate, TEXT("61_gate_FAILED_no_rearm"), FString::Printf(
+					TEXT("attempt %d of %d could not be staged: %.1fs after Trace.DebugTakeCore the local ")
+					TEXT("pawn is %s and %s. Earlier attempts: %s"),
+					Gate.Attempt, GateMaxAttempts, GateRearmTimeoutSeconds,
+					(Pawn == nullptr) ? TEXT("gone (dead or respawning)")
+						: (Pawn->IsCarrier() ? TEXT("carrying the Core") : TEXT("NOT carrying the Core")),
+					(Move != nullptr && Move->IsFalling()) ? TEXT("still in the air") : TEXT("on the ground"),
+					Gate.MissRecord.IsEmpty() ? TEXT("none") : *Gate.MissRecord));
+				return false;
+			}
+			return true;
+		}
+
+		case FCoreThrowGate::EPhase::WaitRunUp:
+		{
+			if (Now < Gate.JumpAt)
+			{
+				return true;
+			}
+
+			GateKey(Gate, TEXT("SpaceBar"), 0.10f);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[IntegWalk] GATE ATTEMPT %d of %d: Core back in hand, %.2fs of run-up behind it, ")
+				TEXT("jumping again. The take-off is measured from scratch — nothing is carried over ")
+				TEXT("from the attempt that missed."),
+				Gate.Attempt, GateMaxAttempts, GateRearmRunUpSeconds);
+
+			Gate.ArmedAt = Now;
+			Gate.Phase = FCoreThrowGate::EPhase::WaitAirborne;
+			return true;
+		}
+
+		case FCoreThrowGate::EPhase::WaitAirborne:
+		{
+			// *** THE CONDITION, ASKED OF THE MOVEMENT COMPONENT AND NOT OF THE CLOCK. *** This is the
+			// whole §7e fix in one line: the old walk assumed a key press became a take-off 0.30 s ago.
+			if (Move != nullptr && Move->IsFalling())
+			{
+				// Solved from the LIVE numbers on the first airborne frame. GetGravityZ() is negative,
+				// so the down-magnitude is its negation; guarded at 1 because a zero-gravity volume
+				// would otherwise divide by nothing and place the release at infinity.
+				const float VelocityZAtTakeoff = static_cast<float>(Pawn->GetVelocity().Z);
+				const float GravityDown = FMath::Max(1.f, -Move->GetGravityZ());
+				const float ToApex = FMath::Max(0.f, VelocityZAtTakeoff / GravityDown);
+
+				Gate.TakeoffVelocityZ = VelocityZAtTakeoff;
+				Gate.TimeToApexSeconds = ToApex;
+
+				// *** THE RELEASE IS SOLVED FIRST AND THE HOLD IS DERIVED FROM IT. *** The other way
+				// round — a constant hold, with the press placed to suit it — is what pinned every
+				// release at take-off + 0.85 s and made GateDescendFraction below ~0.5 unreachable.
+				// See GateMinChargeHoldSeconds.
+				const double ReleaseDelay =
+					static_cast<double>(ToApex) * (1.0 + static_cast<double>(Gate.DescendFraction));
+				Gate.ReleaseAt = Now + ReleaseDelay;
+
+				// The ceiling is read off the LIVE charge knobs, never written out here — see
+				// GateAutoReleaseMarginSeconds. 0 in the auto-release knob is spec v28 §7 switched off,
+				// and then a full charge can be sat on forever and there is no ceiling to respect.
+				const float AutoReleaseSeconds = ATraceCore::GetThrowAutoReleaseSeconds();
+				const float MaxHoldSeconds = (AutoReleaseSeconds > 0.f)
+					? FMath::Max(GateMinChargeHoldSeconds,
+						ATraceCore::GetThrowChargeSeconds() + AutoReleaseSeconds - GateAutoReleaseMarginSeconds)
+					: TNumericLimits<float>::Max();
+
+				Gate.HoldSeconds = FMath::Clamp(static_cast<float>(ReleaseDelay),
+					GateMinChargeHoldSeconds, MaxHoldSeconds);
+				Gate.PressAt = Gate.ReleaseAt - static_cast<double>(Gate.HoldSeconds);
+
+				if (static_cast<float>(ReleaseDelay) > MaxHoldSeconds)
+				{
+					// Not a warning: the aimed release is unchanged, only the press moved later. Said
+					// out loud anyway, because "the press is not at take-off" is a real difference in
+					// what the run staged and the next reader should not have to derive it.
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[IntegWalk] GATE: the aimed release is %.2fs out, past the %.2fs the server ")
+						TEXT("would auto-release a full charge in (v28 §7). Holding %.2fs and pressing ")
+						TEXT("%.2fs after take-off instead, so the RELEASE stays where it was aimed."),
+						ReleaseDelay, MaxHoldSeconds, Gate.HoldSeconds, Gate.PressAt - Now);
+				}
+
+				// DOES THE CHARGE FLOOR ACTUALLY BIND? Asked with a millisecond of slack and asked
+				// SEPARATELY from the clamp below, because the two are not the same event and saying
+				// so wrongly is a lie in the log. When the aimed release is longer than the floor the
+				// press lands ON the take-off frame, and PressAt then differs from Now only by the
+				// rounding of one double subtraction — which still trips `PressAt < Now` and would
+				// otherwise print "inside the 0.70s charge floor" about a 0.78 s release that is
+				// nowhere near it. Only a genuinely short jump binds the floor.
+				const bool bChargeFloorBinds =
+					ReleaseDelay < static_cast<double>(Gate.HoldSeconds) - 0.001;
+
+				if (Gate.PressAt < Now)
+				{
+					Gate.PressAt = Now;
+					Gate.ReleaseAt = Now + static_cast<double>(Gate.HoldSeconds);
+				}
+
+				if (bChargeFloorBinds)
+				{
+					// The aimed release is sooner than a full charge takes, so the two cannot both be
+					// had. The press has just been pulled to now and the full hold kept rather than
+					// clipped: a clipped hold is a different (weaker) throw and every flight number
+					// under it would mean something else. Said out loud, because it means the plan
+					// could not be met — the release slides later in the fall than the fraction asked
+					// for, and the verdict below judges where it actually landed, not where it was
+					// aimed.
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[IntegWalk] GATE: airborne at +%.0f uu/s puts the aimed release %.2fs away, ")
+						TEXT("inside the %.2fs charge floor. Pressing immediately and keeping the full hold, ")
+						TEXT("so the release lands later in the fall than %.0f%% and may land after ")
+						TEXT("touchdown; the verdict will say so rather than assume."),
+						VelocityZAtTakeoff, ReleaseDelay, GateMinChargeHoldSeconds,
+						100.f * Gate.DescendFraction);
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[IntegWalk] GATE ATTEMPT %d of %d: AIRBORNE measured at +%.0f uu/s against ")
+					TEXT("%.0f uu/s of gravity -> apex in %.2fs, so a symmetric flight is %.2fs. Releasing ")
+					TEXT("%.0f%% of the way back down (%.2fs past the apex, ~%.0f uu/s descending, %.2fs of ")
+					TEXT("airtime behind it), so pressing in %.2fs and holding %.2fs."),
+					Gate.Attempt, GateMaxAttempts, VelocityZAtTakeoff, GravityDown, ToApex, 2.f * ToApex,
+					100.f * Gate.DescendFraction, ToApex * Gate.DescendFraction,
+					-GravityDown * ToApex * Gate.DescendFraction,
+					2.f * ToApex - static_cast<float>(Gate.ReleaseAt - Now),
+					Gate.PressAt - Now, Gate.HoldSeconds);
+
+				Gate.Phase = FCoreThrowGate::EPhase::WaitPress;
+				return true;
+			}
+
+			if (Now - Gate.ArmedAt > GateAirborneTimeoutSeconds)
+			{
+				GateAbort(Gate, TEXT("61_gate_FAILED_never_airborne"), FString::Printf(
+					TEXT("the pawn never left the ground within %.1fs of the jump press (pawn %s, ")
+					TEXT("movement %s). No throw was made, because a throw made here would be exactly ")
+					TEXT("the ON-GROUND frame the v31 run mislabelled as \"thrown_while_falling\"."),
+					GateAirborneTimeoutSeconds,
+					(Pawn != nullptr) ? *GetNameSafe(Pawn) : TEXT("<none>"),
+					(Move != nullptr) ? TEXT("present") : TEXT("<none>")));
+				return false;
+			}
+			return true;
+		}
+
+		case FCoreThrowGate::EPhase::WaitPress:
+		{
+			if (Now < Gate.PressAt)
+			{
+				return true;
+			}
+
+			// SAMPLED BEFORE THE PRESS, never after: the throw can be recorded on the very next frame
+			// and a serial read afterwards would already include it.
+			Gate.SerialBeforeThrow = ATraceCore::LastThrow.Serial;
+
+			if (APlayerController* const PressPC = Gate.PC.Get())
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[IntegWalk] KEY LeftMouseButton (%.2fs, controller) — gated, release aimed at ")
+					TEXT("%.2fs past the measured apex."),
+					Gate.HoldSeconds, Gate.TimeToApexSeconds * Gate.DescendFraction);
+				PressPC->ConsoleCommand(
+					FString::Printf(TEXT("Trace.SimInput LeftMouseButton %.2f controller"), Gate.HoldSeconds),
+					/*bWriteToLog=*/false);
+			}
+			else
+			{
+				GateAbort(Gate, TEXT("61_gate_FAILED_no_controller"),
+					TEXT("the local player controller went away between the jump and the throw."));
+				return false;
+			}
+
+			Gate.Phase = FCoreThrowGate::EPhase::WaitThrow;
+			return true;
+		}
+
+		case FCoreThrowGate::EPhase::WaitThrow:
+		{
+			// *** THE MECHANISM BEHIND EVERY MISS THIS GATE HAS EVER PRODUCED, NAMED AS IT HAPPENS. ***
+			//
+			// The hold cannot be recalled once Trace.SimInput has scheduled its release, so seeing the
+			// pawn back on the floor here does not save the attempt — but it does turn "thrown at 0
+			// uu/s vertical" from a symptom into a diagnosis, and it is the line that tells the reader
+			// the arena, not the harness's clock, is what moved. Sampled BEFORE the release is due,
+			// which is the only window in which it means anything.
+			if (!Gate.bLandedBeforeRelease && Now < Gate.ReleaseAt && Move != nullptr && !Move->IsFalling())
+			{
+				Gate.bLandedBeforeRelease = true;
+				Gate.LandedEarlyBySeconds = Gate.ReleaseAt - Now;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[IntegWalk] GATE ATTEMPT %d of %d: THE PAWN IS BACK ON THE GROUND %.2fs BEFORE ")
+					TEXT("the release is due. The jump was solved as a %.2fs symmetric flight, so it has ")
+					TEXT("come down on something higher than it took off from. This attempt is already ")
+					TEXT("lost — the release cannot be recalled — and the gate will re-arm on it."),
+					Gate.Attempt, GateMaxAttempts, Gate.LandedEarlyBySeconds, 2.f * Gate.TimeToApexSeconds);
+			}
+
+			// *** THE GROUND TRUTH. *** ThrowFromHolder writes the thrower's own velocity and falling
+			// bit into LastThrow at the instant of launch. Everything below is read from THAT rather
+			// than re-sampled here, because "what was the pawn doing when it let go" is a question
+			// about a moment that has already passed by the time any poll can ask it.
+			if (ATraceCore::LastThrow.Serial == Gate.SerialBeforeThrow)
+			{
+				if (Now > Gate.ReleaseAt + GateThrowTimeoutSeconds)
+				{
+					GateAbort(Gate, TEXT("61_gate_FAILED_no_throw"), FString::Printf(
+						TEXT("no throw was recorded within %.1fs of the planned release ")
+						TEXT("(ATraceCore::LastThrow.Serial still %d). The Core was probably never taken, ")
+						TEXT("or LMB is no longer THROW. Nothing was photographed as a throw."),
+						GateThrowTimeoutSeconds, Gate.SerialBeforeThrow));
+					return false;
+				}
+				return true;
+			}
+
+			const ATraceCore::FThrowMomentumSample& Sample = ATraceCore::LastThrow;
+			const bool bDescending = Sample.bThrowerFalling && (Sample.ThrowerVelocityZ <= -GateMinDescentUU);
+
+			// THE FRAME IS NAMED BY WHAT HAPPENED, NEVER BY WHAT WAS ASKED FOR. That sentence is the
+			// §7e fix; the three names below are the only place it can be spent.
+			const TCHAR* const FrameName = bDescending
+				? TEXT("61_thrown_while_falling")
+				: (Sample.bThrowerFalling ? TEXT("61_thrown_while_RISING_MISS") : TEXT("61_thrown_ON_GROUND_MISS"));
+
+			if (bDescending)
+			{
+				// THE ATTEMPT COUNT IS IN THE PASS LINE, NOT JUST IN THE FAILURES. A gate that retries
+				// and then prints a bare "PASS" has hidden its own pass rate, which is the thing §7e is
+				// actually about; a reader must be able to see from one line whether this run needed
+				// one jump or three.
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[IntegWalk] GATE VERDICT: PASS on attempt %d of %d (%d missed and re-armed%s%s) ")
+					TEXT("— thrown AIRBORNE and DESCENDING at %.0f uu/s (take-off was +%.0f uu/s, apex ")
+					TEXT("%.2fs later; held %.2fs -> charge x%.2f). Frame filed as %s."),
+					Gate.Attempt, GateMaxAttempts, Gate.Misses,
+					Gate.Misses > 0 ? TEXT(": ") : TEXT(""),
+					Gate.Misses > 0 ? *Gate.MissRecord : TEXT(""),
+					Sample.ThrowerVelocityZ, Gate.TakeoffVelocityZ, Gate.TimeToApexSeconds,
+					Sample.HeldSeconds, Sample.ChargeScale, FrameName);
+				GateRunTail(Gate, FrameName);
+				return false;
+			}
+
+			// ---- A MISS. STAGE IT AGAIN IF THERE IS AN ATTEMPT LEFT (see GateMaxAttempts) ----------
+			++Gate.Misses;
+			// The separator LEADS rather than trails, so the record never ends in a dangling "; " and
+			// the verdict line it is pasted into closes its own bracket cleanly.
+			Gate.MissRecord += FString::Printf(
+				TEXT("%sattempt %d threw %s at %.0f uu/s%s"),
+				Gate.MissRecord.IsEmpty() ? TEXT("") : TEXT("; "),
+				Gate.Attempt,
+				Sample.bThrowerFalling ? TEXT("AIRBORNE RISING") : TEXT("ON THE GROUND"),
+				Sample.ThrowerVelocityZ,
+				Gate.bLandedBeforeRelease
+					? *FString::Printf(TEXT(" (down %.2fs early)"), Gate.LandedEarlyBySeconds)
+					: TEXT(""));
+
+			if (Gate.Attempt < GateMaxAttempts)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[IntegWalk] GATE ATTEMPT %d of %d MISSED — the throw was released with the ")
+					TEXT("thrower %s at %.0f uu/s vertical, not descending (the gate wanted falling and at ")
+					TEXT("least %.0f uu/s down). %s RE-ARMING: taking the Core back and jumping again. ")
+					TEXT("This is a STAGING miss, not a verdict — see GateMaxAttempts — and the run still ")
+					TEXT("FAILS if every attempt misses."),
+					Gate.Attempt, GateMaxAttempts,
+					Sample.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("ON THE GROUND"),
+					Sample.ThrowerVelocityZ, GateMinDescentUU,
+					Gate.bLandedBeforeRelease
+						? TEXT("The pawn was seen landing before the release was due, so the flight was ")
+						  TEXT("shorter than the take-off predicted — it came down on higher ground.")
+						: TEXT("The pawn was never seen landing early, so the release itself, not the ")
+						  TEXT("landing, is what fell outside the window."));
+
+				// The retry arm's deliberate miss is spent on attempt 1 and must not be repeated, or
+				// the arm would prove only that a gate aimed at the floor keeps hitting the floor.
+				// Asked of the attempt NUMBER rather than of the fraction's value: comparing two
+				// floats for equality to decide control flow is how a knob at 0.3500001 turns a red
+				// arm green with nothing in the log to show for it.
+				if (Gate.bMissFirstAttemptOnPurpose && Gate.Attempt == 1)
+				{
+					Gate.DescendFraction = GateDescendFraction;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[IntegWalk] *** RETRY ARM: the deliberate miss is spent. The re-arm aims at ")
+						TEXT("the shipped %.2f of the fall, so a PASS from here is the recovery path ")
+						TEXT("working and nothing else. ***"), GateDescendFraction);
+				}
+
+				++Gate.Attempt;
+				Gate.Phase = FCoreThrowGate::EPhase::WaitCarrier;
+				Gate.RearmAt = Now;
+				Gate.bLandedBeforeRelease = false;
+				Gate.LandedEarlyBySeconds = 0.0;
+
+				GateExec(Gate, TEXT("Trace.DebugTakeCore"));
+				return true;
+			}
+
+			// *** THE TAIL STILL RUNS ON THE LAST MISS, AND THAT IS DELIBERATE. *** A throw DID happen,
+			// so there is a flight, and the flight frames are the evidence for what a Core thrown from
+			// the wrong state actually does — which is the picture the owner's note is about. The tail
+			// takes the frame (under the MISS name) and turns the flight log off.
+			GateLogFail(FString::Printf(
+				TEXT("ALL %d STAGED ATTEMPTS MISSED. The last throw was released with the thrower %s at ")
+				TEXT("%.0f uu/s vertical, not descending (the gate wanted falling and at least %.0f uu/s ")
+				TEXT("down). Take-off was +%.0f uu/s with the apex %.2fs later, and the release was aimed ")
+				TEXT("%.2fs past it. Every attempt: %s. EVERY STAGED JUMP, FROM A DIFFERENT PIECE OF ")
+				TEXT("FLOOR, FAILED TO REACH THE STATE — WHICH IS A FAILURE AND NOT THE v31 ")
+				TEXT("NON-DETERMINISM RE-LABELLED."),
+				GateMaxAttempts,
+				Sample.bThrowerFalling ? TEXT("AIRBORNE") : TEXT("ON THE GROUND"),
+				Sample.ThrowerVelocityZ, GateMinDescentUU, Gate.TakeoffVelocityZ,
+				Gate.TimeToApexSeconds, Gate.TimeToApexSeconds * Gate.DescendFraction, *Gate.MissRecord));
+			GateRunTail(Gate, FrameName);
+			return false;
+		}
+
+		default:
+			return false;
+		}
+	}
+
+	/**
+	 * ONE-SHOT, set by Trace.Integ.WalkCoreRedArm and cleared by the arm it applies to.
+	 *
+	 * A one-shot rather than a mode: a red arm left latched would quietly turn every later Core walk
+	 * in the same process into a failing one, and this file has already been bitten once by a global
+	 * that outlived the run that set it (see TakeShot's note on GTag).
+	 */
+	static bool GGateRedArmOnce = false;
+
+	/**
+	 * ONE-SHOT, set by Trace.Integ.WalkCoreRetryArm. THE RED ARM OF THE RETRY, which is a different
+	 * claim from the red arm above and needs its own arm to prove it.
+	 *
+	 * GGateRedArmOnce proves the gate can still FAIL. It cannot prove the retry RECOVERS, because
+	 * every one of its attempts is aimed past the landing on purpose. This one makes only ATTEMPT 1
+	 * miss and lets the re-arm aim where the shipped gate aims, so the run must print
+	 * "GATE ATTEMPT 1 of 3 MISSED" and then "GATE VERDICT: PASS on attempt 2". A first-time PASS means
+	 * the deliberate miss did not bite; a FAIL means the recovery path does not work.
+	 */
+	static bool GGateFirstAttemptMissOnce = false;
+
+	/** SPEC v32 §7e. Presses the jump and hands the rest of the Core walk to TickCoreThrowGate. */
+	static void ArmCoreThrowGate(APlayerController* PC, const FString& Tag)
+	{
+		TSharedRef<FCoreThrowGate> Gate = MakeShared<FCoreThrowGate>();
+		Gate->PC = PC;
+		Gate->Tag = Tag;
+		Gate->ArmedAt = FPlatformTime::Seconds();
+
+		if (GGateRedArmOnce)
+		{
+			GGateRedArmOnce = false;
+			Gate->DescendFraction = GateRedArmDescendFraction;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[IntegWalk] *** RED ARM (v32 s7e): the release is aimed at %.2f of the fall, i.e. ")
+				TEXT("PAST THE LANDING, instead of the shipped %.2f, on EVERY one of the %d attempts. THE ")
+				TEXT("GATE MUST NOW PRINT \"GATE VERDICT: FAIL\" AND FILE THE FRAME AS ")
+				TEXT("61_thrown_ON_GROUND_MISS. ***"),
+				GateRedArmDescendFraction, GateDescendFraction, GateMaxAttempts);
+		}
+		else if (GGateFirstAttemptMissOnce)
+		{
+			GGateFirstAttemptMissOnce = false;
+			Gate->bMissFirstAttemptOnPurpose = true;
+			Gate->DescendFraction = GateRedArmDescendFraction;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[IntegWalk] *** RETRY ARM (v32 s7e): ATTEMPT 1 ONLY is aimed at %.2f of the fall, ")
+				TEXT("i.e. PAST THE LANDING, so it must miss; the re-arm then aims at the shipped %.2f. ")
+				TEXT("THE GATE MUST NOW PRINT \"GATE ATTEMPT 1 of %d MISSED\" AND THEN \"GATE VERDICT: ")
+				TEXT("PASS on attempt 2\". ***"),
+				GateRedArmDescendFraction, GateDescendFraction, GateMaxAttempts);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[IntegWalk] KEY SpaceBar (0.10s, controller) — GATE ARMED (v32 s7e): the throw is now ")
+			TEXT("placed off the MEASURED take-off, and the frame is named off ATraceCore::LastThrow."));
+
+		if (PC != nullptr)
+		{
+			PC->ConsoleCommand(TEXT("Trace.SimInput SpaceBar 0.10 controller"), /*bWriteToLog=*/false);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[IntegWalk] GATE VERDICT: FAIL — no local controller to jump with."));
+			return;
+		}
+
+		// Interval 0, i.e. once per frame: the release has to be placed inside a window of tens of
+		// milliseconds and a coarser poll would quantise it back into the problem this replaces.
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Gate](float) -> bool
+		{
+			return TickCoreThrowGate(Gate.Get());
+		}), 0.f);
+	}
+
 	/** Runs one step. Kept off the timer lambda so the two paths log identically. */
 	static void RunStep(APlayerController* PC, const FStep& Step, const FString& Tag)
 	{
+		// SPEC v32 §7e. Checked FIRST: a gate step carries no key, no shot and no exec, and falling
+		// through to the key branch would log "KEY  skipped" and lose the rest of the walk in silence.
+		if (Step.bCoreThrowGate)
+		{
+			ArmCoreThrowGate(PC, Tag);
+			return;
+		}
+
 		if (!Step.Shot.IsEmpty())
 		{
 			TakeShot(Tag, Step.Shot);
@@ -669,13 +1532,57 @@ namespace TraceIntegrationWalkFile
 
 	static FAutoConsoleCommandWithWorld GWalkCoreCommand(
 		TEXT("Trace.Integ.WalkCore"),
-		TEXT("Spec v31 §2: takes the Core, runs, JUMPS and releases a charged throw half a second "
-		     "after the apex — the owner's \"thrown while going down\" case, through the real left-"
-		     "mouse route — then photographs the flight. Mode B only. No arguments."),
+		TEXT("Spec v31 §2 / v32 §7e: takes the Core, runs, JUMPS and releases a charged throw a "
+		     "measured fraction of the way back down from the apex — the owner's \"thrown while going "
+		     "down\" case, through the real left-mouse route — then photographs the flight. Re-stages "
+		     "the jump up to three times if the arena cuts a flight short. Mode B only. No arguments."),
 		FConsoleCommandWithWorldDelegate::CreateStatic(
 			[](UWorld* World)
 			{
 				GTag = TEXT("v31core");
+				Start(World, TEXT("Core"));
+			}));
+
+	// SPEC v32 §7e / §8. THE RED ARM OF THE CORE WALK, AS A COMMAND, SO IT IS RUN AND NOT DESCRIBED.
+	//
+	// Identical to Trace.Integ.WalkCore in every respect except where the release is aimed: past the
+	// landing instead of a third of the way down, on every attempt it makes. Same walk, same gate,
+	// same verdict code — so if this prints a PASS, the gate is not reading the state it claims to
+	// read, and the §7e complaint ("silently mislabelling") is back. IT ALSO PROVES THE RETRY CANNOT
+	// MANUFACTURE A PASS: three staged attempts, all aimed at the floor, must still end in one FAIL.
+	// Its frames get their own tag for the reason WalkGuns spells out at length: a deliberately-
+	// failing frame must never be able to overwrite a real one.
+	static FAutoConsoleCommandWithWorld GWalkCoreRedArmCommand(
+		TEXT("Trace.Integ.WalkCoreRedArm"),
+		TEXT("Spec v32 s7e. The Core walk with every throw deliberately released AFTER the landing. The "
+		     "gate MUST print \"GATE VERDICT: FAIL\" and file the frame as 61_thrown_ON_GROUND_MISS. "
+		     "If it passes, the gate is vacuous. Mode B only. No arguments."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(
+			[](UWorld* World)
+			{
+				GGateRedArmOnce = true;
+				GTag = TEXT("v32coreRED");
+				Start(World, TEXT("Core"));
+			}));
+
+	// SPEC v32 §7e / §8. THE RED ARM OF THE *RETRY*, AS A COMMAND, FOR THE SAME REASON.
+	//
+	// Trace.Integ.WalkCoreRedArm proves the gate can still fail. It cannot prove the gate RECOVERS,
+	// because every attempt it makes is aimed at the floor. This one makes attempt 1 miss on purpose
+	// and lets attempt 2 aim properly, so the machinery that turns a 22%-of-runs staging miss into a
+	// pass is RUN rather than described. Its frames get their own tag so a deliberately-missed frame
+	// can never overwrite a real one — see WalkGuns for the run that taught this project that lesson.
+	static FAutoConsoleCommandWithWorld GWalkCoreRetryArmCommand(
+		TEXT("Trace.Integ.WalkCoreRetryArm"),
+		TEXT("Spec v32 s7e. The Core walk with the FIRST throw deliberately released after the landing "
+		     "and every later one aimed normally. The gate MUST print \"GATE ATTEMPT 1 of 3 MISSED\" and "
+		     "then \"GATE VERDICT: PASS on attempt 2\". If it passes first time the deliberate miss did "
+		     "not bite; if it fails, the re-arm does not recover. Mode B only. No arguments."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(
+			[](UWorld* World)
+			{
+				GGateFirstAttemptMissOnce = true;
+				GTag = TEXT("v32coreRETRY");
 				Start(World, TEXT("Core"));
 			}));
 
@@ -711,12 +1618,189 @@ namespace TraceIntegrationWalkFile
 						? World->GetFirstPlayerController()->GetPawn() : nullptr)
 					: nullptr;
 				const bool bPackRig = (LocalChar != nullptr) && LocalChar->UsesPackHands();
-				GTag = bPackRig ? TEXT("v31integ") : TEXT("v31fallback");
+				// The tag is bumped by the pass that re-photographs this walk, which is the whole
+				// point of the two paragraphs above: v31integ_43_pistol_reload.png is the frame the
+				// off-hand shard was FOUND in and it has to stay on disk saying that.
+				GTag = bPackRig ? TEXT("v35shardFIX") : TEXT("v35shardFALLBACK");
 				UE_LOG(LogTraceGame, Display,
 					TEXT("[IntegWalk] hand rig is %s, so these frames are filed as %s_*."),
 					bPackRig ? TEXT("THE PACK (SK_TraceHands)") : TEXT("THE PROCEDURAL CUBE FALLBACK"),
 					*GTag);
 				Start(World, TEXT("Guns"));
+			}));
+
+	// =============================================================================================
+	// *** SPEC v32 §6 — THE BLOOM MEASUREMENT. "CHECK, DON'T REBUILD." ***
+	// =============================================================================================
+	//
+	// The FX doc's whole bloom section is one sentence: "set the threshold low enough that the 1.5x
+	// base intensity already blooms slightly, so the 5x discharge really punches." That is a claim
+	// about a number in a RUNNING game, and the only honest way to answer it is to read the number
+	// out of the running game — the arena's post-process volume is spawned at runtime by
+	// ATraceArenaBuilder::BuildPostProcess, so a header default is a statement of intent and not
+	// evidence that the volume in front of the camera carries it.
+	//
+	// WHY IT LIVES IN THE INTEGRATION-WALK FILE AND NOT IN THE ARENA BUILDER. It measures; it does not
+	// build. Everything in this file exists to turn "the picture is right" into a number or a frame,
+	// and this is the same job. It also keeps a diagnostic out of a 8500-line builder that has no
+	// other reader-facing command in it, and it reads only public engine state — nothing here needs
+	// to be a friend of anything.
+	//
+	// IT DOES NOT TOUCH THE FIDELITY TIERS. Trace.Arena.Fidelity.Bloom is a shipped knob with a
+	// documented meaning (0-3, FFT at 3, never off) and is not this section's business.
+
+	/** The FX doc's two materials, at the BASE multipliers it names. See Art/Pack/docs/unreal-fx_README.md. */
+	struct FBloomBaseEmissive
+	{
+		const TCHAR* Slot;
+		FColor Colour;
+		float BaseMultiplier;
+	};
+
+	/**
+	 * Does an emissive of this colour at this multiplier get past the bloom threshold?
+	 *
+	 * UE's bloom threshold is in LINEAR scene-colour units and the FX doc's colours are sRGB hex, so
+	 * the conversion has to happen or the answer is wrong by the gamma curve — #25E6FF's green
+	 * channel is 0.902 in sRGB and 0.787 in linear, which is the difference between "just crosses"
+	 * and "just misses" at any threshold near 1. FColor -> FLinearColor does exactly that conversion.
+	 *
+	 * The brightest channel is the right quantity: bloom is thresholded per pixel on the scene colour,
+	 * and a saturated cyan whose blue channel is 1.0 blooms on the blue channel whatever the red does.
+	 */
+	static float BloomBrightnessOf(const FBloomBaseEmissive& Emissive)
+	{
+		const FLinearColor Linear = FLinearColor(Emissive.Colour);
+		return FMath::Max3(Linear.R, Linear.G, Linear.B) * Emissive.BaseMultiplier;
+	}
+
+	static FAutoConsoleCommandWithWorld GIntegBloomCommand(
+		TEXT("Trace.Integ.Bloom"),
+		TEXT("Spec v32 s6. Prints the LIVE BloomIntensity/BloomThreshold off every post-process volume "
+		     "in this world and states whether the FX doc's 1.5x base emissive crosses the threshold. "
+		     "Measures only — it changes nothing. No arguments, so it is safe to pass to -TraceExec=."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(
+			[](UWorld* World)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("========== [Bloom] SPEC v32 s6 — LIVE POST-PROCESS, MEASURED =========="));
+
+				if (World == nullptr)
+				{
+					UE_LOG(LogTraceGame, Warning, TEXT("[Bloom] no world."));
+					return;
+				}
+
+				int32 Volumes = 0;
+				bool bHaveEffective = false;
+				float EffectiveIntensity = 0.f;
+				float EffectiveThreshold = 0.f;
+				float EffectivePriority = TNumericLimits<float>::Lowest();
+				FString EffectiveName;
+
+				for (TActorIterator<APostProcessVolume> It(World); It; ++It)
+				{
+					const APostProcessVolume* const Volume = *It;
+					if (!IsValid(Volume))
+					{
+						continue;
+					}
+					++Volumes;
+
+					const FPostProcessSettings& PP = Volume->Settings;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[Bloom] volume %-32s enabled=%d unbound=%d priority=%.1f blend=%.2f | ")
+						TEXT("BloomIntensity override=%d value=%.3f | BloomThreshold override=%d value=%.3f | ")
+						TEXT("method override=%d value=%d | sizeScale override=%d value=%.2f"),
+						*GetNameSafe(Volume), Volume->bEnabled ? 1 : 0, Volume->bUnbound ? 1 : 0,
+						Volume->Priority, Volume->BlendWeight,
+						PP.bOverride_BloomIntensity ? 1 : 0, PP.BloomIntensity,
+						PP.bOverride_BloomThreshold ? 1 : 0, PP.BloomThreshold,
+						PP.bOverride_BloomMethod ? 1 : 0, static_cast<int32>(PP.BloomMethod),
+						PP.bOverride_BloomSizeScale ? 1 : 0, PP.BloomSizeScale);
+
+					// "The one in force" is the highest-priority ENABLED UNBOUND volume that actually
+					// overrides bloom. Bounded volumes are skipped rather than guessed at: whether one
+					// applies depends on where the camera is standing, and this command is not standing
+					// anywhere. The arena's own volume is unbound (BuildPostProcess sets bUnbound), so
+					// on this project that is always the one that matters.
+					if (Volume->bEnabled && Volume->bUnbound && PP.bOverride_BloomThreshold
+						&& Volume->Priority > EffectivePriority)
+					{
+						bHaveEffective = true;
+						EffectivePriority = Volume->Priority;
+						EffectiveIntensity = PP.BloomIntensity;
+						EffectiveThreshold = PP.BloomThreshold;
+						EffectiveName = GetNameSafe(Volume);
+					}
+				}
+
+				if (Volumes == 0)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[Bloom] no APostProcessVolume in this world at all — the arena builder's ")
+						TEXT("BuildPostProcess did not run (dedicated server?), so bloom is at engine defaults."));
+					return;
+				}
+
+				if (!bHaveEffective)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[Bloom] %d volume(s), but none of them is an enabled UNBOUND volume that ")
+						TEXT("overrides BloomThreshold. The threshold in force is the engine default."),
+						Volumes);
+					return;
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Bloom] IN FORCE: %s -> BloomIntensity %.3f, BloomThreshold %.3f."),
+					*EffectiveName, EffectiveIntensity, EffectiveThreshold);
+
+				// THE FX DOC'S QUESTION, ANSWERED WITH THE FX DOC'S OWN NUMBERS.
+				const FBloomBaseEmissive Bases[] =
+				{
+					{ TEXT("circuit_cyan"), FColor(0x25, 0xE6, 0xFF), 1.5f },
+					{ TEXT("core_amber"),   FColor(0xFF, 0x8A, 0x1F), 1.4f },
+				};
+
+				bool bAllCross = true;
+				for (const FBloomBaseEmissive& Base : Bases)
+				{
+					const float Brightness = BloomBrightnessOf(Base);
+					// A NEGATIVE THRESHOLD IS NOT "a very low number", IT IS A DIFFERENT MODE. UE reads
+					// anything below 0 as "every pixel contributes to bloom, weighted by brightness"
+					// rather than "only pixels above the threshold" — so at a negative threshold the
+					// question "does 1.5x cross it" has no crossing to do and the answer is yes by
+					// construction. Both branches are printed with their reason so the log says WHICH.
+					const bool bCrosses = (EffectiveThreshold < 0.f) || (Brightness > EffectiveThreshold);
+					bAllCross = bAllCross && bCrosses;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[Bloom]   %s #%02X%02X%02X at the doc's base x%.2f = %.3f linear (brightest ")
+						TEXT("channel) vs threshold %.3f -> %s%s"),
+						Base.Slot, Base.Colour.R, Base.Colour.G, Base.Colour.B, Base.BaseMultiplier,
+						Brightness, EffectiveThreshold,
+						bCrosses ? TEXT("BLOOMS") : TEXT("DOES NOT BLOOM"),
+						(EffectiveThreshold < 0.f)
+							? TEXT(" (threshold is negative: every pixel contributes, weighted by brightness)")
+							: TEXT(""));
+				}
+
+				// And the discharge, because "the 5.2x really punches" is the other half of the
+				// sentence and it is only meaningful relative to the base that already blooms.
+				const float CyanBase = BloomBrightnessOf(Bases[0]);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Bloom]   headroom: the pistol's 5.2x discharge is %.3f linear, %.1fx the base ")
+					TEXT("that already blooms — which is the \"punch\" the FX doc is asking for."),
+					CyanBase * (5.2f / 1.5f), 5.2f / 1.5f);
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Bloom] VERDICT: the 1.5x base emissive %s at the live threshold %.3f. %s"),
+					bAllCross ? TEXT("ALREADY BLOOMS") : TEXT("DOES *NOT* BLOOM"),
+					EffectiveThreshold,
+					bAllCross
+						? TEXT("The FX doc's request is already met — spec v32 s6 says CHANGE NOTHING.")
+						: TEXT("Spec v32 s6: lower BloomThreshold and record what it moved from and to."));
+				UE_LOG(LogTraceGame, Display, TEXT("======================================================"));
 			}));
 }
 
