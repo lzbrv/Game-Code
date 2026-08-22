@@ -64,6 +64,31 @@ SHADOWED = {
     "CustomTimeDilation", "NetDormancy", "NetCullDistanceSquared",
     "ReplicatedMovement", "AttachmentReplication", "Children",
     "ControllerRotation", "SpawnCollisionHandlingMethod",
+
+    # BOOLEAN MEMBERS, ADDED AFTER A WINDOWS BUILD FAILED ON ONE THIS FILE DID NOT KNOW.
+    #
+    # A collaborator hit `error C4458: declaration of 'bHidden' hides class member` in
+    # TraceCharacter.cpp on 2026-08-22, on a tree where this checker had just printed
+    # "clean (210 files scanned)". The list above was curated for OBJECT-ish members and
+    # every bool was missing - which is backwards, because a bool is exactly the kind of
+    # member somebody re-declares by accident: `bool bHidden = false;` inside a loop reads
+    # as completely ordinary local code, and on Apple clang it compiles without a murmur.
+    # These are AActor / UActorComponent / UPrimitiveComponent bools whose names a person
+    # would plausibly reach for while writing a local.
+    # *** AActor MEMBERS ONLY, AND THAT RESTRICTION IS THE POINT. ***
+    #
+    # This checker is line-based: it does not know which class encloses the line it is
+    # reading. C4458 only fires when the local shadows a member of the ENCLOSING class, so
+    # a name that belongs to USceneComponent or UPrimitiveComponent - bVisible, bCastShadow,
+    # bOwnerNoSee - is perfectly legal as a local inside an AActor, and listing it here
+    # produces confident false positives instead of finding bugs. Verified: adding those
+    # three flagged 14 lines in TraceCharacter, TraceArenaBuilder and TraceAbilitySetX, none
+    # of which is an error, because every one of those classes is an Actor. Everything below
+    # is declared on AActor itself, so any Actor subclass in this project really can shadow it.
+    "bHidden", "bReplicates", "bNetTemporary", "bTearOff", "bOnlyRelevantToOwner",
+    "bBlockInput", "bAutoDestroyWhenFinished", "bIsEditorOnlyActor", "bNetStartup",
+    "bExchangedRoles", "bActorEnableCollision", "bCanBeDamaged",
+    "bCollideWhenPlacing", "bIgnoresOriginShifting",
 }
 
 # A declaration: optional const/static/etc, a type expression, then the name,

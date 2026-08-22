@@ -5829,12 +5829,16 @@ bool ATraceCharacter::DebugGetViewModelFraming(FString& OutLine) const
 				}
 
 				const FName BoneName = HandsRefSkeleton.GetBoneName(BoneIndex);
-				bool bHidden = false;
+
+				// bBoneHidden, not bHidden: AActor declares bHidden, and a local of that name is
+				// error C4458 on MSVC while compiling silently on Apple clang. See
+				// Scripts/check-engine-member-shadowing.py, which now knows this name.
+				bool bBoneHidden = false;
 				for (const FName& Skip : TraceCharacterAssets::HandsHiddenBones)
 				{
-					bHidden |= (Skip == BoneName);
+					bBoneHidden |= (Skip == BoneName);
 				}
-				if (bHidden)
+				if (bBoneHidden)
 				{
 					continue;
 				}
