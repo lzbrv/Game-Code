@@ -11,6 +11,8 @@
 #include "Camera/CameraTypes.h"                // FMinimalViewInfo (GetViewModelMuzzleViewPoint)
 #include "Components/CapsuleComponent.h"
 #include "Containers/Ticker.h"                 // FTSTicker (debug console command below)
+#include "Camera/CameraActor.h"                  // Trace.Characters.Watch films from a free camera
+#include "DrawDebugHelpers.h"                   // ... and labels its subject in the frame
 #include "Engine/Engine.h"                     // GEngine (debug console command below)
 #include "EngineUtils.h"                       // TActorIterator (Trace.DebugAnimProbe)
 #include "HAL/IConsoleManager.h"               // FAutoConsoleCommand (debug console command below)
@@ -35,6 +37,8 @@
 #include "UObject/ConstructorHelpers.h"
 
 
+#include "Animation/AnimClassInterface.h"    // GetTargetSkeleton(): does this ABP fit this rig?
+#include "Core/TraceCharacterRoster.h"        // the per-character body mesh path and its yaw
 #include "Core/TraceGameMode.h"
 #include "Core/TraceGameState.h"
 #include "Abilities/TraceAbilityComponent.h"    // Trace.Bounds.Verify: "the cooldown kept ticking"
@@ -1635,6 +1639,17 @@ namespace
 	/** So the banner is printed once per distinct status rather than once per pawn (ten per match). */
 	ETraceCharacterArtStatus GLoggedCharacterArtStatus = ETraceCharacterArtStatus::Unknown;
 
+	/**
+	 * "ROCCO (/Game/Trace/Characters/Rocco/SK_Rocco.SK_Rocco)" — WHICH character's body is missing and
+	 * where we looked. The enum has no room for a payload and "a character mesh is missing" without
+	 * saying which one is a message that gets re-read rather than acted on. Written by
+	 * TraceCharacterBody::ReportMissingBodyMesh immediately before it reports the status.
+	 */
+	FString GMissingBodyMeshDetail;
+
+	/** Same idea, for the anim class: "ROCCO: <path> did not load." Filled by ReportMissingBodyAnim. */
+	FString GMissingBodyAnimDetail;
+
 	/** "/Game/.../SKM_Manny_Simple.SKM_Manny_Simple" -> "/Game/.../SKM_Manny_Simple". */
 	FString PackageNameOf(const TCHAR* ObjectPath)
 	{
@@ -1651,6 +1666,20 @@ namespace
 	 */
 	void ReportCharacterArtStatus(ETraceCharacterArtStatus NewStatus)
 	{
+		// *** ONE PAWN'S GOOD NEWS DOES NOT CANCEL ANOTHER'S BAD NEWS. ***
+		// Every pawn reports as it dresses, and until per-character bodies landed all ten of them were
+		// answering the same question — "is the Mannequin installed" — so the last writer was always
+		// right. CharacterBodyMeshMissing is about ONE character, so the nine Mannequin pawns that
+		// dress after it would each report Ok and wipe the warning off the screen. Nothing else is
+		// suppressed: a broken Mannequin install (MeshMissing) is more fundamental than a missing
+		// body and still overwrites this, because it is true of every pawn including that one.
+		if (NewStatus == ETraceCharacterArtStatus::Ok
+			&& (GCharacterArtStatus == ETraceCharacterArtStatus::CharacterBodyMeshMissing
+				|| GCharacterArtStatus == ETraceCharacterArtStatus::CharacterBodyAnimMissing))
+		{
+			return;
+		}
+
 		GCharacterArtStatus = NewStatus;
 		if (GLoggedCharacterArtStatus == NewStatus)
 		{
@@ -1690,6 +1719,38 @@ namespace
 			UE_LOG(LogTraceGame, Error, TEXT("  The Mannequin mesh loaded but %s did not, so characters will"), TraceCharacterAssets::UnarmedAnimClass);
 			UE_LOG(LogTraceGame, Error, TEXT("  stand in a fixed pose and never run."));
 			UE_LOG(LogTraceGame, Error, TEXT("  FIX:  %s --force"), TraceCharacterAssets::ImportCommand);
+			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
+			break;
+
+		case ETraceCharacterArtStatus::CharacterBodyMeshMissing:
+			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
+			UE_LOG(LogTraceGame, Error, TEXT("  A CHARACTER'S OWN BODY MESH IS NOT IMPORTED ON THIS MACHINE."));
+			UE_LOG(LogTraceGame, Error, TEXT("  %s"), *GMissingBodyMeshDetail);
+			UE_LOG(LogTraceGame, Error, TEXT("  That character's players are drawn as the MANNEQUIN instead."));
+			UE_LOG(LogTraceGame, Error, TEXT("  Everybody else is unaffected and the match is playable."));
+			UE_LOG(LogTraceGame, Error, TEXT(""));
+			UE_LOG(LogTraceGame, Error, TEXT("  FIX IT, from the project root:"));
+			UE_LOG(LogTraceGame, Error, TEXT("      ./Scripts/import-rocco.sh"));
+			UE_LOG(LogTraceGame, Error, TEXT("  Character art is gitignored/LFS by design, so a fresh clone"));
+			UE_LOG(LogTraceGame, Error, TEXT("  needs the import once."));
+			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
+			break;
+
+		case ETraceCharacterArtStatus::CharacterBodyAnimMissing:
+			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
+			UE_LOG(LogTraceGame, Error, TEXT("  A CHARACTER'S BODY IS IMPORTED BUT NOT RETARGETED."));
+			UE_LOG(LogTraceGame, Error, TEXT("  %s"), *GMissingBodyAnimDetail);
+			UE_LOG(LogTraceGame, Error, TEXT("  That character's players are the right shape and the right"));
+			UE_LOG(LogTraceGame, Error, TEXT("  size, and are FROZEN IN THEIR BIND POSE — arms out, sliding"));
+			UE_LOG(LogTraceGame, Error, TEXT("  around the arena. Nothing else is affected, and a still"));
+			UE_LOG(LogTraceGame, Error, TEXT("  screenshot of one standing looks entirely correct, which is"));
+			UE_LOG(LogTraceGame, Error, TEXT("  exactly why this says so at Error."));
+			UE_LOG(LogTraceGame, Error, TEXT(""));
+			UE_LOG(LogTraceGame, Error, TEXT("  FIX IT, from the project root:"));
+			UE_LOG(LogTraceGame, Error, TEXT("      ./Scripts/retarget-rocco.sh"));
+			UE_LOG(LogTraceGame, Error, TEXT("  An anim blueprint is compiled against a SKELETON, so a body"));
+			UE_LOG(LogTraceGame, Error, TEXT("  on a rig of its own needs its own retargeted copy of"));
+			UE_LOG(LogTraceGame, Error, TEXT("  ABP_Unarmed. That script bakes it."));
 			UE_LOG(LogTraceGame, Error, TEXT("=================================================================="));
 			break;
 
@@ -1774,6 +1835,20 @@ bool ATraceCharacter::GetCharacterArtWarning(FString& OutHeadline, FString& OutD
 		OutHeadline = TEXT("CHARACTER ART NOT INSTALLED");
 		OutDetail = FString::Printf(TEXT("Players are placeholder shapes. Run  %s  from the project root, then relaunch."),
 			TraceCharacterAssets::ImportCommand);
+		return true;
+
+	case ETraceCharacterArtStatus::CharacterBodyMeshMissing:
+		OutHeadline = TEXT("CHARACTER BODY MESH NOT IMPORTED");
+		OutDetail = FString::Printf(
+			TEXT("%s is drawn as the Mannequin. Run  ./Scripts/import-rocco.sh  from the project root, then relaunch."),
+			*GMissingBodyMeshDetail);
+		return true;
+
+	case ETraceCharacterArtStatus::CharacterBodyAnimMissing:
+		OutHeadline = TEXT("CHARACTER BODY NOT RETARGETED");
+		OutDetail = FString::Printf(
+			TEXT("%s is frozen in its bind pose. Run  ./Scripts/retarget-rocco.sh  from the project root, then relaunch."),
+			*GMissingBodyAnimDetail);
 		return true;
 
 	case ETraceCharacterArtStatus::AnimMissing:
@@ -2417,6 +2492,524 @@ void ATraceCharacter::SetupCharacterVisuals()
 	ApplyTeamColors();
 }
 
+// =================================================================================================
+// THE PER-CHARACTER BODY — what OTHER players see when somebody picks Rocco
+// =================================================================================================
+//
+// SetupCharacterVisuals() above dresses every pawn in the Mannequin. It runs from
+// PostInitializeComponents(), which is far too early to know WHO this pawn is: the character id is
+// not on the pawn, it is forwarded by ATracePlayerState from a UTraceAbilityComponent that is
+// attached to the PLAYERSTATE — a third actor-ish object that replicates on its own schedule. So on
+// any machine that did not spawn this pawn there are three independent arrivals (pawn, player state,
+// ability component) and no guaranteed order between them.
+//
+// Everything below exists to make that ordering irrelevant. See UpdateCharacterBodyMesh()'s
+// declaration for the argument in full; the short version is that this is a POLL with a remembered
+// answer, re-asserted from every path that could learn something new, and free when nothing did.
+//
+// THE THREE THINGS A BODY SWAP HAS TO CARRY WITH IT, none of which are the mesh asset:
+//   1. THE YAW. Epic's Mannequin is authored facing +Y and needs -90; Rocco's rig is authored facing
+//      +X and needs 0. Copying the Mannequin's number onto a new mesh stands the character sideways
+//      to the direction it is shooting.
+//   2. THE ANIM BLUEPRINT, WHICH IS PER CHARACTER FOR THE SAME REASON THE MESH IS. An anim blueprint
+//      is compiled against a SKELETON: ABP_Unarmed drives root/pelvis/hand_r and Rocco's rig has
+//      Hips1/Spine021/RightHand1, not one name shared, so it has nothing to move. So each row that
+//      names a body also names the class for that body's rig — Rocco's being Epic's own blend space
+//      retargeted onto SK_Rocco_Skeleton by Scripts/retarget-rocco.sh. The compatibility check stays
+//      anyway: a body that is the right shape and frozen is invisible to a screenshot.
+//   3. THE THINGS BOLTED TO BONES. The third-person knife hangs off "hand_r", which exists on
+//      exactly one of the two rigs. UTraceWeaponComponent is told to rebuild against the new body.
+namespace TraceCharacterBody
+{
+	static_assert(TraceCharacterLayout::MeshYaw == -90.f,
+		"ATraceCharacter::BodyMeshYaw's header default is written as the literal -90 because "
+		"TraceCharacterLayout lives in this .cpp and a header cannot see it. If MeshYaw moves, that "
+		"default moves with it.");
+	static_assert(TraceCharacterRoster::NoneId == 0,
+		"ATraceCharacter::AppliedBodyCharacterId's header default is written as the literal 0 for the "
+		"same reason. If NoneId moves, that default moves with it.");
+
+	/**
+	 * ONE RIG'S NAME FOR A MANNEQUIN BONE.
+	 *
+	 * Not a per-character table, deliberately: this is a property of the SKELETON, several characters
+	 * may share one rig, and the lookup is "ask the mesh which of these names it actually has", which
+	 * cannot be wrong about a mesh it is holding. Adding a rig means adding its names to a row.
+	 *
+	 * THE TRAILING "1" IS NOT A TYPO. RoccoTest.fbx ships TWO armatures using the same 24 bone names,
+	 * so the FBX translator uniquified the second one it reached — every bone on the imported skeleton
+	 * is "RightHand1", "Hips1", "Head1". It is deterministic (it follows the file's node order) and it
+	 * is what the asset on disk actually contains. The un-suffixed spellings are listed beside them so
+	 * a re-export with a single armature keeps working without a code change.
+	 */
+	struct FBodyBoneAliases
+	{
+		/** What the game asks for, in the Mannequin's vocabulary. */
+		const TCHAR* MannequinName;
+
+		/** Everything else that has ever meant the same joint, most likely first. Null-terminated. */
+		const TCHAR* Aliases[4];
+	};
+
+	const FBodyBoneAliases BoneAliasTable[] =
+	{
+		{ TEXT("hand_r"),     { TEXT("RightHand1"),     TEXT("RightHand"),     TEXT("mixamorig:RightHand"),     nullptr } },
+		{ TEXT("hand_l"),     { TEXT("LeftHand1"),      TEXT("LeftHand"),      TEXT("mixamorig:LeftHand"),      nullptr } },
+		{ TEXT("lowerarm_r"), { TEXT("RightForeArm1"),  TEXT("RightForeArm"),  TEXT("mixamorig:RightForeArm"),  nullptr } },
+		{ TEXT("lowerarm_l"), { TEXT("LeftForeArm1"),   TEXT("LeftForeArm"),   TEXT("mixamorig:LeftForeArm"),   nullptr } },
+		{ TEXT("foot_r"),     { TEXT("RightFoot1"),     TEXT("RightFoot"),     TEXT("mixamorig:RightFoot"),     nullptr } },
+		{ TEXT("foot_l"),     { TEXT("LeftFoot1"),      TEXT("LeftFoot"),      TEXT("mixamorig:LeftFoot"),      nullptr } },
+		{ TEXT("head"),       { TEXT("Head1"),          TEXT("Head"),          TEXT("mixamorig:Head"),          nullptr } },
+		{ TEXT("pelvis"),     { TEXT("Hips1"),          TEXT("Hips"),          TEXT("mixamorig:Hips"),          nullptr } },
+	};
+
+	/**
+	 * @return the name @p MeshComp actually has for @p Wanted, or NAME_None if this rig has no
+	 *         equivalent at all. Asks the mesh rather than the character, so it is correct for
+	 *         whatever is on the component at the moment it is called.
+	 */
+	FName ResolveBoneName(const USkeletalMeshComponent* MeshComp, FName Wanted)
+	{
+		if (MeshComp == nullptr || Wanted.IsNone())
+		{
+			return NAME_None;
+		}
+
+		// The Mannequin, and the common case: one lookup and out. A mesh component with no skeletal
+		// mesh at all (the not-imported fallback) answers false here and falls through to answer None,
+		// which is what every caller already guards for.
+		if (MeshComp->DoesSocketExist(Wanted))
+		{
+			return Wanted;
+		}
+
+		for (const FBodyBoneAliases& Row : BoneAliasTable)
+		{
+			if (Wanted != FName(Row.MannequinName))
+			{
+				continue;
+			}
+
+			for (const TCHAR* const Alias : Row.Aliases)
+			{
+				if (Alias == nullptr)
+				{
+					break;
+				}
+				const FName AliasName(Alias);
+				if (MeshComp->DoesSocketExist(AliasName))
+				{
+					return AliasName;
+				}
+			}
+			break;   // the Mannequin name appears once; no other row can match
+		}
+
+		return NAME_None;
+	}
+
+	/** Fills the banner's payload and reports, so a missing body says WHICH body. Once per process. */
+	void ReportMissingBodyMesh(uint8 CharacterId, const FString& MeshPath)
+	{
+		GMissingBodyMeshDetail = FString::Printf(TEXT("%s: %s did not load."),
+			*TraceCharacterRoster::NameFor(CharacterId), *MeshPath);
+		ReportCharacterArtStatus(ETraceCharacterArtStatus::CharacterBodyMeshMissing);
+	}
+
+	/** The same, for the anim class that was supposed to drive that body. */
+	void ReportMissingBodyAnim(uint8 CharacterId, const FString& Detail)
+	{
+		GMissingBodyAnimDetail = FString::Printf(TEXT("%s: %s"),
+			*TraceCharacterRoster::NameFor(CharacterId), *Detail);
+		ReportCharacterArtStatus(ETraceCharacterArtStatus::CharacterBodyAnimMissing);
+	}
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * *** THE RED ARM FOR Trace.Characters.BodyMesh, AND IT IS A REAL BUG, NOT A MUTILATION. ***
+	 *
+	 * At 1 the per-character body is applied ONLY from the lifecycle events — BeginPlay,
+	 * PossessedBy, OnRep_PlayerState — and never from the poll. That is not a broken version of this
+	 * feature, it is the OBVIOUS version of it, the one a reasonable person writes first and the one
+	 * this project's own history says gets written: hook the events, apply once, done.
+	 *
+	 * It fails because THE CHARACTER ID DOES NOT ARRIVE WITH ANY OF THOSE EVENTS. It arrives on a
+	 * UTraceAbilityComponent that replicates separately from the PlayerState, which replicates
+	 * separately from the pawn — and it can land tens of seconds later than all three: a player who
+	 * lets the select screen time out is auto-assigned at the deadline, twenty-five seconds after
+	 * their pawn spawned (measured, in a listen-server run). Every hook has long since fired against
+	 * "no character", so the body stays a Mannequin for the rest of the match.
+	 *
+	 * MEASURED, so the claim is the one the run makes and not the one that sounded right: with this
+	 * at 1 on a connecting client, Trace.Characters.BodyMesh reported
+	 *     FAIL TraceCharacter_0  role=Autonomous  says=ROCCO  applied=MANNEQUIN  draws=SKM_Manny_Simple
+	 *     RESULT: *** FAIL *** - 1 pawn(s) are drawing a body their character did not ask for
+	 * and the same run with it at 0 reported PASS for all ten, INCLUDING a role=Simulated pawn drawing
+	 * SK_Rocco. Which pawn goes red depends on the ordering that machine happened to get — the rule is
+	 * "whichever pawn learns its character after the last hook fired", not "the remote ones".
+	 * A harness whose red arm and green arm agree is not measuring its rule.
+	 */
+	/**
+	 * *** THE RED ARM FOR THE ANIM HALF OF Trace.Characters.BodyMesh, AND IT IS THE STATE THIS
+	 * FEATURE WAS ACTUALLY IN. ***
+	 *
+	 * At 1, ApplyBodyAnimInstance ignores the character's own anim class and offers every pawn
+	 * CharacterAnimClass — Epic's ABP_Unarmed — exactly as it did before this pass. On a Mannequin
+	 * that changes nothing. On Rocco it reproduces the reported bug precisely: the class is bound to
+	 * a skeleton whose bones SK_Rocco does not have, the compatibility check rejects it, and the pawn
+	 * is drawn in its BIND POSE, gliding.
+	 *
+	 * It is here because the anim half of this feature is the half a screenshot cannot fail. A
+	 * standing Rocco in a bind pose and a standing Rocco mid-idle are the same picture; the
+	 * difference is only visible in motion, or in a harness that reads the anim class off the
+	 * component. So the harness reads it — and this switch is how the harness is proved to be
+	 * capable of going red at all.
+	 */
+	TAutoConsoleVariable<int32> CVarBodyAnimIgnore(
+		TEXT("Trace.Characters.BodyAnimIgnore"),
+		0,
+		TEXT("Trace, dev only. 1 = ignore each character's own retargeted anim class and offer every pawn\n")
+		TEXT("Epic's ABP_Unarmed, as this game did before the retarget existed. This is the RED ARM: it puts\n")
+		TEXT("Rocco back in his bind pose, and Trace.Characters.BodyMesh must report FAIL while it is on."),
+		ECVF_Cheat);
+
+	TAutoConsoleVariable<int32> CVarBodyMeshEventsOnly(
+		TEXT("Trace.Characters.BodyMeshEventsOnly"),
+		0,
+		TEXT("Trace, dev only. 1 = apply the per-character body ONLY from BeginPlay/PossessedBy/OnRep_PlayerState\n")
+		TEXT("and never from the per-frame re-assert. This is the RED ARM: it restores the late-arrival bug,\n")
+		TEXT("and Trace.Characters.BodyMesh must report FAIL on remotely-replicated pawns while it is on."),
+		ECVF_Cheat);
+
+	/**
+	 * *** THE RED ARM FOR THE MATERIAL HALF OF Trace.Characters.BodyMesh, AND IT IS THE BUG THIS
+	 * PASS FIXED. ***
+	 *
+	 * At 1, ApplyCharacterBodyMesh swaps the mesh WITHOUT dropping the component's material
+	 * overrides — exactly what the code did before, and exactly what a reasonable person writes,
+	 * because "set the mesh" sounds total and the overrides are invisible in the header of the
+	 * component. They are not cleared by the engine: USkinnedMeshComponent::SetSkinnedAssetAndUpdate
+	 * clears skin-weight profiles and morph targets and nothing else, and an override is returned in
+	 * preference to the asset's own material for that slot.
+	 *
+	 * The result is per-slot and partial, which is why it survived three reviews: the Mannequin has
+	 * two slots and SK_Rocco has ten, so Manny -> Rocco leaves ONLY sections 0 and 1 in M_Mannequin
+	 * and the other eight correct. And it is invisible in a still frame, because ApplyTeamColors
+	 * writes the same team tint into every MID whatever its parent — a wrongly-parented slot is the
+	 * right colour. So the evidence has to be a comparison against the asset, which is what the
+	 * material column does.
+	 */
+	TAutoConsoleVariable<int32> CVarBodyMeshKeepOverrides(
+		TEXT("Trace.Characters.BodyMeshKeepOverrides"),
+		0,
+		TEXT("Trace, dev only. 1 = do not clear the component's material overrides when the body mesh is\n")
+		TEXT("swapped. This is the RED ARM: it restores the stale-override bug, so a pawn that has changed\n")
+		TEXT("body draws some slots in the PREVIOUS body's materials, and Trace.Characters.BodyMesh must\n")
+		TEXT("report FAIL on the material column while it is on."),
+		ECVF_Cheat);
+#endif
+
+	/** 0 in a shipping build: the red arm is a dev-only switch and the fix is unconditional there. */
+	static bool ShouldKeepStaleMaterialOverrides()
+	{
+#if !UE_BUILD_SHIPPING
+		return CVarBodyMeshKeepOverrides.GetValueOnGameThread() != 0;
+#else
+		return false;
+#endif
+	}
+}
+
+FName ATraceCharacter::ResolveBodyBoneName(FName MannequinBoneName) const
+{
+	return TraceCharacterBody::ResolveBoneName(GetMesh(), MannequinBoneName);
+}
+
+void ATraceCharacter::UpdateCharacterBodyMesh(bool bIsPoll)
+{
+	// A dedicated server draws nothing and never builds a pose, so it loads no character art at all —
+	// the same rule, for the same reason, as SetupCharacterVisuals(). The capsule is what the server
+	// simulates and it is identical for every character.
+	if (IsRunningDedicatedServer())
+	{
+		return;
+	}
+
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	if (MeshComp == nullptr)
+	{
+		return;
+	}
+
+#if !UE_BUILD_SHIPPING
+	if (bIsPoll && TraceCharacterBody::CVarBodyMeshEventsOnly.GetValueOnGameThread() != 0)
+	{
+		return;
+	}
+#else
+	(void)bIsPoll;
+#endif
+
+	// THE REPLICATED SELECTION IS THE SOURCE OF TRUTH — the same value the ability framework, the
+	// select screen and the scoreboard read, so the body on screen cannot disagree with the character
+	// being simulated. Null PlayerState, unreplicated ability component and "still choosing" all
+	// answer the same thing here, and it is the right answer: NoneId, i.e. the Mannequin.
+	uint8 DesiredId = TraceCharacterRoster::NoneId;
+	if (const ATracePlayerState* TracePS = GetPlayerState<ATracePlayerState>())
+	{
+		const uint8 Selected = TracePS->GetSelectedCharacter();
+		if (TraceCharacterRoster::IsValidId(Selected))
+		{
+			DesiredId = Selected;
+		}
+	}
+
+	// *** THIS BRANCH IS WHY A POLL IS AFFORDABLE. *** Ten pawns, every frame, on every machine, and
+	// the steady state is one integer compare each. Note that the id is recorded even when the apply
+	// FAILED (see ApplyCharacterBodyMesh), so a missing import costs one LoadSynchronous for the life
+	// of the pawn rather than one per frame.
+	if (DesiredId == AppliedBodyCharacterId)
+	{
+		return;
+	}
+
+	ApplyCharacterBodyMesh(DesiredId);
+}
+
+bool ATraceCharacter::ApplyCharacterBodyMesh(uint8 CharacterId)
+{
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	if (MeshComp == nullptr)
+	{
+		return false;
+	}
+
+	// -TraceNoCharacterArt is how the not-imported path gets TESTED on a machine where the import HAS
+	// been run. It has to cover the per-character bodies too, or the switch would stop simulating a
+	// fresh clone the moment one player picked Rocco.
+	if (FParse::Param(FCommandLine::Get(), TEXT("TraceNoCharacterArt")))
+	{
+		AppliedBodyCharacterId = CharacterId;
+		return false;
+	}
+
+	// EMPTY PATH IS THE NORMAL ANSWER AND IT MEANS THE MANNEQUIN — nine of the ten characters, plus
+	// NoneId, plus every pawn between spawn and lock-in. Find() returns null for NoneId, which lands
+	// in the same place.
+	FString WantedPath;
+	FString WantedAnimPath;
+	float WantedYaw = TraceCharacterLayout::MeshYaw;
+	if (const TraceCharacterRoster::FTraceCharacterEntry* Row = TraceCharacterRoster::Find(CharacterId))
+	{
+		if (Row->BodyMeshPath != nullptr && Row->BodyMeshPath[0] != TEXT('\0'))
+		{
+			WantedPath = Row->BodyMeshPath;
+			WantedYaw = Row->BodyMeshYaw;
+			// READ ONLY ALONGSIDE THE MESH, deliberately. An anim class without the body it was
+			// retargeted for is not a half-fix, it is a class bound to a skeleton this pawn is not
+			// wearing — ApplyBodyAnimInstance would reject it and the pawn would end up in a bind
+			// pose it did not need. A row with a mesh and no anim class is the honest bind-pose case
+			// and is reported as one.
+			WantedAnimPath = (Row->BodyAnimClassPath != nullptr) ? Row->BodyAnimClassPath : TEXT("");
+		}
+	}
+
+	// RECORDED BEFORE THE WORK, ON PURPOSE. "We have already dealt with this id" is what makes the
+	// poll free, and it has to be true of a FAILED apply too — otherwise a character whose mesh is not
+	// imported would attempt a synchronous load every frame for the whole match.
+	AppliedBodyCharacterId = CharacterId;
+
+	USkeletalMesh* WantedMesh = nullptr;
+	if (WantedPath.IsEmpty())
+	{
+		WantedMesh = CharacterMeshAsset.IsNull() ? nullptr : CharacterMeshAsset.LoadSynchronous();
+		if (WantedMesh == nullptr)
+		{
+			// The Mannequin itself is not installed. SetupCharacterVisuals() has already said so, at
+			// Error, with the command to run, and has switched this pawn to the fallback shapes — so
+			// there is nothing to add and nothing to undo.
+			return false;
+		}
+	}
+	else
+	{
+		// LoadSynchronous on the soft path: the first Rocco pawn pays, every one after it gets the
+		// resident object back. This is a character SWITCH or a spawn, not a per-frame path.
+		WantedMesh = Cast<USkeletalMesh>(FSoftObjectPath(WantedPath).TryLoad());
+		if (WantedMesh == nullptr)
+		{
+			// The whole point of the reference being soft: this pawn keeps the Mannequin it is already
+			// wearing, the match carries on, and the missing import is reported through the SAME
+			// machinery a missing Mannequin uses — banner at Error, and a line on the HUD for the rest
+			// of the session, because a log line demonstrably was not enough.
+			TraceCharacterBody::ReportMissingBodyMesh(CharacterId, WantedPath);
+			return false;
+		}
+	}
+
+	const bool bMeshChanged = (MeshComp->GetSkeletalMeshAsset() != WantedMesh);
+	if (bMeshChanged)
+	{
+		// CLEARED BEFORE THE SWAP, AND THIS IS LOAD-BEARING. ApplyTeamColors() has already wrapped the
+		// OLD body's slots in MIDs, and a MID installed by CreateDynamicMaterialInstance lives in the
+		// component's OverrideMaterials — which SetSkeletalMeshAsset does NOT touch
+		// (USkinnedMeshComponent::SetSkinnedAssetAndUpdate clears skin-weight profiles and morph
+		// targets, and nothing else). An override outlives the mesh that justified it and is returned
+		// in preference to the new asset's own material, per slot index. Left in place, Manny -> Rocco
+		// would draw Rocco's first two sections in M_Mannequin through Rocco's UVs, and the switch back
+		// would put Rocco's material on the Mannequin. The team tint hides it — every MID gets the same
+		// colour whatever its parent — which is exactly why it has to be dropped here rather than
+		// noticed later. Trace.Characters.BodyMeshKeepOverrides is the red arm that puts it back.
+		if (!TraceCharacterBody::ShouldKeepStaleMaterialOverrides())
+		{
+			MeshComp->EmptyOverrideMaterials();
+		}
+		MeshComp->SetSkeletalMeshAsset(WantedMesh);
+	}
+
+	BodyMeshYaw = WantedYaw;
+
+	// Written here AND read every frame by UpdateCrouchPresentation, which recomposes this rotation
+	// whenever the slide lean moves. Setting it once would survive exactly until the first slide.
+	// Straight yaw rather than the leaned composition because a body swap happens at spawn or at a
+	// character switch, both of which are standing still; the next lean tick restores the pose.
+	MeshComp->SetRelativeRotation(FRotator(0.f, BodyMeshYaw, 0.f));
+	MeshComp->SetRelativeLocation(FVector(0.f, 0.f, TraceCharacterLayout::MeshOffsetZ));
+
+	// A pawn that was showing the fallback primitives (art half-installed) and then picks a character
+	// whose body IS imported gets the body. Rare, but the alternative is a pawn holding two looks.
+	MeshComp->SetVisibility(true);
+	bUsingSkeletalMesh = true;
+	if (FallbackBodyMesh != nullptr) { FallbackBodyMesh->SetVisibility(false); }
+	if (FallbackHeadMesh != nullptr) { FallbackHeadMesh->SetVisibility(false); }
+
+	ApplyBodyAnimInstance(MeshComp, WantedMesh, CharacterId, WantedAnimPath);
+
+	// The MIDs are per-slot and the slot COUNT is a property of the mesh (the Mannequin has 2,
+	// SK_Rocco has 10), so the team colour has to be rebuilt from scratch against the new body.
+	ApplyTeamColors();
+
+	if (bMeshChanged && Weapon != nullptr)
+	{
+		// The third-person knife is attached to a BONE BY NAME. Changing the asset under it leaves the
+		// attachment pointing at a name the new rig may not have, which is not a crash — it is a knife
+		// lying at the pawn's feet. The component rebuilds it against whatever this rig calls "hand_r".
+		Weapon->NotifyBodyMeshChanged();
+	}
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("%s body -> %s (character %s, yaw %.0f)"),
+		*GetNameSafe(this), *GetNameSafe(WantedMesh), *TraceCharacterRoster::NameFor(CharacterId), BodyMeshYaw);
+
+	return true;
+}
+
+void ATraceCharacter::ApplyBodyAnimInstance(USkeletalMeshComponent* MeshComp, USkeletalMesh* ForMesh,
+	uint8 CharacterId, const FString& BodyAnimClassPath)
+{
+	if (MeshComp == nullptr || ForMesh == nullptr)
+	{
+		return;
+	}
+
+	// *** AN ANIM BLUEPRINT BELONGS TO A SKELETON, NOT TO A MESH, AND THAT IS WHY THIS TAKES A PATH.
+	// *** ABP_Unarmed is compiled against the Mannequin's skeleton — root, pelvis, hand_r. SK_Rocco's
+	// bones are Hips1, Spine021, RightHand1 and not one name is shared, so handing ABP_Unarmed to a
+	// Rocco pawn does not animate it badly, it does not animate it at all. Each character that brings
+	// its own rig therefore brings its own class: Rocco's is Epic's own blend space RETARGETED onto
+	// SK_Rocco_Skeleton and baked to sequences by Scripts/retarget-rocco.sh, so he runs the same walk
+	// cycle everybody else does.
+	//
+	// EMPTY PATH IS THE NORMAL ANSWER: the Mannequin, and the nine characters wearing it, all want
+	// CharacterAnimClass, which is what this function used unconditionally before there was a second
+	// rig in the game.
+	FString AnimClassPath = BodyAnimClassPath;
+#if !UE_BUILD_SHIPPING
+	if (TraceCharacterBody::CVarBodyAnimIgnore.GetValueOnGameThread() != 0)
+	{
+		// The red arm. See the cvar: this is not a mutilation, it is the previous version of this
+		// function, and it is what put Rocco in a bind pose in the first place.
+		AnimClassPath.Reset();
+	}
+#endif
+
+	UClass* LoadedAnimClass = nullptr;
+	bool bWantedCharacterClass = false;
+	if (!AnimClassPath.IsEmpty())
+	{
+		bWantedCharacterClass = true;
+		// Soft by construction, exactly like the mesh path beside it: a clone that has run the import
+		// and not the retarget has the body and not this. TryLoadClass rather than a hard reference so
+		// that machine loses one character's animation instead of failing to start.
+		LoadedAnimClass = FSoftClassPath(AnimClassPath).TryLoadClass<UAnimInstance>();
+		if (LoadedAnimClass == nullptr)
+		{
+			TraceCharacterBody::ReportMissingBodyAnim(CharacterId,
+				FString::Printf(TEXT("%s did not load."), *AnimClassPath));
+		}
+	}
+	else
+	{
+		LoadedAnimClass = CharacterAnimClass.IsNull() ? nullptr : CharacterAnimClass.LoadSynchronous();
+	}
+
+	// THE SKELETON CHECK SURVIVES THE FIX, and it is worth saying why. Both sides are now expected to
+	// agree, so this should never fire — but the state it catches is a pawn of exactly the right
+	// shape, size, colour and position that simply never moves, which is invisible to a screenshot
+	// and to every other check in this file. Asking costs one pointer compare. Handing the class over
+	// regardless is not a crash either: the engine notices, clears the instance and logs once per
+	// pawn per spawn. This lets the game say the useful thing instead.
+	USkeleton* const MeshSkeleton = ForMesh->GetSkeleton();
+	USkeleton* AnimSkeleton = nullptr;
+	if (LoadedAnimClass != nullptr)
+	{
+		if (IAnimClassInterface* const AnimClassInterface = IAnimClassInterface::GetFromClass(LoadedAnimClass))
+		{
+			AnimSkeleton = AnimClassInterface->GetTargetSkeleton();
+		}
+	}
+
+	// A NULL AnimSkeleton means "could not tell" (not an anim blueprint generated class, or a class
+	// that does not carry its target). Try it and let the engine decide, which is exactly what this
+	// code did before there was anything to check — no behaviour change on the path that works.
+	const bool bCompatible = (LoadedAnimClass != nullptr)
+		&& (AnimSkeleton == nullptr || MeshSkeleton == nullptr || AnimSkeleton == MeshSkeleton);
+
+	if (bCompatible)
+	{
+		MeshComp->SetAnimationMode(EAnimationMode::AnimationBlueprint);
+		MeshComp->SetAnimInstanceClass(LoadedAnimClass);
+		return;
+	}
+
+	// Bind pose, and SAID OUT LOUD. A body that is the right shape and frozen is the single most
+	// deniable failure in this whole feature.
+	MeshComp->SetAnimationMode(EAnimationMode::AnimationCustomMode);
+	MeshComp->SetAnimInstanceClass(nullptr);
+
+	if (bWantedCharacterClass && LoadedAnimClass != nullptr)
+	{
+		// The class loaded and is bound to the WRONG skeleton — a stale retarget, or a path pointing
+		// at somebody else's rig. Different failure from "not retargeted yet", same visible result,
+		// so it goes through the same banner with its own sentence.
+		TraceCharacterBody::ReportMissingBodyAnim(CharacterId,
+			FString::Printf(TEXT("%s drives skeleton '%s', but that body is skinned to '%s'."),
+				*AnimClassPath, *GetNameSafe(AnimSkeleton), *GetNameSafe(MeshSkeleton)));
+	}
+
+	static bool bWarnedIncompatibleAnim = false;
+	if (!bWarnedIncompatibleAnim)
+	{
+		bWarnedIncompatibleAnim = true;
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[CharacterArt] %s is skinned to skeleton '%s', which is not the one %s drives ('%s'). ")
+			TEXT("That body is drawn in its BIND POSE and will not animate. A character with a rig of ")
+			TEXT("its own needs its own retargeted anim class: ./Scripts/retarget-rocco.sh bakes Rocco's."),
+			*GetNameSafe(ForMesh), *GetNameSafe(MeshSkeleton),
+			bWantedCharacterClass ? *AnimClassPath : *CharacterAnimClass.ToString(),
+			*GetNameSafe(AnimSkeleton));
+	}
+}
+
 void ATraceCharacter::BeginPlay()
 {
 	Super::BeginPlay();
@@ -2442,6 +3035,10 @@ void ATraceCharacter::BeginPlay()
 	}
 
 	ApplyTeamColors();
+
+	// First of four calls; see the declaration. This one is the only one that can be early enough on
+	// a listen server, and is far too early on a client — which is the whole reason there are four.
+	UpdateCharacterBodyMesh();
 
 	// Snapped, never blended: a pawn spawns without the Core, so the first frame must already be
 	// first person. Blending into it would fly every camera in the match forward from 450 uu back.
@@ -2512,6 +3109,11 @@ void ATraceCharacter::Tick(float DeltaSeconds)
 
 	ApplyRotationMode();
 
+	// *** THE ONE THAT CANNOT GO STALE. *** Every pawn, every machine, every frame — and one integer
+	// compare in the steady state, because the applied character id is remembered. This is what makes
+	// a late-arriving PlayerState, a mid-match character switch and a late joiner all the same case.
+	UpdateCharacterBodyMesh(/*bIsPoll=*/true);
+
 	// BEFORE UpdateViewBlend, and the order is load-bearing: this is what moves BaseEyeHeight for a
 	// slide, and UpdateViewBlend pins the spring arm to BaseEyeHeight. Running it after would leave
 	// the camera one frame behind the point the shot is built from for the whole descent, i.e. a
@@ -2540,6 +3142,10 @@ void ATraceCharacter::PossessedBy(AController* NewController)
 	// the rotation model. Snapped for the same reason as BeginPlay: a fresh pawn has no Core.
 	ApplyRotationMode();
 	UpdateViewBlend(0.f, /*bSnap=*/true);
+
+	// Server side, this is where a RESPAWN gets its body back: the new pawn is possessed by the same
+	// controller, carrying the same PlayerState, which already knows the character.
+	UpdateCharacterBodyMesh();
 }
 
 void ATraceCharacter::OnRep_PlayerState()
@@ -2549,6 +3155,11 @@ void ATraceCharacter::OnRep_PlayerState()
 	// Client side, the PlayerState pointer can arrive before or after the pawn, and its Team can
 	// arrive after that again. Every path that could learn the team ends up here.
 	ApplyTeamColors();
+
+	// And the character with it — though usually NOT YET, because the id is forwarded from an ability
+	// component that replicates separately from the PlayerState it hangs on. This call is the cheap
+	// early-out that catches the lucky ordering; Tick is what catches the rest.
+	UpdateCharacterBodyMesh();
 }
 
 // =================================================================================================
@@ -3204,6 +3815,7 @@ void ATraceCharacter::ApplyColorToSkeletalMesh(const FLinearColor& InColor, floa
 		return;
 	}
 
+	USkeletalMesh* const MIDSourceMesh = MeshComp->GetSkeletalMeshAsset();
 	const int32 NumSlots = MeshComp->GetNumMaterials();
 
 	// Built once and then reused, for the same reason as the static-mesh MIDs below: this runs on
@@ -3211,13 +3823,19 @@ void ATraceCharacter::ApplyColorToSkeletalMesh(const FLinearColor& InColor, floa
 	// trail of garbage. CreateDynamicMaterialInstance(Index) with no parent wraps whatever material
 	// is already in the slot, so Manny keeps his own textures and normal maps — this tints the
 	// existing material, it does not replace it with flat colour.
-	if (CharacterMIDs.Num() != NumSlots)
+	//
+	// KEYED ON THE MESH, not only on the slot count. A MID wraps ONE asset's material, so the honest
+	// question is "were these built for the body we are wearing", and two different bodies can agree
+	// on slot count (any future pair of bespoke rigs) while sharing none of their materials. The count
+	// stays in the test because a mesh can be reimported with more sections under the same pointer.
+	if (CharacterMIDs.Num() != NumSlots || CharacterMIDsMesh.Get() != MIDSourceMesh)
 	{
 		CharacterMIDs.Reset(NumSlots);
 		for (int32 SlotIndex = 0; SlotIndex < NumSlots; ++SlotIndex)
 		{
 			CharacterMIDs.Add(MeshComp->CreateDynamicMaterialInstance(SlotIndex));
 		}
+		CharacterMIDsMesh = MIDSourceMesh;
 	}
 
 	for (UMaterialInstanceDynamic* MID : CharacterMIDs)
@@ -6848,8 +7466,8 @@ void ATraceCharacter::UpdateCrouchPresentation(float DeltaSeconds)
 	CrouchLeanAlpha = FMath::FInterpTo(CrouchLeanAlpha, LeanTarget, DeltaSeconds,
 		FMath::Max(1.f, PoseSettings.SlidePoseBlendSpeed));
 
-	// Composed as Pose * Yaw, not as a rotator sum: the mesh already carries MeshYaw (-90) to point
-	// its +Y forward down the actor's +X, and adding a pitch to a rotator that is already yawed 90
+	// Composed as Pose * Yaw, not as a rotator sum: the mesh already carries BodyMeshYaw (-90 for the
+	// Mannequin) to point its authored forward down the actor's +X, and adding a pitch to a rotator that is already yawed 90
 	// degrees rolls the character sideways instead of tipping it back. Quaternion order in Unreal is
 	// "apply the right one first", so this yaws the mesh into place and THEN pitches and rolls it
 	// about the ACTOR's own Y and X axes, which are the axes a body leans and lists about.
@@ -6865,7 +7483,11 @@ void ATraceCharacter::UpdateCrouchPresentation(float DeltaSeconds)
 			const float RollDegrees = FMath::Clamp(PoseSettings.SlidePoseRollDegrees, -40.f, 40.f);
 			const float DropUU      = FMath::Clamp(PoseSettings.SlidePoseDropUU, 0.f, 80.f);
 
-			const FQuat YawQuat(FRotator(0.f, TraceCharacterLayout::MeshYaw, 0.f));
+			// BodyMeshYaw, not the Mannequin's constant: this pawn's body depends on which character
+			// is playing it, and Rocco's rig needs 0 where the Mannequin needs -90. Using the constant
+			// here would leave a Rocco player standing straight until his first slide and sideways
+			// forever after it.
+			const FQuat YawQuat(FRotator(0.f, BodyMeshYaw, 0.f));
 			const FQuat PoseQuat(FRotator(
 				CrouchLeanAlpha * LeanDegrees,   // pitch: positive tips the body BACK, feet leading
 				0.f,
@@ -7492,10 +8114,18 @@ namespace
 
 						// Component space: the actor's own travel across the pitch cannot contribute, so
 						// anything this measures came from the animation and nothing else.
+						//
+						// THE BONE NAMES ARE RESOLVED, NOT SPELLED. A pawn's body depends on which
+						// character is playing it and "foot_l"/"hand_r" are only the MANNEQUIN's names —
+						// on Rocco's rig they are "LeftFoot1"/"RightHand1". Asking for a bone this rig
+						// does not have returns the component origin, unmoving, i.e. this probe would
+						// report "not animating" about a character that was.
 						if (MeshComp->GetSkinnedAsset() != nullptr)
 						{
-							FootBounds += MeshComp->GetSocketTransform(TEXT("foot_l"), RTS_Component).GetLocation();
-							HandBounds += MeshComp->GetSocketTransform(TEXT("hand_r"), RTS_Component).GetLocation();
+							const FName FootBone = Subject->ResolveBodyBoneName(TEXT("foot_l"));
+							const FName HandBone = Subject->ResolveBodyBoneName(TEXT("hand_r"));
+							FootBounds += MeshComp->GetSocketTransform(FootBone, RTS_Component).GetLocation();
+							HandBounds += MeshComp->GetSocketTransform(HandBone, RTS_Component).GetLocation();
 							if (Samples == 0)
 							{
 								FirstSampleTime = Elapsed;
@@ -7576,6 +8206,583 @@ namespace
 	 * doc, whose radii are all in metres - so the metres value is printed beside it on every line.
 	 * Doing that conversion here, once, is the whole point: it is the arithmetic the defect hides in.
 	 */
+	/**
+	 * Trace.Characters.BodyMesh
+	 *
+	 * "WHAT BODY IS EACH PAWN DRAWING, AND WHICH CHARACTER DOES ITS PLAYERSTATE SAY IT IS?"
+	 *
+	 * THE TWO HALVES ARE THE WHOLE POINT. Either one alone is useless: a log line saying SK_Rocco
+	 * loaded proves nothing about the pawn a Rocco player is drawn as on YOUR machine, and a
+	 * screenshot of a grey humanoid proves nothing about whose pawn it is. This prints them on the
+	 * same line, per pawn, and compares them.
+	 *
+	 * *** RUN IT ON THE MACHINE THAT IS NOT THE ONE THAT SPAWNED THE PAWN. *** "Shows to others" is a
+	 * statement about REMOTE pawns, and the bug this exists to catch — the PlayerState and its ability
+	 * component arriving after the pawn, so a once-only apply reads "no character" — cannot happen on
+	 * the server, where all three exist before BeginPlay. The ROLE column is therefore the first thing
+	 * to read: a run whose every row says Authority has not tested the interesting case. It reports
+	 * on every ATraceCharacter in the world, bots included, which is what makes a listen server a
+	 * useful place to run it: a bot's pawn is remote-flavoured in every way that matters here.
+	 *
+	 * THREE VERDICTS PER PAWN, BECAUSE THERE ARE THREE WAYS TO BE WRONG. The MESH column asks whether
+	 * the pawn is wearing the body its character calls for; the ANIM column asks whether it is running
+	 * the anim class that goes WITH that body; the MATS column asks whether it is being drawn in that
+	 * body's OWN materials. They fail independently, and the last two are the ones no screenshot can
+	 * settle: a Rocco wearing SK_Rocco with no anim instance is the right shape, the right size and
+	 * frozen solid, which in a still frame is indistinguishable from a Rocco standing in his idle —
+	 * and a Rocco whose first two slots are still wearing the Mannequin's material is the right SHAPE
+	 * and the right COLOUR, because the team tint is written into every MID whatever its parent.
+	 *
+	 * EACH VERDICT IS A COMPARISON, NOT A DESCRIPTION, and either can go RED:
+	 *   FAIL   the pawn is drawing a body — or running an anim class — its character did not ask for.
+	 *   SKIP   that asset is not on this machine (a fresh clone that has not run the import, or has
+	 *          imported and not retargeted). Not a defect here — each has its own banner and its own
+	 *          on-screen warning.
+	 *   PASS   everything matches, and at least one pawn was checked.
+	 *
+	 * THREE RED ARMS, ONE PER COLUMN:
+	 *   Trace.Characters.BodyMeshEventsOnly 1  restores the obvious, wrong implementation of the body
+	 *     swap (hook the lifecycle events, apply once). Measured: with it on, a connecting client
+	 *     reported "FAIL ... says=ROCCO applied=MANNEQUIN" and RESULT *** FAIL ***; with it off, the
+	 *     same run reported PASS for all ten pawns including a role=Simulated Rocco.
+	 *   Trace.Characters.BodyAnimIgnore 1      offers every pawn Epic's ABP_Unarmed, as this game did
+	 *     before the retarget existed, which puts Rocco back in the bind pose this feature was
+	 *     reported broken in.
+	 *   Trace.Characters.BodyMeshKeepOverrides 1  stops the body swap from clearing the component's
+	 *     material overrides, restoring the state where a pawn that has changed body draws some slots
+	 *     in the previous body's materials.
+	 * A harness whose red and green arms agree is not measuring its rule.
+	 */
+	FAutoConsoleCommand CmdCharactersBodyMesh(
+		TEXT("Trace.Characters.BodyMesh"),
+		TEXT("Trace, dev only. Per pawn: which character its PlayerState says it is, and which body it is "
+		     "actually drawing. FAILS when the two disagree. Red arm: Trace.Characters.BodyMeshEventsOnly 1."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			UWorld* const World = FindDebugGameWorld();
+			if (World == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[BodyMesh] no game world."));
+				return;
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[BodyMesh] ===== what every pawn is wearing ====="));
+			// Every red arm's value goes in the header, so a log can never be read as green when one of
+			// them was on — the arms are set from the command line and leave no other trace in the file.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BodyMesh] roster source: %s   red arms: EventsOnly=%d AnimIgnore=%d KeepOverrides=%d"),
+				TraceCharacterRoster::CurrentSourceName(),
+				TraceCharacterBody::CVarBodyMeshEventsOnly.GetValueOnGameThread(),
+				TraceCharacterBody::CVarBodyAnimIgnore.GetValueOnGameThread(),
+				TraceCharacterBody::CVarBodyMeshKeepOverrides.GetValueOnGameThread());
+
+			int32 Checked = 0;
+
+			// *** HOW MANY PAWNS ACTUALLY EXERCISE THE FEATURE. *** Checked counts Mannequins too, so a
+			// match in which nobody picked a character with a bespoke body would print PASS having proved
+			// nothing about the thing under test - the most expensive kind of green, and the one this
+			// file's own comment two screens down warns about while not actually guarding against it.
+			int32 Bespoke = 0;
+			int32 Failed = 0;
+			int32 Skipped = 0;
+
+			// The anim half is counted SEPARATELY from the mesh half. They fail independently and for
+			// different reasons — a pawn can wear exactly the right body and be frozen in it — and a
+			// single number would let one hide inside the other.
+			int32 AnimChecked = 0;
+			int32 AnimFailed = 0;
+			int32 AnimSkipped = 0;
+
+			// And the material half, counted separately again for the same reason: a pawn can wear the
+			// right body, run the right anim class, and still be drawn in the PREVIOUS body's materials.
+			int32 MatChecked = 0;
+			int32 MatFailed = 0;
+
+			for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+			{
+				ATraceCharacter* const Pawn = *It;
+				if (Pawn == nullptr || !IsValid(Pawn))
+				{
+					continue;
+				}
+
+				const USkeletalMeshComponent* const MeshComp = Pawn->GetMesh();
+				const USkeletalMesh* const DrawnMesh = (MeshComp != nullptr) ? MeshComp->GetSkeletalMeshAsset() : nullptr;
+
+				// WHAT THE PAWN'S OWN PLAYERSTATE SAYS — the replicated selection, asked the same way
+				// the apply asks it, so the harness cannot pass by reading a different question.
+				uint8 SelectedId = TraceCharacterRoster::NoneId;
+				const ATracePlayerState* const TracePS = Pawn->GetPlayerState<ATracePlayerState>();
+				if (TracePS != nullptr && TraceCharacterRoster::IsValidId(TracePS->GetSelectedCharacter()))
+				{
+					SelectedId = TracePS->GetSelectedCharacter();
+				}
+
+				// WHAT THAT CHARACTER CALLS FOR — resolved from the roster, i.e. from the assets when
+				// the assets are being served and from the C++ table when they are not.
+				FString WantedPath;
+				FString WantedAnimPath;
+				if (const TraceCharacterRoster::FTraceCharacterEntry* Row = TraceCharacterRoster::Find(SelectedId))
+				{
+					if (Row->BodyMeshPath != nullptr && Row->BodyMeshPath[0] != TEXT('\0'))
+					{
+						WantedPath = Row->BodyMeshPath;
+						WantedAnimPath = (Row->BodyAnimClassPath != nullptr) ? Row->BodyAnimClassPath : TEXT("");
+					}
+				}
+
+				const TCHAR* const RoleName =
+					(Pawn->GetLocalRole() == ROLE_Authority)        ? TEXT("Authority")
+					: (Pawn->GetLocalRole() == ROLE_AutonomousProxy) ? TEXT("Autonomous")
+					: TEXT("Simulated");
+
+				const FName HandBone = Pawn->ResolveBodyBoneName(TEXT("hand_r"));
+				const UAnimInstance* const AnimInstance = (MeshComp != nullptr) ? MeshComp->GetAnimInstance() : nullptr;
+
+				// The verdict for THIS pawn.
+				const TCHAR* Verdict = TEXT("PASS");
+				if (WantedPath.IsEmpty())
+				{
+					// The Mannequin is what this character calls for. Matching means the pawn is drawing
+					// the mesh CharacterMeshAsset resolved to, which is what "no bespoke body" looks like.
+					// COMPARE THE MESH, not just the latch. AppliedBodyCharacterId is written by the
+					// apply itself and is KEPT EVEN WHEN THE APPLY FAILED (see the note on it), so a
+					// test made only of that latch reduces to "the apply ran once and something is
+					// drawn" and would pass on a pawn wearing the wrong body entirely.
+					const FString DrawnManneqPath = (DrawnMesh != nullptr)
+						? FSoftObjectPath(DrawnMesh).ToString() : FString();
+					const bool bIsMannequin =
+						DrawnManneqPath == FString(TraceCharacterAssets::MannequinMesh);
+
+					if (DrawnMesh != nullptr && bIsMannequin
+						&& Pawn->GetAppliedBodyCharacterId() == SelectedId)
+					{
+						Verdict = TEXT("PASS");
+						++Checked;
+					}
+					else if (DrawnMesh == nullptr)
+					{
+						Verdict = TEXT("SKIP");   // art not imported at all; the banner covers it
+						++Skipped;
+					}
+					else
+					{
+						Verdict = TEXT("FAIL");
+						++Failed;
+					}
+				}
+				else
+				{
+					const FString DrawnPath = (DrawnMesh != nullptr)
+						? FSoftObjectPath(DrawnMesh).ToString() : FString(TEXT("<none>"));
+
+					if (DrawnPath == WantedPath)
+					{
+						Verdict = TEXT("PASS");
+						++Checked;
+						++Bespoke;
+					}
+					else if (!FPackageName::DoesPackageExist(FPackageName::ObjectPathToPackageName(WantedPath)))
+					{
+						// The import has not been run here. NOT a failure of the wiring, and saying so is
+						// the difference between this harness being trusted and being ignored.
+						Verdict = TEXT("SKIP");
+						++Skipped;
+					}
+					else
+					{
+						Verdict = TEXT("FAIL");
+						++Failed;
+					}
+				}
+
+				// *** THE HALF A SCREENSHOT CANNOT CHECK. *** A pawn wearing the right mesh with no
+				// anim instance is the right shape, the right size and completely frozen; that is the
+				// state this whole retarget exists to end, and it looks identical to a healthy pawn in
+				// any still frame. So the class on the component is compared to the class the roster
+				// names, by path.
+				const UClass* const DrawnAnimClass = (AnimInstance != nullptr) ? AnimInstance->GetClass() : nullptr;
+				const FString DrawnAnimPath = (DrawnAnimClass != nullptr)
+					? FSoftClassPath(DrawnAnimClass).ToString() : FString();
+
+				const TCHAR* AnimVerdict = TEXT("-");
+				if (!WantedAnimPath.IsEmpty())
+				{
+					if (DrawnAnimPath == WantedAnimPath)
+					{
+						AnimVerdict = TEXT("PASS");
+						++AnimChecked;
+					}
+					else if (!FPackageName::DoesPackageExist(FPackageName::ObjectPathToPackageName(WantedAnimPath)))
+					{
+						// Scripts/retarget-rocco.sh has not been run here. The banner and the on-screen
+						// line already say so; this is not a defect in the wiring.
+						AnimVerdict = TEXT("SKIP");
+						++AnimSkipped;
+					}
+					else
+					{
+						AnimVerdict = TEXT("FAIL");
+						++AnimFailed;
+					}
+				}
+
+				// *** THE THIRD WAY TO BE WRONG, AND THE ONE THE MESH COLUMN CANNOT SEE. *** A material
+				// override lives on the COMPONENT, not on the mesh, and SetSkeletalMeshAsset does not
+				// clear it — so an override authored for the previous body wins, per slot index, over
+				// the new asset's own material. A pawn can therefore be drawing exactly the right body
+				// through the wrong materials: Rocco's first two sections in M_Mannequin, or a
+				// Mannequin wearing Rocco's placeholder after a switch back. The team tint hides it
+				// perfectly, since every MID is given the same colour whatever its parent, which is why
+				// this has to be a comparison and not a screenshot. Each slot's material is walked back
+				// through its MID parents and the root is required to be what the DRAWN asset names.
+				const TCHAR* MatVerdict = TEXT("-");
+				int32 StaleSlots = 0;
+				if (MeshComp != nullptr && DrawnMesh != nullptr)
+				{
+					const TArray<FSkeletalMaterial>& AssetMaterials = DrawnMesh->GetMaterials();
+					const int32 SlotCount = MeshComp->GetNumMaterials();
+					for (int32 SlotIndex = 0; SlotIndex < SlotCount; ++SlotIndex)
+					{
+						const UMaterialInterface* Root = MeshComp->GetMaterial(SlotIndex);
+						// Bounded rather than while(true): a corrupt parent chain must not hang a debug
+						// command. Nothing here nests deeper than MID -> instance -> instance -> material.
+						for (int32 Hops = 0; Hops < 8; ++Hops)
+						{
+							const UMaterialInstanceDynamic* const AsMID = Cast<UMaterialInstanceDynamic>(Root);
+							if (AsMID == nullptr) { break; }
+							Root = AsMID->Parent;
+						}
+
+						const UMaterialInterface* const FromAsset = AssetMaterials.IsValidIndex(SlotIndex)
+							? AssetMaterials[SlotIndex].MaterialInterface : nullptr;
+						if (FromAsset != nullptr && Root != FromAsset)
+						{
+							++StaleSlots;
+							UE_LOG(LogTraceGame, Error,
+								TEXT("[BodyMesh]        slot %d draws %s but %s names %s"),
+								SlotIndex, *GetNameSafe(Root), *GetNameSafe(DrawnMesh), *GetNameSafe(FromAsset));
+						}
+					}
+
+					if (StaleSlots > 0) { MatVerdict = TEXT("FAIL"); ++MatFailed; }
+					else                { MatVerdict = TEXT("PASS"); ++MatChecked; }
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BodyMesh] %-4s %-22s role=%-10s local=%d  says=%-9s applied=%-9s"),
+					Verdict, *GetNameSafe(Pawn), RoleName, Pawn->IsLocallyControlled() ? 1 : 0,
+					*TraceCharacterRoster::NameFor(SelectedId),
+					*TraceCharacterRoster::NameFor(Pawn->GetAppliedBodyCharacterId()));
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BodyMesh]        wants=%s"),
+					WantedPath.IsEmpty() ? TEXT("(the Mannequin)") : *WantedPath);
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BodyMesh]        anim %-4s wants=%s"),
+					AnimVerdict,
+					WantedAnimPath.IsEmpty() ? TEXT("(ABP_Unarmed)") : *WantedAnimPath);
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BodyMesh]        draws=%s  yaw=%.1f  anim=%s  hand_r->%s  slots=%d  visible=%d  mats %s"),
+					*GetNameSafe(DrawnMesh),
+					(MeshComp != nullptr) ? MeshComp->GetRelativeRotation().Yaw : 0.f,
+					(AnimInstance != nullptr) ? *GetNameSafe(AnimInstance->GetClass()) : TEXT("<none: bind pose>"),
+					HandBone.IsNone() ? TEXT("<none>") : *HandBone.ToString(),
+					(MeshComp != nullptr) ? MeshComp->GetNumMaterials() : 0,
+					(MeshComp != nullptr && MeshComp->IsVisible()) ? 1 : 0,
+					MatVerdict);
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BodyMesh] anim classes: %d correct, %d wrong, %d not retargeted on this machine "
+				     "(red arm Trace.Characters.BodyAnimIgnore = %d)."),
+				AnimChecked, AnimFailed, AnimSkipped,
+				TraceCharacterBody::CVarBodyAnimIgnore.GetValueOnGameThread());
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BodyMesh] materials: %d pawn(s) drawn entirely in their own body's materials, %d carrying "
+				     "an override left behind by a previous body."),
+				MatChecked, MatFailed);
+
+			// A harness that reports PASS having looked at nothing is the most expensive kind of green.
+			if (Failed > 0 || AnimFailed > 0 || MatFailed > 0)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[BodyMesh] RESULT: *** FAIL *** - %d pawn(s) are drawing a body their character did not ask "
+					     "for, %d are not running the anim class it calls for, and %d are wearing another body's "
+					     "materials (%d/%d correct, %d/%d skipped)."),
+					Failed, AnimFailed, MatFailed, Checked, AnimChecked, Skipped, AnimSkipped);
+			}
+			else if (Checked == 0)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[BodyMesh] RESULT: NOT PROVEN - no pawn could be checked (%d skipped). Either no characters "
+					     "have spawned yet or the art is not imported on this machine."), Skipped);
+			}
+			else if (Bespoke == 0)
+			{
+				// Every pawn matched, and every pawn was a Mannequin. That is a real result about the
+				// FALLBACK - nine of the ten characters live there - but it says nothing about the
+				// feature this command exists to check, so it must not read as PASS.
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[BodyMesh] RESULT: NOT PROVEN - %d pawn(s) all match, but NONE of them wears a bespoke "
+					     "body, so the swap itself was never exercised. Put somebody on a character that has one "
+					     "(Trace.Characters.Select) and run this again."), Checked);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BodyMesh] RESULT: PASS - %d pawn(s) are drawing exactly the body their character calls for, "
+					     "%d of them are running the anim class that goes with it, and %d are in that body's own "
+					     "materials (%d/%d skipped)."),
+					Checked, AnimChecked, MatChecked, Skipped, AnimSkipped);
+			}
+		}));
+
+	/**
+	 * Trace.Characters.Watch <CharacterId> [Seconds] [DistanceUU]
+	 *
+	 * *** THE CAMERA WORK, AND IT EXISTS BECAUSE THE DELIVERABLE IS A PICTURE. ***
+	 *
+	 * "Any player using Rocco shows to others with that model" is a claim about a pawn somebody ELSE
+	 * is driving, and the only honest evidence for it is a frame of that pawn taken from a camera
+	 * that does not own it. Getting one headlessly is the hard part of the whole task: the local
+	 * player's own body is hidden from their own camera, so the subject has to be a bot or a second
+	 * client; a bot is a moving target; and -TraceExec fires its whole list at ONE instant, so a
+	 * single teleport is framing a pawn that has run off by the time the shutter opens.
+	 *
+	 * So this is a FOLLOW, not a pose. Every tick for @p Seconds it re-finds the subject and flies a
+	 * free camera behind and off its shoulder, aimed at its chest — which keeps a running bot in
+	 * frame for as long as -TraceAutoShotRepeat keeps firing. Two or three frames a second apart of
+	 * the same bot are also the proof that it is ANIMATING and not sliding, which is the one thing a
+	 * single screenshot can never settle.
+	 *
+	 * *** A FREE CAMERA, NOT A TELEPORTED PAWN, AND THAT IS NOT A DETAIL. *** The first version of
+	 * this command moved the local pawn. That works on a listen server and silently does not work on
+	 * a CLIENT, where the server owns the pawn's position and corrects every teleport within a frame
+	 * or two — so the shutter opened on an empty corridor. A client is exactly where this evidence
+	 * has to come from, because "what other players see" is a claim about a role=Simulated pawn. A
+	 * view target is local, is never corrected, and leaves the match undisturbed.
+	 *
+	 * IT WATCHES A BODY, NOT A NAME. The subject is chosen by GetAppliedBodyCharacterId — what the
+	 * pawn is actually WEARING — rather than by its PlayerState's selection, so a run where the body
+	 * never got applied finds nothing and says so, instead of pointing the camera confidently at a
+	 * Mannequin.
+	 *
+	 * Trace.Arena.Pose is the manual version of this and stays: it takes literal coordinates and is
+	 * the right tool for photographing the ARENA, which does not move.
+	 */
+	struct FCharacterWatchState
+	{
+		uint8 CharacterId = 0;
+		float Remaining = 0.f;
+		float Distance = 260.f;
+		int32 Frames = 0;
+		int32 FramesWithSubject = 0;
+		TWeakObjectPtr<ACameraActor> Camera;
+	};
+
+	FAutoConsoleCommand CmdCharactersWatch(
+		TEXT("Trace.Characters.Watch"),
+		TEXT("Trace, dev only. Trace.Characters.Watch <CharacterId> [Seconds] [DistanceUU] - point the local "
+		     "view at the nearest pawn WEARING that character's body, so a headless run can photograph what "
+		     "other players see. Pair with -TraceAutoShot/-TraceAutoShotRepeat."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			FCharacterWatchState State;
+			State.CharacterId = (Args.Num() > 0)
+				? static_cast<uint8>(FMath::Clamp(FCString::Atoi(*Args[0]), 0, 255))
+				: TraceCharacterRoster::FirstId;
+			State.Remaining = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 0.5f, 120.f) : 12.f;
+			State.Distance  = (Args.Num() > 2) ? FMath::Clamp(FCString::Atof(*Args[2]), 80.f, 2000.f) : 260.f;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Watch] following the nearest pawn wearing %s for %.1fs at %.0fuu."),
+				*TraceCharacterRoster::NameFor(State.CharacterId), State.Remaining, State.Distance);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) mutable -> bool
+				{
+					State.Remaining -= DeltaTime;
+					const bool bLastFrame = (State.Remaining <= 0.f);
+					++State.Frames;
+
+					UWorld* const World = FindDebugGameWorld();
+					APlayerController* Viewer = nullptr;
+					if (World != nullptr)
+					{
+						for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+						{
+							APlayerController* const PC = It->Get();
+							if (PC != nullptr && PC->IsLocalController())
+							{
+								Viewer = PC;
+								break;
+							}
+						}
+					}
+					if (World == nullptr || Viewer == nullptr)
+					{
+						return !bLastFrame;
+					}
+
+					// NEAREST TO THE VIEWER, so a ten-pawn match cannot pick one across the arena and
+					// spend the whole capture looking at a wall — but A MOVING ONE FIRST.
+					//
+					// THAT PREFERENCE IS FRAMING, NOT SCORING, and the distinction matters. A locomotion
+					// retarget can only be SEEN on a subject that is walking: the nearest Rocco spent one
+					// whole capture idling against a wall, and thirty seconds of a standing figure says
+					// nothing about whether it would move if it tried. Nothing here decides a verdict —
+					// Trace.Characters.BodyMesh does that, over every pawn, moving or not.
+					constexpr double MovingUUPerSecond = 100.0;
+					const FVector From = Viewer->GetPawn() != nullptr
+						? Viewer->GetPawn()->GetActorLocation() : Viewer->GetFocalLocation();
+					ATraceCharacter* Subject = nullptr;
+					double Best = TNumericLimits<double>::Max();
+					bool bBestIsMoving = false;
+					for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+					{
+						ATraceCharacter* const Candidate = *It;
+						if (Candidate == nullptr || !IsValid(Candidate) || Candidate == Viewer->GetPawn())
+						{
+							continue;
+						}
+						if (Candidate->GetAppliedBodyCharacterId() != State.CharacterId)
+						{
+							continue;
+						}
+						const bool bMoving = Candidate->GetVelocity().Size2D() > MovingUUPerSecond;
+						if (bBestIsMoving && !bMoving)
+						{
+							continue;
+						}
+						const double Away = FVector::Dist(Candidate->GetActorLocation(), From);
+						if (Subject == nullptr || (bMoving && !bBestIsMoving) || Away < Best)
+						{
+							Best = Away;
+							bBestIsMoving = bMoving;
+							Subject = Candidate;
+						}
+					}
+
+					if (Subject == nullptr)
+					{
+						if (bLastFrame)
+						{
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[Watch] no pawn is WEARING %s (checked %d frame(s)). Either nobody picked it "
+								     "or the body was never applied — Trace.Characters.BodyMesh says which."),
+								*TraceCharacterRoster::NameFor(State.CharacterId), State.Frames);
+						}
+					}
+					else
+					{
+						++State.FramesWithSubject;
+
+						// *** A FREE CAMERA, NOT A TELEPORTED PAWN, AND THIS IS THE WHOLE REASON THE
+						// FIRST VERSION OF THIS COMMAND PHOTOGRAPHED EMPTY ROOMS. *** Moving the local
+						// pawn works on a listen server and does NOT work on a client: the server owns
+						// that pawn's position, so every teleport is corrected away within a frame or
+						// two and the shutter opens on wherever the server thinks you are. And a client
+						// is exactly where this evidence has to come from — "what OTHER players see" is
+						// a claim about a role=Simulated pawn. A view target is purely local, is never
+						// corrected, and disturbs the match not at all: nobody is shoved into a bot's
+						// face to take its picture.
+						ACameraActor* Camera = State.Camera.Get();
+						if (Camera == nullptr)
+						{
+							FActorSpawnParameters Params;
+							Params.ObjectFlags |= RF_Transient;
+							Camera = World->SpawnActor<ACameraActor>(
+								ACameraActor::StaticClass(), FTransform::Identity, Params);
+							State.Camera = Camera;
+						}
+
+						// AHEAD OF THE SUBJECT AND OFF TO ONE SIDE, LOOKING BACK AT IT. Filming from
+						// behind was the obvious choice and it is the wrong one: these bots strafe and
+						// dash at 800-1150 uu/s, so a camera pinned to the subject's BACK is left
+						// staring at empty floor the moment it changes direction, and the whole point of
+						// the capture is a subject in motion. Placed down its line of travel instead, a
+						// runner comes toward the lens and stays framed. Facing is the fallback for a
+						// subject that is standing still, where there is no line of travel to use.
+						const FVector Chest = Subject->GetActorLocation() + FVector(0.f, 0.f, 40.f);
+						const FVector Travel = Subject->GetVelocity().GetSafeNormal2D();
+						const FVector Along = Travel.IsNearlyZero()
+							? Subject->GetActorForwardVector() * -1.f : Travel;
+						const FVector Spot = Subject->GetActorLocation()
+							+ Along * State.Distance
+							+ FVector::CrossProduct(FVector::UpVector, Along) * (State.Distance * 0.45f)
+							+ FVector(0.f, 0.f, 80.f);
+						const FRotator Aim = (Chest - Spot).Rotation();
+
+						if (Camera != nullptr)
+						{
+							Camera->SetActorLocationAndRotation(Spot, Aim);
+							if (Viewer->GetViewTarget() != Camera)
+							{
+								Viewer->SetViewTargetWithBlend(Camera, 0.f);
+							}
+						}
+
+						// *** THE FRAME HAS TO SAY WHICH PAWN IT IS. *** Ten pawns are on this map and
+						// several are in shot at once; "the detailed one on the left" is somebody
+						// squinting at a screenshot, which is the kind of evidence this project has been
+						// burned by. So the subject is boxed and captioned IN THE PICTURE, with the mesh
+						// and the anim class read off its own component.
+						const USkeletalMeshComponent* const SubjectMesh = Subject->GetMesh();
+						const UAnimInstance* const SubjectAnim =
+							(SubjectMesh != nullptr) ? SubjectMesh->GetAnimInstance() : nullptr;
+#if ENABLE_DRAW_DEBUG
+						DrawDebugBox(World, Chest, FVector(40.f, 40.f, 90.f), FQuat::Identity,
+							FColor::Green, /*bPersistent=*/false, /*LifeTime=*/0.f, /*DepthPriority=*/0,
+							/*Thickness=*/2.f);
+						DrawDebugString(World, FVector(0.f, 0.f, 130.f),
+							FString::Printf(TEXT("%s  role=%s\nbody %s\nanim %s\n%.0f uu/s"),
+								*GetNameSafe(Subject),
+								(Subject->GetLocalRole() == ROLE_Authority) ? TEXT("Authority")
+									: (Subject->GetLocalRole() == ROLE_AutonomousProxy) ? TEXT("Autonomous")
+									: TEXT("Simulated"),
+								*GetNameSafe((SubjectMesh != nullptr) ? SubjectMesh->GetSkeletalMeshAsset() : nullptr),
+								(SubjectAnim != nullptr) ? *GetNameSafe(SubjectAnim->GetClass()) : TEXT("<none: bind pose>"),
+								Subject->GetVelocity().Size2D()),
+							Subject, FColor::Green, /*Duration=*/0.f, /*bDrawShadow=*/true, /*FontScale=*/1.4f);
+#endif
+
+						if (bLastFrame)
+						{
+							UE_LOG(LogTraceGame, Display,
+								TEXT("[Watch] framed %s (role=%s) for %d of %d frame(s): body=%s anim=%s speed=%.0fuu/s"),
+								*GetNameSafe(Subject),
+								(Subject->GetLocalRole() == ROLE_Authority) ? TEXT("Authority")
+									: (Subject->GetLocalRole() == ROLE_AutonomousProxy) ? TEXT("Autonomous")
+									: TEXT("Simulated"),
+								State.FramesWithSubject, State.Frames,
+								*GetNameSafe((SubjectMesh != nullptr) ? SubjectMesh->GetSkeletalMeshAsset() : nullptr),
+								(SubjectAnim != nullptr) ? *GetNameSafe(SubjectAnim->GetClass()) : TEXT("<none: bind pose>"),
+								Subject->GetVelocity().Size2D());
+						}
+					}
+
+					// PUT THE VIEW BACK. A capture that left the player watching a bot for the rest of
+					// the match would be a debug command that breaks the game it is measuring.
+					if (bLastFrame)
+					{
+						if (Viewer->GetPawn() != nullptr)
+						{
+							Viewer->SetViewTargetWithBlend(Viewer->GetPawn(), 0.f);
+						}
+						if (ACameraActor* const Camera = State.Camera.Get())
+						{
+							Camera->Destroy();
+						}
+					}
+					return !bLastFrame;
+				}),
+				0.f);
+		}));
+
 	FAutoConsoleCommand CmdViewModelCensus(
 		TEXT("Trace.ViewModel.Census"),
 		TEXT("Trace.ViewModel.Census [NearbyRadiusUU] - name and measure every primitive drawn at the local player's hands."),

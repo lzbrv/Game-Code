@@ -39,6 +39,8 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
+#include "Animation/AnimInstance.h"
+#include "Engine/SkeletalMesh.h"
 #include "Math/Color.h"
 #include "UObject/ObjectMacros.h"
 
@@ -128,6 +130,60 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Identity")
 	FLinearColor AccentColor = FLinearColor::White;
+
+	// =============================================================================================
+	// THE BODY OTHER PLAYERS SEE
+	// =============================================================================================
+
+	/**
+	 * The skeletal mesh this character's pawn is drawn with ON EVERY MACHINE — the answer to "what
+	 * do the other nine players see when I pick Rocco". NULL means Epic's Mannequin, and null is the
+	 * normal, shipped value for nine of the ten.
+	 *
+	 * *** SOFT, FOR THE SAME REASON ATraceCharacter::CharacterMeshAsset IS SOFT. *** Character art
+	 * is imported per developer (Scripts/import-rocco.sh, Scripts/import-mannequin.sh) and is
+	 * legitimately absent on a fresh clone. A hard reference here would make the ASSET fail to load
+	 * on that machine, which would take the whole roster down to the C++ table — a missing body would
+	 * silently cost every character its card. Soft, it costs exactly the one pawn its body, and says
+	 * so through ETraceCharacterArtStatus.
+	 *
+	 * THIS IS NOT TUNING AND IT DOES NOT BREAK THE RULE AT THE TOP OF THIS FILE. It is not a number
+	 * the game enforces; it is identity, the same kind of fact as DisplayName and AccentColor, and
+	 * like both of those it is generated from the C++ table in Core/TraceCharacterRoster.cpp and
+	 * compared back against it field by field by Trace.VerifyCharacterData.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Body")
+	TSoftObjectPtr<USkeletalMesh> BodyMesh;
+
+	/**
+	 * Degrees of yaw that turn BodyMesh's authored forward onto the actor's +X. -90 for Epic's
+	 * Mannequin (which is authored facing +Y) and therefore the default; 0 for Rocco's rig, which is
+	 * authored facing +X. MEASURED per rig — see TraceCharacterRoster::FTraceCharacterEntry::BodyMeshYaw
+	 * for how, and for why copying the Mannequin's value onto a new mesh is the most likely way this
+	 * ends up looking broken.
+	 *
+	 * Meaningless while BodyMesh is null (the Mannequin brings its own -90), and left at -90 there so
+	 * the value is never a surprise if a mesh is added later.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Body",
+		meta = (ClampMin = "-180.0", ClampMax = "180.0"))
+	float BodyMeshYaw = -90.f;
+
+	/**
+	 * The anim blueprint class that drives BodyMesh. NULL means Epic's ABP_Unarmed, which is the
+	 * right answer for every character whose BodyMesh is also null.
+	 *
+	 * *** A BODY WITHOUT ITS OWN ANIM CLASS IS A BIND POSE. *** An anim blueprint is compiled
+	 * against a SKELETON, so a character with a rig of its own needs a class built for that rig;
+	 * ABP_Unarmed drives the Mannequin's root/pelvis/hand_r and cannot touch a bone called Hips1.
+	 * Rocco's class is the retarget of ABP_Unarmed onto his skeleton, produced by
+	 * Scripts/retarget-rocco.sh — see TraceCharacterRoster::FTraceCharacterEntry::BodyAnimClassPath.
+	 *
+	 * SOFT, for the same reason BodyMesh is soft: the retarget is run per developer and is
+	 * legitimately absent on a fresh clone.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Body")
+	TSoftClassPtr<UAnimInstance> BodyAnimClass;
 
 	// =============================================================================================
 	// THE THREE SLOTS

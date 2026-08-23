@@ -197,6 +197,18 @@ bool UTraceCharacterDefinition::CopyFallbackValues(UTraceCharacterDefinition* Ta
 	Target->DisplayName = Row.Name;
 	Target->AccentColor = Row.Accent;
 
+	// An EMPTY path becomes a NULL soft pointer, not a soft pointer to "" — the two are the same
+	// thing to the runtime but not to a diff, and null is what the details panel shows as "None".
+	// Nothing is loaded here: assigning a soft pointer never touches the package, which is exactly
+	// what lets the generator run on a machine where the character art was never imported.
+	Target->BodyMesh = (Row.BodyMeshPath != nullptr && Row.BodyMeshPath[0] != TEXT('\0'))
+		? TSoftObjectPtr<USkeletalMesh>(FSoftObjectPath(Row.BodyMeshPath))
+		: TSoftObjectPtr<USkeletalMesh>();
+	Target->BodyMeshYaw = Row.BodyMeshYaw;
+	Target->BodyAnimClass = (Row.BodyAnimClassPath != nullptr && Row.BodyAnimClassPath[0] != TEXT('\0'))
+		? TSoftClassPtr<UAnimInstance>(FSoftClassPath(Row.BodyAnimClassPath))
+		: TSoftClassPtr<UAnimInstance>();
+
 	Target->MovementSlot.DisplayName.Reset();     // §6 never named the movement ability
 	Target->MovementSlot.Description = Row.Movement;
 	Target->MovementSlot.CooldownSeconds = 0.f;
@@ -271,6 +283,37 @@ bool UTraceCharacterDefinition::MatchesFallback(UTraceCharacterDefinition* Defin
 		OutMismatch = FString::Printf(TEXT("AccentColor: asset %s != C++ %s"),
 			*Definition->AccentColor.ToString(), *Row.Accent.ToString());
 		return false;
+	}
+
+	// The body, compared as a PATH STRING and never loaded. This runs on machines where the mesh is
+	// not imported (that is the whole reason the reference is soft), so a comparison that resolved
+	// the pointer would report a drift that is really just an absent file.
+	{
+		const FString AssetBodyMesh = Definition->BodyMesh.IsNull()
+			? FString()
+			: Definition->BodyMesh.ToSoftObjectPath().ToString();
+		if (!SameString(TEXT("BodyMesh"), AssetBodyMesh, Row.BodyMeshPath))
+		{
+			return false;
+		}
+	}
+
+	if (!TraceCharacterDefinitionFile::SameFloat(Definition->BodyMeshYaw, Row.BodyMeshYaw))
+	{
+		OutMismatch = FString::Printf(TEXT("BodyMeshYaw: asset %.6f != C++ %.6f"),
+			Definition->BodyMeshYaw, Row.BodyMeshYaw);
+		return false;
+	}
+
+	// The anim class, compared the same way and for the same reason: a path string, never loaded.
+	{
+		const FString AssetBodyAnim = Definition->BodyAnimClass.IsNull()
+			? FString()
+			: Definition->BodyAnimClass.ToSoftObjectPath().ToString();
+		if (!SameString(TEXT("BodyAnimClass"), AssetBodyAnim, Row.BodyAnimClassPath))
+		{
+			return false;
+		}
 	}
 
 	// The slots that must stay empty. If a future pass gives the movement ability a name, this line

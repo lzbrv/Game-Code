@@ -3999,21 +3999,28 @@ void UTraceWeaponComponent::EnsureKnifeVisualsBuilt()
 
 	// --- Third person ---------------------------------------------------------------------------
 	//
-	// DoesSocketExist is the whole guard, and it is doing more work than it looks: the Mannequin is
-	// imported per developer and is legitimately absent on a fresh clone, in which case the skeletal
-	// mesh component exists but has no skeleton — attaching to a socket that does not exist would
-	// silently attach at the component ORIGIN and leave a knife lying at the pawn's feet.
+	// TWO THINGS THE HAND BONE CAN BE, AND ONE OF THEM IS NOTHING.
+	//
+	// The name is RESOLVED rather than assumed: "hand_r" is Epic's Mannequin's spelling and a pawn's
+	// body now depends on which character is playing it — Rocco's rig calls the same joint
+	// "RightHand1". ATraceCharacter::ResolveBodyBoneName asks the mesh that is actually on the pawn.
+	//
+	// A None answer is still the whole guard, and it is doing more work than it looks: character art
+	// is imported per developer and is legitimately absent on a fresh clone, in which case the
+	// skeletal mesh component exists but has no skeleton — attaching to a bone that does not exist
+	// would silently attach at the component ORIGIN and leave a knife lying at the pawn's feet.
 	if (!bKnifeHandBuilt)
 	{
 		USkeletalMeshComponent* BodyMesh = Character->GetMesh();
-		if (BodyMesh != nullptr && BodyMesh->DoesSocketExist(TEXT("hand_r")))
+		const FName HandBoneName = Character->ResolveBodyBoneName(TEXT("hand_r"));
+		if (BodyMesh != nullptr && !HandBoneName.IsNone())
 		{
 			KnifeHandRoot = NewObject<USceneComponent>(Character,
 				MakeUniqueObjectName(Character, USceneComponent::StaticClass(), FName(TEXT("KnifeHandRoot"))));
 			if (KnifeHandRoot != nullptr)
 			{
 				KnifeHandRoot->SetMobility(EComponentMobility::Movable);
-				KnifeHandRoot->SetupAttachment(BodyMesh, TEXT("hand_r"));
+				KnifeHandRoot->SetupAttachment(BodyMesh, HandBoneName);
 				KnifeHandRoot->RegisterComponent();
 				KnifeHandRoot->SetRelativeLocationAndRotation(
 					TraceKnifeLayout::HandOffset, TraceKnifeLayout::HandRotation);
@@ -4029,8 +4036,8 @@ void UTraceWeaponComponent::EnsureKnifeVisualsBuilt()
 				}
 
 				bKnifeHandBuilt = true;
-				UE_LOG(LogTraceGame, Verbose, TEXT("%s built a third-person knife (%d parts)."),
-					*GetNameSafe(Character), KnifeHandParts.Num());
+				UE_LOG(LogTraceGame, Verbose, TEXT("%s built a third-person knife (%d parts) on bone '%s'."),
+					*GetNameSafe(Character), KnifeHandParts.Num(), *HandBoneName.ToString());
 			}
 		}
 	}
@@ -4173,6 +4180,39 @@ void UTraceWeaponComponent::SetGunViewModelHidden(bool bHidden)
 			Part->SetVisibility(bWantGunParts);
 		}
 	}
+}
+
+void UTraceWeaponComponent::NotifyBodyMeshChanged()
+{
+	if (!bKnifeHandBuilt)
+	{
+		// Nothing is attached to the old body, so there is nothing to move. The build that has not
+		// happened yet will resolve the bone against the NEW mesh when it does.
+		return;
+	}
+
+	// DESTROYED RATHER THAN RE-ATTACHED. Re-pointing the root would be fewer allocations, but the
+	// parts under it carry per-rig offsets and a rebuild is one frame's work on a spawn or a character
+	// switch — neither of which happens in a hot loop. Correct beats clever here.
+	for (UStaticMeshComponent* Part : KnifeHandParts)
+	{
+		if (Part != nullptr)
+		{
+			Part->DestroyComponent();
+		}
+	}
+	KnifeHandParts.Reset();
+
+	if (KnifeHandRoot != nullptr)
+	{
+		KnifeHandRoot->DestroyComponent();
+		KnifeHandRoot = nullptr;
+	}
+
+	// The latch, cleared: EnsureKnifeVisualsBuilt() runs from UpdateKnifeVisuals() every tick and
+	// early-outs only when BOTH rigs are built, so the third-person knife comes back on the next
+	// frame, attached to whatever the new body calls its right hand.
+	bKnifeHandBuilt = false;
 }
 
 void UTraceWeaponComponent::UpdateKnifeVisuals(float /*DeltaTime*/)

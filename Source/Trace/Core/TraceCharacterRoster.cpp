@@ -97,7 +97,19 @@ namespace TraceCharacterRosterFile
 				TEXT("DASH ON ITS OWN COOLDOWN, LEAVING A RIPPLE FOR 4S. ANYONE ON EITHER TEAM CAN RIDE IT, "
 				     "INCLUDING THE CORE CARRIER, AND YOU CAN SHOOT WHILE RIDING."),
 				20.f,
-				FLinearColor(1.00f, 0.86f, 0.25f, 1.f)    // amber
+				FLinearColor(1.00f, 0.86f, 0.25f, 1.f),   // amber
+				// *** THE ONLY ROW WITH A BODY OF ITS OWN. *** Imported by Scripts/import-rocco.sh from
+				// Art/Characters/Rocco/RoccoTest.fbx. Absent on a clone that has not run it, which is
+				// why this is a path and not a hard reference — see FTraceCharacterEntry::BodyMeshPath.
+				TEXT("/Game/Trace/Characters/Rocco/SK_Rocco.SK_Rocco"),
+				// MEASURED off the imported asset, not copied from the Mannequin: this rig is authored
+				// facing +X, so it needs no correction at all. See BodyMeshYaw's declaration.
+				0.f,
+				// EPIC'S OWN ABP_Unarmed, RETARGETED ONTO THIS RIG by Scripts/retarget-rocco.sh — the
+				// same blend space the Mannequin runs, baked onto SK_Rocco_Skeleton so that a Rocco
+				// player walks instead of gliding in his bind pose. Absent on a clone that has not run
+				// the retarget, which is why this is a path; see FTraceCharacterEntry::BodyAnimClassPath.
+				TEXT("/Game/Trace/Characters/Rocco/Anims/ABP_Unarmed_Rocco.ABP_Unarmed_Rocco_C")
 			},
 			{
 				2, TEXT("CHUT"),
@@ -347,10 +359,13 @@ namespace TraceCharacterRosterFile
 	{
 		Storage.Reset();
 
-		// FIVE strings PER CHARACTER (name, movement, passive, activated name, activated) — five is the
-		// number of STRINGS on a row, not the number of characters, and it did not move in v18 §2. Reserved
-		// up front so no Add can ever reallocate — see FAssetRosterStorage's comment.
-		Storage.Strings.Reserve(TraceCharacterRoster::Count * 5);
+		// SEVEN strings PER CHARACTER (name, movement, passive, activated name, activated, body mesh
+		// path, body anim class path) — seven is the number of STRINGS on a row, not the number of
+		// characters. It was five until the body mesh landed, six until the retarget, and it did not
+		// move in v18 §2. Reserved up front so no Add can ever reallocate — see FAssetRosterStorage's
+		// comment. *** IF YOU ADD A STRING TO FTraceCharacterEntry, THIS NUMBER MOVES WITH IT: an Add
+		// past the reserve reallocates and every TCHAR* already handed out points at freed memory. ***
+		Storage.Strings.Reserve(TraceCharacterRoster::Count * 7);
 		Storage.Entries.Reserve(TraceCharacterRoster::Count);
 
 		for (int32 IdValue = TraceCharacterRoster::FirstId; IdValue <= TraceCharacterRoster::LastId; ++IdValue)
@@ -403,6 +418,14 @@ namespace TraceCharacterRosterFile
 			const int32 ActivatedNameIndex = Storage.Strings.Add(Definition->ActivatedSlot.DisplayName);
 			const int32 ActivatedIndex = Storage.Strings.Add(Definition->ActivatedSlot.Description);
 
+			// EMPTY WHEN THE ASSET NAMES NO MESH, which is the normal case for nine of the ten — and
+			// it is stored anyway rather than skipped, because the reserve above counts seven strings
+			// a row and an Add that only sometimes happens is an Add nobody can count.
+			const int32 BodyMeshIndex = Storage.Strings.Add(
+				Definition->BodyMesh.IsNull() ? FString() : Definition->BodyMesh.ToSoftObjectPath().ToString());
+			const int32 BodyAnimIndex = Storage.Strings.Add(
+				Definition->BodyAnimClass.IsNull() ? FString() : Definition->BodyAnimClass.ToSoftObjectPath().ToString());
+
 			TraceCharacterRoster::FTraceCharacterEntry Entry;
 			Entry.Id                = static_cast<uint8>(IdValue);
 			Entry.Name              = *Storage.Strings[NameIndex];
@@ -412,6 +435,9 @@ namespace TraceCharacterRosterFile
 			Entry.Activated         = *Storage.Strings[ActivatedIndex];
 			Entry.ActivatedCooldown = Definition->ActivatedSlot.CooldownSeconds;
 			Entry.Accent            = Definition->AccentColor;
+			Entry.BodyMeshPath      = *Storage.Strings[BodyMeshIndex];
+			Entry.BodyMeshYaw       = Definition->BodyMeshYaw;
+			Entry.BodyAnimClassPath = *Storage.Strings[BodyAnimIndex];
 
 			Storage.Entries.Add(Entry);
 		}

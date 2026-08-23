@@ -1849,6 +1849,19 @@ private:
 	/** Diagnostics only (Trace.Core.CarryProbe): did `hand_r` resolve on the holder's mesh last tick? */
 	bool bCarryHandSocketResolved = false;
 
+	/**
+	 * Diagnostics only (Trace.Core.CarryProbe): WHICH bone `hand_r` resolved to last tick, and on
+	 * WHICH mesh. NAME_None / empty when nothing was resolved.
+	 *
+	 * *** THE NAMES ARE THE EVIDENCE, NOT THE BOOLEAN. *** A carrier on the Mannequin and a carrier
+	 * on Rocco's rig both answer "resolved", and for a while only one of them was true: this call
+	 * site read `hand_r` off the mesh directly, so a Rocco's ball fell to the hip fallback while the
+	 * probe still had a bool to be happy about. `hand_r -> RightHand1 on SK_Rocco` is a line that
+	 * cannot be green on the wrong rig.
+	 */
+	FName CarryHandBoneResolved;
+	FString CarryHandBodyName;
+
 	/** One warning per Core, not one per frame, when a holder has no `hand_r` to hang the ball on. */
 	bool bCarryHandMissingLogged = false;
 

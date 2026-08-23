@@ -105,6 +105,22 @@ namespace TraceCharacterDataVerify
 		CompareText(TEXT("ActivatedName"), Live.ActivatedName, Reference.ActivatedName);
 		CompareText(TEXT("Activated"),     Live.Activated,     Reference.Activated);
 
+		// The body every other player sees. Compared as a PATH and never loaded — the mesh is
+		// imported per developer and is legitimately absent here, which is exactly why the reference
+		// is soft. An empty path on both sides means "Epic's Mannequin", which is nine of the ten.
+		CompareText(TEXT("BodyMeshPath"),  Live.BodyMeshPath,  Reference.BodyMeshPath);
+
+		// And the class that drives it. A body whose anim class drifted would still LOOK right in a
+		// screenshot of a standing pawn, which is exactly why it is compared here rather than left
+		// to be noticed by somebody watching a character walk.
+		CompareText(TEXT("BodyAnimClassPath"), Live.BodyAnimClassPath, Reference.BodyAnimClassPath);
+
+		if (Live.BodyMeshYaw != Reference.BodyMeshYaw)
+		{
+			Differences.Add(FString::Printf(TEXT("BodyMeshYaw (%.6f vs %.6f)"),
+				Live.BodyMeshYaw, Reference.BodyMeshYaw));
+		}
+
 		// EXACT, not nearly-equal. See the note in TraceCharacterDefinition.cpp: the value makes one
 		// lossless trip through a .uasset, so any difference at all is a real edit.
 		if (Live.ActivatedCooldown != Reference.ActivatedCooldown)
@@ -332,6 +348,16 @@ namespace TraceCharacterDataVerify
 				static_cast<int32>(Row.Id), Row.Name, *Row.Accent.ToString(), Row.ActivatedName,
 				Row.ActivatedCooldown,
 				(Enforced >= 0.f) ? *FString::Printf(TEXT("%.2fs"), Enforced) : TEXT("<no ability set>"));
+
+			// The body, on its own line because the path is long and because "(the Mannequin)" is the
+			// answer for nine of the ten and should read as a normal state rather than as a blank.
+			UE_LOG(LogTraceGame, Display, TEXT("[CharacterData]     body %s  yaw %.1f"),
+				(Row.BodyMeshPath != nullptr && Row.BodyMeshPath[0] != TEXT('\0'))
+					? Row.BodyMeshPath : TEXT("(the Mannequin)"),
+				Row.BodyMeshYaw);
+			UE_LOG(LogTraceGame, Display, TEXT("[CharacterData]     anim %s"),
+				(Row.BodyAnimClassPath != nullptr && Row.BodyAnimClassPath[0] != TEXT('\0'))
+					? Row.BodyAnimClassPath : TEXT("(ABP_Unarmed)"));
 			UE_LOG(LogTraceGame, Display, TEXT("[CharacterData]       MOVEMENT  %s"), Row.Movement);
 			UE_LOG(LogTraceGame, Display, TEXT("[CharacterData]       PASSIVE   %s"), Row.Passive);
 			UE_LOG(LogTraceGame, Display, TEXT("[CharacterData]       ACTIVATED %s"), Row.Activated);

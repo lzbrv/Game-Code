@@ -62,6 +62,16 @@
 # -----------------------------------------------------------------------------
 # RE-RUNNING IS SAFE, AND IT OVERWRITES
 # -----------------------------------------------------------------------------
+# THE FILES ARE READ-ONLY UNTIL YOU MAKE THEM WRITABLE. .uasset is `lockable` in
+# .gitattributes, so LFS clears the write bit on checkout and every save here
+# fails. Before running:
+#
+#   chmod u+w Content/Trace/Data/Characters/*.uasset
+#
+# (or `git lfs lock` each one, which is the tidy path - see Scripts/lock.sh).
+# The script now FAILS on the first unsaved asset rather than reporting a PASS
+# that wrote nothing; see the note beside save_loaded_asset below.
+#
 # There is no --force flag because there is nothing to force: an existing asset
 # is loaded and rewritten from the C++ table. That means A HAND EDIT TO ONE OF
 # THESE ASSETS DOES NOT SURVIVE A REGENERATE. If you want to change a
@@ -181,7 +191,27 @@ def main():
             fail("  copy_fallback_values refused id {} - see the log above".format(character_id))
             return 1
 
-        unreal.EditorAssetLibrary.save_loaded_asset(asset, only_if_is_dirty=False)
+        # *** THE RETURN VALUE IS CHECKED, AND THAT IS NOT PARANOIA. ***
+        #
+        # MEASURED: .uasset is `lockable` in .gitattributes, so LFS leaves every
+        # one of these files READ-ONLY on checkout. Every save then fails with
+        # "Cannot remove ... as it is read only!" - and this script used to print
+        # "saved" ten times and then PASS, because the round trip below reloaded
+        # the objects that were still resident in memory rather than the files it
+        # had failed to write. A run that changes nothing and reports success is
+        # the worst outcome available here, so the save is now believed only when
+        # it says so.
+        #
+        # THE FIX WHEN THIS FIRES is the same one Scripts/bake-arena.sh makes for
+        # the map:  chmod u+w Content/Trace/Data/Characters/*.uasset   (or
+        # `git lfs lock` them first, which is the tidy path when you have a
+        # remote to lock against).
+        if not unreal.EditorAssetLibrary.save_loaded_asset(asset, only_if_is_dirty=False):
+            fail("  {} FAILED TO SAVE. The most likely cause is the read-only bit LFS leaves on "
+                 "lockable .uasset files: run  chmod u+w Content/Trace/Data/Characters/*.uasset  "
+                 "(or git lfs lock them) and re-run. Nothing was written.".format(asset_name))
+            return 1
+
         written.append((character_id, asset_name))
         packages.append(asset.get_outermost())
         log("  saved")

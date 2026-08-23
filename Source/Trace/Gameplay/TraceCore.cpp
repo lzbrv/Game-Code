@@ -152,10 +152,11 @@ namespace TraceCoreTuning
 	 * that recorded the defect. The Manny is 311 px tall for 180 uu there (1.728 px/uu) and the right
 	 * fist's centroid sits 25 uu outboard of the body centreline at capsule-centre height.
 	 *
-	 * Used ONLY when `hand_r` does not resolve - a machine with no mannequin import draws a 34 uu
-	 * radius cylinder instead, and this keeps the ball at that pawn's right hip rather than at the
-	 * component origin, i.e. lying at its feet. Logged once when it is taken, the way a missing
-	 * mannequin is logged.
+	 * Used ONLY when the right hand does not resolve on the body the pawn is actually drawing - a
+	 * machine with no character art imported draws a 34 uu radius cylinder instead - and this keeps
+	 * the ball at that pawn's right hip rather than at the component origin, i.e. lying at its feet.
+	 * NOT the Rocco case: his rig spells the joint `RightHand1` and ResolveBodyBoneName finds it, so
+	 * he holds the ball in his fist like everyone else. Logged once, naming the mesh that failed.
 	 */
 	constexpr double CarryHandRestRight = 25.0;
 
@@ -2607,10 +2608,13 @@ static TAutoConsoleVariable<float> CVarCoreCarryOffsetUp(
 	ECVF_Default);
 
 /**
- * The holder's right-hand socket. The third-person knife rig hangs off the same one, and goes
- * through the same DoesSocketExist guard for the same reason: asking a mesh for a socket it does not
- * have returns the COMPONENT ORIGIN rather than failing, so an unguarded read draws the ball lying
- * at the pawn's feet and nothing in the log says why.
+ * The holder's right-hand socket, IN THE MANNEQUIN'S VOCABULARY. The third-person knife rig hangs
+ * off the same one and is spelled the same way, and both go through
+ * ATraceCharacter::ResolveBodyBoneName rather than reading the mesh directly: nine of the ten
+ * characters wear the Mannequin, but Rocco's rig shares no bone name with it and calls this joint
+ * `RightHand1`. The resolver keeps the existence check that has to happen either way - asking a mesh
+ * for a socket it does not have returns the COMPONENT ORIGIN rather than failing, so an unguarded
+ * read draws the ball lying at the pawn's feet and nothing in the log says why.
  *
  * A TCHAR literal rather than a file-scope `static const FName`: an FName built during static
  * initialisation runs before the name table is guaranteed to exist, and a name is cheap to build at
@@ -2620,7 +2624,8 @@ static const TCHAR* const GCarryHandSocketName = TEXT("hand_r");
 
 /**
  * The forearm the hand hangs off, used ONLY to point `hand_r` -> fist in the direction the arm is
- * actually lying this frame. Optional by design: if it is missing the fist falls back to straight
+ * actually lying this frame. Spelled the Mannequin's way and resolved per-rig alongside the hand
+ * (Rocco's is `RightForeArm1`). Optional by design: if it is missing the fist falls back to straight
  * down, which is where ABP_Unarmed's rest arm puts it anyway. Every humanoid rig this project can
  * load has it, so it is not a guess about one skeleton the way a finger bone would be.
  */
@@ -12206,6 +12211,8 @@ void ATraceCore::UpdateCarriedArtPlacement()
 	// shell" left over from the last holder is a probe line that lies about a ball lying on the floor.
 	CarryFistDepthUU = 0.0;
 	CarryCradleClampedUU = 0.0;
+	CarryHandBoneResolved = NAME_None;
+	CarryHandBodyName.Reset();
 
 	// The FIST, in the holder's own frame - resolved for anybody who has the Core, whether or not the
 	// A/B arm is going to use it. It is what the grip measurement below is taken against, and a
@@ -12230,8 +12237,26 @@ void ATraceCore::UpdateCarriedArtPlacement()
 
 		if (const USkeletalMeshComponent* Body = Holder->GetMesh())
 		{
-			const FName HandSocket(GCarryHandSocketName);
-			if (Body->DoesSocketExist(HandSocket))
+			// *** ASKED FOR IN THE MANNEQUIN'S VOCABULARY, RESOLVED AGAINST THE BODY ACTUALLY ON THIS
+			// PAWN. *** ResolveBodyBoneName answers `hand_r` on the nine Mannequin characters and
+			// `RightHand1` on Rocco, whose rig shares no bone name with the Mannequin's; a raw
+			// DoesSocketExist here dropped a Rocco carrier's ball to the hip fallback. It still does
+			// the existence check itself - NAME_None is "this rig has no right hand under any name
+			// this project knows" - so the guard that stands between us and GetSocketTransform's habit
+			// of answering a missing socket with the COMPONENT ORIGIN has not been given up.
+			const FName HandSocket = Holder->ResolveBodyBoneName(FName(GCarryHandSocketName));
+
+			// Recorded whether or not it resolved, and BEFORE the branch, so the probe can name the
+			// rig it failed on as readily as the one it worked on. The name is left EMPTY rather than
+			// GetNameSafe's "None" when there is no asset at all, because "None" is also a plausible
+			// mesh name to a reader and the two cases print differently below.
+			if (const USkeletalMesh* const HolderMesh = Body->GetSkeletalMeshAsset())
+			{
+				CarryHandBodyName = HolderMesh->GetName();
+			}
+			CarryHandBoneResolved = HandSocket;
+
+			if (!HandSocket.IsNone())
 			{
 				const FVector HandWorld = Body->GetSocketTransform(HandSocket, RTS_World).GetLocation();
 				HandLocal = Holder->GetActorRotation().UnrotateVector(HandWorld - Holder->GetActorLocation());
@@ -12241,8 +12266,8 @@ void ATraceCore::UpdateCarriedArtPlacement()
 				// same reason the hand itself is read as a world position and un-rotated: this file's
 				// knife rig had to MEASURE its hand-space cant because the axes did not read the way
 				// anyone expected, and elbow -> wrist is a direction no convention can flip.
-				const FName ForearmBone(GCarryForearmBoneName);
-				if (Body->DoesSocketExist(ForearmBone))
+				const FName ForearmBone = Holder->ResolveBodyBoneName(FName(GCarryForearmBoneName));
+				if (!ForearmBone.IsNone())
 				{
 					const FVector ElbowWorld = Body->GetSocketTransform(ForearmBone, RTS_World).GetLocation();
 					const FVector Along = (HandWorld - ElbowWorld).GetSafeNormal();
@@ -12296,11 +12321,18 @@ void ATraceCore::UpdateCarriedArtPlacement()
 			// the picture come down to hand height while the thing the game reads has not moved.
 			Wanted = FistLocal + Cradle - FVector(0.0, 0.0, TraceCoreTuning::OrbHeight);
 
-			// A DEGRADE, NOT AN ERROR, AND IT SAYS SO ONCE. A machine with no mannequin import draws
-			// the fallback capsule and has no `hand_r`; the ball then sits at that pawn's right hip on
-			// the measured rest offset, which is a worse picture and a working one. Silence would be
-			// the bad outcome: DoesSocketExist is what stands between this and GetSocketTransform's
-			// habit of answering a missing socket with the COMPONENT ORIGIN, i.e. a ball at the feet.
+			// A DEGRADE, NOT AN ERROR, AND IT SAYS SO ONCE. A pawn drawing no body at all - a machine
+			// with no character art imported, which draws the fallback capsule - has no right hand to
+			// find; so would a future rig whose spelling is in neither the Mannequin's vocabulary nor
+			// ResolveBodyBoneName's alias table. The ball then sits at that pawn's right hip on the
+			// measured rest offset, which is a worse picture and a working one. Silence would be the
+			// bad outcome: this guard is what stands between us and GetSocketTransform's habit of
+			// answering a missing socket with the COMPONENT ORIGIN, i.e. a ball at the feet.
+			//
+			// *** IT NAMES THE MESH IT FAILED ON, because the previous wording guessed at the cause
+			// ("no mannequin import?") and was wrong the one time it ever fired: it fired on Rocco, on
+			// a machine with the Mannequin installed, because this call site was not going through
+			// the resolver. A reader needs the rig's name to know which of the two cases this is.
 			//
 			// Inside this branch so that turning the A/B arm off (Trace.Core.CarryInHand 0) cannot
 			// produce a warning about a socket nothing asked for.
@@ -12308,9 +12340,12 @@ void ATraceCore::UpdateCarriedArtPlacement()
 			{
 				bCarryHandMissingLogged = true;
 				UE_LOG(LogTraceGame, Warning,
-					TEXT("[Carry] %s has no `%s` socket (no mannequin import?); the carried Core falls back ")
-					TEXT("to the measured right-hip offset (0, %.0f, 0) uu. The ball is drawn, just not in a hand."),
-					*GetNameSafe(Holder), GCarryHandSocketName, TraceCoreTuning::CarryHandRestRight);
+					TEXT("[Carry] %s draws `%s`, which has no `%s` joint under that name or any alias ")
+					TEXT("ResolveBodyBoneName knows; the carried Core falls back to the measured right-hip ")
+					TEXT("offset (0, %.0f, 0) uu. The ball is drawn, just not in a hand."),
+					*GetNameSafe(Holder),
+					CarryHandBodyName.IsEmpty() ? TEXT("<no body mesh: art not imported>") : *CarryHandBodyName,
+					GCarryHandSocketName, TraceCoreTuning::CarryHandRestRight);
 			}
 		}
 	}
@@ -12398,11 +12433,21 @@ void ATraceCore::DebugLogCarryState() const
 	// and the thing every gameplay rule reads did not.
 	const FVector BallWorld = (ArtRoot != nullptr) ? ArtRoot->GetComponentLocation() : GetActorLocation();
 
+	// NAMES, NOT A BOOLEAN, for the hand: `hand_r -> RightHand1 on SK_Rocco` is a line that cannot
+	// read green on the wrong rig, and a bare "resolved" did exactly that while a Rocco's ball was
+	// hanging off his hip. See CarryHandBoneResolved.
+	const FString HandReport = bCarryHandSocketResolved
+		? FString::Printf(TEXT("%s->%s on %s"), GCarryHandSocketName,
+			*CarryHandBoneResolved.ToString(),
+			CarryHandBodyName.IsEmpty() ? TEXT("<no body mesh>") : *CarryHandBodyName)
+		: FString::Printf(TEXT("NOT resolved on %s (hip fallback)"),
+			CarryHandBodyName.IsEmpty() ? TEXT("<no body mesh>") : *CarryHandBodyName);
+
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[CarryProbe] CarryInHand=%d  carrier=%s  hand_r=%s  artRoot rel=%s  BALL world=%s  ACTOR world=%s"),
+		TEXT("[CarryProbe] CarryInHand=%d  carrier=%s  hand=%s  artRoot rel=%s  BALL world=%s  ACTOR world=%s"),
 		CVarCoreCarryInHand.GetValueOnGameThread(),
 		IsValid(Holder) ? *GetNameSafe(Holder) : TEXT("<nobody - the Core is not held>"),
-		bCarryHandSocketResolved ? TEXT("resolved") : TEXT("NOT resolved (hip fallback)"),
+		*HandReport,
 		*AppliedArtRootOffset.ToCompactString(),
 		*BallWorld.ToCompactString(),
 		*GetActorLocation().ToCompactString());
@@ -13519,15 +13564,18 @@ static FAutoConsoleCommandWithWorldAndArgs GTraceCoreFxProbeCmd(
  *
  * Deliberately not a pass/fail verifier. What is being fixed here is a PICTURE - "you cannot see the
  * ball being held" - and the only honest verdict on a picture is a screenshot. What a log CAN settle
- * is everything a screenshot cannot: whether `hand_r` really resolved or the hip fallback quietly
- * took over, whether the ACTOR is still at OrbHeight while the BALL is at hand height, where the ball
+ * is everything a screenshot cannot: which bone the right hand really resolved to ON WHICH RIG, or
+ * whether the hip fallback quietly took over - the pair of names is the point, because a Mannequin
+ * carrier and a Rocco carrier both used to print "resolved" and only one of them meant it -
+ * whether the ACTOR is still at OrbHeight while the BALL is at hand height, where the ball
  * lands in pixels, and which pieces are owner-hidden. Run it with Trace.Core.CarryInHand at 1 and at
  * 0 and the two prints are the A/B, out of one binary.
  */
 static FAutoConsoleCommandWithWorldAndArgs GTraceCoreCarryProbeCmd(
 	TEXT("Trace.Core.CarryProbe"),
-	TEXT("Prints where the carried Core is DRAWN against where its actor is, whether the holder's "
-	     "`hand_r` socket resolved, where the ball lands on this machine's screen in px, and "
+	TEXT("Prints where the carried Core is DRAWN against where its actor is, WHICH bone the holder's "
+	     "right hand resolved to and on which body (`hand_r->RightHand1 on SK_Rocco`), where the "
+	     "ball lands on this machine's screen in px, and "
 	     "bOwnerNoSee on all four drawn pieces. Takes an optional DELAY in seconds, because the "
 	     "answer changes during the 0.35 s pull-back: -TraceExec runs a whole command list on ONE "
 	     "frame, so `Trace.DebugTakeCore 0 0 90|Trace.Core.CarryProbe 3` is how the settled carry "

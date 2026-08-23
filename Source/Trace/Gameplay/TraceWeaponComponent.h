@@ -1156,9 +1156,14 @@ private:
 	//   KnifeViewRoot   first person, OnlyOwnerSee, hung under ATraceCharacter::ViewModelRoot so it
 	//                   inherits the sway/bob/recoil transform the gun already gets for free. This
 	//                   is the rig that physically swings, and it is the swinger's whole read.
-	//   KnifeHandRoot   third person, OwnerNoSee, attached to the Mannequin's hand_r bone so every
+	//   KnifeHandRoot   third person, OwnerNoSee, attached to the pawn's RIGHT HAND BONE so every
 	//                   OTHER player can see that this person chose the knife — which is the tell
 	//                   that they are now 22% faster (spec v12 §3) and cannot shoot back.
+	//                   *** "hand_r" IS THE MANNEQUIN'S NAME FOR THAT BONE AND NOT EVERY BODY'S. ***
+	//                   A pawn's body now depends on which character is playing it, and Rocco's rig
+	//                   calls it "RightHand1". ATraceCharacter::ResolveBodyBoneName does the
+	//                   translation; asking for "hand_r" on that rig gets nothing, which is not a
+	//                   crash but a knife lying at the player's feet.
 	//
 	// THERE IS NO THIRD-PERSON GUN RIG, and that is worth knowing before hunting spec v12 §7's
 	// "knife and gun at the same time" on somebody else's pawn: ATraceCharacter builds a first-person
@@ -1172,6 +1177,22 @@ private:
 
 	void EnsureKnifeVisualsBuilt();
 	void UpdateKnifeVisuals(float DeltaTime);
+
+public:
+	/**
+	 * The pawn's body mesh has been REPLACED (a character was picked, switched, or arrived late), so
+	 * anything of ours hanging off one of its bones is now attached by a name the new rig may not
+	 * have. Tears the third-person knife down; EnsureKnifeVisualsBuilt() puts it back on the next
+	 * tick against whatever the new body calls its right hand.
+	 *
+	 * ONLY THE THIRD-PERSON RIG. KnifeViewRoot hangs off the viewmodel, which is a first-person rig
+	 * belonging to the camera and not to the body, and is unaffected by a body swap.
+	 *
+	 * Safe to call when nothing was built, and safe to call on a pawn with no knife.
+	 */
+	void NotifyBodyMeshChanged();
+
+private:
 
 	/**
 	 * Hides the GUN half of ATraceCharacter's viewmodel while the knife is out — the weapon parts

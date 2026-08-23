@@ -203,6 +203,31 @@ enum class ETraceCharacterArtStatus : uint8
 	AnimMissing,
 	/** Neither is there. Players are drawn as fallback primitives. THIS is the reported bug. */
 	MeshMissing,
+	/**
+	 * The Mannequin install is fine, but a CHARACTER'S OWN body mesh did not load — Rocco's, say,
+	 * on a machine that has never run Scripts/import-rocco.sh. That pawn keeps the Mannequin, so the
+	 * game is playable and nobody is invisible; it is still a missing import and it still gets the
+	 * banner and the on-screen line, because the whole reason this enum exists is that a silent
+	 * degrade gets reported as "the character models were not replaced" three weeks later.
+	 *
+	 * NOT DOWNGRADED BY A LATER PAWN REPORTING Ok — see ReportCharacterArtStatus. Ten pawns dress
+	 * themselves and only one of them may be the character whose body is missing.
+	 */
+	CharacterBodyMeshMissing,
+	/**
+	 * The character's body mesh loaded but the ANIM BLUEPRINT BUILT FOR ITS RIG did not — Rocco's,
+	 * on a machine that ran Scripts/import-rocco.sh and never ran Scripts/retarget-rocco.sh.
+	 *
+	 * *** THIS IS THE STATE THIS ENUM WAS LEAST READY FOR AND THE ONE EASIEST TO SHIP BY ACCIDENT. ***
+	 * The pawn is the right shape, the right size, the right colour and in the right place. It is
+	 * simply frozen in its bind pose, arms out, gliding. Every other check passes, a screenshot of a
+	 * standing player looks perfect, and the only tell is watching somebody walk. So it gets a banner
+	 * and a line on the HUD of its own, naming the script that fixes it.
+	 *
+	 * A SEPARATE VALUE FROM AnimMissing, which is about EPIC'S ABP_Unarmed being absent and is
+	 * therefore true of every pawn at once. This one is true of one character.
+	 */
+	CharacterBodyAnimMissing,
 	/** -TraceNoCharacterArt: the fallback was asked for on purpose, so it is not a defect. */
 	DisabledByCommandLine,
 	/** Dedicated server: renders nothing, so there is nothing to warn about. */
@@ -798,8 +823,105 @@ public:
 	/**
 	 * Resolves the soft art references exactly once per pawn and either dresses the skeletal mesh
 	 * (mannequin + anim blueprint) or switches on the fallback shape. Never fatal.
+	 *
+	 * THE DEFAULT BODY ONLY. Which character this player picked is not knowable this early — the
+	 * PlayerState routinely arrives after the pawn — so the per-character body is applied afterwards
+	 * and re-asserted by UpdateCharacterBodyMesh() below.
 	 */
 	void SetupCharacterVisuals();
+
+	// --- The per-character body (what OTHER players see) -----------------------------------------
+
+	/**
+	 * *** THE FEATURE. *** Puts the body this pawn's CHARACTER should be drawn with onto the mesh
+	 * component — on every machine, for every pawn, local or remote — and keeps it there.
+	 *
+	 * WHY THIS IS A POLL AND NOT AN EVENT, which is the only interesting decision in this file:
+	 *
+	 *   A PLAYERSTATE ARRIVES SEPARATELY FROM ITS PAWN, AND USUALLY LATER. On a client the pawn can
+	 *   replicate in with PlayerState still null, and the character id is not even on the PlayerState
+	 *   — it is FORWARDED from a UTraceAbilityComponent that replicates as a third, independently
+	 *   ordered object. So there are three arrivals and no guaranteed order between them. An apply
+	 *   that ran once in BeginPlay would read "no character", and the pawn would stay a Mannequin
+	 *   forever on every machine except the one that spawned it. This project has been bitten by
+	 *   exactly that shape twice: see the two-latch note in TraceWeaponComponent.h (the controller
+	 *   arriving after the pawn) and UpdateWeaponSelection(), which is re-asserted every frame for
+	 *   the same reason rather than hooked to a swap event.
+	 *
+	 *   There is also no ONE event to hook even if the ordering were solved. The id can change under
+	 *   a live pawn (the practice range allows a mid-match switch) and it changes with no notification
+	 *   this actor can subscribe to.
+	 *
+	 * RE-ASSERTING IS FREE. The applied id is remembered; an unchanged id returns after one integer
+	 * compare, which is why this can sit in Tick for ten pawns without anybody noticing. The id is
+	 * recorded even when the apply FAILED, so a missing mesh costs one LoadSynchronous attempt rather
+	 * than one per frame.
+	 *
+	 * Called from BeginPlay, PossessedBy, OnRep_PlayerState and Tick — every path that could learn
+	 * the answer, plus the one that cannot go stale.
+	 *
+	 * @param bIsPoll  true only from Tick. Exists for the red arm (Trace.Characters.BodyMeshEventsOnly),
+	 *                 which turns the poll off and leaves the three event hooks: that is the obvious
+	 *                 implementation of this feature, and it is the one that goes stale.
+	 */
+	void UpdateCharacterBodyMesh(bool bIsPoll = false);
+
+	/**
+	 * Which character's body this pawn is CURRENTLY DRAWING (not which one its PlayerState says it
+	 * should be — that is the whole point of comparing the two). TraceCharacterRoster::NoneId means
+	 * the Mannequin. For the harness; gameplay has no reason to ask.
+	 */
+	uint8 GetAppliedBodyCharacterId() const { return AppliedBodyCharacterId; }
+
+	/**
+	 * The bone on THIS PAWN'S CURRENT BODY that plays the part the Mannequin's @p MannequinBoneName
+	 * plays — "hand_r" on a Rocco pawn answers "RightHand1".
+	 *
+	 * *** THE MANNEQUIN'S NAMES ARE NOT UNIVERSAL AND NOTHING WARNS YOU. *** Rocco's rig is a
+	 * generic/Mixamo-style skeleton with zero Mannequin bone names, and the FBX carried two armatures
+	 * so every bone also came in with a trailing "1". Everything that attaches to the body by name —
+	 * the third-person knife, the carried Core, the anim probe — asks for the Mannequin's name and
+	 * gets NOTHING on that rig: not a crash, an attachment at the component origin, i.e. a knife
+	 * lying at the player's feet. This is the one place that translation lives.
+	 *
+	 * Returns @p MannequinBoneName unchanged when the current mesh has it (the Mannequin: one
+	 * DoesSocketExist and out), and NAME_None when neither it nor any known alias resolves.
+	 */
+	FName ResolveBodyBoneName(FName MannequinBoneName) const;
+
+private:
+	/**
+	 * Puts @p CharacterId's body on the mesh component: the asset, the yaw that squares it with the
+	 * actor's forward, an anim instance IF one fits this rig, the team-coloured MIDs, and a rebuild
+	 * of anything bolted to a bone. NoneId (and any character with no body of its own) is the
+	 * Mannequin, which is not a failure — it is what nine of the ten characters look like.
+	 *
+	 * RECORDS THE ID EVEN WHEN IT RETURNS FALSE. "Already dealt with" is what keeps the poll free,
+	 * and a missing import must cost one load attempt per pawn rather than one per frame.
+	 *
+	 * @return true when the pawn is now wearing @p CharacterId's body.
+	 */
+	bool ApplyCharacterBodyMesh(uint8 CharacterId);
+
+	/**
+	 * Gives @p MeshComp an anim blueprint IF that blueprint's skeleton is @p ForMesh's, and a bind
+	 * pose plus one loud line if it is not.
+	 *
+	 * AN ANIM BLUEPRINT BELONGS TO A SKELETON, NOT TO A MESH, which is why the class is chosen per
+	 * character rather than once: Rocco's rig shares no bone name with the Mannequin's, so
+	 * ABP_Unarmed literally has nothing to drive on it. @p BodyAnimClassPath is that character's own
+	 * class (Rocco's is ABP_Unarmed retargeted onto his skeleton by Scripts/retarget-rocco.sh); EMPTY
+	 * means CharacterAnimClass, i.e. Epic's ABP_Unarmed, which is right for the Mannequin and for the
+	 * nine characters wearing it.
+	 *
+	 * The skeleton check stays even now that both sides are expected to match, because the failure it
+	 * catches — a body that is the right shape and frozen — is the one that looks perfect in a
+	 * screenshot. @p CharacterId is carried in only so the report can name WHO stopped animating.
+	 */
+	void ApplyBodyAnimInstance(USkeletalMeshComponent* MeshComp, USkeletalMesh* ForMesh,
+		uint8 CharacterId, const FString& BodyAnimClassPath);
+
+public:
 
 	// --- Character art availability (see ETraceCharacterArtStatus) --------------------------------
 
@@ -1850,12 +1972,39 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> FallbackHeadMID;
 
-	/** One per material slot on the skeletal mesh (Manny has two: head/legs and torso). */
+	/** One per material slot on the skeletal mesh (Manny has two: head/legs and torso; SK_Rocco ten). */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UMaterialInstanceDynamic>> CharacterMIDs;
 
+	/**
+	 * The body CharacterMIDs were built against. A MID wraps one asset's material, so swapping the
+	 * body invalidates every entry above even when the slot count happens to match. Weak on purpose:
+	 * this is an identity to compare, never a reason to keep a mesh resident.
+	 */
+	TWeakObjectPtr<USkeletalMesh> CharacterMIDsMesh;
+
 	/** True once SetupCharacterVisuals() has decided; keeps ApplyTeamColors() cheap and correct. */
 	bool bUsingSkeletalMesh = false;
+
+	/**
+	 * The character whose body is ON THE PAWN RIGHT NOW. NoneId = the Mannequin, which is what
+	 * SetupCharacterVisuals() leaves behind, so starting at NoneId is a true statement rather than a
+	 * sentinel. UpdateCharacterBodyMesh() compares the replicated selection against this and does
+	 * nothing at all when they agree.
+	 */
+	uint8 AppliedBodyCharacterId = 0;   // TraceCharacterRoster::NoneId, static_asserted in the .cpp
+
+	/**
+	 * The yaw that turns the CURRENT body's authored forward onto the actor's +X: -90 for the
+	 * Mannequin, 0 for Rocco. Per-pawn rather than the constant it used to be, because the answer is
+	 * a property of the MESH and this pawn's mesh now depends on who is playing it.
+	 *
+	 * READ BY UpdateCrouchPresentation, which rewrites the mesh's relative rotation whenever the
+	 * slide lean moves — so a body swap that only set the rotation once would be un-done by the first
+	 * slide.
+	 */
+	float BodyMeshYaw = -90.f;   // TraceCharacterLayout::MeshYaw, static_asserted in the .cpp
+
 
 	/** Latches so one life produces exactly one death, however many sources fire at once. */
 	bool bDeathHandled = false;
