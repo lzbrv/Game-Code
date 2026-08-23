@@ -16,5 +16,7 @@ echo == discarding editor noise (if any) ==
 %PY% Scripts\config-hygiene.py --discard-benign
 echo.
 echo == git pull ==
-git pull %*
+REM --no-rebase explicitly: git refuses a divergent pull with no strategy configured,
+REM and this repo merges rather than rebases because of the lockable LFS binaries.
+git pull --no-rebase %*
 popd & endlocal

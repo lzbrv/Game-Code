@@ -1290,6 +1290,20 @@ public:
 		 * that differs between a standing throw and one released mid-fall.
 		 */
 		float LaunchHeightAboveFeet = 0.f;
+		// --- DEMO 27. WHAT BECAME OF THE LAUNCH, filled in a tenth of a second after it. -----------
+		//
+		// The three numbers above describe what LEFT THE HAND, and the whole of the Demo 27 bug lived
+		// in the frame after that: a launch of 3509 uu/s that was down to 5 uu/s before the ball had
+		// travelled its own diameter. Every one of those throws printed a perfect launch line. So the
+		// sample now carries the follow-up as well, and Trace.ModeB.ThrowMomentum prints it.
+
+		/** Speed the Core still had LaunchAuditSeconds after the launch. 0 = not audited yet. */
+		float SpeedAfterLaunch = 0.f;
+		/** That as a fraction of LaunchSpeed. ~1.0 for a clean throw; 0.001 for the reported bug. */
+		float LaunchRetained = 0.f;
+		/** How far the Core had got from the thrower's capsule by then, uu. */
+		float DistanceFromThrowerAfterLaunch = 0.f;
+
 		/** SPEC v13 §6. The hold that produced it, and the impulse fraction that hold bought. */
 		float HeldSeconds = 0.f;
 		float ChargeScale = 1.f;
@@ -1321,6 +1335,32 @@ public:
 	 * pawns (-TraceTripTest).
 	 */
 	void RunThrowMomentumTest();
+
+	/**
+	 * Server, mode B, DEMO 27 — *** THE RUNNING THROW, STAGED AND SCORED. Trace.ModeB.RunThrowTest. ***
+	 *
+	 * "It doesn't seem to throw forward when moving forward ... it drops to the ground whenever a
+	 * player is moving forward and throwing." This is that sentence as a test: it makes a pawn
+	 * actually run, throws at a full charge WHILE IT IS STILL RUNNING, and a tenth of a second later
+	 * asks how much of the launch survived and whether the Core got clear of the man who threw it.
+	 *
+	 * WHY IT DRIVES THE PAWN FOR REAL RATHER THAN WRITING A VELOCITY AND THROWING ON THE SAME FRAME,
+	 * which is what Trace.ModeB.MomentumTestNow's RUNNING case does and why that case could never have
+	 * found this. The bug is made of the pawn's ADVANCE BETWEEN TWO FRAMES: the launch point is 70 uu
+	 * ahead of the eye and clears the thrower's own capsule by about 15 uu, and a frame at run speed
+	 * is ~20 uu of forward travel, so the capsule walks into the ball before the ball's first
+	 * integration. A test that sets Velocity, throws and restores Velocity in one frame never moves
+	 * the capsule at all and passes on the broken build.
+	 *
+	 * THE RED ARM IS `Trace.ModeB.FlightHitsPawns 1`, which restores the sweep that let a player
+	 * capsule block the flight and nothing else. This test FAILS on it and PASSES without it, in the
+	 * same build, on the same pawn, from the same command line.
+	 *
+	 * It SKIPS rather than fails when it cannot stage its own state (nothing alive to throw with, a
+	 * wall within the first few metres of the aim), because "the pawn was standing in a doorway" is
+	 * not a fact about the throw rule and must never be reported as one.
+	 */
+	void RunRunningThrowTest();
 
 	// --- Pass input ------------------------------------------------------------------------------
 
@@ -1850,6 +1890,42 @@ private:
 
 	/** Server, mode B. Nearest living player within the pickup radius takes it. True if one did. */
 	bool ServerTryLoosePickup();
+
+	/**
+	 * Server, mode B, DEMO 27 — *** THE THROW'S OWN ALARM, AND IT IS THE CHECK THAT WOULD HAVE CAUGHT
+	 * THIS THE FIRST TIME. ***
+	 *
+	 * A tenth of a second after every launch it compares the Core's speed with the speed it left the
+	 * hand at, and says so in the log when most of it has gone missing. That is exactly the symptom
+	 * the owner reported twice - "it doesn't throw forward", "it drops to the ground" - stated as a
+	 * number, on every throw, in a normal match, with no harness running.
+	 *
+	 * IT ASKS TWO QUESTIONS, AND THEY DO DIFFERENT JOBS.
+	 *
+	 * FIRST, DID A BODY BLOCK THE FLIGHT SWEEP - bFlightHitABody. This is the bug stated as the RULE
+	 * it breaks. It is asked first and it does not care about the speed, because with the
+	 * depenetration guard also in place a self-collision can now leave the speed intact and wreck only
+	 * the clearance: Trace.ModeB.RunThrowTest on the FlightHitsPawns=1 arm keeps 100% of its launch
+	 * and ends 8 uu from the thrower's capsule. This is the Warning, and it cannot cry wolf, because
+	 * SweepLooseCore filtering pawns out of the sweep's answer is exactly what makes the flag
+	 * unsettable on a working tree.
+	 *
+	 * SECOND, HOW MUCH OF THE LAUNCH IS LEFT - the ratio. This one is arm-independent: it does not
+	 * know or care whether the speed was eaten by a magnet, by a bounce rule or by something nobody
+	 * has written yet, so it can still catch the NEXT way of producing the same complaint. Free flight
+	 * preserves 3D speed to within a few percent over 0.1 s (gravity alone) and the catch magnet
+	 * preserves it exactly, so anything below the threshold means the Core HIT something - and the
+	 * line then NAMES what, at Display, because at Bounce() = 0.195 a wall is supposed to take four
+	 * fifths of a launch and a bot bouncing one off a goal spoke is not news.
+	 *
+	 * THE ORDER OF THOSE TWO IS A CORRECTION. The first version of this function had only the ratio
+	 * and split it on a 150 uu clearance, which is a proxy and not a fact: it fired the Demo 27 alarm
+	 * on four of thirty-four throws on the FIXED tree, every one of them an ordinary bounce off arena
+	 * geometry. See LastContactActor for the two fields that ended the guessing.
+	 *
+	 * Reporting only: it changes no rule and no flight. See ATraceCore::LaunchAuditDueServerTime.
+	 */
+	void ServerTickLaunchAudit();
 
 	/**
 	 * Server, mode B, SPEC v6 §4.1 — THE CATCH ZONE.
@@ -2477,10 +2553,84 @@ private:
 	bool bCatchZoneContested = false;
 
 	/**
-	 * SPEC v13 §8. Shared-clock time the CURRENT flight last had a blocked sweep, and the speed it
-	 * was travelling at when it did. Diagnostics for Trace.ModeB.TurnoverLog only.
+	 * SPEC v13 §8. Shared-clock time the CURRENT flight last had a blocked sweep; -1 if it has had
+	 * none.
+	 *
+	 * DEMO 27 TOOK IT OUT OF DIAGNOSTICS, and the line that said so is rewritten rather than deleted
+	 * because reading it as "Trace.ModeB.TurnoverLog only" is now exactly the wrong thing to believe:
+	 * the ALWAYS-ON launch audit reads this field to decide whether anything touched the throw at all,
+	 * and prints the contact's AGE with it, because on the reported bug that age is the launch frame
+	 * itself - "0.000s into the flight". A run with the turnover log off still gets the whole answer.
+	 * See ServerTickLaunchAudit.
 	 */
 	float LastContactServerTime = -1.f;
+
+	/**
+	 * DEMO 27, AND THE ONE FACT THE LAUNCH AUDIT USED TO THROW AWAY: what the current flight last hit.
+	 *
+	 * The contact site has the FHitResult in its hand and, before this, printed the actor's name only
+	 * when Trace.ModeB.TurnoverLog was on — which is OFF in every ordinary run. So the always-on alarm
+	 * below had to guess from a distance whether the Core had hit the thrower or a goal spoke, and it
+	 * guessed wrong on four throws out of thirty-four. Two weak pointers' worth of state ends the
+	 * guessing: see ServerTickLaunchAudit.
+	 */
+	TWeakObjectPtr<AActor> LastContactActor;
+
+	/**
+	 * DEMO 27. The COMPONENT of that actor, by name, because the actor's own name does not identify it.
+	 *
+	 * Every static surface in the arena belongs to one ATraceArenaBuilder, so "TraceArenaBuilder_0"
+	 * tells a reader nothing and "TraceArenaBuilder_0 (DaisPylon_5)" tells them where the player was
+	 * standing. An FName is a copy of two ints — the reason this is not the FString the log line wants
+	 * is that the contact runs on every blocked sweep and the log line runs once per throw.
+	 */
+	FName LastContactComponentName;
+
+	/**
+	 * DEMO 27. True when that contact was a BODY — a pawn-typed collider, or the thrower himself.
+	 *
+	 * Recorded at the contact rather than derived later because it is the HIT COMPONENT'S object type
+	 * that decides it, exactly as in SweepLooseCore, and the component is gone by the time the audit
+	 * runs. This is the bug's signature: with the pawn filter working it can never be true, so a true
+	 * here means the flight sweep is seeing bodies again.
+	 */
+	bool bLastContactWasBody = false;
+
+	/**
+	 * DEMO 27. True once ANY contact in this flight was a body. Latched, and cleared with the flight.
+	 *
+	 * Latched rather than read off bLastContactWasBody because the audit looks once, a tenth of a
+	 * second in, and a self-collision on the launch frame followed by a wall two frames later would
+	 * otherwise have overwritten the only fact worth reporting. THIS IS THE ALARM'S TRIGGER: with
+	 * SweepLooseCore filtering pawns out of the sweep's answer it cannot be set at all, so unlike the
+	 * distance test it replaced it has no false-positive case to tune - it is the broken rule itself.
+	 */
+	bool bFlightHitABody = false;
+
+	/** DEMO 27. Forgets this flight's contact history. Every path that starts or ends a flight calls it. */
+	void ForgetLastContact()
+	{
+		LastContactServerTime = -1.f;
+		LastContactActor = nullptr;
+		LastContactComponentName = NAME_None;
+		bLastContactWasBody = false;
+		bFlightHitABody = false;
+	}
+
+	// --- DEMO 27: THE LAUNCH AUDIT. Server only, diagnostics only, three floats. -------------------
+	//
+	// Armed by ThrowFromHolder and read once by ServerTickLaunchAudit. The serial is carried so a
+	// flight that was caught, reset or thrown again before the audit came due cannot be scored
+	// against a launch it did not belong to - the same reason FThrowMomentumSample::Serial exists.
+
+	/** Shared-clock time the audit is due, or -1 when nothing is armed. */
+	float LaunchAuditDueServerTime = -1.f;
+
+	/** Speed the audited flight left the hand at, uu/s. The denominator of the ratio. */
+	float LaunchAuditLaunchSpeed = 0.f;
+
+	/** LastThrow.Serial at the moment it was armed. */
+	int32 LaunchAuditSerial = 0;
 
 	// --- SPEC v19 §1.5: THE LANDING IS LATCHED, THEN SHOWN, THEN AWARDED. --------------------------
 	//

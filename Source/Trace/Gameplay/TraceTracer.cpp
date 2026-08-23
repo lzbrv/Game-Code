@@ -26,33 +26,52 @@
  * *** THE ONE SIZE KNOB FOR THE WHOLE BEAM. *** See ATraceTracer::GetBeamProfileScale in the header
  * for the argument; this is where the default was chosen.
  *
- * 0.55 WAS PICKED BY LOOKING, and here is the whole of what was looked at. At 1.0 — the frame the
- * user called "a bit too large", Saved/Screenshots/v31integ_45_smg_firing.png as it stood before
- * this pass — the shot is a white plank filling roughly a third of the frame's width, flat enough
- * to read as one of the arena's structural rails. Re-photographed at 0.55 by the same
- * Trace.Integ.WalkGuns run, the same shot is a slender bolt that converges on the crosshair with
- * the taper visible along it. A 0.40 run was taken as the other bracket: measurably smaller (the
- * muzzle flash's disc went 666 -> 411 -> 283 px of frame across 1.0 / 0.55 / 0.40) but past what
- * was asked for — the note was "a BIT too large", and 0.55 is a 45% cut, not a disappearance.
+ * IT WAS 0.55 UNTIL DEMO 27, PICKED AGAINST THE NOTE "a bit too large". At 1.0 the shot is a white
+ * plank filling roughly a third of the frame's width, flat enough to read as one of the arena's
+ * structural rails; 0.55 made it a slender bolt converging on the crosshair with the taper visible
+ * along it. 0.40 was photographed then as the other bracket and REJECTED as further than had been
+ * asked for (the muzzle flash's disc went 666 -> 411 -> 283 px across 1.0 / 0.55 / 0.40).
  *
- * READ THAT BRACKET AS A MEASUREMENT OF THE CORE BEAM AND NOT OF THE FLASH. The three disc widths
- * above were taken while the muzzle cone was still drawn on the OPAQUE emissive material, so what
- * they measured was the silhouette of a solid disc, which is a function of its size alone. The cone
- * is additive now (see the blend argument at the muzzle-flash beat in InitTracer) and its apparent
- * size is a function of its brightness curve as well as its geometry — it is at its widest exactly
- * when it has faded to nothing. The 0.55 chosen here is still the right number for the beam, but a
- * future bracket of the FLASH has to be re-measured; the old px figures do not carry over.
+ * *** DEMO 27 IS 0.40, BECAUSE THE REQUEST CHANGED AND SO DID THE EFFECT. *** The note is now "too
+ * thick" — not "a bit" — and the beam it is about no longer stays on screen: a bolt crosses the gap
+ * and is eaten in 0.10..0.30 s where the old rope lay there for 0.85 s. Half of what made 0.55 the
+ * right answer was that a thin beam which LINGERS still reads, and a thin beam which is gone in a
+ * fifth of a second has to be found first. That trade is gone; the picture is now short-lived by
+ * design, so the width no longer has to carry the persistence.
+ *
+ * *** AND HERE IS WHY IT IS NOT SMALLER, MEASURED RATHER THAN ASSERTED. *** The case that constrains
+ * this knob is not the shot in your own hands, it is somebody else's across the arena — the one the
+ * legibility floor exists for. Trace.TestBeam's third beam (added in this pass) draws exactly that:
+ * 6000 uu, side on, 3000 uu away. Photographed at 1600x900 and isolated by differencing each frame
+ * against the median of the frames with no beam in them, that beam measures:
+ *
+ *     Trace.Fx.BeamScale 0.55   3 px wide, peak 252, profile [208, 252, 221, 61]
+ *     Trace.Fx.BeamScale 0.40   3 px wide, peak 225, profile [183, 225, 216,  37]
+ *
+ * SAME WIDTH. A 27% cut in radius bought no visible thinning out there at all, because a long shot
+ * is already AT THE PIXEL FLOOR and what actually changed was about 11% of its brightness. So 0.40
+ * costs the third-party shot almost nothing — and anything much below it starts spending the only
+ * thing that beam has left. The cut is real where the complaint is: at viewmodel range the halo's
+ * on-screen bar goes from roughly 117 px to 85 px of a 1600 px frame.
+ *
+ * READ THE OLD DISC BRACKET AS A MEASUREMENT OF THE CORE BEAM AND NOT OF THE FLASH. The three disc
+ * widths above were taken while the muzzle cone was still drawn on the OPAQUE emissive material, so
+ * what they measured was the silhouette of a solid disc, which is a function of its size alone. The
+ * cone is additive now (see the blend argument at the muzzle-flash beat in InitTracer) and its
+ * apparent size is a function of its brightness curve as well as its geometry — it is at its widest
+ * exactly when it has faded to nothing. A future bracket of the FLASH has to be re-measured; the old
+ * px figures do not carry over.
  *
  * The knob is live, so the next pass can re-photograph a different value without a rebuild, which
  * is most of the point of it being a CVar: -dpcvars=Trace.Fx.BeamScale=0.40 on the editor command
- * line is how the bracket above was taken, no rebuild involved.
+ * line is how both brackets above were taken, no rebuild involved.
  *
  * File-scope `static`, like TraceCore.cpp's block of the same: internal linkage, so the jumbo build
  * cannot collide it with anything, and no anonymous namespace for the collision checker to flag.
  */
 static TAutoConsoleVariable<float> GCVarTracerBeamScale(
 	TEXT("Trace.Fx.BeamScale"),
-	0.55f,
+	0.40f,
 	TEXT("One multiplier on the ENTIRE authored beam profile — core muzzle and tip radius, halo ")
 	TEXT("radius, and the muzzle-flash cone's radius and height — applied after the legibility floor ")
 	TEXT("and the shipped Tracer settings. Every FX-doc proportion (tip/muzzle, halo/muzzle, the ")
@@ -61,6 +80,50 @@ static TAutoConsoleVariable<float> GCVarTracerBeamScale(
 	TEXT("0.05..4.0. Trace.Fx.Beam's three ABSOLUTE rows grade doc x this; its two RATIO rows are ")
 	TEXT("scale-invariant and grade the doc's raw proportions whatever this is set to."),
 	ECVF_Default);
+
+/**
+ * DEMO 27 — HOW FAST THE BOLT CROSSES THE GAP. See ATraceTracer::BoltBaseSpeedUU for the bracket.
+ *
+ * Live, and it retunes the NEXT shot rather than the one in flight (ATraceTracer::BoltTravel says
+ * why). Clamped in GetBoltSpeed and only there: at 0 the bolt would never leave the muzzle and the
+ * tracer would look like it had stopped rendering, which is the same failure the size knob's clamp
+ * exists to prevent.
+ *
+ * File-scope `static` for the reason the knob above it is: internal linkage, so the jumbo build
+ * cannot collide it, and no anonymous namespace for the collision checker to flag.
+ */
+static TAutoConsoleVariable<float> GCVarBoltSpeed(
+	TEXT("Trace.Fx.BoltSpeed"),
+	ATraceTracer::BoltBaseSpeedUU,
+	TEXT("How fast a tracer's bolt travels, in uu/s, before the 0.10..0.30 s life clamps re-solve ")
+	TEXT("it for very short and very long shots. 22000 is ~8 frames across a 3000 uu corridor at ")
+	TEXT("60 Hz. Clamped 2000..200000. THE SHOT ITSELF IS HITSCAN AND INSTANT — this is the speed ")
+	TEXT("of a picture of a shot that has already been resolved, and nothing about damage, timing ")
+	TEXT("or the aim ray reads it."),
+	ECVF_Default);
+
+/**
+ * *** THE RED ARM FOR THE TRAVEL RULE. *** 0 restores the pre-Demo-27 beam: laid full length from
+ * muzzle to impact on frame one and left there.
+ *
+ * READ IN EXACTLY ONE PLACE — UpdateEffect, where the geometry is written — and deliberately NOT in
+ * ATraceTracer::ResolveBoltTravel or BoltHeadZUU, which are what Trace.Fx.Beam's verdict grades
+ * against. That split is the whole point of it: if the expected side could see this knob, both arms
+ * of the harness would move together and the check would measure nothing, which is the failure this
+ * file has already been caught in twice (the two cone rows that divided their own measurement out).
+ * With the split, Trace.Fx.BeamRopeArm fires a real shot with travel off and the two travel rows go
+ * red while the five profile rows stay green — which also localises the rule being tested.
+ *
+ * It is a debugging knob and not a setting: there is no ini for it and nothing ships with it off.
+ */
+static TAutoConsoleVariable<int32> GCVarBoltTravel(
+	TEXT("Trace.Fx.BoltTravel"),
+	1,
+	TEXT("1 (default) draws the tracer as a short bolt travelling from muzzle to impact. 0 restores ")
+	TEXT("the pre-Demo-27 behaviour — the whole beam laid down instantly at full length — as the ")
+	TEXT("RED ARM for Trace.Fx.Beam's two travel checks. Cosmetic either way: the shot is hitscan ")
+	TEXT("and was resolved before this actor existed."),
+	ECVF_Cheat);
 
 namespace
 {
@@ -318,14 +381,18 @@ namespace
 
 ATraceTracer::ATraceTracer()
 {
-	// Ticks for one sixth of a second to drive the fade, then deletes itself.
+	// Ticks for a fraction of a second to fly the bolt down the shot, then deletes itself.
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = true;
 
 	// Cosmetic-only: each machine spawns its own, so this must never go on the wire.
 	bReplicates = false;
 	SetCanBeDamaged(false);
-	InitialLifeSpan = TracerLifeSeconds;
+
+	// A CEILING, not this shot's answer: the constructor runs before there is a shot to measure.
+	// InitTracer calls SetLifeSpan with the real figure — max(this bolt's life, the flash window) —
+	// as soon as it has resolved the travel. See MaxTracerLifeSeconds.
+	InitialLifeSpan = MaxTracerLifeSeconds;
 
 	EffectRoot = CreateDefaultSubobject<USceneComponent>(TEXT("EffectRoot"));
 	SetRootComponent(EffectRoot);
@@ -490,6 +557,76 @@ float ATraceTracer::GetBeamProfileScale()
 	// Clamped here and only here, so every consumer — the effect and the harness that grades it —
 	// sees the same number and neither can be handed a zero or a negative from the console.
 	return FMath::Clamp(GCVarTracerBeamScale.GetValueOnAnyThread(), 0.05f, 4.0f);
+}
+
+float ATraceTracer::GetBoltSpeed()
+{
+	// Same rule as the size knob: clamped once, here, so the effect and the verdict cannot be handed
+	// different numbers. The floor is what stops a console typo producing a bolt that never leaves
+	// the muzzle, which on screen is indistinguishable from the tracer not rendering at all.
+	return FMath::Clamp(GCVarBoltSpeed.GetValueOnAnyThread(), 2000.f, 200000.f);
+}
+
+FTraceTracerBoltTravel ATraceTracer::ResolveBoltTravel(float ShotLengthUU)
+{
+	FTraceTracerBoltTravel Travel;
+
+	const float SafeShotUU = FMath::Max(0.f, ShotLengthUU);
+
+	// A FIXED FRACTION OF THE SHOT, clamped at both ends — see BoltLengthFraction for why this is
+	// not one constant. A bolt longer than its own shot is legal and needs no special case: the
+	// tail simply starts at the muzzle while the head is already at the impact, and the whole beam
+	// appears at once and is immediately eaten. That is what a pressed-against-a-wall shot is.
+	Travel.LengthUU = FMath::Clamp(SafeShotUU * BoltLengthFraction, BoltMinLengthUU, BoltMaxLengthUU);
+
+	// The head crosses the shot and then the tail crosses the bolt, so this is the whole distance
+	// the leading edge has to cover before there is nothing left on screen.
+	const float TravelSpanUU = SafeShotUU + Travel.LengthUU;
+
+	// CLAMP THE LIFE, THEN RE-SOLVE THE SPEED FROM IT. Not the other way round: truncating a flight
+	// at a fixed speed would switch a bolt off in mid-air, and the swallow at the impact is the
+	// whole of the "disappearing behind it as it moves" the report asks for. Solving the speed keeps
+	// one law — head Z is speed x age — and keeps the head arriving exactly as the tail is eaten.
+	const float NaturalLifeSeconds = TravelSpanUU / GetBoltSpeed();
+	Travel.LifeSeconds = FMath::Clamp(NaturalLifeSeconds, BoltMinLifeSeconds, BoltMaxLifeSeconds);
+	Travel.SpeedUU = TravelSpanUU / FMath::Max(Travel.LifeSeconds, KINDA_SMALL_NUMBER);
+
+	// CONTINUITY, AND IT IS WHY A FULL-RANGE SHOT IS NOT A ROW OF DASHES. Clamping the life above
+	// and re-solving lets the speed grow without bound with the shot, so on a long shot the bolt
+	// advanced further per frame than its own length and drew as separate segments. See
+	// BoltContinuityHz for the derivation; the floor is exact rather than a fudge factor, and it
+	// binds only on shots long enough to need it (a corridor-length shot is untouched).
+	const float FrameSeconds = 1.0f / BoltContinuityHz;
+	if (Travel.LifeSeconds > FrameSeconds)
+	{
+		const float MinLengthForContinuity = SafeShotUU * FrameSeconds / (Travel.LifeSeconds - FrameSeconds);
+		if (MinLengthForContinuity > Travel.LengthUU)
+		{
+			// Re-solve the whole travel off the longer bolt: the span, and therefore the speed, are
+			// both functions of the length and would otherwise disagree with it.
+			Travel.LengthUU = FMath::Min(MinLengthForContinuity, SafeShotUU);
+			const float ReSpanUU = SafeShotUU + Travel.LengthUU;
+			Travel.LifeSeconds = FMath::Clamp(ReSpanUU / GetBoltSpeed(), BoltMinLifeSeconds, BoltMaxLifeSeconds);
+			Travel.SpeedUU = ReSpanUU / FMath::Max(Travel.LifeSeconds, KINDA_SMALL_NUMBER);
+		}
+	}
+
+	return Travel;
+}
+
+float ATraceTracer::BoltHeadZUU(const FTraceTracerBoltTravel& Travel, float ShotLengthUU, float AgeSeconds)
+{
+	// Stops dead at the impact. It does not overshoot and it is not allowed to run backwards on a
+	// negative age (which cannot happen from the world clock, but this is also called by the verdict
+	// with an age read out of a log).
+	return FMath::Clamp(Travel.SpeedUU * AgeSeconds, 0.f, FMath::Max(0.f, ShotLengthUU));
+}
+
+float ATraceTracer::BoltTailZUU(const FTraceTracerBoltTravel& Travel, float ShotLengthUU, float AgeSeconds)
+{
+	// One bolt-length behind the head's UNCLAMPED position, which is what makes the bolt shrink
+	// rather than stop: once the head has pinned at the impact the tail keeps closing on it.
+	return FMath::Clamp(Travel.SpeedUU * AgeSeconds - Travel.LengthUU, 0.f, FMath::Max(0.f, ShotLengthUU));
 }
 
 ATraceTracer* ATraceTracer::GetNewestTracer(const UWorld* World, bool bFirstPersonOnly)
@@ -711,6 +848,13 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 
 	BeamLengthUU = static_cast<float>(Length);
 
+	// --- DEMO 27: HOW THIS SHOT'S BOLT FLIES -----------------------------------------------------
+	//
+	// Resolved ONCE, from the shot's own length, and cached: the rule is a pure function of a length
+	// that cannot change now the beam is placed, and re-reading Trace.Fx.BoltSpeed every frame would
+	// let a bolt change speed halfway down the arena and jump. See ATraceTracer::BoltTravel.
+	BoltTravel = ResolveBoltTravel(BeamLengthUU);
+
 	// Local +Z runs down the shot, so every piece can be placed by its distance along the beam.
 	SetActorLocationAndRotation(BeamStart, FRotationMatrix::MakeFromZ(BeamDir).ToQuat());
 
@@ -720,8 +864,8 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	// --- beam core: ONE MID SHARED BY THE THREE TAPER SEGMENTS -----------------------------------
 	//
 	// The MID is made on the first segment and assigned to the other two, so the three cylinders are
-	// literally the same material instance. They cannot drift apart, and the per-frame fade is one
-	// parameter write rather than three.
+	// literally the same material instance. They cannot drift apart, and the per-frame colour write
+	// is one call rather than three.
 	if (BeamSegments[0] != nullptr)
 	{
 		CoreMID = UTraceFxShapes::MakeGlowMID(BeamSegments[0], 0, ETraceFxBlend::Emissive, CoreBlend);
@@ -812,6 +956,20 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 		GFirstPersonFlashOwner = this;
 	}
 
+	// --- HOW LONG THIS ACTOR ACTUALLY LIVES ------------------------------------------------------
+	//
+	// The bolt's own life, or the muzzle flash's authored 0.28 s window if the flash outlasts it.
+	// Both, because they are on different clocks ON PURPOSE (see the flash paragraph in the class
+	// comment): the bolt is what "lingers on the field" and it is now over in 0.10..0.30 s, while
+	// the flash is a small cone at the shooter's own barrel whose expansion curve pops if it is cut
+	// short. Whichever is longer is when there is nothing left to draw.
+	//
+	// SetLifeSpan rather than InitialLifeSpan: this runs after the actor has begun play, so the
+	// constructor's ceiling is already ticking and this restarts it at the right figure.
+	const float ActorLifeSeconds =
+		FMath::Max(BoltTravel.LifeSeconds, bMuzzleVisible ? MuzzleFlashSeconds : 0.f);
+	SetLifeSpan(ActorLifeSeconds);
+
 	// NO IMPACT POP. Spec v4 §4: "Remove the sphere from the end of the bullet tracer hitscan
 	// animation, so it's just a bullet trace." The beam still terminates exactly on the impact
 	// point, which is the information the sphere was covering up. bImpacted is now unused; see the
@@ -822,7 +980,12 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	const UWorld* ShotWorld = GetWorld();
 	SpawnTimeSeconds = (ShotWorld != nullptr) ? ShotWorld->GetTimeSeconds() : 0.0;
 
-	// Frame one must already look right: this is hitscan, so there is no state before "fully drawn".
+	// FRAME ONE, LAID BEFORE THE FIRST TICK. It is not "fully drawn" any more — at age zero the bolt
+	// is a zero-length sliver sitting on the muzzle, which is correct and is what the head-Z law
+	// says — but it must be laid ALL THE SAME, so that nothing is ever rendered at whatever
+	// transform a recycled component happened to be carrying. The first tick, a frame later, is
+	// where the bolt is 350-odd uu down the shot and visible.
+	bBoltVisible = true;
 	UpdateEffect(0.f);
 
 	// VERBOSE ON PURPOSE - this fires up to ~80 times a second in a full match. Enable it with
@@ -830,58 +993,101 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	// that the tracer is not spawning. (Trace.Fx.Beam logs at Display and is the better probe.)
 	UE_LOG(LogTraceGame, Verbose,
 		TEXT("TRACER: profile=%s%s start=%s len=%.1fuu scale=%.3f core=%.3f->%.3fuu halo=%.3fuu op=%.3f "
-		     "cone=r%.2f/h%.2fuu blends core=%s halo=%s flash=%s"),
+		     "cone=r%.2f/h%.2fuu bolt=%.0fuu @%.0fuu/s life=%.3fs (actor %.3fs) blends core=%s halo=%s flash=%s"),
 		bSmgProfile ? TEXT("SMG") : TEXT("PISTOL"), bFirstPersonShot ? TEXT(" (first person)") : TEXT(""),
 		*BeamStart.ToCompactString(), Length, BeamProfileScale, CoreMuzzleRadiusUU, CoreTipRadiusUU,
 		HaloRadiusUU, HaloOpacityValue, FlashConeRadiusUU, FlashConeHeightUU,
+		BoltTravel.LengthUU, BoltTravel.SpeedUU, BoltTravel.LifeSeconds, ActorLifeSeconds,
 		UTraceFxShapes::BlendName(CoreBlend), UTraceFxShapes::BlendName(HaloBlend),
 		UTraceFxShapes::BlendName(FlashBlend));
 }
 
 void ATraceTracer::UpdateEffect(float AgeSeconds)
 {
-	// --- HOLD, THEN FADE (FX doc: "Spawn at discharge, hold 0.10 s, fade over the decay") --------
+	// *** THE SHOT IS INSTANT AND THIS CHANGES NOTHING ABOUT THAT. ***
 	//
-	// The hold is not decoration. A hitscan beam is drawn and gone inside three frames at 60 Hz, and
-	// a fade that starts on frame one means the brightest frame the player ever sees is one they
-	// were not looking at yet. It also makes the effect MEASURABLE: throughout the hold the geometry
-	// is at exactly the doc's radii, so "the taper radii in uu" is a well-defined question with the
-	// answer 3.000 / 1.300 rather than "3.0 times whatever the fade was on the frame you sampled".
+	// Everything below moves a picture. UTraceWeaponComponent has already traced, already resolved
+	// the hit and already applied the damage by the time ATraceTracer::Spawn is called with the two
+	// points it computed; this actor is spawned afterwards, it is cosmetic, it is never replicated,
+	// and nothing that decides a hit reads a line of this file. So a bolt whose head has not yet
+	// visually reached the player it hit is a picture drawn a few frames behind an event that has
+	// already happened — the damage landed on the frame the trigger went down, exactly as it did
+	// before Demo 27. This pass added no timer, no tick-driven trace and no state any gameplay code
+	// can see. If a future change ever wants the hit to follow the bolt, that is a change to the
+	// weapon component and to the server, and it does not start here.
+	//
 	// The age this frame's geometry is being laid at, recorded for the probe. See
-	// FTraceTracerShotDebug::GeometryAgeSeconds: the muzzle cone's authored SIZE is a function of
-	// age, so a probe grading the live cone has to evaluate the doc's curve at the age the
-	// transform was actually written at rather than at the age its own sample happened to read.
+	// FTraceTracerShotDebug::GeometryAgeSeconds: both the bolt's POSITION and the muzzle cone's SIZE
+	// are functions of age, so a probe grading the live geometry has to evaluate the authored curves
+	// at the age the transforms were actually written at, not at the age its own sample read.
 	GeometryAgeSeconds = AgeSeconds;
 
-	const float DecayAlpha = FMath::Clamp(
-		(AgeSeconds - BeamHoldSeconds) / FMath::Max(BeamDecaySeconds, KINDA_SMALL_NUMBER), 0.f, 1.f);
-
-	// Ease-out on intensity: full brightness on arrival, then a fast drop with a short tail. That
-	// asymmetry is what reads as "weighty" rather than "a light switch".
-	const float Fade = FMath::Pow(1.f - DecayAlpha, 2.2f);
-
-	// --- core: holds the doc's taper, then thins as it dies --------------------------------------
-	// The geometry is re-laid every frame rather than only scaled, because a taper is three
-	// positions as well as three radii and the two must not be able to disagree. Gated on the
-	// COMPONENTS, not on the MID: if no material resolved at all we still want the geometry at the
-	// right thickness rather than three 100 uu wide default cylinders.
-	const float Thinning = 0.35f + 0.65f * Fade;
-	UStaticMeshComponent* Segments[BeamTaperSegments] = { BeamSegments[0], BeamSegments[1], BeamSegments[2] };
-	UTraceFxShapes::TaperAlongLocalZ(
-		MakeArrayView(Segments, BeamTaperSegments), 0.0, static_cast<double>(BeamLengthUU),
-		CoreMuzzleRadiusUU * Thinning, CoreTipRadiusUU * Thinning);
-	UTraceFxShapes::SetGlow(CoreMID, CoreBlend, HotColor, CoreIntensity * Fade);
-
-	// --- halo: constant radius, fading opacity ---------------------------------------------------
+	// --- WHERE THE BOLT IS THIS FRAME ------------------------------------------------------------
 	//
-	// DELIBERATELY NOT COLLAPSING INWARD the way the pre-v32 sheath did. The FX doc's sleeve has one
-	// radius and one opacity, and "hold, then fade over the decay" is a statement about the second.
-	// Animating the radius as well would mean the number a verifier is told to measure — r 5.2 uu —
-	// is only true on the frames nobody sampled.
-	if (bHaloVisible && BeamHalo != nullptr)
+	// THE HOLD-THEN-FADE ENVELOPE IS GONE FROM HERE ENTIRELY. There is no DecayAlpha, no ease-out
+	// Fade and no Thinning: the bolt is at the FX doc's radii and full brightness on every frame it
+	// exists and it ends by being eaten at the impact, not by dimming in place. See the class
+	// comment; in one line, 0.75 s of visible dying is most of why the old beam read as litter.
+	//
+	// Trace.Fx.BoltTravel 0 is the red arm and it is read HERE and nowhere else — the law in
+	// ATraceTracer::BoltHeadZUU, which the verdict grades against, cannot see it. See the CVar.
+	const bool bBoltTravels = (GCVarBoltTravel.GetValueOnAnyThread() != 0);
+	const float HeadZ = bBoltTravels ? BoltHeadZUU(BoltTravel, BeamLengthUU, AgeSeconds) : BeamLengthUU;
+	const float TailZ = bBoltTravels ? BoltTailZUU(BoltTravel, BeamLengthUU, AgeSeconds) : 0.f;
+
+	// SWALLOWED: the tail has reached the impact and there is no bolt left. Hidden once and never
+	// shown again, because the actor can outlive its bolt — the muzzle flash keeps the doc's 0.28 s
+	// whatever the bolt does — and a swallowed bolt must not be re-laid as a sliver at the hit point
+	// for the rest of it. bBoltVisible is what the probe reads to know the difference.
+	if (bBoltVisible && HeadZ - TailZ <= 0.f && AgeSeconds > 0.f)
 	{
-		UTraceFxShapes::StretchAlongLocalZ(BeamHalo, 0.0, static_cast<double>(BeamLengthUU), HaloRadiusUU);
-		UTraceFxShapes::SetGlow(HaloMID, HaloBlend, ShotColor, HaloIntensity, HaloOpacityValue * Fade);
+		bBoltVisible = false;
+		for (UStaticMeshComponent* Segment : BeamSegments)
+		{
+			if (Segment != nullptr)
+			{
+				Segment->SetVisibility(false);
+			}
+		}
+		if (BeamHalo != nullptr)
+		{
+			BeamHalo->SetVisibility(false);
+		}
+	}
+
+	if (bBoltVisible)
+	{
+		// --- core: the doc's taper, laid ALONG THE BOLT ------------------------------------------
+		//
+		// THE TAPER RUNS TAIL -> HEAD, not muzzle -> impact, so the trailing end carries the doc's
+		// muzzle radius and the leading end its tip radius and the dash is a teardrop pointing the
+		// way it is going. Every proportion the doc authored (tip/muzzle 0.433, halo/muzzle 1.733)
+		// is unchanged by that — it is the same two radii over a shorter span. Mapping the taper to
+		// position along the SHOT instead was considered and rejected: a bolt near the muzzle would
+		// then have both ends at ~3.0 uu, i.e. no visible taper at all for most of the flight, and
+		// the ratio rows that tell a pistol from an SMG would collapse to 1.0.
+		//
+		// Re-laid every frame rather than merely scaled, because a taper is three positions as well
+		// as three radii and the two must not be able to disagree. Gated on the COMPONENTS, not on
+		// the MID: if no material resolved at all we still want the geometry at the right size
+		// rather than three 100 uu wide default cylinders.
+		UStaticMeshComponent* Segments[BeamTaperSegments] = { BeamSegments[0], BeamSegments[1], BeamSegments[2] };
+		UTraceFxShapes::TaperAlongLocalZ(
+			MakeArrayView(Segments, BeamTaperSegments), static_cast<double>(TailZ), static_cast<double>(HeadZ),
+			CoreMuzzleRadiusUU, CoreTipRadiusUU);
+		UTraceFxShapes::SetGlow(CoreMID, CoreBlend, HotColor, CoreIntensity);
+
+		// --- halo: the same span, one radius, one opacity ----------------------------------------
+		//
+		// DELIBERATELY NOT COLLAPSING INWARD and no longer fading either. The FX doc's sleeve has one
+		// radius and one opacity; it now has them for the whole of the bolt's life, which makes
+		// "the halo opacity is 0.55" true on every frame instead of only on the frames inside a hold
+		// window nobody sampled. Trace.Fx.Beam's opacity row got strictly stronger from this.
+		if (bHaloVisible && BeamHalo != nullptr)
+		{
+			UTraceFxShapes::StretchAlongLocalZ(BeamHalo, static_cast<double>(TailZ), static_cast<double>(HeadZ), HaloRadiusUU);
+			UTraceFxShapes::SetGlow(HaloMID, HaloBlend, ShotColor, HaloIntensity, HaloOpacityValue);
+		}
 	}
 
 	// --- muzzle: a cone down the beam, growing and dying inside 0.28 s ---------------------------
@@ -932,9 +1138,10 @@ void ATraceTracer::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 
 	// A STATELESS FUNCTION OF AN ABSOLUTE CLOCK, not an accumulator. DeltaSeconds is deliberately
-	// unused: an `Age += Delta` here would double-advance across a hitch and drift over the 0.85 s
-	// this actor lives, and every duration in the effect is short enough for that to show. It also
-	// removes the sample-before-advancing hazard entirely — there is nothing to advance.
+	// unused: an `Age += Delta` here would double-advance across a hitch, and since Demo 27 age is a
+	// POSITION — a double-advanced frame teleports the bolt down the shot rather than merely dimming
+	// it early, over a life that is now a fifth of a second. It also removes the
+	// sample-before-advancing hazard entirely — there is nothing to advance.
 	(void)DeltaSeconds;
 
 	const UWorld* TickWorld = GetWorld();
@@ -969,6 +1176,15 @@ bool ATraceTracer::DescribeShot(FTraceTracerShotDebug& OutInfo) const
 	OutInfo.HaloBlend = HaloBlend;
 	OutInfo.FlashBlend = FlashBlend;
 
+	// THE SHOT'S LENGTH AND THE TRAVEL RULE ARE INPUTS, not readbacks, and are reported for the same
+	// reason ProfileMuzzleRadiusUU is: the verdict has to know what the effect was ASKED for before
+	// it can grade what the effect DID. See FTraceTracerShotDebug's two-lengths note.
+	OutInfo.ShotLengthUU = BeamLengthUU;
+	OutInfo.BoltLengthUU = BoltTravel.LengthUU;
+	OutInfo.BoltSpeedUU = BoltTravel.SpeedUU;
+	OutInfo.BoltLifeSeconds = BoltTravel.LifeSeconds;
+	OutInfo.bBoltVisible = bBoltVisible;
+
 	const UWorld* DescribeWorld = GetWorld();
 	OutInfo.AgeSeconds = (DescribeWorld != nullptr)
 		? static_cast<float>(DescribeWorld->GetTimeSeconds() - SpawnTimeSeconds) : 0.f;
@@ -983,6 +1199,15 @@ bool ATraceTracer::DescribeShot(FTraceTracerShotDebug& OutInfo) const
 	// the number it expects can only ever prove that one constant is spelled the same way twice, and
 	// the specific bug this guards against — the 100x metres/centimetres error — would be invisible
 	// to it because both copies would be wrong together.
+	//
+	// AND SINCE DEMO 27 THAT INCLUDES WHERE THE BOLT IS. The head and the tail are derived from the
+	// live relative locations and Z scales of the core segments — the far end of the furthest one and
+	// the near end of the nearest — which makes "it travels" a measurement of the same kind as "it is
+	// 3.0 uu wide". A beam that is NOT travelling reports a head pinned at the shot's length on every
+	// frame, which is exactly what Trace.Fx.BeamRopeArm produces and what its verdict must reject.
+	float FurthestEndZ = -UE_BIG_NUMBER;
+	float NearestEndZ = UE_BIG_NUMBER;
+
 	for (int32 Index = 0; Index < BeamTaperSegments; ++Index)
 	{
 		const UStaticMeshComponent* Segment = BeamSegments[Index];
@@ -990,10 +1215,31 @@ bool ATraceTracer::DescribeShot(FTraceTracerShotDebug& OutInfo) const
 		{
 			continue;
 		}
+		const FVector SegmentScale = Segment->GetRelativeScale3D();
 		OutInfo.MeasuredSegmentRadiiUU[Index] =
-			UTraceFxShapes::RadiusUUFromShapeScale(static_cast<float>(Segment->GetRelativeScale3D().X));
-		OutInfo.LengthUU += UTraceFxShapes::LengthUUFromShapeScale(static_cast<float>(Segment->GetRelativeScale3D().Z));
+			UTraceFxShapes::RadiusUUFromShapeScale(static_cast<float>(SegmentScale.X));
+
+		// StretchAlongLocalZ centres a cylinder on its own span, so the segment's two ends are its
+		// relative Z plus and minus half of the length its Z scale encodes.
+		const float SegmentLengthUU = UTraceFxShapes::LengthUUFromShapeScale(static_cast<float>(SegmentScale.Z));
+		const float SegmentCentreZ = static_cast<float>(Segment->GetRelativeLocation().Z);
+		FurthestEndZ = FMath::Max(FurthestEndZ, SegmentCentreZ + 0.5f * SegmentLengthUU);
+		NearestEndZ = FMath::Min(NearestEndZ, SegmentCentreZ - 0.5f * SegmentLengthUU);
+
+		OutInfo.DrawnLengthUU += SegmentLengthUU;
 		++OutInfo.SegmentCount;
+	}
+
+	// Zero when the bolt has been swallowed and the segments hidden: reporting the last transform
+	// they happened to hold would be reporting a bolt that is not on screen.
+	if (OutInfo.SegmentCount > 0 && bBoltVisible)
+	{
+		OutInfo.MeasuredHeadZUU = FurthestEndZ;
+		OutInfo.MeasuredTailZUU = NearestEndZ;
+	}
+	else
+	{
+		OutInfo.DrawnLengthUU = 0.f;
 	}
 
 	// The taper's END radii, extrapolated from the two OUTERMOST measured segments back to the ends
@@ -1031,9 +1277,12 @@ bool ATraceTracer::DescribeShot(FTraceTracerShotDebug& OutInfo) const
 	// The instantaneous opacity, recomputed from the SAME expression UpdateEffect uses — which is
 	// legitimate here because opacity is not a transform and cannot be read back off a MID without
 	// the material exposing it. Flagged so nobody mistakes it for a measurement.
-	const float DecayAlpha = FMath::Clamp(
-		(OutInfo.AgeSeconds - BeamHoldSeconds) / FMath::Max(BeamDecaySeconds, KINDA_SMALL_NUMBER), 0.f, 1.f);
-	OutInfo.HaloOpacityNow = OutInfo.bHaloVisible ? HaloOpacityValue * FMath::Pow(1.f - DecayAlpha, 2.2f) : 0.f;
+	//
+	// SINCE DEMO 27 THAT EXPRESSION IS THE CONSTANT ITSELF: the fade is gone, so the halo carries the
+	// FX doc's 0.55 for every frame the bolt exists. That makes this weaker as a check of "does the
+	// fade start" (there is no fade to start) and stronger as a check of the doc's number, which is
+	// what the row was always for. It is still a recomputation and still labelled as one.
+	OutInfo.HaloOpacityNow = (OutInfo.bHaloVisible && bBoltVisible) ? HaloOpacityValue : 0.f;
 
 	OutInfo.bFlashVisible = bMuzzleVisible && (MuzzleFlash != nullptr) && MuzzleFlash->IsVisible();
 	if (MuzzleFlash != nullptr)
@@ -1076,7 +1325,17 @@ namespace
 	float GTestBeamRemaining = 0.f;
 	float GTestBeamAccumulator = 0.f;
 
-	/** Spawns one broadside beam and one down-the-barrel beam in front of the local camera. */
+	/**
+	 * Spawns three beams in front of the local camera: one broadside, one down the barrel, and one
+	 * LONG broadside.
+	 *
+	 * THE THIRD ONE IS DEMO 27'S. Two of the three things the beam has to get right are only
+	 * visible at range. The legibility floor makes a long shot the FATTEST beam in the game (the one
+	 * "too thick" is loudest about) and the bolt's 0.10..0.30 s life clamp only binds out there, so
+	 * a bracket taken entirely at 1400 uu would be a bracket of the case that was never the problem.
+	 * 6000 uu at 3000 uu of standoff is a realistic cross-arena shot seen side on — the third
+	 * party's view, which is the one this project's brief says must stay legible.
+	 */
 	void SpawnTestBeams(UWorld* World, const FVector& ViewLocation, const FRotator& ViewRotation)
 	{
 		const FRotationMatrix Axes(ViewRotation);
@@ -1098,6 +1357,14 @@ namespace
 		// Down the barrel: the real first-person case, including the viewmodel offset.
 		ATraceTracer::Spawn(World, ViewLocation + Forward * 22.0, ViewLocation + Forward * 1400.0,
 			TraceTeamColor(ETraceTeam::Orange), /*bImpacted=*/true);
+
+		// THE LONG ONE, side on and far enough back to fit in frame: 6000 uu, which is where the
+		// legibility floor is comfortably binding and where the bolt's life clamp starts to. This is
+		// the "somebody else's shot across the arena" case, and it is the one to look at before
+		// shrinking anything further.
+		const FVector FarCentre = ViewLocation + Forward * 3000.0 + Up * 120.0;
+		ATraceTracer::Spawn(World, FarCentre - Right * 3000.0, FarCentre + Right * 3000.0,
+			TraceTeamColor(ETraceTeam::Blue), /*bImpacted=*/true);
 	}
 
 	void ArmTestBeam(float DurationSeconds)
@@ -1167,12 +1434,13 @@ static FAutoConsoleCommand GTraceTestBeamCmd(
 // -------------------------------------------------------------------------------------------------
 // Trace.Fx.Beam — SPEC v32 §2's evidence, measured off the beams that are actually on screen
 //
-// "PROVE IT AT RUNTIME. Compiling is not evidence." The four numbers the pass is judged on are the
-// beam's resolved length, the taper radii in uu, the halo opacity and the flash scale over time, and
-// three of the four are only meaningful as a TIME SERIES — a flash that scales 0.55 -> 3.2x over
-// 0.28 s cannot be photographed by a single print. So this samples every frame for a few seconds,
-// follows the newest tracer, and prints one row per frame out of ATraceTracer::DescribeShot(), which
-// reads its numbers back off the live component transforms.
+// "PROVE IT AT RUNTIME. Compiling is not evidence." The numbers the pass is judged on are the beam's
+// resolved length, the taper radii in uu, the halo opacity, the flash scale over time — and, since
+// Demo 27, WHERE THE BOLT IS. Most of those are only meaningful as a TIME SERIES: a flash that
+// scales 0.55 -> 3.2x over 0.28 s, or a bolt that crosses a 3000 uu gap in eight frames, cannot be
+// photographed by a single print. So this samples every frame for a few seconds, follows the newest
+// tracer, and prints one row per frame out of ATraceTracer::DescribeShot(), which reads its numbers
+// back off the live component transforms.
 //
 // *** "THE NEWEST TRACER" MEANS THE NEWEST ONE OF MINE. *** The arena is full of bots and every one
 // of them spawns a tracer per shot, so an unfiltered "newest in the world" grades whoever fired last
@@ -1210,7 +1478,7 @@ namespace TraceTracerFxProbe
 	constexpr float TriggerAtSeconds = 0.80f;
 	constexpr float TriggerHoldSeconds = 2.00f;
 
-	/** The sample kept for the verdict: the newest tracer caught inside its hold window. */
+	/** The sample kept for the verdict: the widest frame of the newest tracer. See the rule in Sample. */
 	bool GHaveBest = false;
 	FTraceTracerShotDebug GBest;
 	uint32 GBestId = 0;
@@ -1241,6 +1509,21 @@ namespace TraceTracerFxProbe
 	 */
 	constexpr float RatioTolerance = 0.01f;
 
+	/**
+	 * Tolerance on a position along the shot, in uu. Demo 27's two travel rows.
+	 *
+	 * WIDE ENOUGH FOR ONE FLOAT AND NOT ONE FRAME. The head and tail are exact arithmetic on the
+	 * transforms the same frame's UpdateEffect wrote, so the only real error is float precision on a
+	 * number that can be 20000 uu (a relative 1e-5, i.e. ~0.2 uu) — hence 2 uu and not 0.05.
+	 *
+	 * It is deliberately NOT frame-sized. A 60 Hz frame carries the bolt 366 uu at the authored
+	 * speed, so a tolerance that absorbed one would also absorb a bolt sitting still for five frames.
+	 * The reason it can be this tight is that the expected side is evaluated at GeometryAgeSeconds —
+	 * the age the effect recorded laying the geometry at — and not at the probe's own sample clock;
+	 * the verdict prints both so a skew announces itself rather than quietly grading nothing.
+	 */
+	constexpr float TravelToleranceUU = 2.0f;
+
 	void PrintSample(const FTraceTracerShotDebug& Sample)
 	{
 		// BOTH CLOCKS, EVERY FRAME. `age` is when the probe looked; `laid` is the age the effect
@@ -1250,13 +1533,14 @@ namespace TraceTracerFxProbe
 		// They are also the only way to notice, from a log alone, if a future change to when the
 		// probe samples ever puts them out of step.
 		UE_LOG(LogTraceGame, Display,
-			TEXT("FXBEAM: age=%.3fs laid=%.3fs profile=%s%s gun=%s len=%.1fuu core=%.3f->%.3fuu seg=[%.3f,%.3f,%.3f] "
+			TEXT("FXBEAM: age=%.3fs laid=%.3fs profile=%s%s gun=%s shot=%.1fuu bolt=[%.0f..%.0f]=%.0fuu "
+			     "core=%.3f->%.3fuu seg=[%.3f,%.3f,%.3f] "
 			     "halo=%.3fuu op=%.3f blend=%s twoSided=%d flash=%s scale=%.3f cone=r%.2f/h%.2fuu"),
 			Sample.AgeSeconds, Sample.GeometryAgeSeconds,
 			Sample.bSmgProfile ? TEXT("SMG") : TEXT("PISTOL"),
 			Sample.bFirstPersonShot ? TEXT("(1P)") : TEXT("(remote)"),
 			Sample.GunMesh.IsNone() ? TEXT("-") : *Sample.GunMesh.ToString(),
-			Sample.LengthUU,
+			Sample.ShotLengthUU, Sample.MeasuredTailZUU, Sample.MeasuredHeadZUU, Sample.DrawnLengthUU,
 			Sample.MeasuredMuzzleRadiusUU, Sample.MeasuredTipRadiusUU,
 			Sample.MeasuredSegmentRadiiUU[0], Sample.MeasuredSegmentRadiiUU[1], Sample.MeasuredSegmentRadiiUU[2],
 			Sample.MeasuredHaloRadiusUU, Sample.HaloOpacityNow,
@@ -1266,9 +1550,9 @@ namespace TraceTracerFxProbe
 	}
 
 	/**
-	 * The verdict. Five of the six rows are a live component transform against an authored number;
-	 * the sixth (halo opacity) is a recomputation, because a MID will not hand a scalar back, and it
-	 * says so in its own row. NOTHING here divides a measurement by a quantity derived from that same
+	 * The verdict. Seven of the eight rows are a live component transform against an authored
+	 * number; the eighth (halo opacity) is a recomputation, because a MID will not hand a scalar
+	 * back, and it says so in its own row. NOTHING here divides a measurement by a quantity derived from that same
 	 * measurement — that is an identity, it prints as a pass over any transform at all, and the two
 	 * cone rows did exactly that until a verifier caught them.
 	 *
@@ -1330,7 +1614,7 @@ namespace TraceTracerFxProbe
 		const float FloorMinUU = FMath::Max(0.f, VerdictSettings.TracerRadiusMinUU);
 		const float FloorMaxUU = FMath::Max(FloorMinUU, VerdictSettings.TracerRadiusMaxUU);
 		const float LegibilityRadiusUU = FMath::Clamp(
-			GBest.LengthUU * FMath::Max(0.f, VerdictSettings.TracerRadiusPerLength), FloorMinUU, FloorMaxUU);
+			GBest.ShotLengthUU * FMath::Max(0.f, VerdictSettings.TracerRadiusPerLength), FloorMinUU, FloorMaxUU);
 		const bool bFloorBinding = (LegibilityRadiusUU > ExpectedMuzzle);
 
 		// =========================================================================================
@@ -1372,7 +1656,7 @@ namespace TraceTracerFxProbe
 			     "of it then x %.3f (Trace.Fx.BeamScale). The ABSOLUTE check below grades against "
 			     "%.3f uu; the two RATIO checks grade the doc's authored proportions, are immune to "
 			     "both the floor and the knob, and are what tells a pistol from an SMG at any range."),
-			GBest.LengthUU, bFloorBinding ? TEXT("THE LEGIBILITY FLOOR") : TEXT("the FX doc"),
+			GBest.ShotLengthUU, bFloorBinding ? TEXT("THE LEGIBILITY FLOOR") : TEXT("the FX doc"),
 			ExpectedMuzzle, LegibilityRadiusUU, VerdictSettings.TracerRadiusPerLength,
 			FloorMinUU, FloorMaxUU, BeamScale, ExpectedMuzzleOnScreen);
 
@@ -1430,6 +1714,51 @@ namespace TraceTracerFxProbe
 			ExpectedCone * FlashKnobScale, ExpectedConeHeight * FlashKnobScale, BeamScale,
 			ExpectedConeRadiusNow, ExpectedConeHeightNow);
 
+		// =========================================================================================
+		// DEMO 27 — DOES THE BOLT ACTUALLY TRAVEL? THE TWO ROWS THAT MAKE THAT A MEASUREMENT
+		//
+		// The user's third request is a change of SHAPE — "more like a single laser disappearing
+		// behind it as it moves" — and a shape change that nothing grades is a claim. These two rows
+		// grade it, and they are built the same way the cone row is: the AUTHORED LAW on the expected
+		// side, evaluated at the age the geometry was laid at, and NOTHING BUT THE LIVE TRANSFORM on
+		// the measured side (DescribeShot derives the head and tail from the segments' own relative
+		// locations and Z scales).
+		//
+		//   bolt head z uu    where the leading edge is along the shot: clamp(speed x age, 0, shot).
+		//                     A beam laid full length on frame one measures the whole shot here and
+		//                     is expected to measure a few hundred uu, so it fails by thousands.
+		//   bolt drawn uu     how much beam is on screen: head - tail. A rope measures the shot's
+		//                     entire length; a bolt measures its own.
+		//
+		// *** THE EXPECTED SIDE CANNOT SEE THE RED ARM. *** ResolveBoltTravel and BoltHeadZUU do not
+		// read Trace.Fx.BoltTravel — only UpdateEffect does — so Trace.Fx.BeamRopeArm moves the
+		// MEASURED side alone and these two rows go red while the five profile rows stay green. That
+		// asymmetry is the whole reason the knob is read where it is; the alternative, a verdict that
+		// re-derives its expectation from the same switch the effect obeyed, is the identity this
+		// file has already shipped twice and been caught at twice.
+		//
+		// The expected travel is resolved from the MEASURED beam's own shot length — an input the
+		// effect reports, exactly like the profile radii — through the one shared resolver, so there
+		// is no second copy of the rule to drift.
+		const FTraceTracerBoltTravel ExpectedTravel = ATraceTracer::ResolveBoltTravel(GBest.ShotLengthUU);
+		const float ExpectedHeadZUU =
+			ATraceTracer::BoltHeadZUU(ExpectedTravel, GBest.ShotLengthUU, GBest.GeometryAgeSeconds);
+		const float ExpectedTailZUU =
+			ATraceTracer::BoltTailZUU(ExpectedTravel, GBest.ShotLengthUU, GBest.GeometryAgeSeconds);
+		const float ExpectedDrawnUU = FMath::Max(0.f, ExpectedHeadZUU - ExpectedTailZUU);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("FXBEAM: TRAVEL — this %.0f uu shot resolves to a %.0f uu bolt at %.0f uu/s living "
+			     "%.3fs (Trace.Fx.BoltSpeed %.0f uu/s authored, life clamped %.2f..%.2fs and the "
+			     "speed then solved from it). At the age the geometry was laid, %.4fs, the law puts "
+			     "the bolt at [%.0f..%.0f] uu — %.0f uu of it on screen out of %.0f. The rows below "
+			     "read the head and tail back off the segments' own transforms; the old instant "
+			     "full-length beam measures [0..%.0f] and fails both, which is Trace.Fx.BeamRopeArm."),
+			GBest.ShotLengthUU, ExpectedTravel.LengthUU, ExpectedTravel.SpeedUU, ExpectedTravel.LifeSeconds,
+			ATraceTracer::GetBoltSpeed(), ATraceTracer::BoltMinLifeSeconds, ATraceTracer::BoltMaxLifeSeconds,
+			GBest.GeometryAgeSeconds, ExpectedTailZUU, ExpectedHeadZUU, ExpectedDrawnUU, GBest.ShotLengthUU,
+			GBest.ShotLengthUU);
+
 		// A suppressed or degraded flash measures zero and fails both cone rows, which is right but
 		// looks like a geometry bug. Say which it is before the table rather than after it.
 		if (!GBest.bFlashVisible)
@@ -1441,9 +1770,9 @@ namespace TraceTracerFxProbe
 				     "below will measure 0.000 for that reason and not because the size is wrong."));
 		}
 
-		// WHERE EACH NUMBER CAME FROM, IN THE TABLE ITSELF. Five of these six are read back off a
+		// WHERE EACH NUMBER CAME FROM, IN THE TABLE ITSELF. Seven of these eight are read back off a
 		// live component transform; the halo's opacity cannot be, because a MID does not hand back
-		// the scalar you wrote into it, so it is recomputed from the same fade expression UpdateEffect
+		// the scalar you wrote into it, so it is recomputed from the same expression UpdateEffect
 		// uses (DescribeShot says so at the point it does it). Printing every row under the word
 		// "measured" was how two recomputations passed for readbacks in the first place, so the row
 		// now carries its own provenance and a reader can weigh it accordingly.
@@ -1467,6 +1796,8 @@ namespace TraceTracerFxProbe
 			{ TEXT("halo opacity"),          Derived,  GBest.HaloOpacityNow,         ExpectedOpacity,        OpacityTolerance  },
 			{ TEXT("flash cone radius uu"),  Readback, GBest.MeasuredConeRadiusUU,   ExpectedConeRadiusNow,  RadiusToleranceUU },
 			{ TEXT("flash cone height uu"),  Readback, GBest.MeasuredConeHeightUU,   ExpectedConeHeightNow,  RadiusToleranceUU },
+			{ TEXT("bolt head z uu"),        Readback, GBest.MeasuredHeadZUU,        ExpectedHeadZUU,        TravelToleranceUU },
+			{ TEXT("bolt drawn length uu"),  Readback, GBest.DrawnLengthUU,          ExpectedDrawnUU,        TravelToleranceUU },
 		};
 
 		int32 Failures = 0;
@@ -1482,15 +1813,15 @@ namespace TraceTracerFxProbe
 		}
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("FXBEAM: %s — expected %s profile, beam was %s from %s, sampled at age %.3fs "
+			TEXT("FXBEAM: %s — expected %s profile, beam was %s from %s, graded at age %.3fs "
 			     "(%d samples over %d of MY tracer(s), %d frames of somebody else's skipped); "
-			     "length %.1f uu, hold %.2fs decay %.2fs life %.2fs"),
+			     "shot %.1f uu, bolt %.0f uu at %.0f uu/s, life %.3fs"),
 			(Failures == 0) ? TEXT("PASS") : TEXT("FAIL"),
 			GExpectSmg ? TEXT("SMG") : TEXT("PISTOL"),
 			GBest.bSmgProfile ? TEXT("SMG") : TEXT("PISTOL"),
 			GBest.GunMesh.IsNone() ? TEXT("no resolved gun mesh") : *GBest.GunMesh.ToString(),
-			GBest.AgeSeconds, GSampleCount, GTracersSeen, GRemoteSamplesSkipped, GBest.LengthUU,
-			ATraceTracer::BeamHoldSeconds, ATraceTracer::BeamDecaySeconds, ATraceTracer::TracerLifeSeconds);
+			GBest.AgeSeconds, GSampleCount, GTracersSeen, GRemoteSamplesSkipped, GBest.ShotLengthUU,
+			ExpectedTravel.LengthUU, ExpectedTravel.SpeedUU, ExpectedTravel.LifeSeconds);
 
 		if (Failures != 0)
 		{
@@ -1556,15 +1887,29 @@ namespace TraceTracerFxProbe
 
 			PrintSample(Shot);
 
-			// KEEP THE NEWEST TRACER CAUGHT INSIDE ITS HOLD, and only inside the hold: that is the
-			// window the FX doc's radii describe, and after it the beam is deliberately thinning so
-			// 3.0 uu is no longer the right answer. Newest rather than smallest-age, because a run
-			// that switches weapons mid-window would otherwise be graded on whichever frame happened
-			// to be sampled earliest — which could be a shot from the PREVIOUS gun. If nothing lands
-			// inside a hold, nothing is kept and the verdict says so rather than grading the wrong
-			// frame, which is the failure mode §8 calls out by name.
-			if (Shot.AgeSeconds <= ATraceTracer::BeamHoldSeconds
-				&& (!GHaveBest || TracerId != GBestId || Shot.AgeSeconds < GBest.AgeSeconds))
+			// KEEP THE FRAME WITH THE MOST BOLT ON SCREEN — of the newest tracer.
+			//
+			// THIS USED TO BE "INSIDE THE 0.10 s HOLD", and the hold is gone with the fade (Demo 27).
+			// It had to be replaced rather than dropped, because the frame a verdict is graded on is
+			// a choice and an ungraded choice is where a harness quietly stops measuring: at age zero
+			// the bolt is a zero-length sliver on the muzzle and at the end it is a zero-length
+			// sliver on the impact, and either would pass the radius rows (segment radii do not
+			// depend on the span) while telling a reader nothing about the shape.
+			//
+			// The widest frame is the best-conditioned one for every row at once. The whole taper is
+			// on screen, so extrapolating the muzzle and tip radii off the outermost segments is at
+			// its most stable; the bolt is in free flight rather than being born or eaten, so the
+			// head and tail rows grade the law where it is actually running; and it is a well-defined
+			// frame that exists for every shot at every range, which "inside the hold" stopped being
+			// the moment there was no hold.
+			//
+			// NEWEST TRACER rather than smallest age, as before: a run that switches weapons
+			// mid-window must not be graded on a frame from the PREVIOUS gun. A strictly-greater test
+			// means a rope — every frame of which is equally wide — keeps its FIRST frame, which is
+			// the youngest and therefore the one where the authored law expects the least travel, so
+			// the red arm fails by the largest margin it can.
+			if (Shot.bBoltVisible
+				&& (!GHaveBest || TracerId != GBestId || Shot.DrawnLengthUU > GBest.DrawnLengthUU))
 			{
 				GHaveBest = true;
 				GBest = Shot;
@@ -1635,16 +1980,25 @@ namespace TraceTracerFxProbe
 		// else's assets.
 		UTraceFxShapes::LogPrimitiveGeometryOnce();
 
+		// Read for the banner ONLY. The verdict's expected side never sees this switch — see the
+		// TRAVEL block in PrintVerdict — but a reader of a log that fails two rows deserves to be
+		// told at the top that somebody turned travel off rather than having to infer it.
+		const bool bBoltTravelOn = (GCVarBoltTravel.GetValueOnAnyThread() != 0);
+
 		UE_LOG(LogTraceGame, Display,
 			TEXT("FXBEAM: watching for %.1fs, expecting %s, and grading MY OWN first-person beam only "
 			     "(anybody else's is skipped: a remote beam is not told which gun fired it). FX doc "
 			     "profile: pistol r 3.0->1.3 uu, SMG r 2.4->1.3 uu, halo r 5.2 uu @ 0.55, cone "
 			     "r 16/13 x h 30 uu scaling 0.55->3.2x over %.2fs, every dimension x %.3f "
-			     "(Trace.Fx.BeamScale); hold %.2fs then fade over %.2fs."),
+			     "(Trace.Fx.BeamScale). TRAVEL: a %.0f%% bolt (%.0f..%.0f uu) at %.0f uu/s, life "
+			     "clamped %.2f..%.2fs, travel %s."),
 			GWatchUntil, bHasExpectation ? (bExpectSmg ? TEXT("the SMG profile") : TEXT("the PISTOL profile"))
 			                             : TEXT("nothing (no verdict)"),
 			ATraceTracer::MuzzleFlashSeconds, ATraceTracer::GetBeamProfileScale(),
-			ATraceTracer::BeamHoldSeconds, ATraceTracer::BeamDecaySeconds);
+			100.f * ATraceTracer::BoltLengthFraction, ATraceTracer::BoltMinLengthUU,
+			ATraceTracer::BoltMaxLengthUU, ATraceTracer::GetBoltSpeed(),
+			ATraceTracer::BoltMinLifeSeconds, ATraceTracer::BoltMaxLifeSeconds,
+			bBoltTravelOn ? TEXT("ON") : TEXT("*** OFF — RED ARM, the two travel rows must fail ***"));
 
 		if (GTicker.IsValid())
 		{
@@ -1735,7 +2089,7 @@ static FAutoConsoleCommand GTraceFxBeamCmd(
 	}));
 
 // -------------------------------------------------------------------------------------------------
-// THREE ARGUMENT-FREE ARMS, AND THE THIRD ONE IS THE RED ARM
+// FOUR ARGUMENT-FREE ARMS, AND TWO OF THEM ARE RED
 //
 // Argument-free for the reason TraceIntegrationWalk.cpp documents at length: a -TraceExec= value
 // containing a space does not survive the macOS launcher's re-exec, so a headless run can only
@@ -1744,6 +2098,8 @@ static FAutoConsoleCommand GTraceFxBeamCmd(
 //   Trace.Fx.BeamPistol   pulls out slot 1, fires, grades against the PISTOL profile -> must PASS
 //   Trace.Fx.BeamSmg      pulls out slot 2, fires, grades against the SMG profile    -> must PASS
 //   Trace.Fx.BeamRedArm   pulls out slot 1, fires, grades against the SMG profile    -> must FAIL
+//   Trace.Fx.BeamRopeArm  slot 1 with the travel switched off (Demo 27)              -> must FAIL
+//                         (defined below the other three, with its own argument)
 //
 // The third one is not a joke command. SPEC v32 §8: "A harness whose red and green arms agree is not
 // measuring its rule." BeamRedArm fires the same weapon BeamPistol does and asks for a different
@@ -1766,4 +2122,46 @@ static FAutoConsoleCommand GTraceFxBeamRedArmCmd(
 	TEXT("RED ARM: draw the PISTOL, fire, and grade it against the SMG profile. Must FAIL — if it "
 	     "passes, Trace.Fx.BeamPistol is not measuring anything."),
 	FConsoleCommandDelegate::CreateStatic([]() { TraceTracerFxProbe::ArmScripted(/*bExpectSmg=*/true, TEXT("One")); }));
+
+// -------------------------------------------------------------------------------------------------
+// AND A FOURTH ARM, FOR THE RULE DEMO 27 ADDED
+//
+//   Trace.Fx.BeamRopeArm   turns Trace.Fx.BoltTravel OFF, draws slot 1, fires, and grades the
+//                          result against the PISTOL profile -> must FAIL, and must fail on the two
+//                          TRAVEL rows only.
+//
+// The existing red arm (BeamRedArm) proves the taper and the cone are read off the geometry by
+// asking for the wrong PROFILE. It says nothing about the travel rule, because both profiles travel
+// identically — so a bolt that had quietly stopped moving would keep it green. This one asks for the
+// wrong SHAPE instead: the same gun, the same profile, the same expectations, with the pre-Demo-27
+// instant full-length beam on screen.
+//
+// WHAT MAKES IT A REAL ARM is that the switch is read in UpdateEffect and NOT in the law the verdict
+// grades against (ATraceTracer::ResolveBoltTravel / BoltHeadZUU carry no knowledge of it). If it
+// were read in both, both sides would move together and this would print PASS over a rope — which is
+// precisely the identity two of this file's cone rows shipped with until a verifier caught them.
+//
+// It leaves the CVar off for the rest of the session ON PURPOSE: a command that quietly restored it
+// could not be told apart from one that never changed anything, and a run that ends in a red arm has
+// nothing left to measure. Set Trace.Fx.BoltTravel 1, or start a new session, to go back.
+//
+// *** RUN IT IN A SESSION OF ITS OWN, like the other three. *** Two beam arms in one -TraceExec list
+// race and grade each other's tracers; that has already produced one false failure in this file.
+// -------------------------------------------------------------------------------------------------
+static FAutoConsoleCommand GTraceFxBeamRopeArmCmd(
+	TEXT("Trace.Fx.BeamRopeArm"),
+	TEXT("RED ARM: switch Trace.Fx.BoltTravel off (restoring the old instant full-length beam), draw "
+	     "the pistol and fire. Must FAIL, on the two TRAVEL rows and only those — if it passes, "
+	     "Trace.Fx.Beam is not measuring that the bolt moves."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		// The string overload, which is the one IConsoleVariable declares virtually on every engine
+		// version this project has been built against.
+		GCVarBoltTravel->Set(TEXT("0"), ECVF_SetByConsole);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("FXBEAM: RED ARM — Trace.Fx.BoltTravel is now 0, so the beam is laid full length on "
+			     "frame one exactly as it was before Demo 27. The five profile rows should stay "
+			     "green and the two travel rows must go red. This does not restore itself."));
+		TraceTracerFxProbe::ArmScripted(/*bExpectSmg=*/false, TEXT("One"));
+	}));
 #endif // !UE_BUILD_SHIPPING

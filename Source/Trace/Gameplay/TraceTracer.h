@@ -4,7 +4,12 @@
 #include "GameFramework/Actor.h"
 
 #include "Gameplay/TraceFxShapes.h"                 // SPEC v32 §1 — the shared shape library
-#include "Gameplay/TraceRailgunFireCurve.h"         // SPEC v32 §2 — the decay length, not retyped
+
+// TraceRailgunFireCurve.h WAS INCLUDED HERE, for BeamDecaySeconds — the beam's old fade borrowed
+// the authored fire clip's tail rather than retyping "0.75". Demo 27 deleted that whole envelope
+// (see "IT IS A TRAVELLING BOLT NOW" below): there is no fade left to derive, so the include went
+// with the constant. The fire curve itself is untouched and is still the weapon's emissive decay;
+// ATraceCharacter and Trace.Railgun.Verify include it directly and always did.
 
 #include "TraceTracer.generated.h"
 
@@ -54,6 +59,35 @@ struct FTraceTracerBeamStart
 
 	/** True when Start came from the gun's mesh landmark rather than from the pawn's marker. */
 	bool bFromGunMesh = false;
+};
+
+/**
+ * DEMO 27 — THE TRAVEL RULE FOR ONE SHOT, RESOLVED FROM ITS LENGTH.
+ *
+ * Three numbers, and they are INPUTS to the effect rather than readings off it: the bolt's length,
+ * the speed its head runs down the shot at, and how long the whole thing therefore lasts. See
+ * ATraceTracer::ResolveBoltTravel for the arithmetic and the choice of constants.
+ *
+ * It is a struct rather than three out-parameters because two callers need all three together and
+ * must agree about them exactly: the effect, which draws the bolt, and Trace.Fx.Beam's verdict,
+ * which grades the drawn bolt against the law. A verifier that re-derives a rule can only prove
+ * that two implementations of it agree, so the verdict calls this same resolver — and the ONE
+ * thing it does not share is the Trace.Fx.BoltTravel escape hatch, which lives in UpdateEffect and
+ * nowhere else, so that switching travel off makes the harness go red instead of moving both sides
+ * of the comparison together.
+ *
+ * Plain struct: nothing replicated, nothing exposed to Blueprint.
+ */
+struct FTraceTracerBoltTravel
+{
+	/** How much bolt is in flight once it is clear of the muzzle, in uu. */
+	float LengthUU = 0.f;
+
+	/** How fast its head runs down the shot, in uu/s. Solved, not assumed — see the clamps. */
+	float SpeedUU = 0.f;
+
+	/** Muzzle to swallowed: (shot + bolt) / speed, in seconds. */
+	float LifeSeconds = 0.f;
 };
 
 /**
@@ -109,7 +143,51 @@ struct FTraceTracerShotDebug
 	 * ever stops being true the log says so instead of the check going quietly, wrongly red.
 	 */
 	float GeometryAgeSeconds = 0.f;
-	float LengthUU = 0.f;
+
+	/**
+	 * DEMO 27 — THE TWO LENGTHS, AND WHY ONE NUMBER STOPPED BEING ENOUGH.
+	 *
+	 * Until this pass the beam was laid muzzle-to-impact on frame one and these were the same thing,
+	 * so there was one field, `LengthUU`, and it was a readback. It is now a TRAVELLING BOLT — a
+	 * short segment that crosses the gap — so "how long is the beam" has two honest answers and they
+	 * are needed for different jobs:
+	 *
+	 *   ShotLengthUU   muzzle -> impact, the distance the shot resolved. NOT A READBACK: it is the
+	 *                  effect's own input, reported for the same reason ProfileMuzzleRadiusUU is.
+	 *                  The verdict needs it because the LEGIBILITY FLOOR is a function of the shot's
+	 *                  length (see InitTracer), and it is also what the travel rule is resolved from.
+	 *                  Grading the floor against the BOLT's length instead would put the expected
+	 *                  muzzle radius of a typical arena shot at the doc's 3.0 uu where 6.5 uu is
+	 *                  what ships — a factor of two, i.e. forty times the row's tolerance, on a row
+	 *                  that would then be wrong on every long shot in the game.
+	 *
+	 *   DrawnLengthUU  MEASURED: the sum of the three core segments' live Z extents, i.e. how much
+	 *                  bolt is on screen this frame. It grows out of the muzzle, holds at the bolt
+	 *                  length, and shrinks to nothing as the tail is swallowed at the impact.
+	 */
+	float ShotLengthUU = 0.f;
+	float DrawnLengthUU = 0.f;
+
+	/**
+	 * WHERE THE BOLT IS, MEASURED OFF THE SEGMENTS THAT ARE ACTUALLY ON SCREEN.
+	 *
+	 * Local Z along the shot: 0 is the muzzle and ShotLengthUU is the impact. Derived from the live
+	 * relative locations and Z scales of the core segments — the far end of the furthest one and the
+	 * near end of the nearest — so they are a readback in exactly the sense the radii are, and a beam
+	 * that is not travelling reports a head pinned at ShotLengthUU on every frame.
+	 *
+	 * This is the field that makes "it travels" a measurement. Trace.Fx.Beam grades it against the
+	 * authored law (ATraceTracer::BoltHeadZUU) evaluated at GeometryAgeSeconds, and
+	 * Trace.Fx.BoltTravel 0 restores the old instant full-length beam as the red arm.
+	 */
+	float MeasuredHeadZUU = 0.f;
+	float MeasuredTailZUU = 0.f;
+
+	/** The travel rule this shot resolved: inputs, not readbacks. See ATraceTracer::ResolveBoltTravel. */
+	float BoltLengthUU = 0.f;
+	float BoltSpeedUU = 0.f;
+	float BoltLifeSeconds = 0.f;
+
 	float MeasuredMuzzleRadiusUU = 0.f;
 	float MeasuredTipRadiusUU = 0.f;
 	float MeasuredSegmentRadiiUU[3] = { 0.f, 0.f, 0.f };
@@ -122,10 +200,12 @@ struct FTraceTracerShotDebug
 	 * The instantaneous animated quantities. NEITHER OF THESE IS A READBACK, and the distinction
 	 * matters enough that Trace.Fx.Beam now prints it in the verdict table beside every row.
 	 *
-	 * HaloOpacityNow is RECOMPUTED from the same fade expression UpdateEffect uses, because a
-	 * material instance will not hand back a scalar that was written into it — there is no
-	 * measurement to take. It is still worth checking (a fade that never starts is a real bug) but
-	 * it cannot catch a wrong opacity CONSTANT, and it is labelled "recomputed" for that reason.
+	 * HaloOpacityNow is RECOMPUTED from the same expression UpdateEffect uses, because a material
+	 * instance will not hand back a scalar that was written into it — there is no measurement to
+	 * take. Since Demo 27 that expression is the FX doc's constant itself (the fade is gone with the
+	 * envelope), which makes the row a straight check of the doc's 0.55 on every frame rather than a
+	 * check that a fade started. It still cannot catch the constant being wrong in both places at
+	 * once, and it is labelled "recomputed" for that reason.
 	 *
 	 * FlashScaleNow is DERIVED FROM a readback — MeasuredConeRadiusUU divided by the authored
 	 * radius — which makes it a fine thing to log and a catastrophic thing to grade against.
@@ -136,6 +216,9 @@ struct FTraceTracerShotDebug
 	 */
 	float HaloOpacityNow = 0.f;
 	float FlashScaleNow = 0.f;
+
+	/** False once the bolt has been swallowed at the impact and the core/halo were hidden. */
+	bool bBoltVisible = false;
 	bool bHaloVisible = false;
 	bool bFlashVisible = false;
 
@@ -188,8 +271,11 @@ struct FTraceTracerShotDebug
  *     overdraw down the middle of the screen.
  *   * THE MUZZLE SPHERE BECAME A CONE, r 16 uu / h 30 uu (pistol) / r 13 uu (SMG), pointing down
  *     the beam, for the first 0.28 s, scaling 0.55 -> 3.2x.
- *   * THE LIFE IS NOW HOLD-THEN-FADE: 0.10 s at full, then a decay whose length is
- *     TraceRailgunFireCurve's own tail rather than a second copy of "0.75".
+ *   * THE LIFE WAS HOLD-THEN-FADE: 0.10 s at full, then a decay whose length was
+ *     TraceRailgunFireCurve's own tail rather than a second copy of "0.75". *** DEMO 27 REPLACED
+ *     THAT WHOLE ENVELOPE ***, because 0.85 s of beam lying still is the thing the user reported;
+ *     see "IT IS A TRAVELLING BOLT NOW" below. The fire curve is still the weapon's emissive decay
+ *     and is untouched — this effect simply no longer borrows it, so the include went with it.
  *
  * --- LENGTH: THE ONE PLACE THIS DELIBERATELY DEPARTS FROM THE FX DOC ---------------------------
  *
@@ -222,9 +308,62 @@ struct FTraceTracerShotDebug
  * DELETED, NOT DISABLED. There is no bImpactFlash setting, because a knob to restore it would be a
  * knob to restore the reported problem.
  *
- * The whole thing snaps to full length on frame one (it is hitscan - there is no travel time to
- * animate) and then decays over TracerLifeSeconds with an ease-out: bright and instant, then a
- * short weighty fade. Nothing translates; only intensity and thickness animate.
+ * --- DEMO 27: IT IS A TRAVELLING BOLT NOW, NOT A ROPE ------------------------------------------
+ *
+ * The report, verbatim: "Bullet tracers are too thick and they last for too long. They shouldn't
+ * linger on the field like they do, it should be more like a single laser disappearing behind it as
+ * it moves." Three things, and the third is a change of SHAPE.
+ *
+ * What was here answered the first sentence of that and contradicted the second. The beam was laid
+ * down at full length on frame one — muzzle to impact, all of it, instantly — and then FADED IN
+ * PLACE over 0.85 s. That is a rope lying across the arena, and at an SMG's 600 RPM there were up to
+ * 8.5 of them lying there at once per shooter. Nothing translated; only intensity and thickness
+ * animated. The old comment here said exactly that and defended it with "it is hitscan - there is no
+ * travel time to animate", which is an argument about the SHOT and not about the PICTURE.
+ *
+ * So the picture changed. A SHORT SEGMENT — the bolt — leaves the muzzle and crosses the gap:
+ *
+ *   * its HEAD advances down the shot at the resolved bolt speed (Trace.Fx.BoltSpeed, 22000 uu/s
+ *     of authored base speed — about 8 frames to cross a 3000 uu corridor at 60 Hz),
+ *   * its TAIL follows one bolt-length behind, so what is drawn is a dash and not a line. The bolt
+ *     is 22% of the shot, clamped to 250..1200 uu, for the same reason the beam's WIDTH has a
+ *     legibility floor: a fixed dash is most of a point-blank shot and a rounding error across the
+ *     arena, and both of those are unreadable.
+ *   * when the head reaches the impact it STOPS THERE and the tail keeps coming, so the bolt is
+ *     swallowed at the hit point rather than switched off in mid-air. That swallow is the
+ *     "disappearing behind it as it moves", and it is also why the effect needs no fade to end
+ *     cleanly: by its last frame there is nothing left of it to fade.
+ *   * so the bolt's life is (shot + bolt) / speed — the head crossing the shot, plus the tail
+ *     crossing the bolt — and it is held inside 0.10..0.30 s by SOLVING THE SPEED rather than by
+ *     truncating the flight. A point-blank shot would otherwise be gone in two frames and an
+ *     arena-length one would linger for a second, which is the complaint again. THE OLD EFFECT
+ *     LIVED 0.85 s AT EVERY RANGE; the typical shot now lives 0.17 s, and the longest 0.30 s.
+ *   * THE FADE IS GONE WITH IT. There is no hold, no decay and no thinning: the bolt is at the FX
+ *     doc's radii and full brightness for every frame it exists, and it ends by being eaten at the
+ *     impact. Half the reason the old beam read as litter is that it spent 0.75 s of its 0.85 s
+ *     visibly dying in place, and a fade is only needed by an effect that has to go somewhere.
+ *
+ * The MUZZLE FLASH is deliberately NOT on this clock. It keeps the FX doc's own 0.28 s window and
+ * its 0.55 -> 3.2x shockwave, so the actor outlives its bolt whenever the bolt is quicker. That is
+ * not an oversight: the flash is a small cone at the shooter's own barrel, it is what makes a
+ * first-person shot legible at all, it was never what "lingers on the field", and truncating an
+ * expansion curve at 60% of its travel pops. The actor still dies at max(bolt life, flash), i.e.
+ * 0.30 s at the very worst against the 0.85 s it used to spend on screen.
+ *
+ * *** AND THE SHOT IS STILL INSTANT. *** This actor has always been cosmetic and self-deleting, and
+ * it is spawned AFTER the hit has been resolved — UTraceWeaponComponent traces, applies damage and
+ * only then asks for a beam between two points it has already computed. Nothing in this file is read
+ * by anything that decides a hit, and this pass added no timer, no tick-driven trace and no state
+ * that any gameplay code can see. A player shot by a beam whose head has not visually reached them
+ * yet was hit at the instant the trigger went down, exactly as before; the bolt is a picture of a
+ * shot that already happened, drawn a few frames late on purpose. See "THE SHOT IS INSTANT" on
+ * UpdateEffect.
+ *
+ * THE TAPER RUNS ALONG THE BOLT, NOT ALONG THE SHOT: the trailing end carries the FX doc's muzzle
+ * radius and the leading end its tip radius, so the dash is a teardrop pointing the way it is going
+ * and every proportion the doc authored (tip/muzzle 0.433, halo/muzzle 1.733) is unchanged. Mapping
+ * the taper to position along the SHOT instead was tried on paper and rejected: it would make both
+ * ends of a bolt near the muzzle 3.0 uu, i.e. no taper at all for most of the flight.
  *
  * --- WIDTH ------------------------------------------------------------------------------------
  *
@@ -409,6 +548,10 @@ public:
 	 * radius subtends roughly 100 px of a 1600 px frame before bloom widens it further, and the
 	 * legibility floor makes a long shot FATTER still (up to 6.5 uu, i.e. an 11.3 uu halo).
 	 *
+	 * DEMO 27 TOOK IT FROM 0.55 TO 0.40 for the report's first clause, "too thick". The whole of the
+	 * bracket — including the measurement that says why it did not go further, which is the long
+	 * third-party shot sitting at the pixel floor already — is at the CVar's definition in the .cpp.
+	 *
 	 * WHY A CVAR RATHER THAN A UTraceSettings PROPERTY. This file's neighbours already made that
 	 * call for exactly this kind of number — Trace.Core.FxGeometry, Trace.Core.ThrownTrailLengthUU
 	 * and the two heart-light knobs are all CVars. The house rule about UPROPERTY(config) is about
@@ -437,41 +580,113 @@ public:
 	static constexpr int32 BeamTaperSegments = 3;
 
 	// =============================================================================================
-	// TIMING — public because the probe reports the window it sampled
+	// DEMO 27 — THE TRAVEL LAW, PUBLIC BECAUSE THE VERDICT GRADES AGAINST IT
 	//
-	// Trace.Fx.Beam has to say WHICH window its numbers were taken from, and a probe that carries its
-	// own copy of "the hold is 0.10 s" is a second place for that fact to live. These are the effect's
-	// timing contract, so they are stated once, here, and read by anything that needs them.
+	// BeamHoldSeconds / BeamDecaySeconds / TracerLifeSeconds USED TO BE HERE and are deleted, not
+	// re-tuned: 0.10 s at full and then 0.75 s dying in place is the shape of the thing the user
+	// reported, and a constant that still existed would be a constant somebody could put back.
+	//
+	// What replaces them is not a shorter envelope, it is a rule about WHERE THE BOLT IS. They are
+	// public for the reason the timing constants were: Trace.Fx.Beam has to grade the drawn bolt
+	// against the law, and a probe carrying its own copy of the law is a second place for it to live
+	// — which is how a harness ends up agreeing with itself. ResolveBoltTravel() below is the one
+	// implementation and both the effect and the verdict call it.
 	// =============================================================================================
 
-	/** Doc: "Spawn at discharge, hold 0.10 s, fade over the decay." */
-	static constexpr float BeamHoldSeconds = 0.10f;
+	/**
+	 * How much of the shot is bolt: 22%, clamped to 250..1200 uu.
+	 *
+	 * A FRACTION AND NOT A CONSTANT, for exactly the reason the beam's radius has a legibility
+	 * floor. 700 uu of dash is most of a point-blank corridor shot (which then reads as the old
+	 * full-length rope, briefly) and 3% of a shot down the long axis of the arena (which reads as a
+	 * dot). A fixed proportion looks the same at every range, which is what makes it read as one
+	 * effect rather than as several; the two clamps then stop the extremes from being silly.
+	 *
+	 * A bolt LONGER than its shot is legal and is what a pressed-against-the-wall shot looks like:
+	 * the whole beam appears at once and is immediately eaten. There is nothing to guard there —
+	 * the tail simply starts at the muzzle and the head is already at the impact.
+	 */
+	static constexpr float BoltLengthFraction = 0.22f;
+	static constexpr float BoltMinLengthUU = 250.0f;
+	static constexpr float BoltMaxLengthUU = 1200.0f;
 
 	/**
-	 * THE DECAY, NOT RETYPED. SPEC v32 §2: "The pistol's decay is 0.75 s (already a constant
-	 * somewhere near the discharge driver — reuse it, do not retype 0.75)."
+	 * The authored head speed in uu/s, before the two life clamps get a say. Trace.Fx.BoltSpeed
+	 * overrides it live; GetBoltSpeed() is the accessor and the only place it is clamped.
 	 *
-	 * It is the tail of the authored fire clip: everything from the end of the flash
-	 * (DecayStartSeconds, 1.15) to the end of the clip (ClipSeconds, 1.90). Derived rather than
-	 * copied so that a re-export of Art/Railgun/fire_curves.json — which regenerates
-	 * TraceRailgunFireCurve.h — moves the beam's fade and the weapon's emissive fade together. Two
-	 * copies of one number is how they end up disagreeing.
+	 * 22000 uu/s is 220 m/s of picture, i.e. 366 uu per 60 Hz frame, i.e. about EIGHT FRAMES to
+	 * cross a 3000 uu corridor. That bracket is the whole argument. Much faster (40000+) and the
+	 * bolt exists for three frames and cannot be followed by eye, which is indistinguishable from
+	 * the flicker the old effect was meant to replace. Much slower (10000) and a shot takes a third
+	 * of a second to arrive, which starts to LOOK like a projectile — and this is hitscan, so a
+	 * visibly slow bolt would be the effect telling the player something false about the weapon.
 	 */
-	static constexpr float BeamDecaySeconds =
-		TraceRailgunFireCurve::ClipSeconds - TraceRailgunFireCurve::DecayStartSeconds;
+	static constexpr float BoltBaseSpeedUU = 22000.0f;
 
 	/**
-	 * Total life: hold plus decay. 0.85 s, up from the 0.17 s this effect used before v32.
+	 * The bolt's life, clamped — BY SOLVING THE SPEED, not by cutting the flight short.
 	 *
-	 * That is a FIVE-FOLD increase in how long a tracer actor lives, and it is worth naming what it
-	 * costs: at 600 RPM a held SMG trigger now keeps ~8.5 of these alive at once per shooter instead
-	 * of ~1.7. They are five collisionless, shadowless, unlit components each and they still expire
-	 * on their own InitialLifeSpan, so the count is bounded by (rate x life) and cannot grow — but it
-	 * is a real change and the two harnesses that COUNT live ATraceTracer actors (the input harness's
-	 * shots-emitted set, Trace.Smg.Verify's before/after delta) both get MORE reliable from it, not
-	 * less, because a longer-lived actor is harder to sample between.
+	 * The natural life is (shot + bolt) / base speed, and across the arena's real range of shots
+	 * that runs from about 0.04 s (pressed against a wall) to 0.95 s (corner to corner). Both ends
+	 * are wrong: two frames is a flicker nobody sees, and a second is the complaint this pass
+	 * exists to answer. So the life is clamped and the SPEED is then re-solved from it, which keeps
+	 * a single law — head Z is speed x age, always — and keeps the head arriving exactly as the
+	 * tail is swallowed. Truncating instead would leave a bolt switched off in mid-flight, which is
+	 * the one thing the swallow was designed to avoid.
+	 *
+	 * The typical mid-arena shot is untouched by both clamps: 3000 uu resolves to 0.17 s at the
+	 * authored 22000 uu/s.
 	 */
-	static constexpr float TracerLifeSeconds = BeamHoldSeconds + BeamDecaySeconds;
+	static constexpr float BoltMinLifeSeconds = 0.10f;
+	static constexpr float BoltMaxLifeSeconds = 0.30f;
+
+	/**
+	 * The slowest frame rate the bolt must still read as ONE object at, in Hz.
+	 *
+	 * *** THIS IS WHAT STOPS A LONG SHOT DRAWING AS A ROW OF DASHES. *** BoltMaxLifeSeconds caps the
+	 * life and the speed is then re-solved from it, so speed grows without bound as the shot gets
+	 * longer: a full-range shot (Config/DefaultGame.ini ships HitscanRange=39600) came out at over
+	 * 130000 uu/s, which is 2200 uu per 60 Hz frame against a bolt capped at 1200 uu. The bolt
+	 * teleported past its own length every frame and the eye saw separate dashes - the exact
+	 * opposite of the "single laser" the report asks for.
+	 *
+	 * The fix is a floor on the LENGTH, not a cap on the speed: capping the speed would put the life
+	 * back up and bring the lingering rope back with it. Requiring that the bolt never advance more
+	 * than its own length in one frame solves in closed form - with S the shot, L the life and dt
+	 * one frame, `advance <= length` is exactly `B >= S*dt / (L - dt)`, and at equality the advance
+	 * IS the length, so the tail lands where the head was and the streak is continuous.
+	 *
+	 * 30 rather than 60 deliberately: a 60 Hz assumption breaks for anybody running at 30, and the
+	 * cost of being conservative is a longer bolt on the longest shots only.
+	 */
+	static constexpr float BoltContinuityHz = 30.0f;
+
+	/**
+	 * This shot's travel rule, resolved from its length. THE ONE IMPLEMENTATION.
+	 *
+	 * Static and public because Trace.Fx.Beam's verdict grades the drawn bolt against it and must
+	 * not carry a second copy. Pure: the only live input it reads is Trace.Fx.BoltSpeed, and it
+	 * deliberately does NOT read Trace.Fx.BoltTravel — see BoltHeadZUU.
+	 */
+	static FTraceTracerBoltTravel ResolveBoltTravel(float ShotLengthUU);
+
+	/**
+	 * Where the bolt's head and tail are at @p AgeSeconds: local Z along the shot, 0 at the muzzle.
+	 *
+	 *     head = clamp(speed x age, 0, shot)                — stops dead at the impact
+	 *     tail = clamp(speed x age - bolt length, 0, shot)  — keeps coming, so the bolt is eaten
+	 *
+	 * THE ESCAPE HATCH IS NOT IN HERE. Trace.Fx.BoltTravel 0 restores the pre-Demo-27 instant
+	 * full-length beam, and it is read in UpdateEffect — at the one place the geometry is written —
+	 * precisely so that it CANNOT move the expected side of the verdict with it. A red arm whose
+	 * expectation follows the defect measures nothing, which is the failure this file has been
+	 * caught in twice; Trace.Fx.BeamRopeArm is that arm and it must fail the two travel rows.
+	 */
+	static float BoltHeadZUU(const FTraceTracerBoltTravel& Travel, float ShotLengthUU, float AgeSeconds);
+	static float BoltTailZUU(const FTraceTracerBoltTravel& Travel, float ShotLengthUU, float AgeSeconds);
+
+	/** Trace.Fx.BoltSpeed, clamped once, here, so the effect and the harness cannot disagree. */
+	static float GetBoltSpeed();
 
 	/**
 	 * Doc: the muzzle cone is "visible for the first 0.28 s of decay, scaling 0.55 -> 3.2x".
@@ -500,6 +715,22 @@ public:
 	static constexpr float MuzzleFlashSeconds = 0.28f;
 	static constexpr float MuzzleFlashStartScale = 0.55f;
 	static constexpr float MuzzleFlashEndScale = 3.2f;
+
+	/**
+	 * The longest this actor can ever be on screen: the slowest bolt or the whole flash, whichever
+	 * outlasts the other. The CONSTRUCTOR's InitialLifeSpan, and a ceiling rather than the answer —
+	 * InitTracer calls SetLifeSpan with THIS shot's own figure the moment it knows it.
+	 *
+	 * It exists because the constructor runs before there is a shot to measure, and an actor that
+	 * somehow never reached InitTracer (it cannot today, but a spawn that fails halfway could) must
+	 * still expire rather than sit in the world for ever. Down from 0.85 s: at 600 RPM a held SMG
+	 * trigger now keeps at most ~2.8 tracers alive per shooter instead of ~8.5, and typically ~1.7.
+	 * The two harnesses that COUNT live ATraceTracer actors — the input harness's shots-emitted set
+	 * and Trace.Smg.Verify's before/after delta — both sample inside a window far shorter than this,
+	 * so a shorter-lived actor does not change what they can see.
+	 */
+	static constexpr float MaxTracerLifeSeconds =
+		(BoltMaxLifeSeconds > MuzzleFlashSeconds) ? BoltMaxLifeSeconds : MuzzleFlashSeconds;
 
 protected:
 	/** Positioned at the beam start and rotated so local +Z runs down the shot. */
@@ -558,9 +789,10 @@ private:
 	 * Applies the whole look for an absolute age in seconds.
 	 *
 	 * SECONDS, NOT A NORMALISED ALPHA, and driven from the world clock rather than an accumulator —
-	 * see the note on SpawnTimeSeconds. Half the numbers in this effect are 0.10 / 0.28 / 0.75 s and
-	 * they have to mean those things, not "some fraction of a life that changed the last time
-	 * somebody retuned the decay".
+	 * see the note on SpawnTimeSeconds. Everything this writes is a function of an absolute duration
+	 * (the bolt's head is speed x age, the flash's window is the doc's 0.28 s), and those have to
+	 * mean seconds rather than "some fraction of a life that changed the last time somebody retuned
+	 * something else".
 	 */
 	void UpdateEffect(float AgeSeconds);
 
@@ -577,7 +809,7 @@ private:
 	/**
 	 * ONE MID, THREE SEGMENTS. The tapered core's three cylinders share a single dynamic material
 	 * instance — created on the first segment and assigned to the other two — so they cannot
-	 * possibly disagree about colour or brightness, and the per-frame fade is one parameter write
+	 * possibly disagree about colour or brightness, and the per-frame colour write is one call
 	 * instead of three. Two objects agreeing about one fact is a failure this codebase logs by name;
 	 * the cheapest way not to have it is not to have two objects.
 	 */
@@ -587,7 +819,7 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> MuzzleMID;
 
-	/** Team colour of the shot, cached for the per-frame fade. */
+	/** Team colour of the shot, cached because the per-frame update re-writes it. */
 	FLinearColor ShotColor = FLinearColor::White;
 
 	/** Near-white version of ShotColor used by the core and the muzzle. */
@@ -598,8 +830,10 @@ private:
 	 *
 	 * House rule, and it has bitten this project twice: a per-frame reader of a short quantity that
 	 * adds DeltaSeconds to a counter double-advances on a hitch, drifts, and disagrees between
-	 * machines. Every duration in this effect (0.10 s hold, 0.28 s flash, 0.75 s decay) is short
-	 * enough for that to be visible. Age is therefore a pure function of World->GetTimeSeconds(),
+	 * machines. Every duration in this effect (a 0.10..0.30 s bolt, a 0.28 s flash) is short enough
+	 * for that to be visible, and a DRIFTING BOLT IS WORSE THAN A DRIFTING FADE: age here is a
+	 * POSITION, so a double-advanced frame teleports the bolt down the shot rather than merely
+	 * dimming it early. Age is therefore a pure function of World->GetTimeSeconds(),
 	 * evaluated fresh, and there is no state to sample before or after advancing because there is no
 	 * advancing.
 	 */
@@ -615,6 +849,11 @@ private:
 	 *
 	 * The initialisers are the pistol's authored profile so that a tracer which returned early from
 	 * InitTracer (a degenerate segment, never drawn) holds documented values rather than garbage.
+	 *
+	 * BeamLengthUU IS THE SHOT'S LENGTH — muzzle to impact — and since Demo 27 that is no longer the
+	 * same thing as how much beam is on screen. The drawn length is the bolt's, it changes every
+	 * frame, and it is not stored: it is read back off the components by DescribeShot, which is what
+	 * makes it a measurement.
 	 */
 	float BeamLengthUU = 0.f;
 	float CoreMuzzleRadiusUU = 3.0f;
@@ -639,16 +878,38 @@ private:
 	 *
 	 * NOT a clock and not an accumulator — it is a record of the argument UpdateEffect was handed,
 	 * which is itself a stateless function of the absolute world clock (see SpawnTimeSeconds). The
-	 * probe needs it because the muzzle cone's authored size is a function of age, so "is the live
-	 * cone the right size?" is only a well-posed question once you know which age to ask it at.
+	 * probe needs it because the muzzle cone's authored size is a function of age — and since Demo 27
+	 * so is the bolt's POSITION — so "is the live geometry right?" is only a well-posed question once
+	 * you know which age to ask it at.
 	 */
 	float GeometryAgeSeconds = 0.f;
+
+	/**
+	 * This shot's travel rule, resolved once by InitTracer from the shot's own length.
+	 *
+	 * Cached rather than re-resolved per frame because it is a pure function of a length that cannot
+	 * change after the beam is placed, and because Trace.Fx.BoltSpeed being live would otherwise let
+	 * a bolt change speed halfway down the arena — the head would jump, which is exactly the drift
+	 * SpawnTimeSeconds exists to prevent. Turning the knob retunes the NEXT shot, like every other
+	 * live knob in this effect.
+	 */
+	FTraceTracerBoltTravel BoltTravel;
 
 	/** Set false once the muzzle flash has been retired, so it is only hidden once. */
 	bool bMuzzleVisible = false;
 
 	/** False when no non-occluding material resolved and the halo was dropped entirely. */
 	bool bHaloVisible = false;
+
+	/**
+	 * False once the tail has been swallowed at the impact and the core and halo were hidden.
+	 *
+	 * The bolt outlives nothing: it is hidden ONCE, at the frame its tail reaches the hit point, and
+	 * never shown again. The actor itself may still be alive at that moment — the muzzle flash keeps
+	 * the FX doc's 0.28 s whatever the bolt does — so this is what stops a swallowed bolt from being
+	 * re-laid as a zero-length sliver at the impact for the rest of the flash.
+	 */
+	bool bBoltVisible = false;
 
 	// --- Tuning ---------------------------------------------------------------------------------
 	//

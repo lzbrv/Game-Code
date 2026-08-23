@@ -66,4 +66,11 @@ echo "== discarding editor noise (if any) =="
 
 echo
 echo "== git pull =="
-exec git pull "$@"
+# --no-rebase EXPLICITLY, so this works on a clone that has never set pull.rebase.
+# Git refuses a divergent pull without a strategy ("Need to specify how to reconcile
+# divergent branches") and that stops the script dead - which is exactly the kind of
+# papercut it exists to remove. MERGE and not rebase, deliberately: this repo carries
+# LFS binaries under `lockable` (see .gitattributes), and rebasing rewrites commits
+# that carry those pointers. A merge commit is the shape this team's history already
+# has. Pass --rebase yourself if you know you want it; your argument wins.
+exec git pull --no-rebase "$@"

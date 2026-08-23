@@ -939,6 +939,79 @@ static TAutoConsoleVariable<float> CVarModeBBounce(
 	ECVF_Default);
 
 // =================================================================================================
+// DEMO 27 — *** THE THROW THAT DROPS AT YOUR FEET WHEN YOU THROW IT WHILE RUNNING. ***
+//
+// "There is still a bug when throwing the core. It doesn't seem to throw forward when moving
+// forward. Now, it drops to the ground whenever a player is moving forward and throwing."
+//
+// THE LAUNCH WAS NEVER THE PROBLEM, and that is why the previous pass did not fix it. The throw's
+// own log line, printed on one of the failing throws, reads
+//
+//     [ModeB] THROW ... at 3509 uu/s ... charged impulse 2561 + inherited 976 (thrower 976 uu/s
+//     horiz, +0 vert, grounded, x1.00), launch Z +713
+//
+// - the forward run is IN there, added, exactly as spec v8 §4 says. What ate it was the very first
+// integration frame afterwards:
+//
+//     [ModeBTurnover] CONTACT at (-17836.07, 0.00, 154.15) | 154 uu above the floor |
+//         speed 3504 -> 681 uu/s | normal (0.98, 0.00, 0.20) | airborne 0.000s | VERDICT: WALL - bounce
+//
+// A "wall" AT THE LAUNCH POINT, ON THE LAUNCH FRAME, whose normal points along the throw. There is
+// no wall there. That normal is the direction from the THROWER'S OWN CAPSULE to the muzzle: the
+// launch is 70 uu ahead of the eye and 10 uu above the top hemisphere's centre, and against a 34 uu
+// capsule plus the Core's 22 uu sphere that clears by 14.7 uu — until the thrower moves. At 976 uu/s
+// a frame carries them ~20 uu, which turns +14.7 into -5 and the sweep into a start-penetrating hit.
+// (Solve the same triangle at 20 uu of advance and the normal comes out (0.98, 0.20). It is the
+// capsule, to two decimals.) The velocity was then MIRRORED about that normal — i.e. reversed, since
+// the normal is the flight direction — and rescaled by the bounce, four times over, 3504 -> 681 ->
+// 133 -> 25 -> 5 uu/s, and the Core dropped where the thrower was standing.
+//
+// WHY THE SWEEP COULD SEE A PAWN AT ALL, which is the actual defect. ServerTickLooseCore asked for
+//
+//     SweepSingleByChannel(..., ECC_WorldStatic, ...)
+//
+// under a comment reading "against static world geometry ... Pawns are deliberately not swept
+// against". THAT IS NOT WHAT THAT CALL DOES. ECC_WorldStatic in that position is a TRACE CHANNEL,
+// not a filter on object types, and the question it asks of every component is "do you BLOCK the
+// WorldStatic channel" — which a character capsule (collision profile "Pawn") answers yes. The
+// comment described the intent; the call never implemented it.
+//
+// TWO THINGS ARE FIXED HERE AND THEY ARE SEPARATE, because either one alone leaves a hole:
+//
+//   1. THE SWEEP NO LONGER ACCEPTS A PAWN AS A SURFACE (TraceModeBTuning::SweepLooseCore). The
+//      channel query stays exactly as it was — every arena surface behaves identically — but a
+//      blocking hit on a pawn body is rejected and the sweep re-asked past it. Pawns are out: the
+//      thrower's, and everybody else's, which is what "first contact takes it is resolved by the
+//      pickup poll" has always required.
+//   2. A CONTACT WHOSE NORMAL POINTS THE WAY THE CORE IS ALREADY TRAVELLING NO LONGER REFLECTS IT.
+//      That is a depenetration, not an impact, and mirroring it turns an exit into an entry. Any
+//      future launch point that ends up inside a lip of geometry now flies out of it instead of
+//      being fired backwards.
+//
+// THE RED ARM IS `Trace.ModeB.FlightHitsPawns 1`. It restores the channel query and NOTHING ELSE -
+// fix 2 stays in - so Trace.ModeB.RunThrowTest can be run against either behaviour in one build.
+//
+// AND THE SHAPE OF ITS FAILURE IS WORTH KNOWING, because it says the two fixes are not alternatives.
+// With the sweep put back but the mirror still guarded, the measured red run reads
+//
+//     CONTACT at (-17382.97, 2880.00, 154.15) with TraceCharacter_0 (CollisionCylinder) | speed
+//         4593 -> 4593 uu/s | normal (0.98, 0.00, 0.20) | airborne 0.011s | VERDICT: DEPENETRATION
+//
+// on frame after frame: the Core keeps its whole velocity and is shoved out of the capsule every
+// tick, so instead of dropping at the thrower's feet it is CARRIED ALONG IN FRONT OF THEM - 19 uu
+// clear after a tenth of a second, when a clean throw is 270. Fix 2 alone turns "it falls at my
+// feet" into "it sticks to my face". Only fix 1 makes the throw leave.
+// =================================================================================================
+static TAutoConsoleVariable<int32> CVarModeBFlightHitsPawns(
+	TEXT("Trace.ModeB.FlightHitsPawns"),
+	0,
+	TEXT("MODE B, Demo 27. 1: RED ARM - let the loose Core's sweep accept a PAWN as a surface again, ")
+	TEXT("as the plain channel query did (the thrower's own capsule, on the launch frame). 0: a ")
+	TEXT("blocking hit on a body is rejected and the sweep re-asked past it. The depenetration guard ")
+	TEXT("is NOT part of this arm. Trace.ModeB.RunThrowTest FAILS on 1 and PASSES on 0."),
+	ECVF_Default);
+
+// =================================================================================================
 // MODE B ONLY — SPEC v6 §4.1, THE CATCH ZONE
 //
 // "create a small invisible radius around players that acts as a 'catch zone,' so that when the core
@@ -1793,6 +1866,77 @@ namespace TraceModeBTuning
 	/** Radius of the sphere swept for the loose Core's collision. Matches the orb the player sees. */
 	constexpr float CollisionRadius = 22.f;
 
+	/** DEMO 27. How many pawn bodies one sweep may reject before it gives up. See SweepLooseCore. */
+	constexpr int32 TraceModeBMaxPawnRejections = 5;
+
+	/**
+	 * DEMO 27. *** THE ONE WORLD QUERY THE LOOSE CORE MAKES. ***
+	 *
+	 * Its flight sweep, its resting-surface probe and its visible-support probe all come through
+	 * here, because all three are asking the same question - "what geometry is the Core touching" -
+	 * and the file already insists in two places that they must not be able to disagree about it.
+	 *
+	 * WHAT IT ADDS TO THE OLD CALL IS ONE SENTENCE: A PAWN IS NOT GEOMETRY. Everything else about the
+	 * query is deliberately unchanged - same channel, same sphere, same ignore list, same responses -
+	 * because the old sweep's treatment of every SURFACE in the arena was correct and this pass has
+	 * no business retuning it.
+	 *
+	 * WHY IT IS A RE-SWEEP AND NOT AN OBJECT-TYPE QUERY, WHICH IS WHAT THIS WAS FIRST WRITTEN AS AND
+	 * WHICH MEASURABLY BROKE SOMETHING ELSE. `SweepSingleByObjectType(WorldStatic|WorldDynamic)` also
+	 * excludes pawns, in one call, and it reads better. But an object query treats EVERY component of
+	 * a listed type as blocking and never looks at that component's own responses - so ATraceEndzone's
+	 * trigger box (WorldDynamic, QueryOnly, every channel set to Ignore, overlapping pawns only)
+	 * became a wall. The first green run of this fix caught it in the act:
+	 *
+	 *     CONTACT at (-17120.00, 0.00, 276.78) with TraceEndzone_2 (Trigger) | speed 3472 -> 675 uu/s
+	 *
+	 * - a throw bouncing off an invisible volume it had passed straight through for thirty demos. So
+	 * the channel query stays, responses and all, and the pawns are filtered out of its ANSWER: if
+	 * the blocking hit is a pawn body, that actor is added to the ignore list and the sweep is asked
+	 * again, which is what the caller wanted in the first place.
+	 *
+	 * The re-sweep costs nothing on the overwhelming majority of frames, because a flight that hits
+	 * nothing hits no pawn either. It is bounded by TraceModeBMaxPawnRejections so a wall of players
+	 * cannot turn one sweep into a loop.
+	 */
+	bool SweepLooseCore(const UWorld& World, FHitResult& OutHit, const FVector& Start, const FVector& End,
+		float SphereRadius, const FCollisionQueryParams& Params)
+	{
+		const FCollisionShape Sphere = FCollisionShape::MakeSphere(SphereRadius);
+
+		// THE RED ARM. Byte-for-byte the call this file made before Demo 27 - the pawn is left in the
+		// answer - so a run against the old behaviour is one CVar away and needs no second build.
+		if (CVarModeBFlightHitsPawns.GetValueOnAnyThread() != 0)
+		{
+			return World.SweepSingleByChannel(OutHit, Start, End, FQuat::Identity, ECC_WorldStatic,
+				Sphere, Params);
+		}
+
+		FCollisionQueryParams Working(Params);
+
+		for (int32 Rejections = 0; Rejections <= TraceModeBMaxPawnRejections; ++Rejections)
+		{
+			const bool bHit = World.SweepSingleByChannel(OutHit, Start, End, FQuat::Identity,
+				ECC_WorldStatic, Sphere, Working);
+
+			// Asked of the COMPONENT'S OBJECT TYPE rather than by casting the actor to APawn: what
+			// blocks a sweep is a shape, and "this shape is a body" is exactly the fact being tested.
+			// It also covers a pawn-typed collider hung on something that is not an APawn.
+			const UPrimitiveComponent* const HitComponent = bHit ? OutHit.GetComponent() : nullptr;
+			if (HitComponent == nullptr || HitComponent->GetCollisionObjectType() != ECC_Pawn)
+			{
+				return bHit;
+			}
+
+			Working.AddIgnoredActor(OutHit.GetActor());
+		}
+
+		// Six pawn bodies deep in one sweep. There is no such situation in a 5v5 match, and the
+		// honest answer for a Core that has only ever met players is "nothing blocked it".
+		OutHit = FHitResult();
+		return false;
+	}
+
 	/** Below this speed the Core is declared at rest, so it stops jittering along the floor. */
 	float RestSpeed()         { return 60.f * FMath::Clamp(MassScale(), 0.5f, 4.f); }
 
@@ -1801,6 +1945,42 @@ namespace TraceModeBTuning
 
 	/** Height above the thrower's eye-line the Core leaves from, so it does not clip their own head. */
 	constexpr double ThrowMuzzleForward = 70.0;
+
+	/**
+	 * DEMO 27. How long after a launch the throw is asked what became of it. See
+	 * ATraceCore::ServerTickLaunchAudit.
+	 *
+	 * 0.10 s is chosen from both ends. It has to be LONG enough that a launch-frame collision has
+	 * finished happening - the reported bug took four frames to spend the throw - and SHORT enough
+	 * that an ordinary throw cannot have reached anything: at the full 3509 uu/s launch this file
+	 * measured, a tenth of a second is 350 uu, about three player widths, and it is well inside the
+	 * 0.50 s the thrower's own catch lockout runs for so the magnet cannot have touched the answer.
+	 */
+	constexpr float LaunchAuditSeconds = 0.10f;
+
+	/**
+	 * DEMO 27. Below this fraction of the launch speed the audit complains.
+	 *
+	 * Free flight loses only gravity over 0.10 s (about 3% of a full-power launch) and the catch
+	 * magnet preserves speed exactly, so anything under 0.60 means the Core HIT something within a
+	 * tenth of a second of leaving the hand. That is either the bug this pass fixed or a throw into a
+	 * wall three metres away, and the audit line prints how far it got from the thrower so a reader
+	 * can tell those two apart in one glance.
+	 */
+	constexpr float LaunchAuditMinRetained = 0.60f;
+
+	/**
+	 * DEMO 27, AND THE KNOB THAT IS NO LONGER HERE.
+	 *
+	 * There was a LaunchAuditMinClearance on this spot: the shipped alarm asked how far the Core had
+	 * got from the thrower and called anything under 150 uu the reported bug. IT DID NOT MEASURE THE
+	 * BUG. Bounce() is 0.195, so every wall bounce loses about four fifths of the launch, and the
+	 * clearance a slow throw has left is then a fact about how close the nearest pylon was - four of
+	 * thirty-four throws on the fixed tree fired that Warning and all four were geometry. The audit
+	 * asks what it HIT instead, which is a fact and not a proxy; see ATraceCore::ServerTickLaunchAudit
+	 * and ATraceCore::LastContactActor. TraceModeBRunThrow::MinClearance keeps a clearance floor of
+	 * its own, because the harness stages a RUNNING thrower and there the separation is the symptom.
+	 */
 
 	/**
 	 * Reports, once per mode-B entry, whether each knob found its UTraceSettings property or fell
@@ -5709,6 +5889,29 @@ static FAutoConsoleCommand GTraceModeBThrowMomentumCmd(
 			(LegacyLaunchZ < 0.f && S.LaunchVelocityZ >= 0.f)
 				? TEXT("  <- THIS IS THE REPORTED BUG: the old rule aimed this throw at the floor.")
 				: TEXT(""));
+
+		// DEMO 27. WHAT BECAME OF IT, which is the half this command could not answer when the owner
+		// reported the same complaint for the second time. Every failing throw printed a perfect
+		// launch line above and then lost the whole of it on the next frame.
+		if (S.LaunchRetained > 0.f)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ModeB]   Demo 27: %.2fs after that launch the Core still had %.0f uu/s - %.0f%% ")
+				TEXT("of it - and was %.0f uu clear of the thrower.%s"),
+				TraceModeBTuning::LaunchAuditSeconds, S.SpeedAfterLaunch, 100.f * S.LaunchRetained,
+				S.DistanceFromThrowerAfterLaunch,
+				(S.LaunchRetained < TraceModeBTuning::LaunchAuditMinRetained)
+					? TEXT("  <- IT HIT SOMETHING IMMEDIATELY. If the contact log names a player, the ")
+					  TEXT("flight sweep is seeing pawns again (Trace.ModeB.FlightHitsPawns).")
+					: TEXT(""));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ModeB]   Demo 27: that launch was not audited - the flight ended inside %.2fs ")
+				TEXT("(caught, scored or reset), or this is not the machine that threw it."),
+				TraceModeBTuning::LaunchAuditSeconds);
+		}
 	}));
 
 // =================================================================================================
@@ -6410,6 +6613,494 @@ static FAutoConsoleCommand GTraceModeBMomentumTestCmd(
 			if (ATraceCore* Core = ATraceCore::Get(World))
 			{
 				Core->RunThrowMomentumTest();
+			}
+		}
+	}));
+
+// =================================================================================================
+// DEMO 27 — Trace.ModeB.RunThrowTest. THE RUNNING THROW, STAGED AND SCORED.
+//
+// See the declaration in TraceCore.h for what it is for and why it drives the pawn for real. What
+// follows is how it stages the state, in the order the phases run.
+// =================================================================================================
+
+namespace TraceModeBRunThrow
+{
+	/** How long the pawn runs before it throws. Past the acceleration ramp at any walk speed. */
+	constexpr double RunUpSeconds = 0.60;
+
+	/**
+	 * How long after the launch the verdict is read.
+	 *
+	 * LaunchAuditSeconds plus a couple of frames, ON PURPOSE: the numbers this scores are the ones
+	 * ATraceCore::ServerTickLaunchAudit already wrote into LastThrow. The test and the shipped
+	 * instrument therefore cannot disagree about what happened - if the audit is wrong, this is wrong
+	 * in exactly the same way and the two stop being independent evidence, which is honest. A second
+	 * measurement of the same flight, taken here, would look like corroboration and would not be.
+	 */
+	constexpr double JudgeAfterLaunchSeconds = TraceModeBTuning::LaunchAuditSeconds + 0.05;
+
+	/** The pawn must actually have been running this fast at the release, or the run proves nothing. */
+	constexpr float MinThrowerSpeed = 300.f;
+
+	/**
+	 * How far clear of the thrower's capsule the Core must be when the verdict is read.
+	 *
+	 * THE HARNESS MAY USE A DISTANCE WHERE THE SHIPPED ALARM MAY NOT, and that difference is the
+	 * point rather than an oversight. This test STAGES the throw: it puts the pawn on open ground
+	 * (ClearAheadUU below), makes it run, and then reads the gap - so nothing but the thrower's own
+	 * body can be responsible for a small one. The always-on alarm sees a bot throw into whatever
+	 * happens to be a metre away, where the same number means nothing; it asks what the Core hit.
+	 *
+	 * The arithmetic behind it: the Core leaves at thousands of uu/s and the thrower keeps running
+	 * under it, so a tenth of a second separates them by a couple of hundred uu - the measured green
+	 * runs read 265 and 276. What the bug produced was 19, and before the depenetration guard it was
+	 * a Core AT REST 87 uu from the launch point with the thrower running over the top of it. 150 sits
+	 * between the two with room on both sides.
+	 */
+	constexpr float MinClearance = 150.f;
+
+	/** How far ahead of the muzzle the staging demands open air, on top of the run-up's own distance. */
+	constexpr double ClearAheadUU = 700.0;
+
+	/**
+	 * *** HOW MUCH FARTHER THAN ITS OWN LAUNCH CLEARANCE THE PAWN IS MADE TO TRAVEL IN ONE FRAME. ***
+	 *
+	 * THIS CONSTANT IS THE WHOLE STAGING, so here is the arithmetic it comes from. The launch point
+	 * is ThrowMuzzleForward ahead of the eye; the Core's sphere clears the thrower's own capsule by
+	 * MeasureLaunchClearance() uu, about 15 at the shipped capsule and eye height. The bug needs the
+	 * capsule to cover that gap BETWEEN the frame that computes the launch point and the frame that
+	 * sweeps it - i.e. it needs
+	 *
+	 *     run speed x frame time  >  clearance
+	 *
+	 * At 60 fps that is a run of about 880 uu/s, which the fastest characters exceed and the slower
+	 * ones do not, and at 120 fps nobody does. THAT IS WHY THE FIRST VERSION OF THIS TEST PASSED ON
+	 * THE RED ARM: it ran at whatever the pawn's own top speed happened to be (800 uu/s that run) on a
+	 * machine drawing fast frames, the capsule advanced 13 uu into a 15 uu gap, and the old sweep
+	 * found nothing to hit. The arms agreed, which means the test measured nothing.
+	 *
+	 * So the run speed is now SOLVED from the clearance and the live frame time instead of being
+	 * whatever the character sheet says, and this is the margin it aims past the gap by. The test
+	 * therefore stages the same geometry on a slow hero, a fast hero, a 30 Hz frame and a 240 Hz one -
+	 * and the green arm passing at a speed no character can reach is a stronger statement than it
+	 * passing at 800 uu/s, not a weaker one: it says the throw leaves cleanly however fast you are
+	 * moving when you let go.
+	 */
+	constexpr double StagedOvershootUU = 8.0;
+
+	/**
+	 * Ceiling on the solved run speed. A very fast frame would otherwise ask for a pawn that crosses
+	 * a wall between two ticks, and the movement component's own sweep would then be the thing under
+	 * test. If the solve is clamped the verdict says so rather than quietly measuring something else.
+	 */
+	constexpr double MaxStagedSpeed = 4000.0;
+
+	/**
+	 * The gap, in uu, between the Core's collision sphere at the launch point and the thrower's own
+	 * capsule. Positive means the throw leaves in clear air.
+	 *
+	 * Measured off the SAME two expressions the launch uses - ThrowFromHolder's muzzle point and the
+	 * catch zone's capsule-surface distance - so that if either is retuned this moves with it. A
+	 * character with a wider capsule, a lower eye or a shorter muzzle offset gets a smaller number
+	 * here and needs less speed to stage the bug, which is exactly right.
+	 */
+	double MeasureLaunchClearance(const ATraceCharacter& Thrower, const FVector& Aim)
+	{
+		const FVector Muzzle = Thrower.GetPawnViewLocation() + Aim * TraceModeBTuning::ThrowMuzzleForward;
+
+		const UCapsuleComponent* const Capsule = Thrower.GetCapsuleComponent();
+		if (Capsule == nullptr)
+		{
+			return TraceModeBTuning::ThrowMuzzleForward;
+		}
+
+		const FVector Centre = Capsule->GetComponentLocation();
+		const double HalfHeight = static_cast<double>(Capsule->GetScaledCapsuleHalfHeight());
+		const double Radius = static_cast<double>(Capsule->GetScaledCapsuleRadius());
+		const double CapHalf = FMath::Max(0.0, HalfHeight - Radius);
+
+		const double ToAxis = FMath::PointDistToSegment(Muzzle,
+			Centre - FVector(0.0, 0.0, CapHalf), Centre + FVector(0.0, 0.0, CapHalf));
+
+		return ToAxis - Radius - static_cast<double>(TraceModeBTuning::CollisionRadius);
+	}
+}
+
+void ATraceCore::RunRunningThrowTest()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ModeBRunThrow] server only - a throw and its first frame of flight both resolve on ")
+			TEXT("the authority."));
+		return;
+	}
+
+	if (!IsModeB())
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[ModeBRunThrow] mode A has no throw. Launch with ?mode=b."));
+		return;
+	}
+
+	UWorld* const World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// THE LOCAL PAWN FIRST, and unlike the momentum test that preference is about determinism rather
+	// than about the network: this test WRITES a velocity every frame for the better part of a second,
+	// and a bot's own movement is being written by its behaviour tree at the same time. The listen
+	// host's pawn has nobody else steering it.
+	ATraceCharacter* Thrower = nullptr;
+	if (const APlayerController* const PC = World->GetFirstPlayerController())
+	{
+		Thrower = Cast<ATraceCharacter>(PC->GetPawn());
+	}
+	if (!IsValid(Thrower) || !Thrower->IsAlive())
+	{
+		Thrower = Carrier;
+	}
+	if (!IsValid(Thrower) || !Thrower->IsAlive())
+	{
+		TArray<ATraceCharacter*> Characters;
+		GatherCharacters(Characters);
+		Thrower = nullptr;
+		for (ATraceCharacter* Candidate : Characters)
+		{
+			if (IsValid(Candidate) && Candidate->IsAlive())
+			{
+				Thrower = Candidate;
+				break;
+			}
+		}
+	}
+
+	if (!IsValid(Thrower) || Thrower->GetCharacterMovement() == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ModeBRunThrow] SKIPPED: nobody alive with a movement component to throw it."));
+		return;
+	}
+
+	// Shared with the ticker by value and outliving this scope by design, exactly as the throw-spread
+	// harness above does it.
+	struct FRunThrowState
+	{
+		TWeakObjectPtr<ATraceCore> Core;
+		TWeakObjectPtr<ATraceCharacter> Thrower;
+		FVector SavedVelocity = FVector::ZeroVector;
+		TEnumAsByte<EMovementMode> SavedMode = MOVE_Walking;
+		double ThrowAt = 0.0;
+		double JudgeAt = 0.0;
+		int32 SerialBefore = 0;
+		int32 Phase = 0;
+
+		/** CLAUSE A: did the loose-Core sweep, run through a living body, refuse to see it? */
+		bool bRuleHolds = false;
+		FString RuleDetail;
+
+		/** The staged run: the clearance it was solved from, the speed that solved it, and the last
+		 *  speed actually written. See StagedOvershootUU. */
+		double Clearance = 0.0;
+		double StagedSpeed = 0.0;
+		bool bSpeedClamped = false;
+	};
+
+	TSharedRef<FRunThrowState> State = MakeShared<FRunThrowState>();
+	State->Core = this;
+	State->Thrower = Thrower;
+	State->SavedVelocity = Thrower->GetCharacterMovement()->Velocity;
+	State->SavedMode = Thrower->GetCharacterMovement()->MovementMode;
+	State->ThrowAt = World->GetTimeSeconds() + TraceModeBRunThrow::RunUpSeconds;
+	State->SerialBefore = LastThrow.Serial;
+
+	// =============================================================================================
+	// CLAUSE A — THE RULE ITSELF, ASKED DIRECTLY AND WITHOUT A THROW: *** A PAWN IS NOT GEOMETRY. ***
+	//
+	// The running throw below is the SYMPTOM the owner reported, and a symptom is worth reproducing.
+	// But whether it reproduces depends on the frame time and the character's top speed, which are
+	// not facts about the rule - the first version of this test staged a 800 uu/s run on a fast
+	// machine, failed to close a 15 uu gap, and PASSED ON THE RED ARM. So the rule is now scored on
+	// its own terms as well: sweep the loose Core's own query straight through a living player's
+	// body and see whether it comes back saying it hit one. That question has the same answer at 30
+	// fps and 240, on every character in the game.
+	// =============================================================================================
+	{
+		const FVector Through = Thrower->GetActorForwardVector().GetSafeNormal2D();
+		const FVector Body = Thrower->GetActorLocation();
+
+		FCollisionQueryParams RuleParams(SCENE_QUERY_STAT(TraceCoreRunThrowRule),
+			/*bTraceComplex=*/false, this);
+		RuleParams.AddIgnoredActor(this);
+
+		FHitResult RuleHit;
+		const bool bBlocked = TraceModeBTuning::SweepLooseCore(*World, RuleHit,
+			Body - Through * 250.0, Body + Through * 250.0,
+			TraceModeBTuning::CollisionRadius, RuleParams);
+
+		// NOT "did it hit nothing" - a wall behind the pawn is a perfectly good blocking hit and has
+		// nothing to do with the rule. The question is whether what it stopped on was a BODY.
+		const UPrimitiveComponent* const RuleComponent = bBlocked ? RuleHit.GetComponent() : nullptr;
+		const bool bHitAPawn = (RuleComponent != nullptr)
+			&& RuleComponent->GetCollisionObjectType() == ECC_Pawn;
+
+		State->bRuleHolds = !bHitAPawn;
+		State->RuleDetail = bHitAPawn
+			? FString::Printf(TEXT("BLOCKED BY %s (%s)"), *GetNameSafe(RuleHit.GetActor()),
+				*GetNameSafe(RuleHit.GetComponent()))
+			: (bBlocked
+				? FString::Printf(TEXT("passed through the body, stopped on %s"),
+					*GetNameSafe(RuleHit.GetActor()))
+				: TEXT("passed through the body, hit nothing"));
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[ModeBRunThrow] staging a RUNNING throw by %s: %.2fs of forward run, then a full charge ")
+		TEXT("released while still moving. The run speed is SOLVED each frame so the capsule covers ")
+		TEXT("its own %.1f uu launch clearance between two frames - see StagedOvershootUU. Arm: ")
+		TEXT("FlightHitsPawns=%d (1 = the pre-Demo-27 sweep, which must FAIL)."),
+		*GetNameSafe(Thrower), TraceModeBRunThrow::RunUpSeconds,
+		TraceModeBRunThrow::MeasureLaunchClearance(*Thrower,
+			Thrower->GetActorForwardVector().GetSafeNormal()),
+		CVarModeBFlightHitsPawns.GetValueOnAnyThread());
+
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[State](float /*Delta*/) -> bool
+	{
+		ATraceCore* const TheCore = State->Core.Get();
+		ATraceCharacter* const Runner = State->Thrower.Get();
+
+		// EVERY ABANDONED PATH RESTORES THE PAWN. A harness that leaves a pawn sprinting at a wall
+		// because its Core was destroyed mid-run has broken the match it was measuring.
+		auto Restore = [&State](ATraceCharacter* Pawn)
+		{
+			if (IsValid(Pawn) && Pawn->GetCharacterMovement() != nullptr)
+			{
+				Pawn->GetCharacterMovement()->SetMovementMode(State->SavedMode);
+				Pawn->GetCharacterMovement()->Velocity = State->SavedVelocity;
+			}
+		};
+
+		if (!IsValid(TheCore) || !IsValid(Runner) || !Runner->IsAlive()
+			|| Runner->GetCharacterMovement() == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBRunThrow] SKIPPED: the thrower or the Core went away mid-run."));
+			Restore(Runner);
+			return false;
+		}
+
+		UWorld* const TickWorld = TheCore->GetWorld();
+		if (!IsValid(TickWorld))
+		{
+			Restore(Runner);
+			return false;
+		}
+		const double Now = TickWorld->GetTimeSeconds();
+		UCharacterMovementComponent* const Movement = Runner->GetCharacterMovement();
+
+		// THE RUN ITSELF, re-applied every frame and through both phases 0 and 1. Written rather than
+		// requested through AddMovementInput because the number that matters is HOW FAR THE CAPSULE
+		// MOVES BETWEEN TWO FRAMES, and a velocity the movement component reaches by its own
+		// acceleration curve makes that number a property of the character's tuning instead of a
+		// constant of the test. It is restored at the end, and the direction is re-read every frame
+		// so the run stays under the pawn's own facing - which is where its aim points too.
+		if (State->Phase <= 1)
+		{
+			const FVector Forward = Runner->GetActorForwardVector().GetSafeNormal2D();
+
+			// THE SPEED IS SOLVED, NOT LOOKED UP. See StagedOvershootUU for the whole argument: the
+			// bug is "capsule advance in one frame beats launch clearance", so the run is set to
+			// whatever makes that true on THIS frame and THIS character, and never below the pawn's
+			// own top speed (a staged run must not be slower than a real one).
+			const double FrameSeconds = FMath::Clamp(
+				static_cast<double>(TickWorld->GetDeltaSeconds()), 1.0 / 240.0, 1.0 / 10.0);
+
+			State->Clearance = TraceModeBRunThrow::MeasureLaunchClearance(*Runner, Forward);
+			const double Needed = (State->Clearance + TraceModeBRunThrow::StagedOvershootUU) / FrameSeconds;
+
+			const double Wanted = FMath::Max(static_cast<double>(Movement->GetMaxSpeed()), Needed);
+			State->bSpeedClamped = (Wanted > TraceModeBRunThrow::MaxStagedSpeed);
+			State->StagedSpeed = FMath::Min(Wanted, TraceModeBRunThrow::MaxStagedSpeed);
+
+			Movement->SetMovementMode(MOVE_Walking);
+			Movement->Velocity = Forward * State->StagedSpeed;
+		}
+
+		switch (State->Phase)
+		{
+		case 0:
+		{
+			if (Now < State->ThrowAt)
+			{
+				return true;
+			}
+
+			// --- THE STAGING CHECK. Is there open air in front of the muzzle? -----------------------
+			//
+			// A throw into a wall three metres away loses its speed for a completely legitimate
+			// reason and would be scored as the bug. So the same query the flight uses is asked along
+			// the aim first, and a blocked one SKIPS the run instead of failing it - the same rule
+			// Trace.Integ.WalkCore applies to a jump that lands on a ledge.
+			FVector Aim = Runner->GetAimDirection();
+			if (Aim.IsNearlyZero())
+			{
+				Aim = Runner->GetActorForwardVector();
+			}
+			Aim = Aim.GetSafeNormal();
+
+			const FVector Muzzle = Runner->GetPawnViewLocation()
+				+ Aim * TraceModeBTuning::ThrowMuzzleForward;
+
+			FCollisionQueryParams ClearParams(SCENE_QUERY_STAT(TraceCoreRunThrowClear),
+				/*bTraceComplex=*/false, TheCore);
+			ClearParams.AddIgnoredActor(TheCore);
+
+			FHitResult ClearHit;
+			if (TraceModeBTuning::SweepLooseCore(*TickWorld, ClearHit, Muzzle,
+				Muzzle + Aim * (TraceModeBRunThrow::ClearAheadUU
+					+ State->StagedSpeed * TraceModeBRunThrow::JudgeAfterLaunchSeconds),
+				TraceModeBTuning::CollisionRadius, ClearParams))
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[ModeBRunThrow] SKIPPED: %s is aimed at %s, %.0f uu ahead. Nothing about the ")
+					TEXT("throw rule can be measured through a wall - move and run it again."),
+					*GetNameSafe(Runner), *GetNameSafe(ClearHit.GetActor()), ClearHit.Distance);
+				Restore(Runner);
+				return false;
+			}
+
+			// The Core, and a forgiven cooldown: the cooldown is not what is under test.
+			if (TheCore->GetCarrier() != Runner)
+			{
+				TheCore->GrantTo(Runner, ETraceCoreGrantReason::Debug);
+			}
+			TheCore->ThrowCooldownEndServerTime = 0.f;
+
+			// A FULL CHARGE, stated as the hold that buys one rather than as a scale, because
+			// ThrowFromHolder takes a hold and derives the scale (spec v13 §6).
+			if (!TheCore->ThrowFromHolder(Runner, ATraceCore::GetThrowChargeSeconds()))
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[ModeBRunThrow] SKIPPED: ThrowFromHolder refused the release."));
+				Restore(Runner);
+				return false;
+			}
+
+			State->JudgeAt = Now + TraceModeBRunThrow::JudgeAfterLaunchSeconds;
+			State->Phase = 1;
+			return true;
+		}
+
+		case 1:
+		{
+			// KEEP RUNNING. This is not padding: the thrower walking forward INTO the ball it has
+			// just released is the entire mechanism under test, and a pawn that stopped at the
+			// release would clear its own launch point by accident.
+			if (Now < State->JudgeAt)
+			{
+				return true;
+			}
+			State->Phase = 2;
+			return true;
+		}
+
+		default:
+			break;
+		}
+
+		// --- SCORE, off the numbers the shipped launch audit already wrote. -------------------------
+		Restore(Runner);
+
+		const ATraceCore::FThrowMomentumSample& Throw = ATraceCore::LastThrow;
+
+		if (Throw.Serial == State->SerialBefore)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBRunThrow] VERDICT: SKIPPED - no throw was recorded at all."));
+			return false;
+		}
+		if (Throw.ThrowerName != GetNameSafe(Runner))
+		{
+			// Somebody else threw inside our window - a bot intercepting the loose Core. Scoring
+			// their throw as ours is exactly how a harness talks itself into a result.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBRunThrow] VERDICT: SKIPPED - the last throw on record is %s's, not %s's."),
+				*Throw.ThrowerName, *GetNameSafe(Runner));
+			return false;
+		}
+		if (Throw.LaunchRetained <= 0.f)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ModeBRunThrow] VERDICT: SKIPPED - the flight ended before the launch audit came ")
+				TEXT("due (caught, scored or reset inside %.2fs)."),
+				TraceModeBRunThrow::JudgeAfterLaunchSeconds);
+			return false;
+		}
+
+		const bool bWasRunning = (Throw.ThrowerSpeed2D >= TraceModeBRunThrow::MinThrowerSpeed);
+		const bool bKeptItsSpeed = (Throw.LaunchRetained >= TraceModeBTuning::LaunchAuditMinRetained);
+		const bool bGotClear = (Throw.DistanceFromThrowerAfterLaunch >= TraceModeBRunThrow::MinClearance);
+
+		// BOTH CLAUSES, AND THE RULE IS NOT THE OPTIONAL ONE. A build that passes the symptom because
+		// the pawn happened to be slow, while its flight sweep still treats a body as a wall, has not
+		// fixed anything - it is one dash or one dropped frame away from the owner's report.
+		const bool bPass = State->bRuleHolds && bWasRunning && bKeptItsSpeed && bGotClear;
+
+		// One string, two log calls. UE_LOG takes its verbosity as a literal, and a FAIL that only
+		// ever printed at Display is a FAIL nobody greps for.
+		const FString Verdict = FString::Printf(
+			TEXT("[ModeBRunThrow] VERDICT: %s | A, THE RULE - a pawn is not geometry: %s (%s) | B, THE ")
+			TEXT("SYMPTOM - %s threw at %.0f uu/s while running %.0f uu/s (needs >= %.0f, %s; staged ")
+			TEXT("%.0f uu/s against a %.1f uu launch clearance%s) | %.2fs later the Core still had ")
+			TEXT("%.0f uu/s, %.0f%% of the launch (needs >= %.0f%%, %s) and was %.0f uu clear of them ")
+			TEXT("(needs >= %.0f, %s) | arm: FlightHitsPawns=%d"),
+			bPass ? TEXT("PASS") : TEXT("FAIL"),
+			State->bRuleHolds ? TEXT("held") : TEXT("BROKEN"), *State->RuleDetail,
+			*Throw.ThrowerName, Throw.LaunchSpeed, Throw.ThrowerSpeed2D,
+			TraceModeBRunThrow::MinThrowerSpeed, bWasRunning ? TEXT("ok") : TEXT("NOT RUNNING"),
+			State->StagedSpeed, State->Clearance,
+			State->bSpeedClamped ? TEXT(", CLAMPED - the frame was too fast to stage it fully") : TEXT(""),
+			TraceModeBRunThrow::JudgeAfterLaunchSeconds, Throw.SpeedAfterLaunch,
+			100.f * Throw.LaunchRetained, 100.f * TraceModeBTuning::LaunchAuditMinRetained,
+			bKeptItsSpeed ? TEXT("ok") : TEXT("LOST IT"),
+			Throw.DistanceFromThrowerAfterLaunch, TraceModeBRunThrow::MinClearance,
+			bGotClear ? TEXT("ok") : TEXT("STILL ON TOP OF THEM"),
+			CVarModeBFlightHitsPawns.GetValueOnAnyThread());
+
+		if (bPass)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("%s"), *Verdict);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("%s"), *Verdict);
+		}
+
+		return false;
+	}));
+}
+
+static FAutoConsoleCommand GTraceModeBRunThrowTestCmd(
+	TEXT("Trace.ModeB.RunThrowTest"),
+	TEXT("MODE B, Demo 27. Server. Runs the local pawn forward, throws at a full charge while it is ")
+	TEXT("still moving, and PASSES only if the Core keeps its launch speed and gets clear of the ")
+	TEXT("thrower. The red arm is Trace.ModeB.FlightHitsPawns 1, on which it must FAIL."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Context.World();
+			if (World == nullptr || World->GetNetMode() == NM_Client)
+			{
+				continue;
+			}
+
+			if (ATraceCore* Core = ATraceCore::Get(World))
+			{
+				Core->RunRunningThrowTest();
 			}
 		}
 	}));
@@ -7317,7 +8008,7 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	bLooseFromThrow = true;   // Spec v6 §4.2: this Core, and only this kind, turns over on landing.
 	CatchZoneTarget = nullptr;
 	bCatchZoneContested = false;
-	LastContactServerTime = -1.f;
+	ForgetLastContact();      // Spec v13 §8, and Demo 27's "what did it hit": this flight starts blank.
 	ClearPendingTurnover();   // Spec v19 §1.5: this throw is awarded on its own landing, not the last one's.
 	// Spec v25 §2, for the same reason and set in the same breath: this throw earns its own turnover.
 	// ClearLooseState() clears the latch on every path that ENDS a flight; the two paths that START
@@ -7329,6 +8020,14 @@ bool ATraceCore::ThrowFromHolder(ATraceCharacter* Thrower, float HeldSeconds)
 	LooseStartServerTime = Now;
 	LooseLocation = LaunchLocation;
 	LooseVelocity = LaunchVelocity;
+
+	// DEMO 27. ARM THE LAUNCH AUDIT. See ServerTickLaunchAudit: a tenth of a second from now the
+	// flight is asked how much of this launch it still has, and says so in the log if the answer is
+	// "almost none". Three assignments, no allocation, and it runs on every throw in a real match
+	// rather than only under a harness - which is the whole point, because this bug shipped twice.
+	LaunchAuditDueServerTime = Now + TraceModeBTuning::LaunchAuditSeconds;
+	LaunchAuditLaunchSpeed = static_cast<float>(LaunchVelocity.Size());
+	LaunchAuditSerial = LastThrow.Serial;
 
 	// A loose Core belongs to nobody, so it must be visible to everybody - including the thrower,
 	// whose own camera had it hidden while they carried it (bOwnerNoSee, resolved through the actor
@@ -7393,6 +8092,11 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	const float Now = GetServerTimeSeconds();
 	const float Step = FMath::Clamp(DeltaSeconds, 0.f, 0.1f);   // A hitch must not teleport the Core.
 
+	// DEMO 27. Ahead of everything, including the pull's early return: the audit is a report about a
+	// launch that has already happened, and a flight that gets picked up by a magnetic delivery in
+	// its first tenth of a second is exactly the kind of thing it must still be able to describe.
+	ServerTickLaunchAudit();
+
 	// --- SPEC v25 §2. A COMPLETED PULL OWNS THE TICK, AND EVERYTHING BELOW IS SKIPPED. ------------
 	//
 	// A Core being magnetically delivered is not falling: it has no gravity, no bounce, no landing, no
@@ -7448,13 +8152,16 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 		// ONE sphere sweep against static world geometry. Pawns are deliberately not swept against:
 		// "first contact takes it" is resolved by the proximity poll below, so a player standing in
 		// the flight path must not also bounce the Core off themselves.
+		//
+		// DEMO 27: THAT SENTENCE IS ONLY TRUE SINCE SweepLooseCore EXISTED. It used to be a channel
+		// sweep, which every player capsule blocks, and the capsule it hit most reliably was the
+		// thrower's own on the launch frame. See the FlightHitsPawns block at the top of this file.
 		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreLoose), /*bTraceComplex=*/false, this);
 		Params.AddIgnoredActor(this);
 
 		FHitResult Hit;
-		const bool bBlocked = World->SweepSingleByChannel(
-			Hit, StartLocation, Desired, FQuat::Identity, ECC_WorldStatic,
-			FCollisionShape::MakeSphere(TraceModeBTuning::CollisionRadius), Params);
+		const bool bBlocked = TraceModeBTuning::SweepLooseCore(
+			*World, Hit, StartLocation, Desired, TraceModeBTuning::CollisionRadius, Params);
 
 		if (bBlocked)
 		{
@@ -7516,8 +8223,24 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 			ArrivalSin = (Speed3DBeforeContact > 1.0)
 				? (ApproachSpeed / Speed3DBeforeContact) : 1.0;
 
-			const FVector Reflected = FVector(LooseVelocity).MirrorByVector(ContactNormal)
-				* TraceModeBTuning::Bounce();
+			// --- DEMO 27. A DEPENETRATION IS NOT AN IMPACT, AND MUST NOT BE MIRRORED. ---------------
+			//
+			// ArrivalSin is NEGATIVE when the Core is already travelling AWAY from the contact normal,
+			// which a real impact never is: you cannot strike a face you are receding from. It happens on
+			// a sweep that STARTS penetrating, where the "normal" is the direction the physics engine
+			// wants to push the Core OUT along - and the push-out above has already done exactly that.
+			// Mirroring on top of it reverses a velocity that was leaving, which is how a 3504 uu/s
+			// forward throw became a 681 uu/s backward one on its own launch frame.
+			//
+			// This is the SECOND of the two Demo 27 fixes and it is deliberately not the first: the
+			// object-type sweep stops the thrower's capsule from being the surface, and this stops ANY
+			// start-penetrating contact - a launch point inside the lip of a crate, a Core dropped by a
+			// debug command inside a wall - from firing the Core backwards out of it.
+			const bool bAlreadySeparating = (ArrivalSin < 0.0);
+
+			const FVector Reflected = bAlreadySeparating
+				? FVector(LooseVelocity)
+				: FVector(LooseVelocity).MirrorByVector(ContactNormal) * TraceModeBTuning::Bounce();
 
 			const bool bLegacyLandingRule = TraceModeBLegacyLandingRule();
 			const bool bClearedTheThrower =
@@ -7577,7 +8300,10 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 
 			LooseVelocity = Reflected;
 
-			if (!bUpwardFacing)
+			// Demo 27: a separating depenetration is not a bounce and is not counted as one. The
+			// tally is read as "how often did a throw come off a wall", and a launch shoved out of a
+			// surface it was already leaving would have inflated it while changing no velocity.
+			if (!bUpwardFacing && !bAlreadySeparating)
 			{
 				++SurfaceStats.WallBounces;
 				UE_LOG(LogTraceGame, Verbose,
@@ -7603,12 +8329,19 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 				// rather than a tidy-up: before v19 the "SETTLED" arm came first, and now that a
 				// contact can come to rest on a lip AND be refused, a chain that reported "SETTLED on
 				// it - turnover" would be printing the opposite of what the same frame did.
+				// DEMO 27 ADDS THE ONE FIELD THAT WOULD HAVE ENDED THIS IN A MINUTE: WHAT IT HIT.
+				// Every other number in this line was already here and the whole set of them was
+				// consistent with a wall. Naming the actor says "TraceCharacter_0" and the diagnosis
+				// is over. A contact log that cannot name the surface is a log that can only be read
+				// by somebody who already knows the answer.
 				UE_LOG(LogTraceGame, Display,
-					TEXT("[ModeBTurnover] CONTACT at %s | %.0f uu above the floor | speed %.0f -> %.0f uu/s | ")
-					TEXT("normal %s (%.0f deg from up, up-facing=%d) | arrival %.1f deg to the surface ")
-					TEXT("(needs %.0f) | airborne %.3fs (needs %.3f) | orb %.0f uu above what is under it ")
-					TEXT("(needs <= %.0f) | VERDICT: %s"),
-					*SurfacePoint.ToCompactString(), SurfacePoint.Z - FloorZ,
+					TEXT("[ModeBTurnover] CONTACT at %s with %s (%s) | %.0f uu above the floor | speed ")
+					TEXT("%.0f -> %.0f uu/s | normal %s (%.0f deg from up, up-facing=%d) | arrival %.1f ")
+					TEXT("deg to the surface (needs %.0f) | airborne %.3fs (needs %.3f) | orb %.0f uu ")
+					TEXT("above what is under it (needs <= %.0f) | VERDICT: %s"),
+					*SurfacePoint.ToCompactString(), *GetNameSafe(Hit.GetActor()),
+					*GetNameSafe(Hit.GetComponent()),
+					SurfacePoint.Z - FloorZ,
 					Speed3DBeforeContact, Reflected.Size(),
 					*ContactNormal.ToCompactString(),
 					FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(ContactNormal.Z, -1.0, 1.0))),
@@ -7617,7 +8350,8 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 					TraceModeBTuning::LandingMinDescentDegrees(),
 					Now - LooseStartServerTime, TraceModeBTuning::LandingMinFlightSeconds(),
 					ContactSupportGap, CVarModeBTurnoverContactSlack.GetValueOnAnyThread(),
-					!bUpwardFacing ? TEXT("WALL - bounce")
+					bAlreadySeparating ? TEXT("DEPENETRATION - flies on, not mirrored (Demo 27)")
+						: !bUpwardFacing ? TEXT("WALL - bounce")
 						: (bContactIsLanding
 							? (bComesToRest ? TEXT("SETTLED on it - turnover") : TEXT("LANDING - turnover"))
 							: (!bVisiblyOnTop ? TEXT("NOT ON TOP OF IT (v19 §1.5) - keeps falling")
@@ -7625,7 +8359,19 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 									: TEXT("GRAZE - flies on")))));
 			}
 
+			// DEMO 27. WHAT IT HIT, KEPT AND NOT ONLY PRINTED. The line above names the actor, but only
+			// under Trace.ModeB.TurnoverLog, which is off in every ordinary run - so the always-on
+			// launch alarm had no way to tell a goal spoke from the thrower's own chest and cried wolf
+			// on four throws in thirty-four. Two cheap fields here are the whole discriminator; see
+			// ServerTickLaunchAudit. The body test is the HIT COMPONENT'S object type, the same
+			// question SweepLooseCore asks and for the same reason: what blocks a sweep is a shape.
 			LastContactServerTime = Now;
+			LastContactActor = Hit.GetActor();
+			LastContactComponentName = (Hit.GetComponent() != nullptr) ? Hit.GetComponent()->GetFName() : NAME_None;
+			bLastContactWasBody =
+				(Hit.GetComponent() != nullptr && Hit.GetComponent()->GetCollisionObjectType() == ECC_Pawn)
+				|| (Hit.GetActor() != nullptr && Hit.GetActor() == LooseThrower.Get());
+			bFlightHitABody = bFlightHitABody || bLastContactWasBody;
 
 			if (Reflected.Size() < TraceModeBTuning::RestSpeed())
 			{
@@ -8025,6 +8771,163 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	}
 }
 
+void ATraceCore::ServerTickLaunchAudit()
+{
+	if (!HasAuthority() || LaunchAuditDueServerTime < 0.f)
+	{
+		return;
+	}
+
+	const float Now = GetServerTimeSeconds();
+	if (Now < LaunchAuditDueServerTime)
+	{
+		return;
+	}
+
+	// One shot. Disarmed before anything below can return early, so a refused audit cannot fire again
+	// on every subsequent frame of the same flight.
+	LaunchAuditDueServerTime = -1.f;
+
+	// THE SERIAL, not the values. A throw that was caught and re-thrown inside the audit window would
+	// otherwise be scored against the FIRST launch's speed - see FThrowMomentumSample::Serial, which
+	// exists because two throws can be byte-identical and this is the same trap one level up.
+	if (LastThrow.Serial != LaunchAuditSerial || LaunchAuditLaunchSpeed < 1.f)
+	{
+		return;
+	}
+
+	const float SpeedNow = static_cast<float>(FVector(LooseVelocity).Size());
+	const float Retained = SpeedNow / LaunchAuditLaunchSpeed;
+
+	// How far it actually got from the man who threw it, measured to his CAPSULE for the same reason
+	// the catch zone is: the distance that matters is the gap a player sees between the ball and the
+	// body, not the gap to a point inside his chest.
+	double DistanceFromThrower = -1.0;
+	if (const ATraceCharacter* Thrower = LooseThrower.Get())
+	{
+		DistanceFromThrower = FVector::Dist(FVector(LooseLocation), Thrower->GetActorLocation());
+		if (const UCapsuleComponent* Capsule = Thrower->GetCapsuleComponent())
+		{
+			const FVector CapsuleCentre = Capsule->GetComponentLocation();
+			const double HalfHeight = static_cast<double>(Capsule->GetScaledCapsuleHalfHeight());
+			const FVector CatchPoint(CapsuleCentre.X, CapsuleCentre.Y,
+				FMath::Clamp(FVector(LooseLocation).Z, CapsuleCentre.Z - HalfHeight, CapsuleCentre.Z + HalfHeight));
+
+			DistanceFromThrower = FMath::Max(0.0,
+				FVector::Dist(FVector(LooseLocation), CatchPoint)
+					- static_cast<double>(Capsule->GetScaledCapsuleRadius()));
+		}
+	}
+
+	LastThrow.SpeedAfterLaunch = SpeedNow;
+	LastThrow.LaunchRetained = Retained;
+	LastThrow.DistanceFromThrowerAfterLaunch = static_cast<float>(FMath::Max(0.0, DistanceFromThrower));
+
+	// --- THE ALARM, AND IT IS ASKED BEFORE THE SPEED. --------------------------------------------
+	//
+	// A BODY BLOCKED THE FLIGHT SWEEP. That is the Demo 27 bug stated as the rule it breaks rather
+	// than as a symptom, and it is why this test comes first: with the depenetration guard also in
+	// place a self-collision can now leave the SPEED intact and only wreck the clearance, so a
+	// ratio-first alarm would have gone to Verbose and said nothing on the very arm that proves it.
+	// Trace.ModeB.RunThrowTest on Trace.ModeB.FlightHitsPawns 1 does exactly that: 100% of the launch
+	// retained, 8 uu clear of the thrower, and the old ordering never printed a word.
+	//
+	// It cannot cry wolf. SweepLooseCore filters pawn-typed colliders out of the sweep's ANSWER, so
+	// on a working tree bFlightHitABody has no way to be set; unlike the clearance test this replaced
+	// there is no threshold here to be wrong about.
+	if (bFlightHitABody)
+	{
+		const FString ContactBodyName = bLastContactWasBody
+			? FString::Printf(TEXT("%s (%s)"), *GetNameSafe(LastContactActor.Get()),
+				*LastContactComponentName.ToString())
+			: FString(TEXT("a body earlier in the same flight"));
+
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[ModeBLaunch] *** %s's throw was blocked by a BODY - %s - and %.2fs later it has ")
+			TEXT("%.0f%% of its %.0f uu/s launch (%.0f uu/s) and is %.0f uu clear of them. A pawn is ")
+			TEXT("not geometry: the flight sweep is meant to filter bodies out of its answer, so this ")
+			TEXT("is the Demo 27 report - \"it doesn't throw forward when moving forward\" - back ")
+			TEXT("again (Trace.ModeB.FlightHitsPawns is %d)."),
+			*LastThrow.ThrowerName, *ContactBodyName, TraceModeBTuning::LaunchAuditSeconds,
+			100.f * Retained, LaunchAuditLaunchSpeed, SpeedNow,
+			LastThrow.DistanceFromThrowerAfterLaunch,
+			CVarModeBFlightHitsPawns.GetValueOnAnyThread());
+		return;
+	}
+
+	if (Retained >= TraceModeBTuning::LaunchAuditMinRetained)
+	{
+		// The ordinary case, and it is Verbose rather than silent so a run can PROVE the audit was
+		// armed and did look. A check nobody can see pass is a check nobody trusts when it fails.
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[ModeBLaunch] %s's throw kept %.0f%% of its %.0f uu/s launch after %.2fs (%.0f uu/s, ")
+			TEXT("%.0f uu clear of them)."),
+			*LastThrow.ThrowerName, 100.f * Retained, LaunchAuditLaunchSpeed,
+			TraceModeBTuning::LaunchAuditSeconds, SpeedNow, LastThrow.DistanceFromThrowerAfterLaunch);
+		return;
+	}
+
+	// --- THE THROW IS SLOW, AND NO BODY TOUCHED IT. WHAT TOOK IT? --------------------------------
+	//
+	// THIS USED TO BE A DISTANCE AND THAT WAS A GUESS. The first version of this function asked
+	// whether the Core had got 150 uu clear of the thrower and called anything nearer the Demo 27 bug.
+	// It cried wolf: Bounce() is 0.195, so EVERY wall bounce loses about 80% of the launch, and how
+	// much clearance a slow throw has left is then a fact about how close the nearest pylon was. Four
+	// of thirty-four throws on the FIXED tree fired that Warning and all four were geometry - one of
+	// them, gk-final.log:1720, with the contact log one line above it naming "TraceArenaBuilder_0
+	// (DaisPylon_5) ... VERDICT: WALL - bounce". An alarm that tells the next reader the ASAP bug is
+	// back on a tree where it is not is worse than no alarm at all.
+	//
+	// The bug now has the test above, which is the rule and not a proxy for it. What is left down here
+	// is a throw that lost its speed to something that was not a player, and the only thing worth
+	// saying about it is WHAT - so the line names the actor and the component, which until now were
+	// printed only under Trace.ModeB.TurnoverLog and therefore in almost no run that mattered.
+	const bool bHadContact = (LastContactServerTime >= 0.f);
+	const FString ContactName = bHadContact
+		? FString::Printf(TEXT("%s (%s)"), *GetNameSafe(LastContactActor.Get()),
+			*LastContactComponentName.ToString())
+		: FString();
+
+	// The contact's age is in both lines because on the bug it is the LAUNCH FRAME ITSELF -
+	// "0.000s into the flight" - and no throw that ever left the hand can be that.
+	const FString Hit = bHadContact
+		? FString::Printf(TEXT("%s took it %.3fs into the flight"), *ContactName,
+			LastContactServerTime - LooseStartServerTime)
+		: FString(TEXT("nothing was recorded hitting it, so look at the magnet and the pull instead"));
+
+	if (bHadContact)
+	{
+		// SLOW, AND ARENA GEOMETRY TOOK IT. An ordinary throw into a wall a couple of metres away, and
+		// at Bounce() = 0.195 it is SUPPOSED to lose four fifths of its speed doing that. Worth a line
+		// so a reader chasing a "the throw died" report can see it happen; never an alarm.
+		//
+		// The clearance is still printed, and at 0 uu with a launch-frame age it is worth reading: that
+		// is a thrower standing against a pylon throwing into it, which looks like the reported bug to
+		// a player and is a separate thing to fix. It is not THIS bug, and this line does not say it is.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ModeBLaunch] %s's throw lost %.0f%% of its launch in %.2fs (%.0f -> %.0f uu/s): %s. ")
+			TEXT("Arena geometry, not a player - %.0f uu clear of them when it was measured."),
+			*LastThrow.ThrowerName, 100.f * (1.f - Retained), TraceModeBTuning::LaunchAuditSeconds,
+			LaunchAuditLaunchSpeed, SpeedNow, *Hit, LastThrow.DistanceFromThrowerAfterLaunch);
+		return;
+	}
+
+	// *** SLOW, AND NOTHING ON RECORD TOUCHED IT. ***
+	//
+	// Still a Warning, and still a rare one by construction: free flight loses only gravity over
+	// 0.10 s and the catch magnet preserves speed exactly, so a Core that shed 40% of its launch with
+	// no blocked sweep behind it means something OUTSIDE the contact path is eating throws. That is
+	// not the Demo 27 self-collision and this line no longer claims it is - it says what it knows.
+	UE_LOG(LogTraceGame, Warning,
+		TEXT("[ModeBLaunch] *** %s's throw LOST %.0f%% of its launch in %.2fs: %.0f -> %.0f uu/s, ")
+		TEXT("%.0f uu clear of them, and %s. No wall, no floor and no player took it, so the speed ")
+		TEXT("went somewhere that is not the contact path - look at the magnet, the pull and the ")
+		TEXT("charge (Trace.ModeB.FlightHitsPawns is %d)."),
+		*LastThrow.ThrowerName, 100.f * (1.f - Retained), TraceModeBTuning::LaunchAuditSeconds,
+		LaunchAuditLaunchSpeed, SpeedNow, LastThrow.DistanceFromThrowerAfterLaunch, *Hit,
+		CVarModeBFlightHitsPawns.GetValueOnAnyThread());
+}
+
 void ATraceCore::ServerApplyCatchZone(float DeltaSeconds)
 {
 	// SPEC v6 §4.1. See the tuning block at the top of this file for what the three knobs mean.
@@ -8284,16 +9187,17 @@ bool ATraceCore::ServerProbeRestingSurface(FVector& OutPoint, FVector& OutNormal
 	const FVector From = LooseLocation;
 	const FVector To = From - FVector(0.0, 0.0, static_cast<double>(TraceModeBRestProbeDepth));
 
-	// The SAME sphere and the SAME channel the flight sweeps use. A probe with a different shape
-	// would be a second opinion about what the Core is touching, and the two would disagree exactly
-	// where it matters - on the lip of a block, which is the geometry the user's report is about.
+	// The SAME sphere and the SAME query the flight sweeps use - literally the same function since
+	// Demo 27. A probe with a different shape would be a second opinion about what the Core is
+	// touching, and the two would disagree exactly where it matters - on the lip of a block, which is
+	// the geometry the user's report is about. It also means the Core can no longer be declared to be
+	// resting on a PLAYER who happens to be standing over it.
 	FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreRestProbe), /*bTraceComplex=*/false, this);
 	Params.AddIgnoredActor(this);
 
 	FHitResult Hit;
-	const bool bHit = World->SweepSingleByChannel(
-		Hit, From, To, FQuat::Identity, ECC_WorldStatic,
-		FCollisionShape::MakeSphere(TraceModeBTuning::CollisionRadius), Params);
+	const bool bHit = TraceModeBTuning::SweepLooseCore(
+		*World, Hit, From, To, TraceModeBTuning::CollisionRadius, Params);
 
 	if (!bHit)
 	{
@@ -8328,10 +9232,11 @@ double ATraceCore::MeasureVisibleSupportGap(FVector& OutSupportPoint) const
 	FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreSupportGap), /*bTraceComplex=*/false, this);
 	Params.AddIgnoredActor(this);
 
+	// Demo 27: the same pawn-rejecting query as the flight sweep, so "what is under it" means the
+	// same thing to this rule as to the one that put the Core there. A player's shins are not a floor.
 	FHitResult Hit;
-	const bool bHit = World->SweepSingleByChannel(
-		Hit, From, To, FQuat::Identity, ECC_WorldStatic,
-		FCollisionShape::MakeSphere(static_cast<float>(TraceModeBVisibleOrbRadius)), Params);
+	const bool bHit = TraceModeBTuning::SweepLooseCore(
+		*World, Hit, From, To, static_cast<float>(TraceModeBVisibleOrbRadius), Params);
 
 	if (!bHit)
 	{
@@ -9351,7 +10256,8 @@ void ATraceCore::ClearLooseState()
 	bLooseFromThrow = false;
 	CatchZoneTarget = nullptr;
 	bCatchZoneContested = false;   // Spec v13 §5: a new flight starts its own contest.
-	LastContactServerTime = -1.f;  // Spec v13 §8: and its own contact history.
+	ForgetLastContact();           // Spec v13 §8: and its own contact history, Demo 27's actor with it.
+	LaunchAuditDueServerTime = -1.f;  // Demo 27: a flight that ended early is not audited.
 	ClearPendingTurnover();        // Spec v19 §1.5: and its own landing.
 
 	// SPEC v25 §2. And its own turnover. Every path that ends a flight comes through here, so this is
@@ -9463,7 +10369,7 @@ bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelo
 	// that step would silently stop testing the timer and start testing the turnover.
 	bLooseFromThrow = bAsThrow;
 	CatchZoneTarget = nullptr;
-	LastContactServerTime = -1.f;
+	ForgetLastContact();      // As the real throw above.
 	ClearPendingTurnover();   // Spec v19 §1.5: as the real throw above.
 	bTurnoverRegisteredThisFlight = false;   // Spec v25 §2: as the real throw above.
 	LooseFromTeam = FromTeam;

@@ -177,6 +177,45 @@ public:
 	//~ End AGameModeBase interface
 
 	/**
+	 * THE LENGTH OF THE MATCH-START COUNTDOWN, and the one thing about it a mode may answer
+	 * differently. Seconds; zero or less means there is no countdown at all.
+	 *
+	 * UTraceSettings::WarmupDuration is the number for A MATCH — five seconds between "enough
+	 * players" and the opening whistle, drawn as the HUD's "MATCH STARTS IN 5" banner. A MATCH is
+	 * the only thing that number is about, and ATracePracticeGameMode returns 0 here (demo 27:
+	 * "Don't have a match start timer in the practice range"). See the note on that override.
+	 *
+	 * *** A VIRTUAL AND NOT A UPROPERTY, DELIBERATELY. *** A per-mode config property is what
+	 * ATracePracticeGameMode's HalfDuration already is, and it does not work: the constructor sets a
+	 * fortnight, `[/Script/Trace.TraceGameMode] HalfDuration=480` in DefaultGame.ini is applied to
+	 * the SUBCLASS too because config sections are inherited, and the range measurably runs 480 s
+	 * halves — "One 480 s half" in its own start-up line. A virtual cannot be overridden by an ini,
+	 * so the mode that says "no countdown" is the mode that gets no countdown.
+	 *
+	 * Public because it is a pure query with no side effects and the practice harness asserts on it:
+	 * Trace.Practice.Verify compares the range's answer with GetDefault<ATraceGameMode>()'s, which
+	 * is what stops "returns 0" passing because everything returns 0.
+	 */
+	virtual float GetWarmupSeconds() const;
+
+	/**
+	 * How long ONE HALF runs, in seconds. The match clock is built from this.
+	 *
+	 * *** A VIRTUAL FOR EXACTLY THE REASON GetWarmupSeconds() IS ONE, and this is the case that
+	 * argument was originally written about. *** ATracePracticeGameMode's constructor sets
+	 * HalfDuration to a fortnight so the range has no period structure, and it does not take:
+	 * `[/Script/Trace.TraceGameMode] HalfDuration=480` in DefaultGame.ini is applied to the SUBCLASS
+	 * too, because UE config sections are inherited. The range measurably ran 480 s halves - "One
+	 * 480 s half" in its own start-up line - so it drew a counting-down match clock and would have
+	 * ended after eight minutes. An ini cannot override a virtual, so the mode that says "no period
+	 * structure" is the mode that gets none.
+	 *
+	 * The base still reads the config property, so `[/Script/Trace.TraceGameMode] HalfDuration` and
+	 * the Trace.Match.HalfSeconds dev override both keep working for the real match exactly as before.
+	 */
+	virtual float GetHalfSeconds() const;
+
+	/**
 	 * Called by ATraceCharacter the moment it dies, while it is still possessed.
 	 * Handles kill/death credit, dropping the Core, wiping the trail and scheduling the respawn.
 	 * @param Cause "Bullet", "Trail" or "Fell".

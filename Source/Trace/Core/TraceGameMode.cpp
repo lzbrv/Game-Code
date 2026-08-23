@@ -2589,6 +2589,18 @@ void ATraceGameMode::CheckMatchStartConditions()
 	}
 }
 
+float ATraceGameMode::GetWarmupSeconds() const
+{
+	return FMath::Max(0.f, UTraceSettings::Get().WarmupDuration);
+}
+
+float ATraceGameMode::GetHalfSeconds() const
+{
+	// The config property, clamped exactly as the call site used to clamp it. See the declaration
+	// for why the period length is asked of the MODE rather than read off the property directly.
+	return FMath::Max(1.f, HalfDuration);
+}
+
 void ATraceGameMode::StartWarmup()
 {
 	ATraceGameState* TraceGameState = GetTraceGameState();
@@ -2602,21 +2614,25 @@ void ATraceGameMode::StartWarmup()
 		return;
 	}
 
-	const float WarmupDuration = FMath::Max(0.f, UTraceSettings::Get().WarmupDuration);
+	// The MODE decides, not the settings object: see GetWarmupSeconds(). A mode that answers zero
+	// gets the branch below, which begins the match inside this very call — so no client ever ticks
+	// a frame in WaitingForPlayers with a deadline on it, and the HUD's "MATCH STARTS IN" banner
+	// (which needs exactly that pair) is not merely hidden, it never has a frame to draw in.
+	const float WarmupSeconds = GetWarmupSeconds();
 
 	// There is no dedicated warm-up match state, so the phase stays WaitingForPlayers and the shared
 	// deadline doubles as the warm-up countdown clients can render.
-	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + WarmupDuration);
+	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + WarmupSeconds);
 	TraceGameState->ForceNetUpdate();
 
-	if (WarmupDuration <= TraceGameModeConstants::ZeroDurationEpsilon)
+	if (WarmupSeconds <= TraceGameModeConstants::ZeroDurationEpsilon)
 	{
 		BeginMatch();
 		return;
 	}
 
-	UE_LOG(LogTraceGame, Log, TEXT("Enough players; warm-up started (%.1fs)."), WarmupDuration);
-	GetWorldTimerManager().SetTimer(WarmupTimerHandle, this, &ATraceGameMode::BeginMatch, WarmupDuration, false);
+	UE_LOG(LogTraceGame, Log, TEXT("Enough players; warm-up started (%.1fs)."), WarmupSeconds);
+	GetWorldTimerManager().SetTimer(WarmupTimerHandle, this, &ATraceGameMode::BeginMatch, WarmupSeconds, false);
 }
 
 void ATraceGameMode::CancelWarmup()
@@ -2920,7 +2936,7 @@ void ATraceGameMode::BeginHalf(int32 HalfIndex)
 
 	const int32 Halves = FMath::Max(1, HalvesPerMatch);
 	const int32 ClampedHalf = FMath::Clamp(HalfIndex, 1, Halves);
-	const float Duration = FMath::Max(1.f, HalfDuration);
+	const float Duration = GetHalfSeconds();
 
 	GetWorldTimerManager().ClearTimer(HalfTimeTimerHandle);
 	GetWorldTimerManager().ClearTimer(MatchTimerHandle);

@@ -228,3 +228,11 @@ Art/Fonts/*.pdf
 /*.otf
 /*.ttf
 /*.zip
+
+# Git LFS re-installs its own hooks into whatever core.hooksPath points at (see
+# Scripts/setup-hooks.sh). Those four are generated per machine and per git-lfs
+# version, so the repo ships only the hook we wrote and lets LFS lay its own.
+.githooks/post-checkout
+.githooks/post-commit
+.githooks/post-merge
+.githooks/pre-push

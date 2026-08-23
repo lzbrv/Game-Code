@@ -52,12 +52,14 @@
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
+#include "UObject/UObjectGlobals.h"             // GetDefault<> — the match's own answer, for the rule row
 
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/TraceAbilityTypes.h"
 #include "Core/TraceCharacter.h"
 #include "Core/TraceCharacterRoster.h"
 #include "Core/TraceGameMode.h"
+#include "Core/TraceGameState.h"                // the match phase and the warm-up deadline
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceHealthComponent.h"
@@ -486,6 +488,17 @@ namespace TracePracticeVerify
 		/** Where the player stood when the switch began, so "without leaving the range" is measured. */
 		FVector PlayerLocationAtSwitch = FVector::ZeroVector;
 
+		/**
+		 * Demo 27, "Don't have a match start timer in the practice range" — THE SYMPTOM, sampled.
+		 *
+		 * Set on any tick that finds the pair the HUD's "MATCH STARTS IN" banner needs: the phase
+		 * still WaitingForPlayers AND a warm-up deadline published on the game state. The harness is
+		 * armed from -ExecCmds on the FIRST TICK of the loaded map, so it is watching before the
+		 * range is furnished and therefore across the entire window in which a countdown could run;
+		 * the old behaviour held that pair for five seconds and ~350 ticks, so this cannot miss it.
+		 */
+		bool bSawStartCountdown = false;
+
 		/** Real seconds each waiting step is allowed. */
 		static constexpr double ShortWait = 0.8;
 		static constexpr double RespawnWait = 8.0;
@@ -586,6 +599,18 @@ namespace TracePracticeVerify
 		ATraceCharacter* const PlayerPawn = LocalPawn(WorldPtr);
 		ATraceCore* const TheCore = ATraceCore::Get(WorldPtr);
 
+		// Demo 27's symptom, sampled on EVERY tick of the run rather than at one chosen moment: a
+		// countdown that ran and finished before the step machine looked would be a countdown this
+		// harness reported as absent. See FRangeRun::bSawStartCountdown.
+		if (const ATraceGameState* const PhaseState = WorldPtr->GetGameState<ATraceGameState>())
+		{
+			if (PhaseState->TraceMatchState == ETraceMatchState::WaitingForPlayers
+				&& PhaseState->MatchEndServerTime > 0.f)
+			{
+				Run->bSawStartCountdown = true;
+			}
+		}
+
 		switch (Run->Step)
 		{
 		// -----------------------------------------------------------------------------------------
@@ -595,8 +620,17 @@ namespace TracePracticeVerify
 			// player has not logged in and the subsystem's 5 Hz poll has not run once. Judging then
 			// would report "the range is empty" about a range that had not been asked to exist yet —
 			// so wait for it, and only call it a failure once the wait is genuinely over.
+			//
+			// "Furnished" now includes "and play has actually started". The targets appear on the
+			// subsystem's poll and the whistle follows on ATracePracticeGameMode::PokeMatchStart's
+			// 1 Hz re-ask, so there is up to a second in which the range is fully built and not yet
+			// live — judging inside it would report a countdown-free range as not running. Waiting
+			// for the pair costs nothing (the wait is bounded by ReadyWaitSeconds either way) and is
+			// what makes the "came up live" row below a measurement rather than a race.
+			const ATraceGameState* const ReadyState = WorldPtr->GetGameState<ATraceGameState>();
 			const bool bFurnished = Range->IsBuilt() && Range->GetDummyCount() > 0
-				&& LocalPawn(WorldPtr) != nullptr;
+				&& LocalPawn(WorldPtr) != nullptr
+				&& ReadyState != nullptr && ReadyState->TraceMatchState == ETraceMatchState::InProgress;
 			if (!bFurnished && SinceStep < FRangeRun::ReadyWaitSeconds)
 			{
 				return true;
@@ -611,6 +645,57 @@ namespace TracePracticeVerify
 			Run->Tally.Report(PadCount >= 3, TEXT("PRACTICE"),
 				*FString::Printf(TEXT("the range has %d pads (core rack, infinite abilities, change "
 				                      "character)."), PadCount));
+
+			// -----------------------------------------------------------------------------------
+			// DEMO 27: "Don't have a match start timer in the practice range." TWO ROWS, and the
+			// first one is the rule.
+			// -----------------------------------------------------------------------------------
+			//
+			// THE RULE, and it is a COMPARISON so that "returns zero" cannot pass because everything
+			// returns zero: the range's authoritative mode must answer 0 warm-up seconds while a
+			// plain ATraceGameMode — the class-default object, asked the same question — must still
+			// answer the match's UTraceSettings::WarmupDuration. Frame-rate independent, and it goes
+			// red the day somebody zeroes WarmupDuration globally and calls the range fixed.
+			//
+			// RED ARM for both rows: Trace.Practice.StartCountdown 1, then run this command in the
+			// range as usual. It gives the range the match's warm-up back and nothing else, and these
+			// two rows — and only these two — must go red. (Running Verify in a real match, this
+			// command's other red arm, cannot exercise them: it stops at the gate above.)
+			const ATraceGameMode* const AuthMode = WorldPtr->GetAuthGameMode<ATraceGameMode>();
+			const float RangeWarmup = (AuthMode != nullptr) ? AuthMode->GetWarmupSeconds() : -1.f;
+			const float MatchWarmup = GetDefault<ATraceGameMode>()->GetWarmupSeconds();
+
+			Run->Tally.Report(RangeWarmup == 0.f && MatchWarmup > 0.f, TEXT("PRACTICE"),
+				*FString::Printf(TEXT("no match-start countdown here (range warm-up %.2fs) while a "
+				                      "match still has one (%.2fs)."), RangeWarmup, MatchWarmup));
+
+			// THE MATCH CLOCK, WHICH IS THE SAME COMPLAINT WEARING A DIFFERENT HAT. The range's
+			// constructor always asked for no period structure and never got it: UE config sections
+			// are inherited, so `[/Script/Trace.TraceGameMode] HalfDuration=480` landed on the
+			// subclass too and the range ran 480 s halves - it announced "One 480 s half" itself
+			// while the HUD counted down - and would have ended after eight minutes of practice.
+			// Compared against the MATCH's answer for the same reason the warm-up rows are: a row
+			// that only asserted "the range's half is huge" would pass if every mode's half were
+			// huge, which measures nothing.
+			const float RangeHalf = (AuthMode != nullptr) ? AuthMode->GetHalfSeconds() : -1.f;
+			const float MatchHalf = GetDefault<ATraceGameMode>()->GetHalfSeconds();
+
+			Run->Tally.Report(RangeHalf > MatchHalf * 100.f && MatchHalf > 0.f, TEXT("PRACTICE"),
+				*FString::Printf(TEXT("no match clock here (range half %.0fs) while a match still "
+				                      "runs one (%.0fs)."), RangeHalf, MatchHalf));
+
+			// THE SYMPTOM, sampled from the first tick of the map (see FRangeRun::bSawStartCountdown):
+			// no tick of this run ever found the phase/deadline pair the HUD draws "MATCH STARTS IN"
+			// from — and by now, with the targets standing, the range is already live rather than
+			// still waiting to be.
+			const bool bLiveNow = (ReadyState != nullptr)
+				&& ReadyState->TraceMatchState == ETraceMatchState::InProgress;
+
+			Run->Tally.Report(!Run->bSawStartCountdown && bLiveNow, TEXT("PRACTICE"),
+				*FString::Printf(TEXT("the range came up live: no countdown was ever published "
+				                      "(seen=%s) and play is running now (%s)."),
+					Run->bSawStartCountdown ? TEXT("yes") : TEXT("no"),
+					bLiveNow ? TEXT("in progress") : TEXT("NOT in progress")));
 
 			for (TActorIterator<ATracePracticeDummyController> It(WorldPtr); It; ++It)
 			{

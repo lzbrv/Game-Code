@@ -30,6 +30,14 @@ class AController;
  *   explicitly. The range's targets are ATracePracticeDummyControllers that stand still; a squad of
  *   ATraceBotControllers hunting you across the arena is the opposite of a place to test movement.
  *
+ *   NO MATCH-START COUNTDOWN. GetWarmupSeconds() returns 0, so the range is LIVE THE INSTANT it can
+ *   be — demo 27, verbatim: "Don't have a match start timer in the practice range." A countdown to
+ *   a start that means nothing here is noise, and it was five seconds of "MATCH STARTS IN 3" over
+ *   the target row. Live-immediately rather than merely not-drawn, because the warm-up is not only
+ *   a banner: play is genuinely held until the whistle (BeginMatch is what grants the Core, applies
+ *   the sides and puts everybody on their spawns), so hiding the number would have left the range
+ *   with five seconds of nothing happening for no stated reason.
+ *
  *   NO WIPE BONUS. WipeBonusPoints = 0. Without it, a solo player's every death pays the empty enemy
  *   side two points (ATraceGameMode::EvaluateWipeBonus counts a one-player team with nobody alive as
  *   a wipe), the lead reaches UTraceSettings::MercyRuleLead after four deaths, and the practice
@@ -64,6 +72,25 @@ public:
 	 * rule.
 	 */
 	virtual AActor* ChoosePlayerStart_Implementation(AController* Player) override;
+
+	/**
+	 * ZERO. The range does not count down to anything.
+	 *
+	 * ATraceGameMode::StartWarmup reads this the moment the start condition is first met, sees zero
+	 * and calls BeginMatch in the same call — so the range goes live on the frame its targets
+	 * appear, and the HUD banner that needs (WaitingForPlayers && MatchEndServerTime > 0) never has
+	 * a frame in which both are true. Nothing is skipped: the whistle still runs in full, which is
+	 * how the Core gets granted, the sides get applied and everybody gets stood on their spawns.
+	 *
+	 * A real match is untouched — this override is the only caller-visible difference, and
+	 * UTraceSettings::WarmupDuration is still what every other mode returns.
+	 *
+	 * RED ARM: Trace.Practice.StartCountdown 1 hands the match's warm-up back to the range and does
+	 * nothing else, and Trace.Practice.Verify then fails its two demo-27 rows and only those.
+	 */
+	virtual float GetWarmupSeconds() const override;
+
+	virtual float GetHalfSeconds() const override;
 
 protected:
 	/**

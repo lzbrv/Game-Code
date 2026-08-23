@@ -367,8 +367,11 @@ namespace TraceInputHarness
 	 *
 	 * UTraceWeaponComponent::FireOnce spawns one locally the instant a shot leaves the muzzle, so
 	 * accumulating these across a burst counts shots that were actually emitted — evidence that is
-	 * independent of whether any of them connected. Tracers live 0.08s, hence the per-tick sampling
-	 * and the set: a single sample would see at most one or two.
+	 * independent of whether any of them connected. A tracer is short-lived — 0.08 s when this was
+	 * written, 0.85 s under spec v32's hold-and-fade, and 0.10..0.30 s again since Demo 27 made it a
+	 * travelling bolt — hence the per-tick sampling and the set: a single sample would see at most
+	 * one or two. The rule is per-tick BECAUSE the life keeps moving; do not replace it with a sample
+	 * interval derived from whatever ATraceTracer's life happens to be this month.
 	 */
 	void CollectTracerIds(UWorld* World, TSet<uint32>& InOutIds)
 	{
