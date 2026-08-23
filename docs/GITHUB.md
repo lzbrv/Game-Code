@@ -898,6 +898,80 @@ Then [SETUP.md](SETUP.md) from §7.
 
 ---
 
+## 11.5 "Your local changes to Config/DefaultEngine.ini would be overwritten"
+
+You did not change that file. **The Unreal editor did**, when you opened the
+project. On startup it tops `Config/DefaultEngine.ini` up with whatever it thinks
+is missing for the machine it is running on:
+
+* **Platform sections.** A Windows editor appends
+  `[/Script/WindowsTargetPlatform.WindowsTargetSettings]` with its shader-format
+  array. A Mac editor never writes that section, so the two machines disagree
+  forever and somebody's copy is always dirty.
+* **Plugin default sections.** This repo already carries the scar: the committed
+  `[/Script/AndroidFileServerEditor.AndroidFileServerRuntimeSettings]` block was
+  injected by a plugin nobody here uses.
+* **Per-machine generated values**, such as that plugin's `SecurityToken` — a
+  random hex string with no business being shared between developers.
+* **Duplicate array entries.** The engine re-appends `+Key=Value` lines it already
+  has, because it matches on the whole line instead of on the key.
+
+### Why the two obvious fixes do not work
+
+**`.gitignore` the file.** It also holds real decisions the team shares — the
+renderer settings, the net driver, the map list. Ignoring it loses those.
+
+**A `.gitattributes` merge driver.** A merge driver only runs during an actual
+merge of two branches. This failure happens *before* any merge is attempted: git
+stops because the working tree is dirty, so the driver never gets a turn.
+
+### What to do instead
+
+```bash
+./Scripts/pull.sh          # instead of `git pull`
+./Scripts/pull.sh --dry-run   # just tell me what is dirty, change nothing
+```
+
+It classifies every `Config/*.ini` against `HEAD` and only discards the noise:
+
+| Verdict | Meaning | What happens |
+|---|---|---|
+| `CLEAN` | identical to HEAD | nothing |
+| `BENIGN` | duplicate `+` entries, editor-injected sections, machine-local keys | discarded, then it pulls |
+| `SUBSTANTIVE` | a real settings decision somebody made | **stopped**, lines printed, nothing discarded |
+
+That distinction is the entire point. "Just discard Config before pulling" is the
+advice that eventually loses somebody's renderer settings.
+
+### Ending it permanently, once
+
+On the machine whose editor keeps dirtying the file — the Windows one, usually:
+
+```bash
+python3 Scripts/config-hygiene.py --adopt
+git add Config && git commit -m "Adopt editor-injected config sections"
+```
+
+That promotes the injected sections *into* the tracked file in canonical,
+de-duplicated form. Once they are there, that editor has nothing left to add and
+nobody's pull is blocked by them again. This is the step that actually ends the
+problem; `pull.sh` only keeps you moving until somebody runs it.
+
+### The hook that stops it coming back
+
+`.githooks/pre-commit` runs `Scripts/config-hygiene.py --check` and refuses any
+commit whose staged `Config/*.ini` carries duplicate array entries — so the noise
+never enters history, where it would give every teammate's editor a fresh excuse
+to rewrite the file.
+
+**Git does not clone hooks.** Every clone runs this once:
+
+```bash
+./Scripts/setup-hooks.sh        # Windows: Scripts\setup-hooks.bat
+```
+
+`git commit --no-verify` bypasses it if you genuinely mean to.
+
 ## 12. Cheat sheet
 
 ```bash

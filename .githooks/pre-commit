@@ -1,0 +1,42 @@
+#!/usr/bin/env sh
+# ==============================================================================
+# Trace - pre-commit hook: keep editor noise out of Config/*.ini history.
+#
+# Runs Scripts/config-hygiene.py --check, which fails on duplicate `+Key=Value`
+# array entries. The Unreal editor re-appends those because it matches on the
+# whole line rather than on the key, and once one is committed every teammate's
+# editor has a fresh excuse to rewrite the file - which is what turns into
+# "your local changes would be overwritten by merge" on their next pull.
+#
+# Installed by Scripts/setup-hooks.sh, which sets core.hooksPath. Hooks are NOT
+# cloned with a repo, so a fresh clone must run that script once.
+#
+# Bypass with `git commit --no-verify` if you genuinely mean it.
+# ==============================================================================
+set -e
+
+ROOT=$(git rev-parse --show-toplevel)
+
+# Nothing staged under Config/ means nothing to check; stay silent and fast.
+if git diff --cached --name-only --diff-filter=ACM | grep -qiE '^Config/.*\.ini$'; then
+    :
+else
+    exit 0
+fi
+
+# Windows installs frequently expose python as `python`, not `python3`.
+if command -v python3 >/dev/null 2>&1; then PY=python3
+elif command -v python  >/dev/null 2>&1; then PY=python
+else
+    echo "pre-commit: no python found; skipping the Config hygiene check." >&2
+    exit 0
+fi
+
+if ! "$PY" "$ROOT/Scripts/config-hygiene.py" --check; then
+    echo
+    echo "pre-commit: refusing the commit - Config/*.ini carries editor noise."
+    echo "  Fix it:      $PY Scripts/config-hygiene.py --fix && git add Config"
+    echo "  Or bypass:   git commit --no-verify"
+    exit 1
+fi
+exit 0
