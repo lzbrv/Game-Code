@@ -310,8 +310,9 @@ Scripts/setup-lfs.sh            # installs the filters if needed, verifies, and 
 command it runs, so it doubles as an explanation of what LFS is doing to your checkout. Run it with
 `--verify` any time you suspect LFS is not engaged.
 
-The clone pulls about **8.3 MiB**: 3.12 MiB of Git objects and 5.14 MiB of binary assets through
-LFS (641 files — the baked arena, its materials, three levels).
+The clone pulls about **70 MB**, nearly all of it binary assets through LFS (~1,650 files — the
+baked arena, its materials, the ten character bodies and their shared animation set, UI art, input
+and character data, sounds, and the collaborator test maps).
 
 ### The first thing that will confuse you: `Content/` is read-only
 
@@ -440,12 +441,18 @@ means it starts over.
 
 If every player on the field is a plain coloured capsule, this section is why.
 
-The characters use Epic's default Mannequin (`SKM_Manny_Simple` + `ABP_Unarmed`) for heads, limbs
-and run cycles. That art is **not in the repository** — `.gitignore` excludes `/Content/Characters/`
+Each of the ten characters now has its **own committed body** under
+`Content/Trace/Characters/<Name>/`, and all ten share one skeleton so a single retargeted animation
+set (`Content/Trace/Characters/Shared/Anims/`) drives every one of them. Epic's default Mannequin
+(`SKM_Manny_Simple` + `ABP_Unarmed`) is still needed anyway, for three reasons: the shared animation
+set is retargeted **from** it, it is the fallback body when the character art is missing, and the
+practice-range dummies are Mannequins by design.
+
+That Epic art is **not in the repository** — `.gitignore` excludes `/Content/Characters/`
 deliberately. It is ~126 MB of binary content, and it would be ~126 MB added to *every* clone and
 pull, against a GitHub Git-LFS free tier of 10 GiB of storage and 10 GiB/month of bandwidth shared
-across the whole account. Keeping it out is a large part of why a clone is ~8.3 MiB rather than
-~135 MB. (See [GITHUB.md §5](GITHUB.md) for the quota arithmetic — and note that the widely-quoted
+across the whole account. Keeping it out is a large part of why a clone is ~70 MB rather than
+~200 MB. (See [GITHUB.md §5](GITHUB.md) for the quota arithmetic — and note that the widely-quoted
 "1 GiB free" figure is out of date.)
 
 Instead it is copied out of **the Unreal install you already have** — every UE 5.8 install ships it

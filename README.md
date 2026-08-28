@@ -1,30 +1,37 @@
 # Trace
 
-A 5v5 competitive arena shooter prototype for **Unreal Engine 5.8**, written entirely in C++.
+A 5v5 competitive arena shooter for **Unreal Engine 5.8**, written entirely in C++.
 
 Trace is a networking prototype first and a game second. It exists to prove out a real
 multiplayer stack — client-side prediction, server-authoritative hitscan with server-side rewind,
 delta-replicated state — on top of a game idea that is small enough to actually finish.
 
-**The gameplay logic is all C++, and the repository now also contains real, editable assets.** For
+**The gameplay logic is all C++, and the repository also contains real, editable assets.** For
 most of this project's life it held no authored binaries at all — the arena, the Core, the trail and
 the whole HUD were built in code from engine primitives (`/Engine/BasicShapes/*` and Canvas
-drawing). That is still how the game runs by default, but it is no longer the whole story: the repo
-now tracks **641 binary assets, 5.14 MiB via Git LFS** — the baked arena `/Game/Maps/Arena_Baked`
-(one `.uasset` per actor, 572 of them), its 66 materials, and three levels.
+drawing). The procedural builder still exists, but the repo now tracks
+**~1,650 binary files, ~70 MB via Git LFS**: the baked shipping arena `/Game/Maps/Arena_Baked`
+(647 One-File-Per-Actor packages), its materials, the ten character bodies and the animation set they
+share, the UI art and font atlases, the input and character data assets, the sound bank sources under
+`Art/Sounds/`, and two collaborator test maps (`Fish_Arena_Test`, `Fish_Map_Test`).
 
 **What that means for you in practice:** binary assets cannot be merged, so the team locks a file
 *before* editing it rather than resolving conflicts afterwards. `Content/**` is checked out
 read-only until you take a lock — that is deliberate, and `chmod` is not the fix. Read
 **[docs/GITHUB.md](docs/GITHUB.md) §4 before you open anything in the editor.** A fresh clone is
-about 8.3 MiB.
+about 70 MB of LFS payload plus a small Git object store.
 
-**One exception worth understanding:** the characters use Epic's default Mannequin
-(`SKM_Manny_Simple` + `ABP_Unarmed`) for heads, limbs and run cycles. That is ~126 MB of engine
-content and it is **gitignored**, so it is not in a fresh clone — it is copied out of the Unreal
-install you already have, which is why a clone is ~8.3 MiB instead of hundreds of megabytes.
+**One exception worth understanding:** Epic's default Mannequin (`SKM_Manny_Simple` + `ABP_Unarmed`)
+is still needed. Each of the ten characters now has its own committed body — `SK_Rocco`, `SK_Elle`
+and the rest under `Content/Trace/Characters/<Name>/` — and all ten are bound to one shared skeleton
+so one retargeted animation set (`Content/Trace/Characters/Shared/Anims/`) drives every one of them.
+But that set is **retargeted from** Epic's `ABP_Unarmed`, the Mannequin is still the fallback body
+when the character art is missing, and the practice-range dummies are Mannequins by design (see
+[docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) item 33). That engine content is ~126 MB and
+**gitignored**, so it is not in a fresh clone — it is copied out of the Unreal install you already
+have.
 
-`Scripts/build.sh` (and `build.bat`) now **imports it automatically** when it is missing, so a
+`Scripts/build.sh` (and `build.bat`) **imports it automatically** when it is missing, so a
 fresh clone just works. Pass `--no-art`, or set `TRACE_SKIP_ART_IMPORT=1`, to skip that. To run it
 by hand: `Scripts/import-mannequin.sh` on macOS/Linux, `Scripts\import-mannequin.bat` on Windows.
 
@@ -39,14 +46,32 @@ to fix it in the Epic Games Launcher.
 
 Two teams of five, one shared Core, one arena.
 
-### Scoring
+### Scoring — the Core is a ball, and it flies
 
 - There is **one Core**, and **both teams contest the same object**. It is not a flag-per-team
   setup — there is a single ball in play.
-- You score by carrying the Core into the **opposing team's endzone** — or by **passing** it to a
-  teammate who is already standing in it. The alley-oop is intended.
-- A match is **two 10-minute halves with a side switch**; the highest score at the end wins.
-  (Everything here is configurable — see [docs/DESIGN.md](docs/DESIGN.md).)
+- The default mode is **goals** (`ScoringMode=ThrownCoreAndGoals`, mode B): each end of the field
+  has a raised goal mouth about 2,000 uu wide, and you score by getting the Core through the
+  **opposing team's goal** — carried in or **thrown** in.
+- **The Core is a physical, thrown, interceptable object.** While carrying, **left mouse charges a
+  throw and releases it the instant you let go** — a tap is a short lob (15% power), a 0.6 s hold
+  is full power, and the throw inherits your own momentum, so a jumping or sprinting throw
+  genuinely carries. **The first player to contact a loose Core picks it up**, both teams alike;
+  a generous catch magnet (450 uu) funnels near-misses into a catcher's hands, so interception is
+  a real defensive play, not a pixel hunt.
+- **Turnovers have a rule of their own:** when the Core changes hands between teams by hitting the
+  ground, the team that dropped it is locked out for 5 s, and anyone on the other team can
+  **pull** it to themselves — hover the crosshair on it and hold (0.3 s ring, line of sight
+  required). The pull is on your melee button when the pull ring is on screen, or on `G` as a
+  dedicated bind.
+- A match is **two 8-minute halves with a side switch**; the highest score at the end wins. The
+  half does not cut a play dead: when the clock expires the whistle waits for the next dead ball
+  (a goal, a turnover between teams, or the Core coming down — capped at 60 s). A lead of **8**
+  ends the match early (mercy rule). There is no "first to N wins" — the clock is the win
+  condition.
+- The older **endzone mode (A)** still exists behind `?mode=a` and plays the original hover-pass
+  ruleset — frozen, and without characters or abilities. In the default goals mode the
+  half-second hover-pass still exists alongside the throw (`PassHoldSeconds=0.5`).
 
 ### The carrier
 
@@ -55,41 +80,58 @@ This is the part that makes Trace different from every other capture-the-thing g
 - **The carrier is invulnerable to bullets.** Not tanky — *immune*. Nothing hitscan can hurt them.
   You cannot shoot the carrier down. Ever.
 - **The carrier cannot shoot.** Picking up the Core holsters your gun.
+- **The carrier is fast** — 1.22× run speed, the same speed as a knife carrier.
 - **The carrier continuously lays a trail** behind them — a visible ribbon marking exactly where
-  they have been for the last few seconds.
+  they have been for the last couple of seconds.
 
-### The trail — the only counterplay
+### The trail — the counterplay
 
 - An **enemy of the carrier** who passes through the trail **while dashing** kills **the carrier**.
 - **Walking or running through the trail does nothing.** No damage, no slow, no effect at all.
   You must be mid-dash for the trail to trip.
 - **Teammates never trip the trail.** The carrier's own team can run through it freely.
-- Dash is therefore the *only* way to stop a carrier. Not damage. Not focus fire. A committed,
-  cooldown-gated dash through the line they just drew.
-- **The carrier can parry it.** A 0.1-second window that makes the trace invulnerable and turns the
+- Dash is the way to stop a carrier who never lets go of the ball. In goals mode the other lever
+  is the ball itself: force a bad throw, intercept it, win the turnover pull.
+- **The carrier can parry.** A 0.175-second window that makes the trace invulnerable and turns the
   **entire trace red** for the duration. Dash into a red trace and you have wasted it. It is a
-  reaction check, not a shield — 0.1 s of cover on a 1.5 s cooldown.
+  reaction check, not a shield — 0.175 s of cover on a 1.5 s cooldown.
 
 The design consequence: chasing a carrier is a positioning puzzle, not an aim duel. The carrier is
 trying to draw a path that no one can safely cut; the defenders are trying to spend a dash at the
 one moment the geometry works. Escorts matter, because a friendly body standing where the enemy
 needs to dash is a real wall.
 
+### Characters and abilities
+
+Ten playable characters — **Rocco, Lily, Roxie, Elle, Slimeball, Mortimer, Chut, Mace, Oyster
+and X** — picked on a select screen, each with its **own body mesh, silhouette and accent colour**
+and each with two abilities on top of the shared kit:
+
+- **`E`** — the activated ability (Elle's teleport gates, Mace's spike, Oyster's poison jar,
+  Mortimer's quake, X's swarm mark, …).
+- **`V`** — the movement ability (Lily's zip, Rocco's ride, Roxie's rocket, …).
+
+Abilities are server-authoritative like everything else, and they exist only in the default goals
+mode — mode A predates the roster and disables them.
+
 ### Everyone else
 
-- Everyone **not** carrying the Core has a **hitscan** gun — instant, no projectile travel time.
+- Everyone **not** carrying the Core has three weapons: a **hitscan pistol** (`1`), an **SMG**
+  (`2`) and a **knife** (`3`), with `R` to reload and a melee attack on right mouse.
 - **No friendly fire.**
 - Bullets never damage the Core carrier (see above).
-- **Everyone**, carrier included, has a **dash** on a short cooldown and a **slide**. There is no
-  boost — it was removed.
+- **Everyone**, carrier included, has a **dash** (charge-based, 3.5 s cooldown) and a **slide**.
+  There is no boost — it was removed.
 - **Movement is Source/Apex-flavoured.** Real Quake-style air acceleration, so strafing in mid-air
   turns your velocity vector instead of braking it; landing does **not** clamp your speed to the
   ground maximum, it bleeds the excess off over a short run-out; and run→jump→slide→jump preserve
   the velocity vector rather than resetting it.
-- The Core is **passed by holding the crosshair on a teammate for half a second** — it is not a
-  thrown, catchable ball. The moment you start a pass **your shield drops and your trace goes
-  invulnerable**, and both come back if you cancel. That half second is the risk beat the whole
-  design turns on.
+- **Wall jump** is on (`bWallJumpEnabled`), and there is a **surf** verb: hit a face steeper than
+  the engine's walkable limit and you slide along it instead of scraping down it, gaining speed up
+  to a derived ceiling. Surf has one large caveat — **the shipping map has nothing to surf on.** The
+  rails are built by the procedural arena builder, and `Arena_Baked` is a baked level that builds
+  nothing, so you have to launch `/Game/Maps/Arena` to try it. See
+  [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) item 30.
 - When the carrier dies the trail is **cleared instantly**.
 
 ---
@@ -103,48 +145,64 @@ Config/
   DefaultGame.ini           Gameplay tunables — [/Script/Trace.TraceSettings] lives here.
   DefaultInput.ini          Switches the engine to Enhanced Input classes, mouse/console keys.
 Content/
-  Maps/                     Arena.umap (empty — see Setup) and Arena_Baked.umap (the bake, opt-in).
-  Trace/Materials/          M_TraceSurface, M_TraceNeon and their instances. COMMITTED, unlike the
-                            /Game/Generated copies, so the baked map is not broken on a fresh clone.
-  __ExternalActors__/       One .uasset per actor of Arena_Baked. This is One File Per Actor — it is
-                            what lets several people edit one map without fighting over the .umap.
+  Maps/                     Arena.umap (empty; the procedural builder fills it), Arena_Baked.umap
+                            (THE shipping map), MainMenu.umap, and the Fish_* collaborator test maps.
+  Trace/                    Committed authored assets: Materials, UI art + font atlases, Input,
+                            Data (character data assets), Audio, Weapons, Art (the kit meshes), and
+                            Characters/ — the ten bodies, the one shared skeleton, and the one
+                            retargeted animation set under Characters/Shared/Anims.
+  __ExternalActors__/       One .uasset per actor of the baked maps. This is One File Per Actor — it
+                            is what lets several people edit one map without fighting over the .umap.
+Art/                        Source-form art (not .uasset): Sounds/ (71 WAVs, the generated bank —
+                            no provenance note yet, see KNOWN_LIMITATIONS item 8), Fonts/ (Lato +
+                            the licensed-face rules), Pack/, Characters/, Railgun/, Smg/.
 Scripts/
   build.sh                  Wraps UnrealBuildTool. Also --projectfiles and --clean.
-  generate-map.sh           Creates the empty /Game/Maps/Arena level headlessly.
-  generate_map.py           The editor-Python it drives. Not a standalone python3 script.
-  bake-arena.sh             Bakes the procedural arena into the editable /Game/Maps/Arena_Baked.
-  bake-arena.py             The editor-Python it drives. Same rules as generate_map.py.
-  generate_content.py       Produces M_TraceSurface / M_TraceNeon into /Game/Generated/Materials.
+  bake-arena.sh             Re-bakes the procedural arena into the editable /Game/Maps/Arena_Baked.
+  generate-map.sh           Recreates the empty /Game/Maps/Arena level headlessly (rarely needed —
+                            the level is committed).
+  generate_content.py       Produces the M_TraceSurface / M_TraceNeon material parents.
   import-mannequin.sh       Imports Epic's Mannequin (~126 MB) from your own engine install.
                             build.sh runs this for you when the art is missing.
-  import-mannequin.bat      Windows twin of the above.
+  import-characters.sh      The generated-character pipeline, one stage per editor run: generate →
+                            materials → import → retarget → portraits. The assets are committed;
+                            you only need this if you change a body recipe.
   run-listen-server.sh      Host a listen server on :7777. The default way to play right now.
   run-client.sh             Connect a client to <ip>:7777.
   run-dedicated-server.sh   Headless server. Needs --editor on a launcher engine — see NETWORKING.
+  run-practice-range.sh     Boot straight into the practice range.
+  verify-practice-range.sh  Three headless runs that prove the practice range's cheats cannot leak
+                            into a real match — red arm first, then green, then the range itself.
   setup-lfs.sh              One-time Git LFS bootstrap after cloning.
+  setup-hooks.sh            One-time: points git at .githooks/ (config-hygiene tripwire + LFS).
   lock.sh / unlock.sh       Take/release the Git LFS lock you need BEFORE editing an asset.
-                            Accepts a World Outliner actor label (Cover_37) as well as a path,
-                            and resolves it to the right One File Per Actor package.
   _trace_common.sh          Shared library: finds the engine, checks the toolchain.
-  *.bat                     Windows counterparts of all of the above, same flags. See SETUP.
+  *.bat                     Windows counterparts, same flags. See SETUP.
 Source/
   Trace.Target.cs           Standalone game target.
   TraceEditor.Target.cs     Editor target — this is what you normally build.
   TraceServer.Target.cs     Dedicated server target.
   Trace/
     Trace.Build.cs          Module dependencies.
-    Trace.h / Trace.cpp     Module boilerplate + the LogTraceGame log category.
     TraceTypes.h            Shared enums, team colours, the replicated trail structs.
     TraceSettings.{h,cpp}   UTraceSettings — every gameplay number, ini-configurable.
-    Core/                   GameMode, GameState, PlayerState, PlayerController, Character.
-    Movement/               TraceCharacterMovementComponent — predicted dash and slide,
-                            Source-style air acceleration, carried-momentum landing.
-    Gameplay/               Health, Weapon, HitZones, Trail, Core, Parry, Endzone, Tracer.
-    Settings/               TraceUserSettings — persisted per-player controls and video.
+    Abilities/              UTraceAbilityComponent + the ten per-character ability sets.
+    AI/                     TraceBotController — bots that play the full ruleset.
+    Audio/                  TraceAudio, the sound bank, sound events, audio verification.
+    Core/                   GameMode, GameState, PlayerState, PlayerController, Character, roster.
+    Data/                   Character definitions and data verification.
+    Debug/                  Input harness, stats dump, verification probes.
+    Gameplay/               Health, Weapon, HitZones, Trail, Core, Parry, Endzone, Tracer, Melee.
+    Modes/                  The practice range (game mode, actors, verification).
+    Movement/               TraceCharacterMovementComponent — predicted dash, slide, wall jump
+                            and surf; Source-style air acceleration, carried-momentum landing.
     Net/                    TraceLagCompensationComponent — pose history + server rewind.
-    UI/                     TraceHUD — Canvas-only HUD and scoreboard.
-    World/                  TraceArenaBuilder, TraceTeamPlayerStart.
-docs/                       SETUP, EDITOR, NETWORKING, GITHUB, DESIGN. You are here.
+    Settings/               TraceUserSettings — persisted per-player controls, audio and video.
+    UI/                     TraceHUD, menus, character select, kill feed, the bitmap-font text
+                            renderers (UI/Text/), UMG widget generators (UI/Widgets/).
+    World/                  TraceArenaBuilder, the bake pieces, team player starts.
+docs/                       Nine docs + generated stats. See the Documentation table below.
+                            KNOWN_LIMITATIONS.md is the one to read before filing a bug.
 .gitattributes              Git LFS + file-locking rules. Read docs/GITHUB.md.
 .gitignore                  Everything generated. Read docs/GITHUB.md.
 ```
@@ -186,62 +244,51 @@ Scripts/setup-lfs.sh             # verifies the LFS filters took effect
 
 # 2. Generate IDE project files, then build the editor target.
 #    First build is 5-20 minutes; incremental builds afterwards are seconds.
+#    build.sh also imports the Mannequin character art when it is missing —
+#    ~126 MB copied from your own engine install, not from GitHub.
 Scripts/build.sh --projectfiles
 Scripts/build.sh
 
-# 3. Create the one required level (see below).
-Scripts/generate-map.sh
-
-# 4. Open it. (build.sh already imported the character art in step 3 —
-#    ~126 MB copied from your own engine install, not from GitHub.)
+# 3. Open the project. All maps are committed — there is no map-generation step.
 open Trace.uproject
 ```
 
-**The one manual step, once per repo:** the level `/Game/Maps/Arena` must exist. It is an
-*entirely empty* level — the arena builds itself in C++ at `BeginPlay`, so this asset is pure
-boilerplate. `Scripts/generate-map.sh` creates it for you, but note what it actually is: it drives
-`Scripts/generate_map.py` inside the editor via Unreal's `pythonscript` commandlet. It is **not** a
-standalone `python3` script and running it with your system Python will not work — nothing outside
-the engine can write a `.umap`. It also needs the **Python Editor Script Plugin** enabled. If the
-plugin is off, the run fails immediately with "the pythonscript commandlet could not be found";
-enable it (Edit → Plugins → *Python Editor Script Plugin*, restart) or just make the level by hand:
-File → New Level → **Empty Level**, save as `Content/Maps/Arena`. Full detail in
-[docs/SETUP.md](docs/SETUP.md#the-one-manual-step-gamemapsarena).
-
-Then press **Play**. To test multiplayer immediately, set the PIE player count to 2 and net mode
-to *Play As Listen Server*. For two real processes:
+Open `Content/Maps/Arena_Baked.umap` and press **Play**. To test multiplayer immediately, set the
+PIE player count to 2 and net mode to *Play As Listen Server*. For two real processes:
 
 ```bash
 Scripts/run-listen-server.sh                   # window 1: host
 Scripts/run-client.sh 127.0.0.1 --pos 700,0    # window 2: joiner
 ```
 
-### The baked arena (`/Game/Maps/Arena_Baked`) — opt-in
+### The two arenas: `Arena_Baked` ships, `Arena` regenerates
 
-`/Game/Maps/Arena` is an empty level and the arena is built from C++ at `BeginPlay`, which means
-nobody can open it, click a wall and move it. `Scripts/bake-arena.sh` runs that same builder once in
-the editor and saves the result as a real level of ~570 placed, individually selectable, readably
-labelled actors (`Wall_North_01`, `Cover_37`, `Goal_Ring_Rim_12`), with **One File Per Actor**
-enabled so several people can edit it at once — each actor is its own lockable file, so two people
-moving two different pieces never block each other. See [docs/GITHUB.md §4.4](docs/GITHUB.md).
+**`/Game/Maps/Arena_Baked` is the shipping map.** It is the server default map
+(`Config/DefaultEngine.ini`), and both PLAY and PRACTICE on the title screen travel to it
+(`TraceMaps::Arena` in `Source/Trace/UI/TraceMatchOptions.h`). It is a real level of **647 placed,
+individually selectable, readably labelled actors** (`Wall_North_01`, `Cover_37`,
+`Goal_Ring_Rim_12`) — 559 of them arena geometry the builder recognises, the rest lights, volumes and
+starts — with **One File Per Actor** enabled so several people can edit it at once: each actor is its
+own lockable file, so two people moving two different pieces never block each other. The game prints
+the tally on every load (`[Arena] Baked level adopted, nothing built: 559 baked pieces …`). See
+[docs/GITHUB.md §4.4](docs/GITHUB.md).
+
+`/Game/Maps/Arena` is the procedural twin: an empty level the C++ arena builder
+(`ATraceArenaBuilder`) fills at `BeginPlay`. It is where arena code changes are developed, and it
+is what `Scripts/bake-arena.sh` runs to produce a fresh `Arena_Baked` when the builder changes:
 
 ```bash
-Scripts/bake-arena.sh                                        # bake (again: --force)
-Scripts/run-listen-server.sh --map /Game/Maps/Arena_Baked    # play it
+Scripts/bake-arena.sh                                        # re-bake (again: --force)
+Scripts/run-listen-server.sh --map /Game/Maps/Arena          # play the procedural twin
 ```
 
-or open `Content/Maps/Arena_Baked.umap` in the editor and press Play.
+Two things worth knowing:
 
-Three things worth knowing before you rely on it:
-
-- **`/Game/Maps/Arena` is still the shipping map.** The baked one is opt-in this pass so the two can
-  be compared. Nothing defaults to it.
 - **The runtime build skips itself on a baked level.** `ATraceArenaBuilder` detects it (via its
   `bLevelIsPreBaked` flag, and independently via the presence of any `ATraceBakedPiece`) and adopts
   the placed actors instead of constructing a second arena on top of them.
-- **It costs draw calls.** Cross-actor batching is impossible once the geometry is real actors:
-  the arena's primitive count goes from ~411 to ~1048. That is the price of editability, and it is
-  why the procedural path stays.
+- **The bake costs draw calls.** Cross-actor batching is impossible once the geometry is real
+  actors — that is the price of editability, and it is why the procedural path stays.
 
 `Scripts/bake-arena.sh --help` documents the rest, including `--nullrhi` (only safe once
 `Content/Trace/Materials` exists — a first bake has to compile shader maps and needs a real RHI).
@@ -264,17 +311,25 @@ See [docs/NETWORKING.md](docs/NETWORKING.md#3-dedicated-server--requires-a-sourc
 | `W` `A` `S` `D` | Move |
 | Mouse | Look |
 | `Space` | Jump |
-| **Left Mouse** | Fire (disabled while carrying the Core) |
-| **Right Mouse** | Pass — hold on a teammate for half a second |
+| **Left Mouse** | Fire — and while carrying the Core, **throw**: hold to charge, release to launch |
+| **Right Mouse** | Melee — and Core **pull**, when the turnover pull ring is on screen |
+| `1` / `2` / `3` | Equip pistol / SMG / knife (number row, not numpad) |
+| `R` | Reload |
+| `E` | Activated ability (character-specific) |
+| `V` | Movement ability (character-specific) |
+| **`Q`** or **Mouse 4** | Parry — carrier only. 0.175 s of trace invulnerability; the whole trace flashes red |
+| `G` | Pull a turned-over Core (dedicated bind; right mouse also pulls when the ring shows) |
+| `F` | Inspect the knife (cosmetic flourish; any real action interrupts it) |
 | **Left Shift** | Dash |
 | **Left Ctrl** | Slide (on the ground) / fast-fall (in the air) |
-| **`Q`** | Parry — carrier only. 0.1s of trace invulnerability; the whole trace flashes red |
 | `Tab` | Scoreboard |
 
-Input is Enhanced Input. As of spec v17 §6 there ARE input assets to open — fourteen `IA_*` actions
-and `IMC_Trace` under `Content/Trace/Input/` — and if they are missing the controller builds the same
-objects in C++ at runtime, exactly as it always did, and logs which path it took. (This paragraph
-used to say "there are no input `.uasset`s to open". That was true until this pass.)
+There is also a **Pass/Throw** row in the options that ships **unbound** — left mouse already
+throws while carrying, so a dedicated key is optional.
+
+Input is Enhanced Input. There ARE input assets to open — `IA_*` actions and `IMC_Trace` under
+`Content/Trace/Input/` — and if they are missing the controller builds the same objects in C++ at
+runtime, exactly as it always did, and logs which path it took.
 
 **But the keys do not come from `IMC_Trace`, and this is the one thing that catches people out.**
 Re-keying that asset changes what you see in the editor, not what you play: the runtime mappings are
@@ -292,20 +347,80 @@ in the console tells you, in red, when the two have drifted apart.
 | Doc | Read it when |
 |---|---|
 | **[docs/SETUP.md](docs/SETUP.md)** | Setting up a Mac from zero. Start here on a new machine. |
-| **[docs/NETWORKING.md](docs/NETWORKING.md)** | You want to playtest — locally, or with the four of us across the internet. |
+| **[docs/NETWORKING.md](docs/NETWORKING.md)** | You want to playtest — locally, or across the internet. |
 | **[docs/GITHUB.md](docs/GITHUB.md)** | **Before your first commit.** Unreal + Git has rules that are not optional. |
 | **[docs/EDITOR.md](docs/EDITOR.md)** | New to the Unreal Editor, or wondering why the viewport is empty. Panels, PIE, and the arena preview button. |
-| **[docs/DESIGN.md](docs/DESIGN.md)** | Tuning the game, or adding a feature. Full knob table, the arena layout and the class map. |
+| **[docs/DESIGN.md](docs/DESIGN.md)** | Historical design reference — carries a banner: it predates the ability system. Tuning truth is `TraceSettings.h` + `Config/DefaultGame.ini`. |
+| **[docs/MIGRATION.md](docs/MIGRATION.md)** | Moving the repo / history surgery. |
+| **[docs/FONTS.md](docs/FONTS.md)** | The bitmap-font text pipeline and the font licensing rules. |
+| **[docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md)** | **Before you file a bug.** Every documented, deliberately-unfixed thing in the build, with the file and line it lives at. |
+| **[docs/DEMO_17_18_STATUS.md](docs/DEMO_17_18_STATUS.md)** | Point-in-time verification snapshot (2026-08-12) — banner-marked; some claims have aged. |
+| `docs/TraceStats.csv` | Generated by the `Trace.DumpStats` console command — not hand-maintained. |
 
 ---
 
 ## Status
 
-Prototype. It plays, it replicates, and it is not balanced. The netcode is the part that is meant to
-be production-shaped; the arena is Tron-styled but is still made of engine primitives.
+It plays, it replicates, and the netcode is the part that is meant to be production-shaped.
 
-It currently has: a title menu with difficulty selection, a post-match result screen, two-half match
-flow with a side switch, first-person with a third-person blend while carrying, animated Epic
-Mannequin characters, a 24000 × 9600 neon arena built in C++, bots that play the full ruleset, an
-editor arena-preview button, and every gameplay number live-editable in Project Settings while
-Play-In-Editor is running.
+It currently has: a **ten-character roster with abilities** and a character select screen; three
+weapons (pistol, SMG, knife) with reload, melee and weapon hotkeys; the thrown-Core goals ruleset
+with charge throws, catches and turnover pulls; two-half match flow with a side switch and
+deferred half-time; a **practice range** (its own game mode, reachable from the title screen);
+bots that play the full ruleset with selectable difficulty (Easy/Normal/Hard, default Normal); a
+title menu with real menu art and a bitmap-font text renderer; a post-match result screen; a
+38,400 × 9,600 uu neon arena (33,600 goal-to-goal plus two hockey-style pockets) shipped as an
+editable baked level; first-person with a third-person blend while carrying; and every gameplay
+number live-editable in Project Settings while Play-In-Editor is running.
+
+All ten characters now render with their **own** body mesh and their own accent, driven by one
+retargeted animation set on one shared skeleton. Be honest about what that art is: it is generated
+low-poly geometry, not modelled characters. Eight of the ten are separable at the design's own
+3,000 uu "who is that" distance; **Rocco and Elle are not** (see
+[known limitations](docs/KNOWN_LIMITATIONS.md) item 28). The practice-range dummies are still Epic's
+Mannequin, so two body styles are on screen in the same session (item 33). The arena is Tron-styled
+engine primitives with authored materials. It is not balanced yet.
+
+**What "it builds" means here.** Both build configurations compile and link, and the editor plus
+`Scripts/run-listen-server.sh` is the path that is genuinely exercised — hundreds of headless runs,
+a screenshot battery and a command-level acceptance suite. The **packaged game has never been run**:
+the Shipping binary aborts at launch on this install layout and there is no cooked content in the
+project. That is not a regression, but nobody should read "both configs green" as "the shipped game
+starts". Detail and reproduction: [known limitations](docs/KNOWN_LIMITATIONS.md) item 29.
+
+## Known limitations
+
+**The full list is [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md)** — 44 numbered entries,
+each with the file and line it lives at and whether it is open, closed or waiting on an owner
+decision. Read it before filing a bug; most of what looks wrong in this build has already been
+measured and decided.
+
+The ones most likely to bite you first:
+
+- **The surf rails are not in the map you will load** (item 30). Patch 28's surf mechanic works and is
+  measured, on `/Game/Maps/Arena` only. PLAY and PRACTICE both go to `Arena_Baked`, which has none.
+- **The packaged game has never been run** (item 29). "Both configs green" means the Shipping target
+  links, not that it starts.
+- **"ACTIVATED" clips on the character-select cards on any 16:10 display** (item 39), and reads
+  correctly at 1920x1080 — which is why it survived this long.
+- **There is no spawn shield** (item 14). The Core carrier's shield is the only invulnerability in
+  the build. It is not missing; it never existed.
+- **Fire-rate tolerance.** The server accepts shots up to 20% faster than the weapon's fire
+  interval (`FireRateTolerance`, `Source/Trace/Gameplay/TraceWeaponComponent.h`), so a modified
+  client could sustain ~+25% DPS. Deliberately not fixed this release: damage stays
+  server-authoritative, the game is a LAN/listen-server game between known players, and a
+  false-positive in the hottest server validation path would drop honest players' shots (item 1).
+- **Hit-zone classification is a three-zone approximation** — a head sphere plus a body/legs height
+  band, with no per-limb geometry, so extreme angles are a balance question rather than a bug.
+  `Trace.HitZoneTest` runs the model's self test in a development build (item 2).
+- **Corpses and the slide are procedural presentation** — posed at runtime, pending real
+  animation assets (item 3).
+- **Owner git/config writes, documented but not executed:** the two tracked `.slnx` files, the
+  `prompt note files/` directory, and the `MultiUserClient` plugin enabled in `Trace.uproject`
+  (items 4-6).
+- **Sound provenance.** `Art/Sounds/` holds 71 WAVs and no `SOURCE_NOTES.md`; the provenance and
+  licence note is pending with the owner. **Do not assume a licence for those files** (item 8).
+- **Font licensing.** The licensed font files are not in the repo and must never be committed; the
+  baked glyph atlases are committed, and whether the Sofachrome EULA permits that is an open
+  owner-level verification task. Typography is frozen meanwhile — read
+  [docs/FONTS.md](docs/FONTS.md) before touching it (item 9).

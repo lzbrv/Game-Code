@@ -130,15 +130,20 @@ game by deleting an asset — worst case it reverts to exactly what it did befor
 
 ## 6. Known issues — what is NOT done
 
-- **The UMG UI is off by default and should stay off for now.** Only 2 of 4 screens converted (title
-  menu, HUD corner). The options menu and character select are still Canvas. Turning it on also
-  currently costs a long black screen on launch (the widget generator leaves retired widget IDs in
-  the asset — 27 of them in the title menu), and the TRACE wordmark draws with broken letters.
-  All three are fixable; none is fixed.
-- **Nothing has been cooked or packaged.** The game runs from the editor binary. Whether the 66
-  material assets and 572 actor packages cook cleanly is untested.
+- **~~The UMG UI is off by default~~ — NO LONGER TRUE (2026-08-28).** UMG is now the shipped
+  default: `Trace.UI.UseUMG` registers with a default of 1 (`Source/Trace/UI/TraceMenuHUD.cpp:217`),
+  both blockers this bullet named (the launch stall and the mis-stroked wordmark) are closed, and the
+  UMG corner was observed active at boot with no flag set. One real caveat survives: a second, dead
+  default of 0 still exists in `Source/Trace/UI/TraceHUD.cpp:4355`, so the answer technically depends
+  on a static-init race — see `KNOWN_LIMITATIONS.md` item 25.
+- **Nothing has been cooked or packaged, and this is now measured rather than assumed.** The game
+  runs from the editor binary. There is no `Saved/Cooked` directory anywhere in the project, and the
+  Shipping binary was run for the first time on 2026-08-28 and does not start on this install layout.
+  Whether the 74 material assets and 647 actor packages cook cleanly is still untested. See
+  `KNOWN_LIMITATIONS.md` item 29 for the reproduction.
 - **Windows is unverified for this pass.** macOS structurally cannot catch the MSVC shadowing errors
   that have broken your build four times — a Windows build is the only real gate.
-- The LFS repo is now **5.14 MiB across 641 files**; a clone costs ~8.3 MiB. GitHub's included quota
+- The LFS repo is now **~70 MB across ~1,650 files** (measured 2026-08-28 on the release branch;
+  it was ~30 MB across ~1,427 files at commit `36401e2`); a clone costs ~70 MB. GitHub's included quota
   is 10 GiB storage and 10 GiB/month bandwidth, so you are far from trouble, but it is no longer
   free-forever the way an asset-free repo was.

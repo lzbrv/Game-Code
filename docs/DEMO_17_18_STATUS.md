@@ -1,5 +1,10 @@
 # Demo 17 / 18 — what is actually done, and what is not
 
+> **POINT-IN-TIME SNAPSHOT (2026-08-12) — do not treat as current.** At least one claim below has
+> since gone false: Mortimer's mantle IS implemented now
+> (`Source/Trace/Abilities/Characters/TraceAbilitySetMortimer.cpp`). Verify against the live tree
+> before acting on anything here.
+
 Written 2026-08-12, after the build pass and its four adversarial verifiers
 finished. **Read this before treating anything from Demo 17 or 18 as
 shipped.** The commit message on `5b2996e` claims integration and

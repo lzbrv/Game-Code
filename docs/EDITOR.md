@@ -39,8 +39,9 @@ meshes and baked lighting would be in the hundreds of megabytes to gigabytes rat
 a clone costs today.
 
 **This section used to claim there was "no asset to lock". That is no longer true** — see §3.5. The
-repo now tracks 641 binary assets (5.14 MiB in Git LFS): the baked arena, its materials and three
-levels. Anything under `Content/` is checked out **read-only** and you must take a lock before you
+repo now tracks ~1,650 binary files (~70 MB in Git LFS): the baked arena, its materials, the ten
+character bodies and the animation set they share, the UI art, input and character data, sounds, and
+the collaborator test maps. Anything under `Content/` is checked out **read-only** and you must take a lock before you
 can edit it. If Unreal refuses to save an asset, that is why, and the fix is a lock rather than a
 `chmod` — see [GITHUB.md §4](GITHUB.md).
 
