@@ -118,6 +118,76 @@ SIDES = {
     "Goal": "game-side",       # a goal is the whole room's event
     "Kill": "client-side",     # the killer's own confirmation, like the hitmarker
     "RoccoRipple": "game-side",  # an ability going off in the world, like Dash
+
+    # --- release FX/AUDIO plan §5.1: the synthesized palette (43 stems, rendered
+    #     by Scripts/generate_sounds.py into Combat/ Abilities/ UI/ Music/).
+    #     "client-side" here includes the plan's "(burst)"/"replicated-local"
+    #     rows: they reach every machine through code that already runs
+    #     everywhere, and are declared Client in C++ so a stray Play() cannot
+    #     double-multicast them.
+    # core combat
+    "MeleeSwing": "game-side",
+    "MeleeHit": "game-side",
+    "MeleeBackstab": "game-side",
+    "Reload": "game-side",
+    "DryFire": "client-side",
+    "WeaponSwitch": "client-side",
+    "DamageTaken": "client-side",
+    "DeathBurst": "game-side",
+    "Respawn": "client-side",
+    "ShieldBlock": "client-side",
+    # per-kit abilities
+    "ChutBash": "client-side",
+    "MaceSpikeThrow": "game-side",
+    "MaceSpikeEmbed": "client-side",
+    "MacePullLoop": "client-side",
+    "OysterPickler": "game-side",
+    "OysterJarBreak": "client-side",
+    "XSting": "client-side",
+    "XStingLoad": "game-side",
+    "RoxieRocketBurst": "client-side",
+    "RoxieRocketLaunch": "game-side",
+    "RoxieRocketLoop": "client-side",
+    "RoxieModded": "game-side",
+    "ElleTeleport": "client-side",
+    "ElleSnap": "client-side",
+    "ElleCloak": "game-side",
+    "ElleDecloak": "game-side",
+    "SlimeballWall": "game-side",
+    "SlimeballStick": "game-side",
+    "MortimerQuake": "game-side",
+    "MortimerMantle": "client-side",
+    "LilyZip": "game-side",
+    "LilyZipLoop": "client-side",
+    "RoccoRideLoop": "client-side",
+    "RoccoJump": "game-side",
+    # UI + countdown (2D)
+    "UIHover": "client-side",
+    "UIBack": "client-side",
+    "UIDeny": "client-side",
+    "CountdownTick": "client-side",
+    "CountdownGo": "client-side",
+    # music (family Music in C++ — the MusicVolumeScale hook)
+    "StingerVictory": "client-side",
+    "StingerDefeat": "client-side",
+    "MusicTitle": "client-side",
+    "AmbienceMatch": "client-side",
+}
+
+# Stems whose WAV is a seamless loop (release FX/AUDIO plan §5.6 step 3; the
+# generator renders these on a circular buffer, so file-start -> file-end IS the
+# loop point — plain looping, no crossfade). import_wav sets looping=True for
+# these and SKIPS FORCE_INLINE: a looping sound is not the "0.03 s hit marker"
+# the inline reasoning below is about, and the two music beds are megabytes
+# (MusicTitle ~11.3 MB, AmbienceMatch ~8.5 MB) — force-inlining those would pin
+# them whole in memory; left at the engine default they stream.
+LOOPING_STEMS = {
+    "MacePullLoop",
+    "RoxieRocketLoop",
+    "LilyZipLoop",
+    "RoccoRideLoop",
+    "MusicTitle",
+    "AmbienceMatch",
 }
 
 # The FOOTSTEP family, spelled once. §1b gives footsteps their own volume knob,
@@ -279,7 +349,7 @@ def manifest(entries, selected):
     log("=== import_sounds: step 1, the manifest ===")
     log("source: {0}".format(SOURCE_DIR))
     log("")
-    log("  {0:<14}{1:<12}{2:>7}{3:>4}{4:>8}{5:>10}{6:>10}   {7}".format(
+    log("  {0:<18}{1:<12}{2:>7}{3:>4}{4:>8}{5:>10}{6:>10}   {7}".format(
         "EVENT", "SIDE", "RATE", "CH", "SECONDS", "PEAK dB", "RMS dB", "FILE"))
 
     ok = True
@@ -309,7 +379,7 @@ def manifest(entries, selected):
 
         mark = "" if (selected is None or stem in selected) else "   (skipped this run)"
         rel = os.path.relpath(path, SOURCE_DIR)
-        log("  {0:<14}{1:<12}{2:>7}{3:>4}{4:>8.2f}{5:>10}{6:>10}   {7}{8}".format(
+        log("  {0:<18}{1:<12}{2:>7}{3:>4}{4:>8.2f}{5:>10}{6:>10}   {7}{8}".format(
             stem, side, rate, channels, seconds,
             "n/a" if peak_db is None else "{0:.2f}".format(peak_db),
             "n/a" if rms_db is None else "{0:.2f}".format(rms_db),
@@ -390,16 +460,26 @@ def import_wav(unreal, stem, path):
     #                        streaming a 0.03 s hit marker costs a seek to save nothing, and a
     #                        first-play hitch on a hit marker is exactly the sound you notice.
     #                        (This is UE5's replacement for the old bStreaming flag.)
-    set_prop(sound, "looping", "bLooping", False)
+    #
+    # A LOOPING_STEMS member is the opposite on both counts (FX/AUDIO plan §5.6):
+    # its WAV is a seamless circular-buffer render, so looping=True and the file
+    # plays forever from its own head — and it is NOT force-inlined; see the note
+    # on LOOPING_STEMS for why (the music beds alone are ~20 MB).
+    is_loop = stem in LOOPING_STEMS
+    set_prop(sound, "looping", "bLooping", is_loop)
     try:
         set_prop(sound, "sound_group", "SoundGroup", unreal.SoundGroup.SOUNDGROUP_EFFECTS)
     except AttributeError:
         log("  (this engine build has no SoundGroup.SOUNDGROUP_EFFECTS - continuing)")
     try:
+        # INHERITED (the engine default) for loops rather than simply not touching the
+        # property: replace_existing re-uses the existing UObject, so a stem moved INTO
+        # LOOPING_STEMS after an inline import would otherwise keep its stale FORCE_INLINE.
         set_prop(sound, "loading_behavior", "LoadingBehavior",
-                 unreal.SoundWaveLoadingBehavior.FORCE_INLINE)
+                 unreal.SoundWaveLoadingBehavior.INHERITED if is_loop
+                 else unreal.SoundWaveLoadingBehavior.FORCE_INLINE)
     except AttributeError:
-        log("  (this engine build has no SoundWaveLoadingBehavior.FORCE_INLINE - continuing)")
+        log("  (this engine build has no SoundWaveLoadingBehavior - continuing)")
 
     unreal.EditorAssetLibrary.save_loaded_asset(sound, only_if_is_dirty=False)
 

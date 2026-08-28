@@ -48,6 +48,19 @@
 # LAYOUT PASS depends on, so it refuses to emit a header unless the em, the LINE
 # HEIGHT and the charset match exactly (see check_weights_agree).
 #
+# -----------------------------------------------------------------------------
+# ...AND A FOURTH SHEET THAT IS NOT ONE OF THEM (UI plan WP12)
+# -----------------------------------------------------------------------------
+#   Names  Lato-Regular.ttf (OFL)  T_FontAtlasNames  the per-glyph FALLBACK
+#
+# Everything above this line is about the three faces a CALLER can ask for. The
+# fourth sheet is not askable: it is reached one GLYPH at a time, for a codepoint
+# the chosen face has no cell for — an accented player name, in practice. It is
+# rasterised over Latin-1 rather than printable ASCII, it does NOT share the
+# licensed faces' line box or charset, it is NOT in ETraceTextWeight, and it is
+# guarded by check_fallback() rather than by check_weights_agree(). See the
+# FALLBACK block further down, and the banner it emits into the header.
+#
 # *** WHAT IS NOT SHARED: THE ADVANCES. *** Three different font files have three
 # different sets of widths — measured here, 94 of the 95 cells differ between the
 # two Sofachrome cuts and Erbaum is narrower than either. While the light cut was
@@ -128,33 +141,65 @@ WEIGHTS = [
 
 DEFAULT_WEIGHT = WEIGHTS[0][0]
 
+# -----------------------------------------------------------------------------
+# THE FALLBACK FACE — AND WHY IT IS NOT IN THE TABLE ABOVE (UI plan WP12)
+# -----------------------------------------------------------------------------
+# T_FontAtlasNames is Lato, rasterised over Latin-1 rather than printable ASCII.
+# It exists because a PLAYER NAME is the one string this game does not author:
+# "Björn" arriving over the network had no cell for its ö and drew a hole in the
+# kill feed. Extending the Sofachrome or Erbaum sheets to cover it was ruled out —
+# that would rasterise more of two faces this public repo may not redistribute.
+# Lato is OFL, its .ttf is already committed, and so its sheet may be.
+#
+# IT IS DELIBERATELY NOT A FOURTH WEIGHT, and that distinction is the whole design:
+#
+#   * A weight is something a CALLER ASKS FOR. Nothing should ever ask to draw in
+#     the fallback — it is reached per GLYPH, by a codepoint the chosen face has no
+#     cell for, and never by a style. Adding it to ETraceTextWeight would put "Lato"
+#     in a UMG dropdown and in WeightFromName(), inviting exactly the two-typefaces
+#     defect spec v23 §A4 removed.
+#   * A weight must satisfy check_weights_agree(): same em, same LINE HEIGHT, same
+#     contiguous charset. This face satisfies NONE of the last two. Lato splits a
+#     137 px line box at em 96 where the licensed faces split a 116 px one, and its
+#     charset has nine holes in it (the C1 block, the soft hyphen, the gaps between
+#     Latin-1 and the typographic marks). It is emitted with its own RANGE TABLE and
+#     its own baseline, and the runtime shifts it onto the drawing face's baseline.
+#
+# So it gets its own section of the generated header and its own guard below.
+FALLBACK = ("Names", "T_FontAtlasNames")
 
-def weights_to_import():
+# Every sheet that has to reach /Game/Trace/UI/Fonts. The fallback goes LAST so that
+# WEIGHTS keeps being indexable by ETraceTextWeight — the enum's values are what saved
+# knobs, data-asset columns and Blueprint pins carry, and "Names" is not one of them.
+ALL_SHEETS = WEIGHTS + [FALLBACK]
+
+
+def sheets_to_import():
     """
-    Which weights step 2 actually imports. All of them, unless
-    TRACE_FONT_ATLAS_WEIGHTS names a comma-separated subset by weight name.
+    Which sheets step 2 actually imports. All of them, unless
+    TRACE_FONT_ATLAS_WEIGHTS names a comma-separated subset by name.
 
     This exists because .uasset is `lockable` in .gitattributes and therefore
     checked out READ-ONLY (see the header of Scripts/lock.sh). Re-importing a
     weight whose asset nobody has locked fails on the write, and re-importing one
     while another session has the project open is worse than failing. Adding a
     NEW weight's sheet touches no existing asset, so it needs neither — hence
-    being able to say "just the bold one".
+    being able to say "just the bold one", or "just Names" the day WP12 landed.
 
-    The HEADER is always regenerated from every weight, because it describes the
+    The HEADER is always regenerated from every sheet, because it describes the
     whole table and a partial one would put the runtime out of step with itself.
     """
     requested = os.environ.get("TRACE_FONT_ATLAS_WEIGHTS", "").strip()
     if not requested:
-        return list(WEIGHTS)
+        return list(ALL_SHEETS)
 
     wanted = [w.strip().lower() for w in requested.split(",") if w.strip()]
-    chosen = [(n, b) for (n, b) in WEIGHTS if n.lower() in wanted]
+    chosen = [(n, b) for (n, b) in ALL_SHEETS if n.lower() in wanted]
 
-    known = ", ".join(n for n, _ in WEIGHTS)
+    known = ", ".join(n for n, _ in ALL_SHEETS)
     for name in wanted:
-        if not any(n.lower() == name for n, _ in WEIGHTS):
-            fail("TRACE_FONT_ATLAS_WEIGHTS names '{0}', which is not a weight. Known: {1}."
+        if not any(n.lower() == name for n, _ in ALL_SHEETS):
+            fail("TRACE_FONT_ATLAS_WEIGHTS names '{0}', which is not a sheet. Known: {1}."
                  .format(name, known))
     return chosen
 
@@ -257,17 +302,84 @@ def digest(path):
         return hashlib.sha1(handle.read()).hexdigest()
 
 
-def load_weight(name, basename):
-    """One weight's JSON, validated on its own terms. Returns a dict or None."""
+def runs_of(codes):
+    """
+    A sorted codepoint list collapsed into contiguous [first, last] runs.
+
+    The same function, for the same reason, as in Scripts/generate_font_atlas.py:
+    one run means the C++ can index by (code - FirstCode); more than one means it
+    needs the range table this emits for the fallback face.
+    """
+    runs = []
+    for code in sorted(codes):
+        if runs and code == runs[-1][1] + 1:
+            runs[-1][1] = code
+        else:
+            runs.append([code, code])
+    return [(a, b) for a, b in runs]
+
+
+def measure_ink_extent(meta, sheet_png):
+    """
+    The topmost and bottommost INK row any cell on this sheet uses, relative to the
+    top of its cell. Returns (top, bottom, note), or (None, None, note).
+
+    This is what proves the fallback face can be baseline-shifted onto a licensed
+    face's line box WITHOUT its ink leaving that box — see check_fallback(). Doing it
+    by measurement rather than by argument matters: Lato's 137 px line box is 21 px
+    taller than the 116 px one the licensed faces share, and "the diacritics probably
+    fit" is not something a reader of the header should have to take on trust.
+
+    PIL's getbbox() on a cropped cell does the scan in C. The per-pixel loop in
+    measure_cap_height above is fine for one cell and would not be for 199.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, None, "NOT MEASURED (Pillow not installed)"
+
+    if not os.path.isfile(sheet_png):
+        return None, None, "NOT MEASURED (the PNG was not on disk)"
+
+    image = Image.open(sheet_png).convert("RGBA")
+    alpha = image.getchannel("A")
+
+    top = None
+    bottom = None
+    for c in meta["characters"]:
+        box = alpha.crop((c["u"], c["v"], c["u"] + c["uSize"], c["v"] + c["vSize"])).getbbox()
+        if box is None:
+            continue                        # space and friends: no ink, nothing to bound
+        if top is None or box[1] < top:
+            top = box[1]
+        if bottom is None or box[3] > bottom:
+            bottom = box[3]
+
+    if top is None:
+        return None, None, "NOT MEASURED (the sheet has no ink at all)"
+    return top, bottom, "MEASURED across all {0} cells".format(len(meta["characters"]))
+
+
+def load_face(name, basename, sparse=False):
+    """
+    One sheet's JSON, validated on its own terms. Returns a dict or None.
+
+    @param sparse  False (every WEIGHT) demands a CONTIGUOUS charset, because the
+                   runtime indexes a weight's cells by (code - FirstCode). True (the
+                   fallback face only) allows holes and reports the runs instead —
+                   Latin-1 has a C1 block and a soft hyphen in the middle of it and
+                   cannot be contiguous by construction.
+    """
     path = json_path(basename)
     if not os.path.isfile(path):
         # NO --thin in this message, deliberately. It used to suggest `--thin 4` for
         # anything that was not Bold, which is the exact flag that ate ( ) [ ] { }
         # and / off a sheet while the HUD draws '[E]'. Every face here is rendered
         # as drawn, from its own real font file.
-        fail("{0} is missing (the {1} weight). Run `python3 Scripts/generate_font_atlas.py "
-             "--font \"Art/Fonts/<the face>\" --name {2}` first — it needs a licensed copy of "
-             "the font at Art/Fonts/ (gitignored, per-developer). Do NOT pass --thin."
+        fail("{0} is missing (the {1} sheet). Run `python3 Scripts/generate_font_atlas.py "
+             "--font \"Art/Fonts/<the face>\" --name {2}` first — for the three LICENSED faces "
+             "that needs your own copy at Art/Fonts/ (gitignored, per-developer) and no --thin; "
+             "for the OFL fallback it is `--font Art/Fonts/Lato-Regular.ttf --charset latin1`."
              .format(path, name, basename))
         return None
 
@@ -281,14 +393,16 @@ def load_weight(name, basename):
 
     first = chars[0]["code"]
     last = chars[-1]["code"]
-    if last - first + 1 != len(chars):
-        # The C++ indexes by (code - FirstCode), which is only correct for a
+    runs = runs_of([c["code"] for c in chars])
+    if not sparse and len(runs) != 1:
+        # The C++ indexes a weight by (code - FirstCode), which is only correct for a
         # contiguous block. Refuse rather than emit a table that silently maps
         # the wrong glyph for every character after the first gap.
-        fail("the {0} atlas charset is not contiguous ({1} glyphs spanning {2}..{3}). "
-             "TraceFontAtlasMetrics indexes by code and cannot express a gap; either keep the "
-             "charset contiguous in generate_font_atlas.py or teach this script to emit a "
-             "sparse lookup.".format(name, len(chars), first, last))
+        fail("the {0} atlas charset is not contiguous ({1} glyphs spanning {2}..{3} in {4} runs). "
+             "TraceFontAtlasMetrics indexes a WEIGHT by code and cannot express a gap. Keep the "
+             "licensed sheets on `--charset ascii`; a holey charset belongs to the FALLBACK face, "
+             "which is emitted with a range table instead."
+             .format(name, len(chars), first, last, len(runs)))
         return None
 
     cap_height, cap_note = measure_cap_height(meta, png_path(basename))
@@ -300,6 +414,8 @@ def load_weight(name, basename):
         "chars": chars,
         "first": first,
         "last": last,
+        "runs": runs,
+        "charset": meta.get("charset", "ascii"),
         "cap_height": cap_height,
         "cap_note": cap_note,
         "sha1": digest(path),
@@ -375,19 +491,220 @@ def check_weights_agree(weights):
     return ok
 
 
+def check_fallback(weights, fallback):
+    """
+    THE GUARD FOR THE FALLBACK FACE, and it asks a different question.
+
+    check_weights_agree() enforces what one LAYOUT PASS needs of a weight. The
+    fallback face is never laid out — it is reached one GLYPH at a time, dropped
+    into a line that some other face is setting. So the em must still match (the
+    whole thing is scaled by Size/EmSize and there is only one EmSize), but the line
+    height and the charset are explicitly allowed to differ, and DO:
+    Lato splits a 137 px box at em 96 against the licensed faces' 116, and its
+    charset has holes where the C1 controls and the soft hyphen were skipped.
+
+    What replaces those two checks is THE ONE THING A DROPPED-IN GLYPH CAN GET WRONG:
+    once it is shifted so its baseline sits on the drawing face's baseline, does its
+    INK still fit inside the drawing face's line box? If it does not, an accented
+    capital collides with the line above it and a descender with the line below, in a
+    multi-line label, and nothing logs. Measured here against EVERY weight rather
+    than argued: the shift is (weight ascent - fallback ascent), which is most
+    negative for the face with the smallest ascent, so the top is checked against the
+    smallest and the bottom against the largest.
+    """
+    ok = True
+    fmeta = fallback["meta"]
+    base = weights[0]
+
+    if fmeta["pixelSize"] != base["meta"]["pixelSize"]:
+        fail("the {0} fallback sheet is em {1} but the weights are em {2}. Everything on screen "
+             "is (Size / EmSize) x atlas pixels and there is ONE EmSize, so a fallback glyph would "
+             "draw at the wrong size inside a correct line. Re-generate it at --size {2}."
+             .format(fallback["name"], fmeta["pixelSize"], base["meta"]["pixelSize"]))
+        ok = False
+
+    for w in weights:
+        if w["meta"]["atlas"]["texture"] == fmeta["atlas"]["texture"]:
+            fail("the {0} weight and the {1} fallback both name texture '{2}'. One would overwrite "
+                 "the other on import.".format(w["name"], fallback["name"],
+                                               fmeta["atlas"]["texture"]))
+            ok = False
+
+    ink_top, ink_bottom, ink_note = measure_ink_extent(fmeta, png_path(fallback["basename"]))
+    fallback["ink_top"] = ink_top
+    fallback["ink_bottom"] = ink_bottom
+    fallback["ink_note"] = ink_note
+
+    if ink_top is None:
+        log("note: the {0} fallback sheet's ink extent was {1}, so the line-box fit below is "
+            "UNVERIFIED this run. It is checked whenever Pillow is available."
+            .format(fallback["name"], ink_note))
+        return ok
+
+    line_h = base["meta"]["lineHeight"]
+    for w in weights:
+        shift = w["meta"]["ascent"] - fmeta["ascent"]
+        top = ink_top + shift
+        bottom = ink_bottom + shift
+        if top < 0 or bottom > line_h:
+            fail("a {0} glyph dropped into a {1} line would put ink at {2}..{3} inside a 0..{4} px "
+                 "line box (shift {5} px, from ascent {6} onto ascent {7}). Multi-line labels would "
+                 "collide. Rasterise the fallback from a face with tighter diacritics, or stop "
+                 "sharing one line box."
+                 .format(fallback["name"], w["name"], top, bottom, line_h, shift,
+                         fmeta["ascent"], w["meta"]["ascent"]))
+            ok = False
+
+    return ok
+
+
 def cells_of(weight):
     return [(c["u"], c["v"], c["uSize"], c["vSize"]) for c in weight["chars"]]
+
+
+def emit_fallback(add, weights, fallback, base_meta):
+    """
+    The FALLBACK FACE section of the generated header (UI plan WP12).
+
+    Everything the runtime needs to drop ONE Lato glyph into a line the licensed
+    faces are setting: a range table (the charset has holes), a cell table, the
+    face record, and the index of '?' for a codepoint even Lato has no cell for.
+    """
+    fmeta = fallback["meta"]
+    fchars = fallback["chars"]
+    runs = fallback["runs"]
+    line_h = int(base_meta["lineHeight"])
+
+    add("\t// =============================================================================")
+    add("\t// THE FALLBACK FACE — one glyph at a time, and NOT a weight (UI plan WP12)")
+    add("\t// =============================================================================")
+    add("\t//")
+    add("\t// THE PROBLEM IT SOLVES. The three sheets above are printable ASCII. Every string this")
+    add("\t// game AUTHORS is inside that set; the one class of string it does not author is a PLAYER")
+    add("\t// NAME, and a \"Björn\" arriving over the network used to draw a hole where its ö should be")
+    add("\t// (it advanced by a space, so at least the row's box stayed honest — but a hole is a hole).")
+    add("\t//")
+    add("\t// WHY THE FIX IS A FOURTH SHEET AND NOT MORE CELLS IN THE FIRST THREE. Sofachrome and")
+    add("\t// Erbaum are licensed for desktop use and this repository is public; rasterising ANOTHER")
+    add("\t// 96 codepoints of them would deepen exactly the licensing exposure docs/FONTS.md flags.")
+    add("\t// {0} is OFL, its .ttf is already committed, and so is this sheet.".format(fmeta["source"]))
+    add("\t//")
+    add("\t// WHY IT IS NOT A FOURTH ETraceTextWeight. A weight is something a CALLER ASKS FOR, and")
+    add("\t// nothing should ever ask for this one — it is reached per GLYPH by a codepoint the chosen")
+    add("\t// face has no cell for. Putting it in the enum would put \"Lato\" in a UMG dropdown and in")
+    add("\t// WeightFromName(), which is the two-typefaces defect spec v23 §A4 removed.")
+    add("\t//")
+    add("\t// WHAT IT SHARES WITH THE WEIGHTS, AND WHAT IT DOES NOT:")
+    add("\t//   SHARED:      EmSize. Everything is scaled by (Size / EmSize) and there is one EmSize,")
+    add("\t//                so a fallback glyph in a correct line comes out the correct size. Enforced")
+    add("\t//                by import_font_atlas.py's check_fallback().")
+    add("\t//   NOT SHARED:  the LINE BOX. {0} splits {1} px at this em where the weights split {2}.".format(
+        fmeta["source"], int(fmeta["lineHeight"]), line_h))
+    add("\t//                A fallback glyph is therefore drawn at (weight ascent - fallback ascent)")
+    add("\t//                px from the line top, which puts its baseline on the line's baseline.")
+    add("\t//   NOT SHARED:  the CHARSET. {0} codepoints in {1} runs — the C1 block, U+00AD and the".format(
+        len(fchars), len(runs)))
+    add("\t//                gaps before the typographic marks are all skipped on purpose. That is why")
+    add("\t//                this face has a RANGE TABLE and the weights have a FirstCode.")
+    add("\t//")
+    if fallback.get("ink_top") is not None:
+        add("\t// AND THE ONE THING THAT COULD GO WRONG, MEASURED RATHER THAN ARGUED: a dropped-in glyph")
+        add("\t// whose ink left the shared line box would collide with the line above or below it in a")
+        add("\t// multi-line label, silently. This sheet's ink spans rows {0}..{1} of its own {2} px cell".format(
+            fallback["ink_top"], fallback["ink_bottom"], int(fmeta["lineHeight"])))
+        add("\t// ({0}), so after the baseline shift it occupies:".format(fallback["ink_note"]))
+        for w in weights:
+            shift = int(w["meta"]["ascent"]) - int(fmeta["ascent"])
+            add("\t//     in a {0:<5s} line (ascent {1}): shift {2:+d} px  ->  ink {3}..{4}  inside 0..{5}".format(
+                w["name"], int(w["meta"]["ascent"]), shift,
+                fallback["ink_top"] + shift, fallback["ink_bottom"] + shift, line_h))
+        add("\t// import_font_atlas.py refuses to write this file if any of those rows leaves the box.")
+    else:
+        add("\t// NOTE: the ink-extent fit could not be measured this run ({0}).".format(
+            fallback.get("ink_note", "reason unrecorded")))
+    add("")
+    add("\tinline constexpr int32 NumFallbackGlyphs = {0};".format(len(fchars)))
+    add("\tinline constexpr int32 NumFallbackRanges = {0};".format(len(runs)))
+    add("")
+    add("\t/** One contiguous run of the fallback charset. Cells[FirstIndex + (Code - First)] is the")
+    add("\t  * cell for Code, for any Code in [First, Last]. */")
+    add("\tstruct FCodeRange")
+    add("\t{")
+    add("\t\tint32 First;")
+    add("\t\tint32 Last;")
+    add("\t\tint32 FirstIndex;")
+    add("\t};")
+    add("")
+    add("\tinline constexpr FCodeRange FallbackRanges[NumFallbackRanges] =")
+    add("\t{")
+    index_by_code = {c["code"]: i for i, c in enumerate(fchars)}
+    for (lo, hi) in runs:
+        add("\t\t{{ {0:6d}, {1:6d}, {2:4d} }},   // U+{0:04X}..U+{1:04X}, {3} glyph(s)".format(
+            lo, hi, index_by_code[lo], hi - lo + 1))
+    add("\t};")
+    add("")
+    add("\tinline constexpr FCell FallbackCells[NumFallbackGlyphs] =")
+    add("\t{")
+    for c in fchars:
+        label = c["char"]
+        if label == " ":
+            label = "space"
+        elif label == "\\":
+            label = "backslash"
+        elif c["code"] == 0xA0:
+            label = "no-break space"
+        elif not (32 < c["code"] < 127):
+            label = "U+{0:04X}  {1}".format(c["code"], label)
+        add("\t\t{{ {0:4d}, {1:4d}, {2:4d}, {3:4d} }},   // {4:5d}  {5}".format(
+            c["u"], c["v"], c["uSize"], c["vSize"], c["code"], label))
+    add("\t};")
+    add("")
+    question = index_by_code.get(ord("?"))
+    add("\t/** '?' in the table above — what a codepoint MISSING FROM BOTH sheets draws. A visible")
+    add("\t  * question mark is the honest answer there; advancing silently is what produced the hole")
+    add("\t  * this face exists to remove. */")
+    add("\tinline constexpr int32 FallbackQuestionIndex = {0};".format(question))
+    add("")
+    add("\t// {0} — {1}, ascent {2}/descent {3}, cap {4} px {5}".format(
+        fallback["name"], fmeta["source"], int(fmeta["ascent"]), int(fmeta["descent"]),
+        int(fallback["cap_height"]), fallback["cap_note"]))
+    add("\tinline constexpr FFace FallbackFace =")
+    add("\t\t{{ TEXT(\"{0}\"), TEXT(\"{1}\"), TEXT(\"{2}/{3}.{3}\"), {4}f, {5}, {6}, {7}.f, {8}.f, {9}.f, FallbackCells }};".format(
+        fallback["name"], fmeta["source"], TEXTURE_DIR, fallback["basename"],
+        fmeta.get("thin", 0.0), fmeta["atlas"]["width"], fmeta["atlas"]["height"],
+        int(fmeta["ascent"]), int(fmeta["descent"]), int(fallback["cap_height"])))
+    add("")
+    add("\t/** The index into FallbackCells for @p Code, or INDEX_NONE. Linear over {0} ranges — it".format(len(runs)))
+    add("\t  * is only ever reached for a codepoint the DRAWING face already failed to supply, which")
+    add("\t  * is a handful of glyphs in a player name and never a whole authored string. */")
+    add("\tinline constexpr int32 FallbackIndexOf(int32 Code)")
+    add("\t{")
+    add("\t\tfor (const FCodeRange& Range : FallbackRanges)")
+    add("\t\t{")
+    add("\t\t\tif (Code >= Range.First && Code <= Range.Last)")
+    add("\t\t\t{")
+    add("\t\t\t\treturn Range.FirstIndex + (Code - Range.First);")
+    add("\t\t\t}")
+    add("\t\t}")
+    add("\t\treturn INDEX_NONE;")
+    add("\t}")
 
 
 def write_header():
     weights = []
     for name, basename in WEIGHTS:
-        loaded = load_weight(name, basename)
+        loaded = load_face(name, basename)
         if loaded is None:
             return False
         weights.append(loaded)
 
     if not check_weights_agree(weights):
+        return False
+
+    fallback = load_face(FALLBACK[0], FALLBACK[1], sparse=True)
+    if fallback is None:
+        return False
+    if not check_fallback(weights, fallback):
         return False
 
     # The DEFAULT weight's numbers double as the module's plain constants, so
@@ -417,6 +734,8 @@ def write_header():
     for w in weights:
         add("//   Content/Trace/UI/Fonts/Source/{0}.json   ({1}, sha1 {2})".format(
             w["basename"], w["name"], w["sha1"]))
+    add("//   Content/Trace/UI/Fonts/Source/{0}.json   ({1}, the FALLBACK face, sha1 {2})".format(
+        fallback["basename"], fallback["name"], fallback["sha1"]))
     add("//")
     add("// THE ONE METRICS SOURCE (spec v22 §A1, two weights by v23 §A3, a third face by v25 §4). Both")
     add("// renderers — the Canvas blitter in TraceCanvasText.cpp and the Slate leaf in")
@@ -438,7 +757,10 @@ def write_header():
     add("//   *** WHAT ONE LAYOUT PASS ACTUALLY REQUIRES, and it is only this: *** the em, the LINE")
     add("//   HEIGHT and the charset. Those three are emitted once, below, and enforced by")
     add("//   import_font_atlas.py's check_weights_agree(), which refuses to write this file if the")
-    add("//   sheets ever disagree about them.")
+    add("//   WEIGHTS ever disagree about them. *** THE FALLBACK FACE AT THE BOTTOM OF THIS FILE IS")
+    add("//   NOT A WEIGHT AND IS NOT BOUND BY THOSE THREE *** — it is never laid out, only dropped")
+    add("//   into a line one glyph at a time, so it shares the em and nothing else. See its own")
+    add("//   section for what replaces the other two guarantees.")
     add("//")
     add("//   *** ADVANCES ARE NOT SHARED. *** Each face has its own cell table below and its own")
     add("//   widths, because each is rasterised from its own font file. An earlier pass synthesised")
@@ -482,7 +804,8 @@ def write_header():
     add("\tinline constexpr int32 DefaultWeight = {0};   // {1}".format(0, base["name"]))
     add("")
     add("\t// =============================================================================")
-    add("\t// SHARED BY EVERY FACE — enforced by the generator, so layout can rely on it")
+    add("\t// SHARED BY EVERY WEIGHT — enforced by the generator, so layout can rely on it")
+    add("\t// (the FALLBACK face at the bottom shares only EmSize; see its own banner)")
     add("\t// =============================================================================")
     add("")
     add("\t/** Em size the sheets were rasterised at. Everything below is in these pixels. */")
@@ -496,11 +819,15 @@ def write_header():
     add("\tinline constexpr float Ascent     = {0}.f;".format(int(meta["ascent"])))
     add("\tinline constexpr float Descent    = {0}.f;".format(int(meta["descent"])))
     add("")
+    add("\t/** The WEIGHTS' charset — one contiguous block, which is what lets them be indexed by")
+    add("\t  * subtraction. The fallback face's charset is wider and has holes; it carries its own")
+    add("\t  * range table rather than a First/Last pair. */")
     add("\tinline constexpr int32 FirstCode = {0};".format(first))
     add("\tinline constexpr int32 LastCode  = {0};".format(last))
     add("\tinline constexpr int32 NumGlyphs = {0};".format(len(chars)))
     add("")
-    add("\t/** One cell, in atlas pixels. Index by (code - FirstCode); the charset is contiguous. */")
+    add("\t/** One cell, in atlas pixels. For a WEIGHT, index by (code - FirstCode); the weights'")
+    add("\t  * charset is contiguous. The fallback face uses FallbackCell() instead. */")
     add("\tstruct FCell")
     add("\t{")
     add("\t\tuint16 U;")
@@ -549,7 +876,9 @@ def write_header():
     add("")
     add("\tstruct FFace")
     add("\t{")
-    add("\t\t/** \"Light\" / \"Bold\" / \"Hud\". The name TraceText::WeightFromName() matches. */")
+    add("\t\t/** \"Light\" / \"Bold\" / \"Hud\". The name TraceText::WeightFromName() matches. The")
+    add("\t\t  * fallback face reuses this struct and calls itself \"{0}\", but it is NOT in Faces[]".format(fallback["name"]))
+    add("\t\t  * and WeightFromName() must never return it — nothing may ASK to draw in it. */")
     add("\t\tconst TCHAR* Name;")
     add("")
     add("\t\t/** The font file this face was rasterised from. This is what a screenshot caption has to")
@@ -567,8 +896,12 @@ def write_header():
     add("\t\tint32 AtlasWidth;")
     add("\t\tint32 AtlasHeight;")
     add("")
-    add("\t\t/** THIS face's split of the shared line box. Baseline and CapTop alignment read these;")
-    add("\t\t  * Ascent + Descent == LineHeight for every face, which is what the guard enforces. */")
+    add("\t\t/** THIS face's split of ITS line box. Baseline and CapTop alignment read these.")
+    add("\t\t  * For every WEIGHT, Ascent + Descent == LineHeight — that is what check_weights_agree()")
+    add("\t\t  * enforces. THE FALLBACK FACE IS THE EXCEPTION: its box is taller ({0} px against {1}),".format(
+        int(fallback["meta"]["lineHeight"]), int(meta["lineHeight"])))
+    add("\t\t  * so its Ascent + Descent does NOT equal LineHeight, and the difference in Ascent is")
+    add("\t\t  * exactly the shift that puts a fallback glyph on the drawing face's baseline. */")
     add("\t\tfloat Ascent;")
     add("\t\tfloat Descent;")
     add("")
@@ -598,6 +931,8 @@ def write_header():
     add("\t{")
     add("\t\treturn Faces[(WeightIndex >= 0 && WeightIndex < NumWeights) ? WeightIndex : DefaultWeight];")
     add("\t}")
+    add("")
+    emit_fallback(add, weights, fallback, meta)
     add("}")
     add("")
 
@@ -613,12 +948,17 @@ def write_header():
 
     with open(HEADER_PATH, "w") as handle:
         handle.write(text)
-    log("wrote {0}  ({1} glyphs, em {2}px, {3} weights)".format(
+    log("wrote {0}  ({1} glyphs, em {2}px, {3} weights + 1 fallback face)".format(
         os.path.relpath(HEADER_PATH, ROOT), len(chars), int(meta["pixelSize"]), len(weights)))
     for w in weights:
         log("    {0:<6s} {1:<20s} thin {2:<4} cap {3} px — {4}".format(
             w["name"], w["basename"], w["meta"].get("thin", 0.0),
             int(w["cap_height"]), w["cap_note"]))
+    log("    {0:<6s} {1:<20s} FALLBACK, charset {2}: {3} glyphs in {4} range(s), line box {5} px "
+        "(the weights' is {6})".format(
+            fallback["name"], fallback["basename"], fallback["charset"],
+            len(fallback["chars"]), len(fallback["runs"]),
+            int(fallback["meta"]["lineHeight"]), int(meta["lineHeight"])))
     if all(shares_grid[w["name"]] is None for w in weights[1:]):
         log("    the weights share one cell grid, so the table is emitted once and aliased.")
     return True
@@ -641,10 +981,10 @@ def set_prop(obj, snake, camel, value):
 
 
 def import_texture(unreal, name, basename):
-    """Imports ONE weight's sheet. Called once per entry in WEIGHTS."""
+    """Imports ONE sheet. Called once per entry in ALL_SHEETS (the weights, then the fallback)."""
     sheet = png_path(basename)
     if not os.path.isfile(sheet):
-        fail("{0} is missing (the {1} weight). Run `python3 Scripts/generate_font_atlas.py` first."
+        fail("{0} is missing (the {1} sheet). Run `python3 Scripts/generate_font_atlas.py` first."
              .format(sheet, name))
         return False
 
@@ -736,11 +1076,13 @@ def main():
             sys.exit(1)
         return
 
-    # Every weight, not just the default. A missing bold sheet is the failure this
+    # Every sheet, not just the default. A missing bold sheet is the failure this
     # loop exists to make loud: the runtime would quietly draw the character names
-    # in light and nobody would see a log line unless they looked for one.
-    selected = weights_to_import()
-    if len(selected) != len(WEIGHTS):
+    # in light and nobody would see a log line unless they looked for one. The
+    # fallback sheet is in this list too — a missing one is quieter still, because
+    # it only shows up on a name nobody on this machine is called.
+    selected = sheets_to_import()
+    if len(selected) != len(ALL_SHEETS):
         log("TRACE_FONT_ATLAS_WEIGHTS: importing only {0}.".format(
             ", ".join(n for n, _ in selected) or "(nothing)"))
     for name, basename in selected:
@@ -753,7 +1095,8 @@ def main():
         if not hasattr(unreal, "SystemLibrary"):
             sys.exit(1)
     else:
-        log("done — {0} weight(s) imported and the metrics header is current.".format(len(WEIGHTS)))
+        log("done — {0} sheet(s) imported ({1} weights + the {2} fallback face) and the metrics "
+            "header is current.".format(len(selected), len(WEIGHTS), FALLBACK[0]))
 
 
 main()

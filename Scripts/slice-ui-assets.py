@@ -51,7 +51,7 @@
 #    bright pixel where the plate should be flat.
 #
 #    The empty frame is then 9-sliced by the widget, which is what lets one
-#    512 px texture be a 720-wide menu row AND a 90-wide KEY chip without the
+#    256 px texture be a 720-wide menu row AND a 90-wide KEY chip without the
 #    corner radius stretching.
 #
 # 3. IT LIFTS THE WORDS OFF THEIR PLATES. PLAY / SETTINGS / KEYBIND / KEY are
@@ -96,6 +96,17 @@
 #    build_word() lifts PLAY off its plate: the stroke's OWN luminance is the
 #    ceiling for alpha, the stroke is white and the rim keeps the artist's amber.
 #    The letterforms are never re-cut, re-shaped or moved - only re-toned.
+#
+# 7. IT RE-TONES THE SWOOSH ONTO THE PLATE PALETTE (release UI plan WP8.3). The
+#    render on the sheet is a flat mid-grey blade - the second-biggest element on
+#    the title and the one thing on it wearing a colour the artist's palette does
+#    not contain. Same move as the wordmark: the SHAPE (alpha) is the artist's
+#    and stays; the TONE is remapped at the source. Luminance runs a two-stop
+#    ramp from PlateFill sRGB(29,41,81) to lifted plate sRGB(46,66,130)
+#    (PlateFill x 1.6 in bytes, saturating at 0.75 of full luminance), and the
+#    top 8% of the luminance histogram - the render's specular ridge - takes the
+#    palette's AmberLifted sRGB(255,128,0) at 60% strength, so the blade's
+#    highlight becomes a neon glint instead of a grey shine. See build_swoosh.
 #
 # -----------------------------------------------------------------------------
 # SIZES - and why each one
@@ -234,11 +245,17 @@ SLIDER_HANDLE = (8672, 8600, 9180, 9290)
 # them 1:1 and a 4K window draws them at 2x.
 # -----------------------------------------------------------------------------
 TARGETS = {
-    # 9-sliced onto a 720x60 menu row, and onto a ~90x34 KEY chip. Only the caps
-    # are ever drawn 1:1, and at 512 wide a cap is 44 px for a 21 px corner.
-    "T_MenuBtn_Default":  (512, None),
-    "T_MenuBtn_Hover":    (512, None),
-    "T_MenuBtn_Disabled": (512, None),
+    # 9-sliced onto a 720x60 menu row, and onto a ~90x34 KEY chip. 256, DOWN FROM
+    # 512 (release UI plan WP7): Slate sizes a Box brush's corner slices from the
+    # TEXTURE's pixel size, and at 512 wide the 44 px cap pair did not fit the
+    # 72.5-unit row image - Slate's overlap guard squashed them 0.8226 and the
+    # artist's circular corner shipped as an ellipse on every plate (the whole
+    # measurement is in TraceMenuArtStyle.h). At 256 the cap is 22 px; 22+22 fits
+    # every plate the menu draws, including the ~90x60 KEY chip, so the corner
+    # comes out circular with no code change anywhere.
+    "T_MenuBtn_Default":  (256, None),
+    "T_MenuBtn_Hover":    (256, None),
+    "T_MenuBtn_Disabled": (256, None),
 
     # Words sit at roughly 26 px cap height on a row. 256 wide is ~4x that.
     "T_MenuWord_Play":     (256, None),
@@ -667,6 +684,82 @@ def build_wordmark(sheet):
     return out
 
 
+def build_swoosh(sheet):
+    """The sweep behind the title, re-toned from render grey onto the plate palette.
+
+    See note 7 in the header. The blade is the second-biggest element on the title
+    screen and the sheet ships it as a flat mid-grey 3D render - the one mark in
+    the set wearing a colour the artist's palette does not contain. The re-tone
+    happens HERE, at the source, exactly the way build_wordmark repairs the mark:
+    alpha (the artist's shape) is untouched, colour is replaced.
+
+    The mapping, stated rather than tuned:
+      * BODY - luminance runs a two-stop ramp in sRGB bytes, 0 -> PlateFill
+        RGB(29,41,81) and 0.75-of-full -> RGB(46,66,130) (PlateFill x 1.6 in
+        bytes), clamped above the second stop. Those are TraceMenuArtStyle's
+        PlateFill and its stated lift, so the swoosh sits in the same family as
+        the button plates instead of beside it.
+      * GLINT - the top 8% of the luminance histogram over the blade's own inked
+        pixels (its specular ridge) blends 60% toward AmberLifted RGB(255,128,0),
+        the palette's one stated bright accent, so the highlight reads as a neon
+        glint rather than a grey shine.
+
+    The runtime tint stays FLinearColor::White (SwooshOpacity 0.55 is an opacity,
+    not a colour) - the art carries the colour, per the sheet-fidelity rule of
+    TraceMenuArtStyle.h."""
+    rgb = np.asarray(sheet.crop(MARKS["swoosh"])).astype(np.float32)
+    rgba = to_rgba(rgb.astype(np.uint8)).astype(np.float32)
+
+    lum = rgb.max(axis=2) / 255.0
+    inked = rgba[:, :, 3] > 0
+
+    # The two stops, in sRGB bytes. 0.75 is where the body ramp saturates: the
+    # blade's diffuse shading lives below it and only the specular ridge above.
+    lo = np.array([29.0, 41.0, 81.0], dtype=np.float32)
+    hi = np.array([46.0, 66.0, 130.0], dtype=np.float32)
+    amber = np.array([255.0, 128.0, 0.0], dtype=np.float32)
+
+    t = np.clip(lum / 0.75, 0.0, 1.0)[:, :, None]
+    body = lo[None, None, :] * (1.0 - t) + hi[None, None, :] * t
+
+    # The specular ridge, measured off the histogram rather than a fixed level so
+    # a re-export at a different exposure keeps the same 8% of glint.
+    if inked.any():
+        ridge = float(np.percentile(lum[inked], 92.0))
+    else:
+        ridge = 2.0   # nothing inked: no glint, and the fail() below fires
+    glint = inked & (lum >= ridge)
+
+    out = rgba.copy()
+    out[:, :, :3] = body
+    out[glint, 0:3] = body[glint] * 0.4 + amber[None, :] * 0.6
+
+    # RED ARM: the point is that the grey is GONE and the glint is amber, not
+    # white. Re-measure the written pixels rather than trust the maths above.
+    if not inked.any() or not glint.any():
+        fail("T_MenuSwoosh: no inked pixels ({0}) or no specular ridge ({1}) found - the sheet or "
+             "MARKS['swoosh'] changed and the re-tone did nothing.".format(
+                 int(inked.sum()), int(glint.sum())))
+        return None
+    body_px = out[inked & ~glint]
+    if body_px.size and float((body_px[:, 2] - body_px[:, 0]).min()) <= 0.0:
+        fail("T_MenuSwoosh: a body pixel came out with red >= blue - the ramp is off the plate "
+             "palette and the blade would ship warm-grey again.")
+        return None
+    glint_px = out[glint]
+    if float((glint_px[:, 0] - glint_px[:, 2]).min()) <= 0.0:
+        fail("T_MenuSwoosh: a glint pixel came out with blue >= red - that is not the amber lift.")
+        return None
+
+    log("    T_MenuSwoosh: {0} px re-toned onto the plate ramp RGB(29,41,81)->RGB(46,66,130); "
+        "{1} px of specular ridge (luminance >= {2:.2f}, the top 8%) took AmberLifted at 60%. "
+        "Alpha untouched.".format(int(inked.sum()), int(glint.sum()), ridge))
+    out8 = np.zeros(out.shape, dtype=np.uint8)
+    out8[:, :, :3] = np.clip(out[:, :, :3], 0.0, 255.0).astype(np.uint8)
+    out8[:, :, 3] = rgba[:, :, 3].astype(np.uint8)
+    return out8
+
+
 def build_slider_handle(sheet):
     """The angular handle, with the rail it is sitting on taken out from under it.
 
@@ -731,11 +824,13 @@ def main():
     if rgba is not None:
         write("T_TraceWordmark", rgba)
 
-    # The two marks that ARE what note 1 assumes: a bright core with a halo, on
-    # black. Black-keying them is the whole job.
-    for key, name in (("swoosh", "T_MenuSwoosh"),
-                      ("back", "T_MenuBack")):
-        write(name, to_rgba(np.asarray(sheet.crop(MARKS[key]))))
+    rgba = build_swoosh(sheet)
+    if rgba is not None:
+        write("T_MenuSwoosh", rgba)
+
+    # The one mark that IS what note 1 assumes: a bright core with a halo, on
+    # black. Black-keying it is the whole job.
+    write("T_MenuBack", to_rgba(np.asarray(sheet.crop(MARKS["back"]))))
 
     log("-" * 74)
     if Failures:

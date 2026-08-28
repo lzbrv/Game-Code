@@ -28,8 +28,18 @@
 #   pattern matches Scripts/import-mannequin.sh: art that we may use but may not
 #   redistribute is imported per-developer, never committed.
 #
+# THE ONE EXCEPTION TO ALL OF THAT: Lato (--charset latin1, UI plan WP12).
+#   Lato ships under the SIL Open Font License. Its .ttf IS in this repository
+#   (Art/Fonts/Lato-Regular.ttf, licence text in Art/Fonts/README.md) and so may
+#   its atlas be, without any of the grey area above. That sheet exists to give
+#   the text stack a per-glyph FALLBACK for codepoints the licensed faces were
+#   never rasterised for — accented player names, mostly — so that a "Björn"
+#   arriving over the network draws its ö instead of a hole. See WP12 and
+#   Source/Trace/UI/Text/TraceText.cpp.
+#
 # Usage:
 #   python3 Scripts/generate_font_atlas.py [--font PATH] [--size PX] [--preview]
+#                                          [--charset ascii|latin1] [--name NAME]
 # =============================================================================
 import argparse
 import json
@@ -47,9 +57,88 @@ ROOT = os.path.dirname(HERE)
 DEFAULT_FONT = os.path.join(ROOT, "Art", "Fonts", "Sofachrome Rg.otf")
 OUT_DIR = os.path.join(ROOT, "Content", "Trace", "UI", "Fonts", "Source")
 
-# Printable ASCII. The menu needs upper case, digits and punctuation; lower case
-# and the rest are cheap and stop a stray string rendering as blanks.
-CHARSET = "".join(chr(c) for c in range(32, 127))
+# =============================================================================
+# THE CHARSETS
+# =============================================================================
+# `ascii` is what every licensed sheet in this project is and must stay: printable
+# ASCII, 95 cells, one contiguous block 32..126. The menu needs upper case, digits
+# and punctuation; lower case and the rest are cheap and stop a stray string
+# rendering as blanks. IT IS THE DEFAULT so that re-running this script for
+# Sofachrome or Erbaum produces byte-identical output to what is committed.
+#
+# `latin1` (UI plan WP12) is for the OFL fallback sheet ONLY. It is deliberately
+# NOT contiguous, and every gap in it is a decision:
+#
+#   32..126     printable ASCII, so the fallback can stand in for a whole string
+#               (it is also the `-TraceNoFontAtlas` face, and a fallback that
+#               could not draw "PLAY" would be no fallback at all).
+#   127..159    SKIPPED. DEL and the C1 control block. They have no glyphs, and a
+#               .notdef box drawn for a control character is worse than nothing.
+#   160..255    the Latin-1 Supplement — the accented letters this whole work
+#               package exists for, plus ¿ ¡ « » ° § © and the rest.
+#   173         SKIPPED inside that range: U+00AD SOFT HYPHEN is an invisible
+#               line-break opportunity, not a character. Rasterising it would put
+#               a stray hyphen in any name that carried one.
+#   EXTRAS      a short, explicitly listed set of TYPOGRAPHIC punctuation that
+#               real UI strings carry and Latin-1 does not have: en/em dash,
+#               curly quotes, bullet, ellipsis, euro. This is a deliberate,
+#               documented extension of the plan's "chr(32..126) + chr(160..255)"
+#               and it costs nine cells. The reason is concrete: WP12's own
+#               acceptance specimen is "BJÖRN — ÀÉÎÕÜ ¿¡", whose dash is U+2014
+#               and is NOT in Latin-1, so a strict Latin-1 sheet would render the
+#               acceptance string with a '?' in the middle of it. The runtime's
+#               lookup is a range table either way (the charset has holes in it
+#               regardless), so extra runs are free.
+#
+# A non-contiguous charset is exactly why Scripts/import_font_atlas.py emits the
+# fallback face as a RANGE TABLE instead of the (code - FirstCode) indexing the
+# three licensed faces use. Keep that in step with this.
+ASCII_CODES = list(range(32, 127))
+
+LATIN1_EXTRA_CODES = [
+    0x2013,   # – en dash
+    0x2014,   # — em dash        <- WP12's acceptance specimen carries this one
+    0x2018,   # ' left single quote
+    0x2019,   # ' right single quote / apostrophe
+    0x201C,   # " left double quote
+    0x201D,   # " right double quote
+    0x2022,   # • bullet
+    0x2026,   # … ellipsis
+    0x20AC,   # € euro
+]
+
+LATIN1_CODES = (
+    ASCII_CODES
+    + [c for c in range(160, 256) if c != 0x00AD]
+    + LATIN1_EXTRA_CODES
+)
+
+CHARSETS = {
+    "ascii": ASCII_CODES,
+    "latin1": LATIN1_CODES,
+}
+
+# The default is what the licensed sheets were made with. Do not change it.
+DEFAULT_CHARSET = "ascii"
+
+# Faces whose OWN FONT FILE is committed to this repository, and the licence that
+# makes that legal. Everything else this script rasterises is a licensed desktop
+# install whose .otf/.ttf is gitignored (see the header), and its sheet inherits
+# that grey position. Keyed by file name so the note is attached AUTOMATICALLY —
+# a Lato sheet cannot be generated without it and then read later as if it carried
+# the same restrictions as the Sofachrome ones.
+OFL_FONTS = {
+    "Lato-Regular.ttf":
+        "SIL Open Font License 1.1 (Art/Fonts/README.md). BOTH this sheet and the font "
+        "file it was rasterised from are committable, unlike the Sofachrome and Erbaum "
+        "sheets in this directory.",
+}
+
+# The atlas may not grow past this. The packer flows rows at MAX_WIDTH and then
+# rounds the height up to a power of two, so `latin1` lands on 2048x2048 where
+# `ascii` lands on 2048x1024. Anything past 2048 would be a 16 MB+ uncompressed
+# UI texture and is a decision somebody should have to make on purpose.
+MAX_HEIGHT = 2048
 
 # THE GUTTER IS 16 PX BECAUSE THE SHEET NEEDS A MIP CHAIN, and that is the whole
 # reason this number changed from 2 (spec v23, integration pass).
@@ -82,16 +171,56 @@ MAX_WIDTH = 2048      # atlas width; height grows in powers of two to fit
 SS = 2                # supersample factor used when thinning
 
 
-def build(font_path, px, out_dir, preview, thin, name="T_FontAtlas"):
+def runs_of(codes):
+    """
+    A sorted codepoint list collapsed into contiguous [first, last] runs.
+
+    Used for reporting here and — the reason it exists — as the shape the runtime
+    lookup takes: `ascii` is one run and can be indexed by (code - first), while
+    `latin1` is nine and cannot. Scripts/import_font_atlas.py derives the fallback
+    face's range table the same way, from the same .json.
+    """
+    runs = []
+    for code in sorted(codes):
+        if runs and code == runs[-1][1] + 1:
+            runs[-1][1] = code
+        else:
+            runs.append([code, code])
+    return [(a, b) for a, b in runs]
+
+
+def build(font_path, px, out_dir, preview, thin, name="T_FontAtlas",
+          charset=DEFAULT_CHARSET):
     if not os.path.isfile(font_path):
         sys.exit(
             "[Trace] font not found: {0}\n"
             "        Put your licensed copy there. It is gitignored on purpose —\n"
             "        see the header of this script.".format(font_path))
 
+    if charset not in CHARSETS:
+        sys.exit("[Trace] unknown --charset {0}. Known: {1}.".format(
+            charset, ", ".join(sorted(CHARSETS))))
+    codes = CHARSETS[charset]
+    chars = "".join(chr(c) for c in codes)
+
     font = ImageFont.truetype(font_path, px)
     ascent, descent = font.getmetrics()
     line_h = ascent + descent
+
+    # A face asked for a charset it does not cover would rasterise .notdef boxes and
+    # nobody would find out until a name drew as a row of rectangles. Say so here.
+    missing = []
+    try:
+        from fontTools.ttLib import TTFont
+        cmap = TTFont(font_path).getBestCmap()
+        missing = [c for c in codes if c not in cmap]
+    except ImportError:
+        pass                                    # fontTools is optional; the check is a bonus
+    if missing:
+        sys.exit("[Trace] {0} has no glyph for {1} of the {2} codepoints in --charset {3}: {4}\n"
+                 "        Pick a face that covers it, or narrow the charset.".format(
+                     os.path.basename(font_path), len(missing), len(codes), charset,
+                     " ".join("U+{0:04X}".format(c) for c in missing[:12])))
 
     # --- measure -------------------------------------------------------------
     # Each cell is a FULL ADVANCE WIDTH by a FULL LINE HEIGHT. That wastes some
@@ -99,7 +228,7 @@ def build(font_path, px, out_dir, preview, thin, name="T_FontAtlas"):
     # and sit every glyph on a shared baseline with no per-glyph bearing table —
     # which is exactly what Unreal's offline font format can express.
     cells = []
-    for ch in CHARSET:
+    for ch in chars:
         adv = int(round(font.getlength(ch)))
         if adv <= 0:
             adv = int(round(px * 0.3))          # space and friends
@@ -124,6 +253,18 @@ def build(font_path, px, out_dir, preview, thin, name="T_FontAtlas"):
     while atlas_h < total_h:
         atlas_h *= 2
     atlas_w = MAX_WIDTH
+
+    # ASSERT-FIT. The rows flowed; whether the result is a texture anyone should ship
+    # is a separate question, and it is answered here rather than by a 4096-tall sheet
+    # appearing in Content/ without comment.
+    if atlas_h > MAX_HEIGHT:
+        sys.exit(
+            "[Trace] {0} glyphs of {1} at em {2} need a {3}x{4} sheet, and the ceiling is "
+            "{3}x{5}.\n"
+            "        Drop the em size or narrow the charset — do NOT raise MAX_HEIGHT without "
+            "checking\n"
+            "        what an uncompressed UI texture that size costs.".format(
+                len(cells), os.path.basename(font_path), px, atlas_w, atlas_h, MAX_HEIGHT))
 
     # --- render --------------------------------------------------------------
     #
@@ -223,12 +364,24 @@ def build(font_path, px, out_dir, preview, thin, name="T_FontAtlas"):
         "descent": descent,
         "lineHeight": line_h,
         "atlas": {"width": atlas_w, "height": atlas_h, "texture": name},
-        "characters": [
-            {"char": c["char"], "code": ord(c["char"]),
-             "u": c["x"], "v": c["y"], "uSize": c["w"], "vSize": c["h"]}
-            for c in cells
-        ],
     }
+
+    # BOTH OF THESE ARE EMITTED ONLY WHEN THEY SAY SOMETHING, and that is on purpose:
+    # WP12 requires this script to stay ZERO-DIFF for the three sheets that already
+    # exist, so a run with the default charset over a non-OFL face has to reproduce
+    # their committed .json byte for byte — key order included, which is why they go
+    # in HERE rather than after the cell list. Readers use meta.get("charset", "ascii").
+    if charset != DEFAULT_CHARSET:
+        meta["charset"] = charset
+    licence = OFL_FONTS.get(os.path.basename(font_path))
+    if licence is not None:
+        meta["licence"] = licence
+
+    meta["characters"] = [
+        {"char": c["char"], "code": ord(c["char"]),
+         "u": c["x"], "v": c["y"], "uSize": c["w"], "vSize": c["h"]}
+        for c in cells
+    ]
     json_path = os.path.join(out_dir, name + ".json")
     with open(json_path, "w") as f:
         json.dump(meta, f, indent=1)
@@ -238,12 +391,26 @@ def build(font_path, px, out_dir, preview, thin, name="T_FontAtlas"):
         png_path, atlas_w, atlas_h, len(cells), 100.0 * used / (atlas_w * atlas_h)))
     print("[Trace] metrics {0}  (em {1}px, ascent {2}, descent {3})".format(
         json_path, px, ascent, descent))
+    print("[Trace] charset {0}  ({1} codepoints in {2} contiguous run(s): {3})".format(
+        charset, len(codes), len(runs_of(codes)),
+        ", ".join("{0}..{1}".format(a, b) for a, b in runs_of(codes))))
+    if licence is not None:
+        print("[Trace] licence {0}".format(licence))
 
     if preview:
         # A sanity sheet: real strings set FROM THE ATLAS, not from the font, so
         # what you look at is what the engine will draw.
         sample = ["PLAY", "SETTINGS", "DIFFICULTY", "SCORING MODE",
                   "SELECT YOUR CHARACTER", "0123456789 - 20s CD"]
+        if charset == "latin1":
+            # WP12's acceptance specimen, plus the rest of the supplement, set FROM
+            # THE SHEET. If the ö or the em dash is missing here it is missing in the
+            # atlas, and that is visible before the engine is ever launched.
+            sample += ["BJÖRN — ÀÉÎÕÜ ¿¡",
+                       "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞß",
+                       "àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ",
+                       "¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿×÷",
+                       "– — ' ' \" \" • … €"]
         # Compose from the METRICS, not from `cells`, so the preview exercises
         # exactly the numbers the engine will be handed.
         by_char = {c["char"]: c for c in meta["characters"]}
@@ -282,14 +449,22 @@ def main():
                          "weight damaged the letterforms — the second deleted ( ) [ ] { } and / "
                          "outright while the HUD draws '[E]'. 0 = as drawn.")
     ap.add_argument("--name", default="T_FontAtlas",
-                    help="output basename (default T_FontAtlas). The game uses three faces: "
-                         "T_FontAtlas (Sofachrome ExtraLight, the default), T_FontAtlasBold "
+                    help="output basename (default T_FontAtlas). The game uses three licensed "
+                         "faces — T_FontAtlas (Sofachrome ExtraLight, the default), T_FontAtlasBold "
                          "(Sofachrome Regular, character names) and T_FontAtlasHud (Erbaum Bold, "
-                         "the in-match HUD and the ability descriptions).")
+                         "the in-match HUD and the ability descriptions) — plus T_FontAtlasNames, "
+                         "the OFL Lato per-glyph FALLBACK sheet (UI plan WP12).")
+    ap.add_argument("--charset", default=DEFAULT_CHARSET, choices=sorted(CHARSETS),
+                    help="which codepoints to rasterise. 'ascii' (default) is printable ASCII, "
+                         "32..126, and is what all three LICENSED sheets are — leaving this alone "
+                         "keeps their output byte-identical. 'latin1' adds the Latin-1 Supplement "
+                         "and a few typographic marks, and is for the OFL Lato fallback sheet only: "
+                         "extending a licensed face's charset rasterises more of a font this repo "
+                         "may not redistribute. See the CHARSETS block above.")
     ap.add_argument("--preview", action="store_true",
                     help="also write a sheet of real strings composed from the atlas")
     a = ap.parse_args()
-    build(a.font, a.size, a.out, a.preview, a.thin, a.name)
+    build(a.font, a.size, a.out, a.preview, a.thin, a.name, a.charset)
 
 
 main()

@@ -64,7 +64,8 @@
 # M_TraceNeon
 #     Unlit, opaque, single-sided. THE EDGE MATERIAL: every line that defines a
 #     shape in the arena wears this.
-#     EmissiveColor = (Color * Tint) * (Glow * GlowScale).
+#     EmissiveColor = (Color * Tint) * (Glow * GlowScale)
+#                     * (1 + PulseAmp * sin(2*pi * Time * PulseRate)).
 #     Opaque + unlit is the important combination: it writes depth so neon blocks
 #     occlude properly, and it ignores every light in the scene so a neon line is
 #     exactly the colour asked for regardless of where the arena's lights point.
@@ -96,6 +97,8 @@
 #
 #   M_TraceNeon    Tint         (1,1,1,1)  team/family tint over Color
 #                  GlowScale    1.0        master emissive strength over Glow
+#                  PulseAmp     0.0        emissive pulse depth, fraction of Glow
+#                  PulseRate    0.0        emissive pulse frequency, Hz
 #   M_TraceSurface Tint         (1,1,1,1)  team/family tint over BaseColor
 #                  bUseGrid     false      STATIC SWITCH - see below
 #                  GridColor    cyan       gridline colour
@@ -106,7 +109,10 @@
 # WHY Tint AND GlowScale COST NOTHING. A vector parameter times a scalar parameter
 # is a UNIFORM EXPRESSION: the material compiler folds the whole chain into one
 # value evaluated on the CPU once per frame, not per pixel. Color * Tint * Glow *
-# GlowScale is the same single uniform the old Color * Glow was.
+# GlowScale is the same single uniform the old Color * Glow was. The pulse chain
+# (release overhaul, MAP plan section 6.1) is uniform for the same reason - Time
+# is itself a uniform expression - so the whole factor folds CPU-side too, and at
+# the 0/0 defaults it is the constant 1: bit-identical output, zero added cost.
 #
 # WHY THE GRID IS A StaticSwitchParameter AND NOT A SCALAR. A scalar "GridStrength
 # = 0" would still compile the gridline maths into the shader and pay for it on
@@ -376,9 +382,31 @@ def build_neon():
     glow = scalar_param(material, "Glow", 6.0, -700, 260, group="Trace|Neon", priority=2)
     glow_scale = scalar_param(material, "GlowScale", 1.0, -700, 400, group="Trace|Neon", priority=3)
 
+    # --- Pulse (release overhaul, MAP plan section 6.1) --------------------------
+    # PulseRate (Hz) and PulseAmp (fraction of Glow) let a piece breathe:
+    #     EmissiveColor *= 1 + PulseAmp * sin(2*pi * Time * PulseRate)
+    # The Sine node's Period stays at its default 1.0, which is what makes the
+    # argument 2*pi * Time * PulseRate and PulseRate a real frequency in Hz.
+    # Every node in the chain (Time, Sine, the multiplies, the add) is a UNIFORM
+    # EXPRESSION - Time included - so, exactly like Tint/GlowScale above, the
+    # compiler folds the whole factor to one CPU-side value per frame: zero
+    # per-pixel cost on the material most emissive pixels in the arena wear.
+    # DEFAULTS 0/0 ARE THE IDENTITY (1 + 0*sin = 1): every existing instance
+    # renders bit-identically until C++ (the builder's pulse-aware MID path, MAP
+    # plan section 6.2) or a designer sets BOTH params. That is also how the
+    # must-not-pulse list is enforced - anything that never asks never moves.
+    pulse_amp = scalar_param(material, "PulseAmp", 0.0, -700, 470, group="Trace|Neon", priority=4)
+    pulse_rate = scalar_param(material, "PulseRate", 0.0, -700, 540, group="Trace|Neon", priority=5)
+    time_expr = new_expression(material, unreal.MaterialExpressionTime, -560, 500)
+    phase = multiply(material, time_expr, pulse_rate, -420, 500)
+    sine = unary(material, unreal.MaterialExpressionSine, phase, -340, 500)
+    swing = multiply(material, sine, pulse_amp, -260, 500)
+    pulse = add(material, constant(material, 1.0, -260, 560), swing, -180, 520)
+
     tinted = multiply(material, colour, tint, -420, -60)
     strength = multiply(material, glow, glow_scale, -420, 320)
-    product = multiply(material, tinted, strength, -200, 80)
+    strength2 = multiply(material, strength, pulse, -120, 400)
+    product = multiply(material, tinted, strength2, -40, 80)
     link_property(product, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
 
     finish_material(material)
